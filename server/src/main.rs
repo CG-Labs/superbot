@@ -73,6 +73,9 @@ mod machines_placement_tests;
 #[cfg(test)]
 mod machines_resize_tests;
 mod passwd;
+mod signin_watch;
+#[cfg(test)]
+mod signin_watch_http_tests;
 mod notify;
 #[cfg(test)]
 mod notify_http_tests;
@@ -238,6 +241,7 @@ async fn main() {
     let break_glass = users::break_glass_flag(&env("AUTH_BREAK_GLASS", "")).unwrap_or_else(|e| exit(e));
     let mfa_pinned = mfa::policy_flag(&env("AUTH_MFA", "")).unwrap_or_else(|e| exit(e));
     let sessions = SessionConfig::from_env(&env("SESSION_IDLE_TIMEOUT", ""), &env("SESSION_MAX_AGE", "")).unwrap_or_else(|e| exit(e));
+    let signin_alerts = signin_watch::Settings::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Sign-in alerts: {e}")));
     let sso = sso::Sso::from_env().unwrap_or_else(|e| exit(format!("SSO: {e}")));
     let signups = signups::Signups::from_env(&secrets::env::EnvStore::process(), &env("SIGNUPS", ""), &env("TURNSTILE_SITE_KEY", ""))
         .unwrap_or_else(|e| exit(format!("Sign-ups: {e}")));
@@ -506,6 +510,7 @@ async fn main() {
         scim,
         payments,
         mfa: mfa::Mfa::with_policy(mfa_pinned),
+        watch: signin_watch::Watch::new(signin_alerts),
         ..Auth::new(Some(app.clone()))
     });
     log_info!("Control plane: {}.", auth_state.machines.describe());
@@ -561,6 +566,7 @@ async fn main() {
     let auth_state_checkout = auth_state.payments.checkout_enabled();
     let mfa_policy = mfa::policy(&auth_state, &app.db);
     log_info!("Two-factor sign-in: required for {}{} (ADR 0094).", match mfa_policy { mfa::Policy::Off => "no one", mfa::Policy::Admins => "admins", mfa::Policy::All => "everyone" }, if mfa_pinned.is_some() { ", set by AUTH_MFA" } else { "" });
+    log_info!("Sign-in alerts: {} (ADR 0104).", auth_state.watch.settings.describe());
     let router = router(app.clone(), auth_state);
     let policy = app.db.global_policy();
     app.db.record(&Event::new(Actor::system("server"), "server.started").details(json!({
@@ -987,6 +993,8 @@ struct Auth {
     payments: billing::Billing,
     /// Second factors for password and code sign-ins (ADR 0094).
     mfa: mfa::Mfa,
+    /// Suspicious sign-in patterns (ADR 0104).
+    watch: signin_watch::Watch,
     /// The database: sessions and audit events. None in tests of auth alone.
     app: Option<AppState>,
 }
@@ -1008,6 +1016,7 @@ impl Auth {
             scim: scim::Scim::default(),
             payments: billing::Billing::default(),
             mfa: mfa::Mfa::default(),
+            watch: signin_watch::Watch::default(),
             app,
         }
     }
@@ -1026,6 +1035,9 @@ impl Auth {
     /// Logs the first good Basic-auth request of a client (see `audit::Logins`).
     /// Session sign-ins are logged once, by `users::login`.
     fn login_ok(&self, source: &Source, actor: &Actor, method: &str) {
+        if let Some(id) = actor.id.as_deref().filter(|_| method == "password") {
+            signin_watch::succeeded(self, source, id, method, false, None);
+        }
         let client = format!("{}|{}", source.ip.as_deref().unwrap_or(""), source.user_agent.as_deref().unwrap_or(""));
         if self.logins.success(&client, db::now()) {
             let who = Who { actor: actor.clone(), source: source.clone() };
@@ -1035,6 +1047,11 @@ impl Auth {
 
     /// Logs a bad password, code, or token, throttled per IP. Never logs what was sent.
     fn login_failed(&self, source: &Source, method: &str, reason: Option<&str>) {
+        // Not guesses: the right password refused for want of a second factor, and any password
+        // once break-glass is off (browsers resend one they cached before, on every request).
+        if !matches!(reason, Some("mfa_required" | "break_glass_off")) {
+            signin_watch::failed(self, source, method, (method == "password").then_some(users::OPERATOR));
+        }
         let client = format!("{}|{method}", source.ip.as_deref().unwrap_or(""));
         let Some(missed) = self.logins.failure(&client, db::now()) else { return };
         let actor = match method {

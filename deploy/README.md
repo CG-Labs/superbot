@@ -444,7 +444,7 @@ Both are off by default, and the installer and Compose don't turn them on. Desig
 | `METRICS_LISTEN` | `off` (default), `on` (`127.0.0.1:9464`), or an address and port such as `0.0.0.0:9464` |
 | `METRICS_TOKEN` or `METRICS_TOKEN_FILE` | A bearer token for scrapers, at least 24 characters. Required off loopback: `botd` won't start without it |
 
-The metrics cover requests (by route class, method and status class, with latency), Bot runs (by harness and result, with duration, plus runs underway, waiting and refused), approvals waiting and the oldest one's age, audit events worth alerting on (failed sign-ins, failed notifications, machine backups, RPO breaches, restores), and with managed machines, machines by state, the reconciler, and each tier's RPO status. Labels never hold ids, emails, names, paths or message text.
+The metrics cover requests (by route class, method and status class, with latency), Bot runs (by harness and result, with duration, plus runs underway, waiting and refused), approvals waiting and the oldest one's age, audit events worth alerting on (failed sign-ins, failed notifications, machine backups, RPO breaches, restores), every failed sign-in guess by method and suspicious sign-in patterns ([sign-in alerts](#status-page-and-slo-alerts)), and with managed machines, machines by state, the reconciler, and each tier's RPO status. Labels never hold ids, emails, names, paths or message text.
 
 On the installer's server, with a Prometheus (or Grafana Alloy, or an OpenTelemetry Collector) on the same host:
 
@@ -521,6 +521,28 @@ promtool check rules /etc/prometheus/superbot-slo.rules.yml
 ```yaml
 # prometheus.yml
 rule_files: ["/etc/prometheus/superbot-slo.rules.yml"]
+```
+
+**Sign-in alerts.** `botd` reports suspicious sign-in patterns on its own, on by default: bursts of failed password, sign-in code and second-factor guesses from one IP or at one account, a sign-in right after one, and admins signing in from a network none of their sessions came from. Each is an `auth.suspicious_sign_in` audit event with the IP and account, and a count in `superbot_signin_suspicious_total`; bursts at one account and sign-ins right after a burst also go to the email and webhook alerts admins turn on under [Approval notifications](#approval-notifications). Thresholds are in `.env` ([ADR 0104](../docs/adr/0104-suspicious-sign-in-alerts.md)):
+
+| Setting in `.env` | Meaning |
+|---|---|
+| `SIGNIN_ALERTS` | `on` (default) or `off` |
+| `SIGNIN_ALERT_IP_FAILURES` | Failed guesses from one IP within the window (default 10, the sign-in limiter's own limit) |
+| `SIGNIN_ALERT_ACCOUNT_FAILURES` | Failed guesses at one account, from any IP (default 5) |
+| `SIGNIN_ALERT_WINDOW` | `5m` to `24h` (default `15m`) |
+| `SIGNIN_ALERT_NEW_IP` | Whose new-network sign-ins are reported: `admins` (default, the owner included), `all` or `off` |
+
+[`deploy/prometheus/superbot-signin.rules.yml`](prometheus/superbot-signin.rules.yml) turns them into alerts: a page when a sign-in works right after a burst, and tickets for attacks on one account, repeated bursts, more than 100 failed guesses in 15 minutes, and admins on new networks. Load it beside the SLO rules:
+
+```sh
+sudo cp deploy/prometheus/superbot-signin.rules.yml /etc/prometheus/
+promtool check rules /etc/prometheus/superbot-signin.rules.yml
+```
+
+```yaml
+# prometheus.yml
+rule_files: ["/etc/prometheus/superbot-slo.rules.yml", "/etc/prometheus/superbot-signin.rules.yml"]
 ```
 
 Route `severity: page` to on-call and `severity: ticket` to a queue in Alertmanager.

@@ -122,7 +122,7 @@ A push says only that something is waiting and for which Bot. No command, tool, 
 
 ### Email and webhooks (approval notices)
 
-Off until an admin turns a channel on ([ADR 0061](../adr/0061-approval-notifications.md)). A notice holds what the approval card shows: the Bot, the tool, the risk class, the reason, and the command cut short (less with `detail: minimal`). Email goes through the operator's own SMTP server, one message per recipient. Webhooks (Slack-compatible or SuperBot JSON, optionally HMAC-signed) go to a URL the admin saves as a secret.
+Off until an admin turns a channel on ([ADR 0061](../adr/0061-approval-notifications.md)). A notice holds what the approval card shows: the Bot, the tool, the risk class, the reason, and the command cut short (less with `detail: minimal`). Email goes through the operator's own SMTP server, one message per recipient. Webhooks (Slack-compatible or SuperBot JSON, optionally HMAC-signed) go to a URL the admin saves as a secret. The same channels carry server alerts to the global list only; a suspicious sign-in alert names the account (its email) and how they signed in, never the IP, which stays in the audit log ([ADR 0104](../adr/0104-suspicious-sign-in-alerts.md)).
 
 ### Billing (Stripe)
 

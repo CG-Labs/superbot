@@ -4803,6 +4803,15 @@ impl Db {
         self.c().query_row("SELECT * FROM sessions WHERE id = ?", [id], session_row).optional().ok().flatten()
     }
 
+    /// The distinct IPs this user's kept sessions came from, newest first, at most `limit`.
+    pub fn session_ips(&self, user_id: &str, limit: u32) -> Vec<String> {
+        let c = self.c();
+        let mut s = c
+            .prepare("SELECT ip FROM sessions WHERE user_id = ? AND ip IS NOT NULL GROUP BY ip ORDER BY max(created_at) DESC LIMIT ?")
+            .unwrap();
+        s.query_map(params![user_id, limit], |r| r.get(0)).unwrap().filter_map(Result::ok).collect()
+    }
+
     /// The live session with this token hash and its active user. None when it is
     /// unknown, revoked, expired (absolute or idle), or the user is disabled.
     pub fn live_session(&self, token_hash: &str, at: i64, idle_ms: i64, max_ms: i64) -> Option<(Session, User)> {

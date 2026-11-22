@@ -338,6 +338,7 @@ fn session_view(s: &Session, cfg: &SessionConfig) -> Value {
 pub fn start_session(a: &Auth, user: &User, method: &str, idp: Option<(&str, &str)>, mfa: Option<&str>, cookie: bool, label: Option<&str>, source: &Source) -> (Session, String) {
     let token = new_secret(SESSION_PREFIX);
     let app = a.app.as_ref().expect("sessions need the database");
+    let new_network = crate::signin_watch::new_network(a, user, source);
     let s = app.db.create_session(&NewSession {
         user_id: &user.id,
         token_hash: &hash(&token),
@@ -351,6 +352,7 @@ pub fn start_session(a: &Auth, user: &User, method: &str, idp: Option<(&str, &st
         expires_at: db::now() + a.sessions.max_ms,
         mfa,
     });
+    crate::signin_watch::succeeded(a, source, &user.id, method, new_network, Some(&s.id));
     (s, token)
 }
 

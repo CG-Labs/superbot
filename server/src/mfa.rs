@@ -318,6 +318,7 @@ fn failed(a: &Auth, source: &Source, u: &User, factor: &str, first: &str, reason
     let at = db::now();
     a.limiter.fail(source.ip.as_deref().unwrap_or(""), at);
     a.mfa.limiter.fail(&u.id, at);
+    crate::signin_watch::failed(a, source, factor, Some(&u.id));
     let who = Who { actor: users::actor(a, u, None, first), source: source.clone() };
     a.record(who.event("auth.login_failed").outcome(Outcome::Failure).details(json!({ "method": factor, "firstFactor": first, "reason": reason })));
 }
