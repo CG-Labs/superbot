@@ -35,6 +35,16 @@ fn sent_by(app: &AppState, bot: &str, user: &str, text: &str) -> i64 {
     m.id
 }
 
+async fn until(what: &str, f: impl Fn() -> bool) {
+    for _ in 0..400 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
 async fn bot_of(port: u16, auth: &str, name: &str) -> String {
     let (code, b) = json_call(port, "POST", "/api/bots", auth, &json!({ "name": name }).to_string()).await;
     assert_eq!(code, 201, "{b}");
@@ -473,4 +483,54 @@ async fn an_open_team_checkout_refuses_before_the_machine_goes() {
     assert_eq!(code, 200, "{v}");
     assert_eq!((v["removed"]["machine"]["destroyed"].clone(), v["removed"]["team"].as_str()), (json!(true), Some(team.as_str())), "{v}");
     assert_eq!(call(port, "GET", &format!("/api/teams/{team}"), &admin, "").await.0, 404);
+}
+
+#[tokio::test]
+async fn runs_they_asked_for_in_others_bots_end_and_are_recorded_before_the_log_is_rewritten() {
+    let (port, app, admin, _) = serve_app().await;
+    app.run_cap.set(Some(1)).unwrap();
+    let dir = app.cfg.data_dir.join("gate");
+    crate::slots_http_tests::gated_claude(&app, &dir);
+    let started = || std::fs::read_to_string(dir.join("order")).unwrap_or_default().lines().map(String::from).collect::<Vec<_>>();
+    let (bob, _) = user_with(port, &admin, "bob@example.com", "member").await;
+    let (ada, ada_auth) = user_with(port, &admin, "ada@example.com", "member").await;
+    let shared = |name: &str| {
+        let b = app.db.create_bot_owned(name, "#fff", "waddle", "claude", None, false, &bob, acl::Visibility::Shared);
+        app.db.set_grant(&b.id, &ada, acl::Grant::Operator, &bob);
+        b.id
+    };
+    let (live, waiting) = (shared("Live"), shared("Waiting"));
+    let say = |bot: String, text: &'static str| {
+        let auth = ada_auth.clone();
+        async move {
+            let (code, body) = call(port, "POST", &format!("/api/bots/{bot}/messages"), &auth, &json!({ "text": text }).to_string()).await;
+            assert_eq!(code, 202, "{body}");
+        }
+    };
+    // Her run going in Bob's Bot, another of hers queued behind it, and one waiting for a slot.
+    say(live.clone(), "first").await;
+    until("her run to start", || started() == std::slice::from_ref(&live)).await;
+    say(live.clone(), "second").await;
+    say(waiting.clone(), "third").await;
+    until("the third to wait for a slot", || app.slots.waiting(&waiting).is_some()).await;
+
+    let (code, v) = erase(port, &admin, &ada, "").await;
+    assert_eq!(code, 200, "{v}");
+    let p = v["pseudonym"].as_str().unwrap().to_string();
+    // Its end was recorded before the rewrite, so under the pseudonym; the others never ran.
+    let finished = audit(port, &admin, "action=bot.run_finished").await;
+    assert!(finished.iter().any(|e| e["botId"] == live.as_str() && e["actorId"] == p.as_str() && e["details"]["result"] == "stopped"), "{finished:?}");
+    let dequeued = audit(port, &admin, "action=bot.run_dequeued").await;
+    assert!(dequeued.iter().any(|e| e["botId"] == waiting.as_str() && e["actorId"] == p.as_str() && e["details"]["result"] == "stopped"), "{dequeued:?}");
+    assert!(!app.serving(&live, None) && !app.serving(&waiting, None));
+    for bot in [&live, &waiting] {
+        assert!(app.db.messages(bot, 20).iter().filter(|m| m.role == "user").all(|m| m.status.as_deref() == Some("done")), "{bot}");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(started(), std::slice::from_ref(&live), "nothing else of hers started");
+    for (table, row) in app.db.all_rows() {
+        if table == "audit_events" {
+            assert!(!row.contains(&ada), "her id in the audit log: {row}");
+        }
+    }
 }

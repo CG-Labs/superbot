@@ -185,17 +185,15 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
         return Err(conflict(format!("The chat of {} was held meanwhile. Release the hold, then erase them again.", held.join(", "))));
     }
     app.db.set_erasing_bots(&u.id, &bot_ids);
-    // Runs record their end as whoever asked, so they must be over before the log is rewritten.
-    let mut stopping: Vec<String> = bots.iter().map(|b| b.id.clone()).collect();
-    for bot in app.db.bots() {
-        if bot.owner_id != u.id && app.live_run(&bot.id).is_some() && app.requested_by(&bot) == u.id {
-            stopping.push(bot.id.clone());
-        }
-    }
+    // Runs record their end as whoever asked, so they must be over before the log is
+    // rewritten: those on their Bots, and in others' Bots those they asked for, queued
+    // or started. Nothing new starts for them meanwhile (`under_way`).
+    let stopping: Vec<String> = bots.iter().map(|b| b.id.clone()).collect();
     for id in &stopping {
         app.stop(id);
     }
-    if !settled(&app, &stopping).await {
+    let theirs = app.stop_for_user(&u.id);
+    if !settled(&app, &stopping, &theirs, &u.id).await {
         return Err(conflict("Runs they started are still stopping. Erase them again in a minute."));
     }
     let mut grants = 0;
@@ -281,10 +279,11 @@ fn add_new(ids: &mut Vec<String>, bots: &[crate::db::Bot]) {
     }
 }
 
-/// Whether every run on `bots` has ended, waiting up to 30 seconds.
-async fn settled(app: &AppState, bots: &[String]) -> bool {
+/// Whether `owned` are done with all their work and `others` with what they took on
+/// for `user_id`, each run's end recorded, waiting up to 30 seconds.
+async fn settled(app: &AppState, owned: &[String], others: &[String], user_id: &str) -> bool {
     for _ in 0..300 {
-        if bots.iter().all(|b| app.live_run(b).is_none()) {
+        if owned.iter().all(|b| app.live_run(b).is_none() && !app.serving(b, None)) && others.iter().all(|b| !app.serving(b, Some(user_id))) {
             return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

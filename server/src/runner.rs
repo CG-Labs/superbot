@@ -169,6 +169,16 @@ struct BotState {
     stopped: bool,
     /// Wakes its run while it waits for a slot (ADR 0073), to see `stopped`.
     wake: Option<Arc<Notify>>,
+    /// Whom the message it took names (`named_in`), from when it leaves the queue until
+    /// its run's end is recorded: an erasure waits for that (ADR 0102).
+    serving: Option<Vec<String>>,
+}
+
+/// The people a queued message's requester names: who asked, whom a Bot or the
+/// scheduler acted for, and whom the run is for.
+fn named_in(msg: &Message) -> Vec<String> {
+    let Some(by) = &msg.requested_by else { return Vec::new() };
+    [&by.actor.id, &by.actor.on_behalf_of, &by.actor.asker].into_iter().flatten().cloned().collect()
 }
 
 pub struct App {
@@ -778,7 +788,9 @@ impl App {
                 let mut st = self.state();
                 let m = st.get_mut(&bot_id).and_then(|s| {
                     s.stopped = false;
-                    s.queue.pop_front()
+                    let m = s.queue.pop_front();
+                    s.serving = m.as_ref().map(named_in);
+                    m
                 });
                 if m.is_none() {
                     st.remove(&bot_id);
@@ -802,6 +814,9 @@ impl App {
             if msg.role == "peer" {
                 self.answer_peer(&msg, before);
             }
+            if let Some(s) = self.state().get_mut(&bot_id) {
+                s.serving = None;
+            }
         }
         self.send(json!({ "type": "status", "botId": bot_id, "working": false }));
     }
@@ -818,6 +833,13 @@ impl App {
             return cant_run("This Bot's id isn't a safe folder name, so it can't run.");
         };
         let by = self.requester(&bot, msg);
+        // Nothing runs on the Bots of someone being erased, or for them (ADR 0102). Not
+        // audited: the event would name them after their erasure rewrote the log.
+        let erased = |u: &str| crate::erasure::under_way(u) || self.db.user(u).is_some_and(|u| u.erased_at.is_some());
+        if erased(&bot.owner_id) || named_in(msg).iter().any(|u| erased(u)) {
+            self.give_back_routine(&bot, msg);
+            return;
+        }
         // A routine queued before its owner or author was disabled doesn't run (ADR 0047).
         if msg.role == "routine"
             && let Some((reason, user)) = crate::handover::blocked(&self.db, &bot.owner_id, by.actor.asker.as_deref())
@@ -2158,6 +2180,53 @@ impl App {
         }
         self.cancel_approvals(bot_id, "The Bot was stopped");
         true
+    }
+
+    /// On every Bot, drops the queued messages that name `user_id` and stops the one it
+    /// is handling if that does, started or not (ADR 0102). The Bots it stopped.
+    pub fn stop_for_user(&self, user_id: &str) -> Vec<String> {
+        let names = |m: &Message| named_in(m).iter().any(|u| u == user_id);
+        let mut stopped = Vec::new();
+        {
+            let mut st = self.state();
+            for (id, s) in st.iter_mut() {
+                let (theirs, rest): (VecDeque<Message>, VecDeque<Message>) = s.queue.drain(..).partition(|m| names(m));
+                s.queue = rest;
+                if !theirs.is_empty() {
+                    let owner = self.db.bot(id).map(|b| b.owner_id);
+                    for m in &theirs {
+                        self.db.set_status(m.id, "done");
+                        if let Some(o) = &owner {
+                            self.give_back_routine_to(o, m);
+                        }
+                    }
+                }
+                if !s.serving.as_ref().is_some_and(|n| n.iter().any(|u| u == user_id)) {
+                    continue;
+                }
+                match &s.run {
+                    Some(r) => {
+                        r.abort.send_if_modified(|v| v.get_or_insert("stopped") == &"stopped");
+                    }
+                    None => {
+                        s.stopped = true;
+                        if let Some(w) = &s.wake {
+                            w.notify_one();
+                        }
+                    }
+                }
+                stopped.push(id.clone());
+            }
+        }
+        for id in &stopped {
+            self.cancel_approvals(id, "The Bot was stopped");
+        }
+        stopped
+    }
+
+    /// Whether the Bot is handling a message (`serving`): any, or one naming `user_id`.
+    pub fn serving(&self, bot_id: &str, user_id: Option<&str>) -> bool {
+        self.state().get(bot_id).and_then(|s| s.serving.as_ref()).is_some_and(|n| user_id.is_none_or(|u| n.iter().any(|x| x == u)))
     }
 
     /// Stops the runs going now in `teammate`'s account here for `owner`'s Bots, which is
