@@ -2,7 +2,7 @@
 # The image's chromium (/usr/local/bin/chromium, ahead of Debian's /usr/bin/chromium on PATH, and
 # AGENT_BROWSER_EXECUTABLE_PATH). agent-browser adds --no-sandbox whenever it sees a container, so
 # this takes the flags that turn Chromium's sandbox off back out, unless the operator turned it
-# off with SUPERBOT_CHROMIUM_SANDBOX=off (docs/adr/0106-chromium-sandbox-in-the-container.md).
+# off with SUPERBOT_CHROMIUM_SANDBOX=off (docs/adr/0107-chromium-sandbox-in-the-container.md).
 # Chromium never falls back quietly: where the sandbox can't start, it stops with "No usable sandbox!".
 set -eu
 

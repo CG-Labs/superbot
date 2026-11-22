@@ -122,7 +122,7 @@ RUN set -eu; \
     rm -rf /tmp/ab-src; \
     install -d -m 1777 /tmp/.X11-unix
 COPY --from=voxl /out/bin/ /usr/local/bin/
-# Chromium with its sandbox on, whatever agent-browser asks (ADR 0106). Ahead of /usr/bin on PATH.
+# Chromium with its sandbox on, whatever agent-browser asks (ADR 0107). Ahead of /usr/bin on PATH.
 COPY --chmod=0755 deploy/docker/chromium.sh /usr/local/bin/chromium
 RUN if [ "$COMPUTER" = off ]; then rm /usr/local/bin/chromium; fi
 

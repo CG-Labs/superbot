@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Writes seccomp-chromium.json: Docker's default seccomp profile plus the one thing Chromium's
-# sandbox needs from it (docs/adr/0106-chromium-sandbox-in-the-container.md). Docker's default
+# sandbox needs from it (docs/adr/0107-chromium-sandbox-in-the-container.md). Docker's default
 # allows namespaces in clone and unshare only with CAP_SYS_ADMIN, and chroot only with
 # CAP_SYS_CHROOT, which botd's container doesn't have. This adds:
 #   clone, unshare  with no namespace flags besides CLONE_NEWUSER, CLONE_NEWPID, CLONE_NEWNET

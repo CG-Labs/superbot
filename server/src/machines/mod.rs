@@ -1079,6 +1079,17 @@ pub fn start(app: AppState, cp: Arc<ControlPlane>) {
         return;
     }
     backup::start(app.clone(), cp.clone());
+    if cp.hosts().is_some() && app.db.metrics().wants_host_use() {
+        let (a, c) = (app.clone(), cp.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(c.reconcile_every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                hosts::read_uses(&a, &c, hosts::READ_WITHIN).await;
+            }
+        });
+    }
     let (a, c) = (app.clone(), cp.clone());
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(c.reconcile_every);

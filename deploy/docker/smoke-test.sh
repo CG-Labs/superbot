@@ -306,7 +306,7 @@ ab open 'data:text/html,<title>superbot-smoke</title><h1>hello</h1>' >/dev/null 
 windows=$(dc exec -T botd xwininfo -display "$display" -root -tree) || fail "couldn't list the windows on $display"
 grep -q '"superbot-smoke - Chromium"' <<<"$windows" || fail "Chromium isn't on the Bot's screen: $windows"
 
-log "Chromium runs with its sandbox on (ADR 0106)"
+log "Chromium runs with its sandbox on (ADR 0107)"
 for _ in $(seq 1 60); do
   grep -q 'Chromium sandbox: on (checked' <<<"$(dc logs --no-color botd)" && break
   sleep 1

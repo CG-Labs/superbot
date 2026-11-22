@@ -1,4 +1,4 @@
-//! Chromium's sandbox where botd runs in the published image (ADR 0106). The image's
+//! Chromium's sandbox where botd runs in the published image (ADR 0107). The image's
 //! `chromium` (deploy/docker/chromium.sh) keeps the sandbox on unless
 //! SUPERBOT_CHROMIUM_SANDBOX=off; botd checks once at start that it can actually come up,
 //! so a host that blocks it says so in botd's log, not only in a Bot's failed browser.

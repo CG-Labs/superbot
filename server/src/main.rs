@@ -621,6 +621,9 @@ async fn main() {
     retention::start(app.clone(), chat_retention);
     users::start_pruning(app.clone(), sessions);
     machines::hosts::load(&app, &control_plane).unwrap_or_else(|e| exit(format!("Incus hosts: {e}")));
+    if observe.metrics.is_some() {
+        app.db.metrics().want_host_use();
+    }
     machines::start(app.clone(), control_plane);
     if policy.mode == policy::Mode::Bypass {
         log_warn!(
@@ -681,19 +684,19 @@ async fn main() {
             (false, false) => "off (install Xvfb and openbox to turn them on)".into(),
         }
     );
-    // The image's Chromium (ADR 0106); a bash install's Chrome for Testing keeps agent-browser's own choice.
+    // The image's Chromium (ADR 0107); a bash install's Chrome for Testing keeps agent-browser's own choice.
     if let Some(browser) = chromium::browser() {
         if chromium_sandbox {
             tokio::spawn(async move {
                 match chromium::check(&browser).await {
                     Ok(()) => log_info!("Chromium sandbox: on (checked: {} starts sandboxed).", browser.display()),
                     Err(e) => log_warn!(
-                        "Chromium sandbox: on, but Chromium can't start sandboxed here, so Bots' browsers won't open: {e}. Give the container user namespaces (Compose: deploy/docker/seccomp-chromium.json), or set SUPERBOT_CHROMIUM_SANDBOX=off to run it without its sandbox (ADR 0106)."
+                        "Chromium sandbox: on, but Chromium can't start sandboxed here, so Bots' browsers won't open: {e}. Give the container user namespaces (Compose: deploy/docker/seccomp-chromium.json), or set SUPERBOT_CHROMIUM_SANDBOX=off to run it without its sandbox (ADR 0107)."
                     ),
                 }
             });
         } else {
-            log_warn!("Chromium sandbox: off (SUPERBOT_CHROMIUM_SANDBOX=off): pages the Bots open run in Chromium without its sandbox (ADR 0106).");
+            log_warn!("Chromium sandbox: off (SUPERBOT_CHROMIUM_SANDBOX=off): pages the Bots open run in Chromium without its sandbox (ADR 0107).");
         }
     }
 

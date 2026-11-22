@@ -1,10 +1,10 @@
-# 0106: Chromium's sandbox inside the container
+# 0107: Chromium's sandbox inside the container
 
 ## Status
 
 Accepted (22 Nov 2026). [#50](https://github.com/CG-Labs/superbot/issues/50) (M4, SOC 2 readiness, CC6.8-3). Changes [ADR 0084](0084-published-image-with-computer-use.md) (the published image with computer use), which left the sandbox off.
 
-0105 is on `main`, and open PR #164 holds 0102, so this is 0106.
+0106 is on `main`, and open PR #164 holds 0102, so this is 0107.
 
 ## Context
 
