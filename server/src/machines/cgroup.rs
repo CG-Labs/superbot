@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// Runs' cgroups made and not yet dropped, by name: a sweep leaves them, even before
-/// their process is in them.
+/// their process is in them. Held across a start's sweep, creation and registration.
 type Live = Arc<Mutex<HashSet<String>>>;
 
 /// The controllers a run's limits need, and one more applied where there is one.
@@ -115,6 +115,12 @@ pub fn absolute(l: &RunLimits, cpus: u32, memory: u64, io: bool) -> AppliedLimit
     }
 }
 
+/// Caps all runs' memory together below the machine's, so the agent always has room.
+fn runs_memory(runs: &Path, memory: u64) -> Result<(), String> {
+    let cap = if memory == u64::MAX { "max".to_string() } else { ((memory / 100) * RUNS_MEMORY_PERCENT).to_string() };
+    write(runs, "memory.max", &cap)
+}
+
 /// The agent's delegated cgroup, set up for runs.
 #[derive(Debug)]
 pub struct Cgroups {
@@ -122,8 +128,8 @@ pub struct Cgroups {
     runs: PathBuf,
     live: Live,
     controllers: Vec<String>,
-    cpus: u32,
-    memory: u64,
+    /// The machine's CPUs and memory, as last measured: a resize changes them live.
+    size: Mutex<(u32, u64)>,
 }
 
 impl Cgroups {
@@ -168,12 +174,25 @@ impl Cgroups {
                 return Err(e);
             }
         }
-        if memory != u64::MAX {
-            write(&runs, "memory.max", &((memory / 100) * RUNS_MEMORY_PERCENT).to_string())?;
-        }
-        let cg = Cgroups { base: base.to_path_buf(), runs, live: Live::default(), controllers: on, cpus: cpus.max(1), memory };
+        runs_memory(&runs, memory)?;
+        let cg = Cgroups { base: base.to_path_buf(), runs, live: Live::default(), controllers: on, size: Mutex::new((cpus.max(1), memory)) };
         cg.sweep();
         Ok(cg)
+    }
+
+    pub fn base(&self) -> &Path {
+        &self.base
+    }
+
+    /// Takes the machine's size as measured now, so runs follow a resize: the next
+    /// run's limits, and the cap on all runs' memory together.
+    pub fn resize(&self, cpus: u32, memory: u64) -> Result<(), String> {
+        let mut size = self.size.lock().unwrap_or_else(|e| e.into_inner());
+        if size.1 != memory {
+            runs_memory(&self.runs, memory)?;
+        }
+        *size = (cpus.max(1), memory);
+        Ok(())
     }
 
     pub fn report(&self) -> RunLimitsReport {
@@ -194,7 +213,8 @@ impl Cgroups {
 
     /// The limits `l` comes to on this machine.
     pub fn applied(&self, l: &RunLimits) -> AppliedLimits {
-        absolute(l, self.cpus, self.memory, self.io())
+        let (cpus, memory) = *self.size.lock().unwrap_or_else(|e| e.into_inner());
+        absolute(l, cpus, memory, self.io())
     }
 
     /// A cgroup for the run `name`, held to `l`. A name in use is refused, since its
@@ -203,7 +223,8 @@ impl Cgroups {
         if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
             return Err("a run's cgroup needs a plain name".into());
         }
-        self.sweep();
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        self.sweep_except(&live);
         let dir = self.runs.join(name);
         std::fs::create_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let applied = self.applied(l);
@@ -228,7 +249,7 @@ impl Cgroups {
         };
         match set() {
             Ok(procs) => {
-                self.live.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string());
+                live.insert(name.to_string());
                 Ok(RunCgroup { dir, procs, applied, name: name.to_string(), live: self.live.clone() })
             }
             Err(e) => {
@@ -240,8 +261,12 @@ impl Cgroups {
 
     /// Removes runs' cgroups that nothing is in any more and no run holds.
     pub fn sweep(&self) {
+        let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        self.sweep_except(&live);
+    }
+
+    fn sweep_except(&self, live: &HashSet<String>) {
         let Ok(entries) = std::fs::read_dir(&self.runs) else { return };
-        let live = self.live.lock().unwrap_or_else(|e| e.into_inner()).clone();
         for e in entries.flatten() {
             let p = e.path();
             let held = e.file_name().to_str().is_some_and(|n| live.contains(n));
@@ -289,7 +314,8 @@ impl RunCgroup {
 impl Drop for RunCgroup {
     /// Gone once empty. What the run left running keeps it until the next sweep.
     fn drop(&mut self) {
-        self.live.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.name);
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        live.remove(&self.name);
         let _ = std::fs::remove_dir(&self.dir);
     }
 }
@@ -383,6 +409,11 @@ mod tests {
         assert_eq!(read(run.dir(), "memory.oom.group"), "1");
         assert_eq!(read(run.dir(), "io.weight"), "default 100");
         assert!(cg.start("j1", &DEFAULT).is_err(), "a name in use");
+        // A resize: the cap on all runs follows, and so do the next run's limits.
+        cg.resize(4, 8 << 30).unwrap();
+        assert_eq!(read(&base.join("runs"), "memory.max"), ((8u64 << 30) / 100 * 90).to_string());
+        assert_eq!(cg.applied(&DEFAULT).cpu_quota_us, 320_000);
+        cg.resize(2, 4 << 30).unwrap();
         // Another run's start doesn't sweep one whose process isn't in it yet.
         let j2 = cg.start("j2", &DEFAULT).unwrap();
         assert!(run.dir().exists() && j2.dir().exists());

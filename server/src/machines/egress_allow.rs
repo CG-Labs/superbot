@@ -168,8 +168,12 @@ pub fn load(nft: &std::path::Path, script: &str) -> Result<(), String> {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("nft didn't start: {e}"))?;
-    child.stdin.take().ok_or("no stdin")?.write_all(script.as_bytes()).map_err(|e| e.to_string())?;
+    // An nft that refuses may exit before it reads it all: its own error says why.
+    let wrote = child.stdin.take().ok_or("no stdin")?.write_all(script.as_bytes());
     let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        wrote.map_err(|e| e.to_string())?;
+    }
     if out.status.success() {
         Ok(())
     } else {

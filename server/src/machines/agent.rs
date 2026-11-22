@@ -674,10 +674,17 @@ fn run_cgroups(cfg: &Config) -> Result<Cgroups, String> {
     let root = Path::new("/sys/fs/cgroup");
     let own = std::fs::read_to_string("/proc/self/cgroup").map_err(|e| format!("/proc/self/cgroup: {e}"))?;
     let base = cgroup::own_base(&own, root).ok_or("this machine has no cgroup v2")?;
-    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let memory = cgroup::machine_memory(&base, root, &meminfo);
-    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+    let (cpus, memory) = machine_size(&base);
     Cgroups::setup(&base, cpus, memory)
+}
+
+/// The machine's CPUs and memory now, as its runs may use them: an Incus resize
+/// changes them under a running agent.
+fn machine_size(base: &Path) -> (u32, u64) {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let memory = cgroup::machine_memory(base, Path::new("/sys/fs/cgroup"), &meminfo);
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+    (cpus, memory)
 }
 
 /// How old the homes' measurement may get before a heartbeat starts another.
@@ -1102,13 +1109,17 @@ impl Agent {
     async fn keep_egress(self: Arc<Self>) {
         let mut first = true;
         loop {
+            // The policy is read under the lock, so a refresh never puts back one that a
+            // newer request replaced while this waited.
+            let one = self.egress_loading.lock().await;
             let p = self.egress().policy;
             if p.mode == wire::EGRESS_ALLOW_LIST {
                 let hosts = egress_allow::entries(&p.allow).is_ok_and(|e| e.iter().any(|e| matches!(e, egress_allow::Entry::Host(_))));
                 if first || hosts {
-                    self.apply_egress(p).await;
+                    self.load_egress(p).await;
                 }
             }
+            drop(one);
             first = false;
             tokio::time::sleep(EGRESS_REFRESH).await;
         }
@@ -1118,6 +1129,11 @@ impl Agent {
     /// with the list's addresses. Saved first, so a restart holds to it.
     async fn apply_egress(&self, p: wire::EgressPolicy) -> wire::EgressReport {
         let _one = self.egress_loading.lock().await;
+        self.load_egress(p).await
+    }
+
+    /// `apply_egress`, for a caller holding `egress_loading`.
+    async fn load_egress(&self, p: wire::EgressPolicy) -> wire::EgressReport {
         let mut report = wire::EgressReport { id: p.id.clone(), mode: p.mode.clone(), at: now_ms(), ..Default::default() };
         let had_list = self.egress().report.mode == wire::EGRESS_ALLOW_LIST;
         let saved = write_private(&self.cfg.state_dir.join(EGRESS_FILE), &serde_json::to_string(&p).unwrap_or_default(), 0o600);
@@ -1655,7 +1671,10 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
     };
     // A run the agent can't hold to its limits still runs, and its exit says why.
     host.limits = j.limits.map(|l| match &a.cgroups {
-        Ok(cg) => match cg.start(&j.job_id, &l) {
+        Ok(cg) => match {
+            let (cpus, memory) = machine_size(cg.base());
+            cg.resize(cpus, memory).and_then(|()| cg.start(&j.job_id, &l))
+        } {
             Ok(rc) => job::Limiting::Cgroup(Arc::new(rc)),
             Err(e) => job::Limiting::Unavailable(e),
         },

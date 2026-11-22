@@ -103,6 +103,19 @@ fn checked(body: Result<Json<Saved>, JsonRejection>, user: bool) -> Res<Saved> {
     Ok(Saved { mode, allow })
 }
 
+/// Refused when `server`'s and `own`'s entries together are more than an agent holds,
+/// which would hold every run for that user back.
+fn fits(server: &Saved, own: Option<&Saved>, whose: &str) -> Res<()> {
+    let n = resolve(server, own).allow.len();
+    if n > wire::EGRESS_MAX_ENTRIES {
+        return Err(bad(format!(
+            "{whose} would have {n} allow-list entries with the server's and their own together; a machine holds at most {}.",
+            wire::EGRESS_MAX_ENTRIES
+        )));
+    }
+    Ok(())
+}
+
 fn changes(from: &Saved, to: &Saved) -> Value {
     let added: Vec<&String> = to.allow.iter().filter(|a| !from.allow.contains(a)).collect();
     let removed: Vec<&String> = from.allow.iter().filter(|a| !to.allow.contains(a)).collect();
@@ -248,6 +261,11 @@ pub async fn get_server(AppS(app): AppS<AppState>) -> Res {
 pub async fn set_server(AppS(app): AppS<AppState>, Extension(by): Extension<Who>, body: Result<Json<Saved>, JsonRejection>) -> Res {
     enrollment(&app)?;
     let to = checked(body, false)?;
+    for u in app.db.users() {
+        if let Some(o) = own(&app, &u.id) {
+            fits(&to, Some(&o), u.email.as_deref().unwrap_or(&u.id))?;
+        }
+    }
     let from = server(&app);
     if from != to {
         app.db.set_setting(SERVER_KEY, &serde_json::to_string(&to).unwrap_or_default());
@@ -289,6 +307,7 @@ pub async fn set_user(AppS(app): AppS<AppState>, Extension(by): Extension<Who>, 
     enrollment(&app)?;
     let to = checked(body, true)?;
     let u = need_user_key(&app, &key)?;
+    fits(&server(&app), Some(&to).filter(|t| t.mode != INHERIT), "Their machine")?;
     let k = format!("{USER_KEY}{}", u.id);
     let from = load(&app, &k).unwrap_or(Saved { mode: INHERIT.into(), allow: vec![] });
     if from != to {
@@ -347,6 +366,17 @@ mod tests {
         let open = resolve(&Saved::open(), None);
         assert!(in_place(&open, None) && in_place(&open, Some(&EgressReport::default())), "never sent one: open");
         assert!(!in_place(&open, Some(&r("old", "on"))), "still holds an old list");
+    }
+
+    #[test]
+    fn the_server_and_a_user_together_fit_on_a_machine() {
+        let many = |p: &str, n: usize| Saved { mode: "allow_list".into(), allow: (0..n).map(|i| format!("{p}{i}.example.com")).collect() };
+        let full = many("s", wire::EGRESS_MAX_ENTRIES);
+        assert!(fits(&full, None, "x").is_ok());
+        assert!(fits(&full, Some(&many("s", 3)), "x").is_ok(), "the same entries count once");
+        let e = fits(&full, Some(&many("u", 1)), "ada@example.com").unwrap_err();
+        assert!(e.1.contains("ada@example.com") && e.1.contains("257"), "{}", e.1);
+        assert!(fits(&full, Some(&Saved::open()), "x").is_ok(), "open for them alone lists nothing");
     }
 
     #[test]
