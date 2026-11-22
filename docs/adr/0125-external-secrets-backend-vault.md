@@ -65,6 +65,7 @@ Failures fail closed:
 - At startup, botd lists both folders and refuses to start if Vault can't be reached or refuses it.
 - Once a cached answer is older than the cache time, a Vault that can't answer (down, sealed, a refused token, an unexpected reply) is `Error::Unavailable`. The cached value is dropped, not served stale, and the next store is **not** asked, so a sealed value Vault was meant to replace never comes back.
 - A Bot run whose secrets can't be read doesn't start (read again after any wait for a slot, so a queued run never starts with a key past its cache time, and checked just before a run on a user's machine, which inherits nothing from botd): the Bot says so in the chat, and `bot.run_refused` is audited with reason `secrets_unavailable`. Everything else that hands out Bots' environment (harness logins on machines, runs elsewhere) gets none of the server-wide secrets rather than some of them.
+- A notification whose URL, signing key or credentials can't be read isn't sent, and the send is recorded as failed: a webhook never goes out unsigned, nor mail or pushes without their credentials.
 - `GET /api/secrets` answers 503.
 
 ### Audit

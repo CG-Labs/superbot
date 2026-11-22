@@ -149,7 +149,11 @@ fn stored(name: &str) -> Option<secrets::Secret> {
 /// For sending: a secret that can't be read (an external store down, ADR 0125) refuses
 /// the send rather than counting as unset, so nothing goes out unsigned or unauthenticated.
 pub(crate) fn needed(name: &str) -> Result<Option<secrets::Secret>, String> {
-    secrets::global().get(name).map_err(|e| format!("{name} couldn't be read from the secret store ({})", e.kind()))
+    needed_from(secrets::global(), name)
+}
+
+fn needed_from(s: &secrets::Secrets, name: &str) -> Result<Option<secrets::Secret>, String> {
+    s.get(name).map_err(|e| format!("{name} couldn't be read from the secret store ({})", e.kind()))
 }
 
 pub fn secret_set(name: &str) -> bool {
