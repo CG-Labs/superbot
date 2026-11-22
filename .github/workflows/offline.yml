@@ -2,8 +2,10 @@ name: offline
 
 # Air-gapped installs (docs/adr/0128-air-gapped-self-host.md, docs/ops/air-gapped.md).
 # install-offline: builds offline bundles from this commit, then installs, upgrades and refuses a
-# downgrade with `install.sh --offline` as root inside a network namespace with no network at all,
-# and loads a bundled image into Docker the same way. Packages the bundle doesn't carry (Caddy,
+# downgrade with `install.sh --offline` as root inside a network namespace with no network at all.
+# botd and Caddy join that namespace too (a systemd drop-in), so the HTTPS checks, run from inside
+# it, show the services work with no network. It loads a bundled image into Docker the same way.
+# It runs on the oldest and newest supported Ubuntu, with binaries built on the oldest. Packages the bundle doesn't carry (Caddy,
 # sqlite3, ...) are installed first, as an operator would from their own mirror.
 # release-bundle (manual): bundles a published release's signed images for each arch, signs each
 # bundle with cosign keylessly under this workflow's identity, and attaches both to the release.
@@ -54,7 +56,12 @@ concurrency:
 jobs:
   install-offline:
     if: github.event_name != 'workflow_dispatch'
-    runs-on: ubuntu-24.04
+    name: install-offline (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -105,11 +112,24 @@ jobs:
           echo '127.0.0.1 offline.test' | sudo tee -a /etc/hosts >/dev/null
           # The installer would take an existing botd's place; this runner has none.
           if id superbot 2>/dev/null; then exit 1; fi
+      - name: A network namespace with only loopback, for the installer, botd and Caddy
+        run: |
+          set -euo pipefail
+          sudo ip netns add offline
+          sudo ip -n offline link set lo up
+          for unit in superbot caddy; do
+            sudo mkdir -p "/etc/systemd/system/$unit.service.d"
+            printf '[Service]\nNetworkNamespacePath=/run/netns/offline\n' \
+              | sudo tee "/etc/systemd/system/$unit.service.d/zz-offline-ci.conf" >/dev/null
+          done
+          sudo systemctl daemon-reload
+          sudo systemctl restart caddy
+          [[ $(sudo readlink "/proc/$(systemctl show -p MainPID --value caddy)/ns/net") == $(sudo ip netns exec offline readlink /proc/self/ns/net) ]]
       - name: Install from the bundle with no network
         run: |
           set -euo pipefail
           arch=$(uname -m)
-          sudo unshare --net -- bash -c '
+          sudo ip netns exec offline bash -c '
             set -euo pipefail
             if curl -sS --max-time 5 https://github.com >/dev/null 2>&1; then echo "the network is still up" >&2; exit 1; fi
             bash "$1" --offline "$2" --domain offline.test --tls-cert "$3" --tls-key "$4" \
@@ -121,6 +141,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo systemctl is-active --quiet superbot
+          [[ $(sudo readlink "/proc/$(systemctl show -p MainPID --value superbot)/ns/net") == $(sudo ip netns exec offline readlink /proc/self/ns/net) ]]
+          curl() { sudo ip netns exec offline curl "$@"; }
           for _ in $(seq 1 30); do
             curl -fsS --cacert "$RUNNER_TEMP/tls.pem" https://offline.test/healthz >/dev/null 2>&1 && break
             sleep 1
@@ -142,8 +164,9 @@ jobs:
         run: |
           set -euo pipefail
           arch=$(uname -m)
+          curl() { sudo ip netns exec offline curl "$@"; }
           before=$(sudo systemctl show -p ExecMainStartTimestampMonotonic --value superbot)
-          sudo unshare --net -- bash deploy/install.sh --offline "$RUNNER_TEMP/b/superbot-offline-$NEW-$arch.tar.gz" --upgrade \
+          sudo ip netns exec offline bash deploy/install.sh --offline "$RUNNER_TEMP/b/superbot-offline-$NEW-$arch.tar.gz" --upgrade \
             --domain offline.test --tls-cert "$RUNNER_TEMP/tls.pem" --tls-key "$RUNNER_TEMP/tls.key" --non-interactive --tz UTC \
             | tee /tmp/offline-upgrade.log
           grep -Fq "Offline upgrade: $OLD -> $NEW" /tmp/offline-upgrade.log
@@ -154,7 +177,7 @@ jobs:
             sleep 1
           done
           curl -fsS --cacert "$RUNNER_TEMP/tls.pem" https://offline.test/healthz
-          if sudo unshare --net -- bash deploy/install.sh --offline "$RUNNER_TEMP/b/superbot-offline-$OLD-$arch.tar.gz" --upgrade \
+          if sudo ip netns exec offline bash deploy/install.sh --offline "$RUNNER_TEMP/b/superbot-offline-$OLD-$arch.tar.gz" --upgrade \
             --domain offline.test --tls-cert "$RUNNER_TEMP/tls.pem" --tls-key "$RUNNER_TEMP/tls.key" --non-interactive --tz UTC \
             >/tmp/offline-downgrade.log 2>&1; then
             echo "a downgrade was allowed" >&2; exit 1
@@ -182,9 +205,9 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
           - arch: aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:

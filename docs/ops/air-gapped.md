@@ -22,7 +22,7 @@ The installer refuses a bundle unless every file in it is listed in `SHA256SUMS`
 
 ## Before you start
 
-The bundle carries SuperBot, not the operating system. Install these on the server first, from your own package mirror (Ubuntu 22.04 or 24.04):
+The bundle carries SuperBot, not the operating system. Install these on the server first, from your own package mirror (Ubuntu 22.04 or 24.04; release bundles are built on 22.04, so their binaries run on both):
 
 - Always: `sudo`, `openssl`, `sqlite3`, `tar`, `coreutils`, `systemd`.
 - Per-user accounts (on by default): `acl` (for `setfacl`).

@@ -1509,6 +1509,10 @@ check_tls_files() {
   openssl pkey -in "$TLS_KEY" -noout 2>/dev/null || die "--tls-key: $TLS_KEY isn't a PEM private key (or it has a passphrase, which Caddy can't use)"
   [[ "$(openssl x509 -in "$TLS_CERT" -noout -pubkey)" == "$(openssl pkey -in "$TLS_KEY" -pubout)" ]] \
     || die "--tls-key doesn't match --tls-cert"
+  local not_before
+  not_before=$(openssl x509 -in "$TLS_CERT" -noout -startdate | sed 's/^notBefore=//')
+  (($(date -u -d "$not_before" +%s) <= $(date -u +%s) + 300)) \
+    || die "--tls-cert isn't valid until $not_before: install it then, keeping the current one until that date"
   openssl x509 -in "$TLS_CERT" -noout -checkend 0 >/dev/null || die "--tls-cert has expired"
   openssl x509 -in "$TLS_CERT" -noout -checkend $((30 * 86400)) >/dev/null || warn "--tls-cert ends within 30 days: renew it and re-run the installer"
   [[ "$(openssl x509 -in "$TLS_CERT" -noout -checkhost "$DOMAIN")" == *"does match"* ]] \
@@ -1627,6 +1631,37 @@ cleanup_offline() {
 
 offline_release_file() { printf '%s\n' "${OFFLINE_RELEASE_FILE:-$SHARE_DIR/offline-release}"; }
 
+# SemVer 2.0.0 precedence, build metadata ignored: 0.1.0-rc.1 < 0.1.0 < 0.1.1, and
+# 0.1.0-ci.2 < 0.1.0-ci.10. `sort -V` gets the first one backwards.
+semver_gt() {
+  local a=${1%%+*} b=${2%%+*} i x y
+  local -a ca cb pa=() pb=()
+  IFS=. read -ra ca <<<"${a%%-*}"
+  IFS=. read -ra cb <<<"${b%%-*}"
+  for i in 0 1 2; do
+    x=$((10#${ca[i]:-0})) y=$((10#${cb[i]:-0}))
+    ((x == y)) || { ((x > y)); return; }
+  done
+  [[ "$a" == *-* ]] && IFS=. read -ra pa <<<"${a#*-}"
+  [[ "$b" == *-* ]] && IFS=. read -ra pb <<<"${b#*-}"
+  ((${#pa[@]} || ${#pb[@]})) || return 1
+  ((${#pa[@]})) || return 0
+  ((${#pb[@]})) || return 1
+  for ((i = 0; i < ${#pa[@]} && i < ${#pb[@]}; i++)); do
+    x=${pa[i]} y=${pb[i]}
+    [[ "$x" == "$y" ]] && continue
+    if [[ "$x" =~ ^[0-9]+$ && "$y" =~ ^[0-9]+$ ]]; then
+      ((10#$x > 10#$y)); return
+    elif [[ "$x" =~ ^[0-9]+$ ]]; then
+      return 1
+    elif [[ "$y" =~ ^[0-9]+$ ]]; then
+      return 0
+    fi
+    [[ "$x" > "$y" ]]; return
+  done
+  ((${#pa[@]} > ${#pb[@]}))
+}
+
 # Unpacks into a root-owned folder (Caddy's files are copied from it as the service user, who
 # can read but not change it) and refuses an older version than the one installed: a newer
 # database may not open with older binaries. Restore a backup to go back.
@@ -1645,8 +1680,7 @@ prepare_offline() {
   release=$(offline_release_file)
   if [[ -f "$release" ]]; then
     installed=$(manifest_value "$release" version)
-    if [[ -n "$installed" && "$installed" != "$OFFLINE_VERSION" &&
-      "$(printf '%s\n%s\n' "$installed" "$OFFLINE_VERSION" | sort -V | tail -n 1)" == "$installed" ]]; then
+    if [[ -n "$installed" ]] && semver_gt "$installed" "$OFFLINE_VERSION"; then
       die "This host runs $installed, newer than the bundle's $OFFLINE_VERSION. To go back, restore a backup made on $OFFLINE_VERSION (docs/ops/air-gapped.md#upgrading)."
     fi
     log "Offline upgrade: ${installed:-unknown} -> $OFFLINE_VERSION"

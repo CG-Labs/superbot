@@ -42,6 +42,9 @@ for f in MANIFEST SHA256SUMS bin/botd bin/botctl deploy/install.sh deploy/offlin
 done
 owners=$(tar -tvf "$B" | awk '{ print $2 }' | sort -u)
 [[ "$owners" == "0/0" ]] || fail "bundle entries should be owned by 0/0, not $owners"
+for f in deploy/install.sh deploy/offline-bundle.sh docker/init.sh; do
+  [[ "$(tar -tvf "$B" "superbot-offline-$VERSION-$ARCH/$f" | cut -c1-10)" == -rwxr-xr-x ]] || fail "$f isn't executable in the bundle"
+done
 "$DIR/offline-bundle.sh" verify "$B" >"$T/verify.log" 2>&1 || { cat "$T/verify.log" >&2; fail "a good bundle didn't verify"; }
 grep -q "version=$VERSION" "$T/verify.log" || fail "verify didn't show the manifest"
 ok "a bundle builds, with binaries, templates, the client, the site and Compose files, and verifies"
@@ -127,16 +130,32 @@ ok "verify reads any arch's bundle; the installer takes only this host's"
 
 # Versions: same or newer installs; older is refused.
 release="$T/offline-release"
-for installed in "$VERSION" 0.0.9 9.9.9; do
+for installed in "$VERSION" 0.0.9 0.1.0-rc.1 0.1.0 9.9.9; do
   printf 'format=1\nversion=%s\n' "$installed" >"$release"
+  newer=false
+  [[ "$installed" != 0.1.0 && "$installed" != 9.9.9 ]] || newer=true
   if (DRY_RUN=true OFFLINE_BUNDLE=$B OFFLINE_RELEASE_FILE=$release prepare_offline) >"$T/prep.log" 2>&1; then
-    [[ "$installed" != 9.9.9 ]] || fail "a downgrade from 9.9.9 to $VERSION was allowed"
+    [[ "$newer" == false ]] || fail "a downgrade from $installed to $VERSION was allowed"
   else
-    [[ "$installed" == 9.9.9 ]] || { cat "$T/prep.log" >&2; fail "installing $VERSION over $installed was refused"; }
+    [[ "$newer" == true ]] || { cat "$T/prep.log" >&2; fail "installing $VERSION over $installed was refused"; }
     grep -q "newer than the bundle's $VERSION" "$T/prep.log" || fail "the downgrade refusal didn't say why"
   fi
 done
 ok "a bundle installs over the same or an older version, never a newer one"
+
+# SemVer precedence, both ways round.
+order=(0.0.9 0.1.0-alpha 0.1.0-alpha.1 0.1.0-alpha.beta 0.1.0-ci.2 0.1.0-ci.10 0.1.0-rc.1 0.1.0 0.1.1 0.2.0 0.10.0 1.0.0)
+for ((i = 0; i < ${#order[@]}; i++)); do
+  for ((j = 0; j < ${#order[@]}; j++)); do
+    if ((i > j)); then
+      semver_gt "${order[i]}" "${order[j]}" || fail "${order[i]} should be newer than ${order[j]}"
+    else
+      ! semver_gt "${order[i]}" "${order[j]}" || fail "${order[i]} shouldn't be newer than ${order[j]}"
+    fi
+  done
+done
+! semver_gt 0.1.0+b.2 0.1.0+b.1 || fail "build metadata changed the order"
+ok "versions order as SemVer: a release candidate upgrades to its release, never back"
 
 # Flags that can't work offline.
 flags() {
@@ -170,7 +189,17 @@ grep -q "isn't a PEM certificate" <<<"$(tls "$T/good.key" "$T/good.key" || true)
 grep -q "both --tls-cert and --tls-key" <<<"$( (TLS_CERT=$T/good.pem TLS_KEY="" DOMAIN=offline.test; check_tls_files) 2>&1 || true)" || fail "a certificate without a key was accepted"
 cert offline.test soon 10
 grep -q "ends within 30 days" <<<"$(tls "$T/soon.pem" "$T/soon.key")" || fail "no warning for a certificate about to end"
-ok "an operator certificate must be PEM, a pair, and for --domain; one about to end is a warning"
+mkdir -p "$T/ca/new"
+: >"$T/ca/index.txt"
+printf '%s\n' '[ca]' 'default_ca = d' '[d]' "database = $T/ca/index.txt" "new_certs_dir = $T/ca/new" \
+  "serial = $T/ca/serial" 'default_md = sha256' 'policy = p' 'copy_extensions = copy' '[p]' 'commonName = supplied' >"$T/ca/ca.cnf"
+echo 01 >"$T/ca/serial"
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=offline.test \
+  -addext subjectAltName=DNS:offline.test -keyout "$T/future.key" -out "$T/future.csr" 2>/dev/null
+openssl ca -batch -selfsign -config "$T/ca/ca.cnf" -keyfile "$T/future.key" -in "$T/future.csr" \
+  -startdate 20990101000000Z -enddate 20991231000000Z -out "$T/future.pem" >/dev/null 2>&1 || fail "couldn't make a future certificate"
+grep -q "isn't valid until" <<<"$(tls "$T/future.pem" "$T/future.key" || true)" || fail "a certificate that starts in 2099 was accepted"
+ok "an operator certificate must be PEM, a pair, for --domain, and valid now; one about to end is a warning"
 
 # The Caddyfile: unchanged without a certificate, no CA and no OCSP with one.
 plain=$(render_caddyfile bots.example.com 127.0.0.1:3000 /var/www/superbot-app /var/www/superbot-site)

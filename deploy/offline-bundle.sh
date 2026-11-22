@@ -28,6 +28,8 @@ cargo_version() {
   awk -F'"' '/^\[package\]/ { p = 1; next } /^\[/ { p = 0 } p && /^version *=/ { print $2; exit }' "$1/server/Cargo.toml"
 }
 
+script_mode() { [[ "$1" == *.sh ]] && echo 0755 || echo 0644; }
+
 # Copies a folder of plain files, refusing links and anything else.
 copy_plain_tree() {
   local src=$1 dest=$2 odd
@@ -115,10 +117,10 @@ cmd_build() {
     install -m 0755 "$bin_dir/$f" "$stage/bin/$f"
   done
   for f in "${DEPLOY_FILES[@]}" install.sh offline-bundle.sh; do
-    install -m 0644 "$root/deploy/$f" "$stage/deploy/$f"
+    install -m "$(script_mode "$f")" "$root/deploy/$f" "$stage/deploy/$f"
   done
   for f in "${DOCKER_FILES[@]}"; do
-    install -m 0644 "$root/deploy/docker/$f" "$stage/docker/$f"
+    install -m "$(script_mode "$f")" "$root/deploy/docker/$f" "$stage/docker/$f"
   done
   install -m 0644 "$root/.env.example" "$stage/env.example"
   copy_plain_tree "$root/site" "$stage/site"
