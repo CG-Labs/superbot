@@ -1224,18 +1224,36 @@ fn license_summary(l: &Value) -> String {
     out
 }
 
-/// `GET /api/sso/{id}/saml`, for a terminal (ADR 0127): what the IdP admin enters, then what the IdP said.
+/// `GET /api/sso/{id}/saml`, for a terminal (ADR 0127, 0137): what the IdP admin enters, then what the IdP said.
 fn saml_summary(v: &Value) -> String {
     let s = |k: &str| v[k].as_str().unwrap_or("-").to_string();
     let mut out = format!(
-        "{} ({}): {}\n  SP entity ID (audience):  {}\n  ACS URL (reply URL):      {}\n  SP metadata:              {}\n  IdP entity ID:            {}\n",
+        "{} ({}): {}\n  SP entity ID (audience):  {}\n  ACS URL (reply URL):      {}\n  SLO URL (logout URL):     {}\n  SP metadata:              {}\n  IdP entity ID:            {}\n",
         s("label"),
         s("provider"),
         v["problem"].as_str().unwrap_or("ready"),
         s("spEntityId"),
         s("acsUrl"),
+        s("sloUrl"),
         s("metadataUrl"),
         s("idpEntityId"),
+    );
+    let key = &v["spKey"];
+    if let Some(c) = key["certificate"].as_object() {
+        out += &format!(
+            "  SP signing certificate:   SHA-256 {} ({}), expires {}\n",
+            c["sha256"].as_str().unwrap_or_default(),
+            key["from"].as_str().unwrap_or_default(),
+            day(&c["notAfter"])
+        );
+    } else if let Some(p) = key["problem"].as_str() {
+        out += &format!("  SP signing key:           {p}\n");
+    }
+    let yes = |b: bool| if b { "yes" } else { "no" };
+    out += &format!(
+        "  Signs AuthnRequests:      {}\n  Single logout:            {}\n",
+        yes(v["signRequests"].as_bool().unwrap_or(false)),
+        if v["singleLogout"].as_bool().unwrap_or(false) { "yes" } else { "no (the IdP's metadata has no HTTP-Redirect SingleLogoutService)" }
     );
     let from = v["from"].as_str().map(|f| format!(" ({f})")).unwrap_or_default();
     out += &format!("  IdP metadata from {}{from}", s("source"));
@@ -1245,15 +1263,17 @@ fn saml_summary(v: &Value) -> String {
         return out;
     }
     out += &format!(":\n    Sign-in URL: {}\n", idp["ssoUrl"].as_str().unwrap_or_default());
+    if let Some(slo) = idp["sloUrl"].as_str() {
+        out += &format!("    Logout URL:  {slo}\n");
+    }
     for c in idp["certificates"].as_array().into_iter().flatten() {
-        out += &format!(
-            "    Certificate SHA-256 {} ({}), expires {}\n",
-            c["sha256"].as_str().unwrap_or_default(),
-            c["subject"].as_str().unwrap_or_default(),
-            chrono::DateTime::from_timestamp_millis(c["notAfter"].as_i64().unwrap_or_default()).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default()
-        );
+        out += &format!("    Certificate SHA-256 {} ({}), expires {}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]));
     }
     out
+}
+
+fn day(ms: &Value) -> String {
+    chrono::DateTime::from_timestamp_millis(ms.as_i64().unwrap_or_default()).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default()
 }
 
 /// One line per user: their plan, each limit as used/allowed, their machine, their
@@ -2197,9 +2217,17 @@ mod tests {
         let out = saml_summary(&v);
         assert!(out.contains("ACS URL (reply URL):      https://bots.example/api/auth/sso/corp/acs"), "{out}");
         assert!(out.contains("from botctl: not loaded yet."), "{out}");
-        v["idp"] = json!({ "ssoUrl": "https://idp.example/sso", "certificates": [{ "sha256": "ab:cd", "subject": "CN=idp", "notAfter": 1_900_000_000_000_i64 }] });
+        assert!(out.contains("Signs AuthnRequests:      no") && out.contains("Single logout:            no ("), "{out}");
+        v["idp"] = json!({ "ssoUrl": "https://idp.example/sso", "sloUrl": "https://idp.example/slo", "certificates": [{ "sha256": "ab:cd", "subject": "CN=idp", "notAfter": 1_900_000_000_000_i64 }] });
+        v["sloUrl"] = json!("https://bots.example/api/auth/sso/corp/slo");
+        v["signRequests"] = json!(true);
+        v["singleLogout"] = json!(true);
+        v["spKey"] = json!({ "from": "generated", "certificate": { "sha256": "12:34", "subject": "CN=sp", "notAfter": 1_900_000_000_000_i64 } });
         let out = saml_summary(&v);
         assert!(out.contains("Certificate SHA-256 ab:cd (CN=idp), expires 2030-03-17"), "{out}");
+        assert!(out.contains("SLO URL (logout URL):     https://bots.example/api/auth/sso/corp/slo") && out.contains("    Logout URL:  https://idp.example/slo"), "{out}");
+        assert!(out.contains("SP signing certificate:   SHA-256 12:34 (generated), expires 2030-03-17"), "{out}");
+        assert!(out.contains("Signs AuthnRequests:      yes") && out.contains("Single logout:            yes\n"), "{out}");
     }
 
     #[test]
