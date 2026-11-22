@@ -416,6 +416,7 @@ pub async fn leave(app: &AppState, by: &Who, team_id: &str, user_id: &str, reaso
     if !app.db.remove_team_member(team_id, user_id, reason != "team_deleted" && reason != SCIM) {
         return false;
     }
+    crate::scim::roles::left(app, by, team_id, user_id).await;
     let mates: HashSet<String> = app.db.team_members(team_id).into_iter().map(|m| m.user_id).collect();
     let mut touched = Vec::new();
     for bot in app.db.bots() {
@@ -445,7 +446,6 @@ pub async fn leave(app: &AppState, by: &Who, team_id: &str, user_id: &str, reaso
         crate::acl_changed(app, by, id, true).await;
     }
     app.db.record(&team_event(by, "team.member_left", team_id, json!({ "user": user_id, "role": member.role, "reason": reason })));
-    crate::scim::roles::left(app, by, team_id, user_id).await;
     release(app, by, team_id, user_id).await;
     crate::team_billing::member_changed(app, team_id, user_id, &tier, "left");
     app.send(json!({ "type": "resync" }));

@@ -73,6 +73,12 @@ fn role_error(e: RoleError) -> ApiError {
         RoleError::NotFound => not_found("Role"),
         RoleError::InUse(n) => conflict(format!("{n} {} still {} this role. Take it away from them first.", if n == 1 { "person" } else { "people" }, if n == 1 { "has" } else { "have" })),
         RoleError::Mapped(n) => conflict(format!("{n} SCIM {} to this role. Remove {} first.", if n == 1 { "group is mapped" } else { "groups are mapped" }, if n == 1 { "that mapping" } else { "those mappings" })),
+        RoleError::Reaches { mapping, scope, perms } => conflict(format!(
+            "A SCIM group is mapped to this role {}, where {} would act on admins. Remove mapping {mapping} first, or leave {} out.",
+            if scope == "org" { "across the server" } else { "in its team" },
+            perms.join(" and "),
+            if perms.len() == 1 { "it" } else { "them" },
+        )),
         RoleError::Db(e) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
@@ -170,21 +176,6 @@ pub async fn update(State(app): State<AppState>, Extension(by): Extension<Who>, 
     let description = v.get("description").map(parse_description).transpose()?;
     let base = (!v["base"].is_null()).then(|| parse_base(&v["base"])).transpose()?.filter(|b| *b != before.base);
     let perms = (!v["permissions"].is_null()).then(|| parse_perms(&v["permissions"])).transpose()?;
-    if let Some(p) = &perms {
-        let new = Perms::from_names(p.iter().copied());
-        for m in app.db.scim_role_mappings_of_role(&before.id) {
-            let reach = new.reaching_admins(m.scope == crate::scim::roles::TEAM);
-            if !reach.is_empty() {
-                return Err(conflict(format!(
-                    "A SCIM group is mapped to this role {}, where {} would act on admins. Remove mapping {} first, or leave {} out.",
-                    if m.scope == "org" { "across the server" } else { "in its team" },
-                    reach.join(" and "),
-                    m.id,
-                    if reach.len() == 1 { "it" } else { "them" },
-                )));
-            }
-        }
-    }
     let moved = app.db.update_custom_role(&before.id, name.as_deref(), description.as_deref(), base, perms.as_deref()).map_err(role_error)?;
     let after = need_role(&app, &before.id)?;
     let mut changes = serde_json::Map::new();

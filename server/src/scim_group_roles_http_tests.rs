@@ -112,7 +112,7 @@ async fn mappings_are_off_by_default_and_never_reach_admins() {
     }
     let refused = events(port, &admin, "action=scim.role_map_refused").await;
     let reasons: Vec<&str> = refused.iter().map(|e| e["details"]["reason"].as_str().unwrap()).collect();
-    assert_eq!(reasons, ["reaches_admins", "reaches_admins", "reaches_admins", "admin", "admin"], "newest first");
+    assert_eq!(reasons, ["reaches_admins", "reaches_admins", "reaches_admins", "built_in", "admin", "admin"], "newest first");
     assert_eq!(refused[0]["outcome"], "denied");
     assert_eq!(refused[0]["details"]["permissions"], json!(["machines.manage"]));
 

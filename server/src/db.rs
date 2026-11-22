@@ -781,7 +781,18 @@ pub enum RoleError {
     InUse(usize),
     /// This many SCIM groups map to it (ADR 0138).
     Mapped(usize),
+    /// A SCIM group maps to it in `scope`, where these permissions would reach admins.
+    Reaches { mapping: String, scope: String, perms: Vec<&'static str> },
     Db(String),
+}
+
+/// A custom role's permissions, read in `c`'s transaction. None: no such role.
+fn role_perms_in(c: &Connection, role_id: &str) -> rusqlite::Result<Option<crate::rbac::Perms>> {
+    let json: Option<String> = c.query_row("SELECT permissions FROM roles WHERE id = ?", [role_id], |r| r.get(0)).optional()?;
+    Ok(json.map(|j| {
+        let names: Vec<String> = serde_json::from_str(&j).unwrap_or_default();
+        crate::rbac::Perms::from_names(names.iter().map(String::as_str))
+    }))
 }
 
 /// A request for access from the public sign-up form (ADR 0022).
@@ -1647,6 +1658,8 @@ pub enum ScimRoleMapError {
     Taken,
     /// The group's link, or the role, went meanwhile.
     Gone,
+    /// The role holds these permissions, which reach admins in the scope.
+    Reaches(Vec<&'static str>),
     Db(String),
 }
 
@@ -4579,6 +4592,16 @@ impl Db {
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(|e| RoleError::Db(e.to_string()))?;
         let at = now();
+        // In the same transaction as the write, so a mapping made meanwhile is seen (ADR 0138).
+        if let Some(v) = permissions {
+            let new = crate::rbac::Perms::from_names(v.iter().copied());
+            let mut st = tx.prepare("SELECT id, scope FROM scim_role_mappings WHERE role_id = ? ORDER BY created_at, id").map_err(|e| RoleError::Db(e.to_string()))?;
+            let maps = st.query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>).map_err(|e| RoleError::Db(e.to_string()))?;
+            drop(st);
+            if let Some((mapping, scope, perms)) = maps.into_iter().map(|(m, sc)| { let p = new.reaching_admins(sc == "team"); (m, sc, p) }).find(|(_, _, p)| !p.is_empty()) {
+                return Err(RoleError::Reaches { mapping, scope, perms });
+            }
+        }
         let res = (|| {
             if tx.execute("UPDATE roles SET updated_at = ?1 WHERE id = ?2", params![at, id])? == 0 {
                 return Ok(None);
@@ -4719,11 +4742,17 @@ impl Db {
         s.query_map([role_id], scim_role_mapping_row).unwrap().filter_map(Result::ok).collect()
     }
 
-    /// Maps the group `team_id` is in `tenant` to a role, while both still exist.
+    /// Maps the group `team_id` is in `tenant` to a role, while both still exist and the
+    /// role's permissions, as they are now, don't reach admins in `scope`.
     pub fn create_scim_role_mapping(&self, tenant: &str, team_id: &str, role_id: &str, scope: &str, by: Option<&str>) -> Result<ScimRoleMapping, ScimRoleMapError> {
         let id = format!("sm{}", crate::random_hex(5));
-        let n = self
-            .c()
+        let c = self.c();
+        let perms = role_perms_in(&c, role_id).map_err(|e| ScimRoleMapError::Db(e.to_string()))?.ok_or(ScimRoleMapError::Gone)?;
+        let reach = perms.reaching_admins(scope == "team");
+        if !reach.is_empty() {
+            return Err(ScimRoleMapError::Reaches(reach));
+        }
+        let n = c
             .execute(
                 "INSERT INTO scim_role_mappings (id, tenant, team_id, role_id, scope, created_at, created_by)
                  SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
@@ -4731,6 +4760,7 @@ impl Db {
                 params![id, tenant, team_id, role_id, scope, now(), by],
             )
             .map_err(|e| if constraint(&e) { ScimRoleMapError::Taken } else { ScimRoleMapError::Db(e.to_string()) })?;
+        drop(c);
         if n == 0 {
             return Err(ScimRoleMapError::Gone);
         }
@@ -4765,6 +4795,9 @@ impl Db {
         let at = now();
         let on_team = "EXISTS (SELECT 1 FROM team_members WHERE team_id = ?3 AND user_id = ?2) AND EXISTS (SELECT 1 FROM roles WHERE id = ?1)";
         let res = (|| {
+            if role_perms_in(&tx, &m.role_id)?.is_none_or(|p| !p.reaching_admins(m.scope == "team").is_empty()) {
+                return Ok(false);
+            }
             let prior: Option<String> = tx.query_row("SELECT role FROM users WHERE id = ?", [user_id], |r| r.get(0)).optional()?;
             let n = if m.scope == "org" {
                 tx.execute(
@@ -4793,10 +4826,15 @@ impl Db {
     /// Takes away what the mapping gave `user_id`, and forgets the grant, in one
     /// transaction. Only a role they still hold from it is cleared; across the server their
     /// built-in role goes back to the one they had before. None if it gave them nothing.
-    pub fn revoke_scim_role(&self, m: &ScimRoleMapping, user_id: &str) -> Option<ScimRevoked> {
+    /// `left`: they left the group, so nothing is taken if they're on its team again (a
+    /// join that raced the leave holds the grant now).
+    pub fn revoke_scim_role(&self, m: &ScimRoleMapping, user_id: &str, left: bool) -> Option<ScimRevoked> {
         let c = self.c();
         let tx = c.unchecked_transaction().ok()?;
         let res = (|| {
+            if left && tx.query_row("SELECT EXISTS (SELECT 1 FROM team_members WHERE team_id = ?1 AND user_id = ?2)", [&m.team_id, user_id], |r| r.get::<_, bool>(0))? {
+                return Ok(None);
+            }
             let prior: Option<Option<String>> =
                 tx.query_row("DELETE FROM scim_role_grants WHERE mapping_id = ?1 AND user_id = ?2 RETURNING prior_role", [&m.id, user_id], |r| r.get(0)).optional()?;
             let Some(prior) = prior else { return Ok(None) };
@@ -8839,26 +8877,35 @@ mod tests {
         assert!(!db.grant_scim_role(&org, &a.id), "once");
         assert!(db.set_user_custom_role(&b.id, &hand.id));
         assert!(!db.grant_scim_role(&org, &b.id), "never over a role given by hand");
-        let back = db.revoke_scim_role(&org, &a.id).unwrap();
+        assert!(matches!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view", "bots.manage"])), Err(RoleError::Reaches { .. })), "checked as it's saved");
+        assert!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view"])).is_ok());
+        let back = db.revoke_scim_role(&org, &a.id, false).unwrap();
         assert_eq!((back.cleared, back.role_before, back.role_after), (true, Some(Role::Member), Some(Role::Readonly)));
         assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Readonly, None));
-        assert!(db.revoke_scim_role(&org, &a.id).is_none());
+        assert!(db.revoke_scim_role(&org, &a.id, false).is_none());
 
         // Given by hand after SCIM gave one: SCIM's claim ends and nothing is taken back.
         assert!(db.grant_scim_role(&org, &a.id));
         assert!(db.set_user_custom_role(&a.id, &hand.id));
-        assert!(db.revoke_scim_role(&org, &a.id).is_none());
+        assert!(db.revoke_scim_role(&org, &a.id, false).is_none());
         assert_eq!(db.user(&a.id).unwrap().role_id, Some(hand.id.clone()));
 
         let in_team = db.create_scim_role_mapping("okta", &team.id, &r.id, "team", None).unwrap();
         assert!(db.grant_scim_role(&in_team, &b.id));
         assert_eq!(db.team_member(&b.id).unwrap().role_id, Some(r.id.clone()));
+        assert!(db.revoke_scim_role(&in_team, &b.id, true).is_none(), "a leave that a rejoin overtook takes nothing");
+        assert_eq!(db.team_member(&b.id).unwrap().role_id, Some(r.id.clone()));
         assert_eq!(db.take_over_scim_grant(&b.id, "team"), Some(in_team.id.clone()));
-        assert!(db.revoke_scim_role(&in_team, &b.id).is_none());
+        assert!(db.revoke_scim_role(&in_team, &b.id, false).is_none());
         assert_eq!(db.team_member(&b.id).unwrap().role_id, Some(r.id.clone()), "kept by hand");
         assert!(db.remove_team_member(&team.id, &b.id, false));
         assert!(!db.grant_scim_role(&in_team, &b.id), "only on the team");
 
+        let wide = db.create_custom_role("Wide", "", Role::Member, &["bots.manage"], None).unwrap();
+        let ops = db.create_team("Ops2", None);
+        db.link_scim_group("okta", &ops.id, None, "Ops2", None).unwrap();
+        assert_eq!(db.create_scim_role_mapping("okta", &ops.id, &wide.id, "org", None).err(), Some(ScimRoleMapError::Reaches(vec!["bots.manage"])));
+        assert!(db.create_scim_role_mapping("okta", &ops.id, &wide.id, "team", None).is_ok(), "bots.manage means nothing in a team");
         assert_eq!(db.delete_custom_role(&r.id), Err(RoleError::Mapped(2)));
         assert!(db.delete_scim_role_mapping(&org.id));
         assert!(db.scim_role_grants(&org.id).is_empty());

@@ -34,7 +34,7 @@ A mapping is refused (400, audited as `scim.role_map_refused`) when the role is:
 
 The other delegable permissions keep holders away from admins by ADR 0123's limits on delegates (`users.manage` can't touch an admin, the owner or a custom-role holder, nor make an admin; `audit.view`, `billing.manage` and `signups.approve` act on no one's account, and approving a sign-up can't make an admin). So a mapped role, held by anyone the IdP puts in the group, can never reach an admin or make one.
 
-A role that is mapped can't later gain such a permission (`PATCH /api/roles/{id}` is 409, naming the mapping), and can't be deleted (409) until its mappings are removed.
+A role that is mapped can't later gain such a permission (`PATCH /api/roles/{id}` is 409, naming the mapping), and can't be deleted (409) until its mappings are removed. The database checks the role's permissions as they are at the moment of each write: saving a mapping, saving a role's permissions (against the mappings saved by then), and each grant. A role edit racing a new mapping therefore can't slip such a permission through. Refusals give `reason` `admin`, `built_in` or `reaches_admins`.
 
 ### Who gets it
 
@@ -57,7 +57,7 @@ Across the server, losing the role puts back the built-in role from before it wa
 
 ### When it's taken away
 
-- They leave the group's team, by any path: SCIM removing them, a SCIM `DELETE` of the user, a team admin's or server admin's removal (`teams::leave`).
+- They leave the group's team, by any path: SCIM removing them, a SCIM `DELETE` of the user, a team admin's or server admin's removal (`teams::leave`, right after the membership row goes, before the rest of offboarding). If SCIM puts them back on the team before that revoke runs, the revoke takes nothing, so the rejoin keeps the role.
 - The mapping is removed (`DELETE /api/scim/role-mappings/{id}`): everyone it gave the role to loses it.
 - The group goes: the IdP deletes it (members leave first, then remaining mappings go) or an admin unlinks it (mappings go, people stay on the team). Deleting the team deletes its mappings.
 

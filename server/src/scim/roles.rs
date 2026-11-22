@@ -113,7 +113,7 @@ fn skipped(app: &AppState, by: &Who, m: &ScimRoleMapping, role: &CustomRole, use
 /// Takes away what the mapping gave `user_id`. Across the server their built-in role goes
 /// back to the one they had before. Whether it had given them anything.
 async fn take_away(app: &AppState, by: &Who, m: &ScimRoleMapping, user_id: &str, reason: &str) -> bool {
-    let Some(r) = app.db.revoke_scim_role(m, user_id) else { return false };
+    let Some(r) = app.db.revoke_scim_role(m, user_id, reason == LEFT_GROUP) else { return false };
     let role = app.db.custom_role(&m.role_id);
     let mut d = json!({ "name": role.as_ref().map(|r| r.name.clone()), "user": user_id, "scope": m.scope, "via": "scim", "mapping": m.id, "tenant": m.tenant, "reason": reason, "held": r.cleared });
     if m.scope == TEAM {
@@ -217,12 +217,16 @@ pub async fn create(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
     let key = v["role"].as_str().map(str::trim).filter(|k| !k.is_empty()).ok_or_else(|| bad("role must be a custom role's id or name"))?;
     match Role::parse(key) {
         Some(Role::Admin) => return Err(refused(&app, &by, "admin", json!({ "role": key, "scope": scope }), "A SCIM group can never be mapped to admin. Give admin by hand.".into())),
-        Some(_) => return Err(bad("A SCIM group maps only to a custom role. Members join with their built-in role as it is.")),
+        Some(_) => {
+            let msg = "A SCIM group maps only to a custom role. Members join with their built-in role as it is.".into();
+            return Err(refused(&app, &by, "built_in", json!({ "role": key, "scope": scope }), msg));
+        }
         None => {}
     }
+    let team = v["team"].as_str().map(str::trim).unwrap_or_default();
+    let _writes = a.scim.group_writes.lock().await;
     let role = app.db.find_custom_role(key).ok_or_else(|| not_found("Role"))?;
-    let reach = reaching(&role, scope);
-    if !reach.is_empty() {
+    let reaches = |role: &CustomRole, reach: Vec<&'static str>| {
         let d = json!({ "role": { "id": role.id, "name": role.name }, "scope": scope, "permissions": reach });
         let msg = format!(
             "{} holds {}, which {} on admins, so a SCIM group can't be given it {}. Give it by hand, or map a role without {}.",
@@ -232,16 +236,21 @@ pub async fn create(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
             if scope == ORG { "across the server" } else { "in a team" },
             if reach.len() == 1 { "it" } else { "them" },
         );
-        return Err(refused(&app, &by, "reaches_admins", d, msg));
+        refused(&app, &by, "reaches_admins", d, msg)
+    };
+    let reach = reaching(&role, scope);
+    if !reach.is_empty() {
+        return Err(reaches(&role, reach));
     }
-    let team = v["team"].as_str().map(str::trim).unwrap_or_default();
-    let _writes = a.scim.group_writes.lock().await;
     let g = app.db.scim_group_of_team(team).ok_or_else(|| not_found("SCIM group"))?;
+    // The database checks the role's permissions again as it saves, against an edit meanwhile.
     let m = app.db.create_scim_role_mapping(&g.tenant, &g.team_id, &role.id, scope, by.actor.id.as_deref()).map_err(|e| match e {
         ScimRoleMapError::Taken => conflict(format!("This group is mapped to a role {} already. Remove that mapping first.", if scope == ORG { "across the server" } else { "in its team" })),
         ScimRoleMapError::Gone => not_found("SCIM group"),
+        ScimRoleMapError::Reaches(reach) => reaches(&role, reach),
         ScimRoleMapError::Db(e) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, e),
     })?;
+    let role = app.db.custom_role(&m.role_id).ok_or_else(|| not_found("Role"))?;
     app.db.record(&event(&by, "scim.role_mapped", &m, Some(&role), json!({ "group": g.display_name, "applies": applies(&role, scope) })));
     let (mut granted, mut skips) = (Vec::new(), Vec::new());
     for u in app.db.scim_group_members(&g.tenant, &g.team_id, false) {
