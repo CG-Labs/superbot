@@ -31,7 +31,7 @@
 .toc li a { display: block; padding: 4px 8px; border-radius: 8px; color: var(--text-dim); text-decoration: none; line-height: 1.35; }
 .toc li a:hover { color: var(--text); background: var(--surface); }
 .toc li a[aria-current="page"] { color: var(--text); background: var(--surface-2); box-shadow: inset 3px 0 0 var(--primary); }
-.nav a[aria-current="page"] { color: var(--text); }
+.nav a[aria-current] { color: var(--text); }
 
 /* The page */
 .doc { min-width: 0; }

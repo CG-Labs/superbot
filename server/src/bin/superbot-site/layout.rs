@@ -39,7 +39,11 @@ pub fn page(s: &Shell, main: &str) -> String {
         true => format!("\n  <script src=\"{root}assets/search.js\" defer></script>"),
         false => String::new(),
     };
-    let current = if s.docs { " aria-current=\"page\"" } else { "" };
+    let current = match (s.docs, s.out == "docs/index.html") {
+        (true, true) => " aria-current=\"page\"",
+        (true, false) => " aria-current=\"true\"",
+        _ => "",
+    };
     format!(
         r##"<!doctype html>
 <html lang="en">

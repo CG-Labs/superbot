@@ -66,8 +66,8 @@ impl Args {
             .remove("--contact-url")
             .or_else(|| std::env::var("SUPERBOT_SITE_CONTACT_URL").ok().filter(|v| !v.is_empty()))
             .unwrap_or_else(|| repo_url.clone());
-        if !markdown::is_external(&contact_url) {
-            return Err(format!("--contact-url must be a full URL (https: or mailto:), not {contact_url}"));
+        if !["https://", "http://", "mailto:"].iter().any(|s| contact_url.starts_with(s)) {
+            return Err(format!("--contact-url must be an https:, http: or mailto: URL, not {contact_url}"));
         }
         Ok(Args {
             out: flags.remove("--out").map(PathBuf::from).unwrap_or_else(|| repo.join("target/site")),
@@ -295,6 +295,8 @@ mod tests {
         assert_eq!(parse(&["--nope"]).err().unwrap(), "unknown argument --nope");
         assert_eq!(parse(&["--out"]).err().unwrap(), "--out needs a value");
         assert!(parse(&["--contact-url", "/get-started"]).is_err());
+        assert!(parse(&["--contact-url", "javascript:alert(1)"]).is_err());
+        assert_eq!(parse(&["--contact-url", "mailto:sales@example.com"]).unwrap().contact_url, "mailto:sales@example.com");
     }
 
     /// The real docs build with no broken links, every page is in the search index, and
