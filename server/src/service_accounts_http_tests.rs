@@ -511,8 +511,22 @@ async fn a_team_service_account_shares_bots_only_within_its_team() {
     assert!(!sees.contains(&teams_bot) && sees.contains(&solos_bot), "{sees:?}");
     assert_eq!(call(port, "GET", &format!("/api/bots/{teams_bot}/messages"), &tok, "").await.0, 404);
 
-    // Out of the team, it's in none, at once.
+    // Out of the team, it's in none, at once, and its open streams are told to forget
+    // the Bot access they worked out.
+    let (live, _) = token(port, &admin, &in_team, json!({})).await;
+    let mut s = stream(port, &live).await;
     assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{in_team}"), &admin, r#"{"team":null}"#).await.0, 200);
+    let mut got = Vec::new();
+    let resynced = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut buf = [0u8; 1024];
+        while !String::from_utf8_lossy(&got).contains("resync") {
+            let n = s.read(&mut buf).await.unwrap();
+            assert!(n > 0, "stream closed");
+            got.extend_from_slice(&buf[..n]);
+        }
+    })
+    .await;
+    assert!(resynced.is_ok(), "no resync after the team changed");
     assert_eq!(app.db.team_id_of(&in_team), None);
     let (tok, _) = token(port, &admin, &in_team, json!({})).await;
     assert_eq!(call(port, "GET", &format!("/api/bots/{teams_bot}/messages"), &tok, "").await.0, 404);
