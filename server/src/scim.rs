@@ -973,6 +973,7 @@ pub async fn delete_user(State(app): State<AppState>, Extension(a): Extension<Ar
     }
     crate::machines::offboard::left(&app, &c.who, &id, crate::machines::offboard::DEPROVISIONED);
     groups::user_deleted(&app, &a, &c, &id).await;
+    roles::user_deleted(&app, &a, &c.who, &id).await;
     crate::deprovision::user_disabled(&app, &c.who, &id, crate::deprovision::SCIM_DELETE).await;
     Ok(StatusCode::NO_CONTENT.into_response())
 }

@@ -319,3 +319,26 @@ async fn leaving_by_hand_and_unlinking_take_the_role_away_too() {
     assert_eq!((unmapped["details"]["reason"].as_str(), unmapped["details"]["revoked"].clone()), (Some("group_removed"), json!([ben])));
     assert_eq!(json_call(port, "GET", MAPPINGS, &admin, "").await.1["mappings"], json!([]));
 }
+
+#[tokio::test]
+async fn a_scim_delete_takes_mapped_roles_away_with_group_roles_turned_off() {
+    let (port, app, admin, _) = serve_app_with(|a| a.scim.enabled = true).await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    let eve = person(port, &t, "eve@example.com").await;
+    // Mapped and given while group roles were on; both flags are off now.
+    let team = app.db.create_team("Eng", None);
+    assert!(app.db.add_team_member(&team.id, &eve, "member", None));
+    app.db.link_scim_group("okta", &team.id, None, "Eng", None).unwrap();
+    let r = role(port, &admin, "Auditor", "readonly", &["audit.view"]).await;
+    let m = app.db.create_scim_role_mapping("okta", &team.id, &r, "org", None).unwrap();
+    assert!(app.db.grant_scim_role(&m, &eve));
+    assert_eq!(app.db.user(&eve).unwrap().role_id.as_deref(), Some(r.as_str()));
+
+    let (code, _, v) = scim(port, &t, "DELETE", &format!("/scim/v2/Users/{eve}"), Value::Null).await;
+    assert_eq!(code, 204, "{v}");
+    let u = app.db.user(&eve).unwrap();
+    assert_eq!((u.role, u.role_id), (Role::Member, None), "back to the role she had");
+    assert!(app.db.scim_role_grants_of_user(&eve).is_empty());
+    let gone = &events(port, &admin, "action=role.unassigned").await[0];
+    assert_eq!((gone["details"]["user"].as_str(), gone["details"]["reason"].as_str()), (Some(eve.as_str()), Some("user_deleted")));
+}

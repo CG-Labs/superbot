@@ -17,6 +17,7 @@ pub const TEAM: &str = "team";
 pub const LEFT_GROUP: &str = "left_group";
 pub const UNMAPPED: &str = "mapping_removed";
 pub const GROUP_GONE: &str = "group_removed";
+pub const USER_DELETED: &str = "user_deleted";
 
 fn conflict(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::CONFLICT, msg.into())
@@ -149,6 +150,18 @@ pub(crate) async fn left(app: &AppState, by: &Who, team_id: &str, user_id: &str)
     for g in app.db.scim_role_grants_of_user(user_id) {
         if let Some(m) = app.db.scim_role_mapping(&g.mapping_id).filter(|m| m.team_id == team_id) {
             take_away(app, by, &m, user_id, LEFT_GROUP).await;
+        }
+    }
+}
+
+/// SCIM deleted `user_id`: every grant they hold from a mapping goes, whatever
+/// SCIM_GROUPS and SCIM_GROUP_ROLES say now, so restoring them by `externalId` brings
+/// no mapped role back.
+pub(crate) async fn user_deleted(app: &AppState, a: &Auth, by: &Who, user_id: &str) {
+    let _writes = a.scim.group_writes.lock().await;
+    for g in app.db.scim_role_grants_of_user(user_id) {
+        if let Some(m) = app.db.scim_role_mapping(&g.mapping_id) {
+            take_away(app, by, &m, user_id, USER_DELETED).await;
         }
     }
 }

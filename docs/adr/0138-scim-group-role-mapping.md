@@ -58,6 +58,7 @@ Across the server, losing the role puts back the built-in role from before it wa
 ### When it's taken away
 
 - They leave the group's team, by any path: SCIM removing them, a SCIM `DELETE` of the user, a team admin's or server admin's removal (`teams::leave`, right after the membership row goes, before the rest of offboarding). If SCIM puts them back on the team before that revoke runs, the revoke takes nothing, so the rejoin keeps the role.
+- SCIM deletes the user: every grant they hold from any mapping goes (reason `user_deleted`), even with `SCIM_GROUPS` or `SCIM_GROUP_ROLES` turned off since, so provisioning the same `externalId` again brings back no mapped role.
 - The mapping is removed (`DELETE /api/scim/role-mappings/{id}`): everyone it gave the role to loses it.
 - The group goes: the IdP deletes it (members leave first, then remaining mappings go) or an admin unlinks it (mappings go, people stay on the team). Deleting the team deletes its mappings.
 
@@ -65,7 +66,7 @@ Mapping writes and SCIM group writes take the same lock (`group_writes`), so a m
 
 ### Audit
 
-`scim.role_mapped`, `scim.role_unmapped` (reason `mapping_removed` or `group_removed`, with who lost the role), `scim.role_map_refused`, `scim.role_skipped`, and every grant and removal as the existing `role.assigned` and `role.unassigned` with `via: "scim"`, the mapping, the tenant, the team (team scope), and a reason (`left_group`, `mapping_removed`, `group_removed`). A grant made when SCIM adds someone has the SCIM token as its actor; one made when an admin creates a mapping has the admin. A hand change that takes over a SCIM grant records `takenFromScim` or `scimMapping`. `GET /api/roles/{id}` shows each holder's `scimMapping`, and each role's `scimMappings` count.
+`scim.role_mapped`, `scim.role_unmapped` (reason `mapping_removed` or `group_removed`, with who lost the role), `scim.role_map_refused`, `scim.role_skipped`, and every grant and removal as the existing `role.assigned` and `role.unassigned` with `via: "scim"`, the mapping, the tenant, the team (team scope), and a reason (`left_group`, `user_deleted`, `mapping_removed`, `group_removed`). A grant made when SCIM adds someone has the SCIM token as its actor; one made when an admin creates a mapping has the admin. A hand change that takes over a SCIM grant records `takenFromScim` or `scimMapping`. `GET /api/roles/{id}` shows each holder's `scimMapping`, and each role's `scimMappings` count.
 
 ## Alternatives considered
 
