@@ -54,7 +54,15 @@ fn yaml_lines(yaml: &str) -> Vec<(usize, &str)> {
                 && tok[1..].chars().all(|c| c == '+' || c == '-' || c.is_ascii_digit())
         });
         if opens_block {
-            block = Some(indent(line));
+            // The body is indented past the key that opened it (`name` in `- name: |`), and
+            // that key's siblings (`uses:` under it) are not; a bare `- |` counts from its dash.
+            let mut key = line.trim_start();
+            let mut dash = indent(line);
+            while let Some(rest) = key.strip_prefix("- ").map(str::trim_start) {
+                dash = line.len() - key.len();
+                key = rest;
+            }
+            block = Some(if key.starts_with(['|', '>']) { dash } else { line.len() - key.len() });
         }
         out.push((i + 1, line));
     }
@@ -176,6 +184,9 @@ fn the_checker_catches_what_it_should() {
     let shell = "steps:\n  - run: echo '{\"uses\": \"x\"}'\n  - run: |\n      echo '{\"uses\": \"x\"}'\n      cat <<EOF\n      uses: a/b@v1\n      - { uses: a/b@v1 }\n      EOF\n\n      true\n  - name: after\n    uses: a/b@v1\n  - run: >-\n      uses: c/d@v1\n";
     assert_eq!(other_uses_keys(shell), Vec::<usize>::new());
     assert_eq!(uses(shell), vec![(12, "a/b@v1".to_string(), String::new())]);
+    let names = "steps:\n  - name: |\n      Checkout\n    uses: actions/checkout@v4\n  - name: >-\n      x\n    'uses': a/b@v1\n  - - |\n      uses: in a list\n    - uses: e/f@v1\n";
+    assert_eq!(uses(names), vec![(4, "actions/checkout@v4".to_string(), String::new()), (10, "e/f@v1".to_string(), String::new())]);
+    assert_eq!(other_uses_keys(names), vec![7]);
     assert_eq!(uses("  - uses:\n      actions/checkout@v4\n"), vec![(1, String::new(), String::new())]);
     assert!(problem("", "").is_some());
 
