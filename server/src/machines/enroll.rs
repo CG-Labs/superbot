@@ -116,6 +116,8 @@ pub struct Enrollment {
     pub offboard: super::offboard::Settings,
     pub(super) offboarding: super::offboard::Working,
     voxl: Option<(Bytes, String)>,
+    /// What new machines' first boot hardens (MACHINE_HARDENING, ADR 0126). None: off.
+    pub hardening: Option<super::hardening::Settings>,
 }
 
 impl std::fmt::Debug for Enrollment {
@@ -161,6 +163,8 @@ impl Enrollment {
                 "MACHINE_TEAMMATE_USERS",
                 "MACHINE_TEAMMATE_FILES",
                 "MACHINE_TEAMMATE_FILES_DAYS",
+                "MACHINE_HARDENING",
+                "MACHINE_EGRESS_DENY",
             ] {
                 if !var(k).trim().is_empty() {
                     return Err(format!("{k} needs MACHINE_CONTROL_URL"));
@@ -238,6 +242,7 @@ impl Enrollment {
         e.screens = super::screens::from_env(var, e.bot_user)?;
         e.teammate_users = super::teammate::from_env(var, e.bot_user)?;
         e.offboard = super::offboard::Settings::from_env(var)?;
+        e.hardening = super::hardening::Settings::from_env(var)?;
         if e.screens.is_some() {
             let on_path = std::env::var_os("PATH")
                 .and_then(|p| std::env::split_paths(&p).map(|d| d.join(VOXL_BIN)).find(|p| p.is_file()));
@@ -282,6 +287,7 @@ impl Enrollment {
             offboard: Default::default(),
             offboarding: Default::default(),
             voxl: None,
+            hardening: None,
         })
     }
 
@@ -354,6 +360,13 @@ impl Enrollment {
     pub fn with_screens(mut self, ports: (u16, u16)) -> Enrollment {
         self.bot_user = true;
         self.screens = Some(super::screens::Settings { ports, width: 1280, height: 800, idle_ms: 600_000 });
+        self
+    }
+
+    /// With MACHINE_HARDENING=on and the built-in egress denials.
+    #[cfg(test)]
+    pub fn with_hardening(mut self) -> Enrollment {
+        self.hardening = Some(super::hardening::Settings::default_on());
         self
     }
 
@@ -519,7 +532,19 @@ impl Enrollment {
                     &voxl.as_ref().map_or(String::new(), |(_, sha)| FIRSTBOOT_VOXL.replace("{sha}", sha)),
                 ),
             };
+            let hardening = self.hardening.as_ref().map_or(String::new(), |h| {
+                for (path, mode, content) in h.files() {
+                    out.push_str(&format!(
+                        "\x20 - path: {path}\n\
+                         \x20   permissions: \"{mode}\"\n\
+                         \x20   content: |\n{}",
+                        indent(&content),
+                    ));
+                }
+                super::hardening::FIRSTBOOT.to_string()
+            });
             let script = FIRSTBOOT
+                .replace("{hardening}\n", &hardening)
                 .replace("{botctl}\n", &botctl)
                 .replace("{bot_user}\n", &bots)
                 .replace("{screens}\n", &screens)
@@ -696,14 +721,15 @@ fn control_cert(ca: &Ca, host: &str) -> Result<ControlCert, String> {
 const FIRSTBOOT_PATH: &str = "/usr/local/lib/superbot/firstboot";
 const GUARD_PATH: &str = "/usr/local/lib/superbot/agent-guard";
 
-/// Run once by cloud-init (ADR 0035): installs the agent botd ships (and botctl, when
-/// botd ships it), each checked against the SHA-256 botd pinned, enrolls, and starts
-/// the agent. Its output goes to the cloud-init log, so nothing in it may print the
+/// Run once by cloud-init (ADR 0035): hardens the machine first (ADR 0126), installs
+/// the agent botd ships (and botctl, when botd ships it), each checked against the
+/// SHA-256 botd pinned, enrolls, and starts the agent. Its output goes to the cloud-init log, so nothing in it may print the
 /// token. Both live in /usr/local/lib/superbot, which the unit lets the agent write,
 /// so it can upgrade them (ADR 0039); /usr/local/bin links to them.
 const FIRSTBOOT: &str = r#"#!/bin/sh
 set -eu
 dir=/usr/local/lib/superbot
+{hardening}
 {botctl}
 {bot_user}
 bin=$dir/superbot-machine
@@ -1008,14 +1034,16 @@ async fn enroll(
     let Some(replaced) = p.app.db.enroll_machine(t.id, &m.id, &m.user_id, &issued) else {
         return refuse(StatusCode::UNAUTHORIZED, "token_used", BAD_TOKEN);
     };
-    record(
-        &p.app,
-        &by,
-        "machine.enrolled",
-        &m.id,
-        Outcome::Success,
-        json!({ "userId": m.user_id, "fingerprint": issued.fingerprint, "serial": issued.serial, "notAfter": issued.not_after }),
-    );
+    let mut details = json!({ "userId": m.user_id, "fingerprint": issued.fingerprint, "serial": issued.serial, "notAfter": issued.not_after });
+    // A machine's first enrollment is when it is up for its user: how long that took
+    // from the request, by provider and tier, is the provisioning time (ADR 0120).
+    if m.enrolled_at.is_none() {
+        details["first"] = json!(true);
+        details["provider"] = json!(m.provider);
+        details["tier"] = json!(m.tier);
+        details["sinceRequestSeconds"] = json!((at - m.created_at).max(0) / 1000);
+    }
+    record(&p.app, &by, "machine.enrolled", &m.id, Outcome::Success, details);
     record_revoked(&p.app, &by, &m, "replaced", &replaced);
     Json(wire::CertificateReply {
         machine_id: m.id.clone(),
