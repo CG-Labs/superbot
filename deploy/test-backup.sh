@@ -202,6 +202,12 @@ grep -qx "SUPERBOT_BACKUP_ENCRYPTION='off'" "$O/.env" || fail "init.sh didn't wr
 refuses "makes a key that --backup-encryption off" env ENV_FILE="$O/.env" "$INIT" --backup-age-generate --backup-encryption off
 ENV_FILE="$O/.env" BACKUP_IDENTITY_FILE="$O/identity.txt" "$INIT" --backup-encryption auto --backup-age-generate >/dev/null
 grep -qx "SUPERBOT_BACKUP_AGE_RECIPIENTS='$(age-keygen -y "$O/identity.txt")'" "$O/.env" || fail "--backup-age-generate didn't set recipients"
+E="$T/compose-empty"
+mkdir "$E"
+printf 'SUPERBOT_BACKUP_AGE_RECIPIENTS=""\n' >"$E/.env"
+refuses "required, but" env ENV_FILE="$E/.env" "$INIT" --backup-encryption required
+ENV_FILE="$E/.env" BACKUP_IDENTITY_FILE="$E/identity.txt" "$INIT" --backup-age-generate >/dev/null
+grep -qx "SUPERBOT_BACKUP_AGE_RECIPIENTS='$(age-keygen -y "$E/identity.txt")'" "$E/.env" || fail "init.sh took quoted-empty recipients as set"
 ok "init.sh makes a private key for a new .env, keeps it on re-runs, and it restores the archives"
 
 echo "All backup script checks passed"

@@ -232,10 +232,12 @@ ok "an upgrade keeps the key, and the key restores the archives superbot-backup 
 reset_flags
 fresh_home enc-old
 BACKUP_IDENTITY_FILE="$T/enc-old-identity.txt"
-printf 'AUTH_PASSWORD=x\nDATA_DIR=%s\n' "$H/superbot/data" >"$env_file"
+# Quoted-empty recipients are plain, as superbot-backup reads them.
+printf 'AUTH_PASSWORD=x\nDATA_DIR=%s\nSUPERBOT_BACKUP_AGE_RECIPIENTS=%s\nSUPERBOT_BACKUP_AGE_RECIPIENTS_FILE=""\n' "$H/superbot/data" "''" >"$env_file"
+cp "$env_file" "$T/enc-old.env"
 configure
 [[ ! -e "$BACKUP_IDENTITY_FILE" ]] || fail "an upgrade made a key without --backup-age-generate"
-if grep -q '^SUPERBOT_BACKUP_' "$env_file"; then fail "an upgrade wrote backup encryption settings without flags"; fi
+[[ "$(grep '^SUPERBOT_BACKUP_' "$env_file")" == "$(grep '^SUPERBOT_BACKUP_' "$T/enc-old.env")" ]] || fail "an upgrade changed backup encryption settings without flags"
 out=$(DOMAIN=ci.example.com summary 2>&1)
 grep -qxF '  Encrypted: plain (no SUPERBOT_BACKUP_AGE_RECIPIENTS)' <<<"$out" || fail "the summary doesn't say backups are plain"
 grep -q "Server backups aren't encrypted.*--backup-age-generate" <<<"$out" || fail "the summary doesn't warn about plain backups"
@@ -249,6 +251,7 @@ check_backup_target
 configure
 grep -qxF "SUPERBOT_BACKUP_AGE_RECIPIENTS=$(age-keygen -y "$BACKUP_IDENTITY_FILE")" "$env_file" || fail "--backup-age-generate didn't encrypt to a new key"
 grep -qxF 'SUPERBOT_BACKUP_ENCRYPTION=required' "$env_file" || fail "--backup-encryption wasn't written"
+[[ $(grep -c '^SUPERBOT_BACKUP_AGE_RECIPIENTS=' "$env_file") == 1 ]] || fail "--backup-age-generate left the empty recipients line"
 ok "upgrades make a key only with --backup-age-generate, and required refuses plain"
 
 reset_flags

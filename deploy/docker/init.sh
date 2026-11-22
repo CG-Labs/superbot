@@ -156,7 +156,9 @@ esac
 [[ -z "$BACKUP_ENCRYPTION" ]] || set_env SUPERBOT_BACKUP_ENCRYPTION "$BACKUP_ENCRYPTION"
 policy=$(sed -n "s/^SUPERBOT_BACKUP_ENCRYPTION=//p" "$ENV_FILE" | tail -n 1 | tr -d "'\"" | tr '[:upper:]' '[:lower:]')
 new_backup_key=false no_age=false
-if ! grep -Eq "^SUPERBOT_BACKUP_AGE_RECIPIENTS=('[^']+'|[^'[:space:]]+)" "$ENV_FILE" && [[ "$policy" != off ]] &&
+# A nonempty SUPERBOT_BACKUP_AGE_RECIPIENTS, quoted or not.
+HAS_RECIPIENTS='^SUPERBOT_BACKUP_AGE_RECIPIENTS=('"'"'[^'"'"'[:space:]][^'"'"']*'"'"'|"[^"[:space:]][^"]*"|[^'"'"'"[:space:]]+)'
+if ! grep -Eq "$HAS_RECIPIENTS" "$ENV_FILE" && [[ "$policy" != off ]] &&
   [[ "$fresh" == true || "$BACKUP_GENERATE" == true ]]; then
   if command -v age-keygen >/dev/null 2>&1; then
     [[ ! -L "$BACKUP_IDENTITY_FILE" ]] || die "refusing symlinked $BACKUP_IDENTITY_FILE"
@@ -173,7 +175,7 @@ if ! grep -Eq "^SUPERBOT_BACKUP_AGE_RECIPIENTS=('[^']+'|[^'[:space:]]+)" "$ENV_F
     no_age=true
   fi
 fi
-if [[ "$policy" == required ]] && ! grep -Eq "^SUPERBOT_BACKUP_AGE_RECIPIENTS=('[^']+'|[^'[:space:]]+)" "$ENV_FILE"; then
+if [[ "$policy" == required ]] && ! grep -Eq "$HAS_RECIPIENTS" "$ENV_FILE"; then
   die "SUPERBOT_BACKUP_ENCRYPTION=required, but $ENV_FILE has no SUPERBOT_BACKUP_AGE_RECIPIENTS: install age and run ./init.sh --backup-age-generate"
 fi
 

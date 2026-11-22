@@ -682,7 +682,7 @@ env_value() {
 }
 
 backup_recipients_set() {
-  grep -Eq '^SUPERBOT_BACKUP_AGE_RECIPIENTS(_FILE)?=.' "$1"
+  [[ -n "$(env_value "$1" SUPERBOT_BACKUP_AGE_RECIPIENTS | tr -d '[:space:]')$(env_value "$1" SUPERBOT_BACKUP_AGE_RECIPIENTS_FILE | tr -d '[:space:]')" ]]
 }
 
 # Makes (or, if one is already there, reuses) the backup age identity at BACKUP_IDENTITY_FILE,
