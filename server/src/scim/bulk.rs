@@ -103,15 +103,22 @@ fn path(method: Method, p: &str) -> Option<(Kind, Option<String>)> {
 
 /// The quoted `"bulkId:<id>"` values in a PATCH path filter such as
 /// `members[value eq "bulkId:u"]`, as (start, end, id) with start..end covering the
-/// quotes.
-fn quoted_refs(s: &str) -> Vec<(usize, usize, &str)> {
+/// quotes. Each quoted value is read as a JSON string, escapes and all, as the filter
+/// itself is.
+fn quoted_refs(s: &str) -> Vec<(usize, usize, String)> {
     let mut out = Vec::new();
     let mut from = 0;
-    while let Some(at) = s[from..].find(&format!("\"{BULK_ID}")).map(|n| from + n) {
-        let id_at = at + 1 + BULK_ID.len();
-        let Some(len) = s[id_at..].find('"') else { break };
-        out.push((at, id_at + len + 1, &s[id_at..id_at + len]));
-        from = id_at + len + 1;
+    while let Some(at) = s[from..].find('"').map(|n| from + n) {
+        let mut strings = serde_json::Deserializer::from_str(&s[at..]).into_iter::<String>();
+        let Some(Ok(value)) = strings.next() else {
+            from = at + 1;
+            continue;
+        };
+        let end = at + strings.byte_offset();
+        if let Some(id) = value.strip_prefix(BULK_ID) {
+            out.push((at, end, id.to_string()));
+        }
+        from = end;
     }
     out
 }
@@ -134,7 +141,7 @@ fn refs_in(v: &Value, out: &mut Vec<String>) {
         Value::Object(o) => {
             for (k, x) in o {
                 match x.as_str() {
-                    Some(s) if k.eq_ignore_ascii_case("path") => quoted_refs(s).into_iter().for_each(|(_, _, id)| add(out, id)),
+                    Some(s) if k.eq_ignore_ascii_case("path") => quoted_refs(s).into_iter().for_each(|(_, _, id)| add(out, &id)),
                     _ => refs_in(x, out),
                 }
             }
@@ -168,7 +175,7 @@ fn resolve_quoted(s: &str, made: &HashMap<String, String>) -> String {
     let mut out = String::with_capacity(s.len());
     let mut from = 0;
     for (start, end, id) in quoted_refs(s) {
-        if let Some(new) = made.get(id) {
+        if let Some(new) = made.get(&id) {
             out.push_str(&s[from..start]);
             out.push_str(&json!(new).to_string());
             from = end;
@@ -538,5 +545,20 @@ mod tests {
         assert_eq!(out["Operations"][2]["path"], json!("members[value eq \"bulkId:v\"] and members[value eq \"u-1\"]"));
         assert_eq!(out["Operations"][3]["value"], json!("says \"bulkId:w\""));
         assert_eq!(resolve_quoted("members[value eq \"bulkId:u", &made), "members[value eq \"bulkId:u", "unterminated");
+
+        // The filter's value is a JSON string, so its escapes name the same bulkId.
+        let escaped = json!({ "Operations": [
+            { "op": "remove", "path": r#"members[value eq "bulkId:a\"b"]"# },
+            { "op": "remove", "path": r#"members[value eq "\u0062ulkId:\u0075"]"# },
+            { "op": "remove", "path": r#"members[value eq "x\"bulkId:y"]"# },
+        ] });
+        let mut refs = Vec::new();
+        refs_in(&escaped, &mut refs);
+        assert_eq!(refs, vec!["a\"b", "u"], "a quote inside another value starts no reference");
+        let made: HashMap<String, String> = [("a\"b".to_string(), "id-ab".to_string()), ("u".to_string(), "u-1".to_string())].into();
+        let out = resolve(&escaped, &made);
+        assert_eq!(out["Operations"][0]["path"], json!("members[value eq \"id-ab\"]"));
+        assert_eq!(out["Operations"][1]["path"], json!("members[value eq \"u-1\"]"));
+        assert_eq!(out["Operations"][2]["path"], escaped["Operations"][2]["path"]);
     }
 }
