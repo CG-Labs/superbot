@@ -33,9 +33,9 @@ pub fn resume_on_enable(raw: &str) -> Result<bool, String> {
 
 /// Whose disabled account stops a routine now: its Bot's owner first, then whoever
 /// wrote its instruction (whom its runs are for, ADR 0046). A user who is gone counts
-/// as disabled.
+/// as disabled, and so does a service account whose owner is (ADR 0143).
 pub fn blocked(db: &Db, owner: &str, author: Option<&str>) -> Option<(&'static str, String)> {
-    let off = |id: &str| !db.user(id).is_some_and(|u| u.active());
+    let off = |id: &str| !db.user(id).is_some_and(|u| crate::service_accounts::may_act(db, &u));
     if off(owner) {
         return Some((OWNER_DISABLED, owner.to_string()));
     }
