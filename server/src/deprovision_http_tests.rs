@@ -187,6 +187,11 @@ async fn deactivating_suspends_their_machine_and_reactivating_resumes_it() {
     set_active(&w, &ada, true).await;
     assert_eq!(state(&w, &m), State::Suspended, "not ours to resume");
     assert_eq!(events(w.port, &w.admin, "action=user.machine_resumed").await.len(), 1);
+
+    // Sealed onto the hash chain like every other event (ADR 0122).
+    assert!(deprovisioned(&w).await.iter().all(|e| e["chainHash"].as_str().is_some_and(|h| h.len() == 64)));
+    let (code, body) = call(w.port, "GET", "/api/audit/verify", &w.admin, "").await;
+    assert_eq!((code, parse(&body)["ok"].as_bool()), (200, Some(true)), "{body}");
 }
 
 #[tokio::test]
