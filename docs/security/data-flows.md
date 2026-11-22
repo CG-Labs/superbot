@@ -6,7 +6,7 @@ What SuperBot stores, where, how it is protected, and what leaves for outside se
 
 ### On the control plane (botd's server)
 
-botd keeps the organisation's data in one SQLite database, `DATA_DIR/app.sqlite`, plus a few files under `DATA_DIR` ([ADR 0029](../adr/0029-per-user-isolation.md)).
+botd keeps the organisation's data in one SQLite database, `DATA_DIR/app.sqlite`, encrypted under the master key ([at rest](#at-rest)), plus a few files under `DATA_DIR` ([ADR 0029](../adr/0029-per-user-isolation.md)).
 
 | Data | Stored as |
 |------|-----------|
@@ -22,7 +22,7 @@ botd keeps the organisation's data in one SQLite database, `DATA_DIR/app.sqlite`
 | Machine records, certificates, backup and restore records | Rows ([ADR 0031](../adr/0031-machine-enrollment-mtls.md), [ADR 0071](../adr/0071-off-host-machine-backups.md)). |
 | Each user's facts and Bots' memory | Files: `DATA_DIR/users/<id>/USER.md`, `DATA_DIR/bots/<id>/`, kept for every run, here or on a machine. A run on a machine sends the changed files back and botd writes them here (up to 1 MiB each). With per-user accounts, runs here work on a copy in the user's folder, which botd copies back. |
 | Each user's working folder, when runs are on this server | Files: `WORKSPACE_DIR/users/<id>/`, owned by that user's Unix account ([ADR 0058](../adr/0058-harness-os-user-by-default.md)). |
-| The master key | A file or environment variable **outside** `DATA_DIR` (`SUPERBOT_MASTER_KEY`, `SUPERBOT_MASTER_KEY_FILE`, or `~/.config/superbot/master.key`). Never in backups. During a rotation, the old key too (`SUPERBOT_MASTER_KEY_PREVIOUS(_FILE)`), until it is removed ([ADR 0096](../adr/0096-master-key-rotation.md)). |
+| The master key | A file or environment variable **outside** `DATA_DIR` (`SUPERBOT_MASTER_KEY`, `SUPERBOT_MASTER_KEY_FILE`, or `~/.config/superbot/master.key`). Never in backups. It opens the encrypted database as well as the sealed values, so a backup is useless without it. During a rotation, the old key too (`SUPERBOT_MASTER_KEY_PREVIOUS(_FILE)`), until it is removed ([ADR 0096](../adr/0096-master-key-rotation.md)). |
 
 ### On each user's machine (managed)
 
@@ -67,7 +67,8 @@ Chat history, approvals, policy, secrets and the audit log stay on the control p
 | Data | Protection |
 |------|-----------|
 | Secrets, approval inputs, push tokens | Sealed field by field with XChaCha20-Poly1305 under the master key. Each value is bound to where it lives (for example its user and name), so a copied row doesn't open elsewhere ([`server/src/secrets/sealed.rs`](../../server/src/secrets/sealed.rs), [ADR 0010](../adr/0010-secrets.md)). |
-| The rest of the database (chats, audit, users) | **Not encrypted by SuperBot.** Whole-database encryption was considered and rejected ([ADR 0010](../adr/0010-secrets.md)). Protect it with the host's disk encryption. |
+| The whole database (chats, audit, users, Bot settings), its WAL, and the copy in each backup | Encrypted with SQLCipher 4 (AES-256, an HMAC per page) under a key derived from the master key with HMAC-SHA256 ([`server/src/database_encryption.rs`](../../server/src/database_encryption.rs), [ADR 0116](../adr/0116-database-encrypted-at-rest.md)). Required on new installs; an existing plain database stays plain until `SUPERBOT_DATABASE_ENCRYPTION=required`, which encrypts it and keeps a plain copy in `DATA_DIR` until the operator deletes it; `off` keeps it plain by choice. A plain database or a plain copy is shown in the startup log, the setup checklist, `botctl database` and `/metrics`, and audited. It doesn't protect against code running as botd's user or root on the host, which can read the key. |
+| Files in `DATA_DIR` (Bots' memory, `USER.md`) and the workspace | **Not encrypted by SuperBot.** Protect them with the host's disk encryption. |
 | Server backups | Encrypted with age when the operator sets `SUPERBOT_BACKUP_AGE_RECIPIENTS`; otherwise plain archives. The master key is never in them ([ADR 0030](../adr/0030-backup-restore-drill.md)). Copies off the host are those archives as they are, or, for plain ones, encrypted by botd as it streams them when `SERVER_BACKUP_AGE_RECIPIENTS` is set ([ADR 0109](../adr/0109-server-backups-off-the-host.md)). |
 | Machine backups (Incus) | botd receives the container's export from the Incus host over mutual TLS and, when `MACHINE_BACKUP_AGE_RECIPIENTS` is set, encrypts it with age as it streams it to S3-compatible storage. Encryption happens in botd, not on the Incus host, and botd needs only the public keys for it. Without recipients the archive is uploaded unencrypted. To restore an encrypted backup, an admin sends the private age identity to botd with the request; botd uses it for that restore only, decrypts the archive and streams it to the Incus host, and never stores or logs the identity ([ADR 0071](../adr/0071-off-host-machine-backups.md)). |
 | Machine disks | Whatever the host provides (Linode, or the Incus host's storage). SuperBot adds no disk encryption. |
