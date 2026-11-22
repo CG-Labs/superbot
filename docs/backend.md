@@ -174,7 +174,7 @@ Admin actions are recorded in `audit_events` in `app.sqlite`: who (person, Bot, 
 
 - **Append-only**: no API edits or deletes rows, and SQLite triggers refuse `UPDATE` and any `DELETE` inside the retention window.
 - **No secrets**: passwords, tokens, message bodies, and routine instructions are never recorded. Details are scrubbed and clipped anyway.
-- **Retention**: `AUDIT_RETENTION_DAYS` (unset or `0` = keep forever, the default). Pruning runs every 6 hours and is itself logged. Backups copy the table with the rest of `app.sqlite`.
+- **Retention**: `AUDIT_RETENTION_DAYS` (unset or `0` = keep forever, the default). Pruning runs every 6 hours and is itself logged. Backups copy the table with the rest of `app.sqlite`. Chat history has its own setting, `CHAT_RETENTION_DAYS`, with per-Bot holds ([ADR 0097](adr/0097-chat-retention.md), [operator guide](../deploy/README.md#chat-history-retention)).
 - **Source IP**: the peer, or the last `X-Forwarded-For` entry when the proxy is on loopback. Set `TRUST_FORWARDED_FOR=1` only when `botd` is reachable solely through your proxy (Compose sets it).
 - **Read it**: the Audit log in the app or the admin console (filters and Export CSV), or:
 
