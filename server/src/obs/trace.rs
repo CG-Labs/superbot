@@ -1,4 +1,4 @@
-//! Traces (ADR 0117): a span per HTTP request and per Bot run, with child spans for each
+//! Traces (ADR 0118): a span per HTTP request and per Bot run, with child spans for each
 //! harness attempt, tool call, approval check and call to a machine's agent, exported
 //! over OTLP/HTTP (JSON) to any OpenTelemetry collector or tracing backend. Off unless
 //! `TRACES_OTLP_ENDPOINT` is set.
@@ -402,7 +402,7 @@ impl Tracer {
 
     pub fn render(&self, out: &mut String) {
         let shared = self.shared();
-        family(out, "superbot_tracing_enabled", "gauge", "1 when botd exports traces over OTLP (TRACES_OTLP_ENDPOINT, ADR 0117).");
+        family(out, "superbot_tracing_enabled", "gauge", "1 when botd exports traces over OTLP (TRACES_OTLP_ENDPOINT, ADR 0118).");
         sample(out, "superbot_tracing_enabled", &[], shared.is_some() as u8 as f64);
         family(
             out,

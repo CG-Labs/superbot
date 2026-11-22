@@ -630,7 +630,7 @@ impl Enrollment {
         path: &str,
         body: &T,
     ) -> Result<(u16, Value), String> {
-        // Only inside a traced request or run (ADR 0117): background calls start no trace.
+        // Only inside a traced request or run (ADR 0118): background calls start no trace.
         let call = agent_call(path);
         let span = crate::obs::trace::child(&format!("{method} {call}"), crate::obs::trace::Kind::Client);
         span.set("http.request.method", method.as_str());

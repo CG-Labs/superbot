@@ -1331,7 +1331,7 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
         Ok(c) => c,
         Err(res) => return *res,
     };
-    // Per-tier metrics and traces (ADR 0117): the plan of whoever sent it, a Bot's owner's.
+    // Per-tier metrics and traces (ADR 0118): the plan of whoever sent it, a Bot's owner's.
     if let Some(app) = a.app.as_ref().filter(|app| obs::wants_tiers(app)) {
         let owner = match caller.principal {
             Principal::Bot => caller.bot.as_deref().and_then(|id| app.db.bot(id)).map(|b| b.owner_id),

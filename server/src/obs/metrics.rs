@@ -64,7 +64,7 @@ const OUTCOMES: [&str; 3] = ["success", "failure", "denied"];
 const METHODS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
 /// Distinct refusal reasons kept; any more count as `other`.
 pub const MAX_REASONS: usize = 32;
-/// Distinct tiers kept for per-tier metrics (ADR 0117); any more count as `other`.
+/// Distinct tiers kept for per-tier metrics (ADR 0118); any more count as `other`.
 pub const MAX_TIERS: usize = 16;
 
 #[derive(Default, Clone)]
@@ -157,7 +157,7 @@ struct Inner {
     runs: BTreeMap<(&'static str, &'static str), u64>,
     run_seconds: BTreeMap<&'static str, Histogram>,
     runs_active: BTreeMap<&'static str, i64>,
-    /// Per tier (ADR 0117): requests by status class, their latency, runs by result and
+    /// Per tier (ADR 0118): requests by status class, their latency, runs by result and
     /// their duration. Only filled while something reads them.
     tiers_wanted: bool,
     tier_http: BTreeMap<(String, &'static str), u64>,
@@ -347,7 +347,7 @@ impl Metrics {
         self.lock().host_use_wanted
     }
 
-    /// Counts requests and runs by tier too (ADR 0117): set when `/metrics` is on, so a
+    /// Counts requests and runs by tier too (ADR 0118): set when `/metrics` is on, so a
     /// server without it looks up no one's tier per request.
     pub fn want_tiers(&self) {
         self.lock().tiers_wanted = true;
@@ -403,7 +403,7 @@ impl Metrics {
             sample(out, "superbot_runs_active", &[("harness", harness)], *n as f64);
         }
         if m.tiers_wanted {
-            family(out, "superbot_http_requests_by_tier_total", "counter", "HTTP requests botd answered, by the tier of whoever sent them (none: no one signed in) and status class (ADR 0117).");
+            family(out, "superbot_http_requests_by_tier_total", "counter", "HTTP requests botd answered, by the tier of whoever sent them (none: no one signed in) and status class (ADR 0118).");
             for ((tier, status), n) in &m.tier_http {
                 sample(out, "superbot_http_requests_by_tier_total", &[("tier", tier), ("status_class", status)], *n as f64);
             }
@@ -411,7 +411,7 @@ impl Metrics {
             for (tier, h) in &m.tier_http_seconds {
                 histogram(out, "superbot_http_request_duration_by_tier_seconds", &[("tier", tier)], &HTTP_BUCKETS, h);
             }
-            family(out, "superbot_runs_by_tier_total", "counter", "Bot runs that finished, by their owner's tier and result (ADR 0117).");
+            family(out, "superbot_runs_by_tier_total", "counter", "Bot runs that finished, by their owner's tier and result (ADR 0118).");
             for ((tier, result), n) in &m.tier_runs {
                 sample(out, "superbot_runs_by_tier_total", &[("tier", tier), ("result", result)], *n as f64);
             }

@@ -139,7 +139,7 @@ pub fn server_secret(name: &str) -> bool {
 /// password, webhook URL, and webhook signing key (ADR 0061), and the Expo access
 /// token that lets botd push to every registered phone (ADR 0080), the token
 /// scrapers send to `/metrics` (ADR 0089), the error tracker's DSN (ADR 0113), the
-/// headers sent to the trace collector (ADR 0117), and the keys to the stores that hold
+/// headers sent to the trace collector (ADR 0118), and the keys to the stores that hold
 /// every machine's backups (ADR 0071) and the server's own (ADR 0109).
 pub const SERVER_SECRETS: [&str; 12] = [
     "TURNSTILE_SECRET",

@@ -75,7 +75,7 @@ pub fn line(level: Level, msg: &str) {
 
 /// A structured line, `msg` naming what happened (`http.request`, `run.finished`), with
 /// `fields` beside it. Only in JSON format: text logs stay as they were. Inside a span
-/// that's kept (ADR 0117), it names the span's `traceId` and `spanId` too.
+/// that's kept (ADR 0118), it names the span's `traceId` and `spanId` too.
 pub fn event(level: Level, msg: &str, mut fields: Value) {
     if let (Value::Object(f), Some(c)) = (&mut fields, super::trace::current_sampled())
         && f.get("traceId").is_none_or(Value::is_null)

@@ -7,7 +7,7 @@
 //! listener is reachable only where the operator binds it. Off loopback it needs a
 //! bearer token (`METRICS_TOKEN`), and botd refuses to start without one.
 //!
-//! Traces (ADR 0117) are in `trace`: a span per request and per run, exported over
+//! Traces (ADR 0118) are in `trace`: a span per request and per run, exported over
 //! OTLP, off unless `TRACES_OTLP_ENDPOINT` is set.
 
 pub mod capacity;
@@ -143,7 +143,7 @@ fn request_id_for(req: &Request) -> String {
 
 /// What a request turned out to be, for its log line, metrics and span: the route it
 /// matched, a template like `/api/bots/{id}/messages` (never the path as sent), and the
-/// tier of whoever sent it (ADR 0117). `track` puts it on the request and reads it
+/// tier of whoever sent it (ADR 0118). `track` puts it on the request and reads it
 /// after, so it's known even when the handler panics.
 #[derive(Clone, Default)]
 struct Noted {

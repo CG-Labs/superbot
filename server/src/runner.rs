@@ -831,7 +831,7 @@ impl App {
             let before = self.db.last_id();
             let queued_in = trace::take_queued(msg.id);
             if let Some(bot) = self.db.bot(&bot_id) {
-                // One span per run (ADR 0117), in the trace of the request that queued it.
+                // One span per run (ADR 0118), in the trace of the request that queued it.
                 let name = format!("run {}", crate::obs::metrics::harness(&bot.harness));
                 let span = match queued_in {
                     Some(h) => h.child(&name, trace::Kind::Internal),

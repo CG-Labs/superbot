@@ -82,7 +82,7 @@ impl App {
     /// hook says it is from (`SUPERBOT_RUN_ID`); what was approved for a run counts only
     /// while that run is the Bot's live one.
     pub async fn check(self: &Arc<Self>, bot: &Bot, harness: &str, tool: &str, input: Value, cwd: Option<PathBuf>, run: Option<&str>) -> Verdict {
-        // A span in the run's trace (ADR 0117): the tool's name and the decision, never its input.
+        // A span in the run's trace (ADR 0118): the tool's name and the decision, never its input.
         let span = trace::child("approval.check", trace::Kind::Internal);
         span.set("superbot.harness", crate::obs::metrics::harness(harness));
         span.set("superbot.tool.name", trace::tool_name(tool));

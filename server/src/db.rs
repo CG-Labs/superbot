@@ -3464,7 +3464,7 @@ impl Db {
         &self.3
     }
 
-    /// This server's tracer (ADR 0117): off unless started with an endpoint.
+    /// This server's tracer (ADR 0118): off unless started with an endpoint.
     pub fn tracer(&self) -> &crate::obs::trace::Tracer {
         &self.4
     }
@@ -6174,7 +6174,7 @@ impl Db {
         let owners: Vec<&str> = owners.iter().map(String::as_str).collect();
         let text = |v: &Option<String>, max: usize| v.as_deref().map(|s| audit::clip(&redact::text_for(&owners, &audit::redact_text(s)), max));
         let mut details = redact::value_for(&owners, audit::scrub(e.details.clone()));
-        // Recorded during a traced request or run (ADR 0117): the trace that shows it.
+        // Recorded during a traced request or run (ADR 0118): the trace that shows it.
         if let Some(t) = crate::obs::trace::current_sampled() {
             if details.is_null() {
                 details = serde_json::json!({});
