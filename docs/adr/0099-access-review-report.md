@@ -47,7 +47,7 @@ We also considered a per-person sign-off (keep or remove, person by person). It'
 
 ### In the app
 
-Admins get **Access review** in the sidebar of the Expo client: the summary, everyone by tenant and team with flags for what to look at twice (admins, no second factor, disabled people still signed in or still holding a machine, SCIM-deleted people), Export CSV (a download on web, the share sheet on phones), notes and **Mark as reviewed**, and the past sign-offs. Others see that it's for admins.
+Admins get **Access review** in the sidebar of the Expo client: the summary, everyone by tenant and team with flags for what to look at twice (admins, no second factor, disabled people still signed in or still holding a machine, SCIM-deleted people), Export CSV (a download on web, the share sheet on phones, named as the server named it, which botd lets a browser on another origin read), notes and **Mark as reviewed**, and the past sign-offs. Others see that it's for admins.
 
 ## Consequences
 

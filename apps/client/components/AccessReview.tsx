@@ -85,7 +85,9 @@ export function AccessReview({ api, onBack }: Props) {
     setExporting(true);
     setError(null);
     try {
-      await saveCsv(csvFileName(report.generatedAt), await api.accessReviewCsv(report.digest), "Export access review");
+      const { csv, fileName } = await api.accessReviewCsv(report.digest);
+      // The server builds the CSV from a fresh report, so name it by that report's time, not the one on screen.
+      await saveCsv(fileName ?? csvFileName(Date.now()), csv, "Export access review");
     } catch (err) {
       const stale = err instanceof ApiError && err.status === 409;
       setError(stale ? "Access changed since this report loaded. Reload it before exporting." : err instanceof Error ? err.message : "Export failed");

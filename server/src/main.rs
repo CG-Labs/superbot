@@ -937,7 +937,8 @@ fn cors_layer() -> CorsLayer {
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
             header::ACCEPT,
-        ]);
+        ])
+        .expose_headers([header::CONTENT_DISPOSITION]);
     layer = match raw.as_str() {
         "*" => layer.allow_origin(AllowOrigin::any()),
         "" => layer.allow_origin(AllowOrigin::list([

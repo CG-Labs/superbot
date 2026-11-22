@@ -125,10 +125,16 @@ async fn the_csv_has_a_dated_row_per_person_and_its_export_is_audited() {
     // Asked for the report on screen: the same one exports, a changed one is refused.
     let url = format!("/api/access-review/export.csv?digest={digest}");
     assert_eq!(call_with(port, "GET", &url, &admin, "", "").await.0, 200);
-    let _ = user_with(port, &admin, "new@example.com", "member").await;
+    let (new, _) = user_with(port, &admin, "new@example.com", "admin").await;
     let (code, _, body) = call_with(port, "GET", &url, &admin, "", "").await;
     assert_eq!(code, 409, "{body}");
     assert_eq!(events(port, &admin, "access_review.exported").await.len(), 2);
+
+    // The web client names the file from Content-Disposition, so a browser on another origin must be let read it.
+    let bearer = crate::scim_http_tests::session_for(port, &admin, &new).await;
+    let (code, head, _) = call_with(port, "GET", "/api/access-review/export.csv", &bearer, "Origin: http://localhost:8081\r\n", "").await;
+    assert_eq!(code, 200);
+    assert!(head.to_ascii_lowercase().contains("access-control-expose-headers: content-disposition"), "{head}");
 }
 
 #[tokio::test]
