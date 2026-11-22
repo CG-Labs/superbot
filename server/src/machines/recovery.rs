@@ -1,7 +1,8 @@
 //! Recovery objectives for machines with off-host backups (ADR 0074). Each tier has an
 //! RPO (how old the newest off-host copy of a machine may get) and an RTO (how long a
 //! restore may take, from the request to the machine enrolling again), set beside its
-//! backup schedule (`backup::Settings`).
+//! backup schedule (`backup::Settings`). Machines backed up by their provider instead
+//! (Linode Backups, ADR 0110) are held to one RPO, `ProviderBackups`, and no RTO.
 //!
 //! botd checks every running machine against its RPO every reconcile interval. A
 //! machine past it opens a breach: audited (`machine.rpo_breached`), alerted to the
@@ -102,6 +103,85 @@ pub fn view(app: &App, cp: &ControlPlane, off: &Offsite, m: &Machine) -> Value {
     })
 }
 
+/// Machines held to an RPO by their provider's own backups (ADR 0110): Linode Backups,
+/// taken once a day in a window Linode picks, so the RPO allows a day and the window.
+/// botd doesn't take or restore these backups, so it times no restores against an RTO.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProviderBackups {
+    pub rpo_ms: i64,
+}
+
+/// MACHINE_BACKUPS_RPO_HOURS when it isn't set: a day and Linode's two-hour window.
+pub const PROVIDER_RPO_HOURS: i64 = 26;
+
+impl ProviderBackups {
+    /// MACHINE_BACKUPS_RPO_HOURS, 25 to 168. `on`: MACHINE_BACKUPS is on and the provider
+    /// says when its backups succeed; otherwise the setting stops botd starting.
+    pub fn from_env(var: &dyn Fn(&str) -> String, on: bool) -> Result<Option<ProviderBackups>, String> {
+        let raw = var("MACHINE_BACKUPS_RPO_HOURS");
+        let raw = raw.trim();
+        if !on {
+            return match raw {
+                "" => Ok(None),
+                _ => Err("MACHINE_BACKUPS_RPO_HOURS needs MACHINE_BACKUPS=on and Linode machines; Incus machines' RPO is MACHINE_BACKUP_RPO_HOURS".into()),
+            };
+        }
+        let hours = match raw {
+            "" => PROVIDER_RPO_HOURS,
+            _ => raw.parse::<i64>().ok().filter(|h| (25..=168).contains(h)).ok_or(format!(
+                "MACHINE_BACKUPS_RPO_HOURS must be 25 to 168 hours (Linode backs up once a day), not \"{}\"",
+                crate::audit::clip(raw, 20)
+            ))?,
+        };
+        Ok(Some(ProviderBackups { rpo_ms: hours * HOUR_MS }))
+    }
+}
+
+/// `linode` as people write it.
+fn provider_name(p: &str) -> String {
+    let mut c = p.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
+/// Why `m` isn't held to its provider backups' RPO now, if it isn't. As off-host
+/// backups': a suspended machine's disk doesn't change.
+fn provider_untracked(cp: &ControlPlane, m: &Machine) -> Option<&'static str> {
+    match m.state {
+        State::Destroyed => Some("destroyed"),
+        _ if !cp.owns(m) => Some("other_provider"),
+        State::Running => None,
+        State::Suspended => Some("suspended"),
+        _ => Some("not_running"),
+    }
+}
+
+/// `m` against its provider backups' RPO: covered since its newest backup the provider
+/// reported, or since it was made.
+pub fn provider_status(_app: &App, cp: &ControlPlane, pb: ProviderBackups, m: &Machine) -> Status {
+    let untracked = provider_untracked(cp, m);
+    let covered_since = m.provider_backup_at.unwrap_or(0).max(m.created_at);
+    Status { untracked, covered_since, rpo_ms: pb.rpo_ms, breach: untracked.is_none() && now() - covered_since > pb.rpo_ms }
+}
+
+/// What admins see of `m`'s provider backups against their RPO, in its view.
+pub fn provider_view(app: &App, cp: &ControlPlane, pb: ProviderBackups, m: &Machine) -> Value {
+    let st = provider_status(app, cp, pb, m);
+    json!({
+        "machineId": m.id,
+        "backups": "provider",
+        "provider": m.provider,
+        "backupsOn": m.backups,
+        "tracked": st.untracked.is_none(),
+        "untrackedReason": st.untracked,
+        "lastBackupAt": m.provider_backup_at,
+        "coveredSince": st.covered_since,
+        "ageMs": (now() - st.covered_since).max(0),
+        "rpoHours": st.rpo_ms / HOUR_MS,
+        "breach": st.breach,
+        "breachedAt": app.db.machine_rpo_breach_open(&m.id).map(|b| b.breached_at),
+    })
+}
+
 /// Whether a finished restore met its RTO. None: not finished, or from before ADR 0074.
 fn within(r: &MachineRestore) -> Option<bool> {
     Some(r.duration_ms? <= r.rto_ms?)
@@ -125,34 +205,53 @@ fn alert(app: &AppState, m: &Machine, action: &str, title: String, lines: Vec<St
     notify::alert(app, a, PAGE);
 }
 
-/// One check of every machine: breaches open and close, audited and alerted. Returns how
-/// many are open after it.
-pub fn watch(app: &AppState, cp: &ControlPlane) -> usize {
-    let Some(off) = cp.offsite.as_deref() else { return 0 };
-    let open: HashMap<String, crate::db::MachineRpoBreach> = app.db.machine_rpo_breaches_open().into_iter().map(|b| (b.machine_id.clone(), b)).collect();
-    let mut breaching = 0;
-    for m in app.db.machines(None) {
-        let was = open.get(&m.id);
-        if m.state == State::Destroyed && was.is_none() {
-            continue;
+/// What machines are held to: off-host backups' RPO per tier (ADR 0074), or their
+/// provider's own backups' (ADR 0110).
+#[derive(Clone, Copy)]
+enum Held<'a> {
+    Offsite(&'a Offsite),
+    Provider(ProviderBackups),
+}
+
+impl Held<'_> {
+    fn of(cp: &ControlPlane) -> Option<Held<'_>> {
+        match (cp.offsite.as_deref(), cp.provider_backups) {
+            (Some(off), _) => Some(Held::Offsite(off)),
+            (None, Some(pb)) => Some(Held::Provider(pb)),
+            (None, None) => None,
         }
-        let st = status(app, cp, off, &m);
-        match (st.breach, was) {
-            (true, Some(_)) => breaching += 1,
-            (true, None) => {
-                let id = format!("rb{}", crate::random_hex(8));
-                let Some(b) = app.db.machine_rpo_breach_start(&id, &m, st.rpo_ms, st.covered_since) else { continue };
-                breaching += 1;
+    }
+
+    fn status(self, app: &App, cp: &ControlPlane, m: &Machine) -> Status {
+        match self {
+            Held::Offsite(off) => status(app, cp, off, m),
+            Held::Provider(pb) => provider_status(app, cp, pb, m),
+        }
+    }
+
+    /// What its backups are called in alerts: `off-host`, or the provider's name.
+    fn kind(self, m: &Machine) -> String {
+        match self {
+            Held::Offsite(_) => "off-host".into(),
+            Held::Provider(_) => provider_name(&m.provider),
+        }
+    }
+
+    /// A new breach's audit details, alert lines and title.
+    fn breached(self, app: &AppState, cp: &ControlPlane, m: &Machine, st: &Status, b: &crate::db::MachineRpoBreach) -> (Value, Vec<String>, String) {
+        let rpo = st.rpo_ms / HOUR_MS;
+        let title = format!("{}'s machine has no {} backup within its RPO", who(app, m), self.kind(m));
+        match self {
+            Held::Offsite(off) => {
                 let last = app.db.machine_last_backup(&m.id);
                 let failed = app.db.machine_backups(&m.id).into_iter().find(|x| x.state == "failed" && x.created_at > st.covered_since);
                 let d = json!({
-                    "breachId": b.id, "rpoHours": st.rpo_ms / HOUR_MS, "intervalHours": off.s.interval_ms(&m.tier) / HOUR_MS,
+                    "breachId": b.id, "rpoHours": rpo, "intervalHours": off.s.interval_ms(&m.tier) / HOUR_MS,
                     "lastBackupAt": last.as_ref().map(|x| x.created_at), "coveredSince": st.covered_since, "breachedAt": b.breached_at,
                     "lastError": failed.as_ref().and_then(|f| f.error.clone()),
                 });
-                app.db.record(&event(&system(&m), "machine.rpo_breached", &m, d).outcome(Outcome::Failure));
                 let mut lines = vec![
-                    format!("Tier {}: RPO {} hours, backed up every {} hours.", m.tier, st.rpo_ms / HOUR_MS, off.s.interval_ms(&m.tier) / HOUR_MS),
+                    format!("Tier {}: RPO {rpo} hours, backed up every {} hours.", m.tier, off.s.interval_ms(&m.tier) / HOUR_MS),
                     match &last {
                         Some(x) => format!("Newest off-host backup: {} ({} ago).", time(x.created_at), ago(now() - x.created_at)),
                         None => "No off-host backup of it yet.".into(),
@@ -161,10 +260,54 @@ pub fn watch(app: &AppState, cp: &ControlPlane) -> usize {
                 if let Some(e) = failed.and_then(|f| f.error) {
                     lines.push(format!("Its last backup failed: {e}"));
                 }
-                if let Some(why) = backup::unable_now(app, cp, &m) {
+                if let Some(why) = backup::unable_now(app, cp, m) {
                     lines.push(format!("It can't be backed up now: {why}"));
                 }
-                alert(app, &m, "machine.rpo_breached", format!("{}'s machine has no off-host backup within its RPO", who(app, &m)), lines);
+                (d, lines, title)
+            }
+            Held::Provider(_) => {
+                let name = provider_name(&m.provider);
+                let d = json!({
+                    "breachId": b.id, "rpoHours": rpo, "backups": "provider", "provider": m.provider, "backupsOn": m.backups,
+                    "lastBackupAt": m.provider_backup_at, "coveredSince": st.covered_since, "breachedAt": b.breached_at,
+                });
+                let mut lines = vec![
+                    format!("Tier {}: RPO {rpo} hours, by {name}'s own daily backups.", m.tier),
+                    match m.provider_backup_at {
+                        Some(at) => format!("Newest {name} backup: {} ({} ago).", time(at), ago(now() - at)),
+                        None => format!("No {name} backup of it yet."),
+                    },
+                ];
+                if !m.backups {
+                    lines.push(format!("Its {name} backups are off. botd turns them on each reconcile once it can; machine.backups_failed in the audit log says why it couldn't."));
+                }
+                (d, lines, title)
+            }
+        }
+    }
+}
+
+/// One check of every machine: breaches open and close, audited and alerted. Returns how
+/// many are open after it.
+pub fn watch(app: &AppState, cp: &ControlPlane) -> usize {
+    let Some(held) = Held::of(cp) else { return 0 };
+    let open: HashMap<String, crate::db::MachineRpoBreach> = app.db.machine_rpo_breaches_open().into_iter().map(|b| (b.machine_id.clone(), b)).collect();
+    let mut breaching = 0;
+    for m in app.db.machines(None) {
+        let was = open.get(&m.id);
+        if m.state == State::Destroyed && was.is_none() {
+            continue;
+        }
+        let st = held.status(app, cp, &m);
+        match (st.breach, was) {
+            (true, Some(_)) => breaching += 1,
+            (true, None) => {
+                let id = format!("rb{}", crate::random_hex(8));
+                let Some(b) = app.db.machine_rpo_breach_start(&id, &m, st.rpo_ms, st.covered_since) else { continue };
+                breaching += 1;
+                let (d, lines, title) = held.breached(app, cp, &m, &st, &b);
+                app.db.record(&event(&system(&m), "machine.rpo_breached", &m, d).outcome(Outcome::Failure));
+                alert(app, &m, "machine.rpo_breached", title, lines);
             }
             (false, Some(b)) => {
                 let reason = match st.untracked {
@@ -178,7 +321,7 @@ pub fn watch(app: &AppState, cp: &ControlPlane) -> usize {
                 let d = json!({ "breachId": b.id, "reason": reason, "breachedAt": b.breached_at, "durationMs": now() - b.breached_at, "coveredSince": st.covered_since });
                 app.db.record(&event(&system(&m), "machine.rpo_recovered", &m, d));
                 if reason == "backed_up" {
-                    let lines = vec![format!("It was past its RPO for {}.", ago(now() - b.breached_at)), format!("Newest off-host backup: {}.", time(st.covered_since))];
+                    let lines = vec![format!("It was past its RPO for {}.", ago(now() - b.breached_at)), format!("Newest {} backup: {}.", held.kind(&m), time(st.covered_since))];
                     alert(app, &m, "machine.rpo_recovered", format!("{}'s machine is back within its RPO", who(app, &m)), lines);
                 }
             }

@@ -139,6 +139,9 @@ pub struct ProviderMachine {
     pub region: String,
     pub ipv4: Option<String>,
     pub backups: bool,
+    /// When the provider's own backups of it last succeeded, if the provider says
+    /// (`reports_backups`, ADR 0110).
+    pub last_backup_at: Option<i64>,
     pub tags: Vec<String>,
     /// Its cloud-init user data (with the enrollment token) is still in its config at
     /// the provider, and `clear_user_data` removes it (ADR 0067). False where the
@@ -239,6 +242,13 @@ pub trait MachineProvider: Send + Sync {
     fn shutdown<'a>(&'a self, id: &'a str) -> Fut<'a, ()>;
     fn boot<'a>(&'a self, id: &'a str) -> Fut<'a, ()>;
     fn enable_backups<'a>(&'a self, id: &'a str) -> Fut<'a, ()>;
+    /// Whether `enable_backups` turns on backups kept off the machine's disk that the
+    /// provider restores, and `get` says when the last one succeeded (`last_backup_at`),
+    /// so machines can be held to an RPO by them (ADR 0110). Not Incus's snapshots, which
+    /// stay on the host.
+    fn reports_backups(&self) -> bool {
+        false
+    }
     /// Deletes the machine and its disks. Succeeds if it is already gone.
     fn delete<'a>(&'a self, id: &'a str) -> Fut<'a, ()>;
     /// Wipes the machine's disks and reinstalls it from `spec`, then boots it. It keeps

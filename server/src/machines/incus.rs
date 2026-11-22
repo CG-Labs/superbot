@@ -633,6 +633,7 @@ fn machine(v: &Value) -> Result<ProviderMachine, ProviderError> {
         },
         ipv4,
         backups: !text("snapshots.schedule").is_empty(),
+        last_backup_at: None,
         tags: text("user.superbot.tags")
             .split(',')
             .filter(|t| !t.is_empty())
@@ -652,6 +653,7 @@ fn provisioning(n: &str) -> ProviderMachine {
         region: String::new(),
         ipv4: None,
         backups: false,
+        last_backup_at: None,
         tags: Vec::new(),
         user_data: false,
     }

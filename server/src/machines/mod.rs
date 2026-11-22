@@ -178,6 +178,9 @@ pub struct ControlPlane {
     pub image: String,
     /// Turn on the provider's backups for every machine.
     pub backups: bool,
+    /// The RPO machines are held to by the provider's own backups (ADR 0110). None:
+    /// `backups` is off, or the provider doesn't say when its backups succeed.
+    pub provider_backups: Option<recovery::ProviderBackups>,
     /// Starts every label and is the tag on every machine, so one account can hold
     /// machines from several control planes without them touching each other's.
     pub label_prefix: String,
@@ -213,6 +216,7 @@ impl Default for ControlPlane {
             regions: Vec::new(),
             image: DEFAULT_IMAGE.into(),
             backups: true,
+            provider_backups: None,
             label_prefix: "superbot".into(),
             authorized_keys: Vec::new(),
             reconcile_every: Duration::from_secs(DEFAULT_RECONCILE_SECONDS),
@@ -280,7 +284,7 @@ impl ControlPlane {
     /// LINODE_TOKEN (or _FILE) turns it on with Linode and then needs MACHINE_REGIONS;
     /// MACHINE_PROVIDER=incus turns it on with an Incus host (`incus_from_env`). The
     /// rest have defaults: MACHINE_TIERS, MACHINE_IMAGE, MACHINE_BACKUPS (on),
-    /// MACHINE_LABEL_PREFIX, MACHINE_AUTHORIZED_KEYS, MACHINE_RECONCILE_SECONDS.
+    /// MACHINE_BACKUPS_RPO_HOURS (`recovery::ProviderBackups`), MACHINE_LABEL_PREFIX, MACHINE_AUTHORIZED_KEYS, MACHINE_RECONCILE_SECONDS.
     /// MACHINE_BACKUP_S3_BUCKET turns on off-host backups (`backup::Settings`, ADR 0071),
     /// for providers that can export machines.
     pub fn from_env(
@@ -393,6 +397,7 @@ impl ControlPlane {
             "0" | "off" | "false" | "no" => false,
             v => return Err(format!("MACHINE_BACKUPS must be on or off, not \"{v}\"")),
         };
+        let provider_backups = recovery::ProviderBackups::from_env(var, backups && provider.reports_backups())?;
         let label_prefix = or("MACHINE_LABEL_PREFIX", "superbot");
         if !slug(&label_prefix, 24) || !label_prefix.starts_with(|c: char| c.is_ascii_lowercase()) {
             return Err("MACHINE_LABEL_PREFIX: up to 24 lowercase letters, digits, and dashes, starting with a letter".into());
@@ -428,6 +433,7 @@ impl ControlPlane {
             tiers,
             image,
             backups,
+            provider_backups,
             label_prefix,
             authorized_keys,
             reconcile_every: Duration::from_secs(secs),
@@ -521,6 +527,11 @@ impl ControlPlane {
         self.provider.is_some()
     }
 
+    /// The provider's name, if it says when its own backups succeed (ADR 0110).
+    pub fn reporting_backups(&self) -> Option<&'static str> {
+        self.provider.as_deref().filter(|p| p.reports_backups()).map(|p| p.name())
+    }
+
     /// The provider's hosts, where it has several (ADR 0076).
     pub fn hosts(&self) -> Option<&dyn provider::Hosts> {
         self.provider.as_deref()?.hosts()
@@ -570,7 +581,11 @@ impl ControlPlane {
                     .map(|(t, p)| format!("{t}={p}"))
                     .collect::<Vec<_>>()
                     .join(", "),
-                if self.backups { "on" } else { "off" },
+                match (self.backups, self.provider_backups) {
+                    (false, _) => "off".to_string(),
+                    (true, None) => "on".to_string(),
+                    (true, Some(pb)) => format!("on (RPO {} hours)", pb.rpo_ms / 3_600_000),
+                },
                 self.offsite.as_ref().map_or("off (set MACHINE_BACKUP_S3_BUCKET)".into(), |o| o.describe()),
                 match self.routing {
                     route::Routing::Off => "off (Bots run on this server)".into(),
@@ -633,6 +648,7 @@ fn observe(m: &mut Machine, pm: &ProviderMachine) {
     m.provider_status = Some(pm.status.clone());
     m.ipv4 = pm.ipv4.clone();
     m.backups = pm.backups;
+    m.provider_backup_at = pm.last_backup_at;
 }
 
 /// Worth trying again by itself, unlike a refusal: rate limits, the network, timeouts,
@@ -1098,6 +1114,10 @@ pub fn start(app: AppState, cp: Arc<ControlPlane>) {
             tick.tick().await;
             hosts::watch(&a, &c).await;
             reconcile(&a, &c).await;
+            // Off-host backups' RPOs are watched beside their backups (`backup::start`).
+            if c.offsite.is_none() {
+                recovery::watch(&a, &c);
+            }
         }
     });
     if cp.enrollment.is_none() {
@@ -1128,6 +1148,8 @@ fn admin_view(app: &App, m: &Machine) -> Value {
         }
         if let Some(off) = cp.offsite.as_deref() {
             v["recovery"] = recovery::view(app, cp, off, m);
+        } else if let Some(pb) = cp.provider_backups {
+            v["recovery"] = recovery::provider_view(app, cp, pb, m);
         }
     }
     v
@@ -1977,6 +1999,7 @@ mod tests {
             (&certs, &[("INCUS_URL", "")][..], "INCUS_URL"),
             (&certs, &[("MACHINE_TIERS", "starter=g6-standard-1")][..], "isn't an Incus plan"),
             (&certs, &[("MACHINE_REGIONS", "Node 1")][..], "MACHINE_REGIONS"),
+            (&certs, &[("MACHINE_BACKUPS_RPO_HOURS", "30")][..], "MACHINE_BACKUP_RPO_HOURS"),
             (&certs, &[("MACHINE_PROVIDER", "docker")][..], "linode or incus"),
             (&EnvStore::fixed(&[("INCUS_CLIENT_CERT", &cert), ("INCUS_SERVER_CERT", &server)]), &[][..], "INCUS_CLIENT_KEY"),
             (&EnvStore::fixed(&[("INCUS_CLIENT_CERT", &cert), ("INCUS_CLIENT_KEY", "nope"), ("INCUS_SERVER_CERT", &server)]), &[][..], "INCUS_CLIENT_KEY"),
@@ -2030,6 +2053,21 @@ mod tests {
             "{}",
             cp.describe()
         );
+        // Linode machines are held to an RPO by Linode Backups (ADR 0110).
+        assert_eq!(cp.reporting_backups(), Some("linode"));
+        assert_eq!(cp.provider_backups, Some(recovery::ProviderBackups { rpo_ms: 26 * 3_600_000 }));
+        assert!(cp.describe().contains("backups on (RPO 26 hours)"), "{}", cp.describe());
+        let cp = with(&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_BACKUPS_RPO_HOURS", "48")]).unwrap();
+        assert_eq!(cp.provider_backups.map(|p| p.rpo_ms), Some(48 * 3_600_000));
+        for (vars, want) in [
+            (&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_BACKUPS_RPO_HOURS", "24")][..], "25 to 168"),
+            (&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_BACKUPS_RPO_HOURS", "a day")][..], "25 to 168"),
+            (&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_BACKUPS_RPO_HOURS", "169")][..], "25 to 168"),
+            (&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_BACKUPS", "off"), ("MACHINE_BACKUPS_RPO_HOURS", "30")][..], "MACHINE_BACKUPS=on"),
+        ] {
+            let e = with(vars).err().unwrap_or_else(|| panic!("{vars:?} should fail"));
+            assert!(e.contains(want), "{vars:?}: {e}");
+        }
         let cp = with(&[
             ("MACHINE_REGIONS", "us-east"),
             ("MACHINE_TIERS", "solo=g6-nanode-1"),
@@ -2048,6 +2086,8 @@ mod tests {
             ),
             (Some("g6-nanode-1"), false, "acme", 1)
         );
+        assert_eq!(cp.provider_backups, None, "no RPO without the backups");
+        assert!(cp.describe().contains("backups off"), "{}", cp.describe());
         for bad in [
             &[("MACHINE_REGIONS", "GB London")][..],
             &[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_BACKUPS", "maybe")],
