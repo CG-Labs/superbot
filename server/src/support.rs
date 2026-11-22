@@ -38,7 +38,7 @@ const PATH_SUFFIXES: [&str; 3] = ["_FILE", "_PATH", "_DIR"];
 /// The settings botd documents. The bundle carries these and settings that look like
 /// SuperBot's or a harness provider's, and only counts the rest of the host's environment.
 const DOCUMENTED: &str = include_str!("../../.env.example");
-const PREFIXES: [&str; 10] = ["SUPERBOT_", "MACHINE_", "INCUS_", "SERVER_BACKUP_", "SMTP_", "SSO_", "SIGNIN_", "TRACES_", "HERMES_", "LINODE_"];
+const PREFIXES: [&str; 13] = ["SUPERBOT_", "MACHINE_", "INCUS_", "SERVER_BACKUP_", "SMTP_", "SSO_", "SIGNIN_", "TRACES_", "HERMES_", "LINODE_", "NOTIFY_", "PUSH_", "TIER_"];
 const SUFFIXES: [&str; 2] = ["_API_KEY", "_BASE_URL"];
 const EXTRA: [&str; 8] = ["TZ", "RUST_LOG", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "STATE_DIRECTORY", "WEB_DIR", "SITE_DIR"];
 

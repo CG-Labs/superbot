@@ -13,6 +13,7 @@ on:
     paths:
       - 'docs/**'
       - 'server/tests/security_docs_links.rs'
+      - 'server/tests/support_docs.rs'
       - 'server/tests/actions_pinned.rs'
       - 'server/tests/image_supply_chain.rs'
       - 'server/tests/release_workflow.rs'
@@ -29,6 +30,7 @@ on:
     paths:
       - 'docs/**'
       - 'server/tests/security_docs_links.rs'
+      - 'server/tests/support_docs.rs'
       - 'server/tests/actions_pinned.rs'
       - 'server/tests/image_supply_chain.rs'
       - 'server/tests/release_workflow.rs'
@@ -60,6 +62,8 @@ jobs:
       - run: cargo test --test image_supply_chain
       # ADR 0111: CHANGELOG.md is checked and each tag becomes a release, with minimal permissions.
       - run: cargo test --test release_workflow
+      # The support playbooks (docs/support/, #60): links, plans against the SLO, placeholders.
+      - run: cargo test --test support_docs
 
   site:
     runs-on: ubuntu-latest
