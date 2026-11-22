@@ -1,7 +1,8 @@
-//! Roles and permissions (RBAC v1). Every API request is mapped to one permission
-//! by `classify`, in the auth middleware, before any handler runs. Anything not in
-//! the table needs `Admin`, so a new route is closed until someone classifies it.
-//! Design: docs/adr/0012-users-sessions-rbac.md.
+//! Roles and permissions. Every API request is mapped to one permission by `classify`,
+//! in the auth middleware, before any handler runs. Anything not in the table needs
+//! `Admin`, so a new route is closed until someone classifies it.
+//! Design: docs/adr/0012-users-sessions-rbac.md; custom roles built from a fixed set of
+//! admin permissions (`DELEGABLE`): docs/adr/0123-custom-roles.md.
 
 use axum::http::Method;
 use serde::{Deserialize, Serialize};
@@ -55,11 +56,46 @@ pub enum Perm {
     Write,
     /// Approve or deny a Bot's risky tool call. People only, or a Bot could approve itself.
     Approve,
-    /// Policy and rules, the audit log, users, sessions, and secrets.
+    /// People: list, add and edit users, make sign-in codes, end sessions. Never admins, or
+    /// anyone with an admin permission, and never roles (ADR 0123).
+    ManageUsers,
+    /// People's Bots and routines: list them, resume paused routines, move a tier's Bots.
+    ManageBots,
+    /// The audit log and the access-review report, and their exports.
+    ViewAudit,
+    /// Everyone's plan and use, and the tiers.
+    ManageBilling,
+    /// The sign-up queue: see, approve (as a member or read-only) and reject.
+    ApproveSignups,
+    /// Machines' lifecycle: request, suspend, resume, resize, rebuild, back up, restore,
+    /// placement and hosts. Never a machine's logins, screens or files.
+    ManageMachines,
+    /// Policy and rules, secrets, roles, and everything no other permission names.
     Admin,
 }
 
-pub const PERMS: [Perm; 6] = [Perm::Account, Perm::Read, Perm::Review, Perm::Write, Perm::Approve, Perm::Admin];
+pub const PERMS: [Perm; 12] = [
+    Perm::Account,
+    Perm::Read,
+    Perm::Review,
+    Perm::Write,
+    Perm::Approve,
+    Perm::ManageUsers,
+    Perm::ManageBots,
+    Perm::ViewAudit,
+    Perm::ManageBilling,
+    Perm::ApproveSignups,
+    Perm::ManageMachines,
+    Perm::Admin,
+];
+
+/// What a custom role can hold on top of its base role (ADR 0123). Fixed: a name that
+/// isn't here is refused when a role is saved, and grants nothing if one is ever read.
+pub const DELEGABLE: [Perm; 6] = [Perm::ManageUsers, Perm::ManageBots, Perm::ViewAudit, Perm::ManageBilling, Perm::ApproveSignups, Perm::ManageMachines];
+
+/// The delegable permissions that mean something within one team, for a role given there:
+/// its people (invites, removing members), its machines, and its plan.
+pub const TEAM_SCOPED: [Perm; 3] = [Perm::ManageUsers, Perm::ManageMachines, Perm::ManageBilling];
 
 impl Perm {
     pub fn as_str(self) -> &'static str {
@@ -69,12 +105,74 @@ impl Perm {
             Perm::Review => "review",
             Perm::Write => "write",
             Perm::Approve => "approve",
+            Perm::ManageUsers => "users.manage",
+            Perm::ManageBots => "bots.manage",
+            Perm::ViewAudit => "audit.view",
+            Perm::ManageBilling => "billing.manage",
+            Perm::ApproveSignups => "signups.approve",
+            Perm::ManageMachines => "machines.manage",
             Perm::Admin => "admin",
         }
     }
+
+    /// A delegable permission by name. Anything else, built-in ones included, is None.
+    pub fn delegable(name: &str) -> Option<Perm> {
+        DELEGABLE.into_iter().find(|p| p.as_str() == name)
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Perm::Account => "Your own session, second factor and settings.",
+            Perm::Read => "See Bots, chats, routines, policy and models.",
+            Perm::Review => "See pending approvals.",
+            Perm::Write => "Chat with Bots and change them, routines and your own settings.",
+            Perm::Approve => "Approve or deny a Bot's risky tool call.",
+            Perm::ManageUsers => "List, add, edit, enable and disable people, make sign-in codes and end sessions. Not admins or anyone with an admin permission, and not roles.",
+            Perm::ManageBots => "List anyone's Bots and routines, resume paused routines, and move a tier's Bots to its default harness.",
+            Perm::ViewAudit => "Read and export the audit log and the access-review report.",
+            Perm::ManageBilling => "See everyone's plan and use, and the tiers.",
+            Perm::ApproveSignups => "See, approve and reject sign-ups, as members or read-only.",
+            Perm::ManageMachines => "Run machines' lifecycle, placement and hosts. Not their logins, screens or files.",
+            Perm::Admin => "Everything, including policy, secrets and roles.",
+        }
+    }
+
+    fn bit(self) -> u16 {
+        1 << self as u16
+    }
 }
 
-/// The whole matrix.
+/// A set of delegable permissions, as a custom role holds them.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Perms(u16);
+
+impl Perms {
+    pub const NONE: Perms = Perms(0);
+
+    /// Unknown names, and any that aren't delegable, are dropped: they grant nothing.
+    pub fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Perms {
+        names.into_iter().filter_map(Perm::delegable).fold(Perms::NONE, Perms::with)
+    }
+
+    pub fn with(self, p: Perm) -> Perms {
+        if DELEGABLE.contains(&p) { Perms(self.0 | p.bit()) } else { self }
+    }
+
+    pub fn has(self, p: Perm) -> bool {
+        DELEGABLE.contains(&p) && self.0 & p.bit() != 0
+    }
+
+    /// Only what applies within a team (`TEAM_SCOPED`).
+    pub fn in_team(self) -> Perms {
+        TEAM_SCOPED.into_iter().filter(|p| self.has(*p)).fold(Perms::NONE, Perms::with)
+    }
+
+    pub fn names(self) -> Vec<&'static str> {
+        DELEGABLE.iter().filter(|p| self.has(**p)).map(|p| p.as_str()).collect()
+    }
+}
+
+/// The built-in roles' matrix.
 pub fn allows(p: Principal, perm: Perm) -> bool {
     use Perm::*;
     match p {
@@ -85,8 +183,14 @@ pub fn allows(p: Principal, perm: Perm) -> bool {
     }
 }
 
-pub fn granted(p: Principal) -> Vec<&'static str> {
-    PERMS.iter().filter(|&&perm| allows(p, perm)).map(|p| p.as_str()).collect()
+/// The matrix with a person's custom role on top (ADR 0123): its base role's permissions,
+/// and the delegable ones it adds. Bots never get a custom role's.
+pub fn permits(p: Principal, extra: Perms, perm: Perm) -> bool {
+    allows(p, perm) || (matches!(p, Principal::User(_)) && extra.has(perm))
+}
+
+pub fn granted(p: Principal, extra: Perms) -> Vec<&'static str> {
+    PERMS.iter().filter(|&&perm| permits(p, extra, perm)).map(|p| p.as_str()).collect()
 }
 
 /// The permission a request needs. `path` is the raw request path. Segments are
@@ -103,8 +207,31 @@ pub fn classify(method: &Method, path: &str) -> Perm {
     }
     let m = if method == Method::HEAD { "GET" } else { method.as_str() };
     match (m, s.as_slice()) {
+        // Admin routes a custom role can be given (ADR 0123). Exact shapes only: anything
+        // else under `users` or `sessions` stays Admin just below. Handlers add what a
+        // delegate may not do on these (`users::Delegate`).
+        ("GET" | "POST", ["users"]) | ("GET" | "PATCH", ["users", _]) => ManageUsers,
+        ("POST", ["users", _, "login-codes"]) | ("DELETE", ["users", _, "sessions"]) => ManageUsers,
+        ("GET", ["sessions"]) | ("DELETE", ["sessions", _]) => ManageUsers,
+        ("GET", ["users", _, "bots" | "routines"]) | ("POST", ["users", _, "routines", "resume"]) => ManageBots,
+        ("POST", ["tiers", _, "move-bots"]) => ManageBots,
+        ("GET", ["audit"] | ["audit", "export.csv"] | ["access-review"] | ["access-review", "export.csv"]) => ViewAudit,
+        ("GET", ["usage"] | ["tiers"] | ["users", _, "usage"]) => ManageBilling,
+        ("GET", ["signups"] | ["signups", _]) | ("POST", ["signups", _, "approve" | "reject"]) => ApproveSignups,
+        // A machine's lifecycle, never its logins, screens, files or teammates, and never
+        // deleting its backups: those stay Admin.
+        ("GET" | "POST" | "DELETE", ["users", _, "machine"]) => ManageMachines,
+        ("POST", ["users", _, "machine", "suspend" | "resume" | "enrollment" | "harnesses"]) => ManageMachines,
+        ("GET" | "POST", ["users", _, "machine", "resize" | "rebuild" | "backups" | "restore"]) => ManageMachines,
+        ("DELETE", ["users", _, "machine", "rebuild" | "certificates"]) => ManageMachines,
+        ("GET", ["users", _, "machine", "agent"]) | ("POST", ["users", _, "machine", "agent", "upgrade"]) => ManageMachines,
+        ("PUT" | "DELETE", ["users", _, "machine", "agent", "hold"]) => ManageMachines,
+        ("GET" | "PUT" | "DELETE", ["users", _, "placement"]) | ("GET" | "PUT", ["users", _, "region"]) => ManageMachines,
+        ("GET", ["machines"] | ["machines", "placements" | "resizes" | "backups" | "recovery" | "substrate" | "hosts" | "legacy"] | ["regions"]) => ManageMachines,
+        ("POST", ["machines", "reconcile"] | ["machines", "hosts", _, "recover"]) | ("PUT" | "DELETE", ["machines", "hosts", _, "drain"]) => ManageMachines,
+
         // The admin portal (ADR 0021): users, sign-in codes, identities, sessions, and a
-        // user's Bot access. First, so no broader arm added below can ever open them.
+        // user's Bot access. Before every broader arm, so none added below can open them.
         (_, ["users", ..] | ["sessions", ..]) => Admin,
 
         ("GET", ["auth", "me"]) | ("POST", ["auth", "logout"]) => Account,
@@ -195,7 +322,33 @@ mod tests {
         for (perm, a, m, r, b) in table {
             assert_eq!([allows(ADMIN, perm), allows(MEMBER, perm), allows(READONLY, perm), allows(BOT, perm)], [a, m, r, b], "{perm:?}");
         }
-        assert_eq!(granted(READONLY), ["account", "read", "review"]);
+        // Only admins hold the delegable permissions among the built-in roles; Bots never do.
+        for perm in DELEGABLE {
+            assert_eq!([allows(ADMIN, perm), allows(MEMBER, perm), allows(READONLY, perm), allows(BOT, perm)], [true, false, false, false], "{perm:?}");
+        }
+        assert_eq!(granted(READONLY, Perms::NONE), ["account", "read", "review"]);
+        assert_eq!(granted(MEMBER, Perms::NONE), ["account", "read", "review", "write", "approve"]);
+        assert_eq!(granted(ADMIN, Perms::NONE).len(), PERMS.len());
+    }
+
+    #[test]
+    fn custom_roles_add_only_delegable_permissions() {
+        let auditor = Perms::from_names(["audit.view", "signups.approve"]);
+        assert_eq!(granted(READONLY, auditor), ["account", "read", "review", "audit.view", "signups.approve"]);
+        assert!(permits(READONLY, auditor, Perm::ViewAudit) && !permits(READONLY, auditor, Perm::Write));
+        assert!(!permits(READONLY, auditor, Perm::Admin) && !permits(MEMBER, auditor, Perm::ManageUsers));
+        // A Bot never carries a custom role's permissions, even if handed one.
+        assert!(!permits(BOT, auditor, Perm::ViewAudit));
+        // Deny by default: unknown names, built-in ones and `admin` grant nothing.
+        let odd = Perms::from_names(["admin", "write", "approve", "users.*", "Audit.View", " audit.view", "root", ""]);
+        assert_eq!(odd, Perms::NONE);
+        assert!(!Perms::NONE.with(Perm::Admin).has(Perm::Admin));
+        for perm in PERMS {
+            assert_eq!(Perm::delegable(perm.as_str()), DELEGABLE.contains(&perm).then_some(perm), "{perm:?}");
+        }
+        let all = DELEGABLE.into_iter().fold(Perms::NONE, Perms::with);
+        assert_eq!(all.names().len(), DELEGABLE.len());
+        assert_eq!(all.in_team().names(), ["users.manage", "billing.manage", "machines.manage"]);
     }
 
     #[test]
@@ -241,36 +394,36 @@ mod tests {
             ("PUT", "/api/bots/b1/notifications", Perm::Admin),
             ("POST", "/api/policy/rules", Perm::Admin),
             ("DELETE", "/api/policy/rules/r1", Perm::Admin),
-            ("GET", "/api/audit", Perm::Admin),
-            ("GET", "/api/audit/export.csv", Perm::Admin),
+            ("GET", "/api/audit", Perm::ViewAudit),
+            ("GET", "/api/audit/export.csv", Perm::ViewAudit),
             // The access-review report, its export and sign-off (ADR 0099).
-            ("GET", "/api/access-review", Perm::Admin),
-            ("GET", "/api/access-review/export.csv", Perm::Admin),
+            ("GET", "/api/access-review", Perm::ViewAudit),
+            ("GET", "/api/access-review/export.csv", Perm::ViewAudit),
             ("POST", "/api/access-review/complete", Perm::Admin),
-            ("GET", "/api/users", Perm::Admin),
-            ("POST", "/api/users", Perm::Admin),
-            ("GET", "/api/users/u1", Perm::Admin),
-            ("PATCH", "/api/users/u1", Perm::Admin),
-            ("POST", "/api/users/u1/login-codes", Perm::Admin),
-            ("DELETE", "/api/users/u1/sessions", Perm::Admin),
-            ("GET", "/api/users/u1/bots", Perm::Admin),
-            ("GET", "/api/users/u1/routines", Perm::Admin),
-            ("POST", "/api/users/u1/routines/resume", Perm::Admin),
+            ("GET", "/api/users", Perm::ManageUsers),
+            ("POST", "/api/users", Perm::ManageUsers),
+            ("GET", "/api/users/u1", Perm::ManageUsers),
+            ("PATCH", "/api/users/u1", Perm::ManageUsers),
+            ("POST", "/api/users/u1/login-codes", Perm::ManageUsers),
+            ("DELETE", "/api/users/u1/sessions", Perm::ManageUsers),
+            ("GET", "/api/users/u1/bots", Perm::ManageBots),
+            ("GET", "/api/users/u1/routines", Perm::ManageBots),
+            ("POST", "/api/users/u1/routines/resume", Perm::ManageBots),
             ("POST", "/api/users/u1/handover", Perm::Admin),
-            ("GET", "/api/users/a%40example.com/bots", Perm::Admin),
+            ("GET", "/api/users/a%40example.com/bots", Perm::ManageBots),
             ("GET", "/api/users/u1/identities", Perm::Admin),
             ("POST", "/api/users/u1/identities", Perm::Admin),
             ("DELETE", "/api/users/u1/identities/i1", Perm::Admin),
-            ("GET", "/api/sessions", Perm::Admin),
-            ("DELETE", "/api/sessions/s1", Perm::Admin),
+            ("GET", "/api/sessions", Perm::ManageUsers),
+            ("DELETE", "/api/sessions/s1", Perm::ManageUsers),
             ("GET", "/api/secrets", Perm::Admin),
             ("PUT", "/api/secrets/OPENAI_API_KEY", Perm::Admin),
             ("DELETE", "/api/secrets/OPENAI_API_KEY", Perm::Admin),
             // POST /api/signups and GET /api/signups/config are public; the auth middleware lets them through first.
-            ("GET", "/api/signups", Perm::Admin),
-            ("GET", "/api/signups/su1", Perm::Admin),
-            ("POST", "/api/signups/su1/approve", Perm::Admin),
-            ("POST", "/api/signups/su1/reject", Perm::Admin),
+            ("GET", "/api/signups", Perm::ApproveSignups),
+            ("GET", "/api/signups/su1", Perm::ApproveSignups),
+            ("POST", "/api/signups/su1/approve", Perm::ApproveSignups),
+            ("POST", "/api/signups/su1/reject", Perm::ApproveSignups),
             // SCIM tokens are admin-only; /scim/v2 has its own guard and never reaches classify.
             ("GET", "/api/scim/tokens", Perm::Admin),
             ("POST", "/api/scim/tokens", Perm::Admin),
@@ -283,14 +436,14 @@ mod tests {
             ("GET", "/api/machine", Perm::Account),
             ("GET", "/api/me/secrets", Perm::Read),
             ("GET", "/api/me/tier", Perm::Read),
-            ("GET", "/api/tiers", Perm::Admin),
+            ("GET", "/api/tiers", Perm::ManageBilling),
             // Moving a managed tier's Bots onto its default harness (ADR 0079).
-            ("POST", "/api/tiers/pro/move-bots", Perm::Admin),
+            ("POST", "/api/tiers/pro/move-bots", Perm::ManageBots),
             // Everyone's plan and use, against their limits (ADR 0040).
-            ("GET", "/api/usage", Perm::Admin),
+            ("GET", "/api/usage", Perm::ManageBilling),
             // Your own usage this billing period; anyone's is for admins (ADR 0050).
             ("GET", "/api/me/usage", Perm::Read),
-            ("GET", "/api/users/u1/usage", Perm::Admin),
+            ("GET", "/api/users/u1/usage", Perm::ManageBilling),
             // Your own plan's checkout and billing portal (ADR 0042).
             ("GET", "/api/billing", Perm::Read),
             ("POST", "/api/billing/checkout", Perm::Write),
@@ -310,41 +463,41 @@ mod tests {
             ("GET", "/api/me/secrets/OPENAI_API_KEY", Perm::Admin),
             ("GET", "/api/users/u1/secrets", Perm::Admin),
             ("DELETE", "/api/users/u1/secrets", Perm::Admin),
-            ("GET", "/api/machines", Perm::Admin),
-            ("POST", "/api/machines/reconcile", Perm::Admin),
-            ("GET", "/api/machines/placements", Perm::Admin),
-            ("GET", "/api/machines/substrate", Perm::Admin),
-            ("GET", "/api/machines/hosts", Perm::Admin),
-            ("POST", "/api/machines/hosts/main/recover", Perm::Admin),
-            ("PUT", "/api/machines/hosts/main/drain", Perm::Admin),
-            ("DELETE", "/api/machines/hosts/main/drain", Perm::Admin),
-            ("GET", "/api/users/u1/placement", Perm::Admin),
-            ("PUT", "/api/users/u1/placement", Perm::Admin),
-            ("DELETE", "/api/users/u1/placement", Perm::Admin),
-            ("GET", "/api/users/u1/machine", Perm::Admin),
-            ("POST", "/api/users/u1/machine", Perm::Admin),
-            ("DELETE", "/api/users/u1/machine", Perm::Admin),
-            ("POST", "/api/users/u1/machine/suspend", Perm::Admin),
-            ("POST", "/api/users/u1/machine/enrollment", Perm::Admin),
-            ("DELETE", "/api/users/u1/machine/certificates", Perm::Admin),
-            ("POST", "/api/users/u1/machine/resume", Perm::Admin),
-            ("POST", "/api/users/u1/machine/resize", Perm::Admin),
-            ("GET", "/api/users/u1/machine/agent", Perm::Admin),
-            ("POST", "/api/users/u1/machine/agent/upgrade", Perm::Admin),
-            ("PUT", "/api/users/u1/machine/agent/hold", Perm::Admin),
-            ("DELETE", "/api/users/u1/machine/agent/hold", Perm::Admin),
-            ("POST", "/api/users/u1/machine/harnesses", Perm::Admin),
-            ("GET", "/api/users/u1/machine/rebuild", Perm::Admin),
-            ("POST", "/api/users/u1/machine/rebuild", Perm::Admin),
-            ("DELETE", "/api/users/u1/machine/rebuild", Perm::Admin),
-            ("GET", "/api/users/u1/machine/backups", Perm::Admin),
-            ("POST", "/api/users/u1/machine/backups", Perm::Admin),
-            ("GET", "/api/users/u1/machine/restore", Perm::Admin),
-            ("POST", "/api/users/u1/machine/restore", Perm::Admin),
-            ("GET", "/api/machines/backups", Perm::Admin),
+            ("GET", "/api/machines", Perm::ManageMachines),
+            ("POST", "/api/machines/reconcile", Perm::ManageMachines),
+            ("GET", "/api/machines/placements", Perm::ManageMachines),
+            ("GET", "/api/machines/substrate", Perm::ManageMachines),
+            ("GET", "/api/machines/hosts", Perm::ManageMachines),
+            ("POST", "/api/machines/hosts/main/recover", Perm::ManageMachines),
+            ("PUT", "/api/machines/hosts/main/drain", Perm::ManageMachines),
+            ("DELETE", "/api/machines/hosts/main/drain", Perm::ManageMachines),
+            ("GET", "/api/users/u1/placement", Perm::ManageMachines),
+            ("PUT", "/api/users/u1/placement", Perm::ManageMachines),
+            ("DELETE", "/api/users/u1/placement", Perm::ManageMachines),
+            ("GET", "/api/users/u1/machine", Perm::ManageMachines),
+            ("POST", "/api/users/u1/machine", Perm::ManageMachines),
+            ("DELETE", "/api/users/u1/machine", Perm::ManageMachines),
+            ("POST", "/api/users/u1/machine/suspend", Perm::ManageMachines),
+            ("POST", "/api/users/u1/machine/enrollment", Perm::ManageMachines),
+            ("DELETE", "/api/users/u1/machine/certificates", Perm::ManageMachines),
+            ("POST", "/api/users/u1/machine/resume", Perm::ManageMachines),
+            ("POST", "/api/users/u1/machine/resize", Perm::ManageMachines),
+            ("GET", "/api/users/u1/machine/agent", Perm::ManageMachines),
+            ("POST", "/api/users/u1/machine/agent/upgrade", Perm::ManageMachines),
+            ("PUT", "/api/users/u1/machine/agent/hold", Perm::ManageMachines),
+            ("DELETE", "/api/users/u1/machine/agent/hold", Perm::ManageMachines),
+            ("POST", "/api/users/u1/machine/harnesses", Perm::ManageMachines),
+            ("GET", "/api/users/u1/machine/rebuild", Perm::ManageMachines),
+            ("POST", "/api/users/u1/machine/rebuild", Perm::ManageMachines),
+            ("DELETE", "/api/users/u1/machine/rebuild", Perm::ManageMachines),
+            ("GET", "/api/users/u1/machine/backups", Perm::ManageMachines),
+            ("POST", "/api/users/u1/machine/backups", Perm::ManageMachines),
+            ("GET", "/api/users/u1/machine/restore", Perm::ManageMachines),
+            ("POST", "/api/users/u1/machine/restore", Perm::ManageMachines),
+            ("GET", "/api/machines/backups", Perm::ManageMachines),
             ("DELETE", "/api/machines/m1/backups", Perm::Admin),
-            ("GET", "/api/machines/recovery", Perm::Admin),
-            ("GET", "/api/machines/legacy", Perm::Admin),
+            ("GET", "/api/machines/recovery", Perm::ManageMachines),
+            ("GET", "/api/machines/legacy", Perm::ManageMachines),
             ("POST", "/api/users/u1/machine/bot-user", Perm::Admin),
             ("POST", "/api/users/u1/machine/harness-login", Perm::Admin),
             ("POST", "/api/users/u1/machine/harness-login/l1/input", Perm::Admin),
@@ -428,6 +581,34 @@ mod tests {
             ("DELETE", "/api/teams/t1", Perm::Admin),
             ("PUT", "/api/teams/t1/members/u1", Perm::Admin),
             ("DELETE", "/api/teams/t1/members/u1", Perm::Admin),
+            // Custom roles (ADR 0123): routes a delegate may use, and what stays with admins.
+            ("GET", "/api/regions", Perm::ManageMachines),
+            ("GET", "/api/machines/resizes", Perm::ManageMachines),
+            ("GET", "/api/users/u1/machine/resize", Perm::ManageMachines),
+            ("GET", "/api/users/u1/region", Perm::ManageMachines),
+            ("PUT", "/api/users/u1/region", Perm::ManageMachines),
+            ("GET", "/api/users/u1/machine/screens", Perm::Admin),
+            ("DELETE", "/api/users/u1/machine/screens/b1", Perm::Admin),
+            ("POST", "/api/users/u1/handover", Perm::Admin),
+            ("GET", "/api/users/u1/isolation", Perm::Admin),
+            ("POST", "/api/users/u1/harness-login", Perm::Admin),
+            ("DELETE", "/api/users/u1", Perm::Admin),
+            ("PUT", "/api/users/u1", Perm::Admin),
+            ("POST", "/api/users/u1/machine/screens", Perm::Admin),
+            ("GET", "/api/users/u1/machine/certificates", Perm::Admin),
+            ("GET", "/api/sessions/s1", Perm::Admin),
+            ("POST", "/api/audit", Perm::Admin),
+            ("DELETE", "/api/signups/su1", Perm::Admin),
+            ("PUT", "/api/tiers", Perm::Admin),
+            ("GET", "/api/roles", Perm::Admin),
+            ("POST", "/api/roles", Perm::Admin),
+            ("GET", "/api/roles/r1", Perm::Admin),
+            ("PATCH", "/api/roles/r1", Perm::Admin),
+            ("DELETE", "/api/roles/r1", Perm::Admin),
+            ("PUT", "/api/roles/r1/users/u1", Perm::Admin),
+            ("DELETE", "/api/roles/r1/users/u1", Perm::Admin),
+            ("PUT", "/api/roles/r1/teams/t1/users/u1", Perm::Admin),
+            ("DELETE", "/api/roles/r1/teams/t1/users/u1", Perm::Admin),
             ("GET", "/", Perm::Read),
             ("GET", "/app.js", Perm::Read),
             ("HEAD", "/api/state", Perm::Read),
@@ -450,6 +631,11 @@ mod tests {
             "/api/audit/../state",
             "/api/nope",
             "/api/",
+            "/api/users/",
+            "/api/users//bots",
+            "/api/Users",
+            "/api/audit/",
+            "/api/machines/hosts//drain",
         ] {
             assert_eq!(classify(&get, p), Perm::Admin, "{p}");
         }

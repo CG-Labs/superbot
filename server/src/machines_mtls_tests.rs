@@ -214,7 +214,7 @@ async fn a_machine_enrolls_once_then_answers_over_mutual_tls() {
     let (uid, mid, token) = machine_for(&env, "ada@example.com").await;
     assert_eq!(env.app.db.machine(&mid).unwrap().enrollment, "none");
     assert_eq!(
-        env.cp.route(&env.app.db, &uid),
+        env.cp.route(&env.app, &uid),
         Err(Refusal::NotEnrolled),
         "running isn't enough: it must enroll"
     );
@@ -307,7 +307,7 @@ async fn a_machine_enrolls_once_then_answers_over_mutual_tls() {
         (true, Some(agent::VERSION), None)
     );
 
-    let Ok(Target::Machine(to)) = env.cp.route(&env.app.db, &uid) else {
+    let Ok(Target::Machine(to)) = env.cp.route(&env.app, &uid) else {
         panic!("A's machine is the target")
     };
     assert_eq!(
@@ -717,7 +717,7 @@ async fn unenrolled_rotated_and_revoked_certificates_are_refused() {
     assert_eq!(code, 401);
     assert!(reason_count(&events(&env, "access.denied").await, "revoked") >= 2);
     assert_eq!(env.app.db.machine(&mid).unwrap().enrollment, "revoked");
-    assert_eq!(env.cp.route(&env.app.db, &uid), Err(Refusal::NotEnrolled));
+    assert_eq!(env.cp.route(&env.app, &uid), Err(Refusal::NotEnrolled));
     let revoked = events(&env, "machine.cert_revoked").await;
     assert!(
         revoked
@@ -784,7 +784,7 @@ async fn a_revocation_between_a_rotations_check_and_its_write_wins() {
     );
     assert!(env.app.db.machine_pins(&mid).is_empty());
     assert_eq!(env.app.db.machine(&mid).unwrap().enrollment, "revoked");
-    assert_eq!(env.cp.route(&env.app.db, &uid), Err(Refusal::NotEnrolled));
+    assert_eq!(env.cp.route(&env.app, &uid), Err(Refusal::NotEnrolled));
     assert_eq!(
         raw(
             &env,
@@ -875,7 +875,7 @@ async fn one_users_machine_cannot_act_for_another() {
         "botd pins B's certificate, so A's agent isn't B: {err}"
     );
     assert!(env.app.db.machine(&mb).unwrap().agent_error.is_some());
-    let Ok(Target::Machine(to_b)) = env.cp.route(&env.app.db, &ub) else {
+    let Ok(Target::Machine(to_b)) = env.cp.route(&env.app, &ub) else {
         panic!("B's machine")
     };
     assert_eq!(to_b.pins, std::slice::from_ref(&b.fingerprint));
@@ -939,7 +939,7 @@ async fn suspend_holds_resume_releases_and_destroy_revokes() {
         "botd won't dial it either"
     );
     assert_eq!(
-        env.cp.route(&env.app.db, &uid),
+        env.cp.route(&env.app, &uid),
         Err(Refusal::NotReady(State::Suspended))
     );
     assert_eq!(events(&env, "machine.cert_held").await.len(), 1);
@@ -1066,7 +1066,7 @@ async fn off_without_a_control_url() {
     let m = app.db.user_machine(&uid).unwrap();
     assert!(app.db.assign_machine(&m.id, None));
     assert_eq!(
-        cp.route(&app.db, &uid),
+        cp.route(&app, &uid),
         Err(Refusal::NotEnrolled),
         "nothing can run there without enrollment"
     );
@@ -1412,7 +1412,7 @@ async fn a_machine_runs_and_relays_only_for_its_own_user() {
     );
 
     // Even if botd were tricked into it, Ada's agent won't run Bea's Bot.
-    let Ok(Target::Machine(to)) = env.cp.route(&env.app.db, &ua) else {
+    let Ok(Target::Machine(to)) = env.cp.route(&env.app, &ua) else {
         panic!("Ada's machine")
     };
     let job: wire::JobRequest = serde_json::from_value(json!({
@@ -1509,7 +1509,7 @@ async fn an_install_waits_until_a_stopped_job_has_exited_and_cleaned_up() {
     let mut env = serve().await;
     let (uid, mid, token) = machine_for(&env, "ada@example.com").await;
     let m = agent_with(&mut env, &mid, &token, CHATTY).await;
-    let Ok(Target::Machine(to)) = env.cp.route(&env.app.db, &uid) else {
+    let Ok(Target::Machine(to)) = env.cp.route(&env.app, &uid) else {
         panic!("Ada's machine")
     };
     // botd goes away mid-run, so its stream to the agent drops; or a Bot is stopped.

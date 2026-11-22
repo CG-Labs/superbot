@@ -230,8 +230,22 @@ impl Refusal {
 
 /// The routing target for `user_id`'s Bots: this server or their own machine only.
 /// Looked up by the owner, never by the Bot or the caller, so a Bot shared with others
-/// still runs on its owner's machine.
-pub fn target(db: &Db, cp: &ControlPlane, user_id: &str) -> Result<Target, Refusal> {
+/// still runs on its owner's machine. `promised`: the owner's current plan is published
+/// as getting a kernel of its own (`ControlPlane::own_kernel_for`), which holds even
+/// where their machine's recorded tier wasn't moved with the plan.
+pub fn target(db: &Db, cp: &ControlPlane, user_id: &str, promised: bool) -> Result<Target, Refusal> {
+    place(db, cp, user_id, Some(promised))
+}
+
+/// `target` for upkeep that runs no Bot there, such as file retention: the same checks
+/// but the own-kernel one (ADR 0120), which is about where Bots may run, not where
+/// their old files may be cleaned up.
+pub fn upkeep_target(db: &Db, cp: &ControlPlane, user_id: &str) -> Result<Target, Refusal> {
+    place(db, cp, user_id, None)
+}
+
+/// `kernel`: None skips the own-kernel check.
+fn place(db: &Db, cp: &ControlPlane, user_id: &str, kernel: Option<bool>) -> Result<Target, Refusal> {
     if cp.routing == Routing::Off {
         return Ok(Target::Local);
     }
@@ -245,7 +259,7 @@ pub fn target(db: &Db, cp: &ControlPlane, user_id: &str) -> Result<Target, Refus
             };
         }
     };
-    if cp.own_kernel_tiers.contains(&m.tier) && !cp.provider.as_ref().is_some_and(|p| p.name() == m.provider && p.substrate() == "vm") {
+    if kernel.is_some_and(|promised| promised || cp.own_kernel_tiers.contains(&m.tier)) && !cp.provider.as_ref().is_some_and(|p| p.name() == m.provider && p.substrate() == "vm") {
         return Err(Refusal::NotOwnKernel(m.provider.clone()));
     }
     if m.state != State::Running {
@@ -512,33 +526,33 @@ mod tests {
         let off = ControlPlane::default();
         let on = ControlPlane { routing: Routing::On, ..ControlPlane::default() };
         let assigned = ControlPlane { routing: Routing::Assigned, ..ControlPlane::default() };
-        assert_eq!(target(db, &off, &a.id), Ok(Target::Local), "routing off: this server");
-        assert_eq!(target(db, &on, &a.id), Err(Refusal::NoMachine));
-        assert_eq!(target(db, &assigned, &a.id), Ok(Target::Local), "not assigned: here, as before");
+        assert_eq!(target(db, &off, &a.id, false), Ok(Target::Local), "routing off: this server");
+        assert_eq!(target(db, &on, &a.id, false), Err(Refusal::NoMachine));
+        assert_eq!(target(db, &assigned, &a.id, false), Ok(Target::Local), "not assigned: here, as before");
 
         let ma = machine(db, &a.id, State::Provisioning);
-        assert_eq!(target(db, &on, &a.id), Err(Refusal::NotAssigned));
-        assert_eq!(target(db, &assigned, &a.id), Ok(Target::Local));
+        assert_eq!(target(db, &on, &a.id, false), Err(Refusal::NotAssigned));
+        assert_eq!(target(db, &assigned, &a.id, false), Ok(Target::Local));
         assert!(db.assign_machine(&ma.id, Some("admin")));
         for cp in [&on, &assigned] {
-            assert_eq!(target(db, cp, &a.id), Err(Refusal::NotReady(State::Provisioning)), "assigned: there or nowhere");
+            assert_eq!(target(db, cp, &a.id, false), Err(Refusal::NotReady(State::Provisioning)), "assigned: there or nowhere");
         }
         set(db, &ma.id, State::Running);
-        assert_eq!(target(db, &assigned, &a.id), Err(Refusal::NotEnrolled));
+        assert_eq!(target(db, &assigned, &a.id, false), Err(Refusal::NotEnrolled));
         recording::enroll(db, &ma);
         for cp in [&on, &assigned] {
-            let Ok(Target::Machine(to)) = target(db, cp, &a.id) else { panic!("A's machine") };
+            let Ok(Target::Machine(to)) = target(db, cp, &a.id, false) else { panic!("A's machine") };
             assert_eq!((to.machine_id.as_str(), to.user_id.as_str()), (ma.id.as_str(), a.id.as_str()));
             assert_eq!(to.pins.len(), 1);
         }
-        assert_eq!(target(db, &on, &b.id), Err(Refusal::NoMachine), "B never gets A's machine");
-        assert_eq!(target(db, &assigned, &b.id), Ok(Target::Local));
+        assert_eq!(target(db, &on, &b.id, false), Err(Refusal::NoMachine), "B never gets A's machine");
+        assert_eq!(target(db, &assigned, &b.id, false), Ok(Target::Local));
         set(db, &ma.id, State::Suspended);
-        assert_eq!(target(db, &assigned, &a.id), Err(Refusal::NotReady(State::Suspended)), "never here instead");
-        assert_eq!(target(db, &off, &a.id), Ok(Target::Local));
+        assert_eq!(target(db, &assigned, &a.id, false), Err(Refusal::NotReady(State::Suspended)), "never here instead");
+        assert_eq!(target(db, &off, &a.id, false), Ok(Target::Local));
 
         assert!(db.unassign_machine(&ma.id));
-        assert_eq!(target(db, &assigned, &a.id), Ok(Target::Local));
+        assert_eq!(target(db, &assigned, &a.id, false), Ok(Target::Local));
     }
 
     #[test]
@@ -562,15 +576,22 @@ mod tests {
             recording::enroll(db, m);
         }
 
-        assert!(matches!(target(db, &vms(&[]), &b.id), Ok(Target::Machine(_))), "off unless set");
-        assert!(matches!(target(db, &vms(&["pro"]), &b.id), Ok(Target::Machine(_))), "another tier's");
-        let r = target(db, &vms(&["starter"]), &b.id);
+        assert!(matches!(target(db, &vms(&[]), &b.id, false), Ok(Target::Machine(_))), "off unless set");
+        assert!(matches!(target(db, &vms(&["pro"]), &b.id, false), Ok(Target::Machine(_))), "another tier's");
+        let r = target(db, &vms(&["starter"]), &b.id, false);
         assert_eq!(r, Err(Refusal::NotOwnKernel("incus".into())), "a container left from before a move to VMs");
         assert_eq!(r.unwrap_err().detail().as_deref(), Some("incus"));
-        assert!(matches!(target(db, &vms(&["starter"]), &a.id), Ok(Target::Machine(_))), "this server's own VM");
+        assert!(matches!(target(db, &vms(&["starter"]), &a.id, false), Ok(Target::Machine(_))), "this server's own VM");
+        assert_eq!(
+            target(db, &vms(&["pro"]), &b.id, true),
+            Err(Refusal::NotOwnKernel("incus".into())),
+            "upgraded to a plan promised its own kernel: the old container's recorded tier doesn't count"
+        );
+        assert!(matches!(target(db, &vms(&["pro"]), &a.id, true), Ok(Target::Machine(_))), "a VM keeps the promise");
+        assert!(matches!(upkeep_target(db, &vms(&["starter"]), &b.id), Ok(Target::Machine(_))), "its old chats are still cleaned up there");
 
         let none = ControlPlane { routing: Routing::On, own_kernel_tiers: vec!["starter".into()], ..ControlPlane::default() };
-        assert_eq!(target(db, &none, &a.id), Err(Refusal::NotOwnKernel("fake".into())), "no provider to vouch for it");
+        assert_eq!(target(db, &none, &a.id, false), Err(Refusal::NotOwnKernel("fake".into())), "no provider to vouch for it");
     }
 
     #[test]
