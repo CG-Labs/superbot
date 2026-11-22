@@ -143,7 +143,30 @@ pub fn check_restore(app: &App, cp: &ControlPlane, m: &Machine, b: &MachineBacku
     Ok(())
 }
 
-/// A machine action a pin refused (`action`: `backup`, `restore`, `move` or `recover`):
+/// Whether a new machine for `user_id` in `region` may be made on `host` (None: no
+/// Incus hosts): a pinned user's only in their region, and with hosts, only on one
+/// tagged with it. Startup merely warns when tags go, so this holds without them.
+pub fn check_create(app: &App, cp: &ControlPlane, user_id: &str, region: &str, host: Option<&str>) -> Result<(), (Box<ResidencyPin>, String)> {
+    let Some(p) = of_user(app, user_id) else { return Ok(()) };
+    if region != p.region {
+        let why = format!("Its data is {}, and the machine would be in {region} (ADR 0129).", pinned_to(&p));
+        return Err((Box::new(p), why));
+    }
+    let (Some(h), Some(host)) = (cp.hosts(), host) else { return Ok(()) };
+    match h.configured().into_iter().find(|c| c.name == host).and_then(|c| c.region) {
+        Some(r) if r == p.region => Ok(()),
+        Some(r) => {
+            let why = format!("Host {host} is in {r}, and this machine's data is {} (ADR 0129).", pinned_to(&p));
+            Err((Box::new(p), why))
+        }
+        None => {
+            let why = format!("Host {host} has no data region, so nothing shows it is in {}, and this machine's data is {} (ADR 0129).", p.region, pinned_to(&p));
+            Err((Box::new(p), why))
+        }
+    }
+}
+
+/// A machine action a pin refused (`action`: `backup`, `restore`, `move`, `recover` or `create`):
 /// audited as `machine.residency_refused`.
 pub fn refused(app: &App, by: &Who, m: &Machine, action: &str, p: &ResidencyPin, why: &str) {
     let d = json!({ "reason": PINNED, "action": action, "pinnedRegion": p.region, "pinnedOn": p.subject_type, "reference": p.reference, "error": why });

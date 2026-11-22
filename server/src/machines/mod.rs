@@ -839,6 +839,16 @@ async fn provision(
                 return m;
             }
         };
+        // Checked on every attempt, retries included: a pin's region may have lost its
+        // host tags since the machine was asked for (ADR 0129).
+        if let Err((pin, why)) = residency::check_create(app, cp, &m.user_id, &m.region, host.as_deref()) {
+            if m.last_error.as_deref() != Some(why.as_str()) {
+                residency::refused(app, by, &m, "create", &pin, &why);
+                m.last_error = Some(why);
+                app.db.save_machine(&m, m.state);
+            }
+            return m;
+        }
         // The firewall first: a machine is never made without one, nor a token minted for
         // a create that won't be sent. Only on its host, so a failing one can't hold it up.
         let on = match (&host, p.hosts()) {
@@ -1504,13 +1514,19 @@ pub(crate) async fn request_as(app: &AppState, cp: &ControlPlane, by: &Who, key:
     };
     // Refused up front when no host has room (ADR 0081), rather than left waiting.
     let place = |plan: &str, region: &str| -> Res<()> {
-        match p.hosts().map(|_| placement::choose(&app, cp, plan, region, None)) {
+        let host = match p.hosts().map(|_| placement::choose(&app, cp, plan, region, None)) {
             Some(Err(why)) => {
                 placement::failed(&app, &by, &u.id, None, plan, &why);
-                Err(conflict(why))
+                return Err(conflict(why));
             }
-            _ => Ok(()),
-        }
+            Some(Ok(h)) => Some(h),
+            None => None,
+        };
+        residency::check_create(&app, cp, &u.id, region, host.as_deref()).map_err(|(pin, why)| {
+            let d = json!({ "reason": residency::PINNED, "action": "create", "region": region, "pinnedRegion": pin.region, "pinnedOn": pin.subject_type, "reference": pin.reference, "userEmail": u.email, "error": why });
+            app.db.record(&by.event("machine.residency_refused").target("user", &u.id).outcome(Outcome::Denied).details(d));
+            conflict(why)
+        })
     };
     let m = match app.db.user_machine(&u.id) {
         Some(mut m) if m.state == State::Error => {

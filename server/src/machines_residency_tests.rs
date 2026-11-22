@@ -171,6 +171,35 @@ async fn without_a_store_in_the_region_a_pin_is_refused_and_pinned_backups_resto
     assert!(env.a.instance(&m.label).is_none() && env.c.instance(&m.label).is_none(), "never made in London");
 }
 
+#[tokio::test]
+async fn a_pinned_users_machine_isnt_made_on_a_host_with_no_region() {
+    // A pin made while hosts were tagged; the tags have gone since, so startup only warns.
+    let env = serve_with(|a, b, c| Fleet::new(vec![a, b, c], DOWN_MS).with_policy(Policy::Fill)).await;
+    let (ada, _) = user_with(env.port, &env.admin, "ada@example.com", "member").await;
+    env.app.db.set_residency_pin(PinOn::User, &ada, "local", "DPA-1", None);
+
+    let (code, v) = json_call(&env, "POST", &format!("/api/users/{ada}/machine"), "").await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("Host a has no data region"), "{v}");
+    let refused = events(&env, "machine.residency_refused").await;
+    assert_eq!(
+        (refused.len(), refused[0]["details"]["action"].as_str(), refused[0]["targetId"].as_str(), refused[0]["outcome"].as_str()),
+        (1, Some("create"), Some(ada.as_str()), Some("denied")),
+        "{refused:?}"
+    );
+    assert!(env.app.db.user_machine(&ada).is_none());
+
+    // One asked for before the pin is held back on every attempt, and audited once.
+    let new = crate::db::NewMachine { user_id: &ada, provider: "incus", label_prefix: &env.cp.label_prefix, tier: "starter", plan: "g6-standard-1", region: "local", created_by: None };
+    let m = env.app.db.add_machine(&new).ok().unwrap();
+    reconcile(&env).await;
+    reconcile(&env).await;
+    let m = env.app.db.machine(&m.id).unwrap();
+    assert!(m.provider_id.is_none() && m.last_error.as_deref().unwrap_or_default().contains("has no data region"), "{m:?}");
+    assert!([&env.a, &env.b, &env.c].iter().all(|s| s.instance(&m.label).is_none()), "never made");
+    assert_eq!(events(&env, "machine.residency_refused").await.len(), 2, "once for the request, once for the waiting machine");
+}
+
 /// Linode, with MACHINE_REGIONS=gb-lon,de-fra-2.
 async fn linode() -> (u16, AppState, String) {
     let fake = Arc::new(Fake::default());
