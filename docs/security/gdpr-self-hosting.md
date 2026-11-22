@@ -42,8 +42,9 @@ Set these in `.env` to match your retention policy. Each deletion pass is audite
 | Teammates' archived work | `TEAMMATE_FILES_RETENTION_DAYS` ([ADR 0112](../adr/0112-harness-session-and-teammate-files-retention.md)) | Kept forever |
 | Audit log | `AUDIT_RETENTION_DAYS` ([deploy guide](../../deploy/README.md#audit-log-retention)) | Kept forever |
 | Sessions | `SESSION_IDLE_TIMEOUT`, `SESSION_MAX_AGE` | 7 days idle, 30 days at most |
-| Server backups | `SUPERBOT_BACKUP_RETENTION_DAYS` on the host, `SERVER_BACKUP_RETENTION_DAYS` off it ([ADR 0109](../adr/0109-server-backups-off-the-host.md)) | 14 days, 30 days |
-| Incus machine backups | `MACHINE_BACKUP_RETENTION`, per plan ([ADR 0071](../adr/0071-off-host-machine-backups.md)) | 14 days |
+| Server backups | `SUPERBOT_BACKUP_RETENTION_DAYS` on the host, `SERVER_BACKUP_RETENTION_DAYS` off it ([ADR 0109](../adr/0109-server-backups-off-the-host.md)) | 14 days, 30 days; the newest off-host copy is always kept |
+| Incus machine backups | `MACHINE_BACKUP_RETENTION`, per plan ([ADR 0071](../adr/0071-off-host-machine-backups.md)) | 14 days; the newest of a live machine is always kept |
+| Linode machine backups | Linode's own ([machine recovery objectives](machine-recovery-objectives.md#linode-machines)) | The newest daily one and two weekly ones, deleted with the machine |
 | Access requests from the signup form | None | Kept until deleted (see [what is missing](#what-exists-and-what-is-missing)) |
 
 `botctl retention` shows the settings, each last pass and held Bots. A Bot an admin holds (`botctl retention hold`, a legal hold) is skipped by retention and can't be deleted or erased until released ([ADR 0098](../adr/0098-chat-retention.md)). Deleted rows stay in server backups until the backups' own retention ends.
@@ -87,7 +88,7 @@ Before you run it:
 After it:
 
 1. **Per-user account.** With per-user accounts on, the answer says `isolationFolderLeft`. Remove the OS account (`sb-u-<id>`) and its folder under `ISOLATION_DIR` as root; SuperBot has no command for it yet.
-2. **Backups.** Server backups keep their data until their retention ends (14 days on the host, 30 off it, by default). Restoring an older backup brings the person back, so keep your own record of erasures outside SuperBot (the restored audit log won't have them) and erase again after any restore.
+2. **Backups.** Server backups keep their data until their retention ends (14 days on the host, 30 off it, by default). The newest off-host copy is never deleted for age: while backups keep running it is one taken after the erasure, but if they stop, the last copy keeps the person's data until you delete it by hand. Check `botctl backups` shows a copy newer than the erasure before you confirm it. Restoring an older backup brings the person back, so keep your own record of erasures outside SuperBot (the restored audit log won't have them) and erase again after any restore.
 3. **Outside services.** Delete their Stripe customer if you have no legal need to keep invoices. What Bots already sent to model providers is held under those providers' terms.
 4. **What erasure doesn't reach**: other people's Bots' memory and chat text that mention them by name, short names in old audit details, and work they left in an owner's `from-teammates/` folder (that owner's files). Harness session files and archived work go by their retention settings ([ADR 0102](../adr/0102-erasing-a-users-data.md)).
 
