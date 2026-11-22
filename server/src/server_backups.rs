@@ -524,11 +524,18 @@ pub fn watch(app: &AppState, sb: &ServerBackups) -> bool {
         }
         (false, Some(at)) => {
             app.db.clear_setting(BREACH);
-            let reason = if sb.target.is_none() { "off" } else if st.covered_since.is_some_and(|c| c > at - sb.rpo_ms) { "backed_up" } else { "objective_changed" };
+            // Only a copy that landed is a recovery: a new store's RPO clock is not.
+            let copied = st.last.as_ref().map(|b| b.created_at);
+            let reason = match copied {
+                _ if sb.target.is_none() => "off",
+                Some(c) if c > at - sb.rpo_ms => "backed_up",
+                None => "store_changed",
+                Some(_) => "objective_changed",
+            };
             let d = json!({ "reason": reason, "breachedAt": at, "durationMs": now() - at, "coveredSince": st.covered_since });
             app.db.record(&Event::new(Actor::system(ACTOR), "server.backup_rpo_recovered").target("server", "backups").details(d));
             if reason == "backed_up" {
-                let lines = vec![format!("They were past their RPO for {}.", ago(now() - at)), format!("Newest archive off the host: {}.", st.covered_since.map(time).unwrap_or_default())];
+                let lines = vec![format!("They were past their RPO for {}.", ago(now() - at)), format!("Newest archive off the host: {}.", copied.map(time).unwrap_or_default())];
                 alert(app, "server.backup_rpo_recovered", "Server backups are back within their RPO", lines);
             }
             false

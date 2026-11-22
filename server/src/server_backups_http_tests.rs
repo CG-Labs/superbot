@@ -340,6 +340,18 @@ async fn a_new_store_starts_empty_and_the_old_one_is_left_alone() {
 }
 
 #[tokio::test]
+async fn a_new_store_closes_a_breach_without_calling_it_a_recovery() {
+    let s = setup(Vec::new(), Some(30)).await;
+    archive(&s.dir, 30 * HOUR, false, b"old");
+    server_backups::pass(&s.app).await.unwrap();
+    assert!(server_backups::watch(&s.app, s.app.server_backups.get().unwrap()), "30 hours > 26");
+    let moved = ServerBackups::with(&s.dir, Some(Target::new(s.s3.settings(), "moved/", Source::Own, Vec::new()).unwrap()));
+    assert!(!server_backups::watch(&s.app, &moved));
+    let ev = audit(&s, "server.backup_rpo_recovered").await;
+    assert_eq!((ev.len(), ev[0]["details"]["reason"].as_str()), (1, Some("store_changed")), "{ev:?}");
+}
+
+#[tokio::test]
 async fn the_checklist_waits_for_the_first_copy() {
     let s = setup(Vec::new(), Some(30)).await;
     let (_, body) = call(s.port, "GET", "/api/setup", &s.admin, "").await;
