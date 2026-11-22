@@ -33,13 +33,13 @@ Scope: the managed service. A self-hosting customer is its own service organisat
 | Area | Done | Partial | Gap |
 |------|------|---------|-----|
 | CC1 Control environment | 0 | 0 | 5 |
-| CC2 Communication and information | 1 | 1 | 4 |
+| CC2 Communication and information | 1 | 2 | 3 |
 | CC3 Risk assessment | 0 | 1 | 4 |
 | CC4 Monitoring activities | 0 | 1 | 1 |
 | CC5 Control activities | 2 | 0 | 2 |
 | CC6 Logical and physical access | 7 | 4 | 6 |
 | CC7 System operations | 3 | 1 | 5 |
-| CC8 Change management | 0 | 0 | 3 |
+| CC8 Change management | 1 | 0 | 2 |
 | CC9 Risk mitigation | 0 | 1 | 3 |
 | A1 Availability | 3 | 1 | 2 |
 | C1 Confidentiality | 0 | 1 | 2 |
@@ -61,7 +61,7 @@ Scope: the managed service. A self-hosting customer is its own service organisat
 | CC2.1-1 | Metrics, alert rules and dashboards for the service | Product | Engineering lead | Dashboard definitions in the repository; screenshots of live dashboards; alert history | Partial | A Prometheus endpoint and structured logs ([ADR 0089](../adr/0089-metrics-and-structured-logs.md), [PR #150](https://github.com/CG-Labs/superbot/pull/150)) and SLO burn-rate alert rules tested with `promtool` ([`deploy/prometheus/superbot-slo.rules.yml`](../../deploy/prometheus/superbot-slo.rules.yml), [ADR 0090](../adr/0090-status-page-and-uptime-slo.md)). A host capacity dashboard and alert rules (A1.1-1, [ADR 0106](../adr/0106-host-capacity-metrics.md), [`deploy/grafana/superbot-capacity.json`](../../deploy/grafana/superbot-capacity.json)). No dashboards for requests and runs, and no error reporting. |
 | CC2.1-2 | Audit events exported to a SIEM | Product | Engineering lead | Export configuration; events arriving in the SIEM | Gap | The audit log is only in SQLite, with CSV export (ADR 0009). Planned for M5. |
 | CC2.2-1 | Security policies communicated to personnel, with awareness training | Process | People lead | Policy portal or handbook; training completion records | Gap | ADRs and this pack are public, but they describe the product, not staff duties. |
-| CC2.3-1 | A vulnerability-disclosure policy and security contact | Process | Security owner | `SECURITY.md`; GitHub private vulnerability reporting turned on; a log of reports and responses | Gap | There is no `SECURITY.md`, and GitHub's private vulnerability reporting is off for the repository. Turn it on before publishing a policy that points at it. |
+| CC2.3-1 | A vulnerability-disclosure policy and security contact | Process | Security owner | `SECURITY.md`; GitHub private vulnerability reporting turned on; a log of reports and responses | Partial | [`SECURITY.md`](../../SECURITY.md) says which versions get fixes, to report privately through GitHub's private vulnerability reporting (no email address or person is named), target times (acknowledge in 3 days, assess in 10, fix Critical and High in 30 days, the rest in 90), scope and safe harbour ([ADR 0111](../adr/0111-changelog-and-github-releases.md)). Owner steps left: turn private vulnerability reporting on in the repository's settings (until then the policy's report form isn't offered), add a contact for the managed service if wanted (the policy's operator TODO), and keep a log of reports and responses. |
 | CC2.3-2 | A public status page for availability incidents | Product | Operator | Status page history; incident notes posted within the SLO's 15 minutes | Done | `/status` and `/status.json`, with incident notes admins post in the console, and an SLO that commits to posting within 15 minutes of confirming an outage ([ADR 0090](../adr/0090-status-page-and-uptime-slo.md), [`server/src/status.rs`](../../server/src/status.rs), [SLO](../slo.md), [PR #151](https://github.com/CG-Labs/superbot/pull/151)). |
 | CC2.3-3 | Privacy policy, terms of service and a DPA | Process | Privacy lead | Published documents; signed DPAs | Gap | None. GDPR docs are on the M4 roadmap. |
 
@@ -133,7 +133,7 @@ Scope: the managed service. A self-hosting customer is its own service organisat
 |----|------|------|-------|---------------------|--------|-----------------|
 | CC8.1-1 | Branch protection and required reviews on `main` | Process | Engineering lead | Exported branch protection settings; a sample of PRs with approvals and green checks | Gap | Changes reach `main` through PRs that run CI, but branch protection is a GitHub setting this repository can't show. |
 | CC8.1-2 | A change-management policy with segregation of duties and an emergency-change process | Process | Engineering lead | The policy; emergency changes with after-the-fact approval | Gap | None. |
-| CC8.1-3 | Release notes for each release | Process | Engineering lead | A changelog or GitHub release per tag | Gap | Images are tagged by commit and semver (ADR 0084), but there is no changelog and no GitHub releases. |
+| CC8.1-3 | Release notes for each release | Process | Engineering lead | A changelog or GitHub release per tag | Done | [`CHANGELOG.md`](../../CHANGELOG.md) (Keep a Changelog) holds a section per version, newest first; its newest version must be `server/Cargo.toml`'s. The [`release`](../../.github/workflows/release.yml) workflow checks it on every change to it or the version and on every tag, fails a `v<semver>` tag with no dated section or a version that doesn't match, and turns each tag on `main` into a GitHub release with that section as its notes, with only that job able to write; the logic is [`deploy/release-notes.sh`](../../deploy/release-notes.sh), ShellCheck-clean and self-tested in CI, and [`server/tests/release_workflow.rs`](../../server/tests/release_workflow.rs) checks the workflow ([ADR 0111](../adr/0111-changelog-and-github-releases.md)). Tags stay manual: no release exists until an engineering lead dates the 0.1.0 section and tags `v0.1.0`. |
 
 ## CC9: Risk mitigation
 

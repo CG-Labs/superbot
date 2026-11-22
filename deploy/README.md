@@ -711,7 +711,7 @@ Each merge to `main` and each release publishes both images for amd64 and arm64 
 | `SUPERBOT_VERSION` | What |
 |--------------------|------|
 | `main` (default) | The latest merge to `main`, and a weekly rebuild with Debian's security fixes |
-| `1.2.3`, `1.2`, `1`, `latest` | A release, once there are any |
+| `1.2.3`, `1.2`, `1`, `latest` | A release, once there are any; what changed in each is in [CHANGELOG.md](../CHANGELOG.md) and on its GitHub release |
 | `sha-<7-char commit>` | Exactly the build of that commit on `main` |
 
 Set `SUPERBOT_IMAGE` and `SUPERBOT_CADDY_IMAGE` to use images from somewhere else (a mirror, or your own registry).
