@@ -4,7 +4,8 @@ name: docs
 # config, so a change to any of them can break one. Changes to server/, deploy/ and
 # apps/client/ run the same test in the server workflow's `cargo test`. Any change under
 # .github/ also checks that actions stay pinned by commit (ADR 0100) and that the docker
-# workflow still scans, signs and attests its images (ADR 0101).
+# workflow still scans, signs and attests its images (ADR 0101), and that the release
+# workflow checks CHANGELOG.md and publishes only from checked tags (ADR 0111).
 on:
   push:
     paths:
@@ -12,6 +13,9 @@ on:
       - 'server/tests/security_docs_links.rs'
       - 'server/tests/actions_pinned.rs'
       - 'server/tests/image_supply_chain.rs'
+      - 'server/tests/release_workflow.rs'
+      - 'CHANGELOG.md'
+      - 'SECURITY.md'
       - '.github/**'
       - '.grype.yaml'
       - 'deploy/README.md'
@@ -22,6 +26,9 @@ on:
       - 'server/tests/security_docs_links.rs'
       - 'server/tests/actions_pinned.rs'
       - 'server/tests/image_supply_chain.rs'
+      - 'server/tests/release_workflow.rs'
+      - 'CHANGELOG.md'
+      - 'SECURITY.md'
       - '.github/**'
       - '.grype.yaml'
       - 'deploy/README.md'
@@ -43,3 +50,5 @@ jobs:
       - run: cargo test --test actions_pinned
       # ADR 0101: images are scanned, signed and attested, with minimal permissions.
       - run: cargo test --test image_supply_chain
+      # ADR 0111: CHANGELOG.md is checked and each tag becomes a release, with minimal permissions.
+      - run: cargo test --test release_workflow

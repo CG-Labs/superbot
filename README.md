@@ -105,6 +105,8 @@ Details: [VM specs](docs/background/grok-bot-computer-specs.md) and [running man
 - [Grok Bot reference](docs/grok-bot-reference.md): what we are rebuilding.
 - [Architecture](docs/architecture.md): the plan and open decisions.
 - [Backend](docs/backend.md): how the server works, and how to run and deploy it.
+- [Changelog](CHANGELOG.md): what changed in each release.
+- [Security policy](SECURITY.md): how to report a vulnerability privately.
 
 ## Status
 
