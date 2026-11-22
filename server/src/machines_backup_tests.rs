@@ -224,7 +224,7 @@ async fn a_machine_is_backed_up_off_host_and_restored_to_enroll_anew() {
 
     // Bots wait, and nothing else starts, until it has enrolled again.
     assert!(env.app.db.assign_machine(&m.id, None));
-    assert_eq!(env.cp.route(&env.app.db, &uid).err().map(|r| r.reason()), Some("machine_restoring"));
+    assert_eq!(env.cp.route(&env.app, &uid).err().map(|r| r.reason()), Some("machine_restoring"));
     let (code, again) = json_call(&env, "POST", &format!("/api/users/{uid}/machine/restore"), &json!({ "backupId": b.id }).to_string()).await;
     assert_eq!(code, 409, "{again}");
     let (code, busy) = json_call(&env, "POST", &format!("/api/users/{uid}/machine/backups"), "").await;
@@ -243,7 +243,7 @@ async fn a_machine_is_backed_up_off_host_and_restored_to_enroll_anew() {
     assert!(!certs_before.contains(&pins[0]), "a new certificate");
     let restored = events(&env, "machine.restored").await;
     assert_eq!(restored.len(), 1, "{restored:?}");
-    assert!(env.cp.route(&env.app.db, &uid).is_ok());
+    assert!(env.cp.route(&env.app, &uid).is_ok());
     let (_, status) = json_call(&env, "GET", &format!("/api/users/{uid}/machine/restore"), "").await;
     assert_eq!(status["restore"]["state"].as_str(), Some("done"), "{status}");
 }
