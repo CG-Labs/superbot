@@ -639,8 +639,8 @@ async function loadRoles({ keepForm = false } = {}) {
     rolesTab.teams = allTeams;
     $("roles-empty").textContent = "No custom roles yet. Make one below to give part of admin away.";
   } catch (err) {
-    roles = NO_ROLES;
     $("roles-empty").textContent = err.message;
+    fail(err);
   }
   renderRoles(keepForm);
 }
@@ -714,6 +714,7 @@ $("role-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const body = { name: $("role-name").value.trim(), description: $("role-description").value.trim(), base: $("role-base").value, permissions: checkedPerms() };
   const r = roles.roles.find((x) => x.id === rolesTab.editing);
+  if (rolesTab.editing && !r) return fail(new Error("That role didn't load. Reload the page before saving."));
   try {
     if (r) {
       if (r.base !== body.base && r.users && !confirm(`${r.users === 1 ? "The 1 person who has" : `The ${r.users} people who have`} ${r.name} across the server move to ${baseName(body.base)} at once. Save?`)) return;
