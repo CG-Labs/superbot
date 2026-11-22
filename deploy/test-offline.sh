@@ -265,10 +265,10 @@ for p in $(jq -r '.[0].Config, .[0].Layers[]' "$O/manifest.json"); do [[ -f "$O/
 ok "an image is checked by the digest its tag names, and bundled for this arch as an OCI archive with the registry's digest that docker load also reads"
 
 ibuild "$T/iown" --image own=own-image:2 --allow-unsigned >"$T/iown.log" 2>&1 || { cat "$T/iown.log" >&2; fail "a local image didn't bundle"; }
-tar -xOf "$T/iown/$TOP.tar.gz" "$TOP/images/own.digest" | grep -qx "$OWN" || fail "the local image wasn't bundled from docker save"
-tar -xOf "$T/iown/$TOP.tar.gz" "$TOP/MANIFEST" | grep -qx "unsigned_images=true" || fail "MANIFEST doesn't say an image is unsigned"
+[[ "$(tar -xOf "$T/iown/$TOP.tar.gz" "$TOP/images/own.digest")" == "$OWN" ]] || fail "the local image wasn't bundled from docker save"
+grep -qx "unsigned_images=true" <<<"$(tar -xOf "$T/iown/$TOP.tar.gz" "$TOP/MANIFEST")" || fail "MANIFEST doesn't say an image is unsigned"
 ibuild "$T/iunsigned" --image u=reg.test/cg/unsigned:1.0.0 --allow-unsigned >/dev/null 2>&1 || fail "an unsigned registry image didn't bundle"
-tar -xOf "$T/iunsigned/$TOP.tar.gz" "$TOP/images/u.digest" | grep -qx "$MINE" || fail "an unsigned registry image wasn't this arch's"
+[[ "$(tar -xOf "$T/iunsigned/$TOP.tar.gz" "$TOP/images/u.digest")" == "$MINE" ]] || fail "an unsigned registry image wasn't this arch's"
 ok "--allow-unsigned bundles a local image through docker save, or a registry's for this arch"
 
 irefused() {
