@@ -61,7 +61,9 @@ Tested in CI on real hosts: no Bot reaches another user's folder or logins, or b
 - Append-only: database triggers refuse updates, and deletes except retention pruning. This guards against mistakes and API misuse, not someone with write access to the database file. Kept forever unless `AUDIT_RETENTION_DAYS` is set.
 - Admins view and filter it in the apps and export CSV ([ADR 0028](../adr/0028-client-admin-console-link-and-audit.md), [ADR 0060](../adr/0060-client-audit-detail-and-filters.md)).
 - **Access reviews**: admins see one report of everyone's role, status, team, SCIM tenant, second factor, last sign-in, Bot access, sessions and API tokens (never the tokens), and machine, export it as dated CSV, and sign it off; the sign-off is an `access_review.completed` event ([ADR 0099](../adr/0099-access-review-report.md)).
-- **Planned:** tamper evidence (hash chain, write-once storage, shipping events off the server) (M5, [ADR 0009](../adr/0009-audit-events.md)).
+- **Tamper-evident**: every event is sealed onto a SHA-256 hash chain. `botctl audit verify` names the first changed, removed, added or reordered event, and checks hashes pinned from a copy kept elsewhere ([ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md)).
+- **SIEM export**: off by default; `AUDIT_EXPORT` sends every event, with its hashes, as JSON lines over HTTPS or syslog over TLS ([guide](../ops/audit-export.md)).
+- **Planned:** write-once storage for exported events (M5).
 
 ## Licence key (self-host)
 
