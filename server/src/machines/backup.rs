@@ -301,9 +301,11 @@ impl Settings {
     /// control plane's, which every tier these name must be one of (empty: unchecked).
     /// `regions`: MACHINE_REGIONS, each of which may have its own store
     /// (MACHINE_BACKUP_S3_<REGION>_BUCKET and the rest, `store_name`), with
-    /// MACHINE_BACKUP_S3_DATA_REGION and MACHINE_BACKUP_RESIDENCY (ADR 0117).
-    pub fn from_env(store: &dyn SecretStore, var: &dyn Fn(&str) -> String, tiers: &[String], regions: &[String]) -> Result<Option<Settings>, String> {
-        let regional: Vec<&String> = regions.iter().filter(|r| !var(&format!("{}_BUCKET", store_name(r))).trim().is_empty()).collect();
+    /// MACHINE_BACKUP_S3_DATA_REGION and MACHINE_BACKUP_RESIDENCY (ADR 0117). `kept`:
+    /// regions no longer offered whose stores are still set, so their backups stay
+    /// reachable for restores, retention and deletion.
+    pub fn from_env(store: &dyn SecretStore, var: &dyn Fn(&str) -> String, tiers: &[String], regions: &[String], kept: &[String]) -> Result<Option<Settings>, String> {
+        let regional: Vec<&String> = regions.iter().chain(kept).filter(|r| !var(&format!("{}_BUCKET", store_name(r))).trim().is_empty()).collect();
         if var("MACHINE_BACKUP_S3_BUCKET").trim().is_empty() {
             if let Some(r) = regional.first() {
                 return Err(format!("{}_BUCKET is set but MACHINE_BACKUP_S3_BUCKET isn't; region stores add to the default store, which turns machine backups on", store_name(r)));
@@ -382,6 +384,22 @@ impl Settings {
     }
 }
 
+/// The data regions `keys` (setting names) give a store of their own:
+/// MACHINE_BACKUP_S3_<REGION>_BUCKET, back to the region's id.
+pub fn named_stores(keys: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = keys
+        .into_iter()
+        .filter_map(|k| {
+            let r = k.strip_prefix("MACHINE_BACKUP_S3_")?.strip_suffix("_BUCKET")?;
+            let ok = !r.is_empty() && !r.starts_with('_') && !r.ends_with('_') && r.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+            ok.then(|| r.to_ascii_lowercase().replace('_', "-"))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Off-host backups, on: the settings and the stores.
 pub struct Offsite {
     pub s: Settings,
@@ -431,6 +449,16 @@ impl Offsite {
                 format!("Its store, {r}'s, isn't set any more; set {}_BUCKET and the rest again to reach it.", store_name(r))
             }),
         }
+    }
+
+    /// Stores that backups in `recorded` are in but that aren't set any more: those
+    /// backups can't be restored, expired or deleted until they are.
+    pub fn unreachable(&self, recorded: &[String]) -> Vec<String> {
+        recorded
+            .iter()
+            .filter(|r| !self.stores.iter().any(|(s, _)| s == *r))
+            .map(|r| format!("Backups in {r}'s store can't be restored, expired or deleted: {}_BUCKET and the rest aren't set any more (ADR 0117).", store_name(r)))
+            .collect()
     }
 
     /// What data regions say about where backups go, for startup and admins.
@@ -1545,7 +1573,7 @@ mod tests {
         let keys = EnvStore::fixed(&[("MACHINE_BACKUP_S3_ACCESS_KEY_ID", "AKID"), ("MACHINE_BACKUP_S3_SECRET_ACCESS_KEY", "s3cret-0123")]);
         let with = |vars: &[(&str, &str)]| {
             let vars: Vec<(String, String)> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-            Settings::from_env(&keys, &move |k| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default(), &[], &[])
+            Settings::from_env(&keys, &move |k| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default(), &[], &[], &[])
         };
         assert!(with(&[]).unwrap().is_none());
         let stray = with(&[("MACHINE_BACKUP_RETENTION", "7")]).err().unwrap();
@@ -1572,7 +1600,7 @@ mod tests {
             "MACHINE_BACKUP_S3_BUCKET" => "backups".into(),
             "MACHINE_BACKUP_S3_ENDPOINT" => "https://s3.example.com".into(),
             _ => String::new(),
-        }, &[], &[]);
+        }, &[], &[], &[]);
         assert!(no_keys.err().unwrap().contains("MACHINE_BACKUP_S3_"));
     }
 
@@ -1581,7 +1609,7 @@ mod tests {
         let mut all: Vec<(String, String)> = vec![("MACHINE_BACKUP_S3_BUCKET".into(), "backups".into()), ("MACHINE_BACKUP_S3_ENDPOINT".into(), "https://s3.example.com".into())];
         all.extend(vars.iter().map(|(k, v)| (k.to_string(), v.to_string())));
         let tiers: Vec<String> = tiers.iter().map(|t| t.to_string()).collect();
-        Settings::from_env(&keys, &move |k| all.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default(), &tiers, &[]).map(Option::unwrap)
+        Settings::from_env(&keys, &move |k| all.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default(), &tiers, &[], &[]).map(Option::unwrap)
     }
 
     #[test]
@@ -1622,14 +1650,15 @@ mod tests {
             ("MACHINE_BACKUP_S3_DE_FRA_2_ACCESS_KEY_ID", "AKID2"),
             ("MACHINE_BACKUP_S3_DE_FRA_2_SECRET_ACCESS_KEY", "s3cret-4567"),
         ]);
-        let with = |vars: &[(&str, &str)], default: bool| {
+        let within = |vars: &[(&str, &str)], default: bool, regions: &[String], kept: &[String]| {
             let mut all: Vec<(String, String)> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
             if default {
                 all.push(("MACHINE_BACKUP_S3_BUCKET".into(), "backups".into()));
                 all.push(("MACHINE_BACKUP_S3_ENDPOINT".into(), "https://gb-lon-1.linodeobjects.com".into()));
             }
-            Settings::from_env(&keys, &move |k| all.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default(), &[], &regions)
+            Settings::from_env(&keys, &move |k| all.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default(), &[], regions, kept)
         };
+        let with = |vars: &[(&str, &str)], default: bool| within(vars, default, &regions, &[]);
         let fra = [("MACHINE_BACKUP_S3_DE_FRA_2_BUCKET", "backups-fra"), ("MACHINE_BACKUP_S3_DE_FRA_2_ENDPOINT", "https://de-fra-1.linodeobjects.com")];
         assert_eq!(store_name("de-fra-2"), "MACHINE_BACKUP_S3_DE_FRA_2");
 
@@ -1668,6 +1697,18 @@ mod tests {
             let e = with(vars, default).err().unwrap_or_else(|| panic!("{vars:?} should fail"));
             assert!(e.contains(want), "{vars:?}: {e}");
         }
+
+        // Frankfurt no longer offered: its store stays reachable for the backups in it.
+        let london = vec!["gb-lon".to_string()];
+        let off = Offsite::new(within(&[fra[0], fra[1], ("MACHINE_BACKUP_S3_DATA_REGION", "gb-lon")], true, &london, &["de-fra-2".into()]).unwrap().unwrap()).unwrap();
+        assert!(off.s3_of(Some("de-fra-2")).is_ok());
+        assert!(off.warnings().is_empty(), "{:?}", off.warnings());
+        assert!(off.unreachable(&["de-fra-2".into()]).is_empty());
+        let off = Offsite::new(within(&[("MACHINE_BACKUP_S3_DATA_REGION", "gb-lon")], true, &london, &[]).unwrap().unwrap()).unwrap();
+        let lost = off.unreachable(&["de-fra-2".into()]);
+        assert!(lost.len() == 1 && lost[0].contains("MACHINE_BACKUP_S3_DE_FRA_2_BUCKET"), "{lost:?}");
+        let names = ["MACHINE_BACKUP_S3_BUCKET", "MACHINE_BACKUP_S3_DE_FRA_2_BUCKET", "MACHINE_BACKUP_S3_DE_FRA_2_ENDPOINT", "MACHINE_BACKUP_S3_GB_LON_BUCKET", "MACHINE_BACKUP_S3__BUCKET", "SERVER_BACKUP_S3_BUCKET"];
+        assert_eq!(named_stores(names.map(String::from)), ["de-fra-2", "gb-lon"]);
     }
 
     #[test]

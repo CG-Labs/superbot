@@ -309,7 +309,9 @@ impl ControlPlane {
     ) -> Result<ControlPlane, String> {
         let mut cp = ControlPlane::provider_from_env(store, &var)?;
         let tiers: Vec<String> = cp.tiers.iter().map(|(t, _)| t.clone()).collect();
-        if let Some(s) = backup::Settings::from_env(store, &var, &tiers, &cp.regions)? {
+        // A region dropped from MACHINE_REGIONS keeps its store while it's set, for the backups in it.
+        let kept: Vec<String> = backup::named_stores(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok())).into_iter().filter(|r| !cp.regions.contains(r)).collect();
+        if let Some(s) = backup::Settings::from_env(store, &var, &tiers, &cp.regions, &kept)? {
             let p = cp.provider.as_deref().ok_or(format!("MACHINE_BACKUP_S3_BUCKET needs the control plane: {NEEDS_IT}"))?;
             if !p.exports() {
                 return Err(format!(
@@ -1390,6 +1392,9 @@ pub(crate) async fn request_as(app: &AppState, cp: &ControlPlane, by: &Who, key:
             cp.regions.join(", ")
         )));
     }
+    // Held from here, so a region change can't land between reading it and making the machine.
+    let _g = cp.ops.lock().await;
+    let u = app.db.user(&u.id).ok_or_else(|| not_found("User"))?;
     // The region set for them or their team (ADR 0117) is where it goes, or nowhere.
     let home = region::effective(&app, cp, &u);
     if let Some(r) = asked_region.as_deref().filter(|r| home.binding() && *r != home.region) {
@@ -1426,7 +1431,6 @@ pub(crate) async fn request_as(app: &AppState, cp: &ControlPlane, by: &Who, key:
             _ => Ok(()),
         }
     };
-    let _g = cp.ops.lock().await;
     let m = match app.db.user_machine(&u.id) {
         Some(mut m) if m.state == State::Error => {
             cp.need_own(&m)?;

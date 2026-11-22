@@ -7372,6 +7372,13 @@ impl Db {
     }
 
     /// Backups of any of the user's machines, destroyed ones too, not yet deleted.
+    /// Every data region's store a kept backup is in (ADR 0117).
+    pub fn machine_backup_stores(&self) -> Vec<String> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT DISTINCT store_region FROM machine_backups WHERE store_region IS NOT NULL AND state <> 'deleted' ORDER BY store_region").unwrap();
+        s.query_map([], |r| r.get(0)).unwrap().filter_map(Result::ok).collect()
+    }
+
     pub fn user_machine_backups_kept(&self, user_id: &str) -> Vec<MachineBackup> {
         let c = self.c();
         let mut s = c.prepare("SELECT * FROM machine_backups WHERE user_id = ? AND state <> 'deleted' ORDER BY created_at, id").unwrap();

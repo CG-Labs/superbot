@@ -566,7 +566,8 @@ async fn main() {
         ..Auth::new(Some(app.clone()))
     });
     log_info!("Control plane: {}.", auth_state.machines.describe());
-    for w in auth_state.machines.offsite.as_deref().map(|o| o.warnings()).unwrap_or_default() {
+    let recorded = app.db.machine_backup_stores();
+    for w in auth_state.machines.offsite.as_deref().map(|o| [o.warnings(), o.unreachable(&recorded)].concat()).unwrap_or_default() {
         log_warn!("WARNING: {w}");
     }
     if let Some(m) = auth_state.payments.meter() {

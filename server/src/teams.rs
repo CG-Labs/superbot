@@ -266,19 +266,29 @@ async fn join(app: &AppState, by: &Who, team: &Team, user: &User, role: &str, vi
     if !user.active() && via != SCIM {
         return Err(conflict("This person is disabled. Enable them first."));
     }
-    // Their data region becomes the team's (ADR 0117): never while their machine is elsewhere.
-    if control_plane(app).is_some()
-        && let Err(why) = crate::machines::region::check_join(app, team, user)
-    {
-        app.db.record(&team_event(by, "team.join_refused", &team.id, json!({ "user": user.id, "reason": "data_region", "via": via, "region": team.region })).outcome(Outcome::Denied));
-        return Err(conflict(why));
-    }
     let tier = app.tier_of(&user.id).name.clone();
-    if !app.db.add_team_member(&team.id, &user.id, role, by.actor.id.as_deref()) {
-        return Err(match app.db.team_id_of(&user.id) {
-            Some(t) if t == team.id => conflict("They're on this team already."),
-            _ => conflict("They're on another team. They have to leave it first."),
-        });
+    {
+        // Their data region becomes the team's (ADR 0117): never while their machine is
+        // elsewhere. Checked and joined under the lock region changes and requests take.
+        let cp = control_plane(app);
+        let _g = match cp {
+            Some(cp) => Some(cp.lock_ops().await),
+            None => None,
+        };
+        if cp.is_some() {
+            let t = app.db.team(&team.id).ok_or_else(|| not_found("Team"))?;
+            let u = app.db.user(&user.id).ok_or_else(|| not_found("User"))?;
+            if let Err(why) = crate::machines::region::check_join(app, &t, &u) {
+                app.db.record(&team_event(by, "team.join_refused", &team.id, json!({ "user": user.id, "reason": "data_region", "via": via, "region": t.region })).outcome(Outcome::Denied));
+                return Err(conflict(why));
+            }
+        }
+        if !app.db.add_team_member(&team.id, &user.id, role, by.actor.id.as_deref()) {
+            return Err(match app.db.team_id_of(&user.id) {
+                Some(t) if t == team.id => conflict("They're on this team already."),
+                _ => conflict("They're on another team. They have to leave it first."),
+            });
+        }
     }
     if let Some(email) = &user.email {
         app.db.delete_team_invites_for(&team.id, email);

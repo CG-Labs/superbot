@@ -68,12 +68,14 @@ The hosts view shows each host's region, and placement grouped by region.
 
 A store can be set for each region. Its settings are the default store's, with the region in the name: `MACHINE_BACKUP_S3_<REGION>_BUCKET`, `_ENDPOINT`, `_REGION`, `_ACCESS_KEY_ID` and `_SECRET_ACCESS_KEY`. `<REGION>` is the id in upper case with `-` as `_`, for example `MACHINE_BACKUP_S3_GB_LON_BUCKET`.
 
-- The secret access key is a server secret: Bots never get it, and it is redacted from logs.
+- The secret access key is a server secret: Bots never get it, and it is redacted from logs. No process botd starts inherits any `MACHINE_BACKUP_S3_*` setting.
 - The default store (`MACHINE_BACKUP_S3_BUCKET`) still turns off-host backups on. The prefix, age recipients, interval and retention are shared by every store.
 - `MACHINE_BACKUP_S3_DATA_REGION` says which region the default store is in, if any.
 - A region may not have both its own store and the default store said to be in it.
 
-A backup goes to its machine's region store, else to the default store. The store is recorded on each backup (`machine_backups.store_region`, with `NULL` meaning the default store). Pruning, restores, imports and deletion all use the recorded store, so changing settings never loses track of a backup. The `machine.backup_created` event and the manifest record the store, and `inRegion`.
+A backup goes to its machine's region store, else to the default store. The store is recorded on each backup (`machine_backups.store_region`, with `NULL` meaning the default store). Pruning, restores, imports and deletion all use the recorded store, so changing settings never loses track of a backup.
+
+A region dropped from `MACHINE_REGIONS` keeps its store while its settings stay. New machines can't go there, but the backups already in it can still be restored, expired and deleted. If its settings are removed while backups are still recorded there, botd warns at startup that those backups can't be reached. The `machine.backup_created` event and the manifest record the store, and `inRegion`.
 
 `MACHINE_BACKUP_RESIDENCY` decides what happens when a region has no store of its own:
 
@@ -101,6 +103,8 @@ We chose refusing over moving because:
 - A Linode can't be moved to another data centre through our API. Migrating it would mean a new machine in any case.
 
 A successful change records `user.region_changed` or `team.region_changed`, with the region before and after (both set and effective). If backups of an earlier machine are left in another region's store, the response says how many. They stay until their retention ends or they are deleted.
+
+Region changes, machine requests and team joins all check and act under the control plane's operations lock. A region change can't slip between a request reading the region and making the machine, nor between a join's check and the new member being added.
 
 ### Teams
 
