@@ -148,6 +148,7 @@ mod server_backups;
 #[cfg(test)]
 mod server_backups_http_tests;
 mod setup;
+mod sigv4;
 #[cfg(test)]
 mod setup_http_tests;
 #[cfg(test)]
