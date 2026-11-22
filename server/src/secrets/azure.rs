@@ -154,7 +154,7 @@ impl KeyVault {
 
 impl Inner {
     /// The Key Vault name for `name` in `scope`, or None if it would be too long to exist.
-    fn secret_name(&self, scope: Scope, name: &str) -> Option<String> {
+    fn vault_id(&self, scope: Scope, name: &str) -> Option<String> {
         let n = format!("{}-{}-{}", self.cfg.prefix, scope.as_str(), name.replace('_', "-"));
         (n.len() <= MAX_NAME).then_some(n)
     }
@@ -264,7 +264,7 @@ impl Inner {
     }
 
     async fn read(&self, scope: Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error> {
-        let Some(id) = self.secret_name(scope, name) else { return Ok(None) };
+        let Some(id) = self.vault_id(scope, name) else { return Ok(None) };
         let url = format!("{}/secrets/{id}?api-version={API_VERSION}", self.cfg.url);
         let Some(body) = self.get(&url, &id).await? else { return Ok(None) };
         let v: Value = serde_json::from_slice(&body).map_err(|e| unavailable(&id, e))?;
@@ -611,10 +611,10 @@ mod tests {
         let (url, _) = stand_in();
         let kv = KeyVault::new(config(&url, &[("AZURE_KEYVAULT_PREFIX", "Acme-SuperBot")])).unwrap();
         let i = &kv.inner;
-        assert_eq!(i.secret_name(Scope::Bots, "OPENAI_API_KEY").as_deref(), Some("acme-superbot-bots-OPENAI-API-KEY"));
+        assert_eq!(i.vault_id(Scope::Bots, "OPENAI_API_KEY").as_deref(), Some("acme-superbot-bots-OPENAI-API-KEY"));
         assert_eq!(i.name_in(Scope::Bots, "ACME-SUPERBOT-BOTS-openai-api-key").as_deref(), Some("OPENAI_API_KEY"));
         assert_eq!(i.name_in(Scope::Server, "acme-superbot-bots-X"), None);
-        assert_eq!(i.secret_name(Scope::Server, &"A".repeat(120)), None, "too long to exist in Key Vault");
+        assert_eq!(i.vault_id(Scope::Server, &"A".repeat(120)), None, "too long to exist in Key Vault");
         assert_eq!(resource_of(&url::Url::parse("https://kv1.vault.azure.cn").unwrap()), "https://vault.azure.cn");
         assert_eq!(resource_of(&url::Url::parse("https://kv1.vault.usgovcloudapi.net").unwrap()), "https://vault.usgovcloudapi.net");
     }
