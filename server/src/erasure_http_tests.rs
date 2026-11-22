@@ -337,6 +337,33 @@ async fn another_visitors_events_stay_theirs() {
 }
 
 #[tokio::test]
+async fn their_answer_to_a_handoff_in_someone_elses_bot_is_erased() {
+    let (port, app, admin, _) = serve_app().await;
+    let (owner, _) = user_with(port, &admin, "owner@example.com", "member").await;
+    let (ada, ada_auth) = user_with(port, &admin, "ada@example.com", "member").await;
+    let bot = app.db.create_bot_owned("Shared", "#fff", "waddle", "claude", None, false, &owner, acl::Visibility::Private);
+    app.db.set_grant(&bot.id, &ada, acl::Grant::Operator, &owner);
+    let waiting = {
+        let (app, bot) = (app.clone(), bot.clone());
+        tokio::spawn(async move { app.handoff(&bot, "Sign in", Duration::from_secs(5)).await })
+    };
+    let card = loop {
+        if let Some(m) = app.db.messages(&bot.id, 10).into_iter().find(|m| m.question.is_some()) {
+            break m.id;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let answer = json!({ "text": "Done, my code was 314159", "answer": { "messageId": card, "option": 0 } }).to_string();
+    assert_eq!(call(port, "POST", &format!("/api/bots/{}/messages", bot.id), &ada_auth, &answer).await.0, 202);
+    assert_eq!(waiting.await.unwrap().as_deref(), Some("Done, my code was 314159"));
+    let (code, v) = erase(port, &admin, &ada, "").await;
+    assert_eq!(code, 200, "{v}");
+    for (table, row) in app.db.all_rows() {
+        assert!(!row.contains("314159"), "in {table}: {row}");
+    }
+}
+
+#[tokio::test]
 async fn a_retried_erasure_still_erases_what_its_deleted_bots_wrote() {
     let (port, app, admin, _) = serve_app().await;
     let (ada, ada_auth) = user_with(port, &admin, "ada@example.com", "member").await;
