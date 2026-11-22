@@ -53,7 +53,7 @@ const report = (p: Partial<Report> = {}): Report => ({
 function fakeApi(r: Report = report()) {
   return {
     accessReview: jest.fn(async () => r),
-    accessReviewCsv: jest.fn(async () => "generated_at\r\n"),
+    accessReviewCsv: jest.fn(async (_d: string) => ({ csv: "generated_at\r\n", fileName: "superbot-access-review-20261122-090500.csv" as string | null })),
     completeAccessReview: jest.fn(async (_d: string, _n?: string) => signOff({ eventId: 10, notes: "checked" })),
   };
 }
@@ -112,7 +112,17 @@ describe("AccessReview", () => {
     const { api, user } = await open();
     await user.press(screen.getByText("Export CSV"));
     expect(api.accessReviewCsv).toHaveBeenCalledWith("d1");
-    expect(saveCsv).toHaveBeenCalledWith("superbot-access-review-20261122-090000.csv", "generated_at\r\n", "Export access review");
+    expect(saveCsv).toHaveBeenCalledWith("superbot-access-review-20261122-090500.csv", "generated_at\r\n", "Export access review");
+  });
+
+  it("names the CSV by when it was exported when the server gives no name", async () => {
+    const api = fakeApi();
+    api.accessReviewCsv.mockResolvedValueOnce({ csv: "generated_at\r\n", fileName: null });
+    jest.spyOn(Date, "now").mockReturnValue(Date.UTC(2026, 10, 22, 10, 0, 0));
+    const { user } = await open(api);
+    await user.press(screen.getByText("Export CSV"));
+    expect(saveCsv).toHaveBeenCalledWith("superbot-access-review-20261122-100000.csv", "generated_at\r\n", "Export access review");
+    jest.restoreAllMocks();
   });
 
   it("refuses to export a report that is no longer current", async () => {

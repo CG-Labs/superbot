@@ -689,11 +689,11 @@ export class SuperBotApi {
     return this.request<AccessReview>("GET", "/api/access-review");
   }
 
-  /** The report as CSV, one dated row per person. */
-  /** The CSV of the report with `digest`. A 409 means access changed since it loaded. */
-  async accessReviewCsv(digest: string): Promise<string> {
+  /** The CSV of the report with `digest`, one dated row per person, and the file name the server gave it. A 409 means access changed since it loaded. */
+  async accessReviewCsv(digest: string): Promise<{ csv: string; fileName: string | null }> {
     const res = await this.send("GET", `/api/access-review/export.csv?digest=${encodeURIComponent(digest)}`);
-    return res.text();
+    const fileName = /filename="([^"]+)"/.exec(res.headers.get("content-disposition") ?? "")?.[1] ?? null;
+    return { csv: await res.text(), fileName };
   }
 
   /** Signs off on the report with `digest`. A 409 means access changed since it loaded. */
