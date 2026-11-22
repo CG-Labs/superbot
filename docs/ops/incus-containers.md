@@ -214,7 +214,7 @@ It cleans up containers and ACLs left by an earlier run. It needs nftables' brid
 
 ## Limits to know
 
-- Containers share the host's kernel. A kernel escape crosses every boundary. Use VMs for tiers that need their own kernel.
+- Containers share the host's kernel. A kernel escape crosses every boundary. Use VMs for tiers that need their own kernel. A server with `MACHINE_OWN_KERNEL_TIERS` set won't start with `MACHINE_PROVIDER=incus`, so unset it here. [ADR 0119](../adr/0119-managed-substrate.md) recommends containers only on hosts that serve one organisation until the boundary has been red-teamed.
 - Containers can't reach each other at all, ping included. They can ping the gateway. The host itself reaches only their agent port.
 - Snapshots (daily, kept 7 days) stay on the same pool. They don't protect against losing the host; off-host backups (step 7) do.
 - A backup restores only to the same machine, on its host or another. Exports are full each time, so storage grows with disk size times retention.

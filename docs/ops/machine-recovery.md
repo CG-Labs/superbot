@@ -144,7 +144,7 @@ botd doesn't restore Linode machines or time their restores. The target below is
    The running agent takes up the new certificate within a minute.
 7. `botctl machine show <user>` shows `enrolled`. If it was assigned, its Bots run there again.
 
-Note the time from step 2 to step 7 for your records: that's the restore time against the RTO target in the [recovery objectives](../security/machine-recovery-objectives.md#linode-machines) (4 hours by default). Drill it on a spare machine of your largest plan before you promise it.
+Note the time from step 2 to step 7 for your records: that's the restore time against the RTO target in the [recovery objectives](../security/machine-recovery-objectives.md#linode-machines) (4 hours by default). Drill it on a spare machine of your largest plan before you promise it. [ADR 0119](../adr/0119-managed-substrate.md) asks for this drill, with its time recorded, before public tiers launch on Linode.
 
 Restoring to a new Linode instead leaves botd tracking the old one; don't, unless the old one is gone, and then destroy the machine in botd and request a new one.
 
