@@ -1113,11 +1113,12 @@ impl Agent {
             // newer request replaced while this waited.
             let one = self.egress_loading.lock().await;
             let p = self.egress().policy;
-            if p.mode == wire::EGRESS_ALLOW_LIST {
-                let hosts = egress_allow::entries(&p.allow).is_ok_and(|e| e.iter().any(|e| matches!(e, egress_allow::Entry::Host(_))));
-                if first || hosts {
-                    self.load_egress(p).await;
-                }
+            // At start a saved `open` loads too: it clears a table left by a restart
+            // mid-change, and reports open rather than not loaded.
+            let hosts = p.mode == wire::EGRESS_ALLOW_LIST
+                && egress_allow::entries(&p.allow).is_ok_and(|e| e.iter().any(|e| matches!(e, egress_allow::Entry::Host(_))));
+            if hosts || (first && (p.mode == wire::EGRESS_ALLOW_LIST || !p.id.is_empty())) {
+                self.load_egress(p).await;
             }
             drop(one);
             first = false;
