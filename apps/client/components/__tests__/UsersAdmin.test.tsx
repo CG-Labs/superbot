@@ -354,6 +354,8 @@ describe("UsersAdmin", () => {
     await waitFor(() => expect(api.assignRole).toHaveBeenCalledWith("r1", "u1"));
     expect(await within(screen.getByLabelText("User Alex")).findByText("Support")).toBeOnTheScreen();
     expect(within(screen.getByLabelText("User Alex")).getByText("Read-only")).toBeOnTheScreen();
+    await user.press(screen.getByRole("radio", { name: "Read-only" }));
+    await waitFor(() => expect(api.patchUser).toHaveBeenCalledWith("u1", { role: "readonly" }));
     await user.press(screen.getByRole("radio", { name: "None" }));
     await waitFor(() => expect(api.unassignRole).toHaveBeenCalledWith("r1", "u1"));
 

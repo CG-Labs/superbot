@@ -134,7 +134,7 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
   };
 
   const setRole = async (role: Role) => {
-    if (role === user.role) return;
+    if (role === user.role && !user.customRole) return;
     if (user.customRole && !(await confirmAsync(`Make ${user.name} ${ROLES.find((r) => r.role === role)?.label ?? role}?`, `Setting a built-in role takes ${user.customRole.name} away from them.`, "Change"))) return;
     void run(() => api.patchUser(user.id, { role }));
   };
