@@ -15,6 +15,9 @@ const PUBLIC: &[(&str, &str)] = &[
     // The status page: fixed component names and admins' public notes (ADR 0090).
     ("GET", "/status"),
     ("GET", "/status.json"),
+    // Published plans: labels, prices, limits; 404 unless published (ADR 0121).
+    ("GET", "/pricing"),
+    ("GET", "/api/plans"),
     ("GET", "/login"),
     ("POST", "/api/auth/login"),
     ("GET", "/api/auth/sso"),
