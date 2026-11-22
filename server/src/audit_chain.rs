@@ -469,8 +469,8 @@ impl<'a> Verifier<'a> {
             _ => Some("unsealed"),
         };
         // A checkpoint is judged only on a row the chain holds: a changed one is named already.
-        let (before, first) = (self.before, self.report.first.unwrap_or(r.id));
-        let reason = reason.or_else(|| self.checks.as_mut().and_then(|c| c.feed(r, before, first)));
+        let before = self.before;
+        let reason = reason.or_else(|| self.checks.as_mut().and_then(|c| c.feed(r, before)));
         let mut pinned_wrong = false;
         for (pin, result) in self.pins.iter_mut().filter(|(p, _)| p.id == r.id) {
             let same = r.hash.as_deref() == Some(pin.hash.as_str());
@@ -514,19 +514,14 @@ impl<'a> Verifier<'a> {
         !self.unexplained.is_empty()
     }
 
-    /// An `audit.erased` row after the range checked: it explains rows in the range if
-    /// it holds on its own (its salt, digest and hash), as its link isn't checked.
-    pub fn explain_later(&mut self, r: &Row) {
-        let intact = match (&r.prev, &r.hash, &r.digest, &r.salt) {
-            (Some(prev), Some(hash), Some(digest), Some(salt)) => crate::audit_chain::digest(salt, &r.erasable) == *digest && link(prev, &r.fixed, digest) == *hash,
-            _ => false,
-        };
-        if intact && action(r) == Some(ERASED) {
-            self.explain(r);
-        }
+    /// Carries the walk on past the range's end, to the head: erased rows in the range wait
+    /// for an `audit.erased` after it, which counts only as part of a chain checked to the
+    /// head (a rewritten one would hold on its own). The report says how far it went.
+    pub fn extend(&mut self) {
+        self.range.to = None;
+        self.report.range = self.range.is_set().then_some(self.range);
     }
 
-    /// The first and last ids walked.
     /// Checkpoint records kept beside the rows from `lo` to `hi`; `pruned`: the anchor's id.
     pub fn recorded(&mut self, rows: &[crate::audit_checkpoint::Recorded], lo: i64, hi: i64, pruned: Option<i64>) {
         let last = self.last;
@@ -614,6 +609,7 @@ fn walk(db: &Db, anchor: Option<Link>, o: &Options, keys: &[Vec<u8>]) -> Report 
     let pruned = anchor.as_ref().map(|a| a.id);
     let mut v = Verifier::new(anchor, o.pins.clone()).within(range, inside).checking(checker);
     let mut after = range.from.map_or(i64::MIN, |f| f.saturating_sub(1));
+    let mut to = range.to;
     'rows: loop {
         let rows = match db.audit_chain_rows(after, BATCH) {
             Ok(rows) => rows,
@@ -625,8 +621,12 @@ fn walk(db: &Db, anchor: Option<Link>, o: &Options, keys: &[Vec<u8>]) -> Report 
         let Some(last) = rows.last() else { break };
         after = last.id;
         for r in &rows {
-            if range.to.is_some_and(|t| r.id > t) {
-                break 'rows;
+            if to.is_some_and(|t| r.id > t) {
+                if !v.has_unexplained() {
+                    break 'rows;
+                }
+                to = None;
+                v.extend();
             }
             v.feed(r);
         }
@@ -634,13 +634,7 @@ fn walk(db: &Db, anchor: Option<Link>, o: &Options, keys: &[Vec<u8>]) -> Report 
             break;
         }
     }
-    if let (Some(to), true) = (range.to, v.has_unexplained()) {
-        match db.audit_chain_rows_by_action(to, ERASED) {
-            Ok(rows) => rows.iter().for_each(|r| v.explain_later(r)),
-            Err(e) => v.fail(format!("couldn't read the erasures after event {to}: {e}")),
-        }
-    }
-    let (lo, hi) = (range.from.unwrap_or(i64::MIN), range.to.unwrap_or(i64::MAX));
+    let (lo, hi) = (range.from.unwrap_or(i64::MIN), to.unwrap_or(i64::MAX));
     match db.with_conn(|c| crate::audit_checkpoint::recorded(c, lo, hi)) {
         Ok(rows) => v.recorded(&rows, lo, hi, pruned),
         Err(e) => v.fail(format!("couldn't read the audit checkpoints: {e}")),

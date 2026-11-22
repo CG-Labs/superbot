@@ -7505,13 +7505,6 @@ impl Db {
         s.query_map(params![after, limit], crate::audit_chain::read_row)?.collect()
     }
 
-    /// The audit rows after id `after` with action `action`, oldest first, as the chain sees them.
-    pub fn audit_chain_rows_by_action(&self, after: i64, action: &str) -> rusqlite::Result<Vec<crate::audit_chain::Row>> {
-        let c = self.c();
-        let mut s = c.prepare(&format!("SELECT {} FROM audit_events WHERE id > ? AND action = ? ORDER BY id", crate::audit_chain::select_list()))?;
-        s.query_map(params![after, action], crate::audit_chain::read_row)?.collect()
-    }
-
     /// The newest audit event's id, 0 when there is none.
     pub fn audit_head(&self) -> i64 {
         self.c().query_row("SELECT coalesce(MAX(id), 0) FROM audit_events", [], |r| r.get(0)).unwrap_or(0)

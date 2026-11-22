@@ -663,9 +663,9 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// A row the chain holds, after `before` (None: not known), walked from `first`:
-    /// None, or why it breaks the chain (`checkpoint`, `timestamp`).
-    pub fn feed(&mut self, r: &Row, before: Option<i64>, first: i64) -> Option<&'static str> {
+    /// A row the chain holds, after `before` (None: not known): None, or why it breaks the
+    /// chain (`checkpoint`, `timestamp`).
+    pub fn feed(&mut self, r: &Row, before: Option<i64>) -> Option<&'static str> {
         match crate::audit_chain::action(r)? {
             CHECKPOINT => {
                 self.report.checked += 1;
@@ -688,12 +688,10 @@ impl<'a> Checker<'a> {
                 let d = crate::audit_chain::details(r);
                 let cp = d.as_ref().and_then(|d| d["checkpoint"].as_i64());
                 let found = cp.and_then(|id| (self.lookup)(id));
+                // Retention keeps a record while its timestamp event is in the log, so a
+                // missing one was removed by hand.
                 if let Some(cp) = cp {
                     self.stamps.insert(r.id, cp);
-                    // Pruned with its checkpoint: nothing left to check it against.
-                    if found.is_none() && cp < first {
-                        return None;
-                    }
                 }
                 match check_stamp(r.id, d.as_ref(), found.as_ref(), self.trust) {
                     Ok((c, s)) => {
@@ -1178,6 +1176,29 @@ mod tests {
     }
 
     #[test]
+    fn a_range_counts_a_later_erasure_only_as_part_of_the_chain() {
+        let app = crate::runner::test_app();
+        let ids = some_events(&app, 3);
+        app.db.execute_raw("DROP TRIGGER audit_events_no_update").unwrap();
+        app.db.execute_raw(&format!("UPDATE audit_events SET chain_salt = NULL WHERE id = {}", ids[1])).unwrap();
+        let erased = app.db.with_conn(|c| crate::audit_chain::insert_erased(c, "p", &[ids[1]])).unwrap();
+        some_events(&app, 1);
+        let range = Range { from: Some(ids[0]), to: Some(ids[2]) };
+        let r = checks(&app, Options { range, ..Default::default() });
+        assert!(r.ok, "{r:?}");
+        assert_eq!(r.range, Some(Range { from: Some(ids[0]), to: None }), "walked on past the erasure to the head");
+        assert!(checks(&app, Options { range: Range { from: Some(ids[2]), to: Some(ids[2]) }, ..Default::default() }).range.unwrap().to.is_some(), "only as far as needed");
+        // Someone clears another row and widens the erasure to name it, resealing just that event.
+        app.db.execute_raw(&format!("UPDATE audit_events SET chain_salt = NULL WHERE id = {}", ids[0])).unwrap();
+        app.db.execute_raw(&format!("UPDATE audit_events SET details = json_set(details, '$.rows', json('[[{}, {}]]')) WHERE id = {erased}", ids[0], ids[1])).unwrap();
+        let row = app.db.audit_chain_rows(erased - 1, 1).unwrap().remove(0);
+        let s = crate::audit_chain::seal(row.prev.as_deref().unwrap(), &row.fixed, &row.erasable);
+        app.db.execute_raw(&format!("UPDATE audit_events SET chain_hash = '{}', chain_salt = '{}', chain_digest = '{}' WHERE id = {erased}", s.hash, s.salt, s.digest)).unwrap();
+        let r = checks(&app, Options { range, ..Default::default() });
+        assert_eq!((r.ok, r.first_broken.map(|b| (b.id, b.reason))), (false, Some((erased + 1, "link"))), "the erasure no longer links to what follows");
+    }
+
+    #[test]
     fn timestamps_are_checked_from_the_token() {
         let app = crate::runner::test_app();
         let fake = FakeTsa::new();
@@ -1241,6 +1262,12 @@ mod tests {
         let r = checks(&app, Options::default());
         assert_eq!((r.ok, r.checkpoints.unwrap().first_broken.map(|f| (f.id, f.reason))), (false, Some((stray, "record"))));
         app.db.execute_raw(&format!("DELETE FROM audit_checkpoints WHERE event_id = {stray}")).unwrap();
+        // Deleting the kept record doesn't let its timestamp event pass unchecked.
+        app.db.execute_raw(&format!("CREATE TABLE kept AS SELECT * FROM audit_checkpoints WHERE event_id = {}", c.id)).unwrap();
+        app.db.execute_raw(&format!("DELETE FROM audit_checkpoints WHERE event_id = {}", c.id)).unwrap();
+        let r = checks(&app, Options::default());
+        assert_eq!((r.first_broken.map(|b| (b.id, b.reason)), r.checkpoints.unwrap().first_broken.map(|f| f.reason)), (Some((ev, "timestamp")), Some("record")));
+        app.db.execute_raw("INSERT INTO audit_checkpoints SELECT * FROM kept").unwrap();
         // Once its timestamp event goes too, so does the record.
         assert_eq!(prune_to(ev), Some(ev));
         assert!(app.db.with_conn(|x| row(x, c.id)).unwrap().is_none());
