@@ -109,6 +109,9 @@ groupdel sb-u-t1 2>/dev/null || true
 as_svc sudo -n /usr/local/sbin/superbot-userctl ensure t1 >/dev/null
 [[ "$(id -u sb-u-t1)" == "$uid" ]] || die "the re-made sb-u-t1 got another uid"
 (cd "$TEST_DIR/users/t1/workspace" && as_svc sudo -n -E -u sb-u-t1 -- "$LIB/bin/superbot-run" /usr/bin/true)
+# A run can't gain privileges again, through sudo or any setuid program (ADR 0145).
+nnp=$(cd "$TEST_DIR/users/t1/workspace" && as_svc sudo -n -E -u sb-u-t1 -- "$LIB/bin/superbot-run" /usr/bin/grep NoNewPrivs /proc/self/status)
+[[ "$(awk '{print $2}' <<<"$nnp")" == 1 ]] || die "a run can gain privileges: $nnp"
 # superbot-run refuses to start outside the account's folders, and as any other account.
 (cd "$TEST_DIR/users" && refused as_svc sudo -n -E -u sb-u-t1 -- "$LIB/bin/superbot-run" /usr/bin/true)
 (cd "$TEST_DIR/users/t1/workspace" && refused as_svc "$LIB/bin/superbot-run" /usr/bin/true)

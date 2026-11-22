@@ -15,6 +15,10 @@ mod acl_http_tests;
 mod adapters;
 mod approvals;
 mod audit;
+mod audit_chain;
+#[cfg(test)]
+mod audit_chain_http_tests;
+mod audit_export;
 #[cfg(test)]
 mod audit_http_tests;
 #[cfg(test)]
@@ -88,6 +92,8 @@ mod machines_upkeep_tests;
 #[cfg(test)]
 mod machines_rebuild_tests;
 #[cfg(test)]
+mod machines_redteam_tests;
+#[cfg(test)]
 mod machines_screens_tests;
 #[cfg(test)]
 mod machines_teammates_tests;
@@ -103,6 +109,8 @@ mod machines_resize_tests;
 mod machines_region_tests;
 #[cfg(test)]
 mod machines_residency_tests;
+#[cfg(test)]
+mod residency_routes_http_tests;
 mod passwd;
 mod plans;
 #[cfg(test)]
@@ -140,6 +148,8 @@ mod sandbox;
 mod scim;
 #[cfg(test)]
 mod scim_bulk_http_tests;
+#[cfg(test)]
+mod scim_group_roles_http_tests;
 #[cfg(test)]
 mod scim_groups_http_tests;
 #[cfg(test)]
@@ -317,7 +327,7 @@ async fn main() {
         .unwrap_or_else(|e| exit(format!("Shared Bots: {e}")));
     let teams = teams::Settings::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Teams: {e}")));
     let resume_routines = handover::resume_on_enable(&env("ROUTINES_ON_ENABLE", "")).unwrap_or_else(|e| exit(e));
-    let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", ""), &env("SCIM_GROUPS", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
+    let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", ""), &env("SCIM_GROUPS", ""), &env("SCIM_GROUP_ROLES", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
     let tiers = tiers::Tiers::from_env(|k| env(k, "")).unwrap_or_else(|e| exit(format!("Tiers: {e}")));
     for name in adapters::NAMES {
         adapters::get(name).expect("listed adapter").check_env(&|k| env(k, "")).unwrap_or_else(|e| exit(e));
@@ -340,6 +350,7 @@ async fn main() {
         log_warn!("{e}");
         std::process::exit(1);
     });
+    let audit_export = audit_export::Settings::from_env(&|k| env(k, ""), &startup_store).unwrap_or_else(|e| exit(format!("Audit export: {e}")));
     let chat_retention = retention::days("CHAT_RETENTION_DAYS", &env("CHAT_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
     let session_retention = retention::days("HARNESS_SESSION_RETENTION_DAYS", &env("HARNESS_SESSION_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
     let teammate_files_retention = retention::days("TEAMMATE_FILES_RETENTION_DAYS", &env("TEAMMATE_FILES_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
@@ -410,6 +421,9 @@ async fn main() {
         .unwrap_or_else(|e| exit(format!("Machine enrollment: {e}")))
         .map(|mut e| {
             e.upkeep.default_to(&managed_bins).unwrap_or_else(|err| exit(format!("Machine enrollment: {err}")));
+            if !e.bot_user {
+                log_warn!("WARNING: {}", machines::botuser::ROOT_WARNING);
+            }
             control_plane.enroll_with(e).unwrap_or_else(|e| exit(format!("Machine enrollment: {e}")))
         });
 
@@ -445,7 +459,8 @@ async fn main() {
         bot_key: bot_key.clone(),
         run_timeout: Duration::from_secs(60 * env("RUN_TIMEOUT_MINUTES", "60").parse::<u64>().unwrap_or(60)),
         default_harness,
-        sandbox_host: sandbox::host(),
+        // Runs under per-user accounts start through superbot-run, with no new privileges.
+        sandbox_host: if isolation.is_some() { sandbox::host_no_new_privs() } else { sandbox::host() },
         home: std::env::var_os("HOME").map(PathBuf::from),
     }, screens);
     let _ = app.tiers.set(Arc::new(tiers));
@@ -645,9 +660,10 @@ async fn main() {
     }
     match auth_state.scim.enabled {
         true => log_info!(
-            "SCIM: on at /scim/v2; new users get the {} role; groups {}.",
+            "SCIM: on at /scim/v2; new users get the {} role; groups {}; group roles {}.",
             auth_state.scim.default_role.as_str(),
-            if auth_state.scim.groups { "are teams (SCIM_GROUPS=on)" } else { "off (SCIM_GROUPS=off)" }
+            if auth_state.scim.groups { "are teams (SCIM_GROUPS=on)" } else { "off (SCIM_GROUPS=off)" },
+            if auth_state.scim.group_roles { "on, never admin (SCIM_GROUP_ROLES=on)" } else { "off (SCIM_GROUP_ROLES=off)" }
         ),
         false => log_info!("SCIM: off (SCIM=off)."),
     }
@@ -720,6 +736,7 @@ async fn main() {
         "sessionIdleMinutes": sessions.idle_ms / 60_000,
         "sessionMaxMinutes": sessions.max_ms / 60_000,
         "auditRetentionDays": retention,
+        "auditExport": audit_export.sink.as_ref().map(|s| json!({ "kind": s.kind(), "sink": s.shown })),
         "chatRetentionDays": chat_retention,
         "harnessSessionRetentionDays": session_retention,
         "teammateFilesRetentionDays": teammate_files_retention,
@@ -748,8 +765,11 @@ async fn main() {
         "databaseEncryption": database_summary,
     })));
     license::start(app.clone());
+    log_info!("Audit export: {} (ADR 0122).", audit_export.describe());
+    audit_export::start(&app, audit_export);
     audit::start_retention(app.clone(), retention);
     secrets::external::start_audit(app.clone());
+    audit_chain::start(app.clone());
     retention::start(app.clone(), retention::Settings { chat: chat_retention, sessions: session_retention, teammate_files: teammate_files_retention });
     server_backups::start(app.clone());
     evidence::start(app.clone(), evidence, sessions, mfa_pinned);
@@ -887,6 +907,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/approvals/{id}/deny", post(deny))
         .route("/audit", get(list_audit))
         .route("/audit/export.csv", get(export_audit))
+        .route("/audit/verify", get(audit_chain::get))
+        .route("/audit/siem", get(audit_export::get))
         .route("/access-review", get(access_review::get))
         .route("/access-review/export.csv", get(access_review::export))
         .route("/access-review/complete", post(access_review::complete))
@@ -1045,6 +1067,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/scim/tokens/{id}", delete(scim::revoke_token))
         .route("/scim/groups", get(scim::groups::list_links).post(scim::groups::link))
         .route("/scim/groups/{team}", delete(scim::groups::unlink))
+        .route("/scim/role-mappings", get(scim::roles::list).post(scim::roles::create))
+        .route("/scim/role-mappings/{id}", get(scim::roles::get).delete(scim::roles::delete))
         .route("/status/incidents", get(status::list).post(status::create))
         .route("/status/incidents/{id}", patch(status::edit).delete(status::delete))
         .route("/status/incidents/{id}/updates", post(status::add_update))
@@ -1277,11 +1301,16 @@ impl Auth {
     }
 
     /// The Bot a token was issued to, acting for its owner, and for whomever its run is
-    /// for (ADR 0046), so what it queues runs for them too.
+    /// for (ADR 0046), so what it queues runs for them too, held where their data is
+    /// pinned (ADR 0139).
     fn bot_actor(&self, bot_id: Option<&str>) -> Actor {
         let app = self.app.as_ref();
         match bot_id.and_then(|id| app?.db.bot(id)) {
-            Some(b) => Actor { asker: app.map(|a| a.acting_for(&b)).filter(|a| *a != b.owner_id), ..Actor::for_bot(&b) },
+            Some(b) => Actor {
+                asker: app.map(|a| a.acting_for(&b)).filter(|a| *a != b.owner_id),
+                carries: app.map(|a| a.carried_by(&b)).unwrap_or_default(),
+                ..Actor::for_bot(&b)
+            },
             None => Actor::bot(bot_id, None),
         }
         .method("bot_token")
@@ -2668,6 +2697,7 @@ async fn ask(State(app): State<AppState>, Extension(c): Extension<Caller>, Exten
         Principal::Bot => {
             let mut actor = Actor::for_bot(&from).method("bot_token");
             actor.asker = Some(app.acting_for(&from)).filter(|a| *a != from.owner_id);
+            actor.carries = app.carried_by(&from);
             Who { actor, source: by.source.clone() }
         }
         Principal::User(_) => by,

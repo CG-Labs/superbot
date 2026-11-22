@@ -120,9 +120,11 @@ pub const ERASED_TEXT: &str = "[erased]";
 /// An erased user's name on their tombstone.
 pub const ERASED_NAME: &str = "Erased user";
 
-/// Whether the message in `m` was sent by user `?1`, or by a run for them.
-const SENT_BY: &str = "(CASE WHEN json_valid(m.requested_by) THEN json_extract(m.requested_by, '$.actor.id') = ?1 OR json_extract(m.requested_by, '$.actor.asker') = ?1 END)";
-const SENT_BY_ANY: &str = "(CASE WHEN json_valid(requested_by) THEN json_extract(requested_by, '$.actor.id') = ?1 OR json_extract(requested_by, '$.actor.asker') = ?1 END)";
+/// Whether the message in `m` was sent by user `?1`, or by a run for them or carrying
+/// their data (ADR 0139). The same people as `SENT_BY_ANY`, so a hold keeps what an
+/// erasure would rewrite.
+const SENT_BY: &str = "(CASE WHEN json_valid(m.requested_by) THEN json_extract(m.requested_by, '$.actor.id') = ?1 OR json_extract(m.requested_by, '$.actor.asker') = ?1 OR EXISTS (SELECT 1 FROM json_each(m.requested_by, '$.actor.carries') WHERE value = ?1) END)";
+const SENT_BY_ANY: &str = "(CASE WHEN json_valid(requested_by) THEN json_extract(requested_by, '$.actor.id') = ?1 OR json_extract(requested_by, '$.actor.asker') = ?1 OR EXISTS (SELECT 1 FROM json_each(requested_by, '$.actor.carries') WHERE value = ?1) END)";
 
 /// How an erasure rewrites a string about the erased person: their id becomes the
 /// pseudonym wherever it appears, as does an email of theirs (any case); a string that is
@@ -710,6 +712,9 @@ pub struct AuditEvent {
     pub session_id: Option<String>,
     /// The user a Bot or the scheduler acted for.
     pub on_behalf_of: Option<String>,
+    /// The hash chain (ADR 0122): the row before's hash, and this row's.
+    pub chain_prev: Option<String>,
+    pub chain_hash: Option<String>,
 }
 
 /// A person who can sign in. `operator` is the owner and break-glass account.
@@ -779,7 +784,20 @@ pub enum RoleError {
     NotFound,
     /// Still given to this many people, across the server or in a team.
     InUse(usize),
+    /// This many SCIM groups map to it (ADR 0138).
+    Mapped(usize),
+    /// A SCIM group maps to it in `scope`, where these permissions would reach admins.
+    Reaches { mapping: String, scope: String, perms: Vec<&'static str> },
     Db(String),
+}
+
+/// A custom role's permissions, read in `c`'s transaction. None: no such role.
+fn role_perms_in(c: &Connection, role_id: &str) -> rusqlite::Result<Option<crate::rbac::Perms>> {
+    let json: Option<String> = c.query_row("SELECT permissions FROM roles WHERE id = ?", [role_id], |r| r.get(0)).optional()?;
+    Ok(json.map(|j| {
+        let names: Vec<String> = serde_json::from_str(&j).unwrap_or_default();
+        crate::rbac::Perms::from_names(names.iter().map(String::as_str))
+    }))
 }
 
 /// A request for access from the public sign-up form (ADR 0022).
@@ -1601,6 +1619,84 @@ fn custom_role_row(r: &Row) -> rusqlite::Result<CustomRole> {
     })
 }
 
+/// A SCIM group mapped to a custom role (ADR 0138): the group's members get the role
+/// across the server (`org`) or within the group's team (`team`) while they're in it.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScimRoleMapping {
+    pub id: String,
+    pub tenant: String,
+    pub team_id: String,
+    pub role_id: String,
+    /// "org" or "team".
+    pub scope: String,
+    pub created_at: i64,
+    pub created_by: Option<String>,
+}
+
+fn scim_role_mapping_row(r: &Row) -> rusqlite::Result<ScimRoleMapping> {
+    Ok(ScimRoleMapping {
+        id: r.get("id")?,
+        tenant: r.get("tenant")?,
+        team_id: r.get("team_id")?,
+        role_id: r.get("role_id")?,
+        scope: r.get("scope")?,
+        created_at: r.get("created_at")?,
+        created_by: r.get("created_by")?,
+    })
+}
+
+/// A role a mapping gave someone, so taking it away touches only what SCIM gave.
+/// `prior_role` is their built-in role before an `org` grant, given back after.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScimRoleGrant {
+    pub mapping_id: String,
+    pub user_id: String,
+    pub scope: String,
+    pub prior_role: Option<Role>,
+    pub granted_at: i64,
+}
+
+fn scim_role_grant_row(r: &Row) -> rusqlite::Result<ScimRoleGrant> {
+    let prior: Option<String> = r.get("prior_role")?;
+    Ok(ScimRoleGrant {
+        mapping_id: r.get("mapping_id")?,
+        user_id: r.get("user_id")?,
+        scope: r.get("scope")?,
+        prior_role: prior.as_deref().and_then(Role::parse).filter(|r| *r != Role::Admin),
+        granted_at: r.get("granted_at")?,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ScimRoleMapError {
+    /// The group has a mapping for this scope already.
+    Taken,
+    /// The group's link, or the role, went meanwhile.
+    Gone,
+    /// The role holds these permissions, which reach admins in the scope.
+    Reaches(Vec<&'static str>),
+    Db(String),
+}
+
+/// What taking a SCIM grant away did: whether the role was still theirs to clear, and,
+/// across the server, their built-in role before and after.
+#[derive(Debug, PartialEq)]
+pub struct ScimRevoked {
+    pub cleared: bool,
+    pub role_before: Option<Role>,
+    pub role_after: Option<Role>,
+}
+
+/// A role given or taken away by hand: what they held just before, read in the same
+/// transaction as the write, and the SCIM mapping whose claim on it ended, if one had.
+#[derive(Debug, PartialEq)]
+pub struct ByHand<T> {
+    pub before: T,
+    pub taken: Option<String>,
+}
+
 fn session_row(r: &Row) -> rusqlite::Result<Session> {
     Ok(Session {
         id: r.get("id")?,
@@ -1712,12 +1808,14 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
         idp_provider: r.get("idp_provider")?,
         session_id: r.get("session_id")?,
         on_behalf_of: r.get("on_behalf_of")?,
+        chain_prev: r.get("chain_prev")?,
+        chain_hash: r.get("chain_hash")?,
     })
 }
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 51] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 53] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1769,6 +1867,8 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 51] = [
     migrate_custom_roles,
     migrate_residency_pins,
     migrate_saml_sessions,
+    migrate_audit_chain,
+    migrate_scim_group_roles,
 ];
 
 /// Native SAML sign-ins' NameID and SessionIndex (ADR 0137), for single logout. Gone with
@@ -1783,6 +1883,35 @@ fn migrate_saml_sessions(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
           sp_name_qualifier TEXT,
           session_index TEXT
         );",
+    )
+}
+
+/// SCIM groups mapped to custom roles (ADR 0138): one mapping per group and scope, and
+/// the grants each made, one per person and scope (a person is in one group at most).
+/// A mapping goes with its team; its people have left the team by then, which took the
+/// grants away. A mapped role can't be deleted.
+fn migrate_scim_group_roles(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS scim_role_mappings (
+          id TEXT PRIMARY KEY,
+          tenant TEXT NOT NULL,
+          team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+          role_id TEXT NOT NULL REFERENCES roles(id),
+          scope TEXT NOT NULL CHECK (scope IN ('org', 'team')),
+          created_at INTEGER NOT NULL,
+          created_by TEXT,
+          UNIQUE (team_id, scope)
+        );
+        CREATE INDEX IF NOT EXISTS scim_role_mappings_role ON scim_role_mappings(role_id);
+        CREATE TABLE IF NOT EXISTS scim_role_grants (
+          mapping_id TEXT NOT NULL REFERENCES scim_role_mappings(id) ON DELETE CASCADE,
+          user_id TEXT NOT NULL,
+          scope TEXT NOT NULL CHECK (scope IN ('org', 'team')),
+          prior_role TEXT,
+          granted_at INTEGER NOT NULL,
+          PRIMARY KEY (user_id, scope)
+        );
+        CREATE INDEX IF NOT EXISTS scim_role_grants_mapping ON scim_role_grants(mapping_id);",
     )
 }
 
@@ -1813,6 +1942,39 @@ fn migrate_disable_holds(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS machine_disable_holds_user ON machine_disable_holds(user_id);",
     )
+}
+
+/// Tamper evidence (ADR 0122): every audit row sealed onto a hash chain. Rows already
+/// there are sealed now, in order, so the chain covers the whole log from here on; an
+/// upgrade records where that happened, as rows before it were sealed at the upgrade,
+/// not when written. A trigger refuses rows without a seal, and the erasure exception
+/// to the update trigger must keep the seal and drop the salt.
+fn migrate_audit_chain(c: &Connection, fresh: bool) -> rusqlite::Result<()> {
+    for col in crate::audit_chain::COLUMNS {
+        let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('audit_events') WHERE name = ?", [col], |r| r.get(0))?;
+        if !has {
+            c.execute_batch(&format!("ALTER TABLE audit_events ADD COLUMN {col} TEXT;"))?;
+        }
+    }
+    c.execute_batch("DROP TRIGGER IF EXISTS audit_events_no_update; DROP TRIGGER IF EXISTS audit_events_sealed;")?;
+    let (sealed, through) = crate::audit_chain::seal_existing(c)?;
+    c.execute_batch(&format!(
+        "{}
+        CREATE TRIGGER audit_events_sealed BEFORE INSERT ON audit_events
+          WHEN NEW.chain_prev IS NULL OR NEW.chain_hash IS NULL OR NEW.chain_digest IS NULL
+          BEGIN SELECT RAISE(ABORT, 'audit_events rows must be sealed onto the hash chain'); END;",
+        audit_update_trigger(true)
+    ))?;
+    if !fresh && sealed > 0 {
+        let details = serde_json::json!({
+            "added": crate::audit_chain::COLUMNS,
+            "sealed": sealed,
+            "through": through,
+            "reason": "tamper evidence: a hash chain over every event; events up to this one were sealed at this upgrade",
+        });
+        crate::audit_chain::insert_system(c, "migration", "audit.schema_upgraded", ("audit", "chain"), &details)?;
+    }
+    Ok(())
 }
 
 /// Custom roles (ADR 0123): a base built-in role and a fixed set of admin permissions on
@@ -1916,13 +2078,27 @@ fn migrate_user_erasure(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
             c.execute_batch(&format!("ALTER TABLE users ADD COLUMN {col} {ty};"))?;
         }
     }
-    let p = format!("(SELECT value FROM settings WHERE key = '{AUDIT_ERASING}')");
     c.execute_batch(&format!(
         "CREATE UNIQUE INDEX IF NOT EXISTS users_erased_as ON users(erased_as) WHERE erased_as IS NOT NULL;
         DROP TRIGGER IF EXISTS audit_events_no_update;
-        CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events
+        {}",
+        audit_update_trigger(false)
+    ))
+}
+
+/// `audit_events_no_update`: refuses every update but an erasure's (ADR 0102). With the
+/// hash chain (ADR 0122) an erasure also keeps the row's seal and clears its salt.
+fn audit_update_trigger(chain: bool) -> String {
+    let p = format!("(SELECT value FROM settings WHERE key = '{AUDIT_ERASING}')");
+    let chain = if chain {
+        "AND NEW.chain_prev IS OLD.chain_prev AND NEW.chain_hash IS OLD.chain_hash AND NEW.chain_digest IS OLD.chain_digest AND NEW.chain_salt IS NULL"
+    } else {
+        ""
+    };
+    format!(
+        "CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events
           WHEN NOT (
-            {p} IS NOT NULL
+            {p} IS NOT NULL {chain}
             AND NEW.id = OLD.id AND NEW.at = OLD.at AND NEW.actor_kind = OLD.actor_kind AND NEW.action = OLD.action
             AND NEW.outcome = OLD.outcome AND NEW.target_type IS OLD.target_type AND NEW.bot_id IS OLD.bot_id
             AND NEW.actor_role IS OLD.actor_role AND NEW.auth_method IS OLD.auth_method
@@ -1938,7 +2114,7 @@ fn migrate_user_erasure(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
             AND (NEW.session_id IS OLD.session_id OR NEW.session_id IS NULL)
           )
           BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;"
-    ))
+    )
 }
 
 /// Whether Bot `?1` is held or has messages from a held Bot in its chat.
@@ -3474,11 +3650,15 @@ fn migrate_audit_events(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
         CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events
           BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;",
     )?;
-    c.execute_batch(&format!(
+    c.execute_batch(&audit_delete_trigger())
+}
+
+fn audit_delete_trigger() -> String {
+    format!(
         "CREATE TRIGGER audit_events_no_delete BEFORE DELETE ON audit_events
           WHEN coalesce(OLD.at >= {AUDIT_CUTOFF}, 1)
           BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;"
-    ))
+    )
 }
 
 /// Unix ms before which audit events may be deleted, or NULL while retention is off.
@@ -4453,6 +4633,7 @@ impl Db {
             if let Some(v) = p.role {
                 set("role", &v.as_str())?;
                 set("role_id", &None::<String>)?;
+                Self::drop_scim_grant_in(&tx, id, "org")?;
             }
             if let Some(v) = p.status { set("status", &v)? }
             if let Some(v) = &p.tier { set("tier", v)? }
@@ -4506,6 +4687,16 @@ impl Db {
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(|e| RoleError::Db(e.to_string()))?;
         let at = now();
+        // In the same transaction as the write, so a mapping made meanwhile is seen (ADR 0138).
+        if let Some(v) = permissions {
+            let new = crate::rbac::Perms::from_names(v.iter().copied());
+            let mut st = tx.prepare("SELECT id, scope FROM scim_role_mappings WHERE role_id = ? ORDER BY created_at, id").map_err(|e| RoleError::Db(e.to_string()))?;
+            let maps = st.query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>).map_err(|e| RoleError::Db(e.to_string()))?;
+            drop(st);
+            if let Some((mapping, scope, perms)) = maps.into_iter().map(|(m, sc)| { let p = new.reaching_admins(sc == "team"); (m, sc, p) }).find(|(_, _, p)| !p.is_empty()) {
+                return Err(RoleError::Reaches { mapping, scope, perms });
+            }
+        }
         let res = (|| {
             if tx.execute("UPDATE roles SET updated_at = ?1 WHERE id = ?2", params![at, id])? == 0 {
                 return Ok(None);
@@ -4541,6 +4732,10 @@ impl Db {
         if held > 0 {
             return Err(RoleError::InUse(held as usize));
         }
+        let mapped: i64 = tx.query_row("SELECT COUNT(*) FROM scim_role_mappings WHERE role_id = ?", [id], |r| r.get(0)).map_err(|e| RoleError::Db(e.to_string()))?;
+        if mapped > 0 {
+            return Err(RoleError::Mapped(mapped as usize));
+        }
         match tx.execute("DELETE FROM roles WHERE id = ?", [id]) {
             Ok(0) => Err(RoleError::NotFound),
             Ok(_) => tx.commit().map_err(|e| RoleError::Db(e.to_string())),
@@ -4562,34 +4757,214 @@ impl Db {
         (users, teams)
     }
 
+    /// Runs `write`, and when it changed a row, ends a SCIM group's claim on `user_id`'s
+    /// role in `scope` (ADR 0138), in one transaction: a role given or taken away by hand
+    /// is never one SCIM takes away later. `held` reads, in the same transaction, what they
+    /// held before. None if nothing changed.
+    fn by_hand<T>(&self, user_id: &str, scope: &str, held: impl FnOnce(&Connection) -> rusqlite::Result<T>, write: impl FnOnce(&Connection) -> rusqlite::Result<usize>) -> Option<ByHand<T>> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().ok()?;
+        let before = held(&tx).ok()?;
+        if write(&tx).unwrap_or(0) == 0 {
+            return None;
+        }
+        let taken = Self::drop_scim_grant_in(&tx, user_id, scope).ok()?;
+        tx.commit().ok().map(|_| ByHand { before, taken })
+    }
+
     /// Gives `user_id` the role across the server, its base becoming their built-in role, in
-    /// one statement, so a role deleted meanwhile can't be half given. False if either is gone.
-    pub fn set_user_custom_role(&self, user_id: &str, role_id: &str) -> bool {
-        self.c()
-            .execute(
+    /// one statement, so a role deleted meanwhile can't be half given. Written even when they
+    /// hold it already, so it is theirs by hand whatever SCIM took away meanwhile. None if
+    /// either is gone; else the custom and built-in roles they held just before.
+    pub fn give_user_custom_role(&self, user_id: &str, role_id: &str) -> Option<ByHand<(Option<String>, Option<Role>)>> {
+        let held = |c: &Connection| {
+            c.query_row("SELECT role_id, role FROM users WHERE id = ?", [user_id], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)))
+                .optional()
+                .map(|h| h.map_or((None, None), |(id, role)| (id, Role::parse(&role))))
+        };
+        self.by_hand(user_id, "org", held, |c| {
+            c.execute(
                 "UPDATE users SET role_id = ?1, role = (SELECT base FROM roles WHERE id = ?1), updated_at = ?2
                  WHERE id = ?3 AND EXISTS (SELECT 1 FROM roles WHERE id = ?1)",
                 params![role_id, now(), user_id],
             )
-            .unwrap_or(0)
-            > 0
+        })
     }
 
     /// Takes the role away across the server. They keep its base as their built-in role.
     pub fn clear_user_custom_role(&self, user_id: &str, role_id: &str) -> bool {
-        self.c().execute("UPDATE users SET role_id = NULL, updated_at = ?1 WHERE id = ?2 AND role_id = ?3", params![now(), user_id, role_id]).unwrap_or(0) > 0
+        self.by_hand(user_id, "org", |_| Ok(()), |c| c.execute("UPDATE users SET role_id = NULL, updated_at = ?1 WHERE id = ?2 AND role_id = ?3", params![now(), user_id, role_id])).is_some()
     }
 
     /// Gives (Some) or takes away (None) a role within the team `user_id` is on. False if
     /// they aren't on that team, or the role is gone.
     pub fn set_team_custom_role(&self, team_id: &str, user_id: &str, role_id: Option<&str>) -> bool {
-        self.c()
-            .execute(
+        self.give_team_custom_role(team_id, user_id, role_id).is_some()
+    }
+
+    /// `set_team_custom_role`, and the custom role they held in the team just before.
+    pub fn give_team_custom_role(&self, team_id: &str, user_id: &str, role_id: Option<&str>) -> Option<ByHand<Option<String>>> {
+        let held = |c: &Connection| c.query_row("SELECT role_id FROM team_members WHERE team_id = ? AND user_id = ?", [team_id, user_id], |r| r.get(0)).optional().map(Option::flatten);
+        self.by_hand(user_id, "team", held, |c| {
+            c.execute(
                 "UPDATE team_members SET role_id = ?1 WHERE team_id = ?2 AND user_id = ?3 AND (?1 IS NULL OR EXISTS (SELECT 1 FROM roles WHERE id = ?1))",
                 params![role_id, team_id, user_id],
             )
-            .unwrap_or(0)
-            > 0
+        })
+    }
+
+    // SCIM groups mapped to custom roles (ADR 0138).
+
+    fn drop_scim_grant_in(c: &Connection, user_id: &str, scope: &str) -> rusqlite::Result<Option<String>> {
+        c.query_row("DELETE FROM scim_role_grants WHERE user_id = ?1 AND scope = ?2 RETURNING mapping_id", [user_id, scope], |r| r.get(0)).optional()
+    }
+
+    pub fn scim_role_mappings(&self) -> Vec<ScimRoleMapping> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM scim_role_mappings ORDER BY tenant, created_at, id").unwrap();
+        s.query_map([], scim_role_mapping_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn scim_role_mapping(&self, id: &str) -> Option<ScimRoleMapping> {
+        self.c().query_row("SELECT * FROM scim_role_mappings WHERE id = ?", [id], scim_role_mapping_row).optional().ok().flatten()
+    }
+
+    /// The mappings of the group `team_id` is, in `tenant`.
+    pub fn scim_role_mappings_of(&self, tenant: &str, team_id: &str) -> Vec<ScimRoleMapping> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM scim_role_mappings WHERE tenant = ? AND team_id = ? ORDER BY scope").unwrap();
+        s.query_map([tenant, team_id], scim_role_mapping_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Every mapping of `team_id`, whichever tenant's.
+    pub fn scim_role_mappings_of_team(&self, team_id: &str) -> Vec<ScimRoleMapping> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM scim_role_mappings WHERE team_id = ? ORDER BY scope").unwrap();
+        s.query_map([team_id], scim_role_mapping_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn scim_role_mappings_of_role(&self, role_id: &str) -> Vec<ScimRoleMapping> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM scim_role_mappings WHERE role_id = ? ORDER BY created_at, id").unwrap();
+        s.query_map([role_id], scim_role_mapping_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Maps the group `team_id` is in `tenant` to a role, while both still exist and the
+    /// role's permissions, as they are now, don't reach admins in `scope`.
+    pub fn create_scim_role_mapping(&self, tenant: &str, team_id: &str, role_id: &str, scope: &str, by: Option<&str>) -> Result<ScimRoleMapping, ScimRoleMapError> {
+        let id = format!("sm{}", crate::random_hex(5));
+        let c = self.c();
+        let perms = role_perms_in(&c, role_id).map_err(|e| ScimRoleMapError::Db(e.to_string()))?.ok_or(ScimRoleMapError::Gone)?;
+        let reach = perms.reaching_admins(scope == "team");
+        if !reach.is_empty() {
+            return Err(ScimRoleMapError::Reaches(reach));
+        }
+        let n = c
+            .execute(
+                "INSERT INTO scim_role_mappings (id, tenant, team_id, role_id, scope, created_at, created_by)
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+                 WHERE EXISTS (SELECT 1 FROM scim_groups WHERE tenant = ?2 AND team_id = ?3) AND EXISTS (SELECT 1 FROM roles WHERE id = ?4)",
+                params![id, tenant, team_id, role_id, scope, now(), by],
+            )
+            .map_err(|e| if constraint(&e) { ScimRoleMapError::Taken } else { ScimRoleMapError::Db(e.to_string()) })?;
+        drop(c);
+        if n == 0 {
+            return Err(ScimRoleMapError::Gone);
+        }
+        self.scim_role_mapping(&id).ok_or(ScimRoleMapError::Gone)
+    }
+
+    /// Deletes a mapping. Its grants must have been taken away first.
+    pub fn delete_scim_role_mapping(&self, id: &str) -> bool {
+        self.c().execute("DELETE FROM scim_role_mappings WHERE id = ?", [id]).unwrap_or(0) > 0
+    }
+
+    pub fn scim_role_grants(&self, mapping_id: &str) -> Vec<ScimRoleGrant> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM scim_role_grants WHERE mapping_id = ? ORDER BY granted_at, user_id").unwrap();
+        s.query_map([mapping_id], scim_role_grant_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// The grants a mapping made to `user_id`, in either scope.
+    pub fn scim_role_grants_of_user(&self, user_id: &str) -> Vec<ScimRoleGrant> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM scim_role_grants WHERE user_id = ? ORDER BY scope").unwrap();
+        s.query_map([user_id], scim_role_grant_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Gives `user_id` the mapping's role and records that SCIM gave it, in one
+    /// transaction, only while they're on its team, hold no custom role in its scope, and
+    /// (across the server) aren't an admin or the owner account. Across the server, the
+    /// role's base becomes their built-in role, and the one they had is kept to give back.
+    pub fn grant_scim_role(&self, m: &ScimRoleMapping, user_id: &str) -> bool {
+        let c = self.c();
+        let Ok(tx) = c.unchecked_transaction() else { return false };
+        let at = now();
+        let on_team = "EXISTS (SELECT 1 FROM team_members WHERE team_id = ?3 AND user_id = ?2) AND EXISTS (SELECT 1 FROM roles WHERE id = ?1)";
+        let res = (|| {
+            if role_perms_in(&tx, &m.role_id)?.is_none_or(|p| !p.reaching_admins(m.scope == "team").is_empty()) {
+                return Ok(false);
+            }
+            let prior: Option<String> = tx.query_row("SELECT role FROM users WHERE id = ?", [user_id], |r| r.get(0)).optional()?;
+            let n = if m.scope == "org" {
+                tx.execute(
+                    &format!(
+                        "UPDATE users SET role_id = ?1, role = (SELECT base FROM roles WHERE id = ?1), updated_at = ?4
+                         WHERE id = ?2 AND role_id IS NULL AND role != 'admin' AND id != ?5 AND {on_team}"
+                    ),
+                    params![m.role_id, user_id, m.team_id, at, crate::users::OPERATOR],
+                )?
+            } else {
+                tx.execute(&format!("UPDATE team_members SET role_id = ?1 WHERE team_id = ?3 AND user_id = ?2 AND role_id IS NULL AND {on_team}"), params![m.role_id, user_id, m.team_id])?
+            };
+            if n == 0 {
+                return Ok(false);
+            }
+            let prior = if m.scope == "org" { prior } else { None };
+            tx.execute(
+                "INSERT OR REPLACE INTO scim_role_grants (mapping_id, user_id, scope, prior_role, granted_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![m.id, user_id, m.scope, prior, at],
+            )?;
+            Ok::<_, rusqlite::Error>(true)
+        })();
+        matches!(res, Ok(true)) && tx.commit().is_ok()
+    }
+
+    /// Takes away what the mapping gave `user_id`, and forgets the grant, in one
+    /// transaction. Only a role they still hold from it is cleared; across the server their
+    /// built-in role goes back to the one they had before. None if it gave them nothing.
+    /// `left`: they left the group, so nothing is taken if they're on its team again (a
+    /// join that raced the leave holds the grant now).
+    pub fn revoke_scim_role(&self, m: &ScimRoleMapping, user_id: &str, left: bool) -> Option<ScimRevoked> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().ok()?;
+        let res = (|| {
+            if left && tx.query_row("SELECT EXISTS (SELECT 1 FROM team_members WHERE team_id = ?1 AND user_id = ?2)", [&m.team_id, user_id], |r| r.get::<_, bool>(0))? {
+                return Ok(None);
+            }
+            let prior: Option<Option<String>> =
+                tx.query_row("DELETE FROM scim_role_grants WHERE mapping_id = ?1 AND user_id = ?2 RETURNING prior_role", [&m.id, user_id], |r| r.get(0)).optional()?;
+            let Some(prior) = prior else { return Ok(None) };
+            if m.scope == "team" {
+                let n = tx.execute("UPDATE team_members SET role_id = NULL WHERE team_id = ?1 AND user_id = ?2 AND role_id = ?3", params![m.team_id, user_id, m.role_id])?;
+                return Ok(Some(ScimRevoked { cleared: n > 0, role_before: None, role_after: None }));
+            }
+            let role = |tx: &Connection| tx.query_row("SELECT role FROM users WHERE id = ?", [user_id], |r| r.get::<_, String>(0)).optional();
+            let before = role(&tx)?;
+            // Never back to admin: a grant is never made to one, so a prior admin is a hand edit.
+            let prior = prior.filter(|p| Role::parse(p).is_some_and(|r| r != Role::Admin));
+            let n = tx.execute(
+                "UPDATE users SET role_id = NULL, role = coalesce(?1, role), updated_at = ?2 WHERE id = ?3 AND role_id = ?4",
+                params![prior, now(), user_id, m.role_id],
+            )?;
+            let after = role(&tx)?;
+            let parse = |r: Option<String>| r.as_deref().and_then(Role::parse);
+            Ok::<_, rusqlite::Error>(Some(ScimRevoked { cleared: n > 0, role_before: parse(before), role_after: parse(after) }))
+        })();
+        match res {
+            Ok(Some(r)) => tx.commit().ok().map(|_| r),
+            _ => None,
+        }
     }
 
     /// What a person's custom role across the server adds. Nothing without one.
@@ -4761,6 +5136,7 @@ impl Db {
              WHERE id = ?1",
             &[&user_id, &ERASED_NAME, &at, &by, &pseudonym],
         )?;
+        run("DELETE FROM scim_role_grants WHERE user_id = ?", &[&user_id])?;
         out.audit_events = Self::pseudonymise_audit(&tx, &scrub, &theirs).map_err(db_err)?;
         tx.commit().map_err(db_err)?;
         Ok(out)
@@ -4801,9 +5177,9 @@ impl Db {
         c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", params![AUDIT_ERASING, s.pseudonym])?;
         let mut sql = String::from(
             "SELECT id, actor_id, actor_name, actor_email, actor_subject, target_id, on_behalf_of, ip, user_agent, session_id, details FROM audit_events
-             WHERE actor_id = ?1 OR target_id = ?1 OR on_behalf_of = ?1 OR instr(details, ?1) > 0",
+             WHERE action != ?2 AND (actor_id = ?1 OR target_id = ?1 OR on_behalf_of = ?1 OR instr(details, ?1) > 0",
         );
-        let mut args: Vec<String> = vec![s.id.clone()];
+        let mut args: Vec<String> = vec![s.id.clone(), crate::audit_chain::ERASED.into()];
         for e in &s.emails {
             args.push(e.clone());
             sql.push_str(&format!(" OR actor_email = ?{n} COLLATE NOCASE OR instr(lower(details), ?{n}) > 0", n = args.len()));
@@ -4812,13 +5188,14 @@ impl Db {
             args.push(x.clone());
             sql.push_str(&format!(" OR actor_subject = ?{n} OR instr(details, ?{n}) > 0", n = args.len()));
         }
+        sql.push(')');
         type Row = (i64, [Option<String>; 9], String);
         let rows: Vec<Row> = {
             let mut st = c.prepare(&sql)?;
             let rows = st.query_map(rusqlite::params_from_iter(&args), |r| Ok((r.get(0)?, [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?], r.get(10)?)))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
-        let mut n = 0;
+        let mut cleared = Vec::new();
         for (id, [actor_id, name, email, subject, target, behalf, ip, agent, session], details) in rows {
             let is = |v: &Option<String>| v.as_deref() == Some(s.id.as_str());
             // A visitor without an account (a signup) is known only by the email they gave.
@@ -4849,13 +5226,18 @@ impl Db {
             }
             c.execute(
                 "UPDATE audit_events SET actor_id = ?2, actor_name = ?3, actor_email = ?4, actor_subject = ?5, target_id = ?6, on_behalf_of = ?7,
-                   ip = ?8, user_agent = ?9, session_id = ?10, details = ?11 WHERE id = ?1",
+                   ip = ?8, user_agent = ?9, session_id = ?10, details = ?11, chain_salt = NULL WHERE id = ?1",
                 params![id, next.0, next.1, next.2, next.3, next.4, next.5, next.6, next.7, next.8, if changed { d.to_string() } else { details }],
             )?;
-            n += 1;
+            cleared.push(id);
+        }
+        // On the chain, in the same transaction: the rows whose salt this erasure cleared.
+        // An erased row no such event names is reported as tampered with (ADR 0122).
+        if !cleared.is_empty() {
+            crate::audit_chain::insert_erased(c, &s.pseudonym, &cleared)?;
         }
         c.execute("DELETE FROM settings WHERE key = ?", [AUDIT_ERASING])?;
-        Ok(n)
+        Ok(cleared.len())
     }
 
     /// Every row of every table, as `(table, the row's columns as text)`.
@@ -6516,6 +6898,11 @@ impl Db {
     /// [`Db::record`] for when saving the event is the operation itself: returns the
     /// new event's id, or the error.
     pub fn try_record(&self, e: &audit::Event) -> rusqlite::Result<i64> {
+        self.record_at(e, now())
+    }
+
+    /// [`Db::try_record`] as of `at` (unix ms), for tests of what happens to old events.
+    pub(crate) fn record_at(&self, e: &audit::Event, at: i64) -> rusqlite::Result<i64> {
         let o = |v: &Option<String>, max: usize| v.as_deref().map(|s| audit::clip(s, max));
         let a = &e.actor;
         let bot_actor = matches!(a.kind, audit::ActorKind::Bot).then_some(a.id.as_deref()).flatten();
@@ -6533,37 +6920,31 @@ impl Db {
                 d.insert("spanId".into(), serde_json::json!(t.span_id()));
             }
         }
-        let details = details.to_string();
-        let c = self.c();
-        let res = c.execute(
-            "INSERT INTO audit_events (at, actor_kind, actor_id, actor_name, actor_subject, action, target_type, target_id, bot_id, outcome, ip, user_agent, details,
-               actor_email, actor_role, auth_method, idp, idp_provider, session_id, on_behalf_of)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
-                now(),
-                a.kind.as_str(),
-                o(&a.id, 128),
-                text(&a.name, 128),
-                o(&a.subject, 256),
-                audit::clip(&e.action, 64),
-                o(&e.target_type, 32),
-                o(&e.target_id, 128),
-                o(&e.bot_id, 128),
-                e.outcome.as_str(),
-                o(&e.source.ip, 64),
-                text(&e.source.user_agent, 256),
-                details,
-                text(&a.email, 254),
-                o(&a.role, 16),
-                o(&a.method, 32),
-                o(&a.idp, 32),
-                o(&a.idp_provider, 64),
-                o(&a.session, 64),
-                o(&a.on_behalf_of, 128),
-            ],
-        );
-        let res = res.map(|_| c.last_insert_rowid());
-        drop(c);
+        use rusqlite::types::Value as V;
+        let v = |s: Option<String>| s.map_or(V::Null, V::Text);
+        let cols = [
+            ("at", V::Integer(at)),
+            ("actor_kind", V::Text(a.kind.as_str().into())),
+            ("actor_id", v(o(&a.id, 128))),
+            ("actor_name", v(text(&a.name, 128))),
+            ("actor_subject", v(o(&a.subject, 256))),
+            ("action", V::Text(audit::clip(&e.action, 64))),
+            ("target_type", v(o(&e.target_type, 32))),
+            ("target_id", v(o(&e.target_id, 128))),
+            ("bot_id", v(o(&e.bot_id, 128))),
+            ("outcome", V::Text(e.outcome.as_str().into())),
+            ("ip", v(o(&e.source.ip, 64))),
+            ("user_agent", v(text(&e.source.user_agent, 256))),
+            ("details", V::Text(details.to_string())),
+            ("actor_email", v(text(&a.email, 254))),
+            ("actor_role", v(o(&a.role, 16))),
+            ("auth_method", v(o(&a.method, 32))),
+            ("idp", v(o(&a.idp, 32))),
+            ("idp_provider", v(o(&a.idp_provider, 64))),
+            ("session_id", v(o(&a.session, 64))),
+            ("on_behalf_of", v(o(&a.on_behalf_of, 128))),
+        ];
+        let res = crate::audit_chain::insert(&self.c(), &cols);
         let reason = e.details.get("reason").and_then(|r| r.as_str());
         self.metrics().audited(&e.action, e.outcome.as_str(), reason);
         crate::obs::trace::audited(&e.action, e.outcome.as_str(), reason);
@@ -6571,7 +6952,17 @@ impl Db {
     }
 
     /// Newest first (or oldest first with `oldest_first`), filtered, at most `limit`.
+    /// Rows that can't be read are left out; see `try_audit_events`.
     pub fn audit_events(&self, f: &audit::Filter, limit: i64, oldest_first: bool) -> Vec<AuditEvent> {
+        self.select_audit_events(f, limit, oldest_first, false).unwrap()
+    }
+
+    /// Like `audit_events`, but a row that can't be read is an error, not a gap.
+    pub fn try_audit_events(&self, f: &audit::Filter, limit: i64, oldest_first: bool) -> rusqlite::Result<Vec<AuditEvent>> {
+        self.select_audit_events(f, limit, oldest_first, true)
+    }
+
+    fn select_audit_events(&self, f: &audit::Filter, limit: i64, oldest_first: bool, strict: bool) -> rusqlite::Result<Vec<AuditEvent>> {
         use rusqlite::types::Value as V;
         let mut sql = String::from("SELECT * FROM audit_events WHERE 1 = 1");
         let mut args: Vec<V> = Vec::new();
@@ -6637,8 +7028,9 @@ impl Db {
         sql.push_str(if oldest_first { " ORDER BY id ASC LIMIT ?" } else { " ORDER BY id DESC LIMIT ?" });
         args.push(V::Integer(limit));
         let c = self.c();
-        let mut s = c.prepare(&sql).unwrap();
-        s.query_map(rusqlite::params_from_iter(args), audit_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c.prepare(&sql)?;
+        let rows = s.query_map(rusqlite::params_from_iter(args), audit_row)?;
+        if strict { rows.collect() } else { Ok(rows.filter_map(Result::ok).collect()) }
     }
 
     /// Whether per-user accounts were on, with their copies in order, when last saved (ADR 0037).
@@ -6670,11 +7062,63 @@ impl Db {
         .unwrap();
     }
 
-    /// Deletes events older than `cutoff` (unix ms). The trigger refuses any row
-    /// still inside the saved retention window.
-    /// Deletes events older than the saved retention window.
-    pub fn prune_audit(&self) -> rusqlite::Result<usize> {
-        self.c().execute(&format!("DELETE FROM audit_events WHERE at < {AUDIT_CUTOFF}"), [])
+    /// Deletes events older than the saved retention window (the trigger refuses any row
+    /// inside it), as one run from the start of the log, so the hash chain stays whole:
+    /// an old row after a younger one waits for it. None after `delivered`, the SIEM
+    /// export's cursor, so nothing goes before it's off the host (ADR 0122). Saves the
+    /// last deleted row as the chain's anchor, and returns how many went and the anchor.
+    pub fn prune_audit(&self, delivered: Option<i64>) -> rusqlite::Result<(usize, Option<crate::audit_chain::Link>)> {
+        let c = self.c();
+        let tx = rusqlite::Transaction::new_unchecked(&c, rusqlite::TransactionBehavior::Immediate)?;
+        // An earlier statement's 'now' than the delete's, so its cutoff is never later than the trigger's.
+        let end: Option<i64> = tx.query_row(
+            &format!("SELECT coalesce((SELECT MIN(id) FROM audit_events WHERE at >= {AUDIT_CUTOFF}), (SELECT MAX(id) + 1 FROM audit_events)) WHERE {AUDIT_CUTOFF} IS NOT NULL"),
+            [],
+            |r| r.get(0),
+        ).optional()?.flatten();
+        let Some(end) = end.map(|e: i64| delivered.map_or(e, |d| e.min(d + 1))) else { return Ok((0, None)) };
+        let last: Option<(i64, Option<String>)> =
+            tx.query_row("SELECT id, chain_hash FROM audit_events WHERE id < ? ORDER BY id DESC LIMIT 1", [end], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let Some((last, hash)) = last else { return Ok((0, None)) };
+        let n = tx.execute("DELETE FROM audit_events WHERE id <= ?", [last])?;
+        let anchor = hash.map(|hash| crate::audit_chain::Link { id: last, hash });
+        if let Some(a) = &anchor {
+            crate::audit_chain::set_anchor(&tx, a)?;
+        }
+        tx.commit()?;
+        Ok((n, anchor))
+    }
+
+    /// The last pruned audit row, which the first one left links to (ADR 0122).
+    pub fn audit_chain_anchor(&self) -> Option<crate::audit_chain::Link> {
+        crate::audit_chain::anchor(&self.c()).ok().flatten()
+    }
+
+    /// Up to `limit` audit rows after id `after`, oldest first, as the hash chain sees them.
+    /// A row that can't be read is an error, never skipped: skipping would hide it.
+    pub fn audit_chain_rows(&self, after: i64, limit: i64) -> rusqlite::Result<Vec<crate::audit_chain::Row>> {
+        let c = self.c();
+        let mut s = c.prepare(&format!("SELECT {} FROM audit_events WHERE id > ? ORDER BY id LIMIT ?", crate::audit_chain::select_list()))?;
+        s.query_map(params![after, limit], crate::audit_chain::read_row)?.collect()
+    }
+
+    /// The newest audit event's id, 0 when there is none.
+    pub fn audit_head(&self) -> i64 {
+        self.c().query_row("SELECT coalesce(MAX(id), 0) FROM audit_events", [], |r| r.get(0)).unwrap_or(0)
+    }
+
+    /// Where the SIEM export to `sink` got to: the last event it delivered (ADR 0122).
+    pub fn audit_export_cursor(&self, sink: &str) -> Option<i64> {
+        let v: Option<String> = self.c().query_row("SELECT value FROM settings WHERE key = ?", [format!("audit_export:{sink}")], |r| r.get(0)).optional().ok().flatten();
+        v.and_then(|v| v.parse().ok())
+    }
+
+    pub fn set_audit_export_cursor(&self, sink: &str, delivered: i64) -> rusqlite::Result<()> {
+        self.c().execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![format!("audit_export:{sink}"), delivered.to_string()],
+        )?;
+        Ok(())
     }
 
     // Machines (ADR 0025)
@@ -8625,6 +9069,79 @@ mod tests {
     }
 
     #[test]
+    fn scim_role_grants_only_ever_take_back_what_they_gave() {
+        let db = Db::open(&temp_path("scim-roles").join("app.sqlite")).unwrap();
+        let a = db.create_user(None, Some("a@example.com"), "A", Role::Readonly).unwrap();
+        let b = db.create_user(None, Some("b@example.com"), "B", Role::Member).unwrap();
+        let team = db.create_team("Eng", None);
+        let other = db.create_team("Ops", None);
+        for u in [&a, &b] {
+            assert!(db.add_team_member(&team.id, &u.id, "member", None));
+        }
+        db.link_scim_group("okta", &team.id, None, "Eng", None).unwrap();
+        let r = db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None).unwrap();
+        let hand = db.create_custom_role("Hand", "", Role::Member, &["users.manage"], None).unwrap();
+        assert!(matches!(db.create_scim_role_mapping("okta", &other.id, &r.id, "org", None), Err(ScimRoleMapError::Gone)), "not a group");
+        assert!(matches!(db.create_scim_role_mapping("entra", &team.id, &r.id, "org", None), Err(ScimRoleMapError::Gone)), "another tenant's");
+        let org = db.create_scim_role_mapping("okta", &team.id, &r.id, "org", None).unwrap();
+        assert!(matches!(db.create_scim_role_mapping("okta", &team.id, &hand.id, "org", None), Err(ScimRoleMapError::Taken)));
+
+        assert!(db.grant_scim_role(&org, &a.id));
+        assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Member, Some(r.id.clone())));
+        assert!(!db.grant_scim_role(&org, &a.id), "once");
+        assert!(db.give_user_custom_role(&b.id, &hand.id).is_some());
+        assert!(!db.grant_scim_role(&org, &b.id), "never over a role given by hand");
+        assert!(matches!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view", "bots.manage"])), Err(RoleError::Reaches { .. })), "checked as it's saved");
+        assert!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view"])).is_ok());
+        assert!(db.revoke_scim_role(&org, &a.id, true).is_none(), "a leave that a rejoin overtook keeps the server-wide grant");
+        assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Member, Some(r.id.clone())));
+        assert_eq!(db.scim_role_grants(&org.id).len(), 1);
+        let back = db.revoke_scim_role(&org, &a.id, false).unwrap();
+        assert_eq!((back.cleared, back.role_before, back.role_after), (true, Some(Role::Member), Some(Role::Readonly)));
+        assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Readonly, None));
+        assert!(db.revoke_scim_role(&org, &a.id, false).is_none());
+
+        // An admin confirms it just as SCIM takes it away: written back, from what was there then.
+        assert!(db.grant_scim_role(&org, &a.id));
+        assert!(db.revoke_scim_role(&org, &a.id, false).is_some());
+        assert_eq!(db.give_user_custom_role(&a.id, &r.id), Some(ByHand { before: (None, Some(Role::Readonly)), taken: None }));
+        assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Member, Some(r.id.clone())));
+        assert!(db.clear_user_custom_role(&a.id, &r.id));
+
+        // Given by hand after SCIM gave one: SCIM's claim ends and nothing is taken back.
+        assert!(db.grant_scim_role(&org, &a.id));
+        assert!(db.give_user_custom_role(&a.id, &hand.id).is_some());
+        assert!(db.revoke_scim_role(&org, &a.id, false).is_none());
+        assert_eq!(db.user(&a.id).unwrap().role_id, Some(hand.id.clone()));
+
+        let in_team = db.create_scim_role_mapping("okta", &team.id, &r.id, "team", None).unwrap();
+        assert!(db.grant_scim_role(&in_team, &b.id));
+        assert_eq!(db.team_member(&b.id).unwrap().role_id, Some(r.id.clone()));
+        assert!(db.revoke_scim_role(&in_team, &b.id, true).is_none(), "a leave that a rejoin overtook takes nothing");
+        assert_eq!(db.team_member(&b.id).unwrap().role_id, Some(r.id.clone()));
+        assert_eq!(db.give_team_custom_role(&team.id, &b.id, Some(&r.id)), Some(ByHand { before: Some(r.id.clone()), taken: Some(in_team.id.clone()) }), "the same role, now by hand");
+        assert!(db.revoke_scim_role(&in_team, &b.id, false).is_none());
+        assert_eq!(db.team_member(&b.id).unwrap().role_id, Some(r.id.clone()), "kept by hand");
+        // An admin confirms the role SCIM gave just as SCIM takes it away: it is still theirs.
+        assert!(db.set_team_custom_role(&team.id, &b.id, None));
+        assert!(db.grant_scim_role(&in_team, &b.id));
+        assert!(db.revoke_scim_role(&in_team, &b.id, false).is_some());
+        assert_eq!(db.give_team_custom_role(&team.id, &b.id, Some(&r.id)), Some(ByHand { before: None, taken: None }), "it says what was there as it wrote");
+        assert_eq!(db.team_member(&b.id).unwrap().role_id, Some(r.id.clone()));
+        assert!(db.remove_team_member(&team.id, &b.id, false));
+        assert!(!db.grant_scim_role(&in_team, &b.id), "only on the team");
+
+        let wide = db.create_custom_role("Wide", "", Role::Member, &["bots.manage"], None).unwrap();
+        let ops = db.create_team("Ops2", None);
+        db.link_scim_group("okta", &ops.id, None, "Ops2", None).unwrap();
+        assert_eq!(db.create_scim_role_mapping("okta", &ops.id, &wide.id, "org", None).err(), Some(ScimRoleMapError::Reaches(vec!["bots.manage"])));
+        assert!(db.create_scim_role_mapping("okta", &ops.id, &wide.id, "team", None).is_ok(), "bots.manage means nothing in a team");
+        assert_eq!(db.delete_custom_role(&r.id), Err(RoleError::Mapped(2)));
+        assert!(db.delete_scim_role_mapping(&org.id));
+        assert!(db.scim_role_grants(&org.id).is_empty());
+    }
+
+    #[test]
     fn teammate_accounts_made_before_their_table_are_remembered_from_the_audit_log() {
         let db = Db::open(&temp_path("spaces").join("app.sqlite")).unwrap();
         let made = |owner: &str, d: Value| audit::Who::system("isolation").event("isolation.account_created").target("user", owner).details(d);
@@ -8657,6 +9174,28 @@ mod tests {
         assert!(db.residency_pin(PinOn::User, &u.id).is_some());
         db.c().execute_batch("DROP TRIGGER pins_kept;").unwrap();
         assert_eq!((db.unpin_residency(PinOn::User, &u.id), db.unpin_residency(PinOn::User, &u.id)), (Ok(true), Ok(false)));
+    }
+
+    #[test]
+    fn a_message_carrying_someones_data_is_held_and_erased_with_theirs() {
+        let db = Db::open(&temp_path("carried-erasure").join("app.sqlite")).unwrap();
+        let ada = db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
+        let bea = db.create_user(None, Some("bea@example.com"), "Bea", Role::Member).unwrap();
+        let bot = db.create_bot_owned("Bea's", "#fff", "waddle", "hermes", None, false, &bea.id, Visibility::Shared);
+        let mut actor = audit::Actor::for_bot(&bot);
+        actor.carries = vec![bea.id.clone(), ada.id.clone()];
+        let m = db.add_message(&bot.id, "user", "Ada's numbers", None, false, Some("done"));
+        db.set_requested_by(m.id, &audit::Who { actor, source: Default::default() });
+
+        db.put_retention_hold(&bot.id, "litigation", None).unwrap();
+        assert_eq!(db.erasure_holds(&ada.id, &[]), vec![bot.id.clone()]);
+        assert!(matches!(db.erase_user(&ada.id, "erased-1", None, &[]), Err(EraseError::Held(_))));
+        assert_eq!(db.message(m.id).unwrap().text, "Ada's numbers", "a held message isn't erased");
+
+        assert!(db.delete_retention_hold(&bot.id));
+        db.erase_user(&ada.id, "erased-1", None, &[]).unwrap();
+        let m = db.message(m.id).unwrap();
+        assert!((m.text.as_str(), m.requested_by.is_none()) == (ERASED_TEXT, true), "{} {:?}", m.text, m.requested_by);
     }
 
     #[test]
@@ -9001,14 +9540,14 @@ mod tests {
         assert!(db.c().execute("UPDATE machines SET state = 'lost'", []).is_err(), "only known states");
 
         // An install from before machines (user_version 9) gets the table on upgrade.
-        db.c().execute_batch("DROP TABLE machines; PRAGMA user_version = 9;").unwrap();
+        db.c().execute_batch(&format!("DROP TABLE machines; {REWIND_AUDIT_CHAIN} PRAGMA user_version = 9;")).unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
         assert!(db.machines(None).is_empty());
         assert!(db.add_machine(&new).is_ok());
 
         // An install with tiers but no enrollment (user_version 11) gets enrollment on upgrade.
-        db.c().execute_batch("DROP TABLE machine_certs; DROP TABLE machine_tokens; PRAGMA user_version = 11;").unwrap();
+        db.c().execute_batch(&format!("DROP TABLE machine_certs; DROP TABLE machine_tokens; {REWIND_AUDIT_CHAIN} PRAGMA user_version = 11;")).unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
         let v: i64 = db.c().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
@@ -9022,7 +9561,7 @@ mod tests {
         db.c()
             .execute_batch(
                 "ALTER TABLE machines DROP COLUMN firewall_id; ALTER TABLE machines DROP COLUMN enroll_by;
-                 ALTER TABLE machines DROP COLUMN enroll_overdue_at; PRAGMA user_version = 12;",
+                 ALTER TABLE machines DROP COLUMN enroll_overdue_at; DROP TRIGGER IF EXISTS audit_events_sealed; PRAGMA user_version = 12;",
             )
             .unwrap();
         drop(db);
@@ -9057,7 +9596,7 @@ mod tests {
         drop(db);
         let db = Db::open(&path).unwrap();
         let actions: Vec<String> = all_events(&db).into_iter().map(|e| e.action).collect();
-        assert_eq!(actions, ["policy.sandbox_initialized", "audit.schema_upgraded", "bot.acl_initialized", "policy.initialized"]);
+        assert_eq!(actions, ["audit.schema_upgraded", "policy.sandbox_initialized", "audit.schema_upgraded", "bot.acl_initialized", "policy.initialized"]);
     }
 
     #[test]
@@ -9072,7 +9611,7 @@ mod tests {
         p.as_object_mut().unwrap().remove("sandbox");
         db.c().execute("UPDATE settings SET value = ? WHERE key = 'policy'", [p.to_string()]).unwrap();
         let sandbox = MIGRATIONS.iter().position(|m| std::ptr::fn_addr_eq(*m, migrate_sandbox as fn(&Connection, bool) -> rusqlite::Result<()>)).unwrap();
-        db.c().execute_batch(&format!("PRAGMA user_version = {sandbox};")).unwrap();
+        db.c().execute_batch(&format!("{REWIND_AUDIT_CHAIN} PRAGMA user_version = {sandbox};")).unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
         assert!(!db.global_policy().sandbox);
@@ -9084,9 +9623,13 @@ mod tests {
         assert_eq!(all_events(&db).iter().filter(|e| e.action == "policy.sandbox_initialized").count(), 1, "once");
     }
 
+    /// Before a test rewinds `user_version` past the hash chain (ADR 0122): earlier
+    /// migrations write audit rows raw, as they did then, and the chain's seals them.
+    const REWIND_AUDIT_CHAIN: &str = "DROP TRIGGER IF EXISTS audit_events_sealed;";
+
     macro_rules! undo_audit_actors {
         () => {
-            "DROP TRIGGER audit_events_no_update;
+            "DROP TRIGGER audit_events_no_update; DROP TRIGGER IF EXISTS audit_events_sealed;
             CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;
             DROP INDEX audit_events_on_behalf_of; DROP INDEX audit_events_session;
             ALTER TABLE audit_events DROP COLUMN actor_email; ALTER TABLE audit_events DROP COLUMN actor_role;
@@ -9133,7 +9676,7 @@ mod tests {
         let v: i64 = db.c().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, MIGRATIONS.len() as i64);
         let rows = all_events(&db);
-        let upgraded = rows.iter().find(|e| e.action == "audit.schema_upgraded").unwrap();
+        let upgraded = rows.iter().find(|e| e.action == "audit.schema_upgraded" && e.target_id.as_deref() == Some("actors")).unwrap();
         let old = rows.iter().find(|e| e.action == "bot.created").unwrap();
         assert_eq!((upgraded.action.as_str(), upgraded.actor_id.as_deref()), ("audit.schema_upgraded", Some("migration")));
         assert_eq!(upgraded.details["added"].as_array().map(Vec::len), Some(AUDIT_ACTOR_COLUMNS.len()));
@@ -9185,7 +9728,7 @@ mod tests {
         let never = db.create_user(None, None, "Never", Role::Member).unwrap();
         let s = db.create_session(&NewSession { user_id: &seen.id, token_hash: "h", kind: "token", method: "sso", idp_subject: None, idp_provider: Some("work"), label: None, ip: None, user_agent: None, expires_at: now() + 1000, mfa: None });
         assert_eq!(db.user(&seen.id).unwrap().last_login_at, Some(s.created_at), "a new session stamps it");
-        db.c().execute_batch(&format!("{UNDO_LAST_LOGIN} PRAGMA user_version = 7;")).unwrap();
+        db.c().execute_batch(&format!("{UNDO_LAST_LOGIN} {REWIND_AUDIT_CHAIN} PRAGMA user_version = 7;")).unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
         let u = db.user(&seen.id).unwrap();
@@ -9240,10 +9783,55 @@ mod tests {
         assert!(db.c().execute("DELETE FROM audit_events WHERE action = 'policy.updated'", []).is_err());
         // No retention set: nothing can be deleted, however old.
         assert!(db.c().execute("DELETE FROM audit_events WHERE at < ?", [now() + 60_000]).is_err());
-        assert_eq!(db.prune_audit().unwrap(), 0);
+        assert_eq!(db.prune_audit(None).unwrap(), (0, None));
         assert_eq!(all_events(&db).len(), 2);
         let e = &all_events(&db)[0];
         assert_eq!((e.actor_kind.as_str(), e.actor_id.as_deref(), e.target_id.as_deref()), ("user", Some("operator"), Some("global")));
+        // Sealed on the hash chain (ADR 0122): a row without a seal can't get in, and no
+        // seal can change, even during an erasure.
+        assert!(e.chain_hash.as_ref().is_some_and(|h| h.len() == 64) && e.chain_prev == all_events(&db)[1].chain_hash);
+        let raw = "INSERT INTO audit_events (at, actor_kind, action, outcome, details) VALUES (1, 'system', 'forged', 'success', '{}')";
+        assert!(db.c().execute(raw, []).unwrap_err().to_string().contains("sealed"));
+        db.c().execute("INSERT INTO settings (key, value) VALUES (?, 'p')", [AUDIT_ERASING]).unwrap();
+        assert!(db.c().execute("UPDATE audit_events SET chain_hash = chain_prev", []).is_err());
+        assert!(db.c().execute("UPDATE audit_events SET chain_digest = 'x', chain_salt = NULL", []).is_err());
+        assert_eq!(db.c().execute("UPDATE audit_events SET chain_salt = NULL", []).unwrap(), 2, "an erasure clears the salt");
+        db.c().execute("DELETE FROM settings WHERE key = ?", [AUDIT_ERASING]).unwrap();
+        // Cleared by hand, with no erasure event naming the rows: their contents can't be vouched for.
+        let r = crate::audit_chain::verify(&db, vec![]);
+        assert_eq!((r.ok, r.checked, r.erased, r.broken), (false, 2, 2, 2), "{r:?}");
+        let ids: Vec<i64> = all_events(&db).iter().map(|e| e.id).collect();
+        crate::audit_chain::insert_erased(&db.c(), "erased-test", &ids).unwrap();
+        let r = crate::audit_chain::verify(&db, vec![]);
+        assert_eq!((r.ok, r.checked, r.erased), (true, 3, 2), "{r:?}");
+    }
+
+    /// Retention deletes a run from the start of the log (ADR 0122), never past the
+    /// SIEM export's cursor, and leaves an anchor the chain carries on from.
+    #[test]
+    fn audit_pruning_keeps_the_chain_whole() {
+        let db = Db::open(&temp_path("audit-prune").join("app.sqlite")).unwrap();
+        db.c().execute_batch(&format!("DROP TRIGGER audit_events_no_delete; DELETE FROM audit_events; {}", audit_delete_trigger())).unwrap();
+        let old = now() - 40 * 86_400_000;
+        let at = |action: &str, t: i64| db.record_at(&audit::Event::new(audit::Actor::system("test"), action), t).unwrap();
+        let [o1, o2, o3] = [at("old", old), at("old", old), at("old", old)];
+        let young = at("young", now());
+        let late = at("old", old);
+        assert_eq!(db.prune_audit(Some(o1)).unwrap(), (0, None), "no retention set");
+        db.set_audit_retention(Some(30));
+        let (n, anchor) = db.prune_audit(Some(o1)).unwrap();
+        assert_eq!((n, anchor.as_ref().map(|a| a.id)), (1, Some(o1)), "held at what the SIEM has");
+        assert!(crate::audit_chain::verify(&db, vec![]).ok);
+        let (n, anchor) = db.prune_audit(None).unwrap();
+        assert_eq!((n, anchor.map(|a| a.id)), (2, Some(o3)));
+        assert_eq!(db.audit_chain_anchor().map(|a| a.id), Some(o3));
+        assert_eq!(db.prune_audit(None).unwrap(), (0, None), "the old row after a young one waits");
+        let r = crate::audit_chain::verify(&db, vec![]);
+        assert_eq!((r.ok, r.first, r.anchor.as_ref().map(|a| a.id), r.checked), (true, Some(young), Some(o3), 2), "{r:?}");
+        assert!(o2 < o3 && late > young);
+        // New rows chain on.
+        at("next", now());
+        assert!(crate::audit_chain::verify(&db, vec![]).ok);
     }
 
     #[test]
@@ -9293,28 +9881,42 @@ mod tests {
     }
 
     #[test]
+    fn a_held_chat_with_a_message_carrying_someones_data_holds_their_erasure() {
+        let db = Db::open(&temp_path("carries-hold").join("app.sqlite")).unwrap();
+        let from = db.create_bot("Bea's", "#fff", "waddle", "claude", None, false);
+        let held = db.create_bot("Cy's", "#fff", "waddle", "claude", None, false);
+        let m = db.add_message(&held.id, "user", "status?", None, false, None);
+        let mut actor = audit::Actor::for_bot(&from);
+        actor.carries = vec!["ada".into()];
+        db.set_requested_by(m.id, &audit::Who { actor, source: Default::default() });
+        assert!(db.erasure_holds("ada", &[]).is_empty(), "no hold yet");
+        assert!(db.put_retention_hold(&held.id, "hold", None).is_some());
+        assert_eq!(db.erasure_holds("ada", &[]), vec![held.id.clone()]);
+        assert!(db.erasure_holds("cy", &[]).is_empty());
+    }
+
+    #[test]
     fn retention_deletes_only_rows_past_the_window() {
         let db = Db::open(&temp_path("retention").join("app.sqlite")).unwrap();
         let day = 86_400_000;
-        db.c()
-            .execute("INSERT INTO audit_events (at, actor_kind, action, outcome) VALUES (?, 'system', 'old.event', 'success')", [now() - 40 * day])
-            .unwrap();
-        assert_eq!(db.prune_audit().unwrap(), 0, "no retention saved yet");
+        // A log that starts with old rows, since pruning takes a run from the start.
+        db.c().execute_batch(&format!("DROP TRIGGER audit_events_no_delete; DELETE FROM audit_events; {}", audit_delete_trigger())).unwrap();
+        let event = |action: &str, at: i64| db.record_at(&audit::Event::new(audit::Actor::system("test"), action), at).unwrap();
+        event("old.event", now() - 40 * day);
+        assert_eq!(db.prune_audit(None).unwrap(), (0, None), "no retention saved yet");
         assert!(db.c().execute("DELETE FROM audit_events", []).is_err());
         db.set_audit_retention(Some(30));
         assert_eq!(db.audit_retention(), Some(30));
-        // A cutoff inside the window would delete young rows, so the whole statement fails.
-        assert!(db.c().execute("DELETE FROM audit_events WHERE at < ?", [now()]).is_err());
-        assert!(db.c().execute("DELETE FROM audit_events", []).is_err());
         // Rows on both sides of the cutoff, to the millisecond: pruning never trips the trigger.
         let start = now();
         let edge = start - 30 * day;
         for ms in (-2_000..=2_000).step_by(50) {
-            db.c()
-                .execute("INSERT INTO audit_events (at, actor_kind, action, outcome) VALUES (?, 'system', 'edge.event', 'success')", [edge + ms])
-                .unwrap();
+            event("edge.event", edge + ms);
         }
-        assert!(db.prune_audit().unwrap() >= 21, "the 40-day-old row and the edge rows older than a second");
+        // A cutoff inside the window would delete young rows, so the whole statement fails.
+        assert!(db.c().execute("DELETE FROM audit_events WHERE at < ?", [now()]).is_err());
+        assert!(db.c().execute("DELETE FROM audit_events", []).is_err());
+        assert!(db.prune_audit(None).unwrap().0 >= 21, "the 40-day-old row and the edge rows older than a second");
         // The cutoff moves with the clock, so a slow runner ages more edge rows out.
         let late = (now() - start).max(1_000);
         let left: Vec<i64> = all_events(&db).iter().filter(|e| e.action == "edge.event").map(|e| e.at).collect();
@@ -9375,6 +9977,8 @@ mod tests {
                 ("rule.added", "user", Some("operator"), Some("rule"), Some("r1"), "success"),
                 ("audit.schema_upgraded", "system", Some("migration"), Some("audit"), Some("actors"), "success"),
                 ("policy.sandbox_initialized", "system", Some("migration"), Some("policy"), Some("global"), "success"),
+                // Every row above, sealed onto the hash chain (ADR 0122).
+                ("audit.schema_upgraded", "system", Some("migration"), Some("audit"), Some("chain"), "success"),
             ]
         );
         assert_eq!(rows[1].details, json!({ "after": 1 }));
@@ -9382,6 +9986,9 @@ mod tests {
         assert!(db.c().execute("DELETE FROM audit_events", []).is_err());
         db.record(&audit::Event::new(audit::Actor::system("server"), "server.started"));
         assert!(all_events(&db)[0].id > rows.last().unwrap().id);
+        let r = crate::audit_chain::verify(&db, vec![]);
+        assert_eq!((r.ok, r.first, r.checked), (true, Some(rows[0].id), rows.len() as u64 + 1), "{r:?}");
+        assert_eq!(rows.last().unwrap().details["sealed"].as_i64(), Some(rows.len() as i64 - 1));
     }
 
     #[test]
