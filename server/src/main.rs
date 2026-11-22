@@ -622,6 +622,9 @@ async fn main() {
     retention::start(app.clone(), chat_retention);
     users::start_pruning(app.clone(), sessions);
     machines::hosts::load(&app, &control_plane).unwrap_or_else(|e| exit(format!("Incus hosts: {e}")));
+    if observe.metrics.is_some() {
+        app.db.metrics().want_host_use();
+    }
     machines::start(app.clone(), control_plane);
     if policy.mode == policy::Mode::Bypass {
         log_warn!(

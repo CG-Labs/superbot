@@ -5,6 +5,7 @@
 //! reason capped at `MAX_REASONS` distinct values. Nothing a person types, no user or
 //! Bot id, and no email can become a label, so the number of series stays bounded.
 
+use crate::machines::provider::HostUse;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::sync::Mutex;
@@ -18,7 +19,7 @@ pub const RUN_BUCKETS: [f64; 11] = [1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 60
 pub const RUN_RESULTS: [&str; 8] = ["done", "error", "timeout", "stopped", "interrupted", "account_removed", "unguarded", "policy"];
 
 /// Audit actions counted in `superbot_events_total`: what an operator alerts on.
-pub const EVENTS: [&str; 30] = [
+pub const EVENTS: [&str; 31] = [
     "auth.login",
     "auth.login_failed",
     "access.denied",
@@ -45,6 +46,7 @@ pub const EVENTS: [&str; 30] = [
     "machine.host_down",
     "machine.host_lost",
     "machine.host_up",
+    "machine.placement_failed",
     "machine.agent_upgrade_failed",
     "notification.sent",
     "notification.failed",
@@ -152,6 +154,10 @@ struct Inner {
     reconciles: u64,
     reconcile_last: Option<(i64, f64)>,
     recent: Window,
+    host_use_wanted: bool,
+    /// Incus hosts' use by host name (ADR 0106): when last read, what it was, and
+    /// whether the latest read failed.
+    host_use: BTreeMap<String, (i64, HostUse, bool)>,
 }
 
 /// One per database, so each test's app counts on its own.
@@ -291,6 +297,34 @@ impl Metrics {
         m.reconcile_last = Some((at_ms, seconds));
     }
 
+    /// Has botd read each Incus host's use (ADR 0106): set when `/metrics`
+    /// is on, so a server without it makes no extra calls to its hosts.
+    pub fn want_host_use(&self) {
+        self.lock().host_use_wanted = true;
+    }
+
+    pub fn wants_host_use(&self) -> bool {
+        self.lock().host_use_wanted
+    }
+
+    /// What Incus host `host` said it uses, at `at_ms`.
+    pub fn host_read(&self, host: &str, at_ms: i64, u: HostUse) {
+        self.lock().host_use.insert(host.to_string(), (at_ms, u, false));
+    }
+
+    /// A read of `host` that failed, keeping the last one that worked: true the first
+    /// time since one worked.
+    pub fn host_read_failed(&self, host: &str) -> bool {
+        let mut m = self.lock();
+        let e = m.host_use.entry(host.to_string()).or_insert_with(|| (0, HostUse::default(), false));
+        !std::mem::replace(&mut e.2, true)
+    }
+
+    /// When `host`'s use was last read (0: never) and what it was.
+    pub fn host_use(&self, host: &str) -> (i64, HostUse) {
+        self.lock().host_use.get(host).map_or((0, HostUse::default()), |(at, u, _)| (*at, u.clone()))
+    }
+
     /// The counters, histograms and in-process gauges, in the text format.
     pub fn render(&self, out: &mut String) {
         let m = self.lock();
@@ -319,7 +353,10 @@ impl Metrics {
             sample(out, "superbot_runs_refused_total", &[("reason", r)], *n as f64);
         }
         family(out, "superbot_events_total", "counter", "Audit events an operator may alert on, by action and outcome.");
-        for ((a, o), n) in &m.events {
+        // From zero, so an alert's increase() sees the first refusal for want of room (ADR 0106).
+        let mut events = m.events.clone();
+        events.entry(("machine.placement_failed", "failure")).or_default();
+        for ((a, o), n) in &events {
             sample(out, "superbot_events_total", &[("event", a), ("outcome", o)], *n as f64);
         }
         // Every label is written from the start, at zero, so an alert's increase() sees the first one.
@@ -420,6 +457,23 @@ mod tests {
         for bad in ["BREW", "203.0.113", "example.com", "secret", "passwd", "email_changed", "sk-live", "Alex"] {
             assert!(!out.contains(bad), "{bad} leaked into: {out}");
         }
+    }
+
+    #[test]
+    fn a_failed_host_reading_keeps_the_last_and_is_reported_once_until_one_works() {
+        let m = Metrics::default();
+        assert!(!m.wants_host_use());
+        m.want_host_use();
+        assert!(m.wants_host_use());
+        assert_eq!(m.host_use("a"), (0, HostUse::default()), "never read");
+        let u = HostUse { cpus: Some(8), ..Default::default() };
+        m.host_read("a", 1_000, u.clone());
+        assert!(m.host_read_failed("a"), "the first failure is reported");
+        assert!(!m.host_read_failed("a"), "not again");
+        assert_eq!(m.host_use("a"), (1_000, u.clone()), "the last reading stays");
+        m.host_read("a", 2_000, u.clone());
+        assert!(m.host_read_failed("a"), "reported again once one worked");
+        assert!(m.host_read_failed("b") && m.host_use("b").0 == 0, "a host never read");
     }
 
     #[test]

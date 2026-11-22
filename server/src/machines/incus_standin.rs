@@ -84,6 +84,12 @@ pub struct World {
     pub backups: BTreeMap<(String, String), Vec<u8>>,
     /// Every request fails as from a host that is gone, and isn't recorded.
     pub down: bool,
+    /// What `GET /1.0/resources` answers (ADR 0106).
+    pub resources: Value,
+    /// What `GET /1.0/storage-pools/default/resources` answers; null: an error.
+    pub pool_resources: Value,
+    /// `GET .../resources` is recorded and never answered.
+    pub stall_resources: bool,
     ops: BTreeMap<String, Op>,
     trusted: Vec<String>,
     next_ip: u8,
@@ -161,6 +167,12 @@ impl StandIn {
         let mut w = World {
             trusted: vec![pki::fingerprint(&pki::cert_der(&cert_pem).unwrap())],
             next_ip: 10,
+            resources: json!({
+                "cpu": { "architecture": "x86_64", "total": 16 },
+                "memory": { "used": 8u64 << 30, "total": 64u64 << 30 },
+                "load": { "average1min": 1.5, "average5min": 1.25, "average10min": 1.0, "processes": 300 },
+            }),
+            pool_resources: json!({ "space": { "used": 100u64 << 30, "total": 1000u64 << 30 }, "inodes": { "used": 1, "total": 2 } }),
             ..World::default()
         };
         w.projects.insert("superbot".into(), json!({ "restricted": "true" }));
@@ -453,6 +465,10 @@ impl World {
     }
 }
 
+/// Marks a response never to be sent.
+#[derive(Clone)]
+struct Stall;
+
 async fn handle(
     State(world): State<Arc<Mutex<World>>>,
     Extension(peer): Extension<pki::Peer>,
@@ -461,6 +477,14 @@ async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let r = respond(&world, peer, method, uri, headers, body);
+    if r.extensions().get::<Stall>().is_some() {
+        return std::future::pending().await;
+    }
+    r
+}
+
+fn respond(world: &Mutex<World>, peer: pki::Peer, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     let mut w = world.lock().unwrap();
     if w.down {
         return err(503, "the host is down");
@@ -488,6 +512,11 @@ async fn handle(
         body: body.clone(),
         if_match: header("if-match"),
     });
+    if w.stall_resources && uri.path().ends_with("/resources") {
+        let mut r = Response::default();
+        r.extensions_mut().insert(Stall);
+        return r;
+    }
     let if_match = header("if-match");
     let parts: Vec<&str> = uri.path().trim_start_matches('/').split('/').collect();
     match (method.as_str(), &parts[..]) {
@@ -545,6 +574,9 @@ async fn handle(
         ("GET", ["1.0", "networks", n]) if *n == "incusbr0" => {
             sync(json!({ "name": n, "type": "bridge", "managed": true }))
         }
+        ("GET", ["1.0", "resources"]) => sync(w.resources.clone()),
+        ("GET", ["1.0", "storage-pools", "default", "resources"]) if !w.pool_resources.is_null() => sync(w.pool_resources.clone()),
+        ("GET", ["1.0", "storage-pools", _, "resources"]) => err(404, "Not found"),
         ("GET", ["1.0", "storage-pools", p]) if *p == "default" => sync(json!({ "name": p, "driver": "zfs" })),
         ("GET", ["1.0", "storage-pools", p]) if *p == "plain" => sync(json!({ "name": p, "driver": "dir" })),
         ("GET", ["1.0", "networks" | "storage-pools", _]) => err(404, "Not found"),

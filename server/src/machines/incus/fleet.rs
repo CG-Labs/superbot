@@ -15,8 +15,8 @@
 
 use super::{Credentials, DEFAULT_IMAGE, DEFAULT_TIERS, Incus, Settings, Size, host_cidr};
 use crate::machines::provider::{
-    ByteStream, CreateSpec, FirewallDevices, FirewallRule, Fut, HostInfo, HostStatus, Hosts, MachineProvider, Policy,
-    ProviderError, ProviderFirewall, ProviderMachine, RebuildSpec, Resources, RestoreSpec,
+    ByteStream, CreateSpec, FirewallDevices, FirewallRule, Fut, HostInfo, HostStatus, HostUse, Hosts, MachineProvider,
+    Policy, ProviderError, ProviderFirewall, ProviderMachine, RebuildSpec, Resources, RestoreSpec,
 };
 use crate::secrets::SecretStore;
 use serde_json::{Value, json};
@@ -618,6 +618,16 @@ impl Hosts for Fleet {
         Box::pin(async move {
             let m = self.member(host).ok_or_else(|| ProviderError::Transport(format!("Incus host {host} isn't configured (INCUS_HOSTS)")))?;
             m.incus.check_server().await
+        })
+    }
+
+    fn host_use<'a>(&'a self, host: &'a str) -> Fut<'a, HostUse> {
+        Box::pin(async move {
+            if self.is(host, HostStatus::Lost) {
+                return Err(lost(host));
+            }
+            let m = self.member(host).ok_or_else(|| ProviderError::Transport(format!("Incus host {host} isn't configured (INCUS_HOSTS)")))?;
+            m.incus.host_use().await
         })
     }
 }

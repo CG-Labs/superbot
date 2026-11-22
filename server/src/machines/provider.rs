@@ -356,6 +356,28 @@ impl Resources {
     }
 }
 
+/// What a host says it has and uses now (ADR 0106), as against what botd allocated on
+/// it. Each part is absent when the host didn't say.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HostUse {
+    /// CPU threads.
+    pub cpus: Option<u64>,
+    /// Load averages over 1 and 5 minutes.
+    pub load: Option<(f64, f64)>,
+    /// Memory used and in all, in bytes.
+    pub memory: Option<(u64, u64)>,
+    pub disks: Vec<DiskUse>,
+}
+
+/// One disk's space used and in all, in bytes. `name` is one of a fixed few: `pool`
+/// (an Incus storage pool), `data` (DATA_DIR) or `workspace` (WORKSPACE_DIR).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DiskUse {
+    pub name: &'static str,
+    pub used: u64,
+    pub total: u64,
+}
+
 /// How new machines are spread over hosts that have room (ADR 0081). `Spread`: the
 /// least loaded host. `Fill`: the first host in the order configured.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
@@ -417,4 +439,6 @@ pub trait Hosts: Send + Sync {
     fn down_after_ms(&self) -> i64;
     /// Asks `host` whether it answers and trusts botd: what it said.
     fn probe<'a>(&'a self, host: &'a str) -> Fut<'a, String>;
+    /// Asks `host` what it has and uses now (ADR 0106).
+    fn host_use<'a>(&'a self, host: &'a str) -> Fut<'a, HostUse>;
 }
