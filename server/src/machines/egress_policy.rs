@@ -272,7 +272,7 @@ pub async fn set_server(AppS(app): AppS<AppState>, Extension(by): Extension<Who>
     enrollment(&app)?;
     let to = checked(body, false)?;
     let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
-    for u in app.db.users() {
+    for u in app.db.users().into_iter().filter(|u| u.erased_at.is_none()) {
         if let Some(o) = own(&app, &u.id) {
             fits(&to, Some(&o), u.email.as_deref().unwrap_or(&u.id))?;
         }

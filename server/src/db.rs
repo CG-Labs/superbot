@@ -4681,6 +4681,7 @@ impl Db {
         run("DELETE FROM email_prefs WHERE user_id = ?", &[&user_id])?;
         run("DELETE FROM billing_checkouts WHERE user_id = ?", &[&user_id])?;
         run("DELETE FROM team_members WHERE user_id = ?", &[&user_id])?;
+        run("DELETE FROM settings WHERE key = ?", &[&format!("machine_egress_policy:user:{user_id}")])?;
         out.routines = run("DELETE FROM routines WHERE author_id = ?", &[&user_id])?;
         out.messages = run(
             &format!(
