@@ -241,6 +241,19 @@ fn list(text: &str) -> impl Iterator<Item = &str> {
     text.split(',').map(str::trim).filter(|e| !e.is_empty())
 }
 
+/// Whether a sudo list takes the user: its entries are read left to right, the last that
+/// matches wins, and a `!` before one (or several) turns it into an exclusion.
+fn listed(text: &str, matches: impl Fn(&str) -> bool) -> bool {
+    let mut taken = false;
+    for e in list(text) {
+        let bare = e.trim_start_matches('!');
+        if matches(bare.trim()) {
+            taken = (e.len() - bare.len()) % 2 == 0;
+        }
+    }
+    taken
+}
+
 /// `privileged`, given `name`'s groups (id, name) and sudo's files (path, text).
 pub fn privileged_in(name: &str, ids: Ids, groups: &[(u32, String)], sudoers: &[(String, String)]) -> Option<String> {
     if ids.uid == 0 {
@@ -274,7 +287,7 @@ pub fn privileged_in(name: &str, ids: Ids, groups: &[(u32, String)], sudoers: &[
             for def in defs.split(':') {
                 if let Some((alias, members)) = def.split_once('=') {
                     let alias = alias.trim().to_string();
-                    if !aliases.contains(&alias) && list(members).any(|m| named(m, &aliases)) {
+                    if !aliases.contains(&alias) && listed(members, |m| named(m, &aliases)) {
                         aliases.push(alias);
                     }
                 }
@@ -304,7 +317,7 @@ pub fn privileged_in(name: &str, ids: Ids, groups: &[(u32, String)], sudoers: &[
                     break;
                 }
             }
-            if list(&users).any(|u| !u.starts_with('!') && named(u, &aliases)) {
+            if listed(&users, |u| named(u, &aliases)) {
                 return Some(format!("has a sudo rule in {path}"));
             }
         }
@@ -1100,6 +1113,8 @@ mod tests {
             "User_Alias INNER = superbot-bots\nUser_Alias OUTER = ops, INNER\nOUTER ALL=(ALL) ALL",
             "User_Alias OUTER = ops, INNER\nUser_Alias INNER = superbot-bots\nOUTER ALL=(ALL) ALL",
             "%:superbot-bots ALL=(ALL) ALL",
+            "!superbot-bots, ALL ALL=(ALL) ALL",
+            "ALL, !!superbot-bots ALL=(ALL) ALL",
         ] {
             assert_eq!(found(text).as_deref(), Some("has a sudo rule in /etc/sudoers.d/x"), "{text}");
         }
@@ -1113,6 +1128,9 @@ mod tests {
             "ops ALL=(superbot-bots) ALL",
             "ops, admins ALL=(ALL) ALL",
             "!superbot-bots, ops ALL=(ALL) ALL",
+            "ALL, !superbot-bots ALL=(ALL) ALL",
+            "%superbot-bots, !superbot-bots ALL=(ALL) ALL",
+            "User_Alias EVERYONE_BUT = ALL, !superbot-bots\nEVERYONE_BUT ALL=(ALL) ALL",
         ] {
             assert_eq!(found(text), None, "{text}");
         }
