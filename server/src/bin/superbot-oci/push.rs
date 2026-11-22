@@ -153,6 +153,13 @@ pub async fn push(settings: &Settings, repo: &Repo, tag: &str, dirs: &[PathBuf],
         pushed.insert(u.digest.clone());
         platforms.push(u.platform.clone());
     }
+    // Each image's own SBOM and provenance manifests, with the index or without it.
+    for e in units.iter().filter_map(|u| u.signatures.as_ref()).flat_map(|s| s.entries.iter()).filter(|e| Layout::role(e) == "attestation") {
+        let d = Layout::digest(e);
+        if pushed.insert(d.to_string()) {
+            push_manifest(&c, d, &sources[d]).await?;
+        }
+    }
     let top = if whole {
         let index = index.expect("whole needs an index");
         for e in &entries {

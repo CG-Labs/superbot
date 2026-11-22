@@ -491,6 +491,8 @@ async fn push_one_arch_tags_that_image_with_its_signatures() {
         assert_eq!(s.resolve("m/app", "1.0.0"), Some(p.amd64.clone()));
         assert!(s.get("m/app", &p.index).is_none(), "no index without the other arch");
         assert!(s.get("m/app", &p.sigs[&p.amd64]).is_some() && s.get("m/app", &p.legacy_tag).is_some(), "the image's signatures");
+        assert!(s.get("m/app", &p.att_amd64).is_some() && s.get("m/app", &p.sigs[&p.att_amd64]).is_some(), "its attestation manifest, signed");
+        assert!(s.get("m/app", &p.att_arm64).is_none(), "not the other arch's");
         assert!(s.get("m/app", &p.sigs[&p.index]).is_none(), "nothing whose subject isn't there");
     }
     // Without signatures (an unsigned image, or an older bundle) the image still goes up.
