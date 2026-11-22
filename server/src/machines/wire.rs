@@ -392,6 +392,14 @@ pub struct Heartbeat {
 pub struct Disk {
     pub used: u64,
     pub total: u64,
+    /// What the Bots' home and teammates' homes hold, in bytes (ADR 0105): what the
+    /// owner's plan's storage counts, not the system, harnesses or tools. None until the
+    /// agent has measured them, and from agents before this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<u64>,
+    /// `files` is a lower bound: some of it couldn't be read, or there was too much.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
 }
 
 /// Whether a harness is logged in on the machine: whether one of the credential files

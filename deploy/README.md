@@ -444,7 +444,7 @@ Both are off by default, and the installer and Compose don't turn them on. Desig
 | `METRICS_LISTEN` | `off` (default), `on` (`127.0.0.1:9464`), or an address and port such as `0.0.0.0:9464` |
 | `METRICS_TOKEN` or `METRICS_TOKEN_FILE` | A bearer token for scrapers, at least 24 characters. Required off loopback: `botd` won't start without it |
 
-The metrics cover requests (by route class, method and status class, with latency), Bot runs (by harness and result, with duration, plus runs underway, waiting and refused), approvals waiting and the oldest one's age, audit events worth alerting on (failed sign-ins, failed notifications, machine backups, RPO breaches, restores), and with managed machines, machines by state, the reconciler, and each tier's RPO status. Labels never hold ids, emails, names, paths or message text.
+The metrics cover requests (by route class, method and status class, with latency), Bot runs (by harness and result, with duration, plus runs underway, waiting and refused), approvals waiting and the oldest one's age, audit events worth alerting on (failed sign-ins, failed notifications, machine backups, RPO breaches, restores), every failed sign-in guess by method and suspicious sign-in patterns ([sign-in alerts](#status-page-and-slo-alerts)), and with managed machines, machines by state, the reconciler, and each tier's RPO status. Labels never hold ids, emails, names, paths or message text.
 
 On the installer's server, with a Prometheus (or Grafana Alloy, or an OpenTelemetry Collector) on the same host:
 
@@ -523,6 +523,28 @@ promtool check rules /etc/prometheus/superbot-slo.rules.yml
 rule_files: ["/etc/prometheus/superbot-slo.rules.yml"]
 ```
 
+**Sign-in alerts.** `botd` reports suspicious sign-in patterns on its own, on by default: bursts of failed password, sign-in code and second-factor guesses from one IP or at one account, a sign-in right after one, and admins signing in from a network none of their sessions came from. Each is an `auth.suspicious_sign_in` audit event with the IP and account, and a count in `superbot_signin_suspicious_total`; bursts at one account and sign-ins right after a burst also go to the email and webhook alerts admins turn on under [Approval notifications](#approval-notifications). Thresholds are in `.env` ([ADR 0104](../docs/adr/0104-suspicious-sign-in-alerts.md)):
+
+| Setting in `.env` | Meaning |
+|---|---|
+| `SIGNIN_ALERTS` | `on` (default) or `off` |
+| `SIGNIN_ALERT_IP_FAILURES` | Failed guesses from one IP within the window (default 10, the sign-in limiter's own limit) |
+| `SIGNIN_ALERT_ACCOUNT_FAILURES` | Failed guesses at one account, from any IP (default 5) |
+| `SIGNIN_ALERT_WINDOW` | `5m` to `24h` (default `15m`) |
+| `SIGNIN_ALERT_NEW_IP` | Whose new-network sign-ins are reported: `admins` (default, the owner included), `all` or `off` |
+
+[`deploy/prometheus/superbot-signin.rules.yml`](prometheus/superbot-signin.rules.yml) turns them into alerts: a page when a sign-in works right after a burst, and tickets for attacks on one account, repeated bursts, more than 100 failed guesses in 15 minutes, and admins on new networks. Load it beside the SLO rules:
+
+```sh
+sudo cp deploy/prometheus/superbot-signin.rules.yml /etc/prometheus/
+promtool check rules /etc/prometheus/superbot-signin.rules.yml
+```
+
+```yaml
+# prometheus.yml
+rule_files: ["/etc/prometheus/superbot-slo.rules.yml", "/etc/prometheus/superbot-signin.rules.yml"]
+```
+
 Route `severity: page` to on-call and `severity: ticket` to a queue in Alertmanager.
 
 ## Approval notifications
@@ -571,7 +593,7 @@ Each tier's `limits` ([ADR 0040](../docs/adr/0040-billing-v0-tier-limits.md)) ar
 | `dailyRoutineRuns` | Routine runs per day (UTC) | Routine firings are skipped until midnight. The Bot says so once a day. |
 | `machineType` | The Linode plan (`g6-standard-2`, …) for the user's machine | Admins can't request or resize their machine to another size. Without one, `MACHINE_TIERS` decides as before. |
 | `concurrentRuns` | Bot runs at once on the user's machine ([ADR 0073](../docs/adr/0073-concurrent-runs-per-machine.md)) | More runs wait their turn, oldest first; the Bot shows it's queued and can be stopped. Without one, `MAX_CONCURRENT_RUNS` (default 8). Runs on this server share `MAX_CONCURRENT_RUNS` instead. |
-| `maxStorageMb` | Storage for a user's files, in MB (1 MB = 1,000,000 bytes): their folder and what botd keeps for them and their Bots ([ADR 0082](../docs/adr/0082-storage-limits-per-tier.md)) | From 90% the Bot warns once a day. At 100% new messages and runs are refused until files are deleted or the plan grows. A machine's own disk is capped by `machineType`, not this. |
+| `maxStorageMb` | Storage for a user's files, in MB (1 MB = 1,000,000 bytes): their folder and what botd keeps for them and their Bots ([ADR 0082](../docs/adr/0082-storage-limits-per-tier.md)) | From 90% the Bot warns once a day. At 100% new messages and runs are refused until files are deleted or the plan grows. While a user's Bots work on their own machine, what its agent says the Bots' and teammates' homes hold counts instead of their folder on the server; the OS doesn't count, and the machine's disk size is still `machineType`'s. A machine that hasn't reported yet counts as nothing (the total shows "at least"); `superbot_machine_storage_reports{report="missing"}` finds them ([ADR 0105](../docs/adr/0105-machine-disk-use-in-storage-limits.md)). |
 
 Every refusal is in the audit log (`bot.create_refused`, `routine.run_refused`, `machine.refused`, `bot.run_refused`, `bot.message_refused`). `botctl usage` (or `GET /api/usage`, admins) lists each person's use against their limits and flags anyone over, for example after moving to a smaller plan; the client shows the same on each user.
 

@@ -194,6 +194,7 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
         }
         Err(EraseError::Db(e)) => return Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, e)),
     };
+    app.storage.erase(&u.id);
     let mut details = serde_json::to_value(&erased).unwrap_or_default();
     details["pseudonym"] = json!(p);
     details["bots"] = json!(bot_ids.len());

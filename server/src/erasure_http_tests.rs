@@ -245,11 +245,20 @@ async fn a_machine_is_destroyed_first_or_the_erasure_waits() {
     assert_eq!(audit(port, &admin, "action=user.erase_refused").await[0]["details"]["reason"].as_str(), Some("team_pays"));
     assert!(app.db.user_machine(&ada).is_some(), "not destroyed for an erasure that was refused");
     app.db.execute_raw("DELETE FROM team_subscriptions").unwrap();
+    // What their homes held, as the agent said (ADR 0105), and botd's measurement of it.
+    let mid = app.db.user_machine(&ada).unwrap().id;
+    app.db.execute_raw(&format!("UPDATE machines SET disk_files = 4096, disk_files_partial = 1, disk_files_at = 1 WHERE id = '{mid}'")).unwrap();
+    crate::storage::current(&app, &ada, std::time::Duration::ZERO).await;
+    assert!(app.storage.last(&ada).is_some());
 
     let (code, v) = erase(port, &admin, &ada, r#"{"destroyMachine":true}"#).await;
     assert_eq!(code, 200, "{v}");
     assert_eq!(v["removed"]["machine"]["destroyed"], json!(true), "{v}");
+    assert_eq!(v["removed"]["diskReports"], json!(1), "{v}");
     assert!(app.db.user_machine(&ada).is_none());
+    let m = app.db.machine(&mid).unwrap();
+    assert_eq!((m.disk_files, m.disk_files_partial, m.disk_files_at), (None, false, None));
+    assert!(app.storage.last(&ada).is_none(), "their measurement is forgotten");
     assert_eq!(audit(port, &admin, "action=machine.destroy_requested").await.len(), 1);
 }
 

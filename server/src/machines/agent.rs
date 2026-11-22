@@ -4,8 +4,9 @@
 //! back as it happens. It knows nothing of harnesses: botd builds each command. Bots
 //! on the machine reach botd's API (approvals, `botctl`) through the agent's relay
 //! on loopback, which forwards over mutual TLS. It also runs harness logins and takes
-//! copies of the user's folder (ADR 0041). Shared by the binary and botd's tests, so
-//! it uses nothing of botd's but its sibling modules.
+//! copies of the user's folder (ADR 0041), and says what the homes on it hold, for
+//! the owner's storage limit (ADR 0105). Shared by the binary and botd's tests, so it
+//! uses nothing of botd's but its sibling modules, `sandbox` and `walk`.
 //!
 //! Settings (cloud-init writes them to /etc/superbot/machine.env):
 //! - `SUPERBOT_CONTROL_URL`: botd's machine port, `https://<host>:<port>`.
@@ -630,6 +631,57 @@ pub struct Agent {
     pub screens: Arc<Screens>,
     /// Teammates' own users and homes (ADR 0048).
     pub teammates: Arc<Teammates>,
+    /// What the Bots' and teammates' homes hold (ADR 0105).
+    home_use: Arc<HomeUse>,
+}
+
+/// How old the homes' measurement may get before a heartbeat starts another.
+pub const HOME_USE_EVERY: Duration = Duration::from_secs(60);
+
+/// What the Bots' and teammates' homes hold, for the owner's storage limit (ADR 0105).
+/// Walking them can take a while, so it never happens on a request: a heartbeat says the
+/// last measurement and starts another once it's `HOME_USE_EVERY` old, and a job's end
+/// starts one at once, so the check before the next run sees what that job wrote. One
+/// walk at a time, on its own thread.
+#[derive(Default)]
+pub struct HomeUse {
+    last: Mutex<Option<(std::time::Instant, u64, bool)>>,
+    walking: std::sync::atomic::AtomicBool,
+    /// Asked for again while a walk ran: that walk may have missed what changed.
+    again: std::sync::atomic::AtomicBool,
+}
+
+impl HomeUse {
+    /// The last measurement: bytes, and whether that's a lower bound.
+    pub fn latest(&self) -> Option<(u64, bool)> {
+        self.last.lock().unwrap_or_else(|e| e.into_inner()).map(|(_, n, partial)| (n, partial))
+    }
+
+    /// Walks `roots` unless a walk is running (which then walks again if `now`), or,
+    /// unless `now`, the last one is recent.
+    pub fn refresh(self: &Arc<Self>, roots: &[PathBuf], now: bool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if now {
+            self.again.store(true, SeqCst);
+        } else if self.last.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|(at, _, _)| at.elapsed() < HOME_USE_EVERY) {
+            return;
+        }
+        if self.walking.swap(true, SeqCst) {
+            return;
+        }
+        let (me, roots) = (self.clone(), roots.to_vec());
+        std::thread::spawn(move || {
+            loop {
+                me.again.store(false, SeqCst);
+                let (n, partial) = crate::walk::walk(&roots, crate::walk::MAX_ENTRIES);
+                *me.last.lock().unwrap_or_else(|e| e.into_inner()) = Some((std::time::Instant::now(), n, partial));
+                me.walking.store(false, SeqCst);
+                if !me.again.load(SeqCst) || me.walking.swap(true, SeqCst) {
+                    break;
+                }
+            }
+        });
+    }
 }
 
 struct RunningJob {
@@ -786,7 +838,9 @@ impl Agent {
             bot: RwLock::new(bot),
             screens,
             teammates,
+            home_use: Arc::default(),
         });
+        a.home_use.refresh(&a.home_roots(), false);
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(a.tools.clone().work());
             a.screens.reap_in_background();
@@ -816,6 +870,11 @@ impl Agent {
     /// Becomes true when the agent should exit and be started again.
     pub fn restarting(&self) -> watch::Receiver<bool> {
         self.restart.subscribe()
+    }
+
+    /// Where the Bots and teammates keep files: what the owner's storage counts here.
+    fn home_roots(&self) -> Vec<PathBuf> {
+        vec![self.cfg.home.clone(), self.cfg.teammates.clone()]
     }
 
     fn jobs(&self) -> std::sync::MutexGuard<'_, HashMap<String, RunningJob>> {
@@ -1148,6 +1207,11 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
     }
     let id = a.identity();
     let (plan, harnesses) = a.tools.report();
+    let disk = disk(&a.cfg.home).map(|d| {
+        let (files, partial) = a.home_use.latest().map_or((None, false), |(n, p)| (Some(n), p));
+        wire::Disk { files, partial, ..d }
+    });
+    a.home_use.refresh(&a.home_roots(), false);
     Json(wire::Heartbeat {
         machine_id: id.machine_id.clone(),
         user_id: id.user_id.clone(),
@@ -1185,7 +1249,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
         bot_user: a.bot().status,
         screens: Some(a.screens.report()),
         teammates: Some(a.teammates.known()),
-        disk: disk(&a.cfg.home),
+        disk,
     })
 }
 
@@ -1202,7 +1266,7 @@ fn disk(path: &Path) -> Option<wire::Disk> {
     let block = (s.f_frsize as u64).max(1);
     let total = (s.f_blocks as u64).saturating_mul(block);
     let free = (s.f_bfree as u64).saturating_mul(block);
-    Some(wire::Disk { used: total.saturating_sub(free), total })
+    Some(wire::Disk { used: total.saturating_sub(free), total, ..Default::default() })
 }
 
 /// Whether `p` is an absolute path inside `home`, with no `..` to climb out.
@@ -1310,6 +1374,8 @@ struct Running(Arc<Agent>, String, #[allow(dead_code)] super::tools::JobPermit);
 impl Drop for Running {
     fn drop(&mut self) {
         self.0.jobs().remove(&self.1);
+        // What the job wrote counts against the owner's storage before their next run.
+        self.0.home_use.refresh(&self.0.home_roots(), true);
     }
 }
 

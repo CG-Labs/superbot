@@ -46,6 +46,7 @@ Gauges read at each scrape:
 | `superbot_approvals_pending`, `superbot_approvals_oldest_pending_age_seconds` | none |
 | `superbot_run_slots_held`, `superbot_runs_waiting` (ADR 0073) | none |
 | `superbot_machines` (with the control plane on) | `state` |
+| `superbot_machine_storage_reports` (with routing on; [ADR 0105](0105-machine-disk-use-in-storage-limits.md)) | `report` |
 | `superbot_machine_rpo_breaches_open`, `superbot_machines_rpo_tracked`, `superbot_machines_past_rpo`, `superbot_machine_backup_age_max_seconds`, `superbot_machine_rpo_seconds` (with off-host backups on) | `tier` (the first: none) |
 | `superbot_build_info` | `version` |
 

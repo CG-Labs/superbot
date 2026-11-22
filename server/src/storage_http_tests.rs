@@ -111,7 +111,7 @@ async fn storage_is_measured_per_user_and_shown_against_the_plan() {
         assert_eq!(get(&w, &path, &w.b).await.0, 403, "{path}");
     }
     // Only the user's own folders are walked, never another's.
-    let f = storage::folders(app, &w.a_id);
+    let f = storage::folders(app, &w.a_id, false);
     let all: Vec<String> = f.files.iter().chain(&f.data).map(|p| p.display().to_string()).collect();
     assert!(all.iter().all(|p| p.contains(&w.a_id)) && !all.iter().any(|p| p.contains(&w.b_id)), "{all:?}");
 
@@ -282,4 +282,170 @@ async fn a_tier_without_a_cap_never_refuses() {
     let (_, plan) = call(port, "GET", "/api/me/tier", &a, "").await;
     let plan: Value = serde_json::from_str(&plan).unwrap();
     assert_eq!((plan["usage"]["storage"]["limit"].clone(), plan["usage"]["storage"]["state"].as_str()), (Value::Null, Some("ok")));
+}
+
+/// `world`, with machine routing on for assigned users (ADR 0036), and Ada assigned to a
+/// machine of her own. Nothing answers for it: what its agent said is set by hand.
+async fn world_on_machine() -> (World, crate::db::Machine) {
+    let p: Arc<dyn MachineProvider> = Arc::new(Fake::default());
+    let mut cp = ControlPlane::for_tests(p);
+    cp.routing = crate::machines::route::Routing::Assigned;
+    let cp = Arc::new(cp);
+    let (port, app, admin, _) = serve_app_with(move |a| a.machines = cp).await;
+    app.tiers.set(Arc::new(Tiers::parse(TIERS, None).unwrap())).unwrap();
+    let (a_id, a) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (b_id, b) = user_with(port, &admin, "bea@example.com", "member").await;
+    fake_claude(&app);
+    let new = crate::db::NewMachine { user_id: &a_id, provider: "fake", label_prefix: "superbot", tier: "small", plan: "g6-standard-1", region: "gb-lon", created_by: None };
+    let m = app.db.add_machine(&new).unwrap();
+    (World { port, app, admin, a_id, a, b_id, b }, m)
+}
+
+#[tokio::test]
+async fn a_machines_homes_count_instead_of_the_workspace_while_bots_work_there() {
+    let (w, m) = world_on_machine().await;
+    let app = &w.app;
+    let bot = app.db.create_bot_owned("Ada's", "#fff", "waddle", "claude", None, false, &w.a_id, Visibility::Private);
+    // 900 KB in her workspace here, from before she had a machine.
+    fill(app, &w.a_id, "old.bin", 900_000);
+    let storage = |plan: Value| plan["usage"]["storage"].clone();
+    let (_, plan) = get(&w, "/api/me/tier", &w.a).await;
+    let s = storage(plan);
+    assert!(s["used"].as_u64().unwrap() >= 900_000 && s["onMachine"] == false && s["machine"].is_null(), "{s}");
+
+    // Assigned: her Bots work on the machine, which hasn't said yet what its homes hold.
+    // The copy here isn't counted, and the total is only a lower bound.
+    assert!(app.db.assign_machine(&m.id, None));
+    let (_, plan) = get(&w, "/api/me/tier", &w.a).await;
+    let s = storage(plan);
+    assert!(s["used"].as_u64().unwrap() < 100_000, "{s}");
+    assert_eq!((s["onMachine"].as_bool(), s["files"].clone(), s["partial"].as_bool()), (Some(true), Value::Null, Some(true)), "{s}");
+    assert_eq!((s["machine"]["report"].as_str(), s["machine"]["used"].clone(), s["machine"]["measuredAt"].clone()), (Some("missing"), Value::Null, Value::Null), "{s}");
+
+    // Its agent says 400 KB: that counts, fresh.
+    app.db.machine_files_seen(&m.id, 400_000, false);
+    let (_, plan) = get(&w, "/api/me/tier", &w.a).await;
+    let s = storage(plan);
+    let used = s["used"].as_u64().unwrap();
+    assert!((400_000..500_000).contains(&used), "{s}");
+    assert_eq!((s["machine"]["report"].as_str(), s["machine"]["used"].as_u64(), s["partial"].as_bool(), s["state"].as_str()), (Some("fresh"), Some(400_000), Some(false), Some("ok")), "{s}");
+    // Bea's machine-less numbers are her own, and Ada's machine shows nowhere of hers.
+    let (_, hers) = get(&w, "/api/me/usage", &w.b).await;
+    assert!(hers["storage"]["onMachine"] == false && hers["storage"]["machine"].is_null(), "{hers}");
+
+    // 1.2 MB on the machine: full. A message is refused, saying where to delete files.
+    app.db.machine_files_seen(&m.id, 1_200_000, false);
+    let (code, body) = call(w.port, "POST", &format!("/api/bots/{}/messages", bot.id), &w.a, r#"{"text":"go"}"#).await;
+    assert_eq!(code, 403, "{body}");
+    assert!(body.contains("Storage is full: 1.2 MB used of the Small plan's 1 MB. Delete files on the computer this Bot works on"), "{body}");
+    let refused = audit(w.port, &w.admin, "action=bot.message_refused").await;
+    let d = &refused[0]["details"];
+    assert_eq!((d["reason"].as_str(), d["machine"]["report"].as_str(), d["machine"]["used"].as_u64(), d["partial"].as_bool()), (Some("storage_limit"), Some("fresh"), Some(1_200_000), Some(false)), "{d}");
+
+    // A report from long ago (the machine's agent stopped answering) still counts: Bots
+    // write there only in runs, and every run starts by reaching it.
+    app.db.machine_files_seen_at(&m.id, 1_200_000, false, db::now() - 20 * 60_000);
+    let r = app.db.add_routine(&bot.id, "Digest", "0 9 * * *", "Sum up my email");
+    let before = audit(w.port, &w.admin, &format!("bot={}", bot.id)).await.len();
+    cron::fire(app, &r, db::now());
+    wait_run(&w, &bot.id, before).await;
+    let runs = audit(w.port, &w.admin, &format!("action=bot.run_refused&bot={}", bot.id)).await;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let d = &runs[0]["details"];
+    assert_eq!((d["reason"].as_str(), d["machine"]["report"].as_str(), d["used"].as_u64().map(|u| u >= 1_200_000)), (Some("storage_limit"), Some("stale"), Some(true)), "{d}");
+    let said: Vec<String> = app.db.messages(&bot.id, 50).into_iter().filter(|m| m.error).map(|m| m.text).collect();
+    assert!(said[0].ends_with("Delete files on the computer I work on, or move to a bigger plan, then ask again."), "{said:?}");
+    let (_, all) = get(&w, "/api/usage", &w.admin).await;
+    let row = all["users"].as_array().unwrap().iter().find(|u| u["user"]["id"] == w.a_id.as_str()).unwrap().clone();
+    assert_eq!((row["over"].clone(), row["plan"]["usage"]["storage"]["machine"]["report"].as_str()), (json!(["maxStorageMb"]), Some("stale")), "{row}");
+
+    // Operators see how recent the reports storage relies on are.
+    let metrics = crate::obs::render(app);
+    assert!(metrics.contains(r#"superbot_machine_storage_reports{report="stale"} 1"#), "{metrics}");
+    assert!(metrics.contains(r#"superbot_machine_storage_reports{report="missing"} 0"#), "{metrics}");
+
+    // Files deleted on the machine: under the cap, and the message is taken again.
+    app.db.machine_files_seen(&m.id, 100_000, false);
+    let (code, body) = call(w.port, "POST", &format!("/api/bots/{}/messages", bot.id), &w.a, r#"{"text":"go"}"#).await;
+    assert_eq!(code, 202, "{body}");
+    let (_, plan) = get(&w, "/api/me/tier", &w.a).await;
+    assert_eq!(storage(plan)["state"], "ok");
+
+    // Unassigned: the Bots work here again, and the workspace here counts again.
+    assert!(app.db.unassign_machine(&m.id));
+    let (_, plan) = get(&w, "/api/me/tier", &w.a).await;
+    let s = storage(plan);
+    assert!(s["used"].as_u64().unwrap() >= 900_000 && s["onMachine"] == false && s["files"].as_u64().unwrap() >= 900_000, "{s}");
+}
+
+#[tokio::test]
+async fn nearly_full_on_a_machine_warns_with_what_the_machine_said() {
+    let (w, m) = world_on_machine().await;
+    let app = &w.app;
+    assert!(app.db.assign_machine(&m.id, None));
+    let bot = app.db.create_bot_owned("Ada's", "#fff", "waddle", "claude", None, false, &w.a_id, Visibility::Private);
+    // A walk on the machine that couldn't read everything: at least 950 KB.
+    app.db.machine_files_seen(&m.id, 950_000, true);
+    let before = audit(w.port, &w.admin, &format!("bot={}", bot.id)).await.len();
+    let (code, body) = call(w.port, "POST", &format!("/api/bots/{}/messages", bot.id), &w.a, r#"{"text":"go"}"#).await;
+    assert_eq!(code, 202, "{body}");
+    wait_run(&w, &bot.id, before).await;
+    let warned = audit(w.port, &w.admin, "action=usage.storage_warning").await;
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    let d = &warned[0]["details"];
+    assert_eq!((d["machine"]["used"].as_u64(), d["machine"]["partial"].as_bool(), d["partial"].as_bool(), d["warnAt"].as_u64()), (Some(950_000), Some(true), Some(true), Some(90)), "{d}");
+    let (_, plan) = get(&w, "/api/me/tier", &w.a).await;
+    assert_eq!((plan["usage"]["storage"]["state"].as_str(), plan["usage"]["storage"]["partial"].as_bool()), (Some("warning"), Some(true)), "{plan}");
+}
+
+/// A stand-in Claude that leaves 2.5 MB in the machine's workspace.
+const FILLS_THE_DISK: &str = r#"#!/bin/sh
+head -c 2500000 /dev/zero > "$HOME/work/big.bin"
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}'
+"#;
+
+/// Heartbeats until the machine's agent has said its homes hold at least `bytes`.
+async fn reported(env: &crate::machines_mtls_tests::Env, mid: &str, bytes: u64) {
+    for _ in 0..400 {
+        let (code, r) = call(env.port, "POST", "/api/machines/reconcile", &env.admin, "").await;
+        assert_eq!(code, 200, "{r}");
+        if env.app.db.machine(mid).and_then(|m| m.disk_files).is_some_and(|b| b as u64 >= bytes) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the agent never said its homes hold {bytes} bytes");
+}
+
+#[tokio::test]
+async fn what_a_run_leaves_on_the_machine_counts_before_the_next_one() {
+    use crate::machines_mtls_tests::{agent_with, events, json_call, machine_for, serve_with, wait_for_event};
+    let mut env = serve_with(|e| e).await;
+    // Small: 2 MB.
+    let tiers = r#"{ "default": "small", "tiers": [{ "name": "small", "label": "Small", "routes": "any", "limits": { "maxStorageMb": 2 } }] }"#;
+    env.app.tiers.set(Arc::new(Tiers::parse(tiers, None).unwrap())).unwrap();
+    let (uid, mid, token) = machine_for(&env, "ada@example.com").await;
+    let m = agent_with(&mut env, &mid, &token, FILLS_THE_DISK).await;
+    let bot = env.app.db.create_bot_owned("Ada's", "#fff", "waddle", "claude", None, false, &uid, Visibility::Shared);
+    // The agent measures its homes off the request path and says so in its heartbeat.
+    reported(&env, &mid, 0).await;
+    let (_, u) = json_call(&env, "GET", &format!("/api/users/{uid}/usage"), "").await;
+    assert_eq!((u["storage"]["onMachine"].as_bool(), u["storage"]["machine"]["report"].as_str(), u["storage"]["state"].as_str()), (Some(true), Some("fresh"), Some("ok")), "{u}");
+
+    // The run leaves 2.5 MB there; its end has the agent measure again, so the next
+    // heartbeat says it, and the next message is refused before anything runs.
+    crate::machines_mtls_tests::send(&env, &bot.id, "fill it").await;
+    wait_for_event(&env, "bot.run_finished").await;
+    assert!(m.home.join("work/big.bin").exists());
+    reported(&env, &mid, 2_500_000).await;
+    let (code, body) = call(env.port, "POST", &format!("/api/bots/{}/messages", bot.id), &env.admin, r#"{"text":"again"}"#).await;
+    assert_eq!(code, 403, "{body}");
+    assert!(body.contains("Storage is full") && body.contains("Delete files on the computer this Bot works on"), "{body}");
+    assert!(!body.contains(&m.home.display().to_string()), "no paths: {body}");
+    let refused = events(&env, "bot.message_refused").await;
+    assert_eq!(refused[0]["details"]["machine"]["report"], "fresh", "{refused:?}");
+    assert_eq!(events(&env, "harness.invoked").await.len(), 1, "nothing more ran");
+    let (_, u) = json_call(&env, "GET", &format!("/api/users/{uid}/usage"), "").await;
+    assert!(u["storage"]["machine"]["used"].as_u64().unwrap() >= 2_500_000 && u["storage"]["state"] == "over", "{u}");
+    m.server.abort();
 }

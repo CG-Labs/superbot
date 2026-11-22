@@ -110,7 +110,7 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - run: shellcheck -S warning deploy/*.sh deploy/docker/*.sh
 
-  # ADR 0090: the SLO burn-rate rules parse, and fire (and stay quiet) when they should.
+  # ADR 0090, ADR 0104: the SLO and sign-in alert rules parse, and fire (and stay quiet) when they should.
   prometheus-rules:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -126,6 +126,8 @@ jobs:
           sudo install "/tmp/prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
       - run: promtool check rules deploy/prometheus/superbot-slo.rules.yml
       - run: promtool test rules deploy/prometheus/superbot-slo.rules.test.yml
+      - run: promtool check rules deploy/prometheus/superbot-signin.rules.yml
+      - run: promtool test rules deploy/prometheus/superbot-signin.rules.test.yml
 
   backup-scripts:
     runs-on: ubuntu-latest

@@ -304,17 +304,23 @@ fn retry(app: &AppState, m: &Machine, plan: &str, e: ProviderError) {
     app.db.machine_resize_move(&m.id, plan, &OPEN, "pending", Some("provider"), Some(&text), true, Some(now() + rebuild::backoff_ms(tries)));
 }
 
+/// Whether what `m`'s agent said at `seen` still holds at `now`: said within
+/// `DISK_FRESH_MS`, or, for a suspended machine, within that of being suspended, since its
+/// disk can't change while it's off. One suspended before that was recorded never is.
+pub fn fresh(m: &Machine, seen: Option<i64>, now: i64) -> bool {
+    let at = match m.state {
+        State::Suspended => m.suspended_at,
+        _ => Some(now),
+    };
+    matches!((seen, at), (Some(seen), Some(at)) if at - seen < DISK_FRESH_MS)
+}
+
 /// What botd knows of the machine and the plans, for `decide`.
 /// Err: the provider failed to say what a plan's disk is (None: it can't say).
 async fn facts(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, m: &Machine, plan: &str) -> Result<Facts, ProviderError> {
     let (from, to) = (p.plan_resources(&m.plan), p.plan_resources(plan));
     let (from_disk, to_disk) = (p.plan_disk(&m.plan).await?, p.plan_disk(plan).await?);
-    // A suspended machine's disk can't change, so what it said just before still holds.
-    let at = match m.state {
-        State::Suspended => m.suspended_at,
-        _ => Some(now()),
-    };
-    let fresh = matches!((m.disk_seen_at, at), (Some(seen), Some(at)) if at - seen < DISK_FRESH_MS);
+    let fresh = fresh(m, m.disk_seen_at, now());
     let tier = app.tier_of(&m.user_id);
     let storage = match storage::limit(&tier.limits) {
         Some(cap) => Some((storage::current(app, &m.user_id, storage::CHECK_AGE).await.used(), cap)),
