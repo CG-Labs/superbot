@@ -395,3 +395,33 @@ async fn an_open_checkout_is_closed_first_and_a_paid_one_refuses() {
     assert_eq!(code, 200, "{v}");
     assert!(stripe.seen().iter().any(|s| s.path == format!("/v1/checkout/sessions/{session}/expire")), "her open page was expired at Stripe");
 }
+
+#[tokio::test]
+async fn an_open_team_checkout_refuses_before_the_machine_goes() {
+    let fake = Arc::new(Fake::default());
+    let p: Arc<dyn MachineProvider> = fake.clone();
+    let (port, app, admin, _) = serve_app_with(|a| a.machines = Arc::new(ControlPlane::for_tests(p))).await;
+    let (ada, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (code, m) = json_call(port, "POST", &format!("/api/users/{ada}/machine"), &admin, "{}").await;
+    assert!([201, 202].contains(&code), "{code} {m}");
+    let (code, t) = json_call(port, "POST", "/api/teams", &admin, &json!({ "name": "Solo", "owner": "ada@example.com", "machines": false }).to_string()).await;
+    assert_eq!(code, 201, "{t}");
+    let team = t["id"].as_str().unwrap().to_string();
+    // Not paying yet, but a checkout for it is open: the team can't go with her.
+    app.db.set_team_open_checkout(&team, "cs_team_1", db::now() / 1000 + 3600);
+    let (code, v) = erase(port, &admin, &ada, r#"{"destroyMachine":true}"#).await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("checkout"), "{v}");
+    let refused = audit(port, &admin, "action=user.erase_refused").await;
+    assert_eq!((refused[0]["details"]["reason"].as_str(), refused[0]["details"]["team"].as_str()), (Some("team_delete_refused"), Some(team.as_str())), "{refused:?}");
+    assert_eq!(audit(port, &admin, "action=team.delete_refused").await[0]["details"]["reason"].as_str(), Some("checkout_open"));
+    assert!(app.db.user_machine(&ada).is_some(), "not destroyed for an erasure that was refused");
+    assert!(audit(port, &admin, "action=machine.destroy_requested").await.is_empty());
+    assert!(app.db.team_member(&ada).is_some() && app.db.user(&ada).unwrap().active());
+
+    app.db.close_team_checkout(&team, "cs_team_1");
+    let (code, v) = erase(port, &admin, &ada, r#"{"destroyMachine":true}"#).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!((v["removed"]["machine"]["destroyed"].clone(), v["removed"]["team"].as_str()), (json!(true), Some(team.as_str())), "{v}");
+    assert_eq!(call(port, "GET", &format!("/api/teams/{team}"), &admin, "").await.0, 404);
+}

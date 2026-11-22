@@ -25,6 +25,7 @@ const TEAM_PAYS: &str = "team_pays";
 const CHECKOUT_PAID: &str = "checkout_paid";
 const MACHINE: &str = "machine";
 const PRIMARY: &str = "primary_bot";
+const TEAM_KEPT: &str = "team_delete_refused";
 /// The reason Bots, grants and offboarding record for an erasure.
 const REASON: &str = "user_erased";
 
@@ -88,6 +89,14 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
         let msg = "They're the last member of a team that pays for a plan, which would go with them. Cancel the team's plan first.".into();
         return refuse(TEAM_PAYS, json!({ "team": m.team_id, "subscription": s.subscription_id }), msg);
     }
+    if let Some(b) = bots.iter().find(|b| b.primary) {
+        return refuse(PRIMARY, json!({ "bot": b.id }), "They own the primary Bot, which can't be deleted. Give it to someone else first.".into());
+    }
+    let machine_now = app.db.user_machine(&u.id);
+    if let Some(m) = machine_now.as_ref().filter(|_| !destroy_machine) {
+        let msg = format!("They have a machine ({}). Destroy it first (botctl machine destroy {}), or erase with destroyMachine: true (botctl user erase {} --destroy-machine --yes).", m.state.as_str(), u.id, u.id);
+        return refuse(MACHINE, json!({ "machine": m.id, "state": m.state.as_str() }), msg);
+    }
     // A checkout page still open could be paid after they're gone. The lock is checkout's
     // own, held until the erasure ends; by then they can't sign in to open another.
     let _checkout = match crate::billing::close_for_erasure(&app, &a, &u.id).await {
@@ -101,15 +110,18 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
         }
         None => None,
     };
-    if let Some(b) = bots.iter().find(|b| b.primary) {
-        return refuse(PRIMARY, json!({ "bot": b.id }), "They own the primary Bot, which can't be deleted. Give it to someone else first.".into());
-    }
-    let mut machine = Value::Null;
-    if let Some(m) = app.db.user_machine(&u.id) {
-        if !destroy_machine {
-            let msg = format!("They have a machine ({}). Destroy it first (botctl machine destroy {}), or erase with destroyMachine: true (botctl user erase {} --destroy-machine --yes).", m.state.as_str(), u.id, u.id);
-            return refuse(MACHINE, json!({ "machine": m.id, "state": m.state.as_str() }), msg);
+    // Whatever would stop their team going with them (an open team checkout too) refuses
+    // here, before anything is destroyed. What it holds is held until they've left.
+    let leaving = match crate::teams::may_erase_member(&app, &by, &u.id).await {
+        Ok(l) => l,
+        Err(e) => {
+            let team = app.db.team_id_of(&u.id);
+            app.db.record(&by.event("user.erase_refused").target("user", &u.id).details(json!({ "reason": TEAM_KEPT, "team": team })).outcome(Outcome::Denied));
+            return Err(e);
         }
+    };
+    let mut machine = Value::Null;
+    if let Some(m) = machine_now {
         crate::machines::destroy_as(&app, &a.machines, &by, &u.id, &|_| true).await?;
         if let Some(m) = app.db.user_machine(&u.id) {
             return Err(conflict(format!("Their machine is {} now. Erase them again once it is destroyed.", m.state.as_str())));
@@ -117,7 +129,7 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
         machine = json!({ "id": m.id, "destroyed": true });
     }
 
-    let team = crate::teams::erase_member(&app, &by, &u.id).await?;
+    let team = crate::teams::erase_member(&app, &by, &u.id, leaving).await?;
     if u.active() {
         app.db.update_user(&u.id, UserPatch { status: Some("disabled"), ..Default::default() }).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         users::disabled(&app, &a, &by, &u.id);

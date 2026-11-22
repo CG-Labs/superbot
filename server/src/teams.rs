@@ -512,20 +512,53 @@ pub(crate) fn last_owner_of(app: &AppState, user_id: &str) -> Option<String> {
     (app.db.team_members(&m.team_id).len() > 1 && owners(app, &m.team_id) == 1).then_some(m.team_id)
 }
 
-/// Takes someone being erased off their team, as an admin's remove does (ADR 0102), and
-/// deletes the team when they were its last member, unless it pays for a plan. Returns
-/// the team they left.
-pub(crate) async fn erase_member(app: &AppState, by: &Who, user_id: &str) -> Res<Option<String>> {
+/// What `may_erase_member` checked: their team, whether they were its last member, and
+/// what keeps the team's billing still until they've left.
+pub(crate) struct Leaving {
+    team: String,
+    alone: bool,
+    billing: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+fn only_owner() -> ApiError {
+    conflict("They're their team's only owner. Make someone else an owner first, or delete the team.")
+}
+
+/// Refuses an erasure that `erase_member` would refuse, before the erasure destroys
+/// anything (ADR 0102): the team's only owner, or its last member when the team can't be
+/// deleted (`team_billing::may_delete`: it pays, or has a checkout open).
+pub(crate) async fn may_erase_member(app: &AppState, by: &Who, user_id: &str) -> Res<Option<Leaving>> {
     let Some(m) = app.db.team_member(user_id) else {
         return Ok(None);
     };
-    let refuse = || conflict("They're their team's only owner. Make someone else an owner first, or delete the team.");
+    if last_owner_of(app, user_id).is_some() {
+        return Err(only_owner());
+    }
+    let alone = app.db.team_members(&m.team_id).len() == 1;
+    let billing = if alone { crate::team_billing::may_delete(app, by, &m.team_id, "member_erased").await? } else { None };
+    Ok(Some(Leaving { team: m.team_id, alone, billing }))
+}
+
+/// Takes someone being erased off their team, as an admin's remove does (ADR 0102), and
+/// deletes the team when they were its last member, unless it pays for a plan. Returns
+/// the team they left. `checked` is what `may_erase_member` found; only a team that
+/// changed since is checked again.
+pub(crate) async fn erase_member(app: &AppState, by: &Who, user_id: &str, checked: Option<Leaving>) -> Res<Option<String>> {
+    let Some(m) = app.db.team_member(user_id) else {
+        return Ok(None);
+    };
+    let refuse = only_owner;
     if last_owner_of(app, user_id).is_some() {
         return Err(refuse());
     }
     let others = app.db.team_members(&m.team_id).len() > 1;
     let name = app.db.team(&m.team_id).map(|t| t.name);
-    let _billing = if others { None } else { crate::team_billing::may_delete(app, by, &m.team_id, "member_erased").await? };
+    let checked = checked.filter(|c| c.team == m.team_id && (c.alone || others));
+    let _billing = match checked {
+        Some(c) => c.billing,
+        None if others => None,
+        None => crate::team_billing::may_delete(app, by, &m.team_id, "member_erased").await?,
+    };
     if !leave(app, by, &m.team_id, user_id, ERASED).await {
         return Err(refuse());
     }
