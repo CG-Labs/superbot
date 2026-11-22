@@ -130,7 +130,7 @@ async fn the_console_is_an_admin_page_without_chat_bots_or_screens() {
     for part in ["script-src 'self'", "style-src 'self'", "frame-ancestors 'none'", "connect-src 'self'"] {
         assert!(csp.contains(part), "{csp}");
     }
-    for tab in ["Users", "Requests", "Machines", "Teams", "Roles", "Audit log", "Settings", "Setup", "Sign out", r#"href="/app/""#] {
+    for tab in ["Users", "Requests", "Machines", "Teams", "Roles", "Service accounts", "Audit log", "Settings", "Setup", "Sign out", r#"href="/app/""#] {
         assert!(html.contains(tab), "{tab}");
     }
     // Nothing the CSP would block: one script, from a file, and no inline styles.
@@ -147,7 +147,7 @@ async fn the_console_is_an_admin_page_without_chat_bots_or_screens() {
         assert!(!CONSOLE_JS.contains(gone) && !html.contains(gone), "{gone} is still in the console");
     }
     let calls = api_calls(CONSOLE_JS);
-    for want in ["/api/users", "/api/signups/x/approve", "/api/machines", "/api/users/x/machine/suspend", "/api/audit", "/api/audit/export.csv", "/api/policy", "/api/secrets/x", "/api/scim/tokens", "/api/setup", "/api/license", "/api/teams", "/api/teams/x/members/x", "/api/roles", "/api/roles/x/users/x", "/api/roles/x/teams/x/users/x"] {
+    for want in ["/api/users", "/api/signups/x/approve", "/api/machines", "/api/users/x/machine/suspend", "/api/audit", "/api/audit/export.csv", "/api/policy", "/api/secrets/x", "/api/scim/tokens", "/api/setup", "/api/license", "/api/teams", "/api/teams/x/members/x", "/api/roles", "/api/roles/x/users/x", "/api/roles/x/teams/x/users/x", "/api/service-accounts", "/api/service-accounts/x", "/api/service-accounts/x/tokens", "/api/service-accounts/x/tokens/x", "/api/service-accounts/x/tokens/x/rotate"] {
         assert!(calls.iter().any(|(_, p)| p == want) || html.contains(want), "the console lost {want}: {calls:?}");
     }
 }
@@ -163,6 +163,23 @@ fn the_console_asks_before_taking_a_role_away_and_matches_emails_in_any_case() {
         assert!(lines[n.saturating_sub(1)..=n].iter().any(|l| l.contains("confirm(")), "line {} takes a role away without asking: {}", n + 1, lines[n].trim());
     }
     assert!(!CONSOLE_JS.contains(".email =="), "the console compares emails case-sensitively");
+}
+
+/// ADR 0152: the console asks before it disables or deletes a service account or revokes a
+/// token, and a new token's secret goes only to the shown-once dialog, never to storage.
+#[test]
+fn the_console_asks_before_stopping_a_service_account_and_keeps_no_token() {
+    let lines: Vec<&str> = CONSOLE_JS.lines().collect();
+    let stops: Vec<usize> = (0..lines.len()).filter(|&n| lines[n].contains(r#"api("DELETE", `/api/service-accounts/"#) || (lines[n].contains("/api/service-accounts/") && lines[n].contains(r#"status: "disabled""#))).collect();
+    assert!(stops.len() >= 3, "{stops:?}");
+    for n in stops {
+        assert!(lines[n.saturating_sub(1)..=n].iter().any(|l| l.contains("confirm(")), "line {} stops a service account or token without asking: {}", n + 1, lines[n].trim());
+    }
+    for kept in ["localStorage", "sessionStorage", "document.cookie"] {
+        assert!(!CONSOLE_JS.contains(kept), "the console keeps something in {kept}");
+    }
+    let secrets: Vec<&str> = lines.iter().map(|l| l.trim()).filter(|l| l.contains("r.token") && !l.contains("r.tokenInfo")).collect();
+    assert!(!secrets.is_empty() && secrets.iter().all(|l| l.contains("value: r.token")), "a token's secret goes somewhere but the shown-once dialog: {secrets:?}");
 }
 
 #[tokio::test]

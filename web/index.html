@@ -16,6 +16,7 @@
       <a href="#machines" data-tab="machines">Machines</a>
       <a href="#teams" data-tab="teams">Teams</a>
       <a href="#roles" data-tab="roles">Roles</a>
+      <a href="#service-accounts" data-tab="service-accounts">Service accounts</a>
       <a href="#audit" data-tab="audit">Audit log</a>
       <a href="#status" data-tab="status">Status</a>
       <a href="#settings" data-tab="settings">Settings</a>
@@ -29,7 +30,7 @@
   </header>
 
   <main>
-    <p class="note">This page is for admins: people, requests for access, machines, teams, custom roles, the audit log, and server settings. Chat, Bots, approvals of Bot actions, and screens are in <a href="/app/" target="_blank" rel="noopener">the app</a>.</p>
+    <p class="note">This page is for admins: people, requests for access, machines, teams, custom roles, service accounts, the audit log, and server settings. Chat, Bots, approvals of Bot actions, and screens are in <a href="/app/" target="_blank" rel="noopener">the app</a>.</p>
     <div class="error" id="error" role="alert" hidden></div>
 
     <section id="tab-users" hidden>
@@ -136,6 +137,30 @@
         <thead><tr><th>Role</th><th>Can do</th></tr></thead>
         <tbody id="roles-builtin"></tbody>
       </table>
+    </section>
+
+    <section id="tab-service-accounts" hidden>
+      <p class="hint">A service account is a script's or integration's own identity. It holds member, read-only or a custom role, across the server or within a team, never admin and never more than its owner holds now. It can't sign in and takes no seat; it acts only through tokens shown once, which always expire and can be rotated or revoked. Everything it does is audited as itself.</p>
+      <form class="card" id="sa-form" autocomplete="off">
+        <h2 id="sa-form-title">New service account</h2>
+        <div class="bar">
+          <input id="sa-name" placeholder="Name, e.g. HR sync" required maxlength="60" />
+          <label>Role <select id="sa-role"></select></label>
+          <label>Where <select id="sa-team"></select></label>
+          <label id="sa-owner-label" hidden>Owner <input id="sa-owner" list="sa-people" placeholder="Email or id" spellcheck="false" /></label>
+        </div>
+        <div class="bar"><input id="sa-description" class="wide" placeholder="What calls with it (optional)" maxlength="500" /></div>
+        <div class="bar" id="sa-first">
+          <label><input type="checkbox" id="sa-first-token" checked /> Make a token now, with everything it holds, expiring in</label>
+          <select id="sa-first-days" title="Expires in"></select>
+        </div>
+        <div class="bar">
+          <button type="submit" class="btn primary" id="sa-save">Create service account</button>
+          <button type="button" class="btn" id="sa-cancel" hidden>Cancel</button>
+        </div>
+      </form>
+      <div id="sa-list"></div>
+      <div class="empty" id="sa-empty" hidden></div>
     </section>
 
     <section id="tab-audit" hidden>
