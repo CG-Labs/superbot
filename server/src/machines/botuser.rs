@@ -1,5 +1,5 @@
-//! Bots' own OS user on users' machines (ADR 0043), botd's side. With
-//! MACHINE_BOT_USER=on, after a heartbeat botd asks each idle agent that can to run its
+//! Bots' own OS user on users' machines (ADR 0043), botd's side. Unless
+//! MACHINE_BOT_USER=off (ADR 0145), after a heartbeat botd asks each idle agent that can to run its
 //! Bots as their own unprivileged user (`superbot-bots`): the agent makes it if it must,
 //! hands it the Bots' home (workspace, logins, the folder copy), and from then on runs
 //! every harness, login and cleanup as it. Until the agent says it's ready, a routed run
@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-pub const OFF: &str = "Bots' own user on machines is off. Set MACHINE_BOT_USER=on to turn it on.";
+pub const OFF: &str = "Bots' own user on machines is off (MACHINE_BOT_USER=off). Remove that setting to turn it on.";
 /// An agent that hasn't taken the request is asked again after this long.
 const RESEND_MS: i64 = 5 * 60_000;
 /// One that failed to set it up is asked again after this long.
