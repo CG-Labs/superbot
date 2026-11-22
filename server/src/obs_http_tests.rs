@@ -81,11 +81,13 @@ fn metrics_are_off_by_default_and_need_a_token_off_loopback() {
 }
 
 #[test]
-fn bots_never_get_the_metrics_token() {
-    assert!(secrets::server_secret("METRICS_TOKEN"));
+fn bots_never_get_the_metrics_token_or_the_error_tracker_dsn() {
     let withheld = adapters::secret_env();
-    assert!(withheld.iter().any(|k| k == "METRICS_TOKEN"));
-    assert!(withheld.iter().any(|k| k == "METRICS_TOKEN_FILE"));
+    for k in ["METRICS_TOKEN", "ERROR_REPORT_DSN"] {
+        assert!(secrets::server_secret(k), "{k}");
+        assert!(withheld.iter().any(|w| *w == k), "{k}");
+        assert!(withheld.iter().any(|w| *w == format!("{k}_FILE")), "{k}_FILE");
+    }
 }
 
 #[tokio::test]
