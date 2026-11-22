@@ -247,7 +247,10 @@ done
 if grep -Ei 'apt-get|rustup|nodesource|cloudsmith|would fetch|git clone|npm ci|build the web client in|cargo build' "$T/dry.log"; then
   fail "the offline dry run reached for the network"
 fi
-rec=$(grep -n "would record bundle $VERSION" "$T/dry.log" | cut -d: -f1 | head -n 1)
-bin=$(grep -n "/bin/botd /usr/local/bin/botd" "$T/dry.log" | cut -d: -f1 | head -n 1)
-((rec < bin)) || fail "the bundle's version is recorded after its binaries are installed"
+first_line() { awk -v s="$1" 'index($0, s) { print NR; exit }' "$2"; }
+rec=$(first_line "would record bundle $VERSION" "$T/dry.log")
+bin=$(first_line "/bin/botd /usr/local/bin/botd" "$T/dry.log")
+if [[ -z "$rec" || -z "$bin" ]] || ((rec > bin)); then
+  fail "the bundle's version is recorded after its binaries are installed"
+fi
 ok "a dry run of the offline install uses only the bundle${net:+ (with no network)}"
