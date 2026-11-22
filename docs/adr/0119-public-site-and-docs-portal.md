@@ -4,7 +4,7 @@
 
 Accepted (22 Nov 2026). First slice of the marketing site and docs portal of M4, [#44](https://github.com/CG-Labs/superbot/issues/44).
 
-0117 is the highest number on `main`, and 0118 is taken by a pull request in flight ([PR #181](https://github.com/CG-Labs/superbot/pull/181)), so this is 0119. Renumber it if another ADR lands first.
+0118 ([PR #181](https://github.com/CG-Labs/superbot/pull/181)) is the highest number on `main`, so this is 0119. Renumber it if another ADR lands first.
 
 ## Context
 
@@ -57,7 +57,7 @@ Or, under a path of an existing SuperBot server, add this before the final `hand
 	}
 ```
 
-Rebuild and replace the folder to update it. The generator refuses to overwrite a folder it didn't make.
+Rebuild into the same folder to update it. The build is written and checked beside the folder and replaces it only if every check passes, so a failed build leaves the published site as it was. A second build into the same folder while one is running is refused, through a lock beside the folder (`.<name>.lock`) that is released when the build exits. The generator refuses to overwrite a folder it didn't make.
 
 ## Alternatives considered
 

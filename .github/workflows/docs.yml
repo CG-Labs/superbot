@@ -73,11 +73,14 @@ jobs:
           node-version: "20"
       - run: cargo test --locked --bin superbot-site
       - run: node --test server/src/bin/superbot-site/assets/search.test.js
-      # Fails on any broken internal link in docs/ or in the built pages.
-      - run: cargo run --locked --bin superbot-site -- --out target/site
+      # Fails on any broken internal link in docs/ or in the built pages. Built outside
+      # target/, which the Rust cache restores.
+      - run: cargo run --locked --bin superbot-site -- --out "$RUNNER_TEMP/superbot-site"
       - name: Keep the built site
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: superbot-site
-          path: target/site
+          path: ${{ runner.temp }}/superbot-site
+          # Keeps the .superbot-site marker, so a downloaded copy can be rebuilt in place.
+          include-hidden-files: true
           retention-days: 14

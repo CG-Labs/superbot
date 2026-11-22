@@ -120,17 +120,62 @@ fn write(out: &Path, path: &str, body: &[u8]) -> Result<(), String> {
     fs::write(&file, body).map_err(|e| format!("{}: {e}", file.display()))
 }
 
+/// Refuses to replace a non-empty folder this tool didn't make.
+fn replaceable(out: &Path) -> Result<(), String> {
+    if !out.exists() {
+        return Ok(());
+    }
+    let empty = fs::read_dir(out).map_err(|e| format!("{}: {e}", out.display()))?.next().is_none();
+    match empty || out.join(MARKER).is_file() {
+        true => Ok(()),
+        false => Err(format!("won't replace {}: it isn't empty and wasn't built by superbot-site", out.display())),
+    }
+}
+
 /// Empties `out` for a fresh build, refusing a non-empty folder this tool didn't make.
 fn prepare(out: &Path) -> Result<(), String> {
+    replaceable(out)?;
     if out.exists() {
-        let empty = fs::read_dir(out).map_err(|e| format!("{}: {e}", out.display()))?.next().is_none();
-        if !empty && !out.join(MARKER).is_file() {
-            return Err(format!("won't replace {}: it isn't empty and wasn't built by superbot-site", out.display()));
-        }
         fs::remove_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
     }
     fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
     write(out, MARKER, b"Built by superbot-site (server/src/bin/superbot-site). Safe to delete.\n")
+}
+
+/// Siblings of `out` that a build uses: `.<name>.<what>`, so swaps are renames on one disk.
+fn sibling(out: &Path, what: &str) -> Result<PathBuf, String> {
+    let name = out.file_name().ok_or(format!("--out {} has no folder name", out.display()))?;
+    Ok(out.with_file_name(format!(".{}.{what}", name.to_string_lossy())))
+}
+
+/// An exclusive lock on building into `out`, held until dropped. The kernel releases it if
+/// the process dies, so a crashed build never leaves it stuck.
+fn lock(out: &Path) -> Result<fs::File, String> {
+    use std::os::fd::AsRawFd;
+    let path = sibling(out, "lock")?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // SAFETY: flock on a descriptor this function owns; it only takes an advisory lock.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(format!("another superbot-site build into {} is running", out.display()));
+    }
+    Ok(file)
+}
+
+/// Removes staging and old folders that earlier builds into `out` left behind. Call it
+/// only while holding the lock.
+fn sweep(out: &Path) {
+    let (Some(dir), Some(name)) = (out.parent(), out.file_name()) else { return };
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    let prefixes = [format!(".{}.building-", name.to_string_lossy()), format!(".{}.old-", name.to_string_lossy())];
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let n = entry.file_name().to_string_lossy().into_owned();
+        if prefixes.iter().any(|p| n.starts_with(p)) && entry.path().join(MARKER).is_file() {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 fn docs_page(pages: &[Page], page: &Page, article: &str, repo_url: &str) -> String {
@@ -200,8 +245,42 @@ fn squash(text: &str, max: usize) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(max).collect()
 }
 
-/// Builds the site into `args.out` and checks it. Returns every problem found.
+/// Builds the site and checks it in a folder beside `args.out`, then puts it in place of
+/// `args.out`. A failed build leaves `args.out` as it was. Returns every problem found.
 pub fn build(args: &Args) -> Result<Summary, Vec<String>> {
+    let one = |e: String| vec![e];
+    replaceable(&args.out).map_err(one)?;
+    let _lock = lock(&args.out).map_err(one)?;
+    sweep(&args.out);
+    let stage = sibling(&args.out, &format!("building-{}", std::process::id())).map_err(one)?;
+    prepare(&stage).map_err(one)?;
+    let built = build_into(args, &stage);
+    if built.is_err() {
+        let _ = fs::remove_dir_all(&stage);
+        return built;
+    }
+    swap(&stage, &args.out).map_err(one)?;
+    built
+}
+
+/// Puts `stage` in place of `out` by renames, so `out` is never missing for long, and
+/// puts the old site back if the second rename fails.
+fn swap(stage: &Path, out: &Path) -> Result<(), String> {
+    let err = |e: std::io::Error| format!("{} to {}: {e}", stage.display(), out.display());
+    if !out.exists() {
+        return fs::rename(stage, out).map_err(err);
+    }
+    let old = sibling(out, &format!("old-{}", std::process::id()))?;
+    fs::rename(out, &old).map_err(|e| format!("{}: {e}", out.display()))?;
+    if let Err(e) = fs::rename(stage, out) {
+        let _ = fs::rename(&old, out);
+        return Err(err(e));
+    }
+    let _ = fs::remove_dir_all(&old);
+    Ok(())
+}
+
+fn build_into(args: &Args, dir: &Path) -> Result<Summary, Vec<String>> {
     let one = |e: String| vec![e];
     let pages = pages::discover(&args.repo).map_err(one)?;
     let tiers = fs::read_to_string(&args.tiers).map_err(|e| vec![format!("{}: {e}", args.tiers.display())])?;
@@ -211,7 +290,6 @@ pub fn build(args: &Args) -> Result<Summary, Vec<String>> {
         repo_url: &args.repo_url,
         pages: pages.iter().map(|p| (p.src.clone(), (p.out.clone(), markdown::anchors(&p.md).into_iter().collect()))).collect(),
     };
-    prepare(&args.out).map_err(one)?;
     let mut errors = Vec::new();
     let mut assets: Vec<(String, String)> = Vec::new();
     let mut index = Vec::new();
@@ -233,27 +311,27 @@ pub fn build(args: &Args) -> Result<Summary, Vec<String>> {
             "x": squash(&r.text, SEARCH_TEXT_CHARS),
         }));
         let indented: String = r.html.lines().map(|l| format!("{l}\n")).collect();
-        write(&args.out, &page.out, docs_page(&pages, page, &indented, &args.repo_url).as_bytes()).map_err(one)?;
+        write(dir, &page.out, docs_page(&pages, page, &indented, &args.repo_url).as_bytes()).map_err(one)?;
     }
-    write(&args.out, "docs/index.html", docs_index(&pages, &args.repo_url).as_bytes()).map_err(one)?;
-    write(&args.out, "index.html", landing::landing(&plans, &args.contact_url, &args.repo_url).as_bytes()).map_err(one)?;
+    write(dir, "docs/index.html", docs_index(&pages, &args.repo_url).as_bytes()).map_err(one)?;
+    write(dir, "index.html", landing::landing(&plans, &args.contact_url, &args.repo_url).as_bytes()).map_err(one)?;
     assets.sort();
     assets.dedup();
     assets.push(("site/assets/site.css".into(), "assets/site.css".into()));
     assets.push(("site/assets/mark.svg".into(), "assets/mark.svg".into()));
     for (src, out) in &assets {
         let body = fs::read(args.repo.join(src)).map_err(|e| vec![format!("{src}: {e}")])?;
-        write(&args.out, out, &body).map_err(one)?;
+        write(dir, out, &body).map_err(one)?;
     }
-    write(&args.out, "assets/docs.css", include_bytes!("assets/docs.css")).map_err(one)?;
-    write(&args.out, "assets/search.js", include_bytes!("assets/search.js")).map_err(one)?;
+    write(dir, "assets/docs.css", include_bytes!("assets/docs.css")).map_err(one)?;
+    write(dir, "assets/search.js", include_bytes!("assets/search.js")).map_err(one)?;
     let index = serde_json::to_string(&index).map_err(|e| vec![e.to_string()])?;
-    write(&args.out, "assets/search-index.js", format!("window.SUPERBOT_SEARCH_INDEX = {index};\n").as_bytes()).map_err(one)?;
+    write(dir, "assets/search-index.js", format!("window.SUPERBOT_SEARCH_INDEX = {index};\n").as_bytes()).map_err(one)?;
     // A broken source link is left as written, so checking the output would only repeat it.
     if !errors.is_empty() {
         return Err(errors);
     }
-    let (links, broken) = check::check(&args.out).map_err(|e| vec![format!("checking {}: {e}", args.out.display())])?;
+    let (links, broken) = check::check(dir).map_err(|e| vec![format!("checking {}: {e}", dir.display())])?;
     match broken.is_empty() {
         true => Ok(Summary { pages: pages.len() + 2, links }),
         false => Err(broken.into_iter().map(|b| format!("built site: {b}")).collect()),
@@ -355,9 +433,29 @@ mod tests {
         let a = Args { repo: repo.clone(), ..args(&out) };
         let errors = build(&a).unwrap_err();
         assert_eq!(errors, ["docs/slo.md:5: sso/entra.md#setup (no heading #setup)", "docs/sso/entra.md:3: ../gone.md (no such file)"]);
+        assert!(!out.exists(), "a failed first build leaves nothing");
         fs::write(repo.join("docs/sso/entra.md"), "# Entra\n\n## Setup\n\nBack to [targets](../slo.md#targets).\n").unwrap();
         let s = build(&a).unwrap_or_else(|e| panic!("{}", e.join("\n")));
         assert_eq!(s.pages, 10);
+        // A failed rebuild leaves the working site in place.
+        fs::write(repo.join("docs/slo.md"), "# SLO\n\n## Targets\n\n[gone](gone.md)\n").unwrap();
+        assert_eq!(build(&a).unwrap_err(), ["docs/slo.md:5: gone.md (no such file)"]);
+        assert!(fs::read_to_string(out.join("docs/slo.html")).unwrap().contains("sso/entra.html#setup"));
+        assert!(out.join(MARKER).is_file());
+        let left: Vec<String> = fs::read_dir(repo.join("target")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert!(left.iter().all(|n| n == "site" || n == ".site.lock"), "{left:?}");
+        // A build into the same folder while one is running is refused, and changes nothing.
+        let held = lock(&out).unwrap();
+        let err = build(&a).unwrap_err();
+        assert!(err[0].contains("another superbot-site build"), "{err:?}");
+        assert!(out.join("docs/slo.html").is_file());
+        drop(held);
+        // Leftovers from a build that died are cleared by the next one.
+        let stale = repo.join("target/.site.building-1");
+        prepare(&stale).unwrap();
+        fs::write(repo.join("docs/slo.md"), "# SLO\n\n## Targets\n").unwrap();
+        build(&a).unwrap_or_else(|e| panic!("{}", e.join("\n")));
+        assert!(!stale.exists());
         fs::remove_dir_all(&repo).unwrap();
     }
 

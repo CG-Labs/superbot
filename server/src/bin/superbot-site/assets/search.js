@@ -66,10 +66,13 @@
     return;
   }
 
+  // The site's top, from this script's own address (<root>/assets/search.js), so links
+  // work under any path and nothing on the page decides where they point.
+  const siteRoot = new URL("../", document.currentScript.src);
+
   function start() {
     const form = document.querySelector("form.search");
     if (!form) return;
-    const root = form.getAttribute("data-root") || "";
     const input = form.querySelector("input");
     const list = form.querySelector(".results");
     const none = form.querySelector(".results-none");
@@ -80,7 +83,7 @@
       if (!loading) {
         loading = new Promise((resolve, reject) => {
           const script = document.createElement("script");
-          script.src = root + "assets/search-index.js";
+          script.src = new URL("assets/search-index.js", siteRoot).href;
           script.onload = () => resolve(window.SUPERBOT_SEARCH_INDEX || []);
           script.onerror = () => {
             loading = null;
@@ -106,7 +109,7 @@
       for (const page of pages) {
         const li = document.createElement("li");
         const a = document.createElement("a");
-        a.href = root + page.u;
+        a.href = new URL(page.u, siteRoot).href;
         a.textContent = page.t;
         const section = document.createElement("span");
         section.className = "result-section";
