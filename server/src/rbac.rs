@@ -423,6 +423,8 @@ mod tests {
             ("DELETE", "/api/policy/rules/r1", Perm::Admin),
             ("GET", "/api/audit", Perm::ViewAudit),
             ("GET", "/api/audit/export.csv", Perm::ViewAudit),
+            ("GET", "/api/audit/verify", Perm::Admin),
+            ("GET", "/api/audit/siem", Perm::Admin),
             // The access-review report, its export and sign-off (ADR 0099).
             ("GET", "/api/access-review", Perm::ViewAudit),
             ("GET", "/api/access-review/export.csv", Perm::ViewAudit),

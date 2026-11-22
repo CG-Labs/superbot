@@ -166,6 +166,10 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl deny <id> [--remember | --remember-global]
   botctl audit [<limit>] [filters]                 Recent audit events, newest first
   botctl audit export [filters] > audit.csv        All matching events as CSV, oldest first
+  botctl audit verify [--pin <id>:<hash>]...       Check the audit log's hash chain; names the first
+                                                   broken link, exits 1 if there is one. --pin: a hash
+                                                   kept elsewhere (your SIEM) the row must still have
+  botctl audit siem                                The SIEM export: sink, delivered, pending, failing
     filters: --from <time> --to <time> --action <a,b.*> --actor <user|bot|system[:id]>
              --actor user:<email> --method <password,code,sso,none,bot_token,scim_token>
              --idp <entra|google|oidc|github|apple|saml> --idp-provider <id> --subject <issuer|sub>
@@ -760,6 +764,20 @@ fn audit_query(rest: &[&str]) -> Result<String, String> {
         }
     }
     Ok(if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) })
+}
+
+/// `botctl audit verify [--pin <id>:<hash>]...`: hashes kept elsewhere (a SIEM, an
+/// earlier check) to hold the chain to.
+fn verify_query(rest: &[&str]) -> Result<String, String> {
+    let mut pins = Vec::new();
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "--pin" => pins.push(encode(it.next().ok_or("--pin needs <event id>:<hash>")?)),
+            other => return Err(format!("Unknown audit verify option \"{other}\". See botctl admin.")),
+        }
+    }
+    Ok(if pins.is_empty() { String::new() } else { format!("?pin={}", pins.join(",")) })
 }
 
 fn flag<'a>(rest: &[&'a str], name: &str) -> Option<&'a str> {
@@ -1521,6 +1539,12 @@ fn run(args: &[String]) -> Result<String, String> {
         ["evidence"] => op("GET", "/api/evidence", None),
         ["evidence", "bundle", rest @ ..] => evidence_bundle(rest),
         ["audit", "export", rest @ ..] => api(Cred::Operator, "GET", &format!("/api/audit/export.csv{}", audit_query(rest)?), None),
+        ["audit", "verify", rest @ ..] => {
+            let res = op("GET", &format!("/api/audit/verify{}", verify_query(rest)?), None)?;
+            // A broken chain is a failure, so a cron job or CI step notices.
+            if serde_json::from_str::<Value>(&res).ok().and_then(|v| v["ok"].as_bool()) == Some(false) { Err(res) } else { Ok(res) }
+        }
+        ["audit", "siem"] => op("GET", "/api/audit/siem", None),
         ["audit", rest @ ..] => op("GET", &format!("/api/audit{}", audit_query(rest)?), None),
         ["retention"] => op("GET", "/api/retention", None),
         ["retention", "hold", bot, reason] => op("PUT", &format!("/api/retention/holds/{}", encode(bot)), Some(json!({ "reason": reason }).to_string())),
@@ -2070,6 +2094,9 @@ mod tests {
         );
         assert!(audit_query(&["--from"]).is_err());
         assert!(audit_query(&["--nope", "x"]).is_err());
+        assert_eq!(verify_query(&[]).unwrap(), "");
+        assert_eq!(verify_query(&["--pin", "12:ab", "--pin", "13:cd"]).unwrap(), "?pin=12:ab,13:cd");
+        assert!(verify_query(&["--pin"]).is_err() && verify_query(&["--all"]).is_err());
     }
 
     #[test]
