@@ -1,6 +1,6 @@
 # Audit log: SIEM export and tamper evidence
 
-Every audit event is sealed onto a hash chain as it is written, so a changed, removed, added or reordered event shows. botd can also send every event to your SIEM as it happens: JSON lines over HTTPS, or RFC 5424 syslog over TLS. The chain is always on and needs nothing. The export is off until you set a sink. Design: [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md).
+Every audit event is sealed onto a hash chain as it is written, so a changed, removed, added or reordered event shows. Every hour botd signs a checkpoint of the chain's head, and can have each one timestamped by an RFC 3161 time-stamping authority (TSA). botd can also send every event to your SIEM as it happens: JSON lines over HTTPS, or RFC 5424 syslog over TLS. The chain and checkpoints are always on and need nothing. Timestamps and the export are off until you set them. Design: [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md) and [ADR 0149](../adr/0149-signed-and-timestamped-audit-checkpoints.md).
 
 ## Check the chain
 
@@ -18,10 +18,17 @@ It prints the result and exits 1 if the chain is broken. The same is `GET /api/a
   - `link`: an event before it was removed, added or reordered, or the start was cut without an anchor.
   - `unsealed`: it has no seal at all.
   - `erased`: its salt was cleared, but no erasure (`audit.erased`) with its own salt names it, so its fields can't be checked. Erasures never clear an `audit.erased` event's salt, so one without a salt is itself reported here.
-- `error`: the log couldn't be read to the end. The check fails.
   - `pin`: it differs from a hash you gave (below).
+  - `checkpoint`: a signed checkpoint doesn't hold (below).
+  - `timestamp`: a checkpoint's RFC 3161 token doesn't hold (below).
+- `error`: the log couldn't be read to the end. The check fails.
+- `checkpoints`: what the check found about checkpoints and timestamps (below).
 
-botd also checks itself a minute after starting and then once a day. Each check, and each one through the API, is recorded as `audit.verified` with the result and the head's hash; a failed check's `reason` is the first break's code (`contents`, `link`, `pin`, `unsealed`, `erased`) or `unreadable`, which `botctl support-bundle` shows. A broken chain logs a warning that links here.
+`--from <id>` and `--to <id>` check only those events, which is quicker on a large log. A range starting after the first event takes that event's link as stored.
+
+botd also checks itself a minute after starting and then once a day. Each check, and each one through the API, is recorded as `audit.verified` with the result and the head's hash; a failed check's `reason` is the first break's code (`contents`, `link`, `pin`, `unsealed`, `erased`, `checkpoint`, `timestamp`) or `unreadable`, which `botctl support-bundle` shows. A broken chain logs a warning that links here.
+
+`botctl audit chain` (or `GET /api/audit/chain`) shows it all at once: the head, the last checkpoint and timestamp, how many events since, whether timestamping is failing, how far the export is behind, and the last check's result. In the app, the audit log's **Chain** button shows the same, with **Check now**.
 
 ### Hold it to a copy kept elsewhere
 
@@ -31,7 +38,83 @@ The chain has no secret key. Someone who can write `app.sqlite` (root, the servi
 botctl audit verify --pin 4182:3f1c...e9a0 --pin 9921:77ab...0c12
 ```
 
-Each pin is `match`, `mismatch`, `gone` (older than what retention deleted) or `missing` (newer than that, yet not there). A mismatch or a missing event fails the check: the history on the host is not the one your SIEM saw.
+Each pin is `match`, `mismatch`, `gone` (older than what retention deleted), `missing` (newer than that, yet not there) or `outside` (not in `--from`/`--to`). A mismatch or a missing event fails the check: the history on the host is not the one your SIEM saw.
+
+Without a SIEM, signed and timestamped checkpoints (next) do part of this job.
+
+## Checkpoints and timestamps
+
+A checkpoint is an `audit.checkpoint` event that signs the chain's head: the id and hash of the event just before it, and the time. It is signed with an Ed25519 key derived from the master key, so nothing new needs a backup. Someone with a copy of `app.sqlite` but not `DATA_DIR/master.key` (a stolen backup, SQL access) can rebuild the chain, but not sign it.
+
+With a TSA, each checkpoint is also sent, as a hash, to a time-stamping authority, which signs it with its time. That proves the head existed by then, which even root can't fake later: a rebuilt chain can't get tokens for the past. Any RFC 3161 TSA works, and several are free:
+
+| TSA | `AUDIT_TIMESTAMP_URL` | CA file |
+|---|---|---|
+| FreeTSA | `https://freetsa.org/tsr` | `https://freetsa.org/files/cacert.pem` |
+| DigiCert | `http://timestamp.digicert.com` | DigiCert Trusted Root G4 |
+| Your own (OpenSSL, EJBCA, a CA's service) | its URL | its CA |
+
+Plain `http` is fine: only a hash goes out, and the token is signed.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `AUDIT_CHECKPOINT_MINUTES` | `60` | How often to sign a checkpoint, if anything happened since the last one. `0` or `off` stops the schedule (`botctl audit checkpoint` still works). Up to `10080` (a week) |
+| `AUDIT_TIMESTAMP_URL` | off | An RFC 3161 TSA to timestamp each checkpoint. `http://` or `https://`, no username, password, query or fragment |
+| `AUDIT_TIMESTAMP_CA_FILE` | none | PEM certificates the TSA's must chain to. Without it, tokens are kept and checked, but shown as `trusted: null`: botd has no TSA roots of its own |
+
+A bad value stops botd at startup with a message naming the setting.
+
+```sh
+botctl audit key                 # the public key, its id, and every key used before
+botctl audit checkpoint          # sign one now
+botctl audit checkpoints 10      # the last 10, with their tokens
+```
+
+### What the check proves
+
+`botctl audit verify` checks every checkpoint and timestamp it walks. `checkpoints` in its answer has how many it `checked`, how many are `timestamped` (and `trustedTimestamps`, with a CA file), the `last` checkpoint and `lastTimestamp`, the `keys` it trusted, and `firstBroken` with one of:
+
+- `head`: the checkpoint doesn't sign the head it is sealed onto. Events before it were changed and the chain rebuilt.
+- `key`: signed by a key botd doesn't trust, or the key id doesn't match.
+- `signature`: the signature doesn't verify.
+- `record`: its record in `audit_checkpoints` is gone, differs from the event, or exists without one; or the stored token isn't the one recorded.
+- `malformed`: the event's details are incomplete.
+- For a token: `imprint` (it stamps something else), `nonce`, `signature`, `certificate` (not a time-stamping certificate, or not valid at its time), `untrusted` (doesn't chain to `AUDIT_TIMESTAMP_CA_FILE`) or `malformed`.
+
+botd trusts the keys it has used, which it keeps in the database. To doubt the database too, take the key from your SIEM (each new key is recorded as `audit.checkpoint_key`) or an earlier `botctl audit key`, and pin it:
+
+```sh
+botctl audit verify --key 3b6a27bc...aa51 --pin 4182:3f1c...e9a0
+```
+
+Then only that key counts, for every checkpoint. After a master key rotation that made new derived keys, give `--key` once per key.
+
+Signatures can't stop root, who holds the master key too; the TSA's tokens and your SIEM can. Changes after the last checkpoint are caught by the chain and the SIEM only, so a shorter `AUDIT_CHECKPOINT_MINUTES` narrows that window.
+
+### Check a checkpoint without botd
+
+Each exported `audit.checkpoint` and `audit.checkpoint_timestamped` carries a `checkpoint` object with the `statement` that was signed, the `signature`, the `publicKey`, and on the timestamped one the `timestamp.token` (base64 DER). With `jq` and OpenSSL 3, from one exported `audit.checkpoint_timestamped` line in `line.json`:
+
+```sh
+# The signature
+jq -j .checkpoint.statement line.json > statement
+jq -r .checkpoint.signature line.json | xxd -r -p > sig
+(printf '302a300506032b6570032100'; jq -r .checkpoint.publicKey line.json) | xxd -r -p > key.der
+openssl pkeyutl -verify -pubin -keyform DER -inkey key.der -rawin -in statement -sigfile sig
+
+# The timestamp: it stamps the statement, "\nsig=" and the signature
+jq -j '.checkpoint.statement + "\nsig=" + .checkpoint.signature' line.json > stamped
+jq -r .checkpoint.timestamp.token line.json | base64 -d > token.der
+openssl ts -verify -token_in -in token.der -data stamped -CAfile <tsa-ca.pem>
+```
+
+Then compare the statement's `seq` and `hash` with that event in your SIEM: they must be its `id` and `chainHash`. Keep the TSA's certificates: a token can be checked for as long as its chain can.
+
+### Failures
+
+Timestamping never holds up the audit log. Checkpoints wait as `pending` and are stamped one at a time, oldest first, with backoff from 1 second up to 5 minutes. After 3 failures in a row botd logs a warning and records `audit.timestamp_failing` with a `reason` (`unreachable`, `refused`, `malformed`, `imprint`, `nonce`, `signature`, `certificate`, `untrusted` or `unsaved`); `audit.timestamp_recovered` follows. `botctl audit chain` shows the last error.
+
+With metrics on, `/metrics` has `superbot_audit_checkpoint_last_timestamp_seconds` and, with a TSA, `superbot_audit_timestamp_pending_checkpoints`, `superbot_audit_timestamp_failing` and `superbot_audit_timestamp_last_timestamp_seconds`. Alert on `superbot_audit_timestamp_failing == 1`, or on the last checkpoint growing older than twice `AUDIT_CHECKPOINT_MINUTES` while there is activity.
 
 ### If it's broken
 
@@ -62,6 +145,7 @@ One JSON object per event, the same shape as `GET /api/audit`, plus:
 | `schema` | `superbot.audit.v1` |
 | `host` | The server's host name |
 | `chainPrev`, `chainHash` | The event's link in the chain. Each event's `chainPrev` is the previous event's `chainHash` |
+| `checkpoint` | Only on `audit.checkpoint` and `audit.checkpoint_timestamped`: the signed statement, signature and key, and on the second the RFC 3161 token ([above](#check-a-checkpoint-without-botd)) |
 
 ```json
 {"id":4182,"at":1795000000000,"time":"2026-11-19T13:46:40.000Z","actorKind":"user","actorId":"u1a2b3c","actorEmail":"ada@example.com","actorRole":"admin","authMethod":"sso","action":"bot.created","targetType":"bot","targetId":"b9f8e7","outcome":"success","details":{"name":"Scout"},"schema":"superbot.audit.v1","host":"<server-host>","chainPrev":"9a0c...","chainHash":"3f1c..."}
