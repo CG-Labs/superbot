@@ -10,7 +10,7 @@ use crate::machines::ControlPlane;
 use crate::obs::trace;
 use crate::machines::route::{self, Assigned, Refusal, Target};
 use crate::machines::wire::{self, JobEvent};
-use crate::tiers::{self, Route, Tier, Tiers, Wiring};
+use crate::tiers::{self, Held, Route, Tier, Tiers, Wiring};
 use crate::{isolation, paths, storage, usage};
 use crate::approvals::RunGrant;
 use crate::policy::{Ctx, Mode, RunScope};
@@ -948,7 +948,7 @@ impl App {
             Err(RunSpaceError::Folder) => return cant_run("This Bot's owner id isn't a safe folder name, so it can't run."),
             Err(RunSpaceError::Secrets(e)) => return self.refuse_for_secrets(&bot, msg, &by, &e, None),
         };
-        self.requesters.lock().unwrap_or_else(|e| e.into_inner()).insert(bot.id.clone(), asker);
+        self.requesters.lock().unwrap_or_else(|e| e.into_inner()).insert(bot.id.clone(), asker.clone());
         if isolated {
             let asker = for_other.clone().unwrap_or_else(|| bot.owner_id.clone());
             self.askers.lock().unwrap_or_else(|e| e.into_inner()).insert(bot.id.clone(), asker);
@@ -960,7 +960,7 @@ impl App {
         }
         let period = self.billing_period(&bot.owner_id, crate::db::now());
         let storage = crate::storage::check(self, &bot.owner_id).await;
-        let Some((tier, route, wiring)) = self.tier_route(&bot, msg, &by, &period, &space.1, storage.as_ref()) else { return };
+        let Some((tier, route, wiring, held)) = self.tier_route(&bot, msg, &by, &asker, &period, &space.1, storage.as_ref()) else { return };
         trace::note("superbot.tier", &tier);
         let placed_at = self.db.placed_at(&bot.owner_id);
         let Some(place) = self.place(&bot, msg, &by, &period.key, bin, for_other.as_deref()).await else { return };
@@ -1237,6 +1237,13 @@ impl App {
             if !wiring.skipped.is_empty() {
                 invoked["fallbackSkipped"] = json!(wiring.skipped);
             }
+            if let Some(h) = &held {
+                invoked["residency"] = json!({
+                    "regions": h.regions,
+                    "fallbackOutsideRegion": h.outside,
+                    "insteadOf": h.instead_of.as_ref().map(|r| json!({ "model": r.model, "provider": r.provider })),
+                });
+            }
             if let Some(r) = &run_as {
                 invoked["runAs"] = json!(r.account);
             }
@@ -1255,6 +1262,7 @@ impl App {
                 provider: route.provider.clone(),
                 endpoints: wiring.endpoints.clone(),
                 fallback: wiring.fallback.clone(),
+                held_to: held.as_ref().map(|h| h.regions.clone()).unwrap_or_default(),
                 model: route.model.clone(),
                 effort: route.effort.clone(),
                 env,
@@ -2074,16 +2082,20 @@ impl App {
     /// owner, within the tier's runs and tokens a billing period (ADR 0050). A route
     /// whose provider is one of the tiers file's endpoints needs that endpoint's key
     /// (`tier_key`, ADR 0077). The owner's storage must be under their tier's cap
-    /// (`storage`, measured by `storage::check`, ADR 0082). None: refused, and the Bot said why.
+    /// (`storage`, measured by `storage::check`, ADR 0082). While the owner's or the
+    /// asker's data is pinned to a region, the route is held there (`Tiers::held`, ADR
+    /// 0139). None: refused, and the Bot said why.
+    #[allow(clippy::too_many_arguments)]
     fn tier_route(
         &self,
         bot: &Bot,
         msg: &Message,
         by: &Who,
+        asker: &str,
         period: &usage::Period,
         env: &HashMap<String, String>,
         storage: Option<&(storage::Measured, u64, storage::State)>,
-    ) -> Option<(String, Route, Wiring)> {
+    ) -> Option<(String, Route, Wiring, Option<Held>)> {
         let tier = self.tier_of(&bot.owner_id);
         let refused = |reason: &str, text: String, limit: Option<u64>, used: Option<u64>, more: Value| {
             self.give_back_routine(bot, msg);
@@ -2112,8 +2124,31 @@ impl App {
             Ok(r) => r,
             Err(e) => return refused("tier_harness", format!("{e} Switch me to one of those in my settings."), None, None, Value::Null),
         };
+        let pins = crate::machines::residency::of_run(self, &bot.owner_id, asker);
+        let held = if pins.is_empty() {
+            None
+        } else {
+            let regions: Vec<String> = pins.iter().map(|p| p.region.clone()).collect();
+            match self.tiers().held(tier, &route, &regions) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    let text = format!(
+                        "This run's data is pinned to {} under a residency agreement, and the {} plan has no model provider marked as there for {}, so I didn't run. Ask an admin to route the plan through a provider in {} (ADR 0139).",
+                        regions.join(" and "),
+                        tier.label,
+                        bot.harness,
+                        regions.join(" and ")
+                    );
+                    let pins: Vec<Value> = pins.iter().map(|p| json!({ "region": p.region, "pinnedOn": p.subject_type, "subjectId": p.subject_id, "reference": p.reference })).collect();
+                    let more = json!({ "harness": bot.harness, "pinnedRegions": regions, "pins": pins, "forUser": (asker != bot.owner_id).then_some(asker), "error": e });
+                    return refused(crate::machines::residency::PINNED, text, None, None, more);
+                }
+            }
+        };
+        let route = held.as_ref().map_or(route, |h| h.route.clone());
         let has_key = |k: &str| tier_key(env, k).is_some();
-        let wiring = match self.tiers().wiring(&route, tier.managed(), has_key) {
+        // A held route's fallbacks are exactly its own, so the harness's settings add none.
+        let wiring = match self.tiers().wiring(&route, tier.managed() || held.is_some(), has_key) {
             Ok(w) => w,
             Err(e) => {
                 let text = format!("The {} plan's model provider isn't set up on this server yet, so I didn't run. Ask an admin to save its key.", tier.label);
@@ -2154,7 +2189,7 @@ impl App {
             // Once a billing period and tier by its key, apart from the chat's once a day.
             crate::billing_mail::storage(self, &bot.owner_id, tier, m.used(), *limit, false);
         }
-        Some((tier.name.clone(), route, wiring))
+        Some((tier.name.clone(), route, wiring, held))
     }
 
     /// Records the tokens a run used, one row per model, charged to the Bot's owner

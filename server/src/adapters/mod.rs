@@ -78,6 +78,10 @@ pub struct RunInput {
     /// What to try, in order, when the provider fails. None: the harness's own
     /// settings. Some: exactly these, and no other provider.
     pub fallback: Option<Vec<crate::tiers::Fallback>>,
+    /// The data regions this run's model calls are held to (ADR 0139): `provider`,
+    /// `endpoints` and `fallback` serve them all, and adapters keep the harness's side
+    /// tasks (summaries, titles, vision) on the route's provider too. Empty: not held.
+    pub held_to: Vec<String>,
     pub model: Option<String>,
     /// Reasoning effort, in the harness's own words (e.g. "high").
     pub effort: Option<String>,
@@ -613,6 +617,7 @@ mod tests {
             provider: None,
             endpoints: Vec::new(),
             fallback: None,
+            held_to: Vec::new(),
             model: None,
             effort: None,
             env: HashMap::from([("PATH".into(), "/opt/superbot/bin:/usr/bin:/bin".into())]),

@@ -100,6 +100,8 @@ mod machines_resize_tests;
 mod machines_region_tests;
 #[cfg(test)]
 mod machines_residency_tests;
+#[cfg(test)]
+mod residency_routes_http_tests;
 mod passwd;
 mod plans;
 #[cfg(test)]

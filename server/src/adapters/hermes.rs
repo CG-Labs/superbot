@@ -74,6 +74,27 @@ fn hermes_provider(input: &RunInput, name: &str) -> String {
     }
 }
 
+/// Hermes's side tasks (`auxiliary.<task>`), across its versions. Each makes its own
+/// model call, on `auto` by default, which may pick another provider.
+const SIDE_TASKS: &[&str] = &[
+    "vision",
+    "web_extract",
+    "compression",
+    "session_search",
+    "skills_hub",
+    "approval",
+    "mcp",
+    "flush_memories",
+    "title_generation",
+    "curator",
+    "background_review",
+    "tts_audio_tags",
+];
+
+/// Keys of Hermes's built-in providers that its `auto` side tasks reach for when the
+/// main provider can't serve them. A held run gets them empty (ADR 0139).
+const BUILT_IN_KEYS: &[&str] = &["OPENROUTER_API_KEY", "NOUS_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"];
+
 fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -90,7 +111,8 @@ fn quote(s: &str) -> String {
 /// endpoint's URL, key, or switch from set, so the Bot's own `config.yaml` can't point
 /// them elsewhere; each key comes from `key_var`. On a managed tier the fallback chain is the route's (or none), the
 /// legacy `fallback_model` is emptied, since Hermes chains both, and subagents can't
-/// pick their own provider (ADR 0077).
+/// pick their own provider (ADR 0077). A run held to a data region sends every side
+/// task to the route's provider and model (ADR 0139).
 fn managed_config(input: &RunInput, secret_names: &[String]) -> Value {
     let inherited = secret_names.iter().filter(|n| crate::secrets::check_name(n).is_ok() && !super::withheld(n));
     let keys: Vec<&str> = input.endpoints.iter().map(|e| e.key_secret.as_str()).collect();
@@ -128,6 +150,13 @@ fn managed_config(input: &RunInput, secret_names: &[String]) -> Value {
         c["fallback_model"] = json!([]);
         // Subagents inherit the route and its chain rather than picking their own.
         c["delegation"] = json!({ "provider": "", "model": "", "base_url": "", "api_key": "", "api_mode": "", "fallback_providers": null });
+    }
+    if !input.held_to.is_empty() {
+        // `main` is the route's provider and model; every field that could point elsewhere is cleared.
+        let main = json!({ "provider": "main", "model": "", "base_url": "", "api_key": "" });
+        let mut aux: serde_json::Map<String, Value> = SIDE_TASKS.iter().map(|t| (t.to_string(), main.clone())).collect();
+        aux["compression"]["fallback_chain"] = json!([]);
+        c["auxiliary"] = Value::Object(aux);
     }
     if let Some(g) = &input.guard {
         // The hook runs in the daemon's folder, not the Bot's, so name the real one.
@@ -218,6 +247,9 @@ impl Adapter for Hermes {
             ("HERMES_ACCEPT_HOOKS".into(), "1".into()),
             ("HERMES_EPHEMERAL_SYSTEM_PROMPT".into(), input.system.clone()),
         ];
+        if !input.held_to.is_empty() {
+            env.extend(BUILT_IN_KEYS.iter().map(|k| (k.to_string(), String::new())));
+        }
         env.extend(input.endpoints.iter().filter_map(|e| Some((key_var(&e.name), input.env.get(&e.key_secret)?.clone()))));
         env
     }
@@ -360,6 +392,7 @@ mod tests {
             provider: None,
             endpoints: Vec::new(),
             fallback: None,
+            held_to: Vec::new(),
             model: None,
             effort: None,
             env: HashMap::from([("BOT_TOKEN".into(), "t0k3n".into()), ("GITHUB_TOKEN".into(), "ghp_x".into())]),
@@ -507,7 +540,7 @@ mod tests {
     }
 
     fn endpoint(name: &str, protocol: Protocol, key: &str) -> crate::tiers::Endpoint {
-        crate::tiers::Endpoint { name: name.into(), protocol, base_url: format!("https://{name}.example/v1"), key_secret: key.into() }
+        crate::tiers::Endpoint { name: name.into(), protocol, base_url: format!("https://{name}.example/v1"), key_secret: key.into(), regions: Vec::new() }
     }
 
     #[test]
@@ -557,6 +590,37 @@ mod tests {
         (i.provider, i.endpoints) = (Some("openrouter".into()), Vec::new());
         assert!(Hermes::default().args(&i, &mut Vec::new()).windows(2).any(|w| w == ["--provider", "openrouter"]));
         assert!(managed_config(&i, &[]).get("providers").is_none());
+        let _ = std::fs::remove_dir_all(&i.state_dir);
+    }
+
+    #[test]
+    fn a_held_run_keeps_its_side_tasks_on_the_route() {
+        let mut i = input(false);
+        i.provider = Some("uk".into());
+        i.endpoints = vec![endpoint("uk", Protocol::AnthropicMessages, "TIER_UK_KEY")];
+        i.fallback = Some(Vec::new());
+        i.env.extend([("TIER_UK_KEY".to_string(), "sk-uk".to_string()), ("OPENROUTER_API_KEY".to_string(), "sk-or".to_string())]);
+        // Not held: Hermes's own side-task settings, and the keys it was given.
+        let c = managed_config(&i, &[]);
+        assert!(c.get("auxiliary").is_none(), "{c}");
+        let job = super::super::job_for(&mut Hermes::default(), &i, &mut Vec::new());
+        assert_eq!(job.env.get("OPENROUTER_API_KEY").map(String::as_str), Some("sk-or"));
+
+        // Held: every side task on the route's provider and model, nothing that points elsewhere.
+        i.held_to = vec!["gb-lon".into()];
+        let c = managed_config(&i, &[]);
+        for task in ["vision", "web_extract", "compression", "session_search", "title_generation", "approval", "mcp", "skills_hub"] {
+            let t = &c["auxiliary"][task];
+            assert_eq!((t["provider"].as_str(), t["model"].as_str(), t["base_url"].as_str(), t["api_key"].as_str()), (Some("main"), Some(""), Some(""), Some("")), "{task}: {c}");
+        }
+        assert_eq!(c["auxiliary"]["compression"]["fallback_chain"], json!([]));
+        assert_eq!(c["fallback_providers"], json!([]));
+        // Built-in providers' keys are empty, inherited or saved; the route's own is handed over.
+        let job = super::super::job_for(&mut Hermes::default(), &i, &mut Vec::new());
+        for k in BUILT_IN_KEYS {
+            assert_eq!(job.env.get(*k).map(String::as_str), Some(""), "{k}");
+        }
+        assert_eq!(job.env.get("HERMES_PROVIDER_SUPERBOT_UK_API_KEY").map(String::as_str), Some("sk-uk"));
         let _ = std::fs::remove_dir_all(&i.state_dir);
     }
 
