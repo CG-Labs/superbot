@@ -480,9 +480,17 @@ fn walk(db: &Db, anchor: Option<Link>, pins: Vec<Link>) -> Report {
     v.finish()
 }
 
-/// What `audit.verified` records: the result and the head, never row contents.
+/// What `audit.verified` records: the result and the head, never row contents. A failed
+/// check's `reason` is a code (`contents`, `link`, `pin`, `unreadable`, ...), which the
+/// support bundle shows.
 pub fn summary(r: &Report) -> Value {
-    json!({ "ok": r.ok, "checked": r.checked, "erased": r.erased, "broken": r.broken, "firstBroken": r.first_broken, "head": r.head, "anchor": r.anchor, "pins": r.pins, "error": r.error })
+    let reason = match (&r.first_broken, &r.error) {
+        _ if r.ok => None,
+        (Some(b), _) => Some(b.reason),
+        (None, Some(_)) => Some("unreadable"),
+        (None, None) => Some("broken"),
+    };
+    json!({ "ok": r.ok, "reason": reason, "checked": r.checked, "erased": r.erased, "broken": r.broken, "firstBroken": r.first_broken, "head": r.head, "anchor": r.anchor, "pins": r.pins, "error": r.error })
 }
 
 /// Checks the chain once a day and records `audit.verified` with the head's hash: a

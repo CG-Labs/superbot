@@ -79,6 +79,8 @@ async fn verify_names_the_first_broken_link_and_holds_pins() {
     assert_eq!((v["ok"].as_bool(), v["firstBroken"]["id"].as_i64(), v["firstBroken"]["reason"].as_str()), (Some(false), Some(forged), Some("contents")), "{v}");
     let failed = &events(port, &admin, "action=audit.verified&outcome=failure").await[0];
     assert_eq!(failed["details"]["firstBroken"]["id"].as_i64(), Some(forged));
+    assert_eq!(failed["details"]["reason"].as_str().map(crate::support::reason_code), Some("contents"), "a code the support bundle shows");
+    assert_eq!(checked["details"]["reason"], Value::Null);
 
     // Re-hashing every row after it hides nothing from a pin kept outside.
     assert!(crate::audit_chain::reseal_from(&app.db, forged) > 0);
@@ -205,6 +207,7 @@ async fn the_siem_export_delivers_every_event_in_order_and_retries() {
     assert_eq!(all.iter().filter(|e| e.action == "audit.export_failing").count(), 1);
     let failing = all.iter().find(|e| e.action == "audit.export_failing").unwrap();
     assert_eq!((failing.outcome.as_str(), failing.details["sink"].as_str()), ("failure", Some(url.trim_end_matches("/ingest"))));
+    assert_eq!(failing.details["reason"].as_str().map(crate::support::reason_code), Some("delivery_failed"));
     until("everything delivered", || app.audit_export.get().unwrap().delivered() >= app.db.audit_head()).await;
 
     let (tries, lines, headers) = got.lock().unwrap().clone();

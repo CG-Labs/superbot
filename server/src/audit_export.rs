@@ -259,7 +259,8 @@ async fn run(app: Arc<App>, x: Arc<Exporter>) {
     let mut wait = FIRST_RETRY;
     loop {
         // A row that can't be read stops the export there, so it's never skipped.
-        let rows = app.db.try_audit_events(&Filter { after: Some(x.delivered()), ..Default::default() }, BATCH, true).map_err(|e| format!("couldn't read the audit log: {e}"));
+        // Failures carry a reason code for the audit event beside the message.
+        let rows = app.db.try_audit_events(&Filter { after: Some(x.delivered()), ..Default::default() }, BATCH, true).map_err(|e| ("unreadable", format!("couldn't read the audit log: {e}")));
         let sent = match rows {
             Ok(rows) => {
                 let Some(last) = rows.last().map(|e| e.id) else {
@@ -267,7 +268,11 @@ async fn run(app: Arc<App>, x: Arc<Exporter>) {
                     continue;
                 };
                 // Delivered only once the cursor is saved; if it can't be, the batch goes again.
-                out.send(&x.sink, &rows, &host).await.and_then(|()| app.db.set_audit_export_cursor(&x.sink.id, last).map_err(|e| format!("couldn't save the export cursor: {e}"))).map(|()| last)
+                out.send(&x.sink, &rows, &host)
+                    .await
+                    .map_err(|e| ("delivery_failed", e))
+                    .and_then(|()| app.db.set_audit_export_cursor(&x.sink.id, last).map_err(|e| ("cursor_unsaved", format!("couldn't save the export cursor: {e}"))))
+                    .map(|()| last)
             }
             Err(e) => Err(e),
         };
@@ -280,13 +285,13 @@ async fn run(app: Arc<App>, x: Arc<Exporter>) {
                 }
                 wait = FIRST_RETRY;
             }
-            Err(e) => {
+            Err((reason, e)) => {
                 let e = secrets::redact::text(&e).into_owned();
                 if x.failed(&e) {
                     log_warn!("WARNING: audit export to {} is failing ({e}); events wait in the database and retention keeps them until they are delivered.", x.sink.shown);
                     let pending = (app.db.audit_head() - x.delivered()).max(0);
                     let ev = Event::new(Actor::system("audit_export"), "audit.export_failing").target("audit", "export").outcome(Outcome::Failure);
-                    app.db.record(&ev.details(json!({ "sink": x.sink.shown, "error": e, "pending": pending })));
+                    app.db.record(&ev.details(json!({ "sink": x.sink.shown, "reason": reason, "error": e, "pending": pending })));
                 }
                 tokio::time::sleep(jitter(wait)).await;
                 wait = (wait * 2).min(LAST_RETRY);
