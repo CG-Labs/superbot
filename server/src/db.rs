@@ -4191,12 +4191,18 @@ impl Db {
             &mut subjects,
         )
         .map_err(db_err)?;
-        Self::past_identifiers(&tx, user_id, &mut emails, &mut exact, &mut subjects).map_err(db_err)?;
         // A SCIM userName is often an email, but not always.
-        let (names, mails): (Vec<String>, Vec<String>) = emails.into_iter().partition(|e| !e.contains('@'));
-        exact.extend(names);
-        exact.extend(subjects.iter().cloned());
-        let scrub = Scrub::new(user_id, pseudonym, mails, exact);
+        let scrub_of = |emails: Vec<String>, mut exact: Vec<String>, subjects: &[String]| {
+            let (names, mails): (Vec<String>, Vec<String>) = emails.into_iter().partition(|e| !e.contains('@'));
+            exact.extend(names);
+            exact.extend(subjects.iter().cloned());
+            Scrub::new(user_id, pseudonym, mails, exact)
+        };
+        let scrub = scrub_of(emails.clone(), exact.clone(), &subjects);
+        // Values they had before may be someone else's now, so they're scrubbed only from
+        // events that name them by id.
+        Self::past_identifiers(&tx, user_id, &mut emails, &mut exact, &mut subjects).map_err(db_err)?;
+        let theirs = scrub_of(emails, exact, &subjects);
 
         let bots_json = serde_json::to_string(bots).unwrap_or_else(|_| "[]".into());
         let run = |sql: &str, p: &[&dyn rusqlite::ToSql]| tx.execute(sql, p).map_err(db_err);
@@ -4238,7 +4244,7 @@ impl Db {
              WHERE id = ?1",
             &[&user_id, &ERASED_NAME, &at, &by, &pseudonym],
         )?;
-        out.audit_events = Self::pseudonymise_audit(&tx, &scrub).map_err(db_err)?;
+        out.audit_events = Self::pseudonymise_audit(&tx, &scrub, &theirs).map_err(db_err)?;
         tx.commit().map_err(db_err)?;
         Ok(out)
     }
@@ -4269,8 +4275,8 @@ impl Db {
     }
 
     /// Rewrites every audit event about `s`'s user as `Scrub` says, inside the caller's
-    /// transaction. Returns how many changed.
-    fn pseudonymise_audit(c: &Connection, s: &Scrub) -> rusqlite::Result<usize> {
+    /// transaction; events that name them by id as `named` says. Returns how many changed.
+    fn pseudonymise_audit(c: &Connection, s: &Scrub, named: &Scrub) -> rusqlite::Result<usize> {
         c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", params![AUDIT_ERASING, s.pseudonym])?;
         let mut sql = String::from(
             "SELECT id, actor_id, actor_name, actor_email, actor_subject, target_id, on_behalf_of, ip, user_agent, session_id, details FROM audit_events
@@ -4295,6 +4301,7 @@ impl Db {
         for (id, [actor_id, name, email, subject, target, behalf, ip, agent, session], details) in rows {
             let is = |v: &Option<String>| v.as_deref() == Some(s.id.as_str());
             let theirs = is(&actor_id);
+            let s = if theirs || is(&target) || is(&behalf) { named } else { s };
             let swap = |v: Option<String>| {
                 if v.as_deref() == Some(s.id.as_str()) { Some(s.pseudonym.clone()) } else { v }
             };

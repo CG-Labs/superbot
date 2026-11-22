@@ -255,14 +255,24 @@ async fn names_and_emails_they_had_before_are_erased_too() {
     for patch in [json!({ "name": "Augusta Ada Byron" }), json!({ "name": "Countess of Lovelace", "email": "ada@example.com" })] {
         assert_eq!(call(port, "PATCH", &format!("/api/users/{ada}"), &admin, &patch.to_string()).await.0, 200);
     }
+    // Someone else gets her old address; what's recorded about them stays theirs.
+    let (bob, bob_auth) = user_with(port, &admin, "ada.byron@example.com", "member").await;
+    bot_of(port, &bob_auth, "Bob's").await;
     let (code, v) = erase(port, &admin, &ada, "").await;
     assert_eq!(code, 200, "{v}");
     for (table, row) in app.db.all_rows() {
         let low = row.to_lowercase();
-        for pii in ["ada.byron@example.com", "augusta ada byron", "countess of lovelace", "ada@example.com"] {
+        for pii in ["augusta ada byron", "countess of lovelace", "ada@example.com"] {
             assert!(!low.contains(pii), "{pii} in {table}: {row}");
         }
+        if table == "audit_events" && low.contains("ada.byron@example.com") {
+            assert!(row.contains(&bob), "her old address only in Bob's events: {row}");
+        }
     }
+    let created = audit(port, &admin, "action=user.created").await;
+    assert!(created.iter().any(|e| e["targetId"].as_str() == Some(bob.as_str()) && e["details"]["email"].as_str() == Some("ada.byron@example.com")), "{created:?}");
+    let bots = audit(port, &admin, "action=bot.created").await;
+    assert!(bots.iter().any(|e| e["actorId"].as_str() == Some(bob.as_str()) && e["actorEmail"].as_str() == Some("ada.byron@example.com")), "{bots:?}");
 }
 
 #[tokio::test]
