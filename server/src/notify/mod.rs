@@ -146,6 +146,16 @@ fn stored(name: &str) -> Option<secrets::Secret> {
     secrets::global().get(name).ok().flatten()
 }
 
+/// For sending: a secret that can't be read (an external store down, ADR 0125) refuses
+/// the send rather than counting as unset, so nothing goes out unsigned or unauthenticated.
+pub(crate) fn needed(name: &str) -> Result<Option<secrets::Secret>, String> {
+    needed_from(secrets::global(), name)
+}
+
+fn needed_from(s: &secrets::Secrets, name: &str) -> Result<Option<secrets::Secret>, String> {
+    s.get(name).map_err(|e| format!("{name} couldn't be read from the secret store ({})", e.kind()))
+}
+
 pub fn secret_set(name: &str) -> bool {
     stored(name).is_some()
 }
@@ -481,7 +491,10 @@ impl Channel for Email {
             if plan.email.is_empty() {
                 return None;
             }
-            let password = stored(smtp::PASSWORD);
+            let password = match needed(smtp::PASSWORD) {
+                Ok(p) => p,
+                Err(e) => return Some(Err(e)),
+            };
             let (subject, body) = (n.email_subject(), n.email_body(links.app().as_deref()));
             let mails: Vec<smtp::Mail> = plan.email.iter().map(|to| smtp::Mail { to: to.clone(), subject: subject.clone(), body: body.clone() }).collect();
             Some(self.smtp.send(password.as_ref().map(|p| p.expose()), &mails).await.map(|results| {
@@ -510,9 +523,16 @@ impl Channel for Webhook {
     fn send<'a>(&'a self, n: &'a Notice, plan: &'a Plan, _links: &'a Links) -> BoxFuture<'a, Option<Result<Sent, String>>> {
         Box::pin(async move {
             let (name, format) = plan.webhook.as_ref()?;
-            let Some(url) = stored(name) else { return Some(Err(format!("{name} isn't set"))) };
+            let url = match needed(name) {
+                Ok(Some(url)) => url,
+                Ok(None) => return Some(Err(format!("{name} isn't set"))),
+                Err(e) => return Some(Err(e)),
+            };
             secrets::redact::register(url.expose());
-            let signing = stored(webhook::SIGNING);
+            let signing = match needed(webhook::SIGNING) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(e)),
+            };
             let mut detail = json!({ "host": webhook::host_of(url.expose()), "format": format, "own": name != webhook::URL });
             Some(Ok(match webhook::post(&self.http, url.expose(), *format, n, signing.as_ref().map(|s| s.expose())).await {
                 Ok(status) => {
