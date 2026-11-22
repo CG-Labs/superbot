@@ -112,6 +112,10 @@ pub enum Refusal {
     Rebuilding,
     /// It is being made again from an off-host backup (ADR 0071).
     Restoring,
+    /// Its tier must have a kernel of its own (MACHINE_OWN_KERNEL_TIERS, ADR 0119), and
+    /// it isn't one of this server's VMs: e.g. an Incus container from before a move to
+    /// Linode. Its provider.
+    NotOwnKernel(String),
 }
 
 impl Refusal {
@@ -136,13 +140,14 @@ impl Refusal {
             Refusal::TeammateNotLoggedIn(_) => "teammate_not_logged_in",
             Refusal::Rebuilding => "machine_rebuilding",
             Refusal::Restoring => "machine_restoring",
+            Refusal::NotOwnKernel(_) => "machine_not_own_kernel",
         }
     }
 
     /// The machine's own words, for the audit log: its error, version or state.
     pub fn detail(&self) -> Option<String> {
         match self {
-            Refusal::Offline(e) | Refusal::Outdated(e) | Refusal::TeammateUserFailed(e) => Some(e.clone()),
+            Refusal::Offline(e) | Refusal::Outdated(e) | Refusal::TeammateUserFailed(e) | Refusal::NotOwnKernel(e) => Some(e.clone()),
             Refusal::NotReady(s) => Some(s.as_str().into()),
             Refusal::HarnessMissing(h) | Refusal::HarnessInstalling(h) | Refusal::NotLoggedIn(h) | Refusal::NoTeammateKey(h) | Refusal::TeammateNotLoggedIn(h) => {
                 Some(h.clone())
@@ -183,6 +188,7 @@ impl Refusal {
             Refusal::TeammateNotLoggedIn(h) => format!("I didn't run: runs for your teammates use their own {h} login on your computer, never yours, and this one has none. They can log in from my details in the app, or an admin can save a server-wide key."),
             Refusal::Rebuilding => "I didn't run: your computer is being rebuilt with the latest setup. Try again in a few minutes.".into(),
             Refusal::Restoring => "I didn't run: your computer is being restored from a backup. Try again once an admin says it's back.".into(),
+            Refusal::NotOwnKernel(_) => "I didn't run: your plan needs a computer with a kernel of its own, and yours isn't one. Ask an admin to move you to a new computer.".into(),
         }
     }
 
@@ -213,7 +219,8 @@ impl Refusal {
             | Refusal::BotUserPending
             | Refusal::BotUserFailed
             | Refusal::Rebuilding
-            | Refusal::Restoring => {
+            | Refusal::Restoring
+            | Refusal::NotOwnKernel(_) => {
                 "it isn't ready to run Bots"
             }
         };
@@ -238,6 +245,9 @@ pub fn target(db: &Db, cp: &ControlPlane, user_id: &str) -> Result<Target, Refus
             };
         }
     };
+    if cp.own_kernel_tiers.contains(&m.tier) && !cp.provider.as_ref().is_some_and(|p| p.name() == m.provider && p.substrate() == "vm") {
+        return Err(Refusal::NotOwnKernel(m.provider.clone()));
+    }
     if m.state != State::Running {
         return Err(Refusal::NotReady(m.state));
     }
@@ -465,6 +475,7 @@ mod tests {
             Refusal::TeammateNotLoggedIn("claude".into()),
             Refusal::Rebuilding,
             Refusal::Restoring,
+            Refusal::NotOwnKernel("incus".into()),
         ];
         for r in &all {
             let m = r.message_for(Some("Ada"));
@@ -528,6 +539,38 @@ mod tests {
 
         assert!(db.unassign_machine(&ma.id));
         assert_eq!(target(db, &assigned, &a.id), Ok(Target::Local));
+    }
+
+    #[test]
+    fn a_tier_that_needs_its_own_kernel_runs_only_on_this_servers_vms() {
+        let app = crate::runner::test_app();
+        let db = &app.db;
+        let a = db.create_user(None, Some("a@example.com"), "A", crate::rbac::Role::Member).unwrap();
+        let b = db.create_user(None, Some("b@example.com"), "B", crate::rbac::Role::Member).unwrap();
+        let vms = |tiers: &[&str]| ControlPlane {
+            routing: Routing::On,
+            own_kernel_tiers: tiers.iter().map(|t| t.to_string()).collect(),
+            ..ControlPlane::for_tests(std::sync::Arc::new(crate::machines::fake::Fake::default()))
+        };
+        let ma = machine(db, &a.id, State::Running);
+        let mb = db
+            .add_machine(&NewMachine { user_id: &b.id, provider: "incus", label_prefix: "superbot", tier: "starter", plan: "c1-m2-d20", region: "gb-lon", created_by: None })
+            .unwrap();
+        set(db, &mb.id, State::Running);
+        for m in [&ma, &mb] {
+            assert!(db.assign_machine(&m.id, None));
+            recording::enroll(db, m);
+        }
+
+        assert!(matches!(target(db, &vms(&[]), &b.id), Ok(Target::Machine(_))), "off unless set");
+        assert!(matches!(target(db, &vms(&["pro"]), &b.id), Ok(Target::Machine(_))), "another tier's");
+        let r = target(db, &vms(&["starter"]), &b.id);
+        assert_eq!(r, Err(Refusal::NotOwnKernel("incus".into())), "a container left from before a move to VMs");
+        assert_eq!(r.unwrap_err().detail().as_deref(), Some("incus"));
+        assert!(matches!(target(db, &vms(&["starter"]), &a.id), Ok(Target::Machine(_))), "this server's own VM");
+
+        let none = ControlPlane { routing: Routing::On, own_kernel_tiers: vec!["starter".into()], ..ControlPlane::default() };
+        assert_eq!(target(db, &none, &a.id), Err(Refusal::NotOwnKernel("fake".into())), "no provider to vouch for it");
     }
 
     #[test]
