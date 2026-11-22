@@ -321,6 +321,11 @@ fn pin_body(cp: &ControlPlane, body: Result<Json<PinBody>, JsonRejection>) -> Re
     Ok((region, text(&b.reference, "reference", 200)?))
 }
 
+/// A pin or unpin that wasn't saved: nothing changed, and nothing is audited as done.
+fn not_saved(e: String) -> ApiError {
+    ApiError(axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("The residency pin couldn't be saved, so nothing changed: {e}"))
+}
+
 fn unpin_body(body: Result<Json<UnpinBody>, JsonRejection>) -> Res<String> {
     let Ok(Json(b)) = body else { return Err(bad("Send {\"reason\": \"<why the pin ends>\"}.")) };
     text(&b.reason, "reason", 500)
@@ -366,10 +371,7 @@ pub async fn pin_user(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Aut
         ));
     }
     let from = u.region.clone();
-    if from.as_deref() != Some(region.as_str()) {
-        app.db.set_user_region(&u.id, Some(&region));
-    }
-    app.db.set_residency_pin(PinOn::User, &u.id, &region, &reference, by.actor.id.as_deref());
+    app.db.pin_residency(PinOn::User, &u.id, &region, &reference, by.actor.id.as_deref()).map_err(not_saved)?;
     let d = json!({ "region": region, "reference": reference, "regionFrom": from, "renewed": own.is_some(), "userEmail": u.email });
     app.db.record(&by.event("user.residency_pinned").target("user", &u.id).details(d));
     let u = app.db.user(&u.id).ok_or_else(|| not_found("User"))?;
@@ -385,7 +387,9 @@ pub async fn unpin_user(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<A
     let u = need_user_key(&app, &key)?;
     let _g = cp.lock_ops().await;
     let p = app.db.residency_pin(PinOn::User, &u.id).ok_or_else(|| not_found("Residency pin on this user"))?;
-    app.db.delete_residency_pin(PinOn::User, &u.id);
+    if !app.db.unpin_residency(PinOn::User, &u.id).map_err(not_saved)? {
+        return Err(not_found("Residency pin on this user"));
+    }
     let d = json!({ "region": p.region, "reference": p.reference, "pinnedAt": p.pinned_at, "pinnedBy": p.pinned_by, "reason": reason, "userEmail": u.email });
     app.db.record(&by.event("user.residency_unpinned").target("user", &u.id).details(d));
     Ok(Json(region::user_view(&app, cp, &u)))
@@ -442,10 +446,7 @@ pub async fn pin_team(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Aut
         return Err(refuse("data_outside", why, extra));
     }
     let from = t.region.clone();
-    if from.as_deref() != Some(region.as_str()) {
-        app.db.set_team_region(&t.id, Some(&region));
-    }
-    app.db.set_residency_pin(PinOn::Team, &t.id, &region, &reference, by.actor.id.as_deref());
+    app.db.pin_residency(PinOn::Team, &t.id, &region, &reference, by.actor.id.as_deref()).map_err(not_saved)?;
     let d = json!({ "region": region, "reference": reference, "regionFrom": from, "renewed": own.is_some(), "members": app.db.team_members(&t.id).len() });
     app.db.record(&crate::teams::team_event(&by, "team.residency_pinned", &t.id, d));
     let t = app.db.team(&t.id).ok_or_else(|| not_found("Team"))?;
@@ -461,7 +462,9 @@ pub async fn unpin_team(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<A
     let _g = cp.lock_ops().await;
     let t = app.db.team(id.trim()).ok_or_else(|| not_found("Team"))?;
     let p = app.db.residency_pin(PinOn::Team, &t.id).ok_or_else(|| not_found("Residency pin on this team"))?;
-    app.db.delete_residency_pin(PinOn::Team, &t.id);
+    if !app.db.unpin_residency(PinOn::Team, &t.id).map_err(not_saved)? {
+        return Err(not_found("Residency pin on this team"));
+    }
     let d = json!({ "region": p.region, "reference": p.reference, "pinnedAt": p.pinned_at, "pinnedBy": p.pinned_by, "reason": reason });
     app.db.record(&crate::teams::team_event(&by, "team.residency_unpinned", &t.id, d));
     Ok(Json(region::team_region_view(&app, cp, &t)))

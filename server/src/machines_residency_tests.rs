@@ -141,7 +141,7 @@ async fn without_a_store_in_the_region_a_pin_is_refused_and_pinned_backups_resto
     assert_eq!(events(&env, "user.residency_pin_refused").await[0]["details"]["reason"].as_str(), Some("region_not_ready"));
 
     // A pin made before the store went away: nothing goes to, or comes from, London's store.
-    env.app.db.set_residency_pin(PinOn::User, &fra, "de-fra-2", "DPA-1", None);
+    env.app.db.pin_residency(PinOn::User, &fra, "de-fra-2", "DPA-1", None).unwrap();
     let (code, v) = json_call(&env, "POST", &format!("/api/users/{fra}/machine/backups"), "").await;
     assert_eq!(code, 409, "{v}");
     assert!(v["error"].as_str().unwrap().contains("no backup store is set there"), "{v}");
@@ -179,7 +179,7 @@ async fn with_hosts_untagged_after_a_pin_no_new_machine_is_made_asked_for_or_ret
     let made = |label: &str| [&env.a, &env.b, &env.c].iter().any(|s| s.instance(label).is_some());
 
     // Pinned while hosts were tagged; the tags have since gone.
-    env.app.db.set_residency_pin(PinOn::User, &fra, "local", "DPA-1", None);
+    env.app.db.pin_residency(PinOn::User, &fra, "local", "DPA-1", None).unwrap();
     let (code, v) = json_call(&env, "POST", &format!("/api/users/{fra}/machine"), "").await;
     assert_eq!(code, 409, "{v}");
     assert!(v["error"].as_str().unwrap().contains("Incus hosts aren't tagged with data regions"), "{v}");
@@ -194,7 +194,7 @@ async fn with_hosts_untagged_after_a_pin_no_new_machine_is_made_asked_for_or_ret
     // A machine already pending when the pin landed waits, audited once, until tagged.
     let new = crate::db::NewMachine { user_id: &lon, provider: "incus", label_prefix: &env.cp.label_prefix, tier: "starter", plan: &env.cp.tiers[0].1, region: "local", created_by: None };
     let m = env.app.db.add_machine(&new).unwrap_or_else(|_| panic!("added"));
-    env.app.db.set_residency_pin(PinOn::User, &lon, "local", "DPA-2", None);
+    env.app.db.pin_residency(PinOn::User, &lon, "local", "DPA-2", None).unwrap();
     reconcile(&env).await;
     reconcile(&env).await;
     let m = env.app.db.machine(&m.id).unwrap();
@@ -206,7 +206,7 @@ async fn with_hosts_untagged_after_a_pin_no_new_machine_is_made_asked_for_or_ret
     assert_eq!(refused[0]["details"]["action"].as_str(), Some("create"));
 
     // Unpinned, it is made.
-    env.app.db.delete_residency_pin(PinOn::User, &lon);
+    assert!(env.app.db.unpin_residency(PinOn::User, &lon).unwrap());
     reconcile(&env).await;
     assert!(env.app.db.machine(&m.id).unwrap().provider_id.is_some() && made(&m.label));
 }
