@@ -221,17 +221,33 @@ pub struct Caller {
     pub bot_token: Option<String>,
     /// What the person's custom role across the server adds to their base role (ADR 0123).
     pub grants: rbac::Perms,
+    /// Set when a service account's token sent the request (ADR 0143).
+    pub service: Option<ServiceCaller>,
+}
+
+/// A service account's token: which one, whose permissions cap it, and the most it may
+/// use now (its scopes, within what its owner holds).
+#[derive(Clone, Debug)]
+pub struct ServiceCaller {
+    pub token: String,
+    pub owner: String,
+    pub scope: rbac::Scope,
 }
 
 impl Caller {
     /// A signed-in person, with their custom role's permissions read now.
     pub fn person(db: &db::Db, u: User, s: Option<Session>, method: &'static str) -> Caller {
         let grants = db.user_perms(&u);
-        Caller { principal: Principal::User(u.role), user: Some(u), session: s, method, bot: None, bot_for: None, bot_token: None, grants }
+        Caller { principal: Principal::User(u.role), user: Some(u), session: s, method, bot: None, bot_for: None, bot_token: None, grants, service: None }
     }
 
     pub fn can(&self, perm: rbac::Perm) -> bool {
-        rbac::permits(self.principal, self.grants, perm)
+        rbac::permits(self.principal, self.grants, perm) && self.scoped(perm)
+    }
+
+    /// Whether a service account's token may use `perm`, whatever grants it. Anyone else: yes.
+    pub fn scoped(&self, perm: rbac::Perm) -> bool {
+        self.service.as_ref().is_none_or(|s| s.scope.has(perm))
     }
 
     /// A full admin: the built-in role, which no custom role can be.
@@ -240,7 +256,7 @@ impl Caller {
     }
 
     pub fn permissions(&self) -> Vec<&'static str> {
-        rbac::granted(self.principal, self.grants)
+        rbac::PERMS.into_iter().filter(|p| self.can(*p)).map(rbac::Perm::as_str).collect()
     }
 }
 
@@ -472,7 +488,7 @@ pub async fn login(Extension(a): Extension<Arc<Auth>>, Extension(source): Extens
         }
         (None, None) => return bad("Send a password or a sign-in code").into_response(),
     };
-    let Some(user) = user.filter(User::active) else {
+    let Some(user) = user.filter(|u| u.active() && !u.service) else {
         a.limiter.fail(&ip, at);
         a.login_failed(&source, method, None);
         let msg = if method == "code" { "That sign-in code is wrong, used, or expired." } else { "Wrong password." };
@@ -502,7 +518,7 @@ pub async fn logout(State(app): State<AppState>, Extension(c): Extension<Caller>
 }
 
 pub async fn me(Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>) -> Json<Value> {
-    Json(json!({
+    let mut v = json!({
         "user": c.user.as_ref().map(user_view),
         "role": match c.principal { Principal::User(r) => json!(r), Principal::Bot => json!("bot") },
         "permissions": c.permissions(),
@@ -512,7 +528,11 @@ pub async fn me(Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Call
         "breakGlass": a.break_glass,
         "landing": crate::landing(c.principal),
         "mfa": c.user.as_ref().map_or(Value::Null, |u| crate::mfa::summary(&a, u)),
-    }))
+    });
+    if let (Some(s), Some(app)) = (&c.service, &a.app) {
+        v["serviceAccount"] = crate::service_accounts::whoami(app, &c, s);
+    }
+    Json(v)
 }
 
 // Users (admin).
