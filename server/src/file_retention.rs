@@ -62,8 +62,9 @@ pub fn keep_sessions_days(app: &App, bot: &Bot, on_machine: bool, isolated: bool
     if held { Some(crate::retention::MAX_DAYS) } else { app.db.retention_days(SESSIONS_KEY) }
 }
 
-/// The Bots held now. Read again before each place a pass deletes in, so a hold placed
-/// while it works on another account or machine still protects what's left.
+/// The Bots held now. Read again before each place a pass deletes in, with
+/// `App::deleting_files` held, which placing a hold takes too: a hold placed while a pass
+/// runs protects everything it hasn't reached.
 fn holds(app: &App) -> HashSet<String> {
     app.db.retention_holds().into_iter().map(|h| h.bot_id).collect()
 }
@@ -154,11 +155,15 @@ pub async fn prune_sessions(app: &Arc<App>, days: u32, at: i64) -> Value {
     let mut t = Tally::default();
 
     // botd's own HOME and Bot folders, which every Bot here used without per-user accounts.
-    let (s, skipped) = bots.sweep(before, None, app.cfg.home.as_deref(), |b| app.bot_dir(&b.id), app.isolation().is_none());
-    t.held_homes += u32::from(skipped);
-    match tokio::task::spawn_blocking(move || crate::sweep::run(&s)).await {
-        Ok(out) => add(&mut t, "this server", Ok(out)),
-        Err(e) => t.error(format!("this server: {e}")),
+    {
+        let _step = app.deleting_files.lock().await;
+        bots.held = holds(app);
+        let (s, skipped) = bots.sweep(before, None, app.cfg.home.as_deref(), |b| app.bot_dir(&b.id), app.isolation().is_none());
+        t.held_homes += u32::from(skipped);
+        match tokio::task::spawn_blocking(move || crate::sweep::run(&s)).await {
+            Ok(out) => add(&mut t, "this server", Ok(out)),
+            Err(e) => t.error(format!("this server: {e}")),
+        }
     }
 
     // Each per-user account's, as the account (ADR 0037, 0064).
@@ -171,6 +176,7 @@ pub async fn prune_sessions(app: &Arc<App>, days: u32, at: i64) -> Value {
         }
         spaces.extend(iso.teammate_pairs().into_iter().map(|(o, t)| (o, Some(t))));
         for (owner, teammate) in spaces {
+            let _step = app.deleting_files.lock().await;
             bots.held = holds(app);
             let space = Space::of(&owner, teammate.as_deref());
             let (Some(run_as), Some(home)) = (iso.run_as_in(space), iso.home_in(space)) else { continue };
@@ -191,6 +197,7 @@ pub async fn prune_sessions(app: &Arc<App>, days: u32, at: i64) -> Value {
     // there, by owner, so only those are pruned.
     let mut found: std::collections::HashMap<String, Vec<(Option<String>, String)>> = std::collections::HashMap::new();
     for m in sweepable_machines(app) {
+        let _step = app.deleting_files.lock().await;
         bots.held = holds(app);
         let (held, keep, report) = bots.sessions(Some(&m.user_id));
         t.held_homes += u32::from(held);
@@ -218,6 +225,7 @@ pub async fn prune_sessions(app: &Arc<App>, days: u32, at: i64) -> Value {
 
     // Hermes Agent keeps its sessions in a database, which only it may change.
     for b in &bots.all {
+        let _step = app.deleting_files.lock().await;
         if !bots.idle(b) || holds(app).contains(&b.id) {
             continue;
         }
@@ -435,6 +443,7 @@ pub async fn prune_teammate_files(app: &Arc<App>, days: u32, at: i64) -> Value {
     let (mut deleted, mut missing, mut held_n, mut waiting, mut unknown, mut files, mut bytes) = (0u32, 0u32, 0u32, 0u32, 0u32, 0u64, 0u64);
     let mut errors: Vec<String> = Vec::new();
     for (table, id, owner, machine, archived_to) in app.db.archives_before(before) {
+        let _step = app.deleting_files.lock().await;
         if held_owners().contains(&owner) {
             held_n += 1;
             continue;

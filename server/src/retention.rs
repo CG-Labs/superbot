@@ -181,7 +181,10 @@ pub async fn put_hold(State(app): State<AppState>, Extension(by): Extension<Who>
     }
     let b = app.db.bot(&bot).ok_or_else(|| not_found("Bot"))?;
     let before = app.db.retention_hold(&b.id);
+    // Waits out a file retention step that's deleting, so none deletes what this holds.
+    let deleting = app.deleting_files.lock().await;
     let hold = app.db.put_retention_hold(&b.id, reason, by.actor.id.as_deref()).ok_or_else(|| not_found("Bot"))?;
+    drop(deleting);
     if before.as_ref().is_none_or(|h| h.reason != hold.reason) {
         let action = if before.is_some() { "chat.hold_changed" } else { "chat.hold_placed" };
         app.db.record(&by.event(action).target("bot", &b.id).bot(&b.id).details(json!({ "reason": hold.reason, "before": before.map(|h| h.reason) })));
