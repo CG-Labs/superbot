@@ -654,7 +654,8 @@ mod tests {
 
         // Sent only if it is still the file listed, and never through a link.
         assert!(reopen(&l.files[1].1).is_ok());
-        std::fs::remove_file(root.join("a.txt")).unwrap();
+        // Kept, not removed, so the replacement below can't be given its inode.
+        std::fs::rename(root.join("a.txt"), root.join("a.old")).unwrap();
         std::os::unix::fs::symlink("/etc/passwd", root.join("a.txt")).unwrap();
         assert_eq!(reopen(&l.files[0].1).unwrap_err().reason, "source_changed");
         std::fs::write(root.join("a.new"), "hello").unwrap();
