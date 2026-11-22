@@ -49,7 +49,10 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
         _ => return Err(bad("destroyMachine must be true or false")),
     };
     let _one = ERASING.lock().await;
-    let u = app.db.find_user_any(&key).ok_or_else(|| not_found("User"))?;
+    let found = app.db.find_user_any(&key).ok_or_else(|| not_found("User"))?;
+    // The record is taken from the user list, not looked up by the request path, so no
+    // request input reaches the Stripe URLs that closing their checkout or team calls.
+    let u = app.db.users().into_iter().find(|x| x.id == found.id).ok_or_else(|| not_found("User"))?;
     if u.erased_at.is_some() {
         return Ok(Json(json!({ "erased": true, "already": true, "pseudonym": u.erased_as, "user": users::user_view(&u) })));
     }
@@ -93,10 +96,7 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
     let _checkout = match a.payments.checkout() {
         Some(co) => {
             let guard = co.lock(&u.id).lock_owned().await;
-            // The id that names the Stripe session comes from the user list, not the request path,
-            // so no request input reaches a Stripe URL.
-            let id = app.db.users().into_iter().map(|x| x.id).find(|id| *id == u.id).ok_or_else(|| not_found("User"))?;
-            match crate::billing::close_last(&app, &co.stripe, crate::billing::Payer::User(&id)).await {
+            match crate::billing::close_last(&app, &co.stripe, crate::billing::Payer::User(&u.id)).await {
                 crate::billing::Last::Closed => {}
                 crate::billing::Last::Paid => {
                     return refuse(CHECKOUT_PAID, json!({}), "Their last checkout was paid; a plan is on the way. Cancel it once it starts, then erase them.".into());
