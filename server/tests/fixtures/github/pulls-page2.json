@@ -17,7 +17,6 @@
     "closed_at": "2026-10-06T12:00:00Z",
     "merged_at": null,
     "merge_commit_sha": null,
-    "merged_by": null,
     "head": {
       "ref": "feature-100",
       "sha": "a100a100a100a100a100a100a100a100a100a100"
@@ -47,12 +46,6 @@
     "closed_at": "2026-10-05T09:30:00Z",
     "merged_at": "2026-10-05T09:30:00Z",
     "merge_commit_sha": "b101b101b101b101b101b101b101b101b101b101",
-    "merged_by": {
-      "login": "author-b",
-      "id": 38182,
-      "type": "User",
-      "site_admin": false
-    },
     "head": {
       "ref": "feature-101",
       "sha": "a101a101a101a101a101a101a101a101a101a101"
@@ -82,12 +75,6 @@
     "closed_at": "2026-09-28T10:00:00Z",
     "merged_at": "2026-09-28T10:00:00Z",
     "merge_commit_sha": "b099b099b099b099b099b099b099b099b099b099",
-    "merged_by": {
-      "login": "maintainer-m",
-      "id": 38766,
-      "type": "User",
-      "site_admin": false
-    },
     "head": {
       "ref": "feature-99",
       "sha": "a099a099a099a099a099a099a099a099a099a099"

@@ -52,8 +52,9 @@ manifest.json: from its first day (00:00 UTC) up to, not including, its last. Br
 protection is as of createdAt, which may be after the period.
 
   pull-requests.json      every pull request merged into the branch in the period: author,
-                          reviews and approvers, checks on its last commit and which were
-                          required, merge commit and who merged it, the CI runs on its merge
+                          reviews and approvers, checks on its last commit, which were
+                          required and their result at the merge, merge commit and who
+                          merged it, the CI runs on its merge
                           commit; and every commit that reached the branch without one
   branch-protection.json  the branch's protection now: rulesets and classic protection,
                           required checks and approvals, force pushes and deletions
@@ -125,7 +126,12 @@ fn optional<T>(r: Result<T, Failure>) -> Result<Result<T, u16>, Failure> {
 fn merged(api: &mut dyn Api, repo: &str, branch: &str, p: &Period) -> Result<Vec<Value>, Failure> {
     let mut url = format!("/repos/{repo}/pulls?state=closed&base={}&sort=updated&direction=desc&per_page=100", enc(branch));
     let mut out = Vec::new();
-    'pages: for _ in 0..MAX_PAGES {
+    let mut pages = 0;
+    'pages: loop {
+        pages += 1;
+        if pages > MAX_PAGES {
+            return Err(Failure::new(0, format!("the merged pull requests run past {MAX_PAGES} pages; export a shorter period")));
+        }
         let r = api.get(&url)?;
         for pr in r.body.as_array().into_iter().flatten() {
             if ms(&pr["updated_at"]).is_some_and(|t| t < p.start_ms()) {
@@ -173,8 +179,26 @@ fn runs_between(api: &mut dyn Api, repo: &str, branch: &str, from: chrono::Naive
 /// protection, as far as the token can see.
 #[derive(Debug, Default, PartialEq)]
 pub struct Required {
-    pub checks: BTreeSet<String>,
+    /// Each required check's name, and the app it must come from when one is set.
+    pub checks: BTreeMap<String, Option<u64>>,
     pub approvals: Option<u64>,
+}
+
+impl Required {
+    fn require(&mut self, name: &str, app: Option<u64>) {
+        let pinned = self.checks.entry(name.to_string()).or_default();
+        if app.is_some() {
+            *pinned = app;
+        }
+    }
+
+    fn names(&self) -> Vec<&str> {
+        self.checks.keys().map(String::as_str).collect()
+    }
+
+    fn apps(&self) -> BTreeMap<&str, u64> {
+        self.checks.iter().filter_map(|(n, a)| Some((n.as_str(), (*a)?))).collect()
+    }
 }
 
 fn enabled(v: &Value, key: &str) -> Option<bool> {
@@ -193,7 +217,7 @@ pub fn protection(branch: &str, info: &Value, rules: &Result<Vec<Value>, u16>, c
             Some("required_status_checks") => {
                 for c in r["parameters"]["required_status_checks"].as_array().into_iter().flatten() {
                     if let Some(name) = c["context"].as_str() {
-                        req.checks.insert(name.to_string());
+                        req.require(name, c["integration_id"].as_u64());
                     }
                 }
             }
@@ -208,10 +232,12 @@ pub fn protection(branch: &str, info: &Value, rules: &Result<Vec<Value>, u16>, c
     if let Some(c) = c {
         let rsc = &c["required_status_checks"];
         for name in rsc["contexts"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-            req.checks.insert(name.to_string());
+            req.require(name, None);
         }
-        for name in rsc["checks"].as_array().into_iter().flatten().filter_map(|x| x["context"].as_str()) {
-            req.checks.insert(name.to_string());
+        for x in rsc["checks"].as_array().into_iter().flatten() {
+            if let Some(name) = x["context"].as_str() {
+                req.require(name, x["app_id"].as_u64());
+            }
         }
         if let Some(n) = c["required_pull_request_reviews"]["required_approving_review_count"].as_u64() {
             req.approvals = Some(req.approvals.unwrap_or_default().max(n));
@@ -222,7 +248,12 @@ pub fn protection(branch: &str, info: &Value, rules: &Result<Vec<Value>, u16>, c
     let shown = &info["protection"]["required_status_checks"];
     if shown["enforcement_level"].as_str().is_some_and(|l| l != "off") {
         for name in shown["contexts"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-            req.checks.insert(name.to_string());
+            req.require(name, None);
+        }
+        for x in shown["checks"].as_array().into_iter().flatten() {
+            if let Some(name) = x["context"].as_str() {
+                req.require(name, x["app_id"].as_u64());
+            }
         }
     }
     let protected = info["protected"].as_bool().unwrap_or(false);
@@ -288,7 +319,8 @@ pub fn protection(branch: &str, info: &Value, rules: &Result<Vec<Value>, u16>, c
         "summary": {
             "pullRequestRequired": pr_required,
             "requiredApprovals": req.approvals,
-            "requiredChecks": req.checks,
+            "requiredChecks": req.names(),
+            "requiredCheckApps": req.apps(),
             "forcePushesBlocked": blocked("non_fast_forward", "allow_force_pushes"),
             "deletionsBlocked": blocked("deletion", "allow_deletions"),
             "adminsIncluded": c.and_then(|c| enabled(c, "enforce_admins")),
@@ -303,24 +335,74 @@ pub fn protection(branch: &str, info: &Value, rules: &Result<Vec<Value>, u16>, c
     (view, req)
 }
 
-/// The latest run of each check by name: re-runs and the same check from another event
+/// The latest of `items` by `at`, then id: re-runs and the same check from another event
 /// (push and pull_request) leave several.
-fn latest_checks(runs: &[Value]) -> Vec<&Value> {
-    let mut by: BTreeMap<&str, &Value> = BTreeMap::new();
-    let key = |r: &Value| (ms(&r["completed_at"]).or_else(|| ms(&r["started_at"])), r["id"].as_u64());
-    for r in runs {
+fn latest<'a>(items: impl Iterator<Item = &'a Value>, at: impl Fn(&Value) -> Option<i64>) -> Option<&'a Value> {
+    items.filter(|v| at(v).is_some()).max_by_key(|v| (at(v), v["id"].as_u64()))
+}
+
+fn finished(r: &Value) -> Option<i64> {
+    ms(&r["completed_at"])
+}
+
+fn created(s: &Value) -> Option<i64> {
+    ms(&s["created_at"]).or_else(|| ms(&s["updated_at"]))
+}
+
+/// What a required check said at the merge, from the latest run completed by then (from
+/// its app, when one is required) or else the latest status set by then, and what it says
+/// now. A check still running at the merge didn't pass, whatever it did later.
+fn required_check(name: &str, app: Option<u64>, runs: &[Value], statuses: &[Value], merged: i64) -> Value {
+    let named = || runs.iter().filter(move |r| r["name"] == name);
+    let from_app = || named().filter(move |r| app.is_none_or(|a| r["app"]["id"].as_u64() == Some(a)));
+    let ctx = || statuses.iter().filter(move |s| app.is_none() && s["context"] == name);
+    let by_merge = |t: Option<i64>| t.filter(|t| *t <= merged);
+    let judge = |run: Option<&Value>, st: Option<&Value>| match (run, st) {
+        (Some(r), _) => (r["conclusion"].clone(), r["conclusion"].as_str().is_some_and(|c| PASSING.contains(&c))),
+        (None, Some(s)) => (s["state"].clone(), s["state"] == "success"),
+        (None, None) => (Value::Null, false),
+    };
+    let (result, passed) = judge(latest(from_app(), |r| by_merge(finished(r))), latest(ctx(), |s| by_merge(created(s))));
+    let (now, passed_now) = judge(latest(from_app(), finished), latest(ctx(), created));
+    json!({
+        "name": name,
+        "app": app,
+        "found": from_app().next().is_some() || ctx().next().is_some(),
+        "result": result,
+        "passed": passed,
+        "resultNow": now,
+        "passedNow": passed_now,
+        "fromOtherApps": named().count() - from_app().count(),
+    })
+}
+
+/// Checks whose latest result by the merge failed: each run by name and app, each status
+/// by context.
+fn failing_at_merge(runs: &[Value], statuses: &[Value], merged: i64) -> Vec<String> {
+    let mut last: BTreeMap<(&str, Option<u64>), &Value> = BTreeMap::new();
+    for r in runs.iter().filter(|r| finished(r).is_some_and(|t| t <= merged)) {
         let Some(name) = r["name"].as_str() else { continue };
-        if by.get(name).is_none_or(|old| key(r) >= key(old)) {
-            by.insert(name, r);
+        let k = (name, r["app"]["id"].as_u64());
+        if last.get(&k).is_none_or(|old| (finished(r), r["id"].as_u64()) >= (finished(old), old["id"].as_u64())) {
+            last.insert(k, r);
         }
     }
-    by.into_values().collect()
+    let mut out: BTreeSet<String> = last.iter().filter(|(_, r)| r["conclusion"].as_str().is_some_and(|c| FAILING.contains(&c))).map(|((n, _), _)| n.to_string()).collect();
+    let mut by_ctx: BTreeMap<&str, &Value> = BTreeMap::new();
+    for st in statuses.iter().filter(|st| created(st).is_some_and(|t| t <= merged)) {
+        let Some(c) = st["context"].as_str() else { continue };
+        if by_ctx.get(c).is_none_or(|old| (created(st), st["id"].as_u64()) >= (created(old), old["id"].as_u64())) {
+            by_ctx.insert(c, st);
+        }
+    }
+    out.extend(by_ctx.iter().filter(|(_, st)| matches!(st["state"].as_str(), Some("failure" | "error"))).map(|(c, _)| c.to_string()));
+    out.into_iter().collect()
 }
 
 /// One merged pull request: who wrote, reviewed, approved and merged it, and the checks
 /// on its last commit. Reviews after the merge are listed but approve nothing; reviews by
 /// bots are listed but are never an approval (the change management policy).
-pub fn pull_view(pr: &Value, reviews: &[Value], check_runs: &[Value], status: &Value, required: &Required, titles: bool) -> Value {
+pub fn pull_view(pr: &Value, reviews: &[Value], check_runs: &[Value], statuses: &[Value], required: &Required, titles: bool) -> Value {
     let author = pr["user"]["login"].as_str().unwrap_or_default();
     let head = pr["head"]["sha"].as_str().unwrap_or_default();
     let merged = ms(&pr["merged_at"]).unwrap_or(i64::MAX);
@@ -345,25 +427,10 @@ pub fn pull_view(pr: &Value, reviews: &[Value], check_runs: &[Value], status: &V
     let on_final = decisive.values().any(|r| r["state"] == "APPROVED" && r["commit_id"] == head);
     let changes_requested: Vec<&str> = decisive.iter().filter(|(_, r)| r["state"] == "CHANGES_REQUESTED").map(|(w, _)| *w).collect();
 
-    let runs = latest_checks(check_runs);
-    let statuses = status["statuses"].as_array().cloned().unwrap_or_default();
-    let mut failing: Vec<&str> = runs.iter().filter(|r| r["conclusion"].as_str().is_some_and(|c| FAILING.contains(&c))).filter_map(|r| r["name"].as_str()).collect();
-    failing.extend(statuses.iter().filter(|s| matches!(s["state"].as_str(), Some("failure" | "error"))).filter_map(|s| s["context"].as_str()));
-    let req: Vec<Value> = required
-        .checks
-        .iter()
-        .map(|name| {
-            let run = runs.iter().find(|r| r["name"] == name.as_str());
-            let st = statuses.iter().find(|s| s["context"] == name.as_str());
-            let (result, passed) = match (run, st) {
-                (Some(r), _) => (r["conclusion"].clone(), r["conclusion"].as_str().is_some_and(|c| PASSING.contains(&c))),
-                (None, Some(s)) => (s["state"].clone(), s["state"] == "success"),
-                (None, None) => (Value::Null, false),
-            };
-            json!({ "name": name, "result": result, "found": run.is_some() || st.is_some(), "passed": passed })
-        })
-        .collect();
+    let failing = failing_at_merge(check_runs, statuses, merged);
+    let req: Vec<Value> = required.checks.iter().map(|(name, app)| required_check(name, *app, check_runs, statuses, merged)).collect();
     let all_passed = (!req.is_empty()).then(|| req.iter().all(|r| r["passed"] == true));
+    let all_passed_now = (!req.is_empty()).then(|| req.iter().all(|r| r["passedNow"] == true));
     json!({
         "number": pr["number"],
         "title": if titles { pr["title"].clone() } else { Value::Null },
@@ -385,12 +452,13 @@ pub fn pull_view(pr: &Value, reviews: &[Value], check_runs: &[Value], status: &V
         "checks": {
             "required": req,
             "allRequiredPassed": all_passed,
+            "allRequiredPassedNow": all_passed_now,
             "failing": failing,
-            "runs": runs.iter().map(|r| json!({
-                "name": r["name"], "app": r["app"]["slug"], "status": r["status"], "conclusion": r["conclusion"],
-                "completedAt": r["completed_at"], "url": r["html_url"],
+            "runs": check_runs.iter().map(|r| json!({
+                "name": r["name"], "app": r["app"]["slug"], "appId": r["app"]["id"], "status": r["status"], "conclusion": r["conclusion"],
+                "completedAt": r["completed_at"], "beforeMerge": finished(r).is_some_and(|t| t <= merged), "url": r["html_url"],
             })).collect::<Vec<_>>(),
-            "statuses": statuses.iter().map(|s| json!({ "context": s["context"], "state": s["state"], "updatedAt": s["updated_at"] })).collect::<Vec<_>>(),
+            "statuses": statuses.iter().map(|s| json!({ "context": s["context"], "state": s["state"], "createdAt": s["created_at"], "beforeMerge": created(s).is_some_and(|t| t <= merged) })).collect::<Vec<_>>(),
         },
     })
 }
@@ -457,16 +525,23 @@ pub fn collect(api: &mut dyn Api, o: &Options) -> Result<Collected, Failure> {
     let (protection, required) = protection(&branch, &branch_info, &rules, &classic);
 
     let mut pulls = Vec::new();
-    for pr in merged(api, repo, &branch, p)? {
-        let n = pr["number"].as_u64().unwrap_or_default();
+    for listed in merged(api, repo, &branch, p)? {
+        let n = listed["number"].as_u64().unwrap_or_default();
+        // The list leaves out who merged it.
+        let pr = api.get(&format!("/repos/{repo}/pulls/{n}"))?.body;
         let head = pr["head"]["sha"].as_str().unwrap_or_default().to_string();
         let reviews = all(api, &format!("/repos/{repo}/pulls/{n}/reviews?per_page=100"), None)?;
-        let (checks, status) = if head.is_empty() {
-            (Vec::new(), Value::Null)
+        // Every run and status, not just the latest, so the result at the merge can be told
+        // from one that came later.
+        let (checks, statuses) = if head.is_empty() {
+            (Vec::new(), Vec::new())
         } else {
-            (all(api, &format!("/repos/{repo}/commits/{head}/check-runs?per_page=100"), Some("check_runs"))?, api.get(&format!("/repos/{repo}/commits/{head}/status?per_page=100"))?.body)
+            (
+                all(api, &format!("/repos/{repo}/commits/{head}/check-runs?filter=all&per_page=100"), Some("check_runs"))?,
+                all(api, &format!("/repos/{repo}/commits/{head}/statuses?per_page=100"), None)?,
+            )
         };
-        pulls.push(pull_view(&pr, &reviews, &checks, &status, &required, o.titles));
+        pulls.push(pull_view(&pr, &reviews, &checks, &statuses, &required, o.titles));
     }
     pulls.sort_by_key(|pr| pr["number"].as_u64());
 
@@ -539,7 +614,8 @@ fn pull_requests(c: &Collected, snapshot: &str) -> Value {
         "repository": c.repo["fullName"],
         "branch": c.branch,
         "rulesAsOf": snapshot,
-        "requiredChecks": c.required.checks,
+        "requiredChecks": c.required.names(),
+        "requiredCheckApps": c.required.apps(),
         "requiredApprovals": c.required.approvals,
         "summary": {
             "merged": pulls.len(),
@@ -555,6 +631,7 @@ fn pull_requests(c: &Collected, snapshot: &str) -> Value {
             "approvalNotOnFinalCommit": numbers(pulls, |p| p["approvedByOther"] == true && p["approvedFinalCommit"] != true),
             "changesRequestedAtMerge": numbers(pulls, |p| p["changesRequestedAtMerge"].as_array().is_some_and(|a| !a.is_empty())),
             "requiredChecksNotPassed": if required { json!(numbers(pulls, |p| p["checks"]["allRequiredPassed"] != true)) } else { Value::Null },
+            "requiredChecksPassedOnlyAfterMerge": if required { json!(numbers(pulls, |p| p["checks"]["allRequiredPassed"] != true && p["checks"]["allRequiredPassedNow"] == true)) } else { Value::Null },
             "failingChecksAtMerge": numbers(pulls, |p| p["checks"]["failing"].as_array().is_some_and(|f| !f.is_empty())),
             "directCommits": direct,
         },
@@ -691,6 +768,7 @@ pub fn summary(c: &Collected) -> String {
         ("approvalNotOnFinalCommit", "Approved, but not on the last commit"),
         ("changesRequestedAtMerge", "Merged with changes requested"),
         ("requiredChecksNotPassed", "Merged without every required check passing"),
+        ("requiredChecksPassedOnlyAfterMerge", "Required checks that passed only after the merge"),
         ("failingChecksAtMerge", "Merged with a failing check"),
         ("directCommits", "Commits without a merged pull request"),
     ] {
@@ -743,12 +821,12 @@ mod tests {
             (vec![review("reviewer-b", "User", "APPROVED", "2026-10-09T11:00:00Z", "head1"), review("reviewer-b", "User", "COMMENTED", "2026-10-09T12:00:00Z", "head1")], vec!["reviewer-b"], true),
         ];
         for (i, (reviews, approvers, on_final)) in cases.into_iter().enumerate() {
-            let v = pull_view(&pr(), &reviews, &[], &Value::Null, &req, true);
+            let v = pull_view(&pr(), &reviews, &[], &[], &req, true);
             assert_eq!(v["approvers"], json!(approvers), "case {i}");
             assert_eq!(v["approvedByOther"], !approvers.is_empty(), "case {i}");
             assert_eq!(v["approvedFinalCommit"], on_final, "case {i}");
         }
-        let v = pull_view(&pr(), &[review("reviewer-c", "User", "CHANGES_REQUESTED", "2026-10-09T11:00:00Z", "head1"), review("review-bot[bot]", "Bot", "COMMENTED", "2026-10-09T11:00:00Z", "head1")], &[], &Value::Null, &req, false);
+        let v = pull_view(&pr(), &[review("reviewer-c", "User", "CHANGES_REQUESTED", "2026-10-09T11:00:00Z", "head1"), review("review-bot[bot]", "Bot", "COMMENTED", "2026-10-09T11:00:00Z", "head1")], &[], &[], &req, false);
         assert_eq!((v["changesRequestedAtMerge"].clone(), v["automatedReviewers"].clone()), (json!(["reviewer-c"]), json!(["review-bot[bot]"])));
         assert_eq!(v["title"], Value::Null, "--no-titles");
         let text = v.to_string();
@@ -756,22 +834,41 @@ mod tests {
     }
 
     #[test]
-    fn required_checks_pass_on_the_latest_run_or_status() {
-        let req = Required { checks: ["rust", "docs", "legacy", "missing"].iter().map(|s| s.to_string()).collect(), approvals: Some(1) };
+    fn required_checks_pass_on_the_latest_result_by_the_merge_from_the_right_app() {
+        let req = Required { checks: BTreeMap::from([("rust".into(), None), ("docs".into(), Some(15368)), ("legacy".into(), None), ("missing".into(), None), ("late".into(), None)]), approvals: Some(1) };
+        let run = |id: u64, name: &str, conclusion: &str, at: &str, app: u64| json!({ "id": id, "name": name, "conclusion": conclusion, "completed_at": at, "app": { "id": app, "slug": format!("app-{app}") } });
         let runs = vec![
-            json!({ "id": 1, "name": "docs", "conclusion": "failure", "completed_at": "2026-10-09T10:00:00Z", "app": { "slug": "github-actions" } }),
-            json!({ "id": 2, "name": "docs", "conclusion": "success", "completed_at": "2026-10-09T11:00:00Z", "app": { "slug": "github-actions" } }),
-            json!({ "id": 3, "name": "rust", "conclusion": "skipped", "completed_at": "2026-10-09T11:00:00Z" }),
-            json!({ "id": 4, "name": "lint", "conclusion": "timed_out", "completed_at": "2026-10-09T11:00:00Z" }),
+            run(1, "docs", "failure", "2026-10-09T10:00:00Z", 15368),
+            run(2, "docs", "success", "2026-10-09T11:00:00Z", 15368),
+            run(3, "docs", "failure", "2026-10-09T11:30:00Z", 999),
+            run(4, "rust", "skipped", "2026-10-09T11:00:00Z", 15368),
+            run(5, "lint", "timed_out", "2026-10-09T11:00:00Z", 15368),
+            run(6, "late", "failure", "2026-10-10T11:00:00Z", 15368),
+            run(7, "late", "success", "2026-10-11T11:00:00Z", 15368),
+            json!({ "id": 8, "name": "rust", "status": "in_progress", "conclusion": null, "completed_at": null, "app": { "id": 15368 } }),
         ];
-        let status = json!({ "statuses": [{ "context": "legacy", "state": "success" }, { "context": "other", "state": "error" }] });
-        let v = pull_view(&pr(), &[], &runs, &status, &req, true);
-        let got: BTreeMap<String, bool> = v["checks"]["required"].as_array().unwrap().iter().map(|r| (r["name"].as_str().unwrap().to_string(), r["passed"].as_bool().unwrap())).collect();
-        assert_eq!(got, BTreeMap::from([("docs".into(), true), ("legacy".into(), true), ("missing".into(), false), ("rust".into(), true)]));
-        assert_eq!(v["checks"]["allRequiredPassed"], false);
-        assert_eq!(v["checks"]["failing"], json!(["lint", "other"]));
-        assert_eq!(v["checks"]["runs"].as_array().unwrap().len(), 3, "one per name");
-        assert_eq!(pull_view(&pr(), &[], &runs, &status, &Required::default(), true)["checks"]["allRequiredPassed"], Value::Null, "nothing required");
+        let statuses = vec![
+            json!({ "id": 2, "context": "legacy", "state": "success", "created_at": "2026-10-09T11:00:00Z" }),
+            json!({ "id": 1, "context": "legacy", "state": "pending", "created_at": "2026-10-09T10:00:00Z" }),
+            json!({ "id": 3, "context": "other", "state": "error", "created_at": "2026-10-09T11:00:00Z" }),
+            json!({ "id": 4, "context": "other", "state": "success", "created_at": "2026-10-12T11:00:00Z" }),
+        ];
+        let v = pull_view(&pr(), &[], &runs, &statuses, &req, true);
+        let got = |key: &str| -> BTreeMap<String, bool> { v["checks"]["required"].as_array().unwrap().iter().map(|r| (r["name"].as_str().unwrap().to_string(), r[key].as_bool().unwrap())).collect() };
+        assert_eq!(got("passed"), BTreeMap::from([("docs".into(), true), ("late".into(), false), ("legacy".into(), true), ("missing".into(), false), ("rust".into(), true)]), "at the merge; docs' failure from another app doesn't count");
+        assert!(got("passedNow")["late"], "passed after the merge");
+        let docs = v["checks"]["required"].as_array().unwrap().iter().find(|r| r["name"] == "docs").unwrap();
+        assert_eq!((docs["app"].as_u64(), docs["fromOtherApps"].as_u64()), (Some(15368), Some(1)));
+        assert_eq!((v["checks"]["allRequiredPassed"].clone(), v["checks"]["allRequiredPassedNow"].clone()), (json!(false), json!(false)), "missing never passes");
+        assert_eq!(v["checks"]["failing"], json!(["docs", "late", "lint", "other"]), "failing by the merge, by name and app; later results don't hide them");
+        assert_eq!(v["checks"]["runs"].as_array().unwrap().len(), 8, "every run is listed");
+        assert_eq!((v["checks"]["runs"][5]["beforeMerge"].clone(), v["checks"]["runs"][6]["beforeMerge"].clone()), (json!(true), json!(false)));
+
+        let pinned = Required { checks: BTreeMap::from([("docs".into(), Some(15368))]), approvals: None };
+        let other_app_only = vec![run(9, "docs", "success", "2026-10-09T11:00:00Z", 999)];
+        let v = pull_view(&pr(), &[], &other_app_only, &[json!({ "id": 5, "context": "docs", "state": "success", "created_at": "2026-10-09T11:00:00Z" })], &pinned, true);
+        assert_eq!((v["checks"]["required"][0]["passed"].clone(), v["checks"]["required"][0]["found"].clone()), (json!(false), json!(false)), "another app's run or a status never stands in for a pinned app");
+        assert_eq!(pull_view(&pr(), &[], &runs, &statuses, &Required::default(), true)["checks"]["allRequiredPassed"], Value::Null, "nothing required");
     }
 
     #[test]
@@ -779,29 +876,30 @@ mod tests {
         let unprotected = json!({ "protected": false, "protection": { "enabled": false, "required_status_checks": { "enforcement_level": "off", "contexts": [] } } });
         let (v, req) = protection("main", &unprotected, &Ok(vec![]), &Err(404));
         assert_eq!(req, Required::default());
-        assert_eq!(v["summary"], json!({ "pullRequestRequired": false, "requiredApprovals": null, "requiredChecks": [], "forcePushesBlocked": false, "deletionsBlocked": false, "adminsIncluded": null }));
+        assert_eq!(v["summary"], json!({ "pullRequestRequired": false, "requiredApprovals": null, "requiredChecks": [], "requiredCheckApps": {}, "forcePushesBlocked": false, "deletionsBlocked": false, "adminsIncluded": null }));
         assert_eq!(v["classic"]["available"], false);
 
         let rules = vec![
             json!({ "type": "pull_request", "parameters": { "required_approving_review_count": 1 }, "ruleset_id": 9 }),
-            json!({ "type": "required_status_checks", "parameters": { "required_status_checks": [{ "context": "rust" }] } }),
+            json!({ "type": "required_status_checks", "parameters": { "required_status_checks": [{ "context": "rust", "integration_id": 15368 }] } }),
             json!({ "type": "deletion" }),
         ];
         let shown = json!({ "protected": true, "protection": { "enabled": true, "required_status_checks": { "enforcement_level": "non_admins", "contexts": ["docs"] } } });
         let (v, req) = protection("main", &shown, &Ok(rules.clone()), &Err(403));
-        assert_eq!(req.checks, BTreeSet::from(["docs".to_string(), "rust".to_string()]));
+        assert_eq!(req.checks, BTreeMap::from([("docs".to_string(), None), ("rust".to_string(), Some(15368))]), "the app a ruleset pins is kept");
+        assert_eq!(v["summary"]["requiredCheckApps"], json!({ "rust": 15368 }));
         assert_eq!(req.approvals, Some(1));
         assert_eq!((v["summary"]["deletionsBlocked"].clone(), v["summary"]["forcePushesBlocked"].clone()), (json!(true), Value::Null), "classic hidden: unknown, not false");
 
         let classic = json!({
-            "required_status_checks": { "strict": true, "contexts": ["server"], "checks": [{ "context": "server" }] },
+            "required_status_checks": { "strict": true, "contexts": ["server"], "checks": [{ "context": "server", "app_id": 77 }] },
             "required_pull_request_reviews": { "required_approving_review_count": 2, "dismiss_stale_reviews": true, "dismissal_restrictions": { "users": [{ "login": "x" }] } },
             "enforce_admins": { "enabled": true }, "allow_force_pushes": { "enabled": false }, "allow_deletions": { "enabled": true },
             "restrictions": { "users": [{ "login": "someone" }] },
         });
         let (v, req) = protection("main", &shown, &Ok(rules), &Ok(classic));
         assert_eq!(req.approvals, Some(2));
-        assert!(req.checks.contains("server"));
+        assert_eq!(req.checks.get("server"), Some(&Some(77)), "classic protection's app is kept");
         assert_eq!(v["summary"]["forcePushesBlocked"], true);
         assert_eq!(v["summary"]["deletionsBlocked"], true, "a ruleset blocks it even where classic allows it");
         assert_eq!(v["summary"]["adminsIncluded"], true);
@@ -827,7 +925,13 @@ mod tests {
         fake.0.insert("next-1".into(), (json!([page(3, "2026-10-04T00:00:00Z", None), page(2, "2026-10-03T00:00:00Z", Some("2026-09-30T23:59:59Z")), page(1, "2026-09-30T00:00:00Z", Some("2026-09-30T00:00:00Z"))]), Some("never".into())));
         let got: Vec<u64> = merged(&mut fake, "o/r", "main", &period()).unwrap().iter().map(|p| p["number"].as_u64().unwrap()).collect();
         assert_eq!(got, vec![4]);
-        assert_eq!(fake.1, vec![first, "next-1".to_string()], "the page past the first old update isn't read");
+        assert_eq!(fake.1, vec![first.clone(), "next-1".to_string()], "the page past the first old update isn't read");
+
+        let mut endless = Fake(HashMap::new(), Vec::new());
+        endless.0.insert(first.clone(), (json!([page(9, "2026-10-20T00:00:00Z", Some("2026-10-20T00:00:00Z"))]), Some(first)));
+        let err = merged(&mut endless, "o/r", "main", &period()).unwrap_err();
+        assert!(err.message.contains("pages"), "a list cut short is an error, never a short list: {}", err.message);
+        assert_eq!(endless.1.len(), MAX_PAGES);
     }
 
     #[test]

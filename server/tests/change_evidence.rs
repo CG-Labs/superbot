@@ -77,6 +77,8 @@ async fn github(State(m): State<Arc<Mock>>, uri: Uri, headers: HeaderMap) -> Res
                 _ => reply(500, r#"{"message":"page 3 is past the period and must not be read"}"#.into(), None),
             }
         }
+        "/pulls/102" => ok("pull-102.json"),
+        "/pulls/101" => ok("pull-101.json"),
         "/pulls/102/reviews" => ok("reviews-102.json"),
         "/pulls/101/reviews" => ok("reviews-101.json"),
         "/actions/runs" => {
@@ -87,10 +89,19 @@ async fn github(State(m): State<Arc<Mock>>, uri: Uri, headers: HeaderMap) -> Res
             assert_eq!((q["sha"].as_str(), q["since"].as_str(), q["until"].as_str()), ("main", "2026-10-01T00:00:00Z", "2026-11-01T00:00:00Z"));
             ok("commits.json")
         }
-        r if r == format!("/commits/{HEAD102}/check-runs") => ok("check-runs-102.json"),
-        r if r == format!("/commits/{HEAD101}/check-runs") => ok("check-runs-101.json"),
-        r if r == format!("/commits/{HEAD102}/status") => ok("status-102.json"),
-        r if r == format!("/commits/{HEAD101}/status") => ok("status-101.json"),
+        r if r.ends_with("/check-runs") => {
+            assert_eq!(q.get("filter").map(String::as_str), Some("all"), "every run, not only the latest");
+            match r.strip_prefix("/commits/").and_then(|x| x.strip_suffix("/check-runs")) {
+                Some(HEAD102) => ok("check-runs-102.json"),
+                Some(HEAD101) => ok("check-runs-101.json"),
+                _ => reply(404, r#"{"message":"Not Found"}"#.into(), None),
+            }
+        }
+        r if r == format!("/commits/{HEAD102}/statuses") => ok("statuses-102.json"),
+        r if r == format!("/commits/{HEAD101}/statuses") => match q.get("page").map(String::as_str) {
+            None => reply(200, fixture("statuses-101-page1.json"), Some(format!("<{base}{REPO}/commits/{HEAD101}/statuses?per_page=100&page=2>; rel=\"next\""))),
+            _ => ok("statuses-101-page2.json"),
+        },
         r if r == format!("/commits/{DIRECT}/pulls") => ok("commit-pulls-direct.json"),
         _ => reply(404, r#"{"message":"Not Found"}"#.into(), None),
     }
@@ -207,16 +218,21 @@ fn exports_merged_pull_requests_checks_protection_and_runs_as_a_checkable_bundle
     assert_eq!(p102["postMergeRuns"][0]["id"], 9001);
     assert_eq!(p101["approvers"], serde_json::json!([]), "approved only after the merge");
     assert_eq!(p101["reviews"][1]["beforeMerge"], false);
-    assert_eq!(p101["checks"]["failing"], serde_json::json!(["docs"]));
+    assert_eq!(p101["mergedBy"], "author-b", "from the pull request itself; the list leaves it out");
+    assert_eq!(p101["checks"]["failing"], serde_json::json!(["ci/extra", "docs"]), "a failing status on the second page counts");
+    let docs = p101["checks"]["required"].as_array().unwrap().iter().find(|r| r["name"] == "docs").unwrap();
+    assert_eq!((docs["passed"].as_bool(), docs["passedNow"].as_bool(), docs["fromOtherApps"].as_u64()), (Some(false), Some(true), Some(1)), "another app's pass doesn't count, and the re-run after the merge passed only then");
     assert_eq!(p101["checks"]["statuses"][0]["context"], "ci/legacy");
     assert_eq!(prs["exceptions"]["noIndependentApproval"], serde_json::json!([101]));
     assert_eq!(prs["exceptions"]["requiredChecksNotPassed"], serde_json::json!([101]));
+    assert_eq!(prs["exceptions"]["requiredChecksPassedOnlyAfterMerge"], serde_json::json!([101]));
     assert_eq!(prs["exceptions"]["directCommits"], serde_json::json!([DIRECT]));
     assert_eq!((prs["summary"]["merged"].as_u64(), prs["summary"]["commitsOnBranch"].as_u64()), (Some(2), Some(3)));
     assert_eq!(prs["periodCovered"]["days"], 31);
 
     let bp = json(&folder, "branch-protection.json");
     assert_eq!(bp["summary"]["requiredChecks"], serde_json::json!(["docs", "rust"]));
+    assert_eq!(bp["summary"]["requiredCheckApps"], serde_json::json!({ "docs": 15368, "rust": 15368 }));
     assert_eq!((bp["summary"]["requiredApprovals"].as_u64(), bp["summary"]["forcePushesBlocked"].as_bool(), bp["summary"]["deletionsBlocked"].as_bool()), (Some(1), Some(true), Some(true)));
     assert_eq!((bp["classic"]["available"].as_bool(), bp["classic"]["status"].as_u64()), (Some(false), Some(403)), "a read-only token can't see classic protection; said so");
     assert!(bp["snapshotAt"].is_string());

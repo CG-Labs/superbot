@@ -17,12 +17,6 @@
     "closed_at": "2026-11-02T08:00:00Z",
     "merged_at": "2026-11-02T08:00:00Z",
     "merge_commit_sha": "b103b103b103b103b103b103b103b103b103b103",
-    "merged_by": {
-      "login": "maintainer-m",
-      "id": 38766,
-      "type": "User",
-      "site_admin": false
-    },
     "head": {
       "ref": "feature-103",
       "sha": "a103a103a103a103a103a103a103a103a103a103"
@@ -52,12 +46,6 @@
     "closed_at": "2026-10-20T15:04:05Z",
     "merged_at": "2026-10-20T15:04:05Z",
     "merge_commit_sha": "b102b102b102b102b102b102b102b102b102b102",
-    "merged_by": {
-      "login": "maintainer-m",
-      "id": 38766,
-      "type": "User",
-      "site_admin": false
-    },
     "head": {
       "ref": "feature-102",
       "sha": "a102a102a102a102a102a102a102a102a102a102"

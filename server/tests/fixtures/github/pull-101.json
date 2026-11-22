@@ -1,0 +1,36 @@
+{
+  "url": "https://api.github.com/repos/example-org/example-repo/pulls/101",
+  "html_url": "https://github.com/example-org/example-repo/pull/101",
+  "number": 101,
+  "state": "closed",
+  "title": "Fix the docs link",
+  "user": {
+    "login": "author-b",
+    "id": 38182,
+    "type": "User",
+    "site_admin": false
+  },
+  "body": "Secret body: deploy notes for the reviewer only.",
+  "created_at": "2026-10-04T10:00:00Z",
+  "updated_at": "2026-10-06T10:00:00Z",
+  "closed_at": "2026-10-05T09:30:00Z",
+  "merged_at": "2026-10-05T09:30:00Z",
+  "merge_commit_sha": "b101b101b101b101b101b101b101b101b101b101",
+  "merged_by": {
+    "login": "author-b",
+    "id": 38182,
+    "type": "User",
+    "site_admin": false
+  },
+  "head": {
+    "ref": "feature-101",
+    "sha": "a101a101a101a101a101a101a101a101a101a101"
+  },
+  "base": {
+    "ref": "main",
+    "sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "author_association": "MEMBER",
+  "draft": false,
+  "merged": true
+}
