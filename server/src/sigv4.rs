@@ -65,7 +65,7 @@ pub fn signature(secret: &str, scope: &Scope, method: &str, uri: &str, query: &s
     let canonical_headers: String = h.iter().map(|(k, v)| format!("{k}:{}\n", v.trim())).collect();
     let canonical = format!("{method}\n{uri}\n{query}\n{canonical_headers}\n{signed}\n{payload_hash}");
     let to_sign = format!("AWS4-HMAC-SHA256\n{}\n{}\n{}", scope.amz_date, scope.credential(), sha256_hex(canonical.as_bytes()));
-    let k = mac(format!("AWS4{secret}").as_bytes(), scope.amz_date[..8].as_bytes());
+    let k = mac(format!("AWS4{secret}").as_bytes(), &scope.amz_date.as_bytes()[..8]);
     let k = mac(&k, scope.region.as_bytes());
     let k = mac(&k, scope.service.as_bytes());
     let k = mac(&k, b"aws4_request");

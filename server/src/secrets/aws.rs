@@ -674,6 +674,7 @@ mod tests {
     }
 
     /// The signature on a request, checked as Secrets Manager does.
+    #[allow(clippy::result_large_err)]
     fn verify(f: &Fake, h: &HeaderMap, body: &[u8]) -> Result<(), Response> {
         let header = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
         let auth = header("authorization");
