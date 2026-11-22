@@ -178,7 +178,8 @@ fn the_console_asks_before_stopping_a_service_account_and_keeps_no_token() {
     for kept in ["localStorage", "sessionStorage", "document.cookie"] {
         assert!(!CONSOLE_JS.contains(kept), "the console keeps something in {kept}");
     }
-    let secrets: Vec<&str> = lines.iter().map(|l| l.trim()).filter(|l| l.contains("r.token") && !l.contains("r.tokenInfo")).collect();
+    let secret = |l: &str| l.match_indices("r.token").any(|(i, m)| !l[i + m.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_'));
+    let secrets: Vec<&str> = lines.iter().map(|l| l.trim()).filter(|l| secret(l)).collect();
     assert!(!secrets.is_empty() && secrets.iter().all(|l| l.contains("value: r.token")), "a token's secret goes somewhere but the shown-once dialog: {secrets:?}");
 }
 
