@@ -160,8 +160,15 @@ async fn holds_are_admin_only_audited_and_stop_the_bot_being_deleted() {
         assert!(body.contains("retention hold"), "{body}");
     }
     assert!(app.db.bot(&bot).is_some());
+    // Nor can a Bot the held one wrote to, since its chat goes with it.
+    let (_, b) = call(port, "POST", "/api/bots", &member, &json!({ "name": "Peer" }).to_string()).await;
+    let peer = parse(&b)["id"].as_str().unwrap().to_string();
+    app.db.add_messages_at(&peer, 1, db::now(), Some(&bot));
+    let (code, body) = call(port, "DELETE", &format!("/api/bots/{peer}"), &member, "").await;
+    assert_eq!(code, 409, "{body}");
 
     assert_eq!(call(port, "DELETE", &hold, &admin, "").await.0, 200);
+    assert_eq!(call(port, "DELETE", &format!("/api/bots/{peer}"), &member, "").await.0, 200);
     let released = audit(port, &admin, "chat.hold_released").await;
     assert_eq!((released.len(), released[0]["details"]["reason"].as_str()), (1, Some("Litigation hold, extended")), "{released:?}");
     assert_eq!(call(port, "DELETE", &format!("/api/bots/{bot}"), &member, "").await.0, 200);

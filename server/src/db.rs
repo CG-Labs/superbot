@@ -1561,6 +1561,10 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 41] = [
     migrate_chat_retention,
 ];
 
+/// Whether Bot `?1` is held or has messages from a held Bot in its chat.
+const HELD_CHAT: &str = "(EXISTS (SELECT 1 FROM retention_holds WHERE bot_id = ?1)
+    OR EXISTS (SELECT 1 FROM messages WHERE bot_id = ?1 AND from_bot IN (SELECT bot_id FROM retention_holds)))";
+
 /// Chat retention (ADR 0098): Bots whose chat an admin holds out of retention, for a legal
 /// hold or any other reason, and an index so the deletion job finds old messages by age.
 /// A held Bot can't be deleted, so the hold goes only when an admin releases it.
@@ -3472,10 +3476,16 @@ impl Db {
         self.retention_hold(bot_id)
     }
 
-    /// Deletes the Bot unless it is held, in one statement, so a hold placed at any moment
-    /// before wins. Whether it was deleted.
+    /// Whether deleting the Bot would delete held chat: it is held, or a held Bot wrote into
+    /// its chat (deleting a Bot deletes every message in its chat).
+    pub fn bot_chat_held(&self, id: &str) -> bool {
+        self.c().query_row(&format!("SELECT {HELD_CHAT}"), [id], |r| r.get(0)).unwrap()
+    }
+
+    /// Deletes the Bot unless its chat is held (`bot_chat_held`), in one statement, so a hold
+    /// placed at any moment before wins. Whether it was deleted.
     pub fn delete_bot_unless_held(&self, id: &str) -> bool {
-        self.c().execute("DELETE FROM bots WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM retention_holds WHERE bot_id = ?1)", [id]).unwrap() > 0
+        self.c().execute(&format!("DELETE FROM bots WHERE id = ?1 AND NOT {HELD_CHAT}"), [id]).unwrap() > 0
     }
 
     /// Whether there was a hold to release.
@@ -7924,7 +7934,12 @@ mod tests {
         assert!(end.is_some() && end < end2, "the cursor moves forward");
         assert!(!db.delete_bot_unless_held(&held.id), "a held Bot isn't deleted");
         assert_eq!(db.message_count(&held.id), 3);
+        let to = db.create_bot("To", "#fff", "waddle", "claude", None, false);
+        db.add_messages_at(&to.id, 1, now(), Some(&held.id));
+        assert!(db.bot_chat_held(&to.id) && !db.delete_bot_unless_held(&to.id), "nor one a held Bot wrote to");
+        assert!(!db.bot_chat_held(&bot.id));
         db.delete_retention_hold(&held.id);
+        assert!(db.delete_bot_unless_held(&to.id));
         assert!(db.delete_bot_unless_held(&held.id));
         assert!(db.put_retention_hold(&held.id, "too late", None).is_none(), "no hold on a Bot that's gone");
 

@@ -2124,8 +2124,8 @@ async fn delete_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
     if bot.primary {
         return Err(bad("The primary Bot can't be deleted"));
     }
-    let held = || ApiError(StatusCode::CONFLICT, "This Bot's chat is held (a retention hold), so it can't be deleted until an admin releases the hold.".into());
-    if app.db.retention_hold(&id).is_some() {
+    let held = || ApiError(StatusCode::CONFLICT, "This Bot's chat is held (a retention hold on it, or on a Bot that wrote in its chat), so it can't be deleted until an admin releases the hold.".into());
+    if app.db.bot_chat_held(&id) {
         return Err(held());
     }
     app.stop(&id);
@@ -2135,7 +2135,7 @@ async fn delete_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
     machines::screens::close(&app, &by, &id, "bot_deleted").await;
     // A hold placed while the screen closed still wins: the Bot is stopped, but nothing is lost.
     if !app.db.delete_bot_unless_held(&id) {
-        return Err(if app.db.retention_hold(&id).is_some() { held() } else { not_found("Bot") });
+        return Err(if app.db.bot_chat_held(&id) { held() } else { not_found("Bot") });
     }
     notify::forget_bot(&app, &id);
     app.db.record(&by.event("bot.deleted").target("bot", &id).bot(&id).details(json!({ "name": bot.name, "harness": bot.harness })));
