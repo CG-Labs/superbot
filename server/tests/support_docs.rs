@@ -2,8 +2,8 @@
 //! pressure and what customers are promised, so they must stay true. Every link and
 //! anchor resolves and every `ADR NNNN` exists; the support tiers list every plan the
 //! shipped tiers file sells with the SLO's availability and recovery numbers; severity
-//! targets cover every plan; the runbooks keep their shape; every `botctl` command they
-//! name exists; and no contact person, email or phone number is invented: contacts are
+//! targets cover every plan; the runbooks keep their shape; the TAM cadence runs from
+//! kickoff through health checks to reviews; every `botctl` command they name exists; and no contact person, email or phone number is invented: contacts are
 //! placeholders the Provider fills in.
 
 use std::collections::{HashMap, HashSet};
@@ -159,6 +159,7 @@ fn sold() -> Vec<String> {
 fn every_link_in_the_playbooks_resolves() {
     let mut files = pages();
     files.push(repo().join("docs/adr/0131-support-bundle.md"));
+    files.push(repo().join("docs/adr/0144-tam-programme-and-health-score.md"));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links:\n{}", bad.join("\n"));
 }
@@ -218,7 +219,9 @@ fn severity_targets_cover_every_plan_and_severity() {
 
 #[test]
 fn runbooks_say_what_to_do_first_and_when_to_escalate() {
-    for name in ["runbook-sign-in.md", "runbook-machine-down.md", "runbook-harness-outage.md", "runbook-approvals-stuck.md"] {
+    let names: Vec<String> = pages().iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).filter(|n| n.starts_with("runbook-")).collect();
+    assert!(names.len() >= 9, "the runbooks: {names:?}");
+    for name in &names {
         let md = read(name);
         for heading in ["## First five minutes", "## Escalate when", "## Afterwards"] {
             assert!(md.lines().any(|l| l == heading), "{name} has no \"{heading}\"");
@@ -271,4 +274,21 @@ fn contacts_are_placeholders_never_invented() {
     }
     assert!(read("tiers.md").contains("<tam-name>"), "the named contact is a placeholder");
     assert!(read("escalation.md").contains("<on-call-pager>"), "the on-call route is a placeholder");
+    let tam = read("tam.md");
+    for placeholder in ["<tam-name>", "<tam-email>", "<backup-tam-name>"] {
+        assert!(tam.contains(placeholder), "tam.md lacks {placeholder}");
+    }
+}
+
+#[test]
+fn the_tam_cadence_runs_kickoff_health_checks_and_reviews() {
+    let tam = read("tam.md");
+    let cadence = tam.split("## Cadence").nth(1).expect("tam.md has a cadence").split("\n## ").next().unwrap();
+    for needle in ["(#kickoff-agenda)", "(health-check.md)", "(health-score.md)", "(qbr-template.md)", "Severity 1"] {
+        assert!(cadence.contains(needle), "the cadence lacks {needle}");
+    }
+    for page in ["health-check.md", "qbr-template.md"] {
+        let md = read(page);
+        assert!(md.contains("botctl health-score"), "{page} doesn't start from the health score");
+    }
 }
