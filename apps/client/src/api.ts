@@ -6,7 +6,9 @@ import type {
   AppState,
   Approval,
   ApprovalScope,
+  AuditChainState,
   AuditPage,
+  AuditVerifyReport,
   BillingEmails,
   BillingView,
   BotAccessView,
@@ -691,6 +693,16 @@ export class SuperBotApi {
   async auditCsv(query: string): Promise<string> {
     const res = await this.send("GET", `/api/audit/export.csv${query ? `?${query}` : ""}`);
     return res.text();
+  }
+
+  /** The hash chain's head, signed checkpoints, timestamps, export lag and last check (ADR 0149). */
+  async auditChain(): Promise<AuditChainState> {
+    return this.request<AuditChainState>("GET", "/api/audit/chain");
+  }
+
+  /** Checks the whole chain now; the server records the result. */
+  async auditVerify(): Promise<AuditVerifyReport> {
+    return this.request<AuditVerifyReport>("GET", "/api/audit/verify");
   }
 
   // The access review: admins only (ADR 0099).
