@@ -100,6 +100,8 @@ mod machines_provider_backup_tests;
 mod machines_resize_tests;
 #[cfg(test)]
 mod machines_region_tests;
+#[cfg(test)]
+mod machines_residency_tests;
 mod passwd;
 mod plans;
 #[cfg(test)]
@@ -186,6 +188,8 @@ mod users_http_tests;
 mod sso_http_tests;
 #[cfg(test)]
 mod sso_saml_http_tests;
+#[cfg(test)]
+mod sso_saml_sp_http_tests;
 #[cfg(test)]
 mod sso_social_http_tests;
 #[cfg(test)]
@@ -599,6 +603,11 @@ async fn main() {
     for w in auth_state.machines.offsite.as_deref().map(|o| [o.warnings(), o.unreachable(&recorded)].concat()).unwrap_or_default() {
         log_warn!("WARNING: {w}");
     }
+    if auth_state.machines.enabled() {
+        for w in machines::residency::warnings(&app, &auth_state.machines) {
+            log_warn!("WARNING: {w}");
+        }
+    }
     if let Some(m) = auth_state.payments.meter() {
         let _ = app.meter.set(m);
     }
@@ -644,6 +653,7 @@ async fn main() {
             (true, false) => "on (set TURNSTILE_SECRET and TURNSTILE_SITE_KEY to add a bot check)",
         }
     );
+    auth_state.sso.load_saved(&app.db);
     for p in &auth_state.sso.providers {
         let ready = p.not_ready().unwrap_or_else(|| "ready".into());
         log_info!("SSO: {} ({}, {}), {ready}; {}; just-in-time sign-up {}.", p.id, p.label, p.type_name(), p.audience(), p.jit_role.map_or("off", |r| r.as_str()));
@@ -913,6 +923,10 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/auth/sso", get(sso::list))
         .route("/auth/sso/{id}/start", get(sso::start))
         .route("/auth/sso/{id}/callback", get(sso::callback).post(sso::callback_post))
+        .route("/auth/sso/{id}/acs", post(sso::acs))
+        .route("/auth/sso/{id}/metadata", get(sso::saml_metadata))
+        .route("/sso/{id}/saml", get(sso::saml_status))
+        .route("/sso/{id}/saml/idp-metadata", put(sso::saml_import))
         .route("/users", get(users::list_users).post(users::create_user))
         .route("/users/{key}", get(users::get_user).patch(users::update_user))
         .route("/users/{key}/login-codes", post(users::create_login_code))
@@ -931,6 +945,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/identities/{id}", delete(sso::unlink_identity))
         .route("/users/{key}/machine", get(machines::get).post(machines::request).delete(machines::destroy))
         .route("/users/{key}/region", get(machines::region::get_user).put(machines::region::set_user))
+        .route("/users/{key}/residency", get(machines::region::get_user).put(machines::residency::pin_user).delete(machines::residency::unpin_user))
         .route("/users/{key}/machine/suspend", post(machines::suspend))
         .route("/users/{key}/machine/resume", post(machines::resume))
         .route("/users/{key}/machine/resize", get(machines::resize::status).post(machines::resize))
@@ -980,6 +995,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/teams", get(teams::list).post(teams::create))
         .route("/teams/{id}", get(teams::get).patch(teams::update).delete(teams::delete))
         .route("/teams/{id}/region", get(machines::region::get_team).put(machines::region::set_team))
+        .route("/teams/{id}/residency", get(machines::region::get_team).put(machines::residency::pin_team).delete(machines::residency::unpin_team))
         .route("/teams/{id}/members/{user}", put(teams::put_member).delete(teams::delete_member))
         .route("/team", get(teams::mine))
         .route("/team/leave", post(teams::leave_mine))
@@ -1378,8 +1394,8 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     // Signing in, the page to do it on, the public site, and asking for access need no credentials.
     let open = match method {
         Method::GET | Method::HEAD => path == "/login" || sso_path(&path).is_some() || site_file(&path).is_some() || path == "/api/signups/config" || path == plans::JSON_PATH,
-        // Apple posts its answer to the callback (response_mode=form_post).
-        Method::POST => path == "/api/auth/login" || sso_path(&path) == Some("callback") || path == "/api/signups",
+        // Apple posts its answer to the callback (response_mode=form_post), SAML IdPs theirs to the ACS.
+        Method::POST => path == "/api/auth/login" || matches!(sso_path(&path), Some("callback" | "acs")) || path == "/api/signups",
         _ => false,
     };
     if open {
@@ -1460,11 +1476,12 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     res
 }
 
-/// `/api/auth/sso` (the list), `/api/auth/sso/{id}/start`, and `/api/auth/sso/{id}/callback`: which one.
+/// `/api/auth/sso` (the list), `/api/auth/sso/{id}/start`, `/api/auth/sso/{id}/callback`, and native
+/// SAML's `/api/auth/sso/{id}/acs` and `/api/auth/sso/{id}/metadata`: which one.
 fn sso_path(path: &str) -> Option<&str> {
     match path.strip_prefix("/api/auth/sso")? {
         "" => Some("list"),
-        rest => rest.strip_prefix('/').and_then(|r| r.split_once('/')).filter(|(id, step)| !id.is_empty() && !id.contains('/') && matches!(*step, "start" | "callback")).map(|(_, step)| step),
+        rest => rest.strip_prefix('/').and_then(|r| r.split_once('/')).filter(|(id, step)| !id.is_empty() && !id.contains('/') && matches!(*step, "start" | "callback" | "acs" | "metadata")).map(|(_, step)| step),
     }
 }
 

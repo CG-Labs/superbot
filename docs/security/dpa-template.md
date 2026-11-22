@@ -106,6 +106,8 @@ The Provider ensures that everyone it authorises to process Customer Personal Da
 
 11.2 Where Customer Personal Data is transferred outside the UK or EEA to a country without an adequacy decision, the parties rely on **[the EU Standard Contractual Clauses (Module 2 or 3), the UK International Data Transfer Addendum, or another mechanism]**, incorporated by reference, with **[completion details]**.
 
+11.3 **[Delete if not agreed.]** Where the parties agree data residency, [Annex IV](#annex-iv-data-residency) applies. It says what the Provider holds to the agreed region, what stays outside it, and how the Customer can check.
+
 ## 12. Liability, term and precedence
 
 12.1 Each party's liability under this DPA is subject to the limits in the Agreement, **[except where Data Protection Law does not allow it]**.
@@ -141,7 +143,7 @@ Measures SuperBot's code provides. "Default" says whether it is on without the P
 | Encryption in transit | HTTPS to the server (Caddy, automatic certificates); mutual TLS 1.3 between the server and each machine with a pinned per-machine certificate; HTTPS with certificate checks to outside services; model providers in the plan routing file must be `https://` or botd refuses to start. | On | [Data flows: in transit](data-flows.md#in-transit), [ADR 0031](../adr/0031-machine-enrollment-mtls.md), [ADR 0097](../adr/0097-model-providers-over-https.md) |
 | Encryption at rest | Secrets, approval inputs and push tokens sealed field by field with XChaCha20-Poly1305 under a master key kept outside the data folder and out of backups; the key can be rotated. The whole database is encrypted with SQLCipher under a key derived from the same master key. Files beside it (Bots' memory, user notes), the workspace and machine disks are not encrypted by SuperBot. **[Provider: state the host disk encryption you use.]** | On (sealed fields); database: on for new installs (`SUPERBOT_DATABASE_ENCRYPTION`) | [`server/src/secrets/sealed.rs`](../../server/src/secrets/sealed.rs), [`server/src/database_encryption.rs`](../../server/src/database_encryption.rs), [ADR 0010](../adr/0010-secrets.md), [ADR 0096](../adr/0096-master-key-rotation.md), [ADR 0116](../adr/0116-database-encrypted-at-rest.md) |
 | Encrypted backups | Server backups and their off-host copies encrypted with age on new installs; plain backups are warned about, audited and can be refused (`SUPERBOT_BACKUP_ENCRYPTION=required`). Incus machine backups are encrypted only with `MACHINE_BACKUP_AGE_RECIPIENTS` (**setting**). | On for new installs | [ADR 0114](../adr/0114-backups-encrypted-by-default.md), [ADR 0071](../adr/0071-off-host-machine-backups.md) |
-| Authentication | SSO with Microsoft Entra ID, Google, Apple, GitHub, OIDC, and SAML through a broker; just-in-time accounts only from an allow-list; sessions stored only as hashes and ended after 7 days idle or 30 days; sign-in failures rate-limited. | On | [Access control: authentication](access-control.md#authentication), [ADR 0012](../adr/0012-users-sessions-rbac.md), [ADR 0103](../adr/0103-sso-jit-needs-an-allow-list.md) |
+| Authentication | SSO with Microsoft Entra ID, Google, Apple, GitHub, OIDC, and SAML (natively or through a broker); just-in-time accounts only from an allow-list; sessions stored only as hashes and ended after 7 days idle or 30 days; sign-in failures rate-limited. | On | [Access control: authentication](access-control.md#authentication), [ADR 0012](../adr/0012-users-sessions-rbac.md), [ADR 0103](../adr/0103-sso-jit-needs-an-allow-list.md) |
 | Multi-factor authentication | TOTP with recovery codes for sign-in codes and the break-glass password, required for admins or everyone by policy (**setting**: `AUTH_MFA` or the admin policy). SSO sign-ins rely on the IdP's MFA, which the Customer enforces at its IdP. | Off | [ADR 0094](../adr/0094-totp-second-factor.md) |
 | Authorisation | Roles (admin, member, read-only); every API route classified, unclassified routes admin-only, checked by a test that walks the router; per-Bot sharing grants; each run gets its own short-lived token. Under the approval policy's `ask` mode, risky agent actions (destructive commands, deletes, outbound messages, installs, `git push`) wait for a person's approval and are refused if the check fails; admins can set classes to allow, save allow rules that skip asking, or switch a Bot or the server to `bypass`. New installs start in `ask`; servers installed before approvals existed start in `bypass`. **[Provider: confirm your global policy is `ask` and review allow rules and per-Bot overrides before keeping this promise.]** | Roles and tokens on; approvals on for new installs (**setting**) | [Access control: authorization](access-control.md#authorization), [ADR 0007](../adr/0007-approvals.md), [ADR 0017](../adr/0017-bot-acls.md), [ADR 0083](../adr/0083-per-run-tokens.md), [`server/src/auth_review_http_tests.rs`](../../server/src/auth_review_http_tests.rs) |
 | Isolation between users | One machine per user (Linode VM or Incus container); a Bot runs only on its owner's machine. Incus containers are unprivileged and firewalled from each other, the host and private ranges. Running Bots as an unprivileged user and teammates as their own OS users on machines, and the Linode Cloud Firewall, are **settings** (`MACHINE_BOT_USER`, `MACHINE_TEAMMATE_USERS`, `MACHINE_FIREWALL`). Tested in CI on real hosts. | Partly on | [Access control: isolation](access-control.md#isolation-between-users), [ADR 0036](../adr/0036-bots-on-the-users-machine.md), [ADR 0065](../adr/0065-incus-container-machines.md), [ADR 0035](../adr/0035-machine-firewall-auto-enroll.md) |
@@ -171,7 +173,7 @@ Measures SuperBot's code provides. "Default" says whether it is on without the P
 | [Hosting provider for the SuperBot server] | The control plane (botd, its database and files) | Everything the server stores: accounts, chat history, Bot memory, secrets (sealed), the audit log, server backups on the host | [Region] | [Mechanism] |
 | [Hosting provider, e.g. Linode (Akamai), or the Incus hosts' provider] | Users' machines | Everything on a user's machine: working folder, Bot memory, harness logins | [The Customer's data region] | [Mechanism] |
 | [Object storage provider] | Off-host server and machine backups | Full copies of the server's data and machines' disks, encrypted as Annex II says | [Server backups: the control plane's region. Machine backups: the Customer's data region] | [Mechanism] |
-| [Model provider(s) in the plan routing file] | Running Bots | Prompts, conversation, tool output and file contents the harness sends | [Region] | [Mechanism] |
+| [Model provider(s) in the plan routing file, each with the endpoint used] | Running Bots | Prompts, conversation, tool output and file contents the harness sends | [Region where the provider processes and stores it, from the provider's terms for that endpoint; "global" or "any" if it gives no region. See [Annex IV.4](#iv4-model-providers)] | [Mechanism] |
 | [Payment processor, e.g. Stripe] | Billing | User and team ids, plan, email for a new customer, token counts, seat counts; card details entered at the processor | [Region] | [Mechanism] |
 | [Push service, e.g. Expo, then Apple and Google] | Push notifications, if offered | Device token, a title and a line naming the Bot | [Region] | [Mechanism] |
 | [Email provider (SMTP)] | Approval and billing emails | Recipient email and the notice's text | [Region] | [Mechanism] |
@@ -180,3 +182,67 @@ Measures SuperBot's code provides. "Default" says whether it is on without the P
 | [Bot check on the signup form, e.g. Cloudflare Turnstile] | Access requests, if enabled | The visitor's challenge answer and IP address | [Region] | [Mechanism] |
 
 Harness logins a user makes with their own Claude or ChatGPT subscription go to that provider under the user's own account, not as the Provider's Subprocessor ([ADR 0041](../adr/0041-machine-harness-logins-and-folder-copy.md)). **[Legal review: confirm this treatment.]**
+
+## Annex IV: Data residency
+
+**[Delete this annex if no data residency is agreed.]** It applies under [Section 11.3](#11-international-transfers) and states only what SuperBot's code does ([ADR 0129](../adr/0129-contractual-data-residency.md), [ADR 0117](../adr/0117-uk-eu-data-regions.md)). Anything it doesn't cover is listed in IV.2 and IV.4; do not promise more in the Agreement.
+
+### IV.1 The agreed region
+
+- **Agreed Region**: **[e.g. the United Kingdom: London (`gb-lon`); or the EU: Frankfurt (`de-fra-2`)]**
+- **Covered**: **[the Customer's team "[team name]" in the Service, or the named users: [list]]**
+- **Reference**: **[the reference recorded with the pin, e.g. this DPA's number and date]**
+
+The Provider pins the covered team or users to the Agreed Region in the Service, with the reference above. The Service refuses the pin unless their machines and machine backups are all in the Agreed Region already and the Service has hosts and a backup store there. While the pin holds:
+
+(a) users' machines are made, restored and moved only on hosts in the Agreed Region;
+
+(b) machine backups go only to a backup store in the Agreed Region. If none is available, the backup does not happen, and the Provider is alerted when a machine misses its recovery point; it is never sent elsewhere instead;
+
+(c) a restore from a backup kept outside the Agreed Region, or onto a host outside it, is refused, including when a host is lost;
+
+(d) the covered team's and users' data region can't be changed, and nobody whose machine or backups are outside the Agreed Region can join the covered team;
+
+(e) every pin, unpin and refusal is recorded in the audit log, with the reference.
+
+### IV.2 What the pin doesn't cover
+
+| Data | Where it is | Note |
+|------|-------------|------|
+| The control plane: the Service's database (accounts, chat history, routines, sealed secrets, the audit log), the files beside it, and server backups | **[Where the Provider runs the server and keeps its backups, e.g. also London]** | The pin doesn't move or hold these. They are in the Agreed Region only if the Provider runs the server and its backup store there; say so here only if it does. |
+| Model calls | [IV.4](#iv4-model-providers) | Bots send prompts, conversation, tool output and file contents to the model provider of the plan. |
+| Push notifications, email, webhooks, billing and sign-in | As [Annex III](#annex-iii-subprocessors) says | |
+| Harness logins with a person's own subscription | The model provider, under the person's own account | Not the Provider's Subprocessor (Annex III). |
+| Support access | **[Where staff who can reach Customer Personal Data are, and how that access is controlled and logged]** | |
+
+### IV.3 Changes
+
+- The Provider unpins the covered team or users, or changes the Agreed Region, only on the Customer's documented instructions **[or: on [number] days' written notice]**. Unpinning records a reason in the audit log and moves nothing by itself.
+- Moving to another region is a transfer the Customer agrees to first: machines are destroyed, their backups deleted on request ([ADR 0108](../adr/0108-deleting-a-destroyed-machines-backups.md)), the region changed, and new machines made.
+- A user who leaves a covered team is no longer held by the team's pin; their machine and backups stay where they are. **[Provider: if the agreement covers people after they leave, pin them individually before they leave.]**
+- If the Service can no longer keep the data in the Agreed Region (for example, the region's backup store is unavailable), it refuses backups and restores rather than using another region, and logs a warning. The Provider tells the Customer within **[time]** and restores in-region storage. Recovery points may be missed meanwhile.
+
+### IV.4 Model providers
+
+The pin does not change or check where model calls go. Each plan's routes, set by the Provider, decide the provider and endpoint ([data flows: model providers](data-flows.md#model-providers-through-tier-routing)). **[Provider: list every provider and endpoint the Customer's plan can route to, including fallbacks.]**
+
+| Provider and endpoint | Where it processes | Where it stores | Source |
+|-----------------------|--------------------|-----------------|--------|
+| [e.g. a Claude model through a cloud platform's regional endpoint in [region]] | [Region] | [Region, or "not stored" with the retention the provider states] | [Link to the provider's terms] |
+
+Facts to check against, as of November 2026. Confirm each provider's current terms before signing, and do not promise UK or EU processing of model calls unless every route in the plan gives it:
+
+- **Anthropic's own API** offers US-only processing or global processing. It has no UK or EU option.
+- **Claude through a cloud platform** (Amazon Bedrock, Google Vertex AI, Microsoft Foundry): the platform's region for the endpoint decides. Cross-region or global inference options can process outside it; use a regional endpoint and check the model is offered there.
+- **OpenAI's API** offers data residency per project to eligible customers, by arrangement with OpenAI. Its Europe region stores and processes in the EEA or Switzerland. Its UK region stores in the UK but does not promise processing there. Some system data is excluded.
+- **Routers** (for example OpenRouter) forward to upstream providers. Treat them as having no region unless their terms say otherwise.
+
+SuperBot doesn't yet hold a pinned Customer's plan to in-region routes ([#58](https://github.com/CG-Labs/superbot/issues/58)). **[Provider: say how you keep the Customer on the endpoints above, for example a plan whose routes use only them, or delete the in-region promise for model calls.]**
+
+### IV.5 Evidence
+
+On request **[or: every [period]]**, under [Section 9](#9-assistance-records-and-audits), the Provider gives the Customer:
+
+- the audit log entries for the covered team and users, filtered by action and exported as CSV: `user.residency_pinned`, `team.residency_pinned`, `user.residency_unpinned`, `team.residency_unpinned`, the `*_pin_refused` and `*_change_refused` entries, `team.join_refused`, `team.delete_refused` and `machine.residency_refused`;
+- the regions view (`botctl regions`, or the admin API): each pin, its reference, and any warning that the Service can't keep it;
+- for each machine, its region and host, and for each backup, the store and region it was kept in.
