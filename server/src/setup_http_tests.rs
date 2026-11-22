@@ -57,6 +57,8 @@ async fn a_fresh_install_reports_what_it_lacks() {
     // Nor has this test server checked its database's encryption (ADR 0116).
     assert_eq!(check(&s, "database_encryption")["done"], false);
     assert_eq!((s["done"].as_u64(), s["total"].as_u64()), (Some(4), Some(9)));
+    // Secrets from the environment and the sealed store only (ADR 0136).
+    assert_eq!((s["secretsBackend"]["backend"].as_str(), s["secretsBackend"]["ok"].as_bool()), (Some("local"), Some(true)));
 }
 
 #[tokio::test]
