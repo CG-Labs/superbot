@@ -1251,6 +1251,13 @@ fn run(args: &[String]) -> Result<String, String> {
         ["machine", "harness-logins", user] => op("GET", &format!("{}/harness-logins", login_base(user)), None),
         ["machine", "harness-logout", user, harness] => op("DELETE", &format!("{}/harness-logins/{}", login_base(user), encode(harness)), None),
         ["machine", "legacy"] => op("GET", "/api/machines/legacy", None),
+        [..] if egress_request(&a).is_some() => {
+            let (method, path, body) = egress_request(&a).unwrap();
+            op(method, &path, body)
+        }
+        ["machine" | "user", "egress", ..] => {
+            Err("Usage: botctl machine egress [open|allow <host|cidr>...] | botctl user egress <user> [inherit|open|allow <host|cidr>...]".into())
+        }
         ["machine", rest @ ..] if matches!(rest.first(), Some(&("backups" | "backup" | "restore" | "delete-backups" | "recovery" | "hosts" | "host"))) => {
             let (method, path, body) = backup_request(rest, |f| std::fs::read_to_string(f).map_err(|e| format!("--identity {f}: {e}")))?;
             op(method, &path, body)
@@ -1305,13 +1312,6 @@ fn run(args: &[String]) -> Result<String, String> {
         [..] if region_request(&a).is_some() => {
             let (method, path, body) = region_request(&a).unwrap();
             op(method, &path, body)
-        }
-        [..] if egress_request(&a).is_some() => {
-            let (method, path, body) = egress_request(&a).unwrap();
-            op(method, &path, body)
-        }
-        ["machine" | "user", "egress", ..] => {
-            Err("Usage: botctl machine egress [open|allow <host|cidr>...] | botctl user egress <user> [inherit|open|allow <host|cidr>...]".into())
         }
         ["user", "add", email, rest @ ..] => {
             let name = rest.first().filter(|n| !n.starts_with("--"));
@@ -1747,6 +1747,9 @@ mod tests {
         );
         for other in [&["machine", "egress", "allow"][..], &["user", "egress", "u1", "closed"], &["user", "egress"], &["machine", "egress", "shut"]] {
             assert_eq!(egress_request(other), None, "{other:?}");
+            let args: Vec<String> = other.iter().map(|s| s.to_string()).collect();
+            let e = run(&args).unwrap_err();
+            assert!(e.starts_with("Usage: botctl machine egress"), "{other:?} reached another command: {e}");
         }
     }
 
