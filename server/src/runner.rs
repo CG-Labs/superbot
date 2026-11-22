@@ -865,9 +865,13 @@ impl App {
     }
 
     /// Fail closed: no run without the secrets an external store couldn't give (ADR 0125).
-    fn refuse_for_secrets(&self, bot: &Bot, msg: &Message, by: &crate::audit::Who, e: &crate::secrets::Error) {
+    /// `period`: the billing period whose run was already taken, given back too.
+    fn refuse_for_secrets(&self, bot: &Bot, msg: &Message, by: &crate::audit::Who, e: &crate::secrets::Error, period: Option<&str>) {
         crate::obs::log::log_warn!("Bot {}: not run, because its secrets couldn't be read: {e}", bot.id);
-        self.give_back_routine(bot, msg);
+        match period {
+            Some(p) => self.give_back(bot, msg, p),
+            None => self.give_back_routine(bot, msg),
+        }
         let ev = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Failure);
         self.db.record(&ev.details(json!({ "reason": "secrets_unavailable", "owner": bot.owner_id, "messageId": msg.id })));
         self.say(&bot.id, "I didn't run this: the secret store can't be read right now, so I'd have no keys. Try again shortly, or ask an admin to check the server log.", true);
@@ -924,7 +928,7 @@ impl App {
         let space = match self.run_space_with(&bot, for_other.is_none()) {
             Ok(space) => space,
             Err(RunSpaceError::Folder) => return cant_run("This Bot's owner id isn't a safe folder name, so it can't run."),
-            Err(RunSpaceError::Secrets(e)) => return self.refuse_for_secrets(&bot, msg, &by, &e),
+            Err(RunSpaceError::Secrets(e)) => return self.refuse_for_secrets(&bot, msg, &by, &e, None),
         };
         self.requesters.lock().unwrap_or_else(|e| e.into_inner()).insert(bot.id.clone(), asker);
         if isolated {
@@ -1012,7 +1016,7 @@ impl App {
                     }
                     (cwd, env)
                 }
-                Err(e) => return self.refuse_for_secrets(&bot, msg, &by, &e),
+                Err(e) => return self.refuse_for_secrets(&bot, msg, &by, &e, Some(&period.key)),
             },
             Place::Here => space,
         };
