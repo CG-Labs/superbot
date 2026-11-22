@@ -1410,6 +1410,11 @@ pub(crate) async fn request_as(app: &AppState, cp: &ControlPlane, by: &Who, key:
     // Held from here, so a region change can't land between reading it and making the machine.
     let _g = cp.ops.lock().await;
     let u = app.db.user(&u.id).ok_or_else(|| not_found("User"))?;
+    // Disabling them meanwhile looks for their machine under this lock (ADR 0124), so a
+    // request that waited here must not make one it would miss.
+    if !u.active() {
+        return Err(conflict("This user is disabled. Enable them before giving them a machine.".into()));
+    }
     // The region set for them or their team (ADR 0117) is where it goes, or nowhere.
     let home = region::effective(&app, cp, &u);
     if let Some(r) = asked_region.as_deref().filter(|r| home.binding() && *r != home.region) {

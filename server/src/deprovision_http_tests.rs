@@ -280,3 +280,51 @@ async fn a_run_token_acts_for_no_one_who_is_disabled() {
     let reasons: Vec<&str> = denied.iter().filter_map(|e| e["details"]["reason"].as_str()).collect();
     assert!(reasons.contains(&"for_user_disabled") && reasons.contains(&"owner_role"), "{denied:?}");
 }
+
+#[tokio::test]
+async fn a_resume_the_provider_refused_is_tried_again() {
+    let w = world(|_| {}).await;
+    let ada = provision(&w, "ada@example.com", "00u1").await;
+    let m = running_machine(&w, &ada).await;
+    set_active(&w, &ada, false).await;
+    w.fake.fail_next("boot", ProviderError::RateLimited);
+    set_active(&w, &ada, true).await;
+    assert_eq!(state(&w, &m), State::Suspended);
+    assert!(w.app.db.disable_hold(&m), "kept until it comes back on");
+    let pass = reconcile(&w).await;
+    assert_eq!(state(&w, &m), State::Running, "{pass}");
+    assert_eq!(pass["disabled"]["resumed"], 1, "{pass}");
+    assert!(!w.app.db.disable_hold(&m));
+}
+
+#[tokio::test]
+async fn a_machine_request_waiting_on_the_lock_makes_none_once_they_are_disabled() {
+    let w = world(|_| {}).await;
+    let ada = provision(&w, "ada@example.com", "00u1").await;
+    let cp = w.app.control_plane.get().unwrap().clone();
+    let lock = cp.lock_ops().await;
+    let (port, admin, who) = (w.port, w.admin.clone(), ada.clone());
+    let asked = tokio::spawn(async move { call(port, "POST", &format!("/api/users/{who}/machine"), &admin, "").await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    w.app.db.update_user(&ada, db::UserPatch { status: Some("disabled"), ..Default::default() }).unwrap();
+    drop(lock);
+    let (code, body) = asked.await.unwrap();
+    assert_eq!(code, 409, "{body}");
+    assert!(w.app.db.user_machine(&ada).is_none() && w.fake.machines().is_empty());
+}
+
+#[tokio::test]
+async fn a_run_for_someone_disabled_behind_its_back_acts_for_no_one_with_open_shared_bots() {
+    let w = world(|_| {}).await;
+    assert_eq!(w.app.shared_bots(), crate::acl::SharedBots::Open);
+    let al = provision(&w, "al@example.com", "00u2").await;
+    let session = session_for(w.port, &w.admin, &al).await;
+    let env = held_claude(&w.app);
+    let desk = w.app.db.create_bot_owned("Desk", "#fff", "waddle", "claude", None, false, users::OPERATOR, Visibility::Shared).id;
+    send(w.port, &session, &desk, "for me").await;
+    let t = run_token(&env).await;
+    assert_eq!(call(w.port, "GET", "/api/bots", &t, "").await.0, 200);
+    w.app.db.update_user(&al, db::UserPatch { status: Some("disabled"), ..Default::default() }).unwrap();
+    assert_eq!(call(w.port, "GET", "/api/bots", &t, "").await.0, 403);
+    w.app.stop(&desk);
+}

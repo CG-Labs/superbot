@@ -49,7 +49,17 @@ pub async fn user_disabled(app: &AppState, by: &Who, user_id: &str, via: &str) -
 /// running is held, and the reconciler powers it off once it is.
 async fn suspend(app: &AppState, by: &Who, user_id: &str, via: &str) -> Value {
     let Some(cp) = control_plane(app) else { return json!({ "state": "none" }) };
-    let Some(m) = app.db.user_machine(user_id) else { return json!({ "state": "none" }) };
+    // Under the lock machines are made under: a request already past its check has saved
+    // its machine by now, and one after it sees the user disabled and makes none.
+    let found = {
+        let _g = cp.lock_ops().await;
+        let m = app.db.user_machine(user_id);
+        if let Some(m) = m.as_ref().filter(|m| cp.suspend_on_disable && matches!(m.state, State::Running | State::Pending | State::Provisioning)) {
+            app.db.hold_for_disable(&m.id, user_id, via);
+        }
+        m
+    };
+    let Some(m) = found else { return json!({ "state": "none" }) };
     if !cp.suspend_on_disable {
         return json!({ "id": m.id, "state": "kept" });
     }
@@ -57,14 +67,8 @@ async fn suspend(app: &AppState, by: &Who, user_id: &str, via: &str) -> Value {
         State::Suspended if !app.db.disable_hold(&m.id) => "already_suspended",
         State::Suspended => "suspended",
         State::Destroying | State::Destroyed | State::Error => "gone",
-        State::Running => {
-            app.db.hold_for_disable(&m.id, user_id, via);
-            power_off(app, cp, by, user_id, &m.id).await
-        }
-        State::Pending | State::Provisioning => {
-            app.db.hold_for_disable(&m.id, user_id, via);
-            "held"
-        }
+        State::Running => power_off(app, cp, by, user_id, &m.id).await,
+        State::Pending | State::Provisioning => "held",
     };
     json!({ "id": m.id, "state": state })
 }
@@ -85,13 +89,23 @@ async fn power_off(app: &AppState, cp: &ControlPlane, by: &Who, user_id: &str, m
 pub async fn user_enabled(app: &AppState, by: &Who, user_id: &str) -> Option<&'static str> {
     let cp = control_plane(app)?;
     let m = app.db.user_machine(user_id)?;
-    if !app.db.drop_disable_hold(&m.id) {
+    if !app.db.disable_hold(&m.id) {
         return None;
     }
     Some(resume(app, cp, by, user_id, &m).await)
 }
 
+/// Resumes a held machine and ends its hold, unless the provider refused: then the hold
+/// stays, so the reconciler tries again.
 async fn resume(app: &AppState, cp: &ControlPlane, by: &Who, user_id: &str, m: &crate::db::Machine) -> &'static str {
+    let done = try_resume(app, cp, by, user_id, m).await;
+    if done != "failed" {
+        app.db.drop_disable_hold(&m.id);
+    }
+    done
+}
+
+async fn try_resume(app: &AppState, cp: &ControlPlane, by: &Who, user_id: &str, m: &crate::db::Machine) -> &'static str {
     if app.db.team_machine(&m.id).is_some_and(|t| t.released_at.is_some()) {
         return "team_released";
     }
@@ -118,7 +132,6 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
         };
         let by = system(&user_id);
         if !disabled(app, &user_id) {
-            app.db.drop_disable_hold(&machine_id);
             resumed += (resume(app, cp, &by, &user_id, &m).await == "resumed") as u32;
         } else if m.state == State::Running && cp.suspend_on_disable {
             suspended += (power_off(app, cp, &by, &user_id, &machine_id).await == "suspended") as u32;

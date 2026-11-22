@@ -1385,8 +1385,11 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
         if !owner.is_some_and(|u| rbac::allows(Principal::User(u.role), need)) {
             return denied("owner_role", "This Bot's owner can't do this.".into());
         }
-        // Nor anything for a teammate who has been disabled since the run began (ADR 0124).
-        if caller.bot_for.as_deref().is_some_and(|u| !app.db.user(u).is_some_and(|u| u.active())) {
+        // Nor anything for a person disabled since the run began (ADR 0124): the teammate the
+        // token is bound to, else whoever asked for the Bot's run, in any SHARED_BOTS mode.
+        let bound_off = caller.bot_for.as_deref().is_some_and(|u| !app.db.user(u).is_some_and(|u| u.active()));
+        let asker_off = || caller.bot.as_deref().and_then(|id| app.db.bot(id)).map(|b| app.requested_by(&b)).and_then(|u| app.db.user(&u)).is_some_and(|u| !u.active());
+        if bound_off || asker_off() {
             return denied("for_user_disabled", "The person this run is for is turned off.".into());
         }
     }

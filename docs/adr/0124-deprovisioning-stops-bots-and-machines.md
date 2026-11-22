@@ -33,20 +33,20 @@ It is safe to run twice. Entra and Okta often deactivate and then delete; the se
 
 ### Bot tokens act for no one who is disabled
 
-Next to the existing check that a Bot can do no more than its owner (403, `access.denied` with `owner_role`), a run token whose run is for a teammate who is now disabled is refused on every route (403, `access.denied` with `for_user_disabled`). Stopping the run already revokes its token when the run ends; this covers the moments between, and any path that disables someone without stopping their runs.
+Next to the existing check that a Bot can do no more than its owner (403, `access.denied` with `owner_role`), a run token whose run is for a person who is now disabled is refused on every route (403, `access.denied` with `for_user_disabled`): the teammate the token is bound to, or else whoever asked for the Bot's run, so it holds in every `SHARED_BOTS` mode. Stopping the run already revokes its token when the run ends; this covers the moments between, and any path that disables someone without stopping their runs.
 
 ### Their machine
 
 `MACHINE_ON_DISABLE`, read with the control plane: `suspend` (the default) or `keep`.
 
-- **Running**: suspended at once through the same path as an admin's suspend (`machine.suspended`, its certificates held), and marked with a **disable hold** (`machine_disable_holds`, migration 48).
+- **Running**: suspended at once through the same path as an admin's suspend (`machine.suspended`, its certificates held), and marked with a **disable hold** (`machine_disable_holds`, migration 48). The machine is looked up and held under the control plane's operations lock, and a machine request rechecks under that lock that its user is still active, so a request racing the disable can't leave a new machine on.
 - **Still being built** (`pending`, `provisioning`): held; the reconciler suspends it once it runs.
 - **The provider refused**: `failed`, the hold stays, and the reconciler tries again on its next pass (`disabled.suspended` in its result).
 - **Already suspended** without a hold (an admin did it, or a team released it): left alone, `already_suspended`, and no hold, so enabling them won't turn it on.
 - **Gone**, no machine, or no control plane: `gone` or `none`.
 - With `keep`: `kept`. It stays running and unreachable from botd, as before.
 
-**Enabling them** (SCIM `active: true`, re-provisioning after a `DELETE`, or an admin) ends the hold and resumes the machine (`machine.resumed`, and `user.machine_resumed` with whether it worked), unless a team released it meanwhile, which ADR 0087 already takes back or destroys. Only a machine the disable suspended comes back on. If someone is enabled by a path that doesn't call this, the reconciler sees the hold of an active user and does the same.
+**Enabling them** (SCIM `active: true`, re-provisioning after a `DELETE`, or an admin) resumes the machine and then ends the hold; if the provider refuses, the hold stays and the reconciler tries again (`disabled.resumed`) (`machine.resumed`, and `user.machine_resumed` with whether it worked), unless a team released it meanwhile, which ADR 0087 already takes back or destroys. Only a machine the disable suspended comes back on. If someone is enabled by a path that doesn't call this, the reconciler sees the hold of an active user and does the same.
 
 The machine is suspended, never destroyed. Deprovisioning is reversible in SCIM (Entra and Okta reactivate people), and a destroyed machine takes the user's files with it. Destroying it is still an admin's step, or erasure's.
 
