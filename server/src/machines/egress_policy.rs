@@ -262,11 +262,16 @@ pub async fn get_server(AppS(app): AppS<AppState>) -> Res {
     Ok(Json(server_view(&app)))
 }
 
+/// Held across a change's `fits` check and its write, so a server and a user change
+/// can't each fit alone and save a combined list too long for an agent.
+static SAVING: Mutex<()> = Mutex::new(());
+
 /// `PUT /api/machines/egress-policy` `{mode, allow}`: sets the server's, and sends every
 /// machine its policy.
 pub async fn set_server(AppS(app): AppS<AppState>, Extension(by): Extension<Who>, body: Result<Json<Saved>, JsonRejection>) -> Res {
     enrollment(&app)?;
     let to = checked(body, false)?;
+    let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
     for u in app.db.users() {
         if let Some(o) = own(&app, &u.id) {
             fits(&to, Some(&o), u.email.as_deref().unwrap_or(&u.id))?;
@@ -313,6 +318,7 @@ pub async fn set_user(AppS(app): AppS<AppState>, Extension(by): Extension<Who>, 
     enrollment(&app)?;
     let to = checked(body, true)?;
     let u = need_user_key(&app, &key)?;
+    let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
     fits(&server(&app), Some(&to).filter(|t| t.mode != INHERIT), "Their machine")?;
     let k = format!("{USER_KEY}{}", u.id);
     let from = load(&app, &k).unwrap_or(Saved { mode: INHERIT.into(), allow: vec![] });
