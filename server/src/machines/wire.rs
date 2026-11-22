@@ -434,7 +434,28 @@ pub struct Heartbeat {
     /// How full the disk holding the Bots' home is (ADR 0085). None before it said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk: Option<Disk>,
+    /// What its first boot hardened (ADR 0126). None if it wasn't, or before it said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardening: Option<Hardening>,
 }
+
+/// A machine's hardening (ADR 0126): each first-boot step's state (`ssh`, `kernel`,
+/// `updates`), whether this boot's harness egress rules are loaded, and whether
+/// updates wait on a reboot.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Hardening {
+    pub steps: BTreeMap<String, String>,
+    pub egress: bool,
+    pub reboot_required: bool,
+}
+
+pub const HARDENING_ON: &str = "on";
+/// Done as far as it can be: in a container the kernel's own settings are the host's.
+pub const HARDENING_PARTIAL: &str = "partial";
+/// Nothing to do: no SSH server, say.
+pub const HARDENING_NONE: &str = "none";
+pub const HARDENING_FAILED: &str = "failed";
 
 /// A disk's use, in bytes, as `statvfs` reports it: `used` is what is taken, root's
 /// reserve included, so it is what a smaller disk would have to hold.

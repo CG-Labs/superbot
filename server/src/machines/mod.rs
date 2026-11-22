@@ -18,6 +18,7 @@ pub mod enroll;
 pub mod fake;
 pub mod firewall;
 pub mod folder;
+pub mod hardening;
 pub mod hosts;
 pub mod incus;
 #[cfg(test)]

@@ -60,6 +60,8 @@ mod machines_backup_tests;
 #[cfg(test)]
 mod machines_bot_user_tests;
 #[cfg(test)]
+mod machines_hardening_tests;
+#[cfg(test)]
 mod machines_hosts_tests;
 #[cfg(test)]
 mod machines_http_tests;
