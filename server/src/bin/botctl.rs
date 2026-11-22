@@ -144,7 +144,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    it can't be deleted while held
   botctl retention release <bot>                   Retention applies to its chat again
   botctl backups                                   Where server backups are copied off this host, the
-                                                   newest copies, and the RPO (ADR 0109)
+                                                   newest copies, and the RPO (ADR 0109), and which
+                                                   backups are encrypted (ADR 0114)
   botctl backups copy                              Copy the newest archive off the host now, if it isn't
   botctl machine list [<state>]                    Every user's machine (pending, running, suspended, error, ... or all)
   botctl machine show <user>                       The user's machine: provider, plan, state, address, enrollment

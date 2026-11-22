@@ -52,7 +52,9 @@ async fn a_fresh_install_reports_what_it_lacks() {
     let backups = check(&s, "backups");
     assert_eq!(backups["done"], false);
     assert!(backups["detail"].as_str().unwrap().contains("stay on this host"), "{backups}");
-    assert_eq!((s["done"].as_u64(), s["total"].as_u64()), (Some(4), Some(7)));
+    // Nor are backups encrypted (ADR 0114).
+    assert_eq!(check(&s, "backup_encryption")["done"], false);
+    assert_eq!((s["done"].as_u64(), s["total"].as_u64()), (Some(4), Some(8)));
 }
 
 #[tokio::test]
@@ -111,7 +113,7 @@ async fn progress_is_saved_and_finishing_is_audited() {
     assert_eq!(actions, ["setup.reopened", "setup.completed", "setup.resumed", "setup.dismissed"], "steps alone aren't audited");
     let done = &ev[1];
     assert_eq!((done["actorId"].as_str(), done["targetType"].as_str()), (Some(users::OPERATOR), Some("setup")));
-    assert_eq!(done["details"]["open"], json!(["domain", "admin", "backups"]));
+    assert_eq!(done["details"]["open"], json!(["domain", "admin", "backups", "backup_encryption"]));
 }
 
 #[tokio::test]

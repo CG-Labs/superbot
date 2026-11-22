@@ -21,6 +21,9 @@ mod audit_http_tests;
 mod auth_review_http_tests;
 #[cfg(test)]
 mod backup_deletion_http_tests;
+mod backup_encryption;
+#[cfg(test)]
+mod backup_encryption_http_tests;
 #[cfg(test)]
 mod interface_http_tests;
 #[cfg(test)]
@@ -593,12 +596,22 @@ async fn main() {
     if let Some(w) = server_backups.warning() {
         log_warn!("WARNING: {w}");
     }
+    let machine_backups = control_plane.offsite.as_ref().map(|o| &o.s);
+    backup_encryption::check(&server_backups, machine_backups).unwrap_or_else(|e| exit(format!("Backup encryption: {e}")));
+    let backup_targets = backup_encryption::targets(&server_backups, machine_backups);
+    let (encryption_line, encryption_warnings) = backup_encryption::startup_lines(server_backups.encryption, &backup_targets);
+    log_info!("Backup encryption: {encryption_line} (ADR 0114).");
+    for w in encryption_warnings {
+        log_warn!("WARNING: {w}");
+    }
     let server_backups_summary = json!({
         "offHost": server_backups.target.is_some(),
         "mode": server_backups.mode.as_str(),
         "store": server_backups.target.as_ref().map(|t| t.source.as_str()),
         "rpoHours": server_backups.target.as_ref().map(|_| server_backups.rpo_ms / 3_600_000),
         "retentionDays": server_backups.target.as_ref().and(server_backups.retention_days),
+        "encryption": server_backups.encryption.as_str(),
+        "unencrypted": backup_targets.iter().filter(|t| !t.encrypted).map(|t| t.id).collect::<Vec<_>>(),
     });
     let _ = app.server_backups.set(Arc::new(server_backups));
     let router = router(app.clone(), auth_state);
@@ -645,6 +658,7 @@ async fn main() {
     audit::start_retention(app.clone(), retention);
     retention::start(app.clone(), chat_retention);
     server_backups::start(app.clone());
+    backup_encryption::start(app.clone());
     users::start_pruning(app.clone(), sessions);
     machines::hosts::load(&app, &control_plane).unwrap_or_else(|e| exit(format!("Incus hosts: {e}")));
     if observe.metrics.is_some() {

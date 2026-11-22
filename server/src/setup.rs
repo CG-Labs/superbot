@@ -342,6 +342,7 @@ fn report(app: &AppState, a: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -
         (n, false) => format!("{n} other admin{}; break-glass sign-in is off.", if n == 1 { "" } else { "s" }),
     };
     let (backed_up, backups_detail) = crate::server_backups::checklist(app);
+    let (encrypted, encryption_detail) = crate::backup_encryption::checklist(app);
     let checklist = vec![
         item("domain", "A public address with HTTPS", domain["ok"] == true, domain["detail"].as_str().unwrap_or_default()),
         item("signin", "Sign-in providers ready", sign_in["ok"] == true, sign_in["detail"].as_str().unwrap_or_default()),
@@ -356,6 +357,7 @@ fn report(app: &AppState, a: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -
             if ask { "On: Bots ask a person before risky actions." } else { "Off (bypass): Bots run risky actions without asking. Turn approvals on unless this is a dev machine." },
         ),
         item("backups", "Server backups copied off this host", backed_up, backups_detail),
+        item("backup_encryption", "Backups encrypted", encrypted, encryption_detail),
     ];
     let done = checklist.iter().filter(|c| c["done"] == true).count();
     let mut p = json!(progress);
