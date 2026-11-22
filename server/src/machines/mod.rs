@@ -18,6 +18,7 @@ pub mod enroll;
 pub mod fake;
 pub mod firewall;
 pub mod folder;
+pub mod hardening;
 pub mod hosts;
 pub mod incus;
 #[cfg(test)]
@@ -174,6 +175,9 @@ pub struct ControlPlane {
     provider: Option<Arc<dyn MachineProvider>>,
     /// Tier name to provider plan, in order; the first is the default.
     pub tiers: Vec<(String, String)>,
+    /// Tiers whose machines must have a kernel of their own (MACHINE_OWN_KERNEL_TIERS,
+    /// ADR 0120). Never set with a provider whose machines share their host's.
+    pub own_kernel_tiers: Vec<String>,
     /// Allowed regions; the first is the default.
     pub regions: Vec<String>,
     pub image: String,
@@ -204,6 +208,10 @@ pub struct ControlPlane {
     /// Off-host backups of machines to object storage (ADR 0071). None: off
     /// (MACHINE_BACKUP_S3_BUCKET).
     pub offsite: Option<Arc<backup::Offsite>>,
+    /// MACHINE_ON_DISABLE (ADR 0124): `suspend`, the default, powers a user's machine
+    /// off when they are disabled or deprovisioned, and back on when enabled; `keep`
+    /// leaves it running, unreachable from botd.
+    pub suspend_on_disable: bool,
     /// One change at a time, from handlers and the reconciler alike, so two can't
     /// race on one machine. Changes are rare and admin-driven; this is cheap.
     ops: tokio::sync::Mutex<()>,
@@ -217,6 +225,7 @@ impl Default for ControlPlane {
         ControlPlane {
             provider: None,
             tiers: parse_tiers(DEFAULT_TIERS).unwrap(),
+            own_kernel_tiers: Vec::new(),
             regions: Vec::new(),
             image: DEFAULT_IMAGE.into(),
             backups: true,
@@ -230,6 +239,7 @@ impl Default for ControlPlane {
             firewall: None,
             firewall_settings: None,
             offsite: None,
+            suspend_on_disable: true,
             ops: tokio::sync::Mutex::new(()),
             provider_seen: Default::default(),
         }
@@ -292,6 +302,34 @@ pub fn parse_tiers(raw: &str) -> Result<Vec<(String, String)>, String> {
     }
     if out.is_empty() {
         return Err("MACHINE_TIERS needs at least one tier=plan".into());
+    }
+    Ok(out)
+}
+
+/// MACHINE_OWN_KERNEL_TIERS (ADR 0120): tiers of `tiers` whose machines must have a
+/// kernel of their own, or `all`. A provider whose machines share their host's kernel
+/// can't make them, so that is a startup error rather than a quiet downgrade.
+fn own_kernel_tiers(raw: &str, tiers: &[(String, String)], p: &dyn MachineProvider) -> Result<Vec<String>, String> {
+    let names = list(raw);
+    let out: Vec<String> = match names.as_slice() {
+        [all] if all.eq_ignore_ascii_case("all") => tiers.iter().map(|(t, _)| t.clone()).collect(),
+        _ => names,
+    };
+    for (i, t) in out.iter().enumerate() {
+        if !tiers.iter().any(|(n, _)| n == t) {
+            return Err(format!("MACHINE_OWN_KERNEL_TIERS: \"{}\" isn't a tier in MACHINE_TIERS", crate::audit::clip(t, 32)));
+        }
+        if out[..i].contains(t) {
+            return Err(format!("MACHINE_OWN_KERNEL_TIERS: tier \"{t}\" is listed twice"));
+        }
+    }
+    if !out.is_empty() && p.substrate() != "vm" {
+        return Err(format!(
+            "MACHINE_OWN_KERNEL_TIERS: {} must have a kernel of their own, and {} machines are {}s that share their host's (ADR 0120). Use a provider that makes VMs, or take them out",
+            out.join(", "),
+            p.name(),
+            p.substrate()
+        ));
     }
     Ok(out)
 }
@@ -460,16 +498,23 @@ impl ControlPlane {
             .ok()
             .filter(|s| (10..=3600).contains(s))
             .ok_or("MACHINE_RECONCILE_SECONDS must be 10 to 3600")?;
+        let suspend_on_disable = match or("MACHINE_ON_DISABLE", "suspend").to_ascii_lowercase().as_str() {
+            "suspend" => true,
+            "keep" => false,
+            v => return Err(format!("MACHINE_ON_DISABLE must be suspend or keep, not \"{}\"", crate::audit::clip(v, 20))),
+        };
         let tiers = parse_tiers(&or("MACHINE_TIERS", provider.default_tiers()))?;
         for (tier, plan) in &tiers {
             provider
                 .check_plan(plan)
                 .map_err(|e| format!("MACHINE_TIERS: {tier}: {e}"))?;
         }
+        let own_kernel_tiers = own_kernel_tiers(&var("MACHINE_OWN_KERNEL_TIERS"), &tiers, provider.as_ref())?;
         Ok(ControlPlane {
             provider: Some(provider),
             routing: route::Routing::parse(&var("MACHINE_ROUTING"))?,
             tiers,
+            own_kernel_tiers,
             image,
             backups,
             provider_backups,
@@ -477,6 +522,7 @@ impl ControlPlane {
             authorized_keys,
             reconcile_every: Duration::from_secs(secs),
             firewall_settings: firewall::Settings::from_env(var)?,
+            suspend_on_disable,
             ..ControlPlane::default()
         })
     }
@@ -611,7 +657,7 @@ impl ControlPlane {
         match &self.provider {
             None => format!("off ({NEEDS_IT} for one machine per user)"),
             Some(p) => format!(
-                "{} ({}s), regions {}{}, tiers {}, backups {}, off-host backups {}, routing {}, enrollment {}, firewall {}",
+                "{} ({}s), regions {}{}, tiers {}{}, backups {}, off-host backups {}, routing {}, enrollment {}, firewall {}",
                 p.name(),
                 p.substrate(),
                 self.regions.first().map_or(String::new(), |r| format!("{r} (default)")),
@@ -621,6 +667,10 @@ impl ControlPlane {
                     .map(|(t, p)| format!("{t}={p}"))
                     .collect::<Vec<_>>()
                     .join(", "),
+                match self.own_kernel_tiers.as_slice() {
+                    [] => String::new(),
+                    t => format!(" (own kernel: {})", t.join(", ")),
+                },
                 match (self.backups, self.provider_backups) {
                     (false, _) => "off".to_string(),
                     (true, None) => "on".to_string(),
@@ -1092,9 +1142,13 @@ pub async fn reconcile(app: &AppState, cp: &ControlPlane) -> Value {
     rebuild::reconcile(app, cp).await;
     resize::reconcile(app, cp).await;
     let teams = crate::teams::sweep(app, cp).await;
+    let disabled = crate::deprovision::sweep(app, cp).await;
     let mut out = json!({ "checked": ids.len(), "changed": changed });
     if teams != json!({}) {
         out["teams"] = teams;
+    }
+    if disabled != json!({}) {
+        out["disabled"] = disabled;
     }
     if let Some(fw) = &cp.firewall {
         let _g = cp.ops.lock().await;
@@ -1395,6 +1449,11 @@ pub(crate) async fn request_as(app: &AppState, cp: &ControlPlane, by: &Who, key:
     // Held from here, so a region change can't land between reading it and making the machine.
     let _g = cp.ops.lock().await;
     let u = app.db.user(&u.id).ok_or_else(|| not_found("User"))?;
+    // Disabling them meanwhile looks for their machine under this lock (ADR 0124), so a
+    // request that waited here must not make one it would miss.
+    if !u.active() {
+        return Err(conflict("This user is disabled. Enable them before giving them a machine.".into()));
+    }
     // The region set for them or their team (ADR 0117) is where it goes, or nowhere.
     let home = region::effective(&app, cp, &u);
     if let Some(r) = asked_region.as_deref().filter(|r| home.binding() && *r != home.region) {
@@ -1790,11 +1849,12 @@ pub async fn substrate(Extension(a): Extension<Arc<Auth>>, Query(q): Query<HashM
     let tiers: Vec<Value> = cp
         .tiers
         .iter()
-        .map(|(t, plan)| json!({ "tier": t, "plan": plan, "resources": p.plan_view(plan) }))
+        .map(|(t, plan)| json!({ "tier": t, "plan": plan, "resources": p.plan_view(plan), "ownKernel": cp.own_kernel_tiers.contains(t) }))
         .collect();
     let mut v = json!({
         "provider": p.name(),
         "substrate": p.substrate(),
+        "kernel": if p.substrate() == "vm" { "own" } else { "shared" },
         "tiers": tiers,
         "regions": cp.regions,
         "defaultRegion": cp.regions.first(),
@@ -2036,6 +2096,15 @@ mod tests {
     }
 
     #[test]
+    fn machines_are_suspended_on_disable_unless_kept() {
+        let with = |v: &'static str| ControlPlane::configured(Arc::new(fake::Fake::default()), &move |k| if k == "MACHINE_ON_DISABLE" { v.into() } else { String::new() });
+        assert!(with("").unwrap().suspend_on_disable, "the default");
+        assert!(with("Suspend").unwrap().suspend_on_disable);
+        assert!(!with("keep").unwrap().suspend_on_disable);
+        assert!(with("destroy").err().unwrap().contains("MACHINE_ON_DISABLE must be suspend or keep"));
+    }
+
+    #[test]
     fn incus_settings() {
         let (cert, key) = incus_standin::self_signed("botd.test");
         let (server, _) = incus_standin::self_signed("incus.test");
@@ -2085,6 +2154,9 @@ mod tests {
             (&certs, &[("MACHINE_REGIONS", "Node 1")][..], "MACHINE_REGIONS"),
             (&certs, &[("MACHINE_BACKUPS_RPO_HOURS", "30")][..], "MACHINE_BACKUP_RPO_HOURS"),
             (&certs, &[("MACHINE_PROVIDER", "docker")][..], "linode or incus"),
+            // Containers share the host's kernel, so a tier promised its own can't be made (ADR 0120).
+            (&certs, &[("MACHINE_OWN_KERNEL_TIERS", "pro")][..], "pro must have a kernel of their own, and incus machines are containers that share their host's"),
+            (&certs, &[("MACHINE_OWN_KERNEL_TIERS", "all")][..], "starter, pro, max must have a kernel of their own"),
             (&EnvStore::fixed(&[("INCUS_CLIENT_CERT", &cert), ("INCUS_SERVER_CERT", &server)]), &[][..], "INCUS_CLIENT_KEY"),
             (&EnvStore::fixed(&[("INCUS_CLIENT_CERT", &cert), ("INCUS_CLIENT_KEY", "nope"), ("INCUS_SERVER_CERT", &server)]), &[][..], "INCUS_CLIENT_KEY"),
             (
@@ -2143,6 +2215,21 @@ mod tests {
         assert!(cp.describe().contains("backups on (RPO 26 hours)"), "{}", cp.describe());
         let cp = with(&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_BACKUPS_RPO_HOURS", "48")]).unwrap();
         assert_eq!(cp.provider_backups.map(|p| p.rpo_ms), Some(48 * 3_600_000));
+        // Linode machines are VMs, so any tier may be promised its own kernel (ADR 0120).
+        assert!(cp.own_kernel_tiers.is_empty() && !cp.describe().contains("own kernel"), "off unless set");
+        let cp = with(&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_OWN_KERNEL_TIERS", " pro, max ")]).unwrap();
+        assert_eq!(cp.own_kernel_tiers, ["pro", "max"]);
+        assert!(cp.describe().contains("max=g6-standard-4 (own kernel: pro, max)"), "{}", cp.describe());
+        let cp = with(&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_OWN_KERNEL_TIERS", "ALL")]).unwrap();
+        assert_eq!(cp.own_kernel_tiers, ["starter", "pro", "max"]);
+        for (vars, want) in [
+            (&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_OWN_KERNEL_TIERS", "gold")][..], "\"gold\" isn't a tier in MACHINE_TIERS"),
+            (&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_OWN_KERNEL_TIERS", "pro,pro")][..], "tier \"pro\" is listed twice"),
+            (&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_OWN_KERNEL_TIERS", "all,pro")][..], "\"all\" isn't a tier"),
+        ] {
+            let e = with(vars).err().unwrap_or_else(|| panic!("{vars:?} should fail"));
+            assert!(e.contains(want), "{vars:?}: {e}");
+        }
         for (vars, want) in [
             (&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_BACKUPS_RPO_HOURS", "24")][..], "25 to 168"),
             (&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_BACKUPS_RPO_HOURS", "a day")][..], "25 to 168"),

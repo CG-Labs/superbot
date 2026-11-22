@@ -1064,3 +1064,20 @@ async fn a_plain_retry_keeps_the_saved_settings() {
         ("g6-standard-2", "de-fra-2")
     );
 }
+
+#[tokio::test]
+async fn the_substrate_view_says_which_tiers_get_their_own_kernel() {
+    let p: Arc<dyn MachineProvider> = Arc::new(Fake::default());
+    let (port, _, owner, _) = serve_app_with(|a| {
+        let mut cp = ControlPlane::for_tests(p);
+        cp.own_kernel_tiers = vec!["pro".into()];
+        a.machines = Arc::new(cp);
+    })
+    .await;
+    let (_, admin) = user_with(port, &owner, "ops@example.com", "admin").await;
+    let (code, s) = json_call(port, "GET", "/api/machines/substrate", &admin, "").await;
+    assert_eq!(code, 200, "{s}");
+    assert_eq!((s["substrate"].as_str(), s["kernel"].as_str()), (Some("vm"), Some("own")));
+    let own: Vec<(&str, bool)> = s["tiers"].as_array().unwrap().iter().map(|t| (t["tier"].as_str().unwrap(), t["ownKernel"] == true)).collect();
+    assert_eq!(own, [("starter", false), ("pro", true), ("max", false)]);
+}

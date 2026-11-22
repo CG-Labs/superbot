@@ -193,9 +193,9 @@ pub trait MachineProvider: Send + Sync {
     /// Stored with each machine, e.g. `linode`.
     fn name(&self) -> &'static str;
     /// What a machine is: `vm` (its own kernel) or `container` (shares the host's).
-    fn substrate(&self) -> &'static str {
-        "vm"
-    }
+    /// No default: a provider says which, so none is taken for a VM by omission
+    /// (MACHINE_OWN_KERNEL_TIERS, ADR 0120).
+    fn substrate(&self) -> &'static str;
     /// MACHINE_TIERS when it isn't set.
     fn default_tiers(&self) -> &'static str {
         super::DEFAULT_TIERS

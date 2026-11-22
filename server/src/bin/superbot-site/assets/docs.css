@@ -1,0 +1,68 @@
+/* SuperBot docs portal, on top of site.css (brand tokens from docs/brand.md). ADR 0119. */
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+.docs-layout { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 48px; align-items: start; padding: 32px 0 72px; }
+@media (max-width: 900px) { .docs-layout { grid-template-columns: 1fr; gap: 24px; padding-top: 20px; } }
+
+/* Sidebar: search and the page list */
+.sidebar { position: sticky; top: 88px; max-height: calc(100vh - 104px); overflow-y: auto; padding-right: 6px; font-size: 15px; }
+/* On narrow screens: search, then the page, then the page list. */
+@media (max-width: 900px) {
+  .sidebar { display: contents; }
+  .search { order: 0; }
+  .doc { order: 1; }
+  .toc { order: 2; border-top: 1px solid var(--border); }
+}
+.search { margin: 0 0 18px; gap: 8px; }
+.search input { width: 100%; min-height: 42px; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font: inherit; }
+.search input:focus-visible { outline: 3px solid var(--focus); outline-offset: 1px; border-color: transparent; }
+.results { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.results:empty { display: none; }
+.results li { padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.results a { font-weight: 600; text-decoration: none; }
+.results a:hover { text-decoration: underline; }
+.result-section { display: block; color: var(--text-dim); font-size: 13px; }
+.results p { margin: 4px 0 0; color: var(--text-dim); font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
+.results-none { color: var(--text-dim); font-size: 14px; margin: 0; }
+
+.toc details { border-bottom: 1px solid var(--border); padding: 8px 0; }
+.toc summary { cursor: pointer; font-weight: 650; padding: 4px 0; list-style-position: outside; }
+.toc ul { list-style: none; margin: 4px 0 6px; padding: 0; }
+.toc li a { display: block; padding: 4px 8px; border-radius: 8px; color: var(--text-dim); text-decoration: none; line-height: 1.35; }
+.toc li a:hover { color: var(--text); background: var(--surface); }
+.toc li a[aria-current="page"] { color: var(--text); background: var(--surface-2); box-shadow: inset 3px 0 0 var(--primary); }
+.nav a[aria-current] { color: var(--text); }
+
+/* The page */
+.doc { min-width: 0; }
+.doc section { padding: 0; margin-top: 32px; }
+.doc h1 { font-size: clamp(30px, 4vw, 40px); margin-bottom: 16px; }
+.doc h2 { font-size: 26px; margin: 40px 0 12px; }
+.doc h3 { font-size: 20px; margin: 28px 0 10px; }
+.doc h4, .doc h5, .doc h6 { font-size: 17px; margin: 22px 0 8px; }
+.doc article > :first-child { margin-top: 0; }
+.doc p, .doc li { max-width: 78ch; }
+.doc ul, .doc ol { padding-left: 1.4em; margin: 0 0 14px; }
+.doc li + li { margin-top: 4px; }
+.doc img { max-width: 100%; height: auto; border-radius: 10px; }
+.doc hr { border: 0; border-top: 1px solid var(--border); margin: 32px 0; }
+.doc blockquote { margin: 0 0 14px; padding: 4px 16px; border-left: 3px solid var(--border); color: var(--text-dim); }
+.doc code { font: 0.9em/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; padding: 0.1em 0.35em; overflow-wrap: anywhere; }
+.doc pre { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; overflow-x: auto; margin: 0 0 16px; }
+.doc pre code { background: none; border: 0; padding: 0; overflow-wrap: normal; }
+.doc table { display: block; overflow-x: auto; border-collapse: collapse; margin: 0 0 16px; font-size: 15px; max-width: 100%; }
+.doc th, .doc td { border: 1px solid var(--border); padding: 8px 10px; text-align: left; vertical-align: top; }
+.doc th { background: var(--surface-2); }
+.doc .crumbs { color: var(--text-dim); font-size: 14px; margin-bottom: 18px; }
+.doc .source { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 14px; }
+.doc-list { columns: 2 280px; column-gap: 32px; }
+.doc-list li { break-inside: avoid; }
+.lede { margin-bottom: 8px; }
+
+/* Plans on the landing page */
+.plans { list-style: none; margin: 32px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 18px; }
+.plan { display: flex; flex-direction: column; }
+.plan .plan-kind { color: var(--sky); font-weight: 600; font-size: 13px; letter-spacing: .06em; text-transform: uppercase; margin-bottom: 8px; }
+@media (prefers-color-scheme: light) { .plan .plan-kind { color: var(--link); } }
+.plan-limits { margin: 14px 0; padding-left: 1.1em; color: var(--text-dim); font-size: 15px; flex: 1; }
+.plan .plan-price { color: var(--text); font-weight: 600; margin: 0 0 14px; }

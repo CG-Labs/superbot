@@ -12,6 +12,8 @@ The kernel needs nftables' bridge family. Without it, Incus can't apply network 
 
 Memory is hard-limited per container, but swap isn't: a restricted project refuses `limits.memory.swap`. If containers mustn't swap, give the host no swap.
 
+Containers share the host's kernel, so the kernel's own hardening is the host's to set. Each container's first boot sets the rest itself ([ADR 0126](../adr/0126-per-user-machine-hardening.md)), but its `kernel.*` settings are refused inside a container and show as `partial`. On the host, copy `kernel.kptr_restrict = 2`, `kernel.dmesg_restrict = 1`, `kernel.yama.ptrace_scope = 1`, `kernel.unprivileged_bpf_disabled = 1` and `kernel.sysrq = 0` into a file in `/etc/sysctl.d`, apply it with `sudo sysctl --system`, and turn on unattended security updates (`sudo dpkg-reconfigure -plow unattended-upgrades`).
+
 ```bash
 incus admin init            # pick zfs, btrfs or lvm for the pool
 ```
@@ -214,7 +216,7 @@ It cleans up containers and ACLs left by an earlier run. It needs nftables' brid
 
 ## Limits to know
 
-- Containers share the host's kernel. A kernel escape crosses every boundary. Use VMs for tiers that need their own kernel.
+- Containers share the host's kernel. A kernel escape crosses every boundary. Use VMs for tiers that need their own kernel. A server with `MACHINE_OWN_KERNEL_TIERS` set won't start with `MACHINE_PROVIDER=incus`, so unset it here. After moving such users to Linode with it set, their old containers are refused every run until they have new machines. [ADR 0120](../adr/0120-managed-substrate.md) recommends containers only on hosts that serve one organisation until the boundary has been red-teamed.
 - Containers can't reach each other at all, ping included. They can ping the gateway. The host itself reaches only their agent port.
 - Snapshots (daily, kept 7 days) stay on the same pool. They don't protect against losing the host; off-host backups (step 7) do.
 - A backup restores only to the same machine, on its host or another. Exports are full each time, so storage grows with disk size times retention.
