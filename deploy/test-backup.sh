@@ -208,6 +208,10 @@ printf 'SUPERBOT_BACKUP_AGE_RECIPIENTS=""\n' >"$E/.env"
 refuses "required, but" env ENV_FILE="$E/.env" "$INIT" --backup-encryption required
 ENV_FILE="$E/.env" BACKUP_IDENTITY_FILE="$E/identity.txt" "$INIT" --backup-age-generate >/dev/null
 grep -qx "SUPERBOT_BACKUP_AGE_RECIPIENTS='$(age-keygen -y "$E/identity.txt")'" "$E/.env" || fail "init.sh took quoted-empty recipients as set"
+printf "SUPERBOT_BACKUP_AGE_RECIPIENTS=' %s '\n" "$public" >"$E/.env"
+cp "$E/.env" "$T/padded.env"
+ENV_FILE="$E/.env" BACKUP_IDENTITY_FILE="$E/identity2.txt" "$INIT" --backup-encryption required --backup-age-generate >/dev/null
+[[ ! -e "$E/identity2.txt" ]] && grep -qxF "$(cat "$T/padded.env")" "$E/.env" || fail "init.sh took padded recipients as unset"
 ok "init.sh makes a private key for a new .env, keeps it on re-runs, and it restores the archives"
 
 echo "All backup script checks passed"
