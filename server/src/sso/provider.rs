@@ -3,7 +3,7 @@
 
 use super::github::{self, GitHub};
 use super::jwt::{self, Invalid, Jwks, Token};
-use super::saml_sp::{self, Attributes, IdpMetadata, SpKey};
+use super::saml_sp::{self, Attributes, Encryption, IdpMetadata, KeyUse, SpKey};
 use super::{apple, saml};
 use crate::rbac::Role;
 use serde_json::Value;
@@ -44,7 +44,19 @@ pub enum Kind {
     /// Identities are stored like the bridge's: under `entity_id`, the NameID lowercased.
     /// `sign_requests` signs AuthnRequests with the SP key (ADR 0137), which is
     /// `SSO_<ID>_PRIVATE_KEY` with `sp_cert` (base64 DER) when that is set, else generated.
-    SamlSp { entity_id: String, sp_entity_id: String, source: IdpSource, attributes: Attributes, allowed_domains: Vec<String>, sign_requests: bool, sp_cert: Option<String> },
+    /// `encryption` takes encrypted assertions (ADR 0150) with a key of their own, likewise
+    /// `SSO_<ID>_ENCRYPTION_PRIVATE_KEY` with `enc_cert`, else generated.
+    SamlSp {
+        entity_id: String,
+        sp_entity_id: String,
+        source: IdpSource,
+        attributes: Attributes,
+        allowed_domains: Vec<String>,
+        sign_requests: bool,
+        sp_cert: Option<String>,
+        encryption: Encryption,
+        enc_cert: Option<String>,
+    },
 }
 
 /// Where a native SAML provider's IdP metadata comes from.
@@ -102,6 +114,8 @@ pub struct Provider {
     idp: Mutex<Option<(Arc<IdpMetadata>, Instant)>>,
     /// Native SAML: our signing key, once loaded or made (ADR 0137).
     pub(super) sp_key: Mutex<Option<Arc<SpKey>>>,
+    /// Native SAML: our encryption key, likewise (ADR 0150).
+    pub(super) enc_key: Mutex<Option<Arc<SpKey>>>,
 }
 
 #[derive(Default)]
@@ -246,7 +260,7 @@ async fn get_text(http: &reqwest::Client, url: &str) -> Result<String, Invalid> 
 
 impl Provider {
     pub fn new(id: &str, label: &str, kind: Kind, client_id: &str, scopes: &str, jit_role: Option<Role>) -> Provider {
-        Provider { id: id.into(), label: label.into(), kind, client_id: client_id.into(), scopes: scopes.into(), jit_role, cache: Default::default(), idp: Mutex::default(), sp_key: Mutex::default() }
+        Provider { id: id.into(), label: label.into(), kind, client_id: client_id.into(), scopes: scopes.into(), jit_role, cache: Default::default(), idp: Mutex::default(), sp_key: Mutex::default(), enc_key: Mutex::default() }
     }
 
     pub fn type_name(&self) -> &'static str {
@@ -363,22 +377,57 @@ impl Provider {
 
     /// Read when used, so `botctl secret set` takes effect without a restart.
     fn stored_secret(&self) -> Option<crate::secrets::Secret> {
-        let s = crate::secrets::global().get(&self.env_var()).ok().flatten()?;
+        Self::stored(&self.env_var())
+    }
+
+    fn stored(name: &str) -> Option<crate::secrets::Secret> {
+        let s = crate::secrets::global().get(name).ok().flatten()?;
         crate::secrets::redact::register(s.expose());
         Some(s)
     }
 
-    /// Native SAML with `SP_CERT_FILE`: the configured SP key, once it is set and matches the
-    /// certificate. Kept once it does; until then each call reads the secret again, so
-    /// `botctl secret set` takes effect without a restart. Err says what is missing.
-    pub(super) fn configured_sp_key(&self) -> Result<Arc<SpKey>, String> {
-        let Kind::SamlSp { sp_cert: Some(cert), .. } = &self.kind else { return Err("no SP_CERT_FILE".into()) };
-        let mut held = self.sp_key.lock().unwrap_or_else(|e| e.into_inner());
+    /// Native SAML: where the configured key for `u` is set. The signing key is the
+    /// provider's secret (`env_var`); the encryption key has a name of its own.
+    pub fn sp_key_var(&self, u: KeyUse) -> String {
+        match u {
+            KeyUse::Signing => self.env_var(),
+            KeyUse::Encryption => format!("SSO_{}_ENCRYPTION_PRIVATE_KEY", self.id.to_ascii_uppercase()),
+        }
+    }
+
+    /// Native SAML: the certificate configured for `u` (`SP_CERT_FILE`, `SP_ENCRYPTION_CERT_FILE`),
+    /// or None when botd makes that key itself.
+    pub fn sp_cert_for(&self, u: KeyUse) -> Option<&str> {
+        match (&self.kind, u) {
+            (Kind::SamlSp { sp_cert, .. }, KeyUse::Signing) => sp_cert.as_deref(),
+            (Kind::SamlSp { enc_cert, .. }, KeyUse::Encryption) => enc_cert.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Where the key for `u` is kept once loaded or made.
+    pub(super) fn sp_key_slot(&self, u: KeyUse) -> &Mutex<Option<Arc<SpKey>>> {
+        match u {
+            KeyUse::Signing => &self.sp_key,
+            KeyUse::Encryption => &self.enc_key,
+        }
+    }
+
+    /// Native SAML with `SP_CERT_FILE` (or `SP_ENCRYPTION_CERT_FILE`): the configured key, once
+    /// it is set and matches the certificate. Kept once it does; until then each call reads the
+    /// secret again, so `botctl secret set` takes effect without a restart. Err says what is missing.
+    pub(super) fn configured_sp_key(&self, u: KeyUse) -> Result<Arc<SpKey>, String> {
+        let (file, cert) = match u {
+            KeyUse::Signing => ("SP_CERT_FILE", self.sp_cert_for(u)),
+            KeyUse::Encryption => ("SP_ENCRYPTION_CERT_FILE", self.sp_cert_for(u)),
+        };
+        let Some(cert) = cert else { return Err(format!("no {file}")) };
+        let mut held = self.sp_key_slot(u).lock().unwrap_or_else(|e| e.into_inner());
         if let Some(k) = held.as_ref() {
             return Ok(k.clone());
         }
-        let var = self.env_var();
-        let pem = self.stored_secret().ok_or_else(|| format!("not offered until {var} is set for SP_CERT_FILE (env, _FILE, or `botctl secret set`)"))?;
+        let var = self.sp_key_var(u);
+        let pem = Self::stored(&var).ok_or_else(|| format!("not offered until {var} is set for {file} (env, _FILE, or `botctl secret set`)"))?;
         let key = Arc::new(SpKey::from_pem(pem.expose(), cert).map_err(|e| format!("not offered: {var}: {e}"))?);
         *held = Some(key.clone());
         Ok(key)
@@ -403,13 +452,14 @@ impl Provider {
 
     /// Why the provider isn't offered, for the startup log.
     pub fn not_ready(&self) -> Option<String> {
-        if let Kind::SamlSp { source, sp_cert, .. } = &self.kind {
+        if let Kind::SamlSp { source, sp_cert, encryption, enc_cert, .. } = &self.kind {
             let loaded = self.idp.lock().unwrap_or_else(|e| e.into_inner()).is_some();
-            return match source {
-                IdpSource::Saved if !loaded => Some(format!("not offered until its IdP metadata is imported: botctl sso saml {} import < metadata.xml", self.id)),
-                _ if sp_cert.is_some() => self.configured_sp_key().err(),
-                _ => None,
-            };
+            if matches!(source, IdpSource::Saved) && !loaded {
+                return Some(format!("not offered until its IdP metadata is imported: botctl sso saml {} import < metadata.xml", self.id));
+            }
+            let signing = sp_cert.as_ref().and_then(|_| self.configured_sp_key(KeyUse::Signing).err());
+            let encrypting = enc_cert.as_ref().filter(|_| *encryption != Encryption::Off).and_then(|_| self.configured_sp_key(KeyUse::Encryption).err());
+            return signing.or(encrypting);
         }
         let var = self.env_var();
         match (&self.kind, self.stored_secret()) {

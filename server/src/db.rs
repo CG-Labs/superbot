@@ -748,6 +748,10 @@ pub struct User {
     pub erased_as: Option<String>,
     /// Their custom role across the server (ADR 0123). `role` is then that role's base.
     pub role_id: Option<String>,
+    /// A service account (ADR 0143), not a person: it never signs in, and only its tokens
+    /// act as it. People lists and lookups by id or email leave these out.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub service: bool,
 }
 
 impl User {
@@ -776,6 +780,64 @@ impl CustomRole {
     pub fn perms(&self) -> crate::rbac::Perms {
         crate::rbac::Perms::from_names(self.permissions.iter().map(String::as_str))
     }
+}
+
+/// Each user's team: its members, and its live service accounts (ADR 0143).
+const TEAM_OF: &str = "SELECT user_id, team_id FROM team_members UNION ALL SELECT user_id, team_id FROM service_accounts WHERE team_id IS NOT NULL AND deleted_at IS NULL";
+
+/// A service account (ADR 0143): its `users` row (kind `service`: role, custom role across
+/// the server, status), and what only it has. `owner_id` is the person whose permissions
+/// cap it; `team_id` the team it acts in, with the custom role `team_role_id` there.
+#[derive(Clone, Debug)]
+pub struct ServiceAccount {
+    pub user: User,
+    pub description: String,
+    pub owner_id: String,
+    pub team_id: Option<String>,
+    pub team_role_id: Option<String>,
+    pub created_by: Option<String>,
+    pub deleted_at: Option<i64>,
+}
+
+#[derive(Default)]
+pub struct ServiceAccountPatch {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub status: Option<&'static str>,
+    pub role: Option<(Role, Option<String>)>,
+    pub team: Option<Option<(String, Option<String>)>>,
+    pub owner: Option<String>,
+}
+
+/// A service account's API token. Only its hash is kept; `hint` is its last four
+/// characters, so people can tell tokens apart. `scopes` None: all the account holds.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceToken {
+    pub id: String,
+    pub account_id: String,
+    pub name: String,
+    pub hint: String,
+    pub scopes: Option<Vec<String>>,
+    pub created_at: i64,
+    pub created_by: Option<String>,
+    pub expires_at: i64,
+    pub last_used_at: Option<i64>,
+    pub last_used_ip: Option<String>,
+    pub revoked_at: Option<i64>,
+    pub revoked_by: Option<String>,
+    pub revoked_reason: Option<String>,
+    pub rotated_to: Option<String>,
+}
+
+pub struct NewServiceToken<'a> {
+    pub account_id: &'a str,
+    pub name: &'a str,
+    pub token_hash: &'a str,
+    pub hint: &'a str,
+    pub scopes: Option<&'a [&'a str]>,
+    pub expires_at: i64,
+    pub created_by: Option<&'a str>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1600,6 +1662,39 @@ fn user_row(r: &Row) -> rusqlite::Result<User> {
         erased_at: r.get("erased_at")?,
         erased_as: r.get("erased_as")?,
         role_id: r.get("role_id")?,
+        service: r.get::<_, String>("kind")? == "service",
+    })
+}
+
+fn service_account_row(r: &Row) -> rusqlite::Result<ServiceAccount> {
+    Ok(ServiceAccount {
+        user: user_row(r)?,
+        description: r.get("sa_description")?,
+        owner_id: r.get("sa_owner")?,
+        team_id: r.get("sa_team")?,
+        team_role_id: r.get("sa_team_role")?,
+        created_by: r.get("sa_created_by")?,
+        deleted_at: r.get("sa_deleted_at")?,
+    })
+}
+
+fn service_token_row(r: &Row) -> rusqlite::Result<ServiceToken> {
+    let scopes: Option<String> = r.get("scopes")?;
+    Ok(ServiceToken {
+        id: r.get("id")?,
+        account_id: r.get("account_id")?,
+        name: r.get("name")?,
+        hint: r.get("hint")?,
+        scopes: scopes.map(|s| serde_json::from_str(&s).unwrap_or_default()),
+        created_at: r.get("created_at")?,
+        created_by: r.get("created_by")?,
+        expires_at: r.get("expires_at")?,
+        last_used_at: r.get("last_used_at")?,
+        last_used_ip: r.get("last_used_ip")?,
+        revoked_at: r.get("revoked_at")?,
+        revoked_by: r.get("revoked_by")?,
+        revoked_reason: r.get("revoked_reason")?,
+        rotated_to: r.get("rotated_to")?,
     })
 }
 
@@ -1815,7 +1910,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 53] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 54] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1869,6 +1964,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 53] = [
     migrate_saml_sessions,
     migrate_audit_chain,
     migrate_scim_group_roles,
+    migrate_service_accounts,
 ];
 
 /// Native SAML sign-ins' NameID and SessionIndex (ADR 0137), for single logout. Gone with
@@ -1912,6 +2008,54 @@ fn migrate_scim_group_roles(c: &Connection, _fresh: bool) -> rusqlite::Result<()
           PRIMARY KEY (user_id, scope)
         );
         CREATE INDEX IF NOT EXISTS scim_role_grants_mapping ON scim_role_grants(mapping_id);",
+    )
+}
+
+/// Service accounts (ADR 0143): `users` rows of kind `service`, which hold a built-in or
+/// custom role like anyone (never admin: the triggers refuse it), with no email, sign-in
+/// or session; what only they have; and their API tokens, kept as hashes. A token is
+/// never deleted, so the audit log's token ids keep meaning something.
+fn migrate_service_accounts(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'kind'", [], |r| r.get(0))?;
+    if !has {
+        c.execute_batch("ALTER TABLE users ADD COLUMN kind TEXT NOT NULL DEFAULT 'person' CHECK (kind IN ('person', 'service'));")?;
+    }
+    c.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS service_accounts_never_admin_insert BEFORE INSERT ON users
+           WHEN NEW.kind = 'service' AND (NEW.role = 'admin' OR NEW.email IS NOT NULL)
+           BEGIN SELECT RAISE(ABORT, 'a service account is never an admin and has no email'); END;
+         CREATE TRIGGER IF NOT EXISTS service_accounts_never_admin_update BEFORE UPDATE ON users
+           WHEN NEW.kind != OLD.kind OR (NEW.kind = 'service' AND (NEW.role = 'admin' OR NEW.email IS NOT NULL))
+           BEGIN SELECT RAISE(ABORT, 'a service account is never an admin and has no email, and no one changes kind'); END;
+         CREATE TABLE IF NOT EXISTS service_accounts (
+           user_id TEXT PRIMARY KEY REFERENCES users(id),
+           description TEXT NOT NULL DEFAULT '',
+           owner_id TEXT NOT NULL REFERENCES users(id),
+           team_id TEXT,
+           team_role_id TEXT REFERENCES roles(id),
+           created_by TEXT,
+           created_at INTEGER NOT NULL,
+           deleted_at INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS service_accounts_owner ON service_accounts(owner_id);
+         CREATE TABLE IF NOT EXISTS service_tokens (
+           id TEXT PRIMARY KEY,
+           account_id TEXT NOT NULL REFERENCES users(id),
+           name TEXT NOT NULL,
+           token_hash TEXT NOT NULL UNIQUE,
+           hint TEXT NOT NULL,
+           scopes TEXT,
+           created_at INTEGER NOT NULL,
+           created_by TEXT,
+           expires_at INTEGER NOT NULL,
+           last_used_at INTEGER,
+           last_used_ip TEXT,
+           revoked_at INTEGER,
+           revoked_by TEXT,
+           revoked_reason TEXT,
+           rotated_to TEXT
+         );
+         CREATE INDEX IF NOT EXISTS service_tokens_account ON service_tokens(account_id, created_at);",
     )
 }
 
@@ -4549,9 +4693,10 @@ impl Db {
 
     // Users
 
+    /// Everyone who can sign in: never a service account (ADR 0143), which has its own list.
     pub fn users(&self) -> Vec<User> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM users ORDER BY created_at, id").unwrap();
+        let mut s = c.prepare("SELECT * FROM users WHERE kind = 'person' ORDER BY created_at, id").unwrap();
         s.query_map([], user_row).unwrap().filter_map(Result::ok).collect()
     }
 
@@ -4565,12 +4710,15 @@ impl Db {
         self.find_user_any(key).filter(|u| u.erased_at.is_none())
     }
 
+    /// `find_user`, erased tombstones included. Never a service account (ADR 0143), so no
+    /// route about people (`/api/users`, teams, roles, Bot grants) reaches one.
     pub fn find_user_any(&self, key: &str) -> Option<User> {
-        if key.contains('@') {
+        let u = if key.contains('@') {
             self.c().query_row("SELECT * FROM users WHERE email = ?", [key], user_row).optional().ok().flatten()
         } else {
             self.user(key)
-        }
+        };
+        u.filter(|u| !u.service)
     }
 
     /// Err when the email or id is taken, or no seat is free. The owner account never
@@ -4588,13 +4736,14 @@ impl Db {
         self.user(&id).ok_or_else(|| UserError::Db("user not saved".into()))
     }
 
-    /// Active users holding a seat (ADR 0038): everyone but the owner account.
+    /// Active users holding a seat (ADR 0038): everyone but the owner account. Service
+    /// accounts aren't people and take none (ADR 0143).
     pub fn active_seats(&self) -> u32 {
         Self::seats_used(&self.c())
     }
 
     fn seats_used(c: &Connection) -> u32 {
-        c.query_row("SELECT COUNT(*) FROM users WHERE status = 'active' AND id != ?", [crate::users::OPERATOR], |r| r.get(0)).unwrap_or(0)
+        c.query_row("SELECT COUNT(*) FROM users WHERE status = 'active' AND kind = 'person' AND id != ?", [crate::users::OPERATOR], |r| r.get(0)).unwrap_or(0)
     }
 
     /// Whether one more active user fits under `cap`. Callers hold the one connection
@@ -4605,7 +4754,7 @@ impl Db {
 
     /// Whether making this existing user active takes a seat: they're disabled now.
     fn enabling(c: &Connection, user_id: &str) -> bool {
-        c.query_row("SELECT status != 'active' AND id != ?2 FROM users WHERE id = ?1", [user_id, crate::users::OPERATOR], |r| r.get(0)).unwrap_or(false)
+        c.query_row("SELECT status != 'active' AND kind = 'person' AND id != ?2 FROM users WHERE id = ?1", [user_id, crate::users::OPERATOR], |r| r.get(0)).unwrap_or(false)
     }
 
     fn insert_user(c: &Connection, id: &str, email: Option<&str>, name: &str, role: Role) -> rusqlite::Result<usize> {
@@ -4727,7 +4876,12 @@ impl Db {
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(|e| RoleError::Db(e.to_string()))?;
         let held: i64 = tx
-            .query_row("SELECT (SELECT COUNT(*) FROM users WHERE role_id = ?1) + (SELECT COUNT(*) FROM team_members WHERE role_id = ?1)", [id], |r| r.get(0))
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM users WHERE role_id = ?1) + (SELECT COUNT(*) FROM team_members WHERE role_id = ?1)
+                  + (SELECT COUNT(*) FROM service_accounts WHERE team_role_id = ?1)",
+                [id],
+                |r| r.get(0),
+            )
             .map_err(|e| RoleError::Db(e.to_string()))?;
         if held > 0 {
             return Err(RoleError::InUse(held as usize));
@@ -4970,6 +5124,187 @@ impl Db {
     /// What a person's custom role across the server adds. Nothing without one.
     pub fn user_perms(&self, u: &User) -> crate::rbac::Perms {
         u.role_id.as_deref().and_then(|id| self.custom_role(id)).map_or(crate::rbac::Perms::NONE, |r| r.perms())
+    }
+
+    // Service accounts (ADR 0143).
+
+    /// Makes a service account: a `users` row of kind `service`, with `role` (member or
+    /// read-only) and, across the server, the custom role `role_id` (whose base `role` is),
+    /// and its own row. `team` is the team it acts in, with the custom role it has there.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_service_account(&self, name: &str, description: &str, role: Role, role_id: Option<&str>, team: Option<(&str, Option<&str>)>, owner: &str, by: Option<&str>) -> Result<ServiceAccount, String> {
+        let id = format!("sa{}", crate::random_hex(5));
+        let at = now();
+        {
+            let c = self.c();
+            let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO users (id, email, display_name, role, role_id, kind, created_at, updated_at) VALUES (?1, NULL, ?2, ?3, ?4, 'service', ?5, ?5)",
+                params![id, name, role.as_str(), role_id, at],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO service_accounts (user_id, description, owner_id, team_id, team_role_id, created_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![id, description, owner, team.map(|t| t.0), team.and_then(|t| t.1), by, at],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+        self.service_account(&id).ok_or_else(|| "service account not saved".into())
+    }
+
+    const SERVICE_ACCOUNT: &str = "SELECT u.*, s.description AS sa_description, s.owner_id AS sa_owner, s.team_id AS sa_team, s.team_role_id AS sa_team_role,
+        s.created_by AS sa_created_by, s.deleted_at AS sa_deleted_at FROM users u JOIN service_accounts s ON s.user_id = u.id";
+
+    pub fn service_account(&self, id: &str) -> Option<ServiceAccount> {
+        self.c().query_row(&format!("{} WHERE u.id = ?", Self::SERVICE_ACCOUNT), [id], service_account_row).optional().ok().flatten()
+    }
+
+    /// Every service account, deleted ones too, oldest first.
+    pub fn service_accounts(&self) -> Vec<ServiceAccount> {
+        let c = self.c();
+        let mut s = c.prepare(&format!("{} ORDER BY u.created_at, u.id", Self::SERVICE_ACCOUNT)).unwrap();
+        s.query_map([], service_account_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Saves the fields given, in one transaction. `role` is the built-in role and the
+    /// custom role across the server (None: none); `team` the team and the custom role there.
+    pub fn update_service_account(&self, id: &str, p: &ServiceAccountPatch) -> Result<(), String> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
+        let at = now();
+        let res = (|| {
+            if tx.execute("UPDATE service_accounts SET user_id = user_id WHERE user_id = ?1 AND deleted_at IS NULL", [id])? == 0 {
+                return Ok(false);
+            }
+            let set = |col: &str, v: &dyn rusqlite::ToSql| tx.execute(&format!("UPDATE users SET {col} = ?1, updated_at = ?2 WHERE id = ?3"), params![v, at, id]);
+            if let Some(v) = &p.name { set("display_name", v)?; }
+            if let Some(v) = p.status { set("status", &v)?; }
+            if let Some((role, role_id)) = &p.role {
+                set("role", &role.as_str())?;
+                set("role_id", role_id)?;
+            }
+            let own = |col: &str, v: &dyn rusqlite::ToSql| tx.execute(&format!("UPDATE service_accounts SET {col} = ?1 WHERE user_id = ?2"), params![v, id]);
+            if let Some(v) = &p.description { own("description", v)?; }
+            if let Some(v) = &p.owner { own("owner_id", v)?; }
+            if let Some(team) = &p.team {
+                own("team_id", &team.as_ref().map(|t| t.0.clone()))?;
+                own("team_role_id", &team.as_ref().and_then(|t| t.1.clone()))?;
+            }
+            Ok::<_, rusqlite::Error>(true)
+        })();
+        match res {
+            Ok(true) => tx.commit().map_err(|e| e.to_string()),
+            Ok(false) => Err("not found".into()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Deletes a service account for good: every live token revoked, the account disabled
+    /// and its roles taken away, in one transaction. The row stays, so the audit log keeps
+    /// naming it. Returns how many tokens were revoked, or None if it was gone already.
+    pub fn delete_service_account(&self, id: &str, by: Option<&str>) -> Option<usize> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().ok()?;
+        let at = now();
+        let res = (|| {
+            if tx.execute("UPDATE service_accounts SET deleted_at = ?1, team_id = NULL, team_role_id = NULL WHERE user_id = ?2 AND deleted_at IS NULL", params![at, id])? == 0 {
+                return Ok(None);
+            }
+            tx.execute("UPDATE users SET status = 'disabled', role_id = NULL, updated_at = ?1 WHERE id = ?2", params![at, id])?;
+            let n = tx.execute(
+                "UPDATE service_tokens SET revoked_at = ?1, revoked_by = ?2, revoked_reason = 'account_deleted' WHERE account_id = ?3 AND revoked_at IS NULL AND expires_at > ?1",
+                params![at, by, id],
+            )?;
+            Ok::<_, rusqlite::Error>(Some(n))
+        })();
+        match res {
+            Ok(Some(n)) => tx.commit().ok().map(|_| n),
+            _ => None,
+        }
+    }
+
+    pub fn create_service_token(&self, t: &NewServiceToken) -> Option<ServiceToken> {
+        let id = format!("st{}", crate::random_hex(5));
+        Self::insert_service_token(&self.c(), &id, t).ok()?;
+        self.service_token(&id)
+    }
+
+    fn insert_service_token(c: &Connection, id: &str, t: &NewServiceToken) -> rusqlite::Result<usize> {
+        let scopes = t.scopes.map(|s| serde_json::to_string(s).unwrap_or_else(|_| "[]".into()));
+        c.execute(
+            "INSERT INTO service_tokens (id, account_id, name, token_hash, hint, scopes, created_at, created_by, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![id, t.account_id, t.name, t.token_hash, t.hint, scopes, now(), t.created_by, t.expires_at],
+        )
+    }
+
+    pub fn service_token(&self, id: &str) -> Option<ServiceToken> {
+        self.c().query_row("SELECT * FROM service_tokens WHERE id = ?", [id], service_token_row).optional().ok().flatten()
+    }
+
+    pub fn service_token_by_hash(&self, token_hash: &str) -> Option<ServiceToken> {
+        self.c().query_row("SELECT * FROM service_tokens WHERE token_hash = ?", [token_hash], service_token_row).optional().ok().flatten()
+    }
+
+    /// An account's tokens, newest first, revoked and expired ones too.
+    pub fn service_tokens(&self, account_id: &str) -> Vec<ServiceToken> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM service_tokens WHERE account_id = ? ORDER BY created_at DESC, id DESC").unwrap();
+        s.query_map([account_id], service_token_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Revokes a token that isn't already. False if it was, or is gone.
+    pub fn revoke_service_token(&self, id: &str, by: Option<&str>, reason: &str) -> bool {
+        self.c()
+            .execute(
+                "UPDATE service_tokens SET revoked_at = ?1, revoked_by = ?2, revoked_reason = ?3 WHERE id = ?4 AND revoked_at IS NULL",
+                params![now(), by, reason, id],
+            )
+            .unwrap_or(0)
+            > 0
+    }
+
+    /// Replaces a live token with `new`, in one transaction: the old one is revoked now, or
+    /// with `keep_until`, expires then (whichever is sooner) so callers can switch over.
+    /// None if the old one was revoked or expired meanwhile.
+    pub fn rotate_service_token(&self, old: &str, new: &NewServiceToken, keep_until: Option<i64>, by: Option<&str>) -> Option<ServiceToken> {
+        let id = format!("st{}", crate::random_hex(5));
+        let at = now();
+        {
+            let c = self.c();
+            let tx = c.unchecked_transaction().ok()?;
+            let changed = match keep_until {
+                Some(until) => tx.execute(
+                    "UPDATE service_tokens SET expires_at = MIN(expires_at, ?1), rotated_to = ?2 WHERE id = ?3 AND revoked_at IS NULL AND rotated_to IS NULL AND expires_at > ?4",
+                    params![until, id, old, at],
+                ),
+                None => tx.execute(
+                    "UPDATE service_tokens SET revoked_at = ?1, revoked_by = ?2, revoked_reason = 'rotated', rotated_to = ?3 WHERE id = ?4 AND revoked_at IS NULL AND rotated_to IS NULL AND expires_at > ?1",
+                    params![at, by, id, old],
+                ),
+            }
+            .ok()?;
+            if changed == 0 {
+                return None;
+            }
+            Self::insert_service_token(&tx, &id, new).ok()?;
+            tx.commit().ok()?;
+        }
+        self.service_token(&id)
+    }
+
+    #[cfg(test)]
+    pub fn set_service_token_expiry(&self, id: &str, expires_at: i64) {
+        self.c().execute("UPDATE service_tokens SET expires_at = ?1 WHERE id = ?2", params![expires_at, id]).unwrap();
+    }
+
+    /// Notes a token's use, at most once a minute, so a busy integration doesn't write on
+    /// every request.
+    pub fn touch_service_token(&self, id: &str, at: i64, ip: Option<&str>) {
+        let _ = self.c().execute(
+            "UPDATE service_tokens SET last_used_at = ?1, last_used_ip = ?2 WHERE id = ?3 AND (last_used_at IS NULL OR last_used_at < ?1 - 60000)",
+            params![at, ip, id],
+        );
     }
 
     // Erasure (ADR 0102).
@@ -8877,14 +9212,16 @@ impl Db {
         self.c().query_row("SELECT * FROM team_members WHERE user_id = ?", [user_id], team_member_row).optional().ok().flatten()
     }
 
+    /// The user's team: as a member, or as the team's service account (ADR 0143), which
+    /// shares and is shared with as one of the team, though it isn't on its list.
     pub fn team_id_of(&self, user_id: &str) -> Option<String> {
-        self.c().query_row("SELECT team_id FROM team_members WHERE user_id = ?", [user_id], |r| r.get(0)).optional().ok().flatten()
+        self.c().query_row(&format!("SELECT team_id FROM ({TEAM_OF}) WHERE user_id = ?"), [user_id], |r| r.get(0)).optional().ok().flatten()
     }
 
-    /// Every member's team, by user id.
+    /// Every member's team, by user id, with teams' service accounts.
     pub fn team_ids(&self) -> HashMap<String, String> {
         let c = self.c();
-        let mut s = c.prepare("SELECT user_id, team_id FROM team_members").unwrap();
+        let mut s = c.prepare(TEAM_OF).unwrap();
         s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(Result::ok).collect()
     }
 
@@ -9152,6 +9489,41 @@ mod tests {
         db.c().execute("DELETE FROM teammate_spaces", []).unwrap();
         migrate_account_removals(&db.c(), false).unwrap();
         assert_eq!(db.teammate_spaces(), [("u1".to_string(), "u2".to_string())]);
+    }
+
+    #[test]
+    fn service_accounts_are_never_admins_people_or_seats() {
+        let db = Db::open(&temp_path("service-accounts").join("app.sqlite")).unwrap();
+        let owner = db.create_user(None, Some("own@example.com"), "Own", Role::Admin).unwrap();
+        let seats = db.active_seats();
+        let sa = db.create_service_account("CI", "", Role::Member, None, None, &owner.id, Some(&owner.id)).unwrap();
+        assert!(sa.user.service && sa.user.email.is_none() && sa.deleted_at.is_none());
+        assert_eq!(db.active_seats(), seats, "takes no seat");
+        assert!(db.users().iter().all(|u| u.id != sa.user.id), "not on the people list");
+        assert!(db.find_user(&sa.user.id).is_none() && db.find_user_any(&sa.user.id).is_none());
+        assert!(db.user(&sa.user.id).is_some(), "but found by id for auth and audit names");
+        // The triggers refuse an admin service account, an email, and a change of kind, whatever writes it.
+        assert!(db.create_service_account("Root", "", Role::Admin, None, None, &owner.id, None).is_err());
+        assert!(db.update_user(&sa.user.id, UserPatch { role: Some(Role::Admin), ..Default::default() }).is_err());
+        assert!(db.update_service_account(&sa.user.id, &ServiceAccountPatch { role: Some((Role::Admin, None)), ..Default::default() }).is_err());
+        assert!(db.update_user(&sa.user.id, UserPatch { email: Some(Some("sa@example.com".into())), ..Default::default() }).is_err());
+        assert!(db.c().execute("UPDATE users SET kind = 'person' WHERE id = ?", [&sa.user.id]).is_err());
+        assert!(db.c().execute("UPDATE users SET kind = 'service' WHERE id = ?", [&owner.id]).is_err());
+        assert!(db.c().execute("INSERT INTO users (id, display_name, role, kind, created_at, updated_at) VALUES ('x', 'X', 'admin', 'service', 0, 0)", []).is_err());
+        assert!(db.c().execute("INSERT INTO users (id, display_name, role, kind, created_at, updated_at) VALUES ('x', 'X', 'member', 'robot', 0, 0)", []).is_err());
+        assert_eq!(db.user(&sa.user.id).unwrap().role, Role::Member);
+
+        let t = NewServiceToken { account_id: &sa.user.id, name: "deploy", token_hash: "h1", hint: "abcd", scopes: Some(&["read"][..]), expires_at: now() + 60_000, created_by: None };
+        let tok = db.create_service_token(&t).unwrap();
+        assert_eq!((tok.scopes.clone(), db.service_token_by_hash("h1").map(|t| t.id)), (Some(vec!["read".to_string()]), Some(tok.id.clone())));
+        let next = NewServiceToken { token_hash: "h2", ..t };
+        let rotated = db.rotate_service_token(&tok.id, &next, None, None).unwrap();
+        assert!(db.rotate_service_token(&tok.id, &NewServiceToken { token_hash: "h3", ..next }, None, None).is_none(), "only once");
+        assert_eq!(db.service_token(&tok.id).unwrap().rotated_to.as_deref(), Some(rotated.id.as_str()));
+        assert_eq!(db.delete_service_account(&sa.user.id, None), Some(1));
+        assert_eq!(db.delete_service_account(&sa.user.id, None), None);
+        assert!(db.service_token(&rotated.id).unwrap().revoked_at.is_some());
+        assert!(!db.user(&sa.user.id).unwrap().active());
     }
 
     #[test]
