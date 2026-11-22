@@ -291,6 +291,7 @@ impl Config {
         if user.is_some() {
             env.insert("USER".into(), self.bot_user.clone());
             env.insert("LOGNAME".into(), self.bot_user.clone());
+            env.insert("TMPDIR".into(), self.home.join(TMP).display().to_string());
         }
         job::Host {
             clear_env: true,
@@ -309,6 +310,7 @@ impl Config {
             ("LANG".to_string(), "C.UTF-8".to_string()),
             ("USER".to_string(), t.user.clone()),
             ("LOGNAME".to_string(), t.user.clone()),
+            ("TMPDIR".to_string(), t.home.join(TMP).display().to_string()),
         ]);
         job::Host { clear_env: true, remove: Vec::new(), env, user: Some(t.ids), limits: None }
     }
@@ -319,8 +321,13 @@ impl Config {
             return Err(format!("{} is root or in root's group; Bots can't run as it.", self.bot_user));
         }
         // SAFETY: no arguments.
-        if ids.uid == unsafe { libc::geteuid() } && !self.allow_own_user {
+        let own = ids.uid == unsafe { libc::geteuid() };
+        if own && !self.allow_own_user {
             return Err(format!("{} is the agent's own user; Bots need their own.", self.bot_user));
+        }
+        // Tests stand their own user in, whatever its groups.
+        if !own && let Some(why) = runas::privileged(&self.bot_user, ids) {
+            return Err(format!("{} {why}; Bots run only as an unprivileged user.", self.bot_user));
         }
         Ok(())
     }
@@ -755,6 +762,12 @@ fn not_teammates(stand_in: bool, bots: Option<Ids>) -> impl Fn(Ids) -> Result<()
         let bots = bots.is_some_and(|b| ids.uid == b.uid || ids.gid == b.gid);
         if !stand_in && (own || bots) {
             return Err("a teammate's user can't be the agent's or the Bots' user".into());
+        }
+        if !stand_in {
+            let name = runas::name_of(ids.uid).ok_or("a teammate's user has no name")?;
+            if let Some(why) = runas::privileged(&name, ids) {
+                return Err(format!("{name} {why}; teammates' runs go only to unprivileged users"));
+            }
         }
         Ok(())
     }
@@ -1337,7 +1350,7 @@ fn login_states(home: &Path, user: Option<Ids>, running: Vec<String>, query: Opt
 /// The Bots' working folders, made as `user` (or the agent) if they aren't there.
 fn work_dirs(cfg: &Config, user: Option<Ids>) -> Result<(), String> {
     runas::as_user(user, || {
-        for dir in [cfg.home.join("work"), cfg.home.join("bots")] {
+        for dir in [cfg.home.join("work"), cfg.home.join("bots"), cfg.home.join(TMP)] {
             std::fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
@@ -1402,6 +1415,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             wire::CAN_RETENTION,
             wire::CAN_RUN_LIMITS,
             wire::CAN_EGRESS_POLICY,
+            wire::CAN_LOCKED_DOWN,
         ]
             .into_iter()
             .chain(a.upgrader.build.is_some().then_some(wire::CAN_UPGRADE))
@@ -1535,10 +1549,14 @@ fn check(cfg: &Config, user_id: &str, j: &wire::JobRequest, home: &Path) -> Resu
     Ok(())
 }
 
-/// The agent sets HOME and PATH; a job can't move them.
+/// The agent sets HOME, PATH and TMPDIR; a job can't move them.
 fn scrub(env: &mut BTreeMap<String, String>) {
-    env.retain(|k, _| k != "HOME" && k != "PATH");
+    env.retain(|k, _| k != "HOME" && k != "PATH" && k != "TMPDIR");
 }
+
+/// Each run user's own temporary folder, in its home (ADR 0145): /tmp is shared by
+/// every user on the machine.
+const TMP: &str = ".tmp";
 
 fn ndjson(e: &impl serde::Serialize) -> Bytes {
     let mut line = serde_json::to_vec(e).unwrap_or_default();
@@ -1664,7 +1682,11 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
     let running = Running(a.clone(), j.job_id.clone(), permit);
     let stop = StopOnDrop(stop_tx);
     let mut host = match &teammate {
-        Some(t) => a.cfg.teammate_host(t),
+        Some(t) => {
+            let tmp = t.home.join(TMP);
+            let _ = runas::as_user(Some(t.ids), || std::fs::DirBuilder::new().mode(0o700).create(&tmp));
+            a.cfg.teammate_host(t)
+        }
         None => {
             let _ = work_dirs(&a.cfg, user);
             a.cfg.host(user)
@@ -2468,6 +2490,33 @@ pub async fn run(cfg: Config) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_job_cant_move_its_home_path_or_temporary_folder() {
+        let mut env: BTreeMap<String, String> =
+            [("HOME", "/root"), ("PATH", "/tmp"), ("TMPDIR", "/tmp"), ("BOT_TOKEN", "t")].map(|(k, v)| (k.into(), v.into())).into();
+        scrub(&mut env);
+        assert_eq!(env.keys().collect::<Vec<_>>(), ["BOT_TOKEN"]);
+    }
+
+    #[test]
+    fn teammates_users_are_never_root_the_agents_the_bots_or_privileged() {
+        let bots = Ids { uid: 990, gid: 990 };
+        let check = not_teammates(false, Some(bots));
+        assert!(check(Ids { uid: 0, gid: 5 }).is_err());
+        assert!(check(Ids { uid: 5, gid: 0 }).is_err());
+        assert!(check(bots).is_err());
+        assert!(check(Ids { uid: 991, gid: 990 }).is_err(), "the Bots' group");
+        // SAFETY: no arguments.
+        let me = unsafe { Ids { uid: libc::geteuid(), gid: libc::getegid() } };
+        assert!(check(me).is_err(), "the agent's own");
+        assert!(check(Ids { uid: 4_000_000_001, gid: 4_000_000_001 }).unwrap_err().contains("no name"));
+        // `nobody` is in no privileged group on any distribution we run on.
+        if let Some((nobody, _)) = runas::lookup("nobody") {
+            assert_eq!(check(nobody), Ok(()));
+        }
+        assert_eq!(not_teammates(true, Some(bots))(me), Ok(()), "a stand-in is the agent's own user");
+    }
 
     #[test]
     fn hardening_is_read_with_care() {

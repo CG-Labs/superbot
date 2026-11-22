@@ -135,6 +135,16 @@ fn probe(ids: Option<(u32, u32)>) -> Host {
         let mut c = std::process::Command::new(bin);
         if let Some((uid, gid)) = ids {
             c.uid(uid).gid(gid).current_dir("/");
+            // With no new privileges, as runs start (ADR 0145): a setuid bwrap can't help them.
+            // SAFETY: a plain prctl, async-signal-safe.
+            unsafe {
+                c.pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
         }
         c.args(args)
             .stdin(std::process::Stdio::null())

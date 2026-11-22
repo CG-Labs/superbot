@@ -404,6 +404,9 @@ async fn main() {
         .unwrap_or_else(|e| exit(format!("Machine enrollment: {e}")))
         .map(|mut e| {
             e.upkeep.default_to(&managed_bins).unwrap_or_else(|err| exit(format!("Machine enrollment: {err}")));
+            if !e.bot_user {
+                log_warn!("WARNING: {}", machines::botuser::ROOT_WARNING);
+            }
             control_plane.enroll_with(e).unwrap_or_else(|e| exit(format!("Machine enrollment: {e}")))
         });
 
