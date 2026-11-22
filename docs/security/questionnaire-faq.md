@@ -6,7 +6,7 @@ Short answers to common questions, as of the code on `main`. Each links to the d
 Organisation data (users, chats, approvals, audit log, secrets, billing records) is in botd's SQLite database on the operator's server. On managed plans, each user's working files, Bot memory and harness logins are on that user's own machine, and in that machine's backups. See [data flows](data-flows.md#what-is-stored-where).
 
 **Can we choose the region?**
-The operator chooses Linode regions (`MACHINE_REGIONS`) or where Incus hosts run, and self-hosting runs wherever you put it. A UK/EU region choice for the managed service is planned for M4 ([roadmap](../ROADMAP.md)).
+Yes, for machines and their backups. An admin sets a data region for your account or team, such as London (`gb-lon`) or Frankfurt (`de-fra-2`). Your machines are made only there, their backups go to a store there, and nothing is moved out unless you ask ([ADR 0117](../adr/0117-uk-eu-data-regions.md)). The server's own database stays where the operator runs botd. Self-hosting runs wherever you put it.
 
 **Is data encrypted in transit?**
 Yes. HTTPS to the server, mutual TLS 1.3 between the server and machines, HTTPS to botd's outside services, and STARTTLS or TLS for email. Model providers set in the plan routing file must be `https://`; botd refuses to start on a plain `http://` provider unless it is on the same host ([ADR 0097](../adr/0097-model-providers-over-https.md)). See [encryption in transit](data-flows.md#in-transit).
