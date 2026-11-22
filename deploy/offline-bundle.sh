@@ -6,6 +6,8 @@
 #                                  [--image NAME=REF]... [--image-identity ID] [--allow-unsigned]
 #   deploy/offline-bundle.sh verify BUNDLE [--sha256 HEX]
 #   deploy/offline-bundle.sh load BUNDLE [--sha256 HEX]      # docker load its images, no network
+#   deploy/offline-bundle.sh push BUNDLE --registry HOST[:PORT][/PATH] [--sha256 HEX]
+#                                  # copy its images to a registry mirror, digests unchanged
 set -euo pipefail
 
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -18,7 +20,7 @@ DOCKER_FILES=(docker-compose.yml Caddyfile .env.example init.sh seccomp-chromium
 IMAGE_ISSUER=https://token.actions.githubusercontent.com
 
 usage() {
-  sed -n '2,8p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # The repository root: the checkout this script is in (deploy/..).
@@ -48,35 +50,119 @@ docker_arch() {
   esac
 }
 
-# NAME=REF: pulled for this arch, its cosign signature checked (unless --allow-unsigned), saved
-# for `docker load`, with what the check printed (certificate, Rekor entry) and its SBOM beside it.
+# Image references: [HOST[:PORT]/]PATH:TAG. A tag is required, so docker load can name what it
+# loads and a mirror gets the same tag; a digest is not taken (the bundle records it).
+image_ref_ok() { [[ "$1" =~ ^[a-z0-9][a-z0-9._/:-]*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ && "$1" != *//* ]]; }
+image_repo() { printf '%s\n' "${1%:*}"; }
+image_tag() { printf '%s\n' "${1##*:}"; }
+# REF as Docker and containerd name it: docker.io/library/ for one-word names, docker.io/ for
+# paths without a registry host.
+image_full_name() {
+  local ref=$1 first=${1%%/*}
+  if [[ "$ref" != */* ]]; then
+    printf 'docker.io/library/%s\n' "$ref"
+  elif [[ "$first" == *.* || "$first" == *:* || "$first" == localhost ]]; then
+    printf '%s\n' "$ref"
+  else
+    printf 'docker.io/%s\n' "$ref"
+  fi
+}
+
+skopeo_copy_args() {
+  local help
+  help=$(skopeo copy --help 2>&1 || true)
+  SKOPEO_COPY=(skopeo copy -q)
+  [[ "$help" != *--preserve-digests* ]] || SKOPEO_COPY+=(--preserve-digests)
+}
+
+# What REF names in its registry for linux/DOCKER_ARCH: IMAGE_TOP is REPO@ the digest REF points
+# at (an index, or one image), which cosign checks; IMAGE_PLATFORM is REPO@ the image for this
+# arch, which is bundled. Attestation entries in an index have no platform and are skipped.
+resolve_registry_image() {
+  local ref=$1 darch=$2 raw repo top digest got
+  raw="$OFFLINE_TMP/raw.json"
+  skopeo inspect --raw "docker://$ref" >"$raw" || die "Couldn't read $ref from its registry"
+  top="sha256:$(sha256sum <"$raw" | awk '{ print $1 }')"
+  repo=$(image_repo "$ref")
+  if jq -e 'has("manifests")' "$raw" >/dev/null 2>&1; then
+    digest=$(jq -r --arg a "$darch" \
+      '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest][0] // empty' "$raw")
+    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "$ref has no linux/$darch image"
+  else
+    digest=$top
+    got=$(skopeo inspect "docker://$repo@$digest" | jq -r .Architecture) || die "Couldn't read $ref's config"
+    [[ "$got" == "$darch" ]] || die "$ref is a $got image, not $darch"
+  fi
+  IMAGE_TOP="$repo@$top" IMAGE_PLATFORM="$repo@$digest"
+}
+
+# Copies SRC (a skopeo source, e.g. docker://REPO@DIGEST) into an OCI image layout, digests kept,
+# and packs it as TAR with a Docker manifest.json beside its index.json: an OCI archive that
+# skopeo, crane or regctl push to a registry unchanged, and that docker load reads. Prints the
+# image's manifest digest.
+oci_image_archive() {
+  local src=$1 ref=$2 tar=$3 layout digest
+  layout=$(mktemp -d "$OFFLINE_TMP/layout.XXXXXX")
+  skopeo_copy_args
+  "${SKOPEO_COPY[@]}" "$src" "oci:$layout:$(image_tag "$ref")" >/dev/null || die "Couldn't copy $ref into the bundle"
+  digest=$(jq -r 'if (.manifests | length) == 1 then .manifests[0].digest else empty end' "$layout/index.json")
+  [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ && -f "$layout/blobs/sha256/${digest#sha256:}" ]] || die "Copying $ref didn't give one image"
+  jq -c --arg ref "$ref" '[{
+      Config: ("blobs/sha256/" + (.config.digest | ltrimstr("sha256:"))),
+      RepoTags: [$ref],
+      Layers: [.layers[].digest | "blobs/sha256/" + ltrimstr("sha256:")]
+    }]' "$layout/blobs/sha256/${digest#sha256:}" >"$layout/manifest.json" || die "$ref's manifest isn't an image manifest"
+  jq -c --arg name "$(image_full_name "$ref")" '.manifests[0].annotations["io.containerd.image.name"] = $name' \
+    "$layout/index.json" >"$layout/index.json.new" && mv "$layout/index.json.new" "$layout/index.json"
+  tar -C "$layout" --owner=0 --group=0 --numeric-owner --sort=name -cf "$tar" oci-layout index.json manifest.json blobs
+  chmod 0644 "$tar"
+  rm -rf -- "$layout"
+  printf '%s\n' "$digest"
+}
+
+# NAME=REF: this arch's image, its cosign signature checked (unless --allow-unsigned), saved as
+# an OCI archive with the registry's digests, with what the check printed (certificate, Rekor
+# entry) and its SBOM beside it. An unsigned image of your own comes from the local Docker if
+# it is there, else from its registry.
 bundle_image() {
-  local spec=$1 out=$2 arch=$3 identity=$4 unsigned=$5 name ref platform pinned
+  local spec=$1 out=$2 arch=$3 identity=$4 unsigned=$5 name ref darch digest got
   name=${spec%%=*} ref=${spec#*=}
-  [[ "$spec" == *=* && "$name" =~ ^[a-z0-9][a-z0-9-]*$ && -n "$ref" ]] || die "--image wants NAME=REF, e.g. superbot=ghcr.io/cg-labs/superbot:0.1.0"
-  command -v docker >/dev/null 2>&1 || die "--image needs docker"
-  platform="linux/$(docker_arch "$arch")"
+  [[ "$spec" == *=* && "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "--image wants NAME=REF, e.g. superbot=ghcr.io/cg-labs/superbot:0.1.0"
+  image_ref_ok "$ref" || die "--image $name: \"$ref\" isn't a tagged image reference (HOST/PATH:TAG, lowercase, no digest)"
+  [[ ! -e "$out/images/$name.tar" ]] || die "--image $name is given twice"
+  command -v skopeo >/dev/null 2>&1 || die "--image needs skopeo"
+  command -v jq >/dev/null 2>&1 || die "--image needs jq"
+  darch=$(docker_arch "$arch")
   mkdir -p "$out/images"
   if [[ "$unsigned" != true ]]; then
     command -v cosign >/dev/null 2>&1 || die "cosign is needed to check $ref's signature (or --allow-unsigned for an image of your own)"
-    log "Pulling $ref ($platform)"
-    docker pull -q --platform "$platform" "$ref" >/dev/null
-    pinned=$(docker image inspect --format '{{index .RepoDigests 0}}' "$ref")
-    [[ "$pinned" == *@sha256:* ]] || die "No registry digest for $ref"
-    cosign verify "$pinned" --certificate-identity "$identity" --certificate-oidc-issuer "$IMAGE_ISSUER" \
+    command -v docker >/dev/null 2>&1 || die "--image needs docker (buildx) to read $ref's SBOM"
+    resolve_registry_image "$ref" "$darch"
+    cosign verify "$IMAGE_TOP" --certificate-identity "$identity" --certificate-oidc-issuer "$IMAGE_ISSUER" \
       --output json >"$out/images/$name.cosign.json" || die "$ref isn't signed by $identity: not bundling it"
-    log "Signature checked: $pinned, signed by $identity"
-    docker buildx imagetools inspect "$pinned" --format "{{ json (index .SBOM \"$platform\").SPDX }}" >"$out/images/$name.sbom.spdx.json" \
+    log "Signature checked: $IMAGE_TOP, signed by $identity"
+    docker buildx imagetools inspect "$IMAGE_TOP" --format "{{ json (index .SBOM \"linux/$darch\").SPDX }}" >"$out/images/$name.sbom.spdx.json" \
       || die "Couldn't read $ref's SBOM"
-    printf '%s\n' "$pinned" >"$out/images/$name.digest"
+    digest=$(oci_image_archive "docker://$IMAGE_PLATFORM" "$ref" "$out/images/$name.tar")
+    [[ "$digest" == "${IMAGE_PLATFORM#*@}" ]] || die "Copying $ref changed its digest ($digest, not ${IMAGE_PLATFORM#*@}): not bundling it"
   else
-    docker image inspect "$ref" >/dev/null 2>&1 || docker pull -q --platform "$platform" "$ref" >/dev/null
     warn "Bundling $ref without checking a signature (--allow-unsigned)"
-    docker image inspect --format '{{.Id}}' "$ref" >"$out/images/$name.digest"
+    if command -v docker >/dev/null 2>&1 && docker image inspect "$ref" >/dev/null 2>&1; then
+      got=$(docker image inspect --format '{{.Architecture}}' "$ref")
+      [[ "$got" == "$darch" ]] || die "$ref is a $got image, not $darch"
+      # Through docker save rather than skopeo's docker-daemon: source, whose Docker API
+      # version newer Docker engines refuse.
+      docker save -o "$OFFLINE_TMP/saved.tar" "$ref" || die "docker save failed for $ref"
+      digest=$(oci_image_archive "docker-archive:$OFFLINE_TMP/saved.tar" "$ref" "$out/images/$name.tar")
+      rm -f -- "$OFFLINE_TMP/saved.tar"
+    else
+      resolve_registry_image "$ref" "$darch"
+      digest=$(oci_image_archive "docker://$IMAGE_PLATFORM" "$ref" "$out/images/$name.tar")
+    fi
   fi
   printf '%s\n' "$ref" >"$out/images/$name.ref"
-  docker save -o "$out/images/$name.tar" "$ref"
-  chmod 0644 "$out/images/$name.tar"
+  printf '%s\n' "$digest" >"$out/images/$name.digest"
+  log "Bundled $ref as $digest (linux/$darch)"
 }
 
 cmd_build() {
@@ -141,6 +227,7 @@ cmd_build() {
     echo "commit=$commit"
     echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "images=${names[*]}"
+    [[ ${#names[@]} -eq 0 ]] || echo "image_format=oci"
     [[ "$unsigned" != true || ${#names[@]} -eq 0 ]] || echo "unsigned_images=true"
   } >"$stage/MANIFEST"
   (cd "$stage" && find . -type f -printf '%P\n' | LC_ALL=C sort | xargs -d '\n' sha256sum) >"$OFFLINE_TMP/SHA256SUMS"
@@ -162,6 +249,7 @@ verify_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --sha256) OFFLINE_BUNDLE_SHA256=$2; shift 2 ;;
+      --registry) [[ "${ALLOW_REGISTRY:-}" == 1 ]] || die "--registry is for push"; PUSH_REGISTRY=$2; shift 2 ;;
       *) die "Unknown option: $1" ;;
     esac
   done
@@ -200,10 +288,66 @@ cmd_load() {
   log "Run Compose from the bundle's docker/ folder with SUPERBOT_VERSION=$OFFLINE_VERSION in .env (docs/ops/air-gapped.md#docker-compose)"
 }
 
+# A registry and optional path to push under: a host (with a dot or a port, or localhost), then
+# lowercase path components.
+registry_ok() {
+  local first=${1%%/*}
+  [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]+)?(/[a-z0-9]+([._-][a-z0-9]+)*)*$ ]] || return 1
+  [[ "$first" == *.* || "$first" == *:* || "$first" == localhost ]]
+}
+
+# The Compose .env setting for a bundled image, by its NAME.
+compose_image_var() {
+  case $1 in
+    superbot) echo SUPERBOT_IMAGE ;;
+    caddy) echo SUPERBOT_CADDY_IMAGE ;;
+  esac
+}
+
+# Copies each image to REGISTRY/<its repository's last part>:<its tag> from the OCI archive, as it
+# is: the registry ends up with the digest the bundle recorded (the one whose signature was
+# checked when it was bundled), and that is checked after the push.
+cmd_push() {
+  local PUSH_REGISTRY=""
+  ALLOW_REGISTRY=1 verify_args "$@"
+  [[ -n "$PUSH_REGISTRY" ]] || die "push needs --registry HOST[:PORT][/PATH], e.g. --registry registry.corp.example/superbot"
+  registry_ok "$PUSH_REGISTRY" || die "--registry \"$PUSH_REGISTRY\" isn't HOST[:PORT][/path] (a host with a dot or a port, or localhost; a lowercase path)"
+  command -v skopeo >/dev/null 2>&1 || die "push needs skopeo (docs/ops/air-gapped.md#registry-mirrors)"
+  OFFLINE_ANY_ARCH=1 offline_unpack_bundle "$BUNDLE" "$OFFLINE_TMP"
+  [[ -n "$(manifest_value "$OFFLINE_DIR/MANIFEST" images)" ]] || die "This bundle has no images: it is for install.sh --offline only"
+  [[ "$(manifest_value "$OFFLINE_DIR/MANIFEST" image_format)" == oci ]] \
+    || die "This bundle's images are docker save archives, which a registry can't take with their digests: use a bundle made by a newer offline-bundle.sh, or docker load and docker push"
+  local tar name ref want dest got var arch envs=()
+  arch=$(manifest_value "$OFFLINE_DIR/MANIFEST" arch)
+  skopeo_copy_args
+  for tar in "$OFFLINE_DIR"/images/*.tar; do
+    [[ -f "$tar" ]] || continue
+    name=$(basename "$tar" .tar)
+    ref=$(cat "$OFFLINE_DIR/images/$name.ref")
+    want=$(cat "$OFFLINE_DIR/images/$name.digest")
+    if ! image_ref_ok "$ref" || [[ ! "$want" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+      die "Refusing $BUNDLE: images/$name.ref or .digest isn't one"
+    fi
+    dest="$PUSH_REGISTRY/$(basename "$(image_repo "$ref")"):$(image_tag "$ref")"
+    "${SKOPEO_COPY[@]}" "oci-archive:$tar" "docker://$dest" >/dev/null || die "Couldn't push $name to $dest"
+    skopeo inspect --raw "docker://$dest" >"$OFFLINE_TMP/pushed.json" || die "Couldn't read $dest back from the registry"
+    got="sha256:$(sha256sum <"$OFFLINE_TMP/pushed.json" | awk '{ print $1 }')"
+    [[ "$got" == "$want" ]] || die "$dest is $got after the push, not the bundle's $want: don't use it"
+    log "Pushed $ref to $dest ($want, linux/$(docker_arch "$arch"))"
+    var=$(compose_image_var "$name")
+    [[ -z "$var" ]] || envs+=("$var=$(image_repo "$dest")@$want")
+  done
+  if [[ ${#envs[@]} -gt 0 ]]; then
+    log "For Compose, pin these in .env (docs/ops/air-gapped.md#registry-mirrors):"
+    printf '    %s\n' "${envs[@]}"
+  fi
+}
+
 case "${1:-}" in
   build) shift; cmd_build "$@" ;;
   verify) shift; cmd_verify "$@" ;;
   load) shift; cmd_load "$@" ;;
+  push) shift; cmd_push "$@" ;;
   -h|--help|"") usage ;;
-  *) die "Unknown command: $1 (build, verify or load)" ;;
+  *) die "Unknown command: $1 (build, verify, load or push)" ;;
 esac
