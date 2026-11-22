@@ -2,7 +2,8 @@
 //! read-only) and a fixed set of admin permissions (`rbac::DELEGABLE`), then gives it to
 //! people across the server, or to a team's members within their team. The built-in
 //! roles are presets of the same permissions and can't be changed. Everything here is
-//! for admins only (`rbac::classify` leaves `/api/roles` to Admin), and audited.
+//! for admins only (`rbac::classify` leaves `/api/roles` to Admin), and audited. A SCIM
+//! group can be mapped to a role (ADR 0138); its members hold it while in the group.
 
 use crate::audit::Who;
 use crate::db::{CustomRole, RoleError, User};
@@ -48,13 +49,18 @@ fn view(app: &AppState, r: &CustomRole) -> Value {
         "id": r.id, "name": r.name, "description": r.description, "base": r.base, "builtIn": false,
         "permissions": perms.names(), "unknown": unknown,
         "effective": rbac::granted(Principal::User(r.base), perms),
-        "users": users.len(), "teamMembers": teams.len(),
+        "users": users.len(), "teamMembers": teams.len(), "scimMappings": app.db.scim_role_mappings_of_role(&r.id).len(),
         "createdAt": r.created_at, "createdBy": r.created_by, "updatedAt": r.updated_at,
     })
 }
 
 fn person(u: &User) -> Value {
     json!({ "id": u.id, "name": u.name, "email": u.email })
+}
+
+/// The SCIM mapping that gave `user_id` their role in `scope`, if one did (ADR 0138).
+fn scim_source(app: &AppState, user_id: &str, scope: &str) -> Option<String> {
+    app.db.scim_role_grants_of_user(user_id).into_iter().find(|g| g.scope == scope).map(|g| g.mapping_id)
 }
 
 fn need_role(app: &AppState, key: &str) -> Res<CustomRole> {
@@ -66,6 +72,7 @@ fn role_error(e: RoleError) -> ApiError {
         RoleError::NameTaken => conflict("A role with that name exists already."),
         RoleError::NotFound => not_found("Role"),
         RoleError::InUse(n) => conflict(format!("{n} {} still {} this role. Take it away from them first.", if n == 1 { "person" } else { "people" }, if n == 1 { "has" } else { "have" })),
+        RoleError::Mapped(n) => conflict(format!("{n} SCIM {} to this role. Remove {} first.", if n == 1 { "group is mapped" } else { "groups are mapped" }, if n == 1 { "that mapping" } else { "those mappings" })),
         RoleError::Db(e) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
@@ -143,8 +150,12 @@ pub async fn get(State(app): State<AppState>, Path(key): Path<String>) -> Res {
     let (users, teams) = app.db.custom_role_holders(&r.id);
     let mut v = view(&app, &r);
     v["holders"] = json!({
-        "users": users.iter().filter_map(|id| app.db.user(id)).map(|u| person(&u)).collect::<Vec<_>>(),
-        "teams": teams.iter().filter_map(|(t, u)| Some(json!({ "team": { "id": t, "name": app.db.team(t)?.name }, "user": person(&app.db.user(u)?) }))).collect::<Vec<_>>(),
+        "users": users.iter().filter_map(|id| app.db.user(id)).map(|u| {
+            let mut p = person(&u);
+            p["scimMapping"] = json!(scim_source(&app, &u.id, "org"));
+            p
+        }).collect::<Vec<_>>(),
+        "teams": teams.iter().filter_map(|(t, u)| Some(json!({ "team": { "id": t, "name": app.db.team(t)?.name }, "user": person(&app.db.user(u)?), "scimMapping": scim_source(&app, u, "team") }))).collect::<Vec<_>>(),
     });
     Ok(Json(v))
 }
@@ -159,6 +170,21 @@ pub async fn update(State(app): State<AppState>, Extension(by): Extension<Who>, 
     let description = v.get("description").map(parse_description).transpose()?;
     let base = (!v["base"].is_null()).then(|| parse_base(&v["base"])).transpose()?.filter(|b| *b != before.base);
     let perms = (!v["permissions"].is_null()).then(|| parse_perms(&v["permissions"])).transpose()?;
+    if let Some(p) = &perms {
+        let new = Perms::from_names(p.iter().copied());
+        for m in app.db.scim_role_mappings_of_role(&before.id) {
+            let reach = new.reaching_admins(m.scope == crate::scim::roles::TEAM);
+            if !reach.is_empty() {
+                return Err(conflict(format!(
+                    "A SCIM group is mapped to this role {}, where {} would act on admins. Remove mapping {} first, or leave {} out.",
+                    if m.scope == "org" { "across the server" } else { "in its team" },
+                    reach.join(" and "),
+                    m.id,
+                    if reach.len() == 1 { "it" } else { "them" },
+                )));
+            }
+        }
+    }
     let moved = app.db.update_custom_role(&before.id, name.as_deref(), description.as_deref(), base, perms.as_deref()).map_err(role_error)?;
     let after = need_role(&app, &before.id)?;
     let mut changes = serde_json::Map::new();
@@ -210,6 +236,8 @@ pub async fn assign(State(app): State<AppState>, Extension(by): Extension<Who>, 
         }
         let from = summary(&app, before.role_id.as_deref());
         app.db.record(&by.event("role.assigned").target("role", &r.id).details(json!({ "name": r.name, "user": before.id, "scope": "org", "from": from })));
+    } else if let Some(mapping) = app.db.take_over_scim_grant(&before.id, "org") {
+        app.db.record(&by.event("role.assigned").target("role", &r.id).details(json!({ "name": r.name, "user": before.id, "scope": "org", "from": summary(&app, Some(&r.id)), "takenFromScim": mapping })));
     }
     let after = need_user_key(&app, &before.id)?;
     if before.role != after.role {
@@ -224,10 +252,11 @@ pub async fn assign(State(app): State<AppState>, Extension(by): Extension<Who>, 
 pub async fn unassign(State(app): State<AppState>, Extension(by): Extension<Who>, Path((key, user)): Path<(String, String)>) -> Res {
     let r = need_role(&app, &key)?;
     let u = need_user_key(&app, &user)?;
+    let scim = scim_source(&app, &u.id, "org");
     if !app.db.clear_user_custom_role(&u.id, &r.id) {
         return Err(ApiError(StatusCode::NOT_FOUND, "They don't have this role.".into()));
     }
-    app.db.record(&by.event("role.unassigned").target("role", &r.id).details(json!({ "name": r.name, "user": u.id, "scope": "org", "keeps": u.role })));
+    app.db.record(&by.event("role.unassigned").target("role", &r.id).details(json!({ "name": r.name, "user": u.id, "scope": "org", "keeps": u.role, "scimMapping": scim })));
     let after = need_user_key(&app, &u.id)?;
     Ok(Json(json!({ "user": user_view(&after), "role": Value::Null })))
 }
@@ -254,6 +283,8 @@ pub async fn assign_in_team(State(app): State<AppState>, Extension(by): Extensio
         }
         let from = summary(&app, m.role_id.as_deref());
         app.db.record(&by.event("role.assigned").target("role", &r.id).details(json!({ "name": r.name, "user": u.id, "scope": "team", "team": t.id, "from": from, "applies": r.perms().in_team().names() })));
+    } else if let Some(mapping) = app.db.take_over_scim_grant(&u.id, "team") {
+        app.db.record(&by.event("role.assigned").target("role", &r.id).details(json!({ "name": r.name, "user": u.id, "scope": "team", "team": t.id, "from": summary(&app, Some(&r.id)), "applies": r.perms().in_team().names(), "takenFromScim": mapping })));
     }
     Ok(Json(json!({ "team": { "id": t.id, "name": t.name }, "user": person(&u), "role": summary(&app, Some(&r.id)), "applies": r.perms().in_team().names() })))
 }
@@ -262,9 +293,10 @@ pub async fn assign_in_team(State(app): State<AppState>, Extension(by): Extensio
 pub async fn unassign_in_team(State(app): State<AppState>, Extension(by): Extension<Who>, Path((key, team, user)): Path<(String, String, String)>) -> Res {
     let r = need_role(&app, &key)?;
     let (t, u, m) = team_member(&app, &team, &user)?;
+    let scim = scim_source(&app, &u.id, "team");
     if m.role_id.as_deref() != Some(r.id.as_str()) || !app.db.set_team_custom_role(&t.id, &u.id, None) {
         return Err(ApiError(StatusCode::NOT_FOUND, "They don't have this role in the team.".into()));
     }
-    app.db.record(&by.event("role.unassigned").target("role", &r.id).details(json!({ "name": r.name, "user": u.id, "scope": "team", "team": t.id })));
+    app.db.record(&by.event("role.unassigned").target("role", &r.id).details(json!({ "name": r.name, "user": u.id, "scope": "team", "team": t.id, "scimMapping": scim })));
     Ok(Json(json!({ "team": { "id": t.id, "name": t.name }, "user": person(&u), "role": Value::Null })))
 }

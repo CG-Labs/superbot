@@ -445,6 +445,7 @@ pub async fn leave(app: &AppState, by: &Who, team_id: &str, user_id: &str, reaso
         crate::acl_changed(app, by, id, true).await;
     }
     app.db.record(&team_event(by, "team.member_left", team_id, json!({ "user": user_id, "role": member.role, "reason": reason })));
+    crate::scim::roles::left(app, by, team_id, user_id).await;
     release(app, by, team_id, user_id).await;
     crate::team_billing::member_changed(app, team_id, user_id, &tier, "left");
     app.send(json!({ "type": "resync" }));

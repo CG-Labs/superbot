@@ -136,6 +136,8 @@ mod runner;
 mod sandbox;
 mod scim;
 #[cfg(test)]
+mod scim_group_roles_http_tests;
+#[cfg(test)]
 mod scim_groups_http_tests;
 #[cfg(test)]
 mod scim_http_tests;
@@ -312,7 +314,7 @@ async fn main() {
         .unwrap_or_else(|e| exit(format!("Shared Bots: {e}")));
     let teams = teams::Settings::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Teams: {e}")));
     let resume_routines = handover::resume_on_enable(&env("ROUTINES_ON_ENABLE", "")).unwrap_or_else(|e| exit(e));
-    let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", ""), &env("SCIM_GROUPS", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
+    let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", ""), &env("SCIM_GROUPS", ""), &env("SCIM_GROUP_ROLES", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
     let tiers = tiers::Tiers::from_env(|k| env(k, "")).unwrap_or_else(|e| exit(format!("Tiers: {e}")));
     for name in adapters::NAMES {
         adapters::get(name).expect("listed adapter").check_env(&|k| env(k, "")).unwrap_or_else(|e| exit(e));
@@ -639,9 +641,10 @@ async fn main() {
     }
     match auth_state.scim.enabled {
         true => log_info!(
-            "SCIM: on at /scim/v2; new users get the {} role; groups {}.",
+            "SCIM: on at /scim/v2; new users get the {} role; groups {}; group roles {}.",
             auth_state.scim.default_role.as_str(),
-            if auth_state.scim.groups { "are teams (SCIM_GROUPS=on)" } else { "off (SCIM_GROUPS=off)" }
+            if auth_state.scim.groups { "are teams (SCIM_GROUPS=on)" } else { "off (SCIM_GROUPS=off)" },
+            if auth_state.scim.group_roles { "on, never admin (SCIM_GROUP_ROLES=on)" } else { "off (SCIM_GROUP_ROLES=off)" }
         ),
         false => log_info!("SCIM: off (SCIM=off)."),
     }
@@ -1035,6 +1038,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/scim/tokens/{id}", delete(scim::revoke_token))
         .route("/scim/groups", get(scim::groups::list_links).post(scim::groups::link))
         .route("/scim/groups/{team}", delete(scim::groups::unlink))
+        .route("/scim/role-mappings", get(scim::roles::list).post(scim::roles::create))
+        .route("/scim/role-mappings/{id}", get(scim::roles::get).delete(scim::roles::delete))
         .route("/status/incidents", get(status::list).post(status::create))
         .route("/status/incidents/{id}", patch(status::edit).delete(status::delete))
         .route("/status/incidents/{id}/updates", post(status::add_update))
