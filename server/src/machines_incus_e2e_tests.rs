@@ -293,6 +293,12 @@ async fn real_incus_containers_enroll_stay_apart_and_follow_the_lifecycle() {
     }
     env.say(&format!("preflight: {}", serde_json::to_string(&checks).unwrap()));
 
+    // The host says what it has and uses, for /metrics (ADR 0106).
+    let u = env.incus.host_use().await.unwrap();
+    assert!(u.cpus.is_some_and(|n| n > 0) && u.memory.is_some_and(|(used, total)| used > 0 && used <= total), "{u:?}");
+    assert!(u.disks.first().is_some_and(|d| d.name == "pool" && d.total > 0 && d.used <= d.total), "{u:?}");
+    env.say(&format!("host use: {u:?}"));
+
     // Two users' containers, made by the provider and sized by the tier.
     let mut users = Vec::new();
     for email in ["ada@example.com", "bea@example.com"] {

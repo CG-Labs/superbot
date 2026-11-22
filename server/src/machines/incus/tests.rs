@@ -637,3 +637,26 @@ async fn no_container_on_an_incus_too_old_or_missing_extensions() {
     s.w().missing_extensions.clear();
     p.create(&spec("superbot-m1", "c1-m2-d20")).await.unwrap();
 }
+
+#[tokio::test]
+async fn a_host_says_its_cpus_load_memory_and_pool_space() {
+    let s = StandIn::start().await;
+    let u = incus(&s).host_use().await.unwrap();
+    assert_eq!(
+        u,
+        HostUse {
+            cpus: Some(16),
+            load: Some((1.5, 1.25)),
+            memory: Some((8 << 30, 64 << 30)),
+            disks: vec![DiskUse { name: "pool", used: 100 << 30, total: 1000 << 30 }],
+        }
+    );
+    // Before resources_load there is no load; a pool that won't say leaves the disk out.
+    s.w().resources["load"] = json!({ "average1min": 0.0, "average5min": 0.0, "average10min": 0.0, "processes": 0 });
+    s.w().pool_resources = Value::Null;
+    let u = incus(&s).host_use().await.unwrap();
+    assert_eq!((u.cpus, u.load, u.disks.len()), (Some(16), None, 0), "{u:?}");
+    assert_eq!(host_use(&json!({}), Some(&json!({ "space": { "total": 0 } }))), HostUse::default());
+    s.w().down = true;
+    assert!(incus(&s).host_use().await.is_err());
+}

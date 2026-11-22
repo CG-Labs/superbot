@@ -18,8 +18,8 @@
 //!   containers, nesting, and host paths there.
 
 use super::provider::{
-    ByteStream, CreateSpec, FirewallDevices, FirewallRule, Fut, MachineProvider, ProviderError, ProviderFirewall,
-    ProviderMachine, RebuildSpec, RestoreFile, RestoreSpec,
+    ByteStream, CreateSpec, DiskUse, FirewallDevices, FirewallRule, Fut, HostUse, MachineProvider, ProviderError,
+    ProviderFirewall, ProviderMachine, RebuildSpec, RestoreFile, RestoreSpec,
 };
 use super::pki;
 use crate::secrets::SecretStore;
@@ -657,6 +657,24 @@ fn provisioning(n: &str) -> ProviderMachine {
     }
 }
 
+/// `GET /1.0/resources` and `GET /1.0/storage-pools/<pool>/resources` as a host's use
+/// (ADR 0106). Load needs the `resources_load` extension; without it, it's absent.
+pub(crate) fn host_use(r: &Value, pool: Option<&Value>) -> HostUse {
+    let total = |v: &Value| v["total"].as_u64().filter(|t| *t > 0);
+    let load = &r["load"];
+    HostUse {
+        cpus: total(&r["cpu"]),
+        load: (load["processes"].as_u64().unwrap_or(0) > 0)
+            .then(|| Some((load["average1min"].as_f64()?, load["average5min"].as_f64()?)))
+            .flatten(),
+        memory: total(&r["memory"]).map(|t| (r["memory"]["used"].as_u64().unwrap_or(0), t)),
+        disks: pool
+            .and_then(|p| total(&p["space"]).map(|t| DiskUse { name: "pool", used: p["space"]["used"].as_u64().unwrap_or(0), total: t }))
+            .into_iter()
+            .collect(),
+    }
+}
+
 /// SSH keys for root, as Linode puts them (ADR 0025); cloud-init merges this under
 /// the enrollment user data.
 fn vendor_data(keys: &[String]) -> String {
@@ -944,6 +962,14 @@ impl Incus {
             return Err(api(400, format!("Incus lacks API extensions: {}", missing.join(", "))));
         }
         Ok(format!("Incus {version} trusts botd"))
+    }
+
+    /// What the host has and uses now (ADR 0106): its CPU threads, load and memory, and
+    /// the space in machines' storage pool. A pool that won't say leaves the disk out.
+    pub(crate) async fn host_use(&self) -> Result<HostUse, ProviderError> {
+        let r = self.call(Method::GET, "/1.0/resources", &[], None, None).await?.metadata;
+        let pool = self.call(Method::GET, &format!("/1.0/storage-pools/{}/resources", self.s.pool), &[], None, None).await;
+        Ok(host_use(&r, pool.ok().map(|p| p.metadata).as_ref()))
     }
 
     async fn check_project(&self) -> Result<(), ProviderError> {

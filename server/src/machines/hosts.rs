@@ -34,6 +34,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub const HOST_LOST: &str = "host_lost";
 /// Restores at once after a host is lost: each streams a whole disk.
@@ -176,6 +177,34 @@ pub async fn watch(app: &AppState, cp: &ControlPlane) -> usize {
         }
     }
     down
+}
+
+/// How long a host may take to say what it uses (ADR 0106).
+pub const READ_WITHIN: Duration = Duration::from_secs(10);
+
+/// With `/metrics` on, what each host that is up has and uses now (ADR 0106): all at
+/// once, each given `within`. It runs apart from host checks and reconciling, so a host
+/// slow to answer holds up neither. A read that fails keeps the last one, whose age
+/// shows on `/metrics`; it is logged once until a read works again, and never makes
+/// the host down.
+pub async fn read_uses(app: &AppState, cp: &ControlPlane, within: Duration) {
+    let metrics = app.db.metrics();
+    let Some(h) = cp.hosts().filter(|_| metrics.wants_host_use()) else { return };
+    let up = h.configured().into_iter().filter(|c| c.status == HostStatus::Up);
+    let reads = up.map(|c| async move { (tokio::time::timeout(within, h.host_use(&c.name)).await, c.name) });
+    for (read, host) in futures_util::future::join_all(reads).await {
+        let e = match read {
+            Ok(Ok(u)) => {
+                metrics.host_read(&host, now(), u);
+                continue;
+            }
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => format!("no answer within {}s", within.as_secs_f64()),
+        };
+        if metrics.host_read_failed(&host) {
+            crate::obs::log::log_warn!("WARNING: Incus host {host} didn't say what it uses ({e}); its capacity metrics keep their last reading.");
+        }
+    }
 }
 
 /// Where a restore of `m` goes: `host` if given, else its own host, or the host
