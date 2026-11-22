@@ -140,23 +140,21 @@ pub(crate) use {log_info, log_warn};
 /// The newest lines botd logged, as JSON whatever `LOG_FORMAT` is, kept in memory for
 /// the support bundle (ADR 0131). A restart forgets them; journald or Docker keeps the rest.
 pub mod recent {
+    use serde_json::{Value, json};
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
     pub const KEEP: usize = 2_000;
-    /// Longer lines are cut: one huge warning mustn't crowd out the rest.
+    /// Longer lines are cut, a field at a time so each stays JSON: one huge warning
+    /// mustn't crowd out the rest.
     pub const MAX_LINE: usize = 4_096;
+    const MAX_FIELD: usize = 1_024;
 
     static LINES: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 
     pub fn push(mut line: String) {
         if line.len() > MAX_LINE {
-            let mut end = MAX_LINE;
-            while !line.is_char_boundary(end) {
-                end -= 1;
-            }
-            line.truncate(end);
-            line.push('…');
+            line = shorten(&line);
         }
         let mut l = LINES.lock().unwrap_or_else(|e| e.into_inner());
         if l.len() >= KEEP {
@@ -168,6 +166,32 @@ pub mod recent {
     /// Oldest first.
     pub fn lines() -> Vec<String> {
         LINES.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect()
+    }
+
+    fn shorten(line: &str) -> String {
+        let mut v: Value = serde_json::from_str(line).unwrap_or_else(|_| json!({ "msg": line }));
+        clip(&mut v);
+        let s = v.to_string();
+        if s.len() <= MAX_LINE {
+            return s;
+        }
+        json!({ "level": v["level"], "msg": v["msg"], "ts": v["ts"], "cut": true }).to_string()
+    }
+
+    fn clip(v: &mut Value) {
+        match v {
+            Value::String(s) if s.len() > MAX_FIELD => {
+                let mut end = MAX_FIELD;
+                while !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                s.truncate(end);
+                s.push('…');
+            }
+            Value::Array(a) => a.iter_mut().for_each(clip),
+            Value::Object(o) => o.values_mut().for_each(clip),
+            _ => {}
+        }
     }
 }
 

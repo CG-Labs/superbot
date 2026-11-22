@@ -44,9 +44,9 @@ One folder, `superbot-support-<time>/`, in ustar format written by botd (about 4
 
 ### Recent logs from memory
 
-botd keeps its newest 2,000 log lines in a ring buffer, rendered as JSON whatever `LOG_FORMAT` is (lines over 4 KiB are cut). Text-mode output is unchanged. It costs at most about 8 MB and a lock per line. A restart empties it: the bundle says where older logs are (journald, Docker). Reading journald from botd would need privileges or a dependency, and Compose has no journald.
+botd keeps its newest 2,000 log lines in a ring buffer, rendered as JSON whatever `LOG_FORMAT` is (a line over 4 KiB has its long fields cut, so it stays JSON). Text-mode output is unchanged. It costs at most about 8 MB and a lock per line. A restart empties it: the bundle says where older logs are (journald, Docker). Reading journald from botd would need privileges or a dependency, and Compose has no journald.
 
-Log lines already avoid emails, names, IPs, message text and tokens ([ADR 0089](0089-metrics-and-structured-logs.md)); the bundle scrubs them again (below) because free-text warnings can carry anything.
+Log lines already avoid emails, names, IPs, message text and tokens ([ADR 0089](0089-metrics-and-structured-logs.md)); the bundle scrubs them again (below) because free-text warnings can carry anything. It scrubs each line's fields, not the line as text, so every line stays one JSON object.
 
 ### Only botd's settings, redacted four ways
 

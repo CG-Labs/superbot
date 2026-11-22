@@ -328,12 +328,14 @@ fn audit_summary(app: &App, now_ms: i64) -> (Value, usize) {
     (v, events.len())
 }
 
+/// The newest log lines, each scrubbed field by field so it stays one JSON object.
 fn logs() -> (String, usize) {
     let lines = crate::obs::log::recent::lines();
     let n = lines.len();
     let mut out = String::new();
     for l in lines {
-        out.push_str(&scrub_text(&l));
+        let v = serde_json::from_str::<Value>(&l).unwrap_or_else(|_| json!({ "msg": l }));
+        out.push_str(&redact::value(scrub_value(v)).to_string());
         out.push('\n');
     }
     (out, n)
@@ -553,6 +555,20 @@ pub(crate) mod tests {
         assert_eq!(mask_emails("é a@b.io é"), "é [email] é");
         assert_eq!(origins_only("see https://h.example.com:8443/a/b, then http://x"), "see https://h.example.com:8443/[redacted], then http://x");
         assert_eq!(origins_only("\"https://h/p?q\""), "\"https://h/[redacted]\"");
+    }
+
+    #[test]
+    fn log_lines_stay_json_whatever_they_say() {
+        let marker = crate::random_hex(6);
+        crate::obs::log::line(crate::obs::log::Level::Info, &format!("Stored secrets: none ({marker}). token=abc123 \"quoted\""));
+        crate::obs::log::line(crate::obs::log::Level::Warn, &format!("{marker}-long {}", "é".repeat(5_000)));
+        let (out, _) = logs();
+        let mine: Vec<Value> = out.lines().filter(|l| l.contains(&marker)).map(|l| serde_json::from_str(l).expect("each line is JSON")).collect();
+        assert_eq!(mine.len(), 2, "{out}");
+        assert_eq!(mine[0]["msg"], format!("Stored secrets: [redacted] ({marker}). token=[redacted] \"quoted\""));
+        let long = mine[1]["msg"].as_str().unwrap();
+        assert!(long.ends_with('…') && long.len() <= 1_024 + '…'.len_utf8(), "cut a field at a time: {}", long.len());
+        assert_eq!(mine[1]["level"], "warn");
     }
 
     /// Reads a ustar archive back: each file's name and contents, checking every checksum.
