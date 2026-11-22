@@ -143,13 +143,17 @@ fn provider_name(p: &str) -> String {
     c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
+/// A running machine with no backup time saved that the provider hasn't described since
+/// botd started: no new breach, and an open one stays open, until it has.
+const NOT_CHECKED_YET: &str = "not_checked_yet";
+
 /// Why `m` isn't held to its provider backups' RPO now, if it isn't. As off-host
 /// backups': a suspended machine's disk doesn't change.
 fn provider_untracked(cp: &ControlPlane, m: &Machine) -> Option<&'static str> {
     match m.state {
         State::Destroyed => Some("destroyed"),
         _ if !cp.owns(m) => Some("other_provider"),
-        State::Running if m.provider_backup_at.is_none() && !cp.provider_saw(&m.id) => Some("not_checked_yet"),
+        State::Running if m.provider_backup_at.is_none() && !cp.provider_saw(&m.id) => Some(NOT_CHECKED_YET),
         State::Running => None,
         State::Suspended => Some("suspended"),
         _ => Some("not_running"),
@@ -301,6 +305,8 @@ pub fn watch(app: &AppState, cp: &ControlPlane) -> usize {
         }
         let st = held.status(app, cp, &m);
         match (st.breach, was) {
+            // Not asked yet since botd started: an open breach stays open until it has.
+            (false, Some(_)) if st.untracked == Some(NOT_CHECKED_YET) => breaching += 1,
             (true, Some(_)) => breaching += 1,
             (true, None) => {
                 let id = format!("rb{}", crate::random_hex(8));

@@ -209,6 +209,14 @@ async fn a_machine_isnt_held_to_it_before_the_provider_says_after_an_upgrade() {
     fake.set(&pid, |pm| pm.last_backup_at = None);
     reconcile(port, &admin).await;
     assert_eq!(watch(&app), 1);
+
+    // A restart doesn't end it before the provider is asked again, nor open another.
+    app.control_plane.get().unwrap().forget_provider_seen();
+    assert_eq!(watch(&app), 1, "still open");
+    reconcile(port, &admin).await;
+    assert_eq!(watch(&app), 1);
+    assert!(events(port, &admin, "machine.rpo_recovered").await.is_empty());
+    assert_eq!(events(port, &admin, "machine.rpo_breached").await.len(), 1, "one breach, one alert");
 }
 
 #[tokio::test]
