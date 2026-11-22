@@ -36,6 +36,8 @@ Copies go to `<prefix>server/<archive>`, beside the machines' `<prefix>machines/
 
 `SERVER_BACKUP_OFF_HOST` is `auto` (the default: copy when a store is set), `on` (refuse to start without a store, for servers that must never keep backups only on the host), or `off`.
 
+Each copy records its destination (endpoint, bucket and folder). Only copies to the store set now count: after a change of bucket, endpoint or prefix, the newest archive is due at once, the RPO clock starts again, and botd neither trusts nor deletes the old store's copies.
+
 ### Encryption
 
 An archive the script encrypted (`.age`, to `SUPERBOT_BACKUP_AGE_RECIPIENTS`) is copied as it is, so the copy is encrypted at rest on both sides and botd never holds a key that opens it. A plain archive is encrypted on the way to `SERVER_BACKUP_AGE_RECIPIENTS` (or `_FILE`; with the machines' store, `MACHINE_BACKUP_AGE_RECIPIENTS` when unset) and stored as `<archive>.age`. With neither, it is copied plain and the startup log says so; the store's own encryption at rest is then all there is.
@@ -44,22 +46,22 @@ botd never reads `SUPERBOT_BACKUP_AGE_RECIPIENTS`: it is the script's, may hold 
 
 ### Retention
 
-`SERVER_BACKUP_RETENTION_DAYS` (30 by default) deletes a copy and its manifest that many days after its archive was made, every pass. The newest copy is never deleted, however old, so a server whose archives stopped still has its last one off the host. `off` leaves deleting to the bucket's own lifecycle rules, so its keys need no delete right; the store then holds every copy botd made.
+`SERVER_BACKUP_RETENTION_DAYS` (30 by default) deletes a copy and its manifest that many days after its archive was made, every pass, counting by the setting as it is now. The newest copy is never deleted, however old, so a server whose archives stopped still has its last one off the host. `off` leaves deleting to the bucket's own lifecycle rules, so its keys need no delete right; botd then deletes nothing, not even copies made while retention was on.
 
 ### Failures, the RPO and alerts
 
 Each copy is a row in a new `server_backups` table (running, done, failed, deleted) and an audit event: `server.backup_copied`, `server.backup_copy_failed` (outcome failure, with the error) and `server.backup_deleted`, all by the system actor `server-backups`. One copy runs at a time (a partial unique index). A failed archive is tried again after 30 minutes. A copy cut off by a restart ends as failed when botd starts; its upload was never completed, so the store holds nothing of it.
 
-The RPO is `SERVER_BACKUP_RPO_HOURS`, by default the archive interval plus ADR 0074's two hours of headroom: 26 hours for the daily timer, or `SUPERBOT_BACKUP_INTERVAL` rounded up to hours plus two under Compose. The age measured is that of the newest archive copied off the host, by the time in its name; before the first copy, the time since copies were turned on. Past the RPO botd opens a breach once (`server.backup_rpo_breached`, failure), sends it through the notifier like a machine's (ADR 0074), and closes it when a newer copy lands (`server.backup_rpo_recovered`, reason `backed_up`). The alert names the last copy's error, or that no newer archive reached `BACKUP_DIR`, so a stopped timer or sidecar is caught too.
+The RPO is `SERVER_BACKUP_RPO_HOURS`, by default the archive interval plus ADR 0074's two hours of headroom: 26 hours for the daily timer, or `SUPERBOT_BACKUP_INTERVAL` rounded up to hours plus two under Compose. The age measured is that of the newest archive copied off the host, by the time in its name; before the first copy, the time since copies were turned on. Past the RPO botd opens a breach once (`server.backup_rpo_breached`, failure), sends it through the notifier like a machine's (ADR 0074), and closes it when a newer copy lands (`server.backup_rpo_recovered`, reason `backed_up`). The alert names the last copy's error, or that no newer archive reached `BACKUP_DIR`, so a stopped timer or sidecar is caught too. The RPO is checked every minute on its own timer, so a long upload can't hold back the alert.
 
-`/metrics` gains `superbot_server_backup_off_host` (1 or 0, always shown) and, with a store, `superbot_server_backup_rpo_seconds`, `superbot_server_backup_age_seconds`, `superbot_server_backup_past_rpo`, `superbot_server_backup_last_copy_timestamp_seconds` and `superbot_server_backup_last_copy_size_bytes`. The five audit actions are counted in `superbot_events_total`. [`deploy/prometheus/superbot-backup.rules.yml`](../../deploy/prometheus/superbot-backup.rules.yml) alerts when backups stay on the host for an hour, are past the RPO, or fail twice in two hours, tested with `promtool` in CI.
+`/metrics` gains `superbot_server_backup_off_host` (1 or 0, always shown) and, with a store, `superbot_server_backup_rpo_seconds`, `superbot_server_backup_age_seconds`, `superbot_server_backup_past_rpo`, `superbot_server_backup_last_copy_timestamp_seconds` and `superbot_server_backup_last_copy_size_bytes`. The five audit actions are counted in `superbot_events_total`. [`deploy/prometheus/superbot-backup.rules.yml`](../../deploy/prometheus/superbot-backup.rules.yml) alerts, per instance, when backups stay on the host for an hour, are past the RPO, or fail twice in two hours, tested with `promtool` in CI.
 
 ### Without a store, the gap is shown
 
 Existing installs have no store, and an upgrade must not make them stop. With none, botd copies nothing, starts as before, and says so where admins look:
 
 - a `WARNING:` line at every start, and `serverBackups.offHost: false` in `server.started`;
-- the setup checklist's new item, "Server backups copied off this host", open until a store is set and the newest copy is within the RPO;
+- the setup checklist's new item, "Server backups copied off this host", open until a store is set, an archive has reached it, and the newest copy is within the RPO;
 - `GET /api/backups` (`botctl backups`): the store without its keys, the RPO, the newest archive and copies, and the warning;
 - `superbot_server_backup_off_host 0` and its alert.
 
@@ -80,9 +82,9 @@ Existing installs have no store, and an upgrade must not make them stop. With no
 ## Tests
 
 - **Settings** (`server_backups_http_tests`): nothing set is on-host with the warning; the server's own store, the machines' store and its recipients, `off` and `on`, Compose's `BACKUP_DIR` and interval; settings that can't work stop botd: `on` without a store, an endpoint or RPO without a bucket, bad hours, days, recipients, endpoint or a missing key. `SUPERBOT_BACKUP_AGE_RECIPIENTS` is never read.
-- **Against the S3 stand-in**: only the newest finished archive is copied (partials, links, folders and odd names ignored), encrypted on the way and decrypted back to the same bytes, with its manifest, row and audit event; nothing new copies nothing; an `.age` archive is copied byte for byte; a failed upload leaves nothing in the store, is audited and counted, isn't retried for 30 minutes, then is; a copy cut off by a restart ends failed; retention deletes old copies but never the newest, and `off` sets no expiry; past the RPO is audited once, alerted, shown in the checklist and gauges, and recovered by a newer copy. Admins see the store without its keys; members get 403. Without a store: nothing copied, the warning in the API and checklist, 409 for copy now, `superbot_server_backup_off_host 0`.
+- **Against the S3 stand-in**: only the newest finished archive is copied (partials, links, folders and odd names ignored), encrypted on the way and decrypted back to the same bytes, with its manifest, row and audit event; nothing new copies nothing; an `.age` archive is copied byte for byte; a failed upload leaves nothing in the store, is audited and counted, isn't retried for 30 minutes, then is; a copy cut off by a restart ends failed; retention deletes old copies but never the newest, by the setting as it is now, and `off` deletes nothing; a new store starts empty and leaves the old one's copies alone; the checklist stays open until the first copy; past the RPO is audited once, alerted, shown in the checklist and gauges, and recovered by a newer copy. Admins see the store without its keys; members get 403. Without a store: nothing copied, the warning in the API and checklist, 409 for copy now, `superbot_server_backup_off_host 0`.
 - **Installer** (`deploy/test-install.sh`): no flags write nothing and the summary warns; bad flags are refused; the flags write the store and recipients, keys only from the environment, and a later flagless upgrade keeps them.
-- **Alert rules**: `promtool test rules` for each alert firing and not.
+- **Alert rules**: `promtool test rules` for each alert firing and not, and one server that copies not hiding another that doesn't.
 
 ## Consequences
 

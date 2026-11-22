@@ -53,7 +53,7 @@ sudo SERVER_BACKUP_S3_ACCESS_KEY_ID=<access-key-id> SERVER_BACKUP_S3_SECRET_ACCE
 Or set `SERVER_BACKUP_S3_BUCKET`, `_ENDPOINT`, `_REGION`, `_ACCESS_KEY_ID` and `_SECRET_ACCESS_KEY` in `.env` (Compose: `deploy/docker/.env`) and restart botd. Without them, a server with machine backups (`MACHINE_BACKUP_S3_*`) uses that store, under `<prefix>server/`. `SERVER_BACKUP_OFF_HOST=on` makes botd refuse to start without a store.
 
 - **What lands there**: `<prefix>server/superbot-<stamp>.tar.gz[.age]` and a manifest `superbot-<stamp>.json` with its size and SHA-256. An archive `superbot-backup` encrypted is copied as it is; a plain one is encrypted on the way to `SERVER_BACKUP_AGE_RECIPIENTS` when set.
-- **Retention**: `SERVER_BACKUP_RETENTION_DAYS` (default 30), never the newest copy.
+- **Retention**: `SERVER_BACKUP_RETENTION_DAYS` (default 30), never the newest copy; `off` deletes nothing. Copies left in a store you moved away from stay there: botd only counts and deletes copies in the store set now.
 - **RPO**: `SERVER_BACKUP_RPO_HOURS`, by default the archive interval plus 2 hours (26 for the daily timer). Past it botd audits `server.backup_rpo_breached` and notifies admins like a machine's breach; [`deploy/prometheus/superbot-backup.rules.yml`](../../deploy/prometheus/superbot-backup.rules.yml) alerts from `/metrics` too.
 - **Check it**: `botctl backups` shows the store, the newest copies and errors; `botctl backups copy` copies the newest archive now. Every copy, failure and deletion is in the audit log (`server.backup_*`).
 
