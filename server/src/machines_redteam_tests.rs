@@ -27,7 +27,7 @@ use crate::machines::job::{self, Host, Limiting};
 use crate::machines::runas::{self, Ids};
 use crate::machines::wire::{self, JobEvent, JobRequest, LimitReport, RunLimits};
 use crate::machines_bot_user_tests::until_ready;
-use crate::machines_mtls_tests::{agent_with_config, machine_for, serve_with_auth};
+use crate::machines_mtls_tests::{agent_with, agent_with_config, machine_for, serve_with_auth};
 use crate::machines_teammates_tests::{World, ada_auth, run as send, said, shared_pi};
 use crate::users_http_tests::user_with;
 use crate::*;
@@ -559,20 +559,29 @@ async fn as_root_red_team_a_run_cant_exhaust_the_machine() {
     };
     let roomy = RunLimits { cpu_percent: 100, memory_percent: 40, pids: 256, io_weight: 100 };
 
-    // The agent keeps its own pace while the runs try to take the machine.
+    // A real agent, asked for heartbeats over mutual TLS as botd does, keeps answering
+    // while the runs try to take the machine.
+    let mut env = serve_with_auth(|e| e, |_| {}).await;
+    let (_ada, mid, token) = machine_for(&env, "ada@example.com").await;
+    let _agent = agent_with(&mut env, &mid, &token, "#!/bin/sh\nexit 3\n").await;
+    let machine = env.app.db.machine(&mid).unwrap();
+    crate::machines::enroll::heartbeat(&env.app, &env.e, &machine).await.expect("the agent answers before the runs");
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let (app, e) = (env.app.clone(), env.e.clone());
     let pace = tokio::spawn(async move {
-        let mut worst = Duration::ZERO;
-        let mut last = tokio::time::Instant::now();
+        let (mut worst, mut asked) = (Duration::ZERO, 0);
         loop {
+            let at = tokio::time::Instant::now();
+            let hb = tokio::time::timeout(Duration::from_secs(10), crate::machines::enroll::heartbeat(&app, &e, &machine)).await;
+            assert!(matches!(hb, Ok(Ok(_))), "the agent answered heartbeat {asked} under load: {hb:?}");
+            worst = worst.max(at.elapsed());
+            asked += 1;
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
                 _ = stop_rx.changed() => break,
             }
-            worst = worst.max(last.elapsed());
-            last = tokio::time::Instant::now();
         }
-        worst
+        (worst, asked)
     });
 
     let bomb = limited("rt-bomb", RunLimits { pids: 64, ..roomy });
@@ -603,7 +612,7 @@ echo "score=$(cat /proc/self/oom_score_adj)"
         ),
     );
     let _ = stop_tx.send(true);
-    let worst = pace.await.unwrap();
+    let (worst, asked) = pace.await.unwrap();
 
     let report = |r: &Ran| r.limited.clone().expect("a report on its limits");
     let b = report(&b);
@@ -616,5 +625,6 @@ echo "score=$(cat /proc/self/oom_score_adj)"
         assert_eq!(out.said(k), "held", "{k}: {}", out.out);
     }
     assert_eq!(out.said("score"), "500", "a run is the first to go when memory runs out: {}", out.out);
-    assert!(worst < Duration::from_secs(2), "the agent kept its pace: its worst gap was {worst:?}");
+    assert!(asked >= 5, "heartbeats were asked throughout: {asked}");
+    assert!(worst < Duration::from_secs(2), "the agent kept answering: its slowest heartbeat took {worst:?}");
 }
