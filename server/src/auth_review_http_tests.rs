@@ -149,8 +149,8 @@ async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() 
         if m != "GET" && p != "/api/auth/logout" && !(m == "DELETE" && p == "/api/me/push") && !own_mfa {
             assert!(!rbac::allows(Principal::User(Role::Readonly), need), "readonly could {m} {p}");
         }
-        // The admin portal, the audit log, the access-review report, retention and its holds, secrets, signups, the setup wizard, the license, status incidents, and SCIM tokens and group links are admin-only.
-        if ["/api/users", "/api/sessions", "/api/audit", "/api/access-review", "/api/retention", "/api/secrets", "/api/signups", "/api/policy", "/api/setup", "/api/license", "/api/usage", "/api/status", "/api/scim"].iter().any(|s| p.starts_with(s)) && !(m == "GET" && p.starts_with("/api/policy")) {
+        // The admin portal, the audit log, the access-review report, retention and its holds, server backups, secrets, signups, the setup wizard, the license, status incidents, and SCIM tokens and group links are admin-only.
+        if ["/api/users", "/api/sessions", "/api/audit", "/api/access-review", "/api/retention", "/api/backups", "/api/secrets", "/api/signups", "/api/policy", "/api/setup", "/api/license", "/api/usage", "/api/status", "/api/scim"].iter().any(|s| p.starts_with(s)) && !(m == "GET" && p.starts_with("/api/policy")) {
             assert_eq!(need, rbac::Perm::Admin, "{m} {p}");
         }
         checked += 1;

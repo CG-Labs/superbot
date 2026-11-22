@@ -111,6 +111,9 @@ mod scim_groups_http_tests;
 mod scim_http_tests;
 mod screen;
 mod secrets;
+mod server_backups;
+#[cfg(test)]
+mod server_backups_http_tests;
 mod setup;
 #[cfg(test)]
 mod setup_http_tests;
@@ -319,6 +322,8 @@ async fn main() {
             std::process::exit(1);
         }
     }
+    let server_backups = server_backups::ServerBackups::from_env(&secrets::env::EnvStore::process(), &|k| env(k, ""), &data_dir)
+        .unwrap_or_else(|e| exit(format!("Server backups: {e}")));
     // Machine enrollment's CA key is derived from the master key (ADR 0031).
     let bin_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
     // Users' machines get the managed tiers' default harnesses unless told otherwise (ADR 0079).
@@ -580,6 +585,18 @@ async fn main() {
             watch.watch.sweep(db::now());
         }
     });
+    log_info!("Server backups: {} (ADR 0109).", server_backups.describe());
+    if let Some(w) = server_backups.warning() {
+        log_warn!("WARNING: {w}");
+    }
+    let server_backups_summary = json!({
+        "offHost": server_backups.target.is_some(),
+        "mode": server_backups.mode.as_str(),
+        "store": server_backups.target.as_ref().map(|t| t.source.as_str()),
+        "rpoHours": server_backups.target.as_ref().map(|_| server_backups.rpo_ms / 3_600_000),
+        "retentionDays": server_backups.target.as_ref().and(server_backups.retention_days),
+    });
+    let _ = app.server_backups.set(Arc::new(server_backups));
     let router = router(app.clone(), auth_state);
     let policy = app.db.global_policy();
     app.db.record(&Event::new(Actor::system("server"), "server.started").details(json!({
@@ -618,10 +635,12 @@ async fn main() {
         "logFormat": observe.log.as_str(),
         "metrics": observe.metrics.as_ref().map(|m| json!({ "loopback": m.addr.ip().is_loopback(), "token": m.token.is_some() })),
         "statusPage": status_page,
+        "serverBackups": server_backups_summary,
     })));
     license::start(app.clone());
     audit::start_retention(app.clone(), retention);
     retention::start(app.clone(), chat_retention);
+    server_backups::start(app.clone());
     users::start_pruning(app.clone(), sessions);
     machines::hosts::load(&app, &control_plane).unwrap_or_else(|e| exit(format!("Incus hosts: {e}")));
     if observe.metrics.is_some() {
@@ -756,6 +775,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/access-review/complete", post(access_review::complete))
         .route("/retention", get(retention::get))
         .route("/retention/holds/{bot}", put(retention::put_hold).delete(retention::delete_hold))
+        .route("/backups", get(server_backups::get).post(server_backups::copy_now))
         .route("/secrets", get(list_secrets))
         .route("/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/me/tier", get(my_tier))

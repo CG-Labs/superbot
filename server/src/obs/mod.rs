@@ -222,6 +222,7 @@ pub fn render(app: &AppState) -> String {
         render_machines(app, cp, &mut out);
     }
     capacity::render(app, &mut out);
+    crate::server_backups::render(app, &mut out);
     out
 }
 
