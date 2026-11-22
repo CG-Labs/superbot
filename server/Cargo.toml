@@ -28,6 +28,10 @@ path = "src/bin/superbot-run.rs"
 name = "superbot-site"
 path = "src/bin/superbot-site/main.rs"
 
+[[bin]]
+name = "superbot-evidence"
+path = "src/bin/superbot-evidence/main.rs"
+
 [dependencies]
 age = { version = "0.12", default-features = false }
 aws-lc-rs = "1"
