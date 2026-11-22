@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 const SERVER_KEY: &str = "machine_egress_policy";
-const USER_KEY: &str = "machine_egress_policy:user:";
+pub const USER_KEY: &str = "machine_egress_policy:user:";
 pub const INHERIT: &str = "inherit";
 /// An agent that holds another policy, or failed to load it, is sent it again after this long.
 const RESEND_MS: i64 = 10 * 60_000;
@@ -252,7 +252,7 @@ fn push_all(app: AppState, only: Option<Vec<Machine>>) {
 
 fn server_view(app: &App) -> Value {
     let s = server(app);
-    let own = app.db.users().iter().filter(|u| own(app, &u.id).is_some()).count();
+    let own = app.db.users().iter().filter(|u| u.erased_at.is_none() && own(app, &u.id).is_some()).count();
     json!({ "mode": s.mode, "allow": s.allow, "usersWithOwnPolicy": own })
 }
 

@@ -4699,6 +4699,7 @@ impl Db {
         run("DELETE FROM team_members WHERE user_id = ?", &[&user_id])?;
         run("DELETE FROM settings WHERE key = ?", &[&format!("machine_egress_policy:user:{user_id}")])?;
         run("DELETE FROM residency_pins WHERE subject_type = 'user' AND subject_id = ?", &[&user_id])?;
+        run("DELETE FROM settings WHERE key = ?", &[&format!("{}{user_id}", crate::machines::egress_policy::USER_KEY)])?;
         run("UPDATE residency_pins SET pinned_by = ?2 WHERE pinned_by = ?1", &[&user_id, &pseudonym])?;
         let refs: Vec<(String, String, String)> = {
             let mut st = tx.prepare("SELECT subject_type, subject_id, reference FROM residency_pins").map_err(db_err)?;
