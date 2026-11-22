@@ -124,12 +124,12 @@ async fn break_glass_password_guesses_count_against_the_owner_from_any_ip() {
     let (port, _, basic_owner) = serve(Settings { account_failures: 4, ..Settings::default() }).await;
     // Reading the audit log as the owner over HTTP Basic would be the owner signing in.
     let (_, admin) = user_with(port, &basic_owner, "root@example.com", "admin").await;
-    let wrong = basic("not-the-password");
+    let wrong = basic(&random_hex(16));
     for i in 0..3 {
         assert_eq!(call_with(port, "GET", "/api/state", &wrong, &from(&format!("203.0.113.{i}")), "").await.0, 401);
     }
     assert!(detections(port, &admin).await.is_empty());
-    assert_eq!(login(port, "198.51.100.9", json!({ "password": "also-wrong" })).await.0, 401);
+    assert_eq!(login(port, "198.51.100.9", json!({ "password": random_hex(16) })).await.0, 401);
     let found = detections(port, &admin).await;
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!((found[0]["targetId"].as_str(), found[0]["details"]["pattern"].as_str(), found[0]["details"]["method"].as_str()), (Some("operator"), Some("account_failures"), Some("password")));
