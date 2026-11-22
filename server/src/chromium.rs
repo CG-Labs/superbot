@@ -8,9 +8,10 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 
-/// SUPERBOT_CHROMIUM_SANDBOX: on (the default) or off. True when on.
+/// SUPERBOT_CHROMIUM_SANDBOX: on (the default) or off, exactly, as the image's `chromium`
+/// reads it. True when on.
 pub fn parse_sandbox(s: &str) -> Result<bool, String> {
-    match s.trim() {
+    match s {
         "" | "on" => Ok(true),
         "off" => Ok(false),
         v => Err(format!("SUPERBOT_CHROMIUM_SANDBOX must be on or off, not \"{v}\"")),
@@ -61,7 +62,8 @@ mod tests {
     fn sandbox_setting() {
         assert_eq!(parse_sandbox(""), Ok(true));
         assert_eq!(parse_sandbox("on"), Ok(true));
-        assert_eq!(parse_sandbox(" off "), Ok(false));
+        assert_eq!(parse_sandbox("off"), Ok(false));
+        assert!(parse_sandbox(" off ").is_err());
         assert!(parse_sandbox("no").unwrap_err().contains("on or off"));
     }
 
