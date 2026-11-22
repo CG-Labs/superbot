@@ -176,6 +176,42 @@ async fn machines_are_held_to_an_rpo_by_their_providers_backups() {
 }
 
 #[tokio::test]
+async fn a_machine_isnt_held_to_it_before_the_provider_says_after_an_upgrade() {
+    let (port, app, admin, fake) = serve().await;
+    let (uid, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let path = format!("/api/users/{uid}/machine");
+    assert_eq!(json_call(port, "POST", &path, &admin).await.0, 202);
+    reconcile(port, &admin).await;
+    reconcile(port, &admin).await;
+    let m = app.db.user_machine(&uid).unwrap();
+    let pid = m.provider_id.clone().unwrap();
+    app.db.machine_backdate(&m.id, 30 * HOUR);
+
+    // An old machine with no backup time saved, as on the first start after upgrading:
+    // nothing until reconciling has asked the provider, however old it is.
+    app.control_plane.get().unwrap().forget_provider_seen();
+    assert_eq!(watch(&app), 0);
+    assert!(events(port, &admin, "machine.rpo_breached").await.is_empty());
+    let (_, view) = json_call(port, "GET", &path, &admin).await;
+    assert_eq!((view["recovery"]["tracked"].as_bool(), view["recovery"]["untrackedReason"].as_str()), (Some(false), Some("not_checked_yet")), "{view}");
+
+    // Its backup is current: held to it, within it.
+    fake.set(&pid, |pm| pm.last_backup_at = Some(db::now() - HOUR));
+    reconcile(port, &admin).await;
+    assert_eq!(watch(&app), 0);
+    let (_, view) = json_call(port, "GET", &path, &admin).await;
+    assert_eq!(view["recovery"]["tracked"].as_bool(), Some(true), "{view}");
+
+    // A saved time counts at once after a restart, and the provider saying there's none
+    // is a breach.
+    app.control_plane.get().unwrap().forget_provider_seen();
+    assert_eq!(watch(&app), 0);
+    fake.set(&pid, |pm| pm.last_backup_at = None);
+    reconcile(port, &admin).await;
+    assert_eq!(watch(&app), 1);
+}
+
+#[tokio::test]
 async fn nothing_is_held_to_an_rpo_with_backups_off() {
     let fake = Arc::new(Fake::default());
     let p: Arc<dyn MachineProvider> = fake.clone();

@@ -206,6 +206,9 @@ pub struct ControlPlane {
     /// One change at a time, from handlers and the reconciler alike, so two can't
     /// race on one machine. Changes are rare and admin-driven; this is cheap.
     ops: tokio::sync::Mutex<()>,
+    /// Machines the provider has described since botd started, so one with no backup
+    /// time saved yet isn't held to the provider backups' RPO before it has said.
+    provider_seen: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Default for ControlPlane {
@@ -227,6 +230,7 @@ impl Default for ControlPlane {
             firewall_settings: None,
             offsite: None,
             ops: tokio::sync::Mutex::new(()),
+            provider_seen: Default::default(),
         }
     }
 }
@@ -235,6 +239,17 @@ impl ControlPlane {
     /// Serialises machine changes, as every request and reconcile step does.
     pub(crate) async fn lock_ops(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.ops.lock().await
+    }
+
+    /// Whether the provider has described machine `id` since botd started.
+    pub(crate) fn provider_saw(&self, id: &str) -> bool {
+        self.provider_seen.lock().unwrap_or_else(|e| e.into_inner()).contains(id)
+    }
+
+    /// As botd just started: the provider has described nothing yet.
+    #[cfg(test)]
+    pub(crate) fn forget_provider_seen(&self) {
+        self.provider_seen.lock().unwrap().clear();
     }
 }
 
@@ -642,7 +657,8 @@ fn system(m: &Machine) -> Who {
     }
 }
 
-fn observe(m: &mut Machine, pm: &ProviderMachine) {
+fn observe(cp: &ControlPlane, m: &mut Machine, pm: &ProviderMachine) {
+    cp.provider_seen.lock().unwrap_or_else(|e| e.into_inner()).insert(m.id.clone());
     m.provider_id = Some(pm.id.clone());
     m.placed_on = None;
     m.provider_status = Some(pm.status.clone());
@@ -770,7 +786,7 @@ async fn provision(
     match found {
         Err(e) => return refused(app, m, by, e, "create"),
         Ok((pm, adopted)) => {
-            observe(&mut m, &pm);
+            observe(cp, &mut m, &pm);
             if adopted {
                 // Record the machine as it is, should it differ from what the row asked for.
                 if pm.plan != m.plan {
@@ -945,7 +961,7 @@ async fn reconcile_one(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvide
                     return false;
                 }
             };
-            observe(&mut m, &pm);
+            observe(cp, &mut m, &pm);
             m.last_error = None;
             let mut events = Vec::new();
             if from == State::Provisioning && pm.running() {

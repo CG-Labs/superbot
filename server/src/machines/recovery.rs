@@ -149,6 +149,7 @@ fn provider_untracked(cp: &ControlPlane, m: &Machine) -> Option<&'static str> {
     match m.state {
         State::Destroyed => Some("destroyed"),
         _ if !cp.owns(m) => Some("other_provider"),
+        State::Running if m.provider_backup_at.is_none() && !cp.provider_saw(&m.id) => Some("not_checked_yet"),
         State::Running => None,
         State::Suspended => Some("suspended"),
         _ => Some("not_running"),
