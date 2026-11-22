@@ -51,7 +51,7 @@ Every process the agent starts as a Bots' or teammate's user (harness runs, logi
 
 - **No new privileges** (`PR_SET_NO_NEW_PRIVS`), for its whole life and every exec: setuid and setgid programs (sudo, su, pkexec, newgrp, a copied root shell) run with the caller's ids, and file capabilities aren't granted. Screens get it too.
 - **umask 077**, so what it makes, in `/tmp` included, is its own.
-- **A temporary folder of its own,** `TMPDIR=<home>/.tmp` (0700), made before each run and login (as the teammate, for a teammate's) and wiped with the home's other scratch files.
+- **A temporary folder of its own,** `TMPDIR=<home>/.tmp` (0700), made before each run and login (as the teammate, for a teammate's). Each start also removes what in it hasn't changed for a day, as its user and without following links, so leftovers don't pile up in the home.
 - **An OOM score floor of 500,** set while the agent is still root. On a machine short of memory the kernel kills a run before the agent or the OS's daemons, and a run can't lower its score back down, even where a root process up the tree once set the floor lower.
 - **Joining its cgroup first,** as in ADR 0135, so it can't leave it.
 
@@ -63,7 +63,7 @@ Each heartbeat says the agent can lock runs down (`locked_down`), and the agent 
 
 ### One server
 
-`superbot-run`, which every run under `ISOLATION=users` goes through, sets no new privileges before it execs the harness. Per-user accounts already had no sudo and no shell.
+`superbot-run`, which every run under `ISOLATION=users` goes through, sets no new privileges before it execs the harness. Per-user accounts already had no sudo and no shell. With `ISOLATION=users`, botd checks for harness sandboxes with no new privileges too, so a host whose only `bwrap` is setuid is seen as having none.
 
 ### Red team
 
