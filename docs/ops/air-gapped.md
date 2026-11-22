@@ -1,6 +1,6 @@
 # Air-gapped installs
 
-SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md).
+SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), and release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md).
 
 ## What a bundle holds
 
@@ -14,8 +14,8 @@ SuperBot runs on a server with no internet access. You make (or download) an **o
 | `deploy/` | `install.sh`, `offline-bundle.sh`, the systemd units and the backup, restore and per-user account scripts |
 | `docker/` | The Compose file, its Caddyfile, `.env.example` and `init.sh` |
 | `env.example` | botd's `.env` template |
-| `images/` | Optional: each image as a `docker save` tarball (`<name>.tar`), its reference and digest, what `cosign verify` printed when it was bundled (`<name>.cosign.json`: certificate and transparency log entry) and its SBOM (`<name>.sbom.spdx.json`) |
-| `MANIFEST` | Format, version, arch, commit, date, images |
+| `images/` | Optional: each image for the bundle's arch as an OCI archive (`<name>.tar`, which `docker load` also reads), with the digest it has in its registry, its reference and that digest, what `cosign verify` printed when it was bundled (`<name>.cosign.json`: certificate and transparency log entry) and its SBOM (`<name>.sbom.spdx.json`) |
+| `MANIFEST` | Format, version, arch, commit, date, images and their format (`image_format=oci`) |
 | `SHA256SUMS` | The SHA-256 of every other file |
 
 The installer refuses a bundle unless every file in it is listed in `SHA256SUMS` with the right hash and nothing else is there, and it holds only plain files and folders under one `superbot-offline-*` folder (no links, devices, absolute paths or `..`).
@@ -36,7 +36,7 @@ The installer lists anything missing and stops before it changes anything.
 
 ## Getting a bundle
 
-**A release bundle.** The `offline` workflow's manual run makes one per arch for a published version, bundles that version's signed images, signs the bundle with cosign under the workflow's GitHub identity, and attaches the bundle, its `.sha256` and its `.sigstore.json` to the GitHub release.
+**A release bundle.** Every release on GitHub has one per arch, attached to it: once the `docker` workflow has published and signed a `v<version>` tag's images, the `offline` workflow builds the bundles from that tag's commit, with those images, signs each with cosign under the workflow's GitHub identity, and attaches the bundle, its `.sha256` and its `.sigstore.json` to the release. (A maintainer can also run it by hand for a release.)
 
 **Your own**, from a checkout of a release tag, on a machine with the same arch as the server:
 
@@ -48,7 +48,7 @@ deploy/offline-bundle.sh build --out dist \
   --image caddy=ghcr.io/cg-labs/superbot-caddy:0.1.0
 ```
 
-`--image` is optional (leave it out for the bash install alone). Each image is pulled for the bundle's arch and its cosign signature checked against the `docker` workflow at that version's tag (`--image-identity` to change it) before it is saved; an image that doesn't verify is not bundled. `--allow-unsigned` bundles an image of your own without a check, and `MANIFEST` says so. The command prints the bundle's SHA-256: record it somewhere the server's operator can read it without the bundle.
+`--image` is optional (leave it out for the bash install alone); with it you also need `skopeo`, `jq`, `docker` (with buildx, for the SBOM) and `cosign`. A reference must have a tag (`HOST/PATH:TAG`). The cosign signature on what the tag names is checked against the `docker` workflow at that version's tag (`--image-identity` to change it), then the image for the bundle's arch is copied from the registry as it is, so it keeps the digest that was signed; an image that doesn't verify, or whose digest would change, is not bundled. `--allow-unsigned` bundles an image of your own without a check (from your local Docker if it is there, else from its registry), and `MANIFEST` says so. The command prints the bundle's SHA-256: record it somewhere the server's operator can read it without the bundle.
 
 ## Verifying a bundle
 
@@ -105,7 +105,7 @@ A bundle made with `--image` carries the images. On the server (Docker, its Comp
 deploy/offline-bundle.sh load superbot-offline-0.1.0-x86_64.tar.gz --sha256 <recorded sha-256>
 ```
 
-It checks the bundle as the installer does and runs `docker load` for each image, with no registry. Then use the bundle's `docker/` folder as [deploy/docker](../../deploy/README.md#docker-compose-supported): `./init.sh`, and `SUPERBOT_VERSION=0.1.0` in `.env` so Compose uses the loaded tags (it never pulls an image it has). Each image's `images/<name>.cosign.json` and `images/<name>.sbom.spdx.json` are the signature check and SBOM from when it was bundled, for your records and scanners. For your own certificate, add `tls /etc/caddy/tls/cert.pem /etc/caddy/tls/key.pem` under the site line of a copy of the Caddyfile, and mount it and the certificate folder with a `docker-compose.override.yml`:
+It checks the bundle as the installer does and runs `docker load` for each image, with no registry. Then use the bundle's `docker/` folder as [deploy/docker](../../deploy/README.md#docker-compose-supported): `./init.sh`, and `SUPERBOT_VERSION=0.1.0` in `.env` so Compose uses the loaded tags (it never pulls an image it has). Each image's `images/<name>.cosign.json` and `images/<name>.sbom.spdx.json` are the signature check and SBOM from when it was bundled, for your records and scanners. With several hosts, or to keep images in one place, push them to your own registry instead ([below](#registry-mirrors)). For your own certificate, add `tls /etc/caddy/tls/cert.pem /etc/caddy/tls/key.pem` under the site line of a copy of the Caddyfile, and mount it and the certificate folder with a `docker-compose.override.yml`:
 
 ```yaml
 services:
@@ -114,6 +114,30 @@ services:
       - ./Caddyfile.offline:/etc/caddy/Caddyfile:ro
       - ./tls:/etc/caddy/tls:ro
 ```
+
+## Registry mirrors
+
+If your network has its own container registry (Harbor, Artifactory, Nexus, `registry:2`, ...), push a bundle's images into it, from any machine that can reach it (any arch):
+
+```sh
+deploy/offline-bundle.sh push superbot-offline-0.1.0-x86_64.tar.gz --sha256 <recorded sha-256> \
+  --registry registry.corp.example/superbot
+```
+
+It checks the bundle as the installer does, copies each image to `<registry>/<name>:<tag>` (here `registry.corp.example/superbot/superbot:0.1.0` and `.../superbot-caddy:0.1.0`) with `skopeo` exactly as it is in the bundle, reads it back, and stops unless the registry now has the **same digest** the bundle recorded, the one whose signature was checked when it was bundled. It prints the settings for Compose's `.env`, pinned by digest:
+
+```sh
+SUPERBOT_IMAGE=registry.corp.example/superbot/superbot@sha256:...
+SUPERBOT_CADDY_IMAGE=registry.corp.example/superbot/superbot-caddy@sha256:...
+```
+
+Put them in `.env` (with `SUPERBOT_VERSION` too) and Compose pulls from your registry; a digest pin means a changed image in the registry can't be run in its place.
+
+- **The push tool:** `skopeo` (from your mirror of Ubuntu's archive, or your OS's). `docker` isn't needed. The images are OCI archives, so you can also push them yourself after extracting the bundle (`skopeo copy oci-archive:images/superbot.tar docker://...`, or any tool that reads an OCI image layout), but then check the digest yourself.
+- **Logins and certificates** are skopeo's: `skopeo login registry.corp.example`, your internal CA in `/etc/containers/certs.d/registry.corp.example/ca.crt` (or the system's trust store). A registry without TLS, for a lab only, is marked `insecure = true` in `/etc/containers/registries.conf.d/`.
+- **One arch per path:** a bundle holds one arch, so pushing an x86_64 and an aarch64 bundle to the same `--registry` replaces the tag; use a path per arch (`--registry registry.corp.example/superbot/arm64`). Digest pins are per arch anyway.
+- **Signatures stay in the bundle:** the mirror gets the image, not its cosign signature, so `cosign verify` against your registry finds nothing. The digest pin is the check, with `images/<name>.cosign.json` in the signed bundle as the record of the signature check.
+- Bundles made before this (with `docker save` images) can't be pushed with their digests: `push` refuses them. Use `load` for those, or a newer bundle.
 
 ## Model providers
 
@@ -146,6 +170,6 @@ botd's clock decides when a license starts and ends: keep it right with an inter
 ## Updates and CVEs
 
 - Security fixes ship as new releases ([SECURITY.md](../../SECURITY.md)); each release's notes in the [changelog](../../CHANGELOG.md) say what changed. Watch the releases from a connected machine (or ask your CG-Labs contact for notice), then make or download the bundle, verify it, and upgrade as above.
-- Images are rebuilt weekly with Debian's security fixes and scanned on every build ([ADR 0101](../adr/0101-image-scanning-and-signing.md)); a release bundle carries that release's images. Each image's SBOM is in the bundle, so your own scanner can match new CVEs against it offline.
+- Images are rebuilt weekly with Debian's security fixes and scanned on every build ([ADR 0101](../adr/0101-image-scanning-and-signing.md)); a release bundle carries that release's images, and every release has its bundles. Each image's SBOM is in the bundle, so your own scanner can match new CVEs against it offline.
 - Rust and npm dependencies are scanned in CI ([ADR 0092](../adr/0092-dependency-vulnerability-scanning.md)). The host's own packages (Caddy, OpenSSL, the kernel) are yours to update from your mirror.
 - For an urgent fix, upgrade to the release that carries it; there are no in-place patches. Keep the previous bundle until the new one has run well, and a backup to restore if it doesn't.
