@@ -187,16 +187,21 @@ async fn provide(app: &AppState, by: &Who, team: &Team, user: &User) -> Value {
         // Under the lock the sweep destroys under, so a due machine is either taken back
         // or destroyed, never both.
         let guard = cp.lock_ops().await;
+        // Leaving releases under this lock too: someone gone by now keeps it released.
+        if app.db.team_id_of(&user.id).as_deref() != Some(team.id.as_str()) {
+            return json!("left");
+        }
         let Some(tm) = app.db.team_machine(&m.id) else { return json!("own") };
         if tm.released_at.is_none() && tm.team_id == team.id {
             return json!("kept");
         }
-        if !app.db.machine(&m.id).is_some_and(|m| matches!(m.state, MachineState::Running | MachineState::Suspended | MachineState::Provisioning | MachineState::Pending | MachineState::Error)) {
+        // Read again under the lock: a sweep may have just suspended it.
+        let Some(state) = app.db.machine(&m.id).map(|m| m.state).filter(|s| matches!(s, MachineState::Running | MachineState::Suspended | MachineState::Provisioning | MachineState::Pending | MachineState::Error)) else {
             return json!("failed");
-        }
+        };
         app.db.team_machine_mark(&m.id, &team.id, &user.id);
         drop(guard);
-        let resumed = match m.state {
+        let resumed = match state {
             MachineState::Suspended => crate::machines::act_if(app, cp, by, &user.id, Step::Resume, None, &|x| ours(app, &team.id, x)).await.is_ok(),
             _ => false,
         };
@@ -298,14 +303,12 @@ async fn join(app: &AppState, by: &Who, team: &Team, user: &User, role: &str, vi
     Ok(v)
 }
 
-/// `user_id` was just enabled. On a team that gives machines and with none of their own
-/// (the IdP put them in its group while disabled, ADR 0095), they get the team's now, as
-/// joining would have given them. Whether one was asked for.
+/// `user_id` was just enabled. On a team that gives machines (the IdP may have put them
+/// in its group while disabled, ADR 0095), they get what joining would have given them:
+/// the team's machine, or the one a former team released taken back before it's
+/// destroyed. Whether a new one was asked for.
 pub(crate) async fn user_enabled(app: &AppState, by: &Who, user_id: &str) -> bool {
     let Some(m) = app.db.team_member(user_id) else { return false };
-    if app.db.user_machine(user_id).is_some() {
-        return false;
-    }
     let (Some(team), Some(user)) = (app.db.team(&m.team_id), app.db.user(user_id)) else { return false };
     if !team.machines || !user.active() {
         return false;
@@ -370,13 +373,16 @@ pub async fn leave(app: &AppState, by: &Who, team_id: &str, user_id: &str, reaso
 async fn release(app: &AppState, by: &Who, team_id: &str, user_id: &str) {
     let Some(cp) = control_plane(app) else { return };
     let Some(m) = app.db.user_machine(user_id) else { return };
-    if app.db.team_machine(&m.id).is_none_or(|t| t.team_id != team_id || t.released_at.is_some()) {
-        return;
-    }
     let days = settings(app).machine_days;
     let due = now() + days as i64 * DAY_MS;
-    if !app.db.team_machine_release(&m.id, team_id, due) {
-        return;
+    {
+        let _g = cp.lock_ops().await;
+        if app.db.team_machine(&m.id).is_none_or(|t| t.team_id != team_id || t.released_at.is_some()) {
+            return;
+        }
+        if !app.db.team_machine_release(&m.id, team_id, due) {
+            return;
+        }
     }
     let suspended = match m.state {
         MachineState::Running if days > 0 => crate::machines::act_if(app, cp, by, user_id, Step::Suspend, None, &|x| released(app, &m.id, x)).await.is_ok(),

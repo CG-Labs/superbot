@@ -479,6 +479,42 @@ async fn leaving_a_group_offboards_like_leaving_the_team() {
 }
 
 #[tokio::test]
+async fn a_returning_member_takes_back_the_machine_a_former_team_released() {
+    let (port, app, admin) = serve().await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    user_with(port, &admin, "ada@example.com", "member").await;
+    user_with(port, &admin, "bea@example.com", "member").await;
+    let alpha = make_team(port, &admin, "Alpha", "ada@example.com").await;
+    let beta = make_team(port, &admin, "Beta", "bea@example.com").await;
+    for team in [&alpha, &beta] {
+        assert_eq!(link(port, &admin, json!({ "tenant": "okta", "team": team })).await.0, 201);
+    }
+    let al = person(port, &t, "al@example.com", "00u1").await;
+    assert_eq!(scim(port, &t, "POST", GROUPS, json!({ "displayName": "Alpha", "members": [{ "value": al }] })).await.0, 201);
+    reconcile(port, &admin).await;
+    let machine = app.db.user_machine(&al).expect("joining gave Al a machine");
+    assert_eq!(scim(port, &t, "PATCH", &format!("{GROUPS}/{alpha}"), remove(&[&al])).await.0, 204);
+    assert!(app.db.team_machine(&machine.id).is_some_and(|m| m.released_at.is_some()));
+
+    // Disabled, Al joins Beta with no machine: Alpha's stays released.
+    let off = json!({ "Operations": [{ "op": "replace", "value": { "active": false } }] });
+    assert_eq!(scim(port, &t, "PATCH", &format!("/scim/v2/Users/{al}"), off).await.0, 200);
+    assert_eq!(scim(port, &t, "POST", GROUPS, json!({ "displayName": "Beta", "members": [{ "value": al }] })).await.0, 201);
+    assert!(app.db.team_machine(&machine.id).is_some_and(|m| m.team_id == alpha && m.released_at.is_some()));
+
+    // Enabled, Beta takes it back before the sweep destroys it, and asks for no other.
+    let before = app.db.machines(None).len();
+    let on = json!({ "Operations": [{ "op": "replace", "value": { "active": true } }] });
+    assert_eq!(scim(port, &t, "PATCH", &format!("/scim/v2/Users/{al}"), on).await.0, 200);
+    let tm = app.db.team_machine(&machine.id).expect("still a team machine");
+    assert_eq!((tm.team_id.as_str(), tm.released_at, tm.release_at), (beta.as_str(), None, None));
+    assert_eq!(app.db.user_machine(&al).unwrap().id, machine.id);
+    assert_eq!(app.db.machines(None).len(), before);
+    let kept = events(port, &admin, "action=team.machine_kept").await;
+    assert!(kept.iter().any(|e| e["details"]["user"] == al.as_str() && e["details"]["fromTeam"] == alpha.as_str()), "{kept:?}");
+}
+
+#[tokio::test]
 async fn deleting_a_group_deletes_only_what_the_idp_made_and_owners_are_never_set_by_scim() {
     let (port, app, admin) = serve().await;
     let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
