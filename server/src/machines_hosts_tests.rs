@@ -31,7 +31,9 @@ pub(crate) struct Env {
     pub(crate) cp: Arc<ControlPlane>,
     pub(crate) e: Arc<Enrollment>,
     mport: u16,
-    _s3: s3_standin::StandIn,
+    pub(crate) s3: s3_standin::StandIn,
+    /// With hosts tagged by region, every region but the first has a store of its own.
+    pub(crate) stores: Vec<(String, s3_standin::StandIn)>,
 }
 
 const AGENT: &str = "stand-in for the superbot-machine binary";
@@ -48,7 +50,9 @@ async fn serve() -> Env {
     serve_with(|a, b, _| Fleet::new(vec![a, b], DOWN_MS).with_policy(Policy::Fill)).await
 }
 
-/// As `serve`, with the fleet `build` makes of hosts `a`, `b` and `c`.
+/// As `serve`, with the fleet `build` makes of hosts `a`, `b` and `c`. With hosts tagged
+/// by data region (ADR 0117), MACHINE_REGIONS is their tags, the first the default; its
+/// backups go to the default store, said to be in it, and every other region's to its own.
 pub(crate) async fn serve_with(build: impl FnOnce(Member, Member, Member) -> Fleet) -> Env {
     let machine_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let agent_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -57,12 +61,28 @@ pub(crate) async fn serve_with(build: impl FnOnce(Member, Member, Member) -> Fle
     let (a, b, c) = (StandIn::start().await, StandIn::start().await, StandIn::start().await);
     let fleet = build(host("a", &a, mport), host("b", &b, mport), host("c", &c, mport));
     let s3 = s3_standin::StandIn::start().await;
+    let mut tags: Vec<String> = Vec::new();
+    for r in crate::machines::provider::Hosts::configured(&fleet).into_iter().filter_map(|h| h.region) {
+        if !tags.contains(&r) {
+            tags.push(r);
+        }
+    }
+    let mut stores = Vec::new();
+    for r in tags.iter().skip(1) {
+        stores.push((r.clone(), s3_standin::StandIn::start().await));
+    }
     let mut cp = ControlPlane::for_tests(Arc::new(fleet));
-    cp.regions = vec!["local".into()];
+    cp.regions = if tags.is_empty() { vec!["local".into()] } else { tags.clone() };
     cp.routing = crate::machines::route::Routing::On;
     let e = cp.enroll_with(Enrollment::for_tests(9, mport, aport).with_agent(AGENT.as_bytes())).unwrap();
     cp.firewall_with(firewall::Settings { sources: Vec::new(), ssh: Vec::new() }).unwrap();
-    let s = Settings { retention: Retention::retention("7").unwrap(), ..Settings::with(s3.settings(), "t/", Vec::new()) };
+    let s = Settings {
+        retention: Retention::retention("7").unwrap(),
+        default_region: tags.first().cloned(),
+        stores: stores.iter().map(|(r, st)| (r.clone(), st.settings())).collect(),
+        regions: cp.regions.clone(),
+        ..Settings::with(s3.settings(), "t/", Vec::new())
+    };
     cp.offsite = Some(Arc::new(Offsite::new(s).unwrap()));
     let cp = Arc::new(cp);
     let shared = cp.clone();
@@ -70,7 +90,7 @@ pub(crate) async fn serve_with(build: impl FnOnce(Member, Member, Member) -> Fle
     hosts::load(&app, &cp).unwrap();
     tokio::spawn(enroll::serve(machine_listener, app.clone(), e.clone(), None));
     let (_, admin) = user_with(port, &owner, "ops@example.com", "admin").await;
-    Env { port, app, admin, a, b, c, cp, e, mport, _s3: s3 }
+    Env { port, app, admin, a, b, c, cp, e, mport, s3, stores }
 }
 
 pub(crate) async fn json_call(env: &Env, method: &str, path: &str, body: &str) -> (u16, Value) {
@@ -123,6 +143,11 @@ async fn machine(env: &Env, email: &str, enroll: bool) -> (String, crate::db::Ma
 /// A member's machine, which placement must put on `host` (stand-in `s`).
 pub(crate) async fn machine_on(env: &Env, s: &StandIn, host: &str, email: &str, enroll: bool) -> (String, crate::db::Machine) {
     let (uid, _) = user_with(env.port, &env.admin, email, "member").await;
+    (uid.clone(), machine_for(env, s, host, &uid, enroll).await)
+}
+
+/// A machine for user `uid`, which placement must put on `host` (stand-in `s`).
+pub(crate) async fn machine_for(env: &Env, s: &StandIn, host: &str, uid: &str, enroll: bool) -> crate::db::Machine {
     let (code, m) = json_call(env, "POST", &format!("/api/users/{uid}/machine"), "").await;
     assert_eq!(code, 202, "{m}");
     let m = env.app.db.machine(m["id"].as_str().unwrap()).unwrap();
@@ -138,7 +163,7 @@ pub(crate) async fn machine_on(env: &Env, s: &StandIn, host: &str, email: &str, 
         write(s, &m.label, "/home/user/notes.txt", "version 1");
         write(s, &m.label, IDENTITY_PATH, "the old agent's key");
     }
-    (uid, env.app.db.machine(&m.id).unwrap())
+    env.app.db.machine(&m.id).unwrap()
 }
 
 pub(crate) fn write(s: &StandIn, label: &str, path: &str, content: &str) {

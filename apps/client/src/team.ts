@@ -60,6 +60,11 @@ export function canLeave(team: Pick<Team, "members" | "role" | "billing">): bool
 
 const day = (unixSeconds: number) => new Date(unixSeconds * 1000).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
 
+/** Where the team keeps its machines and their backups (ADR 0117), when a server admin set it. */
+export function teamRegionLine(team: Pick<Team, "region">): string | null {
+  return team.region ? `Machines and their backups stay in ${team.region}, unless an admin set someone's own region.` : null;
+}
+
 /** What everyone on the team reads about its plan (ADR 0093). */
 export function teamPlanLine(b: TeamBilling | undefined): string | null {
   if (!b) return null;

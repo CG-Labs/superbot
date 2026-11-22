@@ -734,6 +734,9 @@ pub struct User {
     pub last_login_idp_provider: Option<String>,
     /// The tier an admin (later, billing) gave them. None: the default tier (ADR 0033).
     pub tier: Option<String>,
+    /// Where an admin said their machine and its backups live (ADR 0117). None: their
+    /// team's, else the server's default.
+    pub region: Option<String>,
     /// When they were erased (ADR 0102): the row is a tombstone with no personal data.
     pub erased_at: Option<i64>,
     /// The pseudonym the audit log names them by since.
@@ -1529,6 +1532,7 @@ fn user_row(r: &Row) -> rusqlite::Result<User> {
         last_login_method: r.get("last_login_method")?,
         last_login_idp_provider: r.get("last_login_idp_provider")?,
         tier: r.get("tier")?,
+        region: r.get("region")?,
         erased_at: r.get("erased_at")?,
         erased_as: r.get("erased_as")?,
     })
@@ -1650,7 +1654,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 46] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 47] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1697,7 +1701,20 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 46] = [
     migrate_machine_provider_backups,
     migrate_server_backups,
     migrate_file_retention,
+    migrate_data_regions,
 ];
+
+/// Data regions (ADR 0117): the region an admin set for a user or a team, and the
+/// region whose store each machine backup went to (NULL: the default store).
+fn migrate_data_regions(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    for (table, column) in [("users", "region"), ("teams", "region"), ("machine_backups", "store_region")] {
+        let has: bool = c.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{column}'"), [], |r| r.get(0))?;
+        if !has {
+            c.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT;"))?;
+        }
+    }
+    Ok(())
+}
 
 /// Retention for teammates' archived work (ADR 0112): when the retention pass deleted a
 /// removal's archive, or found it gone.
@@ -2355,6 +2372,8 @@ pub struct MachineBackup {
     /// `running`, `done`, `failed`, or `deleted` (past its retention, or on request).
     pub state: String,
     pub object_key: String,
+    /// The data region whose store holds it (ADR 0117). None: the default store.
+    pub store_region: Option<String>,
     pub encrypted: bool,
     pub size: Option<i64>,
     pub sha256: Option<String>,
@@ -2376,6 +2395,7 @@ fn machine_backup_row(r: &Row) -> rusqlite::Result<MachineBackup> {
         plan: r.get("plan")?,
         state: r.get("state")?,
         object_key: r.get("object_key")?,
+        store_region: r.get("store_region")?,
         encrypted: r.get("encrypted")?,
         size: r.get("size")?,
         sha256: r.get("sha256")?,
@@ -2499,6 +2519,7 @@ pub struct NewMachineBackup<'a> {
     pub id: &'a str,
     pub machine: &'a Machine,
     pub object_key: &'a str,
+    pub store_region: Option<&'a str>,
     pub encrypted: bool,
     pub created_by: Option<&'a str>,
 }
@@ -4293,6 +4314,11 @@ impl Db {
             Err(e) if constraint(&e) => Err(UserError::EmailTaken),
             Err(e) => Err(UserError::Db(e.to_string())),
         }
+    }
+
+    /// Sets or clears the user's data region (ADR 0117).
+    pub fn set_user_region(&self, id: &str, region: Option<&str>) -> bool {
+        self.c().execute("UPDATE users SET region = ?1, updated_at = ?2 WHERE id = ?3", params![region, now(), id]).unwrap_or(0) > 0
     }
 
     // Erasure (ADR 0102).
@@ -7188,9 +7214,9 @@ impl Db {
         let made = self
             .c()
             .execute(
-                "INSERT OR IGNORE INTO machine_backups (id, machine_id, user_id, tier, plan, state, object_key, encrypted, created_by, created_at)
-                 VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)",
-                params![n.id, m.id, m.user_id, m.tier, m.plan, n.object_key, n.encrypted, n.created_by, now()],
+                "INSERT OR IGNORE INTO machine_backups (id, machine_id, user_id, tier, plan, state, object_key, store_region, encrypted, created_by, created_at)
+                 VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)",
+                params![n.id, m.id, m.user_id, m.tier, m.plan, n.object_key, n.store_region, n.encrypted, n.created_by, now()],
             )
             .unwrap_or(0)
             == 1;
@@ -7346,6 +7372,13 @@ impl Db {
     }
 
     /// Backups of any of the user's machines, destroyed ones too, not yet deleted.
+    /// Every data region's store a kept backup is in (ADR 0117).
+    pub fn machine_backup_stores(&self) -> Vec<String> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT DISTINCT store_region FROM machine_backups WHERE store_region IS NOT NULL AND state <> 'deleted' ORDER BY store_region").unwrap();
+        s.query_map([], |r| r.get(0)).unwrap().filter_map(Result::ok).collect()
+    }
+
     pub fn user_machine_backups_kept(&self, user_id: &str) -> Vec<MachineBackup> {
         let c = self.c();
         let mut s = c.prepare("SELECT * FROM machine_backups WHERE user_id = ? AND state <> 'deleted' ORDER BY created_at, id").unwrap();
@@ -7808,6 +7841,9 @@ pub struct Team {
     pub name: String,
     /// Each member gets a machine of their own when they join, if the control plane is on.
     pub machines: bool,
+    /// Where its members' machines and their backups live (ADR 0117). None: the
+    /// server's default.
+    pub region: Option<String>,
     pub created_at: i64,
     pub created_by: Option<String>,
     pub updated_at: i64,
@@ -7854,6 +7890,7 @@ fn team_row(r: &Row) -> rusqlite::Result<Team> {
         id: r.get("id")?,
         name: r.get("name")?,
         machines: r.get("machines")?,
+        region: r.get("region")?,
         created_at: r.get("created_at")?,
         created_by: r.get("created_by")?,
         updated_at: r.get("updated_at")?,
@@ -7939,6 +7976,11 @@ impl Db {
         if let Some(m) = machines {
             c.execute("UPDATE teams SET machines = ?1, updated_at = ?2 WHERE id = ?3", params![m, now(), id]).unwrap();
         }
+    }
+
+    /// Sets or clears the team's data region (ADR 0117).
+    pub fn set_team_region(&self, id: &str, region: Option<&str>) -> bool {
+        self.c().execute("UPDATE teams SET region = ?1, updated_at = ?2 WHERE id = ?3", params![region, now(), id]).unwrap_or(0) > 0
     }
 
     /// Deletes the team and its invites. Its members must have left first.
