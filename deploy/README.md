@@ -677,14 +677,14 @@ An active, trialing, or past-due subscription puts the user on its price's tier;
 
 ### Published plans (optional)
 
-`botd` can publish your plans at `/pricing` (a page with no script, styled like `/status`) and `/api/plans` (its JSON, for your own site), open to anyone, through Caddy like every other path ([ADR 0121](../docs/adr/0121-published-plans.md)). Both come from `TIERS_FILE`, so what they say is what `botd` enforces: each tier with `stripePrices` or `publishedPrices`, in the file's order, with its label, limits (Bots, runs a month, tokens a month, routine runs a day, runs at once, storage), its machine's CPUs, memory and disk when the provider knows them without an API call (Incus plans; not Linode types yet), and its `features`. They never show Stripe price ids, models, routes, providers, machine plan ids, users or counts.
+`botd` can publish your plans at `/pricing` (a page with no script, styled like `/status`) and `/api/plans` (its JSON, for your own site), open to anyone, through Caddy like every other path ([ADR 0121](../docs/adr/0121-published-plans.md)). Both come from `TIERS_FILE`, so what they say is what `botd` enforces: each tier with `stripePrices` or `publishedPrices`, in the file's order, with its label, limits (Bots, runs a month, tokens a month, routine runs a day, storage, and runs at once while Bots run on their owners' machines), its machine's CPUs, memory and disk when the provider knows them without an API call (Incus plans; not Linode types yet), and its `features`. They never show Stripe price ids, models, routes, providers, machine plan ids, users or counts.
 
 | Setting | Meaning |
 |---|---|
 | `PLANS_PAGE` | `auto` (default): on only while billing is on, so a self-hosted server with billing off publishes nothing; `on`: always (for a test server, say); `off`: never (both answer 404) |
 | `PLANS_CONTACT_URL` | Where Enterprise buyers ask: an `https://` page or a `mailto:` address. Unset: no Enterprise entry, and tiers without a price say "Contact us" without a link |
 
-Prices are yours to write: `botd` never reads them from Stripe and ships none. Add them to each tier in the tiers file, in the currency's smallest unit as Stripe counts `unit_amount` (`2900` in `gbp` is £29.00), per person, at most one per currency and interval:
+Prices are yours to write: `botd` never reads them from Stripe and ships none. Add them to each tier in the tiers file, in the currency's smallest unit as Stripe counts `unit_amount` (`2900` in `gbp` is £29.00), per person, at most one per currency and interval. Currencies come from a fixed list (`gbp`, `eur`, `usd` and other common ones, Stripe's zero-decimal ones such as `jpy`, and three-decimal ones such as `kwd`, where `1500` is 1.500), so a typo stops `botd` at start:
 
 ```json
 { "name": "pro", "label": "Pro", "stripePrices": ["price_..."],

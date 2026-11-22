@@ -127,6 +127,26 @@ pub struct ListPrice {
     pub interval: String,
 }
 
+/// The currencies a published price may be in, with how many decimal places their
+/// smallest unit has, as Stripe counts `unit_amount` (ADR 0121). A fixed list, so a typo
+/// (`gpb`) is refused at start and every amount is shown at its real scale.
+pub const CURRENCIES: &[(&str, u32)] = &[
+    ("aed", 2), ("aud", 2), ("bgn", 2), ("brl", 2), ("cad", 2), ("chf", 2), ("cny", 2), ("czk", 2), ("dkk", 2),
+    ("eur", 2), ("gbp", 2), ("hkd", 2), ("huf", 2), ("ils", 2), ("inr", 2), ("mxn", 2), ("myr", 2), ("nok", 2),
+    ("nzd", 2), ("php", 2), ("pln", 2), ("ron", 2), ("sar", 2), ("sek", 2), ("sgd", 2), ("thb", 2), ("try", 2),
+    ("twd", 2), ("usd", 2), ("zar", 2),
+    // Zero-decimal: the amount is already whole units.
+    ("bif", 0), ("clp", 0), ("djf", 0), ("gnf", 0), ("jpy", 0), ("kmf", 0), ("krw", 0), ("mga", 0), ("pyg", 0),
+    ("rwf", 0), ("ugx", 0), ("vnd", 0), ("vuv", 0), ("xaf", 0), ("xof", 0), ("xpf", 0),
+    // Three-decimal: 1500 is 1.500.
+    ("bhd", 3), ("jod", 3), ("kwd", 3), ("omr", 3), ("tnd", 3),
+];
+
+/// Decimal places in `currency`'s smallest unit. None: not a currency prices may use.
+pub fn currency_decimals(currency: &str) -> Option<u32> {
+    CURRENCIES.iter().find(|(c, _)| *c == currency).map(|(_, d)| *d)
+}
+
 pub const MAX_PUBLISHED_PRICES: usize = 4;
 /// Ten million in the largest currency unit is far past any per-person plan.
 pub const MAX_PRICE_AMOUNT: u64 = 1_000_000_000;
@@ -351,8 +371,12 @@ fn published_prices(raw: Vec<ListPrice>) -> Result<Vec<ListPrice>, String> {
     let mut out: Vec<ListPrice> = Vec::new();
     for p in raw {
         let currency = p.currency.trim().to_ascii_lowercase();
-        if currency.len() != 3 || !currency.bytes().all(|b| b.is_ascii_lowercase()) {
-            return Err(format!("publishedPrices: currency \"{}\" must be a three-letter ISO 4217 code, like gbp, eur or usd", p.currency.trim()));
+        if currency_decimals(&currency).is_none() {
+            return Err(format!(
+                "publishedPrices: currency \"{}\" must be one of {} (ISO 4217, as Stripe writes it)",
+                crate::audit::clip(p.currency.trim(), 10),
+                CURRENCIES.iter().map(|(c, _)| *c).collect::<Vec<_>>().join(", ")
+            ));
         }
         let interval = p.interval.trim().to_string();
         if !["month", "year"].contains(&interval.as_str()) {
@@ -853,6 +877,8 @@ mod tests {
         assert!(price(r#"{"amount":29.5,"currency":"gbp","interval":"month"}"#).contains("invalid type"));
         assert!(price(r#"{"amount":100,"currency":"pounds","interval":"month"}"#).contains("ISO 4217"));
         assert!(price(r#"{"amount":100,"currency":"g1p","interval":"month"}"#).contains("ISO 4217"));
+        assert!(price(r#"{"amount":100,"currency":"gpb","interval":"month"}"#).contains("must be one of"), "a three-letter typo");
+        assert_eq!((currency_decimals("kwd"), currency_decimals("jpy"), currency_decimals("gbp"), currency_decimals("gpb")), (Some(3), Some(0), Some(2), None));
         assert!(price(r#"{"amount":100,"currency":"gbp","interval":"week"}"#).contains("month or year"));
         assert!(price(r#"{"amount":100,"currency":"gbp","interval":"month","stripe":"price_1"}"#).contains("unknown field"));
         assert!(price(r#"{"amount":100,"currency":"gbp","interval":"month"},{"amount":200,"currency":"GBP","interval":"month"}"#).contains("listed twice"));

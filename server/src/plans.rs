@@ -28,8 +28,6 @@ pub const PAGE_PATH: &str = "/pricing";
 const BUY_PATH: &str = crate::billing::RETURN_PATH;
 const SIGNUP_PATH: &str = "/get-started";
 pub const MAX_CONTACT_URL: usize = 300;
-/// Stripe's zero-decimal currencies: their amounts are already whole units.
-const ZERO_DECIMAL: [&str; 16] = ["bif", "clp", "djf", "gnf", "jpy", "kmf", "krw", "mga", "pyg", "rwf", "ugx", "vnd", "vuv", "xaf", "xof", "xpf"];
 
 /// `PLANS_PAGE`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -152,12 +150,14 @@ fn group(n: u64) -> String {
     out
 }
 
-/// `£29 / month`, `€9.50 / month`, `CHF 290 / year`.
+/// `£29 / month`, `€9.50 / month`, `CHF 290 / year`, `KWD 1.500 / month`, each at its
+/// currency's own scale (`tiers::CURRENCIES`).
 pub fn display(p: &ListPrice) -> String {
-    let n = match ZERO_DECIMAL.contains(&p.currency.as_str()) {
-        true => group(p.amount),
-        false if p.amount.is_multiple_of(100) => group(p.amount / 100),
-        false => format!("{}.{:02}", group(p.amount / 100), p.amount % 100),
+    let decimals = crate::tiers::currency_decimals(&p.currency).unwrap_or(2);
+    let scale = 10u64.pow(decimals);
+    let n = match p.amount.is_multiple_of(scale) {
+        true => group(p.amount / scale),
+        false => format!("{}.{:0width$}", group(p.amount / scale), p.amount % scale, width = decimals as usize),
     };
     let amount = match p.currency.as_str() {
         "gbp" => format!("£{n}"),
@@ -169,11 +169,14 @@ pub fn display(p: &ListPrice) -> String {
 }
 
 /// One sold tier, as anyone may see it. Every limit is what botd enforces; null is no
-/// limit. `concurrentRuns` is the tier's, else this server's `MAX_CONCURRENT_RUNS`.
-/// `machine` is the size of the tier's `machineType` when the provider knows it.
-fn plan(t: &Tier, server_cap: Option<u32>, machine: &dyn Fn(&str) -> Option<Resources>) -> Value {
+/// limit. `machine_cap`: Some(`MAX_CONCURRENT_RUNS`) while Bots run on their owners'
+/// machines, where `concurrentRuns` is the tier's, else that cap. None: Bots run on
+/// this server, whose cap is shared by everyone, so it's no plan's to publish and
+/// `concurrentRuns` is left out. `machine` is the size of the tier's `machineType` when
+/// the provider knows it.
+fn plan(t: &Tier, machine_cap: Option<Option<u32>>, machine: &dyn Fn(&str) -> Option<Resources>) -> Value {
     let l = &t.limits;
-    json!({
+    let mut v = json!({
         "name": t.name,
         "label": t.label,
         "prices": t.published_prices.iter().map(|p| json!({ "amount": p.amount, "currency": p.currency, "interval": p.interval, "display": display(p) })).collect::<Vec<_>>(),
@@ -182,18 +185,21 @@ fn plan(t: &Tier, server_cap: Option<u32>, machine: &dyn Fn(&str) -> Option<Reso
             "monthlyRuns": l.monthly_runs,
             "monthlyTokens": l.monthly_tokens,
             "dailyRoutineRuns": l.daily_routine_runs,
-            "concurrentRuns": l.concurrent_runs.or(server_cap),
             "maxStorageMb": l.max_storage_mb,
         },
         "machine": l.machine_type.as_deref().and_then(machine),
         "features": t.features,
-    })
+    });
+    if let Some(cap) = machine_cap {
+        v["limits"]["concurrentRuns"] = json!(l.concurrent_runs.or(cap));
+    }
+    v
 }
 
 /// Everything both pages show.
-pub fn snapshot(tiers: &Tiers, s: &Settings, server_cap: Option<u32>, machine: &dyn Fn(&str) -> Option<Resources>) -> Value {
+pub fn snapshot(tiers: &Tiers, s: &Settings, machine_cap: Option<Option<u32>>, machine: &dyn Fn(&str) -> Option<Resources>) -> Value {
     json!({
-        "plans": tiers.all().iter().filter(|t| t.published()).map(|t| plan(t, server_cap, machine)).collect::<Vec<_>>(),
+        "plans": tiers.all().iter().filter(|t| t.published()).map(|t| plan(t, machine_cap, machine)).collect::<Vec<_>>(),
         "enterprise": s.contact.as_ref().map(|u| json!({ "label": "Enterprise", "contactUrl": u })),
         "contactUrl": s.contact,
         "perPerson": true,
@@ -207,7 +213,8 @@ fn current(app: &AppState) -> Option<Value> {
     let s = app.plans.get().filter(|s| s.published)?;
     let cp = app.control_plane.get().filter(|cp| cp.enabled());
     let machine = |plan: &str| cp.and_then(|cp| cp.plan_resources(plan));
-    Some(snapshot(app.tiers(), s, app.server_cap(), &machine))
+    let on_machines = cp.is_some_and(|cp| cp.routing != crate::machines::route::Routing::Off);
+    Some(snapshot(app.tiers(), s, on_machines.then(|| app.server_cap()), &machine))
 }
 
 fn off() -> Response {
@@ -274,12 +281,14 @@ fn plan_html(h: &mut String, p: &Value, contact: Option<&str>) {
         limit(n("monthlyRuns"), "Bot run a month", "Bot runs a month", "Unlimited Bot runs"),
         limit(n("monthlyTokens"), "model token a month", "model tokens a month", "No monthly token limit"),
         limit(n("dailyRoutineRuns"), "routine run a day", "routine runs a day", "Unlimited routine runs"),
-        limit(n("concurrentRuns"), "run at once", "runs at once", "No limit on runs at once"),
-        match n("maxStorageMb") {
-            Some(mb) => format!("{} of storage", crate::storage::human(mb.saturating_mul(1_000_000))),
-            None => "No storage limit".into(),
-        },
     ];
+    if l.get("concurrentRuns").is_some() {
+        items.push(limit(n("concurrentRuns"), "run at once on your machine", "runs at once on your machine", "No limit on runs at once"));
+    }
+    items.push(match n("maxStorageMb") {
+        Some(mb) => format!("{} of storage", crate::storage::human(mb.saturating_mul(1_000_000))),
+        None => "No storage limit".into(),
+    });
     let m = &p["machine"];
     if let (Some(c), Some(mem), Some(disk)) = (m["cpus"].as_u64(), m["memoryGiB"].as_u64(), m["diskGiB"].as_u64()) {
         items.push(format!("Own machine: {} CPU{}, {mem} GiB memory, {disk} GiB disk", c, if c == 1 { "" } else { "s" }));
@@ -389,6 +398,9 @@ mod tests {
         assert_eq!(p(123456705, "usd", "year"), "$1,234,567.05 / year");
         assert_eq!(p(29000, "chf", "year"), "CHF 290 / year");
         assert_eq!(p(3000, "jpy", "month"), "JPY 3,000 / month", "zero-decimal currencies are whole units");
+        assert_eq!(p(1500, "kwd", "month"), "KWD 1.500 / month", "three-decimal currencies keep their scale");
+        assert_eq!(p(12000, "kwd", "month"), "KWD 12 / month");
+        assert_eq!(p(1005, "bhd", "year"), "BHD 1.005 / year");
         assert_eq!(group(999), "999");
         assert_eq!(group(1000), "1,000");
     }
@@ -396,7 +408,7 @@ mod tests {
     #[test]
     fn sold_tiers_are_listed_with_limits_and_no_secrets() {
         let tiers = Tiers::parse(PRICED, None).unwrap();
-        let v = snapshot(&tiers, &on(Some("mailto:sales@example.com")), Some(8), &sizes);
+        let v = snapshot(&tiers, &on(Some("mailto:sales@example.com")), Some(Some(8)), &sizes);
         let names: Vec<&str> = v["plans"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["starter", "pro"], "a tier nobody can buy isn't listed: {v}");
         let starter = &v["plans"][0];
@@ -406,7 +418,11 @@ mod tests {
         assert_eq!(starter["features"], json!(["Email support"]));
         let pro = &v["plans"][1];
         assert_eq!((pro["prices"].clone(), pro["limits"]["concurrentRuns"].clone(), pro["machine"].clone()), (json!([]), json!(8), Value::Null));
-        assert_eq!(snapshot(&tiers, &on(None), None, &sizes)["plans"][0]["limits"]["concurrentRuns"], Value::Null, "no cap anywhere");
+        assert_eq!(snapshot(&tiers, &on(None), Some(None), &sizes)["plans"][0]["limits"]["concurrentRuns"], Value::Null, "no cap anywhere");
+        // Bots on this server share its cap with everyone: no plan's to publish.
+        let local = snapshot(&tiers, &on(None), None, &sizes);
+        assert!(local["plans"].as_array().unwrap().iter().all(|p| p["limits"].get("concurrentRuns").is_none()), "{local}");
+        assert!(!render_html(&local, false).contains("at once"), "the page leaves it out too");
         assert_eq!(v["enterprise"], json!({ "label": "Enterprise", "contactUrl": "mailto:sales@example.com" }));
         assert_eq!((v["buyUrl"].as_str(), v["signupUrl"].as_str()), (Some("/app/plan"), None));
         let raw = v.to_string();
@@ -419,11 +435,11 @@ mod tests {
     #[test]
     fn the_page_shows_prices_or_contact_us_and_escapes() {
         let tiers = Tiers::parse(PRICED, None).unwrap();
-        let h = render_html(&snapshot(&tiers, &on(Some("https://example.com/sales?a=1&b=2")), Some(8), &sizes), true);
+        let h = render_html(&snapshot(&tiers, &on(Some("https://example.com/sales?a=1&b=2")), Some(Some(8)), &sizes), true);
         assert!(h.contains("<h2>Starter</h2>") && h.contains("£12.50 / month") && h.contains("£120 / year"), "{h}");
         assert!(h.contains("3 Bots") && h.contains("300 Bot runs a month") && h.contains("No monthly token limit") && h.contains("5 GB of storage"), "{h}");
         assert!(h.contains("Own machine: 2 CPUs, 4 GiB memory, 40 GiB disk"), "{h}");
-        assert!(h.contains("20,000,000 model tokens a month") && h.contains("8 runs at once"), "{h}");
+        assert!(h.contains("20,000,000 model tokens a month") && h.contains("8 runs at once on your machine"), "{h}");
         assert!(h.contains("<a href=\"https://example.com/sales?a=1&amp;b=2\">Contact us</a>"), "Pro has no published price: {h}");
         assert!(h.contains("Contact sales") && h.contains("href=\"/app/plan\"") && h.contains("href=\"/status\""), "{h}");
         assert!(!h.contains("<script") && !h.contains("price_"), "{h}");

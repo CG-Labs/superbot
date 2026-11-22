@@ -71,7 +71,7 @@ async fn anyone_reads_the_plans_without_secrets() {
     assert_eq!(starter["prices"], json!([{ "amount": 1900, "currency": "eur", "interval": "month", "display": "€19 / month" }]));
     assert_eq!(starter["limits"]["maxBots"], 3);
     assert_eq!(starter["limits"]["monthlyTokens"], Value::Null, "no limit");
-    assert_eq!(starter["limits"]["concurrentRuns"], crate::slots::DEFAULT_CAP, "the server's own cap when the tier sets none");
+    assert!(starter["limits"].get("concurrentRuns").is_none(), "Bots run on this server, whose cap is everyone's: {v}");
     assert_eq!(starter["machine"], Value::Null, "no control plane, so no size to publish");
     assert_eq!(v["plans"][1]["prices"], json!([]), "Max has no published price");
     assert_eq!(v["enterprise"], json!({ "label": "Enterprise", "contactUrl": "https://example.com/contact" }));
@@ -79,6 +79,27 @@ async fn anyone_reads_the_plans_without_secrets() {
     for secret in ["price_", "hidden-model", "openrouter", "hermes", "g6-standard-1", "stripePrices", "routes", "self-host"] {
         assert!(!body.contains(secret), "{secret} leaked: {body}");
     }
+}
+
+#[tokio::test]
+async fn runs_at_once_are_published_only_where_bots_run_on_their_own_machine() {
+    use crate::machines::route::Routing;
+    use crate::machines::ControlPlane;
+    let p: Arc<dyn crate::machines::provider::MachineProvider> = Arc::new(crate::machines::fake::Fake::default());
+    let (port, app, _, _) = crate::tests::serve_app_with(|a| {
+        let mut cp = ControlPlane::for_tests(p);
+        cp.routing = Routing::On;
+        a.machines = Arc::new(cp);
+    })
+    .await;
+    app.tiers.set(Arc::new(Tiers::parse(TIERS, None).unwrap())).unwrap();
+    app.plans.set(published(None)).unwrap();
+    let (code, body) = call(port, "GET", "/api/plans", "", "").await;
+    assert_eq!(code, 200, "{body}");
+    let v = parse(&body);
+    assert_eq!(v["plans"][0]["limits"]["concurrentRuns"], crate::slots::DEFAULT_CAP, "the server's MAX_CONCURRENT_RUNS when the tier sets none: {v}");
+    let (_, page) = call(port, "GET", "/pricing", "", "").await;
+    assert!(page.contains(&format!("{} runs at once on your machine", crate::slots::DEFAULT_CAP)), "{page}");
 }
 
 #[tokio::test]

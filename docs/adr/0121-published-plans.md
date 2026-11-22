@@ -28,7 +28,7 @@ A tier is **listed when it is sold**: it has `stripePrices` (as the Plan screen 
 |---|---|
 | `name`, `label` | the tier |
 | `prices` | `publishedPrices`, each with `amount`, `currency`, `interval` and a `display` string (`£29 / month`) |
-| `limits` | `maxBots`, `monthlyRuns`, `monthlyTokens`, `dailyRoutineRuns`, `maxStorageMb`, and `concurrentRuns` (the tier's, else the server's `MAX_CONCURRENT_RUNS`, since that is what applies). `null` is no limit |
+| `limits` | `maxBots`, `monthlyRuns`, `monthlyTokens`, `dailyRoutineRuns`, `maxStorageMb`; `null` is no limit. `concurrentRuns` only while Bots run on their owners' machines (`MACHINE_ROUTING` on or assigned): the tier's, else `MAX_CONCURRENT_RUNS`, which is what a machine applies. Bots on the server itself share one cap with everyone, which is no plan's limit, so it's left out |
 | `machine` | `{cpus, memoryGiB, diskGiB}` for the tier's `machineType` when the provider knows it without a call (Incus plans); otherwise `null` |
 | `features` | the tier's `features`: short lines in the operator's words, such as model access or support |
 
@@ -36,7 +36,7 @@ Plus `enterprise` (`{label, contactUrl}` when `PLANS_CONTACT_URL` is set, else `
 
 ### Prices are the operator's words, not Stripe's
 
-Each tier may list `publishedPrices`: `[{amount, currency, interval}]`, the amount in the currency's smallest unit as Stripe's `unit_amount` counts it, a three-letter ISO 4217 currency, and `month` or `year`; at most four, one per currency and interval, and never zero (ADR 0068: no free tier). The tiers file is checked at start, as for every other field, and botd refuses to start on a bad one.
+Each tier may list `publishedPrices`: `[{amount, currency, interval}]`, the amount in the currency's smallest unit as Stripe's `unit_amount` counts it, a currency from a fixed list of ISO 4217 codes with their decimal places (`tiers::CURRENCIES`: two-decimal ones such as `gbp`, `eur` and `usd`, Stripe's zero-decimal ones such as `jpy`, and the three-decimal `bhd`, `jod`, `kwd`, `omr`, `tnd`), and `month` or `year`; at most four, one per currency and interval, and never zero (ADR 0068: no free tier). The tiers file is checked at start, as for every other field, and botd refuses to start on a bad one. The fixed list means a typo such as `gpb` is refused rather than published, and every amount is shown at its currency's real scale (`KWD 1.500`, `JPY 3,000`, `£29`).
 
 **Why not read amounts from Stripe.** botd would have to call Stripe for a public, unauthenticated page: an amplifier anyone could hit, a page that breaks when Stripe is slow, and a `STRIPE_SECRET_KEY` dependency for something self-hosters without billing might still want. Caching at startup would still need the key and still drift until a restart. Writing the amount next to the Stripe price id keeps one file as the source and costs the operator one line per price. The deploy guide says to keep them equal, since Stripe charges its own price. Reconciling them (a startup check against Stripe when the key is set) is a follow-up.
 
@@ -72,15 +72,16 @@ The public site and docs portal ([PR #182](https://github.com/CG-Labs/superbot/p
 
 ## Tests
 
-- `tiers::tests`: `publishedPrices` and `features` are read and checked (currency, interval, amount range, no zero, no duplicates, at most four; features' length, count and one line), and appear in a tier's view only when set; a tier is sold with a Stripe or a published price.
-- `plans::tests`: `PLANS_PAGE` follows billing under `auto`, and `on` and `off` override it; `PLANS_CONTACT_URL` takes only https and mailto; prices display with symbols, decimals and thousands, and zero-decimal currencies as whole units; the snapshot lists only sold tiers with their limits, machine size and the server's run cap, and contains no Stripe price id, model, provider, harness or machine plan id; the page shows prices or "Contact us", escapes the operator's text and has no script; the startup line names listed tiers and warns about unpriced ones.
-- `plans_http_tests.rs`, on the real router: both pages 404 when plans were never set up, with `auto` and billing off, and with `off` and billing on, for admins too; published, `/api/plans` answers anyone with the plans, prices, limits and Enterprise entry, the right headers and no secrets; `/pricing` renders the same plans with no script; a signed-in person's tier view has published prices and no Stripe ids.
+- `tiers::tests`: `publishedPrices` and `features` are read and checked (currency from the list, so a three-letter typo is refused, interval, amount range, no zero, no duplicates, at most four; features' length, count and one line), and appear in a tier's view only when set; a tier is sold with a Stripe or a published price.
+- `plans::tests`: `PLANS_PAGE` follows billing under `auto`, and `on` and `off` override it; `PLANS_CONTACT_URL` takes only https and mailto; prices display with symbols, decimals and thousands, zero-decimal currencies as whole units and three-decimal ones at their scale; the snapshot lists only sold tiers with their limits and machine size, runs at once only where Bots run on their own machines, and contains no Stripe price id, model, provider, harness or machine plan id; the page shows prices or "Contact us", escapes the operator's text and has no script; the startup line names listed tiers and warns about unpriced ones.
+- `plans_http_tests.rs`, on the real router: both pages 404 when plans were never set up, with `auto` and billing off, and with `off` and billing on, for admins too; published, `/api/plans` answers anyone with the plans, prices, limits and Enterprise entry, the right headers and no secrets; `/pricing` renders the same plans with no script; runs at once appear, with the server's cap as the default, only with Bots routed to machines; a signed-in person's tier view has published prices and no Stripe ids.
 - `auth_review_http_tests.rs`: both routes are in the public list; every other route still refuses callers without credentials.
 
 ## Consequences
 
 - Operators write each price twice, as a Stripe price and as `publishedPrices`, and must keep them equal. The startup warning catches a missing one, not a wrong one.
 - Linode machine sizes aren't shown yet: the provider only knows a type's size by asking Linode's API. Operators can describe it in `features` until botd caches Linode types.
+- A currency outside the list needs a code change to add, with its decimal places.
 - Prices are shown as written, with no tax wording; operators who must show tax-inclusive prices write them that way and can say so in `features`. A page-wide note setting is a follow-up.
 - The licensed self-host plan and per-region prices aren't published in this slice; nor are the SLOs per plan ([docs/slo.md](../slo.md)), which could be added from the same file later.
 - A legacy tier still listed in `stripePrices` for existing subscribers is published too, as it already is on the Plan screen; hiding a tier from sale is a follow-up for both.
