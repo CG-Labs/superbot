@@ -32,6 +32,16 @@ describe("SuperBotApi.logout", () => {
     expect(fetchMock).toHaveBeenCalledWith(`${BASE}/api/auth/logout`, expect.objectContaining({ method: "POST", headers: {} }));
   });
 
+  it("hands back the SAML IdP's sign-out page, only over https", async () => {
+    const answer = (logoutUrl: string) =>
+      (globalThis.fetch = jest.fn(async () => ({ ok: true, status: 200, json: async () => ({ ok: true, logoutUrl }) })) as unknown as typeof fetch);
+    const api = new SuperBotApi({ baseUrl: BASE, cookie: true });
+    answer("https://idp.example/slo?SAMLRequest=x");
+    await expect(api.logout()).resolves.toBe("https://idp.example/slo?SAMLRequest=x");
+    answer("javascript:alert(1)");
+    await expect(api.logout()).resolves.toBeUndefined();
+  });
+
   it("fails when the server couldn't end the session, but not when it was already gone", async () => {
     const answer = (status: number) =>
       (globalThis.fetch = jest.fn(async () => ({ ok: status < 400, status, json: async () => ({}) })) as unknown as typeof fetch);

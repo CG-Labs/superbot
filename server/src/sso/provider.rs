@@ -3,7 +3,7 @@
 
 use super::github::{self, GitHub};
 use super::jwt::{self, Invalid, Jwks, Token};
-use super::saml_sp::{self, Attributes, IdpMetadata};
+use super::saml_sp::{self, Attributes, IdpMetadata, SpKey};
 use super::{apple, saml};
 use crate::rbac::Role;
 use serde_json::Value;
@@ -42,7 +42,9 @@ pub enum Kind {
     Saml { issuer: String, entity_id: String, alias: String, map: ClaimMap, allowed_domains: Vec<String> },
     /// A SAML 2.0 IdP botd is the service provider for itself (ADR 0127), see `saml_sp`.
     /// Identities are stored like the bridge's: under `entity_id`, the NameID lowercased.
-    SamlSp { entity_id: String, sp_entity_id: String, source: IdpSource, attributes: Attributes, allowed_domains: Vec<String> },
+    /// `sign_requests` signs AuthnRequests with the SP key (ADR 0137), which is
+    /// `SSO_<ID>_PRIVATE_KEY` with `sp_cert` (base64 DER) when that is set, else generated.
+    SamlSp { entity_id: String, sp_entity_id: String, source: IdpSource, attributes: Attributes, allowed_domains: Vec<String>, sign_requests: bool, sp_cert: Option<String> },
 }
 
 /// Where a native SAML provider's IdP metadata comes from.
@@ -98,6 +100,8 @@ pub struct Provider {
     cache: tokio::sync::Mutex<Cache>,
     /// Native SAML: the IdP's metadata, and when it was loaded.
     idp: Mutex<Option<(Arc<IdpMetadata>, Instant)>>,
+    /// Native SAML: our signing key, once loaded or made (ADR 0137).
+    pub(super) sp_key: Mutex<Option<Arc<SpKey>>>,
 }
 
 #[derive(Default)]
@@ -242,7 +246,7 @@ async fn get_text(http: &reqwest::Client, url: &str) -> Result<String, Invalid> 
 
 impl Provider {
     pub fn new(id: &str, label: &str, kind: Kind, client_id: &str, scopes: &str, jit_role: Option<Role>) -> Provider {
-        Provider { id: id.into(), label: label.into(), kind, client_id: client_id.into(), scopes: scopes.into(), jit_role, cache: Default::default(), idp: Mutex::default() }
+        Provider { id: id.into(), label: label.into(), kind, client_id: client_id.into(), scopes: scopes.into(), jit_role, cache: Default::default(), idp: Mutex::default(), sp_key: Mutex::default() }
     }
 
     pub fn type_name(&self) -> &'static str {
@@ -350,9 +354,10 @@ impl Provider {
     }
 
     /// Where the provider's secret is set: env, `_FILE`, or the secrets store. Apple's is
-    /// the private key that signs each client secret; the others', the client secret.
+    /// the private key that signs each client secret; native SAML's, the SP signing key
+    /// when `SP_CERT_FILE` is set; the others', the client secret.
     pub fn env_var(&self) -> String {
-        let what = if matches!(self.kind, Kind::Apple { .. }) { "PRIVATE_KEY" } else { "CLIENT_SECRET" };
+        let what = if matches!(self.kind, Kind::Apple { .. } | Kind::SamlSp { .. }) { "PRIVATE_KEY" } else { "CLIENT_SECRET" };
         format!("SSO_{}_{what}", self.id.to_ascii_uppercase())
     }
 
@@ -361,6 +366,22 @@ impl Provider {
         let s = crate::secrets::global().get(&self.env_var()).ok().flatten()?;
         crate::secrets::redact::register(s.expose());
         Some(s)
+    }
+
+    /// Native SAML with `SP_CERT_FILE`: the configured SP key, once it is set and matches the
+    /// certificate. Kept once it does; until then each call reads the secret again, so
+    /// `botctl secret set` takes effect without a restart. Err says what is missing.
+    pub(super) fn configured_sp_key(&self) -> Result<Arc<SpKey>, String> {
+        let Kind::SamlSp { sp_cert: Some(cert), .. } = &self.kind else { return Err("no SP_CERT_FILE".into()) };
+        let mut held = self.sp_key.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(k) = held.as_ref() {
+            return Ok(k.clone());
+        }
+        let var = self.env_var();
+        let pem = self.stored_secret().ok_or_else(|| format!("not offered until {var} is set for SP_CERT_FILE (env, _FILE, or `botctl secret set`)"))?;
+        let key = Arc::new(SpKey::from_pem(pem.expose(), cert).map_err(|e| format!("not offered: {var}: {e}"))?);
+        *held = Some(key.clone());
+        Ok(key)
     }
 
     /// The client secret for one code exchange.
@@ -382,10 +403,11 @@ impl Provider {
 
     /// Why the provider isn't offered, for the startup log.
     pub fn not_ready(&self) -> Option<String> {
-        if let Kind::SamlSp { source, .. } = &self.kind {
+        if let Kind::SamlSp { source, sp_cert, .. } = &self.kind {
             let loaded = self.idp.lock().unwrap_or_else(|e| e.into_inner()).is_some();
             return match source {
                 IdpSource::Saved if !loaded => Some(format!("not offered until its IdP metadata is imported: botctl sso saml {} import < metadata.xml", self.id)),
+                _ if sp_cert.is_some() => self.configured_sp_key().err(),
                 _ => None,
             };
         }
@@ -464,7 +486,7 @@ impl Provider {
     /// Native SAML: the IdP metadata. From a URL it's fetched again after a day, and after a
     /// failure at most once per `gap`, keeping what we had meanwhile, as for OIDC discovery.
     pub async fn idp_metadata(&self, http: &reqwest::Client, gap: Duration) -> Result<Arc<IdpMetadata>, Invalid> {
-        let Kind::SamlSp { source, entity_id, .. } = &self.kind else {
+        let Kind::SamlSp { source, entity_id, sign_requests, .. } = &self.kind else {
             return Err(Invalid("not_configured"));
         };
         let (stale, fresh) = match self.idp.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
@@ -490,7 +512,7 @@ impl Provider {
             return stale.ok_or(e);
         }
         let got = get_text(http, url).await.and_then(|xml| {
-            saml_sp::parse_idp_metadata(&xml, entity_id).map_err(|e| {
+            saml_sp::parse_idp_metadata(&xml, entity_id, *sign_requests).map_err(|e| {
                 crate::obs::log::log_warn!("SSO {}: IdP metadata from {url}: {e}", self.id);
                 Invalid("idp_bad_response")
             })
