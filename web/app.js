@@ -140,14 +140,14 @@ function renderUsers() {
       <td>${lastLogin(u)}</td>
       <td>${u.pendingCodes ? `Waiting<div class="sub">until ${esc(fmt(u.pendingCodes.expiresAt))}</div>` : ""}</td>
       <td>${u.mfa?.enabled ? `On<div class="sub">since ${esc(fmt(u.mfa.enabledAt))}</div>` : ""}</td>
-      <td>${regionCell(u.dataRegion)}${pinNote(u.residency)}</td>
+      <td>${regionCell(u.dataRegion)}${pinNote(u.residency)}${u.ownResidency && u.residency?.subjectType === "team" ? pinNote(u.ownResidency) : ""}</td>
       <td class="actions">
         <button type="button" class="btn" data-act="code" ${active ? "" : "disabled"}>New code</button>
         ${u.mfa?.enabled && u.id !== me.user?.id ? '<button type="button" class="btn" data-act="mfa">Reset 2FA</button>' : ""}
         ${u.breakGlass ? "" : `<button type="button" class="btn" data-act="status">${active ? "Disable" : "Enable"}</button>`}
         <button type="button" class="btn" data-act="sessions">Sign out everywhere</button>
         ${u.dataRegion ? '<button type="button" class="btn" data-act="region">Data region</button>' : ""}
-        ${u.dataRegion && u.residency?.subjectType !== "team" ? `<button type="button" class="btn" data-act="residency">${u.residency ? "Unpin" : "Pin region"}</button>` : ""}
+        ${u.dataRegion && (u.ownResidency || !u.residency) ? `<button type="button" class="btn" data-act="residency">${u.ownResidency ? "Unpin" : "Pin region"}</button>` : ""}
       </td>
     </tr>`;
   }).join("");
@@ -186,7 +186,7 @@ $("users-rows").addEventListener("click", async (e) => {
       notice(`Two-factor authentication reset for ${u.name}.`, false);
     }
     if (t.dataset.act === "region") await setRegion(`/api/users/${key(u.id)}/region`, u.name, u.region);
-    if (t.dataset.act === "residency") await setResidency(`/api/users/${key(u.id)}/residency`, u.name, u.residency, u.dataRegion?.region);
+    if (t.dataset.act === "residency") await setResidency(`/api/users/${key(u.id)}/residency`, u.name, u.ownResidency, u.dataRegion?.region);
     if (t.dataset.act === "sessions") {
       if (!confirm(`Sign ${u.name} out of every session?`)) return;
       const r = await api("DELETE", `/api/users/${key(u.id)}/sessions`);
