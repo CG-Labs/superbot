@@ -88,6 +88,9 @@ mod policy_http_tests;
 #[cfg(test)]
 mod prompts_http_tests;
 mod rbac;
+mod retention;
+#[cfg(test)]
+mod retention_http_tests;
 #[cfg(test)]
 mod run_grants_http_tests;
 #[cfg(test)]
@@ -265,6 +268,7 @@ async fn main() {
         log_warn!("{e}");
         std::process::exit(1);
     });
+    let chat_retention = retention::days("CHAT_RETENTION_DAYS", &env("CHAT_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
     let bot_key = random_hex(32);
     secrets::redact::register(&bot_key);
     WEB_DIR.set(std::env::var("WEB_DIR").ok().map(PathBuf::from)).unwrap();
@@ -574,6 +578,7 @@ async fn main() {
         "sessionIdleMinutes": sessions.idle_ms / 60_000,
         "sessionMaxMinutes": sessions.max_ms / 60_000,
         "auditRetentionDays": retention,
+        "chatRetentionDays": chat_retention,
         "screens": app.screens.is_some(),
         "isolation": if app.isolation().is_some() { "users" } else { "off" },
         "isolationTeammates": app.teammate_accounts(),
@@ -597,6 +602,7 @@ async fn main() {
     })));
     license::start(app.clone());
     audit::start_retention(app.clone(), retention);
+    retention::start(app.clone(), chat_retention);
     users::start_pruning(app.clone(), sessions);
     machines::hosts::load(&app, &control_plane).unwrap_or_else(|e| exit(format!("Incus hosts: {e}")));
     machines::start(app.clone(), control_plane);
@@ -711,6 +717,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/access-review", get(access_review::get))
         .route("/access-review/export.csv", get(access_review::export))
         .route("/access-review/complete", post(access_review::complete))
+        .route("/retention", get(retention::get))
+        .route("/retention/holds/{bot}", put(retention::put_hold).delete(retention::delete_hold))
         .route("/secrets", get(list_secrets))
         .route("/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/me/tier", get(my_tier))
@@ -2122,12 +2130,19 @@ async fn delete_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
     if bot.primary {
         return Err(bad("The primary Bot can't be deleted"));
     }
+    let held = || ApiError(StatusCode::CONFLICT, "This Bot's chat is held (a retention hold on it, or on a Bot that wrote in its chat), so it can't be deleted until an admin releases the hold.".into());
+    if app.db.bot_chat_held(&id) {
+        return Err(held());
+    }
     app.stop(&id);
     if let Some(screens) = &app.screens {
         screens.remove(&id).await;
     }
     machines::screens::close(&app, &by, &id, "bot_deleted").await;
-    app.db.delete_bot(&id);
+    // A hold placed while the screen closed still wins: the Bot is stopped, but nothing is lost.
+    if !app.db.delete_bot_unless_held(&id) {
+        return Err(if app.db.bot_chat_held(&id) { held() } else { not_found("Bot") });
+    }
     notify::forget_bot(&app, &id);
     app.db.record(&by.event("bot.deleted").target("bot", &id).bot(&id).details(json!({ "name": bot.name, "harness": bot.harness })));
     machines::offboard::check_owner(&app, &by, &bot.owner_id);
