@@ -720,6 +720,9 @@ pub struct AuditEvent {
     pub session_id: Option<String>,
     /// The user a Bot or the scheduler acted for.
     pub on_behalf_of: Option<String>,
+    /// The hash chain (ADR 0122): the row before's hash, and this row's.
+    pub chain_prev: Option<String>,
+    pub chain_hash: Option<String>,
 }
 
 /// A person who can sign in. `operator` is the owner and break-glass account.
@@ -1722,12 +1725,14 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
         idp_provider: r.get("idp_provider")?,
         session_id: r.get("session_id")?,
         on_behalf_of: r.get("on_behalf_of")?,
+        chain_prev: r.get("chain_prev")?,
+        chain_hash: r.get("chain_hash")?,
     })
 }
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 52] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 53] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1779,6 +1784,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 52] = [
     migrate_custom_roles,
     migrate_residency_pins,
     migrate_saml_sessions,
+    migrate_audit_chain,
     migrate_user_last_seen,
 ];
 
@@ -1837,6 +1843,39 @@ fn migrate_disable_holds(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS machine_disable_holds_user ON machine_disable_holds(user_id);",
     )
+}
+
+/// Tamper evidence (ADR 0122): every audit row sealed onto a hash chain. Rows already
+/// there are sealed now, in order, so the chain covers the whole log from here on; an
+/// upgrade records where that happened, as rows before it were sealed at the upgrade,
+/// not when written. A trigger refuses rows without a seal, and the erasure exception
+/// to the update trigger must keep the seal and drop the salt.
+fn migrate_audit_chain(c: &Connection, fresh: bool) -> rusqlite::Result<()> {
+    for col in crate::audit_chain::COLUMNS {
+        let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('audit_events') WHERE name = ?", [col], |r| r.get(0))?;
+        if !has {
+            c.execute_batch(&format!("ALTER TABLE audit_events ADD COLUMN {col} TEXT;"))?;
+        }
+    }
+    c.execute_batch("DROP TRIGGER IF EXISTS audit_events_no_update; DROP TRIGGER IF EXISTS audit_events_sealed;")?;
+    let (sealed, through) = crate::audit_chain::seal_existing(c)?;
+    c.execute_batch(&format!(
+        "{}
+        CREATE TRIGGER audit_events_sealed BEFORE INSERT ON audit_events
+          WHEN NEW.chain_prev IS NULL OR NEW.chain_hash IS NULL OR NEW.chain_digest IS NULL
+          BEGIN SELECT RAISE(ABORT, 'audit_events rows must be sealed onto the hash chain'); END;",
+        audit_update_trigger(true)
+    ))?;
+    if !fresh && sealed > 0 {
+        let details = serde_json::json!({
+            "added": crate::audit_chain::COLUMNS,
+            "sealed": sealed,
+            "through": through,
+            "reason": "tamper evidence: a hash chain over every event; events up to this one were sealed at this upgrade",
+        });
+        crate::audit_chain::insert_system(c, "migration", "audit.schema_upgraded", ("audit", "chain"), &details)?;
+    }
+    Ok(())
 }
 
 /// Custom roles (ADR 0123): a base built-in role and a fixed set of admin permissions on
@@ -1940,13 +1979,27 @@ fn migrate_user_erasure(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
             c.execute_batch(&format!("ALTER TABLE users ADD COLUMN {col} {ty};"))?;
         }
     }
-    let p = format!("(SELECT value FROM settings WHERE key = '{AUDIT_ERASING}')");
     c.execute_batch(&format!(
         "CREATE UNIQUE INDEX IF NOT EXISTS users_erased_as ON users(erased_as) WHERE erased_as IS NOT NULL;
         DROP TRIGGER IF EXISTS audit_events_no_update;
-        CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events
+        {}",
+        audit_update_trigger(false)
+    ))
+}
+
+/// `audit_events_no_update`: refuses every update but an erasure's (ADR 0102). With the
+/// hash chain (ADR 0122) an erasure also keeps the row's seal and clears its salt.
+fn audit_update_trigger(chain: bool) -> String {
+    let p = format!("(SELECT value FROM settings WHERE key = '{AUDIT_ERASING}')");
+    let chain = if chain {
+        "AND NEW.chain_prev IS OLD.chain_prev AND NEW.chain_hash IS OLD.chain_hash AND NEW.chain_digest IS OLD.chain_digest AND NEW.chain_salt IS NULL"
+    } else {
+        ""
+    };
+    format!(
+        "CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events
           WHEN NOT (
-            {p} IS NOT NULL
+            {p} IS NOT NULL {chain}
             AND NEW.id = OLD.id AND NEW.at = OLD.at AND NEW.actor_kind = OLD.actor_kind AND NEW.action = OLD.action
             AND NEW.outcome = OLD.outcome AND NEW.target_type IS OLD.target_type AND NEW.bot_id IS OLD.bot_id
             AND NEW.actor_role IS OLD.actor_role AND NEW.auth_method IS OLD.auth_method
@@ -1962,7 +2015,7 @@ fn migrate_user_erasure(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
             AND (NEW.session_id IS OLD.session_id OR NEW.session_id IS NULL)
           )
           BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;"
-    ))
+    )
 }
 
 /// Whether Bot `?1` is held or has messages from a held Bot in its chat.
@@ -3498,11 +3551,15 @@ fn migrate_audit_events(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
         CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events
           BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;",
     )?;
-    c.execute_batch(&format!(
+    c.execute_batch(&audit_delete_trigger())
+}
+
+fn audit_delete_trigger() -> String {
+    format!(
         "CREATE TRIGGER audit_events_no_delete BEFORE DELETE ON audit_events
           WHEN coalesce(OLD.at >= {AUDIT_CUTOFF}, 1)
           BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;"
-    ))
+    )
 }
 
 /// Unix ms before which audit events may be deleted, or NULL while retention is off.
@@ -4825,9 +4882,9 @@ impl Db {
         c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", params![AUDIT_ERASING, s.pseudonym])?;
         let mut sql = String::from(
             "SELECT id, actor_id, actor_name, actor_email, actor_subject, target_id, on_behalf_of, ip, user_agent, session_id, details FROM audit_events
-             WHERE actor_id = ?1 OR target_id = ?1 OR on_behalf_of = ?1 OR instr(details, ?1) > 0",
+             WHERE action != ?2 AND (actor_id = ?1 OR target_id = ?1 OR on_behalf_of = ?1 OR instr(details, ?1) > 0",
         );
-        let mut args: Vec<String> = vec![s.id.clone()];
+        let mut args: Vec<String> = vec![s.id.clone(), crate::audit_chain::ERASED.into()];
         for e in &s.emails {
             args.push(e.clone());
             sql.push_str(&format!(" OR actor_email = ?{n} COLLATE NOCASE OR instr(lower(details), ?{n}) > 0", n = args.len()));
@@ -4836,13 +4893,14 @@ impl Db {
             args.push(x.clone());
             sql.push_str(&format!(" OR actor_subject = ?{n} OR instr(details, ?{n}) > 0", n = args.len()));
         }
+        sql.push(')');
         type Row = (i64, [Option<String>; 9], String);
         let rows: Vec<Row> = {
             let mut st = c.prepare(&sql)?;
             let rows = st.query_map(rusqlite::params_from_iter(&args), |r| Ok((r.get(0)?, [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?], r.get(10)?)))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
-        let mut n = 0;
+        let mut cleared = Vec::new();
         for (id, [actor_id, name, email, subject, target, behalf, ip, agent, session], details) in rows {
             let is = |v: &Option<String>| v.as_deref() == Some(s.id.as_str());
             // A visitor without an account (a signup) is known only by the email they gave.
@@ -4873,13 +4931,18 @@ impl Db {
             }
             c.execute(
                 "UPDATE audit_events SET actor_id = ?2, actor_name = ?3, actor_email = ?4, actor_subject = ?5, target_id = ?6, on_behalf_of = ?7,
-                   ip = ?8, user_agent = ?9, session_id = ?10, details = ?11 WHERE id = ?1",
+                   ip = ?8, user_agent = ?9, session_id = ?10, details = ?11, chain_salt = NULL WHERE id = ?1",
                 params![id, next.0, next.1, next.2, next.3, next.4, next.5, next.6, next.7, next.8, if changed { d.to_string() } else { details }],
             )?;
-            n += 1;
+            cleared.push(id);
+        }
+        // On the chain, in the same transaction: the rows whose salt this erasure cleared.
+        // An erased row no such event names is reported as tampered with (ADR 0122).
+        if !cleared.is_empty() {
+            crate::audit_chain::insert_erased(c, &s.pseudonym, &cleared)?;
         }
         c.execute("DELETE FROM settings WHERE key = ?", [AUDIT_ERASING])?;
-        Ok(n)
+        Ok(cleared.len())
     }
 
     /// Every row of every table, as `(table, the row's columns as text)`.
@@ -6547,6 +6610,11 @@ impl Db {
     /// [`Db::record`] for when saving the event is the operation itself: returns the
     /// new event's id, or the error.
     pub fn try_record(&self, e: &audit::Event) -> rusqlite::Result<i64> {
+        self.record_at(e, now())
+    }
+
+    /// [`Db::try_record`] as of `at` (unix ms), for tests of what happens to old events.
+    pub(crate) fn record_at(&self, e: &audit::Event, at: i64) -> rusqlite::Result<i64> {
         let o = |v: &Option<String>, max: usize| v.as_deref().map(|s| audit::clip(s, max));
         let a = &e.actor;
         let bot_actor = matches!(a.kind, audit::ActorKind::Bot).then_some(a.id.as_deref()).flatten();
@@ -6564,37 +6632,31 @@ impl Db {
                 d.insert("spanId".into(), serde_json::json!(t.span_id()));
             }
         }
-        let details = details.to_string();
-        let c = self.c();
-        let res = c.execute(
-            "INSERT INTO audit_events (at, actor_kind, actor_id, actor_name, actor_subject, action, target_type, target_id, bot_id, outcome, ip, user_agent, details,
-               actor_email, actor_role, auth_method, idp, idp_provider, session_id, on_behalf_of)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
-                now(),
-                a.kind.as_str(),
-                o(&a.id, 128),
-                text(&a.name, 128),
-                o(&a.subject, 256),
-                audit::clip(&e.action, 64),
-                o(&e.target_type, 32),
-                o(&e.target_id, 128),
-                o(&e.bot_id, 128),
-                e.outcome.as_str(),
-                o(&e.source.ip, 64),
-                text(&e.source.user_agent, 256),
-                details,
-                text(&a.email, 254),
-                o(&a.role, 16),
-                o(&a.method, 32),
-                o(&a.idp, 32),
-                o(&a.idp_provider, 64),
-                o(&a.session, 64),
-                o(&a.on_behalf_of, 128),
-            ],
-        );
-        let res = res.map(|_| c.last_insert_rowid());
-        drop(c);
+        use rusqlite::types::Value as V;
+        let v = |s: Option<String>| s.map_or(V::Null, V::Text);
+        let cols = [
+            ("at", V::Integer(at)),
+            ("actor_kind", V::Text(a.kind.as_str().into())),
+            ("actor_id", v(o(&a.id, 128))),
+            ("actor_name", v(text(&a.name, 128))),
+            ("actor_subject", v(o(&a.subject, 256))),
+            ("action", V::Text(audit::clip(&e.action, 64))),
+            ("target_type", v(o(&e.target_type, 32))),
+            ("target_id", v(o(&e.target_id, 128))),
+            ("bot_id", v(o(&e.bot_id, 128))),
+            ("outcome", V::Text(e.outcome.as_str().into())),
+            ("ip", v(o(&e.source.ip, 64))),
+            ("user_agent", v(text(&e.source.user_agent, 256))),
+            ("details", V::Text(details.to_string())),
+            ("actor_email", v(text(&a.email, 254))),
+            ("actor_role", v(o(&a.role, 16))),
+            ("auth_method", v(o(&a.method, 32))),
+            ("idp", v(o(&a.idp, 32))),
+            ("idp_provider", v(o(&a.idp_provider, 64))),
+            ("session_id", v(o(&a.session, 64))),
+            ("on_behalf_of", v(o(&a.on_behalf_of, 128))),
+        ];
+        let res = crate::audit_chain::insert(&self.c(), &cols);
         let reason = e.details.get("reason").and_then(|r| r.as_str());
         self.metrics().audited(&e.action, e.outcome.as_str(), reason);
         crate::obs::trace::audited(&e.action, e.outcome.as_str(), reason);
@@ -6602,7 +6664,17 @@ impl Db {
     }
 
     /// Newest first (or oldest first with `oldest_first`), filtered, at most `limit`.
+    /// Rows that can't be read are left out; see `try_audit_events`.
     pub fn audit_events(&self, f: &audit::Filter, limit: i64, oldest_first: bool) -> Vec<AuditEvent> {
+        self.select_audit_events(f, limit, oldest_first, false).unwrap()
+    }
+
+    /// Like `audit_events`, but a row that can't be read is an error, not a gap.
+    pub fn try_audit_events(&self, f: &audit::Filter, limit: i64, oldest_first: bool) -> rusqlite::Result<Vec<AuditEvent>> {
+        self.select_audit_events(f, limit, oldest_first, true)
+    }
+
+    fn select_audit_events(&self, f: &audit::Filter, limit: i64, oldest_first: bool, strict: bool) -> rusqlite::Result<Vec<AuditEvent>> {
         use rusqlite::types::Value as V;
         let mut sql = String::from("SELECT * FROM audit_events WHERE 1 = 1");
         let mut args: Vec<V> = Vec::new();
@@ -6668,8 +6740,9 @@ impl Db {
         sql.push_str(if oldest_first { " ORDER BY id ASC LIMIT ?" } else { " ORDER BY id DESC LIMIT ?" });
         args.push(V::Integer(limit));
         let c = self.c();
-        let mut s = c.prepare(&sql).unwrap();
-        s.query_map(rusqlite::params_from_iter(args), audit_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c.prepare(&sql)?;
+        let rows = s.query_map(rusqlite::params_from_iter(args), audit_row)?;
+        if strict { rows.collect() } else { Ok(rows.filter_map(Result::ok).collect()) }
     }
 
     /// Audit events from `from` (unix ms) whose action is one of `actions` (a trailing `*`
@@ -6755,11 +6828,63 @@ impl Db {
         .unwrap();
     }
 
-    /// Deletes events older than `cutoff` (unix ms). The trigger refuses any row
-    /// still inside the saved retention window.
-    /// Deletes events older than the saved retention window.
-    pub fn prune_audit(&self) -> rusqlite::Result<usize> {
-        self.c().execute(&format!("DELETE FROM audit_events WHERE at < {AUDIT_CUTOFF}"), [])
+    /// Deletes events older than the saved retention window (the trigger refuses any row
+    /// inside it), as one run from the start of the log, so the hash chain stays whole:
+    /// an old row after a younger one waits for it. None after `delivered`, the SIEM
+    /// export's cursor, so nothing goes before it's off the host (ADR 0122). Saves the
+    /// last deleted row as the chain's anchor, and returns how many went and the anchor.
+    pub fn prune_audit(&self, delivered: Option<i64>) -> rusqlite::Result<(usize, Option<crate::audit_chain::Link>)> {
+        let c = self.c();
+        let tx = rusqlite::Transaction::new_unchecked(&c, rusqlite::TransactionBehavior::Immediate)?;
+        // An earlier statement's 'now' than the delete's, so its cutoff is never later than the trigger's.
+        let end: Option<i64> = tx.query_row(
+            &format!("SELECT coalesce((SELECT MIN(id) FROM audit_events WHERE at >= {AUDIT_CUTOFF}), (SELECT MAX(id) + 1 FROM audit_events)) WHERE {AUDIT_CUTOFF} IS NOT NULL"),
+            [],
+            |r| r.get(0),
+        ).optional()?.flatten();
+        let Some(end) = end.map(|e: i64| delivered.map_or(e, |d| e.min(d + 1))) else { return Ok((0, None)) };
+        let last: Option<(i64, Option<String>)> =
+            tx.query_row("SELECT id, chain_hash FROM audit_events WHERE id < ? ORDER BY id DESC LIMIT 1", [end], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let Some((last, hash)) = last else { return Ok((0, None)) };
+        let n = tx.execute("DELETE FROM audit_events WHERE id <= ?", [last])?;
+        let anchor = hash.map(|hash| crate::audit_chain::Link { id: last, hash });
+        if let Some(a) = &anchor {
+            crate::audit_chain::set_anchor(&tx, a)?;
+        }
+        tx.commit()?;
+        Ok((n, anchor))
+    }
+
+    /// The last pruned audit row, which the first one left links to (ADR 0122).
+    pub fn audit_chain_anchor(&self) -> Option<crate::audit_chain::Link> {
+        crate::audit_chain::anchor(&self.c()).ok().flatten()
+    }
+
+    /// Up to `limit` audit rows after id `after`, oldest first, as the hash chain sees them.
+    /// A row that can't be read is an error, never skipped: skipping would hide it.
+    pub fn audit_chain_rows(&self, after: i64, limit: i64) -> rusqlite::Result<Vec<crate::audit_chain::Row>> {
+        let c = self.c();
+        let mut s = c.prepare(&format!("SELECT {} FROM audit_events WHERE id > ? ORDER BY id LIMIT ?", crate::audit_chain::select_list()))?;
+        s.query_map(params![after, limit], crate::audit_chain::read_row)?.collect()
+    }
+
+    /// The newest audit event's id, 0 when there is none.
+    pub fn audit_head(&self) -> i64 {
+        self.c().query_row("SELECT coalesce(MAX(id), 0) FROM audit_events", [], |r| r.get(0)).unwrap_or(0)
+    }
+
+    /// Where the SIEM export to `sink` got to: the last event it delivered (ADR 0122).
+    pub fn audit_export_cursor(&self, sink: &str) -> Option<i64> {
+        let v: Option<String> = self.c().query_row("SELECT value FROM settings WHERE key = ?", [format!("audit_export:{sink}")], |r| r.get(0)).optional().ok().flatten();
+        v.and_then(|v| v.parse().ok())
+    }
+
+    pub fn set_audit_export_cursor(&self, sink: &str, delivered: i64) -> rusqlite::Result<()> {
+        self.c().execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![format!("audit_export:{sink}"), delivered.to_string()],
+        )?;
+        Ok(())
     }
 
     // Machines (ADR 0025)
@@ -9104,14 +9229,14 @@ mod tests {
         assert!(db.c().execute("UPDATE machines SET state = 'lost'", []).is_err(), "only known states");
 
         // An install from before machines (user_version 9) gets the table on upgrade.
-        db.c().execute_batch("DROP TABLE machines; PRAGMA user_version = 9;").unwrap();
+        db.c().execute_batch(&format!("DROP TABLE machines; {REWIND_AUDIT_CHAIN} PRAGMA user_version = 9;")).unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
         assert!(db.machines(None).is_empty());
         assert!(db.add_machine(&new).is_ok());
 
         // An install with tiers but no enrollment (user_version 11) gets enrollment on upgrade.
-        db.c().execute_batch("DROP TABLE machine_certs; DROP TABLE machine_tokens; PRAGMA user_version = 11;").unwrap();
+        db.c().execute_batch(&format!("DROP TABLE machine_certs; DROP TABLE machine_tokens; {REWIND_AUDIT_CHAIN} PRAGMA user_version = 11;")).unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
         let v: i64 = db.c().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
@@ -9125,7 +9250,7 @@ mod tests {
         db.c()
             .execute_batch(
                 "ALTER TABLE machines DROP COLUMN firewall_id; ALTER TABLE machines DROP COLUMN enroll_by;
-                 ALTER TABLE machines DROP COLUMN enroll_overdue_at; PRAGMA user_version = 12;",
+                 ALTER TABLE machines DROP COLUMN enroll_overdue_at; DROP TRIGGER IF EXISTS audit_events_sealed; PRAGMA user_version = 12;",
             )
             .unwrap();
         drop(db);
@@ -9160,7 +9285,7 @@ mod tests {
         drop(db);
         let db = Db::open(&path).unwrap();
         let actions: Vec<String> = all_events(&db).into_iter().map(|e| e.action).collect();
-        assert_eq!(actions, ["policy.sandbox_initialized", "audit.schema_upgraded", "bot.acl_initialized", "policy.initialized"]);
+        assert_eq!(actions, ["audit.schema_upgraded", "policy.sandbox_initialized", "audit.schema_upgraded", "bot.acl_initialized", "policy.initialized"]);
     }
 
     #[test]
@@ -9175,7 +9300,7 @@ mod tests {
         p.as_object_mut().unwrap().remove("sandbox");
         db.c().execute("UPDATE settings SET value = ? WHERE key = 'policy'", [p.to_string()]).unwrap();
         let sandbox = MIGRATIONS.iter().position(|m| std::ptr::fn_addr_eq(*m, migrate_sandbox as fn(&Connection, bool) -> rusqlite::Result<()>)).unwrap();
-        db.c().execute_batch(&format!("PRAGMA user_version = {sandbox};")).unwrap();
+        db.c().execute_batch(&format!("{REWIND_AUDIT_CHAIN} PRAGMA user_version = {sandbox};")).unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
         assert!(!db.global_policy().sandbox);
@@ -9187,9 +9312,13 @@ mod tests {
         assert_eq!(all_events(&db).iter().filter(|e| e.action == "policy.sandbox_initialized").count(), 1, "once");
     }
 
+    /// Before a test rewinds `user_version` past the hash chain (ADR 0122): earlier
+    /// migrations write audit rows raw, as they did then, and the chain's seals them.
+    const REWIND_AUDIT_CHAIN: &str = "DROP TRIGGER IF EXISTS audit_events_sealed;";
+
     macro_rules! undo_audit_actors {
         () => {
-            "DROP TRIGGER audit_events_no_update;
+            "DROP TRIGGER audit_events_no_update; DROP TRIGGER IF EXISTS audit_events_sealed;
             CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;
             DROP INDEX audit_events_on_behalf_of; DROP INDEX audit_events_session;
             ALTER TABLE audit_events DROP COLUMN actor_email; ALTER TABLE audit_events DROP COLUMN actor_role;
@@ -9236,7 +9365,7 @@ mod tests {
         let v: i64 = db.c().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, MIGRATIONS.len() as i64);
         let rows = all_events(&db);
-        let upgraded = rows.iter().find(|e| e.action == "audit.schema_upgraded").unwrap();
+        let upgraded = rows.iter().find(|e| e.action == "audit.schema_upgraded" && e.target_id.as_deref() == Some("actors")).unwrap();
         let old = rows.iter().find(|e| e.action == "bot.created").unwrap();
         assert_eq!((upgraded.action.as_str(), upgraded.actor_id.as_deref()), ("audit.schema_upgraded", Some("migration")));
         assert_eq!(upgraded.details["added"].as_array().map(Vec::len), Some(AUDIT_ACTOR_COLUMNS.len()));
@@ -9288,7 +9417,7 @@ mod tests {
         let never = db.create_user(None, None, "Never", Role::Member).unwrap();
         let s = db.create_session(&NewSession { user_id: &seen.id, token_hash: "h", kind: "token", method: "sso", idp_subject: None, idp_provider: Some("work"), label: None, ip: None, user_agent: None, expires_at: now() + 1000, mfa: None });
         assert_eq!(db.user(&seen.id).unwrap().last_login_at, Some(s.created_at), "a new session stamps it");
-        db.c().execute_batch(&format!("{UNDO_LAST_LOGIN} PRAGMA user_version = 7;")).unwrap();
+        db.c().execute_batch(&format!("{UNDO_LAST_LOGIN} {REWIND_AUDIT_CHAIN} PRAGMA user_version = 7;")).unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
         let u = db.user(&seen.id).unwrap();
@@ -9343,10 +9472,55 @@ mod tests {
         assert!(db.c().execute("DELETE FROM audit_events WHERE action = 'policy.updated'", []).is_err());
         // No retention set: nothing can be deleted, however old.
         assert!(db.c().execute("DELETE FROM audit_events WHERE at < ?", [now() + 60_000]).is_err());
-        assert_eq!(db.prune_audit().unwrap(), 0);
+        assert_eq!(db.prune_audit(None).unwrap(), (0, None));
         assert_eq!(all_events(&db).len(), 2);
         let e = &all_events(&db)[0];
         assert_eq!((e.actor_kind.as_str(), e.actor_id.as_deref(), e.target_id.as_deref()), ("user", Some("operator"), Some("global")));
+        // Sealed on the hash chain (ADR 0122): a row without a seal can't get in, and no
+        // seal can change, even during an erasure.
+        assert!(e.chain_hash.as_ref().is_some_and(|h| h.len() == 64) && e.chain_prev == all_events(&db)[1].chain_hash);
+        let raw = "INSERT INTO audit_events (at, actor_kind, action, outcome, details) VALUES (1, 'system', 'forged', 'success', '{}')";
+        assert!(db.c().execute(raw, []).unwrap_err().to_string().contains("sealed"));
+        db.c().execute("INSERT INTO settings (key, value) VALUES (?, 'p')", [AUDIT_ERASING]).unwrap();
+        assert!(db.c().execute("UPDATE audit_events SET chain_hash = chain_prev", []).is_err());
+        assert!(db.c().execute("UPDATE audit_events SET chain_digest = 'x', chain_salt = NULL", []).is_err());
+        assert_eq!(db.c().execute("UPDATE audit_events SET chain_salt = NULL", []).unwrap(), 2, "an erasure clears the salt");
+        db.c().execute("DELETE FROM settings WHERE key = ?", [AUDIT_ERASING]).unwrap();
+        // Cleared by hand, with no erasure event naming the rows: their contents can't be vouched for.
+        let r = crate::audit_chain::verify(&db, vec![]);
+        assert_eq!((r.ok, r.checked, r.erased, r.broken), (false, 2, 2, 2), "{r:?}");
+        let ids: Vec<i64> = all_events(&db).iter().map(|e| e.id).collect();
+        crate::audit_chain::insert_erased(&db.c(), "erased-test", &ids).unwrap();
+        let r = crate::audit_chain::verify(&db, vec![]);
+        assert_eq!((r.ok, r.checked, r.erased), (true, 3, 2), "{r:?}");
+    }
+
+    /// Retention deletes a run from the start of the log (ADR 0122), never past the
+    /// SIEM export's cursor, and leaves an anchor the chain carries on from.
+    #[test]
+    fn audit_pruning_keeps_the_chain_whole() {
+        let db = Db::open(&temp_path("audit-prune").join("app.sqlite")).unwrap();
+        db.c().execute_batch(&format!("DROP TRIGGER audit_events_no_delete; DELETE FROM audit_events; {}", audit_delete_trigger())).unwrap();
+        let old = now() - 40 * 86_400_000;
+        let at = |action: &str, t: i64| db.record_at(&audit::Event::new(audit::Actor::system("test"), action), t).unwrap();
+        let [o1, o2, o3] = [at("old", old), at("old", old), at("old", old)];
+        let young = at("young", now());
+        let late = at("old", old);
+        assert_eq!(db.prune_audit(Some(o1)).unwrap(), (0, None), "no retention set");
+        db.set_audit_retention(Some(30));
+        let (n, anchor) = db.prune_audit(Some(o1)).unwrap();
+        assert_eq!((n, anchor.as_ref().map(|a| a.id)), (1, Some(o1)), "held at what the SIEM has");
+        assert!(crate::audit_chain::verify(&db, vec![]).ok);
+        let (n, anchor) = db.prune_audit(None).unwrap();
+        assert_eq!((n, anchor.map(|a| a.id)), (2, Some(o3)));
+        assert_eq!(db.audit_chain_anchor().map(|a| a.id), Some(o3));
+        assert_eq!(db.prune_audit(None).unwrap(), (0, None), "the old row after a young one waits");
+        let r = crate::audit_chain::verify(&db, vec![]);
+        assert_eq!((r.ok, r.first, r.anchor.as_ref().map(|a| a.id), r.checked), (true, Some(young), Some(o3), 2), "{r:?}");
+        assert!(o2 < o3 && late > young);
+        // New rows chain on.
+        at("next", now());
+        assert!(crate::audit_chain::verify(&db, vec![]).ok);
     }
 
     #[test]
@@ -9399,25 +9573,24 @@ mod tests {
     fn retention_deletes_only_rows_past_the_window() {
         let db = Db::open(&temp_path("retention").join("app.sqlite")).unwrap();
         let day = 86_400_000;
-        db.c()
-            .execute("INSERT INTO audit_events (at, actor_kind, action, outcome) VALUES (?, 'system', 'old.event', 'success')", [now() - 40 * day])
-            .unwrap();
-        assert_eq!(db.prune_audit().unwrap(), 0, "no retention saved yet");
+        // A log that starts with old rows, since pruning takes a run from the start.
+        db.c().execute_batch(&format!("DROP TRIGGER audit_events_no_delete; DELETE FROM audit_events; {}", audit_delete_trigger())).unwrap();
+        let event = |action: &str, at: i64| db.record_at(&audit::Event::new(audit::Actor::system("test"), action), at).unwrap();
+        event("old.event", now() - 40 * day);
+        assert_eq!(db.prune_audit(None).unwrap(), (0, None), "no retention saved yet");
         assert!(db.c().execute("DELETE FROM audit_events", []).is_err());
         db.set_audit_retention(Some(30));
         assert_eq!(db.audit_retention(), Some(30));
-        // A cutoff inside the window would delete young rows, so the whole statement fails.
-        assert!(db.c().execute("DELETE FROM audit_events WHERE at < ?", [now()]).is_err());
-        assert!(db.c().execute("DELETE FROM audit_events", []).is_err());
         // Rows on both sides of the cutoff, to the millisecond: pruning never trips the trigger.
         let start = now();
         let edge = start - 30 * day;
         for ms in (-2_000..=2_000).step_by(50) {
-            db.c()
-                .execute("INSERT INTO audit_events (at, actor_kind, action, outcome) VALUES (?, 'system', 'edge.event', 'success')", [edge + ms])
-                .unwrap();
+            event("edge.event", edge + ms);
         }
-        assert!(db.prune_audit().unwrap() >= 21, "the 40-day-old row and the edge rows older than a second");
+        // A cutoff inside the window would delete young rows, so the whole statement fails.
+        assert!(db.c().execute("DELETE FROM audit_events WHERE at < ?", [now()]).is_err());
+        assert!(db.c().execute("DELETE FROM audit_events", []).is_err());
+        assert!(db.prune_audit(None).unwrap().0 >= 21, "the 40-day-old row and the edge rows older than a second");
         // The cutoff moves with the clock, so a slow runner ages more edge rows out.
         let late = (now() - start).max(1_000);
         let left: Vec<i64> = all_events(&db).iter().filter(|e| e.action == "edge.event").map(|e| e.at).collect();
@@ -9478,6 +9651,8 @@ mod tests {
                 ("rule.added", "user", Some("operator"), Some("rule"), Some("r1"), "success"),
                 ("audit.schema_upgraded", "system", Some("migration"), Some("audit"), Some("actors"), "success"),
                 ("policy.sandbox_initialized", "system", Some("migration"), Some("policy"), Some("global"), "success"),
+                // Every row above, sealed onto the hash chain (ADR 0122).
+                ("audit.schema_upgraded", "system", Some("migration"), Some("audit"), Some("chain"), "success"),
             ]
         );
         assert_eq!(rows[1].details, json!({ "after": 1 }));
@@ -9485,6 +9660,9 @@ mod tests {
         assert!(db.c().execute("DELETE FROM audit_events", []).is_err());
         db.record(&audit::Event::new(audit::Actor::system("server"), "server.started"));
         assert!(all_events(&db)[0].id > rows.last().unwrap().id);
+        let r = crate::audit_chain::verify(&db, vec![]);
+        assert_eq!((r.ok, r.first, r.checked), (true, Some(rows[0].id), rows.len() as u64 + 1), "{r:?}");
+        assert_eq!(rows.last().unwrap().details["sealed"].as_i64(), Some(rows.len() as i64 - 1));
     }
 
     #[test]
