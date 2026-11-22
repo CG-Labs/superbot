@@ -4692,17 +4692,23 @@ impl Db {
 
     /// Runs `write`, and when it changed a row, ends a SCIM group's claim on `user_id`'s
     /// role in `scope` (ADR 0138), in one transaction: a role given or taken away by hand
-    /// is never one SCIM takes away later.
-    fn by_hand(&self, user_id: &str, scope: &str, write: impl FnOnce(&Connection) -> rusqlite::Result<usize>) -> bool {
+    /// is never one SCIM takes away later. None if nothing changed; else the mapping whose
+    /// claim ended, if one had.
+    fn by_hand(&self, user_id: &str, scope: &str, write: impl FnOnce(&Connection) -> rusqlite::Result<usize>) -> Option<Option<String>> {
         let c = self.c();
-        let Ok(tx) = c.unchecked_transaction() else { return false };
-        let changed = write(&tx).unwrap_or(0) > 0;
-        changed && Self::drop_scim_grant_in(&tx, user_id, scope).is_ok() && tx.commit().is_ok()
+        let tx = c.unchecked_transaction().ok()?;
+        if write(&tx).unwrap_or(0) == 0 {
+            return None;
+        }
+        let taken = Self::drop_scim_grant_in(&tx, user_id, scope).ok()?;
+        tx.commit().ok().map(|_| taken)
     }
 
     /// Gives `user_id` the role across the server, its base becoming their built-in role, in
-    /// one statement, so a role deleted meanwhile can't be half given. False if either is gone.
-    pub fn set_user_custom_role(&self, user_id: &str, role_id: &str) -> bool {
+    /// one statement, so a role deleted meanwhile can't be half given. Written even when they
+    /// hold it already, so it is theirs by hand whatever SCIM took away meanwhile. None if
+    /// either is gone; else the mapping it was SCIM's from, if it was.
+    pub fn give_user_custom_role(&self, user_id: &str, role_id: &str) -> Option<Option<String>> {
         self.by_hand(user_id, "org", |c| {
             c.execute(
                 "UPDATE users SET role_id = ?1, role = (SELECT base FROM roles WHERE id = ?1), updated_at = ?2
@@ -4714,12 +4720,17 @@ impl Db {
 
     /// Takes the role away across the server. They keep its base as their built-in role.
     pub fn clear_user_custom_role(&self, user_id: &str, role_id: &str) -> bool {
-        self.by_hand(user_id, "org", |c| c.execute("UPDATE users SET role_id = NULL, updated_at = ?1 WHERE id = ?2 AND role_id = ?3", params![now(), user_id, role_id]))
+        self.by_hand(user_id, "org", |c| c.execute("UPDATE users SET role_id = NULL, updated_at = ?1 WHERE id = ?2 AND role_id = ?3", params![now(), user_id, role_id])).is_some()
     }
 
     /// Gives (Some) or takes away (None) a role within the team `user_id` is on. False if
     /// they aren't on that team, or the role is gone.
     pub fn set_team_custom_role(&self, team_id: &str, user_id: &str, role_id: Option<&str>) -> bool {
+        self.give_team_custom_role(team_id, user_id, role_id).is_some()
+    }
+
+    /// `set_team_custom_role`, and the mapping the role in the team was SCIM's from.
+    pub fn give_team_custom_role(&self, team_id: &str, user_id: &str, role_id: Option<&str>) -> Option<Option<String>> {
         self.by_hand(user_id, "team", |c| {
             c.execute(
                 "UPDATE team_members SET role_id = ?1 WHERE team_id = ?2 AND user_id = ?3 AND (?1 IS NULL OR EXISTS (SELECT 1 FROM roles WHERE id = ?1))",
@@ -4732,12 +4743,6 @@ impl Db {
 
     fn drop_scim_grant_in(c: &Connection, user_id: &str, scope: &str) -> rusqlite::Result<Option<String>> {
         c.query_row("DELETE FROM scim_role_grants WHERE user_id = ?1 AND scope = ?2 RETURNING mapping_id", [user_id, scope], |r| r.get(0)).optional()
-    }
-
-    /// Ends a SCIM group's claim on the role `user_id` holds in `scope`, so it is theirs as
-    /// if given by hand. The mapping's id, if there was one.
-    pub fn take_over_scim_grant(&self, user_id: &str, scope: &str) -> Option<String> {
-        Self::drop_scim_grant_in(&self.c(), user_id, scope).ok().flatten()
     }
 
     pub fn scim_role_mappings(&self) -> Vec<ScimRoleMapping> {
@@ -8942,7 +8947,7 @@ mod tests {
         assert!(db.grant_scim_role(&org, &a.id));
         assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Member, Some(r.id.clone())));
         assert!(!db.grant_scim_role(&org, &a.id), "once");
-        assert!(db.set_user_custom_role(&b.id, &hand.id));
+        assert!(db.give_user_custom_role(&b.id, &hand.id).is_some());
         assert!(!db.grant_scim_role(&org, &b.id), "never over a role given by hand");
         assert!(matches!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view", "bots.manage"])), Err(RoleError::Reaches { .. })), "checked as it's saved");
         assert!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view"])).is_ok());
@@ -8956,7 +8961,7 @@ mod tests {
 
         // Given by hand after SCIM gave one: SCIM's claim ends and nothing is taken back.
         assert!(db.grant_scim_role(&org, &a.id));
-        assert!(db.set_user_custom_role(&a.id, &hand.id));
+        assert!(db.give_user_custom_role(&a.id, &hand.id).is_some());
         assert!(db.revoke_scim_role(&org, &a.id, false).is_none());
         assert_eq!(db.user(&a.id).unwrap().role_id, Some(hand.id.clone()));
 
@@ -8965,9 +8970,15 @@ mod tests {
         assert_eq!(db.team_member(&b.id).unwrap().role_id, Some(r.id.clone()));
         assert!(db.revoke_scim_role(&in_team, &b.id, true).is_none(), "a leave that a rejoin overtook takes nothing");
         assert_eq!(db.team_member(&b.id).unwrap().role_id, Some(r.id.clone()));
-        assert_eq!(db.take_over_scim_grant(&b.id, "team"), Some(in_team.id.clone()));
+        assert_eq!(db.give_team_custom_role(&team.id, &b.id, Some(&r.id)), Some(Some(in_team.id.clone())), "the same role, now by hand");
         assert!(db.revoke_scim_role(&in_team, &b.id, false).is_none());
         assert_eq!(db.team_member(&b.id).unwrap().role_id, Some(r.id.clone()), "kept by hand");
+        // An admin confirms the role SCIM gave just as SCIM takes it away: it is still theirs.
+        assert!(db.set_team_custom_role(&team.id, &b.id, None));
+        assert!(db.grant_scim_role(&in_team, &b.id));
+        assert!(db.revoke_scim_role(&in_team, &b.id, false).is_some());
+        assert_eq!(db.give_team_custom_role(&team.id, &b.id, Some(&r.id)), Some(None));
+        assert_eq!(db.team_member(&b.id).unwrap().role_id, Some(r.id.clone()));
         assert!(db.remove_team_member(&team.id, &b.id, false));
         assert!(!db.grant_scim_role(&in_team, &b.id), "only on the team");
 
