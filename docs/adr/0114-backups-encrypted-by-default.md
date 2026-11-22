@@ -4,7 +4,7 @@
 
 Accepted (22 Nov 2026). Part of the SOC 2 readiness checklist of M4, [#50](https://github.com/CG-Labs/superbot/issues/50); closes checklist row CC6.7-2 in the [readiness checklist](../security/soc2-readiness-checklist.md). Builds on the server's backups ([ADR 0030](0030-backup-restore-drill.md)), off-host machine backups ([ADR 0071](0071-off-host-machine-backups.md)) and server backups copied off the host ([ADR 0109](0109-server-backups-off-the-host.md)).
 
-0111 is the highest number on `main`. Another open PR holds 0112, and open PR [#174](https://github.com/CG-Labs/superbot/pull/174) holds 0113.
+0113 is the highest number on `main` (0112 from [#175](https://github.com/CG-Labs/superbot/pull/175), 0113 from [#174](https://github.com/CG-Labs/superbot/pull/174)).
 
 ## Context
 
