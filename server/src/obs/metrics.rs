@@ -64,6 +64,8 @@ const OUTCOMES: [&str; 3] = ["success", "failure", "denied"];
 const METHODS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
 /// Distinct refusal reasons kept; any more count as `other`.
 pub const MAX_REASONS: usize = 32;
+/// Distinct tiers kept for per-tier metrics (ADR 0117); any more count as `other`.
+pub const MAX_TIERS: usize = 16;
 
 #[derive(Default, Clone)]
 struct Histogram {
@@ -155,6 +157,13 @@ struct Inner {
     runs: BTreeMap<(&'static str, &'static str), u64>,
     run_seconds: BTreeMap<&'static str, Histogram>,
     runs_active: BTreeMap<&'static str, i64>,
+    /// Per tier (ADR 0117): requests by status class, their latency, runs by result and
+    /// their duration. Only filled while something reads them.
+    tiers_wanted: bool,
+    tier_http: BTreeMap<(String, &'static str), u64>,
+    tier_http_seconds: BTreeMap<String, Histogram>,
+    tier_runs: BTreeMap<(String, &'static str), u64>,
+    tier_run_seconds: BTreeMap<String, Histogram>,
     refused: BTreeMap<String, u64>,
     events: BTreeMap<(&'static str, &'static str), u64>,
     signin_failures: BTreeMap<&'static str, u64>,
@@ -201,6 +210,16 @@ fn reason(r: &str) -> String {
     if ok { r.to_string() } else { "other".into() }
 }
 
+impl Inner {
+    /// A tier's name as the tiers file spells them (`pro`, `self-host`), the first
+    /// `MAX_TIERS` of them; anything else is `other`.
+    fn tier(&self, t: &str) -> String {
+        let ok = !t.is_empty() && t.len() <= 40 && t.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+        let known: std::collections::BTreeSet<&str> = self.tier_http_seconds.keys().chain(self.tier_run_seconds.keys()).map(String::as_str).collect();
+        if ok && (known.contains(t) || known.len() < MAX_TIERS) { t.to_string() } else { "other".into() }
+    }
+}
+
 /// Takes one off a harness's active runs when dropped, however the run ends.
 pub struct Active<'a> {
     m: &'a Metrics,
@@ -218,10 +237,16 @@ impl Metrics {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub fn request(&self, class: &'static str, method: &'static str, code: u16, seconds: f64) {
+    /// A request answered, and the tier of whoever sent it when per-tier metrics are wanted.
+    pub fn request(&self, class: &'static str, method: &'static str, code: u16, seconds: f64, tier: Option<&str>) {
         let mut m = self.lock();
         *m.http.entry((class, method, status_class(code))).or_default() += 1;
         m.http_seconds.entry(class).or_default().observe(&HTTP_BUCKETS, seconds);
+        if let Some(t) = tier.filter(|_| m.tiers_wanted) {
+            let t = m.tier(t);
+            *m.tier_http.entry((t.clone(), status_class(code))).or_default() += 1;
+            m.tier_http_seconds.entry(t).or_default().observe(&HTTP_BUCKETS, seconds);
+        }
         // Probes would dilute the error share the status page judges the API by.
         if !matches!(class, "healthz" | "status") {
             m.recent.bump(crate::db::now(), |r| {
@@ -254,11 +279,16 @@ impl Metrics {
         Active { m: self, harness: h }
     }
 
-    pub fn run_finished(&self, harness_name: &str, result: &str, seconds: f64) {
+    pub fn run_finished(&self, harness_name: &str, tier: &str, result: &str, seconds: f64) {
         let (h, r) = (harness(harness_name), known(&RUN_RESULTS, result));
         let mut m = self.lock();
         *m.runs.entry((h, r)).or_default() += 1;
         m.run_seconds.entry(h).or_default().observe(&RUN_BUCKETS, seconds);
+        if m.tiers_wanted {
+            let t = m.tier(tier);
+            *m.tier_runs.entry((t.clone(), r)).or_default() += 1;
+            m.tier_run_seconds.entry(t).or_default().observe(&RUN_BUCKETS, seconds);
+        }
         let failed = RUN_FAILURES.contains(&r);
         if failed || r == "done" {
             m.recent.bump(crate::db::now(), |w| {
@@ -317,6 +347,16 @@ impl Metrics {
         self.lock().host_use_wanted
     }
 
+    /// Counts requests and runs by tier too (ADR 0117): set when `/metrics` is on, so a
+    /// server without it looks up no one's tier per request.
+    pub fn want_tiers(&self) {
+        self.lock().tiers_wanted = true;
+    }
+
+    pub fn wants_tiers(&self) -> bool {
+        self.lock().tiers_wanted
+    }
+
     /// What Incus host `host` said it uses, at `at_ms`.
     pub fn host_read(&self, host: &str, at_ms: i64, u: HostUse) {
         self.lock().host_use.insert(host.to_string(), (at_ms, u, false));
@@ -361,6 +401,24 @@ impl Metrics {
         family(out, "superbot_runs_active", "gauge", "Bot runs underway now, by harness.");
         for (harness, n) in &m.runs_active {
             sample(out, "superbot_runs_active", &[("harness", harness)], *n as f64);
+        }
+        if m.tiers_wanted {
+            family(out, "superbot_http_requests_by_tier_total", "counter", "HTTP requests botd answered, by the tier of whoever sent them (none: no one signed in) and status class (ADR 0117).");
+            for ((tier, status), n) in &m.tier_http {
+                sample(out, "superbot_http_requests_by_tier_total", &[("tier", tier), ("status_class", status)], *n as f64);
+            }
+            family(out, "superbot_http_request_duration_by_tier_seconds", "histogram", "Time to answer a request, by the tier of whoever sent it.");
+            for (tier, h) in &m.tier_http_seconds {
+                histogram(out, "superbot_http_request_duration_by_tier_seconds", &[("tier", tier)], &HTTP_BUCKETS, h);
+            }
+            family(out, "superbot_runs_by_tier_total", "counter", "Bot runs that finished, by their owner's tier and result (ADR 0117).");
+            for ((tier, result), n) in &m.tier_runs {
+                sample(out, "superbot_runs_by_tier_total", &[("tier", tier), ("result", result)], *n as f64);
+            }
+            family(out, "superbot_run_duration_by_tier_seconds", "histogram", "How long finished Bot runs took, by their owner's tier.");
+            for (tier, h) in &m.tier_run_seconds {
+                histogram(out, "superbot_run_duration_by_tier_seconds", &[("tier", tier)], &RUN_BUCKETS, h);
+            }
         }
         family(out, "superbot_runs_refused_total", "counter", "Bot runs refused before they started, by reason.");
         for (r, n) in &m.refused {
@@ -445,8 +503,9 @@ mod tests {
     #[test]
     fn labels_come_only_from_fixed_lists() {
         let m = Metrics::default();
-        m.request("bots", method("BREW"), 418, 0.02);
-        m.run_finished("someone@example.com", "it broke: secret", 3.0);
+        m.want_tiers();
+        m.request("bots", method("BREW"), 418, 0.02, Some("Ada's plan"));
+        m.run_finished("someone@example.com", "ada@example.com", "it broke: secret", 3.0);
         drop(m.run_started("../../etc/passwd"));
         m.audited("auth.login_failed", "failure", None);
         m.audited("user.email_changed", "success", None);
@@ -469,9 +528,42 @@ mod tests {
         assert!(out.contains(r#"superbot_signin_suspicious_total{pattern="ip_failures"} 1"#), "{out}");
         assert!(out.contains(r#"superbot_signin_suspicious_total{pattern="new_ip"} 0"#), "{out}");
         assert!(out.contains(r#"superbot_signin_suspicious_total{pattern="other"} 1"#), "{out}");
-        for bad in ["BREW", "203.0.113", "example.com", "secret", "passwd", "email_changed", "sk-live", "Alex"] {
+        assert!(out.contains(r#"superbot_http_requests_by_tier_total{tier="other",status_class="4xx"} 1"#), "{out}");
+        assert!(out.contains(r#"superbot_runs_by_tier_total{tier="other",result="other"} 1"#), "{out}");
+        for bad in ["BREW", "203.0.113", "example.com", "secret", "passwd", "email_changed", "sk-live", "Alex", "Ada"] {
             assert!(!out.contains(bad), "{bad} leaked into: {out}");
         }
+    }
+
+    #[test]
+    fn tiers_are_counted_only_when_wanted_and_capped() {
+        let m = Metrics::default();
+        m.request("bots", "GET", 200, 0.01, Some("pro"));
+        m.run_finished("claude", "pro", "done", 1.0);
+        let mut out = String::new();
+        m.render(&mut out);
+        assert!(!out.contains("_by_tier"), "nothing per tier unless wanted: {out}");
+
+        m.want_tiers();
+        m.request("bots", "GET", 200, 0.01, Some("pro"));
+        m.request("bots", "GET", 503, 0.01, Some("none"));
+        m.request("bots", "GET", 200, 0.01, None);
+        m.run_finished("claude", "pro", "done", 2.0);
+        m.run_finished("codex", "self-host", "error", 2.0);
+        for i in 0..(MAX_TIERS + 5) {
+            m.request("bots", "GET", 200, 0.01, Some(&format!("t{i}")));
+        }
+        let mut out = String::new();
+        m.render(&mut out);
+        assert!(out.contains(r#"superbot_http_requests_by_tier_total{tier="pro",status_class="2xx"} 1"#), "{out}");
+        assert!(out.contains(r#"superbot_http_requests_by_tier_total{tier="none",status_class="5xx"} 1"#), "{out}");
+        assert!(out.contains(r#"superbot_http_request_duration_by_tier_seconds_count{tier="pro"} 1"#), "{out}");
+        assert!(out.contains(r#"superbot_runs_by_tier_total{tier="pro",result="done"} 1"#), "{out}");
+        assert!(out.contains(r#"superbot_runs_by_tier_total{tier="self-host",result="error"} 1"#), "{out}");
+        assert!(out.contains(r#"superbot_run_duration_by_tier_seconds_bucket{tier="pro",le="5"} 1"#), "{out}");
+        let n = m.lock().tier_http_seconds.len();
+        assert!(n <= MAX_TIERS + 1, "{n}");
+        assert!(out.contains(r#"tier="other""#), "past the cap: other: {out}");
     }
 
     #[test]
@@ -522,13 +614,13 @@ mod tests {
     #[test]
     fn requests_runs_and_notices_feed_the_recent_window() {
         let m = Metrics::default();
-        m.request("bots", "GET", 200, 0.01);
-        m.request("bots", "GET", 503, 0.01);
-        m.request("healthz", "GET", 200, 0.01);
-        m.request("status", "GET", 200, 0.01);
-        m.run_finished("claude", "done", 1.0);
-        m.run_finished("claude", "timeout", 1.0);
-        m.run_finished("claude", "stopped", 1.0);
+        m.request("bots", "GET", 200, 0.01, None);
+        m.request("bots", "GET", 503, 0.01, None);
+        m.request("healthz", "GET", 200, 0.01, None);
+        m.request("status", "GET", 200, 0.01, None);
+        m.run_finished("claude", "self-host", "done", 1.0);
+        m.run_finished("claude", "self-host", "timeout", 1.0);
+        m.run_finished("claude", "self-host", "stopped", 1.0);
         m.audited("notification.failed", "failure", None);
         let r = m.recent(crate::db::now(), RECENT_MINUTES);
         assert_eq!(r, Recent { requests: 2, errors: 1, runs_done: 1, runs_failed: 1, notices_sent: 0, notices_failed: 1 });
@@ -537,8 +629,8 @@ mod tests {
     #[test]
     fn histograms_are_cumulative_and_end_in_inf() {
         let m = Metrics::default();
-        m.run_finished("claude", "done", 2.0);
-        m.run_finished("claude", "error", 4000.0);
+        m.run_finished("claude", "self-host", "done", 2.0);
+        m.run_finished("claude", "self-host", "error", 4000.0);
         let mut out = String::new();
         m.render(&mut out);
         assert!(out.contains(r#"superbot_run_duration_seconds_bucket{harness="claude",le="1"} 0"#), "{out}");

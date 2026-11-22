@@ -630,25 +630,49 @@ impl Enrollment {
         path: &str,
         body: &T,
     ) -> Result<(u16, Value), String> {
+        // Only inside a traced request or run (ADR 0117): background calls start no trace.
+        let call = agent_call(path);
+        let span = crate::obs::trace::child(&format!("{method} {call}"), crate::obs::trace::Kind::Client);
+        span.set("http.request.method", method.as_str());
+        span.set("superbot.agent.call", call);
+        span.set("superbot.machine_id", &m.id);
         let pins = app.db.machine_pins(&m.id);
         if pins.is_empty() {
+            span.fail();
             return Err("it has no usable certificate".into());
         }
-        let address = m.ipv4.as_deref().ok_or("it has no address yet")?;
-        let (client, _) = self.pinned(pins)?;
-        let mut r = client
-            .request(method, self.agent_url(address, path))
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| format!("its agent didn't answer: {}", without_url(e)))?;
+        let Some(address) = m.ipv4.as_deref() else {
+            span.fail();
+            return Err("it has no address yet".into());
+        };
+        let (client, _) = self.pinned(pins).inspect_err(|_| span.fail())?;
+        let mut call = client.request(method, self.agent_url(address, path)).json(body);
+        if let Some(ctx) = span.sampled() {
+            call = call.header("traceparent", ctx.traceparent());
+        }
+        let mut r = call.send().await.map_err(|e| {
+            span.fail();
+            format!("its agent didn't answer: {}", without_url(e))
+        })?;
         let code = r.status().as_u16();
+        span.set("http.response.status_code", code);
+        if code >= 500 {
+            span.fail();
+        }
         let reply = read_capped(&mut r, MAX_REPLY)
             .await
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or(Value::Null);
         Ok((code, reply))
     }
+}
+
+/// A call to a machine's agent as a span names it: its path's first two segments
+/// (`/v1/teammates`), never the ids or query after them.
+fn agent_call(path: &str) -> &str {
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let end = path.match_indices('/').nth(2).map_or(path.len(), |(i, _)| i);
+    &path[..end]
 }
 
 fn control_cert(ca: &Ca, host: &str) -> Result<ControlCert, String> {
@@ -1698,6 +1722,14 @@ pub async fn revoke(
 mod tests {
     use super::*;
     use crate::secrets::key::MasterKey;
+
+    #[test]
+    fn agent_calls_are_named_without_ids() {
+        assert_eq!(agent_call("/v1/jobs"), "/v1/jobs");
+        assert_eq!(agent_call("/v1/teammates/u123/logins?owner=ada@example.com"), "/v1/teammates");
+        assert_eq!(agent_call("/v1/screens/b1#x"), "/v1/screens");
+        assert_eq!(agent_call(""), "");
+    }
 
     #[test]
     fn settings() {

@@ -3,7 +3,8 @@
 //! `ts`, `level` and `msg`, and adds a line for each request and each run, with their ids.
 //!
 //! What goes in a structured line is chosen field by field: ids botd makes (request,
-//! run, message, Bot), harness names, route templates and classes, statuses and timings.
+//! run, message, Bot, and trace and span ids when traces are on), harness names, route
+//! templates and classes, statuses and timings.
 //! Never a path as sent, a query string, a body, a name, an email, or a token.
 
 use serde_json::{Map, Value, json};
@@ -73,8 +74,15 @@ pub fn line(level: Level, msg: &str) {
 }
 
 /// A structured line, `msg` naming what happened (`http.request`, `run.finished`), with
-/// `fields` beside it. Only in JSON format: text logs stay as they were.
-pub fn event(level: Level, msg: &str, fields: Value) {
+/// `fields` beside it. Only in JSON format: text logs stay as they were. Inside a span
+/// that's kept (ADR 0117), it names the span's `traceId` and `spanId` too.
+pub fn event(level: Level, msg: &str, mut fields: Value) {
+    if let (Value::Object(f), Some(c)) = (&mut fields, super::trace::current_sampled())
+        && f.get("traceId").is_none_or(Value::is_null)
+    {
+        f.insert("traceId".into(), json!(c.trace_id()));
+        f.insert("spanId".into(), json!(c.span_id()));
+    }
     let rendered = (json() || cfg!(test)).then(|| render(level, msg, fields));
     #[cfg(test)]
     if let Some(r) = &rendered {

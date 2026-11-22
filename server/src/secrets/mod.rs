@@ -138,10 +138,10 @@ pub fn server_secret(name: &str) -> bool {
 /// container and administers the Incus host (ADR 0065), the notifier's SMTP
 /// password, webhook URL, and webhook signing key (ADR 0061), and the Expo access
 /// token that lets botd push to every registered phone (ADR 0080), the token
-/// scrapers send to `/metrics` (ADR 0089), the error tracker's DSN (ADR 0113), and the
-/// keys to the stores that hold every machine's backups (ADR 0071) and the server's own
-/// (ADR 0109).
-pub const SERVER_SECRETS: [&str; 11] = [
+/// scrapers send to `/metrics` (ADR 0089), the error tracker's DSN (ADR 0113), the
+/// headers sent to the trace collector (ADR 0117), and the keys to the stores that hold
+/// every machine's backups (ADR 0071) and the server's own (ADR 0109).
+pub const SERVER_SECRETS: [&str; 12] = [
     "TURNSTILE_SECRET",
     "LINODE_TOKEN",
     "INCUS_CLIENT_KEY",
@@ -151,6 +151,7 @@ pub const SERVER_SECRETS: [&str; 11] = [
     "EXPO_ACCESS_TOKEN",
     "METRICS_TOKEN",
     "ERROR_REPORT_DSN",
+    "TRACES_OTLP_HEADERS",
     "MACHINE_BACKUP_S3_SECRET_ACCESS_KEY",
     "SERVER_BACKUP_S3_SECRET_ACCESS_KEY",
 ];
