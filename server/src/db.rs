@@ -675,6 +675,16 @@ pub struct Approval {
     pub scope: Option<String>,
 }
 
+/// One group of [`Db::audit_counts`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuditCount {
+    pub action: String,
+    pub outcome: String,
+    pub method: Option<String>,
+    pub code: Option<String>,
+    pub n: u64,
+}
+
 /// One row of the audit log. See `audit.rs` and ADR 0009.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -6572,6 +6582,59 @@ impl Db {
         let c = self.c();
         let mut s = c.prepare(&sql).unwrap();
         s.query_map(rusqlite::params_from_iter(args), audit_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Audit events from `from` (unix ms) whose action is one of `actions` (a trailing `*`
+    /// matches a prefix), counted by action, outcome, sign-in method and code: a run's
+    /// `details.result`, else `details.reason`. Counts only, never who (ADR 0144).
+    pub fn audit_counts(&self, from: i64, actions: &[&str]) -> Vec<AuditCount> {
+        use rusqlite::types::Value as V;
+        let mut args = vec![V::Integer(from)];
+        let mut parts = Vec::new();
+        for a in actions {
+            match a.strip_suffix('*') {
+                Some(prefix) => {
+                    parts.push("substr(action, 1, ?) = ?");
+                    args.extend([V::Integer(prefix.len() as i64), V::Text(prefix.into())]);
+                }
+                None => {
+                    parts.push("action = ?");
+                    args.push(V::Text(a.to_string()));
+                }
+            }
+        }
+        if parts.is_empty() {
+            return Vec::new();
+        }
+        let sql = format!(
+            "SELECT action, outcome, auth_method,
+               CASE WHEN json_valid(details) THEN CAST(COALESCE(json_extract(details, '$.result'), json_extract(details, '$.reason')) AS TEXT) END AS code,
+               COUNT(*)
+             FROM audit_events WHERE at >= ? AND ({})
+             GROUP BY action, outcome, auth_method, code ORDER BY action, outcome, code",
+            parts.join(" OR ")
+        );
+        let c = self.c();
+        let mut s = c.prepare(&sql).unwrap();
+        s.query_map(rusqlite::params_from_iter(args), |r| {
+            Ok(AuditCount { action: r.get(0)?, outcome: r.get(1)?, method: r.get(2)?, code: r.get(3)?, n: r.get::<_, i64>(4)?.max(0) as u64 })
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect()
+    }
+
+    /// Active people, the owner aside as seats count them, and how many of them signed in
+    /// or used a session from `since` (unix ms).
+    pub fn people_active_since(&self, since: i64) -> (u64, u64) {
+        self.c()
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(u.last_login_at >= ?1 OR EXISTS (SELECT 1 FROM sessions s WHERE s.user_id = u.id AND s.last_seen_at >= ?1)), 0)
+                 FROM users u WHERE u.status = 'active' AND u.id != ?2",
+                params![since, crate::users::OPERATOR],
+                |r| Ok((r.get::<_, i64>(0)?.max(0) as u64, r.get::<_, i64>(1)?.max(0) as u64)),
+            )
+            .unwrap_or((0, 0))
     }
 
     /// Whether per-user accounts were on, with their copies in order, when last saved (ADR 0037).
