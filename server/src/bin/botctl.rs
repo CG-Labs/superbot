@@ -1274,6 +1274,25 @@ fn saml_summary(v: &Value) -> String {
     } else if let Some(p) = key["problem"].as_str() {
         out += &format!("  SP signing key:           {p}\n");
     }
+    let enc = &v["spEncryptionKey"];
+    if let Some(c) = enc["certificate"].as_object() {
+        out += &format!(
+            "  SP encryption certificate: SHA-256 {} ({}), expires {}\n",
+            c["sha256"].as_str().unwrap_or_default(),
+            enc["from"].as_str().unwrap_or_default(),
+            day(&c["notAfter"])
+        );
+    } else if let Some(p) = enc["problem"].as_str() {
+        out += &format!("  SP encryption key:        {p}\n");
+    }
+    out += &format!(
+        "  Encrypted assertions:     {}\n",
+        match v["encryptedAssertions"].as_str() {
+            Some("allow") => "allowed",
+            Some("require") => "required",
+            _ => "off",
+        }
+    );
     let yes = |b: bool| if b { "yes" } else { "no" };
     out += &format!(
         "  Signs AuthnRequests:      {}\n  Single logout:            {}\n",
@@ -2332,6 +2351,13 @@ mod tests {
         assert!(out.contains("SLO URL (logout URL):     https://bots.example/api/auth/sso/corp/slo") && out.contains("    Logout URL:  https://idp.example/slo"), "{out}");
         assert!(out.contains("SP signing certificate:   SHA-256 12:34 (generated), expires 2030-03-17"), "{out}");
         assert!(out.contains("Signs AuthnRequests:      yes") && out.contains("Single logout:            yes\n"), "{out}");
+        assert!(out.contains("Encrypted assertions:     off") && !out.contains("SP encryption"), "{out}");
+        v["encryptedAssertions"] = json!("require");
+        v["spEncryptionKey"] = json!({ "from": "secret", "certificate": { "sha256": "56:78", "subject": "CN=enc", "notAfter": 1_900_000_000_000_i64 } });
+        let out = saml_summary(&v);
+        assert!(out.contains("SP encryption certificate: SHA-256 56:78 (secret), expires 2030-03-17") && out.contains("Encrypted assertions:     required"), "{out}");
+        v["spEncryptionKey"] = json!({ "problem": "not offered until SSO_CORP_ENCRYPTION_PRIVATE_KEY is set" });
+        assert!(saml_summary(&v).contains("SP encryption key:        not offered until SSO_CORP_ENCRYPTION_PRIVATE_KEY"));
     }
 
     #[test]

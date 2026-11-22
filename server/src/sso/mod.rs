@@ -1912,6 +1912,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn reads_the_encrypted_assertion_settings() {
+        assert!(matches!(&native(&[]).unwrap().providers[0].kind, Kind::SamlSp { encryption: Encryption::Off, enc_cert: None, .. }), "off unless asked");
+        for (v, want) in [("allow", Encryption::Allow), ("REQUIRE", Encryption::Require), ("off", Encryption::Off)] {
+            let s = native(&[("SSO_CORP_ENCRYPTED_ASSERTIONS", v)]).unwrap();
+            assert!(matches!(&s.providers[0].kind, Kind::SamlSp { encryption, enc_cert: None, .. } if *encryption == want), "{v}");
+        }
+        assert!(native(&[("SSO_CORP_ENCRYPTED_ASSERTIONS", "true")]).err().unwrap().contains("off, allow, or require"));
+        assert!(saml(&[("SSO_ADFS_ENCRYPTED_ASSERTIONS", "allow")]).is_err(), "the bridge decrypts in Keycloak");
+
+        let dir = std::env::temp_dir().join(format!("superbot-sp-enc-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sign, _) = SpKey::generate("sign").unwrap();
+        let (enc, enc_der) = SpKey::generate("enc").unwrap();
+        let (sign_pem, enc_pem) = (dir.join("sign.pem"), dir.join("enc.pem"));
+        let write = |p: &std::path::Path, k: &SpKey| std::fs::write(p, format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", k.cert)).unwrap();
+        write(&sign_pem, &sign);
+        write(&enc_pem, &enc);
+        let leak = |p: &std::path::Path| -> &'static str { Box::leak(p.to_string_lossy().into_owned().into_boxed_str()) };
+        let err = native(&[("SSO_CORP_SP_ENCRYPTION_CERT_FILE", leak(&enc_pem))]).err().unwrap();
+        assert!(err.contains("only for SSO_CORP_ENCRYPTED_ASSERTIONS=allow or require"), "{err}");
+        let err = native(&[("SSO_CORP_ENCRYPTED_ASSERTIONS", "allow"), ("SSO_CORP_SP_CERT_FILE", leak(&sign_pem)), ("SSO_CORP_SP_ENCRYPTION_CERT_FILE", leak(&sign_pem))]).err().unwrap();
+        assert!(err.contains("one key for signing, another for encryption"), "{err}");
+        assert!(native(&[("SSO_CORP_ENCRYPTED_ASSERTIONS", "allow"), ("SSO_CORP_SP_ENCRYPTION_CERT_FILE", "/nonexistent/enc.pem")]).is_err());
+
+        // Its own key, as its own secret: not offered until that is set and matches.
+        let id = format!("enc{}", random_hex());
+        let up = id.to_ascii_uppercase();
+        let var = |k: &str| -> &'static str { Box::leak(format!("SSO_{up}_{k}").into_boxed_str()) };
+        let vars = [
+            ("SSO_PROVIDERS", leak(std::path::Path::new(&id))),
+            ("SSO_PUBLIC_URL", "https://bot.example.com"),
+            (var("TYPE"), "saml"),
+            (var("IDP_ENTITY_ID"), ADFS),
+            (var("IDP_METADATA_URL"), "https://idp.example/metadata"),
+            (var("ENCRYPTED_ASSERTIONS"), "require"),
+            (var("SP_ENCRYPTION_CERT_FILE"), leak(&enc_pem)),
+        ];
+        let s = parse(&vars).unwrap();
+        let p = &s.providers[0];
+        assert_eq!(p.sp_key_var(KeyUse::Encryption), format!("SSO_{up}_ENCRYPTION_PRIVATE_KEY"));
+        assert!(p.not_ready().is_some_and(|n| n.contains("ENCRYPTION_PRIVATE_KEY") && n.contains("SP_ENCRYPTION_CERT_FILE")), "{:?}", p.not_ready());
+        assert!(crate::secrets::server_secret(var("ENCRYPTION_PRIVATE_KEY")), "kept as a server secret, never in a bot's environment");
+        let pem = |der: &[u8]| rcgen::KeyPair::try_from(der).unwrap().serialize_pem();
+        let (_, other) = SpKey::generate("other").unwrap();
+        crate::secrets::global().put(var("ENCRYPTION_PRIVATE_KEY"), &pem(&other)).unwrap();
+        assert!(p.not_ready().is_some_and(|n| n.contains("isn't for the SP key")), "{:?}", p.not_ready());
+        let s = parse(&vars).unwrap();
+        let p = &s.providers[0];
+        crate::secrets::global().put(var("ENCRYPTION_PRIVATE_KEY"), &pem(&enc_der)).unwrap();
+        assert_eq!(p.not_ready(), None);
+        assert_eq!(p.configured_sp_key(KeyUse::Encryption).unwrap().info.sha256, enc.info.sha256);
+        assert!(p.configured_sp_key(KeyUse::Signing).is_err(), "the signing key is botd's own here");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn random_hex() -> String {
         crate::random_bytes(8).iter().map(|b| format!("{b:02x}")).collect()
     }
