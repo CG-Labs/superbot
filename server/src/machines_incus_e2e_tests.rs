@@ -452,6 +452,42 @@ async fn real_incus_containers_enroll_stay_apart_and_follow_the_lifecycle() {
     assert_eq!(hardened.len(), 2, "{hardened:?}");
     env.say("hardened: ssh, kernel, updates, egress");
 
+    // Run limits and an allow-list (ADR 0135): each agent holds runs in cgroups of its
+    // own, and with a list a user made now reaches only its entries, and names resolve.
+    until(&env, "both hold runs to limits", &ids, Duration::from_secs(60), |m| {
+        m.agent_upkeep.as_ref().is_some_and(|u| u["runLimits"]["state"] == "on")
+    })
+    .await;
+    let (code, v) = json_call(&env, "PUT", "/api/machines/egress-policy", r#"{"mode":"allow_list","allow":["1.1.1.1"]}"#).await;
+    assert_eq!(code, 200, "{v}");
+    until(&env, "both loaded the allow-list", &ids, Duration::from_secs(60), |m| {
+        m.agent_upkeep.as_ref().is_some_and(|u| u["egressPolicy"]["state"] == "on" && u["egressPolicy"]["mode"] == "allow_list")
+    })
+    .await;
+    let (code, out) = sh(&env, &a, "nft list table inet superbot_allow").await;
+    assert!(code == 0 && out.contains("1.1.1.1"), "{out}");
+    sh(&env, &a, "useradd --system --no-create-home --shell /usr/sbin/nologin sbe2e-late").await;
+    if internet {
+        let (code, _) = sh(&env, &a, &as_late(tcp("1.1.1.1", 443))).await;
+        assert_eq!(code, 0, "a new user in A reaches a listed address");
+        let (code, _) = sh(&env, &a, &as_late(tcp("1.0.0.1", 443))).await;
+        assert_ne!(code, 0, "a new user in A reached an unlisted address");
+        let (code, _) = sh(&env, &a, &tcp("1.0.0.1", 443)).await;
+        assert_eq!(code, 0, "root in A isn't held to the list");
+    }
+    let (code, out) = sh(&env, &a, &as_late("timeout 10 getent hosts github.com".into())).await;
+    assert_eq!(code, 0, "a new user in A still resolves names: {out}");
+    sh(&env, &a, "userdel sbe2e-late").await;
+    let (code, v) = json_call(&env, "PUT", "/api/machines/egress-policy", r#"{"mode":"open"}"#).await;
+    assert_eq!(code, 200, "{v}");
+    until(&env, "both open again", &ids, Duration::from_secs(60), |m| {
+        m.agent_upkeep.as_ref().is_some_and(|u| u["egressPolicy"]["state"] == "open")
+    })
+    .await;
+    let (code, _) = sh(&env, &a, "nft list table inet superbot_allow").await;
+    assert_ne!(code, 0, "the allow-list's table is gone");
+    env.say("run limits on; allow-list loaded, held, and lifted");
+
     // Suspend and resume: a stop and a start; the agent answers again.
     let (uid_a, ma) = &users[0];
     let (code, s) = json_call(&env, "POST", &format!("/api/users/{uid_a}/machine/suspend"), "").await;

@@ -131,6 +131,7 @@ export default function HomeScreen() {
             onOpenUsers={() => router.push("/users")}
             onOpenAudit={() => router.push("/audit")}
             onOpenAccessReview={() => router.push("/access-review")}
+            onOpenRoles={() => router.push("/roles")}
             onOpenConsole={() => void openConsole(api.baseUrl).catch((err) => showError(err, "Couldn't open the admin console"))}
             onOpenSetup={
               setupWaiting ? () => void openSetup(api.baseUrl).catch((err) => showError(err, "Couldn't open the setup wizard")) : undefined

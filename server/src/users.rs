@@ -340,6 +340,7 @@ fn admin_view(a: &Auth, u: &User, identities: &[db::Identity], pending: Option<&
     v["mfa"] = json!({ "enabled": mfa_since.is_some(), "enabledAt": mfa_since });
     if let Some(app) = &a.app {
         v["customRole"] = crate::roles::summary(app, u.role_id.as_deref());
+        v["permissions"] = json!(rbac::granted(Principal::User(u.role), app.db.user_perms(u)));
         v["plan"] = crate::tier_usage(app, &u.id);
         if a.machines.enabled() {
             v["dataRegion"] = json!(crate::machines::region::effective(app, &a.machines, u));

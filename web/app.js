@@ -1,5 +1,5 @@
-// The admin console (ADR 0032): people, requests for access, machines, teams, the audit log,
-// and server settings. Chat, Bots, approvals of Bot actions, and screens are in the app
+// The admin console (ADR 0032): people, requests for access, machines, teams, custom roles,
+// the audit log, and server settings. Chat, Bots, approvals of Bot actions, and screens are in the app
 // at /app/. The server decides what each role may do; this page only shows admin tools.
 
 const $ = (id) => document.getElementById(id);
@@ -78,7 +78,7 @@ let users = [];
 
 async function loadUsers() {
   try {
-    users = await api("GET", "/api/users");
+    [users] = await Promise.all([api("GET", "/api/users"), loadRoleList()]);
     $("users-empty").hidden = users.length > 0;
     $("users-empty").textContent = "No users yet.";
   } catch (err) {
@@ -136,6 +136,7 @@ function renderUsers() {
     return `<tr data-user="${esc(u.id)}">
       <td><div>${esc(u.name)}${u.breakGlass ? ' <span class="tag">owner</span>' : ""}</div><div class="sub">${esc(u.email || u.id)}</div></td>
       <td><select data-act="role" title="Role" ${u.breakGlass ? "disabled" : ""}>${roleOptions(u.role)}</select></td>
+      <td>${customRoleCell(u)}</td>
       <td>${active ? "Active" : '<span class="bad">Disabled</span>'}</td>
       <td>${lastLogin(u)}</td>
       <td>${u.pendingCodes ? `Waiting<div class="sub">until ${esc(fmt(u.pendingCodes.expiresAt))}</div>` : ""}</td>
@@ -201,15 +202,58 @@ $("users-rows").addEventListener("click", async (e) => {
 });
 
 $("users-rows").addEventListener("change", async (e) => {
-  if (e.target.dataset.act !== "role") return;
+  const act = e.target.dataset.act;
+  if (act !== "role" && act !== "custom-role") return;
   const u = users.find((x) => x.id === e.target.closest("tr").dataset.user);
   try {
-    await api("PATCH", `/api/users/${key(u.id)}`, { role: e.target.value });
+    if (act === "role") {
+      if (u.customRole && !confirm(`Make ${u.name} ${ROLES[e.target.value]}? Setting a built-in role takes ${u.customRole.name} away from them.`)) return loadUsers();
+      await api("PATCH", `/api/users/${key(u.id)}`, { role: e.target.value });
+    }
+    if (act === "custom-role") await setCustomRole(u, e.target.value);
   } catch (err) {
     fail(err);
   }
   loadUsers();
 });
+
+// Custom roles (ADR 0123, 0132): a base role plus permissions an admin gives away. The
+// server checks every name and limit; this shows the fixed set and what it adds up to.
+
+const NO_ROLES = { permissions: [], builtIn: [], roles: [] };
+let roles = NO_ROLES;
+
+// Servers from before custom roles have none to offer.
+async function loadRoleList() {
+  roles = await api("GET", "/api/roles").catch(() => NO_ROLES);
+}
+
+const baseName = (b) => ROLES[b] || b;
+const permNames = (list) => (list.length ? list.join(", ") : "nothing");
+const teamPerms = (perms) => roles.permissions.filter((p) => p.team && perms.includes(p.name)).map((p) => p.name);
+function effectivePerms(base, perms) {
+  const preset = roles.builtIn.find((b) => b.id === base)?.permissions || [];
+  return [...preset, ...roles.permissions.map((p) => p.name).filter((p) => perms.includes(p) && !preset.includes(p))];
+}
+const customRoleOptions = (current) => `<option value="">None</option>${roles.roles.map((r) => `<option value="${esc(r.id)}" ${r.id === current ? "selected" : ""}>${esc(r.name)}</option>`).join("")}`;
+
+function customRoleCell(u) {
+  const can = u.permissions ? `<div class="sub" title="What they can do across the server">Can do: ${esc(permNames(u.permissions))}</div>` : "";
+  if (!roles.roles.length && !u.customRole) return can;
+  const locked = u.breakGlass || u.id === me.user?.id;
+  return `<select data-act="custom-role" title="Custom role" ${locked ? "disabled" : ""}>${customRoleOptions(u.roleId)}</select>${can}`;
+}
+
+async function setCustomRole(u, id) {
+  if (!id) {
+    if (!u.roleId || !confirm(`Take ${u.customRole?.name || "their custom role"} away from ${u.name}? They keep ${baseName(u.role).toLowerCase()} as their role.`)) return;
+    await api("DELETE", `/api/roles/${key(u.roleId)}/users/${key(u.id)}`);
+    return;
+  }
+  const r = roles.roles.find((x) => x.id === id);
+  if (u.role === "admin" && !confirm(`Give ${r.name} to ${u.name}? They stop being an admin: their role becomes ${baseName(r.base).toLowerCase()}, with ${r.name}'s permissions on top.`)) return;
+  await api("PUT", `/api/roles/${key(id)}/users/${key(u.id)}`);
+}
 
 $("add-user").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -326,6 +370,63 @@ async function loadMachines() {
   $("give-machine").hidden = off;
   renderMachines();
   loadRegions(off);
+  loadEgress(off);
+}
+
+// Outbound allow-lists (ADR 0135): the server's for every machine, and a user's own.
+const listText = (allow) => (allow || []).join(", ");
+const listOf = (text) => text.split(/[\s,]+/).map((x) => x.trim()).filter(Boolean);
+
+async function loadEgress(off) {
+  $("machines-egress").hidden = true;
+  if (off) return;
+  try {
+    const p = await api("GET", "/api/machines/egress-policy");
+    const own = p.usersWithOwnPolicy ? ` ${p.usersWithOwnPolicy} user${p.usersWithOwnPolicy === 1 ? " has" : "s have"} their own.` : "";
+    $("machines-egress-text").textContent = p.mode === "allow_list"
+      ? `Outbound: only ${listText(p.allow) || "nothing"} (and private addresses stay denied).${own}`
+      : `Outbound: open to the internet; private and metadata addresses denied.${own}`;
+    $("machines-egress").dataset.allow = p.mode === "allow_list" ? listText(p.allow) : "";
+    $("machines-egress").hidden = false;
+  } catch {
+    // Older servers have no allow-lists.
+  }
+}
+
+$("machines-egress-edit").addEventListener("click", async () => {
+  const current = $("machines-egress").dataset.allow || "";
+  const r = prompt("Hosts and networks every machine's Bots may reach, separated by spaces or commas (e.g. api.anthropic.com 203.0.113.0/24). Leave empty for open. Root and the OS's own services aren't held to it.", current);
+  if (r === null || r.trim() === current) return;
+  const allow = listOf(r);
+  try {
+    await api("PUT", "/api/machines/egress-policy", allow.length ? { mode: "allow_list", allow } : { mode: "open" });
+  } catch (err) {
+    fail(err);
+  }
+  loadMachines();
+});
+
+// What a machine's agent says of its allow-list and run limits.
+function guardsCell(m) {
+  const u = m.agentUpkeep || {};
+  const e = u.egressPolicy;
+  const lines = [];
+  if (e && e.state === "failed") lines.push(`<div class="sub bad">Allow-list not loaded${e.error ? `: ${esc(e.error)}` : ""}</div>`);
+  else if (e && e.state === "on") lines.push(`<div class="sub">Allow-list on · ${e.addresses} address${e.addresses === 1 ? "" : "es"}${e.unresolved?.length ? ` · unresolved: ${esc(e.unresolved.join(", "))}` : ""}</div>`);
+  if (u.runLimits?.state === "on") lines.push('<div class="sub">Runs held to limits</div>');
+  else if (u.runLimits?.state === "unavailable") lines.push(`<div class="sub bad">No run limits${u.runLimits.error ? `: ${esc(u.runLimits.error)}` : ""}</div>`);
+  return lines.join("");
+}
+
+async function setUserEgress(m) {
+  const who = m.userEmail || m.userId;
+  const path = `/api/users/${key(m.userId)}/machine/egress-policy`;
+  const p = await api("GET", path);
+  const current = p.own.mode === "allow_list" ? listText(p.own.allow) : p.own.mode;
+  const r = prompt(`${who}'s own outbound allow-list: hosts and networks added to the server's, or "open", or "inherit" to follow the server's (now ${p.server.mode === "allow_list" ? listText(p.server.allow) : "open"}).`, current);
+  if (r === null || r.trim() === current) return;
+  const t = r.trim();
+  await api("PUT", path, t === "open" || t === "inherit" || !t ? { mode: t || "inherit" } : { mode: "allow_list", allow: listOf(t) });
 }
 
 // The data regions offered (ADR 0117), and any whose backups would leave them.
@@ -349,7 +450,7 @@ async function loadRegions(off) {
 function machineActions(m) {
   const b = (act, label) => `<button type="button" class="btn" data-act="${act}">${label}</button>`;
   switch (m.state) {
-    case "running": return b("suspend", "Suspend") + b("resize", "Resize") + b("destroy", "Destroy");
+    case "running": return b("suspend", "Suspend") + b("resize", "Resize") + b("egress", "Allow-list") + b("destroy", "Destroy");
     case "suspended": return b("resume", "Resume") + b("resize", "Resize") + b("destroy", "Destroy");
     case "error": return b("retry", "Retry") + b("destroy", "Destroy");
     case "destroyed": return "";
@@ -379,7 +480,7 @@ function renderMachines() {
     : "";
   $("machines-rows").innerHTML = list.map((m) => `<tr data-machine="${esc(m.id)}">
       <td>${esc(m.userEmail || m.userId)}</td>
-      <td>${esc(m.state)}${m.providerStatus ? `<div class="sub">${esc(m.providerStatus)}</div>` : ""}${m.lastError ? `<div class="sub bad">${esc(m.lastError)}</div>` : ""}${m.enrollOverdueAt && m.enrollment !== "enrolled" ? `<div class="sub bad">Didn't enroll in time (since ${esc(fmt(m.enrollOverdueAt))})</div>` : ""}</td>
+      <td>${esc(m.state)}${m.providerStatus ? `<div class="sub">${esc(m.providerStatus)}</div>` : ""}${m.lastError ? `<div class="sub bad">${esc(m.lastError)}</div>` : ""}${m.enrollOverdueAt && m.enrollment !== "enrolled" ? `<div class="sub bad">Didn't enroll in time (since ${esc(fmt(m.enrollOverdueAt))})</div>` : ""}${guardsCell(m)}</td>
       <td>${esc(m.tier)}<div class="sub">${esc(m.plan)} · ${esc(m.provider)}</div></td>
       <td>${esc(m.region)}</td>
       <td>${esc(m.ipv4 || "")}</td>
@@ -401,6 +502,7 @@ $("machines-rows").addEventListener("click", async (e) => {
     if (t.dataset.act === "suspend") await api("POST", `/api/users/${key(m.userId)}/machine/suspend`);
     if (t.dataset.act === "resume") await api("POST", `/api/users/${key(m.userId)}/machine/resume`);
     if (t.dataset.act === "retry") await api("POST", `/api/users/${key(m.userId)}/machine`);
+    if (t.dataset.act === "egress") await setUserEgress(m);
     if (t.dataset.act === "resize") {
       const tier = prompt(`Move ${who}'s machine to which tier? The provider may restart it.`, m.tier)?.trim();
       if (!tier || tier === m.tier) return;
@@ -453,7 +555,7 @@ let teams = { teams: [], settings: {} };
 
 async function loadTeams() {
   try {
-    teams = await api("GET", "/api/teams");
+    [teams] = await Promise.all([api("GET", "/api/teams"), loadRoleList()]);
     $("teams-empty").textContent = "No teams yet.";
   } catch (err) {
     teams = { teams: [], settings: {} };
@@ -488,10 +590,11 @@ function renderTeams() {
         <button type="button" class="btn" data-act="team-residency">${t.residency ? "Unpin" : "Pin region"}</button>
         <button type="button" class="btn" data-act="delete-team">Delete team</button></div>
       <table class="grid">
-        <thead><tr><th>Person</th><th>Role</th><th>Machine</th><th></th></tr></thead>
+        <thead><tr><th>Person</th><th>Role</th><th>Custom role here</th><th>Machine</th><th></th></tr></thead>
         <tbody>${t.members.map((m) => `<tr data-user="${esc(m.id)}">
           <td><div>${esc(m.name || m.id)}${m.active ? "" : ' <span class="bad">Disabled</span>'}</div><div class="sub">${esc(m.email || "")}</div></td>
           <td><select data-act="team-role" title="Role">${teamRoleOptions(m.role)}</select></td>
+          <td>${teamCustomRoleCell(m)}</td>
           <td>${teamMachine(m.machine)}</td>
           <td class="actions"><button type="button" class="btn" data-act="remove-member">Remove</button></td>
         </tr>`).join("")}</tbody>
@@ -547,11 +650,29 @@ $("teams-list").addEventListener("click", async (e) => {
   }
 });
 
+function teamCustomRoleCell(m) {
+  if (!roles.roles.length && !m.customRole) return "";
+  const r = roles.roles.find((x) => x.id === m.customRole?.id);
+  const applies = r ? `<div class="sub">Here: ${esc(permNames(teamPerms(r.permissions)))}</div>` : "";
+  return `<select data-act="team-custom-role" title="Custom role within this team">${customRoleOptions(m.customRole?.id)}</select>${applies}`;
+}
+
 $("teams-list").addEventListener("change", async (e) => {
-  if (e.target.dataset.act !== "team-role") return;
+  const act = e.target.dataset.act;
+  if (act !== "team-role" && act !== "team-custom-role") return;
   const t = teamOf(e.target);
+  const userId = e.target.closest("tr").dataset.user;
   try {
-    await api("PUT", `/api/teams/${key(t.id)}/members/${key(e.target.closest("tr").dataset.user)}`, { role: e.target.value });
+    if (act === "team-role") await api("PUT", `/api/teams/${key(t.id)}/members/${key(userId)}`, { role: e.target.value });
+    if (act === "team-custom-role") {
+      const held = t.members.find((x) => x.id === userId)?.customRole?.id;
+      if (e.target.value) await api("PUT", `/api/roles/${key(e.target.value)}/teams/${key(t.id)}/users/${key(userId)}`);
+      else if (held) {
+        const name = roles.roles.find((x) => x.id === held)?.name || "their custom role";
+        if (!confirm(`Take ${name} away within ${t.name}? Their role across the server doesn't change.`)) return loadTeams();
+        await api("DELETE", `/api/roles/${key(held)}/teams/${key(t.id)}/users/${key(userId)}`);
+      }
+    }
   } catch (err) {
     fail(err);
   }
@@ -582,6 +703,179 @@ $("add-team").addEventListener("submit", async (e) => {
     fail(err);
   }
   loadTeams();
+});
+
+// Roles tab: build, change and delete custom roles, and give them to people.
+
+const rolesTab = { details: {}, people: [], teams: [], editing: null };
+
+async function loadRoles({ keepForm = false } = {}) {
+  try {
+    roles = await api("GET", "/api/roles");
+    const [details, people, allTeams] = await Promise.all([
+      Promise.all(roles.roles.map((r) => api("GET", `/api/roles/${key(r.id)}`))),
+      api("GET", "/api/users").catch(() => []),
+      api("GET", "/api/teams").then((v) => v.teams || []).catch(() => []),
+    ]);
+    rolesTab.details = Object.fromEntries(details.map((d) => [d.id, d]));
+    rolesTab.people = people;
+    rolesTab.teams = allTeams;
+    $("roles-empty").textContent = "No custom roles yet. Make one below to give part of admin away.";
+  } catch (err) {
+    $("roles-empty").textContent = err.message;
+    fail(err);
+  }
+  renderRoles(keepForm);
+}
+
+const tags = (list) => `<div class="tags">${list.map((p) => `<span class="tag">${esc(p)}</span>`).join("")}</div>`;
+const holdersText = (r) => [r.users && `${r.users} ${r.users === 1 ? "person" : "people"}`, r.teamMembers && `${r.teamMembers} in a team`].filter(Boolean).join(" · ") || "nobody has it";
+const who = (p) => `${esc(p.name || p.email || p.id)}${p.email && p.name ? ` <span class="sub">${esc(p.email)}</span>` : ""}`;
+
+function roleCard(r) {
+  const d = rolesTab.details[r.id] || { holders: { users: [], teams: [] } };
+  const held = r.users + r.teamMembers > 0;
+  const givable = rolesTab.teams.flatMap((t) => t.members.filter((m) => !d.holders.teams.some((h) => h.team.id === t.id && h.user.id === m.id)).map((m) => [t, m]));
+  return `<div class="card" data-role="${esc(r.id)}">
+    <div class="bar"><b>${esc(r.name)}</b> <span class="sub">${esc(baseName(r.base))} + ${esc(permNames(r.permissions))} · ${esc(holdersText(r))}</span>
+      <button type="button" class="btn push" data-act="edit-role">Edit</button>
+      <button type="button" class="btn" data-act="delete-role" ${held ? 'disabled title="Take it away from everyone first"' : ""}>Delete</button></div>
+    ${r.description ? `<p class="hint">${esc(r.description)}</p>` : ""}
+    <span class="sub">Can do across the server:</span>${tags(r.effective)}
+    <span class="sub">Within a team: ${esc(permNames(teamPerms(r.permissions)))}</span>
+    ${r.unknown.length ? `<p class="warn">Unknown here, so they grant nothing: ${esc(r.unknown.join(", "))}. Saving drops them.</p>` : ""}
+    <ul class="holders">
+      ${d.holders.users.map((u) => `<li data-user="${esc(u.id)}">${who(u)} <span class="sub">across the server</span> <button type="button" class="btn push" data-act="unassign-role">Take away</button></li>`).join("")}
+      ${d.holders.teams.map((h) => `<li data-user="${esc(h.user.id)}" data-team="${esc(h.team.id)}">${who(h.user)} <span class="sub">in ${esc(h.team.name)}</span> <button type="button" class="btn push" data-act="unassign-team-role">Take away</button></li>`).join("")}
+    </ul>
+    <form class="bar" data-act="give-role" autocomplete="off">
+      <input name="user" class="wide" list="role-people" placeholder="Give across the server: email or id" required spellcheck="false" />
+      <button type="submit" class="btn">Give</button>
+    </form>
+    ${givable.length ? `<form class="bar" data-act="give-team-role">
+      <select name="member" title="A team's member">${givable.map(([t, m]) => `<option value="${esc(t.id)}|${esc(m.id)}">${esc(t.name)}: ${esc(m.name || m.email || m.id)}${m.customRole ? ` (has ${esc(m.customRole.name)})` : ""}</option>`).join("")}</select>
+      <button type="submit" class="btn">Give within the team</button>
+    </form>` : ""}
+  </div>`;
+}
+
+// `keepForm` keeps unsaved edits when only the holders changed.
+function renderRoles(keepForm = false) {
+  $("roles-empty").hidden = roles.roles.length > 0;
+  $("roles-list").innerHTML = roles.roles.map(roleCard).join("")
+    + `<datalist id="role-people">${rolesTab.people.filter((u) => !u.breakGlass && u.id !== me.user?.id).map((u) => `<option value="${esc(u.email || u.id)}">${esc(u.name)}</option>`).join("")}</datalist>`;
+  $("roles-builtin").innerHTML = roles.builtIn.map((b) => `<tr><td>${esc(b.name)}</td><td>${tags(b.permissions)}</td></tr>`).join("");
+  if (!keepForm) renderRoleForm();
+}
+
+function renderRoleForm() {
+  const r = roles.roles.find((x) => x.id === rolesTab.editing);
+  $("role-form-title").textContent = r ? `Edit ${r.name}` : "New role";
+  $("role-save").textContent = r ? "Save" : "Create role";
+  $("role-cancel").hidden = !r;
+  $("role-name").value = r?.name || "";
+  $("role-description").value = r?.description || "";
+  $("role-base").value = r?.base || "member";
+  $("role-perms").innerHTML = roles.permissions.map((p) => `<label><input type="checkbox" value="${esc(p.name)}" ${r?.permissions.includes(p.name) ? "checked" : ""} />
+    <span><code>${esc(p.name)}</code>${p.team ? ' <span class="tag">also within a team</span>' : ""}<span class="sub">${esc(p.description)}</span></span></label>`).join("");
+  showRoleEffective();
+}
+
+const checkedPerms = () => [...$("role-perms").querySelectorAll("input:checked")].map((i) => i.value);
+function showRoleEffective() {
+  const perms = checkedPerms();
+  $("role-effective").textContent = `Can do: ${effectivePerms($("role-base").value, perms).join(", ")}. Within a team: ${permNames(teamPerms(perms))}.`;
+}
+$("role-perms").addEventListener("change", showRoleEffective);
+$("role-base").addEventListener("change", showRoleEffective);
+$("role-cancel").addEventListener("click", () => {
+  rolesTab.editing = null;
+  renderRoleForm();
+});
+
+$("role-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = { name: $("role-name").value.trim(), description: $("role-description").value.trim(), base: $("role-base").value, permissions: checkedPerms() };
+  const r = roles.roles.find((x) => x.id === rolesTab.editing);
+  if (rolesTab.editing && !r) return fail(new Error("That role didn't load. Reload the page before saving."));
+  try {
+    if (r) {
+      if (r.base !== body.base && r.users && !confirm(`${r.users === 1 ? "The 1 person who has" : `The ${r.users} people who have`} ${r.name} across the server move to ${baseName(body.base)} at once. Save?`)) return;
+      await api("PATCH", `/api/roles/${key(r.id)}`, body);
+      notice(`Saved ${body.name}.`, false);
+    } else {
+      await api("POST", "/api/roles", body);
+      notice(`Made ${body.name}.`, false);
+    }
+    rolesTab.editing = null;
+  } catch (err) {
+    return fail(err);
+  }
+  loadRoles();
+});
+
+const roleOf = (el) => roles.roles.find((r) => r.id === el.closest("[data-role]").dataset.role);
+
+$("roles-list").addEventListener("click", async (e) => {
+  const b = e.target.closest("button[data-act]");
+  if (!b) return;
+  const r = roleOf(b);
+  if (!r) return;
+  if (b.dataset.act === "edit-role") {
+    rolesTab.editing = r.id;
+    renderRoleForm();
+    $("role-name").focus();
+    return;
+  }
+  let resetsForm = false;
+  b.disabled = true;
+  try {
+    if (b.dataset.act === "delete-role") {
+      if (!confirm(`Delete ${r.name}? Nobody has it, so nobody's access changes. The audit log keeps its history.`)) return;
+      await api("DELETE", `/api/roles/${key(r.id)}`);
+      if (rolesTab.editing === r.id) {
+        rolesTab.editing = null;
+        resetsForm = true;
+      }
+    }
+    const li = b.closest("li");
+    if (b.dataset.act === "unassign-role") {
+      if (!confirm(`Take ${r.name} away? They keep ${baseName(r.base).toLowerCase()} as their role.`)) return;
+      await api("DELETE", `/api/roles/${key(r.id)}/users/${key(li.dataset.user)}`);
+    }
+    if (b.dataset.act === "unassign-team-role") {
+      if (!confirm(`Take ${r.name} away within this team? Their role across the server doesn't change.`)) return;
+      await api("DELETE", `/api/roles/${key(r.id)}/teams/${key(li.dataset.team)}/users/${key(li.dataset.user)}`);
+    }
+  } catch (err) {
+    fail(err);
+  } finally {
+    b.disabled = false;
+    loadRoles({ keepForm: !resetsForm });
+  }
+});
+
+$("roles-list").addEventListener("submit", async (e) => {
+  const f = e.target.closest("form[data-act]");
+  if (!f) return;
+  e.preventDefault();
+  const r = roleOf(f);
+  try {
+    if (f.dataset.act === "give-role") {
+      const target = f.user.value.trim();
+      const u = rolesTab.people.find((x) => (x.email || "").toLowerCase() === target.toLowerCase() || x.id === target);
+      if (!u) return fail(new Error(rolesTab.people.length ? `Nobody here is ${target}. Pick someone from the list.` : "People didn't load, so they can't be checked. Reload the page."));
+      if (u.role === "admin" && !confirm(`Give ${r.name} to ${u.name}? They stop being an admin: their role becomes ${baseName(r.base).toLowerCase()}, with ${r.name}'s permissions on top.`)) return;
+      await api("PUT", `/api/roles/${key(r.id)}/users/${key(u.id)}`);
+    }
+    if (f.dataset.act === "give-team-role") {
+      const [team, user] = f.member.value.split("|");
+      await api("PUT", `/api/roles/${key(r.id)}/teams/${key(team)}/users/${key(user)}`);
+    }
+  } catch (err) {
+    fail(err);
+  }
+  loadRoles({ keepForm: true });
 });
 
 // Audit log: append-only record of sign-ins and admin actions (docs/adr/0009-audit-events.md),
@@ -1539,7 +1833,7 @@ $("incidents-list").addEventListener("click", async (e) => {
 
 // Tabs, from the address bar's #fragment so a reload keeps your place.
 
-const TABS = { users: loadUsers, requests: loadRequests, machines: loadMachines, teams: loadTeams, audit: () => loadAudit(), status: loadStatus, settings: loadSettings, setup: loadSetup };
+const TABS = { users: loadUsers, requests: loadRequests, machines: loadMachines, teams: loadTeams, roles: loadRoles, audit: () => loadAudit(), status: loadStatus, settings: loadSettings, setup: loadSetup };
 
 // `#audit?target=approval:<id>`: a notification's link to one approval's trail (ADR 0061).
 function showTab() {

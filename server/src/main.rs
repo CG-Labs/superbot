@@ -63,6 +63,8 @@ mod machines_backup_tests;
 #[cfg(test)]
 mod machines_bot_user_tests;
 #[cfg(test)]
+mod machines_egress_policy_tests;
+#[cfg(test)]
 mod machines_hardening_tests;
 #[cfg(test)]
 mod machines_hosts_tests;
@@ -939,6 +941,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/identities/{id}", delete(sso::unlink_identity))
         .route("/users/{key}/machine", get(machines::get).post(machines::request).delete(machines::destroy))
         .route("/users/{key}/region", get(machines::region::get_user).put(machines::region::set_user))
+        .route("/users/{key}/machine/egress-policy", get(machines::egress_policy::get_user).put(machines::egress_policy::set_user))
         .route("/users/{key}/residency", get(machines::region::get_user).put(machines::residency::pin_user).delete(machines::residency::unpin_user))
         .route("/users/{key}/machine/suspend", post(machines::suspend))
         .route("/users/{key}/machine/resume", post(machines::resume))
@@ -976,6 +979,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/machines/{id}/backups", delete(machines::backup::delete_all))
         .route("/machines/recovery", get(machines::recovery::get))
         .route("/machines/substrate", get(machines::substrate))
+        .route("/machines/egress-policy", get(machines::egress_policy::get_server).put(machines::egress_policy::set_server))
         .route("/regions", get(machines::region::list))
         .route("/machines/hosts", get(machines::hosts::list))
         .route("/machines/hosts/{name}/recover", post(machines::hosts::recover))

@@ -184,6 +184,7 @@ fn job_for(w: &World, cwd: &Path, for_user: Option<&str>) -> wire::JobRequest {
         files: vec![],
         cleanup: None,
         collect: vec![],
+        limits: None,
     }
 }
 

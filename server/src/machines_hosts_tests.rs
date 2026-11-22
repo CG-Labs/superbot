@@ -137,6 +137,8 @@ pub(crate) fn config(env: &Env, machine_id: &str, token: &str) -> Config {
         screens: crate::machines_mtls_tests::no_screens(),
         teammates: crate::db::temp_path("agent-teammates"),
         teammate_stand_in: None,
+        run_cgroups: false,
+        nft: "/nonexistent/nft".into(),
     }
 }
 

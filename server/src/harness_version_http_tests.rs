@@ -183,7 +183,7 @@ async fn on_a_machine_the_codex_there_is_checked() {
     assert_eq!(call(port, "PUT", &format!("/api/users/{a_id}/placement"), &admin, "").await.0, 200);
     let bot = app.db.create_bot_owned("Cody", "#fff", "waddle", "codex", None, false, &a_id, Visibility::Private);
     let script = |version: &str| {
-        let exit = JobEvent::Exit { success: true, status: "exit status: 0".into(), stderr: String::new(), files: Default::default(), too_big: vec![] };
+        let exit = JobEvent::Exit { success: true, status: "exit status: 0".into(), stderr: String::new(), files: Default::default(), too_big: vec![], limited: None };
         *link.script.lock().unwrap() = vec![JobEvent::Started, JobEvent::Line { line: version.into() }, JobEvent::Line { line: REPLY.into() }, exit];
     };
     let jobs = |from: usize| link.sent.lock().unwrap()[from..].iter().map(|(_, j)| (j.bin.clone(), j.args.clone(), j.cwd.clone())).collect::<Vec<_>>();

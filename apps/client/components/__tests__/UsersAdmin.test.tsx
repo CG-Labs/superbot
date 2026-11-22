@@ -3,7 +3,7 @@ import { act, render, screen, userEvent, waitFor, within } from "@testing-librar
 import { UsersAdmin, matchesUser } from "../UsersAdmin";
 import { ApiError, type SuperBotApi } from "../../src/api";
 import { fetchSsoProviders } from "../../src/sso";
-import type { AdminUser, SignupRequest, TeammateAccounts, TeammateRemoval } from "../../src/types";
+import type { AdminUser, CustomRole, SignupRequest, TeammateAccounts, TeammateRemoval } from "../../src/types";
 
 jest.mock("../BotAvatar", () => ({ BotAvatar: () => null }));
 jest.mock("../../src/sso", () => ({
@@ -54,7 +54,7 @@ const ada: SignupRequest = {
   existingUser: false,
 };
 
-function fakeApi(list: AdminUser[], requests: SignupRequest[] = []) {
+function fakeApi(list: AdminUser[], requests: SignupRequest[] = [], roles: CustomRole[] = []) {
   const users = list.map((u) => ({ ...u }));
   let pending = requests.map((r) => ({ ...r }));
   return {
@@ -73,6 +73,15 @@ function fakeApi(list: AdminUser[], requests: SignupRequest[] = []) {
       return { ...r, status: "rejected" };
     }),
     users: jest.fn(async () => users.map((u) => ({ ...u }))),
+    roles: jest.fn(async () => ({ permissions: [], builtIn: [], roles })),
+    assignRole: jest.fn(async (id: string, userId: string) => {
+      const r = roles.find((x) => x.id === id)!;
+      Object.assign(users.find((x) => x.id === userId)!, { role: r.base, roleId: r.id, customRole: { id: r.id, name: r.name } });
+      return {};
+    }),
+    unassignRole: jest.fn(async (_id: string, userId: string) => {
+      Object.assign(users.find((x) => x.id === userId)!, { roleId: null, customRole: null });
+    }),
     createUser: jest.fn(async (b: { email: string; name?: string; role: AdminUser["role"] }) => {
       const u: AdminUser = { ...alex, id: "u2", email: b.email, name: b.name ?? "x", role: b.role, identities: [], pendingCodes: null };
       users.push(u);
@@ -80,7 +89,7 @@ function fakeApi(list: AdminUser[], requests: SignupRequest[] = []) {
     }),
     patchUser: jest.fn(async (id: string, b: Partial<AdminUser>) => {
       const u = users.find((x) => x.id === id)!;
-      Object.assign(u, b);
+      Object.assign(u, b, b.role ? { roleId: null, customRole: null } : {});
       return u;
     }),
     createLoginCode: jest.fn(async () => ({ code: CODE, expiresAt: Date.now() + 24 * 3600_000 })),
@@ -97,8 +106,8 @@ function fakeApi(list: AdminUser[], requests: SignupRequest[] = []) {
   };
 }
 
-async function open(list: AdminUser[], requests: SignupRequest[] = []) {
-  const api = fakeApi(list, requests);
+async function open(list: AdminUser[], requests: SignupRequest[] = [], roles: CustomRole[] = []) {
+  const api = fakeApi(list, requests, roles);
   const user = userEvent.setup();
   await render(<UsersAdmin api={api as unknown as SuperBotApi} meId="operator" onBack={jest.fn()} />);
   await screen.findByLabelText("User Alex");
@@ -320,6 +329,45 @@ describe("UsersAdmin", () => {
     await user.type(screen.getByPlaceholderText("NameID at the SAML IdP"), "G-1234-persistent");
     await user.press(screen.getByText("Link"));
     expect(api.linkIdentity).toHaveBeenCalledWith("u1", { provider: "adfs", subject: "G-1234-persistent", tenant: undefined });
+  });
+
+  it("gives and takes away a custom role, and shows what they can do (ADR 0132)", async () => {
+    const support: CustomRole = {
+      id: "r1",
+      name: "Support",
+      description: "",
+      base: "readonly",
+      builtIn: false,
+      permissions: ["users.manage"],
+      unknown: [],
+      effective: [],
+      users: 0,
+      teamMembers: 0,
+      createdAt: 1,
+      createdBy: null,
+      updatedAt: 1,
+    };
+    const { api, user } = await open([owner, { ...alex, permissions: ["account", "read", "review", "write", "approve"] }], [], [support]);
+    await user.press(screen.getByLabelText("User Alex"));
+    expect(await screen.findByText("Can do: account, read, review, write, approve")).toBeOnTheScreen();
+    await user.press(screen.getByRole("radio", { name: "Support" }));
+    await waitFor(() => expect(api.assignRole).toHaveBeenCalledWith("r1", "u1"));
+    expect(await within(screen.getByLabelText("User Alex")).findByText("Support")).toBeOnTheScreen();
+    expect(within(screen.getByLabelText("User Alex")).getByText("Read-only")).toBeOnTheScreen();
+    await user.press(screen.getByRole("radio", { name: "Read-only" }));
+    await waitFor(() => expect(api.patchUser).toHaveBeenCalledWith("u1", { role: "readonly" }));
+    await waitFor(() => expect(within(screen.getByLabelText("User Alex")).queryByText("Support")).toBeNull());
+    await user.press(screen.getByRole("radio", { name: "Support" }));
+    await waitFor(() => expect(api.assignRole).toHaveBeenCalledTimes(2));
+    expect(await within(screen.getByLabelText("User Alex")).findByText("Support")).toBeOnTheScreen();
+    await user.press(screen.getByRole("radio", { name: "None" }));
+    await waitFor(() => expect(api.unassignRole).toHaveBeenCalledWith("r1", "u1"));
+
+    // The owner keeps admin: no custom role for it.
+    await user.press(screen.getByLabelText("User Owner"));
+    await act(async () => {});
+    await user.press(screen.getByRole("radio", { name: "Support" }));
+    expect(api.assignRole).toHaveBeenCalledTimes(2);
   });
 
   it("won't let you change your own or the owner's role or status", async () => {
