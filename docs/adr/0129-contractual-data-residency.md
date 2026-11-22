@@ -32,15 +32,16 @@ A customer who signs a DPA saying "UK only" needs the product to hold to it for 
 - Pinning sets the user's or team's data region (ADR 0117) to the pinned region. The same region again replaces the reference.
 - `DELETE` on the same path with `{"reason": "..."}` unpins. The reason is required and audited. The data region stays as it was; it can be changed from then on.
 - The routes are admin-only. They aren't in the role table, so the router's default (admin) applies.
-- A user's data is held by their team's pin, else their own. A member's own pin must agree with their team's.
+- A user's data is held by their team's pin, else their own. A member's own pin must agree with their team's, and still holds their own region while the team's is in place, so it survives the team being unpinned.
 
 ### A pin is refused unless the region can keep it
 
 A pin is refused (409, `user.residency_pin_refused` or `team.residency_pin_refused`) when:
 
 - **`region_not_ready`**: the region isn't offered; Incus hosts aren't tagged with regions, or none is in this region; or off-host backups are on and no store is in the region (its own, or the default store said to be there with `MACHINE_BACKUP_S3_DATA_REGION`).
-- **`data_outside`**: the person's machine, or any finished or running backup of theirs, is outside the region. For a team, this is checked for every member, and also refused if a member has their own region or own pin elsewhere. The error lists who and why.
+- **`data_outside`**: the person's machine, or any backup of theirs that isn't deleted, is outside the region. A failed backup counts, because its upload may have finished before it failed; deleting the backups ([ADR 0108](0108-deleting-a-destroyed-machines-backups.md)) clears it. For a team, this is checked for every member, and also refused if a member has their own region or own pin elsewhere. The error lists who and why.
 - **`pinned`** or **`team_pinned`**: they are already pinned to another region. Unpin first, with a reason.
+- **`team_deleting`**: an admin is deleting the team. The delete marks the team under the same operations lock a pin takes, after checking it has no pin, so a pin can't land on a team mid-delete and be removed with it unaudited.
 
 So a pin is never a promise about data that has already left. The operator makes it true first (destroy and purge, as in ADR 0117), then pins.
 
@@ -61,6 +62,10 @@ Every path that places or copies their data checks the pin. A refusal is a 409, 
 Placement (ADR 0117) already keeps new machines on hosts in the region; the pin adds nothing there because the region can't change while pinned.
 
 Scheduled backups of a pinned machine that can't stay in the region are skipped and not audited each time. The reason shows in the backups view and in the RPO alert ([ADR 0074](0074-machine-rpo-and-rto.md)). Only backups an admin asks for are audited as refused.
+
+### Erasure
+
+Erasing a user ([ADR 0102](0102-erasing-a-users-data.md)) deletes their own pin, replaces them as `pinnedBy` with their pseudonym, and scrubs their names and emails from other pins' references, as it does the audit log.
 
 ### Startup warns; it doesn't refuse
 
@@ -108,10 +113,12 @@ Said plainly in the [DPA annex](../security/dpa-template.md#annex-iv-data-reside
 - Unit tests (`residency.rs`): request validation, when a region is ready, and which store a backup is in.
 - End to end, against the Incus stand-ins, the S3 stand-in and the fake Linode (`machines_residency_tests.rs`):
   - pin, renew and unpin, each audited; only admins; region and reference checked;
-  - a pin refused while a machine is elsewhere, and while the region has no store;
+  - a pin refused while a machine is elsewhere, while a failed backup is in another region's store, and while the region has no store;
   - region changes away from a pin refused and audited;
   - a restore onto a host in another region refused before anything is made, audited as a move;
   - with the region's store gone, a pinned backup and restore refused and audited, startup warnings shown, and a lost host's pinned machine skipped and audited, never made elsewhere;
-  - a team pin refused while a member's machine is elsewhere; once pinned, the team's and members' regions held, joins with data elsewhere refused, and the team not deleted until unpinned.
+  - a team pin refused while a member's machine is elsewhere; once pinned, the team's and members' regions held, joins with data elsewhere refused, a member's own pin holding her region under the team's, and the team not deleted until unpinned;
+  - erasure removing the person's pin and their email from a team pin's reference.
+- A unit test for the mark that keeps pins off a team being deleted (`teams.rs`).
 - botctl's commands (`residency_commands`).
 - The security pack's checks (`security_docs_links.rs`) cover the DPA's residency annex and the DPIA template.
