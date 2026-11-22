@@ -79,16 +79,16 @@ Google has no generic SCIM client for custom apps. Put Entra ID or Okta in front
 |----------|---------------|
 | Creates a user | A new user with `SCIM_DEFAULT_ROLE`. With `--sso`, its SSO identity too. If an admin already linked that identity to a user, that user is taken on instead |
 | Updates name, email, `userName` | Updates the user. Roles never change |
-| Sets `active: false` | Disables the user, ends all sessions, closes open screens, and pauses the routines that run for them ([ADR 0047](../adr/0047-disabled-users-routines.md)). Still listed, so the IdP can reactivate |
-| Sets `active: true` | Enables the user. Their paused routines stay paused until an admin resumes them (`botctl user resume-routines`) or hands them over (`botctl user handover`), unless `ROUTINES_ON_ENABLE=resume` |
-| Deletes (`DELETE`) | Disables the user, ends sessions, and pauses their routines; the tenant no longer sees it. Nothing is destroyed. Provisioning the same `externalId` again brings back the same user |
+| Sets `active: false` | Disables the user, ends all sessions, closes open screens, and pauses the routines that run for them ([ADR 0047](../adr/0047-disabled-users-routines.md)). Stops every run and queued message on their Bots and the runs on others' Bots that are for them, ends those runs' Bot tokens, and suspends their machine (`MACHINE_ON_DISABLE`, [ADR 0124](../adr/0124-deprovisioning-stops-bots-and-machines.md)). Still listed, so the IdP can reactivate |
+| Sets `active: true` | Enables the user, and resumes the machine their deactivation suspended. Their paused routines stay paused until an admin resumes them (`botctl user resume-routines`) or hands them over (`botctl user handover`), unless `ROUTINES_ON_ENABLE=resume` |
+| Deletes (`DELETE`) | Disables the user, ends sessions, pauses their routines, stops their Bots' runs, and suspends their machine; the tenant no longer sees it. Nothing is destroyed. Provisioning the same `externalId` again brings back the same user, and their machine |
 | Sends `roles`, `groups` on a user, a password | Ignored |
 
 **The IdP is in charge.** For users it provisioned, the IdP decides name, email, and `active`: an admin can disable one in SuperBot, but the IdP's next update can enable them again. Remove people in the IdP.
 
 **One person, one user.** Email never matches people. If a SuperBot user already has the email, the IdP gets a 409: link that user's SSO identity (`botctl user link <user> <provider> <subject>`) and retry, or change one of the emails. The owner account is never managed by SCIM.
 
-**Audit.** Every change is logged with the token as the actor: `botctl audit --method scim_token`, or `--actor system:scim:<token id>`. Bad tokens are logged as `scim.auth_failed` (throttled), with `reason` `missing`, `unknown`, or `revoked`; a revoked token names which one, so you can find the IdP still sending it. Tokens themselves never are logged.
+**Audit.** Every change is logged with the token as the actor: `botctl audit --method scim_token`, or `--actor system:scim:<token id>`. Each deactivation or deletion also records `user.deprovisioned`, with the Bots it stopped and what happened to the machine (`suspended`, `held` until it finishes building, `failed` and retried by the reconciler, `already_suspended`, `kept`, or `none`). Bad tokens are logged as `scim.auth_failed` (throttled), with `reason` `missing`, `unknown`, or `revoked`; a revoked token names which one, so you can find the IdP still sending it. Tokens themselves never are logged.
 
 ## Groups as teams
 
