@@ -677,6 +677,18 @@ pub struct Approval {
     pub scope: Option<String>,
 }
 
+/// One group of [`Db::audit_counts`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuditCount {
+    pub action: String,
+    pub outcome: String,
+    pub method: Option<String>,
+    pub code: Option<String>,
+    pub n: u64,
+    /// Failures these events say weren't logged (`unloggedSinceLast`), of any reason.
+    pub skipped: u64,
+}
+
 /// One row of the audit log. See `audit.rs` and ADR 0009.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1910,7 +1922,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 55] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 56] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1965,6 +1977,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 55] = [
     migrate_audit_chain,
     migrate_scim_group_roles,
     migrate_service_accounts,
+    migrate_user_last_seen,
     migrate_audit_checkpoints,
 ];
 
@@ -2091,6 +2104,19 @@ fn migrate_service_accounts(c: &Connection, _fresh: bool) -> rusqlite::Result<()
          );
          CREATE INDEX IF NOT EXISTS service_tokens_account ON service_tokens(account_id, created_at);",
     )
+}
+
+/// When each user last used a session or API token (ADR 0144), kept on the user so it
+/// outlives the session row, which is pruned 30 days after it stops working.
+fn migrate_user_last_seen(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'last_seen_at'", [], |r| r.get(0))?;
+    if !has {
+        c.execute_batch(
+            "ALTER TABLE users ADD COLUMN last_seen_at INTEGER;
+             UPDATE users SET last_seen_at = (SELECT max(s.last_seen_at) FROM sessions s WHERE s.user_id = users.id);",
+        )?;
+    }
+    Ok(())
 }
 
 /// Contractual residency pins (ADR 0129): one per user or team at most.
@@ -5506,7 +5532,7 @@ impl Db {
         let at = now();
         run(
             "UPDATE users SET email = NULL, display_name = ?2, role = 'readonly', status = 'disabled', idp_issuer = NULL, idp_subject = NULL,
-               last_login_at = NULL, last_login_method = NULL, last_login_idp_provider = NULL, tier = NULL, role_id = NULL,
+               last_login_at = NULL, last_login_method = NULL, last_login_idp_provider = NULL, last_seen_at = NULL, tier = NULL, role_id = NULL,
                erased_at = ?3, erased_by = ?4, erased_as = ?5, updated_at = ?3
              WHERE id = ?1",
             &[&user_id, &ERASED_NAME, &at, &by, &pseudonym],
@@ -6564,9 +6590,16 @@ impl Db {
     }
 
     /// Records use, at most once a minute per session to keep writes down. The idle
-    /// window is therefore up to a minute shorter than configured.
+    /// window is therefore up to a minute shorter than configured. The user's own
+    /// `last_seen_at` follows, for the health score's adoption (ADR 0144).
     pub fn touch_session(&self, id: &str, at: i64) {
-        let _ = self.c().execute("UPDATE sessions SET last_seen_at = ?1 WHERE id = ?2 AND last_seen_at <= ?1 - 60000", params![at, id]);
+        let c = self.c();
+        if c.execute("UPDATE sessions SET last_seen_at = ?1 WHERE id = ?2 AND last_seen_at <= ?1 - 60000", params![at, id]).unwrap_or(0) > 0 {
+            let _ = c.execute(
+                "UPDATE users SET last_seen_at = ?1 WHERE id = (SELECT user_id FROM sessions WHERE id = ?2) AND coalesce(last_seen_at, 0) < ?1",
+                params![at, id],
+            );
+        }
     }
 
     /// Every live session of one user, newest first, with no cap.
@@ -7431,6 +7464,62 @@ impl Db {
         let mut s = c.prepare(&sql)?;
         let rows = s.query_map(rusqlite::params_from_iter(args), audit_row)?;
         if strict { rows.collect() } else { Ok(rows.filter_map(Result::ok).collect()) }
+    }
+
+    /// Audit events from `from` (unix ms) whose action is one of `actions` (a trailing `*`
+    /// matches a prefix), counted by action, outcome, sign-in method and code: a run's
+    /// `details.result`, else `details.reason`. Counts only, never who (ADR 0144). A
+    /// throttled failure's `unloggedSinceLast` is summed apart as `skipped`: the failures
+    /// it stands for were of any reason, not necessarily its own.
+    pub fn audit_counts(&self, from: i64, actions: &[&str]) -> Vec<AuditCount> {
+        use rusqlite::types::Value as V;
+        let mut args = vec![V::Integer(from)];
+        let mut parts = Vec::new();
+        for a in actions {
+            match a.strip_suffix('*') {
+                Some(prefix) => {
+                    parts.push("substr(action, 1, ?) = ?");
+                    args.extend([V::Integer(prefix.len() as i64), V::Text(prefix.into())]);
+                }
+                None => {
+                    parts.push("action = ?");
+                    args.push(V::Text(a.to_string()));
+                }
+            }
+        }
+        if parts.is_empty() {
+            return Vec::new();
+        }
+        let sql = format!(
+            "SELECT action, outcome, auth_method,
+               CASE WHEN json_valid(details) THEN CAST(COALESCE(json_extract(details, '$.result'), json_extract(details, '$.reason')) AS TEXT) END AS code,
+               COUNT(*),
+               SUM(CASE WHEN json_valid(details) THEN max(0, CAST(COALESCE(json_extract(details, '$.unloggedSinceLast'), 0) AS INTEGER)) ELSE 0 END)
+             FROM audit_events WHERE at >= ? AND ({})
+             GROUP BY action, outcome, auth_method, code ORDER BY action, outcome, code",
+            parts.join(" OR ")
+        );
+        let c = self.c();
+        let mut s = c.prepare(&sql).unwrap();
+        s.query_map(rusqlite::params_from_iter(args), |r| {
+            Ok(AuditCount { action: r.get(0)?, outcome: r.get(1)?, method: r.get(2)?, code: r.get(3)?, n: r.get::<_, i64>(4)?.max(0) as u64, skipped: r.get::<_, i64>(5)?.max(0) as u64 })
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect()
+    }
+
+    /// Active people, the owner aside as seats count them, and how many of them signed in
+    /// or used a session from `since` (unix ms).
+    pub fn people_active_since(&self, since: i64) -> (u64, u64) {
+        self.c()
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(u.last_login_at >= ?1 OR u.last_seen_at >= ?1 OR EXISTS (SELECT 1 FROM sessions s WHERE s.user_id = u.id AND s.last_seen_at >= ?1)), 0)
+                 FROM users u WHERE u.status = 'active' AND u.kind = 'person' AND u.id != ?2",
+                params![since, crate::users::OPERATOR],
+                |r| Ok((r.get::<_, i64>(0)?.max(0) as u64, r.get::<_, i64>(1)?.max(0) as u64)),
+            )
+            .unwrap_or((0, 0))
     }
 
     /// Whether per-user accounts were on, with their copies in order, when last saved (ADR 0037).
@@ -9674,6 +9763,26 @@ mod tests {
         assert_eq!(n as usize, MAX_PUSH_DEVICES, "the oldest go");
         db.c().execute("DELETE FROM sessions WHERE id = ?", [&s2]).unwrap();
         assert!(db.session_push_device(&s2).is_none(), "a pruned session takes its device");
+    }
+
+    #[test]
+    fn activity_outlives_the_session_it_was_seen_on() {
+        let db = Db::open(&temp_path("last-seen").join("app.sqlite")).unwrap();
+        let day = 86_400_000;
+        let seen = db.create_user(None, Some("seen@example.com"), "Seen", Role::Member).unwrap();
+        db.create_user(None, Some("idle@example.com"), "Idle", Role::Member).unwrap();
+        let token = NewSession { user_id: &seen.id, token_hash: "h1", kind: "token", method: "code", idp_subject: None, idp_provider: None, label: None, ip: None, user_agent: None, expires_at: now() + day, mfa: None };
+        let s = db.create_session(&token);
+        db.c().execute("UPDATE sessions SET created_at = ?1, last_seen_at = ?1", [now() - 120 * day]).unwrap();
+        db.c().execute("UPDATE users SET last_login_at = ?1 WHERE last_login_at IS NOT NULL", [now() - 120 * day]).unwrap();
+        db.touch_session(&s.id, now() - 50 * day);
+        db.prune_sessions(now() + 2 * day, day, 365 * day);
+        let left: i64 = db.c().query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0, "the token's session is gone");
+        assert_eq!(db.people_active_since(now() - 90 * day), (2, 1), "the token was used 50 days ago");
+        assert_eq!(db.people_active_since(now() - 30 * day), (2, 0));
+        db.create_service_account("ci", "", Role::Member, None, None, &seen.id, None).unwrap();
+        assert_eq!(db.people_active_since(now() - 30 * day), (2, 0), "a service account isn't a person");
     }
 
     #[test]
