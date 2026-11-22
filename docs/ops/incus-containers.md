@@ -131,9 +131,12 @@ botctl machine backups <user>            # theirs, and their last restore
 botctl machine backup <user>             # one now
 botctl machine restore <user> <backup-id> --identity age-identity.txt --yes
 botctl machine restore <user> status
+botctl machine delete-backups <machine-id> --yes  # a destroyed machine's, now (ADR 0108)
 ```
 
 A restore replaces the machine with the backup. Everything on it since the backup is lost. botd imports the backup beside the container and gives it today's size, security settings and firewall. It removes the agent's old identity, writes a fresh one-time enrollment token as a root-only file, swaps the copy into place, revokes the machine's old certificates and tokens, and then starts it. Bots on it are refused (`machine_restoring`) until its agent enrolls again, normally within a minute of starting. A wrong key or a damaged object fails before anything changes. The audit log has `machine.backup_created`, `machine.backup_failed`, `machine.backup_deleted`, `machine.restore_requested`, `machine.restored` and `machine.restore_failed`.
+
+A destroyed machine's backups are kept until their retention ends, so a mistaken destroy can be undone. To delete them sooner, on a customer's request or with an erasure (`botctl user erase <user> --delete-backups --yes`), run `botctl machine delete-backups <machine-id> --yes` (find it with `botctl machine list destroyed`). It deletes every backup of it from the store, anything else under its prefix there, and any copy a restore left on a host, and audits it as `machine.backups_deleted`. It first asks whether the bucket keeps old versions, so the key always needs `s3:GetBucketVersioning` (and `s3:ListBucket` and `s3:DeleteObject`); if it does, it deletes those too, which also needs `s3:ListBucketVersions` and `s3:DeleteObjectVersion`. It refuses a machine that still exists ([ADR 0108](../adr/0108-deleting-a-destroyed-machines-backups.md)).
 
 ### Several hosts
 

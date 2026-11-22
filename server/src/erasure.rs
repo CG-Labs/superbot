@@ -4,7 +4,8 @@
 //! files in botd's folders go; what they wrote in others' chats is replaced; the user row
 //! stays as a tombstone with no personal data; and every audit event about them names
 //! them by a pseudonym instead. A legal hold on chat they're in, a team they're the
-//! only owner of, a plan they pay for, or a machine not yet destroyed refuses it first.
+//! only owner of, a plan they pay for, a machine not yet destroyed, or their machines'
+//! backups kept without `deleteBackups` refuses it first (ADR 0108).
 //! Design: docs/adr/0102-erasing-a-users-data.md.
 
 use crate::audit::{Outcome, Who};
@@ -24,6 +25,7 @@ const PAYING: &str = "paying";
 const TEAM_PAYS: &str = "team_pays";
 const CHECKOUT_PAID: &str = "checkout_paid";
 const MACHINE: &str = "machine";
+const BACKUPS: &str = "machine_backups";
 const PRIMARY: &str = "primary_bot";
 const TEAM_KEPT: &str = "team_delete_refused";
 /// The reason Bots, grants and offboarding record for an erasure.
@@ -97,14 +99,16 @@ pub fn pseudonym() -> String {
     format!("erased-{}", crate::random_hex(8))
 }
 
-/// `POST /api/users/{key}/erase` `{destroyMachine?: bool}` (send `{}` for none). Admin-only (`rbac::classify`).
-/// Erasing someone already erased answers as the first time did, and changes nothing.
+/// `POST /api/users/{key}/erase` `{destroyMachine?: bool, deleteBackups?: bool}` (send `{}` for none).
+/// Admin-only (`rbac::classify`). Erasing someone already erased answers as the first time
+/// did, and changes nothing.
 pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(key): Path<String>, Json(v): Json<Value>) -> Res {
-    let destroy_machine = match &v["destroyMachine"] {
-        Value::Null => false,
-        Value::Bool(b) => *b,
-        _ => return Err(bad("destroyMachine must be true or false")),
+    let flag = |name: &str| match &v[name] {
+        Value::Null => Ok(false),
+        Value::Bool(b) => Ok(*b),
+        _ => Err(bad(format!("{name} must be true or false"))),
     };
+    let (destroy_machine, delete_backups) = (flag("destroyMachine")?, flag("deleteBackups")?);
     let _one = ERASING.lock().await;
     let u = app.db.find_user_any(&key).ok_or_else(|| not_found("User"))?;
     if u.erased_at.is_some() {
@@ -153,6 +157,22 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
         let msg = format!("They have a machine ({}). Destroy it first (botctl machine destroy {}), or erase with destroyMachine: true (botctl user erase {} --destroy-machine --yes).", m.state.as_str(), u.id, u.id);
         return refuse(MACHINE, json!({ "machine": m.id, "state": m.state.as_str() }), msg);
     }
+    // Their machines' backups hold their disks: deleted with them only when asked, and
+    // only if botd can reach the store, so a refusal here has destroyed nothing.
+    let kept_msg = |n: usize| {
+        format!(
+            "{n} backups of their machines are kept in the backup store until their retention ends. Erase with deleteBackups: true (botctl user erase {} --delete-backups --yes) to delete them too.",
+            u.id
+        )
+    };
+    let backups = app.db.user_machine_backups_kept(&u.id).len();
+    if backups > 0 && !delete_backups {
+        return refuse(BACKUPS, json!({ "backups": backups }), kept_msg(backups));
+    }
+    if backups > 0 && a.machines.offsite.is_none() {
+        let msg = format!("{backups} backups of their machines are recorded, but off-host machine backups are off on this server, so botd can't delete them. Turn them back on (MACHINE_BACKUP_S3_BUCKET and the rest), then erase them again.");
+        return refuse(BACKUPS, json!({ "backups": backups, "store": "off" }), msg);
+    }
     // A checkout page still open could be paid after they're gone. The lock is checkout's
     // own, held until the erasure ends; by then they can't sign in to open another.
     let _checkout = match crate::billing::close_for_erasure(&app, &a, &u.id).await {
@@ -189,6 +209,22 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
             return Err(conflict(format!("Their machine is {} now. Erase them again once it is destroyed.", m.state.as_str())));
         }
         machine = json!({ "id": m.id, "destroyed": true });
+    }
+    // A backup begun before the machine was destroyed counts too; none can begin after.
+    let backups = app.db.user_machine_backups_kept(&u.id).len();
+    if backups > 0 && !delete_backups {
+        return refuse(BACKUPS, json!({ "backups": backups }), kept_msg(backups));
+    }
+    let mut machine_backups = 0;
+    if let Some(off) = a.machines.offsite.as_deref().filter(|_| delete_backups) {
+        // Every machine of theirs, not only those with backups still recorded: one an
+        // erasure stopped on part way has its strays and restore copy left to delete.
+        for m in app.db.machines(None).into_iter().filter(|m| m.user_id == u.id) {
+            let done = crate::machines::backup::purge(&app, &a.machines, off, &by, &m, REASON)
+                .await
+                .map_err(|e| ApiError(e.0, format!("Deleting the backups of their machine {}: {} Erase them again with deleteBackups then.", m.id, e.1)))?;
+            machine_backups += done.backups.len();
+        }
     }
 
     let team = crate::teams::erase_member(&app, &by, &u.id, leaving).await?;
@@ -277,6 +313,7 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
     details["files"] = json!(files);
     details["isolationFolderLeft"] = json!(isolation_left);
     details["machine"] = machine;
+    details["machineBackups"] = json!(machine_backups);
     details["team"] = json!(team);
     app.db.record(&by.event("user.erased").target("user", &p).details(details.clone()));
     app.send(json!({ "type": "resync" }));
