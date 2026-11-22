@@ -105,7 +105,7 @@ With Compose, run the collector on the `superbot_default` network and set `AUDIT
 
 ### Changing the sink
 
-The cursor is kept per sink URL. A new URL starts as `AUDIT_EXPORT_START` says; switching back to an old URL resumes where it stopped. To send everything again to the same sink, use a different path or remove its `audit_export:<url>` row from `settings` while botd is stopped.
+The cursor is kept per sink URL. A new URL starts as `AUDIT_EXPORT_START` says; switching back to an old URL resumes where it stopped. To send everything again to the same sink, use a different path or remove its row from `settings` while botd is stopped. The row's key is `audit_export:` and the sink with its port always written, defaults included, and for a webhook its path: `https://<collector>/ingest` is saved as `audit_export:https://<collector>:443/ingest`, and `syslog+tls://<host>` as `audit_export:syslog+tls://<host>:6514`.
 
 ## Retention and erasure
 

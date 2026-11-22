@@ -514,14 +514,15 @@ pub fn checked(app: &App, by: &crate::audit::Who, r: &Report) {
 }
 
 /// `GET /api/audit/verify[?pin=<id>:<hash>,...]`: checks the chain, and each pinned
-/// hash, from a SIEM or an earlier check, against the row there now. Admins only.
+/// hash, from a SIEM or an earlier check, against the row there now. `pin` may repeat;
+/// every one is checked. Admins only.
 pub async fn get(
     axum::extract::State(app): axum::extract::State<Arc<App>>,
     axum::Extension(by): axum::Extension<crate::audit::Who>,
-    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::extract::Query(q): axum::extract::Query<Vec<(String, String)>>,
 ) -> Result<axum::Json<Report>, (axum::http::StatusCode, String)> {
     let bad = |m: String| (axum::http::StatusCode::BAD_REQUEST, m);
-    let pins: Vec<Link> = q.get("pin").map(|p| p.split(',').filter(|s| !s.trim().is_empty()).map(Link::parse).collect()).transpose().map_err(bad)?.unwrap_or_default();
+    let pins: Vec<Link> = q.iter().filter(|(k, _)| k == "pin").flat_map(|(_, p)| p.split(',')).filter(|s| !s.trim().is_empty()).map(Link::parse).collect::<Result<_, _>>().map_err(bad)?;
     if pins.len() > 100 {
         return Err(bad("At most 100 pins".into()));
     }

@@ -62,6 +62,11 @@ async fn verify_names_the_first_broken_link_and_holds_pins() {
     let pin = format!("{}:{}", scout["id"], scout["chainHash"].as_str().unwrap());
     let v = verify(port, &admin, &format!("?pin={pin}")).await;
     assert_eq!((v["ok"].as_bool(), v["pins"][0]["result"].as_str()), (Some(true), Some("match")), "{v}");
+    // A repeated pin is checked too, not dropped for the last one.
+    let wrong = format!("{}:{}", scout["id"], "0".repeat(64));
+    let v = verify(port, &admin, &format!("?pin={wrong}&pin={pin}")).await;
+    let results: Vec<&str> = v["pins"].as_array().unwrap().iter().map(|p| p["result"].as_str().unwrap()).collect();
+    assert_eq!((v["ok"].as_bool(), results), (Some(false), vec!["mismatch", "match"]), "{v}");
     for bad in ["x", "12", "12:nothex", "0:00"] {
         assert_eq!(call(port, "GET", &format!("/api/audit/verify?pin={bad}"), &admin, "").await.0, 400, "{bad}");
     }
