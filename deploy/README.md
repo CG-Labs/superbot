@@ -290,10 +290,10 @@ The folder copy sends only what the machine doesn't have. Each file is checked b
 
 ### Bots' own user on machines
 
-The agent on a machine runs as root, and by default so do its Bots. To run them as their own unprivileged user instead, add:
+The agent on a machine runs as root. Its Bots run as their own unprivileged user, `superbot-bots`, by default ([ADR 0145](../docs/adr/0145-locked-down-run-users-and-red-team.md)). Only if you must keep them as root, add:
 
 ```sh
-MACHINE_BOT_USER=on   # Bots, their harness CLIs, logins and the folder copy run as superbot-bots
+MACHINE_BOT_USER=off   # Bots run as root: they can read the agent's key; botd warns at every start
 ```
 
 After the next heartbeat, botd asks each idle agent to switch. The agent makes the `superbot-bots` user if it must, hands it the Bots' home (workspace, logins, folder copy) without following links, and from then on runs every harness, login and cleanup as it. The agent's key and the harness CLIs stay root's. Until the switch is done, a Bot says it's being set up and doesn't run; nothing runs on the server instead. New machines get the user at first boot.
@@ -306,6 +306,8 @@ botctl machine agent <user>      # agent.botUser shows ready, setting_up or fail
 ```
 
 Each step is audited as `machine.bot_user_*`. Design: [ADR 0043](../docs/adr/0043-bots-own-os-user-on-machines.md).
+
+Every process the agent starts as the Bots' or a teammate's user is locked down: it can't gain privileges again (no sudo, su, setuid programs or file capabilities), makes files only it can read (umask 077), gets a temporary folder of its own (`TMPDIR`), and is the first the kernel kills when the machine runs out of memory. The agent refuses a run user that is in a privileged group (`sudo`, `adm`, `docker` and the like) or has a sudo rule, so don't add one; `agent.botUser` says why. New and rebuilt machines also hide other users' processes from runs. `agent.botUser.lockedDown` shows whether a machine's agent does all this yet; upgrade it if not. Design: [ADR 0145](../docs/adr/0145-locked-down-run-users-and-red-team.md).
 
 ### Screens on machines
 
@@ -434,6 +436,8 @@ Admin actions (logins, Bot and routine changes, approvals, policy, handoffs) are
 
 - `AUDIT_RETENTION_DAYS` in `.env`: unset or `0` keeps events forever (default: they are small, and deleting them can't be undone). `1` to `36500` deletes older events every 6 hours. Restart `botd` after changing it.
 - Both installs back it up: the bash timer and the Compose `backup` service take a SQLite `.backup` of `app.sqlite`, audit table included, and keep archives for `SUPERBOT_BACKUP_RETENTION_DAYS` (default 14). So a pruned event still exists in backups for that long; shorten it too if you must erase events.
+- Retention deletes from the start of the log only and keeps the last deleted event's hash, so the hash chain still verifies (`botctl audit verify`). With a SIEM export on, nothing is deleted before the SIEM has it.
+- Tamper evidence and SIEM export: every event is on a hash chain, and `AUDIT_EXPORT` (off by default) sends each one to your SIEM as JSON lines over HTTPS or syslog over TLS. See [docs/ops/audit-export.md](../docs/ops/audit-export.md).
 - Source IPs: the installer's Caddy is on loopback, so `botd` trusts its `X-Forwarded-For`. Compose sets `TRUST_FORWARDED_FOR=1`, since `botd` is reachable only through Caddy.
 
 ## Chat history retention

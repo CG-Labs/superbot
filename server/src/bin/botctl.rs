@@ -137,6 +137,11 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    when it pushes the group with that externalId
                                                    (or, with none, that name; the team's by default)
   botctl scim group unlink <team>                  The team is managed by hand again; everyone stays
+  botctl scim role-mappings                        SCIM groups mapped to custom roles (SCIM_GROUP_ROLES=on)
+  botctl scim role map <team> <role> [--org]       The group <team> is gives its members <role> in the
+                                                   team, or with --org across the server. Never admin
+  botctl scim role show <id>                       A mapping and who it gave the role to
+  botctl scim role unmap <id>                      Takes the role from everyone the mapping gave it to
   botctl sessions [<user>]                         Live sessions
   botctl session revoke <id>
   botctl session revoke-all <user>
@@ -161,6 +166,10 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl deny <id> [--remember | --remember-global]
   botctl audit [<limit>] [filters]                 Recent audit events, newest first
   botctl audit export [filters] > audit.csv        All matching events as CSV, oldest first
+  botctl audit verify [--pin <id>:<hash>]...       Check the audit log's hash chain; names the first
+                                                   broken link, exits 1 if there is one. --pin: a hash
+                                                   kept elsewhere (your SIEM) the row must still have
+  botctl audit siem                                The SIEM export: sink, delivered, pending, failing
     filters: --from <time> --to <time> --action <a,b.*> --actor <user|bot|system[:id]>
              --actor user:<email> --method <password,code,sso,none,bot_token,scim_token>
              --idp <entra|google|oidc|github|apple|saml> --idp-provider <id> --subject <issuer|sub>
@@ -757,6 +766,20 @@ fn audit_query(rest: &[&str]) -> Result<String, String> {
     Ok(if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) })
 }
 
+/// `botctl audit verify [--pin <id>:<hash>]...`: hashes kept elsewhere (a SIEM, an
+/// earlier check) to hold the chain to.
+fn verify_query(rest: &[&str]) -> Result<String, String> {
+    let mut pins = Vec::new();
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "--pin" => pins.push(encode(it.next().ok_or("--pin needs <event id>:<hash>")?)),
+            other => return Err(format!("Unknown audit verify option \"{other}\". See botctl admin.")),
+        }
+    }
+    Ok(if pins.is_empty() { String::new() } else { format!("?pin={}", pins.join(",")) })
+}
+
 fn flag<'a>(rest: &[&'a str], name: &str) -> Option<&'a str> {
     rest.windows(2).find(|w| w[0] == name).map(|w| w[1])
 }
@@ -993,13 +1016,20 @@ fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
             ("POST", "/api/scim/groups".into(), Some(body.to_string()))
         }
         ["group", "unlink", team] => ("DELETE", format!("/api/scim/groups/{}", encode(team)), None),
+        ["role-mappings"] | ["role", "list"] => ("GET", "/api/scim/role-mappings".into(), None),
+        ["role", "map", team, role, rest @ ..] if !team.starts_with("--") && !role.starts_with("--") && rest.iter().all(|a| *a == "--org") => {
+            let body = json!({ "team": team, "role": role, "scope": if rest.is_empty() { "team" } else { "org" } });
+            ("POST", "/api/scim/role-mappings".into(), Some(body.to_string()))
+        }
+        ["role", "show", id] => ("GET", format!("/api/scim/role-mappings/{}", encode(id)), None),
+        ["role", "unmap", id] => ("DELETE", format!("/api/scim/role-mappings/{}", encode(id)), None),
         ["token", "create", tenant, rest @ ..] if !tenant.starts_with("--") => {
             let body = json!({ "tenant": tenant, "sso": flag(rest, "--sso"), "label": flag(rest, "--label") });
             ("POST", "/api/scim/tokens".into(), Some(body.to_string()))
         }
         ["token", "revoke", id] => ("DELETE", format!("/api/scim/tokens/{}", encode(id)), None),
         _ => {
-            return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team>".into());
+            return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team> | role-mappings | role map <team> <role> [--org] | role show <id> | role unmap <id>".into());
         }
     })
 }
@@ -1509,6 +1539,12 @@ fn run(args: &[String]) -> Result<String, String> {
         ["evidence"] => op("GET", "/api/evidence", None),
         ["evidence", "bundle", rest @ ..] => evidence_bundle(rest),
         ["audit", "export", rest @ ..] => api(Cred::Operator, "GET", &format!("/api/audit/export.csv{}", audit_query(rest)?), None),
+        ["audit", "verify", rest @ ..] => {
+            let res = op("GET", &format!("/api/audit/verify{}", verify_query(rest)?), None)?;
+            // A broken chain is a failure, so a cron job or CI step notices.
+            if serde_json::from_str::<Value>(&res).ok().and_then(|v| v["ok"].as_bool()) == Some(false) { Err(res) } else { Ok(res) }
+        }
+        ["audit", "siem"] => op("GET", "/api/audit/siem", None),
         ["audit", rest @ ..] => op("GET", &format!("/api/audit{}", audit_query(rest)?), None),
         ["retention"] => op("GET", "/api/retention", None),
         ["retention", "hold", bot, reason] => op("PUT", &format!("/api/retention/holds/{}", encode(bot)), Some(json!({ "reason": reason }).to_string())),
@@ -2058,6 +2094,9 @@ mod tests {
         );
         assert!(audit_query(&["--from"]).is_err());
         assert!(audit_query(&["--nope", "x"]).is_err());
+        assert_eq!(verify_query(&[]).unwrap(), "");
+        assert_eq!(verify_query(&["--pin", "12:ab", "--pin", "13:cd"]).unwrap(), "?pin=12:ab,13:cd");
+        assert!(verify_query(&["--pin"]).is_err() && verify_query(&["--all"]).is_err());
     }
 
     #[test]
@@ -2366,6 +2405,16 @@ mod tests {
         assert!(req(&["group", "link", "okta"]).is_err());
         assert!(req(&["group", "link", "okta", "--name", "x"]).is_err());
         assert!(req(&["group", "unlink"]).is_err());
+        assert_eq!(req(&["role-mappings"]), Ok(("GET", "/api/scim/role-mappings".into(), None)));
+        assert_eq!(req(&["role", "list"]), Ok(("GET", "/api/scim/role-mappings".into(), None)));
+        assert_eq!(req(&["role", "map", "t1", "Support Lead"]), Ok(("POST", "/api/scim/role-mappings".into(), Some(json!({ "team": "t1", "role": "Support Lead", "scope": "team" })))));
+        assert_eq!(req(&["role", "map", "t1", "auditor", "--org"]), Ok(("POST", "/api/scim/role-mappings".into(), Some(json!({ "team": "t1", "role": "auditor", "scope": "org" })))));
+        assert_eq!(req(&["role", "show", "sm 1"]), Ok(("GET", "/api/scim/role-mappings/sm%201".into(), None)));
+        assert_eq!(req(&["role", "unmap", "sm1"]), Ok(("DELETE", "/api/scim/role-mappings/sm1".into(), None)));
+        assert!(req(&["role", "map", "t1"]).is_err());
+        assert!(req(&["role", "map", "--org", "t1"]).is_err());
+        assert!(req(&["role", "map", "t1", "auditor", "--team"]).is_err());
+        assert!(req(&["role", "unmap"]).is_err());
 
         let res = json!({ "token": "sbp_x", "enabled": false, "scimToken": { "id": "st1", "tenant": "entra", "ssoProvider": "work" } });
         let out = scim_created(&res);

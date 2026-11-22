@@ -85,6 +85,12 @@ async fn main() -> ExitCode {
         libc::umask(0o007);
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
     }
+    // Nothing the run starts gains privileges: no sudo, su or pkexec back up, and no
+    // file capabilities (ADR 0145). Kept for the run's whole life, across every exec.
+    // SAFETY: a plain prctl on this process.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return fail("couldn't give up new privileges");
+    }
     // SAFETY: as above.
     if unsafe { libc::getppid() } == 1 {
         return fail("the sudo that started this is gone");

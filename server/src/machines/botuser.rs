@@ -1,5 +1,5 @@
-//! Bots' own OS user on users' machines (ADR 0043), botd's side. With
-//! MACHINE_BOT_USER=on, after a heartbeat botd asks each idle agent that can to run its
+//! Bots' own OS user on users' machines (ADR 0043), botd's side. Unless
+//! MACHINE_BOT_USER=off (ADR 0145), after a heartbeat botd asks each idle agent that can to run its
 //! Bots as their own unprivileged user (`superbot-bots`): the agent makes it if it must,
 //! hands it the Bots' home (workspace, logins, the folder copy), and from then on runs
 //! every harness, login and cleanup as it. Until the agent says it's ready, a routed run
@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-pub const OFF: &str = "Bots' own user on machines is off. Set MACHINE_BOT_USER=on to turn it on.";
+pub const OFF: &str = "Bots' own user on machines is off (MACHINE_BOT_USER=off). Remove that setting to turn it on.";
 /// An agent that hasn't taken the request is asked again after this long.
 const RESEND_MS: i64 = 5 * 60_000;
 /// One that failed to set it up is asked again after this long.
@@ -39,11 +39,14 @@ impl Asked {
     }
 }
 
-/// MACHINE_BOT_USER: on or off (the default).
+/// Logged at start when an admin turned the Bots' own user off.
+pub const ROOT_WARNING: &str = "MACHINE_BOT_USER=off: Bots on users' machines run as root. They can read the agent's key, lift the egress rules and allow-list, and leave their run's cgroup. Remove the setting to run them as their own unprivileged user (ADR 0145).";
+
+/// MACHINE_BOT_USER: on (the default since ADR 0145) or off.
 pub fn from_env(var: &dyn Fn(&str) -> String) -> Result<bool, String> {
     match var("MACHINE_BOT_USER").trim() {
-        "" | "off" => Ok(false),
-        "on" => Ok(true),
+        "" | "on" => Ok(true),
+        "off" => Ok(false),
         v => Err(format!("MACHINE_BOT_USER must be on or off, not \"{v}\"")),
     }
 }
@@ -135,7 +138,8 @@ pub async fn follow_up(app: &App, e: &Enrollment, m: &Machine, hb: &Heartbeat) {
 pub fn upkeep_json(hb: &Heartbeat) -> Value {
     match &hb.bot_user {
         Some(s) => {
-            json!({ "state": s.state, "user": s.user, "uid": s.uid, "error": s.error, "at": s.at })
+            let locked = hb.can.iter().any(|c| c == wire::CAN_LOCKED_DOWN);
+            json!({ "state": s.state, "user": s.user, "uid": s.uid, "error": s.error, "at": s.at, "lockedDown": locked })
         }
         None => Value::Null,
     }
@@ -145,7 +149,7 @@ pub fn upkeep_json(hb: &Heartbeat) -> Value {
 pub fn observed(app: &App, m: &Machine, by: &Who, old: Option<&Value>, new: &Value) {
     let state = |v: Option<&Value>| v.and_then(|v| v["state"].as_str()).map(String::from);
     let (was, now) = (state(old), state(Some(new)));
-    let d = || json!({ "user": new["user"], "uid": new["uid"] });
+    let d = || json!({ "user": new["user"], "uid": new["uid"], "lockedDown": new["lockedDown"] });
     match now.as_deref() {
         Some(wire::BOT_USER_READY) if was.as_deref() != Some(wire::BOT_USER_READY) => {
             app.db.record(&event(by, "machine.bot_user_ready", m, d()));
@@ -270,11 +274,20 @@ mod tests {
     }
 
     #[test]
-    fn off_by_default_and_only_on_or_off() {
-        assert!(!from_env(&|_| String::new()).unwrap());
+    fn on_by_default_and_only_on_or_off() {
+        assert!(from_env(&|_| String::new()).unwrap(), "on unless an admin turns it off (ADR 0145)");
         assert!(from_env(&|_| "on".into()).unwrap());
         assert!(!from_env(&|_| "off".into()).unwrap());
         assert!(from_env(&|_| "yes".into()).is_err());
+    }
+
+    #[test]
+    fn the_agent_view_says_whether_runs_are_locked_down() {
+        let mut h = hb(true, 0, Some((wire::BOT_USER_READY, 1)));
+        assert_eq!(upkeep_json(&h)["lockedDown"], false, "an agent from before ADR 0145");
+        h.can.push(wire::CAN_LOCKED_DOWN.into());
+        assert_eq!(upkeep_json(&h)["lockedDown"], true);
+        assert_eq!(upkeep_json(&hb(true, 0, None)), Value::Null);
     }
 
     #[test]

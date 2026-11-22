@@ -21,7 +21,7 @@ A self-hosting customer can use it as a starting point for their own. Settings a
 | `TEAMS` | `on` when more than one customer shares a server | Sharing stops at a team ([ADR 0087](../adr/0087-team-accounts-and-machines.md)) | The settings file |
 | `MACHINE_HARDENING` | `on` (the default) | Machines are hardened at first boot ([ADR 0126](../adr/0126-per-user-machine-hardening.md)) | `machine.hardened` and `machine.hardening_failed` audit events |
 | `MACHINE_RUN_LIMITS` | `on` (the default) | Each run is held to its tier's limits ([ADR 0135](../adr/0135-run-limits-and-egress-allow-lists.md)) | The settings file |
-| `MACHINE_BOT_USER` | `on` | Bots run as an unprivileged user on their machine, so its egress rules bind them ([ADR 0043](../adr/0043-bots-own-os-user-on-machines.md)) | The settings file |
+| `MACHINE_BOT_USER` | `on` (the default) | Bots run as an unprivileged user on their machine, so its egress rules bind them ([ADR 0043](../adr/0043-bots-own-os-user-on-machines.md)) | The settings file |
 | `MACHINE_TEAMMATE_USERS` | `on` | Teammates' runs can't read the owner's files ([ADR 0048](../adr/0048-teammates-own-os-user-on-machines.md)) | The settings file |
 | `MACHINE_FIREWALL` | `on` for Linode machines | Only botd reaches a machine's agent ([ADR 0035](../adr/0035-machine-firewall-auto-enroll.md)) | `machine.firewall_*` audit events |
 | `MACHINE_ON_DISABLE` | `suspend` (the default) | A disabled user's machine is powered off ([ADR 0124](../adr/0124-deprovisioning-stops-bots-and-machines.md)) | The settings file |

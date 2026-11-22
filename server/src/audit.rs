@@ -2,7 +2,8 @@
 //! triggers refuse UPDATE, and DELETE of anything younger than the retention
 //! window (`AUDIT_RETENTION_DAYS`). Never put secrets or message bodies in an
 //! event; `details` is scrubbed on write as a second line of defense.
-//! Design: docs/adr/0009-audit-events.md; per-user actors and IdP: 0019-audit-actors.md.
+//! Design: docs/adr/0009-audit-events.md; per-user actors and IdP: 0019-audit-actors.md;
+//! the hash chain and SIEM export: 0122-siem-export-and-tamper-evident-audit.md.
 
 use crate::db::{now, AuditEvent, Bot};
 use crate::runner::App;
@@ -68,6 +69,10 @@ pub struct Actor {
     /// only; run events carry it as `forUser`, and it is no audit column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asker: Option<String>,
+    /// Whose data a Bot's run carried when it queued this (ADR 0139): their residency
+    /// pins hold the run it starts, after a restart too. Kept with queued messages only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carries: Vec<String>,
 }
 
 impl Actor {
@@ -796,11 +801,16 @@ pub fn start_retention(app: Arc<App>, days: Option<u32>) {
     });
 }
 
+/// Deletes old events, but none the SIEM export hasn't delivered yet (ADR 0122). The
+/// event names the anchor the chain now starts from.
 pub fn prune(app: &App, days: u32) {
     let cutoff = now() - days as i64 * 86_400_000;
-    match app.db.prune_audit() {
-        Ok(0) => {}
-        Ok(n) => app.db.record(&Event::new(Actor::system("retention"), "audit.pruned").details(json!({ "deleted": n, "olderThan": cutoff, "retentionDays": days }))),
+    let delivered = app.audit_export.get().map(|x| x.delivered());
+    match app.db.prune_audit(delivered) {
+        Ok((0, _)) => {}
+        Ok((n, anchor)) => app.db.record(&Event::new(Actor::system("retention"), "audit.pruned").details(json!({
+            "deleted": n, "olderThan": cutoff, "retentionDays": days, "anchor": anchor, "heldForExport": delivered.is_some(),
+        }))),
         Err(e) => crate::obs::log::log_warn!("audit retention: {e}"),
     }
 }
@@ -848,6 +858,8 @@ mod tests {
             idp_provider: None,
             session_id: None,
             on_behalf_of: Some("u1".into()),
+            chain_prev: None,
+            chain_hash: None,
         };
         let row = csv_row(&e);
         assert!(row.ends_with("\r\n"));

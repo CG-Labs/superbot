@@ -114,7 +114,9 @@ async fn a_pinned_users_region_and_restores_stay_in_it_and_a_pin_needs_all_their
     // The regions page shows the pin.
     let (_, r) = json_call(&env, "GET", "/api/regions", "").await;
     assert_eq!((r["regions"][1]["pinned"]["users"].as_u64(), r["residency"]["pins"][0]["name"].as_str()), (Some(1), Some("fra")), "{r}");
-    assert_eq!(r["residency"]["warnings"], json!([]), "{r}");
+    // Its data is all in de-fra-2; only its open plan's model routes aren't (ADR 0139).
+    let w = r["residency"]["warnings"].as_array().unwrap();
+    assert!(w.len() == 1 && w[0].as_str().unwrap().contains("the Self-host plan has open routing, so no model route is held to de-fra-2"), "{r}");
 
     // Unpinning needs a reason, is audited, and leaves the region as it was.
     assert_eq!(json_call(&env, "DELETE", &path, r#"{"reason":" "}"#).await.0, 400);
