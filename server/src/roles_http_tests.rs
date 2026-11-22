@@ -140,6 +140,33 @@ async fn a_custom_role_opens_its_routes_and_nothing_else() {
     assert_eq!(events(port, &admin, "role.unassigned").await[0]["details"]["keeps"].as_str(), Some("readonly"));
 }
 
+/// The roles editors in the apps show what each person can do from these lists (ADR 0132).
+#[tokio::test]
+async fn admin_user_views_list_each_persons_effective_permissions() {
+    let (port, _, admin, _) = serve_app().await;
+    let (bo, _) = user_with(port, &admin, "bo@example.com", "member").await;
+    let (_, viewer) = user_with(port, &admin, "rex@example.com", "readonly").await;
+    let perms_of = |users: &Value, email: &str| users.as_array().unwrap().iter().find(|u| u["email"] == email).map(|u| u["permissions"].clone()).unwrap();
+
+    let (_, users) = json_call(port, "GET", "/api/users", &admin, "").await;
+    assert_eq!(perms_of(&users, "bo@example.com"), json!(["account", "read", "review", "write", "approve"]));
+    assert_eq!(perms_of(&users, "rex@example.com"), json!(["account", "read", "review"]));
+    assert_eq!(users.as_array().unwrap().iter().find(|u| u["breakGlass"] == true).unwrap()["permissions"].as_array().unwrap().len(), 12);
+
+    let support = role(port, &admin, "Support", "readonly", &["users.manage", "audit.view"]).await;
+    give(port, &admin, &support, &bo).await;
+    let (_, v) = json_call(port, "GET", &format!("/api/users/{bo}"), &admin, "").await;
+    assert_eq!(v["permissions"], json!(["account", "read", "review", "users.manage", "audit.view"]), "{v}");
+    assert_eq!(v["customRole"], json!({ "id": support, "name": "Support" }));
+
+    // A change to the role shows at once, as it applies at once.
+    assert_eq!(call(port, "PATCH", &format!("/api/roles/{support}"), &admin, r#"{"base":"member","permissions":["users.manage"]}"#).await.0, 200);
+    let (_, users) = json_call(port, "GET", "/api/users", &admin, "").await;
+    assert_eq!(perms_of(&users, "bo@example.com"), json!(["account", "read", "review", "write", "approve", "users.manage"]));
+    // Read-only people don't see anyone's.
+    assert_eq!(call(port, "GET", "/api/users", &viewer, "").await.0, 403);
+}
+
 #[tokio::test]
 async fn each_permission_opens_its_own_routes() {
     let (port, _, admin, _) = serve_app().await;
