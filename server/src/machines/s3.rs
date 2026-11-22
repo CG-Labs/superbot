@@ -47,15 +47,19 @@ fn bucket_name(b: &str) -> bool {
         && b.ends_with(|c: char| c.is_ascii_alphanumeric())
 }
 
+/// The settings' names start with this for machine backups (ADR 0071).
+pub const MACHINES: &str = "MACHINE_BACKUP_S3";
+
 impl Settings {
     /// `endpoint` must be https, or http to a loopback address (a local MinIO).
+    #[cfg(test)]
     pub fn new(endpoint: &str, bucket: &str, region: &str, access_key: &str, secret: &str) -> Result<Settings, String> {
-        let bad = || {
-            format!(
-                "MACHINE_BACKUP_S3_ENDPOINT must be https://host[:port], not \"{}\"",
-                crate::audit::clip(endpoint, 80)
-            )
-        };
+        Settings::named(MACHINES, endpoint, bucket, region, access_key, secret)
+    }
+
+    /// `new`, with errors naming `{name}_ENDPOINT`, `{name}_BUCKET` and so on.
+    pub fn named(name: &str, endpoint: &str, bucket: &str, region: &str, access_key: &str, secret: &str) -> Result<Settings, String> {
+        let bad = || format!("{name}_ENDPOINT must be https://host[:port], not \"{}\"", crate::audit::clip(endpoint, 80));
         let u = url::Url::parse(endpoint.trim()).map_err(|_| bad())?;
         let loopback = match u.host() {
             Some(url::Host::Ipv4(a)) => a.is_loopback(),
@@ -78,17 +82,17 @@ impl Settings {
             _ => return Err(bad()),
         };
         if !bucket_name(bucket) {
-            return Err(format!("MACHINE_BACKUP_S3_BUCKET: \"{}\" isn't a bucket name", crate::audit::clip(bucket, 70)));
+            return Err(format!("{name}_BUCKET: \"{}\" isn't a bucket name", crate::audit::clip(bucket, 70)));
         }
         let region = region.trim();
         if region.is_empty() || !region.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
-            return Err("MACHINE_BACKUP_S3_REGION must be a region name, e.g. us-east-1 (auto for R2)".into());
+            return Err(format!("{name}_REGION must be a region name, e.g. us-east-1 (auto for R2)"));
         }
         if access_key.is_empty() || access_key.chars().any(|c| c.is_whitespace() || c.is_control()) {
-            return Err("MACHINE_BACKUP_S3_ACCESS_KEY_ID is empty or has spaces in it".into());
+            return Err(format!("{name}_ACCESS_KEY_ID is empty or has spaces in it"));
         }
         if secret.is_empty() || secret.chars().any(|c| c.is_whitespace() || c.is_control()) {
-            return Err("MACHINE_BACKUP_S3_SECRET_ACCESS_KEY is empty or has spaces in it".into());
+            return Err(format!("{name}_SECRET_ACCESS_KEY is empty or has spaces in it"));
         }
         Ok(Settings {
             endpoint: format!("{}://{host}", u.scheme()),
@@ -103,21 +107,24 @@ impl Settings {
     /// MACHINE_BACKUP_S3_ENDPOINT, _BUCKET, _REGION (us-east-1), and the keys from the
     /// secret store: MACHINE_BACKUP_S3_ACCESS_KEY_ID and _SECRET_ACCESS_KEY (or `_FILE`).
     pub fn from_env(store: &dyn SecretStore, var: &dyn Fn(&str) -> String) -> Result<Settings, String> {
-        let endpoint = var("MACHINE_BACKUP_S3_ENDPOINT");
+        Settings::from_env_named(MACHINES, store, var)
+    }
+
+    /// `from_env`, from the settings whose names start with `name` (`SERVER_BACKUP_S3`).
+    pub fn from_env_named(name: &str, store: &dyn SecretStore, var: &dyn Fn(&str) -> String) -> Result<Settings, String> {
+        let endpoint = var(&format!("{name}_ENDPOINT"));
         if endpoint.trim().is_empty() {
-            return Err("MACHINE_BACKUP_S3_ENDPOINT is needed with MACHINE_BACKUP_S3_BUCKET, e.g. https://s3.<region>.amazonaws.com".into());
+            return Err(format!("{name}_ENDPOINT is needed with {name}_BUCKET, e.g. https://s3.<region>.amazonaws.com"));
         }
         let get = |k: &str| -> Result<String, String> {
-            let v = store
-                .get(k)
-                .map_err(|e| e.to_string())?
-                .ok_or(format!("{k} (or {k}_FILE) is needed with MACHINE_BACKUP_S3_BUCKET"))?;
+            let v = store.get(k).map_err(|e| e.to_string())?.ok_or(format!("{k} (or {k}_FILE) is needed with {name}_BUCKET"))?;
             Ok(v.expose().trim().to_string())
         };
-        let region = Some(var("MACHINE_BACKUP_S3_REGION")).filter(|r| !r.trim().is_empty()).unwrap_or("us-east-1".into());
-        let secret = get("MACHINE_BACKUP_S3_SECRET_ACCESS_KEY")?;
+        let region = Some(var(&format!("{name}_REGION"))).filter(|r| !r.trim().is_empty()).unwrap_or("us-east-1".into());
+        let secret = get(&format!("{name}_SECRET_ACCESS_KEY"))?;
         crate::secrets::redact::register(&secret);
-        Settings::new(&endpoint, var("MACHINE_BACKUP_S3_BUCKET").trim(), &region, &get("MACHINE_BACKUP_S3_ACCESS_KEY_ID")?, &secret)
+        let key = get(&format!("{name}_ACCESS_KEY_ID"))?;
+        Settings::named(name, &endpoint, var(&format!("{name}_BUCKET")).trim(), &region, &key, &secret)
     }
 }
 
@@ -455,6 +462,10 @@ mod tests {
         ] {
             assert!(Settings::new(endpoint, bucket, region, key, secret).is_err(), "{endpoint} {bucket} {region}");
         }
+        let e = Settings::named("SERVER_BACKUP_S3", "http://s3.example.com", "bucket", "us-east-1", "AKID", "s").unwrap_err();
+        assert!(e.starts_with("SERVER_BACKUP_S3_ENDPOINT "), "{e}");
+        let e = Settings::named("SERVER_BACKUP_S3", "https://s3.example.com", "bucket", "us-east-1", "AKID", "s s").unwrap_err();
+        assert!(e.starts_with("SERVER_BACKUP_S3_SECRET_ACCESS_KEY "), "{e}");
     }
 
     #[test]
