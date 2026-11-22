@@ -49,6 +49,9 @@ async fn a_plain_database_is_shown_and_audited_until_it_is_encrypted_and_its_cop
         "{m}"
     );
     assert!(m.contains("event=\"server.database_encryption_changed\""), "counted in superbot_events_total: {m}");
+    let types: std::collections::BTreeSet<String> = m.lines().filter_map(|l| Some(l.strip_prefix("# TYPE ")?.split(' ').next()?.to_string())).collect();
+    let used = crate::machines_placement_tests::metric_names(include_str!("../../deploy/prometheus/superbot-database-encryption.rules.yml"));
+    assert!(!used.is_empty() && used.is_subset(&types), "the rules use metrics botd doesn't write: {:?}", used.difference(&types).collect::<Vec<_>>());
     let item = checklist(port, &admin).await;
     assert_eq!((item["label"].as_str(), item["done"].as_bool()), (Some("Database encrypted"), Some(false)), "{item}");
     assert!(item["detail"].as_str().unwrap().contains("SUPERBOT_DATABASE_ENCRYPTION=required"), "{item}");

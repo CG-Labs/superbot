@@ -136,6 +136,8 @@ jobs:
       - run: promtool test rules deploy/prometheus/superbot-backups.rules.test.yml
       - run: promtool check rules deploy/prometheus/superbot-backup-encryption.rules.yml
       - run: promtool test rules deploy/prometheus/superbot-backup-encryption.rules.test.yml
+      - run: promtool check rules deploy/prometheus/superbot-database-encryption.rules.yml
+      - run: promtool test rules deploy/prometheus/superbot-database-encryption.rules.test.yml
       - run: promtool check rules deploy/prometheus/superbot-errors.rules.yml
       - run: promtool test rules deploy/prometheus/superbot-errors.rules.test.yml
 
