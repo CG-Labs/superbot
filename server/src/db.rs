@@ -7450,7 +7450,7 @@ impl Db {
         self.c()
             .query_row(
                 "SELECT COUNT(*), COALESCE(SUM(u.last_login_at >= ?1 OR u.last_seen_at >= ?1 OR EXISTS (SELECT 1 FROM sessions s WHERE s.user_id = u.id AND s.last_seen_at >= ?1)), 0)
-                 FROM users u WHERE u.status = 'active' AND u.id != ?2",
+                 FROM users u WHERE u.status = 'active' AND u.kind = 'person' AND u.id != ?2",
                 params![since, crate::users::OPERATOR],
                 |r| Ok((r.get::<_, i64>(0)?.max(0) as u64, r.get::<_, i64>(1)?.max(0) as u64)),
             )
@@ -9713,6 +9713,8 @@ mod tests {
         assert_eq!(left, 0, "the token's session is gone");
         assert_eq!(db.people_active_since(now() - 90 * day), (2, 1), "the token was used 50 days ago");
         assert_eq!(db.people_active_since(now() - 30 * day), (2, 0));
+        db.create_service_account("ci", "", Role::Member, None, None, &seen.id, None).unwrap();
+        assert_eq!(db.people_active_since(now() - 30 * day), (2, 0), "a service account isn't a person");
     }
 
     #[test]
