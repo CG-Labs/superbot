@@ -311,9 +311,11 @@ jobs:
             --image "caddy=ghcr.io/${GITHUB_REPOSITORY,,}-caddy:$VERSION" \
             --image-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/docker.yml@refs/tags/v$VERSION"
       - name: Sign the bundle
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          f=dist/superbot-offline-$VERSION-${{ matrix.arch }}.tar.gz
+          f=dist/superbot-offline-$VERSION-$ARCH.tar.gz
           cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
           deploy/offline-bundle.sh verify "$f"
           cat "$f.sha256" >>"$GITHUB_STEP_SUMMARY"
