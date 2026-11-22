@@ -128,6 +128,194 @@ if (offline_unpack_bundle "$wrong" "$T/u") 2>"$T/arch.err"; then fail "the insta
 grep -q "This bundle is for $other" "$T/arch.err" || fail "the arch refusal didn't say why"
 ok "verify reads any arch's bundle; the installer takes only this host's"
 
+# Images, with stand-ins for skopeo, docker and cosign over a registry in $REG: an index with
+# this arch's image, another arch's and an attestation; a local image; a mirror to push to.
+command -v jq >/dev/null 2>&1 || fail "the image checks need jq"
+case $ARCH in x86_64) DARCH=amd64 OTHER_DARCH=arm64 ;; *) DARCH=arm64 OTHER_DARCH=amd64 ;; esac
+REG="$T/reg"
+mkdir -p "$REG/blobs" "$REG/refs" "$REG/local" "$T/img" "$T/stub"
+regkey() { printf '%s' "$1" | sha256sum | cut -c1-16; }
+blob() {
+  local d
+  d=sha256:$(sha256sum <"$1" | cut -c1-64)
+  cp "$1" "$REG/blobs/${d#sha256:}"
+  printf '%s\n' "$d"
+}
+make_image() {
+  local darch=$1 marker=$2 ld cd diff
+  mkdir -p "$T/img/$marker" && echo "$marker" >"$T/img/$marker/marker"
+  tar -C "$T/img/$marker" --owner=0 --group=0 --mtime=@0 -cf - marker | gzip -n >"$T/img/$marker.layer"
+  ld=$(blob "$T/img/$marker.layer")
+  diff=sha256:$(gzip -dc "$T/img/$marker.layer" | sha256sum | cut -c1-64)
+  printf '{"architecture":"%s","os":"linux","config":{},"rootfs":{"type":"layers","diff_ids":["%s"]}}' "$darch" "$diff" >"$T/img/$marker.config"
+  cd=$(blob "$T/img/$marker.config")
+  printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"%s","size":%d}]}' \
+    "$cd" "$(stat -c %s "$T/img/$marker.config")" "$ld" "$(stat -c %s "$T/img/$marker.layer")" >"$T/img/$marker.manifest"
+  blob "$T/img/$marker.manifest"
+}
+MINE=$(make_image "$DARCH" mine)
+THEIRS=$(make_image "$OTHER_DARCH" theirs)
+entry() { printf '{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","size":%d,"platform":{"architecture":"%s","os":"linux"}}' "$1" "$(stat -c %s "$REG/blobs/${1#sha256:}")" "$2"; }
+printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[%s,%s,{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","size":1,"platform":{"architecture":"unknown","os":"unknown"}}]}' \
+  "$(entry "$THEIRS" "$OTHER_DARCH")" "$(entry "$MINE" "$DARCH")" "$THEIRS" >"$T/img/index.json"
+INDEX=$(blob "$T/img/index.json")
+cp "$T/img/index.json" "$REG/refs/$(regkey reg.test/cg/superbot:1.0.0)"
+cp "$T/img/index.json" "$REG/refs/$(regkey reg.test/cg/unsigned:1.0.0)"
+printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[%s]}' "$(entry "$THEIRS" "$OTHER_DARCH")" >"$REG/refs/$(regkey reg.test/cg/elsewhere:1.0.0)"
+cp "$T/img/theirs.manifest" "$REG/refs/$(regkey reg.test/cg/single:1.0.0)"
+echo "reg.test/cg/superbot@$INDEX" >"$REG/signed"
+OWN=$(make_image "$DARCH" own)
+echo "$OWN" >"$REG/local.digest"
+echo "$DARCH" >"$REG/local/$(regkey own-image:2)"
+echo "$OTHER_DARCH" >"$REG/local/$(regkey foreign-image:2)"
+
+cat >"$T/stub/skopeo" <<'EOF'
+#!/usr/bin/env bash
+# skopeo over $STUB_REG. STUB_REWRITE=copy or push changes the manifest it writes.
+set -euo pipefail
+reg=$STUB_REG
+key() { printf '%s' "$1" | sha256sum | cut -c1-16; }
+manifest_of() { if [[ $1 == *@sha256:* ]]; then cat "$reg/blobs/${1##*@sha256:}"; else cat "$reg/refs/$(key "$1")"; fi; }
+rewrite() { if [[ ${STUB_REWRITE:-} == "$1" ]]; then jq -c '.annotations = {"changed": "yes"}'; else cat; fi; }
+case $1 in
+  inspect)
+    if [[ $2 == --raw ]]; then manifest_of "${3#docker://}"; exit; fi
+    cfg=$(manifest_of "${2#docker://}" | jq -r .config.digest)
+    jq '{Architecture: .architecture}' "$reg/blobs/${cfg#sha256:}" ;;
+  copy)
+    [[ $2 != --help ]] || { echo '      --preserve-digests'; exit; }
+    args=()
+    for a in "${@:2}"; do [[ $a == -* ]] || args+=("$a"); done
+    src=${args[0]} dest=${args[1]}
+    case $src in
+      docker://*) m=$(manifest_of "${src#docker://}") ;;
+      docker-archive:*) m=$(cat "$reg/blobs/$(sed 's/^sha256://' "$reg/local.digest")") ;;
+      oci-archive:*)
+        x=$(mktemp -d)
+        tar -xf "${src#oci-archive:}" -C "$x"
+        [[ -f $x/oci-layout && -f $x/manifest.json ]] || { echo "not an OCI archive with manifest.json" >&2; exit 1; }
+        d=$(jq -r '.manifests[0].digest' "$x/index.json")
+        cp "$x"/blobs/sha256/* "$reg/blobs/"
+        rewrite push <"$x/blobs/sha256/${d#sha256:}" >"$reg/refs/$(key "${dest#docker://}")"
+        rm -rf "$x"
+        exit ;;
+    esac
+    dir=${dest#oci:}
+    dir=${dir%:*}
+    tag=${dest##*:}
+    mkdir -p "$dir/blobs/sha256"
+    echo '{"imageLayoutVersion":"1.0.0"}' >"$dir/oci-layout"
+    for d in $(jq -r '.config.digest, .layers[].digest' <<<"$m"); do cp "$reg/blobs/${d#sha256:}" "$dir/blobs/sha256/"; done
+    printf '%s' "$m" | rewrite copy >"$dir/m"
+    d=$(sha256sum <"$dir/m" | cut -c1-64)
+    mv "$dir/m" "$dir/blobs/sha256/$d"
+    printf '{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:%s","size":%d,"annotations":{"org.opencontainers.image.ref.name":"%s"}}]}' \
+      "$d" "$(stat -c %s "$dir/blobs/sha256/$d")" "$tag" >"$dir/index.json" ;;
+  *) echo "stub skopeo: $*" >&2; exit 2 ;;
+esac
+EOF
+cat >"$T/stub/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+key() { printf '%s' "$1" | sha256sum | cut -c1-16; }
+case "$1 $2" in
+  "image inspect")
+    ref=${*: -1}
+    [[ -f $STUB_REG/local/$(key "$ref") ]] || exit 1
+    if [[ $3 == --format ]]; then cat "$STUB_REG/local/$(key "$ref")"; else echo '[{}]'; fi ;;
+  "save -o") : >"$3" ;;
+  "buildx imagetools") echo '{"spdxVersion":"SPDX-2.3"}' ;;
+  *) echo "stub docker: $*" >&2; exit 2 ;;
+esac
+EOF
+cat >"$T/stub/cosign" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $1 == verify ]] || { echo "stub cosign: $*" >&2; exit 2; }
+echo "$*" >>"$STUB_REG/cosign.log"
+grep -qx "$2" "$STUB_REG/signed" || { echo "no matching signatures" >&2; exit 1; }
+echo '[{"critical":{"identity":{"docker-reference":"reg.test/cg/superbot"}}}]'
+EOF
+chmod 0755 "$T/stub/"*
+stubbed() { STUB_REG=$REG PATH="$T/stub:$PATH" "$@"; }
+ibuild() { stubbed "$DIR/offline-bundle.sh" build --out "$1" --version "$VERSION" --bin-dir "$T/bin" --client-dir "$T/client" "${@:2}"; }
+
+ibuild "$T/iout" --image superbot=reg.test/cg/superbot:1.0.0 --image-identity https://ci.test/docker.yml@refs/tags/v1.0.0 >"$T/ibuild.log" 2>&1 \
+  || { cat "$T/ibuild.log" >&2; fail "a bundle with a signed image didn't build"; }
+IB="$T/iout/$TOP.tar.gz"
+rm -rf "$T/ix" && mkdir "$T/ix" && tar -xf "$IB" -C "$T/ix"
+I="$T/ix/$TOP"
+grep -qx "image_format=oci" "$I/MANIFEST" || fail "MANIFEST doesn't say the images are OCI archives"
+grep -qx "images=superbot" "$I/MANIFEST" || fail "MANIFEST doesn't list the image"
+! grep -q "^unsigned_images=" "$I/MANIFEST" || fail "a signed image was called unsigned"
+[[ "$(cat "$I/images/superbot.digest")" == "$MINE" ]] || fail "the bundled image isn't this arch's, with the registry's digest"
+grep -Fq "verify reg.test/cg/superbot@$INDEX --certificate-identity https://ci.test/docker.yml@refs/tags/v1.0.0" "$REG/cosign.log" \
+  || fail "cosign didn't check the index the tag named, with the identity given"
+for f in superbot.cosign.json superbot.sbom.spdx.json superbot.ref; do [[ -s "$I/images/$f" ]] || fail "no images/$f"; done
+mkdir "$T/ix/oci" && tar -xf "$I/images/superbot.tar" -C "$T/ix/oci"
+O="$T/ix/oci"
+[[ -f "$O/oci-layout" && -f "$O/blobs/sha256/${MINE#sha256:}" ]] || fail "the image isn't an OCI layout holding its manifest"
+[[ "$(jq -r '.manifests | length' "$O/index.json")" == 1 && "$(jq -r '.manifests[0].digest' "$O/index.json")" == "$MINE" ]] || fail "index.json doesn't name the one image"
+[[ "$(jq -r '.manifests[0].annotations["io.containerd.image.name"]' "$O/index.json")" == reg.test/cg/superbot:1.0.0 ]] || fail "index.json doesn't name the image for containerd"
+[[ "$(jq -r '.[0].RepoTags[0]' "$O/manifest.json")" == reg.test/cg/superbot:1.0.0 ]] || fail "manifest.json doesn't tag the image for docker load"
+for p in $(jq -r '.[0].Config, .[0].Layers[]' "$O/manifest.json"); do [[ -f "$O/$p" ]] || fail "manifest.json names $p, which isn't in the archive"; done
+[[ "$(sha256sum <"$O/$(jq -r '.[0].Config' "$O/manifest.json")" | cut -c1-64)" == "$(jq -r '.config.digest' "$T/img/mine.manifest" | cut -c8-)" ]] \
+  || fail "manifest.json's config isn't the image's"
+"$DIR/offline-bundle.sh" verify "$IB" >/dev/null || fail "a bundle with an image didn't verify"
+ok "an image is checked by the digest its tag names, and bundled for this arch as an OCI archive with the registry's digest that docker load also reads"
+
+ibuild "$T/iown" --image own=own-image:2 --allow-unsigned >"$T/iown.log" 2>&1 || { cat "$T/iown.log" >&2; fail "a local image didn't bundle"; }
+[[ "$(tar -xOf "$T/iown/$TOP.tar.gz" "$TOP/images/own.digest")" == "$OWN" ]] || fail "the local image wasn't bundled from docker save"
+grep -qx "unsigned_images=true" <<<"$(tar -xOf "$T/iown/$TOP.tar.gz" "$TOP/MANIFEST")" || fail "MANIFEST doesn't say an image is unsigned"
+ibuild "$T/iunsigned" --image u=reg.test/cg/unsigned:1.0.0 --allow-unsigned >/dev/null 2>&1 || fail "an unsigned registry image didn't bundle"
+[[ "$(tar -xOf "$T/iunsigned/$TOP.tar.gz" "$TOP/images/u.digest")" == "$MINE" ]] || fail "an unsigned registry image wasn't this arch's"
+ok "--allow-unsigned bundles a local image through docker save, or a registry's for this arch"
+
+irefused() {
+  local want=$1 why=$2 out
+  shift 2
+  rm -rf "$T/inope"
+  if out=$(ibuild "$T/inope" "$@" 2>&1); then fail "$why: bundled"; fi
+  grep -Fq -- "$want" <<<"$out" || { printf '%s\n' "$out" >&2; fail "$why: refused for another reason"; }
+  [[ ! -e "$T/inope" ]] || [[ -z "$(ls -A "$T/inope")" ]] || fail "$why: left a bundle behind"
+}
+irefused "isn't a tagged image reference" "an untagged reference" --image x=reg.test/cg/superbot
+irefused "isn't a tagged image reference" "a reference by digest" --image "x=reg.test/cg/superbot@$INDEX"
+irefused "isn't a tagged image reference" "an uppercase reference" --image x=Reg.test/cg/superbot:1.0.0
+irefused "isn't signed by" "an image with no signature from the identity" --image x=reg.test/cg/unsigned:1.0.0
+irefused "has no linux/$DARCH image" "an index without this arch" --image x=reg.test/cg/elsewhere:1.0.0 --allow-unsigned
+irefused "is a $OTHER_DARCH image, not $DARCH" "a single image of another arch" --image x=reg.test/cg/single:1.0.0 --allow-unsigned
+irefused "is a $OTHER_DARCH image, not $DARCH" "a local image of another arch" --image x=foreign-image:2 --allow-unsigned
+STUB_REWRITE=copy irefused "changed its digest" "a copy that changed the signed digest" --image superbot=reg.test/cg/superbot:1.0.0
+irefused "given twice" "the same name twice" --image x=own-image:2 --image x=own-image:2 --allow-unsigned
+ok "untagged, digest-only or odd references, unsigned images, other arches and changed digests are not bundled"
+
+push() { stubbed "$DIR/offline-bundle.sh" push "$@" 2>&1; }
+out=$(push "$IB" --registry mirror.test:5000/superbot) || { printf '%s\n' "$out" >&2; fail "push failed"; }
+[[ "$(cat "$REG/refs/$(regkey mirror.test:5000/superbot/superbot:1.0.0)")" == "$(cat "$REG/blobs/${MINE#sha256:}")" ]] || fail "the mirror didn't get the bundled manifest"
+grep -Fq "SUPERBOT_IMAGE=mirror.test:5000/superbot/superbot@$MINE" <<<"$out" || { printf '%s\n' "$out" >&2; fail "push didn't print the pinned Compose setting"; }
+out=$(STUB_REWRITE=push push "$IB" --registry mirror.test/changed) && fail "a push that changed the digest passed"
+grep -Fq "after the push, not the bundle's $MINE" <<<"$out" || { printf '%s\n' "$out" >&2; fail "the changed push failed for another reason"; }
+for bad in mirror "mirror.test/Upper" "https://mirror.test" "mirror.test//x" "-mirror.test"; do
+  out=$(push "$IB" --registry "$bad") && fail "--registry $bad was accepted"
+  grep -Fq "isn't HOST[:PORT][/path]" <<<"$out" || { printf '%s\n' "$out" >&2; fail "--registry $bad refused for another reason"; }
+done
+out=$(push "$IB") && fail "push without --registry passed"
+grep -q "needs --registry" <<<"$out" || fail "push without --registry didn't say why"
+out=$(push "$B" --registry mirror.test) && fail "push of a bundle without images passed"
+grep -q "has no images" <<<"$out" || fail "push of a bundle without images didn't say why"
+old=$(B=$IB remake oldimages sed -i '/^image_format=/d' MANIFEST)
+out=$(push "$old" --registry mirror.test) && fail "push of docker save images passed"
+grep -q "docker save archives" <<<"$out" || fail "push of docker save images didn't say why"
+cp "$T/img/index.json" "$REG/refs/$(regkey reg.test/other/unsigned:1.0.0)"
+ibuild "$T/iclash" --image a=reg.test/cg/unsigned:1.0.0 --image b=reg.test/other/unsigned:1.0.0 --allow-unsigned >/dev/null 2>&1 \
+  || fail "two images with the same last path part didn't bundle"
+out=$(push "$T/iclash/$TOP.tar.gz" --registry mirror.test/clash) && fail "two images pushed to one tag"
+grep -Fq "Images a and b would both be pushed to mirror.test/clash/unsigned:1.0.0: nothing pushed" <<<"$out" || { printf '%s\n' "$out" >&2; fail "the clash was refused for another reason"; }
+[[ ! -e "$REG/refs/$(regkey mirror.test/clash/unsigned:1.0.0)" ]] || fail "an image was pushed before the clash was found"
+grep -q "is for push" <<<"$("$DIR/offline-bundle.sh" verify "$IB" --registry mirror.test 2>&1 || true)" || fail "verify took --registry"
+ok "push copies images to a mirror with the bundle's digest, checks it there, prints Compose's pinned settings, and refuses bad registries, two images on one tag, and old bundles"
+
 # Versions: same or newer installs; older is refused.
 release="$T/offline-release"
 for installed in "$VERSION" 0.0.9 0.1.0-rc.1 0.1.0 9.9.9; do
