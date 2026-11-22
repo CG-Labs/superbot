@@ -6309,7 +6309,17 @@ impl Db {
     }
 
     /// Newest first (or oldest first with `oldest_first`), filtered, at most `limit`.
+    /// Rows that can't be read are left out; see `try_audit_events`.
     pub fn audit_events(&self, f: &audit::Filter, limit: i64, oldest_first: bool) -> Vec<AuditEvent> {
+        self.select_audit_events(f, limit, oldest_first, false).unwrap()
+    }
+
+    /// Like `audit_events`, but a row that can't be read is an error, not a gap.
+    pub fn try_audit_events(&self, f: &audit::Filter, limit: i64, oldest_first: bool) -> rusqlite::Result<Vec<AuditEvent>> {
+        self.select_audit_events(f, limit, oldest_first, true)
+    }
+
+    fn select_audit_events(&self, f: &audit::Filter, limit: i64, oldest_first: bool, strict: bool) -> rusqlite::Result<Vec<AuditEvent>> {
         use rusqlite::types::Value as V;
         let mut sql = String::from("SELECT * FROM audit_events WHERE 1 = 1");
         let mut args: Vec<V> = Vec::new();
@@ -6375,8 +6385,9 @@ impl Db {
         sql.push_str(if oldest_first { " ORDER BY id ASC LIMIT ?" } else { " ORDER BY id DESC LIMIT ?" });
         args.push(V::Integer(limit));
         let c = self.c();
-        let mut s = c.prepare(&sql).unwrap();
-        s.query_map(rusqlite::params_from_iter(args), audit_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c.prepare(&sql)?;
+        let rows = s.query_map(rusqlite::params_from_iter(args), audit_row)?;
+        if strict { rows.collect() } else { Ok(rows.filter_map(Result::ok).collect()) }
     }
 
     /// Whether per-user accounts were on, with their copies in order, when last saved (ADR 0037).

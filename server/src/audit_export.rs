@@ -258,15 +258,21 @@ async fn run(app: Arc<App>, x: Arc<Exporter>) {
     let host = hostname();
     let mut wait = FIRST_RETRY;
     loop {
-        let rows = app.db.audit_events(&Filter { after: Some(x.delivered()), ..Default::default() }, BATCH, true);
-        let Some(last) = rows.last().map(|e| e.id) else {
-            tokio::time::sleep(IDLE).await;
-            continue;
+        // A row that can't be read stops the export there, so it's never skipped.
+        let rows = app.db.try_audit_events(&Filter { after: Some(x.delivered()), ..Default::default() }, BATCH, true).map_err(|e| format!("couldn't read the audit log: {e}"));
+        let sent = match rows {
+            Ok(rows) => {
+                let Some(last) = rows.last().map(|e| e.id) else {
+                    tokio::time::sleep(IDLE).await;
+                    continue;
+                };
+                // Delivered only once the cursor is saved; if it can't be, the batch goes again.
+                out.send(&x.sink, &rows, &host).await.and_then(|()| app.db.set_audit_export_cursor(&x.sink.id, last).map_err(|e| format!("couldn't save the export cursor: {e}"))).map(|()| last)
+            }
+            Err(e) => Err(e),
         };
-        // Delivered only once the cursor is saved; if it can't be, the batch goes again.
-        let sent = out.send(&x.sink, &rows, &host).await.and_then(|()| app.db.set_audit_export_cursor(&x.sink.id, last).map_err(|e| format!("couldn't save the export cursor: {e}")));
         match sent {
-            Ok(()) => {
+            Ok(last) => {
                 if let Some((tries, since)) = x.delivered_to(last) {
                     log_info!("Audit export: {} is taking events again after {tries} failed tries.", x.sink.shown);
                     let e = Event::new(Actor::system("audit_export"), "audit.export_recovered").target("audit", "export");

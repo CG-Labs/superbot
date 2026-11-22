@@ -264,3 +264,28 @@ async fn syslog_sinks_get_rfc_5424_with_octet_counting() {
     assert_eq!((msg["action"].as_str(), msg["schema"].as_str()), (Some("test.syslog"), Some("superbot.audit.v1")));
     until("cursor saved", || app.audit_export.get().unwrap().delivered() >= head).await;
 }
+
+#[tokio::test]
+async fn the_siem_export_stops_at_a_row_it_cannot_read() {
+    let app = runner::test_app();
+    let record = |action: &str| app.db.try_record(&Event::new(Actor::system("test"), action)).unwrap();
+    record("test.before");
+    let bad = record("test.unreadable");
+    record("test.after");
+    app.db.execute_raw("DROP TRIGGER audit_events_no_update").unwrap();
+    app.db.execute_raw(&format!("UPDATE audit_events SET actor_name = x'00' WHERE id = {bad}")).unwrap();
+    let (url, got) = collector(0).await;
+    export_to(&app, &[("AUDIT_EXPORT", &url), ("AUDIT_EXPORT_START", "all")]);
+    let x = app.audit_export.get().unwrap();
+    until("failing", || x.view(app.db.audit_head())["failing"] == true).await;
+    assert!(x.delivered() < bad, "the cursor stops before it, never past it");
+    let ids = |got: &Collected| got.lock().unwrap().1.iter().map(|l| serde_json::from_str::<Value>(l).unwrap()["id"].as_i64().unwrap()).collect::<Vec<_>>();
+    assert!(ids(&got).iter().all(|&id| id < bad), "{:?}", ids(&got));
+
+    // Once it reads again, it goes out in order and the export recovers.
+    app.db.execute_raw(&format!("UPDATE audit_events SET actor_name = NULL WHERE id = {bad}")).unwrap();
+    until("recovery event", || app.db.audit_events(&Default::default(), 1000, false).iter().any(|e| e.action == "audit.export_recovered")).await;
+    until("everything delivered", || x.delivered() >= app.db.audit_head()).await;
+    let sent = ids(&got);
+    assert!(sent.contains(&bad) && sent.windows(2).all(|w| w[0] < w[1]), "{sent:?}");
+}

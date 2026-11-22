@@ -76,6 +76,7 @@ Events are scrubbed when they are recorded: passwords, tokens, message text and 
 
 - Events go in id order. The last delivered id is saved, so after a restart or an outage botd carries on from there. Delivery is at least once: de-duplicate on `host` and `id`.
 - A failure is retried with backoff from 1 second up to 5 minutes, for as long as it takes. Events wait in the database meanwhile, and retention (`AUDIT_RETENTION_DAYS`) never deletes an event the sink hasn't taken, so a long outage grows the table instead of losing events.
+- An event botd can't read from the database (a damaged row) is a failure too: export stops before it and retries, rather than skip it. `botctl audit verify` names the row.
 - After 3 failures in a row botd logs a warning and records `audit.export_failing`; `audit.export_recovered` follows when delivery resumes.
 - `botctl audit siem` (or `GET /api/audit/siem`) shows the sink, the last delivered id, how many are pending, whether it's failing, and the last error. With metrics on, `/metrics` has `superbot_audit_export_pending_events`, `superbot_audit_export_failing` and `superbot_audit_export_last_delivery_timestamp_seconds`. Alert on `superbot_audit_export_failing == 1` or a growing pending count.
 
