@@ -236,6 +236,26 @@ struct FileCfg {
 
 const MAX_FALLBACKS: usize = 3;
 
+/// Why a model provider's `http://` URL is refused (ADR 0097).
+pub const PLAIN_HTTP: &str =
+    "must use https://: plain http:// would send prompts and the API key unencrypted, so it is allowed only to this computer (localhost, 127.0.0.0/8, ::1)";
+
+/// Whether prompts and keys sent to `u` are encrypted on the wire or never leave this
+/// computer: `https`, or `http` to a loopback address. Only an IP literal or the name
+/// `localhost` counts as loopback; any other name could resolve anywhere.
+pub fn encrypted_or_loopback(u: &url::Url) -> bool {
+    match u.scheme() {
+        "https" => true,
+        "http" => match u.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
 /// A named endpoint, checked: its URL is handed to the harness and its key secret is
 /// read from the secrets store, so neither may be anything else.
 fn endpoint(name: &str, e: EndpointCfg) -> Result<Endpoint, String> {
@@ -253,8 +273,11 @@ fn endpoint(name: &str, e: EndpointCfg) -> Result<Endpoint, String> {
             && u.fragment().is_none()
     });
     let ok = parsed.is_some() && url.len() <= 200 && !url.chars().any(|c| c.is_whitespace() || c.is_control());
-    if !ok {
+    let Some(parsed) = parsed.filter(|_| ok) else {
         return Err(at(format!("baseUrl \"{url}\" must be an http(s) URL with a host, of up to 200 characters, without a user, password, query or fragment")));
+    };
+    if !encrypted_or_loopback(&parsed) {
+        return Err(at(format!("baseUrl \"{url}\" {PLAIN_HTTP} (ADR 0097)")));
     }
     let key = e.key_secret.trim().to_string();
     crate::secrets::check_name(&key).map_err(|e| at(format!("keySecret: {e}")))?;
@@ -863,6 +886,62 @@ mod tests {
         assert!(route(r#"{"harness":"hermes","fallback":[{"provider":"p","model":"m"},{"provider":"p","model":"m"}]}"#).contains("twice"));
         let four = r#"{"provider":"p","model":"a"},{"provider":"p","model":"b"},{"provider":"p","model":"c"},{"provider":"p","model":"d"}"#;
         assert!(route(&format!(r#"{{"harness":"hermes","fallback":[{four}]}}"#)).contains("at most 3"));
+    }
+
+    #[test]
+    fn providers_are_reached_over_https_or_loopback_only() {
+        let parse = |url: &str| Tiers::parse(&format!(r#"{{"providers":{{"local":{{"protocol":"openai-chat","baseUrl":"{url}","keySecret":"K"}}}},"tiers":[{{"name":"a","routes":"any"}}]}}"#), None);
+        for url in [
+            "https://api.openai.example/v1",
+            "HTTPS://API.OPENAI.EXAMPLE/v1",
+            "https://10.0.0.5:8443",
+            "http://127.0.0.1:11434/v1",
+            "http://127.8.9.10",
+            "http://localhost:8080/v1",
+            "HTTP://LocalHost:8080",
+            "http://[::1]:8000/v1",
+            "http://[0:0:0:0:0:0:0:1]",
+            // The URL parser reads these as 127.0.0.1.
+            "http://2130706433",
+            "http://0x7f.0.0.1",
+        ] {
+            assert!(parse(url).is_ok(), "{url}: {:?}", parse(url).err());
+        }
+        for url in [
+            "http://api.openai.example/v1",
+            "HTTP://API.OPENAI.EXAMPLE",
+            "http://10.0.0.5:8000",
+            "http://192.168.1.20",
+            "http://172.16.0.1",
+            "http://169.254.169.254",
+            "http://0.0.0.0:8080",
+            "http://[::]:8080",
+            "http://[fd00::1]",
+            "http://[::ffff:127.0.0.1]",
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://localhost.",
+            "http://evil.example#@127.0.0.1",
+            "http://evil.example?@localhost",
+        ] {
+            let e = parse(url).unwrap_err();
+            assert!(e.starts_with("provider \"local\": baseUrl") && (e.contains("https://") || e.contains("without a user")), "{url}: {e}");
+        }
+        // Userinfo never names the host, and is refused whatever the scheme.
+        for url in ["http://127.0.0.1@evil.example", "http://localhost:x@evil.example", "https://127.0.0.1@evil.example", "http://user@127.0.0.1"] {
+            assert!(parse(url).unwrap_err().contains("without a user, password"), "{url}");
+        }
+        let e = parse("http://models.internal.example:8000/v1").unwrap_err();
+        assert!(e.contains("must use https://") && e.contains("unencrypted") && e.contains("ADR 0097"), "{e}");
+
+        // From a file: the error names the file and the provider, and botd won't start.
+        let dir = crate::db::temp_path("tiers-http");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tiers.json");
+        std::fs::write(&path, r#"{"providers":{"lan":{"protocol":"openai-chat","baseUrl":"http://192.168.1.20:8000/v1","keySecret":"K"}},"tiers":[{"name":"a","routes":"any"}]}"#).unwrap();
+        let p = path.display().to_string();
+        let e = Tiers::from_env(|k| if k == "TIERS_FILE" { p.clone() } else { String::new() }).unwrap_err();
+        assert!(e.starts_with(&format!("TIERS_FILE {p}: provider \"lan\": baseUrl \"http://192.168.1.20:8000/v1\" must use https://")), "{e}");
     }
 
     #[test]

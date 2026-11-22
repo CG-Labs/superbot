@@ -208,6 +208,11 @@ pub trait Adapter: Send + Sync {
     fn supports_provider(&self) -> bool {
         false
     }
+    /// Checks the server settings this adapter reads from botd's environment, at startup:
+    /// botd refuses to start on an error.
+    fn check_env(&self, _get: &dyn Fn(&str) -> String) -> Result<(), String> {
+        Ok(())
+    }
     /// Whether `error` says the harness won't resume its session with this run's
     /// settings, as when the owner's tier moved the Bot to another route. The run then
     /// starts a fresh session rather than run on the old route.

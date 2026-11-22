@@ -170,6 +170,25 @@ impl Adapter for Hermes {
         true
     }
 
+    /// `SUPERBOT_HERMES_BASE_URL` gets the prompts and the provider key, so it is held to
+    /// the tiers file's rule for endpoints (ADR 0097).
+    fn check_env(&self, get: &dyn Fn(&str) -> String) -> Result<(), String> {
+        let raw = get("SUPERBOT_HERMES_BASE_URL");
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Ok(());
+        }
+        let url = url::Url::parse(raw)
+            .ok()
+            .filter(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty()) && u.username().is_empty() && u.password().is_none())
+            .ok_or("SUPERBOT_HERMES_BASE_URL must be an http(s) URL with a host, without a user or password")?;
+        if !crate::tiers::encrypted_or_loopback(&url) {
+            // Only the origin: the rest of the URL may carry a token.
+            return Err(format!("SUPERBOT_HERMES_BASE_URL ({}) {} (ADR 0097)", url.origin().ascii_serialization(), crate::tiers::PLAIN_HTTP));
+        }
+        Ok(())
+    }
+
     /// Hermes keeps a session on the provider and model it started with.
     fn resume_refused(&self, error: &str) -> bool {
         error.contains("creation overrides are unsupported on resume")
@@ -431,6 +450,27 @@ mod tests {
         let c: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(c.get("hooks").is_none(), "{c}");
         let _ = std::fs::remove_dir_all(&i.state_dir);
+    }
+
+    #[test]
+    fn the_servers_base_url_is_https_or_loopback() {
+        let check = |v: &str| {
+            let v = v.to_string();
+            Hermes::default().check_env(&move |k| if k == "SUPERBOT_HERMES_BASE_URL" { v.clone() } else { String::new() })
+        };
+        for ok in ["", "  ", "https://openrouter.example/api/v1", "http://127.0.0.1:8080/v1", "http://localhost:11434/v1", "http://[::1]:8000"] {
+            assert!(check(ok).is_ok(), "{ok}: {:?}", check(ok).err());
+        }
+        for plain in ["http://models.example/v1", "http://10.1.2.3:8000/v1", "http://[fd00::1]/v1"] {
+            let e = check(plain).unwrap_err();
+            assert!(e.starts_with("SUPERBOT_HERMES_BASE_URL (http://") && e.contains("must use https://") && e.contains("ADR 0097"), "{plain}: {e}");
+        }
+        let e = check("http://models.example/v1/sk-secret").unwrap_err();
+        assert!(!e.contains("sk-secret"), "only the origin is said: {e}");
+        for bad in ["models.example", "ftp://models.example", "http://127.0.0.1@evil.example", "https://user:sk-pw@models.example"] {
+            let e = check(bad).unwrap_err();
+            assert!(e.contains("must be an http(s) URL") && !e.contains("sk-pw"), "{bad}: {e}");
+        }
     }
 
     fn endpoint(name: &str, protocol: Protocol, key: &str) -> crate::tiers::Endpoint {
