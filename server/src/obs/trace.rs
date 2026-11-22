@@ -1010,7 +1010,8 @@ mod tests {
                     let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
                     let partial = body.contains("\"partial\"");
                     seen.lock().unwrap().push((auth, serde_json::from_str(&body).unwrap()));
-                    if partial { r#"{"partialSuccess":{"rejectedSpans":"2","errorMessage":"too old"}}"# } else { "{}" }
+                    // One rejected, so the counts hold whether "partial" goes alone or batched.
+                    if partial { r#"{"partialSuccess":{"rejectedSpans":"1","errorMessage":"too old"}}"# } else { "{}" }
                 }
             }),
         );
@@ -1043,7 +1044,7 @@ mod tests {
         t.flush(Duration::from_secs(5)).await;
         let mut out = String::new();
         t.render(&mut out);
-        assert!(out.contains(r#"superbot_trace_spans_total{outcome="sent"} 2"#) && out.contains(r#"superbot_trace_spans_total{outcome="failed"} 2"#), "{out}");
+        assert!(out.contains(r#"superbot_trace_spans_total{outcome="sent"} 3"#) && out.contains(r#"superbot_trace_spans_total{outcome="failed"} 1"#), "{out}");
 
         // A collector that's down: counted as failed, never retried into memory.
         let down = settings(&[("TRACES_OTLP_ENDPOINT", "http://127.0.0.1:9/v1/traces")]).unwrap();
