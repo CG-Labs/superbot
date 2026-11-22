@@ -164,7 +164,7 @@ async fn the_owner_enrols_at_sign_in_once_admins_need_a_second_factor() {
 async fn wrong_codes_are_limited_per_challenge_and_per_user() {
     let (port, _, basic, _) = serve(|_| {}).await;
     let (_, other_admin) = user_with(port, &basic, "admin2@example.com", "admin").await;
-    let owner = bearer(&parse(&call(port, "POST", "/api/auth/login", "", &json!({ "password": PW.as_str() }).to_string()).await.1)["token"].as_str().unwrap().to_string());
+    let owner = bearer(parse(&call(port, "POST", "/api/auth/login", "", &json!({ "password": PW.as_str() }).to_string()).await.1)["token"].as_str().unwrap());
     let (key, _) = enrol(port, &owner).await;
     // With the owner enrolled, the password alone stops working over HTTP Basic, policy or not.
     assert_eq!(call(port, "GET", "/api/state", &basic, "").await.0, 401);
