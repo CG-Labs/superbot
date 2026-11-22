@@ -11,13 +11,18 @@
 //! GitHub is OAuth 2 without an ID token, and Apple posts its answer (ADR 0018); both
 //! end in the same callback, checks, and sessions as the rest.
 //!
-//! SAML IdPs sign in through an OIDC broker (ADR 0020): botd never parses SAML itself.
+//! SAML IdPs sign in either through an OIDC broker (ADR 0020), or natively (ADR 0127): botd
+//! is the service provider, sends an AuthnRequest with the HTTP-Redirect binding, and checks
+//! the signed response the IdP posts to `/acs` (`saml_sp`, `xmldsig`). Both end in the same
+//! identities, checks, and sessions as the rest.
 
 pub mod apple;
 mod github;
 pub mod jwt;
 mod provider;
 mod saml;
+pub(crate) mod saml_sp;
+pub(crate) mod xmldsig;
 
 use crate::audit::{Actor, ActorKind, Event, Outcome, Source, Who};
 use crate::db::{self, Identity, JitError, NewIdentity, User};
@@ -31,7 +36,8 @@ use axum::response::{Html, IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use provider::Claims;
-pub use provider::{ClaimMap, ENTRA_AUTHORITY, GOOGLE_ISSUER, Kind, Provider, domain, guid, secure_url};
+pub use provider::{ClaimMap, ENTRA_AUTHORITY, GOOGLE_ISSUER, IdpSource, Kind, Provider, domain, guid, secure_url};
+use saml_sp::{Refused, Sp};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -48,6 +54,11 @@ const MAX_PENDING_PER_IP: usize = 20;
 pub const HANDOFF_PREFIX: &str = "sbh_";
 /// `__Host-` (so Path=/, no Domain): a sibling subdomain can't plant its own binder.
 const BINDER: &str = "__Host-superbot_sso";
+/// Native SAML's binder. The IdP posts the response cross-site, which carries no `SameSite=Lax`
+/// cookie, so this one is `SameSite=None`. It only ties the post to the browser that started.
+const SAML_BINDER: &str = "__Host-superbot_saml";
+/// Where an IdP's metadata imported with botctl is kept (the `settings` table), by provider id.
+const SAML_METADATA_SETTING: &str = "sso_saml_idp_metadata_";
 
 #[derive(Clone)]
 enum Return {
@@ -100,6 +111,8 @@ pub struct Sso {
     app_redirects: Vec<String>,
     pending: Mutex<HashMap<String, Pending>>,
     handoffs: Mutex<HashMap<String, Handoff>>,
+    /// SAML assertions already used (hash of issuer and ID), until they expire.
+    seen: Mutex<HashMap<String, i64>>,
     http: OnceLock<reqwest::Client>,
     /// Least time between JWKS fetches for a key id we don't know.
     pub refresh_gap: Duration,
@@ -114,6 +127,7 @@ impl Default for Sso {
             app_redirects: Vec::new(),
             pending: Mutex::default(),
             handoffs: Mutex::default(),
+            seen: Mutex::default(),
             http: OnceLock::new(),
             refresh_gap: Duration::from_secs(60),
         }
@@ -162,6 +176,10 @@ fn no_store(mut r: Response) -> Response {
 
 fn binder_cookie(value: &str, max_age_s: i64) -> HeaderValue {
     HeaderValue::from_str(&format!("{BINDER}={value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={max_age_s}")).unwrap()
+}
+
+fn saml_binder_cookie(value: &str, max_age_s: i64) -> HeaderValue {
+    HeaderValue::from_str(&format!("{SAML_BINDER}={value}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age={max_age_s}")).unwrap()
 }
 
 fn read_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -225,7 +243,7 @@ impl Sso {
             if sso.provider(&id).is_some() {
                 return Err(format!("SSO_PROVIDERS lists {id} twice"));
             }
-            sso.providers.push(Arc::new(parse_provider(&id, &var, &list)?));
+            sso.providers.push(Arc::new(parse_provider(&id, &sso.public_url, &var, &list)?));
         }
         Ok(sso)
     }
@@ -255,9 +273,53 @@ impl Sso {
         Some(self.public_url.as_str()).filter(|u| !u.is_empty())
     }
 
-    /// The redirect URI to register at the IdP for provider `id`.
+    /// The redirect URI to register at the IdP for provider `id` (native SAML: its ACS URL).
     pub fn callback_url(&self, id: &str) -> String {
-        self.redirect_uri(id)
+        match self.provider(id).filter(|p| p.saml_sp()) {
+            Some(_) => self.acs_url(id),
+            None => self.redirect_uri(id),
+        }
+    }
+
+    /// Native SAML: where the IdP posts its response (the AssertionConsumerService).
+    pub fn acs_url(&self, id: &str) -> String {
+        format!("{}/api/auth/sso/{id}/acs", self.public_url)
+    }
+
+    /// Native SAML: our SP metadata, which is also our default entity ID.
+    pub fn sp_metadata_url(&self, id: &str) -> String {
+        sp_metadata_url(&self.public_url, id)
+    }
+
+    /// Loads IdP metadata imported with botctl, at startup.
+    pub fn load_saved(&self, db: &db::Db) {
+        for p in self.providers.iter().filter(|p| matches!(&p.kind, Kind::SamlSp { source: IdpSource::Saved, .. })) {
+            let Kind::SamlSp { entity_id, .. } = &p.kind else {
+                continue;
+            };
+            let Some(xml) = db.setting(&format!("{SAML_METADATA_SETTING}{}", p.id)) else {
+                continue;
+            };
+            match saml_sp::parse_idp_metadata(&xml, entity_id) {
+                Ok(m) => p.set_idp(m),
+                Err(e) => crate::obs::log::log_warn!("SSO {}: the imported IdP metadata no longer reads: {e}. Import it again: botctl sso saml {} import", p.id, p.id),
+            }
+        }
+    }
+
+    /// A SAML assertion's first use. Err: it was used before, or too many are held.
+    fn first_use(&self, key: &str, until: i64, at: i64) -> Result<(), &'static str> {
+        let mut m = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        m.retain(|_, until| *until > at);
+        let k = hash(key);
+        if m.contains_key(&k) {
+            return Err("replayed");
+        }
+        if m.len() >= MAX_PENDING {
+            return Err("sso_too_many");
+        }
+        m.insert(k, until);
+        Ok(())
     }
 
     /// Remembers a sign-in in progress. False when there are too many.
@@ -284,6 +346,10 @@ impl Sso {
     }
 }
 
+fn sp_metadata_url(public_url: &str, id: &str) -> String {
+    format!("{public_url}/api/auth/sso/{id}/metadata")
+}
+
 type Var<'a> = dyn Fn(&str) -> Option<String> + 'a;
 type List<'a> = dyn Fn(&str) -> Vec<String> + 'a;
 
@@ -291,7 +357,7 @@ const TYPES: [&str; 6] = ["entra", "google", "oidc", "apple", "github", "saml"];
 
 /// Settings that only mean something for some types. Set on another, they would look like
 /// a restriction that isn't there, so they are refused.
-const ONLY_FOR: [(&str, &[&str]); 15] = [
+const ONLY_FOR: [(&str, &[&str]); 20] = [
     ("TENANT", &["entra"]),
     ("ALLOWED_TENANTS", &["entra"]),
     ("AUTHORITY", &["entra"]),
@@ -307,12 +373,21 @@ const ONLY_FOR: [(&str, &[&str]); 15] = [
     ("API_URL", &["github"]),
     ("IDP_ALIAS", &["saml"]),
     ("IDP_ENTITY_ID", &["saml"]),
+    ("IDP_METADATA_URL", &["saml"]),
+    ("IDP_METADATA_FILE", &["saml"]),
+    ("SP_ENTITY_ID", &["saml"]),
+    ("EMAIL_ATTRIBUTE", &["saml"]),
+    ("NAME_ATTRIBUTE", &["saml"]),
 ];
+
+/// The SAML bridge's settings (with `ISSUER`), and native SAML's (without), so each refuses the other's.
+const SAML_BRIDGE_ONLY: [&str; 6] = ["CLIENT_ID", "IDP_ALIAS", "SCOPES", "SUBJECT_CLAIM", "EMAIL_CLAIM", "NAME_CLAIM"];
+const SAML_NATIVE_ONLY: [&str; 5] = ["IDP_METADATA_URL", "IDP_METADATA_FILE", "SP_ENTITY_ID", "EMAIL_ATTRIBUTE", "NAME_ATTRIBUTE"];
 
 /// Claims people or their admins can change, so they can't be the subject.
 const MUTABLE_CLAIMS: [&str; 9] = ["email", "preferred_username", "upn", "unique_name", "name", "nickname", "given_name", "family_name", "phone_number"];
 
-fn parse_provider(id: &str, var: &Var, list: &List) -> Result<Provider, String> {
+fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<Provider, String> {
     let key = |k: &str| format!("SSO_{}_{k}", id.to_ascii_uppercase());
     let preset = match id {
         "entra" | "google" | "apple" | "github" => id,
@@ -325,7 +400,8 @@ fn parse_provider(id: &str, var: &Var, list: &List) -> Result<Provider, String> 
         return Err(format!("{} is only for {}={}", key(k), key("TYPE"), only.join(" or ")));
     }
     let domains = |k: &str| -> Result<Vec<String>, String> { list(&key(k)).iter().map(|d| domain(d).ok_or_else(|| format!("{}: {d} is not a domain like example.com", key(k)))).collect() };
-    let client_id = var(&key("CLIENT_ID")).ok_or_else(|| format!("{} is required", key("CLIENT_ID")))?;
+    let native_saml = ty == "saml" && var(&key("ISSUER")).is_none();
+    let client_id = if native_saml { String::new() } else { var(&key("CLIENT_ID")).ok_or_else(|| format!("{} is required", key("CLIENT_ID")))? };
     let jit_role = match var(&key("JIT_ROLE")).map(|r| r.to_ascii_lowercase()).as_deref() {
         None | Some("off") => None,
         Some(r) => Some(Role::parse(r).ok_or_else(|| format!("{} must be off, readonly, member, or admin", key("JIT_ROLE")))?),
@@ -402,7 +478,41 @@ fn parse_provider(id: &str, var: &Var, list: &List) -> Result<Provider, String> 
             }
             (Kind::Oidc { issuer, map: claim_map("sub")?, allowed_domains }, id)
         }
+        "saml" if native_saml => {
+            if let Some(k) = SAML_BRIDGE_ONLY.iter().find(|k| var(&key(k)).is_some()) {
+                return Err(format!("{} is only for the SAML bridge (with {}). Native SAML reads the IdP's metadata instead", key(k), key("ISSUER")));
+            }
+            let entity_id = var(&key("IDP_ENTITY_ID")).ok_or_else(|| format!("{} is required: the SAML IdP's entity ID, as in its metadata", key("IDP_ENTITY_ID")))?;
+            let entity_id = saml::entity_id(&entity_id).ok_or_else(|| format!("{}: {entity_id} is not an entity ID (a URI, like http://www.okta.com/exk1abc)", key("IDP_ENTITY_ID")))?;
+            let source = match (var(&key("IDP_METADATA_URL")), var(&key("IDP_METADATA_FILE"))) {
+                (Some(_), Some(_)) => return Err(format!("Set {} or {}, not both", key("IDP_METADATA_URL"), key("IDP_METADATA_FILE"))),
+                (Some(u), None) if secure_url(&u) => IdpSource::Url(u),
+                (Some(_), None) => return Err(format!("{} must be an https URL", key("IDP_METADATA_URL"))),
+                (None, Some(f)) => IdpSource::File(f),
+                (None, None) => IdpSource::Saved,
+            };
+            let sp_entity_id = match var(&key("SP_ENTITY_ID")) {
+                Some(e) => saml::entity_id(&e).ok_or_else(|| format!("{}: {e} is not an entity ID (a URI)", key("SP_ENTITY_ID")))?,
+                None => sp_metadata_url(public_url, id),
+            };
+            let attribute = |k: &str| -> Result<Option<String>, String> {
+                match var(&key(k)) {
+                    Some(a) if a.len() <= 256 && a.bytes().all(|b| b.is_ascii_graphic()) => Ok(Some(a)),
+                    Some(_) => Err(format!("{} must be an attribute name", key(k))),
+                    None => Ok(None),
+                }
+            };
+            let attributes = saml_sp::Attributes { email: attribute("EMAIL_ATTRIBUTE")?, name: attribute("NAME_ATTRIBUTE")? };
+            let allowed_domains = domains("ALLOWED_DOMAINS")?;
+            if jit_role.is_some() && allowed_domains.is_empty() {
+                return Err(format!("{} without {} would let anyone SAML IdP {entity_id} signs in get an account: list your email domains, or link people instead", key("JIT_ROLE"), key("ALLOWED_DOMAINS")));
+            }
+            (Kind::SamlSp { entity_id, sp_entity_id, source, attributes, allowed_domains }, saml::LABEL)
+        }
         "saml" => {
+            if let Some(k) = SAML_NATIVE_ONLY.iter().find(|k| var(&key(k)).is_some()) {
+                return Err(format!("{} is only for native SAML (without {})", key(k), key("ISSUER")));
+            }
             let issuer = var(&key("ISSUER")).ok_or_else(|| format!("{} is required: the OIDC issuer of the broker that speaks SAML to your IdP, like https://sso.example.com/realms/superbot", key("ISSUER")))?;
             if !secure_url(&issuer) {
                 return Err(format!("{} must be an https URL", key("ISSUER")));
@@ -475,7 +585,12 @@ fn parse_provider(id: &str, var: &Var, list: &List) -> Result<Provider, String> 
         t => return Err(format!("{}: unknown type {t} ({})", key("TYPE"), TYPES.join(", "))),
     };
     let label = var(&key("LABEL")).map(|l| crate::audit::clip(&l, 40)).unwrap_or_else(|| label.to_string());
-    Ok(Provider::new(id, &label, kind, &client_id, &scopes, jit_role))
+    let p = Provider::new(id, &label, kind, &client_id, &scopes, jit_role);
+    if let Kind::SamlSp { source: IdpSource::File(path), entity_id, .. } = &p.kind {
+        let xml = std::fs::read_to_string(path).map_err(|e| format!("{}: {path}: {e}", key("IDP_METADATA_FILE")))?;
+        p.set_idp(saml_sp::parse_idp_metadata(&xml, entity_id).map_err(|e| format!("{}: {e}", key("IDP_METADATA_FILE")))?);
+    }
+    Ok(p)
 }
 
 // Audit
@@ -495,7 +610,23 @@ pub(crate) fn idp_type(a: &Auth, provider: &str) -> Option<&'static str> {
 }
 
 /// Failures anyone can cause without the IdP's help, by opening a callback URL.
-const UNVOUCHED: [&str; 5] = ["unknown_state", "wrong_provider", "binder_mismatch", "idp_error", "missing_code"];
+/// Native SAML's are the ones before the IdP's signature was checked.
+const UNVOUCHED: [&str; 14] = [
+    "unknown_state",
+    "wrong_provider",
+    "binder_mismatch",
+    "idp_error",
+    "missing_code",
+    "missing_response",
+    "bad_response",
+    "missing_assertion",
+    "encrypted_assertion",
+    "unsigned",
+    "bad_signature",
+    "wrapped",
+    "bad_algorithm",
+    "weak_algorithm",
+];
 
 /// A failed SSO sign-in. The ones in UNVOUCHED are throttled like other failed sign-ins.
 fn failed(a: &Auth, source: &Source, provider: &str, reason: &str, c: Option<&Claims>, extra: Value) {
@@ -576,6 +707,8 @@ pub async fn start(
         }
     };
     let (state, nonce, verifier, binder) = (random(), random(), random(), random());
+    // Native SAML: the AuthnRequest's ID, which the response's InResponseTo must name.
+    let nonce = if p.saml_sp() { saml_sp::request_id() } else { nonce };
     let ret = match ret {
         Return::Cookie { .. } => Return::Cookie { binder: hash(&binder) },
         r => r,
@@ -586,6 +719,15 @@ pub async fn start(
         return no_store(ret.fail("sso_too_many"));
     }
     let mut url = Url::parse(&endpoint).expect("checked by secure_url");
+    if let Kind::SamlSp { sp_entity_id, .. } = &p.kind {
+        let request = saml_sp::authn_request(&Sp { entity_id: sp_entity_id, acs: &sso.acs_url(&id) }, &nonce, &endpoint, at);
+        url.query_pairs_mut().extend_pairs([("SAMLRequest", saml_sp::redirect_encode(&request).as_str()), ("RelayState", &state)]);
+        let mut res = see(url.as_str());
+        if matches!(ret, Return::Cookie { .. }) {
+            res.headers_mut().insert(header::SET_COOKIE, saml_binder_cookie(&binder, PENDING_TTL_MS / 1000));
+        }
+        return no_store(res);
+    }
     url.query_pairs_mut().extend_pairs([
         ("client_id", p.client_id.as_str()),
         ("response_type", "code"),
@@ -679,7 +821,7 @@ async fn finish(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, q: &Ha
     if a.limiter.blocked(&ip, at).is_some() {
         return ret.fail("sso_too_many");
     }
-    let mut claims = match p.sign_in(sso.http(), code, &sso.redirect_uri(id), &pending.verifier, &pending.nonce, sso.refresh_gap).await {
+    let claims = match p.sign_in(sso.http(), code, &sso.redirect_uri(id), &pending.verifier, &pending.nonce, sso.refresh_gap).await {
         Ok(c) => c,
         Err(e) => {
             a.limiter.fail(&ip, at);
@@ -688,6 +830,14 @@ async fn finish(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, q: &Ha
             return ret.fail(if matches!(e.0, "wrong_domain" | "email_unverified" | "wrong_org" | "not_brokered") { "sso_wrong_account" } else { "sso_failed" });
         }
     };
+    complete(a, app, source, id, p, &pending, claims, at)
+}
+
+/// The end of every sign-in, once the IdP vouched for `claims`: the linked (or just-in-time)
+/// user, if active, gets a session cookie, or a one-time code for the app that started.
+#[allow(clippy::too_many_arguments)]
+fn complete(a: &Auth, app: &AppState, source: &Source, id: &str, p: &Provider, pending: &Pending, mut claims: Claims, at: i64) -> Response {
+    let (sso, ret) = (&a.sso, &pending.ret);
     if claims.name.is_none() {
         claims.name = pending.name.clone();
     }
@@ -719,6 +869,150 @@ async fn finish(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, q: &Ha
             see(&with_query(redirect, &[("code", &code), ("state", state)]))
         }
     }
+}
+
+/// `POST /api/auth/sso/{id}/acs`: the IdP posts its SAML response here (HTTP-POST binding).
+pub async fn acs(Extension(a): Extension<Arc<Auth>>, Extension(source): Extension<Source>, headers: HeaderMap, Path(id): Path<String>, Form(f): Form<HashMap<String, String>>) -> Response {
+    let mut res = finish_saml(&a, &source, &headers, &id, &f).await;
+    res.headers_mut().append(header::SET_COOKIE, saml_binder_cookie("", 0));
+    no_store(res)
+}
+
+async fn finish_saml(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, f: &HashMap<String, String>) -> Response {
+    let (sso, (ip, at)) = (&a.sso, (source.ip.clone().unwrap_or_default(), db::now()));
+    let Some(app) = a.app.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    // Only answers to a sign-in this server started: IdP-initiated posts have no RelayState of ours.
+    let Some(pending) = f.get("RelayState").and_then(|s| sso.take(s, at)) else {
+        a.limiter.fail(&ip, at);
+        failed(a, source, id, "unknown_state", None, json!({}));
+        return see("/login?error=sso_expired");
+    };
+    let ret = &pending.ret;
+    let Some(p) = sso.provider(id).filter(|p| p.saml_sp() && pending.provider == id) else {
+        a.limiter.fail(&ip, at);
+        failed(a, source, id, "wrong_provider", None, json!({}));
+        return ret.fail("sso_failed");
+    };
+    if let Return::Cookie { binder } = ret
+        && !read_cookie(headers, SAML_BINDER).is_some_and(|c| crate::same(hash(c).as_bytes(), binder.as_bytes()))
+    {
+        a.limiter.fail(&ip, at);
+        failed(a, source, id, "binder_mismatch", None, json!({}));
+        return ret.fail("sso_expired");
+    }
+    if a.limiter.blocked(&ip, at).is_some() {
+        return ret.fail("sso_too_many");
+    }
+    let Some(posted) = f.get("SAMLResponse") else {
+        failed(a, source, id, "missing_response", None, json!({}));
+        return ret.fail("sso_failed");
+    };
+    let idp = match p.idp_metadata(sso.http(), sso.refresh_gap).await {
+        Ok(m) => m,
+        Err(e) => {
+            failed(a, source, id, e.0, None, json!({}));
+            return ret.fail("sso_failed");
+        }
+    };
+    let Kind::SamlSp { sp_entity_id, attributes, .. } = &p.kind else {
+        return ret.fail("sso_failed");
+    };
+    let acs = sso.acs_url(id);
+    let expect = saml_sp::Expect { sp: Sp { entity_id: sp_entity_id, acs: &acs }, idp: &idp, request_id: &pending.nonce, attributes, now_ms: at };
+    let checked = match saml_sp::check_response(posted, &expect) {
+        Ok(c) => c,
+        Err(Refused(reason, status)) => {
+            if reason != "idp_error" {
+                a.limiter.fail(&ip, at);
+            }
+            let cancelled = status.as_deref().is_some_and(|s| s.contains("AuthnFailed") || s.contains("RequestDenied"));
+            failed(a, source, id, reason, None, status.map_or(json!({}), |s| json!({ "idpStatus": s })));
+            return ret.fail(if cancelled { "sso_cancelled" } else { "sso_failed" });
+        }
+    };
+    let assertion = format!("{}|{}", checked.claims.issuer, checked.assertion_id);
+    if let Err(reason) = sso.first_use(&assertion, checked.until_ms + saml_sp::SKEW_MS, at) {
+        a.limiter.fail(&ip, at);
+        failed(a, source, id, if reason == "replayed" { "replayed" } else { "too_many" }, Some(&checked.claims), json!({ "assertion": crate::audit::clip(&checked.assertion_id, 128) }));
+        return ret.fail(if reason == "replayed" { "sso_failed" } else { reason });
+    }
+    if let Err(e) = p.check_email(checked.claims.email.as_deref()) {
+        a.limiter.fail(&ip, at);
+        failed(a, source, id, e.0, Some(&checked.claims), json!({}));
+        return ret.fail("sso_wrong_account");
+    }
+    complete(a, app, source, id, p, &pending, checked.claims, at)
+}
+
+/// `GET /api/auth/sso/{id}/metadata`: our SAML SP metadata, for the IdP to import.
+pub async fn saml_metadata(Extension(a): Extension<Arc<Auth>>, Path(id): Path<String>) -> Response {
+    let Some(Kind::SamlSp { sp_entity_id, .. }) = a.sso.provider(&id).map(|p| &p.kind) else {
+        return not_found("SAML provider").into_response();
+    };
+    let acs = a.sso.acs_url(&id);
+    ([(header::CONTENT_TYPE, "application/samlmetadata+xml")], saml_sp::sp_metadata(&Sp { entity_id: sp_entity_id, acs: &acs })).into_response()
+}
+
+fn saml_provider<'a>(a: &'a Auth, id: &str) -> Result<&'a Arc<Provider>, ApiError> {
+    a.sso.provider(id).filter(|p| p.saml_sp()).ok_or_else(|| {
+        let native: Vec<&str> = a.sso.providers.iter().filter(|p| p.saml_sp()).map(|p| p.id.as_str()).collect();
+        bad(if native.is_empty() { "No native SAML provider: set SSO_<ID>_TYPE=saml and SSO_<ID>_IDP_ENTITY_ID".to_string() } else { format!("provider must be one of: {}", native.join(", ")) })
+    })
+}
+
+fn saml_view(a: &Auth, p: &Provider) -> Value {
+    let Kind::SamlSp { entity_id, sp_entity_id, source, .. } = &p.kind else {
+        return json!({});
+    };
+    let idp = p.idp_loaded().map(|m| {
+        let certs: Vec<Value> = m.certs.iter().map(|c| json!({ "sha256": c.sha256, "subject": c.subject, "notAfter": c.not_after * 1000 })).collect();
+        json!({ "entityId": m.entity_id, "ssoUrl": m.sso_url, "certificates": certs, "loadedSecondsAgo": p.idp_age().map(|d| d.as_secs()) })
+    });
+    let from = match source {
+        IdpSource::Url(u) => Some(u.clone()),
+        IdpSource::File(f) => Some(f.clone()),
+        IdpSource::Saved => None,
+    };
+    json!({
+        "provider": p.id, "label": p.label, "ready": p.ready(), "problem": p.not_ready(),
+        "spEntityId": sp_entity_id, "acsUrl": a.sso.acs_url(&p.id), "metadataUrl": a.sso.sp_metadata_url(&p.id),
+        "idpEntityId": entity_id, "source": source.name(), "from": from, "idp": idp,
+        "audience": p.audience(), "jitRole": p.jit_role.map(Role::as_str),
+    })
+}
+
+/// `GET /api/sso/{id}/saml`: what to enter at the IdP, and the IdP metadata in use.
+pub async fn saml_status(Extension(a): Extension<Arc<Auth>>, Path(id): Path<String>) -> Res {
+    let p = saml_provider(&a, &id)?;
+    if matches!(&p.kind, Kind::SamlSp { source: IdpSource::Url(_), .. })
+        && let Err(e) = p.idp_metadata(a.sso.http(), a.sso.refresh_gap).await
+    {
+        crate::obs::log::log_warn!("SSO {id}: IdP metadata: {e}");
+    }
+    Ok(Json(saml_view(&a, p)))
+}
+
+/// `PUT /api/sso/{id}/saml/idp-metadata {xml}`: imports the IdP's metadata (botctl), when
+/// it isn't set in `.env`. Checked before it's kept: it must be for `IDP_ENTITY_ID`.
+pub async fn saml_import(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
+    let p = saml_provider(&a, &id)?;
+    let Kind::SamlSp { entity_id, source, .. } = &p.kind else {
+        return Err(bad("not a native SAML provider"));
+    };
+    if *source != IdpSource::Saved {
+        let var = if matches!(source, IdpSource::Url(_)) { "IDP_METADATA_URL" } else { "IDP_METADATA_FILE" };
+        return Err(ApiError(StatusCode::CONFLICT, format!("SSO_{}_{var} sets this provider's IdP metadata. Change it there, or remove it to import here.", id.to_ascii_uppercase())));
+    }
+    let xml = v["xml"].as_str().unwrap_or("");
+    let m = saml_sp::parse_idp_metadata(xml, entity_id).map_err(|e| bad(format!("That IdP metadata can't be used: {e}.")))?;
+    let certs: Vec<&str> = m.certs.iter().map(|c| c.sha256.as_str()).collect();
+    let details = json!({ "provider": p.id, "entityId": m.entity_id, "ssoUrl": m.sso_url, "certificates": certs });
+    app.db.set_setting(&format!("{SAML_METADATA_SETTING}{id}"), xml);
+    p.set_idp(m);
+    app.db.record(&by.event("sso.saml_metadata_imported").target("sso_provider", &p.id).details(details));
+    Ok(Json(saml_view(&a, p)))
 }
 
 /// The user an identity belongs to: linked by an admin, or made now (just in time).
@@ -1209,6 +1503,59 @@ mod tests {
         let okta = [("SSO_PROVIDERS", "okta"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_OKTA_TYPE", "oidc"), ("SSO_OKTA_ISSUER", "https://acme.okta.example"), ("SSO_OKTA_CLIENT_ID", "c1")];
         assert!(with_base(&okta, &[("SSO_OKTA_IDP_ALIAS", "adfs")]).is_err(), "a SAML setting on oidc would look like a check that isn't made");
         assert!(with_base(&okta, &[("SSO_OKTA_IDP_ENTITY_ID", ADFS)]).is_err());
+    }
+
+    fn native(extra: &[(&'static str, &'static str)]) -> Result<Sso, String> {
+        let base = [("SSO_PROVIDERS", "corp"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_CORP_TYPE", "saml"), ("SSO_CORP_IDP_ENTITY_ID", ADFS)];
+        with_base(&base, extra)
+    }
+
+    #[test]
+    fn reads_a_native_saml_provider_without_a_broker_or_secret() {
+        let s = native(&[]).unwrap();
+        let p = s.provider("corp").unwrap();
+        assert!(p.saml_sp() && !p.oidc() && !p.needs_secret());
+        assert_eq!((p.type_name(), p.jit_role), ("saml", None), "audited as idp=saml, like the bridge");
+        assert!(matches!(&p.kind, Kind::SamlSp { entity_id, sp_entity_id, source: IdpSource::Saved, attributes, allowed_domains }
+            if entity_id == ADFS && sp_entity_id == "https://bot.example.com/api/auth/sso/corp/metadata" && attributes.email.is_none() && allowed_domains.is_empty()));
+        assert_eq!(s.callback_url("corp"), "https://bot.example.com/api/auth/sso/corp/acs");
+        assert!(p.not_ready().unwrap().contains("botctl sso saml corp import"), "not offered until its metadata is imported");
+        assert_eq!(p.issuer_for(None).unwrap(), (ADFS.to_string(), None));
+        assert_eq!(p.subject(" 00u1ADA ").unwrap(), "00u1ada", "the same subjects as the bridge, so links carry over");
+
+        let s = native(&[
+            ("SSO_CORP_IDP_METADATA_URL", "https://idp.example/metadata"),
+            ("SSO_CORP_SP_ENTITY_ID", "urn:superbot:corp"),
+            ("SSO_CORP_EMAIL_ATTRIBUTE", "mail"),
+            ("SSO_CORP_ALLOWED_DOMAINS", "example.com"),
+            ("SSO_CORP_JIT_ROLE", "member"),
+        ])
+        .unwrap();
+        let p = &s.providers[0];
+        assert!(matches!(&p.kind, Kind::SamlSp { sp_entity_id, source: IdpSource::Url(u), attributes, .. }
+            if sp_entity_id == "urn:superbot:corp" && u == "https://idp.example/metadata" && attributes.email.as_deref() == Some("mail")));
+        assert_eq!(p.jit_role, Some(Role::Member));
+        assert_eq!(p.check_email(Some("ada@example.com")), Ok(()));
+        assert!(p.check_email(Some("eve@evil.example")).is_err() && p.check_email(None).is_err());
+    }
+
+    #[test]
+    fn refuses_native_saml_settings_that_are_missing_or_mixed() {
+        for (vars, why) in [
+            (vec![("SSO_CORP_IDP_ENTITY_ID", "")], "no entity id"),
+            (vec![("SSO_CORP_IDP_METADATA_URL", "http://idp.example/metadata")], "metadata over plain http"),
+            (vec![("SSO_CORP_IDP_METADATA_URL", "https://idp.example/m"), ("SSO_CORP_IDP_METADATA_FILE", "/x.xml")], "two metadata sources"),
+            (vec![("SSO_CORP_IDP_METADATA_FILE", "/nonexistent/idp.xml")], "an unreadable file"),
+            (vec![("SSO_CORP_JIT_ROLE", "member")], "just in time with no allow-list"),
+            (vec![("SSO_CORP_CLIENT_ID", "superbot")], "a bridge setting"),
+            (vec![("SSO_CORP_IDP_ALIAS", "adfs")], "a bridge setting"),
+            (vec![("SSO_CORP_EMAIL_CLAIM", "email")], "a bridge setting"),
+            (vec![("SSO_CORP_TENANT", T1)], "an Entra setting"),
+        ] {
+            assert!(native(&vars).is_err(), "{why}");
+        }
+        assert!(saml(&[("SSO_ADFS_IDP_METADATA_URL", "https://idp.example/m")]).is_err(), "a native setting on the bridge");
+        assert!(saml(&[("SSO_ADFS_SP_ENTITY_ID", "urn:x")]).is_err());
     }
 
     #[test]
