@@ -11,8 +11,9 @@
 //!
 //! A pin is refused while the region can't keep it (not offered, Incus hosts untagged,
 //! no backup store there) or while any of their data is still elsewhere. Unpinning needs
-//! a reason. Every pin, unpin and refusal is audited. The region covers machines and
-//! their backups only: botd's own database and model calls are where ADR 0117 says.
+//! a reason. Every pin, unpin and refusal is audited. A pinned person's Bot runs take only
+//! model routes the tiers file marks as in the region, or are refused (ADR 0139, in the
+//! runner). botd's own database is where ADR 0117 says.
 
 use super::backup::{self, Offsite};
 use super::{ControlPlane, conflict, event, region};
@@ -35,6 +36,25 @@ pub const PINNED: &str = "residency_pinned";
 /// both exist; pinning refuses anything else.
 pub fn of_user(app: &App, user_id: &str) -> Option<ResidencyPin> {
     app.db.team_id_of(user_id).and_then(|t| app.db.residency_pin(PinOn::Team, &t)).or_else(|| app.db.residency_pin(PinOn::User, user_id))
+}
+
+/// The pins a Bot run is held to (ADR 0139): those of everyone whose data it carries
+/// (its owner, its asker, and whom an asking Bot carried), once per region. Its model
+/// calls must stay in every one.
+pub fn of_run(app: &App, people: &[String]) -> Vec<ResidencyPin> {
+    let mut out: Vec<ResidencyPin> = Vec::new();
+    for p in people.iter().filter_map(|u| of_user(app, u)) {
+        if !out.iter().any(|o| o.region == p.region) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// The pins on `people` now in regions a run's route wasn't held to (`held_to`): made
+/// while it waited for a slot, so it doesn't start (ADR 0139).
+pub fn pinned_beyond(app: &App, people: &[String], held_to: &[String]) -> Vec<ResidencyPin> {
+    of_run(app, people).into_iter().filter(|p| !held_to.contains(&p.region)).collect()
 }
 
 /// Why `region` can't keep pinned data on this server as it is set up now. Empty: it can.
@@ -244,9 +264,10 @@ pub fn check_join(app: &App, cp: &ControlPlane, t: &Team, u: &User) -> Result<()
 }
 
 /// Warnings for startup and admins: pins whose region this server can't keep now, or
-/// whose data is outside it. Their backups and restores are refused until fixed.
+/// whose data is outside it. Their backups and restores are refused until fixed. Also
+/// pins whose people's plans have no model route there (ADR 0139), whose runs are refused.
 pub fn warnings(app: &App, cp: &ControlPlane) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out: Vec<String> = app.tiers().unknown_regions(&cp.regions).into_iter().map(|w| format!("The tiers file's {w} (ADR 0139).")).collect();
     for p in app.db.residency_pins() {
         let (name, people): (String, Vec<String>) = match p.subject_type {
             PinOn::User => match app.db.user(&p.subject_id) {
@@ -264,6 +285,20 @@ pub fn warnings(app: &App, cp: &ControlPlane) -> Vec<String> {
         }
         if !why.is_empty() {
             out.push(format!("{name} is {}, but {}. Backups, restores and new machines that can't stay there are refused (ADR 0129).", pinned_to(&p), why.join("; ")));
+        }
+        let mut gaps: Vec<String> = Vec::new();
+        for id in &people {
+            if let Some(g) = app.tiers().residency_gap(app.tier_of(id), &p.region).filter(|g| !gaps.contains(g)) {
+                gaps.push(g);
+            }
+        }
+        if !gaps.is_empty() {
+            out.push(format!(
+                "{name} is {}, but {}. Their Bots' runs are refused until the tiers file routes them through a provider whose regions include {} (ADR 0139).",
+                pinned_to(&p),
+                gaps.join("; "),
+                p.region
+            ));
         }
     }
     out

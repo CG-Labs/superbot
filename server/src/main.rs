@@ -107,6 +107,8 @@ mod machines_resize_tests;
 mod machines_region_tests;
 #[cfg(test)]
 mod machines_residency_tests;
+#[cfg(test)]
+mod residency_routes_http_tests;
 mod passwd;
 mod plans;
 #[cfg(test)]
@@ -1284,11 +1286,16 @@ impl Auth {
     }
 
     /// The Bot a token was issued to, acting for its owner, and for whomever its run is
-    /// for (ADR 0046), so what it queues runs for them too.
+    /// for (ADR 0046), so what it queues runs for them too, held where their data is
+    /// pinned (ADR 0139).
     fn bot_actor(&self, bot_id: Option<&str>) -> Actor {
         let app = self.app.as_ref();
         match bot_id.and_then(|id| app?.db.bot(id)) {
-            Some(b) => Actor { asker: app.map(|a| a.acting_for(&b)).filter(|a| *a != b.owner_id), ..Actor::for_bot(&b) },
+            Some(b) => Actor {
+                asker: app.map(|a| a.acting_for(&b)).filter(|a| *a != b.owner_id),
+                carries: app.map(|a| a.carried_by(&b)).unwrap_or_default(),
+                ..Actor::for_bot(&b)
+            },
             None => Actor::bot(bot_id, None),
         }
         .method("bot_token")
@@ -2675,6 +2682,7 @@ async fn ask(State(app): State<AppState>, Extension(c): Extension<Caller>, Exten
         Principal::Bot => {
             let mut actor = Actor::for_bot(&from).method("bot_token");
             actor.asker = Some(app.acting_for(&from)).filter(|a| *a != from.owner_id);
+            actor.carries = app.carried_by(&from);
             Who { actor, source: by.source.clone() }
         }
         Principal::User(_) => by,

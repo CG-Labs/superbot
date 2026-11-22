@@ -203,14 +203,16 @@ The Provider pins the covered team or users to the Agreed Region in the Service,
 
 (d) the covered team's and users' data region can't be changed, and nobody whose machine or backups are outside the Agreed Region can join the covered team;
 
-(e) every pin, unpin and refusal is recorded in the audit log, with the reference.
+(e) Bots' runs for the covered team or users send model calls only to provider endpoints the Provider marks as in the Agreed Region, including fallbacks and the harness's side tasks; a run with no such endpoint is refused ([IV.4](#iv4-model-providers));
+
+(f) every pin, unpin and refusal is recorded in the audit log, with the reference.
 
 ### IV.2 What the pin doesn't cover
 
 | Data | Where it is | Note |
 |------|-------------|------|
 | The control plane: the Service's database (accounts, chat history, routines, sealed secrets, the audit log), the files beside it, and server backups | **[Where the Provider runs the server and keeps its backups, e.g. also London]** | The pin doesn't move or hold these. They are in the Agreed Region only if the Provider runs the server and its backup store there; say so here only if it does. |
-| Model calls | [IV.4](#iv4-model-providers) | Bots send prompts, conversation, tool output and file contents to the model provider of the plan. |
+| Model calls outside the plan's routes | [IV.4](#iv4-model-providers) | The pin holds the plan's routes (IV.1(e)). It doesn't hold what a Bot's own tools send, such as a script calling an API with a key the user saved. |
 | Push notifications, email, webhooks, billing and sign-in | As [Annex III](#annex-iii-subprocessors) says | |
 | Harness logins with a person's own subscription | The model provider, under the person's own account | Not the Provider's Subprocessor (Annex III). |
 | Support access | **[Where staff who can reach Customer Personal Data are, and how that access is controlled and logged]** | |
@@ -224,7 +226,7 @@ The Provider pins the covered team or users to the Agreed Region in the Service,
 
 ### IV.4 Model providers
 
-The pin does not change or check where model calls go. Each plan's routes, set by the Provider, decide the provider and endpoint ([data flows: model providers](data-flows.md#model-providers-through-tier-routing)). **[Provider: list every provider and endpoint the Customer's plan can route to, including fallbacks.]**
+Each plan's routes, set by the Provider, decide the provider and endpoint ([data flows: model providers](data-flows.md#model-providers-through-tier-routing)). The Provider marks in the plan routing file which data regions each endpoint processes in. While the pin holds, a run for the covered team or users takes only a route whose endpoint is marked as in the Agreed Region, keeps only fallbacks that are, and is refused (and recorded in the audit log) if the plan has none ([ADR 0139](../adr/0139-in-region-model-routes.md)). The mark is the Provider's statement, not something the Service can check. **[Provider: list every endpoint marked as in the Agreed Region that the Customer's plan can route to, including fallbacks.]**
 
 | Provider and endpoint | Where it processes | Where it stores | Source |
 |-----------------------|--------------------|-----------------|--------|
@@ -237,12 +239,12 @@ Facts to check against, as of November 2026. Confirm each provider's current ter
 - **OpenAI's API** offers data residency per project to eligible customers, by arrangement with OpenAI. Its Europe region stores and processes in the EEA or Switzerland. Its UK region stores in the UK but does not promise processing there. Some system data is excluded.
 - **Routers** (for example OpenRouter) forward to upstream providers. Treat them as having no region unless their terms say otherwise.
 
-SuperBot doesn't yet hold a pinned Customer's plan to in-region routes ([#58](https://github.com/CG-Labs/superbot/issues/58)). **[Provider: say how you keep the Customer on the endpoints above, for example a plan whose routes use only them, or delete the in-region promise for model calls.]**
+Mark an endpoint as in the Agreed Region only if the provider's terms for that endpoint promise processing there, not only storage. With Hermes Agent, the harness's side tasks (summaries, titles, image analysis) use the run's own endpoint, and the keys of the harness's built-in providers are left out of the run. Claude Code and Codex routes name no endpoint from the routing file, so they don't run for a covered team or user.
 
 ### IV.5 Evidence
 
 On request **[or: every [period]]**, under [Section 9](#9-assistance-records-and-audits), the Provider gives the Customer:
 
-- the audit log entries for the covered team and users, filtered by action and exported as CSV: `user.residency_pinned`, `team.residency_pinned`, `user.residency_unpinned`, `team.residency_unpinned`, the `*_pin_refused` and `*_change_refused` entries, `team.join_refused`, `team.delete_refused` and `machine.residency_refused`;
+- the audit log entries for the covered team and users, filtered by action and exported as CSV: `user.residency_pinned`, `team.residency_pinned`, `user.residency_unpinned`, `team.residency_unpinned`, the `*_pin_refused` and `*_change_refused` entries, `team.join_refused`, `team.delete_refused` and `machine.residency_refused`, and `bot.run_refused` with reason `residency_pinned`; each run's `harness.invoked` entry shows the regions it was held to and any fallback left out;
 - the regions view (`botctl regions`, or the admin API): each pin, its reference, and any warning that the Service can't keep it;
 - for each machine, its region and host, and for each backup, the store and region it was kept in.
