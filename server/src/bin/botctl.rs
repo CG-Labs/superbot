@@ -1044,7 +1044,7 @@ fn setup_summary(s: &Value) -> String {
     for p in s["signIn"]["providers"].as_array().into_iter().flatten().filter(|p| p["ready"] != true) {
         let label = p["label"].as_str().unwrap_or_default();
         match p["secret"].as_str() {
-            Some(secret) => out += &format!("\n{label} needs its secret: botctl secret set {secret} < file\n"),
+            Some(name) => out += &format!("\n{label} needs its secret: botctl secret set {name} < file\n"),
             None => out += &format!("\n{label} needs its IdP metadata: botctl sso saml {} import idp-metadata.xml\n", p["id"].as_str().unwrap_or_default()),
         }
     }
