@@ -5,8 +5,11 @@
 //!
 //! - **Well formed, and one assertion.** No DTD, comment, or processing instruction; the root
 //!   is a `samlp:Response`; exactly one `saml:Assertion` in the whole document, a direct child
-//!   of it (no `EncryptedAssertion`); every `ID` in the document unique; every `ds:Signature`
-//!   a direct child of the response or the assertion.
+//!   of it; every `ID` in the document unique; every `ds:Signature` a direct child of the
+//!   response or the assertion. With an encryption key (ADR 0150), the one assertion may be
+//!   an `EncryptedAssertion` instead: the response's signature, if any, is checked first, then
+//!   it is decrypted (`xmlenc`) and the assertion inside held to the same rules, its IDs
+//!   unique against the response's too. `ENCRYPTED_ASSERTIONS=require` refuses a plain one.
 //! - **Success.** Otherwise the IdP's status is audited and nothing else is read.
 //! - **Signed by the IdP.** The assertion carries a valid enveloped signature by one of the
 //!   IdP's certificates (`xmldsig`). A signed response must verify too, but doesn't stand in
@@ -145,21 +148,62 @@ pub fn parse_idp_metadata(xml: &str, entity_id: &str, signs_requests: bool) -> R
     Ok(IdpMetadata { entity_id: entity_id.into(), sso_url, certs, slo })
 }
 
+/// Whether a native provider takes encrypted assertions (`SSO_<ID>_ENCRYPTED_ASSERTIONS`,
+/// ADR 0150). Off: refused, and our metadata has no encryption key. Allow: both. Require:
+/// a plain assertion is refused.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Encryption {
+    #[default]
+    Off,
+    Allow,
+    Require,
+}
+
+impl Encryption {
+    pub fn parse(s: &str) -> Option<Encryption> {
+        match s.to_ascii_lowercase().as_str() {
+            "off" => Some(Encryption::Off),
+            "allow" => Some(Encryption::Allow),
+            "require" => Some(Encryption::Require),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Encryption::Off => "off",
+            Encryption::Allow => "allow",
+            Encryption::Require => "require",
+        }
+    }
+}
+
+/// What our metadata offers IdPs that encrypt: the GCM ciphers, then OAEP with SHA-256 (XML
+/// Encryption 1.1) and with SHA-1 (1.0, which most IdPs send). Nothing botd would refuse.
+fn encryption_methods() -> String {
+    use super::xmlenc::{AES128_GCM, AES256_GCM, MGF1_SHA256, RSA_OAEP, RSA_OAEP_MGF1P, SHA256, XENC11};
+    format!(
+        r#"<md:EncryptionMethod Algorithm="{AES256_GCM}"/><md:EncryptionMethod Algorithm="{AES128_GCM}"/><md:EncryptionMethod Algorithm="{RSA_OAEP}"><ds:DigestMethod xmlns:ds="{}" Algorithm="{SHA256}"/><xenc11:MGF xmlns:xenc11="{XENC11}" Algorithm="{MGF1_SHA256}"/></md:EncryptionMethod><md:EncryptionMethod Algorithm="{RSA_OAEP_MGF1P}"/>"#,
+        xmldsig::DSIG
+    )
+}
+
 /// Our metadata, for the IdP to import: who we are, where to post, and that assertions must
-/// be signed; with an SP key, also its certificate and where to send logout messages.
-pub fn sp_metadata(sp: &Sp, signing: Option<&SpSigning>) -> String {
+/// be signed; with an SP key, also its certificate and where to send logout messages; with
+/// an encryption certificate (`encryption`, base64 DER), the key to encrypt assertions to.
+pub fn sp_metadata(sp: &Sp, signing: Option<&SpSigning>, encryption: Option<&str>) -> String {
     let signed = signing.is_some_and(|s| s.sign_requests);
-    let keys = signing.map_or(String::new(), |s| {
-        format!(
-            r#"
-    <md:KeyDescriptor use="signing"><ds:KeyInfo xmlns:ds="{}"><ds:X509Data><ds:X509Certificate>{}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor>
-    <md:SingleLogoutService Binding="{REDIRECT}" Location="{slo}"/>
-    <md:SingleLogoutService Binding="{POST}" Location="{slo}"/>"#,
-            xmldsig::DSIG,
-            s.cert,
-            slo = escape(s.slo)
-        )
-    });
+    let key_info = |cert: &str| format!(r#"<ds:KeyInfo xmlns:ds="{}"><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>"#, xmldsig::DSIG);
+    let mut keys = String::new();
+    if let Some(s) = signing {
+        keys += &format!("\n    <md:KeyDescriptor use=\"signing\">{}</md:KeyDescriptor>", key_info(s.cert));
+    }
+    if let Some(cert) = encryption {
+        keys += &format!("\n    <md:KeyDescriptor use=\"encryption\">{}{}</md:KeyDescriptor>", key_info(cert), encryption_methods());
+    }
+    if let Some(s) = signing {
+        keys += &format!("\n    <md:SingleLogoutService Binding=\"{REDIRECT}\" Location=\"{slo}\"/>\n    <md:SingleLogoutService Binding=\"{POST}\" Location=\"{slo}\"/>", slo = escape(s.slo));
+    }
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <md:EntityDescriptor xmlns:md="{METADATA}" entityID="{}">
@@ -174,10 +218,13 @@ pub fn sp_metadata(sp: &Sp, signing: Option<&SpSigning>) -> String {
     )
 }
 
-/// botd's signing key for one native SAML provider (ADR 0137). It signs AuthnRequests and
-/// logout messages; its certificate is in our metadata. RSA, which every IdP takes.
+/// One of botd's keys for a native SAML provider: the signing key (ADR 0137), which signs
+/// AuthnRequests and logout messages, or the encryption key (ADR 0150), which IdPs encrypt
+/// assertions to. Never one key for both. Its certificate is in our metadata. RSA, which
+/// every IdP takes.
 pub struct SpKey {
     pair: aws_lc_rs::rsa::KeyPair,
+    decrypt: aws_lc_rs::rsa::OaepPrivateDecryptingKey,
     /// The certificate, base64 DER, as metadata carries it.
     pub cert: String,
     pub info: Cert,
@@ -186,6 +233,22 @@ pub struct SpKey {
 impl std::fmt::Debug for SpKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SpKey").field("sha256", &self.info.sha256).finish_non_exhaustive()
+    }
+}
+
+/// What an SP key is for. Each native provider has one of each, never one key for both.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum KeyUse {
+    Signing,
+    Encryption,
+}
+
+impl KeyUse {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeyUse::Signing => "signing",
+            KeyUse::Encryption => "encryption",
+        }
     }
 }
 
@@ -213,8 +276,12 @@ impl SpKey {
     /// A kept key (PKCS #8 DER) and its certificate (base64 DER). They must match.
     pub fn from_der(pkcs8: &[u8], cert: &str) -> Result<SpKey, String> {
         let pair = aws_lc_rs::rsa::KeyPair::from_pkcs8(pkcs8).map_err(|_| "the SP key isn't an RSA private key (PKCS #8)")?;
+        let decrypt = aws_lc_rs::rsa::PrivateDecryptingKey::from_pkcs8(pkcs8)
+            .ok()
+            .and_then(|k| aws_lc_rs::rsa::OaepPrivateDecryptingKey::new(k).ok())
+            .ok_or("the SP key isn't an RSA private key (PKCS #8)")?;
         let info = Cert::from_base64(cert).map_err(|e| format!("the SP certificate: {e}"))?;
-        let key = SpKey { pair, cert: cert.chars().filter(|c| !c.is_ascii_whitespace()).collect(), info };
+        let key = SpKey { pair, decrypt, cert: cert.chars().filter(|c| !c.is_ascii_whitespace()).collect(), info };
         let probe = b"superbot sp key check";
         xmldsig::verify_raw(xmldsig::RSA_SHA256, probe, &key.sign(probe), std::slice::from_ref(&key.info)).map_err(|_| "the SP certificate isn't for the SP key".to_string())?;
         Ok(key)
@@ -232,6 +299,11 @@ impl SpKey {
         let mut sig = vec![0; self.pair.public_modulus_len()];
         self.pair.sign(&aws_lc_rs::signature::RSA_PKCS1_SHA256, &aws_lc_rs::rand::SystemRandom::new(), data, &mut sig).expect("RSA signing");
         sig
+    }
+
+    /// The key as RSA-OAEP decrypts with it, for encrypted assertions (`xmlenc`).
+    pub fn decrypting(&self) -> &aws_lc_rs::rsa::OaepPrivateDecryptingKey {
+        &self.decrypt
     }
 }
 
@@ -377,6 +449,11 @@ pub struct Expect<'a> {
     pub request_id: &'a str,
     pub attributes: &'a Attributes,
     pub now_ms: i64,
+    /// Our encryption key, when the provider takes encrypted assertions (ADR 0150); without
+    /// one, an `EncryptedAssertion` is refused.
+    pub decrypt: Option<&'a SpKey>,
+    /// Refuse a plain assertion (`ENCRYPTED_ASSERTIONS=require`).
+    pub require_encrypted: bool,
 }
 
 /// A response that passed: who, and the assertion's ID and how long it must be remembered
@@ -427,6 +504,52 @@ fn attribute<'a>(assertion: Node<'a, '_>, names: &[&str]) -> Option<&'a str> {
     })
 }
 
+/// Every `ID`-like attribute at or under `n`.
+fn ids_under<'a>(n: Node<'a, '_>) -> impl Iterator<Item = &'a str> {
+    n.descendants().flat_map(|n| n.attributes()).filter(|a| a.namespace().is_none() && a.name().eq_ignore_ascii_case("id")).map(|a| a.value())
+}
+
+/// A decrypted assertion, made a document of its own in the namespaces the
+/// `EncryptedAssertion` had in scope: it was serialized (and usually signed) in that context,
+/// so its prefixes may be declared only there. An XML declaration in front is dropped.
+fn in_context(encrypted: Node, plaintext: &[u8]) -> Result<String, Refused> {
+    let bad = || Refused("bad_response", None);
+    let text = std::str::from_utf8(plaintext).map_err(|_| bad())?.trim_start_matches('\u{feff}');
+    let text = match text.strip_prefix("<?xml") {
+        Some(rest) => &rest[rest.find("?>").ok_or_else(bad)? + 2..],
+        None => text,
+    };
+    let mut xml = String::from("<decrypted");
+    for ns in encrypted.namespaces().filter(|ns| ns.name() != Some("xml")) {
+        match ns.name() {
+            Some(p) => xml += &format!(r#" xmlns:{p}="{}""#, escape(ns.uri())),
+            None => xml += &format!(r#" xmlns="{}""#, escape(ns.uri())),
+        }
+    }
+    xml += ">";
+    xml += text;
+    xml += "</decrypted>";
+    Ok(xml)
+}
+
+/// The one `saml:Assertion` a decrypted document holds, with nothing beside it (but
+/// whitespace), no assertion inside it, and its signatures only where it can have one.
+fn decrypted_assertion<'a, 'i>(doc: &'a roxmltree::Document<'i>) -> Result<Node<'a, 'i>, Refused> {
+    let wrapper = doc.root_element();
+    let kids: Vec<Node> = wrapper.children().filter(|c| !(c.is_text() && c.text().is_some_and(|t| t.trim().is_empty()))).collect();
+    let [a] = kids.as_slice() else { return Err(Refused("wrapped", None)) };
+    if !is(*a, ASSERTION, "Assertion") {
+        return Err(Refused("wrapped", None));
+    }
+    if a.descendants().skip(1).any(|n| n.is_element() && matches!(n.tag_name().name(), "Assertion" | "EncryptedAssertion")) {
+        return Err(Refused("wrapped", None));
+    }
+    if a.descendants().filter(|n| is(*n, xmldsig::DSIG, "Signature")).any(|s| s.parent() != Some(*a)) {
+        return Err(Refused("wrapped", None));
+    }
+    Ok(*a)
+}
+
 /// Checks the base64 `SAMLResponse` an IdP posted, as the module docs list.
 pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
     let bad = || Refused("bad_response", None);
@@ -451,29 +574,51 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
 
     // Structure first, so nothing below can be pointed at a copy.
     let assertions: Vec<Node> = doc.descendants().filter(|n| n.is_element() && matches!(n.tag_name().name(), "Assertion" | "EncryptedAssertion")).collect();
-    let assertion = match assertions.as_slice() {
-        [a] if is(*a, ASSERTION, "Assertion") && a.parent() == Some(response) => *a,
-        [a] if a.tag_name().name() == "EncryptedAssertion" => {
-            return Err(Refused("encrypted_assertion", None));
-        }
-        [] => return Err(Refused("missing_assertion", None)),
+    let (found, key) = match (assertions.as_slice(), e.decrypt) {
+        ([a], _) if is(*a, ASSERTION, "Assertion") && a.parent() == Some(response) => (*a, None),
+        ([a], None) if a.tag_name().name() == "EncryptedAssertion" => return Err(Refused("encrypted_assertion", None)),
+        ([a], Some(k)) if is(*a, ASSERTION, "EncryptedAssertion") && a.parent() == Some(response) => (*a, Some(k)),
+        ([], _) => return Err(Refused("missing_assertion", None)),
         _ => return Err(Refused("wrapped", None)),
     };
-    let mut ids: Vec<&str> = doc.descendants().flat_map(|n| n.attributes()).filter(|a| a.namespace().is_none() && a.name().eq_ignore_ascii_case("id")).map(|a| a.value()).collect();
+    if key.is_none() && e.require_encrypted {
+        return Err(Refused("unencrypted_assertion", None));
+    }
+    if doc.descendants().filter(|n| is(*n, xmldsig::DSIG, "Signature")).any(|s| s.parent() != Some(response) && (key.is_some() || s.parent() != Some(found))) {
+        return Err(Refused("wrapped", None));
+    }
+
+    // Encrypted: the response's signature, if any, is checked before anything is decrypted.
+    // The assertion inside is read with the same rules as a posted one, and is signed or refused.
+    let plaintext: String;
+    let inner: roxmltree::Document;
+    let assertion = match key {
+        None => found,
+        Some(k) => {
+            xmldsig::verify_enveloped(response, &e.idp.certs)?;
+            plaintext = in_context(found, &super::xmlenc::decrypt(found, k.decrypting())?)?;
+            inner = xmldsig::parse(&plaintext)?;
+            decrypted_assertion(&inner)?
+        }
+    };
+    // Every ID unique, the decrypted assertion's against the response's too.
+    let mut ids: Vec<&str> = ids_under(doc.root()).collect();
+    if key.is_some() {
+        ids.extend(ids_under(assertion.document().root()));
+    }
     let all = ids.len();
     ids.sort_unstable();
     ids.dedup();
     if ids.len() != all {
         return Err(Refused("wrapped", None));
     }
-    if doc.descendants().filter(|n| is(*n, xmldsig::DSIG, "Signature")).any(|s| s.parent() != Some(response) && s.parent() != Some(assertion)) {
-        return Err(Refused("wrapped", None));
-    }
 
     if !xmldsig::verify_enveloped(assertion, &e.idp.certs)? {
         return Err(Refused("unsigned", None));
     }
-    xmldsig::verify_enveloped(response, &e.idp.certs)?;
+    if key.is_none() {
+        xmldsig::verify_enveloped(response, &e.idp.certs)?;
+    }
 
     // From here on, only the verified assertion (and the response that holds it).
     let (now, earliest, latest) = (e.now_ms, e.now_ms - SKEW_MS, e.now_ms + SKEW_MS);
@@ -557,6 +702,9 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
         return Err(bad());
     };
 
+    if subject.children().any(|c| is(c, ASSERTION, "EncryptedID")) {
+        return Err(Refused("encrypted_id", None));
+    }
     let name_id = only(subject, ASSERTION, "NameID").ok_or(Refused("missing_subject", None))?;
     if name_id.attribute("Format") == Some(TRANSIENT) {
         return Err(Refused("transient_subject", None));
@@ -639,6 +787,9 @@ pub mod test_idp {
         pub sign_assertion: bool,
         pub sign_response: bool,
         pub signer: usize,
+        /// Encrypt the (signed) assertion to `encrypt_to`, a certificate from our metadata.
+        pub encrypt: Option<crate::sso::xmlenc::test_encrypter::Encrypt>,
+        pub encrypt_to: String,
     }
 
     impl Response {
@@ -664,6 +815,8 @@ pub mod test_idp {
                 sign_assertion: true,
                 sign_response: false,
                 signer: 0,
+                encrypt: None,
+                encrypt_to: String::new(),
             }
         }
 
@@ -703,6 +856,10 @@ pub mod test_idp {
                 assertion = signed.replacen(&format!(r#" xmlns:saml="{ASSERTION}" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance""#), "", 1);
             }
             let assertion = edit(assertion);
+            let assertion = match &self.encrypt {
+                Some(e) => e.encrypt(&assertion, &self.encrypt_to),
+                None => assertion,
+            };
             let dest = self.destination.as_ref().map(|d| format!(r#" Destination="{d}""#)).unwrap_or_default();
             let xml = format!(
                 r#"<samlp:Response xmlns:samlp="{PROTOCOL}" xmlns:saml="{ASSERTION}" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" ID="{}" Version="2.0" IssueInstant="{}"{dest} InResponseTo="{}"><saml:Issuer>{}</saml:Issuer><samlp:Status><samlp:StatusCode Value="{}"/></samlp:Status>{assertion}</samlp:Response>"#,
@@ -748,7 +905,7 @@ mod tests {
     fn check_at(xml: &str, now_ms: i64) -> Result<Checked, Refused> {
         let idp = idp();
         let attributes = Attributes::default();
-        check_response(&STANDARD.encode(xml), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: REQ, attributes: &attributes, now_ms })
+        check_response(&STANDARD.encode(xml), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: REQ, attributes: &attributes, now_ms, decrypt: None, require_encrypted: false })
     }
 
     fn check(xml: &str) -> Result<Checked, Refused> {
@@ -864,7 +1021,7 @@ mod tests {
         let (key, _) = SpKey::generate("sp").unwrap();
         let slo = "https://bot.example.com/api/auth/sso/okta/slo";
         for sign_requests in [false, true] {
-            let md = sp_metadata(&sp, Some(&SpSigning { cert: &key.cert, slo, sign_requests }));
+            let md = sp_metadata(&sp, Some(&SpSigning { cert: &key.cert, slo, sign_requests }), None);
             let doc = roxmltree::Document::parse(&md).unwrap();
             let spsso = doc.descendants().find(|n| is(*n, METADATA, "SPSSODescriptor")).unwrap();
             assert_eq!(spsso.attribute("AuthnRequestsSigned"), Some(if sign_requests { "true" } else { "false" }));
@@ -875,13 +1032,13 @@ mod tests {
             let order: Vec<&str> = elements(spsso).iter().map(|n| n.tag_name().name()).collect();
             assert_eq!(order, ["KeyDescriptor", "SingleLogoutService", "SingleLogoutService", "NameIDFormat", "AssertionConsumerService"], "schema order");
         }
-        assert!(!sp_metadata(&sp, None).contains("SingleLogoutService"), "no key, no logout");
+        assert!(!sp_metadata(&sp, None, None).contains("SingleLogoutService"), "no key, no logout");
     }
 
     #[test]
     fn writes_sp_metadata_and_a_redirect_authn_request() {
         let sp = Sp { entity_id: SP, acs: ACS };
-        let md = sp_metadata(&sp, None);
+        let md = sp_metadata(&sp, None, None);
         let doc = roxmltree::Document::parse(&md).unwrap();
         let root = doc.root_element();
         assert_eq!(root.attribute("entityID"), Some(SP));
@@ -938,7 +1095,7 @@ mod tests {
         let mapped = Attributes { email: Some("work_mail".into()), name: None };
         let mut custom = base();
         custom.attributes = vec![("email".into(), "personal@evil.example".into()), ("work_mail".into(), "ada@example.com".into())];
-        let c = check_response(&STANDARD.encode(custom.xml()), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: REQ, attributes: &mapped, now_ms: NOW }).unwrap();
+        let c = check_response(&STANDARD.encode(custom.xml()), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: REQ, attributes: &mapped, now_ms: NOW, decrypt: None, require_encrypted: false }).unwrap();
         assert_eq!(c.claims.email.as_deref(), Some("ada@example.com"), "only the configured attribute");
         let mut unspecified = base();
         unspecified.name_id_format = "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified".into();
@@ -1033,8 +1190,199 @@ mod tests {
         assert_eq!(with(|r| r.conditions_extra = "<saml:OneTimeUse/>".into()), "ok");
         assert_eq!(check("not xml").unwrap_err().0, "bad_response");
         assert_eq!(
-            check_response(&"A".repeat(MAX_RESPONSE + 4), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp(), request_id: REQ, attributes: &Attributes::default(), now_ms: NOW }).unwrap_err().0,
+            check_response(&"A".repeat(MAX_RESPONSE + 4), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp(), request_id: REQ, attributes: &Attributes::default(), now_ms: NOW, decrypt: None, require_encrypted: false }).unwrap_err().0,
             "bad_response"
         );
+    }
+
+    // Encrypted assertions (ADR 0150)
+
+    use crate::sso::xmlenc::test_encrypter::Encrypt;
+    use crate::sso::xmlenc::{AES128_GCM, AES256_CBC, RSA_1_5};
+
+    /// Our encryption key, and another SP's.
+    fn enc_keys() -> &'static [SpKey; 2] {
+        static K: std::sync::OnceLock<[SpKey; 2]> = std::sync::OnceLock::new();
+        K.get_or_init(|| [SpKey::generate("enc").unwrap().0, SpKey::generate("other sp").unwrap().0])
+    }
+
+    fn encrypted() -> Response {
+        let mut r = base();
+        r.encrypt = Some(Encrypt::default());
+        r.encrypt_to = enc_keys()[0].cert.clone();
+        r
+    }
+
+    fn check_enc(xml: &str, require: bool) -> Result<Checked, Refused> {
+        let idp = idp();
+        let attributes = Attributes::default();
+        let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: REQ, attributes: &attributes, now_ms: NOW, decrypt: Some(&enc_keys()[0]), require_encrypted: require };
+        check_response(&STANDARD.encode(xml), &e)
+    }
+
+    fn enc_reason(xml: &str) -> &'static str {
+        check_enc(xml, false).err().map_or("ok", |e| e.0)
+    }
+
+    /// `edit` applied to the decrypted assertion of `r` (signed already), then encrypted again
+    /// to our key, as an attacker with only our public certificate can.
+    fn reencrypted(r: &Response, edit: impl Fn(String) -> String) -> String {
+        let mut plain = r.clone();
+        plain.encrypt = None;
+        let xml = plain.xml();
+        let a = &xml[xml.find("<saml:Assertion").unwrap()..xml.rfind("</saml:Assertion>").unwrap() + "</saml:Assertion>".len()];
+        xml.replace(a, &Encrypt::default().encrypt(&edit(a.to_string()), &enc_keys()[0].cert))
+    }
+
+    #[test]
+    fn an_encrypted_assertion_signs_in_like_a_plain_one() {
+        let r = encrypted();
+        let xml = r.xml();
+        assert!(xml.contains("<saml:EncryptedAssertion>") && !xml.contains("00u1ADA"), "the person is only in the ciphertext");
+        let c = check_enc(&xml, true).unwrap();
+        assert_eq!((c.claims.subject.as_str(), c.claims.email.as_deref(), c.assertion_id.as_str()), ("00u1ada-persistent", Some("ada@example.com"), r.assertion_id.as_str()));
+        assert_eq!(c.login.session_index, Some(r.session_index.clone()));
+
+        let mut variants = Vec::new();
+        for (data_alg, key_inside, sign_response) in [(AES128_GCM, false, false), (AES128_GCM, true, true)] {
+            let mut v = encrypted();
+            v.encrypt = Some(Encrypt { data_alg: data_alg.into(), key_inside, ..Default::default() });
+            v.sign_response = sign_response;
+            variants.push(v.xml());
+        }
+        // Serialized with its own namespace declarations (as OpenSAML does), and after an XML declaration.
+        let own = r.xml_with(|a| a.replacen("<saml:Assertion ", &format!(r#"<saml:Assertion xmlns:saml="{ASSERTION}" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" "#), 1));
+        variants.push(own);
+        variants.push(r.xml_with(|a| format!(r#"<?xml version="1.0" encoding="UTF-8"?>{a}"#)));
+        for (i, xml) in variants.iter().enumerate() {
+            assert_eq!(enc_reason(xml), "ok", "variant {i}");
+        }
+        // Allowed but not required: a plain assertion still works.
+        assert!(check_enc(&base().xml(), false).is_ok());
+    }
+
+    #[test]
+    fn encryption_settings_are_kept_to() {
+        assert_eq!(check(&encrypted().xml()).unwrap_err().0, "encrypted_assertion", "off: no key to decrypt with");
+        assert_eq!(check_enc(&base().xml(), true).unwrap_err().0, "unencrypted_assertion", "require: a plain assertion is refused");
+        let mut both = base();
+        both.sign_response = true;
+        assert_eq!(check_enc(&both.xml(), true).unwrap_err().0, "unencrypted_assertion", "however well signed");
+        let mut other = encrypted();
+        other.encrypt_to = enc_keys()[1].cert.clone();
+        assert_eq!(enc_reason(&other.xml()), "bad_encryption", "encrypted for another SP");
+    }
+
+    #[test]
+    fn weak_encryption_is_refused() {
+        let with = |f: fn(&mut Encrypt)| {
+            let mut r = encrypted();
+            let mut e = Encrypt::default();
+            f(&mut e);
+            r.encrypt = Some(e);
+            enc_reason(&r.xml())
+        };
+        assert_eq!(with(|e| e.data_alg = AES256_CBC.into()), "weak_algorithm");
+        assert_eq!(with(|e| e.key_alg = RSA_1_5.into()), "weak_key_transport");
+        assert_eq!(with(|e| e.key_alg = "urn:x:none".into()), "bad_algorithm");
+    }
+
+    #[test]
+    fn encryption_never_stands_in_for_the_idps_signature() {
+        // Anyone can encrypt to our public certificate, so what's inside must still be signed.
+        let mut unsigned = encrypted();
+        unsigned.sign_assertion = false;
+        assert_eq!(enc_reason(&unsigned.xml()), "unsigned");
+        unsigned.sign_response = true;
+        assert_eq!(enc_reason(&unsigned.xml()), "unsigned", "a signed response around an encrypted, unsigned assertion");
+        let r = encrypted();
+        assert_eq!(enc_reason(&reencrypted(&r, |a| a)), "ok", "re-encrypting a signed assertion changes nothing");
+        assert_eq!(enc_reason(&reencrypted(&r, |a| a.replace("00u1ADA-Persistent", "00u1EVE-Persistent"))), "bad_signature", "changed, then encrypted");
+        let mut other = encrypted();
+        other.signer = 1;
+        assert_eq!(enc_reason(&other.xml()), "bad_signature", "signed by someone else, then encrypted");
+
+        // A bad response signature is refused before anything is decrypted, even with the wrong key.
+        let mut signed = encrypted();
+        signed.sign_response = true;
+        signed.encrypt_to = enc_keys()[1].cert.clone();
+        let tampered = signed.xml().replacen(&format!("InResponseTo=\"{REQ}\""), &format!("InResponseTo=\"{REQ}\" Consent=\"x\""), 1);
+        assert_eq!(enc_reason(&tampered), "bad_signature");
+    }
+
+    #[test]
+    fn wrapping_around_or_inside_an_encrypted_assertion_is_refused() {
+        let r = encrypted();
+        let xml = r.xml();
+        let enc = &xml[xml.find("<saml:EncryptedAssertion>").unwrap()..xml.find("</samlp:Response>").unwrap()];
+        let mut plain = r.clone();
+        plain.encrypt = None;
+        let plain_xml = plain.xml();
+        let signed = &plain_xml[plain_xml.find("<saml:Assertion").unwrap()..plain_xml.find("</samlp:Response>").unwrap()];
+        let outer = [
+            ("beside a plain one", xml.replace(enc, &format!("{enc}{signed}"))),
+            ("two encrypted", xml.replace(enc, &format!("{enc}{enc}"))),
+            ("moved into extensions", xml.replace(enc, &format!("<samlp:Extensions>{enc}</samlp:Extensions>"))),
+            ("in another namespace", xml.replace("saml:EncryptedAssertion", "samlp:EncryptedAssertion")),
+            ("a signature inside it", xml.replacen("<xenc:EncryptedData", &format!(r#"<ds:Signature xmlns:ds="{}"/><xenc:EncryptedData"#, xmldsig::DSIG), 1)),
+        ];
+        for (what, xml) in outer {
+            assert_eq!(enc_reason(&xml), "wrapped", "{what}");
+        }
+
+        let evil = |a: &str| a.replace(&r.assertion_id, "_evil").replace("00u1ADA-Persistent", "admin");
+        let inner: [(&str, Box<dyn Fn(String) -> String>); 6] = [
+            ("two assertions", Box::new(move |a| format!("{}{a}", evil(&a)))),
+            ("the signed one in Advice", Box::new(move |a| evil(&a).replacen("</saml:Subject>", &format!("</saml:Subject><saml:Advice>{a}</saml:Advice>"), 1))),
+            ("encrypted again", Box::new(|a| format!("<saml:EncryptedAssertion>{a}</saml:EncryptedAssertion>"))),
+            ("text beside it", Box::new(|a| format!("{a}and more"))),
+            ("something else", Box::new(|_| "<saml:Issuer>x</saml:Issuer>".into())),
+            ("a signature moved into the subject", Box::new(|a| a.replacen("<ds:Signature", "<saml:Subject><ds:Signature", 1).replacen("</ds:Signature>", "</ds:Signature></saml:Subject>", 1))),
+        ];
+        for (what, edit) in inner {
+            assert_eq!(enc_reason(&reencrypted(&r, edit)), "wrapped", "{what}");
+        }
+        // An ID inside the ciphertext that is also outside it.
+        let mut dup = encrypted();
+        dup.id = dup.assertion_id.clone();
+        assert_eq!(enc_reason(&dup.xml()), "wrapped");
+
+        // Inside, the same parser rules: no DTDs, no comments.
+        assert_eq!(enc_reason(&reencrypted(&r, |a| a.replace("00u1ADA-Persistent", "00u1ADA<!---->-Persistent"))), "bad_response");
+        assert_eq!(enc_reason(&reencrypted(&r, |a| format!(r#"<!DOCTYPE x [<!ENTITY e "x">]>{a}"#))), "bad_response");
+        assert_eq!(enc_reason(&reencrypted(&r, |_| "\u{0}not utf-8 \u{FFFF}".into())), "bad_response");
+    }
+
+    #[test]
+    fn encrypted_name_ids_are_refused_with_a_reason() {
+        // Signed by the IdP with an EncryptedID beside the NameID.
+        let mut r = encrypted();
+        r.name_id = format!(r#"x</saml:NameID><saml:EncryptedID><xenc:EncryptedData xmlns:xenc="{}"/></saml:EncryptedID><saml:NameID>y"#, crate::sso::xmlenc::XENC);
+        assert_eq!(enc_reason(&r.xml()), "encrypted_id");
+        r.encrypt = None;
+        assert_eq!(check(&r.xml()).unwrap_err().0, "encrypted_id", "plain too");
+    }
+
+    #[test]
+    fn sp_metadata_offers_only_strong_encryption() {
+        let sp = Sp { entity_id: SP, acs: ACS };
+        let (sign, _) = SpKey::generate("sp").unwrap();
+        let enc = &enc_keys()[0];
+        let md = sp_metadata(&sp, Some(&SpSigning { cert: &sign.cert, slo: "https://bot.example.com/slo", sign_requests: false }), Some(&enc.cert));
+        let doc = roxmltree::Document::parse(&md).unwrap();
+        let spsso = doc.descendants().find(|n| is(*n, METADATA, "SPSSODescriptor")).unwrap();
+        let order: Vec<String> = elements(spsso).iter().map(|n| format!("{}{}", n.tag_name().name(), n.attribute("use").map(|u| format!("/{u}")).unwrap_or_default())).collect();
+        assert_eq!(order, ["KeyDescriptor/signing", "KeyDescriptor/encryption", "SingleLogoutService", "SingleLogoutService", "NameIDFormat", "AssertionConsumerService"], "schema order");
+        let kd = elements(spsso)[1];
+        assert_eq!(kd.descendants().find(|n| is(*n, xmldsig::DSIG, "X509Certificate")).and_then(|n| n.text()), Some(enc.cert.as_str()), "its own key, not the signing one");
+        let methods: Vec<&str> = elements(kd).iter().filter(|n| is(**n, METADATA, "EncryptionMethod")).filter_map(|n| n.attribute("Algorithm")).collect();
+        assert_eq!(methods.len(), 4);
+        assert!(methods.iter().all(|m| m.contains("gcm") || m.contains("rsa-oaep")), "{methods:?}");
+        // What the metadata offers, botd takes.
+        let ok = Encrypt { key_alg: crate::sso::xmlenc::RSA_OAEP.into(), ..Default::default() };
+        let mut r = encrypted();
+        r.encrypt = Some(ok);
+        assert_eq!(enc_reason(&r.xml()), "ok");
+        assert!(!sp_metadata(&sp, None, None).contains("encryption"), "off: nothing to encrypt to");
     }
 }
