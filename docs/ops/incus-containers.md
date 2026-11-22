@@ -75,7 +75,7 @@ MACHINE_FIREWALL=on
 Optional settings:
 
 - `MACHINE_TIERS`, for example `starter=c1-m2-d20,pro=c2-m4-d40,max=c4-m8-d80`.
-- `MACHINE_REGIONS`, with cluster member names.
+- `MACHINE_REGIONS`, with cluster member names. With hosts tagged by region it lists data regions instead; see [data regions](#data-regions).
 - `INCUS_IMAGE_SERVER=local`, if images are imported by hand.
 - `INCUS_EGRESS_DENY`, with the host's other public addresses and anything else containers must never reach.
 
@@ -163,6 +163,33 @@ botctl machine restore <user> <backup-id> --host <name> --yes   # move one machi
 ```
 
 When to recover and what it does: [machine recovery](machine-recovery.md#losing-a-whole-incus-host).
+
+### Data regions
+
+To keep customers' machines and backups in one place, such as London or Frankfurt, tag each host with its region and give each region a backup store there ([ADR 0117](../adr/0117-uk-eu-data-regions.md)):
+
+```bash
+INCUS_REGION=gb-lon                               # every host's region; or per host:
+INCUS_REGION_SPARE=de-fra-2                       # the spare host is in Frankfurt
+# MACHINE_REGIONS=gb-lon,de-fra-2                 # defaults to the tags; the first is the default
+MACHINE_BACKUP_S3_DATA_REGION=gb-lon              # the default store is in London
+MACHINE_BACKUP_S3_DE_FRA_2_BUCKET=<bucket>        # Frankfurt's own store
+MACHINE_BACKUP_S3_DE_FRA_2_ENDPOINT=https://<s3-endpoint-in-frankfurt>
+MACHINE_BACKUP_S3_DE_FRA_2_ACCESS_KEY_ID_FILE=/etc/superbot/backup-s3-fra-key-id
+MACHINE_BACKUP_S3_DE_FRA_2_SECRET_ACCESS_KEY_FILE=/etc/superbot/backup-s3-fra-secret
+# MACHINE_BACKUP_S3_DE_FRA_2_REGION=<s3-region>
+# MACHINE_BACKUP_RESIDENCY=strict                 # refuse, rather than warn, when a region has no store
+```
+
+Tag every host or none. Then set a user's or a team's region:
+
+```bash
+botctl regions                                    # regions, hosts, stores, and residency warnings
+botctl user region <user> de-fra-2                # or default, to follow their team or the server
+botctl team region <team> gb-lon
+```
+
+New machines go only on a host in their region. If none of them has room, the request is refused, never placed in another region. Restores, recovery and a chosen `--host` keep to the region too. Backups go to the region's store. Without one they go to the default store, and botd warns at startup and in `botctl regions`; with `MACHINE_BACKUP_RESIDENCY=strict` botd won't start until every region has a store. A region change is refused while the user's machine is in another region: destroy it, delete its backups if they must go too, then change the region and request a new machine.
 
 ## Testing against a real host
 

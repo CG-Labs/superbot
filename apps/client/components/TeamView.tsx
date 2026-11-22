@@ -15,6 +15,7 @@ import {
   seatsLine,
   TEAM_ROLE_LABEL,
   teamPlanLine,
+  teamRegionLine,
   teamSubscriptionLine,
   type Tone,
 } from "../src/team";
@@ -282,6 +283,7 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
             <Text style={styles.dim}>
               You're {team.role ? `${TEAM_ROLE_LABEL[team.role].toLowerCase()}` : "on this team"} · {team.members.length} {team.members.length === 1 ? "person" : "people"}
             </Text>
+            {teamRegionLine(team) ? <Text style={styles.dim}>{teamRegionLine(team)}</Text> : null}
             {!manage ? <Text style={styles.faint}>Only the team's owners and admins can change the team.</Text> : null}
 
             {team.billing ? (

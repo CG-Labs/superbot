@@ -78,7 +78,7 @@ async fn destroy(env: &Env, user: &str) {
 fn backup_of(env: &Env, m: &Machine, state: &str) -> MachineBackup {
     let id = format!("b{}", random_hex(8));
     let key = format!("t/machines/{}/{id}.incus", m.id);
-    let n = NewMachineBackup { id: &id, machine: m, object_key: &key, encrypted: false, created_by: Some("schedule") };
+    let n = NewMachineBackup { id: &id, machine: m, object_key: &key, store_region: None, encrypted: false, created_by: Some("schedule") };
     env.app.db.machine_backup_start(&n).unwrap();
     match state {
         "done" => {
@@ -285,7 +285,7 @@ async fn an_erasure_asked_again_finishes_what_it_left_and_counts_a_backup_begun_
     env.fake.during_next("delete", {
         let (app, hers) = (env.app.clone(), hers.clone());
         move || {
-            let n = NewMachineBackup { id: "blate", machine: &hers, object_key: "t/late.incus", encrypted: false, created_by: Some("schedule") };
+            let n = NewMachineBackup { id: "blate", machine: &hers, object_key: "t/late.incus", store_region: None, encrypted: false, created_by: Some("schedule") };
             app.db.machine_backup_start(&n).unwrap();
         }
     });
