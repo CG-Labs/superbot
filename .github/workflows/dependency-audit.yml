@@ -31,8 +31,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-audit
       # Fails on any RustSec vulnerability not ignored, with its reason, in .cargo/audit.toml.
@@ -46,8 +46,8 @@ jobs:
       run:
         working-directory: apps/client
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
       # Dev dependencies too: Electron is one, and the desktop app ships inside it.
