@@ -70,7 +70,7 @@ Finished spans are queued (2048 at most; past that they are dropped and counted)
 | Metric | Labels | Meaning |
 |---|---|---|
 | `superbot_tracing_enabled` | none | 1 when `TRACES_OTLP_ENDPOINT` is set |
-| `superbot_trace_spans_total` | `outcome` (`sent`, `failed`, `dropped`) | Spans the collector accepted, spans it refused or that could not be sent, and spans dropped from a full queue |
+| `superbot_trace_spans_total` | `outcome` (`sent`, `failed`, `dropped`) | Spans the collector accepted, spans it refused (a whole batch, or some of one as OTLP's `partialSuccess.rejectedSpans`) or that could not be sent, and spans dropped from a full queue |
 
 ### Per-tier RED metrics
 

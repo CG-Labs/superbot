@@ -449,31 +449,50 @@ async fn export(mut rx: tokio::sync::mpsc::Receiver<Msg>, http: reqwest::Client,
                 req = req.header(k, v.expose());
             }
             let outcome = match req.body(envelope(spans).to_string()).send().await {
-                Ok(r) if r.status().is_success() => Ok(()),
+                Ok(r) if r.status().is_success() => Ok(rejected(r).await.min(n)),
                 Ok(r) => Err(format!("refused them: HTTP {}", r.status().as_u16())),
                 Err(e) if e.is_timeout() => Err("timed out".into()),
                 Err(e) if e.is_connect() => Err("couldn't be reached".into()),
                 Err(_) => Err("failed".into()),
             };
             let Some(s) = shared.upgrade() else { return };
-            match outcome {
-                Ok(()) => {
-                    s.count(0, n);
-                    failing = false;
+            let (failed, why) = match outcome {
+                Ok(0) => (0, None),
+                // Accepted spans aren't sent again; the rest are lost, as when it's down.
+                Ok(k) => (k, Some(format!("rejected {k} of {n}"))),
+                Err(why) => (n, Some(why)),
+            };
+            s.count(0, n - failed);
+            s.count(1, failed);
+            match why {
+                None => failing = false,
+                // Once until it works again: a collector that's down would fill the log.
+                Some(why) if !std::mem::replace(&mut failing, true) => {
+                    log::line(Level::Warn, &format!("WARNING: sending spans to the trace collector: it {why}"));
                 }
-                Err(why) => {
-                    s.count(1, n);
-                    // Once until it works again: a collector that's down would fill the log.
-                    if !std::mem::replace(&mut failing, true) {
-                        log::line(Level::Warn, &format!("WARNING: sending spans to the trace collector: it {why}"));
-                    }
-                }
+                Some(_) => {}
             }
         }
         if let Some(done) = flushed {
             let _ = done.send(());
         }
     }
+}
+
+/// How many spans an accepted export says it rejected (OTLP's `partialSuccess`), from
+/// the first 64 KiB of its reply. An empty or unreadable reply rejected none.
+async fn rejected(mut r: reqwest::Response) -> u64 {
+    let mut body = Vec::new();
+    while body.len() < 64 * 1024 {
+        match r.chunk().await {
+            Ok(Some(c)) => body.extend_from_slice(&c),
+            _ => break,
+        }
+    }
+    let v: Value = serde_json::from_slice(&body).unwrap_or_default();
+    // proto3 JSON writes int64 as a string; some collectors write a number.
+    let n = &v["partialSuccess"]["rejectedSpans"];
+    n.as_u64().or_else(|| n.as_str()?.parse().ok()).unwrap_or(0)
 }
 
 /// OTLP's `ExportTraceServiceRequest`, as JSON.
@@ -982,8 +1001,9 @@ mod tests {
                 let seen = seen.clone();
                 async move {
                     let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                    let partial = body.contains("\"partial\"");
                     seen.lock().unwrap().push((auth, serde_json::from_str(&body).unwrap()));
-                    "{}"
+                    if partial { r#"{"partialSuccess":{"rejectedSpans":"2","errorMessage":"too old"}}"# } else { "{}" }
                 }
             }),
         );
@@ -1008,6 +1028,15 @@ mod tests {
         let mut out = String::new();
         t.render(&mut out);
         assert!(out.contains("superbot_tracing_enabled 1") && out.contains(r#"superbot_trace_spans_total{outcome="sent"} 1"#), "{out}");
+
+        // Accepted, with some rejected: those count as failed, the rest as sent.
+        for name in ["partial", "a", "b"] {
+            drop(t.span(name, Kind::Internal, None));
+        }
+        t.flush(Duration::from_secs(5)).await;
+        let mut out = String::new();
+        t.render(&mut out);
+        assert!(out.contains(r#"superbot_trace_spans_total{outcome="sent"} 2"#) && out.contains(r#"superbot_trace_spans_total{outcome="failed"} 2"#), "{out}");
 
         // A collector that's down: counted as failed, never retried into memory.
         let down = settings(&[("TRACES_OTLP_ENDPOINT", "http://127.0.0.1:9/v1/traces")]).unwrap();

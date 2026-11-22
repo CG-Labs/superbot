@@ -120,7 +120,7 @@ Attribute names are fixed in botd's code, and values are ids botd made, names fr
 `/metrics` (when on) shows:
 
 - `superbot_tracing_enabled`: 1 when an endpoint is set.
-- `superbot_trace_spans_total{outcome}`: spans the collector accepted (`sent`), refused or couldn't be sent (`failed`), and dropped because 2048 were already waiting (`dropped`).
+- `superbot_trace_spans_total{outcome}`: spans the collector accepted (`sent`), refused, rejected in a partly accepted export, or couldn't be sent (`failed`), and dropped because 2048 were already waiting (`dropped`).
 
 botd logs one warning when sending starts failing (`sending spans to the trace collector: it ...`) and doesn't repeat it until a send works again. Spans are sent every 5 seconds, and on shutdown botd waits up to 3 seconds to send the rest.
 
