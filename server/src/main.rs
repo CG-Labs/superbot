@@ -276,8 +276,19 @@ async fn main() {
         log_warn!("{e}");
         std::process::exit(1);
     };
-    let observe = obs::Settings::from_env(&|k| env(k, ""), &secrets::env::EnvStore::process()).unwrap_or_else(|e| exit(format!("Observability: {e}")));
+    // An external secrets manager (ADR 0125), asked after the environment by everything
+    // that reads a secret at startup, and by `secrets::global()` after that.
+    let process_env = secrets::env::EnvStore::process();
+    let external = secrets::external::from_env(&|k| env(k, ""), &process_env).unwrap_or_else(|e| exit(format!("Secrets backend: {e}")));
+    let external_names = external.as_ref().map(|x| x.check().unwrap_or_else(|e| exit(format!("Secrets backend: {e}. botd won't start without its secrets (ADR 0125)."))));
+    let external_shared = external.clone().map(secrets::external::Shared);
+    let startup_store = secrets::external::Layered(std::iter::once(&process_env as &dyn secrets::SecretStore).chain(external_shared.as_ref().map(|s| s as &dyn secrets::SecretStore)).collect());
+    let observe = obs::Settings::from_env(&|k| env(k, ""), &startup_store).unwrap_or_else(|e| exit(format!("Observability: {e}")));
     obs::log::set_format(observe.log);
+    match (&external, external_names) {
+        (Some(x), Some(n)) => log_info!("Secrets backend: {} ({n} names; SECRETS_BACKEND, ADR 0125).", x.describe()),
+        _ => log_info!("Secrets backend: local (the environment and the sealed store; SECRETS_BACKEND=vault adds HashiCorp Vault, ADR 0125)."),
+    }
     obs::errors::install_panic_hook();
     obs::errors::start(&observe.errors);
     let status_page = status::Page::parse(&env("STATUS_PAGE", "")).unwrap_or_else(|e| exit(e));
@@ -286,9 +297,9 @@ async fn main() {
     let sessions = SessionConfig::from_env(&env("SESSION_IDLE_TIMEOUT", ""), &env("SESSION_MAX_AGE", "")).unwrap_or_else(|e| exit(e));
     let signin_alerts = signin_watch::Settings::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Sign-in alerts: {e}")));
     let sso = sso::Sso::from_env().unwrap_or_else(|e| exit(format!("SSO: {e}")));
-    let signups = signups::Signups::from_env(&secrets::env::EnvStore::process(), &env("SIGNUPS", ""), &env("TURNSTILE_SITE_KEY", ""))
+    let signups = signups::Signups::from_env(&startup_store, &env("SIGNUPS", ""), &env("TURNSTILE_SITE_KEY", ""))
         .unwrap_or_else(|e| exit(format!("Sign-ups: {e}")));
-    let mut control_plane = machines::ControlPlane::from_env(&secrets::env::EnvStore::process(), |k| env(k, ""))
+    let mut control_plane = machines::ControlPlane::from_env(&startup_store, |k| env(k, ""))
         .unwrap_or_else(|e| exit(format!("Control plane: {e}")));
     let shared_bots = acl::SharedBots::parse(&env("SHARED_BOTS", ""), control_plane.routing != machines::route::Routing::Off)
         .unwrap_or_else(|e| exit(format!("Shared Bots: {e}")));
@@ -301,7 +312,7 @@ async fn main() {
     }
     let testing = license::testing_flag(&env("TESTING_MODE", "")).unwrap_or_else(|e| exit(e));
     let (payments, ignored_stripe) =
-        billing::Billing::configured(&secrets::env::EnvStore::process(), &|k| env(k, ""), testing).unwrap_or_else(|e| exit(format!("Billing: {e}")));
+        billing::Billing::configured(&startup_store, &|k| env(k, ""), testing).unwrap_or_else(|e| exit(format!("Billing: {e}")));
     let notifier = notify::Notifier::from_env(&|k| env(k, ""), sessions).unwrap_or_else(|e| exit(format!("Notifications: {e}")));
     let (billing_mail, plan_mail_said) = billing_mail::configured(&|k| env(k, ""), payments.enabled(), notifier.smtp.as_ref(), notifier.links.base.as_deref())
         .unwrap_or_else(|e| exit(format!("Billing emails: {e}")));
@@ -350,7 +361,7 @@ async fn main() {
         log_warn!("WARNING: {w}");
     }
     let db = Db::open(&db_path).expect("open database");
-    match secrets::init(&db_path, keys) {
+    match secrets::init(&db_path, keys, external) {
         Ok(r) => {
             log_info!("Master key: {}{}.", r.key_source, if r.created { " (new)" } else { "" });
             if r.sealed + r.redacted + r.discarded > 0 {
@@ -376,7 +387,7 @@ async fn main() {
             std::process::exit(1);
         }
     }
-    let server_backups = server_backups::ServerBackups::from_env(&secrets::env::EnvStore::process(), &|k| env(k, ""), &data_dir)
+    let server_backups = server_backups::ServerBackups::from_env(&startup_store, &|k| env(k, ""), &data_dir)
         .unwrap_or_else(|e| exit(format!("Server backups: {e}")));
     // Machine enrollment's CA key is derived from the master key (ADR 0031).
     let bin_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
@@ -720,6 +731,7 @@ async fn main() {
     })));
     license::start(app.clone());
     audit::start_retention(app.clone(), retention);
+    secrets::external::start_audit(app.clone());
     retention::start(app.clone(), retention::Settings { chat: chat_retention, sessions: session_retention, teammate_files: teammate_files_retention });
     server_backups::start(app.clone());
     backup_encryption::start(app.clone());
@@ -3171,6 +3183,10 @@ fn secret_error(e: secrets::Error) -> ApiError {
         secrets::Error::Store(m) => {
             log_warn!("secrets: {m}");
             ApiError(StatusCode::INTERNAL_SERVER_ERROR, "The secret store failed; see the server log.".into())
+        }
+        secrets::Error::Unavailable(m) => {
+            log_warn!("secrets: {m}");
+            ApiError(StatusCode::SERVICE_UNAVAILABLE, "The external secret store can't be read right now; see the server log.".into())
         }
     }
 }

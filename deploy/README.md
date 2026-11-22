@@ -19,6 +19,10 @@ Re-run with `--upgrade` to pull latest `main`, rebuild, and restart. Exit status
 curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/install.sh | sudo bash -s -- --upgrade
 ```
 
+## Air-gapped (no internet)
+
+Install or upgrade from an offline bundle with `sudo bash install.sh --offline <bundle> --bundle-sha256 <hex> --domain <name> --tls-cert <pem> --tls-key <pem>`: nothing is downloaded or built, and Caddy uses your certificate. See [docs/ops/air-gapped.md](../docs/ops/air-gapped.md).
+
 ## From a local checkout
 
 ```sh
