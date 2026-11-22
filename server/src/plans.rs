@@ -426,8 +426,8 @@ mod tests {
         assert_eq!(v["enterprise"], json!({ "label": "Enterprise", "contactUrl": "mailto:sales@example.com" }));
         assert_eq!((v["buyUrl"].as_str(), v["signupUrl"].as_str()), (Some("/app/plan"), None));
         let raw = v.to_string();
-        for secret in ["price_", "secret/model-name", "openrouter", "hermes", "c2-m4-d40", "machineType", "routes", "legacy"] {
-            assert!(!raw.contains(secret), "{secret} leaked: {raw}");
+        for private in ["price_", "secret/model-name", "openrouter", "hermes", "c2-m4-d40", "machineType", "routes", "legacy"] {
+            assert!(!raw.contains(private), "{private} leaked: {raw}");
         }
         assert_eq!(snapshot(&tiers, &on(None), None, &sizes)["enterprise"], Value::Null);
     }

@@ -76,8 +76,8 @@ async fn anyone_reads_the_plans_without_secrets() {
     assert_eq!(v["plans"][1]["prices"], json!([]), "Max has no published price");
     assert_eq!(v["enterprise"], json!({ "label": "Enterprise", "contactUrl": "https://example.com/contact" }));
     assert_eq!((v["checkout"].as_bool(), v["buyUrl"].clone(), v["signupUrl"].as_str()), (Some(false), Value::Null, Some("/get-started")));
-    for secret in ["price_", "hidden-model", "openrouter", "hermes", "g6-standard-1", "stripePrices", "routes", "self-host"] {
-        assert!(!body.contains(secret), "{secret} leaked: {body}");
+    for private in ["price_", "hidden-model", "openrouter", "hermes", "g6-standard-1", "stripePrices", "routes", "self-host"] {
+        assert!(!body.contains(private), "{private} leaked: {body}");
     }
 }
 
