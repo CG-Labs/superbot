@@ -156,8 +156,12 @@ pub fn uuids(s: &str) -> Vec<String> {
 
 /// Runs a sweep. Blocking.
 pub fn run(s: &Sweep) -> Swept {
+    run_within(s, MAX_ENTRIES)
+}
+
+/// `run`, looking at `budget` entries at most.
+fn run_within(s: &Sweep, mut budget: u64) -> Swept {
     let mut out = Swept::default();
-    let mut budget = MAX_ENTRIES;
     let ids = |v: &[String]| v.iter().flat_map(|id| uuids(id)).collect::<Vec<_>>();
     let mut rules = Rules {
         transcript: false,
@@ -242,9 +246,16 @@ fn list(dir: &Dir, what: &str, budget: &mut u64, out: &mut Swept) -> Option<Vec<
         out.partial = true;
         return None;
     }
-    match dir.entries(*budget) {
+    // One more than the budget, to tell a whole listing from one cut short: sessions
+    // can't be judged on part of a folder.
+    match dir.entries(*budget + 1) {
+        Ok(e) if e.len() as u64 > *budget => {
+            *budget = 0;
+            out.partial = true;
+            None
+        }
         Ok(e) => {
-            *budget = budget.saturating_sub(e.len() as u64);
+            *budget -= e.len() as u64;
             if *budget == 0 {
                 out.partial = true;
             }
@@ -332,8 +343,12 @@ fn newest_in(dir: &Dir, budget: &mut u64, depth: u32) -> Option<i64> {
     if depth == 0 || *budget == 0 {
         return None;
     }
-    let entries = dir.entries(*budget).ok()?;
-    *budget = budget.saturating_sub(entries.len() as u64);
+    let entries = dir.entries(*budget + 1).ok()?;
+    if entries.len() as u64 > *budget {
+        *budget = 0;
+        return None;
+    }
+    *budget -= entries.len() as u64;
     let mut newest = i64::MIN;
     for (name, st) in entries {
         let st = st?;
@@ -501,6 +516,11 @@ mod tests {
         for kept in [format!("{B}.jsonl"), format!("{B}/tool-results/r1.txt"), format!("{C}.jsonl"), "memory/MEMORY.md".into()] {
             assert!(proj.join(&kept).exists(), "{kept}");
         }
+        // Out of budget part way through a folder, nothing in it is judged, let alone deleted.
+        file(&proj.join(format!("{B}/tool-results/r2.txt")), 1);
+        let cut = run_within(&Sweep { before: now() - 30 * DAY, roots: vec![root(&home, ".claude/projects", 2)], ..Default::default() }, 3);
+        assert_eq!((cut.sessions, cut.partial), (0, true), "{cut:?}");
+        assert!(proj.join(format!("{B}.jsonl")).exists());
         // C's old debug log goes, but C isn't gone: its transcript is recent.
         file(&home.join(format!(".claude/debug/{C}.txt")), 40);
         let debug = run(&Sweep { before: now() - 30 * DAY, roots: vec![root(&home, ".claude/debug", 1)], report: vec![C.into()], ..Default::default() });
