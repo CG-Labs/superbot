@@ -7,8 +7,12 @@ name: offline
 # it, show the services work with no network. It loads a bundled image into Docker the same way.
 # It runs on the oldest and newest supported Ubuntu, with binaries built on the oldest. Packages the bundle doesn't carry (Caddy,
 # sqlite3, ...) are installed first, as an operator would from their own mirror.
-# release-bundle (manual): bundles a published release's signed images for each arch, signs each
-# bundle with cosign keylessly under this workflow's identity, and attaches both to the release.
+# It also bundles a multi-arch image from a local registry, checks the bundle keeps that
+# registry's digest for this arch, loads it with no network, and pushes it to a second registry,
+# a stand-in for an operator's mirror, with the same digest (docs/adr/0140-release-bundles-and-registry-mirrors.md).
+# release-bundle: for every v* tag, once the docker workflow has published and signed that tag's
+# images (or by hand, for a published release), bundles them for each arch, signs each bundle
+# with cosign keylessly under this workflow's identity, and attaches both to the release.
 
 on:
   push:
@@ -40,6 +44,10 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/offline.yml'
+  # The docker workflow publishes and signs a tag's images; release-bundle starts when it is done.
+  workflow_run:
+    workflows: [docker]
+    types: [completed]
   workflow_dispatch:
     inputs:
       version:
@@ -50,12 +58,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: offline-${{ github.ref }}-${{ github.event_name }}
+  group: offline-${{ github.event.workflow_run.head_branch || inputs.version || github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   install-offline:
-    if: github.event_name != 'workflow_dispatch'
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     name: install-offline (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -91,23 +99,43 @@ jobs:
           curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
           curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
           sudo apt-get update -qq
-          sudo apt-get install -y -qq caddy sqlite3 age bubblewrap socat acl shellcheck
+          sudo apt-get install -y -qq caddy sqlite3 age bubblewrap socat acl shellcheck skopeo jq
       - name: ShellCheck
         run: shellcheck -x -S style deploy/install.sh deploy/offline-bundle.sh deploy/test-offline.sh
       - name: Bundle checks without root (tampering, downgrades, certificates, the Caddyfile, a dry run)
         run: deploy/test-offline.sh
-      - name: Two bundles, the first with an image, and a certificate for offline.test
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          driver-opts: network=host
+      - name: Two registries on localhost, a source and a mirror, and a two-arch image in the source
+        run: |
+          set -euo pipefail
+          docker run -d --name source-registry -p 127.0.0.1:5000:5000 registry:2 >/dev/null
+          docker run -d --name mirror-registry -p 127.0.0.1:5001:5000 registry:2 >/dev/null
+          sudo mkdir -p /etc/containers/registries.conf.d
+          printf '[[registry]]\nlocation = "localhost:%s"\ninsecure = true\n\n' 5000 5001 \
+            | sudo tee /etc/containers/registries.conf.d/50-offline-ci.conf >/dev/null
+          mkdir -p "$RUNNER_TEMP/image"
+          echo marker >"$RUNNER_TEMP/image/marker"
+          printf 'FROM scratch\nCOPY marker /marker\nCMD ["/marker"]\n' >"$RUNNER_TEMP/image/Dockerfile"
+          for _ in $(seq 1 30); do curl -fsS http://localhost:5000/v2/ >/dev/null 2>&1 && break; sleep 1; done
+          docker buildx build -q --platform linux/amd64,linux/arm64 --push -t localhost:5000/superbot-offline-multi:1 "$RUNNER_TEMP/image" >/dev/null
+          arch=$(case $(uname -m) in x86_64) echo amd64 ;; *) echo arm64 ;; esac)
+          digest=$(skopeo inspect --raw docker://localhost:5000/superbot-offline-multi:1 \
+            | jq -r --arg a "$arch" '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest')
+          [[ $digest == sha256:* ]]
+          echo "MULTI_DIGEST=$digest" >>"$GITHUB_ENV"
+          docker buildx build -q --load -t superbot-offline-ci:1 "$RUNNER_TEMP/image" >/dev/null
+      - name: Two bundles, the first with a local and a registry image, and a certificate for offline.test
         run: |
           set -euo pipefail
           version=$(awk -F'"' '/^\[package\]/ { p = 1; next } /^\[/ { p = 0 } p && /^version *=/ { print $2; exit }' server/Cargo.toml)
           echo "OLD=$version-ci.1" >>"$GITHUB_ENV"
           echo "NEW=$version-ci.2" >>"$GITHUB_ENV"
-          mkdir -p "$RUNNER_TEMP/image"
-          echo marker >"$RUNNER_TEMP/image/marker"
-          printf 'FROM scratch\nCOPY marker /marker\nCMD ["/marker"]\n' >"$RUNNER_TEMP/image/Dockerfile"
-          docker build -q -t superbot-offline-ci:1 "$RUNNER_TEMP/image" >/dev/null
           deploy/offline-bundle.sh build --out "$RUNNER_TEMP/b" --version "$version-ci.1" \
-            --image ci=superbot-offline-ci:1 --allow-unsigned
+            --image ci=superbot-offline-ci:1 --image multi=localhost:5000/superbot-offline-multi:1 --allow-unsigned
+          [[ $(tar -xOf "$RUNNER_TEMP/b/superbot-offline-$version-ci.1-$(uname -m).tar.gz" \
+            "superbot-offline-$version-ci.1-$(uname -m)/images/multi.digest") == "$MULTI_DIGEST" ]]
           deploy/offline-bundle.sh build --out "$RUNNER_TEMP/b" --version "$version-ci.2"
           ls -l "$RUNNER_TEMP/b"
           openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 -subj /CN=offline.test \
@@ -188,12 +216,23 @@ jobs:
           grep -Fq "newer than the bundle's $OLD" /tmp/offline-downgrade.log
           grep -qx "version=$NEW" /usr/local/share/superbot/offline-release
           sudo systemctl is-active --quiet superbot
-      - name: Load the bundle's image into Docker with no network
+      - name: Load the bundle's images into Docker with no network
         run: |
           set -euo pipefail
-          docker rmi -f superbot-offline-ci:1 >/dev/null
+          docker rmi -f superbot-offline-ci:1 localhost:5000/superbot-offline-multi:1 >/dev/null 2>&1 || true
           sudo unshare --net -- deploy/offline-bundle.sh load "$RUNNER_TEMP/b/superbot-offline-$OLD-$(uname -m).tar.gz"
           docker image inspect superbot-offline-ci:1 >/dev/null
+          arch=$(case $(uname -m) in x86_64) echo amd64 ;; *) echo arm64 ;; esac)
+          [[ $(docker image inspect --format '{{.Architecture}}' localhost:5000/superbot-offline-multi:1) == "$arch" ]]
+      - name: Push the bundle's images to a mirror, with the source registry's digest
+        run: |
+          set -euo pipefail
+          deploy/offline-bundle.sh push "$RUNNER_TEMP/b/superbot-offline-$OLD-$(uname -m).tar.gz" --registry localhost:5001/mirror \
+            | tee /tmp/offline-push.log
+          [[ $(skopeo inspect --raw docker://localhost:5001/mirror/superbot-offline-multi:1 | sha256sum | cut -c1-64) == "${MULTI_DIGEST#sha256:}" ]]
+          grep -Fq "to localhost:5001/mirror/superbot-offline-multi:1 ($MULTI_DIGEST" /tmp/offline-push.log
+          docker rmi -f localhost:5000/superbot-offline-multi:1 >/dev/null 2>&1 || true
+          docker pull -q "localhost:5001/mirror/superbot-offline-multi@$MULTI_DIGEST" >/dev/null
       - name: Logs on failure
         if: failure()
         run: |
@@ -201,7 +240,13 @@ jobs:
           cat /tmp/offline-*.log 2>/dev/null || true
 
   release-bundle:
-    if: github.event_name == 'workflow_dispatch'
+    # A tag's docker run that published its images, in this repository; or a manual run.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      startsWith(github.event.workflow_run.head_branch, 'v'))
     name: release-bundle (${{ matrix.arch }})
     strategy:
       fail-fast: false
@@ -217,15 +262,25 @@ jobs:
       contents: write
       id-token: write
     env:
-      VERSION: ${{ inputs.version }}
+      # For a tag's docker run, head_branch is the tag.
+      TAG: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.event.workflow_run.head_branch }}
+      TAG_SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
-      - name: The version is a version
+      - name: The tag is a version tag
         run: |
-          [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "::error::$VERSION isn't a version"; exit 1; }
+          [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "::error::$TAG isn't a v<version> tag"; exit 1; }
+          echo "VERSION=${TAG#v}" >>"$GITHUB_ENV"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: v${{ inputs.version }}
+          ref: refs/tags/${{ env.TAG }}
+          fetch-depth: 0
           persist-credentials: false
+      - name: The tag is on main, and is the commit whose images the docker workflow published
+        run: |
+          git merge-base --is-ancestor HEAD origin/main \
+            || { echo "::error::$TAG isn't on main; release only from main (ADR 0111)"; exit 1; }
+          [[ -z $TAG_SHA || $(git rev-parse HEAD) == "$TAG_SHA" ]] \
+            || { echo "::error::$TAG is $(git rev-parse HEAD), but the docker workflow published $TAG_SHA"; exit 1; }
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
       - run: cargo build --release --bin botd --bin botctl --bin superbot-machine --bin superbot-run
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -241,6 +296,11 @@ jobs:
           SUPERBOT_WEB_BASE_URL: /app
         run: npm ci --no-audit --no-fund && npx expo export --platform web --output-dir dist-app
       - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+      - name: skopeo and jq, to copy the images with their registry digests
+        run: |
+          if ! command -v skopeo >/dev/null || ! command -v jq >/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq skopeo jq
+          fi
       # The images' signatures are checked against the docker workflow at this tag before they
       # are bundled (ADR 0101); the bundle's own signature is this workflow's.
       - name: Bundle, with the release's signed images and their SBOMs
@@ -257,8 +317,13 @@ jobs:
           cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
           deploy/offline-bundle.sh verify "$f"
           cat "$f.sha256" >>"$GITHUB_STEP_SUMMARY"
+      # The release workflow makes the release from the same tag, usually long before this.
       - name: Attach to the release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release upload "v$VERSION" dist/superbot-offline-* --clobber
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do gh release view "$TAG" >/dev/null 2>&1 && break; sleep 10; done
+          gh release view "$TAG" >/dev/null || { echo "::error::No GitHub release for $TAG: the release workflow makes it"; exit 1; }
+          gh release upload "$TAG" dist/superbot-offline-* --clobber
