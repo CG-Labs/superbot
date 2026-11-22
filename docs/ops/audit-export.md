@@ -24,7 +24,7 @@ It prints the result and exits 1 if the chain is broken. The same is `GET /api/a
 - `error`: the log couldn't be read to the end. The check fails.
 - `checkpoints`: what the check found about checkpoints and timestamps (below).
 
-`--from <id>` and `--to <id>` check only those events, which is quicker on a large log. A range starting after the first event takes that event's link as stored.
+`--from <id>` and `--to <id>` check only those events, which is quicker on a large log. A range starting after the first event takes that event's link as stored. If erased events in the range are named by an erasure after `--to`, the check carries on to the head, and `range` in the answer shows that.
 
 botd also checks itself a minute after starting and then once a day. Each check, and each one through the API, is recorded as `audit.verified` with the result and the head's hash; a failed check's `reason` is the first break's code (`contents`, `link`, `pin`, `unsealed`, `erased`, `checkpoint`, `timestamp`) or `unreadable`, which `botctl support-bundle` shows. A broken chain logs a warning that links here.
 

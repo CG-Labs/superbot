@@ -78,7 +78,7 @@ The report's `checkpoints` has how many were checked and stamped, how many stamp
 
 New options:
 
-- `from=<id>` and `to=<id>` (`--from`, `--to`) limit the walk. A range starting after the first event takes that event's link as stored. Pins outside it report `outside`. Erased events in it may be explained by a later `audit.erased` that holds on its own.
+- `from=<id>` and `to=<id>` (`--from`, `--to`) limit the walk. A range starting after the first event takes that event's link as stored. Pins outside it report `outside`. When erased events in it wait for an `audit.erased` after its end, the walk carries on to the head, every check included, so a rewritten erasure can't excuse them; the report's `range` says how far it went. The app marks a partial check's result as such.
 - `key=<hex>` (`--key`, repeatable) trusts only those public keys instead of botd's own, now and before. Use it with a key taken from the SIEM or an earlier `botctl audit key`: the key history lives in the database, which is what the check doubts.
 
 ### The chain's state
