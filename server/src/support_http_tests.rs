@@ -3,7 +3,7 @@
 //! never a secret, an email or a chat.
 
 use crate::audit::{Actor, Event, Outcome};
-use crate::obs::log::log_warn;
+use crate::obs::log::{Level, log_warn, recent, render};
 use crate::secrets::redact;
 use crate::support::tests::untar;
 use crate::tests::{audit_list, call, serve_app};
@@ -127,7 +127,8 @@ async fn no_secret_email_or_chat_reaches_the_bundle() {
     let chat = format!("chat-words-{}", random_hex(6));
     let email = format!("person-{}@customer.example.com", random_hex(4));
     let hook = format!("https://hooks.slack.com/services/T0/B0/{}", random_hex(12));
-    log_warn!("WARNING: provider said {secret} for {email} with {session} posting to {hook}");
+    // Straight into the kept lines: the test's secrets never go to stdout.
+    recent::push(render(Level::Warn, &format!("provider said {secret} for {email} with {session} posting to {hook}"), json!({})));
     let bot = app.db.create_bot("Walker", "#fff", "waddle", "claude", None, false);
     app.db.add_message(&bot.id, "user", &chat, None, false, None);
     let mut actor = Actor::operator();
