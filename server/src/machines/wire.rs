@@ -301,6 +301,11 @@ pub struct TeammatePurged {
     pub purged: bool,
 }
 
+/// Most entries a `/v1/retention` answer lists in `found`, and the most bytes botd reads of
+/// it: 20,000 entries of up to about 200 bytes each fit.
+pub const RETENTION_FOUND_MAX: usize = 20_000;
+pub const RETENTION_REPLY_MAX: usize = 8 << 20;
+
 /// `POST /v1/retention`: delete old harness session files in the HOMEs Bots use here (the
 /// user's and each teammate's) and in the named Bots' own folders, and archived teammates'
 /// work in the user's `work/from-teammates/` (ADR 0112). Paths are relative and plain.

@@ -527,6 +527,11 @@ async fn purge(app: &App, e: &Enrollment, row: &TeammateCleanup) -> bool {
 /// POSTs `body` to the machine's agent, pinned to its certificates. Its JSON answer, or
 /// why it didn't do it.
 pub(crate) async fn ask<T: serde::Serialize>(app: &App, e: &Enrollment, m: &Machine, path: &str, body: &T) -> Result<Value, String> {
+    ask_capped(app, e, m, path, body, 64 << 10).await
+}
+
+/// `ask`, reading an answer of up to `cap` bytes.
+pub(crate) async fn ask_capped<T: serde::Serialize>(app: &App, e: &Enrollment, m: &Machine, path: &str, body: &T, cap: usize) -> Result<Value, String> {
     let pins = app.db.machine_pins(&m.id);
     if pins.is_empty() {
         return Err("it has no usable certificate".into());
@@ -540,7 +545,7 @@ pub(crate) async fn ask<T: serde::Serialize>(app: &App, e: &Enrollment, m: &Mach
         .await
         .map_err(|err| format!("its agent didn't answer: {}", enroll::without_url(err)))?;
     let code = r.status();
-    let reply: Value = enroll::read_capped(&mut r, 64 << 10).await.and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+    let reply: Value = enroll::read_capped(&mut r, cap).await.and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
     if code.is_success() {
         return Ok(reply);
     }

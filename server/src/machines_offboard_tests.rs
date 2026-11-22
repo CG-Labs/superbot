@@ -494,6 +494,7 @@ async fn the_agent_refuses_a_sweep_outside_its_homes() {
         json!({ "ownerId": w.ada, "before": 0, "bots": ["../b"] }),
         json!({ "ownerId": w.ada, "before": 0, "archives": ["a/b"] }),
         json!({ "ownerId": w.ada, "before": 0, "probe": ["../hermes/state.db"] }),
+        json!({ "ownerId": w.ada, "before": 0, "probe": ["b".repeat(161)] }),
         json!({ "ownerId": w.ada, "before": 0, "surprise": 1 }),
     ] {
         assert!(matches!(ask(bad.clone()).await, 400 | 422), "{bad}");
