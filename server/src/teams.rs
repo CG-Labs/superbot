@@ -678,8 +678,9 @@ pub async fn invite(State(app): State<AppState>, Extension(c): Extension<Caller>
     if role != MEMBER && !manages(&me.role) {
         return Err(delegate_limit(&app, &by, &t.id, "Only the team's owners and admins can invite admins."));
     }
-    // Inviting the same email again replaces the invite, role included.
-    if !manages(&me.role) && app.db.team_invites(&t.id).iter().any(|i| i.email == email && i.role != MEMBER) {
+    // Inviting the same email again replaces the invite, role included. An expired one
+    // protects nothing.
+    if !manages(&me.role) && app.db.team_invites(&t.id).iter().any(|i| i.email == email && i.role != MEMBER && i.expires_at > now()) {
         return Err(delegate_limit(&app, &by, &t.id, "Only the team's owners and admins can change an admin's invite."));
     }
     if app.db.find_user(&email).is_some_and(|u| app.db.team_id_of(&u.id).as_deref() == Some(t.id.as_str())) {

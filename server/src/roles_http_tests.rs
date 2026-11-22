@@ -354,6 +354,9 @@ async fn a_team_role_applies_only_in_its_team() {
     // An admin's invite can't be turned into a member's, and so withdrawn.
     assert_eq!(call(port, "POST", "/api/team/invites", &ada_auth, r#"{"email":"lead@example.com","role":"admin"}"#).await.0, 201);
     assert_eq!(call(port, "POST", "/api/team/invites", &cy_auth, r#"{"email":"lead@example.com","role":"member"}"#).await.0, 403);
+    // An expired one protects nothing.
+    app.db.put_team_invite(&team, "old@example.com", "admin", None, db::now() - 1);
+    assert_eq!(call(port, "POST", "/api/team/invites", &cy_auth, r#"{"email":"old@example.com","role":"member"}"#).await.0, 201);
     let (_, invites) = json_call(port, "GET", "/api/team", &ada_auth, "").await;
     assert!(invites["invites"].as_array().unwrap().iter().any(|i| i["email"] == "lead@example.com" && i["role"] == "admin"), "{invites}");
     // Not the team's machines, not roles in it, and not its owners or admins.
