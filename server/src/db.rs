@@ -120,8 +120,10 @@ pub const ERASED_TEXT: &str = "[erased]";
 /// An erased user's name on their tombstone.
 pub const ERASED_NAME: &str = "Erased user";
 
-/// Whether the message in `m` was sent by user `?1`, or by a run for them.
-const SENT_BY: &str = "(CASE WHEN json_valid(m.requested_by) THEN json_extract(m.requested_by, '$.actor.id') = ?1 OR json_extract(m.requested_by, '$.actor.asker') = ?1 END)";
+/// Whether the message in `m` was sent by user `?1`, or by a run for them or carrying
+/// their data (ADR 0139). The same people as `SENT_BY_ANY`, so a hold keeps what an
+/// erasure would rewrite.
+const SENT_BY: &str = "(CASE WHEN json_valid(m.requested_by) THEN json_extract(m.requested_by, '$.actor.id') = ?1 OR json_extract(m.requested_by, '$.actor.asker') = ?1 OR EXISTS (SELECT 1 FROM json_each(m.requested_by, '$.actor.carries') WHERE value = ?1) END)";
 const SENT_BY_ANY: &str = "(CASE WHEN json_valid(requested_by) THEN json_extract(requested_by, '$.actor.id') = ?1 OR json_extract(requested_by, '$.actor.asker') = ?1 OR EXISTS (SELECT 1 FROM json_each(requested_by, '$.actor.carries') WHERE value = ?1) END)";
 
 /// How an erasure rewrites a string about the erased person: their id becomes the
@@ -9464,6 +9466,21 @@ mod tests {
         assert_eq!(db.retention_holds().len(), 1);
         db.delete_bot(&bot.id);
         assert!(db.retention_holds().is_empty(), "a Bot deleted under the database's feet takes its hold");
+    }
+
+    #[test]
+    fn a_held_chat_with_a_message_carrying_someones_data_holds_their_erasure() {
+        let db = Db::open(&temp_path("carries-hold").join("app.sqlite")).unwrap();
+        let from = db.create_bot("Bea's", "#fff", "waddle", "claude", None, false);
+        let held = db.create_bot("Cy's", "#fff", "waddle", "claude", None, false);
+        let m = db.add_message(&held.id, "user", "status?", None, false, None);
+        let mut actor = audit::Actor::for_bot(&from);
+        actor.carries = vec!["ada".into()];
+        db.set_requested_by(m.id, &audit::Who { actor, source: Default::default() });
+        assert!(db.erasure_holds("ada", &[]).is_empty(), "no hold yet");
+        assert!(db.put_retention_hold(&held.id, "hold", None).is_some());
+        assert_eq!(db.erasure_holds("ada", &[]), vec![held.id.clone()]);
+        assert!(db.erasure_holds("cy", &[]).is_empty());
     }
 
     #[test]
