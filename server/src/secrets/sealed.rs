@@ -111,6 +111,19 @@ pub fn approval_context(id: &str) -> String {
     format!("approvals.input/{id}")
 }
 
+/// The settings that hold a native SAML provider's generated SP key, sealed, by provider id;
+/// beside each, `SAML_SP_CERT_SETTING` holds its certificate in the clear (ADR 0137).
+pub const SAML_SP_KEY_SETTING: &str = "sso_saml_sp_key_";
+pub const SAML_SP_CERT_SETTING: &str = "sso_saml_sp_cert_";
+
+/// Where a sealed setting is sealed.
+pub fn setting_context(key: &str) -> String {
+    format!("settings/{key}")
+}
+
+/// `settings` rows whose value is sealed: `key LIKE` this.
+const SEALED_SETTINGS: &str = "sso\\_saml\\_sp\\_key\\_%";
+
 /// Seals a database field, e.g. an approval's tool input.
 pub fn seal_field(context: &str, plain: &str) -> String {
     cipher().seal(context, plain.as_bytes())
@@ -193,6 +206,12 @@ fn any_sealed(c: &Connection) -> rusqlite::Result<Option<(String, String)>> {
     if mfa.is_some() {
         return Ok(mfa);
     }
+    let setting = c
+        .query_row("SELECT key, value FROM settings WHERE key LIKE ? ESCAPE '\\' LIMIT 1", [SEALED_SETTINGS], |r| Ok((setting_context(&r.get::<_, String>(0)?), r.get(1)?)))
+        .optional()?;
+    if setting.is_some() {
+        return Ok(setting);
+    }
     c.query_row("SELECT id, input FROM approvals WHERE input LIKE 'sb1:%' LIMIT 1", [], |r| Ok((approval_context(&r.get::<_, String>(0)?), r.get(1)?)))
         .optional()
 }
@@ -228,6 +247,16 @@ fn discard(c: &Connection, keep: Option<&Cipher>) -> rusqlite::Result<usize> {
     for (user, v) in pairs("SELECT user_id, secret FROM user_mfa")?.iter().filter(|(u, v)| !opens(&mfa_context(u), v)) {
         n += tx.execute("DELETE FROM user_mfa WHERE user_id = ? AND secret = ?", params![user, v])?;
         tx.execute("DELETE FROM mfa_recovery_codes WHERE user_id = ?", [user])?;
+    }
+    // A generated SAML SP key goes with its certificate, so the next one is made afresh.
+    let settings: Vec<(String, String)> = {
+        let mut s = tx.prepare("SELECT key, value FROM settings WHERE key LIKE ? ESCAPE '\\'")?;
+        s.query_map([SEALED_SETTINGS], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+    };
+    for (key, v) in settings.iter().filter(|(k, v)| !opens(&setting_context(k), v)) {
+        n += tx.execute("DELETE FROM settings WHERE key = ? AND value = ?", params![key, v])?;
+        let cert = key.replacen(SAML_SP_KEY_SETTING, SAML_SP_CERT_SETTING, 1);
+        tx.execute("DELETE FROM settings WHERE key = ?", [cert])?;
     }
     for (id, _) in approvals.iter().filter(|(id, v)| !opens(&approval_context(id), v)) {
         n += tx.execute("UPDATE approvals SET input = '{\"sealed\":\"discarded\"}' WHERE id = ?", [id])?;
@@ -305,6 +334,11 @@ fn sealed_rows(c: &Connection) -> rusqlite::Result<Vec<(&'static str, i64, Strin
     for r in s.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
         let (id, user, v) = r?;
         out.push(("UPDATE user_mfa SET secret = ? WHERE rowid = ?", id, mfa_context(&user), v));
+    }
+    let mut s = c.prepare("SELECT rowid, key, value FROM settings WHERE key LIKE ? ESCAPE '\\'")?;
+    for r in s.query_map([SEALED_SETTINGS], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
+        let (id, key, v) = r?;
+        out.push(("UPDATE settings SET value = ? WHERE rowid = ?", id, setting_context(&key), v));
     }
     Ok(out)
 }
@@ -863,16 +897,25 @@ mod tests {
             u.id
         };
         let kept_mfa = mfa(&cipher, 1);
+        let sp = |cipher: &Cipher, id: &str| {
+            let key = format!("{SAML_SP_KEY_SETTING}{id}");
+            db.set_setting(&key, &cipher.seal(&setting_context(&key), b"pkcs8"));
+            db.set_setting(&format!("{SAML_SP_CERT_SETTING}{id}"), "cert");
+        };
+        sp(&cipher, "kept");
         SealedStore::new(connect_again(&c), Arc::new(cipher)).put("KEEP_TOKEN", "kept").unwrap();
         // A value and a key check sealed with another key, e.g. after the key file was swapped.
         let other = Cipher::new(&MasterKey::generate());
         c.execute("INSERT INTO secrets (name, value, created_at, updated_at) VALUES ('LOST_TOKEN', ?, 0, 0)", [other.seal(&context("LOST_TOKEN"), b"lost")]).unwrap();
         push(&other, 2);
         let lost_mfa = mfa(&other, 2);
+        sp(&other, "lost");
         c.execute("UPDATE settings SET value = ? WHERE key = ?", params![other.seal("key-check", KEY_CHECK_PLAIN), KEY_CHECK]).unwrap();
 
         let (cipher, b) = bootstrap(&c, Some(same_key), None, no_key, true).unwrap();
-        assert_eq!(b.discarded, 3, "only the values this key can't open are dropped");
+        assert_eq!(b.discarded, 4, "only the values this key can't open are dropped");
+        assert!(db.setting("sso_saml_sp_key_kept").is_some() && db.setting("sso_saml_sp_cert_kept").is_some());
+        assert!(db.setting("sso_saml_sp_key_lost").is_none() && db.setting("sso_saml_sp_cert_lost").is_none(), "an unreadable SP key goes with its certificate, to be made again");
         let left: Vec<String> = c.prepare("SELECT id FROM push_devices").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
         assert_eq!(left, ["pd1"], "an unreadable push device goes, so its phone can register again");
         assert!(db.mfa(&kept_mfa).is_some() && db.mfa_recovery_left(&kept_mfa) == 1);
@@ -887,7 +930,7 @@ mod tests {
     }
 
     /// One sealed value of each kind: a saved secret, a user's secret, an approval input,
-    /// a push token and a second factor with one recovery code. Returns how many.
+    /// a push token, a second factor with one recovery code, and a SAML SP key. Returns how many.
     fn seal_one_of_each(db: &Db, c: &Connection, cipher: &Arc<Cipher>) -> usize {
         SealedStore::new(connect_again(c), cipher.clone()).put("OPENAI_API_KEY", "sk-saved").unwrap();
         UserSecrets::new(connect_again(c), cipher.clone()).put("ua", "GITHUB_TOKEN", "ghp-mine").unwrap();
@@ -907,7 +950,9 @@ mod tests {
         )
         .unwrap();
         assert!(db.mfa_enable(&u.id, &cipher.seal(&mfa_context(&u.id), b"12345678901234567890"), 1, &["hash".into()]));
-        5
+        let sp = format!("{SAML_SP_KEY_SETTING}corp");
+        db.set_setting(&sp, &cipher.seal(&setting_context(&sp), b"pkcs8"));
+        6
     }
 
     /// Whether every value `seal_one_of_each` wrote opens with `cipher`, as it was written.
@@ -919,6 +964,7 @@ mod tests {
             && is(&approval_context("a1"), one("SELECT input FROM approvals WHERE id = 'a1'"), br#"{"command":"ls"}"#)
             && is(crate::db::PUSH_TOKEN_CONTEXT, one("SELECT token FROM push_devices"), b"ExponentPushToken[r]")
             && is(&mfa_context(&one("SELECT user_id FROM user_mfa")), one("SELECT secret FROM user_mfa"), b"12345678901234567890")
+            && is(&setting_context("sso_saml_sp_key_corp"), one("SELECT value FROM settings WHERE key = 'sso_saml_sp_key_corp'"), b"pkcs8")
     }
 
     fn recovery_codes(c: &Connection) -> i64 {

@@ -69,6 +69,8 @@ let adaHistory: Message[] = [];
 let cookieMe = false;
 /** The server's logout fails with a 502. */
 let failLogout = false;
+/** The server's logout sends the browser on to a SAML IdP's sign-out page. */
+let idpLogout: string | undefined;
 const TOKEN = "sbs_" + "a".repeat(64);
 
 function respond(status: number, body: unknown) {
@@ -91,6 +93,7 @@ beforeEach(() => {
   adaHistory = [];
   cookieMe = false;
   failLogout = false;
+  idpLogout = undefined;
   void setCookieSignedOut(false);
   (setCookieSignedOut as jest.Mock).mockClear();
   (connectSse as jest.Mock).mockClear();
@@ -113,7 +116,7 @@ beforeEach(() => {
       if (stallLogout) return new Promise(() => {});
       if (failLogout) return respond(502, {});
       cookieMe = false;
-      return respond(200, { ok: true });
+      return respond(200, idpLogout ? { ok: true, logoutUrl: idpLogout } : { ok: true });
     }
     if (loginToken && auth !== `Bearer ${loginToken}`) return respond(401, { error: "Login required" });
     if (path === "/api/state") {
@@ -204,6 +207,23 @@ describe("signing in on the server's own pages (ADR 0027)", () => {
     await waitFor(() => expect(setCookieSignedOut).toHaveBeenLastCalledWith(false));
     expect(result.current.api).toBeNull();
     expect(cookieMe).toBe(false);
+  });
+
+  it("goes on to the SAML IdP's sign-out page when the server sends one", async () => {
+    const realLocation = window.location;
+    const assign = jest.fn();
+    Object.defineProperty(window, "location", { value: { assign }, configurable: true });
+    try {
+      cookieMe = true;
+      idpLogout = "https://idp.example/slo?SAMLRequest=x";
+      const { result } = await renderHook(() => useSuperBot(), { wrapper: SuperBotProvider });
+      await waitFor(() => expect(result.current.api).not.toBeNull());
+      await act(() => result.current.logout());
+      await waitFor(() => expect(assign).toHaveBeenCalledWith(idpLogout));
+      expect(setCookieSignedOut).toHaveBeenLastCalledWith(false);
+    } finally {
+      Object.defineProperty(window, "location", { value: realLocation, configurable: true });
+    }
   });
 
   it("shows sign-in when there is no cookie, and doesn't look for one in dev or the desktop app", async () => {
