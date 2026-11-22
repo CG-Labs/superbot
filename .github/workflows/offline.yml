@@ -10,6 +10,10 @@ name: offline
 # It also bundles a multi-arch image from a local registry, checks the bundle keeps that
 # registry's digest for this arch, loads it with no network, and pushes it to a second registry,
 # a stand-in for an operator's mirror, with the same digest (docs/adr/0140-release-bundles-and-registry-mirrors.md).
+# And it signs a two-arch image with SBOM and provenance attestations (a throwaway key, no
+# transparency log), bundles it for both arches, and pushes both bundles to a third registry
+# inside the namespace with no network: the mirror gets the signed index unchanged, and cosign
+# verifies it, each arch, and the provenance there (docs/adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md).
 # release-bundle: for every v* tag, once the docker workflow has published and signed that tag's
 # images (or by hand, for a published release), bundles them for each arch, signs each bundle
 # with cosign keylessly under this workflow's identity, and attaches both to the release.
@@ -80,7 +84,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.os }}
-      - run: cargo build --release --bin botd --bin botctl --bin superbot-machine --bin superbot-run
+      - run: cargo build --release --bin botd --bin botctl --bin superbot-machine --bin superbot-run --bin superbot-oci
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
@@ -107,6 +111,7 @@ jobs:
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
         with:
           driver-opts: network=host
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       - name: Two registries on localhost, a source and a mirror, and a two-arch image in the source
         run: |
           set -euo pipefail
@@ -126,6 +131,23 @@ jobs:
           [[ $digest == sha256:* ]]
           echo "MULTI_DIGEST=$digest" >>"$GITHUB_ENV"
           docker buildx build -q --load -t superbot-offline-ci:1 "$RUNNER_TEMP/image" >/dev/null
+      - name: A signed two-arch image with SBOM and provenance, as the docker workflow publishes a release's
+        working-directory: ${{ runner.temp }}
+        env:
+          COSIGN_PASSWORD: ''
+        run: |
+          set -euo pipefail
+          docker buildx build -q --platform linux/amd64,linux/arm64 --sbom=true --provenance=mode=max --push \
+            -t localhost:5000/superbot-offline-signed:1 image >/dev/null
+          index=sha256:$(skopeo inspect --raw docker://localhost:5000/superbot-offline-signed:1 | sha256sum | cut -c1-64)
+          echo "SIGNED_INDEX=$index" >>"$GITHUB_ENV"
+          # A throwaway key and no transparency log: nothing about this image leaves the runner.
+          cosign generate-key-pair >/dev/null
+          cosign signing-config create --out signing-config.json
+          cosign sign --yes --recursive --key cosign.key --signing-config signing-config.json "localhost:5000/superbot-offline-signed@$index"
+          echo '{"buildType":"https://github.com/CG-Labs/superbot/offline-ci"}' >predicate.json
+          cosign attest --yes --key cosign.key --signing-config signing-config.json --type slsaprovenance1 --predicate predicate.json \
+            "localhost:5000/superbot-offline-signed@$index"
       - name: Two bundles, the first with a local and a registry image, and a certificate for offline.test
         run: |
           set -euo pipefail
@@ -137,6 +159,16 @@ jobs:
           [[ $(tar -xOf "$RUNNER_TEMP/b/superbot-offline-$version-ci.1-$(uname -m).tar.gz" \
             "superbot-offline-$version-ci.1-$(uname -m)/images/multi.digest") == "$MULTI_DIGEST" ]]
           deploy/offline-bundle.sh build --out "$RUNNER_TEMP/b" --version "$version-ci.2"
+          # Both arches' bundles of the signed image (the binaries are this runner's: only the
+          # images and superbot-oci are used from these).
+          for a in x86_64 aarch64; do
+            deploy/offline-bundle.sh build --out "$RUNNER_TEMP/signed" --version "$version-ci.1" --arch "$a" \
+              --image signed=localhost:5000/superbot-offline-signed:1 --image-key "$RUNNER_TEMP/cosign.pub"
+            top=superbot-offline-$version-ci.1-$a
+            [[ $(tar -xOf "$RUNNER_TEMP/signed/$top.tar.gz" "$top/images/signed.index") == "$SIGNED_INDEX" ]]
+            tar -xOf "$RUNNER_TEMP/signed/$top.tar.gz" "$top/images/signed.sbom.spdx.json" | jq -e .spdxVersion >/dev/null
+            tar -tf "$RUNNER_TEMP/signed/$top.tar.gz" "$top/images/signed.signatures.tar" "$top/bin/superbot-oci" >/dev/null
+          done
           ls -l "$RUNNER_TEMP/b"
           openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 -subj /CN=offline.test \
             -addext subjectAltName=DNS:offline.test -keyout "$RUNNER_TEMP/tls.key" -out "$RUNNER_TEMP/tls.pem" 2>/dev/null
@@ -224,6 +256,8 @@ jobs:
           docker image inspect superbot-offline-ci:1 >/dev/null
           arch=$(case $(uname -m) in x86_64) echo amd64 ;; *) echo arm64 ;; esac)
           [[ $(docker image inspect --format '{{.Architecture}}' localhost:5000/superbot-offline-multi:1) == "$arch" ]]
+          sudo unshare --net -- deploy/offline-bundle.sh load "$RUNNER_TEMP/signed/superbot-offline-$OLD-$(uname -m).tar.gz"
+          [[ $(docker image inspect --format '{{.Architecture}}' localhost:5000/superbot-offline-signed:1) == "$arch" ]]
       - name: Push the bundle's images to a mirror, with the source registry's digest
         run: |
           set -euo pipefail
@@ -233,6 +267,37 @@ jobs:
           grep -Fq "to localhost:5001/mirror/superbot-offline-multi:1 ($MULTI_DIGEST" /tmp/offline-push.log
           docker rmi -f localhost:5000/superbot-offline-multi:1 >/dev/null 2>&1 || true
           docker pull -q "localhost:5001/mirror/superbot-offline-multi@$MULTI_DIGEST" >/dev/null
+      # The mirror is a registry binary run inside the namespace, so nothing here has a network.
+      - name: Push both arches' bundles to a mirror with no network; cosign verifies the signed index there
+        run: |
+          set -euo pipefail
+          id=$(docker create registry:2)
+          docker cp "$id:/bin/registry" "$RUNNER_TEMP/registry"
+          docker rm "$id" >/dev/null
+          printf 'version: 0.1\nlog: {level: error}\nstorage: {filesystem: {rootdirectory: %s}}\nhttp: {addr: 127.0.0.1:5002}\n' \
+            "$RUNNER_TEMP/offline-mirror" >"$RUNNER_TEMP/registry.yml"
+          printf '[[registry]]\nlocation = "localhost:5002"\ninsecure = true\n' \
+            | sudo tee /etc/containers/registries.conf.d/51-offline-mirror.conf >/dev/null
+          sudo ip netns exec offline bash -c '
+            set -euo pipefail
+            registry=$1 config=$2 bundles=$3 version=$4 index=$5 cosign=$6 key=$7
+            if curl -sS --max-time 5 https://github.com >/dev/null 2>&1; then echo "the network is still up" >&2; exit 1; fi
+            "$registry" serve "$config" >/tmp/offline-mirror-registry.log 2>&1 &
+            trap "kill $!" EXIT
+            for _ in $(seq 1 30); do curl -fsS http://localhost:5002/v2/ >/dev/null 2>&1 && break; sleep 1; done
+            deploy/offline-bundle.sh push "$bundles/superbot-offline-$version-x86_64.tar.gz" "$bundles/superbot-offline-$version-aarch64.tar.gz" \
+              --registry localhost:5002/mirror 2>&1 | tee /tmp/offline-signed-push.log
+            grep -Fq "to localhost:5002/mirror/superbot-offline-signed:1 ($index, the signed index for linux/amd64, linux/arm64)" /tmp/offline-signed-push.log
+            manifest() { curl -fsS -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json" "http://localhost:5002/v2/mirror/superbot-offline-signed/manifests/$1"; }
+            [[ $(manifest 1 | sha256sum | cut -c1-64) == "${index#sha256:}" ]]
+            # The SBOM and provenance attestations from BuildKit went up with the index, for both arches.
+            [[ $(manifest 1 | jq "[.manifests[] | select(.annotations[\"vnd.docker.reference.type\"] == \"attestation-manifest\")] | length") == 2 ]]
+            for d in $(manifest 1 | jq -r ".manifests[].digest"); do manifest "$d" >/dev/null; done
+            v=(--key "$key" --insecure-ignore-tlog=true)
+            "$cosign" verify "${v[@]}" localhost:5002/mirror/superbot-offline-signed:1 >/dev/null
+            for d in $(manifest 1 | jq -r ".manifests[].digest"); do "$cosign" verify "${v[@]}" "localhost:5002/mirror/superbot-offline-signed@$d" >/dev/null; done
+            "$cosign" verify-attestation "${v[@]}" --type slsaprovenance1 localhost:5002/mirror/superbot-offline-signed:1 >/dev/null
+          ' _ "$RUNNER_TEMP/registry" "$RUNNER_TEMP/registry.yml" "$RUNNER_TEMP/signed" "$OLD" "$SIGNED_INDEX" "$(command -v cosign)" "$RUNNER_TEMP/cosign.pub"
       - name: Logs on failure
         if: failure()
         run: |
@@ -282,7 +347,7 @@ jobs:
           [[ -z $TAG_SHA || $(git rev-parse HEAD) == "$TAG_SHA" ]] \
             || { echo "::error::$TAG is $(git rev-parse HEAD), but the docker workflow published $TAG_SHA"; exit 1; }
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
-      - run: cargo build --release --bin botd --bin botctl --bin superbot-machine --bin superbot-run
+      - run: cargo build --release --bin botd --bin botctl --bin superbot-machine --bin superbot-run --bin superbot-oci
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"

@@ -1,9 +1,10 @@
 //! ADR 0140 (#59): `.github/workflows/offline.yml` makes the offline bundles for every `v*` tag
 //! once the docker workflow has published and signed that tag's images, from that tag's own
 //! commit on `main`, and attaches them, signed, to the tag's release. Its CI job pushes a
-//! bundle's images to a mirror and checks the digests. `deploy/test-offline.sh` tests the
-//! bundles themselves; this checks the workflow wires them up. It reads lines, like
-//! `release_workflow.rs`.
+//! bundle's images to a mirror and checks the digests, and (ADR 0147) pushes both arches'
+//! bundles of a signed image to a mirror with no network, where cosign verifies the signed
+//! index. `deploy/test-offline.sh` tests the bundles themselves; this checks the workflow wires
+//! them up. It reads lines, like `release_workflow.rs`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -171,6 +172,40 @@ fn ci_pushes_a_bundles_images_to_a_mirror_with_their_digests() {
         r#"sha256sum | cut -c1-64) == "${MULTI_DIGEST#sha256:}" ]]"#,
     ] {
         assert!(s.contains(want), "install-offline must have `{want}`");
+    }
+}
+
+#[test]
+fn ci_puts_both_arches_signed_index_in_a_mirror_with_no_network() {
+    let yaml = read(".github/workflows/offline.yml");
+    let all = jobs(&yaml);
+    for id in ["install-offline", "release-bundle"] {
+        let build = steps(job(&all, id)).into_iter().find(|s| s.contains("cargo build --release")).unwrap_or_else(|| panic!("{id} builds the binaries"));
+        assert!(build.contains("--bin superbot-oci"), "{id} builds superbot-oci, which bundles with images carry");
+    }
+    let s = steps(job(&all, "install-offline"));
+    let all_steps = s.join("\n");
+    for want in [
+        "--sbom=true --provenance=mode=max --push",
+        "cosign signing-config create --out signing-config.json",
+        "cosign sign --yes --recursive --key cosign.key --signing-config signing-config.json",
+        "cosign attest --yes --key cosign.key --signing-config signing-config.json --type slsaprovenance1",
+        "for a in x86_64 aarch64; do",
+        r#"--image signed=localhost:5000/superbot-offline-signed:1 --image-key "$RUNNER_TEMP/cosign.pub""#,
+    ] {
+        assert!(all_steps.contains(want), "install-offline must have `{want}`");
+    }
+    let mirror = s.iter().find(|s| s.contains("--registry localhost:5002/mirror")).expect("a push of both arches' bundles");
+    for want in [
+        "sudo ip netns exec offline bash -c",
+        "the network is still up",
+        r#"push "$bundles/superbot-offline-$version-x86_64.tar.gz" "$bundles/superbot-offline-$version-aarch64.tar.gz""#,
+        "($index, the signed index for linux/amd64, linux/arm64)",
+        r#""$cosign" verify "${v[@]}" localhost:5002/mirror/superbot-offline-signed:1"#,
+        r#""$cosign" verify "${v[@]}" "localhost:5002/mirror/superbot-offline-signed@$d""#,
+        r#""$cosign" verify-attestation "${v[@]}" --type slsaprovenance1 localhost:5002/mirror/superbot-offline-signed:1"#,
+    ] {
+        assert!(mirror.contains(want), "the mirror step must have `{want}`");
     }
 }
 
