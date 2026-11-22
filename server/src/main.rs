@@ -15,6 +15,10 @@ mod acl_http_tests;
 mod adapters;
 mod approvals;
 mod audit;
+mod audit_chain;
+#[cfg(test)]
+mod audit_chain_http_tests;
+mod audit_export;
 #[cfg(test)]
 mod audit_http_tests;
 #[cfg(test)]
@@ -46,6 +50,9 @@ mod deprovision;
 #[cfg(test)]
 mod deprovision_http_tests;
 mod erasure;
+mod evidence;
+#[cfg(test)]
+mod evidence_http_tests;
 mod file_retention;
 #[cfg(test)]
 mod file_retention_http_tests;
@@ -337,6 +344,7 @@ async fn main() {
         log_warn!("{e}");
         std::process::exit(1);
     });
+    let audit_export = audit_export::Settings::from_env(&|k| env(k, ""), &startup_store).unwrap_or_else(|e| exit(format!("Audit export: {e}")));
     let chat_retention = retention::days("CHAT_RETENTION_DAYS", &env("CHAT_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
     let session_retention = retention::days("HARNESS_SESSION_RETENTION_DAYS", &env("HARNESS_SESSION_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
     let teammate_files_retention = retention::days("TEAMMATE_FILES_RETENTION_DAYS", &env("TEAMMATE_FILES_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
@@ -352,6 +360,7 @@ async fn main() {
         })
     };
     let data_dir = root("DATA_DIR", "data");
+    let evidence = evidence::Settings::from_env(&|k| env(k, ""), &data_dir).unwrap_or_else(|e| exit(format!("Evidence bundles: {e}")));
     let workspace = root("WORKSPACE_DIR", "workspace");
     let db_path = paths::child(&data_dir, "app.sqlite").unwrap();
     let data_lock = database_encryption::lock_data_dir(&db_path).unwrap_or_else(|e| exit(format!("Database: {e}")));
@@ -716,6 +725,7 @@ async fn main() {
         "sessionIdleMinutes": sessions.idle_ms / 60_000,
         "sessionMaxMinutes": sessions.max_ms / 60_000,
         "auditRetentionDays": retention,
+        "auditExport": audit_export.sink.as_ref().map(|s| json!({ "kind": s.kind(), "sink": s.shown })),
         "chatRetentionDays": chat_retention,
         "harnessSessionRetentionDays": session_retention,
         "teammateFilesRetentionDays": teammate_files_retention,
@@ -744,10 +754,14 @@ async fn main() {
         "databaseEncryption": database_summary,
     })));
     license::start(app.clone());
+    log_info!("Audit export: {} (ADR 0122).", audit_export.describe());
+    audit_export::start(&app, audit_export);
     audit::start_retention(app.clone(), retention);
     secrets::external::start_audit(app.clone());
+    audit_chain::start(app.clone());
     retention::start(app.clone(), retention::Settings { chat: chat_retention, sessions: session_retention, teammate_files: teammate_files_retention });
     server_backups::start(app.clone());
+    evidence::start(app.clone(), evidence, sessions, mfa_pinned);
     backup_encryption::start(app.clone());
     database_encryption::start(app.clone());
     users::start_pruning(app.clone(), sessions);
@@ -882,6 +896,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/approvals/{id}/deny", post(deny))
         .route("/audit", get(list_audit))
         .route("/audit/export.csv", get(export_audit))
+        .route("/audit/verify", get(audit_chain::get))
+        .route("/audit/siem", get(audit_export::get))
         .route("/access-review", get(access_review::get))
         .route("/access-review/export.csv", get(access_review::export))
         .route("/access-review/complete", post(access_review::complete))
@@ -890,6 +906,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/backups", get(server_backups::get).post(server_backups::copy_now))
         .route("/database", get(database_encryption::get))
         .route("/support/bundle", get(support::bundle))
+        .route("/evidence", get(evidence::get))
+        .route("/evidence/bundle", get(evidence::bundle))
         .route("/secrets", get(list_secrets))
         .route("/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/me/tier", get(my_tier))
