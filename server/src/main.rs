@@ -444,7 +444,8 @@ async fn main() {
         bot_key: bot_key.clone(),
         run_timeout: Duration::from_secs(60 * env("RUN_TIMEOUT_MINUTES", "60").parse::<u64>().unwrap_or(60)),
         default_harness,
-        sandbox_host: sandbox::host(),
+        // Runs under per-user accounts start through superbot-run, with no new privileges.
+        sandbox_host: if isolation.is_some() { sandbox::host_no_new_privs() } else { sandbox::host() },
         home: std::env::var_os("HOME").map(PathBuf::from),
     }, screens);
     let _ = app.tiers.set(Arc::new(tiers));
