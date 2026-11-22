@@ -28,6 +28,7 @@ SuperBot sends nothing to CG-Labs. There is no telemetry, analytics or crash rep
 |---------|----------|
 | Let's Encrypt or ZeroSSL (through Caddy) | HTTPS certificates for the server's domain. |
 | `images.linuxcontainers.org` | Incus base images (`INCUS_IMAGE_SERVER`, or `local`). |
+| An error tracker that takes Sentry's protocol (Sentry, GlitchTip, Bugsink, or one the operator runs) | botd's panics and 5xx answers, off unless `ERROR_REPORT_DSN` is set: route templates, statuses, source locations, request ids and botd's version, scrubbed of secrets and emails; never a prompt, chat, path, body or user ([ADR 0113](../adr/0113-service-dashboards-and-error-reporting.md)). It sees the server's IP as the sender. |
 | Node.js downloads and the npm registry | Installing harness CLIs on machines ([ADR 0039](../adr/0039-machine-harnesses-and-agent-upgrades.md)). |
 | GitHub | The install script and releases. |
 | Apple App Store, Google Play | Distributing the apps. |

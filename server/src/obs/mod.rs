@@ -8,6 +8,7 @@
 //! bearer token (`METRICS_TOKEN`), and botd refuses to start without one.
 
 pub mod capacity;
+pub mod errors;
 pub mod log;
 pub mod metrics;
 
@@ -49,6 +50,7 @@ pub fn request_id() -> Option<String> {
 pub struct Settings {
     pub log: log::Format,
     pub metrics: Option<Listen>,
+    pub errors: errors::Settings,
 }
 
 #[derive(Debug)]
@@ -60,6 +62,7 @@ pub struct Listen {
 impl Settings {
     pub fn from_env(get: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result<Settings, String> {
         let log = log::Format::parse(&get("LOG_FORMAT"))?;
+        let errors = errors::Settings::from_env(get, store)?;
         let raw = get("METRICS_LISTEN");
         let addr = match raw.trim().to_ascii_lowercase().as_str() {
             "" | "off" => None,
@@ -67,7 +70,7 @@ impl Settings {
             _ => Some(raw.trim().parse::<SocketAddr>().map_err(|_| format!("METRICS_LISTEN must be off, on, or an address and port such as {DEFAULT_LISTEN}, not \"{raw}\""))?),
         };
         let Some(addr) = addr else {
-            return Ok(Settings { log, metrics: None });
+            return Ok(Settings { log, metrics: None, errors });
         };
         let token = store.get("METRICS_TOKEN").map_err(|e| e.to_string())?;
         if let Some(t) = &token {
@@ -78,11 +81,11 @@ impl Settings {
         } else if !addr.ip().is_loopback() {
             return Err(format!("METRICS_LISTEN={addr} is off loopback, so set METRICS_TOKEN (or METRICS_TOKEN_FILE) for scrapers to send"));
         }
-        Ok(Settings { log, metrics: Some(Listen { addr, token }) })
+        Ok(Settings { log, metrics: Some(Listen { addr, token }), errors })
     }
 
     pub fn describe(&self) -> String {
-        let logs = format!("logs as {} (LOG_FORMAT)", self.log.as_str());
+        let logs = format!("logs as {} (LOG_FORMAT); {}", self.log.as_str(), self.errors.describe());
         match &self.metrics {
             None => format!("{logs}; metrics off (METRICS_LISTEN)"),
             Some(l) => format!(
@@ -133,24 +136,34 @@ fn request_id_for(req: &Request) -> String {
 }
 
 /// The route a request matched, for its log line: a template like
-/// `/api/bots/{id}/messages`, never the path as sent.
-#[derive(Clone)]
-struct Route(String);
+/// `/api/bots/{id}/messages`, never the path as sent. `track` puts it on the request
+/// and reads it after, so it's known even when the handler panics.
+#[derive(Clone, Default)]
+struct Route(std::sync::Arc<std::sync::OnceLock<String>>);
 
 /// On the API's routes: notes the template they matched, for `track`.
 pub async fn note_route(req: Request, next: Next) -> Response {
-    let route = req.extensions().get::<MatchedPath>().map(|m| m.as_str().to_string());
-    let mut res = next.run(req).await;
-    if let Some(r) = route {
-        res.extensions_mut().insert(Route(r));
+    if let (Some(slot), Some(m)) = (req.extensions().get::<Route>(), req.extensions().get::<MatchedPath>()) {
+        let _ = slot.0.set(m.as_str().to_string());
     }
-    res
+    next.run(req).await
+}
+
+/// Inside `track`: a handler that panics answers 500, so the request is counted, logged
+/// and reported like any other 5xx instead of dropping the connection.
+pub fn catch_panics() -> tower_http::catch_panic::CatchPanicLayer<fn(Box<dyn std::any::Any + Send>) -> Response> {
+    fn answer(_: Box<dyn std::any::Any + Send>) -> Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({ "error": "Internal error" }))).into_response()
+    }
+    tower_http::catch_panic::CatchPanicLayer::custom(answer as fn(_) -> _)
 }
 
 /// Outermost: gives every request an id (`X-Request-Id`, echoed back), counts it and
 /// its latency by route class, and logs it in JSON format.
-pub async fn track(AxState(app): AxState<AppState>, req: Request, next: Next) -> Response {
+pub async fn track(AxState(app): AxState<AppState>, mut req: Request, next: Next) -> Response {
     let started = Instant::now();
+    let slot = Route::default();
+    req.extensions_mut().insert(slot.clone());
     let id = request_id_for(&req);
     let class = route_class(req.uri().path());
     let method = metrics::method(req.method().as_str());
@@ -161,8 +174,12 @@ pub async fn track(AxState(app): AxState<AppState>, req: Request, next: Next) ->
     if let Ok(v) = HeaderValue::from_str(&id) {
         res.headers_mut().insert(REQUEST_ID, v);
     }
+    let route = slot.0.get().cloned();
+    // The status page answers 503 in a major outage, on purpose.
+    if code >= 500 && !matches!(class, "healthz" | "status") {
+        errors::http_error(method, route.as_deref(), class, code, &id);
+    }
     if !(class == "healthz" && res.status().is_success()) {
-        let route = res.extensions().get::<Route>().map(|r| r.0.clone());
         let level = if code >= 500 { Level::Warn } else { Level::Info };
         log::event(
             level,
@@ -224,6 +241,7 @@ pub fn render(app: &AppState) -> String {
     capacity::render(app, &mut out);
     crate::server_backups::render(app, &mut out);
     crate::backup_encryption::render(app, &mut out);
+    errors::render(&mut out);
     out
 }
 
