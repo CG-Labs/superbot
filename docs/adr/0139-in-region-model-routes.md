@@ -38,7 +38,7 @@ A named endpoint in the tiers file (ADR 0077) may list `regions`: data region id
 
 A run is held when its data is pinned: the Bot owner's pin (their team's, else their own, as in ADR 0129), and the asker's pin when someone else asks. Every pinned region must be served.
 
-- **Bots asking Bots.** A run carries the data of its owner, its asker, and everyone the asking Bot's run carried, through any number of Bots and in either `SHARED_BOTS` mode. With open sharing, `/api/ask` names only the asking Bot's owner as the next asker. Without this, pinned Ada asking Bea's Bot, which asks Cy's, would send Ada's request through Cy's unheld route. The carried list is used only for pins. Access and whom a run acts for (ADR 0046) are unchanged.
+- **Bots asking Bots.** A run carries the data of its owner, its asker, and everyone the asking Bot's run carried, through any number of Bots and in either `SHARED_BOTS` mode. With open sharing, `/api/ask` names only the asking Bot's owner as the next asker. Without this, pinned Ada asking Bea's Bot, which asks Cy's, would send Ada's request through Cy's unheld route. The list is taken when the Bot asks and kept with the queued message (`requested_by`), so it still holds if the asking Bot runs for someone else first or botd restarts. A late reply carries what the answering run carried. The carried list is used only for pins. Access and whom a run acts for (ADR 0046) are unchanged. Erasing someone (ADR 0102) also stops queued and running work that carries their data, and clears them from it.
 - **Queued runs.** A run picks its route before it waits for a slot. When its turn comes, the pins are read again. If anyone it carries was pinned meanwhile to a region its route wasn't held to, it doesn't start: it is refused (`residency_pinned`, `whileQueued: true`), not counted, and the Bot asks for it to be sent again. Sent again, it takes the held route.
 
 1. The route the tier picks (ADR 0033) is kept if its own provider is an endpoint whose `regions` include every pinned region.
@@ -108,5 +108,6 @@ Pinning still checks only machines and backups (ADR 0129). A tenant whose plan h
   - unpinned, runs are as before;
   - a team pin holds its member's runs;
   - with open sharing, a pinned person's run of one Bot asking a second, which asks a third, holds all three; the second's owner asking again later isn't held;
-  - a pin made while a run waits for a slot refuses it without counting it; sent again, it is held.
+  - a pin made while a run waits for a slot refuses it without counting it; sent again, it is held;
+  - a Bot's queued question keeps the pin it was asked with after that Bot runs for someone else, and the carried people are saved with the message.
 - `machines_residency_tests.rs`: a pin on an open plan is warned about in `GET /api/regions`.

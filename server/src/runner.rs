@@ -194,7 +194,7 @@ struct BotState {
 /// scheduler acted for, and whom the run is for.
 fn named_in(msg: &Message) -> Vec<String> {
     let Some(by) = &msg.requested_by else { return Vec::new() };
-    [&by.actor.id, &by.actor.on_behalf_of, &by.actor.asker].into_iter().flatten().cloned().collect()
+    [&by.actor.id, &by.actor.on_behalf_of, &by.actor.asker].into_iter().flatten().chain(&by.actor.carries).cloned().collect()
 }
 
 pub struct App {
@@ -407,15 +407,17 @@ impl App {
         a.asker.clone().or(person).unwrap_or_else(|| bot.owner_id.clone())
     }
 
+    /// Whose data a Bot's latest run carries (ADR 0139), for what it queues to carry too.
+    pub fn carried_by(&self, bot: &Bot) -> Vec<String> {
+        self.carried.lock().unwrap_or_else(|e| e.into_inner()).get(&bot.id).cloned().unwrap_or_else(|| vec![bot.owner_id.clone()])
+    }
+
     /// Whose data a run of `bot` for `asker`, asked `by`, carries (ADR 0139): the owner,
-    /// the asker, and whom an asking Bot's latest run carried.
-    fn carries(&self, bot: &Bot, asker: &str, by: &Who) -> Vec<String> {
+    /// the asker, and whom an asking Bot's run carried when it queued the message.
+    fn carries(bot: &Bot, asker: &str, by: &Who) -> Vec<String> {
         let mut people = vec![bot.owner_id.clone(), asker.to_string()];
-        if by.actor.kind == ActorKind::Bot
-            && let Some(from) = by.actor.id.as_deref()
-            && let Some(theirs) = self.carried.lock().unwrap_or_else(|e| e.into_inner()).get(from)
-        {
-            people.extend(theirs.iter().cloned());
+        if by.actor.kind == ActorKind::Bot {
+            people.extend(by.actor.carries.iter().cloned());
         }
         let mut seen = std::collections::HashSet::new();
         people.retain(|p| seen.insert(p.clone()));
@@ -969,7 +971,7 @@ impl App {
             Err(RunSpaceError::Secrets(e)) => return self.refuse_for_secrets(&bot, msg, &by, &e, None),
         };
         self.requesters.lock().unwrap_or_else(|e| e.into_inner()).insert(bot.id.clone(), asker.clone());
-        let people = self.carries(&bot, &asker, &by);
+        let people = Self::carries(&bot, &asker, &by);
         self.carried.lock().unwrap_or_else(|e| e.into_inner()).insert(bot.id.clone(), people.clone());
         if isolated {
             let asker = for_other.clone().unwrap_or_else(|| bot.owner_id.clone());
@@ -2398,6 +2400,11 @@ impl App {
             if let (Some(answered), Some(asking)) = (self.db.bot(&msg.bot_id), self.db.bot(asker)) {
                 let mut actor = Actor::for_bot(&answered);
                 actor.asker = Some(msg.requested_by.as_ref().map_or(asking.owner_id.clone(), |by| Self::asker_of(&asking, by)));
+                // What the answering run carried, from its question: the reply holds it too.
+                actor.carries = match &msg.requested_by {
+                    Some(by) => Self::carries(&answered, &Self::asker_of(&answered, by), by),
+                    None => vec![answered.owner_id.clone()],
+                };
                 let by = Who { actor, source: Default::default() };
                 self.db.set_requested_by(m.id, &by);
                 m.requested_by = Some(by);

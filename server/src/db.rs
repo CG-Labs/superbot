@@ -122,7 +122,7 @@ pub const ERASED_NAME: &str = "Erased user";
 
 /// Whether the message in `m` was sent by user `?1`, or by a run for them.
 const SENT_BY: &str = "(CASE WHEN json_valid(m.requested_by) THEN json_extract(m.requested_by, '$.actor.id') = ?1 OR json_extract(m.requested_by, '$.actor.asker') = ?1 END)";
-const SENT_BY_ANY: &str = "(CASE WHEN json_valid(requested_by) THEN json_extract(requested_by, '$.actor.id') = ?1 OR json_extract(requested_by, '$.actor.asker') = ?1 END)";
+const SENT_BY_ANY: &str = "(CASE WHEN json_valid(requested_by) THEN json_extract(requested_by, '$.actor.id') = ?1 OR json_extract(requested_by, '$.actor.asker') = ?1 OR EXISTS (SELECT 1 FROM json_each(requested_by, '$.actor.carries') WHERE value = ?1) END)";
 
 /// How an erasure rewrites a string about the erased person: their id becomes the
 /// pseudonym wherever it appears, as does an email of theirs (any case); a string that is

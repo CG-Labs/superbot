@@ -163,11 +163,20 @@ async fn reply_after(app: &App, bot: &str, before: i64) -> String {
     panic!("no reply from {bot}");
 }
 
-/// `from`, in a run, asks `to` as `/api/ask` does with open shared Bots: as itself, for
-/// its owner, naming no one else.
+/// How `from`, in a run, asks as `/api/ask` does with open shared Bots: as itself, for
+/// its owner, naming no one else, carrying whom its run carries.
+fn asking(app: &App, from: &crate::db::Bot) -> crate::audit::Who {
+    let mut actor = crate::audit::Actor::for_bot(from);
+    actor.carries = app.carried_by(from);
+    crate::audit::Who { actor, source: Default::default() }
+}
+
+async fn ask_as(app: &Arc<App>, from: &crate::db::Bot, to: &crate::db::Bot, by: &crate::audit::Who) -> String {
+    app.ask(from, to, "status?", std::time::Duration::from_secs(10), by).await.expect("no reply")
+}
+
 async fn bot_asks(app: &Arc<App>, from: &crate::db::Bot, to: &crate::db::Bot) -> String {
-    let by = crate::audit::Who { actor: crate::audit::Actor::for_bot(from), source: Default::default() };
-    app.ask(from, to, "status?", std::time::Duration::from_secs(10), &by).await.expect("no reply")
+    ask_as(app, from, to, &asking(app, from)).await
 }
 
 #[tokio::test]
@@ -202,6 +211,35 @@ async fn a_pin_holds_through_bots_asking_bots() {
     // Once Cy's own run asks again, Ada's data isn't in it.
     assert_eq!(run(port, &app, &cy, &cy_bot.id).await, "provider=superbot-us-gpt openrouter=set aux=0");
     assert_eq!(bot_asks(&app, &cy_bot, &bea_two).await, "provider=superbot-us-gpt openrouter=set aux=0");
+}
+
+#[tokio::test]
+async fn a_queued_bot_request_keeps_the_pin_it_was_asked_with() {
+    let (port, app, admin, _) = serve_app().await;
+    app.tiers.set(Arc::new(Tiers::parse(TIERS, None).unwrap())).unwrap();
+    fake_hermes(&app);
+    let (ada_id, ada) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (bea_id, bea) = user_with(port, &admin, "bea@example.com", "member").await;
+    let (cy_id, cy) = user_with(port, &admin, "cy@example.com", "member").await;
+    for who in [&ada, &bea, &cy] {
+        save_keys(port, who).await;
+    }
+    let bea_bot = app.db.create_bot_owned("Bea's", "#fff", "waddle", "hermes", None, false, &bea_id, Visibility::Shared);
+    let cy_bot = app.db.create_bot_owned("Cy's", "#fff", "waddle", "hermes", None, false, &cy_id, Visibility::Shared);
+    app.db.pin_residency(PinOn::User, &ada_id, "gb-lon", "DPA-7", None).unwrap();
+
+    // Ada's run of Bea's Bot asks Cy's; Bea's own run comes before the question runs.
+    let held = "provider=superbot-uk-claude openrouter=unset aux=12";
+    assert_eq!(run(port, &app, &ada, &bea_bot.id).await, held);
+    let by = asking(&app, &bea_bot);
+    assert_eq!(run(port, &app, &bea, &bea_bot.id).await, "provider=superbot-us-gpt openrouter=set aux=0");
+    let before = app.db.last_id();
+    assert_eq!(ask_as(&app, &bea_bot, &cy_bot, &by).await, held, "the question still carries Ada's data");
+
+    // Whom it carries is kept with the queued message, so a restart doesn't lose it.
+    let peer = app.db.messages(&cy_bot.id, 50).into_iter().find(|m| m.id > before && m.role == "peer").expect("no peer message");
+    let kept = app.db.message(peer.id).and_then(|m| m.requested_by).expect("no requester");
+    assert!(kept.actor.carries.contains(&ada_id), "{:?}", kept.actor);
 }
 
 #[tokio::test]
