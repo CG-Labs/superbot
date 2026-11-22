@@ -3,11 +3,14 @@
 //! SCIM_GROUPS=on, pushes groups as teams (`groups`). The core User and Group schemas
 //! only; Bulk, sorting, and ETags are not supported. Each IdP connection is a tenant
 //! with its own bearer tokens (`sbp_`, stored hashed), and sees only the users it
-//! provisioned and the groups it made or an admin linked to it. SCIM never sets roles,
-//! org-wide or on a team.
-//! Design: docs/adr/0023-scim.md, docs/adr/0095-scim-groups-as-teams.md.
+//! provisioned and the groups it made or an admin linked to it. The IdP never names a
+//! role: with SCIM_GROUP_ROLES=on, an admin may map a group to a custom role, never
+//! admin, and its members get and lose it with the group (`roles`).
+//! Design: docs/adr/0023-scim.md, docs/adr/0095-scim-groups-as-teams.md,
+//! docs/adr/0138-scim-group-role-mapping.md.
 
 pub mod groups;
+pub mod roles;
 
 use crate::audit::{Actor, ActorKind, Outcome, Source, Who};
 use crate::db::{self, NewIdentity, ScimConflict, ScimFields, ScimKey, ScimToken, ScimUser, User};
@@ -54,6 +57,10 @@ pub struct Scim {
     /// SCIM_GROUPS=on: groups are teams (ADR 0095). Off: `/Groups` lists none and
     /// refuses the rest, as before.
     pub groups: bool,
+    /// SCIM_GROUP_ROLES=on: admins may map a group to a custom role, which its members
+    /// get and lose with the group (ADR 0138). Off: no mapping is made and nothing is
+    /// given; grants already made are still taken away.
+    pub group_roles: bool,
     /// One group write at a time, so what a request checked still holds when it writes.
     pub group_writes: tokio::sync::Mutex<()>,
 }
@@ -66,6 +73,7 @@ impl Default for Scim {
             limiter: Limiter::new(RATE_LIMIT, RATE_WINDOW_MS),
             failures: Limiter::new(FAIL_LIMIT, FAIL_WINDOW_MS),
             groups: false,
+            group_roles: false,
             group_writes: tokio::sync::Mutex::new(()),
         }
     }
@@ -81,10 +89,15 @@ fn on_off(name: &str, v: &str) -> Result<bool, String> {
 
 impl Scim {
     /// SCIM (off unless on), SCIM_DEFAULT_ROLE (member, the default, or readonly), and
-    /// SCIM_GROUPS (off unless on; needs SCIM=on to do anything).
-    pub fn from_env(scim: &str, role: &str, groups: &str) -> Result<Scim, String> {
+    /// SCIM_GROUPS (off unless on; needs SCIM=on to do anything), and SCIM_GROUP_ROLES
+    /// (off unless on; needs SCIM_GROUPS=on).
+    pub fn from_env(scim: &str, role: &str, groups: &str, group_roles: &str) -> Result<Scim, String> {
         let enabled = on_off("SCIM", scim)?;
         let groups = on_off("SCIM_GROUPS", groups)?;
+        let group_roles = on_off("SCIM_GROUP_ROLES", group_roles)?;
+        if group_roles && !groups {
+            return Err("SCIM_GROUP_ROLES=on needs SCIM_GROUPS=on: a group's role follows its members, and groups are teams.".into());
+        }
         let default_role = match role.trim() {
             "" => Role::Member,
             r => match Role::parse(r) {
@@ -93,7 +106,7 @@ impl Scim {
                 None => return Err(format!("SCIM_DEFAULT_ROLE must be member or readonly, not \"{role}\"")),
             },
         };
-        Ok(Scim { enabled, default_role, groups, ..Scim::default() })
+        Ok(Scim { enabled, default_role, groups, group_roles, ..Scim::default() })
     }
 }
 
@@ -960,6 +973,7 @@ pub async fn delete_user(State(app): State<AppState>, Extension(a): Extension<Ar
     }
     crate::machines::offboard::left(&app, &c.who, &id, crate::machines::offboard::DEPROVISIONED);
     groups::user_deleted(&app, &a, &c, &id).await;
+    roles::user_deleted(&app, &a, &c.who, &id).await;
     crate::deprovision::user_disabled(&app, &c.who, &id, crate::deprovision::SCIM_DELETE).await;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -975,7 +989,7 @@ fn tenant_name(v: &Value) -> Res<String> {
 
 /// `GET /api/scim/tokens`: every token (never a value), and whether SCIM is on.
 pub async fn list_tokens(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>) -> Json<Value> {
-    Json(json!({ "enabled": a.scim.enabled, "defaultRole": a.scim.default_role, "groups": a.scim.groups, "tokens": app.db.scim_tokens() }))
+    Json(json!({ "enabled": a.scim.enabled, "defaultRole": a.scim.default_role, "groups": a.scim.groups, "groupRoles": a.scim.group_roles, "tokens": app.db.scim_tokens() }))
 }
 
 /// `POST /api/scim/tokens {tenant, label?, sso?}`. `sso` names a configured SSO provider
@@ -1024,17 +1038,21 @@ mod tests {
 
     #[test]
     fn settings_are_off_by_default_and_never_make_admins() {
-        let s = Scim::from_env("", "", "").unwrap();
-        assert!(!s.enabled && !s.groups);
+        let s = Scim::from_env("", "", "", "").unwrap();
+        assert!(!s.enabled && !s.groups && !s.group_roles);
         assert_eq!(s.default_role, Role::Member);
-        assert!(Scim::from_env("on", "", "").unwrap().enabled);
-        assert!(!Scim::from_env("on", "", "").unwrap().groups, "groups need their own switch");
-        assert!(Scim::from_env("on", "", "on").unwrap().groups);
-        assert_eq!(Scim::from_env("on", "read-only", "").unwrap().default_role, Role::Readonly);
-        assert!(Scim::from_env("maybe", "", "").is_err());
-        assert!(Scim::from_env("on", "", "teams").is_err());
-        assert!(Scim::from_env("on", "admin", "").is_err());
-        assert!(Scim::from_env("on", "owner", "").is_err());
+        assert!(Scim::from_env("on", "", "", "").unwrap().enabled);
+        assert!(!Scim::from_env("on", "", "", "").unwrap().groups, "groups need their own switch");
+        assert!(Scim::from_env("on", "", "on", "").unwrap().groups);
+        assert!(!Scim::from_env("on", "", "on", "").unwrap().group_roles, "and group roles theirs");
+        assert!(Scim::from_env("on", "", "on", "on").unwrap().group_roles);
+        assert!(Scim::from_env("on", "", "", "on").is_err(), "group roles need groups");
+        assert!(Scim::from_env("on", "", "on", "admin").is_err());
+        assert_eq!(Scim::from_env("on", "read-only", "", "").unwrap().default_role, Role::Readonly);
+        assert!(Scim::from_env("maybe", "", "", "").is_err());
+        assert!(Scim::from_env("on", "", "teams", "").is_err());
+        assert!(Scim::from_env("on", "admin", "", "").is_err());
+        assert!(Scim::from_env("on", "owner", "", "").is_err());
     }
 
     #[test]
@@ -1042,9 +1060,10 @@ mod tests {
         for (name, text) in [(".env.example", include_str!("../../.env.example")), ("deploy/docker/.env.example", include_str!("../../deploy/docker/.env.example"))] {
             let vars: HashMap<&str, &str> = text.lines().filter(|l| !l.trim_start().starts_with('#')).filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim(), v.trim())).collect();
             let get = |k: &str| vars.get(k).copied().unwrap_or("");
-            let s = Scim::from_env(get("SCIM"), get("SCIM_DEFAULT_ROLE"), get("SCIM_GROUPS")).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert!(!s.enabled && !s.groups && vars.contains_key("SCIM"), "{name}");
+            let s = Scim::from_env(get("SCIM"), get("SCIM_DEFAULT_ROLE"), get("SCIM_GROUPS"), get("SCIM_GROUP_ROLES")).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(!s.enabled && !s.groups && !s.group_roles && vars.contains_key("SCIM"), "{name}");
             assert!(text.contains("SCIM_GROUPS"), "{name} documents SCIM_GROUPS");
+            assert!(text.contains("SCIM_GROUP_ROLES"), "{name} documents SCIM_GROUP_ROLES");
         }
     }
 

@@ -97,6 +97,13 @@ pub const DELEGABLE: [Perm; 6] = [Perm::ManageUsers, Perm::ManageBots, Perm::Vie
 /// its people (invites, removing members), its machines, and its plan.
 pub const TEAM_SCOPED: [Perm; 3] = [Perm::ManageUsers, Perm::ManageMachines, Perm::ManageBilling];
 
+/// What a SCIM group's role can never hold (ADR 0138), because its routes act on admins
+/// with no delegate limit to stop them: anyone's Bots and routines, and anyone's machine,
+/// admins' included. Within a team only the team's machines, which its owners' and
+/// admins' are too. Every other delegable permission keeps its holder off admins.
+pub const REACHES_ADMINS: [Perm; 2] = [Perm::ManageBots, Perm::ManageMachines];
+pub const REACHES_ADMINS_IN_TEAM: [Perm; 1] = [Perm::ManageMachines];
+
 impl Perm {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -169,6 +176,13 @@ impl Perms {
 
     pub fn names(self) -> Vec<&'static str> {
         DELEGABLE.iter().filter(|p| self.has(**p)).map(|p| p.as_str()).collect()
+    }
+
+    /// The permissions here that would let a SCIM group's members reach admins, across the
+    /// server or (`team`) within the group's team. Empty: the IdP may give it (ADR 0138).
+    pub fn reaching_admins(self, team: bool) -> Vec<&'static str> {
+        let (held, reach) = if team { (self.in_team(), &REACHES_ADMINS_IN_TEAM[..]) } else { (self, &REACHES_ADMINS[..]) };
+        reach.iter().filter(|p| held.has(**p)).map(|p| p.as_str()).collect()
     }
 }
 
@@ -352,6 +366,19 @@ mod tests {
     }
 
     #[test]
+    fn scim_groups_never_get_permissions_that_reach_admins() {
+        let all = DELEGABLE.into_iter().fold(Perms::NONE, Perms::with);
+        assert_eq!(all.reaching_admins(false), ["bots.manage", "machines.manage"]);
+        assert_eq!(all.reaching_admins(true), ["machines.manage"]);
+        let helpdesk = Perms::from_names(["users.manage", "audit.view", "billing.manage", "signups.approve"]);
+        assert!(helpdesk.reaching_admins(false).is_empty() && helpdesk.reaching_admins(true).is_empty());
+        // Within a team, only what applies there counts: bots.manage does nothing in a team.
+        assert!(Perms::from_names(["bots.manage"]).reaching_admins(true).is_empty());
+        assert_eq!(Perms::from_names(["bots.manage"]).reaching_admins(false), ["bots.manage"]);
+        assert!(Perms::NONE.reaching_admins(false).is_empty());
+    }
+
+    #[test]
     fn every_route_is_classified() {
         let m = |s: &str| Method::from_bytes(s.as_bytes()).unwrap();
         let cases = [
@@ -439,6 +466,11 @@ mod tests {
             ("GET", "/api/scim/groups", Perm::Admin),
             ("POST", "/api/scim/groups", Perm::Admin),
             ("DELETE", "/api/scim/groups/t1", Perm::Admin),
+            // And mapping SCIM groups to custom roles (ADR 0138).
+            ("GET", "/api/scim/role-mappings", Perm::Admin),
+            ("POST", "/api/scim/role-mappings", Perm::Admin),
+            ("GET", "/api/scim/role-mappings/sm1", Perm::Admin),
+            ("DELETE", "/api/scim/role-mappings/sm1", Perm::Admin),
             ("GET", "/api/auth/me", Perm::Account),
             ("GET", "/api/machine", Perm::Account),
             ("GET", "/api/me/secrets", Perm::Read),
