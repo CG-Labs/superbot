@@ -238,6 +238,7 @@ fn machine(v: &Value) -> Result<ProviderMachine, ProviderError> {
             .and_then(Value::as_str)
             .map(String::from),
         backups: v["backups"]["enabled"].as_bool().unwrap_or(false),
+        last_backup_at: v["backups"]["last_successful"].as_str().and_then(time),
         tags: v["tags"]
             .as_array()
             .map(|a| {
@@ -249,6 +250,14 @@ fn machine(v: &Value) -> Result<ProviderMachine, ProviderError> {
             .unwrap_or_default(),
         user_data: false,
     })
+}
+
+/// A Linode time, in ms. Linode writes UTC without a zone (`2018-01-01T00:01:01`).
+fn time(s: &str) -> Option<i64> {
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+        .map(|t| t.and_utc().timestamp_millis())
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(s).map(|t| t.timestamp_millis()))
+        .ok()
 }
 
 /// Linode ids are numbers; anything else never reaches a URL path.
@@ -398,6 +407,12 @@ impl MachineProvider for Linode {
             .await
             .map(drop)
         })
+    }
+
+    /// Linode Backups: daily, kept apart from the Linode's disks, and restored from
+    /// Linode's console onto it or a new Linode.
+    fn reports_backups(&self) -> bool {
+        true
     }
 
     fn delete<'a>(&'a self, id: &'a str) -> Fut<'a, ()> {
@@ -658,6 +673,12 @@ mod tests {
                     record(&s, "GET", format!("/linode/instances/{id}"), &h, Value::Null);
                     match id {
                         7 => (StatusCode::OK, Json(instance(7, "superbot-m7", "running"))),
+                        6 => {
+                            let mut m = instance(6, "superbot-m6", "running");
+                            m["backups"] = json!({ "available": true, "enabled": true, "last_successful": "2026-11-21T03:14:07",
+                                "schedule": { "day": "Scheduling", "window": "Scheduling" } });
+                            (StatusCode::OK, Json(m))
+                        }
                         _ => (StatusCode::NOT_FOUND, Json(json!({ "errors": [{ "reason": "Not found" }] }))),
                     }
                 })
@@ -1107,6 +1128,29 @@ mod tests {
             seen[3].3,
             json!({ "type": "g6-standard-2", "allow_auto_disk_resize": true, "migration_type": "cold" })
         );
+    }
+
+    #[tokio::test]
+    async fn the_last_successful_backup_is_read_from_the_linode() {
+        let (api, seen) = fake_api().await;
+        assert!(api.reports_backups());
+        let m = api.get("6").await.unwrap();
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-21T03:14:07Z").unwrap().timestamp_millis();
+        assert_eq!((m.backups, m.last_backup_at), (true, Some(at)), "UTC, as Linode means it");
+        let none = api.get("7").await.unwrap();
+        assert_eq!((none.backups, none.last_backup_at), (false, None));
+        assert!(api.list("superbot").await.unwrap().iter().all(|m| m.last_backup_at.is_none()));
+        let paths: Vec<String> = seen.lock().unwrap().iter().map(|s| s.1.clone()).collect();
+        assert_eq!(paths.len(), 4, "read with the machine, no call of its own: {paths:?}");
+    }
+
+    #[test]
+    fn linode_times_are_utc() {
+        assert_eq!(time("1970-01-01T00:00:01"), Some(1000));
+        assert_eq!(time("1970-01-01T00:00:01.5"), Some(1500));
+        assert_eq!(time("1970-01-01T01:00:01+01:00"), Some(1000));
+        assert_eq!(time("yesterday"), None);
+        assert_eq!(time(""), None);
     }
 
     #[tokio::test]

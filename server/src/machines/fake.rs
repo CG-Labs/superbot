@@ -3,7 +3,8 @@
 //! `get`, which finds them `running`, so reconciliation has something to do.
 //! Firewalls follow Linode's rules too: labels are unique, a machine is behind at most
 //! one, a create naming a firewall puts the machine behind it, and deleting a machine
-//! takes it off.
+//! takes it off. Backups are Linode's too (`reports_backups`), though none is ever
+//! taken by itself.
 
 use super::provider::{
     CreateSpec, FirewallDevices, FirewallRule, Fut, MachineProvider, ProviderError, ProviderFirewall,
@@ -126,6 +127,7 @@ impl Fake {
             region: region.into(),
             ipv4: Some(format!("192.0.2.{}", s.next)),
             backups: false,
+            last_backup_at: None,
             tags: tags.iter().map(|t| t.to_string()).collect(),
             user_data: false,
         };
@@ -263,6 +265,7 @@ impl MachineProvider for Fake {
                     region: spec.region.clone(),
                     ipv4: Some(format!("192.0.2.{}", s.next)),
                     backups: false,
+                    last_backup_at: None,
                     tags: spec.tags.clone(),
                     user_data: false,
                 };
@@ -321,6 +324,11 @@ impl MachineProvider for Fake {
 
     fn enable_backups<'a>(&'a self, id: &'a str) -> Fut<'a, ()> {
         Box::pin(async move { self.update("enable_backups", id, |m| m.backups = true) })
+    }
+
+    /// As Linode's: when the last one succeeded is set with `set`.
+    fn reports_backups(&self) -> bool {
+        true
     }
 
     fn delete<'a>(&'a self, id: &'a str) -> Fut<'a, ()> {

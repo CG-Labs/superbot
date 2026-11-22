@@ -54,7 +54,7 @@ Or set `SERVER_BACKUP_S3_BUCKET`, `_ENDPOINT`, `_REGION`, `_ACCESS_KEY_ID` and `
 
 - **What lands there**: `<prefix>server/superbot-<stamp>.tar.gz[.age]` and a manifest `superbot-<stamp>.json` with its size and SHA-256. An archive `superbot-backup` encrypted is copied as it is; a plain one is encrypted on the way to `SERVER_BACKUP_AGE_RECIPIENTS` when set.
 - **Retention**: `SERVER_BACKUP_RETENTION_DAYS` (default 30), never the newest copy; `off` deletes nothing. Copies left in a store you moved away from stay there: botd only counts and deletes copies in the store set now.
-- **RPO**: `SERVER_BACKUP_RPO_HOURS`, by default the archive interval plus 2 hours (26 for the daily timer). Past it botd audits `server.backup_rpo_breached` and notifies admins like a machine's breach; [`deploy/prometheus/superbot-backup.rules.yml`](../../deploy/prometheus/superbot-backup.rules.yml) alerts from `/metrics` too.
+- **RPO**: `SERVER_BACKUP_RPO_HOURS`, by default the archive interval plus 2 hours (26 for the daily timer). Past it botd audits `server.backup_rpo_breached` and notifies admins like a machine's breach; [`deploy/prometheus/superbot-server-backups.rules.yml`](../../deploy/prometheus/superbot-server-backups.rules.yml) alerts from `/metrics` too.
 - **Check it**: `botctl backups` shows the store, the newest copies and errors; `botctl backups copy` copies the newest archive now. Every copy, failure and deletion is in the audit log (`server.backup_*`).
 
 Without a store, archives stay on the host: botd logs a warning at every start, the setup checklist's "Server backups copied off this host" stays open, and `superbot_server_backup_off_host` is 0. If you copy them yourself instead (`rclone copy`, `restic`, `rsync`), set `SERVER_BACKUP_OFF_HOST=off` and watch your own copies; for Compose, stream an archive straight to the host: `docker compose exec -T botd superbot-backup - > superbot-$(date -u +%Y%m%d-%H%M).tar.gz`.
@@ -188,7 +188,7 @@ Don't run a restored copy next to the live server to "test" it: botd would run t
 This guide covers botd's own data. Users' machines ([ADR 0025](../adr/0025-control-plane-linode.md)) are backed up separately:
 
 - **Incus containers**: off-host backups to S3-compatible storage, age-encrypted, kept per tier, with an admin restore that makes the machine enroll anew ([ADR 0071](../adr/0071-off-host-machine-backups.md), [setup](incus-containers.md#7-off-host-backups-optional)). Off unless `MACHINE_BACKUP_S3_BUCKET` is set. Each tier has a backup schedule, an RPO and an RTO that botd checks and alerts on ([ADR 0074](../adr/0074-machine-rpo-and-rto.md), [machine recovery](machine-recovery.md)): by default every 24 hours with an RPO of 26 (pro every 12, RPO 14; max every 6, RPO 8), and an RTO of 60 minutes.
-- **Linode VMs**: Linode's own backups (`MACHINE_BACKUPS=on`, the default), restored from Linode's console.
+- **Linode VMs**: Linode's own backups (`MACHINE_BACKUPS=on`, the default), held to an RPO and restored from Linode's console ([machine recovery](machine-recovery.md#linode-machines), [ADR 0110](../adr/0110-linode-machine-recovery-objectives.md)).
 
 Keep the age identity for machine backups off botd's host too, like the one for server archives. Without it, encrypted machine backups can't be restored.
 

@@ -303,7 +303,7 @@ fn value(metrics: &str, series: &str) -> Option<f64> {
 }
 
 /// Every `superbot_*` metric name in `text`.
-fn metric_names(text: &str) -> std::collections::BTreeSet<String> {
+pub(crate) fn metric_names(text: &str) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
     let mut rest = text;
     while let Some(at) = rest.find("superbot_") {
