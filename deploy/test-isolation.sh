@@ -115,6 +115,16 @@ as_svc sudo -n /usr/local/sbin/superbot-userctl ensure t1 >/dev/null
 # A per-user account can't start anything elsewhere, nor sudo.
 refused sudo -u sb-u-t1 sudo -n true
 
+log "Harness session retention sweeps as the account, inside its own folders only (ADR 0112)"
+sid=0b9d2f6e-3c1a-4e8b-9f00-1a2b3c4d5e6f
+sudo -u sb-u-t1 mkdir -p "$TEST_DIR/users/t1/home/.claude/projects/-w"
+sudo -u sb-u-t1 touch -d '400 days ago' "$TEST_DIR/users/t1/home/.claude/projects/-w/$sid.jsonl" "$TEST_DIR/users/t1/home/.claude/projects/-w/keep.md"
+sweep() { printf '{"before":%s,"roots":[{"base":"%s","path":".claude/projects","depth":2}]}' "$(($(date +%s) * 1000))" "$1"; }
+out=$(cd "$TEST_DIR/users/t1/home" && sweep "$TEST_DIR/users/t1/home" | as_svc sudo -n -E -u sb-u-t1 -- "$LIB/bin/superbot-run" --sweep)
+grep -q '"sessions":1' <<<"$out" || die "the sweep didn't delete the old session: $out"
+[[ ! -e "$TEST_DIR/users/t1/home/.claude/projects/-w/$sid.jsonl" && -e "$TEST_DIR/users/t1/home/.claude/projects/-w/keep.md" ]] || die "the sweep deleted the wrong files"
+(cd "$TEST_DIR/users/t1/home" && sweep "$TEST_DIR/users" | refused as_svc sudo -n -E -u sb-u-t1 -- "$LIB/bin/superbot-run" --sweep)
+
 log "A teammate's account for an owner's shared Bots is its own (ADR 0064)"
 for bad in 't1 t1' 't1 ../x' 't1 U2' 't1 t2 t3' "t1 $(printf 'a%.0s' {1..28})"; do
   # shellcheck disable=SC2086 # each is the arguments, on purpose

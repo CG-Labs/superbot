@@ -17,7 +17,7 @@ async fn off_by_default_keeps_everything() {
     let (port, app, admin, _) = serve_app().await;
     let bot = app.db.create_bot("Ada", "#fff", "waddle", "claude", None, false);
     app.db.add_messages_at(&bot.id, 3, db::now() - 3650 * DAY, None);
-    retention::start(app.clone(), None);
+    retention::start(app.clone(), retention::Settings::chat(None));
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(app.db.message_count(&bot.id), 3, "nothing is deleted while retention is off");
     let (code, body) = call(port, "GET", "/api/retention", &admin, "").await;
@@ -33,7 +33,7 @@ async fn turning_it_on_prunes_now_and_records_the_change() {
     let bot = app.db.create_bot("Ada", "#fff", "waddle", "claude", None, false);
     app.db.add_messages_at(&bot.id, 2, db::now() - 40 * DAY, None);
     let recent = app.db.add_message(&bot.id, "user", "this week", None, false, None);
-    retention::start(app.clone(), Some(30));
+    retention::start(app.clone(), retention::Settings::chat(Some(30)));
     for _ in 0..50 {
         if app.db.message_count(&bot.id) == 1 {
             break;
@@ -48,8 +48,8 @@ async fn turning_it_on_prunes_now_and_records_the_change() {
     assert_eq!(app.db.chat_retention(), Some(30));
 
     // Starting again with the same setting is no change; turning it off is.
-    retention::start(app.clone(), Some(30));
-    retention::start(app.clone(), None);
+    retention::start(app.clone(), retention::Settings::chat(Some(30)));
+    retention::start(app.clone(), retention::Settings::chat(None));
     let changed = audit(port, &admin, "chat.retention_changed").await;
     assert_eq!((changed.len(), changed[0]["details"]["before"].as_u64(), changed[0]["details"]["after"].clone()), (2, Some(30), Value::Null), "{changed:?}");
     assert_eq!(app.db.chat_retention(), None);

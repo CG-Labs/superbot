@@ -1236,6 +1236,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             wire::CAN_TEAMMATE_REMOVAL,
             wire::CAN_TEAMMATE_LOGINS,
             wire::CAN_INSTALL_AFTER,
+            wire::CAN_RETENTION,
         ]
             .into_iter()
             .chain(a.upgrader.build.is_some().then_some(wire::CAN_UPGRADE))
@@ -1973,6 +1974,68 @@ async fn purge_teammate(State(a): State<Arc<Agent>>, UrlPath(user): UrlPath<Stri
     }
 }
 
+/// The sweep a `/v1/retention` request asks for, over the HOMEs Bots use here: the
+/// user's, then each teammate's (ADR 0112). Err: a path or name that isn't plain.
+fn retention_sweep(r: &wire::RetentionRequest, home: &Path, teammates: &[PathBuf]) -> Result<crate::sweep::Sweep, &'static str> {
+    use crate::sweep::{Folder, Root, Sweep};
+    let dirs_ok = r.home.iter().chain(&r.state).all(|d| wire::home_path(&d.path) && (1..=8).contains(&d.depth));
+    if !dirs_ok || r.home.len() + r.state.len() > 32 {
+        return Err("Session folders must be up to 32 plain paths inside HOME, each 1 to 8 folders deep.");
+    }
+    if !r.bots.iter().chain(&r.archives).all(|n| plain_name(n)) || r.bots.len() > 10_000 || r.archives.len() > 1_000 {
+        return Err("Bot ids and archive names must be plain names.");
+    }
+    if !r.probe.iter().all(|p| p.len() <= 160 && crate::sweep::plain_path(p)) || r.probe.len() > 10_000 {
+        return Err("Files to look for must be plain paths under a Bots folder.");
+    }
+    let base = |p: &Path| p.display().to_string();
+    let mut s = Sweep { before: r.before, keep: r.keep.clone(), report: r.report.clone(), ..Default::default() };
+    for h in std::iter::once(home).chain(teammates.iter().map(PathBuf::as_path)) {
+        s.roots.extend(r.home.iter().map(|d| Root { base: base(h), path: d.path.clone(), depth: d.depth, transcript: d.transcript }));
+        for bot in &r.bots {
+            s.roots.extend(r.state.iter().map(|d| Root { base: base(h), path: format!("bots/{bot}/{}", d.path), depth: d.depth, transcript: d.transcript }));
+        }
+    }
+    s.folders = r.archives.iter().map(|n| Folder { base: base(home), path: format!("work/{}/{n}", wire::TEAMMATE_ARCHIVE_DIR) }).collect();
+    Ok(s)
+}
+
+/// `POST /v1/retention`: deletes old harness session files and archived teammates' work
+/// (ADR 0112). botd sends it only while none of the Bots it sweeps for is running.
+async fn retention(State(a): State<Arc<Agent>>, Json(r): Json<wire::RetentionRequest>) -> Response {
+    if r.owner_id != a.identity().user_id {
+        return refuse(StatusCode::FORBIDDEN, "This machine runs only its own user's Bots.");
+    }
+    let teammates: Vec<(String, PathBuf)> = a.teammates.known().into_iter().filter(|t| plain_name(t)).map(|t| (t.clone(), a.teammates.home_of(&t))).collect();
+    let homes: Vec<PathBuf> = teammates.iter().map(|(_, h)| h.clone()).collect();
+    let s = match retention_sweep(&r, &a.cfg.home, &homes) {
+        Ok(s) => s,
+        Err(e) => return refuse(StatusCode::BAD_REQUEST, e),
+    };
+    let home = a.cfg.home.clone();
+    let swept = move || {
+        let mut out = crate::sweep::run(&s);
+        // Each probe in every HOME before the next, in botd's order, which it turns each
+        // pass, so past the cap every database still gets its turn.
+        let homes: Vec<(Option<String>, PathBuf)> = std::iter::once((None, home)).chain(teammates.into_iter().map(|(t, h)| (Some(t), h))).collect();
+        'probes: for p in &r.probe {
+            for (user, h) in &homes {
+                if out.found.len() >= wire::RETENTION_FOUND_MAX {
+                    break 'probes;
+                }
+                if std::fs::symlink_metadata(h.join("bots").join(p)).is_ok_and(|m| m.is_file()) {
+                    out.found.push((user.clone(), p.clone()));
+                }
+            }
+        }
+        out
+    };
+    match tokio::task::spawn_blocking(swept).await {
+        Ok(out) => Json(out).into_response(),
+        Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 pub fn router(a: Arc<Agent>) -> Router {
     Router::new()
         .route("/v1/heartbeat", get(heartbeat))
@@ -1994,6 +2057,7 @@ pub fn router(a: Arc<Agent>) -> Router {
         .route("/v1/teammates/{user}/logins", get(get_teammate_logins))
         .route("/v1/teammates/{user}/remove", post(remove_teammate))
         .route("/v1/teammates/{user}/purge", post(purge_teammate))
+        .route("/v1/retention", post(retention))
         .layer(DefaultBodyLimit::max(MAX_RELAY_BODY))
         .with_state(a)
 }

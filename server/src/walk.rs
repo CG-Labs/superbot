@@ -48,6 +48,18 @@ impl Dir {
         Ok(Dir(unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 
+    /// Removes `name` here: an empty folder when `dir`, else a file or link (never what
+    /// a link points to).
+    pub(crate) fn remove(&self, name: &std::ffi::CStr, dir: bool) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let flags = if dir { libc::AT_REMOVEDIR } else { 0 };
+        // SAFETY: `self.0` is an open folder and `name` a NUL-terminated name.
+        if unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), flags) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Each name here (not `.` or `..`) with its `lstat`, or None where that failed; at
     /// most `limit` of them, so a folder of millions is never read whole.
     pub(crate) fn entries(&self, limit: u64) -> std::io::Result<Vec<(std::ffi::CString, Option<libc::stat>)>> {

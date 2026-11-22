@@ -114,6 +114,8 @@ pub const CAN_TEAMMATE_REMOVAL: &str = "teammate_removal";
 pub const CAN_TEAMMATE_LOGINS: &str = "teammate_logins";
 /// Runs an install's `after` script (`InstallSource::Script`, ADR 0072).
 pub const CAN_INSTALL_AFTER: &str = "install_after";
+/// Deletes old harness session files and archived teammates' work (`/v1/retention`, ADR 0112).
+pub const CAN_RETENTION: &str = "retention";
 
 /// The screen protocol this build speaks (ADR 0045). A request names it, an agent
 /// refuses any other, and botd treats an agent that reports another as outdated.
@@ -297,6 +299,54 @@ pub struct TeammatePurge {
 pub struct TeammatePurged {
     /// There was held work, and it's gone now.
     pub purged: bool,
+}
+
+/// Most entries a `/v1/retention` answer lists in `found`, and the most bytes botd reads of
+/// it: 20,000 entries of up to about 200 bytes each fit.
+pub const RETENTION_FOUND_MAX: usize = 20_000;
+pub const RETENTION_REPLY_MAX: usize = 8 << 20;
+
+/// `POST /v1/retention`: delete old harness session files in the HOMEs Bots use here (the
+/// user's and each teammate's) and in the named Bots' own folders, and archived teammates'
+/// work in the user's `work/from-teammates/` (ADR 0112). Paths are relative and plain.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetentionRequest {
+    pub owner_id: String,
+    /// Unix ms: sessions whose files all last changed before this go.
+    pub before: i64,
+    /// Session folders under each HOME, with how many folders down a session sits.
+    #[serde(default)]
+    pub home: Vec<SessionDir>,
+    /// Bots whose own folders (`bots/<id>` in each HOME) are swept.
+    #[serde(default)]
+    pub bots: Vec<String>,
+    /// Session folders under each of those Bots' folders.
+    #[serde(default)]
+    pub state: Vec<SessionDir>,
+    /// Session ids that stay whatever their age: running Bots'.
+    #[serde(default)]
+    pub keep: Vec<String>,
+    /// Session ids to say whether they went.
+    #[serde(default)]
+    pub report: Vec<String>,
+    /// Archive names in `work/from-teammates/` to delete.
+    #[serde(default)]
+    pub archives: Vec<String>,
+    /// Files to say whether they are there, relative to `bots/` in each HOME (a harness's
+    /// session database, `<bot id>/hermes/state.db`), so only those are pruned.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probe: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionDir {
+    pub path: String,
+    pub depth: u32,
+    /// It holds transcripts (`sweep::Root::transcript`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transcript: bool,
 }
 
 /// `token` as a viewer password: plain lowercase hex, long enough to guess at no rate.

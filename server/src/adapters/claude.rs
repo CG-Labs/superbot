@@ -55,6 +55,11 @@ impl Adapter for Claude {
         if let Some(s) = &input.sandbox {
             settings.insert("sandbox".into(), sandbox_settings(s, super::api_host(input)));
         }
+        // Claude Code deletes its own sessions older than this at startup (30 days by
+        // default), whatever SuperBot's retention or holds say (ADR 0112).
+        if let Some(days) = input.keep_sessions_days {
+            settings.insert("cleanupPeriodDays".into(), json!(days.max(1)));
+        }
         if !settings.is_empty() {
             a.extend(["--settings".into(), Value::Object(settings).to_string()]);
         }
@@ -66,6 +71,16 @@ impl Adapter for Claude {
         }
         a.extend(["--".into(), input.prompt.clone()]);
         a
+    }
+
+    /// `~/.claude/projects/<project>/<session>.jsonl`, with `<session>/` (subagents, tool
+    /// results) beside it, and per-session folders and files Claude Code keeps elsewhere.
+    /// `projects/<project>/memory/` has no session id in its name, so it stays.
+    fn sessions(&self) -> super::Sessions {
+        super::Sessions {
+            home: &[(".claude/projects", 2, true), (".claude/file-history", 1, false), (".claude/session-env", 1, false), (".claude/debug", 1, false), (".claude/todos", 1, false)],
+            state: &[],
+        }
     }
 
     fn on_event(&mut self, e: &Value, out: &mut Vec<AgentEvent>) {
