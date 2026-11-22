@@ -319,6 +319,7 @@ fn admin_view(a: &Auth, u: &User, identities: &[db::Identity], pending: Option<&
         v["plan"] = crate::tier_usage(app, &u.id);
         if a.machines.enabled() {
             v["dataRegion"] = json!(crate::machines::region::effective(app, &a.machines, u));
+            v["residency"] = json!(crate::machines::residency::of_user(app, &u.id));
         }
     }
     v

@@ -35,6 +35,7 @@ pub mod provider;
 pub mod rebuild;
 pub mod recovery;
 pub mod region;
+pub mod residency;
 pub mod resize;
 pub mod route;
 pub mod runas;

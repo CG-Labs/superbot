@@ -154,6 +154,13 @@ fn member_view(app: &AppState, m: &TeamMember, machines: bool) -> Value {
 fn team_view(app: &AppState, t: &Team, me: Option<&TeamMember>, manager: bool) -> Value {
     let members: Vec<Value> = app.db.team_members(&t.id).iter().map(|m| member_view(app, m, manager)).collect();
     let mut v = json!({ "id": t.id, "name": t.name, "machines": t.machines, "region": t.region, "createdAt": t.created_at, "members": members });
+    // A contractual pin (ADR 0129): its reference only for those who manage the team.
+    if let Some(p) = app.db.residency_pin(crate::db::PinOn::Team, &t.id) {
+        v["residency"] = json!({ "region": p.region, "pinnedAt": p.pinned_at });
+        if manager || me.is_none() {
+            v["residency"]["reference"] = json!(p.reference);
+        }
+    }
     if let Some(me) = me {
         v["role"] = json!(me.role);
     }
@@ -275,11 +282,11 @@ async fn join(app: &AppState, by: &Who, team: &Team, user: &User, role: &str, vi
             Some(cp) => Some(cp.lock_ops().await),
             None => None,
         };
-        if cp.is_some() {
+        if let Some(cp) = cp {
             let t = app.db.team(&team.id).ok_or_else(|| not_found("Team"))?;
             let u = app.db.user(&user.id).ok_or_else(|| not_found("User"))?;
-            if let Err(why) = crate::machines::region::check_join(app, &t, &u) {
-                app.db.record(&team_event(by, "team.join_refused", &team.id, json!({ "user": user.id, "reason": "data_region", "via": via, "region": t.region })).outcome(Outcome::Denied));
+            if let Err((reason, why)) = crate::machines::region::check_join(app, cp, &t, &u) {
+                app.db.record(&team_event(by, "team.join_refused", &team.id, json!({ "user": user.id, "reason": reason, "via": via, "region": t.region })).outcome(Outcome::Denied));
                 return Err(conflict(why));
             }
         }
@@ -910,6 +917,12 @@ pub async fn update(State(app): State<AppState>, Extension(by): Extension<Who>, 
 /// `DELETE /api/teams/{id}`: everyone leaves, as if each had, then the team goes.
 pub async fn delete(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     let t = need_team(&app, &id)?;
+    if let Some(p) = app.db.residency_pin(crate::db::PinOn::Team, &t.id) {
+        return Err(conflict(format!(
+            "Team {}'s data is pinned to {} ({}). Unpin it first, with a reason (botctl team residency ... unpin) (ADR 0129).",
+            t.name, p.region, p.reference
+        )));
+    }
     let _billing = crate::team_billing::may_delete(&app, &by, &t.id, "admin").await?;
     for m in app.db.team_members(&t.id) {
         leave(&app, &by, &t.id, &m.user_id, "team_deleted").await;

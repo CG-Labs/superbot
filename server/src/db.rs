@@ -1654,7 +1654,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 48] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 49] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1703,7 +1703,23 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 48] = [
     migrate_file_retention,
     migrate_data_regions,
     migrate_disable_holds,
+    migrate_residency_pins,
 ];
+
+/// Contractual residency pins (ADR 0129): one per user or team at most.
+fn migrate_residency_pins(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS residency_pins (
+          subject_type TEXT NOT NULL,
+          subject_id TEXT NOT NULL,
+          region TEXT NOT NULL,
+          reference TEXT NOT NULL,
+          pinned_by TEXT,
+          pinned_at INTEGER NOT NULL,
+          PRIMARY KEY (subject_type, subject_id)
+        );",
+    )
+}
 
 /// Machines suspended because their user was disabled (ADR 0124), so enabling them
 /// resumes those and no other.
@@ -7918,6 +7934,48 @@ pub struct TeamMachine {
     pub release_at: Option<i64>,
 }
 
+/// What a residency pin is on (ADR 0129).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PinOn {
+    User,
+    Team,
+}
+
+impl PinOn {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PinOn::User => "user",
+            PinOn::Team => "team",
+        }
+    }
+}
+
+/// A contractual residency pin (ADR 0129): the user's or team's data stays in `region`,
+/// under the agreement `reference` names, until an admin unpins it with a reason.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidencyPin {
+    pub subject_type: PinOn,
+    pub subject_id: String,
+    pub region: String,
+    pub reference: String,
+    pub pinned_by: Option<String>,
+    pub pinned_at: i64,
+}
+
+fn residency_pin_row(r: &Row) -> rusqlite::Result<ResidencyPin> {
+    let kind: String = r.get("subject_type")?;
+    Ok(ResidencyPin {
+        subject_type: if kind == "team" { PinOn::Team } else { PinOn::User },
+        subject_id: r.get("subject_id")?,
+        region: r.get("region")?,
+        reference: r.get("reference")?,
+        pinned_by: r.get("pinned_by")?,
+        pinned_at: r.get("pinned_at")?,
+    })
+}
+
 fn team_row(r: &Row) -> rusqlite::Result<Team> {
     Ok(Team {
         id: r.get("id")?,
@@ -8016,9 +8074,46 @@ impl Db {
         self.c().execute("UPDATE teams SET region = ?1, updated_at = ?2 WHERE id = ?3", params![region, now(), id]).unwrap_or(0) > 0
     }
 
-    /// Deletes the team and its invites. Its members must have left first.
+    /// The residency pin on a user or a team (ADR 0129), if there is one.
+    pub fn residency_pin(&self, kind: PinOn, id: &str) -> Option<ResidencyPin> {
+        let c = self.c();
+        c.query_row("SELECT * FROM residency_pins WHERE subject_type = ?1 AND subject_id = ?2", params![kind.as_str(), id], residency_pin_row)
+            .optional()
+            .unwrap_or(None)
+    }
+
+    /// Every residency pin, oldest first.
+    pub fn residency_pins(&self) -> Vec<ResidencyPin> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM residency_pins ORDER BY pinned_at, subject_type, subject_id").unwrap();
+        s.query_map([], residency_pin_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Pins a user or a team to `region`, or replaces its pin's reference.
+    pub fn set_residency_pin(&self, kind: PinOn, id: &str, region: &str, reference: &str, by: Option<&str>) -> bool {
+        self.c()
+            .execute(
+                "INSERT INTO residency_pins (subject_type, subject_id, region, reference, pinned_by, pinned_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (subject_type, subject_id) DO UPDATE SET region = excluded.region, reference = excluded.reference, pinned_by = excluded.pinned_by, pinned_at = excluded.pinned_at",
+                params![kind.as_str(), id, region, reference, by, now()],
+            )
+            .unwrap_or(0)
+            > 0
+    }
+
+    pub fn delete_residency_pin(&self, kind: PinOn, id: &str) -> bool {
+        self.c().execute("DELETE FROM residency_pins WHERE subject_type = ?1 AND subject_id = ?2", params![kind.as_str(), id]).unwrap_or(0) > 0
+    }
+
+    /// Deletes the team, its invites and its residency pin (ADR 0129). Its members must
+    /// have left first.
     pub fn delete_team(&self, id: &str) -> bool {
-        self.c().execute("DELETE FROM teams WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM team_members WHERE team_id = ?1)", [id]).unwrap() > 0
+        let c = self.c();
+        let gone = c.execute("DELETE FROM teams WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM team_members WHERE team_id = ?1)", [id]).unwrap() > 0;
+        if gone {
+            let _ = c.execute("DELETE FROM residency_pins WHERE subject_type = 'team' AND subject_id = ?1", [id]);
+        }
+        gone
     }
 
     pub fn team_member(&self, user_id: &str) -> Option<TeamMember> {

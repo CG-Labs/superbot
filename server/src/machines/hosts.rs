@@ -483,6 +483,13 @@ pub async fn recover(
         }
         match app.db.machine_last_backup(&m.id) {
             Some(b) => {
+                // A pinned user's machine is restored only from a backup, and onto a host, in their region (ADR 0129).
+                let pinned = |t: Option<&str>| super::residency::check_restore(&app, cp, &m, &b, t);
+                if let Err((p, why)) = pinned(to.as_deref()) {
+                    super::residency::refused(&app, &by, &m, "recover", &p, &why);
+                    skipped.push(json!({ "machineId": m.id, "userId": m.user_id, "reason": why }));
+                    continue;
+                }
                 // Each placed with the ones before it counted, so a host isn't filled past its room.
                 let target = match &to {
                     Some(t) => placement::fits(&app, cp, &m.plan, &m.region, t).map(|()| t.clone()),
@@ -495,6 +502,11 @@ pub async fn recover(
                         continue;
                     }
                 };
+                if let Err((p, why)) = pinned(Some(&t)) {
+                    super::residency::refused(&app, &by, &m, "recover", &p, &why);
+                    skipped.push(json!({ "machineId": m.id, "userId": m.user_id, "reason": why }));
+                    continue;
+                }
                 let mv = Move { from: Some(name.clone()), to: Some(t.clone()), reason: Some(HOST_LOST) };
                 match backup::begin_restore(&app, cp, &m, &b, &by, &mv) {
                     Some(r) => {
