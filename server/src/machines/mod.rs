@@ -605,6 +605,25 @@ impl ControlPlane {
         self.provider.as_deref().and_then(|p| p.plan_resources(plan))
     }
 
+    /// The machine tier `tier`'s people get (ADR 0040): its `machineType` named by its
+    /// `MACHINE_TIERS` entry if it has one, else by the tier. None: it sets no size.
+    pub fn machine_tier_of(&self, tier: &crate::tiers::Tier) -> Option<(String, String)> {
+        let plan = tier.limits.machine_type.clone()?;
+        let name = self.tiers.iter().find(|(_, p)| *p == plan).map_or_else(|| tier.name.clone(), |(t, _)| t.clone());
+        Some((name, plan))
+    }
+
+    /// Whether botd holds every machine `tier`'s people can get to a kernel of their own
+    /// (MACHINE_OWN_KERNEL_TIERS, ADR 0120). A tier that sets no size can get any
+    /// `MACHINE_TIERS` entry, so only when every one is held to it.
+    pub fn own_kernel_for(&self, tier: &crate::tiers::Tier) -> bool {
+        self.enabled()
+            && match self.machine_tier_of(tier) {
+                Some((name, _)) => self.own_kernel_tiers.contains(&name),
+                None => !self.tiers.is_empty() && self.tiers.iter().all(|(t, _)| self.own_kernel_tiers.contains(t)),
+            }
+    }
+
     /// The provider's name, if it says when its own backups succeed (ADR 0110).
     pub fn reporting_backups(&self) -> Option<&'static str> {
         self.provider.as_deref().filter(|p| p.reports_backups()).map(|p| p.name())
@@ -1342,10 +1361,7 @@ pub async fn list_all(
 /// plan)`: the plan's `machineType`, named by its `MACHINE_TIERS` entry if it has one,
 /// else by the user's tier. None: their plan sets no size, so any `MACHINE_TIERS` entry.
 pub fn size_for(app: &App, cp: &ControlPlane, user_id: &str) -> Option<(String, String)> {
-    let tier = app.tier_of(user_id);
-    let plan = tier.limits.machine_type.clone()?;
-    let name = cp.tiers.iter().find(|(_, p)| *p == plan).map_or_else(|| tier.name.clone(), |(t, _)| t.clone());
-    Some((name, plan))
+    cp.machine_tier_of(app.tier_of(user_id))
 }
 
 /// The provider plan a machine tier means: the name of the size the user's plan gives
@@ -2197,6 +2213,23 @@ mod tests {
         assert!(cp.describe().contains("max=g6-standard-4 (own kernel: pro, max)"), "{}", cp.describe());
         let cp = with(&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_OWN_KERNEL_TIERS", "ALL")]).unwrap();
         assert_eq!(cp.own_kernel_tiers, ["starter", "pro", "max"]);
+        // What a billing tier's people get, as the pricing page promises it (ADR 0121).
+        let plans = crate::tiers::Tiers::parse(
+            r#"{ "default": "a", "tiers": [
+              { "name": "a", "routes": "any", "limits": { "machineType": "g6-standard-2" } },
+              { "name": "pro", "routes": "any", "limits": { "machineType": "g6-dedicated-8" } },
+              { "name": "b", "routes": "any" } ] }"#,
+            None,
+        )
+        .unwrap();
+        let [a, pro, b] = [0, 1, 2].map(|i| &plans.all()[i]);
+        assert_eq!(cp.machine_tier_of(a), Some(("pro".into(), "g6-standard-2".into())), "named by its MACHINE_TIERS entry");
+        assert_eq!(cp.machine_tier_of(pro), Some(("pro".into(), "g6-dedicated-8".into())), "else by the tier");
+        assert_eq!(cp.machine_tier_of(b), None);
+        assert!([a, pro, b].iter().all(|t| cp.own_kernel_for(t)), "all: any machine it can get");
+        let cp = with(&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_OWN_KERNEL_TIERS", "pro")]).unwrap();
+        assert_eq!([a, pro, b].map(|t| cp.own_kernel_for(t)), [true, true, false], "b could get a starter machine");
+        assert!(!ControlPlane::default().own_kernel_for(a), "no control plane, no promise");
         for (vars, want) in [
             (&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_OWN_KERNEL_TIERS", "gold")][..], "\"gold\" isn't a tier in MACHINE_TIERS"),
             (&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_OWN_KERNEL_TIERS", "pro,pro")][..], "tier \"pro\" is listed twice"),

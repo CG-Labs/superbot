@@ -4,7 +4,7 @@
 
 Accepted (22 Nov 2026). First slice of published per-user plans in M4, [#42](https://github.com/CG-Labs/superbot/issues/42). Builds on tiers ([ADR 0033](0033-tiers-model-routing.md)), billing v0's limits and Stripe prices ([ADR 0040](0040-billing-v0-tier-limits.md), [ADR 0042](0042-billing-checkout-portal-customers.md), [ADR 0050](0050-billing-period-token-usage.md), [ADR 0082](0082-storage-limits-per-tier.md)), team billing ([ADR 0093](0093-team-billing.md)), no free tier ([ADR 0068](0068-no-free-tier.md)) and the status page ([ADR 0090](0090-status-page-and-uptime-slo.md)), whose style and safety rules it follows.
 
-Numbering: `main` has up to 0118. Open PRs hold the next two: the public site and docs portal ([PR #182](https://github.com/CG-Labs/superbot/pull/182), 0119 once it moves off `main`'s 0118) and the managed substrate ([PR #183](https://github.com/CG-Labs/superbot/pull/183), 0120), so this is 0121. Renumber it if a collision appears at merge.
+Numbering: the managed substrate ([PR #183](https://github.com/CG-Labs/superbot/pull/183), [ADR 0120](0120-managed-substrate.md)) is merged, and the public site and docs portal ([PR #182](https://github.com/CG-Labs/superbot/pull/182)) holds 0119, so this is 0121. Renumber it if a collision appears at merge.
 
 ## Context
 
@@ -30,9 +30,14 @@ A tier is **listed when it is sold**: it has `stripePrices` (as the Plan screen 
 | `prices` | `publishedPrices`, each with `amount`, `currency`, `interval` and a `display` string (`£29 / month`) |
 | `limits` | `maxBots`, `monthlyRuns`, `monthlyTokens`, `dailyRoutineRuns`, `maxStorageMb`; `null` is no limit. `concurrentRuns` only while Bots run on their owners' machines (`MACHINE_ROUTING` on or assigned): the tier's, else `MAX_CONCURRENT_RUNS`, which is what a machine applies. Bots on the server itself share one cap with everyone, which is no plan's limit, so it's left out |
 | `machine` | `{cpus, memoryGiB, diskGiB}` for the tier's `machineType` when the provider knows it without a call (Incus plans); otherwise `null` |
+| `ownKernel` | `true` only when botd holds every machine the tier's people can get to a kernel of their own (`MACHINE_OWN_KERNEL_TIERS`, [ADR 0120](0120-managed-substrate.md)); see below |
 | `features` | the tier's `features`: short lines in the operator's words, such as model access or support |
 
 Plus `enterprise` (`{label, contactUrl}` when `PLANS_CONTACT_URL` is set, else `null`), `contactUrl`, `perPerson: true`, `checkout` and `buyUrl` (the app's Plan screen, when people can buy there), and `signupUrl` (`/get-started`, when sign-ups are on).
+
+### Own kernel only where botd holds to it
+
+ADR 0120 lets an operator promise some tiers their own kernel and makes botd hold to it: it won't start with a provider whose machines share their host's kernel for those tiers, and refuses runs on their machines that aren't its VMs. The page states that promise exactly where it is enforced, so it can't claim more than botd does. A tier's machine tier is found as when its people ask for a machine (ADR 0040): its `machineType`, named by the `MACHINE_TIERS` entry with that plan, else by the tier's own name. `ownKernel` is `true` when `MACHINE_OWN_KERNEL_TIERS` lists that name. A tier with no `machineType` can get any `MACHINE_TIERS` entry, so it is `true` only when every entry is listed (`all`). Without a control plane, or with the setting unset, it is `false` for every tier and the page says nothing about kernels, even on Linode, whose machines are VMs anyway: an unset setting is no promise. The page adds "with its own kernel" to the machine line, or "Own machine with its own kernel" when the size isn't known. It says nothing about the provider or the plan id.
 
 ### Prices are the operator's words, not Stripe's
 
@@ -64,7 +69,7 @@ Signed-in people's tier view (`GET /api/me/tier`, the Plan screen's list) now al
 
 ### The page
 
-`/pricing` reuses the status page's stylesheet and layout: one card per plan with its prices (or "Contact us"), its limits in plain words ("3 Bots", "300 Bot runs a month", "5 GB of storage", "No monthly token limit"), its machine and its features, then an Enterprise card, a line that prices are per person and a team pays one seat per member (ADR 0093), and links to the Plan screen, `/get-started`, `/status` and the JSON when each applies.
+`/pricing` reuses the status page's stylesheet and layout: one card per plan with its prices (or "Contact us"), its limits in plain words ("3 Bots", "300 Bot runs a month", "5 GB of storage", "No monthly token limit"), its machine (and its own kernel, where held to it) and its features, then an Enterprise card, a line that prices are per person and a team pays one seat per member (ADR 0093), and links to the Plan screen, `/get-started`, `/status` and the JSON when each applies.
 
 ### The public site
 
@@ -73,8 +78,9 @@ The public site and docs portal ([PR #182](https://github.com/CG-Labs/superbot/p
 ## Tests
 
 - `tiers::tests`: `publishedPrices` and `features` are read and checked (currency from the list, so a three-letter typo is refused, interval, amount range, no zero, no duplicates, at most four; features' length, count and one line), and appear in a tier's view only when set; a tier is sold with a Stripe or a published price.
-- `plans::tests`: `PLANS_PAGE` follows billing under `auto`, and `on` and `off` override it; `PLANS_CONTACT_URL` takes only https and mailto; prices display with symbols, decimals and thousands, zero-decimal currencies as whole units and three-decimal ones at their scale; the snapshot lists only sold tiers with their limits and machine size, runs at once only where Bots run on their own machines, and contains no Stripe price id, model, provider, harness or machine plan id; the page shows prices or "Contact us", escapes the operator's text and has no script; the startup line names listed tiers and warns about unpriced ones.
-- `plans_http_tests.rs`, on the real router: both pages 404 when plans were never set up, with `auto` and billing off, and with `off` and billing on, for admins too; published, `/api/plans` answers anyone with the plans, prices, limits and Enterprise entry, the right headers and no secrets; `/pricing` renders the same plans with no script; runs at once appear, with the server's cap as the default, only with Bots routed to machines; a signed-in person's tier view has published prices and no Stripe ids.
+- `plans::tests`: `PLANS_PAGE` follows billing under `auto`, and `on` and `off` override it; `PLANS_CONTACT_URL` takes only https and mailto; prices display with symbols, decimals and thousands, zero-decimal currencies as whole units and three-decimal ones at their scale; the snapshot lists only sold tiers with their limits and machine size, `ownKernel` only for tiers held to it, on the page too, runs at once only where Bots run on their own machines, and contains no Stripe price id, model, provider, harness or machine plan id; the page shows prices or "Contact us", escapes the operator's text and has no script; the startup line names listed tiers and warns about unpriced ones.
+- `plans_http_tests.rs`, on the real router: both pages 404 when plans were never set up, with `auto` and billing off, and with `off` and billing on, for admins too; published, `/api/plans` answers anyone with the plans, prices, limits and Enterprise entry, the right headers and no secrets; `/pricing` renders the same plans with no script; runs at once appear, with the server's cap as the default, only with Bots routed to machines; a signed-in person's tier view has published prices and no Stripe ids; `ownKernel` follows `MACHINE_OWN_KERNEL_TIERS` through each tier's `machineType`, and a tier with none only under every machine tier.
+- `machines::tests`: a tier's machine tier is its `machineType`'s `MACHINE_TIERS` name, else its own; `own_kernel_for` is true for a sized tier whose machine tier is listed, for an unsized one only when all are, and never without a control plane.
 - `auth_review_http_tests.rs`: both routes are in the public list; every other route still refuses callers without credentials.
 
 ## Consequences

@@ -103,6 +103,38 @@ async fn runs_at_once_are_published_only_where_bots_run_on_their_own_machine() {
 }
 
 #[tokio::test]
+async fn own_kernel_is_published_for_the_tiers_machine_own_kernel_tiers_holds() {
+    use crate::machines::ControlPlane;
+    let serve = |own: &'static [&'static str]| async move {
+        let p: Arc<dyn crate::machines::provider::MachineProvider> = Arc::new(crate::machines::fake::Fake::default());
+        let (port, app, _, _) = crate::tests::serve_app_with(|a| {
+            let mut cp = ControlPlane::for_tests(p);
+            cp.own_kernel_tiers = own.iter().map(|t| t.to_string()).collect();
+            a.machines = Arc::new(cp);
+        })
+        .await;
+        app.tiers.set(Arc::new(Tiers::parse(TIERS, None).unwrap())).unwrap();
+        app.plans.set(published(None)).unwrap();
+        let (code, body) = call(port, "GET", "/api/plans", "", "").await;
+        assert_eq!(code, 200, "{body}");
+        let (_, page) = call(port, "GET", "/pricing", "", "").await;
+        let v = parse(&body);
+        let flags: Vec<bool> = v["plans"].as_array().unwrap().iter().map(|p| p["ownKernel"] == true).collect();
+        (flags, page)
+    };
+    // Starter's machineType is MACHINE_TIERS' starter; Max sets no size, so it can get any.
+    let (flags, page) = serve(&["starter"]).await;
+    assert_eq!(flags, [true, false]);
+    assert_eq!(page.matches("Own machine with its own kernel").count(), 1, "{page}");
+    let (flags, _) = serve(&["pro", "max"]).await;
+    assert_eq!(flags, [false, false], "Starter's machines aren't held to it, and Max could get a starter machine");
+    let (flags, _) = serve(&["starter", "pro", "max"]).await;
+    assert_eq!(flags, [true, true], "every machine tier is held to it");
+    let (flags, page) = serve(&[]).await;
+    assert_eq!((flags, page.contains("kernel")), (vec![false, false], false), "off: nothing promised");
+}
+
+#[tokio::test]
 async fn the_pricing_page_renders_the_same_plans() {
     let (port, _, _) = server(Some(published(Some("mailto:sales@example.com")))).await;
     let (code, head, body) = call_with(port, "GET", "/pricing", "", "", "").await;

@@ -6,8 +6,9 @@
 //! "Contact us". Enterprise is listed when `PLANS_CONTACT_URL` gives somewhere to ask.
 //!
 //! Both pages show only what a buyer may see: labels, published prices, limits, machine
-//! sizes and the operator's feature lines. Never a Stripe price id, route, model,
-//! provider, machine plan id, user or count. `PLANS_PAGE` turns them on (`on`), off
+//! sizes, own kernels where botd holds tiers to them (ADR 0120) and the operator's
+//! feature lines. Never a Stripe price id, route, model, provider, machine plan id, user
+//! or count. `PLANS_PAGE` turns them on (`on`), off
 //! (`off`), or on only while billing is (`auto`, the default), so a self-hosted server
 //! with billing off publishes nothing unless its operator asks it to.
 
@@ -173,8 +174,9 @@ pub fn display(p: &ListPrice) -> String {
 /// machines, where `concurrentRuns` is the tier's, else that cap. None: Bots run on
 /// this server, whose cap is shared by everyone, so it's no plan's to publish and
 /// `concurrentRuns` is left out. `machine` is the size of the tier's `machineType` when
-/// the provider knows it.
-fn plan(t: &Tier, machine_cap: Option<Option<u32>>, machine: &dyn Fn(&str) -> Option<Resources>) -> Value {
+/// the provider knows it. `own_kernel`: botd holds the tier's machines to a kernel of
+/// their own (MACHINE_OWN_KERNEL_TIERS, ADR 0120), so the page may promise it.
+fn plan(t: &Tier, machine_cap: Option<Option<u32>>, machine: &dyn Fn(&str) -> Option<Resources>, own_kernel: &dyn Fn(&Tier) -> bool) -> Value {
     let l = &t.limits;
     let mut v = json!({
         "name": t.name,
@@ -188,6 +190,7 @@ fn plan(t: &Tier, machine_cap: Option<Option<u32>>, machine: &dyn Fn(&str) -> Op
             "maxStorageMb": l.max_storage_mb,
         },
         "machine": l.machine_type.as_deref().and_then(machine),
+        "ownKernel": own_kernel(t),
         "features": t.features,
     });
     if let Some(cap) = machine_cap {
@@ -197,9 +200,15 @@ fn plan(t: &Tier, machine_cap: Option<Option<u32>>, machine: &dyn Fn(&str) -> Op
 }
 
 /// Everything both pages show.
-pub fn snapshot(tiers: &Tiers, s: &Settings, machine_cap: Option<Option<u32>>, machine: &dyn Fn(&str) -> Option<Resources>) -> Value {
+pub fn snapshot(
+    tiers: &Tiers,
+    s: &Settings,
+    machine_cap: Option<Option<u32>>,
+    machine: &dyn Fn(&str) -> Option<Resources>,
+    own_kernel: &dyn Fn(&Tier) -> bool,
+) -> Value {
     json!({
-        "plans": tiers.all().iter().filter(|t| t.published()).map(|t| plan(t, machine_cap, machine)).collect::<Vec<_>>(),
+        "plans": tiers.all().iter().filter(|t| t.published()).map(|t| plan(t, machine_cap, machine, own_kernel)).collect::<Vec<_>>(),
         "enterprise": s.contact.as_ref().map(|u| json!({ "label": "Enterprise", "contactUrl": u })),
         "contactUrl": s.contact,
         "perPerson": true,
@@ -213,8 +222,9 @@ fn current(app: &AppState) -> Option<Value> {
     let s = app.plans.get().filter(|s| s.published)?;
     let cp = app.control_plane.get().filter(|cp| cp.enabled());
     let machine = |plan: &str| cp.and_then(|cp| cp.plan_resources(plan));
+    let own_kernel = |t: &Tier| cp.is_some_and(|cp| cp.own_kernel_for(t));
     let on_machines = cp.is_some_and(|cp| cp.routing != crate::machines::route::Routing::Off);
-    Some(snapshot(app.tiers(), s, on_machines.then(|| app.server_cap()), &machine))
+    Some(snapshot(app.tiers(), s, on_machines.then(|| app.server_cap()), &machine, &own_kernel))
 }
 
 fn off() -> Response {
@@ -290,8 +300,16 @@ fn plan_html(h: &mut String, p: &Value, contact: Option<&str>) {
         None => "No storage limit".into(),
     });
     let m = &p["machine"];
-    if let (Some(c), Some(mem), Some(disk)) = (m["cpus"].as_u64(), m["memoryGiB"].as_u64(), m["diskGiB"].as_u64()) {
-        items.push(format!("Own machine: {} CPU{}, {mem} GiB memory, {disk} GiB disk", c, if c == 1 { "" } else { "s" }));
+    let kernel = p["ownKernel"] == true;
+    match (m["cpus"].as_u64(), m["memoryGiB"].as_u64(), m["diskGiB"].as_u64()) {
+        (Some(c), Some(mem), Some(disk)) => items.push(format!(
+            "Own machine: {} CPU{}, {mem} GiB memory, {disk} GiB disk{}",
+            c,
+            if c == 1 { "" } else { "s" },
+            if kernel { ", with its own kernel" } else { "" }
+        )),
+        _ if kernel => items.push("Own machine with its own kernel".into()),
+        _ => {}
     }
     items.extend(p["features"].as_array().into_iter().flatten().filter_map(|f| f.as_str()).map(String::from));
     h.push_str("<ul>");
@@ -366,6 +384,10 @@ mod tests {
         (plan == "c2-m4-d40").then_some(Resources { cpus: 2, memory_gib: 4, disk_gib: 40 })
     }
 
+    fn no_kernel(_: &Tier) -> bool {
+        false
+    }
+
     fn on(contact: Option<&str>) -> Settings {
         Settings { mode: Mode::On, published: true, contact: contact.map(String::from), checkout: true, signups: false }
     }
@@ -408,7 +430,7 @@ mod tests {
     #[test]
     fn sold_tiers_are_listed_with_limits_and_no_secrets() {
         let tiers = Tiers::parse(PRICED, None).unwrap();
-        let v = snapshot(&tiers, &on(Some("mailto:sales@example.com")), Some(Some(8)), &sizes);
+        let v = snapshot(&tiers, &on(Some("mailto:sales@example.com")), Some(Some(8)), &sizes, &no_kernel);
         let names: Vec<&str> = v["plans"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["starter", "pro"], "a tier nobody can buy isn't listed: {v}");
         let starter = &v["plans"][0];
@@ -418,9 +440,9 @@ mod tests {
         assert_eq!(starter["features"], json!(["Email support"]));
         let pro = &v["plans"][1];
         assert_eq!((pro["prices"].clone(), pro["limits"]["concurrentRuns"].clone(), pro["machine"].clone()), (json!([]), json!(8), Value::Null));
-        assert_eq!(snapshot(&tiers, &on(None), Some(None), &sizes)["plans"][0]["limits"]["concurrentRuns"], Value::Null, "no cap anywhere");
+        assert_eq!(snapshot(&tiers, &on(None), Some(None), &sizes, &no_kernel)["plans"][0]["limits"]["concurrentRuns"], Value::Null, "no cap anywhere");
         // Bots on this server share its cap with everyone: no plan's to publish.
-        let local = snapshot(&tiers, &on(None), None, &sizes);
+        let local = snapshot(&tiers, &on(None), None, &sizes, &no_kernel);
         assert!(local["plans"].as_array().unwrap().iter().all(|p| p["limits"].get("concurrentRuns").is_none()), "{local}");
         assert!(!render_html(&local, false).contains("at once"), "the page leaves it out too");
         assert_eq!(v["enterprise"], json!({ "label": "Enterprise", "contactUrl": "mailto:sales@example.com" }));
@@ -429,13 +451,13 @@ mod tests {
         for secret in ["price_", "secret/model-name", "openrouter", "hermes", "c2-m4-d40", "machineType", "routes", "legacy"] {
             assert!(!raw.contains(secret), "{secret} leaked: {raw}");
         }
-        assert_eq!(snapshot(&tiers, &on(None), None, &sizes)["enterprise"], Value::Null);
+        assert_eq!(snapshot(&tiers, &on(None), None, &sizes, &no_kernel)["enterprise"], Value::Null);
     }
 
     #[test]
     fn the_page_shows_prices_or_contact_us_and_escapes() {
         let tiers = Tiers::parse(PRICED, None).unwrap();
-        let h = render_html(&snapshot(&tiers, &on(Some("https://example.com/sales?a=1&b=2")), Some(Some(8)), &sizes), true);
+        let h = render_html(&snapshot(&tiers, &on(Some("https://example.com/sales?a=1&b=2")), Some(Some(8)), &sizes, &no_kernel), true);
         assert!(h.contains("<h2>Starter</h2>") && h.contains("£12.50 / month") && h.contains("£120 / year"), "{h}");
         assert!(h.contains("3 Bots") && h.contains("300 Bot runs a month") && h.contains("No monthly token limit") && h.contains("5 GB of storage"), "{h}");
         assert!(h.contains("Own machine: 2 CPUs, 4 GiB memory, 40 GiB disk"), "{h}");
@@ -450,6 +472,22 @@ mod tests {
         assert!(h.contains("<p class=\"price\">Contact us</p>") && !h.contains("/status\""), "{h}");
         let empty = render_html(&json!({ "plans": [], "enterprise": null }), false);
         assert!(empty.contains("No plans are published yet."), "{empty}");
+    }
+
+    #[test]
+    fn own_kernel_is_promised_only_where_it_is_held_to() {
+        let tiers = Tiers::parse(PRICED, None).unwrap();
+        let starter_only = |t: &Tier| t.name == "starter";
+        let v = snapshot(&tiers, &on(None), None, &sizes, &starter_only);
+        assert_eq!((v["plans"][0]["ownKernel"].clone(), v["plans"][1]["ownKernel"].clone()), (json!(true), json!(false)), "{v}");
+        let h = render_html(&v, false);
+        assert!(h.contains("Own machine: 2 CPUs, 4 GiB memory, 40 GiB disk, with its own kernel"), "{h}");
+        assert_eq!(h.matches("own kernel").count(), 1, "Pro isn't held to it: {h}");
+        let pro_only = |t: &Tier| t.name == "pro";
+        let h = render_html(&snapshot(&tiers, &on(None), None, &sizes, &pro_only), false);
+        assert!(h.contains("<li>Own machine with its own kernel</li>") && h.contains("40 GiB disk</li>"), "no size known for Pro: {h}");
+        let none = snapshot(&tiers, &on(None), None, &sizes, &no_kernel);
+        assert!(none["plans"].as_array().unwrap().iter().all(|p| p["ownKernel"] == false) && !render_html(&none, false).contains("kernel"), "{none}");
     }
 
     #[test]
