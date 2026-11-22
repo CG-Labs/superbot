@@ -343,7 +343,7 @@ async fn a_lost_hosts_machines_are_restored_onto_another_host_and_enroll_anew() 
     let gone = events(&env, "machine.lost").await;
     assert_eq!((gone.len(), gone[0]["details"]["reason"].as_str(), gone[0]["targetId"].as_str()), (1, Some("host_lost"), Some(n.id.as_str())), "{gone:?}");
     assert!(env.app.db.assign_machine(&m.id, None));
-    assert_eq!(env.cp.route(&env.app.db, &ada).err().map(|r| r.reason()), Some("machine_restoring"), "Bots wait until it enrolls");
+    assert_eq!(env.cp.route(&env.app, &ada).err().map(|r| r.reason()), Some("machine_restoring"), "Bots wait until it enrolls");
 
     // Its agent enrolls with the fresh token: done, and timed against the RTO.
     enroll_again(&env, &env.b, &mm).await;
@@ -352,7 +352,7 @@ async fn a_lost_hosts_machines_are_restored_onto_another_host_and_enroll_anew() 
     assert!(r.duration_ms.is_some() && r.rto_ms.is_some());
     let pins = env.app.db.machine_pins(&m.id);
     assert!(pins.len() == 1 && !certs_before.contains(&pins[0]), "a new certificate");
-    assert!(env.cp.route(&env.app.db, &ada).is_ok());
+    assert!(env.cp.route(&env.app, &ada).is_ok());
     let restored = events(&env, "machine.restored").await;
     assert_eq!((restored[0]["details"]["fromHost"].as_str(), restored[0]["details"]["toHost"].as_str()), (Some("a"), Some("b")), "{restored:?}");
     let (_, rec) = json_call(&env, "GET", "/api/machines/recovery", "").await;

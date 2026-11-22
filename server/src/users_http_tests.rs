@@ -83,7 +83,10 @@ async fn password_login_makes_token_and_cookie_sessions() {
     assert_eq!(code, 200);
     let me = parse(&me);
     assert_eq!((me["role"].as_str(), me["method"].as_str(), me["session"]["label"].as_str()), (Some("admin"), Some("session"), Some("Phone")));
-    assert_eq!(me["permissions"], json!(["account", "read", "review", "write", "approve", "admin"]));
+    assert_eq!(
+        me["permissions"],
+        json!(["account", "read", "review", "write", "approve", "users.manage", "bots.manage", "audit.view", "billing.manage", "signups.approve", "machines.manage", "admin"])
+    );
 
     // Cookie sessions, for the web app.
     let (code, head, res) = login(port, &origin(port), json!({ "password": PW.as_str(), "session": "cookie" })).await;
