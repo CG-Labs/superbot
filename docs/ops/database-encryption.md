@@ -40,7 +40,7 @@ docker compose up -d
 Or set the line in `.env` by hand and restart botd. On start, botd:
 
 1. Checks the master key opens what is already sealed in the database (it refuses to encrypt under a key that isn't the database's own).
-2. Writes an encrypted copy next to the database (`app.sqlite-reencrypt`), checks it with SQLite's `integrity_check`, and checks every table has the same number of rows.
+2. Takes the database out of WAL mode and locks it, so nothing writes to it while it is copied (this fails if another process has it open), then writes an encrypted copy next to it (`app.sqlite-reencrypt`), checks it with SQLite's `integrity_check`, and checks every table has the same number of rows.
 3. Keeps the plain database as `app.sqlite-plain-<UTC time>` (mode `0600`) and moves the encrypted copy into its place.
 
 If any step fails, the encrypted copy is deleted, the plain database is left as it was, and botd logs why and exits. The log says `Database encryption: encrypted with SQLCipher ...; encrypted the plain database on this start, keeping a plain copy in app.sqlite-plain-...`, and the audit log records `server.database_encryption_changed` with `migrated` set to that file's name.
@@ -85,5 +85,6 @@ Rotating the master key ([guide](master-key-rotation.md)) re-encrypts the databa
 | `the database is encrypted (ADR 0116) but no master key was found` | botd can't find the master key | Put the key back where `.env` says (`SUPERBOT_MASTER_KEY_FILE`, or `SUPERBOT_MASTER_KEY`) |
 | `the master key doesn't open the encrypted database (wrong key)` | The key isn't the one the database is encrypted under | Use the right key; mid-rotation, set the old one as the previous key |
 | `the master key doesn't open this database's encrypted values (wrong key)` while encrypting | `required` met a plain database whose sealed values are under another key | Fix the key first; nothing was changed |
+| `another botd is using this DATA_DIR`, or `encrypting the database: another process has it open` | Another botd, or a tool like `sqlite3`, has the database open | Stop it and start botd again; nothing was changed |
 | `encrypting the database: ...` | A step above failed (disk full, a damaged database, a process still writing) | botd left the plain database as it was; fix the cause and start again |
 | The master key is lost | An encrypted database can't be opened, and `SUPERBOT_FORGET_SEALED` doesn't help | Restore a backup together with the key it was made under |

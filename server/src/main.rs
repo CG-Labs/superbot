@@ -317,6 +317,8 @@ async fn main() {
     let data_dir = root("DATA_DIR", "data");
     let workspace = root("WORKSPACE_DIR", "workspace");
     let db_path = paths::child(&data_dir, "app.sqlite").unwrap();
+    let data_lock = database_encryption::lock_data_dir(&db_path).unwrap_or_else(|e| exit(format!("Database: {e}")));
+    std::mem::forget(data_lock);
     let db_policy = database_encryption::Policy::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Database encryption: {e}")));
     let mut keys = secrets::Keys::locate(&data_dir).unwrap_or_else(|e| exit(format!("Secrets: {e}")));
     let (db_key, db_start) =

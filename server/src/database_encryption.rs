@@ -270,32 +270,37 @@ pub fn reencrypt(path: &Path, from: Option<&DbKey>, to: Option<&DbKey>, keep: Op
 fn reencrypt_via(path: &Path, work: &Path, from: Option<&DbKey>, to: Option<&DbKey>, keep: Option<&Path>) -> Result<(), String> {
     let db = |e: rusqlite::Error| format!("encrypting the database: {e}");
     let work_str = work.to_str().ok_or("DATA_DIR must be valid UTF-8")?;
-    let (before, version) = {
-        let c = open_with(path, from).map_err(db)?;
-        c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())).map_err(db)?;
-        let before = counts(&c).map_err(db)?;
-        let version = user_version(&c).map_err(db)?;
-        c.execute("ATTACH DATABASE ?1 AS reencrypt KEY ?2", params![work_str, to.map_or("", |k| k.0.as_str())]).map_err(db)?;
-        c.query_row("SELECT sqlcipher_export('reencrypt')", [], |_| Ok(())).map_err(db)?;
-        c.execute_batch(&format!("PRAGMA reencrypt.user_version = {version}")).map_err(db)?;
-        c.execute("DETACH DATABASE reencrypt", []).map_err(db)?;
-        (before, version)
+    // Held until the copy is in place, so no other connection writes to the original
+    // after it is copied. Leaving WAL needs every other connection closed, and the
+    // exclusive locking mode keeps the write lock taken below until `c` is dropped.
+    let c = open_with(path, from).map_err(db)?;
+    c.busy_timeout(std::time::Duration::from_secs(1)).map_err(db)?;
+    let busy = |e: rusqlite::Error| match e.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+            "encrypting the database: another process has it open (is another botd running?); nothing was changed".to_string()
+        }
+        _ => db(e),
     };
+    let mode: String = c.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0)).map_err(busy)?;
+    if mode != "delete" {
+        return Err(format!("encrypting the database: it stayed in {mode} mode (is another botd running?); nothing was changed"));
+    }
+    c.execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;").map_err(busy)?;
+    let before = counts(&c).map_err(db)?;
+    let version = user_version(&c).map_err(db)?;
+    c.execute("ATTACH DATABASE ?1 AS reencrypt KEY ?2", params![work_str, to.map_or("", |k| k.0.as_str())]).map_err(db)?;
+    c.query_row("SELECT sqlcipher_export('reencrypt')", [], |_| Ok(())).map_err(db)?;
+    c.execute_batch(&format!("PRAGMA reencrypt.user_version = {version}")).map_err(db)?;
+    c.execute("DETACH DATABASE reencrypt", []).map_err(db)?;
     {
-        let c = open_with(work, to).map_err(db)?;
-        let check: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0)).map_err(db)?;
+        let w = open_with(work, to).map_err(db)?;
+        let check: String = w.query_row("PRAGMA integrity_check", [], |r| r.get(0)).map_err(db)?;
         if check != "ok" {
             return Err(format!("encrypting the database: the copy failed its integrity check ({check}); nothing was changed"));
         }
-        if counts(&c).map_err(db)? != before || user_version(&c).map_err(db)? != version {
+        if counts(&w).map_err(db)? != before || user_version(&w).map_err(db)? != version {
             return Err("encrypting the database: the copy doesn't hold the same rows; nothing was changed".into());
         }
-    }
-    // Checkpointed above and every connection closed, so the WAL is gone or empty. One
-    // with pages in it would be applied to the new file, so stop rather than lose them.
-    let wal = with_suffix(path, "-wal");
-    if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
-        return Err(format!("encrypting the database: {} still holds changes (is another botd running?); nothing was changed", wal.display()));
     }
     fn io(what: &Path) -> impl FnOnce(std::io::Error) -> String + '_ {
         move |e| format!("encrypting the database: {}: {e}", what.display())
@@ -310,12 +315,26 @@ fn reencrypt_via(path: &Path, work: &Path, from: Option<&DbKey>, to: Option<&DbK
         std::fs::set_permissions(keep, std::fs::Permissions::from_mode(0o600)).map_err(io(keep))?;
         std::fs::File::open(keep).and_then(|f| f.sync_all()).map_err(io(keep))?;
     }
-    for suffix in ["-wal", "-shm"] {
+    for suffix in ["-wal", "-shm", "-journal"] {
         let _ = std::fs::remove_file(with_suffix(path, suffix));
     }
     std::fs::rename(work, path).map_err(io(path))?;
     sync_dir(path);
+    drop(c);
     Ok(())
+}
+
+/// Held for botd's lifetime: a second botd on the same DATA_DIR would write to a database
+/// the first may be replacing, or run the same routines twice.
+pub fn lock_data_dir(db_path: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock = with_suffix(db_path, "-lock");
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(&lock).map_err(|e| format!("{}: {e}", lock.display()))?;
+    match f.try_lock() {
+        Ok(()) => Ok(f),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!("another botd is using this DATA_DIR (it holds {}); stop it first", lock.display())),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("{}: {e}", lock.display())),
+    }
 }
 
 /// A plain copy of the database left by encrypting it.
@@ -612,10 +631,7 @@ fn cli_run(args: &[String]) -> Result<Vec<String>, String> {
             match format(path)? {
                 Format::Missing => Err(format!("{}: no database there", path.display())),
                 Format::Plain => Ok(vec!["plain".into()]),
-                Format::Encrypted => match cli_key(path) {
-                    Ok(_) => Ok(vec!["encrypted, opens with the master key".into()]),
-                    Err(e) => Ok(vec![format!("encrypted, {e}")]),
-                },
+                Format::Encrypted => Ok(vec!["encrypted".into()]),
             }
         }
         _ => Err(USAGE.into()),
@@ -811,11 +827,11 @@ mod tests {
         let path = db_in("dbe-fail");
         let master = MasterKey::generate();
         plain_db(&path, &master);
-        let before = std::fs::read(&path).unwrap();
         let key = DbKey::derive(&master);
         let e = reencrypt(&path, None, Some(&key), Some(&path.with_file_name("missing-dir/copy"))).unwrap_err();
         assert!(e.contains("missing-dir"), "{e}");
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(format(&path).unwrap(), Format::Plain);
+        assert_eq!(bots(&open_with(&path, None).unwrap()), ["KeepMe"], "only its journal mode changed");
         assert!(!with_suffix(&path, WORK_SUFFIX).exists(), "the half-made copy is gone");
 
         // Another connection's unwritten changes stop it too.
@@ -824,11 +840,22 @@ mod tests {
         let reader = open_with(&path, None).unwrap();
         reader.execute_batch("BEGIN; SELECT count(*) FROM bots;").unwrap();
         other.execute_batch("COMMIT").unwrap();
-        assert!(reencrypt(&path, None, Some(&key), None).is_err(), "a reader pins the WAL, so it isn't emptied");
+        let e = reencrypt(&path, None, Some(&key), None).unwrap_err();
+        assert!(e.contains("another process has it open"), "{e}");
         drop(reader);
         drop(other);
         assert_eq!(format(&path).unwrap(), Format::Plain);
         assert_eq!(bots(&open_with(&path, None).unwrap()), ["KeepMe", "Late"]);
+    }
+
+    #[test]
+    fn one_botd_per_data_dir() {
+        let path = db_in("dbe-lock");
+        let held = lock_data_dir(&path).unwrap();
+        let e = lock_data_dir(&path).unwrap_err();
+        assert!(e.contains("another botd is using this DATA_DIR"), "{e}");
+        drop(held);
+        lock_data_dir(&path).unwrap();
     }
 
     #[test]

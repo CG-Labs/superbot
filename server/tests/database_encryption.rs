@@ -148,6 +148,11 @@ fn a_plain_database_is_encrypted_on_opting_in_and_read_with_the_master_key() {
     assert!(get(b.port, "/api/bots").to_string().contains("KeepMe"));
     let ev = get(b.port, "/api/audit?action=server.database_encryption_changed&limit=10")["events"].as_array().cloned().unwrap();
     assert_eq!(ev[0]["details"]["migrated"].as_str(), copy.file_name().unwrap().to_str(), "{ev:?}");
+    let mut second = spawn(&dir, "required", "second");
+    let status = wait_for("the second botd to exit", || second.child.try_wait().unwrap());
+    assert!(!status.success());
+    let log = std::fs::read_to_string(dir.join("second.out")).unwrap() + &std::fs::read_to_string(dir.join("second.err")).unwrap();
+    assert!(log.contains("another botd is using this DATA_DIR"), "{log}");
     drop(b);
     assert!(!plain(&db) && plain(&copy));
 
@@ -160,6 +165,8 @@ fn a_plain_database_is_encrypted_on_opting_in_and_read_with_the_master_key() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "KeepMe\n", "{out:?}");
     let out = database(&dir, &["status", copy.to_str().unwrap()]);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "plain\n");
+    let out = database(&dir, &["status", snap.to_str().unwrap()]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "encrypted\n");
 
     // Another key opens neither, and botd refuses to start with it.
     write_key(&dir.join("keys/master.key"));
