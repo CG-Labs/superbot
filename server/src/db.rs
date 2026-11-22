@@ -1800,7 +1800,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 51] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 52] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
