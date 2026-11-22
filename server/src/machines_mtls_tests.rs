@@ -248,7 +248,7 @@ async fn a_machine_enrolls_once_then_answers_over_mutual_tls() {
             Some(id.fingerprint.as_str())
         )
     );
-    // The first enrollment says how long the machine took to come up (ADR 0119).
+    // The first enrollment says how long the machine took to come up (ADR 0120).
     let d = &enrolled[0]["details"];
     assert_eq!((d["first"].as_bool(), d["provider"].as_str(), d["tier"].as_str()), (Some(true), Some(m.provider.as_str()), Some("starter")), "{d}");
     let took = d["sinceRequestSeconds"].as_i64().unwrap_or(-1);

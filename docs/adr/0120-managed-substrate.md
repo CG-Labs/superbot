@@ -1,4 +1,4 @@
-# 0119: The managed substrate: Linode VMs, Incus containers, an orchestrator, or a mix by tier
+# 0120: The managed substrate: Linode VMs, Incus containers, an orchestrator, or a mix by tier
 
 ## Status
 
@@ -149,7 +149,7 @@ Both pieces are opt-in, and neither changes what happens on a server that doesn'
 
 - A comma-separated list of tiers from `MACHINE_TIERS` whose machines must have a kernel of their own, or `all`. Unset by default.
 - A tier that isn't in `MACHINE_TIERS`, or one listed twice, stops botd at start.
-- With a provider whose machines share their host's kernel (`MACHINE_PROVIDER=incus`), botd refuses to start and names the tiers: "MACHINE_OWN_KERNEL_TIERS: pro must have a kernel of their own, and incus machines are containers that share their host's (ADR 0119)". It's a startup error, not a warning, because the setting records a promise to customers.
+- With a provider whose machines share their host's kernel (`MACHINE_PROVIDER=incus`), botd refuses to start and names the tiers: "MACHINE_OWN_KERNEL_TIERS: pro must have a kernel of their own, and incus machines are containers that share their host's (ADR 0120)". It's a startup error, not a warning, because the setting records a promise to customers.
 - A control plane has one provider today, so the check covers the whole server. It is per tier so that the mix by tier (d) can send those tiers to a VM provider without a new setting.
 - `GET /api/machines/substrate` and `botctl machine substrate` show `kernel` (`own` or `shared`), and `ownKernel` for each tier. The startup line names those tiers.
 - **`MachineProvider::substrate()` no longer has a default.** It used to default to `vm`, so a new provider that forgot to override it would have claimed its own kernel and passed this check. Each provider now says what it makes: `vm` for Linode and the fake provider, `container` for Incus.

@@ -175,7 +175,7 @@ pub struct ControlPlane {
     /// Tier name to provider plan, in order; the first is the default.
     pub tiers: Vec<(String, String)>,
     /// Tiers whose machines must have a kernel of their own (MACHINE_OWN_KERNEL_TIERS,
-    /// ADR 0119). Never set with a provider whose machines share their host's.
+    /// ADR 0120). Never set with a provider whose machines share their host's.
     pub own_kernel_tiers: Vec<String>,
     /// Allowed regions; the first is the default.
     pub regions: Vec<String>,
@@ -300,7 +300,7 @@ pub fn parse_tiers(raw: &str) -> Result<Vec<(String, String)>, String> {
     Ok(out)
 }
 
-/// MACHINE_OWN_KERNEL_TIERS (ADR 0119): tiers of `tiers` whose machines must have a
+/// MACHINE_OWN_KERNEL_TIERS (ADR 0120): tiers of `tiers` whose machines must have a
 /// kernel of their own, or `all`. A provider whose machines share their host's kernel
 /// can't make them, so that is a startup error rather than a quiet downgrade.
 fn own_kernel_tiers(raw: &str, tiers: &[(String, String)], p: &dyn MachineProvider) -> Result<Vec<String>, String> {
@@ -319,7 +319,7 @@ fn own_kernel_tiers(raw: &str, tiers: &[(String, String)], p: &dyn MachineProvid
     }
     if !out.is_empty() && p.substrate() != "vm" {
         return Err(format!(
-            "MACHINE_OWN_KERNEL_TIERS: {} must have a kernel of their own, and {} machines are {}s that share their host's (ADR 0119). Use a provider that makes VMs, or take them out",
+            "MACHINE_OWN_KERNEL_TIERS: {} must have a kernel of their own, and {} machines are {}s that share their host's (ADR 0120). Use a provider that makes VMs, or take them out",
             out.join(", "),
             p.name(),
             p.substrate()
@@ -2124,7 +2124,7 @@ mod tests {
             (&certs, &[("MACHINE_REGIONS", "Node 1")][..], "MACHINE_REGIONS"),
             (&certs, &[("MACHINE_BACKUPS_RPO_HOURS", "30")][..], "MACHINE_BACKUP_RPO_HOURS"),
             (&certs, &[("MACHINE_PROVIDER", "docker")][..], "linode or incus"),
-            // Containers share the host's kernel, so a tier promised its own can't be made (ADR 0119).
+            // Containers share the host's kernel, so a tier promised its own can't be made (ADR 0120).
             (&certs, &[("MACHINE_OWN_KERNEL_TIERS", "pro")][..], "pro must have a kernel of their own, and incus machines are containers that share their host's"),
             (&certs, &[("MACHINE_OWN_KERNEL_TIERS", "all")][..], "starter, pro, max must have a kernel of their own"),
             (&EnvStore::fixed(&[("INCUS_CLIENT_CERT", &cert), ("INCUS_SERVER_CERT", &server)]), &[][..], "INCUS_CLIENT_KEY"),
@@ -2185,7 +2185,7 @@ mod tests {
         assert!(cp.describe().contains("backups on (RPO 26 hours)"), "{}", cp.describe());
         let cp = with(&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_BACKUPS_RPO_HOURS", "48")]).unwrap();
         assert_eq!(cp.provider_backups.map(|p| p.rpo_ms), Some(48 * 3_600_000));
-        // Linode machines are VMs, so any tier may be promised its own kernel (ADR 0119).
+        // Linode machines are VMs, so any tier may be promised its own kernel (ADR 0120).
         assert!(cp.own_kernel_tiers.is_empty() && !cp.describe().contains("own kernel"), "off unless set");
         let cp = with(&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_OWN_KERNEL_TIERS", " pro, max ")]).unwrap();
         assert_eq!(cp.own_kernel_tiers, ["pro", "max"]);
