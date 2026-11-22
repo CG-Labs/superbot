@@ -4,7 +4,8 @@
 //! It takes only what SAML IdPs send: one enveloped `ds:Signature` per signed element, one
 //! `Reference` to that element's own `ID`, the transforms enveloped-signature then Exclusive
 //! C14N, RSA with SHA-256 or SHA-512, and keys from the configured IdP certificates (never
-//! from `KeyInfo`). Anything else is refused, not interpreted.
+//! from `KeyInfo`). Anything else is refused, not interpreted. The HTTP-Redirect binding's
+//! detached signature over a query string (ADR 0137) is checked with the same algorithms and keys.
 //!
 //! Documents are parsed with `roxmltree`, which refuses DTDs (so no entities, external or
 //! otherwise). Comments and processing instructions are refused outright: canonicalization
@@ -19,7 +20,7 @@ use sha2::{Digest, Sha256, Sha512};
 pub const DSIG: &str = "http://www.w3.org/2000/09/xmldsig#";
 pub const EXC_C14N: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
 const ENVELOPED: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
-const RSA_SHA256: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+pub const RSA_SHA256: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
 const RSA_SHA512: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512";
 const RSA_SHA1: &str = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
 const SHA256: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
@@ -215,6 +216,24 @@ fn inclusive_prefixes(method: Node) -> Result<Vec<String>, Invalid> {
     }
 }
 
+/// The RSA verification `alg` (a SignatureMethod URI) names: SHA-256 or SHA-512, never SHA-1.
+fn rsa_algorithm(alg: &str) -> Result<&'static aws_lc_rs::signature::RsaParameters, Invalid> {
+    match alg {
+        RSA_SHA256 => Ok(&aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA256),
+        RSA_SHA512 => Ok(&aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA512),
+        RSA_SHA1 => Err(Invalid("weak_algorithm")),
+        _ => Err(Invalid("bad_algorithm")),
+    }
+}
+
+/// A detached signature over `data` by one of `certs`, as the HTTP-Redirect binding signs its
+/// query string: the same algorithms and keys as an enveloped signature, and no XML.
+pub fn verify_raw(alg: &str, data: &[u8], signature: &[u8], certs: &[Cert]) -> Result<(), Invalid> {
+    let rsa = rsa_algorithm(alg)?;
+    let ok = certs.iter().any(|c| aws_lc_rs::signature::UnparsedPublicKey::new(rsa, &c.key).verify(data, signature).is_ok());
+    if ok { Ok(()) } else { Err(Invalid("bad_signature")) }
+}
+
 fn algorithm<'a>(n: Node<'a, '_>, name: &str) -> Result<&'a str, Invalid> {
     if !is(n, DSIG, name) {
         return Err(Invalid("bad_signature"));
@@ -247,12 +266,7 @@ pub fn verify_enveloped(signed: Node, certs: &[Cert]) -> Result<bool, Invalid> {
         return Err(Invalid("bad_algorithm"));
     }
     let signed_info_prefixes = inclusive_prefixes(c14n)?;
-    let rsa = match algorithm(method, "SignatureMethod")? {
-        RSA_SHA256 => &aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA256,
-        RSA_SHA512 => &aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA512,
-        RSA_SHA1 => return Err(Invalid("weak_algorithm")),
-        _ => return Err(Invalid("bad_algorithm")),
-    };
+    let rsa = rsa_algorithm(algorithm(method, "SignatureMethod")?)?;
     if !is(reference, DSIG, "Reference") {
         return Err(Invalid("bad_signature"));
     }
@@ -320,7 +334,7 @@ pub mod test_signer {
             Cert::from_base64(&self.cert).unwrap()
         }
 
-        fn rsa_sha256(&self, data: &[u8]) -> String {
+        pub fn rsa_sha256(&self, data: &[u8]) -> String {
             let mut sig = vec![0; self.pair.public_modulus_len()];
             self.pair.sign(&aws_lc_rs::signature::RSA_PKCS1_SHA256, &SystemRandom::new(), data, &mut sig).unwrap();
             STANDARD.encode(sig)
@@ -459,6 +473,19 @@ mod tests {
         assert_eq!(check(&xml.replace(r#"PrefixList="xs""#, r#"PrefixList="""#)), Err("bad_signature"), "the prefix list is signed too");
         assert_eq!(check(&xml.replace("<samlp:Response ", "<samlp:Response xmlns:extra=\"urn:x\" ")), Ok(true), "unused ancestor namespaces don't count");
         assert_eq!(check(&xml.replace(">ada@example.com<", ">ada@example.com<!-- -->.evil<")), Err("bad_response"));
+    }
+
+    #[test]
+    fn verifies_a_detached_signature_with_the_same_rules() {
+        let [idp, other] = signers();
+        let data = b"SAMLRequest=abc&RelayState=x&SigAlg=y";
+        let sig = STANDARD.decode(idp.rsa_sha256(data)).unwrap();
+        assert_eq!(verify_raw(RSA_SHA256, data, &sig, &[other.cert(), idp.cert()]), Ok(()));
+        assert_eq!(verify_raw(RSA_SHA256, data, &sig, &[other.cert()]), Err(Invalid("bad_signature")));
+        assert_eq!(verify_raw(RSA_SHA256, b"SAMLRequest=abd&RelayState=x&SigAlg=y", &sig, &[idp.cert()]), Err(Invalid("bad_signature")));
+        assert_eq!(verify_raw(RSA_SHA256, data, &sig, &[]), Err(Invalid("bad_signature")));
+        assert_eq!(verify_raw(RSA_SHA1, data, &sig, &[idp.cert()]), Err(Invalid("weak_algorithm")));
+        assert_eq!(verify_raw("http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256", data, &sig, &[idp.cert()]), Err(Invalid("bad_algorithm")));
     }
 
     #[test]

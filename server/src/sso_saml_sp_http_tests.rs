@@ -2,6 +2,8 @@
 //! responses, and the browser's POST to the ACS done by hand.
 
 use crate::scim_http_tests::session_for;
+use crate::db::{NewIdentity, User};
+use crate::sso::saml_slo::test_idp::Logout;
 use crate::sso::saml_sp::test_idp::{self, IDP, Response, SSO_URL};
 use crate::sso_http_tests::*;
 use crate::tests::{audit_list, call};
@@ -292,4 +294,192 @@ async fn metadata_from_a_file_is_read_at_startup_and_not_replaced() {
     assert_eq!(code, 200);
     assert_eq!(signed_in_as(port, &head).await, Some(u.id));
     std::fs::remove_dir_all(dir).ok();
+}
+
+// Signed AuthnRequests and single logout (ADR 0137)
+
+impl Sp {
+    fn slo(&self) -> String {
+        format!("http://127.0.0.1:{}/api/auth/sso/{}/slo", self.port, self.id)
+    }
+
+    /// Our certificate, as our metadata publishes it.
+    async fn sp_cert(&self) -> crate::sso::xmldsig::Cert {
+        let md = http().get(format!("http://127.0.0.1:{}/api/auth/sso/{}/metadata", self.port, self.id)).send().await.unwrap().text().await.unwrap();
+        let cert = md.split("<ds:X509Certificate>").nth(1).expect("a signing certificate").split('<').next().unwrap();
+        crate::sso::xmldsig::Cert::from_base64(cert).unwrap()
+    }
+
+    fn link(&self) -> User {
+        let u = self.app.db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
+        self.app.db.link_identity(&u.id, &NewIdentity { provider: &self.id, issuer: IDP, subject: STORED, tenant: None, email: None, created_by: Some("test") }).unwrap();
+        u
+    }
+
+    /// A web sign-in in the IdP session `index`: the session cookie header.
+    async fn cookie(&self, index: &str) -> String {
+        let (code, _, head) = self.sign_in(|r| r.session_index = index.into()).await;
+        assert_eq!(code, 200, "{head}");
+        let session = set_cookies(&head).into_iter().find(|c| c.starts_with("__Host-superbot_session=sbs_")).unwrap();
+        format!("Cookie: {}\r\n", session.split(';').next().unwrap())
+    }
+
+    async fn who(&self, cookie: &str) -> Option<String> {
+        let (_, _, me) = crate::tests::call_with(self.port, "GET", "/api/auth/me", "", cookie, "").await;
+        serde_json::from_str::<Value>(&me).ok()?["user"]["id"].as_str().map(String::from)
+    }
+
+    /// The IdP's browser at our SLO URL over the redirect binding: the status and where it goes.
+    async fn slo_get(&self, query: &str) -> (u16, String) {
+        let res = http().get(format!("{}?{query}", self.slo())).send().await.unwrap();
+        (res.status().as_u16(), res.headers().get("location").map(|l| l.to_str().unwrap().to_string()).unwrap_or_default())
+    }
+
+    async fn slo_post(&self, form: &HashMap<String, String>) -> (u16, String) {
+        let res = http().post(self.slo()).form(form).send().await.unwrap();
+        (res.status().as_u16(), res.headers().get("location").map(|l| l.to_str().unwrap().to_string()).unwrap_or_default())
+    }
+
+    async fn audit(&self, action: &str) -> Vec<Value> {
+        audit_list(&call(self.port, "GET", &format!("/api/audit?action={action}"), &self.admin, "").await.1)
+    }
+}
+
+/// A native provider whose IdP has an SLO URL.
+async fn serve_slo(extra: &[(&str, &str)]) -> Sp {
+    let sp = serve(extra).await;
+    let xml = test_idp::with_slo(&test_idp::metadata());
+    let (code, view) = call(sp.port, "PUT", &format!("/api/sso/{}/saml/idp-metadata", sp.id), &sp.admin, &json!({ "xml": xml }).to_string()).await;
+    assert_eq!(code, 200, "{view}");
+    sp
+}
+
+/// A redirect-binding message: its XML, after checking it is signed by `cert`.
+fn signed_redirect(url: &str, cert: &crate::sso::xmldsig::Cert) -> (String, crate::sso::saml_sp::Redirected) {
+    let (base, query) = url.split_once('?').unwrap();
+    let r = crate::sso::saml_sp::from_redirect(query).unwrap();
+    assert_eq!(r.verify(std::slice::from_ref(cert)), Ok(true), "signed by our key");
+    (base.to_string(), r)
+}
+
+#[tokio::test]
+async fn signed_authn_requests_verify_against_the_published_certificate() {
+    let sp = serve(&[("SIGN_REQUESTS", "true")]).await;
+    let md = http().get(format!("http://127.0.0.1:{}/api/auth/sso/{}/metadata", sp.port, sp.id)).send().await.unwrap().text().await.unwrap();
+    assert!(md.contains(r#"AuthnRequestsSigned="true""#) && md.contains(r#"<md:KeyDescriptor use="signing">"#), "{md}");
+    assert!(md.contains(&format!(r#"Location="{}""#, sp.slo())), "{md}");
+    let cert = sp.sp_cert().await;
+    assert_eq!(sp.sp_cert().await.sha256, cert.sha256, "made once, then kept");
+    let made = sp.audit("sso.saml_sp_key_created").await;
+    assert_eq!((made.len(), made[0]["details"]["certificate"].as_str()), (1, Some(cert.sha256.as_str())));
+    let sealed = sp.app.db.setting(&format!("sso_saml_sp_key_{}", sp.id)).unwrap();
+    assert!(crate::secrets::sealed::is_sealed(&sealed), "the key is sealed at rest");
+
+    let (code, head, _) = crate::tests::call_with(sp.port, "GET", &format!("/api/auth/sso/{}/start", sp.id), "", "", "").await;
+    assert_eq!(code, 303);
+    let (to, r) = signed_redirect(&header(&head, "location").unwrap(), &cert);
+    assert_eq!(to, SSO_URL);
+    assert!(r.xml.contains("<samlp:AuthnRequest") && r.relay.is_some(), "{}", r.xml);
+    let q: HashMap<_, _> = url::Url::parse(&header(&head, "location").unwrap()).unwrap().query_pairs().into_owned().collect();
+    assert_eq!(q["SigAlg"], crate::sso::xmldsig::RSA_SHA256);
+    // Still signs in as before: the IdP's half doesn't change.
+    let u = sp.link();
+    assert_eq!(sp.who(&sp.cookie("_s1").await).await, Some(u.id));
+
+    let (_, v) = call(sp.port, "GET", &format!("/api/sso/{}/saml", sp.id), &sp.admin, "").await;
+    let v: Value = serde_json::from_str(&v).unwrap();
+    assert_eq!((v["signRequests"].as_bool(), v["spKey"]["from"].as_str(), v["spKey"]["certificate"]["sha256"].as_str()), (Some(true), Some("generated"), Some(cert.sha256.as_str())));
+    assert_eq!((v["sloUrl"].as_str(), v["singleLogout"].as_bool()), (Some(sp.slo().as_str()), Some(false)), "the IdP has no SLO URL");
+
+    // Unsigned, the redirect has no signature, and an IdP that wants one is refused at import.
+    let plain = serve(&[]).await;
+    let (_, head, _) = crate::tests::call_with(plain.port, "GET", &format!("/api/auth/sso/{}/start", plain.id), "", "", "").await;
+    assert!(!header(&head, "location").unwrap().contains("Signature="));
+    let wants = test_idp::metadata_with(IDP, &[&crate::sso::xmldsig::test_signer::signers()[0]], r#" WantAuthnRequestsSigned="true""#);
+    let (code, e) = call(plain.port, "PUT", &format!("/api/sso/{}/saml/idp-metadata", plain.id), &plain.admin, &json!({ "xml": wants }).to_string()).await;
+    assert!(code == 400 && e.contains("SIGN_REQUESTS"), "{code} {e}");
+    let (code, e) = call(sp.port, "PUT", &format!("/api/sso/{}/saml/idp-metadata", sp.id), &sp.admin, &json!({ "xml": wants }).to_string()).await;
+    assert_eq!(code, 200, "{e}");
+}
+
+#[tokio::test]
+async fn an_idp_logout_request_revokes_the_sessions_it_names_once() {
+    let sp = serve_slo(&[]).await;
+    let u = sp.link();
+    let (first, second) = (sp.cookie("_s1").await, sp.cookie("_s2").await);
+    assert_eq!((sp.who(&first).await, sp.who(&second).await), (Some(u.id.clone()), Some(u.id.clone())));
+    let cert = sp.sp_cert().await;
+    let now = db::now();
+
+    // The IdP ends its session _s1: only the SuperBot session it made goes.
+    let l = Logout::request(&sp.slo(), NAME_ID, Some("_s1"), now);
+    let (code, to) = sp.slo_get(&l.redirect()).await;
+    assert_eq!(code, 303, "{to}");
+    let (base, answer) = signed_redirect(&to, &cert);
+    assert_eq!((base.as_str(), answer.param, answer.relay.as_deref()), (test_idp::SLO_URL, "SAMLResponse", Some("idp-relay")));
+    assert!(answer.xml.contains(&format!(r#"InResponseTo="{}""#, l.id)) && answer.xml.contains("status:Success"), "{}", answer.xml);
+    assert_eq!((sp.who(&first).await, sp.who(&second).await), (None, Some(u.id.clone())));
+    let slo = &sp.audit("auth.slo").await[0];
+    assert_eq!((slo["actorId"].as_str(), slo["actorSubject"].as_str()), (Some(u.id.as_str()), Some(format!("{IDP}|{STORED}").as_str())));
+    assert_eq!((slo["details"]["revoked"].as_u64(), slo["details"]["requestId"].as_str(), slo["details"]["sessionIndexes"].clone()), (Some(1), Some(l.id.as_str()), json!(["_s1"])));
+
+    // The same message again, from elsewhere, unsigned, or badly signed: refused, and kept.
+    let refused = |code: u16| assert_eq!(code, 400);
+    refused(sp.slo_get(&l.redirect()).await.0);
+    assert_eq!(sp.audit("auth.slo_failed").await[0]["details"]["reason"], "replayed");
+    refused(sp.slo_get(&Logout { issuer: "https://evil.example/saml".into(), ..Logout::request(&sp.slo(), NAME_ID, None, now) }.redirect()).await.0);
+    assert_eq!(sp.audit("auth.slo_failed").await[0]["details"]["reason"], "wrong_issuer");
+    refused(sp.slo_get(&Logout { signer: None, ..Logout::request(&sp.slo(), NAME_ID, None, now) }.redirect()).await.0);
+    assert_eq!(sp.audit("auth.slo_failed").await[0]["details"]["reason"], "unsigned");
+    refused(sp.slo_get(&Logout { signer: Some(1), ..Logout::request(&sp.slo(), NAME_ID, None, now) }.redirect()).await.0);
+    refused(sp.slo_post(&Logout { signer: Some(1), ..Logout::request(&sp.slo(), NAME_ID, None, now) }.post()).await.0);
+    refused(sp.slo_get(&Logout { destination: Some("https://other.example/slo".into()), ..Logout::request(&sp.slo(), NAME_ID, None, now) }.redirect()).await.0);
+    refused(sp.slo_get(&Logout { issued_ms: now - 3_600_000, ..Logout::request(&sp.slo(), NAME_ID, None, now) }.redirect()).await.0);
+    refused(sp.slo_get("SAMLRequest=not-deflate").await.0);
+    // Someone else, or another IdP session of Ada's: nothing to revoke, and still answered.
+    assert_eq!(sp.slo_get(&Logout::request(&sp.slo(), "someone-else", None, now).redirect()).await.0, 303);
+    assert_eq!(sp.slo_get(&Logout::request(&sp.slo(), NAME_ID, Some("_s9"), now).redirect()).await.0, 303);
+    assert_eq!(sp.who(&second).await, Some(u.id.clone()));
+
+    // Over the POST binding with no SessionIndex: all of Ada's sessions from this IdP.
+    let (code, to) = sp.slo_post(&Logout::request(&sp.slo(), NAME_ID, None, now).post()).await;
+    assert_eq!(code, 303, "{to}");
+    assert_eq!(sp.who(&second).await, None);
+    assert_eq!(sp.audit("auth.slo").await[0]["details"]["revoked"], 1);
+    let failed = sp.audit("auth.slo_failed").await;
+    assert!(failed.iter().all(|f| f["outcome"] == "failure" && f["details"]["provider"] == sp.id.as_str()), "{failed:?}");
+}
+
+#[tokio::test]
+async fn signing_out_sends_the_idp_a_signed_logout_request() {
+    let sp = serve_slo(&[]).await;
+    let u = sp.link();
+    let cookie = sp.cookie("_s1").await;
+    let (code, _, body) = crate::tests::call_with(sp.port, "POST", "/api/auth/logout", "", &cookie, "").await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(sp.who(&cookie).await, None, "signed out here first");
+    let url = serde_json::from_str::<Value>(&body).unwrap()["logoutUrl"].as_str().expect("logoutUrl").to_string();
+    let (base, request) = signed_redirect(&url, &sp.sp_cert().await);
+    assert_eq!((base.as_str(), request.param, request.relay.as_deref()), (test_idp::SLO_URL, "SAMLRequest", None));
+    assert!(request.xml.contains(&format!(">{NAME_ID}</saml:NameID>")) && request.xml.contains("<samlp:SessionIndex>_s1</samlp:SessionIndex>"), "the NameID as the IdP sent it: {}", request.xml);
+    let id = request.xml.split(" ID=\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    let logout = &sp.audit("auth.logout").await[0];
+    assert_eq!((logout["actorId"].as_str(), logout["details"]["slo"].as_str()), (Some(u.id.as_str()), Some(id.as_str())));
+
+    // The IdP's answer: audited against the session it was for, once.
+    let answer = Logout::response(&sp.slo(), &id, db::now());
+    assert_eq!(sp.slo_get(&answer.redirect()).await, (303, "/login".to_string()));
+    let done = &sp.audit("auth.slo_response").await[0];
+    assert_eq!((done["outcome"].as_str(), done["details"]["requestId"].as_str(), done["details"]["status"].as_str()), (Some("success"), Some(id.as_str()), Some("Success")));
+    assert_eq!(sp.slo_get(&answer.redirect()).await.0, 400);
+    assert_eq!(sp.audit("auth.slo_failed").await[0]["details"]["reason"], "replayed");
+    assert_eq!(sp.slo_get(&Logout::response(&sp.slo(), &id, db::now()).redirect()).await.0, 400, "a second answer to it");
+    assert_eq!(sp.audit("auth.slo_failed").await[0]["details"]["reason"], "unknown_request");
+
+    // An IdP without an SLO URL: signing out ends only SuperBot's session.
+    let plain = serve(&[]).await;
+    plain.link();
+    let cookie = plain.cookie("_s1").await;
+    let (_, _, body) = crate::tests::call_with(plain.port, "POST", "/api/auth/logout", "", &cookie, "").await;
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), json!({ "ok": true }));
 }

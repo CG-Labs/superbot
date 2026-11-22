@@ -491,13 +491,27 @@ pub async fn login(Extension(a): Extension<Arc<Auth>>, Extension(source): Extens
 }
 
 /// Ends the current session. Always clears the cookie.
-pub async fn logout(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> Response {
+/// Ends the caller's session. One a native SAML IdP vouched for, in the browser, also gets
+/// `logoutUrl`: the signed LogoutRequest that ends the IdP's session (ADR 0137).
+pub async fn logout(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> Response {
+    let mut logout_url = None;
     if let Some(s) = &c.session
         && app.db.revoke_session(&s.id, &s.user_id, "logout")
     {
-        app.db.record(&by.event("auth.logout").target("session", &s.id));
+        let slo = (s.kind == "cookie" && s.method == "sso").then(|| crate::sso::logout_request(&a, &app, s)).flatten();
+        let details = slo.as_ref().map(|(_, id)| json!({ "provider": s.idp_provider, "slo": id }));
+        let mut e = by.event("auth.logout").target("session", &s.id);
+        if let Some(d) = details {
+            e = e.details(d);
+        }
+        app.db.record(&e);
+        logout_url = slo.map(|(url, _)| url);
     }
-    ([(header::SET_COOKIE, clear_cookie())], Json(json!({ "ok": true }))).into_response()
+    let mut body = json!({ "ok": true });
+    if let Some(u) = logout_url {
+        body["logoutUrl"] = json!(u);
+    }
+    ([(header::SET_COOKIE, clear_cookie())], Json(body)).into_response()
 }
 
 pub async fn me(Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>) -> Json<Value> {

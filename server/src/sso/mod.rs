@@ -14,13 +14,15 @@
 //! SAML IdPs sign in either through an OIDC broker (ADR 0020), or natively (ADR 0127): botd
 //! is the service provider, sends an AuthnRequest with the HTTP-Redirect binding, and checks
 //! the signed response the IdP posts to `/acs` (`saml_sp`, `xmldsig`). Both end in the same
-//! identities, checks, and sessions as the rest.
+//! identities, checks, and sessions as the rest. Native SAML also signs AuthnRequests when a
+//! provider asks, and does single logout at `/slo` (ADR 0137, `saml_slo`).
 
 pub mod apple;
 mod github;
 pub mod jwt;
 mod provider;
 mod saml;
+pub(crate) mod saml_slo;
 pub(crate) mod saml_sp;
 pub(crate) mod xmldsig;
 
@@ -37,7 +39,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use provider::Claims;
 pub use provider::{ClaimMap, ENTRA_AUTHORITY, GOOGLE_ISSUER, IdpSource, Kind, Provider, domain, guid, secure_url};
-use saml_sp::{Refused, Sp};
+use saml_sp::{Refused, Sp, SpKey, SpSigning};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -59,6 +61,9 @@ const BINDER: &str = "__Host-superbot_sso";
 const SAML_BINDER: &str = "__Host-superbot_saml";
 /// Where an IdP's metadata imported with botctl is kept (the `settings` table), by provider id.
 const SAML_METADATA_SETTING: &str = "sso_saml_idp_metadata_";
+/// A native SAML provider's generated SP key (sealed PKCS #8) and certificate, by provider id.
+const SP_KEY_SETTING: &str = "sso_saml_sp_key_";
+const SP_CERT_SETTING: &str = "sso_saml_sp_cert_";
 
 #[derive(Clone)]
 enum Return {
@@ -96,8 +101,17 @@ struct Handoff {
     user_id: String,
     provider: String,
     claims: Claims,
+    /// Native SAML: kept with the session it becomes, for single logout.
+    saml: Option<db::SamlLogin>,
     challenge: String,
     label: Option<String>,
+    expires: i64,
+}
+
+/// A LogoutRequest we sent the IdP, until it answers.
+struct PendingLogout {
+    provider: String,
+    session: String,
     expires: i64,
 }
 
@@ -111,8 +125,10 @@ pub struct Sso {
     app_redirects: Vec<String>,
     pending: Mutex<HashMap<String, Pending>>,
     handoffs: Mutex<HashMap<String, Handoff>>,
-    /// SAML assertions already used (hash of issuer and ID), until they expire.
+    /// SAML assertions and logout messages already used (hash of issuer and ID), until they expire.
     seen: Mutex<HashMap<String, i64>>,
+    /// Native SAML: our LogoutRequests not answered yet, by ID.
+    logouts: Mutex<HashMap<String, PendingLogout>>,
     http: OnceLock<reqwest::Client>,
     /// Least time between JWKS fetches for a key id we don't know.
     pub refresh_gap: Duration,
@@ -128,6 +144,7 @@ impl Default for Sso {
             pending: Mutex::default(),
             handoffs: Mutex::default(),
             seen: Mutex::default(),
+            logouts: Mutex::default(),
             http: OnceLock::new(),
             refresh_gap: Duration::from_secs(60),
         }
@@ -291,23 +308,28 @@ impl Sso {
         sp_metadata_url(&self.public_url, id)
     }
 
+    /// Native SAML: where the IdP sends logout messages (ADR 0137).
+    pub fn slo_url(&self, id: &str) -> String {
+        format!("{}/api/auth/sso/{id}/slo", self.public_url)
+    }
+
     /// Loads IdP metadata imported with botctl, at startup.
     pub fn load_saved(&self, db: &db::Db) {
         for p in self.providers.iter().filter(|p| matches!(&p.kind, Kind::SamlSp { source: IdpSource::Saved, .. })) {
-            let Kind::SamlSp { entity_id, .. } = &p.kind else {
+            let Kind::SamlSp { entity_id, sign_requests, .. } = &p.kind else {
                 continue;
             };
             let Some(xml) = db.setting(&format!("{SAML_METADATA_SETTING}{}", p.id)) else {
                 continue;
             };
-            match saml_sp::parse_idp_metadata(&xml, entity_id) {
+            match saml_sp::parse_idp_metadata(&xml, entity_id, *sign_requests) {
                 Ok(m) => p.set_idp(m),
                 Err(e) => crate::obs::log::log_warn!("SSO {}: the imported IdP metadata no longer reads: {e}. Import it again: botctl sso saml {} import", p.id, p.id),
             }
         }
     }
 
-    /// A SAML assertion's first use. Err: it was used before, or too many are held.
+    /// A SAML assertion's or logout message's first use. Err: it was used before, or too many are held.
     fn first_use(&self, key: &str, until: i64, at: i64) -> Result<(), &'static str> {
         let mut m = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         m.retain(|_, until| *until > at);
@@ -357,7 +379,7 @@ const TYPES: [&str; 6] = ["entra", "google", "oidc", "apple", "github", "saml"];
 
 /// Settings that only mean something for some types. Set on another, they would look like
 /// a restriction that isn't there, so they are refused.
-const ONLY_FOR: [(&str, &[&str]); 20] = [
+const ONLY_FOR: [(&str, &[&str]); 22] = [
     ("TENANT", &["entra"]),
     ("ALLOWED_TENANTS", &["entra"]),
     ("AUTHORITY", &["entra"]),
@@ -378,11 +400,13 @@ const ONLY_FOR: [(&str, &[&str]); 20] = [
     ("SP_ENTITY_ID", &["saml"]),
     ("EMAIL_ATTRIBUTE", &["saml"]),
     ("NAME_ATTRIBUTE", &["saml"]),
+    ("SIGN_REQUESTS", &["saml"]),
+    ("SP_CERT_FILE", &["saml"]),
 ];
 
 /// The SAML bridge's settings (with `ISSUER`), and native SAML's (without), so each refuses the other's.
 const SAML_BRIDGE_ONLY: [&str; 6] = ["CLIENT_ID", "IDP_ALIAS", "SCOPES", "SUBJECT_CLAIM", "EMAIL_CLAIM", "NAME_CLAIM"];
-const SAML_NATIVE_ONLY: [&str; 5] = ["IDP_METADATA_URL", "IDP_METADATA_FILE", "SP_ENTITY_ID", "EMAIL_ATTRIBUTE", "NAME_ATTRIBUTE"];
+const SAML_NATIVE_ONLY: [&str; 7] = ["IDP_METADATA_URL", "IDP_METADATA_FILE", "SP_ENTITY_ID", "EMAIL_ATTRIBUTE", "NAME_ATTRIBUTE", "SIGN_REQUESTS", "SP_CERT_FILE"];
 
 /// Claims people or their admins can change, so they can't be the subject.
 const MUTABLE_CLAIMS: [&str; 9] = ["email", "preferred_username", "upn", "unique_name", "name", "nickname", "given_name", "family_name", "phone_number"];
@@ -507,7 +531,22 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
             if jit_role.is_some() && allowed_domains.is_empty() {
                 return Err(format!("{} without {} would let anyone SAML IdP {entity_id} signs in get an account: list your email domains, or link people instead", key("JIT_ROLE"), key("ALLOWED_DOMAINS")));
             }
-            (Kind::SamlSp { entity_id, sp_entity_id, source, attributes, allowed_domains }, saml::LABEL)
+            let sign_requests = match var(&key("SIGN_REQUESTS")).map(|v| v.to_ascii_lowercase()).as_deref() {
+                None | Some("false") => false,
+                Some("true") => true,
+                Some(_) => return Err(format!("{} must be true or false", key("SIGN_REQUESTS"))),
+            };
+            // The key itself is a secret, read when used; its certificate is checked now.
+            let sp_cert = match var(&key("SP_CERT_FILE")) {
+                Some(path) => {
+                    let pem = std::fs::read_to_string(&path).map_err(|e| format!("{}: {path}: {e}", key("SP_CERT_FILE")))?;
+                    let body = saml_sp::pem_body(&pem);
+                    xmldsig::Cert::from_base64(&body).map_err(|e| format!("{}: {e}", key("SP_CERT_FILE")))?;
+                    Some(body)
+                }
+                None => None,
+            };
+            (Kind::SamlSp { entity_id, sp_entity_id, source, attributes, allowed_domains, sign_requests, sp_cert }, saml::LABEL)
         }
         "saml" => {
             if let Some(k) = SAML_NATIVE_ONLY.iter().find(|k| var(&key(k)).is_some()) {
@@ -586,9 +625,9 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
     };
     let label = var(&key("LABEL")).map(|l| crate::audit::clip(&l, 40)).unwrap_or_else(|| label.to_string());
     let p = Provider::new(id, &label, kind, &client_id, &scopes, jit_role);
-    if let Kind::SamlSp { source: IdpSource::File(path), entity_id, .. } = &p.kind {
+    if let Kind::SamlSp { source: IdpSource::File(path), entity_id, sign_requests, .. } = &p.kind {
         let xml = std::fs::read_to_string(path).map_err(|e| format!("{}: {path}: {e}", key("IDP_METADATA_FILE")))?;
-        p.set_idp(saml_sp::parse_idp_metadata(&xml, entity_id).map_err(|e| format!("{}: {e}", key("IDP_METADATA_FILE")))?);
+        p.set_idp(saml_sp::parse_idp_metadata(&xml, entity_id, *sign_requests).map_err(|e| format!("{}: {e}", key("IDP_METADATA_FILE")))?);
     }
     Ok(p)
 }
@@ -719,10 +758,21 @@ pub async fn start(
         return no_store(ret.fail("sso_too_many"));
     }
     let mut url = Url::parse(&endpoint).expect("checked by secure_url");
-    if let Kind::SamlSp { sp_entity_id, .. } = &p.kind {
+    if let Kind::SamlSp { sp_entity_id, sign_requests, .. } = &p.kind {
+        let key = match (sign_requests, a.app.as_ref()) {
+            (false, _) => None,
+            (true, Some(app)) => match sp_key(app, p) {
+                Ok(k) => Some(k),
+                Err(e) => {
+                    crate::obs::log::log_warn!("SSO {id}: can't sign the AuthnRequest: {e}");
+                    return no_store(ret.fail("sso_failed"));
+                }
+            },
+            (true, None) => return no_store(ret.fail("sso_failed")),
+        };
         let request = saml_sp::authn_request(&Sp { entity_id: sp_entity_id, acs: &sso.acs_url(&id) }, &nonce, &endpoint, at);
-        url.query_pairs_mut().extend_pairs([("SAMLRequest", saml_sp::redirect_encode(&request).as_str()), ("RelayState", &state)]);
-        let mut res = see(url.as_str());
+        let query = saml_sp::redirect_query("SAMLRequest", &request, Some(&state), key.as_deref());
+        let mut res = see(&saml_sp::with_redirect_query(&endpoint, &query));
         if matches!(ret, Return::Cookie { .. }) {
             res.headers_mut().insert(header::SET_COOKIE, saml_binder_cookie(&binder, PENDING_TTL_MS / 1000));
         }
@@ -830,13 +880,14 @@ async fn finish(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, q: &Ha
             return ret.fail(if matches!(e.0, "wrong_domain" | "email_unverified" | "wrong_org" | "not_brokered") { "sso_wrong_account" } else { "sso_failed" });
         }
     };
-    complete(a, app, source, id, p, &pending, claims, at)
+    complete(a, app, source, id, p, &pending, claims, None, at)
 }
 
 /// The end of every sign-in, once the IdP vouched for `claims`: the linked (or just-in-time)
 /// user, if active, gets a session cookie, or a one-time code for the app that started.
+/// `saml` is a native SAML sign-in's NameID and IdP session, kept with the session.
 #[allow(clippy::too_many_arguments)]
-fn complete(a: &Auth, app: &AppState, source: &Source, id: &str, p: &Provider, pending: &Pending, mut claims: Claims, at: i64) -> Response {
+fn complete(a: &Auth, app: &AppState, source: &Source, id: &str, p: &Provider, pending: &Pending, mut claims: Claims, saml: Option<db::SamlLogin>, at: i64) -> Response {
     let (sso, ret) = (&a.sso, &pending.ret);
     if claims.name.is_none() {
         claims.name = pending.name.clone();
@@ -852,6 +903,9 @@ fn complete(a: &Auth, app: &AppState, source: &Source, id: &str, p: &Provider, p
         Return::Cookie { .. } => {
             let label = pending.label.as_deref().or(Some("Web"));
             let (s, token) = users::start_session(a, &user, "sso", Some((id, &claims.key())), None, true, label, source);
+            if let Some(l) = &saml {
+                app.db.add_saml_session(&s.id, l);
+            }
             signed_in(a, &user, &s, id, &claims, source);
             let mut res = Html(signed_in_page(user.role)).into_response();
             res.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&users::session_cookie(&token, a.sessions.max_ms)).unwrap());
@@ -859,7 +913,7 @@ fn complete(a: &Auth, app: &AppState, source: &Source, id: &str, p: &Provider, p
         }
         Return::App { redirect, challenge, state } => {
             let code = users::new_secret(HANDOFF_PREFIX);
-            let h = Handoff { user_id: user.id, provider: id.into(), claims, challenge: challenge.clone(), label: pending.label.clone(), expires: at + HANDOFF_TTL_MS };
+            let h = Handoff { user_id: user.id, provider: id.into(), claims, saml, challenge: challenge.clone(), label: pending.label.clone(), expires: at + HANDOFF_TTL_MS };
             let mut m = sso.handoffs.lock().unwrap_or_else(|e| e.into_inner());
             m.retain(|_, h| h.expires > at);
             if m.len() >= MAX_PENDING {
@@ -943,16 +997,177 @@ async fn finish_saml(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, f
         failed(a, source, id, e.0, Some(&checked.claims), json!({}));
         return ret.fail("sso_wrong_account");
     }
-    complete(a, app, source, id, p, &pending, checked.claims, at)
+    complete(a, app, source, id, p, &pending, checked.claims, Some(checked.login), at)
 }
 
-/// `GET /api/auth/sso/{id}/metadata`: our SAML SP metadata, for the IdP to import.
+/// `GET /api/auth/sso/{id}/metadata`: our SAML SP metadata, for the IdP to import. With our
+/// key, it has its certificate and the SLO URL; without one (no database), neither.
 pub async fn saml_metadata(Extension(a): Extension<Arc<Auth>>, Path(id): Path<String>) -> Response {
-    let Some(Kind::SamlSp { sp_entity_id, .. }) = a.sso.provider(&id).map(|p| &p.kind) else {
+    let Some(p) = a.sso.provider(&id).filter(|p| p.saml_sp()) else {
         return not_found("SAML provider").into_response();
     };
-    let acs = a.sso.acs_url(&id);
-    ([(header::CONTENT_TYPE, "application/samlmetadata+xml")], saml_sp::sp_metadata(&Sp { entity_id: sp_entity_id, acs: &acs })).into_response()
+    let Kind::SamlSp { sp_entity_id, sign_requests, .. } = &p.kind else {
+        return not_found("SAML provider").into_response();
+    };
+    let key = a.app.as_ref().and_then(|app| sp_key(app, p).map_err(|e| crate::obs::log::log_warn!("SSO {id}: no SP key for the metadata: {e}")).ok());
+    let (acs, slo) = (a.sso.acs_url(&id), a.sso.slo_url(&id));
+    let signing = key.as_ref().map(|k| SpSigning { cert: &k.cert, slo: &slo, sign_requests: *sign_requests });
+    ([(header::CONTENT_TYPE, "application/samlmetadata+xml")], saml_sp::sp_metadata(&Sp { entity_id: sp_entity_id, acs: &acs }, signing.as_ref())).into_response()
+}
+
+// Native SAML: our key and single logout (ADR 0137)
+
+/// A native SAML provider's SP key: `SSO_<ID>_PRIVATE_KEY` with `SP_CERT_FILE`, else made
+/// once and kept sealed in settings, so the certificate in our metadata stays the same.
+fn sp_key(app: &AppState, p: &Provider) -> Result<Arc<SpKey>, String> {
+    let mut held = p.sp_key.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(k) = held.as_ref() {
+        return Ok(k.clone());
+    }
+    let Kind::SamlSp { sp_cert, .. } = &p.kind else { return Err("not a native SAML provider".into()) };
+    let key = match sp_cert {
+        Some(cert) => {
+            let pem = p.sp_key_pem().ok_or_else(|| format!("{} is not set", p.env_var()))?;
+            SpKey::from_pem(pem.expose(), cert).map_err(|e| format!("{}: {e}", p.env_var()))?
+        }
+        None => generated_sp_key(app, p)?,
+    };
+    let key = Arc::new(key);
+    *held = Some(key.clone());
+    Ok(key)
+}
+
+fn generated_sp_key(app: &AppState, p: &Provider) -> Result<SpKey, String> {
+    let (key_name, cert_name) = (format!("{SP_KEY_SETTING}{}", p.id), format!("{SP_CERT_SETTING}{}", p.id));
+    let context = format!("settings/{key_name}");
+    let cipher = crate::secrets::sealed::cipher();
+    if let (Some(sealed), Some(cert)) = (app.db.setting(&key_name), app.db.setting(&cert_name)) {
+        let der = cipher.open(&context, &sealed).map_err(|e| format!("the generated SP key: {e}"))?;
+        return SpKey::from_der(&der, &cert);
+    }
+    let (key, der) = SpKey::generate(&format!("SuperBot SAML SP ({})", p.id))?;
+    app.db.set_setting(&key_name, &cipher.seal(&context, &der));
+    app.db.set_setting(&cert_name, &key.cert);
+    let details = json!({ "provider": p.id, "certificate": key.info.sha256, "notAfter": key.info.not_after * 1000 });
+    app.db.record(&Event::new(Actor::system("sso"), "sso.saml_sp_key_created").target("sso_provider", &p.id).details(details));
+    Ok(key)
+}
+
+/// Signing out of a session a native SAML IdP vouched for: a signed LogoutRequest to the
+/// IdP's SLO URL, for the browser to follow, and its ID. The session is revoked already; this
+/// ends the person's IdP session too. None when the IdP has no SLO URL or we can't sign.
+pub fn logout_request(a: &Auth, app: &AppState, s: &db::Session) -> Option<(String, String)> {
+    let p = a.sso.provider(s.idp_provider.as_deref()?)?;
+    let Kind::SamlSp { sp_entity_id, .. } = &p.kind else { return None };
+    let slo = p.idp_loaded()?.slo.clone()?;
+    let login = app.db.saml_session(&s.id)?;
+    let key = sp_key(app, p).map_err(|e| crate::obs::log::log_warn!("SSO {}: no single logout: {e}", p.id)).ok()?;
+    let (id, at) = (saml_sp::request_id(), db::now());
+    {
+        let mut m = a.sso.logouts.lock().unwrap_or_else(|e| e.into_inner());
+        m.retain(|_, l| l.expires > at);
+        if m.len() >= MAX_PENDING {
+            return None;
+        }
+        m.insert(id.clone(), PendingLogout { provider: p.id.clone(), session: s.id.clone(), expires: at + PENDING_TTL_MS });
+    }
+    let xml = saml_slo::logout_request(sp_entity_id, &id, &slo.location, &login, at);
+    let url = saml_sp::with_redirect_query(&slo.location, &saml_sp::redirect_query("SAMLRequest", &xml, None, Some(&key)));
+    Some((url, id))
+}
+
+/// Refused logout messages anyone can send: the ones before the IdP's signature was checked.
+const SLO_UNVOUCHED: [&str; 6] = ["bad_message", "wrapped", "unsigned", "bad_signature", "bad_algorithm", "weak_algorithm"];
+
+fn slo_failed(a: &Auth, source: &Source, provider: &str, reason: &str, extra: Value) -> Response {
+    let mut d = json!({ "provider": provider, "idp": idp_type(a, provider), "reason": reason });
+    if let (Value::Object(d), Value::Object(e)) = (&mut d, extra) {
+        d.extend(e);
+    }
+    let logged = !SLO_UNVOUCHED.contains(&reason) || {
+        let client = format!("{}|slo", source.ip.as_deref().unwrap_or(""));
+        a.logins.failure(&client, db::now()).map(|missed| d["unloggedSinceLast"] = json!(missed)).is_some()
+    };
+    if logged {
+        let actor = Actor { kind: ActorKind::User, method: Some("sso".into()), idp: idp_type(a, provider).map(String::from), idp_provider: Some(provider.into()), ..Default::default() };
+        a.record(Who { actor, source: source.clone() }.event("auth.slo_failed").outcome(Outcome::Failure).details(d));
+    }
+    let body = "SuperBot couldn't use that logout message. Sign out of SuperBot itself to end your session there.";
+    no_store((StatusCode::BAD_REQUEST, body).into_response())
+}
+
+/// `GET /api/auth/sso/{id}/slo`: a logout message over the HTTP-Redirect binding.
+pub async fn slo_get(Extension(a): Extension<Arc<Auth>>, Extension(source): Extension<Source>, Path(id): Path<String>, OriginalUri(uri): OriginalUri) -> Response {
+    slo(&a, &source, &id, &saml_slo::Incoming::Redirect(uri.query().unwrap_or("")))
+}
+
+/// `POST /api/auth/sso/{id}/slo`: the same over HTTP-POST.
+pub async fn slo_post(Extension(a): Extension<Arc<Auth>>, Extension(source): Extension<Source>, Path(id): Path<String>, Form(f): Form<HashMap<String, String>>) -> Response {
+    slo(&a, &source, &id, &saml_slo::Incoming::Post(&f))
+}
+
+/// The IdP's LogoutRequest revokes the sessions its NameID and SessionIndexes name and is
+/// answered with our signed LogoutResponse; its LogoutResponse to ours is audited.
+fn slo(a: &Auth, source: &Source, id: &str, incoming: &saml_slo::Incoming) -> Response {
+    let Some(app) = a.app.as_ref() else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
+    let Some(p) = a.sso.provider(id).filter(|p| p.saml_sp()) else { return not_found("SAML provider").into_response() };
+    let Kind::SamlSp { sp_entity_id, .. } = &p.kind else { return not_found("SAML provider").into_response() };
+    let Some(idp) = p.idp_loaded() else { return slo_failed(a, source, id, "not_ready", json!({})) };
+    let Some(idp_slo) = idp.slo.clone() else { return slo_failed(a, source, id, "no_slo", json!({})) };
+    let key = match sp_key(app, p) {
+        Ok(k) => k,
+        Err(e) => {
+            crate::obs::log::log_warn!("SSO {id}: can't answer a logout: {e}");
+            return slo_failed(a, source, id, "no_sp_key", json!({}));
+        }
+    };
+    let (slo_url, at) = (a.sso.slo_url(id), db::now());
+    let received = match saml_slo::receive(incoming, &saml_slo::Expect { idp: &idp, slo_url: &slo_url, now_ms: at }) {
+        Ok(r) => r,
+        Err(Refused(reason, detail)) => return slo_failed(a, source, id, reason, json!({ "detail": detail })),
+    };
+    let actor = |subject: Option<String>| Actor { kind: ActorKind::User, subject, method: Some("sso".into()), idp: Some("saml".into()), idp_provider: Some(id.into()), ..Default::default() };
+    match received {
+        saml_slo::Received::Request { id: request_id, name_id, session_indexes, relay, until_ms } => {
+            if let Err(reason) = a.sso.first_use(&format!("slo|{}|{request_id}", idp.entity_id), until_ms, at) {
+                return slo_failed(a, source, id, reason, json!({ "requestId": request_id }));
+            }
+            let subject = format!("{}|{}", idp.entity_id, saml::subject(&name_id));
+            let named = |l: Option<&db::SamlLogin>| session_indexes.is_empty() || l.and_then(|l| l.session_index.as_ref()).is_none_or(|i| session_indexes.contains(i));
+            // Codes first, as when an admin revokes: a redemption holds them until its session exists.
+            a.sso.handoffs.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, h| !(h.provider == id && h.claims.key() == subject && named(h.saml.as_ref())));
+            let revoked = app.db.revoke_saml_sessions(id, &subject, &session_indexes, "saml_logout");
+            let mut users: Vec<&str> = revoked.iter().map(|s| s.user_id.as_str()).collect();
+            users.sort_unstable();
+            users.dedup();
+            let sessions: Vec<&str> = revoked.iter().map(|s| s.id.as_str()).collect();
+            let details = json!({
+                "provider": id, "idp": "saml", "issuer": idp.entity_id, "subject": saml::subject(&name_id), "requestId": request_id,
+                "sessionIndexes": session_indexes, "sessions": sessions, "users": users, "revoked": sessions.len(),
+            });
+            let mut actor = actor(Some(subject.clone()));
+            actor.id = (users.len() == 1).then(|| users[0].to_string());
+            a.record(Who { actor, source: source.clone() }.event("auth.slo").details(details));
+            let answer = saml_slo::logout_response(sp_entity_id, &saml_sp::request_id(), &idp_slo.response, &request_id, at);
+            let query = saml_sp::redirect_query("SAMLResponse", &answer, relay.as_deref(), Some(&key));
+            let mut res = see(&saml_sp::with_redirect_query(&idp_slo.response, &query));
+            res.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_static(users::clear_cookie()));
+            no_store(res)
+        }
+        saml_slo::Received::Response { id: response_id, in_response_to, status, until_ms } => {
+            if let Err(reason) = a.sso.first_use(&format!("slo|{}|{response_id}", idp.entity_id), until_ms, at) {
+                return slo_failed(a, source, id, reason, json!({ "responseId": response_id }));
+            }
+            let pending = a.sso.logouts.lock().unwrap_or_else(|e| e.into_inner()).remove(&in_response_to);
+            let Some(pending) = pending.filter(|l| l.expires > at && l.provider == id) else {
+                return slo_failed(a, source, id, "unknown_request", json!({ "inResponseTo": in_response_to }));
+            };
+            let outcome = if status.is_none() { Outcome::Success } else { Outcome::Failure };
+            let details = json!({ "provider": id, "idp": "saml", "requestId": in_response_to, "status": status.as_deref().unwrap_or("Success") });
+            a.record(Who { actor: actor(None), source: source.clone() }.event("auth.slo_response").target("session", &pending.session).outcome(outcome).details(details));
+            no_store(see("/login"))
+        }
+    }
 }
 
 fn saml_provider<'a>(a: &'a Auth, id: &str) -> Result<&'a Arc<Provider>, ApiError> {
@@ -963,13 +1178,21 @@ fn saml_provider<'a>(a: &'a Auth, id: &str) -> Result<&'a Arc<Provider>, ApiErro
 }
 
 fn saml_view(a: &Auth, p: &Provider) -> Value {
-    let Kind::SamlSp { entity_id, sp_entity_id, source, .. } = &p.kind else {
+    let Kind::SamlSp { entity_id, sp_entity_id, source, sign_requests, sp_cert, .. } = &p.kind else {
         return json!({});
     };
+    let cert = |c: &xmldsig::Cert| json!({ "sha256": c.sha256, "subject": c.subject, "notAfter": c.not_after * 1000 });
     let idp = p.idp_loaded().map(|m| {
-        let certs: Vec<Value> = m.certs.iter().map(|c| json!({ "sha256": c.sha256, "subject": c.subject, "notAfter": c.not_after * 1000 })).collect();
-        json!({ "entityId": m.entity_id, "ssoUrl": m.sso_url, "certificates": certs, "loadedSecondsAgo": p.idp_age().map(|d| d.as_secs()) })
+        let certs: Vec<Value> = m.certs.iter().map(cert).collect();
+        json!({ "entityId": m.entity_id, "ssoUrl": m.sso_url, "sloUrl": m.slo.as_ref().map(|s| &s.location), "certificates": certs, "loadedSecondsAgo": p.idp_age().map(|d| d.as_secs()) })
     });
+    let key = a.app.as_ref().map(|app| sp_key(app, p));
+    let sp_key = match &key {
+        Some(Ok(k)) => json!({ "certificate": cert(&k.info), "from": if sp_cert.is_some() { "secret" } else { "generated" } }),
+        Some(Err(e)) => json!({ "problem": e }),
+        None => Value::Null,
+    };
+    let slo = p.idp_loaded().is_some_and(|m| m.slo.is_some()) && matches!(key, Some(Ok(_)));
     let from = match source {
         IdpSource::Url(u) => Some(u.clone()),
         IdpSource::File(f) => Some(f.clone()),
@@ -978,6 +1201,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
     json!({
         "provider": p.id, "label": p.label, "ready": p.ready(), "problem": p.not_ready(),
         "spEntityId": sp_entity_id, "acsUrl": a.sso.acs_url(&p.id), "metadataUrl": a.sso.sp_metadata_url(&p.id),
+        "sloUrl": a.sso.slo_url(&p.id), "signRequests": sign_requests, "spKey": sp_key, "singleLogout": slo,
         "idpEntityId": entity_id, "source": source.name(), "from": from, "idp": idp,
         "audience": p.audience(), "jitRole": p.jit_role.map(Role::as_str),
     })
@@ -998,7 +1222,7 @@ pub async fn saml_status(Extension(a): Extension<Arc<Auth>>, Path(id): Path<Stri
 /// it isn't set in `.env`. Checked before it's kept: it must be for `IDP_ENTITY_ID`.
 pub async fn saml_import(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
     let p = saml_provider(&a, &id)?;
-    let Kind::SamlSp { entity_id, source, .. } = &p.kind else {
+    let Kind::SamlSp { entity_id, source, sign_requests, .. } = &p.kind else {
         return Err(bad("not a native SAML provider"));
     };
     if *source != IdpSource::Saved {
@@ -1006,7 +1230,7 @@ pub async fn saml_import(State(app): State<AppState>, Extension(a): Extension<Ar
         return Err(ApiError(StatusCode::CONFLICT, format!("SSO_{}_{var} sets this provider's IdP metadata. Change it there, or remove it to import here.", id.to_ascii_uppercase())));
     }
     let xml = v["xml"].as_str().unwrap_or("");
-    let m = saml_sp::parse_idp_metadata(xml, entity_id).map_err(|e| bad(format!("That IdP metadata can't be used: {e}.")))?;
+    let m = saml_sp::parse_idp_metadata(xml, entity_id, *sign_requests).map_err(|e| bad(format!("That IdP metadata can't be used: {e}.")))?;
     let certs: Vec<&str> = m.certs.iter().map(|c| c.sha256.as_str()).collect();
     let details = json!({ "provider": p.id, "entityId": m.entity_id, "ssoUrl": m.sso_url, "certificates": certs });
     app.db.set_setting(&format!("{SAML_METADATA_SETTING}{id}"), xml);
@@ -1078,6 +1302,9 @@ pub fn redeem(a: &Auth, source: Source, code: &str, verifier: &str, cookie: bool
     };
     let label = label.or(h.label.as_deref());
     let (s, token) = users::start_session(a, &user, "sso", Some((&h.provider, &h.claims.key())), None, cookie, label, &source);
+    if let Some(l) = &h.saml {
+        app.db.add_saml_session(&s.id, l);
+    }
     drop(handoffs);
     signed_in(a, &user, &s, &h.provider, &h.claims, &source);
     users::session_response(a, &user, &s, &token)
@@ -1516,8 +1743,9 @@ mod tests {
         let p = s.provider("corp").unwrap();
         assert!(p.saml_sp() && !p.oidc() && !p.needs_secret());
         assert_eq!((p.type_name(), p.jit_role), ("saml", None), "audited as idp=saml, like the bridge");
-        assert!(matches!(&p.kind, Kind::SamlSp { entity_id, sp_entity_id, source: IdpSource::Saved, attributes, allowed_domains }
+        assert!(matches!(&p.kind, Kind::SamlSp { entity_id, sp_entity_id, source: IdpSource::Saved, attributes, allowed_domains, sign_requests: false, sp_cert: None }
             if entity_id == ADFS && sp_entity_id == "https://bot.example.com/api/auth/sso/corp/metadata" && attributes.email.is_none() && allowed_domains.is_empty()));
+        assert_eq!((p.env_var(), s.slo_url("corp")), ("SSO_CORP_PRIVATE_KEY".to_string(), "https://bot.example.com/api/auth/sso/corp/slo".to_string()));
         assert_eq!(s.callback_url("corp"), "https://bot.example.com/api/auth/sso/corp/acs");
         assert!(p.not_ready().unwrap().contains("botctl sso saml corp import"), "not offered until its metadata is imported");
         assert_eq!(p.issuer_for(None).unwrap(), (ADFS.to_string(), None));
@@ -1551,11 +1779,38 @@ mod tests {
             (vec![("SSO_CORP_IDP_ALIAS", "adfs")], "a bridge setting"),
             (vec![("SSO_CORP_EMAIL_CLAIM", "email")], "a bridge setting"),
             (vec![("SSO_CORP_TENANT", T1)], "an Entra setting"),
+            (vec![("SSO_CORP_SIGN_REQUESTS", "yes")], "not true or false"),
+            (vec![("SSO_CORP_SP_CERT_FILE", "/nonexistent/sp.pem")], "an unreadable certificate"),
         ] {
             assert!(native(&vars).is_err(), "{why}");
         }
         assert!(saml(&[("SSO_ADFS_IDP_METADATA_URL", "https://idp.example/m")]).is_err(), "a native setting on the bridge");
         assert!(saml(&[("SSO_ADFS_SP_ENTITY_ID", "urn:x")]).is_err());
+        assert!(saml(&[("SSO_ADFS_SIGN_REQUESTS", "true")]).is_err(), "Keycloak signs the bridge's requests");
+    }
+
+    #[test]
+    fn reads_the_sp_signing_settings() {
+        let s = native(&[("SSO_CORP_SIGN_REQUESTS", "TRUE")]).unwrap();
+        assert!(matches!(&s.providers[0].kind, Kind::SamlSp { sign_requests: true, sp_cert: None, .. }));
+
+        let dir = std::env::temp_dir().join(format!("superbot-sp-cert-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (key, _) = SpKey::generate("test").unwrap();
+        let (good, junk) = (dir.join("sp.pem"), dir.join("junk.pem"));
+        std::fs::write(&good, format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", key.cert)).unwrap();
+        std::fs::write(&junk, "-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydA==\n-----END CERTIFICATE-----\n").unwrap();
+        let leak = |p: &std::path::Path| -> &'static str { Box::leak(p.to_string_lossy().into_owned().into_boxed_str()) };
+        let s = native(&[("SSO_CORP_SP_CERT_FILE", leak(&good)), ("SSO_CORP_IDP_METADATA_URL", "https://idp.example/metadata")]).unwrap();
+        let p = &s.providers[0];
+        assert!(matches!(&p.kind, Kind::SamlSp { sp_cert: Some(c), .. } if *c == key.cert));
+        assert!(p.not_ready().is_some_and(|n| n.contains("SSO_CORP_PRIVATE_KEY")), "the key is the provider's secret: {:?}", p.not_ready());
+        assert!(native(&[("SSO_CORP_SP_CERT_FILE", leak(&junk))]).is_err(), "not a certificate");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn random_hex() -> String {
+        crate::random_bytes(8).iter().map(|b| format!("{b:02x}")).collect()
     }
 
     #[test]
