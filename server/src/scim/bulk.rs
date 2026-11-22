@@ -104,33 +104,19 @@ fn path(method: Method, p: &str) -> Option<(Kind, Option<String>)> {
 /// The quoted `"bulkId:<id>"` values in a PATCH path filter such as
 /// `members[value eq "bulkId:u"]`, as (start, end, id) with start..end covering the
 /// quotes. Each quoted value is read as a JSON string, escapes and all, as the filter
-/// itself is. One pass over `s`, since a path can be most of a 1 MiB request.
+/// itself is. Scanning stops at the first value that isn't one: the handler refuses
+/// that filter anyway, and retrying from each later quote would be quadratic.
 fn quoted_refs(s: &str) -> Vec<(usize, usize, String)> {
     let mut out = Vec::new();
-    let mut chars = s.char_indices();
-    while let Some((at, c)) = chars.next() {
-        if c != '"' {
-            continue;
-        }
-        let mut end = None;
-        while let Some((i, c)) = chars.next() {
-            match c {
-                '\\' => {
-                    chars.next();
-                }
-                '"' => {
-                    end = Some(i + 1);
-                    break;
-                }
-                _ => {}
-            }
-        }
-        let Some(end) = end else { break };
-        if let Ok(value) = serde_json::from_str::<String>(&s[at..end])
-            && let Some(id) = value.strip_prefix(BULK_ID)
-        {
+    let mut from = 0;
+    while let Some(at) = s[from..].find('"').map(|n| from + n) {
+        let mut strings = serde_json::Deserializer::from_str(&s[at..]).into_iter::<String>();
+        let Some(Ok(value)) = strings.next() else { break };
+        let end = at + strings.byte_offset();
+        if let Some(id) = value.strip_prefix(BULK_ID) {
             out.push((at, end, id.to_string()));
         }
+        from = end;
     }
     out
 }
@@ -576,6 +562,12 @@ mod tests {
         assert_eq!(out["Operations"][0]["path"], json!("members[value eq \"id-ab\"]"));
         assert_eq!(out["Operations"][1]["path"], json!("members[value eq \"u-1\"]"));
         assert_eq!(out["Operations"][2]["path"], escaped["Operations"][2]["path"]);
+
+        assert!(quoted_refs(r#"members[value eq "\x"] and members[value eq "bulkId:u"]"#).is_empty(), "nothing after a malformed value");
+        let unclosed = format!("members[value eq \"{}", "\\\"".repeat(MAX_PAYLOAD / 4));
+        let started = std::time::Instant::now();
+        assert!(quoted_refs(&unclosed).is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "one pass, not one per quote: {:?}", started.elapsed());
     }
 
     #[test]
