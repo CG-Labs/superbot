@@ -221,15 +221,17 @@ pub async fn assign(State(app): State<AppState>, Extension(by): Extension<Who>, 
     if by.actor.id.as_deref() == Some(before.id.as_str()) {
         return Err(conflict("You can't change your own role. Ask another admin."));
     }
-    // Written even when they hold it already: SCIM may take it away between the read and now.
-    let taken = app.db.give_user_custom_role(&before.id, &r.id).ok_or_else(|| not_found("Role"))?;
-    if before.role_id.as_deref() != Some(r.id.as_str()) || taken.is_some() {
-        let from = summary(&app, before.role_id.as_deref());
-        app.db.record(&by.event("role.assigned").target("role", &r.id).details(json!({ "name": r.name, "user": before.id, "scope": "org", "from": from, "takenFromScim": taken })));
+    // Written even when they hold it already: SCIM may take it away between the read and
+    // now. What to audit comes from what they held as it was written.
+    let g = app.db.give_user_custom_role(&before.id, &r.id).ok_or_else(|| not_found("Role"))?;
+    let (had, was) = (g.before.0, g.before.1.unwrap_or(before.role));
+    if had.as_deref() != Some(r.id.as_str()) || g.taken.is_some() {
+        let from = summary(&app, had.as_deref());
+        app.db.record(&by.event("role.assigned").target("role", &r.id).details(json!({ "name": r.name, "user": before.id, "scope": "org", "from": from, "takenFromScim": g.taken })));
     }
     let after = need_user_key(&app, &before.id)?;
-    if before.role != after.role {
-        app.db.record(&by.event("user.role_changed").target("user", &after.id).details(json!({ "from": before.role, "to": after.role, "role": { "id": r.id, "name": r.name } })));
+    if was != after.role {
+        app.db.record(&by.event("user.role_changed").target("user", &after.id).details(json!({ "from": was, "to": after.role, "role": { "id": r.id, "name": r.name } })));
         users::lost_access(&app, &by, &after.id, crate::machines::offboard::ACCESS_LOST).await;
     }
     Ok(Json(json!({ "user": user_view(&after), "role": summary(&app, after.role_id.as_deref()) })))
@@ -261,14 +263,14 @@ fn team_member(app: &AppState, team: &str, user: &str) -> Res<(crate::db::Team, 
 /// while they stay on it; their role across the server doesn't change.
 pub async fn assign_in_team(State(app): State<AppState>, Extension(by): Extension<Who>, Path((key, team, user)): Path<(String, String, String)>) -> Res {
     let r = need_role(&app, &key)?;
-    let (t, u, m) = team_member(&app, &team, &user)?;
+    let (t, u, _) = team_member(&app, &team, &user)?;
     if u.role == Role::Readonly {
         return Err(conflict("They're read-only, so they change nothing, in a team too. Make them a member first."));
     }
-    let taken = app.db.give_team_custom_role(&t.id, &u.id, Some(&r.id)).ok_or_else(|| not_found("Team member"))?;
-    if m.role_id.as_deref() != Some(r.id.as_str()) || taken.is_some() {
-        let from = summary(&app, m.role_id.as_deref());
-        let d = json!({ "name": r.name, "user": u.id, "scope": "team", "team": t.id, "from": from, "applies": r.perms().in_team().names(), "takenFromScim": taken });
+    let g = app.db.give_team_custom_role(&t.id, &u.id, Some(&r.id)).ok_or_else(|| not_found("Team member"))?;
+    if g.before.as_deref() != Some(r.id.as_str()) || g.taken.is_some() {
+        let from = summary(&app, g.before.as_deref());
+        let d = json!({ "name": r.name, "user": u.id, "scope": "team", "team": t.id, "from": from, "applies": r.perms().in_team().names(), "takenFromScim": g.taken });
         app.db.record(&by.event("role.assigned").target("role", &r.id).details(d));
     }
     Ok(Json(json!({ "team": { "id": t.id, "name": t.name }, "user": person(&u), "role": summary(&app, Some(&r.id)), "applies": r.perms().in_team().names() })))

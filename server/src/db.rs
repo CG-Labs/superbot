@@ -1684,6 +1684,14 @@ pub struct ScimRevoked {
     pub role_after: Option<Role>,
 }
 
+/// A role given or taken away by hand: what they held just before, read in the same
+/// transaction as the write, and the SCIM mapping whose claim on it ended, if one had.
+#[derive(Debug, PartialEq)]
+pub struct ByHand<T> {
+    pub before: T,
+    pub taken: Option<String>,
+}
+
 fn session_row(r: &Row) -> rusqlite::Result<Session> {
     Ok(Session {
         id: r.get("id")?,
@@ -4692,24 +4700,30 @@ impl Db {
 
     /// Runs `write`, and when it changed a row, ends a SCIM group's claim on `user_id`'s
     /// role in `scope` (ADR 0138), in one transaction: a role given or taken away by hand
-    /// is never one SCIM takes away later. None if nothing changed; else the mapping whose
-    /// claim ended, if one had.
-    fn by_hand(&self, user_id: &str, scope: &str, write: impl FnOnce(&Connection) -> rusqlite::Result<usize>) -> Option<Option<String>> {
+    /// is never one SCIM takes away later. `held` reads, in the same transaction, what they
+    /// held before. None if nothing changed.
+    fn by_hand<T>(&self, user_id: &str, scope: &str, held: impl FnOnce(&Connection) -> rusqlite::Result<T>, write: impl FnOnce(&Connection) -> rusqlite::Result<usize>) -> Option<ByHand<T>> {
         let c = self.c();
         let tx = c.unchecked_transaction().ok()?;
+        let before = held(&tx).ok()?;
         if write(&tx).unwrap_or(0) == 0 {
             return None;
         }
         let taken = Self::drop_scim_grant_in(&tx, user_id, scope).ok()?;
-        tx.commit().ok().map(|_| taken)
+        tx.commit().ok().map(|_| ByHand { before, taken })
     }
 
     /// Gives `user_id` the role across the server, its base becoming their built-in role, in
     /// one statement, so a role deleted meanwhile can't be half given. Written even when they
     /// hold it already, so it is theirs by hand whatever SCIM took away meanwhile. None if
-    /// either is gone; else the mapping it was SCIM's from, if it was.
-    pub fn give_user_custom_role(&self, user_id: &str, role_id: &str) -> Option<Option<String>> {
-        self.by_hand(user_id, "org", |c| {
+    /// either is gone; else the custom and built-in roles they held just before.
+    pub fn give_user_custom_role(&self, user_id: &str, role_id: &str) -> Option<ByHand<(Option<String>, Option<Role>)>> {
+        let held = |c: &Connection| {
+            c.query_row("SELECT role_id, role FROM users WHERE id = ?", [user_id], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)))
+                .optional()
+                .map(|h| h.map_or((None, None), |(id, role)| (id, Role::parse(&role))))
+        };
+        self.by_hand(user_id, "org", held, |c| {
             c.execute(
                 "UPDATE users SET role_id = ?1, role = (SELECT base FROM roles WHERE id = ?1), updated_at = ?2
                  WHERE id = ?3 AND EXISTS (SELECT 1 FROM roles WHERE id = ?1)",
@@ -4720,7 +4734,7 @@ impl Db {
 
     /// Takes the role away across the server. They keep its base as their built-in role.
     pub fn clear_user_custom_role(&self, user_id: &str, role_id: &str) -> bool {
-        self.by_hand(user_id, "org", |c| c.execute("UPDATE users SET role_id = NULL, updated_at = ?1 WHERE id = ?2 AND role_id = ?3", params![now(), user_id, role_id])).is_some()
+        self.by_hand(user_id, "org", |_| Ok(()), |c| c.execute("UPDATE users SET role_id = NULL, updated_at = ?1 WHERE id = ?2 AND role_id = ?3", params![now(), user_id, role_id])).is_some()
     }
 
     /// Gives (Some) or takes away (None) a role within the team `user_id` is on. False if
@@ -4729,9 +4743,10 @@ impl Db {
         self.give_team_custom_role(team_id, user_id, role_id).is_some()
     }
 
-    /// `set_team_custom_role`, and the mapping the role in the team was SCIM's from.
-    pub fn give_team_custom_role(&self, team_id: &str, user_id: &str, role_id: Option<&str>) -> Option<Option<String>> {
-        self.by_hand(user_id, "team", |c| {
+    /// `set_team_custom_role`, and the custom role they held in the team just before.
+    pub fn give_team_custom_role(&self, team_id: &str, user_id: &str, role_id: Option<&str>) -> Option<ByHand<Option<String>>> {
+        let held = |c: &Connection| c.query_row("SELECT role_id FROM team_members WHERE team_id = ? AND user_id = ?", [team_id, user_id], |r| r.get(0)).optional().map(Option::flatten);
+        self.by_hand(user_id, "team", held, |c| {
             c.execute(
                 "UPDATE team_members SET role_id = ?1 WHERE team_id = ?2 AND user_id = ?3 AND (?1 IS NULL OR EXISTS (SELECT 1 FROM roles WHERE id = ?1))",
                 params![role_id, team_id, user_id],
@@ -8959,6 +8974,13 @@ mod tests {
         assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Readonly, None));
         assert!(db.revoke_scim_role(&org, &a.id, false).is_none());
 
+        // An admin confirms it just as SCIM takes it away: written back, from what was there then.
+        assert!(db.grant_scim_role(&org, &a.id));
+        assert!(db.revoke_scim_role(&org, &a.id, false).is_some());
+        assert_eq!(db.give_user_custom_role(&a.id, &r.id), Some(ByHand { before: (None, Some(Role::Readonly)), taken: None }));
+        assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Member, Some(r.id.clone())));
+        assert!(db.clear_user_custom_role(&a.id, &r.id));
+
         // Given by hand after SCIM gave one: SCIM's claim ends and nothing is taken back.
         assert!(db.grant_scim_role(&org, &a.id));
         assert!(db.give_user_custom_role(&a.id, &hand.id).is_some());
@@ -8970,14 +8992,14 @@ mod tests {
         assert_eq!(db.team_member(&b.id).unwrap().role_id, Some(r.id.clone()));
         assert!(db.revoke_scim_role(&in_team, &b.id, true).is_none(), "a leave that a rejoin overtook takes nothing");
         assert_eq!(db.team_member(&b.id).unwrap().role_id, Some(r.id.clone()));
-        assert_eq!(db.give_team_custom_role(&team.id, &b.id, Some(&r.id)), Some(Some(in_team.id.clone())), "the same role, now by hand");
+        assert_eq!(db.give_team_custom_role(&team.id, &b.id, Some(&r.id)), Some(ByHand { before: Some(r.id.clone()), taken: Some(in_team.id.clone()) }), "the same role, now by hand");
         assert!(db.revoke_scim_role(&in_team, &b.id, false).is_none());
         assert_eq!(db.team_member(&b.id).unwrap().role_id, Some(r.id.clone()), "kept by hand");
         // An admin confirms the role SCIM gave just as SCIM takes it away: it is still theirs.
         assert!(db.set_team_custom_role(&team.id, &b.id, None));
         assert!(db.grant_scim_role(&in_team, &b.id));
         assert!(db.revoke_scim_role(&in_team, &b.id, false).is_some());
-        assert_eq!(db.give_team_custom_role(&team.id, &b.id, Some(&r.id)), Some(None));
+        assert_eq!(db.give_team_custom_role(&team.id, &b.id, Some(&r.id)), Some(ByHand { before: None, taken: None }), "it says what was there as it wrote");
         assert_eq!(db.team_member(&b.id).unwrap().role_id, Some(r.id.clone()));
         assert!(db.remove_team_member(&team.id, &b.id, false));
         assert!(!db.grant_scim_role(&in_team, &b.id), "only on the team");
