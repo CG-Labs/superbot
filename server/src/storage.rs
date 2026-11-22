@@ -255,6 +255,14 @@ impl Cache {
         self.measured.lock().unwrap_or_else(|e| e.into_inner()).remove(user_id);
     }
 
+    /// Drops everything kept about an erased user (ADR 0102). The generation stays
+    /// bumped, so a walk still running can't put its result back.
+    pub fn erase(&self, user_id: &str) {
+        self.forget(user_id);
+        self.walking.lock().unwrap_or_else(|e| e.into_inner()).remove(user_id);
+        self.warned.lock().unwrap_or_else(|e| e.into_inner()).remove(user_id);
+    }
+
     /// Forgets the user when dropped. Declared after a run's slot, it drops first: a Bot
     /// let in by that slot can't pass on a measurement from before the run.
     pub fn forget_on_drop<'a>(&'a self, user_id: &'a str) -> Forget<'a> {

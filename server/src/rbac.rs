@@ -386,6 +386,9 @@ mod tests {
             ("GET", "/api/auth/mfa/policy", Perm::Admin),
             ("DELETE", "/api/auth/mfa", Perm::Admin),
             ("DELETE", "/api/users/u1/mfa", Perm::Admin),
+            // Erasing a user's personal data (ADR 0102).
+            ("POST", "/api/users/u1/erase", Perm::Admin),
+            ("POST", "/api/users/a%40example.com/erase", Perm::Admin),
             ("GET", "/api/me/emails", Perm::Account),
             ("PUT", "/api/me/emails", Perm::Write),
             ("POST", "/api/me/emails", Perm::Admin),

@@ -36,7 +36,7 @@ Indexes on `at`, `(action, id)`, and `(actor_kind, actor_id, id)` keep filters f
 ### Append-only
 
 - **Code**: `Db::record` is the only writer. There is no update or delete API, and the only `DELETE` is retention pruning.
-- **Database**: a trigger aborts every `UPDATE`. Another aborts every `DELETE`, unless retention is on (the `audit_retention_days` setting) and the row is older than the window. So even a bug, or a stray query through `botd`, can't rewrite history or delete recent rows.
+- **Database**: a trigger aborts every `UPDATE`, except the narrow rewrite erasing a user makes inside its own transaction: their id to a pseudonym, their identifying fields cleared, nothing else ([ADR 0102](0102-erasing-a-users-data.md)). Another aborts every `DELETE`, unless retention is on (the `audit_retention_days` setting) and the row is older than the window. So even a bug, or a stray query through `botd`, can't rewrite history or delete recent rows.
 - **Limits**: anyone with write access to `app.sqlite` (the service user, root) can drop the triggers. This guards against mistakes and API misuse, not a server compromise. Tamper evidence (hash chain, write-once storage, shipping events off the box) is M5 work.
 
 ### What is logged
@@ -53,6 +53,7 @@ Indexes on `at`, `(action, id)`, and `(actor_kind, actor_id, id)` keep filters f
 | Server and audit | `server.started` (version and the settings that matter: harness, policy mode, auth kind, retention), `audit.exported` (with its filter), `audit.retention_changed`, `audit.pruned`, `audit.schema_upgraded` (an upgrade added columns; rows before it leave them empty) |
 | Chat retention ([ADR 0098](0098-chat-retention.md)) | `chat.retention_changed`, `chat.pruned` (counts only), `chat.hold_placed`, `chat.hold_changed`, `chat.hold_released` |
 | Access reviews ([ADR 0099](0099-access-review-report.md)) | `access_review.exported` (the report's digest and summary), `access_review.completed` (an admin's sign-off: digest, summary, notes) |
+| Erasure ([ADR 0102](0102-erasing-a-users-data.md)) | `user.erased` (the pseudonym and counts of what went), `user.erase_refused` (outcome `denied`, with the reason) |
 
 **Never logged**: passwords, tokens, API keys, `Authorization` headers, message bodies, routine instructions, handoff and ask text. Approval and policy events do carry the call's subject (the command, path, or URL a person decided on), scrubbed and clipped; the full tool input stays in the approvals table. Each event lists the fields it records; `details` are scrubbed before they are written anyway: keys that look secret (`password`, `token`, `secret`, `api_key`, `authorization`, `cookie`, `credential`, ...) become `[redacted]`, and free text has bearer and basic credentials, `--password` style flags, `key=value` secrets, URL user info and secret query parameters, `curl -u user:pass`, and known token prefixes (`sk-`, `ghp_`, ...) masked. Strings are clipped to 500 characters.
 

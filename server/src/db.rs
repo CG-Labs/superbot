@@ -81,6 +81,118 @@ pub struct RetentionHold {
     pub held_at: i64,
 }
 
+/// What erasing a user removed or changed (ADR 0102), counted for its audit event.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Erased {
+    pub sessions: usize,
+    pub login_codes: usize,
+    pub identities: usize,
+    pub mfa: bool,
+    pub recovery_codes: usize,
+    pub scim: bool,
+    pub grants: usize,
+    pub team_invites: usize,
+    pub signups: usize,
+    pub billing_emails: usize,
+    /// Routines they wrote in others' Bots.
+    pub routines: usize,
+    /// Messages they, or their Bots, wrote in others' chats.
+    pub messages: usize,
+    /// Approvals they decided, now by the pseudonym and without their note.
+    pub approvals: usize,
+    /// Their destroyed machines' last reports of what their homes held (ADR 0105).
+    pub disk_reports: usize,
+    pub audit_events: usize,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum EraseError {
+    /// No such user, or already erased.
+    Gone,
+    /// These Bots' chats are held (ADR 0098).
+    Held(Vec<String>),
+    Db(String),
+}
+
+/// What an erased person's messages and approvals say instead.
+pub const ERASED_TEXT: &str = "[erased]";
+/// An erased user's name on their tombstone.
+pub const ERASED_NAME: &str = "Erased user";
+
+/// Whether the message in `m` was sent by user `?1`, or by a run for them.
+const SENT_BY: &str = "(CASE WHEN json_valid(m.requested_by) THEN json_extract(m.requested_by, '$.actor.id') = ?1 OR json_extract(m.requested_by, '$.actor.asker') = ?1 END)";
+const SENT_BY_ANY: &str = "(CASE WHEN json_valid(requested_by) THEN json_extract(requested_by, '$.actor.id') = ?1 OR json_extract(requested_by, '$.actor.asker') = ?1 END)";
+
+/// How an erasure rewrites a string about the erased person: their id becomes the
+/// pseudonym wherever it appears, as does an email of theirs (any case); a string that is
+/// exactly one of their names or subjects (any case) becomes the pseudonym.
+pub(crate) struct Scrub {
+    id: String,
+    pseudonym: String,
+    /// Lowercase.
+    emails: Vec<String>,
+    /// Lowercase.
+    exact: Vec<String>,
+}
+
+impl Scrub {
+    pub(crate) fn new(id: &str, pseudonym: &str, emails: Vec<String>, exact: Vec<String>) -> Scrub {
+        let clean = |v: Vec<String>, min: usize| {
+            let mut v: Vec<String> = v.into_iter().map(|s| s.trim().to_lowercase()).filter(|s| s.chars().count() >= min).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        Scrub { id: id.into(), pseudonym: pseudonym.into(), emails: clean(emails, 3), exact: clean(exact, 2) }
+    }
+
+    pub(crate) fn text(&self, t: &str) -> Option<String> {
+        let lower = t.trim().to_lowercase();
+        if self.exact.contains(&lower) || self.emails.contains(&lower) {
+            return Some(self.pseudonym.clone());
+        }
+        let mut out = t.replace(&self.id, &self.pseudonym);
+        for e in &self.emails {
+            out = replace_ci(&out, e, &self.pseudonym);
+        }
+        (out != t).then_some(out)
+    }
+
+    /// Whether anything in `v` changed.
+    pub(crate) fn value(&self, v: &mut Value) -> bool {
+        match v {
+            Value::String(s) => match self.text(s) {
+                Some(n) => {
+                    *s = n;
+                    true
+                }
+                None => false,
+            },
+            Value::Array(a) => a.iter_mut().fold(false, |c, x| self.value(x) | c),
+            Value::Object(o) => o.values_mut().fold(false, |c, x| self.value(x) | c),
+            _ => false,
+        }
+    }
+}
+
+/// `hay` with each `needle` (lowercase) replaced, in any case. Outside ASCII, where case
+/// changes lengths, a string that contains it is replaced whole.
+fn replace_ci(hay: &str, needle: &str, with: &str) -> String {
+    if !(hay.is_ascii() && needle.is_ascii()) {
+        return if hay.to_lowercase().contains(needle) { with.into() } else { hay.into() };
+    }
+    let low = hay.to_ascii_lowercase();
+    let (mut out, mut i) = (String::new(), 0);
+    while let Some(j) = low[i..].find(needle) {
+        out.push_str(&hay[i..i + j]);
+        out.push_str(with);
+        i += j + needle.len();
+    }
+    out.push_str(&hay[i..]);
+    out
+}
+
 fn retention_hold_row(r: &rusqlite::Row) -> rusqlite::Result<RetentionHold> {
     Ok(RetentionHold { bot_id: r.get("bot_id")?, reason: r.get("reason")?, held_by: r.get("held_by")?, held_at: r.get("held_at")? })
 }
@@ -622,6 +734,10 @@ pub struct User {
     pub last_login_idp_provider: Option<String>,
     /// The tier an admin (later, billing) gave them. None: the default tier (ADR 0033).
     pub tier: Option<String>,
+    /// When they were erased (ADR 0102): the row is a tombstone with no personal data.
+    pub erased_at: Option<i64>,
+    /// The pseudonym the audit log names them by since.
+    pub erased_as: Option<String>,
 }
 
 impl User {
@@ -1409,6 +1525,8 @@ fn user_row(r: &Row) -> rusqlite::Result<User> {
         last_login_method: r.get("last_login_method")?,
         last_login_idp_provider: r.get("last_login_idp_provider")?,
         tier: r.get("tier")?,
+        erased_at: r.get("erased_at")?,
+        erased_as: r.get("erased_as")?,
     })
 }
 
@@ -1528,7 +1646,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 42] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 43] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1571,7 +1689,51 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 42] = [
     migrate_scim_groups,
     migrate_chat_retention,
     migrate_machine_home_use,
+    migrate_user_erasure,
 ];
+
+/// The settings key an erasure sets, to its pseudonym, for its own transaction only:
+/// while it is there, `audit_events_no_update` lets an update replace a person's fields.
+const AUDIT_ERASING: &str = "audit_erasing";
+/// Settings key prefix for the Bots an unfinished erasure took on, by user id.
+const ERASING_BOTS: &str = "erasing_bots:";
+
+/// Erasing a user (ADR 0102): the user row stays as a tombstone, with when, by whom and
+/// as which pseudonym. The audit log stays append-only except that, inside an erasure's
+/// transaction (the `audit_erasing` setting names its pseudonym), an update may replace
+/// the erased person's id with that pseudonym and clear their name, email, subject,
+/// address, user agent and session, and rewrite details; nothing else about an event changes.
+fn migrate_user_erasure(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    for (col, ty) in [("erased_at", "INTEGER"), ("erased_by", "TEXT"), ("erased_as", "TEXT")] {
+        let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = ?", [col], |r| r.get(0))?;
+        if !has {
+            c.execute_batch(&format!("ALTER TABLE users ADD COLUMN {col} {ty};"))?;
+        }
+    }
+    let p = format!("(SELECT value FROM settings WHERE key = '{AUDIT_ERASING}')");
+    c.execute_batch(&format!(
+        "CREATE UNIQUE INDEX IF NOT EXISTS users_erased_as ON users(erased_as) WHERE erased_as IS NOT NULL;
+        DROP TRIGGER IF EXISTS audit_events_no_update;
+        CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events
+          WHEN NOT (
+            {p} IS NOT NULL
+            AND NEW.id = OLD.id AND NEW.at = OLD.at AND NEW.actor_kind = OLD.actor_kind AND NEW.action = OLD.action
+            AND NEW.outcome = OLD.outcome AND NEW.target_type IS OLD.target_type AND NEW.bot_id IS OLD.bot_id
+            AND NEW.actor_role IS OLD.actor_role AND NEW.auth_method IS OLD.auth_method
+            AND NEW.idp IS OLD.idp AND NEW.idp_provider IS OLD.idp_provider
+            AND (NEW.actor_id IS OLD.actor_id OR NEW.actor_id = {p})
+            AND (NEW.target_id IS OLD.target_id OR NEW.target_id = {p})
+            AND (NEW.on_behalf_of IS OLD.on_behalf_of OR NEW.on_behalf_of = {p})
+            AND (NEW.actor_name IS OLD.actor_name OR NEW.actor_name IS NULL)
+            AND (NEW.actor_email IS OLD.actor_email OR NEW.actor_email IS NULL)
+            AND (NEW.actor_subject IS OLD.actor_subject OR NEW.actor_subject IS NULL)
+            AND (NEW.ip IS OLD.ip OR NEW.ip IS NULL)
+            AND (NEW.user_agent IS OLD.user_agent OR NEW.user_agent IS NULL)
+            AND (NEW.session_id IS OLD.session_id OR NEW.session_id IS NULL)
+          )
+          BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;"
+    ))
+}
 
 /// Whether Bot `?1` is held or has messages from a held Bot in its chat.
 const HELD_CHAT: &str = "(EXISTS (SELECT 1 FROM retention_holds WHERE bot_id = ?1)
@@ -3880,8 +4042,13 @@ impl Db {
         self.c().query_row("SELECT * FROM users WHERE id = ?", [id], user_row).optional().ok().flatten()
     }
 
-    /// By id, or by email (case-insensitive) when `key` has an `@`.
+    /// By id, or by email (case-insensitive) when `key` has an `@`. Never an erased user's
+    /// tombstone (ADR 0102); `find_user_any` finds those too.
     pub fn find_user(&self, key: &str) -> Option<User> {
+        self.find_user_any(key).filter(|u| u.erased_at.is_none())
+    }
+
+    pub fn find_user_any(&self, key: &str) -> Option<User> {
         if key.contains('@') {
             self.c().query_row("SELECT * FROM users WHERE email = ?", [key], user_row).optional().ok().flatten()
         } else {
@@ -3956,6 +4123,288 @@ impl Db {
             Err(e) if constraint(&e) => Err(UserError::EmailTaken),
             Err(e) => Err(UserError::Db(e.to_string())),
         }
+    }
+
+    // Erasure (ADR 0102).
+
+    /// The held Bots that keep `user_id` from being erased: a Bot they own whose chat is
+    /// held (ADR 0098), and a held Bot whose chat has messages they sent or one of their
+    /// Bots wrote. Their Bots are named by id in `bots`, so it still works once they're gone.
+    pub fn erasure_holds(&self, user_id: &str, bots: &[String]) -> Vec<String> {
+        Self::holds_in(&self.c(), user_id, bots)
+    }
+
+    fn holds_in(c: &Connection, user_id: &str, bots: &[String]) -> Vec<String> {
+        let bots = serde_json::to_string(bots).unwrap_or_else(|_| "[]".into());
+        let sql = format!(
+            "SELECT b.id FROM bots b WHERE b.id IN (SELECT value FROM json_each(?2))
+               AND (EXISTS (SELECT 1 FROM retention_holds h WHERE h.bot_id = b.id)
+                 OR EXISTS (SELECT 1 FROM messages m WHERE m.bot_id = b.id AND m.from_bot IN (SELECT bot_id FROM retention_holds)))
+             UNION
+             SELECT h.bot_id FROM retention_holds h WHERE EXISTS (
+               SELECT 1 FROM messages m WHERE m.bot_id = h.bot_id AND ({SENT_BY} OR m.from_bot IN (SELECT value FROM json_each(?2))))
+             ORDER BY 1"
+        );
+        let Ok(mut s) = c.prepare(&sql) else {
+            return Vec::new();
+        };
+        s.query_map(params![user_id, bots], |r| r.get(0)).map(|rows| rows.flatten().collect()).unwrap_or_default()
+    }
+
+    /// The subscription paying for the user's own plan now, if one does.
+    pub fn user_paying(&self, user_id: &str) -> Option<Subscription> {
+        paying_subscription(&self.c(), user_id).ok().flatten()
+    }
+
+    /// The Bots an erasure of `user_id` that didn't finish had taken on (ADR 0102).
+    pub fn erasing_bots(&self, user_id: &str) -> Vec<String> {
+        self.setting(&format!("{ERASING_BOTS}{user_id}")).and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()
+    }
+
+    pub fn set_erasing_bots(&self, user_id: &str, bots: &[String]) {
+        let _ = self.c().execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", params![format!("{ERASING_BOTS}{user_id}"), serde_json::to_string(bots).unwrap_or_default()]);
+    }
+
+    /// Erases `user_id`'s personal data in one transaction (ADR 0102). Their Bots must be
+    /// gone already; `bots` names them, so what they wrote in others' chats is erased too.
+    /// The user row stays as a tombstone named `pseudonym`, and every audit event about
+    /// them names them by it, without their name, email, subject, address or user agent.
+    pub fn erase_user(&self, user_id: &str, pseudonym: &str, by: Option<&str>, bots: &[String]) -> Result<Erased, EraseError> {
+        let db_err = |e: rusqlite::Error| EraseError::Db(e.to_string());
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(db_err)?;
+        let u = tx.query_row("SELECT * FROM users WHERE id = ?", [user_id], user_row).optional().map_err(db_err)?.ok_or(EraseError::Gone)?;
+        if u.erased_at.is_some() {
+            return Err(EraseError::Gone);
+        }
+        let held = Self::holds_in(&tx, user_id, bots);
+        if !held.is_empty() {
+            return Err(EraseError::Held(held));
+        }
+        let (mut emails, mut exact, mut subjects) = (Vec::new(), vec![u.name.clone()], Vec::new());
+        emails.extend(u.email.clone());
+        if let (Some(i), Some(s)) = (&u.idp_issuer, &u.idp_subject) {
+            subjects.extend([s.clone(), format!("{i}|{s}")]);
+        }
+        let strings = |sql: &str, emails: &mut Vec<String>, exact: &mut Vec<String>, subjects: &mut Vec<String>| -> rusqlite::Result<()> {
+            let mut s = tx.prepare(sql)?;
+            let rows = s.query_map(params![user_id, u.email], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?;
+            for row in rows {
+                let (kind, v) = row?;
+                let Some(v) = v.filter(|v| !v.trim().is_empty()) else {
+                    continue;
+                };
+                match kind.as_str() {
+                    "email" => emails.push(v),
+                    "subject" => subjects.push(v),
+                    _ => exact.push(v),
+                }
+            }
+            Ok(())
+        };
+        strings(
+            "SELECT 'subject', subject FROM user_identities WHERE user_id = ?1
+             UNION ALL SELECT 'subject', issuer || '|' || subject FROM user_identities WHERE user_id = ?1
+             UNION ALL SELECT 'email', email FROM user_identities WHERE user_id = ?1
+             UNION ALL SELECT 'subject', external_id FROM scim_users WHERE user_id = ?1
+             UNION ALL SELECT 'email', user_name FROM scim_users WHERE user_id = ?1
+             UNION ALL SELECT 'name', given_name FROM scim_users WHERE user_id = ?1
+             UNION ALL SELECT 'name', family_name FROM scim_users WHERE user_id = ?1
+             UNION ALL SELECT 'name', display_name FROM scim_users WHERE user_id = ?1
+             UNION ALL SELECT 'name', formatted FROM scim_users WHERE user_id = ?1
+             UNION ALL SELECT 'name', name FROM signups WHERE user_id = ?1 OR (?2 IS NOT NULL AND email = ?2)
+             UNION ALL SELECT 'email', email FROM signups WHERE user_id = ?1 OR (?2 IS NOT NULL AND email = ?2)",
+            &mut emails,
+            &mut exact,
+            &mut subjects,
+        )
+        .map_err(db_err)?;
+        // A SCIM userName is often an email, but not always.
+        let scrub_of = |emails: Vec<String>, mut exact: Vec<String>, subjects: &[String]| {
+            let (names, mails): (Vec<String>, Vec<String>) = emails.into_iter().partition(|e| !e.contains('@'));
+            exact.extend(names);
+            exact.extend(subjects.iter().cloned());
+            Scrub::new(user_id, pseudonym, mails, exact)
+        };
+        let scrub = scrub_of(emails.clone(), exact.clone(), &subjects);
+        // Values they had before may be someone else's now, so they're scrubbed only from
+        // events that name them by id.
+        Self::past_identifiers(&tx, user_id, &mut emails, &mut exact, &mut subjects).map_err(db_err)?;
+        let theirs = scrub_of(emails, exact, &subjects);
+
+        let bots_json = serde_json::to_string(bots).unwrap_or_else(|_| "[]".into());
+        let run = |sql: &str, p: &[&dyn rusqlite::ToSql]| tx.execute(sql, p).map_err(db_err);
+        let mut out = Erased::default();
+        run("DELETE FROM settings WHERE key = ?", &[&format!("{ERASING_BOTS}{user_id}")])?;
+        run("DELETE FROM push_devices WHERE user_id = ?", &[&user_id])?;
+        out.sessions = run("DELETE FROM sessions WHERE user_id = ?", &[&user_id])?;
+        out.login_codes = run("DELETE FROM login_codes WHERE user_id = ?", &[&user_id])?;
+        out.identities = run("DELETE FROM user_identities WHERE user_id = ?", &[&user_id])?;
+        out.mfa = run("DELETE FROM user_mfa WHERE user_id = ?", &[&user_id])? > 0;
+        out.recovery_codes = run("DELETE FROM mfa_recovery_codes WHERE user_id = ?", &[&user_id])?;
+        out.scim = run("DELETE FROM scim_users WHERE user_id = ?", &[&user_id])? > 0;
+        out.grants = run("DELETE FROM bot_grants WHERE user_id = ?", &[&user_id])?;
+        out.team_invites = match &u.email {
+            Some(e) => run("DELETE FROM team_invites WHERE email = ?", &[e])?,
+            None => 0,
+        };
+        out.signups = run("DELETE FROM signups WHERE user_id = ?1 OR (?2 IS NOT NULL AND email = ?2)", &[&user_id, &u.email])?;
+        out.billing_emails = run("DELETE FROM billing_emails WHERE user_id = ?", &[&user_id])?;
+        run("DELETE FROM email_prefs WHERE user_id = ?", &[&user_id])?;
+        run("DELETE FROM billing_checkouts WHERE user_id = ?", &[&user_id])?;
+        run("DELETE FROM team_members WHERE user_id = ?", &[&user_id])?;
+        out.routines = run("DELETE FROM routines WHERE author_id = ?", &[&user_id])?;
+        out.messages = run(
+            &format!(
+                "UPDATE messages SET text = '{ERASED_TEXT}', question = NULL, requested_by = NULL
+                 WHERE role IN ('user', 'routine') AND {SENT_BY_ANY}
+                    OR from_bot IN (SELECT value FROM json_each(?2))"
+            ),
+            &[&user_id, &bots_json],
+        )?;
+        run(&format!("UPDATE messages SET requested_by = NULL WHERE {SENT_BY_ANY}"), &[&user_id])?;
+        out.approvals = run("UPDATE approvals SET decided_by = ?2, note = NULL WHERE decided_by = ?1", &[&user_id, &pseudonym])?;
+        out.disk_reports = run(
+            "UPDATE machines SET disk_files = NULL, disk_files_partial = 0, disk_files_at = NULL WHERE user_id = ? AND (disk_files IS NOT NULL OR disk_files_at IS NOT NULL)",
+            &[&user_id],
+        )?;
+        let at = now();
+        run(
+            "UPDATE users SET email = NULL, display_name = ?2, role = 'readonly', status = 'disabled', idp_issuer = NULL, idp_subject = NULL,
+               last_login_at = NULL, last_login_method = NULL, last_login_idp_provider = NULL, tier = NULL,
+               erased_at = ?3, erased_by = ?4, erased_as = ?5, updated_at = ?3
+             WHERE id = ?1",
+            &[&user_id, &ERASED_NAME, &at, &by, &pseudonym],
+        )?;
+        out.audit_events = Self::pseudonymise_audit(&tx, &scrub, &theirs).map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        Ok(out)
+    }
+
+    /// Names, emails and sign-in subjects the user had before: what `user.created`,
+    /// `user.updated` and identity events about them recorded, so erasing scrubs old values
+    /// a change left in the log.
+    fn past_identifiers(c: &Connection, user_id: &str, emails: &mut Vec<String>, exact: &mut Vec<String>, subjects: &mut Vec<String>) -> rusqlite::Result<()> {
+        const KEYS: [&str; 9] = ["name", "email", "userName", "externalId", "subject", "givenName", "familyName", "displayName", "formatted"];
+        let mut st = c.prepare("SELECT details FROM audit_events WHERE target_type = 'user' AND target_id = ? AND action IN ('user.created', 'user.updated', 'user.identity_linked', 'user.identity_unlinked')")?;
+        let rows = st.query_map([user_id], |r| r.get::<_, String>(0))?;
+        for d in rows {
+            let Ok(d) = serde_json::from_str::<Value>(&d?) else { continue };
+            if let (Some(i), Some(sub)) = (d["issuer"].as_str(), d["subject"].as_str()) {
+                subjects.push(format!("{i}|{sub}"));
+            }
+            let mut found = |key: &str, v: &Value| {
+                let Some(v) = v.as_str().filter(|v| !v.trim().is_empty()) else { return };
+                match key {
+                    "externalId" | "subject" => subjects.push(v.into()),
+                    "email" | "userName" => emails.push(v.into()),
+                    _ => exact.push(v.into()),
+                }
+            };
+            for key in KEYS {
+                found(key, &d[key]);
+                found(key, &d["changes"][key]["from"]);
+                found(key, &d["changes"][key]["to"]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Rewrites every audit event about `s`'s user as `Scrub` says, inside the caller's
+    /// transaction; events that name them by id as `named` says. Returns how many changed.
+    fn pseudonymise_audit(c: &Connection, s: &Scrub, named: &Scrub) -> rusqlite::Result<usize> {
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", params![AUDIT_ERASING, s.pseudonym])?;
+        let mut sql = String::from(
+            "SELECT id, actor_id, actor_name, actor_email, actor_subject, target_id, on_behalf_of, ip, user_agent, session_id, details FROM audit_events
+             WHERE actor_id = ?1 OR target_id = ?1 OR on_behalf_of = ?1 OR instr(details, ?1) > 0",
+        );
+        let mut args: Vec<String> = vec![s.id.clone()];
+        for e in &s.emails {
+            args.push(e.clone());
+            sql.push_str(&format!(" OR actor_email = ?{n} COLLATE NOCASE OR instr(lower(details), ?{n}) > 0", n = args.len()));
+        }
+        for x in s.exact.iter().filter(|x| x.chars().count() >= 8) {
+            args.push(x.clone());
+            sql.push_str(&format!(" OR actor_subject = ?{n} OR instr(details, ?{n}) > 0", n = args.len()));
+        }
+        type Row = (i64, [Option<String>; 9], String);
+        let rows: Vec<Row> = {
+            let mut st = c.prepare(&sql)?;
+            let rows = st.query_map(rusqlite::params_from_iter(&args), |r| Ok((r.get(0)?, [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?], r.get(10)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut n = 0;
+        for (id, [actor_id, name, email, subject, target, behalf, ip, agent, session], details) in rows {
+            let is = |v: &Option<String>| v.as_deref() == Some(s.id.as_str());
+            // A visitor without an account (a signup) is known only by the email they gave.
+            let visitor = actor_id.is_none() && email.as_deref().is_some_and(|e| s.emails.contains(&e.to_lowercase()));
+            let theirs = is(&actor_id) || visitor;
+            let s = if theirs || is(&target) || is(&behalf) { named } else { s };
+            let swap = |v: Option<String>| {
+                if v.as_deref() == Some(s.id.as_str()) { Some(s.pseudonym.clone()) } else { v }
+            };
+            let mine = |v: Option<String>, matches: bool| if theirs || matches { None } else { v };
+            let email_match = email.as_deref().is_some_and(|e| s.emails.contains(&e.to_lowercase()));
+            let subject_match = subject.as_deref().is_some_and(|x| s.exact.contains(&x.to_lowercase()));
+            let mut d: Value = serde_json::from_str(&details).unwrap_or(Value::Null);
+            let changed = s.value(&mut d);
+            let next = (
+                swap(actor_id.clone()),
+                mine(name.clone(), false),
+                mine(email.clone(), email_match),
+                mine(subject.clone(), subject_match),
+                swap(target.clone()),
+                swap(behalf.clone()),
+                mine(ip.clone(), false),
+                mine(agent.clone(), false),
+                mine(session.clone(), false),
+            );
+            if !changed && next == (actor_id, name, email, subject, target, behalf, ip, agent, session) {
+                continue;
+            }
+            c.execute(
+                "UPDATE audit_events SET actor_id = ?2, actor_name = ?3, actor_email = ?4, actor_subject = ?5, target_id = ?6, on_behalf_of = ?7,
+                   ip = ?8, user_agent = ?9, session_id = ?10, details = ?11 WHERE id = ?1",
+                params![id, next.0, next.1, next.2, next.3, next.4, next.5, next.6, next.7, next.8, if changed { d.to_string() } else { details }],
+            )?;
+            n += 1;
+        }
+        c.execute("DELETE FROM settings WHERE key = ?", [AUDIT_ERASING])?;
+        Ok(n)
+    }
+
+    /// Every row of every table, as `(table, the row's columns as text)`.
+    #[cfg(test)]
+    pub fn all_rows(&self) -> Vec<(String, String)> {
+        let c = self.c();
+        let tables: Vec<String> = {
+            let mut s = c.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").unwrap();
+            s.query_map([], |r| r.get(0)).unwrap().filter_map(Result::ok).collect()
+        };
+        let mut out = Vec::new();
+        for t in tables {
+            let mut s = c.prepare(&format!("SELECT * FROM \"{t}\"")).unwrap();
+            let n = s.column_count();
+            let rows = s
+                .query_map([], |r| {
+                    Ok((0..n)
+                        .map(|i| match r.get_ref(i) {
+                            Ok(rusqlite::types::ValueRef::Text(b) | rusqlite::types::ValueRef::Blob(b)) => String::from_utf8_lossy(b).into_owned(),
+                            Ok(rusqlite::types::ValueRef::Integer(i)) => i.to_string(),
+                            _ => String::new(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\u{1f}"))
+                })
+                .unwrap();
+            out.extend(rows.filter_map(Result::ok).map(|row| (t.clone(), row)));
+        }
+        out
+    }
+
+    #[cfg(test)]
+    pub fn execute_raw(&self, sql: &str) -> rusqlite::Result<usize> {
+        self.c().execute(sql, [])
     }
 
     // Tiers and usage (ADR 0033). Every query names the user.
@@ -7817,7 +8266,9 @@ mod tests {
 
     macro_rules! undo_audit_actors {
         () => {
-            "DROP INDEX audit_events_on_behalf_of; DROP INDEX audit_events_session;
+            "DROP TRIGGER audit_events_no_update;
+            CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;
+            DROP INDEX audit_events_on_behalf_of; DROP INDEX audit_events_session;
             ALTER TABLE audit_events DROP COLUMN actor_email; ALTER TABLE audit_events DROP COLUMN actor_role;
             ALTER TABLE audit_events DROP COLUMN auth_method; ALTER TABLE audit_events DROP COLUMN idp;
             ALTER TABLE audit_events DROP COLUMN idp_provider; ALTER TABLE audit_events DROP COLUMN session_id;

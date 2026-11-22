@@ -48,6 +48,11 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl user resume-routines <user>               Turn back on the routines paused when they were disabled
   botctl user handover <user> <to> [--resume]      Give a disabled user's Bots and routines to <to>;
                                                    --resume turns their paused routines back on
+  botctl user erase <user> [--destroy-machine] --yes
+                                                   Erase their personal data for good (GDPR): Bots, chats,
+                                                   sign-ins, secrets; the audit log keeps a pseudonym.
+                                                   Refused under a legal hold, as a team's last owner, or
+                                                   with a machine (--destroy-machine destroys it first)
   botctl user tier <user> <tier|default>           Their plan: the models and limits they get
   botctl tiers                                     Every tier, its routes and limits, and the default
   botctl tiers move-bots <tier> [--user <user>] [--dry-run]
@@ -1288,6 +1293,10 @@ fn run(args: &[String]) -> Result<String, String> {
         }
         ["user", "routines", key] => op("GET", &format!("/api/users/{}/routines", encode(key)), None),
         ["user", "resume-routines", key] => op("POST", &format!("/api/users/{}/routines/resume", encode(key)), None),
+        ["user", "erase", key, rest @ ..] => {
+            let (path, body) = erase_request(key, rest)?;
+            op("POST", &path, Some(body.to_string()))
+        }
         ["user", "handover", key, rest @ ..] => {
             let (path, body) = handover_request(key, rest)?;
             op("POST", &path, Some(body.to_string()))
@@ -1340,6 +1349,16 @@ fn handover_request(key: &str, rest: &[&str]) -> Result<(String, Value), String>
     Ok((format!("/api/users/{}/handover", encode(key)), json!({ "to": to, "resumeRoutines": resume })))
 }
 
+fn erase_request(key: &str, rest: &[&str]) -> Result<(String, Value), String> {
+    if key.starts_with("--") || rest.iter().any(|a| !matches!(*a, "--yes" | "--destroy-machine")) {
+        return Err("Usage: botctl user erase <user> [--destroy-machine] --yes".into());
+    }
+    if !rest.contains(&"--yes") {
+        return Err("Erasing deletes their personal data for good and can't be undone; add --yes".into());
+    }
+    Ok((format!("/api/users/{}/erase", encode(key)), json!({ "destroyMachine": rest.contains(&"--destroy-machine") })))
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
@@ -1380,6 +1399,18 @@ mod tests {
         assert!(handover_request("u1", &[]).is_err());
         assert!(handover_request("u1", &["--resume"]).is_err());
         assert!(handover_request("u1", &["u2", "u3"]).is_err());
+    }
+
+    #[test]
+    fn erase_needs_yes_and_maybe_destroys_the_machine() {
+        let (path, body) = erase_request("ada@example.com", &["--yes"]).unwrap();
+        assert_eq!(path, "/api/users/ada%40example.com/erase");
+        assert_eq!(body, json!({ "destroyMachine": false }));
+        assert_eq!(erase_request("u1", &["--destroy-machine", "--yes"]).unwrap().1["destroyMachine"], true);
+        assert!(erase_request("u1", &[]).unwrap_err().contains("--yes"));
+        assert!(erase_request("u1", &["--destroy-machine"]).is_err());
+        assert!(erase_request("u1", &["--yes", "u2"]).is_err());
+        assert!(erase_request("--yes", &[]).is_err());
     }
 
     #[test]

@@ -709,6 +709,14 @@ impl Payer<'_> {
     }
 }
 
+/// Closes someone's open checkout before they're erased, holding checkout's own lock for
+/// them until the guard drops. None: checkout is off.
+pub(crate) async fn close_for_erasure(app: &App, a: &Auth, user_id: &str) -> Option<(tokio::sync::OwnedMutexGuard<()>, Last)> {
+    let Some(co) = &a.payments.checkout else { return None };
+    let guard = co.lock(user_id).lock_owned().await;
+    Some((guard, close_last(app, &co.stripe, Payer::User(user_id)).await))
+}
+
 /// Expires the payer's open checkout page, if any, so it can't be paid as well as the
 /// next. Stripe refuses to expire a page that isn't open; then its status says why.
 pub(crate) async fn close_last(app: &App, stripe: &Stripe, payer: Payer<'_>) -> Last {

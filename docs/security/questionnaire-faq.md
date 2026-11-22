@@ -48,7 +48,7 @@ Server: daily backups by default (RPO 24 hours), RTO target 1 hour, drilled in C
 Sessions end after 7 days idle or 30 days. Backups are kept 14 days by default. The audit log and chat history are kept until a retention period is set for each; chat retention skips Bots an admin puts on a legal hold. See [retention](data-flows.md#retention).
 
 **Can a user's data be deleted?**
-Users are disabled, not deleted, today; their sessions end at once. Teammates who leave have their OS users and homes removed from the owner's machine. Erasure for managed users is planned (M4).
+Yes. Disabling someone (or an IdP's SCIM delete) ends their sessions at once and keeps their data. On request, an admin erases them: their Bots, chats, sign-ins, second factor and secrets are deleted, the audit log keeps its events under a random pseudonym, and the erasure is itself audited. It is refused while their chat is under a legal hold. Copies in backups go when the backups' retention ends ([ADR 0102](../adr/0102-erasing-a-users-data.md)). Teammates who leave have their OS users and homes removed from the owner's machine.
 
 **Has SuperBot been security tested?**
 An internal authentication and authorization review found no critical or high issues ([auth review](auth-review-2026-11.md), [SCIM review](auth-review-2026-11-scim.md)). An external penetration test is planned before M3 general availability ([roadmap](../ROADMAP.md)).

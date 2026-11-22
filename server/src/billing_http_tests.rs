@@ -548,9 +548,14 @@ pub(crate) struct FakeStripe {
     answered: Arc<std::sync::Mutex<HashMap<String, (u16, Value)>>>,
     /// Checkout sessions someone paid: no longer open, so they can't be expired.
     paid: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// How long it takes to answer, in milliseconds.
+    delay_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl FakeStripe {
+    pub(crate) fn slow(&self, ms: u64) {
+        self.delay_ms.store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
     pub fn seen(&self) -> Vec<Seen> {
         self.seen.lock().unwrap().clone()
     }
@@ -572,6 +577,7 @@ pub(crate) async fn fake_stripe() -> (String, FakeStripe) {
         let form = url::form_urlencoded::parse(&body).into_owned().collect();
         let seen = Seen { path: uri.path().into(), auth: h("authorization"), key: h("idempotency-key"), version: h("stripe-version"), form };
         f.seen.lock().unwrap().push(seen.clone());
+        tokio::time::sleep(Duration::from_millis(f.delay_ms.load(std::sync::atomic::Ordering::SeqCst))).await;
         // Stripe replays answers by idempotency key, which only POSTs carry.
         if let Some((code, v)) = f.answered.lock().unwrap().get(&seen.key).filter(|_| !seen.key.is_empty()) {
             return (StatusCode::from_u16(*code).unwrap(), Json(v.clone()));
@@ -604,12 +610,12 @@ pub(crate) async fn fake_stripe() -> (String, FakeStripe) {
 }
 
 /// `world(true)` with checkout, against a fake Stripe.
-async fn shop() -> (World, FakeStripe) {
+pub(crate) async fn shop() -> (World, FakeStripe) {
     let (url, f) = fake_stripe().await;
     (world_with(Some(Billing::with_checkout(SECRET, KEY, &url, PUBLIC))).await, f)
 }
 
-async fn buy(w: &World, who: &str, tier: &str) -> (u16, Value) {
+pub(crate) async fn buy(w: &World, who: &str, tier: &str) -> (u16, Value) {
     let (code, body) = call(w.port, "POST", "/api/billing/checkout", who, &json!({ "tier": tier }).to_string()).await;
     (code, parse(&body))
 }

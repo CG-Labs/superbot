@@ -351,6 +351,7 @@ fn check(db: &db::Db, user_id: &str, v: &Value, at: i64) -> Check {
 
 /// After a good password or code: Ok when no second factor is needed, or `v` carries a
 /// good one (its kind); else the reply that starts the second step.
+#[allow(clippy::result_large_err)]
 pub fn gate(a: &Auth, u: &User, method: &'static str, v: &Value, source: &Source) -> Result<Option<&'static str>, Response> {
     let Some(app) = a.app.as_ref() else { return Ok(None) };
     let at = db::now();
