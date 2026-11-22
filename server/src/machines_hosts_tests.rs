@@ -294,6 +294,7 @@ async fn a_lost_hosts_machines_are_restored_onto_another_host_and_enroll_anew() 
     let mm = env.app.db.machine(&m.id).unwrap();
     assert_eq!(mm.provider_id.as_deref(), Some(format!("b/{}", m.label).as_str()), "its record names its new host");
     assert_eq!(mm.state, State::Running);
+    until("the copy to boot", || env.b.instance(&m.label).is_some_and(|i| i.status == "Running")).await;
     let i = env.b.instance(&m.label).unwrap();
     assert_eq!((i.status.as_str(), read(&env.b, &m.label, "/home/user/notes.txt").as_deref()), ("Running", Some("version 1")));
     assert!(env.b.instance(&format!("{}-restore", m.label)).is_none());
