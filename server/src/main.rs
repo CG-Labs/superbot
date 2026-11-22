@@ -96,6 +96,8 @@ mod machines_provider_backup_tests;
 mod machines_resize_tests;
 #[cfg(test)]
 mod machines_region_tests;
+#[cfg(test)]
+mod machines_residency_tests;
 mod passwd;
 mod plans;
 #[cfg(test)]
@@ -594,6 +596,11 @@ async fn main() {
     for w in auth_state.machines.offsite.as_deref().map(|o| [o.warnings(), o.unreachable(&recorded)].concat()).unwrap_or_default() {
         log_warn!("WARNING: {w}");
     }
+    if auth_state.machines.enabled() {
+        for w in machines::residency::warnings(&app, &auth_state.machines) {
+            log_warn!("WARNING: {w}");
+        }
+    }
     if let Some(m) = auth_state.payments.meter() {
         let _ = app.meter.set(m);
     }
@@ -920,6 +927,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/identities/{id}", delete(sso::unlink_identity))
         .route("/users/{key}/machine", get(machines::get).post(machines::request).delete(machines::destroy))
         .route("/users/{key}/region", get(machines::region::get_user).put(machines::region::set_user))
+        .route("/users/{key}/residency", get(machines::region::get_user).put(machines::residency::pin_user).delete(machines::residency::unpin_user))
         .route("/users/{key}/machine/suspend", post(machines::suspend))
         .route("/users/{key}/machine/resume", post(machines::resume))
         .route("/users/{key}/machine/resize", get(machines::resize::status).post(machines::resize))
@@ -969,6 +977,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/teams", get(teams::list).post(teams::create))
         .route("/teams/{id}", get(teams::get).patch(teams::update).delete(teams::delete))
         .route("/teams/{id}/region", get(machines::region::get_team).put(machines::region::set_team))
+        .route("/teams/{id}/residency", get(machines::region::get_team).put(machines::residency::pin_team).delete(machines::residency::unpin_team))
         .route("/teams/{id}/members/{user}", put(teams::put_member).delete(teams::delete_member))
         .route("/team", get(teams::mine))
         .route("/team/leave", post(teams::leave_mine))

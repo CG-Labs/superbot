@@ -768,7 +768,7 @@ fn unable(app: &App, cp: &ControlPlane, m: &Machine) -> Option<String> {
     if let Some(why) = super::hosts::unreachable(cp, m) {
         return Some(why);
     }
-    if let Some(Err(why)) = cp.offsite.as_deref().map(|off| off.store_for(&m.region)) {
+    if let Some(Err((_, why))) = cp.offsite.as_deref().map(|off| super::residency::backup_store(app, off, m)) {
         return Some(why);
     }
     None
@@ -790,7 +790,8 @@ async fn begin(app: &App, cp: &ControlPlane, off: &Offsite, m: &Machine, who: Op
     if pm.user_data {
         return Err("The provider still holds its enrollment token; it is backed up once that is cleared (ADR 0067).".into());
     }
-    let store_region = off.store_for(&m.region)?;
+    let store_region = super::residency::backup_store(app, off, m).map_err(|(_, why)| why)?;
+    let store_region = store_region.as_deref();
     if !off.in_region(&m.region) && off.regional() {
         crate::obs::log::log_warn!("WARNING: machine {} is in {}, and its backup goes to the default store, which isn't said to be there (ADR 0117).", m.id, m.region);
     }
@@ -1240,6 +1241,10 @@ pub async fn create(
         let _g = cp.ops.lock().await;
         let m = app.db.machine(&m.id).ok_or_else(|| not_found("Machine"))?;
         cp.need_own(&m)?;
+        if let Err((Some(p), why)) = super::residency::backup_store(&app, off, &m) {
+            super::residency::refused(&app, &by, &m, "backup", &p, &why);
+            return Err(conflict(why));
+        }
         begin(&app, cp, off, &m, by.actor.id.as_deref()).await.map_err(conflict)?
     };
     let cp = a.machines.clone();
@@ -1351,7 +1356,18 @@ pub async fn restore_request(
     if let Some(why) = cannot_restore(&app, &m) {
         return Err(conflict(why));
     }
-    let mv = super::hosts::restore_move(&app, cp, &m, req.host.as_deref().map(str::trim).filter(|h| !h.is_empty()))?;
+    let host = req.host.as_deref().map(str::trim).filter(|h| !h.is_empty());
+    // A pinned user's data (ADR 0129): checked against the host asked for, then where it goes.
+    let pinned = |to: Option<&str>| match super::residency::check_restore(&app, cp, &m, &b, to) {
+        Ok(()) => Ok(()),
+        Err((p, why)) => {
+            super::residency::refused(&app, &by, &m, if host.is_some() { "move" } else { "restore" }, &p, &why);
+            Err(conflict(why))
+        }
+    };
+    pinned(host)?;
+    let mv = super::hosts::restore_move(&app, cp, &m, host)?;
+    pinned(mv.to.as_deref())?;
     let ids = match (b.encrypted, req.identity.as_deref().filter(|i| !i.trim().is_empty())) {
         (true, None) => return Err(bad("That backup is encrypted: send its age identity as \"identity\" (botctl machine restore ... --identity <file>).")),
         (true, Some(raw)) => identities(raw).map_err(bad)?,
