@@ -124,7 +124,7 @@ pub fn open_field(context: &str, stored: &str) -> Option<String> {
     cipher().open_text(context, stored).ok().map(|s| s.expose().to_string())
 }
 
-const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS secrets (
+pub(crate) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS secrets (
   name TEXT PRIMARY KEY,
   value TEXT NOT NULL,
   created_at INTEGER NOT NULL,

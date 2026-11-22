@@ -205,6 +205,8 @@ pub fn prepare(path: &Path, policy: Policy, keys: &mut Keys) -> Result<(Option<D
             drop(crate::db::Db::open(path).map_err(|e| format!("database: {e}"))?);
             {
                 let c = open_with(path, None).map_err(|e| format!("database: {e}"))?;
+                // A database from before saved secrets doesn't have their tables yet.
+                c.execute_batch(crate::secrets::sealed::SCHEMA).map_err(|e| format!("database: {e}"))?;
                 let (current, previous) = (keys.current.as_ref().map(|(k, _)| k), keys.previous.as_ref().map(|(k, _)| k));
                 crate::secrets::sealed::check_keys(&c, current, previous, crate::secrets::forget_sealed())?;
             }
@@ -846,6 +848,18 @@ mod tests {
         drop(other);
         assert_eq!(format(&path).unwrap(), Format::Plain);
         assert_eq!(bots(&open_with(&path, None).unwrap()), ["KeepMe", "Late"]);
+    }
+
+    #[test]
+    fn a_plain_database_from_before_saved_secrets_is_encrypted_too() {
+        let path = db_in("dbe-old");
+        let db = crate::db::Db::open(&path).unwrap();
+        db.create_bot("KeepMe", "#fff", "waddle", "claude", None, true);
+        drop(db);
+        let master = MasterKey::generate();
+        let (key, start) = prepare(&path, Policy::Required, &mut keys(&path, Some(&master), None)).unwrap();
+        assert!(start.migrated.is_some() && opens(&path, key.as_ref().unwrap()));
+        assert_eq!(bots(&open_with(&path, key.as_ref()).unwrap()), ["KeepMe"]);
     }
 
     #[test]
