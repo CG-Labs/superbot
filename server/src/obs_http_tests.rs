@@ -435,11 +435,13 @@ async fn a_request_its_run_the_harness_its_tools_and_the_bots_calls_share_one_tr
     let dir = std::env::temp_dir().join(format!("superbot-trace-{}", random_hex(4)));
     std::fs::create_dir_all(&dir).unwrap();
     // A harness that hands the test its run token, waits to be let go, uses a tool and replies.
+    let refused = r#"{"type":"assistant","message":{"content":[{"id":"toolu_0","input":{"command":"cat /w/x"},"name":"Bash","type":"tool_use"}]}}"#;
+    let refused_result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_0","type":"tool_result","content":"blocked","is_error":true}]}}"#;
     let tool = r#"{"type":"assistant","message":{"content":[{"id":"toolu_1","input":{"file_path":"/w/ada@example.com.txt"},"name":"Read","type":"tool_use"}]}}"#;
     let ran = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"sk-test-4242"}]}}"#;
     let reply = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"On it."}]}}"#;
     let script = format!(
-        "#!/bin/sh\necho \"$BOT_TOKEN\" > {d}/token.tmp && mv {d}/token.tmp {d}/token\nwhile [ ! -e {d}/go ]; do sleep 0.02; done\necho '{tool}'\necho '{ran}'\necho '{reply}'\n",
+        "#!/bin/sh\necho \"$BOT_TOKEN\" > {d}/token.tmp && mv {d}/token.tmp {d}/token\nwhile [ ! -e {d}/go ]; do sleep 0.02; done\necho '{refused}'\necho '{refused_result}'\necho '{tool}'\necho '{ran}'\necho '{reply}'\n",
         d = dir.display()
     );
     let path = app.cfg.bin_dir.join("claude");
@@ -492,6 +494,11 @@ async fn a_request_its_run_the_harness_its_tools_and_the_bots_calls_share_one_tr
     assert_eq!(tool.len(), 1, "{all:?}");
     assert_eq!(&tool[0]["parentSpanId"], &attempt["spanId"], "{}", tool[0]);
     assert_eq!(attr(tool[0], "superbot.tool.ran").unwrap()["boolValue"], true, "{}", tool[0]);
+    // A refused call ends when its error comes back, marked as one.
+    let refused = spans(&all, "tool Bash");
+    assert_eq!(refused.len(), 1, "{all:?}");
+    assert_eq!((attr(refused[0], "superbot.tool.ran").unwrap()["boolValue"].as_bool(), refused[0]["status"]["code"].as_u64()), (Some(false), Some(2)), "{}", refused[0]);
+    assert!(refused[0]["endTimeUnixNano"].as_str().unwrap().parse::<u64>().unwrap() <= tool[0]["startTimeUnixNano"].as_str().unwrap().parse::<u64>().unwrap());
 
     // The hook's request joined the attempt; its policy check is a child of it.
     let hook = by_rid(&hook_rid);

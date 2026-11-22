@@ -60,7 +60,7 @@ impl Level {
 }
 
 /// A line of botd's own text: printed as is (info to stdout, warnings to stderr), or
-/// as `{"ts", "level", "msg"}` on the same stream.
+/// as `{"ts", "level", "msg"}` on the same stream, with the trace's ids inside a kept span.
 pub fn line(level: Level, msg: &str) {
     if !json() {
         match level {
@@ -70,19 +70,25 @@ pub fn line(level: Level, msg: &str) {
         return;
     }
     let msg = msg.strip_prefix("WARNING: ").unwrap_or(msg);
-    write(level, render(level, msg, json!({})));
+    write(level, render(level, msg, traced(json!({}))));
 }
 
-/// A structured line, `msg` naming what happened (`http.request`, `run.finished`), with
-/// `fields` beside it. Only in JSON format: text logs stay as they were. Inside a span
-/// that's kept (ADR 0118), it names the span's `traceId` and `spanId` too.
-pub fn event(level: Level, msg: &str, mut fields: Value) {
+/// Inside a span that's kept (ADR 0118), `fields` with its `traceId` and `spanId`.
+fn traced(mut fields: Value) -> Value {
     if let (Value::Object(f), Some(c)) = (&mut fields, super::trace::current_sampled())
         && f.get("traceId").is_none_or(Value::is_null)
     {
         f.insert("traceId".into(), json!(c.trace_id()));
         f.insert("spanId".into(), json!(c.span_id()));
     }
+    fields
+}
+
+/// A structured line, `msg` naming what happened (`http.request`, `run.finished`), with
+/// `fields` beside it. Only in JSON format: text logs stay as they were. Inside a span
+/// that's kept (ADR 0118), it names the span's `traceId` and `spanId` too.
+pub fn event(level: Level, msg: &str, fields: Value) {
+    let fields = traced(fields);
     let rendered = (json() || cfg!(test)).then(|| render(level, msg, fields));
     #[cfg(test)]
     if let Some(r) = &rendered {
@@ -151,5 +157,26 @@ pub mod captured {
     /// Every kept line that contains `needle`, parsed.
     pub fn with(needle: &str) -> Vec<serde_json::Value> {
         LINES.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|l| l.contains(needle)).filter_map(|l| serde_json::from_str(l).ok()).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::obs::trace::{Kind, Tracer, within};
+
+    #[tokio::test]
+    async fn plain_lines_and_events_name_a_kept_trace() {
+        let t = Tracer::default();
+        assert_eq!(traced(json!({})), json!({}), "outside a span, nothing");
+        t.capture(1.0, false);
+        let span = t.span("run claude", Kind::Internal, None);
+        let c = span.sampled().unwrap();
+        let line = within(&span, async { render(Level::Warn, "x", traced(json!({}))) }).await;
+        let line: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!((line["traceId"].as_str(), line["spanId"].as_str()), (Some(c.trace_id().as_str()), Some(c.span_id().as_str())), "{line}");
+        t.capture(0.0, false);
+        let dropped = t.span("run claude", Kind::Internal, None);
+        assert_eq!(within(&dropped, async { traced(json!({})) }).await, json!({}), "an unsampled trace isn't named");
     }
 }

@@ -32,6 +32,8 @@ pub enum AgentEvent {
     /// A tool call finished without an error, so the harness really ran it. A call the
     /// harness rejects before its hook (bad arguments, an unknown name) ends in an error.
     ToolRan { name: String },
+    /// A tool call that ended in an error: refused, blocked or failing.
+    ToolFailed { name: String },
     Error(String),
     /// Model tokens the harness says it used (ADR 0050). A run may report several, one
     /// per model or turn; the runner adds them up. A harness that says nothing: unknown.

@@ -395,9 +395,13 @@ impl Tracer {
         #[allow(irrefutable_let_patterns)]
         let Sink::Export(tx) = &shared.sink else { return };
         let (done, wait) = tokio::sync::oneshot::channel();
-        if tx.send(Msg::Flush(done)).await.is_ok() {
-            let _ = tokio::time::timeout(within, wait).await;
-        }
+        // A full queue and a slow collector mustn't hold shutdown past `within`.
+        let _ = tokio::time::timeout(within, async {
+            if tx.send(Msg::Flush(done)).await.is_ok() {
+                let _ = wait.await;
+            }
+        })
+        .await;
     }
 
     pub fn render(&self, out: &mut String) {
@@ -587,7 +591,7 @@ impl Span {
                 Ctx { trace, span: new_span(), sampled: shared.keep(trace) }
             }
         };
-        let state = State { ctx, parent: parent.map(|p| p.span), name: name.to_string(), attrs: Vec::new(), events: Vec::new(), error: false, end: None };
+        let state = State { ctx, parent: parent.map(|p| p.span), name: super::errors::scrub(name), attrs: Vec::new(), events: Vec::new(), error: false, end: None };
         Span(Some(Arc::new(Live { shared, kind, start: now_ns(), state: Mutex::new(state) })))
     }
 
@@ -623,7 +627,7 @@ impl Span {
     /// path as sent.
     pub fn rename(&self, name: impl Into<String>) {
         if let Some(l) = &self.0 {
-            l.state().name = name.into();
+            l.state().name = super::errors::scrub(&name.into());
         }
     }
 
@@ -898,7 +902,10 @@ mod tests {
             assert_eq!(current(), Some(rc));
             note("superbot.route_class", "bots");
             note("superbot.where", format!("ada@example.com {secret}"));
-            let c = child("tool", Kind::Internal);
+            let d = child("tool", Kind::Internal);
+            d.rename("tool ada@example.com");
+            drop(d);
+            let c = child(&format!("tool {secret}"), Kind::Internal);
             c.set("n", 3u64);
             c.set("n", 4u64);
             c.fail();
@@ -911,8 +918,9 @@ mod tests {
         drop(root);
         assert_eq!(current(), None, "outside, no current span");
         let spans = t.captured();
-        assert_eq!(spans.len(), 2, "{spans:?}");
-        let (child, root) = (&spans[0], &spans[1]);
+        assert_eq!(spans.len(), 3, "{spans:?}");
+        let (child, root) = (&spans[1], &spans[2]);
+        assert!(spans[0]["name"].as_str().is_some_and(|n| n.starts_with("tool ") && !n.contains("ada")), "names are scrubbed too: {}", spans[0]);
         assert_eq!(child["traceId"], root["traceId"]);
         assert_eq!(child["parentSpanId"], root["spanId"]);
         assert!(root.get("parentSpanId").is_none() && root["kind"] == 2 && child["kind"] == 1);

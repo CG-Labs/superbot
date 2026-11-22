@@ -93,7 +93,7 @@ Other calls to a machine's agent made during a traced request (a teammate's logi
 | `approval.check` | `superbot.tool.name`, `superbot.policy.action` (`allow`, `ask`, `deny`), `superbot.policy.class`, `superbot.approval.status`, `superbot.approval.id` |
 | `machine.job`, `{method} /v1/{call}` | `superbot.machine_id`, `superbot.job_id`, `superbot.agent.call`, `http.response.status_code` |
 
-Audit events recorded during a span appear on it as span events (`bot.token_issued`, `approval.requested`, `bot.run_finished`, ...), with their outcome and reason code. Failed runs and attempts, 5xx answers and failed machine calls are marked as errors. Health checks and the status page make no spans.
+Audit events recorded during a span appear on it as span events (`bot.token_issued`, `approval.requested`, `bot.run_finished`, ...), with their outcome and reason code. Failed runs and attempts, tool calls that end in an error (refused, blocked or failing), 5xx answers and failed machine calls are marked as errors. Health checks and the status page make no spans.
 
 A routine's or a timer's run starts its own trace.
 
@@ -109,7 +109,7 @@ Paste the id into your backend's trace search. In Grafana Tempo, TraceQL finds f
 
 ## What is never sent
 
-Attribute names are fixed in botd's code, and values are ids botd made, names from fixed lists, numbers and booleans. Tool names are kept only when they look like identifiers; anything else is `other`. Every string is scrubbed before it's sent: known secrets redacted, anything like an email replaced, at most 200 characters. No message, prompt, reply, tool input or output, file path, user id, email, name or IP address is ever in a span. The collector sees botd's IP address as the sender.
+Attribute names are fixed in botd's code, and values are ids botd made, names from fixed lists, numbers and booleans. Tool names are kept only when they look like identifiers; anything else is `other`. Every string, span names included, is scrubbed before it's sent: known secrets redacted, anything like an email replaced, at most 200 characters. No message, prompt, reply, tool input or output, file path, user id, email, name or IP address is ever in a span. The collector sees botd's IP address as the sender.
 
 ## Sampling
 

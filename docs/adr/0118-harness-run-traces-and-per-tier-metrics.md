@@ -51,13 +51,13 @@ With no endpoint, no span is made: every span is an inert `Option` and costs one
 | `machine.job` | client | the attempt, for a run on a Bot's machine | `superbot.machine_id`, `superbot.job_id` |
 | `{method} /v1/{call}` | client | whatever called the machine's agent | `http.request.method`, `superbot.agent.call`, `superbot.machine_id`, `http.response.status_code` |
 
-Each audit event recorded inside a span is added to it as a span event named by its action, with its outcome and reason code. Spans are marked as errors for 5xx answers, failed runs and attempts, and failed agent calls. Health checks and the status page make no spans. Calls to a machine's agent carry a `traceparent`, so the agent can join later; the agent and the harness CLIs don't emit spans yet.
+Each audit event recorded inside a span is added to it as a span event named by its action, with its outcome and reason code. Spans are marked as errors for 5xx answers, failed runs and attempts, tool calls that end in an error (each adapter reports them as `ToolFailed`, beside `ToolRan`), and failed agent calls. Not every harness names its calls, so a result ends the oldest open call of its tool. Health checks and the status page make no spans. Calls to a machine's agent carry a `traceparent`, so the agent can join later; the agent and the harness CLIs don't emit spans yet.
 
 A Bot's requests during a run are tied to it through the run id inside its `BOT_TOKEN` ([ADR 0083](0083-per-run-tokens.md)): botd keeps the live attempts' spans by run id and makes the request's span a child of the attempt's. Nothing from the Bot's side is trusted to pick the trace. Queued messages remember the request that queued them the same way. Both registries are bounded (4096 entries).
 
 ### What never goes in a span
 
-Attribute names are fixed strings in botd's code. Values are ids botd made (request, run, message, Bot, machine, approval), names from fixed lists (route templates, route classes, harnesses, tiers, policy classes, audit actions, results), numbers and booleans. Tool names are kept only if they look like identifiers (`Bash`, `mcp__github__search`); anything else is `other`. Every string still goes through the error reporter's scrubber (known secrets redacted, emails replaced, 200 characters at most). No message text, prompt, reply, tool input or output, file path, user id, email or name is ever set, and the HTTP tests check a run with all of those in it.
+Attribute names are fixed strings in botd's code. Values are ids botd made (request, run, message, Bot, machine, approval), names from fixed lists (route templates, route classes, harnesses, tiers, policy classes, audit actions, results), numbers and booleans. Tool names are kept only if they look like identifiers (`Bash`, `mcp__github__search`); anything else is `other`. Every string, span names included, still goes through the error reporter's scrubber (known secrets redacted, emails replaced, 200 characters at most). No message text, prompt, reply, tool input or output, file path, user id, email or name is ever set, and the HTTP tests check a run with all of those in it.
 
 ### Logs and the audit log
 

@@ -1246,11 +1246,16 @@ impl App {
                         self.with_run(&id, |r| r.status = status.clone());
                         self.send(json!({ "type": "status", "botId": id, "working": true, "status": status }));
                     }
-                    AgentEvent::ToolRan { name } => {
-                        if let Some(i) = tools.iter().position(|(t, _)| t == trace::tool_name(&name))
+                    // Not every harness names its calls, so a result ends the oldest open call of its tool.
+                    AgentEvent::ToolRan { ref name } | AgentEvent::ToolFailed { ref name } => {
+                        let ran = matches!(e, AgentEvent::ToolRan { .. });
+                        if let Some(i) = tools.iter().position(|(t, _)| t == trace::tool_name(name))
                             && let Some((_, span)) = tools.remove(i)
                         {
-                            span.set("superbot.tool.ran", true);
+                            span.set("superbot.tool.ran", ran);
+                            if !ran {
+                                span.fail();
+                            }
                         }
                     }
                     AgentEvent::Error(m) => errors.push(m),
