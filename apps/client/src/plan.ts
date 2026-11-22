@@ -30,13 +30,17 @@ export function storageLine(s: StorageUsage | undefined): string | null {
   if (!s || s.used == null) return null;
   const used = size(s.used);
   const line = s.limit == null ? `Storage: ${used} (no limit)` : `Storage: ${used} of ${size(s.limit)} (${s.percent ?? 0}%)`;
-  return s.partial ? `${line}, at least: some folders couldn't be read` : line;
+  if (s.machine?.report === "missing") return `${line}, at least: the computer hasn't said what it holds yet`;
+  if (s.partial) return `${line}, at least: some folders couldn't be read`;
+  if (s.machine?.report === "stale" && s.machine.measuredAt != null) return `${line}, as the computer said on ${day(s.machine.measuredAt)}`;
+  return line;
 }
 
 /** What to say when storage is nearly full or full, or null when it's fine. */
 export function storageWarning(s: StorageUsage | undefined): string | null {
   if (!s || s.used == null || s.limit == null) return null;
-  if (s.state === "over") return "Storage is full: new messages and tasks are refused until files are deleted from the workspace or the plan grows.";
+  const where = s.onMachine ? "on the computer Bots work on" : "from the workspace";
+  if (s.state === "over") return `Storage is full: new messages and tasks are refused until files are deleted ${where} or the plan grows.`;
   if (s.state === "warning") return `Storage is ${s.percent ?? s.warnAt}% full. At 100%, Bots stop taking new tasks until files are deleted or the plan grows.`;
   return null;
 }
