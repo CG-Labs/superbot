@@ -131,6 +131,12 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
              --idp <entra|google|oidc|github|apple|saml> --idp-provider <id> --subject <issuer|sub>
              --session <id> --on-behalf-of <user id|email> --outcome <success|failure|denied> --bot <id>
     times: YYYY-MM-DD (UTC), RFC 3339, or unix milliseconds
+  botctl retention                                 How long chat history and the audit log are kept
+                                                   (CHAT_RETENTION_DAYS, AUDIT_RETENTION_DAYS), the last
+                                                   deletion pass, and held Bots
+  botctl retention hold <bot> "<reason>"           Keep a Bot's chat out of retention (a legal hold);
+                                                   it can't be deleted while held
+  botctl retention release <bot>                   Retention applies to its chat again
   botctl machine list [<state>]                    Every user's machine (pending, running, suspended, error, ... or all)
   botctl machine show <user>                       The user's machine: provider, plan, state, address, enrollment
   botctl machine request <user> [<tier>] [<region>]  Give the user a machine (a Linode VM or an Incus container)
@@ -1218,6 +1224,9 @@ fn run(args: &[String]) -> Result<String, String> {
         [verb @ ("approve" | "deny"), id, rest @ ..] => decide(verb, id, rest),
         ["audit", "export", rest @ ..] => api(Cred::Operator, "GET", &format!("/api/audit/export.csv{}", audit_query(rest)?), None),
         ["audit", rest @ ..] => op("GET", &format!("/api/audit{}", audit_query(rest)?), None),
+        ["retention"] => op("GET", "/api/retention", None),
+        ["retention", "hold", bot, reason] => op("PUT", &format!("/api/retention/holds/{}", encode(bot)), Some(json!({ "reason": reason }).to_string())),
+        ["retention", "release", bot] => op("DELETE", &format!("/api/retention/holds/{}", encode(bot)), None),
 
         ["login", rest @ ..] => login(rest),
         ["logout"] => op("POST", "/api/auth/logout", None).map(|_| "Signed out. Unset SUPERBOT_TOKEN.".into()),

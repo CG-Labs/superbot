@@ -45,7 +45,7 @@ No. No telemetry, analytics or crash reporting; the licence key is checked offli
 Server: daily backups by default (RPO 24 hours), RTO target 1 hour, drilled in CI. Managed Incus machines: per plan, 8 to 26 hours RPO and 60 minutes RTO, checked and alerted. See [machine recovery objectives](machine-recovery-objectives.md).
 
 **How long do you keep data?**
-Sessions end after 7 days idle or 30 days. Backups are kept 14 days by default. The audit log is kept until a retention period is set. See [retention](data-flows.md#retention).
+Sessions end after 7 days idle or 30 days. Backups are kept 14 days by default. The audit log and chat history are kept until a retention period is set for each; chat retention skips Bots an admin puts on a legal hold. See [retention](data-flows.md#retention).
 
 **Can a user's data be deleted?**
 Users are disabled, not deleted, today; their sessions end at once. Teammates who leave have their OS users and homes removed from the owner's machine. Erasure for managed users is planned (M4).

@@ -418,6 +418,21 @@ Admin actions (logins, Bot and routine changes, approvals, policy, handoffs) are
 - Both installs back it up: the bash timer and the Compose `backup` service take a SQLite `.backup` of `app.sqlite`, audit table included, and keep archives for `SUPERBOT_BACKUP_RETENTION_DAYS` (default 14). So a pruned event still exists in backups for that long; shorten it too if you must erase events.
 - Source IPs: the installer's Caddy is on loopback, so `botd` trusts its `X-Forwarded-For`. Compose sets `TRUST_FORWARDED_FOR=1`, since `botd` is reachable only through Caddy.
 
+## Chat history retention
+
+Chat history (every Bot's messages, routine prompts and Bot-to-Bot messages) is kept forever by default. To delete it after a while ([ADR 0098](../docs/adr/0098-chat-retention.md)):
+
+- `CHAT_RETENTION_DAYS` in `.env`: unset or `0` keeps it forever (default). `1` to `36500` deletes older messages when `botd` starts and every 6 hours after, 500 at a time, and records `chat.pruned` in the audit log with how many went (never their text). Restart `botd` after changing it; the change is audited as `chat.retention_changed`.
+- Never deleted: a message whose run is still queued or running, and anything in or from the chat of a Bot an admin holds. Hold a Bot for a legal hold or any other reason; a held Bot, or one a held Bot wrote to, can't be deleted until the hold is released. Holds are for admins only, through `botctl` (below) or `GET /api/retention` and `PUT`/`DELETE /api/retention/holds/<bot-id>` (`{"reason": "..."}`), and are audited (`chat.hold_placed`, `chat.hold_changed`, `chat.hold_released`).
+- Backups keep deleted messages for `SUPERBOT_BACKUP_RETENTION_DAYS` (default 14), as with the audit log.
+- Not covered: each harness's own session files in the Bot's folder (`DATA_DIR/bots/<id>/`, or the Bot's folder on the user's machine), Bots' memory files, and teammates' work archived to an owner's `from-teammates/` folder. For teammates' work, `MACHINE_TEAMMATE_FILES=delete` and `ISOLATION_TEAMMATE_FILES=delete` delete it after a grace period instead of archiving it.
+
+```sh
+botctl retention                                   # settings, the last pass, held Bots
+botctl retention hold <bot-id> "Legal hold: matter 42"
+botctl retention release <bot-id>
+```
+
 ## Metrics and logs
 
 Both are off by default, and the installer and Compose don't turn them on. Design and the full list of metrics: [ADR 0089](../docs/adr/0089-metrics-and-structured-logs.md).

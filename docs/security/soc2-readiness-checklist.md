@@ -42,7 +42,7 @@ Scope: the managed service. A self-hosting customer is its own service organisat
 | CC8 Change management | 0 | 0 | 3 |
 | CC9 Risk mitigation | 0 | 1 | 3 |
 | A1 Availability | 0 | 1 | 5 |
-| C1 Confidentiality | 0 | 0 | 3 |
+| C1 Confidentiality | 0 | 1 | 2 |
 
 ## CC1: Control environment
 
@@ -161,7 +161,7 @@ Scope: the managed service. A self-hosting customer is its own service organisat
 |----|------|------|-------|---------------------|--------|-----------------|
 | C1.1-1 | Database encryption at rest | Product | Engineering lead | Encrypted database, or the operator's disk encryption recorded per host | Gap | Only secrets are sealed; chat history and the rest of the database aren't encrypted by SuperBot ([encryption at rest](data-flows.md#at-rest)). |
 | C1.1-2 | A data-classification scheme | Process | Security owner | The scheme in the policy set; data inventory | Gap | [Data flows](data-flows.md) describes what is stored where, without classes. |
-| C1.2-1 | Retention for chat history and teammates' archived work | Product | Engineering lead | Retention settings; deletion jobs; tests | Gap | The audit log and backups have retention settings ([retention](data-flows.md#retention)); chat history has none, and teammates' archived work is kept until someone deletes it. Erasure of a user's data is CC6.5-1. |
+| C1.2-1 | Retention for chat history and teammates' archived work | Product | Engineering lead | Retention settings; deletion jobs; tests | Partial | Chat history: `CHAT_RETENTION_DAYS` (off by default) deletes older messages in batches every 6 hours, never a running message or a Bot an admin holds (a legal hold, which also stops the Bot being deleted), with each pass audited as `chat.pruned` with its counts, and settings, the last pass and holds shown to admins (`botctl retention`, `GET /api/retention`) ([ADR 0098](../adr/0098-chat-retention.md), [`server/src/retention.rs`](../../server/src/retention.rs), tests in [`server/src/retention_http_tests.rs`](../../server/src/retention_http_tests.rs)). The audit log and backups have their own settings ([retention](data-flows.md#retention)). Left: teammates' work archived to an owner's `from-teammates/` folder is kept until someone deletes it (`*_TEAMMATE_FILES=delete` deletes it instead of archiving), and harness session files in each Bot's folder aren't covered. Erasure of a user's data is CC6.5-1. |
 
 ## Before engaging an auditor
 
