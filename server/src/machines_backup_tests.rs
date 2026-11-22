@@ -195,6 +195,8 @@ async fn a_machine_is_backed_up_off_host_and_restored_to_enroll_anew() {
     let certs_before = env.app.db.machine_pins(&m.id);
     assert!(!certs_before.is_empty());
     let r = restore_until(&env, &uid, json!({ "backupId": b.id }), "enrolling").await;
+    // Enrolling starts just before the copy boots.
+    until("the copy to boot", || env.incus.instance(&m.label).is_some_and(|i| i.status == "Running")).await;
     let i = env.incus.instance(&m.label).unwrap();
     assert!(env.incus.instance(&format!("{}-restore", m.label)).is_none(), "the copy took the old one's place");
     assert_eq!((i.status.as_str(), read(&env, &m.label, "/home/user/notes.txt").as_deref()), ("Running", Some("version 1")));
