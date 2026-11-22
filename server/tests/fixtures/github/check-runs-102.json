@@ -1,0 +1,62 @@
+{
+  "total_count": 3,
+  "check_runs": [
+    {
+      "id": 10,
+      "name": "docs",
+      "head_sha": "a102a102a102a102a102a102a102a102a102a102",
+      "status": "completed",
+      "conclusion": "failure",
+      "started_at": "2026-10-19T08:00:00Z",
+      "completed_at": "2026-10-19T08:05:00Z",
+      "html_url": "https://github.com/example-org/example-repo/actions/runs/10/job/10",
+      "app": {
+        "id": 15368,
+        "slug": "github-actions",
+        "name": "GitHub Actions"
+      },
+      "output": {
+        "title": null,
+        "summary": "log text never kept"
+      }
+    },
+    {
+      "id": 11,
+      "name": "docs",
+      "head_sha": "a102a102a102a102a102a102a102a102a102a102",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-20T13:00:00Z",
+      "completed_at": "2026-10-20T13:05:00Z",
+      "html_url": "https://github.com/example-org/example-repo/actions/runs/11/job/11",
+      "app": {
+        "id": 15368,
+        "slug": "github-actions",
+        "name": "GitHub Actions"
+      },
+      "output": {
+        "title": null,
+        "summary": "log text never kept"
+      }
+    },
+    {
+      "id": 12,
+      "name": "rust",
+      "head_sha": "a102a102a102a102a102a102a102a102a102a102",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-20T13:00:00Z",
+      "completed_at": "2026-10-20T13:20:00Z",
+      "html_url": "https://github.com/example-org/example-repo/actions/runs/12/job/12",
+      "app": {
+        "id": 15368,
+        "slug": "github-actions",
+        "name": "GitHub Actions"
+      },
+      "output": {
+        "title": null,
+        "summary": "log text never kept"
+      }
+    }
+  ]
+}

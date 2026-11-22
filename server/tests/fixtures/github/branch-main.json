@@ -1,0 +1,23 @@
+{
+  "name": "main",
+  "commit": {
+    "sha": "b102b102b102b102b102b102b102b102b102b102"
+  },
+  "protected": true,
+  "protection": {
+    "enabled": true,
+    "required_status_checks": {
+      "enforcement_level": "non_admins",
+      "contexts": [
+        "rust"
+      ],
+      "checks": [
+        {
+          "context": "rust",
+          "app_id": 15368
+        }
+      ]
+    }
+  },
+  "protection_url": "https://api.github.com/repos/example-org/example-repo/branches/main/protection"
+}

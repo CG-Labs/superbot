@@ -1,0 +1,181 @@
+//! superbot-evidence: exports SOC 2 change-management evidence from GitHub (ADR 0148).
+//! For a period, every pull request merged into the branch with its reviews, approvers,
+//! required checks and merge commit, the commits that reached the branch without one, the
+//! branch's protection, and every CI run on the branch, as a dated bundle with SHA-256
+//! digests beside botd's evidence bundles (ADR 0142).
+//!
+//! Reads GitHub only, with a token from `GITHUB_TOKEN` (or `GH_TOKEN`), never from the
+//! command line. Run by the `change-evidence` workflow each month, or by an operator.
+
+mod changes;
+mod github;
+#[path = "../../evidence_period.rs"]
+mod period;
+#[path = "../../ustar.rs"]
+mod ustar;
+
+use std::io::Write;
+use std::process::ExitCode;
+
+const USAGE: &str = "superbot-evidence: SOC 2 change-management evidence from GitHub (ADR 0148).
+
+  superbot-evidence github --repo <owner/name> [--branch <name>]
+                    [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>] [--no-titles]
+
+Writes one bundle for the period (whole UTC days, --to not included; neither: last month):
+every pull request merged into the branch (default: the repository's default branch) with
+its reviews, approvers, checks and merge commit; commits that reached the branch without a
+merged pull request; the branch's protection now; and every GitHub Actions run on the
+branch. With a manifest and SHA256SUMS. Never overwrites a file. --no-titles leaves pull
+request titles out.
+
+Needs a read-only token in GITHUB_TOKEN (or GH_TOKEN): a fine-grained token with read
+access to Metadata, Contents, Pull requests, Actions, Checks and Commit statuses, plus
+Administration to include classic branch protection; or the workflow's own token.
+GITHUB_API_URL points at GitHub Enterprise Server (default https://api.github.com).";
+
+struct Args {
+    repo: String,
+    branch: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    out: Option<String>,
+    titles: bool,
+}
+
+fn parse(args: &[String]) -> Result<Args, String> {
+    let Some(("github", rest)) = args.split_first().map(|(c, r)| (c.as_str(), r)) else { return Err(USAGE.into()) };
+    let mut a = Args { repo: String::new(), branch: None, from: None, to: None, out: None, titles: true };
+    let mut it = rest.iter();
+    while let Some(flag) = it.next() {
+        if flag == "--no-titles" {
+            a.titles = false;
+            continue;
+        }
+        if matches!(flag.as_str(), "--token" | "-t") {
+            return Err("Pass the token in GITHUB_TOKEN, never on the command line, where other users and shell history see it.".into());
+        }
+        let slot = match flag.as_str() {
+            "--repo" => &mut a.repo,
+            "--branch" => a.branch.get_or_insert_with(String::new),
+            "--from" => a.from.get_or_insert_with(String::new),
+            "--to" => a.to.get_or_insert_with(String::new),
+            "-o" | "--out" => a.out.get_or_insert_with(String::new),
+            _ => return Err(format!("Unknown option {flag}.\n\n{USAGE}")),
+        };
+        if !slot.is_empty() {
+            return Err(format!("{flag} is given twice"));
+        }
+        *slot = it.next().filter(|v| !v.starts_with("--") && !v.is_empty()).ok_or(format!("{flag} needs a value"))?.clone();
+    }
+    if !changes::valid_repo(&a.repo) {
+        return Err(format!("--repo must be owner/name.\n\n{USAGE}"));
+    }
+    if a.branch.as_deref().is_some_and(|b| !changes::valid_branch(b)) {
+        return Err("--branch must be a plain branch name (letters, digits, . _ - /)".into());
+    }
+    Ok(a)
+}
+
+/// The token, from the environment only; never echoed.
+fn token(get: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+    ["GITHUB_TOKEN", "GH_TOKEN"]
+        .iter()
+        .find_map(|k| get(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()))
+        .ok_or_else(|| "Set GITHUB_TOKEN (or GH_TOKEN) to a read-only GitHub token. See superbot-evidence --help.".into())
+}
+
+/// Writes a new file only its owner can read; never over an existing one.
+fn save_private(path: &str, bytes: &[u8]) -> Result<(), String> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(path).and_then(|mut f| f.write_all(bytes).and_then(|_| f.sync_all())).map_err(|e| format!("{path}: {e}"))
+}
+
+fn quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn hint(f: &github::Failure) -> String {
+    match f.status {
+        401 => format!("{}\nThe token was refused: check GITHUB_TOKEN.", f.message),
+        403 | 404 => format!("{}\nThe token can't read this. It needs read access to the repository's Metadata, Contents, Pull requests, Actions, Checks and Commit statuses.", f.message),
+        _ => f.message.clone(),
+    }
+}
+
+fn run(args: &[String]) -> Result<String, String> {
+    if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help" | "help") {
+        return Ok(USAGE.into());
+    }
+    let a = parse(args)?;
+    let now = chrono::Utc::now();
+    let p = period::Period::parse(a.from.as_deref(), a.to.as_deref(), now.date_naive())?;
+    let token = token(&|k| std::env::var(k).ok())?;
+    let base = std::env::var("GITHUB_API_URL").unwrap_or_default();
+    let mut gh = github::GitHub::new(&base, &token)?;
+    let opts = changes::Options { repo: a.repo.clone(), branch: a.branch.clone(), period: p, titles: a.titles };
+    let c = changes::collect(&mut gh, &opts).map_err(|f| hint(&f))?;
+    if gh.scopes.as_deref().is_some_and(changes::can_write) {
+        eprintln!("Warning: this token can write ({}). Use a fine-grained token with read-only access.", gh.scopes.as_deref().unwrap_or_default());
+    }
+    let src = changes::Source { api_host: gh.host(), requests: gh.requests, scopes: gh.scopes.clone() };
+    let b = changes::build(&c, &p, &src, now.timestamp_millis());
+    if b.tar.windows(token.len()).any(|w| w == token.as_bytes()) {
+        return Err("The bundle would contain the token, so it wasn't written.".into());
+    }
+    let file = a.out.clone().unwrap_or_else(|| format!("{}.tar", b.name));
+    save_private(&file, &b.tar)?;
+    Ok(format!(
+        "Saved {file} ({} KB) for {} from {} to {} (not included), in {} requests.\n{}\nManifest SHA-256: {}\nBundle SHA-256: {}\nKeep it in the evidence store; to check it:\n  tar -xf {} && (cd {} && sha256sum -c SHA256SUMS)",
+        b.tar.len().div_ceil(1024),
+        c.repo["fullName"].as_str().unwrap_or(&a.repo),
+        p.from,
+        p.to,
+        gh.requests,
+        changes::summary(&c),
+        b.manifest_sha256,
+        b.sha256,
+        quote(&file),
+        quote(&b.name),
+    ))
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match run(&args) {
+        Ok(out) => {
+            println!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn options_and_the_token_only_from_the_environment() {
+        let a = parse(&args(&["github", "--repo", "o/r", "--from", "2026-10-01", "--to", "2026-11-01", "-o", "x.tar", "--no-titles", "--branch", "main"])).unwrap();
+        assert_eq!((a.repo.as_str(), a.branch.as_deref(), a.from.as_deref(), a.to.as_deref(), a.out.as_deref(), a.titles), ("o/r", Some("main"), Some("2026-10-01"), Some("2026-11-01"), Some("x.tar"), false));
+        for bad in [&["github"][..], &["github", "--repo", "nope"], &["github", "--repo", "o/r", "--repo", "o/s"], &["github", "--repo", "o/r", "--from"], &["github", "--repo", "o/r", "--bogus", "x"], &["gitlab", "--repo", "o/r"], &["github", "--repo", "o/r", "--branch", "a b"]] {
+            assert!(parse(&args(bad)).is_err(), "{bad:?}");
+        }
+        let e = parse(&args(&["github", "--repo", "o/r", "--token", "ghp_x"])).err().unwrap();
+        assert!(e.contains("GITHUB_TOKEN") && !e.contains("ghp_x"), "{e}");
+        assert_eq!(token(&|k| (k == "GH_TOKEN").then(|| " t1 ".into())).unwrap(), "t1");
+        assert_eq!(token(&|k| Some(if k == "GITHUB_TOKEN" { "t2" } else { "t1" }.into())).unwrap(), "t2");
+        assert!(token(&|_| Some("  ".into())).is_err());
+    }
+}
