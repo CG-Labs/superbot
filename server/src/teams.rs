@@ -918,6 +918,8 @@ pub async fn update(State(app): State<AppState>, Extension(by): Extension<Who>, 
 pub async fn delete(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     let t = need_team(&app, &id)?;
     if let Some(p) = app.db.residency_pin(crate::db::PinOn::Team, &t.id) {
+        let d = json!({ "reason": crate::machines::residency::PINNED, "pinnedRegion": p.region, "reference": p.reference });
+        app.db.record(&team_event(&by, "team.delete_refused", &t.id, d).outcome(Outcome::Denied));
         return Err(conflict(format!(
             "Team {}'s data is pinned to {} ({}). Unpin it first, with a reason (botctl team residency ... unpin) (ADR 0129).",
             t.name, p.region, p.reference

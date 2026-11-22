@@ -225,6 +225,7 @@ async fn a_pinned_team_keeps_members_and_its_region_in_it_and_cant_be_deleted_un
     // Pinned teams aren't deleted; unpinning needs a reason, then both work.
     let (code, v) = call_json(port, "DELETE", &format!("/api/teams/{team}"), &admin, "").await;
     assert!(code == 409 && v["error"].as_str().unwrap().contains("Unpin it first"), "{v}");
+    assert_eq!(audit(port, &admin, "team.delete_refused").await[0]["details"]["reason"].as_str(), Some("residency_pinned"));
     assert_eq!(call(port, "DELETE", &path, &admin, "{}").await.0, 400);
     let (code, v) = call_json(port, "DELETE", &path, &admin, r#"{"reason":"moved to the EU contract"}"#).await;
     assert_eq!((code, v["residency"].clone(), v["region"].as_str()), (200, Value::Null, Some("de-fra-2")), "{v}");
