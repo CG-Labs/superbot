@@ -255,9 +255,9 @@ impl Inner {
         let v: Value = serde_json::from_slice(&body).map_err(|e| unavailable(&id, e))?;
         let data = v["payload"]["data"].as_str().ok_or_else(|| Error::Unavailable(format!("GCP Secret Manager: {id} gave an answer with no payload")))?;
         let bytes = Zeroizing::new(STANDARD.decode(data).map_err(|e| unavailable(&id, e))?);
-        if let Some(want) = http::seconds(&v["payload"]["dataCrc32c"])
-            && u64::from(crc32c(&bytes)) != want
-        {
+        // Secret Manager stores a checksum with every version and sends it on each access.
+        let want = http::seconds(&v["payload"]["dataCrc32c"]).ok_or_else(|| Error::Unavailable(format!("GCP Secret Manager: {id} gave an answer with no valid CRC32C")))?;
+        if u64::from(crc32c(&bytes)) != want {
             return Err(Error::Unavailable(format!("GCP Secret Manager: {id} arrived corrupted (CRC32C mismatch)")));
         }
         let text = std::str::from_utf8(&bytes).map_err(|_| Error::Unavailable(format!("GCP Secret Manager: {id} isn't UTF-8 text")))?;
@@ -275,17 +275,28 @@ impl Inner {
             }
             let body = self.get(&path, &q, "listing secrets").await?.ok_or_else(|| Error::Unavailable("GCP Secret Manager: listing secrets answered 404; check GCP_SECRET_MANAGER_PROJECT".into()))?;
             let v: Value = serde_json::from_slice(&body).map_err(|e| unavailable("listing secrets", e))?;
+            // An empty project answers `{}`; anything else odd fails closed, rather than
+            // passing as a list without the names botd needs.
+            let odd = || Error::Unavailable("GCP Secret Manager: listing secrets gave an answer that isn't a list of secrets".into());
             if !v.is_object() {
-                return Err(Error::Unavailable("GCP Secret Manager: listing secrets gave no list".into()));
+                return Err(odd());
             }
-            for s in v["secrets"].as_array().into_iter().flatten() {
-                if let Some(name) = s["name"].as_str().and_then(|n| n.rsplit_once("/secrets/")).and_then(|(_, id)| self.name_in(scope, id)) {
+            let secrets = match &v["secrets"] {
+                Value::Null => &Vec::new(),
+                Value::Array(a) => a,
+                _ => return Err(odd()),
+            };
+            for s in secrets {
+                let name = s["name"].as_str().and_then(|n| n.rsplit_once("/secrets/")).ok_or_else(odd)?.1;
+                if let Some(name) = self.name_in(scope, name) {
                     out.push(name);
                 }
             }
-            match v["nextPageToken"].as_str().filter(|t| !t.is_empty()) {
-                Some(t) => page_token = t.to_string(),
-                None => return Ok(out),
+            match &v["nextPageToken"] {
+                Value::Null => return Ok(out),
+                Value::String(t) if t.is_empty() => return Ok(out),
+                Value::String(t) => page_token = t.clone(),
+                _ => return Err(odd()),
             }
         }
         Err(Error::Unavailable("GCP Secret Manager: listing secrets ran past 1000 pages".into()))
@@ -360,6 +371,10 @@ mod tests {
         reads: AtomicUsize,
         down: AtomicBool,
         corrupt: AtomicBool,
+        /// 1: no checksum, 2: a checksum that isn't a number.
+        checksum: AtomicUsize,
+        /// 1: `secrets` isn't a list, 2: `nextPageToken` isn't a string.
+        odd_list: AtomicUsize,
         expires_in: AtomicUsize,
         /// The service account's public key, to check the JWTs it signs.
         public_key: Mutex<Vec<u8>>,
@@ -426,10 +441,20 @@ mod tests {
             return match found {
                 Some(bytes) => {
                     let crc = crc32c(&bytes) ^ u32::from(f.corrupt.load(Ordering::SeqCst));
-                    (StatusCode::OK, Json(json!({ "name": format!("{secret}/versions/3"), "payload": { "data": STANDARD.encode(&bytes), "dataCrc32c": crc.to_string() } })))
+                    let crc = match f.checksum.load(Ordering::SeqCst) {
+                        1 => Value::Null,
+                        2 => json!("invalid"),
+                        _ => json!(crc.to_string()),
+                    };
+                    (StatusCode::OK, Json(json!({ "name": format!("{secret}/versions/3"), "payload": { "data": STANDARD.encode(&bytes), "dataCrc32c": crc } })))
                 }
                 None => (StatusCode::NOT_FOUND, Json(json!({ "error": { "code": 404, "status": "NOT_FOUND", "message": "x" } }))),
             };
+        }
+        match f.odd_list.load(Ordering::SeqCst) {
+            1 => return (StatusCode::OK, Json(json!({ "secrets": "invalid" }))),
+            2 => return (StatusCode::OK, Json(json!({ "secrets": [], "nextPageToken": 7 }))),
+            _ => {}
         }
         let parent = rest.strip_suffix("/secrets").unwrap_or(&rest);
         let mut ids: Vec<String> = f.secrets.lock().unwrap().keys().filter_map(|k| k.strip_prefix(&format!("{parent}/secrets/")).map(String::from)).collect();
@@ -556,6 +581,19 @@ mod tests {
         f.corrupt.store(true, Ordering::SeqCst);
         let e = secrets.get("CRC_TOKEN").unwrap_err().to_string();
         assert!(e.contains("CRC32C"), "{e}");
+        f.corrupt.store(false, Ordering::SeqCst);
+        for mode in [1, 2] {
+            f.checksum.store(mode, Ordering::SeqCst);
+            let e = secrets.get("CRC_TOKEN").unwrap_err().to_string();
+            assert!(e.contains("no valid CRC32C"), "a missing or malformed checksum fails closed: {e}");
+        }
+        f.checksum.store(0, Ordering::SeqCst);
+        for mode in [1, 2] {
+            f.odd_list.store(mode, Ordering::SeqCst);
+            let e = s.check().unwrap_err().to_string();
+            assert!(e.contains("isn't a list of secrets"), "an odd list fails closed: {e}");
+        }
+        f.odd_list.store(0, Ordering::SeqCst);
         f.down.store(true, Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(250));
         assert!(matches!(secrets.get("DOWN_API_KEY"), Err(Error::Unavailable(_))), "never the sealed value under it");

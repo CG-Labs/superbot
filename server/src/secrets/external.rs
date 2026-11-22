@@ -359,8 +359,9 @@ fn diagnose(x: Option<&ExternalStore>) -> serde_json::Value {
             "detail": "Local: secrets come from the environment and the sealed store. SECRETS_BACKEND=vault, azure-keyvault or gcp-secret-manager adds an external one (ADR 0125, ADR 0136).",
         });
     };
-    let (ok, names, detail) = match x.names() {
-        Ok(n) => (true, Some(n.len()), format!("{} answers: {} names in its bots and server folders.", x.kind(), n.len())),
+    // Straight from the backend, not the cache: whether it answers now.
+    let (ok, names, detail) = match x.check() {
+        Ok(n) => (true, Some(n), format!("{} answers: {n} names in its bots and server folders.", x.kind())),
         Err(e) => (false, None, format!("{} can't be read: {e}. Bot runs are refused until it answers (fail closed).", x.kind())),
     };
     json!({ "backend": x.kind(), "description": x.describe(), "cacheSeconds": x.ttl.as_secs(), "ok": ok, "names": names, "detail": detail })
@@ -540,11 +541,18 @@ pub(crate) mod tests {
 
     #[test]
     fn cloud_credentials_never_reach_bots() {
-        for name in ["AZURE_CLIENT_SECRET", "IDENTITY_HEADER", "GCP_SERVICE_ACCOUNT_KEY"] {
+        for name in ["AZURE_CLIENT_SECRET", "AZURE_FEDERATED_TOKEN", "IDENTITY_HEADER", "GCP_SERVICE_ACCOUNT_KEY"] {
             assert!(super::super::check_name(name).is_err(), "{name} is reserved");
             assert_eq!(scope_of(name), None, "{name} is never read from an external store");
             let s = super::super::Secrets::new(vec![Box::new(super::super::env::EnvStore::fixed(&[(name, "cloud-credential-0123456789")]))]);
             assert!(s.harness_env().is_empty() && s.inherited_harness_env().is_empty() && s.list().unwrap().is_empty(), "{name}");
+        }
+        // Files too: `NAME_FILE` is offered to Bots as `NAME`, read from the file.
+        let file = crate::db::temp_path("cloud-creds").join("token");
+        std::fs::write(&file, "federated-assertion-0123456789\n").unwrap();
+        for var in ["AZURE_FEDERATED_TOKEN_FILE", "AZURE_CLIENT_SECRET_FILE", "GCP_SERVICE_ACCOUNT_KEY_FILE"] {
+            let s = super::super::Secrets::new(vec![Box::new(super::super::env::EnvStore::fixed(&[(var, file.to_str().unwrap())]))]);
+            assert!(s.try_harness_env().unwrap().is_empty() && s.try_inherited_harness_env().unwrap().is_empty(), "{var}");
         }
         let host = crate::adapters::local_host();
         for k in ["AZURE_CLIENT_SECRET", "AZURE_CLIENT_SECRET_FILE", "AZURE_FEDERATED_TOKEN_FILE", "IDENTITY_HEADER", "GCP_SERVICE_ACCOUNT_KEY", "GCP_SERVICE_ACCOUNT_KEY_FILE"] {
@@ -556,6 +564,10 @@ pub(crate) mod tests {
     fn diagnostics_say_whether_the_backend_answers_never_values() {
         assert_eq!(diagnose(None)["backend"], "local");
         let (f, s) = fake(&[(Scope::Bots, "DIAG_TOKEN", "diag-value-1")], Duration::ZERO);
+        let (f2, cached) = fake(&[(Scope::Bots, "DIAG_TOKEN", "diag-value-1")], Duration::from_secs(3600));
+        cached.names().unwrap();
+        f2.down.store(true, Ordering::SeqCst);
+        assert_eq!(diagnose(Some(&cached))["ok"], false, "an outage shows even while names are cached");
         let d = diagnose(Some(&s));
         assert_eq!((d["backend"].as_str(), d["ok"].as_bool(), d["names"].as_u64()), (Some("fake"), Some(true), Some(1)));
         f.down.store(true, Ordering::SeqCst);

@@ -70,7 +70,7 @@ On Azure, `_` becomes `-`. botd's names never contain `-`, so the mapping is rev
 As with Vault, only "there is no such secret" lets the next store answer. Everything else is `Error::Unavailable`, so it can't uncover a sealed copy:
 
 - **Not there** (`None`): Key Vault's 404 (including a soft-deleted secret), Secret Manager's 404 (no such secret, or no versions), or an empty value.
-- **Error**: a disabled Key Vault secret (403), a disabled or destroyed latest version on Google (400 `FAILED_PRECONDITION`), any other refusal or 5xx, a reply without a value, a payload whose CRC32C doesn't match, a payload that isn't UTF-8, a Key Vault list page that points to another host, and a list longer than 1000 pages.
+- **Error**: a disabled Key Vault secret (403), a disabled or destroyed latest version on Google (400 `FAILED_PRECONDITION`), any other refusal or 5xx, a reply without a value, a payload whose CRC32C is missing, malformed or doesn't match, a payload that isn't UTF-8, a list reply of the wrong shape, a Key Vault list page that points to another host, and a list longer than 1000 pages.
 
 To retire a key, delete it. Disabling it stops Bot runs until it is deleted or enabled again, which is louder, but never serves a value the operator meant to replace.
 
@@ -87,12 +87,12 @@ The runtime, request permits and abandoned-request skipping that Vault's client 
 ### Diagnostics
 
 - **Startup**: settings are checked when botd starts, and both folders are listed, as for Vault. botd won't start on a bad setting or a backend it can't reach or sign in to. Settings for a backend other than the one chosen (`AZURE_KEYVAULT_URL` with `SECRETS_BACKEND=local`, say) are named in a warning.
-- **Setup report**: `GET /api/setup` has `secretsBackend`: which backend, its description, its cache time, whether it answers now and how many names it has, or why not.
+- **Setup report**: `GET /api/setup` has `secretsBackend`: which backend, its description, its cache time, whether it answers now (asked straight from the backend, not the cache) and how many names it has, or why not.
 - **botctl**: `botctl secrets backend` prints that and exits non-zero when the backend doesn't answer. `botctl setup` mentions a backend that doesn't answer.
 
 ### Keeping the credentials from Bots
 
-`AZURE_CLIENT_SECRET`, `IDENTITY_HEADER` and `GCP_SERVICE_ACCOUNT_KEY` are reserved. They can't be saved as Bot secrets and are never read from an external store. They, their `_FILE` variables, and `AZURE_FEDERATED_TOKEN_FILE` are removed from the environment of every harness, screen and job botd starts.
+`AZURE_CLIENT_SECRET`, `AZURE_FEDERATED_TOKEN`, `IDENTITY_HEADER` and `GCP_SERVICE_ACCOUNT_KEY` are reserved, so a `_FILE` setting such as `AZURE_FEDERATED_TOKEN_FILE` is never offered to Bots under its stem either. They can't be saved as Bot secrets and are never read from an external store. They, their `_FILE` variables, and `AZURE_FEDERATED_TOKEN_FILE` are removed from the environment of every harness, screen and job botd starts.
 
 ## Consequences
 
