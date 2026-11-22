@@ -220,7 +220,7 @@ pub(super) fn restore_move(app: &App, cp: &ControlPlane, m: &Machine, host: Opti
     let from = machine_host(h, m).unwrap_or_else(|| h.host_of(&m.label));
     let to = match host {
         Some(t) => t.to_string(),
-        None if h.status(&from) == Some(HostStatus::Lost) => placement::choose(app, cp, &m.plan, Some(&from))
+        None if h.status(&from) == Some(HostStatus::Lost) => placement::choose(app, cp, &m.plan, &m.region, Some(&from))
             .map_err(|why| conflict(format!("Its host {from} was declared lost, and there's nowhere to restore it. {why}")))?,
         None => from.clone(),
     };
@@ -237,7 +237,7 @@ pub(super) fn restore_move(app: &App, cp: &ControlPlane, m: &Machine, host: Opti
         )));
     }
     if to != from {
-        placement::fits(app, cp, &m.plan, &to).map_err(conflict)?;
+        placement::fits(app, cp, &m.plan, &m.region, &to).map_err(conflict)?;
     }
     Ok(Move { from: Some(from), to: Some(to), reason: None })
 }
@@ -264,6 +264,7 @@ pub fn view(app: &App, cp: &ControlPlane) -> Option<Value> {
                 None => json!({ "name": c.name, "url": c.url, "fingerprint": c.fingerprint, "state": c.status, "configured": true, "machines": on(app, cp, h, &c.name).len() }),
             };
             v["load"] = loads.iter().find(|l| l.name == c.name).map_or(Value::Null, |l| l.view());
+            v["region"] = json!(c.region);
             v
         })
         .collect();
@@ -271,12 +272,22 @@ pub fn view(app: &App, cp: &ControlPlane) -> Option<Value> {
     rest.sort_by_key(|r| (r.created_at, r.name.clone()));
     out.extend(rest.into_iter().map(|r| row_view(app, cp, h, r, false)));
     let mut v = json!({ "hosts": out, "policy": h.policy(), "downMinutes": h.down_after_ms() / 60_000 });
-    if let Some((tier, plan)) = cp.tiers.first() {
-        match placement::choose(app, cp, plan, None) {
+    if let (Some((tier, plan)), Some(region)) = (cp.tiers.first(), cp.regions.first()) {
+        match placement::choose(app, cp, plan, region, None) {
             Ok(host) => v["placement"] = json!(host),
             Err(why) => (v["placement"], v["placementRefused"]) = (Value::Null, json!(why)),
         }
-        v["placementFor"] = json!({ "tier": tier, "plan": plan });
+        v["placementFor"] = json!({ "tier": tier, "plan": plan, "region": region });
+        if h.tagged() {
+            v["regions"] = json!(cp
+                .regions
+                .iter()
+                .map(|r| match placement::choose(app, cp, plan, r, None) {
+                    Ok(host) => json!({ "region": r, "placement": host }),
+                    Err(why) => json!({ "region": r, "placement": null, "placementRefused": why }),
+                })
+                .collect::<Vec<_>>());
+        }
     }
     Some(v)
 }
@@ -474,8 +485,8 @@ pub async fn recover(
             Some(b) => {
                 // Each placed with the ones before it counted, so a host isn't filled past its room.
                 let target = match &to {
-                    Some(t) => placement::fits(&app, cp, &m.plan, t).map(|()| t.clone()),
-                    None => placement::choose(&app, cp, &m.plan, Some(&name)),
+                    Some(t) => placement::fits(&app, cp, &m.plan, &m.region, t).map(|()| t.clone()),
+                    None => placement::choose(&app, cp, &m.plan, &m.region, Some(&name)),
                 };
                 let t = match target {
                     Ok(t) => t,

@@ -153,7 +153,7 @@ fn member_view(app: &AppState, m: &TeamMember, machines: bool) -> Value {
 /// The team as a member sees it; with `manager`, teammates' machines and invites too.
 fn team_view(app: &AppState, t: &Team, me: Option<&TeamMember>, manager: bool) -> Value {
     let members: Vec<Value> = app.db.team_members(&t.id).iter().map(|m| member_view(app, m, manager)).collect();
-    let mut v = json!({ "id": t.id, "name": t.name, "machines": t.machines, "createdAt": t.created_at, "members": members });
+    let mut v = json!({ "id": t.id, "name": t.name, "machines": t.machines, "region": t.region, "createdAt": t.created_at, "members": members });
     if let Some(me) = me {
         v["role"] = json!(me.role);
     }
@@ -265,6 +265,13 @@ fn ours(app: &AppState, team_id: &str, m: &crate::db::Machine) -> bool {
 async fn join(app: &AppState, by: &Who, team: &Team, user: &User, role: &str, via: &str) -> Res<Value> {
     if !user.active() && via != SCIM {
         return Err(conflict("This person is disabled. Enable them first."));
+    }
+    // Their data region becomes the team's (ADR 0117): never while their machine is elsewhere.
+    if control_plane(app).is_some()
+        && let Err(why) = crate::machines::region::check_join(app, team, user)
+    {
+        app.db.record(&team_event(by, "team.join_refused", &team.id, json!({ "user": user.id, "reason": "data_region", "via": via, "region": team.region })).outcome(Outcome::Denied));
+        return Err(conflict(why));
     }
     let tier = app.tier_of(&user.id).name.clone();
     if !app.db.add_team_member(&team.id, &user.id, role, by.actor.id.as_deref()) {

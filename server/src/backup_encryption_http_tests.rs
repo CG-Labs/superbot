@@ -34,7 +34,7 @@ fn machines(recipients: &str) -> backup::Settings {
         ("MACHINE_BACKUP_S3_SECRET_ACCESS_KEY", "example-secret-0123456789"),
         ("MACHINE_BACKUP_AGE_RECIPIENTS", recipients),
     ];
-    backup::Settings::from_env(&secrets::env::EnvStore::fixed(&pairs), &env_of(&pairs), &[]).unwrap().unwrap()
+    backup::Settings::from_env(&secrets::env::EnvStore::fixed(&pairs), &env_of(&pairs), &[], &[]).unwrap().unwrap()
 }
 
 /// A store of the server's own, encrypting plain archives to `recipients` (may be empty).

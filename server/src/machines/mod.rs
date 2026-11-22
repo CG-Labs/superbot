@@ -33,6 +33,7 @@ pub mod pki;
 pub mod provider;
 pub mod rebuild;
 pub mod recovery;
+pub mod region;
 pub mod resize;
 pub mod route;
 pub mod runas;
@@ -308,7 +309,7 @@ impl ControlPlane {
     ) -> Result<ControlPlane, String> {
         let mut cp = ControlPlane::provider_from_env(store, &var)?;
         let tiers: Vec<String> = cp.tiers.iter().map(|(t, _)| t.clone()).collect();
-        if let Some(s) = backup::Settings::from_env(store, &var, &tiers)? {
+        if let Some(s) = backup::Settings::from_env(store, &var, &tiers, &cp.regions)? {
             let p = cp.provider.as_deref().ok_or(format!("MACHINE_BACKUP_S3_BUCKET needs the control plane: {NEEDS_IT}"))?;
             if !p.exports() {
                 return Err(format!(
@@ -366,7 +367,9 @@ impl ControlPlane {
     /// INCUS_* certificates are needed, and so are MACHINE_CONTROL_URL and
     /// MACHINE_FIREWALL=on, since the firewall is what keeps a container off its
     /// neighbours and private addresses. MACHINE_REGIONS is optional: `local` for a
-    /// lone host, cluster member names otherwise.
+    /// lone host, cluster member names otherwise. With hosts tagged by data region
+    /// (INCUS_REGION, ADR 0117), it is the tags in host order unless set, and each
+    /// region it lists must have a host.
     fn incus_from_env(store: &dyn SecretStore, var: &dyn Fn(&str) -> String) -> Result<ControlPlane, String> {
         if store.get("LINODE_TOKEN").map_err(|e| e.to_string())?.is_some() {
             return Err("MACHINE_PROVIDER=incus and LINODE_TOKEN are both set; a control plane uses one provider".into());
@@ -378,13 +381,32 @@ impl ControlPlane {
             return Err("MACHINE_PROVIDER=incus needs MACHINE_FIREWALL=on: the firewall is what keeps containers off each other, the host, and private addresses".into());
         }
         let p = incus::fleet::Fleet::from_env(store, var)?;
+        let mut tags: Vec<String> = Vec::new();
+        for r in provider::Hosts::configured(&p).into_iter().filter_map(|h| h.region) {
+            if !tags.contains(&r) {
+                tags.push(r);
+            }
+        }
         let mut cp = ControlPlane::configured(Arc::new(p), var)?;
         cp.regions = list(&var("MACHINE_REGIONS"));
-        if cp.regions.is_empty() {
-            cp.regions = vec![incus::LOCAL.into()];
+        if tags.is_empty() {
+            if cp.regions.is_empty() {
+                cp.regions = vec![incus::LOCAL.into()];
+            }
+            if let Some(r) = cp.regions.iter().find(|r| !slug(r, 32)) {
+                return Err(format!("MACHINE_REGIONS: \"{r}\" isn't a cluster member name"));
+            }
+            return Ok(cp);
         }
-        if let Some(r) = cp.regions.iter().find(|r| !slug(r, 32)) {
-            return Err(format!("MACHINE_REGIONS: \"{r}\" isn't a cluster member name"));
+        if cp.regions.is_empty() {
+            cp.regions = tags.clone();
+        }
+        if let Some(r) = cp.regions.iter().find(|r| !tags.contains(r)) {
+            return Err(format!(
+                "MACHINE_REGIONS: no Incus host is in \"{}\"; hosts are in {} (INCUS_REGION, INCUS_REGION_<NAME>)",
+                crate::audit::clip(r, 32),
+                tags.join(", ")
+            ));
         }
         Ok(cp)
     }
@@ -587,10 +609,11 @@ impl ControlPlane {
         match &self.provider {
             None => format!("off ({NEEDS_IT} for one machine per user)"),
             Some(p) => format!(
-                "{} ({}s), regions {}, tiers {}, backups {}, off-host backups {}, routing {}, enrollment {}, firewall {}",
+                "{} ({}s), regions {}{}, tiers {}, backups {}, off-host backups {}, routing {}, enrollment {}, firewall {}",
                 p.name(),
                 p.substrate(),
-                self.regions.join(", "),
+                self.regions.first().map_or(String::new(), |r| format!("{r} (default)")),
+                self.regions.iter().skip(1).map(|r| format!(", {r}")).collect::<String>(),
                 self.tiers
                     .iter()
                     .map(|(t, p)| format!("{t}={p}"))
@@ -659,6 +682,10 @@ fn system(m: &Machine) -> Who {
 
 fn observe(cp: &ControlPlane, m: &mut Machine, pm: &ProviderMachine) {
     cp.provider_seen.lock().unwrap_or_else(|e| e.into_inner()).insert(m.id.clone());
+    // With hosts tagged by region (ADR 0117), where it is is its host's region.
+    if !pm.region.is_empty() && cp.hosts().is_some_and(|h| h.tagged()) {
+        m.region = pm.region.clone();
+    }
     m.provider_id = Some(pm.id.clone());
     m.placed_on = None;
     m.provider_status = Some(pm.status.clone());
@@ -721,7 +748,7 @@ async fn provision(
         Ok((pm, true))
     } else {
         // Where it goes (ADR 0081). With no room anywhere it waits, said once.
-        let host = match p.hosts().map(|_| placement::choose(app, cp, &m.plan, None)) {
+        let host = match p.hosts().map(|_| placement::choose(app, cp, &m.plan, &m.region, None)) {
             None => None,
             Some(Ok(h)) => Some(h),
             Some(Err(why)) => {
@@ -1172,6 +1199,9 @@ fn admin_view(app: &App, m: &Machine) -> Value {
         if let Some(host) = hosts::of(cp, m) {
             v["host"] = json!(host);
         }
+        if let Some(u) = app.db.user(&m.user_id) {
+            v["dataRegion"] = json!(region::effective(app, cp, &u));
+        }
         if let Some(off) = cp.offsite.as_deref() {
             v["recovery"] = recovery::view(app, cp, off, m);
         } else if let Some(pb) = cp.provider_backups {
@@ -1319,7 +1349,9 @@ pub async fn get(
 /// `POST /api/users/{key}/machine` `{tier?, region?}`: gives the user a machine. Asking
 /// again returns the one they have (200), so a retried request never makes a second;
 /// a different tier or region is a 409 (resize instead). After an error, asking again
-/// retries. 202 when one is on its way; 502 if the provider refused it.
+/// retries. 202 when one is on its way; 502 if the provider refused it. The region is
+/// their data region (ADR 0117): asking for another is a 409 when one is set for them
+/// or their team.
 pub async fn request(
     AppS(app): AppS<AppState>,
     Extension(a): Extension<Arc<Auth>>,
@@ -1358,6 +1390,19 @@ pub(crate) async fn request_as(app: &AppState, cp: &ControlPlane, by: &Who, key:
             cp.regions.join(", ")
         )));
     }
+    // The region set for them or their team (ADR 0117) is where it goes, or nowhere.
+    let home = region::effective(&app, cp, &u);
+    if let Some(r) = asked_region.as_deref().filter(|r| home.binding() && *r != home.region) {
+        return Err(region::refuse_request(&app, &by, &u, &home, r));
+    }
+    if asked_region.is_none() && !home.offered {
+        return Err(conflict(format!(
+            "{}'s data region is {}, which this server doesn't offer any more (MACHINE_REGIONS: {}). Add it back, or change their data region.",
+            u.name,
+            home.region,
+            cp.regions.join(", ")
+        )));
+    }
     // What's asked for, else `(tier, plan, region)` as given: a new machine's defaults,
     // or what a retried machine was saved with.
     // A plan that sets a machine size (ADR 0040) gets that size unless asked otherwise,
@@ -1372,8 +1417,8 @@ pub(crate) async fn request_as(app: &AppState, cp: &ControlPlane, by: &Who, key:
         (tier, plan, region)
     };
     // Refused up front when no host has room (ADR 0081), rather than left waiting.
-    let place = |plan: &str| -> Res<()> {
-        match p.hosts().map(|_| placement::choose(&app, cp, plan, None)) {
+    let place = |plan: &str, region: &str| -> Res<()> {
+        match p.hosts().map(|_| placement::choose(&app, cp, plan, region, None)) {
             Some(Err(why)) => {
                 placement::failed(&app, &by, &u.id, None, plan, &why);
                 Err(conflict(why))
@@ -1385,10 +1430,10 @@ pub(crate) async fn request_as(app: &AppState, cp: &ControlPlane, by: &Who, key:
     let m = match app.db.user_machine(&u.id) {
         Some(mut m) if m.state == State::Error => {
             cp.need_own(&m)?;
-            let (tier, plan, region) = settings(&m.tier, &m.plan, &m.region);
+            let (tier, plan, region) = settings(&m.tier, &m.plan, if home.binding() { &home.region } else { &m.region });
             cp.need_plan(&plan)?;
             if m.provider_id.is_none() {
-                place(&plan)?;
+                place(&plan, &region)?;
             }
             // The label stays, so a machine made by an earlier create would be adopted
             // as it is. Only change what's asked for when there's none.
@@ -1441,9 +1486,9 @@ pub(crate) async fn request_as(app: &AppState, cp: &ControlPlane, by: &Who, key:
         Some(m) => return Ok(reply(&app, StatusCode::OK, &m)),
         None => {
             let (default_tier, default_plan) = &cp.tiers[0];
-            let (tier, plan, region) = settings(default_tier, default_plan, &cp.regions[0]);
+            let (tier, plan, region) = settings(default_tier, default_plan, &home.region);
             cp.need_plan(&plan)?;
-            place(&plan)?;
+            place(&plan, &region)?;
             let new = NewMachine {
                 user_id: &u.id,
                 provider: p.name(),
@@ -1748,6 +1793,8 @@ pub async fn substrate(Extension(a): Extension<Arc<Auth>>, Query(q): Query<HashM
         "substrate": p.substrate(),
         "tiers": tiers,
         "regions": cp.regions,
+        "defaultRegion": cp.regions.first(),
+        "hostRegions": cp.hosts().is_some_and(|h| h.tagged()),
         "image": cp.image,
         "backups": cp.backups,
         "enrollment": cp.enrollment.is_some(),
@@ -2018,6 +2065,13 @@ mod tests {
         assert!(e.0 == StatusCode::BAD_REQUEST && e.1.contains("incus machines"), "{}", e.1);
         let cp = with(&certs, &[("MACHINE_REGIONS", "node1,node2"), ("MACHINE_TIERS", "solo=c1-m1-d10")]).unwrap();
         assert_eq!((cp.regions.len(), cp.tiers.len()), (2, 1));
+        // Hosts tagged by data region (ADR 0117): their tags are the regions unless set.
+        let cp = with(&certs, &[("INCUS_REGION", "gb-lon")]).unwrap();
+        assert_eq!(cp.regions, ["gb-lon"]);
+        assert!(cp.describe().contains("regions gb-lon (default)"), "{}", cp.describe());
+        let e = with(&certs, &[("INCUS_REGION", "gb-lon"), ("MACHINE_REGIONS", "gb-lon,de-fra-2")]).err().unwrap();
+        assert!(e.contains("no Incus host is in \"de-fra-2\"; hosts are in gb-lon"), "{e}");
+        assert!(with(&certs, &[("INCUS_REGION", "GB LON")]).err().unwrap().contains("INCUS_REGION: \"GB LON\" isn't a region id"));
 
         for (store, extra, want) in [
             (&certs, &[("MACHINE_FIREWALL", "")][..], "MACHINE_FIREWALL=on"),
