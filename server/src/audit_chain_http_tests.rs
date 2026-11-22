@@ -1,0 +1,243 @@
+//! The tamper-evident audit log and its SIEM export (ADR 0122) on the real router:
+//! `GET /api/audit/verify` names the first broken link, erasure and retention keep the
+//! chain whole, and the export delivers every event in order, retrying until it's taken.
+
+use crate::audit::{Actor, Event};
+use crate::audit_export::Settings;
+use crate::db::now;
+use crate::secrets::env::EnvStore;
+use crate::tests::{audit_list, call, serve_app};
+use crate::users_http_tests::{parse, user_with};
+use crate::*;
+use std::sync::Mutex as StdMutex;
+use tokio::io::AsyncReadExt;
+
+async fn verify(port: u16, admin: &str, query: &str) -> Value {
+    let (code, body) = call(port, "GET", &format!("/api/audit/verify{query}"), admin, "").await;
+    assert_eq!(code, 200, "{body}");
+    parse(&body)
+}
+
+async fn events(port: u16, admin: &str, query: &str) -> Vec<Value> {
+    let (code, body) = call(port, "GET", &format!("/api/audit?limit=1000&{query}"), admin, "").await;
+    assert_eq!(code, 200, "{body}");
+    audit_list(&body)
+}
+
+fn export_to(app: &AppState, vars: &[(&str, &str)]) {
+    let store = EnvStore::fixed(vars);
+    let map: std::collections::HashMap<String, String> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    let settings = Settings::from_env(&|k| map.get(k).cloned().unwrap_or_default(), &store).unwrap();
+    crate::audit_export::start(app, settings);
+}
+
+async fn until(what: &str, f: impl Fn() -> bool) {
+    for _ in 0..400 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[tokio::test]
+async fn verify_names_the_first_broken_link_and_holds_pins() {
+    let (port, app, admin, key) = serve_app().await;
+    for name in ["Scout", "Helper"] {
+        assert_eq!(call(port, "POST", "/api/bots", &admin, &json!({ "name": name }).to_string()).await.0, 201);
+    }
+    let v = verify(port, &admin, "").await;
+    assert_eq!(v["ok"], true, "{v}");
+    let head = v["head"].clone();
+    assert!(v["checked"].as_i64().unwrap() >= 3 && head["hash"].as_str().unwrap().len() == 64, "{v}");
+    assert_eq!(v["first"], 1, "a fresh database chains from its first event");
+    // The check is on the record, with the head a SIEM can keep.
+    let checked = &events(port, &admin, "action=audit.verified").await[0];
+    assert_eq!((checked["outcome"].as_str(), &checked["details"]["head"]), (Some("success"), &head));
+
+    // Every event carries its link; a hash kept elsewhere still matches.
+    let created = events(port, &admin, "action=bot.created").await;
+    let scout = created.iter().find(|e| e["details"]["name"] == "Scout").unwrap().clone();
+    let pin = format!("{}:{}", scout["id"], scout["chainHash"].as_str().unwrap());
+    let v = verify(port, &admin, &format!("?pin={pin}")).await;
+    assert_eq!((v["ok"].as_bool(), v["pins"][0]["result"].as_str()), (Some(true), Some("match")), "{v}");
+    for bad in ["x", "12", "12:nothex", "0:00"] {
+        assert_eq!(call(port, "GET", &format!("/api/audit/verify?pin={bad}"), &admin, "").await.0, 400, "{bad}");
+    }
+
+    // Someone with the database file rewrites history: the edited row is named.
+    let forged = scout["id"].as_i64().unwrap();
+    app.db.execute_raw("DROP TRIGGER audit_events_no_update").unwrap();
+    app.db.execute_raw(&format!("UPDATE audit_events SET details = '{{\"name\":\"Innocent\"}}' WHERE id = {forged}")).unwrap();
+    let v = verify(port, &admin, "").await;
+    assert_eq!((v["ok"].as_bool(), v["firstBroken"]["id"].as_i64(), v["firstBroken"]["reason"].as_str()), (Some(false), Some(forged), Some("contents")), "{v}");
+    let failed = &events(port, &admin, "action=audit.verified&outcome=failure").await[0];
+    assert_eq!(failed["details"]["firstBroken"]["id"].as_i64(), Some(forged));
+
+    // Re-hashing every row after it hides nothing from a pin kept outside.
+    assert!(crate::audit_chain::reseal_from(&app.db, forged) > 0);
+    let v = verify(port, &admin, "").await;
+    assert_eq!(v["ok"], true, "a rebuilt chain is consistent on its own: {v}");
+    let v = verify(port, &admin, &format!("?pin={pin}")).await;
+    assert_eq!((v["ok"].as_bool(), v["pins"][0]["result"].as_str(), v["firstBroken"]["reason"].as_str()), (Some(false), Some("mismatch"), Some("pin")), "{v}");
+
+    // Admins only.
+    let (_, member) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (_, b) = call(port, "POST", "/api/bots", &member, r#"{"name":"Ada's"}"#).await;
+    let bot = parse(&b)["id"].as_str().unwrap().to_string();
+    for path in ["/api/audit/verify", "/api/audit/siem"] {
+        assert_eq!(call(port, "GET", path, &member, "").await.0, 403, "{path}");
+        assert_eq!(call(port, "GET", path, &key.auth(&bot), "").await.0, 403, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn erasure_and_retention_keep_the_chain_whole() {
+    let (port, app, admin, _) = serve_app().await;
+    let (ada, ada_auth) = user_with(port, &admin, "ada@example.com", "member").await;
+    assert_eq!(call(port, "POST", "/api/bots", &ada_auth, r#"{"name":"Ada's"}"#).await.0, 201);
+    let (code, body) = call(port, "POST", &format!("/api/users/{ada}/erase"), &admin, "{}").await;
+    assert_eq!(code, 200, "{body}");
+    let v = verify(port, &admin, "").await;
+    assert_eq!(v["ok"], true, "{v}");
+    assert!(v["erased"].as_i64().unwrap() > 0, "her events lost their salt: {v}");
+
+    // Retention cuts a run of old events from the start and keeps the last one's hash
+    // as the anchor. (A fresh log, so it can start with old events.)
+    app.db.execute_raw("DROP TRIGGER audit_events_no_delete").unwrap();
+    app.db.execute_raw("DELETE FROM audit_events").unwrap();
+    let old = now() - 40 * 86_400_000;
+    let record = |action: &str, at: i64| app.db.record_at(&Event::new(Actor::system("test"), action), at).unwrap();
+    let (o1, o2) = (record("test.old", old), record("test.old", old));
+    let young = record("test.young", now());
+    let late = record("test.old", old);
+    app.db.set_audit_retention(Some(30));
+    crate::audit::prune(&app, 30);
+    let v = verify(port, &admin, "").await;
+    assert_eq!((v["ok"].as_bool(), v["first"].as_i64(), v["anchor"]["id"].as_i64()), (Some(true), Some(young), Some(o2)), "{v}");
+    assert!(o1 < o2 && late > young);
+    let left: Vec<i64> = app.db.audit_chain_rows(i64::MIN, 1000).iter().map(|r| r.id).collect();
+    assert!(left.contains(&late), "an old event after a young one waits for it");
+    let pruned = &events(port, &admin, "action=audit.pruned").await[0];
+    assert_eq!((pruned["details"]["deleted"].as_i64(), pruned["details"]["anchor"]["id"].as_i64()), (Some(2), Some(o2)));
+
+    // Rows cut without the anchor show as a broken link.
+    app.db.execute_raw(&format!("DELETE FROM settings WHERE key = '{}'", crate::audit_chain::ANCHOR)).unwrap();
+    let v = verify(port, &admin, "").await;
+    assert_eq!((v["ok"].as_bool(), v["firstBroken"]["id"].as_i64(), v["firstBroken"]["reason"].as_str()), (Some(false), Some(young), Some("link")), "{v}");
+}
+
+/// What a collector saw: how many requests, the lines it took, and each request's headers.
+type Collected = Arc<StdMutex<(usize, Vec<String>, Vec<String>)>>;
+
+/// A webhook collector: answers 500 to the first `fail` requests, then takes the batches.
+async fn collector(fail: usize) -> (String, Collected) {
+    let got: Collected = Default::default();
+    let state = got.clone();
+    let r = axum::Router::new().route(
+        "/ingest",
+        axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+            let state = state.clone();
+            async move {
+                let mut s = state.lock().unwrap();
+                s.0 += 1;
+                s.2.push(format!("{:?}", headers));
+                if s.0 <= fail {
+                    return axum::http::StatusCode::INTERNAL_SERVER_ERROR;
+                }
+                s.1.extend(body.lines().map(String::from));
+                axum::http::StatusCode::OK
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
+    (format!("http://{addr}/ingest"), got)
+}
+
+#[tokio::test]
+async fn the_siem_export_delivers_every_event_in_order_and_retries() {
+    let (port, app, admin, _) = serve_app().await;
+    let off = parse(&call(port, "GET", "/api/audit/siem", &admin, "").await.1);
+    assert_eq!(off, json!({ "enabled": false }), "off by default");
+
+    let secret = "sbx-siem-test-secret-9f8e7d6c5b4a";
+    secrets::redact::register(secret);
+    app.db.record(&Event::new(Actor::system("test"), "test.secret").details(json!({ "note": format!("token {secret}") })));
+    let token = "siem-collector-token-0a1b2c3d4e5f";
+    let (url, got) = collector(3).await;
+    export_to(&app, &[("AUDIT_EXPORT", &url), ("AUDIT_EXPORT_HEADERS", &format!("Authorization=Bearer {token}"))]);
+    until("delivery", || app.audit_export.get().is_some_and(|x| x.delivered() >= app.db.audit_head())).await;
+
+    // Three failures make it a failing export, on the record once; delivery ends it.
+    until("recovery event", || app.db.audit_events(&Default::default(), 1000, false).iter().any(|e| e.action == "audit.export_recovered")).await;
+    let all = app.db.audit_events(&Default::default(), 1000, true);
+    assert_eq!(all.iter().filter(|e| e.action == "audit.export_failing").count(), 1);
+    let failing = all.iter().find(|e| e.action == "audit.export_failing").unwrap();
+    assert_eq!((failing.outcome.as_str(), failing.details["sink"].as_str()), ("failure", Some(url.trim_end_matches("/ingest"))));
+    until("everything delivered", || app.audit_export.get().unwrap().delivered() >= app.db.audit_head()).await;
+
+    let (tries, lines, headers) = got.lock().unwrap().clone();
+    assert!(tries > 3);
+    assert!(headers.iter().all(|h| h.contains(&format!("Bearer {token}")) && h.contains("application/x-ndjson")), "{headers:?}");
+    let sent: Vec<Value> = lines.iter().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let ids: Vec<i64> = sent.iter().map(|e| e["id"].as_i64().unwrap()).collect();
+    let mut sorted = ids.clone();
+    sorted.dedup();
+    assert_eq!(ids, sorted, "in id order, each once");
+    assert_eq!(ids.first(), Some(&1), "AUDIT_EXPORT_START=all sends the history too");
+    assert!(sent.iter().all(|e| e["schema"] == "superbot.audit.v1" && e["chainHash"].as_str().is_some_and(|h| h.len() == 64)));
+    // Each line links to the one before it, so the SIEM holds the chain too.
+    for w in sent.windows(2) {
+        assert_eq!(w[1]["chainPrev"], w[0]["chainHash"]);
+    }
+    let body = lines.join("\n");
+    assert!(!body.contains(secret) && !body.contains(token), "no secrets in what leaves");
+
+    let siem = parse(&call(port, "GET", "/api/audit/siem", &admin, "").await.1);
+    assert_eq!((siem["enabled"].as_bool(), siem["kind"].as_str(), siem["failing"].as_bool()), (Some(true), Some("webhook"), Some(false)), "{siem}");
+    let mut metrics = String::new();
+    crate::audit_export::render(&app, &mut metrics);
+    assert!(metrics.contains("superbot_audit_export_failing 0") && metrics.contains("superbot_audit_export_last_delivery_timestamp_seconds"), "{metrics}");
+    // The cursor is saved, so a restart resumes after the last delivered event.
+    let delivered = app.audit_export.get().unwrap().delivered();
+    assert_eq!(app.db.audit_export_cursor(&url), Some(delivered));
+}
+
+#[tokio::test]
+async fn syslog_sinks_get_rfc_5424_with_octet_counting() {
+    let app = runner::test_app();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    app.db.record(&Event::new(Actor::system("test"), "test.syslog"));
+    export_to(&app, &[("AUDIT_EXPORT", &format!("syslog+tcp://{addr}")), ("AUDIT_EXPORT_START", "all")]);
+    let (mut conn, _) = listener.accept().await.unwrap();
+    let head = app.db.audit_head();
+    let mut buf = Vec::new();
+    let mut frames: Vec<String> = Vec::new();
+    while (frames.len() as i64) < head {
+        let mut chunk = [0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(10), conn.read(&mut chunk)).await.unwrap().unwrap();
+        assert!(n > 0, "closed early");
+        buf.extend_from_slice(&chunk[..n]);
+        // RFC 5425: "<length> <message>", over and over.
+        while let Some(sp) = buf.iter().position(|&b| b == b' ') {
+            let len: usize = std::str::from_utf8(&buf[..sp]).unwrap().parse().unwrap();
+            if buf.len() < sp + 1 + len {
+                break;
+            }
+            frames.push(String::from_utf8(buf[sp + 1..sp + 1 + len].to_vec()).unwrap());
+            buf.drain(..sp + 1 + len);
+        }
+    }
+    let ours = frames.iter().find(|f| f.contains(" test.syslog ")).expect("our event");
+    // <PRI>1 TIMESTAMP HOST APP PROCID MSGID SD MSG; facility 13 (log audit), severity 6.
+    let parts: Vec<&str> = ours.splitn(8, ' ').collect();
+    assert_eq!((parts[0], parts[3], parts[5], parts[6]), ("<110>1", "superbot", "test.syslog", "-"), "{ours}");
+    assert!(parts[1].ends_with('Z'));
+    let msg: Value = serde_json::from_str(parts[7]).unwrap();
+    assert_eq!((msg["action"].as_str(), msg["schema"].as_str()), (Some("test.syslog"), Some("superbot.audit.v1")));
+    until("cursor saved", || app.audit_export.get().unwrap().delivered() >= head).await;
+}
