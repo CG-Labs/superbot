@@ -54,7 +54,7 @@ The process environment holds the host's variables too (shell, service manager, 
 
 Each shown value is then redacted:
 
-1. **By name.** A name that says secret (`redact::names_secret`: `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, ...; plus `DSN`, `WEBHOOK`, `SALT`, `PASSPHRASE`, `COOKIE`) becomes `[redacted]`, unless it ends `_FILE`, `_PATH` or `_DIR` (where a secret is, not what it is). `OWNER_EMAIL` and `USER_NAME` are left out as personal.
+1. **By name.** A name that says secret (`redact::names_secret`: `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, ...; plus `DSN`, `WEBHOOK`, `SALT`, `PASSPHRASE`, `COOKIE`, `HEADER`) becomes `[redacted]`, unless it ends `_FILE`, `_PATH` or `_DIR` (where a secret is, not what it is). `OWNER_EMAIL` and `USER_NAME` are left out as personal.
 2. **By shape.** A value of 24 or more key-like characters with letters and digits (a generated secret) becomes `[redacted]`. Anything else goes through the audit log's redaction (`Bearer x`, `token=x`, `user:pass@` in URLs, known key prefixes) and a private key or age secret key blanks the whole value.
 3. **URL origins only.** A URL's path and query become `/[redacted]`: Slack webhooks, Sentry DSNs and signed links carry their secret there.
 4. **Emails** become `[email]`.

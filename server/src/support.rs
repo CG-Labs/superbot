@@ -31,8 +31,9 @@ const RECENT_MINUTES: i64 = 15;
 /// Settings that name a person rather than configure botd.
 const PERSONAL: [&str; 2] = ["USER_NAME", "OWNER_EMAIL"];
 /// Words in a setting's name that make its whole value secret, beside `redact::names_secret`'s:
-/// an error tracker's DSN and a webhook URL carry their credential inside.
-const SECRET_WORDS: [&str; 5] = ["DSN", "WEBHOOK", "SALT", "PASSPHRASE", "COOKIE"];
+/// an error tracker's DSN and a webhook URL carry their credential inside, and headers
+/// (`TRACES_OTLP_HEADERS`) carry an exporter's key under any header name it likes.
+const SECRET_WORDS: [&str; 6] = ["DSN", "WEBHOOK", "SALT", "PASSPHRASE", "COOKIE", "HEADER"];
 /// Settings that say where a secret is kept, not what it is.
 const PATH_SUFFIXES: [&str; 3] = ["_FILE", "_PATH", "_DIR"];
 /// The settings botd documents. The bundle carries these and settings that look like
@@ -547,6 +548,7 @@ pub(crate) mod tests {
             ("LICENSE_KEY", "eyJhbGciOiJFZERTQSJ9.e30.sig"),
             ("OWNER_EMAIL", "owner@example.com"),
             ("USER_NAME", "Ada Lovelace"),
+            ("TRACES_OTLP_HEADERS", "x-honeycomb-team=abc123,x-honeycomb-dataset=production"),
         ] {
             assert_eq!(setting(k, v), (MARK.to_string(), true), "{k}");
         }

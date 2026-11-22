@@ -38,7 +38,7 @@ tar -xOf superbot-support-<time>.tar | less
 
 Secret values, chats, prompts, tool inputs, files, names, emails or IP addresses. In detail:
 
-- A setting whose name says it's secret (`_KEY`, `_TOKEN`, `_SECRET`, `PASSWORD`, `DSN`, `WEBHOOK` and the like) shows as `[redacted]`. One that says where a secret is kept (`_FILE`, `_PATH`, `_DIR`) shows the path, not the secret.
+- A setting whose name says it's secret (`_KEY`, `_TOKEN`, `_SECRET`, `PASSWORD`, `DSN`, `WEBHOOK`, `HEADERS` and the like) shows as `[redacted]`. One that says where a secret is kept (`_FILE`, `_PATH`, `_DIR`) shows the path, not the secret.
 - A value that looks like a credential is redacted wherever it is: a long random string, `Bearer x`, `token=x`, `user:password@` in a URL, a known key prefix (`sk-`, `ghp_`, `AKIA` and others), a private key, and any secret botd holds (the sealed store, sessions and tokens it issues).
 - URLs keep their scheme, host and port; paths and queries become `/[redacted]`, because some services put a secret there.
 - Emails become `[email]`. `OWNER_EMAIL` and `USER_NAME` are left out.
