@@ -4,7 +4,7 @@
 
 Accepted. Builds on [ADR 0065](0065-incus-container-machines.md) (Incus containers), [ADR 0067](0067-clearing-enrollment-data-from-containers.md) (clearing enrollment data), [ADR 0069](0069-validating-incus-containers-on-a-real-host.md) (the real-host test) and [ADR 0030](0030-backup-restore-drill.md) (server backups). Covers the backup part of [#29](https://github.com/CG-Labs/superbot/issues/29) together with [#40](https://github.com/CG-Labs/superbot/issues/40).
 
-Per-tier schedules, RPO and RTO targets, breach alerts and timed restore drills: [ADR 0074](0074-machine-rpo-and-rto.md).
+Per-tier schedules, RPO and RTO targets, breach alerts and timed restore drills: [ADR 0074](0074-machine-rpo-and-rto.md). Deleting a destroyed machine's backups on request: [ADR 0108](0108-deleting-a-destroyed-machines-backups.md).
 
 ## Context
 

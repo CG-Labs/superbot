@@ -1,0 +1,88 @@
+name: release
+
+# ADR 0111: CHANGELOG.md is checked on every change to it, to the version or to this
+# workflow, and each v<semver> tag gets a GitHub release whose notes are that version's
+# section of CHANGELOG.md. The docker workflow publishes the tag's images (ADR 0084); this
+# one only writes the release. Tags are made by hand; nothing here makes one.
+on:
+  push:
+    branches: [main]
+    # Path filters don't apply to tag pushes, so every v* tag runs both jobs.
+    tags: ['v*']
+    paths:
+      - 'CHANGELOG.md'
+      - 'server/Cargo.toml'
+      - 'deploy/release-notes.sh'
+      - '.github/workflows/release.yml'
+  pull_request:
+    paths:
+      - 'CHANGELOG.md'
+      - 'server/Cargo.toml'
+      - 'deploy/release-notes.sh'
+      - '.github/workflows/release.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changelog:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Every tag, so `check` can see that each one has a dated section.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: ShellCheck
+        run: |
+          command -v shellcheck >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
+          shellcheck -S style deploy/release-notes.sh
+      - name: The checks catch what they should
+        run: deploy/release-notes.sh self-test
+      - name: CHANGELOG.md matches server/Cargo.toml and every tag
+        run: deploy/release-notes.sh check
+
+  release:
+    needs: changelog
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The tag is on main
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+            || { echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) isn't on main; release only from main (ADR 0111)"; exit 1; }
+      - name: Release notes from CHANGELOG.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          deploy/release-notes.sh notes "$TAG" >"$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md" >>"$GITHUB_STEP_SUMMARY"
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=${TAG#v}
+          args=(--title "SuperBot $version" --notes-file "$RUNNER_TEMP/notes.md")
+          if [[ $version == *-* ]]; then args+=(--prerelease); fi
+          # A re-run updates the notes rather than failing on the release it made.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" "${args[@]}"
+          else
+            gh release create "$TAG" --verify-tag "${args[@]}"
+          fi

@@ -45,7 +45,7 @@ Erasure fights with three things botd must keep:
 ## What it doesn't cover
 
 - **The isolation folder.** With per-user isolation, their OS user's home (`ISOLATION_DIR/<id>`) belongs to that OS user and only the root helper can remove it. The response reports `isolationFolderLeft`; the operator removes the OS user (`superbot-userctl`). A machine's disk goes with the machine.
-- **Backups.** Server backups keep the erased data until `SUPERBOT_BACKUP_RETENTION_DAYS` ends, and machine backups until theirs (deleting those on request is CC6.5-2).
+- **Backups.** Server backups keep the erased data until `SUPERBOT_BACKUP_RETENTION_DAYS` ends. Machine backups go with the erasure when the admin asks (`deleteBackups`), and it is refused while they are kept otherwise ([ADR 0108](0108-deleting-a-destroyed-machines-backups.md)).
 - **Billing records.** Stripe customers, subscriptions and invoices are kept: a business must keep invoices for years, which is a legal basis to keep them (GDPR 17(3)(b)). They name the customer at Stripe, not in botd's database; botd's billing emails go.
 - **Harness session files and teammates' archived work** outside the folders above (ADR 0098's remaining items), and their work archived into an owner's `from-teammates/` folder, which is the owner's.
 - **Bots' names and memory** that mention them by name, in Bots that aren't theirs, and free text in others' chats that names them (only what they sent is erased).

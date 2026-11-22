@@ -48,11 +48,12 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl user resume-routines <user>               Turn back on the routines paused when they were disabled
   botctl user handover <user> <to> [--resume]      Give a disabled user's Bots and routines to <to>;
                                                    --resume turns their paused routines back on
-  botctl user erase <user> [--destroy-machine] --yes
+  botctl user erase <user> [--destroy-machine] [--delete-backups] --yes
                                                    Erase their personal data for good (GDPR): Bots, chats,
                                                    sign-ins, secrets; the audit log keeps a pseudonym.
-                                                   Refused under a legal hold, as a team's last owner, or
-                                                   with a machine (--destroy-machine destroys it first)
+                                                   Refused under a legal hold, as a team's last owner, with
+                                                   a machine (--destroy-machine destroys it first), or with
+                                                   their machines' backups kept (--delete-backups deletes them)
   botctl user tier <user> <tier|default>           Their plan: the models and limits they get
   botctl tiers                                     Every tier, its routes and limits, and the default
   botctl tiers move-bots <tier> [--user <user>] [--dry-run]
@@ -172,6 +173,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine restore <user> <backup-id> [--identity <age-key-file>] [--host <name>] --yes  Make it again from that backup; it enrolls anew
                                                    (--host: onto that Incus host, deleting it from its own; ADR 0076)
   botctl machine restore <user> status             How its latest restore went
+  botctl machine delete-backups <machine-id> --yes Delete a destroyed machine's backups now, not when their
+                                                   retention ends (ADR 0108); botctl machine list destroyed
   botctl machine hosts [check]                     Incus hosts (ADR 0076): up, down or lost, their machines, load and
                                                    capacity, and where a new machine goes (ADR 0081); check asks each now
   botctl machine host drain <name> [--reason <text>]  Place nothing new on the host; its machines stay until moved (ADR 0081)
@@ -818,6 +821,12 @@ fn backup_request(args: &[&str], read: impl Fn(&str) -> Result<String, String>) 
         ["backups", user] => ("GET", at(user, "backups"), None),
         ["backup", user] => ("POST", at(user, "backups"), None),
         ["restore", user, "status"] => ("GET", at(user, "restore"), None),
+        ["delete-backups", id, "--yes"] | ["delete-backups", "--yes", id] if !id.starts_with("--") => {
+            ("DELETE", format!("/api/machines/{}/backups", encode(id)), None)
+        }
+        ["delete-backups", id] if !id.starts_with("--") => {
+            return Err("Deleting a destroyed machine's backups can't be undone, and nothing can be restored from them after; add --yes".into());
+        }
         ["restore", user, id, rest @ ..] if !id.starts_with("--") && rest.contains(&"--yes") => {
             let identity = match rest.iter().position(|a| *a == "--identity") {
                 Some(i) => Some(read(rest.get(i + 1).filter(|f| !f.starts_with("--")).ok_or("--identity needs a file")?)?),
@@ -848,7 +857,7 @@ fn backup_request(args: &[&str], read: impl Fn(&str) -> Result<String, String>) 
         }
         ["restore", _, _, ..] => return Err("Restoring replaces the machine and everything on it since the backup; add --yes".into()),
         _ => return Err(
-            "Usage: botctl machine backups [<user>] | backup <user> | recovery | restore <user> <backup-id> [--identity <file>] [--host <name>] --yes | restore <user> status | hosts [check] | host drain <name> [--reason <text>] | host undrain <name> | host recover <name> [--to <host>] [--identity <file>] --yes"
+            "Usage: botctl machine backups [<user>] | backup <user> | recovery | restore <user> <backup-id> [--identity <file>] [--host <name>] --yes | restore <user> status | delete-backups <machine-id> --yes | hosts [check] | host drain <name> [--reason <text>] | host undrain <name> | host recover <name> [--to <host>] [--identity <file>] --yes"
                 .into(),
         ),
     })
@@ -1192,7 +1201,7 @@ fn run(args: &[String]) -> Result<String, String> {
         ["machine", "harness-logins", user] => op("GET", &format!("{}/harness-logins", login_base(user)), None),
         ["machine", "harness-logout", user, harness] => op("DELETE", &format!("{}/harness-logins/{}", login_base(user), encode(harness)), None),
         ["machine", "legacy"] => op("GET", "/api/machines/legacy", None),
-        ["machine", rest @ ..] if matches!(rest.first(), Some(&("backups" | "backup" | "restore" | "recovery" | "hosts" | "host"))) => {
+        ["machine", rest @ ..] if matches!(rest.first(), Some(&("backups" | "backup" | "restore" | "delete-backups" | "recovery" | "hosts" | "host"))) => {
             let (method, path, body) = backup_request(rest, |f| std::fs::read_to_string(f).map_err(|e| format!("--identity {f}: {e}")))?;
             op(method, &path, body)
         }
@@ -1355,13 +1364,14 @@ fn handover_request(key: &str, rest: &[&str]) -> Result<(String, Value), String>
 }
 
 fn erase_request(key: &str, rest: &[&str]) -> Result<(String, Value), String> {
-    if key.starts_with("--") || rest.iter().any(|a| !matches!(*a, "--yes" | "--destroy-machine")) {
-        return Err("Usage: botctl user erase <user> [--destroy-machine] --yes".into());
+    if key.starts_with("--") || rest.iter().any(|a| !matches!(*a, "--yes" | "--destroy-machine" | "--delete-backups")) {
+        return Err("Usage: botctl user erase <user> [--destroy-machine] [--delete-backups] --yes".into());
     }
     if !rest.contains(&"--yes") {
         return Err("Erasing deletes their personal data for good and can't be undone; add --yes".into());
     }
-    Ok((format!("/api/users/{}/erase", encode(key)), json!({ "destroyMachine": rest.contains(&"--destroy-machine") })))
+    let body = json!({ "destroyMachine": rest.contains(&"--destroy-machine"), "deleteBackups": rest.contains(&"--delete-backups") });
+    Ok((format!("/api/users/{}/erase", encode(key)), body))
 }
 
 fn now_ms() -> i64 {
@@ -1410,8 +1420,11 @@ mod tests {
     fn erase_needs_yes_and_maybe_destroys_the_machine() {
         let (path, body) = erase_request("ada@example.com", &["--yes"]).unwrap();
         assert_eq!(path, "/api/users/ada%40example.com/erase");
-        assert_eq!(body, json!({ "destroyMachine": false }));
+        assert_eq!(body, json!({ "destroyMachine": false, "deleteBackups": false }));
         assert_eq!(erase_request("u1", &["--destroy-machine", "--yes"]).unwrap().1["destroyMachine"], true);
+        let (_, body) = erase_request("u1", &["--delete-backups", "--destroy-machine", "--yes"]).unwrap();
+        assert_eq!(body, json!({ "destroyMachine": true, "deleteBackups": true }));
+        assert!(erase_request("u1", &["--delete-backups"]).unwrap_err().contains("--yes"));
         assert!(erase_request("u1", &[]).unwrap_err().contains("--yes"));
         assert!(erase_request("u1", &["--destroy-machine"]).is_err());
         assert!(erase_request("u1", &["--yes", "u2"]).is_err());
@@ -1540,6 +1553,11 @@ mod tests {
         assert!(backup_request(&["restore", "u1", "b1", "--identity", "--yes"], read).is_err());
         assert!(backup_request(&["restore", "u1", "b1", "--identity", "nope", "--yes"], read).is_err());
         assert!(backup_request(&["backup"], read).is_err());
+        assert_eq!(backup_request(&["delete-backups", "m1a2", "--yes"], read).unwrap(), ("DELETE", "/api/machines/m1a2/backups".into(), None));
+        assert_eq!(backup_request(&["delete-backups", "--yes", "m/1"], read).unwrap(), ("DELETE", "/api/machines/m%2F1/backups".into(), None));
+        assert!(backup_request(&["delete-backups", "m1a2"], read).unwrap_err().contains("--yes"));
+        assert!(backup_request(&["delete-backups", "--yes"], read).is_err());
+        assert!(backup_request(&["delete-backups", "m1", "--yes", "extra"], read).is_err());
         let (_, _, b) = backup_request(&["restore", "u1", "b1", "--host", "spare", "--yes"], read).unwrap();
         assert_eq!(serde_json::from_str::<serde_json::Value>(&b.unwrap()).unwrap(), json!({ "backupId": "b1", "identity": null, "host": "spare" }));
         assert_eq!(backup_request(&["hosts"], read).unwrap(), ("GET", "/api/machines/hosts".into(), None));
