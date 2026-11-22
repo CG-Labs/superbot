@@ -121,7 +121,7 @@ pub const ERASED_TEXT: &str = "[erased]";
 pub const ERASED_NAME: &str = "Erased user";
 
 /// Whether the message in `m` was sent by user `?1`, or by a run for them.
-const SENT_BY: &str = "(CASE WHEN json_valid(m.requested_by) THEN json_extract(m.requested_by, '$.actor.id') = ?1 OR json_extract(m.requested_by, '$.actor.asker') = ?1 END)";
+const SENT_BY: &str = "(CASE WHEN json_valid(m.requested_by) THEN json_extract(m.requested_by, '$.actor.id') = ?1 OR json_extract(m.requested_by, '$.actor.asker') = ?1 OR EXISTS (SELECT 1 FROM json_each(m.requested_by, '$.actor.carries') WHERE value = ?1) END)";
 const SENT_BY_ANY: &str = "(CASE WHEN json_valid(requested_by) THEN json_extract(requested_by, '$.actor.id') = ?1 OR json_extract(requested_by, '$.actor.asker') = ?1 OR EXISTS (SELECT 1 FROM json_each(requested_by, '$.actor.carries') WHERE value = ?1) END)";
 
 /// How an erasure rewrites a string about the erased person: their id becomes the
@@ -8657,6 +8657,28 @@ mod tests {
         assert!(db.residency_pin(PinOn::User, &u.id).is_some());
         db.c().execute_batch("DROP TRIGGER pins_kept;").unwrap();
         assert_eq!((db.unpin_residency(PinOn::User, &u.id), db.unpin_residency(PinOn::User, &u.id)), (Ok(true), Ok(false)));
+    }
+
+    #[test]
+    fn a_message_carrying_someones_data_is_held_and_erased_with_theirs() {
+        let db = Db::open(&temp_path("carried-erasure").join("app.sqlite")).unwrap();
+        let ada = db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
+        let bea = db.create_user(None, Some("bea@example.com"), "Bea", Role::Member).unwrap();
+        let bot = db.create_bot_owned("Bea's", "#fff", "waddle", "hermes", None, false, &bea.id, Visibility::Shared);
+        let mut actor = audit::Actor::for_bot(&bot);
+        actor.carries = vec![bea.id.clone(), ada.id.clone()];
+        let m = db.add_message(&bot.id, "user", "Ada's numbers", None, false, Some("done"));
+        db.set_requested_by(m.id, &audit::Who { actor, source: Default::default() });
+
+        db.put_retention_hold(&bot.id, "litigation", None).unwrap();
+        assert_eq!(db.erasure_holds(&ada.id, &[]), vec![bot.id.clone()]);
+        assert!(matches!(db.erase_user(&ada.id, "erased-1", None, &[]), Err(EraseError::Held(_))));
+        assert_eq!(db.message(m.id).unwrap().text, "Ada's numbers", "a held message isn't erased");
+
+        assert!(db.delete_retention_hold(&bot.id));
+        db.erase_user(&ada.id, "erased-1", None, &[]).unwrap();
+        let m = db.message(m.id).unwrap();
+        assert!((m.text.as_str(), m.requested_by.is_none()) == (ERASED_TEXT, true), "{} {:?}", m.text, m.requested_by);
     }
 
     #[test]
