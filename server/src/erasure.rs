@@ -22,6 +22,7 @@ const HELD: &str = "legal_hold";
 const LAST_OWNER: &str = "last_team_owner";
 const PAYING: &str = "paying";
 const TEAM_PAYS: &str = "team_pays";
+const CHECKOUT_PAID: &str = "checkout_paid";
 const MACHINE: &str = "machine";
 const PRIMARY: &str = "primary_bot";
 /// The reason Bots, grants and offboarding record for an erasure.
@@ -87,6 +88,25 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
         let msg = "They're the last member of a team that pays for a plan, which would go with them. Cancel the team's plan first.".into();
         return refuse(TEAM_PAYS, json!({ "team": m.team_id, "subscription": s.subscription_id }), msg);
     }
+    // A checkout page still open could be paid after they're gone. The lock is checkout's
+    // own, held until the erasure ends; by then they can't sign in to open another.
+    let _checkout = match a.payments.checkout() {
+        Some(co) => {
+            let guard = co.lock(&u.id).lock_owned().await;
+            match crate::billing::close_last(&app, &co.stripe, crate::billing::Payer::User(&u.id)).await {
+                crate::billing::Last::Closed => {}
+                crate::billing::Last::Paid => {
+                    return refuse(CHECKOUT_PAID, json!({}), "Their last checkout was paid; a plan is on the way. Cancel it once it starts, then erase them.".into());
+                }
+                crate::billing::Last::Unknown(e) => {
+                    crate::obs::log::log_warn!("erasure: closing {}'s last Stripe checkout: {e}", u.id);
+                    return Err(ApiError(StatusCode::BAD_GATEWAY, "Stripe couldn't say whether their open checkout was paid. Try again in a minute.".into()));
+                }
+            }
+            Some(guard)
+        }
+        None => None,
+    };
     if let Some(b) = bots.iter().find(|b| b.primary) {
         return refuse(PRIMARY, json!({ "bot": b.id }), "They own the primary Bot, which can't be deleted. Give it to someone else first.".into());
     }

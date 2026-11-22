@@ -50,6 +50,11 @@ async fn erasing_leaves_no_personal_data_and_the_audit_log_names_a_pseudonym() {
     let ada = made["id"].as_str().unwrap().to_string();
     let ada_auth = session_for(port, &admin, &ada).await;
     app.db.link_identity(&ada, &db::NewIdentity { provider: "entra", issuer: "https://login.example.com/t1", subject: "subject-ada-0001", tenant: None, email: Some("ada.work@example.com"), created_by: None }).unwrap();
+    let old = app
+        .db
+        .link_identity(&ada, &db::NewIdentity { provider: "entra", issuer: "https://login.example.com/t2", subject: "subject-old-0002", tenant: None, email: None, created_by: None })
+        .unwrap();
+    assert_eq!(call(port, "DELETE", &format!("/api/users/{ada}/identities/{}", old.id), &admin, "").await.0, 200, "unlinked before, still in the log");
     assert!(app.db.mfa_begin(&ada, "sealed-totp-of-ada"));
     secrets::global().user_put(&ada, "OPENAI_API_KEY", "sk-ada-private-key").unwrap();
 
@@ -94,7 +99,7 @@ async fn erasing_leaves_no_personal_data_and_the_audit_log_names_a_pseudonym() {
     assert!(rows.iter().any(|(t, r)| t == "users" && r.contains("Erased user")) && rows.iter().any(|(t, _)| t == "audit_events"));
     for (table, row) in rows {
         let low = row.to_lowercase();
-        for pii in ["ada@example.com", "ada.work@example.com", "lovelace", "ext-ada-0001", "subject-ada-0001", "sealed-totp-of-ada", "diary", "private inbox", "secret plan"] {
+        for pii in ["ada@example.com", "ada.work@example.com", "lovelace", "ext-ada-0001", "subject-ada-0001", "subject-old-0002", "sealed-totp-of-ada", "diary", "private inbox", "secret plan"] {
             assert!(!low.contains(pii), "{pii} in {table}: {row}");
         }
         if table == "audit_events" {
@@ -289,4 +294,21 @@ async fn a_retried_erasure_still_erases_what_its_deleted_bots_wrote() {
     assert_eq!(code, 200, "{v}");
     assert_eq!(app.db.message(wrote).unwrap().text, "[erased]");
     assert!(app.db.erasing_bots(&ada).is_empty(), "forgotten once erased");
+}
+
+#[tokio::test]
+async fn an_open_checkout_is_closed_first_and_a_paid_one_refuses() {
+    let (w, stripe) = crate::billing_http_tests::shop().await;
+    assert_eq!(crate::billing_http_tests::buy(&w, &w.a, "pro").await.0, 200);
+    stripe.pay("cs_test_1");
+    let (code, v) = erase(w.port, &w.admin, &w.a_id, "").await;
+    assert_eq!(code, 409, "{v}");
+    assert_eq!(audit(w.port, &w.admin, "action=user.erase_refused").await[0]["details"]["reason"].as_str(), Some("checkout_paid"));
+    assert!(w.app.db.user(&w.a_id).unwrap().erased_at.is_none());
+
+    assert_eq!(crate::billing_http_tests::buy(&w, &w.b, "pro").await.0, 200);
+    let session = w.app.db.open_checkout(&w.b_id).unwrap();
+    let (code, v) = erase(w.port, &w.admin, &w.b_id, "").await;
+    assert_eq!(code, 200, "{v}");
+    assert!(stripe.seen().iter().any(|s| s.path == format!("/v1/checkout/sessions/{session}/expire")), "her open page was expired at Stripe");
 }

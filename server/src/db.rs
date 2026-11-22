@@ -4249,18 +4249,22 @@ impl Db {
         Ok(out)
     }
 
-    /// Names and emails the user had before: what `user.created` and `user.updated` events
-    /// about them recorded, so erasing scrubs old values a change left in the log.
+    /// Names, emails and sign-in subjects the user had before: what `user.created`,
+    /// `user.updated` and identity events about them recorded, so erasing scrubs old values
+    /// a change left in the log.
     fn past_identifiers(c: &Connection, user_id: &str, emails: &mut Vec<String>, exact: &mut Vec<String>, subjects: &mut Vec<String>) -> rusqlite::Result<()> {
-        const KEYS: [&str; 8] = ["name", "email", "userName", "externalId", "givenName", "familyName", "displayName", "formatted"];
-        let mut st = c.prepare("SELECT details FROM audit_events WHERE target_type = 'user' AND target_id = ? AND action IN ('user.created', 'user.updated')")?;
+        const KEYS: [&str; 9] = ["name", "email", "userName", "externalId", "subject", "givenName", "familyName", "displayName", "formatted"];
+        let mut st = c.prepare("SELECT details FROM audit_events WHERE target_type = 'user' AND target_id = ? AND action IN ('user.created', 'user.updated', 'user.identity_linked', 'user.identity_unlinked')")?;
         let rows = st.query_map([user_id], |r| r.get::<_, String>(0))?;
         for d in rows {
             let Ok(d) = serde_json::from_str::<Value>(&d?) else { continue };
+            if let (Some(i), Some(sub)) = (d["issuer"].as_str(), d["subject"].as_str()) {
+                subjects.push(format!("{i}|{sub}"));
+            }
             let mut found = |key: &str, v: &Value| {
                 let Some(v) = v.as_str().filter(|v| !v.trim().is_empty()) else { return };
                 match key {
-                    "externalId" => subjects.push(v.into()),
+                    "externalId" | "subject" => subjects.push(v.into()),
                     "email" | "userName" => emails.push(v.into()),
                     _ => exact.push(v.into()),
                 }

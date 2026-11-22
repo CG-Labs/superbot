@@ -604,12 +604,12 @@ pub(crate) async fn fake_stripe() -> (String, FakeStripe) {
 }
 
 /// `world(true)` with checkout, against a fake Stripe.
-async fn shop() -> (World, FakeStripe) {
+pub(crate) async fn shop() -> (World, FakeStripe) {
     let (url, f) = fake_stripe().await;
     (world_with(Some(Billing::with_checkout(SECRET, KEY, &url, PUBLIC))).await, f)
 }
 
-async fn buy(w: &World, who: &str, tier: &str) -> (u16, Value) {
+pub(crate) async fn buy(w: &World, who: &str, tier: &str) -> (u16, Value) {
     let (code, body) = call(w.port, "POST", "/api/billing/checkout", who, &json!({ "tier": tier }).to_string()).await;
     (code, parse(&body))
 }
