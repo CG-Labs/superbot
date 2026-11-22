@@ -17,7 +17,13 @@
 use super::wire::{AppliedLimits, LimitReport, RunLimits, RunLimitsReport, RUN_LIMITS_ON, RUN_LIMITS_UNAVAILABLE};
 use std::fs::File;
 use std::os::fd::AsRawFd;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+/// Runs' cgroups made and not yet dropped, by name: a sweep leaves them, even before
+/// their process is in them.
+type Live = Arc<Mutex<HashSet<String>>>;
 
 /// The controllers a run's limits need, and one more applied where there is one.
 pub const REQUIRED: [&str; 3] = ["cpu", "memory", "pids"];
@@ -114,6 +120,7 @@ pub fn absolute(l: &RunLimits, cpus: u32, memory: u64, io: bool) -> AppliedLimit
 pub struct Cgroups {
     base: PathBuf,
     runs: PathBuf,
+    live: Live,
     controllers: Vec<String>,
     cpus: u32,
     memory: u64,
@@ -164,7 +171,7 @@ impl Cgroups {
         if memory != u64::MAX {
             write(&runs, "memory.max", &((memory / 100) * RUNS_MEMORY_PERCENT).to_string())?;
         }
-        let cg = Cgroups { base: base.to_path_buf(), runs, controllers: on, cpus: cpus.max(1), memory };
+        let cg = Cgroups { base: base.to_path_buf(), runs, live: Live::default(), controllers: on, cpus: cpus.max(1), memory };
         cg.sweep();
         Ok(cg)
     }
@@ -220,7 +227,10 @@ impl Cgroups {
                 .map_err(|e| format!("cgroup.procs: {e}"))
         };
         match set() {
-            Ok(procs) => Ok(RunCgroup { dir, procs, applied }),
+            Ok(procs) => {
+                self.live.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string());
+                Ok(RunCgroup { dir, procs, applied, name: name.to_string(), live: self.live.clone() })
+            }
             Err(e) => {
                 let _ = std::fs::remove_dir(&dir);
                 Err(e)
@@ -228,12 +238,14 @@ impl Cgroups {
         }
     }
 
-    /// Removes runs' cgroups that nothing is in any more.
+    /// Removes runs' cgroups that nothing is in any more and no run holds.
     pub fn sweep(&self) {
         let Ok(entries) = std::fs::read_dir(&self.runs) else { return };
+        let live = self.live.lock().unwrap_or_else(|e| e.into_inner()).clone();
         for e in entries.flatten() {
             let p = e.path();
-            if p.is_dir() && counter(&read(&p, "cgroup.events"), "populated") == 0 {
+            let held = e.file_name().to_str().is_some_and(|n| live.contains(n));
+            if !held && p.is_dir() && counter(&read(&p, "cgroup.events"), "populated") == 0 {
                 let _ = std::fs::remove_dir(&p);
             }
         }
@@ -246,6 +258,8 @@ pub struct RunCgroup {
     dir: PathBuf,
     procs: File,
     applied: AppliedLimits,
+    name: String,
+    live: Live,
 }
 
 impl RunCgroup {
@@ -275,6 +289,7 @@ impl RunCgroup {
 impl Drop for RunCgroup {
     /// Gone once empty. What the run left running keeps it until the next sweep.
     fn drop(&mut self) {
+        self.live.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.name);
         let _ = std::fs::remove_dir(&self.dir);
     }
 }
@@ -368,6 +383,9 @@ mod tests {
         assert_eq!(read(run.dir(), "memory.oom.group"), "1");
         assert_eq!(read(run.dir(), "io.weight"), "default 100");
         assert!(cg.start("j1", &DEFAULT).is_err(), "a name in use");
+        // Another run's start doesn't sweep one whose process isn't in it yet.
+        let j2 = cg.start("j2", &DEFAULT).unwrap();
+        assert!(run.dir().exists() && j2.dir().exists());
         assert!(cg.start("../x", &DEFAULT).is_err());
         std::fs::write(run.dir().join("memory.events"), "max 3\noom_kill 1\n").unwrap();
         std::fs::write(run.dir().join("pids.events"), "max 7\n").unwrap();
