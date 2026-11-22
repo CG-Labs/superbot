@@ -5,7 +5,7 @@
 
 use crate::config::{Settings, credentials_in, insecure_in};
 use crate::layout::{Layout, ROLE};
-use crate::registry::{OCI_INDEX, OCI_MANIFEST, Repo, parse_challenge};
+use crate::registry::{Client, OCI_INDEX, OCI_MANIFEST, Repo, next_link, parse_challenge};
 use crate::{fetch, push, sha256_digest};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -26,6 +26,8 @@ struct Store {
     tags: HashMap<(String, String), String>,
     next_upload: u64,
     writes: usize,
+    /// The Authorization header on each blob upload.
+    upload_auth: Vec<String>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -33,6 +35,14 @@ struct Mode {
     referrers_api: bool,
     login: bool,
     rewrite_tags: bool,
+    /// Referrers one to a page, linked by `Link: <...>; rel="next"`.
+    paged: bool,
+    /// ... with the next page on another origin.
+    page_elsewhere: bool,
+    /// Uploads go to another origin (storage behind the registry), which takes them without a login.
+    upload_elsewhere: bool,
+    /// Manifests come back larger than a manifest can be.
+    huge: bool,
 }
 
 struct Fake {
@@ -99,7 +109,9 @@ async fn handle(State(f): State<Arc<Fake>>, method: Method, uri: Uri, headers: H
         let want = format!("Basic {}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, format!("{}:{}", LOGIN.0, LOGIN.1)));
         return if auth == want { reply(StatusCode::OK, &[], json!({ "token": TOKEN }).to_string().into_bytes()) } else { reply(StatusCode::UNAUTHORIZED, &[], vec![]) };
     }
-    if f.mode.login && auth != format!("Bearer {TOKEN}") {
+    let elsewhere = format!("http://localhost:{}", f.addr.rsplit_once(':').unwrap().1);
+    let signed_upload = f.mode.upload_elsewhere && method == Method::PUT && path.contains("/blobs/uploads/") && uri.query().unwrap_or_default().contains("state=x");
+    if f.mode.login && auth != format!("Bearer {TOKEN}") && !signed_upload {
         let challenge = format!(r#"Bearer realm="http://{}/token",service="fake",scope="repository:x:pull""#, f.addr);
         return reply(StatusCode::UNAUTHORIZED, &[("www-authenticate", challenge)], vec![]);
     }
@@ -111,8 +123,10 @@ async fn handle(State(f): State<Arc<Fake>>, method: Method, uri: Uri, headers: H
     if let Some((repo, id)) = rest.split_once("/blobs/uploads/") {
         if method == Method::POST && id.is_empty() {
             s.next_upload += 1;
-            return reply(StatusCode::ACCEPTED, &[("location", format!("/v2/{repo}/blobs/uploads/u{}?state=x", s.next_upload))], vec![]);
+            let origin = if f.mode.upload_elsewhere { elsewhere.as_str() } else { "" };
+            return reply(StatusCode::ACCEPTED, &[("location", format!("{origin}/v2/{repo}/blobs/uploads/u{}?state=x", s.next_upload))], vec![]);
         }
+        s.upload_auth.push(auth.to_string());
         let digest = uri.query().unwrap_or_default().split('&').find_map(|kv| kv.strip_prefix("digest=")).unwrap_or_default().replace("%3A", ":");
         if method != Method::PUT || !uri.query().unwrap_or_default().contains("state=x") || sha256_digest(&body) != digest {
             return reply(StatusCode::BAD_REQUEST, &[], b"DIGEST_INVALID".to_vec());
@@ -155,14 +169,28 @@ async fn handle(State(f): State<Arc<Fake>>, method: Method, uri: Uri, headers: H
             bytes.push(b'\n');
         }
         let mt = serde_json::from_slice::<Value>(&bytes).unwrap()["mediaType"].as_str().unwrap_or(OCI_MANIFEST).to_string();
+        if f.mode.huge {
+            bytes = vec![b' '; 5 << 20];
+        }
         return reply(StatusCode::OK, &[("content-type", mt)], if method == Method::HEAD { vec![] } else { bytes });
     }
     if let Some((repo, digest)) = rest.rsplit_once("/referrers/") {
         if !f.mode.referrers_api {
             return reply(StatusCode::NOT_FOUND, &[], b"404 page not found".to_vec());
         }
-        let index = json!({ "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": s.referrers(repo, digest) });
-        return reply(StatusCode::OK, &[("content-type", OCI_INDEX.into())], index.to_string().into_bytes());
+        let all = s.referrers(repo, digest);
+        let (from, n) = match f.mode.paged {
+            true => (uri.query().and_then(|q| q.strip_prefix("from=")).and_then(|n| n.parse().ok()).unwrap_or(0), 1),
+            false => (0, all.len()),
+        };
+        let page: Vec<Value> = all.iter().skip(from).take(n).cloned().collect();
+        let mut h = vec![("content-type", OCI_INDEX.to_string())];
+        if from + n < all.len() {
+            let origin = if f.mode.page_elsewhere { elsewhere.as_str() } else { "" };
+            h.push(("link", format!("<{origin}/v2/{repo}/referrers/{digest}?from={}>; rel=\"next\"", from + n)));
+        }
+        let index = json!({ "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": page });
+        return reply(StatusCode::OK, &h, index.to_string().into_bytes());
     }
     if let Some((_, digest)) = rest.rsplit_once("/blobs/") {
         return match s.blobs.get(digest) {
@@ -405,7 +433,9 @@ async fn push_two_arches_puts_up_the_signed_index_with_everything_signed() {
         let p = publish(&src, false);
         let cfg = settings(&[&src, &mirror], None);
         let units = [unit(&src, &p, &p.amd64, &cfg).await, unit(&src, &p, &p.arm64, &cfg).await];
-        let top = push::push(&cfg, &repo(&mirror, "mirror/app"), "1.0.0", &units).await.unwrap();
+        assert_eq!(push::push(&cfg, &repo(&mirror, "mirror/app"), "1.0.0", &units, true).await.unwrap(), p.index, "--check says what the tag will name");
+        assert_eq!(mirror.store.lock().unwrap().writes, 0, "--check writes nothing");
+        let top = push::push(&cfg, &repo(&mirror, "mirror/app"), "1.0.0", &units, false).await.unwrap();
         assert_eq!(top, p.index, "the tag names the signed index, unchanged (api={api})");
         {
             let s = mirror.store.lock().unwrap();
@@ -448,7 +478,7 @@ async fn push_one_arch_tags_that_image_with_its_signatures() {
     let p = publish(&src, false);
     let cfg = settings(&[&src, &mirror], None);
     let u = unit(&src, &p, &p.amd64, &cfg).await;
-    let top = push::push(&cfg, &repo(&mirror, "m/app"), "1.0.0", std::slice::from_ref(&u)).await.unwrap();
+    let top = push::push(&cfg, &repo(&mirror, "m/app"), "1.0.0", std::slice::from_ref(&u), false).await.unwrap();
     assert_eq!(top, p.amd64);
     {
         let s = mirror.store.lock().unwrap();
@@ -459,7 +489,7 @@ async fn push_one_arch_tags_that_image_with_its_signatures() {
     }
     // Without signatures (an unsigned image, or an older bundle) the image still goes up.
     std::fs::remove_dir_all(u.join("signatures")).unwrap();
-    assert_eq!(push::push(&cfg, &repo(&mirror, "m/plain"), "1", &[u]).await.unwrap(), p.amd64);
+    assert_eq!(push::push(&cfg, &repo(&mirror, "m/plain"), "1", &[u], false).await.unwrap(), p.amd64);
 }
 
 #[tokio::test]
@@ -483,7 +513,7 @@ async fn push_keeps_what_a_fallback_tag_lists_already() {
         let (d, _) = s.manifest("m/app", &json!({ "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": [other.clone()] }));
         s.tags.insert(("m/app".into(), p.amd64.replacen(':', "-", 1)), d);
     }
-    push::push(&cfg, &repo(&mirror, "m/app"), "1.0.0", &[unit(&src, &p, &p.amd64, &cfg).await]).await.unwrap();
+    push::push(&cfg, &repo(&mirror, "m/app"), "1.0.0", &[unit(&src, &p, &p.amd64, &cfg).await], false).await.unwrap();
     let s = mirror.store.lock().unwrap();
     let v: Value = serde_json::from_slice(&s.get("m/app", &p.amd64.replacen(':', "-", 1)).unwrap()).unwrap();
     let listed: Vec<&Value> = v["manifests"].as_array().unwrap().iter().collect();
@@ -498,9 +528,11 @@ async fn push_refuses_what_cant_make_the_index_before_writing_anything() {
     let p = publish(&src, true);
     let cfg = settings(&[&src, &mirror], None);
     let (a, b) = (unit(&src, &p, &p.amd64, &cfg).await, unit(&src, &p, &p.arm64, &cfg).await);
-    let e = push::push(&cfg, &repo(&mirror, "m/app"), "1", &[a.clone(), b.clone()]).await.unwrap_err();
+    let e = push::push(&cfg, &repo(&mirror, "m/app"), "1", &[a.clone(), b.clone()], false).await.unwrap_err();
     assert!(e.contains("also lists linux/s390x") && e.contains("add the bundles for those arches"), "{e}");
-    let e = push::push(&cfg, &repo(&mirror, "m/app"), "1", &[a.clone(), a.clone()]).await.unwrap_err();
+    let e = push::push(&cfg, &repo(&mirror, "m/app"), "1", &[a.clone(), b.clone()], true).await.unwrap_err();
+    assert!(e.contains("also lists linux/s390x"), "--check refuses it too: {e}");
+    let e = push::push(&cfg, &repo(&mirror, "m/app"), "1", &[a.clone(), a.clone()], false).await.unwrap_err();
     assert!(e.contains("same image") && e.contains("linux/amd64"), "{e}");
     let unsigned = tmp("unsigned");
     std::fs::create_dir_all(unsigned.join("image")).unwrap();
@@ -508,15 +540,65 @@ async fn push_refuses_what_cant_make_the_index_before_writing_anything() {
         std::fs::copy(b.join("image").join(f), unsigned.join("image").join(f)).unwrap();
     }
     copy_dir(&b.join("image/blobs"), &unsigned.join("image/blobs"));
-    let e = push::push(&cfg, &repo(&mirror, "m/app"), "1", &[a.clone(), unsigned]).await.unwrap_err();
+    let e = push::push(&cfg, &repo(&mirror, "m/app"), "1", &[a.clone(), unsigned], false).await.unwrap_err();
     assert!(e.contains("has no signed multi-arch index"), "{e}");
     let other = serve(Mode::default()).await;
     let q = publish(&other, false);
     let cfg2 = settings(&[&src, &mirror, &other], None);
     let c = unit(&other, &q, &q.arm64, &cfg2).await;
-    let e = push::push(&cfg2, &repo(&mirror, "m/app"), "1", &[a, c]).await.unwrap_err();
+    let e = push::push(&cfg2, &repo(&mirror, "m/app"), "1", &[a, c], false).await.unwrap_err();
     assert!(e.contains("different multi-arch indexes"), "{e}");
     assert_eq!(mirror.store.lock().unwrap().writes, 0, "nothing was pushed");
+}
+
+#[tokio::test]
+async fn fetch_follows_every_page_of_referrers_from_the_registry_alone() {
+    let src = serve(Mode { referrers_api: true, paged: true, ..Mode::default() }).await;
+    let p = publish(&src, false);
+    let cfg = settings(&[&src], None);
+    let got = fetch::fetch(&cfg, &repo(&src, REPO), &p.index, &p.arm64, &tmp("paged").join("o")).await.unwrap();
+    assert_eq!((got.referrers, got.attestations), (5, 1), "the index's signature and provenance are on different pages");
+    let src = serve(Mode { referrers_api: true, paged: true, page_elsewhere: true, ..Mode::default() }).await;
+    let p = publish(&src, false);
+    let e = fetch::fetch(&cfg_for(&src), &repo(&src, REPO), &p.index, &p.arm64, &tmp("paged").join("o")).await.unwrap_err();
+    assert!(e.contains("continue on http://localhost:") && e.contains("refusing it"), "{e}");
+}
+
+fn cfg_for(f: &Fake) -> Settings {
+    settings(&[f], None)
+}
+
+#[tokio::test]
+async fn an_oversized_manifest_is_refused_without_reading_it_all() {
+    let src = serve(Mode { huge: true, ..Mode::default() }).await;
+    let p = publish(&src, false);
+    let e = fetch::fetch(&cfg_for(&src), &repo(&src, REPO), &p.index, &p.arm64, &tmp("huge").join("o")).await.unwrap_err();
+    assert!(e.contains("is over 4096 KiB"), "{e}");
+}
+
+#[tokio::test]
+async fn the_login_goes_to_the_registry_alone_not_to_an_upload_elsewhere() {
+    let src = serve(Mode::default()).await;
+    let mirror = serve(Mode { login: true, upload_elsewhere: true, ..Mode::default() }).await;
+    let p = publish(&src, false);
+    let cfg = settings(&[&src, &mirror], Some(LOGIN));
+    let units = [unit(&src, &p, &p.amd64, &cfg).await, unit(&src, &p, &p.arm64, &cfg).await];
+    assert_eq!(push::push(&cfg, &repo(&mirror, "m/app"), "1", &units, false).await.unwrap(), p.index);
+    let s = mirror.store.lock().unwrap();
+    assert!(!s.upload_auth.is_empty() && s.upload_auth.iter().all(String::is_empty), "{:?}", s.upload_auth);
+}
+
+#[tokio::test]
+async fn a_registry_on_https_cant_send_us_to_http() {
+    let c = Client::new(&Settings::default(), &Repo::parse("reg.test/a").unwrap(), true).await.unwrap();
+    for bad in ["http://reg.test/v2/a/blobs/uploads/1", "http://storage.test/u/1", "ftp://reg.test/x"] {
+        assert!(c.resolve(bad, "upload location").unwrap_err().contains("isn't HTTPS"), "{bad}");
+    }
+    assert_eq!(c.resolve("/v2/a/blobs/uploads/1?s=x", "upload location").unwrap().as_str(), "https://reg.test/v2/a/blobs/uploads/1?s=x");
+    assert!(c.resolve("https://storage.test/u/1", "upload location").is_ok(), "storage elsewhere, over HTTPS, without our login");
+    assert_eq!(next_link(r#"</v2/a/referrers/x?n=2>; rel="next""#), Some("/v2/a/referrers/x?n=2"));
+    assert_eq!(next_link(r#"<https://a.test/p>; rel="prev", </q>; rel=next"#), Some("/q"));
+    assert_eq!(next_link("</q>"), None);
 }
 
 fn copy_dir(from: &Path, to: &Path) {
@@ -538,7 +620,7 @@ async fn a_registry_that_changes_the_tag_is_caught() {
     let p = publish(&src, false);
     let cfg = settings(&[&src, &mirror], None);
     let units = [unit(&src, &p, &p.amd64, &cfg).await, unit(&src, &p, &p.arm64, &cfg).await];
-    let e = push::push(&cfg, &repo(&mirror, "m/app"), "1.0.0", &units).await.unwrap_err();
+    let e = push::push(&cfg, &repo(&mirror, "m/app"), "1.0.0", &units, false).await.unwrap_err();
     assert!(e.contains("after the push, not") && e.contains(&p.index), "{e}");
 }
 
@@ -556,14 +638,22 @@ async fn logs_in_with_the_operators_credentials() {
 #[test]
 fn registries_conf_marks_registries_insecure_as_containers_does() {
     let v2 = "unqualified-search-registries = [\"docker.io\"]\n\n[[registry]]\nlocation = \"lab.test:5000\" # plain HTTP\ninsecure = true\n\n[[registry]]\nprefix = \"corp.test/team\"\nlocation = \"mirror.corp.test/team\"\ninsecure = true\n[[registry.mirror]]\nlocation = \"other.test\"\ninsecure = false\n\n[[registry]]\nlocation = \"*.dev.test\"\ninsecure = true\n\n[[registry]]\nlocation = \"tls.test\"\n";
-    assert!(insecure_in(v2, "lab.test:5000", "x/y"));
-    assert!(!insecure_in(v2, "lab.test", "x/y"), "the port is part of the location");
-    assert!(insecure_in(v2, "corp.test", "team/app") && !insecure_in(v2, "corp.test", "teams/app"), "a prefix covers its path");
-    assert!(insecure_in(v2, "a.dev.test", "app") && !insecure_in(v2, "dev.test", "app"));
-    assert!(!insecure_in(v2, "tls.test", "app") && !insecure_in(v2, "other.test", "app"));
+    let one = |t: &str, h: &str, p: &str| insecure_in(&[t.to_string()], h, p);
+    assert!(one(v2, "lab.test:5000", "x/y"));
+    assert!(!one(v2, "lab.test", "x/y"), "the port is part of the location");
+    assert!(one(v2, "corp.test", "team/app") && !one(v2, "corp.test", "teams/app"), "a prefix covers its path");
+    assert!(one(v2, "a.dev.test", "app") && !one(v2, "dev.test", "app"));
+    assert!(!one(v2, "tls.test", "app") && !one(v2, "other.test", "app"));
     let v1 = "[registries.insecure]\nregistries = ['old.test:5000', \"older.test\"]\n";
-    assert!(insecure_in(v1, "old.test:5000", "a") && insecure_in(v1, "older.test", "a") && !insecure_in(v1, "new.test", "a"));
-    assert!(!insecure_in("# location = \"lab.test:5000\"\n# insecure = true\n", "lab.test:5000", "a"));
+    assert!(one(v1, "old.test:5000", "a") && one(v1, "older.test", "a") && !one(v1, "new.test", "a"));
+    assert!(!one("# location = \"lab.test:5000\"\n# insecure = true\n", "lab.test:5000", "a"));
+    // The most specific registry decides, and a later file's registry replaces an earlier one's.
+    let wide = "[[registry]]\nlocation = \"*.corp.test\"\ninsecure = true\n[[registry]]\nlocation = \"reg.corp.test\"\ninsecure = false\n[[registry]]\nprefix = \"lab.test/secure\"\nlocation = \"lab.test/secure\"\n";
+    assert!(one(wide, "old.corp.test", "a") && !one(wide, "reg.corp.test", "a"), "insecure = false for one host wins over *.corp.test");
+    assert!(one(v2, "lab.test:5000", "secure/a"));
+    let both = [v2.to_string(), "[[registry]]\nlocation = \"lab.test:5000\"\ninsecure = false\n".to_string()];
+    assert!(!insecure_in(&both, "lab.test:5000", "a"), "a drop-in that says insecure = false wins");
+    assert!(insecure_in(&both, "corp.test", "team/a"), "and leaves the others alone");
 }
 
 #[test]

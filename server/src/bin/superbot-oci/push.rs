@@ -84,7 +84,8 @@ async fn push_manifest(c: &Client, reference: &str, s: &Source<'_>) -> Result<cr
     c.put_manifest(reference, &s.bytes, &s.media_type).await
 }
 
-pub async fn push(settings: &Settings, repo: &Repo, tag: &str, dirs: &[PathBuf]) -> Result<String, String> {
+/// With CHECK, only what can be checked here: the digest the tag would name, with no network.
+pub async fn push(settings: &Settings, repo: &Repo, tag: &str, dirs: &[PathBuf], check: bool) -> Result<String, String> {
     let units = dirs.iter().map(|d| load(d)).collect::<Result<Vec<_>, _>>()?;
     let mut images = HashSet::new();
     for u in &units {
@@ -139,6 +140,9 @@ pub async fn push(settings: &Settings, repo: &Repo, tag: &str, dirs: &[PathBuf])
         if whole && !entries.iter().any(|e| e["digest"] == u.digest.as_str()) {
             return Err(format!("{} ({}) isn't in the signed index {}", u.dir.display(), u.platform, index.clone().unwrap_or_default()));
         }
+    }
+    if check {
+        return Ok(if whole { index.expect("whole needs an index") } else { units[0].digest.clone() });
     }
 
     let c = Client::new(settings, repo, true).await?;

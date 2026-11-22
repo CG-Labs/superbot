@@ -16,6 +16,10 @@ const ACCEPT_MANIFESTS: &str = "application/vnd.oci.image.index.v1+json, applica
     application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json";
 /// Registries must take manifests of at least 4 MiB; nothing we copy is near it.
 const MAX_MANIFEST: usize = 4 << 20;
+/// Token service replies and error bodies.
+const MAX_SMALL: usize = 64 << 10;
+/// Referrers a registry may list for one subject, over all its pages.
+const MAX_REFERRERS: usize = 1000;
 
 /// A repository: `HOST[:PORT]/PATH`. The host has a dot or a port, or is localhost.
 #[derive(Clone, Debug, PartialEq)]
@@ -109,6 +113,31 @@ fn chain(e: &dyn std::error::Error) -> String {
     s
 }
 
+/// A response's body, refused once it passes MAX bytes rather than read whole first.
+async fn read_capped(mut res: reqwest::Response, max: usize, what: &str) -> Result<Vec<u8>, String> {
+    let too_big = || format!("{what} is over {} KiB: refusing it", max >> 10);
+    if res.content_length().is_some_and(|n| n > max as u64) {
+        return Err(too_big());
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = res.chunk().await.map_err(|e| format!("{what}: {}", chain(&e)))? {
+        if out.len() + chunk.len() > max {
+            return Err(too_big());
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
+/// The `rel="next"` target of a `Link` header, as the referrers API pages its lists.
+pub fn next_link(h: &str) -> Option<&str> {
+    h.split(',').find_map(|part| {
+        let (target, params) = part.split_once(';')?;
+        let target = target.trim().strip_prefix('<')?.strip_suffix('>')?;
+        params.split(';').any(|p| matches!(p.trim().replace(' ', "").as_str(), "rel=\"next\"" | "rel=next")).then_some(target)
+    })
+}
+
 pub enum Body<'a> {
     Empty,
     Bytes(&'a [u8], &'a str),
@@ -153,13 +182,34 @@ impl Client {
         format!("{}/v2/{}/{rest}", self.base, self.repo.path)
     }
 
+    /// Whether URL is the registry itself (scheme, host and port), the only place its login goes.
+    fn ours(&self, url: &str) -> bool {
+        match (url::Url::parse(&self.base), url::Url::parse(url)) {
+            (Ok(a), Ok(b)) => a.origin() == b.origin(),
+            _ => false,
+        }
+    }
+
+    /// A URL the registry gave us (an upload location, a next page), resolved against it.
+    /// One that would drop from HTTPS to HTTP is refused.
+    pub fn resolve(&self, target: &str, what: &str) -> Result<url::Url, String> {
+        let base = url::Url::parse(&self.base).map_err(|e| e.to_string())?;
+        let url = base.join(target).map_err(|e| format!("{}'s {what} {target}: {e}", self.repo.host))?;
+        if !matches!(url.scheme(), "https" | "http") || (base.scheme() == "https" && url.scheme() != "https") {
+            return Err(format!("{} gave a {what} that isn't HTTPS ({url}): refusing it", self.repo.host));
+        }
+        Ok(url)
+    }
+
     async fn send(&self, method: Method, url: &str, headers: &[(reqwest::header::HeaderName, String)], body: &Body<'_>) -> Result<reqwest::Response, String> {
         for attempt in 0..2 {
             let mut rb = self.http.request(method.clone(), url);
             for (k, v) in headers {
                 rb = rb.header(k, v);
             }
-            if let Some(a) = self.authz.lock().unwrap().clone() {
+            if self.ours(url)
+                && let Some(a) = self.authz.lock().unwrap().clone()
+            {
                 rb = rb.header(AUTHORIZATION, a);
             }
             rb = match body {
@@ -172,7 +222,7 @@ impl Client {
                 }
             };
             let res = rb.send().await.map_err(|e| format!("{} {url}: {}", method, chain(&e)))?;
-            if res.status() == StatusCode::UNAUTHORIZED && attempt == 0 {
+            if res.status() == StatusCode::UNAUTHORIZED && attempt == 0 && self.ours(url) {
                 let challenge = res.headers().get(WWW_AUTHENTICATE).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
                 self.authenticate(&challenge).await?;
                 continue;
@@ -195,6 +245,9 @@ impl Client {
             "bearer" => {
                 let realm = param("realm").ok_or(format!("{host} asked for a token without saying where to get one"))?;
                 let mut url = url::Url::parse(realm).map_err(|e| format!("{host}'s token realm {realm}: {e}"))?;
+                if self.creds.is_some() && self.base.starts_with("https:") && url.scheme() != "https" {
+                    return Err(format!("{host} sends logins to {realm}, which isn't HTTPS: refusing to send yours there"));
+                }
                 let scope = format!("repository:{}:{}", self.repo.path, if self.push { "pull,push" } else { "pull" });
                 {
                     let mut q = url.query_pairs_mut();
@@ -212,7 +265,8 @@ impl Client {
                     let why = if self.creds.is_some() { "refused the login" } else { "wants a login" };
                     return Err(format!("{host} {why} for {scope} (HTTP {}): {login}", res.status().as_u16()));
                 }
-                let v: Value = res.json().await.map_err(|e| format!("{host}'s token service: {e}"))?;
+                let body = read_capped(res, MAX_SMALL, &format!("{host}'s token")).await?;
+                let v: Value = serde_json::from_slice(&body).map_err(|e| format!("{host}'s token service: {e}"))?;
                 let token = v["token"].as_str().or(v["access_token"].as_str()).filter(|t| !t.is_empty()).ok_or(format!("{host}'s token service gave no token"))?;
                 format!("Bearer {token}")
             }
@@ -224,8 +278,8 @@ impl Client {
 
     async fn failure(what: String, res: reqwest::Response) -> String {
         let code = res.status().as_u16();
-        let body = res.text().await.unwrap_or_default();
-        let detail: String = body.chars().take(300).collect();
+        let body = read_capped(res, MAX_SMALL, "the reply").await.unwrap_or_default();
+        let detail: String = String::from_utf8_lossy(&body).chars().take(300).collect();
         format!("{what}: HTTP {code} {}", detail.trim())
     }
 
@@ -238,10 +292,7 @@ impl Client {
         if !res.status().is_success() {
             return Err(Self::failure(format!("Couldn't read {}:{reference}", self.repo), res).await);
         }
-        let bytes = res.bytes().await.map_err(|e| e.to_string())?.to_vec();
-        if bytes.len() > MAX_MANIFEST {
-            return Err(format!("{}:{reference} is larger than a manifest can be", self.repo));
-        }
+        let bytes = read_capped(res, MAX_MANIFEST, &format!("{}:{reference}", self.repo)).await?;
         if digest_ok(reference) && sha256_digest(&bytes) != reference {
             return Err(format!("{}@{reference} came back as {}: refusing it", self.repo, sha256_digest(&bytes)));
         }
@@ -262,25 +313,43 @@ impl Client {
         Ok(Put { indexed_subject: res.headers().contains_key("oci-subject") })
     }
 
-    /// The referrers the registry lists for DIGEST, or None if it has no referrers API.
+    /// The referrers the registry lists for DIGEST, over every page, or None if it has no
+    /// referrers API. Later pages must come from the registry itself.
     pub async fn referrers(&self, digest: &str) -> Result<Option<Vec<Value>>, String> {
-        let res = self.send(Method::GET, &self.url(&format!("referrers/{digest}")), &[(ACCEPT, OCI_INDEX.into())], &Body::Empty).await?;
-        if matches!(res.status(), StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::BAD_REQUEST) {
-            return Ok(None);
-        }
-        if !res.status().is_success() {
-            return Err(Self::failure(format!("Couldn't list what refers to {}@{digest}", self.repo), res).await);
-        }
-        let is_index = res.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|t| t.starts_with(OCI_INDEX));
-        let v: Value = match res.json().await {
-            Ok(v) => v,
-            Err(_) if !is_index => return Ok(None),
-            Err(e) => return Err(format!("{}'s referrers for {digest}: {e}", self.repo)),
-        };
-        match v["manifests"].as_array() {
-            Some(m) => Ok(Some(m.clone())),
-            None if !is_index => Ok(None),
-            None => Err(format!("{}'s referrers for {digest} aren't an index", self.repo)),
+        let what = format!("{}'s referrers for {digest}", self.repo);
+        let mut url = self.url(&format!("referrers/{digest}"));
+        let mut all = Vec::new();
+        let mut first = true;
+        loop {
+            let res = self.send(Method::GET, &url, &[(ACCEPT, OCI_INDEX.into())], &Body::Empty).await?;
+            if first && matches!(res.status(), StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::BAD_REQUEST) {
+                return Ok(None);
+            }
+            if !res.status().is_success() {
+                return Err(Self::failure(format!("Couldn't list what refers to {}@{digest}", self.repo), res).await);
+            }
+            let is_index = res.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|t| t.starts_with(OCI_INDEX));
+            let next = res.headers().get("link").and_then(|v| v.to_str().ok()).and_then(next_link).map(String::from);
+            let body = read_capped(res, MAX_MANIFEST, &what).await?;
+            let page = match serde_json::from_slice::<Value>(&body) {
+                Ok(v) => v["manifests"].as_array().cloned(),
+                Err(_) => None,
+            };
+            match page {
+                Some(m) => all.extend(m),
+                None if first && !is_index => return Ok(None),
+                None => return Err(format!("{what} aren't an index")),
+            }
+            if all.len() > MAX_REFERRERS {
+                return Err(format!("{what} list more than {MAX_REFERRERS}: refusing them"));
+            }
+            let Some(next) = next else { return Ok(Some(all)) };
+            let u = self.resolve(&next, "next page of referrers")?;
+            if !self.ours(u.as_str()) {
+                return Err(format!("{what} continue on {u}, not on {}: refusing it", self.repo.host));
+            }
+            url = u.to_string();
+            first = false;
         }
     }
 
@@ -331,8 +400,7 @@ impl Client {
             return Err(Self::failure(format!("Couldn't start an upload to {}", self.repo), res).await);
         }
         let loc = res.headers().get(LOCATION).and_then(|v| v.to_str().ok()).ok_or(format!("{} started an upload without a Location", self.repo.host))?;
-        let base = url::Url::parse(&self.base).map_err(|e| e.to_string())?;
-        let mut url = base.join(loc).map_err(|e| format!("{}'s upload location {loc}: {e}", self.repo.host))?;
+        let mut url = self.resolve(loc, "upload location")?;
         url.query_pairs_mut().append_pair("digest", digest);
         let res = self.send(Method::PUT, url.as_str(), &[], &Body::File(src)).await?;
         if !res.status().is_success() {

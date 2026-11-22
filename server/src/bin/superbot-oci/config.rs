@@ -79,7 +79,8 @@ impl Settings {
 
     /// Whether registries.conf lets HOST/PATH be reached over plain HTTP.
     pub fn insecure(&self, host: &str, path: &str) -> bool {
-        self.registries_confs.iter().filter_map(|f| std::fs::read_to_string(f).ok()).any(|t| insecure_in(&t, host, path))
+        let texts: Vec<String> = self.registries_confs.iter().filter_map(|f| std::fs::read_to_string(f).ok()).collect();
+        insecure_in(&texts, host, path)
     }
 }
 
@@ -191,9 +192,24 @@ fn covers(pattern: &str, host: &str, path: &str) -> bool {
     pattern == host || pattern == full || full.starts_with(&format!("{pattern}/"))
 }
 
-/// Whether one registries.conf (version 2 `[[registry]]` tables, or version 1's
-/// `[registries.insecure]` list) marks HOST/PATH insecure.
-pub fn insecure_in(text: &str, host: &str, path: &str) -> bool {
+/// Whether registries.conf files, in the order containers reads them (version 2 `[[registry]]`
+/// tables, or version 1's `[registries.insecure]` list), mark HOST/PATH insecure. As in
+/// containers/image, the registry with the longest matching prefix decides, and a later file's
+/// registry with the same prefix replaces an earlier one, so `insecure = false` there wins.
+pub fn insecure_in(texts: &[String], host: &str, path: &str) -> bool {
+    let mut rules: Vec<(String, bool)> = Vec::new();
+    for t in texts {
+        for (prefix, insecure) in registries_in(t) {
+            rules.retain(|(p, _)| *p != prefix);
+            rules.push((prefix, insecure));
+        }
+    }
+    rules.iter().filter(|(p, _)| covers(p, host, path)).max_by_key(|(p, _)| p.len()).is_some_and(|(_, insecure)| *insecure)
+}
+
+/// One registries.conf's registries: each one's prefix (its location if it has none) and
+/// whether it is insecure.
+fn registries_in(text: &str) -> Vec<(String, bool)> {
     #[derive(Default)]
     struct Block {
         location: Option<String>,
@@ -231,5 +247,7 @@ pub fn insecure_in(text: &str, host: &str, path: &str) -> bool {
             v1.extend(list.split(',').map(toml_value).filter(|s| !s.is_empty()).map(String::from));
         }
     }
-    blocks.iter().any(|b| b.insecure && b.prefix.as_ref().or(b.location.as_ref()).is_some_and(|p| covers(p, host, path))) || v1.iter().any(|p| covers(p, host, path))
+    let mut out: Vec<(String, bool)> = blocks.into_iter().filter_map(|b| b.prefix.or(b.location).map(|p| (p, b.insecure))).collect();
+    out.extend(v1.into_iter().map(|p| (p, true)));
+    out
 }

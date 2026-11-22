@@ -2,7 +2,7 @@
 //! bundle and from the bundle into a registry mirror (docs/adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md).
 //! `deploy/offline-bundle.sh` runs it; skopeo can't copy OCI 1.1 referrers.
 //!   superbot-oci fetch --from HOST/PATH@DIGEST --image DIGEST --out DIR
-//!   superbot-oci push --to HOST/PATH:TAG UNIT...
+//!   superbot-oci push [--check] --to HOST/PATH:TAG UNIT...
 //!   superbot-oci --version
 //!
 //! `fetch` writes an OCI image layout holding what `--from` names (an index, or the image
@@ -14,7 +14,8 @@
 //! and, if it was signed, `signatures/` (what `fetch` wrote). When the units hold every image
 //! and attestation their index lists, the index goes up unchanged and the tag names it;
 //! otherwise one unit's image does. Signatures and attestations follow, then the tag, last,
-//! read back. Prints the digest the tag names.
+//! read back. Prints the digest the tag names. `--check` only checks the units, with no network,
+//! and prints the digest the tag would name.
 
 mod config;
 mod fetch;
@@ -42,7 +43,7 @@ pub fn tag_ok(t: &str) -> bool {
 
 const USAGE: &str = "Usage:
   superbot-oci fetch --from HOST/PATH@DIGEST --image DIGEST --out DIR
-  superbot-oci push --to HOST/PATH:TAG UNIT...
+  superbot-oci push [--check] --to HOST/PATH:TAG UNIT...
   superbot-oci --version";
 
 fn flag<'a>(args: &'a [String], name: &str) -> Result<&'a str, String> {
@@ -94,10 +95,15 @@ async fn run(args: &[String]) -> Result<Option<String>, String> {
         Some("push") => {
             let rest = &args[1..];
             let mut units = Vec::new();
+            let mut check = false;
             let mut i = 0;
             while i < rest.len() {
                 match rest[i].as_str() {
                     "--to" => i += 2,
+                    "--check" => {
+                        check = true;
+                        i += 1;
+                    }
                     a if a.starts_with("--") => return Err(format!("Unknown option {a}\n{USAGE}")),
                     a => {
                         units.push(std::path::PathBuf::from(a));
@@ -109,7 +115,7 @@ async fn run(args: &[String]) -> Result<Option<String>, String> {
             if units.is_empty() {
                 return Err(format!("push needs at least one UNIT\n{USAGE}"));
             }
-            push::push(&settings, &repo, &tag, &units).await.map(Some)
+            push::push(&settings, &repo, &tag, &units, check).await.map(Some)
         }
         _ => Err(USAGE.into()),
     }
