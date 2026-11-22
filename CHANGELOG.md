@@ -1,0 +1,34 @@
+# Changelog
+
+All notable changes to SuperBot are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The version is `server/Cargo.toml`'s; tagging `v<version>` publishes the images ([ADR 0084](docs/adr/0084-published-image-with-computer-use.md)) and a GitHub release with that version's section below as its notes ([ADR 0111](docs/adr/0111-changelog-and-github-releases.md)).
+
+Add each user-facing change to the newest section in the PR that makes it. Once that version is tagged, start a `## [Unreleased]` section above it, and rename it to the next version, with `server/Cargo.toml` bumped to match, before tagging that one. CI checks the format, that the newest version is `server/Cargo.toml`'s, and that every tag has a dated section (`deploy/release-notes.sh`).
+
+## [0.1.0] - Unreleased
+
+The first release: everything merged to `main` up to the M4 public-launch work ([roadmap](docs/ROADMAP.md)).
+
+### Added
+
+- `botd`, a harness-agnostic Bot server in Rust, with adapters for Claude Code, Codex, Pi and Hermes Agent ([ADR 0011](docs/adr/0011-hermes-agent-backend.md)); Hermes Agent is the default harness on managed tiers ([ADR 0079](docs/adr/0079-hermes-default-for-managed-tiers.md)).
+- A computer per Bot: a screen with a browser and desktop apps, shown live ([ADR 0003](docs/adr/0003-computer.md)).
+- Bot-to-Bot messaging (`botctl ask`), routines, per-Bot model and reasoning effort, and suggested prompts.
+- An Expo client for web, iOS and Android as the single interface, with a minimal admin-only console ([ADR 0027](docs/adr/0027-expo-primary-hermes-default.md), [ADR 0032](docs/adr/0032-console-admin-only.md)), push notifications ([ADR 0080](docs/adr/0080-client-push-notifications.md)) and an optional biometric app lock ([ADR 0078](docs/adr/0078-client-biometric-app-lock.md)).
+- Installs: a VPS installer and Docker Compose ([ADR 0006](docs/adr/0006-docker-compose.md)), published multi-arch images on GHCR with computer use ([ADR 0084](docs/adr/0084-published-image-with-computer-use.md)), an onboarding wizard ([ADR 0034](docs/adr/0034-onboarding-wizard.md)) and a backup and restore tool with a CI drill ([ADR 0030](docs/adr/0030-backup-restore-drill.md)).
+- Multi-user: users, server-side sessions and RBAC ([ADR 0012](docs/adr/0012-users-sessions-rbac.md)); sign-in with Microsoft Entra ID, Google, generic OIDC, GitHub, Apple and SAML through a broker; SCIM 2.0 provisioning, with SCIM groups as teams ([ADR 0095](docs/adr/0095-scim-groups-as-teams.md)); shared and private Bots.
+- Approvals and a harness permission policy, with an editor, notifications and end-to-end hook tests against the real harness CLIs ([ADR 0007](docs/adr/0007-approvals.md)).
+- Per-user isolation: a Unix account per user on one server ([ADR 0037](docs/adr/0037-per-user-unix-accounts.md)), teammates' own accounts and logins, and a token per run ([ADR 0083](docs/adr/0083-per-run-tokens.md)).
+- A managed control plane: one machine per user on Linode or as an Incus container ([ADR 0025](docs/adr/0025-control-plane-linode.md), [ADR 0065](docs/adr/0065-incus-container-machines.md)), enrolled over mutual TLS ([ADR 0031](docs/adr/0031-machine-enrollment-mtls.md)), with harness CLIs, logins, screens, off-host backups, restores onto another host and placement by host load.
+- Teams with a machine per teammate ([ADR 0087](docs/adr/0087-team-accounts-and-machines.md)).
+- Plans: tiers with model routing behind them ([ADR 0033](docs/adr/0033-tiers-model-routing.md)) and fallback across providers ([ADR 0077](docs/adr/0077-two-providers-through-tier-routing.md)); Stripe billing with checkout, the customer portal, token metering, storage limits, resizing on a plan change, billing emails and team plans ([ADR 0093](docs/adr/0093-team-billing.md)); a self-host license key ([ADR 0038](docs/adr/0038-self-host-license-key.md)) and no free tier ([ADR 0068](docs/adr/0068-no-free-tier.md)).
+- Operations: Prometheus metrics and structured logs ([ADR 0089](docs/adr/0089-metrics-and-structured-logs.md)), host capacity metrics and a dashboard ([ADR 0106](docs/adr/0106-host-capacity-metrics.md)), and a status page with an uptime SLO ([ADR 0090](docs/adr/0090-status-page-and-uptime-slo.md)).
+- Compliance: audit events with CSV export, chat history retention with legal holds ([ADR 0098](docs/adr/0098-chat-retention.md)), an access-review report ([ADR 0099](docs/adr/0099-access-review-report.md)), erasing a user's data ([ADR 0102](docs/adr/0102-erasing-a-users-data.md)) and deleting a destroyed machine's backups ([ADR 0108](docs/adr/0108-deleting-a-destroyed-machines-backups.md)).
+- A security pack for buyers and a SOC 2 readiness checklist ([pack](docs/security/README.md)), a security policy ([SECURITY.md](SECURITY.md)), and this changelog with a GitHub release per tag ([ADR 0111](docs/adr/0111-changelog-and-github-releases.md)).
+
+### Security
+
+- Secrets sealed under a master key and redacted from output ([ADR 0010](docs/adr/0010-secrets.md)), with safe master key rotation ([ADR 0096](docs/adr/0096-master-key-rotation.md)).
+- TOTP second factor with recovery codes ([ADR 0094](docs/adr/0094-totp-second-factor.md)), JIT SSO accounts only from an allow-list ([ADR 0103](docs/adr/0103-sso-jit-needs-an-allow-list.md)), and alerts on suspicious sign-ins ([ADR 0104](docs/adr/0104-suspicious-sign-in-alerts.md)).
+- Model providers only over HTTPS ([ADR 0097](docs/adr/0097-model-providers-over-https.md)) and harness sandboxes on by default.
+- Supply chain: dependency vulnerability scanning ([ADR 0092](docs/adr/0092-dependency-vulnerability-scanning.md)), GitHub Actions pinned by commit ([ADR 0100](docs/adr/0100-github-actions-pinned-by-commit.md)), and image scanning, signing and provenance ([ADR 0101](docs/adr/0101-image-scanning-and-signing.md)).
+- Chromium's sandbox on inside the container ([ADR 0107](docs/adr/0107-chromium-sandbox-in-the-container.md)).
