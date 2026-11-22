@@ -134,5 +134,5 @@ flowchart TB
 
 - Per-user cgroup and egress limits for harness runs, and per-user egress allowlists (M5, [roadmap](../ROADMAP.md)).
 - Native SAML without a broker (M5, [ADR 0020](../adr/0020-saml-bridge.md)).
-- A tamper-evident (hash-chained) audit log (M5, [ADR 0009](../adr/0009-audit-events.md)).
+- Write-once storage for exported audit events (M5; the hash chain and SIEM export are done, [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md)).
 - A read-only root filesystem for the containers ([ADR 0084](../adr/0084-published-image-with-computer-use.md)).

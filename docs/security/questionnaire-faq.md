@@ -30,7 +30,7 @@ Destructive commands, file deletes, outbound messages, network installs and `git
 A token for that run only, revoked when it ends, plus the secrets its owner and the server give it. Never botd's own secrets. See [per-run tokens](access-control.md#bots-a-token-for-each-run).
 
 **Is there an audit log?**
-Yes, append-only, with the actor of each event, viewable and exportable as CSV by admins. Kept forever unless retention is set. Tamper evidence (hash chain) is planned (M5). See [audit log](access-control.md#audit-log).
+Yes, append-only, with the actor of each event, viewable and exportable as CSV by admins. Kept forever unless retention is set. Tamper-evident: each event is on a hash chain that `botctl audit verify` checks, and every event can be exported to your SIEM ([ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md)). See [audit log](access-control.md#audit-log).
 
 **Which third parties see our data?**
 Only the services the operator turns on: hosting, backup storage, model providers, Stripe, push, email, webhooks, IdPs. See [subprocessors](subprocessors.md).
