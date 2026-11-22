@@ -296,13 +296,20 @@ impl Inner {
             let body = self.get(&url, "listing secrets").await?.ok_or_else(|| Error::Unavailable("Azure Key Vault: listing secrets answered 404".into()))?;
             let v: Value = serde_json::from_slice(&body).map_err(|e| unavailable("listing secrets", e))?;
             let items = v["value"].as_array().ok_or_else(|| Error::Unavailable("Azure Key Vault: listing secrets gave no list".into()))?;
+            // A short list would hide cloud-only keys and uncover sealed copies, so odd entries fail closed.
             for item in items {
-                let id = item["id"].as_str().unwrap_or_default();
-                if let Some(name) = id.rsplit('/').next().and_then(|s| self.name_in(scope, s)) {
+                let id = item["id"].as_str().and_then(|id| id.split_once("/secrets/")).map(|(_, s)| s).filter(|s| !s.is_empty() && !s.contains('/'));
+                let id = id.ok_or_else(|| Error::Unavailable("Azure Key Vault: listing secrets gave an entry with no secret id".into()))?;
+                if let Some(name) = self.name_in(scope, id) {
                     out.push(name);
                 }
             }
-            next = v["nextLink"].as_str().filter(|s| !s.is_empty()).map(String::from);
+            next = match &v["nextLink"] {
+                Value::Null => None,
+                Value::String(s) if s.is_empty() => None,
+                Value::String(s) => Some(s.clone()),
+                _ => return Err(Error::Unavailable("Azure Key Vault: listing secrets gave a nextLink that isn't text".into())),
+            };
         }
         Ok(out)
     }
@@ -363,6 +370,8 @@ mod tests {
         down: AtomicBool,
         /// Lists hand out a next page on another host.
         evil: AtomicBool,
+        /// Lists answer oddly: 1 = an entry with no id, 2 = a nextLink that isn't text.
+        odd_list: AtomicUsize,
         expires_in: AtomicUsize,
         /// What the last sign-in asked for.
         asked: Mutex<Vec<HashMap<String, String>>>,
@@ -440,7 +449,12 @@ mod tests {
         names.sort();
         // Two to a page, to follow nextLink.
         let skip: usize = q.get("skip").and_then(|s| s.parse().ok()).unwrap_or(0);
-        let page: Vec<Value> = names.iter().skip(skip).take(2).map(|n| json!({ "id": format!("https://kv.example/secrets/{n}"), "attributes": { "enabled": true } })).collect();
+        let mut page: Vec<Value> = names.iter().skip(skip).take(2).map(|n| json!({ "id": format!("https://kv.example/secrets/{n}"), "attributes": { "enabled": true } })).collect();
+        match f.odd_list.load(Ordering::SeqCst) {
+            1 => page.push(json!({ "attributes": { "enabled": true } })),
+            2 => return (StatusCode::OK, Json(json!({ "value": page, "nextLink": 7 }))),
+            _ => {}
+        }
         let base = h.get("host").and_then(|v| v.to_str().ok()).unwrap_or_default();
         let next = (skip + 2 < names.len()).then(|| match f.evil.load(Ordering::SeqCst) {
             true => "https://elsewhere.example/secrets?skip=2".to_string(),
@@ -604,6 +618,12 @@ mod tests {
         f.evil.store(true, Ordering::SeqCst);
         let e = s.check().unwrap_err().to_string();
         assert!(e.contains("another host"), "a next page elsewhere is refused before a token is sent there: {e}");
+        f.evil.store(false, Ordering::SeqCst);
+        for (odd, err) in [(1, "no secret id"), (2, "nextLink that isn't text")] {
+            f.odd_list.store(odd, Ordering::SeqCst);
+            let e = s.check().unwrap_err().to_string();
+            assert!(e.contains(err), "an odd list fails closed rather than coming back short: {e}");
+        }
     }
 
     #[test]
