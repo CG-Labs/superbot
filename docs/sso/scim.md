@@ -2,7 +2,7 @@
 
 Lets your IdP create SuperBot users when people are assigned the app, keep their name and email current, and disable them when they leave. Disabling ends their sessions at once. With `SCIM_GROUPS=on`, the groups it pushes become [teams](#groups-as-teams), and people join and leave them as the IdP says. Design: [ADR 0023](../adr/0023-scim.md), [ADR 0095](../adr/0095-scim-groups-as-teams.md).
 
-SCIM never gives anyone a role above `SCIM_DEFAULT_ROLE` (member, or readonly), and never a team role; admins promote people as before. Group-to-role mapping and bulk aren't supported.
+SCIM never gives anyone a role above `SCIM_DEFAULT_ROLE` (member, or readonly), and never a team role; admins promote people as before. Group-to-role mapping isn't supported. [Bulk](#bulk) is, for clients that batch.
 
 You need: SuperBot on HTTPS at a fixed address, like `https://superbot.example.com`, and an admin's `botctl` on the server. Below, replace `superbot.example.com` with yours.
 
@@ -120,9 +120,41 @@ The IdP takes the team on when it pushes the group with that `externalId` (or, w
 
 **Audit.** `scim.group_created`, `scim.group_adopted`, `scim.group_resumed` (a retried `POST` that had stopped partway), `scim.group_updated` (with `added`, `removed`, `ownerless`), `scim.group_deleted` (with `teamFate`), `scim.group_member_refused`, `scim.group_linked`, `scim.group_unlinked`, and each join and leave as `team.member_joined` (via `scim`) and `team.member_left` (reason `scim`), with the token as the actor.
 
+## Bulk
+
+`POST /scim/v2/Bulk` ([RFC 7644 section 3.7](https://www.rfc-editor.org/rfc/rfc7644#section-3.7)) sends many user and group changes in one request. Entra ID and Okta don't use it; other SCIM clients, connectors and sync scripts can. Design: [ADR 0149](../adr/0149-scim-bulk.md).
+
+```json
+{
+  "schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],
+  "failOnErrors": 1,
+  "Operations": [
+    { "method": "POST", "path": "/Users", "bulkId": "ada", "data": { "userName": "ada@example.com", "externalId": "00u1" } },
+    { "method": "POST", "path": "/Groups", "bulkId": "eng", "data": { "displayName": "Eng", "members": [{ "value": "bulkId:ada" }] } },
+    { "method": "PATCH", "path": "/Users/<id>", "data": { "Operations": [{ "op": "replace", "path": "active", "value": false }] } },
+    { "method": "DELETE", "path": "/Users/<id>" }
+  ]
+}
+```
+
+**Each operation is its own request.** It goes through exactly what `POST /Users`, `PATCH /Groups/<id>` and the rest would do, with the same token: the same checks, the same tenant (another tenant's user or group is 404), the same deprovisioning when someone is deactivated or deleted, and the same audit events. Group operations need `SCIM_GROUPS=on`, as without Bulk.
+
+**What runs, and in what order.**
+
+- First the whole request is checked: `Operations` a list of at most 100; each `method` `POST`, `PUT`, `PATCH` or `DELETE`; each `path` `/Users` or `/Groups` for a `POST`, `/Users/<id>` or `/Groups/<id>` otherwise; a `bulkId` on every `POST`, each used once; `data` on all but `DELETE`; `failOnErrors` a whole number of at least 1. Any problem is a 400 naming the operation (`Operations[3]: ...`), and nothing runs.
+- Then the operations run one at a time, in the order sent. One that uses `bulkId:<id>` (in its path, or in its data, such as a group member) waits for the `POST` with that `bulkId`, so a group can list a user created later in the same request. Nothing else is reordered.
+- Every operation is tried, whatever the others do. With `failOnErrors: n`, processing stops once `n` have failed. Nothing that worked is undone.
+- A reference to a `bulkId` that no `POST` in the request has, to a `POST` that failed, or a circle of references fails that operation with 409, without running it.
+
+**The answer** is 200 with a `BulkResponse` whenever the request was read, even if every operation failed, so read each one's `status`: what its own request would have answered (`201`, `200`, `204`, `404`, ...). Results are in the order the operations ran; any not listed weren't run. Each has its `method`, `bulkId` (if sent), `status`, `location` (except a failed `POST`), and, on failure, `response` with the SCIM error.
+
+**Audit.** Each operation logs what its own request would. The whole request is also `scim.bulk`, with how many operations were sent, run and failed, why it stopped (`failOnErrors`, `rateLimited`), and each operation's method, path, `bulkId` and status.
+
 ## Limits
 
 600 requests a minute per tenant, then 429 with `Retry-After` (Entra and Okta wait and retry). An IP sending 20 bad tokens in 10 minutes gets 429 for its bad tokens for a while; a valid token from that IP still works, since Entra and Okta send from addresses they share with other customers. Bodies are capped at 64 KiB, or 1 MiB for groups (a `PUT` carries every member). Lists return at most 200 users or groups per page. No groups in groups.
+
+Bulk: at most 100 operations (`maxOperations`) and 1 MiB (`maxPayloadSize`) a request, both in `ServiceProviderConfig`; more is a 413 and nothing runs. Each operation's `data` keeps its own request's cap (64 KiB for a user, 1 MiB for a group), and each operation after the first counts against the 600 a minute: one over it gets a 429 result, and the rest of the request isn't run.
 
 ## Troubleshooting
 
@@ -135,4 +167,7 @@ The IdP takes the team on when it pushes the group with that `externalId` (or, w
 - **Group errors (501)**: `SCIM_GROUPS=on` isn't set. Set it, or turn group provisioning off in the IdP.
 - **409 on adding a group member**: they're on another team. Take them out of that group (or team) first.
 - **400 "isn't a user this tenant provisioned"**: provision the user before the group, or check the IdP sends the user's SuperBot id (it does once it has provisioned them).
+- **Bulk 200, but nothing changed**: read each operation's `status` and `response`; a 200 only means the request was read.
+- **Bulk 413**: more than 100 operations or 1 MiB. Split the request.
+- **Bulk 409 "bulkId:…"**: the operation names a `bulkId` no `POST` in the same request has, or whose `POST` failed.
 - **409 creating a group**: this tenant already has a group with that name or `externalId`. Names are unique per tenant in any ASCII case (`Eng` and `ENG` clash; `Équipe` and `éQUIPE` don't).
