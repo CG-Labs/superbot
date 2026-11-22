@@ -50,7 +50,7 @@ Management and the security owner meet at least quarterly to review: the checkli
 
 ## Configuration baseline
 
-The operator keeps a written baseline of the settings every managed server runs with, and checks each server against it at least quarterly and after every upgrade. It starts from the protections that are off by default: `AUTH_MFA` (at least `admins`), `SUPERBOT_BACKUP_ENCRYPTION=required`, `SUPERBOT_DATABASE_ENCRYPTION=required`, `SERVER_BACKUP_OFF_HOST=on`, `MACHINE_FIREWALL=on` on Linode, `MACHINE_BOT_USER`, `MACHINE_TEAMMATE_USERS`, and the retention periods the [data classification and retention policy](data-classification-and-retention.md#retention) sets. `botctl backups`, `botctl database`, `botctl retention` and the setup checklist show most of them.
+The operator keeps a written baseline of the settings every managed server runs with, and checks each server against it at least quarterly and after every upgrade. It starts from the protections that are off by default: `AUTH_MFA` (at least `admins`), `SUPERBOT_BACKUP_ENCRYPTION=required`, `SUPERBOT_DATABASE_ENCRYPTION=required`, `SERVER_BACKUP_OFF_HOST=on`, `MACHINE_FIREWALL=on` on Linode, `MACHINE_ON_DISABLE=suspend` (the default), `MACHINE_BOT_USER`, `MACHINE_TEAMMATE_USERS`, and the retention periods the [data classification and retention policy](data-classification-and-retention.md#retention) sets. `botctl backups`, `botctl database`, `botctl retention` and the setup checklist show most of them.
 
 ## Vulnerability management
 

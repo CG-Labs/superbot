@@ -77,7 +77,7 @@ Pick the playbooks that fit; every command is audited.
 
 | Situation | Contain with |
 |-----------|--------------|
-| A user's account is compromised | `botctl user disable <user>`: ends their sessions, stops their runs and queued messages, and suspends their machine ([ADR 0124](../../adr/0124-deprovisioning-stops-bots-and-machines.md)). For SSO, also block them at the IdP. Check what they did: `botctl audit --actor user:<email>`. |
+| A user's account is compromised | `botctl user disable <user>`: ends their sessions, stops their runs and queued messages, and suspends their machine when `MACHINE_ON_DISABLE=suspend`, the default and the [baseline](information-security.md#configuration-baseline) ([ADR 0124](../../adr/0124-deprovisioning-stops-bots-and-machines.md)). Confirm it with `botctl machine show <user>`; if it is still running (`keep`), run `botctl machine suspend <user>`. For SSO, also block them at the IdP. Check what they did: `botctl audit --actor user:<email>`. |
 | An admin or an IdP connection is compromised | As above for the admin; `botctl session revoke-all <user>` for anyone they may have handed a session; `botctl scim token revoke <id>` and rotate the SSO client secret at the IdP; review admins with the access-review report. |
 | A saved secret has leaked | Revoke it at its issuer first, then replace it (`botctl secret set <NAME> < file`) or delete it (`botctl secret rm <NAME>`). |
 | The master key may have leaked | Rotate it and everything it protected, following [after a leak](../../ops/master-key-rotation.md#after-a-leak) ([ADR 0096](../../adr/0096-master-key-rotation.md)). |

@@ -47,7 +47,7 @@ Findings (an account that should be gone, a role too high) are fixed within 5 bu
 
 ## Removing access
 
-- When someone leaves, all their production access is removed by the end of their last day, or at once when they leave for cause. In SuperBot, deactivating them through SCIM or `botctl user disable` ends their sessions, stops their runs and suspends their machine ([ADR 0124](../../adr/0124-deprovisioning-stops-bots-and-machines.md)); `botctl session revoke-all` ends sessions alone.
+- When someone leaves, all their production access is removed by the end of their last day, or at once when they leave for cause. In SuperBot, deactivating them through SCIM or `botctl user disable` ends their sessions, stops their runs and, with `MACHINE_ON_DISABLE=suspend` (the default, and required by the [baseline](information-security.md#configuration-baseline)), suspends their machine ([ADR 0124](../../adr/0124-deprovisioning-stops-bots-and-machines.md)); with `keep`, suspend it with `botctl machine suspend`; `botctl session revoke-all` ends sessions alone.
 - When someone changes role, access the new role doesn't need is removed within 5 business days.
 - Shared secrets they could see (the break-glass password, keys) are rotated when someone who could see them leaves.
 - A person's data is erased on request as the [data classification and retention policy](data-classification-and-retention.md#disposal) says.
