@@ -6,11 +6,15 @@
 //! machines' Bots reach it through the machine port as if from loopback. Its own
 //! listener is reachable only where the operator binds it. Off loopback it needs a
 //! bearer token (`METRICS_TOKEN`), and botd refuses to start without one.
+//!
+//! Traces (ADR 0118) are in `trace`: a span per request and per run, exported over
+//! OTLP, off unless `TRACES_OTLP_ENDPOINT` is set.
 
 pub mod capacity;
 pub mod errors;
 pub mod log;
 pub mod metrics;
+pub mod trace;
 
 use crate::machines::route::Routing;
 use crate::machines::{self, ControlPlane, State};
@@ -51,6 +55,7 @@ pub struct Settings {
     pub log: log::Format,
     pub metrics: Option<Listen>,
     pub errors: errors::Settings,
+    pub traces: trace::Settings,
 }
 
 #[derive(Debug)]
@@ -63,6 +68,7 @@ impl Settings {
     pub fn from_env(get: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result<Settings, String> {
         let log = log::Format::parse(&get("LOG_FORMAT"))?;
         let errors = errors::Settings::from_env(get, store)?;
+        let traces = trace::Settings::from_env(get, store)?;
         let raw = get("METRICS_LISTEN");
         let addr = match raw.trim().to_ascii_lowercase().as_str() {
             "" | "off" => None,
@@ -70,7 +76,7 @@ impl Settings {
             _ => Some(raw.trim().parse::<SocketAddr>().map_err(|_| format!("METRICS_LISTEN must be off, on, or an address and port such as {DEFAULT_LISTEN}, not \"{raw}\""))?),
         };
         let Some(addr) = addr else {
-            return Ok(Settings { log, metrics: None, errors });
+            return Ok(Settings { log, metrics: None, errors, traces });
         };
         let token = store.get("METRICS_TOKEN").map_err(|e| e.to_string())?;
         if let Some(t) = &token {
@@ -81,11 +87,11 @@ impl Settings {
         } else if !addr.ip().is_loopback() {
             return Err(format!("METRICS_LISTEN={addr} is off loopback, so set METRICS_TOKEN (or METRICS_TOKEN_FILE) for scrapers to send"));
         }
-        Ok(Settings { log, metrics: Some(Listen { addr, token }), errors })
+        Ok(Settings { log, metrics: Some(Listen { addr, token }), errors, traces })
     }
 
     pub fn describe(&self) -> String {
-        let logs = format!("logs as {} (LOG_FORMAT); {}", self.log.as_str(), self.errors.describe());
+        let logs = format!("logs as {} (LOG_FORMAT); {}; {}", self.log.as_str(), self.errors.describe(), self.traces.describe());
         match &self.metrics {
             None => format!("{logs}; metrics off (METRICS_LISTEN)"),
             Some(l) => format!(
@@ -135,18 +141,39 @@ fn request_id_for(req: &Request) -> String {
         .unwrap_or_else(|| crate::random_hex(8))
 }
 
-/// The route a request matched, for its log line: a template like
-/// `/api/bots/{id}/messages`, never the path as sent. `track` puts it on the request
-/// and reads it after, so it's known even when the handler panics.
+/// What a request turned out to be, for its log line, metrics and span: the route it
+/// matched, a template like `/api/bots/{id}/messages` (never the path as sent), and the
+/// tier of whoever sent it (ADR 0118). `track` puts it on the request and reads it
+/// after, so it's known even when the handler panics.
 #[derive(Clone, Default)]
-struct Route(std::sync::Arc<std::sync::OnceLock<String>>);
+struct Noted {
+    route: std::sync::Arc<std::sync::OnceLock<String>>,
+    tier: std::sync::Arc<std::sync::OnceLock<String>>,
+}
 
 /// On the API's routes: notes the template they matched, for `track`.
 pub async fn note_route(req: Request, next: Next) -> Response {
-    if let (Some(slot), Some(m)) = (req.extensions().get::<Route>(), req.extensions().get::<MatchedPath>()) {
-        let _ = slot.0.set(m.as_str().to_string());
+    if let (Some(slot), Some(m)) = (req.extensions().get::<Noted>(), req.extensions().get::<MatchedPath>()) {
+        let _ = slot.route.set(m.as_str().to_string());
     }
     next.run(req).await
+}
+
+/// The tier label for a request with no signed-in person's or Bot's plan.
+pub const NO_TIER: &str = "none";
+
+/// Whether botd works out each request's tier: only when something reads it, per-tier
+/// metrics (`METRICS_LISTEN`) or traces, since it costs a lookup per request.
+pub fn wants_tiers(app: &AppState) -> bool {
+    app.db.metrics().wants_tiers() || app.db.tracer().on()
+}
+
+/// Called by sign-in once it knows who sent a request: their plan's tier, for `track`.
+pub fn note_tier(req: &Request, tier: &str) {
+    if let Some(slot) = req.extensions().get::<Noted>() {
+        let _ = slot.tier.set(tier.to_string());
+    }
+    trace::note("superbot.tier", tier);
 }
 
 /// Inside `track`: a handler that panics answers 500, so the request is counted, logged
@@ -159,24 +186,45 @@ pub fn catch_panics() -> tower_http::catch_panic::CatchPanicLayer<fn(Box<dyn std
 }
 
 /// Outermost: gives every request an id (`X-Request-Id`, echoed back), counts it and
-/// its latency by route class, and logs it in JSON format.
+/// its latency by route class (and by tier, when wanted), logs it in JSON format, and
+/// traces it as a server span when traces are on.
 pub async fn track(AxState(app): AxState<AppState>, mut req: Request, next: Next) -> Response {
     let started = Instant::now();
-    let slot = Route::default();
+    let slot = Noted::default();
     req.extensions_mut().insert(slot.clone());
     let id = request_id_for(&req);
     let class = route_class(req.uri().path());
     let method = metrics::method(req.method().as_str());
-    let mut res = CURRENT_REQUEST.scope(id.clone(), next.run(req)).await;
+    let probe = matches!(class, "healthz" | "status");
+    let tracer = app.db.tracer();
+    // A proxy's trace is joined only when the operator says it's theirs (TRACES_PARENT).
+    let parent = tracer.accepts_parent().then(|| req.headers().get(trace::TRACEPARENT).and_then(|v| v.to_str().ok()).and_then(trace::Ctx::parse)).flatten();
+    let span = if probe { trace::Span::default() } else { tracer.span(method, trace::Kind::Server, parent) };
+    span.set("http.request.method", method);
+    span.set("superbot.route_class", class);
+    span.set("superbot.request_id", &id);
+    let mut res = CURRENT_REQUEST.scope(id.clone(), trace::within(&span, next.run(req))).await;
     let took = started.elapsed().as_secs_f64();
     let code = res.status().as_u16();
-    app.db.metrics().request(class, method, code, took);
+    let tier = slot.tier.get().map(String::as_str).or_else(|| wants_tiers(&app).then_some(NO_TIER));
+    app.db.metrics().request(class, method, code, took, tier.filter(|_| !probe));
     if let Ok(v) = HeaderValue::from_str(&id) {
         res.headers_mut().insert(REQUEST_ID, v);
     }
-    let route = slot.0.get().cloned();
+    let route = slot.route.get().cloned();
+    if let Some(r) = &route {
+        span.rename(format!("{method} {r}"));
+        span.set("http.route", r);
+    }
+    span.set("http.response.status_code", code);
+    if code >= 500 {
+        span.fail();
+    }
+    span.end();
+    let traced = span.sampled();
+    drop(span);
     // The status page answers 503 in a major outage, on purpose.
-    if code >= 500 && !matches!(class, "healthz" | "status") {
+    if code >= 500 && !probe {
         errors::http_error(method, route.as_deref(), class, code, &id);
     }
     if !(class == "healthz" && res.status().is_success()) {
@@ -187,6 +235,7 @@ pub async fn track(AxState(app): AxState<AppState>, mut req: Request, next: Next
             json!({
                 "requestId": id, "method": method, "route": route, "routeClass": class, "status": code,
                 "durationMs": (took * 1000.0).round() as u64,
+                "traceId": traced.map(|c| c.trace_id()), "spanId": traced.map(|c| c.span_id()),
             }),
         );
     }
@@ -243,6 +292,7 @@ pub fn render(app: &AppState) -> String {
     crate::backup_encryption::render(app, &mut out);
     crate::database_encryption::render(app, &mut out);
     errors::render(&mut out);
+    app.db.tracer().render(&mut out);
     out
 }
 

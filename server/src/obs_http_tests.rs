@@ -2,7 +2,9 @@
 //! asked for, never on the main port, and needs its token when it has one; requests and
 //! runs are counted by bounded labels and logged with their ids; approvals waiting and
 //! machines show as gauges; and no email, name, message, path or token reaches a label
-//! or a structured log line.
+//! or a structured log line. Traces and per-tier metrics (ADR 0118) are off unless
+//! asked for, tie a request to the run it queues and the Bot's calls during it, and
+//! carry no more than those labels and lines do.
 
 use crate::machines::fake::Fake;
 use crate::machines::provider::MachineProvider;
@@ -46,7 +48,7 @@ fn fake_claude(app: &App) {
 #[test]
 fn metrics_are_off_by_default_and_need_a_token_off_loopback() {
     let s = settings(&[]).unwrap();
-    assert!(s.metrics.is_none() && s.log == obs::log::Format::Text, "{s:?}");
+    assert!(s.metrics.is_none() && s.log == obs::log::Format::Text && s.traces.endpoint.is_none(), "{s:?}");
     assert!(settings(&[("METRICS_LISTEN", "off")]).unwrap().metrics.is_none());
 
     let on = settings(&[("METRICS_LISTEN", "on")]).unwrap().metrics.unwrap();
@@ -81,9 +83,9 @@ fn metrics_are_off_by_default_and_need_a_token_off_loopback() {
 }
 
 #[test]
-fn bots_never_get_the_metrics_token_or_the_error_tracker_dsn() {
+fn bots_never_get_the_metrics_token_the_error_tracker_dsn_or_the_trace_headers() {
     let withheld = adapters::secret_env();
-    for k in ["METRICS_TOKEN", "ERROR_REPORT_DSN"] {
+    for k in ["METRICS_TOKEN", "ERROR_REPORT_DSN", "TRACES_OTLP_HEADERS"] {
         assert!(secrets::server_secret(k), "{k}");
         assert!(withheld.iter().any(|w| *w == k), "{k}");
         assert!(withheld.iter().any(|w| *w == format!("{k}_FILE")), "{k}_FILE");
@@ -372,5 +374,218 @@ async fn the_service_dashboard_and_error_rules_use_only_metrics_botd_writes() {
             let e = t["expr"].as_str().unwrap();
             assert!(e.contains(r#"job="$job""#) && e.contains(r#"instance=~"$instance""#), "{}: {e}", p["title"]);
         }
+    }
+}
+
+/// The spans named `name`.
+fn spans<'a>(all: &'a [Value], name: &str) -> Vec<&'a Value> {
+    all.iter().filter(|s| s["name"] == name).collect()
+}
+
+fn attr<'a>(span: &'a Value, key: &str) -> Option<&'a Value> {
+    span["attributes"].as_array()?.iter().find(|a| a["key"] == key).map(|a| &a["value"])
+}
+
+fn str_attr<'a>(span: &'a Value, key: &str) -> Option<&'a str> {
+    attr(span, key)?["stringValue"].as_str()
+}
+
+/// Waits for `done` to show in the metrics.
+async fn wait_for(app: &AppState, done: &str, n: f64) {
+    for _ in 0..400 {
+        if total(&obs::render(app), done) >= n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("never saw {done}: {}", obs::render(app));
+}
+
+/// The installer and Compose copy these files; with nothing filled in, traces are off.
+#[test]
+fn the_example_env_files_leave_traces_off() {
+    for (name, text) in [(".env.example", include_str!("../../.env.example")), ("deploy/docker/.env.example", include_str!("../../deploy/docker/.env.example"))] {
+        let vars: Vec<(&str, &str)> = text.lines().filter(|l| !l.trim_start().starts_with('#')).filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim(), v.trim())).collect();
+        let s = settings(&vars).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(s.traces.endpoint.is_none(), "{name}");
+        for k in ["TRACES_OTLP_ENDPOINT", "TRACES_OTLP_HEADERS", "TRACES_SAMPLE_RATIO"] {
+            assert!(text.contains(k), "{name} documents {k}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn traces_are_off_by_default_and_requests_make_no_spans() {
+    let (port, app, admin, _) = serve_app().await;
+    assert!(!app.db.tracer().on());
+    let rid = format!("t-{}", random_hex(8));
+    call_with(port, "GET", "/api/state", &admin, &format!("X-Request-Id: {rid}\r\ntraceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\n"), "").await;
+    let line = captured::with(&rid).into_iter().find(|l| l["msg"] == "http.request").unwrap();
+    assert!(line.get("traceId").is_none() && line.get("spanId").is_none(), "{line}");
+    let m = obs::render(&app);
+    assert_eq!(total(&m, "superbot_tracing_enabled"), 0.0, "{m}");
+    assert!(!m.contains("_by_tier"), "no per-tier families unless asked for: {m}");
+}
+
+#[tokio::test]
+async fn a_request_its_run_the_harness_its_tools_and_the_bots_calls_share_one_trace() {
+    use std::os::unix::fs::PermissionsExt;
+    let (port, app, admin, _) = serve_app().await;
+    app.db.tracer().capture(1.0, false);
+    let dir = std::env::temp_dir().join(format!("superbot-trace-{}", random_hex(4)));
+    std::fs::create_dir_all(&dir).unwrap();
+    // A harness that hands the test its run token, waits to be let go, uses a tool and replies.
+    let refused = r#"{"type":"assistant","message":{"content":[{"id":"toolu_0","input":{"command":"cat /w/x"},"name":"Bash","type":"tool_use"}]}}"#;
+    let refused_result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_0","type":"tool_result","content":"blocked","is_error":true}]}}"#;
+    let tool = r#"{"type":"assistant","message":{"content":[{"id":"toolu_1","input":{"file_path":"/w/ada@example.com.txt"},"name":"Read","type":"tool_use"}]}}"#;
+    let ran = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"sk-test-4242"}]}}"#;
+    let reply = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"On it."}]}}"#;
+    let script = format!(
+        "#!/bin/sh\necho \"$BOT_TOKEN\" > {d}/token.tmp && mv {d}/token.tmp {d}/token\nwhile [ ! -e {d}/go ]; do sleep 0.02; done\necho '{refused}'\necho '{refused_result}'\necho '{tool}'\necho '{ran}'\necho '{reply}'\n",
+        d = dir.display()
+    );
+    let path = app.cfg.bin_dir.join("claude");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bot = app.db.create_bot("Project Falcon", "#fff", "waddle", "claude", None, false).id;
+
+    let rid = format!("t-{}", random_hex(8));
+    let text = json!({ "text": "email ada@example.com the key sk-test-4242" }).to_string();
+    let (code, _, body) = call_with(port, "POST", &format!("/api/bots/{bot}/messages"), &admin, &format!("X-Request-Id: {rid}\r\n"), &text).await;
+    assert_eq!(code, 202, "{body}");
+
+    // Mid-run, the Bot's approval hook calls botd with its run token.
+    let token = loop {
+        if let Ok(t) = std::fs::read_to_string(dir.join("token")) {
+            break t.trim().to_string();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let hook_rid = format!("t-{}", random_hex(8));
+    let check = json!({ "from": bot, "harness": "claude", "event": { "tool_name": "Bash", "tool_input": { "command": "echo sk-test-4242" }, "cwd": "/tmp" } }).to_string();
+    let (code, _, said) = call_with(port, "POST", "/api/approvals/check", &format!("Bearer {token}"), &format!("X-Request-Id: {hook_rid}\r\n"), &check).await;
+    assert_eq!((code, said.lines().next()), (200, Some("allow")), "{said}");
+    std::fs::write(dir.join("go"), "").unwrap();
+    wait_for(&app, r#"superbot_runs_total{harness="claude",result="done"}"#, 1.0).await;
+
+    let all = app.db.tracer().captured();
+    let by_rid = |r: &str| all.iter().find(|s| str_attr(s, "superbot.request_id") == Some(r)).cloned().unwrap_or_else(|| panic!("no span for {r}: {all:?}"));
+    let req = by_rid(&rid);
+    assert_eq!(req["name"], "POST /api/bots/{id}/messages", "{req}");
+    assert_eq!((req["kind"].as_u64(), str_attr(&req, "http.route"), str_attr(&req, "superbot.route_class")), (Some(2), Some("/api/bots/{id}/messages"), Some("bots")), "{req}");
+    assert_eq!(attr(&req, "http.response.status_code").unwrap()["intValue"], "202");
+    let trace = req["traceId"].as_str().unwrap();
+    assert!(trace.len() == 32 && req.get("parentSpanId").is_none(), "{req}");
+
+    let run = spans(&all, "run claude");
+    assert_eq!(run.len(), 1, "{all:?}");
+    let run = run[0];
+    assert_eq!((run["traceId"].as_str(), &run["parentSpanId"]), (Some(trace), &req["spanId"]), "the run continues the request's trace: {run}");
+    assert_eq!((str_attr(run, "superbot.bot_id"), str_attr(run, "superbot.run.result"), str_attr(run, "superbot.trigger")), (Some(bot.as_str()), Some("done"), Some("user")), "{run}");
+    assert!(str_attr(run, "superbot.run_id").is_some_and(|r| r.starts_with('r')), "{run}");
+
+    let attempt = spans(&all, "harness claude");
+    assert_eq!(attempt.len(), 1, "{all:?}");
+    let attempt = attempt[0];
+    assert_eq!((attempt["traceId"].as_str(), &attempt["parentSpanId"]), (Some(trace), &run["spanId"]), "{attempt}");
+    assert_eq!((str_attr(attempt, "superbot.attempt.result"), attr(attempt, "superbot.attempt").unwrap()["intValue"].as_str()), (Some("done"), Some("1")), "{attempt}");
+
+    let tool = spans(&all, "tool Read");
+    assert_eq!(tool.len(), 1, "{all:?}");
+    assert_eq!(&tool[0]["parentSpanId"], &attempt["spanId"], "{}", tool[0]);
+    assert_eq!(attr(tool[0], "superbot.tool.ran").unwrap()["boolValue"], true, "{}", tool[0]);
+    // A refused call ends when its error comes back, marked as one.
+    let refused = spans(&all, "tool Bash");
+    assert_eq!(refused.len(), 1, "{all:?}");
+    assert_eq!((attr(refused[0], "superbot.tool.ran").unwrap()["boolValue"].as_bool(), refused[0]["status"]["code"].as_u64()), (Some(false), Some(2)), "{}", refused[0]);
+    assert!(refused[0]["endTimeUnixNano"].as_str().unwrap().parse::<u64>().unwrap() <= tool[0]["startTimeUnixNano"].as_str().unwrap().parse::<u64>().unwrap());
+
+    // The hook's request joined the attempt; its policy check is a child of it.
+    let hook = by_rid(&hook_rid);
+    assert_eq!((hook["traceId"].as_str(), &hook["parentSpanId"]), (Some(trace), &attempt["spanId"]), "{hook}");
+    let checked = spans(&all, "approval.check");
+    assert_eq!(checked.len(), 1, "{all:?}");
+    assert_eq!(&checked[0]["parentSpanId"], &hook["spanId"]);
+    assert_eq!((str_attr(checked[0], "superbot.tool.name"), str_attr(checked[0], "superbot.policy.action")), (Some("Bash"), Some("allow")), "{}", checked[0]);
+
+    // Logs and audit events name the trace.
+    let line = captured::with(&rid).into_iter().find(|l| l["msg"] == "http.request").unwrap();
+    assert_eq!((line["traceId"].as_str(), line["spanId"].as_str()), (Some(trace), req["spanId"].as_str()), "{line}");
+    let finished = captured::with(&bot).into_iter().find(|l| l["msg"] == "run.finished").unwrap();
+    assert_eq!(finished["traceId"].as_str(), Some(trace), "{finished}");
+    let audited: Vec<_> = app.db.audit_events(&audit::Filter::default(), 500, true).into_iter().filter(|e| e.bot_id.as_deref() == Some(bot.as_str())).collect();
+    let in_trace: Vec<_> = audited.iter().filter(|e| e.details["traceId"] == trace).collect();
+    assert!(!in_trace.is_empty(), "{audited:?}");
+    assert!(in_trace.iter().all(|e| e.details["spanId"].as_str().is_some_and(|s| s.len() == 16)), "{in_trace:?}");
+
+    // Nothing said, no secret, no name or path reaches a span.
+    let text = serde_json::to_string(&all).unwrap();
+    for bad in ["ada@example.com", "sk-test-4242", "Falcon", "On it.", "/w/", &token] {
+        assert!(!text.contains(bad), "{bad} in {text}");
+    }
+    let m = obs::render(&app);
+    assert_eq!(total(&m, "superbot_tracing_enabled"), 1.0, "{m}");
+    assert!(total(&m, r#"superbot_trace_spans_total{outcome="sent"}"#) >= 6.0, "{m}");
+}
+
+#[tokio::test]
+async fn a_callers_traceparent_is_ignored_unless_accepted_and_sampling_drops_whole_traces() {
+    let (port, app, admin, _) = serve_app().await;
+    let parent = "4bf92f3577b34da6a3ce929d0e0e4736";
+    let header = |rid: &str| format!("X-Request-Id: {rid}\r\ntraceparent: 00-{parent}-00f067aa0ba902b7-01\r\n");
+    let span_for = |rid: &str| app.db.tracer().captured().into_iter().find(|s| str_attr(s, "superbot.request_id") == Some(rid));
+
+    app.db.tracer().capture(1.0, false);
+    let rid = format!("t-{}", random_hex(8));
+    call_with(port, "GET", "/api/state", &admin, &header(&rid), "").await;
+    let s = span_for(&rid).unwrap();
+    assert!(s["traceId"] != parent && s.get("parentSpanId").is_none(), "ignored by default: {s}");
+    assert_eq!(s["name"], "GET /api/state");
+
+    app.db.tracer().capture(1.0, true);
+    let rid = format!("t-{}", random_hex(8));
+    call_with(port, "GET", "/api/state", &admin, &header(&rid), "").await;
+    let s = span_for(&rid).unwrap();
+    assert_eq!((s["traceId"].as_str(), s["parentSpanId"].as_str()), (Some(parent), Some("00f067aa0ba902b7")), "{s}");
+    let line = captured::with(&rid).into_iter().find(|l| l["msg"] == "http.request").unwrap();
+    assert_eq!(line["traceId"].as_str(), Some(parent));
+    let rid = format!("t-{}", random_hex(8));
+    call_with(port, "GET", "/api/state", &admin, &format!("X-Request-Id: {rid}\r\ntraceparent: 00-{parent}-00f067aa0ba902b7-00\r\n"), "").await;
+    assert!(span_for(&rid).is_none(), "a caller's unsampled trace is kept unsampled");
+
+    // Health checks make no spans; a ratio of 0 keeps none, and logs then name no trace.
+    app.db.tracer().capture(0.0, false);
+    let rid = format!("t-{}", random_hex(8));
+    call_with(port, "GET", "/api/state", &admin, &format!("X-Request-Id: {rid}\r\n"), "").await;
+    call_with(port, "GET", "/healthz", "", "", "").await;
+    assert!(app.db.tracer().captured().is_empty());
+    let line = captured::with(&rid).into_iter().find(|l| l["msg"] == "http.request").unwrap();
+    assert!(line.get("traceId").is_none(), "{line}");
+}
+
+#[tokio::test]
+async fn requests_and_runs_are_counted_by_tier_when_asked_with_no_user_ids() {
+    let (port, app, admin, _) = serve_app().await;
+    fake_claude(&app);
+    app.db.metrics().want_tiers();
+    let tier = app.tier_of(users::OPERATOR).name.clone();
+    call(port, "GET", "/api/state", &admin, "").await;
+    call(port, "GET", "/api/state", "", "").await;
+    call(port, "GET", "/healthz", "", "").await;
+    let bot = app.db.create_bot("Falcon", "#fff", "waddle", "claude", None, false).id;
+    let (code, body) = call(port, "POST", &format!("/api/bots/{bot}/messages"), &admin, &json!({ "text": "hi" }).to_string()).await;
+    assert_eq!(code, 202, "{body}");
+    wait_for(&app, r#"superbot_runs_total{harness="claude",result="done"}"#, 1.0).await;
+
+    let m = obs::render(&app);
+    assert!(total(&m, &format!(r#"superbot_http_requests_by_tier_total{{tier="{tier}",status_class="2xx"}}"#)) >= 2.0, "{m}");
+    assert_eq!(total(&m, r#"superbot_http_requests_by_tier_total{tier="none",status_class="4xx"}"#), 1.0, "a caller who isn't signed in: {m}");
+    assert!(total(&m, &format!(r#"superbot_http_request_duration_by_tier_seconds_count{{tier="{tier}"}}"#)) >= 2.0, "{m}");
+    assert_eq!(total(&m, &format!(r#"superbot_runs_by_tier_total{{tier="{tier}",result="done"}}"#)), 1.0, "{m}");
+    assert_eq!(total(&m, &format!(r#"superbot_run_duration_by_tier_seconds_count{{tier="{tier}"}}"#)), 1.0, "{m}");
+    // Health checks aren't anyone's; the families carry tiers, never users or Bots.
+    assert_eq!(total(&m, r#"superbot_http_requests_by_tier_total{tier="none",status_class="2xx"}"#), 0.0, "{m}");
+    for l in m.lines().filter(|l| l.contains("_by_tier")) {
+        assert!(!l.contains(users::OPERATOR) && !l.contains(&bot) && !l.contains("user="), "{l}");
     }
 }
