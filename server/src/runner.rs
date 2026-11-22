@@ -251,6 +251,8 @@ pub struct App {
     pub teams: OnceLock<crate::teams::Settings>,
     /// STATUS_PAGE, and the public status page's shared snapshot (ADR 0090).
     pub status: crate::status::Page,
+    /// PLANS_PAGE and PLANS_CONTACT_URL: the public pricing page (ADR 0121). Unset: off.
+    pub plans: OnceLock<crate::plans::Settings>,
     /// Copies of the server's own backups off this host (ADR 0109).
     pub server_backups: OnceLock<Arc<crate::server_backups::ServerBackups>>,
     /// Whether the database is encrypted at rest, as found at startup (ADR 0116).
@@ -297,6 +299,7 @@ impl App {
             storage: Default::default(),
             teams: OnceLock::new(),
             status: Default::default(),
+            plans: OnceLock::new(),
             server_backups: OnceLock::new(),
             database: OnceLock::new(),
             closing: AtomicBool::new(false),
@@ -388,12 +391,12 @@ impl App {
     /// `machine` (its owner's) or `nowhere`. None while routing is off: always here.
     /// Whether `owner_id`'s Bots run on this server: no machines, or routing says here.
     pub fn runs_here(&self, owner_id: &str) -> bool {
-        self.control_plane.get().is_none_or(|cp| matches!(cp.route(&self.db, owner_id), Ok(Target::Local)))
+        self.control_plane.get().is_none_or(|cp| matches!(cp.route(self, owner_id), Ok(Target::Local)))
     }
 
     pub fn runs_on(&self, bot: &Bot) -> Option<&'static str> {
         let cp = self.control_plane.get().filter(|cp| cp.routing != route::Routing::Off)?;
-        Some(match cp.route(&self.db, &bot.owner_id) {
+        Some(match cp.route(self, &bot.owner_id) {
             Ok(Target::Local) => "server",
             Ok(Target::Machine(_)) => "machine",
             Err(_) => "nowhere",
@@ -1538,7 +1541,7 @@ impl App {
             self.say(&bot.id, &text, true);
             None
         };
-        let to = match cp.route(&self.db, &bot.owner_id) {
+        let to = match cp.route(self, &bot.owner_id) {
             Ok(Target::Local) => return Some(Place::Here),
             Err(r) => return refused(r, None),
             Ok(Target::Machine(to)) => to,

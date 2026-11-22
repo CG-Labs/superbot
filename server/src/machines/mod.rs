@@ -568,8 +568,8 @@ impl ControlPlane {
     }
 
     /// Where `user_id`'s Bots run (`route::target`).
-    pub fn route(&self, db: &crate::db::Db, user_id: &str) -> Result<route::Target, route::Refusal> {
-        route::target(db, self, user_id)
+    pub fn route(&self, app: &App, user_id: &str) -> Result<route::Target, route::Refusal> {
+        route::target(&app.db, self, user_id, self.own_kernel_for(app.tier_of(user_id)))
     }
 
     /// Whether a run of `bin` may start on `machine_id` now, beyond `route::fit`: the Bots'
@@ -610,6 +610,30 @@ impl ControlPlane {
 
     pub fn enabled(&self) -> bool {
         self.provider.is_some()
+    }
+
+    /// What `plan` gives a machine, if the provider knows without asking it (ADR 0081).
+    pub fn plan_resources(&self, plan: &str) -> Option<provider::Resources> {
+        self.provider.as_deref().and_then(|p| p.plan_resources(plan))
+    }
+
+    /// The machine tier `tier`'s people get (ADR 0040): its `machineType` named by its
+    /// `MACHINE_TIERS` entry if it has one, else by the tier. None: it sets no size.
+    pub fn machine_tier_of(&self, tier: &crate::tiers::Tier) -> Option<(String, String)> {
+        let plan = tier.limits.machine_type.clone()?;
+        let name = self.tiers.iter().find(|(_, p)| *p == plan).map_or_else(|| tier.name.clone(), |(t, _)| t.clone());
+        Some((name, plan))
+    }
+
+    /// Whether botd holds every machine `tier`'s people can get to a kernel of their own
+    /// (MACHINE_OWN_KERNEL_TIERS, ADR 0120). A tier that sets no size can get any
+    /// `MACHINE_TIERS` entry, so only when every one is held to it.
+    pub fn own_kernel_for(&self, tier: &crate::tiers::Tier) -> bool {
+        self.enabled()
+            && match self.machine_tier_of(tier) {
+                Some((name, _)) => self.own_kernel_tiers.contains(&name),
+                None => !self.tiers.is_empty() && self.tiers.iter().all(|(t, _)| self.own_kernel_tiers.contains(t)),
+            }
     }
 
     /// The provider's name, if it says when its own backups succeed (ADR 0110).
@@ -1353,10 +1377,7 @@ pub async fn list_all(
 /// plan)`: the plan's `machineType`, named by its `MACHINE_TIERS` entry if it has one,
 /// else by the user's tier. None: their plan sets no size, so any `MACHINE_TIERS` entry.
 pub fn size_for(app: &App, cp: &ControlPlane, user_id: &str) -> Option<(String, String)> {
-    let tier = app.tier_of(user_id);
-    let plan = tier.limits.machine_type.clone()?;
-    let name = cp.tiers.iter().find(|(_, p)| *p == plan).map_or_else(|| tier.name.clone(), |(t, _)| t.clone());
-    Some((name, plan))
+    cp.machine_tier_of(app.tier_of(user_id))
 }
 
 /// The provider plan a machine tier means: the name of the size the user's plan gives
@@ -1902,7 +1923,7 @@ pub async fn mine(
 /// Where a user's Bots run now, and why, as admins see it.
 fn placement_view(app: &App, cp: &ControlPlane, user_id: &str) -> Value {
     let m = app.db.user_machine(user_id);
-    let (runs_on, reason, message) = match cp.route(&app.db, user_id) {
+    let (runs_on, reason, message) = match cp.route(app, user_id) {
         Ok(route::Target::Local) => ("server", None, None),
         Ok(route::Target::Machine(_)) => ("machine", None, None),
         Err(r) => ("nowhere", Some(r.reason()), Some(r.message())),
@@ -2222,6 +2243,23 @@ mod tests {
         assert!(cp.describe().contains("max=g6-standard-4 (own kernel: pro, max)"), "{}", cp.describe());
         let cp = with(&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_OWN_KERNEL_TIERS", "ALL")]).unwrap();
         assert_eq!(cp.own_kernel_tiers, ["starter", "pro", "max"]);
+        // What a billing tier's people get, as the pricing page promises it (ADR 0121).
+        let plans = crate::tiers::Tiers::parse(
+            r#"{ "default": "a", "tiers": [
+              { "name": "a", "routes": "any", "limits": { "machineType": "g6-standard-2" } },
+              { "name": "pro", "routes": "any", "limits": { "machineType": "g6-dedicated-8" } },
+              { "name": "b", "routes": "any" } ] }"#,
+            None,
+        )
+        .unwrap();
+        let [a, pro, b] = [0, 1, 2].map(|i| &plans.all()[i]);
+        assert_eq!(cp.machine_tier_of(a), Some(("pro".into(), "g6-standard-2".into())), "named by its MACHINE_TIERS entry");
+        assert_eq!(cp.machine_tier_of(pro), Some(("pro".into(), "g6-dedicated-8".into())), "else by the tier");
+        assert_eq!(cp.machine_tier_of(b), None);
+        assert!([a, pro, b].iter().all(|t| cp.own_kernel_for(t)), "all: any machine it can get");
+        let cp = with(&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_OWN_KERNEL_TIERS", "pro")]).unwrap();
+        assert_eq!([a, pro, b].map(|t| cp.own_kernel_for(t)), [true, true, false], "b could get a starter machine");
+        assert!(!ControlPlane::default().own_kernel_for(a), "no control plane, no promise");
         for (vars, want) in [
             (&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_OWN_KERNEL_TIERS", "gold")][..], "\"gold\" isn't a tier in MACHINE_TIERS"),
             (&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_OWN_KERNEL_TIERS", "pro,pro")][..], "tier \"pro\" is listed twice"),

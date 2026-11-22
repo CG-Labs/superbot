@@ -314,7 +314,7 @@ async fn ensure(app: &App, e: &Enrollment, s: &Settings, by: &Who, bot: &Bot, fo
 /// on this server. Never this server's display for a Bot routed to a machine.
 pub async fn target(app: &App, bot: &Bot) -> Result<Option<(Arc<Enrollment>, Settings, Assigned)>, Why> {
     let Some(cp) = app.control_plane.get() else { return Ok(None) };
-    let to = match cp.route(&app.db, &bot.owner_id) {
+    let to = match cp.route(app, &bot.owner_id) {
         Ok(Target::Local) => return Ok(None),
         Ok(Target::Machine(to)) => to,
         Err(r) => return Err(Why::Route(r)),
@@ -424,7 +424,7 @@ async fn tunnel(app: &AppState, key: &str, mut tcp: TcpStream) -> Result<(), Str
         close_key(app, &Who::system("control_plane"), bot, key, "access_lost").await;
         return Err("the teammate it's for can no longer use its Bot".into());
     }
-    let to = match app.control_plane.get().map(|cp| cp.route(&app.db, &owner)) {
+    let to = match app.control_plane.get().map(|cp| cp.route(app, &owner)) {
         Some(Ok(Target::Machine(to))) if here.is_some() && to.machine_id == machine_id => to,
         _ => {
             close(app, &Who::system("control_plane"), bot, "moved").await;
@@ -610,7 +610,7 @@ pub async fn reap(app: &App) {
         open.iter()
             .filter_map(|(key, o)| {
                 let here = app.db.bot(&o.bot_id).filter(|b| b.owner_id == o.owner_id);
-                let routed = app.control_plane.get().map(|cp| cp.route(&app.db, &o.owner_id));
+                let routed = app.control_plane.get().map(|cp| cp.route(app, &o.owner_id));
                 let moved = here.is_none() || !matches!(routed, Some(Ok(Target::Machine(ref to))) if to.machine_id == o.machine_id);
                 let lost = here.as_ref().is_some_and(|b| !still_theirs(app, b, o.for_user.as_deref()));
                 let idle = at - o.used >= s.idle_ms && o.tunnels.load(Ordering::SeqCst) == 0 && !app.is_running(&o.bot_id);

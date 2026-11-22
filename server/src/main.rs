@@ -97,6 +97,9 @@ mod machines_resize_tests;
 #[cfg(test)]
 mod machines_region_tests;
 mod passwd;
+mod plans;
+#[cfg(test)]
+mod plans_http_tests;
 mod signin_watch;
 #[cfg(test)]
 mod signin_watch_http_tests;
@@ -297,6 +300,8 @@ async fn main() {
     let notifier = notify::Notifier::from_env(&|k| env(k, ""), sessions).unwrap_or_else(|e| exit(format!("Notifications: {e}")));
     let (billing_mail, plan_mail_said) = billing_mail::configured(&|k| env(k, ""), payments.enabled(), notifier.smtp.as_ref(), notifier.links.base.as_deref())
         .unwrap_or_else(|e| exit(format!("Billing emails: {e}")));
+    let plans = plans::Settings::from_env(&|k| env(k, ""), payments.enabled(), payments.checkout_enabled(), signups.enabled)
+        .unwrap_or_else(|e| exit(format!("Pricing page: {e}")));
     let allow_no_auth = auth_startup(&host, &password, break_glass);
     secrets::redact::register(&password);
     if adapters::get(&default_harness).is_none() {
@@ -595,6 +600,12 @@ async fn main() {
     }
     log_info!("Billing: {}.", billing::describe(auth_state.payments.enabled(), auth_state.payments.checkout_enabled(), app.meter.get().is_some(), app.tiers()));
     log_info!("Billing emails: {plan_mail_said}.");
+    let (plans_line, plans_warnings) = plans.describe(app.tiers());
+    log_info!("Pricing page: {plans_line} (ADR 0121).");
+    for w in plans_warnings {
+        log_warn!("WARNING: {w}");
+    }
+    let _ = app.plans.set(plans);
     if let Some(m) = billing_mail {
         let _ = app.billing_mail.set(Arc::new(m));
     }
@@ -973,6 +984,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/sessions/{id}", delete(users::revoke_session))
         .route("/signups", get(signups::list).post(signups::submit).layer(DefaultBodyLimit::max(signups::MAX_BODY)))
         .route("/signups/config", get(signups::config))
+        .route("/plans", get(plans::json_page))
         .route("/signups/{id}", get(signups::get))
         .route("/signups/{id}/approve", post(signups::approve))
         .route("/signups/{id}/reject", post(signups::reject))
@@ -1016,6 +1028,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         // Open to anyone, like /healthz: no tenant data (ADR 0090).
         .route("/status", get(status::html_page))
         .route("/status.json", get(status::json_page))
+        // Open too: the tiers' published prices and limits (ADR 0121).
+        .route("/pricing", get(plans::html_page))
         .merge(scim_routes)
         .merge(billing_routes)
         .merge(
@@ -1333,7 +1347,7 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     req.extensions_mut().insert(source.clone());
     // Signing in, the page to do it on, the public site, and asking for access need no credentials.
     let open = match method {
-        Method::GET | Method::HEAD => path == "/login" || sso_path(&path).is_some() || site_file(&path).is_some() || path == "/api/signups/config",
+        Method::GET | Method::HEAD => path == "/login" || sso_path(&path).is_some() || site_file(&path).is_some() || path == "/api/signups/config" || path == plans::JSON_PATH,
         // Apple posts its answer to the callback (response_mode=form_post).
         Method::POST => path == "/api/auth/login" || sso_path(&path) == Some("callback") || path == "/api/signups",
         _ => false,
