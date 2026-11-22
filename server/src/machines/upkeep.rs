@@ -169,6 +169,7 @@ fn upkeep_json(hb: &Heartbeat) -> Value {
         "botUser": super::botuser::upkeep_json(hb),
         "screens": super::screens::upkeep_json(hb),
         "teammates": hb.teammates,
+        "hardening": hb.hardening,
     })
 }
 
@@ -213,6 +214,7 @@ pub fn observe(app: &App, machine_id: &str, hb: &Heartbeat) {
             }
         }
         super::botuser::observed(app, &m, &by, m.agent_upkeep.as_ref().map(|v| &v["botUser"]), &new["botUser"]);
+        super::hardening::observed(app, &m, &by, m.agent_upkeep.as_ref().map(|v| &v["hardening"]), &new["hardening"]);
     }
     let (Some(id), Some(report)) = (&m.upgrade_id, hb.upgrade.as_ref()) else { return };
     if report.id != *id {

@@ -1251,6 +1251,43 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
         screens: Some(a.screens.report()),
         teammates: Some(a.teammates.known()),
         disk,
+        hardening: hardening(
+            Path::new(HARDENING_STATUS),
+            Path::new(HARDENING_EGRESS),
+            Path::new(HARDENING_REBOOT),
+        ),
+    })
+}
+
+/// Where the first boot writes each hardening step's state as `step=state` lines
+/// (ADR 0126), where the egress script says this boot's rules are loaded, and the
+/// OS's flag for updates waiting on a reboot.
+const HARDENING_STATUS: &str = "/etc/superbot/hardening";
+const HARDENING_EGRESS: &str = "/run/superbot-hardening/egress";
+const HARDENING_REBOOT: &str = "/run/reboot-required";
+
+/// What those files say. None when the first boot didn't harden the machine. Only
+/// root writes them, but they are read with care all the same: a little of each, and
+/// a few short lower-case `step=state` lines.
+fn hardening(status: &Path, egress: &Path, reboot: &Path) -> Option<wire::Hardening> {
+    fn small(p: &Path) -> Option<String> {
+        use std::io::Read;
+        let mut s = String::new();
+        std::fs::File::open(p).ok()?.take(1024).read_to_string(&mut s).ok()?;
+        Some(s)
+    }
+    let word = |w: &str| !w.is_empty() && w.len() <= 16 && w.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+    let steps = small(status)?
+        .lines()
+        .filter_map(|l| l.trim().split_once('='))
+        .filter(|(k, v)| word(k) && word(v))
+        .take(8)
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    Some(wire::Hardening {
+        steps,
+        egress: small(egress).is_some_and(|s| s.trim() == wire::HARDENING_ON),
+        reboot_required: reboot.exists(),
     })
 }
 
@@ -2218,4 +2255,31 @@ pub async fn run(cfg: Config) -> Result<(), String> {
         _ = restarting.wait_for(|r| *r) => println!("Restarting."),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hardening_is_read_with_care() {
+        let dir = std::env::temp_dir().join(format!("sb-agent-hardening-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (status, egress, reboot) = (dir.join("hardening"), dir.join("egress"), dir.join("reboot-required"));
+        assert_eq!(hardening(&status, &egress, &reboot), None, "not hardened");
+
+        std::fs::write(&status, "ssh=on\nkernel=partial\nupdates=failed\nBAD=x\nlong=aaaaaaaaaaaaaaaaaaaaaaaa\nnoequals\n").unwrap();
+        let h = hardening(&status, &egress, &reboot).unwrap();
+        let steps: Vec<_> = h.steps.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        assert_eq!(steps, ["kernel=partial", "ssh=on", "updates=failed"]);
+        assert!(!h.egress && !h.reboot_required);
+
+        std::fs::write(&egress, "failed\n").unwrap();
+        assert!(!hardening(&status, &egress, &reboot).unwrap().egress);
+        std::fs::write(&egress, "on\n").unwrap();
+        std::fs::write(&reboot, "").unwrap();
+        let h = hardening(&status, &egress, &reboot).unwrap();
+        assert!(h.egress && h.reboot_required);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -1705,7 +1705,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 48] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 49] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1753,8 +1753,23 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 48] = [
     migrate_server_backups,
     migrate_file_retention,
     migrate_data_regions,
+    migrate_disable_holds,
     migrate_custom_roles,
 ];
+
+/// Machines suspended because their user was disabled (ADR 0124), so enabling them
+/// resumes those and no other.
+fn migrate_disable_holds(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS machine_disable_holds (
+          machine_id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          via TEXT NOT NULL,
+          held_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS machine_disable_holds_user ON machine_disable_holds(user_id);",
+    )
+}
 
 /// Custom roles (ADR 0123): a base built-in role and a fixed set of admin permissions on
 /// top. `users.role_id` is a person's role across the server, and `users.role` stays its
@@ -8354,6 +8369,33 @@ impl Db {
 
     pub fn team_machine_forget(&self, machine_id: &str) {
         self.c().execute("DELETE FROM team_machines WHERE machine_id = ?", [machine_id]).unwrap();
+    }
+
+    /// Marks `machine_id` as off because `user_id` was disabled (ADR 0124). The first
+    /// hold stays: a second disable doesn't move when or how it began.
+    pub fn hold_for_disable(&self, machine_id: &str, user_id: &str, via: &str) {
+        self.c()
+            .execute(
+                "INSERT OR IGNORE INTO machine_disable_holds (machine_id, user_id, via, held_at) VALUES (?1, ?2, ?3, ?4)",
+                params![machine_id, user_id, via, now()],
+            )
+            .unwrap();
+    }
+
+    /// Every disable hold: (machine id, user id, via).
+    pub fn disable_holds(&self) -> Vec<(String, String, String)> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT machine_id, user_id, via FROM machine_disable_holds ORDER BY held_at, machine_id").unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn disable_hold(&self, machine_id: &str) -> bool {
+        self.c().query_row("SELECT 1 FROM machine_disable_holds WHERE machine_id = ?", [machine_id], |_| Ok(())).optional().ok().flatten().is_some()
+    }
+
+    /// Ends the hold on `machine_id`. Whether there was one.
+    pub fn drop_disable_hold(&self, machine_id: &str) -> bool {
+        self.c().execute("DELETE FROM machine_disable_holds WHERE machine_id = ?", [machine_id]).unwrap() > 0
     }
 
     #[cfg(test)]

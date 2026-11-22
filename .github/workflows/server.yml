@@ -101,6 +101,13 @@ jobs:
         run: |
           sudo SUPERBOT_MACHINE_BOT_USER_TEST=1 /tmp/botd-tests --ignored --exact \
             machines_offboard_tests::as_root_a_leaving_teammates_user_processes_and_files_go_and_no_one_elses
+      # ADR 0126: a machine's egress rules keep every user but root and the OS's daemons
+      # off private and metadata addresses, a user made after they loaded included.
+      - name: Harness users on a machine can't reach private or metadata addresses
+        run: |
+          sudo apt-get install -y -qq nftables
+          sudo SUPERBOT_MACHINE_BOT_USER_TEST=1 /tmp/botd-tests --ignored --exact \
+            machines_hardening_tests::as_root_harness_users_cant_reach_private_addresses_but_root_can
 
   shellcheck:
     runs-on: ubuntu-latest

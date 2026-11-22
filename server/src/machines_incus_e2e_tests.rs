@@ -411,6 +411,47 @@ async fn real_incus_containers_enroll_stay_apart_and_follow_the_lifecycle() {
     assert!(!reaches(&env, &b, &a4, agent_port).await, "B reached A's agent");
     env.say("isolation holds");
 
+    // Hardened at first boot (ADR 0126). Inside the container, only root and the OS's
+    // daemons reach private addresses: a user made now can't reach botd's machine port
+    // that root just reached, nor the metadata address, but still reaches the internet
+    // and resolves names.
+    for n in [&a, &b] {
+        let (code, out) = sh(&env, n, "cat /etc/superbot/hardening /run/superbot-hardening/egress").await;
+        assert_eq!(code, 0, "{n}: {out}");
+        for want in ["kernel=", "updates=on", "on"] {
+            assert!(out.lines().any(|l| l.starts_with(want)), "{n}: {want} in {out}");
+        }
+        assert!(!out.contains("failed"), "{n}: {out}");
+        let (code, out) = sh(&env, n, "systemctl is-enabled superbot-egress.service && nft list table inet superbot_egress").await;
+        assert!(code == 0 && out.contains("counter"), "{n}: {out}");
+        let (code, out) = sh(&env, n, "test ! -x /usr/sbin/sshd || /usr/sbin/sshd -T | grep -x 'passwordauthentication no'").await;
+        assert_eq!(code, 0, "{n}: sshd: {out}");
+        let (code, out) = sh(&env, n, "apt-config dump | grep -F 'APT::Periodic::Unattended-Upgrade \"1\";'").await;
+        assert_eq!(code, 0, "{n}: {out}");
+    }
+    let (code, out) = sh(&env, &a, "useradd --system --no-create-home --shell /usr/sbin/nologin sbe2e-late").await;
+    assert_eq!(code, 0, "{out}");
+    let as_late = |cmd: String| format!("setpriv --reuid=sbe2e-late --regid=sbe2e-late --clear-groups {cmd}");
+    let tcp = |host: &str, port: u16| format!("timeout 5 bash -c 'exec 3<>/dev/tcp/{host}/{port}' 2>/dev/null");
+    let (code, _) = sh(&env, &a, &as_late(tcp(&gw, env.machine_port))).await;
+    assert_ne!(code, 0, "a new user in A reached botd's machine port");
+    let (code, _) = sh(&env, &a, &as_late(tcp("169.254.169.254", 80))).await;
+    assert_ne!(code, 0, "a new user in A reached the metadata address");
+    if internet {
+        let (code, _) = sh(&env, &a, &as_late(tcp("1.1.1.1", 443))).await;
+        assert_eq!(code, 0, "control: a new user in A reaches the internet");
+    }
+    let (code, out) = sh(&env, &a, &as_late("timeout 10 getent hosts github.com".into())).await;
+    assert_eq!(code, 0, "a new user in A resolves names: {out}");
+    sh(&env, &a, "userdel sbe2e-late").await;
+    until(&env, "both reported hardened", &ids, Duration::from_secs(60), |m| {
+        m.agent_upkeep.as_ref().is_some_and(|u| u["hardening"]["egress"] == true)
+    })
+    .await;
+    let hardened = events(&env, "machine.hardened").await;
+    assert_eq!(hardened.len(), 2, "{hardened:?}");
+    env.say("hardened: ssh, kernel, updates, egress");
+
     // Suspend and resume: a stop and a start; the agent answers again.
     let (uid_a, ma) = &users[0];
     let (code, s) = json_call(&env, "POST", &format!("/api/users/{uid_a}/machine/suspend"), "").await;
