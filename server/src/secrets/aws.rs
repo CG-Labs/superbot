@@ -734,7 +734,7 @@ mod tests {
         if f.down.load(Ordering::SeqCst) {
             return error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServiceError");
         }
-        let req: Value = serde_json::from_slice(&body).unwrap_or_default();
+        let req = Json::<Value>::from_bytes(&body).map(|Json(v)| v).unwrap_or_default();
         let id = req["SecretId"].as_str().unwrap_or_default().to_string();
         let target = h.get("x-amz-target").and_then(|v| v.to_str().ok()).unwrap_or_default();
         match target {
