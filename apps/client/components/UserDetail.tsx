@@ -6,7 +6,7 @@ import { CODE_TTLS, formatExpiry, relativeTime, ROLES, signInMethod } from "../s
 import { overLimits, planUsageLines } from "../src/plan";
 import type { SsoProvider } from "../src/sso";
 import { colors } from "../src/theme";
-import type { AdminUser, LoginCode, Role, SessionView, TeammateAccounts, TeammateRemoval, UserBots, UserIdentity } from "../src/types";
+import type { AdminUser, CustomRole, LoginCode, Role, SessionView, TeammateAccounts, TeammateRemoval, UserBots, UserIdentity } from "../src/types";
 import { BotAvatar } from "./BotAvatar";
 import { Chips } from "./Chips";
 import { CodeReveal } from "./CodeReveal";
@@ -16,6 +16,8 @@ interface Props {
   user: AdminUser;
   meId?: string | null;
   providers: SsoProvider[];
+  /** Custom roles to give (ADR 0123); none on servers from before them. */
+  roles?: CustomRole[];
   /** Called after any change, so the list can reload. */
   onChanged: () => Promise<void> | void;
 }
@@ -81,7 +83,7 @@ function LoadFailed({ message, onRetry }: { message: string; onRetry: () => void
   );
 }
 
-export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
+export function UserDetail({ api, user, meId, providers, roles = [], onChanged }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [ttl, setTtl] = useState<number>(CODE_TTLS[1].minutes);
@@ -131,8 +133,18 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
     }
   };
 
-  const setRole = (role: Role) => {
-    if (role !== user.role) void run(() => api.patchUser(user.id, { role }));
+  const setRole = async (role: Role) => {
+    if (role === user.role) return;
+    if (user.customRole && !(await confirmAsync(`Make ${user.name} ${ROLES.find((r) => r.role === role)?.label ?? role}?`, `Setting a built-in role takes ${user.customRole.name} away from them.`, "Change"))) return;
+    void run(() => api.patchUser(user.id, { role }));
+  };
+
+  const setCustomRole = async (id: string) => {
+    if (id === (user.roleId ?? "")) return;
+    const next = roles.find((r) => r.id === id);
+    if (!next && !(await confirmAsync(`Take ${user.customRole?.name ?? "their custom role"} away from ${user.name}?`, `They keep ${ROLES.find((r) => r.role === user.role)?.label.toLowerCase() ?? user.role} as their role.`, "Take away"))) return;
+    if (next && user.role === "admin" && !(await confirmAsync(`Give ${next.name} to ${user.name}?`, `They stop being an admin: their role becomes ${next.base === "readonly" ? "read-only" : "member"}, with ${next.name}'s permissions on top.`, "Give"))) return;
+    void run(() => (next ? api.assignRole(next.id, user.id) : api.unassignRole(user.roleId ?? "", user.id)));
   };
 
   const toggleStatus = async () => {
@@ -199,10 +211,22 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
       {error ? <Text style={styles.error}>{error}</Text> : null}
 
       <Section title="Role">
-        <Chips options={ROLES.map((r) => ({ value: r.role, label: r.label }))} value={user.role} onChange={setRole} disabled={busy || locked} />
+        <Chips options={ROLES.map((r) => ({ value: r.role, label: r.label }))} value={user.role} onChange={(r) => void setRole(r)} disabled={busy || locked} />
+        {roles.length ? (
+          <>
+            <Text style={styles.faint}>Custom role: its base becomes their role, with its permissions on top.</Text>
+            <Chips
+              options={[{ value: "", label: "None" }, ...roles.map((r) => ({ value: r.id, label: r.name }))]}
+              value={user.roleId ?? ""}
+              onChange={(id) => void setCustomRole(id)}
+              disabled={busy || locked}
+            />
+          </>
+        ) : null}
         {locked ? (
           <Text style={styles.faint}>{user.breakGlass ? "The owner stays an active admin: it's the way back in." : "Another admin changes your own role and status."}</Text>
         ) : null}
+        {user.permissions?.length ? <Text style={styles.dim}>Can do: {user.permissions.join(", ")}</Text> : null}
       </Section>
 
       {user.plan ? (
