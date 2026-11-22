@@ -289,7 +289,7 @@ pub fn user_view(u: &User) -> Value {
         "id": u.id, "email": u.email, "name": u.name, "role": u.role, "status": u.status,
         "breakGlass": u.id == OPERATOR, "idpIssuer": u.idp_issuer, "idpSubject": u.idp_subject,
         "createdAt": u.created_at, "updatedAt": u.updated_at, "lastLoginAt": u.last_login_at,
-        "tier": u.tier,
+        "tier": u.tier, "erasedAt": u.erased_at, "erasedAs": u.erased_as,
     })
 }
 
@@ -484,8 +484,14 @@ pub async fn me(Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Call
 
 // Users (admin).
 
+/// The user `key` names. An erased one (ADR 0100) is gone (410) for everything but
+/// reading their tombstone and erasing again.
 pub fn need_user_key(app: &AppState, key: &str) -> Res<User> {
-    app.db.find_user(key).ok_or_else(|| not_found("User"))
+    let u = app.db.find_user_any(key).ok_or_else(|| not_found("User"))?;
+    match &u.erased_as {
+        Some(p) => Err(ApiError(StatusCode::GONE, format!("This user was erased; the audit log names them {p}."))),
+        None => Ok(u),
+    }
 }
 
 pub async fn list_users(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>) -> Json<Value> {
@@ -499,7 +505,7 @@ pub async fn list_users(State(app): State<AppState>, Extension(a): Extension<Arc
 }
 
 pub async fn get_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Path(key): Path<String>) -> Res {
-    let u = need_user_key(&app, &key)?;
+    let u = app.db.find_user_any(&key).ok_or_else(|| not_found("User"))?;
     crate::storage::warm(&app, std::slice::from_ref(&u.id)).await;
     let mfa = app.db.mfa(&u.id).and_then(|m| m.confirmed_at);
     Ok(Json(admin_view(&a, &u, &app.db.identities(&u.id), app.db.pending_codes(db::now()).get(&u.id), mfa)))
@@ -623,24 +629,35 @@ pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Ar
             app.db.record(&ev("user.enabled").details(json!({ "routinesResumed": resumed })));
             crate::teams::user_enabled(&app, &by, &after.id).await;
         } else {
-            a.sso.forget_user(&after.id);
-            a.mfa.forget_user(&after.id);
-            let n = app.db.revoke_user_sessions(&after.id, by.actor.id.as_deref().unwrap_or(""), "user disabled");
-            let paused = crate::handover::user_disabled(&app, &by, &after.id);
-            app.db.record(&ev("user.disabled").details(json!({ "sessionsRevoked": n, "routinesPaused": paused })));
+            disabled(&app, &a, &by, &after.id);
         }
     }
-    // Screen links don't know who opened them, so anyone losing access closes them all.
     let lost = (before.role != after.role && after.role != Role::Admin) || (before.active() && !after.active());
-    if lost && let Some(screens) = &app.screens {
-        screens.rotate_all().await;
-    }
     if lost {
-        crate::machines::screens::rotate_all(&app).await;
         let reason = if after.active() { crate::machines::offboard::ACCESS_LOST } else { crate::machines::offboard::DISABLED };
-        crate::machines::offboard::left(&app, &by, &after.id, reason);
+        lost_access(&app, &by, &after.id, reason).await;
     }
     Ok(Json(user_view(&after)))
+}
+
+/// After a user's status is saved as disabled: their sign-ins end and the routines run for
+/// them pause (ADR 0047), recorded as `user.disabled`.
+pub(crate) fn disabled(app: &AppState, a: &Auth, by: &Who, user_id: &str) {
+    a.sso.forget_user(user_id);
+    a.mfa.forget_user(user_id);
+    let n = app.db.revoke_user_sessions(user_id, by.actor.id.as_deref().unwrap_or(""), "user disabled");
+    let paused = crate::handover::user_disabled(app, by, user_id);
+    app.db.record(&by.event("user.disabled").target("user", user_id).details(json!({ "sessionsRevoked": n, "routinesPaused": paused })));
+}
+
+/// After someone loses access: every screen link changes, since links don't know who
+/// opened them, and offboarding takes them off teammates' machines and accounts (ADR 0052, 0066).
+pub(crate) async fn lost_access(app: &AppState, by: &Who, user_id: &str, reason: &str) {
+    if let Some(screens) = &app.screens {
+        screens.rotate_all().await;
+    }
+    crate::machines::screens::rotate_all(app).await;
+    crate::machines::offboard::left(app, by, user_id, reason);
 }
 
 /// `{ttlMinutes?, replace?}` (default 60, up to 7 days). Returns the code once; only its

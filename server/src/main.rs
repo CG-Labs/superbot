@@ -30,6 +30,9 @@ mod isolation;
 #[cfg(test)]
 mod isolation_http_tests;
 mod db;
+mod erasure;
+#[cfg(test)]
+mod erasure_http_tests;
 mod license;
 #[cfg(test)]
 mod license_http_tests;
@@ -748,6 +751,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/login-codes", post(users::create_login_code))
         .route("/users/{key}/sessions", delete(users::revoke_user_sessions))
         .route("/users/{key}/mfa", delete(mfa::reset))
+        .route("/users/{key}/erase", post(erasure::erase))
         .route("/users/{key}/bots", get(users::user_bots))
         .route("/users/{key}/usage", get(usage::of_user))
         .route("/users/{key}/routines", get(handover::list))

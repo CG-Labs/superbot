@@ -77,7 +77,7 @@ fn concrete(path: &str) -> String {
 fn the_route_list_is_read_whole() {
     let r = routes();
     assert!(r.len() >= 60, "{} routes: the parser no longer understands fn router", r.len());
-    for (m, p) in [("GET", "/api/state"), ("DELETE", "/api/users/{key}/sessions"), ("POST", "/api/signups/{id}/reject"), ("POST", "/api/auth/sso/{id}/callback"), ("GET", "/healthz"), ("POST", "/api/scim/tokens"), ("PATCH", "/scim/v2/Users/{id}"), ("GET", "/api/setup"), ("PATCH", "/api/setup"), ("PUT", "/api/license"), ("PUT", "/scim/v2/Groups/{id}"), ("PATCH", "/scim/v2/Groups/{id}"), ("POST", "/scim/v2/Groups"), ("POST", "/api/scim/groups"), ("DELETE", "/api/scim/groups/{team}")] {
+    for (m, p) in [("GET", "/api/state"), ("DELETE", "/api/users/{key}/sessions"), ("POST", "/api/signups/{id}/reject"), ("POST", "/api/auth/sso/{id}/callback"), ("GET", "/healthz"), ("POST", "/api/scim/tokens"), ("PATCH", "/scim/v2/Users/{id}"), ("GET", "/api/setup"), ("PATCH", "/api/setup"), ("PUT", "/api/license"), ("PUT", "/scim/v2/Groups/{id}"), ("PATCH", "/scim/v2/Groups/{id}"), ("POST", "/scim/v2/Groups"), ("POST", "/api/scim/groups"), ("DELETE", "/api/scim/groups/{team}"), ("POST", "/api/users/{key}/erase")] {
         assert!(r.contains(&(m.into(), p.into())), "{m} {p} missing from {r:?}");
     }
     for (m, p) in PUBLIC {

@@ -1,0 +1,235 @@
+//! Erasing a user (ADR 0100) on the real router: their personal data leaves the database,
+//! the audit log keeps its events under a pseudonym, and a legal hold, the last owner of a
+//! team, or a machine still there refuses it. Admins only, and twice is once.
+
+use crate::audit::{Actor, ActorKind, Source, Who};
+use crate::machines::ControlPlane;
+use crate::machines::fake::Fake;
+use crate::machines::provider::MachineProvider;
+use crate::scim_http_tests::{okta_user, scim, session_for, token};
+use crate::tests::{audit_list, call, serve_app, serve_app_with};
+use crate::users_http_tests::{parse, user_with};
+use crate::*;
+
+async fn json_call(port: u16, method: &str, path: &str, who: &str, body: &str) -> (u16, Value) {
+    let (code, body) = call(port, method, path, who, body).await;
+    (code, parse(&body))
+}
+
+async fn erase(port: u16, who: &str, user: &str, body: &str) -> (u16, Value) {
+    json_call(port, "POST", &format!("/api/users/{user}/erase"), who, body).await
+}
+
+async fn audit(port: u16, admin: &str, query: &str) -> Vec<Value> {
+    let (code, body) = call(port, "GET", &format!("/api/audit?limit=1000&{query}"), admin, "").await;
+    assert_eq!(code, 200, "{body}");
+    audit_list(&body)
+}
+
+/// A message in `bot`'s chat that `user` sent.
+fn sent_by(app: &AppState, bot: &str, user: &str, text: &str) -> i64 {
+    let m = app.db.add_message(bot, "user", text, None, false, None);
+    let who = Who { actor: Actor { kind: ActorKind::User, id: Some(user.into()), ..Default::default() }, source: Source::default() };
+    app.db.set_requested_by(m.id, &who);
+    m.id
+}
+
+async fn bot_of(port: u16, auth: &str, name: &str) -> String {
+    let (code, b) = json_call(port, "POST", "/api/bots", auth, &json!({ "name": name }).to_string()).await;
+    assert_eq!(code, 201, "{b}");
+    b["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn erasing_leaves_no_personal_data_and_the_audit_log_names_a_pseudonym() {
+    let (port, app, admin, _) = serve_app_with(|a| a.scim.enabled = true).await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    let (code, _, made) = scim(port, &t, "POST", "/scim/v2/Users", okta_user("ada@example.com", "ext-ada-0001")).await;
+    assert_eq!(code, 201, "{made}");
+    let ada = made["id"].as_str().unwrap().to_string();
+    let ada_auth = session_for(port, &admin, &ada).await;
+    app.db.link_identity(&ada, &db::NewIdentity { provider: "entra", issuer: "https://login.example.com/t1", subject: "subject-ada-0001", tenant: None, email: Some("ada.work@example.com"), created_by: None }).unwrap();
+    assert!(app.db.mfa_begin(&ada, "sealed-totp-of-ada"));
+    secrets::global().user_put(&ada, "OPENAI_API_KEY", "sk-ada-private-key").unwrap();
+
+    // Her own Bot, with chat and a routine; a teammate's shared Bot she wrote in, and a grant on it.
+    let mine = bot_of(port, &ada_auth, "Notebook").await;
+    app.db.add_message(&mine, "user", "my private diary entry", None, false, None);
+    app.db.add_routine(&mine, "daily", "0 9 * * *", "summarise my private inbox");
+    let shared = app.db.create_bot("Team", "#fff", "waddle", "claude", None, false).id;
+    let wrote = sent_by(&app, &shared, &ada, "Ada's secret plan for Lovelace Ltd");
+    let reply = app.db.add_message(&shared, "bot", "Noted.", None, false, None);
+    assert_eq!(call(port, "PUT", &format!("/api/bots/{shared}/grants/{ada}"), &admin, r#"{"level":"operator"}"#).await.0, 200);
+    let before = audit(port, &admin, "").await;
+    assert!(before.iter().any(|e| e.to_string().contains("ada@example.com")), "the log names her before");
+
+    let (code, v) = erase(port, &admin, &ada, "").await;
+    assert_eq!(code, 200, "{v}");
+    let p = v["pseudonym"].as_str().unwrap().to_string();
+    assert!(p.starts_with("erased-"), "{v}");
+    assert_eq!((v["already"].clone(), v["removed"]["bots"].clone(), v["removed"]["secrets"].clone(), v["removed"]["grants"].clone()), (json!(false), json!(1), json!(1), json!(1)), "{v}");
+    assert_eq!((v["removed"]["mfa"].clone(), v["removed"]["identities"].clone(), v["removed"]["scim"].clone(), v["removed"]["messages"].clone()), (json!(true), json!(1), json!(true), json!(1)), "{v}");
+
+    // The tombstone: no name, email or sign-in, and gone for every other admin route.
+    let (code, u) = json_call(port, "GET", &format!("/api/users/{ada}"), &admin, "").await;
+    assert_eq!(code, 200, "{u}");
+    assert_eq!((u["email"].clone(), u["name"].as_str(), u["status"].as_str(), u["erasedAs"].as_str(), u["idpSubject"].clone()), (Value::Null, Some("Erased user"), Some("disabled"), Some(p.as_str()), Value::Null), "{u}");
+    assert_eq!(u["identities"], json!([]));
+    assert_eq!(call(port, "GET", "/api/auth/me", &ada_auth, "").await.0, 401, "her sessions are gone");
+    assert_eq!(call(port, "GET", &format!("/api/users/{ada}/bots"), &admin, "").await.0, 410);
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{ada}"), &admin, r#"{"status":"active"}"#).await.0, 410, "never enabled again");
+    assert_eq!(call(port, "POST", &format!("/api/users/{ada}/login-codes"), &admin, "").await.0, 410);
+    assert_eq!(call(port, "PUT", &format!("/api/bots/{shared}/grants/{ada}"), &admin, r#"{"level":"viewer"}"#).await.0, 404);
+    assert_eq!(call(port, "GET", "/api/users/ada@example.com", &admin, "").await.0, 404, "her email finds nobody");
+    assert_eq!(scim(port, &t, "GET", &format!("/scim/v2/Users/{ada}"), Value::Null).await.0, 404);
+    assert!(app.db.bot(&mine).is_none());
+    assert_eq!(app.db.message(wrote).unwrap().text, "[erased]");
+    assert!(app.db.message(wrote).unwrap().requested_by.is_none());
+    assert_eq!(app.db.message(reply.id).unwrap().text, "Noted.", "others' messages stay");
+    assert!(secrets::global().user_list(&ada).unwrap().is_empty());
+
+    // Nothing of hers is left in any table, and the audit log doesn't have her id.
+    let rows = app.db.all_rows();
+    assert!(rows.iter().any(|(t, r)| t == "users" && r.contains("Erased user")) && rows.iter().any(|(t, _)| t == "audit_events"));
+    for (table, row) in rows {
+        let low = row.to_lowercase();
+        for pii in ["ada@example.com", "ada.work@example.com", "lovelace", "ext-ada-0001", "subject-ada-0001", "sealed-totp-of-ada", "diary", "private inbox", "secret plan"] {
+            assert!(!low.contains(pii), "{pii} in {table}: {row}");
+        }
+        if table == "audit_events" {
+            assert!(!row.contains(&ada), "her id in the audit log: {row}");
+        }
+    }
+
+    // Her events stay, under the pseudonym; the erasure names who did it.
+    let after = audit(port, &admin, "").await;
+    assert_eq!(after.len(), before.len() + after.iter().filter(|e| e["id"].as_i64() > before[0]["id"].as_i64()).count());
+    let created = audit(port, &admin, "action=user.created").await;
+    assert!(created.iter().any(|e| e["targetId"].as_str() == Some(p.as_str()) && e["details"]["email"].as_str() == Some(p.as_str())), "{created:?}");
+    let logins: Vec<Value> = audit(port, &admin, "action=auth.login").await.into_iter().filter(|e| e["actorId"].as_str() == Some(p.as_str())).collect();
+    assert!(!logins.is_empty() && logins.iter().all(|e| e["actorEmail"].is_null() && e["actorName"].is_null() && e["sessionId"].is_null()), "{logins:?}");
+    let erased = audit(port, &admin, "action=user.erased").await;
+    assert_eq!(erased.len(), 1, "{erased:?}");
+    assert_eq!((erased[0]["actorId"].as_str(), erased[0]["targetId"].as_str(), erased[0]["details"]["pseudonym"].as_str()), (Some("operator"), Some(p.as_str()), Some(p.as_str())));
+
+    // The log is still append-only outside an erasure.
+    assert!(app.db.execute_raw("UPDATE audit_events SET actor_name = NULL").is_err());
+    assert!(app.db.execute_raw(&format!("UPDATE audit_events SET actor_id = 'x' WHERE actor_id = '{p}'")).is_err());
+
+    // The IdP provisioning her again makes a new user, with none of the old history.
+    let (code, _, again) = scim(port, &t, "POST", "/scim/v2/Users", okta_user("ada@example.com", "ext-ada-0001")).await;
+    assert_eq!(code, 201, "{again}");
+    assert_ne!(again["id"].as_str(), Some(ada.as_str()));
+}
+
+#[tokio::test]
+async fn a_user_under_legal_hold_is_not_erased() {
+    let (port, app, admin, _) = serve_app().await;
+    let (ada, ada_auth) = user_with(port, &admin, "ada@example.com", "member").await;
+    let mine = bot_of(port, &ada_auth, "Notebook").await;
+    assert_eq!(call(port, "PUT", &format!("/api/retention/holds/{mine}"), &admin, r#"{"reason":"litigation"}"#).await.0, 200);
+    let (code, v) = erase(port, &admin, &ada, "").await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("legal hold") && v["error"].as_str().unwrap().contains(&mine), "{v}");
+    assert_eq!(app.db.user(&ada).unwrap().email.as_deref(), Some("ada@example.com"), "nothing changed");
+    assert!(app.db.bot(&mine).is_some());
+    let refused = audit(port, &admin, "action=user.erase_refused").await;
+    assert_eq!((refused[0]["outcome"].as_str(), refused[0]["details"]["reason"].as_str()), (Some("denied"), Some("legal_hold")), "{refused:?}");
+    assert_eq!(call(port, "DELETE", &format!("/api/retention/holds/{mine}"), &admin, "").await.0, 200);
+
+    // Someone else's held Bot with a message she sent holds her too.
+    let held = app.db.create_bot("Case", "#fff", "waddle", "claude", None, false).id;
+    sent_by(&app, &held, &ada, "evidence");
+    assert_eq!(call(port, "PUT", &format!("/api/retention/holds/{held}"), &admin, r#"{"reason":"litigation"}"#).await.0, 200);
+    let (code, v) = erase(port, &admin, &ada, "").await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains(&held), "{v}");
+    assert_eq!(call(port, "DELETE", &format!("/api/retention/holds/{held}"), &admin, "").await.0, 200);
+    let (code, v) = erase(port, &admin, &ada, "").await;
+    assert_eq!(code, 200, "{v}");
+}
+
+#[tokio::test]
+async fn only_another_admin_erases_and_never_the_owner_account() {
+    let (port, app, owner, key) = serve_app().await;
+    let (ada, _) = user_with(port, &owner, "ada@example.com", "member").await;
+    let (_, member) = user_with(port, &owner, "m@example.com", "member").await;
+    let (_, readonly) = user_with(port, &owner, "r@example.com", "readonly").await;
+    let (admin_id, admin) = user_with(port, &owner, "ops@example.com", "admin").await;
+    let bot = key.auth(&app.db.create_bot("Walker", "#fff", "waddle", "claude", None, false).id);
+    assert_eq!(erase(port, "", &ada, "").await.0, 401);
+    for who in [&member, &readonly, &bot] {
+        assert_eq!(erase(port, who, &ada, "").await.0, 403);
+    }
+    assert!(app.db.user(&ada).unwrap().erased_at.is_none());
+    assert_eq!(erase(port, &admin, &admin_id, "").await.0, 409, "not yourself");
+    assert_eq!(erase(port, &admin, users::OPERATOR, "").await.0, 409, "not the owner account");
+    assert_eq!(erase(port, &admin, "nobody@example.com", "").await.0, 404);
+    assert_eq!(erase(port, &admin, &ada, r#"{"destroyMachine":"yes"}"#).await.0, 400);
+    let (code, v) = erase(port, &admin, "ada@example.com", "").await;
+    assert_eq!(code, 200, "by email too: {v}");
+    let erased = audit(port, &owner, "action=user.erased").await;
+    assert_eq!(erased[0]["actorId"].as_str(), Some(admin_id.as_str()), "{erased:?}");
+}
+
+#[tokio::test]
+async fn erasing_twice_is_erasing_once() {
+    let (port, _, admin, _) = serve_app().await;
+    let (ada, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (code, first) = erase(port, &admin, &ada, "").await;
+    assert_eq!((code, first["already"].clone()), (200, json!(false)), "{first}");
+    let (code, again) = erase(port, &admin, &ada, r#"{"destroyMachine":true}"#).await;
+    assert_eq!((code, again["already"].clone(), again["pseudonym"].clone()), (200, json!(true), first["pseudonym"].clone()), "{again}");
+    assert_eq!(audit(port, &admin, "action=user.erased").await.len(), 1);
+    assert_eq!(erase(port, &admin, "ada@example.com", "").await.0, 404, "her email is gone");
+}
+
+#[tokio::test]
+async fn the_last_owner_of_a_team_is_not_erased() {
+    let (port, app, admin, _) = serve_app().await;
+    let (ada, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (bea, _) = user_with(port, &admin, "bea@example.com", "member").await;
+    let (code, t) = json_call(port, "POST", "/api/teams", &admin, &json!({ "name": "Alpha", "owner": "ada@example.com", "machines": false }).to_string()).await;
+    assert_eq!(code, 201, "{t}");
+    let team = t["id"].as_str().unwrap().to_string();
+    assert_eq!(call(port, "PUT", &format!("/api/teams/{team}/members/{bea}"), &admin, "{}").await.0, 200);
+    let (code, v) = erase(port, &admin, &ada, "").await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("only owner"), "{v}");
+    assert_eq!(audit(port, &admin, "action=user.erase_refused").await[0]["details"]["reason"].as_str(), Some("last_team_owner"));
+    assert!(app.db.team_member(&ada).is_some());
+
+    assert_eq!(call(port, "PUT", &format!("/api/teams/{team}/members/{bea}"), &admin, r#"{"role":"owner"}"#).await.0, 200);
+    let (code, v) = erase(port, &admin, &ada, "").await;
+    assert_eq!((code, v["removed"]["team"].as_str()), (200, Some(team.as_str())), "{v}");
+    let (_, t) = json_call(port, "GET", &format!("/api/teams/{team}"), &admin, "").await;
+    assert_eq!(t["members"].as_array().map(|m| m.iter().map(|m| m["user"]["id"].as_str().or(m["id"].as_str()).unwrap_or_default().to_string()).collect::<Vec<_>>()), Some(vec![bea.clone()]), "{t}");
+    let left = audit(port, &admin, "action=team.member_left").await;
+    assert_eq!(left[0]["details"]["reason"].as_str(), Some("erased"), "{left:?}");
+
+    // Their team's last member: the team goes with them.
+    let (code, v) = erase(port, &admin, &bea, "").await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(call(port, "GET", &format!("/api/teams/{team}"), &admin, "").await.0, 404);
+}
+
+#[tokio::test]
+async fn a_machine_is_destroyed_first_or_the_erasure_waits() {
+    let fake = Arc::new(Fake::default());
+    let p: Arc<dyn MachineProvider> = fake.clone();
+    let (port, app, admin, _) = serve_app_with(|a| a.machines = Arc::new(ControlPlane::for_tests(p))).await;
+    let (ada, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (code, m) = json_call(port, "POST", &format!("/api/users/{ada}/machine"), &admin, "{}").await;
+    assert!([201, 202].contains(&code), "{code} {m}");
+    let (code, v) = erase(port, &admin, &ada, "").await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("destroyMachine"), "{v}");
+    assert_eq!(audit(port, &admin, "action=user.erase_refused").await[0]["details"]["reason"].as_str(), Some("machine"));
+    assert!(app.db.user_machine(&ada).is_some(), "kept");
+
+    let (code, v) = erase(port, &admin, &ada, r#"{"destroyMachine":true}"#).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["removed"]["machine"]["destroyed"], json!(true), "{v}");
+    assert!(app.db.user_machine(&ada).is_none());
+    assert_eq!(audit(port, &admin, "action=machine.destroy_requested").await.len(), 1);
+}
