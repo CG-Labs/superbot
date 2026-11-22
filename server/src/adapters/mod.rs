@@ -204,7 +204,7 @@ pub(crate) fn strip_secret_env(cmd: &mut std::process::Command) {
 
 /// How jobs start on this server: botd's environment, without its secrets.
 pub fn local_host() -> job::Host {
-    job::Host { clear_env: false, remove: never_inherited(), env: BTreeMap::new(), user: None }
+    job::Host { clear_env: false, remove: never_inherited(), env: BTreeMap::new(), user: None, limits: None }
 }
 
 pub trait Adapter: Send + Sync {
@@ -337,6 +337,7 @@ pub fn plain_job(bin: &str, args: Vec<String>, env: BTreeMap<String, String>, cw
         files: Vec::new(),
         cleanup,
         collect: Vec::new(),
+        limits: None,
     }
 }
 
@@ -482,6 +483,7 @@ pub fn job_for(adapter: &mut dyn Adapter, input: &RunInput, out: &mut Vec<AgentE
         files: adapter.files(input).into_iter().map(|(p, body)| JobFile { path: path(&p), body }).collect(),
         cleanup: adapter.cleanup(input),
         collect: Vec::new(),
+        limits: None,
     }
 }
 

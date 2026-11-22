@@ -113,6 +113,54 @@ pub struct Limits {
     /// keeps for them and their Bots (ADR 0082). Past it, new runs are refused. Unset: any.
     #[serde(default)]
     pub max_storage_mb: Option<u64>,
+    /// What one Bot run may take of its machine (ADR 0135), held by a cgroup of its own
+    /// there. Each part left out takes the safe default (`RunLimitsSpec::resolve`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_limits: Option<RunLimitsSpec>,
+}
+
+/// A tier's limits for one Bot run on a user's machine (ADR 0135), as shares of the
+/// machine, so they hold whatever its size.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RunLimitsSpec {
+    /// Of all the machine's CPUs, 1 to 100.
+    #[serde(default)]
+    pub cpu_percent: Option<u32>,
+    /// Of the memory runs may use, 1 to 100.
+    #[serde(default)]
+    pub memory_percent: Option<u32>,
+    /// Processes and threads at once, 16 to 65536.
+    #[serde(default)]
+    pub pids: Option<u32>,
+    /// Disk share against other runs, 1 to 10000 (100 is even).
+    #[serde(default)]
+    pub io_weight: Option<u32>,
+}
+
+impl RunLimitsSpec {
+    /// The limits sent with a run: these, the defaults where unset.
+    pub fn resolve(spec: Option<&RunLimitsSpec>) -> crate::machines::wire::RunLimits {
+        let d = crate::machines::cgroup::DEFAULT;
+        let s = spec.copied().unwrap_or_default();
+        crate::machines::wire::RunLimits {
+            cpu_percent: s.cpu_percent.unwrap_or(d.cpu_percent),
+            memory_percent: s.memory_percent.unwrap_or(d.memory_percent),
+            pids: s.pids.unwrap_or(d.pids),
+            io_weight: s.io_weight.unwrap_or(d.io_weight),
+        }
+    }
+
+    fn check(&self) -> Result<(), String> {
+        let within = |v: Option<u32>, lo: u32, hi: u32, name: &str| match v {
+            Some(v) if !(lo..=hi).contains(&v) => Err(format!("runLimits.{name} must be {lo} to {hi} (leave it out for the default)")),
+            _ => Ok(()),
+        };
+        within(self.cpu_percent, 1, 100, "cpuPercent")?;
+        within(self.memory_percent, 1, 100, "memoryPercent")?;
+        within(self.pids, 16, 65_536, "pids")?;
+        within(self.io_weight, 1, 10_000, "ioWeight")
+    }
 }
 
 /// One published price (ADR 0121): an amount in the currency's smallest unit, as Stripe's
@@ -531,6 +579,9 @@ impl Tiers {
             if limits.max_storage_mb.is_some_and(|m| m == 0 || m > crate::storage::MAX_MB) {
                 return Err(format!("tier \"{name}\": maxStorageMb must be 1 to {} (leave it out for no limit)", crate::storage::MAX_MB));
             }
+            if let Some(r) = &limits.run_limits {
+                r.check().map_err(|e| format!("tier \"{name}\": {e}"))?;
+            }
             let mut prices = Vec::new();
             for p in t.stripe_prices {
                 let p = p.trim().to_string();
@@ -826,6 +877,9 @@ mod tests {
         assert!(bad(&one(r#"{"name":"a","routes":"any","limits":{"concurrentRuns":0}}"#)).contains("concurrentRuns must be at least 1"));
         assert!(bad(&one(r#"{"name":"a","routes":"any","limits":{"maxStorageMb":0}}"#)).contains("maxStorageMb must be 1 to"));
         assert!(bad(&one(r#"{"name":"a","routes":"any","limits":{"maxStorageMb":1000000000000}}"#)).contains("maxStorageMb must be 1 to"));
+        assert!(bad(&one(r#"{"name":"a","routes":"any","limits":{"runLimits":{"cpuPercent":0}}}"#)).contains("runLimits.cpuPercent must be 1 to 100"));
+        assert!(bad(&one(r#"{"name":"a","routes":"any","limits":{"runLimits":{"pids":8}}}"#)).contains("runLimits.pids must be 16 to"));
+        assert!(bad(&one(r#"{"name":"a","routes":"any","limits":{"runLimits":{"cpu":50}}}"#)).contains("unknown field"));
         assert!(bad(&one(r#"{"name":"a","routes":"any","stripePrices":["prod_123"]}"#)).contains("isn't a Stripe price id"));
         assert!(bad(&one(r#"{"name":"a","routes":"any","stripePrices":["price_1","price_1"]}"#)).contains("twice"));
         assert!(bad(r#"{"tiers":[{"name":"a","routes":"any","stripePrices":["price_1"]},{"name":"b","routes":"any","stripePrices":["price_1"]}]}"#).contains("twice"));
@@ -850,6 +904,15 @@ mod tests {
         let l = &open.default_tier().limits;
         assert_eq!((l.daily_routine_runs, l.machine_type.as_deref(), open.by_stripe_price("price_x").is_none()), (None, None, true));
         assert_eq!((l.concurrent_runs, l.max_storage_mb), (None, None));
+    }
+
+    #[test]
+    fn run_limits_fill_in_the_defaults() {
+        let t = Tiers::parse(r#"{"tiers":[{"name":"a","routes":"any","limits":{"runLimits":{"cpuPercent":50,"pids":256}}}]}"#, None).unwrap();
+        let r = RunLimitsSpec::resolve(t.get("a").unwrap().limits.run_limits.as_ref());
+        let d = crate::machines::cgroup::DEFAULT;
+        assert_eq!((r.cpu_percent, r.pids, r.memory_percent, r.io_weight), (50, 256, d.memory_percent, d.io_weight));
+        assert_eq!(RunLimitsSpec::resolve(None), d);
     }
 
     #[test]

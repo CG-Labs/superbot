@@ -116,6 +116,10 @@ pub const CAN_TEAMMATE_LOGINS: &str = "teammate_logins";
 pub const CAN_INSTALL_AFTER: &str = "install_after";
 /// Deletes old harness session files and archived teammates' work (`/v1/retention`, ADR 0112).
 pub const CAN_RETENTION: &str = "retention";
+/// Takes `JobRequest::limits` and holds each run to them in a cgroup of its own (ADR 0135).
+pub const CAN_RUN_LIMITS: &str = "run_limits";
+/// Takes an outbound allow-list (`PUT /v1/egress-policy`, ADR 0135).
+pub const CAN_EGRESS_POLICY: &str = "egress_policy";
 
 /// The screen protocol this build speaks (ADR 0045). A request names it, an agent
 /// refuses any other, and botd treats an agent that reports another as outdated.
@@ -437,7 +441,119 @@ pub struct Heartbeat {
     /// What its first boot hardened (ADR 0126). None if it wasn't, or before it said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardening: Option<Hardening>,
+    /// Whether it can hold runs to limits (ADR 0135). None before it could.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_limits: Option<RunLimitsReport>,
+    /// The outbound allow-list it holds (ADR 0135). None before it could take one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_policy: Option<EgressReport>,
 }
+
+/// What a run may use on a machine (ADR 0135): shares of the machine's CPUs and memory
+/// as the agent sees them, processes, and an IO weight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunLimits {
+    /// Percent of all the machine's CPUs, 1 to 100.
+    pub cpu_percent: u32,
+    /// Percent of the machine's memory, 1 to 100.
+    pub memory_percent: u32,
+    /// Processes and threads at once.
+    pub pids: u32,
+    /// cgroup `io.weight`, 1 to 10000 (100 is the kernel's default).
+    pub io_weight: u32,
+}
+
+/// What a run's cgroup saw (ADR 0135), sent with its exit.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LimitReport {
+    /// The limits were applied: false where the agent couldn't (`RunLimitsReport`).
+    pub enforced: bool,
+    /// Processes the kernel killed for going over the memory limit.
+    pub oom_kills: u64,
+    /// Times memory reached the limit.
+    pub memory_max_hits: u64,
+    /// Forks refused at the process limit.
+    pub pids_refused: u64,
+    /// Time held back by the CPU limit.
+    pub cpu_throttled_ms: u64,
+    /// The limits as applied: CPU quota per 100 ms in µs, memory bytes, processes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied: Option<AppliedLimits>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppliedLimits {
+    pub cpu_quota_us: u64,
+    pub memory_bytes: u64,
+    pub pids: u32,
+    /// None where the machine has no io controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_weight: Option<u32>,
+}
+
+/// Whether the agent can hold runs to limits: `on`, or `unavailable` with why (no
+/// cgroup v2, not delegated by systemd, a controller missing).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunLimitsReport {
+    pub state: String,
+    #[serde(default)]
+    pub controllers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+pub const RUN_LIMITS_ON: &str = "on";
+pub const RUN_LIMITS_UNAVAILABLE: &str = "unavailable";
+
+/// An outbound allow-list for Bots and teammates on a machine (ADR 0135). `open`: no
+/// list, the internet stays open (the deny rules of ADR 0126 still apply). `allow_list`:
+/// only `allow`'s hosts and CIDRs, on top of the deny rules.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EgressPolicy {
+    /// botd's id for this policy: a hash of the rest.
+    pub id: String,
+    pub mode: String,
+    pub allow: Vec<String>,
+}
+
+pub const EGRESS_OPEN: &str = "open";
+pub const EGRESS_ALLOW_LIST: &str = "allow_list";
+/// Most entries an allow-list may have, and addresses one host may add.
+pub const EGRESS_MAX_ENTRIES: usize = 256;
+pub const EGRESS_MAX_ADDRESSES_PER_HOST: usize = 32;
+
+/// The allow-list an agent holds and whether its rules are loaded.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressReport {
+    /// The policy's id, empty when it was never sent one.
+    pub id: String,
+    pub mode: String,
+    /// `on` (loaded), `open` (nothing to load) or `failed`.
+    pub state: String,
+    /// Addresses the rules allow now, hosts resolved.
+    #[serde(default)]
+    pub addresses: u32,
+    /// Hosts that didn't resolve the last time: allowed nothing until they do.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// When the rules were last loaded or refreshed.
+    #[serde(default)]
+    pub at: i64,
+}
+
+pub const EGRESS_STATE_ON: &str = "on";
+pub const EGRESS_STATE_OPEN: &str = "open";
+pub const EGRESS_STATE_FAILED: &str = "failed";
 
 /// A machine's hardening (ADR 0126): each first-boot step's state (`ssh`, `kernel`,
 /// `updates`), whether this boot's harness egress rules are loaded, and whether
@@ -835,6 +951,9 @@ pub struct JobRequest {
     /// own OS user, in their home there, and every path must be inside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub for_user: Option<String>,
+    /// What the run may use there (ADR 0135). Sent only to agents with `CAN_RUN_LIMITS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<RunLimits>,
 }
 
 /// What a job stream carries, one per line.
@@ -863,6 +982,9 @@ pub enum JobEvent {
         /// overwrite them until they're small enough to come back.
         #[serde(default)]
         too_big: Vec<String>,
+        /// What its cgroup saw, when it was asked to hold it to limits (ADR 0135).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limited: Option<LimitReport>,
     },
 }
 

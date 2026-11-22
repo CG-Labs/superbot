@@ -94,9 +94,13 @@ struct Run {
 /// Where a run happens: here, or on its owner's machine (ADR 0036).
 enum Place {
     Here,
-    /// The owner's machine, and the teammate's own user there the run is for (ADR 0048).
-    There(Box<(Assigned, wire::Layout, Option<wire::TeammateReply>)>),
+    /// The owner's machine, the teammate's own user there the run is for (ADR 0048), and
+    /// what the run is held to there (ADR 0135).
+    There(Box<(Assigned, wire::Layout, Option<wire::TeammateReply>, Option<wire::RunLimits>)>),
 }
+
+/// A run on a machine held back on CPU for this long, in all, is audited (ADR 0135).
+const RUN_THROTTLED_MS: u64 = 5_000;
 
 /// What a job on a machine sent back: files by path, and those too big to send.
 type Back = (std::collections::BTreeMap<String, String>, Vec<String>);
@@ -126,6 +130,8 @@ struct Spot {
     /// which it doesn't.
     home: Option<PathBuf>,
     caches: Vec<PathBuf>,
+    /// What the run is held to on its machine (ADR 0135). None: here, or not held.
+    limits: Option<wire::RunLimits>,
 }
 
 impl Spot {
@@ -1553,9 +1559,9 @@ impl App {
             let layout = route::fit(&hb, bin)?;
             let keys = if for_other.is_some() { None } else { Some(bot.owner_id.as_str()) };
             cp.ready(self, &hb, keys, &to.machine_id, bin, teammate.is_some())?;
-            Ok((layout, hb.version))
+            Ok((layout, hb.version.clone(), cp.run_limits(self, &hb, &bot.owner_id)))
         });
-        let (layout, version) = match ready {
+        let (layout, version, limits) = match ready {
             Err(r) => return refused(r, Some(&to.machine_id)),
             Ok(ready) => ready,
         };
@@ -1580,10 +1586,10 @@ impl App {
         let e = by.event("bot.run_routed").target("message", &msg.id.to_string()).bot(&bot.id);
         let detail = json!({
             "owner": bot.owner_id, "machine": to.machine_id, "link": cp.link.name(), "agentVersion": version, "forUser": for_other,
-            "teammateUser": user.as_ref().map(|t| &t.user), "messageId": msg.id,
+            "teammateUser": user.as_ref().map(|t| &t.user), "messageId": msg.id, "runLimits": limits,
         });
         self.db.record(&e.details(detail));
-        Some(Place::There(Box::new((to, layout, user))))
+        Some(Place::There(Box::new((to, layout, user, limits))))
     }
 
     /// Whether a run on this server is refused because its harness isn't installed here,
@@ -1707,6 +1713,7 @@ impl App {
             files: vec![],
             cleanup: None,
             collect: vec![],
+            limits: None,
         };
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let (_abort, abort_rx) = watch::channel(None);
@@ -1739,9 +1746,10 @@ impl App {
                 sandbox_host: Some(self.cfg.sandbox_host.clone()),
                 home: None,
                 caches: vec![],
+                limits: None,
             },
             Place::There(there) => {
-                let (to, mut layout, teammate) = *there;
+                let (to, mut layout, teammate, limits) = *there;
                 let botctl = PathBuf::from(layout.botctl.clone().unwrap_or_default());
                 // HOME and PATH are the machine's own; it inherits nothing of botd's.
                 env.remove("PATH");
@@ -1780,6 +1788,7 @@ impl App {
                     sandbox_host: layout.sandbox,
                     home: Some(PathBuf::from(&layout.home)),
                     caches,
+                    limits,
                 }
             }
         }
@@ -1805,11 +1814,13 @@ impl App {
             *n == 1
         };
         let back: Arc<Mutex<Back>> = Arc::default();
+        let limited: Arc<Mutex<Option<wire::LimitReport>>> = Arc::default();
         let (memory_at, user_at) = (spot.memory.display().to_string(), spot.user_file.display().to_string());
         let job_abort = abort.clone();
         let traced = trace::current_handle();
         let exec = |mut job: wire::JobRequest, tx: tokio::sync::mpsc::Sender<JobEvent>| {
-            let (link, back, abort) = (cp.link.clone(), back.clone(), job_abort);
+            let (link, back, limited, abort) = (cp.link.clone(), back.clone(), limited.clone(), job_abort);
+            job.limits = spot.limits;
             job.job_id = format!("j{}", crate::random_hex(8));
             job.bot_id = bot.id.clone();
             job.owner_id = bot.owner_id.clone();
@@ -1822,8 +1833,9 @@ impl App {
                 let (mid_tx, mut mid_rx) = tokio::sync::mpsc::channel::<JobEvent>(64);
                 let forward = async {
                     while let Some(ev) = mid_rx.recv().await {
-                        if let JobEvent::Exit { files, too_big, .. } = &ev {
+                        if let JobEvent::Exit { files, too_big, limited: l, .. } = &ev {
                             *back.lock().unwrap_or_else(|e| e.into_inner()) = (files.clone(), too_big.clone());
+                            *limited.lock().unwrap_or_else(|e| e.into_inner()) = l.clone();
                         }
                         if tx.send(ev).await.is_err() {
                             return;
@@ -1849,6 +1861,9 @@ impl App {
             }
         }
         let (back, too_big) = std::mem::take(&mut *back.lock().unwrap_or_else(|e| e.into_inner()));
+        if let Some(l) = limited.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            self.limited(bot, msg, to, spot.limits, &l);
+        }
         for path in &too_big {
             let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let mib = crate::machines::job::MAX_COLLECT >> 20;
@@ -1866,6 +1881,28 @@ impl App {
                     accounts::remove(&copy);
                 }
             }
+        }
+    }
+
+    /// Audits a run on a machine that hit its limits (ADR 0135): killed for memory,
+    /// refused processes, or held back on CPU for long. A killed run's Bot says why.
+    fn limited(&self, bot: &Bot, msg: &Message, to: &Assigned, limits: Option<wire::RunLimits>, l: &wire::LimitReport) {
+        let killed = l.oom_kills > 0;
+        if !killed && l.pids_refused == 0 && l.cpu_throttled_ms < RUN_THROTTLED_MS {
+            return;
+        }
+        let what: Vec<&str> = [(killed, "memory"), (l.pids_refused > 0, "pids"), (l.cpu_throttled_ms >= RUN_THROTTLED_MS, "cpu")]
+            .into_iter()
+            .filter_map(|(hit, name)| hit.then_some(name))
+            .collect();
+        let e = Who::system("runner").event("machine.run_limited").target("machine", &to.machine_id).bot(&bot.id);
+        let e = e.details(json!({
+            "owner": bot.owner_id, "messageId": msg.id, "killed": killed, "hit": what, "limits": limits, "applied": l.applied,
+            "oomKills": l.oom_kills, "memoryMaxHits": l.memory_max_hits, "pidsRefused": l.pids_refused, "cpuThrottledMs": l.cpu_throttled_ms,
+        }));
+        self.db.record(&if killed { e.outcome(Outcome::Failure) } else { e });
+        if killed {
+            self.say(&bot.id, "My run used more memory than a run may use on your computer, so the computer stopped it. Try a smaller task, or ask an admin about your plan's run limits.", true);
         }
     }
 
@@ -2780,6 +2817,7 @@ mod tests {
             sandbox_host: Some(crate::sandbox::Host { namespaces: true, programs: vec!["socat".into()] }),
             home: Some(dir.join("home")),
             caches: vec![dir.join("home/.npm")],
+            limits: None,
         }
     }
 

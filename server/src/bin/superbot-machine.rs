@@ -11,8 +11,12 @@
 
 #[path = "../machines/agent.rs"]
 mod agent;
+#[path = "../machines/cgroup.rs"]
+mod cgroup;
 #[path = "../machines/display.rs"]
 mod display;
+#[path = "../machines/egress_allow.rs"]
+mod egress_allow;
 #[path = "../machines/job.rs"]
 mod job;
 #[path = "../machines/landing.rs"]

@@ -157,6 +157,8 @@ pub(crate) fn config(env: &Env, machine_id: &str, token: Option<&str>) -> Config
         screens: crate::machines_mtls_tests::no_screens(),
         teammates: crate::db::temp_path("agent-teammates"),
         teammate_stand_in: None,
+        run_cgroups: false,
+        nft: "/nonexistent/nft".into(),
     }
 }
 
@@ -1621,6 +1623,8 @@ fn agent_counts_programs_only_under_its_home_or_the_system() {
         screens: crate::machines_mtls_tests::no_screens(),
         teammates: crate::db::temp_path("roots-teammates"),
         teammate_stand_in: None,
+        run_cgroups: false,
+        nft: "/nonexistent/nft".into(),
     };
     assert_eq!(cfg.layout().botctl, None, "outside the home and the system's directories");
 
