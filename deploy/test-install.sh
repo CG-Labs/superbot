@@ -280,7 +280,7 @@ for bad in "--backup-encryption maybe" "--backup-age-generate --backup-encryptio
 done
 ok "plain by choice is written and said, a host without age still installs, and contradictory flags are refused"
 
-# Database encryption (ADR 0115): a new install requires it; an upgrade changes nothing unless
+# Database encryption (ADR 0116): a new install requires it; an upgrade changes nothing unless
 # asked, and says when the database is plain; the flag is written as given.
 reset_flags
 fresh_home db-new

@@ -8,7 +8,7 @@
 # With SUPERBOT_BACKUP_AGE_RECIPIENTS (age public keys) or SUPERBOT_BACKUP_AGE_RECIPIENTS_FILE set,
 # archives are encrypted with age and end in .age. The master key is never in an archive.
 # SUPERBOT_BACKUP_ENCRYPTION=required refuses to write a plain archive (docs/adr/0114-backups-encrypted-by-default.md).
-# An encrypted app.sqlite (docs/adr/0115-database-encrypted-at-rest.md) is copied with `botd database backup`
+# An encrypted app.sqlite (docs/adr/0116-database-encrypted-at-rest.md) is copied with `botd database backup`
 # (botd on PATH, or SUPERBOT_BOTD), which needs the master key; the copy stays encrypted under it.
 set -euo pipefail
 umask 077
@@ -55,7 +55,7 @@ snapshot() {
     sqlite3 "$src" ".backup '$dest'"
     return
   fi
-  command -v "$botd" >/dev/null 2>&1 || { log "$src is encrypted (ADR 0115), but botd isn't on PATH: set SUPERBOT_BOTD"; return 1; }
+  command -v "$botd" >/dev/null 2>&1 || { log "$src is encrypted (ADR 0116), but botd isn't on PATH: set SUPERBOT_BOTD"; return 1; }
   "$botd" database backup "$src" "$dest"
 }
 

@@ -2,7 +2,7 @@
 //! guide says. Save a secret under key A in a key file; move that file aside as the
 //! previous key, put key B in its place, restart: botd seals everything again under B,
 //! records `secret.master_key_rotated`, and from then on starts with B alone and refuses A.
-//! The database itself is encrypted under a key derived from the master key (ADR 0115), so
+//! The database itself is encrypted under a key derived from the master key (ADR 0116), so
 //! the same restart re-encrypts it under B.
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -116,7 +116,7 @@ fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-/// SQLCipher's raw key for the database under master key `key`, as botd derives it (ADR 0115).
+/// SQLCipher's raw key for the database under master key `key`, as botd derives it (ADR 0116).
 fn database_key(key: [u8; 32]) -> String {
     use aws_lc_rs::hmac;
     let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &key), b"superbot/database/v1");

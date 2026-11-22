@@ -1,4 +1,4 @@
-//! End to end (ADR 0115): the real `botd` with its database encrypted at rest. A server
+//! End to end (ADR 0116): the real `botd` with its database encrypted at rest. A server
 //! that kept a plain database (`SUPERBOT_DATABASE_ENCRYPTION=off`) opts in with `required`:
 //! botd encrypts it at start, keeps a plain copy, and loses nothing. `botd database`, which
 //! superbot-backup and superbot-restore use, copies and reads it with the master key, and

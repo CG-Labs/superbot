@@ -428,7 +428,7 @@ pub struct Report {
 }
 
 /// The master key and the previous one (ADR 0096), found before the database is opened:
-/// an encrypted database needs them to open at all (ADR 0115).
+/// an encrypted database needs them to open at all (ADR 0116).
 pub struct Keys {
     pub current: Option<(key::MasterKey, String)>,
     pub previous: Option<(key::MasterKey, String)>,

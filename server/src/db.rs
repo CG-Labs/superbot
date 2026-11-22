@@ -8093,7 +8093,7 @@ impl Db {
 
 #[cfg(test)]
 impl Db {
-    /// A database encrypted under `key` (ADR 0115), without setting the process's key.
+    /// A database encrypted under `key` (ADR 0116), without setting the process's key.
     pub fn open_keyed(path: &std::path::Path, key: &crate::database_encryption::DbKey) -> Db {
         Db::on(crate::database_encryption::open_with(path, Some(key)).unwrap()).unwrap()
     }

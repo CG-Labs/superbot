@@ -1,4 +1,4 @@
-//! The database encrypted at rest (ADR 0115): SQLCipher (AES-256 pages, each with an
+//! The database encrypted at rest (ADR 0116): SQLCipher (AES-256 pages, each with an
 //! HMAC) under a key derived from the master key, so `app.sqlite`, a disk image or the
 //! database in a backup reads as noise without the master key.
 //!
@@ -45,7 +45,7 @@ pub const PLAIN_COPY_PREFIX: &str = "app.sqlite-plain-";
 /// Where a re-encrypted copy is written before it replaces the database.
 const WORK_SUFFIX: &str = "-reencrypt";
 
-const NO_KEY: &str = "the database is encrypted (ADR 0115) but no master key was found. \
+const NO_KEY: &str = "the database is encrypted (ADR 0116) but no master key was found. \
      Restore the key it was encrypted under (SUPERBOT_MASTER_KEY or SUPERBOT_MASTER_KEY_FILE; see docs/ops/database-encryption.md). \
      Without it the database can't be read, and SUPERBOT_FORGET_SEALED doesn't help: restore a backup and its key instead.";
 
@@ -396,7 +396,7 @@ pub fn startup_lines(s: &State, copies: &[PlainCopy]) -> (String, Vec<String>) {
     if !s.encrypted() && s.policy != Policy::Off {
         warnings.push(
             "The database isn't encrypted: anyone who gets app.sqlite, a disk image or a copy of DATA_DIR can read every chat, Bot's memory and the audit log in it. \
-             Set SUPERBOT_DATABASE_ENCRYPTION=required and restart to encrypt it; botd keeps a plain copy until you delete it (docs/ops/database-encryption.md, ADR 0115)."
+             Set SUPERBOT_DATABASE_ENCRYPTION=required and restart to encrypt it; botd keeps a plain copy until you delete it (docs/ops/database-encryption.md, ADR 0116)."
                 .to_string(),
         );
     }
@@ -506,7 +506,7 @@ pub fn checklist(app: &App) -> (bool, String) {
 /// The gauges `/metrics` shows.
 pub fn render(app: &App, out: &mut String) {
     let Some(s) = app.database.get() else { return };
-    metrics::family(out, "superbot_database_encrypted", "gauge", "1 when the database is encrypted at rest with SQLCipher, 0 when it is plain (ADR 0115).");
+    metrics::family(out, "superbot_database_encrypted", "gauge", "1 when the database is encrypted at rest with SQLCipher, 0 when it is plain (ADR 0116).");
     metrics::sample(out, "superbot_database_encrypted", &[], s.encrypted() as u8 as f64);
     metrics::family(out, "superbot_database_plaintext_allowed", "gauge", "1 when SUPERBOT_DATABASE_ENCRYPTION=off keeps the database plain by choice.");
     metrics::sample(out, "superbot_database_plaintext_allowed", &[], (s.policy == Policy::Off && !s.encrypted()) as u8 as f64);

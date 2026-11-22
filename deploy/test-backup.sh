@@ -214,7 +214,7 @@ ENV_FILE="$E/.env" BACKUP_IDENTITY_FILE="$E/identity2.txt" "$INIT" --backup-encr
 [[ ! -e "$E/identity2.txt" ]] && grep -qxF "$(cat "$T/padded.env")" "$E/.env" || fail "init.sh took padded recipients as unset"
 ok "init.sh makes a private key for a new .env, keeps it on re-runs, and it restores the archives"
 
-# An encrypted database (ADR 0115): a real botd makes one; superbot-backup copies it with botd
+# An encrypted database (ADR 0116): a real botd makes one; superbot-backup copies it with botd
 # and the master key, still encrypted; superbot-restore reads it with the key, restores it
 # unread without one, and refuses another key. CI passes the release build as SUPERBOT_BOTD.
 BOTD=${SUPERBOT_BOTD:-}

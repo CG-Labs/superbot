@@ -134,7 +134,7 @@ log "botd's folder (prepended to Bots' PATH) holds no harness CLI, so runtime np
 dc exec -T botd sh -c 'd=$(dirname "$(command -v botd)"); for h in claude codex pi hermes; do [ ! -e "$d/$h" ] || exit 1; done' \
   || fail "a harness CLI sits next to botd and would shadow ~/.local/bin for Bots"
 
-log "Database encryption (ADR 0115): required for a new .env, and botd made the database encrypted"
+log "Database encryption (ADR 0116): required for a new .env, and botd made the database encrypted"
 grep -qx "SUPERBOT_DATABASE_ENCRYPTION='required'" "$SUPERBOT_ENV_FILE" || fail "a new .env doesn't require database encryption"
 grep -q 'Database encryption: encrypted with SQLCipher.*; created encrypted' <<<"$(dc logs --no-color botd)" || fail "botd didn't create an encrypted database"
 [[ $(dc exec -T botd botd database status /data/app.sqlite) == encrypted ]] || fail "botd database status doesn't say encrypted"

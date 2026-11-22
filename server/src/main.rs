@@ -326,7 +326,7 @@ async fn main() {
     }
     let database = database_encryption::State::new(db_policy, db_start, &data_dir);
     let (db_line, db_warnings) = database_encryption::startup_lines(&database, &database_encryption::plain_copies(&data_dir));
-    log_info!("Database encryption: {db_line} (ADR 0115).");
+    log_info!("Database encryption: {db_line} (ADR 0116).");
     for w in db_warnings {
         log_warn!("WARNING: {w}");
     }

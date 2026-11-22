@@ -54,7 +54,7 @@ async fn a_fresh_install_reports_what_it_lacks() {
     assert!(backups["detail"].as_str().unwrap().contains("stay on this host"), "{backups}");
     // Nor are backups encrypted (ADR 0114).
     assert_eq!(check(&s, "backup_encryption")["done"], false);
-    // Nor has this test server checked its database's encryption (ADR 0115).
+    // Nor has this test server checked its database's encryption (ADR 0116).
     assert_eq!(check(&s, "database_encryption")["done"], false);
     assert_eq!((s["done"].as_u64(), s["total"].as_u64()), (Some(4), Some(9)));
 }

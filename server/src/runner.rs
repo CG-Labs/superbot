@@ -252,7 +252,7 @@ pub struct App {
     pub status: crate::status::Page,
     /// Copies of the server's own backups off this host (ADR 0109).
     pub server_backups: OnceLock<Arc<crate::server_backups::ServerBackups>>,
-    /// Whether the database is encrypted at rest, as found at startup (ADR 0115).
+    /// Whether the database is encrypted at rest, as found at startup (ADR 0116).
     pub database: OnceLock<crate::database_encryption::State>,
     closing: AtomicBool,
 }

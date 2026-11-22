@@ -6,7 +6,7 @@
 #   ./init.sh --from-source                     # build the images here instead of pulling them
 # A new .env gets an age key for backups (docs/adr/0114-backups-encrypted-by-default.md), made with
 # the host's age-keygen; the private half goes to backup-identity.txt (BACKUP_IDENTITY_FILE). It also
-# gets SUPERBOT_DATABASE_ENCRYPTION=required (docs/adr/0115-database-encrypted-at-rest.md).
+# gets SUPERBOT_DATABASE_ENCRYPTION=required (docs/adr/0116-database-encrypted-at-rest.md).
 set -euo pipefail
 
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

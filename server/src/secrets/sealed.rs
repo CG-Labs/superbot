@@ -397,7 +397,7 @@ fn opens(c: &Connection, cipher: &Cipher) -> rusqlite::Result<bool> {
     Ok(any_sealed(c)?.is_none_or(|(context, v)| cipher.open(&context, &v).is_ok()))
 }
 
-/// Before a plain database is encrypted under a key derived from `current` (ADR 0115):
+/// Before a plain database is encrypted under a key derived from `current` (ADR 0116):
 /// refuses when what's sealed opens with neither `current` nor, mid-rotation, `previous`,
 /// so the database is never encrypted under a key that isn't its own. With no key yet,
 /// refuses if anything is sealed. `forget` lets `bootstrap` drop what doesn't open instead.

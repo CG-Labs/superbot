@@ -1,4 +1,4 @@
-//! The database encrypted at rest (ADR 0115): what botd shows and audits about it. A
+//! The database encrypted at rest (ADR 0116): what botd shows and audits about it. A
 //! plain database is shown in `/metrics`, the setup checklist and `GET /api/database`, and
 //! audited once; encrypting it, its plain copy, deleting the copy, and plain by choice are
 //! each audited once more. The file work itself is tested in `database_encryption`.

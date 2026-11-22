@@ -5,7 +5,7 @@
 #   superbot-restore [--home DIR] [--identity FILE] --check <archive | ->   only unpack, verify, and summarise
 # --home DIR reads DATA_DIR and PORT from DIR/superbot/.env (installer layout). Encrypted (.age)
 # archives need the age identity: --identity or SUPERBOT_BACKUP_AGE_IDENTITY_FILE. An encrypted
-# app.sqlite (docs/adr/0115-database-encrypted-at-rest.md) is read with `botd database query` (botd on
+# app.sqlite (docs/adr/0116-database-encrypted-at-rest.md) is read with `botd database query` (botd on
 # PATH, or SUPERBOT_BOTD) and the master key; without them it is restored unread.
 # Run as the user that owns DATA_DIR. The previous contents stay in DATA_DIR/.pre-restore-<stamp>/.
 set -euo pipefail
@@ -96,7 +96,7 @@ summary() {
   printf 'saved secrets:    %s\n' "$(count "$db" secrets)"
   printf 'audit events:     %s\n' "$(count "$db" audit_events)"
   printf 'needs master key: %s\n' "$sealed"
-  plain_sqlite "$db" || printf 'database:         encrypted (SQLCipher, ADR 0115)\n'
+  plain_sqlite "$db" || printf 'database:         encrypted (SQLCipher, ADR 0116)\n'
 }
 
 if [[ "$check_only" == true ]]; then

@@ -151,7 +151,7 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl backups copy                              Copy the newest archive off the host now, if it isn't
   botctl database                                  Whether the database is encrypted at rest (SQLCipher,
                                                    SUPERBOT_DATABASE_ENCRYPTION), and any plain copy left
-                                                   from encrypting it (ADR 0115)
+                                                   from encrypting it (ADR 0116)
   botctl machine list [<state>]                    Every user's machine (pending, running, suspended, error, ... or all)
   botctl machine show <user>                       The user's machine: provider, plan, state, address, enrollment
   botctl machine request <user> [<tier>] [<region>]  Give the user a machine (a Linode VM or an Incus container)

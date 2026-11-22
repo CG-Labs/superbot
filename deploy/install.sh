@@ -35,7 +35,7 @@ BACKUP_OFF_HOST=""
 BACKUP_ENCRYPTION=""
 BACKUP_AGE_GENERATE=false
 BACKUP_IDENTITY_FILE=${BACKUP_IDENTITY_FILE:-/root/superbot-backup-identity.txt}
-# Database encryption at rest (docs/adr/0115-database-encrypted-at-rest.md). A new install
+# Database encryption at rest (docs/adr/0116-database-encrypted-at-rest.md). A new install
 # writes required; an upgrade keeps what .env has unless given --database-encryption.
 DATABASE_ENCRYPTION=""
 # --testing-mode: run unlicensed with billing off (TESTING_MODE=on; docs/adr/0068-no-free-tier.md).
@@ -101,7 +101,7 @@ Usage: install.sh [options]
                       refuse to write or start with them (required), or keep them plain by
                       choice (off)
   --database-encryption auto|required|off
-                      SUPERBOT_DATABASE_ENCRYPTION (ADR 0115): new databases encrypted, an
+                      SUPERBOT_DATABASE_ENCRYPTION (ADR 0116): new databases encrypted, an
                       existing plain one kept plain with a warning (auto); encrypt a plain one
                       on the next start, keeping a plain copy (required, the default for new
                       installs); or keep the database plain by choice (off)
@@ -741,7 +741,7 @@ configure_backup_encryption() {
     die "SUPERBOT_BACKUP_ENCRYPTION=required, but $env_file has no SUPERBOT_BACKUP_AGE_RECIPIENTS: re-run with --backup-age-generate or --backup-age-recipients age1..."
 }
 
-# Database encryption (docs/adr/0115-database-encrypted-at-rest.md): --database-encryption is
+# Database encryption (docs/adr/0116-database-encrypted-at-rest.md): --database-encryption is
 # written as given, and a new .env gets required. An upgrade with no flag changes nothing.
 # botd does the encrypting when it starts, keeping a plain copy of a database it encrypts.
 configure_database_encryption() {
@@ -754,7 +754,7 @@ configure_database_encryption() {
   fi
 }
 
-# True if DB is an ordinary SQLite file: not encrypted (ADR 0115).
+# True if DB is an ordinary SQLite file: not encrypted (ADR 0116).
 plain_database() {
   [[ -s "$1" && "$(head -c 15 "$1" | tr -d '\0')" == "SQLite format 3" ]]
 }
@@ -813,7 +813,7 @@ master_key_default() { printf '%s/.config/superbot/master.key\n' "$1"; }
 db_has_sealed_values() {
   local db=$1
   [[ -f "$db" ]] || return 1
-  # An encrypted database opens only with its master key (ADR 0115).
+  # An encrypted database opens only with its master key (ADR 0116).
   [[ ! -s "$db" ]] || plain_database "$db" || return 0
   [[ -n $(sudo -u "$SUPERBOT_USER" sqlite3 -readonly "$db" "SELECT 1 FROM settings WHERE key = 'secrets_key_check'" 2>/dev/null) ]]
 }
