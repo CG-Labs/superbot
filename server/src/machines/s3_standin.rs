@@ -22,7 +22,31 @@ pub struct World {
     pub calls: Vec<String>,
     /// The next request with this method fails with this status.
     pub fail: Option<(String, u16)>,
+    /// Keys per listing page; S3's 1,000 when unset.
+    pub page: Option<usize>,
+    /// The bucket's versioning status (`Enabled`, `Suspended`), if it was ever turned on.
+    pub versioning: Option<&'static str>,
+    /// Old versions and delete markers, `(key, version id, is a marker)`. Current objects
+    /// are listed as version `current`.
+    pub old: Vec<(String, String, bool)>,
     next: u32,
+}
+
+impl World {
+    /// What overwriting or deleting `key` leaves behind in a versioned bucket.
+    fn keep(&mut self, key: &str, marker: bool) {
+        if self.versioning != Some("Enabled") {
+            return;
+        }
+        if self.objects.contains_key(key) {
+            self.next += 1;
+            self.old.push((key.into(), format!("v{}", self.next), false));
+        }
+        if marker {
+            self.next += 1;
+            self.old.push((key.into(), format!("v{}", self.next), true));
+        }
+    }
 }
 
 pub struct StandIn {
@@ -115,11 +139,44 @@ async fn handle(State(world): State<Arc<Mutex<World>>>, method: Method, uri: Uri
     };
     let key = rest.trim_start_matches('/').to_string();
     match (method.as_str(), key.is_empty()) {
+        ("GET", true) if query.contains_key("versioning") => {
+            let status = w.versioning.map(|s| format!("<Status>{s}</Status>")).unwrap_or_default();
+            xml(StatusCode::OK, format!("<VersioningConfiguration>{status}</VersioningConfiguration>"))
+        }
+        ("GET", true) if query.contains_key("versions") => {
+            let prefix = query.get("prefix").cloned().unwrap_or_default();
+            let after = (query.get("key-marker").cloned().unwrap_or_default(), query.get("version-id-marker").cloned().unwrap_or_default());
+            let page = w.page.unwrap_or(1000);
+            let mut found: Vec<(String, String, bool)> = w.objects.keys().map(|k| (k.clone(), "current".to_string(), false)).chain(w.old.iter().cloned()).collect();
+            found.retain(|(k, v, _)| k.starts_with(&prefix) && (k.clone(), v.clone()) > after);
+            found.sort();
+            let mut out = String::from("<ListVersionsResult>");
+            for (k, v, marker) in found.iter().take(page) {
+                let tag = if *marker { "DeleteMarker" } else { "Version" };
+                out.push_str(&format!("<{tag}><Key>{}</Key><VersionId>{v}</VersionId></{tag}>", k.replace('&', "&amp;")));
+            }
+            if found.len() > page {
+                let (k, v, _) = &found[page - 1];
+                out.push_str(&format!("<IsTruncated>true</IsTruncated><NextKeyMarker>{}</NextKeyMarker><NextVersionIdMarker>{v}</NextVersionIdMarker>", k.replace('&', "&amp;")));
+            } else {
+                out.push_str("<IsTruncated>false</IsTruncated>");
+            }
+            out.push_str("</ListVersionsResult>");
+            xml(StatusCode::OK, out)
+        }
         ("GET", true) => {
             let prefix = query.get("prefix").cloned().unwrap_or_default();
+            let after = query.get("continuation-token").cloned().unwrap_or_default();
+            let page = w.page.unwrap_or(1000);
+            let found: Vec<(&String, &Vec<u8>)> = w.objects.iter().filter(|(k, _)| k.starts_with(&prefix) && **k > after).collect();
             let mut out = String::from("<ListBucketResult>");
-            for (k, v) in w.objects.iter().filter(|(k, _)| k.starts_with(&prefix)) {
-                out.push_str(&format!("<Contents><Key>{k}</Key><Size>{}</Size></Contents>", v.len()));
+            for (k, v) in found.iter().take(page) {
+                out.push_str(&format!("<Contents><Key>{}</Key><Size>{}</Size></Contents>", k.replace('&', "&amp;"), v.len()));
+            }
+            if found.len() > page {
+                out.push_str(&format!("<IsTruncated>true</IsTruncated><NextContinuationToken>{}</NextContinuationToken>", found[page - 1].0.replace('&', "&amp;")));
+            } else {
+                out.push_str("<IsTruncated>false</IsTruncated>");
             }
             out.push_str("</ListBucketResult>");
             xml(StatusCode::OK, out)
@@ -131,6 +188,7 @@ async fn handle(State(world): State<Arc<Mutex<World>>>, method: Method, uri: Uri
                 (StatusCode::OK, [("etag", format!("\"{}\"", s3::sha256_hex(&body)))]).into_response()
             }
             _ => {
+                w.keep(&key, false);
                 w.objects.insert(key, body.to_vec());
                 StatusCode::OK.into_response()
             }
@@ -154,6 +212,7 @@ async fn handle(State(world): State<Arc<Mutex<World>>>, method: Method, uri: Uri
                     _ => return error(StatusCode::BAD_REQUEST, "InvalidPart"),
                 }
             }
+            w.keep(&k, false);
             w.objects.insert(k, data);
             xml(StatusCode::OK, "<CompleteMultipartUploadResult></CompleteMultipartUploadResult>".into())
         }
@@ -161,7 +220,17 @@ async fn handle(State(world): State<Arc<Mutex<World>>>, method: Method, uri: Uri
             w.uploads.remove(&query["uploadId"]);
             StatusCode::NO_CONTENT.into_response()
         }
+        ("DELETE", false) if query.contains_key("versionId") => {
+            let v = &query["versionId"];
+            if v == "current" {
+                w.objects.remove(&key);
+            } else {
+                w.old.retain(|(k, id, _)| !(*k == key && id == v));
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         ("DELETE", false) => {
+            w.keep(&key, true);
             w.objects.remove(&key);
             StatusCode::NO_CONTENT.into_response()
         }
@@ -213,6 +282,13 @@ mod tests {
         assert_eq!(&got[..], b"hello world");
         c.put("p/m.json", b"{}".to_vec()).await.unwrap();
         assert_eq!(c.list("p/").await.unwrap(), ["p/a b.bin", "p/m.json"]);
+        c.put("p/x&y", Vec::new()).await.unwrap();
+        c.put("q/other", Vec::new()).await.unwrap();
+        s.w().page = Some(1);
+        assert_eq!(c.list("p/").await.unwrap(), ["p/a b.bin", "p/m.json", "p/x&y"], "every page, unescaped");
+        assert_eq!(s.w().calls.iter().filter(|c| c.contains("list-type")).count(), 1 + 3);
+        s.w().page = None;
+        c.delete("p/x&y").await.unwrap();
         c.delete("p/a b.bin").await.unwrap();
         c.delete("p/a b.bin").await.unwrap();
         assert!(c.get("p/a b.bin").await.unwrap_err().contains("NoSuchKey"));
@@ -220,6 +296,39 @@ mod tests {
         let bad = S3::new(Settings::new(&s.url, BUCKET, "us-east-1", ACCESS_KEY, "wrong-secret").unwrap()).unwrap();
         let e = bad.put("x", Vec::new()).await.unwrap_err();
         assert!(e.contains("SignatureDoesNotMatch") && !e.contains("wrong-secret"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn old_versions_are_listed_page_by_page_and_deleted_for_good() {
+        let s = StandIn::start().await;
+        let c = S3::new(s.settings()).unwrap();
+        assert!(!c.versioned().await.unwrap());
+        s.w().fail = Some(("GET".into(), 501));
+        assert!(!c.versioned().await.unwrap(), "a store without versioning keeps none");
+        s.w().fail = Some(("GET".into(), 403));
+        assert!(c.versioned().await.unwrap_err().contains("s3:GetBucketVersioning"));
+
+        s.w().versioning = Some("Enabled");
+        assert!(c.versioned().await.unwrap());
+        c.put("p/a", b"one".to_vec()).await.unwrap();
+        c.put("p/a", b"two".to_vec()).await.unwrap();
+        c.put("p/b&c", b"x".to_vec()).await.unwrap();
+        c.put("q/other", b"y".to_vec()).await.unwrap();
+        c.delete("p/b&c").await.unwrap();
+        assert_eq!(c.list("p/").await.unwrap(), ["p/a"], "a plain delete only hides it");
+        s.w().page = Some(1);
+        let v = c.versions("p/").await.unwrap();
+        assert_eq!(v.len(), 4, "p/a now and before, p/b&c before and its marker: {v:?}");
+        assert!(v.iter().any(|(k, _)| k == "p/b&c"), "unescaped: {v:?}");
+        assert_eq!(s.w().calls.iter().filter(|c| c.contains("versions=")).count(), 4);
+        for (k, id) in &v {
+            c.delete_version(k, id).await.unwrap();
+        }
+        assert!(c.versions("p/").await.unwrap().is_empty());
+        assert_eq!(s.keys(), ["q/other"]);
+        c.delete_version("p/a", "gone").await.unwrap();
+        s.w().versioning = Some("Suspended");
+        assert!(c.versioned().await.unwrap(), "suspended still keeps what it kept");
     }
 
     #[tokio::test]

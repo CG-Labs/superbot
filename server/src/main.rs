@@ -20,6 +20,8 @@ mod audit_http_tests;
 #[cfg(test)]
 mod auth_review_http_tests;
 #[cfg(test)]
+mod backup_deletion_http_tests;
+#[cfg(test)]
 mod interface_http_tests;
 #[cfg(test)]
 mod command_analysis_http_tests;
@@ -836,6 +838,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/machines/placements", get(machines::placements))
         .route("/machines/resizes", get(machines::resize::list))
         .route("/machines/backups", get(machines::backup::list_all))
+        .route("/machines/{id}/backups", delete(machines::backup::delete_all))
         .route("/machines/recovery", get(machines::recovery::get))
         .route("/machines/substrate", get(machines::substrate))
         .route("/machines/hosts", get(machines::hosts::list))
