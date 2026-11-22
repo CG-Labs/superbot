@@ -542,3 +542,58 @@ async fn a_team_service_account_shares_bots_only_within_its_team() {
     assert_eq!(call(port, "GET", &format!("/api/bots/{teams_bot}/messages"), &tok, "").await.0, 404);
     assert!(app.db.team_members(&team).iter().all(|m| m.user_id != in_team), "never on the team's list");
 }
+
+#[tokio::test]
+async fn a_read_token_never_streams_approvals() {
+    let (port, app, admin, _) = serve_app().await;
+    let sa = account(port, &admin, json!({ "name": "Watcher", "role": "member" })).await;
+    let bot = app.db.create_bot_owned("Ops", "#fff", "waddle", "claude", None, false, users::OPERATOR, Visibility::Shared).id;
+    let (all, _) = token(port, &admin, &sa, json!({})).await;
+    let (read, _) = token(port, &admin, &sa, json!({ "scopes": ["read"] })).await;
+    let (mut full, mut quiet) = (stream(port, &all).await, stream(port, &read).await);
+    app.send(json!({ "type": "approval", "approval": { "id": "ap1", "botId": bot, "input": { "command": "secret-cmd" } } }));
+    app.send(json!({ "type": "probe", "botId": bot, "n": "after-approval" }));
+    assert!(read_until(&mut full, "after-approval").await.contains("secret-cmd"), "a token with review sees approvals");
+    let got = read_until(&mut quiet, "after-approval").await;
+    assert!(!got.contains("secret-cmd"), "a read token streamed an approval: {got}");
+}
+
+#[tokio::test]
+async fn disabling_or_deleting_a_service_account_stops_its_runs() {
+    use crate::deprovision_http_tests::{held_claude, run_token, send, until};
+    let (port, app, admin, _) = serve_app().await;
+    let env = held_claude(&app);
+    let desk = app.db.create_bot_owned("Desk", "#fff", "waddle", "claude", None, false, users::OPERATOR, Visibility::Shared).id;
+    let sa = account(port, &admin, json!({ "name": "Runner", "role": "member" })).await;
+    let (tok, _) = token(port, &admin, &sa, json!({})).await;
+    let path = format!("/api/service-accounts/{sa}");
+
+    send(port, &tok, &desk, "for the script").await;
+    run_token(&env).await;
+    assert_eq!(call(port, "PATCH", &path, &admin, r#"{"status":"disabled"}"#).await.0, 200);
+    until("its run on someone else's Bot went on after it was disabled", || !app.busy(&desk)).await;
+    assert_eq!(events(port, &admin, "service_account.disabled").await[0]["details"]["runsStopped"], json!([desk]));
+
+    assert_eq!(call(port, "PATCH", &path, &admin, r#"{"status":"active"}"#).await.0, 200);
+    send(port, &tok, &desk, "again").await;
+    run_token(&env).await;
+    assert_eq!(call(port, "DELETE", &path, &admin, "").await.0, 200);
+    until("its run went on after it was deleted", || !app.busy(&desk)).await;
+    assert_eq!(events(port, &admin, "service_account.deleted").await[0]["details"]["runsStopped"], json!([desk]));
+}
+
+#[tokio::test]
+async fn scheduled_work_stops_with_the_owner() {
+    let (port, app, admin, _) = serve_app().await;
+    let (ana, _) = user_with(port, &admin, "ana@example.com", "member").await;
+    let hers = account(port, &admin, json!({ "name": "Nightly", "role": "member" })).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{hers}"), &admin, &body_owner(&ana)).await.0, 200);
+    assert_eq!(handover::blocked(&app.db, users::OPERATOR, Some(&hers)), None);
+    // Its routines on someone else's Bot are refused once its owner is off, as its tokens are.
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{ana}"), &admin, r#"{"status":"disabled"}"#).await.0, 200);
+    assert_eq!(handover::blocked(&app.db, users::OPERATOR, Some(&hers)), Some((handover::AUTHOR_DISABLED, hers.clone())));
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{ana}"), &admin, r#"{"status":"active"}"#).await.0, 200);
+    assert_eq!(handover::blocked(&app.db, users::OPERATOR, Some(&hers)), None);
+    assert_eq!(call(port, "DELETE", &format!("/api/service-accounts/{hers}"), &admin, "").await.0, 200);
+    assert_eq!(handover::blocked(&app.db, users::OPERATOR, Some(&hers)), Some((handover::AUTHOR_DISABLED, hers)));
+}

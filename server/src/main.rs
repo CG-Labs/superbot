@@ -1824,6 +1824,13 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     };
                     let Some(mut data) = filter.apply(&app.db, &data) else { continue };
+                    // Approvals carry commands and inputs: a token sees them only while it may review.
+                    if let Some(t) = service.as_deref()
+                        && serde_json::from_str::<Value>(&data).is_ok_and(|v| v["type"] == "approval")
+                        && !service_accounts::recheck(&app, t, db::now()).is_some_and(|sc| sc.can(Perm::Review))
+                    {
+                        continue;
+                    }
                     // Admins (people, not their Bots) see each Bot's model and route, as in `bot_view_for`.
                     if bot.is_none() && filter.viewer == Viewer::All
                         && let Ok(mut v) = serde_json::from_str::<Value>(&data)

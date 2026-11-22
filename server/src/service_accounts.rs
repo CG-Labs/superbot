@@ -123,7 +123,17 @@ pub fn whoami(app: &AppState, c: &Caller, s: &ServiceCaller) -> Value {
 
 /// The owner, if they can still lend their permissions: an active person, not erased.
 fn live_owner(app: &AppState, id: &str) -> Option<User> {
-    app.db.user(id).filter(|u| u.active() && !u.service && u.erased_at.is_none())
+    owner_of(&app.db, id)
+}
+
+fn owner_of(db: &crate::db::Db, id: &str) -> Option<User> {
+    db.user(id).filter(|u| u.active() && !u.service && u.erased_at.is_none())
+}
+
+/// Whether `u` may still act, for work that starts without a request (routines): active,
+/// and a service account also not deleted, with an owner who could lend it access.
+pub fn may_act(db: &crate::db::Db, u: &User) -> bool {
+    u.active() && (!u.service || db.service_account(&u.id).filter(|s| s.deleted_at.is_none()).is_some_and(|s| owner_of(db, &s.owner_id).is_some()))
 }
 
 /// Everything `owner` holds: across the server, and in `team` when a service account acts
@@ -495,7 +505,8 @@ pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>
             app.db.record(&by.event("service_account.enabled").target("service_account", &id).details(json!({ "name": after.user.name, "routinesResumed": resumed })));
         } else {
             let paused = crate::handover::user_disabled(&app, &by, &id);
-            app.db.record(&by.event("service_account.disabled").target("service_account", &id).details(json!({ "name": after.user.name, "routinesPaused": paused })));
+            let stopped = app.stop_for_user(&id);
+            app.db.record(&by.event("service_account.disabled").target("service_account", &id).details(json!({ "name": after.user.name, "routinesPaused": paused, "runsStopped": stopped })));
         }
     }
     Ok(Json(view(&app, &after)))
@@ -507,7 +518,8 @@ pub async fn delete(State(app): State<AppState>, Extension(c): Extension<Caller>
     let sa = need_account(&app, &c, &by, &key)?;
     let revoked = app.db.delete_service_account(&sa.user.id, by.actor.id.as_deref()).ok_or_else(|| not_found("Service account"))?;
     let paused = crate::handover::user_disabled(&app, &by, &sa.user.id);
-    app.db.record(&by.event("service_account.deleted").target("service_account", &sa.user.id).details(json!({ "name": sa.user.name, "tokensRevoked": revoked, "routinesPaused": paused })));
+    let stopped = app.stop_for_user(&sa.user.id);
+    app.db.record(&by.event("service_account.deleted").target("service_account", &sa.user.id).details(json!({ "name": sa.user.name, "tokensRevoked": revoked, "routinesPaused": paused, "runsStopped": stopped })));
     Ok(Json(json!({ "ok": true, "tokensRevoked": revoked })))
 }
 
