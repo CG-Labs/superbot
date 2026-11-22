@@ -1,0 +1,125 @@
+# Host capacity alerts for botd (docs/adr/0106-host-capacity-metrics.md), from the
+# metrics in docs/adr/0089-metrics-and-structured-logs.md.
+#
+# Load it from prometheus.yml, next to the other rules:
+#   rule_files: ["/etc/prometheus/superbot-slo.rules.yml", "/etc/prometheus/superbot-signin.rules.yml",
+#                "/etc/prometheus/superbot-capacity.rules.yml"]
+# Check it with: promtool check rules superbot-capacity.rules.yml
+#                promtool test rules superbot-capacity.rules.test.yml
+#
+# It assumes the scrape job is named "superbot" (as in deploy/README.md). Allocation is
+# what machines' plans take against INCUS_CAPACITY and INCUS_MAX_MACHINES, as placement
+# counts it (ADR 0081); use is what each host says it has and uses, botd's own host
+# (host="botd", kind="server") included. The dashboard is
+# deploy/grafana/superbot-capacity.json.
+
+groups:
+  - name: superbot-capacity-alerts
+    rules:
+      # A machine waits to be made because no host has room: someone has no computer.
+      - alert: SuperBotMachinesWaitingForRoom
+        expr: max by (job) (superbot_incus_machines_waiting_for_room{job="superbot"}) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: Machines are waiting for room on an Incus host
+          description: "{{ $value }} machines can't be made because no Incus host has room (machine.placement_failed in the audit log says why). Add capacity (INCUS_CAPACITY, or another host in INCUS_HOSTS), undrain a host, or free room; botctl machine hosts shows each host's load."
+
+      # Requests for machines refused for want of room.
+      - alert: SuperBotMachineRequestsRefusedForRoom
+        expr: sum by (job) (increase(superbot_events_total{job="superbot",event="machine.placement_failed"}[15m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: A machine was refused because no Incus host had room
+          description: "Placement refused or held back a machine in the last 15 minutes (machine.placement_failed in the audit log names the plan and each host's reason). Add capacity or a host before more are refused."
+
+      # Little room left across the hosts new machines may go on: the next few requests
+      # may be refused. By CPUs, memory, disk and machine count, each against its limit
+      # (machines only on hosts with INCUS_MAX_MACHINES). Drained or failing hosts' room
+      # doesn't count: nothing new goes there.
+      - alert: SuperBotIncusCapacityLow
+        expr: |
+          label_replace(
+            1 - sum by (job) (superbot_incus_host_allocated_cpus{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
+              / sum by (job) (superbot_incus_host_capacity_cpus{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
+            < 0.15, "resource", "cpus", "", "")
+          or
+          label_replace(
+            1 - sum by (job) (superbot_incus_host_allocated_memory_bytes{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
+              / sum by (job) (superbot_incus_host_capacity_memory_bytes{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
+            < 0.15, "resource", "memory", "", "")
+          or
+          label_replace(
+            1 - sum by (job) (superbot_incus_host_allocated_disk_bytes{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
+              / sum by (job) (superbot_incus_host_capacity_disk_bytes{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
+            < 0.15, "resource", "disk", "", "")
+          or
+          label_replace(
+            1 - sum by (job) (superbot_incus_host_machines{job="superbot"} and on (job, instance, host) superbot_incus_host_max_machines and on (job, instance, host) superbot_incus_host_open == 1)
+              / sum by (job) (superbot_incus_host_max_machines{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
+            < 0.15, "resource", "machines", "", "")
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Incus hosts are nearly out of room ({{ $labels.resource }})"
+          description: "Less than 15% of the open Incus hosts' {{ $labels.resource }} is left for new machines (INCUS_CAPACITY, INCUS_MAX_MACHINES). Add capacity or a host, or undrain one, before placement starts refusing machines."
+
+      # Nowhere for a new machine at all.
+      - alert: SuperBotNoOpenIncusHost
+        expr: sum by (job) (superbot_incus_host_open{job="superbot"}) == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: No Incus host is open for new machines
+          description: "Every Incus host is down, lost, failing its checks or drained, so no machine can be made or restored elsewhere. botctl machine hosts says why for each."
+
+      # What hosts say they use, botd's own included.
+      - alert: SuperBotHostMemoryHigh
+        expr: superbot_host_memory_used_bytes{job="superbot"} / superbot_host_memory_bytes{job="superbot"} > 0.9
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Host {{ $labels.host }} is using over 90% of its memory"
+          description: "{{ $labels.host }} ({{ $labels.kind }}) has used over 90% of its memory for 15 minutes. On an Incus host, containers may be OOM-killed under load: lower INCUS_CAPACITY's memory or move machines off (ADR 0081). On botd's own host, check what else runs there."
+
+      - alert: SuperBotHostDiskFilling
+        expr: superbot_host_disk_used_bytes{job="superbot"} / superbot_host_disk_bytes{job="superbot"} > 0.85
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Disk {{ $labels.disk }} on host {{ $labels.host }} is over 85% full"
+          description: "{{ $labels.host }} ({{ $labels.kind }}) has used over 85% of its {{ $labels.disk }} disk. On an Incus host, snapshots and a restore in place's second copy count here but not in INCUS_CAPACITY; on botd's own host, DATA_DIR holds the database and backups. Free space or grow the disk."
+
+      - alert: SuperBotHostDiskFull
+        expr: superbot_host_disk_used_bytes{job="superbot"} / superbot_host_disk_bytes{job="superbot"} > 0.95
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Disk {{ $labels.disk }} on host {{ $labels.host }} is nearly full"
+          description: "{{ $labels.host }} ({{ $labels.kind }}) has used over 95% of its {{ $labels.disk }} disk. Writes will soon fail: machines' disks on an Incus pool, or botd's database and backups in DATA_DIR. Free space now."
+
+      - alert: SuperBotHostCPUSaturated
+        expr: superbot_host_load5{job="superbot"} / superbot_host_cpus{job="superbot"} > 1.5
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Host {{ $labels.host }} is overloaded"
+          description: "{{ $labels.host }} ({{ $labels.kind }}) has had a 5-minute load average over 1.5 per CPU for 30 minutes, so Bots' runs there are slow. On an Incus host, lower INCUS_CAPACITY's CPUs (they may be overcommitted, ADR 0081) or move machines off."
+
+      # An Incus host that answers but hasn't said what it uses: its use panels are stale.
+      - alert: SuperBotIncusHostReadingStale
+        expr: (time() - superbot_host_reading_timestamp_seconds{job="superbot",kind="incus"} > 900) and on (job, instance, host) superbot_incus_host_up == 1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "botd can't read what Incus host {{ $labels.host }} uses"
+          description: "{{ $labels.host }} answers botd's checks but hasn't said what it uses for over 15 minutes, so its memory, disk and load metrics are stale. botd's log says why (\"didn't say what it uses\")."

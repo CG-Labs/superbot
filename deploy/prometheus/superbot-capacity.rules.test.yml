@@ -1,0 +1,266 @@
+# promtool test rules superbot-capacity.rules.test.yml
+rule_files:
+  - superbot-capacity.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # A machine waits for room, and a request is refused: the refusal opens a ticket at once,
+  # the wait pages after 5 minutes, and both stop once there is room again.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_incus_machines_waiting_for_room{job="superbot",instance="botd:9464"}'
+        values: '0x10 1x30 0x20'
+      - series: 'superbot_events_total{job="superbot",instance="botd:9464",event="machine.placement_failed",outcome="failure"}'
+        values: '0x10 1x50'
+      - series: 'superbot_events_total{job="superbot",instance="botd:9464",event="machine.host_down",outcome="failure"}'
+        values: '0+1x60'
+    alert_rule_test:
+      - eval_time: 13m
+        alertname: SuperBotMachinesWaitingForRoom
+        exp_alerts: []
+      - eval_time: 13m
+        alertname: SuperBotMachineRequestsRefusedForRoom
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+            exp_annotations:
+              summary: "A machine was refused because no Incus host had room"
+              description: "Placement refused or held back a machine in the last 15 minutes (machine.placement_failed in the audit log names the plan and each host's reason). Add capacity or a host before more are refused."
+      - eval_time: 17m
+        alertname: SuperBotMachinesWaitingForRoom
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              job: superbot
+            exp_annotations:
+              summary: "Machines are waiting for room on an Incus host"
+              description: "1 machines can't be made because no Incus host has room (machine.placement_failed in the audit log says why). Add capacity (INCUS_CAPACITY, or another host in INCUS_HOSTS), undrain a host, or free room; botctl machine hosts shows each host's load."
+      - eval_time: 55m
+        alertname: SuperBotMachinesWaitingForRoom
+        exp_alerts: []
+      - eval_time: 55m
+        alertname: SuperBotMachineRequestsRefusedForRoom
+        exp_alerts: []
+
+  # Room runs low only on hosts that are open: a drained host's empty room doesn't count,
+  # and with every host closed it's the page for no open host instead.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_incus_host_open{job="superbot",instance="botd:9464",host="a"}'
+        values: '1x19 0x50'
+      - series: 'superbot_incus_host_allocated_cpus{job="superbot",instance="botd:9464",host="a"}'
+        values: '0x69'
+      - series: 'superbot_incus_host_capacity_cpus{job="superbot",instance="botd:9464",host="a"}'
+        values: '4x69'
+      - series: 'superbot_incus_host_allocated_memory_bytes{job="superbot",instance="botd:9464",host="a"}'
+        values: '0x69'
+      - series: 'superbot_incus_host_capacity_memory_bytes{job="superbot",instance="botd:9464",host="a"}'
+        values: '16x69'
+      - series: 'superbot_incus_host_allocated_disk_bytes{job="superbot",instance="botd:9464",host="a"}'
+        values: '0x69'
+      - series: 'superbot_incus_host_capacity_disk_bytes{job="superbot",instance="botd:9464",host="a"}'
+        values: '400x69'
+      - series: 'superbot_incus_host_machines{job="superbot",instance="botd:9464",host="a"}'
+        values: '0x69'
+      - series: 'superbot_incus_host_max_machines{job="superbot",instance="botd:9464",host="a"}'
+        values: '10x69'
+      - series: 'superbot_incus_host_open{job="superbot",instance="botd:9464",host="b"}'
+        values: '1x44 0x25'
+      - series: 'superbot_incus_host_allocated_cpus{job="superbot",instance="botd:9464",host="b"}'
+        values: '1x19 4x50'
+      - series: 'superbot_incus_host_capacity_cpus{job="superbot",instance="botd:9464",host="b"}'
+        values: '4x69'
+      - series: 'superbot_incus_host_allocated_memory_bytes{job="superbot",instance="botd:9464",host="b"}'
+        values: '2x19 8x50'
+      - series: 'superbot_incus_host_capacity_memory_bytes{job="superbot",instance="botd:9464",host="b"}'
+        values: '16x69'
+      - series: 'superbot_incus_host_allocated_disk_bytes{job="superbot",instance="botd:9464",host="b"}'
+        values: '20x19 80x50'
+      - series: 'superbot_incus_host_capacity_disk_bytes{job="superbot",instance="botd:9464",host="b"}'
+        values: '400x69'
+      - series: 'superbot_incus_host_machines{job="superbot",instance="botd:9464",host="b"}'
+        values: '1x19 4x50'
+    alert_rule_test:
+      - eval_time: 18m
+        alertname: SuperBotIncusCapacityLow
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: SuperBotIncusCapacityLow
+        exp_alerts: []
+      - eval_time: 36m
+        alertname: SuperBotIncusCapacityLow
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              resource: cpus
+            exp_annotations:
+              summary: "Incus hosts are nearly out of room (cpus)"
+              description: "Less than 15% of the open Incus hosts' cpus is left for new machines (INCUS_CAPACITY, INCUS_MAX_MACHINES). Add capacity or a host, or undrain one, before placement starts refusing machines."
+      - eval_time: 36m
+        alertname: SuperBotNoOpenIncusHost
+        exp_alerts: []
+      - eval_time: 51m
+        alertname: SuperBotIncusCapacityLow
+        exp_alerts: []
+      - eval_time: 51m
+        alertname: SuperBotNoOpenIncusHost
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              job: superbot
+            exp_annotations:
+              summary: "No Incus host is open for new machines"
+              description: "Every Incus host is down, lost, failing its checks or drained, so no machine can be made or restored elsewhere. botctl machine hosts says why for each."
+
+  # What hosts use: botd's own memory and disk, and an Incus host's load per CPU.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_host_memory_used_bytes{job="superbot",instance="botd:9464",host="botd",kind="server"}'
+        values: '95x59'
+      - series: 'superbot_host_memory_bytes{job="superbot",instance="botd:9464",host="botd",kind="server"}'
+        values: '100x59'
+      - series: 'superbot_host_disk_used_bytes{job="superbot",instance="botd:9464",host="botd",kind="server",disk="data"}'
+        values: '90x19 96x40'
+      - series: 'superbot_host_disk_bytes{job="superbot",instance="botd:9464",host="botd",kind="server",disk="data"}'
+        values: '100x59'
+      - series: 'superbot_host_load5{job="superbot",instance="botd:9464",host="botd",kind="server"}'
+        values: '1x59'
+      - series: 'superbot_host_cpus{job="superbot",instance="botd:9464",host="botd",kind="server"}'
+        values: '4x59'
+      - series: 'superbot_host_memory_used_bytes{job="superbot",instance="botd:9464",host="a",kind="incus"}'
+        values: '10x59'
+      - series: 'superbot_host_memory_bytes{job="superbot",instance="botd:9464",host="a",kind="incus"}'
+        values: '100x59'
+      - series: 'superbot_host_disk_used_bytes{job="superbot",instance="botd:9464",host="a",kind="incus",disk="pool"}'
+        values: '50x59'
+      - series: 'superbot_host_disk_bytes{job="superbot",instance="botd:9464",host="a",kind="incus",disk="pool"}'
+        values: '100x59'
+      - series: 'superbot_host_load5{job="superbot",instance="botd:9464",host="a",kind="incus"}'
+        values: '24x9 30x50'
+      - series: 'superbot_host_cpus{job="superbot",instance="botd:9464",host="a",kind="incus"}'
+        values: '16x59'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SuperBotHostMemoryHigh
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: SuperBotHostDiskFilling
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: SuperBotHostDiskFull
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: SuperBotHostCPUSaturated
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: SuperBotHostMemoryHigh
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: botd:9464
+              host: botd
+              kind: server
+            exp_annotations:
+              summary: "Host botd is using over 90% of its memory"
+              description: "botd (server) has used over 90% of its memory for 15 minutes. On an Incus host, containers may be OOM-killed under load: lower INCUS_CAPACITY's memory or move machines off (ADR 0081). On botd's own host, check what else runs there."
+      - eval_time: 30m
+        alertname: SuperBotHostDiskFilling
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: botd:9464
+              host: botd
+              kind: server
+              disk: data
+            exp_annotations:
+              summary: "Disk data on host botd is over 85% full"
+              description: "botd (server) has used over 85% of its data disk. On an Incus host, snapshots and a restore in place's second copy count here but not in INCUS_CAPACITY; on botd's own host, DATA_DIR holds the database and backups. Free space or grow the disk."
+      - eval_time: 30m
+        alertname: SuperBotHostDiskFull
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              job: superbot
+              instance: botd:9464
+              host: botd
+              kind: server
+              disk: data
+            exp_annotations:
+              summary: "Disk data on host botd is nearly full"
+              description: "botd (server) has used over 95% of its data disk. Writes will soon fail: machines' disks on an Incus pool, or botd's database and backups in DATA_DIR. Free space now."
+      - eval_time: 30m
+        alertname: SuperBotHostCPUSaturated
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: SuperBotHostCPUSaturated
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: botd:9464
+              host: a
+              kind: incus
+            exp_annotations:
+              summary: "Host a is overloaded"
+              description: "a (incus) has had a 5-minute load average over 1.5 per CPU for 30 minutes, so Bots' runs there are slow. On an Incus host, lower INCUS_CAPACITY's CPUs (they may be overcommitted, ADR 0081) or move machines off."
+
+  # An Incus host that answers but stops saying what it uses, or never has; not one that
+  # is down (its own alert says so), and never botd's own host.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_host_reading_timestamp_seconds{job="superbot",instance="botd:9464",host="a",kind="incus"}'
+        values: '0+60x10 600x49'
+      - series: 'superbot_incus_host_up{job="superbot",instance="botd:9464",host="a"}'
+        values: '1x59'
+      - series: 'superbot_host_reading_timestamp_seconds{job="superbot",instance="botd:9464",host="b",kind="incus"}'
+        values: '0+60x10 600x49'
+      - series: 'superbot_incus_host_up{job="superbot",instance="botd:9464",host="b"}'
+        values: '1x19 0x40'
+      - series: 'superbot_host_reading_timestamp_seconds{job="superbot",instance="botd:9464",host="c",kind="incus"}'
+        values: '0x59'
+      - series: 'superbot_incus_host_up{job="superbot",instance="botd:9464",host="c"}'
+        values: '1x59'
+      - series: 'superbot_host_reading_timestamp_seconds{job="superbot",instance="botd:9464",host="botd",kind="server"}'
+        values: '0+60x59'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SuperBotIncusHostReadingStale
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: SuperBotIncusHostReadingStale
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: botd:9464
+              host: c
+              kind: incus
+            exp_annotations:
+              summary: "botd can't read what Incus host c uses"
+              description: "c answers botd's checks but hasn't said what it uses for over 15 minutes, so its memory, disk and load metrics are stale. botd's log says why (\"didn't say what it uses\")."
+      - eval_time: 40m
+        alertname: SuperBotIncusHostReadingStale
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: botd:9464
+              host: a
+              kind: incus
+            exp_annotations:
+              summary: "botd can't read what Incus host a uses"
+              description: "a answers botd's checks but hasn't said what it uses for over 15 minutes, so its memory, disk and load metrics are stale. botd's log says why (\"didn't say what it uses\")."
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: botd:9464
+              host: c
+              kind: incus
+            exp_annotations:
+              summary: "botd can't read what Incus host c uses"
+              description: "c answers botd's checks but hasn't said what it uses for over 15 minutes, so its memory, disk and load metrics are stale. botd's log says why (\"didn't say what it uses\")."
