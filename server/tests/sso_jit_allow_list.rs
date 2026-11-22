@@ -92,12 +92,14 @@ impl Botd {
 
     /// Whether `/healthz` answers 200 before botd exits or 30 s pass.
     fn healthy(&mut self) -> bool {
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(30) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) {
             if self.child.try_wait().unwrap().is_some() {
                 return false;
             }
-            if let Ok(mut s) = TcpStream::connect(("127.0.0.1", self.port)) {
+            if let Ok(mut s) = TcpStream::connect_timeout(&([127, 0, 0, 1], self.port).into(), left) {
+                let _ = s.set_read_timeout(Some(left));
+                let _ = s.set_write_timeout(Some(left));
                 let _ = s.write_all(format!("GET /healthz HTTP/1.0\r\nHost: 127.0.0.1:{}\r\n\r\n", self.port).as_bytes());
                 let mut res = String::new();
                 let _ = s.read_to_string(&mut res);
