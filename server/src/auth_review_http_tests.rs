@@ -105,6 +105,13 @@ async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() 
     app.db.delete_bot(&gone.id);
     let (_, member) = user_with(port, &admin, "m@example.com", "member").await;
     let (_, readonly) = user_with(port, &admin, "r@example.com", "readonly").await;
+    // Every delegable permission on top of member (ADR 0123): still nothing that is Admin's.
+    let (delegate_id, delegate) = user_with(port, &admin, "d@example.com", "member").await;
+    let all: Vec<&str> = rbac::DELEGABLE.iter().map(|p| p.as_str()).collect();
+    let (code, made) = call(port, "POST", "/api/roles", &admin, &json!({ "name": "Everything", "permissions": all }).to_string()).await;
+    assert_eq!(code, 201, "{made}");
+    let role_id = parse(&made)["id"].as_str().unwrap().to_string();
+    assert_eq!(call(port, "PUT", &format!("/api/roles/{role_id}/users/{delegate_id}"), &admin, "").await.0, 200);
     let forged = format!("Bearer {}", users::new_secret(users::SESSION_PREFIX));
     let cookie = format!("Cookie: {}={}\r\n", users::COOKIE, users::new_secret(users::SESSION_PREFIX));
     let (scim_auth, _) = scim_token(port, &admin, "walk").await;
@@ -146,15 +153,21 @@ async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() 
                 assert_eq!(call(port, &m, &path, auth, "{}").await.0, 403, "{who}: {m} {path} needs {need:?}");
             }
         }
+        if need == rbac::Perm::Admin {
+            assert_eq!(call(port, &m, &path, &delegate, "{}").await.0, 403, "delegate: {m} {path}");
+        }
         // Read-only people change nothing (signing out, removing this session's phone, and
         // their own second factor are their own account).
         let own_mfa = p.starts_with("/api/auth/mfa/") && p != "/api/auth/mfa/policy";
         if m != "GET" && p != "/api/auth/logout" && !(m == "DELETE" && p == "/api/me/push") && !own_mfa {
             assert!(!rbac::allows(Principal::User(Role::Readonly), need), "readonly could {m} {p}");
         }
-        // The admin portal, the audit log, the access-review report, retention and its holds, server backups, secrets, signups, the setup wizard, the license, status incidents, and SCIM tokens and group links are admin-only.
-        if ["/api/users", "/api/sessions", "/api/audit", "/api/access-review", "/api/retention", "/api/backups", "/api/secrets", "/api/signups", "/api/policy", "/api/setup", "/api/license", "/api/usage", "/api/status", "/api/scim"].iter().any(|s| p.starts_with(s)) && !(m == "GET" && p.starts_with("/api/policy")) {
-            assert_eq!(need, rbac::Perm::Admin, "{m} {p}");
+        // The admin portal, the audit log, the access-review report, retention and its holds, server backups, secrets, signups, the setup wizard, the license, status incidents, custom roles, and SCIM tokens and group links are admin-only: some are delegable to a custom role (ADR 0123), but no other built-in role holds them.
+        if ["/api/users", "/api/sessions", "/api/audit", "/api/access-review", "/api/retention", "/api/backups", "/api/secrets", "/api/signups", "/api/policy", "/api/setup", "/api/license", "/api/usage", "/api/status", "/api/scim", "/api/roles"].iter().any(|s| p.starts_with(s)) && !(m == "GET" && p.starts_with("/api/policy")) {
+            assert!(!rbac::allows(Principal::User(Role::Member), need), "{m} {p}");
+            if !(rbac::DELEGABLE.contains(&need)) {
+                assert_eq!(need, rbac::Perm::Admin, "{m} {p}");
+            }
         }
         checked += 1;
     }

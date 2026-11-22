@@ -21,6 +21,7 @@
 use crate::audit::{Actor, Outcome, Source, Who};
 use crate::db::{Team, TeamMember, User, now};
 use crate::machines::{ControlPlane, State as MachineState, Step};
+use crate::rbac::{Perm, Perms};
 use crate::users::Caller;
 use crate::{ApiError, AppState, Res, bad, need_user, not_found};
 use axum::Json;
@@ -95,6 +96,33 @@ fn manages(role: &str) -> bool {
     role == OWNER || role == ADMIN
 }
 
+/// What a custom role given to `m` within their team adds there (ADR 0123): only its
+/// team permissions (`rbac::TEAM_SCOPED`). Owners and admins already have them all.
+/// Nothing for someone read-only across the server: they change nothing anywhere, as
+/// read-only team admins don't.
+fn team_perms(app: &AppState, m: &TeamMember) -> Perms {
+    if app.db.user(&m.user_id).is_none_or(|u| u.role == crate::rbac::Role::Readonly) {
+        return Perms::NONE;
+    }
+    m.role_id.as_deref().and_then(|id| app.db.custom_role(id)).map_or(Perms::NONE, |r| r.perms().in_team())
+}
+
+/// Whether `m` may do `perm` in their team: as an owner or admin, or by a team role.
+fn may(app: &AppState, m: &TeamMember, perm: Perm) -> bool {
+    manages(&m.role) || team_perms(app, m).has(perm)
+}
+
+/// What of the team a member sees beyond its people: its machines and invites, and its
+/// plan's details. Owners, admins and server admins see all of it.
+#[derive(Clone, Copy)]
+struct Sight {
+    machines: bool,
+    invites: bool,
+    billing: bool,
+}
+
+const ALL: Sight = Sight { machines: true, invites: true, billing: true };
+
 fn conflict(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::CONFLICT, msg.into())
 }
@@ -143,6 +171,7 @@ fn member_view(app: &AppState, m: &TeamMember, machines: bool) -> Value {
     let mut v = json!({
         "id": m.user_id, "name": u.as_ref().map(|u| u.name.clone()), "email": u.as_ref().and_then(|u| u.email.clone()),
         "role": m.role, "joinedAt": m.joined_at, "active": u.as_ref().is_some_and(User::active),
+        "customRole": crate::roles::summary(app, m.role_id.as_deref()),
     });
     if machines {
         v["machine"] = machine_view(app, &m.team_id, &m.user_id);
@@ -150,22 +179,25 @@ fn member_view(app: &AppState, m: &TeamMember, machines: bool) -> Value {
     v
 }
 
-/// The team as a member sees it; with `manager`, teammates' machines and invites too.
-fn team_view(app: &AppState, t: &Team, me: Option<&TeamMember>, manager: bool) -> Value {
-    let members: Vec<Value> = app.db.team_members(&t.id).iter().map(|m| member_view(app, m, manager)).collect();
+/// The team as a member sees it, with what `sight` allows: teammates' machines, invites,
+/// and the plan's details.
+fn team_view(app: &AppState, t: &Team, me: Option<&TeamMember>, sight: Sight) -> Value {
+    let members: Vec<Value> = app.db.team_members(&t.id).iter().map(|m| member_view(app, m, sight.machines)).collect();
     let mut v = json!({ "id": t.id, "name": t.name, "machines": t.machines, "region": t.region, "createdAt": t.created_at, "members": members });
-    // A contractual pin (ADR 0129): its reference only for those who manage the team.
+    // A contractual pin (ADR 0129): its reference only for those who manage its members.
     if let Some(p) = app.db.residency_pin(crate::db::PinOn::Team, &t.id) {
         v["residency"] = json!({ "region": p.region, "pinnedAt": p.pinned_at });
-        if manager || me.is_none() {
+        if sight.invites {
             v["residency"]["reference"] = json!(p.reference);
         }
     }
     if let Some(me) = me {
         v["role"] = json!(me.role);
     }
-    if manager {
+    if sight.invites {
         v["invites"] = json!(app.db.team_invites(&t.id));
+    }
+    if sight.machines {
         v["machineDays"] = json!(settings(app).machine_days);
     }
     // Server admins see which IdP group, if any, owns the team's membership (ADR 0095).
@@ -174,7 +206,7 @@ fn team_view(app: &AppState, t: &Team, me: Option<&TeamMember>, manager: bool) -
     {
         v["scimGroup"] = json!({ "tenant": g.tenant, "displayName": g.display_name, "externalId": g.external_id, "origin": g.origin, "provisioned": g.provisioned_at.is_some() });
     }
-    if let Some(b) = crate::team_billing::view(app, &t.id, manager) {
+    if let Some(b) = crate::team_billing::view(app, &t.id, sight.billing) {
         v["billing"] = b;
     }
     v
@@ -506,12 +538,34 @@ fn my_team(app: &AppState, c: &Caller) -> Res<(User, TeamMember, Team)> {
     Ok((u, m, t))
 }
 
-pub(crate) fn my_managed_team(app: &AppState, c: &Caller) -> Res<(User, TeamMember, Team)> {
+fn my_managed_team(app: &AppState, c: &Caller) -> Res<(User, TeamMember, Team)> {
     let (u, m, t) = my_team(app, c)?;
     if !manages(&m.role) {
         return Err(forbidden("Only the team's owners and admins can do this."));
     }
     Ok((u, m, t))
+}
+
+/// Your team, if you may do `perm` in it: as an owner or admin, or by a role given to you
+/// there (ADR 0123).
+pub(crate) fn my_team_for(app: &AppState, c: &Caller, perm: Perm) -> Res<(User, TeamMember, Team)> {
+    let (u, m, t) = my_team(app, c)?;
+    if !may(app, &m, perm) {
+        return Err(forbidden("Only the team's owners and admins can do this."));
+    }
+    Ok((u, m, t))
+}
+
+/// A teammate a team role's holder may manage: a plain member, with no team role of their
+/// own. Owners and admins may manage anyone their role allows.
+fn plain(m: &TeamMember) -> bool {
+    m.role == MEMBER && m.role_id.is_none()
+}
+
+/// What a team role's holder was refused, audited as `users::Delegate` refusals are.
+fn delegate_limit(app: &AppState, by: &Who, team_id: &str, msg: &str) -> ApiError {
+    app.db.record(&by.event("access.denied").outcome(crate::audit::Outcome::Denied).target("team", team_id).details(json!({ "reason": "delegate_limit", "limit": "team_role" })));
+    forbidden(msg)
 }
 
 /// A member of `team_id`, by id or email. Anyone else is not found, so a team admin
@@ -596,10 +650,13 @@ pub(crate) async fn erase_member(app: &AppState, by: &Who, user_id: &str, checke
 /// each teammate's machine and the invites waiting.
 pub async fn mine(State(app): State<AppState>, Extension(c): Extension<Caller>) -> Res {
     let (_, m, t) = my_team(&app, &c)?;
-    let mut v = team_view(&app, &t, Some(&m), manages(&m.role));
+    let sight = Sight { machines: may(&app, &m, Perm::ManageMachines), invites: may(&app, &m, Perm::ManageUsers), billing: may(&app, &m, Perm::ManageBilling) };
+    let mut v = team_view(&app, &t, Some(&m), sight);
     if v.get("billing").is_some() {
-        v["billing"]["canChange"] = json!(manages(&m.role) && crate::rbac::allows(c.principal, crate::rbac::Perm::Write));
+        v["billing"]["canChange"] = json!(sight.billing && crate::rbac::allows(c.principal, Perm::Write));
     }
+    v["customRole"] = crate::roles::summary(&app, m.role_id.as_deref());
+    v["permissions"] = json!(team_perms(&app, &m).names());
     Ok(Json(v))
 }
 
@@ -622,9 +679,17 @@ pub async fn leave_mine(State(app): State<AppState>, Extension(c): Extension<Cal
 
 /// `POST /api/team/invites` `{email, role?}`: invites someone. They join when they accept.
 pub async fn invite(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
-    let (_, _, t) = my_managed_team(&app, &c)?;
+    let (_, me, t) = my_team_for(&app, &c, Perm::ManageUsers)?;
     let email = v["email"].as_str().map(|e| e.trim().to_ascii_lowercase()).filter(|e| e.contains('@') && e.len() <= 254).ok_or_else(|| bad("Send an email address."))?;
     let role = parse_role(&v, &[ADMIN, MEMBER])?;
+    if role != MEMBER && !manages(&me.role) {
+        return Err(delegate_limit(&app, &by, &t.id, "Only the team's owners and admins can invite admins."));
+    }
+    // Inviting the same email again replaces the invite, role included. An expired one
+    // protects nothing.
+    if !manages(&me.role) && app.db.team_invites(&t.id).iter().any(|i| i.email == email && i.role != MEMBER && i.expires_at > now()) {
+        return Err(delegate_limit(&app, &by, &t.id, "Only the team's owners and admins can change an admin's invite."));
+    }
     if app.db.find_user(&email).is_some_and(|u| app.db.team_id_of(&u.id).as_deref() == Some(t.id.as_str())) {
         return Err(conflict("They're on this team already."));
     }
@@ -635,8 +700,11 @@ pub async fn invite(State(app): State<AppState>, Extension(c): Extension<Caller>
 
 /// `DELETE /api/team/invites/{id}`: withdraws an invite.
 pub async fn uninvite(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
-    let (_, _, t) = my_managed_team(&app, &c)?;
+    let (_, me, t) = my_team_for(&app, &c, Perm::ManageUsers)?;
     let inv = app.db.team_invite(&id).filter(|i| i.team_id == t.id).ok_or_else(|| not_found("Invite"))?;
+    if inv.role != MEMBER && !manages(&me.role) {
+        return Err(delegate_limit(&app, &by, &t.id, "Only the team's owners and admins can withdraw an admin's invite."));
+    }
     app.db.delete_team_invite(&inv.id);
     app.db.record(&team_event(&by, "team.invite_cancelled", &t.id, json!({ "email": inv.email, "inviteId": inv.id })));
     Ok(Json(json!({ "ok": true })))
@@ -667,10 +735,13 @@ pub async fn set_role(State(app): State<AppState>, Extension(c): Extension<Calle
 /// `DELETE /api/team/members/{user}`: takes a teammate off the team. Admins can't take
 /// off owners; nobody takes off themselves this way (`POST /api/team/leave`).
 pub async fn remove(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
-    let (me_user, me, t) = my_managed_team(&app, &c)?;
+    let (me_user, me, t) = my_team_for(&app, &c, Perm::ManageUsers)?;
     let (u, m) = teammate(&app, &t.id, &key)?;
     if u.id == me_user.id {
         return Err(conflict("To leave the team yourself, use leave."));
+    }
+    if !manages(&me.role) && !plain(&m) {
+        return Err(delegate_limit(&app, &by, &t.id, "Only the team's owners and admins can take off an admin, or someone with a team role."));
     }
     if m.role == OWNER && me.role != OWNER {
         return Err(forbidden("Only the team's owners can take an owner off the team."));
@@ -696,12 +767,14 @@ fn work_policies(app: &AppState) -> Value {
 /// work on teammates' machines and accounts. Counts and settings only: no Bot, file,
 /// address or login of theirs. Changes nothing.
 pub async fn offboarding(State(app): State<AppState>, Extension(c): Extension<Caller>, Path(key): Path<String>) -> Res {
-    let (me_user, me, t) = my_managed_team(&app, &c)?;
+    let (me_user, me, t) = my_team_for(&app, &c, Perm::ManageUsers)?;
     let (u, m) = teammate(&app, &t.id, &key)?;
     let blocked = if u.id == me_user.id {
         Some("self")
     } else if m.role == OWNER && me.role != OWNER {
         Some("owner")
+    } else if !manages(&me.role) && !plain(&m) {
+        Some("admin")
     } else {
         None
     };
@@ -769,7 +842,7 @@ async fn machine_answer(app: &AppState, by: &Who, team_id: &str, user_id: &str, 
 
 /// `POST /api/team/members/{user}/machine`: gives a teammate a machine, if they have none.
 pub async fn give_machine(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res<(StatusCode, Json<Value>)> {
-    let (_, _, t) = my_managed_team(&app, &c)?;
+    let (_, _, t) = my_team_for(&app, &c, Perm::ManageMachines)?;
     let (u, _) = teammate(&app, &t.id, &key)?;
     let cp = control_plane(&app).ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, crate::machines::NOT_CONFIGURED.into()))?;
     if let Some(m) = app.db.user_machine(&u.id) {
@@ -801,7 +874,7 @@ pub async fn give_machine(State(app): State<AppState>, Extension(c): Extension<C
 }
 
 async fn machine_step(app: AppState, c: Caller, by: Who, key: String, step: Step) -> Res<(StatusCode, Json<Value>)> {
-    let (_, _, t) = my_managed_team(&app, &c)?;
+    let (_, _, t) = my_team_for(&app, &c, Perm::ManageMachines)?;
     let (u, _) = teammate(&app, &t.id, &key)?;
     let cp = control_plane(&app).ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, crate::machines::NOT_CONFIGURED.into()))?;
     team_machine_of(&app, &t.id, &u.id)?;
@@ -868,7 +941,7 @@ fn need_team(app: &AppState, id: &str) -> Res<Team> {
 
 /// `GET /api/teams`: every team, with its members.
 pub async fn list(State(app): State<AppState>) -> Res {
-    let list: Vec<Value> = app.db.teams().iter().map(|t| team_view(&app, t, None, true)).collect();
+    let list: Vec<Value> = app.db.teams().iter().map(|t| team_view(&app, t, None, ALL)).collect();
     Ok(Json(json!({ "teams": list, "settings": { "strict": settings(&app).strict, "machineDays": settings(&app).machine_days, "work": work_policies(&app) } })))
 }
 
@@ -890,12 +963,12 @@ pub async fn create(State(app): State<AppState>, Extension(by): Extension<Who>, 
         app.db.delete_team(&t.id);
         return Err(e);
     }
-    Ok((StatusCode::CREATED, Json(team_view(&app, &t, None, true))))
+    Ok((StatusCode::CREATED, Json(team_view(&app, &t, None, ALL))))
 }
 
 /// `GET /api/teams/{id}`.
 pub async fn get(State(app): State<AppState>, Path(id): Path<String>) -> Res {
-    Ok(Json(team_view(&app, &need_team(&app, &id)?, None, true)))
+    Ok(Json(team_view(&app, &need_team(&app, &id)?, None, ALL)))
 }
 
 /// `PATCH /api/teams/{id}` `{name?, machines?}`.
@@ -911,7 +984,7 @@ pub async fn update(State(app): State<AppState>, Extension(by): Extension<Who>, 
     };
     app.db.update_team(&t.id, name, machines);
     app.db.record(&team_event(&by, "team.updated", &t.id, json!({ "name": name, "machines": machines })));
-    Ok(Json(team_view(&app, &need_team(&app, &id)?, None, true)))
+    Ok(Json(team_view(&app, &need_team(&app, &id)?, None, ALL)))
 }
 
 /// `DELETE /api/teams/{id}`: everyone leaves, as if each had, then the team goes.

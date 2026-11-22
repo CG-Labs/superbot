@@ -70,7 +70,7 @@ botd still starts. Refusing to start would take every other tenant down for one 
 
 ### Where it shows
 
-- **API**: `residency` (the pin, or null) on users (`GET /api/users`, `/api/users/{key}`), on `GET /api/users/{key}/region` and `/residency`, on teams (the reference only for admins and team managers), and on `GET /api/teams/{id}/region`. `GET /api/regions` counts pinned users and teams per region and lists every pin.
+- **API**: `residency` (the pin, or null) on users (`GET /api/users`, `/api/users/{key}`), on `GET /api/users/{key}/region` and `/residency`, on teams (the reference only for admins and those who manage the team's members), and on `GET /api/teams/{id}/region`. `GET /api/regions` counts pinned users and teams per region and lists every pin.
 - **botctl**: `botctl user residency <user> [pin <region> <reference...> | unpin <reason...>]`, and the same for `team`.
 - **Console**: the pin and a Pin region / Unpin button on Users and Teams; pinned counts and residency warnings in the Machines regions line.
 

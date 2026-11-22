@@ -219,6 +219,29 @@ pub struct Caller {
     pub bot_for: Option<String>,
     /// The id of the run token a Bot's request came with (ADR 0083), live only while its run is.
     pub bot_token: Option<String>,
+    /// What the person's custom role across the server adds to their base role (ADR 0123).
+    pub grants: rbac::Perms,
+}
+
+impl Caller {
+    /// A signed-in person, with their custom role's permissions read now.
+    pub fn person(db: &db::Db, u: User, s: Option<Session>, method: &'static str) -> Caller {
+        let grants = db.user_perms(&u);
+        Caller { principal: Principal::User(u.role), user: Some(u), session: s, method, bot: None, bot_for: None, bot_token: None, grants }
+    }
+
+    pub fn can(&self, perm: rbac::Perm) -> bool {
+        rbac::permits(self.principal, self.grants, perm)
+    }
+
+    /// A full admin: the built-in role, which no custom role can be.
+    pub fn admin(&self) -> bool {
+        self.principal == Principal::User(Role::Admin)
+    }
+
+    pub fn permissions(&self) -> Vec<&'static str> {
+        rbac::granted(self.principal, self.grants)
+    }
 }
 
 /// The audit actor: the person, their email and role now, and how this request was
@@ -289,7 +312,7 @@ pub fn user_view(u: &User) -> Value {
         "id": u.id, "email": u.email, "name": u.name, "role": u.role, "status": u.status,
         "breakGlass": u.id == OPERATOR, "idpIssuer": u.idp_issuer, "idpSubject": u.idp_subject,
         "createdAt": u.created_at, "updatedAt": u.updated_at, "lastLoginAt": u.last_login_at,
-        "tier": u.tier, "region": u.region, "erasedAt": u.erased_at, "erasedAs": u.erased_as,
+        "tier": u.tier, "region": u.region, "erasedAt": u.erased_at, "erasedAs": u.erased_as, "roleId": u.role_id,
     })
 }
 
@@ -316,6 +339,7 @@ fn admin_view(a: &Auth, u: &User, identities: &[db::Identity], pending: Option<&
     v["pendingCodes"] = pending.map_or(Value::Null, |(n, exp)| json!({ "count": n, "expiresAt": exp }));
     v["mfa"] = json!({ "enabled": mfa_since.is_some(), "enabledAt": mfa_since });
     if let Some(app) = &a.app {
+        v["customRole"] = crate::roles::summary(app, u.role_id.as_deref());
         v["plan"] = crate::tier_usage(app, &u.id);
         if a.machines.enabled() {
             v["dataRegion"] = json!(crate::machines::region::effective(app, &a.machines, u));
@@ -479,7 +503,8 @@ pub async fn me(Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Call
     Json(json!({
         "user": c.user.as_ref().map(user_view),
         "role": match c.principal { Principal::User(r) => json!(r), Principal::Bot => json!("bot") },
-        "permissions": rbac::granted(c.principal),
+        "permissions": c.permissions(),
+        "customRole": a.app.as_ref().map_or(Value::Null, |app| crate::roles::summary(app, c.user.as_ref().and_then(|u| u.role_id.as_deref()))),
         "method": c.method,
         "session": c.session.as_ref().map(|s| session_view(s, &a.sessions)),
         "breakGlass": a.break_glass,
@@ -497,6 +522,46 @@ pub fn need_user_key(app: &AppState, key: &str) -> Res<User> {
     match &u.erased_as {
         Some(p) => Err(ApiError(StatusCode::GONE, format!("This user was erased; the audit log names them {p}."))),
         None => Ok(u),
+    }
+}
+
+/// What someone with `users.manage` but not the admin role may not do (ADR 0123): change
+/// an admin, the owner, or anyone with a custom role across the server, make anyone an
+/// admin, or (without `billing.manage`) change a tier. Refusals are audited.
+pub struct Delegate<'a> {
+    app: &'a AppState,
+    c: &'a Caller,
+    by: &'a Who,
+}
+
+impl<'a> Delegate<'a> {
+    pub fn new(app: &'a AppState, c: &'a Caller, by: &'a Who) -> Delegate<'a> {
+        Delegate { app, c, by }
+    }
+
+    pub fn refuse(&self, reason: &str, target: Option<&str>, msg: &str) -> ApiError {
+        let mut d = json!({ "reason": "delegate_limit", "limit": reason });
+        if let Some(t) = target {
+            d["user"] = json!(t);
+        }
+        self.app.db.record(&self.by.event("access.denied").outcome(crate::audit::Outcome::Denied).details(d));
+        ApiError(StatusCode::FORBIDDEN, msg.into())
+    }
+
+    /// May the caller change `u`: anyone, for admins; a delegate, only people who hold no
+    /// admin permission of any kind.
+    pub fn may_manage(&self, u: &User) -> Res<()> {
+        if self.c.admin() || (u.role != Role::Admin && u.role_id.is_none() && u.id != OPERATOR) {
+            return Ok(());
+        }
+        Err(self.refuse("protected_user", Some(&u.id), "Only an admin can change an admin, or someone with a custom role."))
+    }
+
+    pub fn may_give(&self, role: Role) -> Res<()> {
+        if self.c.admin() || role != Role::Admin {
+            return Ok(());
+        }
+        Err(self.refuse("admin_role", None, "Only an admin can make someone an admin."))
     }
 }
 
@@ -539,13 +604,14 @@ pub async fn user_bots(State(app): State<AppState>, Path(key): Path<String>) -> 
 }
 
 /// `{email, name?, role?}`. Role defaults to member.
-pub async fn create_user(State(app): State<AppState>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
+pub async fn create_user(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
     let email = v["email"].as_str().map(str::trim).filter(|e| valid_email(e)).ok_or_else(|| bad("A valid email is required"))?;
     let name = clean_name(&v["name"])?.unwrap_or_else(|| email.split('@').next().unwrap_or(email).to_string());
     let role = match &v["role"] {
         Value::Null => Role::Member,
         r => r.as_str().and_then(Role::parse).ok_or_else(|| bad("role must be admin, member, or readonly"))?,
     };
+    Delegate::new(&app, &c, &by).may_give(role)?;
     let u = app.db.create_user(None, Some(email), &name, role).map_err(|e| user_error(&app, &by, e, None, Some(email)))?;
     record_created(&app, &by, &u, None);
     Ok((StatusCode::CREATED, Json(user_view(&u))))
@@ -572,8 +638,10 @@ pub fn record_created(app: &AppState, by: &Who, u: &User, reason: Option<&str>) 
 /// tier is one `TIERS_FILE` lists; null puts them back on the default. Disabling ends the
 /// user's sessions. The owner account can't be demoted or disabled: it is the way
 /// back in (turn off AUTH_BREAK_GLASS instead).
-pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(key): Path<String>, Json(v): Json<Value>) -> Res {
+pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(key): Path<String>, Json(v): Json<Value>) -> Res {
     let before = need_user_key(&app, &key)?;
+    let delegate = Delegate::new(&app, &c, &by);
+    delegate.may_manage(&before)?;
     let mut p = UserPatch { name: clean_name(&v["name"])?, ..Default::default() };
     match &v["email"] {
         Value::Null => {}
@@ -598,6 +666,12 @@ pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Ar
             Some(Some(t.name.clone()))
         }
     };
+    if let Some(r) = p.role {
+        delegate.may_give(r)?;
+    }
+    if p.tier.is_some() && !c.can(rbac::Perm::ManageBilling) {
+        return Err(delegate.refuse("tier", Some(&before.id), "Changing someone's tier needs billing.manage."));
+    }
     let demotes = p.role.is_some_and(|r| r != Role::Admin) || p.status == Some("disabled");
     if before.id == OPERATOR && demotes {
         return Err(ApiError(StatusCode::CONFLICT, "The owner (break-glass) account stays an active admin. Set AUTH_BREAK_GLASS=0 to turn password sign-in off.".into()));
@@ -620,6 +694,11 @@ pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Ar
     }
     if before.role != after.role {
         app.db.record(&ev("user.role_changed").details(json!({ "from": before.role, "to": after.role })));
+    }
+    // A built-in role replaces a custom one (ADR 0123).
+    if let Some(id) = before.role_id.as_deref().filter(|_| after.role_id.is_none()) {
+        let name = app.db.custom_role(id).map(|r| r.name);
+        app.db.record(&by.event("role.unassigned").target("role", id).details(json!({ "name": name, "user": after.id, "scope": "org", "keeps": after.role, "reason": "role_set" })));
     }
     if before.tier != after.tier {
         // `effective` is the tier they're on: an unset one is the default.
@@ -673,8 +752,9 @@ pub(crate) async fn lost_access(app: &AppState, by: &Who, user_id: &str, reason:
 /// `{ttlMinutes?, replace?}` (default 60, up to 7 days). Returns the code once; only its
 /// hash is kept. `replace: true` first drops the user's unused codes, so a regenerated
 /// invite is the only one that works.
-pub async fn create_login_code(State(app): State<AppState>, Extension(by): Extension<Who>, Path(key): Path<String>, body: axum::body::Bytes) -> Res<Response> {
+pub async fn create_login_code(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(key): Path<String>, body: axum::body::Bytes) -> Res<Response> {
     let u = need_user_key(&app, &key)?;
+    Delegate::new(&app, &c, &by).may_manage(&u)?;
     if !u.active() {
         return Err(ApiError(StatusCode::CONFLICT, "This user is disabled. Enable them first.".into()));
     }
@@ -726,8 +806,11 @@ pub async fn list_sessions(State(app): State<AppState>, Extension(a): Extension<
     Ok(Json(json!(list.iter().map(|s| session_view(s, &a.sessions)).collect::<Vec<_>>())))
 }
 
-pub async fn revoke_session(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
+pub async fn revoke_session(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     let s = app.db.session(&id).filter(|s| s.revoked_at.is_none()).ok_or_else(|| not_found("Session"))?;
+    if let Some(u) = app.db.user(&s.user_id) {
+        Delegate::new(&app, &c, &by).may_manage(&u)?;
+    }
     if !app.db.revoke_session(&id, by.actor.id.as_deref().unwrap_or(""), "revoked by admin") {
         return Err(not_found("Session"));
     }
@@ -735,8 +818,9 @@ pub async fn revoke_session(State(app): State<AppState>, Extension(by): Extensio
     Ok(Json(json!({ "ok": true })))
 }
 
-pub async fn revoke_user_sessions(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
+pub async fn revoke_user_sessions(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
     let u = need_user_key(&app, &key)?;
+    Delegate::new(&app, &c, &by).may_manage(&u)?;
     // Codes go first: a redemption holds them until its session exists, so either that
     // session is made in time to be revoked below or the code is already gone.
     a.sso.forget_user(&u.id);
