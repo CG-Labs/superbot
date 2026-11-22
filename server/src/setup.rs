@@ -382,6 +382,7 @@ pub(crate) fn report(app: &AppState, a: &Auth, headers: &HeaderMap, peer: Option
         "tiers": tiers,
         "license": license,
         "approvals": { "mode": mode, "ok": ask },
+        "secretsBackend": crate::secrets::external::diagnostics(),
         "checklist": checklist,
         "done": done,
         "total": checklist.len(),

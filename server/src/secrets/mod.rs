@@ -5,14 +5,17 @@
 //! 2. `SealedStore`: values the operator saves with `botctl secret set` or the API,
 //!    encrypted in SQLite with the master key (see `key`, `sealed`).
 //!
-//! With `SECRETS_BACKEND=vault`, an `external::ExternalStore` over HashiCorp Vault sits
-//! between the two (ADR 0125); Azure Key Vault or AWS Secrets Manager are other
-//! `external::Provider`s. Values never leave botd except into a harness's environment;
+//! With `SECRETS_BACKEND=vault`, `azure-keyvault` or `gcp-secret-manager`, an
+//! `external::ExternalStore` over that secrets manager sits between the two (ADR 0125,
+//! ADR 0136); AWS Secrets Manager would be another `external::Provider`. Values never leave botd except into a harness's environment;
 //! the API lists names only. Every known value is redacted from saved text, events,
 //! and the audit log (`redact`). See docs/adr/0010-secrets.md.
 
+pub mod azure;
 pub mod env;
 pub mod external;
+pub mod gcp;
+mod http;
 pub mod key;
 pub mod redact;
 pub mod sealed;
@@ -113,7 +116,7 @@ pub struct Listed {
 }
 
 /// Names botd or the harnesses rely on; a stored secret must not replace them in a Bot's environment.
-const RESERVED: [&str; 17] = ["VAULT_TOKEN", "VAULT_ROLE_ID", "VAULT_SECRET_ID", "AUTH_PASSWORD", "LICENSE_KEY", "STRIPE_WEBHOOK_SECRET", "STRIPE_SECRET_KEY", "PATH", "HOME", "USER", "LOGNAME", "SHELL", "ENV", "BASH_ENV", "NODE_OPTIONS", "DISPLAY", "DBUS_SESSION_BUS_ADDRESS"];
+const RESERVED: [&str; 21] = ["VAULT_TOKEN", "VAULT_ROLE_ID", "VAULT_SECRET_ID", "AZURE_CLIENT_SECRET", "AZURE_FEDERATED_TOKEN", "IDENTITY_HEADER", "GCP_SERVICE_ACCOUNT_KEY", "AUTH_PASSWORD", "LICENSE_KEY", "STRIPE_WEBHOOK_SECRET", "STRIPE_SECRET_KEY", "PATH", "HOME", "USER", "LOGNAME", "SHELL", "ENV", "BASH_ENV", "NODE_OPTIONS", "DISPLAY", "DBUS_SESSION_BUS_ADDRESS"];
 const RESERVED_PREFIXES: [&str; 7] = ["SUPERBOT_", "BOT_", "SSO_", "LD_", "DYLD_", "AGENT_BROWSER_", "VOXL_"];
 pub const MAX_VALUE: usize = 64 * 1024;
 
@@ -562,6 +565,7 @@ pub fn init(db_path: &Path, keys: Keys, external: Option<Arc<external::ExternalS
     let stored = store.names().map_err(|e| e.to_string())?.len();
     let mut stores: Vec<Box<dyn SecretStore>> = vec![Box::new(env)];
     if let Some(x) = external {
+        external::set_active(&x);
         stores.push(Box::new(external::Shared(x)));
     }
     stores.push(Box::new(store));
