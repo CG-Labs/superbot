@@ -315,15 +315,20 @@ impl Sso {
     /// Loads IdP metadata imported with botctl, at startup.
     pub fn load_saved(&self, db: &db::Db) {
         for p in self.providers.iter().filter(|p| matches!(&p.kind, Kind::SamlSp { source: IdpSource::Saved, .. })) {
-            let Kind::SamlSp { entity_id, sign_requests, .. } = &p.kind else {
+            let Kind::SamlSp { entity_id, sign_requests, metadata_trust, .. } = &p.kind else {
                 continue;
             };
             let Some(xml) = db.setting(&format!("{SAML_METADATA_SETTING}{}", p.id)) else {
                 continue;
             };
-            match saml_sp::parse_idp_metadata(&xml, entity_id, *sign_requests) {
+            match saml_sp::load_idp_metadata(&xml, entity_id, *sign_requests, metadata_trust.as_ref(), db::now()) {
                 Ok(m) => p.set_idp(m),
-                Err(e) => crate::obs::log::log_warn!("SSO {}: the imported IdP metadata no longer reads: {e}. Import it again: botctl sso saml {} import", p.id, p.id),
+                Err(e) => {
+                    crate::obs::log::log_warn!("SSO {}: the imported IdP metadata no longer reads: {e}. Import it again: botctl sso saml {} import", p.id, p.id);
+                    if e.untrusted() {
+                        db.record(&metadata_refused(p, &e));
+                    }
+                }
             }
         }
     }
@@ -378,7 +383,7 @@ const TYPES: [&str; 6] = ["entra", "google", "oidc", "apple", "github", "saml"];
 
 /// Settings that only mean something for some types. Set on another, they would look like
 /// a restriction that isn't there, so they are refused.
-const ONLY_FOR: [(&str, &[&str]); 24] = [
+const ONLY_FOR: [(&str, &[&str]); 26] = [
     ("TENANT", &["entra"]),
     ("ALLOWED_TENANTS", &["entra"]),
     ("AUTHORITY", &["entra"]),
@@ -403,11 +408,25 @@ const ONLY_FOR: [(&str, &[&str]); 24] = [
     ("SP_CERT_FILE", &["saml"]),
     ("ENCRYPTED_ASSERTIONS", &["saml"]),
     ("SP_ENCRYPTION_CERT_FILE", &["saml"]),
+    ("METADATA_SIGNING_CERT_FILE", &["saml"]),
+    ("SIGNED_METADATA", &["saml"]),
 ];
 
 /// The SAML bridge's settings (with `ISSUER`), and native SAML's (without), so each refuses the other's.
 const SAML_BRIDGE_ONLY: [&str; 6] = ["CLIENT_ID", "IDP_ALIAS", "SCOPES", "SUBJECT_CLAIM", "EMAIL_CLAIM", "NAME_CLAIM"];
-const SAML_NATIVE_ONLY: [&str; 9] = ["IDP_METADATA_URL", "IDP_METADATA_FILE", "SP_ENTITY_ID", "EMAIL_ATTRIBUTE", "NAME_ATTRIBUTE", "SIGN_REQUESTS", "SP_CERT_FILE", "ENCRYPTED_ASSERTIONS", "SP_ENCRYPTION_CERT_FILE"];
+const SAML_NATIVE_ONLY: [&str; 11] = [
+    "IDP_METADATA_URL",
+    "IDP_METADATA_FILE",
+    "SP_ENTITY_ID",
+    "EMAIL_ATTRIBUTE",
+    "NAME_ATTRIBUTE",
+    "SIGN_REQUESTS",
+    "SP_CERT_FILE",
+    "ENCRYPTED_ASSERTIONS",
+    "SP_ENCRYPTION_CERT_FILE",
+    "METADATA_SIGNING_CERT_FILE",
+    "SIGNED_METADATA",
+];
 
 /// Claims people or their admins can change, so they can't be the subject.
 const MUTABLE_CLAIMS: [&str; 9] = ["email", "preferred_username", "upn", "unique_name", "name", "nickname", "given_name", "family_name", "phone_number"];
@@ -560,7 +579,13 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
             {
                 return Err(format!("{} must be another key than {}: one key for signing, another for encryption", key("SP_ENCRYPTION_CERT_FILE"), key("SP_CERT_FILE")));
             }
-            (Kind::SamlSp { entity_id, sp_entity_id, source, attributes, allowed_domains, sign_requests, sp_cert, encryption, enc_cert }, saml::LABEL)
+            if let Some(e) = &enc_cert
+                && xmldsig::Cert::from_base64(e).is_ok_and(|c| c.kind != xmldsig::KeyKind::Rsa)
+            {
+                return Err(format!("{} must be an RSA certificate: IdPs encrypt to it with RSA-OAEP", key("SP_ENCRYPTION_CERT_FILE")));
+            }
+            let metadata_trust = metadata_trust(&key, var)?;
+            (Kind::SamlSp { entity_id, sp_entity_id, source, attributes, allowed_domains, sign_requests, sp_cert, encryption, enc_cert, metadata_trust }, saml::LABEL)
         }
         "saml" => {
             if let Some(k) = SAML_NATIVE_ONLY.iter().find(|k| var(&key(k)).is_some()) {
@@ -639,11 +664,33 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
     };
     let label = var(&key("LABEL")).map(|l| crate::audit::clip(&l, 40)).unwrap_or_else(|| label.to_string());
     let p = Provider::new(id, &label, kind, &client_id, &scopes, jit_role);
-    if let Kind::SamlSp { source: IdpSource::File(path), entity_id, sign_requests, .. } = &p.kind {
+    if let Kind::SamlSp { source: IdpSource::File(path), entity_id, sign_requests, metadata_trust, .. } = &p.kind {
         let xml = std::fs::read_to_string(path).map_err(|e| format!("{}: {path}: {e}", key("IDP_METADATA_FILE")))?;
-        p.set_idp(saml_sp::parse_idp_metadata(&xml, entity_id, *sign_requests).map_err(|e| format!("{}: {e}", key("IDP_METADATA_FILE")))?);
+        p.set_idp(saml_sp::load_idp_metadata(&xml, entity_id, *sign_requests, metadata_trust.as_ref(), db::now()).map_err(|e| format!("{}: {e}", key("IDP_METADATA_FILE")))?);
     }
     Ok(p)
+}
+
+/// Native SAML: `METADATA_SIGNING_CERT_FILE` and `SIGNED_METADATA` (ADR 0151). With the
+/// certificates, signed metadata is required unless `SIGNED_METADATA=allow`; `off` (the
+/// default without them) checks nothing.
+fn metadata_trust(key: &dyn Fn(&str) -> String, var: &Var) -> Result<Option<saml_sp::MetadataTrust>, String> {
+    let certs = match var(&key("METADATA_SIGNING_CERT_FILE")) {
+        Some(path) => {
+            let pem = std::fs::read_to_string(&path).map_err(|e| format!("{}: {path}: {e}", key("METADATA_SIGNING_CERT_FILE")))?;
+            Some(xmldsig::certs_from_pem(&pem).map_err(|e| format!("{}: {e}", key("METADATA_SIGNING_CERT_FILE")))?)
+        }
+        None => None,
+    };
+    let mode = var(&key("SIGNED_METADATA")).map(|v| v.to_ascii_lowercase());
+    match (mode.as_deref(), certs) {
+        (None | Some("require"), Some(certs)) => Ok(Some(saml_sp::MetadataTrust { certs, require: true })),
+        (Some("allow"), Some(certs)) => Ok(Some(saml_sp::MetadataTrust { certs, require: false })),
+        (None | Some("off"), None) => Ok(None),
+        (Some("off"), Some(_)) => Err(format!("{}=off would ignore {}: remove one of them", key("SIGNED_METADATA"), key("METADATA_SIGNING_CERT_FILE"))),
+        (Some("allow" | "require"), None) => Err(format!("{} needs {}: the certificate the IdP signs its metadata with", key("SIGNED_METADATA"), key("METADATA_SIGNING_CERT_FILE"))),
+        (Some(_), _) => Err(format!("{} must be off, allow, or require", key("SIGNED_METADATA"))),
+    }
 }
 
 // Audit
@@ -756,7 +803,7 @@ pub async fn start(
     if a.limiter.blocked(&ip, at).is_some() {
         return no_store(ret.fail("sso_too_many"));
     }
-    let endpoint = match p.authorization_endpoint(sso.http(), sso.refresh_gap).await {
+    let endpoint = match p.authorization_endpoint(sso.http(), sso.refresh_gap).await.inspect_err(|_| audit_metadata_refusal(&a, p)) {
         Ok(e) => e,
         Err(e) => {
             crate::obs::log::log_warn!("SSO {id}: discovery failed: {e}");
@@ -981,7 +1028,7 @@ async fn finish_saml(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, f
         failed(a, source, id, "missing_response", None, json!({}));
         return ret.fail("sso_failed");
     };
-    let idp = match p.idp_metadata(sso.http(), sso.refresh_gap).await {
+    let idp = match idp_metadata(a, p).await {
         Ok(m) => m,
         Err(e) => {
             failed(a, source, id, e.0, None, json!({}));
@@ -1128,7 +1175,7 @@ pub async fn logout_request(a: &Auth, app: &AppState, s: &db::Session) -> Option
     // Cached metadata, even if stale, and a short fetch otherwise: clients wait 5 s for this answer.
     let idp = match p.idp_loaded() {
         Some(m) => m,
-        None => tokio::time::timeout(Duration::from_secs(3), p.idp_metadata(a.sso.http(), a.sso.refresh_gap)).await.ok()?.ok()?,
+        None => tokio::time::timeout(Duration::from_secs(3), idp_metadata(a, p)).await.ok()?.ok()?,
     };
     let slo = idp.slo.clone()?;
     let key = sp_key(app, p).map_err(|e| crate::obs::log::log_warn!("SSO {}: no single logout: {e}", p.id)).ok()?;
@@ -1181,9 +1228,9 @@ pub async fn slo_post(Extension(a): Extension<Arc<Auth>>, Extension(source): Ext
 async fn slo(a: &Auth, source: &Source, id: &str, incoming: &saml_slo::Incoming<'_>) -> Response {
     let Some(app) = a.app.as_ref() else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
     let Some(p) = a.sso.provider(id).filter(|p| p.saml_sp()) else { return not_found("SAML provider").into_response() };
-    let Kind::SamlSp { sp_entity_id, .. } = &p.kind else { return not_found("SAML provider").into_response() };
+    let Kind::SamlSp { sp_entity_id, encryption, .. } = &p.kind else { return not_found("SAML provider").into_response() };
     // From a URL, the metadata may not be loaded since a restart: logouts can't wait for a sign-in.
-    let Ok(idp) = p.idp_metadata(a.sso.http(), a.sso.refresh_gap).await else { return slo_failed(a, source, id, "not_ready", json!({})) };
+    let Ok(idp) = idp_metadata(a, p).await else { return slo_failed(a, source, id, "not_ready", json!({})) };
     let Some(idp_slo) = idp.slo.clone() else { return slo_failed(a, source, id, "no_slo", json!({})) };
     let key = match sp_key(app, p) {
         Ok(k) => k,
@@ -1193,7 +1240,9 @@ async fn slo(a: &Auth, source: &Source, id: &str, incoming: &saml_slo::Incoming<
         }
     };
     let (slo_url, at) = (a.sso.slo_url(id), db::now());
-    let received = match saml_slo::receive(incoming, &saml_slo::Expect { idp: &idp, slo_url: &slo_url, now_ms: at }) {
+    // An EncryptedID is decrypted with the key assertions are encrypted to, when there is one.
+    let decrypt = (*encryption != Encryption::Off).then(|| sp_encryption_key(app, p).map_err(|e| crate::obs::log::log_warn!("SSO {id}: can't decrypt logout NameIDs: {e}")).ok()).flatten();
+    let received = match saml_slo::receive(incoming, &saml_slo::Expect { idp: &idp, slo_url: &slo_url, now_ms: at, decrypt: decrypt.as_deref() }) {
         Ok(r) => r,
         Err(Refused(reason, detail)) => return slo_failed(a, source, id, reason, json!({ "detail": detail })),
     };
@@ -1242,6 +1291,28 @@ async fn slo(a: &Auth, source: &Source, id: &str, incoming: &saml_slo::Incoming<
     }
 }
 
+/// The IdP metadata, auditing metadata from the URL refused for its signature or validity.
+async fn idp_metadata(a: &Auth, p: &Provider) -> Result<Arc<saml_sp::IdpMetadata>, jwt::Invalid> {
+    p.idp_metadata(a.sso.http(), a.sso.refresh_gap).await.inspect_err(|_| audit_metadata_refusal(a, p))
+}
+
+fn audit_metadata_refusal(a: &Auth, p: &Provider) {
+    if let Some(e) = p.take_metadata_refusal() {
+        a.record(metadata_refused(p, &e));
+    }
+}
+
+/// `sso.saml_metadata_refused`: IdP metadata whose signature or validity didn't hold (ADR 0151).
+/// The metadata loaded before, if any, stays in use.
+fn metadata_refused(p: &Provider, e: &saml_sp::MetadataRefused) -> Event {
+    let source = match &p.kind {
+        Kind::SamlSp { source, .. } => source.name(),
+        _ => "",
+    };
+    let details = json!({ "provider": p.id, "source": source, "reason": e.reason, "error": crate::audit::clip(&e.message, 256), "kept": p.idp_loaded().is_some() });
+    Event::new(Actor::system("sso"), "sso.saml_metadata_refused").target("sso_provider", &p.id).outcome(Outcome::Failure).details(details)
+}
+
 fn saml_provider<'a>(a: &'a Auth, id: &str) -> Result<&'a Arc<Provider>, ApiError> {
     a.sso.provider(id).filter(|p| p.saml_sp()).ok_or_else(|| {
         let native: Vec<&str> = a.sso.providers.iter().filter(|p| p.saml_sp()).map(|p| p.id.as_str()).collect();
@@ -1250,7 +1321,7 @@ fn saml_provider<'a>(a: &'a Auth, id: &str) -> Result<&'a Arc<Provider>, ApiErro
 }
 
 fn saml_view(a: &Auth, p: &Provider) -> Value {
-    let Kind::SamlSp { entity_id, sp_entity_id, source, sign_requests, sp_cert, encryption, enc_cert, .. } = &p.kind else {
+    let Kind::SamlSp { entity_id, sp_entity_id, source, sign_requests, sp_cert, encryption, enc_cert, metadata_trust, .. } = &p.kind else {
         return json!({});
     };
     let cert = |c: &xmldsig::Cert| json!({ "sha256": c.sha256, "subject": c.subject, "notAfter": c.not_after * 1000 });
@@ -1282,6 +1353,8 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
         "spEntityId": sp_entity_id, "acsUrl": a.sso.acs_url(&p.id), "metadataUrl": a.sso.sp_metadata_url(&p.id),
         "sloUrl": a.sso.slo_url(&p.id), "signRequests": sign_requests, "spKey": sp_key, "singleLogout": slo,
         "encryptedAssertions": encryption.as_str(), "spEncryptionKey": enc_key,
+        "signedMetadata": metadata_trust.as_ref().map_or("off", |t| if t.require { "require" } else { "allow" }),
+        "metadataSigningCertificates": metadata_trust.as_ref().map(|t| t.certs.iter().map(cert).collect::<Vec<_>>()),
         "idpEntityId": entity_id, "source": source.name(), "from": from, "idp": idp,
         "audience": p.audience(), "jitRole": p.jit_role.map(Role::as_str),
     })
@@ -1291,7 +1364,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
 pub async fn saml_status(Extension(a): Extension<Arc<Auth>>, Path(id): Path<String>) -> Res {
     let p = saml_provider(&a, &id)?;
     if matches!(&p.kind, Kind::SamlSp { source: IdpSource::Url(_), .. })
-        && let Err(e) = p.idp_metadata(a.sso.http(), a.sso.refresh_gap).await
+        && let Err(e) = idp_metadata(&a, p).await
     {
         crate::obs::log::log_warn!("SSO {id}: IdP metadata: {e}");
     }
@@ -1302,7 +1375,7 @@ pub async fn saml_status(Extension(a): Extension<Arc<Auth>>, Path(id): Path<Stri
 /// it isn't set in `.env`. Checked before it's kept: it must be for `IDP_ENTITY_ID`.
 pub async fn saml_import(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
     let p = saml_provider(&a, &id)?;
-    let Kind::SamlSp { entity_id, source, sign_requests, .. } = &p.kind else {
+    let Kind::SamlSp { entity_id, source, sign_requests, metadata_trust, .. } = &p.kind else {
         return Err(bad("not a native SAML provider"));
     };
     if *source != IdpSource::Saved {
@@ -1310,7 +1383,17 @@ pub async fn saml_import(State(app): State<AppState>, Extension(a): Extension<Ar
         return Err(ApiError(StatusCode::CONFLICT, format!("SSO_{}_{var} sets this provider's IdP metadata. Change it there, or remove it to import here.", id.to_ascii_uppercase())));
     }
     let xml = v["xml"].as_str().unwrap_or("");
-    let m = saml_sp::parse_idp_metadata(xml, entity_id, *sign_requests).map_err(|e| bad(format!("That IdP metadata can't be used: {e}.")))?;
+    let m = match saml_sp::load_idp_metadata(xml, entity_id, *sign_requests, metadata_trust.as_ref(), db::now()) {
+        Ok(m) => m,
+        Err(e) => {
+            if e.untrusted() {
+                app.db.record(&by.event("sso.saml_metadata_refused").target("sso_provider", &p.id).outcome(Outcome::Failure).details(json!({
+                    "provider": p.id, "source": "botctl", "reason": e.reason, "error": crate::audit::clip(&e.message, 256), "kept": p.idp_loaded().is_some(),
+                })));
+            }
+            return Err(bad(format!("That IdP metadata can't be used: {e}.")));
+        }
+    };
     let certs: Vec<&str> = m.certs.iter().map(|c| c.sha256.as_str()).collect();
     let details = json!({ "provider": p.id, "entityId": m.entity_id, "ssoUrl": m.sso_url, "certificates": certs });
     app.db.set_setting(&format!("{SAML_METADATA_SETTING}{id}"), xml);
@@ -1823,7 +1906,7 @@ mod tests {
         let p = s.provider("corp").unwrap();
         assert!(p.saml_sp() && !p.oidc() && !p.needs_secret());
         assert_eq!((p.type_name(), p.jit_role), ("saml", None), "audited as idp=saml, like the bridge");
-        assert!(matches!(&p.kind, Kind::SamlSp { entity_id, sp_entity_id, source: IdpSource::Saved, attributes, allowed_domains, sign_requests: false, sp_cert: None, encryption: Encryption::Off, enc_cert: None }
+        assert!(matches!(&p.kind, Kind::SamlSp { entity_id, sp_entity_id, source: IdpSource::Saved, attributes, allowed_domains, sign_requests: false, sp_cert: None, encryption: Encryption::Off, enc_cert: None, metadata_trust: None }
             if entity_id == ADFS && sp_entity_id == "https://bot.example.com/api/auth/sso/corp/metadata" && attributes.email.is_none() && allowed_domains.is_empty()));
         assert_eq!((p.env_var(), s.slo_url("corp")), ("SSO_CORP_PRIVATE_KEY".to_string(), "https://bot.example.com/api/auth/sso/corp/slo".to_string()));
         assert_eq!(s.callback_url("corp"), "https://bot.example.com/api/auth/sso/corp/acs");
@@ -1983,6 +2066,86 @@ mod tests {
         assert_eq!(p.not_ready(), None);
         assert_eq!(p.configured_sp_key(KeyUse::Encryption).unwrap().info.sha256, enc.info.sha256);
         assert!(p.configured_sp_key(KeyUse::Signing).is_err(), "the signing key is botd's own here");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sp_keys_may_be_ecdsa_for_signing_but_not_for_encryption() {
+        let dir = std::env::temp_dir().join(format!("superbot-sp-ec-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let leak = |p: &std::path::Path| -> &'static str { Box::leak(p.to_string_lossy().into_owned().into_boxed_str()) };
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name.push(rcgen::DnType::CommonName, "SuperBot SAML SP");
+        let cert = dir.join("ec.pem");
+        std::fs::write(&cert, params.self_signed(&key).unwrap().pem()).unwrap();
+        let err = native(&[("SSO_CORP_ENCRYPTED_ASSERTIONS", "allow"), ("SSO_CORP_SP_ENCRYPTION_CERT_FILE", leak(&cert))]).err().unwrap();
+        assert!(err.contains("must be an RSA certificate"), "{err}");
+
+        let id = format!("ec{}", random_hex());
+        let up = id.to_ascii_uppercase();
+        let var = |k: &str| -> &'static str { Box::leak(format!("SSO_{up}_{k}").into_boxed_str()) };
+        let vars = [
+            ("SSO_PROVIDERS", leak(std::path::Path::new(&id))),
+            ("SSO_PUBLIC_URL", "https://bot.example.com"),
+            (var("TYPE"), "saml"),
+            (var("IDP_ENTITY_ID"), ADFS),
+            (var("IDP_METADATA_URL"), "https://idp.example/metadata"),
+            (var("SP_CERT_FILE"), leak(&cert)),
+        ];
+        let s = parse(&vars).unwrap();
+        let p = &s.providers[0];
+        crate::secrets::global().put(var("PRIVATE_KEY"), &key.serialize_pem()).unwrap();
+        assert_eq!(p.not_ready(), None);
+        assert_eq!(p.configured_sp_key(KeyUse::Signing).unwrap().sig_alg(), xmldsig::ECDSA_SHA384, "signs with ecdsa-sha384");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reads_the_signed_metadata_settings() {
+        use saml_sp::test_idp::{IDP, metadata, signed_metadata};
+        use xmldsig::test_signer::signers;
+        let dir = std::env::temp_dir().join(format!("superbot-md-trust-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let leak = |p: &std::path::Path| -> &'static str { Box::leak(p.to_string_lossy().into_owned().into_boxed_str()) };
+        let pem = |c: &str| format!("-----BEGIN CERTIFICATE-----\n{c}\n-----END CERTIFICATE-----\n");
+        let (anchor, rollover, junk) = (dir.join("anchor.pem"), dir.join("both.pem"), dir.join("junk.pem"));
+        std::fs::write(&anchor, pem(&signers()[1].cert)).unwrap();
+        std::fs::write(&rollover, format!("{}{}", pem(&signers()[1].cert), pem(&signers()[0].cert))).unwrap();
+        std::fs::write(&junk, pem("bm90IGEgY2VydA==")).unwrap();
+
+        let trust = |s: &Sso| match &s.providers[0].kind {
+            Kind::SamlSp { metadata_trust, .. } => metadata_trust.as_ref().map(|t| (t.certs.len(), t.require)),
+            _ => unreachable!(),
+        };
+        assert_eq!(trust(&native(&[]).unwrap()), None, "off unless a certificate is set");
+        assert_eq!(trust(&native(&[("SSO_CORP_METADATA_SIGNING_CERT_FILE", leak(&anchor))]).unwrap()), Some((1, true)), "required with a certificate");
+        assert_eq!(trust(&native(&[("SSO_CORP_METADATA_SIGNING_CERT_FILE", leak(&rollover)), ("SSO_CORP_SIGNED_METADATA", "allow")]).unwrap()), Some((2, false)), "every certificate in the file");
+        assert_eq!(trust(&native(&[("SSO_CORP_SIGNED_METADATA", "off")]).unwrap()), None);
+        let err = |extra: &[(&'static str, &'static str)]| native(extra).err().unwrap();
+        assert!(err(&[("SSO_CORP_SIGNED_METADATA", "require")]).contains("needs SSO_CORP_METADATA_SIGNING_CERT_FILE"));
+        assert!(err(&[("SSO_CORP_SIGNED_METADATA", "allow")]).contains("needs SSO_CORP_METADATA_SIGNING_CERT_FILE"));
+        assert!(err(&[("SSO_CORP_METADATA_SIGNING_CERT_FILE", leak(&anchor)), ("SSO_CORP_SIGNED_METADATA", "off")]).contains("would ignore"));
+        assert!(err(&[("SSO_CORP_METADATA_SIGNING_CERT_FILE", leak(&anchor)), ("SSO_CORP_SIGNED_METADATA", "yes")]).contains("off, allow, or require"));
+        assert!(err(&[("SSO_CORP_METADATA_SIGNING_CERT_FILE", leak(&junk))]).starts_with("SSO_CORP_METADATA_SIGNING_CERT_FILE: "));
+        assert!(err(&[("SSO_CORP_METADATA_SIGNING_CERT_FILE", "/nonexistent/anchor.pem")]).contains("/nonexistent/anchor.pem"));
+        assert!(saml(&[("SSO_ADFS_METADATA_SIGNING_CERT_FILE", leak(&anchor))]).is_err(), "the bridge reads metadata in Keycloak");
+        assert!(with_base(&[("SSO_PROVIDERS", "okta"), ("SSO_OKTA_TYPE", "oidc"), ("SSO_OKTA_ISSUER", "https://okta.example"), ("SSO_OKTA_CLIENT_ID", "x")], &[("SSO_OKTA_SIGNED_METADATA", "allow")]).is_err());
+
+        // A metadata file is checked at startup: unsigned or badly signed, botd won't start.
+        let (unsigned, signed, forged) = (dir.join("unsigned.xml"), dir.join("signed.xml"), dir.join("forged.xml"));
+        std::fs::write(&unsigned, metadata()).unwrap();
+        std::fs::write(&signed, signed_metadata(&metadata(), &signers()[1])).unwrap();
+        std::fs::write(&forged, signed_metadata(&metadata(), &signers()[0])).unwrap();
+        let file = |f: &std::path::Path, mode: &'static str| {
+            let base = [("SSO_PROVIDERS", "corp"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_CORP_TYPE", "saml"), ("SSO_CORP_IDP_ENTITY_ID", IDP)];
+            with_base(&base, &[("SSO_CORP_IDP_METADATA_FILE", leak(f)), ("SSO_CORP_METADATA_SIGNING_CERT_FILE", leak(&anchor)), ("SSO_CORP_SIGNED_METADATA", mode)])
+        };
+        assert!(file(&signed, "require").unwrap().providers[0].idp_loaded().is_some());
+        let e = file(&unsigned, "require").err().unwrap();
+        assert!(e.contains("SSO_CORP_IDP_METADATA_FILE") && e.contains("isn't signed"), "{e}");
+        assert!(file(&unsigned, "allow").is_ok());
+        assert!(file(&forged, "allow").err().unwrap().contains("bad_signature"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

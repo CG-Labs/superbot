@@ -1,5 +1,5 @@
 //! XML Encryption for native SAML (ADR 0150): decrypts the one `EncryptedAssertion` an IdP
-//! sends us with our own SP encryption key, and nothing looser.
+//! sends us, or an `EncryptedID` (ADR 0151), with our own SP encryption key, and nothing looser.
 //!
 //! It takes only what is still sound: AES-GCM for the assertion (XML Encryption 1.1), and
 //! RSA-OAEP for the key that encrypts it. AES-CBC and Triple DES are refused (the CBC padding
@@ -127,7 +127,7 @@ fn encrypted_key(k: Node) -> Result<(&'static OaepAlgorithm, Vec<u8>), Invalid> 
     Ok((alg, cipher_value(value.ok_or_else(bad)?)?))
 }
 
-/// Decrypts `encrypted` (a `saml:EncryptedAssertion`) with `key`. Its children are one
+/// Decrypts `encrypted` (a `saml:EncryptedAssertion` or `EncryptedID`) with `key`. Its children are one
 /// `EncryptedData` and, beside it or in its `KeyInfo`, the `EncryptedKey`s that carry its
 /// content key. Returns the plaintext: the serialized element, still to be checked.
 pub fn decrypt(encrypted: Node, key: &OaepPrivateDecryptingKey) -> Result<Zeroizing<Vec<u8>>, Invalid> {
@@ -279,11 +279,22 @@ pub mod test_encrypter {
         }
 
         pub fn encrypt_with(&self, assertion: &str, cert_b64: &str, content_key: &[u8]) -> String {
+            self.encrypt_element("saml:EncryptedAssertion", assertion, cert_b64, content_key)
+        }
+
+        /// `plaintext` (a serialized element) inside `element` (`saml:EncryptedID`, say), to `cert`.
+        pub fn encrypt_as(&self, element: &str, plaintext: &str, cert_b64: &str) -> String {
+            let mut content_key = vec![0u8; key_len(&self.data_alg)];
+            SystemRandom::new().fill(&mut content_key).unwrap();
+            self.encrypt_element(element, plaintext, cert_b64, &content_key)
+        }
+
+        fn encrypt_element(&self, element: &str, plaintext: &str, cert_b64: &str, content_key: &[u8]) -> String {
             let ek = self.encrypted_key(cert_b64, content_key);
-            let value = seal(content_key, assertion.as_bytes());
+            let value = seal(content_key, plaintext.as_bytes());
             let (inside, beside) = if self.key_inside { (format!(r#"<ds:KeyInfo xmlns:ds="{DSIG}">{ek}</ds:KeyInfo>"#), String::new()) } else { (String::new(), ek) };
             format!(
-                r#"<saml:EncryptedAssertion><xenc:EncryptedData xmlns:xenc="{XENC}" Type="{ELEMENT}"><xenc:EncryptionMethod Algorithm="{}"/>{inside}<xenc:CipherData><xenc:CipherValue>{value}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>{beside}</saml:EncryptedAssertion>"#,
+                r#"<{element}><xenc:EncryptedData xmlns:xenc="{XENC}" Type="{ELEMENT}"><xenc:EncryptionMethod Algorithm="{}"/>{inside}<xenc:CipherData><xenc:CipherValue>{value}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>{beside}</{element}>"#,
                 self.data_alg
             )
         }
@@ -309,7 +320,7 @@ mod tests {
     fn open(xml: &str, key: &SpKey) -> Result<String, &'static str> {
         let doc = roxmltree::Document::parse(xml).map_err(|_| "xml")?;
         let enc = doc.descendants().find(|n| n.tag_name().name() == "EncryptedAssertion").unwrap();
-        decrypt(enc, key.decrypting()).map(|p| String::from_utf8(p.to_vec()).unwrap()).map_err(|e| e.0)
+        decrypt(enc, key.decrypting().unwrap()).map(|p| String::from_utf8(p.to_vec()).unwrap()).map_err(|e| e.0)
     }
 
     fn sealed(e: &Encrypt) -> String {

@@ -20,11 +20,17 @@
 //!   ACS URL; an `AudienceRestriction` names our entity ID; `NotBefore`/`NotOnOrAfter` hold
 //!   (with `SKEW_MS`); the response's and the confirmation's `InResponseTo` are the ID of the
 //!   AuthnRequest this browser started. Unsolicited (IdP-initiated) responses are refused.
-//! - **Someone.** A NameID that isn't transient. The caller then refuses a second use of the
+//! - **Someone.** A NameID that isn't transient. With an encryption key it may be an
+//!   `EncryptedID` (ADR 0151), read only from the verified assertion, decrypted like an
+//!   assertion and holding exactly one NameID. The caller then refuses a second use of the
 //!   assertion's ID, and keeps the NameID and `SessionIndex` for single logout (`saml_slo`).
 //!
 //! With a provider's SP key (ADR 0137), AuthnRequests can be signed with the HTTP-Redirect
-//! binding's query signature, and our metadata publishes the key's certificate.
+//! binding's query signature, and our metadata publishes the key's certificate. The key may
+//! be ECDSA when it's configured (ADR 0151); generated ones are RSA.
+//!
+//! IdP metadata can be held to a signature by a configured certificate (ADR 0151): see
+//! `load_idp_metadata`.
 
 use super::jwt::Invalid;
 use super::provider::Claims;
@@ -99,20 +105,103 @@ pub(super) fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
 }
 
+/// What a provider's IdP metadata must be signed by (ADR 0151): the certificates in
+/// `SSO_<ID>_METADATA_SIGNING_CERT_FILE`, and whether unsigned metadata is refused
+/// (`SIGNED_METADATA=require`, the default with a certificate) or still taken (`allow`).
+#[derive(Clone, Debug)]
+pub struct MetadataTrust {
+    pub certs: Vec<Cert>,
+    pub require: bool,
+}
+
+/// IdP metadata that can't be used: `reason` for the audit log, `message` for the admin.
+/// `reason` is `bad_metadata` unless its signature or validity is what didn't hold.
+#[derive(Debug, PartialEq)]
+pub struct MetadataRefused {
+    pub reason: &'static str,
+    pub message: String,
+}
+
+impl MetadataRefused {
+    fn bad(message: impl Into<String>) -> MetadataRefused {
+        MetadataRefused { reason: "bad_metadata", message: message.into() }
+    }
+
+    /// Refused for its signature or validity, not for what it says: worth an audit event.
+    pub fn untrusted(&self) -> bool {
+        self.reason != "bad_metadata"
+    }
+}
+
+impl std::fmt::Display for MetadataRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// `load_idp_metadata` without a trust anchor, for tests that don't care about one.
+#[cfg(test)]
+pub fn parse_idp_metadata(xml: &str, entity_id: &str, signs_requests: bool) -> Result<IdpMetadata, String> {
+    load_idp_metadata(xml, entity_id, signs_requests, None, 0).map_err(|e| e.message)
+}
+
+/// The text of an element, all of it: a comment inside doesn't cut it short. Exclusive C14N
+/// drops comments, so in signed metadata one can be added without breaking the signature.
+fn all_text(n: Node) -> String {
+    n.descendants().filter(Node::is_text).filter_map(|t| t.text()).collect()
+}
+
+/// With `trust`, the signatures that cover `entity`: the document's (`root`) and the entity's
+/// own, when it's inside an aggregate. Each one present must verify against the anchor, and
+/// one must be present when it's required. Signed metadata past its `validUntil` is refused,
+/// so an old signed copy can't be served again once it has expired.
+fn check_signed(root: Node, entity: Node, t: &MetadataTrust, now_ms: i64) -> Result<(), MetadataRefused> {
+    let path = if root == entity { vec![root] } else { vec![root, entity] };
+    let mut signed = false;
+    for n in &path {
+        match xmldsig::verify_enveloped(*n, &t.certs) {
+            Ok(s) => signed |= s,
+            Err(Invalid(reason)) => return Err(MetadataRefused { reason, message: format!("its signature isn't by the metadata signing certificate ({reason})") }),
+        }
+    }
+    if !signed {
+        return if t.require { Err(MetadataRefused { reason: "unsigned", message: "it isn't signed, and signed metadata is required".into() }) } else { Ok(()) };
+    }
+    for n in &path {
+        if let Some(v) = n.attribute("validUntil") {
+            let until = time(v).map_err(|_| MetadataRefused::bad(format!("its validUntil ({v}) isn't a date")))?;
+            if until <= now_ms {
+                return Err(MetadataRefused { reason: "expired", message: format!("it expired at {v} (validUntil): the IdP must publish a fresh copy") });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The IdP `entity_id` in `xml` (an `EntityDescriptor`, or one inside `EntitiesDescriptor`).
 /// `signs_requests`: this provider signs its AuthnRequests (`SIGN_REQUESTS`), so an IdP that
-/// wants them signed is fine. The error says what to fix, for the admin who imported it.
-pub fn parse_idp_metadata(xml: &str, entity_id: &str, signs_requests: bool) -> Result<IdpMetadata, String> {
+/// wants them signed is fine. With `trust` (ADR 0151), only metadata signed by its
+/// certificate, and not expired at `now_ms`, is read (`check_signed`). The message says what
+/// to fix, for the admin who set it up.
+pub fn load_idp_metadata(xml: &str, entity_id: &str, signs_requests: bool, trust: Option<&MetadataTrust>, now_ms: i64) -> Result<IdpMetadata, MetadataRefused> {
     if xml.len() > MAX_METADATA {
-        return Err("the metadata is over 1 MB".into());
+        return Err(MetadataRefused::bad("the metadata is over 1 MB"));
     }
     let opt = roxmltree::ParsingOptions { allow_dtd: false, nodes_limit: 100_000, ..Default::default() };
-    let doc = roxmltree::Document::parse_with_options(xml.trim_start_matches('\u{feff}'), opt).map_err(|e| format!("the metadata isn't XML SuperBot reads (no DTDs): {e}"))?;
+    let doc = roxmltree::Document::parse_with_options(xml.trim_start_matches('\u{feff}'), opt).map_err(|e| MetadataRefused::bad(format!("the metadata isn't XML SuperBot reads (no DTDs): {e}")))?;
     let entity = doc.descendants().find(|n| is(*n, METADATA, "EntityDescriptor") && n.attribute("entityID") == Some(entity_id));
     let Some(entity) = entity else {
         let found: Vec<&str> = doc.descendants().filter(|n| is(*n, METADATA, "EntityDescriptor")).filter_map(|n| n.attribute("entityID")).take(5).collect();
-        return Err(if found.is_empty() { "no EntityDescriptor in the metadata".into() } else { format!("the metadata is for {}, not {entity_id}", found.join(", ")) });
+        return Err(MetadataRefused::bad(if found.is_empty() { "no EntityDescriptor in the metadata".into() } else { format!("the metadata is for {}, not {entity_id}", found.join(", ")) }));
     };
+    if let Some(t) = trust {
+        check_signed(doc.root_element(), entity, t, now_ms).map_err(|e| MetadataRefused { message: format!("the metadata can't be trusted: {}", e.message), ..e })?;
+    }
+    read_idp(entity, entity_id, signs_requests).map_err(MetadataRefused::bad)
+}
+
+/// What we need from the IdP's `EntityDescriptor`.
+fn read_idp(entity: Node, entity_id: &str, signs_requests: bool) -> Result<IdpMetadata, String> {
     let idp = elements(entity)
         .into_iter()
         .find(|n| is(*n, METADATA, "IDPSSODescriptor") && n.attribute("protocolSupportEnumeration").is_some_and(|p| p.split_ascii_whitespace().any(|p| p == PROTOCOL)))
@@ -133,7 +222,7 @@ pub fn parse_idp_metadata(xml: &str, entity_id: &str, signs_requests: bool) -> R
     let mut certs = Vec::new();
     for kd in elements(idp).into_iter().filter(|n| is(*n, METADATA, "KeyDescriptor") && n.attribute("use").is_none_or(|u| u == "signing")) {
         for c in kd.descendants().filter(|n| is(*n, xmldsig::DSIG, "X509Certificate")) {
-            certs.push(Cert::from_base64(c.text().unwrap_or(""))?);
+            certs.push(Cert::from_base64(&all_text(c))?);
         }
     }
     if certs.is_empty() {
@@ -220,14 +309,22 @@ pub fn sp_metadata(sp: &Sp, signing: Option<&SpSigning>, encryption: Option<&str
 
 /// One of botd's keys for a native SAML provider: the signing key (ADR 0137), which signs
 /// AuthnRequests and logout messages, or the encryption key (ADR 0150), which IdPs encrypt
-/// assertions to. Never one key for both. Its certificate is in our metadata. RSA, which
-/// every IdP takes.
+/// assertions to. Never one key for both. Its certificate is in our metadata. Generated keys
+/// are RSA, which every IdP takes; a configured signing key may be ECDSA on P-256 or P-384
+/// (ADR 0151). An encryption key must be RSA (RSA-OAEP).
 pub struct SpKey {
-    pair: aws_lc_rs::rsa::KeyPair,
-    decrypt: aws_lc_rs::rsa::OaepPrivateDecryptingKey,
+    signing: Signing,
+    /// None for an ECDSA key, which can't decrypt.
+    decrypt: Option<aws_lc_rs::rsa::OaepPrivateDecryptingKey>,
     /// The certificate, base64 DER, as metadata carries it.
     pub cert: String,
     pub info: Cert,
+}
+
+enum Signing {
+    Rsa(aws_lc_rs::rsa::KeyPair),
+    /// The key, and its SignatureMethod (ecdsa-sha256 for P-256, ecdsa-sha384 for P-384).
+    Ec(aws_lc_rs::signature::EcdsaKeyPair, &'static str),
 }
 
 impl std::fmt::Debug for SpKey {
@@ -275,15 +372,22 @@ impl SpKey {
 
     /// A kept key (PKCS #8 DER) and its certificate (base64 DER). They must match.
     pub fn from_der(pkcs8: &[u8], cert: &str) -> Result<SpKey, String> {
-        let pair = aws_lc_rs::rsa::KeyPair::from_pkcs8(pkcs8).map_err(|_| "the SP key isn't an RSA private key (PKCS #8)")?;
-        let decrypt = aws_lc_rs::rsa::PrivateDecryptingKey::from_pkcs8(pkcs8)
-            .ok()
-            .and_then(|k| aws_lc_rs::rsa::OaepPrivateDecryptingKey::new(k).ok())
-            .ok_or("the SP key isn't an RSA private key (PKCS #8)")?;
+        use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair};
+        const NOT_A_KEY: &str = "the SP key isn't an RSA or ECDSA (P-256, P-384) private key (PKCS #8)";
+        let (signing, decrypt) = if let Ok(pair) = aws_lc_rs::rsa::KeyPair::from_pkcs8(pkcs8) {
+            let decrypt = aws_lc_rs::rsa::PrivateDecryptingKey::from_pkcs8(pkcs8).ok().and_then(|k| aws_lc_rs::rsa::OaepPrivateDecryptingKey::new(k).ok()).ok_or(NOT_A_KEY)?;
+            (Signing::Rsa(pair), Some(decrypt))
+        } else if let Ok(pair) = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8) {
+            (Signing::Ec(pair, xmldsig::ECDSA_SHA256), None)
+        } else if let Ok(pair) = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, pkcs8) {
+            (Signing::Ec(pair, xmldsig::ECDSA_SHA384), None)
+        } else {
+            return Err(NOT_A_KEY.into());
+        };
         let info = Cert::from_base64(cert).map_err(|e| format!("the SP certificate: {e}"))?;
-        let key = SpKey { pair, decrypt, cert: cert.chars().filter(|c| !c.is_ascii_whitespace()).collect(), info };
+        let key = SpKey { signing, decrypt, cert: cert.chars().filter(|c| !c.is_ascii_whitespace()).collect(), info };
         let probe = b"superbot sp key check";
-        xmldsig::verify_raw(xmldsig::RSA_SHA256, probe, &key.sign(probe), std::slice::from_ref(&key.info)).map_err(|_| "the SP certificate isn't for the SP key".to_string())?;
+        xmldsig::verify_raw(key.sig_alg(), probe, &key.sign(probe), std::slice::from_ref(&key.info)).map_err(|_| "the SP certificate isn't for the SP key".to_string())?;
         Ok(key)
     }
 
@@ -294,16 +398,32 @@ impl SpKey {
         SpKey::from_der(&der, &pem_body(cert))
     }
 
-    /// RSA-SHA256 of `data` (PKCS #1 v1.5, as XML-DSig and the redirect binding use).
-    pub fn sign(&self, data: &[u8]) -> Vec<u8> {
-        let mut sig = vec![0; self.pair.public_modulus_len()];
-        self.pair.sign(&aws_lc_rs::signature::RSA_PKCS1_SHA256, &aws_lc_rs::rand::SystemRandom::new(), data, &mut sig).expect("RSA signing");
-        sig
+    /// The signature `sign` makes, as a SignatureMethod or SigAlg URI.
+    pub fn sig_alg(&self) -> &'static str {
+        match &self.signing {
+            Signing::Rsa(_) => xmldsig::RSA_SHA256,
+            Signing::Ec(_, alg) => alg,
+        }
     }
 
-    /// The key as RSA-OAEP decrypts with it, for encrypted assertions (`xmlenc`).
-    pub fn decrypting(&self) -> &aws_lc_rs::rsa::OaepPrivateDecryptingKey {
-        &self.decrypt
+    /// A signature over `data`, as XML-DSig and the redirect binding use: RSA-SHA256 (PKCS #1
+    /// v1.5), or ECDSA as `r || s`.
+    pub fn sign(&self, data: &[u8]) -> Vec<u8> {
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        match &self.signing {
+            Signing::Rsa(pair) => {
+                let mut sig = vec![0; pair.public_modulus_len()];
+                pair.sign(&aws_lc_rs::signature::RSA_PKCS1_SHA256, &rng, data, &mut sig).expect("RSA signing");
+                sig
+            }
+            Signing::Ec(pair, _) => pair.sign(&rng, data).expect("ECDSA signing").as_ref().to_vec(),
+        }
+    }
+
+    /// The key as RSA-OAEP decrypts with it, for encrypted assertions and NameIDs (`xmlenc`).
+    /// None for an ECDSA key.
+    pub fn decrypting(&self) -> Option<&aws_lc_rs::rsa::OaepPrivateDecryptingKey> {
+        self.decrypt.as_ref()
     }
 }
 
@@ -329,7 +449,7 @@ pub fn redirect_query(param: &str, xml: &str, relay: Option<&str>, key: Option<&
         q += &format!("&RelayState={}", form(r));
     }
     if let Some(k) = key {
-        q += &format!("&SigAlg={}", form(xmldsig::RSA_SHA256));
+        q += &format!("&SigAlg={}", form(k.sig_alg()));
         let sig = STANDARD.encode(k.sign(q.as_bytes()));
         q += &format!("&Signature={}", form(&sig));
     }
@@ -509,9 +629,10 @@ fn ids_under<'a>(n: Node<'a, '_>) -> impl Iterator<Item = &'a str> {
     n.descendants().flat_map(|n| n.attributes()).filter(|a| a.namespace().is_none() && a.name().eq_ignore_ascii_case("id")).map(|a| a.value())
 }
 
-/// A decrypted assertion, made a document of its own in the namespaces the
-/// `EncryptedAssertion` had in scope: it was serialized (and usually signed) in that context,
-/// so its prefixes may be declared only there. An XML declaration in front is dropped.
+/// A decrypted assertion or NameID, made a document of its own in the namespaces the
+/// `EncryptedAssertion` (or `EncryptedID`) had in scope: it was serialized (and usually
+/// signed) in that context, so its prefixes may be declared only there. An XML declaration
+/// in front is dropped.
 fn in_context(encrypted: Node, plaintext: &[u8]) -> Result<Zeroizing<String>, Refused> {
     let bad = || Refused("bad_response", None);
     let text = std::str::from_utf8(plaintext).map_err(|_| bad())?.trim_start_matches('\u{feff}');
@@ -552,6 +673,53 @@ fn decrypted_assertion<'a, 'i>(doc: &'a roxmltree::Document<'i>) -> Result<Node<
         return Err(Refused("wrapped", None));
     }
     Ok(*a)
+}
+
+/// The person a signed message names, as the IdP sent it, or as decrypted from its `EncryptedID`.
+#[derive(Debug, PartialEq)]
+pub struct NameId {
+    pub value: String,
+    pub format: Option<String>,
+    pub name_qualifier: Option<String>,
+    pub sp_name_qualifier: Option<String>,
+}
+
+/// A `saml:NameID`: only text, 1 to 255 characters, no surrounding whitespace.
+fn read_name_id(n: Node) -> Result<NameId, Refused> {
+    let value = text_of(n).filter(|v| !v.is_empty() && v.len() <= 255 && v.trim() == *v).ok_or(Refused("missing_subject", None))?;
+    Ok(NameId { value: value.to_string(), format: kept(n, "Format"), name_qualifier: kept(n, "NameQualifier"), sp_name_qualifier: kept(n, "SPNameQualifier") })
+}
+
+/// The one identifier `parent` (an assertion's `Subject`, or a `LogoutRequest`) names the
+/// person by: a `NameID`, or an `EncryptedID` decrypted with `key` (ADR 0151). `parent` must be
+/// verified already: the ciphertext is part of what the IdP signed. Two identifiers are
+/// refused as `wrapped`, an `EncryptedID` without a key as `encrypted_id`, and a `BaseID` or
+/// none as `missing_subject`.
+pub fn name_id(parent: Node, key: Option<&SpKey>) -> Result<NameId, Refused> {
+    let ids: Vec<Node> = parent.children().filter(|c| c.is_element() && c.tag_name().namespace() == Some(ASSERTION) && matches!(c.tag_name().name(), "BaseID" | "NameID" | "EncryptedID")).collect();
+    match ids.as_slice() {
+        [n] if n.tag_name().name() == "NameID" => read_name_id(*n),
+        [n] if n.tag_name().name() == "EncryptedID" => match key {
+            Some(k) => decrypted_name_id(*n, k),
+            None => Err(Refused("encrypted_id", None)),
+        },
+        [_, _, ..] => Err(Refused("wrapped", None)),
+        _ => Err(Refused("missing_subject", None)),
+    }
+}
+
+/// An `EncryptedID`'s NameID: decrypted with the same algorithms and single failure as an
+/// `EncryptedAssertion` (`xmlenc`), parsed with the same rules in the namespaces it was
+/// encrypted in, and holding exactly one `saml:NameID` with nothing beside it.
+fn decrypted_name_id(encrypted: Node, key: &SpKey) -> Result<NameId, Refused> {
+    let k = key.decrypting().ok_or(Refused("no_sp_key", None))?;
+    let plaintext = in_context(encrypted, &super::xmlenc::decrypt(encrypted, k)?)?;
+    let doc = xmldsig::parse(&plaintext)?;
+    let kids: Vec<Node> = doc.root_element().children().filter(|c| !(c.is_text() && c.text().is_some_and(|t| t.trim().is_empty()))).collect();
+    match kids.as_slice() {
+        [n] if is(*n, ASSERTION, "NameID") => read_name_id(*n),
+        _ => Err(Refused("wrapped", None)),
+    }
 }
 
 /// Checks the base64 `SAMLResponse` an IdP posted, as the module docs list.
@@ -600,7 +768,7 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
         None => found,
         Some(k) => {
             xmldsig::verify_enveloped(response, &e.idp.certs)?;
-            plaintext = in_context(found, &super::xmlenc::decrypt(found, k.decrypting())?)?;
+            plaintext = in_context(found, &super::xmlenc::decrypt(found, k.decrypting().ok_or(Refused("no_sp_key", None))?)?)?;
             inner = xmldsig::parse(&plaintext)?;
             decrypted_assertion(&inner)?
         }
@@ -706,17 +874,11 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
         return Err(bad());
     };
 
-    if subject.children().any(|c| is(c, ASSERTION, "EncryptedID")) {
-        return Err(Refused("encrypted_id", None));
-    }
-    let name_id = only(subject, ASSERTION, "NameID").ok_or(Refused("missing_subject", None))?;
-    if name_id.attribute("Format") == Some(TRANSIENT) {
+    let nid = name_id(subject, e.decrypt)?;
+    if nid.format.as_deref() == Some(TRANSIENT) {
         return Err(Refused("transient_subject", None));
     }
-    let raw = text_of(name_id).ok_or(Refused("missing_subject", None))?;
-    if raw.is_empty() || raw.len() > 255 || raw.trim() != raw {
-        return Err(Refused("missing_subject", None));
-    }
+    let raw = nid.value.as_str();
     let pick = |set: &Option<String>, defaults: &[&str]| match set {
         Some(n) => attribute(assertion, &[n.as_str()]),
         None => attribute(assertion, defaults),
@@ -724,13 +886,8 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
     let email = pick(&e.attributes.email, &EMAIL_ATTRIBUTES).filter(|m| m.len() <= 254 && crate::users::valid_email(m)).map(String::from);
     let name = pick(&e.attributes.name, &NAME_ATTRIBUTES).map(|n| crate::audit::clip(n, 100));
     let claims = Claims { issuer: e.idp.entity_id.clone(), subject: super::saml::subject(raw), tenant: None, email, name, username: None };
-    let login = SamlLogin {
-        name_id: raw.to_string(),
-        format: kept(name_id, "Format"),
-        name_qualifier: kept(name_id, "NameQualifier"),
-        sp_name_qualifier: kept(name_id, "SPNameQualifier"),
-        session_index: kept(authn, "SessionIndex"),
-    };
+    let session_index = kept(authn, "SessionIndex");
+    let login = SamlLogin { name_id: nid.value, format: nid.format, name_qualifier: nid.name_qualifier, sp_name_qualifier: nid.sp_name_qualifier, session_index };
     Ok(Checked { claims, assertion_id, until_ms: until.min(now + 24 * 3600 * 1000), login })
 }
 
@@ -739,7 +896,7 @@ pub mod test_idp {
     //! A SAML IdP for tests: metadata, and signed responses with any part changed.
 
     use super::*;
-    use crate::sso::xmldsig::test_signer::{Signer, signers};
+    use crate::sso::xmldsig::test_signer::{Signer, signer, signers};
 
     pub const IDP: &str = "https://idp.example/saml";
     pub const SSO_URL: &str = "https://idp.example/saml/sso";
@@ -757,6 +914,18 @@ pub mod test_idp {
 
     pub fn metadata() -> String {
         metadata_with(IDP, &[&signers()[0]], "")
+    }
+
+    /// Metadata whose one signing certificate is test signer `i`'s (2 and 3 are ECDSA).
+    pub fn metadata_signed_by(i: usize) -> String {
+        metadata_with(IDP, &[signer(i)], "")
+    }
+
+    /// `xml` (an EntityDescriptor or EntitiesDescriptor) with an ID on its root, signed by `s`.
+    pub fn signed_metadata(xml: &str, s: &Signer) -> String {
+        let at = xml.find("Descriptor ").expect("a descriptor") + "Descriptor ".len();
+        let with_id = format!(r#"{}ID="_md1" {}"#, &xml[..at], &xml[at..]);
+        s.sign(&with_id, "_md1")
     }
 
     pub const SLO_URL: &str = "https://idp.example/saml/slo";
@@ -794,6 +963,8 @@ pub mod test_idp {
         /// Encrypt the (signed) assertion to `encrypt_to`, a certificate from our metadata.
         pub encrypt: Option<crate::sso::xmlenc::test_encrypter::Encrypt>,
         pub encrypt_to: String,
+        /// Send the NameID as an `EncryptedID` to this certificate, inside what is signed.
+        pub encrypt_name_id_to: Option<String>,
     }
 
     impl Response {
@@ -821,6 +992,16 @@ pub mod test_idp {
                 signer: 0,
                 encrypt: None,
                 encrypt_to: String::new(),
+                encrypt_name_id_to: None,
+            }
+        }
+
+        /// The subject's NameID, or its `EncryptedID`.
+        pub fn name_id_xml(&self) -> String {
+            let plain = format!(r#"<saml:NameID Format="{}">{}</saml:NameID>"#, self.name_id_format, self.name_id);
+            match &self.encrypt_name_id_to {
+                Some(cert) => crate::sso::xmlenc::test_encrypter::Encrypt::default().encrypt_as("saml:EncryptedID", &plain, cert),
+                None => plain,
             }
         }
 
@@ -828,12 +1009,11 @@ pub mod test_idp {
             let attrs: String =
                 self.attributes.iter().map(|(k, v)| format!(r#"<saml:Attribute Name="{k}"><saml:AttributeValue xsi:type="xs:string">{v}</saml:AttributeValue></saml:Attribute>"#)).collect();
             format!(
-                r#"<saml:Assertion ID="{aid}" Version="2.0" IssueInstant="{now}"><saml:Issuer>{iss}</saml:Issuer><saml:Subject><saml:NameID Format="{fmt}">{nid}</saml:NameID><saml:SubjectConfirmation Method="{BEARER}"><saml:SubjectConfirmationData InResponseTo="{cirt}" NotOnOrAfter="{cna}" Recipient="{rcp}"/></saml:SubjectConfirmation></saml:Subject><saml:Conditions NotBefore="{nb}" NotOnOrAfter="{na}"><saml:AudienceRestriction><saml:Audience>{aud}</saml:Audience></saml:AudienceRestriction>{extra}</saml:Conditions><saml:AuthnStatement AuthnInstant="{now}" SessionIndex="{si}"><saml:AuthnContext><saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement><saml:AttributeStatement>{attrs}</saml:AttributeStatement></saml:Assertion>"#,
+                r#"<saml:Assertion ID="{aid}" Version="2.0" IssueInstant="{now}"><saml:Issuer>{iss}</saml:Issuer><saml:Subject>{nid}<saml:SubjectConfirmation Method="{BEARER}"><saml:SubjectConfirmationData InResponseTo="{cirt}" NotOnOrAfter="{cna}" Recipient="{rcp}"/></saml:SubjectConfirmation></saml:Subject><saml:Conditions NotBefore="{nb}" NotOnOrAfter="{na}"><saml:AudienceRestriction><saml:Audience>{aud}</saml:Audience></saml:AudienceRestriction>{extra}</saml:Conditions><saml:AuthnStatement AuthnInstant="{now}" SessionIndex="{si}"><saml:AuthnContext><saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement><saml:AttributeStatement>{attrs}</saml:AttributeStatement></saml:Assertion>"#,
                 aid = self.assertion_id,
                 now = instant(self.not_before + 60_000),
                 iss = self.issuer,
-                fmt = self.name_id_format,
-                nid = self.name_id,
+                nid = self.name_id_xml(),
                 cirt = self.confirm_in_response_to,
                 cna = instant(self.confirm_not_on_or_after),
                 rcp = self.recipient,
@@ -847,7 +1027,7 @@ pub mod test_idp {
 
         /// The response XML, signed as asked, with `edit` applied to the assertion first.
         pub fn xml_with(&self, edit: impl Fn(String) -> String) -> String {
-            let signer = &signers()[self.signer];
+            let signer = signer(self.signer);
             let mut assertion = self.assertion();
             if self.sign_assertion {
                 // Signed in its own document, with the namespaces it will have in place.
@@ -891,7 +1071,7 @@ pub mod test_idp {
 mod tests {
     use super::test_idp::*;
     use super::*;
-    use crate::sso::xmldsig::test_signer::signers;
+    use crate::sso::xmldsig::test_signer::{Signer, signers};
 
     const ACS: &str = "https://bot.example.com/api/auth/sso/okta/acs";
     const SP: &str = "https://bot.example.com/api/auth/sso/okta/metadata";
@@ -959,9 +1139,11 @@ mod tests {
     }
 
     #[test]
-    fn sp_keys_are_rsa_and_match_their_certificate() {
+    fn sp_keys_match_their_certificate() {
         let (key, pkcs8) = SpKey::generate("SuperBot okta").unwrap();
-        assert_eq!(key.pair.public_modulus_len(), 384, "RSA-3072");
+        assert!(matches!(&key.signing, Signing::Rsa(p) if p.public_modulus_len() == 384), "generated keys are RSA-3072");
+        assert_eq!(key.sig_alg(), xmldsig::RSA_SHA256);
+        assert!(key.decrypting().is_some());
         assert!(key.info.subject.contains("SuperBot okta"));
         assert!(key.info.not_after > chrono::Utc::now().timestamp() + 19 * 365 * 86_400);
         let again = SpKey::from_der(&pkcs8, &key.cert).unwrap();
@@ -977,7 +1159,37 @@ mod tests {
         assert!(SpKey::from_pem("not pem", &key.cert).is_err());
         assert!(SpKey::from_pem(&pem("PRIVATE KEY", &pkcs8), &other.cert).is_err());
         let ec = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        assert!(SpKey::from_pem(&ec.serialize_pem(), &key.cert).unwrap_err().contains("RSA"), "ECDSA keys aren't taken yet");
+        assert!(SpKey::from_pem(&ec.serialize_pem(), &key.cert).unwrap_err().contains("isn't for the SP key"), "an ECDSA key with an RSA certificate");
+        let ed = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        assert!(SpKey::from_pem(&ed.serialize_pem(), &key.cert).unwrap_err().contains("isn't an RSA or ECDSA"));
+    }
+
+    /// A configured ECDSA SP key: its PEM and its certificate's PEM.
+    fn ec_sp_key(alg: &'static rcgen::SignatureAlgorithm) -> (String, String) {
+        let key = rcgen::KeyPair::generate_for(alg).unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name.push(rcgen::DnType::CommonName, "SuperBot SAML SP (okta)");
+        (key.serialize_pem(), params.self_signed(&key).unwrap().pem())
+    }
+
+    #[test]
+    fn ecdsa_sp_keys_sign_with_their_curve_and_never_decrypt() {
+        for (alg, sig_alg) in [(&rcgen::PKCS_ECDSA_P256_SHA256, xmldsig::ECDSA_SHA256), (&rcgen::PKCS_ECDSA_P384_SHA384, xmldsig::ECDSA_SHA384)] {
+            let (key_pem, cert_pem) = ec_sp_key(alg);
+            let key = SpKey::from_pem(&key_pem, &cert_pem).unwrap();
+            assert_eq!(key.sig_alg(), sig_alg);
+            assert!(key.decrypting().is_none(), "IdPs encrypt with RSA-OAEP only");
+            let xml = authn_request(&Sp { entity_id: SP, acs: ACS }, REQ, SSO_URL, NOW);
+            let q = redirect_query("SAMLRequest", &xml, Some("s"), Some(&key));
+            assert!(q.contains(&format!("SigAlg={}", form(sig_alg))), "{q}");
+            let r = from_redirect(&q).unwrap();
+            assert_eq!(r.verify(std::slice::from_ref(&key.info)), Ok(true), "verifies as an IdP would");
+            let (other_pem, _) = ec_sp_key(alg);
+            assert!(SpKey::from_pem(&other_pem, &cert_pem).unwrap_err().contains("isn't for the SP key"));
+        }
+        let (p256, _) = ec_sp_key(&rcgen::PKCS_ECDSA_P256_SHA256);
+        let (_, p384_cert) = ec_sp_key(&rcgen::PKCS_ECDSA_P384_SHA384);
+        assert!(SpKey::from_pem(&p256, &p384_cert).is_err(), "a P-256 key with a P-384 certificate");
     }
 
     #[test]
@@ -1358,13 +1570,166 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_name_ids_are_refused_with_a_reason() {
-        // Signed by the IdP with an EncryptedID beside the NameID.
+    fn encrypted_name_ids_are_decrypted_with_our_key() {
+        // In a plain assertion, and in an encrypted one.
+        for encrypt_assertion in [false, true] {
+            let mut r = encrypted();
+            r.encrypt_name_id_to = Some(enc_keys()[0].cert.clone());
+            if !encrypt_assertion {
+                r.encrypt = None;
+            }
+            let c = check_enc(&r.xml(), false).unwrap();
+            assert_eq!(c.claims.subject, crate::sso::saml::subject("00u1ADA-Persistent"));
+            assert_eq!((c.login.name_id.as_str(), c.login.format.as_deref()), ("00u1ADA-Persistent", Some(PERSISTENT)), "kept for single logout, decrypted");
+        }
+        let mut r = base();
+        r.encrypt_name_id_to = Some(enc_keys()[0].cert.clone());
+        assert_eq!(reason(r.clone()), "encrypted_id", "without ENCRYPTED_ASSERTIONS there is no key to decrypt it with");
+        r.encrypt_name_id_to = Some(enc_keys()[1].cert.clone());
+        assert_eq!(enc_reason(&r.xml()), "bad_encryption", "encrypted to another key");
+        r.encrypt_name_id_to = Some(enc_keys()[0].cert.clone());
+        r.name_id_format = TRANSIENT.into();
+        assert_eq!(enc_reason(&r.xml()), "transient_subject", "the decrypted format is checked like a plain one");
+        let (ec_pem, ec_cert) = ec_sp_key(&rcgen::PKCS_ECDSA_P256_SHA256);
+        let ec = SpKey::from_pem(&ec_pem, &ec_cert).unwrap();
+        let idp = idp();
+        let attributes = Attributes::default();
+        let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: REQ, attributes: &attributes, now_ms: NOW, decrypt: Some(&ec), require_encrypted: false };
+        assert_eq!(check_response(&STANDARD.encode(r.xml()), &e).unwrap_err().0, "no_sp_key", "an ECDSA key can't decrypt");
+    }
+
+    #[test]
+    fn encrypted_name_ids_use_only_strong_algorithms_and_hold_one_name_id() {
+        let mut r = base();
+        r.encrypt_name_id_to = Some(enc_keys()[0].cert.clone());
+        let plain = format!(r#"<saml:NameID Format="{PERSISTENT}">00u1ADA-Persistent</saml:NameID>"#);
+        let with_id = |inner: &str, e: &Encrypt| {
+            let mut r = r.clone();
+            r.encrypt_name_id_to = None;
+            let xml = r.xml();
+            let id = &xml[xml.find("<saml:NameID").unwrap()..xml.find("</saml:NameID>").unwrap() + "</saml:NameID>".len()];
+            // Signed again over the swapped identifier, as the IdP would.
+            let mut unsigned = r.clone();
+            unsigned.sign_response = false;
+            unsigned.sign_assertion = false;
+            let swapped = unsigned.xml().replace(id, &e.encrypt_as("saml:EncryptedID", inner, &enc_keys()[0].cert));
+            let aid = r.assertion_id.clone();
+            crate::sso::xmldsig::test_signer::signer(0).sign(&swapped, &aid)
+        };
+        assert_eq!(enc_reason(&with_id(&plain, &Encrypt::default())), "ok");
+        let cbc = Encrypt { data_alg: crate::sso::xmlenc::AES256_CBC.into(), ..Default::default() };
+        assert_eq!(enc_reason(&with_id(&plain, &cbc)), "weak_algorithm", "AES-CBC is refused, as for assertions");
+        let v15 = Encrypt { key_alg: crate::sso::xmlenc::RSA_1_5.into(), ..Default::default() };
+        assert_eq!(enc_reason(&with_id(&plain, &v15)), "weak_key_transport", "RSA PKCS #1 v1.5 too");
+        assert_eq!(enc_reason(&with_id(&format!("{plain}{plain}"), &Encrypt::default())), "wrapped", "two NameIDs inside");
+        assert_eq!(enc_reason(&with_id(r#"<saml:BaseID xsi:type="x"/>"#, &Encrypt::default())), "wrapped", "only a NameID");
+        assert_eq!(enc_reason(&with_id("<saml:NameID> padded </saml:NameID>", &Encrypt::default())), "missing_subject");
+        let dtd = format!(r#"<!DOCTYPE x [<!ENTITY e "x">]>{plain}"#);
+        assert_ne!(enc_reason(&with_id(&dtd, &Encrypt::default())), "ok", "no DTDs in the plaintext");
+    }
+
+    #[test]
+    fn a_subject_names_the_person_once() {
         let mut r = encrypted();
+        // Signed by the IdP with an EncryptedID beside the NameID.
         r.name_id = format!(r#"x</saml:NameID><saml:EncryptedID><xenc:EncryptedData xmlns:xenc="{}"/></saml:EncryptedID><saml:NameID>y"#, crate::sso::xmlenc::XENC);
-        assert_eq!(enc_reason(&r.xml()), "encrypted_id");
+        assert_eq!(enc_reason(&r.xml()), "wrapped");
         r.encrypt = None;
-        assert_eq!(check(&r.xml()).unwrap_err().0, "encrypted_id", "plain too");
+        assert_eq!(check(&r.xml()).unwrap_err().0, "wrapped", "plain too");
+        let mut r = base();
+        r.name_id = format!(r#"x</saml:NameID><saml:NameID Format="{PERSISTENT}">y"#);
+        assert_eq!(reason(r), "wrapped", "two NameIDs");
+        let mut r = base();
+        r.name_id = "x</saml:NameID><saml:BaseID><x/></saml:BaseID><saml:NameID>y".into();
+        assert_eq!(reason(r), "wrapped");
+    }
+
+    #[test]
+    fn ecdsa_signed_responses_verify_against_ecdsa_idp_certificates() {
+        for s in [2, 3] {
+            let idp = parse_idp_metadata(&metadata_signed_by(s), IDP, false).unwrap();
+            let attributes = Attributes::default();
+            let run = |xml: &str| {
+                let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: REQ, attributes: &attributes, now_ms: NOW, decrypt: None, require_encrypted: false };
+                check_response(&STANDARD.encode(xml), &e).err().map_or("ok", |e| e.0)
+            };
+            let mut r = base();
+            r.signer = s;
+            assert_eq!(run(&r.xml()), "ok", "signer {s}");
+            r.signer = if s == 2 { 3 } else { 2 };
+            assert_eq!(run(&r.xml()), "bad_signature", "the other curve");
+            r.signer = 0;
+            assert_eq!(run(&r.xml()), "bad_signature", "an RSA key");
+            let mut r = base();
+            r.signer = s;
+            let sha1 = r.xml().replace(xmldsig::ECDSA_SHA256, "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha1").replace(xmldsig::ECDSA_SHA384, "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha1");
+            assert_eq!(run(&sha1), "weak_algorithm");
+        }
+    }
+
+    fn trust(signers: &[&Signer], require: bool) -> MetadataTrust {
+        MetadataTrust { certs: signers.iter().map(|s| s.cert()).collect(), require }
+    }
+
+    fn load(xml: &str, t: &MetadataTrust) -> Result<IdpMetadata, &'static str> {
+        load_idp_metadata(xml, IDP, false, Some(t), NOW).map_err(|e| e.reason)
+    }
+
+    #[test]
+    fn signed_metadata_is_checked_against_its_anchor() {
+        let anchor = crate::sso::xmldsig::test_signer::signer(1);
+        let required = trust(&[anchor], true);
+        let signed = signed_metadata(&metadata(), anchor);
+        let m = load(&signed, &required).unwrap();
+        assert_eq!(m.certs[0].sha256, signers()[0].cert().sha256, "the IdP's own signing key, from signed metadata");
+        assert_eq!(load(&metadata(), &required).unwrap_err(), "unsigned");
+        assert!(load(&metadata(), &trust(&[anchor], false)).is_ok(), "allow: unsigned is still taken");
+        assert_eq!(load(&signed_metadata(&metadata(), &signers()[0]), &required).unwrap_err(), "bad_signature", "signed by another key");
+        assert_eq!(load(&signed_metadata(&metadata(), &signers()[0]), &trust(&[anchor], false)).unwrap_err(), "bad_signature", "allow: a bad signature is still refused");
+        assert!(load(&signed_metadata(&metadata(), &signers()[0]), &trust(&[anchor, &signers()[0]], true)).is_ok(), "any of the anchors, for rollover");
+
+        // The signing certificate swapped after signing: refused.
+        let swapped = signed.replace(&signers()[0].cert, &signers()[1].cert);
+        assert_eq!(load(&swapped, &required).unwrap_err(), "bad_signature");
+        let moved = signed.replacen(r#"Location="https://idp.example"#, r#"Location="https://evil.example"#, 1);
+        assert_eq!(load(&moved, &required).unwrap_err(), "bad_signature", "the SSO URL changed");
+        // Comments don't change what was signed (exclusive C14N), and don't cut a certificate.
+        let c = &signers()[0].cert;
+        let commented = signed.replacen(c.as_str(), &format!("{}<!-- note -->{}", &c[..10], &c[10..]), 1);
+        assert_eq!(load(&commented, &required).unwrap().certs[0].sha256, signers()[0].cert().sha256);
+        let sha1 = signed.replace(xmldsig::RSA_SHA256, "http://www.w3.org/2000/09/xmldsig#rsa-sha1");
+        assert_eq!(load(&sha1, &required).unwrap_err(), "weak_algorithm");
+        assert_eq!(load_idp_metadata(&metadata(), IDP, false, Some(&required), NOW).unwrap_err().message, "the metadata can't be trusted: it isn't signed, and signed metadata is required");
+    }
+
+    #[test]
+    fn signed_metadata_may_be_ecdsa_and_expires() {
+        for s in [2, 3] {
+            let anchor = crate::sso::xmldsig::test_signer::signer(s);
+            assert!(load(&signed_metadata(&metadata(), anchor), &trust(&[anchor], true)).is_ok(), "signer {s}");
+        }
+        let anchor = &signers()[1];
+        let t = trust(&[anchor], true);
+        let until = |ms: i64| metadata().replacen("<md:EntityDescriptor ", &format!(r#"<md:EntityDescriptor validUntil="{}" "#, instant(ms)), 1);
+        assert!(load(&signed_metadata(&until(NOW + 1_000), anchor), &t).is_ok());
+        assert_eq!(load(&signed_metadata(&until(NOW), anchor), &t).unwrap_err(), "expired", "an old signed copy, served again");
+        assert!(load(&until(NOW - 1_000), &trust(&[anchor], false)).is_ok(), "unsigned metadata's validUntil vouches for nothing");
+        assert!(parse_idp_metadata(&until(NOW - 1_000), IDP, false).is_ok(), "nor without an anchor, as before");
+    }
+
+    #[test]
+    fn aggregates_are_trusted_by_their_own_signature_or_the_entitys() {
+        let anchor = &signers()[1];
+        let t = trust(&[anchor], true);
+        let entity = metadata().replacen(r#"<?xml version="1.0"?>"#, "", 1);
+        let other = entity.replace(IDP, "https://other.example/saml");
+        let aggregate = |inner: &str| format!(r#"<md:EntitiesDescriptor xmlns:md="{METADATA}">{other}{inner}</md:EntitiesDescriptor>"#);
+        assert!(load(&signed_metadata(&aggregate(&entity), anchor), &t).is_ok(), "the whole aggregate signed");
+        assert!(load(&aggregate(&signed_metadata(&entity, anchor)), &t).is_ok(), "only our entity signed");
+        assert_eq!(load(&aggregate(&signed_metadata(&entity, &signers()[0])), &t).unwrap_err(), "bad_signature");
+        let other_signed = format!(r#"<md:EntitiesDescriptor xmlns:md="{METADATA}">{}{entity}</md:EntitiesDescriptor>"#, signed_metadata(&other, anchor));
+        assert_eq!(load(&other_signed, &t).unwrap_err(), "unsigned", "another entity's signature vouches not for ours");
+        assert_eq!(load(&aggregate(&entity), &t).unwrap_err(), "unsigned");
     }
 
     #[test]
