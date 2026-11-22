@@ -387,7 +387,7 @@ cmd_push() {
   OFFLINE_TMP=$(mktemp -d)
   trap cleanup_offline EXIT
 
-  local dirs=() arches=() version="" listed="" dir arch b
+  local dirs=() arches=() trusted=() version="" listed="" dir arch b
   for i in "${!bundles[@]}"; do
     b=${bundles[i]}
     [[ -f "$b" ]] || die "No bundle at $b"
@@ -405,6 +405,10 @@ cmd_push() {
     fi
     version=$OFFLINE_VERSION listed=$(manifest_value "$dir/MANIFEST" images)
     dirs+=("$dir") arches+=("$arch")
+    # A bundle's superbot-oci is run only if the bundle was checked against something the
+    # operator chose: its verified signature, or a --sha256 from where it was published. A
+    # .sha256 file beside it could have been replaced with it.
+    if [[ "$OFFLINE_SIGNED" == true || -n "${sums[i]:-}" ]]; then trusted+=("$dir"); fi
   done
   local multi=false
   [[ ${#dirs[@]} -eq 1 ]] || multi=true
@@ -438,12 +442,18 @@ cmd_push() {
     names+=("$name") dests+=("$dest") indexes+=("$index")
   done
 
-  local oci tools=()
-  for dir in "${dirs[@]}"; do
+  local oci tools=() untrusted=false
+  for dir in "${trusted[@]}"; do
     [[ ! -f "$dir/bin/superbot-oci" ]] || { chmod 0755 "$dir/bin/superbot-oci"; tools+=("$dir/bin/superbot-oci"); }
   done
-  oci=$(find_oci "${tools[@]}") \
-    || die "push needs superbot-oci, which bundles with images carry in bin/ (one for this machine's arch, $(uname -m)); or set SUPERBOT_OCI to one (docs/ops/air-gapped.md#registry-mirrors)"
+  for dir in "${dirs[@]}"; do
+    if [[ -f "$dir/bin/superbot-oci" && ${#tools[@]} -eq 0 ]]; then untrusted=true; fi
+  done
+  if ! oci=$(find_oci "${tools[@]}"); then
+    [[ "$untrusted" == false ]] \
+      || die "push runs the bundle's superbot-oci only when the bundle is checked against its signature (with cosign here) or a --sha256 you give from where it was published, not just the .sha256 file beside it: give --sha256, or set SUPERBOT_OCI to a superbot-oci you trust (docs/ops/air-gapped.md#registry-mirrors)"
+    die "push needs superbot-oci, which bundles with images carry in bin/ (one for this machine's arch, $(uname -m)); or set SUPERBOT_OCI to one (docs/ops/air-gapped.md#registry-mirrors)"
+  fi
 
   # Every image's layouts are unpacked and checked by superbot-oci (with no network) before the
   # first push, so one that can't go up leaves the mirror as it was.

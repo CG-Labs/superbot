@@ -261,7 +261,10 @@ jobs:
       - name: Push the bundle's images to a mirror, with the source registry's digest
         run: |
           set -euo pipefail
-          deploy/offline-bundle.sh push "$RUNNER_TEMP/b/superbot-offline-$OLD-$(uname -m).tar.gz" --registry localhost:5001/mirror \
+          # --sha256 as an operator gives it, from where the bundle was published: a bundle's
+          # superbot-oci runs only once the bundle is checked against it or a signature.
+          b="$RUNNER_TEMP/b/superbot-offline-$OLD-$(uname -m).tar.gz"
+          deploy/offline-bundle.sh push "$b" --sha256 "$(cut -c1-64 "$b.sha256")" --registry localhost:5001/mirror \
             | tee /tmp/offline-push.log
           [[ $(skopeo inspect --raw docker://localhost:5001/mirror/superbot-offline-multi:1 | sha256sum | cut -c1-64) == "${MULTI_DIGEST#sha256:}" ]]
           grep -Fq "to localhost:5001/mirror/superbot-offline-multi:1 ($MULTI_DIGEST" /tmp/offline-push.log
@@ -285,7 +288,8 @@ jobs:
             "$registry" serve "$config" >/tmp/offline-mirror-registry.log 2>&1 &
             trap "kill $!" EXIT
             for _ in $(seq 1 30); do curl -fsS http://localhost:5002/v2/ >/dev/null 2>&1 && break; sleep 1; done
-            deploy/offline-bundle.sh push "$bundles/superbot-offline-$version-x86_64.tar.gz" "$bundles/superbot-offline-$version-aarch64.tar.gz" \
+            x86="$bundles/superbot-offline-$version-x86_64.tar.gz" arm="$bundles/superbot-offline-$version-aarch64.tar.gz"
+            deploy/offline-bundle.sh push "$x86" "$arm" --sha256 "$(cut -c1-64 "$x86.sha256")" --sha256 "$(cut -c1-64 "$arm.sha256")" \
               --registry localhost:5002/mirror 2>&1 | tee /tmp/offline-signed-push.log
             grep -Fq "to localhost:5002/mirror/superbot-offline-signed:1 ($index, the signed index for linux/amd64, linux/arm64)" /tmp/offline-signed-push.log
             manifest() { curl -fsS -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json" "http://localhost:5002/v2/mirror/superbot-offline-signed/manifests/$1"; }

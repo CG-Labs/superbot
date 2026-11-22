@@ -374,11 +374,17 @@ grep -Fq "cargo build --release --bin superbot-oci" <<<"$out" || { printf '%s\n'
 ok "untagged, digest-only or odd references, unsigned images, other arches, changed digests, and images without superbot-oci are not bundled"
 
 push() { stubbed "$DIR/offline-bundle.sh" push "$@" 2>&1; }
-out=$(push "$IB" --registry mirror.test:5000/superbot) || { printf '%s\n' "$out" >&2; fail "push failed"; }
+# One bundle, with the --sha256 an operator copies from where it was published.
+tpush() { push "$1" --sha256 "$(cut -c1-64 "$1.sha256")" "${@:2}"; }
+out=$(push "$IB" --registry mirror.test/untrusted) && fail "push ran a bundle's superbot-oci checked only against the .sha256 beside it"
+grep -Fq "only when the bundle is checked against its signature" <<<"$out" || { printf '%s\n' "$out" >&2; fail "the untrusted superbot-oci was refused for another reason"; }
+! grep -q "mirror.test/untrusted" "$REG/oci.log" 2>/dev/null || fail "the untrusted superbot-oci ran"
+out=$(SUPERBOT_OCI=$T/bin/superbot-oci push "$IB" --registry mirror.test/own) || { printf '%s\n' "$out" >&2; fail "push with SUPERBOT_OCI failed"; }
+out=$(tpush "$IB" --registry mirror.test:5000/superbot) || { printf '%s\n' "$out" >&2; fail "push failed"; }
 [[ "$(cat "$REG/refs/$(regkey mirror.test:5000/superbot/superbot:1.0.0)")" == "$(cat "$REG/blobs/${MINE#sha256:}")" ]] || fail "the mirror didn't get the bundled manifest"
 grep -Fq "SUPERBOT_IMAGE=mirror.test:5000/superbot/superbot@$MINE" <<<"$out" || { printf '%s\n' "$out" >&2; fail "push didn't print the pinned Compose setting"; }
 grep -Fqx "push mirror.test:5000/superbot/superbot:1.0.0 $MINE signatures=yes" "$REG/oci.log" || fail "push didn't hand superbot-oci the image with its signatures"
-out=$(STUB_REWRITE=push push "$IB" --registry mirror.test/changed) && fail "a push that changed the digest passed"
+out=$(STUB_REWRITE=push tpush "$IB" --registry mirror.test/changed) && fail "a push that changed the digest passed"
 grep -Fq "after the push, not the bundle's $MINE" <<<"$out" || { printf '%s\n' "$out" >&2; fail "the changed push failed for another reason"; }
 for bad in mirror "mirror.test/Upper" "https://mirror.test" "mirror.test//x" "-mirror.test"; do
   out=$(push "$IB" --registry "$bad") && fail "--registry $bad was accepted"
@@ -398,20 +404,20 @@ out=$(push "$T/iclash/$TOP.tar.gz" --registry mirror.test/clash) && fail "two im
 grep -Fq "Images a and b would both be pushed to mirror.test/clash/unsigned:1.0.0: nothing pushed" <<<"$out" || { printf '%s\n' "$out" >&2; fail "the clash was refused for another reason"; }
 [[ ! -e "$REG/refs/$(regkey mirror.test/clash/unsigned:1.0.0)" ]] || fail "an image was pushed before the clash was found"
 grep -q "is for push" <<<"$("$DIR/offline-bundle.sh" verify "$IB" --registry mirror.test 2>&1 || true)" || fail "verify took --registry"
-grep -Fq "has no signatures in its bundle" <<<"$(push "$T/iunsigned/$TOP.tar.gz" --registry mirror.test/u)" || fail "push of an unsigned image didn't warn that it has no signatures"
+grep -Fq "has no signatures in its bundle" <<<"$(tpush "$T/iunsigned/$TOP.tar.gz" --registry mirror.test/u)" || fail "push of an unsigned image didn't warn that it has no signatures"
 cp "$T/img/index.json" "$REG/refs/$(regkey reg.test/cg/later:1.0.0)"
 ibuild "$T/itwo" --image a=reg.test/cg/unsigned:1.0.0 --image b=reg.test/cg/later:1.0.0 --allow-unsigned >/dev/null 2>&1 || fail "two images didn't bundle"
-out=$(STUB_REFUSE=mirror.test/two/later:1.0.0 push "$T/itwo/$TOP.tar.gz" --registry mirror.test/two) && fail "a push with an image superbot-oci refuses passed"
+out=$(STUB_REFUSE=mirror.test/two/later:1.0.0 tpush "$T/itwo/$TOP.tar.gz" --registry mirror.test/two) && fail "a push with an image superbot-oci refuses passed"
 grep -Fq "Can't push b to mirror.test/two/later:1.0.0: nothing pushed" <<<"$out" || { printf '%s
 ' "$out" >&2; fail "the refused image was refused for another reason"; }
 [[ ! -e "$REG/refs/$(regkey mirror.test/two/unsigned:1.0.0)" ]] || fail "the first image was pushed before the second was refused"
-out=$(push "$T/itwo/$TOP.tar.gz" --registry mirror.test/two) || { printf '%s
+out=$(tpush "$T/itwo/$TOP.tar.gz" --registry mirror.test/two) || { printf '%s
 ' "$out" >&2; fail "push of two images failed"; }
 [[ -e "$REG/refs/$(regkey mirror.test/two/unsigned:1.0.0)" && -e "$REG/refs/$(regkey mirror.test/two/later:1.0.0)" ]] || fail "push of two images didn't push both"
 nooci=$(B=$IB remake nooci rm bin/superbot-oci)
-out=$(push "$nooci" --registry mirror.test) && fail "push without superbot-oci passed"
+out=$(tpush "$nooci" --registry mirror.test) && fail "push without superbot-oci passed"
 grep -q "push needs superbot-oci" <<<"$out" || { printf '%s\n' "$out" >&2; fail "push without superbot-oci didn't say why"; }
-ok "push copies images with their signatures to a mirror with the bundle's digest, checks it there, prints Compose's pinned settings, and refuses bad registries, two images on one tag, an image that can't go up (before pushing any), old bundles, and no superbot-oci"
+ok "push copies images with their signatures to a mirror with the bundle's digest, checks it there, prints Compose's pinned settings, and refuses bad registries, two images on one tag, an image that can't go up (before pushing any), old bundles, and no superbot-oci; a bundle's superbot-oci runs only once the bundle is checked against a signature or a --sha256 given"
 
 # Both arches' bundles of one release: the signed index goes up, and the tag names it.
 case $ARCH in x86_64) OTHER_ARCH=aarch64 ;; *) OTHER_ARCH=x86_64 ;; esac

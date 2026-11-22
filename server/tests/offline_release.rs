@@ -169,6 +169,7 @@ fn ci_pushes_a_bundles_images_to_a_mirror_with_their_digests() {
         r#"images/multi.digest") == "$MULTI_DIGEST" ]]"#,
         "sudo unshare --net -- deploy/offline-bundle.sh load",
         "--registry localhost:5001/mirror",
+        r#"push "$b" --sha256 "$(cut -c1-64 "$b.sha256")""#,
         r#"sha256sum | cut -c1-64) == "${MULTI_DIGEST#sha256:}" ]]"#,
     ] {
         assert!(s.contains(want), "install-offline must have `{want}`");
@@ -199,7 +200,8 @@ fn ci_puts_both_arches_signed_index_in_a_mirror_with_no_network() {
     for want in [
         "sudo ip netns exec offline bash -c",
         "the network is still up",
-        r#"push "$bundles/superbot-offline-$version-x86_64.tar.gz" "$bundles/superbot-offline-$version-aarch64.tar.gz""#,
+        r#"x86="$bundles/superbot-offline-$version-x86_64.tar.gz" arm="$bundles/superbot-offline-$version-aarch64.tar.gz""#,
+        r#"push "$x86" "$arm" --sha256 "$(cut -c1-64 "$x86.sha256")" --sha256 "$(cut -c1-64 "$arm.sha256")""#,
         "($index, the signed index for linux/amd64, linux/arm64)",
         r#""$cosign" verify "${v[@]}" localhost:5002/mirror/superbot-offline-signed:1"#,
         r#""$cosign" verify "${v[@]}" "localhost:5002/mirror/superbot-offline-signed@$d""#,
