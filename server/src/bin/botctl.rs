@@ -106,6 +106,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    Make the user (member by default) and print a
                                                    one-time sign-in code, once (default 3 days)
   botctl signup reject <id> [--reason "<text>"]    No email is sent either way
+  botctl sso saml <provider>                       Native SAML: what to enter at the IdP, and its metadata
+  botctl sso saml <provider> import [<file> | -] < metadata.xml
+                                                   Import the IdP's SAML metadata (stdin by default)
   botctl scim tokens                               SCIM tokens (never their values), and whether SCIM is on
   botctl scim token create <tenant> [--sso <provider>] [--label "<text>"]
                                                    A bearer token for an IdP's SCIM app, shown once.
@@ -1052,7 +1055,11 @@ fn setup_summary(s: &Value) -> String {
         out += &format!("  [{mark}] {}\n      {}\n", c["label"].as_str().unwrap_or_default(), c["detail"].as_str().unwrap_or_default());
     }
     for p in s["signIn"]["providers"].as_array().into_iter().flatten().filter(|p| p["ready"] != true) {
-        out += &format!("\n{} needs its secret: botctl secret set {} < file\n", p["label"].as_str().unwrap_or_default(), p["secret"].as_str().unwrap_or_default());
+        let label = p["label"].as_str().unwrap_or_default();
+        match p["secret"].as_str() {
+            Some(name) => out += &format!("\n{label} needs its secret: botctl secret set {name} < file\n"),
+            None => out += &format!("\n{label} needs its IdP metadata: botctl sso saml {} import idp-metadata.xml\n", p["id"].as_str().unwrap_or_default()),
+        }
     }
     if !p["completedAt"].is_i64() {
         out += "\nThe console's Setup tab has the commands for each step. When you're done: botctl setup done\n";
@@ -1073,6 +1080,38 @@ fn license_summary(l: &Value) -> String {
     }
     for w in l["warnings"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|w| Some(*w) != l["detail"].as_str()) {
         out += &format!("  Warning: {w}\n");
+    }
+    out
+}
+
+/// `GET /api/sso/{id}/saml`, for a terminal (ADR 0127): what the IdP admin enters, then what the IdP said.
+fn saml_summary(v: &Value) -> String {
+    let s = |k: &str| v[k].as_str().unwrap_or("-").to_string();
+    let mut out = format!(
+        "{} ({}): {}\n  SP entity ID (audience):  {}\n  ACS URL (reply URL):      {}\n  SP metadata:              {}\n  IdP entity ID:            {}\n",
+        s("label"),
+        s("provider"),
+        v["problem"].as_str().unwrap_or("ready"),
+        s("spEntityId"),
+        s("acsUrl"),
+        s("metadataUrl"),
+        s("idpEntityId"),
+    );
+    let from = v["from"].as_str().map(|f| format!(" ({f})")).unwrap_or_default();
+    out += &format!("  IdP metadata from {}{from}", s("source"));
+    let idp = &v["idp"];
+    if idp.is_null() {
+        out += ": not loaded yet.\n";
+        return out;
+    }
+    out += &format!(":\n    Sign-in URL: {}\n", idp["ssoUrl"].as_str().unwrap_or_default());
+    for c in idp["certificates"].as_array().into_iter().flatten() {
+        out += &format!(
+            "    Certificate SHA-256 {} ({}), expires {}\n",
+            c["sha256"].as_str().unwrap_or_default(),
+            c["subject"].as_str().unwrap_or_default(),
+            chrono::DateTime::from_timestamp_millis(c["notAfter"].as_i64().unwrap_or_default()).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default()
+        );
     }
     out
 }
@@ -1343,6 +1382,17 @@ fn run(args: &[String]) -> Result<String, String> {
             let res = api(Cred::Operator, "DELETE", "/api/license", None)?;
             Ok(format!("Removed.\n{}", license_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)))
         }
+        ["sso", "saml", id] => Ok(saml_summary(&serde_json::from_str(&api(Cred::Operator, "GET", &format!("/api/sso/{}/saml", encode(id)), None)?).map_err(|e| e.to_string())?)),
+        ["sso", "saml", id, "json"] => op("GET", &format!("/api/sso/{}/saml", encode(id)), None),
+        ["sso", "saml", id, "import", rest @ ..] if rest.len() <= 1 => {
+            let xml = match rest.first() {
+                None | Some(&"-") => stdin_value(std::io::stdin())?,
+                Some(path) => std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?,
+            };
+            let res = api(Cred::Operator, "PUT", &format!("/api/sso/{}/saml/idp-metadata", encode(id)), Some(json!({ "xml": xml }).to_string()))?;
+            Ok(format!("Imported.\n{}", saml_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)))
+        }
+        ["sso", ..] => Err("Usage: botctl sso saml <provider> [json] | sso saml <provider> import [<file> | -]".into()),
         ["setup", "json"] => op("GET", "/api/setup", None),
         ["setup", rest @ ..] => {
             let (method, body) = setup_request(rest)?;
@@ -1766,12 +1816,16 @@ mod tests {
                 { "id": "domain", "label": "A public address with HTTPS", "done": true, "detail": "People reach SuperBot at https://bots.example.com." },
                 { "id": "signin", "label": "Sign-in providers ready", "done": false, "detail": "Waiting for a secret: Okta." },
             ],
-            "signIn": { "providers": [{ "label": "Okta", "ready": false, "secret": "SSO_OKTA_CLIENT_SECRET" }] },
+            "signIn": { "providers": [
+                { "label": "Okta", "ready": false, "secret": "SSO_OKTA_CLIENT_SECRET" },
+                { "id": "corp", "label": "Corp SAML", "ready": false, "secret": null },
+            ] },
         });
         let out = setup_summary(&s);
         assert!(out.starts_with("Setup: 1 of 2 done (admins see the wizard"), "{out}");
         assert!(out.contains("[x] A public address with HTTPS") && out.contains("[ ] Sign-in providers ready"), "{out}");
         assert!(out.contains("botctl secret set SSO_OKTA_CLIENT_SECRET < file") && out.contains("botctl setup done"), "{out}");
+        assert!(out.contains("Corp SAML needs its IdP metadata: botctl sso saml corp import idp-metadata.xml") && !out.contains("secret set  <"));
         let done = setup_summary(&json!({ "progress": { "completedAt": 1 }, "done": 2, "total": 2, "checklist": [] }));
         assert!(done.starts_with("Setup: 2 of 2 done (finished).") && !done.contains("botctl setup done"), "{done}");
     }
@@ -1862,6 +1916,21 @@ mod tests {
         let out = approved(&res);
         assert!(out.contains("sbc_x") && out.contains("about 72 hours") && out.contains("botctl user link ada@example.com work <subject>"), "{out}");
         assert!(!approved(&json!({ "sso": [] })).contains("user link"));
+    }
+
+    #[test]
+    fn saml_summary_shows_what_to_enter_at_the_idp() {
+        let mut v = json!({
+            "provider": "corp", "label": "Corp", "problem": null, "spEntityId": "https://bots.example/api/auth/sso/corp/metadata",
+            "acsUrl": "https://bots.example/api/auth/sso/corp/acs", "metadataUrl": "https://bots.example/api/auth/sso/corp/metadata",
+            "idpEntityId": "https://idp.example/saml", "source": "botctl", "from": null, "idp": null,
+        });
+        let out = saml_summary(&v);
+        assert!(out.contains("ACS URL (reply URL):      https://bots.example/api/auth/sso/corp/acs"), "{out}");
+        assert!(out.contains("from botctl: not loaded yet."), "{out}");
+        v["idp"] = json!({ "ssoUrl": "https://idp.example/sso", "certificates": [{ "sha256": "ab:cd", "subject": "CN=idp", "notAfter": 1_900_000_000_000_i64 }] });
+        let out = saml_summary(&v);
+        assert!(out.contains("Certificate SHA-256 ab:cd (CN=idp), expires 2030-03-17"), "{out}");
     }
 
     #[test]
