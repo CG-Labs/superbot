@@ -770,15 +770,17 @@ impl App {
     /// only while it runs.
     #[cfg(test)]
     pub(crate) fn run_space(&self, bot: &Bot) -> Option<(PathBuf, HashMap<String, String>)> {
-        self.run_space_with(bot, true)
+        self.run_space_with(bot, true).ok()
     }
 
     /// `run_space`, with the owner's own secrets only if `owner_keys`: a run for someone
     /// else under isolated shared Bots gets the server-wide ones alone (ADR 0046).
-    fn run_space_with(&self, bot: &Bot, owner_keys: bool) -> Option<(PathBuf, HashMap<String, String>)> {
-        let cwd = self.workspace_for(&bot.owner_id)?;
+    /// Errs with why it won't run: an unsafe owner id, or secrets an external store
+    /// couldn't give (ADR 0125), which fail closed.
+    fn run_space_with(&self, bot: &Bot, owner_keys: bool) -> Result<(PathBuf, HashMap<String, String>), RunSpaceError> {
+        let cwd = self.workspace_for(&bot.owner_id).ok_or(RunSpaceError::Folder)?;
         let s = crate::secrets::global();
-        let keys = if owner_keys { s.harness_env_for(&bot.owner_id) } else { s.harness_env() };
+        let keys = if owner_keys { s.try_harness_env_for(&bot.owner_id) } else { s.try_harness_env() }.map_err(RunSpaceError::Secrets)?;
         let mut env: HashMap<String, String> = keys.into_iter().map(|(k, v)| (k, v.expose().to_string())).collect();
         env.extend([
             ("BOT_ID".to_string(), bot.id.clone()),
@@ -787,7 +789,7 @@ impl App {
         ]);
         let path = std::env::var("PATH").unwrap_or_default();
         env.insert("PATH".into(), format!("{}:{path}", self.cfg.bin_dir.display()));
-        Some((cwd, env))
+        Ok((cwd, env))
     }
 
     pub fn enqueue(self: &Arc<Self>, msg: Message) {
@@ -910,8 +912,15 @@ impl App {
             }
             return;
         }
-        let Some(space) = self.run_space_with(&bot, for_other.is_none()) else {
-            return cant_run("This Bot's owner id isn't a safe folder name, so it can't run.");
+        let space = match self.run_space_with(&bot, for_other.is_none()) {
+            Ok(space) => space,
+            Err(RunSpaceError::Folder) => return cant_run("This Bot's owner id isn't a safe folder name, so it can't run."),
+            Err(RunSpaceError::Secrets(e)) => {
+                crate::obs::log::log_warn!("Bot {}: not run, because its secrets couldn't be read: {e}", bot.id);
+                let ev = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Failure);
+                self.db.record(&ev.details(json!({ "reason": "secrets_unavailable", "owner": bot.owner_id, "messageId": msg.id })));
+                return cant_run("I didn't run this: the secret store can't be read right now, so I'd have no keys. Try again shortly, or ask an admin to check the server log.");
+            }
         };
         self.requesters.lock().unwrap_or_else(|e| e.into_inner()).insert(bot.id.clone(), asker);
         if isolated {
@@ -3149,4 +3158,10 @@ mod tests {
         assert_eq!(*in_account.borrow(), Some("removed"));
         assert_eq!(*on_machine.borrow(), None, "a run on the owner's machine doesn't use the account");
     }
+}
+
+/// Why `run_space_with` won't give a run its folder and environment.
+enum RunSpaceError {
+    Folder,
+    Secrets(crate::secrets::Error),
 }
