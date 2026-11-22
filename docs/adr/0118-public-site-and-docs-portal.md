@@ -57,7 +57,7 @@ Or, under a path of an existing SuperBot server, add this before the final `hand
 	}
 ```
 
-Rebuild into the same folder to update it. The build is written and checked beside the folder and replaces it only if every check passes, so a failed build leaves the published site as it was. The generator refuses to overwrite a folder it didn't make.
+Rebuild into the same folder to update it. The build is written and checked beside the folder and replaces it only if every check passes, so a failed build leaves the published site as it was. A second build into the same folder while one is running is refused, through a lock beside the folder (`.<name>.lock`) that is released when the build exits. The generator refuses to overwrite a folder it didn't make.
 
 ## Alternatives considered
 

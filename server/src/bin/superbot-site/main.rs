@@ -142,10 +142,40 @@ fn prepare(out: &Path) -> Result<(), String> {
     write(out, MARKER, b"Built by superbot-site (server/src/bin/superbot-site). Safe to delete.\n")
 }
 
-/// The folder a build is written to before it replaces `out`: beside it, so the swap is a rename.
-fn staging(out: &Path) -> Result<PathBuf, String> {
+/// Siblings of `out` that a build uses: `.<name>.<what>`, so swaps are renames on one disk.
+fn sibling(out: &Path, what: &str) -> Result<PathBuf, String> {
     let name = out.file_name().ok_or(format!("--out {} has no folder name", out.display()))?;
-    Ok(out.with_file_name(format!(".{}.building", name.to_string_lossy())))
+    Ok(out.with_file_name(format!(".{}.{what}", name.to_string_lossy())))
+}
+
+/// An exclusive lock on building into `out`, held until dropped. The kernel releases it if
+/// the process dies, so a crashed build never leaves it stuck.
+fn lock(out: &Path) -> Result<fs::File, String> {
+    use std::os::fd::AsRawFd;
+    let path = sibling(out, "lock")?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // SAFETY: flock on a descriptor this function owns; it only takes an advisory lock.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(format!("another superbot-site build into {} is running", out.display()));
+    }
+    Ok(file)
+}
+
+/// Removes staging and old folders that earlier builds into `out` left behind. Call it
+/// only while holding the lock.
+fn sweep(out: &Path) {
+    let (Some(dir), Some(name)) = (out.parent(), out.file_name()) else { return };
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    let prefixes = [format!(".{}.building-", name.to_string_lossy()), format!(".{}.old-", name.to_string_lossy())];
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let n = entry.file_name().to_string_lossy().into_owned();
+        if prefixes.iter().any(|p| n.starts_with(p)) && entry.path().join(MARKER).is_file() {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 fn docs_page(pages: &[Page], page: &Page, article: &str, repo_url: &str) -> String {
@@ -220,18 +250,34 @@ fn squash(text: &str, max: usize) -> String {
 pub fn build(args: &Args) -> Result<Summary, Vec<String>> {
     let one = |e: String| vec![e];
     replaceable(&args.out).map_err(one)?;
-    let stage = staging(&args.out).map_err(one)?;
+    let _lock = lock(&args.out).map_err(one)?;
+    sweep(&args.out);
+    let stage = sibling(&args.out, &format!("building-{}", std::process::id())).map_err(one)?;
     prepare(&stage).map_err(one)?;
     let built = build_into(args, &stage);
     if built.is_err() {
         let _ = fs::remove_dir_all(&stage);
         return built;
     }
-    if args.out.exists() {
-        fs::remove_dir_all(&args.out).map_err(|e| vec![format!("{}: {e}", args.out.display())])?;
-    }
-    fs::rename(&stage, &args.out).map_err(|e| vec![format!("{} to {}: {e}", stage.display(), args.out.display())])?;
+    swap(&stage, &args.out).map_err(one)?;
     built
+}
+
+/// Puts `stage` in place of `out` by renames, so `out` is never missing for long, and
+/// puts the old site back if the second rename fails.
+fn swap(stage: &Path, out: &Path) -> Result<(), String> {
+    let err = |e: std::io::Error| format!("{} to {}: {e}", stage.display(), out.display());
+    if !out.exists() {
+        return fs::rename(stage, out).map_err(err);
+    }
+    let old = sibling(out, &format!("old-{}", std::process::id()))?;
+    fs::rename(out, &old).map_err(|e| format!("{}: {e}", out.display()))?;
+    if let Err(e) = fs::rename(stage, out) {
+        let _ = fs::rename(&old, out);
+        return Err(err(e));
+    }
+    let _ = fs::remove_dir_all(&old);
+    Ok(())
 }
 
 fn build_into(args: &Args, dir: &Path) -> Result<Summary, Vec<String>> {
@@ -396,7 +442,20 @@ mod tests {
         assert_eq!(build(&a).unwrap_err(), ["docs/slo.md:5: gone.md (no such file)"]);
         assert!(fs::read_to_string(out.join("docs/slo.html")).unwrap().contains("sso/entra.html#setup"));
         assert!(out.join(MARKER).is_file());
-        assert!(!repo.join("target/.site.building").exists());
+        let left: Vec<String> = fs::read_dir(repo.join("target")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert!(left.iter().all(|n| n == "site" || n == ".site.lock"), "{left:?}");
+        // A build into the same folder while one is running is refused, and changes nothing.
+        let held = lock(&out).unwrap();
+        let err = build(&a).unwrap_err();
+        assert!(err[0].contains("another superbot-site build"), "{err:?}");
+        assert!(out.join("docs/slo.html").is_file());
+        drop(held);
+        // Leftovers from a build that died are cleared by the next one.
+        let stale = repo.join("target/.site.building-1");
+        prepare(&stale).unwrap();
+        fs::write(repo.join("docs/slo.md"), "# SLO\n\n## Targets\n").unwrap();
+        build(&a).unwrap_or_else(|e| panic!("{}", e.join("\n")));
+        assert!(!stale.exists());
         fs::remove_dir_all(&repo).unwrap();
     }
 
