@@ -6,8 +6,8 @@
 //! (`server/src/...`) a file that exists. The SOC 2 control mapping must also keep one
 //! row, with a status, for every criterion it claims to cover, and the readiness
 //! checklist (#50) a well-formed row for every gap the mapping lists. The legal templates
-//! (#48) must say they are drafts for legal review and not legal advice, claim no
-//! certification, and keep the provider's details as placeholders.
+//! (#48) and the DPIA template (#58) must say they are drafts for legal review and not
+//! legal advice, claim no certification, and keep the provider's details as placeholders.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -325,8 +325,8 @@ fn the_soc2_readiness_checklist_is_well_formed_and_covers_every_gap() {
     }
 }
 
-/// Legal drafts in the pack (#48) that a managed provider fills in and has reviewed.
-const LEGAL_TEMPLATES: &[&str] = &["privacy-policy-template.md", "terms-of-service-outline.md", "dpa-template.md"];
+/// Legal drafts in the pack (#48, #58) that a managed provider fills in and has reviewed.
+const LEGAL_TEMPLATES: &[&str] = &["privacy-policy-template.md", "terms-of-service-outline.md", "dpa-template.md", "dpia-template.md"];
 
 /// Lines that call something "certified" without a "not" or "no" shortly before it.
 fn certification_claims(md: &str) -> Vec<usize> {
@@ -361,11 +361,16 @@ fn the_legal_templates_are_labelled_drafts_with_placeholders() {
     }
     let dpa = fs::read_to_string(pack().join("dpa-template.md")).unwrap();
     let headings = anchors(&dpa);
-    for h in ["8-personal-data-breaches", "annex-ii-technical-and-organisational-measures", "annex-iii-subprocessors"] {
+    for h in ["8-personal-data-breaches", "annex-ii-technical-and-organisational-measures", "annex-iii-subprocessors", "annex-iv-data-residency", "iv4-model-providers"] {
         assert!(headings.contains(h), "the DPA template needs a `{h}` section");
     }
     let annex = dpa.split("## Annex III").nth(1).unwrap_or("");
     assert!(links(annex).iter().any(|(_, t)| t == "subprocessors.md"), "the DPA's subprocessor annex must link subprocessors.md");
+    let dpia = fs::read_to_string(pack().join("dpia-template.md")).unwrap();
+    let headings = anchors(&dpia);
+    for h in ["1-need-for-a-dpia", "2-the-processing", "4-necessity-and-proportionality", "5-risks", "6-measures-to-reduce-the-risks", "7-sign-off"] {
+        assert!(headings.contains(h), "the DPIA template needs a `{h}` section");
+    }
 }
 
 #[test]
