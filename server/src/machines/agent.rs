@@ -61,7 +61,7 @@ use std::net::SocketAddr;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, watch};
 use zeroize::Zeroizing;
 
@@ -1359,6 +1359,7 @@ fn work_dirs(cfg: &Config, user: Option<Ids>) -> Result<(), String> {
                 .create(&dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))?;
         }
+        sweep_tmp(&cfg.home.join(TMP), SystemTime::now());
         Ok(())
     })
     .map_err(|e| e.to_string())?
@@ -1560,14 +1561,35 @@ fn scrub(env: &mut BTreeMap<String, String>) {
 /// every user on the machine.
 const TMP: &str = ".tmp";
 
-/// `home`'s temporary folder, made as `ids` if it isn't there.
+/// How long a file in a run user's temporary folder is kept untouched before a run's
+/// start removes it: longer than any run, so a run beside it keeps its own.
+const TMP_KEEP: Duration = Duration::from_secs(24 * 3600);
+
+/// `home`'s temporary folder, made as `ids` if it isn't there, and swept.
 fn own_tmp(home: &Path, ids: Ids) -> Result<(), String> {
     let tmp = home.join(TMP);
-    let made = runas::as_user(Some(ids), || match std::fs::DirBuilder::new().mode(0o700).create(&tmp) {
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tmp.is_dir() => Ok(()),
-        r => r,
+    let made = runas::as_user(Some(ids), || {
+        let r = match std::fs::DirBuilder::new().mode(0o700).create(&tmp) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tmp.is_dir() => Ok(()),
+            r => r,
+        };
+        sweep_tmp(&tmp, SystemTime::now());
+        r
     });
     made.and_then(|r| r).map_err(|e| format!("Couldn't make {}: {e}", tmp.display()))
+}
+
+/// Removes what in `tmp` hasn't changed for `TMP_KEEP`, without following links. Run as
+/// the folder's user; what it can't remove stays.
+fn sweep_tmp(tmp: &Path, now: SystemTime) {
+    let Ok(entries) = std::fs::read_dir(tmp) else { return };
+    for e in entries.flatten() {
+        let Ok(m) = e.path().symlink_metadata() else { continue };
+        let old = m.modified().ok().and_then(|t| now.duration_since(t).ok()).is_some_and(|age| age > TMP_KEEP);
+        if old {
+            let _ = if m.is_dir() { std::fs::remove_dir_all(e.path()) } else { std::fs::remove_file(e.path()) };
+        }
+    }
 }
 
 fn ndjson(e: &impl serde::Serialize) -> Bytes {
@@ -2511,6 +2533,25 @@ mod tests {
             [("HOME", "/root"), ("PATH", "/tmp"), ("TMPDIR", "/tmp"), ("BOT_TOKEN", "t")].map(|(k, v)| (k.into(), v.into())).into();
         scrub(&mut env);
         assert_eq!(env.keys().collect::<Vec<_>>(), ["BOT_TOKEN"]);
+    }
+
+    #[test]
+    fn temporary_files_left_a_day_are_swept_and_links_not_followed() {
+        let tmp = std::env::temp_dir().join(format!("sb-agent-sweep-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("sb-agent-sweep-out-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("old-dir/inner")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), "x").unwrap();
+        std::fs::write(tmp.join("new"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, tmp.join("link")).unwrap();
+        let later = SystemTime::now() + TMP_KEEP + Duration::from_secs(60);
+        sweep_tmp(&tmp, SystemTime::now());
+        assert!(tmp.join("new").exists() && tmp.join("old-dir").exists(), "nothing a day old yet");
+        sweep_tmp(&tmp, later);
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "everything older went");
+        assert!(outside.join("keep").exists(), "a link's target stays");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]
