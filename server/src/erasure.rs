@@ -49,10 +49,7 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
         _ => return Err(bad("destroyMachine must be true or false")),
     };
     let _one = ERASING.lock().await;
-    let found = app.db.find_user_any(&key).ok_or_else(|| not_found("User"))?;
-    // The record is taken from the user list, not looked up by the request path, so no
-    // request input reaches the Stripe URLs that closing their checkout or team calls.
-    let u = app.db.users().into_iter().find(|x| x.id == found.id).ok_or_else(|| not_found("User"))?;
+    let u = app.db.find_user_any(&key).ok_or_else(|| not_found("User"))?;
     if u.erased_at.is_some() {
         return Ok(Json(json!({ "erased": true, "already": true, "pseudonym": u.erased_as, "user": users::user_view(&u) })));
     }
@@ -93,20 +90,14 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
     }
     // A checkout page still open could be paid after they're gone. The lock is checkout's
     // own, held until the erasure ends; by then they can't sign in to open another.
-    let _checkout = match a.payments.checkout() {
-        Some(co) => {
-            let guard = co.lock(&u.id).lock_owned().await;
-            match crate::billing::close_last(&app, &co.stripe, crate::billing::Payer::User(&u.id)).await {
-                crate::billing::Last::Closed => {}
-                crate::billing::Last::Paid => {
-                    return refuse(CHECKOUT_PAID, json!({}), "Their last checkout was paid; a plan is on the way. Cancel it once it starts, then erase them.".into());
-                }
-                crate::billing::Last::Unknown(e) => {
-                    crate::obs::log::log_warn!("erasure: closing {}'s last Stripe checkout: {e}", u.id);
-                    return Err(ApiError(StatusCode::BAD_GATEWAY, "Stripe couldn't say whether their open checkout was paid. Try again in a minute.".into()));
-                }
-            }
-            Some(guard)
+    let _checkout = match crate::billing::close_for_erasure(&app, &a, &u.id).await {
+        Some((guard, crate::billing::Last::Closed)) => Some(guard),
+        Some((_, crate::billing::Last::Paid)) => {
+            return refuse(CHECKOUT_PAID, json!({}), "Their last checkout was paid; a plan is on the way. Cancel it once it starts, then erase them.".into());
+        }
+        Some((_, crate::billing::Last::Unknown(e))) => {
+            crate::obs::log::log_warn!("erasure: closing {}'s last Stripe checkout: {e}", u.id);
+            return Err(ApiError(StatusCode::BAD_GATEWAY, "Stripe couldn't say whether their open checkout was paid. Try again in a minute.".into()));
         }
         None => None,
     };
