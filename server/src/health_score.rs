@@ -130,7 +130,7 @@ pub type Tally = BTreeMap<String, u64>;
 pub struct ServerBackups {
     pub off_host: bool,
     pub breach: bool,
-    /// Since the newest moment whose data is off the host.
+    /// Since the newest archive copied off the host was made; None before the first copy.
     pub age_hours: Option<i64>,
     pub rpo_hours: i64,
 }
@@ -159,8 +159,10 @@ pub struct Inputs {
     pub sso_ok: u64,
     /// Failed single sign-on attempts by reason.
     pub sso_failed: Tally,
-    pub scim_ok: u64,
-    /// Failed SCIM requests from a token, or with a revoked one, by `action:reason`.
+    /// Whether a SCIM token was used in the window.
+    pub scim_token_used: bool,
+    /// SCIM requests with a valid token that were refused or failed, by reason, and
+    /// requests with a revoked token (`revoked_token`).
     pub scim_failed: Tally,
     /// Requests with no token or an unknown one: anyone can send those, so they're only counted.
     pub scim_unauthenticated: u64,
@@ -176,7 +178,18 @@ pub struct Inputs {
     pub license: Option<License>,
 }
 
-const ACTIONS: [&str; 9] = ["bot.run_finished", "bot.run_refused", "machine.run_limited", "auth.login", "auth.login_failed", "scim.*", "approval.requested", "approval.expired", "machine.backup_failed"];
+const ACTIONS: [&str; 10] = [
+    "bot.run_finished",
+    "bot.run_refused",
+    "machine.run_limited",
+    "auth.login",
+    "auth.login_failed",
+    "scim.auth_failed",
+    "scim.request_failed",
+    "approval.requested",
+    "approval.expired",
+    "machine.backup_failed",
+];
 
 impl Inputs {
     fn add(&mut self, c: &AuditCount) {
@@ -189,9 +202,9 @@ impl Inputs {
             ("machine.run_limited", _) => self.run_limited += c.n,
             ("auth.login", "success") if sso => self.sso_ok += c.n,
             ("auth.login_failed", _) if sso => bump(&mut self.sso_failed, code),
-            ("scim.auth_failed", _) if code != "revoked" => self.scim_unauthenticated += c.n,
-            (a, "success") if a.starts_with("scim.") => self.scim_ok += c.n,
-            (a, _) if a.starts_with("scim.") => bump(&mut self.scim_failed, format!("{a}:{code}")),
+            ("scim.auth_failed", _) if code == "revoked" => bump(&mut self.scim_failed, "revoked_token".into()),
+            ("scim.auth_failed", _) => self.scim_unauthenticated += c.n,
+            ("scim.request_failed", _) => bump(&mut self.scim_failed, code),
             ("approval.requested", _) => self.approvals_requested += c.n,
             ("approval.expired", _) => self.approvals_expired += c.n,
             ("machine.backup_failed", _) => self.machine_backups_failed += c.n,
@@ -209,12 +222,13 @@ pub fn gather(app: &App, now_ms: i64, days: i64) -> Inputs {
         i.add(&c);
     }
     i.approvals_pending = app.db.approvals_pending().0;
+    i.scim_token_used = app.db.scim_tokens().iter().any(|t| t.last_used_at.is_some_and(|u| u >= from));
     i.server_backups = app.server_backups.get().map(|sb| {
         let st = crate::server_backups::status(app, sb);
         ServerBackups {
             off_host: sb.target.is_some(),
             breach: st.breach,
-            age_hours: st.covered_since.filter(|_| sb.target.is_some()).map(|c| (now_ms - c).max(0) / HOUR_MS),
+            age_hours: st.last.as_ref().map(|b| (now_ms - b.created_at).max(0) / HOUR_MS),
             rpo_hours: sb.rpo_ms / HOUR_MS,
         }
     });
@@ -302,9 +316,9 @@ fn identity(i: &Inputs) -> Judged {
     let p = percent(sso_failed, attempts);
     let facts = json!({
         "ssoAttempts": attempts, "ssoFailed": sso_failed, "ssoFailedPercent": one_place(p), "ssoReasons": top(&i.sso_failed),
-        "scimOk": i.scim_ok, "scimFailed": scim_failed, "scimReasons": top(&i.scim_failed), "scimUnauthenticated": i.scim_unauthenticated,
+        "scimTokenUsed": i.scim_token_used, "scimFailed": scim_failed, "scimReasons": top(&i.scim_failed), "scimUnauthenticated": i.scim_unauthenticated,
     });
-    let scim_used = i.scim_ok + scim_failed > 0;
+    let scim_used = i.scim_token_used || scim_failed > 0;
     if attempts == 0 && !scim_used {
         return Judged { status: Status::NotApplicable, summary: format!("No single sign-on or SCIM in the last {} days.", i.days), facts };
     }
@@ -340,7 +354,7 @@ fn backups(i: &Inputs) -> Judged {
         Some(sb) if sb.breach => worse(Status::Risk, format!("the newest server backup off the host is older than its RPO of {} hours", sb.rpo_hours)),
         Some(sb) => match sb.age_hours {
             Some(h) => worse(Status::Ok, format!("the newest server backup off the host is {h} hours old, within its RPO of {} hours", sb.rpo_hours)),
-            None => worse(Status::Ok, format!("server backups are copied off the host, with an RPO of {} hours", sb.rpo_hours)),
+            None => worse(Status::Watch, format!("no server backup has been copied off the host yet (RPO {} hours)", sb.rpo_hours)),
         },
     }
     if let Some(open) = i.machine_rpo_breaches {
@@ -493,7 +507,7 @@ mod tests {
             runs: tally(&[("done", 190), ("error", 4), ("stopped", 6)]),
             sso_ok: 100,
             sso_failed: tally(&[("not_linked", 2)]),
-            scim_ok: 40,
+            scim_token_used: true,
             approvals_requested: 50,
             approvals_expired: 2,
             server_backups: Some(ServerBackups { off_host: true, breach: false, age_hours: Some(3), rpo_hours: 26 }),
@@ -584,7 +598,7 @@ mod tests {
     #[test]
     fn identity_takes_the_worse_of_sso_and_scim() {
         let mut i = healthy();
-        i.scim_failed = tally(&[("scim.auth_failed:revoked", 3)]);
+        i.scim_failed = tally(&[("revoked_token", 3)]);
         i.scim_unauthenticated = 500;
         let r = report(&i, 0);
         assert_eq!(signal(&r, "identity")["status"], "watch", "a revoked token still in use");
@@ -592,6 +606,11 @@ mod tests {
         i.scim_failed.clear();
         let r = report(&i, 0);
         assert_eq!(signal(&r, "identity")["status"], "ok", "unauthenticated requests are anyone's");
+        i.scim_failed = tally(&[("uniqueness", 7), ("status_403", 3)]);
+        let r = report(&i, 0);
+        assert_eq!(signal(&r, "identity")["status"], "risk", "10 refused provisioning requests");
+        assert_eq!(signal(&r, "identity")["facts"]["scimReasons"][0], json!({ "code": "uniqueness", "count": 7 }));
+        i.scim_failed.clear();
         i.sso_failed = tally(&[("bad_signature", 30), ("not_linked", 4)]);
         let r = report(&i, 0);
         let s = signal(&r, "identity");
@@ -618,6 +637,10 @@ mod tests {
         assert_eq!(signal(&report(&i, 0), "backups")["summary"], "Server backups aren't set up.");
         i.server_backups = Some(ServerBackups { off_host: true, breach: true, age_hours: Some(40), rpo_hours: 26 });
         assert_eq!(signal(&report(&i, 0), "backups")["status"], "risk");
+        i.server_backups = Some(ServerBackups { off_host: true, breach: false, age_hours: None, rpo_hours: 26 });
+        let r = report(&i, 0);
+        assert_eq!(signal(&r, "backups")["status"], "watch", "copies on, none made yet");
+        assert_eq!(signal(&r, "backups")["summary"], "No server backup has been copied off the host yet (RPO 26 hours).");
     }
 
     #[test]
@@ -645,7 +668,7 @@ mod tests {
             assert_eq!(signal(&r, id)["status"], "n/a", "{id}");
         }
         let mut i = Inputs { days: 30, ..Default::default() };
-        i.server_backups = Some(ServerBackups { off_host: true, ..Default::default() });
+        i.server_backups = Some(ServerBackups { off_host: true, age_hours: Some(1), ..Default::default() });
         let r = report(&i, 0);
         assert_eq!((r["score"].as_u64(), r["band"].as_str()), (Some(100), Some("healthy")));
     }
@@ -664,6 +687,7 @@ mod tests {
             c("auth.login_failed", "failure", Some("password"), Some("bad_password"), 4),
             c("scim.auth_failed", "failure", Some("scim_token"), Some("unknown"), 6),
             c("scim.auth_failed", "failure", Some("scim_token"), Some("revoked"), 1),
+            c("scim.request_failed", "failure", Some("scim_token"), Some("uniqueness"), 2),
             c("scim.group_member_refused", "denied", Some("scim_token"), Some("other_team"), 2),
             c("scim.user_linked", "success", Some("scim_token"), None, 8),
             c("approval.requested", "success", None, None, 11),
@@ -675,8 +699,8 @@ mod tests {
         assert_eq!(i.runs, tally(&[("done", 7), ("error", 2)]));
         assert_eq!(i.refused, tally(&[("[text]", 1)]), "free-text reasons never leave");
         assert_eq!((i.sso_ok, i.sso_failed.clone()), (5, tally(&[("not_linked", 3)])), "password sign-ins aren't single sign-on");
-        assert_eq!(i.scim_failed, tally(&[("scim.auth_failed:revoked", 1), ("scim.group_member_refused:other_team", 2)]));
-        assert_eq!((i.scim_unauthenticated, i.scim_ok), (6, 8));
+        assert_eq!(i.scim_failed, tally(&[("revoked_token", 1), ("uniqueness", 2)]), "each failed request once, not its own event too");
+        assert_eq!(i.scim_unauthenticated, 6);
         assert_eq!((i.approvals_requested, i.approvals_expired, i.machine_backups_failed), (11, 4, 1));
     }
 

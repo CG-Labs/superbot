@@ -134,8 +134,31 @@ impl IntoResponse for ScimError {
         if let Some(t) = self.scim_type {
             body["scimType"] = json!(t);
         }
-        scim_json(self.status, body)
+        let mut r = scim_json(self.status, body);
+        r.extensions_mut().insert(Failed(self.scim_type));
+        r
     }
+}
+
+/// On an error response: its `scimType`, for [`request_failed`].
+#[derive(Clone, Copy)]
+struct Failed(Option<&'static str>);
+
+/// A request with a valid token that the server refused or failed: the IdP's provisioning
+/// is stuck until someone fixes it. Not a 404, which IdPs get in their normal course (a
+/// lookup, or a delete already done). The reason is the `scimType`, or the status.
+fn request_failed(app: &AppState, who: &Who, tenant: &str, method: &str, path: &str, r: &Response) {
+    let status = r.status();
+    if !(status.is_client_error() || status.is_server_error()) || status == StatusCode::NOT_FOUND {
+        return;
+    }
+    let reason = match r.extensions().get::<Failed>().and_then(|f| f.0) {
+        Some(t) => t.to_string(),
+        None => format!("status_{}", status.as_u16()),
+    };
+    let resource = path.trim_start_matches('/').split('/').find(|s| !s.is_empty() && *s != "scim" && *s != "v2").unwrap_or("");
+    let details = json!({ "tenant": tenant, "status": status.as_u16(), "reason": reason, "method": method, "resource": resource });
+    app.db.record(&who.event("scim.request_failed").outcome(Outcome::Failure).details(details));
 }
 
 type ScimRes<T = Response> = Result<T, ScimError>;
@@ -272,8 +295,11 @@ pub async fn guard(State(a): State<Arc<Auth>>, mut req: Request, next: Next) -> 
         return too_many(retry);
     }
     let who = Who { actor: actor(&a, &t), source };
-    req.extensions_mut().insert(Caller { token: t, who });
-    next.run(req).await
+    let (tenant, method, path) = (t.tenant.clone(), req.method().to_string(), req.uri().path().to_string());
+    req.extensions_mut().insert(Caller { token: t, who: who.clone() });
+    let r = next.run(req).await;
+    request_failed(&app, &who, &tenant, &method, &path, &r);
+    r
 }
 
 // Discovery (RFC 7644 section 4).

@@ -661,3 +661,25 @@ async fn deprovisioning_pauses_the_users_routines() {
     assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{}", ids[0]), on).await.0, 200);
     assert!(!app.db.routine(&routines[0]).unwrap().enabled, "an admin resumes them, not the IdP");
 }
+
+#[tokio::test]
+async fn refused_requests_are_audited_once_with_their_reason_and_lookups_arent() {
+    let (port, app, admin) = serve(|_| {}).await;
+    let (t, id) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    assert_eq!(scim(port, &t, "POST", USERS, okta_user("ada@example.com", "x1")).await.0, 201);
+    assert_eq!(scim(port, &t, "POST", USERS, okta_user("ada@example.com", "x1")).await.0, 409);
+    assert_eq!(scim(port, &t, "POST", USERS, json!([])).await.0, 400);
+    assert_eq!(scim(port, &t, "GET", &format!("{USERS}/no-such-user"), Value::Null).await.0, 404);
+    assert_eq!(scim(port, "sbp_nope", "GET", USERS, Value::Null).await.0, 401);
+    let failed = events(port, &admin, "action=scim.request_failed").await;
+    let seen: Vec<_> = failed.iter().map(|e| (e["details"]["reason"].as_str(), e["details"]["status"].as_u64(), e["details"]["method"].as_str(), e["details"]["resource"].as_str())).collect();
+    assert_eq!(seen.len(), 2, "{failed:#?}");
+    for want in [(Some("uniqueness"), Some(409), Some("POST"), Some("Users")), (Some("invalidSyntax"), Some(400), Some("POST"), Some("Users"))] {
+        assert!(seen.contains(&want), "{want:?} in {seen:?}");
+    }
+    assert!(failed.iter().all(|e| e["actorId"] == format!("scim:{id}") && e["outcome"] == "failure"), "{failed:#?}");
+    let report = crate::health_score::build(&app, db::now(), 30);
+    let identity = report["signals"].as_array().unwrap().iter().find(|s| s["id"] == "identity").unwrap();
+    assert_eq!((identity["facts"]["scimFailed"].as_u64(), identity["facts"]["scimTokenUsed"].as_bool()), (Some(2), Some(true)), "{identity:#}");
+    assert_eq!(identity["status"], "watch", "{identity:#}");
+}
