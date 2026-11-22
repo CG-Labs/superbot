@@ -692,7 +692,7 @@ Set `SUPERBOT_IMAGE` and `SUPERBOT_CADDY_IMAGE` to use images from somewhere els
 
 ### Verifying the images
 
-Every published image is signed keylessly with [cosign](https://docs.sigstore.dev/cosign/) by the `docker` workflow, under its GitHub identity, and carries SLSA build provenance and an SBOM ([ADR 0101](../docs/adr/0101-image-scanning-and-signing.md)). Images published before that are unsigned. Check an image before you run it, with cosign 3 or later:
+Every published image is signed keylessly with [cosign](https://docs.sigstore.dev/cosign/) by the `docker` workflow, under its GitHub identity, and carries SLSA build provenance and an SBOM ([ADR 0101](../docs/adr/0101-image-scanning-and-signing.md)). Images published before that are unsigned. The `staging-*` tags are the workflow's own, used to sign an image before its public tags move; don't run them. Check an image before you run it, with cosign 3 or later:
 
 ```sh
 cosign verify ghcr.io/cg-labs/superbot:main \

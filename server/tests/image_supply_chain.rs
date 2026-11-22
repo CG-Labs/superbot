@@ -178,8 +178,18 @@ fn docker_workflow_signs_and_attests_what_it_publishes() {
     assert_eq!(subjects, ["${{ env.CADDY_IMAGE }}", "${{ env.IMAGE }}"]);
     for s in &attest {
         assert_eq!(value(s, "push-to-registry"), Some("true"));
-        assert!(value(s, "subject-digest").is_some_and(|d| d.starts_with("${{ steps.tag.outputs.")));
+        assert!(value(s, "subject-digest").is_some_and(|d| d.starts_with("${{ steps.index.outputs.")));
     }
+
+    // Public tags move only once both images are signed and attested.
+    let names: Vec<String> = steps(publish).iter().map(|s| value(s, "name").unwrap_or_default().to_string()).collect();
+    let at = |name: &str| names.iter().position(|n| n == name).unwrap_or_else(|| panic!("publish has no step `{name}`"));
+    let tag = at("Tag the multi-arch images");
+    for before in ["Create the multi-arch images", "Sign the images", "Attest build provenance", "Attest build provenance (Caddy)"] {
+        assert!(at(before) < tag, "`{before}` must come before the public tags move");
+    }
+    let tagging = steps(publish)[tag].join("\n");
+    assert!(tagging.contains(r#""$image@$digest""#) && tagging.contains("not the signed"), "public tags point at the signed digest, checked");
 }
 
 #[test]
