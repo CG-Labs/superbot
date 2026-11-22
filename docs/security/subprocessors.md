@@ -35,4 +35,4 @@ SuperBot sends nothing to CG-Labs. There is no telemetry, analytics or crash rep
 
 ## Planned
 
-- A published subprocessor list for the managed service, with a privacy policy and a DPA (M4, GDPR row of the [roadmap](../ROADMAP.md)).
+- A published subprocessor list for the managed service (M4, GDPR row of the [roadmap](../ROADMAP.md)). The [DPA template](dpa-template.md#annex-iii-subprocessors)'s Annex III is built from the table above for a provider to fill in with the services it really uses, and the [privacy policy template](privacy-policy-template.md) points to it; both are drafts for legal review.
