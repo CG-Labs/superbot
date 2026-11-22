@@ -477,6 +477,7 @@ async fn an_open_team_checkout_refuses_before_the_machine_goes() {
     assert!(app.db.user_machine(&ada).is_some(), "not destroyed for an erasure that was refused");
     assert!(audit(port, &admin, "action=machine.destroy_requested").await.is_empty());
     assert!(app.db.team_member(&ada).is_some() && app.db.user(&ada).unwrap().active());
+    assert!(!crate::erasure::under_way(&ada), "her work runs as before");
 
     app.db.close_team_checkout(&team, "cs_team_1");
     let (code, v) = erase(port, &admin, &ada, r#"{"destroyMachine":true}"#).await;

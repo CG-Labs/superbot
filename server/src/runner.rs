@@ -838,6 +838,7 @@ impl App {
         let erased = |u: &str| crate::erasure::under_way(u) || self.db.user(u).is_some_and(|u| u.erased_at.is_some());
         if erased(&bot.owner_id) || named_in(msg).iter().any(|u| erased(u)) {
             self.give_back_routine(&bot, msg);
+            self.say(&bot.id, "I didn't run this: the account it was for is being erased.", true);
             return;
         }
         // A routine queued before its owner or author was disabled doesn't run (ADR 0047).

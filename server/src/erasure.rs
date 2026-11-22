@@ -104,7 +104,6 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
         app.db.record(&by.event("user.erase_refused").target("user", &u.id).details(d).outcome(Outcome::Denied));
         Err(conflict(msg))
     };
-    let _under_way = begin(&u.id);
     // Bots deleted by an erasure that stopped part way still count, so what they wrote in
     // others' chats is erased when it is retried.
     let owned = |app: &AppState| -> Vec<crate::db::Bot> { app.db.bots().into_iter().filter(|b| b.owner_id == u.id).collect() };
@@ -168,6 +167,9 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
         machine = json!({ "id": m.id, "destroyed": true });
     }
 
+    // Past every refusal: from here, no Bot becomes theirs or leaves them, and nothing
+    // starts for them, until the erasure ends.
+    let _under_way = begin(&u.id);
     let team = crate::teams::erase_member(&app, &by, &u.id, leaving).await?;
     if u.active() {
         app.db.update_user(&u.id, UserPatch { status: Some("disabled"), ..Default::default() }).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -177,8 +179,9 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
         a.sso.forget_user(&u.id);
         a.mfa.forget_user(&u.id);
     }
-    // Disabled now, so they can't make more Bots; take any made while the machine went.
+    // Marked now, so their Bots are these: any made while the machine went, none given away.
     bots = owned(&app);
+    let mut bot_ids = app.db.erasing_bots(&u.id);
     add_new(&mut bot_ids, &bots);
     let held = app.db.erasure_holds(&u.id, &bot_ids);
     if !held.is_empty() {
