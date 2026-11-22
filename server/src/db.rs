@@ -70,6 +70,21 @@ pub struct Message {
     pub requested_by: Option<audit::Who>,
 }
 
+/// A Bot whose chat is kept out of retention (ADR 0097).
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetentionHold {
+    pub bot_id: String,
+    pub reason: String,
+    /// The admin's user id.
+    pub held_by: Option<String>,
+    pub held_at: i64,
+}
+
+fn retention_hold_row(r: &rusqlite::Row) -> rusqlite::Result<RetentionHold> {
+    Ok(RetentionHold { bot_id: r.get("bot_id")?, reason: r.get("reason")?, held_by: r.get("held_by")?, held_at: r.get("held_at")? })
+}
+
 #[derive(Clone, Serialize)]
 pub struct Routine {
     pub id: String,
@@ -1502,7 +1517,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 40] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 41] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1543,7 +1558,23 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 40] = [
     migrate_team_billing,
     migrate_mfa,
     migrate_scim_groups,
+    migrate_chat_retention,
 ];
+
+/// Chat retention (ADR 0097): Bots whose chat an admin holds out of retention, for a legal
+/// hold or any other reason, and an index so the deletion job finds old messages by age.
+/// A held Bot can't be deleted, so the hold goes only when an admin releases it.
+fn migrate_chat_retention(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS retention_holds (
+          bot_id TEXT PRIMARY KEY REFERENCES bots(id) ON DELETE CASCADE,
+          reason TEXT NOT NULL,
+          held_by TEXT,
+          held_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS messages_created ON messages(created_at);",
+    )
+}
 
 /// SCIM groups as teams (ADR 0095): which team each of a tenant's groups is. A team is
 /// one tenant's group at most. `origin` says who made the link: a SCIM `POST` that made
@@ -3354,6 +3385,90 @@ impl Db {
         let c = self.c();
         let mut s = c.prepare("SELECT * FROM messages WHERE status IN ('queued', 'running') ORDER BY id").unwrap();
         s.query_map([], message_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    // Chat retention (ADR 0097)
+
+    /// Days of chat history to keep, as last saved. None = forever.
+    pub fn chat_retention(&self) -> Option<u32> {
+        self.setting("chat_retention_days").and_then(|s| s.parse().ok()).filter(|d| *d > 0)
+    }
+
+    pub fn set_chat_retention(&self, days: Option<u32>) {
+        match days {
+            Some(d) => self.set_setting("chat_retention_days", &d.to_string()),
+            None => {
+                self.c().execute("DELETE FROM settings WHERE key = 'chat_retention_days'", []).unwrap();
+            }
+        }
+    }
+
+    /// Deletes up to `limit` of the oldest messages written before `cutoff` (unix ms), and
+    /// returns how many went. Never a message whose run is queued or running, nor one in or
+    /// from a held Bot's chat.
+    pub fn prune_chat_batch(&self, cutoff: i64, limit: u32) -> rusqlite::Result<usize> {
+        self.c().execute(
+            "DELETE FROM messages WHERE id IN (
+               SELECT id FROM messages
+                WHERE created_at < ?1
+                  AND (status IS NULL OR status NOT IN ('queued', 'running'))
+                  AND bot_id NOT IN (SELECT bot_id FROM retention_holds)
+                  AND (from_bot IS NULL OR from_bot NOT IN (SELECT bot_id FROM retention_holds))
+                ORDER BY created_at, id LIMIT ?2)",
+            params![cutoff, limit],
+        )
+    }
+
+    pub fn retention_holds(&self) -> Vec<RetentionHold> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM retention_holds ORDER BY held_at, bot_id").unwrap();
+        s.query_map([], retention_hold_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn retention_hold(&self, bot_id: &str) -> Option<RetentionHold> {
+        self.c().query_row("SELECT * FROM retention_holds WHERE bot_id = ?", [bot_id], retention_hold_row).optional().ok().flatten()
+    }
+
+    /// Holds the Bot's chat, or changes the reason of its hold. Keeps who held it first and when.
+    pub fn put_retention_hold(&self, bot_id: &str, reason: &str, by: Option<&str>) -> RetentionHold {
+        self.c()
+            .execute(
+                "INSERT INTO retention_holds (bot_id, reason, held_by, held_at) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(bot_id) DO UPDATE SET reason = ?2",
+                params![bot_id, reason, by, now()],
+            )
+            .unwrap();
+        self.retention_hold(bot_id).unwrap()
+    }
+
+    /// Whether there was a hold to release.
+    pub fn delete_retention_hold(&self, bot_id: &str) -> bool {
+        self.c().execute("DELETE FROM retention_holds WHERE bot_id = ?", [bot_id]).unwrap() > 0
+    }
+
+    /// `n` plain messages in the Bot's chat, written at `at`, in one transaction.
+    #[cfg(test)]
+    pub fn add_messages_at(&self, bot_id: &str, n: usize, at: i64, from_bot: Option<&str>) {
+        let mut c = self.c();
+        let tx = c.transaction().unwrap();
+        for i in 0..n {
+            tx.execute(
+                "INSERT INTO messages (bot_id, role, text, from_bot, created_at) VALUES (?1, 'user', ?2, ?3, ?4)",
+                params![bot_id, format!("old {i}"), from_bot, at],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    #[cfg(test)]
+    pub fn set_message_time(&self, id: i64, at: i64) {
+        self.c().execute("UPDATE messages SET created_at = ?1 WHERE id = ?2", params![at, id]).unwrap();
+    }
+
+    #[cfg(test)]
+    pub fn message_count(&self, bot_id: &str) -> i64 {
+        self.c().query_row("SELECT COUNT(*) FROM messages WHERE bot_id = ?", [bot_id], |r| r.get(0)).unwrap()
     }
 
     // Routines
@@ -7744,6 +7859,31 @@ mod tests {
         assert_eq!(all_events(&db).len(), 2);
         let e = &all_events(&db)[0];
         assert_eq!((e.actor_kind.as_str(), e.actor_id.as_deref(), e.target_id.as_deref()), ("user", Some("operator"), Some("global")));
+    }
+
+    #[test]
+    fn chat_pruning_takes_the_oldest_first_and_holds_go_with_their_bot() {
+        let db = Db::open(&temp_path("chat-retention").join("app.sqlite")).unwrap();
+        let day = 86_400_000;
+        let bot = db.create_bot("Ada", "#fff", "waddle", "claude", None, false);
+        db.add_messages_at(&bot.id, 3, now() - 50 * day, None);
+        db.add_messages_at(&bot.id, 2, now() - 40 * day, None);
+        let cutoff = now() - 30 * day;
+        assert_eq!(db.prune_chat_batch(cutoff, 4).unwrap(), 4, "a batch never goes past its limit");
+        let left = db.messages(&bot.id, 10);
+        assert_eq!((left.len(), left[0].created_at < now() - 39 * day), (1, true), "the oldest went first");
+        assert_eq!(db.prune_chat_batch(cutoff, 4).unwrap(), 1);
+        assert_eq!(db.prune_chat_batch(cutoff, 4).unwrap(), 0);
+
+        db.set_chat_retention(Some(90));
+        assert_eq!(db.chat_retention(), Some(90));
+        db.set_chat_retention(None);
+        assert_eq!(db.chat_retention(), None);
+
+        db.put_retention_hold(&bot.id, "hold", Some("u1"));
+        assert_eq!(db.retention_holds().len(), 1);
+        db.delete_bot(&bot.id);
+        assert!(db.retention_holds().is_empty(), "a Bot deleted under the database's feet takes its hold");
     }
 
     #[test]
