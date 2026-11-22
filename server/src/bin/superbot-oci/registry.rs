@@ -18,8 +18,9 @@ const ACCEPT_MANIFESTS: &str = "application/vnd.oci.image.index.v1+json, applica
 const MAX_MANIFEST: usize = 4 << 20;
 /// Token service replies and error bodies.
 const MAX_SMALL: usize = 64 << 10;
-/// Referrers a registry may list for one subject, over all its pages.
+/// Referrers a registry may list for one subject, over all its pages, and the pages.
 const MAX_REFERRERS: usize = 1000;
+const MAX_PAGES: usize = 100;
 
 /// A repository: `HOST[:PORT]/PATH`. The host has a dot or a port, or is localhost.
 #[derive(Clone, Debug, PartialEq)]
@@ -319,8 +320,15 @@ impl Client {
         let what = format!("{}'s referrers for {digest}", self.repo);
         let mut url = self.url(&format!("referrers/{digest}"));
         let mut all = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         let mut first = true;
         loop {
+            if !seen.insert(url.clone()) {
+                return Err(format!("{what} link back to a page already read: refusing them"));
+            }
+            if seen.len() > MAX_PAGES {
+                return Err(format!("{what} run over more than {MAX_PAGES} pages: refusing them"));
+            }
             let res = self.send(Method::GET, &url, &[(ACCEPT, OCI_INDEX.into())], &Body::Empty).await?;
             if first && matches!(res.status(), StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::BAD_REQUEST) {
                 return Ok(None);

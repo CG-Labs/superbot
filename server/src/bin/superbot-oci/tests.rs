@@ -43,6 +43,8 @@ struct Mode {
     upload_elsewhere: bool,
     /// Manifests come back larger than a manifest can be.
     huge: bool,
+    /// Referrers pages are empty and link to themselves.
+    page_loop: bool,
 }
 
 struct Fake {
@@ -177,6 +179,10 @@ async fn handle(State(f): State<Arc<Fake>>, method: Method, uri: Uri, headers: H
     if let Some((repo, digest)) = rest.rsplit_once("/referrers/") {
         if !f.mode.referrers_api {
             return reply(StatusCode::NOT_FOUND, &[], b"404 page not found".to_vec());
+        }
+        if f.mode.page_loop {
+            let h = [("content-type", OCI_INDEX.to_string()), ("link", format!("</v2/{repo}/referrers/{digest}?from=0>; rel=\"next\""))];
+            return reply(StatusCode::OK, &h, json!({ "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": [] }).to_string().into_bytes());
         }
         let all = s.referrers(repo, digest);
         let (from, n) = match f.mode.paged {
@@ -562,6 +568,10 @@ async fn fetch_follows_every_page_of_referrers_from_the_registry_alone() {
     let p = publish(&src, false);
     let e = fetch::fetch(&cfg_for(&src), &repo(&src, REPO), &p.index, &p.arm64, &tmp("paged").join("o")).await.unwrap_err();
     assert!(e.contains("continue on http://localhost:") && e.contains("refusing it"), "{e}");
+    let src = serve(Mode { referrers_api: true, page_loop: true, ..Mode::default() }).await;
+    let p = publish(&src, false);
+    let e = fetch::fetch(&cfg_for(&src), &repo(&src, REPO), &p.index, &p.arm64, &tmp("paged").join("o")).await.unwrap_err();
+    assert!(e.contains("link back to a page already read"), "empty pages that link to themselves end: {e}");
 }
 
 fn cfg_for(f: &Fake) -> Settings {

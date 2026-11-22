@@ -35,7 +35,7 @@ A new binary, `server/src/bin/superbot-oci`, built from the workspace with the H
 
 1. The index cosign just checked must list `DIGEST`. It goes in, with the attestation manifests that index has for `DIGEST`, and not the other arch's.
 2. Then, breadth first from the index, the image and its attestation manifests: each subject's referrers, from the referrers API and the fallback tag (both, merged, since a registry can gain the API after some referrers went into the tag). Each is checked against its digest and must name that subject. Its own referrers are followed too (a signature on an attestation). Cosign's older `.sig`, `.att` and `.sbom` tags are copied as tags.
-3. Every manifest and blob is checked against its digest as it is downloaded. More than 1,000 manifests, a manifest over 4 MiB or a blob over 1 GiB is refused. Bodies are read in chunks and refused when they pass the limit, so an oversized reply is never read whole. Every page of a referrers list is read (its `Link: <...>; rel="next"`), up to 1,000 entries. A page on any host but the registry's own is refused.
+3. Every manifest and blob is checked against its digest as it is downloaded. More than 1,000 manifests, a manifest over 4 MiB or a blob over 1 GiB is refused. Bodies are read in chunks and refused when they pass the limit, so an oversized reply is never read whole. Every page of a referrers list is read (its `Link: <...>; rel="next"`), up to 1,000 entries and 100 pages, and a link back to a page already read is refused. A page on any host but the registry's own is refused.
 
 Each `index.json` entry says what it is in an annotation, `dev.superbot.oci.role`: `index`, `attestation`, `referrer` or `tag` (named by `org.opencontainers.image.ref.name`).
 
