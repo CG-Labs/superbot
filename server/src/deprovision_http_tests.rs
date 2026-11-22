@@ -113,7 +113,7 @@ pub(crate) async fn until(what: &str, f: impl Fn() -> bool) {
     panic!("{what}");
 }
 
-async fn send(port: u16, who: &str, bot: &str, text: &str) {
+pub(crate) async fn send(port: u16, who: &str, bot: &str, text: &str) {
     let (code, res) = call(port, "POST", &format!("/api/bots/{bot}/messages"), who, &json!({ "text": text }).to_string()).await;
     assert_eq!(code, 202, "{res}");
 }

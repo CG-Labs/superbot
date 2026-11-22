@@ -1800,8 +1800,6 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
     let bot_owner = bot.as_deref().and_then(|id| app.db.bot_owner(id));
     let bot_for = c.bot_for.filter(|_| bot.is_some());
     let bot_token = c.bot_token.filter(|_| bot.is_some());
-    // A service token scoped without `review` gets no approvals here either (ADR 0143).
-    let mut review = c.service.as_ref().is_none_or(|s| s.scope.has(Perm::Review));
     let service = c.service.map(|s| s.token);
     // The stream outlives the request that opened it, so it closes within seconds of
     // its session being revoked, expiring, or its user being disabled, and follows
@@ -1826,7 +1824,11 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     };
                     let Some(mut data) = filter.apply(&app.db, &data) else { continue };
-                    if !review && serde_json::from_str::<Value>(&data).is_ok_and(|v| v["type"] == "approval") {
+                    // Approvals carry commands and inputs: a token sees them only while it may review.
+                    if let Some(t) = service.as_deref()
+                        && serde_json::from_str::<Value>(&data).is_ok_and(|v| v["type"] == "approval")
+                        && !service_accounts::recheck(&app, t, db::now()).is_some_and(|sc| sc.can(Perm::Review))
+                    {
                         continue;
                     }
                     // Admins (people, not their Bots) see each Bot's model and route, as in `bot_view_for`.
@@ -1855,9 +1857,7 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
                             _ => break,
                         }
                     } else if let Some(t) = service.as_deref() {
-                        let Some(sc) = service_accounts::recheck(&app, t, db::now()).filter(|sc| sc.can(Perm::Read)) else { break };
-                        review = sc.scoped(Perm::Review);
-                        match sc.user {
+                        match service_accounts::recheck(&app, t, db::now()).filter(|sc| sc.can(Perm::Read)).and_then(|sc| sc.user) {
                             Some(u) => Viewer::User { id: u.id, role: u.role },
                             None => break,
                         }

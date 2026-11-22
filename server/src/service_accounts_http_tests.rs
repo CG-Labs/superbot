@@ -467,13 +467,6 @@ async fn scopes_hold_inside_routes_and_live_streams_end_with_their_token() {
     let (code, st) = json_call(port, "GET", "/api/state", &read, "").await;
     assert_eq!((code, st["approvals"].clone()), (200, json!([])), "{st}");
     assert_eq!(call(port, "GET", "/api/approvals", &read, "").await.0, 403);
-    let (mut full, mut narrow) = (stream(port, &all).await, stream(port, &read).await);
-    let pending = app.db.add_approval(&bot.id, "claude", "Bash", "shell", "rm -rf build", &json!({ "command": "rm -rf build" }), "destructive", "Deletes", db::now() + 60_000);
-    app.push_approval(&pending);
-    app.send(json!({ "type": "probe", "botId": bot.id, "n": "after-approval" }));
-    assert!(read_until(&mut full, "after-approval").await.contains(&pending.id), "a token with review streams approvals");
-    let got = read_until(&mut narrow, "after-approval").await;
-    assert!(!got.contains(&pending.id) && !got.contains("rm -rf"), "the live stream sent an approval to a read token: {got}");
 
     // A stream ends once its token would be refused: revoked, the account disabled, the
     // owner disabled, or the owner no longer able to read.
@@ -551,49 +544,74 @@ async fn a_team_service_account_shares_bots_only_within_its_team() {
 }
 
 #[tokio::test]
-async fn a_service_accounts_work_stops_when_it_or_its_owner_goes() {
-    use crate::deprovision_http_tests::{held_claude, run_token, until};
+async fn a_read_token_never_streams_approvals() {
+    let (port, app, admin, _) = serve_app().await;
+    let sa = account(port, &admin, json!({ "name": "Watcher", "role": "member" })).await;
+    let bot = app.db.create_bot_owned("Ops", "#fff", "waddle", "claude", None, false, users::OPERATOR, Visibility::Shared).id;
+    let (all, _) = token(port, &admin, &sa, json!({})).await;
+    let (read, _) = token(port, &admin, &sa, json!({ "scopes": ["read"] })).await;
+    let (mut full, mut quiet) = (stream(port, &all).await, stream(port, &read).await);
+    app.send(json!({ "type": "approval", "approval": { "id": "ap1", "botId": bot, "input": { "command": "secret-cmd" } } }));
+    app.send(json!({ "type": "probe", "botId": bot, "n": "after-approval" }));
+    assert!(read_until(&mut full, "after-approval").await.contains("secret-cmd"), "a token with review sees approvals");
+    let got = read_until(&mut quiet, "after-approval").await;
+    assert!(!got.contains("secret-cmd"), "a read token streamed an approval: {got}");
+}
+
+#[tokio::test]
+async fn disabling_or_deleting_a_service_account_stops_its_runs() {
+    use crate::deprovision_http_tests::{held_claude, run_token, send, until};
     let (port, app, admin, _) = serve_app().await;
     let env = held_claude(&app);
     let desk = app.db.create_bot_owned("Desk", "#fff", "waddle", "claude", None, false, users::OPERATOR, Visibility::Shared).id;
-    let ask = |tok: String| {
-        let path = format!("/api/bots/{desk}/messages");
-        async move { assert_eq!(call(port, "POST", &path, &tok, r#"{"text":"go"}"#).await.0, 202) }
-    };
-
-    // Disabled, or deleted, its run on someone else's Bot stops.
     let sa = account(port, &admin, json!({ "name": "Runner", "role": "member" })).await;
     let (tok, _) = token(port, &admin, &sa, json!({})).await;
-    ask(tok.clone()).await;
+    let path = format!("/api/service-accounts/{sa}");
+
+    send(port, &tok, &desk, "for the script").await;
     run_token(&env).await;
-    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, r#"{"status":"disabled"}"#).await.0, 200);
-    until("its run went on after it was disabled", || !app.busy(&desk)).await;
+    assert_eq!(call(port, "PATCH", &path, &admin, r#"{"status":"disabled"}"#).await.0, 200);
+    until("its run on someone else's Bot went on after it was disabled", || !app.busy(&desk)).await;
     assert_eq!(events(port, &admin, "service_account.disabled").await[0]["details"]["runsStopped"], json!([desk]));
-    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, r#"{"status":"active"}"#).await.0, 200);
-    ask(tok).await;
+
+    assert_eq!(call(port, "PATCH", &path, &admin, r#"{"status":"active"}"#).await.0, 200);
+    send(port, &tok, &desk, "again").await;
     run_token(&env).await;
-    assert_eq!(call(port, "DELETE", &format!("/api/service-accounts/{sa}"), &admin, "").await.0, 200);
+    assert_eq!(call(port, "DELETE", &path, &admin, "").await.0, 200);
     until("its run went on after it was deleted", || !app.busy(&desk)).await;
     assert_eq!(events(port, &admin, "service_account.deleted").await[0]["details"]["runsStopped"], json!([desk]));
+}
 
-    // Its owner disabled, its run stops, and a routine it wrote is refused when it fires.
-    let (ana, ana_auth) = user_with(port, &admin, "ana@example.com", "member").await;
-    let helpdesk = role(port, &admin, "Helpdesk", "member", &["users.manage"]).await;
-    assert_eq!(call(port, "PUT", &format!("/api/roles/{helpdesk}/users/{ana}"), &admin, "").await.0, 200);
-    let hers = account(port, &ana_auth, json!({ "name": "Ana's", "role": "member" })).await;
-    let (tok, _) = token(port, &ana_auth, &hers, json!({})).await;
-    let body = json!({ "name": "Nightly", "cron": "0 9 * * *", "instruction": "report" }).to_string();
-    let (code, r) = json_call(port, "POST", &format!("/api/bots/{desk}/routines"), &tok, &body).await;
-    assert_eq!(code, 201, "{r}");
-    let nightly = r["id"].as_str().unwrap().to_string();
-    ask(tok).await;
+#[tokio::test]
+async fn scheduled_work_stops_with_the_owner() {
+    let (port, app, admin, _) = serve_app().await;
+    let (ana, _) = user_with(port, &admin, "ana@example.com", "member").await;
+    let hers = account(port, &admin, json!({ "name": "Nightly", "role": "member" })).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{hers}"), &admin, &body_owner(&ana)).await.0, 200);
+    assert_eq!(handover::blocked(&app.db, users::OPERATOR, Some(&hers)), None);
+    // Its routines on someone else's Bot are refused once its owner is off, as its tokens are.
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{ana}"), &admin, r#"{"status":"disabled"}"#).await.0, 200);
+    assert_eq!(handover::blocked(&app.db, users::OPERATOR, Some(&hers)), Some((handover::AUTHOR_DISABLED, hers.clone())));
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{ana}"), &admin, r#"{"status":"active"}"#).await.0, 200);
+    assert_eq!(handover::blocked(&app.db, users::OPERATOR, Some(&hers)), None);
+    assert_eq!(call(port, "DELETE", &format!("/api/service-accounts/{hers}"), &admin, "").await.0, 200);
+    assert_eq!(handover::blocked(&app.db, users::OPERATOR, Some(&hers)), Some((handover::AUTHOR_DISABLED, hers)));
+}
+
+#[tokio::test]
+async fn disabling_its_owner_stops_its_runs() {
+    use crate::deprovision_http_tests::{held_claude, run_token, send, until};
+    let (port, app, admin, _) = serve_app().await;
+    let env = held_claude(&app);
+    let desk = app.db.create_bot_owned("Desk", "#fff", "waddle", "claude", None, false, users::OPERATOR, Visibility::Shared).id;
+    let (ana, _) = user_with(port, &admin, "ana@example.com", "member").await;
+    let hers = account(port, &admin, json!({ "name": "Ana's", "role": "member" })).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{hers}"), &admin, &body_owner(&ana)).await.0, 200);
+    let (tok, _) = token(port, &admin, &hers, json!({})).await;
+
+    send(port, &tok, &desk, "for the script").await;
     run_token(&env).await;
     assert_eq!(call(port, "PATCH", &format!("/api/users/{ana}"), &admin, r#"{"status":"disabled"}"#).await.0, 200);
     until("its run went on after its owner was disabled", || !app.busy(&desk)).await;
     assert_eq!(events(port, &admin, "user.deprovisioned").await[0]["details"]["runsForThemStopped"], json!([desk]));
-    let before = app.db.last_id();
-    cron::fire(&app, &app.db.routine(&nightly).unwrap(), db::now());
-    assert_eq!(app.db.last_id(), before, "nothing queued");
-    let r = app.db.routine(&nightly).unwrap();
-    assert_eq!((r.enabled, r.paused_reason.as_deref(), r.paused_for.as_deref()), (false, Some("author_disabled"), Some(hers.as_str())));
 }

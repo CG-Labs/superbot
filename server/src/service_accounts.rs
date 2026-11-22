@@ -123,7 +123,17 @@ pub fn whoami(app: &AppState, c: &Caller, s: &ServiceCaller) -> Value {
 
 /// The owner, if they can still lend their permissions: an active person, not erased.
 fn live_owner(app: &AppState, id: &str) -> Option<User> {
-    app.db.user(id).filter(|u| u.active() && !u.service && u.erased_at.is_none())
+    owner_of(&app.db, id)
+}
+
+fn owner_of(db: &crate::db::Db, id: &str) -> Option<User> {
+    db.user(id).filter(|u| u.active() && !u.service && u.erased_at.is_none())
+}
+
+/// Whether `u` may still act, for work that starts without a request (routines): active,
+/// and a service account also not deleted, with an owner who could lend it access.
+pub fn may_act(db: &crate::db::Db, u: &User) -> bool {
+    u.active() && (!u.service || db.service_account(&u.id).filter(|s| s.deleted_at.is_none()).is_some_and(|s| owner_of(db, &s.owner_id).is_some()))
 }
 
 /// Everything `owner` holds: across the server, and in `team` when a service account acts
