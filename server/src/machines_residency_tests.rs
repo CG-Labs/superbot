@@ -312,9 +312,12 @@ async fn a_pinned_team_keeps_members_and_its_region_in_it_and_cant_be_deleted_un
     assert_eq!(code, 201, "{t}");
     let beta = t["id"].as_str().unwrap().to_string();
     assert_eq!(call(port, "PUT", &format!("/api/teams/{beta}/residency"), &admin, &pin("gb-lon", "MSA-8, signed by dan@example.com")).await.0, 200);
+    let egress = format!("{}{dan}", crate::machines::egress_policy::USER_KEY);
+    app.db.set_setting(&egress, r#"{"mode":"allow_list","allow":["api.example.com"]}"#);
     let (code, v) = call_json(port, "POST", &format!("/api/users/{dan}/erase"), &admin, "{}").await;
     assert_eq!(code, 200, "{v}");
     assert!(app.db.residency_pin(PinOn::User, &dan).is_none());
+    assert_eq!(app.db.setting(&egress), None);
     let reference = app.db.residency_pin(PinOn::Team, &beta).unwrap().reference;
     assert!(reference.starts_with("MSA-8, signed by ") && !reference.contains("dan@example.com"), "{reference}");
 }

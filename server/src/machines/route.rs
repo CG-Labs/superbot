@@ -116,6 +116,8 @@ pub enum Refusal {
     /// it isn't one of this server's VMs: e.g. an Incus container from before a move to
     /// Linode. Its provider.
     NotOwnKernel(String),
+    /// Its owner's outbound allow-list isn't loaded there yet, or failed to (ADR 0135).
+    EgressPolicy(String),
 }
 
 impl Refusal {
@@ -141,13 +143,16 @@ impl Refusal {
             Refusal::Rebuilding => "machine_rebuilding",
             Refusal::Restoring => "machine_restoring",
             Refusal::NotOwnKernel(_) => "machine_not_own_kernel",
+            Refusal::EgressPolicy(_) => "egress_policy_pending",
         }
     }
 
     /// The machine's own words, for the audit log: its error, version or state.
     pub fn detail(&self) -> Option<String> {
         match self {
-            Refusal::Offline(e) | Refusal::Outdated(e) | Refusal::TeammateUserFailed(e) | Refusal::NotOwnKernel(e) => Some(e.clone()),
+            Refusal::Offline(e) | Refusal::Outdated(e) | Refusal::TeammateUserFailed(e) | Refusal::NotOwnKernel(e) | Refusal::EgressPolicy(e) => {
+                Some(e.clone())
+            }
             Refusal::NotReady(s) => Some(s.as_str().into()),
             Refusal::HarnessMissing(h) | Refusal::HarnessInstalling(h) | Refusal::NotLoggedIn(h) | Refusal::NoTeammateKey(h) | Refusal::TeammateNotLoggedIn(h) => {
                 Some(h.clone())
@@ -189,6 +194,10 @@ impl Refusal {
             Refusal::Rebuilding => "I didn't run: your computer is being rebuilt with the latest setup. Try again in a few minutes.".into(),
             Refusal::Restoring => "I didn't run: your computer is being restored from a backup. Try again once an admin says it's back.".into(),
             Refusal::NotOwnKernel(_) => "I didn't run: your plan needs a computer with a kernel of its own, and yours isn't one. Ask an admin to move you to a new computer.".into(),
+            Refusal::EgressPolicy(e) => format!(
+                "I didn't run: your computer's outbound allow-list isn't in place yet{}. Try again in a minute; if it lasts, ask an admin to look at it (`botctl user egress <your email>`).",
+                quiet(e, |e| format!(" ({e})"))
+            ),
         }
     }
 
@@ -220,7 +229,8 @@ impl Refusal {
             | Refusal::BotUserFailed
             | Refusal::Rebuilding
             | Refusal::Restoring
-            | Refusal::NotOwnKernel(_) => {
+            | Refusal::NotOwnKernel(_)
+            | Refusal::EgressPolicy(_) => {
                 "it isn't ready to run Bots"
             }
         };
@@ -413,7 +423,7 @@ pub mod recording {
                 })),
                 script: Mutex::new(vec![
                     JobEvent::Started,
-                    JobEvent::Exit { success: true, status: "exit status: 0".into(), stderr: String::new(), files: Default::default(), too_big: Vec::new() },
+                    JobEvent::Exit { success: true, status: "exit status: 0".into(), stderr: String::new(), files: Default::default(), too_big: Vec::new(), limited: None },
                 ]),
                 teammates: Mutex::default(),
                 teammate_error: Mutex::default(),

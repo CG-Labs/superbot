@@ -59,6 +59,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    their team's or the default; set it, or follow the team again.
                                                    Refused while their machine is elsewhere
   botctl team region <team> [<region>|default]     The team's data region, for members without their own
+  botctl user egress <user> [inherit|open|allow <host|cidr>...]
+                                                   Their machine's outbound allow-list (ADR 0135): what it gets,
+                                                   and whether it's loaded there; set their own, or follow the server's
   botctl user|team residency <user|team> [pin <region> <reference...> | unpin <reason...>]
                                                    Pin their data to a region under an agreement (ADR 0129):
                                                    machines, backups and restores stay there or are refused.
@@ -171,6 +174,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine list [<state>]                    Every user's machine (pending, running, suspended, error, ... or all)
   botctl machine show <user>                       The user's machine: provider, plan, state, address, enrollment
   botctl machine request <user> [<tier>] [<region>]  Give the user a machine (a Linode VM or an Incus container)
+  botctl machine egress [open|allow <host|cidr>...]  The server's outbound allow-list for every machine (ADR 0135):
+                                                   open (the default), or only these hosts and networks
   botctl machine suspend|resume <user>             Power it off (disk and address kept), or back on
   botctl machine resize <user> <tier>              Move it to the tier's plan
   botctl machine resize <user> status              Its latest resize: a tier change's, and whether it waits, and why
@@ -756,6 +761,21 @@ fn region_request(args: &[&str]) -> Option<(&'static str, String, Option<String>
     })
 }
 
+/// `botctl machine egress ...` and `botctl user egress ...` (ADR 0135): the request to send.
+fn egress_request(args: &[&str]) -> Option<(&'static str, String, Option<String>)> {
+    let set = |mode: &str, allow: &[&str]| Some(json!({ "mode": mode, "allow": allow }).to_string());
+    let user = |key: &str| format!("/api/users/{}/machine/egress-policy", encode(key));
+    Some(match args {
+        ["machine", "egress"] => ("GET", "/api/machines/egress-policy".into(), None),
+        ["machine", "egress", "open"] => ("PUT", "/api/machines/egress-policy".into(), set("open", &[])),
+        ["machine", "egress", "allow", allow @ ..] if !allow.is_empty() => ("PUT", "/api/machines/egress-policy".into(), set("allow_list", allow)),
+        ["user", "egress", key] => ("GET", user(key), None),
+        ["user", "egress", key, m @ ("open" | "inherit")] => ("PUT", user(key), set(m, &[])),
+        ["user", "egress", key, "allow", allow @ ..] if !allow.is_empty() => ("PUT", user(key), set("allow_list", allow)),
+        _ => return None,
+    })
+}
+
 /// `botctl tiers move-bots <tier> [--user <user>] [--dry-run]` (ADR 0079): the path and body.
 fn move_bots_request(args: &[&str]) -> Result<(String, String), String> {
     const USE: &str = "usage: botctl tiers move-bots <tier> [--user <user>] [--dry-run]";
@@ -1297,6 +1317,13 @@ fn run(args: &[String]) -> Result<String, String> {
         ["machine", "harness-logins", user] => op("GET", &format!("{}/harness-logins", login_base(user)), None),
         ["machine", "harness-logout", user, harness] => op("DELETE", &format!("{}/harness-logins/{}", login_base(user), encode(harness)), None),
         ["machine", "legacy"] => op("GET", "/api/machines/legacy", None),
+        [..] if egress_request(&a).is_some() => {
+            let (method, path, body) = egress_request(&a).unwrap();
+            op(method, &path, body)
+        }
+        ["machine" | "user", "egress", ..] => {
+            Err("Usage: botctl machine egress [open|allow <host|cidr>...] | botctl user egress <user> [inherit|open|allow <host|cidr>...]".into())
+        }
         ["machine", rest @ ..] if matches!(rest.first(), Some(&("backups" | "backup" | "restore" | "delete-backups" | "recovery" | "hosts" | "host"))) => {
             let (method, path, body) = backup_request(rest, |f| std::fs::read_to_string(f).map_err(|e| format!("--identity {f}: {e}")))?;
             op(method, &path, body)
@@ -1849,6 +1876,29 @@ mod tests {
         assert_eq!(region_request(&["team", "region", "t1"]), Some(("GET", "/api/teams/t1/region".into(), None)));
         for other in [&["team", "region"][..], &["user", "tier", "u1", "pro"], &["region"]] {
             assert_eq!(region_request(other), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn egress_commands() {
+        let req = |a: &[&str]| egress_request(a).map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())));
+        assert_eq!(req(&["machine", "egress"]), Some(("GET", "/api/machines/egress-policy".into(), None)));
+        assert_eq!(req(&["machine", "egress", "open"]), Some(("PUT", "/api/machines/egress-policy".into(), Some(json!({ "mode": "open", "allow": [] })))));
+        assert_eq!(
+            req(&["machine", "egress", "allow", "api.anthropic.com", "203.0.113.0/24"]),
+            Some(("PUT", "/api/machines/egress-policy".into(), Some(json!({ "mode": "allow_list", "allow": ["api.anthropic.com", "203.0.113.0/24"] }))))
+        );
+        assert_eq!(req(&["user", "egress", "ada@example.com"]), Some(("GET", "/api/users/ada%40example.com/machine/egress-policy".into(), None)));
+        assert_eq!(req(&["user", "egress", "u1", "inherit"]), Some(("PUT", "/api/users/u1/machine/egress-policy".into(), Some(json!({ "mode": "inherit", "allow": [] })))));
+        assert_eq!(
+            req(&["user", "egress", "u1", "allow", "registry.npmjs.org"]),
+            Some(("PUT", "/api/users/u1/machine/egress-policy".into(), Some(json!({ "mode": "allow_list", "allow": ["registry.npmjs.org"] }))))
+        );
+        for other in [&["machine", "egress", "allow"][..], &["user", "egress", "u1", "closed"], &["user", "egress"], &["machine", "egress", "shut"]] {
+            assert_eq!(egress_request(other), None, "{other:?}");
+            let args: Vec<String> = other.iter().map(|s| s.to_string()).collect();
+            let e = run(&args).unwrap_err();
+            assert!(e.starts_with("Usage: botctl machine egress"), "{other:?} reached another command: {e}");
         }
     }
 

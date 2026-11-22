@@ -10,8 +10,11 @@
 pub mod agent;
 pub mod backup;
 pub mod botuser;
+pub mod cgroup;
 #[cfg(test)]
 pub mod display;
+pub mod egress_allow;
+pub mod egress_policy;
 pub mod enroll;
 
 #[cfg(test)]
@@ -568,6 +571,13 @@ impl ControlPlane {
         self.enrollment.as_ref().is_some_and(|e| e.teammate_users)
     }
 
+    /// What a run for `user_id` on the machine that sent `hb` is held to (ADR 0135):
+    /// their tier's run limits, when MACHINE_RUN_LIMITS is on and the agent can hold them.
+    pub fn run_limits(&self, app: &App, hb: &wire::Heartbeat, user_id: &str) -> Option<wire::RunLimits> {
+        let on = self.enrollment.as_ref().is_some_and(|e| e.run_limits) && hb.can.iter().any(|c| c == wire::CAN_RUN_LIMITS);
+        on.then(|| crate::tiers::RunLimitsSpec::resolve(app.tier_of(user_id).limits.run_limits.as_ref()))
+    }
+
     /// Where `user_id`'s Bots run (`route::target`).
     pub fn route(&self, app: &App, user_id: &str) -> Result<route::Target, route::Refusal> {
         route::target(&app.db, self, user_id, self.own_kernel_for(app.tier_of(user_id)))
@@ -582,6 +592,9 @@ impl ControlPlane {
     pub fn ready(&self, app: &App, hb: &wire::Heartbeat, keys: Option<&str>, machine_id: &str, bin: &str, teammate: bool) -> Result<(), route::Refusal> {
         let Some(e) = &self.enrollment else { return Ok(()) };
         botuser::check_run(e, hb)?;
+        if let Some(m) = app.db.machine(machine_id) {
+            egress_policy::check_run(app, &m, hb)?;
+        }
         if teammate {
             teammate::fit(hb)?;
             return logins::check_teammate_run(e, hb, bin);
@@ -1209,6 +1222,9 @@ pub async fn heartbeats(app: &AppState, cp: &ControlPlane) -> Option<usize> {
             rebuild::follow_up(app, cp, e, &m.id, &hb).await;
             upkeep::follow_up(app, cp, e, &m.id, &hb).await;
             botuser::follow_up(app, e, &m, &hb).await;
+            if let Some(m) = app.db.machine(&m.id) {
+                egress_policy::follow_up(app, e, &m, &hb).await;
+            }
             folder::follow_up(app, e, &m, &hb);
             true
         })
