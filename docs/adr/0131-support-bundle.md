@@ -59,7 +59,7 @@ Each shown value is then redacted:
 3. **URL origins only.** A URL's path and query become `/[redacted]`: Slack webhooks, Sentry DSNs and signed links carry their secret there.
 4. **Emails** become `[email]`.
 5. **IP addresses** become `[ip]` (a port after an IPv4 address stays); loopback and unspecified ones (`127.0.0.1`, `0.0.0.0`, `::1`) stay, since they say nothing about a network.
-6. **The licensee's name** becomes `[name]`, in any case. The license, its warnings, the setup checklist and the settings botd started with all repeat it.
+6. **The licensee's name** becomes `[name]`, in any case, as a whole word only (a short name like `IT` leaves `audit-summary.json` alone). The license, its warnings, the setup checklist and the settings botd started with all repeat it.
 
 Every string in every JSON file, and each log line, goes through the same text scrubbing, and then the secrets botd knows (`redact::value`/`redact::text`: the sealed store's values, and the shapes of tokens botd issues). A bundle can contain only what botd chose to put in it, with secrets botd holds caught wherever they appear.
 

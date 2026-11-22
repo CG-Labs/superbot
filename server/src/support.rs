@@ -195,14 +195,20 @@ fn scrub_value(v: Value, names: &[String]) -> Value {
     }
 }
 
-/// `names` (the licensee) become `[name]`, in any ASCII case.
+/// `names` (the licensee) become `[name]`, in any ASCII case, as whole words only, so a
+/// short name like `IT` leaves `audit-summary.json` alone.
 pub fn hide(s: &str, names: &[String]) -> String {
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
     let mut out = s.to_string();
     for n in names {
         let (lower, needle) = (out.to_ascii_lowercase(), n.to_ascii_lowercase());
         let mut next = String::with_capacity(out.len());
         let mut at = 0;
         for (i, _) in lower.match_indices(&needle) {
+            let end = i + needle.len();
+            if i < at || word(out[..i].chars().next_back()) || word(out[end..].chars().next()) {
+                continue;
+            }
             next.push_str(&out[at..i]);
             next.push_str("[name]");
             at = i + needle.len();
@@ -443,7 +449,7 @@ pub fn build(app: &App, vars: &[(String, String)], setup: Value, now_ms: i64) ->
         "logLines": log_lines,
         "auditEvents": audit_events,
     });
-    files.push(("manifest.json", json_file(manifest, &names)));
+    files.push(("manifest.json", json_file(manifest, &[])));
     let entries: Vec<(String, Vec<u8>)> = files.into_iter().map(|(n, b)| (format!("{name}/{n}"), b)).collect();
     let files = entries.iter().map(|(n, b)| (n.clone(), b.len())).collect();
     Bundle { tar: tar(&entries, (now_ms / 1000).max(0) as u64), name, files, redacted_settings, log_lines, audit_events }
@@ -632,7 +638,9 @@ pub(crate) mod tests {
     fn the_licensee_is_hidden_in_any_case() {
         let names = vec!["Acme Ltd".to_string()];
         assert_eq!(hide("Licensed to Acme Ltd; ACME LTD; acme ltd.", &names), "Licensed to [name]; [name]; [name].");
-        assert_eq!(hide("Acme é Ltd", &names), "Acme é Ltd");
+        assert_eq!(hide("Acme é Ltd, Acme Ltdx, xAcme Ltd", &names), "Acme é Ltd, Acme Ltdx, xAcme Ltd", "whole words only");
+        let it = vec!["IT".to_string()];
+        assert_eq!(hide("audit-summary.json, licensed to IT (it).", &it), "audit-summary.json, licensed to [name] ([name]).");
         assert_eq!(scrub_value(json!({ "a": ["for Acme Ltd"] }), &names), json!({ "a": ["for [name]"] }));
     }
 
