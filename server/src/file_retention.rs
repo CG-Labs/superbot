@@ -187,7 +187,9 @@ pub async fn prune_sessions(app: &Arc<App>, days: u32, at: i64) -> Value {
         }
     }
 
-    // Each user's machine, by its agent (ADR 0036).
+    // Each user's machine, by its agent (ADR 0036). It says which session databases are
+    // there, by owner, so only those are pruned.
+    let mut found: std::collections::HashMap<String, Vec<(Option<String>, String)>> = std::collections::HashMap::new();
     for m in sweepable_machines(app) {
         bots.held = holds(app);
         let (held, keep, report) = bots.sessions(Some(&m.user_id));
@@ -202,9 +204,16 @@ pub async fn prune_sessions(app: &Arc<App>, days: u32, at: i64) -> Value {
             keep,
             report,
             archives: Vec::new(),
+            probe: bots.of(Some(&m.user_id)).filter_map(|b| Some(format!("{}/{}", b.id, adapters::get(&b.harness)?.session_db()?))).collect(),
         };
         let what = format!("machine {}", m.id);
-        add(&mut t, &what, ask_machine(app, &m, &req).await);
+        match ask_machine(app, &m, &req).await {
+            Ok(mut out) => {
+                found.insert(m.user_id.clone(), std::mem::take(&mut out.found));
+                add(&mut t, &what, Ok(out));
+            }
+            Err(e) => add(&mut t, &what, Err(e)),
+        }
     }
 
     // Hermes Agent keeps its sessions in a database, which only it may change.
@@ -213,7 +222,7 @@ pub async fn prune_sessions(app: &Arc<App>, days: u32, at: i64) -> Value {
             continue;
         }
         if let Some(a) = adapters::get(&b.harness).filter(|a| a.prune_sessions(Path::new("/"), days, None).is_some()) {
-            let (pruned, errors) = prune_db(app, a.as_ref(), b, days).await;
+            let (pruned, errors) = prune_db(app, a.as_ref(), b, days, found.get(&b.owner_id).map(Vec::as_slice)).await;
             t.hermes += u32::from(pruned > 0);
             for e in errors {
                 t.error(format!("{} for Bot {}: {e}", b.harness, b.id));
@@ -295,9 +304,10 @@ async fn ask_machine(app: &App, m: &Machine, req: &RetentionRequest) -> Result<S
 }
 
 /// Has the Bot's harness delete its own sessions unused for `days` in each place its runs
-/// keep them: its owner's, and each teammate's own (ADR 0048, 0064). How many places it
-/// pruned, and what failed.
-async fn prune_db(app: &App, a: &dyn adapters::Adapter, b: &Bot, days: u32) -> (u32, Vec<String>) {
+/// keep them: its owner's, and each teammate's own (ADR 0048, 0064). On a machine, only
+/// those its agent `found` (None: it wasn't asked). How many places it pruned, and what
+/// failed.
+async fn prune_db(app: &App, a: &dyn adapters::Adapter, b: &Bot, days: u32, found: Option<&[(Option<String>, String)]>) -> (u32, Vec<String>) {
     use crate::machines::route::Target;
     let (mut done, mut errors) = (0u32, Vec::new());
     let target = match app.control_plane.get() {
@@ -351,7 +361,9 @@ async fn prune_db(app: &App, a: &dyn adapters::Adapter, b: &Bot, days: u32) -> (
             }
         }
         Target::Machine(to) => {
-            let Some(cp) = app.control_plane.get() else { return (0, errors) };
+            let (Some(cp), Some(found), Some(db)) = (app.control_plane.get(), found, a.session_db()) else { return (0, errors) };
+            let rel = format!("{}/{db}", b.id);
+            let there = |u: Option<&str>| found.iter().any(|(f, p)| f.as_deref() == u && *p == rel);
             let layout = match cp.link.check(app, &to, &[a.bin()]).await {
                 Ok(hb) => match hb.layout.filter(|_| !hb.missing.iter().any(|m| m == a.bin())) {
                     Some(l) => l,
@@ -360,10 +372,13 @@ async fn prune_db(app: &App, a: &dyn adapters::Adapter, b: &Bot, days: u32) -> (
                 Err(e) => return (0, vec![e]),
             };
             // The owner's, as the Bots' user, then each teammate's that has a user there.
-            let mut places: Vec<(Option<String>, String)> = vec![(None, layout.bots.clone())];
+            let mut places: Vec<(Option<String>, String)> = Vec::new();
+            if there(None) {
+                places.push((None, layout.bots.clone()));
+            }
             if cp.teammate_users() {
                 let known = app.db.machine(&to.machine_id).map(|m| crate::machines::offboard::known(&m)).unwrap_or_default();
-                for u in known {
+                for u in known.into_iter().filter(|u| there(Some(u))) {
                     match cp.link.teammate(&to, &u).await {
                         Ok(t) => places.push((Some(u), t.bots)),
                         Err(e) => errors.push(format!("teammate {u}: {e}")),

@@ -93,6 +93,10 @@ pub struct Swept {
     /// It stopped at `MAX_ENTRIES`, or couldn't read everything.
     #[serde(default)]
     pub partial: bool,
+    /// Of a machine's `RetentionRequest::probe`, those there: the teammate whose HOME it is
+    /// in (None: the machine's user's), and the path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub found: Vec<(Option<String>, String)>,
 }
 
 impl Swept {
@@ -111,6 +115,7 @@ impl Swept {
         self.folders += o.folders;
         self.missing += o.missing;
         self.partial |= o.partial;
+        self.found.extend(o.found);
         for g in o.gone {
             if !self.gone.contains(&g) {
                 self.gone.push(g);

@@ -242,8 +242,8 @@ impl Adapter for Hermes {
         Some(super::plain_job(self.bin(), args, env, state_dir, Some(cleanup)))
     }
 
-    fn has_session_db(&self, state_dir: &std::path::Path) -> bool {
-        state_dir.join("hermes").join("state.db").is_file()
+    fn session_db(&self) -> Option<&'static str> {
+        Some("hermes/state.db")
     }
 
     fn cleanup_failed(&self, input: &RunInput, why: &str) -> String {

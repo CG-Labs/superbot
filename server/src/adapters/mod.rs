@@ -289,10 +289,14 @@ pub trait Adapter: Send + Sync {
     fn prune_sessions(&self, _state_dir: &std::path::Path, _days: u32, _path: Option<&str>) -> Option<JobRequest> {
         None
     }
-    /// Whether `state_dir`, a Bot's state folder this server can read, has the database
-    /// `prune_sessions` prunes.
-    fn has_session_db(&self, _state_dir: &std::path::Path) -> bool {
-        false
+    /// The database `prune_sessions` prunes, relative to a Bot's state folder: only a
+    /// folder that has it is pruned.
+    fn session_db(&self) -> Option<&'static str> {
+        None
+    }
+    /// Whether `state_dir`, a Bot's state folder this server can read, has `session_db`.
+    fn has_session_db(&self, state_dir: &std::path::Path) -> bool {
+        self.session_db().is_some_and(|p| state_dir.join(p).is_file())
     }
 }
 

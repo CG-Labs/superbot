@@ -328,6 +328,10 @@ pub struct RetentionRequest {
     /// Archive names in `work/from-teammates/` to delete.
     #[serde(default)]
     pub archives: Vec<String>,
+    /// Files to say whether they are there, relative to `bots/` in each HOME (a harness's
+    /// session database, `<bot id>/hermes/state.db`), so only those are pruned.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probe: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

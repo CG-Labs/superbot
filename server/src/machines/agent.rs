@@ -1985,6 +1985,9 @@ fn retention_sweep(r: &wire::RetentionRequest, home: &Path, teammates: &[PathBuf
     if !r.bots.iter().chain(&r.archives).all(|n| plain_name(n)) || r.bots.len() > 10_000 || r.archives.len() > 1_000 {
         return Err("Bot ids and archive names must be plain names.");
     }
+    if !r.probe.iter().all(|p| crate::sweep::plain_path(p)) || r.probe.len() > 10_000 {
+        return Err("Files to look for must be plain paths under a Bots folder.");
+    }
     let base = |p: &Path| p.display().to_string();
     let mut s = Sweep { before: r.before, keep: r.keep.clone(), report: r.report.clone(), ..Default::default() };
     for h in std::iter::once(home).chain(teammates.iter().map(PathBuf::as_path)) {
@@ -2003,12 +2006,25 @@ async fn retention(State(a): State<Arc<Agent>>, Json(r): Json<wire::RetentionReq
     if r.owner_id != a.identity().user_id {
         return refuse(StatusCode::FORBIDDEN, "This machine runs only its own user's Bots.");
     }
-    let teammates: Vec<PathBuf> = a.teammates.known().iter().filter(|t| plain_name(t)).map(|t| a.teammates.home_of(t)).collect();
-    let s = match retention_sweep(&r, &a.cfg.home, &teammates) {
+    let teammates: Vec<(String, PathBuf)> = a.teammates.known().into_iter().filter(|t| plain_name(t)).map(|t| (t.clone(), a.teammates.home_of(&t))).collect();
+    let homes: Vec<PathBuf> = teammates.iter().map(|(_, h)| h.clone()).collect();
+    let s = match retention_sweep(&r, &a.cfg.home, &homes) {
         Ok(s) => s,
         Err(e) => return refuse(StatusCode::BAD_REQUEST, e),
     };
-    match tokio::task::spawn_blocking(move || crate::sweep::run(&s)).await {
+    let home = a.cfg.home.clone();
+    let swept = move || {
+        let mut out = crate::sweep::run(&s);
+        for (user, h) in std::iter::once((None, home)).chain(teammates.into_iter().map(|(t, h)| (Some(t), h))) {
+            for p in &r.probe {
+                if std::fs::symlink_metadata(h.join("bots").join(p)).is_ok_and(|m| m.is_file()) {
+                    out.found.push((user.clone(), p.clone()));
+                }
+            }
+        }
+        out
+    };
+    match tokio::task::spawn_blocking(swept).await {
         Ok(out) => Json(out).into_response(),
         Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
