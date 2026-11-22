@@ -71,9 +71,17 @@ async fn verify_names_the_first_broken_link_and_holds_pins() {
         assert_eq!(call(port, "GET", &format!("/api/audit/verify?pin={bad}"), &admin, "").await.0, 400, "{bad}");
     }
 
+    // Storing a value as another type, even with the same hex, breaks the link.
+    app.db.execute_raw("DROP TRIGGER audit_events_no_update").unwrap();
+    let typed = app.db.try_record(&Event::new(Actor::system("test"), "test.typed").target("bot", "deadbeef")).unwrap();
+    app.db.execute_raw(&format!("UPDATE audit_events SET target_id = x'deadbeef' WHERE id = {typed}")).unwrap();
+    let v = verify(port, &admin, "").await;
+    assert_eq!((v["ok"].as_bool(), v["firstBroken"]["id"].as_i64()), (Some(false), Some(typed)), "{v}");
+    app.db.execute_raw(&format!("UPDATE audit_events SET target_id = 'deadbeef' WHERE id = {typed}")).unwrap();
+    assert_eq!(verify(port, &admin, "").await["ok"], true);
+
     // Someone with the database file rewrites history: the edited row is named.
     let forged = scout["id"].as_i64().unwrap();
-    app.db.execute_raw("DROP TRIGGER audit_events_no_update").unwrap();
     app.db.execute_raw(&format!("UPDATE audit_events SET details = '{{\"name\":\"Innocent\"}}' WHERE id = {forged}")).unwrap();
     let v = verify(port, &admin, "").await;
     assert_eq!((v["ok"].as_bool(), v["firstBroken"]["id"].as_i64(), v["firstBroken"]["reason"].as_str()), (Some(false), Some(forged), Some("contents")), "{v}");

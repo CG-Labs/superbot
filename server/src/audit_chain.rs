@@ -54,7 +54,8 @@ fn sha(parts: &[&str]) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Values as a JSON array: unambiguous, with no raw newline in it.
+/// Values as a JSON array: unambiguous, with no raw newline in it. A BLOB is tagged, so
+/// it never hashes like the text of its hex; botd never writes one, so no seal changes.
 fn canonical(values: &[Sql]) -> String {
     Value::Array(
         values
@@ -64,7 +65,7 @@ fn canonical(values: &[Sql]) -> String {
                 Sql::Integer(i) => json!(i),
                 Sql::Real(f) => json!(f),
                 Sql::Text(s) => json!(s),
-                Sql::Blob(b) => json!(b.iter().map(|x| format!("{x:02x}")).collect::<String>()),
+                Sql::Blob(b) => json!({ "blob": b.iter().map(|x| format!("{x:02x}")).collect::<String>() }),
             })
             .collect(),
     )
@@ -615,6 +616,7 @@ mod tests {
         // Fields can't run into each other.
         assert_ne!(canonical(&[Sql::Text("a,b".into())]), canonical(&[Sql::Text("a".into()), Sql::Text("b".into())]));
         assert!(!canonical(&[Sql::Text("a\nb".into())]).contains('\n'));
+        assert_ne!(canonical(&[Sql::Text("deadbeef".into())]), canonical(&[Sql::Blob(vec![0xde, 0xad, 0xbe, 0xef])]), "a type change shows");
         let s = seal(GENESIS, &fixed, &[]);
         assert_ne!(s.salt, seal(GENESIS, &fixed, &[]).salt, "a fresh salt per row");
     }
