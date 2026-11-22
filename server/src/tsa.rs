@@ -410,6 +410,10 @@ fn valid_at(c: &Cert, ms: i64) -> bool {
     c.validity().not_before.timestamp() <= s && s <= c.validity().not_after.timestamp()
 }
 
+fn only_stamping(u: &x509_parser::extensions::ExtendedKeyUsage) -> bool {
+    !(u.any || u.server_auth || u.client_auth || u.code_signing || u.email_protection || u.ocsp_signing || !u.other.is_empty())
+}
+
 /// `child` was signed by `issuer`'s key.
 fn issued_by(child: &Cert, issuer: &Cert) -> bool {
     child.issuer().as_raw() == issuer.subject().as_raw()
@@ -546,7 +550,8 @@ pub fn verify(token: &[u8], imprint: &[u8], nonce: Option<&[u8]>, trust: &Trust)
     if actual != ess_hash {
         return Err(bad("certificate", "the signing-certificate attribute names another certificate"));
     }
-    let stamping = matches!(cert.extended_key_usage(), Ok(Some(e)) if e.value.time_stamping);
+    // RFC 3161 2.3: time-stamping must be the certificate's only extended key usage, and critical.
+    let stamping = matches!(cert.extended_key_usage(), Ok(Some(e)) if e.critical && e.value.time_stamping && only_stamping(e.value));
     if !stamping {
         return Err(bad("certificate", "the TSA's certificate isn't for time-stamping"));
     }
@@ -616,8 +621,13 @@ pub mod fake {
             FakeTsa::with_stamping(true)
         }
 
-        /// `stamping`: whether its certificate says time-stamping.
+        /// `stamping`: whether its certificate says time-stamping, as RFC 3161 asks (critical).
         pub fn with_stamping(stamping: bool) -> FakeTsa {
+            FakeTsa::with_usage(stamping.then_some(true))
+        }
+
+        /// `critical`: its certificate's time-stamping extended key usage, if any, and whether it's critical.
+        pub fn with_usage(critical: Option<bool>) -> FakeTsa {
             let ca_key = rcgen::KeyPair::generate().unwrap();
             let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
             ca.distinguished_name.push(rcgen::DnType::CommonName, "Test TSA Root");
@@ -626,8 +636,12 @@ pub mod fake {
             let key = rcgen::KeyPair::generate().unwrap();
             let mut leaf = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
             leaf.distinguished_name.push(rcgen::DnType::CommonName, "Test TSA");
-            if stamping {
-                leaf.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::TimeStamping];
+            if let Some(critical) = critical {
+                // SEQUENCE { id-kp-timeStamping }; rcgen's own never marks it critical.
+                let usage = vec![0x30, 0x0a, 0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x08];
+                let mut ext = rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 37], usage);
+                ext.set_criticality(critical);
+                leaf.custom_extensions.push(ext);
             }
             let leaf = leaf.signed_by(&key, &ca).unwrap();
             FakeTsa { ca_pem: ca.pem(), leaf: leaf.der().to_vec(), key: EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &key.serialize_der()).unwrap() }
@@ -768,6 +782,9 @@ mod tests {
         let plain = FakeTsa::with_stamping(false);
         let t = token_from_reply(&plain.reply(&request(&imprint, &NONCE), 1_795_000_000_000)).unwrap();
         assert_eq!(verify(&t, &imprint, None, &Trust::default()).unwrap_err().code, "certificate", "not a time-stamping certificate");
+        let lax = FakeTsa::with_usage(Some(false));
+        let t = token_from_reply(&lax.reply(&request(&imprint, &NONCE), 1_795_000_000_000)).unwrap();
+        assert_eq!(verify(&t, &imprint, None, &Trust::default()).unwrap_err().code, "certificate", "time-stamping, but not critical");
         let e = token_from_reply(&FakeTsa::refusal()).unwrap_err();
         assert_eq!(e.code, "refused");
         assert!(e.message.contains("status 2") && e.message.contains("unsupported policy"), "{e}");
