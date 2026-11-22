@@ -850,7 +850,7 @@ mod tests {
             q.split('&').filter(|p| !p.starts_with("SigAlg=")).collect::<Vec<_>>().join("&"),
             "RelayState=x".to_string(),
             "SAMLRequest=bm90IGRlZmxhdGVk".to_string(),
-            format!("SAMLRequest=a&SAMLResponse=b"),
+            "SAMLRequest=a&SAMLResponse=b".to_string(),
         ] {
             assert!(from_redirect(&bad).is_err(), "{bad}");
         }
