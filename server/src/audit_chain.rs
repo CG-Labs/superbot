@@ -87,8 +87,13 @@ pub struct Seal {
     pub digest: String,
 }
 
+/// 16 random bytes as hex, fresh for every row.
+fn new_salt() -> String {
+    crate::random_bytes(16).iter().map(|b| format!("{b:02x}")).collect()
+}
+
 pub fn seal(prev: &str, fixed: &[Sql], erasable: &[Sql]) -> Seal {
-    let salt: String = crate::random_bytes(16).iter().map(|b| format!("{b:02x}")).collect();
+    let salt = new_salt();
     let digest = digest(&salt, erasable);
     Seal { prev: prev.into(), hash: link(prev, fixed, &digest), salt, digest }
 }
@@ -587,16 +592,17 @@ mod tests {
     #[test]
     fn hashes_are_stable_and_cover_every_part() {
         let fixed = [Sql::Integer(1), Sql::Text("a".into()), Sql::Null];
-        let d = digest("00", &[Sql::Text("b".into())]);
-        assert_eq!(d, digest("00", &[Sql::Text("b".into())]));
-        assert_ne!(d, digest("01", &[Sql::Text("b".into())]), "the salt counts");
-        assert_ne!(digest("00", &[Sql::Null]), digest("00", &[Sql::Text(String::new())]), "NULL isn't an empty string");
-        assert_ne!(digest("00", &[Sql::Integer(1)]), digest("00", &[Sql::Text("1".into())]));
+        let (salt, other) = (new_salt(), new_salt());
+        let d = digest(&salt, &[Sql::Text("b".into())]);
+        assert_eq!(d, digest(&salt, &[Sql::Text("b".into())]));
+        assert_ne!(d, digest(&other, &[Sql::Text("b".into())]), "the salt counts");
+        assert_ne!(digest(&salt, &[Sql::Null]), digest(&salt, &[Sql::Text(String::new())]), "NULL isn't an empty string");
+        assert_ne!(digest(&salt, &[Sql::Integer(1)]), digest(&salt, &[Sql::Text("1".into())]));
         let h = link(GENESIS, &fixed, &d);
         assert_eq!(h.len(), 64);
         assert_ne!(h, link(&"1".repeat(64), &fixed, &d));
         assert_ne!(h, link(GENESIS, &fixed[..2], &d));
-        assert_ne!(h, link(GENESIS, &fixed, &digest("00", &[Sql::Text("c".into())])));
+        assert_ne!(h, link(GENESIS, &fixed, &digest(&salt, &[Sql::Text("c".into())])));
         // Fields can't run into each other.
         assert_ne!(canonical(&[Sql::Text("a,b".into())]), canonical(&[Sql::Text("a".into()), Sql::Text("b".into())]));
         assert!(!canonical(&[Sql::Text("a\nb".into())]).contains('\n'));
