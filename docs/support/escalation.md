@@ -42,7 +42,7 @@ Some causes belong to someone else. Support still owns the ticket and keeps the 
 If a ticket isn't moving as it should:
 
 1. Reply on the ticket asking for it to be escalated, and say why (impact grew, a target was missed, the fix didn't work). Support raises it a level and answers within the ticket's response target.
-2. Enterprise: contact your technical account manager (`<tam-email>`), who can pull in any level.
+2. Enterprise: contact your [technical account manager](tam.md) (`<tam-email>`), who can pull in any level.
 3. If that doesn't resolve it, write to `<escalation-email>`, quoting the ticket number. A manager answers within one business day.
 
 ## After a Severity 1
