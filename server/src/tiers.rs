@@ -115,6 +115,24 @@ pub struct Limits {
     pub max_storage_mb: Option<u64>,
 }
 
+/// One published price (ADR 0121): an amount in the currency's smallest unit, as Stripe's
+/// `unit_amount` counts it (2900 is £29.00 in `gbp`), per person, per month or year.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListPrice {
+    pub amount: u64,
+    /// ISO 4217, lowercase, as Stripe writes it.
+    pub currency: String,
+    /// `month` or `year`.
+    pub interval: String,
+}
+
+pub const MAX_PUBLISHED_PRICES: usize = 4;
+/// Ten million in the largest currency unit is far past any per-person plan.
+pub const MAX_PRICE_AMOUNT: u64 = 1_000_000_000;
+pub const MAX_FEATURES: usize = 10;
+pub const MAX_FEATURE_CHARS: usize = 120;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tier {
     pub name: String,
@@ -124,6 +142,12 @@ pub struct Tier {
     pub limits: Limits,
     /// Stripe price ids that pay for this tier (ADR 0040). Admins only see them.
     pub stripe_prices: Vec<String>,
+    /// What the pricing page says the tier costs (ADR 0121), as the operator wrote it.
+    /// Stripe's price decides what's charged; botd never asks Stripe for amounts.
+    pub published_prices: Vec<ListPrice>,
+    /// Short public lines the pricing page lists under the tier, such as its model
+    /// access, in the operator's words (ADR 0121). The routes themselves stay hidden.
+    pub features: Vec<String>,
     /// The harness new Bots of this tier's users get when none is asked for (ADR 0079):
     /// the file's `defaultHarness`, else the first route's. None on an open tier, whose
     /// new Bots get `DEFAULT_HARNESS`.
@@ -194,7 +218,19 @@ impl Tier {
 
     /// What anyone may see: no routes, so no model names.
     pub fn view(&self) -> Value {
-        json!({ "name": self.name, "label": self.label, "managed": self.managed(), "limits": self.limits })
+        let mut v = json!({ "name": self.name, "label": self.label, "managed": self.managed(), "limits": self.limits });
+        if !self.published_prices.is_empty() {
+            v["publishedPrices"] = json!(self.published_prices);
+        }
+        if !self.features.is_empty() {
+            v["features"] = json!(self.features);
+        }
+        v
+    }
+
+    /// Sold, so on the pricing page (ADR 0121): it has a Stripe price or a published one.
+    pub fn published(&self) -> bool {
+        !self.stripe_prices.is_empty() || !self.published_prices.is_empty()
     }
 
     /// For admins: the routes too.
@@ -300,6 +336,54 @@ struct TierCfg {
     stripe_prices: Vec<String>,
     #[serde(default, rename = "defaultHarness")]
     default_harness: Option<String>,
+    #[serde(default, rename = "publishedPrices")]
+    published_prices: Vec<ListPrice>,
+    #[serde(default)]
+    features: Vec<String>,
+}
+
+/// `publishedPrices`, checked: whole positive amounts, a currency code, month or year,
+/// each currency and interval once.
+fn published_prices(raw: Vec<ListPrice>) -> Result<Vec<ListPrice>, String> {
+    if raw.len() > MAX_PUBLISHED_PRICES {
+        return Err(format!("publishedPrices: list at most {MAX_PUBLISHED_PRICES}"));
+    }
+    let mut out: Vec<ListPrice> = Vec::new();
+    for p in raw {
+        let currency = p.currency.trim().to_ascii_lowercase();
+        if currency.len() != 3 || !currency.bytes().all(|b| b.is_ascii_lowercase()) {
+            return Err(format!("publishedPrices: currency \"{}\" must be a three-letter ISO 4217 code, like gbp, eur or usd", p.currency.trim()));
+        }
+        let interval = p.interval.trim().to_string();
+        if !["month", "year"].contains(&interval.as_str()) {
+            return Err(format!("publishedPrices: interval \"{interval}\" must be month or year"));
+        }
+        if p.amount == 0 || p.amount > MAX_PRICE_AMOUNT {
+            return Err(format!(
+                "publishedPrices: amount must be 1 to {MAX_PRICE_AMOUNT} in the currency's smallest unit (2900 is 29.00); SuperBot has no free tier (ADR 0068)"
+            ));
+        }
+        if out.iter().any(|o| o.currency == currency && o.interval == interval) {
+            return Err(format!("publishedPrices: {currency} per {interval} is listed twice"));
+        }
+        out.push(ListPrice { amount: p.amount, currency, interval });
+    }
+    Ok(out)
+}
+
+fn features(raw: Vec<String>) -> Result<Vec<String>, String> {
+    if raw.len() > MAX_FEATURES {
+        return Err(format!("features: list at most {MAX_FEATURES}"));
+    }
+    raw.into_iter()
+        .map(|f| {
+            let f = f.trim().to_string();
+            match (1..=MAX_FEATURE_CHARS).contains(&f.chars().count()) && !f.chars().any(char::is_control) {
+                true => Ok(f),
+                false => Err(format!("features: each is 1 to {MAX_FEATURE_CHARS} characters on one line")),
+            }
+        })
+        .collect()
 }
 
 fn slug(s: &str) -> bool {
@@ -330,7 +414,16 @@ fn word(what: &str, s: &Option<String>) -> Result<Option<String>, String> {
 impl Tiers {
     /// The built-in tier: any harness and model, no limits.
     pub fn self_host() -> Tiers {
-        let t = Tier { name: SELF_HOST.into(), label: "Self-host".into(), routes: None, limits: Limits::default(), stripe_prices: Vec::new(), default_harness: None };
+        let t = Tier {
+            name: SELF_HOST.into(),
+            label: "Self-host".into(),
+            routes: None,
+            limits: Limits::default(),
+            stripe_prices: Vec::new(),
+            published_prices: Vec::new(),
+            features: Vec::new(),
+            default_harness: None,
+        };
         Tiers { list: vec![t], default: 0, providers: Vec::new(), source: "built-in".into() }
     }
 
@@ -435,7 +528,9 @@ impl Tiers {
                 (Some(r), Some(h)) if r.iter().any(|r| r.harness == h) => Some(h.to_string()),
                 (Some(_), Some(h)) => return Err(format!("tier \"{name}\": defaultHarness \"{h}\" must be one of the tier's routes' harnesses")),
             };
-            list.push(Tier { label: label.unwrap_or_else(|| name.clone()), name, routes, limits, stripe_prices: prices, default_harness });
+            let published_prices = published_prices(t.published_prices).map_err(|e| format!("tier \"{name}\": {e}"))?;
+            let features = features(t.features).map_err(|e| format!("tier \"{name}\": {e}"))?;
+            list.push(Tier { label: label.unwrap_or_else(|| name.clone()), name, routes, limits, stripe_prices: prices, published_prices, features, default_harness });
         }
         let default = match default.or(cfg.default.as_deref()).map(str::trim) {
             None => 0,
@@ -731,6 +826,43 @@ mod tests {
         let l = &open.default_tier().limits;
         assert_eq!((l.daily_routine_runs, l.machine_type.as_deref(), open.by_stripe_price("price_x").is_none()), (None, None, true));
         assert_eq!((l.concurrent_runs, l.max_storage_mb), (None, None));
+    }
+
+    #[test]
+    fn published_prices_and_features_are_checked() {
+        let one = |extra: &str| format!(r#"{{"tiers":[{{"name":"a","routes":"any"{extra}}}]}}"#);
+        let raw = one(r#","publishedPrices":[{"amount":2900,"currency":" GBP ","interval":"month"},{"amount":29000,"currency":"gbp","interval":"year"}],"features":[" Claude Sonnet "]"#);
+        let t = Tiers::parse(&raw, None).unwrap();
+        let a = t.get("a").unwrap();
+        assert_eq!(a.published_prices[0], ListPrice { amount: 2900, currency: "gbp".into(), interval: "month".into() });
+        assert_eq!((a.published_prices.len(), a.features.as_slice()), (2, &["Claude Sonnet".to_string()][..]));
+        assert!(a.published());
+        assert_eq!(a.view()["publishedPrices"][1]["amount"], 29000);
+        assert_eq!(a.view()["features"], json!(["Claude Sonnet"]));
+        // Nothing new in the view of a tier that sets neither, and not sold.
+        let plain = Tiers::parse(&one(""), None).unwrap();
+        let p = plain.get("a").unwrap();
+        assert!(p.view().get("publishedPrices").is_none() && p.view().get("features").is_none() && !p.published());
+        assert!(tiers().get("starter").unwrap().published(), "a Stripe price is enough");
+
+        let bad = |extra: &str| Tiers::parse(&one(extra), None).unwrap_err();
+        let price = |p: &str| bad(&format!(r#","publishedPrices":[{p}]"#));
+        assert!(price(r#"{"amount":0,"currency":"gbp","interval":"month"}"#).contains("no free tier"));
+        assert!(price(r#"{"amount":1000000001,"currency":"gbp","interval":"month"}"#).contains("amount must be"));
+        assert!(price(r#"{"amount":-5,"currency":"gbp","interval":"month"}"#).contains("invalid value"));
+        assert!(price(r#"{"amount":29.5,"currency":"gbp","interval":"month"}"#).contains("invalid type"));
+        assert!(price(r#"{"amount":100,"currency":"pounds","interval":"month"}"#).contains("ISO 4217"));
+        assert!(price(r#"{"amount":100,"currency":"g1p","interval":"month"}"#).contains("ISO 4217"));
+        assert!(price(r#"{"amount":100,"currency":"gbp","interval":"week"}"#).contains("month or year"));
+        assert!(price(r#"{"amount":100,"currency":"gbp","interval":"month","stripe":"price_1"}"#).contains("unknown field"));
+        assert!(price(r#"{"amount":100,"currency":"gbp","interval":"month"},{"amount":200,"currency":"GBP","interval":"month"}"#).contains("listed twice"));
+        let five = [r#"{"amount":1,"currency":"gbp","interval":"month"}"#, r#"{"amount":1,"currency":"eur","interval":"month"}"#, r#"{"amount":1,"currency":"usd","interval":"month"}"#, r#"{"amount":1,"currency":"chf","interval":"month"}"#, r#"{"amount":1,"currency":"sek","interval":"month"}"#];
+        assert!(price(&five.join(",")).contains("at most 4"));
+        assert!(bad(r#","features":[""]"#).contains("1 to 120"));
+        assert!(bad(r#","features":["two\nlines"]"#).contains("one line"));
+        assert!(bad(&format!(r#","features":["{}"]"#, "x".repeat(121))).contains("1 to 120"));
+        assert!(bad(&format!(r#","features":[{}]"#, [r#""x""#; 11].join(","))).contains("at most 10"));
+        assert!(bad(r#","publishedPrices":[{"amount":0,"currency":"gbp","interval":"month"}]"#).starts_with("tier \"a\": publishedPrices"));
     }
 
     #[test]

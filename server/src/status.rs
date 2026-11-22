@@ -369,7 +369,7 @@ pub async fn html_page(State(app): State<AppState>) -> Response {
     res
 }
 
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -392,7 +392,7 @@ fn level_of(v: &Value) -> Level {
     serde_json::from_value(v.clone()).unwrap_or(Level::Operational)
 }
 
-const STYLE: &str = "body{font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:#fafafa;color:#171717}\
+pub(crate) const STYLE: &str = "body{font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:#fafafa;color:#171717}\
 main{max-width:720px;margin:0 auto;padding:32px 20px}h1{font-size:22px;margin:0 0 20px}h2{font-size:17px;margin:32px 0 12px}\
 .banner{padding:16px 20px;border-radius:10px;color:#fff;font-weight:600}.list{background:#fff;border:1px solid #e5e5e5;border-radius:10px}\
 .row{display:flex;justify-content:space-between;gap:12px;padding:12px 16px;border-top:1px solid #eee}.row:first-child{border-top:0}\

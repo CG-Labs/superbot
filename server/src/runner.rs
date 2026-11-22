@@ -251,6 +251,8 @@ pub struct App {
     pub teams: OnceLock<crate::teams::Settings>,
     /// STATUS_PAGE, and the public status page's shared snapshot (ADR 0090).
     pub status: crate::status::Page,
+    /// PLANS_PAGE and PLANS_CONTACT_URL: the public pricing page (ADR 0121). Unset: off.
+    pub plans: OnceLock<crate::plans::Settings>,
     /// Copies of the server's own backups off this host (ADR 0109).
     pub server_backups: OnceLock<Arc<crate::server_backups::ServerBackups>>,
     /// Whether the database is encrypted at rest, as found at startup (ADR 0116).
@@ -297,6 +299,7 @@ impl App {
             storage: Default::default(),
             teams: OnceLock::new(),
             status: Default::default(),
+            plans: OnceLock::new(),
             server_backups: OnceLock::new(),
             database: OnceLock::new(),
             closing: AtomicBool::new(false),

@@ -566,6 +566,11 @@ impl ControlPlane {
         self.provider.is_some()
     }
 
+    /// What `plan` gives a machine, if the provider knows without asking it (ADR 0081).
+    pub fn plan_resources(&self, plan: &str) -> Option<provider::Resources> {
+        self.provider.as_deref().and_then(|p| p.plan_resources(plan))
+    }
+
     /// The provider's name, if it says when its own backups succeed (ADR 0110).
     pub fn reporting_backups(&self) -> Option<&'static str> {
         self.provider.as_deref().filter(|p| p.reports_backups()).map(|p| p.name())
