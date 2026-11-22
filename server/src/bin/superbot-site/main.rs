@@ -1,7 +1,7 @@
 //! superbot-site: builds the public site (a landing page and the docs portal) as static
 //! files from this repository. Every page is rendered from the Markdown in `docs/` (and
 //! the install guide, security policy and changelog), with navigation and search, and
-//! the build fails on any broken internal link. ADR 0118.
+//! the build fails on any broken internal link. ADR 0119.
 //!
 //! Usage: superbot-site [--out DIR] [--repo DIR] [--tiers FILE] [--contact-url URL] [--repo-url URL]
 

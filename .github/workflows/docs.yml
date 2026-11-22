@@ -7,7 +7,7 @@ name: docs
 # workflow still scans, signs and attests its images (ADR 0101), and that the release
 # workflow checks CHANGELOG.md and publishes only from checked tags (ADR 0111). The site job
 # builds the public site and docs portal from docs/ and fails on any broken internal link
-# (ADR 0118); the site is kept as an artifact, never published from here.
+# (ADR 0119); the site is kept as an artifact, never published from here.
 on:
   push:
     paths:

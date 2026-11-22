@@ -1,4 +1,4 @@
-/* SuperBot docs portal, on top of site.css (brand tokens from docs/brand.md). ADR 0118. */
+/* SuperBot docs portal, on top of site.css (brand tokens from docs/brand.md). ADR 0119. */
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 
 .docs-layout { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 48px; align-items: start; padding: 32px 0 72px; }
