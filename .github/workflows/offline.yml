@@ -68,7 +68,10 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      # C code (aws-lc, SQLCipher) built against 24.04's glibc headers won't link on 22.04.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.os }}
       - run: cargo build --release --bin botd --bin botctl --bin superbot-machine --bin superbot-run
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -124,7 +127,7 @@ jobs:
           done
           sudo systemctl daemon-reload
           sudo systemctl restart caddy
-          [[ $(sudo readlink "/proc/$(systemctl show -p MainPID --value caddy)/ns/net") == $(sudo ip netns exec offline readlink /proc/self/ns/net) ]]
+          [[ $(sudo readlink "/proc/$(systemctl show -p MainPID --value caddy)/ns/net") == "$(sudo ip netns exec offline readlink /proc/self/ns/net)" ]]
       - name: Install from the bundle with no network
         run: |
           set -euo pipefail
@@ -141,7 +144,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo systemctl is-active --quiet superbot
-          [[ $(sudo readlink "/proc/$(systemctl show -p MainPID --value superbot)/ns/net") == $(sudo ip netns exec offline readlink /proc/self/ns/net) ]]
+          [[ $(sudo readlink "/proc/$(systemctl show -p MainPID --value superbot)/ns/net") == "$(sudo ip netns exec offline readlink /proc/self/ns/net)" ]]
           curl() { sudo ip netns exec offline curl "$@"; }
           for _ in $(seq 1 30); do
             curl -fsS --cacert "$RUNNER_TEMP/tls.pem" https://offline.test/healthz >/dev/null 2>&1 && break
