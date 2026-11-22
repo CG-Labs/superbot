@@ -24,6 +24,10 @@ path = "src/bin/superbot-license.rs"
 name = "superbot-run"
 path = "src/bin/superbot-run.rs"
 
+[[bin]]
+name = "superbot-site"
+path = "src/bin/superbot-site/main.rs"
+
 [dependencies]
 age = { version = "0.12", default-features = false }
 aws-lc-rs = "1"
@@ -53,6 +57,7 @@ url = "2"
 x509-parser = { version = "0.18", default-features = false }
 zeroize = "1.9.2"
 qrcode = { version = "0.15", default-features = false, features = ["svg"] }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 
 [dev-dependencies]
 tokio = { version = "1.54.1", features = ["test-util"] }
