@@ -8,6 +8,9 @@
 //! least loaded after placing it, `fill` the first in the order configured. With no
 //! room anywhere the machine isn't made: the request is refused, or the machine waits
 //! with the reason, audited (`machine.placement_failed`) and alerted once.
+//!
+//! With hosts tagged by data region (ADR 0117), only hosts in the machine's region are
+//! considered: one with no room there waits or is refused, never placed elsewhere.
 
 use super::provider::{HostStatus, Hosts, Policy, Resources};
 use super::{ControlPlane, State};
@@ -29,6 +32,8 @@ pub struct HostLoad {
     pub max_machines: Option<u64>,
     pub machines: u64,
     pub used: Resources,
+    /// Its data region, if hosts are tagged (ADR 0117).
+    pub region: Option<String>,
 }
 
 fn ratio(used: u64, cap: u64) -> f64 {
@@ -44,6 +49,14 @@ impl HostLoad {
             HostStatus::Up if self.failing_since.is_some() => Some(format!("{} didn't answer its last check", self.name)),
             HostStatus::Up if self.drained => Some(format!("{} is drained", self.name)),
             HostStatus::Up => None,
+        }
+    }
+
+    /// Why a machine whose data stays in `region` can't go here, with tagged hosts.
+    pub fn elsewhere(&self, region: &str) -> Option<String> {
+        match &self.region {
+            Some(r) if r != region => Some(format!("{} is in {r}", self.name)),
+            _ => None,
         }
     }
 
@@ -81,7 +94,7 @@ impl HostLoad {
         });
         json!({
             "machines": self.machines, "allocated": self.used, "capacity": self.capacity, "maxMachines": self.max_machines,
-            "free": free, "open": self.closed().is_none(), "closed": self.closed(),
+            "free": free, "open": self.closed().is_none(), "closed": self.closed(), "region": self.region,
         })
     }
 }
@@ -122,6 +135,7 @@ pub fn loads(app: &App, cp: &ControlPlane, h: &dyn Hosts) -> Vec<HostLoad> {
                 max_machines: c.max_machines,
                 machines: 0,
                 used: Resources::default(),
+                region: c.region,
             }
         })
         .collect();
@@ -153,11 +167,12 @@ pub fn loads(app: &App, cp: &ControlPlane, h: &dyn Hosts) -> Vec<HostLoad> {
 
 const NO_ROOM: &str = "No Incus host ";
 
-/// Why no host can take a machine of `plan`.
-fn none(plan: &str, why: Vec<String>) -> String {
+/// Why no host can take a machine of `plan` (in `region`, with tagged hosts).
+fn none(plan: &str, region: Option<&str>, why: Vec<String>) -> String {
+    let within = region.map(|r| format!(" in {r}")).unwrap_or_default();
     match why.is_empty() {
-        true => format!("{NO_ROOM}can take a {plan} machine: none is configured."),
-        false => format!("{NO_ROOM}has room for a {plan} machine: {}.", why.join("; ")),
+        true => format!("{NO_ROOM}can take a {plan} machine{within}: none is configured."),
+        false => format!("{NO_ROOM}has room for a {plan} machine{within}: {}.", why.join("; ")),
     }
 }
 
@@ -167,13 +182,14 @@ pub fn waiting(last_error: &str) -> bool {
 }
 
 /// The host a new machine of `plan` goes on, other than `except`, by INCUS_PLACEMENT;
-/// or why none can take it.
-pub fn choose(app: &App, cp: &ControlPlane, plan: &str, except: Option<&str>) -> Result<String, String> {
-    let Some(h) = cp.hosts() else { return Err(none(plan, Vec::new())) };
+/// or why none can take it. With tagged hosts, only one in `region` (ADR 0117).
+pub fn choose(app: &App, cp: &ControlPlane, plan: &str, region: &str, except: Option<&str>) -> Result<String, String> {
+    let Some(h) = cp.hosts() else { return Err(none(plan, None, Vec::new())) };
+    let within = h.tagged().then_some(region);
     let want = need(cp, plan);
     let (mut fits, mut why) = (Vec::new(), Vec::new());
     for (i, l) in loads(app, cp, h).into_iter().filter(|l| Some(l.name.as_str()) != except).enumerate() {
-        match l.closed().map(Err).unwrap_or_else(|| l.room(want)) {
+        match l.elsewhere(region).or_else(|| l.closed()).map(Err).unwrap_or_else(|| l.room(want)) {
             Ok(load) => fits.push((load, l.machines, i, l.name)),
             Err(e) => why.push(e),
         }
@@ -181,13 +197,19 @@ pub fn choose(app: &App, cp: &ControlPlane, plan: &str, except: Option<&str>) ->
     if h.policy() == Policy::Spread {
         fits.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     }
-    fits.into_iter().next().map(|f| f.3).ok_or_else(|| none(plan, why))
+    fits.into_iter().next().map(|f| f.3).ok_or_else(|| none(plan, within, why))
 }
 
-/// Whether a machine of `plan` may go on `host`: open, with room.
-pub fn fits(app: &App, cp: &ControlPlane, plan: &str, host: &str) -> Result<(), String> {
+/// Whether a machine of `plan` whose data stays in `region` may go on `host`: in that
+/// region (with tagged hosts), open, with room.
+pub fn fits(app: &App, cp: &ControlPlane, plan: &str, region: &str, host: &str) -> Result<(), String> {
     let Some(h) = cp.hosts() else { return Ok(()) };
     let l = loads(app, cp, h).into_iter().find(|l| l.name == host).ok_or_else(|| format!("There's no Incus host \"{}\".", crate::audit::clip(host, 40)))?;
+    if let Some(r) = &l.region
+        && r != region
+    {
+        return Err(format!("Host {host} is in {r}, and this machine's data stays in {region} (ADR 0117)."));
+    }
     match l.closed() {
         Some(why) => Err(format!("Host {why}; nothing new goes there.")),
         None => l.room(need(cp, plan)).map(drop).map_err(|e| format!("Host {e}.")),
@@ -264,6 +286,7 @@ mod tests {
             max_machines: max,
             machines,
             used: r(used),
+            region: None,
         }
     }
 
@@ -295,6 +318,12 @@ mod tests {
         assert_eq!(h.closed().as_deref(), Some("a is down"));
         h.status = HostStatus::Lost;
         assert_eq!(h.closed().as_deref(), Some("a was declared lost"));
+        let mut lon = host("lon-1", None, None, 0, (0, 0, 0));
+        assert_eq!(lon.elsewhere("de-fra-2"), None, "untagged hosts take any region");
+        lon.region = Some("gb-lon".into());
+        assert_eq!((lon.elsewhere("gb-lon"), lon.elsewhere("de-fra-2").as_deref()), (None, Some("lon-1 is in gb-lon")));
+        assert_eq!(none("c1-m2-d20", Some("de-fra-2"), vec!["lon-1 is in gb-lon".into()]), "No Incus host has room for a c1-m2-d20 machine in de-fra-2: lon-1 is in gb-lon.");
+        assert!(waiting(&none("c1-m2-d20", Some("de-fra-2"), vec![])), "a machine waiting for room in its region says so like any other");
         let v = host("b", Some((8, 32, 500)), Some(10), 2, (4, 8, 80)).view();
         assert_eq!(v["free"], json!({ "cpus": 4, "memoryGiB": 24, "diskGiB": 420 }));
         assert_eq!((v["open"].as_bool(), v["allocated"]["cpus"].as_u64()), (Some(true), Some(4)));

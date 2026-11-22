@@ -4,7 +4,7 @@
 
 Accepted (22 Nov 2026). First slice of the marketing site and docs portal of M4, [#44](https://github.com/CG-Labs/superbot/issues/44).
 
-0116 is the highest number on `main`, and 0117 is taken by a pull request in flight ([PR #180](https://github.com/CG-Labs/superbot/pull/180)), so this is 0118. Renumber it if another ADR lands first.
+0117 ([PR #180](https://github.com/CG-Labs/superbot/pull/180)) is the highest number on `main`, so this is 0118. Renumber it if another ADR lands first.
 
 ## Context
 

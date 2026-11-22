@@ -12,6 +12,10 @@
 //! fails as unreachable, never as "not found", so no machine is taken for gone by a
 //! host's silence. Every host's address is denied to every container, and the
 //! firewall is kept the same on every host that is up.
+//!
+//! Hosts may be tagged with the data region they are in (INCUS_REGION, or
+//! INCUS_REGION_<NAME> for one; ADR 0117): then a machine's region is its host's, and
+//! placement keeps each machine on hosts in its region.
 
 use super::{Credentials, DEFAULT_IMAGE, DEFAULT_TIERS, Incus, Settings, Size, host_cidr};
 use crate::machines::provider::{
@@ -32,11 +36,13 @@ pub struct Member {
     /// What its machines may be given in all (ADR 0081). None: no limit.
     pub capacity: Option<Resources>,
     pub max_machines: Option<u64>,
+    /// The data region it is in (ADR 0117). None: hosts aren't tagged.
+    pub region: Option<String>,
 }
 
 impl Member {
     pub fn new(name: &str, incus: Incus) -> Member {
-        Member { name: name.into(), incus, capacity: None, max_machines: None }
+        Member { name: name.into(), incus, capacity: None, max_machines: None, region: None }
     }
 }
 
@@ -91,8 +97,12 @@ fn no_host() -> ProviderError {
     ProviderError::Transport("no Incus host is up".into())
 }
 
+/// With tagged hosts, a machine is in its host's region.
 fn prefixed(m: &Member, mut pm: ProviderMachine) -> ProviderMachine {
     pm.id = format!("{}/{}", m.name, pm.id);
+    if let Some(r) = &m.region {
+        pm.region = r.clone();
+    }
     pm
 }
 
@@ -123,7 +133,9 @@ impl Fleet {
     /// INCUS_HOST_DOWN_MINUTES, and placement (ADR 0081): INCUS_PLACEMENT, and each
     /// host's INCUS_CAPACITY and INCUS_MAX_MACHINES (shared, unless `_<NAME>` sets
     /// that host's own, the first host's included). Capacity is set for every host or for none, so the
-    /// least loaded host is one measure across them all.
+    /// least loaded host is one measure across them all. INCUS_REGION tags hosts with
+    /// their data region (ADR 0117), also every host or none, so no machine lands on a
+    /// host whose region nobody stated.
     pub fn from_env(store: &dyn SecretStore, var: &dyn Fn(&str) -> String) -> Result<Fleet, String> {
         let main = Some(var("INCUS_HOST_NAME").trim().to_string()).filter(|v| !v.is_empty()).unwrap_or(DEFAULT_HOST.into());
         if !host_name(&main) {
@@ -184,7 +196,21 @@ impl Fleet {
                 "" => None,
                 v => Some(v.parse::<u64>().ok().filter(|n| (1..=100_000).contains(n)).ok_or(format!("{key} must be 1 to 100000"))?),
             };
-            members.push(Member { capacity: cap, max_machines: max, ..Member::new(&name, Incus::new(s, c)?) });
+            let (key, raw) = own("INCUS_REGION", &name);
+            let region = match raw.trim() {
+                "" => None,
+                r if crate::machines::slug(r, 32) => Some(r.to_string()),
+                r => return Err(format!("{key}: \"{}\" isn't a region id: lowercase letters, digits and dashes, e.g. gb-lon", crate::audit::clip(r, 40))),
+            };
+            members.push(Member { capacity: cap, max_machines: max, region, ..Member::new(&name, Incus::new(s, c)?) });
+        }
+        if let Some(m) = members.iter().find(|m| m.region.is_none())
+            && members.iter().any(|m| m.region.is_some())
+        {
+            return Err(format!(
+                "INCUS_REGION: set for every Incus host or none; host {} has none (INCUS_REGION for all, INCUS_REGION_<NAME> for one)",
+                m.name
+            ));
         }
         if let Some(m) = members.iter().find(|m| m.capacity.is_none())
             && members.iter().any(|m| m.capacity.is_some())
@@ -274,6 +300,7 @@ impl MachineProvider for Fleet {
                 json!({
                     "name": h.name, "url": h.url, "serverCertificate": h.fingerprint, "project": s.project, "network": s.network,
                     "storagePool": s.pool, "status": h.status, "capacity": h.capacity, "maxMachines": h.max_machines,
+                    "region": h.region,
                 })
             })
             .collect::<Vec<_>>());
@@ -568,6 +595,7 @@ impl Hosts for Fleet {
                 status: s.get(&m.name).copied().unwrap_or(HostStatus::Up),
                 capacity: m.capacity,
                 max_machines: m.max_machines,
+                region: m.region.clone(),
             })
             .collect()
     }
@@ -582,6 +610,11 @@ impl Hosts for Fleet {
                 return Err(ProviderError::Transport(format!("Incus host {host} isn't up")));
             }
             let m = self.member(host).ok_or_else(|| ProviderError::Transport(format!("Incus host {host} isn't configured (INCUS_HOSTS)")))?;
+            // A tagged host's region is botd's word for where it is, not a cluster member.
+            if m.region.is_some() {
+                let local = CreateSpec { region: super::LOCAL.into(), ..spec.clone() };
+                return m.incus.create(&local).await.map(|pm| prefixed(m, pm));
+            }
             m.incus.create(spec).await.map(|pm| prefixed(m, pm))
         })
     }
@@ -741,7 +774,28 @@ mod tests {
         assert_eq!((hosts[0].capacity.map(|c| c.cpus), hosts[1].capacity.map(|c| c.cpus)), (Some(8), Some(32)), "the first host's own, too");
         assert_eq!((hosts[0].max_machines, hosts[1].max_machines), (Some(5), None));
 
+        // Data regions (ADR 0117): every host tagged, or none.
+        let f = two(vec![("INCUS_REGION", "gb-lon".into()), ("INCUS_REGION_B", "de-fra-2".into())]).unwrap();
+        assert_eq!(f.configured().iter().map(|h| h.region.as_deref()).collect::<Vec<_>>(), [Some("gb-lon"), Some("de-fra-2")]);
+        assert!(f.tagged() && !two(vec![]).unwrap().tagged());
+        assert_eq!(f.settings()["hosts"][1]["region"], "de-fra-2");
+        let pm = ProviderMachine {
+            id: "superbot-m1".into(),
+            label: "superbot-m1".into(),
+            status: "running".into(),
+            plan: "c1-m2-d20".into(),
+            region: "local".into(),
+            ipv4: None,
+            backups: false,
+            last_backup_at: None,
+            tags: vec![],
+            user_data: false,
+        };
+        assert_eq!((prefixed(&f.members[1], pm.clone()).region.as_str(), prefixed(&two(vec![]).unwrap().members[1], pm).region.as_str()), ("de-fra-2", "local"));
+
         for (extra, want) in [
+            (vec![("INCUS_REGION_B", "de-fra-2".to_string())], "INCUS_REGION: set for every Incus host or none; host main"),
+            (vec![("INCUS_REGION", "London".to_string())], "INCUS_REGION: \"London\" isn't a region id"),
             (vec![("INCUS_CAPACITY_B", "c8-m32-d500".to_string())], "set for every Incus host or none; host main"),
             (vec![("INCUS_CAPACITY", "32 cpus".to_string())], "INCUS_CAPACITY: \"32 cpus\" isn't a capacity"),
             (vec![("INCUS_CAPACITY", "c32-m128-d2000".to_string()), ("INCUS_CAPACITY_B", "c0-m1-d1".to_string())], "INCUS_CAPACITY_B:"),

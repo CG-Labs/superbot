@@ -130,7 +130,9 @@ pub fn check_name(name: &str) -> Result<(), Error> {
 pub fn server_secret(name: &str) -> bool {
     let provider = |suffix: &str| name.strip_prefix("SSO_").and_then(|n| n.strip_suffix(suffix)).is_some_and(|id| !id.is_empty());
     let bot_webhook = name.strip_prefix(BOT_WEBHOOK_PREFIX).is_some_and(|id| !id.is_empty());
-    env_shaped(name) && (provider("_CLIENT_SECRET") || provider("_PRIVATE_KEY") || SERVER_SECRETS.contains(&name) || bot_webhook)
+    // A data region's own machine backup store (ADR 0117): MACHINE_BACKUP_S3_<REGION>_SECRET_ACCESS_KEY.
+    let region_store = name.strip_prefix("MACHINE_BACKUP_S3_").and_then(|n| n.strip_suffix("_SECRET_ACCESS_KEY")).is_some_and(|r| !r.is_empty());
+    env_shaped(name) && (provider("_CLIENT_SECRET") || provider("_PRIVATE_KEY") || SERVER_SECRETS.contains(&name) || bot_webhook || region_store)
 }
 
 /// The Turnstile secret (ADR 0022), the Linode token, which can rent and delete every
