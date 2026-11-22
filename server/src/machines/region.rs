@@ -18,9 +18,9 @@ use crate::runner::App;
 use crate::users::need_user_key;
 use crate::{ApiError, AppState, Auth, Res, bad, not_found};
 use axum::Json;
-use axum::body::Bytes;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Path, State as AppS};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -100,15 +100,27 @@ pub fn refuse_request(app: &App, by: &Who, u: &User, eff: &Effective, asked: &st
     ))
 }
 
+/// A region change's body: `{"region": "<id>"}`, or `{"region": null}`; the field is required.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pick {
+    #[serde(deserialize_with = "nullable")]
+    region: Option<String>,
+}
+
+fn nullable<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(d)
+}
+
 /// `null`, or one of MACHINE_REGIONS.
-fn pick(cp: &ControlPlane, body: &Bytes) -> Res<Option<String>> {
-    let v: Value = serde_json::from_slice(body).map_err(|e| bad(format!("Invalid JSON: {e}")))?;
-    let obj = v.as_object().filter(|o| o.len() == 1 && o.contains_key("region")).ok_or_else(|| bad("Send {\"region\": \"<id>\"}, or {\"region\": null} for the server's default."))?;
-    let choices = || format!("region must be one of {}, or null for the server's default", cp.regions.join(", "));
-    match &obj["region"] {
-        Value::Null => Ok(None),
-        Value::String(r) if cp.regions.iter().any(|x| x == r.trim()) => Ok(Some(r.trim().to_string())),
-        _ => Err(bad(choices())),
+fn pick(cp: &ControlPlane, body: Result<Json<Pick>, JsonRejection>) -> Res<Option<String>> {
+    let Ok(Json(Pick { region })) = body else {
+        return Err(bad("Send {\"region\": \"<id>\"}, or {\"region\": null} for the server's default."));
+    };
+    match region.as_deref().map(str::trim) {
+        None => Ok(None),
+        Some(r) if cp.regions.iter().any(|x| x == r) => Ok(Some(r.to_string())),
+        Some(_) => Err(bad(format!("region must be one of {}, or null for the server's default", cp.regions.join(", ")))),
     }
 }
 
@@ -153,10 +165,10 @@ pub async fn get_user(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Aut
 
 /// `PUT /api/users/{key}/region` `{region: id | null}`: sets or clears a user's data
 /// region. Refused while their machine is somewhere the new region isn't.
-pub async fn set_user(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<crate::audit::Who>, Path(key): Path<String>, body: Bytes) -> Res {
+pub async fn set_user(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<crate::audit::Who>, Path(key): Path<String>, body: Result<Json<Pick>, JsonRejection>) -> Res {
     let cp = &*a.machines;
     cp.need()?;
-    let to = pick(cp, &body)?;
+    let to = pick(cp, body)?;
     let u = need_user_key(&app, &key)?;
     // Under the lock requests take, so no machine is made meanwhile in the old region.
     let _g = cp.lock_ops().await;
@@ -202,10 +214,10 @@ pub async fn get_team(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Aut
 /// `PUT /api/teams/{id}/region` `{region: id | null}`: sets or clears a team's data
 /// region, for its members with none of their own. Refused while any of them has a
 /// machine somewhere the new region isn't.
-pub async fn set_team(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<crate::audit::Who>, Path(id): Path<String>, body: Bytes) -> Res {
+pub async fn set_team(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<crate::audit::Who>, Path(id): Path<String>, body: Result<Json<Pick>, JsonRejection>) -> Res {
     let cp = &*a.machines;
     cp.need()?;
-    let to = pick(cp, &body)?;
+    let to = pick(cp, body)?;
     let _g = cp.lock_ops().await;
     let t = app.db.team(id.trim()).ok_or_else(|| not_found("Team"))?;
     let before = resolve(cp, None, t.region.as_deref());
@@ -314,12 +326,13 @@ mod tests {
     #[test]
     fn a_region_is_null_or_one_offered() {
         let cp = ControlPlane { regions: vec!["gb-lon".into(), "de-fra-2".into()], ..ControlPlane::default() };
-        let b = |s: &str| Bytes::from(s.to_string());
-        assert_eq!(pick(&cp, &b(r#"{"region":" de-fra-2 "}"#)).unwrap().as_deref(), Some("de-fra-2"));
-        assert_eq!(pick(&cp, &b(r#"{"region":null}"#)).unwrap(), None);
-        for body in [r#"{"region":"us-east"}"#, r#"{}"#, r#"{"region":"gb-lon","x":1}"#, r#"{"region":7}"#, "nope"] {
-            assert!(pick(&cp, &b(body)).is_err(), "{body}");
+        let b = |s: &str| serde_json::from_str::<Pick>(s);
+        let p = |s: &str| pick(&cp, Ok(Json(b(s).unwrap())));
+        assert_eq!(p(r#"{"region":" de-fra-2 "}"#).unwrap().as_deref(), Some("de-fra-2"));
+        assert_eq!(p(r#"{"region":null}"#).unwrap(), None);
+        assert!(p(r#"{"region":"us-east"}"#).unwrap_err().1.contains("gb-lon, de-fra-2"));
+        for body in [r#"{}"#, r#"{"region":"gb-lon","x":1}"#, r#"{"region":7}"#, "nope"] {
+            assert!(b(body).is_err(), "{body}");
         }
-        assert!(pick(&cp, &b(r#"{"region":"us-east"}"#)).unwrap_err().1.contains("gb-lon, de-fra-2"));
     }
 }
