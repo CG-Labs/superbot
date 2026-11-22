@@ -22,6 +22,7 @@ const TOKEN: &str = "test-token-3f9c1e7a5b2d4c6e8f0a";
 const HEAD102: &str = "a102a102a102a102a102a102a102a102a102a102";
 const HEAD101: &str = "a101a101a101a101a101a101a101a101a101a101";
 const DIRECT: &str = "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0";
+const PUSHED_LATER: &str = "e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0";
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
@@ -75,6 +76,15 @@ async fn github(State(m): State<Arc<Mock>>, uri: Uri, headers: HeaderMap) -> Res
                 None => reply(200, fixture("pulls-page1.json"), Some(format!("<{pulls}2>; rel=\"next\", <{pulls}3>; rel=\"last\""))),
                 Some("2") => reply(200, fixture("pulls-page2.json"), Some(format!("<{pulls}3>; rel=\"next\""))),
                 _ => reply(500, r#"{"message":"page 3 is past the period and must not be read"}"#.into(), None),
+            }
+        }
+        "/activity" => {
+            assert_eq!((q["ref"].as_str(), q.get("time_period")), ("refs/heads/main", None), "the branch's updates, back to the period");
+            let activity = format!("{base}{REPO}/activity?ref=refs%2Fheads%2Fmain&direction=desc&per_page=100&after=");
+            match q.get("after").map(String::as_str) {
+                None => reply(200, fixture("activity-page1.json"), Some(format!("<{activity}c1>; rel=\"next\""))),
+                Some("c1") => reply(200, fixture("activity-page2.json"), Some(format!("<{activity}c2>; rel=\"next\""))),
+                _ => reply(500, r#"{"message":"updates before the period must not be read"}"#.into(), None),
             }
         }
         "/pulls/102" => ok("pull-102.json"),
@@ -162,6 +172,7 @@ fn exports_merged_pull_requests_checks_protection_and_runs_as_a_checkable_bundle
     assert!(out.contains("Merged without an approval by someone else: #101"), "{out}");
     assert!(out.contains("Merged without every required check passing: #101"), "{out}");
     assert!(out.contains("Commits without a merged pull request: d0d0d0d0d0d0"), "{out}");
+    assert!(out.contains("Pushes, not pull request merges, to the branch: e0e0e0e0e0e0, d0d0d0d0d0d0"), "{out}");
 
     let requests = m.requests.lock().unwrap().clone();
     assert!(requests.iter().all(|(_, auth)| auth.as_deref() == Some(&format!("Bearer {TOKEN}"))), "every request carries the token as a bearer");
@@ -227,6 +238,9 @@ fn exports_merged_pull_requests_checks_protection_and_runs_as_a_checkable_bundle
     assert_eq!(prs["exceptions"]["requiredChecksNotPassed"], serde_json::json!([101]));
     assert_eq!(prs["exceptions"]["requiredChecksPassedOnlyAfterMerge"], serde_json::json!([101]));
     assert_eq!(prs["exceptions"]["directCommits"], serde_json::json!([DIRECT]));
+    assert_eq!(prs["exceptions"]["directPushes"], serde_json::json!([PUSHED_LATER, DIRECT]), "a force push of a commit dated before the period is caught from the branch's activity");
+    assert_eq!((prs["branchUpdates"]["total"].as_u64(), prs["branchUpdates"]["byType"]["pr_merge"].as_u64()), (Some(4), Some(2)));
+    assert!(!requests.iter().any(|(u, _)| u.contains("after=c2")), "updates before the period aren't read");
     assert_eq!((prs["summary"]["merged"].as_u64(), prs["summary"]["commitsOnBranch"].as_u64()), (Some(2), Some(3)));
     assert_eq!(prs["periodCovered"]["days"], 31);
 
