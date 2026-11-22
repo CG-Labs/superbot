@@ -1,6 +1,9 @@
 //! botd: the server. Owns Bots, chats, memory files, and routines; runs each Bot
 //! on its harness (Claude Code, Codex, Pi, or Hermes Agent); serves the web app and its API.
 
+mod access_review;
+#[cfg(test)]
+mod access_review_http_tests;
 mod accounts;
 #[cfg(test)]
 mod accounts_http_tests;
@@ -705,6 +708,9 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/approvals/{id}/deny", post(deny))
         .route("/audit", get(list_audit))
         .route("/audit/export.csv", get(export_audit))
+        .route("/access-review", get(access_review::get))
+        .route("/access-review/export.csv", get(access_review::export))
+        .route("/access-review/complete", post(access_review::complete))
         .route("/secrets", get(list_secrets))
         .route("/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/me/tier", get(my_tier))
