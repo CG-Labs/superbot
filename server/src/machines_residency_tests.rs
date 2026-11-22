@@ -89,13 +89,20 @@ async fn a_pinned_users_region_and_restores_stay_in_it_and_a_pin_needs_all_their
 
     // Someone whose machine is in London can't be pinned to Frankfurt.
     let (lon, _) = user_with(env.port, &env.admin, "lon@example.com", "member").await;
-    machine_for(&env, &env.a, "a", &lon, false).await;
+    let lm = machine_for(&env, &env.a, "a", &lon, false).await;
     let (code, v) = json_call(&env, "PUT", &format!("/api/users/{lon}/residency"), &pin("de-fra-2", "DPA-2")).await;
     assert_eq!(code, 409, "{v}");
     assert!(v["error"].as_str().unwrap().contains("their machine is in gb-lon"), "{v}");
     let refused = events(&env, "user.residency_pin_refused").await;
     assert_eq!((refused[0]["details"]["reason"].as_str(), refused[0]["targetId"].as_str()), (Some("data_outside"), Some(lon.as_str())));
     assert!(env.app.db.residency_pin(PinOn::User, &lon).is_none());
+    // Once the machine is gone, a backup that failed (perhaps after its upload) still counts.
+    let n = crate::db::NewMachineBackup { id: "bfailed", machine: &lm, object_key: "t/failed.incus", store_region: None, encrypted: false, created_by: Some("schedule") };
+    env.app.db.machine_backup_start(&n).unwrap();
+    assert!(env.app.db.machine_backup_end("bfailed", None, Some("botd stopped")));
+    assert_eq!(json_call(&env, "DELETE", &format!("/api/users/{lon}/machine"), "").await.0, 200);
+    let (code, v) = json_call(&env, "PUT", &format!("/api/users/{lon}/residency"), &pin("de-fra-2", "DPA-2")).await;
+    assert!(code == 409 && v["error"].as_str().unwrap().contains("1 of their machine backups are in a store outside de-fra-2"), "{v}");
 
     // Pinned elsewhere needs an unpin first; the same region again renews the reference.
     let (code, v) = json_call(&env, "PUT", &path, &pin("gb-lon", "DPA-3")).await;
@@ -209,6 +216,11 @@ async fn a_pinned_team_keeps_members_and_its_region_in_it_and_cant_be_deleted_un
     assert_eq!(audit(port, &admin, "team.region_change_refused").await[0]["details"]["reason"].as_str(), Some("residency_pinned"));
     assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/region"), &admin, r#"{"region":"gb-lon"}"#).await.0, 409);
     assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/region"), &admin, r#"{"region":"de-fra-2"}"#).await.0, 200, "the same region is fine");
+    // Her own pin, agreeing with the team's, holds her own region even though the team's would allow clearing it.
+    assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("de-fra-2", "DPA-ada")).await.0, 200);
+    let (code, v) = call_json(port, "PUT", &format!("/api/users/{ada}/region"), &admin, r#"{"region":null}"#).await;
+    assert!(code == 409 && v["error"].as_str().unwrap().contains("Their data is pinned to de-fra-2 (DPA-ada)"), "{v}");
+    assert_eq!(call(port, "DELETE", &format!("/api/users/{ada}/residency"), &admin, r#"{"reason":"covered by the team"}"#).await.0, 200);
     let (code, v) = call_json(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("gb-lon", "DPA-9")).await;
     assert_eq!(code, 409, "{v}");
     assert_eq!(audit(port, &admin, "user.residency_pin_refused").await[0]["details"]["reason"].as_str(), Some("team_pinned"));
@@ -232,4 +244,17 @@ async fn a_pinned_team_keeps_members_and_its_region_in_it_and_cant_be_deleted_un
     assert_eq!(audit(port, &admin, "team.residency_unpinned").await[0]["details"]["reason"].as_str(), Some("moved to the EU contract"));
     assert_eq!(call(port, "DELETE", &format!("/api/teams/{team}"), &admin, "").await.0, 200);
     assert!(app.db.residency_pins().is_empty());
+
+    // Erasing someone takes their own pin, and their email out of any other pin's reference.
+    let (dan, _) = user_with(port, &admin, "dan@example.com", "member").await;
+    assert_eq!(call(port, "PUT", &format!("/api/users/{dan}/residency"), &admin, &pin("gb-lon", "DPA-dan")).await.0, 200);
+    let (code, t) = call_json(port, "POST", "/api/teams", &admin, &json!({ "name": "Beta", "owner": "cy@example.com" }).to_string()).await;
+    assert_eq!(code, 201, "{t}");
+    let beta = t["id"].as_str().unwrap().to_string();
+    assert_eq!(call(port, "PUT", &format!("/api/teams/{beta}/residency"), &admin, &pin("gb-lon", "MSA-8, signed by dan@example.com")).await.0, 200);
+    let (code, v) = call_json(port, "POST", &format!("/api/users/{dan}/erase"), &admin, "{}").await;
+    assert_eq!(code, 200, "{v}");
+    assert!(app.db.residency_pin(PinOn::User, &dan).is_none());
+    let reference = app.db.residency_pin(PinOn::Team, &beta).unwrap().reference;
+    assert!(reference.starts_with("MSA-8, signed by ") && !reference.contains("dan@example.com"), "{reference}");
 }

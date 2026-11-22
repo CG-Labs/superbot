@@ -69,8 +69,9 @@ fn stored_in(off: Option<&Offsite>, store_region: Option<&str>, region: &str) ->
     }
 }
 
-/// What of `user_id`'s data is outside `region` now: their machine, and backups that
-/// finished or are running in a store elsewhere. Empty: all of it is in.
+/// What of `user_id`'s data is outside `region` now: their machine, and backups in a store
+/// elsewhere that aren't deleted. A failed one counts: its upload may have finished before
+/// it failed. Empty: all of it is in.
 fn outside(app: &App, cp: &ControlPlane, user_id: &str, region: &str) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(m) = app.db.user_machine(user_id).filter(|m| m.region != region) {
@@ -81,7 +82,7 @@ fn outside(app: &App, cp: &ControlPlane, user_id: &str, region: &str) -> Vec<Str
         .db
         .user_machine_backups_kept(user_id)
         .iter()
-        .filter(|b| matches!(b.state.as_str(), "done" | "running") && !stored_in(off, b.store_region.as_deref(), region))
+        .filter(|b| !stored_in(off, b.store_region.as_deref(), region))
         .count();
     if n > 0 {
         out.push(format!("{n} of their machine backups are in a store outside {region}"));
@@ -150,14 +151,19 @@ pub fn refused(app: &App, by: &Who, m: &Machine, action: &str, p: &ResidencyPin,
 }
 
 /// Whether `u`'s own region may become `to`, which makes their region `after`: never
-/// away from a pin. A pin on them holds their own region to it; one on their team
-/// allows only none (the team's) or the same.
+/// away from a pin. A pin on them holds their own region to it, even while their team's
+/// pin agrees (that one may end first); one on their team allows only none (the team's)
+/// or the same.
 pub fn check_user_region(app: &App, u: &User, to: Option<&str>, after: &str) -> Result<(), (Box<ResidencyPin>, String)> {
-    let Some(p) = of_user(app, &u.id) else { return Ok(()) };
+    let mine = app.db.residency_pin(PinOn::User, &u.id);
+    let p = match mine.filter(|p| to != Some(p.region.as_str())) {
+        Some(p) => p,
+        None => match app.db.team_id_of(&u.id).and_then(|t| app.db.residency_pin(PinOn::Team, &t)).filter(|p| after != p.region) {
+            Some(p) => p,
+            None => return Ok(()),
+        },
+    };
     let own = p.subject_type == PinOn::User;
-    if after == p.region && (!own || to == Some(p.region.as_str())) {
-        return Ok(());
-    }
     let whose = if own { "Their data" } else { "Their team's data" };
     let why = format!(
         "{whose} is {} by {}. Unpin it first, with a reason (botctl {} residency ... unpin) (ADR 0129).",
@@ -358,6 +364,9 @@ pub async fn pin_team(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Aut
         app.db.record(&crate::teams::team_event(&by, "team.residency_pin_refused", &t.id, d).outcome(Outcome::Denied));
         conflict(why)
     };
+    if crate::teams::being_deleted(&t.id) {
+        return Err(refuse("team_deleting", format!("Team {} is being deleted (ADR 0129).", t.name), Value::Null));
+    }
     let own = app.db.residency_pin(PinOn::Team, &t.id);
     if let Some(o) = own.as_ref().filter(|o| o.region != region) {
         return Err(refuse("pinned", format!("Team {} is {}. Unpin first, with a reason, to pin elsewhere (ADR 0129).", t.name, pinned_to(o)), Value::Null));
