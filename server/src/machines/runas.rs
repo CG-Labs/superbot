@@ -12,7 +12,7 @@ use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A user and group to run as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -149,32 +149,96 @@ pub const PRIVILEGED_GROUPS: [&str; 14] = [
 /// Where sudo reads its rules.
 const SUDOERS: &str = "/etc/sudoers";
 const SUDOERS_D: &str = "/etc/sudoers.d";
+const SUDO_BINS: [&str; 2] = ["/usr/bin/sudo", "/bin/sudo"];
 
 /// Why `name` (with `ids`) isn't an unprivileged user, if it isn't: root's uid or
 /// group, one of `PRIVILEGED_GROUPS`, or a sudo rule for it, one of its groups, or
-/// everyone. Read from the group database and sudo's own files.
+/// everyone. Sudo itself is asked when it's installed (rules from any source it reads);
+/// its files are read too, in case it can't answer.
 pub fn privileged(name: &str, ids: Ids) -> Option<String> {
     let groups = group_list(name, ids.gid);
-    let mut sudoers = Vec::new();
-    let mut read = |p: &Path| {
-        if let Ok(text) = std::fs::read_to_string(p) {
-            sudoers.push((p.display().to_string(), text));
+    let found = privileged_in(name, ids, &groups, &sudoers());
+    if found.is_some() {
+        return found;
+    }
+    sudo_allows(name).then(|| "has a sudo rule (sudo -l lists commands it may run)".into())
+}
+
+/// Whether `sudo -l -U name` says `name` may run anything. Needs root; false when sudo
+/// isn't installed or doesn't answer.
+fn sudo_allows(name: &str) -> bool {
+    let Some(bin) = SUDO_BINS.iter().find(|b| Path::new(b).exists()) else { return false };
+    std::process::Command::new(bin)
+        .args(["-n", "-l", "-U", name])
+        .env_clear()
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("may run the following commands"))
+}
+
+/// Sudo's files: /etc/sudoers, /etc/sudoers.d, and whatever they include.
+fn sudoers() -> Vec<(String, String)> {
+    sudoers_from(vec![PathBuf::from(SUDOERS), PathBuf::from(SUDOERS_D)])
+}
+
+fn sudoers_from(mut todo: Vec<PathBuf>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    todo.reverse();
+    while let Some(p) = todo.pop() {
+        if out.len() >= 256 || out.iter().any(|(q, _)| Path::new(q) == p) {
+            continue;
         }
-    };
-    read(Path::new(SUDOERS));
-    if let Ok(dir) = std::fs::read_dir(SUDOERS_D) {
-        let mut files: Vec<_> = dir.flatten().map(|e| e.path()).collect();
-        files.sort();
-        // sudo skips files with a dot or ending in `~` in its folder.
-        for p in files.iter().filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| !n.contains('.') && !n.ends_with('~'))
-        }) {
-            read(p);
+        if p.is_dir() {
+            let Ok(dir) = std::fs::read_dir(&p) else { continue };
+            let mut files: Vec<_> = dir.flatten().map(|e| e.path()).collect();
+            files.sort();
+            // sudo skips files with a dot or ending in `~` in an included folder.
+            todo.extend(files.into_iter().rev().filter(|f| {
+                f.file_name().and_then(|n| n.to_str()).is_some_and(|n| !n.contains('.') && !n.ends_with('~'))
+            }));
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&p) else { continue };
+        let here = p.parent().unwrap_or(Path::new("/")).to_path_buf();
+        for line in joined(&text) {
+            let mut w = line.split_whitespace();
+            if let (Some("@include" | "#include" | "@includedir" | "#includedir"), Some(to)) = (w.next(), w.next()) {
+                let to = Path::new(to);
+                todo.push(if to.is_absolute() { to.to_path_buf() } else { here.join(to) });
+            }
+        }
+        out.push((p.display().to_string(), text));
+    }
+    out
+}
+
+/// A sudoers file's lines, with `\`-continued lines joined.
+fn joined(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for line in text.lines() {
+        match line.strip_suffix('\\') {
+            Some(head) => {
+                cur.push_str(head);
+                cur.push(' ');
+            }
+            None => {
+                cur.push_str(line);
+                out.push(std::mem::take(&mut cur).trim().to_string());
+            }
         }
     }
-    privileged_in(name, ids, &groups, &sudoers)
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
+/// A list's entries, with the spaces sudo allows around its commas.
+fn list(text: &str) -> impl Iterator<Item = &str> {
+    text.split(',').map(str::trim).filter(|e| !e.is_empty())
 }
 
 /// `privileged`, given `name`'s groups (id, name) and sudo's files (path, text).
@@ -188,44 +252,59 @@ pub fn privileged_in(name: &str, ids: Ids, groups: &[(u32, String)], sudoers: &[
     if let Some((_, g)) = groups.iter().find(|(_, g)| PRIVILEGED_GROUPS.contains(&g.as_str())) {
         return Some(format!("is in the {g} group"));
     }
-    let named = |who: &str| {
+    let files: Vec<(&str, Vec<String>)> = sudoers.iter().map(|(p, t)| (p.as_str(), joined(t))).collect();
+    // `User_Alias NAME = a, b : OTHER = c`, nested in any order: the aliases naming the
+    // user count as it.
+    let mut aliases: Vec<String> = Vec::new();
+    let named = |who: &str, aliases: &[String]| {
         let who = who.trim();
         who == "ALL"
             || who == name
             || who == format!("#{}", ids.uid)
+            || aliases.iter().any(|a| a == who)
             || who
                 .strip_prefix('%')
+                .map(|g| g.trim_start_matches(':'))
                 .is_some_and(|g| groups.iter().any(|(id, n)| n == g || g == format!("#{id}")))
     };
-    // `User_Alias NAME = a, b : OTHER = c`: the aliases naming the user count as it.
-    let mut aliases: Vec<String> = Vec::new();
-    for line in sudoers.iter().flat_map(|(_, t)| t.lines()).map(str::trim) {
-        if let Some(defs) = line.strip_prefix("User_Alias") {
+    loop {
+        let before = aliases.len();
+        for line in files.iter().flat_map(|(_, l)| l) {
+            let Some(defs) = line.strip_prefix("User_Alias") else { continue };
             for def in defs.split(':') {
-                if let Some((alias, members)) = def.split_once('=')
-                    && members.split(',').any(named)
-                {
-                    aliases.push(alias.trim().to_string());
+                if let Some((alias, members)) = def.split_once('=') {
+                    let alias = alias.trim().to_string();
+                    if !aliases.contains(&alias) && list(members).any(|m| named(m, &aliases)) {
+                        aliases.push(alias);
+                    }
                 }
             }
         }
+        if aliases.len() == before {
+            break;
+        }
     }
-    let named = |who: &str| named(who) || aliases.iter().any(|a| a == who.trim());
-    for (path, text) in sudoers {
-        for line in text.lines().map(str::trim) {
-            let users = line.split_whitespace().next().unwrap_or("");
+    for (path, lines) in &files {
+        for line in lines {
             // `#` starts a comment, unless a uid follows it (`#1001 ALL=...`).
             let comment = line.starts_with('#') && !line[1..].starts_with(|c: char| c.is_ascii_digit());
-            if users.is_empty()
-                || comment
-                || line.starts_with('@')
-                || users.starts_with("Defaults")
-                || users.ends_with("_Alias")
-            {
+            let first = line.split_whitespace().next().unwrap_or("");
+            if first.is_empty() || comment || line.starts_with('@') || first.starts_with("Defaults") || first.ends_with("_Alias") {
                 continue;
             }
-            // A rule: `<users> <hosts>=...`, its users a list with no spaces.
-            if users.split(',').any(named) {
+            // A rule: `<users> <hosts> = ...`. The users are a list whose commas may have
+            // spaces around them, so they end at the first word not joined to it by one.
+            let Some((head, _)) = line.split_once('=') else { continue };
+            let mut users = String::new();
+            let mut words = head.split_whitespace().peekable();
+            while let Some(w) = words.next() {
+                users.push_str(w);
+                let more = w.ends_with(',') || words.peek().is_some_and(|n| n.starts_with(','));
+                if !more {
+                    break;
+                }
+            }
+            if list(&users).any(|u| !u.starts_with('!') && named(u, &aliases)) {
                 return Some(format!("has a sudo rule in {path}"));
             }
         }
@@ -969,6 +1048,26 @@ mod tests {
     }
 
     #[test]
+    fn sudo_files_include_what_they_include() {
+        let d = scratch("sudoers");
+        let w = |p: &str, t: &str| {
+            let p = d.join(p);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, t).unwrap();
+        };
+        w("sudoers", "root ALL=(ALL) ALL\n@include extra\n#includedir /nonexistent\n@includedir more\n");
+        w("extra", "@include sudoers\n");
+        w("more/a", "x ALL=(ALL) ALL\n");
+        w("more/b.bak", "y ALL=(ALL) ALL\n");
+        w("more/c~", "z ALL=(ALL) ALL\n");
+        let names: Vec<_> = sudoers_from(vec![d.join("sudoers")])
+            .into_iter()
+            .map(|(p, _)| Path::new(&p).strip_prefix(&d).unwrap().display().to_string())
+            .collect();
+        assert_eq!(names, ["sudoers", "more/a", "extra"]);
+    }
+
+    #[test]
     fn privileged_users_groups_and_sudo_rules_are_found() {
         let ids = Ids { uid: 990, gid: 990 };
         let own = vec![(990, "superbot-bots".to_string())];
@@ -994,6 +1093,13 @@ mod tests {
             "#990 ALL=(ALL) ALL",
             "ALL ALL=(ALL) NOPASSWD: ALL",
             "User_Alias BOTS = ops, superbot-bots\nBOTS ALL=(ALL) ALL",
+            "ops, superbot-bots ALL=(ALL) NOPASSWD: ALL",
+            "ops ,superbot-bots ALL=(ALL) ALL",
+            "ops , superbot-bots\tALL = (ALL) ALL",
+            "ops, \\\n  superbot-bots ALL=(ALL) ALL",
+            "User_Alias INNER = superbot-bots\nUser_Alias OUTER = ops, INNER\nOUTER ALL=(ALL) ALL",
+            "User_Alias OUTER = ops, INNER\nUser_Alias INNER = superbot-bots\nOUTER ALL=(ALL) ALL",
+            "%:superbot-bots ALL=(ALL) ALL",
         ] {
             assert_eq!(found(text).as_deref(), Some("has a sudo rule in /etc/sudoers.d/x"), "{text}");
         }
@@ -1004,6 +1110,9 @@ mod tests {
             "@includedir /etc/sudoers.d",
             "superbot ALL=(sb-u-1) NOPASSWD: /usr/local/bin/superbot-run",
             "User_Alias OPS = ops\nOPS ALL=(ALL) ALL",
+            "ops ALL=(superbot-bots) ALL",
+            "ops, admins ALL=(ALL) ALL",
+            "!superbot-bots, ops ALL=(ALL) ALL",
         ] {
             assert_eq!(found(text), None, "{text}");
         }
