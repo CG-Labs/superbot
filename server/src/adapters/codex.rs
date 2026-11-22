@@ -86,13 +86,10 @@ impl Adapter for Codex {
         let item = &e["item"];
         let kind = str_of(item, "type");
         // Codex reports no item for a call its hook blocked; a failed one says so.
-        if str_of(e, "type") == "item.completed"
-            && !matches!(kind, "" | "agent_message" | "reasoning" | "error")
-            && !matches!(str_of(item, "status"), "failed" | "declined")
-            && item["error"].is_null()
-        {
-            let name = if kind == "command_execution" { "shell" } else { kind };
-            out.push(AgentEvent::ToolRan { name: name.into() });
+        if str_of(e, "type") == "item.completed" && !matches!(kind, "" | "agent_message" | "reasoning" | "error") {
+            let name = if kind == "command_execution" { "shell" } else { kind }.to_string();
+            let failed = matches!(str_of(item, "status"), "failed" | "declined") || !item["error"].is_null();
+            out.push(if failed { AgentEvent::ToolFailed { name } } else { AgentEvent::ToolRan { name } });
         }
         match str_of(e, "type") {
             "thread.started" => out.push(AgentEvent::Session(str_of(e, "thread_id").into())),
@@ -250,6 +247,8 @@ mod tests {
         }
         let ran: Vec<&str> = out.iter().filter_map(|e| if let AgentEvent::ToolRan { name } = e { Some(name.as_str()) } else { None }).collect();
         assert_eq!(ran, ["file_change", "mcp_tool_call", "shell", "todo_list"]);
+        let failed: Vec<&str> = out.iter().filter_map(|e| if let AgentEvent::ToolFailed { name } = e { Some(name.as_str()) } else { None }).collect();
+        assert_eq!(failed, ["mcp_tool_call", "shell"]);
         let hooked: Vec<&str> = ran.into_iter().filter(|t| c.hooks_tool(t)).collect();
         assert_eq!(hooked, ["file_change", "mcp_tool_call", "shell"], "not plans, nor hosted web search");
         assert!(!c.hooks_tool("web_search"));
@@ -267,13 +266,17 @@ mod tests {
         let mut out = Vec::new();
         let done = |o: &str| json!({ "type": "item.completed", "item": { "type": "command_execution", "aggregated_output": o, "status": "failed" } });
         let failed = done("bwrap: No permissions to create new namespace, likely because the kernel does not allow non-privileged user namespaces.\n");
+        let failed_call = |out: &[AgentEvent]| matches!(out, [AgentEvent::ToolFailed { name }] if name == "shell");
         Codex::default().on_event(&failed, &mut out);
-        assert!(out.is_empty(), "without the sandbox it's only a command's output");
+        assert!(failed_call(&out), "without the sandbox it's only a command's output");
+        out.clear();
         let mut c = Codex { sandboxed: true, ..Default::default() };
         c.on_event(&done("total 0\nbwrap is a fine word\n"), &mut out);
-        assert!(out.is_empty());
+        assert!(failed_call(&out));
+        out.clear();
         c.on_event(&failed, &mut out);
         c.on_event(&done("bwrap: setting up uid map: Permission denied\n"), &mut out);
+        out.retain(|e| !matches!(e, AgentEvent::ToolFailed { .. }));
         let [AgentEvent::Text(e)] = out.as_slice() else { panic!("one note, not an error that fails the task, got {}", out.len()) };
         assert!(e.contains("bubblewrap") && e.contains("No permissions to create new namespace"), "{e}");
     }

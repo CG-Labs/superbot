@@ -238,7 +238,7 @@ pub type SeatCap = Box<dyn Fn() -> Option<u32> + Send + Sync>;
 /// The connection, and the seat limit every way of adding or re-enabling a user checks
 /// under the same lock. Unset (as in most tests): no limit.
 /// `.2`: TEAMS=on (ADR 0087), so people in no team share Bots with nobody.
-pub struct Db(Mutex<Connection>, std::sync::OnceLock<SeatCap>, std::sync::atomic::AtomicBool, crate::obs::Metrics);
+pub struct Db(Mutex<Connection>, std::sync::OnceLock<SeatCap>, std::sync::atomic::AtomicBool, crate::obs::Metrics, crate::obs::trace::Tracer);
 
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -3464,7 +3464,7 @@ impl Db {
             tx.pragma_update(None, "user_version", i as i64 + 1)?;
             tx.commit()?;
         }
-        Ok(Db(Mutex::new(c), std::sync::OnceLock::new(), std::sync::atomic::AtomicBool::new(false), crate::obs::Metrics::default()))
+        Ok(Db(Mutex::new(c), std::sync::OnceLock::new(), std::sync::atomic::AtomicBool::new(false), crate::obs::Metrics::default(), crate::obs::trace::Tracer::default()))
     }
 
     fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -3483,6 +3483,11 @@ impl Db {
     /// This server's counters for `/metrics` (ADR 0089).
     pub fn metrics(&self) -> &crate::obs::Metrics {
         &self.3
+    }
+
+    /// This server's tracer (ADR 0118): off unless started with an endpoint.
+    pub fn tracer(&self) -> &crate::obs::trace::Tracer {
+        &self.4
     }
 
     // Generic settings, for small values that need no table of their own.
@@ -6194,7 +6199,18 @@ impl Db {
         let owners: Vec<String> = [e.bot_id.as_deref(), bot_actor].into_iter().flatten().filter_map(|b| self.bot_owner(b)).collect();
         let owners: Vec<&str> = owners.iter().map(String::as_str).collect();
         let text = |v: &Option<String>, max: usize| v.as_deref().map(|s| audit::clip(&redact::text_for(&owners, &audit::redact_text(s)), max));
-        let details = redact::value_for(&owners, audit::scrub(e.details.clone())).to_string();
+        let mut details = redact::value_for(&owners, audit::scrub(e.details.clone()));
+        // Recorded during a traced request or run (ADR 0118): the trace that shows it.
+        if let Some(t) = crate::obs::trace::current_sampled() {
+            if details.is_null() {
+                details = serde_json::json!({});
+            }
+            if let Some(d) = details.as_object_mut() {
+                d.insert("traceId".into(), serde_json::json!(t.trace_id()));
+                d.insert("spanId".into(), serde_json::json!(t.span_id()));
+            }
+        }
+        let details = details.to_string();
         let c = self.c();
         let res = c.execute(
             "INSERT INTO audit_events (at, actor_kind, actor_id, actor_name, actor_subject, action, target_type, target_id, bot_id, outcome, ip, user_agent, details,
@@ -6225,7 +6241,9 @@ impl Db {
         );
         let res = res.map(|_| c.last_insert_rowid());
         drop(c);
-        self.metrics().audited(&e.action, e.outcome.as_str(), e.details.get("reason").and_then(|r| r.as_str()));
+        let reason = e.details.get("reason").and_then(|r| r.as_str());
+        self.metrics().audited(&e.action, e.outcome.as_str(), reason);
+        crate::obs::trace::audited(&e.action, e.outcome.as_str(), reason);
         res
     }
 

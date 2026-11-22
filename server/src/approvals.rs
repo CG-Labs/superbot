@@ -5,6 +5,7 @@
 use crate::adapters::short;
 use crate::audit::{Actor, Event, Outcome, Who};
 use crate::db::{now, Approval, Bot, NewRule};
+use crate::obs::trace;
 use crate::policy::{self, glob_escape, Action, Call, Ctx, RunScope, Verdict, TRUNCATED};
 use crate::runner::App;
 use serde_json::{json, Value};
@@ -81,6 +82,26 @@ impl App {
     /// hook says it is from (`SUPERBOT_RUN_ID`); what was approved for a run counts only
     /// while that run is the Bot's live one.
     pub async fn check(self: &Arc<Self>, bot: &Bot, harness: &str, tool: &str, input: Value, cwd: Option<PathBuf>, run: Option<&str>) -> Verdict {
+        // A span in the run's trace (ADR 0118): the tool's name and the decision, never its input.
+        let span = trace::child("approval.check", trace::Kind::Internal);
+        span.set("superbot.harness", crate::obs::metrics::harness(harness));
+        span.set("superbot.tool.name", trace::tool_name(tool));
+        let v = trace::within(&span, self.check_call(bot, harness, tool, input, cwd, run)).await;
+        span.set(
+            "superbot.policy.action",
+            match v.action {
+                Action::Allow => "allow",
+                Action::Ask => "ask",
+                Action::Deny => "deny",
+            },
+        );
+        if let Some(c) = v.class {
+            span.set("superbot.policy.class", c);
+        }
+        v
+    }
+
+    async fn check_call(self: &Arc<Self>, bot: &Bot, harness: &str, tool: &str, input: Value, cwd: Option<PathBuf>, run: Option<&str>) -> Verdict {
         let cap = self.note_hook(&bot.id);
         let live = self.live_run(&bot.id);
         let run = run.filter(|r| live.as_deref() == Some(*r));
@@ -120,6 +141,7 @@ impl App {
                     d["runId"] = json!(run);
                     let e = Event::new(Actor::system("policy"), "policy.allowed").target("approval", &g.approval_id).bot(&bot.id);
                     self.db.record(&e.details(d));
+                    trace::note("superbot.approval.status", "run_grant");
                     return Verdict { action: Action::Allow, reason: "Approved for the rest of this task".into(), ..v };
                 }
                 let mut wait = Duration::from_secs(p.timeout_minutes as u64 * 60);
@@ -130,6 +152,7 @@ impl App {
                 let in_run = run.map(|r| (r, scope.as_ref()));
                 let expires = now() + wait.as_millis() as i64;
                 let a = self.db.add_approval_in_run(&bot.id, harness, &call.tool, call.kind.name(), &shown, &call.input, class, &v.reason, expires, in_run);
+                trace::note("superbot.approval.id", &a.id);
                 let requested = Event::new(Actor::for_bot(bot), "approval.requested").target("approval", &a.id).bot(&bot.id);
                 let mut d = detail();
                 if let Some(r) = run {
@@ -152,6 +175,7 @@ impl App {
                 drop(guard);
                 self.set_run_status(&bot.id, "Working");
                 let done = self.db.approval(&a.id).unwrap_or(a);
+                trace::note("superbot.approval.status", &done.status);
                 let note = done.note.as_deref().map(|n| format!(" ({n})")).unwrap_or_default();
                 let (action, reason) = match done.status.as_str() {
                     "approved" => (Action::Allow, "Approved by the user".to_string()),
