@@ -13,6 +13,7 @@ import {
   TEAM_LINK_EVERY_MS,
   teamLinkWanted,
   teamPlanLine,
+  teamRegionLine,
   teamSubscriptionLine,
   watchTeamLink,
 } from "../team";
@@ -87,6 +88,9 @@ describe("team rules (mirroring the server's, ADR 0087)", () => {
       subscription: { status: "active", tier: "pro", periodEnd: 1_797_582_000, cancelAt: null },
       seats: { members: 3, billed: 3, syncing: false, error: null },
     };
+    expect(teamRegionLine({ region: "gb-lon" })).toBe("Machines and their backups stay in gb-lon, unless an admin set someone's own region.");
+    expect(teamRegionLine({ region: null })).toBeNull();
+    expect(teamRegionLine({})).toBeNull();
     expect(teamPlanLine(undefined)).toBeNull();
     expect(teamPlanLine({ plan: null })).toMatch(/doesn't pay/);
     expect(teamPlanLine(b)).toBe("The team pays for the Pro plan for everyone on it.");

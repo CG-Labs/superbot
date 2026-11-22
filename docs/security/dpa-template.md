@@ -102,7 +102,7 @@ The Provider ensures that everyone it authorises to process Customer Personal Da
 
 ## 11. International transfers
 
-11.1 Customer Personal Data is stored in **[region(s)]**: the Service's control plane in [region] and users' machines in [regions], as set by the Provider (`MACHINE_REGIONS`, or where its Incus hosts are). Model providers and other Subprocessors process it where Annex III says.
+11.1 Customer Personal Data is stored in **[region(s)]**: the Service's control plane and its backups in [region], and users' machines and their backups in **[the Customer's data region, e.g. London (`gb-lon`) or Frankfurt (`de-fra-2`)]**. The Provider sets the Customer's data region for its account or team; the Service makes machines only there, keeps their backups in a store there, and refuses to move them elsewhere unless the Customer asks ([ADR 0117](../adr/0117-uk-eu-data-regions.md)). Model providers and other Subprocessors process it where Annex III says.
 
 11.2 Where Customer Personal Data is transferred outside the UK or EEA to a country without an adequacy decision, the parties rely on **[the EU Standard Contractual Clauses (Module 2 or 3), the UK International Data Transfer Addendum, or another mechanism]**, incorporated by reference, with **[completion details]**.
 
@@ -169,8 +169,8 @@ Measures SuperBot's code provides. "Default" says whether it is on without the P
 | Subprocessor | Service | Customer Personal Data it receives | Location | Transfer mechanism |
 |--------------|---------|------------------------------------|----------|--------------------|
 | [Hosting provider for the SuperBot server] | The control plane (botd, its database and files) | Everything the server stores: accounts, chat history, Bot memory, secrets (sealed), the audit log, server backups on the host | [Region] | [Mechanism] |
-| [Hosting provider, e.g. Linode (Akamai), or the Incus hosts' provider] | Users' machines | Everything on a user's machine: working folder, Bot memory, harness logins | [Region] | [Mechanism] |
-| [Object storage provider] | Off-host server and machine backups | Full copies of the server's data and machines' disks, encrypted as Annex II says | [Region] | [Mechanism] |
+| [Hosting provider, e.g. Linode (Akamai), or the Incus hosts' provider] | Users' machines | Everything on a user's machine: working folder, Bot memory, harness logins | [The Customer's data region] | [Mechanism] |
+| [Object storage provider] | Off-host server and machine backups | Full copies of the server's data and machines' disks, encrypted as Annex II says | [Server backups: the control plane's region. Machine backups: the Customer's data region] | [Mechanism] |
 | [Model provider(s) in the plan routing file] | Running Bots | Prompts, conversation, tool output and file contents the harness sends | [Region] | [Mechanism] |
 | [Payment processor, e.g. Stripe] | Billing | User and team ids, plan, email for a new customer, token counts, seat counts; card details entered at the processor | [Region] | [Mechanism] |
 | [Push service, e.g. Expo, then Apple and Google] | Push notifications, if offered | Device token, a title and a line naming the Bot | [Region] | [Mechanism] |

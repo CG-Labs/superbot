@@ -96,6 +96,20 @@ function lastLogin(u) {
   return `${esc(fmt(l.at))}<div class="sub">${esc(how)}</div>`;
 }
 
+// Where their machine and backups live (ADR 0117): their own region, their team's, or the default.
+const REGION_FROM = { user: "their own", team: "their team's", default: "the default" };
+function regionCell(r) {
+  if (!r) return "";
+  const gone = r.offered ? "" : '<div class="sub bad">No longer offered</div>';
+  return `${esc(r.region)}<div class="sub">${esc(REGION_FROM[r.source] || r.source)}</div>${gone}`;
+}
+
+async function setRegion(path, who, current) {
+  const r = prompt(`Data region for ${who}: where their machines and backups live. Leave empty for the default. Refused while a machine is elsewhere.`, current || "");
+  if (r === null || r.trim() === (current || "")) return;
+  await api("PUT", path, { region: r.trim() || null });
+}
+
 function renderUsers() {
   $("users-rows").innerHTML = users.map((u) => {
     const active = u.status === "active";
@@ -106,11 +120,13 @@ function renderUsers() {
       <td>${lastLogin(u)}</td>
       <td>${u.pendingCodes ? `Waiting<div class="sub">until ${esc(fmt(u.pendingCodes.expiresAt))}</div>` : ""}</td>
       <td>${u.mfa?.enabled ? `On<div class="sub">since ${esc(fmt(u.mfa.enabledAt))}</div>` : ""}</td>
+      <td>${regionCell(u.dataRegion)}</td>
       <td class="actions">
         <button type="button" class="btn" data-act="code" ${active ? "" : "disabled"}>New code</button>
         ${u.mfa?.enabled && u.id !== me.user?.id ? '<button type="button" class="btn" data-act="mfa">Reset 2FA</button>' : ""}
         ${u.breakGlass ? "" : `<button type="button" class="btn" data-act="status">${active ? "Disable" : "Enable"}</button>`}
         <button type="button" class="btn" data-act="sessions">Sign out everywhere</button>
+        ${u.dataRegion ? '<button type="button" class="btn" data-act="region">Data region</button>' : ""}
       </td>
     </tr>`;
   }).join("");
@@ -148,6 +164,7 @@ $("users-rows").addEventListener("click", async (e) => {
       await api("DELETE", `/api/users/${key(u.id)}/mfa`);
       notice(`Two-factor authentication reset for ${u.name}.`, false);
     }
+    if (t.dataset.act === "region") await setRegion(`/api/users/${key(u.id)}/region`, u.name, u.region);
     if (t.dataset.act === "sessions") {
       if (!confirm(`Sign ${u.name} out of every session?`)) return;
       const r = await api("DELETE", `/api/users/${key(u.id)}/sessions`);
@@ -286,6 +303,24 @@ async function loadMachines() {
   }
   $("give-machine").hidden = off;
   renderMachines();
+  loadRegions(off);
+}
+
+// The data regions offered (ADR 0117), and any whose backups would leave them.
+async function loadRegions(off) {
+  const el = $("machines-regions");
+  el.hidden = true;
+  if (off) return;
+  try {
+    const r = await api("GET", "/api/regions");
+    const each = r.regions.map((x) => `${x.id}${x.default ? " (default)" : ""}${x.offered ? "" : " (no longer offered)"}: ${x.machines} machine${x.machines === 1 ? "" : "s"}`);
+    const warn = (r.backups?.warnings || []).join(" ");
+    el.textContent = `Data regions: ${each.join(", ")}.${warn ? ` ${warn}` : ""}`;
+    el.className = warn ? "warn" : "hint";
+    el.hidden = false;
+  } catch {
+    // Older servers have no regions.
+  }
 }
 
 function machineActions(m) {
@@ -425,8 +460,9 @@ function renderTeams() {
   $("teams-settings").textContent = `${s.strict ? "TEAMS=on: people in no team share with nobody." : "People in no team share with each other (TEAMS=on stops that)."} A leaver's team machine is ${s.machineDays ? `suspended, then deleted after ${s.machineDays} days` : "deleted at once"}.`;
   $("teams-empty").hidden = teams.teams.length > 0;
   $("teams-list").innerHTML = teams.teams.map((t) => `<div class="card" data-team="${esc(t.id)}">
-      <div class="bar"><b>${esc(t.name)}</b> <span class="sub">${t.members.length} people · ${t.machines ? "joining gives a machine" : "no machines given"}${esc(teamPlan(t.billing))}</span>
-        <button type="button" class="btn push" data-act="delete-team">Delete team</button></div>
+      <div class="bar"><b>${esc(t.name)}</b> <span class="sub">${t.members.length} people · ${t.machines ? "joining gives a machine" : "no machines given"} · data in ${esc(t.region || "the default region")}${esc(teamPlan(t.billing))}</span>
+        <button type="button" class="btn push" data-act="team-region">Data region</button>
+        <button type="button" class="btn" data-act="delete-team">Delete team</button></div>
       <table class="grid">
         <thead><tr><th>Person</th><th>Role</th><th>Machine</th><th></th></tr></thead>
         <tbody>${t.members.map((m) => `<tr data-user="${esc(m.id)}">
@@ -473,6 +509,7 @@ $("teams-list").addEventListener("click", async (e) => {
       if (!m || !confirm(offboardNote(m.name || m.email || m.id, t.name))) return;
       await api("DELETE", `/api/teams/${key(t.id)}/members/${key(m.id)}`);
     }
+    if (b.dataset.act === "team-region") await setRegion(`/api/teams/${key(t.id)}/region`, `${t.name}'s members without their own`, t.region);
     if (b.dataset.act === "delete-team") {
       if (!confirm(`Delete ${t.name}? Everyone on it leaves, as if each had: ${offboardNote("each of them", t.name).split("\n\n")[1]}`)) return;
       await api("DELETE", `/api/teams/${key(t.id)}`);

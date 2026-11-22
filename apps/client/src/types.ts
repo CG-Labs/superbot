@@ -862,6 +862,8 @@ export interface Team {
   machineDays?: number;
   /** The team's plan (ADR 0093), while this server sells them. */
   billing?: TeamBilling;
+  /** Where members' machines and backups live (ADR 0117), unless one has their own; null is the server's default. */
+  region?: string | null;
 }
 
 /** A team's plan, paid for by the team for everyone on it (ADR 0093). Never a Stripe id. */
