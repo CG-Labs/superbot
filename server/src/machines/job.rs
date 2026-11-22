@@ -64,13 +64,25 @@ impl Host {
         cmd.envs(&self.env).envs(env);
         if let Some(Limiting::Cgroup(cg)) = &self.limits {
             let (fd, user) = (cg.procs_fd(), self.user.map(|i| (i.uid, i.gid)));
-            // SAFETY: `enter` makes only async-signal-safe calls, and `cg` (holding the
-            // fd) outlives the spawn.
+            // SAFETY: `enter` and `lock_down` make only async-signal-safe calls, and
+            // `cg` (holding the fd) outlives the spawn.
             unsafe {
-                cmd.pre_exec(move || cgroup::enter(fd, user));
+                cmd.pre_exec(move || {
+                    cgroup::enter(fd, user)?;
+                    if user.is_some() {
+                        runas::lock_down()?;
+                    }
+                    Ok(())
+                });
             }
         } else if let Some(ids) = self.user {
-            cmd.uid(ids.uid).gid(ids.gid);
+            // SAFETY: only async-signal-safe calls.
+            unsafe {
+                cmd.pre_exec(move || {
+                    runas::become_user(ids.uid, ids.gid)?;
+                    runas::lock_down()
+                });
+            }
         }
         cmd
     }

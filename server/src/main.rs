@@ -92,6 +92,8 @@ mod machines_upkeep_tests;
 #[cfg(test)]
 mod machines_rebuild_tests;
 #[cfg(test)]
+mod machines_redteam_tests;
+#[cfg(test)]
 mod machines_screens_tests;
 #[cfg(test)]
 mod machines_teammates_tests;
@@ -417,6 +419,9 @@ async fn main() {
         .unwrap_or_else(|e| exit(format!("Machine enrollment: {e}")))
         .map(|mut e| {
             e.upkeep.default_to(&managed_bins).unwrap_or_else(|err| exit(format!("Machine enrollment: {err}")));
+            if !e.bot_user {
+                log_warn!("WARNING: {}", machines::botuser::ROOT_WARNING);
+            }
             control_plane.enroll_with(e).unwrap_or_else(|e| exit(format!("Machine enrollment: {e}")))
         });
 
@@ -452,7 +457,8 @@ async fn main() {
         bot_key: bot_key.clone(),
         run_timeout: Duration::from_secs(60 * env("RUN_TIMEOUT_MINUTES", "60").parse::<u64>().unwrap_or(60)),
         default_harness,
-        sandbox_host: sandbox::host(),
+        // Runs under per-user accounts start through superbot-run, with no new privileges.
+        sandbox_host: if isolation.is_some() { sandbox::host_no_new_privs() } else { sandbox::host() },
         home: std::env::var_os("HOME").map(PathBuf::from),
     }, screens);
     let _ = app.tiers.set(Arc::new(tiers));

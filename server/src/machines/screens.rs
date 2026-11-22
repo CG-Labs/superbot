@@ -55,7 +55,7 @@ pub struct Settings {
 }
 
 /// MACHINE_SCREENS (off, the default, or on) and MACHINE_SCREEN_PORTS. Screens run only
-/// as the Bots' own user, so they need MACHINE_BOT_USER=on. SCREEN_SIZE and
+/// as the Bots' own user, so not with MACHINE_BOT_USER=off. SCREEN_SIZE and
 /// SCREEN_IDLE_MINUTES are shared with this server's own screens.
 pub fn from_env(var: &dyn Fn(&str) -> String, bot_user: bool) -> Result<Option<Settings>, String> {
     match var("MACHINE_SCREENS").trim() {
@@ -64,7 +64,7 @@ pub fn from_env(var: &dyn Fn(&str) -> String, bot_user: bool) -> Result<Option<S
         v => return Err(format!("MACHINE_SCREENS must be on or off, not \"{v}\"")),
     }
     if !bot_user {
-        return Err("MACHINE_SCREENS=on needs MACHINE_BOT_USER=on: a screen never runs as root".into());
+        return Err("MACHINE_SCREENS=on needs the Bots' own user, which MACHINE_BOT_USER=off turns off: a screen never runs as root".into());
     }
     let ports = match var("MACHINE_SCREEN_PORTS").trim() {
         "" => DEFAULT_PORTS,
@@ -704,7 +704,7 @@ mod tests {
         assert_eq!(from_env(&env(&[]), true), Ok(None));
         assert_eq!(from_env(&env(&[("MACHINE_SCREENS", "off")]), false), Ok(None));
         let e = from_env(&env(&[("MACHINE_SCREENS", "on")]), false).unwrap_err();
-        assert!(e.contains("MACHINE_BOT_USER=on"), "{e}");
+        assert!(e.contains("MACHINE_BOT_USER=off"), "{e}");
         assert!(from_env(&env(&[("MACHINE_SCREENS", "yes")]), true).is_err());
         let s = from_env(&env(&[("MACHINE_SCREENS", "on")]), true).unwrap().unwrap();
         assert_eq!((s.ports, s.width, s.height, s.idle_ms), (DEFAULT_PORTS, 1280, 800, 600_000));
