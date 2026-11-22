@@ -139,13 +139,17 @@ notes() {
   v=${tag#v}
   RELEASE_TAGS="$(tags)"$'\n'"$tag" check
   [[ $(cargo_version) == "$v" ]] || die "$tag doesn't match server/Cargo.toml's version $(cargo_version)"
-  body "$v"
-  if [[ -n "${GITHUB_REPOSITORY:-}" ]]; then
-    local image="ghcr.io/${GITHUB_REPOSITORY,,}"
-    # shellcheck disable=SC2016 # the backticks are Markdown
-    printf '\n---\n\nImages: `%s:%s` and `%s-caddy:%s`, signed and with build provenance, once the docker workflow has published them for this tag. Verify them as `deploy/README.md` says ("Verifying the images").\n' \
-      "$image" "$v" "$image" "$v"
+  if [[ -z "${GITHUB_REPOSITORY:-}" ]]; then
+    body "$v"
+    return
   fi
+  # A release page resolves relative links against itself, so they point at the tag's files.
+  local files="${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/blob/$tag/"
+  body "$v" | sed -E "s|\]\(([^):/#][^):]*)\)|](${files}\1)|g"
+  local image="ghcr.io/${GITHUB_REPOSITORY,,}"
+  # shellcheck disable=SC2016 # the backticks are Markdown
+  printf '\n---\n\nImages: `%s:%s` and `%s-caddy:%s`, signed and with build provenance, once the docker workflow has published them for this tag. [Verify them](%sdeploy/README.md#verifying-the-images) before you run them.\n' \
+    "$image" "$v" "$image" "$v" "$files"
 }
 
 self_test() {
@@ -350,7 +354,7 @@ self_test() {
 
 - Next.
 '
-  printf '# Changelog\n\n## [1.1.0] - 2026-11-20\n\n- Two.\n' >"$dir/CHANGELOG.md"
+  printf '# Changelog\n\n## [1.1.0] - 2026-11-20\n\n- Two ([ADR](docs/adr/x.md#why), [site](https://x.example/a), [here](#two)).\n' >"$dir/CHANGELOG.md"
   out=$(CHANGELOG="$dir/CHANGELOG.md" CARGO_TOML="$dir/Cargo.toml" RELEASE_TAGS='' GITHUB_REPOSITORY=Owner/Repo \
     bash "${BASH_SOURCE[0]}" notes v1.1.0 2>&1) || true
   # shellcheck disable=SC2016 # the backticks are Markdown
@@ -358,6 +362,11 @@ self_test() {
     printf 'ok   notes name the images, in lower case\n'
   else
     printf 'FAIL notes name the images, got:\n%s\n' "$out"; fails=$((fails + 1))
+  fi
+  if [[ $out == *'- Two ([ADR](https://github.com/Owner/Repo/blob/v1.1.0/docs/adr/x.md#why), [site](https://x.example/a), [here](#two)).'* ]]; then
+    printf 'ok   notes link the tag'\''s files, and leave other links alone\n'
+  else
+    printf 'FAIL notes link the tag'\''s files, got:\n%s\n' "$out"; fails=$((fails + 1))
   fi
 
   ((fails == 0)) || die "$fails self-test case(s) failed"
