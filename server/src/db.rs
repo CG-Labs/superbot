@@ -3403,20 +3403,44 @@ impl Db {
         }
     }
 
-    /// Deletes up to `limit` of the oldest messages written before `cutoff` (unix ms), and
-    /// returns how many went. Never a message whose run is queued or running, nor one in or
-    /// from a held Bot's chat.
-    pub fn prune_chat_batch(&self, cutoff: i64, limit: u32) -> rusqlite::Result<usize> {
-        self.c().execute(
-            "DELETE FROM messages WHERE id IN (
-               SELECT id FROM messages
-                WHERE created_at < ?1
-                  AND (status IS NULL OR status NOT IN ('queued', 'running'))
-                  AND bot_id NOT IN (SELECT bot_id FROM retention_holds)
-                  AND (from_bot IS NULL OR from_bot NOT IN (SELECT bot_id FROM retention_holds))
-                ORDER BY created_at, id LIMIT ?2)",
-            params![cutoff, limit],
-        )
+    /// Deletes up to `limit` of the oldest messages written before `cutoff` (unix ms) and
+    /// after `after` (the `(created_at, id)` a pass's previous batch ended on), and returns how
+    /// many went and where this batch ended. Never a message whose run is queued or running,
+    /// nor one in or from a held Bot's chat; the cursor means each batch starts past the rows
+    /// earlier batches already looked at, so a large held chat is walked once per pass.
+    pub fn prune_chat_batch(&self, cutoff: i64, after: Option<(i64, i64)>, limit: u32) -> rusqlite::Result<(usize, Option<(i64, i64)>)> {
+        let (at, id) = after.unwrap_or((i64::MIN, i64::MIN));
+        let c = self.c();
+        let tx = c.unchecked_transaction()?;
+        let ids: Vec<(i64, i64)> = {
+            let mut s = tx.prepare(
+                "SELECT created_at, id FROM messages
+                  WHERE created_at < ?1 AND (created_at, id) > (?2, ?3)
+                    AND (status IS NULL OR status NOT IN ('queued', 'running'))
+                    AND bot_id NOT IN (SELECT bot_id FROM retention_holds)
+                    AND (from_bot IS NULL OR from_bot NOT IN (SELECT bot_id FROM retention_holds))
+                  ORDER BY created_at, id LIMIT ?4",
+            )?;
+            s.query_map(params![cutoff, at, id, limit], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+        };
+        let mut deleted = 0;
+        {
+            let mut del = tx.prepare("DELETE FROM messages WHERE id = ?")?;
+            for (_, id) in &ids {
+                deleted += del.execute([id])?;
+            }
+        }
+        tx.commit()?;
+        Ok((deleted, ids.last().copied()))
+    }
+
+    /// How many Bots are held, for a pass's record.
+    pub fn retention_hold_count(&self) -> rusqlite::Result<usize> {
+        self.c().query_row("SELECT COUNT(*) FROM retention_holds", [], |r| r.get::<_, i64>(0)).map(|n| n as usize)
+    }
+
+    pub fn try_set_setting(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        self.c().execute("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2", [key, value]).map(|_| ())
     }
 
     pub fn retention_holds(&self) -> Vec<RetentionHold> {
@@ -3430,15 +3454,27 @@ impl Db {
     }
 
     /// Holds the Bot's chat, or changes the reason of its hold. Keeps who held it first and when.
-    pub fn put_retention_hold(&self, bot_id: &str, reason: &str, by: Option<&str>) -> RetentionHold {
-        self.c()
+    /// None when the Bot is gone, even if it was deleted a moment ago.
+    pub fn put_retention_hold(&self, bot_id: &str, reason: &str, by: Option<&str>) -> Option<RetentionHold> {
+        let n = self
+            .c()
             .execute(
-                "INSERT INTO retention_holds (bot_id, reason, held_by, held_at) VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO retention_holds (bot_id, reason, held_by, held_at)
+                 SELECT id, ?2, ?3, ?4 FROM bots WHERE id = ?1
                  ON CONFLICT(bot_id) DO UPDATE SET reason = ?2",
                 params![bot_id, reason, by, now()],
             )
-            .unwrap();
-        self.retention_hold(bot_id).unwrap()
+            .ok()?;
+        if n == 0 {
+            return None;
+        }
+        self.retention_hold(bot_id)
+    }
+
+    /// Deletes the Bot unless it is held, in one statement, so a hold placed at any moment
+    /// before wins. Whether it was deleted.
+    pub fn delete_bot_unless_held(&self, id: &str) -> bool {
+        self.c().execute("DELETE FROM bots WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM retention_holds WHERE bot_id = ?1)", [id]).unwrap() > 0
     }
 
     /// Whether there was a hold to release.
@@ -7869,18 +7905,34 @@ mod tests {
         db.add_messages_at(&bot.id, 3, now() - 50 * day, None);
         db.add_messages_at(&bot.id, 2, now() - 40 * day, None);
         let cutoff = now() - 30 * day;
-        assert_eq!(db.prune_chat_batch(cutoff, 4).unwrap(), 4, "a batch never goes past its limit");
+        let (n, end) = db.prune_chat_batch(cutoff, None, 4).unwrap();
+        assert_eq!(n, 4, "a batch never goes past its limit");
         let left = db.messages(&bot.id, 10);
         assert_eq!((left.len(), left[0].created_at < now() - 39 * day), (1, true), "the oldest went first");
-        assert_eq!(db.prune_chat_batch(cutoff, 4).unwrap(), 1);
-        assert_eq!(db.prune_chat_batch(cutoff, 4).unwrap(), 0);
+        assert_eq!(db.prune_chat_batch(cutoff, end, 4).unwrap().0, 1);
+        assert_eq!(db.prune_chat_batch(cutoff, None, 4).unwrap(), (0, None));
+
+        // A held Bot's old rows are looked at once a pass: a batch starts past the last one's end.
+        let held = db.create_bot("Held", "#fff", "waddle", "claude", None, false);
+        assert!(db.put_retention_hold(&held.id, "hold", None).is_some());
+        db.add_messages_at(&held.id, 3, now() - 60 * day, None);
+        db.add_messages_at(&bot.id, 2, now() - 50 * day, None);
+        let (n, end) = db.prune_chat_batch(cutoff, None, 1).unwrap();
+        let (n2, end2) = db.prune_chat_batch(cutoff, end, 1).unwrap();
+        assert_eq!((n, n2, db.prune_chat_batch(cutoff, end2, 1).unwrap().0), (1, 1, 0));
+        assert!(end.is_some() && end < end2, "the cursor moves forward");
+        assert!(!db.delete_bot_unless_held(&held.id), "a held Bot isn't deleted");
+        assert_eq!(db.message_count(&held.id), 3);
+        db.delete_retention_hold(&held.id);
+        assert!(db.delete_bot_unless_held(&held.id));
+        assert!(db.put_retention_hold(&held.id, "too late", None).is_none(), "no hold on a Bot that's gone");
 
         db.set_chat_retention(Some(90));
         assert_eq!(db.chat_retention(), Some(90));
         db.set_chat_retention(None);
         assert_eq!(db.chat_retention(), None);
 
-        db.put_retention_hold(&bot.id, "hold", Some("u1"));
+        db.put_retention_hold(&bot.id, "hold", Some("u1")).unwrap();
         assert_eq!(db.retention_holds().len(), 1);
         db.delete_bot(&bot.id);
         assert!(db.retention_holds().is_empty(), "a Bot deleted under the database's feet takes its hold");
