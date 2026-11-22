@@ -1794,7 +1794,7 @@ mod tests {
         assert!(out.starts_with("Setup: 1 of 2 done (admins see the wizard"), "{out}");
         assert!(out.contains("[x] A public address with HTTPS") && out.contains("[ ] Sign-in providers ready"), "{out}");
         assert!(out.contains("botctl secret set SSO_OKTA_CLIENT_SECRET < file") && out.contains("botctl setup done"), "{out}");
-        assert!(out.contains("Corp SAML needs its IdP metadata: botctl sso saml corp import idp-metadata.xml") && !out.contains("secret set  <"), "{out}");
+        assert!(out.contains("Corp SAML needs its IdP metadata: botctl sso saml corp import idp-metadata.xml") && !out.contains("secret set  <"));
         let done = setup_summary(&json!({ "progress": { "completedAt": 1 }, "done": 2, "total": 2, "checklist": [] }));
         assert!(done.starts_with("Setup: 2 of 2 done (finished).") && !done.contains("botctl setup done"), "{done}");
     }
