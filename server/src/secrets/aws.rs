@@ -358,7 +358,8 @@ struct Inner {
     /// What the `Host` header carries, and so what is signed.
     host: String,
     http: reqwest::Client,
-    /// For IMDS and the container endpoint: link-local, so never through a proxy.
+    /// For IMDS and the container endpoint, never through a proxy, as in AWS's SDKs: both
+    /// are on this host or its network, where a proxy may not reach.
     local: reqwest::Client,
     keys: Mutex<Option<(Keys, Instant)>>,
 }
@@ -447,8 +448,7 @@ impl Inner {
                 keys_from_json(&body, &what)
             }
             Source::Container { url, token } => {
-                let client = if url.starts_with("https://") { &self.http } else { &self.local };
-                let mut req = client.get(url);
+                let mut req = self.local.get(url);
                 match token {
                     ContainerToken::None => {}
                     ContainerToken::Value(t) => req = req.header("authorization", t.as_str()),
