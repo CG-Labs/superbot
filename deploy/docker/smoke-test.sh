@@ -305,7 +305,30 @@ ab open 'data:text/html,<title>superbot-smoke</title><h1>hello</h1>' >/dev/null 
 [[ $(ab get title) == superbot-smoke ]] || fail "agent-browser read the wrong title"
 windows=$(dc exec -T botd xwininfo -display "$display" -root -tree) || fail "couldn't list the windows on $display"
 grep -q '"superbot-smoke - Chromium"' <<<"$windows" || fail "Chromium isn't on the Bot's screen: $windows"
+
+log "Chromium runs with its sandbox on (ADR 0107)"
+for _ in $(seq 1 60); do
+  grep -q 'Chromium sandbox: on (checked' <<<"$(dc logs --no-color botd)" && break
+  sleep 1
+done
+grep -q 'Chromium sandbox: on (checked' <<<"$(dc logs --no-color botd)" \
+  || fail "botd didn't find Chromium's sandbox working: $(dc logs --no-color botd | grep 'Chromium sandbox' || true)"
+ab open chrome://sandbox >/dev/null || fail "agent-browser couldn't open chrome://sandbox"
+sandbox=$(ab get text body) || fail "couldn't read chrome://sandbox"
+grep -q 'You are adequately sandboxed' <<<"$sandbox" || fail "chrome://sandbox says Chromium isn't sandboxed: $sandbox"
+grep -Eq 'Layer 1 Sandbox[[:space:]]+Namespace' <<<"$sandbox" || fail "Chromium's namespace sandbox isn't on: $sandbox"
+browsers=$(dc exec -T botd pgrep -a -f '^/usr/lib/chromium/chromium') || fail "no Chromium processes in botd"
+if grep -q -- '--no-sandbox' <<<"$browsers"; then fail "a Chromium process runs with --no-sandbox: $browsers"; fi
+# shellcheck disable=SC2016
+dc exec -T botd sh -c 'n=0; for p in $(pgrep -f "^/usr/lib/chromium/chromium --type=renderer"); do grep -q "^Seccomp:[[:space:]]*2" "/proc/$p/status" || exit 1; n=$((n + 1)); done; [ "$n" -gt 0 ]' \
+  || fail "a Chromium renderer runs without its seccomp filter"
 ab close >/dev/null || true
+log "Without the profile's namespaces Chromium refuses to start, rather than run unsandboxed"
+image=$(docker inspect --format '{{.Config.Image}}' "$(dc ps -q botd)")
+if refused=$(docker run --rm --cap-drop ALL --entrypoint chromium "$image" --headless --disable-gpu --dump-dom about:blank 2>&1); then
+  fail "Chromium started under Docker's default seccomp profile"
+fi
+grep -q 'No usable sandbox' <<<"$refused" || fail "Chromium failed for another reason under Docker's default profile: $refused"
 dc exec -T botd agent-desktop --version >/dev/null || fail "agent-desktop is not runnable in the image"
 
 log "Smoke test passed"

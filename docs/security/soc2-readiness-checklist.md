@@ -37,7 +37,7 @@ Scope: the managed service. A self-hosting customer is its own service organisat
 | CC3 Risk assessment | 0 | 1 | 4 |
 | CC4 Monitoring activities | 0 | 1 | 1 |
 | CC5 Control activities | 2 | 0 | 2 |
-| CC6 Logical and physical access | 5 | 3 | 9 |
+| CC6 Logical and physical access | 6 | 3 | 8 |
 | CC7 System operations | 3 | 1 | 5 |
 | CC8 Change management | 0 | 0 | 3 |
 | CC9 Risk mitigation | 0 | 1 | 3 |
@@ -111,7 +111,7 @@ Scope: the managed service. A self-hosting customer is its own service organisat
 | CC6.7-2 | Backups encrypted | Product | Operator | Each backup target's age recipients; a restore with the key | Partial | age encryption exists for server and machine backups ([ADR 0030](../adr/0030-backup-restore-drill.md), [ADR 0071](../adr/0071-off-host-machine-backups.md)) but is off until the operator sets recipients. |
 | CC6.8-1 | Malware scanning or endpoint detection on servers and hosts | Process | Operator | Agent deployment records; alert history | Gap | None in the product or this repository. |
 | CC6.8-2 | Egress allowlists for runs | Product | Engineering lead | Per-machine egress policy; tests | Gap | Incus containers can't reach private ranges or the host (ADR 0065), but public egress is open. Planned for M5. |
-| CC6.8-3 | Chromium's sandbox inside the container | Product | Engineering lead | The image running Chromium sandboxed; a smoke test | Gap | Off inside the published image (ADR 0084). |
+| CC6.8-3 | Chromium's sandbox inside the container | Product | Engineering lead | The image running Chromium sandboxed; a smoke test | Done | The image's `chromium` takes out the `--no-sandbox` agent-browser adds in any container, and Compose gives botd Docker's own seccomp profile plus the user, PID and network namespaces the sandbox needs, made from the pinned upstream profile and checked in CI ([ADR 0107](../adr/0107-chromium-sandbox-in-the-container.md), [`deploy/docker/chromium.sh`](../../deploy/docker/chromium.sh), [`deploy/docker/seccomp-chromium.json`](../../deploy/docker/seccomp-chromium.json)). botd checks at start that Chromium starts sandboxed and logs it; where it can't, Chromium refuses to start rather than run unsandboxed, and `SUPERBOT_CHROMIUM_SANDBOX=off` is the only way out, logged as a warning on every start ([`server/src/chromium.rs`](../../server/src/chromium.rs)). The Compose smoke test, on amd64 and arm64 before each publish, reads "You are adequately sandboxed" from `chrome://sandbox`, finds no `--no-sandbox` and a seccomp filter on every renderer, and sees Chromium refuse to start under Docker's default profile ([`deploy/docker/smoke-test.sh`](../../deploy/docker/smoke-test.sh)). |
 
 ## CC7: System operations
 

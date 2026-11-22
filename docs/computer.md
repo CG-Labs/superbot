@@ -32,7 +32,7 @@ deploy/install-computer.sh <user that runs botd>
 
 Then add `AGENT_BROWSER_SKILLS_DIR=/opt/computer/share/agent-browser-skills` to botd's environment and restart it. It prints `Screens: on.`
 
-With Docker Compose there's nothing to install: the published image has all of it, with Debian's Chromium (it has arm64 builds, unlike Chrome for Testing), and Compose's Caddy serves the `/screen/` route below from the `botd` container (`SCREEN_ADDR=0.0.0.0`). See [Screens and computer use in Docker](../deploy/README.md#screens-and-computer-use-in-docker) and [ADR 0084](adr/0084-published-image-with-computer-use.md).
+With Docker Compose there's nothing to install: the published image has all of it, with Debian's Chromium (it has arm64 builds, unlike Chrome for Testing), and Compose's Caddy serves the `/screen/` route below from the `botd` container (`SCREEN_ADDR=0.0.0.0`). Chromium keeps its sandbox there too, through a seccomp profile Compose gives `botd` ([ADR 0107](adr/0107-chromium-sandbox-in-the-container.md)). See [Screens and computer use in Docker](../deploy/README.md#screens-and-computer-use-in-docker) and [ADR 0084](adr/0084-published-image-with-computer-use.md).
 
 As on a bash install, screens are off while per-user accounts (`ISOLATION=users`) are on: per-user screens don't exist yet.
 

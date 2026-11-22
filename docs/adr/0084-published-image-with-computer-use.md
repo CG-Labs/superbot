@@ -40,7 +40,7 @@ The GitHub Actions cache keeps layers between runs, so a Debian package layer co
 
 The runtime stage adds what `deploy/install-computer.sh` installs: Xvfb, Openbox, D-Bus (`dbus-x11`), `at-spi2-core`, `x11-utils`, Noto fonts, voxl, agent-browser (and its skills, for `AGENT_BROWSER_SKILLS_DIR`) and agent-desktop. There are two differences:
 
-- **Debian's `chromium`** instead of Chrome for Testing, which has no Linux arm64 build. `AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium` points agent-browser at it, and Debian's security updates keep it current. agent-browser turns Chrome's sandbox off in a container, as it must: Docker's seccomp profile blocks the user namespaces the sandbox needs. That gives a run nothing more than it has: it already runs commands as that account.
+- **Debian's `chromium`** instead of Chrome for Testing, which has no Linux arm64 build. `AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium` points agent-browser at it, and Debian's security updates keep it current. agent-browser turns Chrome's sandbox off in a container, as it must: Docker's seccomp profile blocks the user namespaces the sandbox needs. That gives a run nothing more than it has: it already runs commands as that account. (Changed by [ADR 0107](0107-chromium-sandbox-in-the-container.md): the sandbox is on in the container now.)
 - **voxl is built in its own stage** (`cargo install voxl-server --no-default-features`, pinned to `install-computer.sh`'s 0.3.5) and copied in, so the runtime gets only its four libraries (x264, libyuv, opus, libjpeg), not a compiler.
 
 Release binaries (agent-browser, agent-desktop) are pinned by version and checked by SHA-256 for each architecture. sudo stays the image's only setuid program, and the smoke test checks that.

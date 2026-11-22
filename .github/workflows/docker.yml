@@ -108,6 +108,8 @@ jobs:
           docker compose config --quiet
           docker compose -f docker-compose.yml -f docker-compose.build.yml config --quiet
           rm .env
+      - name: botd's seccomp profile is Docker's own plus Chromium's sandbox rules (ADR 0107)
+        run: deploy/docker/seccomp-chromium.sh --check
       - name: Smoke test (compose up, healthz, auth, web client, screens and browser, backup/restore, compose down)
         env:
           SUPERBOT_IMAGE: superbot:ci

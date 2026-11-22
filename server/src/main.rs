@@ -23,6 +23,7 @@ mod auth_review_http_tests;
 mod interface_http_tests;
 #[cfg(test)]
 mod command_analysis_http_tests;
+mod chromium;
 mod cron;
 mod handover;
 #[cfg(test)]
@@ -333,6 +334,7 @@ async fn main() {
         iso.teammates = teammate_accounts;
     }
     let screen_addr = screen::init_listen_addr(&env("SCREEN_ADDR", "")).unwrap_or_else(|e| exit(e));
+    let chromium_sandbox = chromium::parse_sandbox(&env("SUPERBOT_CHROMIUM_SANDBOX", "")).unwrap_or_else(|e| exit(e));
     // Screens are X displays botd's account runs; any local account could open them.
     let screens = if isolation.is_some() { None } else { paths::child(&data_dir, "screens").and_then(screen::Screens::from_env) };
     if let Some(s) = &screens {
@@ -682,6 +684,21 @@ async fn main() {
             (false, false) => "off (install Xvfb and openbox to turn them on)".into(),
         }
     );
+    // The image's Chromium (ADR 0107); a bash install's Chrome for Testing keeps agent-browser's own choice.
+    if let Some(browser) = chromium::browser() {
+        if chromium_sandbox {
+            tokio::spawn(async move {
+                match chromium::check(&browser).await {
+                    Ok(()) => log_info!("Chromium sandbox: on (checked: {} starts sandboxed).", browser.display()),
+                    Err(e) => log_warn!(
+                        "Chromium sandbox: on, but Chromium can't start sandboxed here, so Bots' browsers won't open: {e}. Give the container user namespaces (Compose: deploy/docker/seccomp-chromium.json), or set SUPERBOT_CHROMIUM_SANDBOX=off to run it without its sandbox (ADR 0107)."
+                    ),
+                }
+            });
+        } else {
+            log_warn!("Chromium sandbox: off (SUPERBOT_CHROMIUM_SANDBOX=off): pages the Bots open run in Chromium without its sandbox (ADR 0107).");
+        }
+    }
 
     // On SIGTERM/SIGINT: stop agents (queued work runs after restart), then exit.
     let shutdown_app = app.clone();
