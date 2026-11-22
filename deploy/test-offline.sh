@@ -246,7 +246,8 @@ cat >"$T/bin/superbot-oci" <<'EOF'
 #!/usr/bin/env bash
 # superbot-oci over $STUB_REG. fetch writes a layout naming the index and one signature; push
 # tags the signed index (from more than one unit) or the one unit's image, and prints its
-# digest, or another one with STUB_REWRITE=push.
+# digest, or another one with STUB_REWRITE=push. push --check prints it without pushing, and
+# refuses the destination in $STUB_REFUSE.
 set -euo pipefail
 reg=$STUB_REG
 key() { printf '%s' "$1" | sha256sum | cut -c1-16; }
@@ -264,10 +265,22 @@ case $1 in
     printf '{"schemaVersion":2,"manifests":[{"digest":"%s","annotations":{"dev.superbot.oci.role":"index"}},{"digest":"sha256:%s","annotations":{"dev.superbot.oci.role":"referrer"}}]}' \
       "${3##*@}" "$d" >"$out/index.json" ;;
   push)
-    [[ $2 == --to ]] || { echo "stub superbot-oci: $*" >&2; exit 2; }
-    dest=$3
+    shift
+    check=false
+    [[ $1 != --check ]] || { check=true; shift; }
+    [[ $1 == --to ]] || { echo "stub superbot-oci: $*" >&2; exit 2; }
+    dest=$2
+    set -- push "$@"
     for u in "${@:4}"; do
       [[ -f $u/image/oci-layout && -f $u/image/manifest.json ]] || { echo "stub superbot-oci: $u/image isn't an image layout" >&2; exit 1; }
+    done
+    if [[ $check == true ]]; then
+      [[ $dest != "${STUB_REFUSE:-}" ]] || { echo "superbot-oci: stub refuses $dest" >&2; exit 1; }
+      if [[ $# -gt 4 ]]; then jq -r '.manifests[] | select(.annotations["dev.superbot.oci.role"] == "index") | .digest' "$4/signatures/index.json"
+      else jq -r '.manifests[0].digest' "$4/image/index.json"; fi
+      exit 0
+    fi
+    for u in "${@:4}"; do
       echo "push $dest $(jq -r '.manifests[0].digest' "$u/image/index.json") signatures=$([[ -f $u/signatures/index.json ]] && echo yes || echo no)" >>"$reg/oci.log"
     done
     if [[ $# -gt 4 ]]; then
@@ -386,10 +399,19 @@ grep -Fq "Images a and b would both be pushed to mirror.test/clash/unsigned:1.0.
 [[ ! -e "$REG/refs/$(regkey mirror.test/clash/unsigned:1.0.0)" ]] || fail "an image was pushed before the clash was found"
 grep -q "is for push" <<<"$("$DIR/offline-bundle.sh" verify "$IB" --registry mirror.test 2>&1 || true)" || fail "verify took --registry"
 grep -Fq "has no signatures in its bundle" <<<"$(push "$T/iunsigned/$TOP.tar.gz" --registry mirror.test/u)" || fail "push of an unsigned image didn't warn that it has no signatures"
+cp "$T/img/index.json" "$REG/refs/$(regkey reg.test/cg/later:1.0.0)"
+ibuild "$T/itwo" --image a=reg.test/cg/unsigned:1.0.0 --image b=reg.test/cg/later:1.0.0 --allow-unsigned >/dev/null 2>&1 || fail "two images didn't bundle"
+out=$(STUB_REFUSE=mirror.test/two/later:1.0.0 push "$T/itwo/$TOP.tar.gz" --registry mirror.test/two) && fail "a push with an image superbot-oci refuses passed"
+grep -Fq "Can't push b to mirror.test/two/later:1.0.0: nothing pushed" <<<"$out" || { printf '%s
+' "$out" >&2; fail "the refused image was refused for another reason"; }
+[[ ! -e "$REG/refs/$(regkey mirror.test/two/unsigned:1.0.0)" ]] || fail "the first image was pushed before the second was refused"
+out=$(push "$T/itwo/$TOP.tar.gz" --registry mirror.test/two) || { printf '%s
+' "$out" >&2; fail "push of two images failed"; }
+[[ -e "$REG/refs/$(regkey mirror.test/two/unsigned:1.0.0)" && -e "$REG/refs/$(regkey mirror.test/two/later:1.0.0)" ]] || fail "push of two images didn't push both"
 nooci=$(B=$IB remake nooci rm bin/superbot-oci)
 out=$(push "$nooci" --registry mirror.test) && fail "push without superbot-oci passed"
 grep -q "push needs superbot-oci" <<<"$out" || { printf '%s\n' "$out" >&2; fail "push without superbot-oci didn't say why"; }
-ok "push copies images with their signatures to a mirror with the bundle's digest, checks it there, prints Compose's pinned settings, and refuses bad registries, two images on one tag, old bundles, and no superbot-oci"
+ok "push copies images with their signatures to a mirror with the bundle's digest, checks it there, prints Compose's pinned settings, and refuses bad registries, two images on one tag, an image that can't go up (before pushing any), old bundles, and no superbot-oci"
 
 # Both arches' bundles of one release: the signed index goes up, and the tag names it.
 case $ARCH in x86_64) OTHER_ARCH=aarch64 ;; *) OTHER_ARCH=x86_64 ;; esac

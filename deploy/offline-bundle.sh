@@ -445,22 +445,19 @@ cmd_push() {
   oci=$(find_oci "${tools[@]}") \
     || die "push needs superbot-oci, which bundles with images carry in bin/ (one for this machine's arch, $(uname -m)); or set SUPERBOT_OCI to one (docs/ops/air-gapped.md#registry-mirrors)"
 
-  local u units top want what var envs=() platforms=""
+  # Every image's layouts are unpacked and checked by superbot-oci (with no network) before the
+  # first push, so one that can't go up leaves the mirror as it was.
+  local u units top want what var envs=() platforms="" wants=() whats=()
   for arch in "${arches[@]}"; do platforms+="${platforms:+, }linux/$(docker_arch "$arch")"; done
   for i in "${!names[@]}"; do
     name=${names[i]} dest=${dests[i]} index=${indexes[i]} units=()
-    ref=$(cat "${dirs[0]}/images/$name.ref")
     for j in "${!dirs[@]}"; do
       u="$OFFLINE_TMP/units/$name/$j"
       untar_layout "${dirs[j]}/images/$name.tar" "$u/image"
-      if [[ -f "${dirs[j]}/signatures/$name.tar" ]]; then
-        untar_layout "${dirs[j]}/signatures/$name.tar" "$u/signatures"
-      else
-        warn "$name (${arches[j]}) has no signatures in its bundle (unsigned, or bundled before ADR 0147): cosign verify won't find any in the mirror"
-      fi
+      [[ ! -f "${dirs[j]}/signatures/$name.tar" ]] || untar_layout "${dirs[j]}/signatures/$name.tar" "$u/signatures"
       units+=("$u")
     done
-    top=$("$oci" push --to "$dest" "${units[@]}") || die "Couldn't push $name to $dest"
+    top=$("$oci" push --check --to "$dest" "${units[@]}") || die "Can't push $name to $dest: nothing pushed"
     if [[ "$multi" == true ]]; then
       want=$index what="the signed index for $platforms"
     else
@@ -468,6 +465,20 @@ cmd_push() {
       # An index that lists this arch alone (and its attestations) is put up whole.
       [[ -z "$index" || "$top" != "$index" ]] || want=$index what="the signed index for linux/$(docker_arch "${arches[0]}")"
     fi
+    [[ "$top" == "$want" ]] || die "$dest would name $top, not the bundle's $want: nothing pushed"
+    wants+=("$want") whats+=("$what")
+  done
+
+  for i in "${!names[@]}"; do
+    name=${names[i]} dest=${dests[i]} want=${wants[i]} what=${whats[i]} units=()
+    ref=$(cat "${dirs[0]}/images/$name.ref")
+    for j in "${!dirs[@]}"; do
+      u="$OFFLINE_TMP/units/$name/$j"
+      [[ -d "$u/signatures" ]] \
+        || warn "$name (${arches[j]}) has no signatures in its bundle (unsigned, or bundled before ADR 0147): cosign verify won't find any in the mirror"
+      units+=("$u")
+    done
+    top=$("$oci" push --to "$dest" "${units[@]}") || die "Couldn't push $name to $dest"
     [[ "$top" == "$want" ]] || die "$dest is $top after the push, not the bundle's $want: don't use it"
     log "Pushed $ref to $dest ($top, $what)"
     var=$(compose_image_var "$name")

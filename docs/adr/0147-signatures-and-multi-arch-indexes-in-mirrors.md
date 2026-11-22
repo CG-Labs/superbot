@@ -35,7 +35,7 @@ A new binary, `server/src/bin/superbot-oci`, built from the workspace with the H
 
 1. The index cosign just checked must list `DIGEST`. It goes in, with the attestation manifests that index has for `DIGEST`, and not the other arch's.
 2. Then, breadth first from the index, the image and its attestation manifests: each subject's referrers, from the referrers API and the fallback tag (both, merged, since a registry can gain the API after some referrers went into the tag). Each is checked against its digest and must name that subject. Its own referrers are followed too (a signature on an attestation). Cosign's older `.sig`, `.att` and `.sbom` tags are copied as tags.
-3. Every manifest and blob is checked against its digest as it is downloaded. More than 1,000 manifests, a manifest over 4 MiB or a blob over 1 GiB is refused.
+3. Every manifest and blob is checked against its digest as it is downloaded. More than 1,000 manifests, a manifest over 4 MiB or a blob over 1 GiB is refused. Bodies are read in chunks and refused when they pass the limit, so an oversized reply is never read whole. Every page of a referrers list is read (its `Link: <...>; rel="next"`), up to 1,000 entries. A page on any host but the registry's own is refused.
 
 Each `index.json` entry says what it is in an annotation, `dev.superbot.oci.role`: `index`, `attestation`, `referrer` or `tag` (named by `org.opencontainers.image.ref.name`).
 
@@ -44,7 +44,9 @@ Each `index.json` entry says what it is in an annotation, `dev.superbot.oci.role
 - When the units hold every image and attestation manifest their index lists, the **index goes up unchanged**, with the images and attestation manifests first (registries check an index's children exist). The tag then names the digest the `docker` workflow signed. That needs every unit to carry the same index and no image twice; anything else is refused before anything is written. With one unit whose index lists more, the tag names that unit's image alone, as before.
 - Then each signature and attestation, once its subject is in the mirror, so referrers of referrers follow. A registry that lists a manifest by its `subject` says so (`OCI-Subject` on the response). For one that doesn't, `push` writes the subject's fallback tag itself, keeping what it already lists, as cosign and oras do. Our role annotations aren't copied into it. Then the cosign tags.
 - The tag goes last and is read back, and the push fails unless it names the expected digest. So a tag never names an image whose signatures aren't there yet.
-- Logins, CAs and plain-HTTP lab registries come from where skopeo and Docker keep them: the auth files (`auths`, `credHelpers` and `credsStore`, running `docker-credential-*` as Docker does), `certs.d/HOST/*.crt`, and `insecure = true` in `registries.conf` (and its `.d` folders). Bearer token and basic logins are supported. An operator's setup from ADR 0140 keeps working unchanged.
+- `push --check` runs every check that needs no network and prints the digest the tag would name. `offline-bundle.sh` runs it for every image before it pushes the first.
+- Logins, CAs and plain-HTTP lab registries come from where skopeo and Docker keep them: the auth files (`auths`, `credHelpers` and `credsStore`, running `docker-credential-*` as Docker does), `certs.d/HOST/*.crt`, and `insecure = true` in `registries.conf` (and its `.d` folders). As in containers/image, the registry with the longest matching prefix decides, and a later file's registry with the same prefix replaces an earlier one, so an `insecure = false` for one host wins over `*.corp.example`. Bearer token and basic logins are supported. An operator's setup from ADR 0140 keeps working unchanged.
+- The login, or the token it gets, goes only to the registry's own scheme, host and port. An upload location on another host (storage behind the registry) gets the upload without it. The client also refuses an HTTPS registry that hands it an HTTP upload location, next page or token service, and redirects elsewhere drop the login.
 
 ### Bundles and `offline-bundle.sh`
 
@@ -63,8 +65,11 @@ Verifying in the mirror is cosign's own command, against our identity, with `--t
   - one unit tags its image with its signatures;
   - the same arch twice, different indexes, an unsigned unit and a missing arch are refused with nothing written;
   - a changed tag is caught, and logins come from the auth file;
-  - `registries.conf` and auth file parsing.
-- `deploy/test-offline.sh` adds a stand-in for `superbot-oci` (only in the bin folder, so `push` finds it in the bundle). It checks the signatures layout and recorded index in a bundle, `--image-key`, that `load` still loads only images, and multi-bundle push: the index pin, refusals of two releases, one arch twice, mismatched `--sha256`, different images and an unsigned arch, each before anything is pushed. A bundle with images and no `superbot-oci` isn't built.
+  - referrers listed one to a page are all fetched, and a page on another host is refused; an oversized manifest is refused;
+  - uploads on another host get no login, and an HTTPS registry can't send the client to HTTP;
+  - `--check` names the tag's digest without writing, and refuses what `push` refuses;
+  - `registries.conf` (most specific registry first, later files win) and auth file parsing.
+- `deploy/test-offline.sh` adds a stand-in for `superbot-oci` (only in the bin folder, so `push` finds it in the bundle). It checks the signatures layout and recorded index in a bundle, `--image-key`, that `load` still loads only images, and multi-bundle push: the index pin, refusals of two releases, one arch twice, mismatched `--sha256`, different images and an unsigned arch, each before anything is pushed. With two images, if `superbot-oci` refuses the second, the first isn't pushed. A bundle with images and no `superbot-oci` isn't built.
 - `offline.yml`'s `install-offline` job builds a two-arch image with SBOM and provenance in a local registry. It signs it `--recursive` and attests it with a throwaway key and no transparency log, so nothing about it leaves the runner. It then bundles the image for x86_64 and aarch64 with `--image-key`, and `docker load`s one with no network. Inside the network namespace with no network, it runs a registry (the binary from `registry:2`), pushes both bundles, and checks that the tag names the signed index and that both attestation manifests are there. `cosign verify` must pass on the tag and each manifest, and `cosign verify-attestation` on the provenance. We ran the same script against Zot, which has the referrers API, while developing this.
 - `server/tests/offline_release.rs` checks that wiring, and that both jobs build `superbot-oci`.
 
