@@ -328,3 +328,21 @@ async fn a_run_for_someone_disabled_behind_its_back_acts_for_no_one_with_open_sh
     assert_eq!(call(w.port, "GET", "/api/bots", &t, "").await.0, 403);
     w.app.stop(&desk);
 }
+
+#[tokio::test]
+async fn disabled_again_while_coming_back_on_keeps_its_hold() {
+    let w = world(|_| {}).await;
+    let ada = provision(&w, "ada@example.com", "00u1").await;
+    let m = running_machine(&w, &ada).await;
+    set_active(&w, &ada, false).await;
+    w.fake.during_next("boot", {
+        let (app, ada) = (w.app.clone(), ada.clone());
+        move || {
+            app.db.update_user(&ada, db::UserPatch { status: Some("disabled"), ..Default::default() }).unwrap();
+        }
+    });
+    set_active(&w, &ada, true).await;
+    assert!(w.app.db.disable_hold(&m), "the second disable's hold");
+    let pass = reconcile(&w).await;
+    assert_eq!(state(&w, &m), State::Suspended, "{pass}");
+}

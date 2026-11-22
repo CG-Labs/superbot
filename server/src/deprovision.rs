@@ -99,7 +99,10 @@ pub async fn user_enabled(app: &AppState, by: &Who, user_id: &str) -> Option<&'s
 /// stays, so the reconciler tries again.
 async fn resume(app: &AppState, cp: &ControlPlane, by: &Who, user_id: &str, m: &crate::db::Machine) -> &'static str {
     let done = try_resume(app, cp, by, user_id, m).await;
-    if done != "failed" {
+    // Under the lock `suspend` holds under: if they were disabled again meanwhile, the
+    // hold is that disable's now, and stays.
+    let _g = cp.lock_ops().await;
+    if done != "failed" && !disabled(app, user_id) {
         app.db.drop_disable_hold(&m.id);
     }
     done
