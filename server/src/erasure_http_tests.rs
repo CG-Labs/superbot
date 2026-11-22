@@ -315,6 +315,35 @@ async fn names_and_emails_they_had_before_are_erased_too() {
 }
 
 #[tokio::test]
+async fn their_answer_to_a_handoff_in_anothers_bot_is_erased() {
+    let (port, app, admin, _) = serve_app().await;
+    let (ada, ada_auth) = user_with(port, &admin, "ada@example.com", "member").await;
+    let shared = app.db.create_bot("Team", "#fff", "waddle", "claude", None, false);
+    assert_eq!(call(port, "PUT", &format!("/api/bots/{}/grants/{ada}", shared.id), &admin, r#"{"level":"operator"}"#).await.0, 200);
+    let handoff = tokio::spawn({
+        let (app, bot) = (app.clone(), shared.clone());
+        async move { app.handoff(&bot, "Log in to the bank", std::time::Duration::from_secs(30)).await }
+    });
+    let card = loop {
+        if let Some(m) = app.db.messages(&shared.id, 10).into_iter().find(|m| m.question.is_some()) {
+            break m;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    let answer = json!({ "text": "Done, the code was 481516", "answer": { "messageId": card.id, "option": 0 } }).to_string();
+    let (code, sent) = json_call(port, "POST", &format!("/api/bots/{}/messages", shared.id), &ada_auth, &answer).await;
+    assert_eq!(code, 202, "{sent}");
+    assert_eq!(handoff.await.unwrap().as_deref(), Some("Done, the code was 481516"));
+    let mid = sent["id"].as_i64().unwrap();
+
+    let (code, v) = erase(port, &admin, &ada, "").await;
+    assert_eq!(code, 200, "{v}");
+    let m = app.db.message(mid).unwrap();
+    assert_eq!(m.text, "[erased]");
+    assert!(m.requested_by.is_none());
+}
+
+#[tokio::test]
 async fn another_visitors_events_stay_theirs() {
     let (port, app, admin, _) = serve_app().await;
     let (ada, _) = user_with(port, &admin, "ada@example.com", "member").await;

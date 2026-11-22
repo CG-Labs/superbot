@@ -2418,7 +2418,9 @@ async fn send_message(State(app): State<AppState>, Extension(c): Extension<Calle
     }
     // Answering a handoff card the Bot is still waiting on: hand the answer to it directly.
     if let Some(tx) = waiter {
-        let msg = app.db.add_message(&id, "user", &text, None, false, Some("done"));
+        let mut msg = app.db.add_message(&id, "user", &text, None, false, Some("done"));
+        app.db.set_requested_by(msg.id, &by);
+        msg.requested_by = Some(by.clone());
         app.push_message(&msg);
         let _ = tx.send(text);
         return Ok((StatusCode::ACCEPTED, Json(json!(msg))));
