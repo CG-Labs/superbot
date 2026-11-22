@@ -221,14 +221,11 @@ pub async fn assign(State(app): State<AppState>, Extension(by): Extension<Who>, 
     if by.actor.id.as_deref() == Some(before.id.as_str()) {
         return Err(conflict("You can't change your own role. Ask another admin."));
     }
-    if before.role_id.as_deref() != Some(r.id.as_str()) {
-        if !app.db.set_user_custom_role(&before.id, &r.id) {
-            return Err(not_found("Role"));
-        }
+    // Written even when they hold it already: SCIM may take it away between the read and now.
+    let taken = app.db.give_user_custom_role(&before.id, &r.id).ok_or_else(|| not_found("Role"))?;
+    if before.role_id.as_deref() != Some(r.id.as_str()) || taken.is_some() {
         let from = summary(&app, before.role_id.as_deref());
-        app.db.record(&by.event("role.assigned").target("role", &r.id).details(json!({ "name": r.name, "user": before.id, "scope": "org", "from": from })));
-    } else if let Some(mapping) = app.db.take_over_scim_grant(&before.id, "org") {
-        app.db.record(&by.event("role.assigned").target("role", &r.id).details(json!({ "name": r.name, "user": before.id, "scope": "org", "from": summary(&app, Some(&r.id)), "takenFromScim": mapping })));
+        app.db.record(&by.event("role.assigned").target("role", &r.id).details(json!({ "name": r.name, "user": before.id, "scope": "org", "from": from, "takenFromScim": taken })));
     }
     let after = need_user_key(&app, &before.id)?;
     if before.role != after.role {
@@ -268,14 +265,11 @@ pub async fn assign_in_team(State(app): State<AppState>, Extension(by): Extensio
     if u.role == Role::Readonly {
         return Err(conflict("They're read-only, so they change nothing, in a team too. Make them a member first."));
     }
-    if m.role_id.as_deref() != Some(r.id.as_str()) {
-        if !app.db.set_team_custom_role(&t.id, &u.id, Some(&r.id)) {
-            return Err(not_found("Team member"));
-        }
+    let taken = app.db.give_team_custom_role(&t.id, &u.id, Some(&r.id)).ok_or_else(|| not_found("Team member"))?;
+    if m.role_id.as_deref() != Some(r.id.as_str()) || taken.is_some() {
         let from = summary(&app, m.role_id.as_deref());
-        app.db.record(&by.event("role.assigned").target("role", &r.id).details(json!({ "name": r.name, "user": u.id, "scope": "team", "team": t.id, "from": from, "applies": r.perms().in_team().names() })));
-    } else if let Some(mapping) = app.db.take_over_scim_grant(&u.id, "team") {
-        app.db.record(&by.event("role.assigned").target("role", &r.id).details(json!({ "name": r.name, "user": u.id, "scope": "team", "team": t.id, "from": summary(&app, Some(&r.id)), "applies": r.perms().in_team().names(), "takenFromScim": mapping })));
+        let d = json!({ "name": r.name, "user": u.id, "scope": "team", "team": t.id, "from": from, "applies": r.perms().in_team().names(), "takenFromScim": taken });
+        app.db.record(&by.event("role.assigned").target("role", &r.id).details(d));
     }
     Ok(Json(json!({ "team": { "id": t.id, "name": t.name }, "user": person(&u), "role": summary(&app, Some(&r.id)), "applies": r.perms().in_team().names() })))
 }
