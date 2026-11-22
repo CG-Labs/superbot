@@ -143,6 +143,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl retention hold <bot> "<reason>"           Keep a Bot's chat out of retention (a legal hold);
                                                    it can't be deleted while held
   botctl retention release <bot>                   Retention applies to its chat again
+  botctl backups                                   Where server backups are copied off this host, the
+                                                   newest copies, and the RPO (ADR 0109)
+  botctl backups copy                              Copy the newest archive off the host now, if it isn't
   botctl machine list [<state>]                    Every user's machine (pending, running, suspended, error, ... or all)
   botctl machine show <user>                       The user's machine: provider, plan, state, address, enrollment
   botctl machine request <user> [<tier>] [<region>]  Give the user a machine (a Linode VM or an Incus container)
@@ -1246,6 +1249,8 @@ fn run(args: &[String]) -> Result<String, String> {
         ["retention"] => op("GET", "/api/retention", None),
         ["retention", "hold", bot, reason] => op("PUT", &format!("/api/retention/holds/{}", encode(bot)), Some(json!({ "reason": reason }).to_string())),
         ["retention", "release", bot] => op("DELETE", &format!("/api/retention/holds/{}", encode(bot)), None),
+        ["backups"] => op("GET", "/api/backups", None),
+        ["backups", "copy"] => op("POST", "/api/backups", None),
 
         ["login", rest @ ..] => login(rest),
         ["logout"] => op("POST", "/api/auth/logout", None).map(|_| "Signed out. Unset SUPERBOT_TOKEN.".into()),

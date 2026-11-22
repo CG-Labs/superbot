@@ -48,7 +48,11 @@ async fn a_fresh_install_reports_what_it_lacks() {
     assert_eq!((s["license"]["mode"].as_str(), s["license"]["testing"].as_bool(), s["license"]["seats"]["limit"].as_u64()), (Some("unlicensed"), Some(true), None));
     assert_eq!(s["license"]["billing"]["enabled"], json!(false));
     assert_eq!(check(&s, "license")["done"], true);
-    assert_eq!((s["done"].as_u64(), s["total"].as_u64()), (Some(4), Some(6)));
+    // No store set: server backups stay on this host, and the checklist says so (ADR 0109).
+    let backups = check(&s, "backups");
+    assert_eq!(backups["done"], false);
+    assert!(backups["detail"].as_str().unwrap().contains("stay on this host"), "{backups}");
+    assert_eq!((s["done"].as_u64(), s["total"].as_u64()), (Some(4), Some(7)));
 }
 
 #[tokio::test]
@@ -107,7 +111,7 @@ async fn progress_is_saved_and_finishing_is_audited() {
     assert_eq!(actions, ["setup.reopened", "setup.completed", "setup.resumed", "setup.dismissed"], "steps alone aren't audited");
     let done = &ev[1];
     assert_eq!((done["actorId"].as_str(), done["targetType"].as_str()), (Some(users::OPERATOR), Some("setup")));
-    assert_eq!(done["details"]["open"], json!(["domain", "admin"]));
+    assert_eq!(done["details"]["open"], json!(["domain", "admin", "backups"]));
 }
 
 #[tokio::test]

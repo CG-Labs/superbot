@@ -133,4 +133,51 @@ grep -qx 'TESTING_MODE=on' "$T/home/superbot/.env" || fail "--testing-mode did n
 grep -q 'no free tier' <<<"$(usage)" || fail "the help doesn't say there's no free tier"
 ok "--testing-mode, and only it, turns testing mode on"
 
+# Off-host server backups (ADR 0109): an upgrade with no flags writes nothing and warns that
+# backups stay on this host; the flags write the store, with keys from the environment only.
+env_file="$T/home/superbot/.env"
+before=$(cat "$env_file")
+SUPERBOT_USER=$(id -un) DRY_RUN=false configure_env >/dev/null
+[[ "$(grep -v '^TESTING_MODE=' "$env_file")" == "$(grep -v '^TESTING_MODE=' <<<"$before")" ]] || fail "an upgrade with no backup flags changed .env"
+if grep -q '^SERVER_BACKUP_' "$env_file"; then fail "server backup settings were written without flags"; fi
+[[ "$(backup_destination "$env_file")" == "on this host only (no store is set)" ]] || fail "no store, but: $(backup_destination "$env_file")"
+grep -q 'Server backups stay on this host' <<<"$(DOMAIN=ci.example.com summary 2>&1)" || fail "the summary doesn't warn that backups stay on this host"
+grep -qx '  Backups:  on this host only (no store is set) (botctl backups)' <<<"$(DOMAIN=ci.example.com summary 2>/dev/null)" || fail "the summary has no Backups line"
+for bad in "--backup-s3-bucket b-1" "--backup-s3-endpoint https://s3.example.com" \
+  "--backup-s3-bucket b-1 --backup-s3-endpoint http://s3.example.com" "--backup-s3-bucket B_1 --backup-s3-endpoint https://s3.example.com" \
+  "--backup-age-recipients ssh-ed25519" "--backup-off-host maybe"; do
+  # shellcheck disable=SC2086
+  if (parse_args $bad && check_backup_target) 2>/dev/null; then fail "accepted $bad"; fi
+done
+age_key=age1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqs3290gq
+parse_args --backup-s3-endpoint https://s3.example.com --backup-s3-bucket superbot-backups --backup-s3-region auto --backup-age-recipients "$age_key"
+check_backup_target
+if (SUPERBOT_USER=$(id -un) DRY_RUN=false configure_env) >/dev/null 2>"$T/err"; then fail "a store without keys was written"; fi
+grep -q 'needs SERVER_BACKUP_S3_ACCESS_KEY_ID' "$T/err" || { cat "$T/err" >&2; fail "no word about the missing keys"; }
+SERVER_BACKUP_S3_ACCESS_KEY_ID=AKIDCI SERVER_BACKUP_S3_SECRET_ACCESS_KEY=ci-secret-0123 SUPERBOT_USER=$(id -un) DRY_RUN=false configure_env >/dev/null
+for line in SERVER_BACKUP_S3_ENDPOINT=https://s3.example.com SERVER_BACKUP_S3_BUCKET=superbot-backups SERVER_BACKUP_S3_REGION=auto \
+  SERVER_BACKUP_S3_ACCESS_KEY_ID=AKIDCI SERVER_BACKUP_S3_SECRET_ACCESS_KEY=ci-secret-0123 "SUPERBOT_BACKUP_AGE_RECIPIENTS=$age_key"; do
+  grep -qxF "$line" "$env_file" || fail ".env lacks $line"
+done
+if grep -q '^SERVER_BACKUP_S3_PREFIX=' "$env_file"; then fail "an unset prefix was written"; fi
+[[ "$(backup_destination "$env_file")" == off-host ]] || fail "a store, but: $(backup_destination "$env_file")"
+if grep -q 'Server backups stay on this host' <<<"$(DOMAIN=ci.example.com summary 2>&1)"; then fail "the summary warns with a store set"; fi
+# A later upgrade with no flags keeps the store and its keys.
+# shellcheck disable=SC2034 # read by install.sh's functions
+BACKUP_S3_ENDPOINT="" BACKUP_S3_BUCKET="" BACKUP_S3_REGION="" BACKUP_AGE_RECIPIENTS=""
+SUPERBOT_USER=$(id -un) DRY_RUN=false configure_env >/dev/null
+grep -qxF SERVER_BACKUP_S3_SECRET_ACCESS_KEY=ci-secret-0123 "$env_file" || fail "an upgrade dropped the store's keys"
+# A key kept in a file, then replaced from the environment: only the new key stays, as
+# botd refuses a key set both ways.
+unset_env_var "$env_file" SERVER_BACKUP_S3_SECRET_ACCESS_KEY
+printf 'SERVER_BACKUP_S3_SECRET_ACCESS_KEY_FILE=/run/secrets/s3\n' >>"$env_file"
+SERVER_BACKUP_S3_SECRET_ACCESS_KEY=ci-secret-4567 SUPERBOT_USER=$(id -un) DRY_RUN=false configure_env >/dev/null
+grep -qxF SERVER_BACKUP_S3_SECRET_ACCESS_KEY=ci-secret-4567 "$env_file" || fail "the replacement key wasn't written"
+if grep -q '^SERVER_BACKUP_S3_SECRET_ACCESS_KEY_FILE=' "$env_file"; then fail "the replaced key's _FILE was kept"; fi
+grep -qxF SERVER_BACKUP_S3_ACCESS_KEY_ID=AKIDCI "$env_file" || fail "the other key was dropped"
+parse_args --backup-off-host off
+SUPERBOT_USER=$(id -un) DRY_RUN=false configure_env >/dev/null
+[[ "$(backup_destination "$env_file")" == "on this host only (SERVER_BACKUP_OFF_HOST=off)" ]] || fail "off, but: $(backup_destination "$env_file")"
+ok "off-host backups: nothing written without flags, the flags and keys written with them, and the gap warned about"
+
 echo "all install checks passed"

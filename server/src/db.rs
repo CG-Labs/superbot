@@ -1650,7 +1650,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 44] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 45] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1695,7 +1695,37 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 44] = [
     migrate_machine_home_use,
     migrate_user_erasure,
     migrate_machine_provider_backups,
+    migrate_server_backups,
 ];
+
+/// Off-host copies of the server's own backup archives (ADR 0109): `running`, then `done`
+/// or `failed`, and `deleted` once past their retention. One runs at a time. An archive
+/// that failed is tried again, so it can have several rows. `destination` is the store
+/// and folder it went to: a copy elsewhere doesn't count once the store changes.
+fn migrate_server_backups(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS server_backups (
+          id TEXT PRIMARY KEY,
+          archive TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('running', 'done', 'failed', 'deleted')),
+          destination TEXT NOT NULL,
+          object_key TEXT NOT NULL,
+          encrypted INTEGER NOT NULL DEFAULT 0,
+          encrypted_by TEXT,
+          size INTEGER,
+          sha256 TEXT,
+          error TEXT,
+          created_at INTEGER NOT NULL,
+          started_at INTEGER NOT NULL,
+          finished_at INTEGER,
+          expires_at INTEGER,
+          deleted_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS server_backups_archive ON server_backups(destination, archive, started_at);
+        CREATE INDEX IF NOT EXISTS server_backups_created ON server_backups(destination, created_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS server_backups_running ON server_backups(state) WHERE state = 'running';",
+    )
+}
 
 /// The settings key an erasure sets, to its pseudonym, for its own transaction only:
 /// while it is there, `audit_events_no_update` lets an update replace a person's fields.
@@ -2343,6 +2373,62 @@ fn machine_backup_row(r: &Row) -> rusqlite::Result<MachineBackup> {
         expires_at: r.get("expires_at")?,
         deleted_at: r.get("deleted_at")?,
     })
+}
+
+/// One off-host copy of a server backup archive (ADR 0109).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerBackup {
+    pub id: String,
+    /// The archive's file name in BACKUP_DIR, e.g. `superbot-20261122-031500.tar.gz.age`.
+    pub archive: String,
+    /// `running`, `done`, `failed`, or `deleted` (past its retention).
+    pub state: String,
+    /// `<endpoint>/<bucket>/<folder>` it was copied to.
+    pub destination: String,
+    pub object_key: String,
+    pub encrypted: bool,
+    /// `archive` (superbot-backup encrypted it) or `botd` (on its way to the store).
+    pub encrypted_by: Option<String>,
+    pub size: Option<i64>,
+    pub sha256: Option<String>,
+    pub error: Option<String>,
+    /// When the archive was made: what the RPO counts from.
+    pub created_at: i64,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub expires_at: Option<i64>,
+    pub deleted_at: Option<i64>,
+}
+
+fn server_backup_row(r: &Row) -> rusqlite::Result<ServerBackup> {
+    Ok(ServerBackup {
+        id: r.get("id")?,
+        archive: r.get("archive")?,
+        state: r.get("state")?,
+        destination: r.get("destination")?,
+        object_key: r.get("object_key")?,
+        encrypted: r.get("encrypted")?,
+        encrypted_by: r.get("encrypted_by")?,
+        size: r.get("size")?,
+        sha256: r.get("sha256")?,
+        error: r.get("error")?,
+        created_at: r.get("created_at")?,
+        started_at: r.get("started_at")?,
+        finished_at: r.get("finished_at")?,
+        expires_at: r.get("expires_at")?,
+        deleted_at: r.get("deleted_at")?,
+    })
+}
+
+/// A copy of an archive about to start.
+pub struct NewServerBackup<'a> {
+    pub id: &'a str,
+    pub archive: &'a str,
+    pub destination: &'a str,
+    pub object_key: &'a str,
+    pub created_at: i64,
+    pub encrypted_by: Option<&'a str>,
 }
 
 /// One restore of a machine from a backup (ADR 0071).
@@ -7094,6 +7180,100 @@ impl Db {
             .execute("UPDATE machine_backups SET state = 'deleted', deleted_at = ? WHERE id = ? AND state IN ('done', 'failed')", params![now(), id])
             .unwrap_or(0)
             == 1
+    }
+
+    // Off-host copies of server backups (ADR 0109)
+
+    /// Records a copy as running, unless one is running already.
+    pub fn server_backup_start(&self, n: &NewServerBackup) -> Option<ServerBackup> {
+        let made = self
+            .c()
+            .execute(
+                "INSERT OR IGNORE INTO server_backups (id, archive, state, destination, object_key, encrypted, encrypted_by, created_at, started_at)
+                 VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?)",
+                params![n.id, n.archive, n.destination, n.object_key, n.encrypted_by.is_some(), n.encrypted_by, n.created_at, now()],
+            )
+            .unwrap_or(0)
+            == 1;
+        if made { self.server_backup(n.id) } else { None }
+    }
+
+    pub fn server_backup(&self, id: &str) -> Option<ServerBackup> {
+        self.c().query_row("SELECT * FROM server_backups WHERE id = ?", [id], server_backup_row).optional().ok().flatten()
+    }
+
+    /// The newest `limit` copies, by when their archive was made, deleted and failed ones too.
+    pub fn server_backups(&self, limit: i64) -> Vec<ServerBackup> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM server_backups ORDER BY created_at DESC, started_at DESC, id DESC LIMIT ?").unwrap();
+        s.query_map([limit], server_backup_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Every copy of `archive` to `destination`, newest attempt first.
+    pub fn server_backups_of(&self, destination: &str, archive: &str) -> Vec<ServerBackup> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM server_backups WHERE destination = ? AND archive = ? ORDER BY started_at DESC, id DESC").unwrap();
+        s.query_map([destination, archive], server_backup_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Every copy in `state`, oldest archive first.
+    pub fn server_backups_in(&self, state: &str) -> Vec<ServerBackup> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM server_backups WHERE state = ? ORDER BY created_at, id").unwrap();
+        s.query_map([state], server_backup_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// The newest archive whose copy to `destination` finished. Of archives made in the same
+    /// second, the one copied last: only the newest is ever copied.
+    pub fn server_last_backup(&self, destination: &str) -> Option<ServerBackup> {
+        self.c()
+            .query_row(
+                "SELECT * FROM server_backups WHERE destination = ? AND state = 'done' ORDER BY created_at DESC, finished_at DESC, id DESC LIMIT 1",
+                [destination],
+                server_backup_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Ends a running copy as `done` (with its size, hash and expiry, if it has one) or `failed`.
+    pub fn server_backup_end(&self, id: &str, done: Option<(i64, &str, Option<i64>)>, error: Option<&str>) -> bool {
+        let (state, size, sha, expires) = match done {
+            Some((size, sha, expires)) => ("done", Some(size), Some(sha), expires),
+            None => ("failed", None, None, None),
+        };
+        self.c()
+            .execute(
+                "UPDATE server_backups SET state = ?, size = ?, sha256 = ?, expires_at = ?, error = ?, finished_at = ? WHERE id = ? AND state = 'running'",
+                params![state, size, sha, expires, error.map(|e| crate::audit::clip(e, 500)), now(), id],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// A finished copy whose objects are gone from the store.
+    pub fn server_backup_deleted(&self, id: &str) -> bool {
+        self.c()
+            .execute("UPDATE server_backups SET state = 'deleted', deleted_at = ? WHERE id = ? AND state = 'done'", params![now(), id])
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Moves a copy `ms` into the past, for tests.
+    #[cfg(test)]
+    pub fn server_backup_backdate(&self, id: &str, ms: i64) {
+        self.c()
+            .execute(
+                "UPDATE server_backups SET created_at = created_at - ?1, started_at = started_at - ?1, finished_at = finished_at - ?1, expires_at = expires_at - ?1 WHERE id = ?2",
+                params![ms, id],
+            )
+            .unwrap();
+    }
+
+    /// Clears a generic setting.
+    pub fn clear_setting(&self, key: &str) {
+        let _ = self.c().execute("DELETE FROM settings WHERE key = ?", [key]);
     }
 
     /// Backups of any of the user's machines, destroyed ones too, not yet deleted.

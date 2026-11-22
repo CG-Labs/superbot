@@ -93,6 +93,10 @@ The installer builds the Expo client (`apps/client`) from the same commit as `bo
 | `--upgrade` | Pull, rebuild, restart |
 | `--ufw` | Enable firewall rules |
 | `--no-backup` | Skip backup timer |
+| `--backup-s3-endpoint`, `--backup-s3-bucket` | Copy server backups off the host to S3-compatible storage; keys in `SERVER_BACKUP_S3_ACCESS_KEY_ID` and `SERVER_BACKUP_S3_SECRET_ACCESS_KEY` in the installer's environment, never flags ([below](#backups-and-restore)) |
+| `--backup-s3-region`, `--backup-s3-prefix` | The store's region (us-east-1; `auto` for R2) and key prefix (`superbot/`) |
+| `--backup-age-recipients` | Encrypt backup archives to these age public keys (`SUPERBOT_BACKUP_AGE_RECIPIENTS`) |
+| `--backup-off-host auto\|on\|off` | `SERVER_BACKUP_OFF_HOST`: copy when a store is set, refuse to start without one, or never copy |
 | `--with-hermes` | Also install Hermes Agent ([below](#hermes-agent)) |
 | `--license-file` | Install the license key CG-Labs sent ([below](#license)) |
 | `--isolation` / `--no-isolation` | Each user's Bots run as their own Unix account, or not ([below](#one-unix-account-per-user)). On for new installs; upgrades keep what they had |
@@ -404,7 +408,16 @@ sudo -u superbot superbot-restore --home /home/superbot - < <archive>
 sudo systemctl start superbot superbot-backup.timer
 ```
 
-Copy archives, the master key, and `.env` off the server: the default RPO is 24 hours, and only for copies that survive the host. Full procedure (new host, hourly schedule, encryption, the drills CI runs, RPO/RTO targets): [docs/ops/backup-restore.md](../docs/ops/backup-restore.md).
+botd copies each archive off the host when it has a store ([ADR 0109](../docs/adr/0109-server-backups-off-the-host.md)): `SERVER_BACKUP_S3_*` in `.env`, or the machine backups' store when that is set. The installer writes one from flags, with the keys from its environment; an upgrade without them keeps what `.env` has:
+
+```sh
+sudo SERVER_BACKUP_S3_ACCESS_KEY_ID=<access-key-id> SERVER_BACKUP_S3_SECRET_ACCESS_KEY=<secret-access-key> \
+  bash -s -- --upgrade --backup-s3-endpoint https://<s3-endpoint> --backup-s3-bucket <bucket> \
+  < <(curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/install.sh)
+botctl backups                                                   # the store, the newest copies, the RPO
+```
+
+Without a store, archives stay on the host: the installer's summary, botd's log, the setup checklist and `/metrics` say so. Copy the master key and `.env` off the server yourself: they are never in archives. The default RPO is 24 hours, and only for copies that survive the host. Full procedure (new host, hourly schedule, encryption, the drills CI runs, RPO/RTO targets): [docs/ops/backup-restore.md](../docs/ops/backup-restore.md).
 
 ## Computer / screens
 
@@ -447,6 +460,8 @@ Both are off by default, and the installer and Compose don't turn them on. Desig
 The metrics cover requests (by route class, method and status class, with latency), Bot runs (by harness and result, with duration, plus runs underway, waiting and refused), approvals waiting and the oldest one's age, audit events worth alerting on (failed sign-ins, failed notifications, machine backups, RPO breaches, restores), every failed sign-in guess by method and suspicious sign-in patterns ([sign-in alerts](#status-page-and-slo-alerts)), and with managed machines, machines by state, the reconciler, and each tier's RPO status. Labels never hold ids, emails, names, paths or message text.
 
 **Host capacity.** `/metrics` also shows `botd`'s own host (`host="botd"`): its CPU threads, load, memory, and the disks `DATA_DIR` and `WORKSPACE_DIR` are on. With Incus machines it adds each host by its `INCUS_HOSTS` name: what machines' plans take of its `INCUS_CAPACITY` and `INCUS_MAX_MACHINES`, whether it's open for new machines, machines waiting for room, and, read every `MACHINE_RECONCILE_SECONDS`, the host's own CPU threads, load, memory and storage pool space. Design: [ADR 0106](../docs/adr/0106-host-capacity-metrics.md). Alert rules for hosts nearing capacity are in [`prometheus/superbot-capacity.rules.yml`](prometheus/superbot-capacity.rules.yml), tested with `promtool test rules prometheus/superbot-capacity.rules.test.yml`; load them next to the other rules. A Grafana dashboard is in [`grafana/superbot-capacity.json`](grafana/superbot-capacity.json): in Grafana, **Dashboards → New → Import**, upload it, and pick your Prometheus data source; it shows one botd at a time.
+
+**Server backups.** `superbot_server_backup_off_host` is 1 when botd copies its backups off the host and 0 when they stay on it; with a store, `/metrics` adds the RPO, the newest copy's age and time, and whether it is past the RPO. Design: [ADR 0109](../docs/adr/0109-server-backups-off-the-host.md). Alert rules (backups on the host, past the RPO, copies failing) are in [`prometheus/superbot-server-backups.rules.yml`](prometheus/superbot-server-backups.rules.yml), tested with `promtool test rules prometheus/superbot-server-backups.rules.test.yml`.
 
 **Machine backups.** With Linode machines, `/metrics` shows running machines by tier with Linode Backups on or off and, with `MACHINE_BACKUPS=on` (the default), the oldest newest backup's age, those past the RPO (`MACHINE_BACKUPS_RPO_HOURS`, 26 by default) and the RPO itself, read from what Linode last said of each machine, never per machine. botd also audits and emails each machine that goes past it (`machine.rpo_breached`). Design: [ADR 0110](../docs/adr/0110-linode-machine-recovery-objectives.md); objectives and the restore procedure: [machine recovery](../docs/ops/machine-recovery.md#linode-machines). Alert rules for stale backups and backups left off are in [`prometheus/superbot-backups.rules.yml`](prometheus/superbot-backups.rules.yml), tested with `promtool test rules prometheus/superbot-backups.rules.test.yml`; load them next to the other rules.
 
@@ -815,7 +830,7 @@ docker compose run --rm --no-deps -T botd superbot-restore - < superbot-20261119
 docker compose up -d
 ```
 
-To encrypt archives, set `SUPERBOT_BACKUP_AGE_RECIPIENTS` in `.env` and `docker compose up -d`; restoring then needs the identity (`--identity`). Check an archive without touching live data with `superbot-restore --check`. New host, schedule, and the restore drill: [docs/ops/backup-restore.md](../docs/ops/backup-restore.md).
+To encrypt archives, set `SUPERBOT_BACKUP_AGE_RECIPIENTS` in `.env` and `docker compose up -d`; restoring then needs the identity (`--identity`). To copy them off the host, set `SERVER_BACKUP_S3_BUCKET`, `_ENDPOINT`, `_ACCESS_KEY_ID` and `_SECRET_ACCESS_KEY` in `.env` and `docker compose up -d`: botd reads the `backups` volume and copies each new archive within a minute, with an RPO of `SUPERBOT_BACKUP_INTERVAL` plus 2 hours ([ADR 0109](../docs/adr/0109-server-backups-off-the-host.md)); without them, botd warns that archives stay on the host. Check an archive without touching live data with `superbot-restore --check`. New host, schedule, and the restore drill: [docs/ops/backup-restore.md](../docs/ops/backup-restore.md).
 
 Archives include the audit log (`audit_events` lives in `app.sqlite`). See [Audit log retention](#audit-log-retention).
 

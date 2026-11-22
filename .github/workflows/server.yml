@@ -130,6 +130,8 @@ jobs:
       - run: promtool test rules deploy/prometheus/superbot-signin.rules.test.yml
       - run: promtool check rules deploy/prometheus/superbot-capacity.rules.yml
       - run: promtool test rules deploy/prometheus/superbot-capacity.rules.test.yml
+      - run: promtool check rules deploy/prometheus/superbot-server-backups.rules.yml
+      - run: promtool test rules deploy/prometheus/superbot-server-backups.rules.test.yml
       - run: promtool check rules deploy/prometheus/superbot-backups.rules.yml
       - run: promtool test rules deploy/prometheus/superbot-backups.rules.test.yml
 

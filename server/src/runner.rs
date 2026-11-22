@@ -244,6 +244,8 @@ pub struct App {
     pub teams: OnceLock<crate::teams::Settings>,
     /// STATUS_PAGE, and the public status page's shared snapshot (ADR 0090).
     pub status: crate::status::Page,
+    /// Copies of the server's own backups off this host (ADR 0109).
+    pub server_backups: OnceLock<Arc<crate::server_backups::ServerBackups>>,
     closing: AtomicBool,
 }
 
@@ -284,6 +286,7 @@ impl App {
             storage: Default::default(),
             teams: OnceLock::new(),
             status: Default::default(),
+            server_backups: OnceLock::new(),
             closing: AtomicBool::new(false),
         })
     }

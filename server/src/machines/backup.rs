@@ -135,18 +135,45 @@ impl Retention {
     }
 }
 
-/// age recipients, one per line or comma: `age1...`. Comments start with `#`.
-pub fn recipients(raw: &str) -> Result<Vec<age::x25519::Recipient>, String> {
+/// age recipients, one per line or comma: `age1...`. Comments start with `#`. Errors
+/// name the setting `var`.
+pub fn recipients_named(var: &str, raw: &str) -> Result<Vec<age::x25519::Recipient>, String> {
     raw.lines()
         .map(str::trim)
         .filter(|l| !l.starts_with('#'))
         .flat_map(|l| l.split(',').map(str::trim))
         .filter(|r| !r.is_empty())
-        .map(|r| {
-            age::x25519::Recipient::from_str(r)
-                .map_err(|_| format!("MACHINE_BACKUP_AGE_RECIPIENTS: \"{}\" isn't an age public key (age1...)", crate::audit::clip(r, 24)))
-        })
+        .map(|r| age::x25519::Recipient::from_str(r).map_err(|_| format!("{var}: \"{}\" isn't an age public key (age1...)", crate::audit::clip(r, 24))))
         .collect()
+}
+
+/// `{var}` or `{var}_FILE` (not both): the recipients they hold, or none.
+pub fn recipients_from_env(var: &str, get: &dyn Fn(&str) -> String) -> Result<Vec<age::x25519::Recipient>, String> {
+    let mut raw = get(var);
+    let file = get(&format!("{var}_FILE"));
+    if !file.trim().is_empty() {
+        if !raw.trim().is_empty() {
+            return Err(format!("Set {var} or {var}_FILE, not both"));
+        }
+        raw = std::fs::read_to_string(file.trim()).map_err(|e| format!("{var}_FILE: {e}"))?;
+    }
+    recipients_named(var, &raw)
+}
+
+/// A key prefix as `{var}` gives it: `superbot/` when unset, else letters, digits, dots,
+/// dashes, underscores and single slashes, ending in `/` unless empty.
+pub fn prefix(var: &str, raw: &str) -> Result<String, String> {
+    if raw.is_empty() {
+        return Ok("superbot/".into());
+    }
+    let mut prefix = raw.trim().trim_start_matches('/').to_string();
+    if prefix.len() > 200 || !prefix.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-/".contains(&b)) || prefix.contains("//") {
+        return Err(format!("{var}: letters, digits, dots, dashes, underscores and single slashes"));
+    }
+    if !prefix.is_empty() && !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+    Ok(prefix)
 }
 
 /// age identities, as `age-keygen` writes them. Never echoed back.
@@ -256,24 +283,8 @@ impl Settings {
             return Ok(None);
         }
         let s3 = s3::Settings::from_env(store, var)?;
-        let mut prefix = var("MACHINE_BACKUP_S3_PREFIX").trim().trim_start_matches('/').to_string();
-        if var("MACHINE_BACKUP_S3_PREFIX").is_empty() {
-            prefix = "superbot/".into();
-        }
-        if prefix.len() > 200 || !prefix.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-/".contains(&b)) || prefix.contains("//") {
-            return Err("MACHINE_BACKUP_S3_PREFIX: letters, digits, dots, dashes, underscores and single slashes".into());
-        }
-        if !prefix.is_empty() && !prefix.ends_with('/') {
-            prefix.push('/');
-        }
-        let mut raw = var("MACHINE_BACKUP_AGE_RECIPIENTS");
-        let file = var("MACHINE_BACKUP_AGE_RECIPIENTS_FILE");
-        if !file.trim().is_empty() {
-            if !raw.trim().is_empty() {
-                return Err("Set MACHINE_BACKUP_AGE_RECIPIENTS or MACHINE_BACKUP_AGE_RECIPIENTS_FILE, not both".into());
-            }
-            raw = std::fs::read_to_string(file.trim()).map_err(|e| format!("MACHINE_BACKUP_AGE_RECIPIENTS_FILE: {e}"))?;
-        }
+        let prefix = prefix("MACHINE_BACKUP_S3_PREFIX", &var("MACHINE_BACKUP_S3_PREFIX"))?;
+        let recipients = recipients_from_env("MACHINE_BACKUP_AGE_RECIPIENTS", var)?;
         let interval_raw = var("MACHINE_BACKUP_INTERVAL_HOURS");
         let mut interval = PerTier::parse("MACHINE_BACKUP_INTERVAL_HOURS", &interval_raw, 1..=720, "hours")?;
         let mut named = Vec::new();
@@ -291,7 +302,7 @@ impl Settings {
         if let Some((v, t)) = named.iter().find(|(_, t)| !tiers.is_empty() && !tiers.contains(t)) {
             return Err(format!("{v}: \"{t}\" isn't one of the machine tiers ({})", tiers.join(", ")));
         }
-        let s = Settings { s3, prefix, recipients: recipients(&raw)?, interval, rpo, rto, retention };
+        let s = Settings { s3, prefix, recipients, interval, rpo, rto, retention };
         for t in s.named() {
             let (every, rpo) = (s.interval_ms(&t) / HOUR_MS, s.rpo_ms(&t) / HOUR_MS);
             if rpo < every + RPO_MIN_HEADROOM_HOURS {
@@ -410,18 +421,24 @@ impl Sink {
 
 /// Sends the provider's export to the store, encrypted if set: its size and SHA-256 as
 /// stored. A failed upload leaves no parts behind.
-async fn upload(off: &Offsite, mut data: ByteStream, key: &str) -> Result<(u64, String), String> {
-    let mut up = off.s3.upload(key).await?;
+async fn upload(off: &Offsite, data: ByteStream, key: &str) -> Result<(u64, String), String> {
+    send(&off.s3, &off.s.recipients, data, key, "the provider").await
+}
+
+/// Streams `data`, read from `from`, to `key` in the store, age-encrypted to `recipients`
+/// if any: its size and SHA-256 as stored. A failed upload leaves no parts behind.
+pub(crate) async fn send(s3: &S3, recipients: &[age::x25519::Recipient], mut data: ByteStream, key: &str, from: &str) -> Result<(u64, String), String> {
+    let mut up = s3.upload(key).await?;
     let sink = Sink::default();
-    let mut enc = if off.s.recipients.is_empty() {
+    let mut enc = if recipients.is_empty() {
         None
     } else {
-        let e = age::Encryptor::with_recipients(off.s.recipients.iter().map(|r| r as &dyn age::Recipient)).map_err(|e| e.to_string())?;
+        let e = age::Encryptor::with_recipients(recipients.iter().map(|r| r as &dyn age::Recipient)).map_err(|e| e.to_string())?;
         Some(e.wrap_output(sink.clone()).map_err(|e| e.to_string())?)
     };
     let res: Result<(), String> = async {
         while let Some(chunk) = data.next().await {
-            let chunk = chunk.map_err(|e| format!("reading the backup from the provider: {e}"))?;
+            let chunk = chunk.map_err(|e| format!("reading the backup from {from}: {e}"))?;
             match enc.as_mut() {
                 Some(w) => {
                     w.write_all(&chunk).map_err(|e| e.to_string())?;

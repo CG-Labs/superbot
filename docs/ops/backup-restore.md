@@ -10,7 +10,7 @@ How to back up a SuperBot server, restore it in place or onto a new host, and pr
 | **RTO** (time to serve again) | 1 hour on a new host: install (about 20 to 30 minutes, mostly the build) plus restore | Same |
 | Restore step alone | 5 minutes (the drills' budget; a small install takes seconds) | Same |
 
-The RPO only holds for archives that are **off the host**. Archives on the server's own disk die with it.
+The RPO only holds for archives that are **off the host**. Archives on the server's own disk die with it. botd copies them off when it has a store ([below](#off-site-copies)), and warns while it hasn't.
 
 ## What a backup holds
 
@@ -41,13 +41,25 @@ Back up now: `sudo systemctl start superbot-backup.service`. Check runs: `system
 
 ## Off-site copies
 
-Copy archives off the host on the same schedule, with whatever you trust: `rclone copy`, `aws s3 cp`, `restic`, `rsync` to another machine. For example, on an installer host, a root cron job or timer after each backup:
+botd copies each new archive to S3-compatible storage (AWS S3, Cloudflare R2, Backblaze B2, MinIO, ...) within a minute of `superbot-backup` writing it ([ADR 0109](../adr/0109-server-backups-off-the-host.md)). Give it a bucket of its own, ideally in another account than the machines' (the keys need put, get, delete and the multipart actions on the prefix, including listing and aborting uploads, or no delete with `SERVER_BACKUP_RETENTION_DAYS=off`; a bucket rule that aborts incomplete multipart uploads after a day is a good backstop):
 
 ```sh
-rclone copy --max-age 2h ~superbot/superbot/backups remote:superbot-backups
+# installer: keys from the environment, never flags
+sudo SERVER_BACKUP_S3_ACCESS_KEY_ID=<access-key-id> SERVER_BACKUP_S3_SECRET_ACCESS_KEY=<secret-access-key> \
+  bash deploy/install.sh --upgrade --backup-s3-endpoint https://<s3-endpoint> --backup-s3-bucket <bucket> \
+  --backup-age-recipients age1...
 ```
 
-For Compose, stream the archive straight to the host: `docker compose exec -T botd superbot-backup - > superbot-$(date -u +%Y%m%d-%H%M).tar.gz`.
+Or set `SERVER_BACKUP_S3_BUCKET`, `_ENDPOINT`, `_REGION`, `_ACCESS_KEY_ID` and `_SECRET_ACCESS_KEY` in `.env` (Compose: `deploy/docker/.env`) and restart botd. Without them, a server with machine backups (`MACHINE_BACKUP_S3_*`) uses that store, under `<prefix>server/`. `SERVER_BACKUP_OFF_HOST=on` makes botd refuse to start without a store.
+
+- **What lands there**: `<prefix>server/superbot-<stamp>.tar.gz[.age]` and a manifest `superbot-<stamp>.json` with its size and SHA-256. An archive `superbot-backup` encrypted is copied as it is; a plain one is encrypted on the way to `SERVER_BACKUP_AGE_RECIPIENTS` when set.
+- **Retention**: `SERVER_BACKUP_RETENTION_DAYS` (default 30), never the newest copy; `off` deletes nothing. Copies left in a store you moved away from stay there: botd only counts and deletes copies in the store set now.
+- **RPO**: `SERVER_BACKUP_RPO_HOURS`, by default the archive interval plus 2 hours (26 for the daily timer). Past it botd audits `server.backup_rpo_breached` and notifies admins like a machine's breach; [`deploy/prometheus/superbot-server-backups.rules.yml`](../../deploy/prometheus/superbot-server-backups.rules.yml) alerts from `/metrics` too.
+- **Check it**: `botctl backups` shows the store, the newest copies and errors; `botctl backups copy` copies the newest archive now. Every copy, failure and deletion is in the audit log (`server.backup_*`).
+
+Without a store, archives stay on the host: botd logs a warning at every start, the setup checklist's "Server backups copied off this host" stays open, and `superbot_server_backup_off_host` is 0. If you copy them yourself instead (`rclone copy`, `restic`, `rsync`), set `SERVER_BACKUP_OFF_HOST=off` and watch your own copies; for Compose, stream an archive straight to the host: `docker compose exec -T botd superbot-backup - > superbot-$(date -u +%Y%m%d-%H%M).tar.gz`.
+
+To restore from the store: download the copy, compare its SHA-256 with the manifest's (`sha256sum`), then restore it below, with `--identity` if it ends in `.age`.
 
 Copy the master key and `.env` off-host once, and again whenever they change. Keep them apart from the archives.
 
