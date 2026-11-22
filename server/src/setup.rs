@@ -324,8 +324,9 @@ fn item(id: &str, label: &str, done: bool, detail: impl Into<String>) -> Value {
     json!({ "id": id, "label": label, "done": done, "detail": detail.into() })
 }
 
-/// Everything the wizard shows, for the request it answers.
-fn report(app: &AppState, a: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -> Value {
+/// Everything the wizard shows, for the request it answers. The support bundle
+/// (ADR 0131) carries its checklist.
+pub(crate) fn report(app: &AppState, a: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -> Value {
     let progress = app.db.setup_progress();
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or_default();
     let on_this_machine = peer.is_some_and(|p| p.to_canonical().is_loopback());

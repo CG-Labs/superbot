@@ -6,6 +6,8 @@
 //! run, message, Bot, and trace and span ids when traces are on), harness names, route
 //! templates and classes, statuses and timings.
 //! Never a path as sent, a query string, a body, a name, an email, or a token.
+//!
+//! The newest lines are also kept in memory, in JSON, for the support bundle (ADR 0131).
 
 use serde_json::{Map, Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,15 +64,16 @@ impl Level {
 /// A line of botd's own text: printed as is (info to stdout, warnings to stderr), or
 /// as `{"ts", "level", "msg"}` on the same stream, with the trace's ids inside a kept span.
 pub fn line(level: Level, msg: &str) {
-    if !json() {
+    let rendered = render(level, msg.strip_prefix("WARNING: ").unwrap_or(msg), traced(json!({})));
+    if json() {
+        write(level, rendered.clone());
+    } else {
         match level {
             Level::Info => println!("{msg}"),
             Level::Warn => eprintln!("{msg}"),
         }
-        return;
     }
-    let msg = msg.strip_prefix("WARNING: ").unwrap_or(msg);
-    write(level, render(level, msg, traced(json!({}))));
+    recent::push(rendered);
 }
 
 /// Inside a span that's kept (ADR 0118), `fields` with its `traceId` and `spanId`.
@@ -88,17 +91,13 @@ fn traced(mut fields: Value) -> Value {
 /// `fields` beside it. Only in JSON format: text logs stay as they were. Inside a span
 /// that's kept (ADR 0118), it names the span's `traceId` and `spanId` too.
 pub fn event(level: Level, msg: &str, fields: Value) {
-    let fields = traced(fields);
-    let rendered = (json() || cfg!(test)).then(|| render(level, msg, fields));
+    let rendered = render(level, msg, traced(fields));
     #[cfg(test)]
-    if let Some(r) = &rendered {
-        captured::push(r);
+    captured::push(&rendered);
+    if json() {
+        write(level, rendered.clone());
     }
-    if json()
-        && let Some(r) = rendered
-    {
-        write(level, r);
-    }
+    recent::push(rendered);
 }
 
 /// Never panics on a failed write: structured lines are also written from the panic
@@ -137,6 +136,40 @@ macro_rules! log_warn {
 }
 
 pub(crate) use {log_info, log_warn};
+
+/// The newest lines botd logged, as JSON whatever `LOG_FORMAT` is, kept in memory for
+/// the support bundle (ADR 0131). A restart forgets them; journald or Docker keeps the rest.
+pub mod recent {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    pub const KEEP: usize = 2_000;
+    /// Longer lines are cut: one huge warning mustn't crowd out the rest.
+    pub const MAX_LINE: usize = 4_096;
+
+    static LINES: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+
+    pub fn push(mut line: String) {
+        if line.len() > MAX_LINE {
+            let mut end = MAX_LINE;
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            line.truncate(end);
+            line.push('…');
+        }
+        let mut l = LINES.lock().unwrap_or_else(|e| e.into_inner());
+        if l.len() >= KEEP {
+            l.pop_front();
+        }
+        l.push_back(line);
+    }
+
+    /// Oldest first.
+    pub fn lines() -> Vec<String> {
+        LINES.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect()
+    }
+}
 
 /// Structured lines, kept in test builds so tests can read what would be logged.
 #[cfg(test)]
