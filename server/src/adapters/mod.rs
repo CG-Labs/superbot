@@ -133,7 +133,8 @@ pub struct Guard {
 /// Server secrets the harness (and everything it runs) must not inherit, or a Bot
 /// could approve its own actions, read what botd seals, or copy the license key or
 /// forge Stripe's webhook or call Stripe's API, or sign in to the Vault, Key Vault or
-/// Secret Manager botd reads its secrets from (ADR 0125, ADR 0136).
+/// Secret Manager botd reads its secrets from (ADR 0125, ADR 0136). botd's AWS
+/// credentials depend on its settings, so `secrets::sign_in_env` adds them (ADR 0146).
 pub(crate) const SECRET_ENV: [&str; 26] = [
     "AUTH_PASSWORD",
     "AUTH_PASSWORD_FILE",
@@ -168,6 +169,7 @@ pub(crate) const SECRET_ENV: [&str; 26] = [
 /// webhook URL (ADR 0061).
 pub(crate) fn secret_env() -> Vec<String> {
     let mut names: Vec<String> = SECRET_ENV.map(String::from).into();
+    names.extend(crate::secrets::sign_in_env());
     for k in crate::secrets::SERVER_SECRETS {
         names.extend([k.to_string(), format!("{k}_FILE")]);
     }

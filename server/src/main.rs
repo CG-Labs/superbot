@@ -298,7 +298,7 @@ async fn main() {
     obs::log::set_format(observe.log);
     match (&external, external_names) {
         (Some(x), Some(n)) => log_info!("Secrets backend: {} ({n} names; SECRETS_BACKEND, ADR 0125).", x.describe()),
-        _ => log_info!("Secrets backend: local (the environment and the sealed store; SECRETS_BACKEND=vault, azure-keyvault or gcp-secret-manager adds one, ADR 0125, ADR 0136)."),
+        _ => log_info!("Secrets backend: local (the environment and the sealed store; SECRETS_BACKEND=vault, azure-keyvault, gcp-secret-manager or aws adds one, ADR 0125, ADR 0136, ADR 0146)."),
     }
     obs::errors::install_panic_hook();
     obs::errors::start(&observe.errors);

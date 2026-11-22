@@ -247,7 +247,7 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine removals [<state>]                Teammate removals: open (default), pending, held, done, cancelled, all
   botctl secrets                                   List secret names (never values)
   botctl secrets backend                           Where botd reads secrets from (local, Vault, Azure Key
-                                                   Vault, GCP Secret Manager) and whether it answers now
+                                                   Vault, GCP or AWS Secrets Manager) and whether it answers now
   botctl secret set <NAME> < value-file            Save a secret, encrypted; Bots get it as $NAME
   botctl secret rm <NAME>                          Delete a saved secret
 
@@ -1196,7 +1196,7 @@ fn setup_summary(s: &Value) -> String {
     out
 }
 
-/// Where botd reads secrets from and whether it answers (ADR 0125, ADR 0136); an error
+/// Where botd reads secrets from and whether it answers (ADR 0125, ADR 0136, ADR 0146); an error
 /// when it doesn't, so scripts can check it.
 fn backend_summary(b: &Value) -> Result<String, String> {
     if b.is_null() {
