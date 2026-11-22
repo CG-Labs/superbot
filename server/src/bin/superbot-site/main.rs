@@ -164,18 +164,34 @@ fn lock(out: &Path) -> Result<fs::File, String> {
     Ok(file)
 }
 
-/// Removes staging and old folders that earlier builds into `out` left behind. Call it
-/// only while holding the lock.
-fn sweep(out: &Path) {
-    let (Some(dir), Some(name)) = (out.parent(), out.file_name()) else { return };
+/// Removes staging and old folders that earlier builds into `out` left behind. If a build
+/// died between the two renames of a swap, `out` is missing, so the newest old copy is put
+/// back first. Call it only while holding the lock.
+fn sweep(out: &Path) -> Result<(), String> {
+    let (Some(dir), Some(name)) = (out.parent(), out.file_name()) else { return Ok(()) };
     let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
-    let prefixes = [format!(".{}.building-", name.to_string_lossy()), format!(".{}.old-", name.to_string_lossy())];
-    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
-        let n = entry.file_name().to_string_lossy().into_owned();
-        if prefixes.iter().any(|p| n.starts_with(p)) && entry.path().join(MARKER).is_file() {
-            let _ = fs::remove_dir_all(entry.path());
-        }
+    let name = name.to_string_lossy();
+    let (building, old) = (format!(".{name}.building-"), format!(".{name}.old-"));
+    let ours = |p: &str| {
+        let mut found: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(p) && e.path().join(MARKER).is_file())
+            .map(|e| (e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), e.path()))
+            .collect();
+        found.sort();
+        found
+    };
+    if !out.exists()
+        && let Some((_, newest)) = ours(&old).pop()
+    {
+        fs::rename(&newest, out).map_err(|e| format!("restoring {} to {}: {e}", newest.display(), out.display()))?;
     }
+    for (_, path) in ours(&building).into_iter().chain(ours(&old)) {
+        let _ = fs::remove_dir_all(path);
+    }
+    Ok(())
 }
 
 fn docs_page(pages: &[Page], page: &Page, article: &str, repo_url: &str) -> String {
@@ -251,7 +267,7 @@ pub fn build(args: &Args) -> Result<Summary, Vec<String>> {
     let one = |e: String| vec![e];
     replaceable(&args.out).map_err(one)?;
     let _lock = lock(&args.out).map_err(one)?;
-    sweep(&args.out);
+    sweep(&args.out).map_err(one)?;
     let stage = sibling(&args.out, &format!("building-{}", std::process::id())).map_err(one)?;
     prepare(&stage).map_err(one)?;
     let built = build_into(args, &stage);
@@ -456,6 +472,15 @@ mod tests {
         fs::write(repo.join("docs/slo.md"), "# SLO\n\n## Targets\n").unwrap();
         build(&a).unwrap_or_else(|e| panic!("{}", e.join("\n")));
         assert!(!stale.exists());
+        // A build that died between the swap's renames left no site, only the old copy and
+        // the new one; the next build puts the old copy back, even if it then fails.
+        let old = repo.join("target/.site.old-1");
+        fs::rename(&out, &old).unwrap();
+        prepare(&stale).unwrap();
+        fs::write(repo.join("docs/slo.md"), "# SLO\n\n## Targets\n\n[gone](gone.md)\n").unwrap();
+        assert_eq!(build(&a).unwrap_err(), ["docs/slo.md:5: gone.md (no such file)"]);
+        assert!(out.join("docs/slo.html").is_file());
+        assert!(!old.exists() && !stale.exists());
         fs::remove_dir_all(&repo).unwrap();
     }
 
