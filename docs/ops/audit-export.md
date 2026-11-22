@@ -13,10 +13,12 @@ It prints the result and exits 1 if the chain is broken. The same is `GET /api/a
 
 - `ok`, `checked` (events walked) and `erased` (events whose personal fields an erasure replaced; they still verify).
 - `head`: the newest event's id and hash. `first` and `anchor`: where the chain starts after retention deleted older events.
-- `firstBroken`: the first event that breaks the chain, and why:
+- `firstBroken`: the lowest event id that breaks the chain, and why:
   - `contents`: the event was changed.
   - `link`: an event before it was removed, added or reordered, or the start was cut without an anchor.
   - `unsealed`: it has no seal at all.
+  - `erased`: its salt was cleared, but no erasure (`audit.erased`) names it, so its fields can't be checked.
+- `error`: the log couldn't be read to the end. The check fails.
   - `pin`: it differs from a hash you gave (below).
 
 botd also checks itself a minute after starting and then once a day. Each check, and each one through the API, is recorded as `audit.verified` with the result and the head's hash. A broken chain logs a warning that links here.
@@ -29,7 +31,7 @@ The chain has no secret key. Someone who can write `app.sqlite` (root, the servi
 botctl audit verify --pin 4182:3f1c...e9a0 --pin 9921:77ab...0c12
 ```
 
-Each pin is `match`, `mismatch` or `gone` (deleted by retention since). A mismatch means the history on the host is not the one your SIEM saw.
+Each pin is `match`, `mismatch`, `gone` (older than what retention deleted) or `missing` (newer than that, yet not there). A mismatch or a missing event fails the check: the history on the host is not the one your SIEM saw.
 
 ### If it's broken
 
@@ -107,4 +109,4 @@ The cursor is kept per sink URL. A new URL starts as `AUDIT_EXPORT_START` says; 
 ## Retention and erasure
 
 - Retention deletes events from the start of the log only, and keeps the last deleted event's hash as the anchor the chain carries on from. An old event written after a newer one waits until the newer one is old enough too. `audit.pruned` records the anchor.
-- Erasing a user ([ADR 0102](../adr/0102-erasing-a-users-data.md)) replaces their personal fields with a pseudonym and drops each event's salt, so the chain still verifies and its digest says nothing about them. Copies already in your SIEM aren't erased by botd: cover them with your SIEM's retention and your DPA, as with backups.
+- Erasing a user ([ADR 0102](../adr/0102-erasing-a-users-data.md)) replaces their personal fields with a pseudonym and drops each event's salt, so its digest says nothing about them. The erasure records `audit.erased` with the ids it changed, and the chain still verifies. A salt cleared any other way fails as `erased`. Copies already in your SIEM aren't erased by botd: cover them with your SIEM's retention and your DPA, as with backups.
