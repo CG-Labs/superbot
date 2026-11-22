@@ -1226,6 +1226,18 @@ pub struct Session {
     pub mfa: Option<String>,
 }
 
+/// What a native SAML sign-in's assertion said about the person and the IdP's session
+/// (ADR 0137): our LogoutRequest names them, and the IdP's names them back.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SamlLogin {
+    /// The NameID as the IdP sent it (identities keep it lowercased).
+    pub name_id: String,
+    pub format: Option<String>,
+    pub name_qualifier: Option<String>,
+    pub sp_name_qualifier: Option<String>,
+    pub session_index: Option<String>,
+}
+
 /// A phone that gets push notifications (ADR 0080), registered by one session and
 /// removed with it. `token` is the provider's address for the device, sealed at rest
 /// and never shown: anyone holding it can send to the phone.
@@ -1710,7 +1722,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 51] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 52] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1761,8 +1773,24 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 51] = [
     migrate_disable_holds,
     migrate_custom_roles,
     migrate_residency_pins,
+    migrate_saml_sessions,
     migrate_audit_chain,
 ];
+
+/// Native SAML sign-ins' NameID and SessionIndex (ADR 0137), for single logout. Gone with
+/// their session, however that goes (pruned, or its user erased).
+fn migrate_saml_sessions(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS saml_sessions (
+          session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+          name_id TEXT NOT NULL,
+          name_id_format TEXT,
+          name_qualifier TEXT,
+          sp_name_qualifier TEXT,
+          session_index TEXT
+        );",
+    )
+}
 
 /// Contractual residency pins (ADR 0129): one per user or team at most.
 fn migrate_residency_pins(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
@@ -5867,6 +5895,45 @@ impl Db {
         c.execute("UPDATE sessions SET revoked_at = ?, revoked_by = ?, revoke_reason = ? WHERE id = ? AND revoked_at IS NULL", params![now(), by, reason, id])
             .unwrap_or(0)
             == 1
+    }
+
+    pub fn add_saml_session(&self, session_id: &str, l: &SamlLogin) {
+        let _ = self.c().execute(
+            "INSERT OR REPLACE INTO saml_sessions (session_id, name_id, name_id_format, name_qualifier, sp_name_qualifier, session_index) VALUES (?, ?, ?, ?, ?, ?)",
+            params![session_id, l.name_id, l.format, l.name_qualifier, l.sp_name_qualifier, l.session_index],
+        );
+    }
+
+    pub fn saml_session(&self, session_id: &str) -> Option<SamlLogin> {
+        self.c()
+            .query_row("SELECT name_id, name_id_format, name_qualifier, sp_name_qualifier, session_index FROM saml_sessions WHERE session_id = ?", [session_id], |r| {
+                Ok(SamlLogin { name_id: r.get(0)?, format: r.get(1)?, name_qualifier: r.get(2)?, sp_name_qualifier: r.get(3)?, session_index: r.get(4)? })
+            })
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Revokes the live sessions provider `provider` signed in as `idp_subject` (`issuer|subject`),
+    /// for the IdP's LogoutRequest (ADR 0137). With `indexes`, only sessions of those IdP
+    /// sessions, and those whose IdP session isn't known (signed in before botd kept it). Only
+    /// sessions created by `before` (ms).
+    pub fn revoke_saml_sessions(&self, provider: &str, idp_subject: &str, indexes: &[String], before: i64, reason: &str) -> Vec<Session> {
+        let found: Vec<(Session, Option<String>)> = {
+            let c = self.c();
+            let mut s = c
+                .prepare(
+                    "SELECT s.*, m.session_index AS saml_session_index FROM sessions s LEFT JOIN saml_sessions m ON m.session_id = s.id
+                     WHERE s.idp_provider = ? AND s.idp_subject = ? AND s.revoked_at IS NULL AND s.created_at <= ? ORDER BY s.created_at, s.id",
+                )
+                .unwrap();
+            s.query_map(params![provider, idp_subject, before], |r| Ok((session_row(r)?, r.get("saml_session_index")?))).unwrap().filter_map(Result::ok).collect()
+        };
+        found
+            .into_iter()
+            .filter(|(_, index)| indexes.is_empty() || index.as_ref().is_none_or(|i| indexes.contains(i)))
+            .filter_map(|(s, _)| self.revoke_session(&s.id, "sso", reason).then_some(s))
+            .collect()
     }
 
     /// Revokes every session of a user and drops their unused sign-in codes and push

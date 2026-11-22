@@ -227,8 +227,11 @@ export class SuperBotApi {
     return this.request<AppState>("GET", "/api/state");
   }
 
-  /** Ends the session on the server, giving up after `timeoutMs`. Nothing to end for a password config. */
-  async logout(timeoutMs = 5000): Promise<void> {
+  /**
+   * Ends the session on the server, giving up after `timeoutMs`. Nothing to end for a password config.
+   * Resolves to the SAML IdP's sign-out page when the server sent one (single logout, ADR 0137).
+   */
+  async logout(timeoutMs = 5000): Promise<string | undefined> {
     if (!this.hasSession) return;
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), timeoutMs);
@@ -236,6 +239,9 @@ export class SuperBotApi {
       const res = await fetch(`${this.baseUrl}/api/auth/logout`, { method: "POST", headers: this.headers(false), signal: ctl.signal });
       // 401: the session was already gone.
       if (!res.ok && res.status !== 401) throw new ApiError(`Sign-out failed (${res.status})`, res.status);
+      if (!res.ok) return;
+      const body = (await res.json().catch(() => ({}))) as { logoutUrl?: unknown };
+      return typeof body.logoutUrl === "string" && /^https:\/\//.test(body.logoutUrl) ? body.logoutUrl : undefined;
     } finally {
       clearTimeout(timer);
     }
