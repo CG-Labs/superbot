@@ -102,6 +102,15 @@ enum Place {
 /// A run on a machine held back on CPU for this long, in all, is audited (ADR 0135).
 const RUN_THROTTLED_MS: u64 = 5_000;
 
+/// Which limits a run on a machine hit enough to audit (ADR 0135): killed for memory,
+/// forks refused, or held back on CPU for `RUN_THROTTLED_MS`.
+fn limits_hit(l: &wire::LimitReport) -> Vec<&'static str> {
+    [(l.oom_kills > 0, "memory"), (l.pids_refused > 0, "pids"), (l.cpu_throttled_ms >= RUN_THROTTLED_MS, "cpu")]
+        .into_iter()
+        .filter_map(|(hit, name)| hit.then_some(name))
+        .collect()
+}
+
 /// What a job on a machine sent back: files by path, and those too big to send.
 type Back = (std::collections::BTreeMap<String, String>, Vec<String>);
 
@@ -1887,14 +1896,11 @@ impl App {
     /// Audits a run on a machine that hit its limits (ADR 0135): killed for memory,
     /// refused processes, or held back on CPU for long. A killed run's Bot says why.
     fn limited(&self, bot: &Bot, msg: &Message, to: &Assigned, limits: Option<wire::RunLimits>, l: &wire::LimitReport) {
-        let killed = l.oom_kills > 0;
-        if !killed && l.pids_refused == 0 && l.cpu_throttled_ms < RUN_THROTTLED_MS {
+        let what = limits_hit(l);
+        if what.is_empty() {
             return;
         }
-        let what: Vec<&str> = [(killed, "memory"), (l.pids_refused > 0, "pids"), (l.cpu_throttled_ms >= RUN_THROTTLED_MS, "cpu")]
-            .into_iter()
-            .filter_map(|(hit, name)| hit.then_some(name))
-            .collect();
+        let killed = l.oom_kills > 0;
         let e = Who::system("runner").event("machine.run_limited").target("machine", &to.machine_id).bot(&bot.id);
         let e = e.details(json!({
             "owner": bot.owner_id, "messageId": msg.id, "killed": killed, "hit": what, "limits": limits, "applied": l.applied,
@@ -2798,6 +2804,14 @@ mod tests {
             assert!(test_hook_secs(bad).unwrap_err().contains(TEST_HOOK_TIMEOUT), "{bad}");
         }
         assert_eq!(tool_label("terminal", "ls"), "Running: ls");
+    }
+
+    #[test]
+    fn only_kills_refused_forks_and_long_throttling_are_audited() {
+        let r = |oom, pids, cpu| wire::LimitReport { enforced: true, oom_kills: oom, memory_max_hits: 40, pids_refused: pids, cpu_throttled_ms: cpu, ..Default::default() };
+        assert!(limits_hit(&r(0, 0, RUN_THROTTLED_MS - 1)).is_empty(), "memory at its limit and a little throttling are normal");
+        assert_eq!(limits_hit(&r(1, 0, 0)), ["memory"]);
+        assert_eq!(limits_hit(&r(0, 3, RUN_THROTTLED_MS)), ["pids", "cpu"]);
     }
 
     fn spot_at(dir: &Path) -> Spot {
