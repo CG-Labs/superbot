@@ -27,10 +27,44 @@ fn hex(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+fn indent(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// `(line number, line)` for the lines that hold YAML keys: not comments, and not the body
+/// of a block scalar (`run: |`), whose shell may say anything.
+fn yaml_lines(yaml: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    let mut block: Option<usize> = None;
+    for (i, line) in yaml.lines().enumerate() {
+        if let Some(parent) = block {
+            if line.trim().is_empty() || indent(line) > parent {
+                continue;
+            }
+            block = None;
+        }
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        let code = line.find(" #").map_or(line, |at| &line[..at]).trim_end();
+        let opens_block = code.rsplit_once(' ').is_some_and(|(head, tok)| {
+            let head = head.trim_end();
+            (head.ends_with(':') || head.ends_with('-'))
+                && tok.starts_with(['|', '>'])
+                && tok[1..].chars().all(|c| c == '+' || c == '-' || c.is_ascii_digit())
+        });
+        if opens_block {
+            block = Some(indent(line));
+        }
+        out.push((i + 1, line));
+    }
+    out
+}
+
 /// `(line number, value, trailing comment)` for each `uses:` key in a YAML file.
 fn uses(yaml: &str) -> Vec<(usize, String, String)> {
     let mut out = Vec::new();
-    for (i, line) in yaml.lines().enumerate() {
+    for (n, line) in yaml_lines(yaml) {
         let t = line.trim_start();
         let t = t.strip_prefix("- ").map(str::trim_start).unwrap_or(t);
         let Some(rest) = t.strip_prefix("uses:") else { continue };
@@ -39,34 +73,31 @@ fn uses(yaml: &str) -> Vec<(usize, String, String)> {
             None => (rest, ""),
         };
         let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
-        out.push((i + 1, value.to_string(), comment.to_string()));
+        out.push((n, value.to_string(), comment.to_string()));
     }
     out
 }
 
-/// Lines with a `uses` key that `uses()` can't read: quoted (`'uses':`), in a flow mapping
-/// (`- { uses: ... }`) or after another key on the line. There's no YAML parser here, so
-/// these are refused rather than skipped, and a step has to be written the plain way.
+/// Lines with a `uses` key that `uses()` can't read: quoted (`'uses':`) or in a flow
+/// mapping (`- { uses: ... }`). There's no YAML parser here, so these are refused rather
+/// than skipped, and a step has to be written the plain way.
 fn other_uses_keys(yaml: &str) -> Vec<usize> {
     let mut out = Vec::new();
-    for (i, line) in yaml.lines().enumerate() {
+    for (n, line) in yaml_lines(yaml) {
         let t = line.trim_start();
-        let plain = t.strip_prefix("- ").map(str::trim_start).unwrap_or(t);
-        if t.starts_with('#') || plain.starts_with("uses:") {
+        let item = t.strip_prefix("- ").map(str::trim_start).unwrap_or(t);
+        if !item.starts_with(['{', '"', '\'', '?']) {
             continue;
         }
         let key_at = |at: usize| {
             let before = line[..at].trim_end();
-            let opens = before.is_empty() || before.ends_with(['-', '{', ',', '?']);
-            let quote = before.ends_with(['"', '\'']) && {
-                let b = before[..before.len() - 1].trim_end();
-                b.is_empty() || b.ends_with(['-', '{', ',', '?'])
-            };
+            let opens = |b: &str| b.is_empty() || b.ends_with(['-', '{', ',', '?']);
+            let quoted = before.ends_with(['"', '\'']) && opens(before[..before.len() - 1].trim_end());
             let after = line[at + 4..].trim_start_matches(['"', '\'']).trim_start();
-            (opens || quote) && after.strip_prefix(':').is_some_and(|r| r.is_empty() || r.starts_with([' ', '\t']))
+            (opens(before) || quoted) && after.strip_prefix(':').is_some_and(|r| r.is_empty() || r.starts_with([' ', '\t']))
         };
         if line.match_indices("uses").any(|(at, _)| key_at(at)) {
-            out.push(i + 1);
+            out.push(n);
         }
     }
     out
@@ -142,6 +173,9 @@ fn the_checker_catches_what_it_should() {
     assert_eq!(other_uses_keys(&yaml), Vec::<usize>::new());
     let odd = "steps:\n  - { uses: actions/checkout@v4 }\n  - 'uses': actions/checkout@v4\n  - \"uses\" : a/b@v1\n  - {name: x, uses: a/b@v1}\n  - run: echo uses: x\n  # - { uses: a/b@v1 }\n  - name: uses\n";
     assert_eq!(other_uses_keys(odd), vec![2, 3, 4, 5]);
+    let shell = "steps:\n  - run: echo '{\"uses\": \"x\"}'\n  - run: |\n      echo '{\"uses\": \"x\"}'\n      cat <<EOF\n      uses: a/b@v1\n      - { uses: a/b@v1 }\n      EOF\n\n      true\n  - name: after\n    uses: a/b@v1\n  - run: >-\n      uses: c/d@v1\n";
+    assert_eq!(other_uses_keys(shell), Vec::<usize>::new());
+    assert_eq!(uses(shell), vec![(12, "a/b@v1".to_string(), String::new())]);
     assert_eq!(uses("  - uses:\n      actions/checkout@v4\n"), vec![(1, String::new(), String::new())]);
     assert!(problem("", "").is_some());
 
