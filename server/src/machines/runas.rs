@@ -12,7 +12,7 @@ use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A user and group to run as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -55,18 +55,306 @@ pub fn lookup(name: &str) -> Option<(Ids, std::path::PathBuf)> {
 
 /// The user this process runs as, by name: tests stand it in for the Bots' user.
 pub fn current_user() -> Option<String> {
+    // SAFETY: no arguments.
+    name_of(unsafe { libc::geteuid() })
+}
+
+/// The name of the user with `uid`, if there is one.
+pub fn name_of(uid: u32) -> Option<String> {
     // getpwuid's static storage is shared by every thread, so another lookup can change
     // the name while it's read; the _r form reads into a buffer of our own.
     let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 16 << 10];
     let mut out: *mut libc::passwd = std::ptr::null_mut();
     // SAFETY: every pointer is valid for the call; the result points into `buf`.
-    let r = unsafe { libc::getpwuid_r(libc::geteuid(), &mut pw, buf.as_mut_ptr(), buf.len(), &mut out) };
+    let r = unsafe { libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut out) };
     if r != 0 || out.is_null() {
         return None;
     }
     // SAFETY: getpwuid_r succeeded, so pw_name is a C string in `buf`.
     Some(unsafe { CStr::from_ptr(pw.pw_name) }.to_string_lossy().into_owned())
+}
+
+/// For `pre_exec`, once a process is a Bot's or a teammate's user (ADR 0145): no
+/// setuid program or file capability raises it again (sudo, su, pkexec, newgrp), and
+/// what it makes, in /tmp too, is its own alone. Only async-signal-safe calls.
+pub fn lock_down() -> io::Result<()> {
+    // SAFETY: umask can't fail.
+    unsafe { libc::umask(0o077) };
+    no_new_privs()
+}
+
+/// The OOM score a Bot's or teammate's process starts at (ADR 0145): above the
+/// agent's and the OS's daemons', so a machine short of memory loses a run first.
+/// Set while root, it's also the lowest the run can take itself back down to.
+pub const RUN_OOM_SCORE_ADJ: &[u8] = b"500";
+
+/// For `pre_exec`, while still root: set the OOM score floor, then become `uid`/`gid`
+/// with no other groups. Only async-signal-safe calls.
+pub fn become_user(uid: u32, gid: u32) -> io::Result<()> {
+    let last = io::Error::last_os_error;
+    // SAFETY: plain syscalls on a static path, a static buffer and this process's ids.
+    unsafe {
+        let fd = libc::open(c"/proc/self/oom_score_adj".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+        if fd < 0 {
+            return Err(last());
+        }
+        let n = RUN_OOM_SCORE_ADJ.len();
+        let wrote = libc::write(fd, RUN_OOM_SCORE_ADJ.as_ptr().cast(), n);
+        libc::close(fd);
+        if wrote != n as isize {
+            return Err(last());
+        }
+        if (libc::geteuid() == 0 && libc::setgroups(0, std::ptr::null()) != 0)
+            || libc::setgid(gid) != 0
+            || libc::setuid(uid) != 0
+        {
+            return Err(last());
+        }
+    }
+    Ok(())
+}
+
+/// `lock_down` without the umask, for programs that set their files' modes as they
+/// need (X's sockets). Async-signal-safe.
+pub fn no_new_privs() -> io::Result<()> {
+    // SAFETY: a plain prctl on this process.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Groups that give root, or another user's files, one way or another: through sudo
+/// or polkit (`sudo`, `wheel`, `admin`), a daemon's socket (`docker`, `lxd`, `incus`,
+/// `libvirt`), raw disks, password hashes or every log. A Bot's or teammate's user is
+/// in none of them.
+pub const PRIVILEGED_GROUPS: [&str; 14] = [
+    "root",
+    "sudo",
+    "wheel",
+    "admin",
+    "adm",
+    "docker",
+    "lxd",
+    "incus",
+    "incus-admin",
+    "libvirt",
+    "disk",
+    "shadow",
+    "systemd-journal",
+    "staff",
+];
+
+/// Where sudo reads its rules.
+const SUDOERS: &str = "/etc/sudoers";
+const SUDOERS_D: &str = "/etc/sudoers.d";
+const SUDO_BINS: [&str; 2] = ["/usr/bin/sudo", "/bin/sudo"];
+
+/// Why `name` (with `ids`) isn't an unprivileged user, if it isn't: root's uid or
+/// group, one of `PRIVILEGED_GROUPS`, or a sudo rule for it, one of its groups, or
+/// everyone. Sudo itself is asked when it's installed (rules from any source it reads);
+/// its files are read too, in case it can't answer.
+pub fn privileged(name: &str, ids: Ids) -> Option<String> {
+    let groups = group_list(name, ids.gid);
+    let found = privileged_in(name, ids, &groups, &sudoers());
+    if found.is_some() {
+        return found;
+    }
+    sudo_allows(name).then(|| "has a sudo rule (sudo -l lists commands it may run)".into())
+}
+
+/// Whether `sudo -l -U name` says `name` may run anything. Needs root; false when sudo
+/// isn't installed or doesn't answer.
+fn sudo_allows(name: &str) -> bool {
+    let Some(bin) = SUDO_BINS.iter().find(|b| Path::new(b).exists()) else { return false };
+    std::process::Command::new(bin)
+        .args(["-n", "-l", "-U", name])
+        .env_clear()
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("may run the following commands"))
+}
+
+/// Sudo's files: /etc/sudoers, /etc/sudoers.d, and whatever they include.
+fn sudoers() -> Vec<(String, String)> {
+    sudoers_from(vec![PathBuf::from(SUDOERS), PathBuf::from(SUDOERS_D)])
+}
+
+fn sudoers_from(mut todo: Vec<PathBuf>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    todo.reverse();
+    while let Some(p) = todo.pop() {
+        if out.len() >= 256 || out.iter().any(|(q, _)| Path::new(q) == p) {
+            continue;
+        }
+        if p.is_dir() {
+            let Ok(dir) = std::fs::read_dir(&p) else { continue };
+            let mut files: Vec<_> = dir.flatten().map(|e| e.path()).collect();
+            files.sort();
+            // sudo skips files with a dot or ending in `~` in an included folder.
+            todo.extend(files.into_iter().rev().filter(|f| {
+                f.file_name().and_then(|n| n.to_str()).is_some_and(|n| !n.contains('.') && !n.ends_with('~'))
+            }));
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&p) else { continue };
+        let here = p.parent().unwrap_or(Path::new("/")).to_path_buf();
+        for line in joined(&text) {
+            let mut w = line.split_whitespace();
+            if let (Some("@include" | "#include" | "@includedir" | "#includedir"), Some(to)) = (w.next(), w.next()) {
+                let to = Path::new(to);
+                todo.push(if to.is_absolute() { to.to_path_buf() } else { here.join(to) });
+            }
+        }
+        out.push((p.display().to_string(), text));
+    }
+    out
+}
+
+/// A sudoers file's lines, with `\`-continued lines joined.
+fn joined(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for line in text.lines() {
+        match line.strip_suffix('\\') {
+            Some(head) => {
+                cur.push_str(head);
+                cur.push(' ');
+            }
+            None => {
+                cur.push_str(line);
+                out.push(std::mem::take(&mut cur).trim().to_string());
+            }
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
+/// A list's entries, with the spaces sudo allows around its commas.
+fn list(text: &str) -> impl Iterator<Item = &str> {
+    text.split(',').map(str::trim).filter(|e| !e.is_empty())
+}
+
+/// Whether a sudo list takes the user: its entries are read left to right, the last that
+/// matches wins, and a `!` before one (or several) turns it into an exclusion.
+fn listed(text: &str, matches: impl Fn(&str) -> bool) -> bool {
+    let mut taken = false;
+    for e in list(text) {
+        let bare = e.trim_start_matches('!');
+        if matches(bare.trim()) {
+            taken = (e.len() - bare.len()) % 2 == 0;
+        }
+    }
+    taken
+}
+
+/// `privileged`, given `name`'s groups (id, name) and sudo's files (path, text).
+pub fn privileged_in(name: &str, ids: Ids, groups: &[(u32, String)], sudoers: &[(String, String)]) -> Option<String> {
+    if ids.uid == 0 {
+        return Some("is root".into());
+    }
+    if ids.gid == 0 || groups.iter().any(|(g, _)| *g == 0) {
+        return Some("is in root's group".into());
+    }
+    if let Some((_, g)) = groups.iter().find(|(_, g)| PRIVILEGED_GROUPS.contains(&g.as_str())) {
+        return Some(format!("is in the {g} group"));
+    }
+    let files: Vec<(&str, Vec<String>)> = sudoers.iter().map(|(p, t)| (p.as_str(), joined(t))).collect();
+    // `User_Alias NAME = a, b : OTHER = c`, nested in any order: the aliases naming the
+    // user count as it.
+    let mut aliases: Vec<String> = Vec::new();
+    let named = |who: &str, aliases: &[String]| {
+        let who = who.trim();
+        who == "ALL"
+            || who == name
+            || who == format!("#{}", ids.uid)
+            || aliases.iter().any(|a| a == who)
+            || who
+                .strip_prefix('%')
+                .map(|g| g.trim_start_matches(':'))
+                .is_some_and(|g| groups.iter().any(|(id, n)| n == g || g == format!("#{id}")))
+    };
+    loop {
+        let before = aliases.len();
+        for line in files.iter().flat_map(|(_, l)| l) {
+            let Some(defs) = line.strip_prefix("User_Alias") else { continue };
+            for def in defs.split(':') {
+                if let Some((alias, members)) = def.split_once('=') {
+                    let alias = alias.trim().to_string();
+                    if !aliases.contains(&alias) && listed(members, |m| named(m, &aliases)) {
+                        aliases.push(alias);
+                    }
+                }
+            }
+        }
+        if aliases.len() == before {
+            break;
+        }
+    }
+    for (path, lines) in &files {
+        for line in lines {
+            // `#` starts a comment, unless a uid follows it (`#1001 ALL=...`).
+            let comment = line.starts_with('#') && !line[1..].starts_with(|c: char| c.is_ascii_digit());
+            let first = line.split_whitespace().next().unwrap_or("");
+            if first.is_empty() || comment || line.starts_with('@') || first.starts_with("Defaults") || first.ends_with("_Alias") {
+                continue;
+            }
+            // A rule: `<users> <hosts> = ...`. The users are a list whose commas may have
+            // spaces around them, so they end at the first word not joined to it by one.
+            let Some((head, _)) = line.split_once('=') else { continue };
+            let mut users = String::new();
+            let mut words = head.split_whitespace().peekable();
+            while let Some(w) = words.next() {
+                users.push_str(w);
+                let more = w.ends_with(',') || words.peek().is_some_and(|n| n.starts_with(','));
+                if !more {
+                    break;
+                }
+            }
+            if listed(&users, |u| named(u, &aliases)) {
+                return Some(format!("has a sudo rule in {path}"));
+            }
+        }
+    }
+    None
+}
+
+/// `name`'s groups, its primary `gid` included, by id and name.
+fn group_list(name: &str, gid: u32) -> Vec<(u32, String)> {
+    let Ok(c) = CString::new(name) else { return vec![(gid, String::new())] };
+    let mut n: libc::c_int = 64;
+    let mut gids: Vec<libc::gid_t> = vec![0; n as usize];
+    // SAFETY: `gids` holds `n` entries; getgrouplist says how many it needs if not.
+    while unsafe { libc::getgrouplist(c.as_ptr(), gid, gids.as_mut_ptr(), &mut n) } < 0 {
+        if n as usize <= gids.len() || n > 65536 {
+            break;
+        }
+        gids.resize(n as usize, 0);
+    }
+    gids.truncate(n.max(0) as usize);
+    if !gids.contains(&gid) {
+        gids.push(gid);
+    }
+    gids.into_iter().map(|g| (g, group_name(g).unwrap_or_default())).collect()
+}
+
+fn group_name(gid: u32) -> Option<String> {
+    let mut gr: libc::group = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 64 << 10];
+    let mut out: *mut libc::group = std::ptr::null_mut();
+    // SAFETY: every pointer is valid for the call; the result points into `buf`.
+    let r = unsafe { libc::getgrgid_r(gid, &mut gr, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if r != 0 || out.is_null() {
+        return None;
+    }
+    // SAFETY: getgrgid_r succeeded, so gr_name is a C string in `buf`.
+    Some(unsafe { CStr::from_ptr(gr.gr_name) }.to_string_lossy().into_owned())
 }
 
 pub fn is_root() -> bool {
@@ -738,6 +1026,114 @@ mod tests {
                 .any(|w| w == ["--home-dir", "/var/lib/superbot-machine/home"])
         );
         assert!(a.iter().any(|s| s == "--system") && a.iter().any(|s| s == "--no-create-home"));
+    }
+
+    #[test]
+    fn a_locked_down_process_cant_gain_privileges_and_keeps_its_files_to_itself() {
+        use std::os::unix::process::CommandExt;
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "grep NoNewPrivs /proc/self/status; umask"]);
+        // SAFETY: lock_down makes only async-signal-safe calls.
+        unsafe { c.pre_exec(lock_down) };
+        let out = String::from_utf8(c.output().unwrap().stdout).unwrap();
+        let mut lines = out.lines();
+        assert_eq!(lines.next().map(|l| l.split_whitespace().collect::<Vec<_>>()), Some(vec!["NoNewPrivs:", "1"]), "{out}");
+        assert_eq!(lines.next(), Some("0077"), "{out}");
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "grep NoNewPrivs /proc/self/status"]);
+        // SAFETY: as above.
+        unsafe { c.pre_exec(no_new_privs) };
+        assert!(String::from_utf8(c.output().unwrap().stdout).unwrap().contains('1'));
+    }
+
+    #[test]
+    fn a_run_starts_with_the_oom_score_floor() {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: getuid and getgid can't fail.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let mut c = std::process::Command::new("cat");
+        c.arg("/proc/self/oom_score_adj");
+        // SAFETY: become_user makes only async-signal-safe calls.
+        unsafe { c.pre_exec(move || become_user(uid, gid)) };
+        let out = c.output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim().as_bytes(), RUN_OOM_SCORE_ADJ);
+    }
+
+    #[test]
+    fn sudo_files_include_what_they_include() {
+        let d = scratch("sudoers");
+        let w = |p: &str, t: &str| {
+            let p = d.join(p);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, t).unwrap();
+        };
+        w("sudoers", "root ALL=(ALL) ALL\n@include extra\n#includedir /nonexistent\n@includedir more\n");
+        w("extra", "@include sudoers\n");
+        w("more/a", "x ALL=(ALL) ALL\n");
+        w("more/b.bak", "y ALL=(ALL) ALL\n");
+        w("more/c~", "z ALL=(ALL) ALL\n");
+        let names: Vec<_> = sudoers_from(vec![d.join("sudoers")])
+            .into_iter()
+            .map(|(p, _)| Path::new(&p).strip_prefix(&d).unwrap().display().to_string())
+            .collect();
+        assert_eq!(names, ["sudoers", "more/a", "extra"]);
+    }
+
+    #[test]
+    fn privileged_users_groups_and_sudo_rules_are_found() {
+        let ids = Ids { uid: 990, gid: 990 };
+        let own = vec![(990, "superbot-bots".to_string())];
+        let none: Vec<(String, String)> = vec![];
+        assert_eq!(privileged_in("superbot-bots", ids, &own, &none), None);
+        assert_eq!(privileged_in("x", Ids { uid: 0, gid: 990 }, &own, &none).as_deref(), Some("is root"));
+        assert_eq!(privileged_in("x", Ids { uid: 990, gid: 0 }, &own, &none).as_deref(), Some("is in root's group"));
+        for g in PRIVILEGED_GROUPS {
+            let with = [own.clone(), vec![(27, g.to_string())]].concat();
+            assert!(privileged_in("superbot-bots", ids, &with, &none).is_some(), "{g}");
+        }
+        // Harmless groups pass.
+        let with = [own.clone(), vec![(100, "users".to_string())]].concat();
+        assert_eq!(privileged_in("superbot-bots", ids, &with, &none), None);
+
+        let rule = |text: &str| vec![("/etc/sudoers.d/x".to_string(), text.to_string())];
+        let found = |text: &str| privileged_in("superbot-bots", ids, &own, &rule(text));
+        for text in [
+            "superbot-bots ALL=(ALL) NOPASSWD: ALL",
+            "ops,superbot-bots ALL=(ALL) ALL",
+            "%superbot-bots ALL=(root) /bin/true",
+            "%#990 ALL=(ALL) ALL",
+            "#990 ALL=(ALL) ALL",
+            "ALL ALL=(ALL) NOPASSWD: ALL",
+            "User_Alias BOTS = ops, superbot-bots\nBOTS ALL=(ALL) ALL",
+            "ops, superbot-bots ALL=(ALL) NOPASSWD: ALL",
+            "ops ,superbot-bots ALL=(ALL) ALL",
+            "ops , superbot-bots\tALL = (ALL) ALL",
+            "ops, \\\n  superbot-bots ALL=(ALL) ALL",
+            "User_Alias INNER = superbot-bots\nUser_Alias OUTER = ops, INNER\nOUTER ALL=(ALL) ALL",
+            "User_Alias OUTER = ops, INNER\nUser_Alias INNER = superbot-bots\nOUTER ALL=(ALL) ALL",
+            "%:superbot-bots ALL=(ALL) ALL",
+            "!superbot-bots, ALL ALL=(ALL) ALL",
+            "ALL, !!superbot-bots ALL=(ALL) ALL",
+        ] {
+            assert_eq!(found(text).as_deref(), Some("has a sudo rule in /etc/sudoers.d/x"), "{text}");
+        }
+        for text in [
+            "# superbot-bots ALL=(ALL) ALL",
+            "Defaults:superbot-bots !requiretty",
+            "root ALL=(ALL:ALL) ALL\n%sudo ALL=(ALL:ALL) ALL",
+            "@includedir /etc/sudoers.d",
+            "superbot ALL=(sb-u-1) NOPASSWD: /usr/local/bin/superbot-run",
+            "User_Alias OPS = ops\nOPS ALL=(ALL) ALL",
+            "ops ALL=(superbot-bots) ALL",
+            "ops, admins ALL=(ALL) ALL",
+            "!superbot-bots, ops ALL=(ALL) ALL",
+            "ALL, !superbot-bots ALL=(ALL) ALL",
+            "%superbot-bots, !superbot-bots ALL=(ALL) ALL",
+            "User_Alias EVERYONE_BUT = ALL, !superbot-bots\nEVERYONE_BUT ALL=(ALL) ALL",
+        ] {
+            assert_eq!(found(text), None, "{text}");
+        }
     }
 
     #[test]

@@ -330,13 +330,11 @@ pub fn enter(fd: std::os::fd::RawFd, user: Option<(u32, u32)>) -> std::io::Resul
         if libc::write(fd, b"0".as_ptr().cast(), 1) != 1 {
             return Err(last());
         }
-        if let Some((uid, gid)) = user
-            && (libc::setgroups(0, std::ptr::null()) != 0 || libc::setgid(gid) != 0 || libc::setuid(uid) != 0)
-        {
-            return Err(last());
-        }
     }
-    Ok(())
+    match user {
+        Some((uid, gid)) => super::runas::become_user(uid, gid),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
