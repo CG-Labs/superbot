@@ -304,6 +304,63 @@ async function loadMachines() {
   $("give-machine").hidden = off;
   renderMachines();
   loadRegions(off);
+  loadEgress(off);
+}
+
+// Outbound allow-lists (ADR 0135): the server's for every machine, and a user's own.
+const listText = (allow) => (allow || []).join(", ");
+const listOf = (text) => text.split(/[\s,]+/).map((x) => x.trim()).filter(Boolean);
+
+async function loadEgress(off) {
+  $("machines-egress").hidden = true;
+  if (off) return;
+  try {
+    const p = await api("GET", "/api/machines/egress-policy");
+    const own = p.usersWithOwnPolicy ? ` ${p.usersWithOwnPolicy} user${p.usersWithOwnPolicy === 1 ? " has" : "s have"} their own.` : "";
+    $("machines-egress-text").textContent = p.mode === "allow_list"
+      ? `Outbound: only ${listText(p.allow) || "nothing"} (and private addresses stay denied).${own}`
+      : `Outbound: open to the internet; private and metadata addresses denied.${own}`;
+    $("machines-egress").dataset.allow = p.mode === "allow_list" ? listText(p.allow) : "";
+    $("machines-egress").hidden = false;
+  } catch {
+    // Older servers have no allow-lists.
+  }
+}
+
+$("machines-egress-edit").addEventListener("click", async () => {
+  const current = $("machines-egress").dataset.allow || "";
+  const r = prompt("Hosts and networks every machine's Bots may reach, separated by spaces or commas (e.g. api.anthropic.com 203.0.113.0/24). Leave empty for open. Root and the OS's own services aren't held to it.", current);
+  if (r === null || r.trim() === current) return;
+  const allow = listOf(r);
+  try {
+    await api("PUT", "/api/machines/egress-policy", allow.length ? { mode: "allow_list", allow } : { mode: "open" });
+  } catch (err) {
+    fail(err);
+  }
+  loadMachines();
+});
+
+// What a machine's agent says of its allow-list and run limits.
+function guardsCell(m) {
+  const u = m.agentUpkeep || {};
+  const e = u.egressPolicy;
+  const lines = [];
+  if (e && e.state === "failed") lines.push(`<div class="sub bad">Allow-list not loaded${e.error ? `: ${esc(e.error)}` : ""}</div>`);
+  else if (e && e.state === "on") lines.push(`<div class="sub">Allow-list on · ${e.addresses} address${e.addresses === 1 ? "" : "es"}${e.unresolved?.length ? ` · unresolved: ${esc(e.unresolved.join(", "))}` : ""}</div>`);
+  if (u.runLimits?.state === "on") lines.push('<div class="sub">Runs held to limits</div>');
+  else if (u.runLimits?.state === "unavailable") lines.push(`<div class="sub bad">No run limits${u.runLimits.error ? `: ${esc(u.runLimits.error)}` : ""}</div>`);
+  return lines.join("");
+}
+
+async function setUserEgress(m) {
+  const who = m.userEmail || m.userId;
+  const path = `/api/users/${key(m.userId)}/machine/egress-policy`;
+  const p = await api("GET", path);
+  const current = p.own.mode === "allow_list" ? listText(p.own.allow) : p.own.mode;
+  const r = prompt(`${who}'s own outbound allow-list: hosts and networks added to the server's, or "open", or "inherit" to follow the server's (now ${p.server.mode === "allow_list" ? listText(p.server.allow) : "open"}).`, current);
+  if (r === null || r.trim() === current) return;
+  const t = r.trim();
+  await api("PUT", path, t === "open" || t === "inherit" || !t ? { mode: t || "inherit" } : { mode: "allow_list", allow: listOf(t) });
 }
 
 // The data regions offered (ADR 0117), and any whose backups would leave them.
@@ -326,7 +383,7 @@ async function loadRegions(off) {
 function machineActions(m) {
   const b = (act, label) => `<button type="button" class="btn" data-act="${act}">${label}</button>`;
   switch (m.state) {
-    case "running": return b("suspend", "Suspend") + b("resize", "Resize") + b("destroy", "Destroy");
+    case "running": return b("suspend", "Suspend") + b("resize", "Resize") + b("egress", "Allow-list") + b("destroy", "Destroy");
     case "suspended": return b("resume", "Resume") + b("resize", "Resize") + b("destroy", "Destroy");
     case "error": return b("retry", "Retry") + b("destroy", "Destroy");
     case "destroyed": return "";
@@ -356,7 +413,7 @@ function renderMachines() {
     : "";
   $("machines-rows").innerHTML = list.map((m) => `<tr data-machine="${esc(m.id)}">
       <td>${esc(m.userEmail || m.userId)}</td>
-      <td>${esc(m.state)}${m.providerStatus ? `<div class="sub">${esc(m.providerStatus)}</div>` : ""}${m.lastError ? `<div class="sub bad">${esc(m.lastError)}</div>` : ""}${m.enrollOverdueAt && m.enrollment !== "enrolled" ? `<div class="sub bad">Didn't enroll in time (since ${esc(fmt(m.enrollOverdueAt))})</div>` : ""}</td>
+      <td>${esc(m.state)}${m.providerStatus ? `<div class="sub">${esc(m.providerStatus)}</div>` : ""}${m.lastError ? `<div class="sub bad">${esc(m.lastError)}</div>` : ""}${m.enrollOverdueAt && m.enrollment !== "enrolled" ? `<div class="sub bad">Didn't enroll in time (since ${esc(fmt(m.enrollOverdueAt))})</div>` : ""}${guardsCell(m)}</td>
       <td>${esc(m.tier)}<div class="sub">${esc(m.plan)} · ${esc(m.provider)}</div></td>
       <td>${esc(m.region)}</td>
       <td>${esc(m.ipv4 || "")}</td>
@@ -378,6 +435,7 @@ $("machines-rows").addEventListener("click", async (e) => {
     if (t.dataset.act === "suspend") await api("POST", `/api/users/${key(m.userId)}/machine/suspend`);
     if (t.dataset.act === "resume") await api("POST", `/api/users/${key(m.userId)}/machine/resume`);
     if (t.dataset.act === "retry") await api("POST", `/api/users/${key(m.userId)}/machine`);
+    if (t.dataset.act === "egress") await setUserEgress(m);
     if (t.dataset.act === "resize") {
       const tier = prompt(`Move ${who}'s machine to which tier? The provider may restart it.`, m.tier)?.trim();
       if (!tier || tier === m.tier) return;
