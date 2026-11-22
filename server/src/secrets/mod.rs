@@ -13,6 +13,7 @@
 
 pub mod env;
 pub mod external;
+mod http;
 pub mod key;
 pub mod redact;
 pub mod sealed;

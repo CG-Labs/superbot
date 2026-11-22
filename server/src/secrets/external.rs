@@ -125,11 +125,14 @@ fn write_audit(db: &crate::db::Db, events: &[Event], dropped: u64) {
     }
 }
 
+/// Each name's answer (a value, or "not there") and when it was read.
+type Answers = HashMap<String, (Instant, Option<Zeroizing<String>>)>;
+
 /// A `Provider` with a cache, fail-closed reads and audited reads; see the module docs.
 pub struct ExternalStore {
     provider: Box<dyn Provider>,
     ttl: Duration,
-    values: Mutex<HashMap<String, (Instant, Option<Zeroizing<String>>)>>,
+    values: Mutex<Answers>,
     names: Mutex<HashMap<Scope, (Instant, Vec<String>)>>,
 }
 
