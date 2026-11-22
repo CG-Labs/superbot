@@ -649,3 +649,198 @@ async fn encryption_is_off_unless_asked_and_allow_takes_both() {
     assert_eq!(code, 200);
     assert_eq!(signed_in_as(allow.port, &head).await, Some(u.id));
 }
+
+// Encrypted NameIDs, ECDSA, and signed IdP metadata (ADR 0151)
+
+#[tokio::test]
+async fn encrypted_name_ids_sign_in_and_out_as_plain_ones() {
+    let sp = serve_slo(&[("ENCRYPTED_ASSERTIONS", "allow")]).await;
+    let u = sp.link();
+    let cert = sp.enc_cert().await;
+    let (code, _, head) = sp
+        .sign_in(|r| {
+            r.encrypt_name_id_to = Some(cert.clone());
+            r.session_index = "_s1".into();
+        })
+        .await;
+    assert_eq!(code, 200, "{head}");
+    let session = set_cookies(&head).into_iter().find(|c| c.starts_with("__Host-superbot_session=sbs_")).unwrap();
+    let cookie = format!("Cookie: {}\r\n", session.split(';').next().unwrap());
+    assert_eq!(sp.who(&cookie).await, Some(u.id.clone()));
+    assert_eq!(sp.audit("auth.login").await[0]["details"]["subject"], STORED, "the decrypted NameID");
+    // In an encrypted assertion too.
+    let (code, _, _) = sp
+        .sign_in(|r| {
+            encrypted_to(&cert)(r);
+            r.encrypt_name_id_to = Some(cert.clone());
+        })
+        .await;
+    assert_eq!(code, 200);
+
+    // The IdP's LogoutRequest names Ada by an EncryptedID: her session goes.
+    let mut l = Logout::request(&sp.slo(), NAME_ID, Some("_s1"), db::now());
+    l.encrypt_name_id_to = Some(cert.clone());
+    let (code, to) = sp.slo_post(&l.post()).await;
+    assert_eq!(code, 303, "{to}");
+    assert_eq!(sp.who(&cookie).await, None);
+    let slo = &sp.audit("auth.slo").await[0];
+    assert_eq!((slo["details"]["subject"].as_str(), slo["details"]["revoked"].as_u64()), (Some(STORED), Some(1)));
+    // Encrypted to someone else: refused.
+    let (other, _) = crate::sso::saml_sp::SpKey::generate("other").unwrap();
+    let mut l = Logout::request(&sp.slo(), NAME_ID, None, db::now());
+    l.encrypt_name_id_to = Some(other.cert.clone());
+    assert_eq!(sp.slo_post(&l.post()).await.0, 400);
+    assert_eq!(sp.audit("auth.slo_failed").await[0]["details"]["reason"], "bad_encryption");
+
+    // Without ENCRYPTED_ASSERTIONS there is no key to decrypt with: refused with a reason.
+    let off = serve_slo(&[]).await;
+    off.link();
+    let (_, to, _) = off.sign_in(|r| r.encrypt_name_id_to = Some(cert.clone())).await;
+    assert_eq!(to, "/login?error=sso_failed");
+    assert_eq!(off.last_failure().await["reason"], "encrypted_id");
+    let mut l = Logout::request(&off.slo(), NAME_ID, None, db::now());
+    l.encrypt_name_id_to = Some(cert.clone());
+    assert_eq!(off.slo_post(&l.post()).await.0, 400);
+    assert_eq!(off.audit("auth.slo_failed").await[0]["details"]["reason"], "encrypted_id");
+}
+
+#[tokio::test]
+async fn ecdsa_idp_keys_and_an_ecdsa_sp_key_sign_in_and_out() {
+    let dir = std::env::temp_dir().join(format!("saml-ec-{}", random_hex(4)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name.push(rcgen::DnType::CommonName, "SuperBot SAML SP");
+    let cert_file = dir.join("sp.pem");
+    std::fs::write(&cert_file, params.self_signed(&key).unwrap().pem()).unwrap();
+    let sp = serve(&[("SIGN_REQUESTS", "true"), ("SP_CERT_FILE", &cert_file.to_string_lossy())]).await;
+    crate::secrets::global().put(&format!("SSO_{}_PRIVATE_KEY", sp.id.to_ascii_uppercase()), &key.serialize_pem()).unwrap();
+
+    // The IdP signs with P-384.
+    let md = test_idp::with_slo(&test_idp::metadata_signed_by(3));
+    let (code, view) = call(sp.port, "PUT", &format!("/api/sso/{}/saml/idp-metadata", sp.id), &sp.admin, &json!({ "xml": md }).to_string()).await;
+    assert_eq!(code, 200, "{view}");
+    let u = sp.link();
+    let (code, _, head) = sp.sign_in(|r| r.signer = 3).await;
+    assert_eq!(code, 200, "{head}");
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(u.id.clone()));
+    for wrong in [0, 2] {
+        let (_, to, _) = sp.sign_in(|r| r.signer = wrong).await;
+        assert_eq!(to, "/login?error=sso_failed", "signer {wrong}");
+    }
+    let mut l = Logout::request(&sp.slo(), NAME_ID, None, db::now());
+    l.signer = Some(3);
+    let (code, to) = sp.slo_get(&l.redirect()).await;
+    assert_eq!(code, 303, "{to}");
+
+    // Our requests and answers are signed with ecdsa-sha256, and verify with our published certificate.
+    let cert = sp.sp_cert().await;
+    let (_, head, _) = crate::tests::call_with(sp.port, "GET", &format!("/api/auth/sso/{}/start", sp.id), "", "", "").await;
+    let location = header(&head, "location").unwrap();
+    let q: HashMap<_, _> = url::Url::parse(&location).unwrap().query_pairs().into_owned().collect();
+    assert_eq!(q["SigAlg"], crate::sso::xmldsig::ECDSA_SHA256);
+    signed_redirect(&location, &cert);
+    signed_redirect(&to, &cert);
+    let (_, v) = call(sp.port, "GET", &format!("/api/sso/{}/saml", sp.id), &sp.admin, "").await;
+    let v: Value = serde_json::from_str(&v).unwrap();
+    assert_eq!((v["spKey"]["from"].as_str(), v["ready"].as_bool()), (Some("secret"), Some(true)));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// A native provider whose metadata must be signed by test signer 1, with no metadata yet.
+async fn serve_trusting(mode: &str, source: Option<(&str, String)>) -> (Sp, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("saml-md-{}", random_hex(4)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let anchor = dir.join("anchor.pem");
+    std::fs::write(&anchor, format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", crate::sso::xmldsig::test_signer::signers()[1].cert)).unwrap();
+    let id = format!("n{}", random_hex(4));
+    let up = id.to_ascii_uppercase();
+    let mut vars = HashMap::from([
+        ("SSO_PROVIDERS".into(), id.clone()),
+        (format!("SSO_{up}_TYPE"), "saml".into()),
+        (format!("SSO_{up}_IDP_ENTITY_ID"), IDP.into()),
+        (format!("SSO_{up}_METADATA_SIGNING_CERT_FILE"), anchor.to_string_lossy().into_owned()),
+        (format!("SSO_{up}_SIGNED_METADATA"), mode.into()),
+    ]);
+    vars.extend(source.map(|(k, v)| (format!("SSO_{up}_{k}"), v)));
+    let (port, app, admin) = serve_vars(vars).await;
+    (Sp { port, app, admin, id, sp_entity: None }, dir)
+}
+
+#[tokio::test]
+async fn imported_metadata_must_be_signed_and_a_bad_copy_keeps_the_last_good_one() {
+    let (sp, dir) = serve_trusting("require", None).await;
+    let signer = |i: usize| crate::sso::xmldsig::test_signer::signer(i);
+    let import = |xml: String| {
+        let (port, admin, id) = (sp.port, sp.admin.clone(), sp.id.clone());
+        async move { call(port, "PUT", &format!("/api/sso/{id}/saml/idp-metadata"), &admin, &json!({ "xml": xml }).to_string()).await }
+    };
+
+    let (code, e) = import(test_idp::metadata()).await;
+    assert!(code == 400 && e.contains("isn't signed"), "{code} {e}");
+    let refused = &sp.audit("sso.saml_metadata_refused").await[0];
+    assert_eq!((refused["outcome"].as_str(), refused["details"]["reason"].as_str(), refused["details"]["source"].as_str()), (Some("failure"), Some("unsigned"), Some("botctl")));
+    assert_eq!(refused["details"]["kept"], false, "nothing loaded yet");
+
+    let good = test_idp::signed_metadata(&test_idp::metadata(), signer(1));
+    let (code, v) = import(good.clone()).await;
+    assert_eq!(code, 200, "{v}");
+    let v: Value = serde_json::from_str(&v).unwrap();
+    assert_eq!((v["signedMetadata"].as_str(), v["ready"].as_bool()), (Some("require"), Some(true)));
+    assert_eq!(v["metadataSigningCertificates"][0]["sha256"], signer(1).cert().sha256);
+
+    // Signed by someone else, or changed after signing: refused, audited, and the good copy stays.
+    let forged = test_idp::signed_metadata(&test_idp::metadata_with(IDP, &[signer(2)], ""), signer(0));
+    let (code, e) = import(forged).await;
+    assert!(code == 400 && e.contains("bad_signature"), "{code} {e}");
+    let tampered = good.replace(&signer(0).cert, &signer(2).cert);
+    assert_eq!(import(tampered).await.0, 400);
+    let refused = sp.audit("sso.saml_metadata_refused").await;
+    assert_eq!((refused.len(), refused[0]["details"]["reason"].as_str(), refused[0]["details"]["kept"].as_bool()), (3, Some("bad_signature"), Some(true)));
+    assert_eq!(sp.app.db.setting(&format!("sso_saml_idp_metadata_{}", sp.id)), Some(good.clone()), "the stored copy is the good one");
+    let u = sp.link();
+    let (code, _, head) = sp.sign_in(|_| {}).await;
+    assert_eq!(code, 200, "still signs in with the last good metadata");
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(u.id));
+    // Metadata that just can't be used isn't a trust failure: refused, not audited as one.
+    let (code, _) = import(test_idp::signed_metadata(&test_idp::metadata_with("https://other.example/saml", &[signer(0)], ""), signer(1))).await;
+    assert_eq!(code, 400);
+    assert_eq!(sp.audit("sso.saml_metadata_refused").await.len(), 3);
+
+    let (allow, allow_dir) = serve_trusting("allow", None).await;
+    let (code, _) = call(allow.port, "PUT", &format!("/api/sso/{}/saml/idp-metadata", allow.id), &allow.admin, &json!({ "xml": test_idp::metadata() }).to_string()).await;
+    assert_eq!(code, 200, "allow: unsigned is taken");
+    let forged = test_idp::signed_metadata(&test_idp::metadata(), signer(0));
+    let (code, _) = call(allow.port, "PUT", &format!("/api/sso/{}/saml/idp-metadata", allow.id), &allow.admin, &json!({ "xml": forged }).to_string()).await;
+    assert_eq!(code, 400, "allow: a bad signature is still refused");
+    std::fs::remove_dir_all(dir).ok();
+    std::fs::remove_dir_all(allow_dir).ok();
+}
+
+#[tokio::test]
+async fn metadata_from_a_url_is_checked_each_time_it_is_fetched() {
+    let signer = |i: usize| crate::sso::xmldsig::test_signer::signer(i);
+    let served = std::sync::Arc::new(std::sync::Mutex::new(test_idp::signed_metadata(&test_idp::metadata(), signer(0))));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let idp_port = listener.local_addr().unwrap().port();
+    let s = served.clone();
+    let app = axum::Router::new().route("/md", axum::routing::get(move || std::future::ready(s.lock().unwrap().clone())));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (sp, dir) = serve_trusting("require", Some(("IDP_METADATA_URL", format!("http://127.0.0.1:{idp_port}/md")))).await;
+
+    // Badly signed: no sign-in, and the refusal is audited.
+    let (code, head, _) = crate::tests::call_with(sp.port, "GET", &format!("/api/auth/sso/{}/start", sp.id), "", "", "").await;
+    assert_eq!(code, 303);
+    assert_eq!(header(&head, "location").as_deref(), Some("/login?error=sso_failed"));
+    let refused = &sp.audit("sso.saml_metadata_refused").await[0];
+    assert_eq!((refused["details"]["reason"].as_str(), refused["details"]["source"].as_str(), refused["details"]["kept"].as_bool()), (Some("bad_signature"), Some("url"), Some(false)));
+
+    // Signed by the anchor: it loads and signs in.
+    *served.lock().unwrap() = test_idp::signed_metadata(&test_idp::metadata(), signer(1));
+    let u = sp.link();
+    let (code, _, head) = sp.sign_in(|_| {}).await;
+    assert_eq!(code, 200);
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(u.id));
+    assert_eq!(sp.audit("sso.saml_metadata_refused").await.len(), 1);
+    std::fs::remove_dir_all(dir).ok();
+}
