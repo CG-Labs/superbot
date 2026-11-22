@@ -248,6 +248,11 @@ async fn a_machine_enrolls_once_then_answers_over_mutual_tls() {
             Some(id.fingerprint.as_str())
         )
     );
+    // The first enrollment says how long the machine took to come up (ADR 0119).
+    let d = &enrolled[0]["details"];
+    assert_eq!((d["first"].as_bool(), d["provider"].as_str(), d["tier"].as_str()), (Some(true), Some(m.provider.as_str()), Some("starter")), "{d}");
+    let took = d["sinceRequestSeconds"].as_i64().unwrap_or(-1);
+    assert!((0..=(crate::db::now() - m.created_at) / 1000).contains(&took), "{d}");
 
     let again = agent::enroll(&config(&env, &mid, Some(&token)))
         .await
@@ -390,6 +395,9 @@ async fn a_running_agent_takes_up_a_certificate_enrolled_by_hand() {
     let by_hand = agent::enroll(&same_disk).await.unwrap();
     assert!(agent.reload_if_changed());
     assert_eq!(agent.identity().fingerprint, by_hand.fingerprint);
+    let enrolled = events(&env, "machine.enrolled").await;
+    let first: Vec<bool> = enrolled.iter().map(|e| e["details"]["sinceRequestSeconds"].is_number()).collect();
+    assert_eq!(first.iter().filter(|f| **f).count(), 1, "only the first enrollment is the machine coming up: {enrolled:?}");
     let (code, _) = raw(
         &env,
         Some(&agent.identity()),
