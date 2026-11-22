@@ -1,7 +1,9 @@
 name: docs
 
-# Links in the security pack (docs/security/) point at ADRs, other docs, workflows and
-# config, so a change to any of them can break one. Changes to server/, deploy/ and
+# Links in the security pack (docs/security/, its policies/ included) point at ADRs, other
+# docs, workflows and config, so a change to any of them can break one. The same test checks
+# each policy's owner, review cadence and checklist items, and the Type II evidence plan's
+# rows (ADR 0130). Changes to server/, deploy/ and
 # apps/client/ run the same test in the server workflow's `cargo test`. Any change under
 # .github/ also checks that actions stay pinned by commit (ADR 0100) and that the docker
 # workflow still scans, signs and attests its images (ADR 0101), and that the release
