@@ -19,6 +19,15 @@ DRY_RUN=false
 INTERACTIVE=true
 WITH_HERMES=false
 LICENSE_FILE=""
+# Off-host copies of server backups (docs/adr/0109-server-backups-off-the-host.md). Empty:
+# .env keeps what it has. The keys come from the installer's environment, never flags:
+# SERVER_BACKUP_S3_ACCESS_KEY_ID and SERVER_BACKUP_S3_SECRET_ACCESS_KEY.
+BACKUP_S3_ENDPOINT=""
+BACKUP_S3_BUCKET=""
+BACKUP_S3_REGION=""
+BACKUP_S3_PREFIX=""
+BACKUP_AGE_RECIPIENTS=""
+BACKUP_OFF_HOST=""
 # --testing-mode: run unlicensed with billing off (TESTING_MODE=on; docs/adr/0068-no-free-tier.md).
 TESTING_MODE_ON=false
 # Hermes Agent release --with-hermes installs: the commit of tag v0.23.3 (NousResearch/hermes-agent),
@@ -62,6 +71,20 @@ Usage: install.sh [options]
   --upgrade           git pull + rebuild + restart
   --ufw               Enable UFW (allow 22, 80, 443)
   --no-backup         Skip daily DATA_DIR backup timer
+  --backup-s3-endpoint URL, --backup-s3-bucket NAME
+                      Copy server backups off this host to S3-compatible storage (ADR 0109).
+                      Give the keys in the environment, not as flags:
+                      SERVER_BACKUP_S3_ACCESS_KEY_ID=... SERVER_BACKUP_S3_SECRET_ACCESS_KEY=...
+                      Without a store, backups stay on this host and the installer says so
+  --backup-s3-region NAME, --backup-s3-prefix PREFIX
+                      The store's region (default us-east-1; auto for R2) and key prefix
+                      (default superbot/)
+  --backup-age-recipients KEYS
+                      Encrypt backup archives to these age public keys (comma-separated), on
+                      this host and off it (SUPERBOT_BACKUP_AGE_RECIPIENTS)
+  --backup-off-host auto|on|off
+                      SERVER_BACKUP_OFF_HOST: copy when a store is set (auto, the default),
+                      refuse to start without one (on), or never copy (off)
   --with-hermes       Also install the Hermes Agent CLI (about 2.5 GB; HERMES_COMMIT pins it)
   --license-file PATH Install the license key CG-Labs sent. SuperBot has no free tier: without a
                       license, Bots don't run unless testing mode is on
@@ -93,6 +116,12 @@ parse_args() {
       --upgrade) UPGRADE=true; shift ;;
       --ufw) ENABLE_UFW=true; shift ;;
       --no-backup) ENABLE_BACKUP=false; shift ;;
+      --backup-s3-endpoint) BACKUP_S3_ENDPOINT=$2; shift 2 ;;
+      --backup-s3-bucket) BACKUP_S3_BUCKET=$2; shift 2 ;;
+      --backup-s3-region) BACKUP_S3_REGION=$2; shift 2 ;;
+      --backup-s3-prefix) BACKUP_S3_PREFIX=$2; shift 2 ;;
+      --backup-age-recipients) BACKUP_AGE_RECIPIENTS=$2; shift 2 ;;
+      --backup-off-host) BACKUP_OFF_HOST=$2; shift 2 ;;
       --with-hermes) WITH_HERMES=true; shift ;;
       --license-file) LICENSE_FILE=$2; shift 2 ;;
       --testing-mode) TESTING_MODE_ON=true; shift ;;
@@ -550,8 +579,74 @@ configure_env() {
     export NEW_PASSWORD_FILE=$pass_file
   fi
 
+  configure_backup_target "$env_file"
+
   chown "$SUPERBOT_USER:$SUPERBOT_USER" "$env_file"
   chmod 0600 "$env_file"
+}
+
+# The off-host backup flags' shapes, checked before the long build. botd checks the rest
+# when it starts and refuses to start on settings that can't work.
+check_backup_target() {
+  if [[ -n "$BACKUP_S3_ENDPOINT$BACKUP_S3_REGION$BACKUP_S3_PREFIX" && -z "$BACKUP_S3_BUCKET" ]]; then
+    die "--backup-s3-endpoint, --backup-s3-region and --backup-s3-prefix need --backup-s3-bucket"
+  fi
+  if [[ -n "$BACKUP_S3_BUCKET" ]]; then
+    [[ -n "$BACKUP_S3_ENDPOINT" ]] || die "--backup-s3-bucket needs --backup-s3-endpoint (https://...)"
+    [[ "$BACKUP_S3_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || die "--backup-s3-bucket: \"$BACKUP_S3_BUCKET\" isn't a bucket name"
+  fi
+  case $BACKUP_S3_ENDPOINT in
+    "" | https://* | http://127.0.0.1* | http://localhost*) ;;
+    *) die "--backup-s3-endpoint must be https://host[:port]" ;;
+  esac
+  [[ -z "$BACKUP_S3_REGION" || "$BACKUP_S3_REGION" =~ ^[A-Za-z0-9_-]+$ ]] || die "--backup-s3-region must be a region name, e.g. us-east-1"
+  [[ -z "$BACKUP_S3_PREFIX" || "$BACKUP_S3_PREFIX" =~ ^[A-Za-z0-9._/-]+$ ]] || die "--backup-s3-prefix: letters, digits, dots, dashes, underscores and slashes"
+  case $BACKUP_OFF_HOST in
+    "" | auto | on | off) ;;
+    *) die "--backup-off-host must be auto, on or off" ;;
+  esac
+  local r
+  for r in ${BACKUP_AGE_RECIPIENTS//,/ }; do
+    [[ "$r" == age1* ]] || die "--backup-age-recipients: \"$r\" isn't an age public key (age1...)"
+  done
+}
+
+# Writes the off-host backup settings given into .env; nothing given, nothing changes, so
+# an upgrade keeps what the server had (docs/adr/0109-server-backups-off-the-host.md).
+configure_backup_target() {
+  local env_file=$1 key
+  if [[ -n "$BACKUP_S3_BUCKET" ]]; then
+    for key in SERVER_BACKUP_S3_ACCESS_KEY_ID SERVER_BACKUP_S3_SECRET_ACCESS_KEY; do
+      if [[ -z "${!key:-}" ]] && ! grep -q "^${key}=." "$env_file" && ! grep -q "^${key}_FILE=." "$env_file"; then
+        die "--backup-s3-bucket needs $key: run the installer with $key=... in its environment"
+      fi
+    done
+    set_env_var "$env_file" SERVER_BACKUP_S3_ENDPOINT "$BACKUP_S3_ENDPOINT"
+    set_env_var "$env_file" SERVER_BACKUP_S3_BUCKET "$BACKUP_S3_BUCKET"
+    [[ -z "$BACKUP_S3_REGION" ]] || set_env_var "$env_file" SERVER_BACKUP_S3_REGION "$BACKUP_S3_REGION"
+    [[ -z "$BACKUP_S3_PREFIX" ]] || set_env_var "$env_file" SERVER_BACKUP_S3_PREFIX "$BACKUP_S3_PREFIX"
+  fi
+  for key in SERVER_BACKUP_S3_ACCESS_KEY_ID SERVER_BACKUP_S3_SECRET_ACCESS_KEY; do
+    [[ -z "${!key:-}" ]] || set_env_var "$env_file" "$key" "${!key}"
+  done
+  [[ -z "$BACKUP_AGE_RECIPIENTS" ]] || set_env_var "$env_file" SUPERBOT_BACKUP_AGE_RECIPIENTS "$BACKUP_AGE_RECIPIENTS"
+  [[ -z "$BACKUP_OFF_HOST" ]] || set_env_var "$env_file" SERVER_BACKUP_OFF_HOST "$BACKUP_OFF_HOST"
+}
+
+# Where server backups go, from .env: "off-host", or why they stay on this host.
+backup_destination() {
+  local env_file=$1 mode
+  [[ -r "$env_file" ]] || { echo "unknown"; return; }
+  mode=$(sed -n 's/^SERVER_BACKUP_OFF_HOST=//p' "$env_file" | tail -n 1 | tr -d '"'"'"' ' | tr '[:upper:]' '[:lower:]')
+  if [[ "$mode" == off ]]; then
+    echo "on this host only (SERVER_BACKUP_OFF_HOST=off)"
+  elif grep -q '^SERVER_BACKUP_S3_BUCKET=.' "$env_file"; then
+    echo "off-host"
+  elif grep -q '^MACHINE_BACKUP_S3_BUCKET=.' "$env_file"; then
+    echo "off-host (machine backups' store)"
+  else
+    echo "on this host only (no store is set)"
+  fi
 }
 
 master_key_default() { printf '%s/.config/superbot/master.key\n' "$1"; }
@@ -1059,10 +1154,11 @@ configure_ufw() {
 }
 
 summary() {
-  local home repo_path pass_file url where app
+  local home repo_path pass_file url where app backups
   home=$(user_home)
   repo_path="$home/superbot"
   pass_file="$home/.superbot-admin-password"
+  backups=$(backup_destination "$repo_path/.env")
   if [[ -n "$DOMAIN" ]]; then
     url="https://${DOMAIN}" where=""
   else
@@ -1089,6 +1185,7 @@ SuperBot is installed.
   Key:      $(master_key_default "$home") encrypts saved secrets. Back it up apart from
             the database: without it they can't be read (deploy/README.md).
   License:  botctl license (no free tier: without a license, Bots run only with TESTING_MODE=on)
+  Backups:  $backups (botctl backups)
   Logs:     journalctl -u superbot -f
   Upgrade:  sudo bash -s -- --upgrade < <(curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/install.sh)
 
@@ -1119,6 +1216,9 @@ EOF
   if [[ -n "${NEW_MASTER_KEY_FILE:-}" ]]; then
     warn "New master key at $NEW_MASTER_KEY_FILE. Copy it somewhere safe, away from your database backups."
   fi
+  if [[ "$backups" == "on this host only"* ]]; then
+    warn "Server backups stay on this host, so losing the host loses them. Copy them off: re-run with --backup-s3-endpoint and --backup-s3-bucket (keys in SERVER_BACKUP_S3_ACCESS_KEY_ID and SERVER_BACKUP_S3_SECRET_ACCESS_KEY), or see docs/ops/backup-restore.md."
+  fi
 }
 
 finish() {
@@ -1132,6 +1232,7 @@ main() {
   parse_args "$@"
   need_root
   check_license_file
+  check_backup_target
   prompt_missing
   detect_source_dir
   TZ_VALUE=${TZ_VALUE:-UTC}
