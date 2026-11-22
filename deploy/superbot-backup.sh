@@ -7,6 +7,7 @@
 #   superbot-backup --home DIR     read DATA_DIR from DIR/superbot/.env; archives go to DIR/superbot/backups
 # With SUPERBOT_BACKUP_AGE_RECIPIENTS (age public keys) or SUPERBOT_BACKUP_AGE_RECIPIENTS_FILE set,
 # archives are encrypted with age and end in .age. The master key is never in an archive.
+# SUPERBOT_BACKUP_ENCRYPTION=required refuses to write a plain archive (docs/adr/0114-backups-encrypted-by-default.md).
 set -euo pipefail
 umask 077
 
@@ -28,7 +29,8 @@ use_home() {
   local home=$1 env_file key value
   env_file="$home/superbot/.env"
   [[ -r "$env_file" ]] || die "cannot read $env_file"
-  for key in DATA_DIR BACKUP_DIR SUPERBOT_BACKUP_RETENTION_DAYS SUPERBOT_BACKUP_AGE_RECIPIENTS SUPERBOT_BACKUP_AGE_RECIPIENTS_FILE; do
+  for key in DATA_DIR BACKUP_DIR SUPERBOT_BACKUP_RETENTION_DAYS SUPERBOT_BACKUP_AGE_RECIPIENTS SUPERBOT_BACKUP_AGE_RECIPIENTS_FILE \
+    SUPERBOT_BACKUP_ENCRYPTION; do
     if [[ -z "${!key:-}" ]]; then
       value=$(env_file_value "$env_file" "$key")
       [[ -z "$value" ]] || export "$key=$value"
@@ -42,7 +44,7 @@ mode=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --home) [[ -n "${2:-}" ]] || die "--home needs a directory"; use_home "$2"; shift 2 ;;
-    -h|--help) sed -n '2,9s/^# \{0,1\}//p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,10s/^# \{0,1\}//p' "$0"; exit 0 ;;
     - | --loop) mode=$1; shift ;;
     # Units from before ADR 0030 ran `superbot-backup <service-user-home>`.
     /*) [[ -d "$1" ]] || die "no such directory: $1"; use_home "$1"; shift ;;
@@ -72,6 +74,15 @@ fi
 if [[ ${#recipients[@]} -gt 0 ]] && ! command -v age >/dev/null 2>&1; then
   die "age recipients are set but age is not installed"
 fi
+ENCRYPTION=${SUPERBOT_BACKUP_ENCRYPTION:-auto}
+case ${ENCRYPTION,,} in
+  auto | off) ;;
+  required)
+    [[ ${#recipients[@]} -gt 0 ]] ||
+      die "SUPERBOT_BACKUP_ENCRYPTION=required, but no SUPERBOT_BACKUP_AGE_RECIPIENTS: refusing to write a plain archive"
+    ;;
+  *) die "SUPERBOT_BACKUP_ENCRYPTION must be auto, required or off" ;;
+esac
 suffix=.tar.gz
 [[ ${#recipients[@]} -eq 0 ]] || suffix=.tar.gz.age
 

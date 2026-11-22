@@ -122,6 +122,7 @@ ok "no Node or --no-client still exits 0"
 
 # No free tier (ADR 0068): only --testing-mode writes TESTING_MODE=on, and the summary says so.
 user_home() { echo "$T/home"; }
+BACKUP_IDENTITY_FILE="$T/home-identity.txt"
 mkdir -p "$T/home/superbot"
 cp "$DIR/../.env.example" "$T/home/superbot/.env.example"
 SUPERBOT_USER=$(id -un) DRY_RUN=false TESTING_MODE_ON=false configure_env >/dev/null
@@ -179,5 +180,101 @@ parse_args --backup-off-host off
 SUPERBOT_USER=$(id -un) DRY_RUN=false configure_env >/dev/null
 [[ "$(backup_destination "$env_file")" == "on this host only (SERVER_BACKUP_OFF_HOST=off)" ]] || fail "off, but: $(backup_destination "$env_file")"
 ok "off-host backups: nothing written without flags, the flags and keys written with them, and the gap warned about"
+
+# Backup encryption (ADR 0114): a new install makes an age key and encrypts to it; an upgrade
+# changes nothing unless asked; plain is a choice that's written down; required refuses plain.
+command -v age-keygen >/dev/null || fail "these checks need age (apt-get install age)"
+command -v sqlite3 >/dev/null || fail "these checks need sqlite3"
+fresh_home() { # name: a home with no .env yet
+  H="$T/$1"
+  mkdir -p "$H/superbot"
+  cp "$DIR/../.env.example" "$H/superbot/.env.example"
+  user_home() { echo "$H"; }
+  env_file="$H/superbot/.env"
+}
+# shellcheck disable=SC2034 # read by install.sh's functions
+reset_flags() {
+  BACKUP_S3_ENDPOINT="" BACKUP_S3_BUCKET="" BACKUP_S3_REGION="" BACKUP_S3_PREFIX="" BACKUP_AGE_RECIPIENTS="" BACKUP_OFF_HOST=""
+  BACKUP_ENCRYPTION="" BACKUP_AGE_GENERATE=false NEW_BACKUP_IDENTITY_FILE=""
+}
+configure() { SUPERBOT_USER=$(id -un) DRY_RUN=false configure_env >/dev/null; }
+
+reset_flags
+fresh_home enc-new
+BACKUP_IDENTITY_FILE="$T/enc-new-identity.txt"
+configure
+[[ -f "$BACKUP_IDENTITY_FILE" && $(stat -c %a "$BACKUP_IDENTITY_FILE") == 600 ]] || fail "a new install made no private backup key"
+public=$(age-keygen -y "$BACKUP_IDENTITY_FILE")
+grep -qxF "SUPERBOT_BACKUP_AGE_RECIPIENTS=$public" "$env_file" || fail "a new install doesn't encrypt to its key"
+out=$(DOMAIN=ci.example.com summary 2>&1)
+grep -qxF '  Encrypted: age (SUPERBOT_BACKUP_AGE_RECIPIENTS)' <<<"$out" || { echo "$out" >&2; fail "the summary doesn't say backups are encrypted"; }
+grep -q "New backup key at $BACKUP_IDENTITY_FILE.*Copy it off this host now" <<<"$out" || fail "the summary doesn't say to copy the new key off the host"
+if grep -q "aren't encrypted" <<<"$out"; then fail "the summary warns about plain backups with a key set"; fi
+ok "a new install makes a private age key and encrypts backups to it"
+
+# The key opens what superbot-backup writes with that .env; nothing else does.
+before=$(cat "$env_file") key=$(sha256sum "$BACKUP_IDENTITY_FILE")
+reset_flags
+configure
+[[ "$(cat "$env_file")" == "$before" && "$(sha256sum "$BACKUP_IDENTITY_FILE")" == "$key" ]] || fail "an upgrade changed the key or .env"
+grep -q "backup key is still on this host" <<<"$(DOMAIN=ci.example.com summary 2>&1)" || fail "the summary doesn't say the key is still on the host"
+mkdir -p "$H/superbot/data/bots/b1"
+sqlite3 "$H/superbot/data/app.sqlite" "CREATE TABLE bots (id TEXT, name TEXT); INSERT INTO bots VALUES ('b1', 'KeepMe');"
+PORT=1 "$DIR/superbot-backup.sh" --home "$H" 2>/dev/null
+mapfile -t sealed < <(find "$H/superbot/backups" -name 'superbot-*.tar.gz.age')
+[[ ${#sealed[@]} == 1 ]] || fail "superbot-backup didn't write an encrypted archive with the installer's .env"
+if PORT=1 "$DIR/superbot-restore.sh" --check "${sealed[0]}" >/dev/null 2>&1; then fail "the archive opened without the key"; fi
+grep -q '^bots:  *1$' <<<"$(PORT=1 "$DIR/superbot-restore.sh" --check --identity "$BACKUP_IDENTITY_FILE" "${sealed[0]}" 2>&1)" ||
+  fail "the installer's key doesn't restore its archive"
+ok "an upgrade keeps the key, and the key restores the archives superbot-backup encrypts to it"
+
+# An install from before ADR 0114: upgrades make no key unless asked, and say backups are plain.
+reset_flags
+fresh_home enc-old
+BACKUP_IDENTITY_FILE="$T/enc-old-identity.txt"
+printf 'AUTH_PASSWORD=x\nDATA_DIR=%s\n' "$H/superbot/data" >"$env_file"
+configure
+[[ ! -e "$BACKUP_IDENTITY_FILE" ]] || fail "an upgrade made a key without --backup-age-generate"
+if grep -q '^SUPERBOT_BACKUP_' "$env_file"; then fail "an upgrade wrote backup encryption settings without flags"; fi
+out=$(DOMAIN=ci.example.com summary 2>&1)
+grep -qxF '  Encrypted: plain (no SUPERBOT_BACKUP_AGE_RECIPIENTS)' <<<"$out" || fail "the summary doesn't say backups are plain"
+grep -q "Server backups aren't encrypted.*--backup-age-generate" <<<"$out" || fail "the summary doesn't warn about plain backups"
+parse_args --backup-encryption required
+check_backup_target
+if (configure) 2>"$T/err"; then fail "required was accepted with no recipients"; fi
+grep -q 'SUPERBOT_BACKUP_ENCRYPTION=required, but' "$T/err" || { cat "$T/err" >&2; fail "no word about required"; }
+reset_flags
+parse_args --backup-age-generate --backup-encryption required
+check_backup_target
+configure
+grep -qxF "SUPERBOT_BACKUP_AGE_RECIPIENTS=$(age-keygen -y "$BACKUP_IDENTITY_FILE")" "$env_file" || fail "--backup-age-generate didn't encrypt to a new key"
+grep -qxF 'SUPERBOT_BACKUP_ENCRYPTION=required' "$env_file" || fail "--backup-encryption wasn't written"
+ok "upgrades make a key only with --backup-age-generate, and required refuses plain"
+
+reset_flags
+fresh_home enc-off
+BACKUP_IDENTITY_FILE="$T/enc-off-identity.txt"
+parse_args --backup-encryption off
+check_backup_target
+configure
+[[ ! -e "$BACKUP_IDENTITY_FILE" ]] || fail "--backup-encryption off made a key"
+grep -qxF 'SUPERBOT_BACKUP_ENCRYPTION=off' "$env_file" || fail "--backup-encryption off wasn't written"
+out=$(DOMAIN=ci.example.com summary 2>&1)
+grep -qxF '  Encrypted: plain by choice (SUPERBOT_BACKUP_ENCRYPTION=off)' <<<"$out" || fail "the summary doesn't say plain is a choice"
+if grep -q "aren't encrypted" <<<"$out"; then fail "plain by choice still warns"; fi
+# Without age-keygen, a new install still finishes, plain, and says so.
+reset_flags
+fresh_home enc-noage
+BACKUP_IDENTITY_FILE="$T/enc-noage-identity.txt"
+(age-keygen() { return 127; } && configure) 2>"$T/err" || { cat "$T/err" >&2; fail "a new install without age failed"; }
+grep -q 'Could not make a backup age key' "$T/err" || fail "no word that the key couldn't be made"
+if grep -q '^SUPERBOT_BACKUP_AGE_RECIPIENTS=' "$env_file"; then fail "recipients were written without a key"; fi
+for bad in "--backup-encryption maybe" "--backup-age-generate --backup-encryption off" \
+  "--backup-age-generate --backup-age-recipients age1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqs3290gq"; do
+  reset_flags
+  # shellcheck disable=SC2086
+  if (parse_args $bad && check_backup_target) 2>/dev/null; then fail "accepted $bad"; fi
+done
+ok "plain by choice is written and said, a host without age still installs, and contradictory flags are refused"
 
 echo "all install checks passed"

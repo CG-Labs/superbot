@@ -28,6 +28,13 @@ BACKUP_S3_REGION=""
 BACKUP_S3_PREFIX=""
 BACKUP_AGE_RECIPIENTS=""
 BACKUP_OFF_HOST=""
+# Backup encryption (docs/adr/0114-backups-encrypted-by-default.md). A new install makes an
+# age key for its backups unless given recipients or --backup-encryption off; an upgrade
+# makes one only with --backup-age-generate. The private half stays root-only on this host
+# until the operator copies it off.
+BACKUP_ENCRYPTION=""
+BACKUP_AGE_GENERATE=false
+BACKUP_IDENTITY_FILE=${BACKUP_IDENTITY_FILE:-/root/superbot-backup-identity.txt}
 # --testing-mode: run unlicensed with billing off (TESTING_MODE=on; docs/adr/0068-no-free-tier.md).
 TESTING_MODE_ON=false
 # Hermes Agent release --with-hermes installs: the commit of tag v0.23.3 (NousResearch/hermes-agent),
@@ -81,7 +88,15 @@ Usage: install.sh [options]
                       (default superbot/)
   --backup-age-recipients KEYS
                       Encrypt backup archives to these age public keys (comma-separated), on
-                      this host and off it (SUPERBOT_BACKUP_AGE_RECIPIENTS)
+                      this host and off it (SUPERBOT_BACKUP_AGE_RECIPIENTS). Without them a
+                      new install makes an age key at BACKUP_IDENTITY_FILE (default
+                      /root/superbot-backup-identity.txt, root only): copy it off the host
+  --backup-age-generate
+                      Make that key on an upgrade too, if .env has no recipients
+  --backup-encryption auto|required|off
+                      SUPERBOT_BACKUP_ENCRYPTION: warn about plain backups (auto, the default),
+                      refuse to write or start with them (required), or keep them plain by
+                      choice (off)
   --backup-off-host auto|on|off
                       SERVER_BACKUP_OFF_HOST: copy when a store is set (auto, the default),
                       refuse to start without one (on), or never copy (off)
@@ -122,6 +137,8 @@ parse_args() {
       --backup-s3-prefix) BACKUP_S3_PREFIX=$2; shift 2 ;;
       --backup-age-recipients) BACKUP_AGE_RECIPIENTS=$2; shift 2 ;;
       --backup-off-host) BACKUP_OFF_HOST=$2; shift 2 ;;
+      --backup-age-generate) BACKUP_AGE_GENERATE=true; shift ;;
+      --backup-encryption) BACKUP_ENCRYPTION=$2; shift 2 ;;
       --with-hermes) WITH_HERMES=true; shift ;;
       --license-file) LICENSE_FILE=$2; shift 2 ;;
       --testing-mode) TESTING_MODE_ON=true; shift ;;
@@ -550,12 +567,17 @@ configure_env() {
     local testing=""
     [[ "$TESTING_MODE_ON" != true ]] || testing=" (TESTING_MODE=on: no license, billing off)"
     log "[dry-run] configure $env_file$testing"
+    if [[ -z "$BACKUP_AGE_RECIPIENTS" && "$BACKUP_ENCRYPTION" != off ]] && { [[ ! -f "$env_file" ]] || [[ "$BACKUP_AGE_GENERATE" == true ]]; }; then
+      log "[dry-run] would make a backup age key at $BACKUP_IDENTITY_FILE (root, 0600) and set SUPERBOT_BACKUP_AGE_RECIPIENTS, unless $env_file has recipients"
+    fi
     return
   fi
 
   [[ ! -L "$env_file" ]] || die "Refusing symlinked $env_file"
   [[ ! -L "$pass_file" ]] || die "Refusing symlinked $pass_file"
+  local fresh=false
   if [[ ! -f "$env_file" ]]; then
+    fresh=true
     cp "$repo_path/.env.example" "$env_file"
     chown "$SUPERBOT_USER:$SUPERBOT_USER" "$env_file"
     chmod 0600 "$env_file"
@@ -590,6 +612,7 @@ configure_env() {
   fi
 
   configure_backup_target "$env_file"
+  configure_backup_encryption "$env_file" "$fresh"
 
   chown "$SUPERBOT_USER:$SUPERBOT_USER" "$env_file"
   chmod 0600 "$env_file"
@@ -619,6 +642,15 @@ check_backup_target() {
   for r in ${BACKUP_AGE_RECIPIENTS//,/ }; do
     [[ "$r" == age1* ]] || die "--backup-age-recipients: \"$r\" isn't an age public key (age1...)"
   done
+  case $BACKUP_ENCRYPTION in
+    "" | auto | required | off) ;;
+    *) die "--backup-encryption must be auto, required or off" ;;
+  esac
+  if [[ "$BACKUP_AGE_GENERATE" == true ]]; then
+    [[ -z "$BACKUP_AGE_RECIPIENTS" ]] || die "give --backup-age-recipients or --backup-age-generate, not both"
+    [[ "$BACKUP_ENCRYPTION" != off ]] || die "--backup-age-generate makes a key that --backup-encryption off would not use"
+  fi
+  [[ "$BACKUP_IDENTITY_FILE" == /* ]] || die "BACKUP_IDENTITY_FILE must be an absolute path, not $BACKUP_IDENTITY_FILE"
 }
 
 # Writes the off-host backup settings given into .env; nothing given, nothing changes, so
@@ -642,6 +674,67 @@ configure_backup_target() {
   done
   [[ -z "$BACKUP_AGE_RECIPIENTS" ]] || set_env_var "$env_file" SUPERBOT_BACKUP_AGE_RECIPIENTS "$BACKUP_AGE_RECIPIENTS"
   [[ -z "$BACKUP_OFF_HOST" ]] || set_env_var "$env_file" SERVER_BACKUP_OFF_HOST "$BACKUP_OFF_HOST"
+}
+
+# KEY's last value in .env, without quotes.
+env_value() {
+  sed -n "s/^$2=//p" "$1" | tail -n 1 | tr -d "\"'"
+}
+
+backup_recipients_set() {
+  grep -Eq '^SUPERBOT_BACKUP_AGE_RECIPIENTS(_FILE)?=.' "$1"
+}
+
+# Makes (or, if one is already there, reuses) the backup age identity at BACKUP_IDENTITY_FILE,
+# private to whoever runs the installer (root), and sets BACKUP_PUBLIC to its public key.
+# Returns 1 if age-keygen is missing or fails.
+make_backup_identity() {
+  local file=$BACKUP_IDENTITY_FILE
+  BACKUP_PUBLIC=""
+  [[ ! -L "$file" ]] || die "Refusing symlinked $file"
+  command -v age-keygen >/dev/null 2>&1 || return 1
+  if [[ ! -e "$file" ]]; then
+    mkdir -p "$(dirname "$file")"
+    (umask 077 && age-keygen -o "$file" 2>/dev/null) || { rm -f "$file"; return 1; }
+    NEW_BACKUP_IDENTITY_FILE=$file
+  fi
+  chmod 0600 "$file"
+  BACKUP_PUBLIC=$(age-keygen -y "$file" 2>/dev/null) || return 1
+  [[ "$BACKUP_PUBLIC" == age1* ]]
+}
+
+# Backup encryption (docs/adr/0114-backups-encrypted-by-default.md): --backup-encryption is
+# written as given; a new .env (or --backup-age-generate) with no recipients gets an age key
+# made here, unless backups are plain by choice. An upgrade with no flags changes nothing.
+configure_backup_encryption() {
+  local env_file=$1 fresh=$2 policy
+  [[ -z "$BACKUP_ENCRYPTION" ]] || set_env_var "$env_file" SUPERBOT_BACKUP_ENCRYPTION "$BACKUP_ENCRYPTION"
+  policy=$(env_value "$env_file" SUPERBOT_BACKUP_ENCRYPTION | tr '[:upper:]' '[:lower:]')
+  backup_recipients_set "$env_file" && return 0
+  [[ "$policy" != off ]] || return 0
+  if [[ "$fresh" == true || "$BACKUP_AGE_GENERATE" == true ]]; then
+    if make_backup_identity; then
+      set_env_var "$env_file" SUPERBOT_BACKUP_AGE_RECIPIENTS "$BACKUP_PUBLIC"
+      log "Backups: encrypted to the age key in $BACKUP_IDENTITY_FILE"
+      return 0
+    fi
+    warn "Could not make a backup age key (is age installed?): backups stay plain until SUPERBOT_BACKUP_AGE_RECIPIENTS is set"
+  fi
+  [[ "$policy" != required ]] ||
+    die "SUPERBOT_BACKUP_ENCRYPTION=required, but $env_file has no SUPERBOT_BACKUP_AGE_RECIPIENTS: re-run with --backup-age-generate or --backup-age-recipients age1..."
+}
+
+# Whether server backups are encrypted, from .env.
+backup_encryption_state() {
+  local env_file=$1
+  [[ -r "$env_file" ]] || { echo "unknown"; return; }
+  if backup_recipients_set "$env_file"; then
+    echo "age (SUPERBOT_BACKUP_AGE_RECIPIENTS)"
+  elif [[ "$(env_value "$env_file" SUPERBOT_BACKUP_ENCRYPTION | tr '[:upper:]' '[:lower:]')" == off ]]; then
+    echo "plain by choice (SUPERBOT_BACKUP_ENCRYPTION=off)"
+  else
+    echo "plain (no SUPERBOT_BACKUP_AGE_RECIPIENTS)"
+  fi
 }
 
 # Where server backups go, from .env: "off-host", or why they stay on this host.
@@ -1165,11 +1258,12 @@ configure_ufw() {
 }
 
 summary() {
-  local home repo_path pass_file url where app backups
+  local home repo_path pass_file url where app backups encryption
   home=$(user_home)
   repo_path="$home/superbot"
   pass_file="$home/.superbot-admin-password"
   backups=$(backup_destination "$repo_path/.env")
+  encryption=$(backup_encryption_state "$repo_path/.env")
   if [[ -n "$DOMAIN" ]]; then
     url="https://${DOMAIN}" where=""
   else
@@ -1197,6 +1291,7 @@ SuperBot is installed.
             the database: without it they can't be read (deploy/README.md).
   License:  botctl license (no free tier: without a license, Bots run only with TESTING_MODE=on)
   Backups:  $backups (botctl backups)
+  Encrypted: $encryption
   Logs:     journalctl -u superbot -f
   Upgrade:  sudo bash -s -- --upgrade < <(curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/install.sh)
 
@@ -1229,6 +1324,14 @@ EOF
   fi
   if [[ "$backups" == "on this host only"* ]]; then
     warn "Server backups stay on this host, so losing the host loses them. Copy them off: re-run with --backup-s3-endpoint and --backup-s3-bucket (keys in SERVER_BACKUP_S3_ACCESS_KEY_ID and SERVER_BACKUP_S3_SECRET_ACCESS_KEY), or see docs/ops/backup-restore.md."
+  fi
+  if [[ "$encryption" == "plain (no"* ]]; then
+    warn "Server backups aren't encrypted: anyone who gets a copy can read every chat. Re-run with --backup-age-generate (or --backup-age-recipients age1...), or --backup-encryption off to keep them plain by choice (docs/ops/backup-restore.md#encryption)."
+  fi
+  if [[ -n "${NEW_BACKUP_IDENTITY_FILE:-}" ]]; then
+    warn "New backup key at $NEW_BACKUP_IDENTITY_FILE: the only key that opens your encrypted backups. Copy it off this host now (a password manager or vault), then delete it here (shred -u $NEW_BACKUP_IDENTITY_FILE). Left here, it is lost with the host, and whoever takes the host can read the backups."
+  elif [[ -f "$BACKUP_IDENTITY_FILE" ]]; then
+    warn "The backup key is still on this host at $BACKUP_IDENTITY_FILE. Once you have a copy off the host, delete it here (shred -u $BACKUP_IDENTITY_FILE)."
   fi
 }
 
