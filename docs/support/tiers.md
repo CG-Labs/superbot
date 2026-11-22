@@ -24,7 +24,7 @@ All plans: SuperBot itself (botd, botctl, the web app and console, the installer
 - **Self-host (licensed).** Help with SuperBot on your own servers: install, upgrade, configuration, backups and restores as documented in the [operator guide](../../deploy/README.md), and bugs. Your servers, network, identity provider and model providers are yours; support explains what SuperBot needs from them. Fixes ship in releases; there's no hotfix to a single server.
 - **Starter, Pro and Max (managed).** The Provider runs the server, the machines and their backups. Support covers anything in the service, including restoring a machine within its plan's RTO. Pro and Max add Severity 1 response at any hour. Max's faster targets for Severity 2 and 3 ([severity](severity.md)) are its support difference; Pro and Max share the same server and SLO.
 - **Enterprise.** Everything above on a deployment of its own (dedicated, VPC or on-premises), plus:
-  - a technical account manager (`<tam-name>`, `<tam-email>`) who knows the deployment, joins onboarding, runs the [success cadence](onboarding.md#success-cadence) and is the customer's [escalation](escalation.md) point;
+  - a [technical account manager](tam.md) (`<tam-name>`, `<tam-email>`) who knows the deployment, joins onboarding, runs the [success cadence](onboarding.md#success-cadence) and is the customer's [escalation](escalation.md) point;
   - response targets, hours and channels agreed in the order form, starting from the defaults in [severity](severity.md#enterprise-defaults);
   - help with SCIM, SAML, data regions and security reviews (the [security pack](../security/README.md));
   - change windows agreed ahead for upgrades on their deployment.

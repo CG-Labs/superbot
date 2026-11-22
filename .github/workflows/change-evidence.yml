@@ -1,0 +1,74 @@
+name: change-evidence
+
+# SOC 2 change-management evidence (ADR 0148, docs/security/soc2-evidence-plan.md). On the
+# 1st of each month, exports last month's merged pull requests (reviews, approvers, checks,
+# merge commits), commits without one, the protection on the default branch and every CI
+# run on it, as a bundle with SHA-256 digests, built by superbot-evidence from this commit.
+# The security owner copies the artifact to the evidence store before it expires. Run it by
+# hand for another period (whole UTC days; to is not included). Read access only: the
+# token can see the repository and nothing it does changes it.
+on:
+  schedule:
+    - cron: '17 4 1 * *'
+  workflow_dispatch:
+    inputs:
+      from:
+        description: 'First day, YYYY-MM-DD (UTC). Empty: last month.'
+        required: false
+        default: ''
+      to:
+        description: 'Day after the last, YYYY-MM-DD (UTC). Empty: last month.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+  checks: read
+  statuses: read
+
+concurrency:
+  group: change-evidence
+  cancel-in-progress: false
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo build --locked --release --bin superbot-evidence
+      - name: Export the period's changes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          FROM: ${{ inputs.from }}
+          TO: ${{ inputs.to }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          period=()
+          if [[ -n "${FROM:-}" || -n "${TO:-}" ]]; then
+            period=(--from "$FROM" --to "$TO")
+          fi
+          cd "$RUNNER_TEMP/evidence"
+          "$GITHUB_WORKSPACE/target/release/superbot-evidence" github --repo "$GITHUB_REPOSITORY" "${period[@]}" | tee summary.txt
+          {
+            echo '## Change-management evidence'
+            echo
+            echo '```'
+            cat summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm summary.txt
+      - name: Keep the bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: change-evidence
+          path: ${{ runner.temp }}/evidence/*.tar
+          if-no-files-found: error
+          retention-days: 90

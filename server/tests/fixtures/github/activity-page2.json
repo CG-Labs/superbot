@@ -1,0 +1,47 @@
+[
+  {
+    "id": 4,
+    "node_id": "PSH_4",
+    "before": "b101b101b101b101b101b101b101b101b101b101",
+    "after": "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0",
+    "ref": "refs/heads/main",
+    "timestamp": "2026-10-15T10:00:00Z",
+    "activity_type": "push",
+    "actor": {
+      "login": "maintainer-m",
+      "id": 38766,
+      "type": "User",
+      "site_admin": false
+    }
+  },
+  {
+    "id": 3,
+    "node_id": "PSH_3",
+    "before": "b099b099b099b099b099b099b099b099b099b099",
+    "after": "b101b101b101b101b101b101b101b101b101b101",
+    "ref": "refs/heads/main",
+    "timestamp": "2026-10-05T09:30:01Z",
+    "activity_type": "pr_merge",
+    "actor": {
+      "login": "author-b",
+      "id": 38766,
+      "type": "User",
+      "site_admin": false
+    }
+  },
+  {
+    "id": 2,
+    "node_id": "PSH_2",
+    "before": "9999999999999999999999999999999999999999",
+    "after": "b099b099b099b099b099b099b099b099b099b099",
+    "ref": "refs/heads/main",
+    "timestamp": "2026-09-28T10:00:01Z",
+    "activity_type": "pr_merge",
+    "actor": {
+      "login": "maintainer-m",
+      "id": 38766,
+      "type": "User",
+      "site_admin": false
+    }
+  }
+]

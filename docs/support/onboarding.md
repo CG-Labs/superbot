@@ -59,9 +59,9 @@ Within 5 business days of signing (Enterprise: led by the technical account mana
 | When | What | Who |
 |---|---|---|
 | Week 1 after go-live | Check-in: sign-in, approvals, first runs, open tickets | Support (Enterprise: TAM) |
-| Monthly | Usage against the plan (`botctl usage`), failed runs by harness, approvals waiting, open tickets, SLO and backup report | Enterprise: TAM with the customer's owner |
-| Quarterly | Business review: adoption, incidents and their reviews, roadmap items they care about, renewals and seats | Enterprise: TAM and the customer's sponsor |
+| Monthly | [Health check](health-check.md): the [health score](health-score.md), usage against the plan (`botctl usage`), failed runs by harness, approvals waiting, open tickets, SLO and backup report | Enterprise: TAM with the customer's owner |
+| Quarterly | [Business review](qbr-template.md): adoption, incidents and their reviews, roadmap items they care about, renewals and seats | Enterprise: TAM and the customer's sponsor |
 | Twice a year | Restore drill on their deployment, with times recorded; security pack and DPA refreshed | Provider, shared with the customer |
 | Before each upgrade | Release notes and any action needed; change window agreed (Enterprise) | Provider |
 
-Signs a customer needs help before they ask: sign-ins dropping, many approvals expiring unanswered, runs failing on one harness, seats near the license limit (`botctl license`), or repeated Severity 3 tickets on the same thing. Raise them at the next check-in, or sooner.
+Signs a customer needs help before they ask: sign-ins dropping, many approvals expiring unanswered, runs failing on one harness, seats near the license limit (`botctl license`), or repeated Severity 3 tickets on the same thing. Most of these show in the [health score](health-score.md) (`botctl health-score`). Raise them at the next check-in, or sooner. Enterprise customers' TAMs run the fuller cadence in the [TAM programme](tam.md#cadence).
