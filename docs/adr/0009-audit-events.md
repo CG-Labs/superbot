@@ -35,9 +35,9 @@ Indexes on `at`, `(action, id)`, and `(actor_kind, actor_id, id)` keep filters f
 
 ### Append-only
 
-- **Code**: `Db::record` is the only writer. There is no update or delete API, and the only `DELETE` is retention pruning.
+- **Code**: `Db::record` is the only writer (through `audit_chain::insert`, which seals each row onto a hash chain, [ADR 0122](0122-siem-export-and-tamper-evident-audit.md)). There is no update or delete API, and the only `DELETE` is retention pruning.
 - **Database**: a trigger aborts every `UPDATE`, except the narrow rewrite erasing a user makes inside its own transaction: their id to a pseudonym, their identifying fields cleared, nothing else ([ADR 0102](0102-erasing-a-users-data.md)). Another aborts every `DELETE`, unless retention is on (the `audit_retention_days` setting) and the row is older than the window. So even a bug, or a stray query through `botd`, can't rewrite history or delete recent rows.
-- **Limits**: anyone with write access to `app.sqlite` (the service user, root) can drop the triggers. This guards against mistakes and API misuse, not a server compromise. Tamper evidence (hash chain, write-once storage, shipping events off the box) is M5 work.
+- **Limits**: anyone with write access to `app.sqlite` (the service user, root) can drop the triggers. This guards against mistakes and API misuse, not a server compromise. Since [ADR 0122](0122-siem-export-and-tamper-evident-audit.md), a hash chain over the rows shows any change, and the SIEM export ships events and their hashes off the box, which is what catches a rebuilt chain.
 
 ### What is logged
 
@@ -93,7 +93,7 @@ Done in [ADR 0019](0019-audit-actors.md), which also adds the email, role, sign-
 
 ## Later (M5)
 
-SIEM export: stream events as JSON lines (syslog, HTTPS webhook, or S3) in the same shape, using `id` as the resume cursor. Tamper evidence (a hash chain over rows or write-once storage) belongs with it.
+SIEM export and tamper evidence: done in [ADR 0122](0122-siem-export-and-tamper-evident-audit.md) (a hash chain over rows, verification, and export as JSON lines over HTTPS or RFC 5424 syslog, with `id` as the resume cursor). Still later: S3 batches with write-once storage.
 
 ## Alternatives considered
 
@@ -103,7 +103,7 @@ SIEM export: stream events as JSON lines (syslog, HTTPS webhook, or S3) in the s
 
 ## Consequences
 
-- The log is only as trustworthy as the host. Off-box export is the real guarantee and is planned for M5.
+- The log is only as trustworthy as the host. Off-box export is the real guarantee ([ADR 0122](0122-siem-export-and-tamper-evident-audit.md)).
 - Login events are per session, not per request; a burst of failures shows as one event with a count.
 - Bot attribution is honest about its limits: a Bot could claim another's id until per-Bot tokens land.
 - The database grows without bound by default; owners who care set `AUDIT_RETENTION_DAYS`.
