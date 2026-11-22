@@ -1114,12 +1114,22 @@ pub fn start(app: AppState, cp: Arc<ControlPlane>) {
             tick.tick().await;
             hosts::watch(&a, &c).await;
             reconcile(&a, &c).await;
-            // Off-host backups' RPOs are watched beside their backups (`backup::start`).
-            if c.offsite.is_none() {
-                recovery::watch(&a, &c);
-            }
         }
     });
+    // Off-host backups' RPOs are watched beside their backups (`backup::start`). Provider
+    // backups' are watched every minute against the times reconciling saved, so a slow
+    // provider or a long MACHINE_RECONCILE_SECONDS can't hold up breach alerts.
+    if cp.offsite.is_none() && cp.provider_backups.is_some() {
+        let (a, c) = (app.clone(), cp.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                recovery::watch(&a, &c);
+            }
+        });
+    }
     if cp.enrollment.is_none() {
         return;
     }

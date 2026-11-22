@@ -56,7 +56,7 @@ Machines at Linode are backed up by Linode's own backup service, not by SuperBot
 |---|---|---|---|
 | Every plan | 24 hours | 26 hours | 4 hours (the Provider's target; not measured by SuperBot) |
 
-3. **Measurement.** The server reads from Linode when each running machine's last backup succeeded, at least once a minute, and checks it against the RPO as for Incus machines: a machine without a successful backup within its RPO (or created within it) is recorded as a breach, with the time it began and ended, and the Provider's operators are alerted. Machines whose Linode Backups are off are counted and alerted on too.
+3. **Measurement.** The server reads from Linode when each running machine's last backup succeeded, every minute by default, and checks that against the RPO at least once a minute, as for Incus machines: a machine without a successful backup within its RPO (or created within it) is recorded as a breach, with the time it began and ended, and the Provider's operators are alerted. Machines whose Linode Backups are off are counted and alerted on too.
 4. **Restores.** The Provider's operators restore a machine from Linode's console onto the same machine, which then connects to SuperBot afresh, its previous connection revoked. SuperBot doesn't time these restores, so the restore time target is the Provider's own, backed by its drills, not a measured objective.
 5. **Not covered.** Losing the Linode data centre that holds both a machine and its backups. A backup older than the oldest Linode keeps.
 
