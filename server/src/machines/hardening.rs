@@ -268,8 +268,17 @@ fi
 if [ ! -x /usr/sbin/sshd ]; then
   echo ssh=none >> "$st"
 elif /usr/sbin/sshd -t && /usr/sbin/sshd -T 2>/dev/null | grep -qx 'passwordauthentication no'; then
-  systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || true
-  echo ssh=on >> "$st"
+  # A running sshd keeps its old settings until it reloads; one not running yet (socket
+  # activation) reads the file when it starts.
+  svc=
+  for u in ssh sshd; do
+    if systemctl is-active --quiet "$u" 2>/dev/null; then svc=$u; break; fi
+  done
+  if [ -z "$svc" ] || systemctl reload "$svc" >/dev/null 2>&1; then
+    echo ssh=on >> "$st"
+  else
+    echo ssh=failed >> "$st"
+  fi
 else
   rm -f /etc/ssh/sshd_config.d/00-superbot-hardening.conf
   echo ssh=failed >> "$st"
@@ -317,9 +326,25 @@ pub fn observed(app: &crate::runner::App, m: &crate::db::Machine, by: &crate::au
     }
 }
 
+/// The steps every hardened first boot reports.
+pub const REQUIRED: [&str; 3] = ["ssh", "kernel", "updates"];
+
 /// The steps that aren't done, `egress` among them when its rules aren't loaded.
+/// A step the first boot must report, missing or in a state botd doesn't know, isn't
+/// done either: an incomplete report never counts as hardened.
 pub fn failing(h: &Hardening) -> Vec<String> {
-    let mut out: Vec<String> = h.steps.iter().filter(|(_, v)| v.as_str() == wire::HARDENING_FAILED).map(|(k, _)| k.clone()).collect();
+    let done = |v: &str| [wire::HARDENING_ON, wire::HARDENING_PARTIAL, wire::HARDENING_NONE].contains(&v);
+    let mut out: Vec<String> = REQUIRED
+        .iter()
+        .filter(|k| !h.steps.get(**k).is_some_and(|v| done(v)))
+        .map(|k| k.to_string())
+        .collect();
+    out.extend(
+        h.steps
+            .iter()
+            .filter(|(k, v)| !REQUIRED.contains(&k.as_str()) && !done(v))
+            .map(|(k, _)| k.clone()),
+    );
     if !h.egress {
         out.push("egress".into());
     }
@@ -389,6 +414,11 @@ mod tests {
 
     #[test]
     fn ssh_is_keys_and_root_only() {
+        // A running sshd that won't reload keeps its old settings: that is a failure.
+        let ssh = &FIRSTBOOT[FIRSTBOOT.find("elif /usr/sbin/sshd -t").unwrap()..FIRSTBOOT.find("if sysctl").unwrap()];
+        assert!(!ssh.contains("|| true"), "{ssh}");
+        let reload = ssh.find("systemctl reload \"$svc\"").unwrap();
+        assert!(ssh[reload..].find("ssh=failed").unwrap() < ssh[reload..].find("\nelse\n  rm -f").unwrap(), "{ssh}");
         for line in ["PermitRootLogin prohibit-password", "AllowUsers root", "PasswordAuthentication no", "AllowTcpForwarding no", "X11Forwarding no"] {
             assert!(SSH.lines().any(|l| l == line), "{line}");
         }
@@ -407,5 +437,15 @@ mod tests {
         h.steps.insert("updates".into(), wire::HARDENING_ON.into());
         h.egress = true;
         assert!(failing(&h).is_empty());
+        // Incomplete or unknown reports are never hardened.
+        h.steps.remove("kernel");
+        h.steps.insert("ssh".into(), "maybe".into());
+        assert_eq!(failing(&h), vec!["ssh".to_string(), "kernel".to_string()]);
+        let empty = Hardening { steps: BTreeMap::new(), egress: true, reboot_required: false };
+        assert_eq!(failing(&empty), vec!["ssh".to_string(), "kernel".to_string(), "updates".to_string()]);
+        h.steps.insert("kernel".into(), wire::HARDENING_ON.into());
+        h.steps.insert("ssh".into(), wire::HARDENING_NONE.into());
+        h.steps.insert("extra".into(), "odd".into());
+        assert_eq!(failing(&h), vec!["extra".to_string()]);
     }
 }

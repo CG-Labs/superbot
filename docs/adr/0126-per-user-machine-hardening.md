@@ -85,7 +85,7 @@ The agent adds `hardening` to its heartbeat: each step from `/etc/superbot/harde
 | Action | When |
 |--------|------|
 | `machine.hardened` | Every step is `on`, `partial` or `none`, and the egress rules are loaded. Recorded the first time, and again after a failure. |
-| `machine.hardening_failed` | A step `failed`, or the egress rules aren't loaded (`failing` lists which). Outcome `failure`. Recorded again only when what fails changes. |
+| `machine.hardening_failed` | A step `failed`, `ssh`, `kernel` or `updates` is missing or in an unknown state, an sshd that is running won't reload, or the egress rules aren't loaded (`failing` lists which). Outcome `failure`. Recorded again only when what fails changes. |
 | `machine.reboot_required` | Updates start waiting on a reboot. A reboot is the operator's call, since it ends Bots' runs. |
 
 ### What the Incus host must do
