@@ -1,0 +1,67 @@
+# promtool test rules superbot-backup-encryption.rules.test.yml
+rule_files:
+  - superbot-backup-encryption.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Plain archives: a ticket after an hour, none before, and only for the plain target.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_backup_encrypted{job="superbot",instance="a:8080",target="server_archives"}'
+        values: '0x120'
+      - series: 'superbot_backup_encrypted{job="superbot",instance="a:8080",target="machines"}'
+        values: '1x120'
+      - series: 'superbot_backup_plaintext_allowed{job="superbot",instance="a:8080"}'
+        values: '0x120'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SuperBotBackupsUnencrypted
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: SuperBotBackupsUnencrypted
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: a:8080
+              target: server_archives
+            exp_annotations:
+              summary: "Backups aren't encrypted (server_archives)"
+              description: "botd writes server_archives backups plain, so anyone who gets a copy can read every chat in it. Set the age recipients (SUPERBOT_BACKUP_AGE_RECIPIENTS, SERVER_BACKUP_AGE_RECIPIENTS or MACHINE_BACKUP_AGE_RECIPIENTS; deploy/install.sh --backup-age-generate makes a key), or SUPERBOT_BACKUP_ENCRYPTION=off to keep them plain by choice. botctl backups shows each target. See docs/ops/backup-restore.md#encryption."
+
+  # Plain by choice on one server doesn't hide another server's plain backups.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_backup_encrypted{job="superbot",instance="a:8080",target="server_archives"}'
+        values: '0x120'
+      - series: 'superbot_backup_plaintext_allowed{job="superbot",instance="a:8080"}'
+        values: '1x120'
+      - series: 'superbot_backup_encrypted{job="superbot",instance="b:8080",target="server_copies"}'
+        values: '0x120'
+      - series: 'superbot_backup_plaintext_allowed{job="superbot",instance="b:8080"}'
+        values: '0x120'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: SuperBotBackupsUnencrypted
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: b:8080
+              target: server_copies
+            exp_annotations:
+              summary: "Backups aren't encrypted (server_copies)"
+              description: "botd writes server_copies backups plain, so anyone who gets a copy can read every chat in it. Set the age recipients (SUPERBOT_BACKUP_AGE_RECIPIENTS, SERVER_BACKUP_AGE_RECIPIENTS or MACHINE_BACKUP_AGE_RECIPIENTS; deploy/install.sh --backup-age-generate makes a key), or SUPERBOT_BACKUP_ENCRYPTION=off to keep them plain by choice. botctl backups shows each target. See docs/ops/backup-restore.md#encryption."
+
+  # Encrypted, or a botd too old to export the gauge: nothing.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_backup_encrypted{job="superbot",instance="a:8080",target="server_archives"}'
+        values: '1x120'
+      - series: 'superbot_backup_plaintext_allowed{job="superbot",instance="a:8080"}'
+        values: '0x120'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: SuperBotBackupsUnencrypted
+        exp_alerts: []

@@ -1,0 +1,27 @@
+# Backup encryption alerts for botd (docs/adr/0114-backups-encrypted-by-default.md), from the
+# metrics in docs/adr/0089-metrics-and-structured-logs.md.
+#
+# Load it from prometheus.yml, next to the other rules:
+#   rule_files: ["/etc/prometheus/superbot-server-backups.rules.yml", "/etc/prometheus/superbot-backup-encryption.rules.yml"]
+# Check it with: promtool check rules superbot-backup-encryption.rules.yml
+#                promtool test rules superbot-backup-encryption.rules.test.yml
+#
+# It assumes the scrape job is named "superbot" (as in deploy/README.md), and alerts per
+# instance and target (server_archives, server_copies, machines). A server that keeps backups
+# plain by choice (SUPERBOT_BACKUP_ENCRYPTION=off) doesn't alert; its gauge still shows 0.
+
+groups:
+  - name: superbot-backup-encryption-alerts
+    rules:
+      # A backup target writes plain copies, and plaintext wasn't chosen.
+      - alert: SuperBotBackupsUnencrypted
+        expr: |
+          max by (job, instance, target) (superbot_backup_encrypted{job="superbot"}) == 0
+          unless on (job, instance)
+          max by (job, instance) (superbot_backup_plaintext_allowed{job="superbot"}) == 1
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Backups aren't encrypted ({{ $labels.target }})"
+          description: "botd writes {{ $labels.target }} backups plain, so anyone who gets a copy can read every chat in it. Set the age recipients (SUPERBOT_BACKUP_AGE_RECIPIENTS, SERVER_BACKUP_AGE_RECIPIENTS or MACHINE_BACKUP_AGE_RECIPIENTS; deploy/install.sh --backup-age-generate makes a key), or SUPERBOT_BACKUP_ENCRYPTION=off to keep them plain by choice. botctl backups shows each target. See docs/ops/backup-restore.md#encryption."
