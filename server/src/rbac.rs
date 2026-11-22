@@ -127,6 +127,11 @@ impl Perm {
         DELEGABLE.into_iter().find(|p| p.as_str() == name)
     }
 
+    /// Any permission by name, built-in ones included.
+    pub fn parse(name: &str) -> Option<Perm> {
+        PERMS.into_iter().find(|p| p.as_str() == name)
+    }
+
     pub fn describe(self) -> &'static str {
         match self {
             Perm::Account => "Your own session, second factor and settings.",
@@ -186,6 +191,49 @@ impl Perms {
     }
 }
 
+/// Any set of permissions, built-in ones included: what a service account's token may use,
+/// and the most its owner holds (ADR 0143). It only ever narrows what a role grants.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Scope(u16);
+
+impl Scope {
+    pub const NONE: Scope = Scope(0);
+
+    pub fn all() -> Scope {
+        PERMS.into_iter().fold(Scope::NONE, Scope::with)
+    }
+
+    /// What `p` holds with `extra` on top, as `granted` lists it.
+    pub fn of(p: Principal, extra: Perms) -> Scope {
+        PERMS.into_iter().filter(|perm| permits(p, extra, *perm)).fold(Scope::NONE, Scope::with)
+    }
+
+    /// Team permissions, which mean something only within a team.
+    pub fn team(perms: Perms) -> Scope {
+        TEAM_SCOPED.into_iter().filter(|p| perms.has(*p)).fold(Scope::NONE, Scope::with)
+    }
+
+    pub fn with(self, p: Perm) -> Scope {
+        Scope(self.0 | p.bit())
+    }
+
+    pub fn has(self, p: Perm) -> bool {
+        self.0 & p.bit() != 0
+    }
+
+    pub fn and(self, o: Scope) -> Scope {
+        Scope(self.0 & o.0)
+    }
+
+    pub fn or(self, o: Scope) -> Scope {
+        Scope(self.0 | o.0)
+    }
+
+    pub fn names(self) -> Vec<&'static str> {
+        PERMS.iter().filter(|p| self.has(**p)).map(|p| p.as_str()).collect()
+    }
+}
+
 /// The built-in roles' matrix.
 pub fn allows(p: Principal, perm: Perm) -> bool {
     use Perm::*;
@@ -227,6 +275,11 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         ("GET" | "POST", ["users"]) | ("GET" | "PATCH", ["users", _]) => ManageUsers,
         ("POST", ["users", _, "login-codes"]) | ("DELETE", ["users", _, "sessions"]) => ManageUsers,
         ("GET", ["sessions"]) | ("DELETE", ["sessions", _]) => ManageUsers,
+        // Service accounts (ADR 0143). Handlers keep a delegate to the ones they own, and
+        // to no more than they hold themselves.
+        ("GET" | "POST", ["service-accounts"]) | ("GET" | "PATCH" | "DELETE", ["service-accounts", _]) => ManageUsers,
+        ("GET" | "POST", ["service-accounts", _, "tokens"]) | ("DELETE", ["service-accounts", _, "tokens", _]) => ManageUsers,
+        ("POST", ["service-accounts", _, "tokens", _, "rotate"]) => ManageUsers,
         ("GET", ["users", _, "bots" | "routines"]) | ("POST", ["users", _, "routines", "resume"]) => ManageBots,
         ("POST", ["tiers", _, "move-bots"]) => ManageBots,
         ("GET", ["audit"] | ["audit", "export.csv"] | ["access-review"] | ["access-review", "export.csv"]) => ViewAudit,
@@ -363,6 +416,30 @@ mod tests {
         let all = DELEGABLE.into_iter().fold(Perms::NONE, Perms::with);
         assert_eq!(all.names().len(), DELEGABLE.len());
         assert_eq!(all.in_team().names(), ["users.manage", "billing.manage", "machines.manage"]);
+    }
+
+    #[test]
+    fn scopes_only_narrow() {
+        assert_eq!(Scope::all().names().len(), PERMS.len());
+        assert_eq!(Scope::of(READONLY, Perms::NONE).names(), ["account", "read", "review"]);
+        assert_eq!(Scope::of(ADMIN, Perms::NONE), Scope::all());
+        let auditor = Perms::from_names(["audit.view"]);
+        assert_eq!(Scope::of(READONLY, auditor).names(), ["account", "read", "review", "audit.view"]);
+        // A Bot never carries a custom role's permissions, in a scope either.
+        assert_eq!(Scope::of(BOT, auditor), Scope::of(BOT, Perms::NONE));
+        let all = DELEGABLE.into_iter().fold(Perms::NONE, Perms::with);
+        assert_eq!(Scope::team(all).names(), ["users.manage", "billing.manage", "machines.manage"]);
+        let member = Scope::of(MEMBER, Perms::NONE);
+        assert_eq!(member.and(Scope::of(READONLY, Perms::NONE)), Scope::of(READONLY, Perms::NONE));
+        assert_eq!(Scope::all().and(member), member);
+        assert!(!member.has(Perm::Admin) && Scope::all().has(Perm::Admin));
+        assert_eq!(member.and(Scope::of(READONLY, auditor)).names(), ["account", "read", "review"]);
+        assert_eq!(Scope::NONE.with(Perm::Read).or(Scope::NONE.with(Perm::Write)).names(), ["read", "write"]);
+        for perm in PERMS {
+            assert_eq!(Perm::parse(perm.as_str()), Some(perm));
+        }
+        assert_eq!(Perm::parse("Admin"), None);
+        assert_eq!(Perm::parse(" read"), None);
     }
 
     #[test]
@@ -643,6 +720,20 @@ mod tests {
             ("DELETE", "/api/roles/r1/users/u1", Perm::Admin),
             ("PUT", "/api/roles/r1/teams/t1/users/u1", Perm::Admin),
             ("DELETE", "/api/roles/r1/teams/t1/users/u1", Perm::Admin),
+            // Service accounts (ADR 0143).
+            ("GET", "/api/service-accounts", Perm::ManageUsers),
+            ("POST", "/api/service-accounts", Perm::ManageUsers),
+            ("GET", "/api/service-accounts/sa1", Perm::ManageUsers),
+            ("PATCH", "/api/service-accounts/sa1", Perm::ManageUsers),
+            ("DELETE", "/api/service-accounts/sa1", Perm::ManageUsers),
+            ("GET", "/api/service-accounts/sa1/tokens", Perm::ManageUsers),
+            ("POST", "/api/service-accounts/sa1/tokens", Perm::ManageUsers),
+            ("DELETE", "/api/service-accounts/sa1/tokens/st1", Perm::ManageUsers),
+            ("POST", "/api/service-accounts/sa1/tokens/st1/rotate", Perm::ManageUsers),
+            ("PUT", "/api/service-accounts/sa1", Perm::Admin),
+            ("GET", "/api/service-accounts/sa1/tokens/st1", Perm::Admin),
+            ("PATCH", "/api/service-accounts/sa1/tokens/st1", Perm::Admin),
+            ("GET", "/api/service-accounts//tokens", Perm::Admin),
             ("GET", "/", Perm::Read),
             ("GET", "/app.js", Perm::Read),
             ("HEAD", "/api/state", Perm::Read),

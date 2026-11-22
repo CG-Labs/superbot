@@ -67,6 +67,25 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl role assign <role> <user> [--team <team>] Give it across the server (its base becomes their role), or
                                                    with --team only in that team (its team permissions)
   botctl role unassign <role> <user> [--team <team>]  Take it away; across the server they keep its base
+  botctl service-accounts                          Service accounts (ADR 0143): non-human callers for scripts
+                                                   and integrations. Admins see all; others with users.manage
+                                                   the ones they own
+  botctl service-account show <sa>                 One, its permissions, and its tokens (never their secrets)
+  botctl service-account add "<name>" [--role member|readonly|<custom role>] [--team <team>] [--description "<text>"]
+                                                   Read-only by default; never admin, never more than you hold.
+                                                   With --team, a custom role applies only in that team
+  botctl service-account edit <sa> [--name "<name>"] [--role <role>] [--team <team>|none] [--owner <user>] [--description "<text>"]
+                                                   Only admins change the owner, whose permissions cap it
+  botctl service-account disable <sa> | enable <sa> | rm <sa>
+                                                   Disabling stops every token; rm revokes them for good
+  botctl service-account token list <sa>           Its tokens, live, expired and revoked
+  botctl service-account token add <sa> [--name "<name>"] [--scopes <a,b>] [--days <1-365>]
+                                                   A token, shown once: scoped to permissions it holds (default
+                                                   all), expiring in --days (default 90)
+  botctl service-account token rotate <sa> <token> [--days <1-365>] [--keep-old <minutes>]
+                                                   A new token with the same scopes; the old one stops now, or
+                                                   after --keep-old minutes (at most 1440)
+  botctl service-account token revoke <sa> <token> It stops working at once
   botctl user tier <user> <tier|default>           Their plan: the models and limits they get
   botctl user region <user> [<region>|default]     Where their machine and its backups live (ADR 0117): theirs,
                                                    their team's or the default; set it, or follow the team again.
@@ -1104,6 +1123,81 @@ fn role_assigned(verb: &str, res: &Value) -> String {
     }
 }
 
+/// `botctl service-accounts` and `botctl service-account ...` (ADR 0143). The server checks
+/// every role, scope and limit; this only shapes the request.
+fn service_account_request(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
+    const USAGE: &str = "Usage: botctl service-accounts | service-account show <sa> | service-account add \"<name>\" [--role member|readonly|<custom role>] [--team <team>] [--description TEXT] | service-account edit <sa> [--name NAME] [--role R] [--team <team>|none] [--owner <user>] [--description TEXT] | service-account disable|enable|rm <sa> | service-account token list <sa> | token add <sa> [--name NAME] [--scopes a,b] [--days N] | token rotate <sa> <token> [--days N] [--keep-old <minutes>] | token revoke <sa> <token>";
+    let at = |id: &str| format!("/api/service-accounts/{}", encode(id));
+    let known = |rest: &[&str], allowed: &[&str]| -> Result<(), String> {
+        let mut it = rest.iter();
+        while let Some(a) = it.next() {
+            if !allowed.contains(a) || it.next().is_none() {
+                return Err(format!("Unexpected \"{a}\". {USAGE}"));
+            }
+        }
+        Ok(())
+    };
+    let number = |rest: &[&str], opt: &str| -> Result<Option<i64>, String> { flag(rest, opt).map(|v| v.parse::<i64>().map_err(|_| format!("{opt} takes a whole number"))).transpose() };
+    let named = |id: &str| !id.starts_with("--");
+    Ok(match args {
+        [] | ["list"] => ("GET", "/api/service-accounts".into(), None),
+        ["show", id] => ("GET", at(id), None),
+        ["add", name, rest @ ..] if named(name) => {
+            known(rest, &["--role", "--team", "--description"])?;
+            let body = json!({ "name": name, "role": flag(rest, "--role"), "team": flag(rest, "--team"), "description": flag(rest, "--description") });
+            ("POST", "/api/service-accounts".into(), Some(body.to_string()))
+        }
+        ["edit", id, rest @ ..] if named(id) && !rest.is_empty() => {
+            known(rest, &["--name", "--role", "--team", "--owner", "--description"])?;
+            let mut body = Map::new();
+            for (opt, field) in [("--name", "name"), ("--role", "role"), ("--owner", "owner"), ("--description", "description")] {
+                if let Some(v) = flag(rest, opt) {
+                    body.insert(field.into(), json!(v));
+                }
+            }
+            if let Some(t) = flag(rest, "--team") {
+                body.insert("team".into(), if t == "none" { Value::Null } else { json!(t) });
+            }
+            ("PATCH", at(id), Some(Value::Object(body).to_string()))
+        }
+        [verb @ ("disable" | "enable"), id] => ("PATCH", at(id), Some(json!({ "status": if *verb == "disable" { "disabled" } else { "active" } }).to_string())),
+        ["rm" | "delete", id] => ("DELETE", at(id), None),
+        ["token" | "tokens", "list", id] | ["tokens", id] => ("GET", format!("{}/tokens", at(id)), None),
+        ["token", "add" | "create", id, rest @ ..] if named(id) => {
+            known(rest, &["--name", "--scopes", "--days"])?;
+            let scopes = flag(rest, "--scopes").map(|s| s.split(',').map(str::trim).filter(|p| !p.is_empty()).collect::<Vec<_>>());
+            let body = json!({ "name": flag(rest, "--name"), "scopes": scopes, "expiresInDays": number(rest, "--days")? });
+            ("POST", format!("{}/tokens", at(id)), Some(body.to_string()))
+        }
+        ["token", "rotate", id, token, rest @ ..] if named(token) => {
+            known(rest, &["--days", "--keep-old"])?;
+            let body = json!({ "expiresInDays": number(rest, "--days")?, "keepOldMinutes": number(rest, "--keep-old")? });
+            ("POST", format!("{}/tokens/{}/rotate", at(id), encode(token)), Some(body.to_string()))
+        }
+        ["token", "revoke", id, token] => ("DELETE", format!("{}/tokens/{}", at(id), encode(token)), None),
+        _ => return Err(USAGE.into()),
+    })
+}
+
+/// What `botctl service-account token add|rotate` prints: the token once, and how to use it.
+fn service_token_created(res: &Value) -> String {
+    let t = &res["tokenInfo"];
+    let days = (t["expiresAt"].as_i64().unwrap_or_default() - now_ms() + 12 * 3_600_000) / 86_400_000;
+    let scopes = t["scopes"].as_array().map_or("all the account holds".into(), |s| s.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "));
+    let mut out = format!(
+        "Token {} for service account {} ({}), with {scopes}, for {days} days.\n\n{}\n\nIt is shown only once. Send it as \"Authorization: Bearer <token>\", or set SUPERBOT_TOKEN for botctl.",
+        t["id"].as_str().unwrap_or_default(),
+        res["serviceAccount"]["name"].as_str().unwrap_or_default(),
+        res["serviceAccount"]["id"].as_str().unwrap_or_default(),
+        res["token"].as_str().unwrap_or_default(),
+    );
+    if let Some(old) = res["replaced"]["id"].as_str() {
+        let mins = (res["replaced"]["endsAt"].as_i64().unwrap_or_default() - now_ms()) / 60_000;
+        out.push_str(&if mins > 0 { format!("\nThe old token {old} keeps working for about {mins} more minutes.") } else { format!("\nThe old token {old} stopped working.") });
+    }
+    out
+}
+
 /// What `botctl scim token create` prints: the token once, and where the IdP sends it.
 fn scim_created(res: &Value) -> String {
     let t = &res["scimToken"];
@@ -1286,6 +1380,25 @@ fn saml_summary(v: &Value) -> String {
     } else if let Some(p) = key["problem"].as_str() {
         out += &format!("  SP signing key:           {p}\n");
     }
+    let enc = &v["spEncryptionKey"];
+    if let Some(c) = enc["certificate"].as_object() {
+        out += &format!(
+            "  SP encryption certificate: SHA-256 {} ({}), expires {}\n",
+            c["sha256"].as_str().unwrap_or_default(),
+            enc["from"].as_str().unwrap_or_default(),
+            day(&c["notAfter"])
+        );
+    } else if let Some(p) = enc["problem"].as_str() {
+        out += &format!("  SP encryption key:        {p}\n");
+    }
+    out += &format!(
+        "  Encrypted assertions:     {}\n",
+        match v["encryptedAssertions"].as_str() {
+            Some("allow") => "allowed",
+            Some("require") => "required",
+            _ => "off",
+        }
+    );
     let yes = |b: bool| if b { "yes" } else { "no" };
     out += &format!(
         "  Signs AuthnRequests:      {}\n  Single logout:            {}\n",
@@ -1529,6 +1642,17 @@ fn run(args: &[String]) -> Result<String, String> {
             match rest.first() {
                 Some(&("rm" | "delete")) => Ok("Deleted.".into()),
                 Some(&verb @ ("assign" | "unassign")) => Ok(role_assigned(verb, &serde_json::from_str(&res).map_err(|e| e.to_string())?)),
+                _ => Ok(pretty(res)),
+            }
+        }
+        ["service-accounts"] | ["service-account", ..] => {
+            let rest = a.get(1..).unwrap_or_default();
+            let (method, path, body) = service_account_request(rest)?;
+            let res = api(Cred::Operator, method, &path, body)?;
+            match rest {
+                ["token", "add" | "create" | "rotate", ..] => Ok(service_token_created(&serde_json::from_str(&res).map_err(|e| e.to_string())?)),
+                ["token", "revoke", ..] => Ok("Revoked. It stopped working.".into()),
+                ["rm" | "delete", ..] => Ok("Deleted. Its tokens are revoked; the audit log keeps its name.".into()),
                 _ => Ok(pretty(res)),
             }
         }
@@ -2344,6 +2468,67 @@ mod tests {
         assert!(out.contains("SLO URL (logout URL):     https://bots.example/api/auth/sso/corp/slo") && out.contains("    Logout URL:  https://idp.example/slo"), "{out}");
         assert!(out.contains("SP signing certificate:   SHA-256 12:34 (generated), expires 2030-03-17"), "{out}");
         assert!(out.contains("Signs AuthnRequests:      yes") && out.contains("Single logout:            yes\n"), "{out}");
+        assert!(out.contains("Encrypted assertions:     off") && !out.contains("SP encryption"), "{out}");
+        v["encryptedAssertions"] = json!("require");
+        v["spEncryptionKey"] = json!({ "from": "secret", "certificate": { "sha256": "56:78", "subject": "CN=enc", "notAfter": 1_900_000_000_000_i64 } });
+        let out = saml_summary(&v);
+        assert!(out.contains("SP encryption certificate: SHA-256 56:78 (secret), expires 2030-03-17") && out.contains("Encrypted assertions:     required"), "{out}");
+        v["spEncryptionKey"] = json!({ "problem": "not offered until SSO_CORP_ENCRYPTION_PRIVATE_KEY is set" });
+        assert!(saml_summary(&v).contains("SP encryption key:        not offered until SSO_CORP_ENCRYPTION_PRIVATE_KEY"));
+    }
+
+    #[test]
+    fn service_account_commands() {
+        let req = |a: &[&str]| service_account_request(a).map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())));
+        let sa = "/api/service-accounts";
+        assert_eq!(req(&[]), Ok(("GET", sa.into(), None)));
+        assert_eq!(req(&["show", "sa1"]), Ok(("GET", format!("{sa}/sa1"), None)));
+        assert_eq!(req(&["add", "CI"]), Ok(("POST", sa.into(), Some(json!({ "name": "CI", "role": null, "team": null, "description": null })))));
+        assert_eq!(
+            req(&["add", "HR sync", "--role", "Help desk", "--team", "t1", "--description", "From HR"]),
+            Ok(("POST", sa.into(), Some(json!({ "name": "HR sync", "role": "Help desk", "team": "t1", "description": "From HR" }))))
+        );
+        assert_eq!(req(&["edit", "sa1", "--team", "none", "--owner", "ada@example.com"]), Ok(("PATCH", format!("{sa}/sa1"), Some(json!({ "team": null, "owner": "ada@example.com" })))));
+        assert_eq!(req(&["edit", "sa1", "--name", "CD", "--role", "member"]), Ok(("PATCH", format!("{sa}/sa1"), Some(json!({ "name": "CD", "role": "member" })))));
+        assert_eq!(req(&["disable", "sa1"]), Ok(("PATCH", format!("{sa}/sa1"), Some(json!({ "status": "disabled" })))));
+        assert_eq!(req(&["enable", "sa1"]), Ok(("PATCH", format!("{sa}/sa1"), Some(json!({ "status": "active" })))));
+        assert_eq!(req(&["rm", "sa1"]), Ok(("DELETE", format!("{sa}/sa1"), None)));
+        assert_eq!(req(&["token", "list", "sa1"]), Ok(("GET", format!("{sa}/sa1/tokens"), None)));
+        assert_eq!(req(&["token", "add", "sa1"]), Ok(("POST", format!("{sa}/sa1/tokens"), Some(json!({ "name": null, "scopes": null, "expiresInDays": null })))));
+        assert_eq!(
+            req(&["token", "add", "sa1", "--name", "deploy", "--scopes", "read, write", "--days", "30"]),
+            Ok(("POST", format!("{sa}/sa1/tokens"), Some(json!({ "name": "deploy", "scopes": ["read", "write"], "expiresInDays": 30 }))))
+        );
+        assert_eq!(
+            req(&["token", "rotate", "sa1", "st1", "--keep-old", "60"]),
+            Ok(("POST", format!("{sa}/sa1/tokens/st1/rotate"), Some(json!({ "expiresInDays": null, "keepOldMinutes": 60 }))))
+        );
+        assert_eq!(req(&["token", "revoke", "sa1", "st1"]), Ok(("DELETE", format!("{sa}/sa1/tokens/st1"), None)));
+        for bad in [
+            &["add"][..],
+            &["add", "--role", "member"],
+            &["add", "X", "--scopes", "read"],
+            &["edit", "sa1"],
+            &["token", "add", "sa1", "--days", "ninety"],
+            &["token", "add", "sa1", "--days"],
+            &["token", "rotate", "sa1"],
+            &["token", "revoke", "sa1"],
+            &["disable"],
+        ] {
+            assert!(req(bad).is_err(), "{bad:?}");
+        }
+
+        let made = json!({
+            "token": "sbsa_secret", "serviceAccount": { "id": "sa1", "name": "CI" },
+            "tokenInfo": { "id": "st1", "scopes": ["read"], "expiresAt": now_ms() + 30 * 86_400_000 },
+        });
+        let out = service_token_created(&made);
+        assert!(out.contains("Token st1 for service account CI (sa1), with read, for 30 days.\n\nsbsa_secret\n\nIt is shown only once."), "{out}");
+        let rotated = json!({ "token": "sbsa_new", "serviceAccount": made["serviceAccount"], "tokenInfo": { "id": "st2", "expiresAt": now_ms() + 86_400_000 }, "replaced": { "id": "st1", "endsAt": now_ms() + 30 * 60_000 + 30_000 } });
+        let out = service_token_created(&rotated);
+        assert!(out.contains("with all the account holds, for 1 days") && out.contains("The old token st1 keeps working for about 30 more minutes."), "{out}");
+        let now = json!({ "replaced": { "id": "st1", "endsAt": now_ms() } });
+        assert!(service_token_created(&now).ends_with("The old token st1 stopped working."));
     }
 
     #[test]
