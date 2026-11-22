@@ -124,7 +124,7 @@ deploy/offline-bundle.sh push superbot-offline-0.1.0-x86_64.tar.gz --sha256 <rec
   --registry registry.corp.example/superbot
 ```
 
-It checks the bundle as the installer does, copies each image to `<registry>/<name>:<tag>` (here `registry.corp.example/superbot/superbot:0.1.0` and `.../superbot-caddy:0.1.0`) with `skopeo` exactly as it is in the bundle, reads it back, and stops unless the registry now has the **same digest** the bundle recorded, the one whose signature was checked when it was bundled. It prints the settings for Compose's `.env`, pinned by digest:
+It checks the bundle as the installer does, copies each image to `<registry>/<name>:<tag>` (here `registry.corp.example/superbot/superbot:0.1.0` and `.../superbot-caddy:0.1.0`) with `skopeo` exactly as it is in the bundle, reads it back, (two images that would take the same tag are refused before anything is pushed), and stops unless the registry now has the **same digest** the bundle recorded, the one whose signature was checked when it was bundled. It prints the settings for Compose's `.env`, pinned by digest:
 
 ```sh
 SUPERBOT_IMAGE=registry.corp.example/superbot/superbot@sha256:...

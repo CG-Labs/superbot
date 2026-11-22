@@ -317,18 +317,28 @@ cmd_push() {
   [[ -n "$(manifest_value "$OFFLINE_DIR/MANIFEST" images)" ]] || die "This bundle has no images: it is for install.sh --offline only"
   [[ "$(manifest_value "$OFFLINE_DIR/MANIFEST" image_format)" == oci ]] \
     || die "This bundle's images are docker save archives, which a registry can't take with their digests: use a bundle made by a newer offline-bundle.sh, or docker load and docker push"
-  local tar name ref want dest got var arch envs=()
+  local tar name ref want dest got var arch envs=() names=() dests=()
   arch=$(manifest_value "$OFFLINE_DIR/MANIFEST" arch)
-  skopeo_copy_args
+  # Every destination first: two images whose repositories end alike (team-a/app:1, team-b/app:1)
+  # would take the same tag, and the second push would silently replace the first.
+  declare -A seen=()
   for tar in "$OFFLINE_DIR"/images/*.tar; do
     [[ -f "$tar" ]] || continue
     name=$(basename "$tar" .tar)
     ref=$(cat "$OFFLINE_DIR/images/$name.ref")
-    want=$(cat "$OFFLINE_DIR/images/$name.digest")
-    if ! image_ref_ok "$ref" || [[ ! "$want" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-      die "Refusing $BUNDLE: images/$name.ref or .digest isn't one"
-    fi
+    image_ref_ok "$ref" || die "Refusing $BUNDLE: images/$name.ref isn't an image reference"
+    [[ "$(cat "$OFFLINE_DIR/images/$name.digest")" =~ ^sha256:[0-9a-f]{64}$ ]] || die "Refusing $BUNDLE: images/$name.digest isn't a digest"
     dest="$PUSH_REGISTRY/$(basename "$(image_repo "$ref")"):$(image_tag "$ref")"
+    [[ -z "${seen[$dest]:-}" ]] || die "Images ${seen[$dest]} and $name would both be pushed to $dest: nothing pushed"
+    seen[$dest]=$name
+    names+=("$name") dests+=("$dest")
+  done
+  skopeo_copy_args
+  local i
+  for i in "${!names[@]}"; do
+    name=${names[i]} dest=${dests[i]} tar="$OFFLINE_DIR/images/${names[i]}.tar"
+    ref=$(cat "$OFFLINE_DIR/images/$name.ref")
+    want=$(cat "$OFFLINE_DIR/images/$name.digest")
     "${SKOPEO_COPY[@]}" "oci-archive:$tar" "docker://$dest" >/dev/null || die "Couldn't push $name to $dest"
     skopeo inspect --raw "docker://$dest" >"$OFFLINE_TMP/pushed.json" || die "Couldn't read $dest back from the registry"
     got="sha256:$(sha256sum <"$OFFLINE_TMP/pushed.json" | awk '{ print $1 }')"

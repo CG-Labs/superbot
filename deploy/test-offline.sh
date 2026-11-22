@@ -307,8 +307,14 @@ grep -q "has no images" <<<"$out" || fail "push of a bundle without images didn'
 old=$(B=$IB remake oldimages sed -i '/^image_format=/d' MANIFEST)
 out=$(push "$old" --registry mirror.test) && fail "push of docker save images passed"
 grep -q "docker save archives" <<<"$out" || fail "push of docker save images didn't say why"
+cp "$T/img/index.json" "$REG/refs/$(regkey reg.test/other/unsigned:1.0.0)"
+ibuild "$T/iclash" --image a=reg.test/cg/unsigned:1.0.0 --image b=reg.test/other/unsigned:1.0.0 --allow-unsigned >/dev/null 2>&1 \
+  || fail "two images with the same last path part didn't bundle"
+out=$(push "$T/iclash/$TOP.tar.gz" --registry mirror.test/clash) && fail "two images pushed to one tag"
+grep -Fq "Images a and b would both be pushed to mirror.test/clash/unsigned:1.0.0: nothing pushed" <<<"$out" || { printf '%s\n' "$out" >&2; fail "the clash was refused for another reason"; }
+[[ ! -e "$REG/refs/$(regkey mirror.test/clash/unsigned:1.0.0)" ]] || fail "an image was pushed before the clash was found"
 grep -q "is for push" <<<"$("$DIR/offline-bundle.sh" verify "$IB" --registry mirror.test 2>&1 || true)" || fail "verify took --registry"
-ok "push copies images to a mirror with the bundle's digest, checks it there, prints Compose's pinned settings, and refuses bad registries and old bundles"
+ok "push copies images to a mirror with the bundle's digest, checks it there, prints Compose's pinned settings, and refuses bad registries, two images on one tag, and old bundles"
 
 # Versions: same or newer installs; older is refused.
 release="$T/offline-release"
