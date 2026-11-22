@@ -67,7 +67,7 @@ export function draftChanges(r: CustomRole, draft: RoleDraft): Partial<RoleDraft
   if (draft.description.trim() !== r.description) out.description = draft.description.trim();
   if (draft.base !== r.base) out.base = draft.base;
   const same = draft.permissions.length === r.permissions.length && draft.permissions.every((p) => r.permissions.includes(p));
-  if (!same) out.permissions = draft.permissions;
+  if (!same || r.unknown.length > 0) out.permissions = draft.permissions;
   return Object.keys(out).length ? out : null;
 }
 

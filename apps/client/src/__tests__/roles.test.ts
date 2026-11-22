@@ -95,6 +95,8 @@ describe("custom roles (ADR 0123, 0132)", () => {
     expect(draftChanges(r, { ...draftOf(r), name: " Help desk ", base: "readonly" })).toEqual({ name: "Help desk", base: "readonly" });
     expect(draftChanges(r, { ...draftOf(r), permissions: [] })).toEqual({ permissions: [] });
     expect(draftChanges(r, { ...draftOf(r), description: "" })).toEqual({ description: "" });
+    const old = role({ unknown: ["future.perm"] });
+    expect(draftChanges(old, { ...draftOf(old), name: "Help desk" })).toEqual({ name: "Help desk", permissions: old.permissions });
   });
 
   it("warns before a new base moves the people who have it", () => {
