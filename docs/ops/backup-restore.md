@@ -176,7 +176,7 @@ Don't run a restored copy next to the live server to "test" it: botd would run t
 This guide covers botd's own data. Users' machines ([ADR 0025](../adr/0025-control-plane-linode.md)) are backed up separately:
 
 - **Incus containers**: off-host backups to S3-compatible storage, age-encrypted, kept per tier, with an admin restore that makes the machine enroll anew ([ADR 0071](../adr/0071-off-host-machine-backups.md), [setup](incus-containers.md#7-off-host-backups-optional)). Off unless `MACHINE_BACKUP_S3_BUCKET` is set. Each tier has a backup schedule, an RPO and an RTO that botd checks and alerts on ([ADR 0074](../adr/0074-machine-rpo-and-rto.md), [machine recovery](machine-recovery.md)): by default every 24 hours with an RPO of 26 (pro every 12, RPO 14; max every 6, RPO 8), and an RTO of 60 minutes.
-- **Linode VMs**: Linode's own backups (`MACHINE_BACKUPS=on`, the default), restored from Linode's console.
+- **Linode VMs**: Linode's own backups (`MACHINE_BACKUPS=on`, the default), held to an RPO and restored from Linode's console ([machine recovery](machine-recovery.md#linode-machines), [ADR 0110](../adr/0110-linode-machine-recovery-objectives.md)).
 
 Keep the age identity for machine backups off botd's host too, like the one for server archives. Without it, encrypted machine backups can't be restored.
 
