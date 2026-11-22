@@ -264,19 +264,19 @@ impl Inner {
     }
 
     async fn read(&self, scope: Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error> {
-        let Some(secret) = self.secret_name(scope, name) else { return Ok(None) };
-        let url = format!("{}/secrets/{secret}?api-version={API_VERSION}", self.cfg.url);
-        let Some(body) = self.get(&url, &secret).await? else { return Ok(None) };
-        let v: Value = serde_json::from_slice(&body).map_err(|e| unavailable(&secret, e))?;
+        let Some(id) = self.secret_name(scope, name) else { return Ok(None) };
+        let url = format!("{}/secrets/{id}?api-version={API_VERSION}", self.cfg.url);
+        let Some(body) = self.get(&url, &id).await? else { return Ok(None) };
+        let v: Value = serde_json::from_slice(&body).map_err(|e| unavailable(&id, e))?;
         // A disabled secret is refused (403) before this; anything else odd fails closed
         // rather than being read as "not there", which would uncover the sealed copy.
         if v["attributes"]["enabled"] == false {
-            return Err(Error::Unavailable(format!("Azure Key Vault: {secret} is disabled")));
+            return Err(Error::Unavailable(format!("Azure Key Vault: {id} is disabled")));
         }
         match v["value"].as_str() {
             Some("") => Ok(None),
             Some(s) => Ok(Some(Zeroizing::new(s.to_string()))),
-            None => Err(Error::Unavailable(format!("Azure Key Vault: {secret} gave an answer with no value"))),
+            None => Err(Error::Unavailable(format!("Azure Key Vault: {id} gave an answer with no value"))),
         }
     }
 
