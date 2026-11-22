@@ -152,6 +152,19 @@ async fn the_console_is_an_admin_page_without_chat_bots_or_screens() {
     }
 }
 
+/// ADR 0132: the console asks before it takes a custom role away, across the server or
+/// within a team, and finds people by email the way the server does (in any case).
+#[test]
+fn the_console_asks_before_taking_a_role_away_and_matches_emails_in_any_case() {
+    let lines: Vec<&str> = CONSOLE_JS.lines().collect();
+    let take_aways: Vec<usize> = (0..lines.len()).filter(|&n| lines[n].contains(r#"api("DELETE", `/api/roles/"#) && lines[n].contains("/users/")).collect();
+    assert!(take_aways.len() >= 3, "{take_aways:?}");
+    for n in take_aways {
+        assert!(lines[n.saturating_sub(1)..=n].iter().any(|l| l.contains("confirm(")), "line {} takes a role away without asking: {}", n + 1, lines[n].trim());
+    }
+    assert!(!CONSOLE_JS.contains(".email =="), "the console compares emails case-sensitively");
+}
+
 #[tokio::test]
 async fn every_call_the_console_makes_is_served_and_admin_only() {
     let (port, _, admin, _) = serve_app().await;
