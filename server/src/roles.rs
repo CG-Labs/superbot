@@ -1,0 +1,267 @@
+//! Custom roles (ADR 0123). An admin builds a role from a base built-in role (member or
+//! read-only) and a fixed set of admin permissions (`rbac::DELEGABLE`), then gives it to
+//! people across the server, or to a team's members within their team. The built-in
+//! roles are presets of the same permissions and can't be changed. Everything here is
+//! for admins only (`rbac::classify` leaves `/api/roles` to Admin), and audited.
+
+use crate::audit::Who;
+use crate::db::{CustomRole, RoleError, User};
+use crate::rbac::{self, DELEGABLE, Perm, Perms, Principal, Role, TEAM_SCOPED};
+use crate::users::{self, OPERATOR, need_user_key, user_view};
+use crate::{ApiError, AppState, Res, bad, not_found};
+use axum::Json;
+use axum::extract::{Extension, Path, State};
+use axum::http::StatusCode;
+use serde_json::{Value, json};
+
+/// Names a custom role can't take, so a role never reads as a built-in one.
+const RESERVED: [&str; 7] = ["admin", "member", "readonly", "read-only", "owner", "bot", "none"];
+
+fn conflict(msg: impl Into<String>) -> ApiError {
+    ApiError(StatusCode::CONFLICT, msg.into())
+}
+
+/// The permissions a role can be built from, and which of them mean something in a team.
+pub fn catalogue() -> Value {
+    json!(DELEGABLE.iter().map(|p| json!({ "name": p.as_str(), "description": p.describe(), "team": TEAM_SCOPED.contains(p) })).collect::<Vec<_>>())
+}
+
+fn built_in() -> Value {
+    let preset = |role: Role, name: &str| json!({ "id": role.as_str(), "name": name, "builtIn": true, "permissions": rbac::granted(Principal::User(role), Perms::NONE) });
+    json!([preset(Role::Admin, "Admin"), preset(Role::Member, "Member"), preset(Role::Readonly, "Read-only")])
+}
+
+/// `{id, name}` of a custom role, or null.
+pub fn summary(app: &AppState, role_id: Option<&str>) -> Value {
+    match role_id.and_then(|id| app.db.custom_role(id)) {
+        Some(r) => json!({ "id": r.id, "name": r.name }),
+        None => Value::Null,
+    }
+}
+
+fn view(app: &AppState, r: &CustomRole) -> Value {
+    let (users, teams) = app.db.custom_role_holders(&r.id);
+    let perms = r.perms();
+    // Names saved by another version of SuperBot, which this one doesn't know: shown, never granted.
+    let unknown: Vec<&String> = r.permissions.iter().filter(|p| Perm::delegable(p).is_none()).collect();
+    json!({
+        "id": r.id, "name": r.name, "description": r.description, "base": r.base, "builtIn": false,
+        "permissions": perms.names(), "unknown": unknown,
+        "effective": rbac::granted(Principal::User(r.base), perms),
+        "users": users.len(), "teamMembers": teams.len(),
+        "createdAt": r.created_at, "createdBy": r.created_by, "updatedAt": r.updated_at,
+    })
+}
+
+fn person(u: &User) -> Value {
+    json!({ "id": u.id, "name": u.name, "email": u.email })
+}
+
+fn need_role(app: &AppState, key: &str) -> Res<CustomRole> {
+    app.db.find_custom_role(key).ok_or_else(|| not_found("Role"))
+}
+
+fn role_error(e: RoleError) -> ApiError {
+    match e {
+        RoleError::NameTaken => conflict("A role with that name exists already."),
+        RoleError::NotFound => not_found("Role"),
+        RoleError::InUse(n) => conflict(format!("{n} {} still {} this role. Take it away from them first.", if n == 1 { "person" } else { "people" }, if n == 1 { "has" } else { "have" })),
+        RoleError::Db(e) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+fn parse_name(v: &Value) -> Res<String> {
+    let name = v.as_str().map(str::trim).unwrap_or_default();
+    if name.is_empty() || name.chars().count() > 60 || name.chars().any(char::is_control) {
+        return Err(bad("name must be 1 to 60 characters"));
+    }
+    if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+        return Err(bad(format!("\"{name}\" is a built-in role's name. Pick another.")));
+    }
+    Ok(name.to_string())
+}
+
+fn parse_description(v: &Value) -> Res<String> {
+    match v {
+        Value::Null => Ok(String::new()),
+        Value::String(s) if s.trim().chars().count() <= 500 && !s.chars().any(|c| c.is_control() && c != '\n') => Ok(s.trim().to_string()),
+        _ => Err(bad("description must be text, at most 500 characters")),
+    }
+}
+
+fn parse_base(v: &Value) -> Res<Role> {
+    match v.as_str().and_then(Role::parse) {
+        Some(Role::Admin) => Err(bad("A custom role can't be based on admin: give the admin role itself instead.")),
+        Some(r) => Ok(r),
+        None => Err(bad("base must be member or readonly")),
+    }
+}
+
+/// Deny by default: every name must be one of the fixed delegable permissions.
+fn parse_perms(v: &Value) -> Res<Vec<&'static str>> {
+    let allowed = || DELEGABLE.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(", ");
+    let list = v.as_array().ok_or_else(|| bad(format!("permissions must be a list of: {}", allowed())))?;
+    let mut perms = Perms::NONE;
+    for p in list {
+        let name = p.as_str().unwrap_or_default();
+        let perm = Perm::delegable(name).ok_or_else(|| bad(format!("Unknown permission \"{name}\". A custom role can hold: {}.", allowed())))?;
+        perms = perms.with(perm);
+    }
+    Ok(perms.names())
+}
+
+fn only_fields(v: &Value, fields: &[&str]) -> Res<()> {
+    let body = v.as_object().ok_or_else(|| bad("Send a JSON object."))?;
+    match body.keys().find(|k| !fields.contains(&k.as_str())) {
+        Some(k) => Err(bad(format!("Unknown field \"{k}\": send {}.", fields.join(", ")))),
+        None => Ok(()),
+    }
+}
+
+/// `GET /api/roles`: the permissions roles are built from, the built-in roles as presets
+/// of them, and every custom role with how many people hold it.
+pub async fn list(State(app): State<AppState>) -> Json<Value> {
+    let roles: Vec<Value> = app.db.custom_roles().iter().map(|r| view(&app, r)).collect();
+    Json(json!({ "permissions": catalogue(), "builtIn": built_in(), "roles": roles }))
+}
+
+/// `POST /api/roles` `{name, description?, base?: "member" | "readonly", permissions}`.
+pub async fn create(State(app): State<AppState>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
+    only_fields(&v, &["name", "description", "base", "permissions"])?;
+    let name = parse_name(&v["name"])?;
+    let description = parse_description(&v["description"])?;
+    let base = if v["base"].is_null() { Role::Member } else { parse_base(&v["base"])? };
+    let perms = parse_perms(&v["permissions"])?;
+    let r = app.db.create_custom_role(&name, &description, base, &perms, by.actor.id.as_deref()).map_err(role_error)?;
+    app.db.record(&by.event("role.created").target("role", &r.id).details(json!({ "name": r.name, "base": r.base, "permissions": perms })));
+    Ok((StatusCode::CREATED, Json(view(&app, &r))))
+}
+
+/// `GET /api/roles/{id}` (id or name): the role and who holds it.
+pub async fn get(State(app): State<AppState>, Path(key): Path<String>) -> Res {
+    let r = need_role(&app, &key)?;
+    let (users, teams) = app.db.custom_role_holders(&r.id);
+    let mut v = view(&app, &r);
+    v["holders"] = json!({
+        "users": users.iter().filter_map(|id| app.db.user(id)).map(|u| person(&u)).collect::<Vec<_>>(),
+        "teams": teams.iter().filter_map(|(t, u)| Some(json!({ "team": { "id": t, "name": app.db.team(t)?.name }, "user": person(&app.db.user(u)?) }))).collect::<Vec<_>>(),
+    });
+    Ok(Json(v))
+}
+
+/// `PATCH /api/roles/{id}` `{name?, description?, base?, permissions?}`. A new base
+/// applies at once to everyone who holds the role across the server, handled as any
+/// other change of role is (`users::update_user`).
+pub async fn update(State(app): State<AppState>, Extension(by): Extension<Who>, Path(key): Path<String>, Json(v): Json<Value>) -> Res {
+    only_fields(&v, &["name", "description", "base", "permissions"])?;
+    let before = need_role(&app, &key)?;
+    let name = (!v["name"].is_null()).then(|| parse_name(&v["name"])).transpose()?;
+    let description = v.get("description").map(parse_description).transpose()?;
+    let base = (!v["base"].is_null()).then(|| parse_base(&v["base"])).transpose()?.filter(|b| *b != before.base);
+    let perms = (!v["permissions"].is_null()).then(|| parse_perms(&v["permissions"])).transpose()?;
+    let moved = app.db.update_custom_role(&before.id, name.as_deref(), description.as_deref(), base, perms.as_deref()).map_err(role_error)?;
+    let after = need_role(&app, &before.id)?;
+    let mut changes = serde_json::Map::new();
+    if before.name != after.name {
+        changes.insert("name".into(), json!({ "from": before.name, "to": after.name }));
+    }
+    if before.description != after.description {
+        changes.insert("description".into(), json!({ "from": before.description, "to": after.description }));
+    }
+    if before.base != after.base {
+        changes.insert("base".into(), json!({ "from": before.base, "to": after.base }));
+    }
+    if before.perms() != after.perms() {
+        changes.insert("permissions".into(), json!({ "from": before.perms().names(), "to": after.perms().names() }));
+    }
+    if !changes.is_empty() {
+        app.db.record(&by.event("role.updated").target("role", &after.id).details(json!({ "name": after.name, "changes": changes, "usersMoved": moved.len() })));
+    }
+    for id in &moved {
+        app.db.record(&by.event("user.role_changed").target("user", id).details(json!({ "from": before.base, "to": after.base, "role": { "id": after.id, "name": after.name }, "reason": "role_updated" })));
+        users::lost_access(&app, &by, id, crate::machines::offboard::ACCESS_LOST).await;
+    }
+    Ok(Json(view(&app, &after)))
+}
+
+/// `DELETE /api/roles/{id}`: only once nobody holds it.
+pub async fn delete(State(app): State<AppState>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
+    let r = need_role(&app, &key)?;
+    app.db.delete_custom_role(&r.id).map_err(role_error)?;
+    app.db.record(&by.event("role.deleted").target("role", &r.id).details(json!({ "name": r.name, "base": r.base, "permissions": r.perms().names() })));
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// `PUT /api/roles/{id}/users/{user}`: gives the role across the server. Its base becomes
+/// their built-in role, replacing admin if they were one. Not the owner account, which
+/// stays an admin, and not yourself.
+pub async fn assign(State(app): State<AppState>, Extension(by): Extension<Who>, Path((key, user)): Path<(String, String)>) -> Res {
+    let r = need_role(&app, &key)?;
+    let before = need_user_key(&app, &user)?;
+    if before.id == OPERATOR {
+        return Err(conflict("The owner (break-glass) account stays an admin."));
+    }
+    if by.actor.id.as_deref() == Some(before.id.as_str()) {
+        return Err(conflict("You can't change your own role. Ask another admin."));
+    }
+    if before.role_id.as_deref() != Some(r.id.as_str()) {
+        if !app.db.set_user_custom_role(&before.id, &r.id) {
+            return Err(not_found("Role"));
+        }
+        let from = summary(&app, before.role_id.as_deref());
+        app.db.record(&by.event("role.assigned").target("role", &r.id).details(json!({ "name": r.name, "user": before.id, "scope": "org", "from": from })));
+    }
+    let after = need_user_key(&app, &before.id)?;
+    if before.role != after.role {
+        app.db.record(&by.event("user.role_changed").target("user", &after.id).details(json!({ "from": before.role, "to": after.role, "role": { "id": r.id, "name": r.name } })));
+        users::lost_access(&app, &by, &after.id, crate::machines::offboard::ACCESS_LOST).await;
+    }
+    Ok(Json(json!({ "user": user_view(&after), "role": summary(&app, after.role_id.as_deref()) })))
+}
+
+/// `DELETE /api/roles/{id}/users/{user}`: takes the role away. They keep its base as
+/// their built-in role.
+pub async fn unassign(State(app): State<AppState>, Extension(by): Extension<Who>, Path((key, user)): Path<(String, String)>) -> Res {
+    let r = need_role(&app, &key)?;
+    let u = need_user_key(&app, &user)?;
+    if !app.db.clear_user_custom_role(&u.id, &r.id) {
+        return Err(ApiError(StatusCode::NOT_FOUND, "They don't have this role.".into()));
+    }
+    app.db.record(&by.event("role.unassigned").target("role", &r.id).details(json!({ "name": r.name, "user": u.id, "scope": "org", "keeps": u.role })));
+    let after = need_user_key(&app, &u.id)?;
+    Ok(Json(json!({ "user": user_view(&after), "role": Value::Null })))
+}
+
+fn team_member(app: &AppState, team: &str, user: &str) -> Res<(crate::db::Team, User, crate::db::TeamMember)> {
+    let t = app.db.team(team).ok_or_else(|| not_found("Team"))?;
+    let u = need_user_key(app, user)?;
+    let m = app.db.team_member(&u.id).filter(|m| m.team_id == t.id).ok_or_else(|| not_found("Team member"))?;
+    Ok((t, u, m))
+}
+
+/// `PUT /api/roles/{id}/teams/{team}/users/{user}`: gives the role to a team's member
+/// within that team. Only its team permissions apply there (`rbac::TEAM_SCOPED`), and only
+/// while they stay on it; their role across the server doesn't change.
+pub async fn assign_in_team(State(app): State<AppState>, Extension(by): Extension<Who>, Path((key, team, user)): Path<(String, String, String)>) -> Res {
+    let r = need_role(&app, &key)?;
+    let (t, u, m) = team_member(&app, &team, &user)?;
+    if m.role_id.as_deref() != Some(r.id.as_str()) {
+        if !app.db.set_team_custom_role(&t.id, &u.id, Some(&r.id)) {
+            return Err(not_found("Team member"));
+        }
+        let from = summary(&app, m.role_id.as_deref());
+        app.db.record(&by.event("role.assigned").target("role", &r.id).details(json!({ "name": r.name, "user": u.id, "scope": "team", "team": t.id, "from": from, "applies": r.perms().in_team().names() })));
+    }
+    Ok(Json(json!({ "team": { "id": t.id, "name": t.name }, "user": person(&u), "role": summary(&app, Some(&r.id)), "applies": r.perms().in_team().names() })))
+}
+
+/// `DELETE /api/roles/{id}/teams/{team}/users/{user}`.
+pub async fn unassign_in_team(State(app): State<AppState>, Extension(by): Extension<Who>, Path((key, team, user)): Path<(String, String, String)>) -> Res {
+    let r = need_role(&app, &key)?;
+    let (t, u, m) = team_member(&app, &team, &user)?;
+    if m.role_id.as_deref() != Some(r.id.as_str()) || !app.db.set_team_custom_role(&t.id, &u.id, None) {
+        return Err(ApiError(StatusCode::NOT_FOUND, "They don't have this role in the team.".into()));
+    }
+    app.db.record(&by.event("role.unassigned").target("role", &r.id).details(json!({ "name": r.name, "user": u.id, "scope": "team", "team": t.id })));
+    Ok(Json(json!({ "team": { "id": t.id, "name": t.name }, "user": person(&u), "role": Value::Null })))
+}

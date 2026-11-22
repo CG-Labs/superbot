@@ -344,6 +344,7 @@ fn decide_error(e: SignupError) -> ApiError {
 pub async fn approve(
     State(app): State<AppState>,
     Extension(a): Extension<Arc<Auth>>,
+    Extension(c): Extension<users::Caller>,
     Extension(by): Extension<Who>,
     Path(id): Path<String>,
     body: Bytes,
@@ -353,6 +354,8 @@ pub async fn approve(
         Value::Null => Role::Member,
         r => r.as_str().and_then(Role::parse).ok_or_else(|| bad("role must be admin, member, or readonly"))?,
     };
+    // `signups.approve` lets people in, never as admins (ADR 0123).
+    users::Delegate::new(&app, &c, &by).may_give(role)?;
     let ttl = users::code_ttl(&v["ttlMinutes"], APPROVAL_CODE_MINUTES)?;
     let (su, user) = match app.db.approve_signup(&id, role, by.actor.id.as_deref().unwrap_or("")) {
         Ok(done) => done,
