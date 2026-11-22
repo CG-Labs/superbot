@@ -250,7 +250,7 @@ async fn discovery_describes_users_only() {
     let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
     let (code, head, spc) = scim(port, &t, "GET", "/scim/v2/ServiceProviderConfig", Value::Null).await;
     assert_eq!((code, header(&head, "content-type").as_deref()), (200, Some("application/scim+json")));
-    assert_eq!((spc["patch"]["supported"].clone(), spc["bulk"]["supported"].clone(), spc["filter"]["supported"].clone()), (json!(true), json!(false), json!(true)));
+    assert_eq!((spc["patch"]["supported"].clone(), spc["bulk"]["supported"].clone(), spc["filter"]["supported"].clone()), (json!(true), json!(true), json!(true)));
     assert_eq!(spc["authenticationSchemes"][0]["type"], "oauthbearertoken");
 
     let (_, _, types) = scim(port, &t, "GET", "/scim/v2/ResourceTypes", Value::Null).await;
@@ -269,8 +269,8 @@ async fn discovery_describes_users_only() {
     is_scim_error(&head, &body, 501);
     assert_eq!(scim(port, &t, "GET", "/scim/v2/Groups/g1", Value::Null).await.0, 404);
     let (code, head, body) = scim(port, &t, "GET", "/scim/v2/Bulk", Value::Null).await;
-    assert_eq!(code, 404);
-    is_scim_error(&head, &body, 404);
+    assert_eq!((code, header(&head, "allow").as_deref()), (405, Some("POST")));
+    is_scim_error(&head, &body, 405);
 }
 
 #[tokio::test]

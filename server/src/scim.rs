@@ -1,12 +1,13 @@
 //! SCIM 2.0 provisioning (RFC 7643, RFC 7644): an enterprise IdP (Entra ID, Okta, ...)
 //! creates, updates, deactivates, and deletes SuperBot users under `/scim/v2`, and with
 //! SCIM_GROUPS=on, pushes groups as teams (`groups`). The core User and Group schemas
-//! only; Bulk, sorting, and ETags are not supported. Each IdP connection is a tenant
+//! only, and Bulk (`bulk`); sorting and ETags are not supported. Each IdP connection is a tenant
 //! with its own bearer tokens (`sbp_`, stored hashed), and sees only the users it
 //! provisioned and the groups it made or an admin linked to it. SCIM never sets roles,
 //! org-wide or on a team.
 //! Design: docs/adr/0023-scim.md, docs/adr/0095-scim-groups-as-teams.md.
 
+pub mod bulk;
 pub mod groups;
 
 use crate::audit::{Actor, ActorKind, Outcome, Source, Who};
@@ -26,7 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub const TOKEN_PREFIX: &str = "sbp_";
-/// One user's attributes are a few hundred bytes; there is no Bulk endpoint.
+/// One user's attributes are a few hundred bytes. Bulk has its own limit (`bulk::MAX_PAYLOAD`).
 pub const MAX_BODY: usize = 64 * 1024;
 const CONTENT_TYPE: &str = "application/scim+json";
 pub const USER_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:User";
@@ -110,6 +111,14 @@ impl ScimError {
     fn new(status: StatusCode, scim_type: Option<&'static str>, detail: impl Into<String>) -> ScimError {
         ScimError { status, scim_type, detail: detail.into() }
     }
+
+    fn body(&self) -> Value {
+        let mut body = json!({ "schemas": [ERROR_SCHEMA], "status": self.status.as_u16().to_string(), "detail": self.detail });
+        if let Some(t) = self.scim_type {
+            body["scimType"] = json!(t);
+        }
+        body
+    }
 }
 
 fn invalid(detail: impl Into<String>) -> ScimError {
@@ -130,11 +139,7 @@ fn server_error(detail: impl Into<String>) -> ScimError {
 
 impl IntoResponse for ScimError {
     fn into_response(self) -> Response {
-        let mut body = json!({ "schemas": [ERROR_SCHEMA], "status": self.status.as_u16().to_string(), "detail": self.detail });
-        if let Some(t) = self.scim_type {
-            body["scimType"] = json!(t);
-        }
-        scim_json(self.status, body)
+        scim_json(self.status, self.body())
     }
 }
 
@@ -301,7 +306,7 @@ pub async fn service_provider_config(headers: HeaderMap) -> Response {
             "schemas": ["urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"],
             "documentationUri": DOCS,
             "patch": { "supported": true },
-            "bulk": { "supported": false, "maxOperations": 0, "maxPayloadSize": 0 },
+            "bulk": { "supported": true, "maxOperations": bulk::MAX_OPERATIONS, "maxPayloadSize": bulk::MAX_PAYLOAD },
             "filter": { "supported": true, "maxResults": MAX_COUNT },
             "changePassword": { "supported": false },
             "sort": { "supported": false },

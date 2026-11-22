@@ -139,6 +139,8 @@ mod runner;
 mod sandbox;
 mod scim;
 #[cfg(test)]
+mod scim_bulk_http_tests;
+#[cfg(test)]
 mod scim_groups_http_tests;
 #[cfg(test)]
 mod scim_http_tests;
@@ -1062,6 +1064,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
             "/scim/v2/Groups/{id}",
             get(scim::groups::get).put(scim::groups::replace).patch(scim::groups::patch).delete(scim::groups::delete).layer(DefaultBodyLimit::max(scim::groups::MAX_BODY)),
         )
+        // Bulk's maxPayloadSize (ADR 0149); each operation keeps its endpoint's own limit.
+        .route("/scim/v2/Bulk", post(scim::bulk::bulk).fallback(scim::bulk::only_post).layer(DefaultBodyLimit::max(scim::bulk::MAX_PAYLOAD)))
         .route("/scim/v2", any(scim::unknown))
         .route("/scim/v2/{*rest}", any(scim::unknown))
         .route_layer(middleware::from_fn(obs::note_route))
