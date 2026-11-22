@@ -613,6 +613,80 @@ async fn a_registry_on_https_cant_send_us_to_http() {
     assert_eq!(next_link("</q>"), None);
 }
 
+/// A cosign `.sig` manifest for SIGS, each a layer, with a config that lists them as cosign's does.
+fn legacy_sig(s: &mut Store, repo: &str, sigs: &[&str]) -> String {
+    let layers: Vec<Value> = sigs
+        .iter()
+        .map(|sig| {
+            let d = s.blob(sig.as_bytes());
+            json!({ "mediaType": "application/vnd.dev.cosign.simplesigning.v1+json", "digest": d, "size": sig.len(), "annotations": { "dev.cosignproject.cosign/signature": sig } })
+        })
+        .collect();
+    let config = json!({ "architecture": "", "os": "", "config": {}, "rootfs": { "type": "layers", "diff_ids": layers.iter().map(|l| l["digest"].clone()).collect::<Vec<_>>() },
+        "history": sigs.iter().map(|_| json!({ "created": "0001-01-01T00:00:00Z" })).collect::<Vec<_>>() });
+    let cb = serde_json::to_vec(&config).unwrap();
+    let cd = s.blob(&cb);
+    s.manifest(repo, &json!({ "schemaVersion": 2, "mediaType": OCI_MANIFEST, "config": { "mediaType": "application/vnd.oci.image.config.v1+json", "digest": cd, "size": cb.len() }, "layers": layers })).0
+}
+
+fn sig_layers(s: &Store, repo: &str, tag: &str) -> Vec<String> {
+    let m: Value = serde_json::from_slice(&s.get(repo, tag).expect("the tag")).unwrap();
+    let cfg: Value = serde_json::from_slice(&s.blobs[m["config"]["digest"].as_str().unwrap()]).unwrap();
+    let layers: Vec<String> = m["layers"].as_array().unwrap().iter().map(|l| l["annotations"]["dev.cosignproject.cosign/signature"].as_str().unwrap().to_string()).collect();
+    assert_eq!(cfg["rootfs"]["diff_ids"].as_array().unwrap().len(), layers.len(), "the config lists every layer");
+    assert_eq!(cfg["history"].as_array().unwrap().len(), layers.len());
+    layers
+}
+
+#[tokio::test]
+async fn cosign_tags_keep_every_signature_from_every_bundle_and_the_mirror() {
+    let src = serve(Mode::default()).await;
+    let mirror = serve(Mode::default()).await;
+    let p = publish(&src, false);
+    let cfg = settings(&[&src, &mirror], None);
+    let t = format!("{}.sig", p.index.replacen(':', "-", 1));
+    {
+        let mut s = src.store.lock().unwrap();
+        let d = legacy_sig(&mut s, REPO, &["first"]);
+        s.tags.insert((REPO.into(), t.clone()), d);
+    }
+    let older = unit(&src, &p, &p.arm64, &cfg).await;
+    {
+        let mut s = src.store.lock().unwrap();
+        let d = legacy_sig(&mut s, REPO, &["first", "again"]);
+        s.tags.insert((REPO.into(), t.clone()), d);
+    }
+    let newer = unit(&src, &p, &p.amd64, &cfg).await;
+    {
+        let mut s = mirror.store.lock().unwrap();
+        let d = legacy_sig(&mut s, "m/app", &["mirror's own"]);
+        s.tags.insert(("m/app".into(), t.clone()), d);
+    }
+    assert_eq!(push::push(&cfg, &repo(&mirror, "m/app"), "1", &[newer.clone(), older.clone()], false).await.unwrap(), p.index);
+    assert_eq!(sig_layers(&mirror.store.lock().unwrap(), "m/app", &t), ["mirror's own", "first", "again"], "the older bundle, last, takes nothing away");
+    // Again: nothing new, so the tag stays as it is.
+    let before = mirror.store.lock().unwrap().tags[&("m/app".to_string(), t.clone())].clone();
+    push::push(&cfg, &repo(&mirror, "m/app"), "1", &[older, newer], false).await.unwrap();
+    assert_eq!(mirror.store.lock().unwrap().tags[&("m/app".to_string(), t)], before);
+}
+
+#[test]
+fn merging_cosign_tags_keeps_the_config_in_step() {
+    let part = |sigs: &[&str]| {
+        let layers: Vec<Value> = sigs.iter().map(|s| json!({ "digest": format!("sha256:{}", s.repeat(64).chars().take(64).collect::<String>()) })).collect();
+        let cfg = json!({ "rootfs": { "type": "layers", "diff_ids": layers.iter().map(|l| l["digest"].clone()).collect::<Vec<_>>() }, "history": sigs.iter().map(|s| json!({ "comment": s })).collect::<Vec<_>>() });
+        (json!({ "schemaVersion": 2, "config": { "digest": "x" }, "layers": layers }), serde_json::to_vec(&cfg).unwrap(), ())
+    };
+    let (m, cfg, from) = push::merge_cosign_tag(&[part(&["a", "b"]), part(&["b", "c"])]).unwrap();
+    let digests: Vec<&str> = m["layers"].as_array().unwrap().iter().map(|l| l["digest"].as_str().unwrap()).collect();
+    assert_eq!(digests.iter().map(|d| &d[7..8]).collect::<Vec<_>>(), ["a", "b", "c"]);
+    assert_eq!(from, [0, 0, 1]);
+    let cfg: Value = serde_json::from_slice(&cfg).unwrap();
+    assert_eq!(cfg["rootfs"]["diff_ids"].as_array().unwrap().iter().map(|d| d.as_str().unwrap()).collect::<Vec<_>>(), digests);
+    assert_eq!(cfg["history"].as_array().unwrap().iter().map(|h| h["comment"].as_str().unwrap()).collect::<Vec<_>>(), ["a", "b", "c"]);
+    assert_eq!(m["config"]["digest"], sha256_digest(&serde_json::to_vec(&cfg).unwrap()));
+}
+
 fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for e in std::fs::read_dir(from).unwrap() {

@@ -398,8 +398,29 @@ impl Client {
         std::fs::rename(&part, dest).map_err(|e| format!("{}: {e}", dest.display()))
     }
 
+    /// A small blob's bytes (a config), checked against DIGEST.
+    pub async fn blob_bytes(&self, digest: &str, max: usize) -> Result<Vec<u8>, String> {
+        let res = self.send(Method::GET, &self.url(&format!("blobs/{digest}")), &[], &Body::Empty).await?;
+        if !res.status().is_success() {
+            return Err(Self::failure(format!("Couldn't read {}@{digest}", self.repo), res).await);
+        }
+        let b = read_capped(res, max, &format!("{}@{digest}", self.repo)).await?;
+        if sha256_digest(&b) != digest {
+            return Err(format!("{}@{digest} came back as {}: refusing it", self.repo, sha256_digest(&b)));
+        }
+        Ok(b)
+    }
+
     /// Uploads SRC as DIGEST unless the registry has it; the registry checks the digest.
     pub async fn push_blob(&self, digest: &str, src: &Path) -> Result<(), String> {
+        self.upload(digest, &Body::File(src)).await
+    }
+
+    pub async fn push_bytes(&self, digest: &str, bytes: &[u8]) -> Result<(), String> {
+        self.upload(digest, &Body::Bytes(bytes, "application/octet-stream")).await
+    }
+
+    async fn upload(&self, digest: &str, body: &Body<'_>) -> Result<(), String> {
         if self.blob_exists(digest).await? {
             return Ok(());
         }
@@ -410,7 +431,7 @@ impl Client {
         let loc = res.headers().get(LOCATION).and_then(|v| v.to_str().ok()).ok_or(format!("{} started an upload without a Location", self.repo.host))?;
         let mut url = self.resolve(loc, "upload location")?;
         url.query_pairs_mut().append_pair("digest", digest);
-        let res = self.send(Method::PUT, url.as_str(), &[], &Body::File(src)).await?;
+        let res = self.send(Method::PUT, url.as_str(), &[], body).await?;
         if !res.status().is_success() {
             return Err(Self::failure(format!("Couldn't upload {}@{digest}", self.repo), res).await);
         }

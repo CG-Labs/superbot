@@ -85,6 +85,90 @@ async fn push_manifest(c: &Client, reference: &str, s: &Source<'_>) -> Result<cr
 }
 
 /// With CHECK, only what can be checked here: the digest the tag would name, with no network.
+/// Cosign's `.sig` and `.att` tags hold one signature or attestation per layer, and cosign adds a
+/// layer when it signs again, so copies of one differ when signatures were added between them.
+/// The tag gets every layer the bundles' copies and the mirror's hold. Other cosign tags (`.sbom`)
+/// hold one thing: the first bundle's copy goes up. Says whether it pushed anything.
+async fn push_cosign_tag(c: &Client, t: &str, copies: Vec<Source<'_>>) -> Result<bool, String> {
+    let first = &copies[0];
+    if !(t.ends_with(".sig") || t.ends_with(".att")) {
+        push_manifest(c, t, first).await?;
+        return Ok(true);
+    }
+    let mut parts: Vec<(Value, Vec<u8>, Option<&Layout>)> = Vec::new();
+    if let Some(b) = c.manifest(t).await?
+        && let Ok(m) = parse(t, &b)
+        && m["layers"].is_array()
+        && let Some(cd) = m["config"]["digest"].as_str()
+    {
+        let cfg = c.blob_bytes(cd, MAX_CONFIG).await?;
+        parts.push((m, cfg, None));
+    }
+    for s in &copies {
+        let cd = s.manifest["config"]["digest"].as_str().ok_or(format!("{t} has no config"))?;
+        parts.push((s.manifest.clone(), s.layout.read(cd)?, Some(s.layout)));
+    }
+    let (manifest, config, from) = merge_cosign_tag(&parts)?;
+    // A copy that already has every layer goes up as it is; the mirror's is left alone.
+    let layers = manifest["layers"].as_array().map_or(0, Vec::len);
+    if let Some((_, _, layout)) = parts.iter().find(|(m, _, _)| m["layers"].as_array().map_or(0, Vec::len) == layers) {
+        let Some(layout) = layout else { return Ok(false) };
+        let s = copies.iter().find(|s| std::ptr::eq(s.layout, *layout)).expect("a copy for each layout");
+        push_manifest(c, t, s).await?;
+        return Ok(true);
+    }
+    c.push_bytes(&sha256_digest(&config), &config).await?;
+    for (l, i) in manifest["layers"].as_array().into_iter().flatten().zip(from) {
+        if let (Some(d), Some(layout)) = (l["digest"].as_str(), parts[i].2) {
+            c.push_blob(d, &layout.path(d)?).await?;
+        }
+    }
+    let bytes = serde_json::to_vec(&manifest).expect("json");
+    c.put_manifest(t, &bytes, &first.media_type).await?;
+    Ok(true)
+}
+
+const MAX_CONFIG: usize = 1 << 20;
+
+/// Copies of one cosign tag (manifest, config bytes) as one: every layer any of them has, by
+/// digest, in the order first seen, with the config's `rootfs.diff_ids` and `history` kept in step
+/// when they list one entry per layer. Says which copy each layer came from.
+pub fn merge_cosign_tag<T>(parts: &[(Value, Vec<u8>, T)]) -> Result<(Value, Vec<u8>, Vec<usize>), String> {
+    let configs = parts.iter().map(|(_, c, _)| serde_json::from_slice::<Value>(c).map_err(|e| format!("a cosign tag's config: {e}"))).collect::<Result<Vec<_>, _>>()?;
+    let (mut layers, mut from, mut diff_ids, mut history) = (Vec::<Value>::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut per_layer = true;
+    for (i, ((m, _, _), cfg)) in parts.iter().zip(&configs).enumerate() {
+        let ls = m["layers"].as_array().cloned().unwrap_or_default();
+        let ids = cfg["rootfs"]["diff_ids"].as_array().filter(|d| d.len() == ls.len());
+        let hs = cfg["history"].as_array().filter(|h| h.len() == ls.len());
+        per_layer &= ids.is_some();
+        for (j, l) in ls.iter().enumerate() {
+            if layers.iter().any(|x| x["digest"] == l["digest"]) {
+                continue;
+            }
+            layers.push(l.clone());
+            from.push(i);
+            diff_ids.push(ids.and_then(|d| d.get(j)).cloned().unwrap_or(Value::Null));
+            history.push(hs.and_then(|h| h.get(j)).cloned());
+        }
+    }
+    let config = if per_layer {
+        let mut cfg = configs[0].clone();
+        cfg["rootfs"]["diff_ids"] = json!(diff_ids);
+        if cfg.get("history").is_some() && history.iter().all(Option::is_some) {
+            cfg["history"] = json!(history);
+        }
+        serde_json::to_vec(&cfg).expect("json")
+    } else {
+        parts[0].1.clone()
+    };
+    let mut m = parts[0].0.clone();
+    m["layers"] = json!(layers);
+    m["config"]["digest"] = json!(sha256_digest(&config));
+    m["config"]["size"] = json!(config.len());
+    Ok((m, config, from))
+}
+
 pub async fn push(settings: &Settings, repo: &Repo, tag: &str, dirs: &[PathBuf], check: bool) -> Result<String, String> {
     let units = dirs.iter().map(|d| load(d)).collect::<Result<Vec<_>, _>>()?;
     let mut images = HashSet::new();
@@ -224,6 +308,8 @@ pub async fn push(settings: &Settings, repo: &Repo, tag: &str, dirs: &[PathBuf],
         let bytes = serde_json::to_vec(&json!({ "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": list })).expect("json");
         c.put_manifest(&t, &bytes, OCI_INDEX).await?;
     }
+    // Cosign's tags: each bundle has its own copy, and the mirror may have one already.
+    let mut cosign_tags: BTreeMap<String, Vec<Source>> = BTreeMap::new();
     for u in &units {
         let Some(s) = &u.signatures else { continue };
         for e in s.entries.iter().filter(|e| Layout::role(e) == "tag") {
@@ -236,7 +322,11 @@ pub async fn push(settings: &Settings, repo: &Repo, tag: &str, dirs: &[PathBuf],
             let bytes = s.read(d)?;
             let manifest = parse(t, &bytes)?;
             let mt = e["mediaType"].as_str().unwrap_or(media_type(&manifest)).to_string();
-            push_manifest(&c, t, &Source { bytes, manifest, media_type: mt, layout: s }).await?;
+            cosign_tags.entry(t.to_string()).or_default().push(Source { bytes, manifest, media_type: mt, layout: s });
+        }
+    }
+    for (t, copies) in cosign_tags {
+        if push_cosign_tag(&c, &t, copies).await? {
             copied += 1;
         }
     }
