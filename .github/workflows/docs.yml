@@ -2,19 +2,29 @@ name: docs
 
 # Links in the security pack (docs/security/) point at ADRs, other docs, workflows and
 # config, so a change to any of them can break one. Changes to server/, deploy/ and
-# apps/client/ run the same test in the server workflow's `cargo test`.
+# apps/client/ run the same test in the server workflow's `cargo test`. Any change under
+# .github/ also checks that actions stay pinned by commit (ADR 0100) and that the docker
+# workflow still scans, signs and attests its images (ADR 0101).
 on:
   push:
     paths:
       - 'docs/**'
       - 'server/tests/security_docs_links.rs'
-      - '.github/workflows/**'
+      - 'server/tests/actions_pinned.rs'
+      - 'server/tests/image_supply_chain.rs'
+      - '.github/**'
+      - '.grype.yaml'
+      - 'deploy/README.md'
       - '.cargo/**'
   pull_request:
     paths:
       - 'docs/**'
       - 'server/tests/security_docs_links.rs'
-      - '.github/workflows/**'
+      - 'server/tests/actions_pinned.rs'
+      - 'server/tests/image_supply_chain.rs'
+      - '.github/**'
+      - '.grype.yaml'
+      - 'deploy/README.md'
       - '.cargo/**'
 
 permissions:
@@ -25,7 +35,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --test security_docs_links
+      # ADR 0100: every remote action is pinned to a full commit SHA.
+      - run: cargo test --test actions_pinned
+      # ADR 0101: images are scanned, signed and attested, with minimal permissions.
+      - run: cargo test --test image_supply_chain

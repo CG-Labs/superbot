@@ -1,5 +1,5 @@
 /** Web and Electron: a normal browser download. */
-export async function saveCsv(name: string, csv: string): Promise<void> {
+export async function saveCsv(name: string, csv: string, _title?: string): Promise<void> {
   const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
   const a = document.createElement("a");
   a.href = url;

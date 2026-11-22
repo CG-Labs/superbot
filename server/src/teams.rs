@@ -502,17 +502,17 @@ fn owners(app: &AppState, team_id: &str) -> usize {
     app.db.team_members(team_id).iter().filter(|m| m.role == OWNER).count()
 }
 
-/// Why someone being erased left their team (ADR 0100).
+/// Why someone being erased left their team (ADR 0102).
 pub const ERASED: &str = "erased";
 
 /// The team `user_id` is the only owner of while others are on it: they can't be erased
-/// until someone else is made an owner (ADR 0100).
+/// until someone else is made an owner (ADR 0102).
 pub(crate) fn last_owner_of(app: &AppState, user_id: &str) -> Option<String> {
     let m = app.db.team_member(user_id).filter(|m| m.role == OWNER)?;
     (app.db.team_members(&m.team_id).len() > 1 && owners(app, &m.team_id) == 1).then_some(m.team_id)
 }
 
-/// Takes someone being erased off their team, as an admin's remove does (ADR 0100), and
+/// Takes someone being erased off their team, as an admin's remove does (ADR 0102), and
 /// deletes the team when they were its last member, unless it pays for a plan. Returns
 /// the team they left.
 pub(crate) async fn erase_member(app: &AppState, by: &Who, user_id: &str) -> Res<Option<String>> {

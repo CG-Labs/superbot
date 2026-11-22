@@ -630,6 +630,78 @@ export interface AuditPage {
   nextBefore: number | null;
 }
 
+/** A live sign-in in the access review: metadata only, never the token. */
+export interface AccessReviewSession {
+  id: string;
+  /** "cookie" (the web app) or "token" (a bearer token: the client, botctl). */
+  kind: string;
+  method: string;
+  idpProvider?: string | null;
+  label?: string | null;
+  createdAt: number;
+  lastSeenAt: number;
+  endsAt: number;
+  mfa?: string | null;
+}
+
+/** One person in `GET /api/access-review` (ADR 0099). */
+export interface AccessReviewPerson {
+  id: string;
+  name: string;
+  email: string | null;
+  role: Role;
+  status: "active" | "disabled";
+  breakGlass: boolean;
+  tier?: string | null;
+  createdAt: number;
+  /** The SCIM tenant that manages them, if any. */
+  scim: { tenant: string; deleted: boolean } | null;
+  team: { id: string; name: string; role: string } | null;
+  mfa: { enabled: boolean; enabledAt: number | null };
+  lastLogin: { at: number; method: string | null; idpProvider: string | null } | null;
+  /** Admins reach every Bot by role, so `all` is set and `bots` is empty. */
+  botAccess: {
+    all: boolean;
+    bots: { id: string; name: string; owner: { id: string; name: string | null }; own: boolean; visibility: string; access: string; grant: string | null }[];
+  };
+  sessions: AccessReviewSession[];
+  apiTokens: AccessReviewSession[];
+  machine: { id: string; provider: string; state: string; enrollment: string; assignedAt: number | null } | null;
+}
+
+export interface AccessReviewSignOff {
+  eventId: number;
+  at: number;
+  time: string;
+  reviewer: { id: string | null; name: string | null; email: string | null; role: string | null; method: string | null };
+  digest: string;
+  summary: AccessReviewSummary | null;
+  notes: string | null;
+}
+
+export interface AccessReviewSummary {
+  people: number;
+  active: number;
+  disabled: number;
+  admins: number;
+  activeWithoutMfa: number;
+  scimManaged: number;
+  browserSessions: number;
+  apiAccess: number;
+  machines: number;
+}
+
+/** `GET /api/access-review` (admins, ADR 0099): everyone, by SCIM tenant then team, and past sign-offs. */
+export interface AccessReview {
+  generatedAt: number;
+  generatedTime: string;
+  /** Names exactly this access; a sign-off sends it back. */
+  digest: string;
+  summary: AccessReviewSummary;
+  groups: { tenant: string | null; team: { id: string; name: string } | null; people: AccessReviewPerson[] }[];
+  reviews: AccessReviewSignOff[];
+}
+
 /** `GET /api/setup` (admins, ADR 0034): the parts the client uses. The wizard itself is in the console. */
 export interface SetupStatus {
   progress: { step: string; show: boolean; dismissed: boolean; completedAt: number | null };

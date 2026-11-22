@@ -1,0 +1,15 @@
+# ADR 0100: actions are pinned to commit SHAs with the version in a comment; Dependabot
+# moves both together. Other ecosystems aren't managed here (ADR 0092 scans them).
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "chore(ci)"

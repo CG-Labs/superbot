@@ -243,6 +243,10 @@ mod tests {
             ("DELETE", "/api/policy/rules/r1", Perm::Admin),
             ("GET", "/api/audit", Perm::Admin),
             ("GET", "/api/audit/export.csv", Perm::Admin),
+            // The access-review report, its export and sign-off (ADR 0099).
+            ("GET", "/api/access-review", Perm::Admin),
+            ("GET", "/api/access-review/export.csv", Perm::Admin),
+            ("POST", "/api/access-review/complete", Perm::Admin),
             ("GET", "/api/users", Perm::Admin),
             ("POST", "/api/users", Perm::Admin),
             ("GET", "/api/users/u1", Perm::Admin),
@@ -382,7 +386,7 @@ mod tests {
             ("GET", "/api/auth/mfa/policy", Perm::Admin),
             ("DELETE", "/api/auth/mfa", Perm::Admin),
             ("DELETE", "/api/users/u1/mfa", Perm::Admin),
-            // Erasing a user's personal data (ADR 0100).
+            // Erasing a user's personal data (ADR 0102).
             ("POST", "/api/users/u1/erase", Perm::Admin),
             ("POST", "/api/users/a%40example.com/erase", Perm::Admin),
             ("GET", "/api/me/emails", Perm::Account),

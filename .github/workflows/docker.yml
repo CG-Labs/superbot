@@ -5,8 +5,11 @@ name: docker
 # (docs/adr/0084-published-image-with-computer-use.md):
 #   ghcr.io/<owner>/superbot        main, sha-<short>, <version>, <major>.<minor>, latest
 #   ghcr.io/<owner>/superbot-caddy  the same tags
-# A weekly run rebuilds main without the cache, and so does each version tag, so Debian's security
-# fixes (Chromium's above all) reach the images. Pull requests build and test only.
+# A weekly run rebuilds main without the cache, and so does each version tag (or a manual run), so
+# Debian's security fixes (Chromium's above all) reach the images. Pull requests build and test only.
+# Every build is scanned with Grype; pushes, the weekly run and tags upload the results to code
+# scanning, and every published image is signed with cosign and carries SLSA build provenance and
+# an SBOM (docs/adr/0101-image-scanning-and-signing.md).
 
 on:
   push:
@@ -29,8 +32,10 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/docker.yml'
+      - '.grype.yaml'
   schedule:
     - cron: '23 4 * * 1'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -43,8 +48,8 @@ jobs:
   build:
     name: compose-smoke (${{ matrix.arch }})
     env:
-      FRESH: ${{ github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/') }}
-      PUBLISH: ${{ github.event_name != 'pull_request' }}
+      FRESH: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
+      PUBLISH: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
     strategy:
       fail-fast: false
       matrix:
@@ -59,7 +64,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Image names
         run: |
           echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >>"$GITHUB_ENV"
@@ -70,9 +75,9 @@ jobs:
             echo "org.opencontainers.image.revision=$GITHUB_SHA"
             echo EOF
           } >>"$GITHUB_ENV"
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - name: Build image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           load: true
@@ -83,7 +88,7 @@ jobs:
           cache-from: type=gha,scope=superbot-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=superbot-${{ matrix.arch }}
       - name: Build Caddy image with the web client
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           target: caddy
@@ -110,10 +115,37 @@ jobs:
           SMOKE_NO_BUILD: '1'
         run: deploy/docker/smoke-test.sh
 
+      # ADR 0101: scan the images the smoke test ran; the pushes below are the same builds.
+      # image-scan uploads the results and applies the severity policy.
+      - name: Install Grype
+        id: grype
+        uses: anchore/scan-action/download-grype@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          cache-db: true
+      - name: Scan the images for vulnerabilities
+        env:
+          GRYPE: ${{ steps.grype.outputs.cmd }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p image-scan
+          for pair in superbot=superbot:ci caddy=superbot-caddy:ci; do
+            name=${pair%%=*} out=image-scan/${pair%%=*}-$ARCH
+            "$GRYPE" "docker:${pair#*=}" --config .grype.yaml \
+              -o "json=$out.json" -o "sarif=$out.sarif" -o "table=$out.txt"
+            echo "$name ($ARCH): $(jq '.matches | length' "$out.json") findings"
+          done
+      - name: Upload scan results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: image-scan-${{ matrix.arch }}
+          path: image-scan/
+          if-no-files-found: error
+          retention-days: 90
+
       # Publishing: the same builds again (all cached), pushed by digest; `publish` tags them.
       - name: Log in to GHCR
         if: env.PUBLISH == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -121,23 +153,27 @@ jobs:
       - name: Push image by digest
         id: push
         if: env.PUBLISH == 'true'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           platforms: linux/${{ matrix.arch }}
           labels: ${{ env.LABELS }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
+          sbom: generator=docker/buildkit-syft-scanner@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315
           cache-from: type=gha,scope=superbot-${{ matrix.arch }}
       - name: Push Caddy image by digest
         id: push-caddy
         if: env.PUBLISH == 'true'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           target: caddy
           platforms: linux/${{ matrix.arch }}
           labels: ${{ env.LABELS }}
           outputs: type=image,name=${{ env.CADDY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
+          sbom: generator=docker/buildkit-syft-scanner@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315
           cache-from: type=gha,scope=caddy-${{ matrix.arch }}
       - name: Save digests
         if: env.PUBLISH == 'true'
@@ -149,35 +185,90 @@ jobs:
           touch "digests/superbot/${DIGEST#sha256:}" "digests/caddy/${CADDY_DIGEST#sha256:}"
       - name: Upload digests
         if: env.PUBLISH == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: digests-${{ matrix.arch }}
           path: digests/
           if-no-files-found: error
           retention-days: 1
 
-  publish:
+  # ADR 0101: uploads each image's scan to code scanning (not from pull requests) and fails on a
+  # Critical vulnerability with a fix that .grype.yaml doesn't accept; the rest is reported.
+  image-scan:
+    name: image-scan (${{ matrix.image }}, ${{ matrix.arch }})
     needs: build
-    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [superbot, caddy]
+        arch: [amd64, arm64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      REPORT: image-scan/${{ matrix.image }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: image-scan-${{ matrix.arch }}
+          path: image-scan
+      - name: Upload to code scanning
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
+        with:
+          sarif_file: ${{ env.REPORT }}.sarif
+          category: image-${{ matrix.image }}-${{ matrix.arch }}
+      - name: No fixable Critical vulnerabilities
+        run: |
+          {
+            echo "### ${{ matrix.image }} (${{ matrix.arch }})"
+            echo
+            echo '| Severity | Findings | With a fix |'
+            echo '|----------|----------|------------|'
+            jq -r '.matches | group_by(.vulnerability.severity)[]
+              | "| \(.[0].vulnerability.severity) | \(length) | \(map(select(.vulnerability.fix.state == "fixed")) | length) |"' "$REPORT.json"
+          } >>"$GITHUB_STEP_SUMMARY"
+          blocking=$(jq -r '.matches[]
+            | select(.vulnerability.severity == "Critical" and .vulnerability.fix.state == "fixed")
+            | "\(.vulnerability.id)  \(.artifact.name) \(.artifact.version) (\(.artifact.type)), fixed in \(.vulnerability.fix.versions | join(", "))"' "$REPORT.json")
+          if [[ -n $blocking ]]; then
+            echo "::error::Fixable Critical vulnerabilities in ${{ matrix.image }} (${{ matrix.arch }}). Fix them, or accept each in .grype.yaml with a reason (ADR 0101):"
+            echo "$blocking"
+            exit 1
+          fi
+
+  publish:
+    needs: [build, image-scan]
+    # A failed scan holds back a release, but not main: the weekly rebuild carries every other fix.
+    if: >-
+      !cancelled() && needs.build.result == 'success'
+      && github.event_name != 'pull_request'
+      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      && (needs.image-scan.result == 'success' || !startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     steps:
       - name: Image names
         run: |
           echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >>"$GITHUB_ENV"
           echo "CADDY_IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}-caddy" >>"$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: digests-*
           path: digests
           merge-multiple: true
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - name: Tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ env.IMAGE }}
           flavor: latest=false
@@ -189,23 +280,69 @@ jobs:
             type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # ADR 0101: each multi-arch index is made under a staging tag for this ref, signed and
+      # attested by digest, and only then given its public tags, so a failure leaves them alone.
+      - name: Create the multi-arch images
+        id: index
+        run: |
+          stage=staging-${GITHUB_REF_NAME//[^A-Za-z0-9_.-]/-}
+          for pair in "superbot=$IMAGE" "caddy=$CADDY_IMAGE"; do
+            dir=${pair%%=*} image=${pair#*=}
+            sources=()
+            for d in "digests/$dir"/*; do sources+=("$image@sha256:${d##*/}"); done
+            ((${#sources[@]} == 2)) || { echo "Expected 2 $dir digests (amd64, arm64), got ${#sources[@]}" >&2; exit 1; }
+            docker buildx imagetools create -t "$image:$stage" "${sources[@]}"
+            docker buildx imagetools inspect "$image:$stage"
+            digest=$(docker buildx imagetools inspect "$image:$stage" --format '{{json .Manifest}}' | jq -r .digest)
+            [[ $digest == sha256:* ]] || { echo "No digest for $image:$stage" >&2; exit 1; }
+            echo "$dir=$digest" >>"$GITHUB_OUTPUT"
+          done
+
+      # Keyless signatures and provenance, both under this workflow's GitHub OIDC identity.
+      # deploy/README.md ("Verifying the images") has the operator's checks.
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+      - name: Sign the images
+        env:
+          DIGEST: ${{ steps.index.outputs.superbot }}
+          CADDY_DIGEST: ${{ steps.index.outputs.caddy }}
+        run: |
+          cosign sign --yes --recursive "$IMAGE@$DIGEST"
+          cosign sign --yes --recursive "$CADDY_IMAGE@$CADDY_DIGEST"
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.index.outputs.superbot }}
+          push-to-registry: true
+          create-storage-record: false
+      - name: Attest build provenance (Caddy)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.CADDY_IMAGE }}
+          subject-digest: ${{ steps.index.outputs.caddy }}
+          push-to-registry: true
+          create-storage-record: false
+
       - name: Tag the multi-arch images
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.index.outputs.superbot }}
+          CADDY_DIGEST: ${{ steps.index.outputs.caddy }}
         run: |
           mapfile -t tags < <(sed -n 's/^.*://p' <<<"$TAGS")
           ((${#tags[@]})) || { echo "No tags for $GITHUB_REF" >&2; exit 1; }
-          for pair in "superbot=$IMAGE" "caddy=$CADDY_IMAGE"; do
-            dir=${pair%%=*} image=${pair#*=}
-            args=() sources=()
+          for pair in "$IMAGE=$DIGEST" "$CADDY_IMAGE=$CADDY_DIGEST"; do
+            image=${pair%%=*} digest=${pair#*=}
+            args=()
             for t in "${tags[@]}"; do args+=(-t "$image:$t"); done
-            for d in "digests/$dir"/*; do sources+=("$image@sha256:${d##*/}"); done
-            ((${#sources[@]} == 2)) || { echo "Expected 2 $dir digests (amd64, arm64), got ${#sources[@]}" >&2; exit 1; }
-            docker buildx imagetools create "${args[@]}" "${sources[@]}"
-            docker buildx imagetools inspect "$image:${tags[0]}"
+            docker buildx imagetools create "${args[@]}" "$image@$digest"
+            for t in "${tags[@]}"; do
+              got=$(docker buildx imagetools inspect "$image:$t" --format '{{json .Manifest}}' | jq -r .digest)
+              [[ $got == "$digest" ]] || { echo "$image:$t is $got, not the signed $digest" >&2; exit 1; }
+            done
           done
