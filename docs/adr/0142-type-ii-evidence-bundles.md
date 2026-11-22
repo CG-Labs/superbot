@@ -76,7 +76,7 @@ Inside botd rather than a systemd timer and a script: it needs no credentials (a
 
 ## Deferred
 
-- Exporting CI runs and merged pull requests from GitHub on the same schedule (needs a GitHub token on the server, or a workflow of its own).
+- Exporting CI runs and merged pull requests from GitHub on the same schedule (needs a GitHub token on the server, or a workflow of its own). Done as a workflow of its own: [ADR 0148](0148-change-management-evidence-from-github.md).
 - Recording the build's commit in `server.started`, so `changes.json` shows commits as well as versions.
 - A tamper-evident audit log and SIEM export ([#56](https://github.com/CG-Labs/superbot/issues/56)).
 - A console button for the bundle.
