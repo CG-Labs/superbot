@@ -1,0 +1,264 @@
+name: offline
+
+# Air-gapped installs (docs/adr/0128-air-gapped-self-host.md, docs/ops/air-gapped.md).
+# install-offline: builds offline bundles from this commit, then installs, upgrades and refuses a
+# downgrade with `install.sh --offline` as root inside a network namespace with no network at all.
+# botd and Caddy join that namespace too (a systemd drop-in), so the HTTPS checks, run from inside
+# it, show the services work with no network. It loads a bundled image into Docker the same way.
+# It runs on the oldest and newest supported Ubuntu, with binaries built on the oldest. Packages the bundle doesn't carry (Caddy,
+# sqlite3, ...) are installed first, as an operator would from their own mirror.
+# release-bundle (manual): bundles a published release's signed images for each arch, signs each
+# bundle with cosign keylessly under this workflow's identity, and attaches both to the release.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/install.sh'
+      - 'deploy/offline-bundle.sh'
+      - 'deploy/test-offline.sh'
+      - 'deploy/superbot*.sh'
+      - 'deploy/*.service'
+      - 'deploy/*.timer'
+      - 'server/**'
+      - 'site/**'
+      - 'apps/client/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/offline.yml'
+  pull_request:
+    paths:
+      - 'deploy/install.sh'
+      - 'deploy/offline-bundle.sh'
+      - 'deploy/test-offline.sh'
+      - 'deploy/superbot*.sh'
+      - 'deploy/*.service'
+      - 'deploy/*.timer'
+      - 'server/**'
+      - 'site/**'
+      - 'apps/client/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/offline.yml'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'A published release whose images are signed, e.g. 0.1.0 (its v<version> tag must exist)'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: offline-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  install-offline:
+    if: github.event_name != 'workflow_dispatch'
+    name: install-offline (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      # C code (aws-lc, SQLCipher) built against 24.04's glibc headers won't link on 22.04.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.os }}
+      - run: cargo build --release --bin botd --bin botctl --bin superbot-machine --bin superbot-run
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/client/package-lock.json
+      - name: Web client for /app/
+        working-directory: apps/client
+        env:
+          CI: '1'
+          EXPO_NO_TELEMETRY: '1'
+          SUPERBOT_WEB_BASE_URL: /app
+        run: npm ci --no-audit --no-fund && npx expo export --platform web --output-dir dist-app
+      - name: The packages a bundle doesn't carry, as from the operator's mirror
+        run: |
+          set -euo pipefail
+          curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+          curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq caddy sqlite3 age bubblewrap socat acl shellcheck
+      - name: ShellCheck
+        run: shellcheck -x -S style deploy/install.sh deploy/offline-bundle.sh deploy/test-offline.sh
+      - name: Bundle checks without root (tampering, downgrades, certificates, the Caddyfile, a dry run)
+        run: deploy/test-offline.sh
+      - name: Two bundles, the first with an image, and a certificate for offline.test
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^\[package\]/ { p = 1; next } /^\[/ { p = 0 } p && /^version *=/ { print $2; exit }' server/Cargo.toml)
+          echo "OLD=$version-ci.1" >>"$GITHUB_ENV"
+          echo "NEW=$version-ci.2" >>"$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/image"
+          echo marker >"$RUNNER_TEMP/image/marker"
+          printf 'FROM scratch\nCOPY marker /marker\nCMD ["/marker"]\n' >"$RUNNER_TEMP/image/Dockerfile"
+          docker build -q -t superbot-offline-ci:1 "$RUNNER_TEMP/image" >/dev/null
+          deploy/offline-bundle.sh build --out "$RUNNER_TEMP/b" --version "$version-ci.1" \
+            --image ci=superbot-offline-ci:1 --allow-unsigned
+          deploy/offline-bundle.sh build --out "$RUNNER_TEMP/b" --version "$version-ci.2"
+          ls -l "$RUNNER_TEMP/b"
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 -subj /CN=offline.test \
+            -addext subjectAltName=DNS:offline.test -keyout "$RUNNER_TEMP/tls.key" -out "$RUNNER_TEMP/tls.pem" 2>/dev/null
+          echo '127.0.0.1 offline.test' | sudo tee -a /etc/hosts >/dev/null
+          # The installer would take an existing botd's place; this runner has none.
+          if id superbot 2>/dev/null; then exit 1; fi
+      - name: A network namespace with only loopback, for the installer, botd and Caddy
+        run: |
+          set -euo pipefail
+          sudo ip netns add offline
+          sudo ip -n offline link set lo up
+          for unit in superbot caddy; do
+            sudo mkdir -p "/etc/systemd/system/$unit.service.d"
+            printf '[Service]\nNetworkNamespacePath=/run/netns/offline\n' \
+              | sudo tee "/etc/systemd/system/$unit.service.d/zz-offline-ci.conf" >/dev/null
+          done
+          sudo systemctl daemon-reload
+          sudo systemctl restart caddy
+          [[ $(sudo readlink "/proc/$(systemctl show -p MainPID --value caddy)/ns/net") == "$(sudo ip netns exec offline readlink /proc/self/ns/net)" ]]
+      - name: Install from the bundle with no network
+        run: |
+          set -euo pipefail
+          arch=$(uname -m)
+          sudo ip netns exec offline bash -c '
+            set -euo pipefail
+            if curl -sS --max-time 5 https://github.com >/dev/null 2>&1; then echo "the network is still up" >&2; exit 1; fi
+            bash "$1" --offline "$2" --domain offline.test --tls-cert "$3" --tls-key "$4" \
+              --testing-mode --non-interactive --tz UTC
+          ' _ deploy/install.sh "$RUNNER_TEMP/b/superbot-offline-$OLD-$arch.tar.gz" "$RUNNER_TEMP/tls.pem" "$RUNNER_TEMP/tls.key" | tee /tmp/offline-install.log
+          grep -Fq "Offline bundle $OLD ($arch" /tmp/offline-install.log
+          grep -Fq 'SuperBot is installed.' /tmp/offline-install.log
+      - name: The offline install serves the operator's certificate and asked no CA
+        run: |
+          set -euo pipefail
+          sudo systemctl is-active --quiet superbot
+          [[ $(sudo readlink "/proc/$(systemctl show -p MainPID --value superbot)/ns/net") == "$(sudo ip netns exec offline readlink /proc/self/ns/net)" ]]
+          curl() { sudo ip netns exec offline curl "$@"; }
+          for _ in $(seq 1 30); do
+            curl -fsS --cacert "$RUNNER_TEMP/tls.pem" https://offline.test/healthz >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS --cacert "$RUNNER_TEMP/tls.pem" https://offline.test/healthz
+          app=$(curl -fsS --cacert "$RUNNER_TEMP/tls.pem" https://offline.test/app/)
+          grep -q '/app/_expo/static/js/web/entry-' <<<"$app"
+          site=$(curl -fsS --cacert "$RUNNER_TEMP/tls.pem" https://offline.test/)
+          grep -qi '<!doctype html' <<<"$site"
+          grep -Fqx $'\ttls /etc/caddy/superbot-tls/cert.pem /etc/caddy/superbot-tls/key.pem' /etc/caddy/Caddyfile
+          [[ $(sudo stat -c '%U:%G %a' /etc/caddy/superbot-tls/key.pem) == 'root:caddy 640' ]]
+          logs=$(sudo journalctl -u caddy --no-pager)
+          if grep -Ei 'obtain|acme-v02|letsencrypt|zerossl|ocsp' <<<"$logs"; then echo "Caddy tried a CA" >&2; exit 1; fi
+          grep -qx "version=$OLD" /usr/local/share/superbot/offline-release
+          [[ $(stat -c '%U %a' /usr/local/bin/botd) == 'root 755' ]]
+          if sudo test -e /home/superbot/superbot/.git; then echo "an offline install has no checkout" >&2; exit 1; fi
+          sudo journalctl -u superbot --no-pager | tail -n 20
+      - name: Upgrade from a newer bundle with no network; refuse the older one again
+        run: |
+          set -euo pipefail
+          arch=$(uname -m)
+          curl() { sudo ip netns exec offline curl "$@"; }
+          before=$(sudo systemctl show -p ExecMainStartTimestampMonotonic --value superbot)
+          sudo ip netns exec offline bash deploy/install.sh --offline "$RUNNER_TEMP/b/superbot-offline-$NEW-$arch.tar.gz" --upgrade \
+            --domain offline.test --tls-cert "$RUNNER_TEMP/tls.pem" --tls-key "$RUNNER_TEMP/tls.key" --non-interactive --tz UTC \
+            | tee /tmp/offline-upgrade.log
+          grep -Fq "Offline upgrade: $OLD -> $NEW" /tmp/offline-upgrade.log
+          grep -qx "version=$NEW" /usr/local/share/superbot/offline-release
+          [[ $(sudo systemctl show -p ExecMainStartTimestampMonotonic --value superbot) != "$before" ]]
+          for _ in $(seq 1 30); do
+            curl -fsS --cacert "$RUNNER_TEMP/tls.pem" https://offline.test/healthz >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS --cacert "$RUNNER_TEMP/tls.pem" https://offline.test/healthz
+          if sudo ip netns exec offline bash deploy/install.sh --offline "$RUNNER_TEMP/b/superbot-offline-$OLD-$arch.tar.gz" --upgrade \
+            --domain offline.test --tls-cert "$RUNNER_TEMP/tls.pem" --tls-key "$RUNNER_TEMP/tls.key" --non-interactive --tz UTC \
+            >/tmp/offline-downgrade.log 2>&1; then
+            echo "a downgrade was allowed" >&2; exit 1
+          fi
+          grep -Fq "newer than the bundle's $OLD" /tmp/offline-downgrade.log
+          grep -qx "version=$NEW" /usr/local/share/superbot/offline-release
+          sudo systemctl is-active --quiet superbot
+      - name: Load the bundle's image into Docker with no network
+        run: |
+          set -euo pipefail
+          docker rmi -f superbot-offline-ci:1 >/dev/null
+          sudo unshare --net -- deploy/offline-bundle.sh load "$RUNNER_TEMP/b/superbot-offline-$OLD-$(uname -m).tar.gz"
+          docker image inspect superbot-offline-ci:1 >/dev/null
+      - name: Logs on failure
+        if: failure()
+        run: |
+          sudo journalctl -u superbot -u caddy --no-pager | tail -n 80 || true
+          cat /tmp/offline-*.log 2>/dev/null || true
+
+  release-bundle:
+    if: github.event_name == 'workflow_dispatch'
+    name: release-bundle (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: The version is a version
+        run: |
+          [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "::error::$VERSION isn't a version"; exit 1; }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: v${{ inputs.version }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - run: cargo build --release --bin botd --bin botctl --bin superbot-machine --bin superbot-run
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/client/package-lock.json
+      - name: Web client for /app/
+        working-directory: apps/client
+        env:
+          CI: '1'
+          EXPO_NO_TELEMETRY: '1'
+          SUPERBOT_WEB_BASE_URL: /app
+        run: npm ci --no-audit --no-fund && npx expo export --platform web --output-dir dist-app
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+      # The images' signatures are checked against the docker workflow at this tag before they
+      # are bundled (ADR 0101); the bundle's own signature is this workflow's.
+      - name: Bundle, with the release's signed images and their SBOMs
+        run: |
+          set -euo pipefail
+          deploy/offline-bundle.sh build --out dist --version "$VERSION" \
+            --image "superbot=ghcr.io/${GITHUB_REPOSITORY,,}:$VERSION" \
+            --image "caddy=ghcr.io/${GITHUB_REPOSITORY,,}-caddy:$VERSION" \
+            --image-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/docker.yml@refs/tags/v$VERSION"
+      - name: Sign the bundle
+        run: |
+          set -euo pipefail
+          f=dist/superbot-offline-$VERSION-${{ matrix.arch }}.tar.gz
+          cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
+          deploy/offline-bundle.sh verify "$f"
+          cat "$f.sha256" >>"$GITHUB_STEP_SUMMARY"
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "v$VERSION" dist/superbot-offline-* --clobber
