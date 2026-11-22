@@ -25,7 +25,7 @@ const EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 pub const BATCH: u32 = 500;
 const PAUSE: Duration = Duration::from_millis(20);
 const MAX_REASON: usize = 500;
-const LAST_PASS: &str = "chat_retention_last_pass";
+pub const LAST_PASS: &str = "chat_retention_last_pass";
 
 /// A retention setting in days: unset or 0 keeps forever.
 pub fn days(name: &str, raw: &str) -> Result<Option<u32>, String> {
