@@ -1715,7 +1715,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 50] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 51] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1766,7 +1766,21 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 50] = [
     migrate_disable_holds,
     migrate_custom_roles,
     migrate_residency_pins,
+    migrate_user_last_seen,
 ];
+
+/// When each user last used a session or API token (ADR 0144), kept on the user so it
+/// outlives the session row, which is pruned 30 days after it stops working.
+fn migrate_user_last_seen(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'last_seen_at'", [], |r| r.get(0))?;
+    if !has {
+        c.execute_batch(
+            "ALTER TABLE users ADD COLUMN last_seen_at INTEGER;
+             UPDATE users SET last_seen_at = (SELECT max(s.last_seen_at) FROM sessions s WHERE s.user_id = users.id);",
+        )?;
+    }
+    Ok(())
+}
 
 /// Contractual residency pins (ADR 0129): one per user or team at most.
 fn migrate_residency_pins(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
@@ -4738,7 +4752,7 @@ impl Db {
         let at = now();
         run(
             "UPDATE users SET email = NULL, display_name = ?2, role = 'readonly', status = 'disabled', idp_issuer = NULL, idp_subject = NULL,
-               last_login_at = NULL, last_login_method = NULL, last_login_idp_provider = NULL, tier = NULL, role_id = NULL,
+               last_login_at = NULL, last_login_method = NULL, last_login_idp_provider = NULL, last_seen_at = NULL, tier = NULL, role_id = NULL,
                erased_at = ?3, erased_by = ?4, erased_as = ?5, updated_at = ?3
              WHERE id = ?1",
             &[&user_id, &ERASED_NAME, &at, &by, &pseudonym],
@@ -5785,9 +5799,16 @@ impl Db {
     }
 
     /// Records use, at most once a minute per session to keep writes down. The idle
-    /// window is therefore up to a minute shorter than configured.
+    /// window is therefore up to a minute shorter than configured. The user's own
+    /// `last_seen_at` follows, for the health score's adoption (ADR 0144).
     pub fn touch_session(&self, id: &str, at: i64) {
-        let _ = self.c().execute("UPDATE sessions SET last_seen_at = ?1 WHERE id = ?2 AND last_seen_at <= ?1 - 60000", params![at, id]);
+        let c = self.c();
+        if c.execute("UPDATE sessions SET last_seen_at = ?1 WHERE id = ?2 AND last_seen_at <= ?1 - 60000", params![at, id]).unwrap_or(0) > 0 {
+            let _ = c.execute(
+                "UPDATE users SET last_seen_at = ?1 WHERE id = (SELECT user_id FROM sessions WHERE id = ?2) AND coalesce(last_seen_at, 0) < ?1",
+                params![at, id],
+            );
+        }
     }
 
     /// Every live session of one user, newest first, with no cap.
@@ -6629,7 +6650,7 @@ impl Db {
     pub fn people_active_since(&self, since: i64) -> (u64, u64) {
         self.c()
             .query_row(
-                "SELECT COUNT(*), COALESCE(SUM(u.last_login_at >= ?1 OR EXISTS (SELECT 1 FROM sessions s WHERE s.user_id = u.id AND s.last_seen_at >= ?1)), 0)
+                "SELECT COUNT(*), COALESCE(SUM(u.last_login_at >= ?1 OR u.last_seen_at >= ?1 OR EXISTS (SELECT 1 FROM sessions s WHERE s.user_id = u.id AND s.last_seen_at >= ?1)), 0)
                  FROM users u WHERE u.status = 'active' AND u.id != ?2",
                 params![since, crate::users::OPERATOR],
                 |r| Ok((r.get::<_, i64>(0)?.max(0) as u64, r.get::<_, i64>(1)?.max(0) as u64)),
@@ -8691,6 +8712,24 @@ mod tests {
         assert_eq!(n as usize, MAX_PUSH_DEVICES, "the oldest go");
         db.c().execute("DELETE FROM sessions WHERE id = ?", [&s2]).unwrap();
         assert!(db.session_push_device(&s2).is_none(), "a pruned session takes its device");
+    }
+
+    #[test]
+    fn activity_outlives_the_session_it_was_seen_on() {
+        let db = Db::open(&temp_path("last-seen").join("app.sqlite")).unwrap();
+        let day = 86_400_000;
+        let seen = db.create_user(None, Some("seen@example.com"), "Seen", Role::Member).unwrap();
+        db.create_user(None, Some("idle@example.com"), "Idle", Role::Member).unwrap();
+        let token = NewSession { user_id: &seen.id, token_hash: "h1", kind: "token", method: "code", idp_subject: None, idp_provider: None, label: None, ip: None, user_agent: None, expires_at: now() + day, mfa: None };
+        let s = db.create_session(&token);
+        db.c().execute("UPDATE sessions SET created_at = ?1, last_seen_at = ?1", [now() - 120 * day]).unwrap();
+        db.c().execute("UPDATE users SET last_login_at = ?1 WHERE last_login_at IS NOT NULL", [now() - 120 * day]).unwrap();
+        db.touch_session(&s.id, now() - 50 * day);
+        db.prune_sessions(now() + 2 * day, day, 365 * day);
+        let left: i64 = db.c().query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0, "the token's session is gone");
+        assert_eq!(db.people_active_since(now() - 90 * day), (2, 1), "the token was used 50 days ago");
+        assert_eq!(db.people_active_since(now() - 30 * day), (2, 0));
     }
 
     #[test]
