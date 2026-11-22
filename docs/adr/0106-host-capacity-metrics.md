@@ -46,7 +46,7 @@ The same families for every host, labelled `host` and `kind` (`server` or `incus
 | `superbot_host_reading_timestamp_seconds` | When the host was last read; 0 if never |
 
 - **botd's own host** is `host="botd"`, read at each scrape: online CPUs (`sysconf`), `/proc/loadavg`, `/proc/meminfo` (used is all but `MemAvailable`), and `statvfs` on `DATA_DIR` (`disk="data"`) and on `WORKSPACE_DIR` (`disk="workspace"`, only if it's another filesystem). Disk used is all but what botd may still write, so root's reserved blocks count as used, as `df` shows. In a container, `/proc` shows the Docker host's figures: still the server's host.
-- **Incus hosts** are read in the host check botd already makes each reconcile (`MACHINE_RECONCILE_SECONDS`, ADR 0076), after a host answers it: `GET /1.0/resources` (CPU threads, memory, and load with the `resources_load` extension) and `GET /1.0/storage-pools/<pool>/resources` (`disk="pool"`). It isn't read at scrape time, so a scrape makes no network calls and a slow host can't hold it up. A read that fails keeps the last one, its age shows on the timestamp, it's logged once until a read works again, and it never makes a host down: answering the check decides that.
+- **Incus hosts** are read every `MACHINE_RECONCILE_SECONDS`, each host that is up (ADR 0076): `GET /1.0/resources` (CPU threads, memory, and load with the `resources_load` extension) and `GET /1.0/storage-pools/<pool>/resources` (`disk="pool"`). It runs on its own, apart from host checks and reconciling, reads every host at once and gives each 10 seconds, so a host slow to answer holds up neither the others nor machines. It isn't read at scrape time either, so a scrape makes no network calls. A read that fails or runs out of time keeps the last one, its age shows on the timestamp, it's logged once until a read works again, and it never makes a host down: answering the check decides that.
 - **Only with `/metrics` on.** botd reads Incus hosts only when `METRICS_LISTEN` is set, so a server without metrics makes no extra calls. botd's own host is read only when scraped.
 
 ### Labels stay bounded
@@ -68,20 +68,20 @@ The new label values are the operator's own host names (`INCUS_HOSTS`, plus `bot
 | `SuperBotHostCPUSaturated` | Load over 1.5 per CPU for 30 minutes | ticket |
 | `SuperBotIncusHostReadingStale` | An Incus host answers but hasn't been read for 15 minutes | ticket |
 
-Room left counts only open hosts: a drained or failing host's room isn't room for anything new. It's measured across the fleet, not per host, because `INCUS_PLACEMENT=fill` fills each host before the next by design. What a host uses is alerted per host.
+Room left counts only open hosts: a drained or failing host's room isn't room for anything new. It's measured across each botd's fleet, not per host, because `INCUS_PLACEMENT=fill` fills each host before the next by design. The fleet alerts group by `instance` too: botd servers scraped in one job each place machines on their own hosts, so one's spare room or open host mustn't hide another's. What a host uses is alerted per host. The dashboard shows one botd at a time for the same reason.
 
 [`deploy/grafana/superbot-capacity.json`](../../deploy/grafana/superbot-capacity.json) is a Grafana dashboard of all of it, with the alerts' thresholds drawn on its panels. A test renders `/metrics` against two Incus stand-ins and fails if the dashboard or the rules use a metric botd doesn't write.
 
 ### Tests
 
 - **Unit**: parsing `/proc/loadavg` and `/proc/meminfo`; botd's own host read for real, one disk per filesystem; each family written once with a sample per host that has it; Incus's resources and pool resources against the stand-in, without `resources_load`, and with a pool that won't say; a failed read keeps the last and is logged once.
-- **Against stand-ins** (`machines_placement_tests`): two Incus hosts with capacities. With metrics off, no host is asked; allocation, capacity, the maximum, up and open are shown. With them on, each check reads both hosts. A host that stops answering is neither up nor open and keeps its last reading; a drained host is up but not open; a pool that stops saying drops its disk. No email, machine id, label or address reaches the new lines. A machine waiting for room shows in the gauge and leaves it when made.
+- **Against stand-ins** (`machines_placement_tests`): two Incus hosts with capacities. With metrics off, no host is asked; allocation, capacity, the maximum, up and open are shown. With them on, a reading reads both hosts; a host that never answers it holds up neither host checks, reconciling, nor reading the other, and keeps its last reading. A host that stops answering is neither up nor open and keeps its last reading; a drained host is up but not open; a pool that stops saying drops its disk. No email, machine id, label or address reaches the new lines. A machine waiting for room shows in the gauge and leaves it when made.
 - **Real Incus** (the `incus-e2e` workflow, ADR 0069): the host's resources and pool space parse.
 
 ## Consequences
 
 - Operators see a fleet filling before placement refuses, and a pool or botd's own disk filling before writes fail, in the monitoring system they already scrape botd with.
 - A scrape now also reads every machine once more for placement's load, and does a `statvfs` or two: negligible at the hundreds of machines ADR 0089 sized scrapes for.
-- With metrics on, each host check makes two more small calls per Incus host.
+- With metrics on, botd makes two more small calls per Incus host each reconcile interval.
 - Incus memory "used" is Incus's own figure; botd's is all but `MemAvailable`. Both are what each system calls used, not the same formula.
 - Not covered: Linode machines' hosts (Linode's), each machine's own CPU and memory (its agent's heartbeat has disk only), node_exporter-level detail (network, disk I/O, inodes), and dashboards for requests and runs (CC2.1-1).
