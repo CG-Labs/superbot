@@ -121,6 +121,14 @@ async fn the_csv_has_a_dated_row_per_person_and_its_export_is_audited() {
     assert!(owner.contains("all (admin)") && owner.contains(",admin,active,false,true,"), "{owner}");
     let ev = events(port, &admin, "access_review.exported").await;
     assert_eq!((ev.len(), ev[0]["details"]["digest"].as_str(), ev[0]["actorId"].as_str()), (1, Some(digest.as_str()), Some("operator")));
+
+    // Asked for the report on screen: the same one exports, a changed one is refused.
+    let url = format!("/api/access-review/export.csv?digest={digest}");
+    assert_eq!(call_with(port, "GET", &url, &admin, "", "").await.0, 200);
+    let _ = user_with(port, &admin, "new@example.com", "member").await;
+    let (code, _, body) = call_with(port, "GET", &url, &admin, "", "").await;
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(events(port, &admin, "access_review.exported").await.len(), 2);
 }
 
 #[tokio::test]
@@ -152,6 +160,7 @@ async fn a_reviewer_signs_off_on_the_report_they_saw() {
     let ev = &events(port, &admin, "access_review.completed").await[0];
     assert_eq!((ev["actorEmail"].as_str(), ev["authMethod"].as_str(), ev["targetType"].as_str()), (Some("lee@example.com"), Some("code"), Some("access_review")));
     assert!(ev["sessionId"].is_string() && ev["time"].is_string());
+    assert_eq!(review["eventId"], ev["id"]);
     assert_eq!(report(port, &admin).await["reviews"][0]["eventId"], ev["id"]);
 
     // Access changes: the old digest no longer signs anything off.

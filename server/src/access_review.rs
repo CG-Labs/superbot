@@ -11,7 +11,7 @@ use crate::rbac::{Principal, Role};
 use crate::users::{SessionConfig, OPERATOR};
 use crate::{bad, need_user, ApiError, App, AppState, Auth, Res};
 use crate::audit::{self, Who};
-use axum::extract::{Extension, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -88,7 +88,7 @@ fn person(app: &App, a: &Auth, u: &User, at: i64, names: &HashMap<&str, &str>, m
             })
             .collect()
     };
-    let live = app.db.live_sessions(Some(&u.id), at, a.sessions.idle_ms, a.sessions.max_ms);
+    let live = app.db.user_live_sessions(&u.id, at, a.sessions.idle_ms, a.sessions.max_ms);
     let (tokens, browsers): (Vec<&Session>, Vec<&Session>) = live.iter().partition(|s| s.kind == "token");
     let machine = app.db.user_machine(&u.id);
     let mfa_at = mfa.get(&u.id).copied();
@@ -235,10 +235,15 @@ pub async fn get(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>
     })))
 }
 
-/// `GET /api/access-review/export.csv`: one row per person, dated, with the digest.
-pub async fn export(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>) -> Result<Response, ApiError> {
+/// `GET /api/access-review/export.csv[?digest=]`: one row per person, dated, with the
+/// digest. With `digest`, a report that no longer matches is a 409, so the file is the
+/// report on screen.
+pub async fn export(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Query(q): Query<HashMap<String, String>>) -> Result<Response, ApiError> {
     need_user(who)?;
     let r = build(&app, &a);
+    if q.get("digest").is_some_and(|d| !crate::same(d.trim().as_bytes(), r.digest.as_bytes())) {
+        return Err(changed());
+    }
     app.db.record(&by.event(EXPORTED).target("access_review", &r.digest[..16]).details(json!({ "digest": r.digest, "summary": r.summary() })));
     let stamp = chrono::DateTime::from_timestamp_millis(r.generated_at).unwrap_or_default().format("%Y%m%d-%H%M%S");
     let headers = [
@@ -263,10 +268,18 @@ pub async fn complete(State(app): State<AppState>, Extension(a): Extension<Arc<A
     };
     let r = build(&app, &a);
     if !crate::same(digest.as_bytes(), r.digest.as_bytes()) {
-        return Err(ApiError(StatusCode::CONFLICT, "Access changed since this report was loaded. Reload it and review again.".into()));
+        return Err(changed());
     }
     let details = json!({ "digest": r.digest, "generatedAt": r.generated_at, "summary": r.summary(), "notes": notes });
-    app.db.record(&by.event(COMPLETED).target("access_review", &r.digest[..16]).details(details));
-    let review = reviews(&app).into_iter().find(|e| e["digest"] == r.digest.as_str() && e["reviewer"]["id"] == json!(by.actor.id)).unwrap_or(Value::Null);
+    let id = app.db.try_record(&by.event(COMPLETED).target("access_review", &r.digest[..16]).details(details)).map_err(|err| {
+        crate::obs::log::log_warn!("access review: could not save the sign-off: {err}");
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Couldn't save the sign-off; see the server log.".into())
+    })?;
+    let f = audit::Filter { actions: vec![COMPLETED.into()], actor_id: by.actor.id.clone(), ..Default::default() };
+    let review = app.db.audit_events(&f, RECENT_REVIEWS, false).iter().find(|e| e.id == id).map(review_view).unwrap_or(Value::Null);
     Ok((StatusCode::CREATED, Json(json!({ "review": review }))))
+}
+
+fn changed() -> ApiError {
+    ApiError(StatusCode::CONFLICT, "Access changed since this report was loaded. Reload it and review again.".into())
 }

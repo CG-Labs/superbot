@@ -4677,6 +4677,14 @@ impl Db {
         let _ = self.c().execute("UPDATE sessions SET last_seen_at = ?1 WHERE id = ?2 AND last_seen_at <= ?1 - 60000", params![at, id]);
     }
 
+    /// Every live session of one user, newest first, with no cap.
+    pub fn user_live_sessions(&self, user_id: &str, at: i64, idle_ms: i64, max_ms: i64) -> Vec<Session> {
+        let c = self.c();
+        let sql = format!("SELECT s.* FROM sessions s WHERE s.user_id = ?4 AND {SESSION_LIVE} ORDER BY s.created_at DESC, s.id");
+        let mut s = c.prepare(&sql).unwrap();
+        s.query_map(params![at, idle_ms, max_ms, user_id], session_row).unwrap().filter_map(Result::ok).collect()
+    }
+
     /// Live sessions, newest first, optionally for one user.
     pub fn live_sessions(&self, user_id: Option<&str>, at: i64, idle_ms: i64, max_ms: i64) -> Vec<Session> {
         let c = self.c();
@@ -5330,6 +5338,14 @@ impl Db {
     /// Writes one event. `details` is scrubbed of secrets; free text (names, the user
     /// agent) is masked the same way; everything is clipped.
     pub fn record(&self, e: &audit::Event) {
+        if let Err(err) = self.try_record(e) {
+            crate::obs::log::log_warn!("audit: could not record {}: {err}", e.action);
+        }
+    }
+
+    /// [`Db::record`] for when saving the event is the operation itself: returns the
+    /// new event's id, or the error.
+    pub fn try_record(&self, e: &audit::Event) -> rusqlite::Result<i64> {
         let o = |v: &Option<String>, max: usize| v.as_deref().map(|s| audit::clip(s, max));
         let a = &e.actor;
         let bot_actor = matches!(a.kind, audit::ActorKind::Bot).then_some(a.id.as_deref()).flatten();
@@ -5337,7 +5353,8 @@ impl Db {
         let owners: Vec<&str> = owners.iter().map(String::as_str).collect();
         let text = |v: &Option<String>, max: usize| v.as_deref().map(|s| audit::clip(&redact::text_for(&owners, &audit::redact_text(s)), max));
         let details = redact::value_for(&owners, audit::scrub(e.details.clone())).to_string();
-        let res = self.c().execute(
+        let c = self.c();
+        let res = c.execute(
             "INSERT INTO audit_events (at, actor_kind, actor_id, actor_name, actor_subject, action, target_type, target_id, bot_id, outcome, ip, user_agent, details,
                actor_email, actor_role, auth_method, idp, idp_provider, session_id, on_behalf_of)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -5364,10 +5381,10 @@ impl Db {
                 o(&a.on_behalf_of, 128),
             ],
         );
-        if let Err(err) = res {
-            crate::obs::log::log_warn!("audit: could not record {}: {err}", e.action);
-        }
+        let res = res.map(|_| c.last_insert_rowid());
+        drop(c);
         self.metrics().audited(&e.action, e.outcome.as_str(), e.details.get("reason").and_then(|r| r.as_str()));
+        res
     }
 
     /// Newest first (or oldest first with `oldest_first`), filtered, at most `limit`.
