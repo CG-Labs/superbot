@@ -249,6 +249,8 @@ async fn main() {
     };
     let observe = obs::Settings::from_env(&|k| env(k, ""), &secrets::env::EnvStore::process()).unwrap_or_else(|e| exit(format!("Observability: {e}")));
     obs::log::set_format(observe.log);
+    obs::errors::install_panic_hook();
+    obs::errors::start(&observe.errors);
     let status_page = status::Page::parse(&env("STATUS_PAGE", "")).unwrap_or_else(|e| exit(e));
     let break_glass = users::break_glass_flag(&env("AUTH_BREAK_GLASS", "")).unwrap_or_else(|e| exit(e));
     let mfa_pinned = mfa::policy_flag(&env("AUTH_MFA", "")).unwrap_or_else(|e| exit(e));
@@ -638,6 +640,7 @@ async fn main() {
         "license": license.summary(),
         "logFormat": observe.log.as_str(),
         "metrics": observe.metrics.as_ref().map(|m| json!({ "loopback": m.addr.ip().is_loopback(), "token": m.token.is_some() })),
+        "errorReports": observe.errors.dsn.is_some(),
         "statusPage": status_page,
         "serverBackups": server_backups_summary,
     })));
@@ -959,6 +962,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
                 .layer(Extension(auth_state)),
         )
         .layer(cors_layer())
+        .layer(obs::catch_panics())
         .layer(middleware::from_fn_with_state(app.clone(), obs::track))
         .with_state(app)
 }
