@@ -53,7 +53,8 @@ jobs:
       # Dev dependencies too: Electron is one, and the desktop app ships inside it.
       - name: Report every advisory
         run: npm audit --package-lock-only || true
-      # Critical only: markdown-it (via react-native-markdown-display, no fixed release) is
-      # High and tracked in the SOC 2 readiness checklist (CC7.1-2) until it's replaced.
-      - name: Fail on critical advisories
-        run: npm audit --package-lock-only --audit-level=critical
+      # High and above fail (ADR 0092, ADR 0115). npm has no per-advisory ignore list, so a High
+      # with no fix is replaced or overridden; an accepted one is listed, with its reason, in the
+      # SOC 2 readiness checklist (CC7.1-2).
+      - name: Fail on high and critical advisories
+        run: npm audit --package-lock-only --audit-level=high
