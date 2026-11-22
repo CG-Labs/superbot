@@ -41,7 +41,7 @@ Back up now: `sudo systemctl start superbot-backup.service`. Check runs: `system
 
 ## Off-site copies
 
-botd copies each new archive to S3-compatible storage (AWS S3, Cloudflare R2, Backblaze B2, MinIO, ...) within a minute of `superbot-backup` writing it ([ADR 0109](../adr/0109-server-backups-off-the-host.md)). Give it a bucket of its own, ideally in another account than the machines' (the keys need put, get and delete on the prefix, or only put and get with `SERVER_BACKUP_RETENTION_DAYS=off`):
+botd copies each new archive to S3-compatible storage (AWS S3, Cloudflare R2, Backblaze B2, MinIO, ...) within a minute of `superbot-backup` writing it ([ADR 0109](../adr/0109-server-backups-off-the-host.md)). Give it a bucket of its own, ideally in another account than the machines' (the keys need put, get, delete and the multipart actions on the prefix, including listing and aborting uploads, or no delete with `SERVER_BACKUP_RETENTION_DAYS=off`; a bucket rule that aborts incomplete multipart uploads after a day is a good backstop):
 
 ```sh
 # installer: keys from the environment, never flags

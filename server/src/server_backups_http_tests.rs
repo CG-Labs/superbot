@@ -420,8 +420,24 @@ async fn a_copy_cut_off_by_a_restart_ends_as_failed() {
     let n = db::NewServerBackup { id: "sbcut", archive: &name, destination: &dest, object_key: "superbot/server/x", created_at: db::now() - HOUR, encrypted_by: None };
     s.app.db.server_backup_start(&n).unwrap();
     assert!(server_backups::pass(&s.app).await.is_none(), "one copy at a time");
+    // Its parts are left in the store, beside another writer's upload under the prefix.
+    s.s3.leave_unfinished("superbot/server/x", HOUR);
+    s.s3.leave_unfinished("superbot/server/x2", HOUR);
     server_backups::start(s.app.clone());
     let b = s.app.db.server_backup("sbcut").unwrap();
     assert_eq!((b.state.as_str(), b.error.as_deref()), ("failed", Some("botd stopped while it was running")));
     assert_eq!(audit(&s, "server.backup_copy_failed").await.len(), 1);
+    for _ in 0..100 {
+        if s.s3.unfinished().len() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(s.s3.unfinished(), ["superbot/server/x2"], "only the cut-off copy's parts go");
+
+    // An upload of the same key begun since botd started is a new copy's: left alone.
+    let t = s.app.server_backups.get().unwrap().target.as_ref().unwrap();
+    s.s3.leave_unfinished("superbot/server/x", 0);
+    assert_eq!(server_backups::abort_cut_off(t, std::slice::from_ref(&b), db::now() - 60_000).await, 0);
+    assert_eq!(server_backups::abort_cut_off(t, &[b], db::now() + 1000).await, 1);
 }

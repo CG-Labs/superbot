@@ -559,14 +559,31 @@ pub async fn pass(app: &AppState) -> Option<ServerBackup> {
 }
 
 /// What a botd that stopped mid-copy left: copies running end as failed. Their uploads
-/// were never completed, so the store holds nothing of them.
-fn interrupted(app: &App) {
+/// were never completed, so the store holds no object of them, only parts. Returns them.
+fn interrupted(app: &App) -> Vec<ServerBackup> {
+    let mut cut = Vec::new();
     for b in app.db.server_backups_in("running") {
         if app.db.server_backup_end(&b.id, None, Some("botd stopped while it was running")) {
             let d = json!({ "archive": b.archive, "object": b.object_key, "error": "interrupted" });
             app.db.record(&event("server.backup_copy_failed", &b, d).outcome(Outcome::Failure));
+            cut.push(b);
         }
     }
+    cut
+}
+
+/// Aborts the parts copies cut off by a restart left in this store, uploads begun before
+/// `before` only, so a copy started since is never touched. Returns how many went.
+pub async fn abort_cut_off(t: &Target, cut: &[ServerBackup], before: i64) -> usize {
+    let dest = t.destination();
+    let mut gone = 0;
+    for b in cut.iter().filter(|b| b.destination == dest) {
+        match t.s3.abort_unfinished(&b.object_key, before).await {
+            Ok(n) => gone += n,
+            Err(e) => crate::obs::log::log_warn!("Server backups: aborting the upload of {} a restart cut off: {e}", b.archive),
+        }
+    }
+    gone
 }
 
 /// Copies archives off the host from startup, when a store is set, and checks the RPO on
@@ -579,7 +596,7 @@ pub fn start(app: AppState) {
         return;
     };
     mark_since(&app, t);
-    interrupted(&app);
+    let (started, cut) = (now(), interrupted(&app));
     let (a, s) = (app.clone(), sb.clone());
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(EVERY);
@@ -590,6 +607,9 @@ pub fn start(app: AppState) {
         }
     });
     tokio::spawn(async move {
+        if let Some(t) = &sb.target {
+            abort_cut_off(t, &cut, started).await;
+        }
         let mut tick = tokio::time::interval(EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

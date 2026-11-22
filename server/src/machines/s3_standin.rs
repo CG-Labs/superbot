@@ -14,10 +14,14 @@ pub const BUCKET: &str = "backups";
 pub const ACCESS_KEY: &str = "AKIDSTANDIN";
 pub const SECRET: &str = "standin-secret-key-0123456789";
 
+/// An unfinished multipart upload: its key, when it began, and its parts.
+type Unfinished = (String, i64, BTreeMap<u32, Vec<u8>>);
+
 #[derive(Default)]
 pub struct World {
     pub objects: BTreeMap<String, Vec<u8>>,
-    uploads: BTreeMap<String, (String, BTreeMap<u32, Vec<u8>>)>,
+    /// By upload id.
+    uploads: BTreeMap<String, Unfinished>,
     /// `METHOD path?query`, in order.
     pub calls: Vec<String>,
     /// The next request with this method fails with this status.
@@ -54,6 +58,19 @@ impl StandIn {
     /// Keys stored, in order.
     pub fn keys(&self) -> Vec<String> {
         self.w().objects.keys().cloned().collect()
+    }
+
+    /// The keys of unfinished multipart uploads.
+    pub fn unfinished(&self) -> Vec<String> {
+        self.w().uploads.values().map(|(k, _, _)| k.clone()).collect()
+    }
+
+    /// Leaves an upload of `key` unfinished, begun `ago` ms back, as a writer that stopped would.
+    pub fn leave_unfinished(&self, key: &str, ago: i64) {
+        let mut w = self.w();
+        w.next += 1;
+        let id = format!("upload-{}", w.next);
+        w.uploads.insert(id, (key.into(), crate::db::now() - ago, BTreeMap::from([(1, b"half".to_vec())])));
     }
 }
 
@@ -115,6 +132,16 @@ async fn handle(State(world): State<Arc<Mutex<World>>>, method: Method, uri: Uri
     };
     let key = rest.trim_start_matches('/').to_string();
     match (method.as_str(), key.is_empty()) {
+        ("GET", true) if query.contains_key("uploads") => {
+            let prefix = query.get("prefix").cloned().unwrap_or_default();
+            let mut out = String::from("<ListMultipartUploadsResult>");
+            for (id, (k, at, _)) in w.uploads.iter().filter(|(_, (k, _, _))| k.starts_with(&prefix)) {
+                let at = chrono::DateTime::from_timestamp_millis(*at).unwrap_or_default().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                out.push_str(&format!("<Upload><Key>{k}</Key><UploadId>{id}</UploadId><Initiated>{at}</Initiated></Upload>"));
+            }
+            out.push_str("</ListMultipartUploadsResult>");
+            xml(StatusCode::OK, out)
+        }
         ("GET", true) => {
             let prefix = query.get("prefix").cloned().unwrap_or_default();
             let mut out = String::from("<ListBucketResult>");
@@ -126,7 +153,7 @@ async fn handle(State(world): State<Arc<Mutex<World>>>, method: Method, uri: Uri
         }
         ("PUT", false) => match (query.get("partNumber"), query.get("uploadId")) {
             (Some(n), Some(id)) => {
-                let Some((_, parts)) = w.uploads.get_mut(id) else { return error(StatusCode::NOT_FOUND, "NoSuchUpload") };
+                let Some((_, _, parts)) = w.uploads.get_mut(id) else { return error(StatusCode::NOT_FOUND, "NoSuchUpload") };
                 parts.insert(n.parse().unwrap_or(0), body.to_vec());
                 (StatusCode::OK, [("etag", format!("\"{}\"", s3::sha256_hex(&body)))]).into_response()
             }
@@ -138,12 +165,12 @@ async fn handle(State(world): State<Arc<Mutex<World>>>, method: Method, uri: Uri
         ("POST", false) if query.contains_key("uploads") => {
             w.next += 1;
             let id = format!("upload-{}", w.next);
-            w.uploads.insert(id.clone(), (key.clone(), BTreeMap::new()));
+            w.uploads.insert(id.clone(), (key.clone(), crate::db::now(), BTreeMap::new()));
             xml(StatusCode::OK, format!("<InitiateMultipartUploadResult><Key>{key}</Key><UploadId>{id}</UploadId></InitiateMultipartUploadResult>"))
         }
         ("POST", false) if query.contains_key("uploadId") => {
             let id = &query["uploadId"];
-            let Some((k, parts)) = w.uploads.remove(id) else { return error(StatusCode::NOT_FOUND, "NoSuchUpload") };
+            let Some((k, _, parts)) = w.uploads.remove(id) else { return error(StatusCode::NOT_FOUND, "NoSuchUpload") };
             let text = String::from_utf8_lossy(&body).to_string();
             let mut data = Vec::new();
             for p in text.split("<Part>").skip(1) {

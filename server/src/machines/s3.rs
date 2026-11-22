@@ -315,6 +315,25 @@ impl S3 {
         }
     }
 
+    /// Aborts unfinished multipart uploads of exactly `key` started before `before` (ms),
+    /// such as one cut off by a restart. Returns how many went.
+    pub async fn abort_unfinished(&self, key: &str, before: i64) -> Result<usize, String> {
+        let res = self.send(Method::GET, None, &[("prefix", key), ("uploads", "")], Vec::new()).await?;
+        let xml = S3::text(res).await?;
+        let mut gone = 0;
+        for u in xml.split("<Upload>").skip(1) {
+            let started = tag(u, "Initiated").and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok()).map(|t| t.timestamp_millis());
+            if let (Some(k), Some(id)) = (tag(u, "Key"), tag(u, "UploadId"))
+                && k == key
+                && started.is_some_and(|s| s < before)
+            {
+                self.send(Method::DELETE, Some(key), &[("uploadId", &id)], Vec::new()).await?;
+                gone += 1;
+            }
+        }
+        Ok(gone)
+    }
+
     /// Starts writing `key` in parts.
     pub async fn upload(&self, key: &str) -> Result<Upload<'_>, String> {
         let res = self.send(Method::POST, Some(key), &[("uploads", "")], Vec::new()).await?;
