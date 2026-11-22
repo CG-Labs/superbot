@@ -499,7 +499,7 @@ pub trait Mailer: Send + Sync {
 impl Mailer for smtp::Smtp {
     fn deliver<'a>(&'a self, mail: &'a smtp::Mail) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            let password = crate::secrets::global().get(smtp::PASSWORD).ok().flatten();
+            let password = crate::notify::needed(smtp::PASSWORD)?;
             let mut results = self.send(password.as_ref().map(|p| p.expose()), std::slice::from_ref(mail)).await?;
             results.pop().unwrap_or_else(|| Err("the mail server didn't answer".into()))
         })
