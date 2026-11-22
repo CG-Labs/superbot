@@ -527,6 +527,16 @@ set_env_var() {
   fi
 }
 
+unset_env_var() {
+  local file=$1 key=$2 tmp
+  grep -q "^${key}=" "$file" || return 0
+  tmp=$(mktemp)
+  K=$key awk 'index($0, ENVIRON["K"] "=") != 1' "$file" >"$tmp" && cat "$tmp" >"$file"
+  local rc=$?
+  rm -f "$tmp"
+  return "$rc"
+}
+
 configure_env() {
   local home repo_path env_file pass_file
   home=$(user_home)
@@ -626,8 +636,9 @@ configure_backup_target() {
     [[ -z "$BACKUP_S3_REGION" ]] || set_env_var "$env_file" SERVER_BACKUP_S3_REGION "$BACKUP_S3_REGION"
     [[ -z "$BACKUP_S3_PREFIX" ]] || set_env_var "$env_file" SERVER_BACKUP_S3_PREFIX "$BACKUP_S3_PREFIX"
   fi
+  # botd refuses a key set both ways, so a key given now replaces its _FILE too.
   for key in SERVER_BACKUP_S3_ACCESS_KEY_ID SERVER_BACKUP_S3_SECRET_ACCESS_KEY; do
-    [[ -z "${!key:-}" ]] || set_env_var "$env_file" "$key" "${!key}"
+    [[ -z "${!key:-}" ]] || { set_env_var "$env_file" "$key" "${!key}" && unset_env_var "$env_file" "${key}_FILE"; }
   done
   [[ -z "$BACKUP_AGE_RECIPIENTS" ]] || set_env_var "$env_file" SUPERBOT_BACKUP_AGE_RECIPIENTS "$BACKUP_AGE_RECIPIENTS"
   [[ -z "$BACKUP_OFF_HOST" ]] || set_env_var "$env_file" SERVER_BACKUP_OFF_HOST "$BACKUP_OFF_HOST"

@@ -167,6 +167,14 @@ if grep -q 'Server backups stay on this host' <<<"$(DOMAIN=ci.example.com summar
 BACKUP_S3_ENDPOINT="" BACKUP_S3_BUCKET="" BACKUP_S3_REGION="" BACKUP_AGE_RECIPIENTS=""
 SUPERBOT_USER=$(id -un) DRY_RUN=false configure_env >/dev/null
 grep -qxF SERVER_BACKUP_S3_SECRET_ACCESS_KEY=ci-secret-0123 "$env_file" || fail "an upgrade dropped the store's keys"
+# A key kept in a file, then replaced from the environment: only the new key stays, as
+# botd refuses a key set both ways.
+unset_env_var "$env_file" SERVER_BACKUP_S3_SECRET_ACCESS_KEY
+printf 'SERVER_BACKUP_S3_SECRET_ACCESS_KEY_FILE=/run/secrets/s3\n' >>"$env_file"
+SERVER_BACKUP_S3_SECRET_ACCESS_KEY=ci-secret-4567 SUPERBOT_USER=$(id -un) DRY_RUN=false configure_env >/dev/null
+grep -qxF SERVER_BACKUP_S3_SECRET_ACCESS_KEY=ci-secret-4567 "$env_file" || fail "the replacement key wasn't written"
+if grep -q '^SERVER_BACKUP_S3_SECRET_ACCESS_KEY_FILE=' "$env_file"; then fail "the replaced key's _FILE was kept"; fi
+grep -qxF SERVER_BACKUP_S3_ACCESS_KEY_ID=AKIDCI "$env_file" || fail "the other key was dropped"
 parse_args --backup-off-host off
 SUPERBOT_USER=$(id -un) DRY_RUN=false configure_env >/dev/null
 [[ "$(backup_destination "$env_file")" == "on this host only (SERVER_BACKUP_OFF_HOST=off)" ]] || fail "off, but: $(backup_destination "$env_file")"
