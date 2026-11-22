@@ -8,7 +8,7 @@ You give botd the new key as its master key and the old key as the **previous** 
 
 An encrypted database ([database encryption](database-encryption.md), [ADR 0116](../adr/0116-database-encrypted-at-rest.md)) is re-encrypted first: botd writes a copy under a key derived from the new master key, checks every table's rows came across, and swaps it in, before it seals values again. Each step can be repeated: a database already under the new key is left as it is, and one still under the old key is re-encrypted on the next start with both keys. No copy under the old key is kept.
 
-What is sealed again: saved secrets (`botctl secret set`, `/api/secrets`), each user's own secrets, approvals' tool input, push tokens, and TOTP secrets for two-factor sign-in. Derived keys, such as the machine CA, are kept, so enrolled machines keep working (see [after a leak](#after-a-leak)). Backup encryption uses age keys, not the master key ([backup guide](backup-restore.md#encryption)).
+What is sealed again: saved secrets (`botctl secret set`, `/api/secrets`), each user's own secrets, approvals' tool input, push tokens, TOTP secrets for two-factor sign-in, and native SAML providers' generated SP keys ([ADR 0137](../adr/0137-saml-signed-requests-and-single-logout.md)), so their certificates don't change. Derived keys, such as the machine CA, are kept, so enrolled machines keep working (see [after a leak](#after-a-leak)). Backup encryption uses age keys, not the master key ([backup guide](backup-restore.md#encryption)).
 
 | Setting | Meaning |
 |---------|---------|

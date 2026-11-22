@@ -924,6 +924,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/auth/sso/{id}/callback", get(sso::callback).post(sso::callback_post))
         .route("/auth/sso/{id}/acs", post(sso::acs))
         .route("/auth/sso/{id}/metadata", get(sso::saml_metadata))
+        .route("/auth/sso/{id}/slo", get(sso::slo_get).post(sso::slo_post))
         .route("/sso/{id}/saml", get(sso::saml_status))
         .route("/sso/{id}/saml/idp-metadata", put(sso::saml_import))
         .route("/users", get(users::list_users).post(users::create_user))
@@ -1395,8 +1396,9 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     // Signing in, the page to do it on, the public site, and asking for access need no credentials.
     let open = match method {
         Method::GET | Method::HEAD => path == "/login" || sso_path(&path).is_some() || site_file(&path).is_some() || path == "/api/signups/config" || path == plans::JSON_PATH,
-        // Apple posts its answer to the callback (response_mode=form_post), SAML IdPs theirs to the ACS.
-        Method::POST => path == "/api/auth/login" || matches!(sso_path(&path), Some("callback" | "acs")) || path == "/api/signups",
+        // Apple posts its answer to the callback (response_mode=form_post), SAML IdPs theirs to
+        // the ACS and their logout messages to the SLO URL.
+        Method::POST => path == "/api/auth/login" || matches!(sso_path(&path), Some("callback" | "acs" | "slo")) || path == "/api/signups",
         _ => false,
     };
     if open {
@@ -1478,11 +1480,11 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
 }
 
 /// `/api/auth/sso` (the list), `/api/auth/sso/{id}/start`, `/api/auth/sso/{id}/callback`, and native
-/// SAML's `/api/auth/sso/{id}/acs` and `/api/auth/sso/{id}/metadata`: which one.
+/// SAML's `/api/auth/sso/{id}/acs`, `/metadata`, and `/slo`: which one.
 fn sso_path(path: &str) -> Option<&str> {
     match path.strip_prefix("/api/auth/sso")? {
         "" => Some("list"),
-        rest => rest.strip_prefix('/').and_then(|r| r.split_once('/')).filter(|(id, step)| !id.is_empty() && !id.contains('/') && matches!(*step, "start" | "callback" | "acs" | "metadata")).map(|(_, step)| step),
+        rest => rest.strip_prefix('/').and_then(|r| r.split_once('/')).filter(|(id, step)| !id.is_empty() && !id.contains('/') && matches!(*step, "start" | "callback" | "acs" | "metadata" | "slo")).map(|(_, step)| step),
     }
 }
 
