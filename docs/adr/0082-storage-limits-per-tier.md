@@ -25,6 +25,8 @@ Managed tiers already cap Bots, runs, routine runs, tokens and machine size. Not
 
 ### Machines: a known gap
 
+Closed by [ADR 0105](0105-machine-disk-use-in-storage-limits.md): what a machine's homes hold now counts. As first decided:
+
 - Users whose Bots run on their own machine ([ADR 0025](0025-control-plane-linode.md), [ADR 0065](0065-incus-container-machines.md)) have most files on that machine's disk. Heartbeats don't report disk use yet, so botd counts only what it holds for them, and the view says `onMachine: true`. The tier's `machineType` already bounds that disk. Reporting it from the machine is follow-up work.
 
 ### Warning and refusal
@@ -50,5 +52,5 @@ Managed tiers already cap Bots, runs, routine runs, tokens and machine size. Not
 
 - Managed tiers can sell storage, and one user can no longer fill the server unnoticed.
 - Full users can still read their chats and delete files or Bots; they just can't start new work until under the cap.
-- Machine users' numbers are low until machines report disk use.
+- Machine users' numbers are low until machines report disk use ([ADR 0105](0105-machine-disk-use-in-storage-limits.md) now counts it).
 - Deleting chat history to free space isn't possible, so it isn't counted; if it grows large, it needs its own limit.
