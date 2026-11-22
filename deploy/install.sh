@@ -40,6 +40,20 @@ BACKUP_IDENTITY_FILE=${BACKUP_IDENTITY_FILE:-/root/superbot-backup-identity.txt}
 DATABASE_ENCRYPTION=""
 # --testing-mode: run unlicensed with billing off (TESTING_MODE=on; docs/adr/0068-no-free-tier.md).
 TESTING_MODE_ON=false
+# Air-gapped installs (docs/adr/0128-air-gapped-self-host.md, docs/ops/air-gapped.md): --offline
+# installs or upgrades from a bundle deploy/offline-bundle.sh made, with no network at all.
+OFFLINE_BUNDLE=""
+OFFLINE_BUNDLE_SHA256=""
+OFFLINE_DIR=""
+OFFLINE_RELEASE_FILE=${OFFLINE_RELEASE_FILE:-}
+OFFLINE_BINARIES=(botd botctl superbot-machine superbot-run)
+# Who may sign a bundle's SHA256SUMS (cosign keyless), checked when the bundle carries a signature.
+OFFLINE_SIGNER_IDENTITY_REGEXP=${OFFLINE_SIGNER_IDENTITY_REGEXP:-'^https://github\.com/CG-Labs/superbot/\.github/workflows/offline\.yml@refs/(heads/main|tags/v[0-9A-Za-z.+-]+)$'}
+OFFLINE_SIGNER_ISSUER=${OFFLINE_SIGNER_ISSUER:-https://token.actions.githubusercontent.com}
+# --tls-cert/--tls-key: the operator's certificate for --domain; Caddy then never asks a CA for one.
+TLS_CERT=""
+TLS_KEY=""
+TLS_DIR=${TLS_DIR:-/etc/caddy/superbot-tls}
 # Hermes Agent release --with-hermes installs: the commit of tag v0.23.3 (NousResearch/hermes-agent),
 # as server/src/adapters/install.rs pins it. Change it with deploy/hermes-pin.sh bump.
 HERMES_COMMIT=${HERMES_COMMIT:-caafe5389ae585ef77387a962aee05b1bcf17029}
@@ -118,6 +132,14 @@ Usage: install.sh [options]
                       where their folders go (default /srv/superbot/users)
   --no-isolation      Turn that off (accounts and their folders are kept)
   --no-client         Skip building the web client (served at /app/)
+  --offline BUNDLE    Install or upgrade (with --upgrade) from an offline bundle made by
+                      deploy/offline-bundle.sh, with no network: no apt, git, curl, cargo, npm
+                      or certificate authority. Needs the system packages already installed
+                      (docs/ops/air-gapped.md), and --tls-cert/--tls-key with --domain
+  --bundle-sha256 HEX The bundle's SHA-256, from where it was published (else BUNDLE.sha256)
+  --tls-cert PATH, --tls-key PATH
+                      Serve --domain with this certificate (PEM, full chain) and key instead of
+                      getting one from Let's Encrypt
   --dry-run           Print actions without changing the system
   --non-interactive   Fail instead of prompting for missing flags
   -h, --help          Show this help
@@ -154,6 +176,10 @@ parse_args() {
       --isolation) ISOLATION_MODE=users; shift ;;
       --no-isolation) ISOLATION_MODE=off; shift ;;
       --no-client) BUILD_CLIENT=false; shift ;;
+      --offline) OFFLINE_BUNDLE=$2; shift 2 ;;
+      --bundle-sha256) OFFLINE_BUNDLE_SHA256=$2; shift 2 ;;
+      --tls-cert) TLS_CERT=$2; shift 2 ;;
+      --tls-key) TLS_KEY=$2; shift 2 ;;
       --dry-run) DRY_RUN=true; shift ;;
       --non-interactive) INTERACTIVE=false; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -239,6 +265,15 @@ install_trusted_files() {
 stage_trusted_deploy() {
   local dest git_dir rev tmp f src
   dest=$(trusted_deploy_dir)
+  if [[ -n "$OFFLINE_BUNDLE" ]]; then
+    if [[ "$DRY_RUN" == true ]]; then
+      log "[dry-run] would copy deploy templates from the bundle to $dest"
+      return
+    fi
+    install_trusted_files "$OFFLINE_DIR/deploy" "$dest"
+    log "Staged deploy templates from the bundle to $dest"
+    return
+  fi
   if [[ -n "$INSTALL_DIR" ]]; then
     src=$(realpath -m "$INSTALL_DIR")
     assert_not_service_owned "$src"
@@ -358,10 +393,20 @@ install_rustup_user() {
     printf '%s\n' '. "$HOME/.cargo/env"' >>"$home/.bashrc"
 }
 
+# shellcheck disable=SC2016
 sync_repo() {
   local home repo_path
   home=$(user_home)
   repo_path="$home/superbot"
+  if [[ -n "$OFFLINE_BUNDLE" ]]; then
+    # No source on the host: the service user's folder holds .env, data and the workspace.
+    log "Preparing $repo_path from the bundle"
+    if [[ "$DRY_RUN" == true ]]; then
+      return
+    fi
+    sudo -u "$SUPERBOT_USER" -H sh -c 'mkdir -p "$1" && cp "$2" "$1/.env.example"' _ "$repo_path" "$OFFLINE_DIR/env.example"
+    return
+  fi
   if [[ -n "$INSTALL_DIR" ]]; then
     log "Syncing $INSTALL_DIR -> $repo_path"
     if [[ "$DRY_RUN" == true ]]; then
@@ -396,6 +441,14 @@ build_botd() {
   local home repo_path
   home=$(user_home)
   repo_path="$home/superbot"
+  if [[ -n "$OFFLINE_BUNDLE" ]]; then
+    local b
+    log "Installing the bundle's binaries into $BIN_DIR"
+    for b in "${OFFLINE_BINARIES[@]}"; do
+      run install -m 0755 -o root -g root "$OFFLINE_DIR/bin/$b" "$BIN_DIR/$b"
+    done
+    return
+  fi
   log "Building release binaries"
   if [[ "$DRY_RUN" == true ]]; then
     return
@@ -423,6 +476,14 @@ build_client() {
   client="$home/superbot/apps/client"
   if [[ "$BUILD_CLIENT" != true ]]; then
     log "Skipping the web client (--no-client)"
+    return
+  fi
+  if [[ -n "$OFFLINE_BUNDLE" ]]; then
+    if [[ "$DRY_RUN" == true ]]; then
+      log "[dry-run] would install the bundle's web client into root-owned $CLIENT_DIR"
+      return
+    fi
+    install_client "$OFFLINE_DIR/client" || client_not_installed "Web client not installed"
     return
   fi
   if [[ "$DRY_RUN" == true ]]; then
@@ -530,6 +591,7 @@ install_release() {
 install_site() {
   local src
   src="$(user_home)/superbot/site"
+  [[ -z "$OFFLINE_BUNDLE" ]] || src="$OFFLINE_DIR/site"
   if [[ "$DRY_RUN" == true ]]; then
     log "[dry-run] would install the landing page from $src into root-owned $SITE_DIR"
     return
@@ -1135,7 +1197,7 @@ configure_isolation() {
     return
   fi
   log "Per-user accounts: on, in $ISOLATION_DIR"
-  apt-get install -y -qq acl sudo
+  [[ -n "$OFFLINE_BUNDLE" ]] || apt-get install -y -qq acl sudo
   group=$(id -gn "$SUPERBOT_USER")
   groupadd -r -f "$ISOLATION_GROUP"
   install -d -m 0755 -o root -g root /etc/superbot
@@ -1211,9 +1273,17 @@ install_backup() {
 # Caddyfile for SITE: the landing page at / and /get-started when SITE_ROOT is set, the web
 # client at /app/ when CLIENT_ROOT is set; everything else (/console/, /login, /api, the
 # /api/events SSE stream, /healthz, the /status page) goes to botd, which also has the landing built in.
+# With TLS_DIR (an operator's certificate there), Caddy serves it and never asks a CA for one or
+# staples OCSP, so it makes no outbound calls (docs/adr/0128-air-gapped-self-host.md).
 render_caddyfile() {
-  local site=$1 upstream=$2 client_root=${3:-} site_root=${4:-}
+  local site=$1 upstream=$2 client_root=${3:-} site_root=${4:-} tls_dir=${5:-}
+  if [[ -n "$tls_dir" ]]; then
+    printf '{\n\tauto_https disable_certs\n\tocsp_stapling off\n}\n\n'
+  fi
   printf '%s {\n\tencode gzip\n' "$site"
+  if [[ -n "$tls_dir" ]]; then
+    printf '\ttls %s/cert.pem %s/key.pem\n' "$tls_dir" "$tls_dir"
+  fi
   if [[ -n "$site_root" ]]; then
     cat <<CADDY
 	@site path / /index.html /get-started /get-started/ /site/*
@@ -1285,15 +1355,22 @@ install_caddy() {
   log "Installing Caddy"
   if [[ "$DRY_RUN" == true ]]; then
     log "[dry-run] would write /etc/caddy/Caddyfile for $DOMAIN: ${site_root:+landing page at / from $site_root, }${client_root:+web client at /app/ from $client_root, }everything else to botd on 127.0.0.1:3000"
+    [[ -z "$TLS_CERT" ]] || log "[dry-run] would serve $DOMAIN with the certificate in $TLS_CERT (copied to $TLS_DIR), never asking a CA"
     return
   fi
   if ! command -v caddy >/dev/null 2>&1; then
+    [[ -z "$OFFLINE_BUNDLE" ]] || die "Caddy isn't installed: install the caddy package from your internal mirror (docs/ops/air-gapped.md)"
     curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
     curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
     apt-get update -qq
     apt-get install -y -qq caddy
   fi
-  render_caddyfile "$DOMAIN" 127.0.0.1:3000 "$client_root" "$site_root" >/etc/caddy/Caddyfile
+  local tls_dir=""
+  if [[ -n "$TLS_CERT" ]]; then
+    install_tls_files
+    tls_dir=$TLS_DIR
+  fi
+  render_caddyfile "$DOMAIN" 127.0.0.1:3000 "$client_root" "$site_root" "$tls_dir" >/etc/caddy/Caddyfile
   systemctl enable caddy
   systemctl reload caddy || systemctl restart caddy
 }
@@ -1306,7 +1383,7 @@ configure_ufw() {
   if [[ "$DRY_RUN" == true ]]; then
     return
   fi
-  apt-get install -y -qq ufw
+  [[ -n "$OFFLINE_BUNDLE" ]] || apt-get install -y -qq ufw
   ufw allow 22/tcp
   ufw allow 80/tcp
   ufw allow 443/tcp
@@ -1314,7 +1391,9 @@ configure_ufw() {
 }
 
 summary() {
-  local home repo_path pass_file url where app backups encryption database
+  local home repo_path pass_file url where app backups encryption database upgrade
+  upgrade="sudo bash -s -- --upgrade < <(curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/install.sh)"
+  [[ -z "$OFFLINE_BUNDLE" ]] || upgrade="sudo bash install.sh --offline <newer bundle> --upgrade${DOMAIN:+ --domain $DOMAIN --tls-cert ... --tls-key ...} (docs/ops/air-gapped.md)"
   home=$(user_home)
   repo_path="$home/superbot"
   pass_file="$home/.superbot-admin-password"
@@ -1351,7 +1430,7 @@ SuperBot is installed.
   Backups:  $backups (botctl backups)
   Encrypted: $encryption
   Logs:     journalctl -u superbot -f
-  Upgrade:  sudo bash -s -- --upgrade < <(curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/install.sh)
+  Upgrade:  $upgrade
 
 Next steps (as the service user):
   sudo -iu $SUPERBOT_USER
@@ -1401,6 +1480,217 @@ EOF
   fi
 }
 
+# --- Offline installs (docs/adr/0128-air-gapped-self-host.md) ---------------------------------
+
+# The flags --offline can't work with, checked before anything changes.
+check_offline_flags() {
+  if [[ -z "$OFFLINE_BUNDLE" ]]; then
+    [[ -z "$OFFLINE_BUNDLE_SHA256" ]] || die "--bundle-sha256 needs --offline"
+    return 0
+  fi
+  [[ -f "$OFFLINE_BUNDLE" && -r "$OFFLINE_BUNDLE" ]] || die "--offline: can't read $OFFLINE_BUNDLE"
+  [[ -z "$INSTALL_DIR" ]] || die "--offline installs from the bundle, not --source-dir"
+  [[ "$WITH_HERMES" != true ]] || die "--with-hermes downloads Hermes Agent, so it can't run --offline: use the published image, which has it (docs/ops/air-gapped.md)"
+  [[ -z "$DOMAIN" || -n "$TLS_CERT" ]] || die "--offline with --domain needs --tls-cert and --tls-key: there is no Let's Encrypt without a network"
+  [[ -z "$OFFLINE_BUNDLE_SHA256" || "$OFFLINE_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--bundle-sha256 must be 64 lowercase hex digits"
+}
+
+# The operator's certificate: both halves, PEM, a pair, valid now, and for --domain.
+check_tls_files() {
+  [[ -n "$TLS_CERT$TLS_KEY" ]] || return 0
+  [[ -n "$TLS_CERT" && -n "$TLS_KEY" ]] || die "Give both --tls-cert and --tls-key"
+  [[ -n "$DOMAIN" ]] || die "--tls-cert and --tls-key need --domain"
+  local f
+  for f in "$TLS_CERT" "$TLS_KEY"; do
+    [[ -f "$f" && -r "$f" ]] || die "Can't read $f"
+  done
+  command -v openssl >/dev/null 2>&1 || die "openssl is needed to check --tls-cert"
+  openssl x509 -in "$TLS_CERT" -noout 2>/dev/null || die "--tls-cert: $TLS_CERT isn't a PEM certificate"
+  openssl pkey -in "$TLS_KEY" -noout 2>/dev/null || die "--tls-key: $TLS_KEY isn't a PEM private key (or it has a passphrase, which Caddy can't use)"
+  [[ "$(openssl x509 -in "$TLS_CERT" -noout -pubkey)" == "$(openssl pkey -in "$TLS_KEY" -pubout)" ]] \
+    || die "--tls-key doesn't match --tls-cert"
+  openssl x509 -in "$TLS_CERT" -noout -checkend 0 >/dev/null || die "--tls-cert has expired"
+  openssl x509 -in "$TLS_CERT" -noout -checkend $((30 * 86400)) >/dev/null || warn "--tls-cert ends within 30 days: renew it and re-run the installer"
+  [[ "$(openssl x509 -in "$TLS_CERT" -noout -checkhost "$DOMAIN")" == *"does match"* ]] \
+    || die "--tls-cert isn't for $DOMAIN"
+}
+
+# Root-owned copies Caddy reads: the key for root and Caddy's group only.
+install_tls_files() {
+  local group=root
+  getent group caddy >/dev/null 2>&1 && group=caddy
+  install -d -m 0750 -o root -g "$group" "$TLS_DIR"
+  install -m 0644 -o root -g "$group" "$TLS_CERT" "$TLS_DIR/cert.pem"
+  install -m 0640 -o root -g "$group" "$TLS_KEY" "$TLS_DIR/key.pem"
+  [[ "$group" == caddy ]] || warn "No caddy group: $TLS_DIR/key.pem is root's only, so Caddy must run as root to read it"
+  log "Certificate for $DOMAIN installed in $TLS_DIR"
+}
+
+manifest_value() { sed -n "s/^$2=//p" "$1" | tail -n 1; }
+
+# The bundle's own SHA-256: --bundle-sha256, else BUNDLE.sha256 beside it.
+offline_expected_sha256() {
+  if [[ -n "$OFFLINE_BUNDLE_SHA256" ]]; then
+    printf '%s\n' "$OFFLINE_BUNDLE_SHA256"
+  elif [[ -f "$1.sha256" ]]; then
+    awk 'NR == 1 { print $1 }' "$1.sha256"
+  fi
+}
+
+# Who made the bundle, before anything in it is read: its signature, if it has one and cosign
+# is here, and its SHA-256. One of them is required.
+offline_check_origin() {
+  local bundle=$1 want got signed=false root=()
+  if [[ -f "$bundle.sigstore.json" ]]; then
+    if command -v cosign >/dev/null 2>&1; then
+      # The operator's own copy of Sigstore's trusted root (cosign initialize on a connected
+      # machine), never one that travelled with the bundle.
+      if [[ -n "${SIGSTORE_TRUSTED_ROOT:-}" ]]; then
+        [[ -f "$SIGSTORE_TRUSTED_ROOT" ]] || die "SIGSTORE_TRUSTED_ROOT: no file at $SIGSTORE_TRUSTED_ROOT"
+        root=(--trusted-root "$SIGSTORE_TRUSTED_ROOT")
+      fi
+      cosign verify-blob --bundle "$bundle.sigstore.json" "${root[@]}" \
+        --certificate-identity-regexp "$OFFLINE_SIGNER_IDENTITY_REGEXP" \
+        --certificate-oidc-issuer "$OFFLINE_SIGNER_ISSUER" "$bundle" >/dev/null 2>&1 \
+        || die "The bundle's signature ($bundle.sigstore.json) doesn't verify: don't install it (docs/ops/air-gapped.md#verifying-a-bundle)"
+      log "Bundle signature verified (signed by $OFFLINE_SIGNER_IDENTITY_REGEXP)"
+      signed=true
+    else
+      warn "The bundle is signed, but cosign isn't installed here, so the signature isn't checked"
+    fi
+  fi
+  want=$(offline_expected_sha256 "$bundle")
+  if [[ -z "$want" ]]; then
+    [[ "$signed" == true ]] || die "Nothing to check the bundle against: give --bundle-sha256 (from where it was published) or put $bundle.sha256 beside it"
+    return 0
+  fi
+  [[ "$want" =~ ^[0-9a-f]{64}$ ]] || die "$bundle.sha256 doesn't hold a SHA-256"
+  got=$(sha256sum "$bundle" | awk '{ print $1 }')
+  [[ "$got" == "$want" ]] || die "The bundle's SHA-256 is $got, not $want: it is damaged or not the one published"
+  log "Bundle SHA-256 matches ($got)"
+}
+
+# One top folder, superbot-offline-*, of plain files and folders: no links, devices, absolute
+# names or "..". Prints the top folder.
+offline_archive_ok() {
+  local archive=$1 entries names top
+  entries=$(tar -tvf "$archive" 2>/dev/null) && names=$(tar -tf "$archive" 2>/dev/null) || return 1
+  [[ -n "$names" ]] || return 1
+  awk '{ t = substr($0, 1, 1) } t != "-" && t != "d" { bad = 1 } END { exit bad }' <<<"$entries" || return 1
+  ! grep -Eq '^/|(^|/)\.\.(/|$)' <<<"$names" || return 1
+  top=$(awk -F/ 'NR == 1 { print $1 }' <<<"$names")
+  [[ "$top" =~ ^superbot-offline-[0-9A-Za-z._+-]+$ ]] || return 1
+  awk -F/ -v top="$top" '$1 != top { bad = 1 } END { exit bad }' <<<"$names" || return 1
+  printf '%s\n' "$top"
+}
+
+# Checks BUNDLE and unpacks it into DEST (an empty folder), setting OFFLINE_DIR to its root.
+# Every file must be in SHA256SUMS with the right hash, and nothing else may be there.
+offline_unpack_bundle() {
+  local bundle=$1 dest=$2 top root arch listed actual
+  offline_check_origin "$bundle"
+  top=$(offline_archive_ok "$bundle") || die "Refusing $bundle: not an offline bundle (one superbot-offline-* folder of plain files)"
+  tar -xf "$bundle" -C "$dest" --no-same-owner --no-same-permissions || die "Couldn't unpack $bundle"
+  root="$dest/$top"
+  find "$root" -type d -exec chmod 0755 {} +
+  find "$root" -type f -exec chmod 0644 {} +
+  [[ -f "$root/MANIFEST" && -f "$root/SHA256SUMS" ]] || die "Refusing $bundle: no MANIFEST or SHA256SUMS"
+  [[ "$(manifest_value "$root/MANIFEST" format)" == 1 ]] || die "Refusing $bundle: bundle format $(manifest_value "$root/MANIFEST" format), this installer reads 1"
+  ! grep -Evq '^[0-9a-f]{64}  [^[:space:][:cntrl:]\\]+$' "$root/SHA256SUMS" || die "Refusing $bundle: SHA256SUMS has a line that isn't a hash and a plain path"
+  ! grep -Eq '  (/|(.*/)?\.\.(/|$))' "$root/SHA256SUMS" || die "Refusing $bundle: SHA256SUMS names a path outside the bundle"
+  (cd "$root" && sha256sum --check --strict --quiet SHA256SUMS) || die "Refusing $bundle: files don't match SHA256SUMS"
+  listed=$(sed 's/^[0-9a-f]*  //' "$root/SHA256SUMS" | LC_ALL=C sort)
+  actual=$(cd "$root" && find . -type f ! -path ./SHA256SUMS -printf '%P\n' | LC_ALL=C sort)
+  [[ "$listed" == "$actual" ]] || die "Refusing $bundle: it holds files SHA256SUMS doesn't list, or lists files it doesn't hold"
+  OFFLINE_VERSION=$(manifest_value "$root/MANIFEST" version)
+  [[ "$OFFLINE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]] || die "Refusing $bundle: version \"$OFFLINE_VERSION\" isn't a version"
+  arch=$(manifest_value "$root/MANIFEST" arch)
+  [[ "$arch" =~ ^(x86_64|aarch64)$ ]] || die "Refusing $bundle: arch \"$arch\" isn't x86_64 or aarch64"
+  [[ "${OFFLINE_ANY_ARCH:-}" == 1 || "$arch" == "$(uname -m)" ]] || die "This bundle is for $arch, but this host is $(uname -m)"
+  local f
+  for f in "${OFFLINE_BINARIES[@]}"; do
+    [[ -f "$root/bin/$f" ]] || die "Refusing $bundle: no bin/$f"
+    chmod 0755 "$root/bin/$f"
+  done
+  for f in "${DEPLOY_FILES[@]}" install.sh; do
+    [[ -f "$root/deploy/$f" ]] || die "Refusing $bundle: no deploy/$f"
+  done
+  [[ -f "$root/env.example" && -f "$root/site/index.html" && -f "$root/client/index.html" ]] \
+    || die "Refusing $bundle: it needs env.example, site/ and client/"
+  OFFLINE_DIR=$root
+  log "Offline bundle $OFFLINE_VERSION ($arch, commit $(manifest_value "$root/MANIFEST" commit)) checked"
+}
+
+cleanup_offline() {
+  [[ -z "${OFFLINE_TMP:-}" ]] || rm -rf -- "$OFFLINE_TMP"
+}
+
+offline_release_file() { printf '%s\n' "${OFFLINE_RELEASE_FILE:-$SHARE_DIR/offline-release}"; }
+
+# Unpacks into a root-owned folder (Caddy's files are copied from it as the service user, who
+# can read but not change it) and refuses an older version than the one installed: a newer
+# database may not open with older binaries. Restore a backup to go back.
+prepare_offline() {
+  [[ -n "$OFFLINE_BUNDLE" ]] || return 0
+  local installed release
+  if [[ "$DRY_RUN" == true ]]; then
+    OFFLINE_TMP=$(mktemp -d)
+  else
+    install -d -m 0755 -o root -g root "$SHARE_DIR"
+    OFFLINE_TMP=$(mktemp -d "$SHARE_DIR/offline.XXXXXX")
+  fi
+  chmod 0755 "$OFFLINE_TMP"
+  trap cleanup_offline EXIT
+  offline_unpack_bundle "$OFFLINE_BUNDLE" "$OFFLINE_TMP"
+  release=$(offline_release_file)
+  if [[ -f "$release" ]]; then
+    installed=$(manifest_value "$release" version)
+    if [[ -n "$installed" && "$installed" != "$OFFLINE_VERSION" &&
+      "$(printf '%s\n%s\n' "$installed" "$OFFLINE_VERSION" | sort -V | tail -n 1)" == "$installed" ]]; then
+      die "This host runs $installed, newer than the bundle's $OFFLINE_VERSION. To go back, restore a backup made on $OFFLINE_VERSION (docs/ops/air-gapped.md#upgrading)."
+    fi
+    log "Offline upgrade: ${installed:-unknown} -> $OFFLINE_VERSION"
+  fi
+}
+
+# What the online installer would apt-get: here it must already be installed, from the
+# operator's own mirror.
+check_offline_tools() {
+  local missing=() c
+  for c in useradd sudo systemctl tar sha256sum openssl sqlite3 awk sed find install; do
+    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+  done
+  if [[ "$(isolation_mode)" == users ]]; then
+    for c in setfacl visudo; do command -v "$c" >/dev/null 2>&1 || missing+=("$c"); done
+  fi
+  [[ -z "$DOMAIN" ]] || command -v caddy >/dev/null 2>&1 || missing+=(caddy)
+  [[ "$ENABLE_UFW" != true ]] || command -v ufw >/dev/null 2>&1 || missing+=(ufw)
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    if [[ "$DRY_RUN" == true ]]; then
+      warn "[dry-run] missing, to install from your mirror first: ${missing[*]}"
+    else
+      die "Install these from your package mirror first (docs/ops/air-gapped.md#before-you-start): ${missing[*]}"
+    fi
+  fi
+  command -v age >/dev/null 2>&1 || warn "age isn't installed: encrypted backups are unavailable"
+  if ! command -v bwrap >/dev/null 2>&1 || ! command -v socat >/dev/null 2>&1; then
+    warn "bubblewrap and socat aren't installed: harness sandboxes are unavailable"
+  fi
+  log "Offline: no packages, git, curl, cargo or npm; everything comes from the bundle"
+}
+
+# Which bundle this host runs, for the next upgrade's version check.
+record_offline_release() {
+  [[ -n "$OFFLINE_BUNDLE" ]] || return 0
+  local release
+  release=$(offline_release_file)
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[dry-run] would record bundle $OFFLINE_VERSION in $release"
+    return
+  fi
+  install -m 0644 -o root -g root "$OFFLINE_DIR/MANIFEST" "$release"
+}
+
 finish() {
   [[ -n "$CLIENT_NOT_INSTALLED" ]] || return 0
   warn "$CLIENT_NOT_INSTALLED. Everything else is installed, but /app/ still serves the previous web client, if any."
@@ -1414,16 +1704,29 @@ main() {
   check_license_file
   check_backup_target
   prompt_missing
-  detect_source_dir
+  check_offline_flags
+  check_tls_files
+  if [[ -n "$OFFLINE_BUNDLE" ]]; then
+    prepare_offline
+  else
+    detect_source_dir
+  fi
   TZ_VALUE=${TZ_VALUE:-UTC}
   USER_NAME_VALUE=${USER_NAME_VALUE:-Owner}
 
   default_isolation
-  ensure_user
-  install_packages
-  install_node
-  install_rustup_user
-  if [[ "$UPGRADE" == true ]]; then
+  if [[ -n "$OFFLINE_BUNDLE" ]]; then
+    check_offline_tools
+    ensure_user
+  else
+    ensure_user
+    install_packages
+    install_node
+    install_rustup_user
+  fi
+  if [[ "$UPGRADE" == true && -n "$OFFLINE_BUNDLE" ]]; then
+    log "Upgrade mode: replacing what the bundle carries"
+  elif [[ "$UPGRADE" == true ]]; then
     log "Upgrade mode: updating source and rebuilding"
   fi
   sync_repo
@@ -1440,6 +1743,7 @@ main() {
   install_backup
   install_caddy
   configure_ufw
+  record_offline_release
   summary
   finish
 }
