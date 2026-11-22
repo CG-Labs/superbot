@@ -39,6 +39,9 @@ mod handover;
 mod handover_http_tests;
 #[cfg(test)]
 mod harness_version_http_tests;
+mod health_score;
+#[cfg(test)]
+mod health_score_http_tests;
 mod isolation;
 #[cfg(test)]
 mod isolation_http_tests;
@@ -51,6 +54,7 @@ mod deprovision;
 mod deprovision_http_tests;
 mod erasure;
 mod evidence;
+mod evidence_period;
 #[cfg(test)]
 mod evidence_http_tests;
 mod file_retention;
@@ -198,6 +202,7 @@ mod storage;
 mod storage_http_tests;
 mod sweep;
 mod users;
+mod ustar;
 mod walk;
 #[cfg(test)]
 mod users_http_tests;
@@ -918,6 +923,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/backups", get(server_backups::get).post(server_backups::copy_now))
         .route("/database", get(database_encryption::get))
         .route("/support/bundle", get(support::bundle))
+        .route("/support/health-score", get(health_score::get))
         .route("/evidence", get(evidence::get))
         .route("/evidence/bundle", get(evidence::bundle))
         .route("/secrets", get(list_secrets))

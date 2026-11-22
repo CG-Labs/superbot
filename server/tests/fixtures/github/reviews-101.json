@@ -1,0 +1,32 @@
+[
+  {
+    "id": 4,
+    "user": {
+      "login": "review-bot[bot]",
+      "id": 70843,
+      "type": "Bot",
+      "site_admin": false
+    },
+    "body": "Automated summary.",
+    "state": "COMMENTED",
+    "html_url": "https://github.com/example-org/example-repo/pull/1#pullrequestreview-4",
+    "submitted_at": "2026-10-05T09:00:00Z",
+    "commit_id": "a101a101a101a101a101a101a101a101a101a101",
+    "author_association": "NONE"
+  },
+  {
+    "id": 5,
+    "user": {
+      "login": "reviewer-c",
+      "id": 15403,
+      "type": "User",
+      "site_admin": false
+    },
+    "body": "Approving after the fact.",
+    "state": "APPROVED",
+    "html_url": "https://github.com/example-org/example-repo/pull/1#pullrequestreview-5",
+    "submitted_at": "2026-10-06T08:00:00Z",
+    "commit_id": "a101a101a101a101a101a101a101a101a101a101",
+    "author_association": "MEMBER"
+  }
+]

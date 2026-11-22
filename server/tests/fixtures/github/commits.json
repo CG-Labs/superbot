@@ -1,0 +1,116 @@
+[
+  {
+    "sha": "b102b102b102b102b102b102b102b102b102b102",
+    "commit": {
+      "author": {
+        "name": "Author Name",
+        "email": "author@example.com",
+        "date": "2026-10-20T15:04:05Z"
+      },
+      "committer": {
+        "name": "GitHub",
+        "email": "noreply@example.com",
+        "date": "2026-10-20T15:04:05Z"
+      },
+      "message": "Add the widget (#102)",
+      "verification": {
+        "verified": true,
+        "reason": "valid"
+      }
+    },
+    "author": {
+      "login": "author-a",
+      "id": 73749,
+      "type": "User",
+      "site_admin": false
+    },
+    "committer": {
+      "login": "web-flow",
+      "id": 91563,
+      "type": "User",
+      "site_admin": false
+    },
+    "parents": [
+      {
+        "sha": "ffffffffffffffffffffffffffffffffffffffff"
+      }
+    ],
+    "html_url": "https://github.com/example-org/example-repo/commit/b102b102b102b102b102b102b102b102b102b102"
+  },
+  {
+    "sha": "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0",
+    "commit": {
+      "author": {
+        "name": "Author Name",
+        "email": "author@example.com",
+        "date": "2026-10-12T08:00:00Z"
+      },
+      "committer": {
+        "name": "GitHub",
+        "email": "noreply@example.com",
+        "date": "2026-10-12T08:00:00Z"
+      },
+      "message": "Direct push message",
+      "verification": {
+        "verified": false,
+        "reason": "unsigned"
+      }
+    },
+    "author": {
+      "login": "maintainer-m",
+      "id": 38766,
+      "type": "User",
+      "site_admin": false
+    },
+    "committer": {
+      "login": "maintainer-m",
+      "id": 38766,
+      "type": "User",
+      "site_admin": false
+    },
+    "parents": [
+      {
+        "sha": "ffffffffffffffffffffffffffffffffffffffff"
+      }
+    ],
+    "html_url": "https://github.com/example-org/example-repo/commit/d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0"
+  },
+  {
+    "sha": "b101b101b101b101b101b101b101b101b101b101",
+    "commit": {
+      "author": {
+        "name": "Author Name",
+        "email": "author@example.com",
+        "date": "2026-10-05T09:30:00Z"
+      },
+      "committer": {
+        "name": "GitHub",
+        "email": "noreply@example.com",
+        "date": "2026-10-05T09:30:00Z"
+      },
+      "message": "Fix the docs link (#101)",
+      "verification": {
+        "verified": true,
+        "reason": "valid"
+      }
+    },
+    "author": {
+      "login": "author-b",
+      "id": 38182,
+      "type": "User",
+      "site_admin": false
+    },
+    "committer": {
+      "login": "web-flow",
+      "id": 91563,
+      "type": "User",
+      "site_admin": false
+    },
+    "parents": [
+      {
+        "sha": "ffffffffffffffffffffffffffffffffffffffff"
+      }
+    ],
+    "html_url": "https://github.com/example-org/example-repo/commit/b101b101b101b101b101b101b101b101b101b101"
+  }
+]
