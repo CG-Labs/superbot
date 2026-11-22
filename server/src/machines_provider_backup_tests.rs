@@ -121,7 +121,8 @@ async fn machines_are_held_to_an_rpo_by_their_providers_backups() {
     assert!(total(&metrics, "superbot_machine_provider_backup_age_max_seconds{") >= 27.0 * 3600.0, "{metrics}");
     assert_eq!(total(&metrics, "superbot_machine_provider_backup_rpo_seconds{"), 26.0 * 3600.0, "{metrics}");
     assert!(!metrics.contains("superbot_machines_rpo_tracked"), "off-host backups' gauges stay off: {metrics}");
-    assert!(!metrics.contains(&m.id) && !metrics.contains(&uid) && !metrics.contains(&pid) && !metrics.contains("ada@"), "{metrics}");
+    // The fake provider's id is a short number that can turn up in a sample's value, so it's matched as a label value.
+    assert!(!metrics.contains(&m.id) && !metrics.contains(&uid) && !metrics.contains(&format!("\"{pid}\"")) && !metrics.contains("ada@"), "{metrics}");
     // The alert rules use only metrics botd writes.
     let types: std::collections::BTreeSet<String> = metrics.lines().filter_map(|l| Some(l.strip_prefix("# TYPE ")?.split(' ').next()?.to_string())).collect();
     let used = crate::machines_placement_tests::metric_names(include_str!("../../deploy/prometheus/superbot-backups.rules.yml"));

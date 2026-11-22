@@ -307,6 +307,10 @@ impl Screens {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        // SAFETY: only async-signal-safe calls; std drops to the user before it.
+        unsafe {
+            c.pre_exec(runas::no_new_privs);
+        }
         c
     }
 
