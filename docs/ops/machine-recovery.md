@@ -102,7 +102,7 @@ To empty a host that still works (to retire it), move its machines one at a time
 
 Linode machines are backed up by Linode Backups, not by botd ([ADR 0110](../adr/0110-linode-machine-recovery-objectives.md)). With `MACHINE_BACKUPS=on` (the default), botd turns them on for every machine once it is running and enrolled, and again whenever it finds them off (`machine.backups_enabled`, or `machine.backups_failed` with Linode's reason). Linode takes one backup a day in a two-hour window it picks, and keeps three: the newest daily, one from this week and one from last week.
 
-Each reconcile reads, with the machine, when its last Linode backup succeeded. No extra Linode call is made, and the scrape never calls Linode.
+Each reconcile reads, with the machine, when its last Linode backup succeeded. No extra Linode call is made, and the scrape never calls Linode. botd checks the saved times against the RPO every minute, apart from reconciling.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -134,7 +134,14 @@ botd doesn't restore Linode machines or time their restores. The target below is
 3. In Cloud Manager, restore the backup **to the same Linode**, overwriting its disks. The Linode keeps its id, IP address and firewall, so nothing in botd changes.
 4. Revoke its certificates: `botctl machine revoke <user> --yes`. The restored disk holds the certificate it had then, which may have been rotated since; either way it now enrolls anew, as a restored Incus machine does.
 5. `botctl machine resume <user>`.
-6. `botctl machine enroll <user>` prints a one-time token (valid an hour) and how to use it. On the machine (Lish console, or SSH with `MACHINE_AUTHORIZED_KEYS`), save it to `/etc/superbot/enroll-token` (mode 600) and run `superbot-machine enroll` with `/etc/superbot/machine.env`'s settings. The running agent takes up the new certificate within a minute.
+6. `botctl machine enroll <user>` prints a one-time token (valid an hour) and how to use it. On the machine (Lish console, or SSH with `MACHINE_AUTHORIZED_KEYS`), save it to `/etc/superbot/enroll-token` (mode 600) and, as root, run:
+
+   ```sh
+   set -a; . /etc/superbot/machine.env; set +a
+   SUPERBOT_ENROLL_TOKEN_FILE=/etc/superbot/enroll-token SUPERBOT_STATE_DIR=/var/lib/superbot-machine superbot-machine enroll
+   ```
+
+   The running agent takes up the new certificate within a minute.
 7. `botctl machine show <user>` shows `enrolled`. If it was assigned, its Bots run there again.
 
 Note the time from step 2 to step 7 for your records: that's the restore time against the RTO target in the [recovery objectives](../security/machine-recovery-objectives.md#linode-machines) (4 hours by default). Drill it on a spare machine of your largest plan before you promise it.
