@@ -172,7 +172,6 @@ pub fn watch(app: &App) -> bool {
     if previous.as_deref() == Some(key.as_str()) {
         return false;
     }
-    app.db.set_setting(STATE, &key);
     let ids = |enc: bool| ts.iter().filter(|t| t.encrypted == enc).map(|t| t.id).collect::<Vec<_>>();
     let plain = ids(false);
     let d = json!({
@@ -182,7 +181,13 @@ pub fn watch(app: &App) -> bool {
         "plaintextAllowed": policy == Policy::Off && !plain.is_empty(),
         "previous": previous,
     });
-    app.db.record(&Event::new(Actor::system(ACTOR), "server.backup_encryption_changed").target("server", "backups").details(d));
+    // The state is saved only once the event is, so a failed write is tried again next minute;
+    // a crash in between repeats the event rather than losing it.
+    if let Err(e) = app.db.try_record(&Event::new(Actor::system(ACTOR), "server.backup_encryption_changed").target("server", "backups").details(d)) {
+        crate::obs::log::log_warn!("backup encryption: could not record the change, will try again: {e}");
+        return false;
+    }
+    app.db.set_setting(STATE, &key);
     true
 }
 

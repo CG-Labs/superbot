@@ -211,6 +211,22 @@ async fn plain_backups_are_shown_and_audited_until_they_are_encrypted() {
 }
 
 #[tokio::test]
+async fn a_change_whose_event_wasnt_saved_is_audited_on_the_next_look() {
+    let (port, app, admin, _) = serve_app().await;
+    let dir = temp_dir("be-retry");
+    app.server_backups.set(Arc::new(ServerBackups::with(&dir, None))).ok().unwrap();
+    app.db
+        .execute_raw("CREATE TEMP TRIGGER no_be BEFORE INSERT ON audit_events WHEN NEW.action = 'server.backup_encryption_changed' BEGIN SELECT RAISE(ABORT, 'disk full'); END")
+        .unwrap();
+    assert!(!backup_encryption::watch(&app));
+    assert!(app.db.setting("backup_encryption_state").is_none(), "the state waits for its event");
+    app.db.execute_raw("DROP TRIGGER no_be").unwrap();
+    assert!(backup_encryption::watch(&app));
+    assert!(!backup_encryption::watch(&app));
+    assert_eq!(audit(port, &admin).await.len(), 1);
+}
+
+#[tokio::test]
 async fn plaintext_by_choice_is_audited_and_still_shown() {
     let (port, app, admin, _) = serve_app().await;
     let dir = temp_dir("be-off");
