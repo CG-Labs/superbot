@@ -480,7 +480,7 @@ pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>
         app.db.record(&by.event("service_account.updated").target("service_account", &id).details(json!({ "name": after.user.name, "changes": changes })));
     }
     // Another team shares other Bots with it: runs it asked for on Bots it can no longer
-    // operate stop, and live streams forget the Bot access they cached.
+    // operate stop.
     if before.team_id != after.team_id {
         let viewer = crate::acl::Viewer::User { id: id.clone(), role: after.user.role };
         for bot in app.db.bots() {
@@ -488,7 +488,6 @@ pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>
                 app.stop(&bot.id);
             }
         }
-        app.send(json!({ "type": "resync" }));
     }
     if before.user.status != after.user.status {
         if after.user.active() {
