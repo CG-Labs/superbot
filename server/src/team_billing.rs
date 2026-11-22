@@ -438,7 +438,7 @@ pub fn view(app: &App, team_id: &str, manager: bool) -> Option<Value> {
 
 #[allow(clippy::result_large_err)]
 fn managed(app: &AppState, c: &Caller) -> Result<(crate::db::User, Team), Response> {
-    let (u, _, t) = crate::teams::my_managed_team(app, c).map_err(IntoResponse::into_response)?;
+    let (u, _, t) = crate::teams::my_team_for(app, c, crate::rbac::Perm::ManageBilling).map_err(IntoResponse::into_response)?;
     Ok((u, t))
 }
 

@@ -36,8 +36,12 @@ fn tiers(base_url: &str) -> String {
 
 /// Starts botd with `tiers` as its tiers file (if any) and `extra` in its environment.
 fn start(tiers: Option<&str>, extra: &[(&str, &str)]) -> Botd {
+    // Tests run in parallel and a freed port can be handed out twice, so the port alone
+    // can't name the data dir.
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let port = free_port();
-    let dir = std::env::temp_dir().join(format!("botd-provider-https-{}-{port}", std::process::id()));
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("botd-provider-https-{}-{n}-{port}", std::process::id()));
     for d in ["data", "workspace", "home"] {
         std::fs::create_dir_all(dir.join(d)).unwrap();
     }
