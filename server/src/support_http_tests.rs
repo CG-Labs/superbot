@@ -134,14 +134,19 @@ async fn no_secret_email_or_chat_reaches_the_bundle() {
     let mut actor = Actor::operator();
     actor.email = Some(email.clone());
     app.db.record(&Event::new(actor, "auth.login_failed").outcome(Outcome::Denied).details(json!({ "reason": "wrong_tenant", "email": email })));
+    let path = format!("/clients/Jane Smith {}/notes.txt", random_hex(4));
+    app.db.record(&Event::new(Actor::system("policy"), "policy.denied").outcome(Outcome::Denied).details(json!({ "reason": format!("Deletes {path} outside the workspace") })));
 
     let (code, _, body) = fetch(port, &admin).await;
     assert_eq!(code, 200);
     let text = String::from_utf8_lossy(&body);
-    for (what, v) in [("registered secret", secret.as_str()), ("session token", session.as_str()), ("email", email.as_str()), ("chat", chat.as_str()), ("webhook path", "/services/T0/B0/")] {
+    for (what, v) in [("registered secret", secret.as_str()), ("session token", session.as_str()), ("email", email.as_str()), ("chat", chat.as_str()), ("webhook path", "/services/T0/B0/"), ("tool input", "Jane Smith")] {
         assert!(!text.contains(v), "the {what} is in the bundle");
     }
     let f = files(&body);
+    let audit = parse(file(&f, "audit-summary.json"));
+    let reasons: Vec<(&str, &str)> = audit["recentProblems"].as_array().unwrap().iter().map(|p| (p["action"].as_str().unwrap(), p["reason"].as_str().unwrap_or_default())).collect();
+    assert!(reasons.contains(&("policy.denied", "[text]")) && reasons.contains(&("auth.login_failed", "wrong_tenant")), "{reasons:?}");
     let logs = file(&f, "logs.jsonl");
     let line = logs.lines().find(|l| l.contains("provider said")).expect("the warning is logged");
     assert!(line.contains("provider said [redacted] for [email] with [redacted] posting to https://hooks.slack.com/[redacted]"), "{line}");

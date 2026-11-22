@@ -31,7 +31,7 @@ tar -xOf superbot-support-<time>.tar | less
 | `config.json` | botd's settings from its environment, with secrets redacted (the names of the ones redacted are listed); other variables on the host are only counted. The settings botd started with, the tiers' names and summary, and the approval policy |
 | `health.json` | The status page's checks and open incidents, the setup checklist, the license, approvals waiting and the oldest one's age, runs running and waiting, the last 15 minutes' metrics, machines and hosts, database encryption and server backups |
 | `logs.jsonl` | The newest lines botd logged since it started (up to 2,000), one JSON object each, whatever `LOG_FORMAT` is |
-| `audit-summary.json` | The last 7 days of the audit log counted by action and outcome, and the newest 100 failures and denials with their reason |
+| `audit-summary.json` | The last 7 days of the audit log counted by action and outcome, and the newest 100 failures and denials with their reason code (a free-text reason shows as `[text]`) |
 | `manifest.json` | The files and their sizes, and how many settings, log lines and audit events went in |
 
 ## What's never in it
@@ -44,7 +44,7 @@ Secret values, chats, prompts, tool inputs, files, names, emails or IP addresses
 - Emails become `[email]`. `OWNER_EMAIL` and `USER_NAME` are left out.
 - IP addresses become `[ip]`, except loopback and `0.0.0.0`, which say nothing about your network.
 - The licensee's name (the organisation on the license) becomes `[name]` wherever it shows.
-- The audit summary has actions, outcomes, times, sign-in methods, identity provider names and reasons; never who, from where, or what they wrote.
+- The audit summary has actions, outcomes, times, sign-in methods, identity provider names and reason codes (a free-text reason, which can quote a path or a command, shows as `[text]`); never who, from where, or what they wrote.
 
 If you find something you'd rather not send, delete it from the bundle and say so in the ticket. If you find a secret in it, don't send it, and tell `<security-email>`: that's a bug.
 

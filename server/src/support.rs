@@ -348,6 +348,14 @@ fn health(app: &App, setup: Value, now_ms: i64) -> Value {
     })
 }
 
+/// An audit reason as the bundle shows it: a code (`not_linked`, `wrong_tenant`) as is,
+/// anything else as `[text]`, since free-text reasons can quote a tool's input (a path,
+/// a command) or a person.
+pub fn reason_code(r: &str) -> &str {
+    let code = !r.is_empty() && r.len() <= 64 && r.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"_.:-".contains(&c));
+    if code { r } else { "[text]" }
+}
+
 /// The last `AUDIT_DAYS` of the audit log, counted, with the newest failures and denials:
 /// what happened and how it ended, never who (names, emails, subjects) or from where.
 fn audit_summary(app: &App, now_ms: i64) -> (Value, usize) {
@@ -374,7 +382,7 @@ fn audit_summary(app: &App, now_ms: i64) -> (Value, usize) {
                 "authMethod": e.auth_method,
                 "idp": e.idp,
                 "targetType": e.target_type,
-                "reason": e.details.get("reason").and_then(Value::as_str).map(|r| audit::clip(r, 120)),
+                "reason": e.details.get("reason").and_then(Value::as_str).map(reason_code),
                 "traceId": e.details.get("traceId").and_then(Value::as_str),
             })
         })
@@ -634,6 +642,16 @@ pub(crate) mod tests {
         assert_eq!(scrub_text("from 198.51.100.7"), "from [ip]");
         assert_eq!(setting("HOST", "10.1.2.3"), ("[ip]".into(), true));
         assert_eq!(setting("HOST", "0.0.0.0"), ("0.0.0.0".into(), false));
+    }
+
+    #[test]
+    fn only_reason_codes_leave_the_audit_log() {
+        for code in ["not_linked", "wrong_tenant", "mfa.required", "scim:conflict", "http-429"] {
+            assert_eq!(reason_code(code), code);
+        }
+        for text in ["Deletes /clients/Jane Smith/notes.txt outside the workspace", "rm -rf build", "Not_Linked", "", &"a".repeat(65)] {
+            assert_eq!(reason_code(text), "[text]", "{text}");
+        }
     }
 
     #[test]
