@@ -40,6 +40,10 @@ services:
       # SERVER_BACKUP_S3_BUCKET is set in .env (docs/adr/0109-server-backups-off-the-host.md).
       BACKUP_DIR: /backups
       SUPERBOT_BACKUP_INTERVAL: ${SUPERBOT_BACKUP_INTERVAL:-86400}
+      # The same encryption settings as the backup sidecar, so botd shows and enforces what it
+      # writes (docs/adr/0114-backups-encrypted-by-default.md).
+      SUPERBOT_BACKUP_AGE_RECIPIENTS: ${SUPERBOT_BACKUP_AGE_RECIPIENTS:-}
+      SUPERBOT_BACKUP_ENCRYPTION: ${SUPERBOT_BACKUP_ENCRYPTION:-}
     # Per-user accounts (ISOLATION=users; docs/adr/0058-harness-os-user-by-default.md): sudo, the
     # image's only setuid program, starts each run as its user's account, and the root helper
     # superbot-userctl makes the account and its folders, and removes a leaving teammate's
