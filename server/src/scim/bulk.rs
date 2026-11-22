@@ -104,16 +104,14 @@ fn path(method: Method, p: &str) -> Option<(Kind, Option<String>)> {
 /// The quoted `"bulkId:<id>"` values in a PATCH path filter such as
 /// `members[value eq "bulkId:u"]`, as (start, end, id) with start..end covering the
 /// quotes. Each quoted value is read as a JSON string, escapes and all, as the filter
-/// itself is.
+/// itself is. Scanning stops at the first value that isn't one: the handler refuses
+/// that filter anyway, and retrying from each later quote would be quadratic.
 fn quoted_refs(s: &str) -> Vec<(usize, usize, String)> {
     let mut out = Vec::new();
     let mut from = 0;
     while let Some(at) = s[from..].find('"').map(|n| from + n) {
         let mut strings = serde_json::Deserializer::from_str(&s[at..]).into_iter::<String>();
-        let Some(Ok(value)) = strings.next() else {
-            from = at + 1;
-            continue;
-        };
+        let Some(Ok(value)) = strings.next() else { break };
         let end = at + strings.byte_offset();
         if let Some(id) = value.strip_prefix(BULK_ID) {
             out.push((at, end, id.to_string()));
@@ -560,5 +558,11 @@ mod tests {
         assert_eq!(out["Operations"][0]["path"], json!("members[value eq \"id-ab\"]"));
         assert_eq!(out["Operations"][1]["path"], json!("members[value eq \"u-1\"]"));
         assert_eq!(out["Operations"][2]["path"], escaped["Operations"][2]["path"]);
+
+        assert!(quoted_refs(r#"members[value eq "\x"] and members[value eq "bulkId:u"]"#).is_empty(), "nothing after a malformed value");
+        let unclosed = format!("members[value eq \"{}", "\\\"".repeat(MAX_PAYLOAD / 4));
+        let started = std::time::Instant::now();
+        assert!(quoted_refs(&unclosed).is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "one pass, not one per quote: {:?}", started.elapsed());
     }
 }
