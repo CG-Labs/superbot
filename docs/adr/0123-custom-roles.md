@@ -57,7 +57,7 @@ Someone with a delegable permission but not the admin role (a delegate) may not:
 - change, sign in as (a sign-in code), or sign out an admin, the owner account, or anyone with a custom role across the server, including other delegates and themselves;
 - make anyone an admin, by creating them, changing them, or approving their sign-up;
 - change a tier without `billing.manage`;
-- in a team: invite as owner or admin, withdraw or replace such an invite (inviting the same email again replaces it), or remove an owner, an admin, or anyone with a team role.
+- in a team: invite as owner or admin, withdraw or replace such an invite (inviting the same email again replaces it), or remove an owner, an admin, or anyone with a team role; nor, though a plain member of the team, a server admin, the owner account, or anyone with a custom role across the server (ADR 0138).
 
 Each refusal is a 403 and an `access.denied` event with `reason: "delegate_limit"` and the limit (`protected_user`, `admin_role`, `tier`, `team_role`).
 
