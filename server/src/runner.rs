@@ -391,12 +391,12 @@ impl App {
     /// `machine` (its owner's) or `nowhere`. None while routing is off: always here.
     /// Whether `owner_id`'s Bots run on this server: no machines, or routing says here.
     pub fn runs_here(&self, owner_id: &str) -> bool {
-        self.control_plane.get().is_none_or(|cp| matches!(cp.route(&self.db, owner_id), Ok(Target::Local)))
+        self.control_plane.get().is_none_or(|cp| matches!(cp.route(self, owner_id), Ok(Target::Local)))
     }
 
     pub fn runs_on(&self, bot: &Bot) -> Option<&'static str> {
         let cp = self.control_plane.get().filter(|cp| cp.routing != route::Routing::Off)?;
-        Some(match cp.route(&self.db, &bot.owner_id) {
+        Some(match cp.route(self, &bot.owner_id) {
             Ok(Target::Local) => "server",
             Ok(Target::Machine(_)) => "machine",
             Err(_) => "nowhere",
@@ -1541,7 +1541,7 @@ impl App {
             self.say(&bot.id, &text, true);
             None
         };
-        let to = match cp.route(&self.db, &bot.owner_id) {
+        let to = match cp.route(self, &bot.owner_id) {
             Ok(Target::Local) => return Some(Place::Here),
             Err(r) => return refused(r, None),
             Ok(Target::Machine(to)) => to,

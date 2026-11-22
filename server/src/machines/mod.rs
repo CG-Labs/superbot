@@ -556,8 +556,8 @@ impl ControlPlane {
     }
 
     /// Where `user_id`'s Bots run (`route::target`).
-    pub fn route(&self, db: &crate::db::Db, user_id: &str) -> Result<route::Target, route::Refusal> {
-        route::target(db, self, user_id)
+    pub fn route(&self, app: &App, user_id: &str) -> Result<route::Target, route::Refusal> {
+        route::target(&app.db, self, user_id, self.own_kernel_for(app.tier_of(user_id)))
     }
 
     /// Whether a run of `bin` may start on `machine_id` now, beyond `route::fit`: the Bots'
@@ -1902,7 +1902,7 @@ pub async fn mine(
 /// Where a user's Bots run now, and why, as admins see it.
 fn placement_view(app: &App, cp: &ControlPlane, user_id: &str) -> Value {
     let m = app.db.user_machine(user_id);
-    let (runs_on, reason, message) = match cp.route(&app.db, user_id) {
+    let (runs_on, reason, message) = match cp.route(app, user_id) {
         Ok(route::Target::Local) => ("server", None, None),
         Ok(route::Target::Machine(_)) => ("machine", None, None),
         Err(r) => ("nowhere", Some(r.reason()), Some(r.message())),
