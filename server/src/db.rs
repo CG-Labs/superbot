@@ -3279,6 +3279,7 @@ impl Db {
         if let Some(v) = p.prompts { set("prompts", &v.map(|l| serde_json::to_string(&l).unwrap())) }
     }
 
+    #[cfg(test)]
     pub fn delete_bot(&self, id: &str) {
         self.c().execute("DELETE FROM bots WHERE id = ?", [id]).unwrap();
     }
