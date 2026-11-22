@@ -1158,18 +1158,18 @@ mod tests {
         assert_eq!(r.first_broken.map(|b| (b.id, b.reason)), Some((ids[1], "contents")));
     }
 
-    const NONCE: [u8; 4] = [0x41, 2, 3, 4];
-
     /// Stamps `c` as the stamper does, with the fake TSA's token: the token and its event.
     fn stamp_by_hand(app: &App, fake: &FakeTsa, c: &Checkpoint) -> (Vec<u8>, i64) {
         app.db.execute_raw(&format!("UPDATE audit_checkpoints SET tsa_status = 'pending', tsa = 'http://tsa.test' WHERE event_id = {}", c.id)).unwrap();
-        let token = fake.token(&c.imprint(), Some(&NONCE), 1_795_386_498_000);
+        let mut nonce = crate::random_bytes(8);
+        nonce[0] = (nonce[0] & 0x7f) | 0x40;
+        let token = fake.token(&c.imprint(), Some(&nonce), 1_795_386_498_000);
         let ev = app
             .db
             .record_with(&Event::new(Actor::system("audit_timestamp"), TIMESTAMPED), |db, id, _| {
                 db.execute(
                     "UPDATE audit_checkpoints SET tsa_status = 'stamped', tsa_token = ?, tsa_time = ?, tsa_nonce = ?, tsa_event_id = ? WHERE event_id = ?",
-                    params![b64().encode(&token), 1_795_386_498_000i64, hex(&NONCE), id, c.id],
+                    params![b64().encode(&token), 1_795_386_498_000i64, hex(&nonce), id, c.id],
                 )?;
                 Ok(json!({ "checkpoint": c.id, "time": 1_795_386_498_000i64, "timestampSha256": hex(&Sha256::digest(&token)) }))
             })
@@ -1196,7 +1196,8 @@ mod tests {
 
         // Swapping in a token for something else is caught.
         app.db.execute_raw("DROP TRIGGER audit_checkpoints_signed").unwrap();
-        let other = fake.token(&[0; 32], Some(&NONCE), 1_795_386_498_000);
+        let nonce = app.db.with_conn(|x| row(x, c.id)).unwrap().unwrap().tsa_nonce.and_then(|n| unhex(&n)).unwrap();
+        let other = fake.token(&[0; 32], Some(&nonce), 1_795_386_498_000);
         app.db.execute_raw(&format!("UPDATE audit_checkpoints SET tsa_token = '{}' WHERE event_id = {}", b64().encode(&other), c.id)).unwrap();
         assert_eq!(checks(&app, Options::default()).checkpoints.unwrap().first_broken.unwrap().reason, "record");
         // Even with the event's hash of it rewritten and the chain resealed.

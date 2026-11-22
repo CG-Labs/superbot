@@ -715,8 +715,25 @@ mod tests {
     const FREETSA: &[u8] = include_bytes!("../tests/fixtures/tsa/freetsa.tsr");
     const DIGICERT_ROOT: &str = include_str!("../tests/fixtures/tsa/digicert-root-g4.crt");
     const FREETSA_CA: &str = include_str!("../tests/fixtures/tsa/freetsa-ca.crt");
-    /// Both fixtures stamp SHA-256("hello") with this nonce.
-    const NONCE: [u8; 8] = [0x69, 0x04, 0xa9, 0x9f, 0xdc, 0x9b, 0x99, 0x6f];
+
+    /// A fresh nonce, as `audit_checkpoint::stamp` makes them.
+    fn nonce() -> Vec<u8> {
+        let mut n = crate::random_bytes(8);
+        n[0] = (n[0] & 0x7f) | 0x40;
+        n
+    }
+
+    /// The nonce a recorded token was asked for with (both fixtures stamp SHA-256("hello")).
+    fn fixture_nonce(token: &[u8]) -> Vec<u8> {
+        let mut ci = Reader::new(token).expect(SEQ).unwrap().reader();
+        read_oid(&mut ci).unwrap();
+        let mut sd = ci.expect(CTX0).unwrap().reader().expect(SEQ).unwrap().reader();
+        sd.expect(INT).unwrap();
+        sd.expect(SET).unwrap();
+        let mut encap = sd.expect(SEQ).unwrap().reader();
+        read_oid(&mut encap).unwrap();
+        tst_info(encap.expect(CTX0).unwrap().reader().expect(OCTETS).unwrap().body).unwrap().nonce.unwrap()
+    }
 
     fn hello() -> Vec<u8> {
         Sha256::digest(b"hello").to_vec()
@@ -744,13 +761,14 @@ mod tests {
     #[test]
     fn requests_parse_as_rfc_3161() {
         let imprint: [u8; 32] = hello().try_into().unwrap();
-        let req = request(&imprint, &NONCE);
+        let sent = nonce();
+        let req = request(&imprint, &sent);
         let mut r = Reader::new(&req).expect(SEQ).unwrap().reader();
         assert_eq!(r.expect(INT).unwrap().body, &[1]);
         let mut m = r.expect(SEQ).unwrap().reader();
         assert_eq!(algorithm(m.expect(SEQ).unwrap()).unwrap(), SHA256);
         assert_eq!(m.expect(OCTETS).unwrap().body, &imprint);
-        assert_eq!(unsigned(r.expect(INT).unwrap().body), &NONCE);
+        assert_eq!(unsigned(r.expect(INT).unwrap().body), &sent[..]);
         assert_eq!(r.expect(BOOL).unwrap().body, &[0xff], "asks for the TSA's certificate");
     }
 
@@ -758,17 +776,19 @@ mod tests {
     fn real_tokens_from_public_tsas_verify() {
         for (reply, ca, subject) in [(DIGICERT, DIGICERT_ROOT, "DigiCert"), (FREETSA, FREETSA_CA, "freetsa")] {
             let token = token_from_reply(reply).unwrap();
-            let s = verify(&token, &hello(), Some(&NONCE), &Trust::default()).unwrap();
+            let sent = fixture_nonce(&token);
+            assert_eq!(sent.len(), 8, "{subject}");
+            let s = verify(&token, &hello(), Some(&sent), &Trust::default()).unwrap();
             assert_eq!((s.trusted, s.time / 1000), (None, 1_795_386_498), "{subject}: {s:?}");
             assert!(s.tsa_subject.contains(subject), "{s:?}");
             let trust = Trust::from_pem(ca).unwrap();
-            assert_eq!(verify(&token, &hello(), Some(&NONCE), &trust).unwrap().trusted, Some(true), "{subject}");
+            assert_eq!(verify(&token, &hello(), Some(&sent), &trust).unwrap().trusted, Some(true), "{subject}");
             // Someone else's CA doesn't vouch for it.
             let other = if subject == "DigiCert" { FREETSA_CA } else { DIGICERT_ROOT };
             assert_eq!(verify(&token, &hello(), None, &Trust::from_pem(other).unwrap()).unwrap_err().code, "untrusted", "{subject}");
             // Another hash, another nonce.
             assert_eq!(verify(&token, &Sha256::digest(b"hellp"), None, &trust).unwrap_err().code, "imprint");
-            assert_eq!(verify(&token, &hello(), Some(&[1, 2, 3]), &trust).unwrap_err().code, "nonce");
+            assert_eq!(verify(&token, &hello(), Some(&nonce()), &trust).unwrap_err().code, "nonce");
         }
     }
 
@@ -793,22 +813,23 @@ mod tests {
     fn the_fake_tsa_is_a_real_one() {
         let tsa = FakeTsa::new();
         let imprint: [u8; 32] = hello().try_into().unwrap();
-        let reply = tsa.reply(&request(&imprint, &NONCE), 1_795_000_000_123);
+        let sent = nonce();
+        let reply = tsa.reply(&request(&imprint, &sent), 1_795_000_000_123);
         let token = token_from_reply(&reply).unwrap();
         let trust = Trust::from_pem(&tsa.ca_pem).unwrap();
-        let s = verify(&token, &imprint, Some(&NONCE), &trust).unwrap();
+        let s = verify(&token, &imprint, Some(&sent), &trust).unwrap();
         assert_eq!((s.time, s.trusted, s.policy.as_str()), (1_795_000_000_123, Some(true), "1.2.3.4.1"));
         assert_eq!(verify(&token, &imprint, None, &Trust::from_pem(&FakeTsa::new().ca_pem).unwrap()).unwrap_err().code, "untrusted");
         let plain = FakeTsa::with_stamping(false);
-        let t = token_from_reply(&plain.reply(&request(&imprint, &NONCE), 1_795_000_000_000)).unwrap();
+        let t = token_from_reply(&plain.reply(&request(&imprint, &nonce()), 1_795_000_000_000)).unwrap();
         assert_eq!(verify(&t, &imprint, None, &Trust::default()).unwrap_err().code, "certificate", "not a time-stamping certificate");
         let lax = FakeTsa::with_usage(Some(false));
-        let t = token_from_reply(&lax.reply(&request(&imprint, &NONCE), 1_795_000_000_000)).unwrap();
+        let t = token_from_reply(&lax.reply(&request(&imprint, &nonce()), 1_795_000_000_000)).unwrap();
         assert_eq!(verify(&t, &imprint, None, &Trust::default()).unwrap_err().code, "certificate", "time-stamping, but not critical");
         use rcgen::ExtendedKeyUsagePurpose as Eku;
         for (usages, trusted) in [(vec![], true), (vec![Eku::TimeStamping], true), (vec![Eku::ServerAuth], false), (vec![Eku::ServerAuth, Eku::ClientAuth], false)] {
             let tsa = FakeTsa::with_intermediate(usages.clone());
-            let t = token_from_reply(&tsa.reply(&request(&imprint, &NONCE), 1_795_000_000_000)).unwrap();
+            let t = token_from_reply(&tsa.reply(&request(&imprint, &nonce()), 1_795_000_000_000)).unwrap();
             let r = verify(&t, &imprint, None, &Trust::from_pem(&tsa.ca_pem).unwrap());
             assert_eq!(r.as_ref().map(|s| s.trusted).map_err(|e| e.code), if trusted { Ok(Some(true)) } else { Err("untrusted") }, "an intermediate for {usages:?}");
         }
