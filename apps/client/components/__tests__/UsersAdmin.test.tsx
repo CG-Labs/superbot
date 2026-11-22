@@ -89,7 +89,7 @@ function fakeApi(list: AdminUser[], requests: SignupRequest[] = [], roles: Custo
     }),
     patchUser: jest.fn(async (id: string, b: Partial<AdminUser>) => {
       const u = users.find((x) => x.id === id)!;
-      Object.assign(u, b);
+      Object.assign(u, b, b.role ? { roleId: null, customRole: null } : {});
       return u;
     }),
     createLoginCode: jest.fn(async () => ({ code: CODE, expiresAt: Date.now() + 24 * 3600_000 })),
@@ -356,6 +356,10 @@ describe("UsersAdmin", () => {
     expect(within(screen.getByLabelText("User Alex")).getByText("Read-only")).toBeOnTheScreen();
     await user.press(screen.getByRole("radio", { name: "Read-only" }));
     await waitFor(() => expect(api.patchUser).toHaveBeenCalledWith("u1", { role: "readonly" }));
+    await waitFor(() => expect(within(screen.getByLabelText("User Alex")).queryByText("Support")).toBeNull());
+    await user.press(screen.getByRole("radio", { name: "Support" }));
+    await waitFor(() => expect(api.assignRole).toHaveBeenCalledTimes(2));
+    expect(await within(screen.getByLabelText("User Alex")).findByText("Support")).toBeOnTheScreen();
     await user.press(screen.getByRole("radio", { name: "None" }));
     await waitFor(() => expect(api.unassignRole).toHaveBeenCalledWith("r1", "u1"));
 
@@ -363,7 +367,7 @@ describe("UsersAdmin", () => {
     await user.press(screen.getByLabelText("User Owner"));
     await act(async () => {});
     await user.press(screen.getByRole("radio", { name: "Support" }));
-    expect(api.assignRole).toHaveBeenCalledTimes(1);
+    expect(api.assignRole).toHaveBeenCalledTimes(2);
   });
 
   it("won't let you change your own or the owner's role or status", async () => {
