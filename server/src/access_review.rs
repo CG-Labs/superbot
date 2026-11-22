@@ -52,12 +52,17 @@ fn session_view(s: &Session, cfg: &SessionConfig) -> Value {
 
 /// The report as it stands now.
 pub fn build(app: &App, a: &Auth) -> Report {
+    build_with(app, &a.sessions)
+}
+
+/// The report, with sessions judged live by `sessions`' lifetimes.
+pub fn build_with(app: &App, sessions: &SessionConfig) -> Report {
     let at = db::now();
     let users = app.db.users();
     let names: HashMap<&str, &str> = users.iter().map(|u| (u.id.as_str(), u.name.as_str())).collect();
     let mfa = app.db.mfa_enabled();
     let teams: HashMap<String, String> = app.db.teams().into_iter().map(|t| (t.id, t.name)).collect();
-    let mut rows: Vec<Row> = users.iter().map(|u| person(app, a, u, at, &names, &mfa, &teams)).collect();
+    let mut rows: Vec<Row> = users.iter().map(|u| person(app, sessions, u, at, &names, &mfa, &teams)).collect();
     rows.sort_by(|x, y| {
         let key = |r: &Row| (r.tenant.clone().unwrap_or_default(), r.team.as_ref().map(|t| t.1.to_lowercase()).unwrap_or_default(), r.team.as_ref().map(|t| t.0.clone()));
         key(x).cmp(&key(y)).then_with(|| x.view["name"].as_str().unwrap_or("").to_lowercase().cmp(&y.view["name"].as_str().unwrap_or("").to_lowercase())).then_with(|| x.view["id"].as_str().cmp(&y.view["id"].as_str()))
@@ -80,7 +85,7 @@ fn with_custom(p: &Value) -> String {
     }
 }
 
-fn person(app: &App, a: &Auth, u: &User, at: i64, names: &HashMap<&str, &str>, mfa: &HashMap<String, i64>, teams: &HashMap<String, String>) -> Row {
+fn person(app: &App, cfg: &SessionConfig, u: &User, at: i64, names: &HashMap<&str, &str>, mfa: &HashMap<String, i64>, teams: &HashMap<String, String>) -> Row {
     let scim = app.db.scim_user_of(&u.id);
     let member = app.db.team_member(&u.id);
     let team = member.as_ref().map(|m| (m.team_id.clone(), teams.get(&m.team_id).cloned().unwrap_or_else(|| m.team_id.clone())));
@@ -100,7 +105,7 @@ fn person(app: &App, a: &Auth, u: &User, at: i64, names: &HashMap<&str, &str>, m
             })
             .collect()
     };
-    let live = app.db.user_live_sessions(&u.id, at, a.sessions.idle_ms, a.sessions.max_ms);
+    let live = app.db.user_live_sessions(&u.id, at, cfg.idle_ms, cfg.max_ms);
     let (tokens, browsers): (Vec<&Session>, Vec<&Session>) = live.iter().partition(|s| s.kind == "token");
     let machine = app.db.user_machine(&u.id);
     let mfa_at = mfa.get(&u.id).copied();
@@ -116,8 +121,8 @@ fn person(app: &App, a: &Auth, u: &User, at: i64, names: &HashMap<&str, &str>, m
         "mfa": { "enabled": mfa_at.is_some(), "enabledAt": mfa_at },
         "lastLogin": u.last_login_at.map(|at| json!({ "at": at, "method": u.last_login_method, "idpProvider": u.last_login_idp_provider })),
         "botAccess": { "all": all_bots, "bots": bots },
-        "sessions": browsers.iter().map(|s| session_view(s, &a.sessions)).collect::<Vec<_>>(),
-        "apiTokens": tokens.iter().map(|s| session_view(s, &a.sessions)).collect::<Vec<_>>(),
+        "sessions": browsers.iter().map(|s| session_view(s, cfg)).collect::<Vec<_>>(),
+        "apiTokens": tokens.iter().map(|s| session_view(s, cfg)).collect::<Vec<_>>(),
         "machine": machine.as_ref().map(|m| json!({ "id": m.id, "provider": m.provider, "state": m.state.as_str(), "enrollment": m.enrollment, "assignedAt": m.assigned_at })),
         "customRole": custom.as_ref().map(|r| role_view(r, r.perms())),
     });
@@ -146,7 +151,8 @@ fn person(app: &App, a: &Auth, u: &User, at: i64, names: &HashMap<&str, &str>, m
 }
 
 impl Report {
-    fn people(&self) -> impl Iterator<Item = &Value> {
+    /// Each person as the report shows them.
+    pub fn people(&self) -> impl Iterator<Item = &Value> {
         self.rows.iter().map(|r| &r.view)
     }
 
