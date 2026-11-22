@@ -322,6 +322,7 @@ async fn metrics_show_each_hosts_allocation_against_its_capacity_and_what_it_use
     // With /metrics off, botd never asks hosts what they use; placement's view and
     // botd's own host are there all the same.
     reconcile(&env).await;
+    read_uses(&env).await;
     assert!(env.a.calls("GET", "/1.0/resources").is_empty(), "no extra calls with metrics off");
     let m = crate::obs::render(&env.app);
     assert_eq!(value(&m, r#"superbot_incus_host_up{host="a"}"#), Some(1.0), "{m}");
@@ -333,9 +334,10 @@ async fn metrics_show_each_hosts_allocation_against_its_capacity_and_what_it_use
     assert!(value(&m, r#"superbot_host_cpus{host="botd",kind="server"}"#).is_some_and(|n| n > 0.0), "{m}");
     assert!(!m.contains(r#"kind="incus""#), "{m}");
 
-    // With it on, each host check reads what each host has and uses.
+    // With it on, botd reads what each host has and uses.
     env.app.db.metrics().want_host_use();
     let (_, ada) = machine_on(&env, &env.a, "a", "ada@example.com", false).await;
+    read_uses(&env).await;
     let m = crate::obs::render(&env.app);
     assert_eq!(value(&m, r#"superbot_incus_host_machines{host="a"}"#), Some(1.0), "{m}");
     assert_eq!(value(&m, r#"superbot_incus_host_machines{host="b"}"#), Some(0.0), "{m}");
@@ -356,6 +358,7 @@ async fn metrics_show_each_hosts_allocation_against_its_capacity_and_what_it_use
     env.a.w().pool_resources = Value::Null;
     env.a.w().resources["memory"]["used"] = json!(60u64 << 30);
     reconcile(&env).await;
+    read_uses(&env).await;
     let (code, d) = json_call(&env, "PUT", "/api/machines/hosts/a/drain", "{}").await;
     assert_eq!(code, 200, "{d}");
     let m = crate::obs::render(&env.app);
@@ -386,4 +389,25 @@ async fn metrics_show_each_hosts_allocation_against_its_capacity_and_what_it_use
     }
     let dashboard: Value = serde_json::from_str(include_str!("../../deploy/grafana/superbot-capacity.json")).unwrap();
     assert!(dashboard["panels"].as_array().is_some_and(|p| !p.is_empty()), "a Grafana dashboard with panels");
+
+    // A host that answers checks but never says what it uses holds up neither host
+    // checks, reconciling, nor reading the others; it keeps its last reading.
+    env.b.w().down = false;
+    reconcile(&env).await;
+    env.a.w().stall_resources = true;
+    let asked = env.a.calls("GET", "/1.0/resources").len();
+    env.b.w().resources["memory"]["used"] = json!(3u64 << 30);
+    let start = std::time::Instant::now();
+    reconcile(&env).await;
+    assert!(start.elapsed() < std::time::Duration::from_secs(5), "reconciling waited for a stalled host: {:?}", start.elapsed());
+    crate::machines::hosts::read_uses(&env.app, &env.cp, std::time::Duration::from_millis(300)).await;
+    assert!(start.elapsed() < std::time::Duration::from_secs(5), "reading waited past its limit: {:?}", start.elapsed());
+    assert_eq!(env.a.calls("GET", "/1.0/resources").len(), asked + 1, "a was asked once, by the reading, not by checks");
+    let m = crate::obs::render(&env.app);
+    assert_eq!(value(&m, r#"superbot_host_memory_used_bytes{host="a",kind="incus"}"#), Some(60.0 * gib), "{m}");
+    assert_eq!(value(&m, r#"superbot_host_memory_used_bytes{host="b",kind="incus"}"#), Some(3.0 * gib), "{m}");
+}
+
+async fn read_uses(env: &Env) {
+    crate::machines::hosts::read_uses(&env.app, &env.cp, std::time::Duration::from_secs(5)).await;
 }

@@ -297,7 +297,7 @@ impl Metrics {
         m.reconcile_last = Some((at_ms, seconds));
     }
 
-    /// Has the host check read each Incus host's use (ADR 0106): set when `/metrics`
+    /// Has botd read each Incus host's use (ADR 0106): set when `/metrics`
     /// is on, so a server without it makes no extra calls to its hosts.
     pub fn want_host_use(&self) {
         self.lock().host_use_wanted = true;

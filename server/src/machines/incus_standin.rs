@@ -88,6 +88,8 @@ pub struct World {
     pub resources: Value,
     /// What `GET /1.0/storage-pools/default/resources` answers; null: an error.
     pub pool_resources: Value,
+    /// `GET .../resources` is recorded and never answered.
+    pub stall_resources: bool,
     ops: BTreeMap<String, Op>,
     trusted: Vec<String>,
     next_ip: u8,
@@ -463,6 +465,10 @@ impl World {
     }
 }
 
+/// Marks a response never to be sent.
+#[derive(Clone)]
+struct Stall;
+
 async fn handle(
     State(world): State<Arc<Mutex<World>>>,
     Extension(peer): Extension<pki::Peer>,
@@ -471,6 +477,14 @@ async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let r = respond(&world, peer, method, uri, headers, body);
+    if r.extensions().get::<Stall>().is_some() {
+        return std::future::pending().await;
+    }
+    r
+}
+
+fn respond(world: &Mutex<World>, peer: pki::Peer, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     let mut w = world.lock().unwrap();
     if w.down {
         return err(503, "the host is down");
@@ -498,6 +512,11 @@ async fn handle(
         body: body.clone(),
         if_match: header("if-match"),
     });
+    if w.stall_resources && uri.path().ends_with("/resources") {
+        let mut r = Response::default();
+        r.extensions_mut().insert(Stall);
+        return r;
+    }
     let if_match = header("if-match");
     let parts: Vec<&str> = uri.path().trim_start_matches('/').split('/').collect();
     match (method.as_str(), &parts[..]) {
