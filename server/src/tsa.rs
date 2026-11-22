@@ -50,7 +50,8 @@ const GENERALIZED_TIME: u8 = 0x18;
 const CTX0: u8 = 0xa0;
 const CTX1: u8 = 0xa1;
 /// How deep a certificate chain may go.
-const MAX_CHAIN: usize = 6;
+/// id-kp-timeStamping (1.3.6.1.5.5.7.3.8), the OID's value bytes.
+const EKU_TIME_STAMPING: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x08];
 /// Bigger than any real reply (a few KB with the TSA's chain); a bound on what we read.
 pub const MAX_REPLY: usize = 256 * 1024;
 
@@ -414,41 +415,36 @@ fn only_stamping(u: &x509_parser::extensions::ExtendedKeyUsage) -> bool {
     !(u.any || u.server_auth || u.client_auth || u.code_signing || u.email_protection || u.ocsp_signing || !u.other.is_empty())
 }
 
-/// `child` was signed by `issuer`'s key.
-fn issued_by(child: &Cert, issuer: &Cert) -> bool {
-    child.issuer().as_raw() == issuer.subject().as_raw()
-        && verify_signature(issuer.public_key().raw, &child.signature_algorithm.algorithm.to_id_string(), None, child.tbs_certificate.as_ref(), &child.signature_value.data).is_ok()
-}
-
-fn is_ca(c: &Cert) -> bool {
-    matches!(c.basic_constraints(), Ok(Some(b)) if b.value.ca)
-}
-
-/// The signer is an anchor, or chains to one through `pool` (the token's certificates),
-/// each link signed by the next and valid at `at`, each issuer below the anchor a CA.
+/// The signer is an anchor, or chains to one valid at `at` through `pool` (the token's
+/// certificates). webpki checks the path as RFC 5280 asks: signatures, validity at `at`,
+/// basic constraints and path lengths, name constraints, unknown critical extensions, and
+/// that no certificate's extended key usage leaves out time-stamping.
 fn chains(signer: &[u8], pool: &[&[u8]], trust: &Trust, at: i64) -> Result<(), Invalid> {
-    let untrusted = |why: &str| bad("untrusted", format!("the TSA's certificate doesn't chain to AUDIT_TIMESTAMP_CA_FILE: {why}"));
-    let mut cur = signer;
-    for _ in 0..MAX_CHAIN {
-        if trust.anchors.iter().any(|a| a.as_slice() == cur) {
-            return Ok(());
-        }
-        let c = parse_cert(cur)?;
-        let anchor = trust.anchors.iter().map(Vec::as_slice).find(|a| parse_cert(a).is_ok_and(|a| issued_by(&c, &a)));
-        if let Some(a) = anchor {
-            return if parse_cert(a).is_ok_and(|a| valid_at(&a, at)) { Ok(()) } else { Err(untrusted("the CA wasn't valid at the token's time")) };
-        }
-        let next = pool.iter().copied().filter(|p| *p != cur).find(|p| parse_cert(p).is_ok_and(|p| issued_by(&c, &p)));
-        let Some(next) = next else {
-            return Err(untrusted("no issuer for it"));
-        };
-        let n = parse_cert(next)?;
-        if !is_ca(&n) || !valid_at(&n, at) {
-            return Err(untrusted("an intermediate isn't a CA valid at the token's time"));
-        }
-        cur = next;
+    use rustls::pki_types::{CertificateDer, UnixTime};
+    let untrusted = |why: String| bad("untrusted", format!("the TSA's certificate doesn't chain to AUDIT_TIMESTAMP_CA_FILE: {why}"));
+    if trust.anchors.iter().any(|a| a.as_slice() == signer) {
+        return Ok(());
     }
-    Err(untrusted("the chain is too long"))
+    let ee = CertificateDer::from(signer);
+    let ee = webpki::EndEntityCert::try_from(&ee).map_err(|e| untrusted(format!("its certificate can't be read ({e})")))?;
+    let intermediates: Vec<CertificateDer> = pool.iter().filter(|p| **p != signer).map(|p| CertificateDer::from(*p)).collect();
+    let time = UnixTime::since_unix_epoch(std::time::Duration::from_millis(at.max(0) as u64));
+    let mut why = "no CA in it issued the TSA's certificate".to_string();
+    for der in &trust.anchors {
+        if !parse_cert(der).is_ok_and(|a| valid_at(&a, at)) {
+            why = "the CA wasn't valid at the token's time".into();
+            continue;
+        }
+        let der = CertificateDer::from(der.as_slice());
+        let Ok(anchor) = webpki::anchor_from_trusted_cert(&der) else { continue };
+        let usage = webpki::KeyUsage::required_if_present(EKU_TIME_STAMPING);
+        match ee.verify_for_usage(webpki::ALL_VERIFICATION_ALGS, &[anchor], &intermediates, time, usage, None, None) {
+            Ok(_) => return Ok(()),
+            Err(webpki::Error::UnknownIssuer) => {}
+            Err(e) => why = format!("{e}"),
+        }
+    }
+    Err(untrusted(why))
 }
 
 /// Checks `token` (a TimeStampToken, DER) against the SHA-256 `imprint` it should stamp,
@@ -613,6 +609,7 @@ pub mod fake {
     pub struct FakeTsa {
         pub ca_pem: String,
         pub leaf: Vec<u8>,
+        extra: Vec<Vec<u8>>,
         key: EcdsaKeyPair,
     }
 
@@ -628,11 +625,34 @@ pub mod fake {
 
         /// `critical`: its certificate's time-stamping extended key usage, if any, and whether it's critical.
         pub fn with_usage(critical: Option<bool>) -> FakeTsa {
+            FakeTsa::build(critical, None)
+        }
+
+        /// Its certificate is issued by an intermediate CA with these extended key usages
+        /// (none: no such extension), which the token carries.
+        pub fn with_intermediate(usages: Vec<rcgen::ExtendedKeyUsagePurpose>) -> FakeTsa {
+            FakeTsa::build(Some(true), Some(usages))
+        }
+
+        fn build(critical: Option<bool>, intermediate: Option<Vec<rcgen::ExtendedKeyUsagePurpose>>) -> FakeTsa {
             let ca_key = rcgen::KeyPair::generate().unwrap();
             let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
             ca.distinguished_name.push(rcgen::DnType::CommonName, "Test TSA Root");
             ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-            let ca = rcgen::CertifiedIssuer::self_signed(ca, ca_key).unwrap();
+            let root = rcgen::CertifiedIssuer::self_signed(ca, ca_key).unwrap();
+            let ca_pem = root.pem();
+            let (ca, extra) = match intermediate {
+                Some(usages) => {
+                    let mut p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+                    p.distinguished_name.push(rcgen::DnType::CommonName, "Test TSA Intermediate");
+                    p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+                    p.extended_key_usages = usages;
+                    let i = rcgen::CertifiedIssuer::signed_by(p, rcgen::KeyPair::generate().unwrap(), &root).unwrap();
+                    let der = i.der().to_vec();
+                    (i, vec![der])
+                }
+                None => (root, vec![]),
+            };
             let key = rcgen::KeyPair::generate().unwrap();
             let mut leaf = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
             leaf.distinguished_name.push(rcgen::DnType::CommonName, "Test TSA");
@@ -644,7 +664,7 @@ pub mod fake {
                 leaf.custom_extensions.push(ext);
             }
             let leaf = leaf.signed_by(&key, &ca).unwrap();
-            FakeTsa { ca_pem: ca.pem(), leaf: leaf.der().to_vec(), key: EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &key.serialize_der()).unwrap() }
+            FakeTsa { ca_pem, leaf: leaf.der().to_vec(), extra, key: EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &key.serialize_der()).unwrap() }
         }
 
         /// A TimeStampResp granting `request` (a TimeStampReq), stamped at `time` (unix ms).
@@ -680,7 +700,7 @@ pub mod fake {
             let sid = seq(&[leaf.issuer().as_raw(), &uint(leaf.raw_serial())]);
             let signer = seq(&[&uint(&[1]), &sid, &alg, &tlv(CTX0, &attrs), &seq(&[&oid("1.2.840.10045.4.3.2")]), &tlv(OCTETS, sig.as_ref())]);
             let encap = seq(&[&oid(TST_INFO), &tlv(CTX0, &tlv(OCTETS, &tst))]);
-            let signed = seq(&[&uint(&[3]), &tlv(SET, &alg), &encap, &tlv(CTX0, &self.leaf), &tlv(SET, &signer)]);
+            let signed = seq(&[&uint(&[3]), &tlv(SET, &alg), &encap, &tlv(CTX0, &[&self.leaf[..], &self.extra.concat()].concat()), &tlv(SET, &signer)]);
             seq(&[&oid(SIGNED_DATA), &tlv(CTX0, &signed)])
         }
     }
@@ -693,8 +713,8 @@ mod tests {
 
     const DIGICERT: &[u8] = include_bytes!("../tests/fixtures/tsa/digicert.tsr");
     const FREETSA: &[u8] = include_bytes!("../tests/fixtures/tsa/freetsa.tsr");
-    const DIGICERT_ROOT: &str = include_str!("../tests/fixtures/tsa/digicert-root-g4.pem");
-    const FREETSA_CA: &str = include_str!("../tests/fixtures/tsa/freetsa-ca.pem");
+    const DIGICERT_ROOT: &str = include_str!("../tests/fixtures/tsa/digicert-root-g4.crt");
+    const FREETSA_CA: &str = include_str!("../tests/fixtures/tsa/freetsa-ca.crt");
     /// Both fixtures stamp SHA-256("hello") with this nonce.
     const NONCE: [u8; 8] = [0x69, 0x04, 0xa9, 0x9f, 0xdc, 0x9b, 0x99, 0x6f];
 
@@ -785,6 +805,13 @@ mod tests {
         let lax = FakeTsa::with_usage(Some(false));
         let t = token_from_reply(&lax.reply(&request(&imprint, &NONCE), 1_795_000_000_000)).unwrap();
         assert_eq!(verify(&t, &imprint, None, &Trust::default()).unwrap_err().code, "certificate", "time-stamping, but not critical");
+        use rcgen::ExtendedKeyUsagePurpose as Eku;
+        for (usages, trusted) in [(vec![], true), (vec![Eku::TimeStamping], true), (vec![Eku::ServerAuth], false), (vec![Eku::ServerAuth, Eku::ClientAuth], false)] {
+            let tsa = FakeTsa::with_intermediate(usages.clone());
+            let t = token_from_reply(&tsa.reply(&request(&imprint, &NONCE), 1_795_000_000_000)).unwrap();
+            let r = verify(&t, &imprint, None, &Trust::from_pem(&tsa.ca_pem).unwrap());
+            assert_eq!(r.as_ref().map(|s| s.trusted).map_err(|e| e.code), if trusted { Ok(Some(true)) } else { Err("untrusted") }, "an intermediate for {usages:?}");
+        }
         let e = token_from_reply(&FakeTsa::refusal()).unwrap_err();
         assert_eq!(e.code, "refused");
         assert!(e.message.contains("status 2") && e.message.contains("unsupported policy"), "{e}");
