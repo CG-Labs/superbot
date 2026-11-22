@@ -104,6 +104,26 @@ function regionCell(r) {
   return `${esc(r.region)}<div class="sub">${esc(REGION_FROM[r.source] || r.source)}</div>${gone}`;
 }
 
+// A residency pin (ADR 0129): their data held to a region under an agreement.
+function pinNote(p) {
+  if (!p) return "";
+  return `<div class="sub">Pinned${p.subjectType === "team" ? " by team" : ""} to ${esc(p.region)} · ${esc(p.reference)}</div>`;
+}
+
+async function setResidency(path, who, pin, region) {
+  if (pin) {
+    const why = prompt(`${who}'s data is pinned to ${pin.region} under "${pin.reference}". To unpin, give the reason; it is audited. The data region stays as it is.`);
+    if (!why?.trim()) return;
+    await api("DELETE", path, { reason: why.trim() });
+    return;
+  }
+  const r = prompt(`Pin ${who}'s data to a region under an agreement: machines, backups and restores stay there or are refused. Refused while any of it is elsewhere. Region:`, region || "");
+  if (!r?.trim()) return;
+  const ref = prompt("The agreement it is under (for example a DPA reference):");
+  if (!ref?.trim()) return;
+  await api("PUT", path, { region: r.trim(), reference: ref.trim() });
+}
+
 async function setRegion(path, who, current) {
   const r = prompt(`Data region for ${who}: where their machines and backups live. Leave empty for the default. Refused while a machine is elsewhere.`, current || "");
   if (r === null || r.trim() === (current || "")) return;
@@ -120,13 +140,14 @@ function renderUsers() {
       <td>${lastLogin(u)}</td>
       <td>${u.pendingCodes ? `Waiting<div class="sub">until ${esc(fmt(u.pendingCodes.expiresAt))}</div>` : ""}</td>
       <td>${u.mfa?.enabled ? `On<div class="sub">since ${esc(fmt(u.mfa.enabledAt))}</div>` : ""}</td>
-      <td>${regionCell(u.dataRegion)}</td>
+      <td>${regionCell(u.dataRegion)}${pinNote(u.residency)}${u.ownResidency && u.residency?.subjectType === "team" ? pinNote(u.ownResidency) : ""}</td>
       <td class="actions">
         <button type="button" class="btn" data-act="code" ${active ? "" : "disabled"}>New code</button>
         ${u.mfa?.enabled && u.id !== me.user?.id ? '<button type="button" class="btn" data-act="mfa">Reset 2FA</button>' : ""}
         ${u.breakGlass ? "" : `<button type="button" class="btn" data-act="status">${active ? "Disable" : "Enable"}</button>`}
         <button type="button" class="btn" data-act="sessions">Sign out everywhere</button>
         ${u.dataRegion ? '<button type="button" class="btn" data-act="region">Data region</button>' : ""}
+        ${u.dataRegion && (u.ownResidency || !u.residency) ? `<button type="button" class="btn" data-act="residency">${u.ownResidency ? "Unpin" : "Pin region"}</button>` : ""}
       </td>
     </tr>`;
   }).join("");
@@ -165,6 +186,7 @@ $("users-rows").addEventListener("click", async (e) => {
       notice(`Two-factor authentication reset for ${u.name}.`, false);
     }
     if (t.dataset.act === "region") await setRegion(`/api/users/${key(u.id)}/region`, u.name, u.region);
+    if (t.dataset.act === "residency") await setResidency(`/api/users/${key(u.id)}/residency`, u.name, u.ownResidency, u.dataRegion?.region);
     if (t.dataset.act === "sessions") {
       if (!confirm(`Sign ${u.name} out of every session?`)) return;
       const r = await api("DELETE", `/api/users/${key(u.id)}/sessions`);
@@ -370,8 +392,9 @@ async function loadRegions(off) {
   if (off) return;
   try {
     const r = await api("GET", "/api/regions");
-    const each = r.regions.map((x) => `${x.id}${x.default ? " (default)" : ""}${x.offered ? "" : " (no longer offered)"}: ${x.machines} machine${x.machines === 1 ? "" : "s"}`);
-    const warn = (r.backups?.warnings || []).join(" ");
+    const pinned = (x) => (x.pinned?.users || x.pinned?.teams ? `, ${x.pinned.users + x.pinned.teams} pinned` : "");
+    const each = r.regions.map((x) => `${x.id}${x.default ? " (default)" : ""}${x.offered ? "" : " (no longer offered)"}: ${x.machines} machine${x.machines === 1 ? "" : "s"}${pinned(x)}`);
+    const warn = [...(r.backups?.warnings || []), ...(r.residency?.warnings || [])].join(" ");
     el.textContent = `Data regions: ${each.join(", ")}.${warn ? ` ${warn}` : ""}`;
     el.className = warn ? "warn" : "hint";
     el.hidden = false;
@@ -518,8 +541,9 @@ function renderTeams() {
   $("teams-settings").textContent = `${s.strict ? "TEAMS=on: people in no team share with nobody." : "People in no team share with each other (TEAMS=on stops that)."} A leaver's team machine is ${s.machineDays ? `suspended, then deleted after ${s.machineDays} days` : "deleted at once"}.`;
   $("teams-empty").hidden = teams.teams.length > 0;
   $("teams-list").innerHTML = teams.teams.map((t) => `<div class="card" data-team="${esc(t.id)}">
-      <div class="bar"><b>${esc(t.name)}</b> <span class="sub">${t.members.length} people · ${t.machines ? "joining gives a machine" : "no machines given"} · data in ${esc(t.region || "the default region")}${esc(teamPlan(t.billing))}</span>
+      <div class="bar"><b>${esc(t.name)}</b> <span class="sub">${t.members.length} people · ${t.machines ? "joining gives a machine" : "no machines given"} · data in ${esc(t.region || "the default region")}${t.residency ? ` · pinned under ${esc(t.residency.reference || "an agreement")}` : ""}${esc(teamPlan(t.billing))}</span>
         <button type="button" class="btn push" data-act="team-region">Data region</button>
+        <button type="button" class="btn" data-act="team-residency">${t.residency ? "Unpin" : "Pin region"}</button>
         <button type="button" class="btn" data-act="delete-team">Delete team</button></div>
       <table class="grid">
         <thead><tr><th>Person</th><th>Role</th><th>Machine</th><th></th></tr></thead>
@@ -568,6 +592,7 @@ $("teams-list").addEventListener("click", async (e) => {
       await api("DELETE", `/api/teams/${key(t.id)}/members/${key(m.id)}`);
     }
     if (b.dataset.act === "team-region") await setRegion(`/api/teams/${key(t.id)}/region`, `${t.name}'s members without their own`, t.region);
+    if (b.dataset.act === "team-residency") await setResidency(`/api/teams/${key(t.id)}/residency`, t.name, t.residency, t.region);
     if (b.dataset.act === "delete-team") {
       if (!confirm(`Delete ${t.name}? Everyone on it leaves, as if each had: ${offboardNote("each of them", t.name).split("\n\n")[1]}`)) return;
       await api("DELETE", `/api/teams/${key(t.id)}`);

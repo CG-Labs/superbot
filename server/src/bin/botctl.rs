@@ -62,6 +62,10 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl user egress <user> [inherit|open|allow <host|cidr>...]
                                                    Their machine's outbound allow-list (ADR 0135): what it gets,
                                                    and whether it's loaded there; set their own, or follow the server's
+  botctl user|team residency <user|team> [pin <region> <reference...> | unpin <reason...>]
+                                                   Pin their data to a region under an agreement (ADR 0129):
+                                                   machines, backups and restores stay there or are refused.
+                                                   Refused while any of it is elsewhere. Unpinning needs a reason
   botctl regions                                   The data regions offered, who and what is in each, the
                                                    hosts and backup store in each, and residency warnings
   botctl tiers                                     Every tier, its routes and limits, and the default
@@ -727,6 +731,15 @@ fn region_request(args: &[&str]) -> Option<(&'static str, String, Option<String>
         ["user", "region", key, r] => ("PUT", format!("/api/users/{}/region", encode(key)), Some(pick(r))),
         ["team", "region", id] => ("GET", format!("/api/teams/{}/region", encode(id)), None),
         ["team", "region", id, r] => ("PUT", format!("/api/teams/{}/region", encode(id)), Some(pick(r))),
+        [kind @ ("user" | "team"), "residency", key, rest @ ..] => {
+            let path = format!("/api/{kind}s/{}/residency", encode(key));
+            match rest {
+                [] => ("GET", path, None),
+                ["pin", region, reference @ ..] if !reference.is_empty() => ("PUT", path, Some(json!({ "region": region, "reference": reference.join(" ") }).to_string())),
+                ["unpin", reason @ ..] if !reason.is_empty() => ("DELETE", path, Some(json!({ "reason": reason.join(" ") }).to_string())),
+                _ => return None,
+            }
+        }
         _ => return None,
     })
 }
@@ -1750,6 +1763,24 @@ mod tests {
             let args: Vec<String> = other.iter().map(|s| s.to_string()).collect();
             let e = run(&args).unwrap_err();
             assert!(e.starts_with("Usage: botctl machine egress"), "{other:?} reached another command: {e}");
+        }
+    }
+
+    #[test]
+    fn residency_commands() {
+        let body = |v: Value| Some(v.to_string());
+        assert_eq!(region_request(&["user", "residency", "ada@example.com"]), Some(("GET", "/api/users/ada%40example.com/residency".into(), None)));
+        assert_eq!(
+            region_request(&["user", "residency", "u1", "pin", "gb-lon", "DPA", "2026-014"]),
+            Some(("PUT", "/api/users/u1/residency".into(), body(json!({ "region": "gb-lon", "reference": "DPA 2026-014" }))))
+        );
+        assert_eq!(
+            region_request(&["team", "residency", "t1", "unpin", "contract", "ended"]),
+            Some(("DELETE", "/api/teams/t1/residency".into(), body(json!({ "reason": "contract ended" }))))
+        );
+        assert_eq!(region_request(&["team", "residency", "t1"]), Some(("GET", "/api/teams/t1/residency".into(), None)));
+        for other in [&["user", "residency", "u1", "pin", "gb-lon"][..], &["team", "residency", "t1", "unpin"], &["user", "residency"], &["bot", "residency", "b1"]] {
+            assert_eq!(region_request(other), None, "{other:?}");
         }
     }
 

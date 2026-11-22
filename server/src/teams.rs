@@ -152,6 +152,32 @@ fn control_plane(app: &AppState) -> Option<&ControlPlane> {
     app.control_plane.get().map(|cp| cp.as_ref()).filter(|cp| cp.enabled())
 }
 
+/// Teams an admin is deleting. Marked and checked under the control plane's operations
+/// lock, as residency pins are, so a pin can't land on a team mid-delete (ADR 0129).
+static DELETING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub fn being_deleted(team_id: &str) -> bool {
+    DELETING.lock().unwrap().iter().any(|t| t == team_id)
+}
+
+struct Deleting(String);
+
+impl Deleting {
+    fn start(team_id: &str) -> Deleting {
+        DELETING.lock().unwrap().push(team_id.to_string());
+        Deleting(team_id.to_string())
+    }
+}
+
+impl Drop for Deleting {
+    fn drop(&mut self) {
+        let mut d = DELETING.lock().unwrap();
+        if let Some(i) = d.iter().position(|t| *t == self.0) {
+            d.remove(i);
+        }
+    }
+}
+
 /// What a team's owners and admins see of a teammate's machine: its lifecycle, never
 /// its address, provider ids, errors, files, logins or screens.
 fn machine_view(app: &AppState, team_id: &str, user_id: &str) -> Value {
@@ -184,6 +210,13 @@ fn member_view(app: &AppState, m: &TeamMember, machines: bool) -> Value {
 fn team_view(app: &AppState, t: &Team, me: Option<&TeamMember>, sight: Sight) -> Value {
     let members: Vec<Value> = app.db.team_members(&t.id).iter().map(|m| member_view(app, m, sight.machines)).collect();
     let mut v = json!({ "id": t.id, "name": t.name, "machines": t.machines, "region": t.region, "createdAt": t.created_at, "members": members });
+    // A contractual pin (ADR 0129): its reference only for those who manage its members.
+    if let Some(p) = app.db.residency_pin(crate::db::PinOn::Team, &t.id) {
+        v["residency"] = json!({ "region": p.region, "pinnedAt": p.pinned_at });
+        if sight.invites {
+            v["residency"]["reference"] = json!(p.reference);
+        }
+    }
     if let Some(me) = me {
         v["role"] = json!(me.role);
     }
@@ -307,11 +340,11 @@ async fn join(app: &AppState, by: &Who, team: &Team, user: &User, role: &str, vi
             Some(cp) => Some(cp.lock_ops().await),
             None => None,
         };
-        if cp.is_some() {
+        if let Some(cp) = cp {
             let t = app.db.team(&team.id).ok_or_else(|| not_found("Team"))?;
             let u = app.db.user(&user.id).ok_or_else(|| not_found("User"))?;
-            if let Err(why) = crate::machines::region::check_join(app, &t, &u) {
-                app.db.record(&team_event(by, "team.join_refused", &team.id, json!({ "user": user.id, "reason": "data_region", "via": via, "region": t.region })).outcome(Outcome::Denied));
+            if let Err((reason, why)) = crate::machines::region::check_join(app, cp, &t, &u) {
+                app.db.record(&team_event(by, "team.join_refused", &team.id, json!({ "user": user.id, "reason": reason, "via": via, "region": t.region })).outcome(Outcome::Denied));
                 return Err(conflict(why));
             }
         }
@@ -983,6 +1016,21 @@ pub async fn update(State(app): State<AppState>, Extension(by): Extension<Who>, 
 /// `DELETE /api/teams/{id}`: everyone leaves, as if each had, then the team goes.
 pub async fn delete(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     let t = need_team(&app, &id)?;
+    let _deleting = {
+        let _g = match control_plane(&app) {
+            Some(cp) => Some(cp.lock_ops().await),
+            None => None,
+        };
+        if let Some(p) = app.db.residency_pin(crate::db::PinOn::Team, &t.id) {
+            let d = json!({ "reason": crate::machines::residency::PINNED, "pinnedRegion": p.region, "reference": p.reference });
+            app.db.record(&team_event(&by, "team.delete_refused", &t.id, d).outcome(Outcome::Denied));
+            return Err(conflict(format!(
+                "Team {}'s data is pinned to {} ({}). Unpin it first, with a reason (botctl team residency ... unpin) (ADR 0129).",
+                t.name, p.region, p.reference
+            )));
+        }
+        Deleting::start(&t.id)
+    };
     let _billing = crate::team_billing::may_delete(&app, &by, &t.id, "admin").await?;
     for m in app.db.team_members(&t.id) {
         leave(&app, &by, &t.id, &m.user_id, "team_deleted").await;
@@ -1038,6 +1086,16 @@ pub async fn delete_member(State(app): State<AppState>, Extension(by): Extension
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_team_is_marked_deleting_until_the_delete_ends() {
+        assert!(!being_deleted("tdel"));
+        {
+            let _d = Deleting::start("tdel");
+            assert!(being_deleted("tdel") && !being_deleted("tother"));
+        }
+        assert!(!being_deleted("tdel"), "dropped when the delete ends, or fails");
+    }
 
     #[test]
     fn settings_parse() {
