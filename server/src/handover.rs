@@ -33,9 +33,15 @@ pub fn resume_on_enable(raw: &str) -> Result<bool, String> {
 
 /// Whose disabled account stops a routine now: its Bot's owner first, then whoever
 /// wrote its instruction (whom its runs are for, ADR 0046). A user who is gone counts
-/// as disabled.
+/// as disabled, and so does a service account that is deleted or whose owner can't act
+/// (ADR 0143): its token would be refused, so what it scheduled stops too.
 pub fn blocked(db: &Db, owner: &str, author: Option<&str>) -> Option<(&'static str, String)> {
-    let off = |id: &str| !db.user(id).is_some_and(|u| u.active());
+    let person = |u: &User| u.active() && !u.service && u.erased_at.is_none();
+    let off = |id: &str| {
+        !db.user(id).is_some_and(|u| {
+            u.active() && (!u.service || db.service_account(id).filter(|s| s.deleted_at.is_none()).and_then(|s| db.user(&s.owner_id)).is_some_and(|o| person(&o)))
+        })
+    };
     if off(owner) {
         return Some((OWNER_DISABLED, owner.to_string()));
     }

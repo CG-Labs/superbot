@@ -495,19 +495,21 @@ pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>
             app.db.record(&by.event("service_account.enabled").target("service_account", &id).details(json!({ "name": after.user.name, "routinesResumed": resumed })));
         } else {
             let paused = crate::handover::user_disabled(&app, &by, &id);
-            app.db.record(&by.event("service_account.disabled").target("service_account", &id).details(json!({ "name": after.user.name, "routinesPaused": paused })));
+            let stopped = app.stop_for_user(&id);
+            app.db.record(&by.event("service_account.disabled").target("service_account", &id).details(json!({ "name": after.user.name, "routinesPaused": paused, "runsStopped": stopped })));
         }
     }
     Ok(Json(view(&app, &after)))
 }
 
-/// `DELETE /api/service-accounts/{id}`: for good. Its tokens are revoked and it's disabled;
-/// the audit log keeps naming it.
+/// `DELETE /api/service-accounts/{id}`: for good. Its tokens are revoked, it's disabled and
+/// the work it asked for stops; the audit log keeps naming it.
 pub async fn delete(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
     let sa = need_account(&app, &c, &by, &key)?;
     let revoked = app.db.delete_service_account(&sa.user.id, by.actor.id.as_deref()).ok_or_else(|| not_found("Service account"))?;
     let paused = crate::handover::user_disabled(&app, &by, &sa.user.id);
-    app.db.record(&by.event("service_account.deleted").target("service_account", &sa.user.id).details(json!({ "name": sa.user.name, "tokensRevoked": revoked, "routinesPaused": paused })));
+    let stopped = app.stop_for_user(&sa.user.id);
+    app.db.record(&by.event("service_account.deleted").target("service_account", &sa.user.id).details(json!({ "name": sa.user.name, "tokensRevoked": revoked, "routinesPaused": paused, "runsStopped": stopped })));
     Ok(Json(json!({ "ok": true, "tokensRevoked": revoked })))
 }
 

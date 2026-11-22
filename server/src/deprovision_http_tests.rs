@@ -74,7 +74,7 @@ async fn deprovisioned(w: &World) -> Vec<Value> {
 
 /// A stand-in `claude` that writes its environment to `claude.env`, then answers only
 /// once `claude.go` exists.
-fn held_claude(app: &App) -> std::path::PathBuf {
+pub(crate) fn held_claude(app: &App) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let dir = &app.cfg.bin_dir;
     let (env, go) = (dir.join("claude.env"), dir.join("claude.go"));
@@ -91,7 +91,7 @@ fn held_claude(app: &App) -> std::path::PathBuf {
 }
 
 /// The `BOT_TOKEN` of the run the stand-in harness is in.
-async fn run_token(env: &std::path::Path) -> String {
+pub(crate) async fn run_token(env: &std::path::Path) -> String {
     for _ in 0..500 {
         if let Ok(s) = std::fs::read_to_string(env) {
             let _ = std::fs::remove_file(env);
@@ -103,7 +103,7 @@ async fn run_token(env: &std::path::Path) -> String {
     panic!("the harness never started");
 }
 
-async fn until(what: &str, f: impl Fn() -> bool) {
+pub(crate) async fn until(what: &str, f: impl Fn() -> bool) {
     for _ in 0..500 {
         if f() {
             return;

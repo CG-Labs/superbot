@@ -467,6 +467,13 @@ async fn scopes_hold_inside_routes_and_live_streams_end_with_their_token() {
     let (code, st) = json_call(port, "GET", "/api/state", &read, "").await;
     assert_eq!((code, st["approvals"].clone()), (200, json!([])), "{st}");
     assert_eq!(call(port, "GET", "/api/approvals", &read, "").await.0, 403);
+    let (mut full, mut narrow) = (stream(port, &all).await, stream(port, &read).await);
+    let pending = app.db.add_approval(&bot.id, "claude", "Bash", "shell", "rm -rf build", &json!({ "command": "rm -rf build" }), "destructive", "Deletes", db::now() + 60_000);
+    app.push_approval(&pending);
+    app.send(json!({ "type": "probe", "botId": bot.id, "n": "after-approval" }));
+    assert!(read_until(&mut full, "after-approval").await.contains(&pending.id), "a token with review streams approvals");
+    let got = read_until(&mut narrow, "after-approval").await;
+    assert!(!got.contains(&pending.id) && !got.contains("rm -rf"), "the live stream sent an approval to a read token: {got}");
 
     // A stream ends once its token would be refused: revoked, the account disabled, the
     // owner disabled, or the owner no longer able to read.
@@ -541,4 +548,52 @@ async fn a_team_service_account_shares_bots_only_within_its_team() {
     let (tok, _) = token(port, &admin, &in_team, json!({})).await;
     assert_eq!(call(port, "GET", &format!("/api/bots/{teams_bot}/messages"), &tok, "").await.0, 404);
     assert!(app.db.team_members(&team).iter().all(|m| m.user_id != in_team), "never on the team's list");
+}
+
+#[tokio::test]
+async fn a_service_accounts_work_stops_when_it_or_its_owner_goes() {
+    use crate::deprovision_http_tests::{held_claude, run_token, until};
+    let (port, app, admin, _) = serve_app().await;
+    let env = held_claude(&app);
+    let desk = app.db.create_bot_owned("Desk", "#fff", "waddle", "claude", None, false, users::OPERATOR, Visibility::Shared).id;
+    let ask = |tok: String| {
+        let path = format!("/api/bots/{desk}/messages");
+        async move { assert_eq!(call(port, "POST", &path, &tok, r#"{"text":"go"}"#).await.0, 202) }
+    };
+
+    // Disabled, or deleted, its run on someone else's Bot stops.
+    let sa = account(port, &admin, json!({ "name": "Runner", "role": "member" })).await;
+    let (tok, _) = token(port, &admin, &sa, json!({})).await;
+    ask(tok.clone()).await;
+    run_token(&env).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, r#"{"status":"disabled"}"#).await.0, 200);
+    until("its run went on after it was disabled", || !app.busy(&desk)).await;
+    assert_eq!(events(port, &admin, "service_account.disabled").await[0]["details"]["runsStopped"], json!([desk]));
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, r#"{"status":"active"}"#).await.0, 200);
+    ask(tok).await;
+    run_token(&env).await;
+    assert_eq!(call(port, "DELETE", &format!("/api/service-accounts/{sa}"), &admin, "").await.0, 200);
+    until("its run went on after it was deleted", || !app.busy(&desk)).await;
+    assert_eq!(events(port, &admin, "service_account.deleted").await[0]["details"]["runsStopped"], json!([desk]));
+
+    // Its owner disabled, its run stops, and a routine it wrote is refused when it fires.
+    let (ana, ana_auth) = user_with(port, &admin, "ana@example.com", "member").await;
+    let helpdesk = role(port, &admin, "Helpdesk", "member", &["users.manage"]).await;
+    assert_eq!(call(port, "PUT", &format!("/api/roles/{helpdesk}/users/{ana}"), &admin, "").await.0, 200);
+    let hers = account(port, &ana_auth, json!({ "name": "Ana's", "role": "member" })).await;
+    let (tok, _) = token(port, &ana_auth, &hers, json!({})).await;
+    let body = json!({ "name": "Nightly", "cron": "0 9 * * *", "instruction": "report" }).to_string();
+    let (code, r) = json_call(port, "POST", &format!("/api/bots/{desk}/routines"), &tok, &body).await;
+    assert_eq!(code, 201, "{r}");
+    let nightly = r["id"].as_str().unwrap().to_string();
+    ask(tok).await;
+    run_token(&env).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{ana}"), &admin, r#"{"status":"disabled"}"#).await.0, 200);
+    until("its run went on after its owner was disabled", || !app.busy(&desk)).await;
+    assert_eq!(events(port, &admin, "user.deprovisioned").await[0]["details"]["runsForThemStopped"], json!([desk]));
+    let before = app.db.last_id();
+    cron::fire(&app, &app.db.routine(&nightly).unwrap(), db::now());
+    assert_eq!(app.db.last_id(), before, "nothing queued");
+    let r = app.db.routine(&nightly).unwrap();
+    assert_eq!((r.enabled, r.paused_reason.as_deref(), r.paused_for.as_deref()), (false, Some("author_disabled"), Some(hers.as_str())));
 }
