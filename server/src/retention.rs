@@ -3,9 +3,11 @@
 //! queued or running, and never one in or from the chat of a Bot an admin holds
 //! (`/api/retention/holds/{bot}`, for a legal hold or any other reason). A held Bot can't be
 //! deleted. Each pass is saved for admins to see, and one that deletes anything records
-//! `chat.pruned` with the count.
+//! `chat.pruned` with the count. The same pass deletes old harness session files and
+//! teammates' archived work when their settings are on (`file_retention`, ADR 0112).
 
 use crate::audit::{Actor, Event, Outcome, Who};
+use crate::file_retention;
 use crate::db::{now, RetentionHold};
 use crate::obs::log::log_warn;
 use crate::runner::App;
@@ -36,17 +38,55 @@ pub fn days(name: &str, raw: &str) -> Result<Option<u32>, String> {
     }
 }
 
-/// Saves the setting, records a change, and prunes now and every few hours while it's on.
-pub fn start(app: Arc<App>, days: Option<u32>) {
-    let before = app.db.chat_retention();
-    if before != days {
-        app.db.set_chat_retention(days);
-        app.db.record(&Event::new(Actor::system("retention"), "chat.retention_changed").details(json!({ "before": before, "after": days })));
+/// How long each kind of data is kept, in days. None: forever.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Settings {
+    pub chat: Option<u32>,
+    /// `HARNESS_SESSION_RETENTION_DAYS`.
+    pub sessions: Option<u32>,
+    /// `TEAMMATE_FILES_RETENTION_DAYS`.
+    pub teammate_files: Option<u32>,
+}
+
+impl Settings {
+    #[cfg(test)]
+    pub fn chat(days: Option<u32>) -> Settings {
+        Settings { chat: days, ..Default::default() }
     }
-    let Some(days) = days else { return };
+}
+
+/// Saves the settings, records each change, and runs a pass now and every few hours while
+/// one is on.
+pub fn start(app: Arc<App>, s: Settings) {
+    let before = app.db.chat_retention();
+    if before != s.chat {
+        app.db.set_chat_retention(s.chat);
+        app.db.record(&Event::new(Actor::system("retention"), "chat.retention_changed").details(json!({ "before": before, "after": s.chat })));
+    }
+    for (key, action, days) in [
+        (file_retention::SESSIONS_KEY, "harness_sessions.retention_changed", s.sessions),
+        (file_retention::FILES_KEY, "teammate_files.retention_changed", s.teammate_files),
+    ] {
+        let before = app.db.retention_days(key);
+        if before != days {
+            app.db.set_retention_days(key, days);
+            app.db.record(&Event::new(Actor::system("retention"), action).details(json!({ "before": before, "after": days })));
+        }
+    }
+    if s == Settings::default() {
+        return;
+    }
     tokio::spawn(async move {
         loop {
-            prune(&app, days, now()).await;
+            if let Some(days) = s.chat {
+                prune(&app, days, now()).await;
+            }
+            if let Some(days) = s.sessions {
+                file_retention::prune_sessions(&app, days, now()).await;
+            }
+            if let Some(days) = s.teammate_files {
+                file_retention::prune_teammate_files(&app, days, now()).await;
+            }
             tokio::time::sleep(EVERY).await;
         }
     });
@@ -118,13 +158,16 @@ fn hold_view(app: &App, h: &RetentionHold) -> Value {
 
 /// `GET /api/retention` (admins): what is kept for how long, the last pass, and the holds.
 pub async fn get(State(app): State<AppState>) -> Json<Value> {
-    let last: Option<Value> = app.db.setting(LAST_PASS).and_then(|s| serde_json::from_str(&s).ok());
+    let last_of = |key: &str| app.db.setting(key).and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let last = last_of(LAST_PASS);
     Json(json!({
         "chat": {
             "retentionDays": app.db.chat_retention(),
             "lastPass": last,
             "holds": app.db.retention_holds().iter().map(|h| hold_view(&app, h)).collect::<Vec<_>>(),
         },
+        "harnessSessions": { "retentionDays": app.db.retention_days(file_retention::SESSIONS_KEY), "lastPass": last_of(file_retention::SESSIONS_LAST) },
+        "teammateFiles": { "retentionDays": app.db.retention_days(file_retention::FILES_KEY), "lastPass": last_of(file_retention::FILES_LAST) },
         "audit": { "retentionDays": app.db.audit_retention() },
     }))
 }

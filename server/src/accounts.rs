@@ -241,6 +241,32 @@ impl RunAs {
         let files = home_files(files)?;
         Ok(self.shell(home, FORGET_FILES, &files)?.lines().count() as u32)
     }
+
+    /// Deletes old harness session files and archived work as the account, from `home`
+    /// (ADR 0112): `superbot-run --sweep` refuses anything outside the account's own
+    /// folders. Blocking.
+    pub fn sweep(&self, home: &Path, s: &crate::sweep::Sweep) -> Result<crate::sweep::Swept, String> {
+        use std::io::Write;
+        let body = serde_json::to_string(s).map_err(|e| e.to_string())?;
+        let (bin, argv) = self.argv_strings("--sweep", Vec::new());
+        let mut child = Command::new(bin)
+            .args(argv)
+            .current_dir(home)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("couldn't start {}: {e}", self.sudo.display()))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(body.as_bytes());
+        }
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(format!("sweeping as {} failed ({}): {}", self.account, out.status, String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("sweeping as {} said something else: {e}", self.account))
+    }
 }
 
 /// Credential files are plain paths inside HOME, as machines take them.

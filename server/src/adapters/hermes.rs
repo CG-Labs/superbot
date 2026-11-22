@@ -32,6 +32,23 @@ fn home(input: &RunInput) -> PathBuf {
     input.state_dir.join("hermes")
 }
 
+/// Stops the Bot's gateway daemon, if it has one running, with HERMES_HOME in `state_dir`.
+fn stop_gateway(state_dir: &std::path::Path, path: Option<&str>) -> JobCleanup {
+    let home = state_dir.join("hermes").display().to_string();
+    let mut env = BTreeMap::from([("HERMES_HOME".to_string(), home.clone())]);
+    if let Some(p) = path {
+        env.insert("PATH".into(), p.into());
+    }
+    JobCleanup {
+        when_exists: format!("{home}/gateway.pid"),
+        bin: "hermes".into(),
+        args: ["gateway", "stop", "--yes"].map(String::from).into(),
+        env,
+        cwd: state_dir.display().to_string(),
+        timeout_secs: STOP_TIMEOUT.as_secs(),
+    }
+}
+
 fn managed_dir(input: &RunInput) -> PathBuf {
     input.config_dir.join("hermes-managed")
 }
@@ -212,19 +229,17 @@ impl Adapter for Hermes {
     /// A stopped or finished `hermes chat` only detaches: the turn keeps running in the
     /// daemon. Stopping the daemon ends it, and the next run starts one with fresh env.
     fn cleanup(&self, input: &RunInput) -> Option<JobCleanup> {
-        let home = home(input).display().to_string();
-        let mut env = BTreeMap::from([("HERMES_HOME".to_string(), home.clone())]);
-        if let Some(path) = input.env.get("PATH") {
-            env.insert("PATH".into(), path.clone());
-        }
-        Some(JobCleanup {
-            when_exists: format!("{home}/gateway.pid"),
-            bin: self.bin().into(),
-            args: ["gateway", "stop", "--yes"].map(String::from).into(),
-            env,
-            cwd: input.state_dir.display().to_string(),
-            timeout_secs: STOP_TIMEOUT.as_secs(),
-        })
+        Some(stop_gateway(&input.state_dir, input.env.get("PATH").map(String::as_str)))
+    }
+
+    /// Hermes keeps transcripts in `HERMES_HOME/state.db`, so it deletes them itself:
+    /// sessions ended and unused for `days`, archived ones too. It refuses while another
+    /// process holds the database, so the gateway is stopped first, as for a run.
+    fn prune_sessions(&self, state_dir: &std::path::Path, days: u32, path: Option<&str>) -> Option<crate::machines::wire::JobRequest> {
+        let cleanup = stop_gateway(state_dir, path);
+        let env = cleanup.env.clone();
+        let args = ["sessions", "prune", "--older-than", &days.to_string(), "--include-archived", "--yes"].map(String::from).into();
+        Some(super::plain_job(self.bin(), args, env, state_dir, Some(cleanup)))
     }
 
     fn cleanup_failed(&self, input: &RunInput, why: &str) -> String {
@@ -348,6 +363,7 @@ mod tests {
             guard: guard.then(|| Guard { command: "'/opt/bin/botctl' hook hermes".into(), timeout_secs: 300, wait: Duration::from_secs(240) }),
             run_as: None,
             sandbox: None,
+            keep_sessions_days: None,
         }
     }
 

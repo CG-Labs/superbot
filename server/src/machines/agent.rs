@@ -1236,6 +1236,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             wire::CAN_TEAMMATE_REMOVAL,
             wire::CAN_TEAMMATE_LOGINS,
             wire::CAN_INSTALL_AFTER,
+            wire::CAN_RETENTION,
         ]
             .into_iter()
             .chain(a.upgrader.build.is_some().then_some(wire::CAN_UPGRADE))
@@ -1973,6 +1974,46 @@ async fn purge_teammate(State(a): State<Arc<Agent>>, UrlPath(user): UrlPath<Stri
     }
 }
 
+/// The sweep a `/v1/retention` request asks for, over the HOMEs Bots use here: the
+/// user's, then each teammate's (ADR 0112). Err: a path or name that isn't plain.
+fn retention_sweep(r: &wire::RetentionRequest, home: &Path, teammates: &[PathBuf]) -> Result<crate::sweep::Sweep, &'static str> {
+    use crate::sweep::{Folder, Root, Sweep};
+    let dirs_ok = r.home.iter().chain(&r.state).all(|d| wire::home_path(&d.path) && (1..=8).contains(&d.depth));
+    if !dirs_ok || r.home.len() + r.state.len() > 32 {
+        return Err("Session folders must be up to 32 plain paths inside HOME, each 1 to 8 folders deep.");
+    }
+    if !r.bots.iter().chain(&r.archives).all(|n| plain_name(n)) || r.bots.len() > 10_000 || r.archives.len() > 1_000 {
+        return Err("Bot ids and archive names must be plain names.");
+    }
+    let base = |p: &Path| p.display().to_string();
+    let mut s = Sweep { before: r.before, keep: r.keep.clone(), report: r.report.clone(), ..Default::default() };
+    for h in std::iter::once(home).chain(teammates.iter().map(PathBuf::as_path)) {
+        s.roots.extend(r.home.iter().map(|d| Root { base: base(h), path: d.path.clone(), depth: d.depth }));
+        for bot in &r.bots {
+            s.roots.extend(r.state.iter().map(|d| Root { base: base(h), path: format!("bots/{bot}/{}", d.path), depth: d.depth }));
+        }
+    }
+    s.folders = r.archives.iter().map(|n| Folder { base: base(home), path: format!("work/{}/{n}", wire::TEAMMATE_ARCHIVE_DIR) }).collect();
+    Ok(s)
+}
+
+/// `POST /v1/retention`: deletes old harness session files and archived teammates' work
+/// (ADR 0112). botd sends it only while none of the Bots it sweeps for is running.
+async fn retention(State(a): State<Arc<Agent>>, Json(r): Json<wire::RetentionRequest>) -> Response {
+    if r.owner_id != a.identity().user_id {
+        return refuse(StatusCode::FORBIDDEN, "This machine runs only its own user's Bots.");
+    }
+    let teammates: Vec<PathBuf> = a.teammates.known().iter().filter(|t| plain_name(t)).map(|t| a.teammates.home_of(t)).collect();
+    let s = match retention_sweep(&r, &a.cfg.home, &teammates) {
+        Ok(s) => s,
+        Err(e) => return refuse(StatusCode::BAD_REQUEST, e),
+    };
+    match tokio::task::spawn_blocking(move || crate::sweep::run(&s)).await {
+        Ok(out) => Json(out).into_response(),
+        Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 pub fn router(a: Arc<Agent>) -> Router {
     Router::new()
         .route("/v1/heartbeat", get(heartbeat))
@@ -1994,6 +2035,7 @@ pub fn router(a: Arc<Agent>) -> Router {
         .route("/v1/teammates/{user}/logins", get(get_teammate_logins))
         .route("/v1/teammates/{user}/remove", post(remove_teammate))
         .route("/v1/teammates/{user}/purge", post(purge_teammate))
+        .route("/v1/retention", post(retention))
         .layer(DefaultBodyLimit::max(MAX_RELAY_BODY))
         .with_state(a)
 }

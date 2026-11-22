@@ -93,6 +93,10 @@ pub struct RunInput {
     /// Set when the policy turns on the harness's own sandbox (ADR 0055) and it can
     /// start where the run happens. Only adapters with `has_sandbox` use it.
     pub sandbox: Option<Sandbox>,
+    /// How long a harness that deletes its own old sessions keeps them (ADR 0112): the
+    /// harness session retention, or forever while a Bot sharing its files is held.
+    /// None: the harness's own default.
+    pub keep_sessions_days: Option<u32>,
 }
 
 /// The harness's own sandbox: its shell commands write only to `cwd`, the temp
@@ -274,6 +278,47 @@ pub trait Adapter: Send + Sync {
     /// How the harness logs in on a user's machine (ADR 0042), if it has a login there.
     fn machine_login(&self) -> Option<MachineLogin> {
         None
+    }
+    /// Where it keeps session files, for harness session retention (ADR 0112).
+    fn sessions(&self) -> Sessions {
+        Sessions::default()
+    }
+    /// For a harness that keeps sessions in a database rather than files: the command that
+    /// deletes those of one Bot unused for `days`, run where its runs happen, in its
+    /// `state_dir`, with `path` as PATH. Its cleanup runs first, as for a run.
+    fn prune_sessions(&self, _state_dir: &std::path::Path, _days: u32, _path: Option<&str>) -> Option<JobRequest> {
+        None
+    }
+}
+
+/// Session folders, each with how many folders down a session sits. Every name with a
+/// UUID in it at that depth is part of the session that UUID names; other names are
+/// never touched.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Sessions {
+    /// Under the HOME its runs use, which every Bot running there shares.
+    pub home: &'static [(&'static str, u32)],
+    /// Under each Bot's own state folder.
+    pub state: &'static [(&'static str, u32)],
+}
+
+/// A short job for a harness, outside any run: `prune_sessions`'s.
+pub fn plain_job(bin: &str, args: Vec<String>, env: BTreeMap<String, String>, cwd: &std::path::Path, cleanup: Option<JobCleanup>) -> JobRequest {
+    JobRequest {
+        protocol: crate::machines::wire::PROTOCOL,
+        job_id: String::new(),
+        bot_id: String::new(),
+        owner_id: String::new(),
+        for_user: None,
+        message_id: 0,
+        bin: bin.into(),
+        args,
+        env,
+        cwd: cwd.display().to_string(),
+        stdin: None,
+        files: Vec::new(),
+        cleanup,
+        collect: Vec::new(),
     }
 }
 
@@ -549,6 +594,7 @@ mod tests {
             guard: Some(Guard { command: "'/opt/bin/botctl' hook x".into(), timeout_secs: 300, wait: std::time::Duration::from_secs(240) }),
             run_as,
             sandbox: None,
+            keep_sessions_days: None,
         }
     }
 

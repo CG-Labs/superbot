@@ -200,7 +200,7 @@ pub fn seen(app: &App, machine_id: &str, user_id: &str) {
     });
 }
 
-fn live(m: &Machine) -> bool {
+pub(crate) fn live(m: &Machine) -> bool {
     !matches!(m.state, State::Destroying | State::Destroyed)
 }
 
@@ -409,7 +409,7 @@ fn cancel(app: &App, by: &Who, m: &Machine, row: &TeammateCleanup, why: &str) ->
 }
 
 /// Whether `m` is up and its agent enrolled, and what to say if not.
-fn reachable(m: &Machine) -> Result<(), String> {
+pub(crate) fn reachable(m: &Machine) -> Result<(), String> {
     if m.state != State::Running {
         return Err(format!("waiting for the machine: it is {}", m.state.as_str()));
     }
@@ -526,7 +526,7 @@ async fn purge(app: &App, e: &Enrollment, row: &TeammateCleanup) -> bool {
 
 /// POSTs `body` to the machine's agent, pinned to its certificates. Its JSON answer, or
 /// why it didn't do it.
-async fn ask<T: serde::Serialize>(app: &App, e: &Enrollment, m: &Machine, path: &str, body: &T) -> Result<Value, String> {
+pub(crate) async fn ask<T: serde::Serialize>(app: &App, e: &Enrollment, m: &Machine, path: &str, body: &T) -> Result<Value, String> {
     let pins = app.db.machine_pins(&m.id);
     if pins.is_empty() {
         return Err("it has no usable certificate".into());

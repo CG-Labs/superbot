@@ -32,6 +32,8 @@ mod terminal;
 mod tools;
 #[path = "../machines/upgrade.rs"]
 mod upgrade;
+#[path = "../sweep.rs"]
+mod sweep;
 #[path = "../walk.rs"]
 mod walk;
 #[path = "../machines/wire.rs"]
