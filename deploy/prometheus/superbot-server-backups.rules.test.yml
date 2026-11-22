@@ -1,6 +1,6 @@
-# promtool test rules superbot-backup.rules.test.yml
+# promtool test rules superbot-server-backups.rules.test.yml
 rule_files:
-  - superbot-backup.rules.yml
+  - superbot-server-backups.rules.yml
 
 evaluation_interval: 1m
 

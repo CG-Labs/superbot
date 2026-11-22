@@ -154,6 +154,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine resize <user> status              Its latest resize: a tier change's, and whether it waits, and why
   botctl machine resizes                           Every resize a tier change asked for that isn't done yet
   botctl machine destroy <user> --yes              Delete it and its disk at the provider
+  botctl machine revoke <user> --yes               Revoke its certificates and unused tokens now; it must enroll again
+  botctl machine enroll <user>                     A one-time token to enroll it by hand, shown once, with how
+                                                   (after a revoke, or a Linode backup restored onto it; ADR 0110)
   botctl machine substrate [check]                 What machines are made on, each tier's size, and isolation; check asks the host
   botctl machine reconcile                         Follow every machine to where it should be now
   botctl machine placement [<user>]                Where each user's Bots run: this server or their machine
@@ -765,8 +768,8 @@ fn machine_request(args: &[&str]) -> Result<(&'static str, String), String> {
 
 type Request = (&'static str, String, Option<String>);
 
-/// `botctl machine list|show|request|suspend|resume|resize|destroy|substrate|reconcile`:
-/// the machine itself (ADR 0025, ADR 0065). None: not one of these.
+/// `botctl machine list|show|request|suspend|resume|resize|destroy|enroll|revoke|substrate|reconcile`:
+/// the machine itself (ADR 0025, ADR 0065) and its enrollment (ADR 0031). None: not one of these.
 fn lifecycle_request(args: &[&str]) -> Option<Result<Request, String>> {
     let at = |user: &str, rest: &str| format!("/api/users/{}/machine{rest}", encode(user));
     Some(Ok(match args {
@@ -789,11 +792,13 @@ fn lifecycle_request(args: &[&str]) -> Option<Result<Request, String>> {
         ["resize", user, tier] => ("POST", at(user, "/resize"), Some(json!({ "tier": tier }).to_string())),
         ["resizes"] => ("GET", "/api/machines/resizes".into(), None),
         ["destroy", user, "--yes"] => ("DELETE", at(user, ""), None),
+        ["enroll", user] => ("POST", at(user, "/enrollment"), None),
+        ["revoke", user, "--yes"] => ("DELETE", at(user, "/certificates"), None),
         ["substrate"] => ("GET", "/api/machines/substrate".into(), None),
         ["substrate", "check"] => ("GET", "/api/machines/substrate?check=true".into(), None),
         ["reconcile"] => ("POST", "/api/machines/reconcile".into(), None),
-        ["list" | "show" | "request" | "suspend" | "resume" | "resize" | "resizes" | "destroy" | "substrate" | "reconcile", ..] => {
-            return Some(Err("Usage: botctl machine list [<state>] | show <user> | request <user> [<tier>] [<region>] | suspend <user> | resume <user> | resize <user> <tier>|status | resizes | destroy <user> --yes | substrate [check] | reconcile".into()));
+        ["list" | "show" | "request" | "suspend" | "resume" | "resize" | "resizes" | "destroy" | "enroll" | "revoke" | "substrate" | "reconcile", ..] => {
+            return Some(Err("Usage: botctl machine list [<state>] | show <user> | request <user> [<tier>] [<region>] | suspend <user> | resume <user> | resize <user> <tier>|status | resizes | destroy <user> --yes | enroll <user> | revoke <user> --yes | substrate [check] | reconcile".into()));
         }
         _ => return None,
     }))
@@ -1472,10 +1477,12 @@ mod tests {
         assert_eq!(r(&["resize", "u1", "status"]), ("GET", "/api/users/u1/machine/resize".into(), None));
         assert_eq!(r(&["resizes"]), ("GET", "/api/machines/resizes".into(), None));
         assert_eq!(r(&["destroy", "u1", "--yes"]), ("DELETE", "/api/users/u1/machine".into(), None));
+        assert_eq!(r(&["enroll", "u1"]), ("POST", "/api/users/u1/machine/enrollment".into(), None));
+        assert_eq!(r(&["revoke", "u1", "--yes"]), ("DELETE", "/api/users/u1/machine/certificates".into(), None));
         assert_eq!(r(&["substrate"]), ("GET", "/api/machines/substrate".into(), None));
         assert_eq!(r(&["substrate", "check"]), ("GET", "/api/machines/substrate?check=true".into(), None));
         assert_eq!(r(&["reconcile"]), ("POST", "/api/machines/reconcile".into(), None));
-        for bad in [&["destroy", "u1"][..], &["resize", "u1"], &["request", "u1", "pro", "node2", "x"], &["substrate", "now"], &["show"], &["resizes", "all"]] {
+        for bad in [&["destroy", "u1"][..], &["revoke", "u1"], &["enroll"], &["resize", "u1"], &["request", "u1", "pro", "node2", "x"], &["substrate", "now"], &["show"], &["resizes", "all"]] {
             assert!(lifecycle_request(bad).unwrap().is_err(), "{bad:?}");
         }
         assert!(lifecycle_request(&["placement"]).is_none(), "the rest are machine_request's");

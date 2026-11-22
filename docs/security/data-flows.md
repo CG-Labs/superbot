@@ -164,7 +164,7 @@ Off until `SCIM=on` ([ADR 0023](../adr/0023-scim.md), [ADR 0026](../adr/0026-sci
 - **Runs.** A run's command, environment (including the secrets it needs) and the user's folder copy go to the machine over mTLS. Output comes back as a stream of events.
 - **Server backups.** `deploy/superbot-backup.sh` archives `DATA_DIR` daily by default, kept 14 days; default RPO 24 hours, RTO target 1 hour, drilled in CI ([ADR 0030](../adr/0030-backup-restore-drill.md)). botd copies each archive to S3-compatible storage the operator chooses (`SERVER_BACKUP_S3_*`, else the machine backups' store, under `server/`) within a minute, with a manifest, and alerts past an RPO of the archive interval plus 2 hours; without a store archives stay on the host and botd warns about it ([ADR 0109](../adr/0109-server-backups-off-the-host.md)).
 - **Incus machine backups.** Full disk copies to S3-compatible object storage the operator chooses, on a per-plan schedule, with RPO and RTO checked, alerted and drilled. See [machine recovery objectives](machine-recovery-objectives.md) ([ADR 0071](../adr/0071-off-host-machine-backups.md), [ADR 0074](../adr/0074-machine-rpo-and-rto.md), [ADR 0076](../adr/0076-restoring-onto-another-incus-host.md)).
-- **Linode machines** use Linode's own backup service (`MACHINE_BACKUPS`, on by default), which the recovery objectives don't cover.
+- **Linode machines** use Linode's own backup service (`MACHINE_BACKUPS`, on by default), held to an RPO that botd checks and alerts on from what the Linode API says of each machine's last successful backup. See [machine recovery objectives](machine-recovery-objectives.md#linode-machines) ([ADR 0110](../adr/0110-linode-machine-recovery-objectives.md)).
 
 ## Retention
 

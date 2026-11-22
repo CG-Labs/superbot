@@ -77,6 +77,8 @@ mod machines_offboard_tests;
 #[cfg(test)]
 mod machines_placement_tests;
 #[cfg(test)]
+mod machines_provider_backup_tests;
+#[cfg(test)]
 mod machines_resize_tests;
 mod passwd;
 mod signin_watch;

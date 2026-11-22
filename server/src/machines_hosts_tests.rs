@@ -171,6 +171,8 @@ pub(crate) async fn back_up(env: &Env, uid: &str) -> crate::db::MachineBackup {
 
 pub(crate) async fn settled(env: &Env, id: &str) -> crate::db::MachineRestore {
     until("the restore", || env.app.db.machine_restore(id).is_some_and(|r| !matches!(r.state.as_str(), "importing" | "replacing"))).await;
+    // It's enrolling before the restored machine boots; the restore holds the lock until then.
+    drop(env.app.control_plane.get().unwrap().lock_ops().await);
     env.app.db.machine_restore(id).unwrap()
 }
 

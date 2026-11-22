@@ -50,7 +50,7 @@ fn job<'a>(all: &'a [(String, Vec<&'a str>)], id: &str) -> &'a [&'a str] {
     &all.iter().find(|(j, _)| j == id).unwrap_or_else(|| panic!("release.yml has no `{id}` job")).1
 }
 
-fn steps<'a>(job: &[&'a str]) -> Vec<String> {
+fn steps(job: &[&str]) -> Vec<String> {
     let at = job.iter().position(|l| l.trim() == "steps:").expect("steps:");
     blocks(job, at, indent(job[at]) + 2).into_iter().map(|s| s.join("\n")).collect()
 }
