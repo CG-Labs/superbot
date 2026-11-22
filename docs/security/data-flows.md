@@ -185,6 +185,6 @@ Off until `SCIM=on` ([ADR 0023](../adr/0023-scim.md), [ADR 0026](../adr/0026-sci
 ## Planned or not built
 
 - Erasing a user's data from server backups and their per-user isolation folder ([ADR 0102](../adr/0102-erasing-a-users-data.md) covers everything else, and [ADR 0108](../adr/0108-deleting-a-destroyed-machines-backups.md) their machines' backups).
-- Encryption of the whole database by SuperBot. Rejected for now ([ADR 0010](../adr/0010-secrets.md)); use disk encryption.
+- Encryption by SuperBot of the files beside the database (Bots' memory, `USER.md`) and the workspace; use disk encryption. The database itself is encrypted ([ADR 0116](../adr/0116-database-encrypted-at-rest.md)).
 - External secret vaults (M5, [ADR 0010](../adr/0010-secrets.md)).
 - Contractual data residency. Today the operator picks Linode regions (`MACHINE_REGIONS`) or where Incus hosts are ([ADR 0025](../adr/0025-control-plane-linode.md)); a UK/EU region choice for managed plans is M4, and enterprise dedicated hosting M5 ([roadmap](../ROADMAP.md)).

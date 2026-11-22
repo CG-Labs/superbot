@@ -5,7 +5,9 @@
 //! every `ADR NNNN` must name an ADR that exists, and every repository path in inline code
 //! (`server/src/...`) a file that exists. The SOC 2 control mapping must also keep one
 //! row, with a status, for every criterion it claims to cover, and the readiness
-//! checklist (#50) a well-formed row for every gap the mapping lists.
+//! checklist (#50) a well-formed row for every gap the mapping lists. The legal templates
+//! (#48) must say they are drafts for legal review and not legal advice, claim no
+//! certification, and keep the provider's details as placeholders.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -323,8 +325,52 @@ fn the_soc2_readiness_checklist_is_well_formed_and_covers_every_gap() {
     }
 }
 
+/// Legal drafts in the pack (#48) that a managed provider fills in and has reviewed.
+const LEGAL_TEMPLATES: &[&str] = &["privacy-policy-template.md", "terms-of-service-outline.md", "dpa-template.md"];
+
+/// Lines that call something "certified" without a "not" or "no" shortly before it.
+fn certification_claims(md: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (n, line) in prose(md) {
+        let lower = line.to_lowercase();
+        for (at, _) in lower.match_indices("certified") {
+            let before = &lower[lower[..at].char_indices().rev().nth(59).map_or(0, |(i, _)| i)..at];
+            if !before.split(|c: char| !c.is_alphanumeric()).any(|w| w == "not" || w == "no") {
+                out.push(n);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn the_legal_templates_are_labelled_drafts_with_placeholders() {
+    for name in LEGAL_TEMPLATES.iter().chain(&["gdpr-self-hosting.md"]) {
+        let md = fs::read_to_string(pack().join(name)).unwrap_or_else(|_| panic!("docs/security/{name} exists"));
+        let top = md.lines().take(6).collect::<Vec<_>>().join("\n").to_lowercase();
+        assert!(top.contains("not legal advice"), "{name} must say near the top that it is not legal advice");
+        assert_eq!(certification_claims(&md), Vec::<usize>::new(), "{name} must not claim a certification (lines listed)");
+    }
+    for name in LEGAL_TEMPLATES {
+        let md = fs::read_to_string(pack().join(name)).unwrap();
+        let top = md.lines().take(6).collect::<Vec<_>>().join("\n");
+        assert!(top.contains("Draft for legal review"), "{name} must say near the top that it is a draft for legal review");
+        for p in ["[Company legal name]", "[Registered address]", "[Contact email]"] {
+            assert!(md.contains(p), "{name} must leave the provider's details as placeholders, such as {p}");
+        }
+    }
+    let dpa = fs::read_to_string(pack().join("dpa-template.md")).unwrap();
+    let headings = anchors(&dpa);
+    for h in ["8-personal-data-breaches", "annex-ii-technical-and-organisational-measures", "annex-iii-subprocessors"] {
+        assert!(headings.contains(h), "the DPA template needs a `{h}` section");
+    }
+    let annex = dpa.split("## Annex III").nth(1).unwrap_or("");
+    assert!(links(annex).iter().any(|(_, t)| t == "subprocessors.md"), "the DPA's subprocessor annex must link subprocessors.md");
+}
+
 #[test]
 fn the_checker_catches_what_it_should() {
+    assert_eq!(certification_claims("We are SOC 2 certified.\nSuperBot is not SOC 2 certified.\nNo one here is certified.\n`certified`\n"), vec![1]);
     assert_eq!(adr_refs("See ADR 0089 and [ADR 0090](x.md), not ADR 12 or `ADR 0001`."), vec![(1, "0089".to_string()), (1, "0090".to_string())]);
     let md = "`server/src/a.rs` `actions/checkout@v4` `/api/x` `docs/sso/` `deploy/a b`\n```\n`web/x.js`\n```\n";
     assert_eq!(path_refs(md), vec![(1, "server/src/a.rs".to_string()), (1, "docs/sso".to_string())]);
