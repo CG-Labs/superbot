@@ -41,7 +41,7 @@ What Hermes v0.23.3 offers, read from its source:
 - A route's **`fallback`** lists up to 3 `{provider, model}` to try in order, each a file endpoint or a built-in.
 - botd refuses to start on a mistake:
   - a name that isn't a slug;
-  - a URL that doesn't parse as http(s) with a host, is over 200 characters, or carries a user, password, query or fragment;
+  - a URL that doesn't parse as http(s) with a host, is over 200 characters, or carries a user, password, query or fragment (and, since [ADR 0097](0097-model-providers-over-https.md), a plain `http://` URL to anything but loopback);
   - a key secret name that isn't valid, or is one of botd's own secrets, which it keeps from every harness;
   - a provider or fallback on a harness that doesn't take one (only Hermes does);
   - more than 3 fallbacks, a fallback listed twice, or a fallback that is the route itself.
