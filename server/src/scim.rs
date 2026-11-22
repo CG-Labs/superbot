@@ -757,6 +757,7 @@ async fn changed(app: &AppState, a: &Auth, c: &Caller, before_user: &User, befor
             let resumed = crate::handover::user_enabled(app, by, &after.user.id);
             app.db.record(&ev("user.enabled").details(json!({ "tenant": c.token.tenant, "routinesResumed": resumed })));
             crate::teams::user_enabled(app, by, &after.user.id).await;
+            crate::deprovision::user_enabled(app, by, &after.user.id).await;
         }
         Some(false) => {
             a.sso.forget_user(&after.user.id);
@@ -769,6 +770,7 @@ async fn changed(app: &AppState, a: &Auth, c: &Caller, before_user: &User, befor
             }
             crate::machines::screens::rotate_all(app).await;
             crate::machines::offboard::left(app, by, &after.user.id, crate::machines::offboard::DEPROVISIONED);
+            crate::deprovision::user_disabled(app, by, &after.user.id, crate::deprovision::SCIM).await;
         }
         None => {}
     }
@@ -958,6 +960,7 @@ pub async fn delete_user(State(app): State<AppState>, Extension(a): Extension<Ar
     }
     crate::machines::offboard::left(&app, &c.who, &id, crate::machines::offboard::DEPROVISIONED);
     groups::user_deleted(&app, &a, &c, &id).await;
+    crate::deprovision::user_disabled(&app, &c.who, &id, crate::deprovision::SCIM_DELETE).await;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

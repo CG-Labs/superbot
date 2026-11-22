@@ -12,6 +12,8 @@ The kernel needs nftables' bridge family. Without it, Incus can't apply network 
 
 Memory is hard-limited per container, but swap isn't: a restricted project refuses `limits.memory.swap`. If containers mustn't swap, give the host no swap.
 
+Containers share the host's kernel, so the kernel's own hardening is the host's to set. Each container's first boot sets the rest itself ([ADR 0126](../adr/0126-per-user-machine-hardening.md)), but its `kernel.*` settings are refused inside a container and show as `partial`. On the host, copy `kernel.kptr_restrict = 2`, `kernel.dmesg_restrict = 1`, `kernel.yama.ptrace_scope = 1`, `kernel.unprivileged_bpf_disabled = 1` and `kernel.sysrq = 0` into a file in `/etc/sysctl.d`, apply it with `sudo sysctl --system`, and turn on unattended security updates (`sudo dpkg-reconfigure -plow unattended-upgrades`).
+
 ```bash
 incus admin init            # pick zfs, btrfs or lvm for the pool
 ```

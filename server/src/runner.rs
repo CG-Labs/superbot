@@ -2337,6 +2337,11 @@ impl App {
         stopped
     }
 
+    /// Whether the Bot has a run going, starting, or queued.
+    pub fn busy(&self, bot_id: &str) -> bool {
+        self.state().get(bot_id).is_some_and(|s| s.run.is_some() || s.serving.is_some() || !s.queue.is_empty())
+    }
+
     /// Whether the Bot is handling a message (`serving`): any, or one naming `user_id`.
     pub fn serving(&self, bot_id: &str, user_id: Option<&str>) -> bool {
         self.state().get(bot_id).and_then(|s| s.serving.as_ref()).is_some_and(|n| user_id.is_none_or(|u| n.iter().any(|x| x == u)))

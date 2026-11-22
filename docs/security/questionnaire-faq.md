@@ -23,6 +23,9 @@ Yes. Sign-in codes and the owner's break-glass password can require a code from 
 **How are users kept apart?**
 Each user's Bots run as that user's own Unix account on one server, or on that user's own machine when managed. A Bot can do no more than its owner. On machines, running Bots as an unprivileged user (`MACHINE_BOT_USER`) and teammates as their own OS users (`MACHINE_TEAMMATE_USERS`) are off by default and must be turned on, as must the Linode firewall (`MACHINE_FIREWALL`). See [isolation](access-control.md#isolation-between-users).
 
+**Are users' machines hardened and patched?**
+Yes, by default. Each new or rebuilt machine's first boot allows SSH only for root with a key and no forwarding, sets kernel hardening settings, turns on the distribution's unattended security updates (they never reboot by themselves; botd records when a reboot is waiting), and stops every user but root and the OS's network daemons from reaching private, link-local and cloud metadata addresses. Those egress rules bind Bots once `MACHINE_BOT_USER` is on. Each machine reports every step, and botd audits a failure. Machines made before this get it when rebuilt ([ADR 0126](../adr/0126-per-user-machine-hardening.md)).
+
 **Can an AI agent take destructive actions on its own?**
 Destructive commands, file deletes, outbound messages, network installs and `git push` wait for a person's approval by default. If the approval check can't be made, the action is refused. See [authorization](access-control.md#authorization).
 
