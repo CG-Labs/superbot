@@ -1985,7 +1985,7 @@ fn retention_sweep(r: &wire::RetentionRequest, home: &Path, teammates: &[PathBuf
     if !r.bots.iter().chain(&r.archives).all(|n| plain_name(n)) || r.bots.len() > 10_000 || r.archives.len() > 1_000 {
         return Err("Bot ids and archive names must be plain names.");
     }
-    if !r.probe.iter().all(|p| crate::sweep::plain_path(p)) || r.probe.len() > 10_000 {
+    if !r.probe.iter().all(|p| p.len() <= 160 && crate::sweep::plain_path(p)) || r.probe.len() > 10_000 {
         return Err("Files to look for must be plain paths under a Bots folder.");
     }
     let base = |p: &Path| p.display().to_string();
@@ -2017,7 +2017,7 @@ async fn retention(State(a): State<Arc<Agent>>, Json(r): Json<wire::RetentionReq
         let mut out = crate::sweep::run(&s);
         for (user, h) in std::iter::once((None, home)).chain(teammates.into_iter().map(|(t, h)| (Some(t), h))) {
             for p in &r.probe {
-                if std::fs::symlink_metadata(h.join("bots").join(p)).is_ok_and(|m| m.is_file()) {
+                if out.found.len() < wire::RETENTION_FOUND_MAX && std::fs::symlink_metadata(h.join("bots").join(p)).is_ok_and(|m| m.is_file()) {
                     out.found.push((user.clone(), p.clone()));
                 }
             }

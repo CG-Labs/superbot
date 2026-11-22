@@ -299,7 +299,7 @@ fn sweepable_machines(app: &App) -> Vec<Machine> {
 
 async fn ask_machine(app: &App, m: &Machine, req: &RetentionRequest) -> Result<Swept, String> {
     let e = app.control_plane.get().and_then(|cp| cp.enrollment.clone()).ok_or("machine enrollment is off")?;
-    let v = crate::machines::offboard::ask(app, &e, m, "/v1/retention", req).await?;
+    let v = crate::machines::offboard::ask_capped(app, &e, m, "/v1/retention", req, wire::RETENTION_REPLY_MAX).await?;
     serde_json::from_value(v).map_err(|e| format!("its agent's answer didn't parse: {e}"))
 }
 
