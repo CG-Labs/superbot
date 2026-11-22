@@ -7,6 +7,7 @@ use crate::adapters::{self, AbortReason, AgentEvent, Guard, RunInput, Sandbox, U
 use crate::audit::{Actor, ActorKind, Event, Outcome, Who};
 use crate::db::{Bot, BotPatch, Db, Message, TokenRow};
 use crate::machines::ControlPlane;
+use crate::obs::trace;
 use crate::machines::route::{self, Assigned, Refusal, Target};
 use crate::machines::wire::{self, JobEvent};
 use crate::tiers::{self, Route, Tier, Tiers, Wiring};
@@ -797,6 +798,7 @@ impl App {
             "message.queued",
             json!({ "requestId": crate::obs::request_id(), "messageId": msg.id, "botId": bot_id, "trigger": msg.role }),
         );
+        crate::obs::trace::queued(msg.id);
         let mut st = self.state();
         let s = st.entry(bot_id.clone()).or_default();
         s.queue.push_back(msg);
@@ -827,8 +829,19 @@ impl App {
             };
             let Some(msg) = next else { break };
             let before = self.db.last_id();
+            let queued_in = trace::take_queued(msg.id);
             if let Some(bot) = self.db.bot(&bot_id) {
-                self.run_one(bot, &msg).await;
+                // One span per run (ADR 0118), in the trace of the request that queued it.
+                let name = format!("run {}", crate::obs::metrics::harness(&bot.harness));
+                let span = match queued_in {
+                    Some(h) => h.child(&name, trace::Kind::Internal),
+                    None => self.db.tracer().span(&name, trace::Kind::Internal, None),
+                };
+                span.set("superbot.message_id", msg.id);
+                span.set("superbot.bot_id", &bot.id);
+                span.set("superbot.harness", crate::obs::metrics::harness(&bot.harness));
+                span.set("superbot.trigger", &msg.role);
+                trace::within(&span, self.run_one(bot, &msg)).await;
             }
             if self.closing.load(Ordering::SeqCst) {
                 return; // left "running": the next start reports it
@@ -913,10 +926,12 @@ impl App {
         let period = self.billing_period(&bot.owner_id, crate::db::now());
         let storage = crate::storage::check(self, &bot.owner_id).await;
         let Some((tier, route, wiring)) = self.tier_route(&bot, msg, &by, &period, &space.1, storage.as_ref()) else { return };
+        trace::note("superbot.tier", &tier);
         let placed_at = self.db.placed_at(&bot.owner_id);
         let Some(place) = self.place(&bot, msg, &by, &period.key, bin, for_other.as_deref()).await else { return };
         // Held until the run ends, however it ends: dropping it lets the next run in.
         let Some((_slot, waited)) = self.slot_for(&bot, msg, &by, &period.key, &place).await else { return };
+        trace::note("superbot.run.waited_for_slot", waited);
         // The run may write files: the next check measures again.
         let owner = bot.owner_id.clone();
         let _measure_again = self.storage.forget_on_drop(&owner);
@@ -1036,6 +1051,8 @@ impl App {
         };
         let host = json!({ "host": if spot.machine.is_some() { "machine" } else { "server" }, "machine": spot.machine.as_ref().map(|m| &m.machine_id) });
         let run_id = format!("r{}", crate::random_hex(8));
+        trace::note("superbot.run_id", &run_id);
+        trace::note("superbot.host", host["host"].as_str().unwrap_or("server"));
         crate::obs::log::event(
             crate::obs::log::Level::Info,
             "run.started",
@@ -1059,6 +1076,7 @@ impl App {
             let guard = (policy.mode == Mode::Ask).then(|| guard(&spot.botctl, &bot.harness, policy.timeout_minutes, test_secs));
             let (sandbox, sandboxed) = spot.sandbox(policy.sandbox, has_sandbox, sandbox_needs);
             let hooks = Arc::new(AtomicU32::new(0));
+            let used_before = used.len();
             {
                 // Under the lock `stop_if` takes, so a stop lands here or on the run.
                 let mut st = self.state();
@@ -1068,7 +1086,9 @@ impl App {
                     if attempt == 0 {
                         self.give_back(&bot, msg, &period.key);
                     }
-                    self.db.metrics().run_finished(&bot.harness, "stopped", started.elapsed().as_secs_f64());
+                    self.db.metrics().run_finished(&bot.harness, &tier, "stopped", started.elapsed().as_secs_f64());
+                    trace::note("superbot.run.result", "stopped");
+                    trace::note("superbot.run.attempts", attempt);
                     crate::obs::log::event(
                         crate::obs::log::Level::Warn,
                         "run.finished",
@@ -1093,6 +1113,17 @@ impl App {
                 });
             }
             self.send(json!({ "type": "status", "botId": bot.id, "working": true, "status": "Thinking" }));
+            // A span per attempt; the Bot's calls to botd while it runs join it.
+            let attempt_span = trace::child(&format!("harness {}", crate::obs::metrics::harness(&bot.harness)), trace::Kind::Internal);
+            attempt_span.set("superbot.harness", crate::obs::metrics::harness(&bot.harness));
+            attempt_span.set("superbot.attempt", attempt + 1);
+            attempt_span.set("superbot.resumed", bot.session_id.is_some());
+            attempt_span.set("superbot.guarded", guard.is_some());
+            attempt_span.set("superbot.host", host["host"].as_str().unwrap_or("server"));
+            if let Some(m) = &route.model {
+                attempt_span.set("gen_ai.request.model", m);
+            }
+            let _traced = trace::run_attempt(&run_id, &attempt_span);
             let timeout = self.cfg.run_timeout;
             let timer = tokio::spawn({
                 let abort_tx = abort_tx.clone();
@@ -1176,6 +1207,8 @@ impl App {
             let mut canary: Option<tokio::task::JoinHandle<()>> = None;
             let mut saw_tool = false;
             let gate = adapters::get(&bot.harness).unwrap();
+            // Tool calls underway, oldest first: each a child span of the attempt.
+            let mut tools: VecDeque<(String, trace::Span)> = VecDeque::new();
             let emit = |e| {
                 // Fail closed: a guarded harness that runs a tool its hook covers without
                 // ever calling the hook isn't enforcing approvals, so stop it.
@@ -1205,11 +1238,26 @@ impl App {
                         self.say(&id, &t, false);
                     }
                     AgentEvent::Tool { name, detail } => {
+                        let tool = trace::tool_name(&name).to_string();
+                        let span = attempt_span.child(&format!("tool {tool}"), trace::Kind::Internal);
+                        span.set("superbot.tool.name", &tool);
+                        tools.push_back((tool, span));
                         let status = tool_label(&name, &detail);
                         self.with_run(&id, |r| r.status = status.clone());
                         self.send(json!({ "type": "status", "botId": id, "working": true, "status": status }));
                     }
-                    AgentEvent::ToolRan { .. } => {}
+                    // Not every harness names its calls, so a result ends the oldest open call of its tool.
+                    AgentEvent::ToolRan { ref name } | AgentEvent::ToolFailed { ref name } => {
+                        let ran = matches!(e, AgentEvent::ToolRan { .. });
+                        if let Some(i) = tools.iter().position(|(t, _)| t == trace::tool_name(name))
+                            && let Some((_, span)) = tools.remove(i)
+                        {
+                            span.set("superbot.tool.ran", ran);
+                            if !ran {
+                                span.fail();
+                            }
+                        }
+                    }
                     AgentEvent::Error(m) => errors.push(m),
                     AgentEvent::Usage(u) => used.push(u),
                 }
@@ -1217,14 +1265,16 @@ impl App {
             let adapter = adapters::get(&bot.harness).unwrap();
             match &spot.machine {
                 None => {
-                    adapters::run(adapter, input, abort_rx.clone(), emit).await;
+                    trace::within(&attempt_span, adapters::run(adapter, input, abort_rx.clone(), emit)).await;
                     match teammate {
                         Some(_) => self.keep_teammate_memory(&bot, &spot.memory, &by),
                         None => self.keep_memory(&bot),
                     }
                 }
-                Some(to) => self.run_there(&bot, msg, &spot, to, adapter, input, abort_rx.clone(), emit).await,
+                Some(to) => trace::within(&attempt_span, self.run_there(&bot, msg, &spot, to, adapter, input, abort_rx.clone(), emit)).await,
             }
+            // Tools still open when the attempt ended never said they finished.
+            tools.clear();
             drop(token);
             timer.abort();
             if let Some(c) = canary {
@@ -1256,6 +1306,7 @@ impl App {
                         && (m.contains("not found") || m.contains("no such") || m.contains("does not exist")))
             });
             if lost && bot.session_id.is_some() && replies == 0 && attempt == 0 {
+                attempt_span.set("superbot.attempt.result", "session_lost");
                 self.db.update_bot(&id, BotPatch { session_id: Some(None), ..Default::default() });
                 bot.session_id = None;
                 continue;
@@ -1271,6 +1322,17 @@ impl App {
                 _ if !errors.is_empty() => ("error", Outcome::Failure),
                 _ => ("done", Outcome::Success),
             };
+            attempt_span.set("superbot.attempt.result", result);
+            attempt_span.set("superbot.replies", replies as u64);
+            let (input_tokens, output_tokens) = used[used_before.min(used.len())..].iter().fold((0u64, 0u64), |(i, o), u| (i + u.input + u.cache_read + u.cache_write, o + u.output));
+            if used.len() > used_before {
+                attempt_span.set("gen_ai.usage.input_tokens", input_tokens);
+                attempt_span.set("gen_ai.usage.output_tokens", output_tokens);
+            }
+            if crate::obs::metrics::RUN_FAILURES.contains(&result) {
+                attempt_span.fail();
+            }
+            attempt_span.end();
             let tokens = self.record_tokens(&bot, msg, &run_id, &route, std::mem::take(&mut used));
             let mut finished = json!({
                 "result": result, "durationMs": started.elapsed().as_millis() as u64, "replies": replies,
@@ -1281,7 +1343,12 @@ impl App {
                 finished["runGrants"] = json!(grants.iter().map(|g| &g.approval_id).collect::<Vec<_>>());
             }
             self.db.record(&by.event("bot.run_finished").target("message", &msg.id.to_string()).bot(&bot.id).outcome(outcome).details(finished));
-            self.db.metrics().run_finished(&bot.harness, result, started.elapsed().as_secs_f64());
+            self.db.metrics().run_finished(&bot.harness, &tier, result, started.elapsed().as_secs_f64());
+            trace::note("superbot.run.result", result);
+            trace::note("superbot.run.attempts", attempt + 1);
+            if crate::obs::metrics::RUN_FAILURES.contains(&result) {
+                trace::fail();
+            }
             crate::obs::log::event(
                 if outcome == Outcome::Success { crate::obs::log::Level::Info } else { crate::obs::log::Level::Warn },
                 "run.finished",
@@ -1737,6 +1804,7 @@ impl App {
         let back: Arc<Mutex<Back>> = Arc::default();
         let (memory_at, user_at) = (spot.memory.display().to_string(), spot.user_file.display().to_string());
         let job_abort = abort.clone();
+        let traced = trace::current_handle();
         let exec = |mut job: wire::JobRequest, tx: tokio::sync::mpsc::Sender<JobEvent>| {
             let (link, back, abort) = (cp.link.clone(), back.clone(), job_abort);
             job.job_id = format!("j{}", crate::random_hex(8));
@@ -1759,7 +1827,12 @@ impl App {
                         }
                     }
                 };
-                tokio::join!(link.run(to, job, abort, mid_tx), forward);
+                // The job on the machine's agent, over mutual TLS (ADR 0036), as a client span.
+                let span = traced.as_ref().map_or_else(trace::Span::default, |h| h.child("machine.job", trace::Kind::Client));
+                span.set("superbot.machine_id", &to.machine_id);
+                span.set("superbot.job_id", &job.job_id);
+                tokio::join!(trace::within(&span, link.run(to, job, abort, mid_tx)), forward);
+                span.end();
             }
         };
         adapters::run_on(adapter, input, abort, emit, exec).await;

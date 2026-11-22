@@ -88,6 +88,7 @@ impl Adapter for Pi {
             }
             // Bad arguments and blocked calls end with `isError` too.
             "tool_execution_end" if e["isError"].as_bool() == Some(false) => out.push(AgentEvent::ToolRan { name: str_of(e, "toolName").into() }),
+            "tool_execution_end" => out.push(AgentEvent::ToolFailed { name: str_of(e, "toolName").into() }),
             _ => {}
         }
     }
@@ -150,5 +151,7 @@ mod tests {
         }
         let ran: Vec<&str> = out.iter().filter_map(|e| if let AgentEvent::ToolRan { name } = e { Some(name.as_str()) } else { None }).collect();
         assert_eq!(ran, ["read"]);
+        let failed: Vec<&str> = out.iter().filter_map(|e| if let AgentEvent::ToolFailed { name } = e { Some(name.as_str()) } else { None }).collect();
+        assert_eq!(failed, ["read", "write"]);
     }
 }

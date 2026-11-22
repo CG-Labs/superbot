@@ -451,7 +451,7 @@ botctl retention release <bot-id>
 
 ## Metrics and logs
 
-Metrics, structured logs and error reporting are off by default, and the installer and Compose don't turn them on. Design and the full list of metrics: [ADR 0089](../docs/adr/0089-metrics-and-structured-logs.md); dashboards, error alerts and error reporting: [ADR 0113](../docs/adr/0113-service-dashboards-and-error-reporting.md).
+Metrics, structured logs, error reporting and traces are off by default, and the installer and Compose don't turn them on. Design and the full list of metrics: [ADR 0089](../docs/adr/0089-metrics-and-structured-logs.md); dashboards, error alerts and error reporting: [ADR 0113](../docs/adr/0113-service-dashboards-and-error-reporting.md); traces and per-tier metrics: [ADR 0118](../docs/adr/0118-harness-run-traces-and-per-tier-metrics.md).
 
 **Metrics.** `botd` serves Prometheus' text format at `/metrics` on a listener of its own, never on its main port, so Caddy never exposes it:
 
@@ -465,6 +465,8 @@ The metrics cover requests (by route class, method and status class, with latenc
 **Host capacity.** `/metrics` also shows `botd`'s own host (`host="botd"`): its CPU threads, load, memory, and the disks `DATA_DIR` and `WORKSPACE_DIR` are on. With Incus machines it adds each host by its `INCUS_HOSTS` name: what machines' plans take of its `INCUS_CAPACITY` and `INCUS_MAX_MACHINES`, whether it's open for new machines, machines waiting for room, and, read every `MACHINE_RECONCILE_SECONDS`, the host's own CPU threads, load, memory and storage pool space. Design: [ADR 0106](../docs/adr/0106-host-capacity-metrics.md). Alert rules for hosts nearing capacity are in [`prometheus/superbot-capacity.rules.yml`](prometheus/superbot-capacity.rules.yml), tested with `promtool test rules prometheus/superbot-capacity.rules.test.yml`; load them next to the other rules. A Grafana dashboard is in [`grafana/superbot-capacity.json`](grafana/superbot-capacity.json): in Grafana, **Dashboards → New → Import**, upload it, and pick your Prometheus data source; it shows one botd at a time.
 
 **Requests and runs.** A Grafana dashboard for requests by route class (rate, 5xx share, 4xx, p50 and p95 latency), Bot runs by harness (started, finished by result, failed, failure share, duration), the run queue (runs waiting for a slot, slots held, approvals waiting) and errors (panics, error reports) is in [`grafana/superbot-service.json`](grafana/superbot-service.json); import it as above. Pick one `botd` or all of them. Alert rules for one harness's runs failing, one route class's 5xx, panics, a run queue that never drains, and error reports not arriving are in [`prometheus/superbot-errors.rules.yml`](prometheus/superbot-errors.rules.yml), tested with `promtool test rules prometheus/superbot-errors.rules.test.yml`. They add to the [SLO rules](#status-page-and-slo-alerts), which watch the whole service; load both. Design: [ADR 0113](../docs/adr/0113-service-dashboards-and-error-reporting.md).
+
+**By tier.** With `/metrics` on, requests and runs are also counted by the tier of whoever they're for (a person's plan, a Bot's owner's plan, `none` for a caller who isn't signed in): `superbot_http_requests_by_tier_total{tier,status_class}`, `superbot_http_request_duration_by_tier_seconds{tier}`, `superbot_runs_by_tier_total{tier,result}` and `superbot_run_duration_by_tier_seconds{tier}`. The first 16 tier names get their own label and any more are `other`. There's no per-user label. For example, each tier's 5xx share: `sum by (tier) (rate(superbot_http_requests_by_tier_total{status_class="5xx"}[5m])) / sum by (tier) (rate(superbot_http_requests_by_tier_total[5m]))`. Design: [ADR 0118](../docs/adr/0118-harness-run-traces-and-per-tier-metrics.md).
 
 **Server backups.** `superbot_server_backup_off_host` is 1 when botd copies its backups off the host and 0 when they stay on it; with a store, `/metrics` adds the RPO, the newest copy's age and time, and whether it is past the RPO. Design: [ADR 0109](../docs/adr/0109-server-backups-off-the-host.md). Alert rules (backups on the host, past the RPO, copies failing) are in [`prometheus/superbot-server-backups.rules.yml`](prometheus/superbot-server-backups.rules.yml), tested with `promtool test rules prometheus/superbot-server-backups.rules.test.yml`.
 
@@ -510,7 +512,7 @@ scrape_configs:
 
 With Docker Compose, `botd` must listen beyond the container's loopback for a scraper to reach it, so a token is needed. In `deploy/docker/.env`, set `METRICS_LISTEN=0.0.0.0:9464` and `METRICS_TOKEN=<openssl rand -hex 32>`. The port isn't published: put the scraper on the `superbot_default` network and scrape `botd:9464`, or add `ports: ["127.0.0.1:9464:9464"]` to `botd` in a `docker-compose.override.yml` to scrape from the host.
 
-**Structured logs.** `LOG_FORMAT=json` (default `text`) makes `botd` print one JSON object per line, on stdout and stderr as before, for journald, Docker's logging drivers, or a shipper such as Vector or Promtail. Each has `ts` (UTC), `level` and `msg`. On top of `botd`'s own lines, it logs every request (`http.request`: request id, method, route template, route class, status, duration) and every run (`message.queued`, `run.started`, `run.finished`: run, message and Bot ids, harness, result, duration). No emails, names, IP addresses, message text, paths as sent or tokens; those stay in the [audit log](#audit-log-retention). Every response has an `X-Request-Id` header, the same id as its log line. An id sent in by a proxy is kept if it's plain (letters, digits, `-`, `_`, `.`, up to 64). `journalctl -u superbot -o cat | jq 'select(.msg == "run.finished")'` lists finished runs.
+**Structured logs.** `LOG_FORMAT=json` (default `text`) makes `botd` print one JSON object per line, on stdout and stderr as before, for journald, Docker's logging drivers, or a shipper such as Vector or Promtail. Each has `ts` (UTC), `level` and `msg`. On top of `botd`'s own lines, it logs every request (`http.request`: request id, method, route template, route class, status, duration) and every run (`message.queued`, `run.started`, `run.finished`: run, message and Bot ids, harness, result, duration). No emails, names, IP addresses, message text, paths as sent or tokens; those stay in the [audit log](#audit-log-retention). Every response has an `X-Request-Id` header, the same id as its log line. With [traces](#traces) on, lines written during a kept trace also have `traceId` and `spanId`. An id sent in by a proxy is kept if it's plain (letters, digits, `-`, `_`, `.`, up to 64). `journalctl -u superbot -o cat | jq 'select(.msg == "run.finished")'` lists finished runs.
 
 **Error reporting.** Off by default. Set `ERROR_REPORT_DSN` to a project's DSN in an error tracker that takes Sentry's protocol (Sentry, self-hosted Sentry, [GlitchTip](https://glitchtip.com) or [Bugsink](https://www.bugsink.com), all of which you can run yourself), and `botd` sends it each panic and each 5xx answer. Design: [ADR 0113](../docs/adr/0113-service-dashboards-and-error-reporting.md).
 
@@ -520,6 +522,25 @@ With Docker Compose, `botd` must listen beyond the container's loopback for a sc
 | `ERROR_REPORT_ENVIRONMENT` | The environment reports are tagged with (default `production`) |
 
 A report holds only what `botd`'s code names: for a panic, its source location, its kind from a fixed list (never its message, which stays in `botd`'s log) and the request id; for a 5xx, the method, route template (`/api/bots/{id}/messages`), route class, status and request id; and `botd`'s version. Never a user, path as sent, query, header, body, prompt or chat. Known secrets are redacted and anything like an email replaced before sending. At most 20 reports a minute are sent; the rest are counted as dropped. A request handler that panics answers 500. Find the full story in `botd`'s log by the request id: `journalctl -u superbot -o cat | grep <request-id>` (with `LOG_FORMAT=json`, the `server.panic` and `http.request` lines). The tracker sees the server's IP as the sender; turn on its setting not to store IP addresses if you like. `/metrics` counts panics (`superbot_panics_total`) and reports sent, failed and dropped (`superbot_error_reports_total`) with or without a tracker.
+
+### Traces
+
+Off by default. Set `TRACES_OTLP_ENDPOINT` to an OpenTelemetry Collector, Grafana Tempo, Jaeger or a vendor that takes OTLP over HTTP, and `botd` sends a span for each request and each Bot run, with a child for each harness attempt, tool call, approval check and call to a Bot's machine. A Bot's own calls back to `botd` during a run (its approval hook, `botctl`) join the run's trace, and a run continues the trace of the request that queued it. Spans hold ids, route templates, harness, tier, tool names, results and token counts: never a message, prompt, reply, tool input or output, path, email or secret. Audit events recorded during a kept trace get its `traceId` and `spanId` in their details.
+
+| Setting in `.env` | Meaning |
+|---|---|
+| `TRACES_OTLP_ENDPOINT` | `off` (default) or the collector's URL, such as `https://<collector-host>:4318` (`/v1/traces` is added when there's no path). Plain `http://` only to loopback |
+| `TRACES_OTLP_INSECURE` | `on` allows plain `http://` to a collector on a private network |
+| `TRACES_OTLP_HEADERS` or `TRACES_OTLP_HEADERS_FILE` | `name=value` pairs split by commas, such as `Authorization=Bearer <token>`. A secret: Bots never get it |
+| `TRACES_SAMPLE_RATIO` | Share of traces kept, `0` to `1` (default `1`) |
+| `TRACES_PARENT` | `ignore` (default) or `accept`: continue a proxy's W3C `traceparent` header |
+
+```sh
+echo 'TRACES_OTLP_ENDPOINT=http://127.0.0.1:4318' | sudo tee -a ~superbot/superbot/.env
+sudo systemctl restart superbot
+```
+
+`/metrics` shows `superbot_tracing_enabled` and spans sent, failed and dropped (`superbot_trace_spans_total`). With Compose, run the collector on the `superbot_default` network and set `TRACES_OTLP_ENDPOINT=http://otel-collector:4318` with `TRACES_OTLP_INSECURE=on`. Collector examples, every span and attribute, and sampling: [docs/ops/tracing.md](../docs/ops/tracing.md).
 
 ## Status page and SLO alerts
 

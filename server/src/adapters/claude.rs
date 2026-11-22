@@ -112,10 +112,8 @@ impl Adapter for Claude {
             // the hook, or failing has `is_error`.
             "user" => {
                 for c in e["message"]["content"].as_array().into_iter().flatten().filter(|c| str_of(c, "type") == "tool_result") {
-                    if let Some(name) = self.calls.remove(str_of(c, "tool_use_id"))
-                        && c["is_error"].as_bool() != Some(true)
-                    {
-                        out.push(AgentEvent::ToolRan { name });
+                    if let Some(name) = self.calls.remove(str_of(c, "tool_use_id")) {
+                        out.push(if c["is_error"].as_bool() == Some(true) { AgentEvent::ToolFailed { name } } else { AgentEvent::ToolRan { name } });
                     }
                 }
             }
@@ -261,6 +259,8 @@ mod tests {
         }
         let ran: Vec<&str> = out.iter().filter_map(|e| if let AgentEvent::ToolRan { name } = e { Some(name.as_str()) } else { None }).collect();
         assert_eq!(ran, ["Read"], "once per call, never for an error");
+        let failed: Vec<&str> = out.iter().filter_map(|e| if let AgentEvent::ToolFailed { name } = e { Some(name.as_str()) } else { None }).collect();
+        assert_eq!(failed, ["Edit"]);
         assert!(c.calls.is_empty());
     }
 }
