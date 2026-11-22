@@ -690,6 +690,31 @@ Each merge to `main` and each release publishes both images for amd64 and arm64 
 
 Set `SUPERBOT_IMAGE` and `SUPERBOT_CADDY_IMAGE` to use images from somewhere else (a mirror, or your own registry).
 
+### Verifying the images
+
+Every published image is signed keylessly with [cosign](https://docs.sigstore.dev/cosign/) by the `docker` workflow, under its GitHub identity, and carries SLSA build provenance and an SBOM ([ADR 0101](../docs/adr/0101-image-scanning-and-signing.md)). Images published before that are unsigned. The `staging-*` tags are the workflow's own, used to sign an image before its public tags move; don't run them. Check an image before you run it, with cosign 3 or later:
+
+```sh
+cosign verify ghcr.io/cg-labs/superbot:main \
+  --certificate-identity https://github.com/CG-Labs/superbot/.github/workflows/docker.yml@refs/heads/main \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+For a release, the identity ends in the tag instead: `--certificate-identity https://github.com/CG-Labs/superbot/.github/workflows/docker.yml@refs/tags/v1.2.3` with `ghcr.io/cg-labs/superbot:1.2.3`. Check `ghcr.io/cg-labs/superbot-caddy` the same way. Accept no other identity: a signature from a fork, another workflow or another branch is not ours.
+
+Check the build provenance (which commit and workflow run built it) with the GitHub CLI:
+
+```sh
+gh attestation verify oci://ghcr.io/cg-labs/superbot:main \
+  --repo CG-Labs/superbot \
+  --signer-workflow CG-Labs/superbot/.github/workflows/docker.yml \
+  --source-ref refs/heads/main
+```
+
+Use `--source-ref refs/tags/v1.2.3` for a release. Read each platform's SBOM (SPDX) and BuildKit's own provenance with `docker buildx imagetools inspect ghcr.io/cg-labs/superbot:main --format '{{ json (index .SBOM "linux/amd64").SPDX }}'` (or `.Provenance` and `.SLSA`).
+
+A tag moves to newer builds, so to run exactly what you verified, verify by digest and pin it: take the digest `cosign verify` prints (`docker-manifest-digest`) and set `SUPERBOT_IMAGE=ghcr.io/cg-labs/superbot@sha256:<digest>` in `.env` (and `SUPERBOT_CADDY_IMAGE` likewise). Each image's vulnerability scan is in the workflow run's `image-scan-<arch>` artifact (JSON, SARIF and a table), and in the repository's code scanning alerts for its maintainers.
+
 ### Build from source
 
 To build both images from the checkout instead, for another set of harness CLIs, Hermes Agent, pinned CLI versions, or a change of your own:
