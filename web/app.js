@@ -1446,6 +1446,7 @@ async function loadScim() {
     $("scim-info").textContent = "";
     $("scim-empty").textContent = err.message;
   }
+  loadScimRoles();
   $("scim-empty").hidden = scimTokens.length > 0;
   $("scim-rows").innerHTML = scimTokens.map((t) => `<tr data-token="${esc(t.id)}" class="${t.revokedAt ? "revoked" : ""}">
       <td>${esc(t.tenant)}</td><td>${esc(t.label || "")}</td><td>${esc(t.ssoProvider || "")}</td>
@@ -1453,6 +1454,37 @@ async function loadScim() {
       <td class="actions">${t.revokedAt ? `Revoked ${esc(fmt(t.revokedAt))}` : '<button type="button" class="btn" data-act="revoke">Revoke</button>'}</td>
     </tr>`).join("");
 }
+
+// SCIM groups mapped to custom roles (ADR 0138): listed and removed here; made with botctl.
+async function loadScimRoles() {
+  let maps = [];
+  try {
+    const r = await api("GET", "/api/scim/role-mappings");
+    maps = r.mappings || [];
+    $("scim-roles-info").textContent = r.enabled
+      ? "Members of a mapped group hold its custom role while they're in it. Map one with botctl scim role map <team> <role> [--org]. Never admin."
+      : "Group roles are off (SCIM_GROUP_ROLES=on, with SCIM_GROUPS=on, turns them on). Roles that mappings gave are still taken back when people leave.";
+    $("scim-roles-empty").textContent = "No groups are mapped to roles.";
+  } catch (err) {
+    $("scim-roles-info").textContent = "";
+    $("scim-roles-empty").textContent = err.message;
+  }
+  $("scim-roles-empty").hidden = maps.length > 0;
+  $("scim-roles-rows").innerHTML = maps.map((m) => `<tr data-mapping="${esc(m.id)}">
+      <td>${esc(m.group || m.team.name || m.team.id)}</td><td>${esc(m.tenant)}</td><td>${esc(m.role ? m.role.name : "")}</td>
+      <td>${m.scope === "org" ? "Across the server" : "In its team"}</td><td>${esc(String(m.grants))}</td>
+      <td class="actions"><button type="button" class="btn" data-act="unmap">Remove</button></td>
+    </tr>`).join("");
+}
+
+$("scim-roles-rows").addEventListener("click", async (e) => {
+  const t = e.target.closest("button[data-act=unmap]");
+  if (!t) return;
+  const id = t.closest("tr").dataset.mapping;
+  if (!confirm("Remove this mapping? Everyone it gave the role to loses it. Roles given by hand stay.")) return;
+  try { await api("DELETE", `/api/scim/role-mappings/${key(id)}`); } catch (err) { fail(err); }
+  loadScimRoles();
+});
 
 $("scim-form").addEventListener("submit", async (e) => {
   e.preventDefault();
