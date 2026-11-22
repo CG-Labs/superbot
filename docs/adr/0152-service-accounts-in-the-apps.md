@@ -23,7 +23,7 @@ Both apps show service accounts to admins only, as they do roles. The console is
 
 ### Tokens are shown once
 
-A new or rotated token's secret is in the reply to that request only. The app shows it in a panel with Copy (the share sheet on phones) and Done; the console shows it in the shown-once dialog it uses for sign-in codes and SCIM tokens. Done, picking another account, or closing the screen forgets it. Neither app writes it to storage, logs or a URL. Lists show a token's preview (`sbsa_…` and its last four characters), name, scopes, state, expiry, and last use with the address it came from.
+A new or rotated token's secret is in the reply to that request only. The app shows it in a panel with Copy (the share sheet on phones) and Done; the console shows it in the shown-once dialog it uses for sign-in codes and SCIM tokens. Done, picking another account, or closing the screen forgets it; while a request that may return one is running, the app doesn't let you pick another account, and the console doesn't let you send it twice. Neither app writes it to storage, logs or a URL. Lists show a token's preview (`sbsa_…` and its last four characters), name, scopes, state, expiry, and last use with the address it came from.
 
 ### What the forms offer
 
