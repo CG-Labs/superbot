@@ -1791,9 +1791,11 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
     let bot_owner = bot.as_deref().and_then(|id| app.db.bot_owner(id));
     let bot_for = c.bot_for.filter(|_| bot.is_some());
     let bot_token = c.bot_token.filter(|_| bot.is_some());
+    let service = c.service.map(|s| s.token);
     // The stream outlives the request that opened it, so it closes within seconds of
     // its session being revoked, expiring, or its user being disabled, and follows
-    // role changes. A Bot's closes when its run ends (ADR 0083), the Bot is deleted,
+    // role changes. A service account's closes once its token would be refused, or
+    // may no longer read (ADR 0143). A Bot's closes when its run ends (ADR 0083), the Bot is deleted,
     // changes hands, or its owner is disabled, and follows its owner's role. One bound
     // to a teammate (ADR 0048) closes once the Bot's latest run isn't theirs, never
     // taking the owner's access.
@@ -1825,7 +1827,7 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
                         break;
                     }
                 }
-                _ = check.tick(), if session.is_some() || bot.is_some() => {
+                _ = check.tick(), if session.is_some() || bot.is_some() || service.is_some() => {
                     let now = if let Some(id) = bot.as_deref() {
                         if !bot_token.as_deref().is_some_and(|t| app.run_tokens.is_live(t, db::now())) {
                             break;
@@ -1837,6 +1839,11 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
                                 v => v,
                             },
                             _ => break,
+                        }
+                    } else if let Some(t) = service.as_deref() {
+                        match service_accounts::recheck(&app, t, db::now()).filter(|sc| sc.can(Perm::Read)).and_then(|sc| sc.user) {
+                            Some(u) => Viewer::User { id: u.id, role: u.role },
+                            None => break,
                         }
                     } else {
                         if !session.as_deref().is_some_and(|s| app.db.session_is_live(s, db::now(), cfg.idle_ms, cfg.max_ms)) {
@@ -1893,7 +1900,7 @@ fn visible_bots(app: &App, c: &Caller, by: &Who) -> Vec<Value> {
 
 async fn state(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> Json<Value> {
     let bots = visible_bots(&app, &c, &by);
-    let approvals = if rbac::allows(c.principal, Perm::Review) { visible_approvals(&app, &c, &by, Some("pending"), None, 200) } else { vec![] };
+    let approvals = if c.can(Perm::Review) { visible_approvals(&app, &c, &by, Some("pending"), None, 200) } else { vec![] };
     // The owner keeps USER_NAME, as before users existed.
     let name = match &c.user {
         Some(u) if u.id != users::OPERATOR => u.name.clone(),

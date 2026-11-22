@@ -3,7 +3,9 @@
 //! hashed, scoped, expiring tokens shown once, never get more than their owner holds,
 //! can't sign in, and show in the audit log as themselves.
 
+use crate::acl::Visibility;
 use crate::tests::{audit_list, call, call_with, serve_app};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::users_http_tests::{parse, user_with};
 use crate::*;
 
@@ -407,4 +409,106 @@ async fn a_team_service_account_acts_only_in_its_team() {
     assert_eq!((code, v["team"].clone(), v["teamRole"].clone()), (200, Value::Null, Value::Null), "{v}");
     assert_eq!(call(port, "GET", "/api/team", &tok, "").await.0, 404);
     assert_eq!(call(port, "DELETE", &format!("/api/roles/{people}"), &admin, "").await.0, 200);
+}
+
+fn bot_ids(v: &Value) -> Vec<String> {
+    v.as_array().unwrap().iter().filter_map(|b| b["id"].as_str().map(String::from)).collect()
+}
+
+/// Opens `GET /api/events` as `who`. Returns the stream once it answered 200.
+async fn stream(port: u16, who: &str) -> tokio::net::TcpStream {
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let req = format!("GET /api/events HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nAuthorization: {who}\r\n\r\n");
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut first = [0u8; 12];
+    s.read_exact(&mut first).await.unwrap();
+    assert_eq!(&first, b"HTTP/1.0 200");
+    s
+}
+
+async fn closes(mut s: tokio::net::TcpStream) -> bool {
+    let mut rest = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), s.read_to_end(&mut rest)).await.is_ok()
+}
+
+#[tokio::test]
+async fn scopes_hold_inside_routes_and_live_streams_end_with_their_token() {
+    let (port, app, admin, _) = serve_app().await;
+    let sa = account(port, &admin, json!({ "name": "Watcher", "role": "member" })).await;
+    let bot = app.db.create_bot_owned("Ops", "#fff", "waddle", "claude", None, false, users::OPERATOR, Visibility::Shared);
+    app.db.add_approval(&bot.id, "claude", "Bash", "shell", "git push", &json!({ "command": "git push" }), "git_push", "Pushes", db::now() + 60_000);
+
+    // A token without `review` doesn't see pending approvals, through any route.
+    let (all, _) = token(port, &admin, &sa, json!({})).await;
+    let (read, _) = token(port, &admin, &sa, json!({ "scopes": ["read"] })).await;
+    let (_, st) = json_call(port, "GET", "/api/state", &all, "").await;
+    assert_eq!(st["approvals"].as_array().map(Vec::len), Some(1), "{st}");
+    let (code, st) = json_call(port, "GET", "/api/state", &read, "").await;
+    assert_eq!((code, st["approvals"].clone()), (200, json!([])), "{st}");
+    assert_eq!(call(port, "GET", "/api/approvals", &read, "").await.0, 403);
+
+    // A stream ends once its token would be refused: revoked, the account disabled, the
+    // owner disabled, or the owner no longer able to read.
+    let tid = |v: &Value| v["tokenInfo"]["id"].as_str().unwrap().to_string();
+    let (t, v) = token(port, &admin, &sa, json!({})).await;
+    let s = stream(port, &t).await;
+    assert_eq!(call(port, "DELETE", &format!("/api/service-accounts/{sa}/tokens/{}", tid(&v)), &admin, "").await.0, 200);
+    assert!(closes(s).await, "still streaming after revoke");
+
+    let s = stream(port, &all).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, r#"{"status":"disabled"}"#).await.0, 200);
+    assert!(closes(s).await, "still streaming after the account was disabled");
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, r#"{"status":"active"}"#).await.0, 200);
+
+    let (ana, ana_auth) = user_with(port, &admin, "ana@example.com", "member").await;
+    let helpdesk = role(port, &admin, "Helpdesk", "member", &["users.manage"]).await;
+    assert_eq!(call(port, "PUT", &format!("/api/roles/{helpdesk}/users/{ana}"), &admin, "").await.0, 200);
+    let hers = account(port, &ana_auth, json!({ "name": "Ana's", "role": "member" })).await;
+    let (t, _) = token(port, &ana_auth, &hers, json!({})).await;
+    let s = stream(port, &t).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{ana}"), &admin, r#"{"role":"readonly"}"#).await.0, 200);
+    let quiet = stream(port, &t).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{ana}"), &admin, r#"{"status":"disabled"}"#).await.0, 200);
+    assert!(closes(s).await && closes(quiet).await, "still streaming after the owner was disabled");
+    // An expired token's stream ends too.
+    let (t, v) = token(port, &admin, &sa, json!({})).await;
+    let s = stream(port, &t).await;
+    app.db.set_service_token_expiry(&tid(&v), db::now() - 1);
+    assert!(closes(s).await, "still streaming after expiry");
+}
+
+#[tokio::test]
+async fn a_team_service_account_shares_bots_only_within_its_team() {
+    let (port, app, admin, _) = serve_app().await;
+    let (ada, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (solo, _) = user_with(port, &admin, "solo@example.com", "member").await;
+    let (code, t) = json_call(port, "POST", "/api/teams", &admin, &json!({ "name": "Alpha", "owner": ada }).to_string()).await;
+    assert_eq!(code, 201, "{t}");
+    let team = t["id"].as_str().unwrap().to_string();
+    let teams_bot = app.db.create_bot_owned("Alpha ops", "#fff", "waddle", "claude", None, false, &ada, Visibility::Shared).id;
+    let solos_bot = app.db.create_bot_owned("Solo desk", "#fff", "waddle", "claude", None, false, &solo, Visibility::Shared).id;
+
+    let in_team = account(port, &admin, json!({ "name": "Alpha bot", "role": "member", "team": team })).await;
+    let (tok, _) = token(port, &admin, &in_team, json!({})).await;
+    let (_, list) = json_call(port, "GET", "/api/bots", &tok, "").await;
+    let sees = bot_ids(&list);
+    assert!(sees.contains(&teams_bot) && !sees.contains(&solos_bot), "{sees:?}");
+    assert_eq!(call(port, "GET", &format!("/api/bots/{teams_bot}/messages"), &tok, "").await.0, 200);
+    assert_eq!(call(port, "GET", &format!("/api/bots/{solos_bot}/messages"), &tok, "").await.0, 404);
+    assert_eq!(call(port, "POST", &format!("/api/bots/{solos_bot}/messages"), &tok, r#"{"text":"hi"}"#).await.0, 404);
+
+    // One across the server is in no team: as a person in none, it reaches no team's Bots.
+    let org = account(port, &admin, json!({ "name": "Org bot", "role": "member" })).await;
+    let (tok, _) = token(port, &admin, &org, json!({})).await;
+    let (_, list) = json_call(port, "GET", "/api/bots", &tok, "").await;
+    let sees = bot_ids(&list);
+    assert!(!sees.contains(&teams_bot) && sees.contains(&solos_bot), "{sees:?}");
+    assert_eq!(call(port, "GET", &format!("/api/bots/{teams_bot}/messages"), &tok, "").await.0, 404);
+
+    // Out of the team, it's in none, at once.
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{in_team}"), &admin, r#"{"team":null}"#).await.0, 200);
+    assert_eq!(app.db.team_id_of(&in_team), None);
+    let (tok, _) = token(port, &admin, &in_team, json!({})).await;
+    assert_eq!(call(port, "GET", &format!("/api/bots/{teams_bot}/messages"), &tok, "").await.0, 404);
+    assert!(app.db.team_members(&team).iter().all(|m| m.user_id != in_team), "never on the team's list");
 }

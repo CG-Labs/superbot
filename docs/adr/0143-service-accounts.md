@@ -19,7 +19,7 @@ A **service account** is a `users` row with `kind = 'service'` and a `service_ac
 
 It can **never be an admin**. The API refuses it (400), and SQLite triggers refuse a service row with role `admin`, an email, or any change of `kind`, whatever writes it. Authentication checks a third time.
 
-Service accounts aren't people. `GET /api/users`, `/api/users/{id}`, role assignment, team membership, Bot grants, seat counts and SCIM don't see them, so none of those routes can make one an admin or a teammate. A team's service account acts in its team as a plain member with its team role, without a `team_members` row or a seat.
+Service accounts aren't people. `GET /api/users`, `/api/users/{id}`, role assignment, team membership, Bot grants, seat counts and SCIM don't see them, so none of those routes can make one an admin or a teammate. A team's service account acts in its team as a plain member with its team role, without a `team_members` row or a seat. For Bot sharing it is one of its team: it reaches the team's shared Bots and no one else's, as a person in that team would. One across the server is in no team, like a person in none.
 
 ### Tokens
 
@@ -31,7 +31,7 @@ A service account acts only through **API tokens** (`sbsa_` and 64 hex character
 - **Rotatable.** `POST .../tokens/{id}/rotate` makes a new token with the same name and scopes. The old one stops at once, or after `keepOldMinutes` (at most a day) so callers can switch over. A token rotates once; an expired or revoked one can't.
 - **Revocable.** `DELETE .../tokens/{id}` stops it at once. Disabling the account stops all its tokens until it's enabled. Deleting it revokes them for good.
 
-Each request reads the token, account and owner afresh, so revoking, disabling, or the owner losing access takes effect on the next request. Use is noted (`lastUsedAt`, `lastUsedIp`) at most once a minute.
+Each request reads the token, account and owner afresh, so revoking, disabling, or the owner losing access takes effect on the next request. A live event stream (`GET /api/events`) rechecks them every few seconds and closes once the token would be refused or may no longer read. Checks inside a route (such as the pending approvals in `GET /api/state`) use the same scoped permissions as the route itself. Use is noted (`lastUsedAt`, `lastUsedIp`) at most once a minute.
 
 ### Never more than the owner
 

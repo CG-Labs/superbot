@@ -690,7 +690,7 @@ pub async fn mine(State(app): State<AppState>, Extension(c): Extension<Caller>) 
     let sight = Sight { machines: can(Perm::ManageMachines), invites: can(Perm::ManageUsers), billing: can(Perm::ManageBilling) };
     let mut v = team_view(&app, &t, Some(&m), sight);
     if v.get("billing").is_some() {
-        v["billing"]["canChange"] = json!(sight.billing && crate::rbac::allows(c.principal, Perm::Write));
+        v["billing"]["canChange"] = json!(sight.billing && c.can(Perm::Write));
     }
     v["customRole"] = crate::roles::summary(&app, m.role_id.as_deref());
     v["permissions"] = json!(team_perms(&app, &m).names());

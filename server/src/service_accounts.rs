@@ -33,6 +33,19 @@ const DAY: i64 = 24 * 60 * 60_000;
 /// working at once.
 pub fn authenticate(app: &AppState, token: &str, source: &Source, at: i64) -> Result<Caller, &'static str> {
     let t = app.db.service_token_by_hash(&users::hash(token)).ok_or("unknown_token")?;
+    let id = t.id.clone();
+    let c = caller(app, t, at)?;
+    app.db.touch_service_token(&id, at, source.ip.as_deref());
+    Ok(c)
+}
+
+/// The caller token `id` makes now, if it still makes one: for what outlives the request
+/// that opened it (the event stream), so it ends as soon as the token would be refused.
+pub fn recheck(app: &AppState, id: &str, at: i64) -> Option<Caller> {
+    caller(app, app.db.service_token(id)?, at).ok()
+}
+
+fn caller(app: &AppState, t: ServiceToken, at: i64) -> Result<Caller, &'static str> {
     if t.revoked_at.is_some() {
         return Err("revoked");
     }
@@ -48,7 +61,6 @@ pub fn authenticate(app: &AppState, token: &str, source: &Source, at: i64) -> Re
         return Err("admin_refused");
     }
     let owner = live_owner(app, &sa.owner_id).ok_or("owner_inactive")?;
-    app.db.touch_service_token(&t.id, at, source.ip.as_deref());
     let scope = token_scope(&t).and(ceiling(app, &owner, sa.team_id.as_deref()));
     let mut c = Caller::person(&app.db, sa.user, None, METHOD);
     c.service = Some(ServiceCaller { token: t.id, owner: owner.id, scope });

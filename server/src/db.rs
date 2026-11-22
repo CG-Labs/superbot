@@ -777,6 +777,9 @@ impl CustomRole {
     }
 }
 
+/// Each user's team: its members, and its live service accounts (ADR 0143).
+const TEAM_OF: &str = "SELECT user_id, team_id FROM team_members UNION ALL SELECT user_id, team_id FROM service_accounts WHERE team_id IS NOT NULL AND deleted_at IS NULL";
+
 /// A service account (ADR 0143): its `users` row (kind `service`: role, custom role across
 /// the server, status), and what only it has. `owner_id` is the person whose permissions
 /// cap it; `team_id` the team it acts in, with the custom role `team_role_id` there.
@@ -8698,14 +8701,16 @@ impl Db {
         self.c().query_row("SELECT * FROM team_members WHERE user_id = ?", [user_id], team_member_row).optional().ok().flatten()
     }
 
+    /// The user's team: as a member, or as the team's service account (ADR 0143), which
+    /// shares and is shared with as one of the team, though it isn't on its list.
     pub fn team_id_of(&self, user_id: &str) -> Option<String> {
-        self.c().query_row("SELECT team_id FROM team_members WHERE user_id = ?", [user_id], |r| r.get(0)).optional().ok().flatten()
+        self.c().query_row(&format!("SELECT team_id FROM ({TEAM_OF}) WHERE user_id = ?"), [user_id], |r| r.get(0)).optional().ok().flatten()
     }
 
-    /// Every member's team, by user id.
+    /// Every member's team, by user id, with teams' service accounts.
     pub fn team_ids(&self) -> HashMap<String, String> {
         let c = self.c();
-        let mut s = c.prepare("SELECT user_id, team_id FROM team_members").unwrap();
+        let mut s = c.prepare(TEAM_OF).unwrap();
         s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(Result::ok).collect()
     }
 
