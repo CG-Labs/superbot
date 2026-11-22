@@ -1556,8 +1556,10 @@ function showTab() {
 window.addEventListener("hashchange", showTab);
 
 $("signout-btn").addEventListener("click", async () => {
-  await api("POST", "/api/auth/logout").catch(() => {});
-  location.href = "/login";
+  const r = await api("POST", "/api/auth/logout").catch(() => null);
+  // A SAML IdP with single logout ends its session too, then sends the browser back (ADR 0137).
+  const idp = typeof r?.logoutUrl === "string" && r.logoutUrl.startsWith("https://") ? r.logoutUrl : null;
+  location.href = idp || "/login";
 });
 
 let me = {};
