@@ -74,14 +74,20 @@ fn elsewhere(app: &App, user_id: &str, region: &str) -> Option<Machine> {
     app.db.user_machine(user_id).filter(|m| m.region != region)
 }
 
-/// Whether `user` may join `team` without their region moving away from their machine.
-pub fn check_join(app: &App, team: &Team, user: &User) -> Result<(), String> {
+/// Whether `user` may join `team` without their region moving away from their machine,
+/// or bringing data from outside the team's residency pin (ADR 0129). Err: the reason
+/// for the audit log, and the message.
+pub fn check_join(app: &App, cp: &ControlPlane, team: &Team, user: &User) -> Result<(), (&'static str, String)> {
+    super::residency::check_join(app, cp, team, user).map_err(|why| (super::residency::PINNED, why))?;
     let (None, Some(r)) = (&user.region, &team.region) else { return Ok(()) };
     match elsewhere(app, &user.id, r) {
         None => Ok(()),
-        Some(m) => Err(format!(
-            "{}'s machine is in {}, and team {} keeps its data in {r}. Destroy their machine first, or set their own data region to {} (ADR 0117).",
-            user.name, m.region, team.name, m.region
+        Some(m) => Err((
+            "data_region",
+            format!(
+                "{}'s machine is in {}, and team {} keeps its data in {r}. Destroy their machine first, or set their own data region to {} (ADR 0117).",
+                user.name, m.region, team.name, m.region
+            ),
         )),
     }
 }
@@ -138,6 +144,8 @@ pub fn user_view(app: &App, cp: &ControlPlane, u: &User) -> Value {
         "team": team.map(|t| json!({ "id": t.id, "name": t.name, "region": t.region })),
         "effective": eff,
         "machine": machine_view(m.as_ref(), &eff.region),
+        "residency": super::residency::of_user(app, &u.id),
+        "ownResidency": app.db.residency_pin(crate::db::PinOn::User, &u.id),
     })
 }
 
@@ -181,6 +189,12 @@ pub async fn set_user(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Aut
         return Ok(Json(v));
     }
     let details = json!({ "from": u.region, "to": to, "effectiveFrom": before.region, "effectiveTo": after.region, "userEmail": u.email });
+    if let Err((p, why)) = super::residency::check_user_region(&app, &u, to.as_deref(), &after.region) {
+        let mut d = details;
+        (d["reason"], d["pinnedRegion"], d["reference"]) = (json!(super::residency::PINNED), json!(p.region), json!(p.reference));
+        app.db.record(&by.event("user.region_change_refused").target("user", &u.id).outcome(Outcome::Denied).details(d));
+        return Err(conflict(why));
+    }
     if let Some(m) = elsewhere(&app, &u.id, &after.region) {
         let mut d = details;
         (d["reason"], d["machineId"], d["machineRegion"]) = (json!("machine_elsewhere"), json!(m.id), json!(m.region));
@@ -225,6 +239,11 @@ pub async fn set_team(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Aut
     if t.region == to {
         return Ok(Json(team_region_view(&app, cp, &t)));
     }
+    if let Err((p, why)) = super::residency::check_team_region(&app, &t, to.as_deref()) {
+        let d = json!({ "from": t.region, "to": to, "reason": super::residency::PINNED, "pinnedRegion": p.region, "reference": p.reference });
+        app.db.record(&crate::teams::team_event(&by, "team.region_change_refused", &t.id, d).outcome(Outcome::Denied));
+        return Err(conflict(why));
+    }
     let (mut moved, mut blocked) = (0, Vec::new());
     for m in app.db.team_members(&t.id) {
         let Some(u) = app.db.user(&m.user_id).filter(|u| u.region.is_none()) else { continue };
@@ -258,6 +277,7 @@ pub fn team_region_view(app: &App, cp: &ControlPlane, t: &Team) -> Value {
     json!({
         "teamId": t.id, "region": t.region, "effective": resolve(cp, None, t.region.as_deref()),
         "members": members.len(), "membersWithOwnRegion": own,
+        "residency": app.db.residency_pin(crate::db::PinOn::Team, &t.id),
     })
 }
 
@@ -271,6 +291,7 @@ pub async fn list(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>)
     let machines: Vec<Machine> = app.db.machines(None).into_iter().filter(|m| m.state != super::State::Destroyed).collect();
     let hosts = cp.hosts().filter(|h| h.tagged()).map(|h| h.configured());
     let backups = cp.offsite.as_deref().map(|off| off.regions_view());
+    let pins = app.db.residency_pins();
     let mut ids: Vec<String> = cp.regions.clone();
     for r in users.iter().filter_map(|u| u.region.clone()).chain(teams.iter().filter_map(|t| t.region.clone())).chain(machines.iter().map(|m| m.region.clone())) {
         if !ids.contains(&r) {
@@ -287,6 +308,10 @@ pub async fn list(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>)
                 "users": users.iter().filter(|u| u.region.as_deref() == Some(r.as_str())).count(),
                 "teams": teams.iter().filter(|t| t.region.as_deref() == Some(r.as_str())).count(),
                 "machines": machines.iter().filter(|m| m.region == *r).count(),
+                "pinned": {
+                    "users": pins.iter().filter(|p| p.subject_type == crate::db::PinOn::User && p.region == *r && app.db.user(&p.subject_id).is_some()).count(),
+                    "teams": pins.iter().filter(|p| p.subject_type == crate::db::PinOn::Team && p.region == *r && app.db.team(&p.subject_id).is_some()).count(),
+                },
             });
             if let Some(h) = &hosts {
                 v["hosts"] = json!(h.iter().filter(|h| h.region.as_deref() == Some(r.as_str())).map(|h| h.name.clone()).collect::<Vec<_>>());
@@ -303,6 +328,7 @@ pub async fn list(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>)
         "hostRegions": hosts.is_some(),
         "regions": regions,
         "backups": cp.offsite.as_deref().map(|off| json!({ "residency": off.s.residency, "dataRegion": off.s.default_region, "warnings": off.warnings() })),
+        "residency": { "pins": super::residency::pins_view(&app), "warnings": super::residency::warnings(&app, cp) },
     })))
 }
 

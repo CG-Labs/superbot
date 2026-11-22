@@ -54,6 +54,11 @@ async fn serve() -> Env {
 /// by data region (ADR 0117), MACHINE_REGIONS is their tags, the first the default; its
 /// backups go to the default store, said to be in it, and every other region's to its own.
 pub(crate) async fn serve_with(build: impl FnOnce(Member, Member, Member) -> Fleet) -> Env {
+    serve_with_offsite(build, |_| ()).await
+}
+
+/// As `serve_with`, with `tweak` applied to the off-host backup settings first.
+pub(crate) async fn serve_with_offsite(build: impl FnOnce(Member, Member, Member) -> Fleet, tweak: impl FnOnce(&mut Settings)) -> Env {
     let machine_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let agent_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let (mport, aport) = (machine_listener.local_addr().unwrap().port(), agent_listener.local_addr().unwrap().port());
@@ -76,13 +81,14 @@ pub(crate) async fn serve_with(build: impl FnOnce(Member, Member, Member) -> Fle
     cp.routing = crate::machines::route::Routing::On;
     let e = cp.enroll_with(Enrollment::for_tests(9, mport, aport).with_agent(AGENT.as_bytes())).unwrap();
     cp.firewall_with(firewall::Settings { sources: Vec::new(), ssh: Vec::new() }).unwrap();
-    let s = Settings {
+    let mut s = Settings {
         retention: Retention::retention("7").unwrap(),
         default_region: tags.first().cloned(),
         stores: stores.iter().map(|(r, st)| (r.clone(), st.settings())).collect(),
         regions: cp.regions.clone(),
         ..Settings::with(s3.settings(), "t/", Vec::new())
     };
+    tweak(&mut s);
     cp.offsite = Some(Arc::new(Offsite::new(s).unwrap()));
     let cp = Arc::new(cp);
     let shared = cp.clone();
