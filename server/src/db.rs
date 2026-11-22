@@ -6674,7 +6674,8 @@ impl Db {
 
     /// Audit events from `from` (unix ms) whose action is one of `actions` (a trailing `*`
     /// matches a prefix), counted by action, outcome, sign-in method and code: a run's
-    /// `details.result`, else `details.reason`. Counts only, never who (ADR 0144).
+    /// `details.result`, else `details.reason`. Counts only, never who (ADR 0144). A
+    /// throttled failure counts with the ones it says weren't logged (`unloggedSinceLast`).
     pub fn audit_counts(&self, from: i64, actions: &[&str]) -> Vec<AuditCount> {
         use rusqlite::types::Value as V;
         let mut args = vec![V::Integer(from)];
@@ -6697,7 +6698,7 @@ impl Db {
         let sql = format!(
             "SELECT action, outcome, auth_method,
                CASE WHEN json_valid(details) THEN CAST(COALESCE(json_extract(details, '$.result'), json_extract(details, '$.reason')) AS TEXT) END AS code,
-               COUNT(*)
+               SUM(1 + CASE WHEN json_valid(details) THEN max(0, CAST(COALESCE(json_extract(details, '$.unloggedSinceLast'), 0) AS INTEGER)) ELSE 0 END)
              FROM audit_events WHERE at >= ? AND ({})
              GROUP BY action, outcome, auth_method, code ORDER BY action, outcome, code",
             parts.join(" OR ")

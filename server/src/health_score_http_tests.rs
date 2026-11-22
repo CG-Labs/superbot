@@ -119,3 +119,20 @@ fn audit_counts_start_where_asked_and_never_say_who() {
     assert!(app.db.audit_counts(db::now() + 60_000, &["auth.login_failed", "bot.run_finished", "scim.*"]).is_empty());
     assert!(app.db.audit_counts(0, &[]).is_empty());
 }
+
+#[test]
+fn throttled_sign_in_failures_count_with_the_ones_not_logged() {
+    let app = runner::test_app();
+    let fail = |missed: u64| Event::new(Actor::operator().method("sso"), "auth.login_failed").outcome(Outcome::Failure).details(json!({ "reason": "bad_signature", "unloggedSinceLast": missed }));
+    app.db.record(&fail(0));
+    app.db.record(&fail(40));
+    for _ in 0..60 {
+        app.db.record(&Event::new(Actor::operator().method("sso"), "auth.login"));
+    }
+    let counts = app.db.audit_counts(db::now() - 60_000, &["auth.login_failed"]);
+    assert_eq!(counts.iter().map(|c| c.n).sum::<u64>(), 42, "{counts:?}");
+    let r = crate::health_score::build(&app, db::now(), 30);
+    let identity = r["signals"].as_array().unwrap().iter().find(|s| s["id"] == "identity").unwrap();
+    assert_eq!((identity["facts"]["ssoFailed"].as_u64(), identity["facts"]["ssoAttempts"].as_u64()), (Some(42), Some(102)), "{identity:#}");
+    assert_eq!(identity["status"], "risk", "a certificate rollover's failures aren't hidden by the throttle: {identity:#}");
+}
