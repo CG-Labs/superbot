@@ -253,7 +253,8 @@ fn sign_in_view(app: &AppState, a: &Auth, public_url: Option<&str>) -> Value {
             })
         })
         .collect();
-    let waiting: Vec<String> = a.sso.providers.iter().filter(|p| !p.ready()).map(|p| p.label.clone()).collect();
+    let waiting = |secret: bool| a.sso.providers.iter().filter(|p| !p.ready() && p.needs_secret() == secret).map(|p| p.label.clone()).collect::<Vec<_>>().join(", ");
+    let (for_secret, for_metadata) = (waiting(true), waiting(false));
     let admins: Vec<Value> = app
         .db
         .users()
@@ -261,10 +262,12 @@ fn sign_in_view(app: &AppState, a: &Auth, public_url: Option<&str>) -> Value {
         .filter(|u| u.role == Role::Admin && u.active() && u.id != users::OPERATOR)
         .map(|u| json!({ "id": u.id, "name": u.name, "email": u.email, "lastLoginAt": u.last_login_at }))
         .collect();
-    let detail = match (a.sso.providers.len(), waiting.is_empty()) {
-        (0, _) => "No SSO providers: people sign in with one-time codes from Users. Add a provider any time.".to_string(),
-        (n, true) => format!("{n} SSO provider{} ready.", if n == 1 { "" } else { "s" }),
-        (_, false) => format!("Waiting for a secret: {}. Saving it takes effect at once, no restart.", waiting.join(", ")),
+    let detail = match (a.sso.providers.len(), for_secret.is_empty(), for_metadata.is_empty()) {
+        (0, ..) => "No SSO providers: people sign in with one-time codes from Users. Add a provider any time.".to_string(),
+        (n, true, true) => format!("{n} SSO provider{} ready.", if n == 1 { "" } else { "s" }),
+        (_, false, true) => format!("Waiting for a secret: {for_secret}. Saving it takes effect at once, no restart."),
+        (_, true, false) => format!("Waiting for IdP metadata: {for_metadata}. Importing it takes effect at once, no restart."),
+        (_, false, false) => format!("Waiting for a secret: {for_secret}; and for IdP metadata: {for_metadata}. Either takes effect at once, no restart."),
     };
     json!({
         "breakGlass": a.break_glass,
@@ -273,7 +276,7 @@ fn sign_in_view(app: &AppState, a: &Auth, public_url: Option<&str>) -> Value {
         "admins": admins,
         "scim": a.scim.enabled,
         "signups": a.signups.enabled,
-        "ok": waiting.is_empty(),
+        "ok": for_secret.is_empty() && for_metadata.is_empty(),
         "detail": detail,
         "templates": templates(&a.sso.providers, public_url, a.sso.public_url()),
         "restart": restart(),

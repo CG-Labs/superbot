@@ -1042,7 +1042,11 @@ fn setup_summary(s: &Value) -> String {
         out += &format!("  [{mark}] {}\n      {}\n", c["label"].as_str().unwrap_or_default(), c["detail"].as_str().unwrap_or_default());
     }
     for p in s["signIn"]["providers"].as_array().into_iter().flatten().filter(|p| p["ready"] != true) {
-        out += &format!("\n{} needs its secret: botctl secret set {} < file\n", p["label"].as_str().unwrap_or_default(), p["secret"].as_str().unwrap_or_default());
+        let label = p["label"].as_str().unwrap_or_default();
+        match p["secret"].as_str() {
+            Some(secret) => out += &format!("\n{label} needs its secret: botctl secret set {secret} < file\n"),
+            None => out += &format!("\n{label} needs its IdP metadata: botctl sso saml {} import idp-metadata.xml\n", p["id"].as_str().unwrap_or_default()),
+        }
     }
     if !p["completedAt"].is_i64() {
         out += "\nThe console's Setup tab has the commands for each step. When you're done: botctl setup done\n";
@@ -1781,12 +1785,16 @@ mod tests {
                 { "id": "domain", "label": "A public address with HTTPS", "done": true, "detail": "People reach SuperBot at https://bots.example.com." },
                 { "id": "signin", "label": "Sign-in providers ready", "done": false, "detail": "Waiting for a secret: Okta." },
             ],
-            "signIn": { "providers": [{ "label": "Okta", "ready": false, "secret": "SSO_OKTA_CLIENT_SECRET" }] },
+            "signIn": { "providers": [
+                { "label": "Okta", "ready": false, "secret": "SSO_OKTA_CLIENT_SECRET" },
+                { "id": "corp", "label": "Corp SAML", "ready": false, "secret": null },
+            ] },
         });
         let out = setup_summary(&s);
         assert!(out.starts_with("Setup: 1 of 2 done (admins see the wizard"), "{out}");
         assert!(out.contains("[x] A public address with HTTPS") && out.contains("[ ] Sign-in providers ready"), "{out}");
         assert!(out.contains("botctl secret set SSO_OKTA_CLIENT_SECRET < file") && out.contains("botctl setup done"), "{out}");
+        assert!(out.contains("Corp SAML needs its IdP metadata: botctl sso saml corp import idp-metadata.xml") && !out.contains("secret set  <"), "{out}");
         let done = setup_summary(&json!({ "progress": { "completedAt": 1 }, "done": 2, "total": 2, "checklist": [] }));
         assert!(done.starts_with("Setup: 2 of 2 done (finished).") && !done.contains("botctl setup done"), "{done}");
     }
