@@ -44,6 +44,26 @@
         },
         "refresh": 1,
         "hide": 0
+      },
+      {
+        "name": "instance",
+        "label": "botd",
+        "description": "One botd at a time: each places machines on its own hosts.",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(superbot_build_info{job=\"$job\"}, instance)",
+          "refId": "instance"
+        },
+        "definition": "label_values(superbot_build_info{job=\"$job\"}, instance)",
+        "multi": false,
+        "includeAll": false,
+        "current": {},
+        "refresh": 1,
+        "hide": 0
       }
     ]
   },
@@ -79,7 +99,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "max(superbot_incus_machines_waiting_for_room{job=\"$job\"})",
+          "expr": "max(superbot_incus_machines_waiting_for_room{job=\"$job\",instance=\"$instance\"})",
           "legendFormat": "waiting",
           "refId": "A",
           "instant": true
@@ -138,7 +158,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(superbot_incus_host_open{job=\"$job\"})",
+          "expr": "sum(superbot_incus_host_open{job=\"$job\",instance=\"$instance\"})",
           "legendFormat": "open",
           "refId": "A",
           "instant": true
@@ -148,7 +168,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "count(superbot_incus_host_open{job=\"$job\"})",
+          "expr": "count(superbot_incus_host_open{job=\"$job\",instance=\"$instance\"})",
           "legendFormat": "configured",
           "refId": "B",
           "instant": true
@@ -207,7 +227,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(superbot_events_total{job=\"$job\",event=\"machine.placement_failed\"}[24h]))",
+          "expr": "sum(increase(superbot_events_total{job=\"$job\",instance=\"$instance\",event=\"machine.placement_failed\"}[24h]))",
           "legendFormat": "refused",
           "refId": "A",
           "instant": true
@@ -266,7 +286,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(superbot_incus_host_machines{job=\"$job\"})",
+          "expr": "sum(superbot_incus_host_machines{job=\"$job\",instance=\"$instance\"})",
           "legendFormat": "machines",
           "refId": "A",
           "instant": true
@@ -321,7 +341,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "1 - sum(superbot_incus_host_allocated_cpus{job=\"$job\"} and on (instance, host) superbot_incus_host_open{job=\"$job\"} == 1) / sum(superbot_incus_host_capacity_cpus{job=\"$job\"} and on (instance, host) superbot_incus_host_open{job=\"$job\"} == 1)",
+          "expr": "1 - sum(superbot_incus_host_allocated_cpus{job=\"$job\",instance=\"$instance\"} and on (instance, host) superbot_incus_host_open{job=\"$job\",instance=\"$instance\"} == 1) / sum(superbot_incus_host_capacity_cpus{job=\"$job\",instance=\"$instance\"} and on (instance, host) superbot_incus_host_open{job=\"$job\",instance=\"$instance\"} == 1)",
           "legendFormat": "CPUs",
           "refId": "A"
         },
@@ -330,7 +350,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "1 - sum(superbot_incus_host_allocated_memory_bytes{job=\"$job\"} and on (instance, host) superbot_incus_host_open{job=\"$job\"} == 1) / sum(superbot_incus_host_capacity_memory_bytes{job=\"$job\"} and on (instance, host) superbot_incus_host_open{job=\"$job\"} == 1)",
+          "expr": "1 - sum(superbot_incus_host_allocated_memory_bytes{job=\"$job\",instance=\"$instance\"} and on (instance, host) superbot_incus_host_open{job=\"$job\",instance=\"$instance\"} == 1) / sum(superbot_incus_host_capacity_memory_bytes{job=\"$job\",instance=\"$instance\"} and on (instance, host) superbot_incus_host_open{job=\"$job\",instance=\"$instance\"} == 1)",
           "legendFormat": "memory",
           "refId": "B"
         },
@@ -339,7 +359,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "1 - sum(superbot_incus_host_allocated_disk_bytes{job=\"$job\"} and on (instance, host) superbot_incus_host_open{job=\"$job\"} == 1) / sum(superbot_incus_host_capacity_disk_bytes{job=\"$job\"} and on (instance, host) superbot_incus_host_open{job=\"$job\"} == 1)",
+          "expr": "1 - sum(superbot_incus_host_allocated_disk_bytes{job=\"$job\",instance=\"$instance\"} and on (instance, host) superbot_incus_host_open{job=\"$job\",instance=\"$instance\"} == 1) / sum(superbot_incus_host_capacity_disk_bytes{job=\"$job\",instance=\"$instance\"} and on (instance, host) superbot_incus_host_open{job=\"$job\",instance=\"$instance\"} == 1)",
           "legendFormat": "disk",
           "refId": "C"
         },
@@ -348,7 +368,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "1 - sum(superbot_incus_host_machines{job=\"$job\"} and on (instance, host) superbot_incus_host_max_machines{job=\"$job\"} and on (instance, host) superbot_incus_host_open{job=\"$job\"} == 1) / sum(superbot_incus_host_max_machines{job=\"$job\"} and on (instance, host) superbot_incus_host_open{job=\"$job\"} == 1)",
+          "expr": "1 - sum(superbot_incus_host_machines{job=\"$job\",instance=\"$instance\"} and on (instance, host) superbot_incus_host_max_machines{job=\"$job\",instance=\"$instance\"} and on (instance, host) superbot_incus_host_open{job=\"$job\",instance=\"$instance\"} == 1) / sum(superbot_incus_host_max_machines{job=\"$job\",instance=\"$instance\"} and on (instance, host) superbot_incus_host_open{job=\"$job\",instance=\"$instance\"} == 1)",
           "legendFormat": "machines",
           "refId": "D"
         }
@@ -412,7 +432,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "superbot_incus_host_open{job=\"$job\"}",
+          "expr": "superbot_incus_host_open{job=\"$job\",instance=\"$instance\"}",
           "legendFormat": "{{host}} open",
           "refId": "A"
         },
@@ -421,7 +441,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "superbot_incus_host_up{job=\"$job\"}",
+          "expr": "superbot_incus_host_up{job=\"$job\",instance=\"$instance\"}",
           "legendFormat": "{{host}} up",
           "refId": "B"
         }
@@ -475,7 +495,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "superbot_incus_host_allocated_cpus{job=\"$job\"} / superbot_incus_host_capacity_cpus{job=\"$job\"}",
+          "expr": "superbot_incus_host_allocated_cpus{job=\"$job\",instance=\"$instance\"} / superbot_incus_host_capacity_cpus{job=\"$job\",instance=\"$instance\"}",
           "legendFormat": "{{host}}",
           "refId": "A"
         }
@@ -547,7 +567,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "superbot_incus_host_allocated_memory_bytes{job=\"$job\"} / superbot_incus_host_capacity_memory_bytes{job=\"$job\"}",
+          "expr": "superbot_incus_host_allocated_memory_bytes{job=\"$job\",instance=\"$instance\"} / superbot_incus_host_capacity_memory_bytes{job=\"$job\",instance=\"$instance\"}",
           "legendFormat": "{{host}}",
           "refId": "A"
         }
@@ -619,7 +639,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "superbot_incus_host_allocated_disk_bytes{job=\"$job\"} / superbot_incus_host_capacity_disk_bytes{job=\"$job\"}",
+          "expr": "superbot_incus_host_allocated_disk_bytes{job=\"$job\",instance=\"$instance\"} / superbot_incus_host_capacity_disk_bytes{job=\"$job\",instance=\"$instance\"}",
           "legendFormat": "{{host}}",
           "refId": "A"
         }
@@ -691,7 +711,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "superbot_incus_host_machines{job=\"$job\"}",
+          "expr": "superbot_incus_host_machines{job=\"$job\",instance=\"$instance\"}",
           "legendFormat": "{{host}}",
           "refId": "A"
         },
@@ -700,7 +720,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "superbot_incus_host_max_machines{job=\"$job\"}",
+          "expr": "superbot_incus_host_max_machines{job=\"$job\",instance=\"$instance\"}",
           "legendFormat": "{{host}} max",
           "refId": "B"
         }
@@ -765,7 +785,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "superbot_host_memory_used_bytes{job=\"$job\"} / superbot_host_memory_bytes{job=\"$job\"}",
+          "expr": "superbot_host_memory_used_bytes{job=\"$job\",instance=\"$instance\"} / superbot_host_memory_bytes{job=\"$job\",instance=\"$instance\"}",
           "legendFormat": "{{host}} ({{kind}})",
           "refId": "A"
         }
@@ -835,7 +855,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "superbot_host_disk_used_bytes{job=\"$job\"} / superbot_host_disk_bytes{job=\"$job\"}",
+          "expr": "superbot_host_disk_used_bytes{job=\"$job\",instance=\"$instance\"} / superbot_host_disk_bytes{job=\"$job\",instance=\"$instance\"}",
           "legendFormat": "{{host}} {{disk}}",
           "refId": "A"
         }
@@ -909,7 +929,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "superbot_host_load5{job=\"$job\"} / superbot_host_cpus{job=\"$job\"}",
+          "expr": "superbot_host_load5{job=\"$job\",instance=\"$instance\"} / superbot_host_cpus{job=\"$job\",instance=\"$instance\"}",
           "legendFormat": "{{host}} ({{kind}})",
           "refId": "A"
         }
@@ -970,7 +990,7 @@
       "id": 16,
       "type": "timeseries",
       "title": "Age of each reading",
-      "description": "How long since each host said what it uses. Incus hosts are read at each host check (MACHINE_RECONCILE_SECONDS); botd's own at each scrape. Alert past 15 minutes: SuperBotIncusHostReadingStale.",
+      "description": "How long since each host said what it uses. Incus hosts are read every MACHINE_RECONCILE_SECONDS; botd's own at each scrape. Alert past 15 minutes: SuperBotIncusHostReadingStale.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -981,7 +1001,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "time() - superbot_host_reading_timestamp_seconds{job=\"$job\"}",
+          "expr": "time() - superbot_host_reading_timestamp_seconds{job=\"$job\",instance=\"$instance\"}",
           "legendFormat": "{{host}} ({{kind}})",
           "refId": "A"
         }
@@ -1049,7 +1069,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "superbot_host_memory_bytes{job=\"$job\"}",
+          "expr": "superbot_host_memory_bytes{job=\"$job\",instance=\"$instance\"}",
           "legendFormat": "{{host}} memory",
           "refId": "A"
         },
@@ -1058,7 +1078,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "superbot_host_disk_bytes{job=\"$job\"}",
+          "expr": "superbot_host_disk_bytes{job=\"$job\",instance=\"$instance\"}",
           "legendFormat": "{{host}} {{disk}} disk",
           "refId": "B"
         }
@@ -1110,7 +1130,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "superbot_host_cpus{job=\"$job\"}",
+          "expr": "superbot_host_cpus{job=\"$job\",instance=\"$instance\"}",
           "legendFormat": "{{host}} threads",
           "refId": "A"
         },
@@ -1119,7 +1139,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "superbot_incus_host_allocated_cpus{job=\"$job\"}",
+          "expr": "superbot_incus_host_allocated_cpus{job=\"$job\",instance=\"$instance\"}",
           "legendFormat": "{{host}} allocated",
           "refId": "B"
         }

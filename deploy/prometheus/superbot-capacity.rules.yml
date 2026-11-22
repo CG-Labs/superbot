@@ -18,7 +18,7 @@ groups:
     rules:
       # A machine waits to be made because no host has room: someone has no computer.
       - alert: SuperBotMachinesWaitingForRoom
-        expr: max by (job) (superbot_incus_machines_waiting_for_room{job="superbot"}) > 0
+        expr: max by (job, instance) (superbot_incus_machines_waiting_for_room{job="superbot"}) > 0
         for: 5m
         labels:
           severity: page
@@ -28,7 +28,7 @@ groups:
 
       # Requests for machines refused for want of room.
       - alert: SuperBotMachineRequestsRefusedForRoom
-        expr: sum by (job) (increase(superbot_events_total{job="superbot",event="machine.placement_failed"}[15m])) > 0
+        expr: sum by (job, instance) (increase(superbot_events_total{job="superbot",event="machine.placement_failed"}[15m])) > 0
         labels:
           severity: ticket
         annotations:
@@ -42,23 +42,23 @@ groups:
       - alert: SuperBotIncusCapacityLow
         expr: |
           label_replace(
-            1 - sum by (job) (superbot_incus_host_allocated_cpus{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
-              / sum by (job) (superbot_incus_host_capacity_cpus{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
+            1 - sum by (job, instance) (superbot_incus_host_allocated_cpus{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
+              / sum by (job, instance) (superbot_incus_host_capacity_cpus{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
             < 0.15, "resource", "cpus", "", "")
           or
           label_replace(
-            1 - sum by (job) (superbot_incus_host_allocated_memory_bytes{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
-              / sum by (job) (superbot_incus_host_capacity_memory_bytes{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
+            1 - sum by (job, instance) (superbot_incus_host_allocated_memory_bytes{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
+              / sum by (job, instance) (superbot_incus_host_capacity_memory_bytes{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
             < 0.15, "resource", "memory", "", "")
           or
           label_replace(
-            1 - sum by (job) (superbot_incus_host_allocated_disk_bytes{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
-              / sum by (job) (superbot_incus_host_capacity_disk_bytes{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
+            1 - sum by (job, instance) (superbot_incus_host_allocated_disk_bytes{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
+              / sum by (job, instance) (superbot_incus_host_capacity_disk_bytes{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
             < 0.15, "resource", "disk", "", "")
           or
           label_replace(
-            1 - sum by (job) (superbot_incus_host_machines{job="superbot"} and on (job, instance, host) superbot_incus_host_max_machines and on (job, instance, host) superbot_incus_host_open == 1)
-              / sum by (job) (superbot_incus_host_max_machines{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
+            1 - sum by (job, instance) (superbot_incus_host_machines{job="superbot"} and on (job, instance, host) superbot_incus_host_max_machines and on (job, instance, host) superbot_incus_host_open == 1)
+              / sum by (job, instance) (superbot_incus_host_max_machines{job="superbot"} and on (job, instance, host) superbot_incus_host_open == 1)
             < 0.15, "resource", "machines", "", "")
         for: 15m
         labels:
@@ -69,7 +69,7 @@ groups:
 
       # Nowhere for a new machine at all.
       - alert: SuperBotNoOpenIncusHost
-        expr: sum by (job) (superbot_incus_host_open{job="superbot"}) == 0
+        expr: sum by (job, instance) (superbot_incus_host_open{job="superbot"}) == 0
         for: 5m
         labels:
           severity: page

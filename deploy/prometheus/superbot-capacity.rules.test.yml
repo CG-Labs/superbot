@@ -25,6 +25,7 @@ tests:
           - exp_labels:
               severity: ticket
               job: superbot
+              instance: botd:9464
             exp_annotations:
               summary: "A machine was refused because no Incus host had room"
               description: "Placement refused or held back a machine in the last 15 minutes (machine.placement_failed in the audit log names the plan and each host's reason). Add capacity or a host before more are refused."
@@ -34,6 +35,7 @@ tests:
           - exp_labels:
               severity: page
               job: superbot
+              instance: botd:9464
             exp_annotations:
               summary: "Machines are waiting for room on an Incus host"
               description: "1 machines can't be made because no Incus host has room (machine.placement_failed in the audit log says why). Add capacity (INCUS_CAPACITY, or another host in INCUS_HOSTS), undrain a host, or free room; botctl machine hosts shows each host's load."
@@ -95,6 +97,7 @@ tests:
           - exp_labels:
               severity: ticket
               job: superbot
+              instance: botd:9464
               resource: cpus
             exp_annotations:
               summary: "Incus hosts are nearly out of room (cpus)"
@@ -111,6 +114,7 @@ tests:
           - exp_labels:
               severity: page
               job: superbot
+              instance: botd:9464
             exp_annotations:
               summary: "No Incus host is open for new machines"
               description: "Every Incus host is down, lost, failing its checks or drained, so no machine can be made or restored elsewhere. botctl machine hosts says why for each."
@@ -264,3 +268,62 @@ tests:
             exp_annotations:
               summary: "botd can't read what Incus host c uses"
               description: "c answers botd's checks but hasn't said what it uses for over 15 minutes, so its memory, disk and load metrics are stale. botd's log says why (\"didn't say what it uses\")."
+
+  # Each botd's hosts are its own: one server with no open host, or nearly out of room,
+  # alerts even while another in the same job has plenty.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_incus_host_open{job="superbot",instance="one:9464",host="a"}'
+        values: '0x39'
+      - series: 'superbot_incus_host_allocated_cpus{job="superbot",instance="one:9464",host="a"}'
+        values: '0x39'
+      - series: 'superbot_incus_host_capacity_cpus{job="superbot",instance="one:9464",host="a"}'
+        values: '4x39'
+      - series: 'superbot_incus_host_open{job="superbot",instance="two:9464",host="b"}'
+        values: '1x39'
+      - series: 'superbot_incus_host_allocated_cpus{job="superbot",instance="two:9464",host="b"}'
+        values: '4x39'
+      - series: 'superbot_incus_host_capacity_cpus{job="superbot",instance="two:9464",host="b"}'
+        values: '4x39'
+      - series: 'superbot_incus_host_open{job="superbot",instance="three:9464",host="c"}'
+        values: '1x39'
+      - series: 'superbot_incus_host_allocated_cpus{job="superbot",instance="three:9464",host="c"}'
+        values: '0x39'
+      - series: 'superbot_incus_host_capacity_cpus{job="superbot",instance="three:9464",host="c"}'
+        values: '100x39'
+      - series: 'superbot_incus_machines_waiting_for_room{job="superbot",instance="two:9464"}'
+        values: '1x39'
+      - series: 'superbot_incus_machines_waiting_for_room{job="superbot",instance="three:9464"}'
+        values: '0x39'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SuperBotNoOpenIncusHost
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              job: superbot
+              instance: one:9464
+            exp_annotations:
+              summary: "No Incus host is open for new machines"
+              description: "Every Incus host is down, lost, failing its checks or drained, so no machine can be made or restored elsewhere. botctl machine hosts says why for each."
+      - eval_time: 10m
+        alertname: SuperBotMachinesWaitingForRoom
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              job: superbot
+              instance: two:9464
+            exp_annotations:
+              summary: "Machines are waiting for room on an Incus host"
+              description: "1 machines can't be made because no Incus host has room (machine.placement_failed in the audit log says why). Add capacity (INCUS_CAPACITY, or another host in INCUS_HOSTS), undrain a host, or free room; botctl machine hosts shows each host's load."
+      - eval_time: 20m
+        alertname: SuperBotIncusCapacityLow
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: two:9464
+              resource: cpus
+            exp_annotations:
+              summary: "Incus hosts are nearly out of room (cpus)"
+              description: "Less than 15% of the open Incus hosts' cpus is left for new machines (INCUS_CAPACITY, INCUS_MAX_MACHINES). Add capacity or a host, or undrain one, before placement starts refusing machines."
