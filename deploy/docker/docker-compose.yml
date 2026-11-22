@@ -42,7 +42,11 @@ services:
     # (docs/adr/0066-removing-teammate-accounts-on-one-server.md). Runs get none of these: they drop
     # every capability when sudo switches to the account.
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID, SETUID, SETGID, AUDIT_WRITE]
-    security_opt: []
+    # Docker's own seccomp profile, plus the user, PID and network namespaces (and chroot inside
+    # them) that Chromium's sandbox needs (docs/adr/0106-chromium-sandbox-in-the-container.md).
+    # Regenerate it with ./seccomp-chromium.sh. Hosts that can't give Chromium its sandbox set
+    # SUPERBOT_CHROMIUM_SANDBOX=off in .env; botd's log says which it is.
+    security_opt: ["seccomp=./seccomp-chromium.json"]
     volumes:
       - data:/data
       - workspace:/workspace

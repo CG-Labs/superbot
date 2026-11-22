@@ -122,6 +122,9 @@ RUN set -eu; \
     rm -rf /tmp/ab-src; \
     install -d -m 1777 /tmp/.X11-unix
 COPY --from=voxl /out/bin/ /usr/local/bin/
+# Chromium with its sandbox on, whatever agent-browser asks (ADR 0106). Ahead of /usr/bin on PATH.
+COPY --chmod=0755 deploy/docker/chromium.sh /usr/local/bin/chromium
+RUN if [ "$COMPUTER" = off ]; then rm /usr/local/bin/chromium; fi
 
 RUN set -eu; pkgs=""; \
     for h in $HARNESSES; do \
@@ -200,7 +203,7 @@ ENV HOME=/home/superbot \
     NPM_CONFIG_PREFIX=/home/superbot/.local \
     PATH=/opt/superbot/bin:/home/superbot/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     DISABLE_AUTOUPDATER=1 \
-    AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium \
+    AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/chromium \
     AGENT_BROWSER_SKILLS_DIR=/opt/computer/share/agent-browser-skills
 
 USER superbot
