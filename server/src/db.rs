@@ -741,12 +741,45 @@ pub struct User {
     pub erased_at: Option<i64>,
     /// The pseudonym the audit log names them by since.
     pub erased_as: Option<String>,
+    /// Their custom role across the server (ADR 0123). `role` is then that role's base.
+    pub role_id: Option<String>,
 }
 
 impl User {
     pub fn active(&self) -> bool {
         self.status == "active"
     }
+}
+
+/// A role an admin made (ADR 0123): a base built-in role (member or read-only) and the
+/// delegable permissions it adds. `permissions` is as saved; `perms` drops any name the
+/// server doesn't know, so it grants nothing.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomRole {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub base: Role,
+    pub permissions: Vec<String>,
+    pub created_at: i64,
+    pub created_by: Option<String>,
+    pub updated_at: i64,
+}
+
+impl CustomRole {
+    pub fn perms(&self) -> crate::rbac::Perms {
+        crate::rbac::Perms::from_names(self.permissions.iter().map(String::as_str))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum RoleError {
+    NameTaken,
+    NotFound,
+    /// Still given to this many people, across the server or in a team.
+    InUse(usize),
+    Db(String),
 }
 
 /// A request for access from the public sign-up form (ADR 0022).
@@ -1156,6 +1189,7 @@ fn machine_row(r: &Row) -> rusqlite::Result<Machine> {
 pub struct UserPatch {
     pub email: Option<Option<String>>,
     pub name: Option<String>,
+    /// A built-in role. It replaces any custom role they had (ADR 0123).
     pub role: Option<Role>,
     pub status: Option<&'static str>,
     /// Some(None): back to the default tier.
@@ -1535,6 +1569,23 @@ fn user_row(r: &Row) -> rusqlite::Result<User> {
         region: r.get("region")?,
         erased_at: r.get("erased_at")?,
         erased_as: r.get("erased_as")?,
+        role_id: r.get("role_id")?,
+    })
+}
+
+fn custom_role_row(r: &Row) -> rusqlite::Result<CustomRole> {
+    let base: String = r.get("base")?;
+    let permissions: String = r.get("permissions")?;
+    Ok(CustomRole {
+        id: r.get("id")?,
+        name: r.get("name")?,
+        description: r.get("description")?,
+        // The CHECK allows only these two; anything else reads as the lesser.
+        base: if base == "member" { Role::Member } else { Role::Readonly },
+        permissions: serde_json::from_str(&permissions).unwrap_or_default(),
+        created_at: r.get("created_at")?,
+        created_by: r.get("created_by")?,
+        updated_at: r.get("updated_at")?,
     })
 }
 
@@ -1654,7 +1705,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 48] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 49] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1703,6 +1754,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 48] = [
     migrate_file_retention,
     migrate_data_regions,
     migrate_disable_holds,
+    migrate_custom_roles,
 ];
 
 /// Machines suspended because their user was disabled (ADR 0124), so enabling them
@@ -1717,6 +1769,36 @@ fn migrate_disable_holds(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS machine_disable_holds_user ON machine_disable_holds(user_id);",
     )
+}
+
+/// Custom roles (ADR 0123): a base built-in role and a fixed set of admin permissions on
+/// top. `users.role_id` is a person's role across the server, and `users.role` stays its
+/// base, so every check that reads the built-in role keeps working. `team_members.role_id`
+/// is a role given within their team, and goes when they leave it. A role still given to
+/// someone can't be deleted (the foreign keys refuse it as well).
+fn migrate_custom_roles(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS roles (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+          description TEXT NOT NULL DEFAULT '',
+          base TEXT NOT NULL CHECK (base IN ('member', 'readonly')),
+          permissions TEXT NOT NULL DEFAULT '[]',
+          created_at INTEGER NOT NULL,
+          created_by TEXT,
+          updated_at INTEGER NOT NULL
+        );",
+    )?;
+    for table in ["users", "team_members"] {
+        let has: bool = c.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = 'role_id'"), [], |r| r.get(0))?;
+        if !has {
+            c.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN role_id TEXT REFERENCES roles(id);
+                 CREATE INDEX IF NOT EXISTS {table}_role ON {table}(role_id) WHERE role_id IS NOT NULL;"
+            ))?;
+        }
+    }
+    Ok(())
 }
 
 /// Data regions (ADR 0117): the region an admin set for a user or a team, and the
@@ -4324,7 +4406,10 @@ impl Db {
         let res = (|| {
             if let Some(v) = &p.email { set("email", v)? }
             if let Some(v) = &p.name { set("display_name", v)? }
-            if let Some(v) = p.role { set("role", &v.as_str())? }
+            if let Some(v) = p.role {
+                set("role", &v.as_str())?;
+                set("role_id", &None::<String>)?;
+            }
             if let Some(v) = p.status { set("status", &v)? }
             if let Some(v) = &p.tier { set("tier", v)? }
             Ok::<_, rusqlite::Error>(())
@@ -4339,6 +4424,133 @@ impl Db {
     /// Sets or clears the user's data region (ADR 0117).
     pub fn set_user_region(&self, id: &str, region: Option<&str>) -> bool {
         self.c().execute("UPDATE users SET region = ?1, updated_at = ?2 WHERE id = ?3", params![region, now(), id]).unwrap_or(0) > 0
+    }
+
+    // Custom roles (ADR 0123).
+
+    pub fn custom_roles(&self) -> Vec<CustomRole> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM roles ORDER BY name, id").unwrap();
+        s.query_map([], custom_role_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn custom_role(&self, id: &str) -> Option<CustomRole> {
+        self.c().query_row("SELECT * FROM roles WHERE id = ?", [id], custom_role_row).optional().ok().flatten()
+    }
+
+    /// By id, or by name (case-insensitive).
+    pub fn find_custom_role(&self, key: &str) -> Option<CustomRole> {
+        self.c().query_row("SELECT * FROM roles WHERE id = ?1 OR name = ?1 ORDER BY id = ?1 DESC LIMIT 1", [key], custom_role_row).optional().ok().flatten()
+    }
+
+    pub fn create_custom_role(&self, name: &str, description: &str, base: Role, permissions: &[&str], by: Option<&str>) -> Result<CustomRole, RoleError> {
+        let id = format!("r{}", crate::random_hex(5));
+        let at = now();
+        let perms = serde_json::to_string(permissions).unwrap_or_else(|_| "[]".into());
+        self.c()
+            .execute(
+                "INSERT INTO roles (id, name, description, base, permissions, created_at, created_by, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?6)",
+                params![id, name, description, base.as_str(), perms, at, by],
+            )
+            .map_err(|e| if constraint(&e) { RoleError::NameTaken } else { RoleError::Db(e.to_string()) })?;
+        self.custom_role(&id).ok_or(RoleError::NotFound)
+    }
+
+    /// Saves the fields given. A new base applies to everyone who holds the role across the
+    /// server, in the same transaction; returns those whose built-in role changed.
+    pub fn update_custom_role(&self, id: &str, name: Option<&str>, description: Option<&str>, base: Option<Role>, permissions: Option<&[&str]>) -> Result<Vec<String>, RoleError> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(|e| RoleError::Db(e.to_string()))?;
+        let at = now();
+        let res = (|| {
+            if tx.execute("UPDATE roles SET updated_at = ?1 WHERE id = ?2", params![at, id])? == 0 {
+                return Ok(None);
+            }
+            let set = |col: &str, v: &dyn rusqlite::ToSql| tx.execute(&format!("UPDATE roles SET {col} = ?1 WHERE id = ?2"), params![v, id]);
+            if let Some(v) = name { set("name", &v)?; }
+            if let Some(v) = description { set("description", &v)?; }
+            if let Some(v) = permissions { set("permissions", &serde_json::to_string(v).unwrap_or_else(|_| "[]".into()))?; }
+            let mut moved = Vec::new();
+            if let Some(b) = base {
+                set("base", &b.as_str())?;
+                let mut s = tx.prepare("SELECT id FROM users WHERE role_id = ?1 AND role != ?2 ORDER BY id")?;
+                moved = s.query_map(params![id, b.as_str()], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+                tx.execute("UPDATE users SET role = ?1, updated_at = ?2 WHERE role_id = ?3 AND role != ?1", params![b.as_str(), at, id])?;
+            }
+            Ok(Some(moved))
+        })();
+        match res {
+            Ok(Some(moved)) => tx.commit().map(|_| moved).map_err(|e| RoleError::Db(e.to_string())),
+            Ok(None) => Err(RoleError::NotFound),
+            Err(e) if constraint(&e) => Err(RoleError::NameTaken),
+            Err(e) => Err(RoleError::Db(e.to_string())),
+        }
+    }
+
+    /// Deletes a role nobody holds. The count and the delete are one transaction.
+    pub fn delete_custom_role(&self, id: &str) -> Result<(), RoleError> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(|e| RoleError::Db(e.to_string()))?;
+        let held: i64 = tx
+            .query_row("SELECT (SELECT COUNT(*) FROM users WHERE role_id = ?1) + (SELECT COUNT(*) FROM team_members WHERE role_id = ?1)", [id], |r| r.get(0))
+            .map_err(|e| RoleError::Db(e.to_string()))?;
+        if held > 0 {
+            return Err(RoleError::InUse(held as usize));
+        }
+        match tx.execute("DELETE FROM roles WHERE id = ?", [id]) {
+            Ok(0) => Err(RoleError::NotFound),
+            Ok(_) => tx.commit().map_err(|e| RoleError::Db(e.to_string())),
+            Err(e) => Err(RoleError::Db(e.to_string())),
+        }
+    }
+
+    /// Who holds the role: users across the server, and (team, user) pairs within a team.
+    pub fn custom_role_holders(&self, id: &str) -> (Vec<String>, Vec<(String, String)>) {
+        let c = self.c();
+        let users = c
+            .prepare("SELECT id FROM users WHERE role_id = ? ORDER BY created_at, id")
+            .and_then(|mut s| s.query_map([id], |r| r.get(0))?.collect())
+            .unwrap_or_default();
+        let teams = c
+            .prepare("SELECT team_id, user_id FROM team_members WHERE role_id = ? ORDER BY team_id, joined_at, user_id")
+            .and_then(|mut s| s.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
+            .unwrap_or_default();
+        (users, teams)
+    }
+
+    /// Gives `user_id` the role across the server, its base becoming their built-in role, in
+    /// one statement, so a role deleted meanwhile can't be half given. False if either is gone.
+    pub fn set_user_custom_role(&self, user_id: &str, role_id: &str) -> bool {
+        self.c()
+            .execute(
+                "UPDATE users SET role_id = ?1, role = (SELECT base FROM roles WHERE id = ?1), updated_at = ?2
+                 WHERE id = ?3 AND EXISTS (SELECT 1 FROM roles WHERE id = ?1)",
+                params![role_id, now(), user_id],
+            )
+            .unwrap_or(0)
+            > 0
+    }
+
+    /// Takes the role away across the server. They keep its base as their built-in role.
+    pub fn clear_user_custom_role(&self, user_id: &str, role_id: &str) -> bool {
+        self.c().execute("UPDATE users SET role_id = NULL, updated_at = ?1 WHERE id = ?2 AND role_id = ?3", params![now(), user_id, role_id]).unwrap_or(0) > 0
+    }
+
+    /// Gives (Some) or takes away (None) a role within the team `user_id` is on. False if
+    /// they aren't on that team, or the role is gone.
+    pub fn set_team_custom_role(&self, team_id: &str, user_id: &str, role_id: Option<&str>) -> bool {
+        self.c()
+            .execute(
+                "UPDATE team_members SET role_id = ?1 WHERE team_id = ?2 AND user_id = ?3 AND (?1 IS NULL OR EXISTS (SELECT 1 FROM roles WHERE id = ?1))",
+                params![role_id, team_id, user_id],
+            )
+            .unwrap_or(0)
+            > 0
+    }
+
+    /// What a person's custom role across the server adds. Nothing without one.
+    pub fn user_perms(&self, u: &User) -> crate::rbac::Perms {
+        u.role_id.as_deref().and_then(|id| self.custom_role(id)).map_or(crate::rbac::Perms::NONE, |r| r.perms())
     }
 
     // Erasure (ADR 0102).
@@ -4487,7 +4699,7 @@ impl Db {
         let at = now();
         run(
             "UPDATE users SET email = NULL, display_name = ?2, role = 'readonly', status = 'disabled', idp_issuer = NULL, idp_subject = NULL,
-               last_login_at = NULL, last_login_method = NULL, last_login_idp_provider = NULL, tier = NULL,
+               last_login_at = NULL, last_login_method = NULL, last_login_idp_provider = NULL, tier = NULL, role_id = NULL,
                erased_at = ?3, erased_by = ?4, erased_as = ?5, updated_at = ?3
              WHERE id = ?1",
             &[&user_id, &ERASED_NAME, &at, &by, &pseudonym],
@@ -7891,6 +8103,9 @@ pub struct TeamMember {
     pub role: String,
     pub joined_at: i64,
     pub added_by: Option<String>,
+    /// A custom role given to them within the team (ADR 0123).
+    #[serde(skip)]
+    pub role_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -7937,6 +8152,7 @@ fn team_member_row(r: &Row) -> rusqlite::Result<TeamMember> {
         role: r.get("role")?,
         joined_at: r.get("joined_at")?,
         added_by: r.get("added_by")?,
+        role_id: r.get("role_id")?,
     })
 }
 

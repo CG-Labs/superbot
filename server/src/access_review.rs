@@ -68,6 +68,18 @@ pub fn build(app: &App, a: &Auth) -> Report {
     Report { generated_at: at, digest, rows }
 }
 
+/// A role cell: the built-in role, and a custom role with its permissions when there is one.
+fn with_custom(p: &Value) -> String {
+    let role = p["role"].as_str().unwrap_or_default();
+    match p["customRole"]["name"].as_str() {
+        Some(name) => {
+            let perms: Vec<&str> = p["customRole"]["permissions"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+            format!("{role}; {name}: {}", perms.join(" "))
+        }
+        None => role.to_string(),
+    }
+}
+
 fn person(app: &App, a: &Auth, u: &User, at: i64, names: &HashMap<&str, &str>, mfa: &HashMap<String, i64>, teams: &HashMap<String, String>) -> Row {
     let scim = app.db.scim_user_of(&u.id);
     let member = app.db.team_member(&u.id);
@@ -92,7 +104,11 @@ fn person(app: &App, a: &Auth, u: &User, at: i64, names: &HashMap<&str, &str>, m
     let (tokens, browsers): (Vec<&Session>, Vec<&Session>) = live.iter().partition(|s| s.kind == "token");
     let machine = app.db.user_machine(&u.id);
     let mfa_at = mfa.get(&u.id).copied();
-    let view = json!({
+    // Custom roles (ADR 0123): across the server, and within their team.
+    let custom = u.role_id.as_deref().and_then(|id| app.db.custom_role(id));
+    let team_custom = member.as_ref().and_then(|m| m.role_id.as_deref()).and_then(|id| app.db.custom_role(id));
+    let role_view = |r: &crate::db::CustomRole, perms: crate::rbac::Perms| json!({ "id": r.id, "name": r.name, "permissions": perms.names() });
+    let mut view = json!({
         "id": u.id, "name": u.name, "email": u.email, "role": u.role, "status": u.status, "breakGlass": u.id == OPERATOR, "tier": u.tier,
         "createdAt": u.created_at,
         "scim": scim.as_ref().map(|s| json!({ "tenant": s.tenant, "deleted": s.deleted_at.is_some() })),
@@ -103,9 +119,13 @@ fn person(app: &App, a: &Auth, u: &User, at: i64, names: &HashMap<&str, &str>, m
         "sessions": browsers.iter().map(|s| session_view(s, &a.sessions)).collect::<Vec<_>>(),
         "apiTokens": tokens.iter().map(|s| session_view(s, &a.sessions)).collect::<Vec<_>>(),
         "machine": machine.as_ref().map(|m| json!({ "id": m.id, "provider": m.provider, "state": m.state.as_str(), "enrollment": m.enrollment, "assignedAt": m.assigned_at })),
+        "customRole": custom.as_ref().map(|r| role_view(r, r.perms())),
     });
+    if let Some(r) = &team_custom {
+        view["team"]["customRole"] = role_view(r, r.perms().in_team());
+    }
     let ids = |list: &[&Session]| list.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
-    let stable = json!([
+    let mut stable = json!([
         u.id, u.role, u.status, u.email,
         scim.as_ref().map(|s| json!([s.tenant, s.deleted_at.is_some()])),
         member.as_ref().map(|m| json!([m.team_id, m.role])),
@@ -115,6 +135,13 @@ fn person(app: &App, a: &Auth, u: &User, at: i64, names: &HashMap<&str, &str>, m
         ids(&browsers), ids(&tokens),
         machine.as_ref().map(|m| json!([m.id, m.state.as_str(), m.assigned_at])),
     ]);
+    // Only when there is one, so reports from before custom roles keep their digests.
+    if custom.is_some() || team_custom.is_some() {
+        let held = |r: &Option<crate::db::CustomRole>, team: bool| r.as_ref().map(|r| json!([r.id, if team { r.perms().in_team() } else { r.perms() }.names()]));
+        if let Some(a) = stable.as_array_mut() {
+            a.push(json!([held(&custom, false), held(&team_custom, true)]));
+        }
+    }
     Row { tenant: scim.map(|s| s.tenant), team, view, stable }
 }
 
@@ -177,11 +204,11 @@ impl Report {
                 c(&generated),
                 r.tenant.as_deref().map(c).unwrap_or_default(),
                 s(&p["team"]["name"]),
-                s(&p["team"]["role"]),
+                c(&with_custom(&p["team"])),
                 s(&p["id"]),
                 s(&p["name"]),
                 s(&p["email"]),
-                s(&p["role"]),
+                c(&with_custom(p)),
                 s(&p["status"]),
                 p["scim"].is_object().to_string(),
                 (p["breakGlass"] == true).to_string(),
