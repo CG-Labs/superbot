@@ -1765,6 +1765,9 @@ main() {
   fi
   sync_repo
   stage_trusted_deploy
+  # Before the new binaries are in place: once they may have opened the database, the older
+  # bundle must stay refused even if a later step fails.
+  record_offline_release
   build_botd
   build_client
   install_site
@@ -1777,7 +1780,6 @@ main() {
   install_backup
   install_caddy
   configure_ufw
-  record_offline_release
   summary
   finish
 }

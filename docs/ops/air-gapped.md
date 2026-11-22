@@ -32,7 +32,7 @@ The bundle carries SuperBot, not the operating system. Install these on the serv
 
 The installer lists anything missing and stops before it changes anything.
 
-**Harness CLIs** (Claude Code, Codex, Pi, Hermes Agent) are not in the bundle for the bash install: install them from your npm or Python mirror, system-wide, as in [deploy/README.md](../../deploy/README.md#one-unix-account-per-user). `--with-hermes` downloads Hermes Agent, so it is refused with `--offline`, and the console's *Install* buttons for harness CLIs download too: don't use them. The published image already has the harness CLIs and the screens, so [Docker Compose](#docker-compose) is the simpler path when you need them.
+**Harness CLIs** (Claude Code, Codex, Pi, Hermes Agent) are not in the bundle for the bash install: install them from your npm or Python mirror, system-wide, as in [deploy/README.md](../../deploy/README.md#one-unix-account-per-user). `--with-hermes` downloads Hermes Agent, so it is refused with `--offline`, and the console's *Install* buttons for harness CLIs download too: don't use them. The published image already has Claude Code, Codex and Pi and the screens, so [Docker Compose](#docker-compose) is the simpler path when you need them. It doesn't have Hermes Agent: for Hermes, build your own image on the connected side (`docker build --build-arg HARNESSES="claude codex pi hermes" -t superbot-hermes:<version> .`) and bundle it with `--image superbot=superbot-hermes:<version> --allow-unsigned` (it is your image, so there is no release signature to check).
 
 ## Getting a bundle
 
