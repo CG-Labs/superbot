@@ -244,6 +244,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine teammates <user> logout <teammate> <harness>  Log that teammate's own harness out on it
   botctl machine removals [<state>]                Teammate removals: open (default), pending, held, done, cancelled, all
   botctl secrets                                   List secret names (never values)
+  botctl secrets backend                           Where botd reads secrets from (local, Vault, Azure Key
+                                                   Vault, GCP Secret Manager) and whether it answers now
   botctl secret set <NAME> < value-file            Save a secret, encrypted; Bots get it as $NAME
   botctl secret rm <NAME>                          Delete a saved secret
 
@@ -1190,10 +1192,31 @@ fn setup_summary(s: &Value) -> String {
             None => out += &format!("\n{label} needs its IdP metadata: botctl sso saml {} import idp-metadata.xml\n", p["id"].as_str().unwrap_or_default()),
         }
     }
+    if s["secretsBackend"]["ok"] == false {
+        out += &format!("\nSecrets backend {}: {}\n", s["secretsBackend"]["backend"].as_str().unwrap_or_default(), s["secretsBackend"]["detail"].as_str().unwrap_or_default());
+    }
     if !p["completedAt"].is_i64() {
         out += "\nThe console's Setup tab has the commands for each step. When you're done: botctl setup done\n";
     }
     out
+}
+
+/// Where botd reads secrets from and whether it answers (ADR 0125, ADR 0136); an error
+/// when it doesn't, so scripts can check it.
+fn backend_summary(b: &Value) -> Result<String, String> {
+    if b.is_null() {
+        return Err("This botd doesn't report its secrets backend; upgrade it.".into());
+    }
+    let mut out = format!("Secrets backend: {}", b["backend"].as_str().unwrap_or("unknown"));
+    if let Some(d) = b["description"].as_str().filter(|_| b["backend"] != "local") {
+        out += &format!(" ({d}");
+        if let Some(s) = b["cacheSeconds"].as_u64() {
+            out += &format!(", cached for {s} s");
+        }
+        out += ")";
+    }
+    out += &format!("\n  {}", b["detail"].as_str().unwrap_or_default());
+    if b["ok"] == true { Ok(out) } else { Err(out) }
 }
 
 /// `GET /api/license`, for a terminal (ADR 0038).
@@ -1578,6 +1601,10 @@ fn run(args: &[String]) -> Result<String, String> {
         ["session", "revoke", id] => op("DELETE", &format!("/api/sessions/{}", encode(id)), None).map(|_| "Revoked.".into()),
         ["session", "revoke-all", key] => op("DELETE", &format!("/api/users/{}/sessions", encode(key)), None),
         ["secrets"] => op("GET", "/api/secrets", None),
+        ["secrets", "backend"] => {
+            let res = api(Cred::Operator, "GET", "/api/setup", None)?;
+            backend_summary(&serde_json::from_str::<Value>(&res).map_err(|e| e.to_string())?["secretsBackend"])
+        }
         ["secret", "set", name] => {
             let name = env_name(name)?;
             let body = json!({ "value": stdin_value(std::io::stdin())? }).to_string();
@@ -2069,6 +2096,19 @@ mod tests {
         assert!(out.contains("Corp SAML needs its IdP metadata: botctl sso saml corp import idp-metadata.xml") && !out.contains("secret set  <"));
         let done = setup_summary(&json!({ "progress": { "completedAt": 1 }, "done": 2, "total": 2, "checklist": [] }));
         assert!(done.starts_with("Setup: 2 of 2 done (finished).") && !done.contains("botctl setup done"), "{done}");
+        let down = setup_summary(&json!({ "progress": { "completedAt": 1 }, "checklist": [], "secretsBackend": { "backend": "azure-keyvault", "ok": false, "detail": "azure-keyvault can't be read: 403" } }));
+        assert!(down.contains("Secrets backend azure-keyvault: azure-keyvault can't be read: 403"), "{down}");
+    }
+
+    #[test]
+    fn secrets_backend_summary() {
+        let local = json!({ "backend": "local", "description": "the environment and the sealed store", "ok": true, "detail": "Local: ..." });
+        assert_eq!(backend_summary(&local).unwrap(), "Secrets backend: local\n  Local: ...");
+        let gcp = json!({ "backend": "gcp-secret-manager", "description": "GCP Secret Manager at https://secretmanager.googleapis.com", "cacheSeconds": 300, "ok": true, "names": 3, "detail": "gcp-secret-manager answers: 3 names" });
+        assert_eq!(backend_summary(&gcp).unwrap(), "Secrets backend: gcp-secret-manager (GCP Secret Manager at https://secretmanager.googleapis.com, cached for 300 s)\n  gcp-secret-manager answers: 3 names");
+        let down = json!({ "backend": "vault", "description": "HashiCorp Vault at https://v", "ok": false, "detail": "vault can't be read" });
+        assert!(backend_summary(&down).unwrap_err().ends_with("vault can't be read"), "a failing backend is an error, for scripts");
+        assert!(backend_summary(&Value::Null).is_err());
     }
 
     #[test]
