@@ -1,7 +1,8 @@
 //! A small S3 client for off-host machine backups (ADR 0071): path-style requests
 //! signed with AWS Signature Version 4, which AWS S3, Cloudflare R2, Backblaze B2,
 //! MinIO and most S3-compatible stores accept. Only what backups need: multipart
-//! uploads, small puts, streaming gets, listings and deletes. The secret key signs requests and
+//! uploads, small puts, streaming gets, listings and deletes (of old versions too, in a
+//! versioned bucket). The secret key signs requests and
 //! goes nowhere else: not in errors, logs, or `Debug`.
 
 use crate::secrets::SecretStore;
@@ -303,6 +304,52 @@ impl S3 {
                 (Some("true"), _) => return Err("the backup store's listing was cut off without a way to go on".into()),
                 _ => return Ok(keys),
             };
+        }
+    }
+
+    /// Whether the bucket keeps old versions (versioning on, or suspended with some kept),
+    /// so a plain delete leaves the bytes behind a delete marker. A store with no
+    /// versioning at all says it doesn't implement it.
+    pub async fn versioned(&self) -> Result<bool, String> {
+        match self.send(Method::GET, None, &[("versioning", "")], Vec::new()).await {
+            Ok(res) => Ok(matches!(tag(&S3::text(res).await?, "Status").as_deref(), Some("Enabled" | "Suspended"))),
+            Err(e) if e.contains("(501)") || e.contains("NotImplemented") => Ok(false),
+            Err(e) => Err(format!("{e} (botd asks whether the bucket keeps old versions: s3:GetBucketVersioning)")),
+        }
+    }
+
+    /// Every version and delete marker of every key under `prefix`, as `(key, version id)`.
+    pub async fn versions(&self, prefix: &str) -> Result<Vec<(String, String)>, String> {
+        let mut out = Vec::new();
+        let mut after: Option<(String, String)> = None;
+        loop {
+            let mut q = vec![("versions", ""), ("prefix", prefix)];
+            if let Some((k, v)) = after.as_ref() {
+                q.push(("key-marker", k));
+                q.push(("version-id-marker", v));
+            }
+            let res = self.send(Method::GET, None, &q, Vec::new()).await?;
+            let xml = S3::text(res).await?;
+            for item in xml.split("<Version>").skip(1).chain(xml.split("<DeleteMarker>").skip(1)) {
+                if let (Some(k), Some(v)) = (tag(item, "Key"), tag(item, "VersionId")) {
+                    out.push((k, v));
+                }
+            }
+            let next = (tag(&xml, "NextKeyMarker"), tag(&xml, "NextVersionIdMarker"));
+            after = match (tag(&xml, "IsTruncated").as_deref(), next) {
+                (Some("true"), (Some(k), Some(v))) if !k.is_empty() && after.as_ref() != Some(&(k.clone(), v.clone())) => Some((k, v)),
+                (Some("true"), _) => return Err("the backup store's listing of versions was cut off without a way to go on".into()),
+                _ => return Ok(out),
+            };
+        }
+    }
+
+    /// Deletes one version for good, or a delete marker. Succeeds if it is already gone.
+    pub async fn delete_version(&self, key: &str, version_id: &str) -> Result<(), String> {
+        match self.send(Method::DELETE, Some(key), &[("versionId", version_id)], Vec::new()).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.contains("(404)") => Ok(()),
+            Err(e) => Err(e),
         }
     }
 

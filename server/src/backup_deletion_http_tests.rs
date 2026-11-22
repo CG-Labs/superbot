@@ -228,6 +228,75 @@ async fn erasing_a_user_deletes_their_machines_backups_only_when_asked() {
 }
 
 #[tokio::test]
+async fn in_a_versioned_bucket_old_versions_and_markers_go_too() {
+    let env = serve(true).await;
+    let s3 = env.s3.as_ref().unwrap();
+    let (uid, m) = member_with_machine(&env, "ada@example.com").await;
+    let b = backup_of(&env, &m, "done");
+    let (_, other) = member_with_machine(&env, "bea@example.com").await;
+    let theirs = backup_of(&env, &other, "done");
+    {
+        let mut w = s3.w();
+        w.versioning = Some("Enabled");
+        let stray = format!("t/machines/{}/left.incus", m.id);
+        w.old = vec![
+            (b.object_key.clone(), "v-older".into(), false),
+            (stray.clone(), "v-stray".into(), false),
+            (stray, "v-marker".into(), true),
+            (theirs.object_key.clone(), "v-theirs".into(), false),
+        ];
+    }
+    destroy(&env, &uid).await;
+    let (code, v) = json_call(&env, "DELETE", &format!("/api/machines/{}/backups", m.id), &env.admin, "").await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!((v["backups"].as_array().map(Vec::len), v["versions"].as_u64(), v["strays"].as_u64()), (Some(1), Some(5), Some(0)), "data, manifest, an older version, a stray's version and its marker: {v}");
+    assert_eq!(s3.keys(), [theirs.object_key.clone(), format!("t/machines/{}/{}.json", other.id, theirs.id)]);
+    assert_eq!(s3.w().old, [(theirs.object_key.clone(), "v-theirs".to_string(), false)], "another machine's versions stay");
+    assert!(!s3.w().calls.iter().any(|c| c.starts_with("DELETE") && !c.contains("versionId=")), "no plain delete to leave a marker: {:?}", s3.w().calls);
+    assert_eq!(events(&env, "machine.backups_deleted").await[0]["details"]["versions"].as_u64(), Some(5));
+}
+
+#[tokio::test]
+async fn an_erasure_asked_again_finishes_what_it_left_and_counts_a_backup_begun_meanwhile() {
+    let env = serve(true).await;
+    let (ada, m) = member_with_machine(&env, "ada@example.com").await;
+    let b = backup_of(&env, &m, "done");
+    let n = NewMachineRestore { id: "rleft", machine: &m, backup_id: &b.id, by: None, rto_ms: None, from_host: None, to_host: None, reason: None };
+    env.app.db.machine_restore_start(&n).unwrap();
+    assert!(env.app.db.machine_restore_move("rleft", &["importing"], "failed", Some("botd stopped mid-restore")));
+    destroy(&env, &ada).await;
+
+    // The restore copy can't go yet: the backups did, so none is recorded as kept.
+    let deletes = env.fake.calls("delete");
+    env.fake.fail_next("delete", ProviderError::Transport("down".into()));
+    let (code, e) = erase(&env, &ada, r#"{"deleteBackups":true}"#).await;
+    assert!(code == 502 && e["error"].as_str().unwrap().contains("restore copy"), "{code} {e}");
+    assert!(env.app.db.user_machine_backups_kept(&ada).is_empty());
+    assert!(env.app.db.user(&ada).unwrap().erased_at.is_none());
+
+    // Asked again, the copy is deleted before they're erased.
+    let (code, v) = erase(&env, &ada, r#"{"deleteBackups":true}"#).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(env.fake.calls("delete"), deletes + 2, "the copy, failing then going");
+    assert_eq!(v["removed"]["machineBackups"].as_u64(), Some(0), "{v}");
+
+    // A backup that ends while the machine is being destroyed is still counted.
+    let (bea, hers) = member_with_machine(&env, "bea@example.com").await;
+    env.fake.during_next("delete", {
+        let (app, hers) = (env.app.clone(), hers.clone());
+        move || {
+            let n = NewMachineBackup { id: "blate", machine: &hers, object_key: "t/late.incus", encrypted: false, created_by: Some("schedule") };
+            app.db.machine_backup_start(&n).unwrap();
+        }
+    });
+    let (code, e) = erase(&env, &bea, r#"{"destroyMachine":true}"#).await;
+    assert!(code == 409 && e["error"].as_str().unwrap().contains("--delete-backups"), "{code} {e}");
+    assert_eq!(env.app.db.machine(&hers.id).unwrap().state, State::Destroyed);
+    assert!(env.app.db.user(&bea).unwrap().erased_at.is_none());
+    assert_eq!(events(&env, "user.erase_refused").await[0]["details"]["reason"].as_str(), Some("machine_backups"));
+}
+
+#[tokio::test]
 async fn with_backups_off_botd_refuses_rather_than_leave_them() {
     let env = serve(false).await;
     let (ada, m) = member_with_machine(&env, "ada@example.com").await;
@@ -236,6 +305,8 @@ async fn with_backups_off_botd_refuses_rather_than_leave_them() {
     destroy(&env, &ada).await;
     let (code, e) = json_call(&env, "DELETE", &format!("/api/machines/{}/backups", m.id), &env.admin, "").await;
     assert!(code == 409 && e["error"].as_str().unwrap().contains("MACHINE_BACKUP_S3_BUCKET"), "{code} {e}");
+    let refused = events(&env, "machine.backups_delete_refused").await;
+    assert_eq!((refused.len(), refused[0]["details"]["reason"].as_str(), refused[0]["targetId"].as_str()), (1, Some("store_off"), Some(m.id.as_str())), "{refused:?}");
 
     let (code, e) = erase(&env, &ada, r#"{"deleteBackups":true}"#).await;
     assert!(code == 409 && e["error"].as_str().unwrap().contains("off-host machine backups are off"), "{code} {e}");

@@ -1143,6 +1143,7 @@ pub async fn restore_request(
 const NOT_DESTROYED: &str = "not_destroyed";
 const BACKUP_RUNNING: &str = "backup_running";
 const RESTORING: &str = "restoring";
+const STORE_OFF: &str = "store_off";
 /// Why an admin's request deleted backups, in `machine.backup_deleted` and `machine.backups_deleted`.
 pub const REQUESTED: &str = "requested";
 
@@ -1154,8 +1155,25 @@ pub struct Purged {
     pub backups: Vec<String>,
     /// Objects found under the machine's prefix in the store once those were gone.
     pub strays: usize,
+    /// In a bucket that keeps old versions: the versions and delete markers deleted for good.
+    pub versions: usize,
     /// Restore copies the provider was asked to delete (none may have been left).
     pub restore_copies: usize,
+}
+
+/// What a backup's data object and manifest both start with: `<...>/<backup-id>.`.
+fn backup_stem(object_key: &str) -> String {
+    let manifest = manifest_key(object_key);
+    manifest.strip_suffix("json").unwrap_or(&manifest).to_string()
+}
+
+/// Deletes every version and delete marker under `prefix` for good. How many.
+async fn delete_versions(off: &Offsite, prefix: &str) -> Result<usize, String> {
+    let all = off.s3.versions(prefix).await?;
+    for (key, id) in &all {
+        off.s3.delete_version(key, id).await?;
+    }
+    Ok(all.len())
 }
 
 /// Asks the provider to delete any copy a restore of `m` left beside it, on the host
@@ -1207,19 +1225,32 @@ pub async fn purge(app: &App, cp: &ControlPlane, off: &Offsite, by: &Who, m: &Ma
         return refuse(RESTORING, "A restore of it is underway; ask again once it has ended.".into());
     }
     let mut done = Purged::default();
+    let prefix = machine_prefix(&off.s.prefix, &m.id);
     let res: Result<(), String> = async {
+        // In a bucket that keeps old versions, a plain delete only hides the bytes.
+        let versioned = off.s3.versioned().await?;
         for b in &kept {
-            off.s3.delete(&b.object_key).await?;
-            off.s3.delete(&manifest_key(&b.object_key)).await?;
+            if versioned {
+                done.versions += delete_versions(off, &backup_stem(&b.object_key)).await?;
+            } else {
+                off.s3.delete(&b.object_key).await?;
+                off.s3.delete(&manifest_key(&b.object_key)).await?;
+            }
             if app.db.machine_backup_deleted(&b.id) {
                 let d = json!({ "backupId": b.id, "object": b.object_key, "reason": reason, "createdAt": b.created_at, "expiresAt": b.expires_at });
                 app.db.record(&event(by, "machine.backup_deleted", m, d));
                 done.backups.push(b.id.clone());
             }
         }
-        for key in off.s3.list(&machine_prefix(&off.s.prefix, &m.id)).await? {
-            off.s3.delete(&key).await?;
-            done.strays += 1;
+        if versioned {
+            let (now, all) = (off.s3.list(&prefix).await?.len(), delete_versions(off, &prefix).await?);
+            done.strays += now;
+            done.versions += all;
+        } else {
+            for key in off.s3.list(&prefix).await? {
+                off.s3.delete(&key).await?;
+                done.strays += 1;
+            }
         }
         done.restore_copies = clear_restore_copies(app, cp, m).await?;
         Ok(())
@@ -1232,7 +1263,7 @@ pub async fn purge(app: &App, cp: &ControlPlane, off: &Offsite, by: &Who, m: &Ma
         let msg = format!("Deleting its backups stopped: {e}. {} went and {left} are left; ask again to finish.", done.backups.len());
         return Err(ApiError(StatusCode::BAD_GATEWAY, msg));
     }
-    let d = json!({ "reason": reason, "backups": done.backups, "strays": done.strays, "restoreCopies": done.restore_copies });
+    let d = json!({ "reason": reason, "backups": done.backups, "strays": done.strays, "versions": done.versions, "restoreCopies": done.restore_copies });
     app.db.record(&event(by, "machine.backups_deleted", m, d));
     Ok(done)
 }
@@ -1240,8 +1271,11 @@ pub async fn purge(app: &App, cp: &ControlPlane, off: &Offsite, by: &Who, m: &Ma
 /// `DELETE /api/machines/{id}/backups`: deletes every backup of a destroyed machine now,
 /// not when their retention ends (ADR 0108). 409 while the machine exists.
 pub async fn delete_all(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
-    let (cp, off) = need(&a)?;
     let m = app.db.machine(id.trim()).ok_or_else(|| not_found("Machine"))?;
+    let (cp, off) = need(&a).inspect_err(|_| {
+        let why = if a.machines.provider.is_none() { "not_configured" } else { STORE_OFF };
+        app.db.record(&event(&by, "machine.backups_delete_refused", &m, json!({ "reason": why, "for": REQUESTED })).outcome(Outcome::Denied));
+    })?;
     let done = purge(&app, cp, off, &by, &m, REQUESTED).await?;
     let mut v = json!(done);
     (v["machineId"], v["userId"]) = (json!(m.id), json!(m.user_id));
@@ -1287,6 +1321,11 @@ mod tests {
         assert_eq!(machine_prefix("", "m1"), "machines/m1/");
         assert!(!format!("{}b1.incus", machine_prefix("p/", "m10")).starts_with(&machine_prefix("p/", "m1")), "m1's sweep leaves m10's alone");
         assert_eq!(manifest_key(&format!("{}b1.incus.age", machine_prefix("p/", "m1"))), "p/machines/m1/b1.json", "the manifest is under it too");
+        for k in ["p/machines/m1/b1.incus.age", "p/machines/m1/b1.incus"] {
+            let stem = backup_stem(k);
+            assert_eq!(stem, "p/machines/m1/b1.");
+            assert!(k.starts_with(&stem) && manifest_key(k).starts_with(&stem) && !"p/machines/m1/b10.incus".starts_with(&stem));
+        }
     }
 
     #[test]

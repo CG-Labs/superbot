@@ -159,13 +159,15 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
     }
     // Their machines' backups hold their disks: deleted with them only when asked, and
     // only if botd can reach the store, so a refusal here has destroyed nothing.
+    let kept_msg = |n: usize| {
+        format!(
+            "{n} backups of their machines are kept in the backup store until their retention ends. Erase with deleteBackups: true (botctl user erase {} --delete-backups --yes) to delete them too.",
+            u.id
+        )
+    };
     let backups = app.db.user_machine_backups_kept(&u.id).len();
     if backups > 0 && !delete_backups {
-        let msg = format!(
-            "{backups} backups of their machines are kept in the backup store until their retention ends. Erase with deleteBackups: true (botctl user erase {} --delete-backups --yes) to delete them too.",
-            u.id
-        );
-        return refuse(BACKUPS, json!({ "backups": backups }), msg);
+        return refuse(BACKUPS, json!({ "backups": backups }), kept_msg(backups));
     }
     if backups > 0 && a.machines.offsite.is_none() {
         let msg = format!("{backups} backups of their machines are recorded, but off-host machine backups are off on this server, so botd can't delete them. Turn them back on (MACHINE_BACKUP_S3_BUCKET and the rest), then erase them again.");
@@ -208,19 +210,19 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
         }
         machine = json!({ "id": m.id, "destroyed": true });
     }
+    // A backup begun before the machine was destroyed counts too; none can begin after.
+    let backups = app.db.user_machine_backups_kept(&u.id).len();
+    if backups > 0 && !delete_backups {
+        return refuse(BACKUPS, json!({ "backups": backups }), kept_msg(backups));
+    }
     let mut machine_backups = 0;
     if let Some(off) = a.machines.offsite.as_deref().filter(|_| delete_backups) {
-        let mut machines: Vec<String> = Vec::new();
-        for b in app.db.user_machine_backups_kept(&u.id) {
-            if !machines.contains(&b.machine_id) {
-                machines.push(b.machine_id);
-            }
-        }
-        for id in machines {
-            let Some(m) = app.db.machine(&id) else { continue };
+        // Every machine of theirs, not only those with backups still recorded: one an
+        // erasure stopped on part way has its strays and restore copy left to delete.
+        for m in app.db.machines(None).into_iter().filter(|m| m.user_id == u.id) {
             let done = crate::machines::backup::purge(&app, &a.machines, off, &by, &m, REASON)
                 .await
-                .map_err(|e| ApiError(e.0, format!("Deleting the backups of their machine {}: {} Erase them again then.", m.id, e.1)))?;
+                .map_err(|e| ApiError(e.0, format!("Deleting the backups of their machine {}: {} Erase them again with deleteBackups then.", m.id, e.1)))?;
             machine_backups += done.backups.len();
         }
     }
