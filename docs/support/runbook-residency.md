@@ -1,10 +1,10 @@
 # Runbook: data residency pins
 
-Something is refused for a person or team pinned to a data region, or a pin can't be made ([ADR 0129](../adr/0129-contractual-data-residency.md)). A pin holds machines, backups and restores to its region whatever else is set, and refuses rather than lets data leave. Severity: [2](severity.md#severities) if a pinned team's backups are refused (they're heading past their RPO), 3 for one machine or restore, 4 for a pin that can't be made yet; 1 if data left the region while pinned.
+Something is refused for a person or team pinned to a data region, or a pin can't be made ([ADR 0129](../adr/0129-contractual-data-residency.md)). A pin holds machines, backups, restores and their Bots' model calls ([ADR 0139](../adr/0139-in-region-model-routes.md)) to its region whatever else is set, and refuses rather than lets data leave. Severity: [2](severity.md#severities) if a pinned team's backups are refused (they're heading past their RPO) or every run of a pinned team is refused, 3 for one machine, restore or Bot, 4 for a pin that can't be made yet; 1 if data left the region while pinned.
 
 ## First five minutes
 
-1. **Who and what.** The person or team, the region and the agreement reference, and what was refused (a new machine, a backup, a restore, a region change, someone joining the team).
+1. **Who and what.** The person or team, the region and the agreement reference, and what was refused (a new machine, a backup, a restore, a region change, someone joining the team, a Bot's run).
 2. **What botd sees:**
 
    ```sh
@@ -13,15 +13,15 @@ Something is refused for a person or team pinned to a data region, or a pin can'
    botctl team residency <team>
    ```
 
-   `residency.warnings` lists every pin botd can't keep right now, and every pinned person with data outside the region. botd logs the same at startup.
+   `residency.warnings` lists every pin botd can't keep right now, every pinned person with data outside the region, every pinned person whose plan has no model route in the region for a harness it offers, and every endpoint naming a region that isn't offered. botd logs the same at startup.
 3. **What the audit log says:**
 
    ```sh
-   botctl audit 50 --action machine.residency_refused,user.residency_*,team.residency_*
+   botctl audit 50 --action machine.residency_refused,bot.run_refused,user.residency_*,team.residency_*
    ```
 
-   A refusal names the `action` (`create`, `backup`, `restore`, `move`, `recover`) and the `error`.
-4. **What changed:** a host's region tag removed, a backup store removed or `MACHINE_BACKUP_S3_DATA_REGION` changed, a restore onto a named host, the person joined a team pinned elsewhere.
+   A machine refusal names the `action` (`create`, `backup`, `restore`, `move`, `recover`) and the `error`. A run refusal has reason `residency_pinned`, the pins, the harness and the `error`; `whileQueued: true` means the pin was made while the run waited for a slot. A held run's `harness.invoked` shows `residency`: the regions, the fallbacks left out and the route it took instead of.
+4. **What changed:** a host's region tag removed, a backup store removed or `MACHINE_BACKUP_S3_DATA_REGION` changed, a restore onto a named host, the person joined a team pinned elsewhere, the person moved plan, or an endpoint's `regions` changed in the tiers file (`botctl tiers`).
 
 ## Refusals and fixes
 
@@ -34,8 +34,10 @@ Something is refused for a person or team pinned to a data region, or a pin can'
 | A new machine, action `create` | Hosts in the region aren't tagged, or are all full or drained | Tag or add a host in the region (`botctl machine hosts`) |
 | A restore or recovery, action `restore`, `move` or `recover` | The backup's store or the target host isn't in the region | Restore from a backup in the region, onto a host tagged with it |
 | Joining a team, `team.join_refused` | The person's own region or data is elsewhere | Move their data into the team's region first |
+| A Bot's run, `bot.run_refused` reason `residency_pinned` | The plan has no route for the Bot's harness whose endpoint lists the region in `regions`: an open tier (`"routes": "any"`), a Claude Code or Codex Bot (they name no endpoint), or the endpoints aren't marked | Give the plan a Hermes Agent route to an endpoint whose provider processes in the region, and list the region in that endpoint's `regions` ([ADR 0139](../adr/0139-in-region-model-routes.md#marking-endpoints)); or move the person to a plan that has one, and switch the Bot to Hermes Agent. Mark an endpoint only if the provider's terms promise processing there ([DPA IV.4](../security/dpa-template.md#iv4-model-providers)). Don't unpin to make it run |
+| A queued run, same reason with `whileQueued: true` | Pinned while the run waited for a slot | Send the message again; it takes the held route, or is refused as above |
 
-A pin covers machines and their backups only. botd's own database and server backups, and model calls, stay where they are ([what a pin doesn't cover](../adr/0129-contractual-data-residency.md#what-a-pin-doesnt-cover)). A customer asking about those needs the [DPA annex](../security/dpa-template.md#annex-iv-data-residency), not a ticket fix.
+A pin doesn't cover botd's own database and server backups, or what a Bot's own tools send (a script calling an API with a saved key; [egress allow-lists](runbook-run-limits-egress.md) are the control there) ([what a pin doesn't cover](../adr/0129-contractual-data-residency.md#what-a-pin-doesnt-cover), [ADR 0139](../adr/0139-in-region-model-routes.md#not-covered)). A customer asking about those needs the [DPA annex](../security/dpa-template.md#annex-iv-data-residency), not a ticket fix.
 
 ## Escalate when
 
