@@ -33,12 +33,12 @@ Scope: the managed service. A self-hosting customer is its own service organisat
 | Area | Done | Partial | Gap |
 |------|------|---------|-----|
 | CC1 Control environment | 0 | 0 | 5 |
-| CC2 Communication and information | 2 | 1 | 3 |
+| CC2 Communication and information | 2 | 2 | 2 |
 | CC3 Risk assessment | 0 | 1 | 4 |
 | CC4 Monitoring activities | 0 | 1 | 1 |
 | CC5 Control activities | 2 | 0 | 2 |
 | CC6 Logical and physical access | 8 | 3 | 6 |
-| CC7 System operations | 3 | 1 | 5 |
+| CC7 System operations | 3 | 2 | 4 |
 | CC8 Change management | 1 | 0 | 2 |
 | CC9 Risk mitigation | 0 | 1 | 3 |
 | A1 Availability | 4 | 1 | 1 |
@@ -63,7 +63,7 @@ Scope: the managed service. A self-hosting customer is its own service organisat
 | CC2.2-1 | Security policies communicated to personnel, with awareness training | Process | People lead | Policy portal or handbook; training completion records | Gap | ADRs and this pack are public, but they describe the product, not staff duties. |
 | CC2.3-1 | A vulnerability-disclosure policy and security contact | Process | Security owner | `SECURITY.md`; GitHub private vulnerability reporting turned on; a log of reports and responses | Partial | [`SECURITY.md`](../../SECURITY.md) says which versions get fixes, to report privately through GitHub's private vulnerability reporting (no email address or person is named), target times (acknowledge in 3 days, assess in 10, fix Critical and High in 30 days, the rest in 90), scope and safe harbour ([ADR 0111](../adr/0111-changelog-and-github-releases.md)). Owner steps left: turn private vulnerability reporting on in the repository's settings (until then the policy's report form isn't offered), add a contact for the managed service if wanted (the policy's operator TODO), and keep a log of reports and responses. |
 | CC2.3-2 | A public status page for availability incidents | Product | Operator | Status page history; incident notes posted within the SLO's 15 minutes | Done | `/status` and `/status.json`, with incident notes admins post in the console, and an SLO that commits to posting within 15 minutes of confirming an outage ([ADR 0090](../adr/0090-status-page-and-uptime-slo.md), [`server/src/status.rs`](../../server/src/status.rs), [SLO](../slo.md), [PR #151](https://github.com/CG-Labs/superbot/pull/151)). |
-| CC2.3-3 | Privacy policy, terms of service and a DPA | Process | Privacy lead | Published documents; signed DPAs | Gap | None. GDPR docs are on the M4 roadmap. |
+| CC2.3-3 | Privacy policy, terms of service and a DPA | Process | Privacy lead | Published documents; signed DPAs | Partial | Drafts for legal review, not legal advice, with placeholders for the provider's details: a [privacy policy template](privacy-policy-template.md), a [terms of service outline](terms-of-service-outline.md) with the product facts each section rests on, and a [DPA template](dpa-template.md) with GDPR Article 28 terms, a breach notification clause, a subprocessor annex built from the [subprocessor list](subprocessors.md), and technical and organisational measures taken only from controls in the code, each linked to its ADR. Self-hosters get a [GDPR guide](gdpr-self-hosting.md): roles, where data lives, retention settings, and answering access and erasure requests with `botctl` and the admin API. CI checks every link and reference in them, that each says it is a draft and not legal advice, and that the DPA keeps its breach, measures and subprocessor sections (`server/tests/security_docs_links.rs`). Left: counsel's review, the provider's details and choices filled in, publishing them, and signed DPAs. |
 
 ## CC3: Risk assessment
 
@@ -124,7 +124,7 @@ Scope: the managed service. A self-hosting customer is its own service organisat
 | CC7.2-2 | A tamper-evident audit log shipped off the server | Product | Engineering lead | Hash chain or write-once store; export configuration | Gap | Append-only in SQLite (ADR 0009). Planned for M5. |
 | CC7.3-1 | A triage process and incident classification | Process | Security owner | Severity definitions; a ticket per security event | Gap | None. |
 | CC7.4-1 | An incident response plan, roles and runbooks | Process | Security owner | The plan; runbooks; a yearly tabletop exercise | Gap | Containment tools exist (disable a user, end sessions, revoke a machine's certificates; [`server/src/rbac.rs`](../../server/src/rbac.rs) lists the admin routes), but no plan. |
-| CC7.4-2 | Telling customers and regulators about security incidents and breaches | Process | Privacy lead | Notification commitment in the DPA; notification records | Gap | The SLO covers outages only ([SLO](../slo.md)). GDPR work is on the M4 roadmap. |
+| CC7.4-2 | Telling customers and regulators about security incidents and breaches | Process | Privacy lead | Notification commitment in the DPA; notification records | Partial | The [DPA template](dpa-template.md#8-personal-data-breaches) commits the provider to tell customers of a personal data breach without undue delay and within a set number of hours (a placeholder, 48 suggested), with what GDPR Article 33(3) asks for, and to help them notify regulators and people; the [self-hosting guide](gdpr-self-hosting.md#breaches) sets out a controller's 72-hour duty and the tools to find and contain a breach. The SLO covers outages ([SLO](../slo.md)). Left: the DPA reviewed and signed, an incident response plan to meet it (CC7.4-1), and records of notifications. |
 | CC7.5-1 | Post-incident reviews | Process | Security owner | A written review per significant incident, with actions tracked | Gap | The SLO's error budget policy asks for a review of outages that spend a quarter of the budget ([SLO](../slo.md)); nothing covers security incidents. |
 
 ## CC8: Change management
@@ -142,7 +142,7 @@ Scope: the managed service. A self-hosting customer is its own service organisat
 | CC9.1-1 | A high-availability control plane | Product | Engineering lead | Failover design; a failover test | Gap | botd is one process with one SQLite database; the RTO is 1 hour ([ADR 0030](../adr/0030-backup-restore-drill.md)). |
 | CC9.1-2 | A business continuity plan | Process | Management | The plan; a yearly test | Gap | Recovery tools exist (A1.2), but no plan. |
 | CC9.2-1 | Vendor risk assessments | Process | Security owner | An assessment per vendor before use and yearly | Gap | None. |
-| CC9.2-2 | A published subprocessor list and DPA for the managed service | Process | Privacy lead | The published list; change notices to customers | Partial | Every outside service the code can call is listed, with what it gets and the setting that turns it on ([subprocessors](subprocessors.md)); the managed service's actual vendors aren't published. |
+| CC9.2-2 | A published subprocessor list and DPA for the managed service | Process | Privacy lead | The published list; change notices to customers | Partial | Every outside service the code can call is listed, with what it gets and the setting that turns it on ([subprocessors](subprocessors.md)). The [DPA template](dpa-template.md#annex-iii-subprocessors) has a subprocessor annex built from that list and a clause for notice of changes and objections (a placeholder, 30 days suggested). Left: the managed service's actual vendors filled in and published, and change notices sent. |
 
 ## A1: Availability
 
