@@ -394,3 +394,126 @@ async fn deleted_work_is_held_then_purged_and_an_admin_can_remove_a_teammate_now
     assert!(bea_home.join("whoami").is_file());
     assert!(removals(&w, "pending").is_empty(), "an admin's removal isn't redone");
 }
+
+/// Old harness sessions on the machine go, in the owner's and teammates' homes and the
+/// Bots' folders, and so does archived work once old, by the agent (ADR 0112).
+#[tokio::test]
+async fn retention_reaches_the_machine_for_sessions_and_archived_work() {
+    const A: &str = "0b9d2f6e-3c1a-4e8b-9f00-1a2b3c4d5e6f";
+    const B: &str = "1c8e3a7f-4d2b-4f9c-8e11-2b3c4d5e6f70";
+    let w = world_with(|e| e, |_| {}, stand_in).await;
+    let team = shared_pi(&w);
+    let ada = ada_auth(&w).await;
+    run(&w, &ada, &team, "go").await;
+    run(&w, &w.bea, &team, "go").await;
+    let t = &w.m.agent.teammates;
+    let (owner_home, bea_home) = (w.m.agent.cfg.home.clone(), t.home_of(&w.bea_id));
+    // Bea's own session, in her home there.
+    let bea_session = bea_home.join(format!(
+        ".codex/sessions/2026/01/02/rollout-2026-01-02T03-04-05-{A}.jsonl"
+    ));
+    std::fs::create_dir_all(bea_session.parent().unwrap()).unwrap();
+    std::fs::write(&bea_session, "{}").unwrap();
+    work_in(&bea_home, "notes.txt", "bea's notes");
+    let claude = |home: &Path, id: &str| home.join(format!(".claude/projects/-work/{id}.jsonl"));
+    let pi = owner_home.join(format!(
+        "bots/{team}/pi-sessions/2026-01-02T03-04-05_s-{B}.jsonl"
+    ));
+    for f in [claude(&owner_home, A), pi.clone()] {
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, "{}").unwrap();
+    }
+    std::fs::write(
+        owner_home.join(".claude/projects/-work/notes.md"),
+        "no session id",
+    )
+    .unwrap();
+
+    // Everything here is from today: a pass 100 days on finds it old.
+    let later = crate::db::now() + 100 * 86_400_000;
+    let p = crate::file_retention::prune_sessions(&w.env.app, 30, later).await;
+    assert!(p["errors"].as_array().unwrap().is_empty(), "{p}");
+    assert_eq!(
+        p["places"].as_u64(),
+        Some(2),
+        "this server and the machine: {p}"
+    );
+    for gone in [claude(&owner_home, A), pi.clone(), bea_session.clone()] {
+        assert!(!gone.exists(), "{}", gone.display());
+    }
+    assert!(
+        owner_home.join(".claude/projects/-work/notes.md").is_file(),
+        "no session id, never touched"
+    );
+    assert!(bea_home.join("work/notes.txt").is_file(), "only sessions");
+
+    let (code, _) = json_call(
+        &w.env,
+        "PATCH",
+        &format!("/api/users/{}", w.bea_id),
+        r#"{"status":"disabled"}"#,
+    )
+    .await;
+    assert_eq!(code, 200);
+    let removed = wait_for_event(&w.env, "machine.teammate_removed").await;
+    let to = Path::new(removed[0]["details"]["archivedTo"].as_str().unwrap()).to_path_buf();
+    assert!(to.join("notes.txt").is_file());
+    pass(&w).await;
+    let f = crate::file_retention::prune_teammate_files(&w.env.app, 30, later).await;
+    assert_eq!(
+        (f["deleted"].as_u64(), f["errors"].as_array().map(Vec::len)),
+        (Some(1), Some(0)),
+        "{f}"
+    );
+    assert!(!to.exists() && owner_home.join("work/from-teammates").is_dir());
+    assert_eq!(events(&w.env, "teammate_files.pruned").await.len(), 1);
+}
+
+/// The agent sweeps only for its own user, and only plain paths inside the homes there.
+#[tokio::test]
+async fn the_agent_refuses_a_sweep_outside_its_homes() {
+    use tower::ServiceExt;
+    let w = world_with(|e| e, |_| {}, stand_in).await;
+    let ask = |body: serde_json::Value| {
+        let req = axum::http::Request::post("/v1/retention")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let router = agent::router(w.m.agent.clone());
+        async move { router.oneshot(req).await.unwrap().status().as_u16() }
+    };
+    let dir = |p: &str, depth: u32| json!([{ "path": p, "depth": depth }]);
+    assert_eq!(
+        ask(json!({ "ownerId": "someone-else", "before": 0 })).await,
+        403
+    );
+    for bad in [
+        json!({ "ownerId": w.ada, "before": 0, "home": dir("../etc", 1) }),
+        json!({ "ownerId": w.ada, "before": 0, "home": dir("/etc", 1) }),
+        json!({ "ownerId": w.ada, "before": 0, "state": dir("pi-sessions", 0) }),
+        json!({ "ownerId": w.ada, "before": 0, "bots": ["../b"] }),
+        json!({ "ownerId": w.ada, "before": 0, "archives": ["a/b"] }),
+        json!({ "ownerId": w.ada, "before": 0, "probe": ["../hermes/state.db"] }),
+        json!({ "ownerId": w.ada, "before": 0, "probe": ["b".repeat(161)] }),
+        json!({ "ownerId": w.ada, "before": 0, "surprise": 1 }),
+    ] {
+        assert!(matches!(ask(bad.clone()).await, 400 | 422), "{bad}");
+    }
+    assert_eq!(
+        ask(json!({ "ownerId": w.ada, "before": 0, "archives": ["nothing-here"] })).await,
+        200
+    );
+    // It says which session databases are there, so a Bot's harness prunes only those.
+    let db = w.m.agent.cfg.home.join("bots/b1/hermes/state.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    std::fs::write(&db, "").unwrap();
+    let body = json!({ "ownerId": w.ada, "before": 0, "probe": ["b1/hermes/state.db", "b2/hermes/state.db"] });
+    let req = axum::http::Request::post("/v1/retention")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    let res = agent::router(w.m.agent.clone()).oneshot(req).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let out: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(out["found"], json!([[null, "b1/hermes/state.db"]]), "{out}");
+}

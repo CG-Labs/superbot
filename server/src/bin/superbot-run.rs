@@ -15,6 +15,10 @@ mod passwd;
 #[path = "../sandbox.rs"]
 #[allow(dead_code)]
 mod sandbox;
+#[path = "../sweep.rs"]
+mod sweep;
+#[path = "../walk.rs"]
+mod walk;
 
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
@@ -72,6 +76,9 @@ async fn main() -> ExitCode {
     };
     if !inside(&home, &cwd) {
         return fail("refusing to start outside the account's own folders");
+    }
+    if bin == SWEEP {
+        return sweep_here(&home);
     }
     // SAFETY: plain syscalls on this process.
     unsafe {
@@ -145,6 +152,48 @@ async fn main() -> ExitCode {
     ExitCode::from(143)
 }
 
+/// `superbot-run --sweep`: deletes old harness session files and archived work in the
+/// account's own folders (ADR 0112), as the account, which botd can't read into. Takes a
+/// `sweep::Sweep` as JSON on stdin and prints what it did as JSON.
+const SWEEP: &str = "--sweep";
+/// The longest request it reads.
+const MAX_SWEEP: u64 = 1 << 20;
+
+fn sweep_here(home: &Path) -> ExitCode {
+    use std::io::Read;
+    let mut body = String::new();
+    if std::io::stdin().take(MAX_SWEEP).read_to_string(&mut body).is_err() {
+        return fail("couldn't read the sweep");
+    }
+    let s: sweep::Sweep = match serde_json::from_str(&body) {
+        Ok(s) => s,
+        Err(e) => return fail(&format!("not a sweep: {e}")),
+    };
+    if let Err(e) = sweep_ok(home, &s) {
+        return fail(&e);
+    }
+    match serde_json::to_string(&sweep::run(&s)) {
+        Ok(out) => {
+            println!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e.to_string()),
+    }
+}
+
+/// A sweep stays inside the account's own folders, `ISOLATION_DIR/<space>`.
+fn sweep_ok(home: &Path, s: &sweep::Sweep) -> Result<(), String> {
+    let bases = s.roots.iter().map(|r| &r.base).chain(s.folders.iter().map(|f| &f.base));
+    for b in bases {
+        let plain = Path::new(b).is_absolute() && !b.split('/').any(|p| p == ".." || p == ".");
+        let real = std::fs::canonicalize(b).unwrap_or_else(|_| b.into());
+        if !plain || !inside(home, &real) {
+            return Err(format!("refusing to sweep outside the account's own folders: {b}"));
+        }
+    }
+    Ok(())
+}
+
 /// TERM to what's left of the run's group, then KILL after the grace period.
 async fn end_group(group: i32) {
     if group_left(group) {
@@ -213,5 +262,18 @@ mod tests {
         assert!(inside(pair, Path::new("/srv/superbot/users/u1-u2/workspace")));
         assert!(!inside(pair, Path::new("/srv/superbot/users/u1/workspace")), "not the owner's folder");
         assert!(!inside(pair, Path::new("/srv/superbot/users/u2/home")), "not the teammate's own");
+    }
+
+    #[test]
+    fn a_sweep_stays_in_the_accounts_own_folders() {
+        let home = Path::new("/srv/superbot/users/u1/home");
+        let root = |base: &str| sweep::Sweep { roots: vec![sweep::Root { base: base.into(), path: ".claude/projects".into(), depth: 2, transcript: true }], ..Default::default() };
+        assert!(sweep_ok(home, &root("/srv/superbot/users/u1/home")).is_ok());
+        assert!(sweep_ok(home, &root("/srv/superbot/users/u1/bots/b1")).is_ok());
+        for bad in ["/srv/superbot/users/u2/home", "/srv/superbot/users/u1/../u2/home", "relative", "/etc"] {
+            assert!(sweep_ok(home, &root(bad)).is_err(), "{bad}");
+        }
+        let folder = sweep::Sweep { folders: vec![sweep::Folder { base: "/srv/superbot/users/u2/workspace".into(), path: "from-teammates/x".into() }], ..Default::default() };
+        assert!(sweep_ok(home, &folder).is_err());
     }
 }

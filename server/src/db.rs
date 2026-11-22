@@ -1650,7 +1650,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 45] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 46] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1696,7 +1696,20 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 45] = [
     migrate_user_erasure,
     migrate_machine_provider_backups,
     migrate_server_backups,
+    migrate_file_retention,
 ];
+
+/// Retention for teammates' archived work (ADR 0112): when the retention pass deleted a
+/// removal's archive, or found it gone.
+fn migrate_file_retention(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    for table in ["teammate_cleanups", "account_removals"] {
+        let has: bool = c.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = 'archive_pruned_at'"), [], |r| r.get(0))?;
+        if !has {
+            c.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN archive_pruned_at INTEGER;"))?;
+        }
+    }
+    Ok(())
+}
 
 /// Off-host copies of the server's own backup archives (ADR 0109): `running`, then `done`
 /// or `failed`, and `deleted` once past their retention. One runs at a time. An archive
@@ -3695,6 +3708,58 @@ impl Db {
                 self.c().execute("DELETE FROM settings WHERE key = 'chat_retention_days'", []).unwrap();
             }
         }
+    }
+
+    /// A retention setting in days, as last saved under `key`. None = forever.
+    pub fn retention_days(&self, key: &str) -> Option<u32> {
+        self.setting(key).and_then(|s| s.parse().ok()).filter(|d| *d > 0)
+    }
+
+    pub fn set_retention_days(&self, key: &str, days: Option<u32>) {
+        match days {
+            Some(d) => self.set_setting(key, &d.to_string()),
+            None => {
+                self.c().execute("DELETE FROM settings WHERE key = ?", [key]).unwrap();
+            }
+        }
+    }
+
+    /// Teammates' work archived to their owner's `from-teammates/` folder before `cutoff`
+    /// (unix ms) and not deleted yet (ADR 0112): `(table, id, owner, machine (None: this
+    /// server), archived to)`, oldest first.
+    pub fn archives_before(&self, cutoff: i64) -> Vec<(&'static str, String, String, Option<String>, String)> {
+        let c = self.c();
+        let mut out = Vec::new();
+        for (table, machine) in [("teammate_cleanups", "machine_id"), ("account_removals", "NULL")] {
+            let mut s = c
+                .prepare(&format!(
+                    "SELECT id, owner_id, {machine}, archived_to FROM {table}
+                     WHERE files = 'archive' AND archived_to IS NOT NULL AND removed_at < ? AND archive_pruned_at IS NULL
+                     ORDER BY removed_at, id"
+                ))
+                .unwrap();
+            let rows = s.query_map([cutoff], |r| Ok((table, r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
+            out.extend(rows.filter_map(Result::ok));
+        }
+        out
+    }
+
+    /// The retention pass deleted the archive, or found it gone.
+    pub fn archive_pruned(&self, table: &str, id: &str) {
+        if matches!(table, "teammate_cleanups" | "account_removals") {
+            let _ = self.c().execute(&format!("UPDATE {table} SET archive_pruned_at = ? WHERE id = ?"), params![now(), id]);
+        }
+    }
+
+    /// Sets when a removal was done, as if long ago.
+    #[cfg(test)]
+    pub fn set_removed_at(&self, table: &str, id: &str, at: i64) {
+        self.c().execute(&format!("UPDATE {table} SET removed_at = ? WHERE id = ?"), params![at, id]).unwrap();
+    }
+
+    /// Clears the Bot's session if it is still `session_id`, whose files are gone.
+    pub fn forget_session_if(&self, bot_id: &str, session_id: &str) -> bool {
+        self.c().execute("UPDATE bots SET session_id = NULL WHERE id = ? AND session_id = ?", [bot_id, session_id]).unwrap_or(0) == 1
     }
 
     /// Deletes up to `limit` of the oldest messages written before `cutoff` (unix ms) and

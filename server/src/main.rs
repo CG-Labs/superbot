@@ -40,6 +40,9 @@ mod isolation;
 mod isolation_http_tests;
 mod db;
 mod erasure;
+mod file_retention;
+#[cfg(test)]
+mod file_retention_http_tests;
 #[cfg(test)]
 mod erasure_http_tests;
 mod license;
@@ -154,6 +157,7 @@ mod usage_http_tests;
 mod storage;
 #[cfg(test)]
 mod storage_http_tests;
+mod sweep;
 mod users;
 mod walk;
 #[cfg(test)]
@@ -252,6 +256,8 @@ async fn main() {
     };
     let observe = obs::Settings::from_env(&|k| env(k, ""), &secrets::env::EnvStore::process()).unwrap_or_else(|e| exit(format!("Observability: {e}")));
     obs::log::set_format(observe.log);
+    obs::errors::install_panic_hook();
+    obs::errors::start(&observe.errors);
     let status_page = status::Page::parse(&env("STATUS_PAGE", "")).unwrap_or_else(|e| exit(e));
     let break_glass = users::break_glass_flag(&env("AUTH_BREAK_GLASS", "")).unwrap_or_else(|e| exit(e));
     let mfa_pinned = mfa::policy_flag(&env("AUTH_MFA", "")).unwrap_or_else(|e| exit(e));
@@ -288,6 +294,8 @@ async fn main() {
         std::process::exit(1);
     });
     let chat_retention = retention::days("CHAT_RETENTION_DAYS", &env("CHAT_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
+    let session_retention = retention::days("HARNESS_SESSION_RETENTION_DAYS", &env("HARNESS_SESSION_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
+    let teammate_files_retention = retention::days("TEAMMATE_FILES_RETENTION_DAYS", &env("TEAMMATE_FILES_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
     let bot_key = random_hex(32);
     secrets::redact::register(&bot_key);
     WEB_DIR.set(std::env::var("WEB_DIR").ok().map(PathBuf::from)).unwrap();
@@ -632,6 +640,8 @@ async fn main() {
         "sessionMaxMinutes": sessions.max_ms / 60_000,
         "auditRetentionDays": retention,
         "chatRetentionDays": chat_retention,
+        "harnessSessionRetentionDays": session_retention,
+        "teammateFilesRetentionDays": teammate_files_retention,
         "screens": app.screens.is_some(),
         "isolation": if app.isolation().is_some() { "users" } else { "off" },
         "isolationTeammates": app.teammate_accounts(),
@@ -651,12 +661,13 @@ async fn main() {
         "license": license.summary(),
         "logFormat": observe.log.as_str(),
         "metrics": observe.metrics.as_ref().map(|m| json!({ "loopback": m.addr.ip().is_loopback(), "token": m.token.is_some() })),
+        "errorReports": observe.errors.dsn.is_some(),
         "statusPage": status_page,
         "serverBackups": server_backups_summary,
     })));
     license::start(app.clone());
     audit::start_retention(app.clone(), retention);
-    retention::start(app.clone(), chat_retention);
+    retention::start(app.clone(), retention::Settings { chat: chat_retention, sessions: session_retention, teammate_files: teammate_files_retention });
     server_backups::start(app.clone());
     backup_encryption::start(app.clone());
     users::start_pruning(app.clone(), sessions);
@@ -973,6 +984,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
                 .layer(Extension(auth_state)),
         )
         .layer(cors_layer())
+        .layer(obs::catch_panics())
         .layer(middleware::from_fn_with_state(app.clone(), obs::track))
         .with_state(app)
 }

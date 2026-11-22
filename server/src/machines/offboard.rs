@@ -164,7 +164,7 @@ pub(crate) fn reason_for(app: &App, user_id: &str) -> &'static str {
 }
 
 /// The teammates with a user on `m`: as its agent last said, and as botd made since.
-fn known(m: &Machine) -> Vec<String> {
+pub(crate) fn known(m: &Machine) -> Vec<String> {
     m.agent_upkeep
         .as_ref()
         .and_then(|v| v["teammates"].as_array())
@@ -200,7 +200,7 @@ pub fn seen(app: &App, machine_id: &str, user_id: &str) {
     });
 }
 
-fn live(m: &Machine) -> bool {
+pub(crate) fn live(m: &Machine) -> bool {
     !matches!(m.state, State::Destroying | State::Destroyed)
 }
 
@@ -409,7 +409,7 @@ fn cancel(app: &App, by: &Who, m: &Machine, row: &TeammateCleanup, why: &str) ->
 }
 
 /// Whether `m` is up and its agent enrolled, and what to say if not.
-fn reachable(m: &Machine) -> Result<(), String> {
+pub(crate) fn reachable(m: &Machine) -> Result<(), String> {
     if m.state != State::Running {
         return Err(format!("waiting for the machine: it is {}", m.state.as_str()));
     }
@@ -526,7 +526,12 @@ async fn purge(app: &App, e: &Enrollment, row: &TeammateCleanup) -> bool {
 
 /// POSTs `body` to the machine's agent, pinned to its certificates. Its JSON answer, or
 /// why it didn't do it.
-async fn ask<T: serde::Serialize>(app: &App, e: &Enrollment, m: &Machine, path: &str, body: &T) -> Result<Value, String> {
+pub(crate) async fn ask<T: serde::Serialize>(app: &App, e: &Enrollment, m: &Machine, path: &str, body: &T) -> Result<Value, String> {
+    ask_capped(app, e, m, path, body, 64 << 10).await
+}
+
+/// `ask`, reading an answer of up to `cap` bytes.
+pub(crate) async fn ask_capped<T: serde::Serialize>(app: &App, e: &Enrollment, m: &Machine, path: &str, body: &T, cap: usize) -> Result<Value, String> {
     let pins = app.db.machine_pins(&m.id);
     if pins.is_empty() {
         return Err("it has no usable certificate".into());
@@ -540,7 +545,7 @@ async fn ask<T: serde::Serialize>(app: &App, e: &Enrollment, m: &Machine, path: 
         .await
         .map_err(|err| format!("its agent didn't answer: {}", enroll::without_url(err)))?;
     let code = r.status();
-    let reply: Value = enroll::read_capped(&mut r, 64 << 10).await.and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+    let reply: Value = enroll::read_capped(&mut r, cap).await.and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
     if code.is_success() {
         return Ok(reply);
     }
