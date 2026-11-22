@@ -111,8 +111,9 @@ pub fn approval_context(id: &str) -> String {
     format!("approvals.input/{id}")
 }
 
-/// The settings that hold a native SAML provider's generated SP key, sealed, by provider id;
-/// beside each, `SAML_SP_CERT_SETTING` holds its certificate in the clear (ADR 0137).
+/// The settings that hold a native SAML provider's generated SP keys, sealed, by provider id
+/// (the signing key, ADR 0137) or id and `_encryption` (the encryption key, ADR 0150); beside
+/// each, `SAML_SP_CERT_SETTING` with the same suffix holds its certificate in the clear.
 pub const SAML_SP_KEY_SETTING: &str = "sso_saml_sp_key_";
 pub const SAML_SP_CERT_SETTING: &str = "sso_saml_sp_cert_";
 
