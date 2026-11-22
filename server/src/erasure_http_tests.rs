@@ -290,6 +290,28 @@ async fn names_and_emails_they_had_before_are_erased_too() {
 }
 
 #[tokio::test]
+async fn what_they_gave_as_a_visitor_is_erased_too() {
+    let (port, app, admin, _) = serve_app().await;
+    let (ada, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let visitor = |email: &str| Who {
+        actor: Actor { kind: ActorKind::User, name: Some("Ada Visiting".into()), email: Some(email.into()), ..Default::default() },
+        source: Source { ip: Some("203.0.113.77".into()), user_agent: Some("AdaBrowser/1.0".into()) },
+    };
+    app.db.record(&visitor("Ada@Example.com").event("signup.submitted").target("signup", "su_1"));
+    app.db.record(&visitor("bob@example.com").event("signup.submitted").target("signup", "su_2"));
+    let (code, v) = erase(port, &admin, &ada, "").await;
+    assert_eq!(code, 200, "{v}");
+    let events = audit(port, &admin, "action=signup.submitted").await;
+    let of = |t: &str| events.iter().find(|e| e["targetId"].as_str() == Some(t)).unwrap().clone();
+    let (hers, his) = (of("su_1"), of("su_2"));
+    for k in ["actorName", "actorEmail", "ip", "userAgent"] {
+        assert!(hers[k].is_null(), "{k}: {hers}");
+    }
+    assert_eq!(his["actorName"].as_str(), Some("Ada Visiting"), "another visitor's event stays: {his}");
+    assert_eq!(his["ip"].as_str(), Some("203.0.113.77"), "{his}");
+}
+
+#[tokio::test]
 async fn a_retried_erasure_still_erases_what_its_deleted_bots_wrote() {
     let (port, app, admin, _) = serve_app().await;
     let (ada, ada_auth) = user_with(port, &admin, "ada@example.com", "member").await;
