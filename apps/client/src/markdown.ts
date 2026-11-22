@@ -7,7 +7,7 @@ export function parseMarkdown(src: string): Token[] {
   return new Lexer({ gfm: true, breaks: false }).lex(src);
 }
 
-const NAMED: Record<string, string> = {
+const NAMED = new Map<string, string>(Object.entries({
   amp: "&",
   lt: "<",
   gt: ">",
@@ -26,7 +26,7 @@ const NAMED: Record<string, string> = {
   rdquo: "\u201d",
   middot: "\u00b7",
   times: "\u00d7",
-};
+}));
 
 /** Decodes the character references marked leaves in text and link targets; unknown ones stay as written. */
 export function decodeEntities(s: string): string {
@@ -36,7 +36,7 @@ export function decodeEntities(s: string): string {
       const code = ref[1] === "x" || ref[1] === "X" ? parseInt(ref.slice(2), 16) : parseInt(ref.slice(1), 10);
       return code > 0 && code <= 0x10ffff && (code < 0xd800 || code > 0xdfff) ? String.fromCodePoint(code) : "\ufffd";
     }
-    return NAMED[ref.toLowerCase()] ?? whole;
+    return NAMED.get(ref.toLowerCase()) ?? whole;
   });
 }
 

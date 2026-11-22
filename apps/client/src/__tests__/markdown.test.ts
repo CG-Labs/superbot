@@ -38,6 +38,7 @@ describe("decodeEntities", () => {
   it("decodes named and numeric references and keeps unknown ones", () => {
     expect(decodeEntities("a &amp; b &lt;c&gt; &quot;d&quot; &#169; &#x2014; &bogus;")).toBe('a & b <c> "d" \u00a9 \u2014 &bogus;');
     expect(decodeEntities("&#0; &#xD800; &#x110000;")).toBe("\ufffd \ufffd \ufffd");
+    expect(decodeEntities("&constructor; &toString; &__proto__;")).toBe("&constructor; &toString; &__proto__;");
   });
 });
 

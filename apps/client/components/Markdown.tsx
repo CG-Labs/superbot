@@ -149,7 +149,7 @@ function inline(tokens: Token[], key: string): ReactNode[] {
       case "codespan":
         return (
           <Text key={k} style={styles.codeInline}>
-            {decodeEntities(t.text)}
+            {t.text}
           </Text>
         );
       case "br":
