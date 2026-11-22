@@ -59,6 +59,7 @@ Tested in CI on real hosts: no Bot reaches another user's folder or logins, or b
 - Each event names its actor (user, Bot or system) with email, role, sign-in method, IdP, session, and who a Bot acted for ([ADR 0019](../adr/0019-audit-actors.md)).
 - Append-only: database triggers refuse updates, and deletes except retention pruning. This guards against mistakes and API misuse, not someone with write access to the database file. Kept forever unless `AUDIT_RETENTION_DAYS` is set.
 - Admins view and filter it in the apps and export CSV ([ADR 0028](../adr/0028-client-admin-console-link-and-audit.md), [ADR 0060](../adr/0060-client-audit-detail-and-filters.md)).
+- **Access reviews**: admins see one report of everyone's role, status, team, SCIM tenant, second factor, last sign-in, Bot access, sessions and API tokens (never the tokens), and machine, export it as dated CSV, and sign it off; the sign-off is an `access_review.completed` event ([ADR 0099](../adr/0099-access-review-report.md)).
 - **Planned:** tamper evidence (hash chain, write-once storage, shipping events off the server) (M5, [ADR 0009](../adr/0009-audit-events.md)).
 
 ## Licence key (self-host)
