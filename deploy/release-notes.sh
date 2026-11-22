@@ -12,7 +12,7 @@
 # CHANGELOG.md follows Keep a Changelog 1.1.0: an optional `## [Unreleased]` first, then
 # `## [X.Y.Z] - YYYY-MM-DD` sections, newest first. The newest may say `- Unreleased`
 # instead of a date until it is tagged. CHANGELOG, CARGO_TOML and RELEASE_TAGS (one tag per
-# line; default: `git tag --list 'v*'`) override the inputs. With GITHUB_REPOSITORY set,
+# line; default: the `v*` tags HEAD contains) override the inputs. With GITHUB_REPOSITORY set,
 # the notes end with the release's image names.
 set -euo pipefail
 
@@ -60,7 +60,8 @@ tags() {
   if [[ -n "${RELEASE_TAGS+x}" ]]; then
     printf '%s\n' "$RELEASE_TAGS"
   else
-    git -C "$repo" tag --list 'v*'
+    # Only tags this commit contains: an older tag's changelog can't know newer ones.
+    git -C "$repo" tag --merged HEAD --list 'v*'
   fi
 }
 
@@ -85,16 +86,22 @@ sections() {
   done <"$changelog"
 }
 
-# The body of version $1's section, without the blank lines around it or link references.
+# The body of version $1's section, without the blank lines around it, followed by the
+# link reference definitions (`[label]: target`) from anywhere in the file that it uses.
 body() {
   awk -v want="## [$1] - " '
-    index($0, "## ") == 1 { if (on) exit; on = (index($0, want) == 1); next }
-    on && /^\[[^]]+\]: / { next }
-    on { lines[++n] = $0 }
+    /^\[[^]]+\]: / { label = tolower(substr($0, 2, index($0, "]:") - 2)); defs[label] = $0; order[++d] = label; next }
+    index($0, "## ") == 1 { on = (index($0, want) == 1); next }
+    on { lines[++n] = $0; text = text "\n" tolower($0) }
     END {
       s = 1; while (s <= n && lines[s] ~ /^[ \t]*$/) s++
       e = n; while (e >= s && lines[e] ~ /^[ \t]*$/) e--
       for (i = s; i <= e; i++) print lines[i]
+      sep = "\n"
+      for (i = 1; i <= d; i++) {
+        l = order[i]
+        if (!(l in used) && index(text, "[" l "]")) { printf "%s%s\n", sep, defs[l]; sep = ""; used[l] = 1 }
+      }
     }
   ' "$changelog"
 }
@@ -119,7 +126,7 @@ check() {
       prev_date=$d
     fi
     [[ -z "$prev" ]] || newer "$prev" "$v" || die "CHANGELOG.md:$n: $v must come after $prev (newest first)"
-    body "$v" | grep -qv -e '^#' -e '^[[:space:]]*$' || die "CHANGELOG.md:$n: $v's section has no entries"
+    body "$v" | grep -v -e '^#' -e '^[[:space:]]*$' -e '^\[[^]]*\]: ' >/dev/null || die "CHANGELOG.md:$n: $v's section has no entries"
     prev=$v
   done <<<"$list"
   cargo=$(cargo_version)
@@ -145,7 +152,7 @@ notes() {
   fi
   # A release page resolves relative links against itself, so they point at the tag's files.
   local files="${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/blob/$tag/"
-  body "$v" | sed -E "s|\]\(([^):/#][^):]*)\)|](${files}\1)|g"
+  body "$v" | sed -E -e "s|\]\(([^):/#][^):]*)\)|](${files}\1)|g" -e "s~^(\[[^]]+\]: )([^ :/#][^ :]*)( |$)~\1${files}\2\3~"
   local image="ghcr.io/${GITHUB_REPOSITORY,,}"
   # shellcheck disable=SC2016 # the backticks are Markdown
   printf '\n---\n\nImages: `%s:%s` and `%s-caddy:%s`, signed and with build provenance, once the docker workflow has published them for this tag. [Verify them](%sdeploy/README.md#verifying-the-images) before you run them.\n' \
@@ -367,6 +374,45 @@ self_test() {
     printf 'ok   notes link the tag'\''s files, and leave other links alone\n'
   else
     printf 'FAIL notes link the tag'\''s files, got:\n%s\n' "$out"; fails=$((fails + 1))
+  fi
+
+  printf '# Changelog\n\n## [1.1.0] - 2026-11-20\n\n- See [the guide][guide] and [Site].\n\n## [1.0.0] - 2026-11-01\n\n- One.\n\n[guide]: deploy/README.md\n[site]: https://x.example\n[unused]: docs/x.md\n[1.0.0]: https://x.example/v1.0.0\n' >"$dir/CHANGELOG.md"
+  out=$(CHANGELOG="$dir/CHANGELOG.md" CARGO_TOML="$dir/Cargo.toml" RELEASE_TAGS='' GITHUB_REPOSITORY=Owner/Repo \
+    bash "${BASH_SOURCE[0]}" notes v1.1.0 2>&1) || true
+  if [[ $out == *$'[the guide][guide] and [Site].\n\n[guide]: https://github.com/Owner/Repo/blob/v1.1.0/deploy/README.md\n[site]: https://x.example\n'* && $out != *unused* && $out != *'[1.0.0]:'* ]]; then
+    printf 'ok   notes keep the link definitions they use, pointed at the tag\n'
+  else
+    printf 'FAIL notes keep the link definitions they use, got:\n%s\n' "$out"; fails=$((fails + 1))
+  fi
+
+  { printf '# Changelog\n\n## [1.1.0] - 2026-11-20\n\n'; for _ in $(seq 20000); do printf -- '- A long entry about one change of many.\n'; done; } >"$dir/CHANGELOG.md"
+  if CHANGELOG="$dir/CHANGELOG.md" CARGO_TOML="$dir/Cargo.toml" RELEASE_TAGS='' bash "${BASH_SOURCE[0]}" check >/dev/null 2>&1; then
+    printf 'ok   a long section passes\n'
+  else
+    printf 'FAIL a long section passes\n'; fails=$((fails + 1))
+  fi
+
+  # Re-running an older tag's release, once a newer tag exists, checks only the tags it holds.
+  local git_=(git -C "$dir/repo" -c user.name=test -c user.email=test@example.invalid -c init.defaultBranch=main)
+  mkdir -p "$dir/repo/deploy" "$dir/repo/server"
+  cp "${BASH_SOURCE[0]}" "$dir/repo/deploy/release-notes.sh"
+  "${git_[@]}" init -q
+  printf '[package]\nversion = "1.0.0"\n' >"$dir/repo/server/Cargo.toml"
+  printf '# Changelog\n\n## [1.0.0] - 2026-11-01\n\n- One.\n' >"$dir/repo/CHANGELOG.md"
+  "${git_[@]}" add -A && "${git_[@]}" commit -qm one && "${git_[@]}" tag v1.0.0
+  printf '[package]\nversion = "1.1.0"\n' >"$dir/repo/server/Cargo.toml"
+  printf '# Changelog\n\n## [1.1.0] - 2026-11-20\n\n- Two.\n\n## [1.0.0] - 2026-11-01\n\n- One.\n' >"$dir/repo/CHANGELOG.md"
+  "${git_[@]}" commit -qam two && "${git_[@]}" tag v1.1.0 && "${git_[@]}" checkout -q v1.0.0
+  if out=$(env -u CHANGELOG -u CARGO_TOML -u RELEASE_TAGS GITHUB_REPOSITORY='' bash "$dir/repo/deploy/release-notes.sh" notes v1.0.0 2>&1) && [[ $out == '- One.' ]]; then
+    printf 'ok   an older tag still releases once a newer one exists\n'
+  else
+    printf 'FAIL an older tag still releases once a newer one exists, got:\n%s\n' "$out"; fails=$((fails + 1))
+  fi
+  "${git_[@]}" checkout -q v1.1.0 && "${git_[@]}" tag -d v1.0.0 >/dev/null && "${git_[@]}" tag v0.9.0 v1.1.0
+  if ! out=$(env -u CHANGELOG -u CARGO_TOML -u RELEASE_TAGS bash "$dir/repo/deploy/release-notes.sh" check 2>&1) && [[ $out == *'tag v0.9.0 has no dated section'* ]]; then
+    printf 'ok   tags the commit holds are still checked\n'
+  else
+    printf 'FAIL tags the commit holds are still checked, got:\n%s\n' "$out"; fails=$((fails + 1))
   fi
 
   ((fails == 0)) || die "$fails self-test case(s) failed"
