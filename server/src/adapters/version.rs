@@ -217,6 +217,7 @@ pub async fn read_here(real: &Path, path: &str, cwd: &Path, run_as: Option<&RunA
         files: vec![],
         cleanup: None,
         collect: vec![],
+        limits: None,
     };
     let job = match run_as {
         Some(r) => r.prepare(job)?,
@@ -393,7 +394,7 @@ mod tests {
             }
             read_job(rx)
         };
-        let exit = |success: bool, stderr: &str| JobEvent::Exit { success, status: "exit status: 1".into(), stderr: stderr.into(), files: Default::default(), too_big: vec![] };
+        let exit = |success: bool, stderr: &str| JobEvent::Exit { success, status: "exit status: 1".into(), stderr: stderr.into(), files: Default::default(), too_big: vec![], limited: None };
         let ok = send(vec![JobEvent::Started, JobEvent::Line { line: "codex-cli 0.171.0".into() }, JobEvent::Ping, exit(true, "")]).await;
         assert_eq!(ok.as_deref(), Ok("codex-cli 0.171.0\n"));
         assert_eq!(send(vec![exit(false, "warn\nbad flag\n")]).await, Err("--version exit status: 1: bad flag".into()));

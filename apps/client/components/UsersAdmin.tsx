@@ -14,7 +14,7 @@ import type { SuperBotApi } from "../src/api";
 import { relativeTime, ROLES, signInMethod } from "../src/invite";
 import { fetchSsoProviders, type SsoProvider } from "../src/sso";
 import { colors } from "../src/theme";
-import type { AdminUser } from "../src/types";
+import type { AdminUser, CustomRole } from "../src/types";
 import { InviteUserForm } from "./InviteUserForm";
 import { SignupRequests } from "./SignupRequests";
 import { UserDetail } from "./UserDetail";
@@ -29,7 +29,7 @@ const ROLE_LABEL = Object.fromEntries(ROLES.map((r) => [r.role, r.label]));
 
 export function matchesUser(u: AdminUser, q: string): boolean {
   const s = q.trim().toLowerCase();
-  return !s || [u.name, u.email ?? "", u.role, u.status, ...(u.identities ?? []).map((i) => i.provider)].some((v) => v.toLowerCase().includes(s));
+  return !s || [u.name, u.email ?? "", u.role, u.status, u.customRole?.name ?? "", ...(u.identities ?? []).map((i) => i.provider)].some((v) => v.toLowerCase().includes(s));
 }
 
 function UserRow({ u, providers, selected, onPress }: { u: AdminUser; providers: SsoProvider[]; selected: boolean; onPress: () => void }) {
@@ -46,6 +46,7 @@ function UserRow({ u, providers, selected, onPress }: { u: AdminUser; providers:
         </Text>
         <View style={styles.tags}>
           <Text style={[styles.tag, u.role === "admin" && styles.adminTag]}>{ROLE_LABEL[u.role] ?? u.role}</Text>
+          {u.customRole ? <Text style={styles.tag}>{u.customRole.name}</Text> : null}
           {u.status === "disabled" ? <Text style={[styles.tag, styles.disabledTag]}>Disabled</Text> : null}
           {(u.identities ?? []).map((i) => (
             <Text key={i.id} style={styles.tag}>
@@ -81,6 +82,7 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
     inviteBusy.current = b;
   }, []);
   const [providers, setProviders] = useState<SsoProvider[]>([]);
+  const [roles, setRoles] = useState<CustomRole[]>([]);
 
   const load = useCallback(async () => {
     try {
@@ -102,12 +104,16 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
   useEffect(() => {
     void load();
     void fetchSsoProviders(api.baseUrl).then(setProviders);
+    api.roles().then(
+      (v) => setRoles(v.roles),
+      () => setRoles([]),
+    );
   }, [api, load]);
 
   const selected = users?.find((u) => u.id === selectedId) ?? null;
   const list = (users ?? []).filter((u) => matchesUser(u, query));
   const detail = selected ? (
-    <UserDetail key={selected.id} api={api} user={selected} meId={meId} providers={providers} onChanged={load} />
+    <UserDetail key={selected.id} api={api} user={selected} meId={meId} providers={providers} roles={roles} onChanged={load} />
   ) : null;
 
   return (

@@ -182,3 +182,12 @@ span.sub { display: inline; }
 
 #tab-settings h3 { font-size: 13.5px; font-weight: 600; margin: 18px 0 6px; }
 .bar input.minutes { width: 5em; }
+
+.wide { flex: 1; min-width: 16em; }
+.perms { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 6px 16px; margin-bottom: 10px; }
+.perms label { display: flex; gap: 8px; align-items: flex-start; }
+.perms input { margin-top: 3px; }
+.perms .sub { display: block; }
+.tags { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0; }
+.holders { margin: 8px 0 0; padding: 0; list-style: none; }
+.holders li { display: flex; align-items: center; gap: 8px; padding: 3px 0; }

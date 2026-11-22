@@ -54,11 +54,27 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    Refused under a legal hold, as a team's last owner, with
                                                    a machine (--destroy-machine destroys it first), or with
                                                    their machines' backups kept (--delete-backups deletes them)
+  botctl roles                                     Custom roles (ADR 0123), the permissions they're built from,
+                                                   and the built-in roles as presets of them
+  botctl role show <role>                          A role (id or name), its effective permissions, and who has it
+  botctl role add "<name>" [--base member|readonly] [--perms <a,b>] [--description "<text>"]
+                                                   A role on member (default) or read-only, plus permissions:
+                                                   users.manage, bots.manage, audit.view, billing.manage,
+                                                   signups.approve, machines.manage
+  botctl role edit <role> [--name "<name>"] [--base member|readonly] [--perms <a,b>|none] [--description "<text>"]
+                                                   A new base applies at once to everyone who has it
+  botctl role rm <role>                            Delete it, once nobody has it
+  botctl role assign <role> <user> [--team <team>] Give it across the server (its base becomes their role), or
+                                                   with --team only in that team (its team permissions)
+  botctl role unassign <role> <user> [--team <team>]  Take it away; across the server they keep its base
   botctl user tier <user> <tier|default>           Their plan: the models and limits they get
   botctl user region <user> [<region>|default]     Where their machine and its backups live (ADR 0117): theirs,
                                                    their team's or the default; set it, or follow the team again.
                                                    Refused while their machine is elsewhere
   botctl team region <team> [<region>|default]     The team's data region, for members without their own
+  botctl user egress <user> [inherit|open|allow <host|cidr>...]
+                                                   Their machine's outbound allow-list (ADR 0135): what it gets,
+                                                   and whether it's loaded there; set their own, or follow the server's
   botctl user|team residency <user|team> [pin <region> <reference...> | unpin <reason...>]
                                                    Pin their data to a region under an agreement (ADR 0129):
                                                    machines, backups and restores stay there or are refused.
@@ -154,6 +170,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
              --idp <entra|google|oidc|github|apple|saml> --idp-provider <id> --subject <issuer|sub>
              --session <id> --on-behalf-of <user id|email> --outcome <success|failure|denied> --bot <id>
     times: YYYY-MM-DD (UTC), RFC 3339, or unix milliseconds
+  botctl support-bundle [-o <file>]                Save a support bundle for a ticket (ADR 0131): version,
+                                                   redacted settings, health, recent logs and an audit
+                                                   summary, in a tar; no secrets, emails or chats
   botctl retention                                 How long chat history, harness session files,
                                                    teammates' archived work and the audit log are kept
                                                    (CHAT_RETENTION_DAYS, HARNESS_SESSION_RETENTION_DAYS,
@@ -172,6 +191,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine list [<state>]                    Every user's machine (pending, running, suspended, error, ... or all)
   botctl machine show <user>                       The user's machine: provider, plan, state, address, enrollment
   botctl machine request <user> [<tier>] [<region>]  Give the user a machine (a Linode VM or an Incus container)
+  botctl machine egress [open|allow <host|cidr>...]  The server's outbound allow-list for every machine (ADR 0135):
+                                                   open (the default), or only these hosts and networks
   botctl machine suspend|resume <user>             Power it off (disk and address kept), or back on
   botctl machine resize <user> <tier>              Move it to the tier's plan
   botctl machine resize <user> status              Its latest resize: a tier change's, and whether it waits, and why
@@ -294,6 +315,17 @@ fn exchange(cred: Cred, method: &str, path: &str, body: Option<String>) -> Resul
     let (head, body) = res.split_once("\r\n\r\n").unwrap_or((&res, ""));
     let code: u16 = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
     Ok((code, body.to_string()))
+}
+
+/// Like `exchange`, for replies that aren't text: the status, the head and the body's bytes.
+fn exchange_bytes(cred: Cred, method: &str, path: &str) -> Result<(u16, String, Vec<u8>), String> {
+    let mut s = send(cred, method, path, None)?;
+    let mut res = Vec::new();
+    s.read_to_end(&mut res).map_err(|e| e.to_string())?;
+    let split = res.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(res.len());
+    let head = String::from_utf8_lossy(&res[..split]).to_string();
+    let code: u16 = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    Ok((code, head, res.get(split + 4..).unwrap_or_default().to_vec()))
 }
 
 fn failure(code: u16, body: &str) -> String {
@@ -760,6 +792,21 @@ fn region_request(args: &[&str]) -> Option<(&'static str, String, Option<String>
     })
 }
 
+/// `botctl machine egress ...` and `botctl user egress ...` (ADR 0135): the request to send.
+fn egress_request(args: &[&str]) -> Option<(&'static str, String, Option<String>)> {
+    let set = |mode: &str, allow: &[&str]| Some(json!({ "mode": mode, "allow": allow }).to_string());
+    let user = |key: &str| format!("/api/users/{}/machine/egress-policy", encode(key));
+    Some(match args {
+        ["machine", "egress"] => ("GET", "/api/machines/egress-policy".into(), None),
+        ["machine", "egress", "open"] => ("PUT", "/api/machines/egress-policy".into(), set("open", &[])),
+        ["machine", "egress", "allow", allow @ ..] if !allow.is_empty() => ("PUT", "/api/machines/egress-policy".into(), set("allow_list", allow)),
+        ["user", "egress", key] => ("GET", user(key), None),
+        ["user", "egress", key, m @ ("open" | "inherit")] => ("PUT", user(key), set(m, &[])),
+        ["user", "egress", key, "allow", allow @ ..] if !allow.is_empty() => ("PUT", user(key), set("allow_list", allow)),
+        _ => return None,
+    })
+}
+
 /// `botctl tiers move-bots <tier> [--user <user>] [--dry-run]` (ADR 0079): the path and body.
 fn move_bots_request(args: &[&str]) -> Result<(String, String), String> {
     const USE: &str = "usage: botctl tiers move-bots <tier> [--user <user>] [--dry-run]";
@@ -964,6 +1011,76 @@ fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
             return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team>".into());
         }
     })
+}
+
+/// `botctl roles` and `botctl role ...`: custom roles (ADR 0123, 0132). The server checks
+/// every name and permission; this only shapes the request.
+fn role_request(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
+    const USAGE: &str = "Usage: botctl roles | role show <role> | role add \"<name>\" [--base member|readonly] [--perms a,b] [--description TEXT] | role edit <role> [--name NAME] [--base B] [--perms a,b|none] [--description TEXT] | role rm <role> | role assign|unassign <role> <user> [--team <team>]";
+    let perms = |v: &str| -> Value {
+        if v == "none" {
+            return json!([]);
+        }
+        json!(v.split(',').map(str::trim).filter(|p| !p.is_empty()).collect::<Vec<_>>())
+    };
+    let at = |id: &str| format!("/api/roles/{}", encode(id));
+    let holder = |id: &str, user: &str, rest: &[&str]| match flag(rest, "--team") {
+        Some(team) => format!("{}/teams/{}/users/{}", at(id), encode(team), encode(user)),
+        None => format!("{}/users/{}", at(id), encode(user)),
+    };
+    let known = |rest: &[&str], allowed: &[&str]| -> Result<(), String> {
+        let mut it = rest.iter();
+        while let Some(a) = it.next() {
+            if !allowed.contains(a) || it.next().is_none() {
+                return Err(format!("Unexpected \"{a}\". {USAGE}"));
+            }
+        }
+        Ok(())
+    };
+    Ok(match args {
+        [] | ["list"] => ("GET", "/api/roles".into(), None),
+        ["show", id] => ("GET", at(id), None),
+        ["add", name, rest @ ..] if !name.starts_with("--") => {
+            known(rest, &["--base", "--perms", "--description"])?;
+            let body = json!({ "name": name, "base": flag(rest, "--base"), "description": flag(rest, "--description"), "permissions": perms(flag(rest, "--perms").unwrap_or("none")) });
+            ("POST", "/api/roles".into(), Some(body.to_string()))
+        }
+        ["edit", id, rest @ ..] if !id.starts_with("--") && !rest.is_empty() => {
+            known(rest, &["--name", "--base", "--perms", "--description"])?;
+            let mut body = Map::new();
+            for (opt, field) in [("--name", "name"), ("--base", "base"), ("--description", "description")] {
+                if let Some(v) = flag(rest, opt) {
+                    body.insert(field.into(), json!(v));
+                }
+            }
+            if let Some(v) = flag(rest, "--perms") {
+                body.insert("permissions".into(), perms(v));
+            }
+            ("PATCH", at(id), Some(Value::Object(body).to_string()))
+        }
+        ["rm" | "delete", id] => ("DELETE", at(id), None),
+        [verb @ ("assign" | "unassign"), id, user, rest @ ..] if !user.starts_with("--") => {
+            known(rest, &["--team"])?;
+            (if *verb == "assign" { "PUT" } else { "DELETE" }, holder(id, user, rest), None)
+        }
+        _ => return Err(USAGE.into()),
+    })
+}
+
+/// What `botctl role assign|unassign` prints.
+fn role_assigned(verb: &str, res: &Value) -> String {
+    let who = res["user"]["email"].as_str().or(res["user"]["name"].as_str()).unwrap_or_default();
+    let team = res["team"]["name"].as_str();
+    match (verb, team) {
+        ("assign", Some(t)) => format!(
+            "{who} has {} in {t}. There it gives: {}.",
+            res["role"]["name"].as_str().unwrap_or_default(),
+            res["applies"].as_array().filter(|a| !a.is_empty()).map_or("nothing (it has no team permissions)".into(), |a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
+        ),
+        ("assign", None) => format!("{who} has {} now; their role is {}.", res["role"]["name"].as_str().unwrap_or_default(), res["user"]["role"].as_str().unwrap_or_default()),
+        (_, Some(t)) => format!("Taken away from {who} in {t}."),
+        _ => format!("Taken away. {who} keeps {} as their role.", res["user"]["role"].as_str().unwrap_or_default()),
+    }
 }
 
 /// What `botctl scim token create` prints: the token once, and where the IdP sends it.
@@ -1301,6 +1418,13 @@ fn run(args: &[String]) -> Result<String, String> {
         ["machine", "harness-logins", user] => op("GET", &format!("{}/harness-logins", login_base(user)), None),
         ["machine", "harness-logout", user, harness] => op("DELETE", &format!("{}/harness-logins/{}", login_base(user), encode(harness)), None),
         ["machine", "legacy"] => op("GET", "/api/machines/legacy", None),
+        [..] if egress_request(&a).is_some() => {
+            let (method, path, body) = egress_request(&a).unwrap();
+            op(method, &path, body)
+        }
+        ["machine" | "user", "egress", ..] => {
+            Err("Usage: botctl machine egress [open|allow <host|cidr>...] | botctl user egress <user> [inherit|open|allow <host|cidr>...]".into())
+        }
         ["machine", rest @ ..] if matches!(rest.first(), Some(&("backups" | "backup" | "restore" | "delete-backups" | "recovery" | "hosts" | "host"))) => {
             let (method, path, body) = backup_request(rest, |f| std::fs::read_to_string(f).map_err(|e| format!("--identity {f}: {e}")))?;
             op(method, &path, body)
@@ -1336,9 +1460,20 @@ fn run(args: &[String]) -> Result<String, String> {
                 _ => Ok(pretty(res)),
             }
         }
+        ["roles"] | ["role", ..] => {
+            let rest = a.get(1..).unwrap_or_default();
+            let (method, path, body) = role_request(rest)?;
+            let res = api(Cred::Operator, method, &path, body)?;
+            match rest.first() {
+                Some(&("rm" | "delete")) => Ok("Deleted.".into()),
+                Some(&verb @ ("assign" | "unassign")) => Ok(role_assigned(verb, &serde_json::from_str(&res).map_err(|e| e.to_string())?)),
+                _ => Ok(pretty(res)),
+            }
+        }
         ["approvals"] => op("GET", "/api/approvals?status=pending", None),
         ["approvals", status] => op("GET", &format!("/api/approvals?status={status}"), None),
         [verb @ ("approve" | "deny"), id, rest @ ..] => decide(verb, id, rest),
+        ["support-bundle", rest @ ..] => support_bundle(rest),
         ["audit", "export", rest @ ..] => api(Cred::Operator, "GET", &format!("/api/audit/export.csv{}", audit_query(rest)?), None),
         ["audit", "verify", rest @ ..] => {
             let res = op("GET", &format!("/api/audit/verify{}", verify_query(rest)?), None)?;
@@ -1496,6 +1631,47 @@ fn erase_request(key: &str, rest: &[&str]) -> Result<(String, Value), String> {
     Ok((format!("/api/users/{}/erase", encode(key)), body))
 }
 
+/// `botctl support-bundle [-o <file>]`: the file to save it as, if not botd's name for it.
+fn bundle_out<'a>(rest: &[&'a str]) -> Result<Option<&'a str>, String> {
+    match rest {
+        [] => Ok(None),
+        ["-o" | "--out", file] => Ok(Some(file)),
+        _ => Err("Usage: botctl support-bundle [-o <file>]".into()),
+    }
+}
+
+/// The file name a reply's `Content-Disposition` gives, if it is a plain one: it is saved
+/// in the current folder, so no paths and no hidden files.
+fn attachment_name(head: &str) -> Option<String> {
+    let line = head.lines().find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))?;
+    let name = line.split_once("filename=")?.1.trim().trim_matches('"');
+    let plain = !name.is_empty() && !name.starts_with('.') && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    plain.then(|| name.to_string())
+}
+
+/// Writes a new file only its owner can read; never over an existing one.
+fn save_private(path: &str, bytes: &[u8]) -> Result<(), String> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(path).and_then(|mut f| f.write_all(bytes)).map_err(|e| format!("{path}: {e}"))
+}
+
+fn support_bundle(rest: &[&str]) -> Result<String, String> {
+    let out = bundle_out(rest)?;
+    let (code, head, body) = exchange_bytes(Cred::Operator, "GET", "/api/support/bundle")?;
+    if !(200..300).contains(&code) {
+        return Err(failure(code, &String::from_utf8_lossy(&body)));
+    }
+    let path = out.map(String::from).or_else(|| attachment_name(&head)).unwrap_or_else(|| "superbot-support.tar".into());
+    save_private(&path, &body)?;
+    Ok(format!(
+        "Saved {path} ({} KB). It has no secrets, emails or chats, but read it before you attach it to a ticket:\n  tar -tvf {path}\n  tar -xOf {path} | less",
+        body.len().div_ceil(1024)
+    ))
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
@@ -1524,6 +1700,36 @@ mod tests {
         assert_eq!(failure(403, r#"{"error":"not allowed"}"#), "not allowed (HTTP 403)");
         assert_eq!(failure(502, "Bad Gateway"), "Bad Gateway (HTTP 502)");
         assert_eq!(failure(400, r#"{"error":7}"#), r#"{"error":7} (HTTP 400)"#);
+    }
+
+    #[test]
+    fn a_support_bundle_is_saved_where_asked_or_under_botds_plain_name() {
+        assert_eq!(bundle_out(&[]), Ok(None));
+        assert_eq!(bundle_out(&["-o", "t.tar"]), Ok(Some("t.tar")));
+        assert_eq!(bundle_out(&["--out", "/tmp/t.tar"]), Ok(Some("/tmp/t.tar")));
+        assert!(bundle_out(&["-o"]).is_err() && bundle_out(&["t.tar"]).is_err());
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: application/x-tar\r\ncontent-disposition: attachment; filename=\"superbot-support-20261122T120000Z.tar\"";
+        assert_eq!(attachment_name(head).as_deref(), Some("superbot-support-20261122T120000Z.tar"));
+        for bad in ["../etc/passwd", ".bashrc", "a/b.tar", "", "x y.tar"] {
+            assert_eq!(attachment_name(&format!("Content-Disposition: attachment; filename=\"{bad}\"")), None, "{bad}");
+        }
+        assert_eq!(attachment_name("HTTP/1.1 200 OK"), None);
+    }
+
+    #[test]
+    fn a_saved_bundle_is_private_and_never_overwrites() {
+        let path = std::env::temp_dir().join(format!("botctl-bundle-{}.tar", std::process::id()));
+        let p = path.to_str().unwrap();
+        let _ = std::fs::remove_file(&path);
+        save_private(p, b"tar").unwrap();
+        assert!(save_private(p, b"other").is_err(), "an existing file is kept");
+        assert_eq!(std::fs::read(&path).unwrap(), b"tar");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -1794,6 +2000,29 @@ mod tests {
     }
 
     #[test]
+    fn egress_commands() {
+        let req = |a: &[&str]| egress_request(a).map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())));
+        assert_eq!(req(&["machine", "egress"]), Some(("GET", "/api/machines/egress-policy".into(), None)));
+        assert_eq!(req(&["machine", "egress", "open"]), Some(("PUT", "/api/machines/egress-policy".into(), Some(json!({ "mode": "open", "allow": [] })))));
+        assert_eq!(
+            req(&["machine", "egress", "allow", "api.anthropic.com", "203.0.113.0/24"]),
+            Some(("PUT", "/api/machines/egress-policy".into(), Some(json!({ "mode": "allow_list", "allow": ["api.anthropic.com", "203.0.113.0/24"] }))))
+        );
+        assert_eq!(req(&["user", "egress", "ada@example.com"]), Some(("GET", "/api/users/ada%40example.com/machine/egress-policy".into(), None)));
+        assert_eq!(req(&["user", "egress", "u1", "inherit"]), Some(("PUT", "/api/users/u1/machine/egress-policy".into(), Some(json!({ "mode": "inherit", "allow": [] })))));
+        assert_eq!(
+            req(&["user", "egress", "u1", "allow", "registry.npmjs.org"]),
+            Some(("PUT", "/api/users/u1/machine/egress-policy".into(), Some(json!({ "mode": "allow_list", "allow": ["registry.npmjs.org"] }))))
+        );
+        for other in [&["machine", "egress", "allow"][..], &["user", "egress", "u1", "closed"], &["user", "egress"], &["machine", "egress", "shut"]] {
+            assert_eq!(egress_request(other), None, "{other:?}");
+            let args: Vec<String> = other.iter().map(|s| s.to_string()).collect();
+            let e = run(&args).unwrap_err();
+            assert!(e.starts_with("Usage: botctl machine egress"), "{other:?} reached another command: {e}");
+        }
+    }
+
+    #[test]
     fn residency_commands() {
         let body = |v: Value| Some(v.to_string());
         assert_eq!(region_request(&["user", "residency", "ada@example.com"]), Some(("GET", "/api/users/ada%40example.com/residency".into(), None)));
@@ -1958,6 +2187,42 @@ mod tests {
         v["idp"] = json!({ "ssoUrl": "https://idp.example/sso", "certificates": [{ "sha256": "ab:cd", "subject": "CN=idp", "notAfter": 1_900_000_000_000_i64 }] });
         let out = saml_summary(&v);
         assert!(out.contains("Certificate SHA-256 ab:cd (CN=idp), expires 2030-03-17"), "{out}");
+    }
+
+    #[test]
+    fn role_commands() {
+        let req = |a: &[&str]| role_request(a).map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())));
+        assert_eq!(req(&[]), Ok(("GET", "/api/roles".into(), None)));
+        assert_eq!(req(&["show", "Help desk"]), Ok(("GET", "/api/roles/Help%20desk".into(), None)));
+        assert_eq!(
+            req(&["add", "Auditor"]),
+            Ok(("POST", "/api/roles".into(), Some(json!({ "name": "Auditor", "base": null, "description": null, "permissions": [] }))))
+        );
+        assert_eq!(
+            req(&["add", "Auditor", "--base", "readonly", "--perms", "audit.view, signups.approve", "--description", "Reviews"]),
+            Ok(("POST", "/api/roles".into(), Some(json!({ "name": "Auditor", "base": "readonly", "description": "Reviews", "permissions": ["audit.view", "signups.approve"] }))))
+        );
+        assert_eq!(req(&["edit", "r1", "--perms", "none"]), Ok(("PATCH", "/api/roles/r1".into(), Some(json!({ "permissions": [] })))));
+        assert_eq!(
+            req(&["edit", "r1", "--name", "Support", "--base", "member", "--description", ""]),
+            Ok(("PATCH", "/api/roles/r1".into(), Some(json!({ "name": "Support", "base": "member", "description": "" }))))
+        );
+        assert_eq!(req(&["rm", "r1"]), Ok(("DELETE", "/api/roles/r1".into(), None)));
+        assert_eq!(req(&["assign", "r1", "ada@example.com"]), Ok(("PUT", "/api/roles/r1/users/ada%40example.com".into(), None)));
+        assert_eq!(req(&["assign", "r1", "u1", "--team", "t1"]), Ok(("PUT", "/api/roles/r1/teams/t1/users/u1".into(), None)));
+        assert_eq!(req(&["unassign", "r1", "u1"]), Ok(("DELETE", "/api/roles/r1/users/u1".into(), None)));
+        assert_eq!(req(&["unassign", "r1", "u1", "--team", "t1"]), Ok(("DELETE", "/api/roles/r1/teams/t1/users/u1".into(), None)));
+        for bad in [&["add"][..], &["add", "--base", "member"], &["add", "X", "--perm", "audit.view"], &["add", "X", "--base"], &["edit", "r1"], &["assign", "r1"], &["assign", "r1", "u1", "--org", "x"], &["show"]] {
+            assert!(req(bad).is_err(), "{bad:?}");
+        }
+
+        let org = json!({ "user": { "email": "ada@example.com", "role": "readonly" }, "role": { "name": "Auditor" } });
+        assert_eq!(role_assigned("assign", &org), "ada@example.com has Auditor now; their role is readonly.");
+        assert_eq!(role_assigned("unassign", &org), "Taken away. ada@example.com keeps readonly as their role.");
+        let team = json!({ "team": { "name": "Ops" }, "user": { "email": "ada@example.com" }, "role": { "name": "Lead" }, "applies": ["users.manage"] });
+        assert_eq!(role_assigned("assign", &team), "ada@example.com has Lead in Ops. There it gives: users.manage.");
+        assert!(role_assigned("assign", &json!({ "team": { "name": "Ops" }, "user": {}, "role": {}, "applies": [] })).contains("no team permissions"));
+        assert_eq!(role_assigned("unassign", &team), "Taken away from ada@example.com in Ops.");
     }
 
     #[test]

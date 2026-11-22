@@ -32,8 +32,12 @@
 //! - `SUPERBOT_MAX_SCREENS`: Bots' screens shown at once (ADR 0045; default 4).
 //! - `SUPERBOT_TEAMMATES`: where teammates' own homes are, for their runs of the
 //!   user's shared Bots (ADR 0048; default `<state dir>/teammates`).
+//! - `SUPERBOT_RUN_CGROUPS`: `delegated` when systemd delegates the unit its cgroup,
+//!   so each run can be held to its limits in a cgroup of its own (ADR 0135).
 
+use super::cgroup::{self, Cgroups};
 use super::display::{self, Screens};
+use super::egress_allow;
 use super::job;
 use super::landing::Landing;
 use super::pki::{self, Peer};
@@ -104,6 +108,10 @@ pub struct Config {
     pub teammates: PathBuf,
     /// Tests can't make users: every teammate runs as this existing one instead.
     pub teammate_stand_in: Option<String>,
+    /// systemd delegates this unit its cgroup (ADR 0135).
+    pub run_cgroups: bool,
+    /// The nft that loads the outbound allow-list (ADR 0135).
+    pub nft: PathBuf,
 }
 
 /// Where harnesses and botctl may live, besides the Bots' home: the system's program
@@ -236,6 +244,12 @@ impl Config {
             },
             teammates,
             teammate_stand_in: None,
+            run_cgroups: match var("SUPERBOT_RUN_CGROUPS").as_deref() {
+                None | Some("off") => false,
+                Some("delegated") => true,
+                Some(_) => return Err("SUPERBOT_RUN_CGROUPS must be delegated or off".into()),
+            },
+            nft: "nft".into(),
         })
     }
 
@@ -283,6 +297,7 @@ impl Config {
             remove: Vec::new(),
             env,
             user,
+            limits: None,
         }
     }
 
@@ -295,7 +310,7 @@ impl Config {
             ("USER".to_string(), t.user.clone()),
             ("LOGNAME".to_string(), t.user.clone()),
         ]);
-        job::Host { clear_env: true, remove: Vec::new(), env, user: Some(t.ids) }
+        job::Host { clear_env: true, remove: Vec::new(), env, user: Some(t.ids), limits: None }
     }
 
     /// Why `ids` can't be the Bots' user, if it can't.
@@ -633,6 +648,43 @@ pub struct Agent {
     pub teammates: Arc<Teammates>,
     /// What the Bots' and teammates' homes hold (ADR 0105).
     home_use: Arc<HomeUse>,
+    /// Runs' cgroups, or why runs can't be held to limits here (ADR 0135).
+    cgroups: Result<Cgroups, String>,
+    /// The outbound allow-list botd sent, and how its rules stand (ADR 0135).
+    egress: Mutex<Egress>,
+    /// One load of the allow-list's rules at a time.
+    egress_loading: tokio::sync::Mutex<()>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Egress {
+    policy: wire::EgressPolicy,
+    report: wire::EgressReport,
+}
+
+const EGRESS_FILE: &str = "egress-policy.json";
+/// How often an allow-list's hosts are resolved again.
+pub const EGRESS_REFRESH: Duration = Duration::from_secs(300);
+
+/// This process's cgroup, split for runs (ADR 0135), when the unit is delegated it.
+fn run_cgroups(cfg: &Config) -> Result<Cgroups, String> {
+    if !cfg.run_cgroups {
+        return Err("the agent's unit isn't delegated its cgroup: rebuild the machine to hold runs to limits".into());
+    }
+    let root = Path::new("/sys/fs/cgroup");
+    let own = std::fs::read_to_string("/proc/self/cgroup").map_err(|e| format!("/proc/self/cgroup: {e}"))?;
+    let base = cgroup::own_base(&own, root).ok_or("this machine has no cgroup v2")?;
+    let (cpus, memory) = machine_size(&base);
+    Cgroups::setup(&base, cpus, memory)
+}
+
+/// The machine's CPUs and memory now, as its runs may use them: an Incus resize
+/// changes them under a running agent.
+fn machine_size(base: &Path) -> (u32, u64) {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let memory = cgroup::machine_memory(base, Path::new("/sys/fs/cgroup"), &meminfo);
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+    (cpus, memory)
 }
 
 /// How old the homes' measurement may get before a heartbeat starts another.
@@ -826,6 +878,26 @@ impl Agent {
         }
         let screens = Arc::new(Screens::new(cfg.screens.clone(), cfg.home.clone(), cfg.bot_user.clone()));
         let teammates = Arc::new(Teammates::new(cfg.teammates.clone(), cfg.state_dir.clone(), cfg.teammate_stand_in.clone()));
+        let cgroups = run_cgroups(&cfg);
+        match &cgroups {
+            Ok(cg) => println!("Runs are held to their limits in {}.", cg.runs().display()),
+            Err(e) => eprintln!("Run limits: {e}"),
+        }
+        // A saved allow-list holds from the start: no job runs until its rules load.
+        let saved: Option<wire::EgressPolicy> = std::fs::read(cfg.state_dir.join(EGRESS_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok());
+        let egress = match saved {
+            Some(policy) => {
+                let report = wire::EgressReport {
+                    id: policy.id.clone(),
+                    mode: policy.mode.clone(),
+                    state: wire::EGRESS_STATE_FAILED.into(),
+                    error: Some("not loaded yet".into()),
+                    ..Default::default()
+                };
+                Egress { policy, report }
+            }
+            None => Egress::default(),
+        };
         let a = Arc::new(Agent {
             cfg,
             current: RwLock::new((Arc::new(id), server)),
@@ -839,9 +911,13 @@ impl Agent {
             screens,
             teammates,
             home_use: Arc::default(),
+            cgroups,
+            egress: Mutex::new(egress),
+            egress_loading: tokio::sync::Mutex::new(()),
         });
         a.home_use.refresh(&a.home_roots(), false);
         if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(a.clone().keep_egress());
             tokio::spawn(a.tools.clone().work());
             a.screens.reap_in_background();
             if let Some(deadline) = a.upgrader.trial_deadline() {
@@ -1024,6 +1100,75 @@ impl Agent {
         }
     }
 
+    fn egress(&self) -> Egress {
+        self.egress.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Loads the saved allow-list's rules, then resolves its hosts again every
+    /// `EGRESS_REFRESH`, so the rules follow their addresses.
+    async fn keep_egress(self: Arc<Self>) {
+        let mut first = true;
+        loop {
+            // The policy is read under the lock, so a refresh never puts back one that a
+            // newer request replaced while this waited.
+            let one = self.egress_loading.lock().await;
+            let p = self.egress().policy;
+            // At start a saved `open` loads too: it clears a table left by a restart
+            // mid-change, and reports open rather than not loaded.
+            let hosts = p.mode == wire::EGRESS_ALLOW_LIST
+                && egress_allow::entries(&p.allow).is_ok_and(|e| e.iter().any(|e| matches!(e, egress_allow::Entry::Host(_))));
+            if hosts || (first && (p.mode == wire::EGRESS_ALLOW_LIST || !p.id.is_empty())) {
+                self.load_egress(p).await;
+            }
+            drop(one);
+            first = false;
+            tokio::time::sleep(EGRESS_REFRESH).await;
+        }
+    }
+
+    /// Takes `p` and loads its rules: the table goes for `open`, or is replaced whole
+    /// with the list's addresses. Saved first, so a restart holds to it.
+    async fn apply_egress(&self, p: wire::EgressPolicy) -> wire::EgressReport {
+        let _one = self.egress_loading.lock().await;
+        self.load_egress(p).await
+    }
+
+    /// `apply_egress`, for a caller holding `egress_loading`.
+    async fn load_egress(&self, p: wire::EgressPolicy) -> wire::EgressReport {
+        let mut report = wire::EgressReport { id: p.id.clone(), mode: p.mode.clone(), at: now_ms(), ..Default::default() };
+        let had_list = self.egress().report.mode == wire::EGRESS_ALLOW_LIST;
+        let saved = write_private(&self.cfg.state_dir.join(EGRESS_FILE), &serde_json::to_string(&p).unwrap_or_default(), 0o600);
+        let loaded = match (&saved, p.mode.as_str()) {
+            (Err(e), _) => Err(format!("couldn't save the policy: {e}")),
+            (Ok(()), wire::EGRESS_OPEN) => {
+                report.state = wire::EGRESS_STATE_OPEN.into();
+                if had_list || egress_table_loaded(&self.cfg.nft) {
+                    egress_allow::load(&self.cfg.nft, &egress_allow::removal())
+                } else {
+                    Ok(())
+                }
+            }
+            (Ok(()), _) => {
+                let list = egress_allow::entries(&p.allow).unwrap_or_default();
+                let (addrs, unresolved) = egress_allow::addresses(&list, egress_allow::system_resolve).await;
+                report.addresses = addrs.len() as u32;
+                report.unresolved = unresolved;
+                let ex = egress_exempt();
+                let script = egress_allow::rules(&ex, &addrs);
+                report.state = wire::EGRESS_STATE_ON.into();
+                let nft = self.cfg.nft.clone();
+                tokio::task::spawn_blocking(move || egress_allow::load(&nft, &script)).await.unwrap_or_else(|e| Err(e.to_string()))
+            }
+        };
+        if let Err(e) = loaded {
+            eprintln!("Outbound allow-list: {e}");
+            report.state = wire::EGRESS_STATE_FAILED.into();
+            report.error = Some(e);
+        }
+        *self.egress.lock().unwrap_or_else(|e| e.into_inner()) = Egress { policy: p, report: report.clone() };
+        report
+    }
+
     /// Rotates when due. Returns whether it did.
     pub async fn rotate_if_due(&self) -> Result<bool, Failed> {
         let id = self.identity();
@@ -1037,6 +1182,24 @@ impl Agent {
         })?;
         Ok(true)
     }
+}
+
+/// Whether this machine has an allow-list table loaded now.
+fn egress_table_loaded(nft: &Path) -> bool {
+    std::process::Command::new(nft)
+        .args(["list", "table", "inet", egress_allow::TABLE])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Root, the OS's network daemons that exist here, and the resolvers, as the deny
+/// rules of ADR 0126 let through.
+fn egress_exempt() -> egress_allow::Exempt {
+    let uids = egress_allow::DAEMONS.iter().filter_map(|n| runas::lookup(n).map(|(ids, _)| ids.uid)).collect();
+    let (dns4, dns6) = egress_allow::resolvers(&std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default());
+    egress_allow::Exempt { uids, dns4, dns6 }
 }
 
 /// Clients must show a certificate from the CA naming the control plane, so another
@@ -1237,6 +1400,8 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             wire::CAN_TEAMMATE_LOGINS,
             wire::CAN_INSTALL_AFTER,
             wire::CAN_RETENTION,
+            wire::CAN_RUN_LIMITS,
+            wire::CAN_EGRESS_POLICY,
         ]
             .into_iter()
             .chain(a.upgrader.build.is_some().then_some(wire::CAN_UPGRADE))
@@ -1256,6 +1421,11 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             Path::new(HARDENING_EGRESS),
             Path::new(HARDENING_REBOOT),
         ),
+        run_limits: Some(match &a.cgroups {
+            Ok(cg) => cg.report(),
+            Err(e) => Cgroups::unavailable(e.clone()),
+        }),
+        egress_policy: Some(a.egress().report),
     })
 }
 
@@ -1465,6 +1635,17 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
         if j.for_user.as_deref().is_some_and(|u| a.teammates.is_leaving(u)) {
             return refuse(StatusCode::CONFLICT, "That teammate's user is being removed.");
         }
+        // An allow-list botd set holds every run: none starts while its rules aren't loaded.
+        let egress = a.egress();
+        if egress.policy.mode == wire::EGRESS_ALLOW_LIST && egress.report.state != wire::EGRESS_STATE_ON {
+            return refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "This machine's outbound allow-list isn't loaded: {}",
+                    egress.report.error.as_deref().unwrap_or("no reason given")
+                ),
+            );
+        }
         if jobs.len() >= a.cfg.max_jobs {
             return refuse(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1482,13 +1663,24 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
     };
     let running = Running(a.clone(), j.job_id.clone(), permit);
     let stop = StopOnDrop(stop_tx);
-    let host = match &teammate {
+    let mut host = match &teammate {
         Some(t) => a.cfg.teammate_host(t),
         None => {
             let _ = work_dirs(&a.cfg, user);
             a.cfg.host(user)
         }
     };
+    // A run the agent can't hold to its limits still runs, and its exit says why.
+    host.limits = j.limits.map(|l| match &a.cgroups {
+        Ok(cg) => {
+            let (cpus, memory) = machine_size(cg.base());
+            match cg.resize(cpus, memory).and_then(|()| cg.start(&j.job_id, &l)) {
+                Ok(rc) => job::Limiting::Cgroup(Arc::new(rc)),
+                Err(e) => job::Limiting::Unavailable(e),
+            }
+        }
+        Err(e) => job::Limiting::Unavailable(e.clone()),
+    });
     let (ev_tx, ev_rx) = mpsc::channel::<wire::JobEvent>(256);
     let screen = a.screens.hold(&wire::screen_key(&j.bot_id, j.for_user.as_deref()));
     tokio::spawn(async move {
@@ -2037,6 +2229,21 @@ fn retention_sweep(r: &wire::RetentionRequest, home: &Path, teammates: &[PathBuf
     Ok(s)
 }
 
+/// `PUT /v1/egress-policy`: the outbound allow-list for every uid but root and the OS's
+/// network daemons (ADR 0135). Answers how its rules stand once they are loaded.
+async fn put_egress_policy(State(a): State<Arc<Agent>>, Json(p): Json<wire::EgressPolicy>) -> Response {
+    if !egress_allow::mode_ok(&p.mode) {
+        return refuse(StatusCode::BAD_REQUEST, "mode must be open or allow_list");
+    }
+    if let Err(e) = egress_allow::entries(&p.allow) {
+        return refuse(StatusCode::BAD_REQUEST, e);
+    }
+    if p.mode == wire::EGRESS_OPEN && !p.allow.is_empty() {
+        return refuse(StatusCode::BAD_REQUEST, "an open policy lists nothing");
+    }
+    Json(a.apply_egress(p).await).into_response()
+}
+
 /// `POST /v1/retention`: deletes old harness session files and archived teammates' work
 /// (ADR 0112). botd sends it only while none of the Bots it sweeps for is running.
 async fn retention(State(a): State<Arc<Agent>>, Json(r): Json<wire::RetentionRequest>) -> Response {
@@ -2095,6 +2302,7 @@ pub fn router(a: Arc<Agent>) -> Router {
         .route("/v1/teammates/{user}/remove", post(remove_teammate))
         .route("/v1/teammates/{user}/purge", post(purge_teammate))
         .route("/v1/retention", post(retention))
+        .route("/v1/egress-policy", axum::routing::put(put_egress_policy))
         .layer(DefaultBodyLimit::max(MAX_RELAY_BODY))
         .with_state(a)
 }

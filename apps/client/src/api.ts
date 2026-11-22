@@ -13,6 +13,8 @@ import type {
   BotNotificationsPatch,
   BotNotificationsView,
   BotView,
+  CustomRole,
+  CustomRoleRef,
   LoginCode,
   Message,
   MfaPolicy,
@@ -36,6 +38,8 @@ import type {
   PushRegistration,
   PushView,
   Role,
+  RoleDraft,
+  RolesView,
   Routine,
   ServerConfig,
   SessionView,
@@ -700,6 +704,55 @@ export class SuperBotApi {
   async completeAccessReview(digest: string, notes?: string): Promise<AccessReviewSignOff> {
     const res = await this.request<{ review: AccessReviewSignOff }>("POST", "/api/access-review/complete", { digest, notes: notes?.trim() || null });
     return res.review;
+  }
+
+  // Custom roles: admins only (ADR 0123, 0132).
+
+  async roles(): Promise<RolesView> {
+    return this.request<RolesView>("GET", "/api/roles");
+  }
+
+  /** The role with who has it, across the server and within teams. */
+  async role(id: string): Promise<CustomRole> {
+    return this.request<CustomRole>("GET", `/api/roles/${encodeURIComponent(id)}`);
+  }
+
+  async createRole(draft: RoleDraft): Promise<CustomRole> {
+    return this.request<CustomRole>("POST", "/api/roles", draft);
+  }
+
+  /** A new base applies at once to everyone who has the role across the server. */
+  async updateRole(id: string, patch: Partial<RoleDraft>): Promise<CustomRole> {
+    return this.request<CustomRole>("PATCH", `/api/roles/${encodeURIComponent(id)}`, patch);
+  }
+
+  /** Refused (409) while anyone has it. */
+  async deleteRole(id: string): Promise<void> {
+    await this.request("DELETE", `/api/roles/${encodeURIComponent(id)}`);
+  }
+
+  /** Gives it across the server: its base becomes their role. */
+  async assignRole(id: string, user: string): Promise<{ user: AdminUser; role: CustomRoleRef | null }> {
+    return this.request<{ user: AdminUser; role: CustomRoleRef | null }>("PUT", `/api/roles/${encodeURIComponent(id)}/users/${encodeURIComponent(user)}`);
+  }
+
+  /** Takes it away; they keep its base as their role. */
+  async unassignRole(id: string, user: string): Promise<void> {
+    await this.request("DELETE", `/api/roles/${encodeURIComponent(id)}/users/${encodeURIComponent(user)}`);
+  }
+
+  /** Gives it to a team's member within that team: only its team permissions apply there. */
+  async assignTeamRole(id: string, team: string, user: string): Promise<{ applies: string[] }> {
+    return this.request<{ applies: string[] }>("PUT", `/api/roles/${encodeURIComponent(id)}/teams/${encodeURIComponent(team)}/users/${encodeURIComponent(user)}`);
+  }
+
+  async unassignTeamRole(id: string, team: string, user: string): Promise<void> {
+    await this.request("DELETE", `/api/roles/${encodeURIComponent(id)}/teams/${encodeURIComponent(team)}/users/${encodeURIComponent(user)}`);
+  }
+
+  /** Every team, as server admins see them. */
+  async teams(): Promise<Team[]> {
+    return (await this.request<{ teams: Team[] }>("GET", "/api/teams")).teams ?? [];
   }
 
   eventsUrl(): string {
