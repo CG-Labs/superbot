@@ -589,6 +589,12 @@ fn plain(m: &TeamMember) -> bool {
     m.role == MEMBER && m.role_id.is_none()
 }
 
+/// Whom a team role's holder may take off the team: a plain member whom a server-wide
+/// delegate could change too (`users::Delegate`): no admin, owner account, or custom role.
+fn delegable(u: &User, m: &TeamMember) -> bool {
+    plain(m) && u.role != crate::rbac::Role::Admin && u.role_id.is_none() && u.id != crate::users::OPERATOR
+}
+
 /// What a team role's holder was refused, audited as `users::Delegate` refusals are.
 fn delegate_limit(app: &AppState, by: &Who, team_id: &str, msg: &str) -> ApiError {
     app.db.record(&by.event("access.denied").outcome(crate::audit::Outcome::Denied).target("team", team_id).details(json!({ "reason": "delegate_limit", "limit": "team_role" })));
@@ -767,8 +773,8 @@ pub async fn remove(State(app): State<AppState>, Extension(c): Extension<Caller>
     if u.id == me_user.id {
         return Err(conflict("To leave the team yourself, use leave."));
     }
-    if !manages(&me.role) && !plain(&m) {
-        return Err(delegate_limit(&app, &by, &t.id, "Only the team's owners and admins can take off an admin, or someone with a team role."));
+    if !manages(&me.role) && !delegable(&u, &m) {
+        return Err(delegate_limit(&app, &by, &t.id, "Only the team's owners and admins can take off an admin, of the team or the server, or someone with a team role."));
     }
     if m.role == OWNER && me.role != OWNER {
         return Err(forbidden("Only the team's owners can take an owner off the team."));
@@ -800,7 +806,7 @@ pub async fn offboarding(State(app): State<AppState>, Extension(c): Extension<Ca
         Some("self")
     } else if m.role == OWNER && me.role != OWNER {
         Some("owner")
-    } else if !manages(&me.role) && !plain(&m) {
+    } else if !manages(&me.role) && !delegable(&u, &m) {
         Some("admin")
     } else {
         None

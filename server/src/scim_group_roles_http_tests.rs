@@ -321,6 +321,38 @@ async fn leaving_by_hand_and_unlinking_take_the_role_away_too() {
 }
 
 #[tokio::test]
+async fn a_mapped_team_role_takes_off_plain_members_but_never_a_server_admin() {
+    let (port, app, admin) = serve(true).await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    let lead = person(port, &t, "lead@example.com").await;
+    let adm = person(port, &t, "adm@example.com").await;
+    let wide = person(port, &t, "wide@example.com").await;
+    let mem = person(port, &t, "mem@example.com").await;
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{adm}"), &admin, r#"{"role":"admin"}"#).await.0, 200);
+    let viewer = role(port, &admin, "Viewer", "member", &["audit.view"]).await;
+    assert_eq!(call(port, "PUT", &format!("/api/roles/{viewer}/users/{wide}"), &admin, "").await.0, 200);
+    let team = group(port, &t, "Support", &[&lead]).await;
+    let r = role(port, &admin, "Team lead", "member", &["users.manage"]).await;
+    let (code, m) = map(port, &admin, json!({ "team": team, "role": r })).await;
+    assert_eq!((code, m["granted"].clone()), (201, json!([lead])), "{m}");
+    // Put on the team by hand, so the group gives them nothing: plain members, all three.
+    for u in [&adm, &wide, &mem] {
+        assert_eq!(call(port, "PUT", &format!("/api/teams/{team}/members/{u}"), &admin, "{}").await.0, 200);
+        assert_eq!(team_role(&app, u), None);
+    }
+
+    let auth = crate::scim_http_tests::session_for(port, &admin, &lead).await;
+    for u in [&adm, &wide] {
+        let (_, v) = json_call(port, "GET", &format!("/api/team/members/{u}/offboarding"), &auth, "").await;
+        assert_eq!(v["blocked"], "admin", "{v}");
+        assert_eq!(call(port, "DELETE", &format!("/api/team/members/{u}"), &auth, "").await.0, 403, "a team role reaches no server admin, nor a server-wide role");
+        assert_eq!(app.db.team_member(u).map(|m| m.team_id), Some(team.clone()));
+    }
+    assert_eq!(call(port, "DELETE", &format!("/api/team/members/{mem}"), &auth, "").await.0, 200);
+    assert!(app.db.team_member(&mem).is_none());
+}
+
+#[tokio::test]
 async fn a_scim_delete_takes_mapped_roles_away_with_group_roles_turned_off() {
     let (port, app, admin, _) = serve_app_with(|a| a.scim.enabled = true).await;
     let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;

@@ -16,7 +16,7 @@ Letting the IdP name roles is where admin escalation hides: whoever can edit a g
 
 An admin maps one tenant's group to one custom role (ADR 0123), in one scope:
 
-- **team** (the default): the role within the team the group is (ADR 0095). Only its team permissions apply, as for any team role.
+- **team** (the default): the role within the team the group is (ADR 0095). Only its team permissions apply, as for any team role. With `users.manage` its holders can take plain members off the team, but never a server admin, the owner account, or anyone with a custom role across the server, whom the tenant may not manage.
 - **org**: the role across the server. Its base becomes the person's built-in role, as when an admin gives it.
 
 A group has at most one mapping per scope (`UNIQUE(team_id, scope)`), since a person holds one custom role per scope. Mappings are per tenant: a group belongs to one tenant, and the mapping records it.
