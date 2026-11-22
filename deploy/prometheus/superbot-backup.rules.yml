@@ -6,7 +6,8 @@
 # Check it with: promtool check rules superbot-backup.rules.yml
 #                promtool test rules superbot-backup.rules.test.yml
 #
-# It assumes the scrape job is named "superbot" (as in deploy/README.md). botd pages its
+# It assumes the scrape job is named "superbot" (as in deploy/README.md), and alerts per
+# instance, so one server that copies never hides another that doesn't. botd pages its
 # own notifier on an RPO breach too (server.backup_rpo_breached); these rules are for
 # operators who alert from Prometheus. `botctl backups` shows what botd sees.
 
@@ -15,7 +16,7 @@ groups:
     rules:
       # No store is set, or SERVER_BACKUP_OFF_HOST=off: losing the host loses the backups.
       - alert: SuperBotServerBackupsOnHost
-        expr: max by (job) (superbot_server_backup_off_host{job="superbot"}) == 0
+        expr: max by (job, instance) (superbot_server_backup_off_host{job="superbot"}) == 0
         for: 1h
         labels:
           severity: ticket
@@ -25,7 +26,7 @@ groups:
 
       # The newest archive off the host is older than SERVER_BACKUP_RPO_HOURS.
       - alert: SuperBotServerBackupPastRPO
-        expr: max by (job) (superbot_server_backup_past_rpo{job="superbot"}) == 1
+        expr: max by (job, instance) (superbot_server_backup_past_rpo{job="superbot"}) == 1
         labels:
           severity: page
         annotations:
@@ -34,7 +35,7 @@ groups:
 
       # Copies keep failing: each is retried every 30 minutes.
       - alert: SuperBotServerBackupCopyFailing
-        expr: sum by (job) (increase(superbot_events_total{job="superbot",event="server.backup_copy_failed"}[2h])) >= 2
+        expr: sum by (job, instance) (increase(superbot_events_total{job="superbot",event="server.backup_copy_failed"}[2h])) >= 2
         labels:
           severity: ticket
         annotations:
