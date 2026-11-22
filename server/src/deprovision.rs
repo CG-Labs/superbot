@@ -28,7 +28,7 @@ fn disabled(app: &AppState, user_id: &str) -> bool {
 }
 
 /// `user_id` was just disabled (`via`): stops their Bots' work and the work on others'
-/// Bots for them, and powers their machine off. Recorded as `user.deprovisioned` with
+/// Bots for them or their service accounts, and powers their machine off. Recorded as `user.deprovisioned` with
 /// what it stopped. Safe to call again: what is already stopped or off is left alone.
 pub async fn user_disabled(app: &AppState, by: &Who, user_id: &str, via: &str) -> Value {
     let mut stopped = Vec::new();
@@ -38,7 +38,15 @@ pub async fn user_disabled(app: &AppState, by: &Who, user_id: &str, via: &str) -
             stopped.push(b.id);
         }
     }
-    let for_them: Vec<String> = app.stop_for_user(user_id).into_iter().filter(|id| !stopped.contains(id)).collect();
+    // Their service accounts' tokens are refused from now on (ADR 0143), so the work
+    // those accounts asked for stops with theirs.
+    let accounts = app.db.service_accounts().into_iter().filter(|s| s.owner_id == user_id && s.deleted_at.is_none()).map(|s| s.user.id);
+    let mut for_them: Vec<String> = Vec::new();
+    for id in std::iter::once(user_id.to_string()).chain(accounts).flat_map(|u| app.stop_for_user(&u)) {
+        if !stopped.contains(&id) && !for_them.contains(&id) {
+            for_them.push(id);
+        }
+    }
     let machine = suspend(app, by, user_id, via).await;
     let details = json!({ "via": via, "botsStopped": stopped, "runsForThemStopped": for_them, "machine": machine });
     app.db.record(&by.event("user.deprovisioned").target("user", user_id).details(details.clone()));

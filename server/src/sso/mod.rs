@@ -25,6 +25,7 @@ mod saml;
 pub(crate) mod saml_slo;
 pub(crate) mod saml_sp;
 pub(crate) mod xmldsig;
+pub(crate) mod xmlenc;
 
 use crate::audit::{Actor, ActorKind, Event, Outcome, Source, Who};
 use crate::db::{self, Identity, JitError, NewIdentity, User};
@@ -40,7 +41,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use provider::Claims;
 pub use provider::{ClaimMap, ENTRA_AUTHORITY, GOOGLE_ISSUER, IdpSource, Kind, Provider, domain, guid, secure_url};
-use saml_sp::{Refused, Sp, SpKey, SpSigning};
+use saml_sp::{Encryption, KeyUse, Refused, Sp, SpKey, SpSigning};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -377,7 +378,7 @@ const TYPES: [&str; 6] = ["entra", "google", "oidc", "apple", "github", "saml"];
 
 /// Settings that only mean something for some types. Set on another, they would look like
 /// a restriction that isn't there, so they are refused.
-const ONLY_FOR: [(&str, &[&str]); 22] = [
+const ONLY_FOR: [(&str, &[&str]); 24] = [
     ("TENANT", &["entra"]),
     ("ALLOWED_TENANTS", &["entra"]),
     ("AUTHORITY", &["entra"]),
@@ -400,11 +401,13 @@ const ONLY_FOR: [(&str, &[&str]); 22] = [
     ("NAME_ATTRIBUTE", &["saml"]),
     ("SIGN_REQUESTS", &["saml"]),
     ("SP_CERT_FILE", &["saml"]),
+    ("ENCRYPTED_ASSERTIONS", &["saml"]),
+    ("SP_ENCRYPTION_CERT_FILE", &["saml"]),
 ];
 
 /// The SAML bridge's settings (with `ISSUER`), and native SAML's (without), so each refuses the other's.
 const SAML_BRIDGE_ONLY: [&str; 6] = ["CLIENT_ID", "IDP_ALIAS", "SCOPES", "SUBJECT_CLAIM", "EMAIL_CLAIM", "NAME_CLAIM"];
-const SAML_NATIVE_ONLY: [&str; 7] = ["IDP_METADATA_URL", "IDP_METADATA_FILE", "SP_ENTITY_ID", "EMAIL_ATTRIBUTE", "NAME_ATTRIBUTE", "SIGN_REQUESTS", "SP_CERT_FILE"];
+const SAML_NATIVE_ONLY: [&str; 9] = ["IDP_METADATA_URL", "IDP_METADATA_FILE", "SP_ENTITY_ID", "EMAIL_ATTRIBUTE", "NAME_ATTRIBUTE", "SIGN_REQUESTS", "SP_CERT_FILE", "ENCRYPTED_ASSERTIONS", "SP_ENCRYPTION_CERT_FILE"];
 
 /// Claims people or their admins can change, so they can't be the subject.
 const MUTABLE_CLAIMS: [&str; 9] = ["email", "preferred_username", "upn", "unique_name", "name", "nickname", "given_name", "family_name", "phone_number"];
@@ -535,16 +538,29 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
                 Some(_) => return Err(format!("{} must be true or false", key("SIGN_REQUESTS"))),
             };
             // The key itself is a secret, read when used; its certificate is checked now.
-            let sp_cert = match var(&key("SP_CERT_FILE")) {
-                Some(path) => {
-                    let pem = std::fs::read_to_string(&path).map_err(|e| format!("{}: {path}: {e}", key("SP_CERT_FILE")))?;
-                    let body = saml_sp::pem_body(&pem);
-                    xmldsig::Cert::from_base64(&body).map_err(|e| format!("{}: {e}", key("SP_CERT_FILE")))?;
-                    Some(body)
-                }
-                None => None,
+            let cert_file = |k: &str| -> Result<Option<String>, String> {
+                let Some(path) = var(&key(k)) else { return Ok(None) };
+                let pem = std::fs::read_to_string(&path).map_err(|e| format!("{}: {path}: {e}", key(k)))?;
+                let body = saml_sp::pem_body(&pem);
+                xmldsig::Cert::from_base64(&body).map_err(|e| format!("{}: {e}", key(k)))?;
+                Ok(Some(body))
             };
-            (Kind::SamlSp { entity_id, sp_entity_id, source, attributes, allowed_domains, sign_requests, sp_cert }, saml::LABEL)
+            let sp_cert = cert_file("SP_CERT_FILE")?;
+            let encryption = match var(&key("ENCRYPTED_ASSERTIONS")) {
+                None => Encryption::Off,
+                Some(v) => Encryption::parse(&v).ok_or_else(|| format!("{} must be off, allow, or require", key("ENCRYPTED_ASSERTIONS")))?,
+            };
+            let enc_cert = cert_file("SP_ENCRYPTION_CERT_FILE")?;
+            if encryption == Encryption::Off && enc_cert.is_some() {
+                return Err(format!("{} is only for {}=allow or require", key("SP_ENCRYPTION_CERT_FILE"), key("ENCRYPTED_ASSERTIONS")));
+            }
+            let same_key = |a: &str, b: &str| matches!((xmldsig::Cert::from_base64(a), xmldsig::Cert::from_base64(b)), (Ok(a), Ok(b)) if a.same_key(&b));
+            if let (Some(e), Some(s)) = (&enc_cert, &sp_cert)
+                && same_key(e, s)
+            {
+                return Err(format!("{} must be another key than {}: one key for signing, another for encryption", key("SP_ENCRYPTION_CERT_FILE"), key("SP_CERT_FILE")));
+            }
+            (Kind::SamlSp { entity_id, sp_entity_id, source, attributes, allowed_domains, sign_requests, sp_cert, encryption, enc_cert }, saml::LABEL)
         }
         "saml" => {
             if let Some(k) = SAML_NATIVE_ONLY.iter().find(|k| var(&key(k)).is_some()) {
@@ -648,7 +664,7 @@ pub(crate) fn idp_type(a: &Auth, provider: &str) -> Option<&'static str> {
 
 /// Failures anyone can cause without the IdP's help, by opening a callback URL.
 /// Native SAML's are the ones before the IdP's signature was checked.
-const UNVOUCHED: [&str; 14] = [
+const UNVOUCHED: [&str; 18] = [
     "unknown_state",
     "wrong_provider",
     "binder_mismatch",
@@ -658,6 +674,10 @@ const UNVOUCHED: [&str; 14] = [
     "bad_response",
     "missing_assertion",
     "encrypted_assertion",
+    "unencrypted_assertion",
+    "bad_encryption",
+    "weak_key_transport",
+    "no_sp_key",
     "unsigned",
     "bad_signature",
     "wrapped",
@@ -968,11 +988,30 @@ async fn finish_saml(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, f
             return ret.fail("sso_failed");
         }
     };
-    let Kind::SamlSp { sp_entity_id, attributes, .. } = &p.kind else {
+    let Kind::SamlSp { sp_entity_id, attributes, encryption, .. } = &p.kind else {
         return ret.fail("sso_failed");
     };
+    let decrypt = match encryption {
+        Encryption::Off => None,
+        _ => match sp_encryption_key(app, p) {
+            Ok(k) => Some(k),
+            Err(e) => {
+                crate::obs::log::log_warn!("SSO {id}: can't decrypt assertions: {e}");
+                failed(a, source, id, "no_sp_key", None, json!({}));
+                return ret.fail("sso_failed");
+            }
+        },
+    };
     let acs = sso.acs_url(id);
-    let expect = saml_sp::Expect { sp: Sp { entity_id: sp_entity_id, acs: &acs }, idp: &idp, request_id: &pending.nonce, attributes, now_ms: at };
+    let expect = saml_sp::Expect {
+        sp: Sp { entity_id: sp_entity_id, acs: &acs },
+        idp: &idp,
+        request_id: &pending.nonce,
+        attributes,
+        now_ms: at,
+        decrypt: decrypt.as_deref(),
+        require_encrypted: *encryption == Encryption::Require,
+    };
     let checked = match saml_sp::check_response(posted, &expect) {
         Ok(c) => c,
         Err(Refused(reason, status)) => {
@@ -1004,45 +1043,77 @@ pub async fn saml_metadata(Extension(a): Extension<Arc<Auth>>, Path(id): Path<St
     let Some(p) = a.sso.provider(&id).filter(|p| p.saml_sp()) else {
         return not_found("SAML provider").into_response();
     };
-    let Kind::SamlSp { sp_entity_id, sign_requests, .. } = &p.kind else {
+    let Kind::SamlSp { sp_entity_id, sign_requests, encryption, .. } = &p.kind else {
         return not_found("SAML provider").into_response();
     };
     let key = a.app.as_ref().and_then(|app| sp_key(app, p).map_err(|e| crate::obs::log::log_warn!("SSO {id}: no SP key for the metadata: {e}")).ok());
+    let enc = match (encryption, a.app.as_ref()) {
+        (Encryption::Off, _) | (_, None) => None,
+        (_, Some(app)) => sp_encryption_key(app, p).map_err(|e| crate::obs::log::log_warn!("SSO {id}: no SP encryption key for the metadata: {e}")).ok(),
+    };
     let (acs, slo) = (a.sso.acs_url(&id), a.sso.slo_url(&id));
     let signing = key.as_ref().map(|k| SpSigning { cert: &k.cert, slo: &slo, sign_requests: *sign_requests });
-    ([(header::CONTENT_TYPE, "application/samlmetadata+xml")], saml_sp::sp_metadata(&Sp { entity_id: sp_entity_id, acs: &acs }, signing.as_ref())).into_response()
+    let md = saml_sp::sp_metadata(&Sp { entity_id: sp_entity_id, acs: &acs }, signing.as_ref(), enc.as_ref().map(|k| k.cert.as_str()));
+    ([(header::CONTENT_TYPE, "application/samlmetadata+xml")], md).into_response()
 }
 
 // Native SAML: our key and single logout (ADR 0137)
 
-/// A native SAML provider's SP key: `SSO_<ID>_PRIVATE_KEY` with `SP_CERT_FILE`, else made
-/// once and kept sealed in settings, so the certificate in our metadata stays the same.
+/// A native SAML provider's SP signing key: `SSO_<ID>_PRIVATE_KEY` with `SP_CERT_FILE`, else
+/// made once and kept sealed in settings, so the certificate in our metadata stays the same.
 fn sp_key(app: &AppState, p: &Provider) -> Result<Arc<SpKey>, String> {
-    let Kind::SamlSp { sp_cert, .. } = &p.kind else { return Err("not a native SAML provider".into()) };
-    if sp_cert.is_some() {
-        return p.configured_sp_key();
+    sp_key_for(app, p, KeyUse::Signing)
+}
+
+/// The same for its encryption key (ADR 0150): `SSO_<ID>_ENCRYPTION_PRIVATE_KEY` with
+/// `SP_ENCRYPTION_CERT_FILE`, else made once and kept like the signing key, beside it.
+fn sp_encryption_key(app: &AppState, p: &Provider) -> Result<Arc<SpKey>, String> {
+    sp_key_for(app, p, KeyUse::Encryption)
+}
+
+fn sp_key_for(app: &AppState, p: &Provider, u: KeyUse) -> Result<Arc<SpKey>, String> {
+    if !p.saml_sp() {
+        return Err("not a native SAML provider".into());
     }
-    let mut held = p.sp_key.lock().unwrap_or_else(|e| e.into_inner());
+    if p.sp_cert_for(u).is_some() {
+        return p.configured_sp_key(u);
+    }
+    let mut held = p.sp_key_slot(u).lock().unwrap_or_else(|e| e.into_inner());
     if let Some(k) = held.as_ref() {
         return Ok(k.clone());
     }
-    let key = Arc::new(generated_sp_key(app, p)?);
+    let key = Arc::new(generated_sp_key(app, p, u)?);
     *held = Some(key.clone());
     Ok(key)
 }
 
-fn generated_sp_key(app: &AppState, p: &Provider) -> Result<SpKey, String> {
-    let (key_name, cert_name) = (format!("{SP_KEY_SETTING}{}", p.id), format!("{SP_CERT_SETTING}{}", p.id));
+/// The settings a generated key and its certificate are kept in. The encryption key's are the
+/// signing key's with `_encryption` after the id (ids have no `_`), so sealing, rotation and
+/// `SUPERBOT_FORGET_SEALED` treat both alike.
+pub(crate) fn sp_key_settings(provider: &str, u: KeyUse) -> (String, String) {
+    let suffix = match u {
+        KeyUse::Signing => "",
+        KeyUse::Encryption => "_encryption",
+    };
+    (format!("{SP_KEY_SETTING}{provider}{suffix}"), format!("{SP_CERT_SETTING}{provider}{suffix}"))
+}
+
+fn generated_sp_key(app: &AppState, p: &Provider, u: KeyUse) -> Result<SpKey, String> {
+    let (key_name, cert_name) = sp_key_settings(&p.id, u);
     let context = crate::secrets::sealed::setting_context(&key_name);
     let cipher = crate::secrets::sealed::cipher();
     if let (Some(sealed), Some(cert)) = (app.db.setting(&key_name), app.db.setting(&cert_name)) {
-        let der = cipher.open(&context, &sealed).map_err(|e| format!("the generated SP key: {e}"))?;
+        let der = cipher.open(&context, &sealed).map_err(|e| format!("the generated SP {} key: {e}", u.as_str()))?;
         return SpKey::from_der(&der, &cert);
     }
-    let (key, der) = SpKey::generate(&format!("SuperBot SAML SP ({})", p.id))?;
+    let subject = match u {
+        KeyUse::Signing => format!("SuperBot SAML SP ({})", p.id),
+        KeyUse::Encryption => format!("SuperBot SAML SP encryption ({})", p.id),
+    };
+    let (key, der) = SpKey::generate(&subject)?;
     app.db.set_setting(&key_name, &cipher.seal(&context, &der));
     app.db.set_setting(&cert_name, &key.cert);
-    let details = json!({ "provider": p.id, "certificate": key.info.sha256, "notAfter": key.info.not_after * 1000 });
+    let details = json!({ "provider": p.id, "use": u.as_str(), "certificate": key.info.sha256, "notAfter": key.info.not_after * 1000 });
     app.db.record(&Event::new(Actor::system("sso"), "sso.saml_sp_key_created").target("sso_provider", &p.id).details(details));
     Ok(key)
 }
@@ -1179,7 +1250,7 @@ fn saml_provider<'a>(a: &'a Auth, id: &str) -> Result<&'a Arc<Provider>, ApiErro
 }
 
 fn saml_view(a: &Auth, p: &Provider) -> Value {
-    let Kind::SamlSp { entity_id, sp_entity_id, source, sign_requests, sp_cert, .. } = &p.kind else {
+    let Kind::SamlSp { entity_id, sp_entity_id, source, sign_requests, sp_cert, encryption, enc_cert, .. } = &p.kind else {
         return json!({});
     };
     let cert = |c: &xmldsig::Cert| json!({ "sha256": c.sha256, "subject": c.subject, "notAfter": c.not_after * 1000 });
@@ -1193,6 +1264,13 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
         Some(Err(e)) => json!({ "problem": e }),
         None => Value::Null,
     };
+    let enc_key = match (encryption, a.app.as_ref()) {
+        (Encryption::Off, _) | (_, None) => Value::Null,
+        (_, Some(app)) => match sp_encryption_key(app, p) {
+            Ok(k) => json!({ "certificate": cert(&k.info), "from": if enc_cert.is_some() { "secret" } else { "generated" } }),
+            Err(e) => json!({ "problem": e }),
+        },
+    };
     let slo = p.idp_loaded().is_some_and(|m| m.slo.is_some()) && matches!(key, Some(Ok(_)));
     let from = match source {
         IdpSource::Url(u) => Some(u.clone()),
@@ -1203,6 +1281,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
         "provider": p.id, "label": p.label, "ready": p.ready(), "problem": p.not_ready(),
         "spEntityId": sp_entity_id, "acsUrl": a.sso.acs_url(&p.id), "metadataUrl": a.sso.sp_metadata_url(&p.id),
         "sloUrl": a.sso.slo_url(&p.id), "signRequests": sign_requests, "spKey": sp_key, "singleLogout": slo,
+        "encryptedAssertions": encryption.as_str(), "spEncryptionKey": enc_key,
         "idpEntityId": entity_id, "source": source.name(), "from": from, "idp": idp,
         "audience": p.audience(), "jitRole": p.jit_role.map(Role::as_str),
     })
@@ -1744,7 +1823,7 @@ mod tests {
         let p = s.provider("corp").unwrap();
         assert!(p.saml_sp() && !p.oidc() && !p.needs_secret());
         assert_eq!((p.type_name(), p.jit_role), ("saml", None), "audited as idp=saml, like the bridge");
-        assert!(matches!(&p.kind, Kind::SamlSp { entity_id, sp_entity_id, source: IdpSource::Saved, attributes, allowed_domains, sign_requests: false, sp_cert: None }
+        assert!(matches!(&p.kind, Kind::SamlSp { entity_id, sp_entity_id, source: IdpSource::Saved, attributes, allowed_domains, sign_requests: false, sp_cert: None, encryption: Encryption::Off, enc_cert: None }
             if entity_id == ADFS && sp_entity_id == "https://bot.example.com/api/auth/sso/corp/metadata" && attributes.email.is_none() && allowed_domains.is_empty()));
         assert_eq!((p.env_var(), s.slo_url("corp")), ("SSO_CORP_PRIVATE_KEY".to_string(), "https://bot.example.com/api/auth/sso/corp/slo".to_string()));
         assert_eq!(s.callback_url("corp"), "https://bot.example.com/api/auth/sso/corp/acs");
@@ -1832,7 +1911,78 @@ mod tests {
         let p = &s.providers[0];
         crate::secrets::global().put(var("PRIVATE_KEY"), &pem(&der)).unwrap();
         assert_eq!(p.not_ready(), None);
-        assert_eq!(p.configured_sp_key().unwrap().info.sha256, mine.info.sha256);
+        assert_eq!(p.configured_sp_key(KeyUse::Signing).unwrap().info.sha256, mine.info.sha256);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reads_the_encrypted_assertion_settings() {
+        assert!(matches!(&native(&[]).unwrap().providers[0].kind, Kind::SamlSp { encryption: Encryption::Off, enc_cert: None, .. }), "off unless asked");
+        for (v, want) in [("allow", Encryption::Allow), ("REQUIRE", Encryption::Require), ("off", Encryption::Off)] {
+            let s = native(&[("SSO_CORP_ENCRYPTED_ASSERTIONS", v)]).unwrap();
+            assert!(matches!(&s.providers[0].kind, Kind::SamlSp { encryption, enc_cert: None, .. } if *encryption == want), "{v}");
+        }
+        assert!(native(&[("SSO_CORP_ENCRYPTED_ASSERTIONS", "true")]).err().unwrap().contains("off, allow, or require"));
+        assert!(saml(&[("SSO_ADFS_ENCRYPTED_ASSERTIONS", "allow")]).is_err(), "the bridge decrypts in Keycloak");
+
+        let dir = std::env::temp_dir().join(format!("superbot-sp-enc-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sign, _) = SpKey::generate("sign").unwrap();
+        let (enc, enc_der) = SpKey::generate("enc").unwrap();
+        let (sign_pem, enc_pem) = (dir.join("sign.pem"), dir.join("enc.pem"));
+        let write = |p: &std::path::Path, k: &SpKey| std::fs::write(p, format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", k.cert)).unwrap();
+        write(&sign_pem, &sign);
+        write(&enc_pem, &enc);
+        let leak = |p: &std::path::Path| -> &'static str { Box::leak(p.to_string_lossy().into_owned().into_boxed_str()) };
+        let err = native(&[("SSO_CORP_SP_ENCRYPTION_CERT_FILE", leak(&enc_pem))]).err().unwrap();
+        assert!(err.contains("only for SSO_CORP_ENCRYPTED_ASSERTIONS=allow or require"), "{err}");
+        let err = native(&[("SSO_CORP_ENCRYPTED_ASSERTIONS", "allow"), ("SSO_CORP_SP_CERT_FILE", leak(&sign_pem)), ("SSO_CORP_SP_ENCRYPTION_CERT_FILE", leak(&sign_pem))]).err().unwrap();
+        assert!(err.contains("one key for signing, another for encryption"), "{err}");
+        // Another certificate, but for the signing certificate's key: still one key.
+        let (_, sign_der) = SpKey::generate("sign").unwrap();
+        let reissue = |cn: &str| {
+            let kp = rcgen::KeyPair::try_from(sign_der.as_slice()).unwrap();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.distinguished_name.push(rcgen::DnType::CommonName, cn);
+            format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", base64::engine::general_purpose::STANDARD.encode(params.self_signed(&kp).unwrap().der()))
+        };
+        let (first, second) = (dir.join("first.pem"), dir.join("second.pem"));
+        std::fs::write(&first, reissue("signing")).unwrap();
+        std::fs::write(&second, reissue("encryption")).unwrap();
+        assert_ne!(std::fs::read(&first).unwrap(), std::fs::read(&second).unwrap());
+        let err = native(&[("SSO_CORP_ENCRYPTED_ASSERTIONS", "allow"), ("SSO_CORP_SP_CERT_FILE", leak(&first)), ("SSO_CORP_SP_ENCRYPTION_CERT_FILE", leak(&second))]).err().unwrap();
+        assert!(err.contains("one key for signing, another for encryption"), "{err}");
+        assert!(native(&[("SSO_CORP_ENCRYPTED_ASSERTIONS", "allow"), ("SSO_CORP_SP_CERT_FILE", leak(&sign_pem)), ("SSO_CORP_SP_ENCRYPTION_CERT_FILE", leak(&enc_pem))]).is_ok(), "two keys");
+        assert!(native(&[("SSO_CORP_ENCRYPTED_ASSERTIONS", "allow"), ("SSO_CORP_SP_ENCRYPTION_CERT_FILE", "/nonexistent/enc.pem")]).is_err());
+
+        // Its own key, as its own secret: not offered until that is set and matches.
+        let id = format!("enc{}", random_hex());
+        let up = id.to_ascii_uppercase();
+        let var = |k: &str| -> &'static str { Box::leak(format!("SSO_{up}_{k}").into_boxed_str()) };
+        let vars = [
+            ("SSO_PROVIDERS", leak(std::path::Path::new(&id))),
+            ("SSO_PUBLIC_URL", "https://bot.example.com"),
+            (var("TYPE"), "saml"),
+            (var("IDP_ENTITY_ID"), ADFS),
+            (var("IDP_METADATA_URL"), "https://idp.example/metadata"),
+            (var("ENCRYPTED_ASSERTIONS"), "require"),
+            (var("SP_ENCRYPTION_CERT_FILE"), leak(&enc_pem)),
+        ];
+        let s = parse(&vars).unwrap();
+        let p = &s.providers[0];
+        assert_eq!(p.sp_key_var(KeyUse::Encryption), format!("SSO_{up}_ENCRYPTION_PRIVATE_KEY"));
+        assert!(p.not_ready().is_some_and(|n| n.contains("ENCRYPTION_PRIVATE_KEY") && n.contains("SP_ENCRYPTION_CERT_FILE")), "{:?}", p.not_ready());
+        assert!(crate::secrets::server_secret(var("ENCRYPTION_PRIVATE_KEY")), "kept as a server secret, never in a bot's environment");
+        let pem = |der: &[u8]| rcgen::KeyPair::try_from(der).unwrap().serialize_pem();
+        let (_, other) = SpKey::generate("other").unwrap();
+        crate::secrets::global().put(var("ENCRYPTION_PRIVATE_KEY"), &pem(&other)).unwrap();
+        assert!(p.not_ready().is_some_and(|n| n.contains("isn't for the SP key")), "{:?}", p.not_ready());
+        let s = parse(&vars).unwrap();
+        let p = &s.providers[0];
+        crate::secrets::global().put(var("ENCRYPTION_PRIVATE_KEY"), &pem(&enc_der)).unwrap();
+        assert_eq!(p.not_ready(), None);
+        assert_eq!(p.configured_sp_key(KeyUse::Encryption).unwrap().info.sha256, enc.info.sha256);
+        assert!(p.configured_sp_key(KeyUse::Signing).is_err(), "the signing key is botd's own here");
         let _ = std::fs::remove_dir_all(dir);
     }
 

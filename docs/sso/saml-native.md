@@ -1,6 +1,6 @@
 # Sign in with SAML 2.0 (Okta, Microsoft Entra ID, ADFS, OneLogin, …)
 
-SuperBot is the SAML service provider (SP) itself: your IdP posts its signed answer straight to SuperBot, which checks the signature against the IdP's certificate and the audience, recipient, time and request it answers ([ADR 0127](../adr/0127-native-saml-service-provider.md)). There is nothing else to run. People land on the same users as with any other provider. If your IdP also speaks OpenID Connect, [OIDC](oidc.md) works just as well; the [Keycloak bridge](saml.md) remains for IdPs that need encrypted assertions or signed requests.
+SuperBot is the SAML service provider (SP) itself: your IdP posts its signed answer straight to SuperBot, which checks the signature against the IdP's certificate and the audience, recipient, time and request it answers ([ADR 0127](../adr/0127-native-saml-service-provider.md)). There is nothing else to run. People land on the same users as with any other provider. If your IdP also speaks OpenID Connect, [OIDC](oidc.md) works just as well; the [Keycloak bridge](saml.md) remains for IdPs that can only encrypt assertions with AES-CBC (Entra ID and ADFS do), if you must encrypt there.
 
 ```
 browser ──► SuperBot ──AuthnRequest──► Okta / Entra ID / ADFS
@@ -33,6 +33,7 @@ Acme (corp): ready
   SP metadata:              https://superbot.example.com/api/auth/sso/corp/metadata
   IdP entity ID:            http://www.okta.com/exk1abc
   SP signing certificate:   SHA-256 9c:02:… (generated), expires 2046-11-21
+  Encrypted assertions:     off
   Signs AuthnRequests:      no
   Single logout:            yes
   IdP metadata from url (https://acme.okta.example/app/exk1abc/sso/saml/metadata):
@@ -58,7 +59,7 @@ Whatever the IdP:
 - **ACS URL** (reply URL, single sign-on URL) and **Recipient/Destination**: the ACS URL above.
 - **Audience** (SP entity ID, identifier): the SP entity ID above.
 - **NameID**: **persistent**, from an id that never changes or moves to another person: not an email, UPN or username. SuperBot links people by it.
-- **Sign the assertion** with RSA-SHA256 (signing the response as well is fine). Don't encrypt it.
+- **Sign the assertion** with RSA-SHA256 (signing the response as well is fine). Leave it unencrypted unless you [turn encryption on](#encrypted-assertions) at both ends.
 - An **email** attribute, and a display name if you like.
 - Only the people who should use SuperBot assigned to the app, and **MFA required** ([below](#require-mfa-at-the-idp)).
 
@@ -67,7 +68,7 @@ Whatever the IdP:
 1. **Applications → Create App Integration → SAML 2.0**, named SuperBot.
 2. **Single sign-on URL**: the ACS URL, with **Use this for Recipient URL and Destination URL** on. **Audience URI (SP Entity ID)**: the SP entity ID.
 3. **Name ID format**: **Persistent**. **Application username**: **Custom**, `user.getInternalProperty("id")`: the Okta user id (`00u…`), which never changes.
-4. **Show Advanced Settings**: **Response** Signed, **Assertion Signature** Signed, **Signature Algorithm** RSA-SHA256, **Assertion Encryption** Unencrypted.
+4. **Show Advanced Settings**: **Response** Signed, **Assertion Signature** Signed, **Signature Algorithm** RSA-SHA256, **Assertion Encryption** Unencrypted (or Encrypted, [below](#encrypted-assertions)).
 5. **Attribute Statements**: `email` → `user.email`, `displayName` → `user.displayName`.
 6. **Assignments**: only the people or groups who should use SuperBot.
 
@@ -79,7 +80,7 @@ On the app's **Sign On** tab, the **Metadata URL** is `SSO_CORP_IDP_METADATA_URL
 2. **Single sign-on → SAML → Basic SAML Configuration**: **Identifier (Entity ID)** the SP entity ID, **Reply URL (Assertion Consumer Service URL)** the ACS URL. Leave the sign-on and relay state URLs empty; the **Logout Url** is the SLO URL if you want [single logout](#single-logout).
 3. **Attributes & Claims → Unique User Identifier (Name ID)**: **Name identifier format** Persistent, **Source attribute** `user.objectid`. The default (`user.userprincipalname`) can change and move to someone else.
 4. Keep the default claims: Entra sends the email as `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress` (from `user.mail`) and the name as `http://schemas.microsoft.com/identity/claims/displayname`, which SuperBot reads without settings.
-5. **SAML Certificates**: **Signing Option** Sign SAML assertion (or Sign SAML response and assertion), **Signing Algorithm** SHA-256. Leave **Token encryption** off.
+5. **SAML Certificates**: **Signing Option** Sign SAML assertion (or Sign SAML response and assertion), **Signing Algorithm** SHA-256. Leave **Token encryption** off: Entra ID encrypts with AES-CBC, which SuperBot refuses.
 6. **Properties → Assignment required?** Yes, then **Users and groups**: only those who should use SuperBot.
 
 Under **SAML Certificates**, the **App Federation Metadata Url** is `SSO_CORP_IDP_METADATA_URL`. Under **Set up SuperBot**, the **Microsoft Entra Identifier** (`https://sts.windows.net/<tenant-id>/`) is `SSO_CORP_IDP_ENTITY_ID`.
@@ -124,6 +125,9 @@ People disabled in SuperBot, by an admin or by SCIM deprovisioning ([SCIM](scim.
 | `SSO_<ID>_SIGN_REQUESTS` | `false` | `true`: sign AuthnRequests with the SP key ([below](#signed-authnrequests)). |
 | `SSO_<ID>_SP_CERT_FILE` | | Your own SP certificate (PEM), with its key as `SSO_<ID>_PRIVATE_KEY`. Without it, botd makes and keeps one. |
 | `SSO_<ID>_PRIVATE_KEY` | | With `SP_CERT_FILE`: the SP's private key (PKCS #8 PEM), as env, `_FILE`, or `botctl secret set`. |
+| `SSO_<ID>_ENCRYPTED_ASSERTIONS` | `off` | `allow`: take encrypted assertions as well as plain ones; `require`: only encrypted ones ([below](#encrypted-assertions)). `off` refuses them. |
+| `SSO_<ID>_SP_ENCRYPTION_CERT_FILE` | | With `allow` or `require`: your own encryption certificate (PEM), another key than the signing one, with its key as `SSO_<ID>_ENCRYPTION_PRIVATE_KEY`. Without it, botd makes and keeps one. |
+| `SSO_<ID>_ENCRYPTION_PRIVATE_KEY` | | With `SP_ENCRYPTION_CERT_FILE`: its private key (PKCS #8 PEM), as env, `_FILE`, or `botctl secret set`. |
 
 The bridge's settings (`CLIENT_ID`, `IDP_ALIAS`, `SCOPES`, `*_CLAIM`) are refused on a native provider, and the native ones on a bridge provider, so a provider is never half of each. There is no client secret.
 
@@ -136,6 +140,24 @@ If your IdP imported SuperBot's metadata before this key existed, import it agai
 ## Signed AuthnRequests
 
 Most IdPs don't need them. If yours says it wants signed requests (`WantAuthnRequestsSigned="true"` in its metadata, which botd refuses otherwise), set `SSO_CORP_SIGN_REQUESTS=true` and restart: every AuthnRequest is then signed with RSA-SHA256 over the redirect URL, and the metadata says so. At the IdP, import SuperBot's metadata again or upload the SP certificate (Entra ID: **SAML Certificates → Verification certificates**, with **Require verification certificates** on; Okta: **Signature Certificate** under **Show Advanced Settings**).
+
+## Encrypted assertions
+
+Assertions travel through the browser over HTTPS, so most setups don't need them encrypted as well. If your policy wants it, SuperBot decrypts them ([ADR 0150](../adr/0150-saml-encrypted-assertions.md)):
+
+1. Set `SSO_CORP_ENCRYPTED_ASSERTIONS=allow` and restart. botd makes a second key for the provider, used only for decryption (RSA-3072, sealed in its database like the signing key, audited as `sso.saml_sp_key_created` with `use` = `encryption`), and publishes its certificate in the SP metadata as `<md:KeyDescriptor use="encryption">`, with the algorithms it takes. `botctl sso saml corp` shows its SHA-256.
+2. At the IdP, import SuperBot's metadata again, or upload that certificate, and turn encryption on with **AES-GCM** and **RSA-OAEP**. Okta: **Assertion Encryption** Encrypted, **Encryption Algorithm** AES256-GCM, **Key Transport Algorithm** RSA-OAEP, **Encryption Certificate** the one from the SP metadata.
+3. Once sign-ins work, set `SSO_CORP_ENCRYPTED_ASSERTIONS=require` so a plain assertion is refused.
+
+What botd takes and refuses:
+
+- **Content**: AES-128-GCM, AES-192-GCM, AES-256-GCM. AES-CBC and Triple DES are refused (`weak_algorithm`): unauthenticated, they allow padding-oracle attacks. Entra ID and ADFS only encrypt with AES-256-CBC, so leave encryption off for them.
+- **Key transport**: RSA-OAEP (`rsa-oaep-mgf1p`, or XML Encryption 1.1 `rsa-oaep` with SHA-1 to SHA-512). RSA PKCS #1 v1.5 is refused (`weak_key_transport`).
+- **Keys** come only from botd, never from the message. Several `EncryptedKey`s (as during an IdP certificate rollover) are fine; the one for botd's key is used.
+- **The IdP's signature still counts.** Anyone can encrypt to SuperBot's public certificate, so the assertion inside must be signed by the IdP, exactly as a plain one. A signature on the response is checked before anything is decrypted. The decrypted assertion goes through every other check: one assertion only, no assertion inside it, signatures only where they belong, IDs unique across the response and the assertion.
+- **Encrypted NameIDs** (`EncryptedID`) aren't supported (`encrypted_id`): encrypt the whole assertion instead.
+
+To use your own key, set `SSO_CORP_SP_ENCRYPTION_CERT_FILE=/etc/superbot/corp-enc.pem` and `botctl secret set SSO_CORP_ENCRYPTION_PRIVATE_KEY < corp-enc.key`. It must be another key than the signing one. The provider isn't offered until the key is set and matches. To change keys, give the IdP the new certificate first; botd decrypts only with the key it has.
 
 ## Single logout
 
@@ -159,8 +181,13 @@ Every refused sign-in is in the audit log with a reason (`botctl audit --action 
 | `not_linked` | Link the person, or turn on just in time. The event has the `subject` and the IdP's entity ID as `issuer`. |
 | `unsigned` | The IdP signs only the response, or nothing: sign the assertion. |
 | `bad_signature` | The IdP signed with a certificate botd doesn't have: refresh or import the metadata (`botctl sso saml <id>` shows the certificates in use). |
-| `weak_algorithm`, `bad_algorithm` | Use RSA-SHA256 (SHA-1 is refused). |
-| `encrypted_assertion` | Turn off assertion encryption, or use the bridge. |
+| `weak_algorithm`, `bad_algorithm` | Use RSA-SHA256 (SHA-1 is refused), and AES-GCM if you encrypt (AES-CBC is refused). |
+| `encrypted_assertion` | The IdP encrypts but `SSO_<ID>_ENCRYPTED_ASSERTIONS` is `off`: turn it on ([above](#encrypted-assertions)), or turn off encryption at the IdP. |
+| `unencrypted_assertion` | `ENCRYPTED_ASSERTIONS=require`, but the IdP sent a plain assertion: turn on encryption at the IdP. |
+| `bad_encryption` | botd couldn't decrypt: the IdP encrypts to another certificate (import SuperBot's metadata again), or the encrypted data is malformed. |
+| `weak_key_transport` | The IdP wraps the key with RSA PKCS #1 v1.5: choose RSA-OAEP. (AES-CBC content shows as `weak_algorithm`: choose AES-GCM.) |
+| `encrypted_id` | The IdP encrypts the NameID: encrypt the assertion instead. |
+| `no_sp_key` | botd has no decryption key: with `SP_ENCRYPTION_CERT_FILE`, set `SSO_<ID>_ENCRYPTION_PRIVATE_KEY` (`botctl sso saml <id>` shows the problem). |
 | `wrong_audience` | The IdP's audience (entity ID) isn't the SP entity ID botctl shows. |
 | `wrong_recipient`, `wrong_destination` | The IdP's ACS (reply) URL isn't the one botctl shows, often because `SSO_PUBLIC_URL` differs from the address people use. |
 | `wrong_issuer` | `SSO_<ID>_IDP_ENTITY_ID` isn't the IdP's entity ID. |
