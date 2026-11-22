@@ -65,7 +65,17 @@ Copy the master key and `.env` off-host once, and again whenever they change. Ke
 
 ## Encryption
 
-Optional, with [age](https://age-encryption.org). The server holds only the public key, so neither it nor your off-site storage can read old archives; restoring needs the identity (private key) you keep elsewhere.
+On by default for new installs, with [age](https://age-encryption.org) ([ADR 0114](../adr/0114-backups-encrypted-by-default.md)). The server holds only the public key, so neither it nor your off-site storage can read old archives; restoring needs the identity (private key) you keep elsewhere.
+
+**New installs.** The installer makes a key at `/root/superbot-backup-identity.txt` (root, `0600`; `BACKUP_IDENTITY_FILE` picks another path) and Compose's `init.sh` at `deploy/docker/backup-identity.txt`, and set `SUPERBOT_BACKUP_AGE_RECIPIENTS` to its public key. **Copy that file off the host now**, store it like a password, then delete it there (`shred -u FILE`). Until you do, every installer run says it is still on the host. Without the key, the archives can't be restored.
+
+**Upgrades** don't make a key on their own; plain backups keep working, with a warning. To encrypt, either make a key on the server and copy it off:
+
+```sh
+sudo bash install.sh --upgrade --backup-age-generate     # Compose: deploy/docker/init.sh --backup-age-generate
+```
+
+or make one on your laptop and give the server the public key:
 
 ```sh
 age-keygen -o superbot-backup-identity.txt     # on your laptop; store it like a password
@@ -78,7 +88,17 @@ Put the public key in the server's `.env` (installer) or `deploy/docker/.env` (C
 SUPERBOT_BACKUP_AGE_RECIPIENTS=age1...
 ```
 
-Then `sudo systemctl start superbot-backup.service` or `docker compose up -d`. If the setting is there but `age` is missing, backups fail rather than write plaintext. The installer installs `age` and the image includes it.
+Then `sudo systemctl start superbot-backup.service` or `docker compose up -d`. If the setting is there but `age` is missing, backups fail rather than write plaintext. The installer installs `age` and the image includes it. Machine backups have their own recipients, `MACHINE_BACKUP_AGE_RECIPIENTS` ([setup](incus-containers.md#7-off-host-backups-optional)).
+
+**Plain backups are shown.** botd checks three targets: the server's archives, its copies off the host (with an [off-site store](#off-site-copies)), and machines' off-host backups (with Incus). Each plain one gets a `WARNING` at startup, an open "Backups encrypted" item on the setup checklist, a line in `botctl backups`, `superbot_backup_encrypted{target}` at 0 in `/metrics` (alert: [`superbot-backup-encryption.rules.yml`](../../deploy/prometheus/superbot-backup-encryption.rules.yml)), and a `server.backup_encryption_changed` audit event when that changes.
+
+**`SUPERBOT_BACKUP_ENCRYPTION`** (`--backup-encryption` on the installer and `init.sh`):
+
+| Value | Plain backups |
+|-------|---------------|
+| `auto` (default) | Written, with the warnings above |
+| `required` | Refused: botd won't start while a target would be plain, `superbot-backup` won't write a plain archive, and botd won't copy a plain archive off the host when it has no recipients to encrypt it to |
+| `off` | Written by choice: no warnings, but still shown in `botctl backups`, the checklist and `/metrics`, and the choice is audited |
 
 ## Check an archive
 

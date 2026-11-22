@@ -18,7 +18,7 @@ refuses() { # message command...
   local msg=$1
   shift
   if "$@" >"$T/out" 2>&1; then fail "expected a refusal: $*"; fi
-  grep -qF "$msg" "$T/out" || { cat "$T/out" >&2; fail "expected '$msg' from: $*"; }
+  grep -qF -- "$msg" "$T/out" || { cat "$T/out" >&2; fail "expected '$msg' from: $*"; }
 }
 
 seed() { # data-dir
@@ -160,5 +160,58 @@ for _ in $(seq 1 50); do curl -fsS -o /dev/null http://127.0.0.1:18731/healthz/ 
 refuses "botd is running" env DATA_DIR="$D" PORT=18731 "$RESTORE" "${plain[0]}"
 kill "$srv"
 ok "restore refuses while something answers /healthz on PORT"
+
+# SUPERBOT_BACKUP_ENCRYPTION (ADR 0114): required refuses plaintext, from the environment or .env.
+R="$T/required"
+refuses "refusing to write a plain archive" env DATA_DIR="$D" BACKUP_DIR="$R" SUPERBOT_BACKUP_ENCRYPTION=required "$BACKUP"
+[[ -z $(find "$R" -type f ! -name .lock 2>/dev/null) ]] || fail "required left a plain archive"
+refuses "must be auto, required or off" env DATA_DIR="$D" BACKUP_DIR="$R" SUPERBOT_BACKUP_ENCRYPTION=maybe "$BACKUP"
+cp "$H/superbot/.env" "$T/env.saved"
+echo SUPERBOT_BACKUP_ENCRYPTION=required >>"$H/superbot/.env"
+refuses "refusing to write a plain archive" "$BACKUP" --home "$H"
+echo "SUPERBOT_BACKUP_AGE_RECIPIENTS=$RECIPIENT" >>"$H/superbot/.env"
+"$BACKUP" --home "$H" 2>/dev/null
+[[ -n $(find "$H/superbot/backups" -name 'superbot-*.tar.gz.age') ]] || fail "required with recipients wrote no encrypted archive"
+cp "$T/env.saved" "$H/superbot/.env"
+DATA_DIR=$D BACKUP_DIR=$R SUPERBOT_BACKUP_ENCRYPTION=off "$BACKUP" 2>/dev/null
+[[ -n $(find "$R" -name 'superbot-*.tar.gz') ]] || fail "off didn't write a plain archive"
+ok "SUPERBOT_BACKUP_ENCRYPTION=required refuses plain archives; off and recipients still write"
+
+# Compose's init.sh (ADR 0114): a new .env gets a private age key; the key restores what the
+# sidecar would write with that .env; a re-run keeps it; plain by choice makes none.
+INIT="$DIR/docker/init.sh"
+C="$T/compose"
+mkdir "$C"
+ENV_FILE="$C/.env" BACKUP_IDENTITY_FILE="$C/identity.txt" "$INIT" --localhost >"$T/init.out"
+[[ -f "$C/identity.txt" && $(stat -c %a "$C/identity.txt") == 600 ]] || fail "init.sh made no private backup key"
+public=$(age-keygen -y "$C/identity.txt")
+grep -qx "SUPERBOT_BACKUP_AGE_RECIPIENTS='$public'" "$C/.env" || fail "init.sh doesn't encrypt to its key"
+grep -q "Copy it off this host now" "$T/init.out" || fail "init.sh doesn't say to copy the key off"
+key=$(sha256sum "$C/identity.txt") env_before=$(cat "$C/.env")
+ENV_FILE="$C/.env" BACKUP_IDENTITY_FILE="$C/identity.txt" "$INIT" --localhost >"$T/init.out"
+[[ "$(sha256sum "$C/identity.txt")" == "$key" && "$(cat "$C/.env")" == "$env_before" ]] || fail "re-running init.sh changed the key or .env"
+grep -q "still on this host" "$T/init.out" || fail "init.sh doesn't say the key is still on the host"
+DATA_DIR=$D SUPERBOT_BACKUP_AGE_RECIPIENTS=$public "$BACKUP" - >"$T/compose.age"
+"$RESTORE" --check --identity "$C/identity.txt" "$T/compose.age" >"$T/check" 2>&1 || { cat "$T/check" >&2; fail "init.sh's key doesn't open the archive"; }
+refuses "could not decrypt" "$RESTORE" --check --identity "$T/id.txt" "$T/compose.age"
+O="$T/compose-off"
+mkdir "$O"
+ENV_FILE="$O/.env" BACKUP_IDENTITY_FILE="$O/identity.txt" "$INIT" --localhost --backup-encryption off >/dev/null
+[[ ! -e "$O/identity.txt" ]] || fail "init.sh made a key with --backup-encryption off"
+grep -qx "SUPERBOT_BACKUP_ENCRYPTION='off'" "$O/.env" || fail "init.sh didn't write --backup-encryption off"
+refuses "makes a key that --backup-encryption off" env ENV_FILE="$O/.env" "$INIT" --backup-age-generate --backup-encryption off
+ENV_FILE="$O/.env" BACKUP_IDENTITY_FILE="$O/identity.txt" "$INIT" --backup-encryption auto --backup-age-generate >/dev/null
+grep -qx "SUPERBOT_BACKUP_AGE_RECIPIENTS='$(age-keygen -y "$O/identity.txt")'" "$O/.env" || fail "--backup-age-generate didn't set recipients"
+E="$T/compose-empty"
+mkdir "$E"
+printf 'SUPERBOT_BACKUP_AGE_RECIPIENTS=""\n' >"$E/.env"
+refuses "required, but" env ENV_FILE="$E/.env" "$INIT" --backup-encryption required
+ENV_FILE="$E/.env" BACKUP_IDENTITY_FILE="$E/identity.txt" "$INIT" --backup-age-generate >/dev/null
+grep -qx "SUPERBOT_BACKUP_AGE_RECIPIENTS='$(age-keygen -y "$E/identity.txt")'" "$E/.env" || fail "init.sh took quoted-empty recipients as set"
+printf "SUPERBOT_BACKUP_AGE_RECIPIENTS=' %s '\n" "$public" >"$E/.env"
+cp "$E/.env" "$T/padded.env"
+ENV_FILE="$E/.env" BACKUP_IDENTITY_FILE="$E/identity2.txt" "$INIT" --backup-encryption required --backup-age-generate >/dev/null
+[[ ! -e "$E/identity2.txt" ]] && grep -qxF "$(cat "$T/padded.env")" "$E/.env" || fail "init.sh took padded recipients as unset"
+ok "init.sh makes a private key for a new .env, keeps it on re-runs, and it restores the archives"
 
 echo "All backup script checks passed"

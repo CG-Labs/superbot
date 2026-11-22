@@ -5,6 +5,8 @@
 *.pem
 *.key
 secrets/
+# The backup age identity deploy/docker/init.sh makes (docs/adr/0114-backups-encrypted-by-default.md).
+backup-identity.txt
 # Source code, not secrets.
 !server/src/secrets/
 

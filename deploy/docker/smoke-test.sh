@@ -44,8 +44,13 @@ expect_code() { # expected-code curl-args...
 }
 
 log "Writing an isolated env file"
-ENV_FILE="$SUPERBOT_ENV_FILE" "$DIR/init.sh" --localhost --tz UTC --user-name Smoke >/dev/null
-grep -Ev '^(SUPERBOT_HTTP_PORT|SUPERBOT_HTTPS_PORT|ALLOWED_HOSTS)=' "$SUPERBOT_ENV_FILE" >"$WORK/env.tmp"
+ENV_FILE="$SUPERBOT_ENV_FILE" BACKUP_IDENTITY_FILE="$WORK/init-identity.txt" "$DIR/init.sh" --localhost --tz UTC --user-name Smoke >/dev/null
+# init.sh encrypts backups to a key it makes when the host has age-keygen (ADR 0114); the restore
+# drill below sets its own, made in the image, so it runs the same either way.
+if command -v age-keygen >/dev/null 2>&1; then
+  grep -q "^SUPERBOT_BACKUP_AGE_RECIPIENTS='age1" "$SUPERBOT_ENV_FILE" || fail "init.sh made no backup key"
+fi
+grep -Ev '^(SUPERBOT_HTTP_PORT|SUPERBOT_HTTPS_PORT|ALLOWED_HOSTS|SUPERBOT_BACKUP_AGE_RECIPIENTS)=' "$SUPERBOT_ENV_FILE" >"$WORK/env.tmp"
 mv "$WORK/env.tmp" "$SUPERBOT_ENV_FILE"
 {
   echo "SUPERBOT_HTTP_PORT=$HTTP_PORT"

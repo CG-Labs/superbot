@@ -240,6 +240,7 @@ pub fn render(app: &AppState) -> String {
     }
     capacity::render(app, &mut out);
     crate::server_backups::render(app, &mut out);
+    crate::backup_encryption::render(app, &mut out);
     errors::render(&mut out);
     out
 }

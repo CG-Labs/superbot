@@ -122,6 +122,11 @@ pub struct ServerBackups {
     pub rpo_ms: i64,
     /// None: botd never deletes copies (the bucket's own lifecycle rules do).
     pub retention_days: Option<i64>,
+    /// SUPERBOT_BACKUP_AGE_RECIPIENTS (or `_FILE`) is set, so superbot-backup encrypts
+    /// archives. Only whether it is set: botd never reads the keys (ADR 0114).
+    pub archive_recipients: bool,
+    /// SUPERBOT_BACKUP_ENCRYPTION (ADR 0114).
+    pub encryption: crate::backup_encryption::Policy,
 }
 
 fn rpo_hours(var: &dyn Fn(&str) -> String) -> Result<i64, String> {
@@ -206,13 +211,23 @@ impl ServerBackups {
         if mode == Mode::On && target.is_none() {
             return Err("SERVER_BACKUP_OFF_HOST=on, but no store is set: set SERVER_BACKUP_S3_BUCKET (or MACHINE_BACKUP_S3_BUCKET) and its endpoint and keys".into());
         }
-        Ok(ServerBackups { mode, dir, target, rpo_ms, retention_days })
+        let archive_recipients = ["SUPERBOT_BACKUP_AGE_RECIPIENTS", "SUPERBOT_BACKUP_AGE_RECIPIENTS_FILE"].iter().any(|k| !var(k).trim().is_empty());
+        let encryption = crate::backup_encryption::Policy::from_env(var)?;
+        Ok(ServerBackups { mode, dir, target, rpo_ms, retention_days, archive_recipients, encryption })
     }
 
     /// For tests: copying to `target` from `dir`, with the defaults.
     #[cfg(test)]
     pub fn with(dir: &Path, target: Option<Target>) -> ServerBackups {
-        ServerBackups { mode: Mode::Auto, dir: dir.into(), target, rpo_ms: DEFAULT_RPO_HOURS * HOUR_MS, retention_days: Some(DEFAULT_RETENTION_DAYS) }
+        ServerBackups {
+            mode: Mode::Auto,
+            dir: dir.into(),
+            target,
+            rpo_ms: DEFAULT_RPO_HOURS * HOUR_MS,
+            retention_days: Some(DEFAULT_RETENTION_DAYS),
+            archive_recipients: false,
+            encryption: crate::backup_encryption::Policy::Auto,
+        }
     }
 
     fn kept(&self) -> String {
@@ -390,6 +405,12 @@ async fn copy(app: &App, sb: &ServerBackups, t: &Target, a: &Archive, by: Option
     let n = NewServerBackup { id: &id, archive: &a.name, destination: &dest, object_key: &object, created_at: a.created_at, encrypted_by };
     let b = app.db.server_backup_start(&n)?;
     let res: Result<(u64, String), String> = async {
+        if !a.encrypted && !botd_encrypts && sb.encryption == crate::backup_encryption::Policy::Required {
+            return Err(format!(
+                "SUPERBOT_BACKUP_ENCRYPTION=required: {} is plain and botd has no recipients to encrypt it to, so it isn't copied (set SERVER_BACKUP_AGE_RECIPIENTS, or let superbot-backup write an encrypted archive)",
+                a.name
+            ));
+        }
         let file = tokio::fs::File::open(&a.path).await.map_err(|e| format!("opening {} in BACKUP_DIR: {e}", a.name))?;
         let recipients = if botd_encrypts { &t.recipients[..] } else { &[] };
         let (size, sha) = backup::send(&t.s3, recipients, read(file), &object, "BACKUP_DIR").await?;
@@ -649,6 +670,7 @@ pub fn view(app: &App, sb: &ServerBackups) -> Value {
         "rpoHours": sb.rpo_ms / HOUR_MS,
         "retentionDays": sb.retention_days,
         "warning": sb.warning(),
+        "encryption": crate::backup_encryption::view(app),
         "newestArchive": newest.map(|a| json!({ "name": a.name, "createdAt": a.created_at, "encrypted": a.encrypted })),
         "lastBackupAt": st.last.as_ref().map(|b| b.created_at),
         "coveredSince": st.covered_since,
