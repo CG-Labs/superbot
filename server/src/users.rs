@@ -499,7 +499,7 @@ pub async fn logout(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
     if let Some(s) = &c.session
         && app.db.revoke_session(&s.id, &s.user_id, "logout")
     {
-        let slo = (s.kind == "cookie" && s.method == "sso").then(|| crate::sso::logout_request(&a, &app, s)).flatten();
+        let slo = if s.kind == "cookie" && s.method == "sso" { crate::sso::logout_request(&a, &app, s).await } else { None };
         let details = slo.as_ref().map(|(_, id)| json!({ "provider": s.idp_provider, "slo": id }));
         let mut e = by.event("auth.logout").target("session", &s.id);
         if let Some(d) = details {

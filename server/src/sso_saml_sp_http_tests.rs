@@ -331,18 +331,23 @@ impl Sp {
 
     /// The IdP's browser at our SLO URL over the redirect binding: the status and where it goes.
     async fn slo_get(&self, query: &str) -> (u16, String) {
-        let res = http().get(format!("{}?{query}", self.slo())).send().await.unwrap();
-        (res.status().as_u16(), res.headers().get("location").map(|l| l.to_str().unwrap().to_string()).unwrap_or_default())
+        answered(http().get(format!("{}?{query}", self.slo())).send().await.unwrap())
     }
 
     async fn slo_post(&self, form: &HashMap<String, String>) -> (u16, String) {
-        let res = http().post(self.slo()).form(form).send().await.unwrap();
-        (res.status().as_u16(), res.headers().get("location").map(|l| l.to_str().unwrap().to_string()).unwrap_or_default())
+        answered(http().post(self.slo()).form(form).send().await.unwrap())
     }
 
     async fn audit(&self, action: &str) -> Vec<Value> {
         audit_list(&call(self.port, "GET", &format!("/api/audit?action={action}"), &self.admin, "").await.1)
     }
+}
+
+/// The SLO URL's answer: its status and where it sends the browser. It never touches the
+/// browser's cookie, which may be for a session the message didn't name.
+fn answered(res: reqwest::Response) -> (u16, String) {
+    assert!(res.headers().get("set-cookie").is_none(), "{:?}", res.headers());
+    (res.status().as_u16(), res.headers().get("location").map(|l| l.to_str().unwrap().to_string()).unwrap_or_default())
 }
 
 /// A native provider whose IdP has an SLO URL.
@@ -482,4 +487,27 @@ async fn signing_out_sends_the_idp_a_signed_logout_request() {
     let cookie = plain.cookie("_s1").await;
     let (_, _, body) = crate::tests::call_with(plain.port, "POST", "/api/auth/logout", "", &cookie, "").await;
     assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), json!({ "ok": true }));
+}
+
+#[tokio::test]
+async fn logouts_load_metadata_from_a_url_without_waiting_for_a_sign_in() {
+    let md = test_idp::with_slo(&test_idp::metadata());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let idp_port = listener.local_addr().unwrap().port();
+    let app = axum::Router::new().route("/md", axum::routing::get(move || std::future::ready(md.clone())));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let id = format!("n{}", random_hex(4));
+    let up = id.to_ascii_uppercase();
+    let vars = HashMap::from([
+        ("SSO_PROVIDERS".into(), id.clone()),
+        (format!("SSO_{up}_TYPE"), "saml".into()),
+        (format!("SSO_{up}_IDP_ENTITY_ID"), IDP.into()),
+        (format!("SSO_{up}_IDP_METADATA_URL"), format!("http://127.0.0.1:{idp_port}/md")),
+    ]);
+    let (port, app, admin) = serve_vars(vars).await;
+    let sp = Sp { port, app, admin, id, sp_entity: None };
+    // As after a restart: nothing has loaded the metadata yet.
+    let (code, to) = sp.slo_get(&Logout::request(&sp.slo(), NAME_ID, None, db::now()).redirect()).await;
+    assert_eq!(code, 303, "{to}");
+    assert!(to.starts_with(test_idp::SLO_URL), "{to}");
 }

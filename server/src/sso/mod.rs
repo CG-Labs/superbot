@@ -29,6 +29,7 @@ pub(crate) mod xmldsig;
 use crate::audit::{Actor, ActorKind, Event, Outcome, Source, Who};
 use crate::db::{self, Identity, JitError, NewIdentity, User};
 use crate::rbac::Role;
+use crate::secrets::sealed::{SAML_SP_CERT_SETTING as SP_CERT_SETTING, SAML_SP_KEY_SETTING as SP_KEY_SETTING};
 use crate::users::{self, hash};
 use crate::{ApiError, AppState, Auth, Res, bad, not_found};
 use axum::Json;
@@ -61,9 +62,6 @@ const BINDER: &str = "__Host-superbot_sso";
 const SAML_BINDER: &str = "__Host-superbot_saml";
 /// Where an IdP's metadata imported with botctl is kept (the `settings` table), by provider id.
 const SAML_METADATA_SETTING: &str = "sso_saml_idp_metadata_";
-/// A native SAML provider's generated SP key (sealed PKCS #8) and certificate, by provider id.
-const SP_KEY_SETTING: &str = "sso_saml_sp_key_";
-const SP_CERT_SETTING: &str = "sso_saml_sp_cert_";
 
 #[derive(Clone)]
 enum Return {
@@ -1020,26 +1018,22 @@ pub async fn saml_metadata(Extension(a): Extension<Arc<Auth>>, Path(id): Path<St
 /// A native SAML provider's SP key: `SSO_<ID>_PRIVATE_KEY` with `SP_CERT_FILE`, else made
 /// once and kept sealed in settings, so the certificate in our metadata stays the same.
 fn sp_key(app: &AppState, p: &Provider) -> Result<Arc<SpKey>, String> {
+    let Kind::SamlSp { sp_cert, .. } = &p.kind else { return Err("not a native SAML provider".into()) };
+    if sp_cert.is_some() {
+        return p.configured_sp_key();
+    }
     let mut held = p.sp_key.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(k) = held.as_ref() {
         return Ok(k.clone());
     }
-    let Kind::SamlSp { sp_cert, .. } = &p.kind else { return Err("not a native SAML provider".into()) };
-    let key = match sp_cert {
-        Some(cert) => {
-            let pem = p.sp_key_pem().ok_or_else(|| format!("{} is not set", p.env_var()))?;
-            SpKey::from_pem(pem.expose(), cert).map_err(|e| format!("{}: {e}", p.env_var()))?
-        }
-        None => generated_sp_key(app, p)?,
-    };
-    let key = Arc::new(key);
+    let key = Arc::new(generated_sp_key(app, p)?);
     *held = Some(key.clone());
     Ok(key)
 }
 
 fn generated_sp_key(app: &AppState, p: &Provider) -> Result<SpKey, String> {
     let (key_name, cert_name) = (format!("{SP_KEY_SETTING}{}", p.id), format!("{SP_CERT_SETTING}{}", p.id));
-    let context = format!("settings/{key_name}");
+    let context = crate::secrets::sealed::setting_context(&key_name);
     let cipher = crate::secrets::sealed::cipher();
     if let (Some(sealed), Some(cert)) = (app.db.setting(&key_name), app.db.setting(&cert_name)) {
         let der = cipher.open(&context, &sealed).map_err(|e| format!("the generated SP key: {e}"))?;
@@ -1056,11 +1050,11 @@ fn generated_sp_key(app: &AppState, p: &Provider) -> Result<SpKey, String> {
 /// Signing out of a session a native SAML IdP vouched for: a signed LogoutRequest to the
 /// IdP's SLO URL, for the browser to follow, and its ID. The session is revoked already; this
 /// ends the person's IdP session too. None when the IdP has no SLO URL or we can't sign.
-pub fn logout_request(a: &Auth, app: &AppState, s: &db::Session) -> Option<(String, String)> {
+pub async fn logout_request(a: &Auth, app: &AppState, s: &db::Session) -> Option<(String, String)> {
     let p = a.sso.provider(s.idp_provider.as_deref()?)?;
     let Kind::SamlSp { sp_entity_id, .. } = &p.kind else { return None };
-    let slo = p.idp_loaded()?.slo.clone()?;
     let login = app.db.saml_session(&s.id)?;
+    let slo = p.idp_metadata(a.sso.http(), a.sso.refresh_gap).await.ok()?.slo.clone()?;
     let key = sp_key(app, p).map_err(|e| crate::obs::log::log_warn!("SSO {}: no single logout: {e}", p.id)).ok()?;
     let (id, at) = (saml_sp::request_id(), db::now());
     {
@@ -1098,21 +1092,22 @@ fn slo_failed(a: &Auth, source: &Source, provider: &str, reason: &str, extra: Va
 
 /// `GET /api/auth/sso/{id}/slo`: a logout message over the HTTP-Redirect binding.
 pub async fn slo_get(Extension(a): Extension<Arc<Auth>>, Extension(source): Extension<Source>, Path(id): Path<String>, OriginalUri(uri): OriginalUri) -> Response {
-    slo(&a, &source, &id, &saml_slo::Incoming::Redirect(uri.query().unwrap_or("")))
+    slo(&a, &source, &id, &saml_slo::Incoming::Redirect(uri.query().unwrap_or(""))).await
 }
 
 /// `POST /api/auth/sso/{id}/slo`: the same over HTTP-POST.
 pub async fn slo_post(Extension(a): Extension<Arc<Auth>>, Extension(source): Extension<Source>, Path(id): Path<String>, Form(f): Form<HashMap<String, String>>) -> Response {
-    slo(&a, &source, &id, &saml_slo::Incoming::Post(&f))
+    slo(&a, &source, &id, &saml_slo::Incoming::Post(&f)).await
 }
 
 /// The IdP's LogoutRequest revokes the sessions its NameID and SessionIndexes name and is
 /// answered with our signed LogoutResponse; its LogoutResponse to ours is audited.
-fn slo(a: &Auth, source: &Source, id: &str, incoming: &saml_slo::Incoming) -> Response {
+async fn slo(a: &Auth, source: &Source, id: &str, incoming: &saml_slo::Incoming<'_>) -> Response {
     let Some(app) = a.app.as_ref() else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
     let Some(p) = a.sso.provider(id).filter(|p| p.saml_sp()) else { return not_found("SAML provider").into_response() };
     let Kind::SamlSp { sp_entity_id, .. } = &p.kind else { return not_found("SAML provider").into_response() };
-    let Some(idp) = p.idp_loaded() else { return slo_failed(a, source, id, "not_ready", json!({})) };
+    // From a URL, the metadata may not be loaded since a restart: logouts can't wait for a sign-in.
+    let Ok(idp) = p.idp_metadata(a.sso.http(), a.sso.refresh_gap).await else { return slo_failed(a, source, id, "not_ready", json!({})) };
     let Some(idp_slo) = idp.slo.clone() else { return slo_failed(a, source, id, "no_slo", json!({})) };
     let key = match sp_key(app, p) {
         Ok(k) => k,
@@ -1150,9 +1145,8 @@ fn slo(a: &Auth, source: &Source, id: &str, incoming: &saml_slo::Incoming) -> Re
             a.record(Who { actor, source: source.clone() }.event("auth.slo").details(details));
             let answer = saml_slo::logout_response(sp_entity_id, &saml_sp::request_id(), &idp_slo.response, &request_id, at);
             let query = saml_sp::redirect_query("SAMLResponse", &answer, relay.as_deref(), Some(&key));
-            let mut res = see(&saml_sp::with_redirect_query(&idp_slo.response, &query));
-            res.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_static(users::clear_cookie()));
-            no_store(res)
+            // The browser's own cookie is left alone: its session may not be one the IdP named.
+            no_store(see(&saml_sp::with_redirect_query(&idp_slo.response, &query)))
         }
         saml_slo::Received::Response { id: response_id, in_response_to, status, until_ms } => {
             if let Err(reason) = a.sso.first_use(&format!("slo|{}|{response_id}", idp.entity_id), until_ms, at) {
@@ -1806,6 +1800,32 @@ mod tests {
         assert!(matches!(&p.kind, Kind::SamlSp { sp_cert: Some(c), .. } if *c == key.cert));
         assert!(p.not_ready().is_some_and(|n| n.contains("SSO_CORP_PRIVATE_KEY")), "the key is the provider's secret: {:?}", p.not_ready());
         assert!(native(&[("SSO_CORP_SP_CERT_FILE", leak(&junk))]).is_err(), "not a certificate");
+
+        // A key that isn't the certificate's keeps it off offer; the right one makes it ready.
+        let id = format!("spk{}", random_hex());
+        let up = id.to_ascii_uppercase();
+        let var = |k: &str| -> &'static str { Box::leak(format!("SSO_{up}_{k}").into_boxed_str()) };
+        let vars = [
+            ("SSO_PROVIDERS", leak(std::path::Path::new(&id))),
+            ("SSO_PUBLIC_URL", "https://bot.example.com"),
+            (var("TYPE"), "saml"),
+            (var("IDP_ENTITY_ID"), ADFS),
+            (var("IDP_METADATA_URL"), "https://idp.example/metadata"),
+            (var("SP_CERT_FILE"), leak(&good)),
+        ];
+        let s = parse(&vars).unwrap();
+        let p = &s.providers[0];
+        let pem = |der: &[u8]| rcgen::KeyPair::try_from(der).unwrap().serialize_pem();
+        let (_, other) = SpKey::generate("other").unwrap();
+        crate::secrets::global().put(var("PRIVATE_KEY"), &pem(&other)).unwrap();
+        assert!(p.not_ready().is_some_and(|n| n.contains("isn't for the SP key")), "{:?}", p.not_ready());
+        let (mine, der) = SpKey::generate("mine").unwrap();
+        std::fs::write(&good, format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", mine.cert)).unwrap();
+        let s = parse(&vars).unwrap();
+        let p = &s.providers[0];
+        crate::secrets::global().put(var("PRIVATE_KEY"), &pem(&der)).unwrap();
+        assert_eq!(p.not_ready(), None);
+        assert_eq!(p.configured_sp_key().unwrap().info.sha256, mine.info.sha256);
         let _ = std::fs::remove_dir_all(dir);
     }
 

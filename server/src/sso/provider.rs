@@ -368,9 +368,20 @@ impl Provider {
         Some(s)
     }
 
-    /// Native SAML: the configured SP signing key (PEM), when `SP_CERT_FILE` is set.
-    pub(super) fn sp_key_pem(&self) -> Option<crate::secrets::Secret> {
-        matches!(self.kind, Kind::SamlSp { sp_cert: Some(_), .. }).then(|| self.stored_secret()).flatten()
+    /// Native SAML with `SP_CERT_FILE`: the configured SP key, once it is set and matches the
+    /// certificate. Kept once it does; until then each call reads the secret again, so
+    /// `botctl secret set` takes effect without a restart. Err says what is missing.
+    pub(super) fn configured_sp_key(&self) -> Result<Arc<SpKey>, String> {
+        let Kind::SamlSp { sp_cert: Some(cert), .. } = &self.kind else { return Err("no SP_CERT_FILE".into()) };
+        let mut held = self.sp_key.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(k) = held.as_ref() {
+            return Ok(k.clone());
+        }
+        let var = self.env_var();
+        let pem = self.stored_secret().ok_or_else(|| format!("not offered until {var} is set for SP_CERT_FILE (env, _FILE, or `botctl secret set`)"))?;
+        let key = Arc::new(SpKey::from_pem(pem.expose(), cert).map_err(|e| format!("not offered: {var}: {e}"))?);
+        *held = Some(key.clone());
+        Ok(key)
     }
 
     /// The client secret for one code exchange.
@@ -396,9 +407,7 @@ impl Provider {
             let loaded = self.idp.lock().unwrap_or_else(|e| e.into_inner()).is_some();
             return match source {
                 IdpSource::Saved if !loaded => Some(format!("not offered until its IdP metadata is imported: botctl sso saml {} import < metadata.xml", self.id)),
-                _ if sp_cert.is_some() && self.stored_secret().is_none() => {
-                    Some(format!("not offered until {} is set for SP_CERT_FILE (env, _FILE, or `botctl secret set`)", self.env_var()))
-                }
+                _ if sp_cert.is_some() => self.configured_sp_key().err(),
                 _ => None,
             };
         }
