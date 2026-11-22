@@ -44,6 +44,7 @@ The images are Debian (Node's slim image, with Chromium for the Bots' computer) 
 ## Consequences
 
 - Each push, weekly run and release leaves scan results in code scanning and as an artifact (90 days; download them for a Type II observation period that's longer), and each published image has a signature and provenance an operator can check.
+- The first scan of the server image found three fixable Critical Go standard library flaws, all in Debian's `age` binary (built with Go 1.24.4): TLS session resumption, the HTTP/2 server, and Windows junctions. `age` only encrypts backups locally and reaches none of them, so they are accepted in `.grype.yaml` until Debian rebuilds it.
 - A fixable Critical turns the workflow red until it's fixed (a manual run picks up a Debian or Alpine fix) or accepted with a reason in `.grype.yaml`. A release can't be published past it.
 - Images published before this change are unsigned. Verifying a tag checks what it points to now; operators who pin by digest run exactly what they verified.
 - The weekly rebuild and every merge add a scan of each image (about a minute each, the vulnerability database cached between runs) and, when publishing, the SBOM generation and signing.
