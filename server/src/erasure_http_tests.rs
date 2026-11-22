@@ -227,9 +227,55 @@ async fn a_machine_is_destroyed_first_or_the_erasure_waits() {
     assert_eq!(audit(port, &admin, "action=user.erase_refused").await[0]["details"]["reason"].as_str(), Some("machine"));
     assert!(app.db.user_machine(&ada).is_some(), "kept");
 
+    // The last member of a paying team is refused before the machine goes.
+    let (code, t) = json_call(port, "POST", "/api/teams", &admin, &json!({ "name": "Solo", "owner": "ada@example.com", "machines": false }).to_string()).await;
+    assert_eq!(code, 201, "{t}");
+    let team = t["id"].as_str().unwrap().to_string();
+    app.db
+        .execute_raw(&format!("INSERT INTO team_subscriptions (subscription_id, team_id, provider, status, tier, started, event_created, updated_at) VALUES ('sub_1', '{team}', 'stripe', 'active', 'pro', 0, 0, 0)"))
+        .unwrap();
+    let (code, v) = erase(port, &admin, &ada, r#"{"destroyMachine":true}"#).await;
+    assert_eq!(code, 409, "{v}");
+    assert_eq!(audit(port, &admin, "action=user.erase_refused").await[0]["details"]["reason"].as_str(), Some("team_pays"));
+    assert!(app.db.user_machine(&ada).is_some(), "not destroyed for an erasure that was refused");
+    app.db.execute_raw("DELETE FROM team_subscriptions").unwrap();
+
     let (code, v) = erase(port, &admin, &ada, r#"{"destroyMachine":true}"#).await;
     assert_eq!(code, 200, "{v}");
     assert_eq!(v["removed"]["machine"]["destroyed"], json!(true), "{v}");
     assert!(app.db.user_machine(&ada).is_none());
     assert_eq!(audit(port, &admin, "action=machine.destroy_requested").await.len(), 1);
+}
+
+#[tokio::test]
+async fn names_and_emails_they_had_before_are_erased_too() {
+    let (port, app, admin, _) = serve_app().await;
+    let (ada, _) = user_with(port, &admin, "ada.byron@example.com", "member").await;
+    for patch in [json!({ "name": "Augusta Ada Byron" }), json!({ "name": "Countess of Lovelace", "email": "ada@example.com" })] {
+        assert_eq!(call(port, "PATCH", &format!("/api/users/{ada}"), &admin, &patch.to_string()).await.0, 200);
+    }
+    let (code, v) = erase(port, &admin, &ada, "").await;
+    assert_eq!(code, 200, "{v}");
+    for (table, row) in app.db.all_rows() {
+        let low = row.to_lowercase();
+        for pii in ["ada.byron@example.com", "augusta ada byron", "countess of lovelace", "ada@example.com"] {
+            assert!(!low.contains(pii), "{pii} in {table}: {row}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_retried_erasure_still_erases_what_its_deleted_bots_wrote() {
+    let (port, app, admin, _) = serve_app().await;
+    let (ada, ada_auth) = user_with(port, &admin, "ada@example.com", "member").await;
+    let gone = bot_of(port, &ada_auth, "Scribe").await;
+    let shared = app.db.create_bot("Team", "#fff", "waddle", "claude", None, false).id;
+    let wrote = app.db.add_message_from(&shared, "user", "notes about Ada's health", None, false, None, Some(&gone)).id;
+    // As if a first try deleted the Bot and then stopped.
+    app.db.set_erasing_bots(&ada, std::slice::from_ref(&gone));
+    app.db.delete_bot(&gone);
+    let (code, v) = erase(port, &admin, &ada, "").await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(app.db.message(wrote).unwrap().text, "[erased]");
+    assert!(app.db.erasing_bots(&ada).is_empty(), "forgotten once erased");
 }

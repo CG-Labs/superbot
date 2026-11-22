@@ -22,6 +22,7 @@ use std::sync::Arc;
 const HELD: &str = "legal_hold";
 const LAST_OWNER: &str = "last_team_owner";
 const PAYING: &str = "paying";
+const TEAM_PAYS: &str = "team_pays";
 const MACHINE: &str = "machine";
 const PRIMARY: &str = "primary_bot";
 /// The reason Bots, grants and offboarding record for an erasure.
@@ -65,8 +66,12 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
         app.db.record(&by.event("user.erase_refused").target("user", &u.id).details(d).outcome(Outcome::Denied));
         Err(conflict(msg))
     };
-    let bots: Vec<crate::db::Bot> = app.db.bots().into_iter().filter(|b| b.owner_id == u.id).collect();
-    let bot_ids: Vec<String> = bots.iter().map(|b| b.id.clone()).collect();
+    // Bots deleted by an erasure that stopped part way still count, so what they wrote in
+    // others' chats is erased when it is retried.
+    let owned = |app: &AppState| -> Vec<crate::db::Bot> { app.db.bots().into_iter().filter(|b| b.owner_id == u.id).collect() };
+    let mut bots = owned(&app);
+    let mut bot_ids = app.db.erasing_bots(&u.id);
+    add_new(&mut bot_ids, &bots);
     let held = app.db.erasure_holds(&u.id, &bot_ids);
     if !held.is_empty() {
         let msg = format!("They're under a legal hold: the chat of {} is held, and they or their Bots are in it. Release the hold first (botctl retention release <bot>).", held.join(", "));
@@ -77,6 +82,12 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
     }
     if let Some(s) = app.db.user_paying(&u.id) {
         return refuse(PAYING, json!({ "subscription": s.subscription_id }), "They pay for a plan. Cancel it in the billing portal first; they can be erased once it has ended.".into());
+    }
+    if let Some(m) = app.db.team_member(&u.id).filter(|m| app.db.team_members(&m.team_id).len() == 1)
+        && let Some(s) = app.db.team_paying(&m.team_id)
+    {
+        let msg = "They're the last member of a team that pays for a plan, which would go with them. Cancel the team's plan first.".into();
+        return refuse(TEAM_PAYS, json!({ "team": m.team_id, "subscription": s.subscription_id }), msg);
     }
     if let Some(b) = bots.iter().find(|b| b.primary) {
         return refuse(PRIMARY, json!({ "bot": b.id }), "They own the primary Bot, which can't be deleted. Give it to someone else first.".into());
@@ -103,10 +114,26 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
         a.sso.forget_user(&u.id);
         a.mfa.forget_user(&u.id);
     }
+    // Disabled now, so they can't make more Bots; take any made while the machine went.
+    bots = owned(&app);
+    add_new(&mut bot_ids, &bots);
+    let held = app.db.erasure_holds(&u.id, &bot_ids);
+    if !held.is_empty() {
+        return Err(conflict(format!("The chat of {} was held meanwhile. Release the hold, then erase them again.", held.join(", "))));
+    }
+    app.db.set_erasing_bots(&u.id, &bot_ids);
+    // Runs record their end as whoever asked, so they must be over before the log is rewritten.
+    let mut stopping: Vec<String> = bots.iter().map(|b| b.id.clone()).collect();
     for bot in app.db.bots() {
         if bot.owner_id != u.id && app.live_run(&bot.id).is_some() && app.requested_by(&bot) == u.id {
-            app.stop(&bot.id);
+            stopping.push(bot.id.clone());
         }
+    }
+    for id in &stopping {
+        app.stop(id);
+    }
+    if !settled(&app, &stopping).await {
+        return Err(conflict("Runs they started are still stopping. Erase them again in a minute."));
     }
     let mut grants = 0;
     for (bot_id, level) in app.db.user_grants(&u.id) {
@@ -119,7 +146,6 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
     }
     let mut files = 0;
     for b in &bots {
-        app.stop(&b.id);
         if let Some(screens) = &app.screens {
             screens.remove(&b.id).await;
         }
@@ -133,15 +159,15 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
         crate::notify::forget_bot(&app, &b.id);
         app.db.record(&by.event("bot.deleted").target("bot", &b.id).bot(&b.id).details(json!({ "name": b.name, "harness": b.harness, "reason": REASON })));
         app.send(json!({ "type": "botDeleted", "botId": b.id }));
-        files += usize::from(remove(app.bot_dir(&b.id)));
+        files += usize::from(remove(app.bot_dir(&b.id))?);
     }
     crate::machines::offboard::check_owner(&app, &by, &u.id);
     let secrets = crate::secrets::global().user_forget(&u.id).map_err(crate::secret_error)?;
     let users_dir = |root: &std::path::Path| crate::paths::child(&crate::paths::child(&crate::paths::canonical(root)?, crate::isolation::USERS)?, &u.id);
-    files += usize::from(remove(users_dir(&app.cfg.data_dir)));
+    files += usize::from(remove(users_dir(&app.cfg.data_dir))?);
     let isolation_left = match app.isolation() {
         None => {
-            files += usize::from(remove(users_dir(&app.cfg.workspace)));
+            files += usize::from(remove(users_dir(&app.cfg.workspace))?);
             false
         }
         Some(iso) => iso.user_root(&u.id).is_some_and(|d| d.exists()),
@@ -171,9 +197,35 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
     Ok(Json(json!({ "erased": true, "already": false, "pseudonym": p, "user": users::user_view(&u), "removed": details })))
 }
 
-/// Deletes a folder of botd's own. Whether there was one.
-fn remove(dir: Option<std::path::PathBuf>) -> bool {
-    dir.filter(|d| d.is_dir()).is_some_and(|d| std::fs::remove_dir_all(d).is_ok())
+/// Deletes a folder of botd's own. Whether there was one. A folder it can't delete stops
+/// the erasure before anything is marked erased, so trying again tries it again.
+fn remove(dir: Option<std::path::PathBuf>) -> Res<bool> {
+    let Some(d) = dir.filter(|d| d.is_dir()) else {
+        return Ok(false);
+    };
+    std::fs::remove_dir_all(&d).map(|_| true).map_err(|e| {
+        crate::obs::log::log_warn!("erasure: deleting {}: {e}", d.display());
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "A folder of theirs couldn't be deleted; see the server log. Nothing is marked erased yet, so erase them again once it's fixed.".into())
+    })
+}
+
+fn add_new(ids: &mut Vec<String>, bots: &[crate::db::Bot]) {
+    for b in bots {
+        if !ids.contains(&b.id) {
+            ids.push(b.id.clone());
+        }
+    }
+}
+
+/// Whether every run on `bots` has ended, waiting up to 30 seconds.
+async fn settled(app: &AppState, bots: &[String]) -> bool {
+    for _ in 0..300 {
+        if bots.iter().all(|b| app.live_run(b).is_none()) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    false
 }
 
 #[cfg(test)]

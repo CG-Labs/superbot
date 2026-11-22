@@ -1681,6 +1681,8 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 42] = [
 /// The settings key an erasure sets, to its pseudonym, for its own transaction only:
 /// while it is there, `audit_events_no_update` lets an update replace a person's fields.
 const AUDIT_ERASING: &str = "audit_erasing";
+/// Settings key prefix for the Bots an unfinished erasure took on, by user id.
+const ERASING_BOTS: &str = "erasing_bots:";
 
 /// Erasing a user (ADR 0100): the user row stays as a tombstone, with when, by whom and
 /// as which pseudonym. The audit log stays append-only except that, inside an erasure's
@@ -4126,6 +4128,15 @@ impl Db {
         paying_subscription(&self.c(), user_id).ok().flatten()
     }
 
+    /// The Bots an erasure of `user_id` that didn't finish had taken on (ADR 0100).
+    pub fn erasing_bots(&self, user_id: &str) -> Vec<String> {
+        self.setting(&format!("{ERASING_BOTS}{user_id}")).and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()
+    }
+
+    pub fn set_erasing_bots(&self, user_id: &str, bots: &[String]) {
+        let _ = self.c().execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", params![format!("{ERASING_BOTS}{user_id}"), serde_json::to_string(bots).unwrap_or_default()]);
+    }
+
     /// Erases `user_id`'s personal data in one transaction (ADR 0100). Their Bots must be
     /// gone already; `bots` names them, so what they wrote in others' chats is erased too.
     /// The user row stays as a tombstone named `pseudonym`, and every audit event about
@@ -4180,6 +4191,7 @@ impl Db {
             &mut subjects,
         )
         .map_err(db_err)?;
+        Self::past_identifiers(&tx, user_id, &mut emails, &mut exact, &mut subjects).map_err(db_err)?;
         // A SCIM userName is often an email, but not always.
         let (names, mails): (Vec<String>, Vec<String>) = emails.into_iter().partition(|e| !e.contains('@'));
         exact.extend(names);
@@ -4189,6 +4201,7 @@ impl Db {
         let bots_json = serde_json::to_string(bots).unwrap_or_else(|_| "[]".into());
         let run = |sql: &str, p: &[&dyn rusqlite::ToSql]| tx.execute(sql, p).map_err(db_err);
         let mut out = Erased::default();
+        run("DELETE FROM settings WHERE key = ?", &[&format!("{ERASING_BOTS}{user_id}")])?;
         run("DELETE FROM push_devices WHERE user_id = ?", &[&user_id])?;
         out.sessions = run("DELETE FROM sessions WHERE user_id = ?", &[&user_id])?;
         out.login_codes = run("DELETE FROM login_codes WHERE user_id = ?", &[&user_id])?;
@@ -4228,6 +4241,31 @@ impl Db {
         out.audit_events = Self::pseudonymise_audit(&tx, &scrub).map_err(db_err)?;
         tx.commit().map_err(db_err)?;
         Ok(out)
+    }
+
+    /// Names and emails the user had before: what `user.created` and `user.updated` events
+    /// about them recorded, so erasing scrubs old values a change left in the log.
+    fn past_identifiers(c: &Connection, user_id: &str, emails: &mut Vec<String>, exact: &mut Vec<String>, subjects: &mut Vec<String>) -> rusqlite::Result<()> {
+        const KEYS: [&str; 8] = ["name", "email", "userName", "externalId", "givenName", "familyName", "displayName", "formatted"];
+        let mut st = c.prepare("SELECT details FROM audit_events WHERE target_type = 'user' AND target_id = ? AND action IN ('user.created', 'user.updated')")?;
+        let rows = st.query_map([user_id], |r| r.get::<_, String>(0))?;
+        for d in rows {
+            let Ok(d) = serde_json::from_str::<Value>(&d?) else { continue };
+            let mut found = |key: &str, v: &Value| {
+                let Some(v) = v.as_str().filter(|v| !v.trim().is_empty()) else { return };
+                match key {
+                    "externalId" => subjects.push(v.into()),
+                    "email" | "userName" => emails.push(v.into()),
+                    _ => exact.push(v.into()),
+                }
+            };
+            for key in KEYS {
+                found(key, &d[key]);
+                found(key, &d["changes"][key]["from"]);
+                found(key, &d["changes"][key]["to"]);
+            }
+        }
+        Ok(())
     }
 
     /// Rewrites every audit event about `s`'s user as `Scrub` says, inside the caller's
