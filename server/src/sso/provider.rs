@@ -478,6 +478,12 @@ impl Provider {
             return Ok(m.clone());
         }
         let mut c = self.cache.lock().await;
+        // Whoever held the lock may just have fetched it.
+        if let Some((m, at)) = self.idp.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+            && at.elapsed() < META_TTL
+        {
+            return Ok(m.clone());
+        }
         if let Some((at, e)) = c.idp_failed
             && at.elapsed() < gap
         {

@@ -232,6 +232,14 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
         return Err(bad());
     }
 
+    // A failed response usually carries no assertion. Its status is unsigned, but it only ever
+    // leads to a refusal, so reading it first is safe and keeps the IdP's reason.
+    let status = only(response, PROTOCOL, "Status").and_then(|s| only(s, PROTOCOL, "StatusCode")).ok_or_else(bad)?;
+    if status.attribute("Value") != Some(SUCCESS) {
+        let codes: Vec<&str> = std::iter::successors(Some(status), |c| only(*c, PROTOCOL, "StatusCode")).filter_map(|c| c.attribute("Value")).map(|v| v.rsplit(':').next().unwrap_or(v)).collect();
+        return Err(Refused("idp_error", Some(crate::audit::clip(&codes.join("/"), 128))));
+    }
+
     // Structure first, so nothing below can be pointed at a copy.
     let assertions: Vec<Node> = doc.descendants().filter(|n| n.is_element() && matches!(n.tag_name().name(), "Assertion" | "EncryptedAssertion")).collect();
     let assertion = match assertions.as_slice() {
@@ -251,12 +259,6 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
     }
     if doc.descendants().filter(|n| is(*n, xmldsig::DSIG, "Signature")).any(|s| s.parent() != Some(response) && s.parent() != Some(assertion)) {
         return Err(Refused("wrapped", None));
-    }
-
-    let status = only(response, PROTOCOL, "Status").and_then(|s| only(s, PROTOCOL, "StatusCode")).ok_or_else(bad)?;
-    if status.attribute("Value") != Some(SUCCESS) {
-        let codes: Vec<&str> = std::iter::successors(Some(status), |c| only(*c, PROTOCOL, "StatusCode")).filter_map(|c| c.attribute("Value")).map(|v| v.rsplit(':').next().unwrap_or(v)).collect();
-        return Err(Refused("idp_error", Some(crate::audit::clip(&codes.join("/"), 128))));
     }
 
     if !xmldsig::verify_enveloped(assertion, &e.idp.certs)? {
@@ -691,6 +693,9 @@ mod tests {
         let nested = r#"<samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Responder"><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:RequestDenied"/></samlp:StatusCode>"#;
         let denied = base().xml().replace(&format!(r#"<samlp:StatusCode Value="{SUCCESS}"/>"#), nested);
         assert_eq!(check(&denied).unwrap_err(), Refused("idp_error", Some("Responder/RequestDenied".into())));
+        let (start, end) = (denied.find("<saml:Assertion").unwrap(), denied.rfind("</saml:Assertion>").unwrap() + "</saml:Assertion>".len());
+        let bare = format!("{}{}", &denied[..start], &denied[end..]);
+        assert_eq!(check(&bare).unwrap_err(), Refused("idp_error", Some("Responder/RequestDenied".into())), "a failure without an assertion keeps its reason");
         let mut unsolicited = base();
         unsolicited.in_response_to = String::new();
         let xml = unsolicited.xml().replace(r#" InResponseTo="""#, "");
