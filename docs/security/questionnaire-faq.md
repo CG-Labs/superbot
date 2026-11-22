@@ -6,7 +6,10 @@ Short answers to common questions, as of the code on `main`. Each links to the d
 Organisation data (users, chats, approvals, audit log, secrets, billing records) is in botd's SQLite database on the operator's server. On managed plans, each user's working files, Bot memory and harness logins are on that user's own machine, and in that machine's backups. See [data flows](data-flows.md#what-is-stored-where).
 
 **Can we choose the region?**
-Yes, for machines and their backups. An admin sets a data region for your account or team, such as London (`gb-lon`) or Frankfurt (`de-fra-2`). Your machines are made only there, their backups go to a store there, and nothing is moved out unless you ask ([ADR 0117](../adr/0117-uk-eu-data-regions.md)). The server's own database stays where the operator runs botd. Self-hosting runs wherever you put it.
+Yes, for machines and their backups. An admin sets a data region for your account or team, such as London (`gb-lon`) or Frankfurt (`de-fra-2`). Your machines are made only there, their backups go to a store there, and nothing is moved out unless you ask ([ADR 0117](../adr/0117-uk-eu-data-regions.md)). Under a residency agreement the provider pins you to that region: backups, restores and moves elsewhere are refused and audited, and the region can't change until it is unpinned with a reason ([ADR 0129](../adr/0129-contractual-data-residency.md), [DPA Annex IV](dpa-template.md#annex-iv-data-residency)). The server's own database stays where the operator runs botd. Self-hosting runs wherever you put it.
+
+**Do model calls stay in our region?**
+Only if the plan routes them to a provider endpoint in that region. A data region or pin covers machines and backups, not model calls. Anthropic's own API has no UK or EU processing option; Claude through a cloud platform's regional endpoint, or OpenAI's data residency by arrangement, can give one. The provider must list each model provider and region in the [DPA](dpa-template.md#iv4-model-providers).
 
 **Is data encrypted in transit?**
 Yes. HTTPS to the server, mutual TLS 1.3 between the server and machines, HTTPS to botd's outside services, and STARTTLS or TLS for email. Model providers set in the plan routing file must be `https://`; botd refuses to start on a plain `http://` provider unless it is on the same host ([ADR 0097](../adr/0097-model-providers-over-https.md)). See [encryption in transit](data-flows.md#in-transit).
@@ -15,7 +18,7 @@ Yes. HTTPS to the server, mutual TLS 1.3 between the server and machines, HTTPS 
 Secrets, approval inputs and push tokens are encrypted field by field (XChaCha20-Poly1305) with a master key kept outside the data folder, which the operator can rotate ([ADR 0096](../adr/0096-master-key-rotation.md)). The whole database is encrypted with SQLCipher under a key derived from the master key, on by default for new installs ([ADR 0116](../adr/0116-database-encrypted-at-rest.md)). Files beside it (Bots' memory, user notes), the workspace and machine disks rely on the host's disk encryption. Backups are encrypted with age when the operator sets recipients, and are otherwise plain; machine backups include harness logins. See [encryption at rest](data-flows.md#at-rest).
 
 **Do you support SSO and SCIM?**
-Yes: Microsoft Entra ID, Google, Apple, GitHub, any OIDC provider, and SAML through a Keycloak broker. SCIM 2.0 user provisioning and deprovisioning. Native SAML is planned (M5). See [authentication](access-control.md#authentication).
+Yes: Microsoft Entra ID, Google, Apple, GitHub, any OIDC provider, and SAML 2.0, natively ([ADR 0127](../adr/0127-native-saml-service-provider.md)) or through a Keycloak broker. SCIM 2.0 user provisioning and deprovisioning. See [authentication](access-control.md#authentication).
 
 **Do you support MFA?**
 Yes. Sign-in codes and the owner's break-glass password can require a code from an authenticator app (TOTP), with one-time recovery codes. Admins require it for admins, which includes the owner, or for everyone ([ADR 0094](../adr/0094-totp-second-factor.md)). SSO sign-ins rely on your IdP's MFA: enforce it there ([IdP guides](../sso/)).

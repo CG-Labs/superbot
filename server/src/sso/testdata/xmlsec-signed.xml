@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" ID="_r1" Version="2.0" IssueInstant="2026-11-22T17:00:00Z">
+  <saml:Issuer>https://idp.example/xmlsec</saml:Issuer>
+  <saml:Assertion ID="_a1" Version="2.0" IssueInstant="2026-11-22T17:00:00Z">
+    <saml:Issuer>https://idp.example/xmlsec</saml:Issuer>
+    <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+      <ds:SignedInfo>
+        <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+        <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+        <ds:Reference URI="#_a1">
+          <ds:Transforms>
+            <ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
+            <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"><ec:InclusiveNamespaces xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#" PrefixList="xs"/></ds:Transform>
+          </ds:Transforms>
+          <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+          <ds:DigestValue>HcgCPFMYfbQgokKyGwaRqqFQaWy2Tm5HJsn/3gLoHAE=</ds:DigestValue>
+        </ds:Reference>
+      </ds:SignedInfo>
+      <ds:SignatureValue>chTB32BPjLob+qYSghgZUVQBzXZ/N7LrU/QU8SZb45Wt1SiWsx3CkEHl+6upU9NA
+GmFajIOl4I9Kawk5ZMVIR9KxKUrBe21+ILN5/ZMSjl8ejE3G8/e8k+HcQW6xLQL9
+cwc8j5e2lUzcAT5jFW4bOSdxc9afLRubZ7FI41XOtGqElCf5/khOE/Nz3HWkzzq4
+DXYXNjebIcr6WmRLSvJorBGJhqN9rmYS/UQ252Vp1x3KuWRfPHr2h++f7U9/JucD
+DOtInngf631vbQmxJT79qPObjhFWIzZRjrjU0Klem80lTzBmZcTM6Qd/NOeiftW5
+9fdMoHHLFB2DPYG26o/X/A==</ds:SignatureValue>
+    </ds:Signature>
+    <saml:Subject><saml:NameID Format="urn:oasis:names:tc:SAML:2.0:nameid-format:persistent">Ada-1 &amp; "co" &lt;x&gt;</saml:NameID></saml:Subject>
+    <saml:AttributeStatement><saml:Attribute Name="email"><saml:AttributeValue xsi:type="xs:string">ada@example.com</saml:AttributeValue></saml:Attribute></saml:AttributeStatement>
+  </saml:Assertion>
+</samlp:Response>

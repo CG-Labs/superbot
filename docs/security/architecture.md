@@ -134,6 +134,6 @@ flowchart TB
 ## Planned
 
 - cgroup limits per run inside a machine, outbound allow-lists, and hardening for machines enrolled before ADR 0126 without a rebuild (M5, [ADR 0126](../adr/0126-per-user-machine-hardening.md)).
-- Native SAML without a broker (M5, [ADR 0020](../adr/0020-saml-bridge.md)).
+- Encrypted assertions, signed AuthnRequests and single logout for native SAML (M5, [ADR 0127](../adr/0127-native-saml-service-provider.md)).
 - A tamper-evident (hash-chained) audit log (M5, [ADR 0009](../adr/0009-audit-events.md)).
 - A read-only root filesystem for the containers ([ADR 0084](../adr/0084-published-image-with-computer-use.md)).

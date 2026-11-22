@@ -104,6 +104,26 @@ function regionCell(r) {
   return `${esc(r.region)}<div class="sub">${esc(REGION_FROM[r.source] || r.source)}</div>${gone}`;
 }
 
+// A residency pin (ADR 0129): their data held to a region under an agreement.
+function pinNote(p) {
+  if (!p) return "";
+  return `<div class="sub">Pinned${p.subjectType === "team" ? " by team" : ""} to ${esc(p.region)} · ${esc(p.reference)}</div>`;
+}
+
+async function setResidency(path, who, pin, region) {
+  if (pin) {
+    const why = prompt(`${who}'s data is pinned to ${pin.region} under "${pin.reference}". To unpin, give the reason; it is audited. The data region stays as it is.`);
+    if (!why?.trim()) return;
+    await api("DELETE", path, { reason: why.trim() });
+    return;
+  }
+  const r = prompt(`Pin ${who}'s data to a region under an agreement: machines, backups and restores stay there or are refused. Refused while any of it is elsewhere. Region:`, region || "");
+  if (!r?.trim()) return;
+  const ref = prompt("The agreement it is under (for example a DPA reference):");
+  if (!ref?.trim()) return;
+  await api("PUT", path, { region: r.trim(), reference: ref.trim() });
+}
+
 async function setRegion(path, who, current) {
   const r = prompt(`Data region for ${who}: where their machines and backups live. Leave empty for the default. Refused while a machine is elsewhere.`, current || "");
   if (r === null || r.trim() === (current || "")) return;
@@ -121,13 +141,14 @@ function renderUsers() {
       <td>${lastLogin(u)}</td>
       <td>${u.pendingCodes ? `Waiting<div class="sub">until ${esc(fmt(u.pendingCodes.expiresAt))}</div>` : ""}</td>
       <td>${u.mfa?.enabled ? `On<div class="sub">since ${esc(fmt(u.mfa.enabledAt))}</div>` : ""}</td>
-      <td>${regionCell(u.dataRegion)}</td>
+      <td>${regionCell(u.dataRegion)}${pinNote(u.residency)}${u.ownResidency && u.residency?.subjectType === "team" ? pinNote(u.ownResidency) : ""}</td>
       <td class="actions">
         <button type="button" class="btn" data-act="code" ${active ? "" : "disabled"}>New code</button>
         ${u.mfa?.enabled && u.id !== me.user?.id ? '<button type="button" class="btn" data-act="mfa">Reset 2FA</button>' : ""}
         ${u.breakGlass ? "" : `<button type="button" class="btn" data-act="status">${active ? "Disable" : "Enable"}</button>`}
         <button type="button" class="btn" data-act="sessions">Sign out everywhere</button>
         ${u.dataRegion ? '<button type="button" class="btn" data-act="region">Data region</button>' : ""}
+        ${u.dataRegion && (u.ownResidency || !u.residency) ? `<button type="button" class="btn" data-act="residency">${u.ownResidency ? "Unpin" : "Pin region"}</button>` : ""}
       </td>
     </tr>`;
   }).join("");
@@ -166,6 +187,7 @@ $("users-rows").addEventListener("click", async (e) => {
       notice(`Two-factor authentication reset for ${u.name}.`, false);
     }
     if (t.dataset.act === "region") await setRegion(`/api/users/${key(u.id)}/region`, u.name, u.region);
+    if (t.dataset.act === "residency") await setResidency(`/api/users/${key(u.id)}/residency`, u.name, u.ownResidency, u.dataRegion?.region);
     if (t.dataset.act === "sessions") {
       if (!confirm(`Sign ${u.name} out of every session?`)) return;
       const r = await api("DELETE", `/api/users/${key(u.id)}/sessions`);
@@ -357,8 +379,9 @@ async function loadRegions(off) {
   if (off) return;
   try {
     const r = await api("GET", "/api/regions");
-    const each = r.regions.map((x) => `${x.id}${x.default ? " (default)" : ""}${x.offered ? "" : " (no longer offered)"}: ${x.machines} machine${x.machines === 1 ? "" : "s"}`);
-    const warn = (r.backups?.warnings || []).join(" ");
+    const pinned = (x) => (x.pinned?.users || x.pinned?.teams ? `, ${x.pinned.users + x.pinned.teams} pinned` : "");
+    const each = r.regions.map((x) => `${x.id}${x.default ? " (default)" : ""}${x.offered ? "" : " (no longer offered)"}: ${x.machines} machine${x.machines === 1 ? "" : "s"}${pinned(x)}`);
+    const warn = [...(r.backups?.warnings || []), ...(r.residency?.warnings || [])].join(" ");
     el.textContent = `Data regions: ${each.join(", ")}.${warn ? ` ${warn}` : ""}`;
     el.className = warn ? "warn" : "hint";
     el.hidden = false;
@@ -504,8 +527,9 @@ function renderTeams() {
   $("teams-settings").textContent = `${s.strict ? "TEAMS=on: people in no team share with nobody." : "People in no team share with each other (TEAMS=on stops that)."} A leaver's team machine is ${s.machineDays ? `suspended, then deleted after ${s.machineDays} days` : "deleted at once"}.`;
   $("teams-empty").hidden = teams.teams.length > 0;
   $("teams-list").innerHTML = teams.teams.map((t) => `<div class="card" data-team="${esc(t.id)}">
-      <div class="bar"><b>${esc(t.name)}</b> <span class="sub">${t.members.length} people · ${t.machines ? "joining gives a machine" : "no machines given"} · data in ${esc(t.region || "the default region")}${esc(teamPlan(t.billing))}</span>
+      <div class="bar"><b>${esc(t.name)}</b> <span class="sub">${t.members.length} people · ${t.machines ? "joining gives a machine" : "no machines given"} · data in ${esc(t.region || "the default region")}${t.residency ? ` · pinned under ${esc(t.residency.reference || "an agreement")}` : ""}${esc(teamPlan(t.billing))}</span>
         <button type="button" class="btn push" data-act="team-region">Data region</button>
+        <button type="button" class="btn" data-act="team-residency">${t.residency ? "Unpin" : "Pin region"}</button>
         <button type="button" class="btn" data-act="delete-team">Delete team</button></div>
       <table class="grid">
         <thead><tr><th>Person</th><th>Role</th><th>Custom role here</th><th>Machine</th><th></th></tr></thead>
@@ -555,6 +579,7 @@ $("teams-list").addEventListener("click", async (e) => {
       await api("DELETE", `/api/teams/${key(t.id)}/members/${key(m.id)}`);
     }
     if (b.dataset.act === "team-region") await setRegion(`/api/teams/${key(t.id)}/region`, `${t.name}'s members without their own`, t.region);
+    if (b.dataset.act === "team-residency") await setResidency(`/api/teams/${key(t.id)}/residency`, t.name, t.residency, t.region);
     if (b.dataset.act === "delete-team") {
       if (!confirm(`Delete ${t.name}? Everyone on it leaves, as if each had: ${offboardNote("each of them", t.name).split("\n\n")[1]}`)) return;
       await api("DELETE", `/api/teams/${key(t.id)}`);
@@ -1478,7 +1503,7 @@ const providerRow = (p) => `<tr>
     <td>${esc(p.label)}<div class="sub">${esc(p.id)} · ${esc(p.type)}${p.jitRole ? ` · new people join as ${esc(ROLES[p.jitRole] || p.jitRole)}` : ""}</div></td>
     <td>${p.ready ? "Ready" : `<span class="warn-text">${esc(p.problem || "Not ready")}</span>`}</td>
     <td>${copyBlock(p.callbackUrl)}</td>
-    <td>${p.secretSavable === false ? envSecret(p.secret) : secretForm(p)}</td>
+    <td>${!p.secret ? `<span class="sub">No secret. IdP metadata: <code>botctl sso saml ${esc(p.id)}</code></span>` : p.secretSavable === false ? envSecret(p.secret) : secretForm(p)}</td>
   </tr>`;
 const secretForm = (p) => `<form class="secret-inline" data-secret="${esc(p.secret)}" autocomplete="off">
     <textarea rows="1" placeholder="${esc(p.secret)}" required spellcheck="false" autocomplete="off"></textarea>
@@ -1502,9 +1527,9 @@ function setupSignIn(s) {
   setup.template = pick.id;
   const template = `<h2>Add a provider</h2>
     <div class="bar"><label>Provider <select id="setup-template">${s.templates.map((t) => `<option value="${esc(t.id)}" ${t.id === pick.id ? "selected" : ""}>${esc(t.label)}${t.configured ? " (set up)" : ""}</option>`).join("")}</select></label></div>
-    <p class="hint">1. Register SuperBot at the provider (see ${esc(pick.docs)}) with this redirect URI:</p>${copyBlock(pick.callbackUrl)}
+    <p class="hint">1. Register SuperBot at the provider (see ${esc(pick.docs)}) with this ${pick.secret ? "redirect URI" : "ACS URL (reply URL)"}:</p>${copyBlock(pick.callbackUrl)}
     <p class="hint">2. Add these lines to .env, filling in the &lt;placeholders&gt;:</p>${copyBlock(pick.env)}
-    <p class="hint">3. Restart botd (below). 4. The provider then shows up on this page: save its secret, <code>${esc(pick.secret)}</code>, there.</p>
+    <p class="hint">3. Restart botd (below). 4. ${pick.secret ? `The provider then shows up on this page: save its secret, <code>${esc(pick.secret)}</code>, there.` : `It needs no secret: <code>botctl sso saml ${esc(pick.id)}</code> shows its SP entity ID and checks the IdP metadata.`}</p>
     ${howto(s.restart)}`;
   return verdict(s.ok, s.detail) + providers + `<h2>Admins</h2>${admins}<p class="hint">${esc(extra)}</p>` + template;
 }
