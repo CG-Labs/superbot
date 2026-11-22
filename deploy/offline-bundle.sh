@@ -151,7 +151,8 @@ oci_image_archive() {
 
 # NAME=REF: this arch's image, its cosign signature checked (unless --allow-unsigned), saved as
 # an OCI archive with the registry's digests, with what the check printed (certificate, Rekor
-# entry), its SBOM, and its signatures and attestations (an OCI layout, for push) beside it.
+# entry) and its SBOM beside it, and its signatures and attestations (an OCI layout, for push)
+# in signatures/NAME.tar.
 # With KEY, the signature is checked against that public key instead of IDENTITY. An unsigned
 # image of your own comes from the local Docker if it is there, else from its registry.
 bundle_image() {
@@ -185,8 +186,10 @@ bundle_image() {
     rmdir "$sigs"
     "$OCI_TOOL" fetch --from "$(image_full_name "$IMAGE_TOP")" --image "$digest" --out "$sigs" \
       || die "Couldn't copy $ref's signatures and attestations into the bundle"
-    tar -C "$sigs" --owner=0 --group=0 --numeric-owner --sort=name -cf "$out/images/$name.signatures.tar" oci-layout index.json blobs
-    chmod 0644 "$out/images/$name.signatures.tar"
+    # Beside images/, not in it: an older offline-bundle.sh would docker load any images/*.tar.
+    mkdir -p "$out/signatures"
+    tar -C "$sigs" --owner=0 --group=0 --numeric-owner --sort=name -cf "$out/signatures/$name.tar" oci-layout index.json blobs
+    chmod 0644 "$out/signatures/$name.tar"
     rm -rf -- "$sigs"
     # The signed index the image came from, which push puts up when it has every arch's bundle.
     [[ "$IMAGE_TOP" == "$IMAGE_PLATFORM" ]] || printf '%s\n' "${IMAGE_TOP#*@}" >"$out/images/$name.index"
@@ -329,10 +332,9 @@ cmd_load() {
   offline_unpack_bundle "$BUNDLE" "$OFFLINE_TMP"
   local tar name ref found=false
   for tar in "$OFFLINE_DIR"/images/*.tar; do
-    name=$(basename "$tar" .tar)
-    # NAME.signatures.tar is for push, not an image.
-    [[ -f "$tar" && "$name" != *.* ]] || continue
+    [[ -f "$tar" ]] || continue
     found=true
+    name=$(basename "$tar" .tar)
     ref=$(cat "$OFFLINE_DIR/images/$name.ref")
     docker load -q -i "$tar" >/dev/null || die "docker load failed for $name"
     docker image inspect "$ref" >/dev/null 2>&1 || die "$name loaded, but $ref isn't there"
@@ -413,8 +415,8 @@ cmd_push() {
   local tar name ref dest index names=() dests=() indexes=()
   declare -A seen=()
   for tar in "${dirs[0]}"/images/*.tar; do
+    [[ -f "$tar" ]] || continue
     name=$(basename "$tar" .tar)
-    [[ -f "$tar" && "$name" != *.* ]] || continue
     ref=$(cat "${dirs[0]}/images/$name.ref")
     image_ref_ok "$ref" || die "Refusing ${bundles[0]}: images/$name.ref isn't an image reference"
     index=""
@@ -423,7 +425,7 @@ cmd_push() {
       [[ -f "$dir/images/$name.tar" && "$(cat "$dir/images/$name.ref")" == "$ref" ]] || die "$b doesn't hold the same $name image ($ref) as ${bundles[0]}: give bundles of one release"
       [[ "$(cat "$dir/images/$name.digest")" =~ ^sha256:[0-9a-f]{64}$ ]] || die "Refusing $b: images/$name.digest isn't a digest"
       [[ "$multi" == true ]] || { index=$(cat "$dir/images/$name.index" 2>/dev/null || true); continue; }
-      [[ -f "$dir/images/$name.index" && -f "$dir/images/$name.signatures.tar" ]] \
+      [[ -f "$dir/images/$name.index" && -f "$dir/signatures/$name.tar" ]] \
         || die "$b's $name image has no signed multi-arch index with it (unsigned, or bundled before ADR 0147), so these bundles can't put one up: push each to its own --registry path"
       s=$(cat "$dir/images/$name.index")
       [[ -z "$index" || "$s" == "$index" ]] || die "The bundles' $name images come from different signed indexes ($index, $s): give bundles of one release"
@@ -451,8 +453,8 @@ cmd_push() {
     for j in "${!dirs[@]}"; do
       u="$OFFLINE_TMP/units/$name/$j"
       untar_layout "${dirs[j]}/images/$name.tar" "$u/image"
-      if [[ -f "${dirs[j]}/images/$name.signatures.tar" ]]; then
-        untar_layout "${dirs[j]}/images/$name.signatures.tar" "$u/signatures"
+      if [[ -f "${dirs[j]}/signatures/$name.tar" ]]; then
+        untar_layout "${dirs[j]}/signatures/$name.tar" "$u/signatures"
       else
         warn "$name (${arches[j]}) has no signatures in its bundle (unsigned, or bundled before ADR 0147): cosign verify won't find any in the mirror"
       fi

@@ -167,7 +167,7 @@ jobs:
             top=superbot-offline-$version-ci.1-$a
             [[ $(tar -xOf "$RUNNER_TEMP/signed/$top.tar.gz" "$top/images/signed.index") == "$SIGNED_INDEX" ]]
             tar -xOf "$RUNNER_TEMP/signed/$top.tar.gz" "$top/images/signed.sbom.spdx.json" | jq -e .spdxVersion >/dev/null
-            tar -tf "$RUNNER_TEMP/signed/$top.tar.gz" "$top/images/signed.signatures.tar" "$top/bin/superbot-oci" >/dev/null
+            tar -tf "$RUNNER_TEMP/signed/$top.tar.gz" "$top/signatures/signed.tar" "$top/bin/superbot-oci" >/dev/null
           done
           ls -l "$RUNNER_TEMP/b"
           openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 -subj /CN=offline.test \
