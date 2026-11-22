@@ -242,7 +242,9 @@ pub fn start(app: &Arc<App>, settings: Settings) {
             Start::All => 0,
             Start::New => app.db.audit_head(),
         };
-        app.db.set_audit_export_cursor(&sink.id, from);
+        if let Err(e) = app.db.set_audit_export_cursor(&sink.id, from) {
+            log_warn!("Audit export: couldn't save where {} starts ({e}); trying again after the first delivery.", sink.shown);
+        }
         from
     });
     let x = Arc::new(Exporter::new(sink, delivered));
@@ -261,9 +263,10 @@ async fn run(app: Arc<App>, x: Arc<Exporter>) {
             tokio::time::sleep(IDLE).await;
             continue;
         };
-        match out.send(&x.sink, &rows, &host).await {
+        // Delivered only once the cursor is saved; if it can't be, the batch goes again.
+        let sent = out.send(&x.sink, &rows, &host).await.and_then(|()| app.db.set_audit_export_cursor(&x.sink.id, last).map_err(|e| format!("couldn't save the export cursor: {e}")));
+        match sent {
             Ok(()) => {
-                app.db.set_audit_export_cursor(&x.sink.id, last);
                 if let Some((tries, since)) = x.delivered_to(last) {
                     log_info!("Audit export: {} is taking events again after {tries} failed tries.", x.sink.shown);
                     let e = Event::new(Actor::system("audit_export"), "audit.export_recovered").target("audit", "export");

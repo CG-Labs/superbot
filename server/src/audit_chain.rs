@@ -188,6 +188,29 @@ pub fn insert_system(c: &Connection, part: &str, action: &str, target: (&str, &s
     )
 }
 
+/// The event an erasure writes, in its own transaction, naming the rows whose salt it
+/// cleared. An erased row that no such event names fails verification.
+pub const ERASED: &str = "audit.erased";
+
+/// Records which rows an erasure cleared the salt of, as `[first, last]` id ranges.
+pub fn insert_erased(c: &Connection, pseudonym: &str, ids: &[i64]) -> rusqlite::Result<i64> {
+    insert_system(c, "erasure", ERASED, ("user", pseudonym), &json!({ "rows": ranges(ids) }))
+}
+
+fn ranges(ids: &[i64]) -> Vec<[i64; 2]> {
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut out: Vec<[i64; 2]> = Vec::new();
+    for id in ids {
+        match out.last_mut() {
+            Some(r) if r[1] + 1 == id => r[1] = id,
+            _ => out.push([id, id]),
+        }
+    }
+    out
+}
+
 /// One row as the chain sees it.
 #[derive(Clone, Debug)]
 pub struct Row {
@@ -205,12 +228,19 @@ pub fn select_list() -> String {
     FIXED.iter().chain(ERASABLE.iter()).chain(COLUMNS.iter()).copied().collect::<Vec<_>>().join(", ")
 }
 
+/// Reads any value SQLite holds: a seal that isn't text counts as no seal.
 pub fn read_row(r: &rusqlite::Row) -> rusqlite::Result<Row> {
     let val = |i: usize| r.get::<_, Sql>(i);
+    let text = |i: usize| -> rusqlite::Result<Option<String>> {
+        Ok(match val(i)? {
+            Sql::Text(t) => Some(t),
+            _ => None,
+        })
+    };
     let fixed = (0..FIXED.len()).map(val).collect::<rusqlite::Result<Vec<_>>>()?;
     let erasable = (FIXED.len()..FIXED.len() + ERASABLE.len()).map(val).collect::<rusqlite::Result<Vec<_>>>()?;
     let n = FIXED.len() + ERASABLE.len();
-    Ok(Row { id: r.get(0)?, fixed, erasable, prev: r.get(n)?, hash: r.get(n + 1)?, salt: r.get(n + 2)?, digest: r.get(n + 3)? })
+    Ok(Row { id: r.get(0)?, fixed, erasable, prev: text(n)?, hash: text(n + 1)?, salt: text(n + 2)?, digest: text(n + 3)? })
 }
 
 /// Seals rows written before the chain, in id order, each onto the one before; rows
@@ -245,8 +275,9 @@ pub fn seal_existing(c: &Connection) -> rusqlite::Result<(usize, i64)> {
 
 /// The first row that breaks the chain, and why: `unsealed` (no seal), `link` (its
 /// link to the row before doesn't match: a row before it was removed, added or
-/// changed), `contents` (the row itself changed), or `pin` (it differs from a hash
-/// pinned from a copy kept elsewhere).
+/// changed), `contents` (the row itself changed), `erased` (its salt is gone but no
+/// erasure names it, so its erasable fields can't be checked), or `pin` (it differs
+/// from, or lacks, a hash pinned from a copy kept elsewhere).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Broken {
     pub id: i64,
@@ -258,7 +289,8 @@ pub struct Broken {
 pub struct Pinned {
     pub id: i64,
     pub hash: String,
-    /// `match`, `mismatch`, or `gone` (pruned since, or never there).
+    /// `match`, `mismatch`, `gone` (pruned by retention since) or `missing` (not there,
+    /// and newer than anything retention deleted: a failure).
     pub result: &'static str,
 }
 
@@ -279,6 +311,19 @@ pub struct Report {
     /// The last pruned row, which the first row left must link to.
     pub anchor: Option<Link>,
     pub pins: Vec<Pinned>,
+    /// Set when the log couldn't be read to the end; the check then fails.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl Report {
+    /// Counts a break, keeping the lowest id as the first.
+    fn broke(&mut self, id: i64, reason: &'static str) {
+        self.broken += 1;
+        if self.first_broken.as_ref().is_none_or(|b| id < b.id) {
+            self.first_broken = Some(Broken { id, reason });
+        }
+    }
 }
 
 /// Walks the chain one row at a time, oldest first.
@@ -286,11 +331,13 @@ pub struct Verifier {
     report: Report,
     expected: Option<String>,
     pins: Vec<(Link, Option<&'static str>)>,
+    /// Erased rows not yet named by an `audit.erased` event after them.
+    unexplained: std::collections::BTreeSet<i64>,
 }
 
 impl Verifier {
     pub fn new(anchor: Option<Link>, pins: Vec<Link>) -> Verifier {
-        Verifier { report: Report { anchor, ..Default::default() }, expected: None, pins: pins.into_iter().map(|p| (p, None)).collect() }
+        Verifier { report: Report { anchor, ..Default::default() }, expected: None, pins: pins.into_iter().map(|p| (p, None)).collect(), unexplained: Default::default() }
     }
 
     pub fn feed(&mut self, r: &Row) {
@@ -326,41 +373,96 @@ impl Verifier {
         }
         let reason = reason.or(pinned_wrong.then_some("pin"));
         if let Some(reason) = reason {
-            rep.broken += 1;
-            rep.first_broken.get_or_insert(Broken { id: r.id, reason });
+            self.report.broke(r.id, reason);
+        } else {
+            if r.salt.is_none() {
+                self.unexplained.insert(r.id);
+            }
+            if r.fixed.get(3) == Some(&Sql::Text(ERASED.into())) {
+                self.explain(r);
+            }
         }
         if let Some(h) = &r.hash {
-            rep.head = Some(Link { id: r.id, hash: h.clone() });
+            self.report.head = Some(Link { id: r.id, hash: h.clone() });
         }
         self.expected = Some(r.hash.clone().unwrap_or(expected));
     }
 
+    /// An intact `audit.erased` row: the erased rows it names are accounted for.
+    fn explain(&mut self, r: &Row) {
+        let details = ERASABLE.iter().position(|c| *c == "details").and_then(|i| r.erasable.get(i));
+        let Some(Sql::Text(details)) = details else { return };
+        let Ok(v) = serde_json::from_str::<Value>(details) else { return };
+        for range in v["rows"].as_array().into_iter().flatten() {
+            let (Some(a), Some(b)) = (range[0].as_i64(), range[1].as_i64()) else { continue };
+            if a > b {
+                continue;
+            }
+            let named: Vec<i64> = self.unexplained.range(a..=b).copied().collect();
+            for id in named {
+                self.unexplained.remove(&id);
+            }
+        }
+    }
+
+    /// The log couldn't be read past here.
+    pub fn fail(&mut self, error: String) {
+        self.report.error = Some(error);
+    }
+
     pub fn finish(mut self) -> Report {
         let rep = &mut self.report;
+        for id in std::mem::take(&mut self.unexplained) {
+            rep.broke(id, "erased");
+        }
         for (p, result) in self.pins {
-            // The last pruned row is gone, but its hash is kept as the anchor.
-            let result = result.unwrap_or(match &rep.anchor {
+            let result = result.unwrap_or_else(|| match &rep.anchor {
+                // The last pruned row is gone, but its hash is kept as the anchor.
                 Some(a) if a.id == p.id && a.hash == p.hash => "match",
                 Some(a) if a.id == p.id => {
-                    rep.broken += 1;
-                    rep.first_broken.get_or_insert(Broken { id: p.id, reason: "pin" });
+                    rep.broke(p.id, "pin");
                     "mismatch"
                 }
-                _ => "gone",
+                Some(a) if p.id < a.id => "gone",
+                // Never pruned, yet not there: deleted, or a restore from before it.
+                _ => {
+                    rep.broke(p.id, "pin");
+                    "missing"
+                }
             });
             rep.pins.push(Pinned { id: p.id, hash: p.hash, result });
         }
-        rep.ok = rep.broken == 0;
+        rep.ok = rep.broken == 0 && rep.error.is_none();
         self.report
     }
 }
 
 /// Checks the whole chain, a batch at a time, so other writers aren't held up long.
+/// Retention may prune between batches and move the anchor; a check that fails then is
+/// run again, so pruning never looks like tampering.
 pub fn verify(db: &Db, pins: Vec<Link>) -> Report {
-    let mut v = Verifier::new(db.audit_chain_anchor(), pins);
+    let mut tries = 0;
+    loop {
+        let anchor = db.audit_chain_anchor();
+        let r = walk(db, anchor.clone(), pins.clone());
+        tries += 1;
+        if r.ok || tries == 3 || db.audit_chain_anchor() == anchor {
+            return r;
+        }
+    }
+}
+
+fn walk(db: &Db, anchor: Option<Link>, pins: Vec<Link>) -> Report {
+    let mut v = Verifier::new(anchor, pins);
     let mut after = i64::MIN;
     loop {
-        let rows = db.audit_chain_rows(after, BATCH);
+        let rows = match db.audit_chain_rows(after, BATCH) {
+            Ok(rows) => rows,
+            Err(e) => {
+                v.fail(format!("couldn't read the audit log after event {after}: {e}"));
+                break;
+            }
+        };
         let Some(last) = rows.last() else { break };
         after = last.id;
         for r in &rows {
@@ -375,7 +477,7 @@ pub fn verify(db: &Db, pins: Vec<Link>) -> Report {
 
 /// What `audit.verified` records: the result and the head, never row contents.
 pub fn summary(r: &Report) -> Value {
-    json!({ "ok": r.ok, "checked": r.checked, "erased": r.erased, "broken": r.broken, "firstBroken": r.first_broken, "head": r.head, "anchor": r.anchor, "pins": r.pins })
+    json!({ "ok": r.ok, "checked": r.checked, "erased": r.erased, "broken": r.broken, "firstBroken": r.first_broken, "head": r.head, "anchor": r.anchor, "pins": r.pins, "error": r.error })
 }
 
 /// Checks the chain once a day and records `audit.verified` with the head's hash: a
@@ -396,6 +498,9 @@ pub fn start(app: Arc<App>) {
 /// Records a check's result, and warns when the chain is broken.
 pub fn checked(app: &App, by: &crate::audit::Who, r: &Report) {
     use crate::audit::Outcome;
+    if let Some(e) = &r.error {
+        crate::obs::log::log_warn!("WARNING: the audit log's hash chain couldn't be checked: {e}");
+    }
     if let Some(b) = &r.first_broken {
         crate::obs::log::log_warn!("WARNING: the audit log's hash chain is broken at event {} ({}); see docs/ops/audit-export.md.", b.id, b.reason);
     }
@@ -428,7 +533,7 @@ pub async fn get(
 pub fn reseal_from(db: &Db, from: i64) -> usize {
     let mut prev = GENESIS.to_string();
     let mut n = 0;
-    for r in db.audit_chain_rows(i64::MIN, i64::MAX) {
+    for r in db.audit_chain_rows(i64::MIN, i64::MAX).unwrap() {
         if r.id >= from {
             let s = seal(&prev, &r.fixed, &r.erasable);
             db.execute_raw(&format!(
@@ -450,8 +555,14 @@ mod tests {
     use super::*;
 
     fn row(id: i64, prev: &str, action: &str) -> (Row, Seal) {
+        row_with(id, prev, action, "{}")
+    }
+
+    fn row_with(id: i64, prev: &str, action: &str, details: &str) -> (Row, Seal) {
         let fixed = vec![Sql::Integer(id), Sql::Integer(1_000 + id), Sql::Text("system".into()), Sql::Text(action.into())];
-        let erasable = vec![Sql::Text("u1".into()), Sql::Text("{}".into())];
+        let mut erasable = vec![Sql::Null; ERASABLE.len()];
+        erasable[0] = Sql::Text("u1".into());
+        erasable[6] = Sql::Text(details.into());
         let s = seal(prev, &fixed, &erasable);
         (Row { id, fixed, erasable, prev: Some(s.prev.clone()), hash: Some(s.hash.clone()), salt: Some(s.salt.clone()), digest: Some(s.digest.clone()) }, s)
     }
@@ -520,7 +631,7 @@ mod tests {
         assert_eq!(check(&gone, None, vec![]).first_broken, Some(Broken { id: 5, reason: "link" }));
         let mut swapped = rows.clone();
         swapped.swap(1, 2);
-        assert_eq!(check(&swapped, None, vec![]).first_broken.unwrap().id, 3);
+        assert_eq!(check(&swapped, None, vec![]).first_broken.unwrap().id, 2, "the lowest id that breaks");
         // Rebuilt from a changed row on: every link holds, but a pinned hash doesn't.
         let mut rebuilt = rows[..2].to_vec();
         let mut prev = rebuilt[1].hash.clone().unwrap();
@@ -549,18 +660,44 @@ mod tests {
         let r = check(&rows[2..], Some(anchor.clone()), vec![Link { id: 2, hash: anchor.hash.clone() }, Link { id: 1, hash: GENESIS.into() }]);
         assert!(r.ok, "{r:?}");
         assert_eq!((r.first, r.pins[0].result, r.pins[1].result), (Some(3), "match", "gone"));
+        // A pinned row newer than anything pruned that isn't there fails: deleted, or
+        // a backup from before it restored.
+        let pin = Link { id: 6, hash: rows[5].hash.clone().unwrap() };
+        let r = check(&rows[2..5], Some(anchor.clone()), vec![pin.clone()]);
+        assert_eq!((r.ok, r.pins[0].result, r.first_broken.clone()), (false, "missing", Some(Broken { id: 6, reason: "pin" })));
+        assert_eq!(check(&rows[..5], None, vec![pin]).pins[0].result, "missing", "nothing pruned, so nothing is gone");
         let wrong = Link { id: 2, hash: GENESIS.into() };
         assert_eq!(check(&rows[2..], Some(wrong), vec![]).first_broken, Some(Broken { id: 3, reason: "link" }));
-        // Erased: the person's fields are gone with the salt, and the digest stands for them.
+        // Erased: the person's fields are gone with the salt, and the digest stands for
+        // them, once an erasure after it names the row.
         let mut erased = rows.clone();
-        erased[3].erasable = vec![Sql::Text("x-pseudonym".into()), Sql::Text("{}".into())];
+        erased[3].erasable[0] = Sql::Text("x-pseudonym".into());
         erased[3].salt = None;
         let r = check(&erased, None, vec![]);
-        assert_eq!((r.ok, r.erased), (true, 1));
+        assert_eq!((r.ok, r.erased, r.first_broken), (false, 1, Some(Broken { id: 4, reason: "erased" })), "a salt cleared by hand");
+        let (named, _) = row_with(7, erased[5].hash.as_ref().unwrap(), ERASED, r#"{"rows":[[2,2],[4,5]]}"#);
+        erased.push(named.clone());
+        let r = check(&erased, None, vec![]);
+        assert_eq!((r.ok, r.erased, r.checked), (true, 1, 7), "{r:?}");
+        // Only an intact erasure event counts.
+        let mut forged = erased.clone();
+        forged[6].erasable[6] = Sql::Text(r#"{"rows":[[1,6]]}"#.into());
+        forged[3].salt = None;
+        assert_eq!(check(&forged, None, vec![]).first_broken, Some(Broken { id: 4, reason: "erased" }));
+        let (other, _) = row_with(7, erased[5].hash.as_ref().unwrap(), ERASED, r#"{"rows":[[5,6]]}"#);
+        let mut wrong = erased[..6].to_vec();
+        wrong.push(other);
+        assert_eq!(check(&wrong, None, vec![]).first_broken, Some(Broken { id: 4, reason: "erased" }), "it must name this row");
         // A salt kept with changed fields is a change, not an erasure.
         let mut kept = rows;
         kept[3].erasable[0] = Sql::Text("x-pseudonym".into());
         assert!(!check(&kept, None, vec![]).ok);
+    }
+
+    #[test]
+    fn erasures_are_recorded_as_ranges() {
+        assert_eq!(ranges(&[9, 3, 4, 5, 7, 4]), vec![[3, 5], [7, 7], [9, 9]]);
+        assert!(ranges(&[]).is_empty());
     }
 
     #[test]

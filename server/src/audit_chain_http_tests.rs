@@ -102,6 +102,20 @@ async fn erasure_and_retention_keep_the_chain_whole() {
     let v = verify(port, &admin, "").await;
     assert_eq!(v["ok"], true, "{v}");
     assert!(v["erased"].as_i64().unwrap() > 0, "her events lost their salt: {v}");
+    let named = &events(port, &admin, "action=audit.erased").await[0];
+    assert!(named["details"]["rows"].as_array().is_some_and(|r| !r.is_empty()), "the erasure names the rows it cleared: {named}");
+
+    // Clearing a salt by hand, to change a row's fields unseen, is caught.
+    let id = app.db.try_record(&Event::new(Actor::system("test"), "test.kept").details(json!({ "name": "Kept" }))).unwrap();
+    app.db.execute_raw("DROP TRIGGER audit_events_no_update").unwrap();
+    app.db.execute_raw(&format!("UPDATE audit_events SET chain_salt = NULL, details = '{{\"name\":\"Other\"}}' WHERE id = {id}")).unwrap();
+    let v = verify(port, &admin, "").await;
+    assert_eq!((v["ok"].as_bool(), v["firstBroken"]["id"].as_i64(), v["firstBroken"]["reason"].as_str()), (Some(false), Some(id), Some("erased")), "{v}");
+    // A seal SQLite holds as something other than text is no seal, never skipped.
+    app.db.execute_raw(&format!("UPDATE audit_events SET chain_salt = 'x', chain_hash = x'00' WHERE id = {id}")).unwrap();
+    let v = verify(port, &admin, "").await;
+    assert_eq!((v["ok"].as_bool(), v["firstBroken"]["reason"].as_str()), (Some(false), Some("unsealed")), "{v}");
+    assert!(v["checked"].as_i64().unwrap() > 1, "and the rows after it are still checked");
 
     // Retention cuts a run of old events from the start and keeps the last one's hash
     // as the anchor. (A fresh log, so it can start with old events.)
@@ -117,10 +131,19 @@ async fn erasure_and_retention_keep_the_chain_whole() {
     let v = verify(port, &admin, "").await;
     assert_eq!((v["ok"].as_bool(), v["first"].as_i64(), v["anchor"]["id"].as_i64()), (Some(true), Some(young), Some(o2)), "{v}");
     assert!(o1 < o2 && late > young);
-    let left: Vec<i64> = app.db.audit_chain_rows(i64::MIN, 1000).iter().map(|r| r.id).collect();
+    let left: Vec<i64> = app.db.audit_chain_rows(i64::MIN, 1000).unwrap().iter().map(|r| r.id).collect();
     assert!(left.contains(&late), "an old event after a young one waits for it");
     let pruned = &events(port, &admin, "action=audit.pruned").await[0];
     assert_eq!((pruned["details"]["deleted"].as_i64(), pruned["details"]["anchor"]["id"].as_i64()), (Some(2), Some(o2)));
+
+    // A pinned event newer than the anchor that's gone is a failure, not pruning.
+    let v = verify(port, &admin, &format!("?pin={o1}:{}", "a".repeat(64))).await;
+    assert_eq!((v["ok"].as_bool(), v["pins"][0]["result"].as_str()), (Some(true), Some("gone")), "{v}");
+    let newest = app.db.audit_head();
+    let pin = format!("{newest}:{}", app.db.audit_chain_rows(newest - 1, 1).unwrap()[0].hash.clone().unwrap());
+    app.db.execute_raw(&format!("DELETE FROM audit_events WHERE id = {newest}")).unwrap();
+    let v = verify(port, &admin, &format!("?pin={pin}")).await;
+    assert_eq!((v["ok"].as_bool(), v["pins"][0]["result"].as_str(), v["firstBroken"]["reason"].as_str()), (Some(false), Some("missing"), Some("pin")), "{v}");
 
     // Rows cut without the anchor show as a broken link.
     app.db.execute_raw(&format!("DELETE FROM settings WHERE key = '{}'", crate::audit_chain::ANCHOR)).unwrap();

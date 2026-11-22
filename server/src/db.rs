@@ -4591,7 +4591,7 @@ impl Db {
             let rows = st.query_map(rusqlite::params_from_iter(&args), |r| Ok((r.get(0)?, [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?], r.get(10)?)))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
-        let mut n = 0;
+        let mut cleared = Vec::new();
         for (id, [actor_id, name, email, subject, target, behalf, ip, agent, session], details) in rows {
             let is = |v: &Option<String>| v.as_deref() == Some(s.id.as_str());
             // A visitor without an account (a signup) is known only by the email they gave.
@@ -4625,10 +4625,15 @@ impl Db {
                    ip = ?8, user_agent = ?9, session_id = ?10, details = ?11, chain_salt = NULL WHERE id = ?1",
                 params![id, next.0, next.1, next.2, next.3, next.4, next.5, next.6, next.7, next.8, if changed { d.to_string() } else { details }],
             )?;
-            n += 1;
+            cleared.push(id);
+        }
+        // On the chain, in the same transaction: the rows whose salt this erasure cleared.
+        // An erased row no such event names is reported as tampered with (ADR 0122).
+        if !cleared.is_empty() {
+            crate::audit_chain::insert_erased(c, &s.pseudonym, &cleared)?;
         }
         c.execute("DELETE FROM settings WHERE key = ?", [AUDIT_ERASING])?;
-        Ok(n)
+        Ok(cleared.len())
     }
 
     /// Every row of every table, as `(table, the row's columns as text)`.
@@ -6436,10 +6441,11 @@ impl Db {
     }
 
     /// Up to `limit` audit rows after id `after`, oldest first, as the hash chain sees them.
-    pub fn audit_chain_rows(&self, after: i64, limit: i64) -> Vec<crate::audit_chain::Row> {
+    /// A row that can't be read is an error, never skipped: skipping would hide it.
+    pub fn audit_chain_rows(&self, after: i64, limit: i64) -> rusqlite::Result<Vec<crate::audit_chain::Row>> {
         let c = self.c();
-        let mut s = c.prepare(&format!("SELECT {} FROM audit_events WHERE id > ? ORDER BY id LIMIT ?", crate::audit_chain::select_list())).unwrap();
-        s.query_map(params![after, limit], crate::audit_chain::read_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c.prepare(&format!("SELECT {} FROM audit_events WHERE id > ? ORDER BY id LIMIT ?", crate::audit_chain::select_list()))?;
+        s.query_map(params![after, limit], crate::audit_chain::read_row)?.collect()
     }
 
     /// The newest audit event's id, 0 when there is none.
@@ -6453,11 +6459,12 @@ impl Db {
         v.and_then(|v| v.parse().ok())
     }
 
-    pub fn set_audit_export_cursor(&self, sink: &str, delivered: i64) {
-        let _ = self.c().execute(
+    pub fn set_audit_export_cursor(&self, sink: &str, delivered: i64) -> rusqlite::Result<()> {
+        self.c().execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
             params![format!("audit_export:{sink}"), delivered.to_string()],
-        );
+        )?;
+        Ok(())
     }
 
     // Machines (ADR 0025)
@@ -8892,8 +8899,13 @@ mod tests {
         assert!(db.c().execute("UPDATE audit_events SET chain_digest = 'x', chain_salt = NULL", []).is_err());
         assert_eq!(db.c().execute("UPDATE audit_events SET chain_salt = NULL", []).unwrap(), 2, "an erasure clears the salt");
         db.c().execute("DELETE FROM settings WHERE key = ?", [AUDIT_ERASING]).unwrap();
+        // Cleared by hand, with no erasure event naming the rows: their contents can't be vouched for.
         let r = crate::audit_chain::verify(&db, vec![]);
-        assert_eq!((r.ok, r.checked, r.erased), (true, 2, 2), "{r:?}");
+        assert_eq!((r.ok, r.checked, r.erased, r.broken), (false, 2, 2, 2), "{r:?}");
+        let ids: Vec<i64> = all_events(&db).iter().map(|e| e.id).collect();
+        crate::audit_chain::insert_erased(&db.c(), "erased-test", &ids).unwrap();
+        let r = crate::audit_chain::verify(&db, vec![]);
+        assert_eq!((r.ok, r.checked, r.erased), (true, 3, 2), "{r:?}");
     }
 
     /// Retention deletes a run from the start of the log (ADR 0122), never past the
