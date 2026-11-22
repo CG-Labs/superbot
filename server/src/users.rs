@@ -283,6 +283,7 @@ pub fn actor(a: &Auth, u: &User, s: Option<&Session>, method: &str) -> Actor {
         session: s.map(|s| s.id.clone()),
         on_behalf_of: None,
         asker: None,
+        carries: Vec::new(),
     }
 }
 
