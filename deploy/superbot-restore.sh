@@ -140,12 +140,16 @@ if plain_sqlite "$work/data/app.sqlite"; then
 elif (( size == 0 || size % 512 != 0 )); then
   # SQLCipher writes whole pages, so anything else is damaged, encrypted or not.
   die "app.sqlite failed integrity_check: neither SQLite nor whole encrypted pages ($size bytes)"
+elif ! command -v "${SUPERBOT_BOTD:-botd}" >/dev/null 2>&1; then
+  say "app.sqlite is encrypted and wasn't checked here (botd isn't on PATH: set SUPERBOT_BOTD); botd checks it with the master key when it starts"
 elif check=$(query "$work/data/app.sqlite" 'PRAGMA integrity_check;' 2>&1); then
   [[ "$check" == ok ]] || die "app.sqlite failed integrity_check: $check"
 elif [[ "$check" == *"wrong key"* ]]; then
   die "app.sqlite is encrypted under another master key: $check. Give its key (SUPERBOT_MASTER_KEY_FILE, or SUPERBOT_MASTER_KEY_PREVIOUS_FILE)"
+elif [[ "$check" == *"no master key was found"* ]]; then
+  say "app.sqlite is encrypted and wasn't checked here (no master key given); botd checks it with the master key when it starts"
 else
-  say "app.sqlite is encrypted and wasn't checked here ($check); botd checks it with the master key when it starts"
+  die "could not check the encrypted app.sqlite: $check"
 fi
 
 summary "$work/data"

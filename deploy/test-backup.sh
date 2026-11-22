@@ -264,6 +264,7 @@ SUPERBOT_BOTD=$BOTD SUPERBOT_MASTER_KEY_FILE="$T/missing.key" "$RESTORE" --check
   { cat "$T/check" >&2; fail "--check without the master key refused the archive"; }
 grep -q "wasn't checked here" "$T/check" && grep -q '^bots:  *?$' "$T/check" || { cat "$T/check" >&2; fail "--check without the key doesn't say it couldn't read it"; }
 refuses "encrypted under another master key" env SUPERBOT_BOTD="$BOTD" SUPERBOT_MASTER_KEY_FILE="$T/wrong.key" "$RESTORE" --check "${enc[0]}"
+refuses "could not check the encrypted app.sqlite" env SUPERBOT_BOTD="$BOTD" SUPERBOT_MASTER_KEY=not-a-key "$RESTORE" --check "${enc[0]}"
 rm "$ED/app.sqlite"
 SUPERBOT_BOTD=$BOTD "$RESTORE" --home "$EH" "${enc[0]}" 2>/dev/null
 [[ $(SUPERBOT_MASTER_KEY_FILE="$EH/keys/master.key" "$BOTD" database query "$ED/app.sqlite" "SELECT name FROM bots WHERE name = 'KeepEnc'") == KeepEnc ]] ||

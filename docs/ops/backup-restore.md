@@ -102,7 +102,7 @@ Then `sudo systemctl start superbot-backup.service` or `docker compose up -d`. I
 
 ## Check an archive
 
-`superbot-restore --check` unpacks to a temporary folder, runs SQLite's `integrity_check`, and prints what's inside, without touching the live data. An encrypted database is read with `botd database query` and the master key (from `--home`'s `.env`, or `SUPERBOT_MASTER_KEY(_FILE)`): with another key `--check` and restores refuse it; with none the counts show `?`, it isn't checked, and a restore still puts it back for botd to open with its key. Run it on every off-site copy you depend on, at least monthly.
+`superbot-restore --check` unpacks to a temporary folder, runs SQLite's `integrity_check`, and prints what's inside, without touching the live data. An encrypted database is read with `botd database query` and the master key (from `--home`'s `.env`, or `SUPERBOT_MASTER_KEY(_FILE)`): with another key `--check` and restores refuse it; with none (or no `botd`) the counts show `?`, it isn't checked, and a restore still puts it back for botd to open with its key; any other error reading it (an unreadable key file, a malformed key) stops `--check` and the restore. Run it on every off-site copy you depend on, at least monthly.
 
 ```sh
 sudo -u superbot superbot-restore --check /home/superbot/superbot/backups/superbot-20261119-031500.tar.gz
