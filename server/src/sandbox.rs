@@ -106,35 +106,58 @@ impl Host {
 /// [`Host`] for this machine, checked once per process. Containers and some
 /// distributions (Ubuntu 24.04's AppArmor) block user namespaces.
 pub fn host() -> Host {
-    host_as(None)
+    checked(None, false)
+}
+
+/// [`Host`] for runs that start with no new privileges, as every run through
+/// `superbot-run` does (ADR 0145): a setuid `bwrap` can't help them.
+pub fn host_no_new_privs() -> Host {
+    checked(None, true)
 }
 
 /// [`Host`] for runs as the user `(uid, gid)`, checked as that user once per process:
-/// root may make namespaces an unprivileged user can't.
+/// root may make namespaces an unprivileged user can't. Such runs have no new privileges.
+/// Only the machine agent checks as another user.
+#[allow(dead_code)]
 pub fn host_as(ids: Option<(u32, u32)>) -> Host {
-    type Checked = Vec<(Option<(u32, u32)>, Host)>;
+    checked(ids, ids.is_some())
+}
+
+fn checked(ids: Option<(u32, u32)>, nnp: bool) -> Host {
+    type Checked = Vec<((Option<(u32, u32)>, bool), Host)>;
     static HOSTS: std::sync::Mutex<Checked> = std::sync::Mutex::new(Vec::new());
     let mut hosts = HOSTS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, h)) = hosts.iter().find(|(i, _)| *i == ids) {
+    if let Some((_, h)) = hosts.iter().find(|(k, _)| *k == (ids, nnp)) {
         return h.clone();
     }
-    let h = probe(ids);
-    hosts.push((ids, h.clone()));
+    let h = probe(ids, nnp);
+    hosts.push(((ids, nnp), h.clone()));
     h
 }
 
 #[cfg(target_os = "macos")]
-fn probe(_ids: Option<(u32, u32)>) -> Host {
+fn probe(_ids: Option<(u32, u32)>, _nnp: bool) -> Host {
     Host { namespaces: Path::new("/usr/bin/sandbox-exec").exists(), programs: PROGRAMS.map(String::from).into() }
 }
 
 #[cfg(target_os = "linux")]
-fn probe(ids: Option<(u32, u32)>) -> Host {
+fn probe(ids: Option<(u32, u32)>, nnp: bool) -> Host {
     use std::os::unix::process::CommandExt;
     let ok = |bin: &str, args: &[&str]| {
         let mut c = std::process::Command::new(bin);
         if let Some((uid, gid)) = ids {
             c.uid(uid).gid(gid).current_dir("/");
+        }
+        if nnp {
+            // SAFETY: a plain prctl, async-signal-safe.
+            unsafe {
+                c.pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
         }
         c.args(args)
             .stdin(std::process::Stdio::null())
@@ -151,7 +174,7 @@ fn probe(ids: Option<(u32, u32)>) -> Host {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn probe(_ids: Option<(u32, u32)>) -> Host {
+fn probe(_ids: Option<(u32, u32)>, _nnp: bool) -> Host {
     Host::default()
 }
 

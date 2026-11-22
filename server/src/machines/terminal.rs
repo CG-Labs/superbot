@@ -286,14 +286,16 @@ impl Logins {
             .stdout(o)
             .stderr(e)
             .kill_on_drop(true);
-        if let Some(ids) = user {
-            cmd.uid(ids.uid).gid(ids.gid);
-        }
+        let drop_to = user.map(|i| (i.uid, i.gid));
         // SAFETY: only async-signal-safe calls between fork and exec.
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
+                }
+                if let Some((uid, gid)) = drop_to {
+                    runas::become_user(uid, gid)?;
+                    runas::lock_down()?;
                 }
                 Ok(())
             });
