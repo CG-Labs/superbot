@@ -1,6 +1,6 @@
 # Air-gapped installs
 
-SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), and release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md).
+SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md), and signatures and multi-arch indexes in mirrors in [ADR 0147](../adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md).
 
 ## What a bundle holds
 
@@ -8,13 +8,14 @@ SuperBot runs on a server with no internet access. You make (or download) an **o
 
 | Path | What |
 |------|------|
-| `bin/` | `botd`, `botctl`, `superbot-machine`, `superbot-run`, built for release |
+| `bin/` | `botd`, `botctl`, `superbot-machine`, `superbot-run`, built for release; with images, `superbot-oci` too, which `push` uses (the installer doesn't) |
 | `client/` | The Expo web client, built for `/app/` |
 | `site/` | The landing page |
 | `deploy/` | `install.sh`, `offline-bundle.sh`, the systemd units and the backup, restore and per-user account scripts |
 | `docker/` | The Compose file, its Caddyfile, `.env.example` and `init.sh` |
 | `env.example` | botd's `.env` template |
-| `images/` | Optional: each image for the bundle's arch as an OCI archive (`<name>.tar`, which `docker load` also reads), with the digest it has in its registry, its reference and that digest, what `cosign verify` printed when it was bundled (`<name>.cosign.json`: certificate and transparency log entry) and its SBOM (`<name>.sbom.spdx.json`) |
+| `images/` | Optional: each image for the bundle's arch as an OCI archive (`<name>.tar`, which `docker load` also reads), with the digest it has in its registry, its reference and that digest, what `cosign verify` printed when it was bundled (`<name>.cosign.json`: certificate and transparency log entry), its SBOM (`<name>.sbom.spdx.json`), and for a signed image the digest of the multi-arch index that was signed (`<name>.index`) |
+| `signatures/` | With signed images: each one's signatures and attestations as an OCI layout (`<name>.tar`): the cosign signatures on the multi-arch index, this arch's image and its attestation manifest (BuildKit's SBOM and provenance), and the build provenance on the index |
 | `MANIFEST` | Format, version, arch, commit, date, images and their format (`image_format=oci`) |
 | `SHA256SUMS` | The SHA-256 of every other file |
 
@@ -41,14 +42,14 @@ The installer lists anything missing and stops before it changes anything.
 **Your own**, from a checkout of a release tag, on a machine with the same arch as the server:
 
 ```sh
-cargo build --release --bin botd --bin botctl --bin superbot-machine --bin superbot-run
+cargo build --release --bin botd --bin botctl --bin superbot-machine --bin superbot-run --bin superbot-oci
 (cd apps/client && npm ci && SUPERBOT_WEB_BASE_URL=/app npx expo export --platform web --output-dir dist-app)
 deploy/offline-bundle.sh build --out dist \
   --image superbot=ghcr.io/cg-labs/superbot:0.1.0 \
   --image caddy=ghcr.io/cg-labs/superbot-caddy:0.1.0
 ```
 
-`--image` is optional (leave it out for the bash install alone); with it you also need `skopeo`, `jq`, `docker` (with buildx, for the SBOM) and `cosign`. A reference must have a tag (`HOST/PATH:TAG`). The cosign signature on what the tag names is checked against the `docker` workflow at that version's tag (`--image-identity` to change it), then the image for the bundle's arch is copied from the registry as it is, so it keeps the digest that was signed; an image that doesn't verify, or whose digest would change, is not bundled. `--allow-unsigned` bundles an image of your own without a check (from your local Docker if it is there, else from its registry), and `MANIFEST` says so. The command prints the bundle's SHA-256: record it somewhere the server's operator can read it without the bundle.
+`--image` is optional (leave it out for the bash install alone); with it you also need `skopeo`, `jq`, `docker` (with buildx, for the SBOM) and `cosign`. A reference must have a tag (`HOST/PATH:TAG`). The cosign signature on what the tag names is checked against the `docker` workflow at that version's tag (`--image-identity` to change it), then the image for the bundle's arch is copied from the registry as it is, so it keeps the digest that was signed; an image that doesn't verify, or whose digest would change, is not bundled. Its signatures and attestations are copied into the bundle with it, by `superbot-oci`, for [`push`](#registry-mirrors). For an image you signed with your own cosign key, give `--image-key cosign.pub` instead: the signature is checked against that key, with no transparency log. `--allow-unsigned` bundles an image of your own without a check (from your local Docker if it is there, else from its registry), and `MANIFEST` says so. The command prints the bundle's SHA-256: record it somewhere the server's operator can read it without the bundle.
 
 ## Verifying a bundle
 
@@ -117,14 +118,14 @@ services:
 
 ## Registry mirrors
 
-If your network has its own container registry (Harbor, Artifactory, Nexus, `registry:2`, ...), push a bundle's images into it, from any machine that can reach it (any arch):
+If your network has its own container registry (Harbor, Artifactory, Nexus, Zot, `registry:2`, ...), push a bundle's images into it, from any machine that can reach it. Give both arches' bundles of a release to put up the multi-arch images:
 
 ```sh
-deploy/offline-bundle.sh push superbot-offline-0.1.0-x86_64.tar.gz --sha256 <recorded sha-256> \
-  --registry registry.corp.example/superbot
+deploy/offline-bundle.sh push superbot-offline-0.1.0-x86_64.tar.gz superbot-offline-0.1.0-aarch64.tar.gz \
+  --sha256 <x86_64 sha-256> --sha256 <aarch64 sha-256> --registry registry.corp.example/superbot
 ```
 
-It checks the bundle as the installer does, copies each image to `<registry>/<name>:<tag>` (here `registry.corp.example/superbot/superbot:0.1.0` and `.../superbot-caddy:0.1.0`) with `skopeo` exactly as it is in the bundle, reads it back, (two images that would take the same tag are refused before anything is pushed), and stops unless the registry now has the **same digest** the bundle recorded, the one whose signature was checked when it was bundled. It prints the settings for Compose's `.env`, pinned by digest:
+It checks each bundle as the installer does (one `--sha256` per bundle, in the same order), and that they are one release with one bundle per arch. Then, with the bundle's `superbot-oci`, it copies each image to `<registry>/<name>:<tag>` (here `registry.corp.example/superbot/superbot:0.1.0` and `.../superbot-caddy:0.1.0`) exactly as it is in the bundles: both arches' images, the **signed multi-arch index** they came from, unchanged, and every signature and attestation the bundles carry. The tag goes up last and is read back, and it stops unless the registry now has the **same digest** that was signed: the index's, so `docker pull` on either arch gets its own image. With one bundle, the tag names that arch's image alone, with its signatures. Everything is checked before anything is pushed: bundles of two releases, the same arch twice, an unsigned image or a bundle made before ADR 0147 in a multi-arch push, and two images that would take the same tag are refused. It prints the settings for Compose's `.env`, pinned by digest:
 
 ```sh
 SUPERBOT_IMAGE=registry.corp.example/superbot/superbot@sha256:...
@@ -133,11 +134,28 @@ SUPERBOT_CADDY_IMAGE=registry.corp.example/superbot/superbot-caddy@sha256:...
 
 Put them in `.env` (with `SUPERBOT_VERSION` too) and Compose pulls from your registry; a digest pin means a changed image in the registry can't be run in its place.
 
-- **The push tool:** `skopeo` (from your mirror of Ubuntu's archive, or your OS's). `docker` isn't needed. The images are OCI archives, so you can also push them yourself after extracting the bundle (`skopeo copy oci-archive:images/superbot.tar docker://...`, or any tool that reads an OCI image layout), but then check the digest yourself.
-- **Logins and certificates** are skopeo's: `skopeo login registry.corp.example`, your internal CA in `/etc/containers/certs.d/registry.corp.example/ca.crt` (or the system's trust store). A registry without TLS, for a lab only, is marked `insecure = true` in `/etc/containers/registries.conf.d/`.
-- **One arch per path:** a bundle holds one arch, so pushing an x86_64 and an aarch64 bundle to the same `--registry` replaces the tag; use a path per arch (`--registry registry.corp.example/superbot/arm64`). Digest pins are per arch anyway.
-- **Signatures stay in the bundle:** the mirror gets the image, not its cosign signature, so `cosign verify` against your registry finds nothing. The digest pin is the check, with `images/<name>.cosign.json` in the signed bundle as the record of the signature check.
-- Bundles made before this (with `docker save` images) can't be pushed with their digests: `push` refuses them. Use `load` for those, or a newer bundle.
+### Checking signatures in the mirror
+
+The mirror has the release's cosign signatures and provenance, so you (or your registry's admission policy) can check an image there, with no internet. cosign needs Sigstore's trusted root offline, as for [the bundle](#verifying-a-bundle): `trusted_root.json`, copied in separately.
+
+```sh
+cosign verify registry.corp.example/superbot/superbot:0.1.0 --trusted-root trusted_root.json \
+  --certificate-identity https://github.com/CG-Labs/superbot/.github/workflows/docker.yml@refs/tags/v0.1.0 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+cosign verify-attestation --type slsaprovenance1 registry.corp.example/superbot/superbot:0.1.0 --trusted-root trusted_root.json \
+  --certificate-identity https://github.com/CG-Labs/superbot/.github/workflows/docker.yml@refs/tags/v0.1.0 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+The first checks the index's signature; each arch's image (`...@sha256:<its digest>`) is signed too. The second checks the build provenance the `docker` workflow attached. `docker buildx imagetools inspect registry.corp.example/superbot/superbot:0.1.0 --format '{{ json (index .SBOM "linux/amd64").SPDX }}'` reads each arch's SBOM from the mirror. Accept no other identity, as for the published images ([deploy/README.md](../../deploy/README.md#verifying-the-images)).
+
+### Notes
+
+- **Registries:** with the [OCI 1.1 referrers API](https://github.com/opencontainers/distribution-spec/blob/main/spec.md#listing-referrers) (Zot, Harbor 2.8 and later) the signatures are listed there; otherwise (`registry:2`) under the `sha256-<digest>` tags cosign also reads, keeping what those tags already list. The registry must take OCI image indexes and artifact manifests, as current ones do.
+- **The push tool** is `superbot-oci`, in the bundle's `bin/` for its arch: push from a machine of a bundle's arch, or set `SUPERBOT_OCI` to one built for yours (`cargo build --release --bin superbot-oci`). skopeo and docker aren't needed.
+- **Logins and certificates** are skopeo's and Docker's: `skopeo login registry.corp.example` or `docker login` (their auth files and credential helpers), your internal CA in `/etc/containers/certs.d/registry.corp.example/ca.crt` (or `/etc/docker/certs.d/...`, or the system's trust store). A registry without TLS, for a lab only, is marked `insecure = true` in `/etc/containers/registries.conf.d/`.
+- **Doing it yourself:** the images are OCI archives and the signatures OCI layouts, so after extracting a bundle any tool that copies OCI layouts with their referrers can push them; then check the digests yourself.
+- Bundles made before ADR 0147 have no signatures or `superbot-oci` (set `SUPERBOT_OCI`): their images go up alone, one arch per path (`--registry registry.corp.example/superbot/arm64`), and `cosign verify` against the mirror finds nothing; `images/<name>.cosign.json` is the record of the check. Bundles made before ADR 0140 (with `docker save` images) can't be pushed with their digests: `push` refuses them. Use `load` for those, or a newer bundle.
 
 ## Model providers
 
