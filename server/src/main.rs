@@ -46,6 +46,9 @@ mod deprovision;
 #[cfg(test)]
 mod deprovision_http_tests;
 mod erasure;
+mod evidence;
+#[cfg(test)]
+mod evidence_http_tests;
 mod file_retention;
 #[cfg(test)]
 mod file_retention_http_tests;
@@ -350,6 +353,7 @@ async fn main() {
         })
     };
     let data_dir = root("DATA_DIR", "data");
+    let evidence = evidence::Settings::from_env(&|k| env(k, ""), &data_dir).unwrap_or_else(|e| exit(format!("Evidence bundles: {e}")));
     let workspace = root("WORKSPACE_DIR", "workspace");
     let db_path = paths::child(&data_dir, "app.sqlite").unwrap();
     let data_lock = database_encryption::lock_data_dir(&db_path).unwrap_or_else(|e| exit(format!("Database: {e}")));
@@ -746,6 +750,7 @@ async fn main() {
     secrets::external::start_audit(app.clone());
     retention::start(app.clone(), retention::Settings { chat: chat_retention, sessions: session_retention, teammate_files: teammate_files_retention });
     server_backups::start(app.clone());
+    evidence::start(app.clone(), evidence, sessions, mfa_pinned);
     backup_encryption::start(app.clone());
     database_encryption::start(app.clone());
     users::start_pruning(app.clone(), sessions);
@@ -888,6 +893,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/backups", get(server_backups::get).post(server_backups::copy_now))
         .route("/database", get(database_encryption::get))
         .route("/support/bundle", get(support::bundle))
+        .route("/evidence", get(evidence::get))
+        .route("/evidence/bundle", get(evidence::bundle))
         .route("/secrets", get(list_secrets))
         .route("/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/me/tier", get(my_tier))
