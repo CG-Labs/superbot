@@ -172,7 +172,7 @@ function AccountForm({
   );
 }
 
-function NewAccount({ api, view, roles, teams, onCreated }: { api: SuperBotApi; view: ServiceAccountsView; roles: CustomRole[]; teams: Team[]; onCreated: (id: string, minted: MintedServiceToken | null, error: string | null) => Promise<void> }) {
+function NewAccount({ api, view, roles, teams, onBusy, onCreated }: { api: SuperBotApi; view: ServiceAccountsView; roles: CustomRole[]; teams: Team[]; onBusy: (busy: boolean) => void; onCreated: (id: string, minted: MintedServiceToken | null, error: string | null) => Promise<void> }) {
   const [draft, setDraft] = useState<ServiceAccountDraft>(emptyDraft());
   const [firstToken, setFirstToken] = useState(true);
   const [days, setDays] = useState(view.defaultDays);
@@ -182,6 +182,7 @@ function NewAccount({ api, view, roles, teams, onCreated }: { api: SuperBotApi; 
 
   const create = async () => {
     setBusy(true);
+    onBusy(true);
     setError(null);
     try {
       const sa = await api.createServiceAccount(createBody(draft));
@@ -194,10 +195,12 @@ function NewAccount({ api, view, roles, teams, onCreated }: { api: SuperBotApi; 
           tokenError = `Made ${sa.name}, but not its token: ${message(err)}`;
         }
       }
+      onBusy(false);
       await onCreated(sa.id, minted, tokenError);
     } catch (err) {
       setError(message(err));
       setBusy(false);
+      onBusy(false);
     }
   };
 
@@ -235,6 +238,7 @@ function AccountDetail({
   onDismissMinted,
   onChanged,
   onDeleted,
+  onBusy,
   notice,
 }: {
   api: SuperBotApi;
@@ -247,6 +251,8 @@ function AccountDetail({
   onDismissMinted: () => void;
   onChanged: () => Promise<void>;
   onDeleted: () => Promise<void>;
+  /** While a request runs, picking another account would lose a secret it returns. */
+  onBusy: (busy: boolean) => void;
   notice: string | null;
 }) {
   const [full, setFull] = useState<ServiceAccount | null>(null);
@@ -274,6 +280,7 @@ function AccountDetail({
 
   const run = async (action: () => Promise<unknown>) => {
     setBusy(true);
+    onBusy(true);
     setError(null);
     try {
       await action();
@@ -281,6 +288,7 @@ function AccountDetail({
       setError(message(err));
     } finally {
       setBusy(false);
+      onBusy(false);
     }
   };
   const refresh = async () => {
@@ -450,6 +458,7 @@ export function ServiceAccountsAdmin({ api, onBack }: Props) {
   const [picked, setPicked] = useState<Picked>(null);
   const [minted, setMinted] = useState<MintedServiceToken | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -467,6 +476,7 @@ export function ServiceAccountsAdmin({ api, onBack }: Props) {
   }, [api, load]);
 
   const pick = (p: Picked) => {
+    if (busy) return;
     setPicked(p);
     setMinted(null);
     setNotice(null);
@@ -486,9 +496,11 @@ export function ServiceAccountsAdmin({ api, onBack }: Props) {
       onDismissMinted={() => setMinted(null)}
       onChanged={load}
       onDeleted={async () => {
-        pick(null);
+        setPicked(null);
+        setMinted(null);
         await load();
       }}
+      onBusy={setBusy}
       notice={notice}
     />
   ) : picked?.kind === "new" ? (
@@ -497,6 +509,7 @@ export function ServiceAccountsAdmin({ api, onBack }: Props) {
       view={view}
       roles={roles}
       teams={teams}
+      onBusy={setBusy}
       onCreated={async (id, m, tokenError) => {
         await load();
         setPicked({ kind: "account", id });
@@ -513,7 +526,7 @@ export function ServiceAccountsAdmin({ api, onBack }: Props) {
           <Text style={styles.back}>‹ Bots</Text>
         </Pressable>
         <Text style={styles.title}>Service accounts</Text>
-        <Button label="New service account" primary disabled={!view} onPress={() => pick({ kind: "new" })} />
+        <Button label="New service account" primary disabled={!view || busy} onPress={() => pick({ kind: "new" })} />
       </View>
       <View style={styles.body}>
         <View style={wide ? styles.listPaneWide : styles.listPane}>
@@ -526,6 +539,8 @@ export function ServiceAccountsAdmin({ api, onBack }: Props) {
                   key={s.id}
                   style={[styles.listRow, picked?.kind === "account" && picked.id === s.id && styles.selected]}
                   onPress={() => pick({ kind: "account", id: s.id })}
+                  disabled={busy}
+                  accessibilityState={{ disabled: busy }}
                   accessibilityRole="button"
                   accessibilityLabel={`Service account ${s.name}`}
                 >

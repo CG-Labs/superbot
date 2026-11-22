@@ -891,7 +891,7 @@ async function loadServiceAccounts({ keepForm = false } = {}) {
       api("GET", "/api/users").catch(() => []),
       api("GET", "/api/teams").then((v) => v.teams || []).catch(() => []),
     ]);
-    const details = await Promise.all(view.serviceAccounts.map((s) => api("GET", `/api/service-accounts/${key(s.id)}`).catch(() => s)));
+    const details = await Promise.all(view.serviceAccounts.map((s) => api("GET", `/api/service-accounts/${key(s.id)}`).catch(() => ({ ...s, loadFailed: true }))));
     saTab.view = view;
     saTab.details = Object.fromEntries(details.map((d) => [d.id, d]));
     saTab.people = people;
@@ -957,7 +957,7 @@ function saCard(s) {
     ${!active ? '<p class="warn">Disabled: its tokens don\'t work. Enable it to use or make tokens.</p>' : ""}
     <span class="sub">Can use today:</span>${s.effective.length ? tags(s.effective) : ' <span class="sub">nothing</span>'}
     ${s.team ? `<span class="sub">In ${esc(s.team.name)}: ${esc(permNames(s.teamPermissions))}</span>` : ""}
-    ${tokens.length ? `<table class="grid"><thead><tr><th>Token</th><th>Scopes</th><th>State</th><th>Use</th><th></th></tr></thead><tbody>${tokens.map((t) => tokenRow(t, active)).join("")}</tbody></table>` : '<p class="hint">No tokens yet.</p>'}
+    ${d.loadFailed ? '<p class="warn">Its tokens didn\'t load. <button type="button" class="btn" data-act="reload-sa">Reload</button></p>' : tokens.length ? `<table class="grid"><thead><tr><th>Token</th><th>Scopes</th><th>State</th><th>Use</th><th></th></tr></thead><tbody>${tokens.map((t) => tokenRow(t, active)).join("")}</tbody></table>` : '<p class="hint">No tokens yet.</p>'}
     ${active ? `<form class="bar" data-act="new-token" autocomplete="off">
       <input name="name" placeholder="Token name (optional), e.g. CI" maxlength="60" />
       <span class="sub">Scopes (none: everything it holds):</span>
@@ -984,9 +984,15 @@ function renderSaForm(reset = true) {
   const role = reset ? (s ? saRoleKey(s) : "readonly") : $("sa-role").value || "readonly";
   const team = reset ? s?.team?.id || "" : $("sa-team").value;
   const days = reset ? String(saTab.view.defaultDays) : $("sa-first-days").value || String(saTab.view.defaultDays);
-  $("sa-role").innerHTML = [["readonly", "Read-only"], ["member", "Member"], ...roles.roles.map((r) => [r.id, `${r.name} (${baseName(r.base).toLowerCase()} +)`])]
-    .map(([v, l]) => `<option value="${esc(v)}" ${v === role ? "selected" : ""}>${esc(l)}</option>`).join("");
-  $("sa-team").innerHTML = `<option value="">Across the server</option>${saTab.teams.map((t) => `<option value="${esc(t.id)}" ${t.id === team ? "selected" : ""}>${esc(t.name)}</option>`).join("")}`;
+  // The account's own role and team stay offered even when roles or teams didn't load, so a
+  // save never quietly drops them.
+  const held = s && (s.customRole || s.teamRole);
+  const roleList = [["readonly", "Read-only"], ["member", "Member"], ...roles.roles.map((r) => [r.id, `${r.name} (${baseName(r.base).toLowerCase()} +)`])];
+  if (held && !roleList.some(([v]) => v === held.id)) roleList.push([held.id, held.name]);
+  $("sa-role").innerHTML = roleList.map(([v, l]) => `<option value="${esc(v)}" ${v === role ? "selected" : ""}>${esc(l)}</option>`).join("");
+  const teamList = saTab.teams.map((t) => [t.id, t.name]);
+  if (s?.team && !teamList.some(([v]) => v === s.team.id)) teamList.push([s.team.id, s.team.name]);
+  $("sa-team").innerHTML = `<option value="">Across the server</option>${teamList.map(([v, l]) => `<option value="${esc(v)}" ${v === team ? "selected" : ""}>${esc(l)}</option>`).join("")}`;
   $("sa-first-days").innerHTML = daysOptions();
   $("sa-first-days").value = days;
   if (!reset) return;
@@ -1012,6 +1018,8 @@ $("sa-form").addEventListener("submit", async (e) => {
   if (custom && body.team && custom.base === "readonly") return fail(new Error("A read-only role changes nothing in a team. Pick one based on member."));
   const s = saTab.view.serviceAccounts.find((x) => x.id === saTab.editing);
   if (saTab.editing && !s) return fail(new Error("That service account didn't load. Reload the page before saving."));
+  if ($("sa-save").disabled) return;
+  $("sa-save").disabled = true;
   try {
     if (s) {
       const patch = {};
@@ -1038,6 +1046,8 @@ $("sa-form").addEventListener("submit", async (e) => {
     saTab.editing = null;
   } catch (err) {
     return fail(err);
+  } finally {
+    $("sa-save").disabled = false;
   }
   loadServiceAccounts();
 });
@@ -1058,6 +1068,7 @@ $("sa-list").addEventListener("click", async (e) => {
   if (!b) return;
   const s = saOf(b);
   if (!s) return;
+  if (b.dataset.act === "reload-sa") return loadServiceAccounts({ keepForm: true });
   if (b.dataset.act === "edit-sa") {
     saTab.editing = s.id;
     renderSaForm();
@@ -1105,6 +1116,9 @@ $("sa-list").addEventListener("submit", async (e) => {
   if (!f) return;
   e.preventDefault();
   const s = saOf(f);
+  const submit = f.querySelector("button[type=submit]");
+  if (submit.disabled) return;
+  submit.disabled = true;
   const body = { expiresInDays: Number(f.days.value) };
   const name = f.elements.name.value.trim();
   const scopes = [...f.querySelectorAll("input[name=scope]:checked")].map((i) => i.value);

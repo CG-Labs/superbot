@@ -179,8 +179,9 @@ fn the_console_asks_before_stopping_a_service_account_and_keeps_no_token() {
         assert!(!CONSOLE_JS.contains(kept), "the console keeps something in {kept}");
     }
     let secret = |l: &str| l.match_indices("r.token").any(|(i, m)| !l[i + m.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_'));
-    let secrets: Vec<&str> = lines.iter().map(|l| l.trim()).filter(|l| secret(l)).collect();
-    assert!(!secrets.is_empty() && secrets.iter().all(|l| l.contains("value: r.token")), "a token's secret goes somewhere but the shown-once dialog: {secrets:?}");
+    let uses: Vec<usize> = (0..lines.len()).filter(|&n| secret(lines[n])).collect();
+    let elsewhere: Vec<usize> = uses.iter().copied().filter(|&n| !lines[n].contains("value: r.token")).map(|n| n + 1).collect();
+    assert!(!uses.is_empty() && elsewhere.is_empty(), "a token's secret goes somewhere but the shown-once dialog, on lines {elsewhere:?}");
 }
 
 #[tokio::test]

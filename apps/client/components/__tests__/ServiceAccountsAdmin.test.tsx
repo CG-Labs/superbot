@@ -169,6 +169,24 @@ describe("ServiceAccountsAdmin (ADR 0143, 0152)", () => {
     await waitFor(() => expect(api.revokeServiceToken).toHaveBeenCalledWith("sa1", "st1"));
   });
 
+  it("won't switch accounts while a rotate is pending, so its new secret is still shown", async () => {
+    const api = mockApi({ ...VIEW, serviceAccounts: [SA, { ...SA, id: "sa2", name: "Export" }] });
+    let finish: (m: MintedServiceToken) => void = () => {};
+    api.rotateServiceToken.mockImplementationOnce(() => new Promise<MintedServiceToken>((resolve) => (finish = resolve)));
+    const u = userEvent.setup();
+    await open(api, u);
+    await u.press(screen.getByLabelText("Rotate CI"));
+    await u.press(screen.getByLabelText("Confirm rotate CI"));
+    await waitFor(() => expect(screen.getByLabelText("Service account Export")).toBeDisabled());
+    expect(screen.getByLabelText("New service account")).toBeDisabled();
+    await u.press(screen.getByLabelText("Service account Export"));
+    expect(api.serviceAccount).not.toHaveBeenCalledWith("sa2");
+
+    finish(minted(ROTATED));
+    expect(await screen.findByTestId("token-value")).toHaveTextContent(ROTATED);
+    await waitFor(() => expect(screen.getByLabelText("Service account Export")).not.toBeDisabled());
+  });
+
   it("doesn't revoke when the admin says no", async () => {
     (confirmAsync as jest.Mock).mockResolvedValueOnce(false);
     const api = mockApi();
