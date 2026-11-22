@@ -7,7 +7,7 @@ use crate::machines::State as MachineState;
 use crate::policy::{Action, Mode, Override, Policy, Rule};
 use crate::rbac::Role;
 use crate::secrets::{redact, sealed};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -139,12 +139,21 @@ pub(crate) struct Scrub {
 impl Scrub {
     pub(crate) fn new(id: &str, pseudonym: &str, emails: Vec<String>, exact: Vec<String>) -> Scrub {
         let clean = |v: Vec<String>, min: usize| {
-            let mut v: Vec<String> = v.into_iter().map(|s| s.trim().to_lowercase()).filter(|s| s.chars().count() >= min).collect();
+            let mut v: Vec<String> = v
+                .into_iter()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| s.chars().count() >= min)
+                .collect();
             v.sort();
             v.dedup();
             v
         };
-        Scrub { id: id.into(), pseudonym: pseudonym.into(), emails: clean(emails, 3), exact: clean(exact, 2) }
+        Scrub {
+            id: id.into(),
+            pseudonym: pseudonym.into(),
+            emails: clean(emails, 3),
+            exact: clean(exact, 2),
+        }
     }
 
     pub(crate) fn text(&self, t: &str) -> Option<String> {
@@ -180,7 +189,11 @@ impl Scrub {
 /// changes lengths, a string that contains it is replaced whole.
 fn replace_ci(hay: &str, needle: &str, with: &str) -> String {
     if !(hay.is_ascii() && needle.is_ascii()) {
-        return if hay.to_lowercase().contains(needle) { with.into() } else { hay.into() };
+        return if hay.to_lowercase().contains(needle) {
+            with.into()
+        } else {
+            hay.into()
+        };
     }
     let low = hay.to_ascii_lowercase();
     let (mut out, mut i) = (String::new(), 0);
@@ -194,7 +207,12 @@ fn replace_ci(hay: &str, needle: &str, with: &str) -> String {
 }
 
 fn retention_hold_row(r: &rusqlite::Row) -> rusqlite::Result<RetentionHold> {
-    Ok(RetentionHold { bot_id: r.get("bot_id")?, reason: r.get("reason")?, held_by: r.get("held_by")?, held_at: r.get("held_at")? })
+    Ok(RetentionHold {
+        bot_id: r.get("bot_id")?,
+        reason: r.get("reason")?,
+        held_by: r.get("held_by")?,
+        held_at: r.get("held_at")?,
+    })
 }
 
 #[derive(Clone, Serialize)]
@@ -238,7 +256,12 @@ pub type SeatCap = Box<dyn Fn() -> Option<u32> + Send + Sync>;
 /// The connection, and the seat limit every way of adding or re-enabling a user checks
 /// under the same lock. Unset (as in most tests): no limit.
 /// `.2`: TEAMS=on (ADR 0087), so people in no team share Bots with nobody.
-pub struct Db(Mutex<Connection>, std::sync::OnceLock<SeatCap>, std::sync::atomic::AtomicBool, crate::obs::Metrics);
+pub struct Db(
+    Mutex<Connection>,
+    std::sync::OnceLock<SeatCap>,
+    std::sync::atomic::AtomicBool,
+    crate::obs::Metrics,
+);
 
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -260,8 +283,11 @@ fn bot_row(r: &Row) -> rusqlite::Result<Bot> {
         created_at: r.get("created_at")?,
         owner_id: r.get("owner_id")?,
         // The column's CHECK allows only the two; anything else would fail closed.
-        visibility: Visibility::parse(&r.get::<_, String>("visibility")?).unwrap_or(Visibility::Private),
-        prompts: r.get::<_, Option<String>>("prompts")?.and_then(|j| serde_json::from_str(&j).ok()),
+        visibility: Visibility::parse(&r.get::<_, String>("visibility")?)
+            .unwrap_or(Visibility::Private),
+        prompts: r
+            .get::<_, Option<String>>("prompts")?
+            .and_then(|j| serde_json::from_str(&j).ok()),
     })
 }
 
@@ -287,7 +313,9 @@ fn message_row(r: &Row) -> rusqlite::Result<Message> {
         status: r.get("status")?,
         from_bot: r.get("from_bot")?,
         created_at: r.get("created_at")?,
-        requested_by: r.get::<_, Option<String>>("requested_by")?.and_then(|s| serde_json::from_str(&s).ok()),
+        requested_by: r
+            .get::<_, Option<String>>("requested_by")?
+            .and_then(|s| serde_json::from_str(&s).ok()),
     })
 }
 
@@ -414,7 +442,10 @@ pub enum Applied {
     /// Its customer is linked to another user (ADR 0042).
     CustomerOfAnotherUser,
     Unchanged,
-    Changed { from: Option<String>, to: Option<String> },
+    Changed {
+        from: Option<String>,
+        to: Option<String>,
+    },
 }
 
 /// What an event applied by `Db::apply_subscription` changed, for the billing emails it
@@ -530,20 +561,46 @@ pub enum Linked {
     Deleted,
 }
 
-fn link_in(c: &Connection, user_id: &str, provider: &str, customer_id: &str, via: &str) -> rusqlite::Result<Linked> {
-    let deleted: bool = c.query_row("SELECT COUNT(*) FROM billing_deleted_customers WHERE customer_id = ?", [customer_id], |r| r.get(0))?;
+fn link_in(
+    c: &Connection,
+    user_id: &str,
+    provider: &str,
+    customer_id: &str,
+    via: &str,
+) -> rusqlite::Result<Linked> {
+    let deleted: bool = c.query_row(
+        "SELECT COUNT(*) FROM billing_deleted_customers WHERE customer_id = ?",
+        [customer_id],
+        |r| r.get(0),
+    )?;
     if deleted {
         return Ok(Linked::Deleted);
     }
-    let by_customer: Option<String> = c.query_row("SELECT user_id FROM billing_customers WHERE customer_id = ?", [customer_id], |r| r.get(0)).optional()?;
+    let by_customer: Option<String> = c
+        .query_row(
+            "SELECT user_id FROM billing_customers WHERE customer_id = ?",
+            [customer_id],
+            |r| r.get(0),
+        )
+        .optional()?;
     if let Some(u) = by_customer {
-        return Ok(if u == user_id { Linked::Already } else { Linked::OfAnotherUser(u) });
+        return Ok(if u == user_id {
+            Linked::Already
+        } else {
+            Linked::OfAnotherUser(u)
+        });
     }
     // A team's customer (ADR 0093) pays for the team, never for one person.
     if let Some(t) = customer_team_in(c, customer_id)? {
         return Ok(Linked::OfAnotherUser(format!("team:{t}")));
     }
-    let by_user: Option<String> = c.query_row("SELECT customer_id FROM billing_customers WHERE user_id = ?", [user_id], |r| r.get(0)).optional()?;
+    let by_user: Option<String> = c
+        .query_row(
+            "SELECT customer_id FROM billing_customers WHERE user_id = ?",
+            [user_id],
+            |r| r.get(0),
+        )
+        .optional()?;
     if let Some(other) = by_user {
         return Ok(Linked::UserHasAnother(other));
     }
@@ -555,24 +612,55 @@ fn link_in(c: &Connection, user_id: &str, provider: &str, customer_id: &str, via
 }
 
 fn customer_team_in(c: &Connection, customer_id: &str) -> rusqlite::Result<Option<String>> {
-    c.query_row("SELECT team_id FROM team_customers WHERE customer_id = ?", [customer_id], |r| r.get(0)).optional()
+    c.query_row(
+        "SELECT team_id FROM team_customers WHERE customer_id = ?",
+        [customer_id],
+        |r| r.get(0),
+    )
+    .optional()
 }
 
 /// Links a payment-provider customer to a team (ADR 0093), as `link_in` does to a user:
 /// one customer per team, one team per customer, never a user's, and the first link stands.
-fn link_team_in(c: &Connection, team_id: &str, provider: &str, customer_id: &str, via: &str) -> rusqlite::Result<Linked> {
-    let deleted: bool = c.query_row("SELECT COUNT(*) FROM billing_deleted_customers WHERE customer_id = ?", [customer_id], |r| r.get(0))?;
+fn link_team_in(
+    c: &Connection,
+    team_id: &str,
+    provider: &str,
+    customer_id: &str,
+    via: &str,
+) -> rusqlite::Result<Linked> {
+    let deleted: bool = c.query_row(
+        "SELECT COUNT(*) FROM billing_deleted_customers WHERE customer_id = ?",
+        [customer_id],
+        |r| r.get(0),
+    )?;
     if deleted {
         return Ok(Linked::Deleted);
     }
     if let Some(t) = customer_team_in(c, customer_id)? {
-        return Ok(if t == team_id { Linked::Already } else { Linked::OfAnotherUser(format!("team:{t}")) });
+        return Ok(if t == team_id {
+            Linked::Already
+        } else {
+            Linked::OfAnotherUser(format!("team:{t}"))
+        });
     }
-    let user: Option<String> = c.query_row("SELECT user_id FROM billing_customers WHERE customer_id = ?", [customer_id], |r| r.get(0)).optional()?;
+    let user: Option<String> = c
+        .query_row(
+            "SELECT user_id FROM billing_customers WHERE customer_id = ?",
+            [customer_id],
+            |r| r.get(0),
+        )
+        .optional()?;
     if let Some(u) = user {
         return Ok(Linked::OfAnotherUser(u));
     }
-    let by_team: Option<String> = c.query_row("SELECT customer_id FROM team_customers WHERE team_id = ?", [team_id], |r| r.get(0)).optional()?;
+    let by_team: Option<String> = c
+        .query_row(
+            "SELECT customer_id FROM team_customers WHERE team_id = ?",
+            [team_id],
+            |r| r.get(0),
+        )
+        .optional()?;
     if let Some(other) = by_team {
         return Ok(Linked::UserHasAnother(other));
     }
@@ -584,7 +672,11 @@ fn link_team_in(c: &Connection, team_id: &str, provider: &str, customer_id: &str
 }
 
 /// Queues a billing email, due at `due`, unless one with its key was queued before.
-fn queue_email(c: &Connection, e: &crate::billing_mail::NewEmail, due: i64) -> rusqlite::Result<bool> {
+fn queue_email(
+    c: &Connection,
+    e: &crate::billing_mail::NewEmail,
+    due: i64,
+) -> rusqlite::Result<bool> {
     let facts = serde_json::to_string(&e.facts).unwrap_or_else(|_| "{}".into());
     Ok(c.execute(
         "INSERT OR IGNORE INTO billing_emails (key, user_id, kind, facts, event_id, next_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -612,7 +704,10 @@ fn queued_email_row(r: &Row) -> rusqlite::Result<crate::billing_mail::Queued> {
 
 /// Records a payment-provider event id. False when it was already applied.
 fn first_delivery(c: &Connection, event_id: &str, event_type: &str) -> rusqlite::Result<bool> {
-    Ok(c.execute("INSERT OR IGNORE INTO billing_events (event_id, type, received_at) VALUES (?, ?, ?)", params![event_id, event_type, now()])? == 1)
+    Ok(c.execute(
+        "INSERT OR IGNORE INTO billing_events (event_id, type, received_at) VALUES (?, ?, ?)",
+        params![event_id, event_type, now()],
+    )? == 1)
 }
 
 fn routine_row(r: &Row) -> rusqlite::Result<Routine> {
@@ -1099,7 +1194,9 @@ fn machine_row(r: &Row) -> rusqlite::Result<Machine> {
         enroll_overdue_at: r.get("enroll_overdue_at")?,
         assigned_at: r.get("assigned_at")?,
         assigned_by: r.get("assigned_by")?,
-        agent_upkeep: r.get::<_, Option<String>>("agent_upkeep")?.and_then(|j| serde_json::from_str(&j).ok()),
+        agent_upkeep: r
+            .get::<_, Option<String>>("agent_upkeep")?
+            .and_then(|j| serde_json::from_str(&j).ok()),
         harnesses_sent_at: r.get("harnesses_sent_at")?,
         harnesses_sent_plan: r.get("harnesses_sent_plan")?,
         upgrade_hold_at: r.get("upgrade_hold_at")?,
@@ -1200,7 +1297,11 @@ pub struct PushDevice {
 
 impl std::fmt::Debug for PushDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PushDevice").field("id", &self.id).field("user_id", &self.user_id).field("platform", &self.platform).finish_non_exhaustive()
+        f.debug_struct("PushDevice")
+            .field("id", &self.id)
+            .field("user_id", &self.user_id)
+            .field("platform", &self.platform)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1553,7 +1654,9 @@ fn session_row(r: &Row) -> rusqlite::Result<Session> {
 
 /// None when the sealed token doesn't open (another master key): such a device can't be reached.
 fn push_device_row(r: &Row) -> rusqlite::Result<Option<PushDevice>> {
-    let Some(token) = sealed::open_field(PUSH_TOKEN_CONTEXT, &r.get::<_, String>("token")?) else { return Ok(None) };
+    let Some(token) = sealed::open_field(PUSH_TOKEN_CONTEXT, &r.get::<_, String>("token")?) else {
+        return Ok(None);
+    };
     Ok(Some(PushDevice {
         id: r.get("id")?,
         user_id: r.get("user_id")?,
@@ -1581,7 +1684,10 @@ fn approval_row(r: &Row) -> rusqlite::Result<Approval> {
         tool: r.get("tool")?,
         kind: r.get("kind")?,
         subject: r.get("subject")?,
-        input: match sealed::open_field(&sealed::approval_context(&r.get::<_, String>("id")?), &input) {
+        input: match sealed::open_field(
+            &sealed::approval_context(&r.get::<_, String>("id")?),
+            &input,
+        ) {
             Some(input) => serde_json::from_str(&input).unwrap_or(Value::Null),
             None => serde_json::json!({ "sealed": "unreadable" }),
         },
@@ -1595,7 +1701,9 @@ fn approval_row(r: &Row) -> rusqlite::Result<Approval> {
         note: r.get("note")?,
         rule_id: r.get("rule_id")?,
         run_id: r.get("run_id")?,
-        run_scope: r.get::<_, Option<String>>("run_scope")?.and_then(|s| serde_json::from_str(&s).ok()),
+        run_scope: r
+            .get::<_, Option<String>>("run_scope")?
+            .and_then(|s| serde_json::from_str(&s).ok()),
         scope: r.get("scope")?,
     })
 }
@@ -1605,7 +1713,11 @@ fn rule_row(r: &Row) -> rusqlite::Result<Rule> {
     Ok(Rule {
         id: r.get("id")?,
         bot_id: r.get("bot_id")?,
-        action: if action == "allow" { Action::Allow } else { Action::Deny },
+        action: if action == "allow" {
+            Action::Allow
+        } else {
+            Action::Deny
+        },
         tool: r.get("tool")?,
         pattern: r.get("pattern")?,
         note: r.get("note")?,
@@ -1695,13 +1807,15 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 44] = [
 
 /// Off-host copies of the server's own backup archives (ADR 0109): `running`, then `done`
 /// or `failed`, and `deleted` once past their retention. One runs at a time. An archive
-/// that failed is tried again, so it can have several rows.
+/// that failed is tried again, so it can have several rows. `destination` is the store
+/// and folder it went to: a copy elsewhere doesn't count once the store changes.
 fn migrate_server_backups(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
     c.execute_batch(
         "CREATE TABLE IF NOT EXISTS server_backups (
           id TEXT PRIMARY KEY,
           archive TEXT NOT NULL,
           state TEXT NOT NULL CHECK (state IN ('running', 'done', 'failed', 'deleted')),
+          destination TEXT NOT NULL,
           object_key TEXT NOT NULL,
           encrypted INTEGER NOT NULL DEFAULT 0,
           encrypted_by TEXT,
@@ -1714,8 +1828,8 @@ fn migrate_server_backups(c: &Connection, _fresh: bool) -> rusqlite::Result<()> 
           expires_at INTEGER,
           deleted_at INTEGER
         );
-        CREATE INDEX IF NOT EXISTS server_backups_archive ON server_backups(archive, started_at);
-        CREATE INDEX IF NOT EXISTS server_backups_created ON server_backups(created_at);
+        CREATE INDEX IF NOT EXISTS server_backups_archive ON server_backups(destination, archive, started_at);
+        CREATE INDEX IF NOT EXISTS server_backups_created ON server_backups(destination, created_at);
         CREATE UNIQUE INDEX IF NOT EXISTS server_backups_running ON server_backups(state) WHERE state = 'running';",
     )
 }
@@ -1732,8 +1846,16 @@ const ERASING_BOTS: &str = "erasing_bots:";
 /// the erased person's id with that pseudonym and clear their name, email, subject,
 /// address, user agent and session, and rewrite details; nothing else about an event changes.
 fn migrate_user_erasure(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
-    for (col, ty) in [("erased_at", "INTEGER"), ("erased_by", "TEXT"), ("erased_as", "TEXT")] {
-        let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = ?", [col], |r| r.get(0))?;
+    for (col, ty) in [
+        ("erased_at", "INTEGER"),
+        ("erased_by", "TEXT"),
+        ("erased_as", "TEXT"),
+    ] {
+        let has: bool = c.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = ?",
+            [col],
+            |r| r.get(0),
+        )?;
         if !has {
             c.execute_batch(&format!("ALTER TABLE users ADD COLUMN {col} {ty};"))?;
         }
@@ -1848,7 +1970,11 @@ fn migrate_team_billing(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
           subscription_id TEXT
         );",
     )?;
-    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('token_usage') WHERE name = 'meter_customer'", [], |r| r.get(0))?;
+    let has: bool = c.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('token_usage') WHERE name = 'meter_customer'",
+        [],
+        |r| r.get(0),
+    )?;
     if has {
         return Ok(());
     }
@@ -1876,7 +2002,11 @@ fn migrate_mfa(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
             PRIMARY KEY (user_id, code_hash)
         );",
     )?;
-    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'mfa'", [], |r| r.get(0))?;
+    let has: bool = c.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'mfa'",
+        [],
+        |r| r.get(0),
+    )?;
     if !has {
         c.execute_batch("ALTER TABLE sessions ADD COLUMN mfa TEXT;")?;
     }
@@ -1943,7 +2073,11 @@ fn migrate_billing_emails(c: &Connection, _fresh: bool) -> rusqlite::Result<()> 
 /// What the homes on a machine hold (ADR 0105), as its agent last said, and when botd
 /// heard it: the owner's storage counts it while their Bots work there.
 fn migrate_machine_home_use(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
-    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'disk_files'", [], |r| r.get(0))?;
+    let has: bool = c.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'disk_files'",
+        [],
+        |r| r.get(0),
+    )?;
     if has {
         return Ok(());
     }
@@ -1957,7 +2091,11 @@ fn migrate_machine_home_use(c: &Connection, _fresh: bool) -> rusqlite::Result<()
 /// When a machine was suspended (ADR 0085): what its agent said of its disk before then
 /// still holds while it's off, and what it said long before doesn't.
 fn migrate_machine_suspended_at(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
-    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'suspended_at'", [], |r| r.get(0))?;
+    let has: bool = c.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'suspended_at'",
+        [],
+        |r| r.get(0),
+    )?;
     if has {
         return Ok(());
     }
@@ -2009,7 +2147,11 @@ fn migrate_teams(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
 
 /// The size last sent to the provider for a resize whose outcome is unknown (ADR 0085).
 fn migrate_machine_resize_sent(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
-    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'resize_sent_plan'", [], |r| r.get(0))?;
+    let has: bool = c.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'resize_sent_plan'",
+        [],
+        |r| r.get(0),
+    )?;
     if has {
         return Ok(());
     }
@@ -2022,7 +2164,11 @@ fn migrate_machine_resize_sent(c: &Connection, _fresh: bool) -> rusqlite::Result
 /// Resizing a machine when its user's tier changes (ADR 0085): the latest resize, kept
 /// on the machine as rebuilds are, and what its agent says of its disk.
 fn migrate_machine_tier_resize(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
-    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'resize_state'", [], |r| r.get(0))?;
+    let has: bool = c.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'resize_state'",
+        [],
+        |r| r.get(0),
+    )?;
     if has {
         return Ok(());
     }
@@ -2071,7 +2217,11 @@ fn migrate_push_devices(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
 /// A host an admin drained (ADR 0081): nothing new is placed there, and machines on
 /// it stay until moved.
 fn migrate_machine_host_drain(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
-    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machine_hosts') WHERE name = 'drained_at'", [], |r| r.get(0))?;
+    let has: bool = c.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('machine_hosts') WHERE name = 'drained_at'",
+        [],
+        |r| r.get(0),
+    )?;
     if !has {
         c.execute_batch(
             "ALTER TABLE machine_hosts ADD COLUMN drained_at INTEGER;
@@ -2079,7 +2229,11 @@ fn migrate_machine_host_drain(c: &Connection, _fresh: bool) -> rusqlite::Result<
             ALTER TABLE machine_hosts ADD COLUMN drain_reason TEXT;",
         )?;
     }
-    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'placed_on'", [], |r| r.get(0))?;
+    let has: bool = c.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'placed_on'",
+        [],
+        |r| r.get(0),
+    )?;
     if !has {
         c.execute_batch("ALTER TABLE machines ADD COLUMN placed_on TEXT;")?;
     }
@@ -2105,7 +2259,11 @@ fn migrate_machine_hosts(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
           created_at INTEGER NOT NULL
         );",
     )?;
-    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machine_restores') WHERE name = 'to_host'", [], |r| r.get(0))?;
+    let has: bool = c.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('machine_restores') WHERE name = 'to_host'",
+        [],
+        |r| r.get(0),
+    )?;
     if !has {
         c.execute_batch(
             "ALTER TABLE machine_restores ADD COLUMN from_host TEXT;
@@ -2252,7 +2410,11 @@ fn migrate_machine_backups(c: &Connection, _fresh: bool) -> rusqlite::Result<()>
 /// Recovery objectives (ADR 0074): each restore's tier, RTO and how long it took, and
 /// each time a machine went past its RPO.
 fn migrate_machine_recovery(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
-    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machine_restores') WHERE name = 'rto_ms'", [], |r| r.get(0))?;
+    let has: bool = c.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('machine_restores') WHERE name = 'rto_ms'",
+        [],
+        |r| r.get(0),
+    )?;
     if !has {
         c.execute_batch(
             "ALTER TABLE machine_restores ADD COLUMN tier TEXT;
@@ -2367,6 +2529,8 @@ pub struct ServerBackup {
     pub archive: String,
     /// `running`, `done`, `failed`, or `deleted` (past its retention).
     pub state: String,
+    /// `<endpoint>/<bucket>/<folder>` it was copied to.
+    pub destination: String,
     pub object_key: String,
     pub encrypted: bool,
     /// `archive` (superbot-backup encrypted it) or `botd` (on its way to the store).
@@ -2387,6 +2551,7 @@ fn server_backup_row(r: &Row) -> rusqlite::Result<ServerBackup> {
         id: r.get("id")?,
         archive: r.get("archive")?,
         state: r.get("state")?,
+        destination: r.get("destination")?,
         object_key: r.get("object_key")?,
         encrypted: r.get("encrypted")?,
         encrypted_by: r.get("encrypted_by")?,
@@ -2405,6 +2570,7 @@ fn server_backup_row(r: &Row) -> rusqlite::Result<ServerBackup> {
 pub struct NewServerBackup<'a> {
     pub id: &'a str,
     pub archive: &'a str,
+    pub destination: &'a str,
     pub object_key: &'a str,
     pub created_at: i64,
     pub encrypted_by: Option<&'a str>,
@@ -2483,7 +2649,11 @@ pub struct NewMachineRestore<'a> {
 
 /// Rebuilding machines enrolled before ADR 0039 with today's agent (ADR 0056).
 fn migrate_machine_rebuild(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
-    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'rebuild_state'", [], |r| r.get(0))?;
+    let has: bool = c.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'rebuild_state'",
+        [],
+        |r| r.get(0),
+    )?;
     if has {
         return Ok(());
     }
@@ -2510,12 +2680,22 @@ fn migrate_sandbox(c: &Connection, fresh: bool) -> rusqlite::Result<()> {
     if fresh {
         return Ok(());
     }
-    let saved: Option<String> = c.query_row("SELECT value FROM settings WHERE key = 'policy'", [], |r| r.get(0)).optional()?;
-    let Some(mut policy) = saved.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).filter(serde_json::Value::is_object) else {
+    let saved: Option<String> = c
+        .query_row("SELECT value FROM settings WHERE key = 'policy'", [], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let Some(mut policy) = saved
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .filter(serde_json::Value::is_object)
+    else {
         return Ok(());
     };
     policy["sandbox"] = false.into();
-    c.execute("UPDATE settings SET value = ? WHERE key = 'policy'", [policy.to_string()])?;
+    c.execute(
+        "UPDATE settings SET value = ? WHERE key = 'policy'",
+        [policy.to_string()],
+    )?;
     let details = serde_json::json!({ "sandbox": false, "reason": "existing install keeps harness sandboxes off" });
     c.execute(
         "INSERT INTO audit_events (at, actor_kind, actor_id, action, target_type, target_id, outcome, details) VALUES (?, 'system', 'migration', 'policy.sandbox_initialized', 'policy', 'global', 'success', ?)",
@@ -2526,7 +2706,11 @@ fn migrate_sandbox(c: &Connection, fresh: bool) -> rusqlite::Result<()> {
 
 /// Suggested prompts per Bot (ADR 0054), as a JSON array. NULL: the client's defaults.
 fn migrate_bot_prompts(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
-    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('bots') WHERE name = 'prompts'", [], |r| r.get(0))?;
+    let has: bool = c.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('bots') WHERE name = 'prompts'",
+        [],
+        |r| r.get(0),
+    )?;
     if !has {
         c.execute_batch("ALTER TABLE bots ADD COLUMN prompts TEXT;")?;
     }
@@ -2538,7 +2722,11 @@ fn migrate_bot_prompts(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
 /// never stored: they live with the run and end with it.
 fn migrate_approval_runs(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
     for col in ["run_id", "run_scope", "scope"] {
-        let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('approvals') WHERE name = ?", [col], |r| r.get(0))?;
+        let has: bool = c.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('approvals') WHERE name = ?",
+            [col],
+            |r| r.get(0),
+        )?;
         if !has {
             c.execute_batch(&format!("ALTER TABLE approvals ADD COLUMN {col} TEXT;"))?;
         }
@@ -2756,7 +2944,11 @@ pub struct NewAccountRemoval<'a> {
 /// deleted Bot's usage stays billed. `meter_status` is for reporting to Stripe, when
 /// that's on. Subscriptions keep their period's start, for billing-period usage.
 fn migrate_token_usage(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
-    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('subscriptions') WHERE name = 'period_start'", [], |r| r.get(0))?;
+    let has: bool = c.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('subscriptions') WHERE name = 'period_start'",
+        [],
+        |r| r.get(0),
+    )?;
     if !has {
         c.execute_batch("ALTER TABLE subscriptions ADD COLUMN period_start INTEGER;")?;
     }
@@ -2786,8 +2978,16 @@ fn migrate_token_usage(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
 
 /// Why botd paused a routine, and for whom (ADR 0047), so it can be resumed.
 fn migrate_routine_pauses(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
-    for (col, ty) in [("paused_reason", "TEXT"), ("paused_for", "TEXT"), ("paused_at", "INTEGER")] {
-        let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('routines') WHERE name = ?", [col], |r| r.get(0))?;
+    for (col, ty) in [
+        ("paused_reason", "TEXT"),
+        ("paused_for", "TEXT"),
+        ("paused_at", "INTEGER"),
+    ] {
+        let has: bool = c.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('routines') WHERE name = ?",
+            [col],
+            |r| r.get(0),
+        )?;
         if !has {
             c.execute_batch(&format!("ALTER TABLE routines ADD COLUMN {col} {ty};"))?;
         }
@@ -2798,7 +2998,11 @@ fn migrate_routine_pauses(c: &Connection, _fresh: bool) -> rusqlite::Result<()> 
 /// Who wrote each routine's instruction, so its runs are for them (ADR 0046). Routines
 /// from before have none, and run for their Bot's owner as they did.
 fn migrate_routine_authors(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
-    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('routines') WHERE name = 'author_id'", [], |r| r.get(0))?;
+    let has: bool = c.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('routines') WHERE name = 'author_id'",
+        [],
+        |r| r.get(0),
+    )?;
     if !has {
         c.execute_batch("ALTER TABLE routines ADD COLUMN author_id TEXT;")?;
     }
@@ -2845,7 +3049,11 @@ fn migrate_billing_customers(c: &Connection, _fresh: bool) -> rusqlite::Result<(
 /// Harness CLIs and agent upgrades on machines (ADR 0039): what each agent last said,
 /// the plan sent to it, and an upgrade on its way, held, or failed.
 fn migrate_machine_upkeep(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
-    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'agent_upkeep'", [], |r| r.get(0))?;
+    let has: bool = c.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'agent_upkeep'",
+        [],
+        |r| r.get(0),
+    )?;
     if has {
         return Ok(());
     }
@@ -2917,7 +3125,11 @@ fn migrate_machine_lockdown(c: &Connection, _fresh: bool) -> rusqlite::Result<()
 /// user's Bots run there. Kept on the machine row, so a user can only be placed on
 /// their own machine, and destroying it ends the placement.
 fn migrate_machine_placement(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
-    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'assigned_at'", [], |r| r.get(0))?;
+    let has: bool = c.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'assigned_at'",
+        [],
+        |r| r.get(0),
+    )?;
     if !has {
         c.execute_batch("ALTER TABLE machines ADD COLUMN assigned_at INTEGER; ALTER TABLE machines ADD COLUMN assigned_by TEXT;")?;
     }
@@ -2977,7 +3189,9 @@ fn migrate_machine_enrollment(c: &Connection, _fresh: bool) -> rusqlite::Result<
 /// counted per user and UTC month, for the tier's monthly limit. Keyed by user, so
 /// every query names one.
 fn migrate_tiers(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
-    let has_tier = c.prepare("SELECT 1 FROM pragma_table_info('users') WHERE name = 'tier'")?.exists([])?;
+    let has_tier = c
+        .prepare("SELECT 1 FROM pragma_table_info('users') WHERE name = 'tier'")?
+        .exists([])?;
     if !has_tier {
         c.execute_batch("ALTER TABLE users ADD COLUMN tier TEXT;")?;
     }
@@ -3090,7 +3304,15 @@ fn migrate_signups(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
 }
 
 /// The actor columns the audit log gained with per-user actors (ADR 0019).
-pub const AUDIT_ACTOR_COLUMNS: [&str; 7] = ["actor_email", "actor_role", "auth_method", "idp", "idp_provider", "session_id", "on_behalf_of"];
+pub const AUDIT_ACTOR_COLUMNS: [&str; 7] = [
+    "actor_email",
+    "actor_role",
+    "auth_method",
+    "idp",
+    "idp_provider",
+    "session_id",
+    "on_behalf_of",
+];
 
 /// Per-user audit actors (ADR 0019): each event says who acted as of then (email,
 /// role), how they signed in (method, SSO provider and type, session), and whom a Bot
@@ -3288,7 +3510,8 @@ fn migrate_audit_events(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
 /// Unix ms before which audit events may be deleted, or NULL while retention is off.
 /// Pruning and the delete trigger share it: SQLite's 'now' is fixed for one statement,
 /// so both see the same cutoff.
-const AUDIT_CUTOFF: &str = "(SELECT (CAST(strftime('%s', 'now') AS INTEGER) - CAST(value AS INTEGER) * 86400) * 1000
+const AUDIT_CUTOFF: &str =
+    "(SELECT (CAST(strftime('%s', 'now') AS INTEGER) - CAST(value AS INTEGER) * 86400) * 1000
   FROM settings WHERE key = 'audit_retention_days' AND CAST(value AS INTEGER) > 0)";
 
 /// Approvals and harness policy. Fresh installs ask before risky tools; existing
@@ -3344,7 +3567,10 @@ fn migrate_approvals(c: &Connection, fresh: bool) -> rusqlite::Result<()> {
           BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;",
     )?;
     let policy = Policy::new(if fresh { Mode::Ask } else { Mode::Bypass });
-    c.execute("INSERT INTO settings (key, value) VALUES ('policy', ?)", [serde_json::to_string(&policy).unwrap()])?;
+    c.execute(
+        "INSERT INTO settings (key, value) VALUES ('policy', ?)",
+        [serde_json::to_string(&policy).unwrap()],
+    )?;
     let detail = serde_json::json!({ "mode": policy.mode, "reason": if fresh { "fresh install" } else { "existing install keeps bypass" } });
     c.execute(
         "INSERT INTO audit_events (at, actor, action, target, detail) VALUES (?, 'system', 'policy.initialized', 'global', ?)",
@@ -3405,7 +3631,12 @@ impl Db {
             tx.pragma_update(None, "user_version", i as i64 + 1)?;
             tx.commit()?;
         }
-        Ok(Db(Mutex::new(c), std::sync::OnceLock::new(), std::sync::atomic::AtomicBool::new(false), crate::obs::Metrics::default()))
+        Ok(Db(
+            Mutex::new(c),
+            std::sync::OnceLock::new(),
+            std::sync::atomic::AtomicBool::new(false),
+            crate::obs::Metrics::default(),
+        ))
     }
 
     fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -3429,7 +3660,13 @@ impl Db {
     // Generic settings, for small values that need no table of their own.
 
     pub fn setting(&self, key: &str) -> Option<String> {
-        self.c().query_row("SELECT value FROM settings WHERE key = ?", [key], |r| r.get(0)).optional().ok().flatten()
+        self.c()
+            .query_row("SELECT value FROM settings WHERE key = ?", [key], |r| {
+                r.get(0)
+            })
+            .optional()
+            .ok()
+            .flatten()
     }
 
     pub fn set_setting(&self, key: &str, value: &str) {
@@ -3440,28 +3677,78 @@ impl Db {
 
     pub fn bots(&self) -> Vec<Bot> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM bots ORDER BY primary_bot DESC, created_at").unwrap();
-        s.query_map([], bot_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT * FROM bots ORDER BY primary_bot DESC, created_at")
+            .unwrap();
+        s.query_map([], bot_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     pub fn bot(&self, id: &str) -> Option<Bot> {
-        self.c().query_row("SELECT * FROM bots WHERE id = ?", [id], bot_row).optional().ok().flatten()
+        self.c()
+            .query_row("SELECT * FROM bots WHERE id = ?", [id], bot_row)
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// Owned by the owner account and shared, like every Bot from before ACLs.
-    pub fn create_bot(&self, name: &str, color: &str, shape: &str, harness: &str, model: Option<&str>, primary: bool) -> Bot {
-        self.create_bot_owned(name, color, shape, harness, model, primary, crate::users::OPERATOR, Visibility::Shared)
+    pub fn create_bot(
+        &self,
+        name: &str,
+        color: &str,
+        shape: &str,
+        harness: &str,
+        model: Option<&str>,
+        primary: bool,
+    ) -> Bot {
+        self.create_bot_owned(
+            name,
+            color,
+            shape,
+            harness,
+            model,
+            primary,
+            crate::users::OPERATOR,
+            Visibility::Shared,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn create_bot_owned(&self, name: &str, color: &str, shape: &str, harness: &str, model: Option<&str>, primary: bool, owner: &str, visibility: Visibility) -> Bot {
-        self.create_bot_capped(name, color, shape, harness, model, primary, owner, visibility, None).unwrap()
+    pub fn create_bot_owned(
+        &self,
+        name: &str,
+        color: &str,
+        shape: &str,
+        harness: &str,
+        model: Option<&str>,
+        primary: bool,
+        owner: &str,
+        visibility: Visibility,
+    ) -> Bot {
+        self.create_bot_capped(
+            name, color, shape, harness, model, primary, owner, visibility, None,
+        )
+        .unwrap()
     }
 
     /// None when the owner already has `max_bots`. Counting and inserting are one
     /// statement, so two creates racing for the last slot can't both get it.
     #[allow(clippy::too_many_arguments)]
-    pub fn create_bot_capped(&self, name: &str, color: &str, shape: &str, harness: &str, model: Option<&str>, primary: bool, owner: &str, visibility: Visibility, max_bots: Option<u32>) -> Option<Bot> {
+    pub fn create_bot_capped(
+        &self,
+        name: &str,
+        color: &str,
+        shape: &str,
+        harness: &str,
+        model: Option<&str>,
+        primary: bool,
+        owner: &str,
+        visibility: Visibility,
+        max_bots: Option<u32>,
+    ) -> Option<Bot> {
         let id = crate::short_id();
         let n = self
             .c()
@@ -3489,12 +3776,21 @@ impl Db {
     }
 
     pub fn set_bot_visibility(&self, id: &str, v: Visibility) {
-        self.c().execute("UPDATE bots SET visibility = ? WHERE id = ?", params![v.as_str(), id]).unwrap();
+        self.c()
+            .execute(
+                "UPDATE bots SET visibility = ? WHERE id = ?",
+                params![v.as_str(), id],
+            )
+            .unwrap();
     }
 
     pub fn grant(&self, bot_id: &str, user_id: &str) -> Option<Grant> {
         self.c()
-            .query_row("SELECT * FROM bot_grants WHERE bot_id = ? AND user_id = ?", [bot_id, user_id], grant_row)
+            .query_row(
+                "SELECT * FROM bot_grants WHERE bot_id = ? AND user_id = ?",
+                [bot_id, user_id],
+                grant_row,
+            )
             .optional()
             .ok()
             .flatten()
@@ -3504,14 +3800,25 @@ impl Db {
     /// A user's grants, by Bot id.
     pub fn user_grants(&self, user_id: &str) -> std::collections::HashMap<String, Grant> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM bot_grants WHERE user_id = ?").unwrap();
-        s.query_map([user_id], grant_row).unwrap().filter_map(Result::ok).map(|g| (g.bot_id, g.level)).collect()
+        let mut s = c
+            .prepare("SELECT * FROM bot_grants WHERE user_id = ?")
+            .unwrap();
+        s.query_map([user_id], grant_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|g| (g.bot_id, g.level))
+            .collect()
     }
 
     pub fn grants(&self, bot_id: &str) -> Vec<BotGrant> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM bot_grants WHERE bot_id = ? ORDER BY created_at, user_id").unwrap();
-        s.query_map([bot_id], grant_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT * FROM bot_grants WHERE bot_id = ? ORDER BY created_at, user_id")
+            .unwrap();
+        s.query_map([bot_id], grant_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// Adds or changes a grant. Returns the level it had before.
@@ -3530,30 +3837,61 @@ impl Db {
     /// Removes a grant. Returns its level, or None if there was none.
     pub fn remove_grant(&self, bot_id: &str, user_id: &str) -> Option<Grant> {
         let before = self.grant(bot_id, user_id)?;
-        self.c().execute("DELETE FROM bot_grants WHERE bot_id = ? AND user_id = ?", [bot_id, user_id]).unwrap();
+        self.c()
+            .execute(
+                "DELETE FROM bot_grants WHERE bot_id = ? AND user_id = ?",
+                [bot_id, user_id],
+            )
+            .unwrap();
         Some(before)
     }
 
     pub fn update_bot(&self, id: &str, p: BotPatch) {
         let c = self.c();
         let set = |col: &str, v: &dyn rusqlite::ToSql| {
-            c.execute(&format!("UPDATE bots SET {col} = ? WHERE id = ?"), params![v, id]).unwrap();
+            c.execute(
+                &format!("UPDATE bots SET {col} = ? WHERE id = ?"),
+                params![v, id],
+            )
+            .unwrap();
         };
-        if let Some(v) = p.name { set("name", &v) }
-        if let Some(v) = p.color { set("color", &v) }
-        if let Some(v) = p.shape { set("shape", &v) }
-        if let Some(v) = p.harness { set("harness", &v) }
-        if let Some(v) = p.model { set("model", &v) }
-        if let Some(v) = p.effort { set("effort", &v) }
-        if let Some(v) = p.session_id { set("session_id", &v) }
-        if let Some(v) = p.hidden { set("hidden", &v) }
-        if let Some(v) = p.unread { set("unread", &v) }
-        if let Some(v) = p.prompts { set("prompts", &v.map(|l| serde_json::to_string(&l).unwrap())) }
+        if let Some(v) = p.name {
+            set("name", &v)
+        }
+        if let Some(v) = p.color {
+            set("color", &v)
+        }
+        if let Some(v) = p.shape {
+            set("shape", &v)
+        }
+        if let Some(v) = p.harness {
+            set("harness", &v)
+        }
+        if let Some(v) = p.model {
+            set("model", &v)
+        }
+        if let Some(v) = p.effort {
+            set("effort", &v)
+        }
+        if let Some(v) = p.session_id {
+            set("session_id", &v)
+        }
+        if let Some(v) = p.hidden {
+            set("hidden", &v)
+        }
+        if let Some(v) = p.unread {
+            set("unread", &v)
+        }
+        if let Some(v) = p.prompts {
+            set("prompts", &v.map(|l| serde_json::to_string(&l).unwrap()))
+        }
     }
 
     #[cfg(test)]
     pub fn delete_bot(&self, id: &str) {
-        self.c().execute("DELETE FROM bots WHERE id = ?", [id]).unwrap();
+        self.c()
+            .execute("DELETE FROM bots WHERE id = ?", [id])
+            .unwrap();
     }
 
     // Messages
@@ -3563,7 +3901,10 @@ impl Db {
         let mut s = c
             .prepare("SELECT * FROM (SELECT * FROM messages WHERE bot_id = ? ORDER BY id DESC LIMIT ?) ORDER BY id")
             .unwrap();
-        s.query_map(params![bot_id, limit], message_row).unwrap().filter_map(Result::ok).collect()
+        s.query_map(params![bot_id, limit], message_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     pub fn last_message(&self, bot_id: &str) -> Option<Message> {
@@ -3595,16 +3936,41 @@ impl Db {
     }
 
     pub fn message(&self, id: i64) -> Option<Message> {
-        self.c().query_row("SELECT * FROM messages WHERE id = ?", [id], message_row).optional().ok().flatten()
+        self.c()
+            .query_row("SELECT * FROM messages WHERE id = ?", [id], message_row)
+            .optional()
+            .ok()
+            .flatten()
     }
 
-    pub fn add_message(&self, bot_id: &str, role: &str, text: &str, question: Option<&Value>, error: bool, status: Option<&str>) -> Message {
+    pub fn add_message(
+        &self,
+        bot_id: &str,
+        role: &str,
+        text: &str,
+        question: Option<&Value>,
+        error: bool,
+        status: Option<&str>,
+    ) -> Message {
         self.add_message_from(bot_id, role, text, question, error, status, None)
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn add_message_from(&self, bot_id: &str, role: &str, text: &str, question: Option<&Value>, error: bool, status: Option<&str>, from_bot: Option<&str>) -> Message {
-        let owners: Vec<String> = [Some(bot_id), from_bot].into_iter().flatten().filter_map(|b| self.bot_owner(b)).collect();
+    pub fn add_message_from(
+        &self,
+        bot_id: &str,
+        role: &str,
+        text: &str,
+        question: Option<&Value>,
+        error: bool,
+        status: Option<&str>,
+        from_bot: Option<&str>,
+    ) -> Message {
+        let owners: Vec<String> = [Some(bot_id), from_bot]
+            .into_iter()
+            .flatten()
+            .filter_map(|b| self.bot_owner(b))
+            .collect();
         let owners: Vec<&str> = owners.iter().map(String::as_str).collect();
         let question = question.map(|q| redact::value_for(&owners, q.clone()).to_string());
         let c = self.c();
@@ -3619,59 +3985,107 @@ impl Db {
     }
 
     pub fn last_id(&self) -> i64 {
-        self.c().query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| r.get(0)).unwrap_or(0)
+        self.c()
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0)
     }
 
     /// The Bot's chat bubbles written after message `after`.
     pub fn replies_after(&self, bot_id: &str, after: i64) -> Vec<Message> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM messages WHERE bot_id = ? AND id > ? AND role = 'bot' ORDER BY id").unwrap();
-        s.query_map(params![bot_id, after], message_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare(
+                "SELECT * FROM messages WHERE bot_id = ? AND id > ? AND role = 'bot' ORDER BY id",
+            )
+            .unwrap();
+        s.query_map(params![bot_id, after], message_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     pub fn set_status(&self, id: i64, status: &str) {
-        self.c().execute("UPDATE messages SET status = ? WHERE id = ?", params![status, id]).unwrap();
+        self.c()
+            .execute(
+                "UPDATE messages SET status = ? WHERE id = ?",
+                params![status, id],
+            )
+            .unwrap();
     }
 
     /// Free text (name, email, user agent) is masked as `record` masks it.
     pub fn set_requested_by(&self, id: i64, who: &audit::Who) {
         let mut who = who.clone();
-        for v in [&mut who.actor.name, &mut who.actor.email, &mut who.source.user_agent].into_iter().flatten() {
+        for v in [
+            &mut who.actor.name,
+            &mut who.actor.email,
+            &mut who.source.user_agent,
+        ]
+        .into_iter()
+        .flatten()
+        {
             *v = audit::redact_text(v);
         }
-        let who = serde_json::to_value(&who).map(|v| redact::value(v).to_string()).unwrap_or_default();
-        self.c().execute("UPDATE messages SET requested_by = ? WHERE id = ?", params![who, id]).unwrap();
+        let who = serde_json::to_value(&who)
+            .map(|v| redact::value(v).to_string())
+            .unwrap_or_default();
+        self.c()
+            .execute(
+                "UPDATE messages SET requested_by = ? WHERE id = ?",
+                params![who, id],
+            )
+            .unwrap();
     }
 
     pub fn set_question(&self, id: i64, q: &Value) {
         let owner = self.message(id).and_then(|m| self.bot_owner(&m.bot_id));
         let q = redact::value_for(owner.as_deref().as_slice(), q.clone()).to_string();
-        self.c().execute("UPDATE messages SET question = ? WHERE id = ?", params![q, id]).unwrap();
+        self.c()
+            .execute(
+                "UPDATE messages SET question = ? WHERE id = ?",
+                params![q, id],
+            )
+            .unwrap();
     }
 
     /// Who owns a Bot: whose own secrets are redacted from what it writes (ADR 0029).
     pub fn bot_owner(&self, bot_id: &str) -> Option<String> {
-        self.c().query_row("SELECT owner_id FROM bots WHERE id = ?", [bot_id], |r| r.get(0)).ok()
+        self.c()
+            .query_row("SELECT owner_id FROM bots WHERE id = ?", [bot_id], |r| {
+                r.get(0)
+            })
+            .ok()
     }
 
     pub fn pending(&self) -> Vec<Message> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM messages WHERE status IN ('queued', 'running') ORDER BY id").unwrap();
-        s.query_map([], message_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT * FROM messages WHERE status IN ('queued', 'running') ORDER BY id")
+            .unwrap();
+        s.query_map([], message_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     // Chat retention (ADR 0098)
 
     /// Days of chat history to keep, as last saved. None = forever.
     pub fn chat_retention(&self) -> Option<u32> {
-        self.setting("chat_retention_days").and_then(|s| s.parse().ok()).filter(|d| *d > 0)
+        self.setting("chat_retention_days")
+            .and_then(|s| s.parse().ok())
+            .filter(|d| *d > 0)
     }
 
     pub fn set_chat_retention(&self, days: Option<u32>) {
         match days {
             Some(d) => self.set_setting("chat_retention_days", &d.to_string()),
             None => {
-                self.c().execute("DELETE FROM settings WHERE key = 'chat_retention_days'", []).unwrap();
+                self.c()
+                    .execute("DELETE FROM settings WHERE key = 'chat_retention_days'", [])
+                    .unwrap();
             }
         }
     }
@@ -3681,7 +4095,12 @@ impl Db {
     /// many went and where this batch ended. Never a message whose run is queued or running,
     /// nor one in or from a held Bot's chat; the cursor means each batch starts past the rows
     /// earlier batches already looked at, so a large held chat is walked once per pass.
-    pub fn prune_chat_batch(&self, cutoff: i64, after: Option<(i64, i64)>, limit: u32) -> rusqlite::Result<(usize, Option<(i64, i64)>)> {
+    pub fn prune_chat_batch(
+        &self,
+        cutoff: i64,
+        after: Option<(i64, i64)>,
+        limit: u32,
+    ) -> rusqlite::Result<(usize, Option<(i64, i64)>)> {
         let (at, id) = after.unwrap_or((i64::MIN, i64::MIN));
         let c = self.c();
         let tx = c.unchecked_transaction()?;
@@ -3694,7 +4113,10 @@ impl Db {
                     AND (from_bot IS NULL OR from_bot NOT IN (SELECT bot_id FROM retention_holds))
                   ORDER BY created_at, id LIMIT ?4",
             )?;
-            s.query_map(params![cutoff, at, id, limit], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+            s.query_map(params![cutoff, at, id, limit], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?
         };
         let mut deleted = 0;
         {
@@ -3709,7 +4131,11 @@ impl Db {
 
     /// How many Bots are held, for a pass's record.
     pub fn retention_hold_count(&self) -> rusqlite::Result<usize> {
-        self.c().query_row("SELECT COUNT(*) FROM retention_holds", [], |r| r.get::<_, i64>(0)).map(|n| n as usize)
+        self.c()
+            .query_row("SELECT COUNT(*) FROM retention_holds", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map(|n| n as usize)
     }
 
     pub fn try_set_setting(&self, key: &str, value: &str) -> rusqlite::Result<()> {
@@ -3718,17 +4144,35 @@ impl Db {
 
     pub fn retention_holds(&self) -> Vec<RetentionHold> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM retention_holds ORDER BY held_at, bot_id").unwrap();
-        s.query_map([], retention_hold_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT * FROM retention_holds ORDER BY held_at, bot_id")
+            .unwrap();
+        s.query_map([], retention_hold_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     pub fn retention_hold(&self, bot_id: &str) -> Option<RetentionHold> {
-        self.c().query_row("SELECT * FROM retention_holds WHERE bot_id = ?", [bot_id], retention_hold_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT * FROM retention_holds WHERE bot_id = ?",
+                [bot_id],
+                retention_hold_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// Holds the Bot's chat, or changes the reason of its hold. Keeps who held it first and when.
     /// None when the Bot is gone, even if it was deleted a moment ago.
-    pub fn put_retention_hold(&self, bot_id: &str, reason: &str, by: Option<&str>) -> Option<RetentionHold> {
+    pub fn put_retention_hold(
+        &self,
+        bot_id: &str,
+        reason: &str,
+        by: Option<&str>,
+    ) -> Option<RetentionHold> {
         let n = self
             .c()
             .execute(
@@ -3747,18 +4191,29 @@ impl Db {
     /// Whether deleting the Bot would delete held chat: it is held, or a held Bot wrote into
     /// its chat (deleting a Bot deletes every message in its chat).
     pub fn bot_chat_held(&self, id: &str) -> bool {
-        self.c().query_row(&format!("SELECT {HELD_CHAT}"), [id], |r| r.get(0)).unwrap()
+        self.c()
+            .query_row(&format!("SELECT {HELD_CHAT}"), [id], |r| r.get(0))
+            .unwrap()
     }
 
     /// Deletes the Bot unless its chat is held (`bot_chat_held`), in one statement, so a hold
     /// placed at any moment before wins. Whether it was deleted.
     pub fn delete_bot_unless_held(&self, id: &str) -> bool {
-        self.c().execute(&format!("DELETE FROM bots WHERE id = ?1 AND NOT {HELD_CHAT}"), [id]).unwrap() > 0
+        self.c()
+            .execute(
+                &format!("DELETE FROM bots WHERE id = ?1 AND NOT {HELD_CHAT}"),
+                [id],
+            )
+            .unwrap()
+            > 0
     }
 
     /// Whether there was a hold to release.
     pub fn delete_retention_hold(&self, bot_id: &str) -> bool {
-        self.c().execute("DELETE FROM retention_holds WHERE bot_id = ?", [bot_id]).unwrap() > 0
+        self.c()
+            .execute("DELETE FROM retention_holds WHERE bot_id = ?", [bot_id])
+            .unwrap()
+            > 0
     }
 
     /// `n` plain messages in the Bot's chat, written at `at`, in one transaction.
@@ -3778,12 +4233,23 @@ impl Db {
 
     #[cfg(test)]
     pub fn set_message_time(&self, id: i64, at: i64) {
-        self.c().execute("UPDATE messages SET created_at = ?1 WHERE id = ?2", params![at, id]).unwrap();
+        self.c()
+            .execute(
+                "UPDATE messages SET created_at = ?1 WHERE id = ?2",
+                params![at, id],
+            )
+            .unwrap();
     }
 
     #[cfg(test)]
     pub fn message_count(&self, bot_id: &str) -> i64 {
-        self.c().query_row("SELECT COUNT(*) FROM messages WHERE bot_id = ?", [bot_id], |r| r.get(0)).unwrap()
+        self.c()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE bot_id = ?",
+                [bot_id],
+                |r| r.get(0),
+            )
+            .unwrap()
     }
 
     // Routines
@@ -3793,11 +4259,18 @@ impl Db {
         let mut s = c
             .prepare("SELECT * FROM routines WHERE ?1 IS NULL OR bot_id = ?1 ORDER BY created_at")
             .unwrap();
-        s.query_map([bot_id], routine_row).unwrap().filter_map(Result::ok).collect()
+        s.query_map([bot_id], routine_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     pub fn routine(&self, id: &str) -> Option<Routine> {
-        self.c().query_row("SELECT * FROM routines WHERE id = ?", [id], routine_row).optional().ok().flatten()
+        self.c()
+            .query_row("SELECT * FROM routines WHERE id = ?", [id], routine_row)
+            .optional()
+            .ok()
+            .flatten()
     }
 
     #[cfg(test)]
@@ -3807,7 +4280,15 @@ impl Db {
 
     /// A routine whose runs are for `author` (ADR 0046), written whole so the scheduler
     /// never sees it without its author.
-    pub fn add_routine_by(&self, bot_id: &str, name: &str, cron: &str, instruction: &str, enabled: bool, author: Option<&str>) -> Routine {
+    pub fn add_routine_by(
+        &self,
+        bot_id: &str,
+        name: &str,
+        cron: &str,
+        instruction: &str,
+        enabled: bool,
+        author: Option<&str>,
+    ) -> Routine {
         let id = crate::short_id();
         self.c()
             .execute(
@@ -3820,16 +4301,36 @@ impl Db {
 
     /// `author`: whom its runs are for once `instruction` changes it (ADR 0046). Both
     /// change under one lock, so the scheduler never reads one without the other.
-    pub fn update_routine(&self, id: &str, name: Option<&str>, cron: Option<&str>, instruction: Option<&str>, enabled: Option<bool>, author: Option<&str>) {
+    pub fn update_routine(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        cron: Option<&str>,
+        instruction: Option<&str>,
+        enabled: Option<bool>,
+        author: Option<&str>,
+    ) {
         let c = self.c();
         let set = |col: &str, v: &dyn rusqlite::ToSql| {
-            c.execute(&format!("UPDATE routines SET {col} = ? WHERE id = ?"), params![v, id]).unwrap();
+            c.execute(
+                &format!("UPDATE routines SET {col} = ? WHERE id = ?"),
+                params![v, id],
+            )
+            .unwrap();
         };
-        if let Some(v) = name { set("name", &v) }
-        if let Some(v) = cron { set("cron", &v) }
+        if let Some(v) = name {
+            set("name", &v)
+        }
+        if let Some(v) = cron {
+            set("cron", &v)
+        }
         if let Some(v) = instruction {
             if let Some(a) = author {
-                c.execute("UPDATE routines SET author_id = ? WHERE id = ? AND instruction != ?", params![a, id, v]).unwrap();
+                c.execute(
+                    "UPDATE routines SET author_id = ? WHERE id = ? AND instruction != ?",
+                    params![a, id, v],
+                )
+                .unwrap();
             }
             set("instruction", &v)
         }
@@ -3852,8 +4353,15 @@ impl Db {
     /// Routines botd paused for `user_id`.
     pub fn routines_paused_for(&self, user_id: &str) -> Vec<Routine> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM routines WHERE paused_for = ? AND enabled = 0 ORDER BY created_at").unwrap();
-        s.query_map([user_id], routine_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare(
+                "SELECT * FROM routines WHERE paused_for = ? AND enabled = 0 ORDER BY created_at",
+            )
+            .unwrap();
+        s.query_map([user_id], routine_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// Turns a paused routine back on. False when it isn't paused any more.
@@ -3886,18 +4394,33 @@ impl Db {
     }
 
     pub fn routine_ran(&self, id: &str, at: i64) {
-        self.c().execute("UPDATE routines SET last_run_at = ? WHERE id = ?", params![at, id]).unwrap();
+        self.c()
+            .execute(
+                "UPDATE routines SET last_run_at = ? WHERE id = ?",
+                params![at, id],
+            )
+            .unwrap();
     }
 
     pub fn delete_routine(&self, id: &str) {
-        self.c().execute("DELETE FROM routines WHERE id = ?", [id]).unwrap();
+        self.c()
+            .execute("DELETE FROM routines WHERE id = ?", [id])
+            .unwrap();
     }
 
     // Harness policy
 
     pub fn global_policy(&self) -> Policy {
-        let v: Option<String> = self.c().query_row("SELECT value FROM settings WHERE key = 'policy'", [], |r| r.get(0)).optional().ok().flatten();
-        v.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| Policy::new(Mode::Ask))
+        let v: Option<String> = self
+            .c()
+            .query_row("SELECT value FROM settings WHERE key = 'policy'", [], |r| {
+                r.get(0)
+            })
+            .optional()
+            .ok()
+            .flatten();
+        v.and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| Policy::new(Mode::Ask))
     }
 
     pub fn set_global_policy(&self, p: &Policy) {
@@ -3912,13 +4435,23 @@ impl Db {
     }
 
     fn read_setup(c: &Connection) -> crate::setup::Progress {
-        let v: Option<String> = c.query_row("SELECT value FROM settings WHERE key = 'setup'", [], |r| r.get(0)).optional().ok().flatten();
-        v.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+        let v: Option<String> = c
+            .query_row("SELECT value FROM settings WHERE key = 'setup'", [], |r| {
+                r.get(0)
+            })
+            .optional()
+            .ok()
+            .flatten();
+        v.and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
     }
 
     /// Changes the progress under one lock, so concurrent saves of different fields don't
     /// undo each other. Returns it before and after; nothing is written when `f` fails.
-    pub fn update_setup_progress<E>(&self, f: impl FnOnce(&mut crate::setup::Progress) -> Result<(), E>) -> Result<(crate::setup::Progress, crate::setup::Progress), E> {
+    pub fn update_setup_progress<E>(
+        &self,
+        f: impl FnOnce(&mut crate::setup::Progress) -> Result<(), E>,
+    ) -> Result<(crate::setup::Progress, crate::setup::Progress), E> {
         let c = self.c();
         let before = Self::read_setup(&c);
         let mut after = before.clone();
@@ -3931,7 +4464,16 @@ impl Db {
     }
 
     pub fn bot_override(&self, bot_id: &str) -> Option<Override> {
-        let v: Option<String> = self.c().query_row("SELECT policy FROM bot_policies WHERE bot_id = ?", [bot_id], |r| r.get(0)).optional().ok().flatten();
+        let v: Option<String> = self
+            .c()
+            .query_row(
+                "SELECT policy FROM bot_policies WHERE bot_id = ?",
+                [bot_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
         v.and_then(|s| serde_json::from_str(&s).ok())
     }
 
@@ -3951,23 +4493,43 @@ impl Db {
 
     pub fn effective_policy(&self, bot_id: &str) -> Policy {
         let global = self.global_policy();
-        self.bot_override(bot_id).map(|o| o.apply(&global)).unwrap_or(global)
+        self.bot_override(bot_id)
+            .map(|o| o.apply(&global))
+            .unwrap_or(global)
     }
 
     /// Rules for one Bot plus the global ones (`Some`), only global ones (`None`).
     pub fn rules(&self, bot_id: Option<&str>) -> Vec<Rule> {
         let c = self.c();
         let mut s = c.prepare("SELECT * FROM policy_rules WHERE bot_id IS NULL OR bot_id = ?1 ORDER BY created_at").unwrap();
-        s.query_map([bot_id], rule_row).unwrap().filter_map(Result::ok).collect()
+        s.query_map([bot_id], rule_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     pub fn rule(&self, id: &str) -> Option<Rule> {
-        self.c().query_row("SELECT * FROM policy_rules WHERE id = ?", [id], rule_row).optional().ok().flatten()
+        self.c()
+            .query_row("SELECT * FROM policy_rules WHERE id = ?", [id], rule_row)
+            .optional()
+            .ok()
+            .flatten()
     }
 
-    pub fn add_rule(&self, bot_id: Option<&str>, action: Action, tool: &str, pattern: &str, note: Option<&str>) -> Rule {
+    pub fn add_rule(
+        &self,
+        bot_id: Option<&str>,
+        action: Action,
+        tool: &str,
+        pattern: &str,
+        note: Option<&str>,
+    ) -> Rule {
         let id = crate::short_id();
-        let action = if action == Action::Allow { "allow" } else { "deny" };
+        let action = if action == Action::Allow {
+            "allow"
+        } else {
+            "deny"
+        };
         self.c()
             .execute(
                 "INSERT INTO policy_rules (id, bot_id, action, tool, pattern, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -3978,15 +4540,30 @@ impl Db {
     }
 
     pub fn delete_rule(&self, id: &str) {
-        self.c().execute("DELETE FROM policy_rules WHERE id = ?", [id]).unwrap();
+        self.c()
+            .execute("DELETE FROM policy_rules WHERE id = ?", [id])
+            .unwrap();
     }
 
     // Approvals
 
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub fn add_approval(&self, bot_id: &str, harness: &str, tool: &str, kind: &str, subject: &str, input: &Value, class: &str, reason: &str, expires_at: i64) -> Approval {
-        self.add_approval_in_run(bot_id, harness, tool, kind, subject, input, class, reason, expires_at, None)
+    pub fn add_approval(
+        &self,
+        bot_id: &str,
+        harness: &str,
+        tool: &str,
+        kind: &str,
+        subject: &str,
+        input: &Value,
+        class: &str,
+        reason: &str,
+        expires_at: i64,
+    ) -> Approval {
+        self.add_approval_in_run(
+            bot_id, harness, tool, kind, subject, input, class, reason, expires_at, None,
+        )
     }
 
     /// `add_approval` for a call from a live run: `run` is its id, and what approving the
@@ -4012,13 +4589,19 @@ impl Db {
         let owners = owners.as_slice();
         let mut input = redact::value_for(owners, input.clone()).to_string();
         if input.len() > 20_000 {
-            input = serde_json::json!({ "truncated": input.chars().take(20_000).collect::<String>() }).to_string();
+            input =
+                serde_json::json!({ "truncated": input.chars().take(20_000).collect::<String>() })
+                    .to_string();
         }
         // Tool input can hold anything a Bot wrote (file contents, commands), so it is sealed at rest.
         let input = sealed::seal_field(&sealed::approval_context(&id), &input);
         let run_id = run.map(|(r, _)| r);
         let run_scope = run.and_then(|(_, s)| s).map(|s| {
-            let covers: Vec<String> = s.covers_text().iter().map(|w| redact::text_for(owners, w).into_owned()).collect();
+            let covers: Vec<String> = s
+                .covers_text()
+                .iter()
+                .map(|w| redact::text_for(owners, w).into_owned())
+                .collect();
             serde_json::json!({ "covers": covers, "exact": s.exact.is_some() }).to_string()
         });
         self.c()
@@ -4032,38 +4615,76 @@ impl Db {
     }
 
     pub fn approval(&self, id: &str) -> Option<Approval> {
-        self.c().query_row("SELECT * FROM approvals WHERE id = ?", [id], approval_row).optional().ok().flatten()
+        self.c()
+            .query_row("SELECT * FROM approvals WHERE id = ?", [id], approval_row)
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// Newest first. `status` filters, e.g. "pending".
-    pub fn approvals(&self, status: Option<&str>, bot_id: Option<&str>, limit: i64) -> Vec<Approval> {
+    pub fn approvals(
+        &self,
+        status: Option<&str>,
+        bot_id: Option<&str>,
+        limit: i64,
+    ) -> Vec<Approval> {
         let c = self.c();
         let mut s = c
             .prepare("SELECT * FROM approvals WHERE (?1 IS NULL OR status = ?1) AND (?2 IS NULL OR bot_id = ?2) ORDER BY created_at DESC, rowid DESC LIMIT ?3")
             .unwrap();
-        s.query_map(params![status, bot_id, limit], approval_row).unwrap().filter_map(Result::ok).collect()
+        s.query_map(params![status, bot_id, limit], approval_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// How many approvals are pending, and when the oldest was asked for.
     pub fn approvals_pending(&self) -> (i64, Option<i64>) {
         self.c()
-            .query_row("SELECT COUNT(*), MIN(created_at) FROM approvals WHERE status = 'pending'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(
+                "SELECT COUNT(*), MIN(created_at) FROM approvals WHERE status = 'pending'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap_or((0, None))
     }
 
     /// Like `approvals`, but only for these Bots, so `limit` counts only their rows.
-    pub fn approvals_among(&self, status: Option<&str>, bot_ids: &[String], limit: i64) -> Vec<Approval> {
+    pub fn approvals_among(
+        &self,
+        status: Option<&str>,
+        bot_ids: &[String],
+        limit: i64,
+    ) -> Vec<Approval> {
         let c = self.c();
         let mut s = c
             .prepare("SELECT * FROM approvals WHERE (?1 IS NULL OR status = ?1) AND bot_id IN (SELECT value FROM json_each(?2)) ORDER BY created_at DESC, rowid DESC LIMIT ?3")
             .unwrap();
         let ids = serde_json::to_string(bot_ids).unwrap();
-        s.query_map(params![status, ids, limit], approval_row).unwrap().filter_map(Result::ok).collect()
+        s.query_map(params![status, ids, limit], approval_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// Closes a pending approval. False if it was already closed (first decision wins).
-    pub fn finish_approval(&self, id: &str, status: &str, by: &str, note: Option<&str>, rule_id: Option<&str>) -> bool {
-        self.finish_approval_scoped(id, status, by, note, rule_id, (status == "approved").then_some("once"))
+    pub fn finish_approval(
+        &self,
+        id: &str,
+        status: &str,
+        by: &str,
+        note: Option<&str>,
+        rule_id: Option<&str>,
+    ) -> bool {
+        self.finish_approval_scoped(
+            id,
+            status,
+            by,
+            note,
+            rule_id,
+            (status == "approved").then_some("once"),
+        )
     }
 
     /// Approves a pending approval for the rest of its run (ADR 0051). False if it was
@@ -4072,7 +4693,15 @@ impl Db {
         self.finish_approval_scoped(id, "approved", by, note, None, Some("run"))
     }
 
-    fn finish_approval_scoped(&self, id: &str, status: &str, by: &str, note: Option<&str>, rule_id: Option<&str>, scope: Option<&str>) -> bool {
+    fn finish_approval_scoped(
+        &self,
+        id: &str,
+        status: &str,
+        by: &str,
+        note: Option<&str>,
+        rule_id: Option<&str>,
+        scope: Option<&str>,
+    ) -> bool {
         self.c()
             .execute(
                 "UPDATE approvals SET status = ?, decided_by = ?, note = ?, rule_id = ?, scope = ?, decided_at = ? WHERE id = ? AND status = 'pending'",
@@ -4085,7 +4714,14 @@ impl Db {
     /// Closes a pending approval and saves its remembered rule in one transaction,
     /// so a decision that loses the race (to a timeout, a stop, or someone else) saves
     /// no rule. None if the approval was no longer pending.
-    pub fn finish_approval_with_rule(&self, id: &str, status: &str, by: &str, note: Option<&str>, rule: &NewRule) -> Option<Rule> {
+    pub fn finish_approval_with_rule(
+        &self,
+        id: &str,
+        status: &str,
+        by: &str,
+        note: Option<&str>,
+        rule: &NewRule,
+    ) -> Option<Rule> {
         let rule_id = crate::short_id();
         let c = self.c();
         let tx = c.unchecked_transaction().ok()?;
@@ -4099,7 +4735,11 @@ impl Db {
         if closed != 1 {
             return None;
         }
-        let action = if rule.action == Action::Allow { "allow" } else { "deny" };
+        let action = if rule.action == Action::Allow {
+            "allow"
+        } else {
+            "deny"
+        };
         tx.execute(
             "INSERT INTO policy_rules (id, bot_id, action, tool, pattern, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             params![rule_id, rule.bot_id, action, rule.tool, rule.pattern, rule.note, now()],
@@ -4114,12 +4754,21 @@ impl Db {
 
     pub fn users(&self) -> Vec<User> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM users ORDER BY created_at, id").unwrap();
-        s.query_map([], user_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT * FROM users ORDER BY created_at, id")
+            .unwrap();
+        s.query_map([], user_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     pub fn user(&self, id: &str) -> Option<User> {
-        self.c().query_row("SELECT * FROM users WHERE id = ?", [id], user_row).optional().ok().flatten()
+        self.c()
+            .query_row("SELECT * FROM users WHERE id = ?", [id], user_row)
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// By id, or by email (case-insensitive) when `key` has an `@`. Never an erased user's
@@ -4130,7 +4779,11 @@ impl Db {
 
     pub fn find_user_any(&self, key: &str) -> Option<User> {
         if key.contains('@') {
-            self.c().query_row("SELECT * FROM users WHERE email = ?", [key], user_row).optional().ok().flatten()
+            self.c()
+                .query_row("SELECT * FROM users WHERE email = ?", [key], user_row)
+                .optional()
+                .ok()
+                .flatten()
         } else {
             self.user(key)
         }
@@ -4138,17 +4791,36 @@ impl Db {
 
     /// Err when the email or id is taken, or no seat is free. The owner account never
     /// needs a seat: it is how an operator gets back in.
-    pub fn create_user(&self, id: Option<&str>, email: Option<&str>, name: &str, role: Role) -> Result<User, UserError> {
-        let id = id.map(String::from).unwrap_or_else(|| format!("u{}", crate::short_id()));
-        let cap = if id == crate::users::OPERATOR { None } else { self.seat_cap() };
+    pub fn create_user(
+        &self,
+        id: Option<&str>,
+        email: Option<&str>,
+        name: &str,
+        role: Role,
+    ) -> Result<User, UserError> {
+        let id = id
+            .map(String::from)
+            .unwrap_or_else(|| format!("u{}", crate::short_id()));
+        let cap = if id == crate::users::OPERATOR {
+            None
+        } else {
+            self.seat_cap()
+        };
         {
             let c = self.c();
             if !Self::seat_free(&c, cap) {
                 return Err(UserError::NoSeat);
             }
-            Self::insert_user(&c, &id, email, name, role).map_err(|e| if constraint(&e) { UserError::EmailTaken } else { UserError::Db(e.to_string()) })?;
+            Self::insert_user(&c, &id, email, name, role).map_err(|e| {
+                if constraint(&e) {
+                    UserError::EmailTaken
+                } else {
+                    UserError::Db(e.to_string())
+                }
+            })?;
         }
-        self.user(&id).ok_or_else(|| UserError::Db("user not saved".into()))
+        self.user(&id)
+            .ok_or_else(|| UserError::Db("user not saved".into()))
     }
 
     /// Active users holding a seat (ADR 0038): everyone but the owner account.
@@ -4157,7 +4829,12 @@ impl Db {
     }
 
     fn seats_used(c: &Connection) -> u32 {
-        c.query_row("SELECT COUNT(*) FROM users WHERE status = 'active' AND id != ?", [crate::users::OPERATOR], |r| r.get(0)).unwrap_or(0)
+        c.query_row(
+            "SELECT COUNT(*) FROM users WHERE status = 'active' AND id != ?",
+            [crate::users::OPERATOR],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
     }
 
     /// Whether one more active user fits under `cap`. Callers hold the one connection
@@ -4168,10 +4845,21 @@ impl Db {
 
     /// Whether making this existing user active takes a seat: they're disabled now.
     fn enabling(c: &Connection, user_id: &str) -> bool {
-        c.query_row("SELECT status != 'active' AND id != ?2 FROM users WHERE id = ?1", [user_id, crate::users::OPERATOR], |r| r.get(0)).unwrap_or(false)
+        c.query_row(
+            "SELECT status != 'active' AND id != ?2 FROM users WHERE id = ?1",
+            [user_id, crate::users::OPERATOR],
+            |r| r.get(0),
+        )
+        .unwrap_or(false)
     }
 
-    fn insert_user(c: &Connection, id: &str, email: Option<&str>, name: &str, role: Role) -> rusqlite::Result<usize> {
+    fn insert_user(
+        c: &Connection,
+        id: &str,
+        email: Option<&str>,
+        name: &str,
+        role: Role,
+    ) -> rusqlite::Result<usize> {
         let at = now();
         c.execute(
             "INSERT INTO users (id, email, display_name, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -4183,19 +4871,35 @@ impl Db {
     pub fn update_user(&self, id: &str, p: UserPatch) -> Result<(), UserError> {
         let cap = self.seat_cap();
         let c = self.c();
-        let tx = c.unchecked_transaction().map_err(|e| UserError::Db(e.to_string()))?;
+        let tx = c
+            .unchecked_transaction()
+            .map_err(|e| UserError::Db(e.to_string()))?;
         if p.status == Some("active") && Self::enabling(&tx, id) && !Self::seat_free(&tx, cap) {
             return Err(UserError::NoSeat);
         }
         let set = |col: &str, v: &dyn rusqlite::ToSql| {
-            tx.execute(&format!("UPDATE users SET {col} = ?, updated_at = ? WHERE id = ?"), params![v, now(), id]).map(|_| ())
+            tx.execute(
+                &format!("UPDATE users SET {col} = ?, updated_at = ? WHERE id = ?"),
+                params![v, now(), id],
+            )
+            .map(|_| ())
         };
         let res = (|| {
-            if let Some(v) = &p.email { set("email", v)? }
-            if let Some(v) = &p.name { set("display_name", v)? }
-            if let Some(v) = p.role { set("role", &v.as_str())? }
-            if let Some(v) = p.status { set("status", &v)? }
-            if let Some(v) = &p.tier { set("tier", v)? }
+            if let Some(v) = &p.email {
+                set("email", v)?
+            }
+            if let Some(v) = &p.name {
+                set("display_name", v)?
+            }
+            if let Some(v) = p.role {
+                set("role", &v.as_str())?
+            }
+            if let Some(v) = p.status {
+                set("status", &v)?
+            }
+            if let Some(v) = &p.tier {
+                set("tier", v)?
+            }
             Ok::<_, rusqlite::Error>(())
         })();
         match res {
@@ -4228,7 +4932,9 @@ impl Db {
         let Ok(mut s) = c.prepare(&sql) else {
             return Vec::new();
         };
-        s.query_map(params![user_id, bots], |r| r.get(0)).map(|rows| rows.flatten().collect()).unwrap_or_default()
+        s.query_map(params![user_id, bots], |r| r.get(0))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
     }
 
     /// The subscription paying for the user's own plan now, if one does.
@@ -4238,22 +4944,40 @@ impl Db {
 
     /// The Bots an erasure of `user_id` that didn't finish had taken on (ADR 0102).
     pub fn erasing_bots(&self, user_id: &str) -> Vec<String> {
-        self.setting(&format!("{ERASING_BOTS}{user_id}")).and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()
+        self.setting(&format!("{ERASING_BOTS}{user_id}"))
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default()
     }
 
     pub fn set_erasing_bots(&self, user_id: &str, bots: &[String]) {
-        let _ = self.c().execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", params![format!("{ERASING_BOTS}{user_id}"), serde_json::to_string(bots).unwrap_or_default()]);
+        let _ = self.c().execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            params![
+                format!("{ERASING_BOTS}{user_id}"),
+                serde_json::to_string(bots).unwrap_or_default()
+            ],
+        );
     }
 
     /// Erases `user_id`'s personal data in one transaction (ADR 0102). Their Bots must be
     /// gone already; `bots` names them, so what they wrote in others' chats is erased too.
     /// The user row stays as a tombstone named `pseudonym`, and every audit event about
     /// them names them by it, without their name, email, subject, address or user agent.
-    pub fn erase_user(&self, user_id: &str, pseudonym: &str, by: Option<&str>, bots: &[String]) -> Result<Erased, EraseError> {
+    pub fn erase_user(
+        &self,
+        user_id: &str,
+        pseudonym: &str,
+        by: Option<&str>,
+        bots: &[String],
+    ) -> Result<Erased, EraseError> {
         let db_err = |e: rusqlite::Error| EraseError::Db(e.to_string());
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(db_err)?;
-        let u = tx.query_row("SELECT * FROM users WHERE id = ?", [user_id], user_row).optional().map_err(db_err)?.ok_or(EraseError::Gone)?;
+        let u = tx
+            .query_row("SELECT * FROM users WHERE id = ?", [user_id], user_row)
+            .optional()
+            .map_err(db_err)?
+            .ok_or(EraseError::Gone)?;
         if u.erased_at.is_some() {
             return Err(EraseError::Gone);
         }
@@ -4266,9 +4990,15 @@ impl Db {
         if let (Some(i), Some(s)) = (&u.idp_issuer, &u.idp_subject) {
             subjects.extend([s.clone(), format!("{i}|{s}")]);
         }
-        let strings = |sql: &str, emails: &mut Vec<String>, exact: &mut Vec<String>, subjects: &mut Vec<String>| -> rusqlite::Result<()> {
+        let strings = |sql: &str,
+                       emails: &mut Vec<String>,
+                       exact: &mut Vec<String>,
+                       subjects: &mut Vec<String>|
+         -> rusqlite::Result<()> {
             let mut s = tx.prepare(sql)?;
-            let rows = s.query_map(params![user_id, u.email], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?;
+            let rows = s.query_map(params![user_id, u.email], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?;
             for row in rows {
                 let (kind, v) = row?;
                 let Some(v) = v.filter(|v| !v.trim().is_empty()) else {
@@ -4301,7 +5031,8 @@ impl Db {
         .map_err(db_err)?;
         // A SCIM userName is often an email, but not always.
         let scrub_of = |emails: Vec<String>, mut exact: Vec<String>, subjects: &[String]| {
-            let (names, mails): (Vec<String>, Vec<String>) = emails.into_iter().partition(|e| !e.contains('@'));
+            let (names, mails): (Vec<String>, Vec<String>) =
+                emails.into_iter().partition(|e| !e.contains('@'));
             exact.extend(names);
             exact.extend(subjects.iter().cloned());
             Scrub::new(user_id, pseudonym, mails, exact)
@@ -4309,29 +5040,42 @@ impl Db {
         let scrub = scrub_of(emails.clone(), exact.clone(), &subjects);
         // Values they had before may be someone else's now, so they're scrubbed only from
         // events that name them by id.
-        Self::past_identifiers(&tx, user_id, &mut emails, &mut exact, &mut subjects).map_err(db_err)?;
+        Self::past_identifiers(&tx, user_id, &mut emails, &mut exact, &mut subjects)
+            .map_err(db_err)?;
         let theirs = scrub_of(emails, exact, &subjects);
 
         let bots_json = serde_json::to_string(bots).unwrap_or_else(|_| "[]".into());
         let run = |sql: &str, p: &[&dyn rusqlite::ToSql]| tx.execute(sql, p).map_err(db_err);
         let mut out = Erased::default();
-        run("DELETE FROM settings WHERE key = ?", &[&format!("{ERASING_BOTS}{user_id}")])?;
+        run(
+            "DELETE FROM settings WHERE key = ?",
+            &[&format!("{ERASING_BOTS}{user_id}")],
+        )?;
         run("DELETE FROM push_devices WHERE user_id = ?", &[&user_id])?;
         out.sessions = run("DELETE FROM sessions WHERE user_id = ?", &[&user_id])?;
         out.login_codes = run("DELETE FROM login_codes WHERE user_id = ?", &[&user_id])?;
         out.identities = run("DELETE FROM user_identities WHERE user_id = ?", &[&user_id])?;
         out.mfa = run("DELETE FROM user_mfa WHERE user_id = ?", &[&user_id])? > 0;
-        out.recovery_codes = run("DELETE FROM mfa_recovery_codes WHERE user_id = ?", &[&user_id])?;
+        out.recovery_codes = run(
+            "DELETE FROM mfa_recovery_codes WHERE user_id = ?",
+            &[&user_id],
+        )?;
         out.scim = run("DELETE FROM scim_users WHERE user_id = ?", &[&user_id])? > 0;
         out.grants = run("DELETE FROM bot_grants WHERE user_id = ?", &[&user_id])?;
         out.team_invites = match &u.email {
             Some(e) => run("DELETE FROM team_invites WHERE email = ?", &[e])?,
             None => 0,
         };
-        out.signups = run("DELETE FROM signups WHERE user_id = ?1 OR (?2 IS NOT NULL AND email = ?2)", &[&user_id, &u.email])?;
+        out.signups = run(
+            "DELETE FROM signups WHERE user_id = ?1 OR (?2 IS NOT NULL AND email = ?2)",
+            &[&user_id, &u.email],
+        )?;
         out.billing_emails = run("DELETE FROM billing_emails WHERE user_id = ?", &[&user_id])?;
         run("DELETE FROM email_prefs WHERE user_id = ?", &[&user_id])?;
-        run("DELETE FROM billing_checkouts WHERE user_id = ?", &[&user_id])?;
+        run(
+            "DELETE FROM billing_checkouts WHERE user_id = ?",
+            &[&user_id],
+        )?;
         run("DELETE FROM team_members WHERE user_id = ?", &[&user_id])?;
         out.routines = run("DELETE FROM routines WHERE author_id = ?", &[&user_id])?;
         out.messages = run(
@@ -4342,8 +5086,14 @@ impl Db {
             ),
             &[&user_id, &bots_json],
         )?;
-        run(&format!("UPDATE messages SET requested_by = NULL WHERE {SENT_BY_ANY}"), &[&user_id])?;
-        out.approvals = run("UPDATE approvals SET decided_by = ?2, note = NULL WHERE decided_by = ?1", &[&user_id, &pseudonym])?;
+        run(
+            &format!("UPDATE messages SET requested_by = NULL WHERE {SENT_BY_ANY}"),
+            &[&user_id],
+        )?;
+        out.approvals = run(
+            "UPDATE approvals SET decided_by = ?2, note = NULL WHERE decided_by = ?1",
+            &[&user_id, &pseudonym],
+        )?;
         out.disk_reports = run(
             "UPDATE machines SET disk_files = NULL, disk_files_partial = 0, disk_files_at = NULL WHERE user_id = ? AND (disk_files IS NOT NULL OR disk_files_at IS NOT NULL)",
             &[&user_id],
@@ -4364,17 +5114,37 @@ impl Db {
     /// Names, emails and sign-in subjects the user had before: what `user.created`,
     /// `user.updated` and identity events about them recorded, so erasing scrubs old values
     /// a change left in the log.
-    fn past_identifiers(c: &Connection, user_id: &str, emails: &mut Vec<String>, exact: &mut Vec<String>, subjects: &mut Vec<String>) -> rusqlite::Result<()> {
-        const KEYS: [&str; 9] = ["name", "email", "userName", "externalId", "subject", "givenName", "familyName", "displayName", "formatted"];
+    fn past_identifiers(
+        c: &Connection,
+        user_id: &str,
+        emails: &mut Vec<String>,
+        exact: &mut Vec<String>,
+        subjects: &mut Vec<String>,
+    ) -> rusqlite::Result<()> {
+        const KEYS: [&str; 9] = [
+            "name",
+            "email",
+            "userName",
+            "externalId",
+            "subject",
+            "givenName",
+            "familyName",
+            "displayName",
+            "formatted",
+        ];
         let mut st = c.prepare("SELECT details FROM audit_events WHERE target_type = 'user' AND target_id = ? AND action IN ('user.created', 'user.updated', 'user.identity_linked', 'user.identity_unlinked')")?;
         let rows = st.query_map([user_id], |r| r.get::<_, String>(0))?;
         for d in rows {
-            let Ok(d) = serde_json::from_str::<Value>(&d?) else { continue };
+            let Ok(d) = serde_json::from_str::<Value>(&d?) else {
+                continue;
+            };
             if let (Some(i), Some(sub)) = (d["issuer"].as_str(), d["subject"].as_str()) {
                 subjects.push(format!("{i}|{sub}"));
             }
             let mut found = |key: &str, v: &Value| {
-                let Some(v) = v.as_str().filter(|v| !v.trim().is_empty()) else { return };
+                let Some(v) = v.as_str().filter(|v| !v.trim().is_empty()) else {
+                    return;
+                };
                 match key {
                     "externalId" | "subject" => subjects.push(v.into()),
                     "email" | "userName" => emails.push(v.into()),
@@ -4393,7 +5163,10 @@ impl Db {
     /// Rewrites every audit event about `s`'s user as `Scrub` says, inside the caller's
     /// transaction; events that name them by id as `named` says. Returns how many changed.
     fn pseudonymise_audit(c: &Connection, s: &Scrub, named: &Scrub) -> rusqlite::Result<usize> {
-        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", params![AUDIT_ERASING, s.pseudonym])?;
+        c.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            params![AUDIT_ERASING, s.pseudonym],
+        )?;
         let mut sql = String::from(
             "SELECT id, actor_id, actor_name, actor_email, actor_subject, target_id, on_behalf_of, ip, user_agent, session_id, details FROM audit_events
              WHERE actor_id = ?1 OR target_id = ?1 OR on_behalf_of = ?1 OR instr(details, ?1) > 0",
@@ -4401,31 +5174,83 @@ impl Db {
         let mut args: Vec<String> = vec![s.id.clone()];
         for e in &s.emails {
             args.push(e.clone());
-            sql.push_str(&format!(" OR actor_email = ?{n} COLLATE NOCASE OR instr(lower(details), ?{n}) > 0", n = args.len()));
+            sql.push_str(&format!(
+                " OR actor_email = ?{n} COLLATE NOCASE OR instr(lower(details), ?{n}) > 0",
+                n = args.len()
+            ));
         }
         for x in s.exact.iter().filter(|x| x.chars().count() >= 8) {
             args.push(x.clone());
-            sql.push_str(&format!(" OR actor_subject = ?{n} OR instr(details, ?{n}) > 0", n = args.len()));
+            sql.push_str(&format!(
+                " OR actor_subject = ?{n} OR instr(details, ?{n}) > 0",
+                n = args.len()
+            ));
         }
         type Row = (i64, [Option<String>; 9], String);
         let rows: Vec<Row> = {
             let mut st = c.prepare(&sql)?;
-            let rows = st.query_map(rusqlite::params_from_iter(&args), |r| Ok((r.get(0)?, [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?], r.get(10)?)))?;
+            let rows = st.query_map(rusqlite::params_from_iter(&args), |r| {
+                Ok((
+                    r.get(0)?,
+                    [
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                    ],
+                    r.get(10)?,
+                ))
+            })?;
             rows.collect::<rusqlite::Result<_>>()?
         };
         let mut n = 0;
-        for (id, [actor_id, name, email, subject, target, behalf, ip, agent, session], details) in rows {
+        for (
+            id,
+            [
+                actor_id,
+                name,
+                email,
+                subject,
+                target,
+                behalf,
+                ip,
+                agent,
+                session,
+            ],
+            details,
+        ) in rows
+        {
             let is = |v: &Option<String>| v.as_deref() == Some(s.id.as_str());
             // A visitor without an account (a signup) is known only by the email they gave.
-            let visitor = actor_id.is_none() && email.as_deref().is_some_and(|e| s.emails.contains(&e.to_lowercase()));
+            let visitor = actor_id.is_none()
+                && email
+                    .as_deref()
+                    .is_some_and(|e| s.emails.contains(&e.to_lowercase()));
             let theirs = is(&actor_id) || visitor;
-            let s = if theirs || is(&target) || is(&behalf) { named } else { s };
+            let s = if theirs || is(&target) || is(&behalf) {
+                named
+            } else {
+                s
+            };
             let swap = |v: Option<String>| {
-                if v.as_deref() == Some(s.id.as_str()) { Some(s.pseudonym.clone()) } else { v }
+                if v.as_deref() == Some(s.id.as_str()) {
+                    Some(s.pseudonym.clone())
+                } else {
+                    v
+                }
             };
             let mine = |v: Option<String>, matches: bool| if theirs || matches { None } else { v };
-            let email_match = email.as_deref().is_some_and(|e| s.emails.contains(&e.to_lowercase()));
-            let subject_match = subject.as_deref().is_some_and(|x| s.exact.contains(&x.to_lowercase()));
+            let email_match = email
+                .as_deref()
+                .is_some_and(|e| s.emails.contains(&e.to_lowercase()));
+            let subject_match = subject
+                .as_deref()
+                .is_some_and(|x| s.exact.contains(&x.to_lowercase()));
             let mut d: Value = serde_json::from_str(&details).unwrap_or(Value::Null);
             let changed = s.value(&mut d);
             let next = (
@@ -4439,7 +5264,12 @@ impl Db {
                 mine(agent.clone(), false),
                 mine(session.clone(), false),
             );
-            if !changed && next == (actor_id, name, email, subject, target, behalf, ip, agent, session) {
+            if !changed
+                && next
+                    == (
+                        actor_id, name, email, subject, target, behalf, ip, agent, session,
+                    )
+            {
                 continue;
             }
             c.execute(
@@ -4458,8 +5288,13 @@ impl Db {
     pub fn all_rows(&self) -> Vec<(String, String)> {
         let c = self.c();
         let tables: Vec<String> = {
-            let mut s = c.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").unwrap();
-            s.query_map([], |r| r.get(0)).unwrap().filter_map(Result::ok).collect()
+            let mut s = c
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect()
         };
         let mut out = Vec::new();
         for t in tables {
@@ -4469,7 +5304,10 @@ impl Db {
                 .query_map([], |r| {
                     Ok((0..n)
                         .map(|i| match r.get_ref(i) {
-                            Ok(rusqlite::types::ValueRef::Text(b) | rusqlite::types::ValueRef::Blob(b)) => String::from_utf8_lossy(b).into_owned(),
+                            Ok(
+                                rusqlite::types::ValueRef::Text(b)
+                                | rusqlite::types::ValueRef::Blob(b),
+                            ) => String::from_utf8_lossy(b).into_owned(),
                             Ok(rusqlite::types::ValueRef::Integer(i)) => i.to_string(),
                             _ => String::new(),
                         })
@@ -4492,25 +5330,44 @@ impl Db {
     /// Tiers assigned to users, each once.
     pub fn assigned_tiers(&self) -> Vec<String> {
         let c = self.c();
-        let mut s = c.prepare("SELECT DISTINCT tier FROM users WHERE tier IS NOT NULL ORDER BY tier").unwrap();
-        s.query_map([], |r| r.get(0)).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT DISTINCT tier FROM users WHERE tier IS NOT NULL ORDER BY tier")
+            .unwrap();
+        s.query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     pub fn owned_bot_count(&self, owner_id: &str) -> u32 {
-        self.c().query_row("SELECT COUNT(*) FROM bots WHERE owner_id = ?", [owner_id], |r| r.get(0)).unwrap_or(0)
+        self.c()
+            .query_row(
+                "SELECT COUNT(*) FROM bots WHERE owner_id = ?",
+                [owner_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
     }
 
     /// The ids of the Bots a user owns.
     pub fn owned_bot_ids(&self, owner_id: &str) -> Vec<String> {
         let c = self.c();
-        let Ok(mut st) = c.prepare("SELECT id FROM bots WHERE owner_id = ? ORDER BY id") else { return Vec::new() };
-        st.query_map([owner_id], |r| r.get(0)).map(|rows| rows.flatten().collect()).unwrap_or_default()
+        let Ok(mut st) = c.prepare("SELECT id FROM bots WHERE owner_id = ? ORDER BY id") else {
+            return Vec::new();
+        };
+        st.query_map([owner_id], |r| r.get(0))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
     }
 
     /// Runs counted for this user in `period` (`YYYY-MM`).
     pub fn runs_used(&self, user_id: &str, period: &str) -> u32 {
         self.c()
-            .query_row("SELECT runs FROM usage_monthly WHERE user_id = ? AND period = ?", [user_id, period], |r| r.get(0))
+            .query_row(
+                "SELECT runs FROM usage_monthly WHERE user_id = ? AND period = ?",
+                [user_id, period],
+                |r| r.get(0),
+            )
             .optional()
             .ok()
             .flatten()
@@ -4544,7 +5401,11 @@ impl Db {
     /// Routine runs counted for this user on `day` (`YYYY-MM-DD`).
     pub fn routine_runs_used(&self, user_id: &str, day: &str) -> u32 {
         self.c()
-            .query_row("SELECT routine_runs FROM usage_daily WHERE user_id = ? AND day = ?", [user_id, day], |r| r.get(0))
+            .query_row(
+                "SELECT routine_runs FROM usage_daily WHERE user_id = ? AND day = ?",
+                [user_id, day],
+                |r| r.get(0),
+            )
             .optional()
             .ok()
             .flatten()
@@ -4553,7 +5414,12 @@ impl Db {
 
     /// Counts one routine run for the user, unless that would pass `limit`, in one
     /// statement like `take_run`. Ok: routine runs used now; Err: the limit.
-    pub fn take_routine_run(&self, user_id: &str, day: &str, limit: Option<u32>) -> Result<u32, u32> {
+    pub fn take_routine_run(
+        &self,
+        user_id: &str,
+        day: &str,
+        limit: Option<u32>,
+    ) -> Result<u32, u32> {
         let cap = limit.map_or(i64::MAX, i64::from);
         let taken = self
             .c()
@@ -4626,22 +5492,51 @@ impl Db {
         let sums = "COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_read_tokens), 0),
                     COALESCE(SUM(cache_write_tokens), 0), COUNT(DISTINCT run_id), COUNT(DISTINCT CASE WHEN reported = 0 THEN run_id END)";
         let totals = |r: &rusqlite::Row, at: usize| -> rusqlite::Result<TokenTotals> {
-            let n = |i: usize| r.get::<_, i64>(at + i).map(|v| u64::try_from(v).unwrap_or(0));
-            Ok(TokenTotals { input: n(0)?, output: n(1)?, cache_read: n(2)?, cache_write: n(3)?, runs: n(4)?, unreported_runs: n(5)? })
+            let n = |i: usize| {
+                r.get::<_, i64>(at + i)
+                    .map(|v| u64::try_from(v).unwrap_or(0))
+            };
+            Ok(TokenTotals {
+                input: n(0)?,
+                output: n(1)?,
+                cache_read: n(2)?,
+                cache_write: n(3)?,
+                runs: n(4)?,
+                unreported_runs: n(5)?,
+            })
         };
         let all = c
-            .query_row(&format!("SELECT {sums} FROM token_usage WHERE user_id = ?1 AND at >= ?2 AND at < ?3"), params![user_id, start, end], |r| totals(r, 0))
+            .query_row(
+                &format!(
+                    "SELECT {sums} FROM token_usage WHERE user_id = ?1 AND at >= ?2 AND at < ?3"
+                ),
+                params![user_id, start, end],
+                |r| totals(r, 0),
+            )
             .unwrap_or_default();
         let grouped = |by: &str| -> Vec<(Option<String>, TokenTotals)> {
-            let sql = format!("SELECT {by}, {sums} FROM token_usage WHERE user_id = ?1 AND at >= ?2 AND at < ?3 GROUP BY {by} ORDER BY {by}");
-            let Ok(mut st) = c.prepare(&sql) else { return Vec::new() };
-            st.query_map(params![user_id, start, end], |r| Ok((r.get::<_, Option<String>>(0)?, totals(r, 1)?)))
-                .map(|rows| rows.filter_map(Result::ok).collect())
-                .unwrap_or_default()
+            let sql = format!(
+                "SELECT {by}, {sums} FROM token_usage WHERE user_id = ?1 AND at >= ?2 AND at < ?3 GROUP BY {by} ORDER BY {by}"
+            );
+            let Ok(mut st) = c.prepare(&sql) else {
+                return Vec::new();
+            };
+            st.query_map(params![user_id, start, end], |r| {
+                Ok((r.get::<_, Option<String>>(0)?, totals(r, 1)?))
+            })
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
         };
         let by_model = grouped("model");
-        let by_bot = grouped("bot_id").into_iter().filter_map(|(id, t)| Some((id?, t))).collect();
-        TokenSummary { all, by_model, by_bot }
+        let by_bot = grouped("bot_id")
+            .into_iter()
+            .filter_map(|(id, t)| Some((id?, t)))
+            .collect();
+        TokenSummary {
+            all,
+            by_model,
+            by_bot,
+        }
     }
 
     /// The oldest token rows waiting to go to Stripe.
@@ -4654,7 +5549,15 @@ impl Db {
             return Vec::new();
         };
         st.query_map([limit], |r| {
-            Ok(MeterRow { id: r.get(0)?, user_id: r.get(1)?, run_id: r.get(2)?, tokens: u64::try_from(r.get::<_, i64>(3)?).unwrap_or(0), at: r.get(4)?, attempts: r.get(5)?, customer: r.get(6)? })
+            Ok(MeterRow {
+                id: r.get(0)?,
+                user_id: r.get(1)?,
+                run_id: r.get(2)?,
+                tokens: u64::try_from(r.get::<_, i64>(3)?).unwrap_or(0),
+                at: r.get(4)?,
+                attempts: r.get(5)?,
+                customer: r.get(6)?,
+            })
         })
         .map(|rows| rows.filter_map(Result::ok).collect())
         .unwrap_or_default()
@@ -4669,7 +5572,13 @@ impl Db {
     }
 
     /// Whether `action` was audited about this target at or after `since` (ms).
-    pub fn audited_since(&self, action: &str, target_type: &str, target_id: &str, since: i64) -> bool {
+    pub fn audited_since(
+        &self,
+        action: &str,
+        target_type: &str,
+        target_id: &str,
+        since: i64,
+    ) -> bool {
         self.c()
             .query_row(
                 "SELECT EXISTS (SELECT 1 FROM audit_events WHERE action = ?1 AND target_type = ?2 AND target_id = ?3 AND at >= ?4)",
@@ -4704,7 +5613,15 @@ impl Db {
     }
 
     pub fn subscription_by_id(&self, subscription_id: &str) -> Option<Subscription> {
-        self.c().query_row("SELECT * FROM subscriptions WHERE subscription_id = ?", [subscription_id], subscription_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT * FROM subscriptions WHERE subscription_id = ?",
+                [subscription_id],
+                subscription_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// Applies one payment-provider event, in one transaction: records the event id (a
@@ -4740,19 +5657,44 @@ impl Db {
         if !first_delivery(&tx, event_id, event_type).map_err(|e| e.to_string())? {
             return Ok((Applied::Duplicate, None, 0));
         }
-        let by_id = tx.query_row("SELECT * FROM subscriptions WHERE subscription_id = ?", [&sub.subscription_id], subscription_row).optional().map_err(|e| e.to_string())?;
+        let by_id = tx
+            .query_row(
+                "SELECT * FROM subscriptions WHERE subscription_id = ?",
+                [&sub.subscription_id],
+                subscription_row,
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
         let mut paying_before: Option<Subscription> = None;
         let mut paying_after: Option<Subscription> = None;
         let mut other_paying: Option<Subscription> = None;
-        let customer_user = |cus: &str| tx.query_row("SELECT user_id FROM billing_customers WHERE customer_id = ?", [cus], |r| r.get::<_, String>(0)).optional();
+        let customer_user = |cus: &str| {
+            tx.query_row(
+                "SELECT user_id FROM billing_customers WHERE customer_id = ?",
+                [cus],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        };
         let others_customer = match (&by_id, &sub.customer_id) {
             (Some(s), _) if s.user_id != sub.user_id => false,
             (_, Some(cus)) => {
-                customer_user(cus).map_err(|e| e.to_string())?.is_some_and(|u| u != sub.user_id) || customer_team_in(&tx, cus).map_err(|e| e.to_string())?.is_some()
+                customer_user(cus)
+                    .map_err(|e| e.to_string())?
+                    .is_some_and(|u| u != sub.user_id)
+                    || customer_team_in(&tx, cus)
+                        .map_err(|e| e.to_string())?
+                        .is_some()
             }
             (_, None) => false,
         };
-        let teams: bool = tx.query_row("SELECT COUNT(*) FROM team_subscriptions WHERE subscription_id = ?", [&sub.subscription_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        let teams: bool = tx
+            .query_row(
+                "SELECT COUNT(*) FROM team_subscriptions WHERE subscription_id = ?",
+                [&sub.subscription_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
         let outcome = if teams || by_id.as_ref().is_some_and(|s| s.user_id != sub.user_id) {
             Applied::OtherUser
         } else if others_customer {
@@ -4768,9 +5710,14 @@ impl Db {
         }) {
             Applied::Stale
         } else {
-            let paying_id = |s: &Option<Subscription>| s.as_ref().map(|s| s.subscription_id.clone());
+            let paying_id =
+                |s: &Option<Subscription>| s.as_ref().map(|s| s.subscription_id.clone());
             let before = paying_subscription(&tx, &sub.user_id).map_err(|e| e.to_string())?;
-            let tier = if set_tier { sub.tier.clone() } else { by_id.as_ref().and_then(|s| s.tier.clone()) };
+            let tier = if set_tier {
+                sub.tier.clone()
+            } else {
+                by_id.as_ref().and_then(|s| s.tier.clone())
+            };
             tx.execute(
                 "INSERT INTO subscriptions (subscription_id, user_id, provider, customer_id, status, price_id, tier, period_end, started, event_created, updated_at, period_start)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
@@ -4792,14 +5739,26 @@ impl Db {
                 )
                 .optional()
                 .map_err(|e| e.to_string())?;
-            if after.as_ref().is_some_and(|s| s.subscription_id != sub.subscription_id) && !moved {
+            if after
+                .as_ref()
+                .is_some_and(|s| s.subscription_id != sub.subscription_id)
+                && !moved
+            {
                 Applied::Superseded
             } else if !set_tier && !moved {
                 Applied::Unchanged
             } else {
-                let from: Option<String> = tx.query_row("SELECT tier FROM users WHERE id = ?", [&sub.user_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+                let from: Option<String> = tx
+                    .query_row("SELECT tier FROM users WHERE id = ?", [&sub.user_id], |r| {
+                        r.get(0)
+                    })
+                    .map_err(|e| e.to_string())?;
                 if from != to {
-                    tx.execute("UPDATE users SET tier = ?, updated_at = ? WHERE id = ?", params![to, now(), sub.user_id]).map_err(|e| e.to_string())?;
+                    tx.execute(
+                        "UPDATE users SET tier = ?, updated_at = ? WHERE id = ?",
+                        params![to, now(), sub.user_id],
+                    )
+                    .map_err(|e| e.to_string())?;
                     Applied::Changed { from, to }
                 } else {
                     Applied::Unchanged
@@ -4808,9 +5767,18 @@ impl Db {
         };
         let linked = match (&outcome, &sub.customer_id) {
             (Applied::OtherUser | Applied::CustomerOfAnotherUser, _) | (_, None) => None,
-            (_, Some(cus)) => Some(link_in(&tx, &sub.user_id, &sub.provider, cus, "subscription").map_err(|e| e.to_string())?),
+            (_, Some(cus)) => Some(
+                link_in(&tx, &sub.user_id, &sub.provider, cus, "subscription")
+                    .map_err(|e| e.to_string())?,
+            ),
         };
-        let emails = mail(&Change { applied: &outcome, before: by_id.as_ref(), paying_before: paying_before.as_ref(), paying_after: paying_after.as_ref(), other_paying: other_paying.as_ref() });
+        let emails = mail(&Change {
+            applied: &outcome,
+            before: by_id.as_ref(),
+            paying_before: paying_before.as_ref(),
+            paying_after: paying_after.as_ref(),
+            other_paying: other_paying.as_ref(),
+        });
         // Held until the caller has followed the event (`release_billing_emails`), so a
         // plan email can say what the computer is doing; due anyway after the hold.
         let due = now() + crate::billing_mail::HOLD_MS;
@@ -4835,15 +5803,23 @@ impl Db {
     pub fn due_billing_emails(&self, now: i64, limit: u32) -> Vec<crate::billing_mail::Queued> {
         let c = self.c();
         let Ok(mut q) = c.prepare("SELECT * FROM billing_emails WHERE state = 'pending' AND next_at <= ? ORDER BY id LIMIT ?") else { return Vec::new() };
-        q.query_map(params![now, limit], queued_email_row).map(|rows| rows.flatten().collect()).unwrap_or_default()
+        q.query_map(params![now, limit], queued_email_row)
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
     }
 
     /// A user's billing emails, newest first.
     #[cfg(test)]
     pub fn billing_emails_of(&self, user_id: &str, limit: u32) -> Vec<crate::billing_mail::Queued> {
         let c = self.c();
-        let Ok(mut q) = c.prepare("SELECT * FROM billing_emails WHERE user_id = ? ORDER BY id DESC LIMIT ?") else { return Vec::new() };
-        q.query_map(params![user_id, limit], queued_email_row).map(|rows| rows.flatten().collect()).unwrap_or_default()
+        let Ok(mut q) =
+            c.prepare("SELECT * FROM billing_emails WHERE user_id = ? ORDER BY id DESC LIMIT ?")
+        else {
+            return Vec::new();
+        };
+        q.query_map(params![user_id, limit], queued_email_row)
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
     }
 
     /// Makes a Stripe event's held emails due now.
@@ -4868,7 +5844,12 @@ impl Db {
 
     /// Settles a pending billing email: `sent`, `skipped` or `failed`, or `pending` with
     /// why its last try failed.
-    pub fn billing_email_result(&self, id: i64, state: &str, reason: Option<&str>) -> Result<(), String> {
+    pub fn billing_email_result(
+        &self,
+        id: i64,
+        state: &str,
+        reason: Option<&str>,
+    ) -> Result<(), String> {
         let done = (state != "pending").then(now);
         self.c()
             .execute("UPDATE billing_emails SET state = ?, reason = ?, done_at = ? WHERE id = ? AND state = 'pending'", params![state, reason, done, id])
@@ -4879,12 +5860,26 @@ impl Db {
     /// Makes every pending billing email due now, as if its backoff had passed.
     #[cfg(test)]
     pub fn billing_emails_due_now(&self) {
-        self.c().execute("UPDATE billing_emails SET next_at = 0 WHERE state = 'pending'", []).unwrap();
+        self.c()
+            .execute(
+                "UPDATE billing_emails SET next_at = 0 WHERE state = 'pending'",
+                [],
+            )
+            .unwrap();
     }
 
     /// Whether the person wants usage emails (ADR 0091). On unless they turned them off.
     pub fn usage_emails(&self, user_id: &str) -> bool {
-        self.c().query_row("SELECT usage_emails FROM email_prefs WHERE user_id = ?", [user_id], |r| r.get(0)).optional().ok().flatten().unwrap_or(true)
+        self.c()
+            .query_row(
+                "SELECT usage_emails FROM email_prefs WHERE user_id = ?",
+                [user_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(true)
     }
 
     pub fn set_usage_emails(&self, user_id: &str, on: bool) -> Result<(), String> {
@@ -4900,39 +5895,81 @@ impl Db {
 
     /// The user's payment-provider customer (ADR 0042).
     pub fn customer_of(&self, user_id: &str) -> Option<String> {
-        self.c().query_row("SELECT customer_id FROM billing_customers WHERE user_id = ?", [user_id], |r| r.get(0)).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT customer_id FROM billing_customers WHERE user_id = ?",
+                [user_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// The user a customer is linked to.
     pub fn customer_user(&self, customer_id: &str) -> Option<String> {
-        self.c().query_row("SELECT user_id FROM billing_customers WHERE customer_id = ?", [customer_id], |r| r.get(0)).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT user_id FROM billing_customers WHERE customer_id = ?",
+                [customer_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// Links a customer to a user for one provider event, in one transaction with
     /// recording the event. None: the event was applied already.
-    pub fn link_customer(&self, event_id: &str, event_type: &str, user_id: &str, provider: &str, customer_id: &str, via: &str) -> Result<Option<Linked>, String> {
+    pub fn link_customer(
+        &self,
+        event_id: &str,
+        event_type: &str,
+        user_id: &str,
+        provider: &str,
+        customer_id: &str,
+        via: &str,
+    ) -> Result<Option<Linked>, String> {
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
         if !first_delivery(&tx, event_id, event_type).map_err(|e| e.to_string())? {
             return Ok(None);
         }
-        let linked = link_in(&tx, user_id, provider, customer_id, via).map_err(|e| e.to_string())?;
+        let linked =
+            link_in(&tx, user_id, provider, customer_id, via).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(Some(linked))
     }
 
     /// Drops a customer the provider deleted, for one provider event. `Ok(None)`: the
     /// event was applied already; else the user or team (ADR 0093) that had it, if any.
-    pub fn unlink_customer(&self, event_id: &str, event_type: &str, customer_id: &str) -> Result<Option<Unlinked>, String> {
+    pub fn unlink_customer(
+        &self,
+        event_id: &str,
+        event_type: &str,
+        customer_id: &str,
+    ) -> Result<Option<Unlinked>, String> {
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
         if !first_delivery(&tx, event_id, event_type).map_err(|e| e.to_string())? {
             return Ok(None);
         }
-        let user: Option<String> =
-            tx.query_row("DELETE FROM billing_customers WHERE customer_id = ? RETURNING user_id", [customer_id], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
-        let team: Option<String> =
-            tx.query_row("DELETE FROM team_customers WHERE customer_id = ? RETURNING team_id", [customer_id], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+        let user: Option<String> = tx
+            .query_row(
+                "DELETE FROM billing_customers WHERE customer_id = ? RETURNING user_id",
+                [customer_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let team: Option<String> = tx
+            .query_row(
+                "DELETE FROM team_customers WHERE customer_id = ? RETURNING team_id",
+                [customer_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
         tx.execute("INSERT OR IGNORE INTO billing_deleted_customers (customer_id, deleted_at) VALUES (?, ?)", params![customer_id, now()]).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(Some(Unlinked { user, team }))
@@ -4941,7 +5978,15 @@ impl Db {
     /// The user's checkout session that may still be open (`expires_at` in seconds, as Stripe has it).
     pub fn open_checkout(&self, user_id: &str) -> Option<String> {
         let at = now() / 1000;
-        self.c().query_row("SELECT session_id FROM billing_checkouts WHERE user_id = ? AND expires_at > ?", params![user_id, at], |r| r.get(0)).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT session_id FROM billing_checkouts WHERE user_id = ? AND expires_at > ?",
+                params![user_id, at],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     pub fn set_open_checkout(&self, user_id: &str, session_id: &str, expires_at: i64) {
@@ -4954,7 +5999,10 @@ impl Db {
 
     /// Forgets the user's open checkout if it is `session_id` (closed, or paid).
     pub fn close_checkout(&self, user_id: &str, session_id: &str) {
-        let _ = self.c().execute("DELETE FROM billing_checkouts WHERE user_id = ? AND session_id = ?", params![user_id, session_id]);
+        let _ = self.c().execute(
+            "DELETE FROM billing_checkouts WHERE user_id = ? AND session_id = ?",
+            params![user_id, session_id],
+        );
     }
 
     // Team billing (ADR 0093)
@@ -4976,7 +6024,12 @@ impl Db {
 
     /// A team's checkout went through: keep it until its subscription is recorded, so
     /// no second checkout opens meanwhile. Forgotten at once if it already is.
-    pub fn team_checkout_paid(&self, team_id: &str, session_id: &str, subscription_id: Option<&str>) {
+    pub fn team_checkout_paid(
+        &self,
+        team_id: &str,
+        session_id: &str,
+        subscription_id: Option<&str>,
+    ) {
         match subscription_id {
             Some(sub) if self.team_subscription_by_id(sub).is_none() => {
                 let _ = self.c().execute("UPDATE team_checkouts SET subscription_id = ? WHERE team_id = ? AND session_id = ?", params![sub, team_id, session_id]);
@@ -4987,7 +6040,10 @@ impl Db {
 
     /// The team's paid checkout for `subscription_id` is done with: its subscription is recorded.
     pub fn close_team_checkout_for(&self, team_id: &str, subscription_id: &str) {
-        let _ = self.c().execute("DELETE FROM team_checkouts WHERE team_id = ? AND subscription_id = ?", params![team_id, subscription_id]);
+        let _ = self.c().execute(
+            "DELETE FROM team_checkouts WHERE team_id = ? AND subscription_id = ?",
+            params![team_id, subscription_id],
+        );
     }
 
     pub fn set_team_open_checkout(&self, team_id: &str, session_id: &str, expires_at: i64) {
@@ -4999,12 +6055,23 @@ impl Db {
     }
 
     pub fn close_team_checkout(&self, team_id: &str, session_id: &str) {
-        let _ = self.c().execute("DELETE FROM team_checkouts WHERE team_id = ? AND session_id = ?", params![team_id, session_id]);
+        let _ = self.c().execute(
+            "DELETE FROM team_checkouts WHERE team_id = ? AND session_id = ?",
+            params![team_id, session_id],
+        );
     }
 
     /// The team's payment-provider customer.
     pub fn team_customer(&self, team_id: &str) -> Option<String> {
-        self.c().query_row("SELECT customer_id FROM team_customers WHERE team_id = ?", [team_id], |r| r.get(0)).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT customer_id FROM team_customers WHERE team_id = ?",
+                [team_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// The team a customer is linked to.
@@ -5014,13 +6081,21 @@ impl Db {
 
     /// Links a customer to a team for one provider event (a completed checkout). None:
     /// the event was applied already.
-    pub fn link_team_customer(&self, event_id: &str, event_type: &str, team_id: &str, provider: &str, customer_id: &str) -> Result<Option<Linked>, String> {
+    pub fn link_team_customer(
+        &self,
+        event_id: &str,
+        event_type: &str,
+        team_id: &str,
+        provider: &str,
+        customer_id: &str,
+    ) -> Result<Option<Linked>, String> {
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
         if !first_delivery(&tx, event_id, event_type).map_err(|e| e.to_string())? {
             return Ok(None);
         }
-        let linked = link_team_in(&tx, team_id, provider, customer_id, "checkout").map_err(|e| e.to_string())?;
+        let linked = link_team_in(&tx, team_id, provider, customer_id, "checkout")
+            .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(Some(linked))
     }
@@ -5042,7 +6117,15 @@ impl Db {
     }
 
     pub fn team_subscription_by_id(&self, subscription_id: &str) -> Option<TeamSubscription> {
-        self.c().query_row("SELECT * FROM team_subscriptions WHERE subscription_id = ?", [subscription_id], team_subscription_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT * FROM team_subscriptions WHERE subscription_id = ?",
+                [subscription_id],
+                team_subscription_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// The subscription paying for the plan of `user_id`'s team, if they're on one that
@@ -5071,11 +6154,19 @@ impl Db {
         ) else {
             return Vec::new();
         };
-        s.query_map([], team_subscription_row).map(|rows| rows.filter_map(Result::ok).collect()).unwrap_or_default()
+        s.query_map([], team_subscription_row)
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
     }
 
     pub fn team_member_count(&self, team_id: &str) -> i64 {
-        self.c().query_row("SELECT COUNT(*) FROM team_members WHERE team_id = ?", [team_id], |r| r.get(0)).unwrap_or(0)
+        self.c()
+            .query_row(
+                "SELECT COUNT(*) FROM team_members WHERE team_id = ?",
+                [team_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
     }
 
     /// Counts a seat update about to be sent, and returns how many have been, this one included.
@@ -5131,12 +6222,35 @@ impl Db {
             return Ok((Applied::Duplicate, None, 0));
         }
         let e = |e: rusqlite::Error| e.to_string();
-        let by_id = tx.query_row("SELECT * FROM team_subscriptions WHERE subscription_id = ?", [&sub.subscription_id], team_subscription_row).optional().map_err(e)?;
-        let personal: bool = tx.query_row("SELECT COUNT(*) FROM subscriptions WHERE subscription_id = ?", [&sub.subscription_id], |r| r.get(0)).map_err(e)?;
+        let by_id = tx
+            .query_row(
+                "SELECT * FROM team_subscriptions WHERE subscription_id = ?",
+                [&sub.subscription_id],
+                team_subscription_row,
+            )
+            .optional()
+            .map_err(e)?;
+        let personal: bool = tx
+            .query_row(
+                "SELECT COUNT(*) FROM subscriptions WHERE subscription_id = ?",
+                [&sub.subscription_id],
+                |r| r.get(0),
+            )
+            .map_err(e)?;
         let others_customer = match &sub.customer_id {
             Some(cus) => {
-                let user: Option<String> = tx.query_row("SELECT user_id FROM billing_customers WHERE customer_id = ?", [cus], |r| r.get(0)).optional().map_err(e)?;
-                user.is_some() || customer_team_in(&tx, cus).map_err(e)?.is_some_and(|t| t != sub.team_id)
+                let user: Option<String> = tx
+                    .query_row(
+                        "SELECT user_id FROM billing_customers WHERE customer_id = ?",
+                        [cus],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(e)?;
+                user.is_some()
+                    || customer_team_in(&tx, cus)
+                        .map_err(e)?
+                        .is_some_and(|t| t != sub.team_id)
             }
             None => false,
         };
@@ -5155,7 +6269,11 @@ impl Db {
             Applied::Stale
         } else {
             let before = team_paying_in(&tx, &sub.team_id).map_err(e)?;
-            let tier = if set_tier { sub.tier.clone() } else { by_id.as_ref().and_then(|s| s.tier.clone()) };
+            let tier = if set_tier {
+                sub.tier.clone()
+            } else {
+                by_id.as_ref().and_then(|s| s.tier.clone())
+            };
             tx.execute(
                 "INSERT INTO team_subscriptions (subscription_id, team_id, provider, customer_id, status, price_id, tier, item_id, quantity,
                    period_start, period_end, cancel_at, started, event_created, updated_at, paid_by)
@@ -5194,8 +6312,15 @@ impl Db {
                 .map_err(e)?;
             let id = |s: &Option<TeamSubscription>| s.as_ref().map(|s| s.subscription_id.clone());
             let moved = id(&before) != id(&after);
-            let (from, to) = (before.as_ref().and_then(|s| s.tier.clone()), after.as_ref().and_then(|s| s.tier.clone()));
-            let outcome = if after.as_ref().is_some_and(|s| s.subscription_id != sub.subscription_id) && !moved {
+            let (from, to) = (
+                before.as_ref().and_then(|s| s.tier.clone()),
+                after.as_ref().and_then(|s| s.tier.clone()),
+            );
+            let outcome = if after
+                .as_ref()
+                .is_some_and(|s| s.subscription_id != sub.subscription_id)
+                && !moved
+            {
                 Applied::Superseded
             } else if from != to {
                 Applied::Changed { from, to }
@@ -5208,7 +6333,9 @@ impl Db {
         };
         let linked = match (&outcome, &sub.customer_id) {
             (Applied::OtherUser | Applied::CustomerOfAnotherUser, _) | (_, None) => None,
-            (_, Some(cus)) => Some(link_team_in(&tx, &sub.team_id, &sub.provider, cus, "subscription").map_err(e)?),
+            (_, Some(cus)) => Some(
+                link_team_in(&tx, &sub.team_id, &sub.provider, cus, "subscription").map_err(e)?,
+            ),
         };
         let emails = mail(&TeamChange {
             applied: &outcome,
@@ -5232,32 +6359,55 @@ impl Db {
     pub fn identity(&self, issuer: &str, subject: &str) -> Option<(Identity, User)> {
         let c = self.c();
         let i = c
-            .query_row("SELECT * FROM user_identities WHERE issuer = ? AND subject = ?", [issuer, subject], identity_row)
+            .query_row(
+                "SELECT * FROM user_identities WHERE issuer = ? AND subject = ?",
+                [issuer, subject],
+                identity_row,
+            )
             .optional()
             .ok()
             .flatten()?;
-        let u = c.query_row("SELECT * FROM users WHERE id = ?", [&i.user_id], user_row).optional().ok().flatten()?;
+        let u = c
+            .query_row("SELECT * FROM users WHERE id = ?", [&i.user_id], user_row)
+            .optional()
+            .ok()
+            .flatten()?;
         Some((i, u))
     }
 
     pub fn identities(&self, user_id: &str) -> Vec<Identity> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM user_identities WHERE user_id = ? ORDER BY created_at, id").unwrap();
-        s.query_map([user_id], identity_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT * FROM user_identities WHERE user_id = ? ORDER BY created_at, id")
+            .unwrap();
+        s.query_map([user_id], identity_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// Every user's identities, keyed by user id, for the admin list.
     pub fn all_identities(&self) -> HashMap<String, Vec<Identity>> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM user_identities ORDER BY created_at, id").unwrap();
+        let mut s = c
+            .prepare("SELECT * FROM user_identities ORDER BY created_at, id")
+            .unwrap();
         let mut out: HashMap<String, Vec<Identity>> = HashMap::new();
-        for i in s.query_map([], identity_row).unwrap().filter_map(Result::ok) {
+        for i in s
+            .query_map([], identity_row)
+            .unwrap()
+            .filter_map(Result::ok)
+        {
             out.entry(i.user_id.clone()).or_default().push(i);
         }
         out
     }
 
-    fn insert_identity(tx: &Connection, user_id: &str, i: &NewIdentity) -> rusqlite::Result<String> {
+    fn insert_identity(
+        tx: &Connection,
+        user_id: &str,
+        i: &NewIdentity,
+    ) -> rusqlite::Result<String> {
         let id = format!("i{}", crate::short_id());
         tx.execute(
             "INSERT INTO user_identities (id, user_id, provider, issuer, subject, tenant, email, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -5272,7 +6422,15 @@ impl Db {
     }
 
     fn identity_by_id(&self, id: &str) -> Option<Identity> {
-        self.c().query_row("SELECT * FROM user_identities WHERE id = ?", [id], identity_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT * FROM user_identities WHERE id = ?",
+                [id],
+                identity_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// Err when the identity is linked already, to this user or another.
@@ -5280,15 +6438,28 @@ impl Db {
         let id = {
             let c = self.c();
             let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
-            let id = Self::insert_identity(&tx, user_id, i).map_err(|e| if constraint(&e) { "This identity is already linked to a user".to_string() } else { e.to_string() })?;
+            let id = Self::insert_identity(&tx, user_id, i).map_err(|e| {
+                if constraint(&e) {
+                    "This identity is already linked to a user".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
             tx.commit().map_err(|e| e.to_string())?;
             id
         };
-        self.identity_by_id(&id).ok_or_else(|| "identity not saved".into())
+        self.identity_by_id(&id)
+            .ok_or_else(|| "identity not saved".into())
     }
 
     /// Just-in-time sign-up: a new user and their first identity, together or not at all.
-    pub fn create_sso_user(&self, email: Option<&str>, name: &str, role: Role, i: &NewIdentity) -> Result<User, JitError> {
+    pub fn create_sso_user(
+        &self,
+        email: Option<&str>,
+        name: &str,
+        role: Role,
+        i: &NewIdentity,
+    ) -> Result<User, JitError> {
         let id = format!("u{}", crate::short_id());
         let cap = self.seat_cap();
         {
@@ -5303,7 +6474,13 @@ impl Db {
                 params![id, email, name, role.as_str(), at, at],
             )
             .map_err(|e| if constraint(&e) { JitError::EmailTaken } else { JitError::Database })?;
-            Self::insert_identity(&tx, &id, i).map_err(|e| if constraint(&e) { JitError::IdentityTaken } else { JitError::Database })?;
+            Self::insert_identity(&tx, &id, i).map_err(|e| {
+                if constraint(&e) {
+                    JitError::IdentityTaken
+                } else {
+                    JitError::Database
+                }
+            })?;
             tx.commit().map_err(|_| JitError::Database)?;
         }
         self.user(&id).ok_or(JitError::Database)
@@ -5314,7 +6491,8 @@ impl Db {
         let gone = self.identity_by_id(id).filter(|i| i.user_id == user_id)?;
         let c = self.c();
         let tx = c.unchecked_transaction().ok()?;
-        tx.execute("DELETE FROM user_identities WHERE id = ?", [id]).ok()?;
+        tx.execute("DELETE FROM user_identities WHERE id = ?", [id])
+            .ok()?;
         tx.execute(
             "UPDATE users SET
                idp_issuer = (SELECT issuer FROM user_identities WHERE user_id = ?1 ORDER BY created_at, id LIMIT 1),
@@ -5330,7 +6508,10 @@ impl Db {
 
     /// A sign-in with this identity: when, and the email the IdP sent this time.
     pub fn touch_identity(&self, id: &str, email: Option<&str>, at: i64) {
-        let _ = self.c().execute("UPDATE user_identities SET last_login_at = ?, email = coalesce(?, email) WHERE id = ?", params![at, email, id]);
+        let _ = self.c().execute(
+            "UPDATE user_identities SET last_login_at = ?, email = coalesce(?, email) WHERE id = ?",
+            params![at, email, id],
+        );
     }
 
     // Sessions and sign-in codes. Callers hash tokens; nothing here sees one.
@@ -5355,7 +6536,11 @@ impl Db {
     }
 
     pub fn session(&self, id: &str) -> Option<Session> {
-        self.c().query_row("SELECT * FROM sessions WHERE id = ?", [id], session_row).optional().ok().flatten()
+        self.c()
+            .query_row("SELECT * FROM sessions WHERE id = ?", [id], session_row)
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// The distinct IPs this user's kept sessions came from, newest first, at most `limit`.
@@ -5364,12 +6549,21 @@ impl Db {
         let mut s = c
             .prepare("SELECT ip FROM sessions WHERE user_id = ? AND ip IS NOT NULL GROUP BY ip ORDER BY max(created_at) DESC LIMIT ?")
             .unwrap();
-        s.query_map(params![user_id, limit], |r| r.get(0)).unwrap().filter_map(Result::ok).collect()
+        s.query_map(params![user_id, limit], |r| r.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// The live session with this token hash and its active user. None when it is
     /// unknown, revoked, expired (absolute or idle), or the user is disabled.
-    pub fn live_session(&self, token_hash: &str, at: i64, idle_ms: i64, max_ms: i64) -> Option<(Session, User)> {
+    pub fn live_session(
+        &self,
+        token_hash: &str,
+        at: i64,
+        idle_ms: i64,
+        max_ms: i64,
+    ) -> Option<(Session, User)> {
         let c = self.c();
         let s = c
             .query_row(
@@ -5380,7 +6574,11 @@ impl Db {
             .optional()
             .ok()
             .flatten()?;
-        let u = c.query_row("SELECT * FROM users WHERE id = ?", [&s.user_id], user_row).optional().ok().flatten()?;
+        let u = c
+            .query_row("SELECT * FROM users WHERE id = ?", [&s.user_id], user_row)
+            .optional()
+            .ok()
+            .flatten()?;
         Some((s, u))
     }
 
@@ -5400,23 +6598,48 @@ impl Db {
     /// Records use, at most once a minute per session to keep writes down. The idle
     /// window is therefore up to a minute shorter than configured.
     pub fn touch_session(&self, id: &str, at: i64) {
-        let _ = self.c().execute("UPDATE sessions SET last_seen_at = ?1 WHERE id = ?2 AND last_seen_at <= ?1 - 60000", params![at, id]);
+        let _ = self.c().execute(
+            "UPDATE sessions SET last_seen_at = ?1 WHERE id = ?2 AND last_seen_at <= ?1 - 60000",
+            params![at, id],
+        );
     }
 
     /// Every live session of one user, newest first, with no cap.
-    pub fn user_live_sessions(&self, user_id: &str, at: i64, idle_ms: i64, max_ms: i64) -> Vec<Session> {
+    pub fn user_live_sessions(
+        &self,
+        user_id: &str,
+        at: i64,
+        idle_ms: i64,
+        max_ms: i64,
+    ) -> Vec<Session> {
         let c = self.c();
-        let sql = format!("SELECT s.* FROM sessions s WHERE s.user_id = ?4 AND {SESSION_LIVE} ORDER BY s.created_at DESC, s.id");
+        let sql = format!(
+            "SELECT s.* FROM sessions s WHERE s.user_id = ?4 AND {SESSION_LIVE} ORDER BY s.created_at DESC, s.id"
+        );
         let mut s = c.prepare(&sql).unwrap();
-        s.query_map(params![at, idle_ms, max_ms, user_id], session_row).unwrap().filter_map(Result::ok).collect()
+        s.query_map(params![at, idle_ms, max_ms, user_id], session_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// Live sessions, newest first, optionally for one user.
-    pub fn live_sessions(&self, user_id: Option<&str>, at: i64, idle_ms: i64, max_ms: i64) -> Vec<Session> {
+    pub fn live_sessions(
+        &self,
+        user_id: Option<&str>,
+        at: i64,
+        idle_ms: i64,
+        max_ms: i64,
+    ) -> Vec<Session> {
         let c = self.c();
-        let sql = format!("SELECT s.* FROM sessions s WHERE (?4 IS NULL OR s.user_id = ?4) AND {SESSION_LIVE} ORDER BY s.created_at DESC, s.id LIMIT 1000");
+        let sql = format!(
+            "SELECT s.* FROM sessions s WHERE (?4 IS NULL OR s.user_id = ?4) AND {SESSION_LIVE} ORDER BY s.created_at DESC, s.id LIMIT 1000"
+        );
         let mut s = c.prepare(&sql).unwrap();
-        s.query_map(params![at, idle_ms, max_ms, user_id], session_row).unwrap().filter_map(Result::ok).collect()
+        s.query_map(params![at, idle_ms, max_ms, user_id], session_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// False if it was already revoked or doesn't exist.
@@ -5440,11 +6663,20 @@ impl Db {
                 params![now(), by, reason, user_id],
             )
             .unwrap_or(0);
-        let _ = c.execute("DELETE FROM login_codes WHERE user_id = ? AND used_at IS NULL", [user_id]);
+        let _ = c.execute(
+            "DELETE FROM login_codes WHERE user_id = ? AND used_at IS NULL",
+            [user_id],
+        );
         n
     }
 
-    pub fn add_login_code(&self, code_hash: &str, user_id: &str, created_by: &str, expires_at: i64) {
+    pub fn add_login_code(
+        &self,
+        code_hash: &str,
+        user_id: &str,
+        created_by: &str,
+        expires_at: i64,
+    ) {
         self.c()
             .execute(
                 "INSERT INTO login_codes (code_hash, user_id, created_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
@@ -5455,10 +6687,21 @@ impl Db {
 
     /// Adds a sign-in code in place of the user's unused ones, in one transaction so two
     /// admins replacing at once leave one working code. Returns how many it replaced.
-    pub fn replace_login_codes(&self, code_hash: &str, user_id: &str, created_by: &str, expires_at: i64) -> usize {
+    pub fn replace_login_codes(
+        &self,
+        code_hash: &str,
+        user_id: &str,
+        created_by: &str,
+        expires_at: i64,
+    ) -> usize {
         let mut c = self.c();
         let tx = c.transaction().unwrap();
-        let n = tx.execute("DELETE FROM login_codes WHERE user_id = ? AND used_at IS NULL", [user_id]).unwrap();
+        let n = tx
+            .execute(
+                "DELETE FROM login_codes WHERE user_id = ? AND used_at IS NULL",
+                [user_id],
+            )
+            .unwrap();
         tx.execute(
             "INSERT INTO login_codes (code_hash, user_id, created_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
             params![code_hash, user_id, created_by, now(), expires_at],
@@ -5474,7 +6717,12 @@ impl Db {
         let mut s = c
             .prepare("SELECT user_id, count(*), max(expires_at) FROM login_codes WHERE used_at IS NULL AND ? < expires_at GROUP BY user_id")
             .unwrap();
-        s.query_map([at], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?)))).unwrap().filter_map(Result::ok).collect()
+        s.query_map([at], |r| {
+            Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?)))
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect()
     }
 
     // Sign-ups (ADR 0022)
@@ -5499,29 +6747,52 @@ impl Db {
     }
 
     pub fn signup(&self, id: &str) -> Option<Signup> {
-        self.c().query_row("SELECT * FROM signups WHERE id = ?", [id], signup_row).optional().ok().flatten()
+        self.c()
+            .query_row("SELECT * FROM signups WHERE id = ?", [id], signup_row)
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// Newest first. `status` None: all of them.
     pub fn signups(&self, status: Option<&str>, limit: u32) -> Vec<Signup> {
         let c = self.c();
         let mut s = c.prepare("SELECT * FROM signups WHERE ?1 IS NULL OR status = ?1 ORDER BY created_at DESC, id LIMIT ?2").unwrap();
-        s.query_map(params![status, limit], signup_row).unwrap().filter_map(Result::ok).collect()
+        s.query_map(params![status, limit], signup_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     #[cfg(test)]
     pub fn pending_signups(&self) -> i64 {
-        self.c().query_row("SELECT count(*) FROM signups WHERE status = 'pending'", [], |r| r.get(0)).unwrap_or(0)
+        self.c()
+            .query_row(
+                "SELECT count(*) FROM signups WHERE status = 'pending'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
     }
 
     /// Approves a pending request: its user is made in the same transaction, so a
     /// request is never approved without one, nor a user made for a closed request.
-    pub fn approve_signup(&self, id: &str, role: Role, by: &str) -> Result<(Signup, User), SignupError> {
+    pub fn approve_signup(
+        &self,
+        id: &str,
+        role: Role,
+        by: &str,
+    ) -> Result<(Signup, User), SignupError> {
         let cap = self.seat_cap();
         let user_id = {
             let c = self.c();
-            let tx = c.unchecked_transaction().map_err(|e| SignupError::Db(e.to_string()))?;
-            let s = tx.query_row("SELECT * FROM signups WHERE id = ?", [id], signup_row).optional().map_err(|e| SignupError::Db(e.to_string()))?;
+            let tx = c
+                .unchecked_transaction()
+                .map_err(|e| SignupError::Db(e.to_string()))?;
+            let s = tx
+                .query_row("SELECT * FROM signups WHERE id = ?", [id], signup_row)
+                .optional()
+                .map_err(|e| SignupError::Db(e.to_string()))?;
             let s = s.ok_or(SignupError::NotFound)?;
             if s.status != "pending" {
                 return Err(SignupError::Closed(s.status));
@@ -5530,7 +6801,13 @@ impl Db {
                 return Err(SignupError::NoSeat);
             }
             let user_id = format!("u{}", crate::short_id());
-            Self::insert_user(&tx, &user_id, Some(&s.email), &s.name, role).map_err(|e| if constraint(&e) { SignupError::EmailTaken } else { SignupError::Db(e.to_string()) })?;
+            Self::insert_user(&tx, &user_id, Some(&s.email), &s.name, role).map_err(|e| {
+                if constraint(&e) {
+                    SignupError::EmailTaken
+                } else {
+                    SignupError::Db(e.to_string())
+                }
+            })?;
             tx.execute(
                 "UPDATE signups SET status = 'approved', decided_at = ?, decided_by = ?, user_id = ?, role = ? WHERE id = ? AND status = 'pending'",
                 params![now(), by, user_id, role.as_str(), id],
@@ -5539,10 +6816,18 @@ impl Db {
             tx.commit().map_err(|e| SignupError::Db(e.to_string()))?;
             user_id
         };
-        Ok((self.signup(id).ok_or(SignupError::NotFound)?, self.user(&user_id).ok_or(SignupError::NotFound)?))
+        Ok((
+            self.signup(id).ok_or(SignupError::NotFound)?,
+            self.user(&user_id).ok_or(SignupError::NotFound)?,
+        ))
     }
 
-    pub fn reject_signup(&self, id: &str, by: &str, reason: Option<&str>) -> Result<Signup, SignupError> {
+    pub fn reject_signup(
+        &self,
+        id: &str,
+        by: &str,
+        reason: Option<&str>,
+    ) -> Result<Signup, SignupError> {
         let s = self.signup(id).ok_or(SignupError::NotFound)?;
         let n = self
             .c()
@@ -5561,7 +6846,14 @@ impl Db {
 
     /// A tenant's first token sets its SSO provider for good: a token naming another gets
     /// `Err` with the tenant's provider. Checked and written in one transaction.
-    pub fn create_scim_token(&self, tenant: &str, label: Option<&str>, sso_provider: Option<&str>, token_hash: &str, by: Option<&str>) -> Result<ScimToken, Option<String>> {
+    pub fn create_scim_token(
+        &self,
+        tenant: &str,
+        label: Option<&str>,
+        sso_provider: Option<&str>,
+        token_hash: &str,
+        by: Option<&str>,
+    ) -> Result<ScimToken, Option<String>> {
         let id = format!("st{}", crate::random_hex(4));
         let c = self.c();
         let tx = c.unchecked_transaction().unwrap();
@@ -5577,32 +6869,68 @@ impl Db {
             params![id, tenant, label, sso_provider, token_hash, now(), by],
         )
         .unwrap();
-        let t = tx.query_row("SELECT * FROM scim_tokens WHERE id = ?", [&id], scim_token_row).unwrap();
+        let t = tx
+            .query_row(
+                "SELECT * FROM scim_tokens WHERE id = ?",
+                [&id],
+                scim_token_row,
+            )
+            .unwrap();
         tx.commit().unwrap();
         Ok(t)
     }
 
     pub fn scim_token(&self, id: &str) -> Option<ScimToken> {
-        self.c().query_row("SELECT * FROM scim_tokens WHERE id = ?", [id], scim_token_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT * FROM scim_tokens WHERE id = ?",
+                [id],
+                scim_token_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// Newest first, revoked ones too.
     pub fn scim_tokens(&self) -> Vec<ScimToken> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM scim_tokens ORDER BY created_at DESC, id").unwrap();
-        s.query_map([], scim_token_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT * FROM scim_tokens ORDER BY created_at DESC, id")
+            .unwrap();
+        s.query_map([], scim_token_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// The unrevoked token with this hash. Records use, at most once a minute.
     pub fn live_scim_token(&self, token_hash: &str, at: i64) -> Option<ScimToken> {
-        let t = self.c().query_row("SELECT * FROM scim_tokens WHERE token_hash = ? AND revoked_at IS NULL", [token_hash], scim_token_row).optional().ok().flatten()?;
+        let t = self
+            .c()
+            .query_row(
+                "SELECT * FROM scim_tokens WHERE token_hash = ? AND revoked_at IS NULL",
+                [token_hash],
+                scim_token_row,
+            )
+            .optional()
+            .ok()
+            .flatten()?;
         let _ = self.c().execute("UPDATE scim_tokens SET last_used_at = ?1 WHERE id = ?2 AND coalesce(last_used_at, 0) <= ?1 - 60000", params![at, t.id]);
         Some(t)
     }
 
     /// The token with this hash, revoked or not: a revoked token still in use is worth an alert.
     pub fn scim_token_by_hash(&self, token_hash: &str) -> Option<ScimToken> {
-        self.c().query_row("SELECT * FROM scim_tokens WHERE token_hash = ?", [token_hash], scim_token_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT * FROM scim_tokens WHERE token_hash = ?",
+                [token_hash],
+                scim_token_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// False if it was already revoked or doesn't exist.
@@ -5612,7 +6940,15 @@ impl Db {
 
     /// Which tenant manages a user, if any, deleted or not.
     pub fn scim_user_of(&self, user_id: &str) -> Option<ScimUser> {
-        self.c().query_row(&format!("{SCIM_USER_SELECT} WHERE l.user_id = ?"), [user_id], scim_user_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                &format!("{SCIM_USER_SELECT} WHERE l.user_id = ?"),
+                [user_id],
+                scim_user_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// A user the tenant manages and hasn't deleted.
@@ -5630,33 +6966,75 @@ impl Db {
             ScimKey::ExternalId(v) => ("l.external_id = ?2", v),
             ScimKey::UserName(v) => ("l.user_name = ?2 AND l.deleted_at IS NULL", v),
         };
-        self.c().query_row(&format!("{SCIM_USER_SELECT} WHERE l.tenant = ?1 AND {clause}"), params![tenant, v], scim_user_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                &format!("{SCIM_USER_SELECT} WHERE l.tenant = ?1 AND {clause}"),
+                params![tenant, v],
+                scim_user_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// A page of the tenant's live users, oldest first, and how many match in all.
-    pub fn scim_list(&self, tenant: &str, key: Option<&ScimKey>, offset: i64, limit: i64) -> (i64, Vec<ScimUser>) {
+    pub fn scim_list(
+        &self,
+        tenant: &str,
+        key: Option<&ScimKey>,
+        offset: i64,
+        limit: i64,
+    ) -> (i64, Vec<ScimUser>) {
         let (col, v) = match key {
             None => ("l.user_name", None),
             Some(ScimKey::UserName(v)) => ("l.user_name", Some(v)),
             Some(ScimKey::ExternalId(v)) => ("l.external_id", Some(v)),
         };
         let c = self.c();
-        let filter = format!("WHERE l.tenant = ?1 AND l.deleted_at IS NULL AND (?2 IS NULL OR {col} = ?2)");
-        let total: i64 = c.query_row(&format!("SELECT count(*) FROM scim_users l {filter}"), params![tenant, v], |r| r.get(0)).unwrap_or(0);
-        let mut s = c.prepare(&format!("{SCIM_USER_SELECT} {filter} ORDER BY l.created_at, l.user_id LIMIT ?3 OFFSET ?4")).unwrap();
-        let list = s.query_map(params![tenant, v, limit, offset], scim_user_row).unwrap().filter_map(Result::ok).collect();
+        let filter =
+            format!("WHERE l.tenant = ?1 AND l.deleted_at IS NULL AND (?2 IS NULL OR {col} = ?2)");
+        let total: i64 = c
+            .query_row(
+                &format!("SELECT count(*) FROM scim_users l {filter}"),
+                params![tenant, v],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let mut s = c
+            .prepare(&format!(
+                "{SCIM_USER_SELECT} {filter} ORDER BY l.created_at, l.user_id LIMIT ?3 OFFSET ?4"
+            ))
+            .unwrap();
+        let list = s
+            .query_map(params![tenant, v, limit, offset], scim_user_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
         (total, list)
     }
 
     /// Turning a disabled user back on takes a seat under `cap`, checked here, in the write's transaction.
-    fn write_scim_user(tx: &Connection, tenant: &str, user_id: &str, f: &ScimFields, at: i64, cap: Option<u32>) -> Result<(), ScimConflict> {
+    fn write_scim_user(
+        tx: &Connection,
+        tenant: &str,
+        user_id: &str,
+        f: &ScimFields,
+        at: i64,
+        cap: Option<u32>,
+    ) -> Result<(), ScimConflict> {
         if f.active == Some(true) && Self::enabling(tx, user_id) && !Self::seat_free(tx, cap) {
             return Err(ScimConflict::NoSeat);
         }
         Self::write_scim_rows(tx, tenant, user_id, f, at).map_err(scim_conflict)
     }
 
-    fn write_scim_rows(tx: &Connection, tenant: &str, user_id: &str, f: &ScimFields, at: i64) -> rusqlite::Result<()> {
+    fn write_scim_rows(
+        tx: &Connection,
+        tenant: &str,
+        user_id: &str,
+        f: &ScimFields,
+        at: i64,
+    ) -> rusqlite::Result<()> {
         tx.execute(
             "UPDATE users SET email = ?, display_name = ?, status = coalesce(?, status), updated_at = ? WHERE id = ?",
             params![f.email, f.display_name, f.active.map(|on| if on { "active" } else { "disabled" }), at, user_id],
@@ -5673,7 +7051,13 @@ impl Db {
 
     /// A new user made by a SCIM tenant, with its SSO identity when the tenant links one.
     /// All of it or none.
-    pub fn create_scim_user(&self, tenant: &str, f: &ScimFields, role: Role, identity: Option<&NewIdentity>) -> Result<User, ScimConflict> {
+    pub fn create_scim_user(
+        &self,
+        tenant: &str,
+        f: &ScimFields,
+        role: Role,
+        identity: Option<&NewIdentity>,
+    ) -> Result<User, ScimConflict> {
         let id = format!("u{}", crate::short_id());
         let cap = self.seat_cap();
         {
@@ -5690,18 +7074,31 @@ impl Db {
             }
             tx.commit().map_err(scim_conflict)?;
         }
-        self.user(&id).ok_or_else(|| ScimConflict::Db("user not saved".into()))
+        self.user(&id)
+            .ok_or_else(|| ScimConflict::Db("user not saved".into()))
     }
 
     /// Sets what SCIM manages on an existing user. An update (`restore` false) needs the
     /// tenant's live user; `restore` also takes a user the tenant deleted, or one no tenant
     /// manages. Never another tenant's: checked in the same transaction as the write.
-    pub fn save_scim_user(&self, tenant: &str, user_id: &str, f: &ScimFields, restore: bool) -> Result<(), ScimConflict> {
+    pub fn save_scim_user(
+        &self,
+        tenant: &str,
+        user_id: &str,
+        f: &ScimFields,
+        restore: bool,
+    ) -> Result<(), ScimConflict> {
         let cap = self.seat_cap();
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(scim_conflict)?;
-        let row: Option<(String, Option<i64>)> =
-            tx.query_row("SELECT tenant, deleted_at FROM scim_users WHERE user_id = ?", [user_id], |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(scim_conflict)?;
+        let row: Option<(String, Option<i64>)> = tx
+            .query_row(
+                "SELECT tenant, deleted_at FROM scim_users WHERE user_id = ?",
+                [user_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(scim_conflict)?;
         match row {
             Some((t, _)) if t != tenant => return Err(ScimConflict::OtherTenant),
             Some((_, None)) => {}
@@ -5715,10 +7112,18 @@ impl Db {
     /// A SCIM DELETE: the user is disabled and hidden from the tenant, never removed.
     pub fn delete_scim_user(&self, tenant: &str, user_id: &str) -> bool {
         let c = self.c();
-        let Ok(tx) = c.unchecked_transaction() else { return false };
+        let Ok(tx) = c.unchecked_transaction() else {
+            return false;
+        };
         let at = now();
         let n = tx.execute("UPDATE scim_users SET deleted_at = ?, updated_at = ? WHERE tenant = ? AND user_id = ? AND deleted_at IS NULL", params![at, at, tenant, user_id]).unwrap_or(0);
-        let ok = n == 1 && tx.execute("UPDATE users SET status = 'disabled', updated_at = ? WHERE id = ?", params![at, user_id]).is_ok();
+        let ok = n == 1
+            && tx
+                .execute(
+                    "UPDATE users SET status = 'disabled', updated_at = ? WHERE id = ?",
+                    params![at, user_id],
+                )
+                .is_ok();
         ok && tx.commit().is_ok()
     }
 
@@ -5727,39 +7132,85 @@ impl Db {
     /// A tenant's groups, oldest first.
     pub fn scim_groups(&self, tenant: &str) -> Vec<ScimGroup> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM scim_groups WHERE tenant = ? ORDER BY created_at, team_id").unwrap();
-        s.query_map([tenant], scim_group_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT * FROM scim_groups WHERE tenant = ? ORDER BY created_at, team_id")
+            .unwrap();
+        s.query_map([tenant], scim_group_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// Every tenant's groups, for admins.
     pub fn all_scim_groups(&self) -> Vec<ScimGroup> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM scim_groups ORDER BY tenant, created_at, team_id").unwrap();
-        s.query_map([], scim_group_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT * FROM scim_groups ORDER BY tenant, created_at, team_id")
+            .unwrap();
+        s.query_map([], scim_group_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     pub fn scim_group(&self, tenant: &str, team_id: &str) -> Option<ScimGroup> {
-        self.c().query_row("SELECT * FROM scim_groups WHERE tenant = ? AND team_id = ?", [tenant, team_id], scim_group_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT * FROM scim_groups WHERE tenant = ? AND team_id = ?",
+                [tenant, team_id],
+                scim_group_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// The group a team is, whichever tenant's.
     pub fn scim_group_of_team(&self, team_id: &str) -> Option<ScimGroup> {
-        self.c().query_row("SELECT * FROM scim_groups WHERE team_id = ?", [team_id], scim_group_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT * FROM scim_groups WHERE team_id = ?",
+                [team_id],
+                scim_group_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// By `externalId` (exactly) or `displayName` (any case).
-    pub fn scim_group_find(&self, tenant: &str, external_id: Option<&str>, display_name: Option<&str>) -> Option<ScimGroup> {
+    pub fn scim_group_find(
+        &self,
+        tenant: &str,
+        external_id: Option<&str>,
+        display_name: Option<&str>,
+    ) -> Option<ScimGroup> {
         let (col, v) = match (external_id, display_name) {
             (Some(x), _) => ("external_id", x),
             (None, Some(n)) => ("display_name", n),
             (None, None) => return None,
         };
-        self.c().query_row(&format!("SELECT * FROM scim_groups WHERE tenant = ? AND {col} = ?"), [tenant, v], scim_group_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                &format!("SELECT * FROM scim_groups WHERE tenant = ? AND {col} = ?"),
+                [tenant, v],
+                scim_group_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// A new team for a group a SCIM tenant created, linked to it: both or neither. A
     /// team SCIM makes gives no machines until an admin turns that on.
-    pub fn create_scim_group(&self, tenant: &str, external_id: Option<&str>, display_name: &str, team_name: &str, by: Option<&str>) -> Result<ScimGroup, ScimGroupConflict> {
+    pub fn create_scim_group(
+        &self,
+        tenant: &str,
+        external_id: Option<&str>,
+        display_name: &str,
+        team_name: &str,
+        by: Option<&str>,
+    ) -> Result<ScimGroup, ScimGroupConflict> {
         let id = format!("t{}", crate::random_hex(5));
         let at = now();
         let c = self.c();
@@ -5771,13 +7222,26 @@ impl Db {
             params![id, tenant, external_id, display_name, at, by],
         )
         .map_err(scim_group_conflict)?;
-        let g = tx.query_row("SELECT * FROM scim_groups WHERE team_id = ?", [&id], scim_group_row).map_err(scim_group_conflict)?;
+        let g = tx
+            .query_row(
+                "SELECT * FROM scim_groups WHERE team_id = ?",
+                [&id],
+                scim_group_row,
+            )
+            .map_err(scim_group_conflict)?;
         tx.commit().map_err(scim_group_conflict)?;
         Ok(g)
     }
 
     /// An admin links a team that exists to a tenant's group, for the IdP to take on.
-    pub fn link_scim_group(&self, tenant: &str, team_id: &str, external_id: Option<&str>, display_name: &str, by: Option<&str>) -> Result<ScimGroup, ScimGroupConflict> {
+    pub fn link_scim_group(
+        &self,
+        tenant: &str,
+        team_id: &str,
+        external_id: Option<&str>,
+        display_name: &str,
+        by: Option<&str>,
+    ) -> Result<ScimGroup, ScimGroupConflict> {
         let at = now();
         let c = self.c();
         c.execute(
@@ -5785,12 +7249,25 @@ impl Db {
             params![team_id, tenant, external_id, display_name, at, by],
         )
         .map_err(scim_group_conflict)?;
-        c.query_row("SELECT * FROM scim_groups WHERE team_id = ?", [team_id], scim_group_row).map_err(scim_group_conflict)
+        c.query_row(
+            "SELECT * FROM scim_groups WHERE team_id = ?",
+            [team_id],
+            scim_group_row,
+        )
+        .map_err(scim_group_conflict)
     }
 
     /// Sets a group's `displayName` and `externalId` and renames its team, while the
     /// tenant still has it. `provision` marks an admin's link as taken on by the IdP.
-    pub fn save_scim_group(&self, tenant: &str, team_id: &str, external_id: Option<&str>, display_name: &str, team_name: &str, provision: bool) -> Result<ScimGroup, ScimGroupConflict> {
+    pub fn save_scim_group(
+        &self,
+        tenant: &str,
+        team_id: &str,
+        external_id: Option<&str>,
+        display_name: &str,
+        team_name: &str,
+        provision: bool,
+    ) -> Result<ScimGroup, ScimGroupConflict> {
         let at = now();
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(scim_group_conflict)?;
@@ -5804,8 +7281,18 @@ impl Db {
         if n != 1 {
             return Err(ScimGroupConflict::Gone);
         }
-        tx.execute("UPDATE teams SET name = ?1, updated_at = ?2 WHERE id = ?3 AND name != ?1", params![team_name, at, team_id]).map_err(scim_group_conflict)?;
-        let g = tx.query_row("SELECT * FROM scim_groups WHERE team_id = ?", [team_id], scim_group_row).map_err(scim_group_conflict)?;
+        tx.execute(
+            "UPDATE teams SET name = ?1, updated_at = ?2 WHERE id = ?3 AND name != ?1",
+            params![team_name, at, team_id],
+        )
+        .map_err(scim_group_conflict)?;
+        let g = tx
+            .query_row(
+                "SELECT * FROM scim_groups WHERE team_id = ?",
+                [team_id],
+                scim_group_row,
+            )
+            .map_err(scim_group_conflict)?;
         tx.commit().map_err(scim_group_conflict)?;
         Ok(g)
     }
@@ -5818,7 +7305,15 @@ impl Db {
 
     /// Ends a team's link to its group, and returns what it was. The team stays.
     pub fn unlink_scim_group(&self, team_id: &str) -> Option<ScimGroup> {
-        self.c().query_row("DELETE FROM scim_groups WHERE team_id = ? RETURNING *", [team_id], scim_group_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "DELETE FROM scim_groups WHERE team_id = ? RETURNING *",
+                [team_id],
+                scim_group_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// The team's members `tenant` provisioned and hasn't deleted, oldest member first.
@@ -5831,7 +7326,10 @@ impl Db {
                  WHERE m.team_id = ?1 AND l.tenant = ?2 AND (?3 OR l.deleted_at IS NULL) ORDER BY m.joined_at, m.user_id",
             )
             .unwrap();
-        s.query_map(params![team_id, tenant, deleted], user_row).unwrap().filter_map(Result::ok).collect()
+        s.query_map(params![team_id, tenant, deleted], user_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// Spends a sign-in code: once, before it expires, for an active user. Returns the user.
@@ -5848,7 +7346,10 @@ impl Db {
             .optional()
             .ok()
             .flatten()?;
-        c.query_row("SELECT * FROM users WHERE id = ?", [user_id], user_row).optional().ok().flatten()
+        c.query_row("SELECT * FROM users WHERE id = ?", [user_id], user_row)
+            .optional()
+            .ok()
+            .flatten()
     }
 
     // Second factor (ADR 0094). Secrets are sealed under the user's id; recovery codes
@@ -5856,9 +7357,17 @@ impl Db {
 
     pub fn mfa(&self, user_id: &str) -> Option<MfaRow> {
         self.c()
-            .query_row("SELECT secret, confirmed_at, last_step FROM user_mfa WHERE user_id = ?", [user_id], |r| {
-                Ok(MfaRow { secret: r.get(0)?, confirmed_at: r.get(1)?, last_step: r.get(2)? })
-            })
+            .query_row(
+                "SELECT secret, confirmed_at, last_step FROM user_mfa WHERE user_id = ?",
+                [user_id],
+                |r| {
+                    Ok(MfaRow {
+                        secret: r.get(0)?,
+                        confirmed_at: r.get(1)?,
+                        last_step: r.get(2)?,
+                    })
+                },
+            )
             .optional()
             .ok()
             .flatten()
@@ -5867,8 +7376,13 @@ impl Db {
     /// Users with a confirmed second factor, and since when.
     pub fn mfa_enabled(&self) -> HashMap<String, i64> {
         let c = self.c();
-        let mut s = c.prepare("SELECT user_id, confirmed_at FROM user_mfa WHERE confirmed_at IS NOT NULL").unwrap();
-        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT user_id, confirmed_at FROM user_mfa WHERE confirmed_at IS NOT NULL")
+            .unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// Starts (or restarts) enrolment with a new sealed secret. False when the user
@@ -5890,7 +7404,9 @@ impl Db {
     /// replaced, removed, or already confirmed).
     pub fn mfa_confirm(&self, user_id: &str, sealed: &str, step: i64, recovery: &[String]) -> bool {
         let c = self.c();
-        let Ok(tx) = c.unchecked_transaction() else { return false };
+        let Ok(tx) = c.unchecked_transaction() else {
+            return false;
+        };
         let at = now();
         let n = tx
             .execute(
@@ -5905,7 +7421,9 @@ impl Db {
     /// has a confirmed second factor.
     pub fn mfa_enable(&self, user_id: &str, sealed: &str, step: i64, recovery: &[String]) -> bool {
         let c = self.c();
-        let Ok(tx) = c.unchecked_transaction() else { return false };
+        let Ok(tx) = c.unchecked_transaction() else {
+            return false;
+        };
         let at = now();
         let n = tx
             .execute(
@@ -5917,8 +7435,16 @@ impl Db {
         n == 1 && Self::write_recovery(&tx, user_id, recovery, at).is_ok() && tx.commit().is_ok()
     }
 
-    fn write_recovery(tx: &rusqlite::Transaction, user_id: &str, recovery: &[String], at: i64) -> rusqlite::Result<()> {
-        tx.execute("DELETE FROM mfa_recovery_codes WHERE user_id = ?", [user_id])?;
+    fn write_recovery(
+        tx: &rusqlite::Transaction,
+        user_id: &str,
+        recovery: &[String],
+        at: i64,
+    ) -> rusqlite::Result<()> {
+        tx.execute(
+            "DELETE FROM mfa_recovery_codes WHERE user_id = ?",
+            [user_id],
+        )?;
         for h in recovery {
             tx.execute("INSERT INTO mfa_recovery_codes (user_id, code_hash, used_at, created_at) VALUES (?, ?, NULL, ?)", params![user_id, h, at])?;
         }
@@ -5928,8 +7454,16 @@ impl Db {
     /// Replaces a confirmed user's recovery codes. False when they have no second factor.
     pub fn mfa_replace_recovery(&self, user_id: &str, recovery: &[String]) -> bool {
         let c = self.c();
-        let Ok(tx) = c.unchecked_transaction() else { return false };
-        let on: bool = tx.query_row("SELECT COUNT(*) FROM user_mfa WHERE user_id = ? AND confirmed_at IS NOT NULL", [user_id], |r| r.get(0)).unwrap_or(false);
+        let Ok(tx) = c.unchecked_transaction() else {
+            return false;
+        };
+        let on: bool = tx
+            .query_row(
+                "SELECT COUNT(*) FROM user_mfa WHERE user_id = ? AND confirmed_at IS NOT NULL",
+                [user_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
         on && Self::write_recovery(&tx, user_id, recovery, now()).is_ok() && tx.commit().is_ok()
     }
 
@@ -5957,16 +7491,33 @@ impl Db {
     }
 
     pub fn mfa_recovery_left(&self, user_id: &str) -> i64 {
-        self.c().query_row("SELECT COUNT(*) FROM mfa_recovery_codes WHERE user_id = ? AND used_at IS NULL", [user_id], |r| r.get(0)).unwrap_or(0)
+        self.c()
+            .query_row(
+                "SELECT COUNT(*) FROM mfa_recovery_codes WHERE user_id = ? AND used_at IS NULL",
+                [user_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
     }
 
     /// Removes the user's second factor and recovery codes. True if they had a confirmed one.
     pub fn mfa_delete(&self, user_id: &str) -> bool {
         let c = self.c();
-        let Ok(tx) = c.unchecked_transaction() else { return false };
-        let confirmed = tx.execute("DELETE FROM user_mfa WHERE user_id = ? AND confirmed_at IS NOT NULL", [user_id]).unwrap_or(0) == 1;
+        let Ok(tx) = c.unchecked_transaction() else {
+            return false;
+        };
+        let confirmed = tx
+            .execute(
+                "DELETE FROM user_mfa WHERE user_id = ? AND confirmed_at IS NOT NULL",
+                [user_id],
+            )
+            .unwrap_or(0)
+            == 1;
         let _ = tx.execute("DELETE FROM user_mfa WHERE user_id = ?", [user_id]);
-        let _ = tx.execute("DELETE FROM mfa_recovery_codes WHERE user_id = ?", [user_id]);
+        let _ = tx.execute(
+            "DELETE FROM mfa_recovery_codes WHERE user_id = ?",
+            [user_id],
+        );
         tx.commit().is_ok() && confirmed
     }
 
@@ -5975,25 +7526,62 @@ impl Db {
     /// Registers `token` for this session, in place of any it had. A token another
     /// session held moves here, so that session (and its person) stops getting it.
     #[allow(clippy::too_many_arguments)]
-    pub fn put_push_device(&self, user_id: &str, session_id: &str, provider: &str, token: &str, platform: &str, approvals: bool, routines: bool) -> (PushDevice, PushPut) {
+    pub fn put_push_device(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        provider: &str,
+        token: &str,
+        platform: &str,
+        approvals: bool,
+        routines: bool,
+    ) -> (PushDevice, PushPut) {
         let token_hash = crate::users::hash(token);
         let at = now();
         let mut c = self.c();
         let tx = c.transaction().unwrap();
-        let mine = tx.query_row("SELECT * FROM push_devices WHERE session_id = ?", [session_id], push_device_row).optional().unwrap().flatten();
-        let theirs: Option<String> =
-            tx.query_row("SELECT session_id FROM push_devices WHERE token_hash = ? AND session_id <> ?", params![token_hash, session_id], |r| r.get(0)).optional().unwrap();
+        let mine = tx
+            .query_row(
+                "SELECT * FROM push_devices WHERE session_id = ?",
+                [session_id],
+                push_device_row,
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        let theirs: Option<String> = tx
+            .query_row(
+                "SELECT session_id FROM push_devices WHERE token_hash = ? AND session_id <> ?",
+                params![token_hash, session_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
         let change = match &mine {
             Some(d) if d.token == token && d.provider == provider && d.platform == platform => {
-                if (d.approvals, d.routines) == (approvals, routines) { PushPut::Unchanged } else { PushPut::Updated }
+                if (d.approvals, d.routines) == (approvals, routines) {
+                    PushPut::Unchanged
+                } else {
+                    PushPut::Updated
+                }
             }
             _ if theirs.is_some() => PushPut::Moved,
             _ => PushPut::Added,
         };
-        tx.execute("DELETE FROM push_devices WHERE token_hash = ? AND session_id <> ?", params![token_hash, session_id]).unwrap();
+        tx.execute(
+            "DELETE FROM push_devices WHERE token_hash = ? AND session_id <> ?",
+            params![token_hash, session_id],
+        )
+        .unwrap();
         // Read raw, so a row whose token no longer opens still keeps its id (ON CONFLICT does).
-        let stored: Option<(String, i64)> =
-            tx.query_row("SELECT id, created_at FROM push_devices WHERE session_id = ?", [session_id], |r| Ok((r.get(0)?, r.get(1)?))).optional().unwrap();
+        let stored: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT id, created_at FROM push_devices WHERE session_id = ?",
+                [session_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .unwrap();
         let (id, created) = stored.unwrap_or_else(|| (format!("pd{}", crate::random_hex(8)), at));
         tx.execute(
             "INSERT INTO push_devices (id, user_id, session_id, provider, token_hash, token, platform, approvals, routines, created_at, updated_at)
@@ -6007,31 +7595,65 @@ impl Db {
             params![user_id, MAX_PUSH_DEVICES as i64],
         )
         .unwrap();
-        let d = tx.query_row("SELECT * FROM push_devices WHERE id = ?", [&id], push_device_row).unwrap().expect("just sealed");
+        let d = tx
+            .query_row(
+                "SELECT * FROM push_devices WHERE id = ?",
+                [&id],
+                push_device_row,
+            )
+            .unwrap()
+            .expect("just sealed");
         tx.commit().unwrap();
         (d, change)
     }
 
     pub fn session_push_device(&self, session_id: &str) -> Option<PushDevice> {
-        self.c().query_row("SELECT * FROM push_devices WHERE session_id = ?", [session_id], push_device_row).optional().ok().flatten().flatten()
+        self.c()
+            .query_row(
+                "SELECT * FROM push_devices WHERE session_id = ?",
+                [session_id],
+                push_device_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
     }
 
     /// The device this session registered, removed. None: it had none.
     pub fn delete_session_push_device(&self, session_id: &str) -> Option<PushDevice> {
         let d = self.session_push_device(session_id)?;
-        (self.c().execute("DELETE FROM push_devices WHERE id = ?", [&d.id]).unwrap_or(0) == 1).then_some(d)
+        (self
+            .c()
+            .execute("DELETE FROM push_devices WHERE id = ?", [&d.id])
+            .unwrap_or(0)
+            == 1)
+            .then_some(d)
     }
 
     /// Removes a device the provider says is gone, if it still has the token it said
     /// that about. Returns whether it did.
     pub fn delete_push_device_with(&self, id: &str, token_hash: &str) -> bool {
-        self.c().execute("DELETE FROM push_devices WHERE id = ? AND token_hash = ?", params![id, token_hash]).unwrap_or(0) == 1
+        self.c()
+            .execute(
+                "DELETE FROM push_devices WHERE id = ? AND token_hash = ?",
+                params![id, token_hash],
+            )
+            .unwrap_or(0)
+            == 1
     }
 
     /// `user_id`'s devices that want `kind`, while the session that registered each is
     /// still live and theirs, and they are active. Binds the session lifetimes as
     /// `live_session` does, so an idle or expired session's phone gets nothing.
-    pub fn live_push_devices(&self, user_id: &str, kind: PushKind, at: i64, idle_ms: i64, max_ms: i64) -> Vec<PushDevice> {
+    pub fn live_push_devices(
+        &self,
+        user_id: &str,
+        kind: PushKind,
+        at: i64,
+        idle_ms: i64,
+        max_ms: i64,
+    ) -> Vec<PushDevice> {
         let want = match kind {
             PushKind::Approvals => "d.approvals = 1",
             PushKind::Routines => "d.routines = 1",
@@ -6042,7 +7664,10 @@ impl Db {
         );
         let c = self.c();
         let mut s = c.prepare(&sql).unwrap();
-        s.query_map(params![at, idle_ms, max_ms, user_id], push_device_row).unwrap().filter_map(|r| r.ok().flatten()).collect()
+        s.query_map(params![at, idle_ms, max_ms, user_id], push_device_row)
+            .unwrap()
+            .filter_map(|r| r.ok().flatten())
+            .collect()
     }
 
     /// Deletes sessions and codes that stopped working before `before` (unix ms).
@@ -6054,7 +7679,10 @@ impl Db {
                 params![before, max_ms, idle_ms],
             )
             .unwrap_or(0);
-        let _ = c.execute("DELETE FROM login_codes WHERE coalesce(used_at, expires_at) < ?", [before]);
+        let _ = c.execute(
+            "DELETE FROM login_codes WHERE coalesce(used_at, expires_at) < ?",
+            [before],
+        );
         n
     }
 
@@ -6074,10 +7702,19 @@ impl Db {
     pub fn try_record(&self, e: &audit::Event) -> rusqlite::Result<i64> {
         let o = |v: &Option<String>, max: usize| v.as_deref().map(|s| audit::clip(s, max));
         let a = &e.actor;
-        let bot_actor = matches!(a.kind, audit::ActorKind::Bot).then_some(a.id.as_deref()).flatten();
-        let owners: Vec<String> = [e.bot_id.as_deref(), bot_actor].into_iter().flatten().filter_map(|b| self.bot_owner(b)).collect();
+        let bot_actor = matches!(a.kind, audit::ActorKind::Bot)
+            .then_some(a.id.as_deref())
+            .flatten();
+        let owners: Vec<String> = [e.bot_id.as_deref(), bot_actor]
+            .into_iter()
+            .flatten()
+            .filter_map(|b| self.bot_owner(b))
+            .collect();
         let owners: Vec<&str> = owners.iter().map(String::as_str).collect();
-        let text = |v: &Option<String>, max: usize| v.as_deref().map(|s| audit::clip(&redact::text_for(&owners, &audit::redact_text(s)), max));
+        let text = |v: &Option<String>, max: usize| {
+            v.as_deref()
+                .map(|s| audit::clip(&redact::text_for(&owners, &audit::redact_text(s)), max))
+        };
         let details = redact::value_for(&owners, audit::scrub(e.details.clone())).to_string();
         let c = self.c();
         let res = c.execute(
@@ -6109,12 +7746,21 @@ impl Db {
         );
         let res = res.map(|_| c.last_insert_rowid());
         drop(c);
-        self.metrics().audited(&e.action, e.outcome.as_str(), e.details.get("reason").and_then(|r| r.as_str()));
+        self.metrics().audited(
+            &e.action,
+            e.outcome.as_str(),
+            e.details.get("reason").and_then(|r| r.as_str()),
+        );
         res
     }
 
     /// Newest first (or oldest first with `oldest_first`), filtered, at most `limit`.
-    pub fn audit_events(&self, f: &audit::Filter, limit: i64, oldest_first: bool) -> Vec<AuditEvent> {
+    pub fn audit_events(
+        &self,
+        f: &audit::Filter,
+        limit: i64,
+        oldest_first: bool,
+    ) -> Vec<AuditEvent> {
         use rusqlite::types::Value as V;
         let mut sql = String::from("SELECT * FROM audit_events WHERE 1 = 1");
         let mut args: Vec<V> = Vec::new();
@@ -6169,7 +7815,10 @@ impl Db {
         }
         if !f.methods.is_empty() {
             let marks = vec!["?"; f.methods.len()].join(", ");
-            and(&format!("auth_method IN ({marks})"), f.methods.iter().map(|m| V::Text(m.clone())).collect());
+            and(
+                &format!("auth_method IN ({marks})"),
+                f.methods.iter().map(|m| V::Text(m.clone())).collect(),
+            );
         }
         if let Some(id) = f.before {
             and("id < ?", vec![V::Integer(id)]);
@@ -6177,16 +7826,32 @@ impl Db {
         if let Some(id) = f.after {
             and("id > ?", vec![V::Integer(id)]);
         }
-        sql.push_str(if oldest_first { " ORDER BY id ASC LIMIT ?" } else { " ORDER BY id DESC LIMIT ?" });
+        sql.push_str(if oldest_first {
+            " ORDER BY id ASC LIMIT ?"
+        } else {
+            " ORDER BY id DESC LIMIT ?"
+        });
         args.push(V::Integer(limit));
         let c = self.c();
         let mut s = c.prepare(&sql).unwrap();
-        s.query_map(rusqlite::params_from_iter(args), audit_row).unwrap().filter_map(Result::ok).collect()
+        s.query_map(rusqlite::params_from_iter(args), audit_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// Whether per-user accounts were on, with their copies in order, when last saved (ADR 0037).
     pub fn isolation_was_on(&self) -> bool {
-        let v: Option<String> = self.c().query_row("SELECT value FROM settings WHERE key = 'isolation'", [], |r| r.get(0)).optional().ok().flatten();
+        let v: Option<String> = self
+            .c()
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'isolation'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
         v.as_deref() == Some("users")
     }
 
@@ -6197,7 +7862,16 @@ impl Db {
 
     /// Days of audit history to keep. None = forever.
     pub fn audit_retention(&self) -> Option<u32> {
-        let v: Option<String> = self.c().query_row("SELECT value FROM settings WHERE key = 'audit_retention_days'", [], |r| r.get(0)).optional().ok().flatten();
+        let v: Option<String> = self
+            .c()
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'audit_retention_days'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
         v.and_then(|s| s.parse().ok()).filter(|d| *d > 0)
     }
 
@@ -6217,7 +7891,10 @@ impl Db {
     /// still inside the saved retention window.
     /// Deletes events older than the saved retention window.
     pub fn prune_audit(&self) -> rusqlite::Result<usize> {
-        self.c().execute(&format!("DELETE FROM audit_events WHERE at < {AUDIT_CUTOFF}"), [])
+        self.c().execute(
+            &format!("DELETE FROM audit_events WHERE at < {AUDIT_CUTOFF}"),
+            [],
+        )
     }
 
     // Machines (ADR 0025)
@@ -6232,26 +7909,46 @@ impl Db {
             params![id, n.user_id, n.provider, format!("{}-{id}", n.label_prefix), n.label_prefix, n.tier, n.plan, n.region, at, n.created_by],
         );
         match res {
-            Ok(_) => self.machine(&id).ok_or_else(|| AddMachine::Db("the new machine wasn't saved".into())),
-            Err(e) if constraint(&e) => self.user_machine(n.user_id).map_or_else(|| Err(AddMachine::Db(e.to_string())), |m| Err(AddMachine::Exists(Box::new(m)))),
+            Ok(_) => self
+                .machine(&id)
+                .ok_or_else(|| AddMachine::Db("the new machine wasn't saved".into())),
+            Err(e) if constraint(&e) => self.user_machine(n.user_id).map_or_else(
+                || Err(AddMachine::Db(e.to_string())),
+                |m| Err(AddMachine::Exists(Box::new(m))),
+            ),
             Err(e) => Err(AddMachine::Db(e.to_string())),
         }
     }
 
     pub fn machine(&self, id: &str) -> Option<Machine> {
-        self.c().query_row("SELECT * FROM machines WHERE id = ?", [id], machine_row).optional().ok().flatten()
+        self.c()
+            .query_row("SELECT * FROM machines WHERE id = ?", [id], machine_row)
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// The user's machine that isn't destroyed, if any.
     pub fn user_machine(&self, user_id: &str) -> Option<Machine> {
-        self.c().query_row("SELECT * FROM machines WHERE user_id = ? AND state <> 'destroyed'", [user_id], machine_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT * FROM machines WHERE user_id = ? AND state <> 'destroyed'",
+                [user_id],
+                machine_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// Newest first. `state` None: every one, destroyed too.
     pub fn machines(&self, state: Option<MachineState>) -> Vec<Machine> {
         let c = self.c();
         let mut s = c.prepare("SELECT * FROM machines WHERE ?1 IS NULL OR state = ?1 ORDER BY created_at DESC, id").unwrap();
-        s.query_map([state.map(MachineState::as_str)], machine_row).unwrap().filter_map(Result::ok).collect()
+        s.query_map([state.map(MachineState::as_str)], machine_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// Writes `m` back if the stored machine is still in state `from`, so two changes
@@ -6313,7 +8010,12 @@ impl Db {
 
     /// Puts back the enrollment deadline and overdue mark a token replaced, when the
     /// machine it was for never got it (a restore that failed before the swap).
-    pub fn restore_enroll_by(&self, machine_id: &str, enroll_by: Option<i64>, overdue_at: Option<i64>) {
+    pub fn restore_enroll_by(
+        &self,
+        machine_id: &str,
+        enroll_by: Option<i64>,
+        overdue_at: Option<i64>,
+    ) {
         let _ = self.c().execute(
             "UPDATE machines SET enroll_by = ?, enroll_overdue_at = ? WHERE id = ?",
             params![enroll_by, overdue_at, machine_id],
@@ -6336,7 +8038,10 @@ impl Db {
 
     /// Records that the machine is behind firewall `firewall_id` at the provider.
     pub fn set_machine_firewall(&self, machine_id: &str, firewall_id: &str) {
-        let _ = self.c().execute("UPDATE machines SET firewall_id = ? WHERE id = ?", params![firewall_id, machine_id]);
+        let _ = self.c().execute(
+            "UPDATE machines SET firewall_id = ? WHERE id = ?",
+            params![firewall_id, machine_id],
+        );
     }
 
     /// How many machines other than `except` that aren't destroyed use the firewall.
@@ -6563,7 +8268,12 @@ impl Db {
     /// Forgets the harness sessions of the user's Bots: a session lives on the host
     /// that ran it, so after a move the next run starts a new one. Returns how many.
     pub fn forget_sessions_of(&self, owner_id: &str) -> usize {
-        self.c().execute("UPDATE bots SET session_id = NULL WHERE owner_id = ? AND session_id IS NOT NULL", [owner_id]).unwrap_or(0)
+        self.c()
+            .execute(
+                "UPDATE bots SET session_id = NULL WHERE owner_id = ? AND session_id IS NOT NULL",
+                [owner_id],
+            )
+            .unwrap_or(0)
     }
 
     /// When the owner's machine was assigned (None: it isn't). A run reads this as it
@@ -6610,7 +8320,10 @@ impl Db {
 
     /// Queues a teammate's removal from a machine, unless one is pending: returns that
     /// one then, and whether this call made it.
-    pub fn teammate_cleanup_queue(&self, n: &NewTeammateCleanup) -> Option<(TeammateCleanup, bool)> {
+    pub fn teammate_cleanup_queue(
+        &self,
+        n: &NewTeammateCleanup,
+    ) -> Option<(TeammateCleanup, bool)> {
         let c = self.c();
         let made = c
             .execute(
@@ -6632,11 +8345,23 @@ impl Db {
     }
 
     pub fn teammate_cleanup(&self, id: &str) -> Option<TeammateCleanup> {
-        self.c().query_row("SELECT * FROM teammate_cleanups WHERE id = ?", [id], teammate_cleanup_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT * FROM teammate_cleanups WHERE id = ?",
+                [id],
+                teammate_cleanup_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// Newest first, in `state` (any if None), on `machine_id` (any if None).
-    pub fn teammate_cleanups(&self, state: Option<&str>, machine_id: Option<&str>) -> Vec<TeammateCleanup> {
+    pub fn teammate_cleanups(
+        &self,
+        state: Option<&str>,
+        machine_id: Option<&str>,
+    ) -> Vec<TeammateCleanup> {
         let c = self.c();
         let mut s = c
             .prepare(
@@ -6644,12 +8369,21 @@ impl Db {
                  ORDER BY created_at DESC, id",
             )
             .unwrap();
-        s.query_map(params![state, machine_id], teammate_cleanup_row).unwrap().filter_map(Result::ok).collect()
+        s.query_map(params![state, machine_id], teammate_cleanup_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// An attempt at a pending (or held, for a purge) removal failed, or is waiting on
     /// the machine (`attempt` false). Returns whether it was still in `state`.
-    pub fn teammate_cleanup_failed(&self, id: &str, state: &str, error: &str, attempt: bool) -> bool {
+    pub fn teammate_cleanup_failed(
+        &self,
+        id: &str,
+        state: &str,
+        error: &str,
+        attempt: bool,
+    ) -> bool {
         self.c()
             .execute(
                 "UPDATE teammate_cleanups SET last_error = ?, attempts = attempts + ?, tried_at = CASE WHEN ? THEN ? ELSE tried_at END
@@ -6662,7 +8396,12 @@ impl Db {
 
     /// The agent removed the teammate: `held` while their work waits for `purge_at`,
     /// else done. Returns whether it was still pending, so it's recorded once.
-    pub fn teammate_cleanup_removed(&self, id: &str, archived_to: Option<&str>, purge_at: Option<i64>) -> bool {
+    pub fn teammate_cleanup_removed(
+        &self,
+        id: &str,
+        archived_to: Option<&str>,
+        purge_at: Option<i64>,
+    ) -> bool {
         let at = now();
         self.c()
             .execute(
@@ -6677,7 +8416,12 @@ impl Db {
 
     #[cfg(test)]
     pub fn teammate_cleanup_due_now(&self, id: &str) {
-        self.c().execute("UPDATE teammate_cleanups SET purge_at = ? WHERE id = ?", params![now() - 1, id]).unwrap();
+        self.c()
+            .execute(
+                "UPDATE teammate_cleanups SET purge_at = ? WHERE id = ?",
+                params![now() - 1, id],
+            )
+            .unwrap();
     }
 
     /// Ends a removal in `from` as `to` (`done` or `cancelled`), with `note` as its
@@ -6721,18 +8465,29 @@ impl Db {
     /// Kept with botd's data, so a recreated container, whose password database starts
     /// afresh while the folders stay, still knows whose folders they are.
     pub fn teammate_space_made(&self, owner_id: &str, user_id: &str) {
-        let _ = self.c().execute("INSERT OR IGNORE INTO teammate_spaces (owner_id, user_id, made_at) VALUES (?, ?, ?)", params![owner_id, user_id, now()]);
+        let _ = self.c().execute(
+            "INSERT OR IGNORE INTO teammate_spaces (owner_id, user_id, made_at) VALUES (?, ?, ?)",
+            params![owner_id, user_id, now()],
+        );
     }
 
     /// Every `(owner, teammate)` whose account and folders may be on this server.
     pub fn teammate_spaces(&self) -> Vec<(String, String)> {
         let c = self.c();
-        let mut s = c.prepare("SELECT owner_id, user_id FROM teammate_spaces ORDER BY owner_id, user_id").unwrap();
-        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT owner_id, user_id FROM teammate_spaces ORDER BY owner_id, user_id")
+            .unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     pub fn teammate_space_gone(&self, owner_id: &str, user_id: &str) {
-        let _ = self.c().execute("DELETE FROM teammate_spaces WHERE owner_id = ? AND user_id = ?", [owner_id, user_id]);
+        let _ = self.c().execute(
+            "DELETE FROM teammate_spaces WHERE owner_id = ? AND user_id = ?",
+            [owner_id, user_id],
+        );
     }
 
     /// Queues the removal of a teammate's account for an owner's Bots, unless one is
@@ -6759,12 +8514,24 @@ impl Db {
     }
 
     pub fn account_removal(&self, id: &str) -> Option<AccountRemoval> {
-        self.c().query_row("SELECT * FROM account_removals WHERE id = ?", [id], account_removal_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT * FROM account_removals WHERE id = ?",
+                [id],
+                account_removal_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// Newest first, in `state` (any if None), where `user_id` (anyone if None) is the
     /// owner or the teammate.
-    pub fn account_removals(&self, state: Option<&str>, user_id: Option<&str>) -> Vec<AccountRemoval> {
+    pub fn account_removals(
+        &self,
+        state: Option<&str>,
+        user_id: Option<&str>,
+    ) -> Vec<AccountRemoval> {
         let c = self.c();
         let mut s = c
             .prepare(
@@ -6772,7 +8539,10 @@ impl Db {
                  ORDER BY created_at DESC, id",
             )
             .unwrap();
-        s.query_map(params![state, user_id], account_removal_row).unwrap().filter_map(Result::ok).collect()
+        s.query_map(params![state, user_id], account_removal_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// The helper is about to run for a pending (or held, for a purge) removal: counted
@@ -6796,7 +8566,12 @@ impl Db {
 
     /// The helper removed the account: `held` while their work waits for `purge_at`,
     /// else done. Returns whether it was still pending, so it's recorded once.
-    pub fn account_removal_removed(&self, id: &str, archived_to: Option<&str>, purge_at: Option<i64>) -> bool {
+    pub fn account_removal_removed(
+        &self,
+        id: &str,
+        archived_to: Option<&str>,
+        purge_at: Option<i64>,
+    ) -> bool {
         let at = now();
         self.c()
             .execute(
@@ -6811,7 +8586,12 @@ impl Db {
 
     #[cfg(test)]
     pub fn account_removal_due_now(&self, id: &str) {
-        self.c().execute("UPDATE account_removals SET purge_at = ? WHERE id = ?", params![now() - 1, id]).unwrap();
+        self.c()
+            .execute(
+                "UPDATE account_removals SET purge_at = ? WHERE id = ?",
+                params![now() - 1, id],
+            )
+            .unwrap();
     }
 
     /// Ends a removal in `from` as `to` (`done` or `cancelled`), with `note` as its last
@@ -6854,7 +8634,14 @@ impl Db {
 
     /// Records an upgrade as on its way, unless the machine is held or another is (one
     /// sent before `stale_before` no longer counts). Returns whether this one is.
-    pub fn machine_upgrade_claim(&self, machine_id: &str, id: &str, build: &str, by: &str, stale_before: i64) -> bool {
+    pub fn machine_upgrade_claim(
+        &self,
+        machine_id: &str,
+        id: &str,
+        build: &str,
+        by: &str,
+        stale_before: i64,
+    ) -> bool {
         self.c()
             .execute(
                 "UPDATE machines SET upgrade_id = ?, upgrade_build = ?, upgrade_sent_at = ?, upgrade_by = ?
@@ -6880,13 +8667,21 @@ impl Db {
 
     /// Lets a build that failed be tried again.
     pub fn machine_upgrade_forget_failure(&self, machine_id: &str) {
-        let _ = self.c().execute("UPDATE machines SET upgrade_failed_build = NULL WHERE id = ?", [machine_id]);
+        let _ = self.c().execute(
+            "UPDATE machines SET upgrade_failed_build = NULL WHERE id = ?",
+            [machine_id],
+        );
     }
 
     /// Holds the agent at its build, unless it is held already or an upgrade is on its
     /// way (one sent before `stale_before` no longer counts): a hold that is taken means
     /// no upgrade starts until it is released. Returns whether it was taken.
-    pub fn machine_upgrade_hold(&self, machine_id: &str, by: Option<&str>, stale_before: i64) -> bool {
+    pub fn machine_upgrade_hold(
+        &self,
+        machine_id: &str,
+        by: Option<&str>,
+        stale_before: i64,
+    ) -> bool {
         self.c()
             .execute(
                 "UPDATE machines SET upgrade_hold_at = ?, upgrade_hold_by = ?
@@ -6913,7 +8708,14 @@ impl Db {
 
     /// Queues rebuild `id`, unless the machine isn't running, its agent is held, or a
     /// rebuild is underway. Returns whether this one is queued.
-    pub fn machine_rebuild_queue(&self, machine_id: &str, id: &str, by: &str, discard: bool, from: Option<&str>) -> bool {
+    pub fn machine_rebuild_queue(
+        &self,
+        machine_id: &str,
+        id: &str,
+        by: &str,
+        discard: bool,
+        from: Option<&str>,
+    ) -> bool {
         let at = now();
         self.c()
             .execute(
@@ -6940,7 +8742,11 @@ impl Db {
         next_at: Option<i64>,
         error: Option<&str>,
     ) -> bool {
-        let states = from.iter().map(|s| format!("'{}'", s.replace('\'', ""))).collect::<Vec<_>>().join(", ");
+        let states = from
+            .iter()
+            .map(|s| format!("'{}'", s.replace('\'', "")))
+            .collect::<Vec<_>>()
+            .join(", ");
         self.c()
             .execute(
                 &format!(
@@ -6960,7 +8766,10 @@ impl Db {
         if !self.machine_rebuild_move(machine_id, id, from, "rebuilding", true, None, None) {
             return false;
         }
-        let _ = self.c().execute("UPDATE machines SET rebuild_sent_at = ?, rebuild_at = ? WHERE id = ?", params![at, at, machine_id]);
+        let _ = self.c().execute(
+            "UPDATE machines SET rebuild_sent_at = ?, rebuild_at = ? WHERE id = ?",
+            params![at, at, machine_id],
+        );
         true
     }
 
@@ -6979,7 +8788,15 @@ impl Db {
 
     /// Asks for `machine_id` to become `(tier, plan)`, replacing any resize not yet done.
     /// Returns whether it was saved: not when the same one is open already.
-    pub fn machine_resize_queue(&self, machine_id: &str, tier: &str, plan: &str, from: (&str, &str), cause: &str, event: Option<&str>) -> bool {
+    pub fn machine_resize_queue(
+        &self,
+        machine_id: &str,
+        tier: &str,
+        plan: &str,
+        from: (&str, &str),
+        cause: &str,
+        event: Option<&str>,
+    ) -> bool {
         let at = now();
         self.c()
             .execute(
@@ -7008,7 +8825,11 @@ impl Db {
         attempt: bool,
         next_at: Option<i64>,
     ) -> bool {
-        let states = from.iter().map(|s| format!("'{}'", s.replace('\'', ""))).collect::<Vec<_>>().join(", ");
+        let states = from
+            .iter()
+            .map(|s| format!("'{}'", s.replace('\'', "")))
+            .collect::<Vec<_>>()
+            .join(", ");
         self.c()
             .execute(
                 &format!(
@@ -7046,7 +8867,10 @@ impl Db {
         let mut s = c
             .prepare("SELECT * FROM machines WHERE resize_state IN ('pending', 'waiting') OR resize_sent_plan IS NOT NULL ORDER BY resize_requested_at, id")
             .unwrap();
-        s.query_map([], machine_row).unwrap().filter_map(Result::ok).collect()
+        s.query_map([], machine_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// What the machine's agent said of its disk, in bytes.
@@ -7076,7 +8900,10 @@ impl Db {
     #[cfg(test)]
     pub fn machine_disk_seen_at(&self, machine_id: &str, used: u64, total: u64, at: i64) {
         self.machine_disk_seen(machine_id, used, total);
-        let _ = self.c().execute("UPDATE machines SET disk_seen_at = ? WHERE id = ?", params![at, machine_id]);
+        let _ = self.c().execute(
+            "UPDATE machines SET disk_seen_at = ? WHERE id = ?",
+            params![at, machine_id],
+        );
     }
 
     /// Forgets a machine's resize, as if none was ever asked for.
@@ -7102,25 +8929,45 @@ impl Db {
             )
             .unwrap_or(0)
             == 1;
-        if made { self.machine_backup(n.id) } else { None }
+        if made {
+            self.machine_backup(n.id)
+        } else {
+            None
+        }
     }
 
     pub fn machine_backup(&self, id: &str) -> Option<MachineBackup> {
-        self.c().query_row("SELECT * FROM machine_backups WHERE id = ?", [id], machine_backup_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT * FROM machine_backups WHERE id = ?",
+                [id],
+                machine_backup_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// The machine's backups, newest first, deleted ones too.
     pub fn machine_backups(&self, machine_id: &str) -> Vec<MachineBackup> {
         let c = self.c();
         let mut s = c.prepare("SELECT * FROM machine_backups WHERE machine_id = ? ORDER BY created_at DESC, id DESC").unwrap();
-        s.query_map([machine_id], machine_backup_row).unwrap().filter_map(Result::ok).collect()
+        s.query_map([machine_id], machine_backup_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// Every backup in `state`, oldest first.
     pub fn machine_backups_in(&self, state: &str) -> Vec<MachineBackup> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM machine_backups WHERE state = ? ORDER BY created_at, id").unwrap();
-        s.query_map([state], machine_backup_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT * FROM machine_backups WHERE state = ? ORDER BY created_at, id")
+            .unwrap();
+        s.query_map([state], machine_backup_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// The machine's newest backup that finished.
@@ -7137,7 +8984,12 @@ impl Db {
     }
 
     /// Ends a running backup as `done` (with its size, hash and expiry) or `failed`.
-    pub fn machine_backup_end(&self, id: &str, done: Option<(i64, &str, i64)>, error: Option<&str>) -> bool {
+    pub fn machine_backup_end(
+        &self,
+        id: &str,
+        done: Option<(i64, &str, i64)>,
+        error: Option<&str>,
+    ) -> bool {
         let (state, size, sha, expires) = match done {
             Some((size, sha, expires)) => ("done", Some(size), Some(sha), Some(expires)),
             None => ("failed", None, None, None),
@@ -7166,9 +9018,9 @@ impl Db {
         let made = self
             .c()
             .execute(
-                "INSERT OR IGNORE INTO server_backups (id, archive, state, object_key, encrypted, encrypted_by, created_at, started_at)
-                 VALUES (?, ?, 'running', ?, ?, ?, ?, ?)",
-                params![n.id, n.archive, n.object_key, n.encrypted_by.is_some(), n.encrypted_by, n.created_at, now()],
+                "INSERT OR IGNORE INTO server_backups (id, archive, state, destination, object_key, encrypted, encrypted_by, created_at, started_at)
+                 VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?)",
+                params![n.id, n.archive, n.destination, n.object_key, n.encrypted_by.is_some(), n.encrypted_by, n.created_at, now()],
             )
             .unwrap_or(0)
             == 1;
@@ -7176,41 +9028,69 @@ impl Db {
     }
 
     pub fn server_backup(&self, id: &str) -> Option<ServerBackup> {
-        self.c().query_row("SELECT * FROM server_backups WHERE id = ?", [id], server_backup_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT * FROM server_backups WHERE id = ?",
+                [id],
+                server_backup_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// The newest `limit` copies, by when their archive was made, deleted and failed ones too.
     pub fn server_backups(&self, limit: i64) -> Vec<ServerBackup> {
         let c = self.c();
         let mut s = c.prepare("SELECT * FROM server_backups ORDER BY created_at DESC, started_at DESC, id DESC LIMIT ?").unwrap();
-        s.query_map([limit], server_backup_row).unwrap().filter_map(Result::ok).collect()
+        s.query_map([limit], server_backup_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
-    /// Every copy of `archive`, newest attempt first.
-    pub fn server_backups_of(&self, archive: &str) -> Vec<ServerBackup> {
+    /// Every copy of `archive` to `destination`, newest attempt first.
+    pub fn server_backups_of(&self, destination: &str, archive: &str) -> Vec<ServerBackup> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM server_backups WHERE archive = ? ORDER BY started_at DESC, id DESC").unwrap();
-        s.query_map([archive], server_backup_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c.prepare("SELECT * FROM server_backups WHERE destination = ? AND archive = ? ORDER BY started_at DESC, id DESC").unwrap();
+        s.query_map([destination, archive], server_backup_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// Every copy in `state`, oldest archive first.
     pub fn server_backups_in(&self, state: &str) -> Vec<ServerBackup> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM server_backups WHERE state = ? ORDER BY created_at, id").unwrap();
-        s.query_map([state], server_backup_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT * FROM server_backups WHERE state = ? ORDER BY created_at, id")
+            .unwrap();
+        s.query_map([state], server_backup_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
-    /// The newest archive whose copy finished.
-    pub fn server_last_backup(&self) -> Option<ServerBackup> {
+    /// The newest archive whose copy to `destination` finished.
+    pub fn server_last_backup(&self, destination: &str) -> Option<ServerBackup> {
         self.c()
-            .query_row("SELECT * FROM server_backups WHERE state = 'done' ORDER BY created_at DESC, id DESC LIMIT 1", [], server_backup_row)
+            .query_row(
+                "SELECT * FROM server_backups WHERE destination = ? AND state = 'done' ORDER BY created_at DESC, id DESC LIMIT 1",
+                [destination],
+                server_backup_row,
+            )
             .optional()
             .ok()
             .flatten()
     }
 
     /// Ends a running copy as `done` (with its size, hash and expiry, if it has one) or `failed`.
-    pub fn server_backup_end(&self, id: &str, done: Option<(i64, &str, Option<i64>)>, error: Option<&str>) -> bool {
+    pub fn server_backup_end(
+        &self,
+        id: &str,
+        done: Option<(i64, &str, Option<i64>)>,
+        error: Option<&str>,
+    ) -> bool {
         let (state, size, sha, expires) = match done {
             Some((size, sha, expires)) => ("done", Some(size), Some(sha), expires),
             None => ("failed", None, None, None),
@@ -7245,7 +9125,9 @@ impl Db {
 
     /// Clears a generic setting.
     pub fn clear_setting(&self, key: &str) {
-        let _ = self.c().execute("DELETE FROM settings WHERE key = ?", [key]);
+        let _ = self
+            .c()
+            .execute("DELETE FROM settings WHERE key = ?", [key]);
     }
 
     /// Starts a restore of the machine, unless one is underway.
@@ -7259,7 +9141,11 @@ impl Db {
             )
             .unwrap_or(0)
             == 1;
-        if made { self.machine_restore(n.id) } else { None }
+        if made {
+            self.machine_restore(n.id)
+        } else {
+            None
+        }
     }
 
     // The status page (ADR 0090)
@@ -7274,11 +9160,21 @@ impl Db {
     /// Live machines by state: destroyed ones aren't counted.
     pub fn machine_state_counts(&self) -> HashMap<String, i64> {
         let c = self.c();
-        let mut s = c.prepare("SELECT state, COUNT(*) FROM machines WHERE state != 'destroyed' GROUP BY state").unwrap();
-        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare(
+                "SELECT state, COUNT(*) FROM machines WHERE state != 'destroyed' GROUP BY state",
+            )
+            .unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
-    pub fn status_incident_create(&self, n: &NewStatusIncident) -> rusqlite::Result<StatusIncident> {
+    pub fn status_incident_create(
+        &self,
+        n: &NewStatusIncident,
+    ) -> rusqlite::Result<StatusIncident> {
         let at = now();
         let resolved = (n.state == "resolved").then_some(at);
         let comps = serde_json::to_string(n.components).unwrap_or_else(|_| "[]".into());
@@ -7295,11 +9191,20 @@ impl Db {
             )?;
             tx.commit()?;
         }
-        self.status_incident(n.id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+        self.status_incident(n.id)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)
     }
 
     pub fn status_incident(&self, id: &str) -> rusqlite::Result<Option<StatusIncident>> {
-        let Some(mut i) = self.c().query_row("SELECT * FROM status_incidents WHERE id = ?", [id], status_incident_row).optional()? else {
+        let Some(mut i) = self
+            .c()
+            .query_row(
+                "SELECT * FROM status_incidents WHERE id = ?",
+                [id],
+                status_incident_row,
+            )
+            .optional()?
+        else {
             return Ok(None);
         };
         i.updates = self.status_updates(&i.id, i64::MAX)?;
@@ -7308,16 +9213,29 @@ impl Db {
 
     fn status_updates(&self, id: &str, limit: i64) -> rusqlite::Result<Vec<StatusUpdate>> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM status_incident_updates WHERE incident_id = ? ORDER BY id DESC LIMIT ?")?;
+        let mut s = c.prepare(
+            "SELECT * FROM status_incident_updates WHERE incident_id = ? ORDER BY id DESC LIMIT ?",
+        )?;
         let rows = s.query_map(params![id, limit], |r| {
-            Ok(StatusUpdate { id: r.get("id")?, state: r.get("state")?, body: r.get("body")?, created_by: r.get("created_by")?, created_at: r.get("created_at")? })
+            Ok(StatusUpdate {
+                id: r.get("id")?,
+                state: r.get("state")?,
+                body: r.get("body")?,
+                created_by: r.get("created_by")?,
+                created_at: r.get("created_at")?,
+            })
         })?;
         rows.collect()
     }
 
     /// Open incidents, and those resolved at or after `resolved_since`, newest first, with
     /// up to `updates` of each one's newest updates.
-    pub fn status_incidents(&self, resolved_since: i64, limit: i64, updates: i64) -> rusqlite::Result<Vec<StatusIncident>> {
+    pub fn status_incidents(
+        &self,
+        resolved_since: i64,
+        limit: i64,
+        updates: i64,
+    ) -> rusqlite::Result<Vec<StatusIncident>> {
         let list: Vec<StatusIncident> = {
             let c = self.c();
             let mut s = c.prepare("SELECT * FROM status_incidents WHERE resolved_at IS NULL OR resolved_at >= ? ORDER BY resolved_at IS NOT NULL, created_at DESC LIMIT ?")?;
@@ -7335,12 +9253,24 @@ impl Db {
     /// Every open incident's impact and components, however many there are.
     pub fn status_incidents_open(&self) -> rusqlite::Result<Vec<(String, Vec<String>)>> {
         let c = self.c();
-        let mut s = c.prepare("SELECT impact, components FROM status_incidents WHERE resolved_at IS NULL")?;
-        let rows = s.query_map([], |r| Ok((r.get::<_, String>(0)?, serde_json::from_str(&r.get::<_, String>(1)?).unwrap_or_default())))?;
+        let mut s =
+            c.prepare("SELECT impact, components FROM status_incidents WHERE resolved_at IS NULL")?;
+        let rows = s.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                serde_json::from_str(&r.get::<_, String>(1)?).unwrap_or_default(),
+            ))
+        })?;
         rows.collect()
     }
 
-    pub fn status_incident_edit(&self, id: &str, title: Option<&str>, impact: Option<&str>, components: Option<&[String]>) -> rusqlite::Result<bool> {
+    pub fn status_incident_edit(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        impact: Option<&str>,
+        components: Option<&[String]>,
+    ) -> rusqlite::Result<bool> {
         let comps = components.map(|c| serde_json::to_string(c).unwrap_or_else(|_| "[]".into()));
         Ok(self.c().execute(
             "UPDATE status_incidents SET title = COALESCE(?1, title), impact = COALESCE(?2, impact), components = COALESCE(?3, components), updated_at = ?4 WHERE id = ?5",
@@ -7350,7 +9280,13 @@ impl Db {
 
     /// Adds an update; its state becomes the incident's. Resolving stamps `resolved_at`,
     /// and any other state reopens it.
-    pub fn status_incident_add_update(&self, id: &str, state: &str, body: &str, by: Option<&str>) -> rusqlite::Result<bool> {
+    pub fn status_incident_add_update(
+        &self,
+        id: &str,
+        state: &str,
+        body: &str,
+        by: Option<&str>,
+    ) -> rusqlite::Result<bool> {
         let at = now();
         let c = self.c();
         let tx = c.unchecked_transaction()?;
@@ -7371,19 +9307,35 @@ impl Db {
     }
 
     pub fn status_incident_delete(&self, id: &str) -> rusqlite::Result<bool> {
-        Ok(self.c().execute("DELETE FROM status_incidents WHERE id = ?", [id])? == 1)
+        Ok(self
+            .c()
+            .execute("DELETE FROM status_incidents WHERE id = ?", [id])?
+            == 1)
     }
 
     // Hosts (ADR 0076)
 
     pub fn machine_hosts(&self) -> Vec<MachineHost> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM machine_hosts ORDER BY created_at, name").unwrap();
-        s.query_map([], machine_host_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT * FROM machine_hosts ORDER BY created_at, name")
+            .unwrap();
+        s.query_map([], machine_host_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     pub fn machine_host(&self, name: &str) -> Option<MachineHost> {
-        self.c().query_row("SELECT * FROM machine_hosts WHERE name = ?", [name], machine_host_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT * FROM machine_hosts WHERE name = ?",
+                [name],
+                machine_host_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// Records a host the first time it is configured; its address may change later,
@@ -7396,14 +9348,23 @@ impl Db {
             params![name, url, fingerprint, now()],
         )
         .unwrap();
-        c.query_row("SELECT * FROM machine_hosts WHERE name = ?", [name], machine_host_row).unwrap()
+        c.query_row(
+            "SELECT * FROM machine_hosts WHERE name = ?",
+            [name],
+            machine_host_row,
+        )
+        .unwrap()
     }
 
     /// It answered: up again, if it was down. Returns whether it was down.
     pub fn machine_host_answered(&self, name: &str) -> bool {
         let c = self.c();
         let was_down = c
-            .query_row("SELECT state = 'down' FROM machine_hosts WHERE name = ?", [name], |r| r.get::<_, bool>(0))
+            .query_row(
+                "SELECT state = 'down' FROM machine_hosts WHERE name = ?",
+                [name],
+                |r| r.get::<_, bool>(0),
+            )
             .unwrap_or(false);
         c.execute(
             "UPDATE machine_hosts SET state = 'up', failing_since = NULL, last_error = NULL, down_at = NULL, checked_at = ?1
@@ -7423,7 +9384,13 @@ impl Db {
             params![now(), crate::audit::clip(error, 300), name],
         )
         .unwrap();
-        c.query_row("SELECT failing_since FROM machine_hosts WHERE name = ?", [name], |r| r.get(0)).ok().flatten()
+        c.query_row(
+            "SELECT failing_since FROM machine_hosts WHERE name = ?",
+            [name],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten()
     }
 
     /// Up to down, once. Returns whether this call did it.
@@ -7463,21 +9430,44 @@ impl Db {
 
     /// Gives a machine its new provider id, as after a move to another host.
     pub fn set_machine_provider_id(&self, machine_id: &str, provider_id: &str) {
-        self.c().execute("UPDATE machines SET provider_id = ?, updated_at = ? WHERE id = ?", params![provider_id, now(), machine_id]).unwrap();
+        self.c()
+            .execute(
+                "UPDATE machines SET provider_id = ?, updated_at = ? WHERE id = ?",
+                params![provider_id, now(), machine_id],
+            )
+            .unwrap();
     }
 
     /// The firewall a machine is behind now, as after a move to a host that has only today's.
     pub fn set_machine_firewall_id(&self, machine_id: &str, firewall_id: Option<&str>) {
-        self.c().execute("UPDATE machines SET firewall_id = ?, updated_at = ? WHERE id = ?", params![firewall_id, now(), machine_id]).unwrap();
+        self.c()
+            .execute(
+                "UPDATE machines SET firewall_id = ?, updated_at = ? WHERE id = ?",
+                params![firewall_id, now(), machine_id],
+            )
+            .unwrap();
     }
 
     #[cfg(test)]
     pub fn machine_host_failing_backdate(&self, name: &str, ms: i64) {
-        self.c().execute("UPDATE machine_hosts SET failing_since = failing_since - ?1 WHERE name = ?2", params![ms, name]).unwrap();
+        self.c()
+            .execute(
+                "UPDATE machine_hosts SET failing_since = failing_since - ?1 WHERE name = ?2",
+                params![ms, name],
+            )
+            .unwrap();
     }
 
     pub fn machine_restore(&self, id: &str) -> Option<MachineRestore> {
-        self.c().query_row("SELECT * FROM machine_restores WHERE id = ?", [id], machine_restore_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT * FROM machine_restores WHERE id = ?",
+                [id],
+                machine_restore_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// The machine's restore underway, if any.
@@ -7522,8 +9512,13 @@ impl Db {
     /// The newest restores of every machine, newest first.
     pub fn machine_restores_recent(&self, limit: u32) -> Vec<MachineRestore> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM machine_restores ORDER BY created_at DESC, id DESC LIMIT ?").unwrap();
-        s.query_map([limit], machine_restore_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT * FROM machine_restores ORDER BY created_at DESC, id DESC LIMIT ?")
+            .unwrap();
+        s.query_map([limit], machine_restore_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// How long a finished restore took (ADR 0074).
@@ -7550,7 +9545,13 @@ impl Db {
     // RPO breaches (ADR 0074)
 
     /// Opens a breach for the machine, unless one is open. Returns it if this call did.
-    pub fn machine_rpo_breach_start(&self, id: &str, m: &Machine, rpo_ms: i64, covered_since: i64) -> Option<MachineRpoBreach> {
+    pub fn machine_rpo_breach_start(
+        &self,
+        id: &str,
+        m: &Machine,
+        rpo_ms: i64,
+        covered_since: i64,
+    ) -> Option<MachineRpoBreach> {
         let made = self
             .c()
             .execute(
@@ -7560,7 +9561,17 @@ impl Db {
             )
             .unwrap_or(0)
             == 1;
-        if made { self.c().query_row("SELECT * FROM machine_rpo_breaches WHERE id = ?", [id], machine_rpo_breach_row).ok() } else { None }
+        if made {
+            self.c()
+                .query_row(
+                    "SELECT * FROM machine_rpo_breaches WHERE id = ?",
+                    [id],
+                    machine_rpo_breach_row,
+                )
+                .ok()
+        } else {
+            None
+        }
     }
 
     /// Ends an open breach. Returns whether this call did.
@@ -7575,34 +9586,63 @@ impl Db {
     pub fn machine_rpo_breaches_open(&self) -> Vec<MachineRpoBreach> {
         let c = self.c();
         let mut s = c.prepare("SELECT * FROM machine_rpo_breaches WHERE ended_at IS NULL ORDER BY breached_at, id").unwrap();
-        s.query_map([], machine_rpo_breach_row).unwrap().filter_map(Result::ok).collect()
+        s.query_map([], machine_rpo_breach_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// The machine's open breach, if any.
     pub fn machine_rpo_breach_open(&self, machine_id: &str) -> Option<MachineRpoBreach> {
         self.c()
-            .query_row("SELECT * FROM machine_rpo_breaches WHERE machine_id = ? AND ended_at IS NULL", [machine_id], machine_rpo_breach_row)
+            .query_row(
+                "SELECT * FROM machine_rpo_breaches WHERE machine_id = ? AND ended_at IS NULL",
+                [machine_id],
+                machine_rpo_breach_row,
+            )
             .ok()
     }
 
     /// The newest breaches, open or not, newest first.
     pub fn machine_rpo_breaches(&self, limit: u32) -> Vec<MachineRpoBreach> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM machine_rpo_breaches ORDER BY breached_at DESC, id DESC LIMIT ?").unwrap();
-        s.query_map([limit], machine_rpo_breach_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare(
+                "SELECT * FROM machine_rpo_breaches ORDER BY breached_at DESC, id DESC LIMIT ?",
+            )
+            .unwrap();
+        s.query_map([limit], machine_rpo_breach_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// Every restore in `state`.
     pub fn machine_restores_in(&self, state: &str) -> Vec<MachineRestore> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM machine_restores WHERE state = ? ORDER BY created_at, id").unwrap();
-        s.query_map([state], machine_restore_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT * FROM machine_restores WHERE state = ? ORDER BY created_at, id")
+            .unwrap();
+        s.query_map([state], machine_restore_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// Moves a restore from one of `from` to `to`. Returns whether it moved.
-    pub fn machine_restore_move(&self, id: &str, from: &[&str], to: &str, error: Option<&str>) -> bool {
+    pub fn machine_restore_move(
+        &self,
+        id: &str,
+        from: &[&str],
+        to: &str,
+        error: Option<&str>,
+    ) -> bool {
         let at = now();
-        let states = from.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(", ");
+        let states = from
+            .iter()
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
         self.c()
             .execute(
                 &format!(
@@ -7640,7 +9680,12 @@ impl Db {
 
     #[cfg(test)]
     pub fn machine_rebuild_due_now(&self, machine_id: &str) {
-        self.c().execute("UPDATE machines SET rebuild_next_at = ? WHERE id = ?", params![now() - 1, machine_id]).unwrap();
+        self.c()
+            .execute(
+                "UPDATE machines SET rebuild_next_at = ? WHERE id = ?",
+                params![now() - 1, machine_id],
+            )
+            .unwrap();
     }
 
     #[cfg(test)]
@@ -7663,28 +9708,51 @@ impl Db {
 
     #[cfg(test)]
     pub fn machine_restore_backdate(&self, id: &str, ms: i64) {
-        self.c().execute("UPDATE machine_restores SET created_at = created_at - ?1 WHERE id = ?2", params![ms, id]).unwrap();
+        self.c()
+            .execute(
+                "UPDATE machine_restores SET created_at = created_at - ?1 WHERE id = ?2",
+                params![ms, id],
+            )
+            .unwrap();
     }
 
     #[cfg(test)]
     pub fn machine_restore_replaced_backdate(&self, id: &str, ms: i64) {
-        self.c().execute("UPDATE machine_restores SET replaced_at = replaced_at - ?1 WHERE id = ?2", params![ms, id]).unwrap();
+        self.c()
+            .execute(
+                "UPDATE machine_restores SET replaced_at = replaced_at - ?1 WHERE id = ?2",
+                params![ms, id],
+            )
+            .unwrap();
     }
 
     #[cfg(test)]
     pub fn machine_enrolled_backdate(&self, id: &str, ms: i64) {
-        self.c().execute("UPDATE machines SET enrolled_at = enrolled_at - ?1 WHERE id = ?2", params![ms, id]).unwrap();
+        self.c()
+            .execute(
+                "UPDATE machines SET enrolled_at = enrolled_at - ?1 WHERE id = ?2",
+                params![ms, id],
+            )
+            .unwrap();
     }
 
     #[cfg(test)]
     pub fn machine_backdate(&self, id: &str, ms: i64) {
-        self.c().execute("UPDATE machines SET created_at = created_at - ?1 WHERE id = ?2", params![ms, id]).unwrap();
+        self.c()
+            .execute(
+                "UPDATE machines SET created_at = created_at - ?1 WHERE id = ?2",
+                params![ms, id],
+            )
+            .unwrap();
     }
 
     #[cfg(test)]
     pub fn machine_upgrade_backdate(&self, machine_id: &str, ms: i64) {
         self.c()
-            .execute("UPDATE machines SET upgrade_sent_at = upgrade_sent_at - ? WHERE id = ?", params![ms, machine_id])
+            .execute(
+                "UPDATE machines SET upgrade_sent_at = upgrade_sent_at - ? WHERE id = ?",
+                params![ms, machine_id],
+            )
             .unwrap();
     }
 }
@@ -7795,7 +9863,12 @@ impl Db {
     /// Whether a Bot `owner` shares, or grants, can reach `user` (ADR 0087): people in
     /// the same team, or two people in no team unless TEAMS=on. The owner always.
     pub fn same_team(&self, owner: &str, user: &str) -> bool {
-        owner == user || crate::acl::reaches(self.teams_strict(), self.team_id_of(owner).as_deref(), self.team_id_of(user).as_deref())
+        owner == user
+            || crate::acl::reaches(
+                self.teams_strict(),
+                self.team_id_of(owner).as_deref(),
+                self.team_id_of(user).as_deref(),
+            )
     }
 
     pub fn create_team(&self, name: &str, by: Option<&str>) -> Team {
@@ -7811,22 +9884,39 @@ impl Db {
     }
 
     pub fn team(&self, id: &str) -> Option<Team> {
-        self.c().query_row("SELECT * FROM teams WHERE id = ?", [id], team_row).optional().ok().flatten()
+        self.c()
+            .query_row("SELECT * FROM teams WHERE id = ?", [id], team_row)
+            .optional()
+            .ok()
+            .flatten()
     }
 
     pub fn teams(&self) -> Vec<Team> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM teams ORDER BY created_at, id").unwrap();
-        s.query_map([], team_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT * FROM teams ORDER BY created_at, id")
+            .unwrap();
+        s.query_map([], team_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     pub fn update_team(&self, id: &str, name: Option<&str>, machines: Option<bool>) {
         let c = self.c();
         if let Some(n) = name {
-            c.execute("UPDATE teams SET name = ?1, updated_at = ?2 WHERE id = ?3", params![n, now(), id]).unwrap();
+            c.execute(
+                "UPDATE teams SET name = ?1, updated_at = ?2 WHERE id = ?3",
+                params![n, now(), id],
+            )
+            .unwrap();
         }
         if let Some(m) = machines {
-            c.execute("UPDATE teams SET machines = ?1, updated_at = ?2 WHERE id = ?3", params![m, now(), id]).unwrap();
+            c.execute(
+                "UPDATE teams SET machines = ?1, updated_at = ?2 WHERE id = ?3",
+                params![m, now(), id],
+            )
+            .unwrap();
         }
     }
 
@@ -7836,28 +9926,60 @@ impl Db {
     }
 
     pub fn team_member(&self, user_id: &str) -> Option<TeamMember> {
-        self.c().query_row("SELECT * FROM team_members WHERE user_id = ?", [user_id], team_member_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT * FROM team_members WHERE user_id = ?",
+                [user_id],
+                team_member_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     pub fn team_id_of(&self, user_id: &str) -> Option<String> {
-        self.c().query_row("SELECT team_id FROM team_members WHERE user_id = ?", [user_id], |r| r.get(0)).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT team_id FROM team_members WHERE user_id = ?",
+                [user_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// Every member's team, by user id.
     pub fn team_ids(&self) -> HashMap<String, String> {
         let c = self.c();
-        let mut s = c.prepare("SELECT user_id, team_id FROM team_members").unwrap();
-        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT user_id, team_id FROM team_members")
+            .unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     pub fn team_members(&self, team_id: &str) -> Vec<TeamMember> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM team_members WHERE team_id = ? ORDER BY joined_at, user_id").unwrap();
-        s.query_map([team_id], team_member_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT * FROM team_members WHERE team_id = ? ORDER BY joined_at, user_id")
+            .unwrap();
+        s.query_map([team_id], team_member_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// Adds `user_id` to the team. False if they're in a team already, this one included.
-    pub fn add_team_member(&self, team_id: &str, user_id: &str, role: &str, by: Option<&str>) -> bool {
+    pub fn add_team_member(
+        &self,
+        team_id: &str,
+        user_id: &str,
+        role: &str,
+        by: Option<&str>,
+    ) -> bool {
         self.c()
             .execute(
                 "INSERT OR IGNORE INTO team_members (user_id, team_id, role, joined_at, added_by) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -7896,7 +10018,14 @@ impl Db {
     }
 
     /// Invites `email`, or renews a pending invite with the new role and expiry.
-    pub fn put_team_invite(&self, team_id: &str, email: &str, role: &str, by: Option<&str>, expires_at: i64) -> TeamInvite {
+    pub fn put_team_invite(
+        &self,
+        team_id: &str,
+        email: &str,
+        role: &str,
+        by: Option<&str>,
+        expires_at: i64,
+    ) -> TeamInvite {
         let id = format!("ti{}", crate::random_hex(8));
         let c = self.c();
         c.execute(
@@ -7905,31 +10034,62 @@ impl Db {
             params![id, team_id, email, role, now(), by, expires_at],
         )
         .unwrap();
-        c.query_row("SELECT * FROM team_invites WHERE team_id = ? AND email = ?", [team_id, email], team_invite_row).unwrap()
+        c.query_row(
+            "SELECT * FROM team_invites WHERE team_id = ? AND email = ?",
+            [team_id, email],
+            team_invite_row,
+        )
+        .unwrap()
     }
 
     pub fn team_invite(&self, id: &str) -> Option<TeamInvite> {
-        self.c().query_row("SELECT * FROM team_invites WHERE id = ?", [id], team_invite_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT * FROM team_invites WHERE id = ?",
+                [id],
+                team_invite_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     pub fn team_invites(&self, team_id: &str) -> Vec<TeamInvite> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM team_invites WHERE team_id = ? ORDER BY created_at, id").unwrap();
-        s.query_map([team_id], team_invite_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT * FROM team_invites WHERE team_id = ? ORDER BY created_at, id")
+            .unwrap();
+        s.query_map([team_id], team_invite_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     pub fn invites_for_email(&self, email: &str) -> Vec<TeamInvite> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM team_invites WHERE email = ? ORDER BY created_at, id").unwrap();
-        s.query_map([email], team_invite_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT * FROM team_invites WHERE email = ? ORDER BY created_at, id")
+            .unwrap();
+        s.query_map([email], team_invite_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     pub fn delete_team_invite(&self, id: &str) -> bool {
-        self.c().execute("DELETE FROM team_invites WHERE id = ?", [id]).unwrap() > 0
+        self.c()
+            .execute("DELETE FROM team_invites WHERE id = ?", [id])
+            .unwrap()
+            > 0
     }
 
     pub fn delete_team_invites_for(&self, team_id: &str, email: &str) {
-        self.c().execute("DELETE FROM team_invites WHERE team_id = ? AND email = ?", [team_id, email]).unwrap();
+        self.c()
+            .execute(
+                "DELETE FROM team_invites WHERE team_id = ? AND email = ?",
+                [team_id, email],
+            )
+            .unwrap();
     }
 
     /// Notes that `team_id` gave `user_id` the machine, or gives it back to a team after
@@ -7945,13 +10105,26 @@ impl Db {
     }
 
     pub fn team_machine(&self, machine_id: &str) -> Option<TeamMachine> {
-        self.c().query_row("SELECT * FROM team_machines WHERE machine_id = ?", [machine_id], team_machine_row).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT * FROM team_machines WHERE machine_id = ?",
+                [machine_id],
+                team_machine_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     pub fn team_machines(&self) -> Vec<TeamMachine> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM team_machines ORDER BY created_at, machine_id").unwrap();
-        s.query_map([], team_machine_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c
+            .prepare("SELECT * FROM team_machines ORDER BY created_at, machine_id")
+            .unwrap();
+        s.query_map([], team_machine_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
     }
 
     /// Releases `machine_id` if `team_id` still holds it: another team may have taken it.
@@ -7966,17 +10139,32 @@ impl Db {
     }
 
     pub fn team_machine_forget(&self, machine_id: &str) {
-        self.c().execute("DELETE FROM team_machines WHERE machine_id = ?", [machine_id]).unwrap();
+        self.c()
+            .execute(
+                "DELETE FROM team_machines WHERE machine_id = ?",
+                [machine_id],
+            )
+            .unwrap();
     }
 
     #[cfg(test)]
     pub fn team_machine_backdate(&self, machine_id: &str, ms: i64) {
-        self.c().execute("UPDATE team_machines SET release_at = release_at - ?1 WHERE machine_id = ?2", params![ms, machine_id]).unwrap();
+        self.c()
+            .execute(
+                "UPDATE team_machines SET release_at = release_at - ?1 WHERE machine_id = ?2",
+                params![ms, machine_id],
+            )
+            .unwrap();
     }
 
     #[cfg(test)]
     pub fn machine_set_enrolled(&self, machine_id: &str) {
-        self.c().execute("UPDATE machines SET enrollment = 'enrolled' WHERE id = ?", [machine_id]).unwrap();
+        self.c()
+            .execute(
+                "UPDATE machines SET enrollment = 'enrolled' WHERE id = ?",
+                [machine_id],
+            )
+            .unwrap();
     }
 }
 
@@ -7998,11 +10186,19 @@ mod tests {
     #[test]
     fn teammate_accounts_made_before_their_table_are_remembered_from_the_audit_log() {
         let db = Db::open(&temp_path("spaces").join("app.sqlite")).unwrap();
-        let made = |owner: &str, d: Value| audit::Who::system("isolation").event("isolation.account_created").target("user", owner).details(d);
+        let made = |owner: &str, d: Value| {
+            audit::Who::system("isolation")
+                .event("isolation.account_created")
+                .target("user", owner)
+                .details(d)
+        };
         db.record(&made("u1", json!({ "account": "sb-t-1", "forUser": "u2" })));
         db.record(&made("u1", json!({ "account": "sb-t-1", "forUser": "u2" })));
         db.record(&made("u1", json!({ "account": "sb-u-u1" })));
-        db.record(&made("u3", json!({ "account": "sb-t-2", "forUser": "u4" })).outcome(audit::Outcome::Failure));
+        db.record(
+            &made("u3", json!({ "account": "sb-t-2", "forUser": "u4" }))
+                .outcome(audit::Outcome::Failure),
+        );
         db.c().execute("DELETE FROM teammate_spaces", []).unwrap();
         migrate_account_removals(&db.c(), false).unwrap();
         assert_eq!(db.teammate_spaces(), [("u1".to_string(), "u2".to_string())]);
@@ -8011,63 +10207,227 @@ mod tests {
     #[test]
     fn push_tokens_are_sealed_one_per_session_and_capped_per_person() {
         let db = Db::open(&temp_path("push").join("app.sqlite")).unwrap();
-        let u = db.create_user(None, Some("push@example.com"), "P", Role::Member).unwrap();
-        let other = db.create_user(None, Some("push2@example.com"), "Q", Role::Member).unwrap();
+        let u = db
+            .create_user(None, Some("push@example.com"), "P", Role::Member)
+            .unwrap();
+        let other = db
+            .create_user(None, Some("push2@example.com"), "Q", Role::Member)
+            .unwrap();
         let session = |user: &str| {
             let hash = crate::random_hex(16);
-            let s = NewSession { user_id: user, token_hash: &hash, kind: "token", method: "code", idp_subject: None, idp_provider: None, label: None, ip: None, user_agent: None, expires_at: now() + 60_000, mfa: None };
+            let s = NewSession {
+                user_id: user,
+                token_hash: &hash,
+                kind: "token",
+                method: "code",
+                idp_subject: None,
+                idp_provider: None,
+                label: None,
+                ip: None,
+                user_agent: None,
+                expires_at: now() + 60_000,
+                mfa: None,
+            };
             db.create_session(&s).id
         };
         let s1 = session(&u.id);
-        let (d, change) = db.put_push_device(&u.id, &s1, "expo", "ExponentPushToken[t-1]", "ios", true, true);
-        assert_eq!((change, d.token.as_str()), (PushPut::Added, "ExponentPushToken[t-1]"));
-        let raw: String = db.c().query_row("SELECT token FROM push_devices", [], |r| r.get(0)).unwrap();
+        let (d, change) = db.put_push_device(
+            &u.id,
+            &s1,
+            "expo",
+            "ExponentPushToken[t-1]",
+            "ios",
+            true,
+            true,
+        );
+        assert_eq!(
+            (change, d.token.as_str()),
+            (PushPut::Added, "ExponentPushToken[t-1]")
+        );
+        let raw: String = db
+            .c()
+            .query_row("SELECT token FROM push_devices", [], |r| r.get(0))
+            .unwrap();
         assert!(!raw.contains("t-1"), "sealed at rest: {raw}");
-        let (d2, change) = db.put_push_device(&u.id, &s1, "expo", "ExponentPushToken[t-2]", "ios", true, true);
-        assert_eq!((change, d2.id == d.id), (PushPut::Added, true), "a new token for the session replaces the old one");
-        assert_eq!(db.put_push_device(&u.id, &s1, "expo", "ExponentPushToken[t-2]", "ios", true, true).1, PushPut::Unchanged);
-        assert_eq!(db.put_push_device(&u.id, &s1, "expo", "ExponentPushToken[t-2]", "ios", false, true).1, PushPut::Updated);
+        let (d2, change) = db.put_push_device(
+            &u.id,
+            &s1,
+            "expo",
+            "ExponentPushToken[t-2]",
+            "ios",
+            true,
+            true,
+        );
+        assert_eq!(
+            (change, d2.id == d.id),
+            (PushPut::Added, true),
+            "a new token for the session replaces the old one"
+        );
+        assert_eq!(
+            db.put_push_device(
+                &u.id,
+                &s1,
+                "expo",
+                "ExponentPushToken[t-2]",
+                "ios",
+                true,
+                true
+            )
+            .1,
+            PushPut::Unchanged
+        );
+        assert_eq!(
+            db.put_push_device(
+                &u.id,
+                &s1,
+                "expo",
+                "ExponentPushToken[t-2]",
+                "ios",
+                false,
+                true
+            )
+            .1,
+            PushPut::Updated
+        );
         // A token sealed under a lost key doesn't open; registering again still works and keeps the row.
-        let lost = crate::secrets::sealed::Cipher::new(&crate::secrets::key::MasterKey::generate()).seal(PUSH_TOKEN_CONTEXT, b"ExponentPushToken[t-2]");
-        db.c().execute("UPDATE push_devices SET token = ? WHERE session_id = ?", params![lost, s1]).unwrap();
+        let lost = crate::secrets::sealed::Cipher::new(&crate::secrets::key::MasterKey::generate())
+            .seal(PUSH_TOKEN_CONTEXT, b"ExponentPushToken[t-2]");
+        db.c()
+            .execute(
+                "UPDATE push_devices SET token = ? WHERE session_id = ?",
+                params![lost, s1],
+            )
+            .unwrap();
         assert!(db.session_push_device(&s1).is_none());
-        let (d3, change) = db.put_push_device(&u.id, &s1, "expo", "ExponentPushToken[t-2]", "ios", true, true);
-        assert_eq!((change, d3.id == d.id, d3.token.as_str()), (PushPut::Added, true, "ExponentPushToken[t-2]"));
+        let (d3, change) = db.put_push_device(
+            &u.id,
+            &s1,
+            "expo",
+            "ExponentPushToken[t-2]",
+            "ios",
+            true,
+            true,
+        );
+        assert_eq!(
+            (change, d3.id == d.id, d3.token.as_str()),
+            (PushPut::Added, true, "ExponentPushToken[t-2]")
+        );
         let s2 = session(&other.id);
-        assert_eq!(db.put_push_device(&other.id, &s2, "expo", "ExponentPushToken[t-2]", "android", true, true).1, PushPut::Moved);
-        assert!(db.session_push_device(&s1).is_none(), "a token lives on one session only");
+        assert_eq!(
+            db.put_push_device(
+                &other.id,
+                &s2,
+                "expo",
+                "ExponentPushToken[t-2]",
+                "android",
+                true,
+                true
+            )
+            .1,
+            PushPut::Moved
+        );
+        assert!(
+            db.session_push_device(&s1).is_none(),
+            "a token lives on one session only"
+        );
         for i in 0..MAX_PUSH_DEVICES + 3 {
             let s = session(&u.id);
-            db.put_push_device(&u.id, &s, "expo", &format!("ExponentPushToken[c-{i}]"), "ios", true, true);
+            db.put_push_device(
+                &u.id,
+                &s,
+                "expo",
+                &format!("ExponentPushToken[c-{i}]"),
+                "ios",
+                true,
+                true,
+            );
         }
-        let n: i64 = db.c().query_row("SELECT COUNT(*) FROM push_devices WHERE user_id = ?", [&u.id], |r| r.get(0)).unwrap();
+        let n: i64 = db
+            .c()
+            .query_row(
+                "SELECT COUNT(*) FROM push_devices WHERE user_id = ?",
+                [&u.id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(n as usize, MAX_PUSH_DEVICES, "the oldest go");
-        db.c().execute("DELETE FROM sessions WHERE id = ?", [&s2]).unwrap();
-        assert!(db.session_push_device(&s2).is_none(), "a pruned session takes its device");
+        db.c()
+            .execute("DELETE FROM sessions WHERE id = ?", [&s2])
+            .unwrap();
+        assert!(
+            db.session_push_device(&s2).is_none(),
+            "a pruned session takes its device"
+        );
     }
 
     #[test]
     fn the_bot_cap_holds_under_concurrent_requests() {
         let db = std::sync::Arc::new(Db::open(&temp_path("bot-cap").join("app.sqlite")).unwrap());
-        let u = db.create_user(None, Some("cap@example.com"), "Cap", Role::Member).unwrap();
-        let other = db.create_user(None, Some("other@example.com"), "Other", Role::Member).unwrap();
-        let theirs: Vec<String> = (0..8).map(|_| db.create_bot_owned("T", "#fff", "waddle", "claude", None, false, &other.id, Visibility::Private).id).collect();
+        let u = db
+            .create_user(None, Some("cap@example.com"), "Cap", Role::Member)
+            .unwrap();
+        let other = db
+            .create_user(None, Some("other@example.com"), "Other", Role::Member)
+            .unwrap();
+        let theirs: Vec<String> = (0..8)
+            .map(|_| {
+                db.create_bot_owned(
+                    "T",
+                    "#fff",
+                    "waddle",
+                    "claude",
+                    None,
+                    false,
+                    &other.id,
+                    Visibility::Private,
+                )
+                .id
+            })
+            .collect();
         // Creates and transfers race for the same 3 slots.
         let threads: Vec<_> = (0..16)
             .map(|i| {
                 let (db, owner, bot) = (db.clone(), u.id.clone(), theirs[i % 8].clone());
                 std::thread::spawn(move || {
                     if i < 8 {
-                        db.create_bot_capped("B", "#fff", "waddle", "claude", None, false, &owner, Visibility::Private, Some(3)).is_some()
+                        db.create_bot_capped(
+                            "B",
+                            "#fff",
+                            "waddle",
+                            "claude",
+                            None,
+                            false,
+                            &owner,
+                            Visibility::Private,
+                            Some(3),
+                        )
+                        .is_some()
                     } else {
                         db.set_bot_owner_capped(&bot, &owner, Some(3))
                     }
                 })
             })
             .collect();
-        let won = threads.into_iter().map(|t| t.join().unwrap()).filter(|ok| *ok).count();
+        let won = threads
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
         assert_eq!((won, db.owned_bot_count(&u.id)), (3, 3));
-        assert!(db.create_bot_capped("B", "#fff", "waddle", "claude", None, false, &other.id, Visibility::Private, None).is_some());
+        assert!(
+            db.create_bot_capped(
+                "B",
+                "#fff",
+                "waddle",
+                "claude",
+                None,
+                false,
+                &other.id,
+                Visibility::Private,
+                None
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -8130,9 +10490,20 @@ mod tests {
                         event_created: at,
                         updated_at: 0,
                     };
-                    db.apply_subscription(&format!("{}-{n}", u.id), "customer.subscription.updated", &s, true, &|_| Vec::new()).unwrap();
+                    db.apply_subscription(
+                        &format!("{}-{n}", u.id),
+                        "customer.subscription.updated",
+                        &s,
+                        true,
+                        &|_| Vec::new(),
+                    )
+                    .unwrap();
                 }
-                assert_eq!(db.user(&u.id).unwrap().tier.as_deref(), want, "events {picked:?} in order {order:?}");
+                assert_eq!(
+                    db.user(&u.id).unwrap().tier.as_deref(),
+                    want,
+                    "events {picked:?} in order {order:?}"
+                );
             }
         }
     }
@@ -8156,10 +10527,31 @@ mod tests {
             event_created: 10,
             updated_at: 0,
         };
-        let mail = |_: &Change| vec![NewEmail { key: "stripe:evt_1:plan_started".into(), user_id: u.id.clone(), kind: Kind::PlanStarted, facts: Facts::default(), event_id: Some("evt_1".into()) }];
-        let (applied, _, queued) = db.apply_subscription("evt_1", "customer.subscription.updated", &s, true, &mail).unwrap();
-        assert_eq!((applied, queued), (Applied::Changed { from: None, to: Some("pro".into()) }, 1));
-        let (applied, _, queued) = db.apply_subscription("evt_1", "customer.subscription.updated", &s, true, &mail).unwrap();
+        let mail = |_: &Change| {
+            vec![NewEmail {
+                key: "stripe:evt_1:plan_started".into(),
+                user_id: u.id.clone(),
+                kind: Kind::PlanStarted,
+                facts: Facts::default(),
+                event_id: Some("evt_1".into()),
+            }]
+        };
+        let (applied, _, queued) = db
+            .apply_subscription("evt_1", "customer.subscription.updated", &s, true, &mail)
+            .unwrap();
+        assert_eq!(
+            (applied, queued),
+            (
+                Applied::Changed {
+                    from: None,
+                    to: Some("pro".into())
+                },
+                1
+            )
+        );
+        let (applied, _, queued) = db
+            .apply_subscription("evt_1", "customer.subscription.updated", &s, true, &mail)
+            .unwrap();
         assert_eq!((applied, queued), (Applied::Duplicate, 0));
         // Held, but due after the hold even if never released.
         let at = now();
@@ -8183,10 +10575,23 @@ mod tests {
     #[test]
     fn subscribers_from_before_customers_were_linked_keep_their_portal() {
         let db = Db::open(&temp_path("billing-backfill").join("app.sqlite")).unwrap();
-        let ids: Vec<String> = (0..4).map(|_| db.create_user(None, None, "Payer", Role::Member).unwrap().id).collect();
+        let ids: Vec<String> = (0..4)
+            .map(|_| {
+                db.create_user(None, None, "Payer", Role::Member)
+                    .unwrap()
+                    .id
+            })
+            .collect();
         // One customer; two of their own; one shared with another user (ADR 0040 kept the
         // other user's subscription out, but its id may still be on record).
-        let rows = [(&ids[0], "sub_a", "cus_a"), (&ids[0], "sub_a2", "cus_a"), (&ids[1], "sub_b", "cus_b"), (&ids[1], "sub_b2", "cus_b2"), (&ids[2], "sub_c", "cus_shared"), (&ids[3], "sub_d", "cus_shared")];
+        let rows = [
+            (&ids[0], "sub_a", "cus_a"),
+            (&ids[0], "sub_a2", "cus_a"),
+            (&ids[1], "sub_b", "cus_b"),
+            (&ids[1], "sub_b2", "cus_b2"),
+            (&ids[2], "sub_c", "cus_shared"),
+            (&ids[3], "sub_d", "cus_shared"),
+        ];
         {
             let c = db.c();
             c.execute("DELETE FROM billing_customers", []).unwrap();
@@ -8206,13 +10611,23 @@ mod tests {
 
     #[test]
     fn the_pending_cap_holds_under_concurrent_requests() {
-        let db = std::sync::Arc::new(Db::open(&temp_path("signup-cap").join("app.sqlite")).unwrap());
+        let db =
+            std::sync::Arc::new(Db::open(&temp_path("signup-cap").join("app.sqlite")).unwrap());
         let results: Vec<_> = (0..16)
             .map(|i| {
                 let db = db.clone();
                 std::thread::spawn(move || {
                     let email = format!("p{i}@example.com");
-                    let s = NewSignup { name: "P", email: &email, company: "C", team_size: "1", use_case: "U", sign_in: "other", ip: None, user_agent: None };
+                    let s = NewSignup {
+                        name: "P",
+                        email: &email,
+                        company: "C",
+                        team_size: "1",
+                        use_case: "U",
+                        sign_in: "other",
+                        ip: None,
+                        user_agent: None,
+                    };
                     db.add_signup(&s, 3).map(|_| ())
                 })
             })
@@ -8221,68 +10636,171 @@ mod tests {
             .map(|t| t.join().unwrap())
             .collect();
         assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 3);
-        assert!(results.iter().all(|r| r.is_ok() || *r == Err(AddSignup::Full)));
+        assert!(
+            results
+                .iter()
+                .all(|r| r.is_ok() || *r == Err(AddSignup::Full))
+        );
         assert_eq!(db.pending_signups(), 3);
         let taken = db.signups(Some("pending"), 1)[0].email.to_uppercase();
-        let s = NewSignup { name: "P", email: &taken, company: "C", team_size: "1", use_case: "U", sign_in: "other", ip: None, user_agent: None };
-        assert_eq!(db.add_signup(&s, 10).map(|_| ()), Err(AddSignup::Duplicate), "emails match without case");
+        let s = NewSignup {
+            name: "P",
+            email: &taken,
+            company: "C",
+            team_size: "1",
+            use_case: "U",
+            sign_in: "other",
+            ip: None,
+            user_agent: None,
+        };
+        assert_eq!(
+            db.add_signup(&s, 10).map(|_| ()),
+            Err(AddSignup::Duplicate),
+            "emails match without case"
+        );
     }
 
     #[test]
     fn fresh_install_asks() {
         let db = Db::open(&temp_path("fresh").join("app.sqlite")).unwrap();
         assert_eq!(db.global_policy().mode, Mode::Ask);
-        let v: i64 = db.c().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v: i64 = db
+            .c()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, MIGRATIONS.len() as i64);
         let e = &all_events(&db)[0];
-        assert_eq!((e.action.as_str(), e.actor_kind.as_str(), e.target_type.as_deref(), e.outcome.as_str()), ("policy.initialized", "system", Some("policy"), "success"));
+        assert_eq!(
+            (
+                e.action.as_str(),
+                e.actor_kind.as_str(),
+                e.target_type.as_deref(),
+                e.outcome.as_str()
+            ),
+            ("policy.initialized", "system", Some("policy"), "success")
+        );
         assert!(e.time.ends_with('Z'), "{}", e.time);
     }
 
     #[test]
     fn a_held_machine_claims_no_upgrade() {
         let db = Db::open(&temp_path("upgrade-hold").join("app.sqlite")).unwrap();
-        let u = db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
-        let new = NewMachine { user_id: &u.id, provider: "fake", label_prefix: "superbot", tier: "starter", plan: "g6-standard-1", region: "gb-lon", created_by: None };
+        let u = db
+            .create_user(None, Some("ada@example.com"), "Ada", Role::Member)
+            .unwrap();
+        let new = NewMachine {
+            user_id: &u.id,
+            provider: "fake",
+            label_prefix: "superbot",
+            tier: "starter",
+            plan: "g6-standard-1",
+            region: "gb-lon",
+            created_by: None,
+        };
         let m = db.add_machine(&new).unwrap();
         assert!(db.machine_upgrade_hold(&m.id, Some("admin"), 0));
-        assert!(!db.machine_upgrade_hold(&m.id, Some("admin"), 0), "held already");
-        assert!(!db.machine_upgrade_claim(&m.id, "u1", "b", "admin", 0), "held");
+        assert!(
+            !db.machine_upgrade_hold(&m.id, Some("admin"), 0),
+            "held already"
+        );
+        assert!(
+            !db.machine_upgrade_claim(&m.id, "u1", "b", "admin", 0),
+            "held"
+        );
         assert!(db.machine_upgrade_release(&m.id));
         assert!(!db.machine_upgrade_release(&m.id), "released already");
         assert!(db.machine_upgrade_claim(&m.id, "u1", "b", "admin", 0));
-        assert!(!db.machine_upgrade_claim(&m.id, "u2", "b", "admin", 0), "one on its way");
+        assert!(
+            !db.machine_upgrade_claim(&m.id, "u2", "b", "admin", 0),
+            "one on its way"
+        );
     }
 
     #[test]
     fn a_rebuild_steps_only_from_the_state_it_expects() {
         let path = temp_path("rebuild-steps").join("app.sqlite");
         let db = Db::open(&path).unwrap();
-        let u = db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
-        let new = NewMachine { user_id: &u.id, provider: "fake", label_prefix: "superbot", tier: "starter", plan: "g6-standard-1", region: "gb-lon", created_by: None };
+        let u = db
+            .create_user(None, Some("ada@example.com"), "Ada", Role::Member)
+            .unwrap();
+        let new = NewMachine {
+            user_id: &u.id,
+            provider: "fake",
+            label_prefix: "superbot",
+            tier: "starter",
+            plan: "g6-standard-1",
+            region: "gb-lon",
+            created_by: None,
+        };
         let m = db.add_machine(&new).unwrap();
-        assert!(!db.machine_rebuild_queue(&m.id, "r1", "auto", false, None), "only a running machine");
-        db.c().execute("UPDATE machines SET state = 'running' WHERE id = ?", [&m.id]).unwrap();
+        assert!(
+            !db.machine_rebuild_queue(&m.id, "r1", "auto", false, None),
+            "only a running machine"
+        );
+        db.c()
+            .execute(
+                "UPDATE machines SET state = 'running' WHERE id = ?",
+                [&m.id],
+            )
+            .unwrap();
         assert!(!db.machine_may_hold_work(&m.id));
         assert!(db.machine_rebuild_queue(&m.id, "r1", "auto", false, Some("0.3.0")));
-        assert!(!db.machine_rebuild_queue(&m.id, "r2", "auto", false, None), "one at a time");
-        assert!(!db.machine_rebuild_move(&m.id, "r0", &["queued"], "cancelled", false, None, None), "a stale rebuild changes nothing");
-        assert!(!db.machine_rebuild_sending(&m.id, "r1", &["retrying"]), "not from another state");
+        assert!(
+            !db.machine_rebuild_queue(&m.id, "r2", "auto", false, None),
+            "one at a time"
+        );
+        assert!(
+            !db.machine_rebuild_move(&m.id, "r0", &["queued"], "cancelled", false, None, None),
+            "a stale rebuild changes nothing"
+        );
+        assert!(
+            !db.machine_rebuild_sending(&m.id, "r1", &["retrying"]),
+            "not from another state"
+        );
         assert!(db.machine_rebuild_sending(&m.id, "r1", &["queued"]));
         let r = db.machine(&m.id).unwrap();
-        assert_eq!((r.rebuild_state.as_deref(), r.rebuild_attempts, r.rebuild_from.as_deref()), (Some("rebuilding"), 1, Some("0.3.0")));
+        assert_eq!(
+            (
+                r.rebuild_state.as_deref(),
+                r.rebuild_attempts,
+                r.rebuild_from.as_deref()
+            ),
+            (Some("rebuilding"), 1, Some("0.3.0"))
+        );
         assert!(r.rebuild_sent_at.is_some());
-        assert!(db.machine_rebuild_move(&m.id, "r1", &["rebuilding"], "failed", false, None, Some("no")));
+        assert!(db.machine_rebuild_move(
+            &m.id,
+            "r1",
+            &["rebuilding"],
+            "failed",
+            false,
+            None,
+            Some("no")
+        ));
         assert!(db.machine_upgrade_hold(&m.id, None, 0));
-        assert!(!db.machine_rebuild_queue(&m.id, "r3", "admin", true, None), "held");
+        assert!(
+            !db.machine_rebuild_queue(&m.id, "r3", "admin", true, None),
+            "held"
+        );
         db.machine_upgrade_release(&m.id);
-        assert!(db.machine_rebuild_queue(&m.id, "r3", "admin", true, None), "again after a failure");
+        assert!(
+            db.machine_rebuild_queue(&m.id, "r3", "admin", true, None),
+            "again after a failure"
+        );
         let r = db.machine(&m.id).unwrap();
-        assert_eq!((r.rebuild_attempts, r.rebuild_error.as_deref(), r.rebuild_discard), (0, None, true));
+        assert_eq!(
+            (
+                r.rebuild_attempts,
+                r.rebuild_error.as_deref(),
+                r.rebuild_discard
+            ),
+            (0, None, true)
+        );
         assert!(db.assign_machine(&m.id, None));
         assert!(db.machine_may_hold_work(&m.id), "assigned");
         assert!(db.unassign_machine(&m.id));
-        let routed = audit::Event::new(audit::Actor::system("t"), "bot.run_routed").details(json!({ "machine": m.id }));
+        let routed = audit::Event::new(audit::Actor::system("t"), "bot.run_routed")
+            .details(json!({ "machine": m.id }));
         db.record(&routed);
         assert!(db.machine_may_hold_work(&m.id), "a Bot ran there");
 
@@ -8297,77 +10815,154 @@ mod tests {
                  ALTER TABLE machines DROP COLUMN rebuild_from;",
             )
             .unwrap();
-        let rebuild = MIGRATIONS.iter().position(|m| std::ptr::fn_addr_eq(*m, migrate_machine_rebuild as fn(&Connection, bool) -> rusqlite::Result<()>)).unwrap();
-        db.c().execute_batch(&format!("PRAGMA user_version = {rebuild};")).unwrap();
+        let rebuild = MIGRATIONS
+            .iter()
+            .position(|m| {
+                std::ptr::fn_addr_eq(
+                    *m,
+                    migrate_machine_rebuild as fn(&Connection, bool) -> rusqlite::Result<()>,
+                )
+            })
+            .unwrap();
+        db.c()
+            .execute_batch(&format!("PRAGMA user_version = {rebuild};"))
+            .unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
         let r = db.machine(&m.id).unwrap();
-        assert_eq!((r.rebuild_state, r.rebuild_attempts, r.rebuild_discard), (None, 0, false));
+        assert_eq!(
+            (r.rebuild_state, r.rebuild_attempts, r.rebuild_discard),
+            (None, 0, false)
+        );
     }
 
     #[test]
     fn an_upgrade_on_its_way_takes_no_hold() {
         let db = Db::open(&temp_path("upgrade-claimed").join("app.sqlite")).unwrap();
-        let u = db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
-        let new = NewMachine { user_id: &u.id, provider: "fake", label_prefix: "superbot", tier: "starter", plan: "g6-standard-1", region: "gb-lon", created_by: None };
+        let u = db
+            .create_user(None, Some("ada@example.com"), "Ada", Role::Member)
+            .unwrap();
+        let new = NewMachine {
+            user_id: &u.id,
+            provider: "fake",
+            label_prefix: "superbot",
+            tier: "starter",
+            plan: "g6-standard-1",
+            region: "gb-lon",
+            created_by: None,
+        };
         let m = db.add_machine(&new).unwrap();
         assert!(db.machine_upgrade_claim(&m.id, "u1", "b", "admin", 0));
-        assert!(!db.machine_upgrade_hold(&m.id, Some("admin"), 0), "an upgrade is on its way");
+        assert!(
+            !db.machine_upgrade_hold(&m.id, Some("admin"), 0),
+            "an upgrade is on its way"
+        );
         assert!(db.machine(&m.id).unwrap().upgrade_hold_at.is_none());
         db.machine_upgrade_backdate(&m.id, 60_000);
-        assert!(db.machine_upgrade_hold(&m.id, Some("admin"), now() - 1000), "a stale one doesn't count");
+        assert!(
+            db.machine_upgrade_hold(&m.id, Some("admin"), now() - 1000),
+            "a stale one doesn't count"
+        );
         assert!(db.machine_upgrade_end(&m.id, "u1", None));
-        assert!(!db.machine_upgrade_claim(&m.id, "u2", "b", "admin", 0), "held");
+        assert!(
+            !db.machine_upgrade_claim(&m.id, "u2", "b", "admin", 0),
+            "held"
+        );
     }
 
     #[test]
     fn one_live_machine_per_user() {
         let path = temp_path("machines").join("app.sqlite");
         let db = Db::open(&path).unwrap();
-        let u = db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
-        let new = NewMachine { user_id: &u.id, provider: "fake", label_prefix: "superbot", tier: "starter", plan: "g6-standard-1", region: "gb-lon", created_by: Some("operator") };
+        let u = db
+            .create_user(None, Some("ada@example.com"), "Ada", Role::Member)
+            .unwrap();
+        let new = NewMachine {
+            user_id: &u.id,
+            provider: "fake",
+            label_prefix: "superbot",
+            tier: "starter",
+            plan: "g6-standard-1",
+            region: "gb-lon",
+            created_by: Some("operator"),
+        };
         let m = db.add_machine(&new).unwrap();
-        assert_eq!((m.state, m.label.clone(), m.provider_id.as_deref()), (MachineState::Pending, format!("superbot-{}", m.id), None));
+        assert_eq!(
+            (m.state, m.label.clone(), m.provider_id.as_deref()),
+            (MachineState::Pending, format!("superbot-{}", m.id), None)
+        );
         match db.add_machine(&new) {
             Err(AddMachine::Exists(e)) => assert_eq!(e.id, m.id),
             other => panic!("{other:?}"),
         }
-        let missing = NewMachine { user_id: "u-nobody", ..new };
-        assert!(matches!(db.add_machine(&missing), Err(AddMachine::Db(_))), "only for real users");
+        let missing = NewMachine {
+            user_id: "u-nobody",
+            ..new
+        };
+        assert!(
+            matches!(db.add_machine(&missing), Err(AddMachine::Db(_))),
+            "only for real users"
+        );
 
         let mut next = m.clone();
         next.state = MachineState::Provisioning;
         next.provider_id = Some("42".into());
         assert!(db.save_machine(&next, MachineState::Pending));
-        assert!(!db.save_machine(&next, MachineState::Pending), "a stale change loses");
+        assert!(
+            !db.save_machine(&next, MachineState::Pending),
+            "a stale change loses"
+        );
         next.state = MachineState::Destroyed;
         assert!(db.save_machine(&next, MachineState::Provisioning));
         assert!(db.user_machine(&u.id).is_none());
         let again = db.add_machine(&new).unwrap();
         assert_ne!(again.id, m.id);
         assert_eq!(db.machines(None).len(), 2);
-        assert_eq!(db.machines(Some(MachineState::Destroyed))[0].provider_id.as_deref(), Some("42"));
-        assert!(db.c().execute("UPDATE machines SET state = 'lost'", []).is_err(), "only known states");
+        assert_eq!(
+            db.machines(Some(MachineState::Destroyed))[0]
+                .provider_id
+                .as_deref(),
+            Some("42")
+        );
+        assert!(
+            db.c()
+                .execute("UPDATE machines SET state = 'lost'", [])
+                .is_err(),
+            "only known states"
+        );
 
         // An install from before machines (user_version 9) gets the table on upgrade.
-        db.c().execute_batch("DROP TABLE machines; PRAGMA user_version = 9;").unwrap();
+        db.c()
+            .execute_batch("DROP TABLE machines; PRAGMA user_version = 9;")
+            .unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
         assert!(db.machines(None).is_empty());
         assert!(db.add_machine(&new).is_ok());
 
         // An install with tiers but no enrollment (user_version 11) gets enrollment on upgrade.
-        db.c().execute_batch("DROP TABLE machine_certs; DROP TABLE machine_tokens; PRAGMA user_version = 11;").unwrap();
+        db.c()
+            .execute_batch(
+                "DROP TABLE machine_certs; DROP TABLE machine_tokens; PRAGMA user_version = 11;",
+            )
+            .unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
-        let v: i64 = db.c().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v: i64 = db
+            .c()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, MIGRATIONS.len() as i64);
         let tables: i64 = db.c().query_row("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('machine_certs', 'machine_tokens', 'usage_monthly')", [], |r| r.get(0)).unwrap();
         assert_eq!(tables, 3);
 
         // An install at main's enrollment version (12) gets the lockdown columns, and
         // its machines keep working.
-        let live = db.machines(None).into_iter().find(|m| m.state != MachineState::Destroyed).unwrap();
+        let live = db
+            .machines(None)
+            .into_iter()
+            .find(|m| m.state != MachineState::Destroyed)
+            .unwrap();
         db.c()
             .execute_batch(
                 "ALTER TABLE machines DROP COLUMN firewall_id; ALTER TABLE machines DROP COLUMN enroll_by;
@@ -8376,13 +10971,23 @@ mod tests {
             .unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
-        let v: i64 = db.c().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v: i64 = db
+            .c()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, MIGRATIONS.len() as i64);
         let m = db.machine(&live.id).unwrap();
-        assert_eq!((m.firewall_id, m.enroll_by, m.enroll_overdue_at), (None, None, None));
+        assert_eq!(
+            (m.firewall_id, m.enroll_by, m.enroll_overdue_at),
+            (None, None, None)
+        );
         db.set_machine_firewall(&live.id, "501");
         assert_eq!(db.machines_on_firewall("501", "nobody"), 1);
-        assert_eq!(db.machines_on_firewall("501", &live.id), 0, "not counting the one asked about");
+        assert_eq!(
+            db.machines_on_firewall("501", &live.id),
+            0,
+            "not counting the one asked about"
+        );
     }
 
     #[test]
@@ -8400,13 +11005,24 @@ mod tests {
         drop(c);
         let db = Db::open(&path).unwrap();
         assert_eq!(db.global_policy().mode, Mode::Bypass);
-        assert!(!db.global_policy().sandbox, "an upgrade keeps harness sandboxes off");
+        assert!(
+            !db.global_policy().sandbox,
+            "an upgrade keeps harness sandboxes off"
+        );
         assert_eq!(db.bots().len(), 1);
         // Reopening doesn't re-run the migrations.
         drop(db);
         let db = Db::open(&path).unwrap();
         let actions: Vec<String> = all_events(&db).into_iter().map(|e| e.action).collect();
-        assert_eq!(actions, ["policy.sandbox_initialized", "audit.schema_upgraded", "bot.acl_initialized", "policy.initialized"]);
+        assert_eq!(
+            actions,
+            [
+                "policy.sandbox_initialized",
+                "audit.schema_upgraded",
+                "bot.acl_initialized",
+                "policy.initialized"
+            ]
+        );
     }
 
     #[test]
@@ -8415,22 +11031,67 @@ mod tests {
         let db = Db::open(&path).unwrap();
         assert!(db.global_policy().sandbox, "a fresh install has them on");
         let bot = db.create_bot("Ada", "#fff", "waddle", "codex", None, false);
-        db.set_bot_override(&bot.id, Some(&Override { timeout_minutes: Some(3), ..Default::default() }));
+        db.set_bot_override(
+            &bot.id,
+            Some(&Override {
+                timeout_minutes: Some(3),
+                ..Default::default()
+            }),
+        );
         // As saved before ADR 0055: no `sandbox` in the policy.
         let mut p = serde_json::to_value(db.global_policy()).unwrap();
         p.as_object_mut().unwrap().remove("sandbox");
-        db.c().execute("UPDATE settings SET value = ? WHERE key = 'policy'", [p.to_string()]).unwrap();
-        let sandbox = MIGRATIONS.iter().position(|m| std::ptr::fn_addr_eq(*m, migrate_sandbox as fn(&Connection, bool) -> rusqlite::Result<()>)).unwrap();
-        db.c().execute_batch(&format!("PRAGMA user_version = {sandbox};")).unwrap();
+        db.c()
+            .execute(
+                "UPDATE settings SET value = ? WHERE key = 'policy'",
+                [p.to_string()],
+            )
+            .unwrap();
+        let sandbox = MIGRATIONS
+            .iter()
+            .position(|m| {
+                std::ptr::fn_addr_eq(
+                    *m,
+                    migrate_sandbox as fn(&Connection, bool) -> rusqlite::Result<()>,
+                )
+            })
+            .unwrap();
+        db.c()
+            .execute_batch(&format!("PRAGMA user_version = {sandbox};"))
+            .unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
         assert!(!db.global_policy().sandbox);
-        assert_eq!((db.effective_policy(&bot.id).sandbox, db.effective_policy(&bot.id).timeout_minutes), (false, 3), "its Bots follow it");
-        let e = all_events(&db).into_iter().find(|e| e.action == "policy.sandbox_initialized").unwrap();
-        assert_eq!((e.actor_kind.as_str(), e.target_id.as_deref(), e.details["sandbox"].as_bool()), ("system", Some("global"), Some(false)));
+        assert_eq!(
+            (
+                db.effective_policy(&bot.id).sandbox,
+                db.effective_policy(&bot.id).timeout_minutes
+            ),
+            (false, 3),
+            "its Bots follow it"
+        );
+        let e = all_events(&db)
+            .into_iter()
+            .find(|e| e.action == "policy.sandbox_initialized")
+            .unwrap();
+        assert_eq!(
+            (
+                e.actor_kind.as_str(),
+                e.target_id.as_deref(),
+                e.details["sandbox"].as_bool()
+            ),
+            ("system", Some("global"), Some(false))
+        );
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(all_events(&db).iter().filter(|e| e.action == "policy.sandbox_initialized").count(), 1, "once");
+        assert_eq!(
+            all_events(&db)
+                .iter()
+                .filter(|e| e.action == "policy.sandbox_initialized")
+                .count(),
+            1,
+            "once"
+        );
     }
 
     macro_rules! undo_audit_actors {
@@ -8460,8 +11121,11 @@ mod tests {
     const UNDO_AUDIT_ACTORS: &str = concat!(undo_last_login!(), undo_audit_actors!());
 
     /// Rewinds a database to before bot ACLs, so a test can set `user_version` lower.
-    const UNDO_BOT_ACLS: &str =
-        concat!(undo_last_login!(), undo_audit_actors!(), " DROP TABLE bot_grants; DROP INDEX bots_owner; ALTER TABLE bots DROP COLUMN visibility; ALTER TABLE bots DROP COLUMN owner_id;");
+    const UNDO_BOT_ACLS: &str = concat!(
+        undo_last_login!(),
+        undo_audit_actors!(),
+        " DROP TABLE bot_grants; DROP INDEX bots_owner; ALTER TABLE bots DROP COLUMN visibility; ALTER TABLE bots DROP COLUMN owner_id;"
+    );
 
     #[test]
     fn upgrade_keeps_old_audit_rows_and_records_new_actors() {
@@ -8469,7 +11133,9 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let bot = db.create_bot("Kept", "#fff", "waddle", "claude", None, true);
         let queued = db.add_message(&bot.id, "user", "hi", None, false, Some("queued"));
-        db.c().execute_batch(&format!("{UNDO_AUDIT_ACTORS} PRAGMA user_version = 5;")).unwrap();
+        db.c()
+            .execute_batch(&format!("{UNDO_AUDIT_ACTORS} PRAGMA user_version = 5;"))
+            .unwrap();
         // A row as version 5 wrote it.
         db.c()
             .execute(
@@ -8479,17 +11145,45 @@ mod tests {
             .unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
-        let v: i64 = db.c().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v: i64 = db
+            .c()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, MIGRATIONS.len() as i64);
         let rows = all_events(&db);
-        let upgraded = rows.iter().find(|e| e.action == "audit.schema_upgraded").unwrap();
+        let upgraded = rows
+            .iter()
+            .find(|e| e.action == "audit.schema_upgraded")
+            .unwrap();
         let old = rows.iter().find(|e| e.action == "bot.created").unwrap();
-        assert_eq!((upgraded.action.as_str(), upgraded.actor_id.as_deref()), ("audit.schema_upgraded", Some("migration")));
-        assert_eq!(upgraded.details["added"].as_array().map(Vec::len), Some(AUDIT_ACTOR_COLUMNS.len()));
-        assert_eq!((old.actor_id.as_deref(), old.actor_name.as_deref()), (Some("operator"), Some("Owner")), "old rows stay as written");
-        assert_eq!((&old.actor_email, &old.auth_method, &old.idp, &old.session_id, &old.on_behalf_of), (&None, &None, &None, &None, &None));
+        assert_eq!(
+            (upgraded.action.as_str(), upgraded.actor_id.as_deref()),
+            ("audit.schema_upgraded", Some("migration"))
+        );
+        assert_eq!(
+            upgraded.details["added"].as_array().map(Vec::len),
+            Some(AUDIT_ACTOR_COLUMNS.len())
+        );
+        assert_eq!(
+            (old.actor_id.as_deref(), old.actor_name.as_deref()),
+            (Some("operator"), Some("Owner")),
+            "old rows stay as written"
+        );
+        assert_eq!(
+            (
+                &old.actor_email,
+                &old.auth_method,
+                &old.idp,
+                &old.session_id,
+                &old.on_behalf_of
+            ),
+            (&None, &None, &None, &None, &None)
+        );
         let m = db.message(queued.id).unwrap();
-        assert!(m.requested_by.is_none(), "messages queued before the upgrade have no requester");
+        assert!(
+            m.requested_by.is_none(),
+            "messages queued before the upgrade have no requester"
+        );
 
         let who = audit::Who {
             actor: audit::Actor {
@@ -8504,26 +11198,63 @@ mod tests {
             source: audit::Source::default(),
         };
         db.set_requested_by(m.id, &who);
-        assert_eq!(db.message(m.id).unwrap().requested_by.map(|w| w.actor), Some(who.actor.clone()));
+        assert_eq!(
+            db.message(m.id).unwrap().requested_by.map(|w| w.actor),
+            Some(who.actor.clone())
+        );
         db.record(&who.event("bot.updated"));
         let e = &all_events(&db)[0];
         assert_eq!(
-            (e.actor_email.as_deref(), e.actor_role.as_deref(), e.auth_method.as_deref(), e.idp.as_deref(), e.idp_provider.as_deref(), e.session_id.as_deref()),
-            (Some("ada@example.com"), Some("admin"), Some("sso"), Some("entra"), Some("work"), Some("s1"))
+            (
+                e.actor_email.as_deref(),
+                e.actor_role.as_deref(),
+                e.auth_method.as_deref(),
+                e.idp.as_deref(),
+                e.idp_provider.as_deref(),
+                e.session_id.as_deref()
+            ),
+            (
+                Some("ada@example.com"),
+                Some("admin"),
+                Some("sso"),
+                Some("entra"),
+                Some("work"),
+                Some("s1")
+            )
         );
-        assert!(db.c().execute("UPDATE audit_events SET actor_email = 'x'", []).is_err(), "still append-only");
+        assert!(
+            db.c()
+                .execute("UPDATE audit_events SET actor_email = 'x'", [])
+                .is_err(),
+            "still append-only"
+        );
     }
 
     #[test]
     fn actor_text_is_scrubbed_and_clipped() {
         let db = Db::open(&temp_path("actor-scrub").join("app.sqlite")).unwrap();
-        let actor = audit::Actor { name: Some("Ada password=hunter2".into()), email: Some(format!("{}@example.com", "a".repeat(300))), ..audit::Actor::operator() };
-        let source = audit::Source { ip: None, user_agent: Some("curl --token sbs_0123456789abcdef0123456789".into()) };
+        let actor = audit::Actor {
+            name: Some("Ada password=hunter2".into()),
+            email: Some(format!("{}@example.com", "a".repeat(300))),
+            ..audit::Actor::operator()
+        };
+        let source = audit::Source {
+            ip: None,
+            user_agent: Some("curl --token sbs_0123456789abcdef0123456789".into()),
+        };
         db.record(&audit::Who { actor, source }.event("x.y"));
         let e = &all_events(&db)[0];
         assert_eq!(e.actor_name.as_deref(), Some("Ada password=[redacted]"));
-        assert!(!e.user_agent.as_deref().unwrap().contains("sbs_0123"), "{:?}", e.user_agent);
-        assert_eq!(e.actor_email.as_deref().unwrap().chars().count(), 255, "254 and an ellipsis");
+        assert!(
+            !e.user_agent.as_deref().unwrap().contains("sbs_0123"),
+            "{:?}",
+            e.user_agent
+        );
+        assert_eq!(
+            e.actor_email.as_deref().unwrap().chars().count(),
+            255,
+            "254 and an ellipsis"
+        );
     }
 
     #[test]
@@ -8532,13 +11263,38 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let seen = db.create_user(None, None, "Seen", Role::Member).unwrap();
         let never = db.create_user(None, None, "Never", Role::Member).unwrap();
-        let s = db.create_session(&NewSession { user_id: &seen.id, token_hash: "h", kind: "token", method: "sso", idp_subject: None, idp_provider: Some("work"), label: None, ip: None, user_agent: None, expires_at: now() + 1000, mfa: None });
-        assert_eq!(db.user(&seen.id).unwrap().last_login_at, Some(s.created_at), "a new session stamps it");
-        db.c().execute_batch(&format!("{UNDO_LAST_LOGIN} PRAGMA user_version = 7;")).unwrap();
+        let s = db.create_session(&NewSession {
+            user_id: &seen.id,
+            token_hash: "h",
+            kind: "token",
+            method: "sso",
+            idp_subject: None,
+            idp_provider: Some("work"),
+            label: None,
+            ip: None,
+            user_agent: None,
+            expires_at: now() + 1000,
+            mfa: None,
+        });
+        assert_eq!(
+            db.user(&seen.id).unwrap().last_login_at,
+            Some(s.created_at),
+            "a new session stamps it"
+        );
+        db.c()
+            .execute_batch(&format!("{UNDO_LAST_LOGIN} PRAGMA user_version = 7;"))
+            .unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
         let u = db.user(&seen.id).unwrap();
-        assert_eq!((u.last_login_at, u.last_login_method.as_deref(), u.last_login_idp_provider.as_deref()), (Some(s.created_at), Some("sso"), Some("work")));
+        assert_eq!(
+            (
+                u.last_login_at,
+                u.last_login_method.as_deref(),
+                u.last_login_idp_provider.as_deref()
+            ),
+            (Some(s.created_at), Some("sso"), Some("work"))
+        );
         assert_eq!(db.user(&never.id).unwrap().last_login_at, None);
     }
 
@@ -8547,32 +11303,81 @@ mod tests {
         let path = temp_path("acl-upgrade").join("app.sqlite");
         let db = Db::open(&path).unwrap();
         let old = db.create_bot("Old", "#fff", "waddle", "claude", None, true);
-        db.c().execute_batch(&format!("{UNDO_BOT_ACLS} PRAGMA user_version = 4;")).unwrap();
+        db.c()
+            .execute_batch(&format!("{UNDO_BOT_ACLS} PRAGMA user_version = 4;"))
+            .unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
         let b = db.bot(&old.id).unwrap();
-        assert_eq!((b.owner_id.as_str(), b.visibility), ("operator", Visibility::Shared));
-        let e = all_events(&db).into_iter().find(|e| e.action == "bot.acl_initialized").unwrap();
-        assert_eq!((e.action.as_str(), e.actor_id.as_deref(), e.details["bots"].as_i64()), ("bot.acl_initialized", Some("migration"), Some(1)));
+        assert_eq!(
+            (b.owner_id.as_str(), b.visibility),
+            ("operator", Visibility::Shared)
+        );
+        let e = all_events(&db)
+            .into_iter()
+            .find(|e| e.action == "bot.acl_initialized")
+            .unwrap();
+        assert_eq!(
+            (
+                e.action.as_str(),
+                e.actor_id.as_deref(),
+                e.details["bots"].as_i64()
+            ),
+            ("bot.acl_initialized", Some("migration"), Some(1))
+        );
 
         // Grants: one per user and Bot, gone with the Bot, and the schema refuses unknown words.
-        let u = db.create_user(None, Some("g@example.com"), "G", Role::Member).unwrap();
-        let mine = db.create_bot_owned("Mine", "#fff", "waddle", "claude", None, false, &u.id, Visibility::Private);
-        assert_eq!((mine.owner_id.as_str(), mine.visibility), (u.id.as_str(), Visibility::Private));
-        assert_eq!(db.set_grant(&old.id, &u.id, Grant::Viewer, "operator"), None);
-        assert_eq!(db.set_grant(&old.id, &u.id, Grant::Operator, "operator"), Some(Grant::Viewer));
+        let u = db
+            .create_user(None, Some("g@example.com"), "G", Role::Member)
+            .unwrap();
+        let mine = db.create_bot_owned(
+            "Mine",
+            "#fff",
+            "waddle",
+            "claude",
+            None,
+            false,
+            &u.id,
+            Visibility::Private,
+        );
+        assert_eq!(
+            (mine.owner_id.as_str(), mine.visibility),
+            (u.id.as_str(), Visibility::Private)
+        );
+        assert_eq!(
+            db.set_grant(&old.id, &u.id, Grant::Viewer, "operator"),
+            None
+        );
+        assert_eq!(
+            db.set_grant(&old.id, &u.id, Grant::Operator, "operator"),
+            Some(Grant::Viewer)
+        );
         assert_eq!(db.grants(&old.id).len(), 1);
         assert_eq!(db.user_grants(&u.id).get(&old.id), Some(&Grant::Operator));
         let c = db.c();
-        assert!(c.execute("UPDATE bots SET visibility = 'public' WHERE id = ?", [&old.id]).is_err());
-        assert!(c.execute("UPDATE bot_grants SET level = 'owner'", []).is_err());
+        assert!(
+            c.execute(
+                "UPDATE bots SET visibility = 'public' WHERE id = ?",
+                [&old.id]
+            )
+            .is_err()
+        );
+        assert!(
+            c.execute("UPDATE bot_grants SET level = 'owner'", [])
+                .is_err()
+        );
         drop(c);
         db.set_bot_visibility(&old.id, Visibility::Private);
         assert!(db.set_bot_owner_capped(&old.id, &u.id, None));
-        assert_eq!(db.bot(&old.id).map(|b| (b.owner_id, b.visibility)), Some((u.id.clone(), Visibility::Private)));
+        assert_eq!(
+            db.bot(&old.id).map(|b| (b.owner_id, b.visibility)),
+            Some((u.id.clone(), Visibility::Private))
+        );
         assert_eq!(db.remove_grant(&old.id, &u.id), Some(Grant::Operator));
         assert_eq!(db.remove_grant(&old.id, &u.id), None);
-        let other = db.create_user(None, Some("o@example.com"), "O", Role::Member).unwrap();
+        let other = db
+            .create_user(None, Some("o@example.com"), "O", Role::Member)
+            .unwrap();
         db.set_grant(&mine.id, &other.id, Grant::Viewer, &u.id);
         assert_eq!(db.grants(&mine.id).len(), 1);
         db.delete_bot(&mine.id);
@@ -8582,17 +11387,50 @@ mod tests {
     #[test]
     fn audit_is_append_only() {
         let db = Db::open(&temp_path("audit").join("app.sqlite")).unwrap();
-        db.record(&audit::Event::new(audit::Actor::operator(), "policy.updated").target("policy", "global").details(json!({ "mode": "ask" })));
-        assert!(db.c().execute("UPDATE audit_events SET actor_id = 'x'", []).is_err());
-        assert!(db.c().execute("UPDATE audit_events SET details = '{}' WHERE action = 'policy.updated'", []).is_err());
+        db.record(
+            &audit::Event::new(audit::Actor::operator(), "policy.updated")
+                .target("policy", "global")
+                .details(json!({ "mode": "ask" })),
+        );
+        assert!(
+            db.c()
+                .execute("UPDATE audit_events SET actor_id = 'x'", [])
+                .is_err()
+        );
+        assert!(
+            db.c()
+                .execute(
+                    "UPDATE audit_events SET details = '{}' WHERE action = 'policy.updated'",
+                    []
+                )
+                .is_err()
+        );
         assert!(db.c().execute("DELETE FROM audit_events", []).is_err());
-        assert!(db.c().execute("DELETE FROM audit_events WHERE action = 'policy.updated'", []).is_err());
+        assert!(
+            db.c()
+                .execute(
+                    "DELETE FROM audit_events WHERE action = 'policy.updated'",
+                    []
+                )
+                .is_err()
+        );
         // No retention set: nothing can be deleted, however old.
-        assert!(db.c().execute("DELETE FROM audit_events WHERE at < ?", [now() + 60_000]).is_err());
+        assert!(
+            db.c()
+                .execute("DELETE FROM audit_events WHERE at < ?", [now() + 60_000])
+                .is_err()
+        );
         assert_eq!(db.prune_audit().unwrap(), 0);
         assert_eq!(all_events(&db).len(), 2);
         let e = &all_events(&db)[0];
-        assert_eq!((e.actor_kind.as_str(), e.actor_id.as_deref(), e.target_id.as_deref()), ("user", Some("operator"), Some("global")));
+        assert_eq!(
+            (
+                e.actor_kind.as_str(),
+                e.actor_id.as_deref(),
+                e.target_id.as_deref()
+            ),
+            ("user", Some("operator"), Some("global"))
+        );
     }
 
     #[test]
@@ -8606,7 +11444,11 @@ mod tests {
         let (n, end) = db.prune_chat_batch(cutoff, None, 4).unwrap();
         assert_eq!(n, 4, "a batch never goes past its limit");
         let left = db.messages(&bot.id, 10);
-        assert_eq!((left.len(), left[0].created_at < now() - 39 * day), (1, true), "the oldest went first");
+        assert_eq!(
+            (left.len(), left[0].created_at < now() - 39 * day),
+            (1, true),
+            "the oldest went first"
+        );
         assert_eq!(db.prune_chat_batch(cutoff, end, 4).unwrap().0, 1);
         assert_eq!(db.prune_chat_batch(cutoff, None, 4).unwrap(), (0, None));
 
@@ -8617,18 +11459,30 @@ mod tests {
         db.add_messages_at(&bot.id, 2, now() - 50 * day, None);
         let (n, end) = db.prune_chat_batch(cutoff, None, 1).unwrap();
         let (n2, end2) = db.prune_chat_batch(cutoff, end, 1).unwrap();
-        assert_eq!((n, n2, db.prune_chat_batch(cutoff, end2, 1).unwrap().0), (1, 1, 0));
+        assert_eq!(
+            (n, n2, db.prune_chat_batch(cutoff, end2, 1).unwrap().0),
+            (1, 1, 0)
+        );
         assert!(end.is_some() && end < end2, "the cursor moves forward");
-        assert!(!db.delete_bot_unless_held(&held.id), "a held Bot isn't deleted");
+        assert!(
+            !db.delete_bot_unless_held(&held.id),
+            "a held Bot isn't deleted"
+        );
         assert_eq!(db.message_count(&held.id), 3);
         let to = db.create_bot("To", "#fff", "waddle", "claude", None, false);
         db.add_messages_at(&to.id, 1, now(), Some(&held.id));
-        assert!(db.bot_chat_held(&to.id) && !db.delete_bot_unless_held(&to.id), "nor one a held Bot wrote to");
+        assert!(
+            db.bot_chat_held(&to.id) && !db.delete_bot_unless_held(&to.id),
+            "nor one a held Bot wrote to"
+        );
         assert!(!db.bot_chat_held(&bot.id));
         db.delete_retention_hold(&held.id);
         assert!(db.delete_bot_unless_held(&to.id));
         assert!(db.delete_bot_unless_held(&held.id));
-        assert!(db.put_retention_hold(&held.id, "too late", None).is_none(), "no hold on a Bot that's gone");
+        assert!(
+            db.put_retention_hold(&held.id, "too late", None).is_none(),
+            "no hold on a Bot that's gone"
+        );
 
         db.set_chat_retention(Some(90));
         assert_eq!(db.chat_retention(), Some(90));
@@ -8638,7 +11492,10 @@ mod tests {
         db.put_retention_hold(&bot.id, "hold", Some("u1")).unwrap();
         assert_eq!(db.retention_holds().len(), 1);
         db.delete_bot(&bot.id);
-        assert!(db.retention_holds().is_empty(), "a Bot deleted under the database's feet takes its hold");
+        assert!(
+            db.retention_holds().is_empty(),
+            "a Bot deleted under the database's feet takes its hold"
+        );
     }
 
     #[test]
@@ -8653,7 +11510,11 @@ mod tests {
         db.set_audit_retention(Some(30));
         assert_eq!(db.audit_retention(), Some(30));
         // A cutoff inside the window would delete young rows, so the whole statement fails.
-        assert!(db.c().execute("DELETE FROM audit_events WHERE at < ?", [now()]).is_err());
+        assert!(
+            db.c()
+                .execute("DELETE FROM audit_events WHERE at < ?", [now()])
+                .is_err()
+        );
         assert!(db.c().execute("DELETE FROM audit_events", []).is_err());
         // Rows on both sides of the cutoff, to the millisecond: pruning never trips the trigger.
         let start = now();
@@ -8663,13 +11524,30 @@ mod tests {
                 .execute("INSERT INTO audit_events (at, actor_kind, action, outcome) VALUES (?, 'system', 'edge.event', 'success')", [edge + ms])
                 .unwrap();
         }
-        assert!(db.prune_audit().unwrap() >= 21, "the 40-day-old row and the edge rows older than a second");
+        assert!(
+            db.prune_audit().unwrap() >= 21,
+            "the 40-day-old row and the edge rows older than a second"
+        );
         // The cutoff moves with the clock, so a slow runner ages more edge rows out.
         let late = (now() - start).max(1_000);
-        let left: Vec<i64> = all_events(&db).iter().filter(|e| e.action == "edge.event").map(|e| e.at).collect();
-        assert!(left.iter().all(|&at| at > edge - 1_000), "rows past the window are gone");
-        let young = (-2_000..=2_000).step_by(50).filter(|&ms| ms >= late).count();
-        assert_eq!(left.iter().filter(|&&at| at >= edge + late).count(), young, "rows inside the window stay");
+        let left: Vec<i64> = all_events(&db)
+            .iter()
+            .filter(|e| e.action == "edge.event")
+            .map(|e| e.at)
+            .collect();
+        assert!(
+            left.iter().all(|&at| at > edge - 1_000),
+            "rows past the window are gone"
+        );
+        let young = (-2_000..=2_000)
+            .step_by(50)
+            .filter(|&ms| ms >= late)
+            .count();
+        assert_eq!(
+            left.iter().filter(|&&at| at >= edge + late).count(),
+            young,
+            "rows inside the window stay"
+        );
         assert!(all_events(&db).iter().all(|e| e.action != "old.event"));
         db.set_audit_retention(None);
         assert_eq!(db.audit_retention(), None);
@@ -8679,10 +11557,22 @@ mod tests {
     fn secrets_never_reach_the_audit_table() {
         let db = Db::open(&temp_path("scrub").join("app.sqlite")).unwrap();
         let subject = r#"mcp__chat__send {"message":"hi there","token":"hunter3"}"#;
-        let e = audit::Event::new(audit::Actor::operator(), "x.y").details(json!({ "token": "abc", "cmd": "curl -u admin:hunter2 https://x", "subject": subject }));
+        let e = audit::Event::new(audit::Actor::operator(), "x.y").details(
+            json!({ "token": "abc", "cmd": "curl -u admin:hunter2 https://x", "subject": subject }),
+        );
         db.record(&e);
-        let raw: String = db.c().query_row("SELECT details FROM audit_events WHERE action = 'x.y'", [], |r| r.get(0)).unwrap();
-        assert!(!raw.contains("abc") && !raw.contains("hunter2") && !raw.contains("hunter3"), "{raw}");
+        let raw: String = db
+            .c()
+            .query_row(
+                "SELECT details FROM audit_events WHERE action = 'x.y'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !raw.contains("abc") && !raw.contains("hunter2") && !raw.contains("hunter3"),
+            "{raw}"
+        );
         assert!(raw.contains("hi there"), "{raw}");
     }
 
@@ -8712,24 +11602,78 @@ mod tests {
         let rows = db.audit_events(&audit::Filter::default(), 10, true);
         let view: Vec<_> = rows
             .iter()
-            .map(|e| (e.action.as_str(), e.actor_kind.as_str(), e.actor_id.as_deref(), e.target_type.as_deref(), e.target_id.as_deref(), e.outcome.as_str()))
+            .map(|e| {
+                (
+                    e.action.as_str(),
+                    e.actor_kind.as_str(),
+                    e.actor_id.as_deref(),
+                    e.target_type.as_deref(),
+                    e.target_id.as_deref(),
+                    e.outcome.as_str(),
+                )
+            })
             .collect();
         assert_eq!(
             view,
             [
-                ("policy.initialized", "system", None, Some("policy"), Some("global"), "success"),
-                ("policy.updated", "user", Some("operator"), Some("policy"), Some("global"), "success"),
-                ("approval.requested", "bot", Some("b1"), Some("approval"), Some("a1"), "success"),
+                (
+                    "policy.initialized",
+                    "system",
+                    None,
+                    Some("policy"),
+                    Some("global"),
+                    "success"
+                ),
+                (
+                    "policy.updated",
+                    "user",
+                    Some("operator"),
+                    Some("policy"),
+                    Some("global"),
+                    "success"
+                ),
+                (
+                    "approval.requested",
+                    "bot",
+                    Some("b1"),
+                    Some("approval"),
+                    Some("a1"),
+                    "success"
+                ),
                 ("policy.denied", "system", None, None, None, "denied"),
-                ("rule.added", "user", Some("operator"), Some("rule"), Some("r1"), "success"),
-                ("audit.schema_upgraded", "system", Some("migration"), Some("audit"), Some("actors"), "success"),
-                ("policy.sandbox_initialized", "system", Some("migration"), Some("policy"), Some("global"), "success"),
+                (
+                    "rule.added",
+                    "user",
+                    Some("operator"),
+                    Some("rule"),
+                    Some("r1"),
+                    "success"
+                ),
+                (
+                    "audit.schema_upgraded",
+                    "system",
+                    Some("migration"),
+                    Some("audit"),
+                    Some("actors"),
+                    "success"
+                ),
+                (
+                    "policy.sandbox_initialized",
+                    "system",
+                    Some("migration"),
+                    Some("policy"),
+                    Some("global"),
+                    "success"
+                ),
             ]
         );
         assert_eq!(rows[1].details, json!({ "after": 1 }));
         // Still append-only, and ids keep counting up.
         assert!(db.c().execute("DELETE FROM audit_events", []).is_err());
-        db.record(&audit::Event::new(audit::Actor::system("server"), "server.started"));
+        db.record(&audit::Event::new(
+            audit::Actor::system("server"),
+            "server.started",
+        ));
         assert!(all_events(&db)[0].id > rows.last().unwrap().id);
     }
 
@@ -8745,8 +11689,14 @@ mod tests {
         drop(db);
         let db = Db::open(&path).unwrap();
         assert_eq!(db.bot(&bot.id).map(|b| b.name), Some("Kept".into()));
-        assert!(db.users().is_empty(), "the owner is made by botd at start, not by the migration");
-        let v: i64 = db.c().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert!(
+            db.users().is_empty(),
+            "the owner is made by botd at start, not by the migration"
+        );
+        let v: i64 = db
+            .c()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, MIGRATIONS.len() as i64);
         // The schema refuses what the code never writes.
         let c = db.c();
@@ -8769,40 +11719,96 @@ mod tests {
         drop(db);
         let db = Db::open(&path).unwrap();
         let (i, found) = db.identity("https://idp.example", "s1").unwrap();
-        assert_eq!((found.id.as_str(), i.provider.as_str()), (u.id.as_str(), "oidc"));
+        assert_eq!(
+            (found.id.as_str(), i.provider.as_str()),
+            (u.id.as_str(), "oidc")
+        );
     }
 
     #[test]
     fn identities_link_once_and_keep_the_users_own_in_step() {
         let db = Db::open(&temp_path("identities").join("app.sqlite")).unwrap();
-        let a = db.create_user(None, Some("a@example.com"), "A", Role::Member).unwrap();
+        let a = db
+            .create_user(None, Some("a@example.com"), "A", Role::Member)
+            .unwrap();
         let b = db.create_user(None, None, "B", Role::Member).unwrap();
-        let new = |subject: &'static str| NewIdentity { provider: "entra", issuer: "https://login.example/t1/v2.0", subject, tenant: Some("t1"), email: None, created_by: Some("operator") };
+        let new = |subject: &'static str| NewIdentity {
+            provider: "entra",
+            issuer: "https://login.example/t1/v2.0",
+            subject,
+            tenant: Some("t1"),
+            email: None,
+            created_by: Some("operator"),
+        };
         let first = db.link_identity(&a.id, &new("oid-1")).unwrap();
         let second = db.link_identity(&a.id, &new("oid-2")).unwrap();
-        assert!(db.link_identity(&b.id, &new("oid-1")).is_err(), "one user per identity");
+        assert!(
+            db.link_identity(&b.id, &new("oid-1")).is_err(),
+            "one user per identity"
+        );
         assert!(db.link_identity(&a.id, &new("oid-1")).is_err(), "and once");
-        assert_eq!(db.user(&a.id).unwrap().idp_subject.as_deref(), Some("oid-1"), "the first is the user's own");
-        assert_eq!(db.identity("https://login.example/t1/v2.0", "oid-2").map(|(i, u)| (i.id, u.id)), Some((second.id.clone(), a.id.clone())));
-        assert!(db.identity("https://login.example/t2/v2.0", "oid-2").is_none(), "the issuer is part of the key");
+        assert_eq!(
+            db.user(&a.id).unwrap().idp_subject.as_deref(),
+            Some("oid-1"),
+            "the first is the user's own"
+        );
+        assert_eq!(
+            db.identity("https://login.example/t1/v2.0", "oid-2")
+                .map(|(i, u)| (i.id, u.id)),
+            Some((second.id.clone(), a.id.clone()))
+        );
+        assert!(
+            db.identity("https://login.example/t2/v2.0", "oid-2")
+                .is_none(),
+            "the issuer is part of the key"
+        );
         db.touch_identity(&first.id, Some("new@example.com"), 42);
         db.touch_identity(&first.id, None, 43);
-        let touched = db.identities(&a.id).into_iter().find(|i| i.id == first.id).unwrap();
-        assert_eq!((touched.email.as_deref(), touched.last_login_at), (Some("new@example.com"), Some(43)));
+        let touched = db
+            .identities(&a.id)
+            .into_iter()
+            .find(|i| i.id == first.id)
+            .unwrap();
+        assert_eq!(
+            (touched.email.as_deref(), touched.last_login_at),
+            (Some("new@example.com"), Some(43))
+        );
 
-        assert!(db.unlink_identity(&b.id, &first.id).is_none(), "only the owner's");
-        assert_eq!(db.unlink_identity(&a.id, &first.id).map(|i| i.subject), Some("oid-1".into()));
-        assert_eq!(db.user(&a.id).unwrap().idp_subject.as_deref(), Some("oid-2"), "the next one takes over");
+        assert!(
+            db.unlink_identity(&b.id, &first.id).is_none(),
+            "only the owner's"
+        );
+        assert_eq!(
+            db.unlink_identity(&a.id, &first.id).map(|i| i.subject),
+            Some("oid-1".into())
+        );
+        assert_eq!(
+            db.user(&a.id).unwrap().idp_subject.as_deref(),
+            Some("oid-2"),
+            "the next one takes over"
+        );
         db.unlink_identity(&a.id, &second.id).unwrap();
         let u = db.user(&a.id).unwrap();
         assert_eq!((u.idp_issuer, u.idp_subject), (None, None));
 
         // Just in time: a user and their identity together, never merged by email.
-        let jit = |email: Option<&'static str>, subject: &'static str| db.create_sso_user(email, "J", Role::Readonly, &new(subject));
-        assert_eq!(jit(Some("A@example.com"), "oid-3").unwrap_err(), JitError::EmailTaken);
-        assert!(db.identity("https://login.example/t1/v2.0", "oid-3").is_none(), "nothing half made");
+        let jit = |email: Option<&'static str>, subject: &'static str| {
+            db.create_sso_user(email, "J", Role::Readonly, &new(subject))
+        };
+        assert_eq!(
+            jit(Some("A@example.com"), "oid-3").unwrap_err(),
+            JitError::EmailTaken
+        );
+        assert!(
+            db.identity("https://login.example/t1/v2.0", "oid-3")
+                .is_none(),
+            "nothing half made"
+        );
         let j = jit(Some("j@example.com"), "oid-3").unwrap();
-        assert_eq!((j.role, j.idp_subject.as_deref()), (Role::Readonly, Some("oid-3")));
+        assert_eq!(
+            (j.role, j.idp_subject.as_deref()),
+            (Role::Readonly, Some("oid-3"))
+        );
         assert_eq!(jit(None, "oid-3").unwrap_err(), JitError::IdentityTaken);
     }
 
@@ -8813,11 +11819,26 @@ mod tests {
         db.record(&ev(audit::Actor::operator(), "bot.created").bot("b1"));
         db.record(&ev(audit::Actor::bot(Some("b1"), Some("A")), "routine.created").bot("b1"));
         db.record(&ev(audit::Actor::bot(Some("b2"), None), "routine.deleted").bot("b2"));
-        db.record(&ev(audit::Actor::operator(), "auth.login_failed").outcome(audit::Outcome::Failure));
-        let q = |f: audit::Filter| db.audit_events(&f, 100, false).into_iter().map(|e| e.action).collect::<Vec<_>>();
-        let f = |k: &str, v: &str| audit::Filter::from_query(&[(k.to_string(), v.to_string())].into()).unwrap();
-        assert_eq!(q(f("action", "routine.*")), ["routine.deleted", "routine.created"]);
-        assert_eq!(q(f("action", "bot.created,auth.login_failed")), ["auth.login_failed", "bot.created"]);
+        db.record(
+            &ev(audit::Actor::operator(), "auth.login_failed").outcome(audit::Outcome::Failure),
+        );
+        let q = |f: audit::Filter| {
+            db.audit_events(&f, 100, false)
+                .into_iter()
+                .map(|e| e.action)
+                .collect::<Vec<_>>()
+        };
+        let f = |k: &str, v: &str| {
+            audit::Filter::from_query(&[(k.to_string(), v.to_string())].into()).unwrap()
+        };
+        assert_eq!(
+            q(f("action", "routine.*")),
+            ["routine.deleted", "routine.created"]
+        );
+        assert_eq!(
+            q(f("action", "bot.created,auth.login_failed")),
+            ["auth.login_failed", "bot.created"]
+        );
         assert_eq!(q(f("actor", "bot:b1")), ["routine.created"]);
         assert_eq!(q(f("actor", "bot")).len(), 2);
         assert_eq!(q(f("outcome", "failure")), ["auth.login_failed"]);
@@ -8825,15 +11846,37 @@ mod tests {
         assert_eq!(q(f("to", "2000-01-01")).len(), 0);
         assert_eq!(q(f("from", "2000-01-01")).len(), 5);
         let newest = all_events(&db)[0].id;
-        assert_eq!(q(audit::Filter { before: Some(newest), ..Default::default() }).len(), 4);
-        let oldest_first = db.audit_events(&audit::Filter { after: Some(newest - 2), ..Default::default() }, 100, true);
-        assert_eq!(oldest_first.iter().map(|e| e.action.as_str()).collect::<Vec<_>>(), ["routine.deleted", "auth.login_failed"]);
+        assert_eq!(
+            q(audit::Filter {
+                before: Some(newest),
+                ..Default::default()
+            })
+            .len(),
+            4
+        );
+        let oldest_first = db.audit_events(
+            &audit::Filter {
+                after: Some(newest - 2),
+                ..Default::default()
+            },
+            100,
+            true,
+        );
+        assert_eq!(
+            oldest_first
+                .iter()
+                .map(|e| e.action.as_str())
+                .collect::<Vec<_>>(),
+            ["routine.deleted", "auth.login_failed"]
+        );
     }
 
     #[test]
     fn audit_filters_by_person_and_sign_in() {
         let db = Db::open(&temp_path("actor-filters").join("app.sqlite")).unwrap();
-        let ada = db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
+        let ada = db
+            .create_user(None, Some("ada@example.com"), "Ada", Role::Member)
+            .unwrap();
         let person = |method: &str, idp: Option<&str>, session: &str| audit::Actor {
             id: Some(ada.id.clone()),
             email: Some("Ada@Example.com".into()),
@@ -8849,36 +11892,82 @@ mod tests {
         let ev = |actor: audit::Actor, action: &str| audit::Event::new(actor, action);
         db.record(&ev(person("sso", Some("work"), "s1"), "bot.created"));
         db.record(&ev(person("password", None, "s2"), "policy.updated"));
-        db.record(&ev(audit::Actor::bot(Some("b1"), Some("A")).method("bot_token").on_behalf_of(&ada.id), "approval.requested"));
-        db.record(&ev(audit::Actor::system("scheduler").on_behalf_of(&ada.id), "routine.fired"));
+        db.record(&ev(
+            audit::Actor::bot(Some("b1"), Some("A"))
+                .method("bot_token")
+                .on_behalf_of(&ada.id),
+            "approval.requested",
+        ));
+        db.record(&ev(
+            audit::Actor::system("scheduler").on_behalf_of(&ada.id),
+            "routine.fired",
+        ));
         db.record(&ev(gone, "auth.login"));
-        let q = |f: audit::Filter| db.audit_events(&f, 100, false).into_iter().map(|e| e.action).collect::<Vec<_>>();
+        let q = |f: audit::Filter| {
+            db.audit_events(&f, 100, false)
+                .into_iter()
+                .map(|e| e.action)
+                .collect::<Vec<_>>()
+        };
         let f = |k: &str, v: &str| {
-            let mut f = audit::Filter::from_query(&[(k.to_string(), v.to_string())].into()).unwrap();
+            let mut f =
+                audit::Filter::from_query(&[(k.to_string(), v.to_string())].into()).unwrap();
             f.resolve_users(|key| db.find_user(key).map(|u| u.id));
             f
         };
-        assert_eq!(q(f("actor", &format!("user:{}", ada.id))), ["policy.updated", "bot.created"]);
-        assert_eq!(q(f("actor", "user:ada@example.com")), ["policy.updated", "bot.created"], "an email finds the user");
-        assert_eq!(q(f("actor", "user:ADA@example.com")), ["policy.updated", "bot.created"], "any case");
-        let mut old_email = audit::Filter::from_query(&[("actor".into(), "user:ada@example.com".into())].into()).unwrap();
+        assert_eq!(
+            q(f("actor", &format!("user:{}", ada.id))),
+            ["policy.updated", "bot.created"]
+        );
+        assert_eq!(
+            q(f("actor", "user:ada@example.com")),
+            ["policy.updated", "bot.created"],
+            "an email finds the user"
+        );
+        assert_eq!(
+            q(f("actor", "user:ADA@example.com")),
+            ["policy.updated", "bot.created"],
+            "any case"
+        );
+        let mut old_email =
+            audit::Filter::from_query(&[("actor".into(), "user:ada@example.com".into())].into())
+                .unwrap();
         old_email.resolve_users(|_| None);
-        assert_eq!(q(old_email), ["auth.login", "policy.updated", "bot.created"], "no such user now: matches the recorded email");
+        assert_eq!(
+            q(old_email),
+            ["auth.login", "policy.updated", "bot.created"],
+            "no such user now: matches the recorded email"
+        );
         assert_eq!(q(f("method", "sso")), ["bot.created"]);
-        assert_eq!(q(f("method", "password,bot_token")), ["approval.requested", "policy.updated"]);
+        assert_eq!(
+            q(f("method", "password,bot_token")),
+            ["approval.requested", "policy.updated"]
+        );
         assert_eq!(q(f("idpProvider", "work")), ["bot.created"]);
         assert_eq!(q(f("idp", "entra")), ["bot.created"]);
-        assert_eq!(q(f("subject", "https://login.example/t1/v2.0|oid-1")), ["bot.created"]);
+        assert_eq!(
+            q(f("subject", "https://login.example/t1/v2.0|oid-1")),
+            ["bot.created"]
+        );
         assert_eq!(q(f("session", "s2")), ["policy.updated"]);
-        assert_eq!(q(f("onBehalfOf", &ada.id)), ["routine.fired", "approval.requested"]);
-        assert_eq!(q(f("onBehalfOf", "ada@example.com")), ["routine.fired", "approval.requested"]);
+        assert_eq!(
+            q(f("onBehalfOf", &ada.id)),
+            ["routine.fired", "approval.requested"]
+        );
+        assert_eq!(
+            q(f("onBehalfOf", "ada@example.com")),
+            ["routine.fired", "approval.requested"]
+        );
     }
 
     #[test]
     fn bot_policy_inherits_and_overrides() {
         let db = Db::open(&temp_path("policy").join("app.sqlite")).unwrap();
         let bot = db.create_bot("A", "#fff", "waddle", "claude", None, true);
-        let o = Override { mode: Some(Mode::Bypass), ..Default::default() };
+        let o = Override {
+            mode: Some(Mode::Bypass),
+            ..Default::default()
+        };
         db.set_bot_override(&bot.id, Some(&o));
         assert_eq!(db.effective_policy(&bot.id).mode, Mode::Bypass);
         let mut g = db.global_policy();
@@ -8889,18 +11978,40 @@ mod tests {
         assert_eq!(db.effective_policy(&bot.id).mode, Mode::Ask);
 
         let global = db.add_rule(None, Action::Deny, "*", "*evil*", None);
-        let mine = db.add_rule(Some(&bot.id), Action::Allow, "shell", "git push", Some("note"));
+        let mine = db.add_rule(
+            Some(&bot.id),
+            Action::Allow,
+            "shell",
+            "git push",
+            Some("note"),
+        );
         assert_eq!(db.rules(Some(&bot.id)).len(), 2);
         assert_eq!(db.rules(None).len(), 1);
         db.delete_rule(&mine.id);
-        assert_eq!(db.rules(Some(&bot.id)).iter().map(|r| r.id.clone()).collect::<Vec<_>>(), [global.id]);
+        assert_eq!(
+            db.rules(Some(&bot.id))
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>(),
+            [global.id]
+        );
     }
 
     #[test]
     fn first_decision_wins() {
         let db = Db::open(&temp_path("approval").join("app.sqlite")).unwrap();
         let bot = db.create_bot("A", "#fff", "waddle", "claude", None, true);
-        let a = db.add_approval(&bot.id, "claude", "Bash", "shell", "git push", &json!({ "command": "git push" }), "git_push", "Pushes", now() + 1000);
+        let a = db.add_approval(
+            &bot.id,
+            "claude",
+            "Bash",
+            "shell",
+            "git push",
+            &json!({ "command": "git push" }),
+            "git_push",
+            "Pushes",
+            now() + 1000,
+        );
         assert_eq!(db.approvals(Some("pending"), None, 10).len(), 1);
         assert!(db.finish_approval(&a.id, "approved", "user", None, None));
         assert!(!db.finish_approval(&a.id, "denied", "user", None, None));
@@ -8911,34 +12022,100 @@ mod tests {
     #[test]
     fn scim_groups_are_unique_per_tenant_and_go_with_their_team() {
         let db = Db::open(&temp_path("scim-groups").join("app.sqlite")).unwrap();
-        let eng = db.create_scim_group("okta", Some("00g1"), "Eng", "Eng", Some("scim:st1")).unwrap();
-        assert_eq!((eng.origin.as_str(), eng.provisioned_at.is_some(), db.team(&eng.team_id).unwrap().machines), ("scim", true, false));
+        let eng = db
+            .create_scim_group("okta", Some("00g1"), "Eng", "Eng", Some("scim:st1"))
+            .unwrap();
+        assert_eq!(
+            (
+                eng.origin.as_str(),
+                eng.provisioned_at.is_some(),
+                db.team(&eng.team_id).unwrap().machines
+            ),
+            ("scim", true, false)
+        );
         // Another tenant may use the same name and externalId; this one may not, in any case.
-        assert!(db.create_scim_group("entra", Some("00g1"), "Eng", "Eng", None).is_ok());
-        assert_eq!(db.create_scim_group("okta", None, "ENG", "ENG", None).err(), Some(ScimGroupConflict::DisplayName));
+        assert!(
+            db.create_scim_group("entra", Some("00g1"), "Eng", "Eng", None)
+                .is_ok()
+        );
+        assert_eq!(
+            db.create_scim_group("okta", None, "ENG", "ENG", None).err(),
+            Some(ScimGroupConflict::DisplayName)
+        );
         // ASCII case only: the filter compares the same way.
-        assert!(db.create_scim_group("entra", None, "Équipe", "Équipe", None).is_ok());
-        assert!(db.create_scim_group("entra", None, "éQUIPE", "éQUIPE", None).is_ok());
-        assert!(db.scim_group_find("entra", None, Some("ÉQUIPE")).is_some_and(|g| g.display_name == "Équipe"));
-        assert_eq!(db.create_scim_group("okta", Some("00g1"), "Other", "Other", None).err(), Some(ScimGroupConflict::ExternalId));
+        assert!(
+            db.create_scim_group("entra", None, "Équipe", "Équipe", None)
+                .is_ok()
+        );
+        assert!(
+            db.create_scim_group("entra", None, "éQUIPE", "éQUIPE", None)
+                .is_ok()
+        );
+        assert!(
+            db.scim_group_find("entra", None, Some("ÉQUIPE"))
+                .is_some_and(|g| g.display_name == "Équipe")
+        );
+        assert_eq!(
+            db.create_scim_group("okta", Some("00g1"), "Other", "Other", None)
+                .err(),
+            Some(ScimGroupConflict::ExternalId)
+        );
         assert_eq!(db.teams().len(), 4, "a refused group leaves no team behind");
-        assert_eq!(db.scim_group_find("okta", None, Some("eng")).map(|g| g.team_id), Some(eng.team_id.clone()));
-        assert!(db.scim_group_find("okta", Some("00G1"), None).is_none(), "externalId is exact");
+        assert_eq!(
+            db.scim_group_find("okta", None, Some("eng"))
+                .map(|g| g.team_id),
+            Some(eng.team_id.clone())
+        );
+        assert!(
+            db.scim_group_find("okta", Some("00G1"), None).is_none(),
+            "externalId is exact"
+        );
 
         // A team made by hand, linked once, to one tenant.
         let ops = db.create_team("Ops", None);
-        let l = db.link_scim_group("okta", &ops.id, None, "Ops", Some("u1")).unwrap();
+        let l = db
+            .link_scim_group("okta", &ops.id, None, "Ops", Some("u1"))
+            .unwrap();
         assert_eq!((l.origin.as_str(), l.provisioned_at), ("admin", None));
-        assert_eq!(db.link_scim_group("entra", &ops.id, None, "Ops", None).err(), Some(ScimGroupConflict::Team));
-        assert_eq!(db.link_scim_group("okta", "t-none", None, "Gone", None).err(), Some(ScimGroupConflict::Gone));
-        let saved = db.save_scim_group("okta", &ops.id, Some("00g2"), "Operations", "Operations", true).unwrap();
+        assert_eq!(
+            db.link_scim_group("entra", &ops.id, None, "Ops", None)
+                .err(),
+            Some(ScimGroupConflict::Team)
+        );
+        assert_eq!(
+            db.link_scim_group("okta", "t-none", None, "Gone", None)
+                .err(),
+            Some(ScimGroupConflict::Gone)
+        );
+        let saved = db
+            .save_scim_group(
+                "okta",
+                &ops.id,
+                Some("00g2"),
+                "Operations",
+                "Operations",
+                true,
+            )
+            .unwrap();
         assert!(saved.provisioned_at.is_some());
         assert_eq!(db.team(&ops.id).unwrap().name, "Operations");
-        assert_eq!(db.save_scim_group("entra", &ops.id, None, "x", "x", true).err(), Some(ScimGroupConflict::Gone), "another tenant's");
+        assert_eq!(
+            db.save_scim_group("entra", &ops.id, None, "x", "x", true)
+                .err(),
+            Some(ScimGroupConflict::Gone),
+            "another tenant's"
+        );
 
         // Unlinked, a stale write finds nothing; a deleted team takes its link with it.
-        assert_eq!(db.unlink_scim_group(&ops.id).map(|g| g.origin), Some("admin".into()));
-        assert_eq!(db.save_scim_group("okta", &ops.id, None, "x", "x", true).err(), Some(ScimGroupConflict::Gone));
+        assert_eq!(
+            db.unlink_scim_group(&ops.id).map(|g| g.origin),
+            Some("admin".into())
+        );
+        assert_eq!(
+            db.save_scim_group("okta", &ops.id, None, "x", "x", true)
+                .err(),
+            Some(ScimGroupConflict::Gone)
+        );
         assert!(db.team(&ops.id).is_some());
         assert!(db.delete_team(&eng.team_id));
         assert!(db.scim_group("okta", &eng.team_id).is_none() && db.scim_groups("okta").is_empty());

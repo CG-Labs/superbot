@@ -99,12 +99,33 @@ pub struct Target {
 }
 
 impl Target {
-    pub fn new(store: s3::Settings, prefix: &str, source: Source, recipients: Vec<age::x25519::Recipient>) -> Result<Target, String> {
-        Ok(Target { s3: S3::new(store.clone())?, store, prefix: prefix.into(), source, recipients })
+    pub fn new(
+        store: s3::Settings,
+        prefix: &str,
+        source: Source,
+        recipients: Vec<age::x25519::Recipient>,
+    ) -> Result<Target, String> {
+        Ok(Target {
+            s3: S3::new(store.clone())?,
+            store,
+            prefix: prefix.into(),
+            source,
+            recipients,
+        })
     }
 
     fn folder(&self) -> String {
         format!("{}server/", self.prefix)
+    }
+
+    /// Which copies count: only those made to this store and folder.
+    pub fn destination(&self) -> String {
+        format!(
+            "{}/{}/{}",
+            self.store.endpoint,
+            self.store.bucket,
+            self.folder()
+        )
     }
 }
 
@@ -127,12 +148,17 @@ fn rpo_hours(var: &dyn Fn(&str) -> String) -> Result<i64, String> {
             .parse::<i64>()
             .ok()
             .filter(|h| (2..=744).contains(h))
-            .ok_or(format!("SERVER_BACKUP_RPO_HOURS: \"{}\" isn't 2 to 744 hours", crate::audit::clip(raw.trim(), 20)));
+            .ok_or(format!(
+                "SERVER_BACKUP_RPO_HOURS: \"{}\" isn't 2 to 744 hours",
+                crate::audit::clip(raw.trim(), 20)
+            ));
     }
     // Compose's sidecar archives every SUPERBOT_BACKUP_INTERVAL seconds; botd reads it
     // only as a hint, so a value it can't read changes nothing.
     match var("SUPERBOT_BACKUP_INTERVAL").trim().parse::<i64>() {
-        Ok(s) if s > 0 => Ok(((s + HOUR_MS / 1000 - 1) / (HOUR_MS / 1000) + backup::RPO_HEADROOM_HOURS).min(744)),
+        Ok(s) if s > 0 => {
+            Ok(((s + HOUR_MS / 1000 - 1) / (HOUR_MS / 1000) + backup::RPO_HEADROOM_HOURS).min(744))
+        }
         _ => Ok(DEFAULT_RPO_HOURS),
     }
 }
@@ -146,7 +172,10 @@ fn retention(raw: &str) -> Result<Option<i64>, String> {
             .ok()
             .filter(|d| (1..=3650).contains(d))
             .map(Some)
-            .ok_or(format!("SERVER_BACKUP_RETENTION_DAYS: \"{}\" isn't off or 1 to 3650 days", crate::audit::clip(r, 20))),
+            .ok_or(format!(
+                "SERVER_BACKUP_RETENTION_DAYS: \"{}\" isn't off or 1 to 3650 days",
+                crate::audit::clip(r, 20)
+            )),
     }
 }
 
@@ -156,12 +185,25 @@ impl ServerBackups {
     /// ENDPOINT, REGION, PREFIX and keys, else MACHINE_BACKUP_S3_*'s store,
     /// SERVER_BACKUP_AGE_RECIPIENTS (or `_FILE`; with the machines' store, theirs when
     /// unset), SERVER_BACKUP_RPO_HOURS and SERVER_BACKUP_RETENTION_DAYS.
-    pub fn from_env(store: &dyn SecretStore, var: &dyn Fn(&str) -> String, data_dir: &Path) -> Result<ServerBackups, String> {
-        let mode = match var("SERVER_BACKUP_OFF_HOST").trim().to_ascii_lowercase().as_str() {
+    pub fn from_env(
+        store: &dyn SecretStore,
+        var: &dyn Fn(&str) -> String,
+        data_dir: &Path,
+    ) -> Result<ServerBackups, String> {
+        let mode = match var("SERVER_BACKUP_OFF_HOST")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "" | "auto" => Mode::Auto,
             "on" => Mode::On,
             "off" => Mode::Off,
-            other => return Err(format!("SERVER_BACKUP_OFF_HOST must be auto, on or off, not \"{}\"", crate::audit::clip(other, 20))),
+            other => {
+                return Err(format!(
+                    "SERVER_BACKUP_OFF_HOST must be auto, on or off, not \"{}\"",
+                    crate::audit::clip(other, 20)
+                ));
+            }
         };
         let dir = match var("BACKUP_DIR").trim() {
             "" => data_dir.parent().unwrap_or(Path::new(".")).join("backups"),
@@ -171,19 +213,31 @@ impl ServerBackups {
         let retention_days = retention(&var("SERVER_BACKUP_RETENTION_DAYS"))?;
         let set = |k: &&&str| !var(k).trim().is_empty();
         let own = !var("SERVER_BACKUP_S3_BUCKET").trim().is_empty();
-        if !own && let Some(k) = ["SERVER_BACKUP_S3_ENDPOINT", "SERVER_BACKUP_S3_REGION", "SERVER_BACKUP_S3_PREFIX"].iter().find(set) {
-            return Err(format!("{k} is set but SERVER_BACKUP_S3_BUCKET isn't; set the bucket or unset {k}"));
+        if !own
+            && let Some(k) = [
+                "SERVER_BACKUP_S3_ENDPOINT",
+                "SERVER_BACKUP_S3_REGION",
+                "SERVER_BACKUP_S3_PREFIX",
+            ]
+            .iter()
+            .find(set)
+        {
+            return Err(format!(
+                "{k} is set but SERVER_BACKUP_S3_BUCKET isn't; set the bucket or unset {k}"
+            ));
         }
         let target = if mode == Mode::Off {
             None
         } else if own {
             let s = s3::Settings::from_env_named(NAME, store, var)?;
-            let prefix = backup::prefix("SERVER_BACKUP_S3_PREFIX", &var("SERVER_BACKUP_S3_PREFIX"))?;
+            let prefix =
+                backup::prefix("SERVER_BACKUP_S3_PREFIX", &var("SERVER_BACKUP_S3_PREFIX"))?;
             let recipients = backup::recipients_from_env("SERVER_BACKUP_AGE_RECIPIENTS", var)?;
             Some(Target::new(s, &prefix, Source::Own, recipients)?)
         } else if !var("MACHINE_BACKUP_S3_BUCKET").trim().is_empty() {
             let s = s3::Settings::from_env(store, var)?;
-            let prefix = backup::prefix("MACHINE_BACKUP_S3_PREFIX", &var("MACHINE_BACKUP_S3_PREFIX"))?;
+            let prefix =
+                backup::prefix("MACHINE_BACKUP_S3_PREFIX", &var("MACHINE_BACKUP_S3_PREFIX"))?;
             let mut recipients = backup::recipients_from_env("SERVER_BACKUP_AGE_RECIPIENTS", var)?;
             if recipients.is_empty() {
                 recipients = backup::recipients_from_env("MACHINE_BACKUP_AGE_RECIPIENTS", var)?;
@@ -193,21 +247,40 @@ impl ServerBackups {
             None
         };
         if target.is_none() && mode == Mode::Auto {
-            let needs = ["SERVER_BACKUP_RPO_HOURS", "SERVER_BACKUP_RETENTION_DAYS", "SERVER_BACKUP_AGE_RECIPIENTS", "SERVER_BACKUP_AGE_RECIPIENTS_FILE"];
+            let needs = [
+                "SERVER_BACKUP_RPO_HOURS",
+                "SERVER_BACKUP_RETENTION_DAYS",
+                "SERVER_BACKUP_AGE_RECIPIENTS",
+                "SERVER_BACKUP_AGE_RECIPIENTS_FILE",
+            ];
             if let Some(k) = needs.iter().find(set) {
-                return Err(format!("{k} is set but there is nowhere to copy server backups to; set SERVER_BACKUP_S3_BUCKET or unset {k}"));
+                return Err(format!(
+                    "{k} is set but there is nowhere to copy server backups to; set SERVER_BACKUP_S3_BUCKET or unset {k}"
+                ));
             }
         }
         if mode == Mode::On && target.is_none() {
             return Err("SERVER_BACKUP_OFF_HOST=on, but no store is set: set SERVER_BACKUP_S3_BUCKET (or MACHINE_BACKUP_S3_BUCKET) and its endpoint and keys".into());
         }
-        Ok(ServerBackups { mode, dir, target, rpo_ms, retention_days })
+        Ok(ServerBackups {
+            mode,
+            dir,
+            target,
+            rpo_ms,
+            retention_days,
+        })
     }
 
     /// For tests: copying to `target` from `dir`, with the defaults.
     #[cfg(test)]
     pub fn with(dir: &Path, target: Option<Target>) -> ServerBackups {
-        ServerBackups { mode: Mode::Auto, dir: dir.into(), target, rpo_ms: DEFAULT_RPO_HOURS * HOUR_MS, retention_days: Some(DEFAULT_RETENTION_DAYS) }
+        ServerBackups {
+            mode: Mode::Auto,
+            dir: dir.into(),
+            target,
+            rpo_ms: DEFAULT_RPO_HOURS * HOUR_MS,
+            retention_days: Some(DEFAULT_RETENTION_DAYS),
+        }
     }
 
     fn kept(&self) -> String {
@@ -230,12 +303,19 @@ impl ServerBackups {
                 self.rpo_ms / HOUR_MS,
                 self.kept(),
                 if t.recipients.is_empty() {
-                    "plain archives copied unencrypted (set SUPERBOT_BACKUP_AGE_RECIPIENTS)".to_string()
+                    "plain archives copied unencrypted (set SUPERBOT_BACKUP_AGE_RECIPIENTS)"
+                        .to_string()
                 } else {
-                    format!("plain archives encrypted to {} age recipients on the way", t.recipients.len())
+                    format!(
+                        "plain archives encrypted to {} age recipients on the way",
+                        t.recipients.len()
+                    )
                 }
             ),
-            None => format!("off ({}): archives in {dir} stay on this host", self.why_not().unwrap_or_default()),
+            None => format!(
+                "off ({}): archives in {dir} stay on this host",
+                self.why_not().unwrap_or_default()
+            ),
         }
     }
 
@@ -245,7 +325,9 @@ impl ServerBackups {
         match (&self.target, self.mode) {
             (Some(_), _) => None,
             (None, Mode::Off) => Some("SERVER_BACKUP_OFF_HOST=off".into()),
-            (None, _) => Some("no store is set: SERVER_BACKUP_S3_BUCKET, or MACHINE_BACKUP_S3_BUCKET".into()),
+            (None, _) => {
+                Some("no store is set: SERVER_BACKUP_S3_BUCKET, or MACHINE_BACKUP_S3_BUCKET".into())
+            }
         }
     }
 
@@ -274,13 +356,18 @@ pub struct Archive {
 /// The time in an archive's name: `superbot-YYYYmmdd-HHMMSS...`, UTC.
 pub fn named_time(name: &str) -> Option<i64> {
     let stamp = name.strip_prefix("superbot-")?.get(..15)?;
-    chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%d-%H%M%S").ok().map(|t| t.and_utc().timestamp_millis())
+    chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%d-%H%M%S")
+        .ok()
+        .map(|t| t.and_utc().timestamp_millis())
 }
 
 /// Whether `name` is an archive superbot-backup finished: it writes `.partial-*` first and
 /// renames it when done. Plain names only, as they become keys in the store.
 fn archive_name(name: &str) -> Option<bool> {
-    let plain = name.len() <= 100 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+    let plain = name.len() <= 100
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
     if !plain || !name.starts_with("superbot-") {
         return None;
     }
@@ -295,15 +382,28 @@ fn archive_name(name: &str) -> Option<bool> {
 
 /// Every finished archive in `dir`, oldest first. Links and folders aren't archives.
 pub fn archives(dir: &Path) -> Vec<Archive> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut out: Vec<Archive> = entries
         .filter_map(Result::ok)
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
             let encrypted = archive_name(&name)?;
-            let meta = std::fs::symlink_metadata(e.path()).ok().filter(|m| m.is_file())?;
-            let written = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis() as i64);
-            Some(Archive { created_at: named_time(&name).unwrap_or(written), path: e.path(), name, encrypted })
+            let meta = std::fs::symlink_metadata(e.path())
+                .ok()
+                .filter(|m| m.is_file())?;
+            let written = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_millis() as i64);
+            Some(Archive {
+                created_at: named_time(&name).unwrap_or(written),
+                path: e.path(),
+                name,
+                encrypted,
+            })
         })
         .collect();
     out.sort_by(|a, b| (a.created_at, &a.name).cmp(&(b.created_at, &b.name)));
@@ -332,33 +432,54 @@ fn read(file: tokio::fs::File) -> ByteStream {
 }
 
 fn event(action: &str, b: &ServerBackup, details: Value) -> Event {
-    Event::new(Actor::system(ACTOR), action).target("server_backup", &b.id).details(details)
+    Event::new(Actor::system(ACTOR), action)
+        .target("server_backup", &b.id)
+        .details(details)
 }
 
 fn time(ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(ms).map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default()
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_default()
 }
 
 fn ago(ms: i64) -> String {
     let h = ms as f64 / HOUR_MS as f64;
-    if h < 1.0 { format!("{} minutes", (ms / 60_000).max(0)) } else { format!("{h:.1} hours") }
+    if h < 1.0 {
+        format!("{} minutes", (ms / 60_000).max(0))
+    } else {
+        format!("{h:.1} hours")
+    }
 }
 
 fn alert(app: &AppState, action: &str, title: &str, lines: Vec<String>) {
-    let a = Alert { event: action.into(), title: title.into(), lines, target_type: "server".into(), target_id: "backups".into(), link: None };
+    let a = Alert {
+        event: action.into(),
+        title: title.into(),
+        lines,
+        target_type: "server".into(),
+        target_id: "backups".into(),
+        link: None,
+    };
     notify::alert(app, a, PAGE);
 }
 
 // Copies
 
 /// The archive to copy now, if one is due: the newest, unless it's copied or being
-/// copied, is no newer than the newest copy, or failed less than RETRY_MS ago.
+/// copied to this store, is no newer than its newest copy there, or failed less than
+/// RETRY_MS ago.
 pub fn due(app: &App, sb: &ServerBackups) -> Option<Archive> {
+    let dest = sb.target.as_ref()?.destination();
     let newest = archives(&sb.dir).pop()?;
-    if app.db.server_last_backup().is_some_and(|b| b.created_at >= newest.created_at) {
+    if app
+        .db
+        .server_last_backup(&dest)
+        .is_some_and(|b| b.created_at >= newest.created_at)
+    {
         return None;
     }
-    match app.db.server_backups_of(&newest.name).first() {
+    match app.db.server_backups_of(&dest, &newest.name).first() {
         None => Some(newest),
         Some(b) if b.state == "failed" && now() - b.started_at >= RETRY_MS => Some(newest),
         Some(_) => None,
@@ -366,12 +487,38 @@ pub fn due(app: &App, sb: &ServerBackups) -> Option<Archive> {
 }
 
 /// Copies `a` to the store with its manifest. None if a copy is running already.
-async fn copy(app: &App, sb: &ServerBackups, t: &Target, a: &Archive, by: Option<&Who>) -> Option<ServerBackup> {
+async fn copy(
+    app: &App,
+    sb: &ServerBackups,
+    t: &Target,
+    a: &Archive,
+    by: Option<&Who>,
+) -> Option<ServerBackup> {
     let botd_encrypts = !a.encrypted && !t.recipients.is_empty();
-    let object = format!("{}{}{}", t.folder(), a.name, if botd_encrypts { ".age" } else { "" });
-    let encrypted_by = if a.encrypted { Some("archive") } else if botd_encrypts { Some("botd") } else { None };
+    let object = format!(
+        "{}{}{}",
+        t.folder(),
+        a.name,
+        if botd_encrypts { ".age" } else { "" }
+    );
+    let encrypted_by = if a.encrypted {
+        Some("archive")
+    } else if botd_encrypts {
+        Some("botd")
+    } else {
+        None
+    };
     let id = format!("sb{}", crate::random_hex(8));
-    let b = app.db.server_backup_start(&NewServerBackup { id: &id, archive: &a.name, object_key: &object, created_at: a.created_at, encrypted_by })?;
+    let dest = t.destination();
+    let n = NewServerBackup {
+        id: &id,
+        archive: &a.name,
+        destination: &dest,
+        object_key: &object,
+        created_at: a.created_at,
+        encrypted_by,
+    };
+    let b = app.db.server_backup_start(&n)?;
     let res: Result<(u64, String), String> = async {
         let file = tokio::fs::File::open(&a.path).await.map_err(|e| format!("opening {} in BACKUP_DIR: {e}", a.name))?;
         let recipients = if botd_encrypts { &t.recipients[..] } else { &[] };
@@ -393,7 +540,10 @@ async fn copy(app: &App, sb: &ServerBackups, t: &Target, a: &Archive, by: Option
     match res {
         Ok((size, sha)) => {
             let expires = sb.retention_days.map(|d| a.created_at + d * DAY_MS);
-            if app.db.server_backup_end(&b.id, Some((size as i64, &sha, expires)), None) {
+            if app
+                .db
+                .server_backup_end(&b.id, Some((size as i64, &sha, expires)), None)
+            {
                 let d = json!({
                     "archive": a.name, "object": object, "bucket": t.store.bucket, "store": t.source.as_str(), "size": size, "sha256": sha,
                     "encrypted": b.encrypted, "encryptedBy": encrypted_by, "createdAt": a.created_at, "expiresAt": expires, "requestedBy": requested,
@@ -402,22 +552,36 @@ async fn copy(app: &App, sb: &ServerBackups, t: &Target, a: &Archive, by: Option
             }
         }
         Err(e) => {
-            crate::obs::log::log_warn!("Server backups: copying {} off the host failed: {e}", a.name);
+            crate::obs::log::log_warn!(
+                "Server backups: copying {} off the host failed: {e}",
+                a.name
+            );
             if app.db.server_backup_end(&b.id, None, Some(&e)) {
                 let d = json!({ "archive": a.name, "object": object, "bucket": t.store.bucket, "error": e, "requestedBy": requested });
-                app.db.record(&event("server.backup_copy_failed", &b, d).outcome(Outcome::Failure));
+                app.db
+                    .record(&event("server.backup_copy_failed", &b, d).outcome(Outcome::Failure));
             }
         }
     }
     app.db.server_backup(&id)
 }
 
-/// Deletes copies past their retention from the store, never the newest. Returns how many went.
-pub async fn prune(app: &App, t: &Target) -> usize {
-    let at = now();
-    let newest = app.db.server_last_backup().map(|b| b.id);
+/// Deletes copies in this store older than the retention set now, never the newest.
+/// With retention off, nothing. Returns how many went.
+pub async fn prune(app: &App, sb: &ServerBackups, t: &Target) -> usize {
+    let Some(days) = sb.retention_days else {
+        return 0;
+    };
+    let cutoff = now() - days * DAY_MS;
+    let dest = t.destination();
+    let newest = app.db.server_last_backup(&dest).map(|b| b.id);
     let mut gone = 0;
-    for b in app.db.server_backups_in("done").into_iter().filter(|b| b.expires_at.is_some_and(|e| e <= at)) {
+    for b in app
+        .db
+        .server_backups_in("done")
+        .into_iter()
+        .filter(|b| b.destination == dest && b.created_at <= cutoff)
+    {
         if newest.as_ref() == Some(&b.id) {
             continue;
         }
@@ -428,11 +592,14 @@ pub async fn prune(app: &App, t: &Target) -> usize {
         match res {
             Ok(()) if app.db.server_backup_deleted(&b.id) => {
                 gone += 1;
-                let d = json!({ "archive": b.archive, "object": b.object_key, "reason": "retention", "createdAt": b.created_at, "expiresAt": b.expires_at });
+                let d = json!({ "archive": b.archive, "object": b.object_key, "reason": "retention", "retentionDays": days, "createdAt": b.created_at });
                 app.db.record(&event("server.backup_deleted", &b, d));
             }
             Ok(()) => {}
-            Err(e) => crate::obs::log::log_warn!("Server backups: deleting {} past its retention: {e}", b.archive),
+            Err(e) => crate::obs::log::log_warn!(
+                "Server backups: deleting {} past its retention: {e}",
+                b.archive
+            ),
         }
     }
     gone
@@ -448,52 +615,125 @@ pub struct Status {
     pub breached_at: Option<i64>,
 }
 
+/// When copies to `dest` were turned on: SINCE holds `<ms> <destination>`.
+fn since(app: &App, dest: &str) -> Option<i64> {
+    let v = app.db.setting(SINCE)?;
+    let (ms, d) = v.split_once(' ')?;
+    if d == dest { ms.parse().ok() } else { None }
+}
+
+/// Starts the RPO clock for a store copies weren't going to before.
+fn mark_since(app: &App, t: &Target) {
+    let dest = t.destination();
+    if since(app, &dest).is_none() {
+        app.db.set_setting(SINCE, &format!("{} {dest}", now()));
+    }
+}
+
 pub fn status(app: &App, sb: &ServerBackups) -> Status {
-    let last = app.db.server_last_backup();
-    let covered_since = last.as_ref().map(|b| b.created_at).or_else(|| app.db.setting(SINCE).and_then(|s| s.parse().ok()));
+    let dest = sb.target.as_ref().map(Target::destination);
+    let last = dest.as_deref().and_then(|d| app.db.server_last_backup(d));
+    let covered_since = last
+        .as_ref()
+        .map(|b| b.created_at)
+        .or_else(|| dest.as_deref().and_then(|d| since(app, d)));
     let breach = sb.target.is_some() && covered_since.is_some_and(|c| now() - c > sb.rpo_ms);
     let breached_at = app.db.setting(BREACH).and_then(|s| s.parse().ok());
-    Status { last, covered_since, breach, breached_at }
+    Status {
+        last,
+        covered_since,
+        breach,
+        breached_at,
+    }
 }
 
 /// Opens or closes the RPO breach, audited and alerted. True while it's open.
 pub fn watch(app: &AppState, sb: &ServerBackups) -> bool {
+    // Both the RPO timer and a pass watch: one at a time, so a breach opens once.
+    static WATCHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = WATCHING.lock().unwrap_or_else(|e| e.into_inner());
     let st = status(app, sb);
     match (st.breach, st.breached_at) {
         (true, None) => {
             let at = now();
             app.db.set_setting(BREACH, &at.to_string());
-            let failed = app.db.server_backups(20).into_iter().find(|b| b.state == "failed" && st.covered_since.is_none_or(|c| b.created_at >= c));
+            let dest = sb.target.as_ref().map(Target::destination);
+            let failed = app.db.server_backups(20).into_iter().find(|b| {
+                b.state == "failed"
+                    && dest.as_ref() == Some(&b.destination)
+                    && st.covered_since.is_none_or(|c| b.created_at >= c)
+            });
             let d = json!({
                 "rpoHours": sb.rpo_ms / HOUR_MS, "lastBackupAt": st.last.as_ref().map(|b| b.created_at), "coveredSince": st.covered_since,
                 "breachedAt": at, "lastError": failed.as_ref().and_then(|f| f.error.clone()),
             });
-            app.db.record(&Event::new(Actor::system(ACTOR), "server.backup_rpo_breached").target("server", "backups").details(d).outcome(Outcome::Failure));
+            app.db.record(
+                &Event::new(Actor::system(ACTOR), "server.backup_rpo_breached")
+                    .target("server", "backups")
+                    .details(d)
+                    .outcome(Outcome::Failure),
+            );
             let mut lines = vec![
                 format!("RPO {} hours.", sb.rpo_ms / HOUR_MS),
                 match &st.last {
-                    Some(b) => format!("Newest archive off the host: {} ({} ago).", time(b.created_at), ago(at - b.created_at)),
+                    Some(b) => format!(
+                        "Newest archive off the host: {} ({} ago).",
+                        time(b.created_at),
+                        ago(at - b.created_at)
+                    ),
                     None => "No archive has been copied off the host yet.".into(),
                 },
             ];
             match failed.and_then(|f| f.error) {
                 Some(e) => lines.push(format!("The last copy failed: {e}")),
-                None if archives(&sb.dir).last().is_none_or(|a| st.covered_since.is_some_and(|c| a.created_at <= c)) => {
-                    lines.push(format!("No newer archive in {}: check superbot-backup's timer or sidecar.", sb.dir.display()))
+                None if archives(&sb.dir)
+                    .last()
+                    .is_none_or(|a| st.covered_since.is_some_and(|c| a.created_at <= c)) =>
+                {
+                    lines.push(format!(
+                        "No newer archive in {}: check superbot-backup's timer or sidecar.",
+                        sb.dir.display()
+                    ))
                 }
                 None => {}
             }
-            alert(app, "server.backup_rpo_breached", "Server backups are past their RPO", lines);
+            alert(
+                app,
+                "server.backup_rpo_breached",
+                "Server backups are past their RPO",
+                lines,
+            );
             true
         }
         (false, Some(at)) => {
             app.db.clear_setting(BREACH);
-            let reason = if sb.target.is_none() { "off" } else if st.covered_since.is_some_and(|c| c > at - sb.rpo_ms) { "backed_up" } else { "objective_changed" };
+            let reason = if sb.target.is_none() {
+                "off"
+            } else if st.covered_since.is_some_and(|c| c > at - sb.rpo_ms) {
+                "backed_up"
+            } else {
+                "objective_changed"
+            };
             let d = json!({ "reason": reason, "breachedAt": at, "durationMs": now() - at, "coveredSince": st.covered_since });
-            app.db.record(&Event::new(Actor::system(ACTOR), "server.backup_rpo_recovered").target("server", "backups").details(d));
+            app.db.record(
+                &Event::new(Actor::system(ACTOR), "server.backup_rpo_recovered")
+                    .target("server", "backups")
+                    .details(d),
+            );
             if reason == "backed_up" {
-                let lines = vec![format!("They were past their RPO for {}.", ago(now() - at)), format!("Newest archive off the host: {}.", st.covered_since.map(time).unwrap_or_default())];
-                alert(app, "server.backup_rpo_recovered", "Server backups are back within their RPO", lines);
+                let lines = vec![
+                    format!("They were past their RPO for {}.", ago(now() - at)),
+                    format!(
+                        "Newest archive off the host: {}.",
+                        st.covered_since.map(time).unwrap_or_default()
+                    ),
+                ];
+                alert(
+                    app,
+                    "server.backup_rpo_recovered",
+                    "Server backups are back within their RPO",
+                    lines,
+                );
             }
             false
         }
@@ -506,7 +746,7 @@ pub fn watch(app: &AppState, sb: &ServerBackups) -> bool {
 pub async fn pass(app: &AppState) -> Option<ServerBackup> {
     let sb = app.server_backups.get()?.clone();
     let t = sb.target.as_ref()?;
-    prune(app, t).await;
+    prune(app, &sb, t).await;
     let made = match due(app, &sb) {
         Some(a) => copy(app, &sb, t, &a, None).await,
         None => None,
@@ -519,25 +759,39 @@ pub async fn pass(app: &AppState) -> Option<ServerBackup> {
 /// were never completed, so the store holds nothing of them.
 fn interrupted(app: &App) {
     for b in app.db.server_backups_in("running") {
-        if app.db.server_backup_end(&b.id, None, Some("botd stopped while it was running")) {
+        if app
+            .db
+            .server_backup_end(&b.id, None, Some("botd stopped while it was running"))
+        {
             let d = json!({ "archive": b.archive, "object": b.object_key, "error": "interrupted" });
-            app.db.record(&event("server.backup_copy_failed", &b, d).outcome(Outcome::Failure));
+            app.db
+                .record(&event("server.backup_copy_failed", &b, d).outcome(Outcome::Failure));
         }
     }
 }
 
-/// Copies archives off the host from startup, when a store is set. Without one, a breach
+/// Copies archives off the host from startup, when a store is set, and checks the RPO on
+/// its own timer so a slow upload can't hold back the alert. Without a store, a breach
 /// left open by an earlier start is closed.
 pub fn start(app: AppState) {
-    let Some(sb) = app.server_backups.get().cloned() else { return };
-    if sb.target.is_none() {
+    let Some(sb) = app.server_backups.get().cloned() else {
+        return;
+    };
+    let Some(t) = &sb.target else {
         watch(&app, &sb);
         return;
-    }
-    if app.db.setting(SINCE).is_none() {
-        app.db.set_setting(SINCE, &now().to_string());
-    }
+    };
+    mark_since(&app, t);
     interrupted(&app);
+    let (a, s) = (app.clone(), sb.clone());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            watch(&a, &s);
+        }
+    });
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -557,7 +811,7 @@ pub fn view(app: &App, sb: &ServerBackups) -> Value {
     let target = sb.target.as_ref().map(|t| {
         json!({
             "source": t.source.as_str(), "endpoint": t.store.endpoint, "bucket": t.store.bucket, "region": t.store.region,
-            "prefix": t.folder(), "encryptsPlainArchives": !t.recipients.is_empty(),
+            "prefix": t.folder(), "destination": t.destination(), "encryptsPlainArchives": !t.recipients.is_empty(),
             "recipients": t.recipients.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
         })
     });
@@ -580,47 +834,134 @@ pub fn view(app: &App, sb: &ServerBackups) -> Value {
     })
 }
 
-/// The setup checklist's item: done when archives are copied off the host and the newest
-/// copy is within the RPO.
+/// The setup checklist's item: done once an archive is copied off the host and the
+/// newest copy is within the RPO.
 pub fn checklist(app: &App) -> (bool, String) {
     let Some(sb) = app.server_backups.get() else {
         return (false, "Server backups stay on this host, so losing the host loses them. Set SERVER_BACKUP_S3_BUCKET to copy them off (ADR 0109).".into());
     };
-    let Some(t) = &sb.target else { return (false, sb.warning().unwrap_or_default()) };
+    let Some(t) = &sb.target else {
+        return (false, sb.warning().unwrap_or_default());
+    };
     let st = status(app, sb);
     let to = format!("{}/{}", t.store.bucket, t.folder());
     let rpo = sb.rpo_ms / HOUR_MS;
     match (&st.last, st.breach) {
-        (Some(b), false) => (true, format!("Copied to {to}; the newest copy is from {} ({} ago), within the RPO of {rpo} hours.", time(b.created_at), ago(now() - b.created_at))),
-        (None, false) => (true, format!("Copying to {to}; the first archive goes when superbot-backup next writes one. RPO {rpo} hours.")),
-        (Some(b), true) => (false, format!("Copying to {to}, but the newest copy is {} old, past the RPO of {rpo} hours. See botctl backups.", ago(now() - b.created_at))),
-        (None, true) => (false, format!("Copying to {to}, but nothing has been copied within the RPO of {rpo} hours. See botctl backups.")),
+        (Some(b), false) => (
+            true,
+            format!(
+                "Copied to {to}; the newest copy is from {} ({} ago), within the RPO of {rpo} hours.",
+                time(b.created_at),
+                ago(now() - b.created_at)
+            ),
+        ),
+        (None, false) => (
+            false,
+            format!(
+                "Copying to {to}; the first archive goes when superbot-backup next writes one. RPO {rpo} hours."
+            ),
+        ),
+        (Some(b), true) => (
+            false,
+            format!(
+                "Copying to {to}, but the newest copy is {} old, past the RPO of {rpo} hours. See botctl backups.",
+                ago(now() - b.created_at)
+            ),
+        ),
+        (None, true) => (
+            false,
+            format!(
+                "Copying to {to}, but nothing has been copied within the RPO of {rpo} hours. See botctl backups."
+            ),
+        ),
     }
 }
 
 /// The gauges `/metrics` shows (ADR 0089): whether archives leave the host and, when
 /// they do, how old the newest copy is against the RPO.
 pub fn render(app: &App, out: &mut String) {
-    let Some(sb) = app.server_backups.get() else { return };
-    metrics::family(out, "superbot_server_backup_off_host", "gauge", "1 when server backups are copied off this host (ADR 0109); 0 when they stay on it.");
-    metrics::sample(out, "superbot_server_backup_off_host", &[], sb.target.is_some() as u8 as f64);
+    let Some(sb) = app.server_backups.get() else {
+        return;
+    };
+    metrics::family(
+        out,
+        "superbot_server_backup_off_host",
+        "gauge",
+        "1 when server backups are copied off this host (ADR 0109); 0 when they stay on it.",
+    );
+    metrics::sample(
+        out,
+        "superbot_server_backup_off_host",
+        &[],
+        sb.target.is_some() as u8 as f64,
+    );
     if sb.target.is_none() {
         return;
     }
     let st = status(app, sb);
-    metrics::family(out, "superbot_server_backup_rpo_seconds", "gauge", "The RPO server backups are held to.");
-    metrics::sample(out, "superbot_server_backup_rpo_seconds", &[], sb.rpo_ms as f64 / 1000.0);
+    metrics::family(
+        out,
+        "superbot_server_backup_rpo_seconds",
+        "gauge",
+        "The RPO server backups are held to.",
+    );
+    metrics::sample(
+        out,
+        "superbot_server_backup_rpo_seconds",
+        &[],
+        sb.rpo_ms as f64 / 1000.0,
+    );
     if let Some(c) = st.covered_since {
-        metrics::family(out, "superbot_server_backup_age_seconds", "gauge", "Age of the newest archive copied off the host (before the first, time since copies were turned on).");
-        metrics::sample(out, "superbot_server_backup_age_seconds", &[], (now() - c).max(0) as f64 / 1000.0);
+        metrics::family(
+            out,
+            "superbot_server_backup_age_seconds",
+            "gauge",
+            "Age of the newest archive copied off the host (before the first, time since copies were turned on).",
+        );
+        metrics::sample(
+            out,
+            "superbot_server_backup_age_seconds",
+            &[],
+            (now() - c).max(0) as f64 / 1000.0,
+        );
     }
-    metrics::family(out, "superbot_server_backup_past_rpo", "gauge", "1 while the newest archive off the host is older than the RPO.");
-    metrics::sample(out, "superbot_server_backup_past_rpo", &[], st.breach as u8 as f64);
+    metrics::family(
+        out,
+        "superbot_server_backup_past_rpo",
+        "gauge",
+        "1 while the newest archive off the host is older than the RPO.",
+    );
+    metrics::sample(
+        out,
+        "superbot_server_backup_past_rpo",
+        &[],
+        st.breach as u8 as f64,
+    );
     if let Some(b) = &st.last {
-        metrics::family(out, "superbot_server_backup_last_copy_timestamp_seconds", "gauge", "When the newest archive copied off the host was made.");
-        metrics::sample(out, "superbot_server_backup_last_copy_timestamp_seconds", &[], b.created_at as f64 / 1000.0);
-        metrics::family(out, "superbot_server_backup_last_copy_size_bytes", "gauge", "The newest copy's size in the store.");
-        metrics::sample(out, "superbot_server_backup_last_copy_size_bytes", &[], b.size.unwrap_or(0) as f64);
+        metrics::family(
+            out,
+            "superbot_server_backup_last_copy_timestamp_seconds",
+            "gauge",
+            "When the newest archive copied off the host was made.",
+        );
+        metrics::sample(
+            out,
+            "superbot_server_backup_last_copy_timestamp_seconds",
+            &[],
+            b.created_at as f64 / 1000.0,
+        );
+        metrics::family(
+            out,
+            "superbot_server_backup_last_copy_size_bytes",
+            "gauge",
+            "The newest copy's size in the store.",
+        );
+        metrics::sample(
+            out,
+            "superbot_server_backup_last_copy_size_bytes",
+            &[],
+            b.size.unwrap_or(0) as f64,
+        );
     }
 }
 
@@ -631,7 +972,10 @@ fn conflict(msg: impl Into<String>) -> ApiError {
 }
 
 fn settings(app: &App) -> Result<Arc<ServerBackups>, ApiError> {
-    app.server_backups.get().cloned().ok_or_else(|| conflict("Server backups aren't set up on this server."))
+    app.server_backups
+        .get()
+        .cloned()
+        .ok_or_else(|| conflict("Server backups aren't set up on this server."))
 }
 
 /// `GET /api/backups` (admins): `view`.
@@ -644,7 +988,9 @@ pub async fn get(State(app): State<AppState>) -> Res {
 /// and answers with `view` and the copy made, if any. 409 while archives stay on this host.
 pub async fn copy_now(State(app): State<AppState>, Extension(by): Extension<Who>) -> Res {
     let sb = settings(&app)?;
-    let Some(t) = &sb.target else { return Err(conflict(sb.warning().unwrap_or_default())) };
+    let Some(t) = &sb.target else {
+        return Err(conflict(sb.warning().unwrap_or_default()));
+    };
     let made = match due(&app, &sb) {
         Some(a) => copy(&app, &sb, t, &a, Some(&by)).await,
         None => None,
