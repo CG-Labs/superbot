@@ -58,7 +58,7 @@ use rustls::pki_types::CertificateDer;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::net::SocketAddr;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
@@ -819,7 +819,6 @@ fn bot_status(state: &str, user: &str, uid: Option<u32>, error: Option<String>) 
 
 /// The saved Bots' user, checked: still there, with the same ids, owning the home.
 fn load_bot_user(cfg: &Config, tools: &Tools) -> Bot {
-    use std::os::unix::fs::MetadataExt;
     let path = cfg.state_dir.join(BOT_USER_FILE);
     let saved = match std::fs::read(&path) {
         Ok(b) => match serde_json::from_slice::<SavedBotUser>(&b) {
@@ -931,6 +930,11 @@ impl Agent {
             egress_loading: tokio::sync::Mutex::new(()),
         });
         a.home_use.refresh(&a.home_roots(), false);
+        let mut tmps = vec![a.cfg.home.join(TMP)];
+        if let Ok(homes) = std::fs::read_dir(a.teammates.root()) {
+            tmps.extend(homes.flatten().map(|h| h.path().join(TMP)));
+        }
+        std::thread::spawn(move || sweep_tmps(&tmps, SystemTime::now()));
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(a.clone().keep_egress());
             tokio::spawn(a.tools.clone().work());
@@ -1359,7 +1363,6 @@ fn work_dirs(cfg: &Config, user: Option<Ids>) -> Result<(), String> {
                 .create(&dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        sweep_tmp(&cfg.home.join(TMP), SystemTime::now());
         Ok(())
     })
     .map_err(|e| e.to_string())?
@@ -1561,35 +1564,68 @@ fn scrub(env: &mut BTreeMap<String, String>) {
 /// every user on the machine.
 const TMP: &str = ".tmp";
 
-/// How long a file in a run user's temporary folder is kept untouched before a run's
-/// start removes it: longer than any run, so a run beside it keeps its own.
+/// How long what's left in a temporary folder is kept untouched before the agent's
+/// start removes it.
 const TMP_KEEP: Duration = Duration::from_secs(24 * 3600);
+/// How many entries one leftover may hold for the sweep to look through it; a bigger one
+/// is kept, and counts against the owner's storage.
+const TMP_SWEEP_MAX: usize = 50_000;
 
-/// `home`'s temporary folder, made as `ids` if it isn't there, and swept.
+/// `home`'s temporary folder, made as `ids` if it isn't there.
 fn own_tmp(home: &Path, ids: Ids) -> Result<(), String> {
     let tmp = home.join(TMP);
-    let made = runas::as_user(Some(ids), || {
-        let r = match std::fs::DirBuilder::new().mode(0o700).create(&tmp) {
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tmp.is_dir() => Ok(()),
-            r => r,
-        };
-        sweep_tmp(&tmp, SystemTime::now());
-        r
+    let made = runas::as_user(Some(ids), || match std::fs::DirBuilder::new().mode(0o700).create(&tmp) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tmp.is_dir() => Ok(()),
+        r => r,
     });
     made.and_then(|r| r).map_err(|e| format!("Couldn't make {}: {e}", tmp.display()))
 }
 
-/// Removes what in `tmp` hasn't changed for `TMP_KEEP`, without following links. Run as
-/// the folder's user; what it can't remove stays.
-fn sweep_tmp(tmp: &Path, now: SystemTime) {
-    let Ok(entries) = std::fs::read_dir(tmp) else { return };
-    for e in entries.flatten() {
-        let Ok(m) = e.path().symlink_metadata() else { continue };
-        let old = m.modified().ok().and_then(|t| now.duration_since(t).ok()).is_some_and(|age| age > TMP_KEEP);
-        if old {
-            let _ = if m.is_dir() { std::fs::remove_dir_all(e.path()) } else { std::fs::remove_file(e.path()) };
+/// A job's own temporary folder in `home`'s, made as `user`; removed when the job ends.
+fn job_tmp(home: &Path, job: &str, user: Option<Ids>) -> Option<PathBuf> {
+    let dir = home.join(TMP).join(job);
+    let made = runas::as_user(user, || std::fs::DirBuilder::new().mode(0o700).create(&dir));
+    matches!(made, Ok(Ok(()))).then_some(dir)
+}
+
+/// Removes, from each temporary folder in `tmps` and as its owner, what neither it nor
+/// anything in it has changed for `TMP_KEEP`, without following links. For the agent's
+/// start, off its requests: nothing runs yet, so only what crashed runs and logins left.
+fn sweep_tmps(tmps: &[PathBuf], now: SystemTime) {
+    for tmp in tmps {
+        let Ok(m) = tmp.symlink_metadata() else { continue };
+        if !m.is_dir() {
+            continue;
+        }
+        let owner = Ids { uid: m.uid(), gid: m.gid() };
+        let _ = runas::as_user(Some(owner).filter(|o| o.uid != 0), || {
+            let Ok(entries) = std::fs::read_dir(tmp) else { return };
+            for e in entries.flatten() {
+                let mut seen = 0;
+                if newest(&e.path(), &mut seen).is_some_and(|t| now.duration_since(t).is_ok_and(|age| age > TMP_KEEP)) {
+                    let p = e.path();
+                    let _ = if p.symlink_metadata().is_ok_and(|m| m.is_dir()) { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+                }
+            }
+        });
+    }
+}
+
+/// When `p`, or anything under it, last changed, not following links; None past
+/// `TMP_SWEEP_MAX` entries or if any can't be read.
+fn newest(p: &Path, seen: &mut usize) -> Option<SystemTime> {
+    *seen += 1;
+    if *seen > TMP_SWEEP_MAX {
+        return None;
+    }
+    let m = p.symlink_metadata().ok()?;
+    let mut t = m.modified().ok()?;
+    if m.is_dir() {
+        for e in std::fs::read_dir(p).ok()? {
+            t = t.max(newest(&e.ok()?.path(), seen)?);
         }
     }
+    Some(t)
 }
 
 fn ndjson(e: &impl serde::Serialize) -> Bytes {
@@ -1725,6 +1761,11 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
             a.cfg.host(user)
         }
     };
+    let home = teammate.as_ref().map_or(&a.cfg.home, |t| &t.home);
+    let tmp = job_tmp(home, &j.job_id, host.user);
+    if let Some(t) = &tmp {
+        host.env.insert("TMPDIR".into(), t.display().to_string());
+    }
     // A run the agent can't hold to its limits still runs, and its exit says why.
     host.limits = j.limits.map(|l| match &a.cgroups {
         Ok(cg) => {
@@ -1745,6 +1786,10 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
             let _ = stop_rx.wait_for(|s| *s).await;
         };
         job::run(&host, &j, abort, &ev_tx).await;
+        if let Some(t) = tmp {
+            let user = host.user;
+            let _ = tokio::task::spawn_blocking(move || runas::as_user(user, || std::fs::remove_dir_all(t))).await;
+        }
     });
     // Held until the stream ends: dropping it stops the job.
     stream(ev_rx, wire::JobEvent::Ping, stop)
@@ -2536,22 +2581,41 @@ mod tests {
     }
 
     #[test]
-    fn temporary_files_left_a_day_are_swept_and_links_not_followed() {
-        let tmp = std::env::temp_dir().join(format!("sb-agent-sweep-{}", std::process::id()));
-        let outside = std::env::temp_dir().join(format!("sb-agent-sweep-out-{}", std::process::id()));
-        std::fs::create_dir_all(tmp.join("old-dir/inner")).unwrap();
+    fn only_what_nothing_in_has_changed_for_a_day_is_swept() {
+        let root = std::env::temp_dir().join(format!("sb-agent-sweep-{}", std::process::id()));
+        let tmp = root.join(TMP);
+        let outside = root.join("outside");
+        std::fs::create_dir_all(tmp.join("job-a/inner")).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("keep"), "x").unwrap();
-        std::fs::write(tmp.join("new"), "x").unwrap();
+        std::fs::write(tmp.join("loose"), "x").unwrap();
         std::os::unix::fs::symlink(&outside, tmp.join("link")).unwrap();
-        let later = SystemTime::now() + TMP_KEEP + Duration::from_secs(60);
-        sweep_tmp(&tmp, SystemTime::now());
-        assert!(tmp.join("new").exists() && tmp.join("old-dir").exists(), "nothing a day old yet");
-        sweep_tmp(&tmp, later);
+        let day = TMP_KEEP + Duration::from_secs(60);
+        sweep_tmps(std::slice::from_ref(&tmp), SystemTime::now());
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 3, "nothing a day old yet");
+        // A file changed inside an old folder keeps the whole folder.
+        let old = SystemTime::now() - day;
+        for p in [tmp.join("job-a"), tmp.join("job-a/inner")] {
+            std::fs::File::open(&p).unwrap().set_modified(old).unwrap();
+        }
+        std::fs::write(tmp.join("job-a/inner/fresh"), "x").unwrap();
+        sweep_tmps(std::slice::from_ref(&tmp), SystemTime::now());
+        assert!(tmp.join("job-a/inner/fresh").exists(), "a fresh file inside keeps its folder");
+        sweep_tmps(std::slice::from_ref(&tmp), SystemTime::now() + day);
         assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "everything older went");
         assert!(outside.join("keep").exists(), "a link's target stays");
-        let _ = std::fs::remove_dir_all(&tmp);
-        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_job_gets_its_own_temporary_folder() {
+        let home = std::env::temp_dir().join(format!("sb-agent-jobtmp-{}", std::process::id()));
+        std::fs::create_dir_all(home.join(TMP)).unwrap();
+        let dir = job_tmp(&home, "job-1", None).unwrap();
+        assert_eq!(dir, home.join(TMP).join("job-1"));
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&dir).unwrap().permissions()) & 0o777, 0o700);
+        assert_eq!(job_tmp(&home, "job-1", None), None, "never one another job has");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
