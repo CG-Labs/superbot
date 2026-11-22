@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
-use crate::markdown::is_external;
+use crate::markdown::{is_external, percent_decode};
 
 /// Values of the given attribute (`href`, `src`, `id`) in an HTML document.
 pub fn attr_values(html: &str, attr: &str) -> Vec<String> {
@@ -106,7 +106,7 @@ pub fn check(root: &Path) -> std::io::Result<(usize, Vec<String>)> {
         }
         if let Some(f) = frag.filter(|f| !f.is_empty())
             && target.ends_with(".html")
-            && !ids.get(&target).is_some_and(|ids| ids.contains(f))
+            && !ids.get(&target).is_some_and(|ids| ids.contains(&percent_decode(f)))
         {
             bad.push(format!("{at} (no id {f})"));
         }
@@ -135,7 +135,7 @@ mod tests {
         fs::write(root.join("index.html"), r#"<a href="docs/">Docs</a> <a href="https://example.com/">x</a>"#).unwrap();
         fs::write(
             root.join("docs/index.html"),
-            r##"<h2 id="top">T</h2><a href="#top">ok</a><a href="sso/entra.html#setup">ok</a><a href="../index.html">ok</a>
+            r##"<h2 id="top">T</h2><h2 id="café">C</h2><a href="#top">ok</a><a href="#caf%C3%A9">ok</a><a href="sso/entra.html#setup">ok</a><a href="../index.html">ok</a>
             <a href="#gone">1</a><a href="sso/okta.html">2</a><a href="sso/entra.html#nope">3</a><a href="/docs/">4</a>
             <a href="../../x.html">5</a><img src="../assets/missing.css">"##,
         )
@@ -143,7 +143,7 @@ mod tests {
         fs::write(root.join("docs/sso/entra.html"), r#"<h2 id="setup">Setup</h2><a href="../index.html#top">ok</a>"#).unwrap();
         let (n, bad) = check(&root).unwrap();
         fs::remove_dir_all(&root).unwrap();
-        assert_eq!(n, 12);
+        assert_eq!(n, 13);
         assert_eq!(
             bad,
             [

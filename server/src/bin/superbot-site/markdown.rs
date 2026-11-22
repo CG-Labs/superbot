@@ -132,7 +132,7 @@ fn normalize(path: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
-fn percent_decode(s: &str) -> String {
+pub fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -167,7 +167,7 @@ impl Site<'_> {
     fn frag(&self, frag: Option<&str>, anchors: impl FnOnce() -> HashSet<String>) -> Result<String, String> {
         match frag {
             None => Ok(String::new()),
-            Some(f) if anchors().contains(f) => Ok(format!("#{f}")),
+            Some(f) if anchors().contains(&percent_decode(f)) => Ok(format!("#{f}")),
             Some(f) => Err(format!("no heading #{f}")),
         }
     }
@@ -294,7 +294,7 @@ mod tests {
         for (src, out, md) in [
             ("docs/slo.md", "docs/slo.html", "# SLO\n\n## Targets\n"),
             ("docs/security/README.md", "docs/security/index.html", "# Pack\n\n## Contents\n"),
-            ("docs/sso/entra.md", "docs/sso/entra.html", "# Entra\n\n## Setup\n\n## Setup\n"),
+            ("docs/sso/entra.md", "docs/sso/entra.html", "# Entra\n\n## Setup\n\n## Setup\n\n## Café\n"),
         ] {
             pages.insert(src.to_string(), (out.to_string(), anchors(md).into_iter().collect()));
         }
@@ -337,6 +337,8 @@ mod tests {
         assert_eq!(r("../security/"), Ok(Resolved::Href("../security/index.html".into())));
         assert_eq!(r("../security#contents"), Ok(Resolved::Href("../security/index.html#contents".into())));
         assert_eq!(r("#setup-1"), Ok(Resolved::Href("#setup-1".into())));
+        assert_eq!(r("#caf%C3%A9"), Ok(Resolved::Href("#caf%C3%A9".into())));
+        assert_eq!(r("#café"), Ok(Resolved::Href("#café".into())));
         assert_eq!(r("/docs/slo.md"), Ok(Resolved::Href("../slo.html".into())));
         assert_eq!(r("../slo.md#nope"), Err("no heading #nope".into()));
         assert_eq!(r("#nope"), Err("no heading #nope".into()));

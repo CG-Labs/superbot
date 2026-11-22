@@ -57,7 +57,7 @@ Or, under a path of an existing SuperBot server, add this before the final `hand
 	}
 ```
 
-Rebuild and replace the folder to update it. The generator refuses to overwrite a folder it didn't make.
+Rebuild into the same folder to update it. The build is written and checked beside the folder and replaces it only if every check passes, so a failed build leaves the published site as it was. The generator refuses to overwrite a folder it didn't make.
 
 ## Alternatives considered
 

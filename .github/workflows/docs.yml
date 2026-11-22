@@ -80,4 +80,6 @@ jobs:
         with:
           name: superbot-site
           path: target/site
+          # Keeps the .superbot-site marker, so a downloaded copy can be rebuilt in place.
+          include-hidden-files: true
           retention-days: 14
