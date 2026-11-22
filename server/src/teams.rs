@@ -98,7 +98,12 @@ fn manages(role: &str) -> bool {
 
 /// What a custom role given to `m` within their team adds there (ADR 0123): only its
 /// team permissions (`rbac::TEAM_SCOPED`). Owners and admins already have them all.
+/// Nothing for someone read-only across the server: they change nothing anywhere, as
+/// read-only team admins don't.
 fn team_perms(app: &AppState, m: &TeamMember) -> Perms {
+    if app.db.user(&m.user_id).is_none_or(|u| u.role == crate::rbac::Role::Readonly) {
+        return Perms::NONE;
+    }
     m.role_id.as_deref().and_then(|id| app.db.custom_role(id)).map_or(Perms::NONE, |r| r.perms().in_team())
 }
 
@@ -672,6 +677,10 @@ pub async fn invite(State(app): State<AppState>, Extension(c): Extension<Caller>
     let role = parse_role(&v, &[ADMIN, MEMBER])?;
     if role != MEMBER && !manages(&me.role) {
         return Err(delegate_limit(&app, &by, &t.id, "Only the team's owners and admins can invite admins."));
+    }
+    // Inviting the same email again replaces the invite, role included.
+    if !manages(&me.role) && app.db.team_invites(&t.id).iter().any(|i| i.email == email && i.role != MEMBER) {
+        return Err(delegate_limit(&app, &by, &t.id, "Only the team's owners and admins can change an admin's invite."));
     }
     if app.db.find_user(&email).is_some_and(|u| app.db.team_id_of(&u.id).as_deref() == Some(t.id.as_str())) {
         return Err(conflict("They're on this team already."));

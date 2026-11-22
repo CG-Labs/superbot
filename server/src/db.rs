@@ -4684,7 +4684,7 @@ impl Db {
         let at = now();
         run(
             "UPDATE users SET email = NULL, display_name = ?2, role = 'readonly', status = 'disabled', idp_issuer = NULL, idp_subject = NULL,
-               last_login_at = NULL, last_login_method = NULL, last_login_idp_provider = NULL, tier = NULL,
+               last_login_at = NULL, last_login_method = NULL, last_login_idp_provider = NULL, tier = NULL, role_id = NULL,
                erased_at = ?3, erased_by = ?4, erased_as = ?5, updated_at = ?3
              WHERE id = ?1",
             &[&user_id, &ERASED_NAME, &at, &by, &pseudonym],

@@ -46,7 +46,7 @@ The built-in roles are presets of the same permissions, and behave exactly as be
 A custom role is a **base** (`member` or `readonly`, never `admin`) plus any of the delegable permissions. Its holder can do what the base does, and what its permissions open. A role can't be based on admin, and `admin` or a coarse permission can't be one of its permissions, so a role never adds up to admin.
 
 - **Across the server**: `users.role_id` points at the role, and `users.role` is kept equal to its base. Every check that reads the built-in role (Bot ACLs, approvals, notifications, MFA policy, SCIM, the access review) keeps working as before, unchanged. Giving someone a role sets their built-in role to its base, so an admin given a role is an admin no longer.
-- **Within a team**: `team_members.role_id` points at the role. Only its team permissions (`users.manage`, `billing.manage`, `machines.manage`) apply, only in that team, and only while they stay on it: the row goes when they leave. It never changes their role across the server, nor opens server-wide routes. Changing team roles (owner, admin, member) stays with team owners and admins.
+- **Within a team**: `team_members.role_id` points at the role. Only its team permissions (`users.manage`, `billing.manage`, `machines.manage`) apply, only in that team, and only while they stay on it: the row goes when they leave. It never changes their role across the server, nor opens server-wide routes. Changing team roles (owner, admin, member) stays with team owners and admins. Team actions still need write access, as they do for team owners and admins, so a read-only person can't be given a team role (409), and one they hold does nothing while they're read-only: read-only people change nothing, anywhere.
 
 **Deny by default.** A role is saved only with names from the fixed list (400 otherwise, naming the allowed ones). A name the server doesn't know in a stored role, as a newer version or a hand edit might leave, grants nothing: `GET /api/roles/:id` lists it as `unknown`. A custom role's name can't be a built-in one's (`admin`, `member`, `readonly`, `read-only`, `owner`, `bot`, `none`).
 
@@ -57,7 +57,7 @@ Someone with a delegable permission but not the admin role (a delegate) may not:
 - change, sign in as (a sign-in code), or sign out an admin, the owner account, or anyone with a custom role across the server, including other delegates and themselves;
 - make anyone an admin, by creating them, changing them, or approving their sign-up;
 - change a tier without `billing.manage`;
-- in a team: invite as owner or admin, withdraw such an invite, or remove an owner, an admin, or anyone with a team role.
+- in a team: invite as owner or admin, withdraw or replace such an invite (inviting the same email again replaces it), or remove an owner, an admin, or anyone with a team role.
 
 Each refusal is a 403 and an `access.denied` event with `reason: "delegate_limit"` and the limit (`protected_user`, `admin_role`, `tier`, `team_role`).
 
@@ -81,7 +81,7 @@ Users carry `roleId` and, in admin views, `customRole: {id, name}`; `GET /api/au
 
 ### Data
 
-One migration adds a `roles` table (`id`, `name` unique ignoring case, `description`, `base` checked as member or readonly, `permissions` as a JSON list, `created_at`, `created_by`, `updated_at`) and a nullable `role_id` referencing it on `users` and `team_members`. Existing databases get no roles and no `role_id`s, so everyone keeps exactly the access they had. A `role_id` is read on every request, so a change applies to existing sessions at once.
+One migration adds a `roles` table (`id`, `name` unique ignoring case, `description`, `base` checked as member or readonly, `permissions` as a JSON list, `created_at`, `created_by`, `updated_at`) and a nullable `role_id` referencing it on `users` and `team_members`. Existing databases get no roles and no `role_id`s, so everyone keeps exactly the access they had. A `role_id` is read on every request, so a change applies to existing sessions at once. Erasing someone ([ADR 0102](0102-erasing-a-users-data.md)) clears their `role_id` and takes them off their team, so a role they held can be deleted.
 
 ## Alternatives considered
 

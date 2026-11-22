@@ -245,6 +245,9 @@ fn team_member(app: &AppState, team: &str, user: &str) -> Res<(crate::db::Team, 
 pub async fn assign_in_team(State(app): State<AppState>, Extension(by): Extension<Who>, Path((key, team, user)): Path<(String, String, String)>) -> Res {
     let r = need_role(&app, &key)?;
     let (t, u, m) = team_member(&app, &team, &user)?;
+    if u.role == Role::Readonly {
+        return Err(conflict("They're read-only, so they change nothing, in a team too. Make them a member first."));
+    }
     if m.role_id.as_deref() != Some(r.id.as_str()) {
         if !app.db.set_team_custom_role(&t.id, &u.id, Some(&r.id)) {
             return Err(not_found("Team member"));

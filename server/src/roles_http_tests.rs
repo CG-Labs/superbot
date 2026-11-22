@@ -280,6 +280,19 @@ async fn a_new_base_follows_its_holders_and_held_roles_stay() {
 }
 
 #[tokio::test]
+async fn erasing_a_holder_frees_their_role() {
+    let (port, _, admin, _) = serve_app().await;
+    let r = role(port, &admin, "Auditor", "readonly", &["audit.view"]).await;
+    let (bo, _) = user_with(port, &admin, "bo@example.com", "member").await;
+    give(port, &admin, &r, &bo).await;
+    let (code, v) = json_call(port, "POST", &format!("/api/users/{bo}/erase"), &admin, "{}").await;
+    assert_eq!(code, 200, "{v}");
+    let (_, v) = json_call(port, "GET", &format!("/api/roles/{r}"), &admin, "").await;
+    assert_eq!(v["users"], 0, "{v}");
+    assert_eq!(call(port, "DELETE", &format!("/api/roles/{r}"), &admin, "").await.0, 200);
+}
+
+#[tokio::test]
 async fn the_owner_and_yourself_keep_your_roles() {
     let (port, _, admin, _) = serve_app().await;
     let r = role(port, &admin, "Viewer plus", "readonly", &["audit.view"]).await;
@@ -338,6 +351,11 @@ async fn a_team_role_applies_only_in_its_team() {
     assert_eq!(code, 201, "{inv}");
     assert_eq!(call(port, "POST", "/api/team/invites", &cy_auth, r#"{"email":"boss@example.com","role":"admin"}"#).await.0, 403);
     assert_eq!(call(port, "DELETE", &format!("/api/team/invites/{}", inv["id"].as_str().unwrap()), &cy_auth, "").await.0, 200);
+    // An admin's invite can't be turned into a member's, and so withdrawn.
+    assert_eq!(call(port, "POST", "/api/team/invites", &ada_auth, r#"{"email":"lead@example.com","role":"admin"}"#).await.0, 201);
+    assert_eq!(call(port, "POST", "/api/team/invites", &cy_auth, r#"{"email":"lead@example.com","role":"member"}"#).await.0, 403);
+    let (_, invites) = json_call(port, "GET", "/api/team", &ada_auth, "").await;
+    assert!(invites["invites"].as_array().unwrap().iter().any(|i| i["email"] == "lead@example.com" && i["role"] == "admin"), "{invites}");
     // Not the team's machines, not roles in it, and not its owners or admins.
     assert_eq!(call(port, "POST", &format!("/api/team/members/{dee}/machine"), &cy_auth, "").await.0, 403);
     assert_eq!(call(port, "PATCH", &format!("/api/team/members/{dee}"), &cy_auth, r#"{"role":"admin"}"#).await.0, 403);
@@ -345,7 +363,7 @@ async fn a_team_role_applies_only_in_its_team() {
     assert_eq!(call(port, "DELETE", &format!("/api/team/members/{ada}"), &cy_auth, "").await.0, 403);
     assert_eq!(call(port, "DELETE", &format!("/api/team/members/{eve}"), &cy_auth, "").await.0, 403);
     let refused = events(port, &admin, "access.denied").await;
-    assert_eq!(refused.iter().filter(|e| e["details"]["limit"] == "team_role" && e["targetId"] == team.as_str()).count(), 3, "{refused:?}");
+    assert_eq!(refused.iter().filter(|e| e["details"]["limit"] == "team_role" && e["targetId"] == team.as_str()).count(), 4, "{refused:?}");
     let (_, preview) = json_call(port, "GET", &format!("/api/team/members/{eve}/offboarding"), &cy_auth, "").await;
     assert_eq!(preview["blocked"].as_str(), Some("admin"), "{preview}");
     // A plain member, they can take off.
@@ -356,6 +374,18 @@ async fn a_team_role_applies_only_in_its_team() {
     let (_, team_view) = json_call(port, "GET", "/api/team", &ada_auth, "").await;
     let cy_row = team_view["members"].as_array().unwrap().iter().find(|m| m["id"] == cy.as_str()).unwrap().clone();
     assert_eq!(cy_row["customRole"]["name"].as_str(), Some("Team people"));
+
+    // Read-only people change nothing, in a team too: not given a team role, and one they
+    // hold does nothing while they're read-only.
+    let (ro, _) = user_with(port, &admin, "ro@example.com", "readonly").await;
+    assert_eq!(call(port, "PUT", &format!("/api/teams/{team}/members/{ro}"), &admin, r#"{"role":"member"}"#).await.0, 200);
+    assert_eq!(call(port, "PUT", &format!("/api/roles/{people}/teams/{team}/users/{ro}"), &admin, "").await.0, 409);
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{cy}"), &admin, r#"{"role":"readonly"}"#).await.0, 200);
+    let (_, mine) = json_call(port, "GET", "/api/team", &cy_auth, "").await;
+    assert_eq!(mine["permissions"], json!([]), "{mine}");
+    assert!(mine.get("invites").is_none(), "{mine}");
+    assert_eq!(call(port, "GET", &format!("/api/team/members/{eve}/offboarding"), &cy_auth, "").await.0, 403);
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{cy}"), &admin, r#"{"role":"member"}"#).await.0, 200);
 
     // Leaving the team takes the role with it.
     assert_eq!(call(port, "POST", "/api/team/leave", &cy_auth, "").await.0, 200);
