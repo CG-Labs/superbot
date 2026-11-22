@@ -51,8 +51,8 @@ Anything wrong is a 400 (`invalidSyntax`, `invalidValue` or `invalidPath`, namin
 
 ### Order, references and partial failure
 
-- **Order**: operations run one at a time, in the order sent, except that an operation that refers to `bulkId:x` waits until the POST that defines `x` has run. So a group that lists a user created later in the same request works, as RFC 7644 section 3.7.2 shows, and the user is created first. Nothing else is reordered.
-- **References**: every string `bulkId:x` in an operation's path or data is replaced with the id x's POST made. Only POSTs in the same request define `bulkId`s; one request can't refer to another's.
+- **Order**: operations run one at a time, in the order sent, except that the POST defining `bulkId:x` is moved forward to run just before the first operation that refers to `x` (after the POSTs it refers to itself, the same way). So a group that lists a user created later in the same request works, as RFC 7644 section 3.7.2 shows, and the user is created first. Nothing else is reordered: the operation that needed `x` stays in its place, so writes sent after it still run after it. Holding back the operation instead would let later writes pass it (a PATCH adding a new member, then a PUT emptying the group, would end with the member in the group).
+- **References**: every string `bulkId:x` in an operation's path or data, and every quoted `"bulkId:x"` inside a PATCH operation's `path` filter (`members[value eq "bulkId:x"]`), is replaced with the id x's POST made. Only POSTs in the same request define `bulkId`s; one request can't refer to another's.
 - **409 for a reference that can't resolve**, without running the operation: `x` isn't the `bulkId` of a POST in this request; x's POST failed; or the references are circular (two POSTs naming each other, or a POST naming itself), which since groups don't hold groups can only be a mistake. RFC 7644 section 3.7.1 allows stopping at a circular reference with 409.
 - **Partial failure**: by default every operation is tried, whatever others did, as the RFC asks. Each succeeds or fails on its own and is never rolled back: there is no transaction across operations, as there is none across single requests.
 - **`failOnErrors: n`**: once n operations have failed, processing stops; the rest aren't run.
@@ -72,7 +72,7 @@ Concurrent requests behave as they do one by one: a group operation takes the sa
 - **All or nothing in one database transaction.** Not what RFC 7644 asks (it says to carry on past failures), and impossible here: deprovisioning suspends machines and stops runs, and team joins call the billing provider, none of which a database rollback undoes.
 - **Calling the router again for each operation** (an internal sub-request). Same effect, but it would pass through the guard again, so each operation would need its token re-sent and re-checked, and would hide which handler ran. Calling the handlers directly with the already-checked caller is simpler and as strict.
 - **Fail a malformed operation on its own** rather than the whole request. Closer to "carry on past failures", but a request with a malformed operation is a broken client; running the rest of it leaves an unpredictable state. Processing failures (a 409 on one user) still don't stop others.
-- **Dependency ordering across all operations** (for example, every POST first). Changes the order of PATCHes and DELETEs relative to each other, which the client may rely on. Only waiting for referenced POSTs keeps the client's order otherwise.
+- **Dependency ordering across all operations** (for example, every POST first). Changes the order of PATCHes and DELETEs relative to each other, which the client may rely on. Moving only referenced POSTs keeps the client's order otherwise.
 - **No limit on operations beyond the payload.** The RFC requires both; a per-request cap also bounds how long one request holds a connection.
 
 ## Not done

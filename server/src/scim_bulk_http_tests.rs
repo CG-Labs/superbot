@@ -154,7 +154,7 @@ async fn bulk_ids_put_new_users_in_new_groups_whatever_the_order() {
     )
     .await;
     let order: Vec<(&str, Option<&str>, &str)> = ops.iter().map(|o| (o["method"].as_str().unwrap(), o["bulkId"].as_str(), o["status"].as_str().unwrap())).collect();
-    assert_eq!(order, [("POST", Some("alice"), "201"), ("POST", Some("guides"), "201"), ("POST", Some("bob"), "201"), ("PATCH", None, "204")], "each waits for the POST it names");
+    assert_eq!(order, [("POST", Some("alice"), "201"), ("POST", Some("guides"), "201"), ("POST", Some("bob"), "201"), ("PATCH", None, "204")], "each POST runs just before the first operation that names it");
     let (alice, team, bob) = (id_of(&ops[0]), id_of(&ops[1]), id_of(&ops[2]));
     assert_eq!(ops[3]["location"].as_str().map(|l| l.ends_with(&format!("/Groups/{team}"))), Some(true));
 
@@ -168,6 +168,52 @@ async fn bulk_ids_put_new_users_in_new_groups_whatever_the_order() {
     assert!(on_team.contains(&alice) && on_team.contains(&bob), "{on_team:?}");
     assert_eq!(events(w.port, &w.admin, "action=scim.group_created").await.len(), 1);
     assert_eq!(events(w.port, &w.admin, "action=team.member_joined").await.len(), 2);
+}
+
+/// Only a referenced POST moves: writes after the operation that needs it still run
+/// after it. And a reference in a filtered PATCH path is the new id, not the literal.
+#[tokio::test]
+async fn pulling_a_post_forward_keeps_later_writes_later() {
+    let w = world(|_| {}).await;
+    let (t, _) = token(w.port, &w.admin, json!({ "tenant": "okta" })).await;
+    let carol = person(w.port, &t, "carol@example.com", "00u9").await;
+    let (code, _, g) = scim(w.port, &t, "POST", GROUPS, json!({ "displayName": "Eng", "members": [{ "value": carol }] })).await;
+    assert_eq!(code, 201, "{g}");
+    let team = g["id"].as_str().unwrap().to_string();
+    let add = |r: &str| json!({ "Operations": [{ "op": "add", "path": "members", "value": [{ "value": format!("bulkId:{r}") }] }] });
+    let ops = ran(
+        w.port,
+        &t,
+        req(json!([
+            { "method": "PATCH", "path": format!("/Groups/{team}"), "data": add("u") },
+            { "method": "PUT", "path": format!("/Groups/{team}"), "data": { "displayName": "Eng", "members": [] } },
+            { "method": "POST", "path": "/Users", "bulkId": "u", "data": okta_user("u@example.com", "00u1") },
+        ])),
+    )
+    .await;
+    let order: Vec<(&str, &str)> = ops.iter().map(|o| (o["method"].as_str().unwrap(), o["status"].as_str().unwrap())).collect();
+    assert_eq!(order, [("POST", "201"), ("PATCH", "204"), ("PUT", "200")], "{ops:?}");
+    let (_, _, g) = scim(w.port, &t, "GET", &format!("{GROUPS}/{team}"), Value::Null).await;
+    assert_eq!(g["members"].as_array().map_or(0, Vec::len), 0, "the PUT, sent after the PATCH, still wins: {g}");
+
+    let mut both = add("v");
+    both["Operations"].as_array_mut().unwrap().push(json!({ "op": "remove", "path": "members[value eq \"bulkId:v\"]" }));
+    let ops = ran(
+        w.port,
+        &t,
+        req(json!([
+            { "method": "POST", "path": "/Users", "bulkId": "v", "data": okta_user("v@example.com", "00u2") },
+            { "method": "PATCH", "path": format!("/Groups/{team}"), "data": both },
+            { "method": "PATCH", "path": format!("/Groups/{team}"), "data": add("v") },
+            { "method": "PATCH", "path": format!("/Groups/{team}"), "data": { "Operations": [{ "op": "remove", "path": "members[value eq \"bulkId:v\"]" }] } },
+        ])),
+    )
+    .await;
+    assert_eq!(statuses(&ops), ["201", "204", "204", "204"], "{ops:?}");
+    let v = id_of(&ops[0]);
+    let (_, _, g) = scim(w.port, &t, "GET", &format!("{GROUPS}/{team}"), Value::Null).await;
+    assert_eq!(g["members"].as_array().map_or(0, Vec::len), 0, "both filtered removes took {v} out again: {g}");
+    assert!(!w.app.db.team_members(&team).iter().any(|m| m.user_id == v));
 }
 
 #[tokio::test]
@@ -189,10 +235,10 @@ async fn references_to_failed_unknown_or_circular_bulk_ids_are_409() {
     )
     .await;
     let order: Vec<(Option<&str>, &str)> = ops.iter().map(|o| (o["bulkId"].as_str(), o["status"].as_str().unwrap())).collect();
-    assert_eq!(order, [(Some("dup"), "409"), (None, "409"), (None, "409"), (Some("ok"), "201"), (Some("c1"), "409"), (Some("c2"), "409")], "{ops:?}");
+    assert_eq!(order, [(Some("dup"), "409"), (None, "409"), (Some("c2"), "409"), (Some("c1"), "409"), (None, "409"), (Some("ok"), "201")], "{ops:?}");
     assert_eq!(ops[0]["response"]["scimType"], "uniqueness", "the handler's own error");
     assert!(ops[0].get("location").is_none(), "a failed POST has no location");
-    for (i, says) in [(1, "failed"), (2, "isn't the bulkId of a POST"), (4, "circular"), (5, "circular")] {
+    for (i, says) in [(1, "failed"), (2, "circular"), (3, "circular"), (4, "isn't the bulkId of a POST")] {
         let r = &ops[i]["response"];
         assert_eq!((r["schemas"].clone(), r["status"].as_str()), (json!(["urn:ietf:params:scim:api:messages:2.0:Error"]), Some("409")));
         assert!(r["detail"].as_str().unwrap().contains(says), "{i}: {r}");

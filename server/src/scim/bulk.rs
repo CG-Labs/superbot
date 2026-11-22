@@ -101,24 +101,50 @@ fn path(method: Method, p: &str) -> Option<(Kind, Option<String>)> {
     }
 }
 
-/// Every `bulkId:<id>` string in `v`, each once.
+/// The quoted `"bulkId:<id>"` values in a PATCH path filter such as
+/// `members[value eq "bulkId:u"]`, as (start, end, id) with start..end covering the
+/// quotes.
+fn quoted_refs(s: &str) -> Vec<(usize, usize, &str)> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = s[from..].find(&format!("\"{BULK_ID}")).map(|n| from + n) {
+        let id_at = at + 1 + BULK_ID.len();
+        let Some(len) = s[id_at..].find('"') else { break };
+        out.push((at, id_at + len + 1, &s[id_at..id_at + len]));
+        from = id_at + len + 1;
+    }
+    out
+}
+
+/// Every `bulkId:<id>` in `v`, each once: whole string values, and quoted values inside
+/// a PATCH operation's `path` filter.
 fn refs_in(v: &Value, out: &mut Vec<String>) {
+    fn add(out: &mut Vec<String>, id: &str) {
+        if !out.iter().any(|r| r == id) {
+            out.push(id.to_string());
+        }
+    }
     match v {
         Value::String(s) => {
-            if let Some(id) = s.strip_prefix(BULK_ID)
-                && !out.iter().any(|r| r == id)
-            {
-                out.push(id.to_string());
+            if let Some(id) = s.strip_prefix(BULK_ID) {
+                add(out, id);
             }
         }
         Value::Array(l) => l.iter().for_each(|x| refs_in(x, out)),
-        Value::Object(o) => o.values().for_each(|x| refs_in(x, out)),
+        Value::Object(o) => {
+            for (k, x) in o {
+                match x.as_str() {
+                    Some(s) if k.eq_ignore_ascii_case("path") => quoted_refs(s).into_iter().for_each(|(_, _, id)| add(out, id)),
+                    _ => refs_in(x, out),
+                }
+            }
+        }
         _ => {}
     }
 }
 
-/// `v` with each `bulkId:<id>` replaced by the id its POST made. Every reference is
-/// resolved before this is called.
+/// `v` with each `bulkId:<id>` (as `refs_in` finds them) replaced by the id its POST
+/// made. Every reference is resolved before this is called.
 fn resolve(v: &Value, made: &HashMap<String, String>) -> Value {
     match v {
         Value::String(s) => match s.strip_prefix(BULK_ID).and_then(|id| made.get(id)) {
@@ -126,9 +152,30 @@ fn resolve(v: &Value, made: &HashMap<String, String>) -> Value {
             None => v.clone(),
         },
         Value::Array(l) => Value::Array(l.iter().map(|x| resolve(x, made)).collect()),
-        Value::Object(o) => Value::Object(o.iter().map(|(k, x)| (k.clone(), resolve(x, made))).collect()),
+        Value::Object(o) => Value::Object(
+            o.iter()
+                .map(|(k, x)| match x.as_str() {
+                    Some(s) if k.eq_ignore_ascii_case("path") => (k.clone(), json!(resolve_quoted(s, made))),
+                    _ => (k.clone(), resolve(x, made)),
+                })
+                .collect(),
+        ),
         _ => v.clone(),
     }
+}
+
+fn resolve_quoted(s: &str, made: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut from = 0;
+    for (start, end, id) in quoted_refs(s) {
+        if let Some(new) = made.get(id) {
+            out.push_str(&s[from..start]);
+            out.push_str(&json!(new).to_string());
+            from = end;
+        }
+    }
+    out.push_str(&s[from..]);
+    out
 }
 
 /// The whole request, checked before any operation runs: the envelope, each
@@ -187,20 +234,42 @@ fn read(v: &Value) -> ScimRes<(Vec<Op>, Option<usize>)> {
     Ok((ops, fail_on))
 }
 
-/// The order operations run in: as sent, except that one waits for each POST whose
-/// `bulkId` it refers to. The second list never becomes ready: its references are
-/// circular, or wait on ones that are.
-fn order(ops: &[Op]) -> (Vec<usize>, Vec<usize>) {
+/// The order operations run in: as sent, except that a POST another operation refers to
+/// by `bulkId` runs just before the first operation that needs it (after the POSTs it
+/// refers to itself). Nothing else moves, so later writes never pass earlier ones.
+/// `true` marks an operation that can't run: its references are circular, or wait on
+/// ones that are.
+fn order(ops: &[Op]) -> Vec<(usize, bool)> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Seen {
+        No,
+        Visiting,
+        Ran,
+        Stuck,
+    }
+    fn visit(i: usize, deps: &[Vec<usize>], seen: &mut [Seen], out: &mut Vec<(usize, bool)>) -> bool {
+        match seen[i] {
+            Seen::Ran => return true,
+            Seen::Visiting | Seen::Stuck => return false,
+            Seen::No => {}
+        }
+        seen[i] = Seen::Visiting;
+        let mut ready = true;
+        for &d in &deps[i] {
+            ready &= visit(d, deps, seen, out);
+        }
+        seen[i] = if ready { Seen::Ran } else { Seen::Stuck };
+        out.push((i, !ready));
+        ready
+    }
     let posts: HashMap<&str, usize> = ops.iter().enumerate().filter(|(_, o)| o.method == Method::Post).filter_map(|(i, o)| Some((o.bulk_id.as_deref()?, i))).collect();
     let deps: Vec<Vec<usize>> = ops.iter().map(|o| o.refs.iter().filter_map(|r| posts.get(r.as_str()).copied()).collect()).collect();
-    let mut done = vec![false; ops.len()];
-    let mut run = Vec::with_capacity(ops.len());
-    while let Some(i) = (0..ops.len()).find(|&i| !done[i] && deps[i].iter().all(|&d| done[d])) {
-        done[i] = true;
-        run.push(i);
+    let mut seen = vec![Seen::No; ops.len()];
+    let mut out = Vec::with_capacity(ops.len());
+    for i in 0..ops.len() {
+        visit(i, &deps, &mut seen, &mut out);
     }
-    let stuck = (0..ops.len()).filter(|&i| !done[i]).collect();
-    (run, stuck)
+    out
 }
 
 /// Hands one operation to the endpoint's own handler.
@@ -282,14 +351,14 @@ pub async fn bulk(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>
         return Err(too_large(format!("The size of the bulk operation exceeds the maxPayloadSize ({MAX_PAYLOAD}).")));
     }
     let (ops, fail_on) = read(&parse_body(body)?)?;
-    let (run, stuck) = order(&ops);
+    let run = order(&ops);
     let base = base_url(&headers);
     let tenant = c.token.tenant.as_str();
     let posts: HashSet<&str> = ops.iter().filter(|o| o.method == Method::Post).filter_map(|o| o.bulk_id.as_deref()).collect();
     let mut made: HashMap<String, String> = HashMap::new();
     let (mut results, mut audit) = (Vec::new(), Vec::new());
     let (mut failed, mut stopped) = (0usize, None);
-    for (n, (i, circular)) in run.iter().map(|&i| (i, false)).chain(stuck.iter().map(|&i| (i, true))).enumerate() {
+    for (n, &(i, circular)) in run.iter().enumerate() {
         if fail_on.is_some_and(|f| failed >= f) {
             stopped = Some(Stopped::FailOnErrors);
             break;
@@ -436,8 +505,38 @@ mod tests {
         ]))
         .unwrap()
         .0;
-        assert_eq!(order(&ops), (vec![1, 3, 0, 2, 6], vec![4, 5]));
+        assert_eq!(order(&ops), vec![(1, false), (3, false), (0, false), (2, false), (5, true), (4, true), (6, false)]);
         let made: HashMap<String, String> = [("a".to_string(), "u-a".to_string())].into();
         assert_eq!(resolve(&ops[0].data, &made)["members"], json!([{ "value": "u-a" }, { "value": "bulkId:b" }]));
+
+        let ops = read(&req(vec![
+            op("PATCH", "/Groups/g1", json!({ "data": { "Operations": [{ "op": "add", "path": "members", "value": [{ "value": "bulkId:u" }] }] } })),
+            op("PUT", "/Groups/g1", json!({ "data": { "displayName": "Eng", "members": [] } })),
+            op("POST", "/Users", json!({ "bulkId": "u", "data": { "userName": "u" } })),
+            op("POST", "/Users", json!({ "bulkId": "me", "data": { "userName": "me", "externalId": "bulkId:me" } })),
+        ]))
+        .unwrap()
+        .0;
+        assert_eq!(order(&ops), vec![(2, false), (0, false), (1, false), (3, true)], "only the POST moves, so the PUT still runs last");
+    }
+
+    #[test]
+    fn references_inside_patch_path_filters_resolve() {
+        let data = json!({ "Operations": [
+            { "op": "add", "path": "members", "value": [{ "value": "bulkId:u" }] },
+            { "op": "remove", "path": "members[value eq \"bulkId:u\"]" },
+            { "op": "remove", "path": "members[value eq \"bulkId:v\"] and members[value eq \"bulkId:u\"]" },
+            { "op": "replace", "path": "displayName", "value": "says \"bulkId:w\"" },
+        ] });
+        let mut refs = Vec::new();
+        refs_in(&data, &mut refs);
+        assert_eq!(refs, vec!["u", "v"], "a quoted reference counts only inside a path");
+        let made: HashMap<String, String> = [("u".to_string(), "u-1".to_string())].into();
+        let out = resolve(&data, &made);
+        assert_eq!(out["Operations"][0]["value"], json!([{ "value": "u-1" }]));
+        assert_eq!(out["Operations"][1]["path"], json!("members[value eq \"u-1\"]"));
+        assert_eq!(out["Operations"][2]["path"], json!("members[value eq \"bulkId:v\"] and members[value eq \"u-1\"]"));
+        assert_eq!(out["Operations"][3]["value"], json!("says \"bulkId:w\""));
+        assert_eq!(resolve_quoted("members[value eq \"bulkId:u", &made), "members[value eq \"bulkId:u", "unterminated");
     }
 }

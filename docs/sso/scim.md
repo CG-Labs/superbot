@@ -142,7 +142,7 @@ The IdP takes the team on when it pushes the group with that `externalId` (or, w
 **What runs, and in what order.**
 
 - First the whole request is checked: `Operations` a list of at most 100; each `method` `POST`, `PUT`, `PATCH` or `DELETE`; each `path` `/Users` or `/Groups` for a `POST`, `/Users/<id>` or `/Groups/<id>` otherwise; a `bulkId` on every `POST`, each used once; `data` on all but `DELETE`; `failOnErrors` a whole number of at least 1. Any problem is a 400 naming the operation (`Operations[3]: ...`), and nothing runs.
-- Then the operations run one at a time, in the order sent. One that uses `bulkId:<id>` (in its path, or in its data, such as a group member) waits for the `POST` with that `bulkId`, so a group can list a user created later in the same request. Nothing else is reordered.
+- Then the operations run one at a time, in the order sent. The `POST` with a `bulkId` runs just before the first operation that uses `bulkId:<id>` (in its path, in its data such as a group member, or in a PATCH filter such as `members[value eq "bulkId:<id>"]`), so a group can list a user created later in the same request. Nothing else is reordered, so writes sent after that operation still run after it.
 - Every operation is tried, whatever the others do. With `failOnErrors: n`, processing stops once `n` have failed. Nothing that worked is undone.
 - A reference to a `bulkId` that no `POST` in the request has, to a `POST` that failed, or a circle of references fails that operation with 409, without running it.
 
