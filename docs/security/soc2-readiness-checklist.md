@@ -36,7 +36,7 @@ Scope: the managed service. A self-hosting customer is its own service organisat
 | CC2 Communication and information | 1 | 1 | 4 |
 | CC3 Risk assessment | 0 | 1 | 4 |
 | CC4 Monitoring activities | 0 | 1 | 1 |
-| CC5 Control activities | 0 | 0 | 4 |
+| CC5 Control activities | 1 | 0 | 3 |
 | CC6 Logical and physical access | 4 | 4 | 9 |
 | CC7 System operations | 1 | 2 | 6 |
 | CC8 Change management | 0 | 0 | 3 |
@@ -87,7 +87,7 @@ Scope: the managed service. A self-hosting customer is its own service organisat
 | ID | Item | Kind | Owner | Evidence to collect | Status | Where it stands |
 |----|------|------|-------|---------------------|--------|-----------------|
 | CC5.1-1 | A hardened configuration baseline for the managed service | Process | Operator | Baseline document; each server's settings checked against it | Gap | Several protections are off until the operator turns them on (`MACHINE_FIREWALL`, `MACHINE_BOT_USER`, `MACHINE_TEAMMATE_USERS`, `TEAMS`, `AUTH_MFA`, backup encryption), and nothing records which the managed service uses. |
-| CC5.2-1 | GitHub Actions pinned by commit | Product | Engineering lead | Workflows referencing actions by full commit SHA; an update process | Gap | Every workflow in [`.github/workflows/`](../../.github/workflows/) pins actions by tag (for example `actions/checkout@v4`). |
+| CC5.2-1 | GitHub Actions pinned by commit | Product | Engineering lead | Workflows referencing actions by full commit SHA; an update process | Done | Every remote action in [`.github/workflows/`](../../.github/workflows/) is pinned to a full commit SHA with its version in a comment; Dependabot proposes updates weekly in one grouped PR ([`.github/dependabot.yml`](../../.github/dependabot.yml)); CI fails on any `uses:` that isn't a commit SHA ([`server/tests/actions_pinned.rs`](../../server/tests/actions_pinned.rs), run by [`docs.yml`](../../.github/workflows/docs.yml)) ([ADR 0100](../adr/0100-github-actions-pinned-by-commit.md)). |
 | CC5.2-2 | Signed container images with provenance | Product | Engineering lead | Signatures and attestations on each published image; verification steps for operators | Gap | Images are built and published by CI ([`docker.yml`](../../.github/workflows/docker.yml), ADR 0084) without signatures or provenance. |
 | CC5.3-1 | A written policy set: information security, access control, change management, incident response, vendor management, data classification and retention, acceptable use, business continuity | Process | Security owner | Approved policies with owners and review dates | Gap | Operator guides exist ([install](../../deploy/README.md), [backup and restore](../ops/backup-restore.md), [machine recovery](../ops/machine-recovery.md)), but no policies. |
 
