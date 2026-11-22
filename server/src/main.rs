@@ -96,6 +96,8 @@ mod machines_provider_backup_tests;
 mod machines_resize_tests;
 #[cfg(test)]
 mod machines_region_tests;
+#[cfg(test)]
+mod machines_residency_tests;
 mod passwd;
 mod plans;
 #[cfg(test)]
