@@ -567,6 +567,13 @@ async fn main() {
     let mfa_policy = mfa::policy(&auth_state, &app.db);
     log_info!("Two-factor sign-in: required for {}{} (ADR 0094).", match mfa_policy { mfa::Policy::Off => "no one", mfa::Policy::Admins => "admins", mfa::Policy::All => "everyone" }, if mfa_pinned.is_some() { ", set by AUTH_MFA" } else { "" });
     log_info!("Sign-in alerts: {} (ADR 0104).", auth_state.watch.settings.describe());
+    let watch = auth_state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            watch.watch.sweep(db::now());
+        }
+    });
     let router = router(app.clone(), auth_state);
     let policy = app.db.global_policy();
     app.db.record(&Event::new(Actor::system("server"), "server.started").details(json!({

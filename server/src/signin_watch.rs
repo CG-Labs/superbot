@@ -32,6 +32,9 @@ const MAX_IPS_COMPARED: u32 = 500;
 /// Detections written to the audit log per minute, over every IP and account. The rest
 /// are still counted in the metrics, and the next one written says how many weren't.
 const MAX_EVENTS_PER_MINUTE: u32 = 60;
+/// Email and webhook alerts per minute, kept apart from the audit budget so bursts from
+/// many IPs can't use it up.
+const MAX_ALERTS_PER_MINUTE: u32 = 10;
 
 /// Whose sign-ins from a new network are reported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,11 +134,13 @@ impl Settings {
     }
 }
 
-/// One key's recent failures (at most its limit, oldest first), and when it last alerted.
+/// One key's recent failures (at most its limit, oldest first), when it last alerted,
+/// and when it last reached its limit with no sign-in reported since.
 #[derive(Default)]
 struct Track {
     fails: VecDeque<i64>,
     alerted_at: Option<i64>,
+    burst_at: Option<i64>,
 }
 
 impl Track {
@@ -144,6 +149,18 @@ impl Track {
             self.fails.pop_front();
         }
         self.fails.len()
+    }
+
+    fn last(&self) -> i64 {
+        self.fails.back().copied().into_iter().chain(self.alerted_at).chain(self.burst_at).max().unwrap_or(i64::MIN)
+    }
+
+    fn live(&self, at: i64, window: i64) -> bool {
+        at - self.last() < window
+    }
+
+    fn bursting(&self, at: i64, window: i64) -> bool {
+        self.burst_at.is_some_and(|b| at - b < window)
     }
 }
 
@@ -154,13 +171,33 @@ struct State {
     /// The current minute's start, and detections written in it.
     minute: (i64, u32),
     unrecorded: u64,
+    /// The current minute's start, and alerts sent in it.
+    alerts: (i64, u32),
+    swept_at: i64,
+}
+
+impl State {
+    /// Forgets keys whose window has passed, at most once a minute.
+    fn sweep(&mut self, at: i64, window: i64) {
+        if at - self.swept_at < MINUTE {
+            return;
+        }
+        self.swept_at = at;
+        self.ips.retain(|_, t| t.live(at, window));
+        self.accounts.retain(|_, t| t.live(at, window));
+    }
 }
 
 fn track<'a>(m: &'a mut HashMap<String, Track>, key: &str, at: i64, window: i64) -> &'a mut Track {
     if !m.contains_key(key) && m.len() >= MAX_TRACKED {
-        m.retain(|_, t| t.fails.back().is_some_and(|l| at - l < window) || t.alerted_at.is_some_and(|a| at - a < window));
+        m.retain(|_, t| t.live(at, window));
+        // Still full of live keys: drop the tenth least recently seen, keeping bursts.
         if m.len() >= MAX_TRACKED {
-            m.clear();
+            let mut by_age: Vec<(bool, i64, String)> = m.iter().map(|(k, t)| (t.bursting(at, window), t.last(), k.clone())).collect();
+            by_age.sort_unstable();
+            for (_, _, k) in by_age.into_iter().take(MAX_TRACKED / 10) {
+                m.remove(&k);
+            }
         }
     }
     m.entry(key.to_string()).or_default()
@@ -204,6 +241,7 @@ impl Watch {
             return Vec::new();
         }
         let mut st = self.lock();
+        st.sweep(at, s.window_ms);
         let mut out = Vec::new();
         for (scope, key, limit, pattern) in [("ip", ip, s.ip_failures, "ip_failures"), ("account", account, s.account_failures, "account_failures")] {
             let Some(key) = key.filter(|k| !k.is_empty()) else { continue };
@@ -214,6 +252,9 @@ impl Watch {
             while t.fails.len() > limit as usize {
                 t.fails.pop_front();
             }
+            if n >= limit as usize {
+                t.burst_at = Some(at);
+            }
             if n >= limit as usize && t.alerted_at.is_none_or(|a| at - a >= s.window_ms) {
                 t.alerted_at = Some(at);
                 out.push(Detection { pattern, scope, failures: n });
@@ -223,23 +264,25 @@ impl Watch {
     }
 
     /// A sign-in that worked, from `ip` to `account`: reported when either reached its
-    /// limit within the window. That key's count then starts over, so the next sign-in
-    /// isn't reported again.
+    /// limit within the last window, even if some of those failures have aged out since.
+    /// That key's count then starts over, so the next sign-in isn't reported again.
     pub fn succeeded(&self, ip: Option<&str>, account: &str, at: i64) -> Option<Detection> {
         let s = self.settings;
         if !s.enabled {
             return None;
         }
         let mut st = self.lock();
+        st.sweep(at, s.window_ms);
         let mut found = None;
         for (scope, key, limit) in [("account", Some(account), s.account_failures), ("ip", ip, s.ip_failures)] {
             let Some(key) = key.filter(|k| !k.is_empty()) else { continue };
             let map = if scope == "ip" { &mut st.ips } else { &mut st.accounts };
             let Some(t) = map.get_mut(key) else { continue };
             let n = t.recent(at, s.window_ms);
-            if n >= limit as usize {
+            if n >= limit as usize || t.bursting(at, s.window_ms) {
                 t.fails.clear();
-                found = found.or(Some(Detection { pattern: "success_after_failures", scope, failures: n }));
+                t.burst_at = None;
+                found = found.or(Some(Detection { pattern: "success_after_failures", scope, failures: n.max(limit as usize) }));
             }
         }
         found
@@ -258,6 +301,21 @@ impl Watch {
         }
         st.minute.1 += 1;
         Some(std::mem::take(&mut st.unrecorded))
+    }
+
+    /// Whether an email and webhook alert may go now.
+    fn alert_budget(&self, at: i64) -> bool {
+        let mut st = self.lock();
+        if at - st.alerts.0 >= MINUTE {
+            st.alerts = (at, 0);
+        }
+        st.alerts.1 += 1;
+        st.alerts.1 <= MAX_ALERTS_PER_MINUTE
+    }
+
+    /// Forgets IPs and accounts whose window has passed, so a quiet server doesn't keep them.
+    pub fn sweep(&self, at: i64) {
+        self.lock().sweep(at, self.settings.window_ms);
     }
 }
 
@@ -314,7 +372,30 @@ fn report(a: &Auth, source: &Source, d: Detection, method: &str, account: Option
     let Some(app) = &a.app else { return };
     app.db.metrics().signin_suspicious(d.pattern);
     let s = a.watch.settings;
-    let Some(unrecorded) = a.watch.budget(db::now()) else { return };
+    let at = db::now();
+    if let Some(unrecorded) = a.watch.budget(at) {
+        record(app, source, d, method, account, session, unrecorded, s);
+    }
+    // Bursts from one IP are the internet's background noise; these point at one person.
+    if let (true, Some(id)) = (matches!(d.pattern, "account_failures" | "success_after_failures"), account) {
+        if !a.watch.alert_budget(at) {
+            return;
+        }
+        let name = app.db.user(id).map(|u| u.email.unwrap_or(u.name)).unwrap_or_else(|| id.to_string());
+        let title = match d.pattern {
+            "account_failures" => format!("{} failed sign-in attempts at {name}'s account", d.failures),
+            _ => format!("{name} signed in right after {} failed attempts", d.failures),
+        };
+        let lines = vec![
+            format!("Method: {method}. Counted by {} over the last {} minutes.", if d.scope == "ip" { "source IP" } else { "account" }, s.window_ms / MINUTE),
+            "The source IP and every attempt are in the audit log (auth.suspicious_sign_in, auth.login_failed).".into(),
+        ];
+        crate::notify::alert(app, crate::notify::Alert { event: ACTION.into(), title, lines, target_type: "user".into(), target_id: id.into(), link: None }, "audit");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record(app: &crate::AppState, source: &Source, d: Detection, method: &str, account: Option<&str>, session: Option<&str>, unrecorded: u64, s: Settings) {
     let mut details = json!({ "pattern": d.pattern, "scope": d.scope, "method": method });
     if d.failures > 0 {
         details["failures"] = json!(d.failures);
@@ -334,19 +415,6 @@ fn report(a: &Auth, source: &Source, d: Detection, method: &str, account: Option
         e = e.target("user", u);
     }
     app.db.record(&e);
-    // Bursts from one IP are the internet's background noise; these point at one person.
-    if let (true, Some(id)) = (matches!(d.pattern, "account_failures" | "success_after_failures"), account) {
-        let name = app.db.user(id).map(|u| u.email.unwrap_or(u.name)).unwrap_or_else(|| id.to_string());
-        let title = match d.pattern {
-            "account_failures" => format!("{} failed sign-in attempts at {name}'s account", d.failures),
-            _ => format!("{name} signed in right after {} failed attempts", d.failures),
-        };
-        let lines = vec![
-            format!("Method: {method}. Counted by {} over the last {} minutes.", if d.scope == "ip" { "source IP" } else { "account" }, s.window_ms / MINUTE),
-            "The source IP and every attempt are in the audit log (auth.suspicious_sign_in, auth.login_failed).".into(),
-        ];
-        crate::notify::alert(app, crate::notify::Alert { event: ACTION.into(), title, lines, target_type: "user".into(), target_id: id.into(), link: None }, "audit");
-    }
 }
 
 #[cfg(test)]
@@ -433,6 +501,63 @@ mod tests {
         w.failed(Some("203.0.113.9"), Some("u1"), t);
         w.failed(Some("198.51.100.2"), Some("u1"), t);
         assert_eq!(w.succeeded(Some("192.0.2.1"), "u1", t + w.settings.window_ms), None);
+    }
+
+    #[test]
+    fn a_sign_in_soon_after_a_burst_is_reported_though_its_first_failures_aged_out() {
+        let w = watch(100, 5);
+        let t = 1_000_000;
+        for i in 0..5 {
+            w.failed(Some("203.0.113.9"), Some("u1"), t + i * MINUTE);
+        }
+        // Minute 15: the first failure has left the window, but the limit was reached at minute 4.
+        let d = w.succeeded(Some("192.0.2.1"), "u1", t + 15 * MINUTE + 1);
+        assert_eq!(d, Some(Detection { pattern: "success_after_failures", scope: "account", failures: 5 }));
+        assert_eq!(w.succeeded(Some("192.0.2.1"), "u1", t + 15 * MINUTE + 2), None, "reported once");
+    }
+
+    #[test]
+    fn expired_keys_are_swept_without_waiting_for_the_map_to_fill() {
+        let w = watch(5, 5);
+        let t = 1_000_000;
+        w.failed(Some("203.0.113.9"), Some("u1"), t);
+        let sizes = |w: &Watch| {
+            let st = w.lock();
+            (st.ips.len(), st.accounts.len())
+        };
+        w.sweep(t + w.settings.window_ms - 1);
+        assert_eq!(sizes(&w), (1, 1));
+        w.sweep(t + w.settings.window_ms + MINUTE);
+        assert_eq!(sizes(&w), (0, 0));
+    }
+
+    #[test]
+    fn a_full_map_keeps_live_bursts() {
+        let w = watch(3, 100);
+        let t = 1_000_000;
+        for i in 0..3 {
+            w.failed(Some("203.0.113.9"), None, t + i);
+        }
+        for i in 0..(MAX_TRACKED as i64 + 50) {
+            w.failed(Some(&format!("ip{i}")), None, t + 10);
+        }
+        assert!(w.lock().ips.len() <= MAX_TRACKED);
+        assert_eq!(w.succeeded(Some("203.0.113.9"), "u1", t + 20).map(|d| d.pattern), Some("success_after_failures"));
+    }
+
+    #[test]
+    fn alerts_have_their_own_budget() {
+        let w = Watch::default();
+        let t = 1_000_000;
+        for _ in 0..MAX_EVENTS_PER_MINUTE {
+            w.budget(t);
+        }
+        assert_eq!(w.budget(t), None);
+        for _ in 0..MAX_ALERTS_PER_MINUTE {
+            assert!(w.alert_budget(t));
+        }
+        assert!(!w.alert_budget(t));
+        assert!(w.alert_budget(t + MINUTE));
     }
 
     #[test]
