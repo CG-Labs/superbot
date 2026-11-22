@@ -208,6 +208,10 @@ pub struct ControlPlane {
     /// Off-host backups of machines to object storage (ADR 0071). None: off
     /// (MACHINE_BACKUP_S3_BUCKET).
     pub offsite: Option<Arc<backup::Offsite>>,
+    /// MACHINE_ON_DISABLE (ADR 0124): `suspend`, the default, powers a user's machine
+    /// off when they are disabled or deprovisioned, and back on when enabled; `keep`
+    /// leaves it running, unreachable from botd.
+    pub suspend_on_disable: bool,
     /// One change at a time, from handlers and the reconciler alike, so two can't
     /// race on one machine. Changes are rare and admin-driven; this is cheap.
     ops: tokio::sync::Mutex<()>,
@@ -235,6 +239,7 @@ impl Default for ControlPlane {
             firewall: None,
             firewall_settings: None,
             offsite: None,
+            suspend_on_disable: true,
             ops: tokio::sync::Mutex::new(()),
             provider_seen: Default::default(),
         }
@@ -493,6 +498,11 @@ impl ControlPlane {
             .ok()
             .filter(|s| (10..=3600).contains(s))
             .ok_or("MACHINE_RECONCILE_SECONDS must be 10 to 3600")?;
+        let suspend_on_disable = match or("MACHINE_ON_DISABLE", "suspend").to_ascii_lowercase().as_str() {
+            "suspend" => true,
+            "keep" => false,
+            v => return Err(format!("MACHINE_ON_DISABLE must be suspend or keep, not \"{}\"", crate::audit::clip(v, 20))),
+        };
         let tiers = parse_tiers(&or("MACHINE_TIERS", provider.default_tiers()))?;
         for (tier, plan) in &tiers {
             provider
@@ -512,6 +522,7 @@ impl ControlPlane {
             authorized_keys,
             reconcile_every: Duration::from_secs(secs),
             firewall_settings: firewall::Settings::from_env(var)?,
+            suspend_on_disable,
             ..ControlPlane::default()
         })
     }
@@ -1131,9 +1142,13 @@ pub async fn reconcile(app: &AppState, cp: &ControlPlane) -> Value {
     rebuild::reconcile(app, cp).await;
     resize::reconcile(app, cp).await;
     let teams = crate::teams::sweep(app, cp).await;
+    let disabled = crate::deprovision::sweep(app, cp).await;
     let mut out = json!({ "checked": ids.len(), "changed": changed });
     if teams != json!({}) {
         out["teams"] = teams;
+    }
+    if disabled != json!({}) {
+        out["disabled"] = disabled;
     }
     if let Some(fw) = &cp.firewall {
         let _g = cp.ops.lock().await;
@@ -1434,6 +1449,11 @@ pub(crate) async fn request_as(app: &AppState, cp: &ControlPlane, by: &Who, key:
     // Held from here, so a region change can't land between reading it and making the machine.
     let _g = cp.ops.lock().await;
     let u = app.db.user(&u.id).ok_or_else(|| not_found("User"))?;
+    // Disabling them meanwhile looks for their machine under this lock (ADR 0124), so a
+    // request that waited here must not make one it would miss.
+    if !u.active() {
+        return Err(conflict("This user is disabled. Enable them before giving them a machine.".into()));
+    }
     // The region set for them or their team (ADR 0117) is where it goes, or nowhere.
     let home = region::effective(&app, cp, &u);
     if let Some(r) = asked_region.as_deref().filter(|r| home.binding() && *r != home.region) {
@@ -2073,6 +2093,15 @@ mod tests {
             cp.need().err().map(|e| (e.0, e.1)),
             Some((StatusCode::SERVICE_UNAVAILABLE, NOT_CONFIGURED.to_string()))
         );
+    }
+
+    #[test]
+    fn machines_are_suspended_on_disable_unless_kept() {
+        let with = |v: &'static str| ControlPlane::configured(Arc::new(fake::Fake::default()), &move |k| if k == "MACHINE_ON_DISABLE" { v.into() } else { String::new() });
+        assert!(with("").unwrap().suspend_on_disable, "the default");
+        assert!(with("Suspend").unwrap().suspend_on_disable);
+        assert!(!with("keep").unwrap().suspend_on_disable);
+        assert!(with("destroy").err().unwrap().contains("MACHINE_ON_DISABLE must be suspend or keep"));
     }
 
     #[test]
