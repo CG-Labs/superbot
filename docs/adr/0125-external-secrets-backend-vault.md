@@ -64,7 +64,7 @@ Failures fail closed:
 
 - At startup, botd lists both folders and refuses to start if Vault can't be reached or refuses it.
 - Once a cached answer is older than the cache time, a Vault that can't answer (down, sealed, a refused token, an unexpected reply) is `Error::Unavailable`. The cached value is dropped, not served stale, and the next store is **not** asked, so a sealed value Vault was meant to replace never comes back.
-- A Bot run whose secrets can't be read doesn't start (checked again just before a run on a user's machine, which inherits nothing from botd, in case Vault went down while it waited for a slot): the Bot says so in the chat, and `bot.run_refused` is audited with reason `secrets_unavailable`. Everything else that hands out Bots' environment (harness logins on machines, runs elsewhere) gets none of the server-wide secrets rather than some of them.
+- A Bot run whose secrets can't be read doesn't start (read again after any wait for a slot, so a queued run never starts with a key past its cache time, and checked just before a run on a user's machine, which inherits nothing from botd): the Bot says so in the chat, and `bot.run_refused` is audited with reason `secrets_unavailable`. Everything else that hands out Bots' environment (harness logins on machines, runs elsewhere) gets none of the server-wide secrets rather than some of them.
 - `GET /api/secrets` answers 503.
 
 ### Audit
@@ -73,7 +73,7 @@ Every read that reaches Vault, and every failure, is a `secret.read` event: acto
 
 ### Talking to Vault
 
-A `Vault` client (reqwest, rustls, 5 s to connect, 10 s per request, no redirects, so a token is never sent anywhere else) runs on a thread of its own with its own small runtime: `SecretStore::get` is synchronous and is called from inside botd's async code, where blocking on a runtime would panic. A caller on one of botd's runtime workers waits with `block_in_place`, so its other tasks move to another worker and a slow Vault never stalls requests, heartbeats or timers. A reply that isn't KV v2's shape is an error, not "not there", so it can't uncover the sealed copy. AppRole tokens are renewed by logging in again two thirds of the way through their lease, and once more whenever Vault refuses the token. A token file is read again whenever Vault refuses the token.
+A `Vault` client (reqwest, rustls, 5 s to connect, 10 s per request, no redirects, so a token is never sent anywhere else) runs on a small runtime of its own, up to 8 requests at once (a request whose caller has stopped waiting is skipped before it starts): `SecretStore::get` is synchronous and is called from inside botd's async code, where blocking on a runtime would panic. A caller on one of botd's runtime workers waits with `block_in_place`, so its other tasks move to another worker and a slow Vault never stalls requests, heartbeats or timers. A reply that isn't KV v2's shape is an error, not "not there", so it can't uncover the sealed copy. AppRole tokens are renewed by logging in again two thirds of the way through their lease, and once more whenever Vault refuses the token. A token file is read again whenever Vault refuses the token.
 
 ### The provider trait
 

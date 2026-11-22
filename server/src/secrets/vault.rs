@@ -19,8 +19,10 @@ use zeroize::Zeroizing;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TIMEOUT: Duration = Duration::from_secs(10);
-/// Longest a caller waits for the request thread: a login and a retried request.
+/// Longest a caller waits for its turn, then for its answer: a login and a retried request.
 const WAIT: Duration = Duration::from_secs(35);
+/// Requests to Vault at once; more wait for a permit.
+const MAX_REQUESTS: usize = 8;
 
 pub enum Auth {
     /// The token itself, or the file that holds it (read again when Vault refuses it).
@@ -120,11 +122,20 @@ struct Inner {
     token: Mutex<Option<Token>>,
 }
 
-type Job = Box<dyn FnOnce(&tokio::runtime::Runtime) + Send>;
-
 pub struct Vault {
     inner: Arc<Inner>,
-    jobs: Mutex<mpsc::Sender<Job>>,
+    /// Botd's own runtime can't be blocked on from inside, so requests run on this one.
+    rt: Option<tokio::runtime::Runtime>,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl Drop for Vault {
+    fn drop(&mut self) {
+        // Dropping a runtime blocks, which panics inside another runtime's tasks.
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+        }
+    }
 }
 
 fn unavailable(what: &str, e: impl std::fmt::Display) -> Error {
@@ -139,38 +150,46 @@ impl Vault {
             b = b.tls_certs_merge([c]);
         }
         let http = b.build().map_err(|e| format!("Vault client: {e}"))?;
-        let (tx, rx) = mpsc::channel::<Job>();
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| format!("Vault client: {e}"))?;
-        std::thread::Builder::new()
-            .name("vault".into())
-            .spawn(move || {
-                for job in rx {
-                    job(&rt);
-                }
-            })
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("vault")
+            .enable_all()
+            .build()
             .map_err(|e| format!("Vault client: {e}"))?;
-        Ok(Vault { inner: Arc::new(Inner { cfg, http, token: Mutex::new(None) }), jobs: Mutex::new(tx) })
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_REQUESTS));
+        Ok(Vault { inner: Arc::new(Inner { cfg, http, token: Mutex::new(None) }), rt: Some(rt), permits })
     }
 
-    /// Runs `f` on the request thread and waits for it.
+    /// Runs `f` on Vault's runtime, up to `MAX_REQUESTS` at once, and waits for it. A
+    /// caller that gives up drops its receiver, and a job not yet started is skipped.
     fn run<T, F, Fut>(&self, f: F) -> Result<T, Error>
     where
         T: Send + 'static,
         F: FnOnce(Arc<Inner>) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = Result<T, Error>>,
+        Fut: std::future::Future<Output = Result<T, Error>> + Send,
     {
-        let (tx, rx) = mpsc::channel();
+        // None says the request started; then its answer.
+        let (tx, rx) = mpsc::channel::<Option<Result<T, Error>>>();
         let inner = Arc::clone(&self.inner);
-        let job: Job = Box::new(move |rt| {
-            let _ = tx.send(rt.block_on(f(inner)));
+        let permits = Arc::clone(&self.permits);
+        let rt = self.rt.as_ref().ok_or_else(|| Error::Unavailable("Vault: the client stopped".into()))?;
+        rt.spawn(async move {
+            let Ok(_permit) = permits.acquire_owned().await else { return };
+            // Whoever asked has stopped waiting: don't spend a request on it.
+            if tx.send(None).is_err() {
+                return;
+            }
+            let _ = tx.send(Some(f(inner).await));
         });
-        self.jobs.lock().unwrap_or_else(|e| e.into_inner()).send(job).map_err(|_| Error::Unavailable("Vault: the request thread stopped".into()))?;
-        let wait = || rx.recv_timeout(WAIT);
+        let wait = || -> Option<Result<T, Error>> {
+            rx.recv_timeout(WAIT).ok()?;
+            rx.recv_timeout(WAIT).ok().flatten()
+        };
         // On one of botd's runtime workers, hand its other tasks to another worker while
         // this waits, so a slow Vault never stalls requests, heartbeats or timers.
         let multi = tokio::runtime::Handle::try_current().is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
         let got = if multi { tokio::task::block_in_place(wait) } else { wait() };
-        got.map_err(|_| Error::Unavailable("Vault: no answer in time".into()))?
+        got.unwrap_or_else(|| Err(Error::Unavailable("Vault: no answer in time".into())))
     }
 }
 
@@ -600,6 +619,28 @@ mod tests {
         assert!(ticks.load(Ordering::SeqCst) >= before + 10, "other tasks kept running while Vault was slow");
         ticker.abort();
         redact::forget("slow-value-1");
+    }
+
+    #[test]
+    fn reads_run_side_by_side() {
+        let (url, f) = stand_in();
+        f.tokens.lock().unwrap().push("hvs.many".into());
+        for i in 0..MAX_REQUESTS {
+            put(&f, &format!("bots/MANY_{i}_TOKEN"), &format!("many-value-{i}"));
+        }
+        f.delay_ms.store(800, Ordering::SeqCst);
+        let s = vault(&url, &[("VAULT_TOKEN", "hvs.many")], Duration::ZERO);
+        let start = Instant::now();
+        std::thread::scope(|sc| {
+            for i in 0..MAX_REQUESTS {
+                let s = &s;
+                sc.spawn(move || assert!(s.get(&format!("MANY_{i}_TOKEN")).unwrap().is_some()));
+            }
+        });
+        assert!(start.elapsed() < Duration::from_millis(800 * 3), "{MAX_REQUESTS} reads of 0.8 s took {:?}", start.elapsed());
+        for i in 0..MAX_REQUESTS {
+            redact::forget(&format!("many-value-{i}"));
+        }
     }
 
     #[test]

@@ -1005,8 +1005,23 @@ impl App {
             },
             Place::There(_) => None,
         };
+        // Secrets read before a wait for a slot may be past their cache time: read them
+        // again, so a queued run never starts with a rotated key or one Vault would no
+        // longer give (ADR 0125).
+        let space = if waited {
+            match self.run_space_with(&bot, for_other.is_none()) {
+                Ok(fresh) => fresh,
+                Err(RunSpaceError::Secrets(e)) => return self.refuse_for_secrets(&bot, msg, &by, &e, Some(&period.key)),
+                Err(RunSpaceError::Folder) => {
+                    self.give_back(&bot, msg, &period.key);
+                    return self.say(&bot.id, "This Bot's owner id isn't a safe folder name, so it can't run.", true);
+                }
+            }
+        } else {
+            space
+        };
         // A run elsewhere inherits nothing of botd's, so it needs those secrets too, read
-        // now: the store may have gone down while the run waited for a slot (ADR 0125).
+        // now: the store may have gone down while the run waited for a slot.
         let space = match &place {
             Place::There(_) => match crate::secrets::global().try_inherited_harness_env() {
                 Ok(inherited) => {
