@@ -806,8 +806,9 @@ $("roles-list").addEventListener("submit", async (e) => {
     if (f.dataset.act === "give-role") {
       const target = f.user.value.trim();
       const u = rolesTab.people.find((x) => (x.email || "").toLowerCase() === target.toLowerCase() || x.id === target);
-      if (u?.role === "admin" && !confirm(`Give ${r.name} to ${u.name}? They stop being an admin: their role becomes ${baseName(r.base).toLowerCase()}, with ${r.name}'s permissions on top.`)) return;
-      await api("PUT", `/api/roles/${key(r.id)}/users/${key(u?.id || target)}`);
+      if (!u) return fail(new Error(rolesTab.people.length ? `Nobody here is ${target}. Pick someone from the list.` : "People didn't load, so they can't be checked. Reload the page."));
+      if (u.role === "admin" && !confirm(`Give ${r.name} to ${u.name}? They stop being an admin: their role becomes ${baseName(r.base).toLowerCase()}, with ${r.name}'s permissions on top.`)) return;
+      await api("PUT", `/api/roles/${key(r.id)}/users/${key(u.id)}`);
     }
     if (f.dataset.act === "give-team-role") {
       const [team, user] = f.member.value.split("|");
