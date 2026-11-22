@@ -69,6 +69,10 @@ pub struct Actor {
     /// only; run events carry it as `forUser`, and it is no audit column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asker: Option<String>,
+    /// Whose data a Bot's run carried when it queued this (ADR 0139): their residency
+    /// pins hold the run it starts, after a restart too. Kept with queued messages only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carries: Vec<String>,
 }
 
 impl Actor {

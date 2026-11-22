@@ -120,6 +120,10 @@ pub const CAN_RETENTION: &str = "retention";
 pub const CAN_RUN_LIMITS: &str = "run_limits";
 /// Takes an outbound allow-list (`PUT /v1/egress-policy`, ADR 0135).
 pub const CAN_EGRESS_POLICY: &str = "egress_policy";
+/// Every process it starts as a Bot's or teammate's user has no new privileges and its
+/// own umask and TMPDIR, and it refuses users with a privileged group or a sudo rule
+/// (ADR 0145).
+pub const CAN_LOCKED_DOWN: &str = "locked_down";
 
 /// The screen protocol this build speaks (ADR 0045). A request names it, an agent
 /// refuses any other, and botd treats an agent that reports another as outdated.
