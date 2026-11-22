@@ -530,3 +530,122 @@ async fn refusals_before_a_signature_is_checked_are_logged_sparingly() {
     assert_eq!(failed.len(), 1, "{failed:?}");
     assert_eq!(failed[0]["details"]["reason"], "no_slo");
 }
+
+// Encrypted assertions (ADR 0150)
+
+impl Sp {
+    /// The certificate our metadata asks IdPs to encrypt to.
+    async fn enc_cert(&self) -> String {
+        let md = http().get(format!("http://127.0.0.1:{}/api/auth/sso/{}/metadata", self.port, self.id)).send().await.unwrap().text().await.unwrap();
+        let kd = md.split(r#"<md:KeyDescriptor use="encryption">"#).nth(1).expect("an encryption certificate");
+        kd.split("<ds:X509Certificate>").nth(1).unwrap().split('<').next().unwrap().to_string()
+    }
+}
+
+fn encrypted_to(cert: &str) -> impl FnOnce(&mut Response) {
+    let cert = cert.to_string();
+    move |r| {
+        r.encrypt = Some(Encrypt::default());
+        r.encrypt_to = cert;
+    }
+}
+
+use crate::sso::xmlenc::test_encrypter::Encrypt;
+
+#[tokio::test]
+async fn encrypted_assertions_sign_in_with_a_sealed_key_of_their_own() {
+    let sp = serve(&[("ENCRYPTED_ASSERTIONS", "require"), ("SIGN_REQUESTS", "true")]).await;
+    let cert = sp.enc_cert().await;
+    assert_eq!(sp.enc_cert().await, cert, "made once, then kept");
+    let enc_sha = crate::sso::xmldsig::Cert::from_base64(&cert).unwrap().sha256;
+    assert_ne!(sp.sp_cert().await.sha256, enc_sha, "never the signing key");
+    let made = sp.audit("sso.saml_sp_key_created").await;
+    let uses: Vec<(&str, &str)> = made.iter().map(|m| (m["details"]["use"].as_str().unwrap(), m["details"]["certificate"].as_str().unwrap())).collect();
+    assert!(uses.contains(&("encryption", enc_sha.as_str())) && uses.iter().filter(|u| u.0 == "encryption").count() == 1, "{uses:?}");
+    let sealed = sp.app.db.setting(&format!("sso_saml_sp_key_{}_encryption", sp.id)).unwrap();
+    assert!(crate::secrets::sealed::is_sealed(&sealed), "the key is sealed at rest");
+    assert_eq!(sp.app.db.setting(&format!("sso_saml_sp_cert_{}_encryption", sp.id)), Some(cert.clone()));
+
+    let u = sp.link();
+    let (code, _, head) = sp.sign_in(encrypted_to(&cert)).await;
+    assert_eq!(code, 200, "{head}");
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(u.id.clone()));
+    let login = &sp.audit("auth.login").await[0];
+    assert_eq!((login["actorId"].as_str(), login["details"]["subject"].as_str()), (Some(u.id.as_str()), Some(STORED)));
+
+    // Required: a plain assertion, however well signed, is refused. (Unvouched failures after
+    // this one are audited at most once a minute, so only the sign-in is checked below.)
+    let (_, to, _) = sp.sign_in(|_| {}).await;
+    assert_eq!(to, "/login?error=sso_failed");
+    assert_eq!(sp.last_failure().await["reason"], "unencrypted_assertion");
+    // Anyone can encrypt to our certificate: the assertion inside must still be the IdP's.
+    let (_, to, head) = sp
+        .sign_in(|r| {
+            encrypted_to(&cert)(r);
+            r.sign_assertion = false;
+        })
+        .await;
+    assert_eq!(to, "/login?error=sso_failed");
+    assert!(signed_in_as(sp.port, &head).await.is_none());
+    let (_, to, _) = sp
+        .sign_in(|r| {
+            encrypted_to(&cert)(r);
+            r.signer = 1;
+        })
+        .await;
+    assert_eq!(to, "/login?error=sso_failed");
+    // To another key, or with a cipher botd refuses: no sign-in.
+    let (other, _) = crate::sso::saml_sp::SpKey::generate("other").unwrap();
+    for tweak in [
+        Box::new(encrypted_to(&other.cert)) as Box<dyn FnOnce(&mut Response)>,
+        Box::new({
+            let cert = cert.clone();
+            move |r: &mut Response| {
+                r.encrypt = Some(Encrypt { data_alg: crate::sso::xmlenc::AES256_CBC.into(), ..Default::default() });
+                r.encrypt_to = cert;
+            }
+        }),
+        Box::new({
+            let cert = cert.clone();
+            move |r: &mut Response| {
+                r.encrypt = Some(Encrypt { key_alg: crate::sso::xmlenc::RSA_1_5.into(), ..Default::default() });
+                r.encrypt_to = cert;
+            }
+        }),
+    ] {
+        let (code, to, head) = sp.sign_in(tweak).await;
+        assert_eq!((code, to.as_str()), (303, "/login?error=sso_failed"));
+        assert!(signed_in_as(sp.port, &head).await.is_none());
+    }
+
+    let (_, v) = call(sp.port, "GET", &format!("/api/sso/{}/saml", sp.id), &sp.admin, "").await;
+    let v: Value = serde_json::from_str(&v).unwrap();
+    assert_eq!(
+        (v["encryptedAssertions"].as_str(), v["spEncryptionKey"]["from"].as_str(), v["spEncryptionKey"]["certificate"]["sha256"].as_str()),
+        (Some("require"), Some("generated"), Some(enc_sha.as_str()))
+    );
+}
+
+#[tokio::test]
+async fn encryption_is_off_unless_asked_and_allow_takes_both() {
+    let off = serve(&[]).await;
+    let md = http().get(format!("http://127.0.0.1:{}/api/auth/sso/{}/metadata", off.port, off.id)).send().await.unwrap().text().await.unwrap();
+    assert!(!md.contains("encryption"), "{md}");
+    let (_, v) = call(off.port, "GET", &format!("/api/sso/{}/saml", off.id), &off.admin, "").await;
+    let v: Value = serde_json::from_str(&v).unwrap();
+    assert_eq!((v["encryptedAssertions"].as_str(), v["spEncryptionKey"].clone()), (Some("off"), Value::Null));
+    assert!(off.app.db.setting(&format!("sso_saml_sp_key_{}_encryption", off.id)).is_none(), "no key made");
+    off.link();
+    let (other, _) = crate::sso::saml_sp::SpKey::generate("other").unwrap();
+    let (_, to, _) = off.sign_in(encrypted_to(&other.cert)).await;
+    assert_eq!(to, "/login?error=sso_failed");
+    assert_eq!(off.last_failure().await["reason"], "encrypted_assertion");
+
+    let allow = serve(&[("ENCRYPTED_ASSERTIONS", "allow")]).await;
+    let u = allow.link();
+    let cert = allow.enc_cert().await;
+    assert_eq!(allow.who(&allow.cookie("_s1").await).await, Some(u.id.clone()), "plain");
+    let (code, _, head) = allow.sign_in(encrypted_to(&cert)).await;
+    assert_eq!(code, 200);
+    assert_eq!(signed_in_as(allow.port, &head).await, Some(u.id));
+}

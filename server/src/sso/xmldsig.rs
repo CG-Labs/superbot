@@ -188,6 +188,11 @@ pub struct Cert {
 }
 
 impl Cert {
+    /// Whether two certificates are for the same key, whatever else differs.
+    pub fn same_key(&self, other: &Cert) -> bool {
+        self.key == other.key
+    }
+
     pub fn from_base64(b64: &str) -> Result<Cert, String> {
         let der = base64(b64).ok_or("a certificate isn't base64")?;
         let (rest, c) = x509_parser::parse_x509_certificate(&der).map_err(|_| "a certificate isn't X.509".to_string())?;
