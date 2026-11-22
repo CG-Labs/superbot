@@ -263,6 +263,31 @@ async fn a_machine_is_destroyed_first_or_the_erasure_waits() {
 }
 
 #[tokio::test]
+async fn what_their_signup_recorded_is_erased_too() {
+    let (port, app, admin, _) = serve_app().await;
+    let form = json!({
+        "name": "Grace Brewster Hopper", "email": "grace@example.com", "company": "Eckert-Mauchly", "teamSize": "11-50",
+        "useCase": "Compiler notes", "signIn": "microsoft", "consent": true, "website": "",
+    });
+    let extra = "X-Forwarded-For: 192.0.2.77\r\nUser-Agent: GraceBrowser/1.0\r\n";
+    assert_eq!(crate::tests::call_with(port, "POST", "/api/signups", "", extra, &form.to_string()).await.0, 202);
+    let (_, list) = json_call(port, "GET", "/api/signups?status=pending", &admin, "").await;
+    let id = list[0]["id"].as_str().unwrap().to_string();
+    let (code, v) = json_call(port, "POST", &format!("/api/signups/{id}/approve"), &admin, r#"{"role":"member"}"#).await;
+    assert_eq!(code, 200, "{v}");
+    let grace = v["user"]["id"].as_str().unwrap().to_string();
+    assert!(audit(port, &admin, "action=signup.submitted").await[0]["ip"].as_str() == Some("192.0.2.77"));
+    let (code, v) = erase(port, &admin, &grace, "").await;
+    assert_eq!(code, 200, "{v}");
+    for (table, row) in app.db.all_rows() {
+        for pii in ["Grace Brewster Hopper", "grace@example.com", "192.0.2.77", "GraceBrowser"] {
+            assert!(!row.contains(pii), "{pii} in {table}: {row}");
+        }
+    }
+    assert_eq!(audit(port, &admin, "action=signup.submitted").await.len(), 1, "the event stays");
+}
+
+#[tokio::test]
 async fn names_and_emails_they_had_before_are_erased_too() {
     let (port, app, admin, _) = serve_app().await;
     let (ada, _) = user_with(port, &admin, "ada.byron@example.com", "member").await;

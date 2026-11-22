@@ -4336,7 +4336,9 @@ impl Db {
         let mut n = 0;
         for (id, [actor_id, name, email, subject, target, behalf, ip, agent, session], details) in rows {
             let is = |v: &Option<String>| v.as_deref() == Some(s.id.as_str());
-            let theirs = is(&actor_id);
+            // A visitor without an account (a signup) is known only by the email they gave.
+            let visitor = actor_id.is_none() && email.as_deref().is_some_and(|e| s.emails.contains(&e.to_lowercase()));
+            let theirs = is(&actor_id) || visitor;
             let s = if theirs || is(&target) || is(&behalf) { named } else { s };
             let swap = |v: Option<String>| {
                 if v.as_deref() == Some(s.id.as_str()) { Some(s.pseudonym.clone()) } else { v }
