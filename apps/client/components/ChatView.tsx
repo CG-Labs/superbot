@@ -10,7 +10,6 @@ import {
   View,
   type TextInputInstance,
 } from "react-native";
-import Markdown from "react-native-markdown-display";
 import { copyText, COPY_LABEL } from "../src/clipboard";
 import { showError } from "../src/dialogs";
 import { isOpenHandoff } from "../src/handoff";
@@ -21,6 +20,7 @@ import type { Message } from "../src/types";
 import { ApprovalCard } from "./ApprovalsInbox";
 import { BotAvatar } from "./BotAvatar";
 import { HandoffBanner } from "./HandoffBanner";
+import { Markdown } from "./Markdown";
 import { ModelBar, PlanBar } from "./ModelBar";
 
 interface Props {
@@ -123,7 +123,7 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
               {isUser ? (
                 <Text style={styles.userText}>{item.text}</Text>
               ) : (
-                <Markdown style={mdStyles}>{item.text}</Markdown>
+                <Markdown>{item.text}</Markdown>
               )}
               {!isUser && item.text ? (
                 <Pressable
@@ -181,7 +181,7 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
       {draft ? (
         <View style={styles.row}>
           <View style={styles.bubble}>
-            <Markdown style={mdStyles}>{draft}</Markdown>
+            <Markdown>{draft}</Markdown>
           </View>
         </View>
       ) : null}
@@ -274,12 +274,6 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
     </View>
   );
 }
-
-const mdStyles = StyleSheet.create({
-  body: { color: colors.text, fontSize: 15 },
-  code_inline: { backgroundColor: "#2a2a2a", borderRadius: 4 },
-  fence: { backgroundColor: "#111", padding: 8, borderRadius: 8 },
-});
 
 const styles = StyleSheet.create({
   chat: { flex: 1, backgroundColor: colors.bgMain },
