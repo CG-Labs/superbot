@@ -9,7 +9,7 @@
 //! A push says only that something is waiting and for which Bot: no command, tool,
 //! reason, routine name, or output. The app fetches those after it opens.
 
-use super::{Channel, Links, Notice, NoticeKind, Offer, Plan, Sent, Throttle, clip, stored};
+use super::{Channel, Links, Notice, NoticeKind, Offer, Plan, Sent, Throttle, clip, needed};
 use crate::acl::{Access, Viewer};
 use crate::audit::{Actor, Event, Outcome, Who};
 use crate::db::{Bot, Db, Message as ChatMessage, PushDevice, PushKind, PushPut};
@@ -136,7 +136,10 @@ impl Provider for Expo {
 
     fn send<'a>(&'a self, msgs: &'a [Message]) -> BoxFuture<'a, Vec<Ticket>> {
         Box::pin(async move {
-            let access = stored(EXPO_ACCESS_TOKEN);
+            let access = match needed(EXPO_ACCESS_TOKEN) {
+                Ok(a) => a,
+                Err(e) => return msgs.iter().map(|_| Ticket::Failed(e.clone())).collect(),
+            };
             if let Some(a) = &access {
                 crate::secrets::redact::register(a.expose());
             }

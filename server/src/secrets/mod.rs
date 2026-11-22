@@ -5,15 +5,18 @@
 //! 2. `SealedStore`: values the operator saves with `botctl secret set` or the API,
 //!    encrypted in SQLite with the master key (see `key`, `sealed`).
 //!
-//! A store for Vault, Azure Key Vault, or GCP Secret Manager is another `SecretStore`
-//! added to that list. Values never leave botd except into a harness's environment;
+//! With `SECRETS_BACKEND=vault`, an `external::ExternalStore` over HashiCorp Vault sits
+//! between the two (ADR 0125); Azure Key Vault or AWS Secrets Manager are other
+//! `external::Provider`s. Values never leave botd except into a harness's environment;
 //! the API lists names only. Every known value is redacted from saved text, events,
 //! and the audit log (`redact`). See docs/adr/0010-secrets.md.
 
 pub mod env;
+pub mod external;
 pub mod key;
 pub mod redact;
 pub mod sealed;
+pub mod vault;
 
 use env::EnvStore;
 use serde::Serialize;
@@ -48,6 +51,9 @@ pub enum Error {
     Invalid(String),
     /// The store failed: I/O, database, or a value that won't decrypt.
     Store(String),
+    /// An external secrets manager couldn't answer or refused botd. Fails closed: the
+    /// caller gets no value, not a stale one or one from another store (ADR 0125).
+    Unavailable(String),
 }
 
 impl Error {
@@ -57,6 +63,7 @@ impl Error {
             Error::ReadOnly => "read-only",
             Error::Invalid(_) => "invalid",
             Error::Store(_) => "store error",
+            Error::Unavailable(_) => "unavailable",
         }
     }
 }
@@ -65,7 +72,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Error::ReadOnly => f.write_str("secrets here are read-only"),
-            Error::Invalid(m) | Error::Store(m) => f.write_str(m),
+            Error::Invalid(m) | Error::Store(m) | Error::Unavailable(m) => f.write_str(m),
         }
     }
 }
@@ -106,11 +113,11 @@ pub struct Listed {
 }
 
 /// Names botd or the harnesses rely on; a stored secret must not replace them in a Bot's environment.
-const RESERVED: [&str; 14] = ["AUTH_PASSWORD", "LICENSE_KEY", "STRIPE_WEBHOOK_SECRET", "STRIPE_SECRET_KEY", "PATH", "HOME", "USER", "LOGNAME", "SHELL", "ENV", "BASH_ENV", "NODE_OPTIONS", "DISPLAY", "DBUS_SESSION_BUS_ADDRESS"];
+const RESERVED: [&str; 17] = ["VAULT_TOKEN", "VAULT_ROLE_ID", "VAULT_SECRET_ID", "AUTH_PASSWORD", "LICENSE_KEY", "STRIPE_WEBHOOK_SECRET", "STRIPE_SECRET_KEY", "PATH", "HOME", "USER", "LOGNAME", "SHELL", "ENV", "BASH_ENV", "NODE_OPTIONS", "DISPLAY", "DBUS_SESSION_BUS_ADDRESS"];
 const RESERVED_PREFIXES: [&str; 7] = ["SUPERBOT_", "BOT_", "SSO_", "LD_", "DYLD_", "AGENT_BROWSER_", "VOXL_"];
 pub const MAX_VALUE: usize = 64 * 1024;
 
-fn env_shaped(name: &str) -> bool {
+pub(crate) fn env_shaped(name: &str) -> bool {
     !name.is_empty() && name.len() <= 128 && name.bytes().enumerate().all(|(i, b)| b == b'_' || b.is_ascii_uppercase() || (i > 0 && b.is_ascii_digit()))
 }
 
@@ -263,8 +270,14 @@ impl Secrets {
     /// `harness_env` for a Bot owned by `owner`: the server-wide values, with the
     /// owner's own on top. Another user's never appear.
     pub fn harness_env_for(&self, owner: &str) -> Vec<(String, Secret)> {
-        let mut out = self.harness_env();
-        let Ok(users) = self.users() else { return out };
+        closed(self.try_harness_env_for(owner))
+    }
+
+    /// `harness_env_for`, or the error of an external store that couldn't answer, so a
+    /// run can be refused rather than started without its keys (ADR 0125).
+    pub fn try_harness_env_for(&self, owner: &str) -> Result<Vec<(String, Secret)>, Error> {
+        let mut out = self.try_harness_env()?;
+        let Ok(users) = self.users() else { return Ok(out) };
         for (name, ..) in users.names(owner).unwrap_or_default() {
             if check_user_name(&name).is_err() {
                 continue;
@@ -279,7 +292,7 @@ impl Secrets {
                 Err(e) => crate::obs::log::log_warn!("A user's secret {name} couldn't be read ({}).", e.kind()),
             }
         }
-        out
+        Ok(out)
     }
 
     /// The value and the store it came from.
@@ -338,20 +351,35 @@ impl Secrets {
     /// those the harness already inherits (plain environment variables). So `NAME_FILE`
     /// arrives as `NAME`, and saved secrets arrive unless the environment sets the name.
     pub fn harness_env(&self) -> Vec<(String, Secret)> {
+        closed(self.try_harness_env())
+    }
+
+    /// `harness_env`, or the error of an external store that couldn't answer.
+    pub fn try_harness_env(&self) -> Result<Vec<(String, Secret)>, Error> {
         self.harness_env_where(false)
     }
 
     /// What `harness_env` leaves out because local children inherit it from botd's own
     /// environment. A run elsewhere doesn't inherit anything, so it gets these too.
     pub fn inherited_harness_env(&self) -> Vec<(String, Secret)> {
+        closed(self.harness_env_where(true))
+    }
+
+    /// `inherited_harness_env`, or the error of an external store that couldn't answer.
+    pub fn try_inherited_harness_env(&self) -> Result<Vec<(String, Secret)>, Error> {
         self.harness_env_where(true)
     }
 
-    fn harness_env_where(&self, inherited: bool) -> Vec<(String, Secret)> {
+    fn harness_env_where(&self, inherited: bool) -> Result<Vec<(String, Secret)>, Error> {
         let mut seen: Vec<String> = Vec::new();
         let mut out = Vec::new();
         for s in &self.stores {
-            for name in s.names().unwrap_or_default() {
+            let names = match s.names() {
+                Ok(n) => n,
+                Err(e @ Error::Unavailable(_)) => return Err(e),
+                Err(_) => Vec::new(),
+            };
+            for name in names {
                 if seen.contains(&name) || check_name(&name).is_err() || server_secret(&name) {
                     continue;
                 }
@@ -365,11 +393,12 @@ impl Secrets {
                         }
                     }
                     Ok(None) => {}
+                    Err(e @ Error::Unavailable(_)) => return Err(e),
                     Err(e) => crate::obs::log::log_warn!("secret {name}: {e}"),
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     /// Teaches the redactor a value. Environment names are a guess from the name, so
@@ -399,6 +428,15 @@ impl Secrets {
         }
         n
     }
+}
+
+/// Fail closed: with an external store down, a Bot gets none of the server-wide
+/// secrets rather than some of them, or ones from a store that should be shadowed.
+fn closed(r: Result<Vec<(String, Secret)>, Error>) -> Vec<(String, Secret)> {
+    r.unwrap_or_else(|e| {
+        crate::obs::log::log_warn!("Secrets: none were given out, because {e}.");
+        Vec::new()
+    })
 }
 
 static GLOBAL: OnceLock<Secrets> = OnceLock::new();
@@ -479,7 +517,7 @@ pub fn forget_sealed() -> bool {
 /// Startup: check the master key (`keys`, made here if there's none and nothing is
 /// sealed), seal plaintext left by older versions, and redact known secrets already
 /// saved. Runs after `Db::open`, before anything is served. An error means botd must not start.
-pub fn init(db_path: &Path, keys: Keys) -> Result<Report, String> {
+pub fn init(db_path: &Path, keys: Keys, external: Option<Arc<external::ExternalStore>>) -> Result<Report, String> {
     let c = sealed::connect(db_path)?;
     let forget = forget_sealed();
     // Known values are redacted from approval inputs before they're sealed, so learn them first.
@@ -521,8 +559,13 @@ pub fn init(db_path: &Path, keys: Keys) -> Result<Report, String> {
     let cipher = sealed::install(cipher)?;
     let store = sealed::SealedStore::new(sealed::connect(db_path)?, Arc::clone(&cipher));
     let users = sealed::UserSecrets::new(sealed::connect(db_path)?, Arc::clone(&cipher));
-    let secrets = Secrets::new(vec![Box::new(env), Box::new(store)]).with_users(users);
-    let stored = secrets.stores[1].names().map_err(|e| e.to_string())?.len();
+    let stored = store.names().map_err(|e| e.to_string())?.len();
+    let mut stores: Vec<Box<dyn SecretStore>> = vec![Box::new(env)];
+    if let Some(x) = external {
+        stores.push(Box::new(external::Shared(x)));
+    }
+    stores.push(Box::new(store));
+    let secrets = Secrets::new(stores).with_users(users);
     secrets.register_all();
     let redacted = redact::scrub_rows(&c).map_err(|e| format!("database: {e}"))?;
     // After a rotation too, so values sealed under the old key don't linger in free pages.

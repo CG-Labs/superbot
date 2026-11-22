@@ -101,6 +101,9 @@ mod machines_resize_tests;
 #[cfg(test)]
 mod machines_region_tests;
 mod passwd;
+mod plans;
+#[cfg(test)]
+mod plans_http_tests;
 mod signin_watch;
 #[cfg(test)]
 mod signin_watch_http_tests;
@@ -122,6 +125,9 @@ mod rbac;
 mod retention;
 #[cfg(test)]
 mod retention_http_tests;
+mod roles;
+#[cfg(test)]
+mod roles_http_tests;
 #[cfg(test)]
 mod run_grants_http_tests;
 #[cfg(test)]
@@ -272,8 +278,19 @@ async fn main() {
         log_warn!("{e}");
         std::process::exit(1);
     };
-    let observe = obs::Settings::from_env(&|k| env(k, ""), &secrets::env::EnvStore::process()).unwrap_or_else(|e| exit(format!("Observability: {e}")));
+    // An external secrets manager (ADR 0125), asked after the environment by everything
+    // that reads a secret at startup, and by `secrets::global()` after that.
+    let process_env = secrets::env::EnvStore::process();
+    let external = secrets::external::from_env(&|k| env(k, ""), &process_env).unwrap_or_else(|e| exit(format!("Secrets backend: {e}")));
+    let external_names = external.as_ref().map(|x| x.check().unwrap_or_else(|e| exit(format!("Secrets backend: {e}. botd won't start without its secrets (ADR 0125)."))));
+    let external_shared = external.clone().map(secrets::external::Shared);
+    let startup_store = secrets::external::Layered(std::iter::once(&process_env as &dyn secrets::SecretStore).chain(external_shared.as_ref().map(|s| s as &dyn secrets::SecretStore)).collect());
+    let observe = obs::Settings::from_env(&|k| env(k, ""), &startup_store).unwrap_or_else(|e| exit(format!("Observability: {e}")));
     obs::log::set_format(observe.log);
+    match (&external, external_names) {
+        (Some(x), Some(n)) => log_info!("Secrets backend: {} ({n} names; SECRETS_BACKEND, ADR 0125).", x.describe()),
+        _ => log_info!("Secrets backend: local (the environment and the sealed store; SECRETS_BACKEND=vault adds HashiCorp Vault, ADR 0125)."),
+    }
     obs::errors::install_panic_hook();
     obs::errors::start(&observe.errors);
     let status_page = status::Page::parse(&env("STATUS_PAGE", "")).unwrap_or_else(|e| exit(e));
@@ -282,9 +299,9 @@ async fn main() {
     let sessions = SessionConfig::from_env(&env("SESSION_IDLE_TIMEOUT", ""), &env("SESSION_MAX_AGE", "")).unwrap_or_else(|e| exit(e));
     let signin_alerts = signin_watch::Settings::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Sign-in alerts: {e}")));
     let sso = sso::Sso::from_env().unwrap_or_else(|e| exit(format!("SSO: {e}")));
-    let signups = signups::Signups::from_env(&secrets::env::EnvStore::process(), &env("SIGNUPS", ""), &env("TURNSTILE_SITE_KEY", ""))
+    let signups = signups::Signups::from_env(&startup_store, &env("SIGNUPS", ""), &env("TURNSTILE_SITE_KEY", ""))
         .unwrap_or_else(|e| exit(format!("Sign-ups: {e}")));
-    let mut control_plane = machines::ControlPlane::from_env(&secrets::env::EnvStore::process(), |k| env(k, ""))
+    let mut control_plane = machines::ControlPlane::from_env(&startup_store, |k| env(k, ""))
         .unwrap_or_else(|e| exit(format!("Control plane: {e}")));
     let shared_bots = acl::SharedBots::parse(&env("SHARED_BOTS", ""), control_plane.routing != machines::route::Routing::Off)
         .unwrap_or_else(|e| exit(format!("Shared Bots: {e}")));
@@ -297,10 +314,12 @@ async fn main() {
     }
     let testing = license::testing_flag(&env("TESTING_MODE", "")).unwrap_or_else(|e| exit(e));
     let (payments, ignored_stripe) =
-        billing::Billing::configured(&secrets::env::EnvStore::process(), &|k| env(k, ""), testing).unwrap_or_else(|e| exit(format!("Billing: {e}")));
+        billing::Billing::configured(&startup_store, &|k| env(k, ""), testing).unwrap_or_else(|e| exit(format!("Billing: {e}")));
     let notifier = notify::Notifier::from_env(&|k| env(k, ""), sessions).unwrap_or_else(|e| exit(format!("Notifications: {e}")));
     let (billing_mail, plan_mail_said) = billing_mail::configured(&|k| env(k, ""), payments.enabled(), notifier.smtp.as_ref(), notifier.links.base.as_deref())
         .unwrap_or_else(|e| exit(format!("Billing emails: {e}")));
+    let plans = plans::Settings::from_env(&|k| env(k, ""), payments.enabled(), payments.checkout_enabled(), signups.enabled)
+        .unwrap_or_else(|e| exit(format!("Pricing page: {e}")));
     let allow_no_auth = auth_startup(&host, &password, break_glass);
     secrets::redact::register(&password);
     if adapters::get(&default_harness).is_none() {
@@ -345,7 +364,7 @@ async fn main() {
         log_warn!("WARNING: {w}");
     }
     let db = Db::open(&db_path).expect("open database");
-    match secrets::init(&db_path, keys) {
+    match secrets::init(&db_path, keys, external) {
         Ok(r) => {
             log_info!("Master key: {}{}.", r.key_source, if r.created { " (new)" } else { "" });
             if r.sealed + r.redacted + r.discarded > 0 {
@@ -371,7 +390,7 @@ async fn main() {
             std::process::exit(1);
         }
     }
-    let server_backups = server_backups::ServerBackups::from_env(&secrets::env::EnvStore::process(), &|k| env(k, ""), &data_dir)
+    let server_backups = server_backups::ServerBackups::from_env(&startup_store, &|k| env(k, ""), &data_dir)
         .unwrap_or_else(|e| exit(format!("Server backups: {e}")));
     // Machine enrollment's CA key is derived from the master key (ADR 0031).
     let bin_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
@@ -600,6 +619,12 @@ async fn main() {
     }
     log_info!("Billing: {}.", billing::describe(auth_state.payments.enabled(), auth_state.payments.checkout_enabled(), app.meter.get().is_some(), app.tiers()));
     log_info!("Billing emails: {plan_mail_said}.");
+    let (plans_line, plans_warnings) = plans.describe(app.tiers());
+    log_info!("Pricing page: {plans_line} (ADR 0121).");
+    for w in plans_warnings {
+        log_warn!("WARNING: {w}");
+    }
+    let _ = app.plans.set(plans);
     if let Some(m) = billing_mail {
         let _ = app.billing_mail.set(Arc::new(m));
     }
@@ -711,6 +736,7 @@ async fn main() {
     log_info!("Audit export: {} (ADR 0122).", audit_export.describe());
     audit_export::start(&app, audit_export);
     audit::start_retention(app.clone(), retention);
+    secrets::external::start_audit(app.clone());
     audit_chain::start(app.clone());
     retention::start(app.clone(), retention::Settings { chat: chat_retention, sessions: session_retention, teammate_files: teammate_files_retention });
     server_backups::start(app.clone());
@@ -980,10 +1006,15 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/machine/teammate/{owner}/harness-login/{id}/input", post(machines::logins::teammate_input))
         .route("/machine/teammate/{owner}/harness-logins", get(machines::logins::teammate_status))
         .route("/machine/teammate/{owner}/harness-logins/{harness}", delete(machines::logins::teammate_logout))
+        .route("/roles", get(roles::list).post(roles::create))
+        .route("/roles/{id}", get(roles::get).patch(roles::update).delete(roles::delete))
+        .route("/roles/{id}/users/{user}", put(roles::assign).delete(roles::unassign))
+        .route("/roles/{id}/teams/{team}/users/{user}", put(roles::assign_in_team).delete(roles::unassign_in_team))
         .route("/sessions", get(users::list_sessions))
         .route("/sessions/{id}", delete(users::revoke_session))
         .route("/signups", get(signups::list).post(signups::submit).layer(DefaultBodyLimit::max(signups::MAX_BODY)))
         .route("/signups/config", get(signups::config))
+        .route("/plans", get(plans::json_page))
         .route("/signups/{id}", get(signups::get))
         .route("/signups/{id}/approve", post(signups::approve))
         .route("/signups/{id}/reject", post(signups::reject))
@@ -1027,6 +1058,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         // Open to anyone, like /healthz: no tenant data (ADR 0090).
         .route("/status", get(status::html_page))
         .route("/status.json", get(status::json_page))
+        // Open too: the tiers' published prices and limits (ADR 0121).
+        .route("/pricing", get(plans::html_page))
         .merge(scim_routes)
         .merge(billing_routes)
         .merge(
@@ -1344,7 +1377,7 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     req.extensions_mut().insert(source.clone());
     // Signing in, the page to do it on, the public site, and asking for access need no credentials.
     let open = match method {
-        Method::GET | Method::HEAD => path == "/login" || sso_path(&path).is_some() || site_file(&path).is_some() || path == "/api/signups/config",
+        Method::GET | Method::HEAD => path == "/login" || sso_path(&path).is_some() || site_file(&path).is_some() || path == "/api/signups/config" || path == plans::JSON_PATH,
         // Apple posts its answer to the callback (response_mode=form_post).
         Method::POST => path == "/api/auth/login" || sso_path(&path) == Some("callback") || path == "/api/signups",
         _ => false,
@@ -1383,10 +1416,12 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     if caller.principal == Principal::Bot && claimed.as_deref().is_some_and(|id| Some(id) != caller.bot.as_deref()) {
         return denied("bot_mismatch", "This token belongs to another Bot.".into());
     }
-    if !rbac::allows(caller.principal, need) {
-        let msg = match caller.principal {
-            Principal::Bot => "Only a signed-in person can do this, not a Bot.".to_string(),
-            Principal::User(r) => format!("Your role ({}) can't do this.", r.as_str()),
+    if !caller.can(need) {
+        let custom = caller.user.as_ref().and_then(|u| u.role_id.as_deref()).and_then(|id| a.app.as_ref()?.db.custom_role(id));
+        let msg = match (caller.principal, custom) {
+            (Principal::Bot, _) => "Only a signed-in person can do this, not a Bot.".to_string(),
+            (_, Some(r)) => format!("Your role ({}) can't do this.", r.name),
+            (Principal::User(r), None) => format!("Your role ({}) can't do this.", r.as_str()),
         };
         return denied("role", msg);
     }
@@ -1438,8 +1473,11 @@ fn sso_path(path: &str) -> Option<&str> {
 /// it also has good ones elsewhere.
 fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<Response>> {
     let h = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let operator = |method: &'static str| Caller { principal: Principal::User(Role::Admin), user: a.operator(), session: None, method, bot: None, bot_for: None, bot_token: None };
-    let from_session = |(s, u): (db::Session, db::User)| Caller { principal: Principal::User(u.role), user: Some(u), session: Some(s), method: "session", bot: None, bot_for: None, bot_token: None };
+    let operator = |method: &'static str| Caller { principal: Principal::User(Role::Admin), user: a.operator(), session: None, method, bot: None, bot_for: None, bot_token: None, grants: rbac::Perms::NONE };
+    let from_session = |(s, u): (db::Session, db::User)| match &a.app {
+        Some(app) => Caller::person(&app.db, u, Some(s), "session"),
+        None => Caller { principal: Principal::User(u.role), user: Some(u), session: Some(s), method: "session", bot: None, bot_for: None, bot_token: None, grants: rbac::Perms::NONE },
+    };
     let fail = |method: &str, reason: Option<&str>, clear: bool| {
         a.login_failed(source, method, reason);
         Err(Box::new(unauthorized(a, req, clear)))
@@ -1458,7 +1496,7 @@ fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<
                     Some(_) => {
                         // A Bot's call during its run (its approval hook, botctl) is part of the run's trace.
                         obs::trace::join_run(&e.run);
-                        Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token", bot: Some(e.bot), bot_for: e.for_user, bot_token: Some(e.id) })
+                        Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token", bot: Some(e.bot), bot_for: e.for_user, bot_token: Some(e.id), grants: rbac::Perms::NONE })
                     }
                 },
                 Err(r) => fail("bot_token", Some(r.reason()), false),
@@ -1831,7 +1869,7 @@ async fn state(State(app): State<AppState>, Extension(c): Extension<Caller>, Ext
     let tier = app.tier_of(me_id);
     let harnesses: Vec<&str> = adapters::installed().into_iter().filter(|h| tier.allows_harness(h)).collect();
     Json(json!({
-        "me": { "name": name, "id": c.user.as_ref().map(|u| &u.id), "email": c.user.as_ref().and_then(|u| u.email.as_ref()), "role": role, "permissions": rbac::granted(c.principal), "session": c.session.is_some(), "tier": tier.view() },
+        "me": { "name": name, "id": c.user.as_ref().map(|u| &u.id), "email": c.user.as_ref().and_then(|u| u.email.as_ref()), "role": role, "permissions": c.permissions(), "session": c.session.is_some(), "tier": tier.view() },
         "harnesses": harnesses,
         "defaultHarness": default_harness_for(&app, me_id),
         "bots": bots,
@@ -2625,7 +2663,7 @@ fn caller_now(app: &App, a: &Auth, c: &Caller) -> Option<Caller> {
         return None;
     }
     let u = app.db.user(&s.user_id)?;
-    Some(Caller { principal: Principal::User(u.role), user: Some(u), ..c.clone() })
+    Some(Caller { principal: Principal::User(u.role), grants: app.db.user_perms(&u), user: Some(u), ..c.clone() })
 }
 
 /// With teammates' own users on machines (ADR 0048), whose screen of `bot` a caller
@@ -3148,6 +3186,10 @@ fn secret_error(e: secrets::Error) -> ApiError {
         secrets::Error::Store(m) => {
             log_warn!("secrets: {m}");
             ApiError(StatusCode::INTERNAL_SERVER_ERROR, "The secret store failed; see the server log.".into())
+        }
+        secrets::Error::Unavailable(m) => {
+            log_warn!("secrets: {m}");
+            ApiError(StatusCode::SERVICE_UNAVAILABLE, "The external secret store can't be read right now; see the server log.".into())
         }
     }
 }
@@ -3756,7 +3798,7 @@ mod tests {
             .route("/api/bots/{id}/routines", get(list_routines).post(create_routine))
             .route("/api/routines/{id}", patch(update_routine).delete(delete_routine))
             .layer(Extension(Who { actor: Actor::operator(), source: Source::default() }))
-            .layer(Extension(Caller { principal: Principal::User(Role::Admin), user: None, session: None, method: "none", bot: None, bot_for: None, bot_token: None }))
+            .layer(Extension(Caller { principal: Principal::User(Role::Admin), user: None, session: None, method: "none", bot: None, bot_for: None, bot_token: None, grants: rbac::Perms::NONE }))
             .with_state(app.clone());
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();

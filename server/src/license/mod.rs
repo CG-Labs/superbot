@@ -862,4 +862,22 @@ mod tests {
         l.load(env(&[]));
         assert_eq!(l.status().mode, Mode::Unlicensed, "an empty file is no license");
     }
+
+    /// Air-gapped servers (ADR 0128): a license is checked against the keys built into botd
+    /// and seats are counted in the local database, so licensing must never need a network.
+    #[test]
+    fn licensing_never_reaches_the_network() {
+        for (file, src) in [("license/mod.rs", include_str!("mod.rs")), ("license/token.rs", include_str!("token.rs"))] {
+            let code = src.split("\n#[cfg(test)]\n").next().unwrap();
+            for needle in ["reqwest", "hyper", "TcpStream", "UdpSocket", "ToSocketAddrs", "lookup_host", "http://", "https://"] {
+                assert!(!code.contains(needle), "{file} uses {needle}: licensing must work with no network (ADR 0128)");
+            }
+        }
+        // A year-long license verifies, with its seats, from the key alone.
+        let l = lic("lic-offline");
+        let c = claims(Some(12), 365);
+        l.load(env(&[("LICENSE_KEY", &mint(&c))]));
+        let s = l.status();
+        assert_eq!((s.mode, s.seat_cap(), s.usable()), (Mode::Active, Some(12), true));
+    }
 }

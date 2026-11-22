@@ -19,6 +19,10 @@ Re-run with `--upgrade` to pull latest `main`, rebuild, and restart. Exit status
 curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/install.sh | sudo bash -s -- --upgrade
 ```
 
+## Air-gapped (no internet)
+
+Install or upgrade from an offline bundle with `sudo bash install.sh --offline <bundle> --bundle-sha256 <hex> --domain <name> --tls-cert <pem> --tls-key <pem>`: nothing is downloaded or built, and Caddy uses your certificate. See [docs/ops/air-gapped.md](../docs/ops/air-gapped.md).
+
 ## From a local checkout
 
 ```sh
@@ -676,6 +680,25 @@ Each Stripe customer is linked to one user, from a completed checkout or the fir
 Usage and token metering ([ADR 0050](../docs/adr/0050-billing-period-token-usage.md)): botd records each run's model tokens and counts runs and tokens per billing period, the paid subscription's period or else the calendar month. People see theirs on the Plan screen and with `botctl usage me`. To report tokens to Stripe for usage-based prices, create a meter in Stripe (aggregation: sum; customer mapping from `stripe_customer_id`), set `STRIPE_METER_EVENT` to its event name, and restart. Off unless set; it needs `STRIPE_SECRET_KEY`, and a restricted key also needs write access to Meter Events.
 
 An active, trialing, or past-due subscription puts the user on its price's tier; a canceled, unpaid, or paused one moves them back to the default tier. Events are checked against their signature and a 5-minute clock window, applied once, and in order. Every change is audited (`user.tier_changed` with `source: stripe`, `billing.subscription_synced`); events botd can't place are audited as `billing.event_ignored`. A subscription event replaces a tier an admin set by hand.
+
+### Published plans (optional)
+
+`botd` can publish your plans at `/pricing` (a page with no script, styled like `/status`) and `/api/plans` (its JSON, for your own site), open to anyone, through Caddy like every other path ([ADR 0121](../docs/adr/0121-published-plans.md)). Both come from `TIERS_FILE`, so what they say is what `botd` enforces: each tier with `stripePrices` or `publishedPrices`, in the file's order, with its label, limits (Bots, runs a month, tokens a month, routine runs a day, storage, and runs at once while Bots run on their owners' machines), its machine's CPUs, memory and disk when the provider knows them without an API call (Incus plans; not Linode types yet), that its machine has its own kernel only when `MACHINE_OWN_KERNEL_TIERS` holds it to one ([ADR 0120](../docs/adr/0120-managed-substrate.md); a tier without `machineType` needs `all`), and its `features`. They never show Stripe price ids, models, routes, providers, machine plan ids, users or counts.
+
+| Setting | Meaning |
+|---|---|
+| `PLANS_PAGE` | `auto` (default): on only while billing is on, so a self-hosted server with billing off publishes nothing; `on`: always (for a test server, say); `off`: never (both answer 404) |
+| `PLANS_CONTACT_URL` | Where Enterprise buyers ask: an `https://` page or a `mailto:` address. Unset: no Enterprise entry, and tiers without a price say "Contact us" without a link |
+
+Prices are yours to write: `botd` never reads them from Stripe and ships none. Add them to each tier in the tiers file, in the currency's smallest unit as Stripe counts `unit_amount` (`2900` in `gbp` is £29.00), per person, at most one per currency and interval. Currencies come from a fixed list (`gbp`, `eur`, `usd` and other common ones, Stripe's zero-decimal ones such as `jpy`, and three-decimal ones such as `kwd`, where `1500` is 1.500), so a typo stops `botd` at start:
+
+```json
+{ "name": "pro", "label": "Pro", "stripePrices": ["price_..."],
+  "publishedPrices": [{ "amount": <amount>, "currency": "gbp", "interval": "month" }],
+  "features": ["Hermes Agent and Claude Code", "Email support"], ... }
+```
+
+Keep `publishedPrices` the same as the Stripe prices in `stripePrices`: Stripe charges its own price, whatever the page says. A tier without `publishedPrices` shows "Contact us", and `botd`'s startup log names it. The page says prices are per person and that a team pays one seat per member ([ADR 0093](../docs/adr/0093-team-billing.md)); it links to the app's Plan screen when checkout is on, to `/get-started` when sign-ups are on, and to `/status` while it is on. Restart `botd` after editing the file. A public site can link to `/pricing`, or read `/api/plans` to show the same numbers.
 
 ## License
 
