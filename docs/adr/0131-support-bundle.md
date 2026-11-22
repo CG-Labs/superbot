@@ -20,7 +20,7 @@ Three constraints:
 
 ### An admin API, saved by botctl
 
-`GET /api/support/bundle` answers an admin with a tar file (`application/x-tar`, `Content-Disposition: attachment; filename="superbot-support-<UTC time>.tar"`, `Cache-Control: no-store`). It isn't in the RBAC table, so it takes the default for unlisted routes: admins only; members, read-only users and Bots get 403. Each bundle is audited as `support.bundle_created` with its name, size, files and counts.
+`GET /api/support/bundle` answers an admin with a tar file (`application/x-tar`, `Content-Disposition: attachment; filename="superbot-support-<UTC time>.tar"`, `Cache-Control: no-store`). It isn't in the RBAC table, so it takes the default for unlisted routes: admins only. Members, read-only users and Bots get 403, and so does anyone with a custom role, which can't hold the admin permission ([ADR 0123](0123-custom-roles.md)). Each bundle is audited as `support.bundle_created` with its name, size, files and counts.
 
 `botctl support-bundle [-o <file>]` calls it with the operator's credentials (loopback only, as every operator command), reads the reply as bytes, and saves it under the server's name or the one given: created new (never over an existing file) and mode 0600. It prints the path and how to read it.
 
@@ -76,7 +76,7 @@ Chats, prompts, tool inputs and outputs, files, harness transcripts, users and t
 ## Tests
 
 - `support::tests`: secret-named settings lose their values; `_FILE`/`_PATH`/`_DIR` settings and plain ones are kept; secrets are found by shape in innocent names (URLs with credentials, paths and queries, `Bearer`, `token=`, key prefixes, random strings, private keys); a registered secret is redacted anywhere; emails and URLs are cut without eating neighbouring text; the environment shows only botd's settings, sorted, naming what it changed and counting the rest; the documented list parses from `.env.example`; the tar reads back with valid checksums, and the system `tar -tvf` agrees.
-- `support_http_tests.rs`, on the real router: members, read-only users and Bots get 403, nobody gets 401; an admin gets a tar with the right headers and the seven files, audited once with matching size; the bundle carries version, health (an approval waiting, the setup checklist, the license), config, the audit summary with a failed sign-in's reason, and a manifest whose sizes match; a registered secret, a session token, an email, a chat message and a webhook path, logged or audited, appear nowhere in it; settings are redacted by name, shape and known value, and host variables are left out.
+- `support_http_tests.rs`, on the real router: members, read-only users, a custom role with every delegable permission, and Bots get 403, nobody gets 401; an admin gets a tar with the right headers and the seven files, audited once with matching size; the bundle carries version, health (an approval waiting, the setup checklist, the license), config, the audit summary with a failed sign-in's reason, and a manifest whose sizes match; a registered secret, a session token, an email, a chat message and a webhook path, logged or audited, appear nowhere in it; settings are redacted by name, shape and known value, and host variables are left out.
 - `botctl` tests: `support-bundle` options, only plain file names from `Content-Disposition`, and saved files private and never overwritten.
 - `auth_review_http_tests.rs` checks the new route refuses callers without credentials, as for every route.
 

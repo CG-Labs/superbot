@@ -1,5 +1,6 @@
-//! The support bundle (ADR 0131) on the real router: admins only, audited, a tarball any
-//! `tar` reads, with the files support needs, and never a secret, an email or a chat.
+//! The support bundle (ADR 0131) on the real router: admins only (no custom role reaches
+//! it, ADR 0123), audited, a tarball any `tar` reads, with the files support needs, and
+//! never a secret, an email or a chat.
 
 use crate::audit::{Actor, Event, Outcome};
 use crate::obs::log::log_warn;
@@ -45,8 +46,14 @@ async fn only_admins_get_it_and_it_is_audited() {
     let (port, app, admin, key) = serve_app().await;
     let (_, member) = user_with(port, &admin, "m@example.com", "member").await;
     let (_, readonly) = user_with(port, &admin, "r@example.com", "readonly").await;
+    let (delegate_id, delegate) = user_with(port, &admin, "d@example.com", "member").await;
+    let every = ["users.manage", "bots.manage", "audit.view", "billing.manage", "signups.approve", "machines.manage"];
+    let (code, role) = call(port, "POST", "/api/roles", &admin, &json!({ "name": "Everything delegable", "permissions": every }).to_string()).await;
+    assert_eq!(code, 201, "{role}");
+    let path = format!("/api/roles/{}/users/{delegate_id}", parse(&role)["id"].as_str().unwrap());
+    assert_eq!(call(port, "PUT", &path, &admin, "").await.0, 200);
     let bot = app.db.create_bot("Walker", "#fff", "waddle", "claude", None, false);
-    for (who, auth) in [("member", member.as_str()), ("readonly", readonly.as_str()), ("bot", key.auth(&bot.id).as_str())] {
+    for (who, auth) in [("member", member.as_str()), ("readonly", readonly.as_str()), ("custom role", delegate.as_str()), ("bot", key.auth(&bot.id).as_str())] {
         assert_eq!(call(port, "GET", "/api/support/bundle", auth, "").await.0, 403, "{who}");
     }
     assert_eq!(call(port, "GET", "/api/support/bundle", "", "").await.0, 401);
