@@ -125,8 +125,12 @@ async fn handle(State(f): State<Arc<Fake>>, method: Method, uri: Uri, headers: H
     if let Some((repo, id)) = rest.split_once("/blobs/uploads/") {
         if method == Method::POST && id.is_empty() {
             s.next_upload += 1;
-            let origin = if f.mode.upload_elsewhere { elsewhere.as_str() } else { "" };
-            return reply(StatusCode::ACCEPTED, &[("location", format!("{origin}/v2/{repo}/blobs/uploads/u{}?state=x", s.next_upload))], vec![]);
+            // Relative to the request, as a registry may answer.
+            let location = match f.mode.upload_elsewhere {
+                true => format!("{elsewhere}/v2/{repo}/blobs/uploads/u{}?state=x", s.next_upload),
+                false => format!("u{}?state=x", s.next_upload),
+            };
+            return reply(StatusCode::ACCEPTED, &[("location", location)], vec![]);
         }
         s.upload_auth.push(auth.to_string());
         let digest = uri.query().unwrap_or_default().split('&').find_map(|kv| kv.strip_prefix("digest=")).unwrap_or_default().replace("%3A", ":");
@@ -192,8 +196,11 @@ async fn handle(State(f): State<Arc<Fake>>, method: Method, uri: Uri, headers: H
         let page: Vec<Value> = all.iter().skip(from).take(n).cloned().collect();
         let mut h = vec![("content-type", OCI_INDEX.to_string())];
         if from + n < all.len() {
-            let origin = if f.mode.page_elsewhere { elsewhere.as_str() } else { "" };
-            h.push(("link", format!("<{origin}/v2/{repo}/referrers/{digest}?from={}>; rel=\"next\"", from + n)));
+            let link = match f.mode.page_elsewhere {
+                true => format!("<{elsewhere}/v2/{repo}/referrers/{digest}?from={}>; rel=\"next\"", from + n),
+                false => format!("<?from={}>; rel=\"next\"", from + n),
+            };
+            h.push(("link", link));
         }
         let index = json!({ "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": page });
         return reply(StatusCode::OK, &h, index.to_string().into_bytes());
@@ -604,10 +611,14 @@ async fn the_login_goes_to_the_registry_alone_not_to_an_upload_elsewhere() {
 async fn a_registry_on_https_cant_send_us_to_http() {
     let c = Client::new(&Settings::default(), &Repo::parse("reg.test/a").unwrap(), true).await.unwrap();
     for bad in ["http://reg.test/v2/a/blobs/uploads/1", "http://storage.test/u/1", "ftp://reg.test/x"] {
-        assert!(c.resolve(bad, "upload location").unwrap_err().contains("isn't HTTPS"), "{bad}");
+        assert!(c.resolve("https://reg.test/v2/a/blobs/uploads/", bad, "upload location").unwrap_err().contains("isn't HTTPS"), "{bad}");
     }
-    assert_eq!(c.resolve("/v2/a/blobs/uploads/1?s=x", "upload location").unwrap().as_str(), "https://reg.test/v2/a/blobs/uploads/1?s=x");
-    assert!(c.resolve("https://storage.test/u/1", "upload location").is_ok(), "storage elsewhere, over HTTPS, without our login");
+    let start = "https://reg.test/v2/a/blobs/uploads/";
+    assert_eq!(c.resolve(start, "/v2/a/blobs/uploads/1?s=x", "upload location").unwrap().as_str(), "https://reg.test/v2/a/blobs/uploads/1?s=x");
+    assert_eq!(c.resolve(start, "1?s=x", "upload location").unwrap().as_str(), "https://reg.test/v2/a/blobs/uploads/1?s=x", "relative to the request");
+    let page = "https://reg.test/v2/a/referrers/sha256:x";
+    assert_eq!(c.resolve(page, "?from=1", "next page").unwrap().as_str(), "https://reg.test/v2/a/referrers/sha256:x?from=1");
+    assert!(c.resolve(start, "https://storage.test/u/1", "upload location").is_ok(), "storage elsewhere, over HTTPS, without our login");
     assert_eq!(next_link(r#"</v2/a/referrers/x?n=2>; rel="next""#), Some("/v2/a/referrers/x?n=2"));
     assert_eq!(next_link(r#"<https://a.test/p>; rel="prev", </q>; rel=next"#), Some("/q"));
     assert_eq!(next_link("</q>"), None);

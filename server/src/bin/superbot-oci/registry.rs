@@ -191,11 +191,14 @@ impl Client {
         }
     }
 
-    /// A URL the registry gave us (an upload location, a next page), resolved against it.
-    /// One that would drop from HTTPS to HTTP is refused.
-    pub fn resolve(&self, target: &str, what: &str) -> Result<url::Url, String> {
+    /// A URL the registry gave us (an upload location, a next page), resolved against the
+    /// request it answered, as relative references are. One that would drop from HTTPS to HTTP
+    /// is refused.
+    pub fn resolve(&self, request: &str, target: &str, what: &str) -> Result<url::Url, String> {
         let base = url::Url::parse(&self.base).map_err(|e| e.to_string())?;
-        let url = base.join(target).map_err(|e| format!("{}'s {what} {target}: {e}", self.repo.host))?;
+        let url = url::Url::parse(request)
+            .and_then(|r| r.join(target))
+            .map_err(|e| format!("{}'s {what} {target}: {e}", self.repo.host))?;
         if !matches!(url.scheme(), "https" | "http") || (base.scheme() == "https" && url.scheme() != "https") {
             return Err(format!("{} gave a {what} that isn't HTTPS ({url}): refusing it", self.repo.host));
         }
@@ -352,7 +355,7 @@ impl Client {
                 return Err(format!("{what} list more than {MAX_REFERRERS}: refusing them"));
             }
             let Some(next) = next else { return Ok(Some(all)) };
-            let u = self.resolve(&next, "next page of referrers")?;
+            let u = self.resolve(&url, &next, "next page of referrers")?;
             if !self.ours(u.as_str()) {
                 return Err(format!("{what} continue on {u}, not on {}: refusing it", self.repo.host));
             }
@@ -424,12 +427,13 @@ impl Client {
         if self.blob_exists(digest).await? {
             return Ok(());
         }
-        let res = self.send(Method::POST, &self.url("blobs/uploads/"), &[(CONTENT_LENGTH, "0".into())], &Body::Empty).await?;
+        let start = self.url("blobs/uploads/");
+        let res = self.send(Method::POST, &start, &[(CONTENT_LENGTH, "0".into())], &Body::Empty).await?;
         if res.status() != StatusCode::ACCEPTED {
             return Err(Self::failure(format!("Couldn't start an upload to {}", self.repo), res).await);
         }
         let loc = res.headers().get(LOCATION).and_then(|v| v.to_str().ok()).ok_or(format!("{} started an upload without a Location", self.repo.host))?;
-        let mut url = self.resolve(loc, "upload location")?;
+        let mut url = self.resolve(&start, loc, "upload location")?;
         url.query_pairs_mut().append_pair("digest", digest);
         let res = self.send(Method::PUT, url.as_str(), &[], body).await?;
         if !res.status().is_success() {
