@@ -118,6 +118,24 @@ jobs:
         run: |
           sudo SUPERBOT_MACHINE_BOT_USER_TEST=1 /tmp/botd-tests --ignored --exact \
             machines_hardening_tests::as_root_runs_are_held_to_their_limits_and_say_when_they_hit_them
+      # ADR 0145: red team. A locked-down run tries to raise its privileges, read
+      # another person's or the agent's files, get past the allow-list, and take the machine.
+      - name: "Red team: a run can't raise its privileges"
+        run: |
+          sudo SUPERBOT_MACHINE_BOT_USER_TEST=1 /tmp/botd-tests --ignored --exact \
+            machines_redteam_tests::as_root_red_team_a_run_cant_raise_its_privileges
+      - name: "Red team: Bots can't reach another person's files or the agent's secrets"
+        run: |
+          sudo SUPERBOT_MACHINE_BOT_USER_TEST=1 /tmp/botd-tests --ignored --exact \
+            machines_redteam_tests::as_root_red_team_bots_cant_reach_another_persons_files_or_the_agents_secrets
+      - name: "Red team: a run can't get past or change the allow-list"
+        run: |
+          sudo SUPERBOT_MACHINE_BOT_USER_TEST=1 /tmp/botd-tests --ignored --exact \
+            machines_redteam_tests::as_root_red_team_a_run_cant_get_past_or_change_the_allow_list
+      - name: "Red team: a run can't exhaust the machine"
+        run: |
+          sudo SUPERBOT_MACHINE_BOT_USER_TEST=1 /tmp/botd-tests --ignored --exact \
+            machines_redteam_tests::as_root_red_team_a_run_cant_exhaust_the_machine
 
   shellcheck:
     runs-on: ubuntu-latest

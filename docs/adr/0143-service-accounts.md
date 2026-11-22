@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (22 Nov 2026). Third slice of [#53](https://github.com/CG-Labs/superbot/issues/53) (M5, "Advanced RBAC"), on top of [ADR 0123](0123-custom-roles.md) (custom roles) and [ADR 0132](0132-custom-roles-in-the-apps.md) (custom roles in the apps). Follows [ADR 0009](0009-audit-events.md) (the audit log) and [ADR 0012](0012-users-sessions-rbac.md) (users, sessions and roles).
+Accepted (22 Nov 2026). Fourth slice of [#53](https://github.com/CG-Labs/superbot/issues/53) (M5, "Advanced RBAC"), on top of [ADR 0123](0123-custom-roles.md) (custom roles), [ADR 0132](0132-custom-roles-in-the-apps.md) (custom roles in the apps) and [ADR 0138](0138-scim-group-role-mapping.md) (SCIM group-to-role mapping). Follows [ADR 0009](0009-audit-events.md) (the audit log) and [ADR 0012](0012-users-sessions-rbac.md) (users, sessions and roles).
 
 ## Context
 

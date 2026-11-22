@@ -156,6 +156,11 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    when it pushes the group with that externalId
                                                    (or, with none, that name; the team's by default)
   botctl scim group unlink <team>                  The team is managed by hand again; everyone stays
+  botctl scim role-mappings                        SCIM groups mapped to custom roles (SCIM_GROUP_ROLES=on)
+  botctl scim role map <team> <role> [--org]       The group <team> is gives its members <role> in the
+                                                   team, or with --org across the server. Never admin
+  botctl scim role show <id>                       A mapping and who it gave the role to
+  botctl scim role unmap <id>                      Takes the role from everyone the mapping gave it to
   botctl sessions [<user>]                         Live sessions
   botctl session revoke <id>
   botctl session revoke-all <user>
@@ -1030,13 +1035,20 @@ fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
             ("POST", "/api/scim/groups".into(), Some(body.to_string()))
         }
         ["group", "unlink", team] => ("DELETE", format!("/api/scim/groups/{}", encode(team)), None),
+        ["role-mappings"] | ["role", "list"] => ("GET", "/api/scim/role-mappings".into(), None),
+        ["role", "map", team, role, rest @ ..] if !team.starts_with("--") && !role.starts_with("--") && rest.iter().all(|a| *a == "--org") => {
+            let body = json!({ "team": team, "role": role, "scope": if rest.is_empty() { "team" } else { "org" } });
+            ("POST", "/api/scim/role-mappings".into(), Some(body.to_string()))
+        }
+        ["role", "show", id] => ("GET", format!("/api/scim/role-mappings/{}", encode(id)), None),
+        ["role", "unmap", id] => ("DELETE", format!("/api/scim/role-mappings/{}", encode(id)), None),
         ["token", "create", tenant, rest @ ..] if !tenant.starts_with("--") => {
             let body = json!({ "tenant": tenant, "sso": flag(rest, "--sso"), "label": flag(rest, "--label") });
             ("POST", "/api/scim/tokens".into(), Some(body.to_string()))
         }
         ["token", "revoke", id] => ("DELETE", format!("/api/scim/tokens/{}", encode(id)), None),
         _ => {
-            return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team>".into());
+            return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team> | role-mappings | role map <team> <role> [--org] | role show <id> | role unmap <id>".into());
         }
     })
 }
@@ -2552,6 +2564,16 @@ mod tests {
         assert!(req(&["group", "link", "okta"]).is_err());
         assert!(req(&["group", "link", "okta", "--name", "x"]).is_err());
         assert!(req(&["group", "unlink"]).is_err());
+        assert_eq!(req(&["role-mappings"]), Ok(("GET", "/api/scim/role-mappings".into(), None)));
+        assert_eq!(req(&["role", "list"]), Ok(("GET", "/api/scim/role-mappings".into(), None)));
+        assert_eq!(req(&["role", "map", "t1", "Support Lead"]), Ok(("POST", "/api/scim/role-mappings".into(), Some(json!({ "team": "t1", "role": "Support Lead", "scope": "team" })))));
+        assert_eq!(req(&["role", "map", "t1", "auditor", "--org"]), Ok(("POST", "/api/scim/role-mappings".into(), Some(json!({ "team": "t1", "role": "auditor", "scope": "org" })))));
+        assert_eq!(req(&["role", "show", "sm 1"]), Ok(("GET", "/api/scim/role-mappings/sm%201".into(), None)));
+        assert_eq!(req(&["role", "unmap", "sm1"]), Ok(("DELETE", "/api/scim/role-mappings/sm1".into(), None)));
+        assert!(req(&["role", "map", "t1"]).is_err());
+        assert!(req(&["role", "map", "--org", "t1"]).is_err());
+        assert!(req(&["role", "map", "t1", "auditor", "--team"]).is_err());
+        assert!(req(&["role", "unmap"]).is_err());
 
         let res = json!({ "token": "sbp_x", "enabled": false, "scimToken": { "id": "st1", "tenant": "entra", "ssoProvider": "work" } });
         let out = scim_created(&res);

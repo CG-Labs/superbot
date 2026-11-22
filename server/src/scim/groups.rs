@@ -5,8 +5,9 @@
 //! touched, and never shown. Joining and leaving go through the same code as a team
 //! admin's add and remove, so offboarding (ADR 0052, 0066) and team billing's seats
 //! (ADR 0093) follow. SCIM never gives a team role: members join as `member`, and a
-//! team the IdP made has no owner until a server admin names one. Off unless
-//! SCIM_GROUPS=on as well as SCIM=on.
+//! team the IdP made has no owner until a server admin names one. An admin can map a
+//! group to a custom role (ADR 0138, `roles`), which its members get and lose with it.
+//! Off unless SCIM_GROUPS=on as well as SCIM=on.
 
 use super::*;
 use crate::db::{ScimGroup, ScimGroupConflict, Team};
@@ -399,7 +400,7 @@ struct Moved {
 /// Takes `gone` off the team and puts `new` on it, through the team's own join and
 /// leave. A join refused by a race (someone joined another team meanwhile) stops there
 /// with a 409; what was done stays done, and the IdP's retry finishes it.
-async fn change_members(app: &AppState, c: &Caller, team: &Team, gone: &[String], new: &[String]) -> ScimRes<Moved> {
+async fn change_members(app: &AppState, a: &Auth, c: &Caller, team: &Team, gone: &[String], new: &[String]) -> ScimRes<Moved> {
     let mut m = Moved::default();
     for id in gone {
         let owner = app.db.team_member(id).is_some_and(|x| x.team_id == team.id && x.role == teams::OWNER);
@@ -411,7 +412,10 @@ async fn change_members(app: &AppState, c: &Caller, team: &Team, gone: &[String]
     for id in new {
         let Some(u) = app.db.user(id) else { continue };
         match teams::join_from_scim(app, &c.who, team, &u).await {
-            Ok(_) => m.added.push(id.clone()),
+            Ok(_) => {
+                super::roles::joined(app, a, &c.who, &c.token.tenant, &team.id, id).await;
+                m.added.push(id.clone())
+            }
             Err(e) if e.0 == StatusCode::CONFLICT && app.db.team_id_of(id).as_deref() == Some(team.id.as_str()) => {}
             Err(e) => return Err(uniqueness(format!("{id}: {}", e.1))),
         }
@@ -513,7 +517,7 @@ pub async fn create(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
             app.db.record(&c.who.event(action).target("team", &g.team_id).details(json!({
                 "tenant": tenant, "team": g.team_id, "externalId": g.external_id, "displayName": g.display_name, "linkedBy": link.created_by,
             })));
-            let moved = change_members(&app, &c, &team, &gone, &joining).await.inspect_err(|_| app.db.reopen_scim_group(tenant, &g.team_id))?;
+            let moved = change_members(&app, &a, &c, &team, &gone, &joining).await.inspect_err(|_| app.db.reopen_scim_group(tenant, &g.team_id))?;
             record_update(&app, &c, &link, &g, &moved);
             g
         }
@@ -525,7 +529,7 @@ pub async fn create(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
             app.db.record(&c.who.event("scim.group_created").target("team", &team.id).details(json!({
                 "tenant": tenant, "team": team.id, "externalId": g.external_id, "displayName": g.display_name,
             })));
-            change_members(&app, &c, &team, &[], &new).await.inspect_err(|_| app.db.reopen_scim_group(tenant, &g.team_id))?;
+            change_members(&app, &a, &c, &team, &[], &new).await.inspect_err(|_| app.db.reopen_scim_group(tenant, &g.team_id))?;
             g
         }
     };
@@ -539,7 +543,7 @@ pub async fn create(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
 
 /// Saves a group's new attributes and members. `externalId` can be set once, never
 /// changed.
-async fn update(app: &AppState, c: &Caller, before: &ScimGroup, team: &Team, p: &Patched, members: &[String]) -> ScimRes<ScimGroup> {
+async fn update(app: &AppState, a: &Auth, c: &Caller, before: &ScimGroup, team: &Team, p: &Patched, members: &[String]) -> ScimRes<ScimGroup> {
     if let Some(old) = before.external_id.as_deref()
         && p.external_id.as_deref() != Some(old)
     {
@@ -548,7 +552,7 @@ async fn update(app: &AppState, c: &Caller, before: &ScimGroup, team: &Team, p: 
     let (gone, new) = p.delta(members);
     check_new(app, c, Some(&team.id), &new)?;
     let g = app.db.save_scim_group(&c.token.tenant, &team.id, p.external_id.as_deref(), &p.display_name, &team_name(&p.display_name), true).map_err(group_conflict)?;
-    let moved = change_members(app, c, team, &gone, &new).await?;
+    let moved = change_members(app, a, c, team, &gone, &new).await?;
     record_update(app, c, before, &g, &moved);
     Ok(app.db.scim_group(&c.token.tenant, &team.id).unwrap_or(g))
 }
@@ -569,7 +573,7 @@ pub async fn replace(State(app): State<AppState>, Extension(a): Extension<Arc<Au
     if let Some(m) = d.members {
         p.replace(m);
     }
-    let g = update(&app, &c, &before, &team, &p, &members).await?;
+    let g = update(&app, &a, &c, &before, &team, &p, &members).await?;
     Ok(scim_json(StatusCode::OK, resource(&app, &base_url(&headers), &g, true)))
 }
 
@@ -584,7 +588,7 @@ pub async fn patch(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
     let members: Vec<String> = app.db.scim_group_members(&c.token.tenant, &team.id, true).into_iter().map(|u| u.id).collect();
     let mut p = Patched::new(&before.display_name, before.external_id.as_deref(), &members);
     apply_patch(&mut p, &v)?;
-    update(&app, &c, &before, &team, &p, &members).await?;
+    update(&app, &a, &c, &before, &team, &p, &members).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -600,7 +604,8 @@ pub async fn delete(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
     let _writes = a.scim.group_writes.lock().await;
     let (g, team) = need(&app, &c, &id)?;
     let members: Vec<String> = app.db.scim_group_members(&c.token.tenant, &team.id, true).into_iter().map(|u| u.id).collect();
-    let moved = change_members(&app, &c, &team, &members, &[]).await?;
+    let moved = change_members(&app, &a, &c, &team, &members, &[]).await?;
+    super::roles::group_gone(&app, &c.who, &team.id).await;
     app.db.unlink_scim_group(&team.id);
     let left = app.db.team_members(&team.id).len();
     let fate = if g.origin == "scim" && left == 0 {
@@ -685,8 +690,12 @@ pub async fn link(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>
 
 /// `DELETE /api/scim/groups/{team}`: ends the link. Everyone stays on the team, which
 /// admins and the team's managers manage by hand again; the IdP's group is 404 to it.
+/// Its role mappings go, with the roles they gave (ADR 0138).
 pub async fn unlink(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(team): Path<String>) -> Res {
     let _writes = a.scim.group_writes.lock().await;
+    if app.db.scim_group_of_team(&team).is_some() {
+        super::roles::group_gone(&app, &by, &team).await;
+    }
     let g = app.db.unlink_scim_group(&team).ok_or_else(|| not_found("SCIM group"))?;
     app.db.record(&by.event("scim.group_unlinked").target("team", &team).details(json!({ "tenant": g.tenant, "team": team, "externalId": g.external_id, "displayName": g.display_name, "origin": g.origin })));
     Ok(Json(json!({ "ok": true })))
