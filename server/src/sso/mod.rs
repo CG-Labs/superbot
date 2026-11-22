@@ -554,7 +554,10 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
             if encryption == Encryption::Off && enc_cert.is_some() {
                 return Err(format!("{} is only for {}=allow or require", key("SP_ENCRYPTION_CERT_FILE"), key("ENCRYPTED_ASSERTIONS")));
             }
-            if enc_cert.is_some() && enc_cert == sp_cert {
+            let same_key = |a: &str, b: &str| matches!((xmldsig::Cert::from_base64(a), xmldsig::Cert::from_base64(b)), (Ok(a), Ok(b)) if a.same_key(&b));
+            if let (Some(e), Some(s)) = (&enc_cert, &sp_cert)
+                && same_key(e, s)
+            {
                 return Err(format!("{} must be another key than {}: one key for signing, another for encryption", key("SP_ENCRYPTION_CERT_FILE"), key("SP_CERT_FILE")));
             }
             (Kind::SamlSp { entity_id, sp_entity_id, source, attributes, allowed_domains, sign_requests, sp_cert, encryption, enc_cert }, saml::LABEL)
@@ -1935,6 +1938,21 @@ mod tests {
         assert!(err.contains("only for SSO_CORP_ENCRYPTED_ASSERTIONS=allow or require"), "{err}");
         let err = native(&[("SSO_CORP_ENCRYPTED_ASSERTIONS", "allow"), ("SSO_CORP_SP_CERT_FILE", leak(&sign_pem)), ("SSO_CORP_SP_ENCRYPTION_CERT_FILE", leak(&sign_pem))]).err().unwrap();
         assert!(err.contains("one key for signing, another for encryption"), "{err}");
+        // Another certificate, but for the signing certificate's key: still one key.
+        let (_, sign_der) = SpKey::generate("sign").unwrap();
+        let reissue = |cn: &str| {
+            let kp = rcgen::KeyPair::try_from(sign_der.as_slice()).unwrap();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.distinguished_name.push(rcgen::DnType::CommonName, cn);
+            format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", base64::engine::general_purpose::STANDARD.encode(params.self_signed(&kp).unwrap().der()))
+        };
+        let (first, second) = (dir.join("first.pem"), dir.join("second.pem"));
+        std::fs::write(&first, reissue("signing")).unwrap();
+        std::fs::write(&second, reissue("encryption")).unwrap();
+        assert_ne!(std::fs::read(&first).unwrap(), std::fs::read(&second).unwrap());
+        let err = native(&[("SSO_CORP_ENCRYPTED_ASSERTIONS", "allow"), ("SSO_CORP_SP_CERT_FILE", leak(&first)), ("SSO_CORP_SP_ENCRYPTION_CERT_FILE", leak(&second))]).err().unwrap();
+        assert!(err.contains("one key for signing, another for encryption"), "{err}");
+        assert!(native(&[("SSO_CORP_ENCRYPTED_ASSERTIONS", "allow"), ("SSO_CORP_SP_CERT_FILE", leak(&sign_pem)), ("SSO_CORP_SP_ENCRYPTION_CERT_FILE", leak(&enc_pem))]).is_ok(), "two keys");
         assert!(native(&[("SSO_CORP_ENCRYPTED_ASSERTIONS", "allow"), ("SSO_CORP_SP_ENCRYPTION_CERT_FILE", "/nonexistent/enc.pem")]).is_err());
 
         // Its own key, as its own secret: not offered until that is set and matches.

@@ -512,23 +512,27 @@ fn ids_under<'a>(n: Node<'a, '_>) -> impl Iterator<Item = &'a str> {
 /// A decrypted assertion, made a document of its own in the namespaces the
 /// `EncryptedAssertion` had in scope: it was serialized (and usually signed) in that context,
 /// so its prefixes may be declared only there. An XML declaration in front is dropped.
-fn in_context(encrypted: Node, plaintext: &[u8]) -> Result<String, Refused> {
+fn in_context(encrypted: Node, plaintext: &[u8]) -> Result<Zeroizing<String>, Refused> {
     let bad = || Refused("bad_response", None);
     let text = std::str::from_utf8(plaintext).map_err(|_| bad())?.trim_start_matches('\u{feff}');
     let text = match text.strip_prefix("<?xml") {
         Some(rest) => &rest[rest.find("?>").ok_or_else(bad)? + 2..],
         None => text,
     };
-    let mut xml = String::from("<decrypted");
+    let mut open = String::from("<decrypted");
     for ns in encrypted.namespaces().filter(|ns| ns.name() != Some("xml")) {
         match ns.name() {
-            Some(p) => xml += &format!(r#" xmlns:{p}="{}""#, escape(ns.uri())),
-            None => xml += &format!(r#" xmlns="{}""#, escape(ns.uri())),
+            Some(p) => open += &format!(r#" xmlns:{p}="{}""#, escape(ns.uri())),
+            None => open += &format!(r#" xmlns="{}""#, escape(ns.uri())),
         }
     }
-    xml += ">";
-    xml += text;
-    xml += "</decrypted>";
+    open += ">";
+    const CLOSE: &str = "</decrypted>";
+    // Sized up front, so the plaintext is never left behind in a reallocated buffer.
+    let mut xml = Zeroizing::new(String::with_capacity(open.len() + text.len() + CLOSE.len()));
+    xml.push_str(&open);
+    xml.push_str(text);
+    xml.push_str(CLOSE);
     Ok(xml)
 }
 
@@ -590,7 +594,7 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
 
     // Encrypted: the response's signature, if any, is checked before anything is decrypted.
     // The assertion inside is read with the same rules as a posted one, and is signed or refused.
-    let plaintext: String;
+    let plaintext: Zeroizing<String>;
     let inner: roxmltree::Document;
     let assertion = match key {
         None => found,

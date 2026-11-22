@@ -166,7 +166,8 @@ pub fn decrypt(encrypted: Node, key: &OaepPrivateDecryptingKey) -> Result<Zeroiz
         return Err(bad());
     }
     let keys: Vec<(&OaepAlgorithm, Vec<u8>)> = keys.into_iter().map(encrypted_key).collect::<Result<_, _>>()?;
-    let mut sealed = cipher_value(cipher)?;
+    // Opened in place: the plaintext never leaves this zeroizing buffer.
+    let mut sealed = Zeroizing::new(cipher_value(cipher)?);
     if sealed.len() < GCM_IV + GCM_TAG {
         return Err(bad());
     }
@@ -188,8 +189,10 @@ pub fn decrypt(encrypted: Node, key: &OaepPrivateDecryptingKey) -> Result<Zeroiz
     let opener = LessSafeKey::new(UnboundKey::new(cipher_alg, &content_key).map_err(|_| bad())?);
     let (iv, body) = sealed.split_at_mut(GCM_IV);
     let nonce = Nonce::try_assume_unique_for_key(iv).map_err(|_| bad())?;
-    let plain = opener.open_in_place(nonce, Aad::empty(), body).map_err(|_| bad())?;
-    Ok(Zeroizing::new(plain.to_vec()))
+    let n = opener.open_in_place(nonce, Aad::empty(), body).map_err(|_| bad())?.len();
+    sealed.copy_within(GCM_IV..GCM_IV + n, 0);
+    sealed.truncate(n);
+    Ok(sealed)
 }
 
 #[cfg(test)]
