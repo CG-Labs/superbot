@@ -3,10 +3,11 @@
 
 use super::github::{self, GitHub};
 use super::jwt::{self, Invalid, Jwks, Token};
+use super::saml_sp::{self, Attributes, IdpMetadata};
 use super::{apple, saml};
 use crate::rbac::Role;
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const META_TTL: Duration = Duration::from_secs(24 * 3600);
@@ -39,6 +40,30 @@ pub enum Kind {
     /// token must say the broker used the IdP `alias`; identities are stored under the
     /// IdP's `entity_id`, with its name for the person as the subject.
     Saml { issuer: String, entity_id: String, alias: String, map: ClaimMap, allowed_domains: Vec<String> },
+    /// A SAML 2.0 IdP botd is the service provider for itself (ADR 0127), see `saml_sp`.
+    /// Identities are stored like the bridge's: under `entity_id`, the NameID lowercased.
+    SamlSp { entity_id: String, sp_entity_id: String, source: IdpSource, attributes: Attributes, allowed_domains: Vec<String> },
+}
+
+/// Where a native SAML provider's IdP metadata comes from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum IdpSource {
+    /// `SSO_<ID>_IDP_METADATA_URL`: fetched when needed, again daily.
+    Url(String),
+    /// `SSO_<ID>_IDP_METADATA_FILE`: read at startup.
+    File(String),
+    /// Neither: imported with `botctl sso saml <id> import`, kept in the database.
+    Saved,
+}
+
+impl IdpSource {
+    pub fn name(&self) -> &'static str {
+        match self {
+            IdpSource::Url(_) => "url",
+            IdpSource::File(_) => "file",
+            IdpSource::Saved => "botctl",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -71,6 +96,8 @@ pub struct Provider {
     /// Just-in-time sign-up: who an unknown but valid identity becomes. None: refused.
     pub jit_role: Option<Role>,
     cache: tokio::sync::Mutex<Cache>,
+    /// Native SAML: the IdP's metadata, and when it was loaded.
+    idp: Mutex<Option<(Arc<IdpMetadata>, Instant)>>,
 }
 
 #[derive(Default)]
@@ -80,6 +107,7 @@ struct Cache {
     /// The last failed fetch, so a down IdP costs one timeout per gap, not one per sign-in.
     meta_failed: Option<(Instant, Invalid)>,
     jwks_failed: Option<(Instant, Invalid)>,
+    idp_failed: Option<(Instant, Invalid)>,
 }
 
 pub struct Metadata {
@@ -196,9 +224,25 @@ async fn get_json(http: &reqwest::Client, url: &str) -> Result<Value, Invalid> {
     }
 }
 
+/// An IdP's SAML metadata document, at most `MAX_METADATA` bytes.
+async fn get_text(http: &reqwest::Client, url: &str) -> Result<String, Invalid> {
+    let mut res = http.get(url).header("accept", "application/samlmetadata+xml, application/xml, text/xml").send().await.map_err(|_| Invalid("idp_unreachable"))?;
+    if res.status().as_u16() != 200 {
+        return Err(Invalid("idp_bad_response"));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = res.chunk().await.map_err(|_| Invalid("idp_unreachable"))? {
+        body.extend_from_slice(&chunk);
+        if body.len() > saml_sp::MAX_METADATA {
+            return Err(Invalid("idp_bad_response"));
+        }
+    }
+    String::from_utf8(body).map_err(|_| Invalid("idp_bad_response"))
+}
+
 impl Provider {
     pub fn new(id: &str, label: &str, kind: Kind, client_id: &str, scopes: &str, jit_role: Option<Role>) -> Provider {
-        Provider { id: id.into(), label: label.into(), kind, client_id: client_id.into(), scopes: scopes.into(), jit_role, cache: Default::default() }
+        Provider { id: id.into(), label: label.into(), kind, client_id: client_id.into(), scopes: scopes.into(), jit_role, cache: Default::default(), idp: Mutex::default() }
     }
 
     pub fn type_name(&self) -> &'static str {
@@ -208,8 +252,18 @@ impl Provider {
             Kind::Oidc { .. } => "oidc",
             Kind::Apple { .. } => "apple",
             Kind::GitHub { .. } => "github",
-            Kind::Saml { .. } => "saml",
+            Kind::Saml { .. } | Kind::SamlSp { .. } => "saml",
         }
+    }
+
+    /// botd is the SAML service provider itself, rather than signing in over OIDC.
+    pub fn saml_sp(&self) -> bool {
+        matches!(self.kind, Kind::SamlSp { .. })
+    }
+
+    /// Native SAML has no client secret: it checks signatures with the IdP's certificates.
+    pub fn needs_secret(&self) -> bool {
+        !self.saml_sp()
     }
 
     /// Whether a person with this email could sign in here, as far as the email shows:
@@ -217,14 +271,26 @@ impl Provider {
     /// Some(false) when it isn't, None when the provider doesn't go by email domain.
     pub fn takes_email(&self, email: &str) -> Option<bool> {
         match &self.kind {
-            Kind::Google { hosted_domains: d, .. } | Kind::Oidc { allowed_domains: d, .. } | Kind::Apple { allowed_domains: d, .. } | Kind::Saml { allowed_domains: d, .. } if !d.is_empty() => Some(email_in(email, d)),
+            Kind::Google { hosted_domains: d, .. } | Kind::Oidc { allowed_domains: d, .. } | Kind::Apple { allowed_domains: d, .. } | Kind::Saml { allowed_domains: d, .. } | Kind::SamlSp { allowed_domains: d, .. } if !d.is_empty() => {
+                Some(email_in(email, d))
+            }
             _ => None,
         }
     }
 
     /// OpenID Connect, with an ID token and a nonce. GitHub is plain OAuth 2.
     pub fn oidc(&self) -> bool {
-        !matches!(self.kind, Kind::GitHub { .. })
+        !matches!(self.kind, Kind::GitHub { .. } | Kind::SamlSp { .. })
+    }
+
+    /// Native SAML's domain list (the IdP's email attribute, from its signed assertion): with
+    /// one, the email is required and must be in it, as `email_within` does for OIDC.
+    pub fn check_email(&self, email: Option<&str>) -> Result<(), Invalid> {
+        match self.takes_email(email.unwrap_or("")) {
+            Some(_) if email.is_none() => Err(Invalid("email_unverified")),
+            Some(false) => Err(Invalid("wrong_domain")),
+            _ => Ok(()),
+        }
     }
 
     /// How the IdP returns the code: Apple must POST it when scopes are asked for.
@@ -251,6 +317,10 @@ impl Provider {
             Kind::GitHub { web, allowed_orgs, .. } => format!("members of {} on {web}", allowed_orgs.join(", ")),
             Kind::Saml { entity_id, alias, allowed_domains, .. } if allowed_domains.is_empty() => format!("anyone SAML IdP {entity_id} signs in (broker alias {alias})"),
             Kind::Saml { entity_id, alias, allowed_domains, .. } => format!("verified emails at {} from SAML IdP {entity_id} (broker alias {alias})", allowed_domains.join(", ")),
+            Kind::SamlSp { entity_id, allowed_domains, .. } if allowed_domains.is_empty() => {
+                format!("anyone SAML IdP {entity_id} signs in (native)")
+            }
+            Kind::SamlSp { entity_id, allowed_domains, .. } => format!("emails at {} from SAML IdP {entity_id} (native)", allowed_domains.join(", ")),
         }
     }
 
@@ -275,6 +345,7 @@ impl Provider {
             // Straight to the SAML IdP, past the broker's own login page. Only a shortcut:
             // `claims` checks the IdP the broker actually used.
             Kind::Saml { alias, .. } => vec![(saml::HINT_PARAM, alias.clone())],
+            Kind::SamlSp { .. } => vec![],
         }
     }
 
@@ -311,6 +382,13 @@ impl Provider {
 
     /// Why the provider isn't offered, for the startup log.
     pub fn not_ready(&self) -> Option<String> {
+        if let Kind::SamlSp { source, .. } = &self.kind {
+            let loaded = self.idp.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+            return match source {
+                IdpSource::Saved if !loaded => Some(format!("not offered until its IdP metadata is imported: botctl sso saml {} import < metadata.xml", self.id)),
+                _ => None,
+            };
+        }
         let var = self.env_var();
         match (&self.kind, self.stored_secret()) {
             (_, None) => Some(format!("not offered until {var} is set (env, _FILE, or `botctl secret set`)")),
@@ -324,7 +402,7 @@ impl Provider {
         match &self.kind {
             Kind::Entra { authority, tenant, .. } => Some(format!("{authority}/{tenant}/v2.0/.well-known/openid-configuration")),
             Kind::Google { issuer, .. } | Kind::Oidc { issuer, .. } | Kind::Apple { issuer, .. } | Kind::Saml { issuer, .. } => Some(format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'))),
-            Kind::GitHub { .. } => None,
+            Kind::GitHub { .. } | Kind::SamlSp { .. } => None,
         }
     }
 
@@ -332,6 +410,7 @@ impl Provider {
     pub async fn authorization_endpoint(&self, http: &reqwest::Client, gap: Duration) -> Result<String, Invalid> {
         match &self.kind {
             Kind::GitHub { web, .. } => Ok(format!("{web}/login/oauth/authorize")),
+            Kind::SamlSp { .. } => Ok(self.idp_metadata(http, gap).await?.sso_url.clone()),
             _ => Ok(self.metadata(http, gap).await?.authorization_endpoint.clone()),
         }
     }
@@ -349,7 +428,9 @@ impl Provider {
                 }
                 Ok((format!("{authority}/{tid}/v2.0"), Some(tid)))
             }
-            Kind::Google { issuer, .. } | Kind::Oidc { issuer, .. } | Kind::Apple { issuer, .. } | Kind::GitHub { web: issuer, .. } | Kind::Saml { entity_id: issuer, .. } if tenant.is_none() => Ok((issuer.clone(), None)),
+            Kind::Google { issuer, .. } | Kind::Oidc { issuer, .. } | Kind::Apple { issuer, .. } | Kind::GitHub { web: issuer, .. } | Kind::Saml { entity_id: issuer, .. } | Kind::SamlSp { entity_id: issuer, .. } if tenant.is_none() => {
+                Ok((issuer.clone(), None))
+            }
             _ => Err("tenant is only for Entra providers".into()),
         }
     }
@@ -360,9 +441,70 @@ impl Provider {
         match self.kind {
             Kind::Entra { .. } => guid(s).ok_or_else(|| "subject must be the user's Entra object id (a GUID)".into()),
             Kind::GitHub { .. } => github::user_id(s).ok_or_else(|| "subject must be the GitHub user's numeric id (gh api users/<login> --jq .id), not the login".into()),
-            Kind::Saml { .. } if !s.is_empty() && s.len() <= 255 => Ok(saml::subject(s)),
+            Kind::Saml { .. } | Kind::SamlSp { .. } if !s.is_empty() && s.len() <= 255 => Ok(saml::subject(s)),
             _ if !s.is_empty() && s.len() <= 255 => Ok(s.into()),
             _ => Err("subject must be 1 to 255 characters".into()),
+        }
+    }
+
+    /// Native SAML: the IdP metadata loaded now, from any source.
+    pub fn idp_loaded(&self) -> Option<Arc<IdpMetadata>> {
+        self.idp.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(m, _)| m.clone())
+    }
+
+    /// When the IdP metadata was loaded, for `botctl sso saml`.
+    pub fn idp_age(&self) -> Option<Duration> {
+        self.idp.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(_, at)| at.elapsed())
+    }
+
+    pub fn set_idp(&self, m: IdpMetadata) {
+        *self.idp.lock().unwrap_or_else(|e| e.into_inner()) = Some((Arc::new(m), Instant::now()));
+    }
+
+    /// Native SAML: the IdP metadata. From a URL it's fetched again after a day, and after a
+    /// failure at most once per `gap`, keeping what we had meanwhile, as for OIDC discovery.
+    pub async fn idp_metadata(&self, http: &reqwest::Client, gap: Duration) -> Result<Arc<IdpMetadata>, Invalid> {
+        let Kind::SamlSp { source, entity_id, .. } = &self.kind else {
+            return Err(Invalid("not_configured"));
+        };
+        let (stale, fresh) = match self.idp.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some((m, at)) => (Some(m.clone()), at.elapsed() < META_TTL),
+            None => (None, false),
+        };
+        let IdpSource::Url(url) = source else {
+            return stale.ok_or(Invalid("not_configured"));
+        };
+        if let (Some(m), true) = (&stale, fresh) {
+            return Ok(m.clone());
+        }
+        let mut c = self.cache.lock().await;
+        // Whoever held the lock may just have fetched it.
+        if let Some((m, at)) = self.idp.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+            && at.elapsed() < META_TTL
+        {
+            return Ok(m.clone());
+        }
+        if let Some((at, e)) = c.idp_failed
+            && at.elapsed() < gap
+        {
+            return stale.ok_or(e);
+        }
+        let got = get_text(http, url).await.and_then(|xml| {
+            saml_sp::parse_idp_metadata(&xml, entity_id).map_err(|e| {
+                crate::obs::log::log_warn!("SSO {}: IdP metadata from {url}: {e}", self.id);
+                Invalid("idp_bad_response")
+            })
+        });
+        match got {
+            Ok(m) => {
+                c.idp_failed = None;
+                self.set_idp(m);
+                self.idp_loaded().ok_or(Invalid("idp_bad_response"))
+            }
+            Err(e) => {
+                c.idp_failed = Some((Instant::now(), e));
+                stale.ok_or(e)
+            }
         }
     }
 
@@ -552,7 +694,7 @@ impl Provider {
                 }
                 Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email, name: None, username: None })
             }
-            Kind::GitHub { .. } => Err(Invalid("not_configured")),
+            Kind::GitHub { .. } | Kind::SamlSp { .. } => Err(Invalid("not_configured")),
         }
     }
 }

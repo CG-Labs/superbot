@@ -158,3 +158,19 @@ fn without_just_in_time_no_allow_list_is_needed() {
         assert!(b.healthy(), "{ty}:\n{}", b.log());
     }
 }
+
+/// Native SAML (ADR 0127): no broker or client id, the same rule.
+#[test]
+fn native_saml_follows_the_same_rule() {
+    let native = |extra: &[(&str, &str)]| -> Vec<(String, String)> {
+        let mut v = vec![("SSO_PROVIDERS".to_string(), "corp".to_string()), ("SSO_CORP_TYPE".into(), "saml".into()), ("SSO_CORP_IDP_ENTITY_ID".into(), "http://www.okta.com/exk1abc".into())];
+        v.extend(extra.iter().map(|(k, val)| (format!("SSO_CORP_{k}"), val.to_string())));
+        v
+    };
+    let mut b = start(&native(&[("JIT_ROLE", "member")]));
+    assert!(!b.exits().success());
+    assert!(b.log().contains("SSO: SSO_CORP_JIT_ROLE without SSO_CORP_ALLOWED_DOMAINS"), "{}", b.log());
+    let mut b = start(&native(&[("JIT_ROLE", "member"), ("ALLOWED_DOMAINS", "example.com")]));
+    assert!(b.healthy(), "{}", b.log());
+    assert!(b.log().contains("not offered until its IdP metadata is imported"), "{}", b.log());
+}

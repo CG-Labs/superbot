@@ -18,7 +18,7 @@ Yes. HTTPS to the server, mutual TLS 1.3 between the server and machines, HTTPS 
 Secrets, approval inputs and push tokens are encrypted field by field (XChaCha20-Poly1305) with a master key kept outside the data folder, which the operator can rotate ([ADR 0096](../adr/0096-master-key-rotation.md)). The whole database is encrypted with SQLCipher under a key derived from the master key, on by default for new installs ([ADR 0116](../adr/0116-database-encrypted-at-rest.md)). Files beside it (Bots' memory, user notes), the workspace and machine disks rely on the host's disk encryption. Backups are encrypted with age when the operator sets recipients, and are otherwise plain; machine backups include harness logins. See [encryption at rest](data-flows.md#at-rest).
 
 **Do you support SSO and SCIM?**
-Yes: Microsoft Entra ID, Google, Apple, GitHub, any OIDC provider, and SAML through a Keycloak broker. SCIM 2.0 user provisioning and deprovisioning. Native SAML is planned (M5). See [authentication](access-control.md#authentication).
+Yes: Microsoft Entra ID, Google, Apple, GitHub, any OIDC provider, and SAML 2.0, natively ([ADR 0127](../adr/0127-native-saml-service-provider.md)) or through a Keycloak broker. SCIM 2.0 user provisioning and deprovisioning. See [authentication](access-control.md#authentication).
 
 **Do you support MFA?**
 Yes. Sign-in codes and the owner's break-glass password can require a code from an authenticator app (TOTP), with one-time recovery codes. Admins require it for admins, which includes the owner, or for everyone ([ADR 0094](../adr/0094-totp-second-factor.md)). SSO sign-ins rely on your IdP's MFA: enforce it there ([IdP guides](../sso/)).

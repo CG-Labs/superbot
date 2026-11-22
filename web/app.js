@@ -1268,7 +1268,7 @@ const providerRow = (p) => `<tr>
     <td>${esc(p.label)}<div class="sub">${esc(p.id)} · ${esc(p.type)}${p.jitRole ? ` · new people join as ${esc(ROLES[p.jitRole] || p.jitRole)}` : ""}</div></td>
     <td>${p.ready ? "Ready" : `<span class="warn-text">${esc(p.problem || "Not ready")}</span>`}</td>
     <td>${copyBlock(p.callbackUrl)}</td>
-    <td>${p.secretSavable === false ? envSecret(p.secret) : secretForm(p)}</td>
+    <td>${!p.secret ? `<span class="sub">No secret. IdP metadata: <code>botctl sso saml ${esc(p.id)}</code></span>` : p.secretSavable === false ? envSecret(p.secret) : secretForm(p)}</td>
   </tr>`;
 const secretForm = (p) => `<form class="secret-inline" data-secret="${esc(p.secret)}" autocomplete="off">
     <textarea rows="1" placeholder="${esc(p.secret)}" required spellcheck="false" autocomplete="off"></textarea>
@@ -1292,9 +1292,9 @@ function setupSignIn(s) {
   setup.template = pick.id;
   const template = `<h2>Add a provider</h2>
     <div class="bar"><label>Provider <select id="setup-template">${s.templates.map((t) => `<option value="${esc(t.id)}" ${t.id === pick.id ? "selected" : ""}>${esc(t.label)}${t.configured ? " (set up)" : ""}</option>`).join("")}</select></label></div>
-    <p class="hint">1. Register SuperBot at the provider (see ${esc(pick.docs)}) with this redirect URI:</p>${copyBlock(pick.callbackUrl)}
+    <p class="hint">1. Register SuperBot at the provider (see ${esc(pick.docs)}) with this ${pick.secret ? "redirect URI" : "ACS URL (reply URL)"}:</p>${copyBlock(pick.callbackUrl)}
     <p class="hint">2. Add these lines to .env, filling in the &lt;placeholders&gt;:</p>${copyBlock(pick.env)}
-    <p class="hint">3. Restart botd (below). 4. The provider then shows up on this page: save its secret, <code>${esc(pick.secret)}</code>, there.</p>
+    <p class="hint">3. Restart botd (below). 4. ${pick.secret ? `The provider then shows up on this page: save its secret, <code>${esc(pick.secret)}</code>, there.` : `It needs no secret: <code>botctl sso saml ${esc(pick.id)}</code> shows its SP entity ID and checks the IdP metadata.`}</p>
     ${howto(s.restart)}`;
   return verdict(s.ok, s.detail) + providers + `<h2>Admins</h2>${admins}<p class="hint">${esc(extra)}</p>` + template;
 }
