@@ -1234,6 +1234,24 @@ default_isolation() {
   log "New install: each user's Bots run as their own Unix account (--no-isolation turns this off)"
 }
 
+# Since ADR 0145, Bots on users' machines run as their own locked-down user unless .env says
+# MACHINE_BOT_USER=off. An upgrade of a control plane that never set it says what will change.
+machine_bot_user_notice() {
+  local env_file="$1"
+  [[ "$UPGRADE" == true && -f "$env_file" ]] || return 0
+  [[ -n "$(env_value "$env_file" MACHINE_CONTROL_URL | tr -d '[:space:]')" ]] || return 0
+  case "$(env_value "$env_file" MACHINE_BOT_USER | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')" in
+    "")
+      log "Machines: Bots now run as the unprivileged superbot-bots user by default (ADR 0145)."
+      log "  Each idle agent switches after its next heartbeat; agents too old to switch hold runs"
+      log "  (agent_outdated) until upgraded: botctl machine upgrade <user>. MACHINE_BOT_USER=off opts out."
+      ;;
+    off)
+      warn "MACHINE_BOT_USER=off: Bots on users' machines run as root and can read the agent's key (ADR 0145)."
+      ;;
+  esac
+}
+
 install_systemd() {
   local home deploy unit
   home=$(user_home)
@@ -1776,6 +1794,7 @@ main() {
   install_license
   install_hermes
   configure_isolation
+  machine_bot_user_notice "$(user_home)/superbot/.env"
   install_systemd
   install_backup
   install_caddy
