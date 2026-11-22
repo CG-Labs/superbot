@@ -626,12 +626,12 @@ fn commits_on_branch(api: &mut dyn Api, repo: &str, branch: &str, p: &Period, pu
             None if lookups < MAX_COMMIT_LOOKUPS => {
                 lookups += 1;
                 // A refused lookup proves nothing about the commit, so it's unchecked, not direct.
-                let Ok(prs) = optional(api.get(&format!("/repos/{repo}/commits/{sha}/pulls")).map(|r| r.body))? else {
+                let Ok(prs) = optional(all(api, &format!("/repos/{repo}/commits/{sha}/pulls?per_page=100"), None))? else {
                     (unchecked, refused) = (unchecked + 1, refused + 1);
                     commits.push(commit_view(c, None));
                     continue;
                 };
-                prs.as_array().into_iter().flatten().find(|x| x["merged_at"].is_string() && x["base"]["ref"] == branch).and_then(|x| x["number"].as_u64())
+                prs.iter().find(|x| x["merged_at"].is_string() && x["base"]["ref"] == branch).and_then(|x| x["number"].as_u64())
             }
             None => {
                 unchecked += 1;
@@ -1015,16 +1015,20 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_commit_lookup_is_unchecked_not_a_direct_commit() {
+    fn commit_lookups_read_every_page_and_a_refused_one_is_unchecked_not_direct() {
         let commit = |sha: &str| json!({ "sha": sha, "commit": { "committer": { "date": "2026-10-10T00:00:00Z" } } });
         let mut fake = Fake(HashMap::new(), Vec::new());
         let list = format!("/repos/o/r/commits?sha=main&since={}&until={}&per_page=100", enc("2026-10-01T00:00:00Z"), enc("2026-11-01T00:00:00Z"));
-        fake.0.insert(list, (json!([commit("m1"), commit("d1"), commit("x1")]), None));
-        fake.0.insert("/repos/o/r/commits/d1/pulls".into(), (json!([]), None));
+        fake.0.insert(list, (json!([commit("m1"), commit("d1"), commit("x1"), commit("p1")]), None));
+        fake.0.insert("/repos/o/r/commits/d1/pulls?per_page=100".into(), (json!([]), None));
+        let other = json!({ "number": 3, "merged_at": "2026-10-09T00:00:00Z", "base": { "ref": "release" } });
+        fake.0.insert("/repos/o/r/commits/p1/pulls?per_page=100".into(), (json!([other]), Some("p1-page-2".into())));
+        fake.0.insert("p1-page-2".into(), (json!([{ "number": 8, "merged_at": "2026-10-10T00:00:00Z", "base": { "ref": "main" } }]), None));
         let pulls = [json!({ "number": 7, "mergeCommit": "m1" })];
         let v = commits_on_branch(&mut fake, "o/r", "main", &period(), &pulls).unwrap();
-        assert_eq!(v["direct"].as_array().unwrap().iter().map(|c| c["sha"].as_str().unwrap()).collect::<Vec<_>>(), ["d1"]);
-        assert_eq!((v["unchecked"].as_u64(), v["uncheckedBecauseRefused"].as_u64(), v["total"].as_u64(), v["viaPullRequest"].as_u64()), (Some(1), Some(1), Some(3), Some(1)));
+        assert_eq!(v["direct"].as_array().unwrap().iter().map(|c| c["sha"].as_str().unwrap()).collect::<Vec<_>>(), ["d1"], "p1's pull request into main is on the second page");
+        assert_eq!(v["commits"][3]["pullRequest"], 8);
+        assert_eq!((v["unchecked"].as_u64(), v["uncheckedBecauseRefused"].as_u64(), v["total"].as_u64(), v["viaPullRequest"].as_u64()), (Some(1), Some(1), Some(4), Some(2)));
         assert!(!fake.1.iter().any(|u| u.contains("/m1/")), "a merge commit isn't looked up");
     }
 
