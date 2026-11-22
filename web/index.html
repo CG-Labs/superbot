@@ -50,7 +50,7 @@
         </label>
       </form>
       <table class="grid">
-        <thead><tr><th>Person</th><th>Role</th><th>Status</th><th>Last sign-in</th><th>Code</th><th>2FA</th><th></th></tr></thead>
+        <thead><tr><th>Person</th><th>Role</th><th>Status</th><th>Last sign-in</th><th>Code</th><th>2FA</th><th>Data region</th><th></th></tr></thead>
         <tbody id="users-rows"></tbody>
       </table>
       <div class="empty" id="users-empty" hidden></div>
@@ -87,6 +87,7 @@
         <button type="button" class="btn" id="machines-reconcile">Reconcile now</button>
       </form>
       <p class="warn" id="machines-rpo" hidden></p>
+      <p class="hint" id="machines-regions" hidden></p>
       <table class="grid">
         <thead><tr><th>User</th><th>State</th><th>Tier</th><th>Region</th><th>Address</th><th>Off-host backup</th><th>Updated</th><th></th></tr></thead>
         <tbody id="machines-rows"></tbody>

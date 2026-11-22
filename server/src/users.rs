@@ -289,7 +289,7 @@ pub fn user_view(u: &User) -> Value {
         "id": u.id, "email": u.email, "name": u.name, "role": u.role, "status": u.status,
         "breakGlass": u.id == OPERATOR, "idpIssuer": u.idp_issuer, "idpSubject": u.idp_subject,
         "createdAt": u.created_at, "updatedAt": u.updated_at, "lastLoginAt": u.last_login_at,
-        "tier": u.tier, "erasedAt": u.erased_at, "erasedAs": u.erased_as,
+        "tier": u.tier, "region": u.region, "erasedAt": u.erased_at, "erasedAs": u.erased_as,
     })
 }
 
@@ -317,6 +317,9 @@ fn admin_view(a: &Auth, u: &User, identities: &[db::Identity], pending: Option<&
     v["mfa"] = json!({ "enabled": mfa_since.is_some(), "enabledAt": mfa_since });
     if let Some(app) = &a.app {
         v["plan"] = crate::tier_usage(app, &u.id);
+        if a.machines.enabled() {
+            v["dataRegion"] = json!(crate::machines::region::effective(app, &a.machines, u));
+        }
     }
     v
 }

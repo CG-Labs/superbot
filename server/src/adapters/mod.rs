@@ -158,9 +158,14 @@ pub(crate) fn secret_env() -> Vec<String> {
     for k in crate::secrets::SERVER_SECRETS {
         names.extend([k.to_string(), format!("{k}_FILE")]);
     }
-    let ours = |k: &String| k.starts_with("SSO_") || k.starts_with(crate::secrets::BOT_WEBHOOK_PREFIX);
-    names.extend(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).filter(ours));
+    names.extend(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).filter(|k| named_secret(k)));
     names
+}
+
+/// botd's secrets whose names depend on its settings: SSO providers', Bots' webhooks,
+/// and every machine backup store's, each data region's included (ADR 0117).
+fn named_secret(k: &str) -> bool {
+    k.starts_with("SSO_") || k.starts_with(crate::secrets::BOT_WEBHOOK_PREFIX) || k.starts_with("MACHINE_BACKUP_S3_")
 }
 
 /// Tier endpoints' key secrets, and their `_FILE`: a run gets one only when routed to
@@ -750,6 +755,14 @@ mod tests {
         super::strip_secret_env(&mut cmd);
         assert!(cmd.get_envs().any(|(k, v)| k == "E2E_WITHHELD_KEY" && v.is_none()));
         assert!(!super::secret_env().contains(&"E2E_WITHHELD_KEY".to_string()), "still a name a tiers file may use");
+    }
+
+    #[test]
+    fn region_backup_keys_are_never_inherited() {
+        for k in ["MACHINE_BACKUP_S3_DE_FRA_2_SECRET_ACCESS_KEY", "MACHINE_BACKUP_S3_DE_FRA_2_SECRET_ACCESS_KEY_FILE", "MACHINE_BACKUP_S3_GB_LON_ACCESS_KEY_ID"] {
+            assert!(super::named_secret(k), "{k}");
+        }
+        assert!(!super::named_secret("MACHINE_REGIONS"));
     }
 
     fn sandboxed(dir: &std::path::Path) -> RunInput {

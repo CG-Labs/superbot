@@ -420,12 +420,18 @@ pub struct HostInfo {
     pub capacity: Option<Resources>,
     /// How many machines it may have, if set (INCUS_MAX_MACHINES).
     pub max_machines: Option<u64>,
+    /// The data region it is in (INCUS_REGION, ADR 0117), if hosts are tagged.
+    pub region: Option<String>,
 }
 
 /// Several hosts behind one provider: machine ids say which one each is on.
 pub trait Hosts: Send + Sync {
     /// Every configured host, in placement order.
     fn configured(&self) -> Vec<HostInfo>;
+    /// Whether hosts are tagged with data regions (ADR 0117): every host or none is.
+    fn tagged(&self) -> bool {
+        self.configured().iter().any(|h| h.region.is_some())
+    }
     /// The host a machine id is on.
     fn host_of(&self, id: &str) -> String;
     /// The id of the machine called `name` on `host`.

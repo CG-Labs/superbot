@@ -178,6 +178,16 @@ describe("TeamView", () => {
     expect(screen.getByText(/only owner/)).toBeOnTheScreen();
   });
 
+  it("says where the team's data stays when it has a region (ADR 0117)", async () => {
+    await open({ ...teamAs("member"), region: "de-fra-2" }, { meId: "al" });
+    expect(screen.getByText(/Machines and their backups stay in de-fra-2/)).toBeOnTheScreen();
+  });
+
+  it("says nothing about regions when the team has none", async () => {
+    await open(teamAs("owner"));
+    expect(screen.queryByText(/backups stay in/)).toBeNull();
+  });
+
   it("gives members a read-only view with no machines, invites or actions", async () => {
     await open(teamAs("member"), { meId: "al" });
     expect(screen.getByText("Only the team's owners and admins can change the team.")).toBeOnTheScreen();

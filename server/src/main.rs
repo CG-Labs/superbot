@@ -89,6 +89,8 @@ mod machines_placement_tests;
 mod machines_provider_backup_tests;
 #[cfg(test)]
 mod machines_resize_tests;
+#[cfg(test)]
+mod machines_region_tests;
 mod passwd;
 mod signin_watch;
 #[cfg(test)]
@@ -564,6 +566,10 @@ async fn main() {
         ..Auth::new(Some(app.clone()))
     });
     log_info!("Control plane: {}.", auth_state.machines.describe());
+    let recorded = app.db.machine_backup_stores();
+    for w in auth_state.machines.offsite.as_deref().map(|o| [o.warnings(), o.unreachable(&recorded)].concat()).unwrap_or_default() {
+        log_warn!("WARNING: {w}");
+    }
     if let Some(m) = auth_state.payments.meter() {
         let _ = app.meter.set(m);
     }
@@ -882,6 +888,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/identities", get(sso::list_identities).post(sso::link_identity))
         .route("/users/{key}/identities/{id}", delete(sso::unlink_identity))
         .route("/users/{key}/machine", get(machines::get).post(machines::request).delete(machines::destroy))
+        .route("/users/{key}/region", get(machines::region::get_user).put(machines::region::set_user))
         .route("/users/{key}/machine/suspend", post(machines::suspend))
         .route("/users/{key}/machine/resume", post(machines::resume))
         .route("/users/{key}/machine/resize", get(machines::resize::status).post(machines::resize))
@@ -918,6 +925,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/machines/{id}/backups", delete(machines::backup::delete_all))
         .route("/machines/recovery", get(machines::recovery::get))
         .route("/machines/substrate", get(machines::substrate))
+        .route("/regions", get(machines::region::list))
         .route("/machines/hosts", get(machines::hosts::list))
         .route("/machines/hosts/{name}/recover", post(machines::hosts::recover))
         .route("/machines/hosts/{name}/drain", put(machines::hosts::drain).delete(machines::hosts::undrain))
@@ -929,6 +937,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/isolation/teammate-removals", get(teammate_removals::list_all))
         .route("/teams", get(teams::list).post(teams::create))
         .route("/teams/{id}", get(teams::get).patch(teams::update).delete(teams::delete))
+        .route("/teams/{id}/region", get(machines::region::get_team).put(machines::region::set_team))
         .route("/teams/{id}/members/{user}", put(teams::put_member).delete(teams::delete_member))
         .route("/team", get(teams::mine))
         .route("/team/leave", post(teams::leave_mine))
