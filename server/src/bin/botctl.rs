@@ -161,6 +161,10 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl deny <id> [--remember | --remember-global]
   botctl audit [<limit>] [filters]                 Recent audit events, newest first
   botctl audit export [filters] > audit.csv        All matching events as CSV, oldest first
+  botctl audit verify [--pin <id>:<hash>]...       Check the audit log's hash chain; names the first
+                                                   broken link, exits 1 if there is one. --pin: a hash
+                                                   kept elsewhere (your SIEM) the row must still have
+  botctl audit siem                                The SIEM export: sink, delivered, pending, failing
     filters: --from <time> --to <time> --action <a,b.*> --actor <user|bot|system[:id]>
              --actor user:<email> --method <password,code,sso,none,bot_token,scim_token>
              --idp <entra|google|oidc|github|apple|saml> --idp-provider <id> --subject <issuer|sub>
@@ -169,6 +173,13 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl support-bundle [-o <file>]                Save a support bundle for a ticket (ADR 0131): version,
                                                    redacted settings, health, recent logs and an audit
                                                    summary, in a tar; no secrets, emails or chats
+  botctl evidence                                  The evidence bundle schedule (EVIDENCE_BUNDLES), where
+                                                   bundles are written and those kept (ADR 0142)
+  botctl evidence bundle [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]
+                                                   Save a SOC 2 evidence bundle for a period (last month
+                                                   by default; to isn't included): access review, versions,
+                                                   backups, retention, sign-ins and alerts, with SHA-256
+                                                   digests; no secrets, names, emails or chats
   botctl retention                                 How long chat history, harness session files,
                                                    teammates' archived work and the audit log are kept
                                                    (CHAT_RETENTION_DAYS, HARNESS_SESSION_RETENTION_DAYS,
@@ -748,6 +759,20 @@ fn audit_query(rest: &[&str]) -> Result<String, String> {
         }
     }
     Ok(if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) })
+}
+
+/// `botctl audit verify [--pin <id>:<hash>]...`: hashes kept elsewhere (a SIEM, an
+/// earlier check) to hold the chain to.
+fn verify_query(rest: &[&str]) -> Result<String, String> {
+    let mut pins = Vec::new();
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "--pin" => pins.push(encode(it.next().ok_or("--pin needs <event id>:<hash>")?)),
+            other => return Err(format!("Unknown audit verify option \"{other}\". See botctl admin.")),
+        }
+    }
+    Ok(if pins.is_empty() { String::new() } else { format!("?pin={}", pins.join(",")) })
 }
 
 fn flag<'a>(rest: &[&'a str], name: &str) -> Option<&'a str> {
@@ -1499,7 +1524,15 @@ fn run(args: &[String]) -> Result<String, String> {
         ["approvals", status] => op("GET", &format!("/api/approvals?status={status}"), None),
         [verb @ ("approve" | "deny"), id, rest @ ..] => decide(verb, id, rest),
         ["support-bundle", rest @ ..] => support_bundle(rest),
+        ["evidence"] => op("GET", "/api/evidence", None),
+        ["evidence", "bundle", rest @ ..] => evidence_bundle(rest),
         ["audit", "export", rest @ ..] => api(Cred::Operator, "GET", &format!("/api/audit/export.csv{}", audit_query(rest)?), None),
+        ["audit", "verify", rest @ ..] => {
+            let res = op("GET", &format!("/api/audit/verify{}", verify_query(rest)?), None)?;
+            // A broken chain is a failure, so a cron job or CI step notices.
+            if serde_json::from_str::<Value>(&res).ok().and_then(|v| v["ok"].as_bool()) == Some(false) { Err(res) } else { Ok(res) }
+        }
+        ["audit", "siem"] => op("GET", "/api/audit/siem", None),
         ["audit", rest @ ..] => op("GET", &format!("/api/audit{}", audit_query(rest)?), None),
         ["retention"] => op("GET", "/api/retention", None),
         ["retention", "hold", bot, reason] => op("PUT", &format!("/api/retention/holds/{}", encode(bot)), Some(json!({ "reason": reason }).to_string())),
@@ -1695,6 +1728,57 @@ fn support_bundle(rest: &[&str]) -> Result<String, String> {
     ))
 }
 
+/// `botctl evidence bundle [--from <date> --to <date>] [-o <file>]`: botd's path and the file to save it as.
+fn evidence_request<'a>(rest: &[&'a str]) -> Result<(String, Option<&'a str>), String> {
+    const USE: &str = "Usage: botctl evidence bundle [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]";
+    let (mut from, mut to, mut out) = (None, None, None);
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        let slot = match *a {
+            "--from" => &mut from,
+            "--to" => &mut to,
+            "-o" | "--out" => &mut out,
+            _ => return Err(USE.into()),
+        };
+        if slot.is_some() {
+            return Err(USE.into());
+        }
+        *slot = Some(*it.next().filter(|v| !v.starts_with("--")).ok_or(USE)?);
+    }
+    let path = match (from, to) {
+        (None, None) => "/api/evidence/bundle".to_string(),
+        (Some(f), Some(t)) => format!("/api/evidence/bundle?from={}&to={}", encode(f), encode(t)),
+        _ => return Err("Give both --from and --to, or neither for last month.".into()),
+    };
+    Ok((path, out))
+}
+
+fn evidence_bundle(rest: &[&str]) -> Result<String, String> {
+    let (path, out) = evidence_request(rest)?;
+    let (code, head, body) = exchange_bytes(Cred::Operator, "GET", &path)?;
+    if !(200..300).contains(&code) {
+        return Err(failure(code, &String::from_utf8_lossy(&body)));
+    }
+    let served = attachment_name(&head);
+    let file = out.map(String::from).or_else(|| served.clone()).unwrap_or_else(|| "superbot-evidence.tar".into());
+    save_private(&file, &body)?;
+    let manifest = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("x-evidence-manifest-sha256:").map(|v| v.trim().to_string())).unwrap_or_default();
+    Ok(format!(
+        "Saved {file} ({} KB). Its manifest's SHA-256 is {manifest}, as audited (evidence.bundle_created). Keep it in the evidence store; to check it:\n  {}",
+        body.len().div_ceil(1024),
+        evidence_check(&file, served.as_deref())
+    ))
+}
+
+/// The shell line that checks a saved bundle. Its files sit in a folder named as botd
+/// served the bundle, whatever it was saved as.
+fn evidence_check(file: &str, served: Option<&str>) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let folder = served.unwrap_or_else(|| file.rsplit('/').next().unwrap_or(file));
+    let folder = folder.strip_suffix(".tar").unwrap_or(folder);
+    format!("tar -xf {} && cd {} && sha256sum -c SHA256SUMS", quote(file), quote(folder))
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
@@ -1737,6 +1821,23 @@ mod tests {
             assert_eq!(attachment_name(&format!("Content-Disposition: attachment; filename=\"{bad}\"")), None, "{bad}");
         }
         assert_eq!(attachment_name("HTTP/1.1 200 OK"), None);
+    }
+
+    #[test]
+    fn an_evidence_bundles_check_uses_the_served_folder_and_quotes_paths() {
+        let served = "superbot-evidence-2026-10-01_2026-11-01-20261101T000000Z.tar";
+        assert_eq!(evidence_check("evidence.tar", Some(served)), "tar -xf 'evidence.tar' && cd 'superbot-evidence-2026-10-01_2026-11-01-20261101T000000Z' && sha256sum -c SHA256SUMS");
+        assert_eq!(evidence_check("my dir/it's.tar", None), "tar -xf 'my dir/it'\\''s.tar' && cd 'it'\\''s' && sha256sum -c SHA256SUMS");
+    }
+
+    #[test]
+    fn an_evidence_bundle_is_for_last_month_or_the_period_given() {
+        assert_eq!(evidence_request(&[]), Ok(("/api/evidence/bundle".into(), None)));
+        assert_eq!(evidence_request(&["--from", "2026-10-01", "--to", "2026-11-01", "-o", "e.tar"]), Ok(("/api/evidence/bundle?from=2026-10-01&to=2026-11-01".into(), Some("e.tar"))));
+        assert_eq!(evidence_request(&["--to", "2026-11-01", "--from", "2026-10-01"]).unwrap().0, "/api/evidence/bundle?from=2026-10-01&to=2026-11-01");
+        for bad in [&["--from", "2026-10-01"][..], &["--from"], &["--from", "--to"], &["x"], &["-o", "a", "-o", "b"], &["--to", "2026-11-01"]] {
+            assert!(evidence_request(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -1981,6 +2082,9 @@ mod tests {
         );
         assert!(audit_query(&["--from"]).is_err());
         assert!(audit_query(&["--nope", "x"]).is_err());
+        assert_eq!(verify_query(&[]).unwrap(), "");
+        assert_eq!(verify_query(&["--pin", "12:ab", "--pin", "13:cd"]).unwrap(), "?pin=12:ab,13:cd");
+        assert!(verify_query(&["--pin"]).is_err() && verify_query(&["--all"]).is_err());
     }
 
     #[test]
