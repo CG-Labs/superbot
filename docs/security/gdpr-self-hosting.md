@@ -73,7 +73,7 @@ There is no single export of everything about a person yet. Collect it from thes
 ### Rectification and restriction
 
 - **Correct a name or email**: `PATCH /api/users/<user>` with `name` or `email`; audited as `user.updated`. For users your identity provider provisions over SCIM, change it at the IdP.
-- **Restrict processing**: `botctl user disable <user>` ends their sessions and pauses the routines that run for them, and keeps their data. `botctl user enable <user>` undoes it.
+- **Restrict processing**: `botctl user disable <user>` ends their sessions and pauses the routines that run for them, and keeps their data. `botctl user enable <user>` lets them sign in again but leaves those routines paused; `botctl user resume-routines <user>` restarts them, or set `ROUTINES_ON_ENABLE=resume` to restart them on enable ([ADR 0047](../adr/0047-disabled-users-routines.md)).
 
 ### Erasure
 
