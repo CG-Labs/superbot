@@ -4,7 +4,9 @@
 #   superbot-restore [--home DIR] [--identity FILE] <archive | ->           restore into DATA_DIR (botd stopped)
 #   superbot-restore [--home DIR] [--identity FILE] --check <archive | ->   only unpack, verify, and summarise
 # --home DIR reads DATA_DIR and PORT from DIR/superbot/.env (installer layout). Encrypted (.age)
-# archives need the age identity: --identity or SUPERBOT_BACKUP_AGE_IDENTITY_FILE.
+# archives need the age identity: --identity or SUPERBOT_BACKUP_AGE_IDENTITY_FILE. An encrypted
+# app.sqlite (docs/adr/0116-database-encrypted-at-rest.md) is read with `botd database query` (botd on
+# PATH, or SUPERBOT_BOTD) and the master key; without them it is restored unread.
 # Run as the user that owns DATA_DIR. The previous contents stay in DATA_DIR/.pre-restore-<stamp>/.
 set -euo pipefail
 umask 077
@@ -25,13 +27,15 @@ use_home() {
   local home=$1 env_file key value
   env_file="$home/superbot/.env"
   [[ -r "$env_file" ]] || die "cannot read $env_file"
-  for key in DATA_DIR PORT SUPERBOT_BACKUP_AGE_IDENTITY_FILE; do
+  for key in DATA_DIR PORT SUPERBOT_BACKUP_AGE_IDENTITY_FILE SUPERBOT_MASTER_KEY SUPERBOT_MASTER_KEY_FILE \
+    SUPERBOT_MASTER_KEY_PREVIOUS SUPERBOT_MASTER_KEY_PREVIOUS_FILE; do
     if [[ -z "${!key:-}" ]]; then
       value=$(env_file_value "$env_file" "$key")
       [[ -z "$value" ]] || export "$key=$value"
     fi
   done
   export DATA_DIR=${DATA_DIR:-"$home/superbot/data"}
+  [[ -n "${SUPERBOT_MASTER_KEY:-}${SUPERBOT_MASTER_KEY_FILE:-}" ]] || export SUPERBOT_MASTER_KEY_FILE="$home/.config/superbot/master.key"
 }
 
 check_only=false
@@ -62,14 +66,27 @@ botd_running() {
   command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet superbot.service 2>/dev/null
 }
 
-count() { sqlite3 -readonly "$1" "SELECT count(*) FROM $2" 2>/dev/null || echo '?'; }
+plain_sqlite() { [[ "$(head -c 15 "$1" | tr -d '\0')" == "SQLite format 3" ]]; }
+
+# Runs read-only SQL on a database copy: sqlite3 for a plain one, botd (with the master key)
+# for an encrypted one.
+query() {
+  if plain_sqlite "$1"; then
+    sqlite3 -readonly "$1" "$2"
+  else
+    "${SUPERBOT_BOTD:-botd}" database query "$1" "$2"
+  fi
+}
+
+count() { query "$1" "SELECT count(*) FROM $2" 2>/dev/null || echo '?'; }
 
 summary() {
   local dir=$1 db=$1/app.sqlite created newest sealed
   created=$(sed -n 's/^created=//p' "$dir/.superbot-backup" 2>/dev/null || true)
-  newest=$(sqlite3 -readonly "$db" "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', max(at) / 1000, 'unixepoch') FROM audit_events" 2>/dev/null || true)
+  newest=$(query "$db" "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', max(at) / 1000, 'unixepoch') FROM audit_events" 2>/dev/null || true)
   sealed=no
-  [[ -z $(sqlite3 -readonly "$db" "SELECT 1 FROM settings WHERE key = 'secrets_key_check'" 2>/dev/null) ]] || sealed=yes
+  [[ -z $(query "$db" "SELECT 1 FROM settings WHERE key = 'secrets_key_check'" 2>/dev/null) ]] || sealed=yes
+  plain_sqlite "$db" || sealed="yes (the database is encrypted under it)"
   printf 'created:          %s\n' "${created:-unknown (archive from before ADR 0030)}"
   printf 'newest audit:     %s\n' "${newest:-none}"
   printf 'users:            %s\n' "$(count "$db" users)"
@@ -79,6 +96,7 @@ summary() {
   printf 'saved secrets:    %s\n' "$(count "$db" secrets)"
   printf 'audit events:     %s\n' "$(count "$db" audit_events)"
   printf 'needs master key: %s\n' "$sealed"
+  plain_sqlite "$db" || printf 'database:         encrypted (SQLCipher, ADR 0116)\n'
 }
 
 if [[ "$check_only" == true ]]; then
@@ -115,8 +133,24 @@ rm -f "$work/archive" "$work/archive.tar.gz"
 [[ -f "$work/data/app.sqlite" ]] || die "archive has no app.sqlite; not a superbot-backup archive"
 format=$(sed -n 's/^format=//p' "$work/data/.superbot-backup" 2>/dev/null || true)
 [[ -z "$format" || "$format" == 1 ]] || die "archive format $format is newer than this superbot-restore; upgrade first"
-check=$(sqlite3 "$work/data/app.sqlite" 'PRAGMA integrity_check;' 2>&1) || true
-[[ "$check" == ok ]] || die "app.sqlite failed integrity_check: $check"
+size=$(stat -c %s "$work/data/app.sqlite")
+if plain_sqlite "$work/data/app.sqlite"; then
+  check=$(sqlite3 "$work/data/app.sqlite" 'PRAGMA integrity_check;' 2>&1) || true
+  [[ "$check" == ok ]] || die "app.sqlite failed integrity_check: $check"
+elif (( size == 0 || size % 512 != 0 )); then
+  # SQLCipher writes whole pages, so anything else is damaged, encrypted or not.
+  die "app.sqlite failed integrity_check: neither SQLite nor whole encrypted pages ($size bytes)"
+elif ! command -v "${SUPERBOT_BOTD:-botd}" >/dev/null 2>&1; then
+  say "app.sqlite is encrypted and wasn't checked here (botd isn't on PATH: set SUPERBOT_BOTD); botd checks it with the master key when it starts"
+elif check=$(query "$work/data/app.sqlite" 'PRAGMA integrity_check;' 2>&1); then
+  [[ "$check" == ok ]] || die "app.sqlite failed integrity_check: $check"
+elif [[ "$check" == *"wrong key"* ]]; then
+  die "app.sqlite is encrypted under another master key: $check. Give its key (SUPERBOT_MASTER_KEY_FILE, or SUPERBOT_MASTER_KEY_PREVIOUS_FILE)"
+elif [[ "$check" == *"no master key was found"* ]]; then
+  say "app.sqlite is encrypted and wasn't checked here (no master key given); botd checks it with the master key when it starts"
+else
+  die "could not check the encrypted app.sqlite: $check"
+fi
 
 summary "$work/data"
 if [[ "$check_only" == true ]]; then

@@ -134,6 +134,11 @@ log "botd's folder (prepended to Bots' PATH) holds no harness CLI, so runtime np
 dc exec -T botd sh -c 'd=$(dirname "$(command -v botd)"); for h in claude codex pi hermes; do [ ! -e "$d/$h" ] || exit 1; done' \
   || fail "a harness CLI sits next to botd and would shadow ~/.local/bin for Bots"
 
+log "Database encryption (ADR 0116): required for a new .env, and botd made the database encrypted"
+grep -qx "SUPERBOT_DATABASE_ENCRYPTION='required'" "$SUPERBOT_ENV_FILE" || fail "a new .env doesn't require database encryption"
+grep -q 'Database encryption: encrypted with SQLCipher.*; created encrypted' <<<"$(dc logs --no-color botd)" || fail "botd didn't create an encrypted database"
+[[ $(dc exec -T botd botd database status /data/app.sqlite) == encrypted ]] || fail "botd database status doesn't say encrypted"
+
 log "Per-user accounts (ADR 0058): on for a new .env, and an account can't read botd's data or env"
 grep -qx 'ISOLATION=users' "$SUPERBOT_ENV_FILE" || fail "a new .env doesn't turn per-user accounts on"
 grep -q 'Isolation: each user' <<<"$(dc logs --no-color botd)" || fail "botd didn't start with per-user accounts"
@@ -201,6 +206,7 @@ grep -qx 'app.sqlite' <<<"$listing" || fail "archive has no app.sqlite"
 mkdir "$WORK/unpacked"
 tar -xzf "$WORK/backup.tar.gz" -C "$WORK/unpacked"
 if grep -rqF -e "$SECRET_VALUE" -e "$MASTER_KEY" "$WORK/unpacked"; then fail "a backup holds a secret or the master key"; fi
+[[ "$(head -c 15 "$WORK/unpacked/app.sqlite" | tr -d '\0')" != "SQLite format 3" ]] || fail "the archive holds the database decrypted"
 curl -fsS "${AUTH[@]}" -H 'Content-Type: application/json' -d '{"name":"DropMe"}' "$BASE/api/bots" >/dev/null
 if dc run --rm --no-deps -T botd superbot-restore - <"$WORK/backup.tar.gz" 2>/dev/null; then
   fail "restore ran while botd was up"

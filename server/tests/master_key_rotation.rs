@@ -2,6 +2,8 @@
 //! guide says. Save a secret under key A in a key file; move that file aside as the
 //! previous key, put key B in its place, restart: botd seals everything again under B,
 //! records `secret.master_key_rotated`, and from then on starts with B alone and refuses A.
+//! The database itself is encrypted under a key derived from the master key (ADR 0116), so
+//! the same restart re-encrypts it under B.
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -114,9 +116,24 @@ fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-/// The saved secret as it is in the database, opened with `key` the way botd seals it (ADR 0010).
-fn stored_secret(dir: &Path, key: [u8; 32]) -> Option<String> {
+/// SQLCipher's raw key for the database under master key `key`, as botd derives it (ADR 0116).
+fn database_key(key: [u8; 32]) -> String {
+    use aws_lc_rs::hmac;
+    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &key), b"superbot/database/v1");
+    format!("x'{}'", tag.as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>())
+}
+
+/// The database, if `key` opens it.
+fn database(dir: &Path, key: [u8; 32]) -> Option<rusqlite::Connection> {
     let c = rusqlite::Connection::open(dir.join("data/app.sqlite")).unwrap();
+    c.execute_batch("PRAGMA cipher_log_level = NONE").unwrap();
+    c.key(None::<&str>, database_key(key), false).unwrap();
+    c.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).ok().map(|_| c)
+}
+
+/// The saved secret as it is in the database, opened with `key` the way botd seals it (ADR 0010).
+fn stored_secret(dir: &Path, db_key: [u8; 32], key: [u8; 32]) -> Option<String> {
+    let c = database(dir, db_key).expect("the database opens with its key");
     let sealed: String = c.query_row("SELECT value FROM secrets WHERE name = 'E2E_TOKEN'", [], |r| r.get(0)).unwrap();
     let raw = B64.decode(sealed.strip_prefix("sb1:").unwrap()).unwrap();
     let (nonce, ct) = raw.split_at(24);
@@ -139,7 +156,9 @@ fn botd_rotates_its_master_key_from_a_previous_key_file() {
     let (code, res) = http(&botd, "PUT", "/api/secrets/E2E_TOKEN", &json!({ "value": SECRET }).to_string());
     assert_eq!(code, 200, "{res}");
     drop(botd);
-    assert_eq!(stored_secret(&dir, a).as_deref(), Some(SECRET));
+    assert_eq!(stored_secret(&dir, a, a).as_deref(), Some(SECRET));
+    let head = std::fs::read(dir.join("data/app.sqlite")).unwrap();
+    assert!(!head.starts_with(b"SQLite format 3"), "a new database is encrypted");
 
     // The guide's steps: the old key becomes the previous key, a new one takes its place.
     std::fs::rename(&key, &previous).unwrap();
@@ -154,8 +173,9 @@ fn botd_rotates_its_master_key_from_a_previous_key_file() {
     let listed = get(&botd, "/api/secrets")["secrets"].as_array().cloned().unwrap();
     assert!(listed.iter().any(|s| s["name"] == "E2E_TOKEN"), "{listed:?}");
     drop(botd);
-    assert_eq!(stored_secret(&dir, b).as_deref(), Some(SECRET), "the value survives, sealed under the new key");
-    assert_eq!(stored_secret(&dir, a), None, "and the old key no longer opens it");
+    assert!(database(&dir, a).is_none(), "the database is re-encrypted: the old key doesn't open it");
+    assert_eq!(stored_secret(&dir, b, b).as_deref(), Some(SECRET), "the value survives, sealed under the new key");
+    assert_eq!(stored_secret(&dir, b, a), None, "and the old key no longer opens it");
 
     // Left set by mistake: nothing happens again, and botd says to remove it.
     let botd = start(&dir, Some(&previous), "again");

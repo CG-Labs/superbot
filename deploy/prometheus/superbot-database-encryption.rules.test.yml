@@ -1,0 +1,80 @@
+# promtool test rules superbot-database-encryption.rules.test.yml
+rule_files:
+  - superbot-database-encryption.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # A plain database: a ticket after an hour, none before.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_database_encrypted{job="superbot",instance="a:8080"}'
+        values: '0x120'
+      - series: 'superbot_database_plaintext_allowed{job="superbot",instance="a:8080"}'
+        values: '0x120'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SuperBotDatabaseUnencrypted
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: SuperBotDatabaseUnencrypted
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: a:8080
+            exp_annotations:
+              summary: "The database isn't encrypted"
+              description: "botd's database on a:8080 is plain, so anyone who gets app.sqlite, a disk image or a copy of DATA_DIR can read every chat in it. Set SUPERBOT_DATABASE_ENCRYPTION=required and restart (deploy/install.sh --database-encryption required); botd encrypts it and keeps a plain copy until you delete it. Or set it to off to keep it plain by choice. botctl database shows the state. See docs/ops/database-encryption.md."
+
+  # Plain by choice on one server doesn't hide another server's plain database.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_database_encrypted{job="superbot",instance="a:8080"}'
+        values: '0x120'
+      - series: 'superbot_database_plaintext_allowed{job="superbot",instance="a:8080"}'
+        values: '1x120'
+      - series: 'superbot_database_encrypted{job="superbot",instance="b:8080"}'
+        values: '0x120'
+      - series: 'superbot_database_plaintext_allowed{job="superbot",instance="b:8080"}'
+        values: '0x120'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: SuperBotDatabaseUnencrypted
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: b:8080
+            exp_annotations:
+              summary: "The database isn't encrypted"
+              description: "botd's database on b:8080 is plain, so anyone who gets app.sqlite, a disk image or a copy of DATA_DIR can read every chat in it. Set SUPERBOT_DATABASE_ENCRYPTION=required and restart (deploy/install.sh --database-encryption required); botd encrypts it and keeps a plain copy until you delete it. Or set it to off to keep it plain by choice. botctl database shows the state. See docs/ops/database-encryption.md."
+
+  # A plain copy left for a day: a ticket; an encrypted database without one: nothing.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_database_encrypted{job="superbot",instance="a:8080"}'
+        values: '1x1600'
+      - series: 'superbot_database_plain_copies{job="superbot",instance="a:8080"}'
+        values: '1x1600'
+      - series: 'superbot_database_encrypted{job="superbot",instance="b:8080"}'
+        values: '1x1600'
+      - series: 'superbot_database_plain_copies{job="superbot",instance="b:8080"}'
+        values: '0x1600'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: SuperBotDatabaseUnencrypted
+        exp_alerts: []
+      - eval_time: 12h
+        alertname: SuperBotDatabasePlainCopyLeft
+        exp_alerts: []
+      - eval_time: 25h
+        alertname: SuperBotDatabasePlainCopyLeft
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: a:8080
+            exp_annotations:
+              summary: "A plain copy of the database is still in DATA_DIR"
+              description: "botd encrypted the database on a:8080 and kept a plain copy of it, which holds every chat unencrypted. Once SuperBot runs well, delete it (botctl database names it). See docs/ops/database-encryption.md#the-plain-copy."

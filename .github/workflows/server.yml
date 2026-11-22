@@ -136,16 +136,26 @@ jobs:
       - run: promtool test rules deploy/prometheus/superbot-backups.rules.test.yml
       - run: promtool check rules deploy/prometheus/superbot-backup-encryption.rules.yml
       - run: promtool test rules deploy/prometheus/superbot-backup-encryption.rules.test.yml
+      - run: promtool check rules deploy/prometheus/superbot-database-encryption.rules.yml
+      - run: promtool test rules deploy/prometheus/superbot-database-encryption.rules.test.yml
       - run: promtool check rules deploy/prometheus/superbot-errors.rules.yml
       - run: promtool test rules deploy/prometheus/superbot-errors.rules.test.yml
 
   backup-scripts:
+    needs: rust
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # botd encrypts the database and copies it for superbot-backup (ADR 0116).
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: botd-release
+          path: /tmp/botd-release
       - name: Install age and sqlite3
         run: sudo apt-get update -qq && sudo apt-get install -y -qq age sqlite3
-      - run: deploy/test-backup.sh
+      - run: chmod +x /tmp/botd-release/botd && deploy/test-backup.sh
+        env:
+          SUPERBOT_BOTD: /tmp/botd-release/botd
 
   install-pipe-dry-run:
     runs-on: ubuntu-latest
@@ -173,6 +183,8 @@ jobs:
           grep -Fq 'Console:  https://ci.example.com/console/' /tmp/fresh.log
           # ADR 0114: a fresh install encrypts backups to a key it makes, kept as root outside the backups.
           grep -Fq 'would make a backup age key at /root/superbot-backup-identity.txt (root, 0600) and set SUPERBOT_BACKUP_AGE_RECIPIENTS' /tmp/fresh.log
+          # ADR 0116: a fresh install encrypts its database.
+          grep -Fq 'would set SUPERBOT_DATABASE_ENCRYPTION=required' /tmp/fresh.log
       # ADR 0058: on for new installs; --no-isolation and upgrades don't get them.
       - name: Per-user accounts are on for new installs
         run: |

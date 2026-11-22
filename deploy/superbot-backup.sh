@@ -8,6 +8,8 @@
 # With SUPERBOT_BACKUP_AGE_RECIPIENTS (age public keys) or SUPERBOT_BACKUP_AGE_RECIPIENTS_FILE set,
 # archives are encrypted with age and end in .age. The master key is never in an archive.
 # SUPERBOT_BACKUP_ENCRYPTION=required refuses to write a plain archive (docs/adr/0114-backups-encrypted-by-default.md).
+# An encrypted app.sqlite (docs/adr/0116-database-encrypted-at-rest.md) is copied with `botd database backup`
+# (botd on PATH, or SUPERBOT_BOTD), which needs the master key; the copy stays encrypted under it.
 set -euo pipefail
 umask 077
 
@@ -30,7 +32,7 @@ use_home() {
   env_file="$home/superbot/.env"
   [[ -r "$env_file" ]] || die "cannot read $env_file"
   for key in DATA_DIR BACKUP_DIR SUPERBOT_BACKUP_RETENTION_DAYS SUPERBOT_BACKUP_AGE_RECIPIENTS SUPERBOT_BACKUP_AGE_RECIPIENTS_FILE \
-    SUPERBOT_BACKUP_ENCRYPTION; do
+    SUPERBOT_BACKUP_ENCRYPTION SUPERBOT_MASTER_KEY SUPERBOT_MASTER_KEY_FILE SUPERBOT_MASTER_KEY_PREVIOUS SUPERBOT_MASTER_KEY_PREVIOUS_FILE; do
     if [[ -z "${!key:-}" ]]; then
       value=$(env_file_value "$env_file" "$key")
       [[ -z "$value" ]] || export "$key=$value"
@@ -38,6 +40,23 @@ use_home() {
   done
   export DATA_DIR=${DATA_DIR:-"$home/superbot/data"}
   export BACKUP_DIR=${BACKUP_DIR:-"$home/superbot/backups"}
+  # The installer's key, also when root runs this with --home.
+  [[ -n "${SUPERBOT_MASTER_KEY:-}${SUPERBOT_MASTER_KEY_FILE:-}" ]] || export SUPERBOT_MASTER_KEY_FILE="$home/.config/superbot/master.key"
+}
+
+# Plain SQLite starts with this header; SQLCipher's file is random from the first byte.
+plain_sqlite() { [[ "$(head -c 15 "$1" | tr -d '\0')" == "SQLite format 3" ]]; }
+
+# A consistent copy of the live database: sqlite3's online .backup for a plain one, botd's for
+# an encrypted one (the same online backup, keyed).
+snapshot() {
+  local src=$1 dest=$2 botd=${SUPERBOT_BOTD:-botd}
+  if [[ ! -s "$src" ]] || plain_sqlite "$src"; then
+    sqlite3 "$src" ".backup '$dest'"
+    return
+  fi
+  command -v "$botd" >/dev/null 2>&1 || { log "$src is encrypted (ADR 0116), but botd isn't on PATH: set SUPERBOT_BOTD"; return 1; }
+  "$botd" database backup "$src" "$dest"
 }
 
 mode=""
@@ -96,7 +115,7 @@ archive() {
   printf 'format=%s\ncreated=%s\n' "$FORMAT" "$(date -u +%FT%TZ)" >"$tmp/.superbot-backup"
   members+=(-C "$tmp" .superbot-backup)
   if [[ -f "$DATA_DIR/app.sqlite" ]]; then
-    sqlite3 "$DATA_DIR/app.sqlite" ".backup '$tmp/app.sqlite'" || status=$?
+    snapshot "$DATA_DIR/app.sqlite" "$tmp/app.sqlite" || status=$?
     members+=(-C "$tmp" app.sqlite)
   fi
   if [[ $status -eq 0 ]]; then
