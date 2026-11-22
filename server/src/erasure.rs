@@ -12,7 +12,6 @@ use crate::db::{EraseError, UserPatch};
 use crate::users::{self, OPERATOR};
 use crate::{ApiError, AppState, Auth, Res, bad, not_found};
 use axum::Json;
-use axum::body::Bytes;
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -40,10 +39,9 @@ pub fn pseudonym() -> String {
     format!("erased-{}", crate::random_hex(8))
 }
 
-/// `POST /api/users/{key}/erase` `{destroyMachine?: bool}`. Admin-only (`rbac::classify`).
+/// `POST /api/users/{key}/erase` `{destroyMachine?: bool}` (send `{}` for none). Admin-only (`rbac::classify`).
 /// Erasing someone already erased answers as the first time did, and changes nothing.
-pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(key): Path<String>, body: Bytes) -> Res {
-    let v: Value = if body.iter().all(u8::is_ascii_whitespace) { Value::Null } else { serde_json::from_slice(&body).map_err(|e| bad(format!("Invalid JSON: {e}")))? };
+pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(key): Path<String>, Json(v): Json<Value>) -> Res {
     let destroy_machine = match &v["destroyMachine"] {
         Value::Null => false,
         Value::Bool(b) => *b,

@@ -17,6 +17,7 @@ async fn json_call(port: u16, method: &str, path: &str, who: &str, body: &str) -
 }
 
 async fn erase(port: u16, who: &str, user: &str, body: &str) -> (u16, Value) {
+    let body = if body.is_empty() { "{}" } else { body };
     json_call(port, "POST", &format!("/api/users/{user}/erase"), who, body).await
 }
 
