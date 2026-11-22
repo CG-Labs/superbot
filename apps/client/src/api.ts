@@ -1,5 +1,7 @@
 import { authHeader, basicAuthHeader, normalizeBaseUrl } from "./auth";
 import type {
+  AccessReview,
+  AccessReviewSignOff,
   AdminUser,
   AppState,
   Approval,
@@ -679,6 +681,24 @@ export class SuperBotApi {
   async auditCsv(query: string): Promise<string> {
     const res = await this.send("GET", `/api/audit/export.csv${query ? `?${query}` : ""}`);
     return res.text();
+  }
+
+  // The access review: admins only (ADR 0099).
+
+  async accessReview(): Promise<AccessReview> {
+    return this.request<AccessReview>("GET", "/api/access-review");
+  }
+
+  /** The report as CSV, one dated row per person. */
+  async accessReviewCsv(): Promise<string> {
+    const res = await this.send("GET", "/api/access-review/export.csv");
+    return res.text();
+  }
+
+  /** Signs off on the report with `digest`. A 409 means access changed since it loaded. */
+  async completeAccessReview(digest: string, notes?: string): Promise<AccessReviewSignOff> {
+    const res = await this.request<{ review: AccessReviewSignOff }>("POST", "/api/access-review/complete", { digest, notes: notes?.trim() || null });
+    return res.review;
   }
 
   eventsUrl(): string {

@@ -29,13 +29,14 @@ function setup(me: Me) {
     onOpenApprovals: jest.fn(),
     onOpenUsers: jest.fn(),
     onOpenAudit: jest.fn(),
+    onOpenAccessReview: jest.fn(),
     onOpenConsole: jest.fn(),
   };
   return props;
 }
 
 describe("Sidebar admin entries", () => {
-  it("shows admins the users, the audit log, and a link to the admin console", async () => {
+  it("shows admins the users, the audit log, the access review, and a link to the admin console", async () => {
     const props = setup({ name: "Owner", role: "admin", permissions: ALL });
     const user = userEvent.setup();
     await render(<Sidebar {...props} />);
@@ -43,6 +44,8 @@ describe("Sidebar admin entries", () => {
     expect(props.onOpenConsole).toHaveBeenCalledTimes(1);
     await user.press(screen.getByText("Audit log"));
     expect(props.onOpenAudit).toHaveBeenCalledTimes(1);
+    await user.press(screen.getByText("Access review"));
+    expect(props.onOpenAccessReview).toHaveBeenCalledTimes(1);
     await user.press(screen.getByText("Users"));
     expect(props.onOpenUsers).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("link", { name: "Finish server setup" })).toBeNull();
@@ -68,6 +71,7 @@ describe("Sidebar admin entries", () => {
     expect(screen.queryByRole("link", { name: "Admin console" })).toBeNull();
     expect(screen.queryByText("Admin console ↗")).toBeNull();
     expect(screen.queryByText("Audit log")).toBeNull();
+    expect(screen.queryByText("Access review")).toBeNull();
     expect(screen.queryByText("Users")).toBeNull();
     expect(screen.getByText("Approvals")).toBeOnTheScreen();
   });
