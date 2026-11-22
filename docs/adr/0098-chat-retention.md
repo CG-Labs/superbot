@@ -1,4 +1,4 @@
-# 0097: Chat history retention
+# 0098: Chat history retention
 
 ## Status
 

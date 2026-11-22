@@ -246,6 +246,9 @@ async fn main() {
     let resume_routines = handover::resume_on_enable(&env("ROUTINES_ON_ENABLE", "")).unwrap_or_else(|e| exit(e));
     let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", ""), &env("SCIM_GROUPS", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
     let tiers = tiers::Tiers::from_env(|k| env(k, "")).unwrap_or_else(|e| exit(format!("Tiers: {e}")));
+    for name in adapters::NAMES {
+        adapters::get(name).expect("listed adapter").check_env(&|k| env(k, "")).unwrap_or_else(|e| exit(e));
+    }
     let testing = license::testing_flag(&env("TESTING_MODE", "")).unwrap_or_else(|e| exit(e));
     let (payments, ignored_stripe) =
         billing::Billing::configured(&secrets::env::EnvStore::process(), &|k| env(k, ""), testing).unwrap_or_else(|e| exit(format!("Billing: {e}")));

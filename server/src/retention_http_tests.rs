@@ -1,4 +1,4 @@
-//! Chat retention (ADR 0097) on the real router: off unless set, deletes old chat in
+//! Chat retention (ADR 0098) on the real router: off unless set, deletes old chat in
 //! batches but never a held Bot's or a message whose run is still going, audits each pass
 //! with its counts, and lets only admins see it and hold or release a Bot's chat.
 

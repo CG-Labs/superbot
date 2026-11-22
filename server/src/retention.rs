@@ -1,4 +1,4 @@
-//! Chat retention (ADR 0097). `CHAT_RETENTION_DAYS` (unset or 0 = keep forever) deletes chat
+//! Chat retention (ADR 0098). `CHAT_RETENTION_DAYS` (unset or 0 = keep forever) deletes chat
 //! messages older than that every few hours, a batch at a time, never one whose run is still
 //! queued or running, and never one in or from the chat of a Bot an admin holds
 //! (`/api/retention/holds/{bot}`, for a legal hold or any other reason). A held Bot can't be

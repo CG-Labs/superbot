@@ -59,7 +59,7 @@ Chat history, approvals, policy, secrets and the audit log stay on the control p
 | botd to Incus | Mutual TLS, with the Incus host's certificate pinned by SHA-256 ([ADR 0065](../adr/0065-incus-container-machines.md)). |
 | botd to Stripe, Expo, Linode, S3, IdPs, webhooks | HTTPS with certificate checks. Webhook and S3 URLs must be HTTPS (plain HTTP only to loopback, for tests). |
 | botd to SMTP | STARTTLS by default, or implicit TLS. Plain text only to a relay on the same machine ([ADR 0061](../adr/0061-approval-notifications.md)). |
-| Harness to model provider | The harness's own client, to the provider's URL. A provider in the plan routing file (`TIERS_FILE`) may use `http://` to any host, and the harness then sends prompts and the key unencrypted. Use `https://`. |
+| Harness to model provider | The harness's own client, to the provider's URL. A provider in the plan routing file (`TIERS_FILE`) and `SUPERBOT_HERMES_BASE_URL` must be `https://`, or plain `http://` only to this host (`127.0.0.0/8`, `::1`, `localhost`); botd refuses to start otherwise ([ADR 0097](../adr/0097-model-providers-over-https.md)). An endpoint the operator or a user gives a harness in its own settings (`ANTHROPIC_BASE_URL`, a Bot's Codex or Pi config) is theirs to keep on HTTPS. |
 
 ### At rest
 
@@ -171,7 +171,7 @@ Off until `SCIM=on` ([ADR 0023](../adr/0023-scim.md), [ADR 0026](../adr/0026-sci
 |------|---------|
 | Sessions | End after 7 days idle or 30 days at most (`SESSION_IDLE_TIMEOUT`, `SESSION_MAX_AGE`). |
 | Audit log | Kept forever unless `AUDIT_RETENTION_DAYS` is set. |
-| Chat history | Kept forever unless `CHAT_RETENTION_DAYS` is set; then older messages are deleted when botd starts and every 6 hours, in batches, and each pass that deletes any is audited (`chat.pruned`) with the count, never the text. Never deleted: a message whose run is still queued or running, and the chat of a Bot an admin holds (a legal hold, `botctl retention hold`), which can't be deleted while held ([ADR 0097](../adr/0097-chat-retention.md)). Harness session files in each Bot's folder and Bots' memory aren't covered. |
+| Chat history | Kept forever unless `CHAT_RETENTION_DAYS` is set; then older messages are deleted when botd starts and every 6 hours, in batches, and each pass that deletes any is audited (`chat.pruned`) with the count, never the text. Never deleted: a message whose run is still queued or running, and the chat of a Bot an admin holds (a legal hold, `botctl retention hold`), which can't be deleted while held ([ADR 0098](../adr/0098-chat-retention.md)). Harness session files in each Bot's folder and Bots' memory aren't covered. |
 | Server backups | 14 days (`SUPERBOT_BACKUP_RETENTION_DAYS`). Deleted chat and audit rows stay in backups until then. |
 | Machine backups | 14 days per plan, the newest of a live machine always kept; a destroyed machine's backups go at the end of their retention. |
 | Teammates who leave | Their OS user and home on the owner's machine (or their account for the owner's Bots on one server) are removed. Their work is handed to the owner's `from-teammates/` folder and then kept as the owner's files (`MACHINE_TEAMMATE_FILES=archive`, `ISOLATION_TEAMMATE_FILES=archive`, the defaults), or held aside and deleted after `*_TEAMMATE_FILES_DAYS` with `delete` ([ADR 0052](../adr/0052-teammate-offboarding-on-machines.md), [ADR 0066](../adr/0066-removing-teammate-accounts-on-one-server.md)). Nothing deletes archived work by age. |

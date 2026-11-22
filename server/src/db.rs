@@ -70,7 +70,7 @@ pub struct Message {
     pub requested_by: Option<audit::Who>,
 }
 
-/// A Bot whose chat is kept out of retention (ADR 0097).
+/// A Bot whose chat is kept out of retention (ADR 0098).
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RetentionHold {
@@ -1561,7 +1561,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 41] = [
     migrate_chat_retention,
 ];
 
-/// Chat retention (ADR 0097): Bots whose chat an admin holds out of retention, for a legal
+/// Chat retention (ADR 0098): Bots whose chat an admin holds out of retention, for a legal
 /// hold or any other reason, and an index so the deletion job finds old messages by age.
 /// A held Bot can't be deleted, so the hold goes only when an admin releases it.
 fn migrate_chat_retention(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
@@ -3387,7 +3387,7 @@ impl Db {
         s.query_map([], message_row).unwrap().filter_map(Result::ok).collect()
     }
 
-    // Chat retention (ADR 0097)
+    // Chat retention (ADR 0098)
 
     /// Days of chat history to keep, as last saved. None = forever.
     pub fn chat_retention(&self) -> Option<u32> {

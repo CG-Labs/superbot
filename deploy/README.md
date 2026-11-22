@@ -420,7 +420,7 @@ Admin actions (logins, Bot and routine changes, approvals, policy, handoffs) are
 
 ## Chat history retention
 
-Chat history (every Bot's messages, routine prompts and Bot-to-Bot messages) is kept forever by default. To delete it after a while ([ADR 0097](../docs/adr/0097-chat-retention.md)):
+Chat history (every Bot's messages, routine prompts and Bot-to-Bot messages) is kept forever by default. To delete it after a while ([ADR 0098](../docs/adr/0098-chat-retention.md)):
 
 - `CHAT_RETENTION_DAYS` in `.env`: unset or `0` keeps it forever (default). `1` to `36500` deletes older messages when `botd` starts and every 6 hours after, 500 at a time, and records `chat.pruned` in the audit log with how many went (never their text). Restart `botd` after changing it; the change is audited as `chat.retention_changed`.
 - Never deleted: a message whose run is still queued or running, and anything in or from the chat of a Bot an admin holds. Hold a Bot for a legal hold or any other reason; a held Bot can't be deleted until the hold is released. Holds are for admins only, through `botctl` (below) or `GET /api/retention` and `PUT`/`DELETE /api/retention/holds/<bot-id>` (`{"reason": "..."}`), and are audited (`chat.hold_placed`, `chat.hold_changed`, `chat.hold_released`).
@@ -552,7 +552,7 @@ Off unless you set `TIERS_FILE`: without it every user is on one open `self-host
 
 - Copy [`tiers.example.json`](tiers.example.json) next to `.env`, edit the routes and limits, and set `TIERS_FILE` to its path (and `DEFAULT_TIER` if you like). Restart `botd`; it refuses to start on a bad file.
 - Assign users: `botctl user tier alex@example.com pro`, or `default`. `botctl tiers` lists them with their routes.
-- Hermes routes can use model endpoints the file names under `providers`, with a `fallback` chain per route ([ADR 0077](../docs/adr/0077-two-providers-through-tier-routing.md)). Save each endpoint's key as the secret its `keySecret` names, e.g. `botctl secret set TIER_ANTHROPIC_KEY < key.txt`. Until then, runs routed to it are refused, fallbacks to it are skipped, and botd warns at startup.
+- Hermes routes can use model endpoints the file names under `providers`, with a `fallback` chain per route ([ADR 0077](../docs/adr/0077-two-providers-through-tier-routing.md)). Save each endpoint's key as the secret its `keySecret` names, e.g. `botctl secret set TIER_ANTHROPIC_KEY < key.txt`. Until then, runs routed to it are refused, fallbacks to it are skipped, and botd warns at startup. Each `baseUrl` must be `https://`; plain `http://` is allowed only to this host (`127.0.0.1`, `::1`, `localhost`), for a local model server or a TLS tunnel, and botd refuses to start on anything else ([ADR 0097](../docs/adr/0097-model-providers-over-https.md)).
 - New Bots on a managed tier get its `defaultHarness` (else its first route's harness): Hermes on every shipped plan. `DEFAULT_HARNESS` applies only on open tiers like `self-host`. botd's startup line says which, and warns if a default isn't installed where the runs happen; a run on a harness that isn't installed here is refused, with how to install it (`deploy/install.sh --with-hermes`, or `hermes` in `SUPERBOT_HARNESSES` for Docker) ([ADR 0079](../docs/adr/0079-hermes-default-for-managed-tiers.md)).
 - Bots made before keep their harness. To move a managed tier's Bots onto its default, list them first, then move them (Bots mid-run are skipped; run it again later). Each move is audited (`bot.updated` with `via: tier_default`, and `tier.bots_moved`), and starts a fresh session:
 
