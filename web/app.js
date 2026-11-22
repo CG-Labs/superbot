@@ -584,7 +584,11 @@ $("teams-list").addEventListener("change", async (e) => {
     if (act === "team-custom-role") {
       const held = t.members.find((x) => x.id === userId)?.customRole?.id;
       if (e.target.value) await api("PUT", `/api/roles/${key(e.target.value)}/teams/${key(t.id)}/users/${key(userId)}`);
-      else if (held) await api("DELETE", `/api/roles/${key(held)}/teams/${key(t.id)}/users/${key(userId)}`);
+      else if (held) {
+        const name = roles.roles.find((x) => x.id === held)?.name || "their custom role";
+        if (!confirm(`Take ${name} away within ${t.name}? Their role across the server doesn't change.`)) return loadTeams();
+        await api("DELETE", `/api/roles/${key(held)}/teams/${key(t.id)}/users/${key(userId)}`);
+      }
     }
   } catch (err) {
     fail(err);
@@ -750,7 +754,10 @@ $("roles-list").addEventListener("click", async (e) => {
       if (!confirm(`Take ${r.name} away? They keep ${baseName(r.base).toLowerCase()} as their role.`)) return;
       await api("DELETE", `/api/roles/${key(r.id)}/users/${key(li.dataset.user)}`);
     }
-    if (b.dataset.act === "unassign-team-role") await api("DELETE", `/api/roles/${key(r.id)}/teams/${key(li.dataset.team)}/users/${key(li.dataset.user)}`);
+    if (b.dataset.act === "unassign-team-role") {
+      if (!confirm(`Take ${r.name} away within this team? Their role across the server doesn't change.`)) return;
+      await api("DELETE", `/api/roles/${key(r.id)}/teams/${key(li.dataset.team)}/users/${key(li.dataset.user)}`);
+    }
   } catch (err) {
     fail(err);
   } finally {
@@ -767,9 +774,9 @@ $("roles-list").addEventListener("submit", async (e) => {
   try {
     if (f.dataset.act === "give-role") {
       const target = f.user.value.trim();
-      const u = rolesTab.people.find((x) => x.email === target || x.id === target);
+      const u = rolesTab.people.find((x) => (x.email || "").toLowerCase() === target.toLowerCase() || x.id === target);
       if (u?.role === "admin" && !confirm(`Give ${r.name} to ${u.name}? They stop being an admin: their role becomes ${baseName(r.base).toLowerCase()}, with ${r.name}'s permissions on top.`)) return;
-      await api("PUT", `/api/roles/${key(r.id)}/users/${key(target)}`);
+      await api("PUT", `/api/roles/${key(r.id)}/users/${key(u?.id || target)}`);
     }
     if (f.dataset.act === "give-team-role") {
       const [team, user] = f.member.value.split("|");
