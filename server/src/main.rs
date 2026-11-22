@@ -85,6 +85,8 @@ mod machines_upkeep_tests;
 #[cfg(test)]
 mod machines_rebuild_tests;
 #[cfg(test)]
+mod machines_redteam_tests;
+#[cfg(test)]
 mod machines_screens_tests;
 #[cfg(test)]
 mod machines_teammates_tests;
