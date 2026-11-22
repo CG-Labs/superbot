@@ -5,24 +5,17 @@
 //! (`VAULT_TOKEN`, or `VAULT_TOKEN_FILE`, read again whenever Vault refuses the one it
 //! has, so Vault Agent can rotate it) or AppRole (`VAULT_ROLE_ID`, `VAULT_SECRET_ID`,
 //! each also `_FILE`), logging in again before the token's lease runs out and once more
-//! when Vault refuses it. Requests run on a thread of their own, so a store read from
-//! inside botd's async code never blocks on a runtime it is part of.
+//! when Vault refuses it. Requests run on a runtime of their own (`http::Worker`).
 
 use super::external::{self, Provider, Scope};
+use super::http::Worker;
 use super::{Error, SecretStore};
 use crate::audit::{Event, Outcome};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
-
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const TIMEOUT: Duration = Duration::from_secs(10);
-/// Longest a caller waits for its turn, then for its answer: a login and a retried request.
-const WAIT: Duration = Duration::from_secs(35);
-/// Requests to Vault at once; more wait for a permit.
-const MAX_REQUESTS: usize = 8;
 
 pub enum Auth {
     /// The token itself, or the file that holds it (read again when Vault refuses it).
@@ -124,18 +117,7 @@ struct Inner {
 
 pub struct Vault {
     inner: Arc<Inner>,
-    /// Botd's own runtime can't be blocked on from inside, so requests run on this one.
-    rt: Option<tokio::runtime::Runtime>,
-    permits: Arc<tokio::sync::Semaphore>,
-}
-
-impl Drop for Vault {
-    fn drop(&mut self) {
-        // Dropping a runtime blocks, which panics inside another runtime's tasks.
-        if let Some(rt) = self.rt.take() {
-            rt.shutdown_background();
-        }
-    }
+    worker: Worker,
 }
 
 fn unavailable(what: &str, e: impl std::fmt::Display) -> Error {
@@ -144,52 +126,18 @@ fn unavailable(what: &str, e: impl std::fmt::Display) -> Error {
 
 impl Vault {
     pub fn new(cfg: Config) -> Result<Vault, String> {
-        let mut b = reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT).timeout(TIMEOUT).redirect(reqwest::redirect::Policy::none());
-        if let Some(pem) = &cfg.ca {
-            let c = reqwest::Certificate::from_pem(pem.as_bytes()).map_err(|e| format!("VAULT_CACERT: {e}"))?;
-            b = b.tls_certs_merge([c]);
-        }
-        let http = b.build().map_err(|e| format!("Vault client: {e}"))?;
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("vault")
-            .enable_all()
-            .build()
-            .map_err(|e| format!("Vault client: {e}"))?;
-        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_REQUESTS));
-        Ok(Vault { inner: Arc::new(Inner { cfg, http, token: Mutex::new(None) }), rt: Some(rt), permits })
+        let http = super::http::client("Vault", cfg.ca.as_deref().map(|pem| ("VAULT_CACERT", pem)), false)?;
+        Ok(Vault { inner: Arc::new(Inner { cfg, http, token: Mutex::new(None) }), worker: Worker::new("Vault", "vault")? })
     }
 
-    /// Runs `f` on Vault's runtime, up to `MAX_REQUESTS` at once, and waits for it. A
-    /// caller that gives up drops its receiver, and a job not yet started is skipped.
+    /// Runs `f` on Vault's runtime and waits for it (`http::Worker::run`).
     fn run<T, F, Fut>(&self, f: F) -> Result<T, Error>
     where
         T: Send + 'static,
-        F: FnOnce(Arc<Inner>) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = Result<T, Error>> + Send,
+        F: FnOnce(Arc<Inner>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, Error>> + Send + 'static,
     {
-        // None says the request started; then its answer.
-        let (tx, rx) = mpsc::channel::<Option<Result<T, Error>>>();
-        let inner = Arc::clone(&self.inner);
-        let permits = Arc::clone(&self.permits);
-        let rt = self.rt.as_ref().ok_or_else(|| Error::Unavailable("Vault: the client stopped".into()))?;
-        rt.spawn(async move {
-            let Ok(_permit) = permits.acquire_owned().await else { return };
-            // Whoever asked has stopped waiting: don't spend a request on it.
-            if tx.send(None).is_err() {
-                return;
-            }
-            let _ = tx.send(Some(f(inner).await));
-        });
-        let wait = || -> Option<Result<T, Error>> {
-            rx.recv_timeout(WAIT).ok()?;
-            rx.recv_timeout(WAIT).ok().flatten()
-        };
-        // On one of botd's runtime workers, hand its other tasks to another worker while
-        // this waits, so a slow Vault never stalls requests, heartbeats or timers.
-        let multi = tokio::runtime::Handle::try_current().is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
-        let got = if multi { tokio::task::block_in_place(wait) } else { wait() };
-        got.unwrap_or_else(|| Err(Error::Unavailable("Vault: no answer in time".into())))
+        self.worker.run(f(Arc::clone(&self.inner)))
     }
 }
 
@@ -341,12 +289,14 @@ mod tests {
     use super::super::env::EnvStore;
     use super::super::external::{tests::audited, ExternalStore};
     use super::super::{redact, sealed, Secrets};
+    use super::super::http::tests::settings;
     use super::*;
     use axum::extract::{Path, Query, State};
     use axum::http::{HeaderMap, StatusCode};
     use axum::Json;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use super::super::http::MAX_REQUESTS;
 
     /// A stand-in for Vault's KV v2 and AppRole APIs: no real Vault, account or network.
     #[derive(Default)]
@@ -439,25 +389,11 @@ mod tests {
             .route("/v1/secret/metadata/{*rest}", axum::routing::get(metadata))
             .route("/v1/auth/approle/login", axum::routing::post(login))
             .with_state(Arc::clone(&f));
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            rt.block_on(async move {
-                let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-                tx.send(format!("http://{}", listener.local_addr().unwrap())).unwrap();
-                axum::serve(listener, app).await.unwrap();
-            });
-        });
-        (rx.recv().unwrap(), f)
+        (super::super::http::tests::serve(app), f)
     }
 
     fn put(f: &Fake, path: &str, value: &str) {
         f.kv.lock().unwrap().insert(format!("superbot/{path}"), json!({ "value": value }));
-    }
-
-    fn settings(pairs: &[(&str, &str)]) -> impl Fn(&str) -> String + use<> {
-        let map: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        move |k: &str| map.get(k).cloned().unwrap_or_default()
     }
 
     fn vault(url: &str, extra: &[(&str, &str)], ttl: Duration) -> Arc<ExternalStore> {
@@ -677,7 +613,7 @@ mod tests {
             assert!(s.harness_env().is_empty() && s.inherited_harness_env().is_empty() && s.list().unwrap().is_empty(), "{name}");
             let host = crate::adapters::local_host();
             for k in [name.to_string(), format!("{name}_FILE")] {
-                assert!(host.remove.iter().any(|r| *r == k), "{k} removed from local jobs");
+                assert!(host.remove.contains(&k), "{k} removed from local jobs");
             }
         }
     }

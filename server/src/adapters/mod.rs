@@ -132,9 +132,9 @@ pub struct Guard {
 
 /// Server secrets the harness (and everything it runs) must not inherit, or a Bot
 /// could approve its own actions, read what botd seals, or copy the license key or
-/// forge Stripe's webhook or call Stripe's API, or sign in to the Vault botd reads
-/// its secrets from (ADR 0125).
-pub(crate) const SECRET_ENV: [&str; 20] = [
+/// forge Stripe's webhook or call Stripe's API, or sign in to the Vault, Key Vault or
+/// Secret Manager botd reads its secrets from (ADR 0125, ADR 0136).
+pub(crate) const SECRET_ENV: [&str; 26] = [
     "AUTH_PASSWORD",
     "AUTH_PASSWORD_FILE",
     "SUPERBOT_PASSWORD",
@@ -155,6 +155,12 @@ pub(crate) const SECRET_ENV: [&str; 20] = [
     "VAULT_ROLE_ID_FILE",
     "VAULT_SECRET_ID",
     "VAULT_SECRET_ID_FILE",
+    "AZURE_CLIENT_SECRET",
+    "AZURE_CLIENT_SECRET_FILE",
+    "AZURE_FEDERATED_TOKEN_FILE",
+    "IDENTITY_HEADER",
+    "GCP_SERVICE_ACCOUNT_KEY",
+    "GCP_SERVICE_ACCOUNT_KEY_FILE",
 ];
 
 /// `SECRET_ENV`, `secrets::SERVER_SECRETS` (and their `_FILE`), every `SSO_*` setting:
