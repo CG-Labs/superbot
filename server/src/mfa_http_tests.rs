@@ -49,12 +49,12 @@ fn unbase32(s: &str) -> Vec<u8> {
 }
 
 /// The code an authenticator app shows `steps` time steps from now.
-fn code(key: &[u8], steps: i64) -> String {
+pub(super) fn code(key: &[u8], steps: i64) -> String {
     mfa::code_at(key, db::now() + steps * mfa::STEP_MS)
 }
 
 /// Sets up a second factor in settings. Returns the key and the recovery codes.
-async fn enrol(port: u16, auth: &str) -> (Vec<u8>, Vec<String>) {
+pub(super) async fn enrol(port: u16, auth: &str) -> (Vec<u8>, Vec<String>) {
     let (status, setup) = json_call(port, "POST", "/api/auth/mfa/enroll", auth, json!({})).await;
     assert_eq!(status, 200, "{setup}");
     let key = unbase32(setup["secret"].as_str().unwrap());

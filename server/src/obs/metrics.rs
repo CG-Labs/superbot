@@ -147,6 +147,8 @@ struct Inner {
     runs_active: BTreeMap<&'static str, i64>,
     refused: BTreeMap<String, u64>,
     events: BTreeMap<(&'static str, &'static str), u64>,
+    signin_failures: BTreeMap<&'static str, u64>,
+    signin_suspicious: BTreeMap<&'static str, u64>,
     reconciles: u64,
     reconcile_last: Option<(i64, f64)>,
     recent: Window,
@@ -273,6 +275,16 @@ impl Metrics {
         }
     }
 
+    /// A failed sign-in that guessed a credential, counted before the audit log's throttle.
+    pub fn signin_failed(&self, method: &str) {
+        *self.lock().signin_failures.entry(known(&crate::signin_watch::METHODS, method)).or_default() += 1;
+    }
+
+    /// A suspicious sign-in pattern botd saw (ADR 0104).
+    pub fn signin_suspicious(&self, pattern: &str) {
+        *self.lock().signin_suspicious.entry(known(&crate::signin_watch::PATTERNS, pattern)).or_default() += 1;
+    }
+
     pub fn reconciled(&self, at_ms: i64, seconds: f64) {
         let mut m = self.lock();
         m.reconciles += 1;
@@ -309,6 +321,15 @@ impl Metrics {
         family(out, "superbot_events_total", "counter", "Audit events an operator may alert on, by action and outcome.");
         for ((a, o), n) in &m.events {
             sample(out, "superbot_events_total", &[("event", a), ("outcome", o)], *n as f64);
+        }
+        // Every label is written from the start, at zero, so an alert's increase() sees the first one.
+        family(out, "superbot_signin_failures_total", "counter", "Failed sign-ins that guessed a credential, by method; every one, unlike the audit log's throttled auth.login_failed.");
+        for method in crate::signin_watch::METHODS.iter().chain(m.signin_failures.contains_key("other").then_some(&"other")) {
+            sample(out, "superbot_signin_failures_total", &[("method", method)], m.signin_failures.get(method).copied().unwrap_or(0) as f64);
+        }
+        family(out, "superbot_signin_suspicious_total", "counter", "Suspicious sign-in patterns botd saw, by pattern (auth.suspicious_sign_in).");
+        for pattern in crate::signin_watch::PATTERNS.iter().chain(m.signin_suspicious.contains_key("other").then_some(&"other")) {
+            sample(out, "superbot_signin_suspicious_total", &[("pattern", pattern)], m.signin_suspicious.get(pattern).copied().unwrap_or(0) as f64);
         }
         family(out, "superbot_machine_reconcile_passes_total", "counter", "Passes of the machine reconciler.");
         sample(out, "superbot_machine_reconcile_passes_total", &[], m.reconciles as f64);
@@ -379,6 +400,10 @@ mod tests {
         m.audited("auth.login_failed", "failure", None);
         m.audited("user.email_changed", "success", None);
         m.audited("bot.run_refused", "denied", Some("Alex's key sk-live-123"));
+        m.signin_failed("totp");
+        m.signin_failed("alex@example.com");
+        m.signin_suspicious("ip_failures");
+        m.signin_suspicious("203.0.113.9");
         let mut out = String::new();
         m.render(&mut out);
         assert!(out.contains(r#"superbot_http_requests_total{route_class="bots",method="other",status_class="4xx"} 1"#), "{out}");
@@ -386,7 +411,13 @@ mod tests {
         assert!(out.contains(r#"superbot_runs_active{harness="other"} 0"#), "{out}");
         assert!(out.contains(r#"superbot_events_total{event="auth.login_failed",outcome="failure"} 1"#), "{out}");
         assert!(out.contains(r#"superbot_runs_refused_total{reason="other"} 1"#), "{out}");
-        for bad in ["BREW", "example.com", "secret", "passwd", "email_changed", "sk-live", "Alex"] {
+        assert!(out.contains(r#"superbot_signin_failures_total{method="totp"} 1"#), "{out}");
+        assert!(out.contains(r#"superbot_signin_failures_total{method="code"} 0"#), "{out}");
+        assert!(out.contains(r#"superbot_signin_failures_total{method="other"} 1"#), "{out}");
+        assert!(out.contains(r#"superbot_signin_suspicious_total{pattern="ip_failures"} 1"#), "{out}");
+        assert!(out.contains(r#"superbot_signin_suspicious_total{pattern="new_ip"} 0"#), "{out}");
+        assert!(out.contains(r#"superbot_signin_suspicious_total{pattern="other"} 1"#), "{out}");
+        for bad in ["BREW", "203.0.113", "example.com", "secret", "passwd", "email_changed", "sk-live", "Alex"] {
             assert!(!out.contains(bad), "{bad} leaked into: {out}");
         }
     }

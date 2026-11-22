@@ -1,0 +1,256 @@
+# promtool test rules superbot-signin.rules.test.yml
+rule_files:
+  - superbot-signin.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # A sign-in works after a burst: it pages at once, and stops once the window has passed.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="success_after_failures"}'
+        values: '0x10 1x80'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="ip_failures"}'
+        values: '0x90'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="account_failures"}'
+        values: '0x90'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="new_ip"}'
+        values: '0x90'
+      - series: 'superbot_signin_failures_total{job="superbot",method="code"}'
+        values: '0+1x90'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SuperBotSignInAfterFailures
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              job: superbot
+            exp_annotations:
+              summary: A sign-in worked right after a burst of failed ones
+              description: "botd saw a sign-in succeed from an IP or to an account that had just reached its failure limit (SIGNIN_ALERT_IP_FAILURES, SIGNIN_ALERT_ACCOUNT_FAILURES). Find it in the audit log (auth.suspicious_sign_in, pattern success_after_failures) and, if it wasn't them, end the person's sessions and disable them."
+      - eval_time: 15m
+        alertname: SuperBotAccountSignInFailures
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: SuperBotSignInBurstsRepeated
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: SuperBotSignInFailuresHigh
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: SuperBotSignInFromNewNetwork
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: SuperBotSignInAfterFailures
+        exp_alerts: []
+
+  # One account reaches its failure limit.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="account_failures"}'
+        values: '0x10 1x80'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="ip_failures"}'
+        values: '0x90'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="success_after_failures"}'
+        values: '0x90'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="new_ip"}'
+        values: '0x90'
+      - series: 'superbot_signin_failures_total{job="superbot",method="code"}'
+        values: '0+1x90'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SuperBotAccountSignInFailures
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+            exp_annotations:
+              summary: One account is getting many failed sign-ins
+              description: "An account reached SIGNIN_ALERT_ACCOUNT_FAILURES failed sign-ins within SIGNIN_ALERT_WINDOW. For a second factor, the person's password or sign-in code may be known to someone else. The audit log (auth.suspicious_sign_in, pattern account_failures) names the account."
+      - eval_time: 15m
+        alertname: SuperBotSignInAfterFailures
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: SuperBotSignInBurstsRepeated
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: SuperBotSignInFailuresHigh
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: SuperBotSignInFromNewNetwork
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: SuperBotAccountSignInFailures
+        exp_alerts: []
+
+  # An admin signs in from a new network.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="new_ip"}'
+        values: '0x10 1x80'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="ip_failures"}'
+        values: '0x90'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="account_failures"}'
+        values: '0x90'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="success_after_failures"}'
+        values: '0x90'
+      - series: 'superbot_signin_failures_total{job="superbot",method="code"}'
+        values: '0+1x90'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SuperBotSignInFromNewNetwork
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+            exp_annotations:
+              summary: An admin signed in from a new network
+              description: "Someone covered by SIGNIN_ALERT_NEW_IP (admins by default) signed in from a network none of their kept sessions came from. Confirm it was them: the audit log (auth.suspicious_sign_in, pattern new_ip) has the account and IP."
+      - eval_time: 15m
+        alertname: SuperBotSignInAfterFailures
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: SuperBotAccountSignInFailures
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: SuperBotSignInBurstsRepeated
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: SuperBotSignInFailuresHigh
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: SuperBotSignInFromNewNetwork
+        exp_alerts: []
+
+  # Three bursts from single IPs in an hour: someone keeps coming back after the limiter's pauses.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="ip_failures"}'
+        values: '0x5 1x20 2x20 3x120'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="account_failures"}'
+        values: '0x90'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="success_after_failures"}'
+        values: '0x90'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="new_ip"}'
+        values: '0x90'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: SuperBotSignInBurstsRepeated
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+            exp_annotations:
+              summary: Repeated bursts of failed sign-ins
+              description: "Three or more bursts of failed sign-ins from single IPs in the last hour, each past SIGNIN_ALERT_IP_FAILURES. The audit log (auth.suspicious_sign_in, pattern ip_failures) has the IPs; block them at the proxy or firewall if they persist."
+      - eval_time: 50m
+        alertname: SuperBotSignInAfterFailures
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: SuperBotAccountSignInFailures
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: SuperBotSignInFailuresHigh
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: SuperBotSignInFromNewNetwork
+        exp_alerts: []
+      - eval_time: 3h
+        alertname: SuperBotSignInBurstsRepeated
+        exp_alerts: []
+
+  # Two bursts in an hour are the internet's background noise.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="ip_failures"}'
+        values: '0x5 1x20 2x60'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="account_failures"}'
+        values: '0x90'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="success_after_failures"}'
+        values: '0x90'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="new_ip"}'
+        values: '0x90'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: SuperBotSignInAfterFailures
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: SuperBotAccountSignInFailures
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: SuperBotSignInBurstsRepeated
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: SuperBotSignInFailuresHigh
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: SuperBotSignInFromNewNetwork
+        exp_alerts: []
+
+  # Guessing spread across many IPs: ten failed sign-ins a minute, none of them a burst.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_signin_failures_total{job="superbot",method="password"}'
+        values: '0+6x60'
+      - series: 'superbot_signin_failures_total{job="superbot",method="code"}'
+        values: '0+4x60'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="ip_failures"}'
+        values: '0x90'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="account_failures"}'
+        values: '0x90'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="success_after_failures"}'
+        values: '0x90'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="new_ip"}'
+        values: '0x90'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SuperBotSignInFailuresHigh
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+            exp_annotations:
+              summary: Many failed sign-ins across the server
+              description: "More than 100 failed sign-ins (passwords, sign-in codes, second factors) in 15 minutes. Check superbot_signin_failures_total by method and the audit log's auth.login_failed events for where they come from."
+      - eval_time: 30m
+        alertname: SuperBotSignInAfterFailures
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: SuperBotAccountSignInFailures
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: SuperBotSignInBurstsRepeated
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: SuperBotSignInFromNewNetwork
+        exp_alerts: []
+
+  # A few typos a minute stay quiet.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_signin_failures_total{job="superbot",method="code"}'
+        values: '0+2x60'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="ip_failures"}'
+        values: '0x90'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="account_failures"}'
+        values: '0x90'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="success_after_failures"}'
+        values: '0x90'
+      - series: 'superbot_signin_suspicious_total{job="superbot",pattern="new_ip"}'
+        values: '0x90'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SuperBotSignInAfterFailures
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: SuperBotAccountSignInFailures
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: SuperBotSignInBurstsRepeated
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: SuperBotSignInFailuresHigh
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: SuperBotSignInFromNewNetwork
+        exp_alerts: []
