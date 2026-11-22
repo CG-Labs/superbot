@@ -9,7 +9,7 @@ Organisation data (users, chats, approvals, audit log, secrets, billing records)
 Yes, for machines and their backups. An admin sets a data region for your account or team, such as London (`gb-lon`) or Frankfurt (`de-fra-2`). Your machines are made only there, their backups go to a store there, and nothing is moved out unless you ask ([ADR 0117](../adr/0117-uk-eu-data-regions.md)). Under a residency agreement the provider pins you to that region: backups, restores and moves elsewhere are refused and audited, and the region can't change until it is unpinned with a reason ([ADR 0129](../adr/0129-contractual-data-residency.md), [DPA Annex IV](dpa-template.md#annex-iv-data-residency)). The server's own database stays where the operator runs botd. Self-hosting runs wherever you put it.
 
 **Do model calls stay in our region?**
-Only if the plan routes them to a provider endpoint in that region. A data region or pin covers machines and backups, not model calls. Anthropic's own API has no UK or EU processing option; Claude through a cloud platform's regional endpoint, or OpenAI's data residency by arrangement, can give one. The provider must list each model provider and region in the [DPA](dpa-template.md#iv4-model-providers).
+Only if the plan routes them to a provider endpoint in that region. A data region alone covers machines and backups. A residency pin also holds model calls: the operator marks which regions each endpoint in the plan processes in, and a pinned user's or team's runs use only those endpoints, including fallbacks and Hermes Agent's side tasks, or are refused and audited ([ADR 0139](../adr/0139-in-region-model-routes.md)). Anthropic's own API has no UK or EU processing option; Claude through a cloud platform's regional endpoint, or OpenAI's data residency by arrangement, can give one. The provider must list each model provider and region in the [DPA](dpa-template.md#iv4-model-providers).
 
 **Is data encrypted in transit?**
 Yes. HTTPS to the server, mutual TLS 1.3 between the server and machines, HTTPS to botd's outside services, and STARTTLS or TLS for email. Model providers set in the plan routing file must be `https://`; botd refuses to start on a plain `http://` provider unless it is on the same host ([ADR 0097](../adr/0097-model-providers-over-https.md)). See [encryption in transit](data-flows.md#in-transit).
@@ -36,7 +36,7 @@ Destructive commands, file deletes, outbound messages, network installs and `git
 A token for that run only, revoked when it ends, plus the secrets its owner and the server give it. Never botd's own secrets. See [per-run tokens](access-control.md#bots-a-token-for-each-run).
 
 **Is there an audit log?**
-Yes, append-only, with the actor of each event, viewable and exportable as CSV by admins. Kept forever unless retention is set. Tamper evidence (hash chain) is planned (M5). See [audit log](access-control.md#audit-log).
+Yes, append-only, with the actor of each event, viewable and exportable as CSV by admins. Kept forever unless retention is set. Tamper-evident: each event is on a hash chain that `botctl audit verify` checks, and every event can be exported to your SIEM ([ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md)). See [audit log](access-control.md#audit-log).
 
 **Which third parties see our data?**
 Only the services the operator turns on: hosting, backup storage, model providers, Stripe, push, email, webhooks, IdPs. See [subprocessors](subprocessors.md).

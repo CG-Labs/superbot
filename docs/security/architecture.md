@@ -136,5 +136,5 @@ flowchart TB
 
 - Hardening and run limits for machines enrolled before ADR 0126 and ADR 0135 without a rebuild, dedicated or VPC hosts, and the red-team exercise (M5, [ADR 0126](../adr/0126-per-user-machine-hardening.md), [ADR 0135](../adr/0135-run-limits-and-egress-allow-lists.md)).
 - Encrypted assertions, signed AuthnRequests and single logout for native SAML (M5, [ADR 0127](../adr/0127-native-saml-service-provider.md)).
-- A tamper-evident (hash-chained) audit log (M5, [ADR 0009](../adr/0009-audit-events.md)).
+- Write-once storage for exported audit events (M5; the hash chain and SIEM export are done, [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md)).
 - A read-only root filesystem for the containers ([ADR 0084](../adr/0084-published-image-with-computer-use.md)).

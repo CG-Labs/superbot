@@ -59,6 +59,16 @@ pub struct Endpoint {
     /// No trailing slash.
     pub base_url: String,
     pub key_secret: String,
+    /// The data regions (`MACHINE_REGIONS` ids) the operator says this endpoint
+    /// processes in, so runs of data pinned there may use it (ADR 0139). Empty: none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<String>,
+}
+
+impl Endpoint {
+    pub fn serves(&self, region: &str) -> bool {
+        self.regions.iter().any(|r| r == region)
+    }
 }
 
 #[derive(Deserialize)]
@@ -67,7 +77,24 @@ struct EndpointCfg {
     protocol: Protocol,
     base_url: String,
     key_secret: String,
+    #[serde(default)]
+    regions: Vec<String>,
 }
+
+/// A route held to pinned data regions (ADR 0139): its own provider serves every one,
+/// and only fallbacks that do too are kept.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Held {
+    pub route: Route,
+    /// The regions it is held to.
+    pub regions: Vec<String>,
+    /// Fallbacks left out because their provider doesn't serve every region.
+    pub outside: Vec<Fallback>,
+    /// The Bot's own route, when it was outside and another of the tier's was taken.
+    pub instead_of: Option<Route>,
+}
+
+const MAX_ENDPOINT_REGIONS: usize = 16;
 
 /// What a run on a route needs from the tiers file besides the route: the endpoints
 /// it and its fallbacks name, and the fallbacks it may take.
@@ -388,7 +415,21 @@ fn endpoint(name: &str, e: EndpointCfg) -> Result<Endpoint, String> {
     if crate::secrets::server_secret(&key) || crate::adapters::secret_env().contains(&key) {
         return Err(at(format!("keySecret: {key} is one of botd's own secrets")));
     }
-    Ok(Endpoint { name: name.into(), protocol: e.protocol, base_url: url, key_secret: key })
+    if e.regions.len() > MAX_ENDPOINT_REGIONS {
+        return Err(at(format!("regions: list at most {MAX_ENDPOINT_REGIONS}")));
+    }
+    let mut regions: Vec<String> = Vec::new();
+    for r in e.regions {
+        let r = r.trim().to_string();
+        if !slug_of(&r, 32) {
+            return Err(at(format!("regions: \"{r}\" must be a data region id, as MACHINE_REGIONS lists them (lowercase letters, digits, and dashes)")));
+        }
+        if regions.contains(&r) {
+            return Err(at(format!("regions: {r} is listed twice")));
+        }
+        regions.push(r);
+    }
+    Ok(Endpoint { name: name.into(), protocol: e.protocol, base_url: url, key_secret: key, regions })
 }
 
 #[derive(Deserialize)]
@@ -723,6 +764,60 @@ impl Tiers {
 
     fn endpoint(&self, name: &str) -> Option<&Endpoint> {
         self.providers.iter().find(|e| e.name == name)
+    }
+
+    /// Whether `provider` is one of this file's endpoints and serves every region.
+    fn serves_all(&self, provider: Option<&str>, regions: &[String]) -> bool {
+        provider.and_then(|p| self.endpoint(p)).is_some_and(|e| regions.iter().all(|r| e.serves(r)))
+    }
+
+    /// `route` held to pinned `regions` (ADR 0139): kept if its provider serves them all,
+    /// else the first of the tier's routes for the same harness that does. Fallbacks
+    /// whose provider doesn't are left out. A harness's built-in provider has no data
+    /// region, so only the file's endpoints count. Err: why none of the tier's do.
+    pub fn held(&self, tier: &Tier, route: &Route, regions: &[String]) -> Result<Held, String> {
+        let same = tier.routes.iter().flatten().filter(|r| r.harness == route.harness && *r != route);
+        let Some(pick) = std::iter::once(route).chain(same).find(|r| self.serves_all(r.provider.as_deref(), regions)) else {
+            let into = regions.join(" and ");
+            let why = match route.provider.as_deref() {
+                None => format!("the {} route names no provider from the tiers file, so nothing shows where its model calls are processed", route.harness),
+                Some(p) => match self.endpoint(p) {
+                    None => format!("its provider {p} is the harness's own, which has no data region"),
+                    Some(e) if e.regions.is_empty() => format!("its provider {p} has no regions in the tiers file"),
+                    Some(e) => format!("its provider {p} is marked as in {}, not {into}", e.regions.join(", ")),
+                },
+            };
+            return Err(format!("The {} plan has no {} route whose provider is marked as in {into}: {why} (ADR 0139).", tier.label, route.harness));
+        };
+        let (fallback, outside) = pick.fallback.iter().cloned().partition(|f| self.serves_all(Some(&f.provider), regions));
+        Ok(Held { route: Route { fallback, ..pick.clone() }, regions: regions.to_vec(), outside, instead_of: (pick != route).then(|| route.clone()) })
+    }
+
+    /// What of `tier` can't run for data pinned to `region` (ADR 0139). None: every
+    /// harness it offers has a route there.
+    pub fn residency_gap(&self, tier: &Tier, region: &str) -> Option<String> {
+        let Some(routes) = &tier.routes else {
+            return Some(format!("the {} plan has open routing, so no model route is held to {region}", tier.label));
+        };
+        let regions = [region.to_string()];
+        let mut missing: Vec<&str> = Vec::new();
+        for r in routes {
+            if !missing.contains(&r.harness.as_str()) && self.held(tier, r, &regions).is_err() {
+                missing.push(&r.harness);
+            }
+        }
+        (!missing.is_empty()).then(|| format!("the {} plan has no model route in {region} for {}", tier.label, missing.join(", ")))
+    }
+
+    /// Regions the file's endpoints name that aren't offered (`offered`: MACHINE_REGIONS).
+    pub fn unknown_regions(&self, offered: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
+        for e in &self.providers {
+            for r in e.regions.iter().filter(|r| !offered.contains(r)) {
+                out.push(format!("provider {} names data region {r}, which isn't one of MACHINE_REGIONS", e.name));
+            }
+        }
+        out
     }
 
     /// What a run on `route` gets, given which secrets it has. A provider this file
@@ -1107,6 +1202,94 @@ mod tests {
         assert!(route(r#"{"harness":"hermes","fallback":[{"provider":"p","model":"m"},{"provider":"p","model":"m"}]}"#).contains("twice"));
         let four = r#"{"provider":"p","model":"a"},{"provider":"p","model":"b"},{"provider":"p","model":"c"},{"provider":"p","model":"d"}"#;
         assert!(route(&format!(r#"{{"harness":"hermes","fallback":[{four}]}}"#)).contains("at most 3"));
+    }
+
+    const REGIONAL: &str = r#"{
+      "providers": {
+        "uk-claude": { "protocol": "anthropic-messages", "baseUrl": "https://uk.claude.example", "keySecret": "TIER_UK_KEY", "regions": [" gb-lon "] },
+        "eu-gpt": { "protocol": "openai-chat", "baseUrl": "https://eu.gpt.example/v1", "keySecret": "TIER_EU_KEY", "regions": ["de-fra-2", "gb-lon"] },
+        "us-gpt": { "protocol": "openai-chat", "baseUrl": "https://us.gpt.example/v1", "keySecret": "TIER_US_KEY" }
+      },
+      "tiers": [
+        { "name": "pro", "label": "Pro", "routes": [
+            { "harness": "hermes", "provider": "us-gpt", "model": "gpt-5",
+              "fallback": [{ "provider": "eu-gpt", "model": "gpt-5" }, { "provider": "openrouter", "model": "x/y" }] },
+            { "harness": "hermes", "provider": "uk-claude", "model": "claude-sonnet-4-5",
+              "fallback": [{ "provider": "us-gpt", "model": "gpt-5" }, { "provider": "eu-gpt", "model": "gpt-5-mini" }] },
+            { "harness": "claude", "model": "claude-sonnet-4-5" }
+        ] },
+        { "name": "us", "label": "US", "routes": [{ "harness": "hermes", "provider": "us-gpt", "model": "gpt-5" }] },
+        { "name": "open", "label": "Open", "routes": "any" }
+      ]
+    }"#;
+
+    #[test]
+    fn pinned_runs_hold_to_routes_whose_providers_are_in_the_region() {
+        let t = Tiers::parse(REGIONAL, None).unwrap();
+        let pro = t.get("pro").unwrap();
+        let gb = ["gb-lon".to_string()];
+        // The Bot's route is outside: the tier's first hermes route in the region instead,
+        // with only its in-region fallbacks.
+        let us = pro.route("hermes", Some("gpt-5"), None).unwrap();
+        let h = t.held(pro, &us, &gb).unwrap();
+        assert_eq!((h.route.provider.as_deref(), h.route.model.as_deref()), (Some("uk-claude"), Some("claude-sonnet-4-5")));
+        assert_eq!(h.route.fallback, [Fallback { provider: "eu-gpt".into(), model: "gpt-5-mini".into() }]);
+        assert_eq!(h.outside, [Fallback { provider: "us-gpt".into(), model: "gpt-5".into() }]);
+        assert_eq!(h.instead_of.as_ref().and_then(|r| r.provider.as_deref()), Some("us-gpt"));
+        assert_eq!(h.regions, gb);
+        // Already in the region: kept as it is, less the fallbacks outside it.
+        let uk = pro.route("hermes", Some("claude-sonnet-4-5"), None).unwrap();
+        let h = t.held(pro, &uk, &gb).unwrap();
+        assert_eq!((h.route.model.as_deref(), h.instead_of.is_none(), h.outside.len()), (Some("claude-sonnet-4-5"), true, 1));
+        // Its wiring takes only in-region endpoints and keys, and the harness adds no fallback.
+        let w = t.wiring(&h.route, true, |_| true).unwrap();
+        assert_eq!(w.endpoints.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["uk-claude", "eu-gpt"]);
+        assert_eq!((w.fallback.as_ref().map(Vec::len), w.unused_keys.as_slice()), (Some(1), &["TIER_US_KEY".to_string()][..]));
+        // Frankfurt: only eu-gpt serves it, and no route has it as its own provider.
+        let e = t.held(pro, &uk, &["de-fra-2".into()]).unwrap_err();
+        assert!(e.contains("The Pro plan has no hermes route") && e.contains("uk-claude is marked as in gb-lon, not de-fra-2"), "{e}");
+        // Held to two regions: a provider must serve both.
+        let both = ["gb-lon".to_string(), "de-fra-2".to_string()];
+        let e = t.held(pro, &us, &both).unwrap_err();
+        assert!(e.contains("marked as in gb-lon and de-fra-2: its provider us-gpt has no regions"), "{e}");
+        // A harness's built-in provider, or none, has no data region.
+        let claude = pro.route("claude", None, None).unwrap();
+        assert!(t.held(pro, &claude, &gb).unwrap_err().contains("names no provider from the tiers file"));
+        let us_tier = t.get("us").unwrap();
+        let e = t.held(us_tier, &us_tier.route("hermes", None, None).unwrap(), &gb).unwrap_err();
+        assert!(e.contains("us-gpt has no regions"), "{e}");
+        let open = t.get("open").unwrap();
+        assert!(t.held(open, &open.route("hermes", Some("m"), None).unwrap(), &gb).is_err());
+        let built_in = Tiers::parse(r#"{"tiers":[{"name":"a","routes":[{"harness":"hermes","provider":"openrouter","model":"m"}]}]}"#, None).unwrap();
+        let a = built_in.get("a").unwrap();
+        assert!(built_in.held(a, &a.route("hermes", None, None).unwrap(), &gb).unwrap_err().contains("openrouter is the harness's own"));
+
+        // What admins are warned about, per plan.
+        assert_eq!(t.residency_gap(pro, "gb-lon").as_deref(), Some("the Pro plan has no model route in gb-lon for claude"));
+        assert_eq!(t.residency_gap(pro, "de-fra-2").as_deref(), Some("the Pro plan has no model route in de-fra-2 for hermes, claude"));
+        assert!(t.residency_gap(open, "gb-lon").unwrap().contains("open routing"));
+        let only = Tiers::parse(r#"{"providers":{"uk":{"protocol":"openai-chat","baseUrl":"https://uk.example","keySecret":"K","regions":["gb-lon"]}},"tiers":[{"name":"a","routes":[{"harness":"hermes","provider":"uk"}]}]}"#, None).unwrap();
+        assert_eq!(only.residency_gap(only.get("a").unwrap(), "gb-lon"), None);
+        assert_eq!(t.unknown_regions(&["gb-lon".into()]), ["provider eu-gpt names data region de-fra-2, which isn't one of MACHINE_REGIONS"]);
+        assert!(t.unknown_regions(&["gb-lon".into(), "de-fra-2".into()]).is_empty());
+
+        // Admins see the regions; endpoints without any say nothing new.
+        let v = t.admin_view();
+        assert_eq!((v["providers"]["uk-claude"]["regions"].clone(), v["providers"]["us-gpt"].get("regions")), (json!(["gb-lon"]), None));
+    }
+
+    #[test]
+    fn endpoint_regions_are_checked() {
+        let bad = |regions: &str| {
+            Tiers::parse(&format!(r#"{{"providers":{{"p":{{"protocol":"openai-chat","baseUrl":"https://x.example","keySecret":"K","regions":{regions}}}}},"tiers":[{{"name":"a","routes":"any"}}]}}"#), None)
+                .unwrap_err()
+        };
+        assert!(bad(r#"["GB-LON"]"#).contains("must be a data region id"));
+        assert!(bad(r#"[""]"#).contains("must be a data region id"));
+        assert!(bad(r#"["gb-lon","gb-lon"]"#).contains("listed twice"));
+        assert!(bad(r#""gb-lon""#).contains("invalid type"));
+        let many: Vec<String> = (0..17).map(|i| format!("\"r{i}\"")).collect();
+        assert!(bad(&format!("[{}]", many.join(","))).contains("at most 16"));
     }
 
     #[test]

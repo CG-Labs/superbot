@@ -10,7 +10,7 @@ use crate::machines::ControlPlane;
 use crate::obs::trace;
 use crate::machines::route::{self, Assigned, Refusal, Target};
 use crate::machines::wire::{self, JobEvent};
-use crate::tiers::{self, Route, Tier, Tiers, Wiring};
+use crate::tiers::{self, Held, Route, Tier, Tiers, Wiring};
 use crate::{isolation, paths, storage, usage};
 use crate::approvals::RunGrant;
 use crate::policy::{Ctx, Mode, RunScope};
@@ -194,7 +194,7 @@ struct BotState {
 /// scheduler acted for, and whom the run is for.
 fn named_in(msg: &Message) -> Vec<String> {
     let Some(by) = &msg.requested_by else { return Vec::new() };
-    [&by.actor.id, &by.actor.on_behalf_of, &by.actor.asker].into_iter().flatten().cloned().collect()
+    [&by.actor.id, &by.actor.on_behalf_of, &by.actor.asker].into_iter().flatten().chain(&by.actor.carries).cloned().collect()
 }
 
 pub struct App {
@@ -241,6 +241,10 @@ pub struct App {
     /// Whom each Bot's latest run was asked by, whatever SHARED_BOTS is: what leaving a
     /// team (ADR 0087) stops.
     requesters: Mutex<HashMap<String, String>>,
+    /// Whose data each Bot's latest run carries, by Bot: its owner, its asker, and whom
+    /// the Bot that asked carried, through any number of Bots in any SHARED_BOTS mode.
+    /// Their residency pins hold the run (ADR 0139); access isn't decided by it.
+    carried: Mutex<HashMap<String, Vec<String>>>,
     /// ROUTINES_ON_ENABLE=resume (ADR 0047): re-enabling a user resumes the routines
     /// paused when they were disabled. Unset: they stay paused until an admin resumes them.
     pub resume_routines_on_enable: OnceLock<bool>,
@@ -274,6 +278,8 @@ pub struct App {
     pub evidence: OnceLock<Arc<crate::evidence::Settings>>,
     /// Whether the database is encrypted at rest, as found at startup (ADR 0116).
     pub database: OnceLock<crate::database_encryption::State>,
+    /// The audit log's SIEM export, when AUDIT_EXPORT is set (ADR 0122).
+    pub audit_export: OnceLock<Arc<crate::audit_export::Exporter>>,
     closing: AtomicBool,
 }
 
@@ -305,6 +311,7 @@ impl App {
             shared_bots: OnceLock::new(),
             askers: Mutex::default(),
             requesters: Mutex::default(),
+            carried: Mutex::default(),
             resume_routines_on_enable: OnceLock::new(),
             meter: OnceLock::new(),
             notifier: OnceLock::new(),
@@ -320,6 +327,7 @@ impl App {
             server_backups: OnceLock::new(),
             evidence: OnceLock::new(),
             database: OnceLock::new(),
+            audit_export: OnceLock::new(),
             closing: AtomicBool::new(false),
         })
     }
@@ -403,6 +411,23 @@ impl App {
             ActorKind::System => None,
         };
         a.asker.clone().or(person).unwrap_or_else(|| bot.owner_id.clone())
+    }
+
+    /// Whose data a Bot's latest run carries (ADR 0139), for what it queues to carry too.
+    pub fn carried_by(&self, bot: &Bot) -> Vec<String> {
+        self.carried.lock().unwrap_or_else(|e| e.into_inner()).get(&bot.id).cloned().unwrap_or_else(|| vec![bot.owner_id.clone()])
+    }
+
+    /// Whose data a run of `bot` for `asker`, asked `by`, carries (ADR 0139): the owner,
+    /// the asker, and whom an asking Bot's run carried when it queued the message.
+    fn carries(bot: &Bot, asker: &str, by: &Who) -> Vec<String> {
+        let mut people = vec![bot.owner_id.clone(), asker.to_string()];
+        if by.actor.kind == ActorKind::Bot {
+            people.extend(by.actor.carries.iter().cloned());
+        }
+        let mut seen = std::collections::HashSet::new();
+        people.retain(|p| seen.insert(p.clone()));
+        people
     }
 
     /// Where a Bot's runs go now, as anyone who can see it may know (ADR 0046): `server`,
@@ -951,7 +976,9 @@ impl App {
             Err(RunSpaceError::Folder) => return cant_run("This Bot's owner id isn't a safe folder name, so it can't run."),
             Err(RunSpaceError::Secrets(e)) => return self.refuse_for_secrets(&bot, msg, &by, &e, None),
         };
-        self.requesters.lock().unwrap_or_else(|e| e.into_inner()).insert(bot.id.clone(), asker);
+        self.requesters.lock().unwrap_or_else(|e| e.into_inner()).insert(bot.id.clone(), asker.clone());
+        let people = Self::carries(&bot, &asker, &by);
+        self.carried.lock().unwrap_or_else(|e| e.into_inner()).insert(bot.id.clone(), people.clone());
         if isolated {
             let asker = for_other.clone().unwrap_or_else(|| bot.owner_id.clone());
             self.askers.lock().unwrap_or_else(|e| e.into_inner()).insert(bot.id.clone(), asker);
@@ -963,7 +990,7 @@ impl App {
         }
         let period = self.billing_period(&bot.owner_id, crate::db::now());
         let storage = crate::storage::check(self, &bot.owner_id).await;
-        let Some((tier, route, wiring)) = self.tier_route(&bot, msg, &by, &period, &space.1, storage.as_ref()) else { return };
+        let Some((tier, route, wiring, held)) = self.tier_route(&bot, msg, &by, &asker, &people, &period, &space.1, storage.as_ref()) else { return };
         trace::note("superbot.tier", &tier);
         let placed_at = self.db.placed_at(&bot.owner_id);
         let Some(place) = self.place(&bot, msg, &by, &period.key, bin, for_other.as_deref()).await else { return };
@@ -981,6 +1008,19 @@ impl App {
             if let Some(text) = text {
                 self.say(&bot.id, &text, true);
             }
+            return;
+        }
+        // Someone it carries may have been pinned meanwhile: its route isn't held there.
+        let held_to = held.as_ref().map(|h| h.regions.clone()).unwrap_or_default();
+        let since = if waited { crate::machines::residency::pinned_beyond(self, &people, &held_to) } else { Vec::new() };
+        if !since.is_empty() {
+            self.give_back(&bot, msg, &period.key);
+            let regions: Vec<&str> = since.iter().map(|p| p.region.as_str()).collect();
+            let pins: Vec<Value> = since.iter().map(|p| json!({ "region": p.region, "pinnedOn": p.subject_type, "subjectId": p.subject_id, "reference": p.reference })).collect();
+            let details = json!({ "reason": crate::machines::residency::PINNED, "owner": bot.owner_id, "pinnedRegions": regions, "pins": pins, "heldTo": held_to, "whileQueued": true, "forUser": (asker != bot.owner_id).then_some(&asker), "messageId": msg.id });
+            self.db.record(&by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied).details(details));
+            let text = format!("This run's data was pinned to {} under a residency agreement while it waited, so I didn't run it on the route it had. Send it again (ADR 0139).", regions.join(" and "));
+            self.say(&bot.id, &text, true);
             return;
         }
         // Another of the owner's Bots may have filled their storage meanwhile (ADR 0082).
@@ -1240,6 +1280,13 @@ impl App {
             if !wiring.skipped.is_empty() {
                 invoked["fallbackSkipped"] = json!(wiring.skipped);
             }
+            if let Some(h) = &held {
+                invoked["residency"] = json!({
+                    "regions": h.regions,
+                    "fallbackOutsideRegion": h.outside,
+                    "insteadOf": h.instead_of.as_ref().map(|r| json!({ "model": r.model, "provider": r.provider })),
+                });
+            }
             if let Some(r) = &run_as {
                 invoked["runAs"] = json!(r.account);
             }
@@ -1258,6 +1305,7 @@ impl App {
                 provider: route.provider.clone(),
                 endpoints: wiring.endpoints.clone(),
                 fallback: wiring.fallback.clone(),
+                held_to: held.as_ref().map(|h| h.regions.clone()).unwrap_or_default(),
                 model: route.model.clone(),
                 effort: route.effort.clone(),
                 env,
@@ -2077,16 +2125,22 @@ impl App {
     /// owner, within the tier's runs and tokens a billing period (ADR 0050). A route
     /// whose provider is one of the tiers file's endpoints needs that endpoint's key
     /// (`tier_key`, ADR 0077). The owner's storage must be under their tier's cap
-    /// (`storage`, measured by `storage::check`, ADR 0082). None: refused, and the Bot said why.
+    /// (`storage`, measured by `storage::check`, ADR 0082). While the data of anyone
+    /// the run carries (`people`: owner, asker, and whom an asking Bot carried) is pinned
+    /// to a region, the route is held there (`Tiers::held`, ADR 0139). None: refused,
+    /// and the Bot said why.
+    #[allow(clippy::too_many_arguments)]
     fn tier_route(
         &self,
         bot: &Bot,
         msg: &Message,
         by: &Who,
+        asker: &str,
+        people: &[String],
         period: &usage::Period,
         env: &HashMap<String, String>,
         storage: Option<&(storage::Measured, u64, storage::State)>,
-    ) -> Option<(String, Route, Wiring)> {
+    ) -> Option<(String, Route, Wiring, Option<Held>)> {
         let tier = self.tier_of(&bot.owner_id);
         let refused = |reason: &str, text: String, limit: Option<u64>, used: Option<u64>, more: Value| {
             self.give_back_routine(bot, msg);
@@ -2115,8 +2169,31 @@ impl App {
             Ok(r) => r,
             Err(e) => return refused("tier_harness", format!("{e} Switch me to one of those in my settings."), None, None, Value::Null),
         };
+        let pins = crate::machines::residency::of_run(self, people);
+        let held = if pins.is_empty() {
+            None
+        } else {
+            let regions: Vec<String> = pins.iter().map(|p| p.region.clone()).collect();
+            match self.tiers().held(tier, &route, &regions) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    let text = format!(
+                        "This run's data is pinned to {} under a residency agreement, and the {} plan has no model provider marked as there for {}, so I didn't run. Ask an admin to route the plan through a provider in {} (ADR 0139).",
+                        regions.join(" and "),
+                        tier.label,
+                        bot.harness,
+                        regions.join(" and ")
+                    );
+                    let pins: Vec<Value> = pins.iter().map(|p| json!({ "region": p.region, "pinnedOn": p.subject_type, "subjectId": p.subject_id, "reference": p.reference })).collect();
+                    let more = json!({ "harness": bot.harness, "pinnedRegions": regions, "pins": pins, "forUser": (asker != bot.owner_id).then_some(asker), "error": e });
+                    return refused(crate::machines::residency::PINNED, text, None, None, more);
+                }
+            }
+        };
+        let route = held.as_ref().map_or(route, |h| h.route.clone());
         let has_key = |k: &str| tier_key(env, k).is_some();
-        let wiring = match self.tiers().wiring(&route, tier.managed(), has_key) {
+        // A held route's fallbacks are exactly its own, so the harness's settings add none.
+        let wiring = match self.tiers().wiring(&route, tier.managed() || held.is_some(), has_key) {
             Ok(w) => w,
             Err(e) => {
                 let text = format!("The {} plan's model provider isn't set up on this server yet, so I didn't run. Ask an admin to save its key.", tier.label);
@@ -2157,7 +2234,7 @@ impl App {
             // Once a billing period and tier by its key, apart from the chat's once a day.
             crate::billing_mail::storage(self, &bot.owner_id, tier, m.used(), *limit, false);
         }
-        Some((tier.name.clone(), route, wiring))
+        Some((tier.name.clone(), route, wiring, held))
     }
 
     /// Records the tokens a run used, one row per model, charged to the Bot's owner
@@ -2329,6 +2406,11 @@ impl App {
             if let (Some(answered), Some(asking)) = (self.db.bot(&msg.bot_id), self.db.bot(asker)) {
                 let mut actor = Actor::for_bot(&answered);
                 actor.asker = Some(msg.requested_by.as_ref().map_or(asking.owner_id.clone(), |by| Self::asker_of(&asking, by)));
+                // What the answering run carried, from its question: the reply holds it too.
+                actor.carries = match &msg.requested_by {
+                    Some(by) => Self::carries(&answered, &Self::asker_of(&answered, by), by),
+                    None => vec![answered.owner_id.clone()],
+                };
                 let by = Who { actor, source: Default::default() };
                 self.db.set_requested_by(m.id, &by);
                 m.requested_by = Some(by);
