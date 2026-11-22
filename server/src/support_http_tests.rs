@@ -154,9 +154,10 @@ async fn settings_are_redacted_by_name_shape_and_known_value() {
         ("ANTHROPIC_API_KEY", api_key.clone()),
         ("SERVER_BACKUP_S3_SECRET_ACCESS_KEY", s3.clone()),
         ("SMTP_URL", format!("smtp://mailer:{known}@smtp.example.com:587")),
-        ("SOME_SETTING", generated.clone()),
+        ("MACHINE_LABEL_PREFIX", generated.clone()),
         ("ERROR_REPORT_DSN", format!("https://{}@o1.ingest.example.com/2", random_hex(16))),
-        ("INNOCENT", format!("prefix {known} suffix")),
+        ("PRIMARY_BOT_NAME", format!("prefix {known} suffix")),
+        ("SSH_AUTH_SOCK", "/tmp/ssh-agent.sock".into()),
         ("OWNER_EMAIL", "owner@customer.example.com".into()),
         ("SUPERBOT_MASTER_KEY_FILE", "/etc/superbot/master.key".into()),
         ("PORT", "3000".into()),
@@ -172,10 +173,13 @@ async fn settings_are_redacted_by_name_shape_and_known_value() {
     let f = files(&b.tar);
     let env = &parse(file(&f, "config.json"))["environment"];
     assert_eq!(env["SMTP_URL"], "smtp://[redacted]@smtp.example.com:587");
-    assert_eq!(env["INNOCENT"], "prefix [redacted] suffix");
+    assert_eq!(env["PRIMARY_BOT_NAME"], "prefix [redacted] suffix");
+    assert!(env.get("SSH_AUTH_SOCK").is_none(), "the host's own variables stay out");
+    assert_eq!(parse(file(&f, "config.json"))["otherVariables"], 1);
+    assert!(!text.contains("ssh-agent.sock"));
     assert_eq!(env["SUPERBOT_MASTER_KEY_FILE"], "/etc/superbot/master.key", "where the key is, not the key");
     assert_eq!(env["PORT"], "3000");
-    for k in ["ANTHROPIC_API_KEY", "SERVER_BACKUP_S3_SECRET_ACCESS_KEY", "SOME_SETTING", "ERROR_REPORT_DSN", "OWNER_EMAIL"] {
+    for k in ["ANTHROPIC_API_KEY", "SERVER_BACKUP_S3_SECRET_ACCESS_KEY", "MACHINE_LABEL_PREFIX", "ERROR_REPORT_DSN", "OWNER_EMAIL"] {
         assert_eq!(env[k], "[redacted]", "{k}");
     }
     assert_eq!(b.redacted_settings, 7, "{env}");

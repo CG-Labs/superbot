@@ -3,6 +3,7 @@
 *
 !Cargo.toml
 !Cargo.lock
+!.env.example
 !server/
 !web/
 !site/

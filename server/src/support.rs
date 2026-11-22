@@ -35,8 +35,12 @@ const PERSONAL: [&str; 2] = ["USER_NAME", "OWNER_EMAIL"];
 const SECRET_WORDS: [&str; 5] = ["DSN", "WEBHOOK", "SALT", "PASSPHRASE", "COOKIE"];
 /// Settings that say where a secret is kept, not what it is.
 const PATH_SUFFIXES: [&str; 3] = ["_FILE", "_PATH", "_DIR"];
-/// Process noise that says nothing about botd.
-const SKIP: [&str; 2] = ["LS_COLORS", "_"];
+/// The settings botd documents. The bundle carries these and settings that look like
+/// SuperBot's or a harness provider's, and only counts the rest of the host's environment.
+const DOCUMENTED: &str = include_str!("../../.env.example");
+const PREFIXES: [&str; 10] = ["SUPERBOT_", "MACHINE_", "INCUS_", "SERVER_BACKUP_", "SMTP_", "SSO_", "SIGNIN_", "TRACES_", "HERMES_", "LINODE_"];
+const SUFFIXES: [&str; 2] = ["_API_KEY", "_BASE_URL"];
+const EXTRA: [&str; 8] = ["TZ", "RUST_LOG", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "STATE_DIRECTORY", "WEB_DIR", "SITE_DIR"];
 
 const README: &str = "SuperBot support bundle
 =======================
@@ -45,8 +49,9 @@ Made by botd for a support ticket (docs/support/README.md, ADR 0131). Check it b
 you send it: every file is plain text.
 
   version.json        botd's version, OS, uptime, and the harnesses on this server
-  config.json         botd's environment, secrets redacted; the settings it started with;
-                      tiers and the approval policy
+  config.json         botd's settings from its environment, secrets redacted (other
+                      variables are only counted); the settings it started with; tiers
+                      and the approval policy
   health.json         the status page's checks and open incidents, the setup checklist,
                       license, approvals waiting, runs, machines, database and backups
   logs.jsonl          the newest lines botd logged since it started (at most 2,000)
@@ -157,12 +162,13 @@ fn scrub_value(v: Value) -> Value {
 }
 
 /// The environment as the bundle shows it, sorted, and the names whose values were changed.
-pub fn environment(vars: &[(String, String)]) -> (BTreeMap<String, String>, Vec<String>) {
+pub fn environment(vars: &[(String, String)]) -> (BTreeMap<String, String>, Vec<String>, usize) {
     let mut shown = BTreeMap::new();
     let mut redacted = Vec::new();
+    let mut other = 0;
     for (k, v) in vars {
-        let named = k.bytes().next().is_some_and(|c| c.is_ascii_alphabetic() || c == b'_') && k.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
-        if !named || SKIP.contains(&k.as_str()) {
+        if !ours(k) {
+            other += 1;
             continue;
         }
         let (value, changed) = setting(k, v);
@@ -172,7 +178,20 @@ pub fn environment(vars: &[(String, String)]) -> (BTreeMap<String, String>, Vec<
         shown.insert(k.clone(), value);
     }
     redacted.sort();
-    (shown, redacted)
+    (shown, redacted, other)
+}
+
+/// Whether a variable is one of botd's settings, so the bundle shows it.
+pub fn ours(name: &str) -> bool {
+    static NAMES: std::sync::LazyLock<std::collections::HashSet<&'static str>> = std::sync::LazyLock::new(|| DOCUMENTED.lines().filter_map(documented).collect());
+    NAMES.contains(name) || EXTRA.contains(&name) || PREFIXES.iter().any(|p| name.starts_with(p)) || SUFFIXES.iter().any(|x| name.ends_with(x))
+}
+
+/// The setting a `.env.example` line documents, set or commented out: `PORT=3000`, `# TZ=UTC`.
+fn documented(line: &str) -> Option<&str> {
+    let (name, _) = line.trim_start_matches(['#', ' ']).split_once('=')?;
+    let plain = name.bytes().next().is_some_and(|c| c.is_ascii_uppercase()) && name.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_');
+    plain.then_some(name)
 }
 
 // The files
@@ -203,13 +222,14 @@ fn version(app: &App, started: Option<&AuditEvent>, now_ms: i64) -> Value {
 }
 
 fn config(app: &App, vars: &[(String, String)], started: Option<&AuditEvent>) -> (Value, usize) {
-    let (env, redacted) = environment(vars);
+    let (env, redacted, other) = environment(vars);
     let t = app.tiers();
     let policy = app.db.global_policy();
     let n = redacted.len();
     let v = json!({
         "environment": env,
         "redacted": redacted,
+        "otherVariables": other,
         "startedWith": started.map(|e| e.details.clone()),
         "tiers": {
             "source": t.source,
@@ -500,14 +520,30 @@ pub(crate) mod tests {
 
     #[test]
     fn the_environment_is_sorted_and_names_what_it_changed() {
-        let vars: Vec<(String, String)> = [("PORT", "3000"), ("OPENAI_API_KEY", "sk-proj-abc"), ("LS_COLORS", "x"), ("bad name", "y"), ("ALLOWED_HOSTS", "a.example.com")]
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        let (env, redacted) = environment(&vars);
-        assert_eq!(env.keys().collect::<Vec<_>>(), ["ALLOWED_HOSTS", "OPENAI_API_KEY", "PORT"]);
+        let vars: Vec<(String, String)> =
+            [("PORT", "3000"), ("OPENAI_API_KEY", "sk-proj-abc"), ("LS_COLORS", "x"), ("bad name", "y"), ("ALLOWED_HOSTS", "a.example.com"), ("TMUX", "/tmp/t"), ("SSO_OKTA_ISSUER", "https://example.okta.com")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        let (env, redacted, other) = environment(&vars);
+        assert_eq!(env.keys().collect::<Vec<_>>(), ["ALLOWED_HOSTS", "OPENAI_API_KEY", "PORT", "SSO_OKTA_ISSUER"]);
         assert_eq!(env["OPENAI_API_KEY"], MARK);
         assert_eq!(redacted, ["OPENAI_API_KEY"]);
+        assert_eq!(other, 3, "the host's own variables are only counted");
+    }
+
+    #[test]
+    fn botds_settings_come_from_the_documented_example() {
+        let names: Vec<&str> = DOCUMENTED.lines().filter_map(documented).collect();
+        assert!(names.len() > 150, "{}", names.len());
+        for name in ["PORT", "AUTH_PASSWORD", "TZ", "ISOLATION", "SUPERBOT_MASTER_KEY_FILE", "ERROR_REPORT_DSN"] {
+            assert!(names.contains(&name) && ours(name), "{name}");
+        }
+        assert_eq!(documented("# A comment, not a setting: x=y"), None);
+        for name in ["HOME", "USER", "TMUX", "SSH_AUTH_SOCK", "HOSTNAME", "INVOCATION_ID"] {
+            assert!(!ours(name), "{name}");
+        }
+        assert!(ours("ANTHROPIC_API_KEY") && ours("OPENAI_BASE_URL") && ours("SUPERBOT_ANYTHING"));
     }
 
     #[test]
