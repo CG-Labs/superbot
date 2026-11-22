@@ -473,6 +473,8 @@ pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>
     change("teamRole", role_summary(was.team_role()), role_summary(now.team_role()));
     if roles_changed {
         change("permissions", json!(was.holds().names()), json!(now.holds().names()));
+        // Open streams keep the Bot access they worked out; a new team or role changes it.
+        app.send(json!({ "type": "resync" }));
     }
     if !changes.is_empty() {
         app.db.record(&by.event("service_account.updated").target("service_account", &id).details(json!({ "name": after.user.name, "changes": changes })));
