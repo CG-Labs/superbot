@@ -146,19 +146,31 @@ struct Failed(Option<&'static str>);
 
 /// A request with a valid token that the server refused or failed: the IdP's provisioning
 /// is stuck until someone fixes it. Not a 404, which IdPs get in their normal course (a
-/// lookup, or a delete already done). The reason is the `scimType`, or the status.
+/// lookup, or a delete already done). The reason is the `scimType` in snake case
+/// (`invalid_syntax`), or the status: a code the support bundle and health score keep.
 fn request_failed(app: &AppState, who: &Who, tenant: &str, method: &str, path: &str, r: &Response) {
     let status = r.status();
     if !(status.is_client_error() || status.is_server_error()) || status == StatusCode::NOT_FOUND {
         return;
     }
     let reason = match r.extensions().get::<Failed>().and_then(|f| f.0) {
-        Some(t) => t.to_string(),
+        Some(t) => snake_case(t),
         None => format!("status_{}", status.as_u16()),
     };
     let resource = path.trim_start_matches('/').split('/').find(|s| !s.is_empty() && *s != "scim" && *s != "v2").unwrap_or("");
     let details = json!({ "tenant": tenant, "status": status.as_u16(), "reason": reason, "method": method, "resource": resource });
     app.db.record(&who.event("scim.request_failed").outcome(Outcome::Failure).details(details));
+}
+
+fn snake_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for c in s.chars() {
+        if c.is_ascii_uppercase() {
+            out.push('_');
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
 }
 
 type ScimRes<T = Response> = Result<T, ScimError>;

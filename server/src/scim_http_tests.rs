@@ -674,7 +674,7 @@ async fn refused_requests_are_audited_once_with_their_reason_and_lookups_arent()
     let failed = events(port, &admin, "action=scim.request_failed").await;
     let seen: Vec<_> = failed.iter().map(|e| (e["details"]["reason"].as_str(), e["details"]["status"].as_u64(), e["details"]["method"].as_str(), e["details"]["resource"].as_str())).collect();
     assert_eq!(seen.len(), 2, "{failed:#?}");
-    for want in [(Some("uniqueness"), Some(409), Some("POST"), Some("Users")), (Some("invalidSyntax"), Some(400), Some("POST"), Some("Users"))] {
+    for want in [(Some("uniqueness"), Some(409), Some("POST"), Some("Users")), (Some("invalid_syntax"), Some(400), Some("POST"), Some("Users"))] {
         assert!(seen.contains(&want), "{want:?} in {seen:?}");
     }
     assert!(failed.iter().all(|e| e["actorId"] == format!("scim:{id}") && e["outcome"] == "failure"), "{failed:#?}");
@@ -682,4 +682,6 @@ async fn refused_requests_are_audited_once_with_their_reason_and_lookups_arent()
     let identity = report["signals"].as_array().unwrap().iter().find(|s| s["id"] == "identity").unwrap();
     assert_eq!((identity["facts"]["scimFailed"].as_u64(), identity["facts"]["scimTokenUsed"].as_bool()), (Some(2), Some(true)), "{identity:#}");
     assert_eq!(identity["status"], "watch", "{identity:#}");
+    let reasons: Vec<_> = identity["facts"]["scimReasons"].as_array().unwrap().iter().map(|r| r["code"].as_str().unwrap()).collect();
+    assert_eq!(reasons, ["invalid_syntax", "uniqueness"], "codes the score keeps, not [text]");
 }
