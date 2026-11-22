@@ -50,6 +50,7 @@ Gauges read at each scrape:
 | `superbot_incus_host_*`, `superbot_incus_machines_waiting_for_room` (with Incus hosts; [ADR 0106](0106-host-capacity-metrics.md)) | `host` (the last: none) |
 | `superbot_host_*`: botd's own host and Incus hosts' CPUs, load, memory and disk ([ADR 0106](0106-host-capacity-metrics.md)) | `host`, `kind`, and `disk` for disks |
 | `superbot_machine_rpo_breaches_open`, `superbot_machines_rpo_tracked`, `superbot_machines_past_rpo`, `superbot_machine_backup_age_max_seconds`, `superbot_machine_rpo_seconds` (with off-host backups on) | `tier` (the first: none) |
+| `superbot_machines_provider_backups`, `superbot_machines_past_provider_backup_rpo`, `superbot_machine_provider_backup_age_max_seconds`, `superbot_machine_provider_backup_rpo_seconds` (Linode Backups; [ADR 0110](0110-linode-machine-recovery-objectives.md)), and `superbot_machine_rpo_breaches_open` for them too | `provider`, `tier`, and `backups` (`on`, `off`) for the first |
 | `superbot_build_info` | `version` |
 
 Request duration is to the first byte of the answer, so a long SSE stream (`/api/events`) counts its setup, not its life.

@@ -963,6 +963,9 @@ pub struct Machine {
     /// kept.
     #[serde(skip)]
     pub suspended_at: Option<i64>,
+    /// When the provider's own backups of it last succeeded, as the provider last said
+    /// (Linode Backups, ADR 0110).
+    pub provider_backup_at: Option<i64>,
 }
 
 /// A certificate the control plane issued a machine (ADR 0031). Looked up by
@@ -1142,6 +1145,7 @@ fn machine_row(r: &Row) -> rusqlite::Result<Machine> {
         disk_files_partial: r.get("disk_files_partial")?,
         disk_files_at: r.get("disk_files_at")?,
         suspended_at: r.get("suspended_at")?,
+        provider_backup_at: r.get("provider_backup_at")?,
     })
 }
 
@@ -1646,7 +1650,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 43] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 44] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1690,6 +1694,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 43] = [
     migrate_chat_retention,
     migrate_machine_home_use,
     migrate_user_erasure,
+    migrate_machine_provider_backups,
 ];
 
 /// The settings key an erasure sets, to its pseudonym, for its own transaction only:
@@ -1924,6 +1929,16 @@ fn migrate_machine_home_use(c: &Connection, _fresh: bool) -> rusqlite::Result<()
          ALTER TABLE machines ADD COLUMN disk_files_partial INTEGER NOT NULL DEFAULT 0;
          ALTER TABLE machines ADD COLUMN disk_files_at INTEGER;",
     )
+}
+
+/// When the provider's own backups of a machine last succeeded (ADR 0110), so Linode
+/// machines are held to an RPO by them.
+fn migrate_machine_provider_backups(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'provider_backup_at'", [], |r| r.get(0))?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch("ALTER TABLE machines ADD COLUMN provider_backup_at INTEGER;")
 }
 
 /// When a machine was suspended (ADR 0085): what its agent said of its disk before then
@@ -6181,8 +6196,9 @@ impl Db {
             .execute(
                 "UPDATE machines SET provider_id = ?, tier = ?, plan = ?, region = ?, state = ?, provider_status = ?, ipv4 = ?, backups = ?,
                  last_error = ?, create_sent_at = ?, placed_on = ?, updated_at = ?, destroyed_at = ?, firewall_id = ?,
-                 suspended_at = CASE WHEN ?5 != 'suspended' THEN NULL WHEN state = 'suspended' THEN suspended_at ELSE ?12 END
-                 WHERE id = ? AND state = ?",
+                 suspended_at = CASE WHEN ?5 != 'suspended' THEN NULL WHEN state = 'suspended' THEN suspended_at ELSE ?12 END,
+                 provider_backup_at = ?15
+                 WHERE id = ?16 AND state = ?17",
                 params![
                     m.provider_id,
                     m.tier,
@@ -6198,6 +6214,7 @@ impl Db {
                     now(),
                     m.destroyed_at,
                     m.firewall_id,
+                    m.provider_backup_at,
                     m.id,
                     from.as_str()
                 ],

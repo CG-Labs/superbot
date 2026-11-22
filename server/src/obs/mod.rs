@@ -248,8 +248,13 @@ fn render_machines(app: &AppState, cp: &ControlPlane, out: &mut String) {
     for (r, n) in &reports {
         metrics::sample(out, "superbot_machine_storage_reports", &[("report", r)], *n as f64);
     }
-    let Some(off) = cp.offsite.as_deref() else { return };
     let tier = |t: &str| if cp.tiers.iter().any(|(n, _)| n == t) { t.to_string() } else { "other".to_string() };
+    if cp.offsite.is_some() || cp.provider_backups.is_some() {
+        metrics::family(out, "superbot_machine_rpo_breaches_open", "gauge", "Machines past their RPO now, as botd last recorded (ADR 0074, ADR 0110).");
+        metrics::sample(out, "superbot_machine_rpo_breaches_open", &[], app.db.machine_rpo_breaches_open().len() as f64);
+    }
+    render_provider_backups(app, cp, &all, &tier, out);
+    let Some(off) = cp.offsite.as_deref() else { return };
     // Per tier: machines held to their RPO, those past it, and the oldest coverage age.
     let mut tiers: BTreeMap<String, (u64, u64, i64)> = BTreeMap::new();
     for m in all.iter().filter(|m| m.state != State::Destroyed) {
@@ -262,8 +267,6 @@ fn render_machines(app: &AppState, cp: &ControlPlane, out: &mut String) {
         e.1 += st.breach as u64;
         e.2 = e.2.max(now - st.covered_since);
     }
-    metrics::family(out, "superbot_machine_rpo_breaches_open", "gauge", "Machines past their RPO now, as botd last recorded (ADR 0074).");
-    metrics::sample(out, "superbot_machine_rpo_breaches_open", &[], app.db.machine_rpo_breaches_open().len() as f64);
     metrics::family(out, "superbot_machines_rpo_tracked", "gauge", "Machines held to their tier's RPO now, by tier.");
     for (t, (n, _, _)) in &tiers {
         metrics::sample(out, "superbot_machines_rpo_tracked", &[("tier", t)], *n as f64);
@@ -280,6 +283,46 @@ fn render_machines(app: &AppState, cp: &ControlPlane, out: &mut String) {
     for t in tiers.keys() {
         let rpo = if t == "other" { off.s.rpo_ms("") } else { off.s.rpo_ms(t) };
         metrics::sample(out, "superbot_machine_rpo_seconds", &[("tier", t)], rpo as f64 / 1000.0);
+    }
+}
+
+/// Running machines' provider backups (Linode Backups, ADR 0110), by tier: on or off at
+/// the provider and, while botd holds them to an RPO, those past it, the oldest age of
+/// the newest backup (since creation when there's none yet) and the RPO. Read from what
+/// the reconciler last saw, so a scrape never calls the provider.
+fn render_provider_backups(app: &AppState, cp: &ControlPlane, all: &[crate::db::Machine], tier: &dyn Fn(&str) -> String, out: &mut String) {
+    let Some(provider) = cp.reporting_backups() else { return };
+    let now = crate::db::now();
+    let mut tiers: BTreeMap<String, (u64, u64, u64, i64)> = BTreeMap::new();
+    for m in all.iter().filter(|m| m.state == State::Running && m.provider == provider) {
+        let e = tiers.entry(tier(&m.tier)).or_default();
+        e.0 += m.backups as u64;
+        e.1 += !m.backups as u64;
+        if let Some(pb) = cp.provider_backups {
+            let st = machines::recovery::provider_status(app, cp, pb, m);
+            if st.untracked.is_none() {
+                e.2 += st.breach as u64;
+                e.3 = e.3.max(now - st.covered_since);
+            }
+        }
+    }
+    metrics::family(out, "superbot_machines_provider_backups", "gauge", "Running machines by whether their provider's own backups are on, by provider and tier (ADR 0110).");
+    for (t, (on, off, _, _)) in &tiers {
+        metrics::sample(out, "superbot_machines_provider_backups", &[("provider", provider), ("tier", t), ("backups", "on")], *on as f64);
+        metrics::sample(out, "superbot_machines_provider_backups", &[("provider", provider), ("tier", t), ("backups", "off")], *off as f64);
+    }
+    let Some(pb) = cp.provider_backups else { return };
+    metrics::family(out, "superbot_machines_past_provider_backup_rpo", "gauge", "Running machines whose newest provider backup is older than the RPO now, by provider and tier.");
+    for (t, (_, _, past, _)) in &tiers {
+        metrics::sample(out, "superbot_machines_past_provider_backup_rpo", &[("provider", provider), ("tier", t)], *past as f64);
+    }
+    metrics::family(out, "superbot_machine_provider_backup_age_max_seconds", "gauge", "Age of the oldest newest provider backup among running machines (since creation if none yet), by provider and tier.");
+    for (t, (_, _, _, age)) in &tiers {
+        metrics::sample(out, "superbot_machine_provider_backup_age_max_seconds", &[("provider", provider), ("tier", t)], *age as f64 / 1000.0);
+    }
+    metrics::family(out, "superbot_machine_provider_backup_rpo_seconds", "gauge", "The RPO machines are held to by their provider's backups (MACHINE_BACKUPS_RPO_HOURS).");
+    for t in tiers.keys() {
+        metrics::sample(out, "superbot_machine_provider_backup_rpo_seconds", &[("provider", provider), ("tier", t)], pb.rpo_ms as f64 / 1000.0);
     }
 }
 

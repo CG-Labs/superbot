@@ -1,0 +1,73 @@
+# promtool test rules superbot-backups.rules.test.yml
+rule_files:
+  - superbot-backups.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Starter's oldest newest backup goes past the 26-hour RPO: a ticket after 15 minutes,
+  # gone once a backup lands. Pro, well within it, stays quiet throughout.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_machine_provider_backup_age_max_seconds{job="superbot",instance="botd:9464",provider="linode",tier="starter"}'
+        values: '80000x10 100000x30 3600x10'
+      - series: 'superbot_machine_provider_backup_rpo_seconds{job="superbot",instance="botd:9464",provider="linode",tier="starter"}'
+        values: '93600x50'
+      - series: 'superbot_machine_provider_backup_age_max_seconds{job="superbot",instance="botd:9464",provider="linode",tier="pro"}'
+        values: '50000x50'
+      - series: 'superbot_machine_provider_backup_rpo_seconds{job="superbot",instance="botd:9464",provider="linode",tier="pro"}'
+        values: '93600x50'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: SuperBotMachineBackupsStale
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: SuperBotMachineBackupsStale
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: SuperBotMachineBackupsStale
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: botd:9464
+              provider: linode
+              tier: starter
+            exp_annotations:
+              summary: "A linode machine on starter has no backup within its RPO"
+              description: "The oldest newest linode backup among running starter machines is 1d 3h 46m 40s old, past the RPO (MACHINE_BACKUPS_RPO_HOURS). machine.rpo_breached in the audit log names the machines. Check their backups in the provider's console: a failed or paused backup, backups turned off, or a machine too busy to snapshot."
+      - eval_time: 45m
+        alertname: SuperBotMachineBackupsStale
+        exp_alerts: []
+
+  # Two machines with backups off for over an hour: a ticket; turned on, it clears. A
+  # tier whose machines all have them on stays quiet.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_machines_provider_backups{job="superbot",instance="botd:9464",provider="linode",tier="starter",backups="off"}'
+        values: '0x10 2x70 0x10'
+      - series: 'superbot_machines_provider_backups{job="superbot",instance="botd:9464",provider="linode",tier="starter",backups="on"}'
+        values: '3x10 1x70 3x10'
+      - series: 'superbot_machines_provider_backups{job="superbot",instance="botd:9464",provider="linode",tier="pro",backups="off"}'
+        values: '0x90'
+      - series: 'superbot_machines_provider_backups{job="superbot",instance="botd:9464",provider="linode",tier="pro",backups="on"}'
+        values: '4x90'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: SuperBotMachineBackupsOff
+        exp_alerts: []
+      - eval_time: 75m
+        alertname: SuperBotMachineBackupsOff
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: botd:9464
+              provider: linode
+              tier: starter
+            exp_annotations:
+              summary: "linode machines on starter have backups off"
+              description: "2 running starter machines have had linode backups off for an hour, so they can't be restored. With MACHINE_BACKUPS=on, machine.backups_failed in the audit log says why botd couldn't turn them on; with MACHINE_BACKUPS=off, turn it on or record why these machines go without."
+      - eval_time: 85m
+        alertname: SuperBotMachineBackupsOff
+        exp_alerts: []

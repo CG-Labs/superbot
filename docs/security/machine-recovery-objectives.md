@@ -1,14 +1,14 @@
 # Machine recovery objectives
 
-Text for an SLA, a DPA's availability and resilience clause, or a security questionnaire, describing how a SuperBot operator protects customers' managed machines. It states only what SuperBot enforces and measures ([ADR 0074](../adr/0074-machine-rpo-and-rto.md)). The numbers are SuperBot's defaults; an operator who changes them (see [machine recovery](../ops/machine-recovery.md)) must change them here too, and should not promise tighter numbers than the server is set to, nor an RTO their own drill hasn't shown for the plan's largest disk. The encryption statement holds only with `MACHINE_BACKUP_AGE_RECIPIENTS` set.
+Text for an SLA, a DPA's availability and resilience clause, or a security questionnaire, describing how a SuperBot operator protects customers' managed machines. It states only what SuperBot enforces and measures ([ADR 0074](../adr/0074-machine-rpo-and-rto.md); for Linode machines, [ADR 0110](../adr/0110-linode-machine-recovery-objectives.md)), except where it says a number is the Provider's own target. The numbers are SuperBot's defaults; an operator who changes them (see [machine recovery](../ops/machine-recovery.md)) must change them here too, and should not promise tighter numbers than the server is set to, nor an RTO their own drill hasn't shown for the plan's largest disk. The encryption statement holds only with `MACHINE_BACKUP_AGE_RECIPIENTS` set.
 
-"Provider" below is whoever runs the SuperBot server. "Machine" is a customer's managed computer running as an Incus container on the Provider's infrastructure.
+"Provider" below is whoever runs the SuperBot server. "Machine" is a customer's managed computer running as an Incus container on the Provider's infrastructure, or, under [Linode machines](#linode-machines), as a virtual machine at Linode (Akamai).
 
 ---
 
 ## Scope
 
-This covers machines that run as Incus containers with off-host backups turned on. It does not cover machines on other hosting providers, files the customer keeps elsewhere, or data in third-party services the customer's Bots use.
+This covers machines that run as Incus containers with off-host backups turned on, and, as set out under [Linode machines](#linode-machines), machines that run at Linode with Linode Backups turned on. It does not cover machines on other hosting providers, files the customer keeps elsewhere, or data in third-party services the customer's Bots use.
 
 ## Backups
 
@@ -44,6 +44,21 @@ This covers machines that run as Incus containers with off-host backups turned o
 5. **Changes since the last backup.** A restore brings back the machine as of a backup. Anything written after that backup is lost.
 6. **Credentials.** A restored machine connects to SuperBot afresh. Its previous connection is revoked, and the customer's Bots may need to sign in to outside services again.
 7. **Failures outside the Provider's control**, including the object storage provider being unavailable. A breach caused by one is still recorded.
+
+## Linode machines
+
+Machines at Linode are backed up by Linode's own backup service, not by SuperBot. The sections above apply to them except as follows.
+
+1. **Backups.** SuperBot turns on Linode Backups for each machine once it is set up, and again whenever it finds them off. Linode takes a backup of the whole machine once a day, in a two-hour window it chooses, and keeps three: the newest daily one, one from the current week and one from the week before. Linode stores them apart from the machine's disks, in the same data centre. They aren't encrypted with the Provider's keys.
+2. **Objectives.**
+
+| Plan | Backed up every | RPO | Restore time target |
+|---|---|---|---|
+| Every plan | 24 hours | 26 hours | 4 hours (the Provider's target; not measured by SuperBot) |
+
+3. **Measurement.** The server reads from Linode when each running machine's last backup succeeded, every minute by default, and checks that against the RPO at least once a minute, as for Incus machines: a machine without a successful backup within its RPO (or created within it) is recorded as a breach, with the time it began and ended, and the Provider's operators are alerted. Machines whose Linode Backups are off are counted and alerted on too.
+4. **Restores.** The Provider's operators restore a machine from Linode's console onto the same machine, which then connects to SuperBot afresh, its previous connection revoked. SuperBot doesn't time these restores, so the restore time target is the Provider's own, backed by its drills, not a measured objective.
+5. **Not covered.** Losing the Linode data centre that holds both a machine and its backups. A backup older than the oldest Linode keeps.
 
 The objectives are targets the system measures and alerts on. Any credits or remedies for missing them are set in the customer's agreement, not here.
 

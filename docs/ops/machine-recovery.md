@@ -2,7 +2,7 @@
 
 How botd holds users' Incus containers to a recovery point objective (RPO) and a recovery time objective (RTO) per tier, how it tells you when one is missed, and how to drill a restore. Design: [ADR 0074](../adr/0074-machine-rpo-and-rto.md). Backups and restores themselves: [ADR 0071](../adr/0071-off-host-machine-backups.md) and [setup](incus-containers.md#7-off-host-backups-optional). The text for customers is in [machine recovery objectives](../security/machine-recovery-objectives.md).
 
-This needs off-host backups on (`MACHINE_BACKUP_S3_BUCKET` set). Linode machines use Linode's own backups and aren't tracked.
+This needs off-host backups on (`MACHINE_BACKUP_S3_BUCKET` set). Linode machines use Linode's own backups instead, held to an RPO as described [below](#linode-machines).
 
 ## Settings
 
@@ -97,3 +97,54 @@ It declares the host lost (for good; a replacement gets a new name), revokes its
 The data lost is everything on each machine since its newest backup. A whole host's restores take about machines ÷ 2 × one restore's time.
 
 To empty a host that still works (to retire it), move its machines one at a time: `botctl machine restore <user> <backup-id> --host <other> --yes`. That deletes the old container once the new one is ready.
+
+## Linode machines
+
+Linode machines are backed up by Linode Backups, not by botd ([ADR 0110](../adr/0110-linode-machine-recovery-objectives.md)). With `MACHINE_BACKUPS=on` (the default), botd turns them on for every machine once it is running and enrolled, and again whenever it finds them off (`machine.backups_enabled`, or `machine.backups_failed` with Linode's reason). Linode takes one backup a day in a two-hour window it picks, and keeps three: the newest daily, one from this week and one from last week.
+
+Each reconcile reads, with the machine, when its last Linode backup succeeded. No extra Linode call is made, and the scrape never calls Linode. botd checks the saved times against the RPO every minute, apart from reconciling.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `MACHINE_BACKUPS_RPO_HOURS` | `26` | The most a running machine's newest Linode backup may lag: a day and Linode's window. 25 to 168, one number for every tier. |
+
+It needs `MACHINE_BACKUPS=on` and Linode; botd won't start with it set otherwise. botd logs it at start (`backups on (RPO 26 hours)`).
+
+### Alerts
+
+The same events and channels as off-host backups (above):
+
+| Event | Audit action | When |
+|---|---|---|
+| Past its RPO | `machine.rpo_breached` (failure; `backups: provider`) | A running machine's newest Linode backup, and its creation, are older than the RPO. Once per breach. The alert says when the last backup was and whether Linode Backups are off. |
+| Back within its RPO | `machine.rpo_recovered` | A newer backup is seen. The breach also ends, silently, when the machine is suspended or destroyed or the RPO is raised past its age. |
+
+With metrics on, `superbot_machines_provider_backups{backups="off"}`, `superbot_machines_past_provider_backup_rpo` and `superbot_machine_provider_backup_age_max_seconds` show the same by tier. [`deploy/prometheus/superbot-backups.rules.yml`](../../deploy/prometheus/superbot-backups.rules.yml) alerts on stale backups (15 minutes past the RPO) and on machines with backups off for an hour, which also catches `MACHINE_BACKUPS=off`.
+
+A machine whose backups were off (or that predates `MACHINE_BACKUPS=on`) breaches at once if it is older than the RPO, and recovers at its first backup, within a day.
+
+On a breach: open the Linode in Cloud Manager (its label is `<prefix>-<machine id>`; `botctl machine show <user>` has its Linode id) and look at its Backups tab. A failed or missing backup is Linode's to explain; `botctl machine reconcile` turns backups back on if they were off.
+
+### Restoring a Linode machine
+
+botd doesn't restore Linode machines or time their restores. The target below is yours to drill.
+
+1. Pick the backup in Cloud Manager: the Linode's **Backups** tab. Everything written since it was taken is lost.
+2. Power the machine off through botd, so its state stays right and its certificates are held: `botctl machine suspend <user>`.
+3. In Cloud Manager, restore the backup **to the same Linode**, overwriting its disks. The Linode keeps its id, IP address and firewall, so nothing in botd changes.
+4. Revoke its certificates: `botctl machine revoke <user> --yes`. The restored disk holds the certificate it had then, which may have been rotated since; either way it now enrolls anew, as a restored Incus machine does.
+5. `botctl machine resume <user>`.
+6. `botctl machine enroll <user>` prints a one-time token (valid an hour) and how to use it. On the machine (Lish console, or SSH with `MACHINE_AUTHORIZED_KEYS`), save it to `/etc/superbot/enroll-token` (mode 600) and, as root, run:
+
+   ```sh
+   set -a; . /etc/superbot/machine.env; set +a
+   SUPERBOT_ENROLL_TOKEN_FILE=/etc/superbot/enroll-token SUPERBOT_STATE_DIR=/var/lib/superbot-machine superbot-machine enroll
+   ```
+
+   The running agent takes up the new certificate within a minute.
+7. `botctl machine show <user>` shows `enrolled`. If it was assigned, its Bots run there again.
+
+Note the time from step 2 to step 7 for your records: that's the restore time against the RTO target in the [recovery objectives](../security/machine-recovery-objectives.md#linode-machines) (4 hours by default). Drill it on a spare machine of your largest plan before you promise it.
+
+Restoring to a new Linode instead leaves botd tracking the old one; don't, unless the old one is gone, and then destroy the machine in botd and request a new one.
+

@@ -924,7 +924,7 @@ async fn replace(app: &App, cp: &ControlPlane, e: &Enrollment, r: &MachineRestor
     };
     match booted {
         Ok(pm) => {
-            observe(&mut m, &pm);
+            observe(cp, &mut m, &pm);
             m.state = next(from, Step::Restored).unwrap_or(from);
             m.last_error = None;
             app.db.save_machine(&m, from);
