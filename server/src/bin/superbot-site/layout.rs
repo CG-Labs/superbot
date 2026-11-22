@@ -103,7 +103,7 @@ pub fn page(s: &Shell, main: &str) -> String {
 /// The docs sidebar: search (shown once its script runs) and every page by section, with
 /// the current page marked and its section open. "Decisions" starts closed elsewhere.
 pub fn sidebar(pages: &[Page], out: &str) -> String {
-    let mut html = format!(
+    let mut html = String::from(
         r#"    <aside class="sidebar" aria-label="Documentation">
       <form class="search" role="search" hidden>
         <label class="sr-only" for="search">Search the docs</label>
