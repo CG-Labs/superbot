@@ -93,7 +93,10 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
     let _checkout = match a.payments.checkout() {
         Some(co) => {
             let guard = co.lock(&u.id).lock_owned().await;
-            match crate::billing::close_last(&app, &co.stripe, crate::billing::Payer::User(&u.id)).await {
+            // The id that names the Stripe session comes from the user list, not the request path,
+            // so no request input reaches a Stripe URL.
+            let id = app.db.users().into_iter().map(|x| x.id).find(|id| *id == u.id).ok_or_else(|| not_found("User"))?;
+            match crate::billing::close_last(&app, &co.stripe, crate::billing::Payer::User(&id)).await {
                 crate::billing::Last::Closed => {}
                 crate::billing::Last::Paid => {
                     return refuse(CHECKOUT_PAID, json!({}), "Their last checkout was paid; a plan is on the way. Cancel it once it starts, then erase them.".into());
