@@ -377,7 +377,7 @@ fn short_path(file: &str) -> String {
 /// in it scrubbed.
 fn envelope(event: Value, environment: &str) -> String {
     let mut event = scrub_value(event);
-    let id = crate::random_hex(16);
+    let id = event_id();
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     if let Value::Object(m) = &mut event {
         m.insert("event_id".into(), json!(id));
@@ -403,6 +403,18 @@ fn envelope(event: Value, environment: &str) -> String {
         json!({ "type": "event" }),
         event
     )
+}
+
+/// 32 hex digits, unique within this process, without I/O: this runs in the panic hook,
+/// where a second panic (say, `/dev/urandom` unreadable for want of descriptors) would
+/// abort botd.
+fn event_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:016x}{:08x}{:08x}", std::process::id(), seq as u32)
 }
 
 fn scrub_value(v: Value) -> Value {
@@ -567,6 +579,7 @@ mod tests {
         assert!(e["tags"].get("b").is_none());
         assert_eq!(e["environment"], "staging");
         assert_eq!(e["event_id"].as_str().unwrap().len(), 32);
+        assert_ne!(event_id(), event_id());
         assert_eq!(
             e["release"],
             format!("superbot@{}", env!("CARGO_PKG_VERSION"))
