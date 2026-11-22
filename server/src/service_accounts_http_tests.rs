@@ -594,6 +594,11 @@ async fn scheduled_work_stops_with_the_owner() {
     assert_eq!(handover::blocked(&app.db, users::OPERATOR, Some(&hers)), Some((handover::AUTHOR_DISABLED, hers.clone())));
     assert_eq!(call(port, "PATCH", &format!("/api/users/{ana}"), &admin, r#"{"status":"active"}"#).await.0, 200);
     assert_eq!(handover::blocked(&app.db, users::OPERATOR, Some(&hers)), None);
+    // And once its owner may no longer write, as its tokens can't.
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{ana}"), &admin, r#"{"role":"readonly"}"#).await.0, 200);
+    assert_eq!(handover::blocked(&app.db, users::OPERATOR, Some(&hers)), Some((handover::AUTHOR_DISABLED, hers.clone())));
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{ana}"), &admin, r#"{"role":"member"}"#).await.0, 200);
+    assert_eq!(handover::blocked(&app.db, users::OPERATOR, Some(&hers)), None);
     assert_eq!(call(port, "DELETE", &format!("/api/service-accounts/{hers}"), &admin, "").await.0, 200);
     assert_eq!(handover::blocked(&app.db, users::OPERATOR, Some(&hers)), Some((handover::AUTHOR_DISABLED, hers)));
 }

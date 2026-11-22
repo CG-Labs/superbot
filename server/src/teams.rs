@@ -100,24 +100,24 @@ fn manages(role: &str) -> bool {
 /// team permissions (`rbac::TEAM_SCOPED`). Owners and admins already have them all.
 /// Nothing for someone read-only across the server: they change nothing anywhere, as
 /// read-only team admins don't.
-fn team_perms(app: &AppState, m: &TeamMember) -> Perms {
-    if app.db.user(&m.user_id).is_none_or(|u| u.role == crate::rbac::Role::Readonly) {
+fn team_perms(db: &crate::db::Db, m: &TeamMember) -> Perms {
+    if db.user(&m.user_id).is_none_or(|u| u.role == crate::rbac::Role::Readonly) {
         return Perms::NONE;
     }
-    m.role_id.as_deref().and_then(|id| app.db.custom_role(id)).map_or(Perms::NONE, |r| r.perms().in_team())
+    m.role_id.as_deref().and_then(|id| db.custom_role(id)).map_or(Perms::NONE, |r| r.perms().in_team())
 }
 
 /// Whether `m` may do `perm` in their team: as an owner or admin, or by a team role.
 fn may(app: &AppState, m: &TeamMember, perm: Perm) -> bool {
-    manages(&m.role) || team_perms(app, m).has(perm)
+    manages(&m.role) || team_perms(&app.db, m).has(perm)
 }
 
 /// The team permissions `user_id` holds in `team_id`: all of them as its owner or admin,
 /// else their team role's there, else none. What caps a team's service account (ADR 0143).
-pub(crate) fn perms_in(app: &AppState, user_id: &str, team_id: &str) -> Perms {
-    match app.db.team_member(user_id).filter(|m| m.team_id == team_id) {
+pub(crate) fn perms_in(db: &crate::db::Db, user_id: &str, team_id: &str) -> Perms {
+    match db.team_member(user_id).filter(|m| m.team_id == team_id) {
         Some(m) if manages(&m.role) => crate::rbac::TEAM_SCOPED.into_iter().fold(Perms::NONE, Perms::with),
-        Some(m) => team_perms(app, &m),
+        Some(m) => team_perms(db, &m),
         None => Perms::NONE,
     }
 }
@@ -693,7 +693,7 @@ pub async fn mine(State(app): State<AppState>, Extension(c): Extension<Caller>) 
         v["billing"]["canChange"] = json!(sight.billing && c.can(Perm::Write));
     }
     v["customRole"] = crate::roles::summary(&app, m.role_id.as_deref());
-    v["permissions"] = json!(team_perms(&app, &m).names());
+    v["permissions"] = json!(team_perms(&app.db, &m).names());
     Ok(Json(v))
 }
 

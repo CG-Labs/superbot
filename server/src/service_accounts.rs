@@ -61,7 +61,7 @@ fn caller(app: &AppState, t: ServiceToken, at: i64) -> Result<Caller, &'static s
         return Err("admin_refused");
     }
     let owner = live_owner(app, &sa.owner_id).ok_or("owner_inactive")?;
-    let scope = token_scope(&t).and(ceiling(app, &owner, sa.team_id.as_deref()));
+    let scope = token_scope(&t).and(ceiling(&app.db, &owner, sa.team_id.as_deref()));
     let mut c = Caller::person(&app.db, sa.user, None, METHOD);
     c.service = Some(ServiceCaller { token: t.id, owner: owner.id, scope });
     Ok(c)
@@ -131,16 +131,24 @@ fn owner_of(db: &crate::db::Db, id: &str) -> Option<User> {
 }
 
 /// Whether `u` may still act, for work that starts without a request (routines): active,
-/// and a service account also not deleted, with an owner who could lend it access.
+/// and a service account also not deleted, with an owner who could still lend it `write`.
 pub fn may_act(db: &crate::db::Db, u: &User) -> bool {
-    u.active() && (!u.service || db.service_account(&u.id).filter(|s| s.deleted_at.is_none()).is_some_and(|s| owner_of(db, &s.owner_id).is_some()))
+    if !u.active() {
+        return false;
+    }
+    if !u.service {
+        return true;
+    }
+    let Some(sa) = db.service_account(&u.id).filter(|s| s.deleted_at.is_none()) else { return false };
+    // As its token would be: within what its owner holds now, and allowed to send work.
+    owner_of(db, &sa.owner_id).is_some_and(|o| Roles::of(db, &sa).holds().and(ceiling(db, &o, sa.team_id.as_deref())).has(Perm::Write))
 }
 
 /// Everything `owner` holds: across the server, and in `team` when a service account acts
 /// there. A service account's requests never get more.
-pub fn ceiling(app: &AppState, owner: &User, team: Option<&str>) -> Scope {
-    let all = Scope::of(Principal::User(owner.role), app.db.user_perms(owner));
-    all.or(team.map_or(Scope::NONE, |t| Scope::team(crate::teams::perms_in(app, &owner.id, t))))
+pub fn ceiling(db: &crate::db::Db, owner: &User, team: Option<&str>) -> Scope {
+    let all = Scope::of(Principal::User(owner.role), db.user_perms(owner));
+    all.or(team.map_or(Scope::NONE, |t| Scope::team(crate::teams::perms_in(db, &owner.id, t))))
 }
 
 /// What a token's scopes allow: all the account holds when it has none. Always `account`,
@@ -161,9 +169,9 @@ struct Roles {
 }
 
 impl Roles {
-    fn of(app: &AppState, sa: &ServiceAccount) -> Roles {
-        let custom = sa.user.role_id.as_deref().or(sa.team_role_id.as_deref()).and_then(|id| app.db.custom_role(id));
-        Roles { role: sa.user.role, custom, team: sa.team_id.as_deref().and_then(|t| app.db.team(t)) }
+    fn of(db: &crate::db::Db, sa: &ServiceAccount) -> Roles {
+        let custom = sa.user.role_id.as_deref().or(sa.team_role_id.as_deref()).and_then(|id| db.custom_role(id));
+        Roles { role: sa.user.role, custom, team: sa.team_id.as_deref().and_then(|t| db.team(t)) }
     }
 
     fn org_role(&self) -> Option<&CustomRole> {
@@ -311,7 +319,7 @@ fn need_account(app: &AppState, c: &Caller, by: &Who, key: &str) -> Res<ServiceA
 
 /// Refuses roles that would give a service account more than `owner` holds.
 fn within(app: &AppState, by: &Who, owner: &User, roles: &Roles, target: Option<&str>) -> Res<()> {
-    let cap = ceiling(app, owner, roles.team.as_ref().map(|t| t.id.as_str()));
+    let cap = ceiling(&app.db, owner, roles.team.as_ref().map(|t| t.id.as_str()));
     let missing: Vec<&str> = roles.holds().names().into_iter().filter(|n| Perm::parse(n).is_some_and(|p| !cap.has(p))).collect();
     if missing.is_empty() {
         return Ok(());
@@ -346,12 +354,12 @@ fn token_view(t: &ServiceToken, at: i64) -> Value {
 }
 
 fn view(app: &AppState, sa: &ServiceAccount) -> Value {
-    let roles = Roles::of(app, sa);
+    let roles = Roles::of(&app.db, sa);
     let owner = app.db.user(&sa.owner_id);
     let live = owner.as_ref().filter(|o| live_owner(app, &o.id).is_some());
     let at = crate::db::now();
     let tokens = app.db.service_tokens(&sa.user.id);
-    let effective = live.map_or(Scope::NONE, |o| roles.holds().and(ceiling(app, o, roles.team.as_ref().map(|t| t.id.as_str()))));
+    let effective = live.map_or(Scope::NONE, |o| roles.holds().and(ceiling(&app.db, o, roles.team.as_ref().map(|t| t.id.as_str()))));
     json!({
         "id": sa.user.id, "name": sa.user.name, "description": sa.description, "role": sa.user.role, "status": sa.user.status,
         "customRole": role_summary(roles.org_role()), "team": roles.team.as_ref().map(|t| json!({ "id": t.id, "name": t.name })),
@@ -421,7 +429,7 @@ pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>
     only_fields(&v, &["name", "description", "role", "team", "status", "owner"])?;
     let before = need_account(&app, &c, &by, &key)?;
     let id = before.user.id.clone();
-    let was = Roles::of(&app, &before);
+    let was = Roles::of(&app.db, &before);
     let mut p = ServiceAccountPatch {
         name: (!v["name"].is_null()).then(|| parse_name(&v["name"], "name", 60)).transpose()?.filter(|n| *n != before.user.name),
         description: v.get("description").map(parse_description).transpose()?.filter(|d| *d != before.description),
@@ -552,7 +560,7 @@ pub async fn create_token(State(app): State<AppState>, Extension(c): Extension<C
     let sa = need_account(&app, &c, &by, &key)?;
     need_active(&sa)?;
     let name = if v["name"].is_null() { "API token".to_string() } else { parse_name(&v["name"], "name", 60)? };
-    let scopes = parse_scopes(&v["scopes"], Roles::of(&app, &sa).holds())?;
+    let scopes = parse_scopes(&v["scopes"], Roles::of(&app.db, &sa).holds())?;
     let expires_at = crate::db::now() + parse_days(&v["expiresInDays"])? * DAY;
     let (hash, hint, token) = mint();
     let t = app
