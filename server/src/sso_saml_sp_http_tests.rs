@@ -445,6 +445,12 @@ async fn an_idp_logout_request_revokes_the_sessions_it_names_once() {
     assert_eq!(sp.slo_get(&Logout::request(&sp.slo(), "someone-else", None, now).redirect()).await.0, 303);
     assert_eq!(sp.slo_get(&Logout::request(&sp.slo(), NAME_ID, Some("_s9"), now).redirect()).await.0, 303);
     assert_eq!(sp.who(&second).await, Some(u.id.clone()));
+    // A message issued before this session (beyond the clock skew), as one replayed after a
+    // restart would be, can't reach it.
+    let earlier = now - crate::sso::saml_sp::SKEW_MS - 60_000;
+    assert_eq!(sp.slo_get(&Logout { issued_ms: earlier, ..Logout::request(&sp.slo(), NAME_ID, None, now) }.redirect()).await.0, 303);
+    assert_eq!(sp.who(&second).await, Some(u.id.clone()));
+    assert_eq!(sp.audit("auth.slo").await[0]["details"]["revoked"], 0);
 
     // Over the POST binding with no SessionIndex: all of Ada's sessions from this IdP.
     let (code, to) = sp.slo_post(&Logout::request(&sp.slo(), NAME_ID, None, now).post()).await;
@@ -510,4 +516,17 @@ async fn logouts_load_metadata_from_a_url_without_waiting_for_a_sign_in() {
     let (code, to) = sp.slo_get(&Logout::request(&sp.slo(), NAME_ID, None, db::now()).redirect()).await;
     assert_eq!(code, 303, "{to}");
     assert!(to.starts_with(test_idp::SLO_URL), "{to}");
+}
+
+#[tokio::test]
+async fn refusals_before_a_signature_is_checked_are_logged_sparingly() {
+    let sp = serve(&[]).await;
+    let (code, view) = call(sp.port, "PUT", &format!("/api/sso/{}/saml/idp-metadata", sp.id), &sp.admin, &json!({ "xml": test_idp::metadata() }).to_string()).await;
+    assert_eq!(code, 200, "{view}");
+    for _ in 0..5 {
+        assert_eq!(sp.slo_get("").await.0, 400);
+    }
+    let failed = sp.audit("auth.slo_failed").await;
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["details"]["reason"], "no_slo");
 }

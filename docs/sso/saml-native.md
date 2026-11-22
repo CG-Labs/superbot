@@ -172,7 +172,7 @@ Every refused sign-in is in the audit log with a reason (`botctl audit --action 
 | `idp_error` | The IdP said no (`idpStatus` has its status code), for example someone not assigned to the app. |
 | `user_disabled` | The person is disabled in SuperBot. |
 
-Refused logout messages are audited as `auth.slo_failed` (`botctl audit --action auth.slo_failed`), and the browser sees a short error. Those before the signature check are throttled the same way.
+Refused logout messages are audited as `auth.slo_failed` (`botctl audit --action auth.slo_failed`), and the browser sees a short error. Those before the signature check (including `not_ready` and `no_slo`) are throttled the same way.
 
 | Reason | Fix |
 |--------|-----|

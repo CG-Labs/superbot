@@ -1076,7 +1076,7 @@ pub async fn logout_request(a: &Auth, app: &AppState, s: &db::Session) -> Option
 }
 
 /// Refused logout messages anyone can send: the ones before the IdP's signature was checked.
-const SLO_UNVOUCHED: [&str; 6] = ["bad_message", "wrapped", "unsigned", "bad_signature", "bad_algorithm", "weak_algorithm"];
+const SLO_UNVOUCHED: [&str; 9] = ["not_ready", "no_slo", "no_sp_key", "bad_message", "wrapped", "unsigned", "bad_signature", "bad_algorithm", "weak_algorithm"];
 
 fn slo_failed(a: &Auth, source: &Source, provider: &str, reason: &str, extra: Value) -> Response {
     let mut d = json!({ "provider": provider, "idp": idp_type(a, provider), "reason": reason });
@@ -1128,7 +1128,7 @@ async fn slo(a: &Auth, source: &Source, id: &str, incoming: &saml_slo::Incoming<
     };
     let actor = |subject: Option<String>| Actor { kind: ActorKind::User, subject, method: Some("sso".into()), idp: Some("saml".into()), idp_provider: Some(id.into()), ..Default::default() };
     match received {
-        saml_slo::Received::Request { id: request_id, name_id, session_indexes, relay, until_ms } => {
+        saml_slo::Received::Request { id: request_id, name_id, session_indexes, relay, issued_ms, until_ms } => {
             if let Err(reason) = a.sso.first_use(&format!("slo|{}|{request_id}", idp.entity_id), until_ms, at) {
                 return slo_failed(a, source, id, reason, json!({ "requestId": request_id }));
             }
@@ -1136,7 +1136,9 @@ async fn slo(a: &Auth, source: &Source, id: &str, incoming: &saml_slo::Incoming<
             let named = |l: Option<&db::SamlLogin>| session_indexes.is_empty() || l.and_then(|l| l.session_index.as_ref()).is_none_or(|i| session_indexes.contains(i));
             // Codes first, as when an admin revokes: a redemption holds them until its session exists.
             a.sso.handoffs.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, h| !(h.provider == id && h.claims.key() == subject && named(h.saml.as_ref())));
-            let revoked = app.db.revoke_saml_sessions(id, &subject, &session_indexes, "saml_logout");
+            // Only sessions from before the request was issued: replayed after a restart, which
+            // forgets used IDs, it finds nothing left to revoke.
+            let revoked = app.db.revoke_saml_sessions(id, &subject, &session_indexes, issued_ms + saml_sp::SKEW_MS, "saml_logout");
             let mut users: Vec<&str> = revoked.iter().map(|s| s.user_id.as_str()).collect();
             users.sort_unstable();
             users.dedup();

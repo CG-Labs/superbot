@@ -49,7 +49,8 @@ pub struct Expect<'a> {
 #[derive(Debug, PartialEq)]
 pub enum Received {
     /// The IdP signed this person out: revoke their sessions, then answer.
-    Request { id: String, name_id: String, session_indexes: Vec<String>, relay: Option<String>, until_ms: i64 },
+    /// `issued_ms` is its `IssueInstant`.
+    Request { id: String, name_id: String, session_indexes: Vec<String>, relay: Option<String>, issued_ms: i64, until_ms: i64 },
     /// The IdP's answer to our LogoutRequest. `status` is None for success, else its codes.
     Response { id: String, in_response_to: String, status: Option<String>, until_ms: i64 },
 }
@@ -139,7 +140,7 @@ pub fn receive(incoming: &Incoming, e: &Expect) -> Result<Received, Refused> {
     }
     let session_indexes = indexes.into_iter().map(|n| text_of(n).map(str::trim).filter(|i| !i.is_empty() && i.len() <= 1024).map(String::from)).collect::<Option<Vec<_>>>().ok_or_else(bad)?;
     let relay = relay.filter(|r| r.len() <= 80);
-    Ok(Received::Request { id, name_id: name_id.to_string(), session_indexes, relay, until_ms })
+    Ok(Received::Request { id, name_id: name_id.to_string(), session_indexes, relay, issued_ms: issued, until_ms })
 }
 
 fn name_id_xml(l: &SamlLogin) -> String {
@@ -314,7 +315,7 @@ mod tests {
     #[test]
     fn a_signed_logout_request_names_the_person_and_their_idp_sessions() {
         let l = request();
-        let want = Received::Request { id: l.id.clone(), name_id: "00u1ADA-Persistent".into(), session_indexes: vec!["_s1".into()], relay: Some("idp-relay".into()), until_ms: NOW - 1_000 + MAX_AGE_MS + 2 * SKEW_MS };
+        let want = Received::Request { id: l.id.clone(), name_id: "00u1ADA-Persistent".into(), session_indexes: vec!["_s1".into()], relay: Some("idp-relay".into()), issued_ms: NOW - 1_000, until_ms: NOW - 1_000 + MAX_AGE_MS + 2 * SKEW_MS };
         assert_eq!(redirect(&l).as_ref(), Ok(&want), "over HTTP-Redirect");
         assert_eq!(post(&l).as_ref(), Ok(&want), "over HTTP-POST, with the enveloped signature");
         let mut all = request();

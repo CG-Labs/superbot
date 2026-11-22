@@ -5853,17 +5853,18 @@ impl Db {
 
     /// Revokes the live sessions provider `provider` signed in as `idp_subject` (`issuer|subject`),
     /// for the IdP's LogoutRequest (ADR 0137). With `indexes`, only sessions of those IdP
-    /// sessions, and those whose IdP session isn't known (signed in before botd kept it).
-    pub fn revoke_saml_sessions(&self, provider: &str, idp_subject: &str, indexes: &[String], reason: &str) -> Vec<Session> {
+    /// sessions, and those whose IdP session isn't known (signed in before botd kept it). Only
+    /// sessions created by `before` (ms).
+    pub fn revoke_saml_sessions(&self, provider: &str, idp_subject: &str, indexes: &[String], before: i64, reason: &str) -> Vec<Session> {
         let found: Vec<(Session, Option<String>)> = {
             let c = self.c();
             let mut s = c
                 .prepare(
                     "SELECT s.*, m.session_index AS saml_session_index FROM sessions s LEFT JOIN saml_sessions m ON m.session_id = s.id
-                     WHERE s.idp_provider = ? AND s.idp_subject = ? AND s.revoked_at IS NULL ORDER BY s.created_at, s.id",
+                     WHERE s.idp_provider = ? AND s.idp_subject = ? AND s.revoked_at IS NULL AND s.created_at <= ? ORDER BY s.created_at, s.id",
                 )
                 .unwrap();
-            s.query_map(params![provider, idp_subject], |r| Ok((session_row(r)?, r.get("saml_session_index")?))).unwrap().filter_map(Result::ok).collect()
+            s.query_map(params![provider, idp_subject, before], |r| Ok((session_row(r)?, r.get("saml_session_index")?))).unwrap().filter_map(Result::ok).collect()
         };
         found
             .into_iter()
