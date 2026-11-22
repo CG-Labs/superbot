@@ -38,17 +38,23 @@ pub fn of_user(app: &App, user_id: &str) -> Option<ResidencyPin> {
     app.db.team_id_of(user_id).and_then(|t| app.db.residency_pin(PinOn::Team, &t)).or_else(|| app.db.residency_pin(PinOn::User, user_id))
 }
 
-/// The pins a Bot run is held to (ADR 0139): its owner's, and the asker's when someone
-/// else asks, once per region. Its model calls must stay in every one.
-pub fn of_run(app: &App, owner_id: &str, asker: &str) -> Vec<ResidencyPin> {
-    let mut out: Vec<ResidencyPin> = of_user(app, owner_id).into_iter().collect();
-    if asker != owner_id
-        && let Some(p) = of_user(app, asker)
-        && !out.iter().any(|o| o.region == p.region)
-    {
-        out.push(p);
+/// The pins a Bot run is held to (ADR 0139): those of everyone whose data it carries
+/// (its owner, its asker, and whom an asking Bot carried), once per region. Its model
+/// calls must stay in every one.
+pub fn of_run(app: &App, people: &[String]) -> Vec<ResidencyPin> {
+    let mut out: Vec<ResidencyPin> = Vec::new();
+    for p in people.iter().filter_map(|u| of_user(app, u)) {
+        if !out.iter().any(|o| o.region == p.region) {
+            out.push(p);
+        }
     }
     out
+}
+
+/// The pins on `people` now in regions a run's route wasn't held to (`held_to`): made
+/// while it waited for a slot, so it doesn't start (ADR 0139).
+pub fn pinned_beyond(app: &App, people: &[String], held_to: &[String]) -> Vec<ResidencyPin> {
+    of_run(app, people).into_iter().filter(|p| !held_to.contains(&p.region)).collect()
 }
 
 /// Why `region` can't keep pinned data on this server as it is set up now. Empty: it can.

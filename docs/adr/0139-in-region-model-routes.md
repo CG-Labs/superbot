@@ -38,6 +38,9 @@ A named endpoint in the tiers file (ADR 0077) may list `regions`: data region id
 
 A run is held when its data is pinned: the Bot owner's pin (their team's, else their own, as in ADR 0129), and the asker's pin when someone else asks. Every pinned region must be served.
 
+- **Bots asking Bots.** A run carries the data of its owner, its asker, and everyone the asking Bot's run carried, through any number of Bots and in either `SHARED_BOTS` mode. With open sharing, `/api/ask` names only the asking Bot's owner as the next asker. Without this, pinned Ada asking Bea's Bot, which asks Cy's, would send Ada's request through Cy's unheld route. The carried list is used only for pins. Access and whom a run acts for (ADR 0046) are unchanged.
+- **Queued runs.** A run picks its route before it waits for a slot. When its turn comes, the pins are read again. If anyone it carries was pinned meanwhile to a region its route wasn't held to, it doesn't start: it is refused (`residency_pinned`, `whileQueued: true`), not counted, and the Bot asks for it to be sent again. Sent again, it takes the held route.
+
 1. The route the tier picks (ADR 0033) is kept if its own provider is an endpoint whose `regions` include every pinned region.
 2. Otherwise the run takes the tier's first route for the same harness whose provider does. The tier still picks the model; a pinned tenant on a plan with both a US and a UK route gets the UK one.
 3. Fallbacks whose provider doesn't serve every region are left out. The chain is pinned to what's left, so the harness's own settings can't add a provider, even on a tier where they otherwise could.
@@ -85,7 +88,7 @@ Pinning still checks only machines and backups (ADR 0129). A tenant whose plan h
 - **What a Bot's tools send.** A shell command or script in a run can call any API with a key the user saved. Egress allow-lists ([ADR 0135](0135-run-limits-and-egress-allow-lists.md)) are the control for that; the DPA says the pin doesn't hold it.
 - **Side tasks Hermes adds later** under a name botd doesn't list. They take Hermes's default (`auto`, the main model as of November 2026). The built-in keys being empty keeps them from a router.
 - **Harness logins stored in a Bot's Hermes home.** Hermes keeps OAuth logins (such as the Nous Portal) in `HERMES_HOME`. botd doesn't make those for Bots, but doesn't remove one a user made.
-- **Runs already started** when a pin is made finish on their route.
+- **Runs already started** when a pin is made finish on their route. Runs still waiting for a slot are refused instead (above).
 - **Remaining on #58:** a region for botd's own database and server backups, or a dedicated deployment per region; showing the pin in the app; an option to refuse startup when a pin can't be kept; keeping a leaver's pin.
 
 ## Tests
@@ -103,5 +106,7 @@ Pinning still checks only machines and backups (ADR 0129). A tenant whose plan h
   - an asker's pin holds a run of someone else's Bot;
   - the warnings name the plan's harness without a route, and a provider's unknown region;
   - unpinned, runs are as before;
-  - a team pin holds its member's runs.
+  - a team pin holds its member's runs;
+  - with open sharing, a pinned person's run of one Bot asking a second, which asks a third, holds all three; the second's owner asking again later isn't held;
+  - a pin made while a run waits for a slot refuses it without counting it; sent again, it is held.
 - `machines_residency_tests.rs`: a pin on an open plan is warned about in `GET /api/regions`.

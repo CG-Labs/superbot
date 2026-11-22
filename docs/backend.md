@@ -290,11 +290,12 @@ Each user is on a **tier** (a plan). A tier lists the harness and model **routes
   - On a managed tier Hermes falls back only along the route's chain (at once on 402 or 429, after retries on 5xx), and the run ends in an error when it runs out.
   - Changing a user's tier starts their Bots' next Hermes runs in a fresh session.
   - `GET /api/tiers` (admins) shows the endpoints without keys.
-- **Residency** ([ADR 0139](adr/0139-in-region-model-routes.md)): an endpoint may list `regions`, the `MACHINE_REGIONS` ids it processes in (e.g. `"regions": ["gb-lon"]` for a Claude endpoint in a London cloud region). It is your word; botd can't check it. While a run's data is pinned ([ADR 0129](adr/0129-contractual-data-residency.md)), whether the Bot owner's pin or the asker's:
+- **Residency** ([ADR 0139](adr/0139-in-region-model-routes.md)): an endpoint may list `regions`, the `MACHINE_REGIONS` ids it processes in (e.g. `"regions": ["gb-lon"]` for a Claude endpoint in a London cloud region). It is your word; botd can't check it. While a run's data is pinned ([ADR 0129](adr/0129-contractual-data-residency.md)), whether the Bot owner's pin, the asker's, or that of anyone an asking Bot's run carried:
   - the run takes the Bot's route only if its own provider is an endpoint whose `regions` include every pinned region, else the tier's first route for that harness whose provider does;
   - fallbacks outside the region are left out, and the harness's own settings add none;
   - Hermes's side tasks (summaries, titles, vision, web extraction) use the run's endpoint, and the keys of Hermes's built-in providers (`OPENROUTER_API_KEY` and the like) are empty in the run;
-  - with no such route, including on an open tier and for Claude Code or Codex (they name no endpoint), the run is refused (`bot.run_refused`, reason `residency_pinned`, with the pins) and not counted.
+  - with no such route, including on an open tier and for Claude Code or Codex (they name no endpoint), the run is refused (`bot.run_refused`, reason `residency_pinned`, with the pins) and not counted;
+  - a run waiting for a slot when someone it carries is pinned to a region its route wasn't held to is refused the same way (`whileQueued: true`) when its turn comes.
 
   `GET /api/regions` and the startup log warn about pinned people whose plan has no route in their region, and about `regions` that aren't in `MACHINE_REGIONS`.
 - **Audit**: `harness.invoked` records the tier and route, with `fallback` and `fallbackSkipped`, and for a held run `residency` (`regions`, `fallbackOutsideRegion`, `insteadOf`); refusals are `bot.run_refused` with reason `tier_harness`, `tier_limit`, `tier_token_limit`, `provider_key_missing`, or `residency_pinned`.

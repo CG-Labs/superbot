@@ -152,6 +152,99 @@ async fn a_team_pin_holds_its_members_runs() {
     assert!(d["error"].as_str().unwrap().contains("us-gpt has no regions"), "{d}");
 }
 
+/// The Bot's first reply after message `before`.
+async fn reply_after(app: &App, bot: &str, before: i64) -> String {
+    for _ in 0..300 {
+        if let Some(m) = app.db.replies_after(bot, before).into_iter().next() {
+            return m.text;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("no reply from {bot}");
+}
+
+/// `from`, in a run, asks `to` as `/api/ask` does with open shared Bots: as itself, for
+/// its owner, naming no one else.
+async fn bot_asks(app: &Arc<App>, from: &crate::db::Bot, to: &crate::db::Bot) -> String {
+    let by = crate::audit::Who { actor: crate::audit::Actor::for_bot(from), source: Default::default() };
+    app.ask(from, to, "status?", std::time::Duration::from_secs(10), &by).await.expect("no reply")
+}
+
+#[tokio::test]
+async fn a_pin_holds_through_bots_asking_bots() {
+    let (port, app, admin, _) = serve_app().await;
+    app.tiers.set(Arc::new(Tiers::parse(TIERS, None).unwrap())).unwrap();
+    fake_hermes(&app);
+    let (ada_id, ada) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (bea_id, bea) = user_with(port, &admin, "bea@example.com", "member").await;
+    let (cy_id, cy) = user_with(port, &admin, "cy@example.com", "member").await;
+    for who in [&ada, &bea, &cy] {
+        save_keys(port, who).await;
+    }
+    let bea_bot = app.db.create_bot_owned("Bea's", "#fff", "waddle", "hermes", None, false, &bea_id, Visibility::Shared);
+    let cy_bot = app.db.create_bot_owned("Cy's", "#fff", "waddle", "hermes", None, false, &cy_id, Visibility::Shared);
+    let bea_two = app.db.create_bot_owned("Bea's other", "#fff", "waddle", "hermes", None, false, &bea_id, Visibility::Shared);
+    app.db.pin_residency(PinOn::User, &ada_id, "gb-lon", "DPA-7", None).unwrap();
+
+    // Bea's own run asks Cy's Bot: nobody pinned, as before.
+    assert_eq!(run(port, &app, &bea, &bea_bot.id).await, "provider=superbot-us-gpt openrouter=set aux=0");
+    assert_eq!(bot_asks(&app, &bea_bot, &cy_bot).await, "provider=superbot-us-gpt openrouter=set aux=0");
+
+    // Ada's run of Bea's Bot asks Cy's, which asks Bea's other: each held to Ada's London.
+    let held = "provider=superbot-uk-claude openrouter=unset aux=12";
+    assert_eq!(run(port, &app, &ada, &bea_bot.id).await, held);
+    assert_eq!(bot_asks(&app, &bea_bot, &cy_bot).await, held);
+    assert_eq!(bot_asks(&app, &cy_bot, &bea_two).await, held);
+    let invoked = audit(port, &admin, &format!("action=harness.invoked&bot={}", bea_two.id)).await;
+    assert_eq!(invoked[0]["details"]["residency"]["regions"], json!(["gb-lon"]), "{}", invoked[0]);
+    assert_ne!(invoked[0]["details"]["forUser"], json!(ada_id), "whom it acts for is unchanged: {}", invoked[0]);
+
+    // Once Cy's own run asks again, Ada's data isn't in it.
+    assert_eq!(run(port, &app, &cy, &cy_bot.id).await, "provider=superbot-us-gpt openrouter=set aux=0");
+    assert_eq!(bot_asks(&app, &cy_bot, &bea_two).await, "provider=superbot-us-gpt openrouter=set aux=0");
+}
+
+#[tokio::test]
+async fn a_pin_made_while_a_run_waits_refuses_it() {
+    let (port, app, admin, _) = serve_app().await;
+    app.tiers.set(Arc::new(Tiers::parse(TIERS, None).unwrap())).unwrap();
+    fake_hermes(&app);
+    app.run_cap.set(Some(1)).unwrap();
+    let dir = app.cfg.data_dir.join("gate");
+    crate::slots_http_tests::gated_claude(&app, &dir);
+    let (ada_id, ada) = user_with(port, &admin, "ada@example.com", "member").await;
+    save_keys(port, &ada).await;
+    let x = app.db.create_bot_owned("X", "#fff", "waddle", "claude", None, false, &ada_id, Visibility::Private).id;
+    let y = app.db.create_bot_owned("Y", "#fff", "waddle", "hermes", None, false, &ada_id, Visibility::Private).id;
+    let runs = || async { parse_json(&call(port, "GET", "/api/me/tier", &ada, "").await.1)["usage"]["runs"].as_u64() };
+    let before = app.db.last_id();
+    for b in [&x, &y] {
+        let (code, body) = call(port, "POST", &format!("/api/bots/{b}/messages"), &ada, r#"{"text":"go"}"#).await;
+        assert_eq!(code, 202, "{body}");
+    }
+    for _ in 0..400 {
+        if app.slots.waiting(&y).is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(app.slots.waiting(&y).is_some(), "Y didn't queue");
+
+    // Y took the plan's US route; Ada is pinned to London before its turn comes.
+    app.db.pin_residency(PinOn::User, &ada_id, "gb-lon", "DPA-7", None).unwrap();
+    std::fs::write(dir.join(format!("go-{x}")), "").unwrap();
+    let said = reply_after(&app, &y, before).await;
+    assert!(said.contains("pinned to gb-lon") && said.contains("while it waited"), "{said}");
+    let refused = audit(port, &admin, &format!("action=bot.run_refused&bot={y}")).await;
+    let d = &refused[0]["details"];
+    assert_eq!((d["reason"].as_str(), d["whileQueued"].as_bool(), d["heldTo"].clone()), (Some("residency_pinned"), Some(true), json!([])), "{d}");
+    assert!(audit(port, &admin, &format!("action=harness.invoked&bot={y}")).await.is_empty(), "Y didn't start");
+    assert_eq!(runs().await, Some(1), "only X's run counts");
+
+    // Sent again, it takes the London route.
+    assert_eq!(run(port, &app, &ada, &y).await, "provider=superbot-uk-claude openrouter=unset aux=12");
+}
+
 fn parse_json(s: &str) -> Value {
     serde_json::from_str(s).unwrap_or(Value::Null)
 }
