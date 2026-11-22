@@ -402,11 +402,12 @@ impl Inner {
         let result = self.sign_in().await;
         http::audit_login("aws", self.cfg.source.method(), &result);
         let (k, at) = result?;
+        // Under the lock, so overlapping sign-ins can't forget the keys that end up kept.
+        let mut kept = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         for v in k.secrets() {
             redact::register(v);
         }
-        let old = self.keys.lock().unwrap_or_else(|e| e.into_inner()).replace((k.clone(), at));
-        if let Some((old, _)) = &old {
+        if let Some((old, _)) = kept.replace((k.clone(), at)) {
             for v in old.secrets().filter(|v| !k.secrets().any(|n| n == *v)) {
                 redact::forget(v);
             }
