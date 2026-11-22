@@ -7206,11 +7206,12 @@ impl Db {
         s.query_map([state], server_backup_row).unwrap().filter_map(Result::ok).collect()
     }
 
-    /// The newest archive whose copy to `destination` finished.
+    /// The newest archive whose copy to `destination` finished. Of archives made in the same
+    /// second, the one copied last: only the newest is ever copied.
     pub fn server_last_backup(&self, destination: &str) -> Option<ServerBackup> {
         self.c()
             .query_row(
-                "SELECT * FROM server_backups WHERE destination = ? AND state = 'done' ORDER BY created_at DESC, id DESC LIMIT 1",
+                "SELECT * FROM server_backups WHERE destination = ? AND state = 'done' ORDER BY created_at DESC, finished_at DESC, id DESC LIMIT 1",
                 [destination],
                 server_backup_row,
             )

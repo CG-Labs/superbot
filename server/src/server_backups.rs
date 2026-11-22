@@ -272,6 +272,8 @@ pub struct Archive {
     pub path: PathBuf,
     /// When it was made: the time in its name, else when it was written.
     pub created_at: i64,
+    /// Its place among archives made in the same second (`-1`, `-2`, ...).
+    pub seq: u32,
     /// superbot-backup encrypted it (`.age`).
     pub encrypted: bool,
 }
@@ -280,6 +282,12 @@ pub struct Archive {
 pub fn named_time(name: &str) -> Option<i64> {
     let stamp = name.strip_prefix("superbot-")?.get(..15)?;
     chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%d-%H%M%S").ok().map(|t| t.and_utc().timestamp_millis())
+}
+
+/// superbot-backup's `-n` after the time, for a second archive in the same second; 0 without.
+pub fn named_seq(name: &str) -> u32 {
+    let rest = name.strip_prefix("superbot-").and_then(|n| n.get(15..)).unwrap_or_default();
+    rest.strip_prefix('-').and_then(|r| r.split('.').next()).and_then(|n| n.parse().ok()).unwrap_or(0)
 }
 
 /// Whether `name` is an archive superbot-backup finished: it writes `.partial-*` first and
@@ -308,10 +316,10 @@ pub fn archives(dir: &Path) -> Vec<Archive> {
             let encrypted = archive_name(&name)?;
             let meta = std::fs::symlink_metadata(e.path()).ok().filter(|m| m.is_file())?;
             let written = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis() as i64);
-            Some(Archive { created_at: named_time(&name).unwrap_or(written), path: e.path(), name, encrypted })
+            Some(Archive { created_at: named_time(&name).unwrap_or(written), seq: named_seq(&name), path: e.path(), name, encrypted })
         })
         .collect();
-    out.sort_by(|a, b| (a.created_at, &a.name).cmp(&(b.created_at, &b.name)));
+    out.sort_by(|a, b| (a.created_at, a.seq, &a.name).cmp(&(b.created_at, b.seq, &b.name)));
     out
 }
 
@@ -362,7 +370,7 @@ fn alert(app: &AppState, action: &str, title: &str, lines: Vec<String>) {
 pub fn due(app: &App, sb: &ServerBackups) -> Option<Archive> {
     let dest = sb.target.as_ref()?.destination();
     let newest = archives(&sb.dir).pop()?;
-    if app.db.server_last_backup(&dest).is_some_and(|b| b.created_at >= newest.created_at) {
+    if app.db.server_last_backup(&dest).is_some_and(|b| (b.created_at, named_seq(&b.archive)) >= (newest.created_at, newest.seq)) {
         return None;
     }
     match app.db.server_backups_of(&dest, &newest.name).first() {

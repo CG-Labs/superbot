@@ -268,6 +268,24 @@ async fn a_failed_copy_is_audited_and_tried_again_later() {
 }
 
 #[tokio::test]
+async fn archives_made_in_the_same_second_are_each_copied() {
+    let s = setup(Vec::new(), Some(30)).await;
+    let first = archive(&s.dir, HOUR, false, b"first");
+    let made = server_backups::pass(&s.app).await.unwrap();
+    assert_eq!(made.archive, first);
+    let stem = first.strip_suffix(".tar.gz").unwrap();
+    for n in [1, 2] {
+        let next = format!("{stem}-{n}.tar.gz");
+        std::fs::write(s.dir.join(&next), format!("archive {n}")).unwrap();
+        assert_eq!(server_backups::archives(&s.dir).last().map(|a| a.name.clone()), Some(next.clone()), "the -{n} is the newest");
+        let made = server_backups::pass(&s.app).await.expect("a later archive of the same second");
+        assert_eq!((made.archive.as_str(), made.state.as_str()), (next.as_str(), "done"));
+        assert!(server_backups::pass(&s.app).await.is_none(), "and then nothing");
+    }
+    assert_eq!((server_backups::named_seq(&first), server_backups::named_seq("superbot-20261122-031500-12.tar.gz.age")), (0, 12));
+}
+
+#[tokio::test]
 async fn an_admin_can_copy_now() {
     let s = setup(Vec::new(), Some(30)).await;
     let name = archive(&s.dir, HOUR, false, b"archive");
