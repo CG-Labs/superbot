@@ -241,6 +241,10 @@ impl MachineProvider for Fake {
         "fake"
     }
 
+    fn substrate(&self) -> &'static str {
+        "vm"
+    }
+
     fn create<'a>(&'a self, spec: &'a CreateSpec) -> Fut<'a, ProviderMachine> {
         Box::pin(async move {
             self.with("create", |s| {

@@ -287,6 +287,10 @@ impl MachineProvider for Linode {
         "linode"
     }
 
+    fn substrate(&self) -> &'static str {
+        "vm"
+    }
+
     fn create<'a>(&'a self, spec: &'a CreateSpec) -> Fut<'a, ProviderMachine> {
         Box::pin(async move {
             let pass = root_pass();

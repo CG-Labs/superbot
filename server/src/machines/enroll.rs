@@ -1008,14 +1008,16 @@ async fn enroll(
     let Some(replaced) = p.app.db.enroll_machine(t.id, &m.id, &m.user_id, &issued) else {
         return refuse(StatusCode::UNAUTHORIZED, "token_used", BAD_TOKEN);
     };
-    record(
-        &p.app,
-        &by,
-        "machine.enrolled",
-        &m.id,
-        Outcome::Success,
-        json!({ "userId": m.user_id, "fingerprint": issued.fingerprint, "serial": issued.serial, "notAfter": issued.not_after }),
-    );
+    let mut details = json!({ "userId": m.user_id, "fingerprint": issued.fingerprint, "serial": issued.serial, "notAfter": issued.not_after });
+    // A machine's first enrollment is when it is up for its user: how long that took
+    // from the request, by provider and tier, is the provisioning time (ADR 0120).
+    if m.enrolled_at.is_none() {
+        details["first"] = json!(true);
+        details["provider"] = json!(m.provider);
+        details["tier"] = json!(m.tier);
+        details["sinceRequestSeconds"] = json!((at - m.created_at).max(0) / 1000);
+    }
+    record(&p.app, &by, "machine.enrolled", &m.id, Outcome::Success, details);
     record_revoked(&p.app, &by, &m, "replaced", &replaced);
     Json(wire::CertificateReply {
         machine_id: m.id.clone(),
