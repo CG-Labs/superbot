@@ -540,6 +540,9 @@ mod tests {
             "voxl",
             "#!/usr/bin/env python3\nimport socket, sys, time\nport = int(sys.argv[sys.argv.index('--port') + 1])\ns = socket.socket()\ns.bind(('127.0.0.1', port))\ns.listen()\ntime.sleep(60)\n",
         );
+        // A parallel test's fork can hold a script open for writing until it execs, and running
+        // the script meanwhile fails with ETXTBSY. Those forks exec within milliseconds.
+        std::thread::sleep(std::time::Duration::from_millis(100));
         // Both slots' ports must be free, or tests running alongside take the second one.
         let free = loop {
             let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
