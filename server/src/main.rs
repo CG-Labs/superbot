@@ -93,6 +93,8 @@ mod machines_upkeep_tests;
 #[cfg(test)]
 mod machines_rebuild_tests;
 #[cfg(test)]
+mod machines_redteam_tests;
+#[cfg(test)]
 mod machines_screens_tests;
 #[cfg(test)]
 mod machines_teammates_tests;
@@ -145,6 +147,8 @@ mod run_tokens_http_tests;
 mod runner;
 mod sandbox;
 mod scim;
+#[cfg(test)]
+mod scim_group_roles_http_tests;
 #[cfg(test)]
 mod scim_groups_http_tests;
 #[cfg(test)]
@@ -323,7 +327,7 @@ async fn main() {
         .unwrap_or_else(|e| exit(format!("Shared Bots: {e}")));
     let teams = teams::Settings::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Teams: {e}")));
     let resume_routines = handover::resume_on_enable(&env("ROUTINES_ON_ENABLE", "")).unwrap_or_else(|e| exit(e));
-    let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", ""), &env("SCIM_GROUPS", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
+    let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", ""), &env("SCIM_GROUPS", ""), &env("SCIM_GROUP_ROLES", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
     let tiers = tiers::Tiers::from_env(|k| env(k, "")).unwrap_or_else(|e| exit(format!("Tiers: {e}")));
     for name in adapters::NAMES {
         adapters::get(name).expect("listed adapter").check_env(&|k| env(k, "")).unwrap_or_else(|e| exit(e));
@@ -417,6 +421,9 @@ async fn main() {
         .unwrap_or_else(|e| exit(format!("Machine enrollment: {e}")))
         .map(|mut e| {
             e.upkeep.default_to(&managed_bins).unwrap_or_else(|err| exit(format!("Machine enrollment: {err}")));
+            if !e.bot_user {
+                log_warn!("WARNING: {}", machines::botuser::ROOT_WARNING);
+            }
             control_plane.enroll_with(e).unwrap_or_else(|e| exit(format!("Machine enrollment: {e}")))
         });
 
@@ -452,7 +459,8 @@ async fn main() {
         bot_key: bot_key.clone(),
         run_timeout: Duration::from_secs(60 * env("RUN_TIMEOUT_MINUTES", "60").parse::<u64>().unwrap_or(60)),
         default_harness,
-        sandbox_host: sandbox::host(),
+        // Runs under per-user accounts start through superbot-run, with no new privileges.
+        sandbox_host: if isolation.is_some() { sandbox::host_no_new_privs() } else { sandbox::host() },
         home: std::env::var_os("HOME").map(PathBuf::from),
     }, screens);
     let _ = app.tiers.set(Arc::new(tiers));
@@ -652,9 +660,10 @@ async fn main() {
     }
     match auth_state.scim.enabled {
         true => log_info!(
-            "SCIM: on at /scim/v2; new users get the {} role; groups {}.",
+            "SCIM: on at /scim/v2; new users get the {} role; groups {}; group roles {}.",
             auth_state.scim.default_role.as_str(),
-            if auth_state.scim.groups { "are teams (SCIM_GROUPS=on)" } else { "off (SCIM_GROUPS=off)" }
+            if auth_state.scim.groups { "are teams (SCIM_GROUPS=on)" } else { "off (SCIM_GROUPS=off)" },
+            if auth_state.scim.group_roles { "on, never admin (SCIM_GROUP_ROLES=on)" } else { "off (SCIM_GROUP_ROLES=off)" }
         ),
         false => log_info!("SCIM: off (SCIM=off)."),
     }
@@ -1058,6 +1067,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/scim/tokens/{id}", delete(scim::revoke_token))
         .route("/scim/groups", get(scim::groups::list_links).post(scim::groups::link))
         .route("/scim/groups/{team}", delete(scim::groups::unlink))
+        .route("/scim/role-mappings", get(scim::roles::list).post(scim::roles::create))
+        .route("/scim/role-mappings/{id}", get(scim::roles::get).delete(scim::roles::delete))
         .route("/status/incidents", get(status::list).post(status::create))
         .route("/status/incidents/{id}", patch(status::edit).delete(status::delete))
         .route("/status/incidents/{id}/updates", post(status::add_update))
