@@ -1627,3 +1627,33 @@ fn agent_counts_programs_only_under_its_home_or_the_system() {
     cfg.botctl = "/bin/sh".into();
     assert_eq!(cfg.layout().botctl.as_deref(), Some("/bin/sh"), "a system program");
 }
+
+#[test]
+fn the_agent_measures_its_homes_off_the_request_path_and_again_after_a_job() {
+    let home = crate::db::temp_path("home-use");
+    std::fs::create_dir_all(home.join("work")).unwrap();
+    std::fs::write(home.join("work/a.bin"), vec![0u8; 1000]).unwrap();
+    let roots = [home.clone(), crate::db::temp_path("home-use-teammates")];
+    let usage = Arc::new(agent::HomeUse::default());
+    let until = |want: u64| {
+        for _ in 0..400 {
+            if usage.latest() == Some((want, false)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("never measured {want}: {:?}", usage.latest());
+    };
+    // Nothing said before the first walk ends; the heartbeat that starts it doesn't wait.
+    assert_eq!(usage.latest(), None);
+    usage.refresh(&roots, false);
+    until(1000);
+    // A heartbeat soon after doesn't walk again...
+    std::fs::write(home.join("work/b.bin"), vec![0u8; 500]).unwrap();
+    usage.refresh(&roots, false);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(usage.latest(), Some((1000, false)));
+    // ...but a job's end does, so the next heartbeat says what it wrote.
+    usage.refresh(&roots, true);
+    until(1500);
+}

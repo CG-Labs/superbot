@@ -10,7 +10,9 @@
 pub mod log;
 pub mod metrics;
 
+use crate::machines::route::Routing;
 use crate::machines::{self, ControlPlane, State};
+use crate::storage::Report;
 use crate::secrets::{self, SecretStore};
 use crate::{AppState, same};
 use axum::extract::{MatchedPath, Request, State as AxState};
@@ -234,11 +236,20 @@ fn render_machines(app: &AppState, cp: &ControlPlane, out: &mut String) {
     for (s, n) in &by_state {
         metrics::sample(out, "superbot_machines", &[("state", s)], *n as f64);
     }
+    // Storage limits count these reports while the user's Bots work there (ADR 0105).
+    let now = crate::db::now();
+    let mut reports: BTreeMap<&'static str, u64> = [Report::Fresh, Report::Stale, Report::Missing].iter().map(|r| (r.as_str(), 0)).collect();
+    for m in all.iter().filter(|m| m.state != State::Destroyed && m.assigned_at.is_some() && cp.routing != Routing::Off) {
+        *reports.entry(crate::storage::on_machine(m, now).report.as_str()).or_default() += 1;
+    }
+    metrics::family(out, "superbot_machine_storage_reports", "gauge", "Machines users' Bots work on, by how recent their agent's report of what the homes hold is: fresh, stale or missing (ADR 0105).");
+    for (r, n) in &reports {
+        metrics::sample(out, "superbot_machine_storage_reports", &[("report", r)], *n as f64);
+    }
     let Some(off) = cp.offsite.as_deref() else { return };
     let tier = |t: &str| if cp.tiers.iter().any(|(n, _)| n == t) { t.to_string() } else { "other".to_string() };
     // Per tier: machines held to their RPO, those past it, and the oldest coverage age.
     let mut tiers: BTreeMap<String, (u64, u64, i64)> = BTreeMap::new();
-    let now = crate::db::now();
     for m in all.iter().filter(|m| m.state != State::Destroyed) {
         let st = machines::recovery::status(app, cp, off, m);
         if st.untracked.is_some() {
