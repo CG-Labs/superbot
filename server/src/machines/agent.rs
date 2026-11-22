@@ -302,8 +302,10 @@ impl Config {
         }
     }
 
-    /// The environment a teammate's jobs start from: their own home and user (ADR 0048).
-    fn teammate_host(&self, t: &Teammate) -> job::Host {
+    /// The environment a teammate's jobs and logins start from: their own home and user
+    /// (ADR 0048), with their temporary folder made first, as them (ADR 0145).
+    fn teammate_host(&self, t: &Teammate) -> Result<job::Host, String> {
+        own_tmp(&t.home, t.ids)?;
         let env = BTreeMap::from([
             ("HOME".to_string(), t.home.display().to_string()),
             ("PATH".to_string(), self.harness_path.clone()),
@@ -312,7 +314,7 @@ impl Config {
             ("LOGNAME".to_string(), t.user.clone()),
             ("TMPDIR".to_string(), t.home.join(TMP).display().to_string()),
         ]);
-        job::Host { clear_env: true, remove: Vec::new(), env, user: Some(t.ids), limits: None }
+        Ok(job::Host { clear_env: true, remove: Vec::new(), env, user: Some(t.ids), limits: None })
     }
 
     /// Why `ids` can't be the Bots' user, if it can't.
@@ -1558,6 +1560,16 @@ fn scrub(env: &mut BTreeMap<String, String>) {
 /// every user on the machine.
 const TMP: &str = ".tmp";
 
+/// `home`'s temporary folder, made as `ids` if it isn't there.
+fn own_tmp(home: &Path, ids: Ids) -> Result<(), String> {
+    let tmp = home.join(TMP);
+    let made = runas::as_user(Some(ids), || match std::fs::DirBuilder::new().mode(0o700).create(&tmp) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tmp.is_dir() => Ok(()),
+        r => r,
+    });
+    made.and_then(|r| r).map_err(|e| format!("Couldn't make {}: {e}", tmp.display()))
+}
+
 fn ndjson(e: &impl serde::Serialize) -> Bytes {
     let mut line = serde_json::to_vec(e).unwrap_or_default();
     line.push(b'\n');
@@ -1682,11 +1694,10 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
     let running = Running(a.clone(), j.job_id.clone(), permit);
     let stop = StopOnDrop(stop_tx);
     let mut host = match &teammate {
-        Some(t) => {
-            let tmp = t.home.join(TMP);
-            let _ = runas::as_user(Some(t.ids), || std::fs::DirBuilder::new().mode(0o700).create(&tmp));
-            a.cfg.teammate_host(t)
-        }
+        Some(t) => match a.cfg.teammate_host(t) {
+            Ok(h) => h,
+            Err(e) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        },
         None => {
             let _ = work_dirs(&a.cfg, user);
             a.cfg.host(user)
@@ -1747,7 +1758,10 @@ async fn start_login(State(a): State<Arc<Agent>>, Json(r): Json<wire::LoginReque
         return refuse(StatusCode::CONFLICT, "That teammate's user is being removed.");
     }
     let (home, host) = match &teammate {
-        Some(t) => (t.home.clone(), a.cfg.teammate_host(t)),
+        Some(t) => match a.cfg.teammate_host(t) {
+            Ok(h) => (t.home.clone(), h),
+            Err(e) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        },
         None => (a.cfg.home.clone(), a.cfg.host(user)),
     };
     if a.upgrader.staging() {
@@ -2497,6 +2511,22 @@ mod tests {
             [("HOME", "/root"), ("PATH", "/tmp"), ("TMPDIR", "/tmp"), ("BOT_TOKEN", "t")].map(|(k, v)| (k.into(), v.into())).into();
         scrub(&mut env);
         assert_eq!(env.keys().collect::<Vec<_>>(), ["BOT_TOKEN"]);
+    }
+
+    #[test]
+    fn a_teammates_temporary_folder_is_made_before_a_job_or_login() {
+        let home = std::env::temp_dir().join(format!("sb-agent-tmp-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        // SAFETY: no arguments.
+        let me = unsafe { Ids { uid: libc::geteuid(), gid: libc::getegid() } };
+        own_tmp(&home, me).unwrap();
+        let m = std::fs::metadata(home.join(TMP)).unwrap();
+        assert!(m.is_dir() && std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777 == 0o700);
+        own_tmp(&home, me).unwrap();
+        std::fs::remove_dir(home.join(TMP)).unwrap();
+        std::fs::write(home.join(TMP), "").unwrap();
+        assert!(own_tmp(&home, me).unwrap_err().contains("Couldn't make"));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
