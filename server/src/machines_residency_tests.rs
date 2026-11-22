@@ -211,6 +211,23 @@ async fn with_hosts_untagged_after_a_pin_no_new_machine_is_made_asked_for_or_ret
     assert!(env.app.db.machine(&m.id).unwrap().provider_id.is_some() && made(&m.label));
 }
 
+#[tokio::test]
+async fn a_pin_checks_the_host_a_machine_is_on_not_only_its_record() {
+    let env = incus(true).await;
+    let (fra, _) = user_with(env.port, &env.admin, "fra@example.com", "member").await;
+    // Made before hosts were tagged: recorded as Frankfurt, but on host a, in London.
+    let mut m = machine_for(&env, &env.a, "a", &fra, false).await;
+    m.region = "de-fra-2".into();
+    assert!(env.app.db.save_machine(&m, m.state));
+    env.app.db.set_user_region(&fra, Some("de-fra-2"));
+
+    let (code, v) = json_call(&env, "PUT", &format!("/api/users/{fra}/residency"), &pin("de-fra-2", "DPA-1")).await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("their machine is on host a, in gb-lon"), "{v}");
+    assert_eq!(events(&env, "user.residency_pin_refused").await[0]["details"]["reason"].as_str(), Some("data_outside"));
+    assert!(env.app.db.residency_pin(PinOn::User, &fra).is_none());
+}
+
 /// Linode, with MACHINE_REGIONS=gb-lon,de-fra-2.
 async fn linode() -> (u16, AppState, String) {
     let fake = Arc::new(Fake::default());

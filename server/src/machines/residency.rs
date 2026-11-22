@@ -69,13 +69,25 @@ fn stored_in(off: Option<&Offsite>, store_region: Option<&str>, region: &str) ->
     }
 }
 
-/// What of `user_id`'s data is outside `region` now: their machine, and backups in a store
-/// elsewhere that aren't deleted. A failed one counts: its upload may have finished before
-/// it failed. Empty: all of it is in.
+/// What of `user_id`'s data is outside `region` now: their machine (by its record, and by
+/// its host's tag now, since a machine made before hosts were tagged may be on any host),
+/// and backups in a store elsewhere that aren't deleted. A failed one counts: its upload
+/// may have finished before it failed. Empty: all of it is in.
 fn outside(app: &App, cp: &ControlPlane, user_id: &str, region: &str) -> Vec<String> {
     let mut out = Vec::new();
-    if let Some(m) = app.db.user_machine(user_id).filter(|m| m.region != region) {
-        out.push(format!("their machine is in {}", m.region));
+    if let Some(m) = app.db.user_machine(user_id) {
+        if m.region != region {
+            out.push(format!("their machine is in {}", m.region));
+        } else if let Some(h) = cp.hosts().filter(|_| cp.owns(&m)) {
+            let host = m.provider_id.as_deref().map(|p| h.host_of(p)).or_else(|| m.placed_on.clone());
+            if let Some(host) = host {
+                match h.configured().into_iter().find(|c| c.name == host).and_then(|c| c.region) {
+                    Some(r) if r == region => {}
+                    Some(r) => out.push(format!("their machine is on host {host}, in {r}")),
+                    None => out.push(format!("their machine is on host {host}, which has no data region")),
+                }
+            }
+        }
     }
     let off = cp.offsite.as_deref();
     let n = app
