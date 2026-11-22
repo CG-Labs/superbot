@@ -1054,7 +1054,12 @@ pub async fn logout_request(a: &Auth, app: &AppState, s: &db::Session) -> Option
     let p = a.sso.provider(s.idp_provider.as_deref()?)?;
     let Kind::SamlSp { sp_entity_id, .. } = &p.kind else { return None };
     let login = app.db.saml_session(&s.id)?;
-    let slo = p.idp_metadata(a.sso.http(), a.sso.refresh_gap).await.ok()?.slo.clone()?;
+    // Cached metadata, even if stale, and a short fetch otherwise: clients wait 5 s for this answer.
+    let idp = match p.idp_loaded() {
+        Some(m) => m,
+        None => tokio::time::timeout(Duration::from_secs(3), p.idp_metadata(a.sso.http(), a.sso.refresh_gap)).await.ok()?.ok()?,
+    };
+    let slo = idp.slo.clone()?;
     let key = sp_key(app, p).map_err(|e| crate::obs::log::log_warn!("SSO {}: no single logout: {e}", p.id)).ok()?;
     let (id, at) = (saml_sp::request_id(), db::now());
     {
