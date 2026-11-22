@@ -1,6 +1,6 @@
 # Runbook: native SAML sign-in
 
-People can't sign in with a SAML identity provider that botd talks to directly (`SSO_<ID>_TYPE=saml`, [guide](../sso/saml-native.md), [ADR 0127](../adr/0127-native-saml-service-provider.md)). For SAML through the Keycloak bridge, OIDC and the rest, use the [sign-in runbook](runbook-sign-in.md). Severity: [1](severity.md#severities) if SAML is the only way in and nobody can sign in, 2 if it fails for many while another way works, 3 for one person.
+People can't sign in with a SAML identity provider that botd talks to directly (`SSO_<ID>_TYPE=saml`, [guide](../sso/saml-native.md), [ADR 0127](../adr/0127-native-saml-service-provider.md), [ADR 0137](../adr/0137-saml-signed-requests-and-single-logout.md)). For SAML through the Keycloak bridge, OIDC and the rest, use the [sign-in runbook](runbook-sign-in.md). Severity: [1](severity.md#severities) if SAML is the only way in and nobody can sign in, 2 if it fails for many while another way works, 3 for one person.
 
 ## First five minutes
 
@@ -18,7 +18,7 @@ People can't sign in with a SAML identity provider that botd talks to directly (
    botctl audit 50 --action auth.login_failed --idp saml
    ```
 
-   Each refusal has a `reason`. The [health score](health-score.md#identity)'s `identity` signal has the week's reasons counted, without names.
+   Each refusal has a `reason`. The [health score](health-score.md#identity)'s `identity` signal counts the last 30 days' reasons, without names.
 4. **What changed:** an IdP certificate rollover, a new app or attribute mapping at the IdP, a change of `SSO_PUBLIC_URL`, a proxy or domain, a clock.
 
 ## Reasons and fixes
@@ -34,6 +34,12 @@ The [guide's table](../sso/saml-native.md#troubleshooting) has every reason. The
 | `encrypted_assertion`, `unsigned`, `weak_algorithm` | The IdP app's settings changed | Unencrypted assertions, signed with RSA-SHA256 ([guide](../sso/saml-native.md#2-register-superbot-at-your-idp)) |
 | `not_linked`, `transient_subject` | A new person, or the NameID format changed | Link them ([guide](../sso/saml-native.md#3-let-people-in)); keep the NameID persistent. A changed NameID needs every person re-linked, so change it back if you can |
 | `idp_error` | The IdP refused: the person isn't assigned to the app, or conditional access | `idpStatus` says which; the customer's IdP admin fixes it |
+| Not offered; `botctl sso saml <provider>` says the IdP wants signed requests | Its metadata has `WantAuthnRequestsSigned="true"` | `SSO_<ID>_SIGN_REQUESTS=true`, restart, and give the IdP SuperBot's metadata or SP certificate ([guide](../sso/saml-native.md#signed-authnrequests)) |
+| Not offered with your own SP key | `SSO_<ID>_PRIVATE_KEY` missing or not matching `SSO_<ID>_SP_CERT_FILE` | Set the matching key and restart ([guide](../sso/saml-native.md#the-sp-key)) |
+
+## Signing out doesn't sign out
+
+Single logout works only when the IdP's metadata has a logout URL and the IdP has SuperBot's SP certificate and SLO URL (`botctl sso saml <provider>` says `Single logout: yes`; [guide](../sso/saml-native.md#single-logout)). An IdP that imported SuperBot's metadata before the SP key existed needs it imported again. Refused logout messages are in `botctl audit 50 --action auth.slo_failed`: `unsigned` or `bad_signature` means the IdP's certificate isn't in the metadata botd has, `wrong_destination` a different SLO URL at the IdP, `expired` a clock. The phone app and `botctl` end only their own session, by design. A person still signed in after the IdP said they were signed out is Severity 2: end their sessions with `botctl user disable <user>`, then `botctl user enable <user>` and `botctl user resume-routines <user>`, while it's fixed.
 
 ## Nobody can sign in
 
