@@ -1,7 +1,7 @@
-//! Secrets kept in an external secrets manager (ADR 0125): HashiCorp Vault today
-//! (`vault`), Azure Key Vault or AWS Secrets Manager later. Each is a `Provider`; the
-//! `ExternalStore` around it is the `SecretStore` botd asks, and does the rest the same
-//! way for all of them:
+//! Secrets kept in an external secrets manager: HashiCorp Vault (`vault`, ADR 0125),
+//! Azure Key Vault (`azure-keyvault`) and GCP Secret Manager (`gcp-secret-manager`,
+//! ADR 0136). Each is a `Provider`; the `ExternalStore` around it is the `SecretStore`
+//! botd asks, and does the rest the same way for all of them:
 //!
 //! - Two folders: `bots` holds the server-wide secrets Bots get, `server` holds botd's
 //!   own (`server_secret` names, and Stripe's keys). A name is only ever read from its
@@ -297,16 +297,73 @@ pub fn cache_ttl(raw: &str) -> Result<Duration, String> {
     }
 }
 
-/// `SECRETS_BACKEND`: `local` (the default: the environment and the sealed store only)
-/// or `vault`. None for local.
+/// `SECRETS_BACKEND`: `local` (the default: the environment and the sealed store only),
+/// `vault`, `azure-keyvault` or `gcp-secret-manager`. None for local. Settings for a
+/// backend that isn't the one chosen are warned about, not used.
 pub fn from_env(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result<Option<Arc<ExternalStore>>, String> {
     let ttl = cache_ttl(&var("SECRETS_CACHE_SECONDS"))?;
-    let provider: Box<dyn Provider> = match var("SECRETS_BACKEND").trim() {
-        "" | "local" => return Ok(None),
+    let chosen = var("SECRETS_BACKEND").trim().to_string();
+    let provider: Box<dyn Provider> = match chosen.as_str() {
+        "" | "local" => {
+            warn_unused(var, "local");
+            return Ok(None);
+        }
         "vault" => Box::new(super::vault::Vault::new(super::vault::Config::from_env(var, store)?)?),
-        other => return Err(format!("SECRETS_BACKEND must be local or vault, not {other:?}")),
+        "azure-keyvault" => Box::new(super::azure::KeyVault::new(super::azure::Config::from_env(var, store)?)?),
+        "gcp-secret-manager" => Box::new(super::gcp::SecretManager::new(super::gcp::Config::from_env(var, store)?)?),
+        other => return Err(format!("SECRETS_BACKEND must be local, vault, azure-keyvault or gcp-secret-manager, not {other:?}")),
     };
+    warn_unused(var, &chosen);
     Ok(Some(Arc::new(ExternalStore::new(provider, ttl))))
+}
+
+/// The settings of backends other than `chosen` that are set: probably a mistake.
+pub fn unused_settings(var: &dyn Fn(&str) -> String, chosen: &str) -> Vec<&'static str> {
+    const KEYS: [(&str, &str); 6] = [
+        ("vault", "VAULT_ADDR"),
+        ("azure-keyvault", "AZURE_KEYVAULT_URL"),
+        ("azure-keyvault", "AZURE_KEYVAULT_AUTH"),
+        ("gcp-secret-manager", "GCP_SECRET_MANAGER_PROJECT"),
+        ("gcp-secret-manager", "GCP_SECRET_MANAGER_AUTH"),
+        ("gcp-secret-manager", "GCP_SECRET_MANAGER_LOCATION"),
+    ];
+    KEYS.iter().filter(|(b, k)| *b != chosen && !var(k).trim().is_empty()).map(|(_, k)| *k).collect()
+}
+
+fn warn_unused(var: &dyn Fn(&str) -> String, chosen: &str) {
+    let unused = unused_settings(var, chosen);
+    if !unused.is_empty() {
+        crate::obs::log::log_warn!("Secrets backend: {} set, but SECRETS_BACKEND is {chosen}, so they are ignored (ADR 0136).", unused.join(", "));
+    }
+}
+
+/// The external store botd runs with, for diagnostics (`secrets::init` sets it).
+static ACTIVE: std::sync::OnceLock<Arc<ExternalStore>> = std::sync::OnceLock::new();
+
+pub(crate) fn set_active(x: &Arc<ExternalStore>) {
+    let _ = ACTIVE.set(Arc::clone(x));
+}
+
+/// The secrets backend and whether it answers, for the setup report and `botctl secrets
+/// backend`: names, counts and errors, never a value.
+pub fn diagnostics() -> serde_json::Value {
+    diagnose(ACTIVE.get().map(Arc::as_ref))
+}
+
+fn diagnose(x: Option<&ExternalStore>) -> serde_json::Value {
+    let Some(x) = x else {
+        return json!({
+            "backend": "local",
+            "description": "the environment and the sealed store",
+            "ok": true,
+            "detail": "Local: secrets come from the environment and the sealed store. SECRETS_BACKEND=vault, azure-keyvault or gcp-secret-manager adds an external one (ADR 0125, ADR 0136).",
+        });
+    };
+    let (ok, names, detail) = match x.names() {
+        Ok(n) => (true, Some(n.len()), format!("{} answers: {} names in its bots and server folders.", x.kind(), n.len())),
+        Err(e) => (false, None, format!("{} can't be read: {e}. Bot runs are refused until it answers (fail closed).", x.kind())),
+    };
+    json!({ "backend": x.kind(), "description": x.describe(), "cacheSeconds": x.ttl.as_secs(), "ok": ok, "names": names, "detail": detail })
 }
 
 #[cfg(test)]
@@ -461,6 +518,50 @@ pub(crate) mod tests {
         let var = |k: &str| if k == "SECRETS_BACKEND" { "local".to_string() } else { String::new() };
         assert!(from_env(&var, &env).unwrap().is_none(), "local is the default");
         let var = |k: &str| if k == "SECRETS_BACKEND" { "consul".to_string() } else { String::new() };
-        assert!(from_env(&var, &env).err().unwrap().contains("local or vault"));
+        assert!(from_env(&var, &env).err().unwrap().contains("local, vault, azure-keyvault or gcp-secret-manager"));
+    }
+
+    #[test]
+    fn each_backend_is_chosen_and_checked_at_startup() {
+        let env = super::super::env::EnvStore::fixed(&[]);
+        for (backend, err) in [("vault", "needs VAULT_ADDR"), ("azure-keyvault", "needs AZURE_KEYVAULT_URL"), ("gcp-secret-manager", "needs GCP_SECRET_MANAGER_PROJECT")] {
+            let var = super::super::http::tests::settings(&[("SECRETS_BACKEND", backend)]);
+            assert!(from_env(&var, &env).err().unwrap().contains(err), "{backend}");
+        }
+        let var = super::super::http::tests::settings(&[("SECRETS_BACKEND", "azure-keyvault"), ("AZURE_KEYVAULT_URL", "https://kv1.vault.azure.net"), ("SECRETS_CACHE_SECONDS", "60")]);
+        let x = from_env(&var, &env).unwrap().unwrap();
+        assert_eq!((x.kind(), x.ttl), ("azure-keyvault", Duration::from_secs(60)));
+        let var = super::super::http::tests::settings(&[("SECRETS_BACKEND", "gcp-secret-manager"), ("GCP_SECRET_MANAGER_PROJECT", "proj-1")]);
+        assert_eq!(from_env(&var, &env).unwrap().unwrap().kind(), "gcp-secret-manager");
+        let var = super::super::http::tests::settings(&[("VAULT_ADDR", "https://v"), ("GCP_SECRET_MANAGER_PROJECT", "p"), ("AZURE_KEYVAULT_URL", "https://kv")]);
+        assert_eq!(unused_settings(&var, "local"), ["VAULT_ADDR", "AZURE_KEYVAULT_URL", "GCP_SECRET_MANAGER_PROJECT"]);
+        assert_eq!(unused_settings(&var, "vault"), ["AZURE_KEYVAULT_URL", "GCP_SECRET_MANAGER_PROJECT"]);
+    }
+
+    #[test]
+    fn cloud_credentials_never_reach_bots() {
+        for name in ["AZURE_CLIENT_SECRET", "IDENTITY_HEADER", "GCP_SERVICE_ACCOUNT_KEY"] {
+            assert!(super::super::check_name(name).is_err(), "{name} is reserved");
+            assert_eq!(scope_of(name), None, "{name} is never read from an external store");
+            let s = super::super::Secrets::new(vec![Box::new(super::super::env::EnvStore::fixed(&[(name, "cloud-credential-0123456789")]))]);
+            assert!(s.harness_env().is_empty() && s.inherited_harness_env().is_empty() && s.list().unwrap().is_empty(), "{name}");
+        }
+        let host = crate::adapters::local_host();
+        for k in ["AZURE_CLIENT_SECRET", "AZURE_CLIENT_SECRET_FILE", "AZURE_FEDERATED_TOKEN_FILE", "IDENTITY_HEADER", "GCP_SERVICE_ACCOUNT_KEY", "GCP_SERVICE_ACCOUNT_KEY_FILE"] {
+            assert!(host.remove.iter().any(|r| r == k), "{k} removed from local jobs");
+        }
+    }
+
+    #[test]
+    fn diagnostics_say_whether_the_backend_answers_never_values() {
+        assert_eq!(diagnose(None)["backend"], "local");
+        let (f, s) = fake(&[(Scope::Bots, "DIAG_TOKEN", "diag-value-1")], Duration::ZERO);
+        let d = diagnose(Some(&s));
+        assert_eq!((d["backend"].as_str(), d["ok"].as_bool(), d["names"].as_u64()), (Some("fake"), Some(true), Some(1)));
+        f.down.store(true, Ordering::SeqCst);
+        let d = diagnose(Some(&s));
+        assert_eq!(d["ok"], false);
+        assert!(d["detail"].as_str().unwrap().contains("fake is down"), "{d}");
+        assert!(!d.to_string().contains("diag-value-1"));
     }
 }
