@@ -29,10 +29,15 @@ $ botctl sso saml corp
 Acme (corp): ready
   SP entity ID (audience):  https://superbot.example.com/api/auth/sso/corp/metadata
   ACS URL (reply URL):      https://superbot.example.com/api/auth/sso/corp/acs
+  SLO URL (logout URL):     https://superbot.example.com/api/auth/sso/corp/slo
   SP metadata:              https://superbot.example.com/api/auth/sso/corp/metadata
   IdP entity ID:            http://www.okta.com/exk1abc
+  SP signing certificate:   SHA-256 9c:02:… (generated), expires 2046-11-21
+  Signs AuthnRequests:      no
+  Single logout:            yes
   IdP metadata from url (https://acme.okta.example/app/exk1abc/sso/saml/metadata):
     Sign-in URL: https://acme.okta.example/app/acme_superbot_1/exk1abc/sso/saml
+    Logout URL:  https://acme.okta.example/app/exk1abc/slo/saml
     Certificate SHA-256 3f:a1:… (CN=acme), expires 2036-05-01
 ```
 
@@ -71,7 +76,7 @@ On the app's **Sign On** tab, the **Metadata URL** is `SSO_CORP_IDP_METADATA_URL
 ### Microsoft Entra ID
 
 1. **Entra admin center → Enterprise applications → New application → Create your own application**, named SuperBot, **Integrate any other application you don't find in the gallery (Non-gallery)**.
-2. **Single sign-on → SAML → Basic SAML Configuration**: **Identifier (Entity ID)** the SP entity ID, **Reply URL (Assertion Consumer Service URL)** the ACS URL. Leave the sign-on, relay state and logout URLs empty.
+2. **Single sign-on → SAML → Basic SAML Configuration**: **Identifier (Entity ID)** the SP entity ID, **Reply URL (Assertion Consumer Service URL)** the ACS URL. Leave the sign-on and relay state URLs empty; the **Logout Url** is the SLO URL if you want [single logout](#single-logout).
 3. **Attributes & Claims → Unique User Identifier (Name ID)**: **Name identifier format** Persistent, **Source attribute** `user.objectid`. The default (`user.userprincipalname`) can change and move to someone else.
 4. Keep the default claims: Entra sends the email as `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress` (from `user.mail`) and the name as `http://schemas.microsoft.com/identity/claims/displayname`, which SuperBot reads without settings.
 5. **SAML Certificates**: **Signing Option** Sign SAML assertion (or Sign SAML response and assertion), **Signing Algorithm** SHA-256. Leave **Token encryption** off.
@@ -116,8 +121,30 @@ People disabled in SuperBot, by an admin or by SCIM deprovisioning ([SCIM](scim.
 | `SSO_<ID>_ALLOWED_DOMAINS` | | Only these email domains, comma separated (exact; list subdomains on their own). |
 | `SSO_<ID>_JIT_ROLE` | `off` | `readonly`, `member` or `admin`: create a user at first sign-in. Needs `ALLOWED_DOMAINS`. |
 | `SSO_<ID>_LABEL` | `Company SSO` | Button text: "Sign in with …". |
+| `SSO_<ID>_SIGN_REQUESTS` | `false` | `true`: sign AuthnRequests with the SP key ([below](#signed-authnrequests)). |
+| `SSO_<ID>_SP_CERT_FILE` | | Your own SP certificate (PEM), with its key as `SSO_<ID>_PRIVATE_KEY`. Without it, botd makes and keeps one. |
+| `SSO_<ID>_PRIVATE_KEY` | | With `SP_CERT_FILE`: the SP's private key (PKCS #8 PEM), as env, `_FILE`, or `botctl secret set`. |
 
 The bridge's settings (`CLIENT_ID`, `IDP_ALIAS`, `SCOPES`, `*_CLAIM`) are refused on a native provider, and the native ones on a bridge provider, so a provider is never half of each. There is no client secret.
+
+## The SP key
+
+Each native provider has a signing key and certificate of its own ([ADR 0137](../adr/0137-saml-signed-requests-and-single-logout.md)). botd makes them the first time they're needed (RSA-3072, the certificate valid for 20 years), keeps the key sealed in its database, audits `sso.saml_sp_key_created`, and publishes the certificate and the SLO URL in the SP metadata. `botctl sso saml corp` shows its SHA-256. To use your own, set `SSO_CORP_SP_CERT_FILE=/etc/superbot/corp-sp.pem` and the key as `SSO_CORP_PRIVATE_KEY` (`botctl secret set SSO_CORP_PRIVATE_KEY < corp-sp.key`); the provider isn't offered until the key is set and matches the certificate. botd reads it once, so restart botd after changing it.
+
+If your IdP imported SuperBot's metadata before this key existed, import it again (or add the certificate and the SLO URL by hand) before turning on signed requests or single logout.
+
+## Signed AuthnRequests
+
+Most IdPs don't need them. If yours says it wants signed requests (`WantAuthnRequestsSigned="true"` in its metadata, which botd refuses otherwise), set `SSO_CORP_SIGN_REQUESTS=true` and restart: every AuthnRequest is then signed with RSA-SHA256 over the redirect URL, and the metadata says so. At the IdP, import SuperBot's metadata again or upload the SP certificate (Entra ID: **SAML Certificates → Verification certificates**, with **Require verification certificates** on; Okta: **Signature Certificate** under **Show Advanced Settings**).
+
+## Single logout
+
+When the IdP's metadata has an HTTP-Redirect `SingleLogoutService` on https, botd does single logout over the browser:
+
+- **Signing out of SuperBot** ends the SuperBot session, then takes the browser to the IdP with a signed LogoutRequest, which ends the IdP session too and comes back to the sign-in page. Only browser sessions do this; the phone app and `botctl` end their own session only.
+- **Signing out at the IdP** (or the IdP ending the session) sends SuperBot a signed LogoutRequest at the SLO URL. botd revokes the SuperBot sessions that IdP session made (or all of that person's sessions from this IdP if it names none), audits `auth.slo` with the sessions revoked, and answers with a signed LogoutResponse.
+
+At the IdP, set the **logout URL** (single logout URL, SLO endpoint) to the SLO URL `botctl` shows, HTTP-Redirect or HTTP-POST, and give it the SP certificate to check our requests (Okta: **Enable Single Logout** and upload the **Signature Certificate**; Entra ID: **Logout Url (Optional)** under **Basic SAML Configuration**). Then refresh or import the IdP's metadata so botd sees its logout URL; `botctl sso saml corp` says `Single logout: yes`. Back-channel (SOAP) logout isn't supported.
 
 ## Require MFA at the IdP
 
@@ -144,3 +171,17 @@ Every refused sign-in is in the audit log with a reason (`botctl audit --action 
 | `email_unverified`, `wrong_domain` | No email attribute was sent, or it isn't in `ALLOWED_DOMAINS`. Set `SSO_<ID>_EMAIL_ATTRIBUTE` if the IdP uses another name. |
 | `idp_error` | The IdP said no (`idpStatus` has its status code), for example someone not assigned to the app. |
 | `user_disabled` | The person is disabled in SuperBot. |
+
+Refused logout messages are audited as `auth.slo_failed` (`botctl audit --action auth.slo_failed`), and the browser sees a short error. Those before the signature check are throttled the same way.
+
+| Reason | Fix |
+|--------|-----|
+| `unsigned`, `bad_signature` | The IdP must sign logout messages with a certificate in its metadata: refresh or import it. |
+| `wrong_issuer` | The message came from another entity than `SSO_<ID>_IDP_ENTITY_ID`. |
+| `wrong_destination` | The IdP's logout URL for SuperBot isn't the SLO URL botctl shows, or it sends no `Destination`. |
+| `expired`, `not_yet_valid` | The message is older than five minutes, or clocks differ by more than two: fix NTP. |
+| `replayed` | The same message arrived twice. |
+| `unknown_request` | A LogoutResponse to a request botd didn't send, or sent over 10 minutes ago. |
+| `encrypted_id` | Turn off NameID encryption for SuperBot at the IdP. |
+| `no_slo` | The IdP's metadata in use has no HTTP-Redirect `SingleLogoutService` on https. |
+| `bad_message` | Not a SAML logout message botd can read. |
