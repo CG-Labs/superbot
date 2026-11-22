@@ -59,10 +59,11 @@ you send it: every file is plain text.
                       and the newest failures and denials (no names, emails or addresses)
   manifest.json       what is in this bundle and how much was redacted
 
-Never in it: secret values, chats, prompts, tool inputs, files, names, emails or IP
-addresses. A secret-named setting shows as [redacted]; URLs keep only their scheme,
-host and port. If you find anything you would rather not send, delete it and say so
-in the ticket.
+Never in it: secret values, chats, prompts, tool inputs, files, emails, IP addresses,
+or the licensee's name. A secret-named setting shows as [redacted], an email as [email],
+an IP address as [ip] (loopback and 0.0.0.0 stay), the licensee as [name]; URLs keep
+only their scheme, host and port. If you find anything you would rather not send,
+delete it and say so in the ticket.
 ";
 
 // Redaction
@@ -95,7 +96,7 @@ pub fn scrub_text(s: &str) -> String {
     let s = audit::redact_text(s);
     let s = origins_only(&s);
     let s = redact::text(&s).into_owned();
-    mask_emails(&s)
+    mask_ips(&mask_emails(&s))
 }
 
 /// A generated-looking value (an API key, a password from a generator): long, one word
@@ -151,14 +152,71 @@ pub fn mask_emails(s: &str) -> String {
     out
 }
 
-/// Every string in `v` through [`scrub_text`]. Keys are botd's own and stay.
-fn scrub_value(v: Value) -> Value {
+/// IP addresses become `[ip]`, a port after an IPv4 address stays. Loopback and unspecified
+/// addresses (`127.0.0.1`, `0.0.0.0`, `::1`) say nothing about a network and stay too.
+pub fn mask_ips(s: &str) -> String {
+    let b = s.as_bytes();
+    let part = |c: u8| c.is_ascii_hexdigit() || c == b'.' || c == b':';
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let (mut out, mut copied, mut i) = (String::with_capacity(s.len()), 0, 0);
+    while i < b.len() {
+        if !part(b[i]) {
+            i += 1;
+            continue;
+        }
+        let end = i + b[i..].iter().take_while(|&&c| part(c)).count();
+        let inside_word = (i > 0 && word(b[i - 1])) || b.get(end).is_some_and(|&c| word(c));
+        let run = s[i..end].trim_end_matches(['.', ':']);
+        let ip = run.parse::<std::net::IpAddr>().ok().map(|ip| (ip, run.len())).or_else(|| {
+            let (v4, _) = run.split_once(':')?;
+            v4.parse::<std::net::Ipv4Addr>().ok().map(|ip| (ip.into(), v4.len()))
+        });
+        if let (false, Some((ip, len))) = (inside_word, ip)
+            && !ip.is_loopback()
+            && !ip.is_unspecified()
+        {
+            out.push_str(&s[copied..i]);
+            out.push_str("[ip]");
+            copied = i + len;
+        }
+        i = end;
+    }
+    out.push_str(&s[copied..]);
+    out
+}
+
+/// Every string in `v` through [`scrub_text`] and [`hide`]. Keys are botd's own and stay.
+fn scrub_value(v: Value, names: &[String]) -> Value {
     match v {
-        Value::String(s) => Value::String(scrub_text(&s)),
-        Value::Array(a) => Value::Array(a.into_iter().map(scrub_value).collect()),
-        Value::Object(o) => Value::Object(o.into_iter().map(|(k, v)| (k, scrub_value(v))).collect()),
+        Value::String(s) => Value::String(hide(&scrub_text(&s), names)),
+        Value::Array(a) => Value::Array(a.into_iter().map(|v| scrub_value(v, names)).collect()),
+        Value::Object(o) => Value::Object(o.into_iter().map(|(k, v)| (k, scrub_value(v, names))).collect()),
         other => other,
     }
+}
+
+/// `names` (the licensee) become `[name]`, in any ASCII case.
+pub fn hide(s: &str, names: &[String]) -> String {
+    let mut out = s.to_string();
+    for n in names {
+        let (lower, needle) = (out.to_ascii_lowercase(), n.to_ascii_lowercase());
+        let mut next = String::with_capacity(out.len());
+        let mut at = 0;
+        for (i, _) in lower.match_indices(&needle) {
+            next.push_str(&out[at..i]);
+            next.push_str("[name]");
+            at = i + needle.len();
+        }
+        next.push_str(&out[at..]);
+        out = next;
+    }
+    out
+}
+
+/// What the bundle hides by name: the licensee, which the license, the setup checklist and
+/// the settings botd started with all repeat.
+fn names(app: &App) -> Vec<String> {
+    app.license.status().claims.map(|c| c.sub.trim().to_string()).filter(|n| n.len() >= 2).into_iter().collect()
 }
 
 /// The environment as the bundle shows it, sorted, and the names whose values were changed.
@@ -329,21 +387,21 @@ fn audit_summary(app: &App, now_ms: i64) -> (Value, usize) {
 }
 
 /// The newest log lines, each scrubbed field by field so it stays one JSON object.
-fn logs() -> (String, usize) {
+fn logs(names: &[String]) -> (String, usize) {
     let lines = crate::obs::log::recent::lines();
     let n = lines.len();
     let mut out = String::new();
     for l in lines {
         let v = serde_json::from_str::<Value>(&l).unwrap_or_else(|_| json!({ "msg": l }));
-        out.push_str(&redact::value(scrub_value(v)).to_string());
+        out.push_str(&redact::value(scrub_value(v, names)).to_string());
         out.push('\n');
     }
     (out, n)
 }
 
 /// JSON, pretty, with every string through botd's redaction once more.
-fn json_file(v: Value) -> Vec<u8> {
-    let v = redact::value(scrub_value(v));
+fn json_file(v: Value, names: &[String]) -> Vec<u8> {
+    let v = redact::value(scrub_value(v, names));
     let mut s = serde_json::to_string_pretty(&v).unwrap_or_default();
     s.push('\n');
     redact::text(&s).into_owned().into_bytes()
@@ -365,14 +423,15 @@ pub fn build(app: &App, vars: &[(String, String)], setup: Value, now_ms: i64) ->
     let started = last_start(app);
     let (config, redacted_settings) = config(app, vars, started.as_ref());
     let (audit, audit_events) = audit_summary(app, now_ms);
-    let (logs, log_lines) = logs();
+    let names = names(app);
+    let (logs, log_lines) = logs(&names);
     let mut files: Vec<(&str, Vec<u8>)> = vec![
         ("README.txt", README.as_bytes().to_vec()),
-        ("version.json", json_file(version(app, started.as_ref(), now_ms))),
-        ("config.json", json_file(config)),
-        ("health.json", json_file(health(app, setup, now_ms))),
+        ("version.json", json_file(version(app, started.as_ref(), now_ms), &names)),
+        ("config.json", json_file(config, &names)),
+        ("health.json", json_file(health(app, setup, now_ms), &names)),
         ("logs.jsonl", redact::text(&logs).into_owned().into_bytes()),
-        ("audit-summary.json", json_file(audit)),
+        ("audit-summary.json", json_file(audit, &names)),
     ];
     let listed: Vec<(String, usize)> = files.iter().map(|(n, b)| (n.to_string(), b.len())).collect();
     let manifest = json!({
@@ -384,7 +443,7 @@ pub fn build(app: &App, vars: &[(String, String)], setup: Value, now_ms: i64) ->
         "logLines": log_lines,
         "auditEvents": audit_events,
     });
-    files.push(("manifest.json", json_file(manifest)));
+    files.push(("manifest.json", json_file(manifest, &names)));
     let entries: Vec<(String, Vec<u8>)> = files.into_iter().map(|(n, b)| (format!("{name}/{n}"), b)).collect();
     let files = entries.iter().map(|(n, b)| (n.clone(), b.len())).collect();
     Bundle { tar: tar(&entries, (now_ms / 1000).max(0) as u64), name, files, redacted_settings, log_lines, audit_events }
@@ -516,7 +575,7 @@ pub(crate) mod tests {
         let secret = format!("plain-words-{}", crate::random_hex(6));
         redact::register(&secret);
         assert_eq!(shown("INNOCENT_NAME", &format!("before {secret} after")), "before [redacted] after");
-        assert_eq!(scrub_value(json!({ "deep": [{ "x": secret.clone() }] })), json!({ "deep": [{ "x": "[redacted]" }] }));
+        assert_eq!(scrub_value(json!({ "deep": [{ "x": secret.clone() }] }), &[]), json!({ "deep": [{ "x": "[redacted]" }] }));
         redact::forget(&secret);
     }
 
@@ -558,11 +617,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn ip_addresses_are_masked_and_nothing_else() {
+        assert_eq!(mask_ips("HOST=10.0.0.5, peer 203.0.113.9:8443."), "HOST=[ip], peer [ip]:8443.");
+        assert_eq!(mask_ips("[2001:db8::1]:443 or fe80::1%eth0 ::ffff:198.51.100.2"), "[[ip]]:443 or [ip]%eth0 [ip]");
+        assert_eq!(mask_ips("http://192.168.1.20:3000/x"), "http://[ip]:3000/x");
+        let kept = "0.0.0.0 127.0.0.1 [::1]:3000 :: at 18:22:54 on 2026-11-22T18:22:54Z, v0.5.0, 1.5s, superbot::support, deadbeef, cafe:beef, a1.2.3.4, 1.2.3.4b";
+        assert_eq!(mask_ips(kept), kept);
+        assert_eq!(scrub_text("from 198.51.100.7"), "from [ip]");
+        assert_eq!(setting("HOST", "10.1.2.3"), ("[ip]".into(), true));
+        assert_eq!(setting("HOST", "0.0.0.0"), ("0.0.0.0".into(), false));
+    }
+
+    #[test]
+    fn the_licensee_is_hidden_in_any_case() {
+        let names = vec!["Acme Ltd".to_string()];
+        assert_eq!(hide("Licensed to Acme Ltd; ACME LTD; acme ltd.", &names), "Licensed to [name]; [name]; [name].");
+        assert_eq!(hide("Acme é Ltd", &names), "Acme é Ltd");
+        assert_eq!(scrub_value(json!({ "a": ["for Acme Ltd"] }), &names), json!({ "a": ["for [name]"] }));
+    }
+
+    #[test]
     fn log_lines_stay_json_whatever_they_say() {
         let marker = crate::random_hex(6);
         crate::obs::log::line(crate::obs::log::Level::Info, &format!("Stored secrets: none ({marker}). token=abc123 \"quoted\""));
         crate::obs::log::line(crate::obs::log::Level::Warn, &format!("{marker}-long {}", "é".repeat(5_000)));
-        let (out, _) = logs();
+        let (out, _) = logs(&[]);
         let mine: Vec<Value> = out.lines().filter(|l| l.contains(&marker)).map(|l| serde_json::from_str(l).expect("each line is JSON")).collect();
         assert_eq!(mine.len(), 2, "{out}");
         assert_eq!(mine[0]["msg"], format!("Stored secrets: [redacted] ({marker}). token=[redacted] \"quoted\""));

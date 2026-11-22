@@ -42,6 +42,8 @@ Secret values, chats, prompts, tool inputs, files, names, emails or IP addresses
 - A value that looks like a credential is redacted wherever it is: a long random string, `Bearer x`, `token=x`, `user:password@` in a URL, a known key prefix (`sk-`, `ghp_`, `AKIA` and others), a private key, and any secret botd holds (the sealed store, sessions and tokens it issues).
 - URLs keep their scheme, host and port; paths and queries become `/[redacted]`, because some services put a secret there.
 - Emails become `[email]`. `OWNER_EMAIL` and `USER_NAME` are left out.
+- IP addresses become `[ip]`, except loopback and `0.0.0.0`, which say nothing about your network.
+- The licensee's name (the organisation on the license) becomes `[name]` wherever it shows.
 - The audit summary has actions, outcomes, times, sign-in methods, identity provider names and reasons; never who, from where, or what they wrote.
 
 If you find something you'd rather not send, delete it from the bundle and say so in the ticket. If you find a secret in it, don't send it, and tell `<security-email>`: that's a bug.

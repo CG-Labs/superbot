@@ -147,6 +147,32 @@ async fn no_secret_email_or_chat_reaches_the_bundle() {
     redact::forget(&secret);
 }
 
+/// The licensee is named by the license, the setup checklist and the start event; none of
+/// them, nor an IP address anywhere, reaches the bundle.
+#[tokio::test]
+async fn the_licensee_and_ip_addresses_stay_out() {
+    let (port, app, admin, _) = serve_app().await;
+    let mut c = crate::license::test_keys::claims(Some(25), 200);
+    c.sub = format!("Northwind Traders {}", random_hex(4));
+    let (code, body) = call(port, "PUT", "/api/license", &admin, &json!({ "key": crate::license::test_keys::mint(&c) }).to_string()).await;
+    assert_eq!(code, 200, "{body}");
+    log_warn!("WARNING: {} reached 203.0.113.9:443 and 2001:db8::7 from 127.0.0.1", c.sub.to_uppercase());
+
+    let (code, _, body) = fetch(port, &admin).await;
+    assert_eq!(code, 200);
+    let text = String::from_utf8_lossy(&body);
+    for v in [c.sub.as_str(), &c.sub.to_uppercase(), "Northwind", "203.0.113.9", "2001:db8::7"] {
+        assert!(!text.contains(v), "{v} is in the bundle");
+    }
+    let f = files(&body);
+    let license = &parse(file(&f, "health.json"))["license"];
+    assert_eq!(license["summary"]["licensee"], "[name]", "{license}");
+    assert!(license["detail"].as_str().unwrap().starts_with("Licensed to [name] (business"), "{license}");
+    let line = file(&f, "logs.jsonl").lines().find(|l| l.contains("reached [ip]")).expect("the warning is logged");
+    assert!(line.contains("[name] reached [ip]:443 and [ip] from 127.0.0.1"), "{line}");
+    assert_eq!(app.license.status().claims.map(|c| c.sub), Some(c.sub.clone()), "only the bundle hides it");
+}
+
 /// The environment, as `build` gets it: secrets by name and by shape, and secrets botd
 /// knows, wherever they are, never reach any file.
 #[tokio::test]
