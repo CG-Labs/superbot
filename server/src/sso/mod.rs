@@ -357,6 +357,7 @@ fn parse_provider(id: &str, var: &Var, list: &List) -> Result<Provider, String> 
             if !secure_url(&authority) {
                 return Err(format!("{} must be an https URL", key("AUTHORITY")));
             }
+            // Always pinned to a tenant id or ALLOWED_TENANTS: that list is what just in time needs here.
             let tenant = var(&key("TENANT")).ok_or_else(|| format!("{} is required: your directory (tenant) id, or organizations with {}", key("TENANT"), key("ALLOWED_TENANTS")))?;
             let mut allowed = Vec::new();
             for t in list(&key("ALLOWED_TENANTS")) {
@@ -395,7 +396,11 @@ fn parse_provider(id: &str, var: &Var, list: &List) -> Result<Provider, String> 
             if !secure_url(&issuer) {
                 return Err(format!("{} must be an https URL", key("ISSUER")));
             }
-            (Kind::Oidc { issuer, map: claim_map("sub")?, allowed_domains: domains("ALLOWED_DOMAINS")? }, id)
+            let allowed_domains = domains("ALLOWED_DOMAINS")?;
+            if jit_role.is_some() && allowed_domains.is_empty() {
+                return Err(format!("{} without {} would let anyone the {id} IdP signs in get an account: list your email domains, or link people instead", key("JIT_ROLE"), key("ALLOWED_DOMAINS")));
+            }
+            (Kind::Oidc { issuer, map: claim_map("sub")?, allowed_domains }, id)
         }
         "saml" => {
             let issuer = var(&key("ISSUER")).ok_or_else(|| format!("{} is required: the OIDC issuer of the broker that speaks SAML to your IdP, like https://sso.example.com/realms/superbot", key("ISSUER")))?;
@@ -410,7 +415,11 @@ fn parse_provider(id: &str, var: &Var, list: &List) -> Result<Provider, String> 
             if map.subject == saml::IDP_CLAIM {
                 return Err(format!("{}={}: that claim names the IdP, not the person", key("SUBJECT_CLAIM"), map.subject));
             }
-            (Kind::Saml { issuer, entity_id, alias, map, allowed_domains: domains("ALLOWED_DOMAINS")? }, saml::LABEL)
+            let allowed_domains = domains("ALLOWED_DOMAINS")?;
+            if jit_role.is_some() && allowed_domains.is_empty() {
+                return Err(format!("{} without {} would let anyone SAML IdP {entity_id} signs in get an account: list your email domains, or link people instead", key("JIT_ROLE"), key("ALLOWED_DOMAINS")));
+            }
+            (Kind::Saml { issuer, entity_id, alias, map, allowed_domains }, saml::LABEL)
         }
         "apple" => {
             let issuer = var(&key("ISSUER")).unwrap_or_else(|| apple::ISSUER.into()).trim_end_matches('/').to_string();
@@ -1138,7 +1147,42 @@ mod tests {
         assert_eq!((p.label.as_str(), p.jit_role), ("Contoso", Some(Role::Member)));
         assert!(matches!(&p.kind, Kind::Saml { map, allowed_domains, .. } if map.subject == "saml_nameid" && allowed_domains == &["example.com"]));
         assert!(p.audience().starts_with("verified emails at example.com from SAML IdP"));
-        assert!(saml(&[("SSO_ADFS_JIT_ROLE", "member")]).is_ok(), "your own IdP: just in time needs no domain list, like oidc");
+    }
+
+    /// SOC 2 CC6.2-1: no provider makes accounts just in time without a list of who may have one.
+    #[test]
+    fn every_type_refuses_just_in_time_without_an_allow_list() {
+        let okta = [("SSO_PROVIDERS", "okta"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_OKTA_TYPE", "oidc"), ("SSO_OKTA_ISSUER", "https://acme.okta.example"), ("SSO_OKTA_CLIENT_ID", "c1")];
+        let oidc = |extra: &[(&'static str, &'static str)]| with_base(&okta, extra);
+        type Case = (&'static str, fn(&[(&'static str, &'static str)]) -> Result<Sso, String>, Vec<(&'static str, &'static str)>, &'static str, Vec<(&'static str, &'static str)>);
+        let cases: [Case; 5] = [
+            ("google", google, vec![("SSO_GOOGLE_JIT_ROLE", "member")], "SSO_GOOGLE_HOSTED_DOMAINS", vec![("SSO_GOOGLE_HOSTED_DOMAINS", "example.com")]),
+            ("apple", apple, vec![("SSO_APPLE_JIT_ROLE", "member")], "SSO_APPLE_ALLOWED_DOMAINS", vec![("SSO_APPLE_ALLOWED_DOMAINS", "example.com")]),
+            ("github", github, vec![("SSO_GITHUB_JIT_ROLE", "member")], "SSO_GITHUB_ALLOWED_ORGS", vec![("SSO_GITHUB_ALLOWED_ORGS", "acme")]),
+            ("saml", saml, vec![("SSO_ADFS_JIT_ROLE", "member")], "SSO_ADFS_ALLOWED_DOMAINS", vec![("SSO_ADFS_ALLOWED_DOMAINS", "example.com")]),
+            ("entra organizations", entra, vec![("SSO_ENTRA_JIT_ROLE", "member"), ("SSO_ENTRA_TENANT", "organizations")], "SSO_ENTRA_ALLOWED_TENANTS", vec![("SSO_ENTRA_ALLOWED_TENANTS", "22222222-2222-2222-2222-222222222222")]),
+        ];
+        for (name, build, jit, key, allow) in cases {
+            let err = build(&jit).err().unwrap_or_else(|| panic!("{name}: just in time with no allow-list was accepted"));
+            assert!(err.contains(key), "{name}: the error names {key}: {err}");
+            let ok = build(&[jit.as_slice(), allow.as_slice()].concat()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(ok.providers[0].jit_role, Some(Role::Member), "{name}");
+        }
+        let err = oidc(&[("SSO_OKTA_JIT_ROLE", "member")]).err().expect("oidc: just in time with no allow-list was accepted");
+        assert!(err.contains("SSO_OKTA_JIT_ROLE") && err.contains("SSO_OKTA_ALLOWED_DOMAINS") && err.contains("okta"), "{err}");
+        let ok = oidc(&[("SSO_OKTA_JIT_ROLE", "admin"), ("SSO_OKTA_ALLOWED_DOMAINS", "example.com")]).unwrap();
+        assert_eq!((ok.providers[0].jit_role, ok.providers[0].audience()), (Some(Role::Admin), "verified emails at example.com".to_string()));
+        let err = saml(&[("SSO_ADFS_JIT_ROLE", "readonly")]).err().expect("saml: just in time with no allow-list was accepted");
+        assert!(err.contains("SSO_ADFS_JIT_ROLE") && err.contains(ADFS), "the error names the SAML IdP: {err}");
+
+        // Entra pinned to one tenant: the tenant is the allow-list.
+        let pinned = entra(&[("SSO_ENTRA_JIT_ROLE", "member")]).unwrap();
+        assert_eq!((pinned.providers[0].jit_role, pinned.providers[0].audience()), (Some(Role::Member), format!("tenant {T1}")));
+        assert!(entra(&[("SSO_ENTRA_JIT_ROLE", "member"), ("SSO_ENTRA_TENANT", "common")]).is_err());
+
+        // Without just in time, an admin links each person, so no list is needed.
+        assert!(oidc(&[]).is_ok() && saml(&[]).is_ok() && google(&[]).is_ok() && github(&[]).is_ok() && apple(&[]).is_ok());
+        assert!(oidc(&[("SSO_OKTA_JIT_ROLE", "off")]).is_ok() && saml(&[("SSO_ADFS_JIT_ROLE", "off")]).is_ok());
     }
 
     #[test]
