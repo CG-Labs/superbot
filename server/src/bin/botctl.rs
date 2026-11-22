@@ -137,11 +137,13 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
              --idp <entra|google|oidc|github|apple|saml> --idp-provider <id> --subject <issuer|sub>
              --session <id> --on-behalf-of <user id|email> --outcome <success|failure|denied> --bot <id>
     times: YYYY-MM-DD (UTC), RFC 3339, or unix milliseconds
-  botctl retention                                 How long chat history and the audit log are kept
-                                                   (CHAT_RETENTION_DAYS, AUDIT_RETENTION_DAYS), the last
-                                                   deletion pass, and held Bots
-  botctl retention hold <bot> "<reason>"           Keep a Bot's chat out of retention (a legal hold);
-                                                   it can't be deleted while held
+  botctl retention                                 How long chat history, harness session files,
+                                                   teammates' archived work and the audit log are kept
+                                                   (CHAT_RETENTION_DAYS, HARNESS_SESSION_RETENTION_DAYS,
+                                                   TEAMMATE_FILES_RETENTION_DAYS, AUDIT_RETENTION_DAYS),
+                                                   each last deletion pass, and held Bots
+  botctl retention hold <bot> "<reason>"           Keep a Bot's chat and files out of retention (a legal
+                                                   hold); it can't be deleted while held
   botctl retention release <bot>                   Retention applies to its chat again
   botctl backups                                   Where server backups are copied off this host, the
                                                    newest copies, and the RPO (ADR 0109)

@@ -206,6 +206,12 @@ pub struct App {
     pub isolation: OnceLock<Arc<Isolation>>,
     /// Runs on each user's machine now, by user.
     on_machines: Mutex<HashMap<String, u32>>,
+    /// Per Bot: a run holds it shared while it runs, and the retention pass alone while it
+    /// deletes harness session files, so it never deletes from under a run (ADR 0112).
+    session_files: Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>,
+    /// Held by each deleting step of file retention, which reads holds after taking it,
+    /// and by placing a hold: a hold placed is kept by every step after (ADR 0112).
+    pub deleting_files: tokio::sync::Mutex<()>,
     /// Runs at once on each computer, and the runs waiting their turn (ADR 0073).
     pub slots: Arc<Slots>,
     /// MAX_CONCURRENT_RUNS: runs at once on this server, and on a machine whose owner's
@@ -270,6 +276,8 @@ impl App {
             tiers: OnceLock::new(),
             isolation: OnceLock::new(),
             on_machines: Mutex::default(),
+            session_files: Mutex::default(),
+            deleting_files: tokio::sync::Mutex::default(),
             slots: Arc::default(),
             run_cap: OnceLock::new(),
             shared_bots: OnceLock::new(),
@@ -436,6 +444,20 @@ impl App {
     /// Runs of `owner_id`'s Bots on their machine now, theirs and teammates'.
     pub fn runs_on_machine(&self, owner_id: &str) -> u32 {
         self.on_machines.lock().unwrap_or_else(|e| e.into_inner()).get(owner_id).copied().unwrap_or(0)
+    }
+
+    fn session_files_lock(&self, bot_id: &str) -> Arc<tokio::sync::RwLock<()>> {
+        self.session_files.lock().unwrap_or_else(|e| e.into_inner()).entry(bot_id.to_string()).or_default().clone()
+    }
+
+    /// Keeps the retention pass off the Bot's session files while the guard lives.
+    pub async fn using_session_files(&self, bot_id: &str) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.session_files_lock(bot_id).read_owned().await
+    }
+
+    /// Keeps runs of the Bot from starting while the guard lives. None: one is running.
+    pub fn sweeping_session_files(&self, bot_id: &str) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        self.session_files_lock(bot_id).try_write_owned().ok()
     }
 
     pub fn is_running(&self, bot_id: &str) -> bool {
@@ -992,6 +1014,12 @@ impl App {
             spot.env.extend(env);
             spot.screens = true;
         }
+        // Held until the run ends: the retention pass may have deleted the session meanwhile.
+        let _session_files = self.using_session_files(&bot.id).await;
+        if for_other.is_none() {
+            bot.session_id = self.db.bot(&bot.id).and_then(|b| b.session_id);
+        }
+        let keep_sessions_days = crate::file_retention::keep_sessions_days(self, &bot, spot.machine.is_some(), run_as.is_some());
         self.init_bot_files(&bot);
         self.db.set_status(msg.id, "running");
         let started = Instant::now();
@@ -1136,6 +1164,7 @@ impl App {
                 guard: guard.clone(),
                 run_as: run_as.clone(),
                 sandbox,
+                keep_sessions_days,
             };
 
             let mut errors: Vec<String> = Vec::new();
