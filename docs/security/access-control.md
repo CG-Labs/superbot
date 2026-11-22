@@ -7,7 +7,7 @@ How people and Bots sign in, what each may do, how one user is kept from another
 | Method | How it works |
 |--------|--------------|
 | **Sessions** | An opaque 256-bit token, stored only as a SHA-256 hash. Sent as a cookie (`__Host-superbot_session`: HttpOnly, Secure, SameSite=Strict) or a bearer token from the apps. Ends after 7 days idle or 30 days at most, and on sign-out, "sign out everywhere", or the user being disabled ([ADR 0012](../adr/0012-users-sessions-rbac.md), [ADR 0024](../adr/0024-auth-review-hardening.md)). |
-| **SSO (OpenID Connect)** | Microsoft Entra ID, Google, any OIDC provider (Okta, Auth0, Keycloak, ...), Sign in with Apple, and GitHub. Several at once; optional allowed email domains; just-in-time accounts ([ADR 0014](../adr/0014-oidc-sso-entra.md), [ADR 0016](../adr/0016-sso-multi-provider.md), [ADR 0018](../adr/0018-sso-github-apple.md)). Entra emails count only when the tenant verified the domain ([auth review, AUTH-03](auth-review-2026-11.md)). |
+| **SSO (OpenID Connect)** | Microsoft Entra ID, Google, any OIDC provider (Okta, Auth0, Keycloak, ...), Sign in with Apple, and GitHub. Several at once; optional allowed email domains; just-in-time accounts, only with an allow-list for the provider (domains, GitHub organizations or Entra tenants, [ADR 0103](../adr/0103-sso-jit-needs-an-allow-list.md)) ([ADR 0014](../adr/0014-oidc-sso-entra.md), [ADR 0016](../adr/0016-sso-multi-provider.md), [ADR 0018](../adr/0018-sso-github-apple.md)). Entra emails count only when the tenant verified the domain ([auth review, AUTH-03](auth-review-2026-11.md)). |
 | **SAML** | Through an OIDC broker (Keycloak) that checks the IdP's signed assertion. botd never parses SAML itself and accepts only logins brokered by the named IdP ([ADR 0020](../adr/0020-saml-bridge.md)). |
 | **One-time sign-in codes** | An admin issues a code for a person; it expires (default 60 minutes). |
 | **Break-glass password** | `AUTH_PASSWORD`, for the owner account, for setup and recovery. Constant-time compare and rate-limited. |
@@ -59,6 +59,7 @@ Tested in CI on real hosts: no Bot reaches another user's folder or logins, or b
 - Each event names its actor (user, Bot or system) with email, role, sign-in method, IdP, session, and who a Bot acted for ([ADR 0019](../adr/0019-audit-actors.md)).
 - Append-only: database triggers refuse updates, and deletes except retention pruning. This guards against mistakes and API misuse, not someone with write access to the database file. Kept forever unless `AUDIT_RETENTION_DAYS` is set.
 - Admins view and filter it in the apps and export CSV ([ADR 0028](../adr/0028-client-admin-console-link-and-audit.md), [ADR 0060](../adr/0060-client-audit-detail-and-filters.md)).
+- **Access reviews**: admins see one report of everyone's role, status, team, SCIM tenant, second factor, last sign-in, Bot access, sessions and API tokens (never the tokens), and machine, export it as dated CSV, and sign it off; the sign-off is an `access_review.completed` event ([ADR 0099](../adr/0099-access-review-report.md)).
 - **Planned:** tamper evidence (hash chain, write-once storage, shipping events off the server) (M5, [ADR 0009](../adr/0009-audit-events.md)).
 
 ## Licence key (self-host)

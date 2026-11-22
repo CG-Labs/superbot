@@ -157,7 +157,7 @@ Restart botd. The log says `SSO: adfs (Acme, saml), ready; anyone SAML IdP http:
 | `SSO_<ID>_SUBJECT_CLAIM` | `identity_provider_identity` | The claim with the IdP's id for the person. Mutable claims (`email`, `preferred_username`, …) are refused. |
 | `SSO_<ID>_EMAIL_CLAIM` | `email` | The claim with the email. It counts only when `email_verified` is true. |
 | `SSO_<ID>_NAME_CLAIM` | `name` | The claim with the display name. |
-| `SSO_<ID>_JIT_ROLE` | `off` | `readonly`, `member`, or `admin`: create a user the first time someone signs in. |
+| `SSO_<ID>_JIT_ROLE` | `off` | `readonly`, `member`, or `admin`: create a user the first time someone signs in. Needs `SSO_<ID>_ALLOWED_DOMAINS` (and so **Trust Email**): botd won't start without it ([ADR 0103](../adr/0103-sso-jit-needs-an-allow-list.md)). |
 
 `SSO_PUBLIC_URL` and `SSO_APP_REDIRECTS` are shared by all providers; see [the Entra guide](entra.md#all-settings). Settings of other types (`TENANT`, `ALLOWED_ORGS`, …) on a `saml` provider are refused, and `IDP_ALIAS` or `IDP_ENTITY_ID` on other types are too.
 
@@ -176,7 +176,7 @@ Admins can also link it in the app: **Users**, pick the person, then **Single si
 
 SAML subjects are compared without case: Keycloak lowercases the NameID before passing it on, and SuperBot lowercases what you link.
 
-**Or just in time.** With `SSO_ADFS_JIT_ROLE=member`, anyone your IdP lets into the SuperBot app becomes a member. Limit who that is at the IdP (ADFS: the relying party's access control policy; Okta: app assignments), and to be sure, with `SSO_ADFS_ALLOWED_DOMAINS`. If someone's email already belongs to another SuperBot user, sign-in is refused until an admin links them.
+**Or just in time** (your domains only). With `SSO_ADFS_ALLOWED_DOMAINS=example.com` and `SSO_ADFS_JIT_ROLE=member`, anyone your IdP lets into the SuperBot app with a verified `@example.com` email becomes a member. `JIT_ROLE` without `ALLOWED_DOMAINS` is refused at startup ([ADR 0103](../adr/0103-sso-jit-needs-an-allow-list.md)). Also limit who can use the app at the IdP (ADFS: the relying party's access control policy; Okta: app assignments). If someone's email already belongs to another SuperBot user, sign-in is refused until an admin links them.
 
 One person can sign in with several providers (SAML, Entra, Google, …) as one user: link each identity to the same user.
 

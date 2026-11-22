@@ -1,0 +1,29 @@
+# Grype settings for the image scan in .github/workflows/docker.yml (docs/adr/0101-image-scanning-and-signing.md).
+# CI fails on a Critical vulnerability that has a fix. One we can't fix yet (a fix that has
+# to come from upstream, such as Caddy's own binary) is accepted here, one entry per finding,
+# with why and who owns it, and removed when the fix lands:
+#
+#   - vulnerability: CVE-YYYY-NNNNN
+#     package:
+#       name: zlib
+#     reason: "Caddy's base image ships it; fixed when caddy:2 is rebuilt. Owner: engineering lead."
+ignore:
+  # Debian's age (backup encryption, deploy/superbot-backup.sh) is built with Go 1.24.4, and
+  # Debian hasn't rebuilt it. age only encrypts and decrypts local files, so none of these Go
+  # standard library flaws is reachable from it. Remove when Debian ships a rebuilt age.
+  # Owner: engineering lead.
+  - vulnerability: GO-2026-4337
+    package:
+      name: stdlib
+      location: "/usr/bin/age*"
+    reason: "crypto/tls session resumption; age makes no TLS connections"
+  - vulnerability: GO-2026-6612
+    package:
+      name: stdlib
+      location: "/usr/bin/age*"
+    reason: "HTTP/2 server flow control; age runs no HTTP server"
+  - vulnerability: GO-2026-6604
+    package:
+      name: stdlib
+      location: "/usr/bin/age*"
+    reason: "os.Root junctions, Windows only; the image is Linux"

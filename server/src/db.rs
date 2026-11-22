@@ -81,7 +81,7 @@ pub struct RetentionHold {
     pub held_at: i64,
 }
 
-/// What erasing a user removed or changed (ADR 0100), counted for its audit event.
+/// What erasing a user removed or changed (ADR 0102), counted for its audit event.
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Erased {
@@ -732,7 +732,7 @@ pub struct User {
     pub last_login_idp_provider: Option<String>,
     /// The tier an admin (later, billing) gave them. None: the default tier (ADR 0033).
     pub tier: Option<String>,
-    /// When they were erased (ADR 0100): the row is a tombstone with no personal data.
+    /// When they were erased (ADR 0102): the row is a tombstone with no personal data.
     pub erased_at: Option<i64>,
     /// The pseudonym the audit log names them by since.
     pub erased_as: Option<String>,
@@ -1684,7 +1684,7 @@ const AUDIT_ERASING: &str = "audit_erasing";
 /// Settings key prefix for the Bots an unfinished erasure took on, by user id.
 const ERASING_BOTS: &str = "erasing_bots:";
 
-/// Erasing a user (ADR 0100): the user row stays as a tombstone, with when, by whom and
+/// Erasing a user (ADR 0102): the user row stays as a tombstone, with when, by whom and
 /// as which pseudonym. The audit log stays append-only except that, inside an erasure's
 /// transaction (the `audit_erasing` setting names its pseudonym), an update may replace
 /// the erased person's id with that pseudonym and clear their name, email, subject,
@@ -4015,7 +4015,7 @@ impl Db {
     }
 
     /// By id, or by email (case-insensitive) when `key` has an `@`. Never an erased user's
-    /// tombstone (ADR 0100); `find_user_any` finds those too.
+    /// tombstone (ADR 0102); `find_user_any` finds those too.
     pub fn find_user(&self, key: &str) -> Option<User> {
         self.find_user_any(key).filter(|u| u.erased_at.is_none())
     }
@@ -4097,7 +4097,7 @@ impl Db {
         }
     }
 
-    // Erasure (ADR 0100).
+    // Erasure (ADR 0102).
 
     /// The held Bots that keep `user_id` from being erased: a Bot they own whose chat is
     /// held (ADR 0098), and a held Bot whose chat has messages they sent or one of their
@@ -4128,7 +4128,7 @@ impl Db {
         paying_subscription(&self.c(), user_id).ok().flatten()
     }
 
-    /// The Bots an erasure of `user_id` that didn't finish had taken on (ADR 0100).
+    /// The Bots an erasure of `user_id` that didn't finish had taken on (ADR 0102).
     pub fn erasing_bots(&self, user_id: &str) -> Vec<String> {
         self.setting(&format!("{ERASING_BOTS}{user_id}")).and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()
     }
@@ -4137,7 +4137,7 @@ impl Db {
         let _ = self.c().execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", params![format!("{ERASING_BOTS}{user_id}"), serde_json::to_string(bots).unwrap_or_default()]);
     }
 
-    /// Erases `user_id`'s personal data in one transaction (ADR 0100). Their Bots must be
+    /// Erases `user_id`'s personal data in one transaction (ADR 0102). Their Bots must be
     /// gone already; `bots` names them, so what they wrote in others' chats is erased too.
     /// The user row stays as a tombstone named `pseudonym`, and every audit event about
     /// them names them by it, without their name, email, subject, address or user agent.
@@ -5280,6 +5280,14 @@ impl Db {
         let _ = self.c().execute("UPDATE sessions SET last_seen_at = ?1 WHERE id = ?2 AND last_seen_at <= ?1 - 60000", params![at, id]);
     }
 
+    /// Every live session of one user, newest first, with no cap.
+    pub fn user_live_sessions(&self, user_id: &str, at: i64, idle_ms: i64, max_ms: i64) -> Vec<Session> {
+        let c = self.c();
+        let sql = format!("SELECT s.* FROM sessions s WHERE s.user_id = ?4 AND {SESSION_LIVE} ORDER BY s.created_at DESC, s.id");
+        let mut s = c.prepare(&sql).unwrap();
+        s.query_map(params![at, idle_ms, max_ms, user_id], session_row).unwrap().filter_map(Result::ok).collect()
+    }
+
     /// Live sessions, newest first, optionally for one user.
     pub fn live_sessions(&self, user_id: Option<&str>, at: i64, idle_ms: i64, max_ms: i64) -> Vec<Session> {
         let c = self.c();
@@ -5933,6 +5941,14 @@ impl Db {
     /// Writes one event. `details` is scrubbed of secrets; free text (names, the user
     /// agent) is masked the same way; everything is clipped.
     pub fn record(&self, e: &audit::Event) {
+        if let Err(err) = self.try_record(e) {
+            crate::obs::log::log_warn!("audit: could not record {}: {err}", e.action);
+        }
+    }
+
+    /// [`Db::record`] for when saving the event is the operation itself: returns the
+    /// new event's id, or the error.
+    pub fn try_record(&self, e: &audit::Event) -> rusqlite::Result<i64> {
         let o = |v: &Option<String>, max: usize| v.as_deref().map(|s| audit::clip(s, max));
         let a = &e.actor;
         let bot_actor = matches!(a.kind, audit::ActorKind::Bot).then_some(a.id.as_deref()).flatten();
@@ -5940,7 +5956,8 @@ impl Db {
         let owners: Vec<&str> = owners.iter().map(String::as_str).collect();
         let text = |v: &Option<String>, max: usize| v.as_deref().map(|s| audit::clip(&redact::text_for(&owners, &audit::redact_text(s)), max));
         let details = redact::value_for(&owners, audit::scrub(e.details.clone())).to_string();
-        let res = self.c().execute(
+        let c = self.c();
+        let res = c.execute(
             "INSERT INTO audit_events (at, actor_kind, actor_id, actor_name, actor_subject, action, target_type, target_id, bot_id, outcome, ip, user_agent, details,
                actor_email, actor_role, auth_method, idp, idp_provider, session_id, on_behalf_of)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -5967,10 +5984,10 @@ impl Db {
                 o(&a.on_behalf_of, 128),
             ],
         );
-        if let Err(err) = res {
-            crate::obs::log::log_warn!("audit: could not record {}: {err}", e.action);
-        }
+        let res = res.map(|_| c.last_insert_rowid());
+        drop(c);
         self.metrics().audited(&e.action, e.outcome.as_str(), e.details.get("reason").and_then(|r| r.as_str()));
+        res
     }
 
     /// Newest first (or oldest first with `oldest_first`), filtered, at most `limit`.

@@ -97,7 +97,7 @@ botctl user unlink ada@example.com <identity-id>                 # identity id f
 
 Unlinking stops new sign-ins; end current ones with `botctl session revoke-all ada@example.com`. Disabling a user (`botctl user disable`) does both.
 
-**Or just in time.** With `SSO_ENTRA_JIT_ROLE=member`, anyone in your tenant who can sign in to the app becomes a member on first sign-in. To limit who that is, in Entra open **Enterprise applications → SuperBot → Properties**, set **Assignment required** to **Yes**, and assign users or groups under **Users and groups**. If someone's email already belongs to another SuperBot user, sign-in is refused until an admin links them.
+**Or just in time.** With `SSO_ENTRA_JIT_ROLE=member`, anyone in your tenant who can sign in to the app becomes a member on first sign-in. The tenant is the allow-list: `SSO_ENTRA_TENANT` is always one tenant id, or `organizations`/`common` with the tenant ids in `SSO_ENTRA_ALLOWED_TENANTS`, so no domain list is needed ([ADR 0103](../adr/0103-sso-jit-needs-an-allow-list.md)). To limit who that is further, in Entra open **Enterprise applications → SuperBot → Properties**, set **Assignment required** to **Yes**, and assign users or groups under **Users and groups**. If someone's email already belongs to another SuperBot user, sign-in is refused until an admin links them.
 
 Once every admin can sign in with Microsoft, consider `AUTH_BREAK_GLASS=0` ([backend docs](../backend.md#users-sessions-and-roles)).
 

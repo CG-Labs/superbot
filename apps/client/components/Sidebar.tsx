@@ -22,6 +22,8 @@ interface Props {
   /** These three are shown to admins only; the server refuses the admin API and console to everyone else. */
   onOpenUsers?: () => void;
   onOpenAudit?: () => void;
+  /** Admins: who has access, to review and sign off (ADR 0099). */
+  onOpenAccessReview?: () => void;
   /** The server's admin console (ADR 0027), in a new tab or the system browser. */
   onOpenConsole?: () => void;
   /** Set while the server's setup wizard waits for an admin (ADR 0034); opens it in the console. */
@@ -29,7 +31,7 @@ interface Props {
   compact?: boolean;
 }
 
-export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOpenPlan, onOpenSecrets, onOpenTeam, onOpenSettings, onOpenUsers, onOpenAudit, onOpenConsole, onOpenSetup, compact }: Props) {
+export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOpenPlan, onOpenSecrets, onOpenTeam, onOpenSettings, onOpenUsers, onOpenAudit, onOpenAccessReview, onOpenConsole, onOpenSetup, compact }: Props) {
   const {
     bots,
     activeId,
@@ -160,6 +162,11 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOp
           {onOpenAudit ? (
             <Pressable style={styles.approvalsBtn} onPress={onOpenAudit} accessibilityRole="button">
               <Text style={styles.hiddenText}>Audit log</Text>
+            </Pressable>
+          ) : null}
+          {onOpenAccessReview ? (
+            <Pressable style={styles.approvalsBtn} onPress={onOpenAccessReview} accessibilityRole="button">
+              <Text style={styles.hiddenText}>Access review</Text>
             </Pressable>
           ) : null}
           {onOpenConsole ? (

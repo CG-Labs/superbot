@@ -1,4 +1,4 @@
-# 0100: Erasing a user's data
+# 0102: Erasing a user's data
 
 ## Status
 

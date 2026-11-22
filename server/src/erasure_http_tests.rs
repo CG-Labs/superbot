@@ -1,4 +1,4 @@
-//! Erasing a user (ADR 0100) on the real router: their personal data leaves the database,
+//! Erasing a user (ADR 0102) on the real router: their personal data leaves the database,
 //! the audit log keeps its events under a pseudonym, and a legal hold, the last owner of a
 //! team, or a machine still there refuses it. Admins only, and twice is once.
 

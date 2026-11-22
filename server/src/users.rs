@@ -484,7 +484,7 @@ pub async fn me(Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Call
 
 // Users (admin).
 
-/// The user `key` names. An erased one (ADR 0100) is gone (410) for everything but
+/// The user `key` names. An erased one (ADR 0102) is gone (410) for everything but
 /// reading their tombstone and erasing again.
 pub fn need_user_key(app: &AppState, key: &str) -> Res<User> {
     let u = app.db.find_user_any(key).ok_or_else(|| not_found("User"))?;

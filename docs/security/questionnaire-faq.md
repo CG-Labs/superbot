@@ -48,7 +48,7 @@ Server: daily backups by default (RPO 24 hours), RTO target 1 hour, drilled in C
 Sessions end after 7 days idle or 30 days. Backups are kept 14 days by default. The audit log and chat history are kept until a retention period is set for each; chat retention skips Bots an admin puts on a legal hold. See [retention](data-flows.md#retention).
 
 **Can a user's data be deleted?**
-Yes. Disabling someone (or an IdP's SCIM delete) ends their sessions at once and keeps their data. On request, an admin erases them: their Bots, chats, sign-ins, second factor and secrets are deleted, the audit log keeps its events under a random pseudonym, and the erasure is itself audited. It is refused while their chat is under a legal hold. Copies in backups go when the backups' retention ends ([ADR 0100](../adr/0100-erasing-a-users-data.md)). Teammates who leave have their OS users and homes removed from the owner's machine.
+Yes. Disabling someone (or an IdP's SCIM delete) ends their sessions at once and keeps their data. On request, an admin erases them: their Bots, chats, sign-ins, second factor and secrets are deleted, the audit log keeps its events under a random pseudonym, and the erasure is itself audited. It is refused while their chat is under a legal hold. Copies in backups go when the backups' retention ends ([ADR 0102](../adr/0102-erasing-a-users-data.md)). Teammates who leave have their OS users and homes removed from the owner's machine.
 
 **Has SuperBot been security tested?**
 An internal authentication and authorization review found no critical or high issues ([auth review](auth-review-2026-11.md), [SCIM review](auth-review-2026-11-scim.md)). An external penetration test is planned before M3 general availability ([roadmap](../ROADMAP.md)).
@@ -57,7 +57,7 @@ An internal authentication and authorization review found no critical or high is
 No. No SOC 2 audit has started. A [SOC 2 control mapping](soc2-control-mapping.md) shows, for each Security, Availability and Confidentiality criterion, what the product does, what the operator or customer must do, and the gaps. A [readiness checklist](soc2-readiness-checklist.md) tracks each gap with an owner, the evidence to collect and its status; a Type II audit is planned for M5 ([roadmap](../ROADMAP.md#compliance-path-not-promises)).
 
 **Do you scan dependencies for known vulnerabilities?**
-Yes, in CI: `cargo audit` and `npm audit` run on every lockfile change and weekly. Accepted findings are listed with reasons ([ADR 0092](../adr/0092-dependency-vulnerability-scanning.md)). Container images aren't scanned yet.
+Yes, in CI: `cargo audit` and `npm audit` run on every lockfile change and weekly. Accepted findings are listed with reasons ([ADR 0092](../adr/0092-dependency-vulnerability-scanning.md)). Every container image is scanned with Grype on each build and weekly; CI fails on a Critical vulnerability with a fix, and published images are signed with cosign and carry build provenance ([ADR 0101](../adr/0101-image-scanning-and-signing.md)).
 
 **Who is responsible for which controls?**
 It depends on who runs the server. When you self-host, you are the operator: hosting, physical security, backups off the host, alert channels and your own policies are yours. On the managed service, those are the provider's. Either way, you decide who gets access and enforce MFA at your IdP. See [how to read the mapping](soc2-control-mapping.md#how-to-read-it).

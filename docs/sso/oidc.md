@@ -61,7 +61,7 @@ Restart botd. The log says `SSO: okta (Okta, oidc), ready; anyone the IdP signs 
 | `SSO_<ID>_SUBJECT_CLAIM` | `sub` | The claim that says who someone is. It must never change for a person: `email`, `preferred_username`, `upn`, `name`, and similar are refused. |
 | `SSO_<ID>_EMAIL_CLAIM` | `email` | The claim with the email. It counts only when `email_verified` is `true` (a boolean, or the string `"true"`). |
 | `SSO_<ID>_NAME_CLAIM` | `name` | The claim with the display name. |
-| `SSO_<ID>_JIT_ROLE` | `off` | `readonly`, `member`, or `admin`: create a user the first time someone signs in. |
+| `SSO_<ID>_JIT_ROLE` | `off` | `readonly`, `member`, or `admin`: create a user the first time someone signs in. Needs `SSO_<ID>_ALLOWED_DOMAINS`: botd won't start without it ([ADR 0103](../adr/0103-sso-jit-needs-an-allow-list.md)). |
 
 `SSO_PUBLIC_URL` and `SSO_APP_REDIRECTS` are shared by all providers; see [the Entra guide](entra.md#all-settings). Entra or Google settings (`TENANT`, `HOSTED_DOMAINS`, …) on an `oidc` provider are refused, so nothing looks like a restriction that isn't there.
 
@@ -76,7 +76,7 @@ botctl audit 5 --action auth.login_failed          # details.subject on the not_
 botctl user link ada@example.com okta <subject>
 ```
 
-**Or just in time.** With `SSO_OKTA_JIT_ROLE=member`, anyone the IdP signs in to this app becomes a member. Limit who that is at the IdP (Okta: assign the app to groups; Keycloak: a realm just for your team, or a client role check; Auth0: only enable your company connection) and, to be sure, with `SSO_OKTA_ALLOWED_DOMAINS`. An IdP that lets anyone sign up (Auth0 with a database or social connection, for example) plus just in time means anyone can get in: don't combine them without `ALLOWED_DOMAINS`. If someone's email already belongs to another SuperBot user, sign-in is refused until an admin links them.
+**Or just in time** (your domains only). With `SSO_OKTA_ALLOWED_DOMAINS=example.com` and `SSO_OKTA_JIT_ROLE=member`, anyone the IdP signs in to this app with a verified `@example.com` email becomes a member. `JIT_ROLE` without `ALLOWED_DOMAINS` is refused at startup, because an IdP that lets anyone sign up (Auth0 with a database or social connection, Keycloak with self-registration) would otherwise let anyone in ([ADR 0103](../adr/0103-sso-jit-needs-an-allow-list.md)). Also limit who can use the app at the IdP (Okta: assign the app to groups; Keycloak: a realm just for your team, or a client role check; Auth0: only enable your company connection). If your people have no common email domain, keep `JIT_ROLE=off` and link them, or use [SCIM](scim.md). If someone's email already belongs to another SuperBot user, sign-in is refused until an admin links them.
 
 ## Require MFA at the IdP
 

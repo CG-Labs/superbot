@@ -5,7 +5,7 @@
 //! stays as a tombstone with no personal data; and every audit event about them names
 //! them by a pseudonym instead. A legal hold on chat they're in, a team they're the
 //! only owner of, a plan they pay for, or a machine not yet destroyed refuses it first.
-//! Design: docs/adr/0100-erasing-a-users-data.md.
+//! Design: docs/adr/0102-erasing-a-users-data.md.
 
 use crate::audit::{Outcome, Who};
 use crate::db::{EraseError, UserPatch};

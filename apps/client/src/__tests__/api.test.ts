@@ -122,6 +122,24 @@ describe("audit log (ADR 0009, 0019)", () => {
   });
 });
 
+describe("access review (ADR 0099)", () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  it("exports the report with its digest, under the name the server gave it", async () => {
+    const answer = (disposition: string | null) =>
+      (globalThis.fetch = jest.fn(async () => ({ ok: true, status: 200, headers: new Headers(disposition ? { "content-disposition": disposition } : {}), text: async () => "a\r\n" })) as unknown as typeof fetch);
+    const api = new SuperBotApi({ baseUrl: BASE, cookie: true });
+    answer('attachment; filename="superbot-access-review-20261122-090500.csv"');
+    expect(await api.accessReviewCsv("d 1")).toEqual({ csv: "a\r\n", fileName: "superbot-access-review-20261122-090500.csv" });
+    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toBe(`${BASE}/api/access-review/export.csv?digest=d%201`);
+    answer(null);
+    expect(await api.accessReviewCsv("d1")).toEqual({ csv: "a\r\n", fileName: null });
+  });
+});
+
 describe("personal secrets (ADR 0029, 0044)", () => {
   const realFetch = globalThis.fetch;
   afterEach(() => {
