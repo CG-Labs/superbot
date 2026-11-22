@@ -590,30 +590,48 @@ pub fn collect(api: &mut dyn Api, o: &Options) -> Result<Collected, Failure> {
     raw_runs.retain(|r| in_period(p, &r["created_at"]) && seen.insert(r["id"].as_u64()));
     raw_runs.sort_by_key(|r| (ms(&r["created_at"]), r["id"].as_u64()));
     let runs: Vec<Value> = raw_runs.iter().map(run_view).collect();
-    let mut by_sha: HashMap<&str, Vec<Value>> = HashMap::new();
-    for r in &runs {
-        if let Some(sha) = r["headSha"].as_str() {
-            by_sha.entry(sha).or_default().push(json!({ "id": r["id"], "workflow": r["workflow"], "conclusion": r["conclusion"], "url": r["url"] }));
-        }
-    }
     for pr in &mut pulls {
-        let after = pr["mergeCommit"].as_str().and_then(|s| by_sha.get(s)).cloned().unwrap_or_default();
-        pr["postMergeRuns"] = json!(after);
+        pr["postMergeRuns"] = match pr["mergeCommit"].as_str() {
+            Some(sha) => json!(merge_runs(api, repo, &branch, sha)?),
+            None => json!([]),
+        };
     }
 
+    let commits = commits_on_branch(api, repo, &branch, p, &pulls)?;
+    let repo_view = json!({ "fullName": info["full_name"], "private": info["private"], "defaultBranch": info["default_branch"], "url": info["html_url"] });
+    let updates = branch_updates(api, repo, &branch, p)?;
+    Ok(Collected { repo: repo_view, branch, protection, required, pulls, commits, updates, runs, runs_truncated })
+}
+
+/// The CI runs on a merge commit, read by commit so a run that started after the period
+/// still counts for a pull request merged just before its end.
+fn merge_runs(api: &mut dyn Api, repo: &str, branch: &str, sha: &str) -> Result<Vec<Value>, Failure> {
+    let mut runs = all(api, &format!("/repos/{repo}/actions/runs?head_sha={}&exclude_pull_requests=true&per_page=100", enc(sha)), Some("workflow_runs"))?;
+    runs.retain(|r| r["head_branch"] == branch);
+    runs.sort_by_key(|r| (ms(&r["created_at"]), r["id"].as_u64()));
+    Ok(runs.iter().map(|r| json!({ "id": r["id"], "workflow": r["name"], "conclusion": r["conclusion"], "createdAt": r["created_at"], "url": r["html_url"] })).collect())
+}
+
+/// Every commit on the branch dated in the period, with the merged pull request it came from.
+fn commits_on_branch(api: &mut dyn Api, repo: &str, branch: &str, p: &Period, pulls: &[Value]) -> Result<Value, Failure> {
     let since = format!("{}T00:00:00Z", p.from);
     let until = format!("{}T00:00:00Z", p.to);
-    let listed = all(api, &format!("/repos/{repo}/commits?sha={}&since={}&until={}&per_page=100", enc(&branch), enc(&since), enc(&until)), None)?;
+    let listed = all(api, &format!("/repos/{repo}/commits?sha={}&since={}&until={}&per_page=100", enc(branch), enc(&since), enc(&until)), None)?;
     let by_merge: HashMap<&str, u64> = pulls.iter().filter_map(|pr| Some((pr["mergeCommit"].as_str()?, pr["number"].as_u64()?))).collect();
-    let (mut commits, mut direct, mut unchecked, mut lookups) = (Vec::new(), Vec::new(), 0, 0);
+    let (mut commits, mut direct, mut unchecked, mut refused, mut lookups) = (Vec::new(), Vec::new(), 0, 0, 0);
     for c in listed.iter().filter(|c| in_period(p, &c["commit"]["committer"]["date"])) {
         let sha = c["sha"].as_str().unwrap_or_default();
         let pr = match by_merge.get(sha) {
             Some(n) => Some(*n),
             None if lookups < MAX_COMMIT_LOOKUPS => {
                 lookups += 1;
-                let prs = optional(api.get(&format!("/repos/{repo}/commits/{sha}/pulls")).map(|r| r.body))?.unwrap_or_default();
-                prs.as_array().into_iter().flatten().find(|x| x["merged_at"].is_string() && x["base"]["ref"] == branch.as_str()).and_then(|x| x["number"].as_u64())
+                // A refused lookup proves nothing about the commit, so it's unchecked, not direct.
+                let Ok(prs) = optional(api.get(&format!("/repos/{repo}/commits/{sha}/pulls")).map(|r| r.body))? else {
+                    (unchecked, refused) = (unchecked + 1, refused + 1);
+                    commits.push(commit_view(c, None));
+                    continue;
+                };
+                prs.as_array().into_iter().flatten().find(|x| x["merged_at"].is_string() && x["base"]["ref"] == branch).and_then(|x| x["number"].as_u64())
             }
             None => {
                 unchecked += 1;
@@ -627,18 +645,15 @@ pub fn collect(api: &mut dyn Api, o: &Options) -> Result<Collected, Failure> {
         }
         commits.push(v);
     }
-    let commits = json!({
+    Ok(json!({
         "basis": "commit date: a commit made before the period and pushed to the branch in it is in branchUpdates, not here",
         "total": commits.len(),
         "viaPullRequest": commits.iter().filter(|c| c["pullRequest"].is_u64()).count(),
         "direct": direct,
         "unchecked": unchecked,
+        "uncheckedBecauseRefused": refused,
         "commits": commits,
-    });
-
-    let repo_view = json!({ "fullName": info["full_name"], "private": info["private"], "defaultBranch": info["default_branch"], "url": info["html_url"] });
-    let updates = branch_updates(api, repo, &branch, p)?;
-    Ok(Collected { repo: repo_view, branch, protection, required, pulls, commits, updates, runs, runs_truncated })
+    }))
 }
 
 // The bundle
@@ -839,6 +854,9 @@ pub fn summary(c: &Collected) -> String {
     if let Err(status) = c.updates {
         out += &format!("\n  GitHub answered {status} for {}'s activity: direct pushes are known only from commit dates.", c.branch);
     }
+    if let Some(n) = c.commits["unchecked"].as_u64().filter(|n| *n > 0) {
+        out += &format!("\n  {n} commits on the branch weren't checked for a pull request.");
+    }
     if c.runs_truncated {
         out += "\n  More than 1,000 runs on one day: that day's list is incomplete.";
     }
@@ -994,6 +1012,20 @@ mod tests {
         let err = merged(&mut endless, "o/r", "main", &period()).unwrap_err();
         assert!(err.message.contains("pages"), "a list cut short is an error, never a short list: {}", err.message);
         assert_eq!(endless.1.len(), MAX_PAGES);
+    }
+
+    #[test]
+    fn a_refused_commit_lookup_is_unchecked_not_a_direct_commit() {
+        let commit = |sha: &str| json!({ "sha": sha, "commit": { "committer": { "date": "2026-10-10T00:00:00Z" } } });
+        let mut fake = Fake(HashMap::new(), Vec::new());
+        let list = format!("/repos/o/r/commits?sha=main&since={}&until={}&per_page=100", enc("2026-10-01T00:00:00Z"), enc("2026-11-01T00:00:00Z"));
+        fake.0.insert(list, (json!([commit("m1"), commit("d1"), commit("x1")]), None));
+        fake.0.insert("/repos/o/r/commits/d1/pulls".into(), (json!([]), None));
+        let pulls = [json!({ "number": 7, "mergeCommit": "m1" })];
+        let v = commits_on_branch(&mut fake, "o/r", "main", &period(), &pulls).unwrap();
+        assert_eq!(v["direct"].as_array().unwrap().iter().map(|c| c["sha"].as_str().unwrap()).collect::<Vec<_>>(), ["d1"]);
+        assert_eq!((v["unchecked"].as_u64(), v["uncheckedBecauseRefused"].as_u64(), v["total"].as_u64(), v["viaPullRequest"].as_u64()), (Some(1), Some(1), Some(3), Some(1)));
+        assert!(!fake.1.iter().any(|u| u.contains("/m1/")), "a merge commit isn't looked up");
     }
 
     #[test]

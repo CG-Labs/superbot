@@ -91,6 +91,14 @@ async fn github(State(m): State<Arc<Mock>>, uri: Uri, headers: HeaderMap) -> Res
         "/pulls/101" => ok("pull-101.json"),
         "/pulls/102/reviews" => ok("reviews-102.json"),
         "/pulls/101/reviews" => ok("reviews-101.json"),
+        "/actions/runs" if q.contains_key("head_sha") => match q["head_sha"].as_str() {
+            "b102b102b102b102b102b102b102b102b102b102" => ok("runs-b102.json"),
+            sha => {
+                let mut all: Value = serde_json::from_str(&fixture("runs.json")).unwrap();
+                all["workflow_runs"].as_array_mut().unwrap().retain(|r| r["head_sha"] == sha);
+                reply(200, all.to_string(), None)
+            }
+        },
         "/actions/runs" => {
             assert_eq!((q["branch"].as_str(), q["created"].as_str()), ("main", "2026-10-01T00:00:00Z..2026-10-31T23:59:59Z"));
             ok("runs.json")
@@ -226,7 +234,8 @@ fn exports_merged_pull_requests_checks_protection_and_runs_as_a_checkable_bundle
     assert_eq!((p102["approvers"].clone(), p102["approvedFinalCommit"].as_bool()), (serde_json::json!(["reviewer-b"]), Some(true)));
     assert_eq!(p102["automatedReviewers"], serde_json::json!(["review-bot[bot]"]));
     assert_eq!(p102["checks"]["allRequiredPassed"], true, "docs passed on its re-run");
-    assert_eq!(p102["postMergeRuns"][0]["id"], 9001);
+    assert_eq!(p102["postMergeRuns"].as_array().unwrap().iter().map(|r| r["id"].as_u64().unwrap()).collect::<Vec<_>>(), [9001, 9004], "read by commit, so a run after the period counts; not another branch's");
+    assert_eq!(p101["postMergeRuns"][0]["id"], 9002);
     assert_eq!(p101["approvers"], serde_json::json!([]), "approved only after the merge");
     assert_eq!(p101["reviews"][1]["beforeMerge"], false);
     assert_eq!(p101["mergedBy"], "author-b", "from the pull request itself; the list leaves it out");
