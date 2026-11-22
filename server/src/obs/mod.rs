@@ -7,6 +7,7 @@
 //! listener is reachable only where the operator binds it. Off loopback it needs a
 //! bearer token (`METRICS_TOKEN`), and botd refuses to start without one.
 
+pub mod capacity;
 pub mod log;
 pub mod metrics;
 
@@ -220,6 +221,7 @@ pub fn render(app: &AppState) -> String {
     if let Some(cp) = app.control_plane.get().filter(|cp| cp.enabled()) {
         render_machines(app, cp, &mut out);
     }
+    capacity::render(app, &mut out);
     out
 }
 

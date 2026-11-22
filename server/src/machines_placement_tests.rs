@@ -114,6 +114,9 @@ async fn new_machines_go_to_the_least_loaded_open_host_and_never_past_its_room()
     assert!(gm.last_error.as_deref().unwrap().contains("No Incus host has room"), "{:?}", gm.last_error);
     let failed: Vec<Value> = events(&env, "machine.placement_failed").await.into_iter().filter(|e| e["targetId"] == g.id.as_str()).collect();
     assert_eq!(failed.len(), 1, "{failed:?}");
+    let m = crate::obs::render(&env.app);
+    assert_eq!(value(&m, "superbot_incus_machines_waiting_for_room"), Some(1.0), "{m}");
+    assert!(value(&m, r#"superbot_events_total{event="machine.placement_failed",outcome="failure"}"#).is_some_and(|n| n >= 1.0), "{m}");
     // Its reason changes as hosts do (a stops answering), and it isn't announced again.
     env.a.w().down = true;
     reconcile(&env).await;
@@ -132,6 +135,7 @@ async fn new_machines_go_to_the_least_loaded_open_host_and_never_past_its_room()
     reconcile(&env).await;
     let gm = env.app.db.machine(&g.id).unwrap();
     assert_eq!((gm.provider_id.as_deref(), gm.last_error.as_deref()), (Some(format!("b/{}", gm.label).as_str()), None), "{gm:?}");
+    assert_eq!(value(&crate::obs::render(&env.app), "superbot_incus_machines_waiting_for_room"), Some(0.0));
 }
 
 #[tokio::test]
@@ -291,4 +295,95 @@ async fn a_refused_create_frees_its_room_for_its_retry() {
     let (code, d) = ask(&env, &uid).await;
     assert_eq!(code, 202, "{d}");
     assert!(d["providerId"].as_str().is_some_and(|p| p.starts_with("a/")), "{d}");
+}
+
+/// A sample's value on `/metrics`, if the series is there.
+fn value(metrics: &str, series: &str) -> Option<f64> {
+    metrics.lines().find_map(|l| l.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+}
+
+/// Every `superbot_*` metric name in `text`.
+fn metric_names(text: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("superbot_") {
+        let name: String = rest[at..].chars().take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_').collect();
+        rest = &rest[at + name.len()..];
+        out.insert(name);
+    }
+    out
+}
+
+#[tokio::test]
+async fn metrics_show_each_hosts_allocation_against_its_capacity_and_what_it_uses() {
+    let env = serve_with(|a, b, _| Fleet::new(vec![Member { max_machines: Some(3), ..sized(a, "c4-m8-d80") }, sized(b, "c2-m4-d40")], DOWN_MS)).await;
+    let gib = (1u64 << 30) as f64;
+
+    // With /metrics off, botd never asks hosts what they use; placement's view and
+    // botd's own host are there all the same.
+    reconcile(&env).await;
+    assert!(env.a.calls("GET", "/1.0/resources").is_empty(), "no extra calls with metrics off");
+    let m = crate::obs::render(&env.app);
+    assert_eq!(value(&m, r#"superbot_incus_host_up{host="a"}"#), Some(1.0), "{m}");
+    assert_eq!(value(&m, r#"superbot_incus_host_open{host="b"}"#), Some(1.0), "{m}");
+    assert_eq!(value(&m, r#"superbot_incus_host_capacity_cpus{host="a"}"#), Some(4.0), "{m}");
+    assert_eq!(value(&m, r#"superbot_incus_host_capacity_memory_bytes{host="b"}"#), Some(4.0 * gib), "{m}");
+    assert_eq!(value(&m, r#"superbot_incus_host_max_machines{host="a"}"#), Some(3.0), "{m}");
+    assert_eq!(value(&m, r#"superbot_incus_host_max_machines{host="b"}"#), None, "b has no maximum: {m}");
+    assert!(value(&m, r#"superbot_host_cpus{host="botd",kind="server"}"#).is_some_and(|n| n > 0.0), "{m}");
+    assert!(!m.contains(r#"kind="incus""#), "{m}");
+
+    // With it on, each host check reads what each host has and uses.
+    env.app.db.metrics().want_host_use();
+    let (_, ada) = machine_on(&env, &env.a, "a", "ada@example.com", false).await;
+    let m = crate::obs::render(&env.app);
+    assert_eq!(value(&m, r#"superbot_incus_host_machines{host="a"}"#), Some(1.0), "{m}");
+    assert_eq!(value(&m, r#"superbot_incus_host_machines{host="b"}"#), Some(0.0), "{m}");
+    assert_eq!(value(&m, r#"superbot_incus_host_allocated_cpus{host="a"}"#), Some(1.0), "{m}");
+    assert_eq!(value(&m, r#"superbot_incus_host_allocated_memory_bytes{host="a"}"#), Some(2.0 * gib), "{m}");
+    assert_eq!(value(&m, r#"superbot_incus_host_allocated_disk_bytes{host="a"}"#), Some(20.0 * gib), "{m}");
+    assert_eq!(value(&m, r#"superbot_host_cpus{host="a",kind="incus"}"#), Some(16.0), "{m}");
+    assert_eq!(value(&m, r#"superbot_host_load1{host="b",kind="incus"}"#), Some(1.5), "{m}");
+    assert_eq!(value(&m, r#"superbot_host_memory_used_bytes{host="a",kind="incus"}"#), Some(8.0 * gib), "{m}");
+    assert_eq!(value(&m, r#"superbot_host_disk_bytes{host="a",kind="incus",disk="pool"}"#), Some(1000.0 * gib), "{m}");
+    assert!(value(&m, r#"superbot_host_disk_bytes{host="botd",kind="server",disk="data"}"#).is_some_and(|n| n > 0.0), "{m}");
+    let read_b = value(&m, r#"superbot_host_reading_timestamp_seconds{host="b",kind="incus"}"#).unwrap();
+    assert!(read_b > 0.0, "{m}");
+
+    // A host that stops answering is neither up nor open, and keeps its last reading;
+    // a drained one is up but not open; a pool that stops saying drops its disk.
+    env.b.w().down = true;
+    env.a.w().pool_resources = Value::Null;
+    env.a.w().resources["memory"]["used"] = json!(60u64 << 30);
+    reconcile(&env).await;
+    let (code, d) = json_call(&env, "PUT", "/api/machines/hosts/a/drain", "{}").await;
+    assert_eq!(code, 200, "{d}");
+    let m = crate::obs::render(&env.app);
+    assert_eq!(value(&m, r#"superbot_incus_host_up{host="b"}"#), Some(0.0), "{m}");
+    assert_eq!(value(&m, r#"superbot_incus_host_open{host="b"}"#), Some(0.0), "{m}");
+    assert_eq!(value(&m, r#"superbot_incus_host_up{host="a"}"#), Some(1.0), "{m}");
+    assert_eq!(value(&m, r#"superbot_incus_host_open{host="a"}"#), Some(0.0), "{m}");
+    assert_eq!(value(&m, r#"superbot_host_reading_timestamp_seconds{host="b",kind="incus"}"#), Some(read_b), "{m}");
+    assert_eq!(value(&m, r#"superbot_host_memory_used_bytes{host="a",kind="incus"}"#), Some(60.0 * gib), "{m}");
+    assert_eq!(value(&m, r#"superbot_host_disk_bytes{host="a",kind="incus",disk="pool"}"#), None, "{m}");
+
+    // Hosts are the only new label values: no people, machines or addresses.
+    let capacity: Vec<&str> = m.lines().filter(|l| l.starts_with("superbot_incus_host_") || l.starts_with("superbot_host_")).collect();
+    for bad in ["@example.com", ada.label.as_str(), ada.id.as_str(), "127.0.0.1"] {
+        assert!(!capacity.iter().any(|l| l.contains(bad)), "{bad} leaked into: {capacity:?}");
+    }
+
+    // The dashboard and the alert rules use only metrics botd writes.
+    let types: std::collections::BTreeSet<String> = m.lines().filter_map(|l| Some(l.strip_prefix("# TYPE ")?.split(' ').next()?.to_string())).collect();
+    for (file, text) in [
+        ("deploy/grafana/superbot-capacity.json", include_str!("../../deploy/grafana/superbot-capacity.json")),
+        ("deploy/prometheus/superbot-capacity.rules.yml", include_str!("../../deploy/prometheus/superbot-capacity.rules.yml")),
+    ] {
+        let used = metric_names(text);
+        assert!(!used.is_empty(), "{file}");
+        let missing: Vec<_> = used.difference(&types).collect();
+        assert!(missing.is_empty(), "{file} uses metrics botd doesn't write: {missing:?}");
+    }
+    let dashboard: Value = serde_json::from_str(include_str!("../../deploy/grafana/superbot-capacity.json")).unwrap();
+    assert!(dashboard["panels"].as_array().is_some_and(|p| !p.is_empty()), "a Grafana dashboard with panels");
 }

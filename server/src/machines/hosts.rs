@@ -154,6 +154,7 @@ pub async fn watch(app: &AppState, cp: &ControlPlane) -> usize {
                     record(app, &by, "machine.host_up", &c.name, Outcome::Success, json!({ "url": c.url, "machines": n }));
                     alert(app, "machine.host_up", &c.name, format!("Incus host {} answers again", c.name), vec![format!("{n} machines are on it; new machines can go there again.")]);
                 }
+                read_use(app, h, &c.name).await;
             }
             Err(e) => {
                 let since = app.db.machine_host_failed(&c.name, &e.to_string());
@@ -176,6 +177,24 @@ pub async fn watch(app: &AppState, cp: &ControlPlane) -> usize {
         }
     }
     down
+}
+
+/// With `/metrics` on, what a host that answered has and uses now (ADR 0106). A read
+/// that fails keeps the last one, whose age shows on `/metrics`; it is logged once
+/// until a read works again, and never makes the host down.
+async fn read_use(app: &AppState, h: &dyn Hosts, host: &str) {
+    let metrics = app.db.metrics();
+    if !metrics.wants_host_use() {
+        return;
+    }
+    match h.host_use(host).await {
+        Ok(u) => metrics.host_read(host, now(), u),
+        Err(e) => {
+            if metrics.host_read_failed(host) {
+                crate::obs::log::log_warn!("WARNING: Incus host {host} didn't say what it uses ({e}); its capacity metrics keep their last reading.");
+            }
+        }
+    }
 }
 
 /// Where a restore of `m` goes: `host` if given, else its own host, or the host
