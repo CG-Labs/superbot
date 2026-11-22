@@ -63,7 +63,10 @@ impl Level {
 
 /// A line of botd's own text: printed as is (info to stdout, warnings to stderr), or
 /// as `{"ts", "level", "msg"}` on the same stream, with the trace's ids inside a kept span.
+/// Secrets botd knows and the tokens it issues are `[redacted]` first: an error a provider
+/// echoes back can carry a key, and journald keeps what botd prints.
 pub fn line(level: Level, msg: &str) {
+    let msg = &*crate::secrets::redact::text(msg);
     let rendered = render(level, msg.strip_prefix("WARNING: ").unwrap_or(msg), traced(json!({})));
     if json() {
         write(level, rendered.clone());
@@ -221,6 +224,21 @@ pub mod captured {
 mod tests {
     use super::*;
     use crate::obs::trace::{Kind, Tracer, within};
+    use crate::secrets::redact;
+
+    #[test]
+    fn plain_lines_never_carry_a_known_value_or_an_issued_token() {
+        let marker = crate::random_hex(6);
+        let value = format!("plain-words-{}", crate::random_hex(8));
+        let issued = format!("{}{}", crate::users::SESSION_PREFIX, "ab".repeat(32));
+        redact::register(&value);
+        line(Level::Warn, &format!("WARNING: {marker} provider echoed {value} and {issued}"));
+        redact::forget(&value);
+        let kept: Vec<Value> = recent::lines().iter().filter(|l| l.contains(&marker)).map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0]["msg"], format!("{marker} provider echoed [redacted] and [redacted]"));
+        assert_eq!(kept[0]["level"], "warn");
+    }
 
     #[tokio::test]
     async fn plain_lines_and_events_name_a_kept_trace() {
