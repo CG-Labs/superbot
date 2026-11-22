@@ -35,6 +35,9 @@ BACKUP_OFF_HOST=""
 BACKUP_ENCRYPTION=""
 BACKUP_AGE_GENERATE=false
 BACKUP_IDENTITY_FILE=${BACKUP_IDENTITY_FILE:-/root/superbot-backup-identity.txt}
+# Database encryption at rest (docs/adr/0116-database-encrypted-at-rest.md). A new install
+# writes required; an upgrade keeps what .env has unless given --database-encryption.
+DATABASE_ENCRYPTION=""
 # --testing-mode: run unlicensed with billing off (TESTING_MODE=on; docs/adr/0068-no-free-tier.md).
 TESTING_MODE_ON=false
 # Hermes Agent release --with-hermes installs: the commit of tag v0.23.3 (NousResearch/hermes-agent),
@@ -97,6 +100,11 @@ Usage: install.sh [options]
                       SUPERBOT_BACKUP_ENCRYPTION: warn about plain backups (auto, the default),
                       refuse to write or start with them (required), or keep them plain by
                       choice (off)
+  --database-encryption auto|required|off
+                      SUPERBOT_DATABASE_ENCRYPTION (ADR 0116): new databases encrypted, an
+                      existing plain one kept plain with a warning (auto); encrypt a plain one
+                      on the next start, keeping a plain copy (required, the default for new
+                      installs); or keep the database plain by choice (off)
   --backup-off-host auto|on|off
                       SERVER_BACKUP_OFF_HOST: copy when a store is set (auto, the default),
                       refuse to start without one (on), or never copy (off)
@@ -139,6 +147,7 @@ parse_args() {
       --backup-off-host) BACKUP_OFF_HOST=$2; shift 2 ;;
       --backup-age-generate) BACKUP_AGE_GENERATE=true; shift ;;
       --backup-encryption) BACKUP_ENCRYPTION=$2; shift 2 ;;
+      --database-encryption) DATABASE_ENCRYPTION=$2; shift 2 ;;
       --with-hermes) WITH_HERMES=true; shift ;;
       --license-file) LICENSE_FILE=$2; shift 2 ;;
       --testing-mode) TESTING_MODE_ON=true; shift ;;
@@ -567,6 +576,9 @@ configure_env() {
     local testing=""
     [[ "$TESTING_MODE_ON" != true ]] || testing=" (TESTING_MODE=on: no license, billing off)"
     log "[dry-run] configure $env_file$testing"
+    if [[ -n "$DATABASE_ENCRYPTION" ]] || [[ ! -f "$env_file" ]]; then
+      log "[dry-run] would set SUPERBOT_DATABASE_ENCRYPTION=${DATABASE_ENCRYPTION:-required}"
+    fi
     if [[ -z "$BACKUP_AGE_RECIPIENTS" && "$BACKUP_ENCRYPTION" != off ]] && { [[ ! -f "$env_file" ]] || [[ "$BACKUP_AGE_GENERATE" == true ]]; }; then
       log "[dry-run] would make a backup age key at $BACKUP_IDENTITY_FILE (root, 0600) and set SUPERBOT_BACKUP_AGE_RECIPIENTS, unless $env_file has recipients"
     fi
@@ -613,6 +625,7 @@ configure_env() {
 
   configure_backup_target "$env_file"
   configure_backup_encryption "$env_file" "$fresh"
+  configure_database_encryption "$env_file" "$fresh"
 
   chown "$SUPERBOT_USER:$SUPERBOT_USER" "$env_file"
   chmod 0600 "$env_file"
@@ -651,6 +664,10 @@ check_backup_target() {
     [[ "$BACKUP_ENCRYPTION" != off ]] || die "--backup-age-generate makes a key that --backup-encryption off would not use"
   fi
   [[ "$BACKUP_IDENTITY_FILE" == /* ]] || die "BACKUP_IDENTITY_FILE must be an absolute path, not $BACKUP_IDENTITY_FILE"
+  case $DATABASE_ENCRYPTION in
+    "" | auto | required | off) ;;
+    *) die "--database-encryption must be auto, required or off" ;;
+  esac
 }
 
 # Writes the off-host backup settings given into .env; nothing given, nothing changes, so
@@ -724,6 +741,43 @@ configure_backup_encryption() {
     die "SUPERBOT_BACKUP_ENCRYPTION=required, but $env_file has no SUPERBOT_BACKUP_AGE_RECIPIENTS: re-run with --backup-age-generate or --backup-age-recipients age1..."
 }
 
+# Database encryption (docs/adr/0116-database-encrypted-at-rest.md): --database-encryption is
+# written as given, and a new .env gets required. An upgrade with no flag changes nothing.
+# botd does the encrypting when it starts, keeping a plain copy of a database it encrypts.
+configure_database_encryption() {
+  local env_file=$1 fresh=$2 policy=$DATABASE_ENCRYPTION
+  [[ -n "$policy" || "$fresh" != true ]] || policy=required
+  [[ -n "$policy" ]] || return 0
+  set_env_var "$env_file" SUPERBOT_DATABASE_ENCRYPTION "$policy"
+  if [[ "$policy" == required ]] && plain_database "$(env_value "$env_file" DATA_DIR)/app.sqlite"; then
+    log "Database: botd encrypts it when it starts, keeping a plain copy beside it until you delete it (docs/ops/database-encryption.md)"
+  fi
+}
+
+# True if DB is an ordinary SQLite file: not encrypted (ADR 0116).
+plain_database() {
+  [[ -s "$1" && "$(head -c 15 "$1" | tr -d '\0')" == "SQLite format 3" ]]
+}
+
+# Whether the database is encrypted at rest, from .env and the file itself.
+database_encryption_state() {
+  local env_file=$1 db policy
+  [[ -r "$env_file" ]] || { echo "unknown"; return; }
+  db="$(env_value "$env_file" DATA_DIR)/app.sqlite"
+  policy=$(env_value "$env_file" SUPERBOT_DATABASE_ENCRYPTION | tr '[:upper:]' '[:lower:]')
+  if [[ -s "$db" ]] && ! plain_database "$db"; then
+    echo "encrypted (SQLCipher, key derived from the master key)"
+  elif [[ "$policy" == off ]]; then
+    echo "plain by choice (SUPERBOT_DATABASE_ENCRYPTION=off)"
+  elif [[ "$policy" == required ]]; then
+    echo "encrypted when botd starts (SUPERBOT_DATABASE_ENCRYPTION=required)"
+  elif [[ -s "$db" ]]; then
+    echo "plain (SUPERBOT_DATABASE_ENCRYPTION=${policy:-auto})"
+  else
+    echo "encrypted when botd creates it"
+  fi
+}
+
 # Whether server backups are encrypted, from .env.
 backup_encryption_state() {
   local env_file=$1
@@ -759,6 +813,8 @@ master_key_default() { printf '%s/.config/superbot/master.key\n' "$1"; }
 db_has_sealed_values() {
   local db=$1
   [[ -f "$db" ]] || return 1
+  # An encrypted database opens only with its master key (ADR 0116).
+  [[ ! -s "$db" ]] || plain_database "$db" || return 0
   [[ -n $(sudo -u "$SUPERBOT_USER" sqlite3 -readonly "$db" "SELECT 1 FROM settings WHERE key = 'secrets_key_check'" 2>/dev/null) ]]
 }
 
@@ -1258,12 +1314,13 @@ configure_ufw() {
 }
 
 summary() {
-  local home repo_path pass_file url where app backups encryption
+  local home repo_path pass_file url where app backups encryption database
   home=$(user_home)
   repo_path="$home/superbot"
   pass_file="$home/.superbot-admin-password"
   backups=$(backup_destination "$repo_path/.env")
   encryption=$(backup_encryption_state "$repo_path/.env")
+  database=$(database_encryption_state "$repo_path/.env")
   if [[ -n "$DOMAIN" ]]; then
     url="https://${DOMAIN}" where=""
   else
@@ -1287,8 +1344,9 @@ SuperBot is installed.
   Console:  $url/console/$where (built-in admin page)
   Sign-ups: botctl signup list (approve with botctl signup approve <id>)
   Password: stored in $pass_file (also in $repo_path/.env as AUTH_PASSWORD)
-  Key:      $(master_key_default "$home") encrypts saved secrets. Back it up apart from
-            the database: without it they can't be read (deploy/README.md).
+  Key:      $(master_key_default "$home") encrypts the database and saved secrets. Back it
+            up apart from the database: without it they can't be read (deploy/README.md).
+  Database: $database (botctl database)
   License:  botctl license (no free tier: without a license, Bots run only with TESTING_MODE=on)
   Backups:  $backups (botctl backups)
   Encrypted: $encryption
@@ -1327,6 +1385,14 @@ EOF
   fi
   if [[ "$encryption" == "plain (no"* ]]; then
     warn "Server backups aren't encrypted: anyone who gets a copy can read every chat. Re-run with --backup-age-generate (or --backup-age-recipients age1...), or --backup-encryption off to keep them plain by choice (docs/ops/backup-restore.md#encryption)."
+  fi
+  if [[ "$database" == "plain (SUPERBOT"* ]]; then
+    warn "The database isn't encrypted: anyone who copies DATA_DIR can read every chat. Re-run with --database-encryption required (botd encrypts it on its next start and keeps a plain copy until you delete it), or --database-encryption off to keep it plain by choice (docs/ops/database-encryption.md)."
+  fi
+  local copies=()
+  [[ ! -r "$repo_path/.env" ]] || mapfile -t copies < <(compgen -G "$(env_value "$repo_path/.env" DATA_DIR)/app.sqlite-plain-*" || true)
+  if [[ ${#copies[@]} -gt 0 ]]; then
+    warn "A plain copy of the database is still beside it: ${copies[*]}. Once botd runs well on the encrypted one, delete it (shred -u), as it holds every chat unencrypted (docs/ops/database-encryption.md#the-plain-copy)."
   fi
   if [[ -n "${NEW_BACKUP_IDENTITY_FILE:-}" ]]; then
     warn "New backup key at $NEW_BACKUP_IDENTITY_FILE: the only key that opens your encrypted backups. Copy it off this host now (a password manager or vault), then delete it here (shred -u $NEW_BACKUP_IDENTITY_FILE). Left here, it is lost with the host, and whoever takes the host can read the backups."

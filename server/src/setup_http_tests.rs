@@ -54,7 +54,9 @@ async fn a_fresh_install_reports_what_it_lacks() {
     assert!(backups["detail"].as_str().unwrap().contains("stay on this host"), "{backups}");
     // Nor are backups encrypted (ADR 0114).
     assert_eq!(check(&s, "backup_encryption")["done"], false);
-    assert_eq!((s["done"].as_u64(), s["total"].as_u64()), (Some(4), Some(8)));
+    // Nor has this test server checked its database's encryption (ADR 0116).
+    assert_eq!(check(&s, "database_encryption")["done"], false);
+    assert_eq!((s["done"].as_u64(), s["total"].as_u64()), (Some(4), Some(9)));
 }
 
 #[tokio::test]
@@ -113,7 +115,7 @@ async fn progress_is_saved_and_finishing_is_audited() {
     assert_eq!(actions, ["setup.reopened", "setup.completed", "setup.resumed", "setup.dismissed"], "steps alone aren't audited");
     let done = &ev[1];
     assert_eq!((done["actorId"].as_str(), done["targetType"].as_str()), (Some(users::OPERATOR), Some("setup")));
-    assert_eq!(done["details"]["open"], json!(["domain", "admin", "backups", "backup_encryption"]));
+    assert_eq!(done["details"]["open"], json!(["domain", "admin", "backups", "backup_encryption", "database_encryption"]));
 }
 
 #[tokio::test]

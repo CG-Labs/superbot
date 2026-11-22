@@ -36,7 +36,7 @@ hyper-util = { version = "0.1.21", features = ["server", "http1", "tokio", "serv
 libc = "0.2"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "form", "stream"] }
-rusqlite = { version = "0.43.0", features = ["bundled"] }
+rusqlite = { version = "0.43.0", features = ["bundled-sqlcipher-vendored-openssl", "backup"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-platform-verifier = "0.7"
 serde = { version = "1.0.229", features = ["derive"] }

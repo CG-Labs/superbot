@@ -18,11 +18,11 @@ The RPO only holds for archives that are **off the host**. Archives on the serve
 
 | In the archive | Not in the archive | Keep it off-host yourself |
 |--|--|--|
-| `app.sqlite` as an online SQLite `.backup` copy (users, sessions, Bots, chats, routines, approvals, sealed secrets, the audit log), Bot memory (`bots/`), user files (`USER.md`, `users/`), Hermes per-Bot data, `.superbot-backup` (format and time) | The master key (by design, [ADR 0010](../adr/0010-secrets.md)); `.env`; the workspace; harness logins (`~/.claude`, `~/.codex`, …); per-run screen state; Caddy certificates | **Master key** (installer: `~superbot/.config/superbot/master.key`; Compose: `SUPERBOT_MASTER_KEY` in `deploy/docker/.env`). **`.env`** (login password, SSO settings). **The age identity**, if you encrypt. |
+| `app.sqlite` as an online SQLite `.backup` copy (users, sessions, Bots, chats, routines, approvals, sealed secrets, the audit log), still encrypted when the database is ([database encryption](database-encryption.md)), Bot memory (`bots/`), user files (`USER.md`, `users/`), Hermes per-Bot data, `.superbot-backup` (format and time) | The master key (by design, [ADR 0010](../adr/0010-secrets.md)); `.env`; the workspace; harness logins (`~/.claude`, `~/.codex`, …); per-run screen state; Caddy certificates | **Master key** (installer: `~superbot/.config/superbot/master.key`; Compose: `SUPERBOT_MASTER_KEY` in `deploy/docker/.env`). **`.env`** (login password, SSO settings). **The age identity**, if you encrypt. |
 
-Without the master key, saved secrets and approvals' tool input can't be read; botd refuses to start on the restored data until you give it the right key or tell it to drop them ([master key](../../deploy/README.md#master-key)).
+Without the master key, an encrypted database can't be opened at all, and in a plain one saved secrets and approvals' tool input can't be read; botd refuses to start on the restored data until you give it the right key ([master key](../../deploy/README.md#master-key)). Plain copies left by encrypting the database (`app.sqlite-plain-*`) are never archived.
 
-The copy is safe while Bots are running: SQLite's `.backup` takes a consistent snapshot.
+The copy is safe while Bots are running: SQLite's online backup takes a consistent snapshot. For an encrypted database `superbot-backup` runs `botd database backup`, the same online backup under the same key, so it needs `botd` on its `PATH` (or `SUPERBOT_BOTD`) and the master key: the systemd unit reads it from `.env`, `--home` falls back to `~/.config/superbot/master.key`, and the Compose `backup` service gets `SUPERBOT_MASTER_KEY`. Archives are then encrypted twice over: the database by SQLCipher under the master key, the whole archive by age when it has recipients ([ADR 0116](../adr/0116-database-encrypted-at-rest.md)).
 
 ## Schedule
 
@@ -102,7 +102,7 @@ Then `sudo systemctl start superbot-backup.service` or `docker compose up -d`. I
 
 ## Check an archive
 
-`superbot-restore --check` unpacks to a temporary folder, runs SQLite's `integrity_check`, and prints what's inside, without touching the live data. Run it on every off-site copy you depend on, at least monthly.
+`superbot-restore --check` unpacks to a temporary folder, runs SQLite's `integrity_check`, and prints what's inside, without touching the live data. An encrypted database is read with `botd database query` and the master key (from `--home`'s `.env`, or `SUPERBOT_MASTER_KEY(_FILE)`): with another key `--check` and restores refuse it; with none (or no `botd`) the counts show `?`, it isn't checked, and a restore still puts it back for botd to open with its key; any other error reading it (an unreadable key file, a malformed key) stops `--check` and the restore. Run it on every off-site copy you depend on, at least monthly.
 
 ```sh
 sudo -u superbot superbot-restore --check /home/superbot/superbot/backups/superbot-20261119-031500.tar.gz
@@ -116,7 +116,8 @@ newest audit:     2026-11-19T03:14:40Z
 users:            12
 bots:             9
 ...
-needs master key: yes
+needs master key: yes (the database is encrypted under it)
+database:         encrypted (SQLCipher, ADR 0116)
 ```
 
 `newest audit` is the last change the archive holds: the start of the data you'd lose.
@@ -159,7 +160,7 @@ curl -fsS http://127.0.0.1:3000/healthz
 4. If the domain changed, update the SSO redirect URLs at your IdP (and re-run the installer with `--domain` so Caddy serves the new name).
 5. Log the harness CLIs in again (`sudo -iu superbot claude login`, …). Restore the workspace from your own copy if you keep one.
 
-With the wrong master key, botd logs `the master key doesn't open this database's encrypted values (wrong key)` and exits; fix the key and start again.
+With the wrong master key, botd logs `the master key doesn't open the encrypted database (wrong key)` (or, with a plain database, `the master key doesn't open this database's encrypted values (wrong key)`) and exits; fix the key and start again.
 
 ### Compose, same host
 
@@ -192,7 +193,7 @@ A restore you haven't tried is a hope. Two drills run in CI on every change to t
 |--|--|--|
 | Installer | [`deploy/backup-drill.sh`](../../deploy/backup-drill.sh), job `backup-drill` in `server.yml` | Installs the real systemd units with the installer's functions, seeds a Bot, a sealed secret, and a user, backs up through `superbot-backup.service` with age encryption, checks the archive holds no secret or key, checks the timer is persistent and fires within the RPO, then deletes the service user (data, `.env`, master key, local archives), reinstalls, shows botd refusing the new key, restores the off-host copies, and checks the data, the secret, the user, and the audit log. A change made after the backup is gone, as the RPO says. Restore budget: `SUPERBOT_DRILL_RTO_SECONDS` (300). |
 | Compose | [`deploy/docker/smoke-test.sh`](../../deploy/docker/smoke-test.sh), job `compose-smoke` in `docker.yml` | The `backup` service writes an age-encrypted archive; `--check` refuses it without the identity; then every volume is deleted, a fresh stack starts empty, and the archive is restored and checked. Restore budget: `SMOKE_RTO_SECONDS` (300). |
-| Scripts | [`deploy/test-backup.sh`](../../deploy/test-backup.sh), job `backup-scripts` | Retention, name collisions, the installer's `.env` layout, encryption failures, damaged, foreign, and newer-format archives refused before anything changes. |
+| Scripts | [`deploy/test-backup.sh`](../../deploy/test-backup.sh), job `backup-scripts` | Retention, name collisions, the installer's `.env` layout, encryption failures, damaged, foreign, and newer-format archives refused before anything changes; with the release `botd`, an encrypted database backed up still encrypted, checked and restored with its key, unread without one, and refused under another. |
 
 **Your own drill, quarterly** (and after any big upgrade): restore the latest **off-site** archive onto a scratch server following [Installer, new host](#installer-new-host) or [Compose, new host](#compose-new-host), sign in, and check a few Bots and chats. Time it from "server gone" to `/healthz`: that is your real RTO. Write down the date, the archive's `newest audit`, and the time taken. On a throwaway VM you can also run the installer drill itself (it deletes the `superbot` user, so never on a real server):
 

@@ -383,7 +383,7 @@ The `harness-e2e` workflow's Footprint job runs it on the pinned CLIs and upload
 
 ## Master key
 
-botd encrypts saved secrets (`botctl secret set`) and approvals' tool input with a master key: `~superbot/.config/superbot/master.key` (mode `0600`, folder `0700`). The installer creates it on first install and on the first `--upgrade` that needs it, before botd restarts, and never replaces it. It is outside `DATA_DIR`, so the daily backups don't include it: **copy it somewhere safe, apart from the backups.** Design and threat model: [ADR 0010](../docs/adr/0010-secrets.md).
+botd encrypts the database and, inside it, saved secrets (`botctl secret set`) and approvals' tool input with a master key: `~superbot/.config/superbot/master.key` (mode `0600`, folder `0700`). The installer creates it on first install and on the first `--upgrade` that needs it, before botd restarts, and never replaces it. It is outside `DATA_DIR`, so the daily backups don't include it: **copy it somewhere safe, apart from the backups.** Design and threat model: [ADR 0010](../docs/adr/0010-secrets.md).
 
 ```sh
 # Save a key for the Bots (value on stdin, stays out of shell history); list names; delete
@@ -391,14 +391,15 @@ sudo -u superbot env SUPERBOT_PASSWORD="$(sudo grep -oP '^AUTH_PASSWORD=\K.*' ~s
 ```
 
 - **Upgrading** from a release before secrets: the first start seals old approval inputs and scrubs known secrets (the login password, keys in `.env`) from saved chats. Nothing else changes. To downgrade, restore a backup from before the upgrade.
-- **Restoring on a new server**: restore the backup, then put the key back at the same path (owner `superbot`, mode `0600`) before starting botd. With a missing or wrong key, botd logs why and refuses to start; the installer refuses too rather than make a new key over sealed data.
-- **Key lost for good**: add `SUPERBOT_FORGET_SEALED=1` to `.env` and restart. Saved secrets and old approval inputs are dropped, everything else is kept, and a new key is made. It only drops what the current key can't open, but remove the line afterwards.
+- **Database encryption**: new installs write `SUPERBOT_DATABASE_ENCRYPTION=required`, so `app.sqlite` is SQLCipher, encrypted under a key derived from the master key. An install from before keeps a plain database, with a warning, until `--upgrade --database-encryption required`; botd then encrypts it on its next start and keeps a plain copy beside it until you delete it. `botctl database` shows which. Guide: [database encryption](../docs/ops/database-encryption.md) ([ADR 0116](../docs/adr/0116-database-encrypted-at-rest.md)).
+- **Restoring on a new server**: restore the backup, then put the key back at the same path (owner `superbot`, mode `0600`) before starting botd. With a missing or wrong key, botd logs why and refuses to start; the installer refuses too rather than make a new key over sealed data or an encrypted database.
+- **Key lost for good**: an encrypted database can't be opened without it; restore a backup and the key it was made under. With a plain database, add `SUPERBOT_FORGET_SEALED=1` to `.env` and restart: saved secrets and old approval inputs are dropped, everything else is kept, and a new key is made. It only drops what the current key can't open, but remove the line afterwards.
 - **Your own key**: set `SUPERBOT_MASTER_KEY` (64 hex chars, `openssl rand -hex 32`) in `.env` instead of the file, or point `SUPERBOT_MASTER_KEY_FILE` elsewhere. Not both.
-- **Rotating the key**: keep the old key as `SUPERBOT_MASTER_KEY_PREVIOUS_FILE` (or `SUPERBOT_MASTER_KEY_PREVIOUS`), put a new one in its place, and restart: botd seals everything again under the new key in one transaction and records `secret.master_key_rotated`. Then remove the previous key. Compose: `./init.sh --rotate-master-key`. Steps, checks and recovery: [master key rotation](../docs/ops/master-key-rotation.md) ([ADR 0096](../docs/adr/0096-master-key-rotation.md)).
+- **Rotating the key**: keep the old key as `SUPERBOT_MASTER_KEY_PREVIOUS_FILE` (or `SUPERBOT_MASTER_KEY_PREVIOUS`), put a new one in its place, and restart: botd re-encrypts the database and seals everything again under the new key, and records `secret.master_key_rotated`. Then remove the previous key. Compose: `./init.sh --rotate-master-key`. Steps, checks and recovery: [master key rotation](../docs/ops/master-key-rotation.md) ([ADR 0096](../docs/adr/0096-master-key-rotation.md)).
 
 ## Backups and restore
 
-`superbot-backup.timer` archives `DATA_DIR` daily at 03:15 into `~superbot/superbot/backups/superbot-<UTC stamp>.tar.gz` (an online SQLite copy, so safe while Bots run) and keeps `SUPERBOT_BACKUP_RETENTION_DAYS` (default 14). Set `SUPERBOT_BACKUP_AGE_RECIPIENTS` in `.env` to encrypt them with age. Same tool and format as Compose.
+`superbot-backup.timer` archives `DATA_DIR` daily at 03:15 into `~superbot/superbot/backups/superbot-<UTC stamp>.tar.gz` (an online SQLite copy, so safe while Bots run; an encrypted database stays encrypted in it, copied by `botd database backup`) and keeps `SUPERBOT_BACKUP_RETENTION_DAYS` (default 14). Set `SUPERBOT_BACKUP_AGE_RECIPIENTS` in `.env` to encrypt them with age. Same tool and format as Compose.
 
 ```sh
 sudo systemctl start superbot-backup.service                     # back up now
@@ -417,7 +418,7 @@ sudo SERVER_BACKUP_S3_ACCESS_KEY_ID=<access-key-id> SERVER_BACKUP_S3_SECRET_ACCE
 botctl backups                                                   # the store, the newest copies, the RPO
 ```
 
-Without a store, archives stay on the host: the installer's summary, botd's log, the setup checklist and `/metrics` say so. Copy the master key and `.env` off the server yourself: they are never in archives. The default RPO is 24 hours, and only for copies that survive the host. Full procedure (new host, hourly schedule, encryption, the drills CI runs, RPO/RTO targets): [docs/ops/backup-restore.md](../docs/ops/backup-restore.md).
+Without a store, archives stay on the host: the installer's summary, botd's log, the setup checklist and `/metrics` say so. Copy the master key and `.env` off the server yourself: they are never in archives, and an encrypted database in an archive opens only with that key. The default RPO is 24 hours, and only for copies that survive the host. Full procedure (new host, hourly schedule, encryption, the drills CI runs, RPO/RTO targets): [docs/ops/backup-restore.md](../docs/ops/backup-restore.md).
 
 ## Computer / screens
 
@@ -468,6 +469,8 @@ The metrics cover requests (by route class, method and status class, with latenc
 **Server backups.** `superbot_server_backup_off_host` is 1 when botd copies its backups off the host and 0 when they stay on it; with a store, `/metrics` adds the RPO, the newest copy's age and time, and whether it is past the RPO. Design: [ADR 0109](../docs/adr/0109-server-backups-off-the-host.md). Alert rules (backups on the host, past the RPO, copies failing) are in [`prometheus/superbot-server-backups.rules.yml`](prometheus/superbot-server-backups.rules.yml), tested with `promtool test rules prometheus/superbot-server-backups.rules.test.yml`.
 
 **Backup encryption.** `superbot_backup_encrypted{target}` is 1 when a backup target is age-encrypted and 0 when it is plain, for `server_archives` (superbot-backup's archives), `server_copies` (botd's off-host copies) and `machines` (Incus machines' off-host backups); `superbot_backup_plaintext_allowed` is 1 with `SUPERBOT_BACKUP_ENCRYPTION=off`. Design: [ADR 0114](../docs/adr/0114-backups-encrypted-by-default.md). The alert rule (a target plain for an hour, unless plain by choice) is in [`prometheus/superbot-backup-encryption.rules.yml`](prometheus/superbot-backup-encryption.rules.yml), tested with `promtool test rules prometheus/superbot-backup-encryption.rules.test.yml`.
+
+**Database encryption.** `superbot_database_encrypted` is 1 when `app.sqlite` is encrypted with SQLCipher and 0 when it is plain; `superbot_database_plaintext_allowed` is 1 with `SUPERBOT_DATABASE_ENCRYPTION=off`; `superbot_database_plain_copies` counts plain copies left in `DATA_DIR` by encrypting it. Design: [ADR 0116](../docs/adr/0116-database-encrypted-at-rest.md). The alert rules (plain for an hour, unless plain by choice; a plain copy left for a day) are in [`prometheus/superbot-database-encryption.rules.yml`](prometheus/superbot-database-encryption.rules.yml), tested with `promtool test rules prometheus/superbot-database-encryption.rules.test.yml`.
 
 **Machine backups.** With Linode machines, `/metrics` shows running machines by tier with Linode Backups on or off and, with `MACHINE_BACKUPS=on` (the default), the oldest newest backup's age, those past the RPO (`MACHINE_BACKUPS_RPO_HOURS`, 26 by default) and the RPO itself, read from what Linode last said of each machine, never per machine. botd also audits and emails each machine that goes past it (`machine.rpo_breached`). Design: [ADR 0110](../docs/adr/0110-linode-machine-recovery-objectives.md); objectives and the restore procedure: [machine recovery](../docs/ops/machine-recovery.md#linode-machines). Alert rules for stale backups and backups left off are in [`prometheus/superbot-backups.rules.yml`](prometheus/superbot-backups.rules.yml), tested with `promtool test rules prometheus/superbot-backups.rules.test.yml`; load them next to the other rules.
 
@@ -728,7 +731,7 @@ Without a domain, `./init.sh` gives plain HTTP at `http://localhost`, published 
 | `users` | `/srv/superbot/users` | With [per-user accounts](#per-user-accounts-in-docker): each user's home (harness logins), workspace, memory copies, and Bots' harness state. |
 | `caddy-data`, `caddy-config` | Caddy | Certificates and ACME account. |
 
-`init.sh` also writes a random `SUPERBOT_MASTER_KEY` once, which encrypts saved secrets ([master key](#master-key)); Compose refuses to start without it. To replace it, run `./init.sh --rotate-master-key` and follow [master key rotation](../docs/ops/master-key-rotation.md). Save API keys for the Bots encrypted instead of in `.env` with `SUPERBOT_PASSWORD=<AUTH_PASSWORD> docker compose exec -T -e SUPERBOT_PASSWORD botd botctl secret set OPENAI_API_KEY < key.txt`.
+`init.sh` also writes a random `SUPERBOT_MASTER_KEY` once, which encrypts the database and saved secrets ([master key](#master-key)), and, for a new `.env`, `SUPERBOT_DATABASE_ENCRYPTION=required` (`--database-encryption` changes it; [database encryption](../docs/ops/database-encryption.md)); Compose refuses to start without it. To replace it, run `./init.sh --rotate-master-key` and follow [master key rotation](../docs/ops/master-key-rotation.md). Save API keys for the Bots encrypted instead of in `.env` with `SUPERBOT_PASSWORD=<AUTH_PASSWORD> docker compose exec -T -e SUPERBOT_PASSWORD botd botctl secret set OPENAI_API_KEY < key.txt`.
 
 Secure by default: Compose refuses to start without `AUTH_PASSWORD`; the image sets `HOST=0.0.0.0`, so `botd` itself also refuses to run without it, and `ALLOW_NO_AUTH` is forced off. `ALLOWED_HOSTS` always includes `SUPERBOT_DOMAIN` (or `localhost`); add other names, such as `localhost:8080` when you change `SUPERBOT_HTTP_PORT`, in `.env`.
 
@@ -851,7 +854,7 @@ Archives include the audit log (`audit_events` lives in `app.sqlite`). See [Audi
 
 `superbot-restore` checks the archive with `PRAGMA integrity_check` before it swaps anything, and refuses to run while `botd` is up.
 
-Archives don't include `SUPERBOT_MASTER_KEY`, by design. Keep a copy of `.env` (or at least that line) somewhere safe, apart from the archives: restoring onto a new host needs the same key, or saved secrets can't be read (see [master key](#master-key) for the way out if it is lost).
+Archives don't include `SUPERBOT_MASTER_KEY`, by design. Keep a copy of `.env` (or at least that line) somewhere safe, apart from the archives: restoring onto a new host needs the same key, or the encrypted database and saved secrets can't be read (see [master key](#master-key) for the way out if it is lost).
 
 Archives do not include the `workspace` volume (Bots' files) or the `home` volume (harness logins: secrets; log in again after a fresh restore). Back those up with a raw volume copy if you need them:
 
@@ -870,7 +873,7 @@ The two installs are independent; do not run both on one host (both want ports 8
 sudo systemctl disable --now superbot superbot-backup.timer caddy
 sudo -u superbot superbot-backup --home /home/superbot - > superbot-migrate.tar.gz
 cd superbot/deploy/docker && ./init.sh --domain bots.example.com   # reuse AUTH_PASSWORD from ~superbot/superbot/.env if you like
-# Carry the master key over (replacing the one init.sh made), or saved secrets won't open:
+# Carry the master key over (replacing the one init.sh made), or the database and saved secrets won't open:
 key=$(sudo cat ~superbot/.config/superbot/master.key) && sed -i "s|^SUPERBOT_MASTER_KEY=.*|SUPERBOT_MASTER_KEY='$key'|" .env
 docker compose up -d && docker compose stop botd backup
 docker compose run --rm --no-deps -T botd superbot-restore - < superbot-migrate.tar.gz
