@@ -121,6 +121,9 @@ mod rbac;
 mod retention;
 #[cfg(test)]
 mod retention_http_tests;
+mod roles;
+#[cfg(test)]
+mod roles_http_tests;
 #[cfg(test)]
 mod run_grants_http_tests;
 #[cfg(test)]
@@ -980,6 +983,10 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/machine/teammate/{owner}/harness-login/{id}/input", post(machines::logins::teammate_input))
         .route("/machine/teammate/{owner}/harness-logins", get(machines::logins::teammate_status))
         .route("/machine/teammate/{owner}/harness-logins/{harness}", delete(machines::logins::teammate_logout))
+        .route("/roles", get(roles::list).post(roles::create))
+        .route("/roles/{id}", get(roles::get).patch(roles::update).delete(roles::delete))
+        .route("/roles/{id}/users/{user}", put(roles::assign).delete(roles::unassign))
+        .route("/roles/{id}/teams/{team}/users/{user}", put(roles::assign_in_team).delete(roles::unassign_in_team))
         .route("/sessions", get(users::list_sessions))
         .route("/sessions/{id}", delete(users::revoke_session))
         .route("/signups", get(signups::list).post(signups::submit).layer(DefaultBodyLimit::max(signups::MAX_BODY)))
@@ -1386,10 +1393,12 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     if caller.principal == Principal::Bot && claimed.as_deref().is_some_and(|id| Some(id) != caller.bot.as_deref()) {
         return denied("bot_mismatch", "This token belongs to another Bot.".into());
     }
-    if !rbac::allows(caller.principal, need) {
-        let msg = match caller.principal {
-            Principal::Bot => "Only a signed-in person can do this, not a Bot.".to_string(),
-            Principal::User(r) => format!("Your role ({}) can't do this.", r.as_str()),
+    if !caller.can(need) {
+        let custom = caller.user.as_ref().and_then(|u| u.role_id.as_deref()).and_then(|id| a.app.as_ref()?.db.custom_role(id));
+        let msg = match (caller.principal, custom) {
+            (Principal::Bot, _) => "Only a signed-in person can do this, not a Bot.".to_string(),
+            (_, Some(r)) => format!("Your role ({}) can't do this.", r.name),
+            (Principal::User(r), None) => format!("Your role ({}) can't do this.", r.as_str()),
         };
         return denied("role", msg);
     }
@@ -1441,8 +1450,11 @@ fn sso_path(path: &str) -> Option<&str> {
 /// it also has good ones elsewhere.
 fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<Response>> {
     let h = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let operator = |method: &'static str| Caller { principal: Principal::User(Role::Admin), user: a.operator(), session: None, method, bot: None, bot_for: None, bot_token: None };
-    let from_session = |(s, u): (db::Session, db::User)| Caller { principal: Principal::User(u.role), user: Some(u), session: Some(s), method: "session", bot: None, bot_for: None, bot_token: None };
+    let operator = |method: &'static str| Caller { principal: Principal::User(Role::Admin), user: a.operator(), session: None, method, bot: None, bot_for: None, bot_token: None, grants: rbac::Perms::NONE };
+    let from_session = |(s, u): (db::Session, db::User)| match &a.app {
+        Some(app) => Caller::person(&app.db, u, Some(s), "session"),
+        None => Caller { principal: Principal::User(u.role), user: Some(u), session: Some(s), method: "session", bot: None, bot_for: None, bot_token: None, grants: rbac::Perms::NONE },
+    };
     let fail = |method: &str, reason: Option<&str>, clear: bool| {
         a.login_failed(source, method, reason);
         Err(Box::new(unauthorized(a, req, clear)))
@@ -1461,7 +1473,7 @@ fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<
                     Some(_) => {
                         // A Bot's call during its run (its approval hook, botctl) is part of the run's trace.
                         obs::trace::join_run(&e.run);
-                        Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token", bot: Some(e.bot), bot_for: e.for_user, bot_token: Some(e.id) })
+                        Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token", bot: Some(e.bot), bot_for: e.for_user, bot_token: Some(e.id), grants: rbac::Perms::NONE })
                     }
                 },
                 Err(r) => fail("bot_token", Some(r.reason()), false),
@@ -1834,7 +1846,7 @@ async fn state(State(app): State<AppState>, Extension(c): Extension<Caller>, Ext
     let tier = app.tier_of(me_id);
     let harnesses: Vec<&str> = adapters::installed().into_iter().filter(|h| tier.allows_harness(h)).collect();
     Json(json!({
-        "me": { "name": name, "id": c.user.as_ref().map(|u| &u.id), "email": c.user.as_ref().and_then(|u| u.email.as_ref()), "role": role, "permissions": rbac::granted(c.principal), "session": c.session.is_some(), "tier": tier.view() },
+        "me": { "name": name, "id": c.user.as_ref().map(|u| &u.id), "email": c.user.as_ref().and_then(|u| u.email.as_ref()), "role": role, "permissions": c.permissions(), "session": c.session.is_some(), "tier": tier.view() },
         "harnesses": harnesses,
         "defaultHarness": default_harness_for(&app, me_id),
         "bots": bots,
@@ -2628,7 +2640,7 @@ fn caller_now(app: &App, a: &Auth, c: &Caller) -> Option<Caller> {
         return None;
     }
     let u = app.db.user(&s.user_id)?;
-    Some(Caller { principal: Principal::User(u.role), user: Some(u), ..c.clone() })
+    Some(Caller { principal: Principal::User(u.role), grants: app.db.user_perms(&u), user: Some(u), ..c.clone() })
 }
 
 /// With teammates' own users on machines (ADR 0048), whose screen of `bot` a caller
@@ -3759,7 +3771,7 @@ mod tests {
             .route("/api/bots/{id}/routines", get(list_routines).post(create_routine))
             .route("/api/routines/{id}", patch(update_routine).delete(delete_routine))
             .layer(Extension(Who { actor: Actor::operator(), source: Source::default() }))
-            .layer(Extension(Caller { principal: Principal::User(Role::Admin), user: None, session: None, method: "none", bot: None, bot_for: None, bot_token: None }))
+            .layer(Extension(Caller { principal: Principal::User(Role::Admin), user: None, session: None, method: "none", bot: None, bot_for: None, bot_token: None, grants: rbac::Perms::NONE }))
             .with_state(app.clone());
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
