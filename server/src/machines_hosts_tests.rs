@@ -171,6 +171,8 @@ pub(crate) async fn back_up(env: &Env, uid: &str) -> crate::db::MachineBackup {
 
 pub(crate) async fn settled(env: &Env, id: &str) -> crate::db::MachineRestore {
     until("the restore", || env.app.db.machine_restore(id).is_some_and(|r| !matches!(r.state.as_str(), "importing" | "replacing"))).await;
+    // It's enrolling before the restored machine boots; the restore holds the lock until then.
+    drop(env.app.control_plane.get().unwrap().lock_ops().await);
     env.app.db.machine_restore(id).unwrap()
 }
 
@@ -294,7 +296,6 @@ async fn a_lost_hosts_machines_are_restored_onto_another_host_and_enroll_anew() 
     let mm = env.app.db.machine(&m.id).unwrap();
     assert_eq!(mm.provider_id.as_deref(), Some(format!("b/{}", m.label).as_str()), "its record names its new host");
     assert_eq!(mm.state, State::Running);
-    until("the copy to boot", || env.b.instance(&m.label).is_some_and(|i| i.status == "Running")).await;
     let i = env.b.instance(&m.label).unwrap();
     assert_eq!((i.status.as_str(), read(&env.b, &m.label, "/home/user/notes.txt").as_deref()), ("Running", Some("version 1")));
     assert!(env.b.instance(&format!("{}-restore", m.label)).is_none());
