@@ -5,7 +5,9 @@ name: docs
 # apps/client/ run the same test in the server workflow's `cargo test`. Any change under
 # .github/ also checks that actions stay pinned by commit (ADR 0100) and that the docker
 # workflow still scans, signs and attests its images (ADR 0101), and that the release
-# workflow checks CHANGELOG.md and publishes only from checked tags (ADR 0111).
+# workflow checks CHANGELOG.md and publishes only from checked tags (ADR 0111). The site job
+# builds the public site and docs portal from docs/ and fails on any broken internal link
+# (ADR 0118); the site is kept as an artifact, never published from here.
 on:
   push:
     paths:
@@ -20,6 +22,9 @@ on:
       - '.grype.yaml'
       - 'deploy/README.md'
       - '.cargo/**'
+      - 'site/**'
+      - 'server/src/bin/superbot-site/**'
+      - 'deploy/tiers.example.json'
   pull_request:
     paths:
       - 'docs/**'
@@ -33,6 +38,9 @@ on:
       - '.grype.yaml'
       - 'deploy/README.md'
       - '.cargo/**'
+      - 'site/**'
+      - 'server/src/bin/superbot-site/**'
+      - 'deploy/tiers.example.json'
 
 permissions:
   contents: read
@@ -52,3 +60,24 @@ jobs:
       - run: cargo test --test image_supply_chain
       # ADR 0111: CHANGELOG.md is checked and each tag becomes a release, with minimal permissions.
       - run: cargo test --test release_workflow
+
+  site:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+      - run: cargo test --locked --bin superbot-site
+      - run: node --test server/src/bin/superbot-site/assets/search.test.js
+      # Fails on any broken internal link in docs/ or in the built pages.
+      - run: cargo run --locked --bin superbot-site -- --out target/site
+      - name: Keep the built site
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: superbot-site
+          path: target/site
+          retention-days: 14
