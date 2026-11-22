@@ -7,7 +7,12 @@
 //! row, with a status, for every criterion it claims to cover, and the readiness
 //! checklist (#50) a well-formed row for every gap the mapping lists. The legal templates
 //! (#48) and the DPIA template (#58) must say they are drafts for legal review and not
-//! legal advice, claim no certification, and keep the provider's details as placeholders.
+//! legal advice, claim no certification, and keep the provider's details as
+//! placeholders. The policy set
+//! (`docs/security/policies/`, #57, ADR 0130) is checked like the rest of the pack, and
+//! each policy must name a role as its owner, a review cadence and only checklist items
+//! that exist; the Type II evidence plan must keep a row for every criterion and list
+//! every checklist row under its own criterion.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -170,29 +175,48 @@ fn path_refs(md: &str) -> Vec<(usize, String)> {
     out
 }
 
-#[test]
-fn every_link_in_the_security_pack_resolves() {
-    let mut files: Vec<PathBuf> = fs::read_dir(pack())
-        .expect("docs/security exists")
+fn policies() -> PathBuf {
+    pack().join("policies")
+}
+
+/// The Markdown files directly in `dir`, sorted.
+fn markdown_in(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|_| panic!("{} exists", dir.display()))
         .map(|e| e.unwrap().path())
         .filter(|p| p.extension().is_some_and(|e| e == "md"))
         .collect();
     files.sort();
+    files
+}
+
+#[test]
+fn every_link_in_the_security_pack_resolves() {
+    let mut files = markdown_in(&pack());
     assert!(files.iter().any(|f| f.ends_with("README.md")), "docs/security/README.md indexes the pack");
+    files.extend(markdown_in(&policies()));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links in docs/security:\n{}", bad.join("\n"));
 }
 
+/// The link targets in `index`, without anchors.
+fn linked_from(index: &Path) -> HashSet<String> {
+    let md = fs::read_to_string(index).unwrap();
+    links(&md).into_iter().map(|(_, t)| t.split('#').next().unwrap().to_string()).collect()
+}
+
 #[test]
 fn the_index_links_every_page_of_the_pack() {
-    let index = fs::read_to_string(pack().join("README.md")).unwrap();
-    let linked: HashSet<String> = links(&index).into_iter().map(|(_, t)| t.split('#').next().unwrap().to_string()).collect();
-    for entry in fs::read_dir(pack()).unwrap() {
-        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
-        if name.ends_with(".md") && name != "README.md" {
-            assert!(linked.contains(&name), "docs/security/README.md doesn't link {name}");
+    for (index, dir) in [(pack().join("README.md"), pack()), (policies().join("README.md"), policies())] {
+        let linked = linked_from(&index);
+        for file in markdown_in(&dir) {
+            let name = file.file_name().unwrap().to_string_lossy().into_owned();
+            if name != "README.md" {
+                assert!(linked.contains(&name), "{} doesn't link {name}", index.display());
+            }
         }
     }
+    assert!(linked_from(&pack().join("README.md")).contains("policies/README.md"), "docs/security/README.md must link the policy set's index");
 }
 
 /// The AICPA 2017 Trust Services Criteria the SOC 2 mapping covers: Security (CC1-CC9),
@@ -373,6 +397,138 @@ fn the_legal_templates_are_labelled_drafts_with_placeholders() {
     }
 }
 
+/// The policy set the checklist's CC5.3-1 asks for, plus acceptable use (ADR 0130).
+const POLICIES: &[&str] = &[
+    "information-security.md",
+    "access-control.md",
+    "change-management.md",
+    "incident-response.md",
+    "vendor-management.md",
+    "business-continuity.md",
+    "data-classification-and-retention.md",
+    "acceptable-use.md",
+];
+const CADENCES: &[&str] = &["yearly", "quarterly", "monthly"];
+
+/// A policy's header table, `| Field | Value |` rows before its first `## ` heading.
+fn header(md: &str) -> HashMap<String, String> {
+    md.lines()
+        .take_while(|l| !l.starts_with("## "))
+        .filter_map(|l| {
+            let cells: Vec<&str> = l.strip_prefix('|')?.trim_end().strip_suffix('|')?.split('|').map(str::trim).collect();
+            (cells.len() == 2).then(|| (cells[0].to_string(), cells[1].to_string()))
+        })
+        .collect()
+}
+
+/// Words that look like email addresses, so no policy names a person by one.
+fn emails(md: &str) -> Vec<String> {
+    md.split(|c: char| c.is_whitespace() || "()<>[]`,;\"'|".contains(c))
+        .filter_map(|w| {
+            let (user, host) = w.split_once('@')?;
+            let host = host.trim_end_matches('.');
+            (!user.is_empty() && host.contains('.') && !host.starts_with('.')).then(|| w.to_string())
+        })
+        .collect()
+}
+
+fn checklist_ids() -> HashSet<String> {
+    let md = fs::read_to_string(pack().join("soc2-readiness-checklist.md")).unwrap();
+    checklist_rows(&md).into_iter().map(|r| r[0].clone()).collect()
+}
+
+#[test]
+fn the_policy_set_is_complete_and_well_formed() {
+    let ids = checklist_ids();
+    let index = fs::read_to_string(policies().join("README.md")).expect("docs/security/policies/README.md indexes the policy set");
+    for name in std::iter::once("README.md").chain(POLICIES.iter().copied()) {
+        let md = fs::read_to_string(policies().join(name)).unwrap_or_else(|_| panic!("docs/security/policies/{name} exists"));
+        assert_eq!(certification_claims(&md), Vec::<usize>::new(), "{name} must not claim a certification (lines listed)");
+        assert_eq!(emails(&md), Vec::<String>::new(), "{name} must name roles, never people: no email addresses");
+        assert!(md.contains("not SOC 2 certified"), "{name} must say plainly that SuperBot is not certified");
+    }
+    assert!(index.to_lowercase().contains("drafts, not adopted"), "the policy index must say the policies are drafts until adopted");
+    let mut covered = HashSet::new();
+    for name in POLICIES {
+        let md = fs::read_to_string(policies().join(name)).unwrap();
+        let h = header(&md);
+        let field = |f: &str| h.get(f).unwrap_or_else(|| panic!("{name}: its header table needs a `{f}` row"));
+        assert!(OWNERS.contains(&field("Owner").as_str()), "{name}: owner `{}` must be a role from the checklist, one of {OWNERS:?}", field("Owner"));
+        assert!(OWNERS.contains(&field("Approver").as_str()), "{name}: approver `{}` must be one of {OWNERS:?}", field("Approver"));
+        let review = field("Review").to_lowercase();
+        assert!(CADENCES.iter().any(|c| review.contains(c)), "{name}: review `{review}` must give a cadence, one of {CADENCES:?}");
+        let status = field("Status");
+        assert!(status.starts_with("Draft") || status.starts_with("Approved"), "{name}: status `{status}` must start with Draft or Approved");
+        let controls: Vec<&str> = field("Controls").split(',').map(str::trim).filter(|c| !c.is_empty()).collect();
+        assert!(!controls.is_empty(), "{name}: must name the checklist items it covers");
+        for c in controls {
+            assert!(ids.contains(c), "{name}: `{c}` isn't a row of the readiness checklist");
+            covered.insert(c.to_string());
+        }
+    }
+    for want in ["CC5.3-1", "CC7.3-1", "CC7.4-1", "CC7.5-1", "CC8.1-2", "CC9.1-2", "CC9.2-1", "C1.1-2"] {
+        assert!(covered.contains(want), "no policy covers {want}, which asks for one");
+    }
+
+    let ir = fs::read_to_string(policies().join("incident-response.md")).unwrap();
+    let headings = anchors(&ir);
+    for h in ["severity-levels", "roles", "runbook", "communication", "post-incident-review", "testing-the-plan"] {
+        assert!(headings.contains(h), "the incident response plan needs a `{h}` section");
+    }
+    for sev in ["SEV-1", "SEV-2", "SEV-3", "SEV-4"] {
+        assert!(ir.contains(&format!("| {sev} ")), "the incident response plan's severity table needs a {sev} row");
+    }
+
+    let bcp = fs::read_to_string(policies().join("business-continuity.md")).unwrap();
+    let targets = linked_from(&policies().join("business-continuity.md"));
+    for want in ["../../ops/backup-restore.md", "../../ops/machine-recovery.md", "../machine-recovery-objectives.md"] {
+        assert!(targets.contains(want), "the business continuity plan must link {want}");
+    }
+    assert!(bcp.contains("RPO") && bcp.contains("RTO"), "the business continuity plan must state its RPO and RTO");
+
+    let dc = fs::read_to_string(policies().join("data-classification-and-retention.md")).unwrap();
+    let cited: HashSet<String> = adr_refs(&dc).into_iter().map(|(_, n)| n).collect();
+    for adr in ["0009", "0098", "0102", "0112"] {
+        assert!(cited.contains(adr), "the data classification and retention policy must cite ADR {adr}");
+    }
+    assert!(linked_from(&policies().join("data-classification-and-retention.md")).contains("../data-flows.md"), "the data classification policy must link data flows");
+}
+
+#[test]
+fn the_type_ii_evidence_plan_covers_every_criterion() {
+    let md = fs::read_to_string(pack().join("soc2-evidence-plan.md")).expect("docs/security/soc2-evidence-plan.md exists");
+    assert!(md.contains("not SOC 2 certified"), "the evidence plan must say plainly that SuperBot is not certified");
+    assert_eq!(certification_claims(&md), Vec::<usize>::new(), "the evidence plan must not claim a certification (lines listed)");
+    let rows: Vec<Vec<String>> = md
+        .lines()
+        .filter_map(|l| {
+            let cells: Vec<String> = l.strip_prefix('|')?.trim_end().strip_suffix('|')?.split('|').map(|c| c.trim().to_string()).collect();
+            criterion(cells.first()?.split_whitespace().next()?).is_some_and(|(_, n)| n.is_some()).then_some(cells)
+        })
+        .collect();
+    let want: Vec<String> = CRITERIA.iter().flat_map(|(g, n)| (1..=*n).map(move |i| format!("{g}.{i}"))).collect();
+    let got: Vec<String> = rows.iter().map(|r| r[0].split_whitespace().next().unwrap().to_string()).collect();
+    assert_eq!(got, want, "soc2-evidence-plan.md must have one row per criterion, in order");
+    let ids = checklist_ids();
+    let mut listed = HashSet::new();
+    for r in &rows {
+        let c = r[0].split_whitespace().next().unwrap();
+        assert_eq!(r.len(), 5, "{c}: a row has 5 cells: criterion, already produced, how it's collected, still manual, checklist rows");
+        assert!(r[1..4].iter().all(|cell| !cell.is_empty()), "{c}: every cell needs something, even `None`");
+        for id in r[4].split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            assert!(ids.contains(id), "{c}: `{id}` isn't a row of the readiness checklist");
+            assert!(id.starts_with(&format!("{c}-")), "{c}: `{id}` belongs under its own criterion");
+            listed.insert(id.to_string());
+        }
+    }
+    let mut missing: Vec<&String> = ids.iter().filter(|id| !listed.contains(*id)).collect();
+    missing.sort();
+    assert!(missing.is_empty(), "the evidence plan must list every checklist row under its criterion; missing {missing:?}");
+    for want in ["policies/README.md", "soc2-readiness-checklist.md"] {
+        assert!(linked_from(&pack().join("soc2-evidence-plan.md")).contains(want), "the evidence plan must link {want}");
+    }
+}
+
 #[test]
 fn the_checker_catches_what_it_should() {
     assert_eq!(certification_claims("We are SOC 2 certified.\nSuperBot is not SOC 2 certified.\nNo one here is certified.\n`certified`\n"), vec![1]);
@@ -397,4 +553,8 @@ fn the_checker_catches_what_it_should() {
     let a = anchors(md);
     assert!(a.contains("data-flows") && a.contains("at-rest") && a.contains("at-rest-1"));
     assert!(anchors("## Bots: a token for each run").contains("bots-a-token-for-each-run"));
+    assert_eq!(emails("Ask ops@example.com, not @greptileai or user:<email> or a@b."), vec!["ops@example.com"]);
+    let h = header("# P\n\n| Field | Value |\n|-------|-------|\n| Owner | Security owner |\n| Controls | CC5.3-1, CC7.4-1 |\n\n## Scope\n| Owner | Nobody |\n");
+    assert_eq!(h.get("Owner").map(String::as_str), Some("Security owner"));
+    assert_eq!(h.get("Controls").map(String::as_str), Some("CC5.3-1, CC7.4-1"));
 }
