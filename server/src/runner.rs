@@ -270,6 +270,8 @@ pub struct App {
     pub plans: OnceLock<crate::plans::Settings>,
     /// Copies of the server's own backups off this host (ADR 0109).
     pub server_backups: OnceLock<Arc<crate::server_backups::ServerBackups>>,
+    /// Where evidence bundles are written, and when (ADR 0142).
+    pub evidence: OnceLock<Arc<crate::evidence::Settings>>,
     /// Whether the database is encrypted at rest, as found at startup (ADR 0116).
     pub database: OnceLock<crate::database_encryption::State>,
     closing: AtomicBool,
@@ -316,6 +318,7 @@ impl App {
             status: Default::default(),
             plans: OnceLock::new(),
             server_backups: OnceLock::new(),
+            evidence: OnceLock::new(),
             database: OnceLock::new(),
             closing: AtomicBool::new(false),
         })
