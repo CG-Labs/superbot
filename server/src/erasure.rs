@@ -32,31 +32,49 @@ const REASON: &str = "user_erased";
 /// One erasure at a time, so two requests for one user can't both run its steps.
 static ERASING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Whose erasure is under way. Their Bots are counted while it runs, so no Bot may
-/// become theirs, or stop being theirs, and nothing may start running for them.
-static UNDER_WAY: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// Whose erasure is under way, and whether it has stopped their runs. Their Bots are
+/// counted while it runs, so no Bot may become theirs, or stop being theirs; once their
+/// runs are stopped, none may start, whatever their status says meanwhile.
+static UNDER_WAY: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
 
-fn under_way_list() -> std::sync::MutexGuard<'static, Vec<String>> {
+fn under_way_list() -> std::sync::MutexGuard<'static, Vec<(String, bool)>> {
     UNDER_WAY.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Marks `user_id`'s erasure under way until dropped.
 pub(crate) struct UnderWay(String);
 
+impl UnderWay {
+    /// From here until the erasure ends, nothing starts on their Bots or for them.
+    pub(crate) fn stop_runs(&self) {
+        for (u, stopping) in under_way_list().iter_mut() {
+            if *u == self.0 {
+                *stopping = true;
+            }
+        }
+    }
+}
+
 impl Drop for UnderWay {
     fn drop(&mut self) {
-        under_way_list().retain(|u| *u != self.0);
+        under_way_list().retain(|(u, _)| *u != self.0);
     }
 }
 
 pub(crate) fn begin(user_id: &str) -> UnderWay {
-    under_way_list().push(user_id.into());
+    under_way_list().push((user_id.into(), false));
     UnderWay(user_id.into())
 }
 
 /// Whether `user_id`'s erasure is under way.
+#[cfg(test)]
 pub fn under_way(user_id: &str) -> bool {
-    under_way_list().iter().any(|u| u == user_id)
+    under_way_list().iter().any(|(u, _)| u == user_id)
+}
+
+/// Whether `user_id`'s erasure has stopped their runs and hasn't ended.
+pub fn runs_stopped(user_id: &str) -> bool {
+    under_way_list().iter().any(|(u, stopping)| u == user_id && *stopping)
 }
 
 /// Runs `f`, which gives a user a Bot or takes one from them, unless one of `users` is
@@ -64,7 +82,7 @@ pub fn under_way(user_id: &str) -> bool {
 /// that erasure lists their Bots or not at all. None: one of them is.
 pub fn unless_erasing<T>(users: &[&str], f: impl FnOnce() -> T) -> Option<T> {
     let list = under_way_list();
-    if users.iter().any(|u| list.iter().any(|x| x == u)) {
+    if users.iter().any(|u| list.iter().any(|(x, _)| x == u)) {
         return None;
     }
     Some(f())
@@ -160,7 +178,7 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
     };
     // From here no Bot becomes theirs or leaves them until the erasure ends, so the
     // primary Bot, which may have been given to them meanwhile, is checked once more.
-    let _under_way = begin(&u.id);
+    let under_way = begin(&u.id);
     if let Some(b) = owned(&app).into_iter().find(|b| b.primary) {
         return refuse(PRIMARY, json!({ "bot": b.id }), "They own the primary Bot, which can't be deleted. Give it to someone else first.".into());
     }
@@ -193,7 +211,8 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
     app.db.set_erasing_bots(&u.id, &bot_ids);
     // Runs record their end as whoever asked, so they must be over before the log is
     // rewritten: those on their Bots, and in others' Bots those they asked for, queued
-    // or started. Nothing new starts for them meanwhile (`under_way`).
+    // or started. Nothing new starts for them from here, even if they're enabled again.
+    under_way.stop_runs();
     let stopping: Vec<String> = bots.iter().map(|b| b.id.clone()).collect();
     for id in &stopping {
         app.stop(id);

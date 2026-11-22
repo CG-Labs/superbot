@@ -556,3 +556,32 @@ async fn runs_they_asked_for_in_others_bots_end_and_are_recorded_before_the_log_
         }
     }
 }
+
+#[tokio::test]
+async fn once_their_runs_are_stopped_nothing_starts_for_them_whatever_their_status() {
+    let (port, app, admin, _) = serve_app().await;
+    let dir = app.cfg.data_dir.join("gate");
+    crate::slots_http_tests::gated_claude(&app, &dir);
+    let started = || std::fs::read_to_string(dir.join("order")).unwrap_or_default().lines().count();
+    let (bob, _) = user_with(port, &admin, "bob@example.com", "member").await;
+    let (ada, ada_auth) = user_with(port, &admin, "ada@example.com", "member").await;
+    let bot = app.db.create_bot_owned("Shared", "#fff", "waddle", "claude", None, false, &bob, acl::Visibility::Shared).id;
+    app.db.set_grant(&bot, &ada, acl::Grant::Operator, &bob);
+    let (path, say) = (format!("/api/bots/{bot}/messages"), |text: &str| json!({ "text": text }).to_string());
+
+    // Marked, before her runs are stopped: her work runs, as a refused erasure would leave it.
+    let erasing = crate::erasure::begin(&ada);
+    assert_eq!(call(port, "POST", &path, &ada_auth, &say("first")).await.0, 202);
+    until("her run to start", || started() == 1).await;
+    std::fs::write(dir.join(format!("go-{bot}")), "").unwrap();
+    until("it to end", || !app.serving(&bot, None)).await;
+
+    // Her runs stopped: she's still active (as if enabled again), and nothing starts.
+    erasing.stop_runs();
+    assert!(app.db.user(&ada).unwrap().active());
+    assert_eq!(call(port, "POST", &path, &ada_auth, &say("second")).await.0, 202);
+    until("the Bot to say why", || app.db.last_message(&bot).is_some_and(|m| m.text.contains("being erased"))).await;
+    assert_eq!(started(), 1, "nothing else started");
+    drop(erasing);
+    assert!(!crate::erasure::runs_stopped(&ada));
+}
