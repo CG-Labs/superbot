@@ -204,7 +204,7 @@ pub async fn prune_sessions(app: &Arc<App>, days: u32, at: i64) -> Value {
             keep,
             report,
             archives: Vec::new(),
-            probe: bots.of(Some(&m.user_id)).filter_map(|b| Some(format!("{}/{}", b.id, adapters::get(&b.harness)?.session_db()?))).collect(),
+            probe: turned(bots.of(Some(&m.user_id)).filter_map(|b| Some(format!("{}/{}", b.id, adapters::get(&b.harness)?.session_db()?))).collect()),
         };
         let what = format!("machine {}", m.id);
         match ask_machine(app, &m, &req).await {
@@ -262,6 +262,16 @@ pub async fn prune_sessions(app: &Arc<App>, days: u32, at: i64) -> Value {
     });
     finish(app, SESSIONS_LAST, "harness_sessions.pruned", &pass, failed, t.swept.files > 0 || t.hermes > 0);
     pass
+}
+
+/// `v` started at a random place each pass, so an agent that stops at its cap
+/// (`wire::RETENTION_FOUND_MAX`) still reaches every entry over passes.
+fn turned(mut v: Vec<String>) -> Vec<String> {
+    if !v.is_empty() {
+        let by = usize::from_str_radix(&crate::random_hex(4), 16).unwrap_or(0) % v.len();
+        v.rotate_left(by);
+    }
+    v
 }
 
 fn add(t: &mut Tally, what: &str, r: Result<Swept, String>) {

@@ -2015,9 +2015,15 @@ async fn retention(State(a): State<Arc<Agent>>, Json(r): Json<wire::RetentionReq
     let home = a.cfg.home.clone();
     let swept = move || {
         let mut out = crate::sweep::run(&s);
-        for (user, h) in std::iter::once((None, home)).chain(teammates.into_iter().map(|(t, h)| (Some(t), h))) {
-            for p in &r.probe {
-                if out.found.len() < wire::RETENTION_FOUND_MAX && std::fs::symlink_metadata(h.join("bots").join(p)).is_ok_and(|m| m.is_file()) {
+        // Each probe in every HOME before the next, in botd's order, which it turns each
+        // pass, so past the cap every database still gets its turn.
+        let homes: Vec<(Option<String>, PathBuf)> = std::iter::once((None, home)).chain(teammates.into_iter().map(|(t, h)| (Some(t), h))).collect();
+        'probes: for p in &r.probe {
+            for (user, h) in &homes {
+                if out.found.len() >= wire::RETENTION_FOUND_MAX {
+                    break 'probes;
+                }
+                if std::fs::symlink_metadata(h.join("bots").join(p)).is_ok_and(|m| m.is_file()) {
                     out.found.push((user.clone(), p.clone()));
                 }
             }
