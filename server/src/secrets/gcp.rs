@@ -632,10 +632,10 @@ mod tests {
             (vec![p, ("GCE_METADATA_HOST", "evil.example/path")], "GCE_METADATA_HOST"),
         ] {
             let e = ok(&pairs).err().unwrap_or_default();
-            assert!(e.contains(err), "{pairs:?}: {e}");
+            assert!(e.contains(err), "expected an error containing {err:?}");
         }
         let key = key_file(&Fake::default(), "http://token.example/token");
         let e = ok(&[("GCP_SECRET_MANAGER_AUTH", "service-account-key"), ("GCP_SERVICE_ACCOUNT_KEY", &key)]).err().unwrap();
-        assert!(e.contains("token_uri must use https"), "{e}");
+        assert!(e.contains("token_uri must use https"));
     }
 }
