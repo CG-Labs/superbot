@@ -104,21 +104,33 @@ fn path(method: Method, p: &str) -> Option<(Kind, Option<String>)> {
 /// The quoted `"bulkId:<id>"` values in a PATCH path filter such as
 /// `members[value eq "bulkId:u"]`, as (start, end, id) with start..end covering the
 /// quotes. Each quoted value is read as a JSON string, escapes and all, as the filter
-/// itself is.
+/// itself is. One pass over `s`, since a path can be most of a 1 MiB request.
 fn quoted_refs(s: &str) -> Vec<(usize, usize, String)> {
     let mut out = Vec::new();
-    let mut from = 0;
-    while let Some(at) = s[from..].find('"').map(|n| from + n) {
-        let mut strings = serde_json::Deserializer::from_str(&s[at..]).into_iter::<String>();
-        let Some(Ok(value)) = strings.next() else {
-            from = at + 1;
+    let mut chars = s.char_indices();
+    while let Some((at, c)) = chars.next() {
+        if c != '"' {
             continue;
-        };
-        let end = at + strings.byte_offset();
-        if let Some(id) = value.strip_prefix(BULK_ID) {
+        }
+        let mut end = None;
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => {
+                    end = Some(i + 1);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { break };
+        if let Ok(value) = serde_json::from_str::<String>(&s[at..end])
+            && let Some(id) = value.strip_prefix(BULK_ID)
+        {
             out.push((at, end, id.to_string()));
         }
-        from = end;
     }
     out
 }
@@ -126,28 +138,32 @@ fn quoted_refs(s: &str) -> Vec<(usize, usize, String)> {
 /// Every `bulkId:<id>` in `v`, each once: whole string values, and quoted values inside
 /// a PATCH operation's `path` filter.
 fn refs_in(v: &Value, out: &mut Vec<String>) {
-    fn add(out: &mut Vec<String>, id: &str) {
-        if !out.iter().any(|r| r == id) {
+    fn add(id: &str, seen: &mut HashSet<String>, out: &mut Vec<String>) {
+        if seen.insert(id.to_string()) {
             out.push(id.to_string());
         }
     }
-    match v {
-        Value::String(s) => {
-            if let Some(id) = s.strip_prefix(BULK_ID) {
-                add(out, id);
-            }
-        }
-        Value::Array(l) => l.iter().for_each(|x| refs_in(x, out)),
-        Value::Object(o) => {
-            for (k, x) in o {
-                match x.as_str() {
-                    Some(s) if k.eq_ignore_ascii_case("path") => quoted_refs(s).into_iter().for_each(|(_, _, id)| add(out, &id)),
-                    _ => refs_in(x, out),
+    fn walk(v: &Value, seen: &mut HashSet<String>, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => {
+                if let Some(id) = s.strip_prefix(BULK_ID) {
+                    add(id, seen, out);
                 }
             }
+            Value::Array(l) => l.iter().for_each(|x| walk(x, seen, out)),
+            Value::Object(o) => {
+                for (k, x) in o {
+                    match x.as_str() {
+                        Some(s) if k.eq_ignore_ascii_case("path") => quoted_refs(s).iter().for_each(|(_, _, id)| add(id, seen, out)),
+                        _ => walk(x, seen, out),
+                    }
+                }
+            }
+            _ => {}
         }
-        _ => {}
     }
+    let mut seen = out.iter().cloned().collect();
+    walk(v, &mut seen, out);
 }
 
 /// `v` with each `bulkId:<id>` (as `refs_in` finds them) replaced by the id its POST
@@ -560,5 +576,18 @@ mod tests {
         assert_eq!(out["Operations"][0]["path"], json!("members[value eq \"id-ab\"]"));
         assert_eq!(out["Operations"][1]["path"], json!("members[value eq \"u-1\"]"));
         assert_eq!(out["Operations"][2]["path"], escaped["Operations"][2]["path"]);
+    }
+
+    #[test]
+    fn hostile_paths_and_references_take_one_pass() {
+        let start = std::time::Instant::now();
+        let quotes = format!("members[value eq \"{}", "\\\"".repeat(MAX_PAYLOAD / 2));
+        assert!(quoted_refs(&quotes).is_empty(), "never closed");
+        let data = json!({ "Operations": [{ "op": "add", "path": quotes, "value": (0..50_000).map(|i| json!({ "value": format!("bulkId:{i}") })).collect::<Vec<_>>() }] });
+        let mut refs = Vec::new();
+        refs_in(&data, &mut refs);
+        assert_eq!(refs.len(), 50_000);
+        assert!(resolve(&data, &HashMap::new()) == data);
+        assert!(start.elapsed() < std::time::Duration::from_secs(10), "{:?}", start.elapsed());
     }
 }
