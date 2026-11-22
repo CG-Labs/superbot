@@ -2294,7 +2294,7 @@ pub struct MachineBackup {
     pub user_id: String,
     pub tier: String,
     pub plan: String,
-    /// `running`, `done`, `failed`, or `deleted` (past its retention).
+    /// `running`, `done`, `failed`, or `deleted` (past its retention, or on request).
     pub state: String,
     pub object_key: String,
     pub encrypted: bool,
@@ -7077,6 +7077,20 @@ impl Db {
             .execute("UPDATE machine_backups SET state = 'deleted', deleted_at = ? WHERE id = ? AND state IN ('done', 'failed')", params![now(), id])
             .unwrap_or(0)
             == 1
+    }
+
+    /// Backups of any of the user's machines, destroyed ones too, not yet deleted.
+    pub fn user_machine_backups_kept(&self, user_id: &str) -> Vec<MachineBackup> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM machine_backups WHERE user_id = ? AND state <> 'deleted' ORDER BY created_at, id").unwrap();
+        s.query_map([user_id], machine_backup_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Every restore of the machine, oldest first.
+    pub fn machine_restores(&self, machine_id: &str) -> Vec<MachineRestore> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM machine_restores WHERE machine_id = ? ORDER BY created_at, id").unwrap();
+        s.query_map([machine_id], machine_restore_row).unwrap().filter_map(Result::ok).collect()
     }
 
     /// Starts a restore of the machine, unless one is underway.

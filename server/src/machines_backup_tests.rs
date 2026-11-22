@@ -361,6 +361,40 @@ async fn the_schedule_backs_up_only_enrolled_machines_and_keeps_the_newest() {
     assert!(env.s3.keys().is_empty(), "{:?}", env.s3.keys());
 }
 
+#[tokio::test]
+async fn a_destroyed_machines_backups_and_restore_copy_are_deleted_on_request() {
+    let mut env = serve(Vec::new()).await;
+    let (uid, m) = enrolled(&mut env, "ada@example.com").await;
+    let (first, second) = (back_up(&env, &uid).await, back_up(&env, &uid).await);
+    assert_eq!((first.state.as_str(), second.state.as_str()), ("done", "done"));
+    // A restore that stopped part way left its copy of the disk beside the container.
+    let copy = format!("{}-restore", m.label);
+    let i = env.incus.instance(&m.label).unwrap();
+    env.incus.w().instances.insert(copy.clone(), i);
+    let n = crate::db::NewMachineRestore { id: "rleft", machine: &m, backup_id: &first.id, by: None, rto_ms: None, from_host: None, to_host: None, reason: None };
+    env.app.db.machine_restore_start(&n).unwrap();
+    assert!(env.app.db.machine_restore_move("rleft", &["importing"], "failed", Some("botd stopped mid-restore")));
+
+    // Not while the machine exists: its backups are how it comes back.
+    let path = format!("/api/machines/{}/backups", m.id);
+    let (code, e) = json_call(&env, "DELETE", &path, "").await;
+    assert_eq!(code, 409, "{e}");
+    assert_eq!(env.s3.keys().len(), 4);
+
+    let (code, _) = json_call(&env, "DELETE", &format!("/api/users/{uid}/machine"), "").await;
+    assert_eq!(code, 200);
+    let (code, v) = json_call(&env, "DELETE", &path, "").await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!((v["backups"].as_array().map(Vec::len), v["restoreCopies"].as_u64(), v["strays"].as_u64()), (Some(2), Some(1), Some(0)), "{v}");
+    assert!(env.s3.keys().is_empty(), "{:?}", env.s3.keys());
+    assert!(env.incus.instance(&copy).is_none(), "the restore's copy of the disk is gone too");
+    assert!(env.app.db.machine_backups(&m.id).iter().all(|b| b.state == "deleted"));
+    let deleted = events(&env, "machine.backup_deleted").await;
+    assert!(deleted.len() == 2 && deleted.iter().all(|e| e["details"]["reason"] == "requested" && e["actorKind"] == "user"), "{deleted:?}");
+    let (_, all) = json_call(&env, "GET", "/api/machines/backups", "").await;
+    assert_eq!(all["backups"].as_array().map(Vec::len), Some(0), "{all}");
+}
+
 #[test]
 fn backups_are_off_unless_configured_and_need_a_provider_that_exports() {
     let store = crate::secrets::env::EnvStore::fixed(&[("MACHINE_BACKUP_S3_ACCESS_KEY_ID", "AKID"), ("MACHINE_BACKUP_S3_SECRET_ACCESS_KEY", "s3cret-0123")]);
