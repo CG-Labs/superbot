@@ -130,6 +130,8 @@ jobs:
       - run: promtool test rules deploy/prometheus/superbot-signin.rules.test.yml
       - run: promtool check rules deploy/prometheus/superbot-capacity.rules.yml
       - run: promtool test rules deploy/prometheus/superbot-capacity.rules.test.yml
+      - run: promtool check rules deploy/prometheus/superbot-backup.rules.yml
+      - run: promtool test rules deploy/prometheus/superbot-backup.rules.test.yml
 
   backup-scripts:
     runs-on: ubuntu-latest

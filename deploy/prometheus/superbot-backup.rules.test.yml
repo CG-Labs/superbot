@@ -1,0 +1,88 @@
+# promtool test rules superbot-backup.rules.test.yml
+rule_files:
+  - superbot-backup.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # No store: a ticket after an hour, none before; nothing about the RPO or copies.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_server_backup_off_host{job="superbot"}'
+        values: '0x120'
+      - series: 'superbot_events_total{job="superbot",event="server.backup_copy_failed",outcome="failure"}'
+        values: '0x120'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SuperBotServerBackupsOnHost
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: SuperBotServerBackupsOnHost
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+            exp_annotations:
+              summary: Server backups stay on the host
+              description: "botd isn't copying its backups off this host, so losing the host loses them. Set SERVER_BACKUP_S3_BUCKET with its endpoint and keys (deploy/install.sh --backup-s3-bucket, or .env) and restart botd. See docs/ops/backup-restore.md."
+      - eval_time: 70m
+        alertname: SuperBotServerBackupPastRPO
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: SuperBotServerBackupCopyFailing
+        exp_alerts: []
+
+  # Copying: past the RPO pages at once and stops when a copy lands.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_server_backup_off_host{job="superbot"}'
+        values: '1x120'
+      - series: 'superbot_server_backup_past_rpo{job="superbot"}'
+        values: '0x30 1x30 0x60'
+      - series: 'superbot_events_total{job="superbot",event="server.backup_copy_failed",outcome="failure"}'
+        values: '0x120'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SuperBotServerBackupPastRPO
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: SuperBotServerBackupPastRPO
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              job: superbot
+            exp_annotations:
+              summary: Server backups are past their RPO
+              description: "The newest server backup copied off the host is older than its RPO. botctl backups shows the last copy and its error; if no newer archive is in BACKUP_DIR, check superbot-backup's timer (systemctl status superbot-backup.timer) or the Compose backup sidecar."
+      - eval_time: 40m
+        alertname: SuperBotServerBackupsOnHost
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: SuperBotServerBackupPastRPO
+        exp_alerts: []
+
+  # One failed copy is retried quietly; a second within two hours is a ticket.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_server_backup_off_host{job="superbot"}'
+        values: '1x240'
+      - series: 'superbot_server_backup_past_rpo{job="superbot"}'
+        values: '0x240'
+      - series: 'superbot_events_total{job="superbot",event="server.backup_copy_failed",outcome="failure"}'
+        values: '0x30 1x30 2x180'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: SuperBotServerBackupCopyFailing
+        exp_alerts: []
+      - eval_time: 75m
+        alertname: SuperBotServerBackupCopyFailing
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+            exp_annotations:
+              summary: Copying server backups off the host keeps failing
+              description: "botd failed to copy a server backup to its store at least twice in two hours. The audit log (server.backup_copy_failed) and botctl backups have the error: usually the store's keys, bucket or network."
+      - eval_time: 240m
+        alertname: SuperBotServerBackupCopyFailing
+        exp_alerts: []
