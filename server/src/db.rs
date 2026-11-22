@@ -4697,6 +4697,17 @@ impl Db {
         run("DELETE FROM email_prefs WHERE user_id = ?", &[&user_id])?;
         run("DELETE FROM billing_checkouts WHERE user_id = ?", &[&user_id])?;
         run("DELETE FROM team_members WHERE user_id = ?", &[&user_id])?;
+        run("DELETE FROM residency_pins WHERE subject_type = 'user' AND subject_id = ?", &[&user_id])?;
+        run("UPDATE residency_pins SET pinned_by = ?2 WHERE pinned_by = ?1", &[&user_id, &pseudonym])?;
+        let refs: Vec<(String, String, String)> = {
+            let mut st = tx.prepare("SELECT subject_type, subject_id, reference FROM residency_pins").map_err(db_err)?;
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(db_err)?.filter_map(Result::ok).collect()
+        };
+        for (kind, id, reference) in refs {
+            if let Some(r) = scrub.text(&reference) {
+                run("UPDATE residency_pins SET reference = ?3 WHERE subject_type = ?1 AND subject_id = ?2", &[&kind, &id, &r])?;
+            }
+        }
         out.routines = run("DELETE FROM routines WHERE author_id = ?", &[&user_id])?;
         out.messages = run(
             &format!(
