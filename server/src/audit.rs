@@ -774,17 +774,10 @@ impl Logins {
 
 // Retention: `AUDIT_RETENTION_DAYS` (unset or 0 = keep forever).
 
-const MAX_RETENTION_DAYS: u32 = 36_500;
 const PRUNE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
 pub fn retention_days(raw: &str) -> Result<Option<u32>, String> {
-    match raw.trim() {
-        "" | "0" => Ok(None),
-        v => match v.parse::<u32>() {
-            Ok(d) if (1..=MAX_RETENTION_DAYS).contains(&d) => Ok(Some(d)),
-            _ => Err(format!("AUDIT_RETENTION_DAYS must be a number of days from 1 to {MAX_RETENTION_DAYS}, or 0 to keep forever")),
-        },
-    }
+    crate::retention::days("AUDIT_RETENTION_DAYS", raw)
 }
 
 /// Saves the retention setting (the delete trigger reads it), logs a change, and prunes every few hours.

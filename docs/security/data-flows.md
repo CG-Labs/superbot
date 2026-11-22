@@ -11,9 +11,10 @@ botd keeps the organisation's data in one SQLite database, `DATA_DIR/app.sqlite`
 | Data | Stored as |
 |------|-----------|
 | Users, roles, SSO identities, signup requests, SCIM users | Rows. Users are disabled, never deleted ([ADR 0012](../adr/0012-users-sessions-rbac.md), [ADR 0023](../adr/0023-scim.md)). |
+| Teams and their members; SCIM groups | Rows. A SCIM group is a team's link to one IdP tenant: the tenant's name, the IdP's group id (`externalId`) and name ([ADR 0087](../adr/0087-team-accounts-and-machines.md), [ADR 0095](../adr/0095-scim-groups-as-teams.md)). |
 | Sessions, one-time sign-in codes, SCIM tokens, machine enrollment tokens | SHA-256 hashes only. The token itself is never stored. |
 | Bot records: owner, visibility, grants, settings, policy rules | Rows. |
-| Chat history, routines, approvals | Rows. An approval's tool input is sealed (encrypted, below). Chat text is not sealed. |
+| Chat history, routines, approvals | Rows. An approval's tool input is sealed (encrypted, below). Chat text is not sealed. Chat history can be deleted by age ([retention](#retention)). |
 | Secrets: server-wide (the "Vault") and each person's own | Sealed ([ADR 0010](../adr/0010-secrets.md), [ADR 0044](../adr/0044-client-personal-secrets.md)). Values are never returned by the API, only names. |
 | Push device tokens | Sealed, plus a hash for lookups ([ADR 0080](../adr/0080-client-push-notifications.md)). |
 | Audit log | Append-only rows ([ADR 0009](../adr/0009-audit-events.md)). |
@@ -21,7 +22,7 @@ botd keeps the organisation's data in one SQLite database, `DATA_DIR/app.sqlite`
 | Machine records, certificates, backup and restore records | Rows ([ADR 0031](../adr/0031-machine-enrollment-mtls.md), [ADR 0071](../adr/0071-off-host-machine-backups.md)). |
 | Each user's facts and Bots' memory | Files: `DATA_DIR/users/<id>/USER.md`, `DATA_DIR/bots/<id>/`, kept for every run, here or on a machine. A run on a machine sends the changed files back and botd writes them here (up to 1 MiB each). With per-user accounts, runs here work on a copy in the user's folder, which botd copies back. |
 | Each user's working folder, when runs are on this server | Files: `WORKSPACE_DIR/users/<id>/`, owned by that user's Unix account ([ADR 0058](../adr/0058-harness-os-user-by-default.md)). |
-| The master key | A file or environment variable **outside** `DATA_DIR` (`SUPERBOT_MASTER_KEY`, `SUPERBOT_MASTER_KEY_FILE`, or `~/.config/superbot/master.key`). Never in backups. |
+| The master key | A file or environment variable **outside** `DATA_DIR` (`SUPERBOT_MASTER_KEY`, `SUPERBOT_MASTER_KEY_FILE`, or `~/.config/superbot/master.key`). Never in backups. During a rotation, the old key too (`SUPERBOT_MASTER_KEY_PREVIOUS(_FILE)`), until it is removed ([ADR 0096](../adr/0096-master-key-rotation.md)). |
 
 ### On each user's machine (managed)
 
@@ -58,7 +59,7 @@ Chat history, approvals, policy, secrets and the audit log stay on the control p
 | botd to Incus | Mutual TLS, with the Incus host's certificate pinned by SHA-256 ([ADR 0065](../adr/0065-incus-container-machines.md)). |
 | botd to Stripe, Expo, Linode, S3, IdPs, webhooks | HTTPS with certificate checks. Webhook and S3 URLs must be HTTPS (plain HTTP only to loopback, for tests). |
 | botd to SMTP | STARTTLS by default, or implicit TLS. Plain text only to a relay on the same machine ([ADR 0061](../adr/0061-approval-notifications.md)). |
-| Harness to model provider | The harness's own client, to the provider's URL. A provider in the plan routing file (`TIERS_FILE`) may use `http://` to any host, and the harness then sends prompts and the key unencrypted. Use `https://`. |
+| Harness to model provider | The harness's own client, to the provider's URL. A provider in the plan routing file (`TIERS_FILE`) and `SUPERBOT_HERMES_BASE_URL` must be `https://`, or plain `http://` only to this host (`127.0.0.0/8`, `::1`, `localhost`); botd refuses to start otherwise ([ADR 0097](../adr/0097-model-providers-over-https.md)). An endpoint the operator or a user gives a harness in its own settings (`ANTHROPIC_BASE_URL`, a Bot's Codex or Pi config) is theirs to keep on HTTPS. |
 
 ### At rest
 
@@ -148,6 +149,14 @@ sequenceDiagram
 - A team's plan is bought by its owners and admins for everyone on it. Stripe gets the team's ID, the buyer's user ID and email (for a new customer), and the number of members, never their names or emails. The team's Stripe customer is never a person's.
 - Billing emails go through the operator's SMTP server to the person the plan is for, as plain text: their plan name and dates, what their computer is doing about a plan change, and how close they are to their tier's tokens and storage. Never a Stripe id, price, amount, card detail, portal link or secret. Off unless billing and SMTP are on ([ADR 0091](../adr/0091-billing-emails.md)). A team plan's emails go to the team's owners and admins ([ADR 0093](../adr/0093-team-billing.md)).
 
+### Identity providers (SCIM, inbound)
+
+Off until `SCIM=on` ([ADR 0023](../adr/0023-scim.md), [ADR 0026](../adr/0026-scim-review-hardening.md)). The IdP calls botd at `/scim/v2` with a tenant's bearer token; botd never calls the IdP. It sends people's names, emails, the IdP's ids for them, and whether they're active, and with `SCIM_GROUPS=on`, group names, the IdP's group ids, and members ([ADR 0095](../adr/0095-scim-groups-as-teams.md)).
+
+- A tenant sees and changes only the users it provisioned and the groups it made or an admin linked to it. It never gets anyone else's data back: a group's `members` lists only the tenant's own people.
+- Group membership moves people onto and off teams, which changes who shares their Bots, which machines they get, and which plan they're on; leaving runs the same offboarding as a team admin's removal. SCIM never sets a role.
+- Everything it sends that SuperBot doesn't keep (roles, phone numbers, Okta's placeholder password) is dropped, never stored or logged. Every change is in the audit log with the token as the actor.
+
 ### Machines and backups
 
 - **Provisioning.** botd sends the Linode or Incus API a machine's label, tags, region, size and cloud-init data with a one-time enrollment token ([ADR 0035](../adr/0035-machine-firewall-auto-enroll.md)). Incus containers have that data cleared once enrolled ([ADR 0067](../adr/0067-clearing-enrollment-data-from-containers.md)).
@@ -162,9 +171,10 @@ sequenceDiagram
 |------|---------|
 | Sessions | End after 7 days idle or 30 days at most (`SESSION_IDLE_TIMEOUT`, `SESSION_MAX_AGE`). |
 | Audit log | Kept forever unless `AUDIT_RETENTION_DAYS` is set. |
-| Server backups | 14 days (`SUPERBOT_BACKUP_RETENTION_DAYS`). |
+| Chat history | Kept forever unless `CHAT_RETENTION_DAYS` is set; then older messages are deleted when botd starts and every 6 hours, in batches, and each pass that deletes any is audited (`chat.pruned`) with the count, never the text. Never deleted: a message whose run is still queued or running, and the chat of a Bot an admin holds (a legal hold, `botctl retention hold`), which can't be deleted while held, nor can a Bot it wrote to ([ADR 0098](../adr/0098-chat-retention.md)). Harness session files in each Bot's folder and Bots' memory aren't covered. |
+| Server backups | 14 days (`SUPERBOT_BACKUP_RETENTION_DAYS`). Deleted chat and audit rows stay in backups until then. |
 | Machine backups | 14 days per plan, the newest of a live machine always kept; a destroyed machine's backups go at the end of their retention. |
-| Teammates who leave | Their OS user and home on the owner's machine are removed; work is held aside until purged ([ADR 0052](../adr/0052-teammate-offboarding-on-machines.md)). |
+| Teammates who leave | Their OS user and home on the owner's machine (or their account for the owner's Bots on one server) are removed. Their work is handed to the owner's `from-teammates/` folder and then kept as the owner's files (`MACHINE_TEAMMATE_FILES=archive`, `ISOLATION_TEAMMATE_FILES=archive`, the defaults), or held aside and deleted after `*_TEAMMATE_FILES_DAYS` with `delete` ([ADR 0052](../adr/0052-teammate-offboarding-on-machines.md), [ADR 0066](../adr/0066-removing-teammate-accounts-on-one-server.md)). Nothing deletes archived work by age. |
 
 ## Planned or not built
 

@@ -38,7 +38,7 @@ SQLite had no secret columns, but the approval queue stored raw tool input, whic
 - **Creation**: the VPS installer creates the key as the service user (0600, folder 0700, `mv -n` so it never replaces one) after writing `.env` and before (re)starting botd, on fresh installs and `--upgrade`. Compose's `init.sh` writes a random key into `.env` once, and Compose refuses to start without it. If neither ran, botd creates the default key file itself on first start, but only when the database holds nothing sealed.
 - **Checks at start**: a sealed known value in `settings` (`secrets_key_check`) tells a wrong key from a right one. Missing key with sealed data, wrong key, loose file permissions, or both variables set: botd prints why and exits before serving anything. It never generates a key over existing sealed data. The installer refuses the same case before botd starts.
 - **Lost key**: start once with `SUPERBOT_FORGET_SEALED=1`. Only values the current key can't open are dropped (saved secrets deleted, approval inputs replaced by a marker); the rest of the database stays. With a working key the flag does nothing, so leaving it set is harmless.
-- **Rotation**: not built yet (follow-up): re-seal every row under a new key in one transaction, keeping the old key until it commits.
+- **Rotation**: built in [ADR 0096](0096-master-key-rotation.md): with the old key as `SUPERBOT_MASTER_KEY_PREVIOUS(_FILE)`, botd re-seals every row under the new key in one transaction at start, keeping the old key until it commits.
 
 ### Migration (upgrade from earlier versions)
 

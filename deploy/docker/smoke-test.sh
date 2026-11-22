@@ -259,6 +259,23 @@ grep -q '"name":"KeepMe"' <<<"$(curl -fsS "${AUTH[@]}" "$BASE/api/audit?action=b
 ((rto <= ${SMOKE_RTO_SECONDS:-300})) || fail "restore took ${rto}s (budget ${SMOKE_RTO_SECONDS:-300}s)"
 log "Restore drill passed: back up in ${rto}s"
 
+log "Master key rotation (ADR 0096): init.sh keeps the old key as the previous one, botd seals everything again at start"
+ENV_FILE="$SUPERBOT_ENV_FILE" "$DIR/init.sh" --rotate-master-key >/dev/null
+NEW_KEY=$(sed -n "s/^SUPERBOT_MASTER_KEY='\(.*\)'$/\1/p" "$SUPERBOT_ENV_FILE")
+[[ -z "${GITHUB_ACTIONS:-}" ]] || echo "::add-mask::$NEW_KEY"
+[[ ${#NEW_KEY} == 64 && "$NEW_KEY" != "$MASTER_KEY" ]] || fail "init.sh --rotate-master-key did not write a new key"
+grep -qx "SUPERBOT_MASTER_KEY_PREVIOUS='$MASTER_KEY'" "$SUPERBOT_ENV_FILE" || fail "init.sh --rotate-master-key did not keep the old key"
+if ENV_FILE="$SUPERBOT_ENV_FILE" "$DIR/init.sh" --rotate-master-key >/dev/null 2>&1; then fail "init.sh rotated again while a rotation was pending"; fi
+dc up -d --no-build --wait --wait-timeout 120
+grep -q "Master key rotated" <<<"$(dc logs --no-color botd)" || fail "botd did not rotate the master key"
+grep -q '"action":"secret.master_key_rotated"' <<<"$(curl -fsS "${AUTH[@]}" "$BASE/api/audit?action=secret.master_key_rotated")" || fail "no audit event for the rotation"
+grep -q '"name":"SMOKE_API_KEY"' <<<"$(curl -fsS "${AUTH[@]}" "$BASE/api/secrets")" || fail "the saved secret is missing after the rotation"
+grep -v '^SUPERBOT_MASTER_KEY_PREVIOUS=' "$SUPERBOT_ENV_FILE" >"$WORK/env.tmp"
+install -m 0600 "$WORK/env.tmp" "$SUPERBOT_ENV_FILE"
+dc up -d --no-build --wait --wait-timeout 120
+[[ $(curl -fsS "$BASE/healthz") == '{"ok":true}' ]] || fail "botd did not start with the new key alone"
+MASTER_KEY=$NEW_KEY
+
 log "Screens (docs/computer.md): on with ISOLATION=off, a Bot's screen starts and is viewed through Caddy"
 ENV_FILE="$SUPERBOT_ENV_FILE" "$DIR/init.sh" --no-isolation >/dev/null
 dc up -d --no-build --force-recreate --wait --wait-timeout 120 botd

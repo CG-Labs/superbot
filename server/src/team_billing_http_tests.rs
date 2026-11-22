@@ -37,7 +37,7 @@ async fn add(w: &World, team: &str, user: &str, role: &str) {
 }
 
 /// A subscription event for `team`'s subscription, priced `price`, with `seats`.
-fn team_event(team: &str, id: &str, created: i64, f: impl FnOnce(&mut Value)) -> String {
+pub(crate) fn team_event(team: &str, id: &str, created: i64, f: impl FnOnce(&mut Value)) -> String {
     event(UPDATED, "", id, created, |v| {
         let o = &mut v["data"]["object"];
         o["id"] = json!("sub_test_alpha");
@@ -49,11 +49,11 @@ fn team_event(team: &str, id: &str, created: i64, f: impl FnOnce(&mut Value)) ->
     })
 }
 
-fn tier(w: &World, user: &str) -> String {
+pub(crate) fn tier(w: &World, user: &str) -> String {
     w.app.tier_of(user).name.clone()
 }
 
-fn seat_posts(f: &FakeStripe) -> Vec<crate::billing_http_tests::Seen> {
+pub(crate) fn seat_posts(f: &FakeStripe) -> Vec<crate::billing_http_tests::Seen> {
     f.seen().into_iter().filter(|s| s.path.starts_with("/v1/subscription_items/")).collect()
 }
 

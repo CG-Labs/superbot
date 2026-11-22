@@ -119,7 +119,6 @@ const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? o
 export function blockedReason(p: Pick<OffboardingPreview, "blocked">): string | null {
   if (p.blocked === "self") return "To leave the team yourself, use Leave team.";
   if (p.blocked === "owner") return "Only the team's owners can take an owner off the team.";
-  if (p.blocked === "scim") return "This team's members come from your identity provider. Remove them there.";
   return null;
 }
 

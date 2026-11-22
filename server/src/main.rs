@@ -85,6 +85,9 @@ mod policy_http_tests;
 #[cfg(test)]
 mod prompts_http_tests;
 mod rbac;
+mod retention;
+#[cfg(test)]
+mod retention_http_tests;
 #[cfg(test)]
 mod run_grants_http_tests;
 #[cfg(test)]
@@ -92,7 +95,6 @@ mod run_tokens_http_tests;
 mod runner;
 mod sandbox;
 mod scim;
-mod scim_groups;
 #[cfg(test)]
 mod scim_groups_http_tests;
 #[cfg(test)]
@@ -244,6 +246,9 @@ async fn main() {
     let resume_routines = handover::resume_on_enable(&env("ROUTINES_ON_ENABLE", "")).unwrap_or_else(|e| exit(e));
     let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", ""), &env("SCIM_GROUPS", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
     let tiers = tiers::Tiers::from_env(|k| env(k, "")).unwrap_or_else(|e| exit(format!("Tiers: {e}")));
+    for name in adapters::NAMES {
+        adapters::get(name).expect("listed adapter").check_env(&|k| env(k, "")).unwrap_or_else(|e| exit(e));
+    }
     let testing = license::testing_flag(&env("TESTING_MODE", "")).unwrap_or_else(|e| exit(e));
     let (payments, ignored_stripe) =
         billing::Billing::configured(&secrets::env::EnvStore::process(), &|k| env(k, ""), testing).unwrap_or_else(|e| exit(format!("Billing: {e}")));
@@ -260,6 +265,7 @@ async fn main() {
         log_warn!("{e}");
         std::process::exit(1);
     });
+    let chat_retention = retention::days("CHAT_RETENTION_DAYS", &env("CHAT_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
     let bot_key = random_hex(32);
     secrets::redact::register(&bot_key);
     WEB_DIR.set(std::env::var("WEB_DIR").ok().map(PathBuf::from)).unwrap();
@@ -282,6 +288,19 @@ async fn main() {
                 log_info!("Secrets: sealed {} saved tool inputs, redacted {} saved rows, discarded {} sealed values.", r.sealed, r.redacted, r.discarded);
             }
             log_info!("Stored secrets: {}.", r.stored);
+            if let Some((from, done)) = &r.rotated {
+                log_info!(
+                    "Master key rotated from {from}: sealed {} values again under the new key ({} already were). Remove the previous key now (docs/ops/master-key-rotation.md).",
+                    done.resealed,
+                    done.current
+                );
+                if done.unreadable > 0 {
+                    log_warn!("Master key rotation: {} sealed values open with neither key and were left as they were.", done.unreadable);
+                }
+            }
+            if let Some(from) = &r.previous_unused {
+                log_warn!("{from} is set, but the master key already opens everything, so there is nothing to rotate. Remove it.");
+            }
         }
         Err(e) => {
             log_warn!("Secrets: {e}");
@@ -381,7 +400,7 @@ async fn main() {
                 log_info!("Isolation: ISOLATION_TEAMMATES=off, so a teammate's run of a shared Bot uses its owner's account (ADR 0046).");
             }
             let mut own = vec![app.cfg.data_dir.clone(), PathBuf::from(".env")];
-            own.extend(std::env::var_os("SUPERBOT_MASTER_KEY_FILE").map(PathBuf::from));
+            own.extend(["SUPERBOT_MASTER_KEY_FILE", "SUPERBOT_MASTER_KEY_PREVIOUS_FILE"].iter().filter_map(|k| std::env::var_os(k).map(PathBuf::from)));
             for p in accounts::close_to_others(&own) {
                 log_warn!("WARNING: other accounts can read {p}, which botd couldn't change. Per-user accounts must not read botd's files: chmod o-rwx it.");
             }
@@ -512,9 +531,9 @@ async fn main() {
     }
     match auth_state.scim.enabled {
         true => log_info!(
-            "SCIM: on at /scim/v2; new users get the {} role; {} (ADR 0095).",
+            "SCIM: on at /scim/v2; new users get the {} role; groups {}.",
             auth_state.scim.default_role.as_str(),
-            if auth_state.scim.groups { "groups are teams" } else { "groups aren't provisioned (SCIM_GROUPS=off)" }
+            if auth_state.scim.groups { "are teams (SCIM_GROUPS=on)" } else { "off (SCIM_GROUPS=off)" }
         ),
         false => log_info!("SCIM: off (SCIM=off)."),
     }
@@ -534,6 +553,7 @@ async fn main() {
     let control_plane = auth_state.machines.clone();
     let _ = app.control_plane.set(control_plane.clone());
     let auth_state_scim = auth_state.scim.enabled;
+    let auth_state_scim_groups = auth_state.scim.enabled && auth_state.scim.groups;
     let auth_state_billing = auth_state.payments.enabled();
     let auth_state_checkout = auth_state.payments.checkout_enabled();
     let mfa_policy = mfa::policy(&auth_state, &app.db);
@@ -555,6 +575,7 @@ async fn main() {
         "sessionIdleMinutes": sessions.idle_ms / 60_000,
         "sessionMaxMinutes": sessions.max_ms / 60_000,
         "auditRetentionDays": retention,
+        "chatRetentionDays": chat_retention,
         "screens": app.screens.is_some(),
         "isolation": if app.isolation().is_some() { "users" } else { "off" },
         "isolationTeammates": app.teammate_accounts(),
@@ -563,6 +584,7 @@ async fn main() {
         "sso": sso_ids,
         "controlPlane": control_plane.enabled(),
         "scim": auth_state_scim,
+        "scimGroups": auth_state_scim_groups,
         "billing": auth_state_billing,
         "billingCheckout": auth_state_checkout,
         "billingEmails": app.billing_mail.get().is_some(),
@@ -577,6 +599,7 @@ async fn main() {
     })));
     license::start(app.clone());
     audit::start_retention(app.clone(), retention);
+    retention::start(app.clone(), chat_retention);
     users::start_pruning(app.clone(), sessions);
     machines::hosts::load(&app, &control_plane).unwrap_or_else(|e| exit(format!("Incus hosts: {e}")));
     machines::start(app.clone(), control_plane);
@@ -688,6 +711,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/approvals/{id}/deny", post(deny))
         .route("/audit", get(list_audit))
         .route("/audit/export.csv", get(export_audit))
+        .route("/retention", get(retention::get))
+        .route("/retention/holds/{bot}", put(retention::put_hold).delete(retention::delete_hold))
         .route("/secrets", get(list_secrets))
         .route("/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/me/tier", get(my_tier))
@@ -815,6 +840,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/signups/{id}/reject", post(signups::reject))
         .route("/scim/tokens", get(scim::list_tokens).post(scim::create_token))
         .route("/scim/tokens/{id}", delete(scim::revoke_token))
+        .route("/scim/groups", get(scim::groups::list_links).post(scim::groups::link))
+        .route("/scim/groups/{team}", delete(scim::groups::unlink))
         .route("/status/incidents", get(status::list).post(status::create))
         .route("/status/incidents/{id}", patch(status::edit).delete(status::delete))
         .route("/status/incidents/{id}/updates", post(status::add_update))
@@ -828,10 +855,11 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/scim/v2/Schemas/{id}", get(scim::schema))
         .route("/scim/v2/Users", get(scim::list_users).post(scim::create_user))
         .route("/scim/v2/Users/{id}", get(scim::get_user).put(scim::replace_user).patch(scim::patch_user).delete(scim::delete_user))
-        .route("/scim/v2/Groups", get(scim_groups::list_groups).post(scim_groups::create_group))
+        // An Okta PUT carries the whole member list (ADR 0095).
+        .route("/scim/v2/Groups", get(scim::groups::list).post(scim::groups::create).layer(DefaultBodyLimit::max(scim::groups::MAX_BODY)))
         .route(
             "/scim/v2/Groups/{id}",
-            get(scim_groups::get_group).put(scim_groups::replace_group).patch(scim_groups::patch_group).delete(scim_groups::delete_group),
+            get(scim::groups::get).put(scim::groups::replace).patch(scim::groups::patch).delete(scim::groups::delete).layer(DefaultBodyLimit::max(scim::groups::MAX_BODY)),
         )
         .route("/scim/v2", any(scim::unknown))
         .route("/scim/v2/{*rest}", any(scim::unknown))
@@ -2096,12 +2124,19 @@ async fn delete_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
     if bot.primary {
         return Err(bad("The primary Bot can't be deleted"));
     }
+    let held = || ApiError(StatusCode::CONFLICT, "This Bot's chat is held (a retention hold on it, or on a Bot that wrote in its chat), so it can't be deleted until an admin releases the hold.".into());
+    if app.db.bot_chat_held(&id) {
+        return Err(held());
+    }
     app.stop(&id);
     if let Some(screens) = &app.screens {
         screens.remove(&id).await;
     }
     machines::screens::close(&app, &by, &id, "bot_deleted").await;
-    app.db.delete_bot(&id);
+    // A hold placed while the screen closed still wins: the Bot is stopped, but nothing is lost.
+    if !app.db.delete_bot_unless_held(&id) {
+        return Err(if app.db.bot_chat_held(&id) { held() } else { not_found("Bot") });
+    }
     notify::forget_bot(&app, &id);
     app.db.record(&by.event("bot.deleted").target("bot", &id).bot(&id).details(json!({ "name": bot.name, "harness": bot.harness })));
     machines::offboard::check_owner(&app, &by, &bot.owner_id);

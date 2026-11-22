@@ -390,6 +390,7 @@ sudo -u superbot env SUPERBOT_PASSWORD="$(sudo grep -oP '^AUTH_PASSWORD=\K.*' ~s
 - **Restoring on a new server**: restore the backup, then put the key back at the same path (owner `superbot`, mode `0600`) before starting botd. With a missing or wrong key, botd logs why and refuses to start; the installer refuses too rather than make a new key over sealed data.
 - **Key lost for good**: add `SUPERBOT_FORGET_SEALED=1` to `.env` and restart. Saved secrets and old approval inputs are dropped, everything else is kept, and a new key is made. It only drops what the current key can't open, but remove the line afterwards.
 - **Your own key**: set `SUPERBOT_MASTER_KEY` (64 hex chars, `openssl rand -hex 32`) in `.env` instead of the file, or point `SUPERBOT_MASTER_KEY_FILE` elsewhere. Not both.
+- **Rotating the key**: keep the old key as `SUPERBOT_MASTER_KEY_PREVIOUS_FILE` (or `SUPERBOT_MASTER_KEY_PREVIOUS`), put a new one in its place, and restart: botd seals everything again under the new key in one transaction and records `secret.master_key_rotated`. Then remove the previous key. Compose: `./init.sh --rotate-master-key`. Steps, checks and recovery: [master key rotation](../docs/ops/master-key-rotation.md) ([ADR 0096](../docs/adr/0096-master-key-rotation.md)).
 
 ## Backups and restore
 
@@ -416,6 +417,21 @@ Admin actions (logins, Bot and routine changes, approvals, policy, handoffs) are
 - `AUDIT_RETENTION_DAYS` in `.env`: unset or `0` keeps events forever (default: they are small, and deleting them can't be undone). `1` to `36500` deletes older events every 6 hours. Restart `botd` after changing it.
 - Both installs back it up: the bash timer and the Compose `backup` service take a SQLite `.backup` of `app.sqlite`, audit table included, and keep archives for `SUPERBOT_BACKUP_RETENTION_DAYS` (default 14). So a pruned event still exists in backups for that long; shorten it too if you must erase events.
 - Source IPs: the installer's Caddy is on loopback, so `botd` trusts its `X-Forwarded-For`. Compose sets `TRUST_FORWARDED_FOR=1`, since `botd` is reachable only through Caddy.
+
+## Chat history retention
+
+Chat history (every Bot's messages, routine prompts and Bot-to-Bot messages) is kept forever by default. To delete it after a while ([ADR 0098](../docs/adr/0098-chat-retention.md)):
+
+- `CHAT_RETENTION_DAYS` in `.env`: unset or `0` keeps it forever (default). `1` to `36500` deletes older messages when `botd` starts and every 6 hours after, 500 at a time, and records `chat.pruned` in the audit log with how many went (never their text). Restart `botd` after changing it; the change is audited as `chat.retention_changed`.
+- Never deleted: a message whose run is still queued or running, and anything in or from the chat of a Bot an admin holds. Hold a Bot for a legal hold or any other reason; a held Bot, or one a held Bot wrote to, can't be deleted until the hold is released. Holds are for admins only, through `botctl` (below) or `GET /api/retention` and `PUT`/`DELETE /api/retention/holds/<bot-id>` (`{"reason": "..."}`), and are audited (`chat.hold_placed`, `chat.hold_changed`, `chat.hold_released`).
+- Backups keep deleted messages for `SUPERBOT_BACKUP_RETENTION_DAYS` (default 14), as with the audit log.
+- Not covered: each harness's own session files in the Bot's folder (`DATA_DIR/bots/<id>/`, or the Bot's folder on the user's machine), Bots' memory files, and teammates' work archived to an owner's `from-teammates/` folder. For teammates' work, `MACHINE_TEAMMATE_FILES=delete` and `ISOLATION_TEAMMATE_FILES=delete` delete it after a grace period instead of archiving it.
+
+```sh
+botctl retention                                   # settings, the last pass, held Bots
+botctl retention hold <bot-id> "Legal hold: matter 42"
+botctl retention release <bot-id>
+```
 
 ## Metrics and logs
 
@@ -536,7 +552,7 @@ Off unless you set `TIERS_FILE`: without it every user is on one open `self-host
 
 - Copy [`tiers.example.json`](tiers.example.json) next to `.env`, edit the routes and limits, and set `TIERS_FILE` to its path (and `DEFAULT_TIER` if you like). Restart `botd`; it refuses to start on a bad file.
 - Assign users: `botctl user tier alex@example.com pro`, or `default`. `botctl tiers` lists them with their routes.
-- Hermes routes can use model endpoints the file names under `providers`, with a `fallback` chain per route ([ADR 0077](../docs/adr/0077-two-providers-through-tier-routing.md)). Save each endpoint's key as the secret its `keySecret` names, e.g. `botctl secret set TIER_ANTHROPIC_KEY < key.txt`. Until then, runs routed to it are refused, fallbacks to it are skipped, and botd warns at startup.
+- Hermes routes can use model endpoints the file names under `providers`, with a `fallback` chain per route ([ADR 0077](../docs/adr/0077-two-providers-through-tier-routing.md)). Save each endpoint's key as the secret its `keySecret` names, e.g. `botctl secret set TIER_ANTHROPIC_KEY < key.txt`. Until then, runs routed to it are refused, fallbacks to it are skipped, and botd warns at startup. Each `baseUrl` must be `https://`; plain `http://` is allowed only to this host (`127.0.0.1`, `::1`, `localhost`), for a local model server or a TLS tunnel, and botd refuses to start on anything else ([ADR 0097](../docs/adr/0097-model-providers-over-https.md)).
 - New Bots on a managed tier get its `defaultHarness` (else its first route's harness): Hermes on every shipped plan. `DEFAULT_HARNESS` applies only on open tiers like `self-host`. botd's startup line says which, and warns if a default isn't installed where the runs happen; a run on a harness that isn't installed here is refused, with how to install it (`deploy/install.sh --with-hermes`, or `hermes` in `SUPERBOT_HARNESSES` for Docker) ([ADR 0079](../docs/adr/0079-hermes-default-for-managed-tiers.md)).
 - Bots made before keep their harness. To move a managed tier's Bots onto its default, list them first, then move them (Bots mid-run are skipped; run it again later). Each move is audited (`bot.updated` with `via: tier_default`, and `tier.bots_moved`), and starts a fresh session:
 
@@ -656,7 +672,7 @@ Without a domain, `./init.sh` gives plain HTTP at `http://localhost`, published 
 | `users` | `/srv/superbot/users` | With [per-user accounts](#per-user-accounts-in-docker): each user's home (harness logins), workspace, memory copies, and Bots' harness state. |
 | `caddy-data`, `caddy-config` | Caddy | Certificates and ACME account. |
 
-`init.sh` also writes a random `SUPERBOT_MASTER_KEY` once, which encrypts saved secrets ([master key](#master-key)); Compose refuses to start without it. Save API keys for the Bots encrypted instead of in `.env` with `SUPERBOT_PASSWORD=<AUTH_PASSWORD> docker compose exec -T -e SUPERBOT_PASSWORD botd botctl secret set OPENAI_API_KEY < key.txt`.
+`init.sh` also writes a random `SUPERBOT_MASTER_KEY` once, which encrypts saved secrets ([master key](#master-key)); Compose refuses to start without it. To replace it, run `./init.sh --rotate-master-key` and follow [master key rotation](../docs/ops/master-key-rotation.md). Save API keys for the Bots encrypted instead of in `.env` with `SUPERBOT_PASSWORD=<AUTH_PASSWORD> docker compose exec -T -e SUPERBOT_PASSWORD botd botctl secret set OPENAI_API_KEY < key.txt`.
 
 Secure by default: Compose refuses to start without `AUTH_PASSWORD`; the image sets `HOST=0.0.0.0`, so `botd` itself also refuses to run without it, and `ALLOW_NO_AUTH` is forced off. `ALLOWED_HOSTS` always includes `SUPERBOT_DOMAIN` (or `localhost`); add other names, such as `localhost:8080` when you change `SUPERBOT_HTTP_PORT`, in `.env`.
 

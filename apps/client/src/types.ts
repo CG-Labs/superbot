@@ -778,8 +778,6 @@ export interface Team {
   invites?: TeamInvite[];
   /** Owners and admins only: how long a leaver's team machine is kept suspended. */
   machineDays?: number;
-  /** Set when a SCIM tenant's group is this team: its members change only in the identity provider. */
-  scimTenant?: string;
   /** The team's plan (ADR 0093), while this server sells them. */
   billing?: TeamBilling;
 }
@@ -817,7 +815,7 @@ export interface OffboardingPreview {
   user: { id: string; name: string | null };
   role: TeamRole;
   allowed: boolean;
-  blocked: "self" | "owner" | "scim" | null;
+  blocked: "self" | "owner" | null;
   /** Grants between them and teammates that end. */
   grants: number;
   machine: { fate: "suspend" | "destroy" | "kept" | "none"; days?: number };

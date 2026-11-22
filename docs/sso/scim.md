@@ -1,8 +1,8 @@
-# Provision users with SCIM (Entra ID, Okta)
+# Provision users and teams with SCIM (Entra ID, Okta)
 
-Lets your IdP create SuperBot users when people are assigned the app, keep their name and email current, and disable them when they leave. Disabling ends their sessions at once. With `SCIM_GROUPS=on`, its groups become SuperBot teams, and people join and leave teams as the groups say. Design: [ADR 0023](../adr/0023-scim.md), groups: [ADR 0095](../adr/0095-scim-groups-as-teams.md).
+Lets your IdP create SuperBot users when people are assigned the app, keep their name and email current, and disable them when they leave. Disabling ends their sessions at once. With `SCIM_GROUPS=on`, the groups it pushes become [teams](#groups-as-teams), and people join and leave them as the IdP says. Design: [ADR 0023](../adr/0023-scim.md), [ADR 0095](../adr/0095-scim-groups-as-teams.md).
 
-Users, and groups as teams. Group-to-role mapping and bulk come later. SCIM never gives anyone a role above `SCIM_DEFAULT_ROLE` (member, or readonly), nor any team role but member; admins promote people as before.
+SCIM never gives anyone a role above `SCIM_DEFAULT_ROLE` (member, or readonly), and never a team role; admins promote people as before. Group-to-role mapping and bulk aren't supported.
 
 You need: SuperBot on HTTPS at a fixed address, like `https://superbot.example.com`, and an admin's `botctl` on the server. Below, replace `superbot.example.com` with yours.
 
@@ -13,7 +13,7 @@ In `.env` (or `deploy/docker/.env`), then restart botd:
 ```sh
 SCIM=on
 # SCIM_DEFAULT_ROLE=member          # or readonly; admin is refused
-# SCIM_GROUPS=on                    # groups become teams (see "Groups as teams" below)
+# SCIM_GROUPS=on                    # pushed groups become teams (off by default)
 ```
 
 botd logs `SCIM: on at /scim/v2` on start, and whether groups are teams. Off, `/scim/v2` answers 404.
@@ -45,9 +45,9 @@ In the [Microsoft Entra admin center](https://entra.microsoft.com): **Identity �
 1. **Provisioning → Get started**, **Provisioning Mode: Automatic**.
 2. **Admin Credentials**: **Tenant URL** `https://superbot.example.com/scim/v2`, **Secret Token** the `sbp_…` token. **Test Connection**, then **Save**.
 3. **Mappings**:
-   - **Provision Microsoft Entra ID Groups**: **No**, unless `SCIM_GROUPS=on` and you want groups as teams. Then **Yes**, with the default mappings (`displayName → displayName`, `objectId → externalId`, `members → members`).
+   - **Provision Microsoft Entra ID Groups**: with `SCIM_GROUPS=on`, leave it **Yes** (keep `displayName → displayName`, `objectId → externalId`, `members → members`). Otherwise set **Enabled** to **No**.
    - **Provision Microsoft Entra ID Users**: if the tenant links SSO (`--sso`), edit the **externalId** mapping: source attribute **objectId** (the default, `mailNickname`, is refused). Keep `userPrincipalName → userName`, `mail → emails[type eq "work"].value`, `Switch([IsSoftDeleted], …) → active`, and the name mappings. Others are ignored.
-4. **Settings → Scope: Sync only assigned users and groups**. Assign people under **Users and groups**. With groups as teams, assign only the groups that are teams: a person is on one team at most.
+4. **Settings → Scope: Sync only assigned users and groups**. Assign people under **Users and groups**.
 5. **Provisioning Status: On**, **Save**. Entra syncs about every 40 minutes; **Provision on demand** does one person now.
 
 Removing someone from the app, or disabling or deleting them in Entra, sets `active` to false: SuperBot disables them and ends their sessions. When Entra deletes them for good (30 days after a soft delete), it sends `DELETE`; SuperBot keeps the disabled user and its audit history.
@@ -60,12 +60,12 @@ In the Okta Admin Console, open SuperBot's app integration (the OIDC app from [o
 2. **Provisioning → Integration → Edit**:
    - **SCIM connector base URL**: `https://superbot.example.com/scim/v2`
    - **Unique identifier field for users**: `userName`
-   - **Supported provisioning actions**: **Push New Users**, **Push Profile Updates**, and **Push Groups** if `SCIM_GROUPS=on`. Leave **Import Groups** off.
+   - **Supported provisioning actions**: **Push New Users**, **Push Profile Updates**, and with `SCIM_GROUPS=on`, **Push Groups**. Leave **Import Groups** off.
    - **Authentication Mode**: **HTTP Header**, **Authorization**: the `sbp_…` token.
    - **Test Connector Configuration**, then **Save**.
 3. **Provisioning → To App → Edit**: enable **Create Users**, **Update User Attributes**, **Deactivate Users**. **Save**.
 4. **Assignments**: assign people or groups (groups here only choose who is provisioned).
-5. With groups as teams: **Push Groups → + Push Groups**, pick each team's group. Okta pushes its name and members.
+5. With `SCIM_GROUPS=on`: **Push Groups → Push Groups → Find groups by name**, pick the groups to be teams, and **Save**. Okta creates each one, or links it to a team an admin linked by name (below).
 
 Okta sends its user id (`00u…`) as `externalId`. That is the `sub` in Okta's ID tokens, so `--sso okta` (your OIDC provider's id, with the default `SSO_OKTA_SUBJECT_CLAIM=sub`) links each person's SSO identity. Okta's placeholder password is ignored. Unassigning or deactivating someone sets `active` to false; Okta never deletes users.
 
@@ -82,26 +82,7 @@ Google has no generic SCIM client for custom apps. Put Entra ID or Okta in front
 | Sets `active: false` | Disables the user, ends all sessions, closes open screens, and pauses the routines that run for them ([ADR 0047](../adr/0047-disabled-users-routines.md)). Still listed, so the IdP can reactivate |
 | Sets `active: true` | Enables the user. Their paused routines stay paused until an admin resumes them (`botctl user resume-routines`) or hands them over (`botctl user handover`), unless `ROUTINES_ON_ENABLE=resume` |
 | Deletes (`DELETE`) | Disables the user, ends sessions, and pauses their routines; the tenant no longer sees it. Nothing is destroyed. Provisioning the same `externalId` again brings back the same user |
-| Sends `groups` on a user, roles, a password | Ignored |
-
-## Groups as teams
-
-With `SCIM_GROUPS=on` ([ADR 0095](../adr/0095-scim-groups-as-teams.md)):
-
-| IdP does | SuperBot does |
-|----------|---------------|
-| Creates a group | A new team named after it. Its members join it |
-| Adds a member | They join the team as a member and get their machine (a disabled person gets it once enabled). Sharing with people outside the team stops |
-| Removes a member | They leave the team: grants with teammates end, they're removed from teammates' machines and accounts, and the machine the team gave them is suspended, then destroyed after `TEAM_MACHINE_DAYS` |
-| Renames a group | Renames the team |
-| Deletes a group | Everyone leaves, then the team goes. A team paying for a plan is kept, empty, until a server admin ends the plan |
-| Deletes a user | They leave the team too |
-
-- **Members must be users this tenant provisioned**, by their SCIM id: push users before groups (Entra and Okta do). Anyone else is a 400.
-- **One team per person.** Adding someone who's on another team is a 409. Assign SuperBot only the groups that are teams, not "All staff".
-- **No roles from the IdP.** Everyone joins as a member. A new team has no owner: a server admin names one (`PUT /api/teams/<team>/members/<user>` with `{"role":"owner"}`, or the console's Teams tab). Owners and admins then manage machines, roles and billing.
-- **The IdP decides who's on its teams.** Invites, removing people, leaving, and renaming or deleting the team are refused in SuperBot (409); change the group instead.
-- Audited as `scim.group_created`, `scim.group_updated`, `scim.group_deleted`, and the usual `team.member_joined` (`via: scim`) and `team.member_left` (reason `scim_removed`, `scim_group_deleted` or `scim_user_deleted`).
+| Sends `roles`, `groups` on a user, a password | Ignored |
 
 **The IdP is in charge.** For users it provisioned, the IdP decides name, email, and `active`: an admin can disable one in SuperBot, but the IdP's next update can enable them again. Remove people in the IdP.
 
@@ -109,9 +90,39 @@ With `SCIM_GROUPS=on` ([ADR 0095](../adr/0095-scim-groups-as-teams.md)):
 
 **Audit.** Every change is logged with the token as the actor: `botctl audit --method scim_token`, or `--actor system:scim:<token id>`. Bad tokens are logged as `scim.auth_failed` (throttled), with `reason` `missing`, `unknown`, or `revoked`; a revoked token names which one, so you can find the IdP still sending it. Tokens themselves never are logged.
 
+## Groups as teams
+
+With `SCIM_GROUPS=on`, each group the IdP pushes is a SuperBot [team](../adr/0087-team-accounts-and-machines.md): its members share Bots, get the team's machines, and are on its plan if it pays ([ADR 0093](../adr/0093-team-billing.md)).
+
+| IdP does | SuperBot does |
+|----------|---------------|
+| Creates a group | A new team with that name, **no owner and no machines**. Give it an owner (`PUT /api/teams/<id>/members/<user> {"role":"owner"}`, or the console's Teams tab) and turn machines on (`PATCH /api/teams/<id> {"machines":true}`) |
+| Adds a member | They join as a plain member, exactly as a team admin's add: the team's machine, its plan, and the seat sync. Disabled people join too, without a machine, and get the team's when they're enabled |
+| Removes a member | They leave as a team admin's removal would: grants between teammates go, they're removed from teammates' machines and accounts, their team machine is suspended and destroyed after `TEAM_MACHINE_DAYS`, and the seat sync runs. Even the team's last owner (logged as `ownerless`) |
+| Renames the group | Renames the team |
+| Deletes the group | Its members leave, as above. A team the IdP made, left empty, is deleted, unless it pays for a plan; a team an admin linked, or one with people the IdP doesn't manage, stays, managed by hand again |
+| Deletes a user | They also leave the team their group put them on |
+
+**Only its own people.** A group holds only people this tenant provisioned. Adding anyone else is a 400. People on the team the tenant doesn't manage are never shown or removed. Someone on another team is a 409: a person is on one team at most, and SCIM never moves them; take them out of the other group first.
+
+**Never a role.** Everyone joins as `member`. Owners and admins are set in SuperBot, not the IdP.
+
+**Teams made by hand** are invisible to SCIM until an admin links one to a tenant:
+
+```sh
+botctl scim group link entra <team id> --external-id <Entra group objectId>   # Entra
+botctl scim group link okta <team id> --name "Sales"                          # Okta, by group name
+botctl scim groups                                                            # links, their teams, and counts
+botctl scim group unlink <team id>                                            # managed by hand again; nobody leaves
+```
+
+The IdP takes the team on when it pushes the group with that `externalId` (or, without one, that name), and then manages the tenant's people on it. Its owner and anyone else stay.
+
+**Audit.** `scim.group_created`, `scim.group_adopted`, `scim.group_resumed` (a retried `POST` that had stopped partway), `scim.group_updated` (with `added`, `removed`, `ownerless`), `scim.group_deleted` (with `teamFate`), `scim.group_member_refused`, `scim.group_linked`, `scim.group_unlinked`, and each join and leave as `team.member_joined` (via `scim`) and `team.member_left` (reason `scim`), with the token as the actor.
+
 ## Limits
 
-600 requests a minute per tenant, then 429 with `Retry-After` (Entra and Okta wait and retry). An IP sending 20 bad tokens in 10 minutes gets 429 for its bad tokens for a while; a valid token from that IP still works, since Entra and Okta send from addresses they share with other customers. Bodies are capped at 64 KiB (about 900 group members in one request). Lists return at most 200 users or groups per page.
+600 requests a minute per tenant, then 429 with `Retry-After` (Entra and Okta wait and retry). An IP sending 20 bad tokens in 10 minutes gets 429 for its bad tokens for a while; a valid token from that IP still works, since Entra and Okta send from addresses they share with other customers. Bodies are capped at 64 KiB, or 1 MiB for groups (a `PUT` carries every member). Lists return at most 200 users or groups per page. No groups in groups.
 
 ## Troubleshooting
 
@@ -121,6 +132,7 @@ With `SCIM_GROUPS=on` ([ADR 0095](../adr/0095-scim-groups-as-teams.md)):
 - **400 "externalId is required" or "externalId: …"**: the tenant links SSO, and the IdP didn't send the person's subject. Entra: map **objectId** to **externalId**.
 - **409 "Another SuperBot user has this email"**: see *One person, one user* above.
 - **409 on a user that exists**: the IdP is creating someone this tenant already has. Entra and Okta look the user up first and then update instead; check the matching attribute is `userName`.
-- **Group errors (501)**: `SCIM_GROUPS` is off. Turn group provisioning off in the IdP, or turn `SCIM_GROUPS=on`.
-- **400 "isn't a user this tenant provisioned"** on a group: the member wasn't provisioned by this tenant yet (or was deleted). Assign the person to the app too.
-- **409 "is on another team"** on a group: the person is in two team groups. Remove them from one.
+- **Group errors (501)**: `SCIM_GROUPS=on` isn't set. Set it, or turn group provisioning off in the IdP.
+- **409 on adding a group member**: they're on another team. Take them out of that group (or team) first.
+- **400 "isn't a user this tenant provisioned"**: provision the user before the group, or check the IdP sends the user's SuperBot id (it does once it has provisioned them).
+- **409 creating a group**: this tenant already has a group with that name or `externalId`. Names are unique per tenant in any ASCII case (`Eng` and `ENG` clash; `Équipe` and `éQUIPE` don't).

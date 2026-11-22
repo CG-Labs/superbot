@@ -91,7 +91,7 @@ All on loopback with the fake provider: the real router, botd's machine port and
 
 - `MACHINE_ROUTING=on` with enrollment on reaches the owner's machine over authenticated, pinned TLS, and refuses there with a clear reason until machines run Bots.
 - One new listening port on managed control planes, open to the internet: it serves only enrollment (token-gated), the CA-pinned agent download, and calls with a valid machine certificate. Both ports serve at most 256 connections at once, each for at most 10 minutes, and botd reads the agent binary once at start.
-- Rotating the master key rotates the CA too.
+- Rotating the master key rotates the CA too. Amended by [ADR 0096](0096-master-key-rotation.md): a rotation keeps the derived-key root, so the CA stays, unless `SUPERBOT_ROTATE_DERIVED_KEYS=1`.
 - Linode metadata (user data) needs a region and image that support it; others would need another way to deliver the token (an admin-issued token works).
 - The agent binary botd serves must suit the machines' architecture (both x86_64 Linux today).
 

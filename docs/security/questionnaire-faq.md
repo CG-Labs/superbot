@@ -9,10 +9,10 @@ Organisation data (users, chats, approvals, audit log, secrets, billing records)
 The operator chooses Linode regions (`MACHINE_REGIONS`) or where Incus hosts run, and self-hosting runs wherever you put it. A UK/EU region choice for the managed service is planned for M4 ([roadmap](../ROADMAP.md)).
 
 **Is data encrypted in transit?**
-Yes, with one operator choice. HTTPS to the server, mutual TLS 1.3 between the server and machines, HTTPS to botd's outside services, and STARTTLS or TLS for email. Runs reach model providers at the `baseUrl` the operator sets in the plan routing file, which may be plain `http://`; use `https://` so prompts and keys are encrypted. See [encryption in transit](data-flows.md#in-transit).
+Yes. HTTPS to the server, mutual TLS 1.3 between the server and machines, HTTPS to botd's outside services, and STARTTLS or TLS for email. Model providers set in the plan routing file must be `https://`; botd refuses to start on a plain `http://` provider unless it is on the same host ([ADR 0097](../adr/0097-model-providers-over-https.md)). See [encryption in transit](data-flows.md#in-transit).
 
 **Is data encrypted at rest?**
-Secrets, approval inputs and push tokens are encrypted field by field (XChaCha20-Poly1305) with a master key kept outside the data folder. The rest of the database, and machine disks, rely on the host's disk encryption. Backups are encrypted with age when the operator sets recipients, and are otherwise plain; machine backups include harness logins. See [encryption at rest](data-flows.md#at-rest).
+Secrets, approval inputs and push tokens are encrypted field by field (XChaCha20-Poly1305) with a master key kept outside the data folder, which the operator can rotate ([ADR 0096](../adr/0096-master-key-rotation.md)). The rest of the database, and machine disks, rely on the host's disk encryption. Backups are encrypted with age when the operator sets recipients, and are otherwise plain; machine backups include harness logins. See [encryption at rest](data-flows.md#at-rest).
 
 **Do you support SSO and SCIM?**
 Yes: Microsoft Entra ID, Google, Apple, GitHub, any OIDC provider, and SAML through a Keycloak broker. SCIM 2.0 user provisioning and deprovisioning. Native SAML is planned (M5). See [authentication](access-control.md#authentication).
@@ -45,7 +45,7 @@ No. No telemetry, analytics or crash reporting; the licence key is checked offli
 Server: daily backups by default (RPO 24 hours), RTO target 1 hour, drilled in CI. Managed Incus machines: per plan, 8 to 26 hours RPO and 60 minutes RTO, checked and alerted. See [machine recovery objectives](machine-recovery-objectives.md).
 
 **How long do you keep data?**
-Sessions end after 7 days idle or 30 days. Backups are kept 14 days by default. The audit log is kept until a retention period is set. See [retention](data-flows.md#retention).
+Sessions end after 7 days idle or 30 days. Backups are kept 14 days by default. The audit log and chat history are kept until a retention period is set for each; chat retention skips Bots an admin puts on a legal hold. See [retention](data-flows.md#retention).
 
 **Can a user's data be deleted?**
 Users are disabled, not deleted, today; their sessions end at once. Teammates who leave have their OS users and homes removed from the owner's machine. Erasure for managed users is planned (M4).
