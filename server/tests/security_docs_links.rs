@@ -7,12 +7,11 @@
 //! row, with a status, for every criterion it claims to cover, and the readiness
 //! checklist (#50) a well-formed row for every gap the mapping lists. The legal templates
 //! (#48) and the DPIA template (#58) must say they are drafts for legal review and not
-//! legal advice, claim no certification, and keep the provider's details as
-//! placeholders. The policy set
-//! (`docs/security/policies/`, #57, ADR 0130) is checked like the rest of the pack, and
-//! each policy must name a role as its owner, a review cadence and only checklist items
-//! that exist; the Type II evidence plan must keep a row for every criterion and list
-//! every checklist row under its own criterion.
+//! legal advice, claim no certification, and keep the provider's details as placeholders.
+//! The policy set (`docs/security/policies/`, #57, ADR 0130) is checked like the rest of
+//! the pack, and each policy must name a role as its owner, a review cadence and only
+//! checklist items that exist; the Type II evidence plan must keep a row for every
+//! criterion and list every checklist row under its own criterion.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;

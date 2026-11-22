@@ -145,6 +145,7 @@ pub fn user_view(app: &App, cp: &ControlPlane, u: &User) -> Value {
         "effective": eff,
         "machine": machine_view(m.as_ref(), &eff.region),
         "residency": super::residency::of_user(app, &u.id),
+        "ownResidency": app.db.residency_pin(crate::db::PinOn::User, &u.id),
     })
 }
 

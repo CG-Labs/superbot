@@ -69,13 +69,25 @@ fn stored_in(off: Option<&Offsite>, store_region: Option<&str>, region: &str) ->
     }
 }
 
-/// What of `user_id`'s data is outside `region` now: their machine, and backups in a store
-/// elsewhere that aren't deleted. A failed one counts: its upload may have finished before
-/// it failed. Empty: all of it is in.
+/// What of `user_id`'s data is outside `region` now: their machine (by its record, and by
+/// its host's tag now, since a machine made before hosts were tagged may be on any host),
+/// and backups in a store elsewhere that aren't deleted. A failed one counts: its upload
+/// may have finished before it failed. Empty: all of it is in.
 fn outside(app: &App, cp: &ControlPlane, user_id: &str, region: &str) -> Vec<String> {
     let mut out = Vec::new();
-    if let Some(m) = app.db.user_machine(user_id).filter(|m| m.region != region) {
-        out.push(format!("their machine is in {}", m.region));
+    if let Some(m) = app.db.user_machine(user_id) {
+        if m.region != region {
+            out.push(format!("their machine is in {}", m.region));
+        } else if let Some(h) = cp.hosts().filter(|_| cp.owns(&m)) {
+            let host = m.provider_id.as_deref().map(|p| h.host_of(p)).or_else(|| m.placed_on.clone());
+            if let Some(host) = host {
+                match h.configured().into_iter().find(|c| c.name == host).and_then(|c| c.region) {
+                    Some(r) if r == region => {}
+                    Some(r) => out.push(format!("their machine is on host {host}, in {r}")),
+                    None => out.push(format!("their machine is on host {host}, which has no data region")),
+                }
+            }
+        }
     }
     let off = cp.offsite.as_deref();
     let n = app
@@ -143,34 +155,40 @@ pub fn check_restore(app: &App, cp: &ControlPlane, m: &Machine, b: &MachineBacku
     Ok(())
 }
 
-/// Whether a new machine for `user_id` in `region` may be made on `host` (None: no
-/// Incus hosts): a pinned user's only in their region, and with hosts, only on one
-/// tagged with it. Startup merely warns when tags go, so this holds without them.
-pub fn check_create(app: &App, cp: &ControlPlane, user_id: &str, region: &str, host: Option<&str>) -> Result<(), (Box<ResidencyPin>, String)> {
+/// Whether a new machine for `user_id` may be placed in `region`: for a pinned user, only
+/// their pinned region and, with Incus hosts, only once hosts are tagged, since placement
+/// keeps to a region only then. Checked on every attempt, retries included.
+pub fn check_create(app: &App, cp: &ControlPlane, user_id: &str, region: &str) -> Result<(), (Box<ResidencyPin>, String)> {
     let Some(p) = of_user(app, user_id) else { return Ok(()) };
-    if region != p.region {
-        let why = format!("Its data is {}, and the machine would be in {region} (ADR 0129).", pinned_to(&p));
-        return Err((Box::new(p), why));
-    }
-    let (Some(h), Some(host)) = (cp.hosts(), host) else { return Ok(()) };
-    match h.configured().into_iter().find(|c| c.name == host).and_then(|c| c.region) {
-        Some(r) if r == p.region => Ok(()),
-        Some(r) => {
-            let why = format!("Host {host} is in {r}, and this machine's data is {} (ADR 0129).", pinned_to(&p));
-            Err((Box::new(p), why))
-        }
-        None => {
-            let why = format!("Host {host} has no data region, so nothing shows it is in {}, and this machine's data is {} (ADR 0129).", p.region, pinned_to(&p));
-            Err((Box::new(p), why))
-        }
-    }
+    let why = if region != p.region {
+        format!("Its data is {}, and the machine would be in {region} (ADR 0129).", pinned_to(&p))
+    } else if cp.hosts().is_some_and(|h| !h.tagged()) {
+        format!(
+            "Its data is {}, and Incus hosts aren't tagged with data regions, so nothing shows a host is in {} (INCUS_REGION, INCUS_REGION_<NAME>) (ADR 0129).",
+            pinned_to(&p),
+            p.region
+        )
+    } else {
+        return Ok(());
+    };
+    Err((Box::new(p), why))
 }
 
-/// A machine action a pin refused (`action`: `backup`, `restore`, `move`, `recover` or `create`):
-/// audited as `machine.residency_refused`.
+fn refusal(action: &str, p: &ResidencyPin, why: &str) -> Value {
+    json!({ "reason": PINNED, "action": action, "pinnedRegion": p.region, "pinnedOn": p.subject_type, "reference": p.reference, "error": why })
+}
+
+/// A machine action a pin refused (`action`: `create`, `backup`, `restore`, `move` or
+/// `recover`): audited as `machine.residency_refused`.
 pub fn refused(app: &App, by: &Who, m: &Machine, action: &str, p: &ResidencyPin, why: &str) {
-    let d = json!({ "reason": PINNED, "action": action, "pinnedRegion": p.region, "pinnedOn": p.subject_type, "reference": p.reference, "error": why });
-    app.db.record(&event(by, "machine.residency_refused", m, d).outcome(Outcome::Denied));
+    app.db.record(&event(by, "machine.residency_refused", m, refusal(action, p, why)).outcome(Outcome::Denied));
+}
+
+/// A new machine a pin refused before there was one to name: audited on the user.
+pub fn refused_request(app: &App, by: &Who, user_id: &str, p: &ResidencyPin, why: &str) {
+    let mut d = refusal("create", p, why);
+    d["userId"] = json!(user_id);
+    app.db.record(&by.event("machine.residency_refused").target("user", user_id).outcome(Outcome::Denied).details(d));
 }
 
 /// Whether `u`'s own region may become `to`, which makes their region `after`: never
