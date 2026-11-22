@@ -1,0 +1,84 @@
+# Error alerts for botd (docs/adr/0113-service-dashboards-and-error-reporting.md), from the
+# metrics in docs/adr/0089-metrics-and-structured-logs.md.
+#
+# Load it from prometheus.yml next to superbot-slo.rules.yml:
+#   rule_files: ["/etc/prometheus/superbot-slo.rules.yml", "/etc/prometheus/superbot-errors.rules.yml"]
+# Check it with: promtool check rules superbot-errors.rules.yml
+#                promtool test rules superbot-errors.rules.test.yml
+#
+# The SLO rules watch the whole service: every route's 5xx against the error budget, and
+# every harness's runs against the 10% run objective. These watch the parts, so one
+# broken route class or one broken harness shows even when the whole looks fine, and
+# watch panics, a run queue that never drains, and error reports that don't arrive.
+#
+# It assumes the scrape job is named "superbot" (as in deploy/README.md). Thresholds are
+# starting points: tune them to your traffic.
+
+groups:
+  - name: superbot-errors-recording
+    interval: 30s
+    rules:
+      # Each harness's share of finished runs that broke (error or timeout).
+      - record: superbot:runs_failed_by_harness:ratio_rate30m
+        expr: |
+          sum by (job, harness) (rate(superbot_runs_total{result=~"error|timeout"}[30m]))
+          / sum by (job, harness) (rate(superbot_runs_total{result=~"done|error|timeout"}[30m]))
+
+      # Each route class's share of requests answered with a 5xx. Health checks and the
+      # status page (which answers 503 in a major outage, on purpose) are left out.
+      - record: superbot:http_request_errors_by_route_class:ratio_rate10m
+        expr: |
+          sum by (job, route_class) (rate(superbot_http_requests_total{status_class="5xx",route_class!~"healthz|status"}[10m]))
+          / sum by (job, route_class) (rate(superbot_http_requests_total{route_class!~"healthz|status"}[10m]))
+
+  - name: superbot-errors-alerts
+    rules:
+      - alert: SuperBotHarnessRunsFailing
+        expr: |
+          superbot:runs_failed_by_harness:ratio_rate30m > 0.25
+          and on(job, harness)
+          sum by (job, harness) (increase(superbot_runs_total{result=~"done|error|timeout"}[30m])) >= 5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Bot runs on {{ $labels.harness }} are failing"
+          description: "{{ $value | humanizePercentage }} of {{ $labels.harness }} runs in the last 30 minutes ended in error or timeout. Check the harness's CLI version and login, its model provider's status, and botd's run.finished log lines for that harness."
+
+      - alert: SuperBotRouteClassErrors
+        expr: |
+          superbot:http_request_errors_by_route_class:ratio_rate10m > 0.05
+          and on(job, route_class)
+          sum by (job, route_class) (increase(superbot_http_requests_total{route_class!~"healthz|status"}[10m])) >= 20
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "botd's {{ $labels.route_class }} routes are failing"
+          description: "{{ $value | humanizePercentage }} of {{ $labels.route_class }} requests in the last 10 minutes were answered with a 5xx. Check the error tracker (ERROR_REPORT_DSN) or botd's http.request log lines at level warn for that routeClass."
+
+      # A panic that ends botd is never scraped: SuperBotDown covers that one.
+      - alert: SuperBotPanics
+        expr: sum by (job, instance) (increase(superbot_panics_total[15m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: botd panicked
+          description: "botd at {{ $labels.instance }} panicked in the last 15 minutes. A request that panics answers 500; a task that panics stops. Find it in the error tracker or botd's server.panic log line, and its message in botd's stderr."
+
+      - alert: SuperBotRunQueueBacklog
+        expr: sum by (job, instance) (superbot_runs_waiting) > 0
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Bot runs have waited for a slot for 30 minutes
+          description: "{{ $value }} runs at {{ $labels.instance }} are waiting for a run slot, and some have been waiting for 30 minutes without a break. Raise MAX_CONCURRENT_RUNS or a tier's concurrentRuns (ADR 0073), or look for runs that don't finish."
+
+      - alert: SuperBotErrorReportsFailing
+        expr: sum by (job, instance) (increase(superbot_error_reports_total{outcome="failed"}[30m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: botd's error reports aren't reaching the error tracker
+          description: "The error tracker refused or didn't answer reports from botd at {{ $labels.instance }} in the last 30 minutes, so panics and 5xx answers may be missing there. Check ERROR_REPORT_DSN, the tracker's rate limits, and botd's log for \"error tracker\"."
