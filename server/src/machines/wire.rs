@@ -335,6 +335,9 @@ pub struct RetentionRequest {
 pub struct SessionDir {
     pub path: String,
     pub depth: u32,
+    /// It holds transcripts (`sweep::Root::transcript`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transcript: bool,
 }
 
 /// `token` as a viewer password: plain lowercase hex, long enough to guess at no rate.

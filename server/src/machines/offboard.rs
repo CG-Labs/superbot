@@ -164,7 +164,7 @@ pub(crate) fn reason_for(app: &App, user_id: &str) -> &'static str {
 }
 
 /// The teammates with a user on `m`: as its agent last said, and as botd made since.
-fn known(m: &Machine) -> Vec<String> {
+pub(crate) fn known(m: &Machine) -> Vec<String> {
     m.agent_upkeep
         .as_ref()
         .and_then(|v| v["teammates"].as_array())

@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn a_sweep_stays_in_the_accounts_own_folders() {
         let home = Path::new("/srv/superbot/users/u1/home");
-        let root = |base: &str| sweep::Sweep { roots: vec![sweep::Root { base: base.into(), path: ".claude/projects".into(), depth: 2 }], ..Default::default() };
+        let root = |base: &str| sweep::Sweep { roots: vec![sweep::Root { base: base.into(), path: ".claude/projects".into(), depth: 2, transcript: true }], ..Default::default() };
         assert!(sweep_ok(home, &root("/srv/superbot/users/u1/home")).is_ok());
         assert!(sweep_ok(home, &root("/srv/superbot/users/u1/bots/b1")).is_ok());
         for bad in ["/srv/superbot/users/u2/home", "/srv/superbot/users/u1/../u2/home", "relative", "/etc"] {

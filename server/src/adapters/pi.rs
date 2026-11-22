@@ -16,7 +16,7 @@ fn guard_file(input: &RunInput) -> PathBuf {
 impl Adapter for Pi {
     /// `--session-dir` puts each Bot's sessions, `<time>_<session>.jsonl`, in its own folder.
     fn sessions(&self) -> super::Sessions {
-        super::Sessions { home: &[], state: &[("pi-sessions", 1)] }
+        super::Sessions { home: &[], state: &[("pi-sessions", 1, true)] }
     }
 
     fn bin(&self) -> &'static str {

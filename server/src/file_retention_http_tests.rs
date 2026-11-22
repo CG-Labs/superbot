@@ -160,7 +160,7 @@ async fn archived_work_goes_once_old_unless_its_owner_is_held() {
     let (machine_row, _) = app.db.teammate_cleanup_queue(&n).unwrap();
     app.db.teammate_cleanup_removed(&machine_row.id, Some("/home/superbot/work/from-teammates/lee-2026-01-02"), None);
     app.db.set_removed_at("teammate_cleanups", &machine_row.id, now - 100 * DAY);
-    // Archived on this server, whose per-user accounts are off now: nothing of it is left.
+    // Archived on this server, whose per-user accounts are off now: they may still be there.
     let removal = |user: &'static str, name: &str, at: i64| {
         let n = NewAccountRemoval { owner_id: &owner.id, user_id: user, account: "sb-t-x", reason: "disabled", files: "archive", grace_days: 0, created_by: None };
         let (r, _) = app.db.account_removal_queue(&n).unwrap();
@@ -168,7 +168,7 @@ async fn archived_work_goes_once_old_unless_its_owner_is_held() {
         app.db.set_removed_at("account_removals", &r.id, at);
         r.id
     };
-    removal("u-max", "max-2026-01-02", now - 100 * DAY);
+    let max = removal("u-max", "max-2026-01-02", now - 100 * DAY);
     let recent = removal("u-neo", "neo-2026-01-02", now - DAY);
 
     assert_eq!(call(port, "PUT", &format!("/api/retention/holds/{}", bot.id), &admin, &json!({ "reason": "Hold" }).to_string()).await.0, 200);
@@ -178,12 +178,16 @@ async fn archived_work_goes_once_old_unless_its_owner_is_held() {
 
     assert_eq!(call(port, "DELETE", &format!("/api/retention/holds/{}", bot.id), &admin, "").await.0, 200);
     let pass = file_retention::prune_teammate_files(&app, 30, now).await;
-    assert_eq!((pass["held"].as_u64(), pass["missing"].as_u64(), pass["errors"].as_array().map(Vec::len)), (Some(0), Some(2), Some(0)), "{pass}");
+    let counts = |p: &Value| ["held", "missing", "waiting"].map(|k| p[k].as_u64());
+    assert_eq!((counts(&pass), pass["errors"].as_array().map(Vec::len)), ([Some(0), Some(1), Some(1)], Some(0)), "{pass}");
     let pruned = audit(port, &admin, "teammate_files.pruned").await;
-    assert_eq!(pruned[0]["details"]["missing"].as_u64(), Some(2), "{pruned:?}");
-    // Each is done once; the recent one waits.
-    let left: Vec<String> = app.db.archives_before(now).into_iter().map(|a| a.1).collect();
-    assert_eq!(left, [recent], "{left:?}");
+    assert_eq!(pruned[0]["details"]["missing"].as_u64(), Some(1), "{pruned:?}");
+    // Each is done once; the account's waits for the account to be checked, the recent one for its time.
+    let mut left: Vec<String> = app.db.archives_before(now).into_iter().map(|a| a.1).collect();
+    left.sort();
+    let mut want = vec![max, recent];
+    want.sort();
+    assert_eq!(left, want, "{left:?}");
     let again = file_retention::prune_teammate_files(&app, 30, now).await;
     assert_eq!(again["missing"].as_u64(), Some(0), "{again}");
 }

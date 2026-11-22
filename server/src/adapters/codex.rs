@@ -39,7 +39,7 @@ impl Adapter for Codex {
     /// the same files once archived. Its indexes (`history.jsonl`, `session_index.jsonl`,
     /// `state_*.sqlite`) have no session id in their names, so they stay.
     fn sessions(&self) -> super::Sessions {
-        super::Sessions { home: &[(".codex/sessions", 4), (".codex/archived_sessions", 1)], state: &[] }
+        super::Sessions { home: &[(".codex/sessions", 4, true), (".codex/archived_sessions", 1, true)], state: &[] }
     }
 
     fn bin(&self) -> &'static str {

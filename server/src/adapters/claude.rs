@@ -78,7 +78,7 @@ impl Adapter for Claude {
     /// `projects/<project>/memory/` has no session id in its name, so it stays.
     fn sessions(&self) -> super::Sessions {
         super::Sessions {
-            home: &[(".claude/projects", 2), (".claude/file-history", 1), (".claude/session-env", 1), (".claude/debug", 1), (".claude/todos", 1)],
+            home: &[(".claude/projects", 2, true), (".claude/file-history", 1, false), (".claude/session-env", 1, false), (".claude/debug", 1, false), (".claude/todos", 1, false)],
             state: &[],
         }
     }

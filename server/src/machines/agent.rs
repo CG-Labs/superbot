@@ -1988,9 +1988,9 @@ fn retention_sweep(r: &wire::RetentionRequest, home: &Path, teammates: &[PathBuf
     let base = |p: &Path| p.display().to_string();
     let mut s = Sweep { before: r.before, keep: r.keep.clone(), report: r.report.clone(), ..Default::default() };
     for h in std::iter::once(home).chain(teammates.iter().map(PathBuf::as_path)) {
-        s.roots.extend(r.home.iter().map(|d| Root { base: base(h), path: d.path.clone(), depth: d.depth }));
+        s.roots.extend(r.home.iter().map(|d| Root { base: base(h), path: d.path.clone(), depth: d.depth, transcript: d.transcript }));
         for bot in &r.bots {
-            s.roots.extend(r.state.iter().map(|d| Root { base: base(h), path: format!("bots/{bot}/{}", d.path), depth: d.depth }));
+            s.roots.extend(r.state.iter().map(|d| Root { base: base(h), path: format!("bots/{bot}/{}", d.path), depth: d.depth, transcript: d.transcript }));
         }
     }
     s.folders = r.archives.iter().map(|n| Folder { base: base(home), path: format!("work/{}/{n}", wire::TEAMMATE_ARCHIVE_DIR) }).collect();

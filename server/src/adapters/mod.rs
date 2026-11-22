@@ -289,6 +289,11 @@ pub trait Adapter: Send + Sync {
     fn prune_sessions(&self, _state_dir: &std::path::Path, _days: u32, _path: Option<&str>) -> Option<JobRequest> {
         None
     }
+    /// Whether `state_dir`, a Bot's state folder this server can read, has the database
+    /// `prune_sessions` prunes.
+    fn has_session_db(&self, _state_dir: &std::path::Path) -> bool {
+        false
+    }
 }
 
 /// Session folders, each with how many folders down a session sits. Every name with a
@@ -296,10 +301,12 @@ pub trait Adapter: Send + Sync {
 /// never touched.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Sessions {
-    /// Under the HOME its runs use, which every Bot running there shares.
-    pub home: &'static [(&'static str, u32)],
-    /// Under each Bot's own state folder.
-    pub state: &'static [(&'static str, u32)],
+    /// Under the HOME its runs use, which every Bot running there shares: each folder,
+    /// how deep its sessions are, and whether it holds their transcripts (a session whose
+    /// transcript went is gone; one that lost only side files can still be resumed).
+    pub home: &'static [(&'static str, u32, bool)],
+    /// Under each Bot's own state folder, the same.
+    pub state: &'static [(&'static str, u32, bool)],
 }
 
 /// A short job for a harness, outside any run: `prune_sessions`'s.
