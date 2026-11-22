@@ -131,7 +131,13 @@ export function AccessReview({ api, onBack }: Props) {
       </View>
       {error ? <Text style={styles.error}>{error}</Text> : null}
       {!report ? (
-        error ? null : <ActivityIndicator color={colors.textDim} style={{ marginTop: 20 }} />
+        error ? (
+          <Pressable onPress={() => void load()} accessibilityRole="button" style={styles.retry}>
+            <Text style={styles.link}>Retry</Text>
+          </Pressable>
+        ) : (
+          <ActivityIndicator color={colors.textDim} style={{ marginTop: 20 }} />
+        )
       ) : (
         <ScrollView contentContainerStyle={styles.body} testID="access-review">
           <Text style={styles.faint}>Generated {new Date(report.generatedAt).toLocaleString()}</Text>
@@ -222,6 +228,7 @@ const styles = StyleSheet.create({
     minHeight: 60,
   },
   link: { color: colors.blueDot },
+  retry: { paddingHorizontal: 16, paddingVertical: 8 },
   ok: { color: colors.text },
   error: { color: colors.danger, paddingHorizontal: 16, paddingVertical: 8 },
 });

@@ -130,4 +130,14 @@ describe("AccessReview", () => {
     await render(<AccessReview api={api as unknown as SuperBotApi} onBack={jest.fn()} />);
     expect(await screen.findByText("Admins only")).toBeOnTheScreen();
   });
+
+  it("tries again after a failed load", async () => {
+    const api = fakeApi();
+    api.accessReview.mockRejectedValueOnce(new Error("Network down"));
+    const user = userEvent.setup();
+    await render(<AccessReview api={api as unknown as SuperBotApi} onBack={jest.fn()} />);
+    await user.press(await screen.findByText("Retry"));
+    expect(await screen.findByTestId("access-review")).toBeOnTheScreen();
+    expect(screen.queryByText("Network down")).toBeNull();
+  });
 });
