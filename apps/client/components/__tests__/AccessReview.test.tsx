@@ -1,5 +1,5 @@
 import React from "react";
-import { render, screen, userEvent, within } from "@testing-library/react-native";
+import { render, screen, userEvent, waitFor, within } from "@testing-library/react-native";
 import { AccessReview } from "../AccessReview";
 import { ApiError, type SuperBotApi } from "../../src/api";
 import { saveCsv } from "../../src/saveCsv";
@@ -89,6 +89,15 @@ describe("AccessReview", () => {
     expect(screen.queryByText("None yet.")).toBeNull();
   });
 
+  it("drops the sign-off message once a reload shows different access", async () => {
+    const { api, user } = await open();
+    await user.press(screen.getByText("Mark as reviewed"));
+    expect(await screen.findByText(/^Signed off at/)).toBeOnTheScreen();
+    api.accessReview.mockResolvedValueOnce(report({ digest: "d2" }));
+    await user.press(screen.getByText("Reload"));
+    await waitFor(() => expect(screen.queryByText(/^Signed off at/)).toBeNull());
+  });
+
   it("says to reload when access changed since it loaded", async () => {
     const api = fakeApi();
     api.completeAccessReview.mockRejectedValueOnce(new ApiError("changed", 409));
@@ -102,8 +111,17 @@ describe("AccessReview", () => {
   it("exports the CSV under the server's name", async () => {
     const { api, user } = await open();
     await user.press(screen.getByText("Export CSV"));
-    expect(api.accessReviewCsv).toHaveBeenCalled();
+    expect(api.accessReviewCsv).toHaveBeenCalledWith("d1");
     expect(saveCsv).toHaveBeenCalledWith("superbot-access-review-20261122-090000.csv", "generated_at\r\n", "Export access review");
+  });
+
+  it("refuses to export a report that is no longer current", async () => {
+    const api = fakeApi();
+    api.accessReviewCsv.mockRejectedValueOnce(new ApiError("changed", 409));
+    const { user } = await open(api);
+    await user.press(screen.getByText("Export CSV"));
+    expect(await screen.findByText("Access changed since this report loaded. Reload it before exporting.")).toBeOnTheScreen();
+    expect(saveCsv).not.toHaveBeenCalled();
   });
 
   it("shows why it couldn't load", async () => {

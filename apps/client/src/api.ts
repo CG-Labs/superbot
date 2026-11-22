@@ -690,8 +690,9 @@ export class SuperBotApi {
   }
 
   /** The report as CSV, one dated row per person. */
-  async accessReviewCsv(): Promise<string> {
-    const res = await this.send("GET", "/api/access-review/export.csv");
+  /** The CSV of the report with `digest`. A 409 means access changed since it loaded. */
+  async accessReviewCsv(digest: string): Promise<string> {
+    const res = await this.send("GET", `/api/access-review/export.csv?digest=${encodeURIComponent(digest)}`);
     return res.text();
   }
 

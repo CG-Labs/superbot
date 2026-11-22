@@ -68,6 +68,7 @@ export function AccessReview({ api, onBack }: Props) {
 
   const load = useCallback(async () => {
     setError(null);
+    setSignError(null);
     try {
       setReport(await api.accessReview());
     } catch (err) {
@@ -84,9 +85,10 @@ export function AccessReview({ api, onBack }: Props) {
     setExporting(true);
     setError(null);
     try {
-      await saveCsv(csvFileName(report.generatedAt), await api.accessReviewCsv(), "Export access review");
+      await saveCsv(csvFileName(report.generatedAt), await api.accessReviewCsv(report.digest), "Export access review");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Export failed");
+      const stale = err instanceof ApiError && err.status === 409;
+      setError(stale ? "Access changed since this report loaded. Reload it before exporting." : err instanceof Error ? err.message : "Export failed");
     } finally {
       setExporting(false);
     }
@@ -161,11 +163,11 @@ export function AccessReview({ api, onBack }: Props) {
               >
                 <Text style={styles.primaryText}>{saving ? "Signing off…" : "Mark as reviewed"}</Text>
               </Pressable>
-              <Pressable onPress={() => void load().then(() => setSignError(null))} accessibilityRole="button">
+              <Pressable onPress={() => void load()} accessibilityRole="button">
                 <Text style={styles.link}>Reload</Text>
               </Pressable>
             </View>
-            {signed ? <Text style={styles.ok}>Signed off at {new Date(signed.at).toLocaleString()}.</Text> : null}
+            {signed && signed.digest === report.digest ? <Text style={styles.ok}>Signed off at {new Date(signed.at).toLocaleString()}.</Text> : null}
             {signError ? <Text style={styles.error}>{signError}</Text> : null}
           </View>
           {report.groups.map((g) => (
