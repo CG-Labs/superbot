@@ -247,6 +247,8 @@ async fn a_pinned_team_keeps_members_and_its_region_in_it_and_cant_be_deleted_un
     assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/region"), &admin, r#"{"region":"de-fra-2"}"#).await.0, 200, "the same region is fine");
     // Her own pin, agreeing with the team's, holds her own region even though the team's would allow clearing it.
     assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("de-fra-2", "DPA-ada")).await.0, 200);
+    let (_, u) = call_json(port, "GET", &format!("/api/users/{ada}"), &admin, "").await;
+    assert_eq!((u["residency"]["subjectType"].as_str(), u["ownResidency"]["reference"].as_str()), (Some("team"), Some("DPA-ada")), "the console unpins her own: {u}");
     let (code, v) = call_json(port, "PUT", &format!("/api/users/{ada}/region"), &admin, r#"{"region":null}"#).await;
     assert!(code == 409 && v["error"].as_str().unwrap().contains("Their data is pinned to de-fra-2 (DPA-ada)"), "{v}");
     assert_eq!(call(port, "DELETE", &format!("/api/users/{ada}/residency"), &admin, r#"{"reason":"covered by the team"}"#).await.0, 200);

@@ -58,8 +58,9 @@ Every path that places or copies their data checks the pin. A refusal is a 409, 
 | A restore | The backup's recorded store isn't in the region | action `restore` |
 | A restore onto a named host | As above, or the host isn't tagged with the region | action `move` |
 | Recovering a lost host | As above, for each pinned machine; it is skipped and listed with the reason | action `recover` |
+| A new machine | It would be outside the region, or, with Incus hosts, the host picked isn't tagged with the region. Checked on every attempt, so a waiting machine stays unmade if the tags go | action `create`; a waiting machine is audited once per reason |
 
-Placement (ADR 0117) already keeps new machines on hosts in the region; the pin adds nothing there because the region can't change while pinned.
+Placement (ADR 0117) keeps new machines on hosts in the region only while hosts are tagged. Tags can go after a pin is made, and startup only warns, so creation checks the pin itself.
 
 Scheduled backups of a pinned machine that can't stay in the region are skipped and not audited each time. The reason shows in the backups view and in the RPO alert ([ADR 0074](0074-machine-rpo-and-rto.md)). Only backups an admin asks for are audited as refused.
 

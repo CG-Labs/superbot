@@ -344,6 +344,7 @@ fn admin_view(a: &Auth, u: &User, identities: &[db::Identity], pending: Option<&
         if a.machines.enabled() {
             v["dataRegion"] = json!(crate::machines::region::effective(app, &a.machines, u));
             v["residency"] = json!(crate::machines::residency::of_user(app, &u.id));
+            v["ownResidency"] = json!(app.db.residency_pin(crate::db::PinOn::User, &u.id));
         }
     }
     v
