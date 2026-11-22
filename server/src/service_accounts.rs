@@ -479,6 +479,16 @@ pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>
     if !changes.is_empty() {
         app.db.record(&by.event("service_account.updated").target("service_account", &id).details(json!({ "name": after.user.name, "changes": changes })));
     }
+    // Another team shares other Bots with it: runs it asked for on Bots it can no longer
+    // operate stop.
+    if before.team_id != after.team_id {
+        let viewer = crate::acl::Viewer::User { id: id.clone(), role: after.user.role };
+        for bot in app.db.bots() {
+            if app.live_run(&bot.id).is_some() && app.requested_by(&bot) == id && viewer.access(&app.db, &bot) < crate::acl::Access::Operate {
+                app.stop(&bot.id);
+            }
+        }
+    }
     if before.user.status != after.user.status {
         if after.user.active() {
             let resumed = crate::handover::user_enabled(&app, &by, &id);
