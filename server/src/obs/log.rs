@@ -87,11 +87,14 @@ pub fn event(level: Level, msg: &str, fields: Value) {
     }
 }
 
+/// Never panics on a failed write: structured lines are also written from the panic
+/// hook, where a second panic aborts botd.
 fn write(level: Level, line: String) {
-    match level {
-        Level::Info => println!("{line}"),
-        Level::Warn => eprintln!("{line}"),
-    }
+    use std::io::Write;
+    let _ = match level {
+        Level::Info => writeln!(std::io::stdout().lock(), "{line}"),
+        Level::Warn => writeln!(std::io::stderr().lock(), "{line}"),
+    };
 }
 
 pub fn render(level: Level, msg: &str, fields: Value) -> String {

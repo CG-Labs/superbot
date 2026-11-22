@@ -159,7 +159,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(superbot_http_requests_total{job=\"$job\",instance=~\"$instance\",route_class!~\"healthz|status\",status_class=\"5xx\"}[5m])) / sum(rate(superbot_http_requests_total{job=\"$job\",instance=~\"$instance\",route_class!~\"healthz|status\"}[5m]))",
+          "expr": "(sum(rate(superbot_http_requests_total{job=\"$job\",instance=~\"$instance\",route_class!~\"healthz|status\",status_class=\"5xx\"}[5m])) or sum(rate(superbot_http_requests_total{job=\"$job\",instance=~\"$instance\",route_class!~\"healthz|status\"}[5m])) * 0) / sum(rate(superbot_http_requests_total{job=\"$job\",instance=~\"$instance\",route_class!~\"healthz|status\"}[5m]))",
           "legendFormat": "5xx share (5m)",
           "refId": "A",
           "instant": true
@@ -465,7 +465,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (route_class) (rate(superbot_http_requests_total{job=\"$job\",instance=~\"$instance\",route_class!~\"healthz|status\",status_class=\"5xx\"}[$__rate_interval])) / sum by (route_class) (rate(superbot_http_requests_total{job=\"$job\",instance=~\"$instance\",route_class!~\"healthz|status\"}[$__rate_interval]))",
+          "expr": "(sum by (route_class) (rate(superbot_http_requests_total{job=\"$job\",instance=~\"$instance\",route_class!~\"healthz|status\",status_class=\"5xx\"}[$__rate_interval])) or sum by (route_class) (rate(superbot_http_requests_total{job=\"$job\",instance=~\"$instance\",route_class!~\"healthz|status\"}[$__rate_interval])) * 0) / sum by (route_class) (rate(superbot_http_requests_total{job=\"$job\",instance=~\"$instance\",route_class!~\"healthz|status\"}[$__rate_interval]))",
           "legendFormat": "{{route_class}}",
           "refId": "A",
           "range": true
@@ -834,7 +834,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(superbot_runs_total{job=\"$job\",instance=~\"$instance\",result=~\"error|timeout\"}[1h])) / sum(rate(superbot_runs_total{job=\"$job\",instance=~\"$instance\",result=~\"done|error|timeout\"}[1h]))",
+          "expr": "(sum(rate(superbot_runs_total{job=\"$job\",instance=~\"$instance\",result=~\"error|timeout\"}[1h])) or sum(rate(superbot_runs_total{job=\"$job\",instance=~\"$instance\",result=~\"done|error|timeout\"}[1h])) * 0) / sum(rate(superbot_runs_total{job=\"$job\",instance=~\"$instance\",result=~\"done|error|timeout\"}[1h]))",
           "legendFormat": "Run failure share (1h)",
           "refId": "A",
           "instant": true
@@ -1131,7 +1131,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (harness) (rate(superbot_runs_total{job=\"$job\",instance=~\"$instance\",result=~\"error|timeout\"}[30m])) / sum by (harness) (rate(superbot_runs_total{job=\"$job\",instance=~\"$instance\",result=~\"done|error|timeout\"}[30m]))",
+          "expr": "(sum by (harness) (rate(superbot_runs_total{job=\"$job\",instance=~\"$instance\",result=~\"error|timeout\"}[30m])) or sum by (harness) (rate(superbot_runs_total{job=\"$job\",instance=~\"$instance\",result=~\"done|error|timeout\"}[30m])) * 0) / sum by (harness) (rate(superbot_runs_total{job=\"$job\",instance=~\"$instance\",result=~\"done|error|timeout\"}[30m]))",
           "legendFormat": "{{harness}}",
           "refId": "A",
           "range": true
