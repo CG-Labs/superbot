@@ -33,8 +33,8 @@ Five new runbooks cover the M5 features that landed since the first slice: SAML 
 |---|---|---|
 | `adoption` | 25 | Share of people with a seat who signed in, or whose session or token was used, in the window |
 | `runs` | 20 | Share of finished Bot runs that ended `error` or `timeout` |
-| `identity` | 20 | Share of single sign-on attempts that failed; count of failed SCIM requests made with a token. The worse of the two |
-| `backups` | 20 | Server backups against their RPO and whether they leave the host; machines past their RPO; machine backups that failed |
+| `identity` | 20 | Share of single sign-on attempts that failed; count of SCIM requests with a valid token that were refused or failed, and of revoked tokens still in use. The worse of the two |
+| `backups` | 20 | Server backups against their RPO, whether they leave the host, and whether one has yet; machines past their RPO; machine backups that failed |
 | `approvals` | 10 | Share of approvals asked for that expired unanswered |
 | `license` | 5 | Days to its end; seats in use against the cap |
 
@@ -48,9 +48,16 @@ Each signal is ok (100 points), watch (50) or at risk (0), or n/a when there's n
 - **Unauthenticated SCIM probes are only counted.** A SCIM request with no token or an unknown one can come from anyone on the internet, so it would let a stranger move a customer's score. A revoked token still in use is counted as a failure: it means the IdP's provisioning stopped.
 - **The window is 7 to 90 days, 30 by default.** Shorter is noise; a quarter covers the business review, and longer is history rather than health. When the audit log keeps fewer days than asked (`AUDIT_RETENTION_DAYS`), the report says `partial`.
 
+### Two records added
+
+The score needs two things botd didn't keep:
+
+- **Refused SCIM requests.** A SCIM request with a valid token that botd answers with an error (a duplicate user, a bad request, no seat left, a server error) wasn't audited unless it changed something, so an IdP could fail to provision people for weeks with nothing to count. SCIM's guard now records `scim.request_failed` after the handler, with the tenant, status, method, resource and reason (the error's `scimType`, or `status_<code>`), never the request body. A 404 isn't recorded: IdPs look people up and repeat deletes in their normal course. A request that also has its own event (`scim.group_member_refused`) is counted once, by this one. The tenant's rate limit bounds how many an IdP can cause.
+- **When each person was last seen.** Sessions and API tokens are pruned 30 days after they stop working, so a token used early in a 90-day window could take its only record of use with it. `users.last_seen_at` follows each session's own (written at most once a minute, as the session's is), is filled from the sessions there are when the column is added, and is cleared when a person is erased.
+
 ### Computed on demand, from existing data
 
-`GET /api/support/health-score?days=<n>` computes the report from the audit log (one grouped query over the window: action, outcome, sign-in method and the `result` or `reason` code, counts only), users' last sign-in and session use, server backup status, open machine RPO breaches and the license. It returns the score, band, the signals at risk and at watch, and each signal's status, summary, facts and playbook anchor. Reason codes go through the support bundle's `reason_code`, so a free-text reason becomes `[text]`.
+`GET /api/support/health-score?days=<n>` computes the report from the audit log (one grouped query over the window: action, outcome, sign-in method and the `result` or `reason` code, counts only), users' last sign-in and last use, whether a SCIM token was used, server backup status (age from the newest archive copied off the host), open machine RPO breaches and the license. It returns the score, band, the signals at risk and at watch, and each signal's status, summary, facts and playbook anchor. Reason codes go through the support bundle's `reason_code`, so a free-text reason becomes `[text]`.
 
 It isn't in the RBAC table, so it takes the default for unlisted routes: admins only, as the support bundle. It isn't audited: it's a read of aggregate counts, like usage. `botctl health-score [--days <n>] [json]` calls it with the operator's credentials and prints one line per signal, then which signals to look at and where the playbook is.
 
@@ -72,6 +79,7 @@ The bundle carries the same report for the last 30 days as `health-score.json`, 
 ## Tests
 
 - `health_score.rs`: rules judge at their thresholds; weights sum to 100 and ids are unique; the score is the weighted mean of what can be judged, and a new server is judged on what it has; one signal at risk keeps a high score out of healthy; failed runs are errors and timeouts only; identity takes the worse of SSO and SCIM, and unauthenticated SCIM is only counted; backups take the worst of server and machines; the license is judged by its end and seats; the window is checked; audit counts become inputs; and the playbook's table, sections, bands and window match the code.
+- `scim_http_tests.rs`: a duplicate user and a malformed request with a valid token are each audited once as `scim.request_failed` with their reason, a 404 lookup and a bad token aren't, and the score counts them. `db.rs`: a token's use outlives its pruned session.
 - `health_score_http_tests.rs`, on the real router: members, read-only users, a custom role with every delegable permission, and Bots get 403, nobody gets 401, an admin gets the report; a window outside 7 to 90 days, or not a number, is 400; the report counts the people, runs, refusals, sign-ins, SCIM failures and approvals the database recorded, and carries no email or Bot name; the grouped audit query starts where asked and returns no actor.
 - `support_http_tests.rs`: the bundle has `health-score.json` with every signal, and its manifest lists it.
 - botctl's tests: the window and `json` flags, and the summary's lines.
