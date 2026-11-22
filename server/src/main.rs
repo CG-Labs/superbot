@@ -330,7 +330,7 @@ async fn main() {
         log_warn!("{e}");
         std::process::exit(1);
     });
-    let audit_export = audit_export::Settings::from_env(&|k| env(k, ""), &secrets::env::EnvStore::process()).unwrap_or_else(|e| exit(format!("Audit export: {e}")));
+    let audit_export = audit_export::Settings::from_env(&|k| env(k, ""), &startup_store).unwrap_or_else(|e| exit(format!("Audit export: {e}")));
     let chat_retention = retention::days("CHAT_RETENTION_DAYS", &env("CHAT_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
     let session_retention = retention::days("HARNESS_SESSION_RETENTION_DAYS", &env("HARNESS_SESSION_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
     let teammate_files_retention = retention::days("TEAMMATE_FILES_RETENTION_DAYS", &env("TEAMMATE_FILES_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
