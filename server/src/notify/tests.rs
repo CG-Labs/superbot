@@ -366,3 +366,26 @@ fn deleting_a_bot_forgets_its_settings_and_url() {
     forget_bot(&app, &bot.id);
     assert!(load(&app.db).bots.is_empty() && !secret_set(&webhook::bot_secret(&bot.id)));
 }
+
+/// An external store that's down: every read fails closed.
+struct Down;
+impl secrets::SecretStore for Down {
+    fn kind(&self) -> &'static str {
+        "vault"
+    }
+    fn get(&self, _: &str) -> Result<Option<secrets::Secret>, secrets::Error> {
+        Err(secrets::Error::Unavailable("Vault didn't answer".into()))
+    }
+    fn names(&self) -> Result<Vec<String>, secrets::Error> {
+        Err(secrets::Error::Unavailable("Vault didn't answer".into()))
+    }
+}
+
+#[test]
+fn a_signing_key_that_cant_be_read_stops_the_send_rather_than_going_unsigned() {
+    let s = secrets::Secrets::new(vec![Box::new(secrets::env::EnvStore::fixed(&[])), Box::new(Down)]);
+    let e = needed_from(&s, webhook::SIGNING).unwrap_err();
+    assert!(e.contains("NOTIFY_WEBHOOK_SECRET") && e.contains("unavailable"), "{e}");
+    let up = secrets::Secrets::new(vec![Box::new(secrets::env::EnvStore::fixed(&[]))]);
+    assert!(needed_from(&up, webhook::SIGNING).unwrap().is_none(), "an unset key is still just unset");
+}
