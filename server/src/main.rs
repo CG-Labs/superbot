@@ -158,6 +158,9 @@ mod scim_http_tests;
 mod screen;
 mod secrets;
 mod server_backups;
+mod service_accounts;
+#[cfg(test)]
+mod service_accounts_http_tests;
 #[cfg(test)]
 mod server_backups_http_tests;
 mod setup;
@@ -1057,6 +1060,11 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/roles/{id}", get(roles::get).patch(roles::update).delete(roles::delete))
         .route("/roles/{id}/users/{user}", put(roles::assign).delete(roles::unassign))
         .route("/roles/{id}/teams/{team}/users/{user}", put(roles::assign_in_team).delete(roles::unassign_in_team))
+        .route("/service-accounts", get(service_accounts::list).post(service_accounts::create))
+        .route("/service-accounts/{id}", get(service_accounts::get).patch(service_accounts::update).delete(service_accounts::delete))
+        .route("/service-accounts/{id}/tokens", get(service_accounts::list_tokens).post(service_accounts::create_token))
+        .route("/service-accounts/{id}/tokens/{token}", delete(service_accounts::revoke_token))
+        .route("/service-accounts/{id}/tokens/{token}/rotate", post(service_accounts::rotate_token))
         .route("/sessions", get(users::list_sessions))
         .route("/sessions/{id}", delete(users::revoke_session))
         .route("/signups", get(signups::list).post(signups::submit).layer(DefaultBodyLimit::max(signups::MAX_BODY)))
@@ -1295,7 +1303,8 @@ impl Auth {
             return None;
         }
         let at = db::now();
-        let found = app.db.live_session(&users::hash(token), at, self.sessions.idle_ms, self.sessions.max_ms)?;
+        // A service account never has a session (ADR 0143); one found anyway is refused.
+        let found = app.db.live_session(&users::hash(token), at, self.sessions.idle_ms, self.sessions.max_ms).filter(|(_, u)| !u.service)?;
         app.db.touch_session(&found.0.id, at);
         Some(found)
     }
@@ -1454,6 +1463,7 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     }
     let actor = match (&caller.principal, &caller.user) {
         (Principal::Bot, _) => a.bot_actor(caller.bot.as_deref()),
+        (_, Some(u)) if u.service => service_accounts::actor(u, caller.service.as_ref()),
         (_, Some(u)) => users::actor(&a, u, caller.session.as_ref(), caller.method),
         (_, None) => Actor::operator().method(caller.method),
     };
@@ -1471,10 +1481,18 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     if caller.principal == Principal::Bot && claimed.as_deref().is_some_and(|id| Some(id) != caller.bot.as_deref()) {
         return denied("bot_mismatch", "This token belongs to another Bot.".into());
     }
+    if caller.service.is_some()
+        && let Some(msg) = service_accounts::person_only(&method, &path)
+    {
+        return denied("service_account", msg.into());
+    }
     if !caller.can(need) {
         let custom = caller.user.as_ref().and_then(|u| u.role_id.as_deref()).and_then(|id| a.app.as_ref()?.db.custom_role(id));
         let msg = match (caller.principal, custom) {
             (Principal::Bot, _) => "Only a signed-in person can do this, not a Bot.".to_string(),
+            _ if caller.service.is_some() && rbac::permits(caller.principal, caller.grants, need) => {
+                return denied("token_scope", format!("This token can't do this: it needs {}, which its scopes or its owner's permissions leave out.", need.as_str()));
+            }
             (_, Some(r)) => format!("Your role ({}) can't do this.", r.name),
             (Principal::User(r), None) => format!("Your role ({}) can't do this.", r.as_str()),
         };
@@ -1529,10 +1547,10 @@ fn sso_path(path: &str) -> Option<&str> {
 /// it also has good ones elsewhere.
 fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<Response>> {
     let h = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let operator = |method: &'static str| Caller { principal: Principal::User(Role::Admin), user: a.operator(), session: None, method, bot: None, bot_for: None, bot_token: None, grants: rbac::Perms::NONE };
+    let operator = |method: &'static str| Caller { principal: Principal::User(Role::Admin), user: a.operator(), session: None, method, bot: None, bot_for: None, bot_token: None, grants: rbac::Perms::NONE, service: None };
     let from_session = |(s, u): (db::Session, db::User)| match &a.app {
         Some(app) => Caller::person(&app.db, u, Some(s), "session"),
-        None => Caller { principal: Principal::User(u.role), user: Some(u), session: Some(s), method: "session", bot: None, bot_for: None, bot_token: None, grants: rbac::Perms::NONE },
+        None => Caller { principal: Principal::User(u.role), user: Some(u), session: Some(s), method: "session", bot: None, bot_for: None, bot_token: None, grants: rbac::Perms::NONE, service: None },
     };
     let fail = |method: &str, reason: Option<&str>, clear: bool| {
         a.login_failed(source, method, reason);
@@ -1552,10 +1570,18 @@ fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<
                     Some(_) => {
                         // A Bot's call during its run (its approval hook, botctl) is part of the run's trace.
                         obs::trace::join_run(&e.run);
-                        Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token", bot: Some(e.bot), bot_for: e.for_user, bot_token: Some(e.id), grants: rbac::Perms::NONE })
+                        Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token", bot: Some(e.bot), bot_for: e.for_user, bot_token: Some(e.id), grants: rbac::Perms::NONE, service: None })
                     }
                 },
                 Err(r) => fail("bot_token", Some(r.reason()), false),
+            };
+        }
+        // A service account's API token (ADR 0143): hashed, scoped, expiring, revocable.
+        if t.starts_with(service_accounts::TOKEN_PREFIX) {
+            let Some(app) = a.app.as_ref() else { return fail(service_accounts::METHOD, Some("bad_token"), false) };
+            return match service_accounts::authenticate(app, t, source, db::now()) {
+                Ok(c) => Ok(c),
+                Err(reason) => fail(service_accounts::METHOD, Some(reason), false),
             };
         }
         return match a.session(t) {
@@ -1807,9 +1833,11 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
     let bot_owner = bot.as_deref().and_then(|id| app.db.bot_owner(id));
     let bot_for = c.bot_for.filter(|_| bot.is_some());
     let bot_token = c.bot_token.filter(|_| bot.is_some());
+    let service = c.service.map(|s| s.token);
     // The stream outlives the request that opened it, so it closes within seconds of
     // its session being revoked, expiring, or its user being disabled, and follows
-    // role changes. A Bot's closes when its run ends (ADR 0083), the Bot is deleted,
+    // role changes. A service account's closes once its token would be refused, or
+    // may no longer read (ADR 0143). A Bot's closes when its run ends (ADR 0083), the Bot is deleted,
     // changes hands, or its owner is disabled, and follows its owner's role. One bound
     // to a teammate (ADR 0048) closes once the Bot's latest run isn't theirs, never
     // taking the owner's access.
@@ -1829,6 +1857,13 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     };
                     let Some(mut data) = filter.apply(&app.db, &data) else { continue };
+                    // Approvals carry commands and inputs: a token sees them only while it may review.
+                    if let Some(t) = service.as_deref()
+                        && serde_json::from_str::<Value>(&data).is_ok_and(|v| v["type"] == "approval")
+                        && !service_accounts::recheck(&app, t, db::now()).is_some_and(|sc| sc.can(Perm::Review))
+                    {
+                        continue;
+                    }
                     // Admins (people, not their Bots) see each Bot's model and route, as in `bot_view_for`.
                     if bot.is_none() && filter.viewer == Viewer::All
                         && let Ok(mut v) = serde_json::from_str::<Value>(&data)
@@ -1841,7 +1876,7 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
                         break;
                     }
                 }
-                _ = check.tick(), if session.is_some() || bot.is_some() => {
+                _ = check.tick(), if session.is_some() || bot.is_some() || service.is_some() => {
                     let now = if let Some(id) = bot.as_deref() {
                         if !bot_token.as_deref().is_some_and(|t| app.run_tokens.is_live(t, db::now())) {
                             break;
@@ -1853,6 +1888,11 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
                                 v => v,
                             },
                             _ => break,
+                        }
+                    } else if let Some(t) = service.as_deref() {
+                        match service_accounts::recheck(&app, t, db::now()).filter(|sc| sc.can(Perm::Read)).and_then(|sc| sc.user) {
+                            Some(u) => Viewer::User { id: u.id, role: u.role },
+                            None => break,
                         }
                     } else {
                         if !session.as_deref().is_some_and(|s| app.db.session_is_live(s, db::now(), cfg.idle_ms, cfg.max_ms)) {
@@ -1909,7 +1949,7 @@ fn visible_bots(app: &App, c: &Caller, by: &Who) -> Vec<Value> {
 
 async fn state(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> Json<Value> {
     let bots = visible_bots(&app, &c, &by);
-    let approvals = if rbac::allows(c.principal, Perm::Review) { visible_approvals(&app, &c, &by, Some("pending"), None, 200) } else { vec![] };
+    let approvals = if c.can(Perm::Review) { visible_approvals(&app, &c, &by, Some("pending"), None, 200) } else { vec![] };
     // The owner keeps USER_NAME, as before users existed.
     let name = match &c.user {
         Some(u) if u.id != users::OPERATOR => u.name.clone(),
@@ -3855,7 +3895,7 @@ mod tests {
             .route("/api/bots/{id}/routines", get(list_routines).post(create_routine))
             .route("/api/routines/{id}", patch(update_routine).delete(delete_routine))
             .layer(Extension(Who { actor: Actor::operator(), source: Source::default() }))
-            .layer(Extension(Caller { principal: Principal::User(Role::Admin), user: None, session: None, method: "none", bot: None, bot_for: None, bot_token: None, grants: rbac::Perms::NONE }))
+            .layer(Extension(Caller { principal: Principal::User(Role::Admin), user: None, session: None, method: "none", bot: None, bot_for: None, bot_token: None, grants: rbac::Perms::NONE, service: None }))
             .with_state(app.clone());
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
