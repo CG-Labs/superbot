@@ -112,7 +112,7 @@ pub enum Refusal {
     Rebuilding,
     /// It is being made again from an off-host backup (ADR 0071).
     Restoring,
-    /// Its tier must have a kernel of its own (MACHINE_OWN_KERNEL_TIERS, ADR 0119), and
+    /// Its tier must have a kernel of its own (MACHINE_OWN_KERNEL_TIERS, ADR 0120), and
     /// it isn't one of this server's VMs: e.g. an Incus container from before a move to
     /// Linode. Its provider.
     NotOwnKernel(String),
