@@ -1,4 +1,4 @@
-// Docs search for the SuperBot site (ADR 0118). The index (assets/search-index.js) is
+// Docs search for the SuperBot site (ADR 0119). The index (assets/search-index.js) is
 // loaded the first time the search box gets focus, and results are built with
 // textContent only, so nothing from the index is ever parsed as HTML.
 (function () {

@@ -706,7 +706,9 @@ async fn main() {
     machines::hosts::load(&app, &control_plane).unwrap_or_else(|e| exit(format!("Incus hosts: {e}")));
     if observe.metrics.is_some() {
         app.db.metrics().want_host_use();
+        app.db.metrics().want_tiers();
     }
+    app.db.tracer().start(&observe.traces);
     machines::start(app.clone(), control_plane);
     if policy.mode == policy::Mode::Bypass {
         log_warn!(
@@ -796,6 +798,7 @@ async fn main() {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        shutdown_app.db.tracer().flush(Duration::from_secs(3)).await;
         std::process::exit(0);
     });
 
@@ -1337,6 +1340,14 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
         Ok(c) => c,
         Err(res) => return *res,
     };
+    // Per-tier metrics and traces (ADR 0118): the plan of whoever sent it, a Bot's owner's.
+    if let Some(app) = a.app.as_ref().filter(|app| obs::wants_tiers(app)) {
+        let owner = match caller.principal {
+            Principal::Bot => caller.bot.as_deref().and_then(|id| app.db.bot(id)).map(|b| b.owner_id),
+            Principal::User(_) => caller.user.as_ref().map(|u| u.id.clone()),
+        };
+        obs::note_tier(&req, owner.as_deref().map_or(obs::NO_TIER, |o| app.tier_of(o).name.as_str()));
+    }
     let actor = match (&caller.principal, &caller.user) {
         (Principal::Bot, _) => a.bot_actor(caller.bot.as_deref()),
         (_, Some(u)) => users::actor(&a, u, caller.session.as_ref(), caller.method),
@@ -1421,7 +1432,11 @@ fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<
                 Ok(e) => match app.db.bot(&e.bot) {
                     None => fail("bot_token", Some("bot_gone"), false),
                     Some(b) if b.owner_id != e.owner => fail("bot_token", Some("bot_moved"), false),
-                    Some(_) => Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token", bot: Some(e.bot), bot_for: e.for_user, bot_token: Some(e.id) }),
+                    Some(_) => {
+                        // A Bot's call during its run (its approval hook, botctl) is part of the run's trace.
+                        obs::trace::join_run(&e.run);
+                        Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token", bot: Some(e.bot), bot_for: e.for_user, bot_token: Some(e.id) })
+                    }
                 },
                 Err(r) => fail("bot_token", Some(r.reason()), false),
             };

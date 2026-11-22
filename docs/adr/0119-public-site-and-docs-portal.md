@@ -1,10 +1,10 @@
-# 0118: The public site and docs portal, built as static files
+# 0119: The public site and docs portal, built as static files
 
 ## Status
 
 Accepted (22 Nov 2026). First slice of the marketing site and docs portal of M4, [#44](https://github.com/CG-Labs/superbot/issues/44).
 
-0117 ([PR #180](https://github.com/CG-Labs/superbot/pull/180)) is the highest number on `main`, so this is 0118. Renumber it if another ADR lands first.
+0118 ([PR #181](https://github.com/CG-Labs/superbot/pull/181)) is the highest number on `main`, and 0120 is taken by a pull request in flight ([PR #183](https://github.com/CG-Labs/superbot/pull/183)), so this is 0119. Renumber it if another ADR lands first.
 
 ## Context
 
