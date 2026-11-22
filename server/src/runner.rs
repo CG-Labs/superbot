@@ -864,6 +864,15 @@ impl App {
         self.send(json!({ "type": "status", "botId": bot_id, "working": false }));
     }
 
+    /// Fail closed: no run without the secrets an external store couldn't give (ADR 0125).
+    fn refuse_for_secrets(&self, bot: &Bot, msg: &Message, by: &crate::audit::Who, e: &crate::secrets::Error) {
+        crate::obs::log::log_warn!("Bot {}: not run, because its secrets couldn't be read: {e}", bot.id);
+        self.give_back_routine(bot, msg);
+        let ev = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Failure);
+        self.db.record(&ev.details(json!({ "reason": "secrets_unavailable", "owner": bot.owner_id, "messageId": msg.id })));
+        self.say(&bot.id, "I didn't run this: the secret store can't be read right now, so I'd have no keys. Try again shortly, or ask an admin to check the server log.", true);
+    }
+
     async fn run_one(self: &Arc<Self>, mut bot: Bot, msg: &Message) {
         let cant_run = |text: &str| {
             self.give_back_routine(&bot, msg);
@@ -915,12 +924,7 @@ impl App {
         let space = match self.run_space_with(&bot, for_other.is_none()) {
             Ok(space) => space,
             Err(RunSpaceError::Folder) => return cant_run("This Bot's owner id isn't a safe folder name, so it can't run."),
-            Err(RunSpaceError::Secrets(e)) => {
-                crate::obs::log::log_warn!("Bot {}: not run, because its secrets couldn't be read: {e}", bot.id);
-                let ev = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Failure);
-                self.db.record(&ev.details(json!({ "reason": "secrets_unavailable", "owner": bot.owner_id, "messageId": msg.id })));
-                return cant_run("I didn't run this: the secret store can't be read right now, so I'd have no keys. Try again shortly, or ask an admin to check the server log.");
-            }
+            Err(RunSpaceError::Secrets(e)) => return self.refuse_for_secrets(&bot, msg, &by, &e),
         };
         self.requesters.lock().unwrap_or_else(|e| e.into_inner()).insert(bot.id.clone(), asker);
         if isolated {
@@ -996,6 +1000,21 @@ impl App {
                 Err(()) => return,
             },
             Place::There(_) => None,
+        };
+        // A run elsewhere inherits nothing of botd's, so it needs those secrets too, read
+        // now: the store may have gone down while the run waited for a slot (ADR 0125).
+        let space = match &place {
+            Place::There(_) => match crate::secrets::global().try_inherited_harness_env() {
+                Ok(inherited) => {
+                    let (cwd, mut env) = space;
+                    for (k, v) in inherited {
+                        env.entry(k).or_insert_with(|| v.expose().to_string());
+                    }
+                    (cwd, env)
+                }
+                Err(e) => return self.refuse_for_secrets(&bot, msg, &by, &e),
+            },
+            Place::Here => space,
         };
         let mut spot = self.spot(&bot, bot_dir.clone(), space, place, for_other.as_deref());
         spot.for_other = for_other.clone();
@@ -1751,9 +1770,6 @@ impl App {
                 let botctl = PathBuf::from(layout.botctl.clone().unwrap_or_default());
                 // HOME and PATH are the machine's own; it inherits nothing of botd's.
                 env.remove("PATH");
-                for (k, v) in crate::secrets::global().inherited_harness_env() {
-                    env.entry(k).or_insert_with(|| v.expose().to_string());
-                }
                 env.insert("BOT_API".into(), layout.api.clone());
                 env.insert("SUPERBOT_BOTCTL".into(), botctl.display().to_string());
                 let teammate_user = match (teammate, for_other) {

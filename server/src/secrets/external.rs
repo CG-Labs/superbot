@@ -164,6 +164,11 @@ impl ExternalStore {
                 names.sort();
                 names.dedup();
                 self.names.lock().unwrap_or_else(|e| e.into_inner()).insert(scope, (Instant::now(), names.clone()));
+                audit(
+                    Event::new(actor(), "secret.read")
+                        .target("secret_folder", scope.as_str())
+                        .details(json!({ "store": self.provider.kind(), "scope": scope.as_str(), "op": "list", "names": names.len() })),
+                );
                 Ok(names)
             }
             Err(e) => {
@@ -382,6 +387,8 @@ pub(crate) mod tests {
         let mut names = s.names().unwrap();
         names.sort();
         assert_eq!(names, ["GH_TOKEN", "LINODE_TOKEN"]);
+        let listed = PENDING.lock().unwrap().iter().filter(|e| e.target_type.as_deref() == Some("secret_folder") && e.details["store"] == "fake" && e.outcome == Outcome::Success).count();
+        assert!(listed >= 2, "each folder listed from the backend is audited");
         redact::forget("gh-1");
         redact::forget("lin-1");
     }

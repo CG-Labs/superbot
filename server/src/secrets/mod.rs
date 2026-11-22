@@ -363,6 +363,11 @@ impl Secrets {
         closed(self.harness_env_where(true))
     }
 
+    /// `inherited_harness_env`, or the error of an external store that couldn't answer.
+    pub fn try_inherited_harness_env(&self) -> Result<Vec<(String, Secret)>, Error> {
+        self.harness_env_where(true)
+    }
+
     fn harness_env_where(&self, inherited: bool) -> Result<Vec<(String, Secret)>, Error> {
         let mut seen: Vec<String> = Vec::new();
         let mut out = Vec::new();

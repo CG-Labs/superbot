@@ -165,7 +165,12 @@ impl Vault {
             let _ = tx.send(rt.block_on(f(inner)));
         });
         self.jobs.lock().unwrap_or_else(|e| e.into_inner()).send(job).map_err(|_| Error::Unavailable("Vault: the request thread stopped".into()))?;
-        rx.recv_timeout(WAIT).map_err(|_| Error::Unavailable("Vault: no answer in time".into()))?
+        let wait = || rx.recv_timeout(WAIT);
+        // On one of botd's runtime workers, hand its other tasks to another worker while
+        // this waits, so a slow Vault never stalls requests, heartbeats or timers.
+        let multi = tokio::runtime::Handle::try_current().is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+        let got = if multi { tokio::task::block_in_place(wait) } else { wait() };
+        got.map_err(|_| Error::Unavailable("Vault: no answer in time".into()))?
     }
 }
 
@@ -262,9 +267,13 @@ impl Inner {
         let (_, body) = self.get(&path).await?;
         let Some(body) = body else { return Ok(None) };
         let data = &body["data"]["data"];
-        if data.is_null() {
+        if data.is_null() && body["data"]["metadata"].is_object() {
             // A deleted version: no value until a new one is written.
             return Ok(None);
+        }
+        if !data.is_object() {
+            // Anything else isn't KV v2's answer; fail closed rather than read it as "not there".
+            return Err(Error::Unavailable(format!("Vault: {path} gave an answer that isn't a KV v2 secret")));
         }
         match data[self.cfg.field.as_str()].as_str() {
             Some(v) if !v.is_empty() => Ok(Some(Zeroizing::new(v.to_string()))),
@@ -331,6 +340,7 @@ mod tests {
         down: AtomicBool,
         namespaces: Mutex<Vec<String>>,
         lease: AtomicUsize,
+        delay_ms: AtomicUsize,
     }
 
     type F = Arc<Fake>;
@@ -352,7 +362,16 @@ mod tests {
             return e;
         }
         f.reads.fetch_add(1, Ordering::SeqCst);
-        match f.kv.lock().unwrap().get(&rest) {
+        let delay = f.delay_ms.load(Ordering::SeqCst) as u64;
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        if rest.ends_with("/MALFORMED_TOKEN") {
+            return (StatusCode::OK, Json(json!({})));
+        }
+        if rest.ends_with("/DELETED_TOKEN") {
+            return (StatusCode::OK, Json(json!({ "data": { "data": null, "metadata": { "deletion_time": "2026-11-22T00:00:00Z", "version": 2 } } })));
+        }
+        let found = f.kv.lock().unwrap().get(&rest).cloned();
+        match found {
             Some(fields) => (StatusCode::OK, Json(json!({ "data": { "data": fields, "metadata": { "version": 1 } } }))),
             None => (StatusCode::NOT_FOUND, Json(json!({ "errors": [] }))),
         }
@@ -543,6 +562,44 @@ mod tests {
             redact::forget(v);
         }
         redact::forget_for("ua", "own-token-value-1");
+    }
+
+    #[test]
+    fn answers_that_arent_kv_v2_fail_closed() {
+        let (url, f) = stand_in();
+        f.tokens.lock().unwrap().push("hvs.shape".into());
+        let s = vault(&url, &[("VAULT_TOKEN", "hvs.shape")], Duration::from_secs(60));
+        let path = crate::db::temp_path("vault-shape").join("app.sqlite");
+        let sealed = sealed::SealedStore::new(sealed::connect(&path).unwrap(), sealed::cipher());
+        let secrets = Secrets::new(vec![Box::new(EnvStore::fixed(&[])), Box::new(external::Shared(Arc::clone(&s))), Box::new(sealed)]);
+        secrets.put("MALFORMED_TOKEN", "sealed-shape-value-1").unwrap();
+        assert!(matches!(secrets.get("MALFORMED_TOKEN"), Err(Error::Unavailable(_))), "not read as missing, so the sealed copy stays shadowed");
+        assert!(s.get("DELETED_TOKEN").unwrap().is_none(), "a deleted version is no value");
+        redact::forget("sealed-shape-value-1");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_slow_vault_doesnt_stall_botds_other_tasks() {
+        let (url, f) = stand_in();
+        f.tokens.lock().unwrap().push("hvs.slow".into());
+        put(&f, "bots/SLOW_TOKEN", "slow-value-1");
+        f.delay_ms.store(600, Ordering::SeqCst);
+        let s = vault(&url, &[("VAULT_TOKEN", "hvs.slow")], Duration::ZERO);
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let t = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                t.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = ticks.load(Ordering::SeqCst);
+        // Called straight from a task on the only worker, as a Bot run does.
+        assert_eq!(s.get("SLOW_TOKEN").unwrap().unwrap().expose(), "slow-value-1");
+        assert!(ticks.load(Ordering::SeqCst) >= before + 10, "other tasks kept running while Vault was slow");
+        ticker.abort();
+        redact::forget("slow-value-1");
     }
 
     #[test]
