@@ -70,7 +70,7 @@ pub struct Settings {
     /// SIGNIN_ALERT_IP_FAILURES: failed guesses from one IP within the window.
     pub ip_failures: u32,
     /// SIGNIN_ALERT_ACCOUNT_FAILURES: failed guesses at one account, from any IP.
-    pub account_failures: u32,
+    pub person_failures: u32,
     /// SIGNIN_ALERT_WINDOW.
     pub window_ms: i64,
     /// SIGNIN_ALERT_NEW_IP.
@@ -79,7 +79,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { enabled: true, ip_failures: 10, account_failures: 5, window_ms: 15 * MINUTE, new_ip: NewIp::Admins }
+        Settings { enabled: true, ip_failures: 10, person_failures: 5, window_ms: 15 * MINUTE, new_ip: NewIp::Admins }
     }
 }
 
@@ -114,7 +114,7 @@ impl Settings {
         Ok(Settings {
             enabled,
             ip_failures: count("SIGNIN_ALERT_IP_FAILURES", d.ip_failures)?,
-            account_failures: count("SIGNIN_ALERT_ACCOUNT_FAILURES", d.account_failures)?,
+            person_failures: count("SIGNIN_ALERT_ACCOUNT_FAILURES", d.person_failures)?,
             window_ms,
             new_ip,
         })
@@ -127,7 +127,7 @@ impl Settings {
         format!(
             "on: {} failed sign-ins from one IP or {} at one account within {} minutes; sign-ins from a new network reported for {}",
             self.ip_failures,
-            self.account_failures,
+            self.person_failures,
             self.window_ms / MINUTE,
             self.new_ip.as_str()
         )
@@ -243,7 +243,7 @@ impl Watch {
         let mut st = self.lock();
         st.sweep(at, s.window_ms);
         let mut out = Vec::new();
-        for (scope, key, limit, pattern) in [("ip", ip, s.ip_failures, "ip_failures"), ("account", account, s.account_failures, "account_failures")] {
+        for (scope, key, limit, pattern) in [("ip", ip, s.ip_failures, "ip_failures"), ("account", account, s.person_failures, "account_failures")] {
             let Some(key) = key.filter(|k| !k.is_empty()) else { continue };
             let map = if scope == "ip" { &mut st.ips } else { &mut st.accounts };
             let t = track(map, key, at, s.window_ms);
@@ -274,7 +274,7 @@ impl Watch {
         let mut st = self.lock();
         st.sweep(at, s.window_ms);
         let mut found = None;
-        for (scope, key, limit) in [("account", Some(account), s.account_failures), ("ip", ip, s.ip_failures)] {
+        for (scope, key, limit) in [("account", Some(account), s.person_failures), ("ip", ip, s.ip_failures)] {
             let Some(key) = key.filter(|k| !k.is_empty()) else { continue };
             let map = if scope == "ip" { &mut st.ips } else { &mut st.accounts };
             let Some(t) = map.get_mut(key) else { continue };
@@ -399,7 +399,7 @@ fn record(app: &crate::AppState, source: &Source, d: Detection, method: &str, ac
     let mut details = json!({ "pattern": d.pattern, "scope": d.scope, "method": method });
     if d.failures > 0 {
         details["failures"] = json!(d.failures);
-        details["threshold"] = json!(if d.scope == "ip" { s.ip_failures } else { s.account_failures });
+        details["threshold"] = json!(if d.scope == "ip" { s.ip_failures } else { s.person_failures });
         details["windowSeconds"] = json!(s.window_ms / 1000);
     }
     if let Some(id) = session {
@@ -422,7 +422,7 @@ mod tests {
     use super::*;
 
     fn watch(ip: u32, account: u32) -> Watch {
-        Watch::new(Settings { ip_failures: ip, account_failures: account, ..Settings::default() })
+        Watch::new(Settings { ip_failures: ip, person_failures: account, ..Settings::default() })
     }
 
     #[test]
@@ -440,7 +440,7 @@ mod tests {
             }
             .to_string()
         };
-        assert_eq!(Settings::from_env(&set).unwrap(), Settings { enabled: true, ip_failures: 25, account_failures: 3, window_ms: 60 * MINUTE, new_ip: NewIp::All });
+        assert_eq!(Settings::from_env(&set).unwrap(), Settings { enabled: true, ip_failures: 25, person_failures: 3, window_ms: 60 * MINUTE, new_ip: NewIp::All });
         let off = |k: &str| if k == "SIGNIN_ALERTS" { "off".into() } else { String::new() };
         assert!(!Settings::from_env(&off).unwrap().enabled);
         for (k, v) in [("SIGNIN_ALERTS", "maybe"), ("SIGNIN_ALERT_IP_FAILURES", "1"), ("SIGNIN_ALERT_ACCOUNT_FAILURES", "lots"), ("SIGNIN_ALERT_WINDOW", "2d"), ("SIGNIN_ALERT_WINDOW", "1m"), ("SIGNIN_ALERT_NEW_IP", "bots")] {
@@ -562,7 +562,7 @@ mod tests {
 
     #[test]
     fn off_sees_nothing() {
-        let w = Watch::new(Settings { enabled: false, ip_failures: 2, account_failures: 2, ..Settings::default() });
+        let w = Watch::new(Settings { enabled: false, ip_failures: 2, person_failures: 2, ..Settings::default() });
         for i in 0..10 {
             assert!(w.failed(Some("203.0.113.9"), Some("u1"), i).is_empty());
         }

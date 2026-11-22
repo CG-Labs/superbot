@@ -77,7 +77,7 @@ async fn a_burst_of_wrong_codes_from_one_ip_is_audited_before_the_limiter_steps_
 
 #[tokio::test]
 async fn wrong_second_factors_at_one_account_are_counted_across_ips_then_a_sign_in_is_flagged() {
-    let (port, app, admin) = serve(Settings { account_failures: 3, ..Settings::default() }).await;
+    let (port, app, admin) = serve(Settings { person_failures: 3, ..Settings::default() }).await;
     let (ada, ada_auth) = user_with(port, &admin, "ada@example.com", "member").await;
     let (key, _) = enrol(port, &ada_auth).await;
     let (bob, _) = user_with(port, &admin, "bob@example.com", "member").await;
@@ -121,7 +121,7 @@ async fn wrong_second_factors_at_one_account_are_counted_across_ips_then_a_sign_
 
 #[tokio::test]
 async fn break_glass_password_guesses_count_against_the_owner_from_any_ip() {
-    let (port, _, basic_owner) = serve(Settings { account_failures: 4, ..Settings::default() }).await;
+    let (port, _, basic_owner) = serve(Settings { person_failures: 4, ..Settings::default() }).await;
     // Reading the audit log as the owner over HTTP Basic would be the owner signing in.
     let (_, admin) = user_with(port, &basic_owner, "root@example.com", "admin").await;
     let wrong = basic(&random_hex(16));
@@ -180,7 +180,7 @@ async fn new_networks_for_everyone_or_no_one() {
 
 #[tokio::test]
 async fn off_reports_nothing_but_still_counts_failures() {
-    let (port, app, admin) = serve(Settings { enabled: false, ip_failures: 2, account_failures: 2, ..Settings::default() }).await;
+    let (port, app, admin) = serve(Settings { enabled: false, ip_failures: 2, person_failures: 2, ..Settings::default() }).await;
     for i in 0..4 {
         assert_eq!(login(port, "203.0.113.7", json!({ "code": format!("sbc_{i:064x}") })).await.0, 401);
     }
@@ -211,7 +211,7 @@ async fn a_password_cached_from_before_break_glass_was_turned_off_is_no_attack()
     let (port, app, admin_basic, _) = serve_app_with(|a| {
         a.password = PW.clone();
         a.break_glass = false;
-        a.watch = Watch::new(Settings { ip_failures: 2, account_failures: 2, ..Settings::default() });
+        a.watch = Watch::new(Settings { ip_failures: 2, person_failures: 2, ..Settings::default() });
     })
     .await;
     for _ in 0..5 {
