@@ -36,6 +36,10 @@ services:
       # Screens' viewers listen on the compose network, where only Caddy reaches them (/screen/69xx/).
       # Each checks its own token. Screens run with ISOLATION=off (docs/computer.md).
       SCREEN_ADDR: 0.0.0.0
+      # Where the backup sidecar writes archives, which botd copies off the host when
+      # SERVER_BACKUP_S3_BUCKET is set in .env (docs/adr/0109-server-backups-off-the-host.md).
+      BACKUP_DIR: /backups
+      SUPERBOT_BACKUP_INTERVAL: ${SUPERBOT_BACKUP_INTERVAL:-86400}
     # Per-user accounts (ISOLATION=users; docs/adr/0058-harness-os-user-by-default.md): sudo, the
     # image's only setuid program, starts each run as its user's account, and the root helper
     # superbot-userctl makes the account and its folders, and removes a leaving teammate's
@@ -53,7 +57,8 @@ services:
       - home:/home/superbot
       # Each user's account folders: home (harness logins), workspace, memory, Bots' state.
       - users:/srv/superbot/users
-      # So `docker compose exec botd superbot-backup` archives outlive the container.
+      # So `docker compose exec botd superbot-backup` archives outlive the container, and
+      # botd can copy the sidecar's archives off the host.
       - backups:/backups
     # Not published: reachable only through Caddy on the compose network.
     expose: ["3000"]
