@@ -26,6 +26,6 @@ Admins see what to enter at the IdP and the metadata in use with `botctl sso sam
 ## Consequences
 
 - SAML IdPs (Okta, Entra ID, ADFS, OneLogin, PingFederate) need no broker. The bridge remains for IdPs that need what this slice lacks.
-- Not in this slice: encrypted assertions, signed AuthnRequests, single logout, IdP-initiated sign-in, ECDSA keys, and per-provider certificate pinning beyond the metadata. Each is refused with a clear reason rather than half-supported.
+- Not in this slice: encrypted assertions, signed AuthnRequests, single logout, IdP-initiated sign-in, ECDSA keys, and per-provider certificate pinning beyond the metadata. Each is refused with a clear reason rather than half-supported. Signed AuthnRequests and single logout came next, in [ADR 0137](0137-saml-signed-requests-and-single-logout.md).
 - We own a small XML-DSig verifier. It is deliberately narrow, and any change to `server/src/sso/xmldsig.rs` needs its wrapping and canonicalization tests to stay green; it should be in the next external security review's scope.
 - New dependencies: `roxmltree` (pure Rust, no unsafe, no DTD support) and `miniz_oxide` (DEFLATE for the redirect binding).
