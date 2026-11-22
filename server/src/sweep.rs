@@ -56,6 +56,10 @@ pub struct Root {
     /// Plain names under `base`, joined with `/`.
     pub path: String,
     pub depth: u32,
+    /// It holds the sessions' transcripts: only a session deleted here counts as gone in
+    /// `Swept::gone`, not one whose side files elsewhere went while its transcript stays.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transcript: bool,
 }
 
 /// A folder to delete: `path` under `base`, as for `Root`.
@@ -89,6 +93,10 @@ pub struct Swept {
     /// It stopped at `MAX_ENTRIES`, or couldn't read everything.
     #[serde(default)]
     pub partial: bool,
+    /// Of a machine's `RetentionRequest::probe`, those there: the teammate whose HOME it is
+    /// in (None: the machine's user's), and the path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub found: Vec<(Option<String>, String)>,
 }
 
 impl Swept {
@@ -107,6 +115,7 @@ impl Swept {
         self.folders += o.folders;
         self.missing += o.missing;
         self.partial |= o.partial;
+        self.found.extend(o.found);
         for g in o.gone {
             if !self.gone.contains(&g) {
                 self.gone.push(g);
@@ -150,7 +159,8 @@ pub fn run(s: &Sweep) -> Swept {
     let mut out = Swept::default();
     let mut budget = MAX_ENTRIES;
     let ids = |v: &[String]| v.iter().flat_map(|id| uuids(id)).collect::<Vec<_>>();
-    let rules = Rules {
+    let mut rules = Rules {
+        transcript: false,
         before: s.before,
         keep: ids(&s.keep),
         only: s.only.as_deref().map(ids),
@@ -162,7 +172,10 @@ pub fn run(s: &Sweep) -> Swept {
             continue;
         }
         match open(&r.base, &r.path) {
-            Ok(Some(dir)) => sweep_dir(&dir, r.depth, &rules, &mut budget, &mut out),
+            Ok(Some(dir)) => {
+                rules.transcript = r.transcript;
+                sweep_dir(&dir, r.depth, &rules, &mut budget, &mut out)
+            }
             Ok(None) => {}
             Err(e) => out.error(format!("{}: {e}", r.path)),
         }
@@ -174,6 +187,8 @@ pub fn run(s: &Sweep) -> Swept {
 }
 
 struct Rules {
+    /// The root being swept holds transcripts.
+    transcript: bool,
     before: i64,
     keep: Vec<String>,
     only: Option<Vec<String>>,
@@ -302,7 +317,7 @@ fn sweep_dir(dir: &Dir, depth: u32, rules: &Rules, budget: &mut u64, out: &mut S
         }
         if whole {
             out.sessions += 1;
-            for (uuid, id) in &rules.report {
+            for (uuid, id) in rules.report.iter().filter(|_| rules.transcript) {
                 if names.contains(uuid) && !out.gone.contains(id) {
                     out.gone.push(id.clone());
                 }
@@ -451,7 +466,7 @@ mod tests {
     }
 
     fn root(base: &Path, path: &str, depth: u32) -> Root {
-        Root { base: base.display().to_string(), path: path.into(), depth }
+        Root { base: base.display().to_string(), path: path.into(), depth, transcript: path != ".claude/debug" }
     }
 
     #[test]
@@ -486,6 +501,10 @@ mod tests {
         for kept in [format!("{B}.jsonl"), format!("{B}/tool-results/r1.txt"), format!("{C}.jsonl"), "memory/MEMORY.md".into()] {
             assert!(proj.join(&kept).exists(), "{kept}");
         }
+        // C's old debug log goes, but C isn't gone: its transcript is recent.
+        file(&home.join(format!(".claude/debug/{C}.txt")), 40);
+        let debug = run(&Sweep { before: now() - 30 * DAY, roots: vec![root(&home, ".claude/debug", 1)], report: vec![C.into()], ..Default::default() });
+        assert_eq!((debug.sessions, debug.gone.len()), (1, 0), "{debug:?}");
         // A root that isn't there is nothing.
         let none = run(&Sweep { roots: vec![root(&home, ".codex/sessions", 4)], before: now(), ..Default::default() });
         assert_eq!(none, Swept::default());

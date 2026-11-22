@@ -242,6 +242,10 @@ impl Adapter for Hermes {
         Some(super::plain_job(self.bin(), args, env, state_dir, Some(cleanup)))
     }
 
+    fn session_db(&self) -> Option<&'static str> {
+        Some("hermes/state.db")
+    }
+
     fn cleanup_failed(&self, input: &RunInput, why: &str) -> String {
         format!(
             "Couldn't stop this Bot's Hermes daemon ({why}), so its last turn may still be running. Try again; if this keeps happening, run `hermes gateway stop --yes` with HERMES_HOME={}.",
@@ -400,6 +404,17 @@ mod tests {
         let zeros = events(&[r#"{"type": "result", "session_id": "s", "exit_code": 0, "text": "Hi", "tokens": {"input": 0, "output": 0, "total": 0, "cache_read": 0, "cache_write": 0}}"#]);
         assert!(!zeros.iter().any(|e| e.starts_with("usage")), "{zeros:?}");
         assert!(!events(&[r#"{"type": "result", "session_id": "s", "exit_code": 0, "text": "Hi"}"#]).iter().any(|e| e.starts_with("usage")));
+    }
+
+    #[test]
+    fn only_a_bot_folder_with_a_hermes_database_is_pruned() {
+        let state = crate::db::temp_path("hermes-db");
+        assert!(!Hermes::default().has_session_db(&state));
+        std::fs::create_dir_all(state.join("hermes")).unwrap();
+        assert!(!Hermes::default().has_session_db(&state), "a home with no sessions yet");
+        std::fs::write(state.join("hermes/state.db"), "").unwrap();
+        assert!(Hermes::default().has_session_db(&state));
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]

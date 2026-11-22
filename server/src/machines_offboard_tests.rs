@@ -493,6 +493,7 @@ async fn the_agent_refuses_a_sweep_outside_its_homes() {
         json!({ "ownerId": w.ada, "before": 0, "state": dir("pi-sessions", 0) }),
         json!({ "ownerId": w.ada, "before": 0, "bots": ["../b"] }),
         json!({ "ownerId": w.ada, "before": 0, "archives": ["a/b"] }),
+        json!({ "ownerId": w.ada, "before": 0, "probe": ["../hermes/state.db"] }),
         json!({ "ownerId": w.ada, "before": 0, "surprise": 1 }),
     ] {
         assert!(matches!(ask(bad.clone()).await, 400 | 422), "{bad}");
@@ -501,4 +502,17 @@ async fn the_agent_refuses_a_sweep_outside_its_homes() {
         ask(json!({ "ownerId": w.ada, "before": 0, "archives": ["nothing-here"] })).await,
         200
     );
+    // It says which session databases are there, so a Bot's harness prunes only those.
+    let db = w.m.agent.cfg.home.join("bots/b1/hermes/state.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    std::fs::write(&db, "").unwrap();
+    let body = json!({ "ownerId": w.ada, "before": 0, "probe": ["b1/hermes/state.db", "b2/hermes/state.db"] });
+    let req = axum::http::Request::post("/v1/retention")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    let res = agent::router(w.m.agent.clone()).oneshot(req).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let out: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(out["found"], json!([[null, "b1/hermes/state.db"]]), "{out}");
 }

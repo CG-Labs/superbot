@@ -42,9 +42,10 @@ fn session_dirs() -> (Vec<SessionDir>, Vec<SessionDir>) {
         let Some(a) = adapters::get(name) else { continue };
         let s = a.sessions();
         for (list, dirs) in [(&mut home, s.home), (&mut state, s.state)] {
-            for (path, depth) in dirs {
-                if !list.iter().any(|d: &SessionDir| d.path == *path) {
-                    list.push(SessionDir { path: path.to_string(), depth: *depth });
+            for (path, depth, transcript) in dirs {
+                match list.iter_mut().find(|d: &&mut SessionDir| d.path == *path) {
+                    Some(d) => d.transcript |= *transcript,
+                    None => list.push(SessionDir { path: path.to_string(), depth: *depth, transcript: *transcript }),
                 }
             }
         }
@@ -59,6 +60,12 @@ fn session_dirs() -> (Vec<SessionDir>, Vec<SessionDir>) {
 pub fn keep_sessions_days(app: &App, bot: &Bot, on_machine: bool, isolated: bool) -> Option<u32> {
     let held = app.db.retention_holds().iter().any(|h| (!on_machine && !isolated) || app.db.bot_owner(&h.bot_id).as_deref() == Some(bot.owner_id.as_str()));
     if held { Some(crate::retention::MAX_DAYS) } else { app.db.retention_days(SESSIONS_KEY) }
+}
+
+/// The Bots held now. Read again before each place a pass deletes in, so a hold placed
+/// while it works on another account or machine still protects what's left.
+fn holds(app: &App) -> HashSet<String> {
+    app.db.retention_holds().into_iter().map(|h| h.bot_id).collect()
 }
 
 /// What a pass found about the Bots it sweeps for.
@@ -100,10 +107,10 @@ impl Bots {
             (s.keep, s.report) = (keep, report);
         }
         if let Some(h) = home.filter(|_| !held) {
-            s.roots.extend(home_dirs.iter().map(|d| Root { base: h.display().to_string(), path: d.path.clone(), depth: d.depth }));
+            s.roots.extend(home_dirs.iter().map(|d| Root { base: h.display().to_string(), path: d.path.clone(), depth: d.depth, transcript: d.transcript }));
         }
         for dir in self.of(owner).filter(|b| self.idle(b)).filter_map(state) {
-            s.roots.extend(state_dirs.iter().map(|d| Root { base: dir.display().to_string(), path: d.path.clone(), depth: d.depth }));
+            s.roots.extend(state_dirs.iter().map(|d| Root { base: dir.display().to_string(), path: d.path.clone(), depth: d.depth, transcript: d.transcript }));
         }
         (s, held && home.is_some())
     }
@@ -132,7 +139,7 @@ impl Tally {
 pub async fn prune_sessions(app: &Arc<App>, days: u32, at: i64) -> Value {
     let before = at - i64::from(days) * DAY_MS;
     let all = app.db.bots();
-    let held: HashSet<String> = app.db.retention_holds().into_iter().map(|h| h.bot_id).collect();
+    let held = holds(app);
     let mut guards = Vec::new();
     let mut busy = HashSet::new();
     for b in &all {
@@ -143,7 +150,7 @@ pub async fn prune_sessions(app: &Arc<App>, days: u32, at: i64) -> Value {
             }
         }
     }
-    let bots = Bots { all, held, busy };
+    let mut bots = Bots { all, held, busy };
     let mut t = Tally::default();
 
     // botd's own HOME and Bot folders, which every Bot here used without per-user accounts.
@@ -164,6 +171,7 @@ pub async fn prune_sessions(app: &Arc<App>, days: u32, at: i64) -> Value {
         }
         spaces.extend(iso.teammate_pairs().into_iter().map(|(o, t)| (o, Some(t))));
         for (owner, teammate) in spaces {
+            bots.held = holds(app);
             let space = Space::of(&owner, teammate.as_deref());
             let (Some(run_as), Some(home)) = (iso.run_as_in(space), iso.home_in(space)) else { continue };
             if !iso.ready_in(space) {
@@ -179,8 +187,11 @@ pub async fn prune_sessions(app: &Arc<App>, days: u32, at: i64) -> Value {
         }
     }
 
-    // Each user's machine, by its agent (ADR 0036).
+    // Each user's machine, by its agent (ADR 0036). It says which session databases are
+    // there, by owner, so only those are pruned.
+    let mut found: std::collections::HashMap<String, Vec<(Option<String>, String)>> = std::collections::HashMap::new();
     for m in sweepable_machines(app) {
+        bots.held = holds(app);
         let (held, keep, report) = bots.sessions(Some(&m.user_id));
         t.held_homes += u32::from(held);
         let (home, state) = session_dirs();
@@ -193,21 +204,32 @@ pub async fn prune_sessions(app: &Arc<App>, days: u32, at: i64) -> Value {
             keep,
             report,
             archives: Vec::new(),
+            probe: bots.of(Some(&m.user_id)).filter_map(|b| Some(format!("{}/{}", b.id, adapters::get(&b.harness)?.session_db()?))).collect(),
         };
         let what = format!("machine {}", m.id);
-        add(&mut t, &what, ask_machine(app, &m, &req).await);
+        match ask_machine(app, &m, &req).await {
+            Ok(mut out) => {
+                found.insert(m.user_id.clone(), std::mem::take(&mut out.found));
+                add(&mut t, &what, Ok(out));
+            }
+            Err(e) => add(&mut t, &what, Err(e)),
+        }
     }
 
     // Hermes Agent keeps its sessions in a database, which only it may change.
-    for b in bots.all.iter().filter(|b| bots.idle(b)) {
+    for b in &bots.all {
+        if !bots.idle(b) || holds(app).contains(&b.id) {
+            continue;
+        }
         if let Some(a) = adapters::get(&b.harness).filter(|a| a.prune_sessions(Path::new("/"), days, None).is_some()) {
-            match prune_db(app, a.as_ref(), b, days).await {
-                Ok(true) => t.hermes += 1,
-                Ok(false) => {}
-                Err(e) => t.error(format!("{} for Bot {}: {e}", b.harness, b.id)),
+            let (pruned, errors) = prune_db(app, a.as_ref(), b, days, found.get(&b.owner_id).map(Vec::as_slice)).await;
+            t.hermes += u32::from(pruned > 0);
+            for e in errors {
+                t.error(format!("{} for Bot {}: {e}", b.harness, b.id));
             }
         }
     }
+    bots.held = holds(app);
 
     // A Bot whose saved session went starts a new one next time.
     let mut forgotten = 0u32;
@@ -281,91 +303,139 @@ async fn ask_machine(app: &App, m: &Machine, req: &RetentionRequest) -> Result<S
     serde_json::from_value(v).map_err(|e| format!("its agent's answer didn't parse: {e}"))
 }
 
-/// Has the Bot's harness delete its own sessions unused for `days`, where the Bot runs.
-/// Whether it did.
-async fn prune_db(app: &App, a: &dyn adapters::Adapter, b: &Bot, days: u32) -> Result<bool, String> {
+/// Has the Bot's harness delete its own sessions unused for `days` in each place its runs
+/// keep them: its owner's, and each teammate's own (ADR 0048, 0064). On a machine, only
+/// those its agent `found` (None: it wasn't asked). How many places it pruned, and what
+/// failed.
+async fn prune_db(app: &App, a: &dyn adapters::Adapter, b: &Bot, days: u32, found: Option<&[(Option<String>, String)]>) -> (u32, Vec<String>) {
     use crate::machines::route::Target;
-    let path = std::env::var("PATH").ok();
+    let (mut done, mut errors) = (0u32, Vec::new());
     let target = match app.control_plane.get() {
-        Some(cp) => cp.route(&app.db, &b.owner_id).map_err(|_| "its owner's machine isn't ready".to_string())?,
+        Some(cp) => match cp.route(&app.db, &b.owner_id) {
+            Ok(t) => t,
+            Err(_) => return (0, vec!["its owner's machine isn't ready".into()]),
+        },
         None => Target::Local,
     };
-    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-    let (_stop, abort) = tokio::sync::watch::channel(None);
-    let run = async move {
-        let r: Result<bool, String> = match &target {
-            Target::Local => {
-                let iso = app.isolation();
-                let space = Space::User(&b.owner_id);
-                let state = match iso {
-                    Some(i) => i.bot_state_in(space, &b.id),
-                    None => app.bot_dir(&b.id).filter(|d| d.join("hermes").is_dir()),
-                };
-                let Some(state) = state else { return Ok(false) };
-                if !adapters::installed().contains(&a.bin()) {
-                    return Ok(false);
-                }
-                let Some(mut job) = a.prune_sessions(&state, days, path.as_deref()) else { return Ok(false) };
-                if let Some(r) = iso.and_then(|i| i.ready_in(space).then(|| i.run_as_in(space)).flatten()) {
-                    job = r.prepare(job)?;
-                } else if iso.is_some() {
-                    return Ok(false);
-                }
-                let stop = async { tokio::time::sleep(std::time::Duration::from_secs(PRUNE_SECS)).await };
-                crate::machines::job::run(&adapters::local_host(), &job, stop, &tx).await;
-                Ok(true)
+    match target {
+        Target::Local => {
+            if !adapters::installed().contains(&a.bin()) {
+                return (0, errors);
             }
-            Target::Machine(to) => {
-                let cp = app.control_plane.get().ok_or("no control plane")?;
-                let hb = cp.link.check(app, to, &[a.bin()]).await?;
-                let Some(layout) = hb.layout.filter(|_| !hb.missing.iter().any(|m| m == a.bin())) else { return Ok(false) };
-                let state = Path::new(&layout.bots).join(&b.id);
-                let Some(mut job) = a.prune_sessions(&state, days, None) else { return Ok(false) };
+            let path = std::env::var("PATH").ok();
+            let mut jobs = Vec::new();
+            match app.isolation() {
+                None => {
+                    if let Some(d) = app.bot_dir(&b.id).filter(|d| a.has_session_db(d)) {
+                        jobs.extend(a.prune_sessions(&d, days, path.as_deref()));
+                    }
+                }
+                Some(iso) => {
+                    let mut teammates: Vec<Option<String>> = vec![None];
+                    teammates.extend(iso.teammate_pairs().into_iter().filter(|(o, _)| *o == b.owner_id).map(|(_, t)| Some(t)));
+                    for t in &teammates {
+                        let space = Space::of(&b.owner_id, t.as_deref());
+                        let (Some(state), Some(run_as)) = (iso.bot_state_in(space, &b.id), iso.run_as_in(space)) else { continue };
+                        if !iso.ready_in(space) || !a.has_session_db(&state) {
+                            continue;
+                        }
+                        match a.prune_sessions(&state, days, path.as_deref()).map(|j| run_as.prepare(j)) {
+                            Some(Ok(job)) => jobs.push(job),
+                            Some(Err(e)) => errors.push(e),
+                            None => {}
+                        }
+                    }
+                }
+            }
+            for job in jobs {
+                let (tx, rx) = tokio::sync::mpsc::channel(64);
+                let run = async move {
+                    let stop = tokio::time::sleep(std::time::Duration::from_secs(PRUNE_SECS));
+                    crate::machines::job::run(&adapters::local_host(), &job, stop, &tx).await;
+                };
+                let ((), r) = tokio::join!(run, job_result(a, rx));
+                match r {
+                    Ok(()) => done += 1,
+                    Err(e) => errors.push(e),
+                }
+            }
+        }
+        Target::Machine(to) => {
+            let (Some(cp), Some(found), Some(db)) = (app.control_plane.get(), found, a.session_db()) else { return (0, errors) };
+            let rel = format!("{}/{db}", b.id);
+            let there = |u: Option<&str>| found.iter().any(|(f, p)| f.as_deref() == u && *p == rel);
+            let layout = match cp.link.check(app, &to, &[a.bin()]).await {
+                Ok(hb) => match hb.layout.filter(|_| !hb.missing.iter().any(|m| m == a.bin())) {
+                    Some(l) => l,
+                    None => return (0, errors),
+                },
+                Err(e) => return (0, vec![e]),
+            };
+            // The owner's, as the Bots' user, then each teammate's that has a user there.
+            let mut places: Vec<(Option<String>, String)> = Vec::new();
+            if there(None) {
+                places.push((None, layout.bots.clone()));
+            }
+            if cp.teammate_users() {
+                let known = app.db.machine(&to.machine_id).map(|m| crate::machines::offboard::known(&m)).unwrap_or_default();
+                for u in known.into_iter().filter(|u| there(Some(u))) {
+                    match cp.link.teammate(&to, &u).await {
+                        Ok(t) => places.push((Some(u), t.bots)),
+                        Err(e) => errors.push(format!("teammate {u}: {e}")),
+                    }
+                }
+            }
+            for (for_user, bots) in places {
+                let Some(mut job) = a.prune_sessions(&Path::new(&bots).join(&b.id), days, None) else { continue };
                 job.job_id = format!("j{}", crate::random_hex(8));
                 job.bot_id = b.id.clone();
                 job.owner_id = b.owner_id.clone();
-                let stopper = tokio::spawn({
-                    let stop = _stop.clone();
-                    async move {
+                job.for_user = for_user;
+                let (tx, rx) = tokio::sync::mpsc::channel(64);
+                let (stop, abort) = tokio::sync::watch::channel(None);
+                let to = &to;
+                let run = async move {
+                    let stopper = tokio::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_secs(PRUNE_SECS)).await;
                         let _ = stop.send(Some("timeout"));
-                    }
-                });
-                cp.link.run(to, job, abort.clone(), tx.clone()).await;
-                stopper.abort();
-                Ok(true)
-            }
-        };
-        r
-    };
-    let collect = async {
-        let mut result: Result<(), String> = Err("it didn't finish".into());
-        while let Some(ev) = rx.recv().await {
-            match ev {
-                JobEvent::Exit { success: true, .. } => result = Ok(()),
-                JobEvent::Exit { status, stderr, .. } => result = Err(format!("{} exited with {status}: {}", a.bin(), stderr.trim())),
-                JobEvent::Error { message } => result = Err(message),
-                JobEvent::Cleanup { why } => result = Err(why),
-                _ => {}
+                    });
+                    cp.link.run(to, job, abort, tx).await;
+                    stopper.abort();
+                };
+                let ((), r) = tokio::join!(run, job_result(a, rx));
+                match r {
+                    Ok(()) => done += 1,
+                    Err(e) => errors.push(e),
+                }
             }
         }
-        result
-    };
-    let (ran, result) = tokio::join!(run, collect);
-    match ran? {
-        true => result.map(|()| true),
-        false => Ok(false),
     }
+    (done, errors)
+}
+
+/// How a prune job ended, from its events.
+async fn job_result(a: &dyn adapters::Adapter, mut rx: tokio::sync::mpsc::Receiver<JobEvent>) -> Result<(), String> {
+    let mut result: Result<(), String> = Err("it didn't finish".into());
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            JobEvent::Exit { success: true, .. } => result = Ok(()),
+            JobEvent::Exit { status, stderr, .. } => result = Err(format!("{} exited with {status}: {}", a.bin(), stderr.trim())),
+            JobEvent::Error { message } => result = Err(message),
+            JobEvent::Cleanup { why } => result = Err(why),
+            _ => {}
+        }
+    }
+    result
 }
 
 /// One pass of teammates' archived work retention. Returns what it saved as the last pass.
 pub async fn prune_teammate_files(app: &Arc<App>, days: u32, at: i64) -> Value {
     let before = at - i64::from(days) * DAY_MS;
-    let held: HashSet<String> = app.db.retention_holds().into_iter().filter_map(|h| app.db.bot_owner(&h.bot_id)).collect();
+    let held_owners = || -> HashSet<String> { holds(app).iter().filter_map(|b| app.db.bot_owner(b)).collect() };
     let (mut deleted, mut missing, mut held_n, mut waiting, mut unknown, mut files, mut bytes) = (0u32, 0u32, 0u32, 0u32, 0u32, 0u64, 0u64);
     let mut errors: Vec<String> = Vec::new();
     for (table, id, owner, machine, archived_to) in app.db.archives_before(before) {
-        if held.contains(&owner) {
+        if held_owners().contains(&owner) {
             held_n += 1;
             continue;
         }
@@ -395,12 +465,20 @@ pub async fn prune_teammate_files(app: &Arc<App>, days: u32, at: i64) -> Value {
                             let s = Sweep { folders: vec![Folder { base: ws.display().to_string(), path: format!("{}/{name}", wire::TEAMMATE_ARCHIVE_DIR) }], ..Default::default() };
                             tokio::task::spawn_blocking(move || run_as.sweep(&home, &s)).await.unwrap_or_else(|e| Err(e.to_string()))
                         }
-                        // No account any more: nothing of theirs is left on this server.
-                        _ if !iso.ready_in(space) => Ok(Swept { missing: 1, ..Default::default() }),
-                        _ => Err("the owner's folders aren't known".into()),
+                        // Their folder is gone (removed or erased), and the archive with it.
+                        (_, _, Some(ws)) if ws.parent().is_some_and(|root| matches!(root.try_exists(), Ok(false))) => Ok(Swept { missing: 1, ..Default::default() }),
+                        // Not ready yet, or can't be checked: tried again next pass.
+                        _ => {
+                            waiting += 1;
+                            continue;
+                        }
                     }
                 }
-                None => Ok(Swept { missing: 1, ..Default::default() }),
+                // Per-user accounts are off now; the account and its folders may still be there.
+                None => {
+                    waiting += 1;
+                    continue;
+                }
             },
         };
         match r {
