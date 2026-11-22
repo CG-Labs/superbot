@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn tokens_are_random_and_only_their_hash_and_hint_are_kept() {
         let (hash, hint, token) = mint();
-        assert!(token.starts_with(TOKEN_PREFIX) && token.len() == TOKEN_PREFIX.len() + 64, "{token}");
+        assert!(token.starts_with(TOKEN_PREFIX) && token.len() == TOKEN_PREFIX.len() + 64, "a prefix and 64 hex characters");
         assert_eq!((hash, hint.as_str()), (users::hash(&token), &token[token.len() - 4..]));
         assert_ne!(mint().2, token);
         // Never read as a session token, whose prefix is close.

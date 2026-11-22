@@ -76,13 +76,16 @@ async fn admins_make_service_accounts_that_never_hold_admin_and_are_not_people()
     // Not a person: the people routes don't find it, so they can't make it one, or an admin.
     let (_, users) = json_call(port, "GET", "/api/users", &admin, "").await;
     assert!(!users.to_string().contains(&aud), "{users}");
-    for (method, path, body) in [
+    for (i, (method, path, body)) in [
         ("GET", format!("/api/users/{aud}"), ""),
         ("PATCH", format!("/api/users/{aud}"), r#"{"role":"admin"}"#),
         ("POST", format!("/api/users/{aud}/login-codes"), ""),
         ("PUT", format!("/api/roles/{auditor}/users/{aud}"), ""),
-    ] {
-        assert_eq!(call(port, method, &path, &admin, body).await.0, 404, "{method} {path}");
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(call(port, method, &path, &admin, body).await.0, 404, "{method}, route {i}");
     }
     assert_eq!(app.db.active_seats(), seats, "takes no seat");
 
@@ -306,14 +309,17 @@ async fn delegates_manage_only_their_own_and_never_beyond_what_they_hold() {
     let (_, list) = json_call(port, "GET", "/api/service-accounts", &ana_auth, "").await;
     let ids: Vec<&str> = list["serviceAccounts"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
     assert_eq!(ids, [mine.as_str()]);
-    for (method, path) in [
+    for (i, (method, path)) in [
         ("GET", format!("/api/service-accounts/{admins}")),
         ("PATCH", format!("/api/service-accounts/{admins}")),
         ("DELETE", format!("/api/service-accounts/{admins}")),
         ("GET", format!("/api/service-accounts/{admins}/tokens")),
         ("POST", format!("/api/service-accounts/{admins}/tokens")),
-    ] {
-        assert_eq!(call(port, method, &path, &ana_auth, "{}").await.0, 403, "{method} {path}");
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(call(port, method, &path, &ana_auth, "{}").await.0, 403, "{method}, route {i}");
     }
     let denied = events(port, &admin, "access.denied").await;
     assert_eq!(denied[0]["details"]["limit"].as_str(), Some("service_account_owner"));
