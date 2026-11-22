@@ -111,10 +111,18 @@ pub const SECTIONS: [Section; 5] = [
 pub const SUMMARY_CRITERIA: [&str; 3] = ["CC2.1", "CC4.1", "CC7.2"];
 
 /// Detail fields kept as text when they hold a code (`admin`, `sso`, `burst_ip`), never free text.
-const CODE_KEYS: [&str; 26] = [
+const CODE_KEYS: [&str; 28] = [
     "from", "to", "before", "after", "method", "firstFactor", "kind", "pattern", "mode", "encryption", "policy", "policyMode", "mfaPolicy", "state", "source", "harness", "defaultHarness",
-    "tier", "provider", "store", "digest", "isolation", "auth", "level", "channel", "target",
+    "tier", "provider", "store", "digest", "isolation", "auth", "level", "channel", "target", "scope", "keeps",
 ];
+/// Ids of who or what an event is about when it isn't the target (`role.assigned` names the user).
+const ID_KEYS: [&str; 4] = ["user", "team", "bot", "machine"];
+/// Lists of permission names.
+const CODE_LIST_KEYS: [&str; 2] = ["permissions", "applies"];
+/// Code strings kept inside nested objects, such as a policy's mode before and after.
+const NESTED_CODE_KEYS: [&str; 2] = ["mode", "action"];
+/// Nested objects whose every value is a code, such as a policy's action per risky class.
+const CODE_MAP_KEYS: [&str; 1] = ["classes"];
 /// Detail fields kept as text when they hold a version or build.
 const VERSION_KEYS: [&str; 5] = ["version", "fromVersion", "toVersion", "fromBuild", "toBuild"];
 
@@ -248,14 +256,18 @@ fn version_like(s: &str) -> bool {
 }
 
 /// An event's details with only what can't be free text: numbers, booleans, codes in
-/// [`CODE_KEYS`], versions in [`VERSION_KEYS`], a reason's code, and nested objects of
-/// numbers and booleans (counts, summaries). Notes, names, paths and messages go.
+/// [`CODE_KEYS`], ids in [`ID_KEYS`], versions in [`VERSION_KEYS`], a reason's code,
+/// permission lists, and nested objects of numbers, booleans and the few codes named
+/// above (counts, summaries, policies). Notes, names, paths and messages go.
 pub fn safe_details(v: &Value) -> Value {
-    fn nested(v: &Value) -> Option<Value> {
+    let code = |s: &str| support::reason_code(s) == s;
+    fn nested(key: &str, v: &Value, code: &dyn Fn(&str) -> bool, codes: bool) -> Option<Value> {
         match v {
             Value::Number(_) | Value::Bool(_) => Some(v.clone()),
+            Value::String(s) if (codes || NESTED_CODE_KEYS.contains(&key)) && code(s) => Some(v.clone()),
             Value::Object(o) => {
-                let kept: Map<String, Value> = o.iter().filter_map(|(k, v)| Some((k.clone(), nested(v)?))).collect();
+                let codes = CODE_MAP_KEYS.contains(&key);
+                let kept: Map<String, Value> = o.iter().filter_map(|(k, v)| Some((k.clone(), nested(k, v, code, codes)?))).collect();
                 (!kept.is_empty()).then_some(Value::Object(kept))
             }
             _ => None,
@@ -266,10 +278,12 @@ pub fn safe_details(v: &Value) -> Value {
         let keep = match v {
             Value::Number(_) | Value::Bool(_) | Value::Null => Some(v.clone()),
             Value::String(s) if k == "reason" => Some(json!(support::reason_code(s))),
-            Value::String(s) if CODE_KEYS.contains(&k.as_str()) && support::reason_code(s) == s => Some(v.clone()),
+            Value::String(s) if CODE_KEYS.contains(&k.as_str()) && code(s) => Some(v.clone()),
+            Value::String(s) if ID_KEYS.contains(&k.as_str()) => Some(json!(ident(s))),
             Value::String(s) if VERSION_KEYS.contains(&k.as_str()) && version_like(s) => Some(v.clone()),
             Value::Array(a) if !a.is_empty() && a.iter().all(|x| x.is_number() || x.is_boolean()) => Some(v.clone()),
-            Value::Object(_) => nested(v),
+            Value::Array(a) if CODE_LIST_KEYS.contains(&k.as_str()) && a.iter().all(|x| x.as_str().is_some_and(code)) => Some(v.clone()),
+            Value::Object(_) => nested(k, v, &code, false),
             _ => None,
         };
         Some((k.clone(), keep?))
@@ -356,6 +370,8 @@ struct Scan {
     last_id: Option<i64>,
     digest: String,
     truncated: bool,
+    /// Every `server.started` in the period as (time, version), past the listing cap.
+    starts: Vec<(String, Option<String>)>,
     all: BTreeMap<String, BTreeMap<String, u64>>,
     sections: Vec<Tally>,
 }
@@ -364,7 +380,7 @@ struct Scan {
 /// each matching section's tally fed.
 fn scan(app: &App, p: &Period) -> Scan {
     let mut hash = Sha256::new();
-    let mut s = Scan { total: 0, first_id: None, last_id: None, digest: String::new(), truncated: false, all: BTreeMap::new(), sections: SECTIONS.iter().map(|_| Tally::default()).collect() };
+    let mut s = Scan { total: 0, first_id: None, last_id: None, digest: String::new(), truncated: false, starts: Vec::new(), all: BTreeMap::new(), sections: SECTIONS.iter().map(|_| Tally::default()).collect() };
     let mut after = None;
     loop {
         let f = audit::Filter { from: Some(p.start_ms()), to: Some(p.end_ms()), after, ..Default::default() };
@@ -375,6 +391,9 @@ fn scan(app: &App, p: &Period) -> Scan {
             s.first_id.get_or_insert(e.id);
             s.last_id = Some(e.id);
             s.total += 1;
+            if e.action == "server.started" {
+                s.starts.push((e.time.clone(), e.details["version"].as_str().map(|v| if version_like(v) { v.to_string() } else { "[text]".into() })));
+            }
             for (sec, t) in SECTIONS.iter().zip(s.sections.iter_mut()) {
                 if sec.actions.iter().any(|a| matches(a, &e.action)) {
                     t.add(e);
@@ -444,18 +463,16 @@ fn access(app: &App, inputs: &Inputs, t: &Tally) -> Value {
     })
 }
 
-fn changes(app: &App, p: &Period, t: &Tally) -> Value {
+fn changes(app: &App, p: &Period, t: &Tally, started: &[(String, Option<String>)]) -> Value {
     let start = audit::Filter { actions: vec!["server.started".into()], to: Some(p.start_ms()), ..Default::default() };
     let before = app.db.audit_events(&start, 1, false).pop();
-    let version = |e: &Value| e["details"]["version"].as_str().map(String::from);
     let mut current = before.as_ref().and_then(|e| e.details["version"].as_str().map(String::from));
     let (mut starts, mut upgrades) = (Vec::new(), Vec::new());
-    for e in t.events.iter().filter(|e| e["action"] == "server.started") {
-        let v = version(e);
-        starts.push(json!({ "time": e["time"], "version": v }));
-        if v != current {
-            upgrades.push(json!({ "time": e["time"], "from": current, "to": v }));
-            current = v;
+    for (time, v) in started {
+        starts.push(json!({ "time": time, "version": v }));
+        if *v != current {
+            upgrades.push(json!({ "time": time, "from": current, "to": v }));
+            current = v.clone();
         }
     }
     json!({
@@ -550,7 +567,7 @@ pub fn build(app: &App, inputs: &Inputs, p: &Period, now_ms: i64, scheduled: boo
     let mut files: Vec<(&str, Vec<u8>)> = vec![
         ("README.txt", README.as_bytes().to_vec()),
         ("access-review.json", json_file(with_period(access(app, inputs, tally("access-review.json"))))),
-        ("changes.json", json_file(with_period(changes(app, p, tally("changes.json"))))),
+        ("changes.json", json_file(with_period(changes(app, p, tally("changes.json"), &s.starts)))),
         ("backups.json", json_file(with_period(backups(app, tally("backups.json"))))),
         ("retention.json", json_file(with_period(retention(app, p, tally("retention.json"))))),
         ("sign-ins-and-alerts.json", json_file(with_period(tally("sign-ins-and-alerts.json").view()))),
@@ -673,13 +690,15 @@ pub fn save(dir: &Path, b: &Bundle) -> std::io::Result<PathBuf> {
 }
 
 /// One pass of the schedule at `now_ms`: last month's bundle if `dir` has none, then
-/// bundles past their retention deleted. `failed` holds the period that last failed, so a
-/// failure is audited once, not every hour.
+/// bundles past their retention deleted. Last month's is never written once past its own
+/// retention, so a short one doesn't rewrite and delete it every hour. `failed` holds the
+/// period that last failed, so a failure is audited once, not every hour.
 pub fn tick(app: &App, s: &Settings, inputs: &Inputs, now_ms: i64, failed: &mut Option<Period>) {
     let today = date_of(now_ms);
+    let expired = |q: &Period| s.keep_days.is_some_and(|keep| q.to + chrono::Days::new(u64::from(keep)) < today);
     let p = Period::month_before(today);
     let have = bundles(&s.dir);
-    if !have.iter().any(|(_, _, q)| *q == p) {
+    if !expired(&p) && !have.iter().any(|(_, _, q)| *q == p) {
         let b = build(app, inputs, &p, now_ms, true);
         match save(&s.dir, &b) {
             Ok(path) => {
@@ -700,7 +719,7 @@ pub fn tick(app: &App, s: &Settings, inputs: &Inputs, now_ms: i64, failed: &mut 
     let Some(keep) = s.keep_days else { return };
     let mut deleted = Vec::new();
     for (name, _, q) in bundles(&s.dir) {
-        if q.to + chrono::Days::new(u64::from(keep)) < today && std::fs::remove_file(s.dir.join(&name)).is_ok() {
+        if expired(&q) && std::fs::remove_file(s.dir.join(&name)).is_ok() {
             deleted.push(name);
         }
     }
@@ -836,6 +855,24 @@ mod tests {
         assert_eq!(safe_details(&json!("text")), json!({}));
         assert_eq!(ident("u1a2b3c4"), "u1a2b3c4");
         assert_eq!(ident("Jane Smith"), "[text]");
+    }
+
+    #[test]
+    fn access_and_policy_changes_keep_who_and_what_changed() {
+        let assigned = json!({ "name": "Auditors", "user": "u1a2b3c4", "scope": "team", "team": "t9", "from": "member", "applies": ["bots.view", "audit.read"] });
+        assert_eq!(safe_details(&assigned), json!({ "user": "u1a2b3c4", "scope": "team", "team": "t9", "from": "member", "applies": ["bots.view", "audit.read"] }));
+        assert_eq!(safe_details(&json!({ "user": "Jane Smith", "applies": ["ok", "Not A Code"] })), json!({ "user": "[text]" }));
+        let policy = json!({
+            "before": { "mode": "ask", "classes": { "shell": "ask", "network": "allow" }, "timeoutMinutes": 30, "sandbox": true, "note": "jane" },
+            "after": { "mode": "bypass", "classes": { "shell": "allow", "files": "Free Text" }, "timeoutMinutes": 10, "sandbox": false },
+        });
+        assert_eq!(
+            safe_details(&policy),
+            json!({
+                "before": { "mode": "ask", "classes": { "shell": "ask", "network": "allow" }, "timeoutMinutes": 30, "sandbox": true },
+                "after": { "mode": "bypass", "classes": { "shell": "allow" }, "timeoutMinutes": 10, "sandbox": false },
+            })
+        );
     }
 
     #[test]

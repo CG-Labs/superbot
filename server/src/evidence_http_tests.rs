@@ -301,3 +301,41 @@ async fn a_bundle_that_cant_be_written_is_audited_once() {
     assert_eq!(events[0].outcome, "failure");
     assert_eq!(failed, Some(Period::month_before(today())));
 }
+
+#[test]
+fn every_deployment_is_listed_however_many_other_changes_there_are() {
+    let app = runner::test_app();
+    let actor = || Actor::system("test");
+    app.db.record(&Event::new(actor(), "server.started").details(json!({ "version": "0.1.0" })));
+    for _ in 0..5_001 {
+        app.db.record(&Event::new(actor(), "policy.updated").details(json!({ "after": { "mode": "ask" } })));
+    }
+    app.db.record(&Event::new(actor(), "server.started").details(json!({ "version": "0.2.0" })));
+    let p = Period { from: today(), to: today().succ_opt().unwrap() };
+    let inputs = Inputs { sessions: users::SessionConfig::default(), mfa: mfa::Policy::Off };
+    let (_, f) = files(&evidence::build(&app, &inputs, &p, db::now(), false).tar);
+    let c = parse(file(&f, "changes.json"));
+    assert!(c["period"]["eventsTotal"].as_u64() > c["period"]["eventsListed"].as_u64(), "past the listing cap: {}", c["period"]["eventsTotal"]);
+    let versions: Vec<&str> = c["starts"].as_array().unwrap().iter().map(|s| s["version"].as_str().unwrap()).collect();
+    assert_eq!(versions, ["0.1.0", "0.2.0"], "a start past the listing cap is still a deployment");
+    assert_eq!(c["versionChanges"].as_array().unwrap().last().unwrap()["to"], "0.2.0");
+}
+
+#[tokio::test]
+async fn a_month_already_past_retention_is_never_written() {
+    let app = runner::test_app();
+    let dir = crate::db::temp_path("evidence-short").join("evidence");
+    let s = Settings { monthly: true, dir: dir.clone(), keep_days: Some(1) };
+    let inputs = Inputs { sessions: users::SessionConfig::default(), mfa: mfa::Policy::Off };
+    let at = |d: &str| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").unwrap().and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_millis();
+    let mut failed = None;
+    evidence::tick(&app, &s, &inputs, at("2026-11-01"), &mut failed);
+    assert_eq!(evidence::bundles(&dir).len(), 1, "written on the 1st");
+    for day in ["2026-11-03", "2026-11-04", "2026-11-05"] {
+        evidence::tick(&app, &s, &inputs, at(day), &mut failed);
+        assert!(evidence::bundles(&dir).is_empty(), "pruned and not written again on {day}");
+    }
+    let f = audit::Filter { actions: vec!["evidence.*".into()], ..Default::default() };
+    let actions: Vec<String> = app.db.audit_events(&f, 10, true).into_iter().map(|e| e.action).collect();
+    assert_eq!(actions, [evidence::CREATED, evidence::PRUNED], "once each, not every hour");
+}

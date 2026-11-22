@@ -1715,14 +1715,24 @@ fn evidence_bundle(rest: &[&str]) -> Result<String, String> {
     if !(200..300).contains(&code) {
         return Err(failure(code, &String::from_utf8_lossy(&body)));
     }
-    let file = out.map(String::from).or_else(|| attachment_name(&head)).unwrap_or_else(|| "superbot-evidence.tar".into());
+    let served = attachment_name(&head);
+    let file = out.map(String::from).or_else(|| served.clone()).unwrap_or_else(|| "superbot-evidence.tar".into());
     save_private(&file, &body)?;
     let manifest = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("x-evidence-manifest-sha256:").map(|v| v.trim().to_string())).unwrap_or_default();
     Ok(format!(
-        "Saved {file} ({} KB). Its manifest's SHA-256 is {manifest}, as audited (evidence.bundle_created). Keep it in the evidence store; to check it:\n  tar -xf {file} && cd {} && sha256sum -c SHA256SUMS",
+        "Saved {file} ({} KB). Its manifest's SHA-256 is {manifest}, as audited (evidence.bundle_created). Keep it in the evidence store; to check it:\n  {}",
         body.len().div_ceil(1024),
-        file.rsplit('/').next().unwrap_or(&file).trim_end_matches(".tar")
+        evidence_check(&file, served.as_deref())
     ))
+}
+
+/// The shell line that checks a saved bundle. Its files sit in a folder named as botd
+/// served the bundle, whatever it was saved as.
+fn evidence_check(file: &str, served: Option<&str>) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let folder = served.unwrap_or_else(|| file.rsplit('/').next().unwrap_or(file));
+    let folder = folder.strip_suffix(".tar").unwrap_or(folder);
+    format!("tar -xf {} && cd {} && sha256sum -c SHA256SUMS", quote(file), quote(folder))
 }
 
 fn now_ms() -> i64 {
@@ -1767,6 +1777,13 @@ mod tests {
             assert_eq!(attachment_name(&format!("Content-Disposition: attachment; filename=\"{bad}\"")), None, "{bad}");
         }
         assert_eq!(attachment_name("HTTP/1.1 200 OK"), None);
+    }
+
+    #[test]
+    fn an_evidence_bundles_check_uses_the_served_folder_and_quotes_paths() {
+        let served = "superbot-evidence-2026-10-01_2026-11-01-20261101T000000Z.tar";
+        assert_eq!(evidence_check("evidence.tar", Some(served)), "tar -xf 'evidence.tar' && cd 'superbot-evidence-2026-10-01_2026-11-01-20261101T000000Z' && sha256sum -c SHA256SUMS");
+        assert_eq!(evidence_check("my dir/it's.tar", None), "tar -xf 'my dir/it'\\''s.tar' && cd 'it'\\''s' && sha256sum -c SHA256SUMS");
     }
 
     #[test]
