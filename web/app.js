@@ -626,7 +626,7 @@ $("add-team").addEventListener("submit", async (e) => {
 
 const rolesTab = { details: {}, people: [], teams: [], editing: null };
 
-async function loadRoles() {
+async function loadRoles({ keepForm = false } = {}) {
   try {
     roles = await api("GET", "/api/roles");
     const [details, people, allTeams] = await Promise.all([
@@ -642,7 +642,7 @@ async function loadRoles() {
     roles = NO_ROLES;
     $("roles-empty").textContent = err.message;
   }
-  renderRoles();
+  renderRoles(keepForm);
 }
 
 const tags = (list) => `<div class="tags">${list.map((p) => `<span class="tag">${esc(p)}</span>`).join("")}</div>`;
@@ -676,12 +676,13 @@ function roleCard(r) {
   </div>`;
 }
 
-function renderRoles() {
+// `keepForm` keeps unsaved edits when only the holders changed.
+function renderRoles(keepForm = false) {
   $("roles-empty").hidden = roles.roles.length > 0;
   $("roles-list").innerHTML = roles.roles.map(roleCard).join("")
     + `<datalist id="role-people">${rolesTab.people.filter((u) => !u.breakGlass && u.id !== me.user?.id).map((u) => `<option value="${esc(u.email || u.id)}">${esc(u.name)}</option>`).join("")}</datalist>`;
   $("roles-builtin").innerHTML = roles.builtIn.map((b) => `<tr><td>${esc(b.name)}</td><td>${tags(b.permissions)}</td></tr>`).join("");
-  renderRoleForm();
+  if (!keepForm) renderRoleForm();
 }
 
 function renderRoleForm() {
@@ -742,12 +743,16 @@ $("roles-list").addEventListener("click", async (e) => {
     $("role-name").focus();
     return;
   }
+  let resetsForm = false;
   b.disabled = true;
   try {
     if (b.dataset.act === "delete-role") {
       if (!confirm(`Delete ${r.name}? Nobody has it, so nobody's access changes. The audit log keeps its history.`)) return;
       await api("DELETE", `/api/roles/${key(r.id)}`);
-      if (rolesTab.editing === r.id) rolesTab.editing = null;
+      if (rolesTab.editing === r.id) {
+        rolesTab.editing = null;
+        resetsForm = true;
+      }
     }
     const li = b.closest("li");
     if (b.dataset.act === "unassign-role") {
@@ -762,7 +767,7 @@ $("roles-list").addEventListener("click", async (e) => {
     fail(err);
   } finally {
     b.disabled = false;
-    loadRoles();
+    loadRoles({ keepForm: !resetsForm });
   }
 });
 
@@ -785,7 +790,7 @@ $("roles-list").addEventListener("submit", async (e) => {
   } catch (err) {
     fail(err);
   }
-  loadRoles();
+  loadRoles({ keepForm: true });
 });
 
 // Audit log: append-only record of sign-ins and admin actions (docs/adr/0009-audit-events.md),
