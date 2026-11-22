@@ -397,6 +397,55 @@ async fn an_open_checkout_is_closed_first_and_a_paid_one_refuses() {
 }
 
 #[tokio::test]
+async fn no_bot_becomes_theirs_or_leaves_them_while_they_are_erased() {
+    let (port, app, admin, _) = serve_app().await;
+    let (ada, ada_auth) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (bea, _) = user_with(port, &admin, "bea@example.com", "member").await;
+    let beas = app.db.create_bot_owned("Bea's", "#fff", "waddle", "claude", None, false, &bea, acl::Visibility::Private).id;
+    let hers = bot_of(port, &ada_auth, "Hers").await;
+    {
+        let _erasing = crate::erasure::begin(&ada);
+        let (code, v) = json_call(port, "POST", "/api/bots", &ada_auth, r#"{"name":"Late"}"#).await;
+        assert_eq!(code, 409, "{v}");
+        for (bot, to) in [(&beas, &ada), (&hers, &bea)] {
+            let (code, v) = json_call(port, "PATCH", &format!("/api/bots/{bot}/access"), &admin, &json!({ "owner": to }).to_string()).await;
+            assert_eq!(code, 409, "{v}");
+        }
+    }
+    assert_eq!(app.db.bots().iter().filter(|b| b.owner_id == ada).map(|b| b.id.clone()).collect::<Vec<_>>(), vec![hers.clone()]);
+    assert_eq!(app.db.bot(&beas).unwrap().owner_id, bea);
+
+    // Creates racing a real erasure land before it lists her Bots, or not at all.
+    let racers: Vec<_> = (0..4)
+        .map(|i| {
+            let auth = ada_auth.clone();
+            tokio::spawn(async move {
+                let mut made = Vec::new();
+                for n in 0..500 {
+                    let (code, b) = json_call(port, "POST", "/api/bots", &auth, &json!({ "name": format!("R{i}-{n}") }).to_string()).await;
+                    match code {
+                        201 => made.push(b["id"].as_str().unwrap().to_string()),
+                        401 | 409 => return (code, made),
+                        _ => panic!("{code} {b}"),
+                    }
+                }
+                panic!("never refused")
+            })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (code, v) = erase(port, &admin, &ada, "").await;
+    assert_eq!(code, 200, "{v}");
+    let mut made = Vec::new();
+    for r in racers {
+        made.extend(r.await.unwrap().1);
+    }
+    assert!(!made.is_empty(), "some landed before the erasure");
+    assert!(made.iter().all(|b| app.db.bot(b).is_none()), "every Bot made for her went with her");
+    assert!(app.db.bots().iter().all(|b| b.owner_id != ada));
+}
+
+#[tokio::test]
 async fn an_open_team_checkout_refuses_before_the_machine_goes() {
     let fake = Arc::new(Fake::default());
     let p: Arc<dyn MachineProvider> = fake.clone();

@@ -32,6 +32,44 @@ const REASON: &str = "user_erased";
 /// One erasure at a time, so two requests for one user can't both run its steps.
 static ERASING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Whose erasure is under way. Their Bots are counted while it runs, so no Bot may
+/// become theirs, or stop being theirs, and nothing may start running for them.
+static UNDER_WAY: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn under_way_list() -> std::sync::MutexGuard<'static, Vec<String>> {
+    UNDER_WAY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Marks `user_id`'s erasure under way until dropped.
+pub(crate) struct UnderWay(String);
+
+impl Drop for UnderWay {
+    fn drop(&mut self) {
+        under_way_list().retain(|u| *u != self.0);
+    }
+}
+
+pub(crate) fn begin(user_id: &str) -> UnderWay {
+    under_way_list().push(user_id.into());
+    UnderWay(user_id.into())
+}
+
+/// Whether `user_id`'s erasure is under way.
+pub fn under_way(user_id: &str) -> bool {
+    under_way_list().iter().any(|u| u == user_id)
+}
+
+/// Runs `f`, which gives a user a Bot or takes one from them, unless one of `users` is
+/// being erased. It runs under the lock an erasure is marked with, so it lands before
+/// that erasure lists their Bots or not at all. None: one of them is.
+pub fn unless_erasing<T>(users: &[&str], f: impl FnOnce() -> T) -> Option<T> {
+    let list = under_way_list();
+    if users.iter().any(|u| list.iter().any(|x| x == u)) {
+        return None;
+    }
+    Some(f())
+}
+
 fn conflict(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::CONFLICT, msg.into())
 }
@@ -66,6 +104,7 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
         app.db.record(&by.event("user.erase_refused").target("user", &u.id).details(d).outcome(Outcome::Denied));
         Err(conflict(msg))
     };
+    let _under_way = begin(&u.id);
     // Bots deleted by an erasure that stopped part way still count, so what they wrote in
     // others' chats is erased when it is retried.
     let owned = |app: &AppState| -> Vec<crate::db::Bot> { app.db.bots().into_iter().filter(|b| b.owner_id == u.id).collect() };

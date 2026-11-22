@@ -2099,9 +2099,8 @@ async fn create_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
     };
     check_tier(&app, &owner, &harness, p.model.clone().flatten().as_deref(), p.effort.clone().flatten().as_deref(), None)?;
     let max = tier.limits.max_bots;
-    let bot = app
-        .db
-        .create_bot_capped(
+    let made = erasure::unless_erasing(&[&owner], || {
+        app.db.create_bot_capped(
             &name,
             p.color.as_deref().unwrap_or(pick(&COLORS)),
             p.shape.as_deref().unwrap_or(pick(&SHAPES)),
@@ -2112,7 +2111,12 @@ async fn create_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
             visibility,
             max,
         )
-        .ok_or_else(|| {
+    });
+    // Not audited: the event would name them after their erasure rewrote the log.
+    let Some(made) = made else {
+        return Err(ApiError(StatusCode::CONFLICT, "This account is being erased, so it can't have new Bots.".into()));
+    };
+    let bot = made.ok_or_else(|| {
             let details = json!({ "reason": "tier_bot_limit", "name": name, "owner": owner, "tier": tier.name, "limit": max });
             app.db.record(&by.event("bot.create_refused").target("user", &owner).outcome(Outcome::Denied).details(details));
             ApiError(StatusCode::FORBIDDEN, format!("The {} plan allows {} Bots, and they're all in use. Delete one first.", tier.label, max.unwrap_or(0)))
@@ -2264,7 +2268,19 @@ pub(crate) async fn give_bot(app: &AppState, by: &Who, bot: &db::Bot, to: &db::U
     // Work started for the old owner runs in their folder with their keys; it
     // ends here, and its token stops working (it names the old owner). A refused
     // transfer (another request took the last slot) leaves that work running.
-    if !app.stop_if(id, || app.db.set_bot_owner_capped(id, &to.id, max)) {
+    // Neither the old owner nor the new one may be being erased (ADR 0102).
+    let mut erasing = false;
+    let moved = app.stop_if(id, || {
+        let from = app.db.bot(id).map(|b| b.owner_id).unwrap_or_default();
+        erasure::unless_erasing(&[&from, &to.id], || app.db.set_bot_owner_capped(id, &to.id, max)).unwrap_or_else(|| {
+            erasing = true;
+            false
+        })
+    });
+    if erasing {
+        return Err(ApiError(StatusCode::CONFLICT, "Its owner or the one it would go to is being erased. Try again once that's done.".into()));
+    }
+    if !moved {
         let details = json!({ "reason": "tier_bot_limit", "from": bot.owner_id, "to": to.id, "tier": tier.name, "limit": max });
         app.db.record(&by.event("bot.transfer_refused").target("bot", id).bot(id).outcome(Outcome::Denied).details(details));
         return Err(ApiError(StatusCode::FORBIDDEN, format!("{}'s plan ({}) allows {} Bots, and they're all in use.", to.name, tier.label, max.unwrap_or(0))));
