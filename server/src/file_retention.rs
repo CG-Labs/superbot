@@ -329,7 +329,7 @@ async fn prune_db(app: &App, a: &dyn adapters::Adapter, b: &Bot, days: u32, foun
     use crate::machines::route::Target;
     let (mut done, mut errors) = (0u32, Vec::new());
     let target = match app.control_plane.get() {
-        Some(cp) => match cp.route(app, &b.owner_id) {
+        Some(cp) => match crate::machines::route::upkeep_target(&app.db, cp, &b.owner_id) {
             Ok(t) => t,
             Err(_) => return (0, vec!["its owner's machine isn't ready".into()]),
         },

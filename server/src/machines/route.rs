@@ -234,6 +234,18 @@ impl Refusal {
 /// as getting a kernel of its own (`ControlPlane::own_kernel_for`), which holds even
 /// where their machine's recorded tier wasn't moved with the plan.
 pub fn target(db: &Db, cp: &ControlPlane, user_id: &str, promised: bool) -> Result<Target, Refusal> {
+    place(db, cp, user_id, Some(promised))
+}
+
+/// `target` for upkeep that runs no Bot there, such as file retention: the same checks
+/// but the own-kernel one (ADR 0120), which is about where Bots may run, not where
+/// their old files may be cleaned up.
+pub fn upkeep_target(db: &Db, cp: &ControlPlane, user_id: &str) -> Result<Target, Refusal> {
+    place(db, cp, user_id, None)
+}
+
+/// `kernel`: None skips the own-kernel check.
+fn place(db: &Db, cp: &ControlPlane, user_id: &str, kernel: Option<bool>) -> Result<Target, Refusal> {
     if cp.routing == Routing::Off {
         return Ok(Target::Local);
     }
@@ -247,7 +259,7 @@ pub fn target(db: &Db, cp: &ControlPlane, user_id: &str, promised: bool) -> Resu
             };
         }
     };
-    if (promised || cp.own_kernel_tiers.contains(&m.tier)) && !cp.provider.as_ref().is_some_and(|p| p.name() == m.provider && p.substrate() == "vm") {
+    if kernel.is_some_and(|promised| promised || cp.own_kernel_tiers.contains(&m.tier)) && !cp.provider.as_ref().is_some_and(|p| p.name() == m.provider && p.substrate() == "vm") {
         return Err(Refusal::NotOwnKernel(m.provider.clone()));
     }
     if m.state != State::Running {
@@ -576,6 +588,7 @@ mod tests {
             "upgraded to a plan promised its own kernel: the old container's recorded tier doesn't count"
         );
         assert!(matches!(target(db, &vms(&["pro"]), &a.id, true), Ok(Target::Machine(_))), "a VM keeps the promise");
+        assert!(matches!(upkeep_target(db, &vms(&["starter"]), &b.id), Ok(Target::Machine(_))), "its old chats are still cleaned up there");
 
         let none = ControlPlane { routing: Routing::On, own_kernel_tiers: vec!["starter".into()], ..ControlPlane::default() };
         assert_eq!(target(db, &none, &a.id, false), Err(Refusal::NotOwnKernel("fake".into())), "no provider to vouch for it");
