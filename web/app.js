@@ -974,11 +974,22 @@ function renderServiceAccounts(keepForm = false) {
   $("sa-empty").hidden = list.length > 0;
   $("sa-list").innerHTML = list.map(saCard).join("")
     + `<datalist id="sa-people">${saTab.people.filter((u) => u.status === "active").map((u) => `<option value="${esc(u.email || u.id)}">${esc(u.name)}</option>`).join("")}</datalist>`;
-  if (!keepForm) renderSaForm();
+  renderSaForm(!keepForm);
 }
 
-function renderSaForm() {
+// `reset` fills the fields from the account being edited (or empties them); without it the
+// pickers are refreshed and what's typed or picked stays.
+function renderSaForm(reset = true) {
   const s = saTab.view.serviceAccounts.find((x) => x.id === saTab.editing);
+  const role = reset ? (s ? saRoleKey(s) : "readonly") : $("sa-role").value || "readonly";
+  const team = reset ? s?.team?.id || "" : $("sa-team").value;
+  const days = reset ? String(saTab.view.defaultDays) : $("sa-first-days").value || String(saTab.view.defaultDays);
+  $("sa-role").innerHTML = [["readonly", "Read-only"], ["member", "Member"], ...roles.roles.map((r) => [r.id, `${r.name} (${baseName(r.base).toLowerCase()} +)`])]
+    .map(([v, l]) => `<option value="${esc(v)}" ${v === role ? "selected" : ""}>${esc(l)}</option>`).join("");
+  $("sa-team").innerHTML = `<option value="">Across the server</option>${saTab.teams.map((t) => `<option value="${esc(t.id)}" ${t.id === team ? "selected" : ""}>${esc(t.name)}</option>`).join("")}`;
+  $("sa-first-days").innerHTML = daysOptions();
+  $("sa-first-days").value = days;
+  if (!reset) return;
   $("sa-form-title").textContent = s ? `Edit ${s.name}` : "New service account";
   $("sa-save").textContent = s ? "Save" : "Create service account";
   $("sa-cancel").hidden = !s;
@@ -987,11 +998,6 @@ function renderSaForm() {
   $("sa-name").value = s?.name || "";
   $("sa-description").value = s?.description || "";
   $("sa-owner").value = s?.owner ? s.owner.email || s.owner.id : "";
-  const current = s ? saRoleKey(s) : "readonly";
-  $("sa-role").innerHTML = [["readonly", "Read-only"], ["member", "Member"], ...roles.roles.map((r) => [r.id, `${r.name} (${baseName(r.base).toLowerCase()} +)`])]
-    .map(([v, l]) => `<option value="${esc(v)}" ${v === current ? "selected" : ""}>${esc(l)}</option>`).join("");
-  $("sa-team").innerHTML = `<option value="">Across the server</option>${saTab.teams.map((t) => `<option value="${esc(t.id)}" ${t.id === s?.team?.id ? "selected" : ""}>${esc(t.name)}</option>`).join("")}`;
-  $("sa-first-days").innerHTML = daysOptions();
 }
 
 $("sa-cancel").addEventListener("click", () => {
@@ -2099,7 +2105,7 @@ $("incidents-list").addEventListener("click", async (e) => {
 
 // Tabs, from the address bar's #fragment so a reload keeps your place.
 
-const TABS = { users: loadUsers, requests: loadRequests, machines: loadMachines, teams: loadTeams, roles: loadRoles, "service-accounts": loadServiceAccounts, audit: () => loadAudit(), status: loadStatus, settings: loadSettings, setup: loadSetup };
+const TABS = { users: loadUsers, requests: loadRequests, machines: loadMachines, teams: loadTeams, roles: loadRoles, "service-accounts": () => loadServiceAccounts({ keepForm: true }), audit: () => loadAudit(), status: loadStatus, settings: loadSettings, setup: loadSetup };
 
 // `#audit?target=approval:<id>`: a notification's link to one approval's trail (ADR 0061).
 function showTab() {

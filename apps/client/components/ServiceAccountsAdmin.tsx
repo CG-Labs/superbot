@@ -314,6 +314,7 @@ function AccountDetail({
     const m = await api.createServiceToken(sa.id, { name: tokenName.trim() || undefined, scopes: scopes.length ? scopes : undefined, expiresInDays: days });
     setTokenName("");
     setScopes([]);
+    setDays(view.defaultDays);
     onMinted(m);
     await refresh();
   });
