@@ -276,6 +276,8 @@ pub struct App {
     pub database: OnceLock<crate::database_encryption::State>,
     /// The audit log's SIEM export, when AUDIT_EXPORT is set (ADR 0122).
     pub audit_export: OnceLock<Arc<crate::audit_export::Exporter>>,
+    /// Signed checkpoints of the audit chain, and their timestamps (ADR 0149).
+    pub audit_checkpoints: OnceLock<Arc<crate::audit_checkpoint::Checkpoints>>,
     closing: AtomicBool,
 }
 
@@ -323,6 +325,7 @@ impl App {
             evidence: OnceLock::new(),
             database: OnceLock::new(),
             audit_export: OnceLock::new(),
+            audit_checkpoints: OnceLock::new(),
             closing: AtomicBool::new(false),
         })
     }
