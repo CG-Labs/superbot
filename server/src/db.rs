@@ -683,6 +683,8 @@ pub struct AuditCount {
     pub method: Option<String>,
     pub code: Option<String>,
     pub n: u64,
+    /// Failures these events say weren't logged (`unloggedSinceLast`), of any reason.
+    pub skipped: u64,
 }
 
 /// One row of the audit log. See `audit.rs` and ADR 0009.
@@ -6748,7 +6750,8 @@ impl Db {
     /// Audit events from `from` (unix ms) whose action is one of `actions` (a trailing `*`
     /// matches a prefix), counted by action, outcome, sign-in method and code: a run's
     /// `details.result`, else `details.reason`. Counts only, never who (ADR 0144). A
-    /// throttled failure counts with the ones it says weren't logged (`unloggedSinceLast`).
+    /// throttled failure's `unloggedSinceLast` is summed apart as `skipped`: the failures
+    /// it stands for were of any reason, not necessarily its own.
     pub fn audit_counts(&self, from: i64, actions: &[&str]) -> Vec<AuditCount> {
         use rusqlite::types::Value as V;
         let mut args = vec![V::Integer(from)];
@@ -6771,7 +6774,8 @@ impl Db {
         let sql = format!(
             "SELECT action, outcome, auth_method,
                CASE WHEN json_valid(details) THEN CAST(COALESCE(json_extract(details, '$.result'), json_extract(details, '$.reason')) AS TEXT) END AS code,
-               SUM(1 + CASE WHEN json_valid(details) THEN max(0, CAST(COALESCE(json_extract(details, '$.unloggedSinceLast'), 0) AS INTEGER)) ELSE 0 END)
+               COUNT(*),
+               SUM(CASE WHEN json_valid(details) THEN max(0, CAST(COALESCE(json_extract(details, '$.unloggedSinceLast'), 0) AS INTEGER)) ELSE 0 END)
              FROM audit_events WHERE at >= ? AND ({})
              GROUP BY action, outcome, auth_method, code ORDER BY action, outcome, code",
             parts.join(" OR ")
@@ -6779,7 +6783,7 @@ impl Db {
         let c = self.c();
         let mut s = c.prepare(&sql).unwrap();
         s.query_map(rusqlite::params_from_iter(args), |r| {
-            Ok(AuditCount { action: r.get(0)?, outcome: r.get(1)?, method: r.get(2)?, code: r.get(3)?, n: r.get::<_, i64>(4)?.max(0) as u64 })
+            Ok(AuditCount { action: r.get(0)?, outcome: r.get(1)?, method: r.get(2)?, code: r.get(3)?, n: r.get::<_, i64>(4)?.max(0) as u64, skipped: r.get::<_, i64>(5)?.max(0) as u64 })
         })
         .unwrap()
         .filter_map(Result::ok)

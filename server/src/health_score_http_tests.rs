@@ -130,9 +130,22 @@ fn throttled_sign_in_failures_count_with_the_ones_not_logged() {
         app.db.record(&Event::new(Actor::operator().method("sso"), "auth.login"));
     }
     let counts = app.db.audit_counts(db::now() - 60_000, &["auth.login_failed"]);
-    assert_eq!(counts.iter().map(|c| c.n).sum::<u64>(), 42, "{counts:?}");
+    assert_eq!((counts.iter().map(|c| c.n).sum::<u64>(), counts.iter().map(|c| c.skipped).sum::<u64>()), (2, 40), "{counts:?}");
     let r = crate::health_score::build(&app, db::now(), 30);
     let identity = r["signals"].as_array().unwrap().iter().find(|s| s["id"] == "identity").unwrap();
     assert_eq!((identity["facts"]["ssoFailed"].as_u64(), identity["facts"]["ssoAttempts"].as_u64()), (Some(42), Some(102)), "{identity:#}");
     assert_eq!(identity["status"], "risk", "a certificate rollover's failures aren't hidden by the throttle: {identity:#}");
+    assert_eq!(identity["facts"]["ssoReasons"], json!([{ "code": "throttled", "count": 40 }, { "code": "bad_signature", "count": 2 }]), "the skipped ones' reasons aren't known");
+}
+
+#[test]
+fn bad_tokens_not_logged_never_count_as_a_revoked_one() {
+    let app = runner::test_app();
+    let bad = |reason: &str, missed: u64| Event::new(Actor::system("scim").method("scim_token"), "scim.auth_failed").outcome(Outcome::Failure).details(json!({ "reason": reason, "unloggedSinceLast": missed }));
+    app.db.record(&bad("unknown", 0));
+    app.db.record(&bad("revoked", 10));
+    let r = crate::health_score::build(&app, db::now(), 30);
+    let identity = r["signals"].as_array().unwrap().iter().find(|s| s["id"] == "identity").unwrap();
+    assert_eq!((identity["facts"]["scimFailed"].as_u64(), identity["facts"]["scimUnauthenticated"].as_u64()), (Some(1), Some(11)), "{identity:#}");
+    assert_eq!(identity["status"], "watch", "one revoked token in use, not eleven: {identity:#}");
 }

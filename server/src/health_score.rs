@@ -37,6 +37,8 @@ pub const HEALTHY: u32 = 80;
 pub const WATCH: u32 = 50;
 /// Reason codes listed per signal, most frequent first.
 const TOP: usize = 5;
+/// The reason given to failures the audit log throttled: logged as a count, not each with its reason.
+pub const THROTTLED: &str = "throttled";
 
 /// A signal's verdict, from best to worst (`NotApplicable` when there's nothing to judge).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -201,9 +203,19 @@ impl Inputs {
             ("bot.run_refused", _) => bump(&mut self.refused, code),
             ("machine.run_limited", _) => self.run_limited += c.n,
             ("auth.login", "success") if sso => self.sso_ok += c.n,
-            ("auth.login_failed", _) if sso => bump(&mut self.sso_failed, code),
-            ("scim.auth_failed", _) if code == "revoked" => bump(&mut self.scim_failed, "revoked_token".into()),
-            ("scim.auth_failed", _) => self.scim_unauthenticated += c.n,
+            ("auth.login_failed", _) if sso => {
+                bump(&mut self.sso_failed, code);
+                if c.skipped > 0 {
+                    *self.sso_failed.entry(THROTTLED.into()).or_default() += c.skipped;
+                }
+            }
+            // Bad tokens are throttled per address whatever the reason, so the ones not
+            // logged may be guesses as well as a revoked token: they're only counted.
+            ("scim.auth_failed", _) if code == "revoked" => {
+                bump(&mut self.scim_failed, "revoked_token".into());
+                self.scim_unauthenticated += c.skipped;
+            }
+            ("scim.auth_failed", _) => self.scim_unauthenticated += c.n + c.skipped,
             ("scim.request_failed", _) => bump(&mut self.scim_failed, code),
             ("approval.requested", _) => self.approvals_requested += c.n,
             ("approval.expired", _) => self.approvals_expired += c.n,
@@ -676,7 +688,7 @@ mod tests {
     #[test]
     fn audit_counts_become_inputs() {
         let mut i = Inputs::default();
-        let c = |action: &str, outcome: &str, method: Option<&str>, code: Option<&str>, n| AuditCount { action: action.into(), outcome: outcome.into(), method: method.map(String::from), code: code.map(String::from), n };
+        let c = |action: &str, outcome: &str, method: Option<&str>, code: Option<&str>, n| AuditCount { action: action.into(), outcome: outcome.into(), method: method.map(String::from), code: code.map(String::from), n, skipped: 0 };
         for x in [
             c("bot.run_finished", "success", None, Some("done"), 7),
             c("bot.run_finished", "failure", None, Some("error"), 2),
@@ -687,6 +699,8 @@ mod tests {
             c("auth.login_failed", "failure", Some("password"), Some("bad_password"), 4),
             c("scim.auth_failed", "failure", Some("scim_token"), Some("unknown"), 6),
             c("scim.auth_failed", "failure", Some("scim_token"), Some("revoked"), 1),
+            AuditCount { skipped: 10, ..c("scim.auth_failed", "failure", Some("scim_token"), Some("revoked"), 1) },
+            AuditCount { skipped: 7, ..c("auth.login_failed", "failure", Some("sso"), Some("bad_signature"), 1) },
             c("scim.request_failed", "failure", Some("scim_token"), Some("uniqueness"), 2),
             c("scim.group_member_refused", "denied", Some("scim_token"), Some("other_team"), 2),
             c("scim.user_linked", "success", Some("scim_token"), None, 8),
@@ -698,9 +712,9 @@ mod tests {
         }
         assert_eq!(i.runs, tally(&[("done", 7), ("error", 2)]));
         assert_eq!(i.refused, tally(&[("[text]", 1)]), "free-text reasons never leave");
-        assert_eq!((i.sso_ok, i.sso_failed.clone()), (5, tally(&[("not_linked", 3)])), "password sign-ins aren't single sign-on");
-        assert_eq!(i.scim_failed, tally(&[("revoked_token", 1), ("uniqueness", 2)]), "each failed request once, not its own event too");
-        assert_eq!(i.scim_unauthenticated, 6);
+        assert_eq!((i.sso_ok, i.sso_failed.clone()), (5, tally(&[("bad_signature", 1), ("not_linked", 3), (THROTTLED, 7)])), "password sign-ins aren't single sign-on; skipped failures aren't given a reason");
+        assert_eq!(i.scim_failed, tally(&[("revoked_token", 2), ("uniqueness", 2)]), "each failed request once, not its own event too");
+        assert_eq!(i.scim_unauthenticated, 16, "bad tokens not logged may be guesses, so they're only counted");
         assert_eq!((i.approvals_requested, i.approvals_expired, i.machine_backups_failed), (11, 4, 1));
     }
 
