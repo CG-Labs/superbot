@@ -195,7 +195,7 @@ fresh_home() { # name: a home with no .env yet
 # shellcheck disable=SC2034 # read by install.sh's functions
 reset_flags() {
   BACKUP_S3_ENDPOINT="" BACKUP_S3_BUCKET="" BACKUP_S3_REGION="" BACKUP_S3_PREFIX="" BACKUP_AGE_RECIPIENTS="" BACKUP_OFF_HOST=""
-  BACKUP_ENCRYPTION="" BACKUP_AGE_GENERATE=false NEW_BACKUP_IDENTITY_FILE=""
+  BACKUP_ENCRYPTION="" BACKUP_AGE_GENERATE=false NEW_BACKUP_IDENTITY_FILE="" DATABASE_ENCRYPTION=""
 }
 configure() { SUPERBOT_USER=$(id -un) DRY_RUN=false configure_env >/dev/null; }
 
@@ -279,5 +279,54 @@ for bad in "--backup-encryption maybe" "--backup-age-generate --backup-encryptio
   if (parse_args $bad && check_backup_target) 2>/dev/null; then fail "accepted $bad"; fi
 done
 ok "plain by choice is written and said, a host without age still installs, and contradictory flags are refused"
+
+# Database encryption (ADR 0115): a new install requires it; an upgrade changes nothing unless
+# asked, and says when the database is plain; the flag is written as given.
+reset_flags
+fresh_home db-new
+BACKUP_IDENTITY_FILE="$T/db-new-identity.txt"
+configure
+grep -qxF 'SUPERBOT_DATABASE_ENCRYPTION=required' "$env_file" || fail "a new install doesn't require database encryption"
+out=$(DOMAIN=ci.example.com summary 2>&1)
+grep -qxF '  Database: encrypted when botd starts (SUPERBOT_DATABASE_ENCRYPTION=required) (botctl database)' <<<"$out" ||
+  { echo "$out" >&2; fail "the summary doesn't say the database will be encrypted"; }
+grep -q 'encrypts the database and saved secrets' <<<"$out" || fail "the summary doesn't say the master key encrypts the database"
+mkdir -p "$H/superbot/data"
+head -c 8192 /dev/urandom >"$H/superbot/data/app.sqlite"
+grep -qxF '  Database: encrypted (SQLCipher, key derived from the master key) (botctl database)' <<<"$(DOMAIN=ci.example.com summary 2>&1)" ||
+  fail "the summary doesn't see an encrypted database"
+db_has_sealed_values "$H/superbot/data/app.sqlite" || fail "an encrypted database wasn't taken to need the master key"
+ok "a new install requires database encryption, and an encrypted database needs the master key"
+
+reset_flags
+fresh_home db-old
+BACKUP_IDENTITY_FILE="$T/db-old-identity.txt"
+mkdir -p "$H/superbot/data"
+printf 'AUTH_PASSWORD=x\nDATA_DIR=%s\nSUPERBOT_BACKUP_ENCRYPTION=off\n' "$H/superbot/data" >"$env_file"
+sqlite3 "$H/superbot/data/app.sqlite" "CREATE TABLE bots (id TEXT); INSERT INTO bots VALUES ('b1');"
+configure
+if grep -q '^SUPERBOT_DATABASE_ENCRYPTION=' "$env_file"; then fail "an upgrade set database encryption without the flag"; fi
+out=$(DOMAIN=ci.example.com summary 2>&1)
+grep -qxF '  Database: plain (SUPERBOT_DATABASE_ENCRYPTION=auto) (botctl database)' <<<"$out" || { echo "$out" >&2; fail "the summary doesn't say the database is plain"; }
+grep -q "The database isn't encrypted.*--database-encryption required" <<<"$out" || fail "the summary doesn't warn about a plain database"
+parse_args --database-encryption required
+check_backup_target
+out=$(SUPERBOT_USER=$(id -un) DRY_RUN=false configure_env 2>&1)
+grep -qxF 'SUPERBOT_DATABASE_ENCRYPTION=required' "$env_file" || fail "--database-encryption required wasn't written"
+grep -q 'botd encrypts it when it starts, keeping a plain copy' <<<"$out" || fail "no word that botd encrypts the plain database"
+touch "$H/superbot/data/app.sqlite-plain-20260101-000000"
+grep -q "A plain copy of the database is still beside it: $H/superbot/data/app.sqlite-plain-20260101-000000" <<<"$(DOMAIN=ci.example.com summary 2>&1)" ||
+  fail "the summary doesn't warn about the plain copy"
+reset_flags
+parse_args --database-encryption off
+configure
+grep -qxF 'SUPERBOT_DATABASE_ENCRYPTION=off' "$env_file" || fail "--database-encryption off wasn't written"
+out=$(DOMAIN=ci.example.com summary 2>&1)
+grep -qxF '  Database: plain by choice (SUPERBOT_DATABASE_ENCRYPTION=off) (botctl database)' <<<"$out" || fail "the summary doesn't say plain is a choice"
+if grep -q "The database isn't encrypted" <<<"$out"; then fail "a plain database by choice still warns"; fi
+reset_flags
+if (parse_args --database-encryption maybe && check_backup_target) 2>/dev/null; then fail "accepted --database-encryption maybe"; fi
+grep -q -- '--database-encryption auto|required|off' <<<"$(usage)" || fail "the help has no --database-encryption"
+ok "upgrades keep the database setting unless asked, warn when it's plain, and write the flag as given"
 
 echo "all install checks passed"

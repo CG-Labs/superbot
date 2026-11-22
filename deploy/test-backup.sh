@@ -214,4 +214,60 @@ ENV_FILE="$E/.env" BACKUP_IDENTITY_FILE="$E/identity2.txt" "$INIT" --backup-encr
 [[ ! -e "$E/identity2.txt" ]] && grep -qxF "$(cat "$T/padded.env")" "$E/.env" || fail "init.sh took padded recipients as unset"
 ok "init.sh makes a private key for a new .env, keeps it on re-runs, and it restores the archives"
 
+# An encrypted database (ADR 0115): a real botd makes one; superbot-backup copies it with botd
+# and the master key, still encrypted; superbot-restore reads it with the key, restores it
+# unread without one, and refuses another key. CI passes the release build as SUPERBOT_BOTD.
+BOTD=${SUPERBOT_BOTD:-}
+for b in "$DIR/../target/release/botd" "$DIR/../target/debug/botd"; do
+  [[ -n "$BOTD" || ! -x "$b" ]] || BOTD=$b
+done
+if [[ -z "$BOTD" ]]; then
+  [[ -z "${CI:-}" ]] || fail "set SUPERBOT_BOTD to a botd build for the encrypted database checks"
+  echo "skip - encrypted database checks (no botd: build it, or set SUPERBOT_BOTD)"
+  echo "All backup script checks passed"
+  exit 0
+fi
+BOTD=$(realpath "$BOTD")
+plain_db() { [[ "$(head -c 15 "$1" | tr -d '\0')" == "SQLite format 3" ]]; }
+new_key() { (umask 077 && head -c 32 /dev/urandom | base64 >"$1"); }
+EH="$T/enc-home"
+ED="$EH/superbot/data"
+mkdir -p "$ED" "$EH/keys" "$EH/workspace"
+new_key "$EH/keys/master.key"
+new_key "$T/wrong.key"
+printf "DATA_DIR='%s'\nPORT=1\nSUPERBOT_MASTER_KEY_FILE=%s\n" "$ED" "$EH/keys/master.key" >"$EH/superbot/.env"
+env -i PATH="$PATH" HOME="$EH" HOST=127.0.0.1 PORT=18732 AUTH_PASSWORD=ci-password DATA_DIR="$ED" WORKSPACE_DIR="$EH/workspace" \
+  SCREENS=off TESTING_MODE=on SUPERBOT_DATABASE_ENCRYPTION=required SUPERBOT_MASTER_KEY_FILE="$EH/keys/master.key" \
+  "$BOTD" >"$T/botd.log" 2>&1 &
+botd_pid=$!
+for _ in $(seq 1 100); do curl -fsS -o /dev/null http://127.0.0.1:18732/healthz 2>/dev/null && break; sleep 0.1; done
+curl -fsS -u ci:ci-password -H 'Content-Type: application/json' -d '{"name":"KeepEnc"}' http://127.0.0.1:18732/api/bots >/dev/null ||
+  { cat "$T/botd.log" >&2; fail "botd didn't start on an encrypted database"; }
+kill "$botd_pid"
+wait "$botd_pid" 2>/dev/null || true
+if plain_db "$ED/app.sqlite"; then fail "botd made a plain database with SUPERBOT_DATABASE_ENCRYPTION=required"; fi
+
+SUPERBOT_BOTD=$BOTD "$BACKUP" --home "$EH" 2>/dev/null
+mapfile -t enc < <(find "$EH/superbot/backups" -name 'superbot-*.tar.gz')
+[[ ${#enc[@]} == 1 ]] || fail "no archive of the encrypted database"
+mkdir "$T/enc-unpacked"
+tar -xzf "${enc[0]}" -C "$T/enc-unpacked" ./app.sqlite 2>/dev/null || tar -xzf "${enc[0]}" -C "$T/enc-unpacked" app.sqlite
+if plain_db "$T/enc-unpacked/app.sqlite"; then fail "the archive holds the database decrypted"; fi
+refuses "backup failed" env SUPERBOT_BOTD="$BOTD" DATA_DIR="$ED" BACKUP_DIR="$T/enc-nokey" SUPERBOT_MASTER_KEY_FILE="$T/wrong.key" "$BACKUP"
+refuses "botd isn't on PATH" env SUPERBOT_BOTD="$T/no-botd" DATA_DIR="$ED" BACKUP_DIR="$T/enc-nokey" "$BACKUP"
+ok "superbot-backup copies an encrypted database with botd and the master key, still encrypted"
+
+SUPERBOT_BOTD=$BOTD "$RESTORE" --home "$EH" --check "${enc[0]}" >"$T/check" 2>&1 || { cat "$T/check" >&2; fail "--check refused the encrypted archive"; }
+grep -Eq '^bots: +[1-9]' "$T/check" && grep -q '^database: *encrypted' "$T/check" && grep -q '^needs master key: yes' "$T/check" ||
+  { cat "$T/check" >&2; fail "--check summary of an encrypted database is wrong"; }
+SUPERBOT_BOTD=$BOTD SUPERBOT_MASTER_KEY_FILE="$T/missing.key" "$RESTORE" --check "${enc[0]}" >"$T/check" 2>&1 ||
+  { cat "$T/check" >&2; fail "--check without the master key refused the archive"; }
+grep -q "wasn't checked here" "$T/check" && grep -q '^bots:  *?$' "$T/check" || { cat "$T/check" >&2; fail "--check without the key doesn't say it couldn't read it"; }
+refuses "encrypted under another master key" env SUPERBOT_BOTD="$BOTD" SUPERBOT_MASTER_KEY_FILE="$T/wrong.key" "$RESTORE" --check "${enc[0]}"
+rm "$ED/app.sqlite"
+SUPERBOT_BOTD=$BOTD "$RESTORE" --home "$EH" "${enc[0]}" 2>/dev/null
+[[ $(SUPERBOT_MASTER_KEY_FILE="$EH/keys/master.key" "$BOTD" database query "$ED/app.sqlite" "SELECT name FROM bots WHERE name = 'KeepEnc'") == KeepEnc ]] ||
+  fail "the restored database doesn't open with the master key"
+ok "superbot-restore reads an encrypted database with the key, restores it unread without one, and refuses another key"
+
 echo "All backup script checks passed"

@@ -5,14 +5,15 @@
 #   ./init.sh --domain bots.example.com --tz Europe/Jersey --user-name Alex
 #   ./init.sh --from-source                     # build the images here instead of pulling them
 # A new .env gets an age key for backups (docs/adr/0114-backups-encrypted-by-default.md), made with
-# the host's age-keygen; the private half goes to backup-identity.txt (BACKUP_IDENTITY_FILE).
+# the host's age-keygen; the private half goes to backup-identity.txt (BACKUP_IDENTITY_FILE). It also
+# gets SUPERBOT_DATABASE_ENCRYPTION=required (docs/adr/0115-database-encrypted-at-rest.md).
 set -euo pipefail
 
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ENV_FILE=${ENV_FILE:-"$DIR/.env"}
 DOMAIN="" TZ_VALUE="" USER_NAME_VALUE="" HARNESSES="" ISOLATION_VALUE="" SOURCE=""
 DOMAIN_SET=false HARNESSES_SET=false ROTATE_KEY=false
-BACKUP_GENERATE=false BACKUP_ENCRYPTION=""
+BACKUP_GENERATE=false BACKUP_ENCRYPTION="" DATABASE_ENCRYPTION=""
 BACKUP_IDENTITY_FILE=${BACKUP_IDENTITY_FILE:-"$DIR/backup-identity.txt"}
 BUILD_FILES=docker-compose.yml:docker-compose.build.yml
 
@@ -42,6 +43,10 @@ Usage: init.sh [options]
   --backup-encryption auto|required|off
                      SUPERBOT_BACKUP_ENCRYPTION: warn about plain backups (auto), refuse them
                      (required), or keep them plain by choice (off)
+  --database-encryption auto|required|off
+                     SUPERBOT_DATABASE_ENCRYPTION: encrypt new databases and warn about a plain one (auto),
+                     encrypt a plain one on the next start, keeping a plain copy (required; a new .env
+                     gets it), or keep the database plain by choice (off)
   -h, --help         Show this help
 EOF
 }
@@ -60,6 +65,7 @@ while [[ $# -gt 0 ]]; do
     --rotate-master-key) ROTATE_KEY=true; shift ;;
     --backup-age-generate) BACKUP_GENERATE=true; shift ;;
     --backup-encryption) BACKUP_ENCRYPTION=${2:?--backup-encryption needs a value}; shift 2 ;;
+    --database-encryption) DATABASE_ENCRYPTION=${2:?--database-encryption needs a value}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
@@ -71,6 +77,10 @@ fi
 case $BACKUP_ENCRYPTION in
   "" | auto | required | off) ;;
   *) die "--backup-encryption must be auto, required or off" ;;
+esac
+case $DATABASE_ENCRYPTION in
+  "" | auto | required | off) ;;
+  *) die "--database-encryption must be auto, required or off" ;;
 esac
 [[ "$BACKUP_GENERATE" != true || "$BACKUP_ENCRYPTION" != off ]] || die "--backup-age-generate makes a key that --backup-encryption off would not use"
 [[ "$BACKUP_IDENTITY_FILE" == /* ]] || die "BACKUP_IDENTITY_FILE must be an absolute path"
@@ -150,6 +160,10 @@ case "$SOURCE" in
   build) set_env COMPOSE_FILE "$BUILD_FILES" ;;
   published) set_env COMPOSE_FILE docker-compose.yml ;;
 esac
+
+# Database encryption: given, or required for a new .env. botd encrypts when it starts.
+[[ -n "$DATABASE_ENCRYPTION" || "$fresh" != true ]] || DATABASE_ENCRYPTION=required
+[[ -z "$DATABASE_ENCRYPTION" ]] || set_env SUPERBOT_DATABASE_ENCRYPTION "$DATABASE_ENCRYPTION"
 
 # Backup encryption: a new .env (or --backup-age-generate) with no recipients gets an age key,
 # unless backups are plain by choice. An .env that has recipients, or an opt-out, is kept.

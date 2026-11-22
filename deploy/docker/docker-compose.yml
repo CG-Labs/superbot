@@ -103,6 +103,10 @@ services:
       SUPERBOT_BACKUP_RETENTION_DAYS: ${SUPERBOT_BACKUP_RETENTION_DAYS:-14}
       SUPERBOT_BACKUP_AGE_RECIPIENTS: ${SUPERBOT_BACKUP_AGE_RECIPIENTS:-}
       SUPERBOT_BACKUP_ENCRYPTION: ${SUPERBOT_BACKUP_ENCRYPTION:-}
+      # An encrypted database (docs/adr/0115-database-encrypted-at-rest.md) is copied with botd and
+      # its key; the copy stays encrypted, and the key never goes into an archive.
+      SUPERBOT_MASTER_KEY: ${SUPERBOT_MASTER_KEY:?Set SUPERBOT_MASTER_KEY in deploy/docker/.env (run ./init.sh)}
+      SUPERBOT_MASTER_KEY_PREVIOUS: ${SUPERBOT_MASTER_KEY_PREVIOUS:-}
     volumes:
       - data:/data
       - backups:/backups
