@@ -4,7 +4,7 @@
 
 Accepted (22 Nov 2026). Part of [#54](https://github.com/CG-Labs/superbot/issues/54) (M5, per-user computer hardening). Builds on machines and their first boot ([ADR 0025](0025-control-plane-linode.md), [ADR 0031](0031-machine-enrollment-mtls.md), [ADR 0035](0035-machine-firewall-auto-enroll.md)), Incus containers and their isolation boundary ([ADR 0065](0065-incus-container-machines.md), [ADR 0069](0069-validating-incus-containers-on-a-real-host.md)), the Bots' and teammates' own OS users ([ADR 0043](0043-bots-own-os-user-on-machines.md), [ADR 0048](0048-teammates-own-os-user-on-machines.md)) and rebuilds ([ADR 0056](0056-rebuilding-machines-enrolled-before-0039.md)).
 
-Numbered 0126 because 0119 to 0125 are taken by other open PRs.
+Numbered 0126 because 0119 and 0121 to 0125 are reserved for other open PRs (0120 is merged).
 
 ## Context
 
