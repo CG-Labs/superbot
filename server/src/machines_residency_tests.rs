@@ -171,6 +171,46 @@ async fn without_a_store_in_the_region_a_pin_is_refused_and_pinned_backups_resto
     assert!(env.a.instance(&m.label).is_none() && env.c.instance(&m.label).is_none(), "never made in London");
 }
 
+#[tokio::test]
+async fn with_hosts_untagged_after_a_pin_no_new_machine_is_made_asked_for_or_retried() {
+    let env = serve_with(|a, b, c| Fleet::new(vec![a, b, c], DOWN_MS).with_policy(Policy::Fill)).await;
+    let (fra, _) = user_with(env.port, &env.admin, "fra@example.com", "member").await;
+    let (lon, _) = user_with(env.port, &env.admin, "lon@example.com", "member").await;
+    let made = |label: &str| [&env.a, &env.b, &env.c].iter().any(|s| s.instance(label).is_some());
+
+    // Pinned while hosts were tagged; the tags have since gone.
+    env.app.db.set_residency_pin(PinOn::User, &fra, "local", "DPA-1", None);
+    let (code, v) = json_call(&env, "POST", &format!("/api/users/{fra}/machine"), "").await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("Incus hosts aren't tagged with data regions"), "{v}");
+    let refused = events(&env, "machine.residency_refused").await;
+    assert_eq!(
+        (refused[0]["details"]["action"].as_str(), refused[0]["targetType"].as_str(), refused[0]["targetId"].as_str()),
+        (Some("create"), Some("user"), Some(fra.as_str())),
+        "{refused:?}"
+    );
+    assert!(env.app.db.user_machine(&fra).is_none());
+
+    // A machine already pending when the pin landed waits, audited once, until tagged.
+    let new = crate::db::NewMachine { user_id: &lon, provider: "incus", label_prefix: &env.cp.label_prefix, tier: "starter", plan: &env.cp.tiers[0].1, region: "local", created_by: None };
+    let m = env.app.db.add_machine(&new).unwrap_or_else(|_| panic!("added"));
+    env.app.db.set_residency_pin(PinOn::User, &lon, "local", "DPA-2", None);
+    reconcile(&env).await;
+    reconcile(&env).await;
+    let m = env.app.db.machine(&m.id).unwrap();
+    assert_eq!((m.state, m.provider_id.as_deref(), m.placed_on.as_deref()), (crate::machines::State::Pending, None, None), "{m:?}");
+    assert!(m.last_error.as_deref().unwrap_or_default().contains("aren't tagged"), "{m:?}");
+    assert!(!made(&m.label));
+    let refused = events(&env, "machine.residency_refused").await;
+    assert_eq!(refused.iter().filter(|e| e["targetId"] == m.id.as_str()).count(), 1, "{refused:?}");
+    assert_eq!(refused[0]["details"]["action"].as_str(), Some("create"));
+
+    // Unpinned, it is made.
+    env.app.db.delete_residency_pin(PinOn::User, &lon);
+    reconcile(&env).await;
+    assert!(env.app.db.machine(&m.id).unwrap().provider_id.is_some() && made(&m.label));
+}
+
 /// Linode, with MACHINE_REGIONS=gb-lon,de-fra-2.
 async fn linode() -> (u16, AppState, String) {
     let fake = Arc::new(Fake::default());

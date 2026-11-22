@@ -143,11 +143,40 @@ pub fn check_restore(app: &App, cp: &ControlPlane, m: &Machine, b: &MachineBacku
     Ok(())
 }
 
-/// A machine action a pin refused (`action`: `backup`, `restore`, `move` or `recover`):
-/// audited as `machine.residency_refused`.
+/// Whether a new machine for `user_id` may be placed in `region`: for a pinned user, only
+/// their pinned region and, with Incus hosts, only once hosts are tagged, since placement
+/// keeps to a region only then. Checked on every attempt, retries included.
+pub fn check_create(app: &App, cp: &ControlPlane, user_id: &str, region: &str) -> Result<(), (Box<ResidencyPin>, String)> {
+    let Some(p) = of_user(app, user_id) else { return Ok(()) };
+    let why = if region != p.region {
+        format!("Its data is {}, and the machine would be in {region} (ADR 0129).", pinned_to(&p))
+    } else if cp.hosts().is_some_and(|h| !h.tagged()) {
+        format!(
+            "Its data is {}, and Incus hosts aren't tagged with data regions, so nothing shows a host is in {} (INCUS_REGION, INCUS_REGION_<NAME>) (ADR 0129).",
+            pinned_to(&p),
+            p.region
+        )
+    } else {
+        return Ok(());
+    };
+    Err((Box::new(p), why))
+}
+
+fn refusal(action: &str, p: &ResidencyPin, why: &str) -> Value {
+    json!({ "reason": PINNED, "action": action, "pinnedRegion": p.region, "pinnedOn": p.subject_type, "reference": p.reference, "error": why })
+}
+
+/// A machine action a pin refused (`action`: `create`, `backup`, `restore`, `move` or
+/// `recover`): audited as `machine.residency_refused`.
 pub fn refused(app: &App, by: &Who, m: &Machine, action: &str, p: &ResidencyPin, why: &str) {
-    let d = json!({ "reason": PINNED, "action": action, "pinnedRegion": p.region, "pinnedOn": p.subject_type, "reference": p.reference, "error": why });
-    app.db.record(&event(by, "machine.residency_refused", m, d).outcome(Outcome::Denied));
+    app.db.record(&event(by, "machine.residency_refused", m, refusal(action, p, why)).outcome(Outcome::Denied));
+}
+
+/// A new machine a pin refused before there was one to name: audited on the user.
+pub fn refused_request(app: &App, by: &Who, user_id: &str, p: &ResidencyPin, why: &str) {
+    let mut d = refusal("create", p, why);
+    d["userId"] = json!(user_id);
+    app.db.record(&by.event("machine.residency_refused").target("user", user_id).outcome(Outcome::Denied).details(d));
 }
 
 /// Whether `u`'s own region may become `to`, which makes their region `after`: never

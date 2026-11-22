@@ -54,12 +54,13 @@ Every path that places or copies their data checks the pin. A refusal is a 409, 
 | Changing the user's or team's region | It would move away from the pin, or clear it | `user.region_change_refused` / `team.region_change_refused`, reason `residency_pinned` |
 | Joining a pinned team | The new member's own region or pin is elsewhere, or any of their data is outside | `team.join_refused`, reason `residency_pinned` |
 | Deleting a pinned team (admin) | Always, until unpinned | `team.delete_refused`, reason `residency_pinned` |
+| A new machine (asked for, or retried by the reconciler) | It would be outside the region, or Incus hosts aren't tagged with regions (placement keeps to a region only when they are) | `machine.residency_refused`, action `create` |
 | A backup | The machine isn't in the region, or no store is in the region. This holds even with `MACHINE_BACKUP_RESIDENCY=warn` | `machine.residency_refused`, action `backup` |
 | A restore | The backup's recorded store isn't in the region | action `restore` |
 | A restore onto a named host | As above, or the host isn't tagged with the region | action `move` |
 | Recovering a lost host | As above, for each pinned machine; it is skipped and listed with the reason | action `recover` |
 
-Placement (ADR 0117) already keeps new machines on hosts in the region; the pin adds nothing there because the region can't change while pinned.
+Placement (ADR 0117) keeps new machines on hosts in the region, but only while hosts are tagged. If the tags are removed after a pin is made, botd only warns at startup, so a new machine for a pinned person is refused on every attempt until they are back. A machine waiting this way stays pending and is audited once.
 
 Scheduled backups of a pinned machine that can't stay in the region are skipped and not audited each time. The reason shows in the backups view and in the RPO alert ([ADR 0074](0074-machine-rpo-and-rto.md)). Only backups an admin asks for are audited as refused.
 
@@ -75,7 +76,7 @@ botd still starts. Refusing to start would take every other tenant down for one 
 
 ### Where it shows
 
-- **API**: `residency` (the pin, or null) on users (`GET /api/users`, `/api/users/{key}`), on `GET /api/users/{key}/region` and `/residency`, on teams (the reference only for admins and those who manage the team's members), and on `GET /api/teams/{id}/region`. `GET /api/regions` counts pinned users and teams per region and lists every pin.
+- **API**: `residency` (the pin that holds their data, the team's first, or null) and `ownResidency` (the user's own pin, which can be unpinned on its own) on users (`GET /api/users`, `/api/users/{key}`), on `GET /api/users/{key}/region` and `/residency`, on teams (the reference only for admins and those who manage the team's members), and on `GET /api/teams/{id}/region`. `GET /api/regions` counts pinned users and teams per region and lists every pin.
 - **botctl**: `botctl user residency <user> [pin <region> <reference...> | unpin <reason...>]`, and the same for `team`.
 - **Console**: the pin and a Pin region / Unpin button on Users and Teams; pinned counts and residency warnings in the Machines regions line.
 

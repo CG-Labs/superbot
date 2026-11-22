@@ -824,6 +824,14 @@ async fn provision(
     let found = if let Some(pm) = earlier {
         Ok((pm, true))
     } else {
+        if let Err((pin, why)) = residency::check_create(app, cp, &m.user_id, &m.region) {
+            if m.last_error.as_deref() != Some(why.as_str()) {
+                residency::refused(app, by, &m, "create", &pin, &why);
+                m.last_error = Some(why);
+                app.db.save_machine(&m, m.state);
+            }
+            return m;
+        }
         // Where it goes (ADR 0081). With no room anywhere it waits, said once.
         let host = match p.hosts().map(|_| placement::choose(app, cp, &m.plan, &m.region, None)) {
             None => None,
@@ -1504,6 +1512,10 @@ pub(crate) async fn request_as(app: &AppState, cp: &ControlPlane, by: &Who, key:
     };
     // Refused up front when no host has room (ADR 0081), rather than left waiting.
     let place = |plan: &str, region: &str| -> Res<()> {
+        if let Err((pin, why)) = residency::check_create(&app, cp, &u.id, region) {
+            residency::refused_request(&app, &by, &u.id, &pin, &why);
+            return Err(conflict(why));
+        }
         match p.hosts().map(|_| placement::choose(&app, cp, plan, region, None)) {
             Some(Err(why)) => {
                 placement::failed(&app, &by, &u.id, None, plan, &why);
