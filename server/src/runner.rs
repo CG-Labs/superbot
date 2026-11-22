@@ -255,6 +255,8 @@ pub struct App {
     pub server_backups: OnceLock<Arc<crate::server_backups::ServerBackups>>,
     /// Whether the database is encrypted at rest, as found at startup (ADR 0116).
     pub database: OnceLock<crate::database_encryption::State>,
+    /// The audit log's SIEM export, when AUDIT_EXPORT is set (ADR 0122).
+    pub audit_export: OnceLock<Arc<crate::audit_export::Exporter>>,
     closing: AtomicBool,
 }
 
@@ -299,6 +301,7 @@ impl App {
             status: Default::default(),
             server_backups: OnceLock::new(),
             database: OnceLock::new(),
+            audit_export: OnceLock::new(),
             closing: AtomicBool::new(false),
         })
     }

@@ -347,11 +347,7 @@ fn rotate(c: &Connection, old: &Cipher, new: &Cipher, new_derived_keys: bool) ->
         "derivedKeysKept": !new_derived_keys,
         "recoveryCodesDropped": recovery_codes_dropped,
     });
-    tx.execute(
-        "INSERT INTO audit_events (at, actor_kind, actor_id, action, target_type, target_id, outcome, details)
-         VALUES (?, 'system', 'secrets', 'secret.master_key_rotated', 'secret', 'master-key', 'success', ?)",
-        params![crate::db::now(), details.to_string()],
-    )?;
+    crate::audit_chain::insert_system(&tx, "secrets", "secret.master_key_rotated", ("secret", "master-key"), &details)?;
     tx.commit()?;
     Ok(done)
 }

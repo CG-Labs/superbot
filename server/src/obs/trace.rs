@@ -94,26 +94,33 @@ impl Endpoint {
         Ok(Endpoint { url: url.to_string(), host, plain, headers: Vec::new() })
     }
 
-    /// `name=value` pairs split by commas, as OpenTelemetry's `OTEL_EXPORTER_OTLP_HEADERS`.
     fn with_headers(mut self, raw: &str) -> Result<Endpoint, String> {
-        for pair in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-            let (k, v) = pair.split_once('=').ok_or("TRACES_OTLP_HEADERS must be name=value pairs split by commas")?;
-            let (k, v) = (k.trim(), v.trim());
-            if k.is_empty() || !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
-                return Err("TRACES_OTLP_HEADERS: a header name is letters, digits, '-' and '_'".into());
-            }
-            if v.is_empty() || reqwest::header::HeaderValue::from_str(v).is_err() {
-                return Err(format!("TRACES_OTLP_HEADERS: the value of {k} isn't a valid header value"));
-            }
-            secrets::redact::register(v);
-            // `Bearer <token>`: the token may turn up on its own.
-            if let Some((_, token)) = v.rsplit_once(' ') {
-                secrets::redact::register(token.trim());
-            }
-            self.headers.push((k.to_string(), secrets::Secret::new(v)));
-        }
+        self.headers = headers("TRACES_OTLP_HEADERS", raw)?;
         Ok(self)
     }
+}
+
+/// `name=value` pairs split by commas, as OpenTelemetry's `OTEL_EXPORTER_OTLP_HEADERS`,
+/// from the secret `var`. Each value is registered for redaction.
+pub fn headers(var: &str, raw: &str) -> Result<Vec<(String, secrets::Secret)>, String> {
+    let mut out = Vec::new();
+    for pair in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').ok_or(format!("{var} must be name=value pairs split by commas"))?;
+        let (k, v) = (k.trim(), v.trim());
+        if k.is_empty() || !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            return Err(format!("{var}: a header name is letters, digits, '-' and '_'"));
+        }
+        if v.is_empty() || reqwest::header::HeaderValue::from_str(v).is_err() {
+            return Err(format!("{var}: the value of {k} isn't a valid header value"));
+        }
+        secrets::redact::register(v);
+        // `Bearer <token>`: the token may turn up on its own.
+        if let Some((_, token)) = v.rsplit_once(' ') {
+            secrets::redact::register(token.trim());
+        }
+        out.push((k.to_string(), secrets::Secret::new(v)));
+    }
+    Ok(out)
 }
 
 impl Settings {
