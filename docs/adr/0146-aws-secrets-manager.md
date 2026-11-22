@@ -41,14 +41,14 @@ The credential settings are AWS's own: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_K
 
 ### Credentials
 
-With `chain`, botd takes the first source that is set, in the SDKs' order: environment keys, then web identity, then the container endpoint, then the instance profile. It picks **once, at startup**, says which in the startup line and the setup report, and uses only that one. A source that later fails is an error, never a reason to try the next. Shared config and credentials files, SSO and `credential_process` are never read: they are for people, and `credential_process` runs a program. To pin a source, set `AWS_SECRETS_MANAGER_AUTH`.
+With `chain`, botd takes the first source that is set, in the SDKs' order: environment keys, then web identity, then the container endpoint, then the instance profile. It checks the sources only as far as the first that is set, so a half-set later source it won't use can't stop it. It picks **once, at startup**, says which in the startup line and the setup report, and uses only that one. A source that later fails is an error, never a reason to try the next. Shared config and credentials files, SSO and `credential_process` are never read: they are for people, and `credential_process` runs a program. To pin a source, set `AWS_SECRETS_MANAGER_AUTH`.
 
 - **Environment:** used as given, never renewed. `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` must both be set or neither. The secret key and session token are registered for redaction.
 - **Web identity:** `AssumeRoleWithWebIdentity` at STS (unsigned, as AWS designed it), with the token file read again for every sign-in, because EKS rotates it.
 - **Container:** a GET to `http://169.254.170.2<RELATIVE_URI>`, or to a `FULL_URI` that is https, or http to this computer, `169.254.170.2` or `169.254.170.23` (the SDKs' rule). The authorization token file is read again for every sign-in, because EKS Pod Identity rotates it.
 - **Instance profile:** IMDSv2 only: a session token from `PUT /latest/api/token`, then the role's keys. botd never falls back to IMDSv1, so an instance that requires IMDSv2 works and a forwarded request can't get keys.
 
-Temporary keys are kept and renewed two thirds of the way to their `Expiration`. When Secrets Manager answers `ExpiredTokenException`, `UnrecognizedClientException` or `InvalidClientTokenId`, botd gets new keys once and retries. Each sign-in is audited as `secret.backend_login` with the store (`aws`) and the method, never a credential. Requests to IMDS and the container endpoint never go through a proxy. Requests to Secrets Manager and STS follow no redirects.
+Temporary keys are kept and renewed two thirds of the way to their `Expiration`. Each new secret key and session token is registered for redaction, and the ones it replaces are forgotten, so the list doesn't grow. When Secrets Manager answers `ExpiredTokenException`, `UnrecognizedClientException` or `InvalidClientTokenId`, botd gets new keys once and retries. Each sign-in is audited as `secret.backend_login` with the store (`aws`) and the method, never a credential. Requests to IMDS and the container endpoint never go through a proxy. Requests to Secrets Manager and STS follow no redirects.
 
 ### Names
 

@@ -40,6 +40,13 @@ pub struct Keys {
     pub token: Option<Zeroizing<String>>,
 }
 
+impl Keys {
+    /// What must never show up in logs or saved text.
+    fn secrets(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.secret.as_str()).chain(self.token.as_ref().map(|t| t.as_str()))
+    }
+}
+
 /// What the container endpoint wants in `Authorization`.
 pub enum ContainerToken {
     None,
@@ -257,15 +264,21 @@ impl Config {
             Ok(Source::InstanceProfile { endpoint: metadata_setting(&var("AWS_EC2_METADATA_SERVICE_ENDPOINT"))? })
         };
         let source = match var("AWS_SECRETS_MANAGER_AUTH").trim() {
-            "" | "chain" => match (env_keys()?, web_identity()?, container()?) {
-                (Some(k), _, _) => Source::Env(k),
-                (None, Some(w), _) => w,
-                (None, None, Some(c)) => c,
-                (None, None, None) if metadata_off => {
+            // In order, and only as far as the first that has credentials: settings for a
+            // later source botd won't use can't stop it.
+            "" | "chain" => {
+                if let Some(k) = env_keys()? {
+                    Source::Env(k)
+                } else if let Some(w) = web_identity()? {
+                    w
+                } else if let Some(c) = container()? {
+                    c
+                } else if metadata_off {
                     return Err("SECRETS_BACKEND=aws found no AWS credentials: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN, or the container's credential settings, or unset AWS_EC2_METADATA_DISABLED for the instance profile".into());
+                } else {
+                    instance_profile()?
                 }
-                (None, None, None) => instance_profile()?,
-            },
+            }
             "env" => Source::Env(env_keys()?.ok_or("AWS_SECRETS_MANAGER_AUTH=env needs AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (or their _FILE)")?),
             "web-identity" => web_identity()?.ok_or("AWS_SECRETS_MANAGER_AUTH=web-identity needs AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN (EKS sets them)")?,
             "container" => container()?.ok_or("AWS_SECRETS_MANAGER_AUTH=container needs AWS_CONTAINER_CREDENTIALS_RELATIVE_URI or AWS_CONTAINER_CREDENTIALS_FULL_URI (ECS and EKS set them)")?,
@@ -388,7 +401,15 @@ impl Inner {
         let result = self.sign_in().await;
         http::audit_login("aws", self.cfg.source.method(), &result);
         let (k, at) = result?;
-        *self.keys.lock().unwrap_or_else(|e| e.into_inner()) = Some((k.clone(), at));
+        for v in k.secrets() {
+            redact::register(v);
+        }
+        let old = self.keys.lock().unwrap_or_else(|e| e.into_inner()).replace((k.clone(), at));
+        if let Some((old, _)) = &old {
+            for v in old.secrets().filter(|v| !k.secrets().any(|n| n == *v)) {
+                redact::forget(v);
+            }
+        }
         Ok(k)
     }
 
@@ -664,7 +685,7 @@ mod tests {
 
     fn issue(f: &Fake) -> (String, String, String) {
         let n = f.sign_ins.fetch_add(1, Ordering::SeqCst);
-        let (id, secret, token) = (format!("ASIAFAKE{n:08}"), format!("aws-secret-{n}-{}", crate::random_hex(6)), format!("aws-session-{n}"));
+        let (id, secret, token) = (format!("ASIAFAKE{n:08}"), format!("aws-secret-{n}-{}", crate::random_hex(6)), format!("aws-session-{n}-{}", crate::random_hex(6)));
         f.keys.lock().unwrap().insert(id.clone(), (secret.clone(), Some(token.clone())));
         (id, secret, token)
     }
@@ -943,11 +964,19 @@ mod tests {
         assert_eq!(f.sign_ins.load(Ordering::SeqCst), 1);
         assert_eq!(f.web_tokens.lock().unwrap().as_slice(), ["eyJ.web-identity.1"]);
 
+        let (first_id, (first_secret, first_token)) = f.keys.lock().unwrap().iter().next().map(|(k, v)| (k.clone(), v.clone())).unwrap();
+        let first_token = first_token.unwrap();
+        let said = format!("signed with {first_secret} and {first_token}");
+        assert_eq!(redact::text(&said), format!("signed with {} and {}", redact::MARK, redact::MARK), "STS's keys are redacted wherever they show");
+
         std::fs::write(&file, "eyJ.web-identity.2\n").unwrap();
-        let issued: Vec<String> = f.keys.lock().unwrap().keys().cloned().collect();
-        f.expired.lock().unwrap().extend(issued);
+        f.expired.lock().unwrap().insert(first_id.clone());
         assert_eq!(s.get("GITHUB_TOKEN").unwrap().unwrap().expose(), "gh-from-aws-1", "expired: signs in once more and retries");
         assert_eq!(f.sign_ins.load(Ordering::SeqCst), 2);
+        let (second_secret, second_token) = f.keys.lock().unwrap().iter().find(|(k, _)| **k != first_id).map(|(_, v)| v.clone()).unwrap();
+        assert_eq!(redact::text(&second_secret), redact::MARK, "renewed keys are redacted too");
+        assert_eq!(redact::text(&second_token.unwrap()), redact::MARK);
+        assert_eq!(redact::text(&said), said, "and the lapsed ones forgotten, so the list doesn't grow");
         assert_eq!(f.web_tokens.lock().unwrap().last().map(String::as_str), Some("eyJ.web-identity.2"), "the token file is read again");
         assert!(audited("aws").iter().any(|e| e.action == "secret.backend_login" && e.details["method"] == "web-identity" && e.outcome == Outcome::Success));
 
@@ -1049,6 +1078,14 @@ mod tests {
         let keys = [r, ("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE"), ("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")];
         let both = [&keys[..], &[("AWS_WEB_IDENTITY_TOKEN_FILE", "/var/run/token"), ("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/botd")]].concat();
         assert!(matches!(ok(&both).unwrap().source, Source::Env(_)), "the environment's keys come first, as in AWS's chain");
+        let unused = [
+            &keys[..],
+            &[("AWS_WEB_IDENTITY_TOKEN_FILE", "/t"), ("AWS_CONTAINER_CREDENTIALS_FULL_URI", "http://evil.example/creds"), ("AWS_EC2_METADATA_SERVICE_ENDPOINT", "nonsense")],
+        ]
+        .concat();
+        assert!(matches!(ok(&unused).unwrap().source, Source::Env(_)), "settings for sources after the one used are never checked");
+        let w = [r, ("AWS_WEB_IDENTITY_TOKEN_FILE", "/t"), ("AWS_ROLE_ARN", "arn:aws:iam::1:role/b"), ("AWS_CONTAINER_AUTHORIZATION_TOKEN", "t"), ("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", "/t")];
+        assert!(matches!(ok(&w).unwrap().source, Source::WebIdentity { .. }));
         let c = ok(&[r, ("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/v2/credentials/abc"), ("AWS_CONTAINER_CREDENTIALS_FULL_URI", "http://127.0.0.1/x")]).unwrap();
         assert!(matches!(&c.source, Source::Container { url, .. } if url == "http://169.254.170.2/v2/credentials/abc"));
         let c = ok(&[r, ("AWS_CONTAINER_CREDENTIALS_FULL_URI", "http://169.254.170.23/v1/credentials")]).unwrap();
