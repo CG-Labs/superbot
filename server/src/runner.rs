@@ -252,6 +252,8 @@ pub struct App {
     pub status: crate::status::Page,
     /// Copies of the server's own backups off this host (ADR 0109).
     pub server_backups: OnceLock<Arc<crate::server_backups::ServerBackups>>,
+    /// Whether the database is encrypted at rest, as found at startup (ADR 0115).
+    pub database: OnceLock<crate::database_encryption::State>,
     closing: AtomicBool,
 }
 
@@ -295,6 +297,7 @@ impl App {
             teams: OnceLock::new(),
             status: Default::default(),
             server_backups: OnceLock::new(),
+            database: OnceLock::new(),
             closing: AtomicBool::new(false),
         })
     }

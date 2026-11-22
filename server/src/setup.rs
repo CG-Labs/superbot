@@ -343,6 +343,7 @@ fn report(app: &AppState, a: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -
     };
     let (backed_up, backups_detail) = crate::server_backups::checklist(app);
     let (encrypted, encryption_detail) = crate::backup_encryption::checklist(app);
+    let (db_encrypted, db_detail) = crate::database_encryption::checklist(app);
     let checklist = vec![
         item("domain", "A public address with HTTPS", domain["ok"] == true, domain["detail"].as_str().unwrap_or_default()),
         item("signin", "Sign-in providers ready", sign_in["ok"] == true, sign_in["detail"].as_str().unwrap_or_default()),
@@ -358,6 +359,7 @@ fn report(app: &AppState, a: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -
         ),
         item("backups", "Server backups copied off this host", backed_up, backups_detail),
         item("backup_encryption", "Backups encrypted", encrypted, encryption_detail),
+        item("database_encryption", "Database encrypted", db_encrypted, db_detail),
     ];
     let done = checklist.iter().filter(|c| c["done"] == true).count();
     let mut p = json!(progress);

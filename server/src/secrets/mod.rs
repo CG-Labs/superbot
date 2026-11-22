@@ -427,12 +427,56 @@ pub struct Report {
     pub previous_unused: Option<String>,
 }
 
-/// Startup: find or make the master key, check it, seal plaintext left by older
-/// versions, and redact known secrets already saved. Runs after `Db::open`, before
-/// anything is served. An error means botd must not start.
-pub fn init(db_path: &Path) -> Result<Report, String> {
+/// The master key and the previous one (ADR 0096), found before the database is opened:
+/// an encrypted database needs them to open at all (ADR 0115).
+pub struct Keys {
+    pub current: Option<(key::MasterKey, String)>,
+    pub previous: Option<(key::MasterKey, String)>,
+    /// Made on this start, because there was none.
+    pub created: bool,
+    data_dir: std::path::PathBuf,
+}
+
+impl Keys {
+    /// Finds the configured keys; makes none.
+    pub fn locate(data_dir: &Path) -> Result<Keys, String> {
+        let current = key::locate(data_dir)?;
+        let previous = key::locate_previous(data_dir)?;
+        for (k, _) in current.iter().chain(previous.iter()) {
+            k.register_redactions();
+        }
+        Ok(Keys { current, previous, created: false, data_dir: data_dir.to_path_buf() })
+    }
+
+    #[cfg(test)]
+    pub fn with(current: Option<(key::MasterKey, String)>, previous: Option<(key::MasterKey, String)>, data_dir: &Path) -> Keys {
+        Keys { current, previous, created: false, data_dir: data_dir.to_path_buf() }
+    }
+
+    /// The master key, made now if there is none. Only for a database that can't hold a
+    /// sealed value yet: a new one, or one checked to have none.
+    pub fn current_or_create(&mut self) -> Result<&key::MasterKey, String> {
+        if self.current.is_none() {
+            let (k, source) = key::create(&self.data_dir)?;
+            k.register_redactions();
+            self.current = Some((k, source));
+            self.created = true;
+        }
+        Ok(&self.current.as_ref().expect("set above").0)
+    }
+}
+
+/// SUPERBOT_FORGET_SEALED=1: drop sealed values a lost or wrong key can't open.
+pub fn forget_sealed() -> bool {
+    std::env::var("SUPERBOT_FORGET_SEALED").is_ok_and(|v| v == "1")
+}
+
+/// Startup: check the master key (`keys`, made here if there's none and nothing is
+/// sealed), seal plaintext left by older versions, and redact known secrets already
+/// saved. Runs after `Db::open`, before anything is served. An error means botd must not start.
+pub fn init(db_path: &Path, keys: Keys) -> Result<Report, String> {
     let c = sealed::connect(db_path)?;
-    let forget = std::env::var("SUPERBOT_FORGET_SEALED").is_ok_and(|v| v == "1");
+    let forget = forget_sealed();
     // Known values are redacted from approval inputs before they're sealed, so learn them first.
     let env = EnvStore::process();
     for name in env.names().unwrap_or_default() {
@@ -440,34 +484,32 @@ pub fn init(db_path: &Path) -> Result<Report, String> {
             redact::register_if_random(v.expose());
         }
     }
-    let data_dir = db_path.parent().unwrap_or(Path::new("."));
-    let (found, mut key_source) = match key::locate(data_dir)? {
+    let data_dir = keys.data_dir.clone();
+    let made_before = keys.created;
+    let (found, mut key_source) = match keys.current {
         Some((k, source)) => (Some(k), source),
         None => (None, String::new()),
     };
-    if let Some(k) = &found {
-        k.register_redactions();
-    }
-    let (previous, previous_source) = match key::locate_previous(data_dir)? {
+    let (previous, previous_source) = match keys.previous {
         Some((k, source)) => {
-            k.register_redactions();
             let new_derived_keys = std::env::var("SUPERBOT_ROTATE_DERIVED_KEYS").is_ok_and(|v| v == "1");
             (Some(sealed::Previous { key: k, new_derived_keys }), Some(source))
         }
         None => (None, None),
     };
-    let (cipher, boot) = sealed::bootstrap(
+    let (cipher, mut boot) = sealed::bootstrap(
         &c,
         found,
         previous,
         || {
-            let (k, source) = key::create(data_dir)?;
+            let (k, source) = key::create(&data_dir)?;
             k.register_redactions();
             key_source = source;
             Ok(k)
         },
         forget,
     )?;
+    boot.created |= made_before;
     if forget && boot.discarded == 0 {
         crate::obs::log::log_warn!("SUPERBOT_FORGET_SEALED=1 is set, but the master key works, so nothing was dropped. Remove the setting.");
     }

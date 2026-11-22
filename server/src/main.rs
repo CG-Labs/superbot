@@ -38,6 +38,9 @@ mod harness_version_http_tests;
 mod isolation;
 #[cfg(test)]
 mod isolation_http_tests;
+mod database_encryption;
+#[cfg(test)]
+mod database_encryption_http_tests;
 mod db;
 mod erasure;
 mod file_retention;
@@ -246,6 +249,10 @@ fn pick<'a>(a: &[&'a str]) -> &'a str {
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "database") {
+        std::process::exit(database_encryption::cli(&args[1..]));
+    }
     let port: u16 = env("PORT", "3000").parse().expect("PORT must be a number");
     let host = env("HOST", "127.0.0.1");
     let password = auth_password();
@@ -310,8 +317,21 @@ async fn main() {
     let data_dir = root("DATA_DIR", "data");
     let workspace = root("WORKSPACE_DIR", "workspace");
     let db_path = paths::child(&data_dir, "app.sqlite").unwrap();
+    let db_policy = database_encryption::Policy::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Database encryption: {e}")));
+    let mut keys = secrets::Keys::locate(&data_dir).unwrap_or_else(|e| exit(format!("Secrets: {e}")));
+    let (db_key, db_start) =
+        database_encryption::prepare(&db_path, db_policy, &mut keys).unwrap_or_else(|e| exit(format!("Database encryption: {e}")));
+    if let Some(k) = db_key {
+        database_encryption::install(k);
+    }
+    let database = database_encryption::State::new(db_policy, db_start, &data_dir);
+    let (db_line, db_warnings) = database_encryption::startup_lines(&database, &database_encryption::plain_copies(&data_dir));
+    log_info!("Database encryption: {db_line} (ADR 0115).");
+    for w in db_warnings {
+        log_warn!("WARNING: {w}");
+    }
     let db = Db::open(&db_path).expect("open database");
-    match secrets::init(&db_path) {
+    match secrets::init(&db_path, keys) {
         Ok(r) => {
             log_info!("Master key: {}{}.", r.key_source, if r.created { " (new)" } else { "" });
             if r.sealed + r.redacted + r.discarded > 0 {
@@ -386,6 +406,8 @@ async fn main() {
         home: std::env::var_os("HOME").map(PathBuf::from),
     }, screens);
     let _ = app.tiers.set(Arc::new(tiers));
+    let database_summary = json!({ "policy": database.policy.as_str(), "encrypted": database.encrypted() });
+    let _ = app.database.set(database);
     log_info!("Tiers: {}.", app.tiers().describe());
     let run_cap = slots::parse_cap(&env("MAX_CONCURRENT_RUNS", "")).unwrap_or_else(|e| exit(e));
     let _ = app.run_cap.set(run_cap);
@@ -664,12 +686,14 @@ async fn main() {
         "errorReports": observe.errors.dsn.is_some(),
         "statusPage": status_page,
         "serverBackups": server_backups_summary,
+        "databaseEncryption": database_summary,
     })));
     license::start(app.clone());
     audit::start_retention(app.clone(), retention);
     retention::start(app.clone(), retention::Settings { chat: chat_retention, sessions: session_retention, teammate_files: teammate_files_retention });
     server_backups::start(app.clone());
     backup_encryption::start(app.clone());
+    database_encryption::start(app.clone());
     users::start_pruning(app.clone(), sessions);
     machines::hosts::load(&app, &control_plane).unwrap_or_else(|e| exit(format!("Incus hosts: {e}")));
     if observe.metrics.is_some() {
@@ -805,6 +829,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/retention", get(retention::get))
         .route("/retention/holds/{bot}", put(retention::put_hold).delete(retention::delete_hold))
         .route("/backups", get(server_backups::get).post(server_backups::copy_now))
+        .route("/database", get(database_encryption::get))
         .route("/secrets", get(list_secrets))
         .route("/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/me/tier", get(my_tier))

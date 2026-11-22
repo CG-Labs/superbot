@@ -3389,7 +3389,11 @@ fn migrate_approvals(c: &Connection, fresh: bool) -> rusqlite::Result<()> {
 
 impl Db {
     pub fn open(path: &std::path::Path) -> rusqlite::Result<Db> {
-        let c = Connection::open(path)?;
+        Db::on(crate::database_encryption::open(path)?)
+    }
+
+    /// The database on an open connection: schema and migrations brought up to date.
+    pub fn on(c: Connection) -> rusqlite::Result<Db> {
         let fresh: bool = c.query_row("SELECT NOT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'bots')", [], |r| r.get(0))?;
         c.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -8084,6 +8088,14 @@ impl Db {
     #[cfg(test)]
     pub fn machine_set_enrolled(&self, machine_id: &str) {
         self.c().execute("UPDATE machines SET enrollment = 'enrolled' WHERE id = ?", [machine_id]).unwrap();
+    }
+}
+
+#[cfg(test)]
+impl Db {
+    /// A database encrypted under `key` (ADR 0115), without setting the process's key.
+    pub fn open_keyed(path: &std::path::Path, key: &crate::database_encryption::DbKey) -> Db {
+        Db::on(crate::database_encryption::open_with(path, Some(key)).unwrap()).unwrap()
     }
 }
 

@@ -141,7 +141,7 @@ CREATE TABLE IF NOT EXISTS user_secrets (
 
 /// A connection of its own to the database (WAL allows several), with the `secrets` table.
 pub fn connect(path: &Path) -> Result<Connection, String> {
-    let c = Connection::open(path).map_err(|e| e.to_string())?;
+    let c = crate::database_encryption::open(path).map_err(|e| e.to_string())?;
     // Overwrite freed space with zeros, so replaced values don't linger in free pages.
     c.execute_batch(&format!("PRAGMA secure_delete = ON; {SCHEMA}")).map_err(|e| e.to_string())?;
     Ok(c)
@@ -395,6 +395,25 @@ fn opens(c: &Connection, cipher: &Cipher) -> rusqlite::Result<bool> {
         return Ok(cipher.open("key-check", &v).is_ok_and(|p| p.as_slice() == KEY_CHECK_PLAIN));
     }
     Ok(any_sealed(c)?.is_none_or(|(context, v)| cipher.open(&context, &v).is_ok()))
+}
+
+/// Before a plain database is encrypted under a key derived from `current` (ADR 0115):
+/// refuses when what's sealed opens with neither `current` nor, mid-rotation, `previous`,
+/// so the database is never encrypted under a key that isn't its own. With no key yet,
+/// refuses if anything is sealed. `forget` lets `bootstrap` drop what doesn't open instead.
+pub fn check_keys(c: &Connection, current: Option<&MasterKey>, previous: Option<&MasterKey>, forget: bool) -> Result<(), String> {
+    let db = |e: rusqlite::Error| format!("database: {e}");
+    match current {
+        _ if forget => Ok(()),
+        None if key_check(c).map_err(db)?.is_some() || any_sealed(c).map_err(db)?.is_some() => Err(MISSING_KEY.into()),
+        None => Ok(()),
+        Some(k) if opens(c, &Cipher::new(k)).map_err(db)? => Ok(()),
+        Some(_) => match previous {
+            Some(p) if opens(c, &Cipher::new(p)).map_err(db)? => Ok(()),
+            Some(_) => Err(WRONG_KEYS.into()),
+            None => Err(WRONG_KEY.into()),
+        },
+    }
 }
 
 /// Startup checks: find or make the key (never making one when sealed values exist),

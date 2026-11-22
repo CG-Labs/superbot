@@ -19,7 +19,7 @@ pub const RUN_BUCKETS: [f64; 11] = [1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 60
 pub const RUN_RESULTS: [&str; 8] = ["done", "error", "timeout", "stopped", "interrupted", "account_removed", "unguarded", "policy"];
 
 /// Audit actions counted in `superbot_events_total`: what an operator alerts on.
-pub const EVENTS: [&str; 37] = [
+pub const EVENTS: [&str; 38] = [
     "auth.login",
     "auth.login_failed",
     "access.denied",
@@ -57,6 +57,7 @@ pub const EVENTS: [&str; 37] = [
     "server.backup_rpo_breached",
     "server.backup_rpo_recovered",
     "server.backup_encryption_changed",
+    "server.database_encryption_changed",
 ];
 
 const OUTCOMES: [&str; 3] = ["success", "failure", "denied"];
