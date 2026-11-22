@@ -524,7 +524,7 @@ mod tests {
         let pi = home.join("bots/b1/pi-sessions");
         std::fs::create_dir_all(&pi).unwrap();
         // A session folder that is a link to someone else's files, and a session that is one.
-        std::os::unix::fs::symlink(&theirs, pi.join(format!("{A}"))).unwrap();
+        std::os::unix::fs::symlink(&theirs, pi.join(A)).unwrap();
         std::os::unix::fs::symlink(&theirs, home.join("bots/b2")).unwrap();
         let out = run(&Sweep {
             before: now() + DAY,

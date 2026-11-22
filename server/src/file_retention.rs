@@ -362,15 +362,16 @@ async fn prune_db(app: &App, a: &dyn adapters::Adapter, b: &Bot, days: u32) -> R
 pub async fn prune_teammate_files(app: &Arc<App>, days: u32, at: i64) -> Value {
     let before = at - i64::from(days) * DAY_MS;
     let held: HashSet<String> = app.db.retention_holds().into_iter().filter_map(|h| app.db.bot_owner(&h.bot_id)).collect();
-    let (mut deleted, mut missing, mut held_n, mut waiting, mut files, mut bytes) = (0u32, 0u32, 0u32, 0u32, 0u64, 0u64);
+    let (mut deleted, mut missing, mut held_n, mut waiting, mut unknown, mut files, mut bytes) = (0u32, 0u32, 0u32, 0u32, 0u32, 0u64, 0u64);
     let mut errors: Vec<String> = Vec::new();
     for (table, id, owner, machine, archived_to) in app.db.archives_before(before) {
         if held.contains(&owner) {
             held_n += 1;
             continue;
         }
+        // A removal that couldn't name its archive said only the folder it went into.
         let Some(name) = archive_name(&archived_to) else {
-            errors.push(format!("{id}: {archived_to} isn't in a {} folder", wire::TEAMMATE_ARCHIVE_DIR));
+            unknown += 1;
             continue;
         };
         let r = match &machine {
@@ -425,6 +426,7 @@ pub async fn prune_teammate_files(app: &Arc<App>, days: u32, at: i64) -> Value {
         "bytes": bytes,
         "held": held_n,
         "waiting": waiting,
+        "unknown": unknown,
         "errors": errors,
     });
     finish(app, FILES_LAST, "teammate_files.pruned", &pass, !errors.is_empty(), deleted + missing > 0);

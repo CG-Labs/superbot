@@ -626,6 +626,52 @@ mod tests {
     }
 
     #[test]
+    fn harness_sessions_are_kept_as_long_as_retention_or_a_hold_says() {
+        let dir = std::env::temp_dir();
+        let settings = |days: Option<u32>| {
+            let mut i = input(&dir, None);
+            i.keep_sessions_days = days;
+            let args = job_for(get("claude").unwrap().as_mut(), &i, &mut Vec::new()).args;
+            let at = args.iter().position(|a| a == "--settings").unwrap();
+            serde_json::from_str::<Value>(&args[at + 1]).unwrap()
+        };
+        assert_eq!(
+            settings(None).get("cleanupPeriodDays"),
+            None,
+            "Claude Code's own default"
+        );
+        assert_eq!(settings(Some(30))["cleanupPeriodDays"], 30);
+        assert_eq!(settings(Some(36_500))["cleanupPeriodDays"], 36_500);
+        // Only Hermes keeps them in a database, which it prunes itself, its gateway stopped first.
+        let state = dir.join("bots/b1");
+        let job = get("hermes")
+            .unwrap()
+            .prune_sessions(&state, 30, Some("/usr/bin"))
+            .unwrap();
+        assert_eq!(
+            (job.bin.as_str(), job.args.join(" ")),
+            (
+                "hermes",
+                "sessions prune --older-than 30 --include-archived --yes".into()
+            )
+        );
+        assert_eq!(
+            job.env["HERMES_HOME"],
+            state.join("hermes").display().to_string()
+        );
+        assert_eq!(job.cleanup.unwrap().args, ["gateway", "stop", "--yes"]);
+        for name in ["claude", "codex", "pi"] {
+            assert!(
+                get(name)
+                    .unwrap()
+                    .prune_sessions(&state, 30, None)
+                    .is_none(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn jobs_for_a_machine_never_go_through_this_servers_accounts() {
         let dir = std::env::temp_dir();
         let job = job_for(get("claude").unwrap().as_mut(), &input(&dir, Some(run_as("/usr/bin/sudo"))), &mut Vec::new());

@@ -1268,6 +1268,39 @@ mod tests {
     }
 
     #[test]
+    fn a_sweep_runs_as_the_account_through_superbot_run() {
+        let dir = crate::db::temp_path("sweep-as");
+        let (sudo, seen) = (dir.join("sudo"), dir.join("seen"));
+        let reply = r#"{"sessions":2,"files":3,"bytes":10,"folders":0}"#;
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat >> '{0}'\necho '{reply}'\n",
+            seen.display()
+        );
+        std::fs::write(&sudo, script).unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let r = for_tests(&dir, sudo.to_str().unwrap())
+            .run_as("u1")
+            .unwrap();
+        let s = crate::sweep::Sweep {
+            before: 5,
+            ..Default::default()
+        };
+        let out = r.sweep(&dir, &s).unwrap();
+        assert_eq!((out.sessions, out.files, out.bytes), (2, 3, 10));
+        let seen = std::fs::read_to_string(&seen).unwrap();
+        assert!(
+            seen.starts_with("-n\n-E\n-u\nsb-u-u1\n--\n/usr/local/bin/superbot-run\n--sweep\n"),
+            "{seen}"
+        );
+        assert!(
+            seen.contains(r#""before":5"#),
+            "the sweep goes on stdin: {seen}"
+        );
+        let failing = for_tests(&dir, "/bin/false").run_as("u1").unwrap();
+        assert!(failing.sweep(&dir, &s).is_err());
+    }
+
+    #[test]
     fn a_teammate_account_is_made_by_the_helper_with_both_ids() {
         let dir = crate::db::temp_path("ensure-pair");
         let log = dir.join("log");

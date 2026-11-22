@@ -18,7 +18,6 @@ mod sandbox;
 #[path = "../sweep.rs"]
 mod sweep;
 #[path = "../walk.rs"]
-#[allow(dead_code)]
 mod walk;
 
 use std::os::unix::fs::DirBuilderExt;
