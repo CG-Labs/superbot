@@ -44,8 +44,10 @@ untar_layout() {
   local tar=$1 dest=$2 entries names
   entries=$(tar -tvf "$tar" 2>/dev/null) || die "Couldn't read $tar"
   names=$(tar -tf "$tar" 2>/dev/null) || die "Couldn't read $tar"
-  if ! awk '{ t = substr($0, 1, 1) } t != "-" && t != "d" { bad = 1 } END { exit bad }' <<<"$entries" \
-    || grep -Eq '^/|(^|/)\.\.(/|$)' <<<"$names"; then
+  if ! awk '{ t = substr($0, 1, 1) } t != "-" && t != "d" { bad = 1 } END { exit bad }' <<<"$entries"; then
+    die "Refusing $tar: it holds links, special files or paths outside it"
+  fi
+  if grep -Eq '^/|(^|/)\.\.(/|$)' <<<"$names"; then
     die "Refusing $tar: it holds links, special files or paths outside it"
   fi
   mkdir -p "$dest"
