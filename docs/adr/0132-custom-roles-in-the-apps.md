@@ -26,7 +26,7 @@ While editing a role, the editor previews what it would add up to from `GET /api
 
 ### Confirmations
 
-The apps ask before what silently changes someone's access: giving a custom role to an admin (they stop being one), and changing the base of a role people hold (they all move at once). Deleting is offered only once nobody holds the role, as the server refuses it (409) otherwise.
+The apps ask before what silently changes someone's access: giving a custom role to an admin (they stop being one), and changing the base of a role people hold (they all move at once), taking a role away (they keep its base as a built-in role), and setting a built-in role for someone with a custom role (it clears the custom role). Deleting is offered only once nobody holds the role, as the server refuses it (409) otherwise.
 
 ## Alternatives considered
 
