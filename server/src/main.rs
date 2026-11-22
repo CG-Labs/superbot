@@ -933,7 +933,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/isolation/teammate-removals", get(teammate_removals::list_all))
         .route("/teams", get(teams::list).post(teams::create))
         .route("/teams/{id}", get(teams::get).patch(teams::update).delete(teams::delete))
-        .route("/teams/{id}/region", put(machines::region::set_team))
+        .route("/teams/{id}/region", get(machines::region::get_team).put(machines::region::set_team))
         .route("/teams/{id}/members/{user}", put(teams::put_member).delete(teams::delete_member))
         .route("/team", get(teams::mine))
         .route("/team/leave", post(teams::leave_mine))

@@ -58,7 +58,7 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl user region <user> [<region>|default]     Where their machine and its backups live (ADR 0117): theirs,
                                                    their team's or the default; set it, or follow the team again.
                                                    Refused while their machine is elsewhere
-  botctl team region <team> <region>|default       The team's data region, for members without their own
+  botctl team region <team> [<region>|default]     The team's data region, for members without their own
   botctl regions                                   The data regions offered, who and what is in each, the
                                                    hosts and backup store in each, and residency warnings
   botctl tiers                                     Every tier, its routes and limits, and the default
@@ -720,6 +720,7 @@ fn region_request(args: &[&str]) -> Option<(&'static str, String, Option<String>
         ["regions"] => ("GET", "/api/regions".into(), None),
         ["user", "region", key] => ("GET", format!("/api/users/{}/region", encode(key)), None),
         ["user", "region", key, r] => ("PUT", format!("/api/users/{}/region", encode(key)), Some(pick(r))),
+        ["team", "region", id] => ("GET", format!("/api/teams/{}/region", encode(id)), None),
         ["team", "region", id, r] => ("PUT", format!("/api/teams/{}/region", encode(id)), Some(pick(r))),
         _ => return None,
     })
@@ -1696,7 +1697,8 @@ mod tests {
         assert_eq!(region_request(&["user", "region", "u1", "default"]), Some(("PUT", "/api/users/u1/region".into(), body(Value::Null))));
         assert_eq!(region_request(&["team", "region", "t1", "de-fra-2"]), Some(("PUT", "/api/teams/t1/region".into(), body(json!("de-fra-2")))));
         assert_eq!(region_request(&["team", "region", "t1", "default"]), Some(("PUT", "/api/teams/t1/region".into(), body(Value::Null))));
-        for other in [&["team", "region", "t1"][..], &["user", "tier", "u1", "pro"], &["region"]] {
+        assert_eq!(region_request(&["team", "region", "t1"]), Some(("GET", "/api/teams/t1/region".into(), None)));
+        for other in [&["team", "region"][..], &["user", "tier", "u1", "pro"], &["region"]] {
             assert_eq!(region_request(other), None, "{other:?}");
         }
     }

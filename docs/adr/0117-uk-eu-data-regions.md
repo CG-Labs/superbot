@@ -116,7 +116,7 @@ The region covers users' machines and their backups only. botd's own database (u
 - **botctl**:
   - `botctl regions`
   - `botctl user region <user> [<region>|default]`
-  - `botctl team region <team> <region>|default`
+  - `botctl team region <team> [<region>|default]`
   - `botctl machine request <user> [<tier>] [<region>]` is unchanged, but is checked against the binding region.
 - **Console**:
   - a Data region column and button on Users;

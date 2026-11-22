@@ -192,6 +192,13 @@ pub async fn set_user(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Aut
     Ok(Json(v))
 }
 
+/// `GET /api/teams/{id}/region`.
+pub async fn get_team(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>, Path(id): Path<String>) -> Res {
+    a.machines.need()?;
+    let t = app.db.team(id.trim()).ok_or_else(|| not_found("Team"))?;
+    Ok(Json(team_region_view(&app, &a.machines, &t)))
+}
+
 /// `PUT /api/teams/{id}/region` `{region: id | null}`: sets or clears a team's data
 /// region, for its members with none of their own. Refused while any of them has a
 /// machine somewhere the new region isn't.
