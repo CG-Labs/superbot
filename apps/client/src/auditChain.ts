@@ -14,11 +14,23 @@ export function shortHash(hash: string | null | undefined): string {
 
 const when = (ms: number | null | undefined) => (ms ? new Date(ms).toLocaleString() : "never");
 
+/** A partial check's bounds, as "events 10 to 20 only"; "" for the whole log. */
+export function rangeText(r: AuditVerification["range"]): string {
+  if (!r || (r.from == null && r.to == null)) return "";
+  if (r.from != null && r.to != null) return `events ${r.from} to ${r.to} only`;
+  return r.from != null ? `from event ${r.from} only` : `up to event ${r.to} only`;
+}
+
 export function verificationLine(v: AuditVerification | null): ChainLine {
   if (!v) return { label: "Last check", text: "Not checked yet. botd checks once a day.", tone: "dim" };
-  if (v.ok) return { label: "Last check", text: `Intact: ${v.checked} events, ${when(v.at)}`, tone: "ok" };
+  const part = rangeText(v.range);
+  if (v.ok) {
+    // A partial check says nothing about the rest of the log.
+    if (part) return { label: "Last check", text: `Intact, ${part}: ${v.checked} events, ${when(v.at)}`, tone: "warn" };
+    return { label: "Last check", text: `Intact: ${v.checked} events, ${when(v.at)}`, tone: "ok" };
+  }
   const where = v.firstBroken ? ` at event ${v.firstBroken.id} (${v.firstBroken.reason})` : v.reason ? ` (${v.reason})` : "";
-  return { label: "Last check", text: `Broken${where}, ${when(v.at)}`, tone: "bad" };
+  return { label: "Last check", text: `Broken${where}${part ? `, ${part}` : ""}, ${when(v.at)}`, tone: "bad" };
 }
 
 export function checkpointLine(c: AuditCheckpoint | null, everyMinutes: number): ChainLine {

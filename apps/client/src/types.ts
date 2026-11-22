@@ -747,6 +747,8 @@ export interface AuditVerification {
   checked: number;
   broken: number;
   firstBroken: { id: number; reason: string } | null;
+  /** Set when only part of the log was checked (`--from`/`--to`); null bounds are open. */
+  range?: { from: number | null; to: number | null } | null;
 }
 
 /** The SIEM export's progress (`GET /api/audit/siem`). */

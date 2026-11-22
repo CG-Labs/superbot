@@ -40,6 +40,15 @@ describe("audit chain lines (ADR 0149)", () => {
     expect(verificationLine(broken)).toMatchObject({ tone: "bad", text: expect.stringContaining("Broken at event 41 (checkpoint)") });
   });
 
+  it("says when the last check covered only part of the log", () => {
+    const partial = { ...chainState().verification!, range: { from: 10, to: 20 } };
+    expect(verificationLine(partial)).toMatchObject({ tone: "warn", text: expect.stringContaining("Intact, events 10 to 20 only") });
+    expect(verificationLine({ ...partial, range: { from: 10, to: null } }).text).toContain("from event 10 only");
+    expect(verificationLine({ ...partial, range: { from: null, to: 20 } }).text).toContain("up to event 20 only");
+    expect(verificationLine({ ...partial, range: null }).tone).toBe("ok");
+    expect(verificationLine({ ...partial, ok: false, firstBroken: { id: 12, reason: "contents" } }).text).toContain("Broken at event 12 (contents), events 10 to 20 only");
+  });
+
   it("names the last checkpoint, the head it signs and its key", () => {
     expect(checkpointLine(null, 0)).toMatchObject({ tone: "dim", text: "None yet (on request only)" });
     expect(checkpointLine(checkpoint(), 60).text).toContain("Event 41 signs event 40 (abababababab…)");
