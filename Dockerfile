@@ -22,7 +22,9 @@ RUN SUPERBOT_WEB_BASE_URL=/app npx expo export --platform web --output-dir /out/
 
 # Compose's Caddy (`target: caddy`): stock Caddy plus the client and the landing page, so
 # each rebuild ships them from this checkout. The Caddyfile is mounted from deploy/docker/.
+# The upgrade brings Alpine's security fixes in before caddy:2 itself is rebuilt (ADR 0101).
 FROM ${CADDY_IMAGE} AS caddy
+RUN apk upgrade --no-cache
 COPY --from=client /out/app /srv/superbot-app
 COPY site /srv/superbot-site
 LABEL org.opencontainers.image.title="SuperBot Caddy" \
@@ -73,7 +75,9 @@ ARG PI_VERSION=latest
 ARG HERMES_COMMIT=caafe5389ae585ef77387a962aee05b1bcf17029
 ARG SUPERBOT_UID=10001
 
+# The upgrade brings Debian's security fixes in before the Node image itself is rebuilt (ADR 0101).
 RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends \
         acl age ca-certificates curl git procps sqlite3 sudo tini tzdata \
     && rm -rf /var/lib/apt/lists/*

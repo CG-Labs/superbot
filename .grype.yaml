@@ -1,0 +1,10 @@
+# Grype settings for the image scan in .github/workflows/docker.yml (docs/adr/0101-image-scanning-and-signing.md).
+# CI fails on a Critical vulnerability that has a fix. One we can't fix yet (a fix that has
+# to come from upstream, such as Caddy's own binary) is accepted here, one entry per finding,
+# with why and who owns it, and removed when the fix lands:
+#
+#   - vulnerability: CVE-YYYY-NNNNN
+#     package:
+#       name: zlib
+#     reason: "Caddy's base image ships it; fixed when caddy:2 is rebuilt. Owner: engineering lead."
+ignore: []
