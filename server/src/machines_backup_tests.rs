@@ -152,6 +152,8 @@ async fn restore_until(env: &Env, uid: &str, body: Value, want: &str) -> crate::
     assert_eq!((code, r["restore"]["state"].as_str()), (202, Some("importing")), "{r}");
     let id = r["restore"]["id"].as_str().unwrap().to_string();
     until(want, || env.app.db.machine_restore(&id).is_some_and(|r| !matches!(r.state.as_str(), "importing" | "replacing"))).await;
+    // It's enrolling before the restored machine boots; the restore holds the lock until then.
+    drop(env.app.control_plane.get().unwrap().lock_ops().await);
     let r = env.app.db.machine_restore(&id).unwrap();
     assert_eq!(r.state, want, "{:?}", r.error);
     // A restore is "enrolling" just before the copy boots, so the agent can enroll as
