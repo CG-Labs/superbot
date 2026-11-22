@@ -882,11 +882,8 @@ impl App {
         if waited && let Some((m, limit, storage::State::Over)) = storage::check(self, &bot.owner_id).await {
             self.give_back(&bot, msg, &period.key);
             let tier = self.tier_of(&bot.owner_id);
-            let text = storage::full_text(&tier.label, m.used(), limit);
-            let details = json!({
-                "reason": "storage_limit", "owner": bot.owner_id, "tier": tier.name, "limit": limit, "used": m.used(), "partial": m.partial,
-                "period": period.key, "messageId": msg.id,
-            });
+            let text = storage::full_text(&tier.label, &m, limit);
+            let details = storage::details(&m, json!({ "reason": "storage_limit", "owner": bot.owner_id, "tier": tier.name, "limit": limit, "period": period.key, "messageId": msg.id }));
             self.db.record(&by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied).details(details));
             if self.db.last_message(&bot.id).is_none_or(|m| m.text != text) {
                 self.say(&bot.id, &text, true);
@@ -1903,8 +1900,8 @@ impl App {
         };
         if let Some((m, limit, storage::State::Over)) = storage {
             crate::billing_mail::storage(self, &bot.owner_id, tier, m.used(), *limit, true);
-            let text = storage::full_text(&tier.label, m.used(), *limit);
-            return refused("storage_limit", text, Some(*limit), Some(m.used()), json!({ "partial": m.partial }));
+            let text = storage::full_text(&tier.label, m, *limit);
+            return refused("storage_limit", text, Some(*limit), Some(m.used()), storage::details(m, json!({})));
         }
         let (this, more) = match period.source {
             usage::Source::Calendar => ("month", "the 1st (UTC)".to_string()),
@@ -1928,9 +1925,9 @@ impl App {
         if let Some((m, limit, storage::State::Warning)) = storage {
             if self.storage.first_warning(&self.db, &bot.owner_id, crate::db::now()) {
                 let who = Who { actor: Actor::system("billing").on_behalf_of(&bot.owner_id), source: Default::default() };
-                let details = json!({ "owner": bot.owner_id, "tier": tier.name, "limit": limit, "used": m.used(), "warnAt": storage::WARN_PERCENT, "partial": m.partial });
+                let details = storage::details(m, json!({ "owner": bot.owner_id, "tier": tier.name, "limit": limit, "warnAt": storage::WARN_PERCENT }));
                 self.db.record(&who.event(storage::WARNING_ACTION).target("user", &bot.owner_id).bot(&bot.id).details(details));
-                self.say(&bot.id, &storage::warning_text(&tier.label, m.used(), *limit), false);
+                self.say(&bot.id, &storage::warning_text(&tier.label, m, *limit), false);
             }
             // Once a billing period and tier by its key, apart from the chat's once a day.
             crate::billing_mail::storage(self, &bot.owner_id, tier, m.used(), *limit, false);

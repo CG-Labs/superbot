@@ -141,6 +141,7 @@ mod storage;
 #[cfg(test)]
 mod storage_http_tests;
 mod users;
+mod walk;
 #[cfg(test)]
 mod users_http_tests;
 #[cfg(test)]
@@ -2371,10 +2372,10 @@ async fn send_message(State(app): State<AppState>, Extension(c): Extension<Calle
         && let Some((m, limit, storage::State::Over)) = storage::check(&app, &bot.owner_id).await
     {
         let tier = app.tier_of(&bot.owner_id);
-        let details = json!({ "reason": "storage_limit", "owner": bot.owner_id, "tier": tier.name, "limit": limit, "used": m.used(), "partial": m.partial });
+        let details = storage::details(&m, json!({ "reason": "storage_limit", "owner": bot.owner_id, "tier": tier.name, "limit": limit }));
         app.db.record(&by.event("bot.message_refused").bot(&id).outcome(Outcome::Denied).details(details));
         billing_mail::storage(&app, &bot.owner_id, tier, m.used(), limit, true);
-        return Err(ApiError(StatusCode::FORBIDDEN, storage::refusal_text(&tier.label, m.used(), limit)));
+        return Err(ApiError(StatusCode::FORBIDDEN, storage::refusal_text(&tier.label, &m, limit)));
     }
     // Answering a choice card: remember which option was picked.
     let mut handoff = None;

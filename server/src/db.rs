@@ -835,6 +835,14 @@ pub struct Machine {
     pub disk_used: Option<i64>,
     pub disk_total: Option<i64>,
     pub disk_seen_at: Option<i64>,
+    /// What its agent last said the Bots' and teammates' homes hold, in bytes, whether
+    /// that was a lower bound, and when botd heard it (ADR 0105). None: never said.
+    #[serde(skip)]
+    pub disk_files: Option<i64>,
+    #[serde(skip)]
+    pub disk_files_partial: bool,
+    #[serde(skip)]
+    pub disk_files_at: Option<i64>,
     /// When it was last suspended, while it is. None for one suspended before this was
     /// kept.
     #[serde(skip)]
@@ -1014,6 +1022,9 @@ fn machine_row(r: &Row) -> rusqlite::Result<Machine> {
         disk_used: r.get("disk_used")?,
         disk_total: r.get("disk_total")?,
         disk_seen_at: r.get("disk_seen_at")?,
+        disk_files: r.get("disk_files")?,
+        disk_files_partial: r.get("disk_files_partial")?,
+        disk_files_at: r.get("disk_files_at")?,
         suspended_at: r.get("suspended_at")?,
     })
 }
@@ -1517,7 +1528,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 41] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 42] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1559,6 +1570,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 41] = [
     migrate_mfa,
     migrate_scim_groups,
     migrate_chat_retention,
+    migrate_machine_home_use,
 ];
 
 /// Whether Bot `?1` is held or has messages from a held Bot in its chat.
@@ -1735,6 +1747,20 @@ fn migrate_billing_emails(c: &Connection, _fresh: bool) -> rusqlite::Result<()> 
             usage_emails INTEGER NOT NULL DEFAULT 1,
             updated_at INTEGER NOT NULL
         );",
+    )
+}
+
+/// What the homes on a machine hold (ADR 0105), as its agent last said, and when botd
+/// heard it: the owner's storage counts it while their Bots work there.
+fn migrate_machine_home_use(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'disk_files'", [], |r| r.get(0))?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch(
+        "ALTER TABLE machines ADD COLUMN disk_files INTEGER;
+         ALTER TABLE machines ADD COLUMN disk_files_partial INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE machines ADD COLUMN disk_files_at INTEGER;",
     )
 }
 
@@ -6413,7 +6439,8 @@ impl Db {
     pub fn machine_rebuilt_reset(&self, machine_id: &str) {
         let _ = self.c().execute(
             "UPDATE machines SET agent_upkeep = NULL, harnesses_sent_at = NULL, harnesses_sent_plan = NULL, upgrade_id = NULL,
-             upgrade_build = NULL, upgrade_sent_at = NULL, upgrade_by = NULL, upgrade_failed_build = NULL WHERE id = ?",
+             upgrade_build = NULL, upgrade_sent_at = NULL, upgrade_by = NULL, upgrade_failed_build = NULL,
+             disk_files = NULL, disk_files_partial = 0, disk_files_at = NULL WHERE id = ?",
             [machine_id],
         );
     }
@@ -6499,6 +6526,20 @@ impl Db {
         let _ = self.c().execute(
             "UPDATE machines SET disk_used = ?, disk_total = ?, disk_seen_at = ? WHERE id = ?",
             params![b(used), b(total), now(), machine_id],
+        );
+    }
+
+    /// What the machine's agent said its homes hold, in bytes (ADR 0105). A heartbeat
+    /// without it (an agent that hasn't measured yet) leaves the last one as it was.
+    pub fn machine_files_seen(&self, machine_id: &str, bytes: u64, partial: bool) {
+        self.machine_files_seen_at(machine_id, bytes, partial, now());
+    }
+
+    /// The same, heard at `at` (tests set it long ago).
+    pub fn machine_files_seen_at(&self, machine_id: &str, bytes: u64, partial: bool, at: i64) {
+        let _ = self.c().execute(
+            "UPDATE machines SET disk_files = ?, disk_files_partial = ?, disk_files_at = ? WHERE id = ?",
+            params![i64::try_from(bytes).unwrap_or(i64::MAX), partial, at, machine_id],
         );
     }
 

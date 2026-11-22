@@ -116,6 +116,16 @@ describe("storage (ADR 0082)", () => {
     expect(storageWarning(storage(1_200_000, 1e6, "over"))).toMatch(/^Storage is full: new messages and tasks are refused until files are deleted/);
   });
 
+  it("counts what the Bots' computer said, says when it hasn't, and where to delete (ADR 0105)", () => {
+    const machine = (report: "fresh" | "stale" | "missing", used: number | null, measuredAt: number | null) => ({ onMachine: true, partial: report === "missing", machine: { used, report, partial: false, measuredAt } });
+    expect(storageLine(storage(500_000, 1e6, "ok", machine("fresh", 400_000, 1)))).toBe("Storage: 500 KB of 1 MB (50%)");
+    expect(storageLine(storage(500_000, 1e6, "ok", machine("stale", 400_000, Date.UTC(2026, 10, 2))))).toBe("Storage: 500 KB of 1 MB (50%), as the computer said on 2026-11-02");
+    expect(storageLine(storage(100_000, 1e6, "ok", machine("missing", null, null)))).toBe("Storage: 100 KB of 1 MB (10%), at least: the computer hasn't said what it holds yet");
+    expect(storageWarning(storage(1_200_000, 1e6, "over", machine("fresh", 1_100_000, 1)))).toBe(
+      "Storage is full: new messages and tasks are refused until files are deleted on the computer Bots work on or the plan grows.",
+    );
+  });
+
   it("adds a storage line to the plan and flags it when full", () => {
     const full: PlanUsage = { ...starter, limits: { maxStorageMb: 1 }, usage: { ...starter.usage, storage: storage(1_200_000, 1e6, "over") } };
     expect(planUsageLines(full).at(-1)).toBe("Storage: 1.2 MB of 1 MB (120%)");

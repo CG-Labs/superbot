@@ -109,11 +109,21 @@ export interface StorageUsage {
   state: "ok" | "warning" | "over" | null;
   /** The percentage from which people are warned. */
   warnAt: number;
-  /** Some folders couldn't be read: the number is a lower bound. */
+  /** Some folders couldn't be read, or the machine hasn't said yet: the number is a lower bound. */
   partial: boolean;
   measuredAt: number | null;
-  /** Their Bots run on their own machine, whose disk this doesn't count. */
+  /** Their Bots work on their own machine: its homes count instead of the workspace (ADR 0105). */
   onMachine?: boolean;
+  /** What that machine last said its homes hold, however old (ADR 0105). */
+  machine?: MachineStorage | null;
+}
+
+/** A machine's report of its homes (ADR 0105): `used` is null until it first says. */
+export interface MachineStorage {
+  used: number | null;
+  report: "fresh" | "stale" | "missing";
+  partial: boolean;
+  measuredAt: number | null;
 }
 
 /** A plan with what the user has used of it (`/api/me/tier`, and admins' user views). */

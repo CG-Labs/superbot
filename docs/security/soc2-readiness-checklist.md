@@ -41,7 +41,7 @@ Scope: the managed service. A self-hosting customer is its own service organisat
 | CC7 System operations | 3 | 1 | 5 |
 | CC8 Change management | 0 | 0 | 3 |
 | CC9 Risk mitigation | 0 | 1 | 3 |
-| A1 Availability | 0 | 1 | 5 |
+| A1 Availability | 1 | 1 | 4 |
 | C1 Confidentiality | 0 | 1 | 2 |
 
 ## CC1: Control environment
@@ -149,7 +149,7 @@ Scope: the managed service. A self-hosting customer is its own service organisat
 | ID | Item | Kind | Owner | Evidence to collect | Status | Where it stands |
 |----|------|------|-------|---------------------|--------|-----------------|
 | A1.1-1 | Host capacity metrics and capacity dashboards | Product | Engineering lead | Metrics for each host's CPU, memory and disk against its capacity; dashboards | Gap | Metrics cover machines by state, runs and run slots ([ADR 0089](../adr/0089-metrics-and-structured-logs.md)), not host capacity. |
-| A1.1-2 | Machines' disk use counted in tier storage limits | Product | Engineering lead | Storage limits including reported disk use; tests | Gap | Machines report disk use, but storage limits don't count it ([ADR 0085](../adr/0085-resizing-machines-on-a-tier-change.md), [ADR 0082](../adr/0082-storage-limits-per-tier.md)). |
+| A1.1-2 | Machines' disk use counted in tier storage limits | Product | Engineering lead | Storage limits including reported disk use; tests | Done | Each machine's agent reports what its Bots' and teammates' homes hold, not the OS. That counts in the tier's storage limit instead of the server's copy of the workspace while the user's Bots work there. An old report still counts; a missing one counts nothing and marks the total "at least". Warnings and refusals say where to delete, audit events carry the report, and `superbot_machine_storage_reports` counts fresh, stale and missing reports ([ADR 0105](../adr/0105-machine-disk-use-in-storage-limits.md), [`server/src/storage.rs`](../../server/src/storage.rs), [`server/src/walk.rs`](../../server/src/walk.rs), [`server/src/storage_http_tests.rs`](../../server/src/storage_http_tests.rs)). |
 | A1.1-3 | Uptime measured against the SLO for a quarter | Process | Operator | The outside probe's results; monthly SLO reports | Partial | The SLO, the probe target and burn-rate rules exist ([SLO](../slo.md), [ADR 0090](../adr/0090-status-page-and-uptime-slo.md)); no quarter has been measured. |
 | A1.2-1 | Server backups copied off the host by default | Product | Engineering lead | Off-host backup configuration; backups arriving there | Gap | Server backups stay on the host unless the operator copies them off ([ADR 0030](../adr/0030-backup-restore-drill.md)); only Incus machines back up off-host ([ADR 0071](../adr/0071-off-host-machine-backups.md)). |
 | A1.2-2 | Recovery objectives for Linode machines | Product | Engineering lead | Objectives, checks and alerts like Incus machines' | Gap | Linode machines rely on Linode Backups, which the [machine recovery objectives](machine-recovery-objectives.md) don't cover. |

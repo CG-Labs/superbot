@@ -65,5 +65,5 @@ Each wait is audited once per reason as `machine.resize_waiting`, not on every p
 - Upgrades take effect on the machine within a minute, with no admin.
 - Downgrades never shrink a disk below what's on it. A user over the smaller plan's limits keeps the bigger machine until they delete files, and is told so. That could hold a downgrade indefinitely. Admins see it in `botctl machine resizes`.
 - A Linode resize restarts the user's machine. Waiting for running Bots limits the damage, but a machine that is idle between runs is restarted without warning.
-- Machine disk use is now reported, but storage limits ([ADR 0082](0082-storage-limits-per-tier.md)) don't count it yet.
+- Machine disk use is now reported, but storage limits ([ADR 0082](0082-storage-limits-per-tier.md)) don't count it yet. [ADR 0105](0105-machine-disk-use-in-storage-limits.md) counts what the machine's homes hold.
 - Billing emails and yearly prices at checkout stay on #31.
