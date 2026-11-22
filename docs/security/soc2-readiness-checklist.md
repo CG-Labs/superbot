@@ -37,7 +37,7 @@ Scope: the managed service. A self-hosting customer is its own service organisat
 | CC3 Risk assessment | 0 | 1 | 4 |
 | CC4 Monitoring activities | 0 | 1 | 1 |
 | CC5 Control activities | 0 | 0 | 4 |
-| CC6 Logical and physical access | 2 | 4 | 11 |
+| CC6 Logical and physical access | 3 | 4 | 10 |
 | CC7 System operations | 1 | 2 | 6 |
 | CC8 Change management | 0 | 0 | 3 |
 | CC9 Risk mitigation | 0 | 1 | 3 |
@@ -107,7 +107,7 @@ Scope: the managed service. A self-hosting customer is its own service organisat
 | CC6.5-1 | Erasing a user's data | Product | Engineering lead | An erasure command or API, tested, with its audit event | Gap | Users are disabled, never deleted; a SCIM delete is a soft delete (ADR 0023). GDPR erasure is on the M4 roadmap. |
 | CC6.5-2 | Deleting a destroyed machine's backups on request | Product | Engineering lead | A deletion path, tested and audited | Gap | Backups are deleted only when their retention ends ([ADR 0071](../adr/0071-off-host-machine-backups.md)). |
 | CC6.6-1 | Intrusion detection or a WAF in front of the service | Process | Operator | Tool configuration; alert history | Gap | Only Caddy is public, with sign-in rate limits ([auth review](auth-review-2026-11.md)); nothing detects intrusions. |
-| CC6.7-1 | Model providers reached only over HTTPS | Product | Engineering lead | The tiers file refusing `http://` outside loopback; tests | Gap | A provider's `baseUrl` may be `http` or `https` (`server/src/tiers.rs`, ADR 0077), which would send prompts and keys unencrypted. |
+| CC6.7-1 | Model providers reached only over HTTPS | Product | Engineering lead | The tiers file refusing `http://` outside loopback; tests | Done | botd refuses to start when a tiers file provider's `baseUrl` or `SUPERBOT_HERMES_BASE_URL` is plain `http://` to anything but loopback (`127.0.0.0/8`, `::1`, `localhost`), naming the provider and file; URLs a harness is given in its own settings are the operator's or user's ([ADR 0097](../adr/0097-model-providers-over-https.md), [`server/src/tiers.rs`](../../server/src/tiers.rs), [`server/src/adapters/hermes.rs`](../../server/src/adapters/hermes.rs), tests in [`server/tests/provider_https_only.rs`](../../server/tests/provider_https_only.rs)). |
 | CC6.7-2 | Backups encrypted | Product | Operator | Each backup target's age recipients; a restore with the key | Partial | age encryption exists for server and machine backups ([ADR 0030](../adr/0030-backup-restore-drill.md), [ADR 0071](../adr/0071-off-host-machine-backups.md)) but is off until the operator sets recipients. |
 | CC6.8-1 | Malware scanning or endpoint detection on servers and hosts | Process | Operator | Agent deployment records; alert history | Gap | None in the product or this repository. |
 | CC6.8-2 | Egress allowlists for runs | Product | Engineering lead | Per-machine egress policy; tests | Gap | Incus containers can't reach private ranges or the host (ADR 0065), but public egress is open. Planned for M5. |
