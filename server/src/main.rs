@@ -271,8 +271,9 @@ fn env(key: &str, default: &str) -> String {
 
 pub fn random_bytes(n: usize) -> Vec<u8> {
     use std::io::Read;
-    let mut b = vec![0u8; n];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).expect("read /dev/urandom");
+    let mut b = Vec::with_capacity(n);
+    std::fs::File::open("/dev/urandom").and_then(|f| f.take(n as u64).read_to_end(&mut b)).expect("read /dev/urandom");
+    assert_eq!(b.len(), n, "short read from /dev/urandom");
     b
 }
 
