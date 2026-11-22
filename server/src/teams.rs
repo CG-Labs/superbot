@@ -195,12 +195,13 @@ async fn provide(app: &AppState, by: &Who, team: &Team, user: &User) -> Value {
         if tm.released_at.is_none() && tm.team_id == team.id {
             return json!("kept");
         }
-        if !app.db.machine(&m.id).is_some_and(|m| matches!(m.state, MachineState::Running | MachineState::Suspended | MachineState::Provisioning | MachineState::Pending | MachineState::Error)) {
+        // Read again under the lock: a sweep may have just suspended it.
+        let Some(state) = app.db.machine(&m.id).map(|m| m.state).filter(|s| matches!(s, MachineState::Running | MachineState::Suspended | MachineState::Provisioning | MachineState::Pending | MachineState::Error)) else {
             return json!("failed");
-        }
+        };
         app.db.team_machine_mark(&m.id, &team.id, &user.id);
         drop(guard);
-        let resumed = match m.state {
+        let resumed = match state {
             MachineState::Suspended => crate::machines::act_if(app, cp, by, &user.id, Step::Resume, None, &|x| ours(app, &team.id, x)).await.is_ok(),
             _ => false,
         };
