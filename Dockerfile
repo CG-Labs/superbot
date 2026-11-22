@@ -34,7 +34,7 @@ LABEL org.opencontainers.image.title="SuperBot Caddy" \
 
 FROM ${RUST_IMAGE} AS build
 WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock .env.example ./
 COPY server server
 COPY web web
 COPY site site

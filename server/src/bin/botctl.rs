@@ -150,6 +150,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
              --idp <entra|google|oidc|github|apple|saml> --idp-provider <id> --subject <issuer|sub>
              --session <id> --on-behalf-of <user id|email> --outcome <success|failure|denied> --bot <id>
     times: YYYY-MM-DD (UTC), RFC 3339, or unix milliseconds
+  botctl support-bundle [-o <file>]                Save a support bundle for a ticket (ADR 0131): version,
+                                                   redacted settings, health, recent logs and an audit
+                                                   summary, in a tar; no secrets, emails or chats
   botctl retention                                 How long chat history, harness session files,
                                                    teammates' archived work and the audit log are kept
                                                    (CHAT_RETENTION_DAYS, HARNESS_SESSION_RETENTION_DAYS,
@@ -290,6 +293,17 @@ fn exchange(cred: Cred, method: &str, path: &str, body: Option<String>) -> Resul
     let (head, body) = res.split_once("\r\n\r\n").unwrap_or((&res, ""));
     let code: u16 = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
     Ok((code, body.to_string()))
+}
+
+/// Like `exchange`, for replies that aren't text: the status, the head and the body's bytes.
+fn exchange_bytes(cred: Cred, method: &str, path: &str) -> Result<(u16, String, Vec<u8>), String> {
+    let mut s = send(cred, method, path, None)?;
+    let mut res = Vec::new();
+    s.read_to_end(&mut res).map_err(|e| e.to_string())?;
+    let split = res.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(res.len());
+    let head = String::from_utf8_lossy(&res[..split]).to_string();
+    let code: u16 = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    Ok((code, head, res.get(split + 4..).unwrap_or_default().to_vec()))
 }
 
 fn failure(code: u16, body: &str) -> String {
@@ -1321,6 +1335,7 @@ fn run(args: &[String]) -> Result<String, String> {
         ["approvals"] => op("GET", "/api/approvals?status=pending", None),
         ["approvals", status] => op("GET", &format!("/api/approvals?status={status}"), None),
         [verb @ ("approve" | "deny"), id, rest @ ..] => decide(verb, id, rest),
+        ["support-bundle", rest @ ..] => support_bundle(rest),
         ["audit", "export", rest @ ..] => api(Cred::Operator, "GET", &format!("/api/audit/export.csv{}", audit_query(rest)?), None),
         ["audit", rest @ ..] => op("GET", &format!("/api/audit{}", audit_query(rest)?), None),
         ["retention"] => op("GET", "/api/retention", None),
@@ -1472,6 +1487,47 @@ fn erase_request(key: &str, rest: &[&str]) -> Result<(String, Value), String> {
     Ok((format!("/api/users/{}/erase", encode(key)), body))
 }
 
+/// `botctl support-bundle [-o <file>]`: the file to save it as, if not botd's name for it.
+fn bundle_out<'a>(rest: &[&'a str]) -> Result<Option<&'a str>, String> {
+    match rest {
+        [] => Ok(None),
+        ["-o" | "--out", file] => Ok(Some(file)),
+        _ => Err("Usage: botctl support-bundle [-o <file>]".into()),
+    }
+}
+
+/// The file name a reply's `Content-Disposition` gives, if it is a plain one: it is saved
+/// in the current folder, so no paths and no hidden files.
+fn attachment_name(head: &str) -> Option<String> {
+    let line = head.lines().find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))?;
+    let name = line.split_once("filename=")?.1.trim().trim_matches('"');
+    let plain = !name.is_empty() && !name.starts_with('.') && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    plain.then(|| name.to_string())
+}
+
+/// Writes a new file only its owner can read; never over an existing one.
+fn save_private(path: &str, bytes: &[u8]) -> Result<(), String> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(path).and_then(|mut f| f.write_all(bytes)).map_err(|e| format!("{path}: {e}"))
+}
+
+fn support_bundle(rest: &[&str]) -> Result<String, String> {
+    let out = bundle_out(rest)?;
+    let (code, head, body) = exchange_bytes(Cred::Operator, "GET", "/api/support/bundle")?;
+    if !(200..300).contains(&code) {
+        return Err(failure(code, &String::from_utf8_lossy(&body)));
+    }
+    let path = out.map(String::from).or_else(|| attachment_name(&head)).unwrap_or_else(|| "superbot-support.tar".into());
+    save_private(&path, &body)?;
+    Ok(format!(
+        "Saved {path} ({} KB). It has no secrets, emails or chats, but read it before you attach it to a ticket:\n  tar -tvf {path}\n  tar -xOf {path} | less",
+        body.len().div_ceil(1024)
+    ))
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
@@ -1500,6 +1556,36 @@ mod tests {
         assert_eq!(failure(403, r#"{"error":"not allowed"}"#), "not allowed (HTTP 403)");
         assert_eq!(failure(502, "Bad Gateway"), "Bad Gateway (HTTP 502)");
         assert_eq!(failure(400, r#"{"error":7}"#), r#"{"error":7} (HTTP 400)"#);
+    }
+
+    #[test]
+    fn a_support_bundle_is_saved_where_asked_or_under_botds_plain_name() {
+        assert_eq!(bundle_out(&[]), Ok(None));
+        assert_eq!(bundle_out(&["-o", "t.tar"]), Ok(Some("t.tar")));
+        assert_eq!(bundle_out(&["--out", "/tmp/t.tar"]), Ok(Some("/tmp/t.tar")));
+        assert!(bundle_out(&["-o"]).is_err() && bundle_out(&["t.tar"]).is_err());
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: application/x-tar\r\ncontent-disposition: attachment; filename=\"superbot-support-20261122T120000Z.tar\"";
+        assert_eq!(attachment_name(head).as_deref(), Some("superbot-support-20261122T120000Z.tar"));
+        for bad in ["../etc/passwd", ".bashrc", "a/b.tar", "", "x y.tar"] {
+            assert_eq!(attachment_name(&format!("Content-Disposition: attachment; filename=\"{bad}\"")), None, "{bad}");
+        }
+        assert_eq!(attachment_name("HTTP/1.1 200 OK"), None);
+    }
+
+    #[test]
+    fn a_saved_bundle_is_private_and_never_overwrites() {
+        let path = std::env::temp_dir().join(format!("botctl-bundle-{}.tar", std::process::id()));
+        let p = path.to_str().unwrap();
+        let _ = std::fs::remove_file(&path);
+        save_private(p, b"tar").unwrap();
+        assert!(save_private(p, b"other").is_err(), "an existing file is kept");
+        assert_eq!(std::fs::read(&path).unwrap(), b"tar");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

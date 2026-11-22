@@ -159,6 +159,9 @@ mod sso;
 mod status;
 #[cfg(test)]
 mod status_http_tests;
+mod support;
+#[cfg(test)]
+mod support_http_tests;
 mod stripe;
 mod tiers;
 mod billing;
@@ -882,6 +885,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/retention/holds/{bot}", put(retention::put_hold).delete(retention::delete_hold))
         .route("/backups", get(server_backups::get).post(server_backups::copy_now))
         .route("/database", get(database_encryption::get))
+        .route("/support/bundle", get(support::bundle))
         .route("/secrets", get(list_secrets))
         .route("/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/me/tier", get(my_tier))

@@ -23,6 +23,7 @@ pub const SECTIONS: &[(&str, &str)] = &[
     ("sso", "Single sign-on"),
     ("ops", "Operations"),
     ("security", "Security pack"),
+    ("support", "Support"),
     ("adr", "Decisions"),
     ("background", "Background"),
 ];
