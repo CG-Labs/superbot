@@ -8879,6 +8879,9 @@ mod tests {
         assert!(!db.grant_scim_role(&org, &b.id), "never over a role given by hand");
         assert!(matches!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view", "bots.manage"])), Err(RoleError::Reaches { .. })), "checked as it's saved");
         assert!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view"])).is_ok());
+        assert!(db.revoke_scim_role(&org, &a.id, true).is_none(), "a leave that a rejoin overtook keeps the server-wide grant");
+        assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Member, Some(r.id.clone())));
+        assert_eq!(db.scim_role_grants(&org.id).len(), 1);
         let back = db.revoke_scim_role(&org, &a.id, false).unwrap();
         assert_eq!((back.cleared, back.role_before, back.role_after), (true, Some(Role::Member), Some(Role::Readonly)));
         assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Readonly, None));
