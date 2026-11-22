@@ -209,6 +209,9 @@ pub struct App {
     /// Per Bot: a run holds it shared while it runs, and the retention pass alone while it
     /// deletes harness session files, so it never deletes from under a run (ADR 0112).
     session_files: Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>,
+    /// Held by each deleting step of file retention, which reads holds after taking it,
+    /// and by placing a hold: a hold placed is kept by every step after (ADR 0112).
+    pub deleting_files: tokio::sync::Mutex<()>,
     /// Runs at once on each computer, and the runs waiting their turn (ADR 0073).
     pub slots: Arc<Slots>,
     /// MAX_CONCURRENT_RUNS: runs at once on this server, and on a machine whose owner's
@@ -274,6 +277,7 @@ impl App {
             isolation: OnceLock::new(),
             on_machines: Mutex::default(),
             session_files: Mutex::default(),
+            deleting_files: tokio::sync::Mutex::default(),
             slots: Arc::default(),
             run_cap: OnceLock::new(),
             shared_bots: OnceLock::new(),

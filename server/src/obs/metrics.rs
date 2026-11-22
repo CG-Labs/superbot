@@ -149,6 +149,7 @@ impl Window {
 struct Inner {
     http: BTreeMap<(&'static str, &'static str, &'static str), u64>,
     http_seconds: BTreeMap<&'static str, Histogram>,
+    runs_started: BTreeMap<&'static str, u64>,
     runs: BTreeMap<(&'static str, &'static str), u64>,
     run_seconds: BTreeMap<&'static str, Histogram>,
     runs_active: BTreeMap<&'static str, i64>,
@@ -245,7 +246,9 @@ impl Metrics {
 
     pub fn run_started(&self, harness_name: &str) -> Active<'_> {
         let h = harness(harness_name);
-        *self.lock().runs_active.entry(h).or_default() += 1;
+        let mut m = self.lock();
+        *m.runs_started.entry(h).or_default() += 1;
+        *m.runs_active.entry(h).or_default() += 1;
         Active { m: self, harness: h }
     }
 
@@ -340,6 +343,10 @@ impl Metrics {
         family(out, "superbot_http_request_duration_seconds", "histogram", "Time to answer a request (to the first byte of a stream), by route class.");
         for (class, h) in &m.http_seconds {
             histogram(out, "superbot_http_request_duration_seconds", &[("route_class", class)], &HTTP_BUCKETS, h);
+        }
+        family(out, "superbot_runs_started_total", "counter", "Bot runs that started (took a slot and called their harness), by harness.");
+        for (harness, n) in &m.runs_started {
+            sample(out, "superbot_runs_started_total", &[("harness", harness)], *n as f64);
         }
         family(out, "superbot_runs_total", "counter", "Bot runs that finished, by harness and result.");
         for ((harness, result), n) in &m.runs {
@@ -451,6 +458,7 @@ mod tests {
         assert!(out.contains(r#"superbot_http_requests_total{route_class="bots",method="other",status_class="4xx"} 1"#), "{out}");
         assert!(out.contains(r#"superbot_runs_total{harness="other",result="other"} 1"#), "{out}");
         assert!(out.contains(r#"superbot_runs_active{harness="other"} 0"#), "{out}");
+        assert!(out.contains(r#"superbot_runs_started_total{harness="other"} 1"#), "{out}");
         assert!(out.contains(r#"superbot_events_total{event="auth.login_failed",outcome="failure"} 1"#), "{out}");
         assert!(out.contains(r#"superbot_runs_refused_total{reason="other"} 1"#), "{out}");
         assert!(out.contains(r#"superbot_signin_failures_total{method="totp"} 1"#), "{out}");

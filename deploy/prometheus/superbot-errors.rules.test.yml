@@ -1,0 +1,189 @@
+# promtool test rules superbot-errors.rules.test.yml
+rule_files:
+  - superbot-errors.rules.yml
+
+evaluation_interval: 30s
+
+tests:
+  # Half of claude's runs fail; codex is fine; hermes failed once, too few runs to judge.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_runs_total{job="superbot",harness="claude",result="done"}'
+        values: '0+2x60'
+      - series: 'superbot_runs_total{job="superbot",harness="claude",result="error"}'
+        values: '0+1x60'
+      - series: 'superbot_runs_total{job="superbot",harness="claude",result="timeout"}'
+        values: '0+1x60'
+      - series: 'superbot_runs_total{job="superbot",harness="claude",result="stopped"}'
+        values: '0+20x60'
+      - series: 'superbot_runs_total{job="superbot",harness="codex",result="done"}'
+        values: '0+5x60'
+      - series: 'superbot_runs_total{job="superbot",harness="codex",result="error"}'
+        values: '0x60'
+      - series: 'superbot_runs_total{job="superbot",harness="hermes",result="error"}'
+        values: '0x20 1x40'
+    promql_expr_test:
+      - expr: superbot:runs_failed_by_harness:ratio_rate30m{harness="claude"}
+        eval_time: 45m
+        exp_samples:
+          - labels: 'superbot:runs_failed_by_harness:ratio_rate30m{job="superbot",harness="claude"}'
+            value: 0.5
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SuperBotHarnessRunsFailing
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: SuperBotHarnessRunsFailing
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              harness: claude
+            exp_annotations:
+              summary: "Bot runs on claude are failing"
+              description: "50% of claude runs in the last 30 minutes ended in error or timeout. Check the harness's CLI version and login, its model provider's status, and botd's run.finished log lines for that harness."
+
+  # Stopped and interrupted runs aren't failures.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_runs_total{job="superbot",harness="pi",result="done"}'
+        values: '0+1x60'
+      - series: 'superbot_runs_total{job="superbot",harness="pi",result="stopped"}'
+        values: '0+9x60'
+      - series: 'superbot_runs_total{job="superbot",harness="pi",result="interrupted"}'
+        values: '0+9x60'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: SuperBotHarnessRunsFailing
+        exp_alerts: []
+
+  # A tenth of bots requests fail; every approvals request fails but there are few of
+  # them; the status page's 503s don't count.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_http_requests_total{job="superbot",route_class="bots",method="GET",status_class="2xx"}'
+        values: '0+90x60'
+      - series: 'superbot_http_requests_total{job="superbot",route_class="bots",method="POST",status_class="5xx"}'
+        values: '0+10x60'
+      - series: 'superbot_http_requests_total{job="superbot",route_class="approvals",method="POST",status_class="5xx"}'
+        values: '0x30 1x30'
+      - series: 'superbot_http_requests_total{job="superbot",route_class="status",method="GET",status_class="5xx"}'
+        values: '0+100x60'
+    promql_expr_test:
+      - expr: superbot:http_request_errors_by_route_class:ratio_rate10m{route_class="bots"}
+        eval_time: 30m
+        exp_samples:
+          - labels: 'superbot:http_request_errors_by_route_class:ratio_rate10m{job="superbot",route_class="bots"}'
+            value: 0.1
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: SuperBotRouteClassErrors
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: SuperBotRouteClassErrors
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              route_class: bots
+            exp_annotations:
+              summary: "botd's bots routes are failing"
+              description: "10% of bots requests in the last 10 minutes were answered with a 5xx. Check the error tracker (ERROR_REPORT_DSN) or botd's http.request log lines at level warn for that routeClass."
+
+  # One failure in a hundred is under the line.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_http_requests_total{job="superbot",route_class="machines",method="GET",status_class="2xx"}'
+        values: '0+99x60'
+      - series: 'superbot_http_requests_total{job="superbot",route_class="machines",method="GET",status_class="5xx"}'
+        values: '0+1x60'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: SuperBotRouteClassErrors
+        exp_alerts: []
+
+  # One panic: the ticket opens, then clears once it's out of the window.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_panics_total{job="superbot",instance="botd:9464"}'
+        values: '0x10 1x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SuperBotPanics
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: SuperBotPanics
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: botd:9464
+            exp_annotations:
+              summary: botd panicked
+              description: "botd at botd:9464 panicked in the last 15 minutes. A request that panics answers 500; a task that panics stops. Find it in the error tracker or botd's server.panic log line, and its message in botd's stderr."
+      - eval_time: 30m
+        alertname: SuperBotPanics
+        exp_alerts: []
+
+  # Runs wait for a slot without a break for over 30 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_runs_waiting{job="superbot",instance="botd:9464"}'
+        values: '0x5 2x45'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SuperBotRunQueueBacklog
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: SuperBotRunQueueBacklog
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: botd:9464
+            exp_annotations:
+              summary: Bot runs have waited for a slot for 30 minutes
+              description: "2 runs at botd:9464 are waiting for a run slot, and some have been waiting for 30 minutes without a break. Raise MAX_CONCURRENT_RUNS or a tier's concurrentRuns (ADR 0073), or look for runs that don't finish."
+
+  # A queue that drains now and then is a busy server, not a backlog.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_runs_waiting{job="superbot",instance="botd:9464"}'
+        values: '3x10 0 3x10 0 3x10 0 3x10'
+    alert_rule_test:
+      - eval_time: 44m
+        alertname: SuperBotRunQueueBacklog
+        exp_alerts: []
+
+  # The tracker refuses reports; reports dropped over the rate limit alone don't page.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_error_reports_total{job="superbot",instance="botd:9464",kind="http_5xx",outcome="failed"}'
+        values: '0x5 2x40'
+      - series: 'superbot_error_reports_total{job="superbot",instance="botd:9464",kind="http_5xx",outcome="sent"}'
+        values: '0+1x45'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: SuperBotErrorReportsFailing
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: SuperBotErrorReportsFailing
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: botd:9464
+            exp_annotations:
+              summary: botd's error reports aren't reaching the error tracker
+              description: "The error tracker refused or didn't answer reports from botd at botd:9464 in the last 30 minutes, so panics and 5xx answers may be missing there. Check ERROR_REPORT_DSN, the tracker's rate limits, and botd's log for \"error tracker\"."
+
+  - interval: 1m
+    input_series:
+      - series: 'superbot_error_reports_total{job="superbot",instance="botd:9464",kind="http_5xx",outcome="dropped"}'
+        values: '0+5x30'
+      - series: 'superbot_error_reports_total{job="superbot",instance="botd:9464",kind="http_5xx",outcome="failed"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SuperBotErrorReportsFailing
+        exp_alerts: []

@@ -81,11 +81,13 @@ fn metrics_are_off_by_default_and_need_a_token_off_loopback() {
 }
 
 #[test]
-fn bots_never_get_the_metrics_token() {
-    assert!(secrets::server_secret("METRICS_TOKEN"));
+fn bots_never_get_the_metrics_token_or_the_error_tracker_dsn() {
     let withheld = adapters::secret_env();
-    assert!(withheld.iter().any(|k| k == "METRICS_TOKEN"));
-    assert!(withheld.iter().any(|k| k == "METRICS_TOKEN_FILE"));
+    for k in ["METRICS_TOKEN", "ERROR_REPORT_DSN"] {
+        assert!(secrets::server_secret(k), "{k}");
+        assert!(withheld.iter().any(|w| *w == k), "{k}");
+        assert!(withheld.iter().any(|w| *w == format!("{k}_FILE")), "{k}_FILE");
+    }
 }
 
 #[tokio::test]
@@ -200,6 +202,7 @@ async fn runs_are_counted_by_harness_and_result_and_logged_with_their_ids() {
     let m = obs::render(&app);
     assert_eq!(total(&m, done), 1.0, "{m}");
     assert_eq!(total(&m, r#"superbot_run_duration_seconds_count{harness="claude"}"#), 1.0, "{m}");
+    assert_eq!(total(&m, r#"superbot_runs_started_total{harness="claude"}"#), 1.0, "{m}");
     assert_eq!(total(&m, r#"superbot_runs_active{harness="claude"}"#), 0.0, "{m}");
     assert_eq!(total(&m, "superbot_runs_waiting"), 0.0, "{m}");
 
@@ -254,4 +257,120 @@ async fn machines_and_the_reconciler_show_when_the_control_plane_is_on() {
     assert!(total(&m, "superbot_machine_reconcile_last_pass_timestamp_seconds") > 1.0e9, "{m}");
     assert_eq!(total(&m, r#"superbot_machines{state="running"}"#), 0.0, "{m}");
     assert!(m.contains(r#"superbot_machines{state="pending"} 0"#) && !m.contains(r#"state="destroyed""#), "{m}");
+}
+
+#[tokio::test]
+async fn panics_and_5xx_answers_reach_the_error_tracker_without_what_was_said() {
+    use axum::routing::{get, post};
+    use std::sync::{Arc, Mutex};
+    let (_, app, _, _) = serve_app().await;
+    let got: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let seen = got.clone();
+    let tracker = axum::Router::new().route(
+        "/api/9/envelope/",
+        post(move |h: axum::http::HeaderMap, body: String| {
+            let seen = seen.clone();
+            async move {
+                let auth = h.get("x-sentry-auth").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                seen.lock().unwrap().push((auth, body));
+                "{}"
+            }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let tracker_port = l.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(l, tracker).await });
+
+    let key = format!("pk{}", random_hex(8));
+    let dsn = format!("http://{key}@127.0.0.1:{tracker_port}/9");
+    let s = obs::errors::Settings::from_env(&|k| if k == "ERROR_REPORT_ENVIRONMENT" { "ci".into() } else { String::new() }, &EnvStore::fixed(&[("ERROR_REPORT_DSN", &dsn)])).unwrap();
+    assert!(s.describe().contains("127.0.0.1") && !s.describe().contains(&key), "{}", s.describe());
+    let mine = format!("errtest{}-", random_hex(4));
+    *obs::errors::ONLY_REQUESTS.lock().unwrap() = Some(mine.clone());
+    obs::errors::install_panic_hook();
+    obs::errors::start(&s);
+
+    let prompt = format!("summarise the board minutes {}", random_hex(4));
+    let said = prompt.clone();
+    let routes = axum::Router::new()
+        .route("/api/boom/{id}", get(move || async move { panic!("{said}") }))
+        .route("/api/fail/{id}", get(|| async { (axum::http::StatusCode::BAD_GATEWAY, "upstream said: summarise the board minutes") }))
+        .route_layer(axum::middleware::from_fn(obs::note_route))
+        .layer(obs::catch_panics())
+        .layer(axum::middleware::from_fn_with_state(app.clone(), obs::track))
+        .with_state(app.clone());
+    let l = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(l, routes).await });
+
+    let (code, _, body) = call_with(port, "GET", "/api/boom/ada@example.com", "", &format!("X-Request-Id: {mine}boom\r\n"), "").await;
+    assert_eq!((code, parse(&body)["error"].as_str()), (500, Some("Internal error")), "a panic answers 500: {body}");
+    let (code, _, _) = call_with(port, "GET", "/api/fail/ada@example.com", "", &format!("X-Request-Id: {mine}fail\r\n"), "").await;
+    assert_eq!(code, 502);
+    for _ in 0..200 {
+        if got.lock().unwrap().len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let m = obs::render(&app);
+    obs::errors::stop();
+    *obs::errors::ONLY_REQUESTS.lock().unwrap() = None;
+
+    let got = got.lock().unwrap().clone();
+    assert_eq!(got.len(), 3, "a panic and two 5xx: {got:?}");
+    let events: Vec<Value> = got
+        .iter()
+        .map(|(auth, body)| {
+            assert!(auth.contains(&format!("sentry_key={key}")), "{auth}");
+            for bad in [prompt.as_str(), "board minutes", "ada@", "example.com"] {
+                assert!(!body.contains(bad), "{bad} reached the tracker: {body}");
+            }
+            serde_json::from_str(body.lines().nth(2).unwrap()).unwrap()
+        })
+        .collect();
+    let panic = events.iter().find(|e| e["tags"]["kind"] == "panic").expect("the panic");
+    assert_eq!((panic["level"].as_str(), panic["tags"]["request_id"].as_str()), (Some("fatal"), Some(format!("{mine}boom").as_str())), "{panic}");
+    assert!(panic["tags"]["location"].as_str().is_some_and(|l| l.contains("src/obs_http_tests.rs:")), "{panic}");
+    assert_eq!(panic["exception"]["values"][0]["value"], "panic (message withheld; see botd's log)");
+    assert_eq!((panic["environment"].as_str(), panic["platform"].as_str()), (Some("ci"), Some("native")));
+    let http: Vec<(&str, &str)> = events.iter().filter(|e| e["tags"]["kind"] == "http_5xx").map(|e| (e["tags"]["route"].as_str().unwrap(), e["tags"]["status"].as_str().unwrap())).collect();
+    assert!(http.contains(&("/api/boom/{id}", "500")) && http.contains(&("/api/fail/{id}", "502")), "{http:?}");
+
+    assert!(total(&m, "superbot_panics_total") >= 1.0, "{m}");
+    assert_eq!(total(&m, "superbot_error_reporting_enabled"), 1.0, "{m}");
+    assert!(total(&m, r#"superbot_error_reports_total{kind="panic",outcome="sent"}"#) >= 1.0, "{m}");
+    assert!(total(&m, r#"superbot_error_reports_total{kind="http_5xx",outcome="sent"}"#) >= 2.0, "{m}");
+    assert_eq!(total(&m, r#"superbot_http_requests_total{route_class="api_other",method="GET",status_class="5xx"}"#), 2.0, "{m}");
+    let line = captured::with(&format!("{mine}boom")).into_iter().find(|l| l["msg"] == "server.panic").expect("a server.panic line");
+    assert!(!line.to_string().contains(&prompt), "{line}");
+}
+
+#[tokio::test]
+async fn the_service_dashboard_and_error_rules_use_only_metrics_botd_writes() {
+    let (_, app, _, _) = serve_app().await;
+    let m = obs::render(&app);
+    let types: std::collections::BTreeSet<String> = m.lines().filter_map(|l| Some(l.strip_prefix("# TYPE ")?.split(' ').next()?.to_string())).collect();
+    for (file, text) in [
+        ("deploy/grafana/superbot-service.json", include_str!("../../deploy/grafana/superbot-service.json")),
+        ("deploy/prometheus/superbot-errors.rules.yml", include_str!("../../deploy/prometheus/superbot-errors.rules.yml")),
+    ] {
+        let used: std::collections::BTreeSet<String> = crate::machines_placement_tests::metric_names(text)
+            .into_iter()
+            .map(|n| ["_bucket", "_sum", "_count"].iter().find_map(|s| n.strip_suffix(s).filter(|b| types.contains(*b))).map_or(n.clone(), String::from))
+            .collect();
+        assert!(!used.is_empty(), "{file}");
+        let missing: Vec<_> = used.difference(&types).collect();
+        assert!(missing.is_empty(), "{file} uses metrics botd doesn't write: {missing:?}");
+    }
+    let dashboard: Value = serde_json::from_str(include_str!("../../deploy/grafana/superbot-service.json")).unwrap();
+    let panels = dashboard["panels"].as_array().unwrap();
+    let ids: std::collections::BTreeSet<u64> = panels.iter().filter_map(|p| p["id"].as_u64()).collect();
+    assert_eq!(ids.len(), panels.len(), "every panel has its own id");
+    for p in panels.iter().filter(|p| p["type"] != "row") {
+        for t in p["targets"].as_array().unwrap() {
+            let e = t["expr"].as_str().unwrap();
+            assert!(e.contains(r#"job="$job""#) && e.contains(r#"instance=~"$instance""#), "{}: {e}", p["title"]);
+        }
+    }
 }
