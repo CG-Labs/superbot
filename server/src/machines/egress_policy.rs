@@ -132,6 +132,8 @@ fn enrollment(app: &App) -> Res<&std::sync::Arc<Enrollment>> {
 /// every heartbeat.
 static SENT: Mutex<Option<HashMap<String, (String, i64)>>> = Mutex::new(None);
 
+static PUSHING: Mutex<Option<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> = Mutex::new(None);
+
 fn mark_sent(machine_id: &str, id: &str) {
     SENT.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(machine_id.into(), (id.into(), now()));
 }
@@ -156,6 +158,10 @@ pub fn in_place(p: &EgressPolicy, hb: Option<&EgressReport>) -> bool {
 
 /// Sends `m`'s agent its policy now. Its answer: how the rules stand there.
 pub async fn push(app: &App, e: &Enrollment, m: &Machine) -> Result<EgressReport, String> {
+    // Read and sent under one lock per machine, so an older, wider list can't reach
+    // the agent after a newer one.
+    let lock = PUSHING.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(m.id.clone()).or_default().clone();
+    let _held = lock.lock().await;
     let p = effective(app, &m.user_id);
     mark_sent(&m.id, &p.id);
     match e.call_agent(app, m, reqwest::Method::PUT, "/v1/egress-policy", &p).await {

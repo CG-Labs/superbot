@@ -182,6 +182,11 @@ pub fn load(nft: &std::path::Path, script: &str) -> Result<(), String> {
     }
 }
 
+/// Hosts looked up at once, and how long a whole list may take: a policy change waits
+/// behind a load, so a list of slow hosts mustn't hold the next one back for long.
+const RESOLVE_PARALLEL: usize = 16;
+const RESOLVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// `list`'s addresses: its CIDRs, and each host's addresses from `resolve` (at most
 /// `EGRESS_MAX_ADDRESSES_PER_HOST` each, as /32 or /128). Also the hosts that gave none.
 pub async fn addresses<F, Fut>(list: &[Entry], resolve: F) -> (Vec<String>, Vec<String>)
@@ -189,12 +194,24 @@ where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Vec<IpAddr>>,
 {
+    use futures_util::StreamExt;
+    let deadline = tokio::time::Instant::now() + RESOLVE_DEADLINE;
+    let hosts: Vec<String> = list.iter().filter_map(|e| if let Entry::Host(h) = e { Some(h.clone()) } else { None }).collect();
+    let resolved: Vec<Vec<IpAddr>> = futures_util::stream::iter(hosts)
+        .map(|h| {
+            let look = resolve(h);
+            async move { tokio::time::timeout_at(deadline, look).await.unwrap_or_default() }
+        })
+        .buffered(RESOLVE_PARALLEL)
+        .collect()
+        .await;
+    let mut resolved = resolved.into_iter();
     let (mut out, mut unresolved) = (Vec::new(), Vec::new());
     for e in list {
         match e {
             Entry::Net(n) => out.push(n.clone()),
             Entry::Host(h) => {
-                let mut ips = resolve(h.clone()).await;
+                let mut ips = resolved.next().unwrap_or_default();
                 ips.sort();
                 ips.dedup();
                 if ips.is_empty() {

@@ -1671,13 +1671,13 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
     };
     // A run the agent can't hold to its limits still runs, and its exit says why.
     host.limits = j.limits.map(|l| match &a.cgroups {
-        Ok(cg) => match {
+        Ok(cg) => {
             let (cpus, memory) = machine_size(cg.base());
-            cg.resize(cpus, memory).and_then(|()| cg.start(&j.job_id, &l))
-        } {
-            Ok(rc) => job::Limiting::Cgroup(Arc::new(rc)),
-            Err(e) => job::Limiting::Unavailable(e),
-        },
+            match cg.resize(cpus, memory).and_then(|()| cg.start(&j.job_id, &l)) {
+                Ok(rc) => job::Limiting::Cgroup(Arc::new(rc)),
+                Err(e) => job::Limiting::Unavailable(e),
+            }
+        }
         Err(e) => job::Limiting::Unavailable(e.clone()),
     });
     let (ev_tx, ev_rx) = mpsc::channel::<wire::JobEvent>(256);
