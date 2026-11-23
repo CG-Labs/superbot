@@ -1,6 +1,6 @@
 # Air-gapped installs
 
-SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md), signatures and multi-arch indexes in mirrors in [ADR 0147](../adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md), how every release's bundles are checked end to end in [ADR 0172](../adr/0172-release-bundles-checked-end-to-end.md), harness installs on users' machines from your own mirrors in [ADR 0186](../adr/0186-harness-installs-from-internal-mirrors.md), and Hermes Agent from a Hermes bundle in [ADR 0200](../adr/0200-hermes-agent-bundle-for-air-gapped-installs.md).
+SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md), signatures and multi-arch indexes in mirrors in [ADR 0147](../adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md), how every release's bundles are checked end to end in [ADR 0172](../adr/0172-release-bundles-checked-end-to-end.md), harness installs on users' machines from your own mirrors in [ADR 0186](../adr/0186-harness-installs-from-internal-mirrors.md), Hermes Agent from a Hermes bundle in [ADR 0200](../adr/0200-hermes-agent-bundle-for-air-gapped-installs.md), and Hermes Agent on users' machines from that bundle in [ADR 0210](../adr/0210-hermes-agent-on-air-gapped-machines.md).
 
 ## What a bundle holds
 
@@ -155,7 +155,7 @@ Then it stops botd, swaps the tree into `/opt/hermes` (root-owned, linked from `
 
 An `--upgrade` without `--with-hermes` keeps the Hermes Agent you have. When the new release pins another commit, the installer says so: re-run with `--with-hermes --hermes-bundle` and that release's Hermes bundle.
 
-Hermes Agent on users' own machines still needs the internet ([below](#harness-clis-on-users-machines)).
+Users' own machines get Hermes Agent from the same bundle, through botd ([below](#hermes-agent-on-users-machines)).
 
 ## Docker Compose
 
@@ -245,7 +245,22 @@ botd fetches every file the harness plan names, from where machines would and tr
 
 **Agents:** a machine's agent needs this release or later to use the npm registry or the CA, since older ones would refuse the plan or fetch from npm's registry: botd doesn't send them a plan with mirrors in it, and `botctl machine harnesses <user>` says to upgrade first. Agents upgrade from botd itself, over the control plane, so `botctl machine upgrade <user>` (or `MACHINE_AGENT_UPGRADES=auto`) works with no internet. A mirror for Node.js alone needs no upgrade.
 
-**Hermes Agent** has no npm package: its installer, pinned by SHA-256, clones its code from GitHub and its Python packages from PyPI, which no mirror setting covers. Leave `hermes` out of `MACHINE_HARNESSES` on machines without the internet, and set it explicitly: unset, it defaults to the managed tiers' harness, Hermes on the shipped plans. botd's startup log and `botctl machine mirror` name any harness still fetched from the internet.
+### Hermes Agent on users' machines
+
+Hermes Agent has no npm package, and its installer reaches GitHub and PyPI, which no mirror setting covers. Machines get it from botd instead, from the [Hermes bundle](#hermes-agent) you carry in for the server ([ADR 0210](../adr/0210-hermes-agent-on-air-gapped-machines.md)). Put the bundle for each of your machines' arches on botd's server, with its `.sha256` beside it, and name them in `.env`:
+
+```sh
+MACHINE_HERMES_BUNDLE=/var/lib/superbot/superbot-hermes-v0.23.3-x86_64.tar.gz,/var/lib/superbot/superbot-hermes-v0.23.3-aarch64.tar.gz
+```
+
+- Each is an absolute path, readable by botd's user, at most one per arch. Instead of the `.sha256` file, give the SHA-256 you recorded: `<path>=<sha-256>`. It needs `MACHINE_CONTROL_URL`.
+- At start, botd checks each bundle in full as `install.sh` does: its SHA-256, its files against `SHA256SUMS`, its `MANIFEST` (for `/opt/hermes`), and every entry of its tree. Each must hold the Hermes commit machines' plan pins, the same one the server's bundle holds. botd won't start otherwise, and names the file.
+- botd serves them to enrolled machines only, over the machine port's mutual TLS. Machines reach that port anyway, so no firewall changes.
+- Each machine's agent downloads its arch's bundle and checks its SHA-256. It unpacks and checks the tree in a root-only folder beside `/opt/hermes`, moves it in, and runs `hermes-share.sh` there. If anything fails, it puts the previous `/opt/hermes` back. A machine needs about 1 GB free for the download and 2.7 GB under `/opt`, twice that while it replaces an earlier one.
+- `botctl machine mirror` reads each bundle again and checks it against its SHA-256. After you replace a bundle file (for a release that moves the Hermes pin), restart botd.
+- Agents need this release or later. botd doesn't send older ones the plan, and `botctl machine harnesses <user>` says to upgrade first (`botctl machine upgrade <user>`).
+
+Without `MACHINE_HERMES_BUNDLE`, machines run Hermes's installer, which needs the internet. Then leave `hermes` out of `MACHINE_HARNESSES` and set it explicitly: unset, it defaults to the managed tiers' harness, Hermes on the shipped plans. botd's startup log and `botctl machine mirror` name any harness still fetched from the internet.
 
 ## Model providers
 
@@ -264,7 +279,7 @@ Logins that go through a vendor's website (`claude login`, `codex login`) don't 
 | Sign-in | Password, TOTP, and SSO against an identity provider inside your network (ADFS, Keycloak or another OIDC/SAML IdP); cloud IdPs (Entra, Google, GitHub, Apple) only if the server can reach them |
 | Harness CLIs on this server | Claude Code, Codex and Pi download from the internet: install from your npm mirror instead, or use the published image |
 | `--with-hermes` | Downloads Hermes Agent: with `--offline`, give `--hermes-bundle` ([Hermes Agent](#hermes-agent)) |
-| Harness CLIs on users' machines | Claude Code, Codex and Pi from your Node.js and npm mirrors ([above](#harness-clis-on-users-machines)); Hermes Agent needs GitHub and PyPI |
+| Harness CLIs on users' machines | Claude Code, Codex and Pi from your Node.js and npm mirrors ([above](#harness-clis-on-users-machines)); Hermes Agent from botd's Hermes bundle (`MACHINE_HERMES_BUNDLE`, [above](#hermes-agent-on-users-machines)) |
 | Billing (Stripe), push notifications (`PUSH_PROVIDER=expo`), Turnstile on the sign-up form | Need the internet: leave them off (the default) |
 | Managed machines on Linode | Need the internet: use Incus hosts inside your network, or none |
 | Off-host backups | An S3-compatible store inside your network (MinIO, Ceph) |
