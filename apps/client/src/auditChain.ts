@@ -1,4 +1,4 @@
-import type { AuditChainState, AuditCheckpoint, AuditExportState, AuditVerification } from "./types";
+import type { AuditChainState, AuditCheckpoint, AuditExportSink, AuditExportState, AuditVerification } from "./types";
 
 /** What the panel says about one part of the chain, and whether it's good news. */
 export interface ChainLine {
@@ -51,10 +51,21 @@ export function timestampLine(s: AuditChainState): ChainLine {
 
 export function exportLine(x: AuditExportState): ChainLine {
   if (!x.enabled) return { label: "SIEM export", text: "Off (AUDIT_EXPORT)", tone: "dim" };
-  if (x.failing) return { label: "SIEM export", text: `Failing to ${x.sink}: ${x.lastError ?? "no answer"}. ${x.pending} waiting.`, tone: "bad" };
+  return sinkLine(x);
+}
+
+/** One line per sink: a SIEM and an archive side by side (ADR 0173). */
+export function exportLines(x: AuditExportState): ChainLine[] {
+  if (!x.enabled || !x.sinks?.length) return [exportLine(x)];
+  return x.sinks.map(sinkLine);
+}
+
+function sinkLine(x: AuditExportSink): ChainLine {
+  const label = x.kind === "s3" ? "Archive" : "SIEM export";
+  if (x.failing) return { label, text: `Failing to ${x.sink}: ${x.lastError ?? "no answer"}. ${x.pending} waiting.`, tone: "bad" };
   const a = x.archive;
   const lock = !a ? "" : a.lock === "off" ? ", objects not locked" : a.lastObject?.retainUntil ? `, last object locked (${a.lastObject.lockMode ?? a.lock}) until ${when(a.lastObject.retainUntil)}` : "";
-  return { label: "SIEM export", text: `${x.sink}: ${x.pending} behind, last delivery ${when(x.deliveredAt)}${lock}`, tone: x.pending > 1000 || a?.lock === "off" ? "warn" : "ok" };
+  return { label, text: `${x.sink}: ${x.pending} behind, last delivery ${when(x.deliveredAt)}${lock}`, tone: x.pending > 1000 || a?.lock === "off" ? "warn" : "ok" };
 }
 
 /** Every line, in the order the panel shows them. */
@@ -64,6 +75,6 @@ export function chainLines(s: AuditChainState): ChainLine[] {
     { label: "Head", text: s.head ? `Event ${s.head.id} · ${shortHash(s.head.hash)}` : "No events yet", tone: "dim" },
     checkpointLine(s.checkpoints.last, s.checkpoints.everyMinutes),
     timestampLine(s),
-    exportLine(s.export),
+    ...exportLines(s.export),
   ];
 }

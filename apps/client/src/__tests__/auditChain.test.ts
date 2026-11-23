@@ -1,4 +1,4 @@
-import { chainLines, checkpointLine, exportLine, shortHash, timestampLine, verificationLine } from "../auditChain";
+import { chainLines, checkpointLine, exportLine, exportLines, shortHash, timestampLine, verificationLine } from "../auditChain";
 import type { AuditChainState, AuditCheckpoint } from "../types";
 
 const HASH = "ab".repeat(32);
@@ -75,6 +75,19 @@ describe("audit chain lines (ADR 0149)", () => {
     const on = { enabled: true as const, kind: "s3", sink: "s3://audit/prod", delivered: 40, pending: 0, deliveredAt: null, failing: false, lastError: null, archive };
     expect(exportLine(on)).toMatchObject({ tone: "ok", text: expect.stringContaining("last object locked (compliance) until") });
     expect(exportLine({ ...on, archive: { ...archive, lock: "off" as const, lastObject: null } })).toMatchObject({ tone: "warn", text: expect.stringContaining("objects not locked") });
+  });
+
+  it("shows a SIEM and an archive side by side, each with its own state", () => {
+    const archive = { endpoint: "https://s3.example", bucket: "audit", prefix: "prod", lock: "bucket" as const, retainDays: null, batchSeconds: 300, lastObject: null };
+    const siem = { kind: "webhook", sink: "https://siem.example", delivered: 30, pending: 13, deliveredAt: null, failing: true, lastError: "answered HTTP 503" };
+    const s3 = { kind: "s3", sink: "s3://audit/prod", delivered: 43, pending: 0, deliveredAt: null, failing: false, lastError: null, archive };
+    const both = { enabled: true as const, ...siem, sinks: [siem, s3] };
+    expect(exportLines(both)).toEqual([
+      { label: "SIEM export", text: "Failing to https://siem.example: answered HTTP 503. 13 waiting.", tone: "bad" },
+      { label: "Archive", text: "s3://audit/prod: 0 behind, last delivery never", tone: "ok" },
+    ]);
+    expect(chainLines(chainState({ export: both })).map((l) => l.label).slice(-2)).toEqual(["SIEM export", "Archive"]);
+    expect(exportLines({ enabled: false })).toEqual([exportLine({ enabled: false })]);
   });
 
   it("lists every part in order", () => {
