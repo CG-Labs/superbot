@@ -238,7 +238,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
     times: YYYY-MM-DD (UTC), RFC 3339, or unix milliseconds
   botctl support-bundle [-o <file>]                Save a support bundle for a ticket (ADR 0131): version,
                                                    redacted settings, health, recent logs and an audit
-                                                   summary, in a tar; no secrets, emails or chats
+                                                   summary, in a tar; no secrets, emails or chats. When botd
+                                                   is down: botd support bundle (or botd support check), ADR 0187
   botctl health-score [--days <n>] [json]          The customer health score (ADR 0144) for the last 30 days
                                                    (7 to 90): adoption, Bot runs, sign-in and SCIM, backups,
                                                    approvals and the license, each ok, watch or at risk
@@ -2107,7 +2108,7 @@ fn save_private(path: &str, bytes: &[u8]) -> Result<(), String> {
 
 fn support_bundle(rest: &[&str]) -> Result<String, String> {
     let out = bundle_out(rest)?;
-    let (code, head, body) = exchange_bytes(Cred::Operator, "GET", "/api/support/bundle")?;
+    let (code, head, body) = exchange_bytes(Cred::Operator, "GET", "/api/support/bundle").map_err(offline_hint)?;
     if !(200..300).contains(&code) {
         return Err(failure(code, &String::from_utf8_lossy(&body)));
     }
@@ -2117,6 +2118,15 @@ fn support_bundle(rest: &[&str]) -> Result<String, String> {
         "Saved {path} ({} KB). It has no secrets, emails or chats, but read it before you attach it to a ticket:\n  tar -tvf {path}\n  tar -xOf {path} | less",
         body.len().div_ceil(1024)
     ))
+}
+
+/// Says how to make a bundle without botd when it can't be reached (ADR 0187).
+fn offline_hint(e: String) -> String {
+    if e.starts_with("Can't reach the server") {
+        format!("{e}\nbotd isn't answering. On the server, botd support bundle makes one without it, and botd support check says what's wrong (docs/support/support-check.md).")
+    } else {
+        e
+    }
 }
 
 /// `botctl support-report`: needs no botd, only the ticket system's export.
@@ -2328,6 +2338,13 @@ mod tests {
         assert_eq!(failure(403, r#"{"error":"not allowed"}"#), "not allowed (HTTP 403)");
         assert_eq!(failure(502, "Bad Gateway"), "Bad Gateway (HTTP 502)");
         assert_eq!(failure(400, r#"{"error":7}"#), r#"{"error":7} (HTTP 400)"#);
+    }
+
+    #[test]
+    fn a_support_bundle_without_botd_points_at_the_offline_one() {
+        let hint = offline_hint("Can't reach the server: Connection refused (os error 111)".into());
+        assert!(hint.contains("botd support bundle") && hint.contains("docs/support/support-check.md"), "{hint}");
+        assert_eq!(offline_hint("Missing SUPERBOT_TOKEN".into()), "Missing SUPERBOT_TOKEN");
     }
 
     #[test]
