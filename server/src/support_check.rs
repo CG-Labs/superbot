@@ -266,7 +266,8 @@ fn listen_addr(s: &Settings) -> String {
     if host.contains(':') && !host.starts_with('[') { format!("[{host}]:{port}") } else { format!("{host}:{port}") }
 }
 
-fn check_botd(s: &Settings, data_dir: &Path) -> Finding {
+/// `in_container`: run in a container of its own, which can't see another container's process or loopback.
+fn check_botd(s: &Settings, data_dir: &Path, in_container: bool) -> Finding {
     let locks = std::fs::read_to_string("/proc/locks").unwrap_or_default();
     let holder = lock_holder(&data_dir.join("app.sqlite-lock"), &locks);
     let addr = listen_addr(s);
@@ -278,7 +279,7 @@ fn check_botd(s: &Settings, data_dir: &Path) -> Finding {
             .fix("It may still be starting: schema changes on a large database take a while. If it stays like this, read its newest log lines (journalctl -u superbot -n 200, or docker compose logs --tail 200 botd)."),
         (None, true) => Finding::new("botd", Level::Warn, format!("/healthz answers on {addr}, but nothing holds this DATA_DIR's lock"))
             .fix("That botd uses another DATA_DIR. Point this check at its settings with --home or --env-file."),
-        (None, false) if Path::new("/.dockerenv").exists() => Finding::new("botd", Level::Info, "not seen from this container: a separate container can't see the botd service's process or its loopback port")
+        (None, false) if in_container => Finding::new("botd", Level::Info, "not seen from this container: a separate container can't see the botd service's process or its loopback port")
             .fix("docker compose ps says whether botd runs. While it does, run this check in it: docker compose exec botd botd support check."),
         (None, false) => Finding::new("botd", Level::Warn, "isn't running")
             .fix("Start it (sudo systemctl start superbot, or docker compose up -d). If it stops again, its last log lines say why; botd support bundle collects them for a ticket."),
@@ -636,7 +637,7 @@ pub fn run(s: &Settings, before_upgrade: bool, now_ms: i64) -> Report {
     let db = check_database(&data_dir, &keys);
     let (license, names) = check_license(s, &data_dir, now_ms);
     let findings = vec![
-        check_botd(s, &data_dir),
+        check_botd(s, &data_dir, Path::new("/.dockerenv").exists()),
         check_data_dir(&data_dir),
         check_disk(&data_dir, db.bytes, before_upgrade),
         db.finding,
@@ -1039,7 +1040,8 @@ mod tests {
         assert!(db.summary.starts_with("plain, ") && db.summary.contains(&format!("schema {0} of {0}", crate::db::schema_version())), "{}", db.summary);
         assert_eq!(db.details["integrity"], true);
         assert_eq!(finding(&r, "license").level, Level::Info, "testing mode");
-        assert_eq!(finding(&r, "botd").level, Level::Warn, "nothing runs on it");
+        let expected = if Path::new("/.dockerenv").exists() { Level::Info } else { Level::Warn };
+        assert_eq!(finding(&r, "botd").level, expected, "nothing runs on it");
         assert!(finding(&r, "backups").summary.contains("encrypted; botd copied the newest off this host"), "{}", finding(&r, "backups").summary);
         assert!(!r.failed());
         let text = r.text();
@@ -1181,7 +1183,7 @@ mod tests {
             assert!(String::from_utf8_lossy(&buf[..n]).starts_with("GET /healthz HTTP/1.0\r\n"));
             s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 11\r\n\r\n{\"ok\":true}").unwrap();
         });
-        let f = check_botd(&srv.settings(&[("PORT", &port), ("HOST", "0.0.0.0")]), &srv.data);
+        let f = check_botd(&srv.settings(&[("PORT", &port), ("HOST", "0.0.0.0")]), &srv.data, false);
         server.join().unwrap();
         if std::path::Path::new("/proc/locks").exists() {
             assert_eq!(f.level, Level::Ok, "{f:?}");
@@ -1189,7 +1191,11 @@ mod tests {
         }
         assert_eq!(f.details["healthz"], true);
         drop(lock);
-        assert_eq!(check_botd(&srv.settings(&[]), &srv.data).details["pid"], Value::Null, "released");
+        let gone = check_botd(&srv.settings(&[]), &srv.data, false);
+        assert_eq!((gone.level, &gone.details["pid"]), (Level::Warn, &Value::Null), "released");
+        let unseen = check_botd(&srv.settings(&[]), &srv.data, true);
+        assert_eq!(unseen.level, Level::Info, "a separate container can't tell");
+        assert!(unseen.fix.as_deref().unwrap_or_default().contains("docker compose exec"), "{unseen:?}");
     }
 
     #[test]
