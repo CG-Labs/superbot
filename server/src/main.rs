@@ -783,7 +783,7 @@ async fn main() {
         "sessionIdleMinutes": sessions.idle_ms / 60_000,
         "sessionMaxMinutes": sessions.max_ms / 60_000,
         "auditRetentionDays": retention,
-        "auditExport": audit_export.sink.as_ref().map(|s| json!({ "kind": s.kind(), "sink": s.shown })),
+        "auditExport": (!audit_export.sinks.is_empty()).then(|| audit_export.sinks.iter().map(|s| json!({ "kind": s.kind(), "sink": s.shown })).collect::<Vec<_>>()),
         "auditCheckpointMinutes": audit_checkpoints.every,
         "auditTimestamps": audit_checkpoints.tsa.as_ref().map(|t| json!({ "tsa": t.shown, "trustAnchors": audit_checkpoints.trust.len() })),
         "chatRetentionDays": chat_retention,

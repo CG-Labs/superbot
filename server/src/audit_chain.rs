@@ -763,8 +763,8 @@ pub async fn get(
     let archive = match o.archive {
         false => None,
         true => {
-            let Some((x, a)) = app.audit_export.get().and_then(|x| x.sink.archive().map(|a| (x, a))) else {
-                return Err((axum::http::StatusCode::CONFLICT, "There is no archive to check: archive=on needs AUDIT_EXPORT=s3://<bucket>/<prefix>".into()));
+            let Some((x, a)) = app.audit_export.get().and_then(|x| x.archive()) else {
+                return Err((axum::http::StatusCode::CONFLICT, "There is no archive to check: archive=on needs an s3://<bucket>/<prefix> in AUDIT_EXPORT".into()));
             };
             // Read before the listing, so what was delivered by then is in it.
             let delivered = x.delivered();

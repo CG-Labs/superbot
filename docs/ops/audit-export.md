@@ -1,6 +1,6 @@
 # Audit log: SIEM export and tamper evidence
 
-Every audit event is sealed onto a hash chain as it is written, so a changed, removed, added or reordered event shows. Every hour botd signs a checkpoint of the chain's head, and can have each one timestamped by an RFC 3161 time-stamping authority (TSA). botd can also send every event to your SIEM as it happens: JSON lines over HTTPS, or RFC 5424 syslog over TLS. Or it can archive them in batches to an S3 bucket with Object Lock, where nobody can change or delete them until their retention ends ([below](#archive-events-to-write-once-s3)). The chain and checkpoints are always on and need nothing. Timestamps and the export are off until you set them. Design: [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md), [ADR 0149](../adr/0149-signed-and-timestamped-audit-checkpoints.md), [ADR 0154](../adr/0154-write-once-s3-audit-archive.md) and [ADR 0163](../adr/0163-checking-the-audit-archive.md).
+Every audit event is sealed onto a hash chain as it is written, so a changed, removed, added or reordered event shows. Every hour botd signs a checkpoint of the chain's head, and can have each one timestamped by an RFC 3161 time-stamping authority (TSA). botd can also send every event to your SIEM as it happens: JSON lines over HTTPS, or RFC 5424 syslog over TLS. Or it can archive them in batches to an S3 bucket with Object Lock, where nobody can change or delete them until their retention ends ([below](#archive-events-to-write-once-s3)), or do both at once ([below](#a-siem-and-an-archive-together)). The chain and checkpoints are always on and need nothing. Timestamps and the export are off until you set them. Design: [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md), [ADR 0149](../adr/0149-signed-and-timestamped-audit-checkpoints.md), [ADR 0154](../adr/0154-write-once-s3-audit-archive.md), [ADR 0163](../adr/0163-checking-the-audit-archive.md) and [ADR 0173](../adr/0173-an-archive-alongside-a-siem.md).
 
 ## Check the chain
 
@@ -130,7 +130,7 @@ In `.env` (installer) or `deploy/docker/.env` (Compose), then restart botd:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `AUDIT_EXPORT` | `off` | Where to send events. `https://<collector>/<path>`: JSON lines. `syslog+tls://<host>[:6514]`: syslog over TLS. `http://` and `syslog+tcp://` work only to loopback |
+| `AUDIT_EXPORT` | `off` | Where to send events. `https://<collector>/<path>`: JSON lines. `syslog+tls://<host>[:6514]`: syslog over TLS. `http://` and `syslog+tcp://` work only to loopback. Add `,s3://<bucket>/<prefix>` to archive them too ([below](#a-siem-and-an-archive-together)) |
 | `AUDIT_EXPORT_INSECURE` | `off` | `on` allows `http://` and `syslog+tcp://` to any host, for a collector on a private network such as the Compose network |
 | `AUDIT_EXPORT_HEADERS` or `AUDIT_EXPORT_HEADERS_FILE` | none | HTTPS only: headers, `name=value` pairs split by commas, such as `Authorization=Bearer <token>`. A secret: redacted everywhere, and no Bot's harness gets it. With `SECRETS_BACKEND=vault` it can live in Vault ([vault.md](vault.md)) |
 | `AUDIT_EXPORT_START` | `all` | For a new sink: `all` sends the history still in the database first, `new` only events from now on |
@@ -163,7 +163,7 @@ Events are scrubbed when they are recorded: passwords, tokens, message text and 
 - A failure is retried with backoff from 1 second up to 5 minutes, for as long as it takes. Events wait in the database meanwhile, and retention (`AUDIT_RETENTION_DAYS`) never deletes an event the sink hasn't taken, so a long outage grows the table instead of losing events.
 - An event botd can't read from the database (a damaged row) is a failure too: export stops before it and retries, rather than skip it. `botctl audit verify` names the row.
 - After 3 failures in a row botd logs a warning and records `audit.export_failing` with a `reason` of `delivery_failed`, `unreadable`, `cursor_unsaved` or, for the S3 archive, `not_write_once`; `audit.export_recovered` follows when delivery resumes.
-- `botctl audit siem` (or `GET /api/audit/siem`) shows the sink, the last delivered id, how many are pending, whether it's failing, and the last error. With metrics on, `/metrics` has `superbot_audit_export_pending_events`, `superbot_audit_export_failing` and `superbot_audit_export_last_delivery_timestamp_seconds`. Alert on `superbot_audit_export_failing == 1` or a growing pending count.
+- `botctl audit siem` (or `GET /api/audit/siem`) shows the sink, the last delivered id, how many are pending, whether it's failing, and the last error. With metrics on, `/metrics` has `superbot_audit_export_pending_events`, `superbot_audit_export_failing` and `superbot_audit_export_last_delivery_timestamp_seconds`, each labelled with the sink's `kind` (`webhook`, `syslog` or `s3`). Alert on `superbot_audit_export_failing == 1` or a growing pending count.
 
 ### Examples
 
@@ -194,7 +194,7 @@ The cursor is kept per sink URL. A new URL starts as `AUDIT_EXPORT_START` says; 
 
 ## Archive events to write-once S3
 
-Instead of a SIEM, `AUDIT_EXPORT` can name an S3 bucket. botd writes events there in batches, one JSON-lines object per batch, and each object is locked with S3 Object Lock: until its retention ends nobody can change or delete it, not botd, not root on the server, and in compliance mode not even the store account's root. It works with any S3-compatible store with Object Lock: AWS S3, MinIO, Backblaze B2, Wasabi, Ceph.
+Instead of a SIEM, or beside one ([below](#a-siem-and-an-archive-together)), `AUDIT_EXPORT` can name an S3 bucket. botd writes events there in batches, one JSON-lines object per batch, and each object is locked with S3 Object Lock: until its retention ends nobody can change or delete it, not botd, not root on the server, and in compliance mode not even the store account's root. It works with any S3-compatible store with Object Lock: AWS S3, MinIO, Backblaze B2, Wasabi, Ceph.
 
 Make the bucket with Object Lock on (it can only be turned on when the bucket is made, on most stores), and give it a default retention, for example compliance mode for 7 years (2555 days). Then:
 
@@ -208,7 +208,7 @@ AUDIT_EXPORT_S3_SECRET_ACCESS_KEY=<secret>
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `AUDIT_EXPORT` | `off` | `s3://<bucket>[/<prefix>]`. The prefix defaults to `superbot-audit`; give each server its own |
+| `AUDIT_EXPORT` | `off` | `s3://<bucket>[/<prefix>]`, alone or after a SIEM and a comma. The prefix defaults to `superbot-audit`; give each server its own |
 | `AUDIT_EXPORT_S3_ENDPOINT` | none | The store's address, `https://host[:port]` (`http://` only to loopback, for a local MinIO) |
 | `AUDIT_EXPORT_S3_REGION` | `us-east-1` | The region requests are signed for (`auto` for R2) |
 | `AUDIT_EXPORT_S3_ACCESS_KEY_ID`, `AUDIT_EXPORT_S3_SECRET_ACCESS_KEY` (or `_FILE`) | none | The store's keys. The secret is redacted everywhere and no Bot gets it; with `SECRETS_BACKEND=vault` both can live in Vault |
@@ -260,6 +260,26 @@ The check fails, and exits 1, if any of that doesn't hold. `firstBroken` then na
 For this, the key botd uses also needs `s3:ListBucketVersions` on the bucket; export works without it. Without it the check fails, and the error names the missing right. It still needs no delete rights.
 
 Erased users' data stays in locked objects until their lock ends, like a SIEM or a backup: choose the period with your DPA in mind.
+
+## A SIEM and an archive together
+
+List both in `AUDIT_EXPORT`, split by a comma: live events for your SIEM's detections, and a copy nobody can change for auditors. The SIEM's settings (`AUDIT_EXPORT_HEADERS`, `AUDIT_EXPORT_INSECURE`) and the archive's (`AUDIT_EXPORT_S3_*`) are the same as for each alone:
+
+```sh
+AUDIT_EXPORT=https://<splunk-host>:8088/services/collector/raw,s3://<bucket>/<prefix>
+AUDIT_EXPORT_HEADERS=Authorization=Splunk <hec-token>,X-Splunk-Request-Channel=<channel-guid>
+AUDIT_EXPORT_S3_ENDPOINT=https://s3.<region>.amazonaws.com
+AUDIT_EXPORT_S3_REGION=<region>
+AUDIT_EXPORT_S3_ACCESS_KEY_ID=<key id>
+AUDIT_EXPORT_S3_SECRET_ACCESS_KEY=<secret>
+```
+
+- **One of each.** At most one SIEM (`https://`, `syslog+tls://`, or their plain forms) and one `s3://` archive, in either order. Two SIEMs, two archives or an empty entry stop botd at startup. A comma in a webhook's path is written `%2C`.
+- **Each on its own.** Each sink has its own cursor, retries, `audit.export_failing` and `audit.export_recovered` (with `kind` in their details), so a SIEM outage doesn't stop the archive, and the archive's batching doesn't slow the SIEM. Both get the same lines, so `host` and `id` match across them.
+- **Retention waits for both.** `AUDIT_RETENTION_DAYS` never deletes an event either sink hasn't taken.
+- **Adding one keeps the other.** Cursors are kept per sink, so adding an archive beside a running SIEM (or the other way round) resumes the one that was there. The new one starts as `AUDIT_EXPORT_START` says: with `all`, the default, the archive starts with the history still in the database.
+- **Status.** `botctl audit siem` (`GET /api/audit/siem`) leads with the sink in the worst state, failing first and then furthest behind, so its `failing` and `pending` cover both, and lists each under `sinks`. The app's audit log shows a `SIEM export` and an `Archive` line. In `/metrics`, each sink is its own series by `kind`.
+- **Checks.** `botctl audit verify --archive` checks the archive as above. Pins from the SIEM (`--pin`) and the archive check can be used together.
 
 ## Retention and erasure
 

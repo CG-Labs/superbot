@@ -154,10 +154,11 @@ sequenceDiagram
 
 ### Identity providers (SCIM, inbound)
 
-Off until `SCIM=on` ([ADR 0023](../adr/0023-scim.md), [ADR 0026](../adr/0026-scim-review-hardening.md)). The IdP calls botd at `/scim/v2` with a tenant's bearer token; botd never calls the IdP. It sends people's names, emails, the IdP's ids for them, and whether they're active, and with `SCIM_GROUPS=on`, group names, the IdP's group ids, and members ([ADR 0095](../adr/0095-scim-groups-as-teams.md)).
+Off until `SCIM=on` ([ADR 0023](../adr/0023-scim.md), [ADR 0026](../adr/0026-scim-review-hardening.md)). The IdP calls botd at `/scim/v2` with a tenant's bearer token; botd never calls the IdP. It sends people's names, emails, the IdP's ids for them, whether they're active, their Enterprise User attributes (employee number, cost center, organization, division, department, and manager, kept only when the manager is in the same tenant; [ADR 0176](../adr/0176-scim-enterprise-user-extension.md)), and with `SCIM_GROUPS=on`, group names, the IdP's group ids, and members ([ADR 0095](../adr/0095-scim-groups-as-teams.md)).
 
 - A tenant sees and changes only the users it provisioned and the groups it made or an admin linked to it. It never gets anyone else's data back: a group's `members` lists only the tenant's own people.
 - Group membership moves people onto and off teams, which changes who shares their Bots, which machines they get, and which plan they're on; leaving runs the same offboarding as a team admin's removal. SCIM never sets a role.
+- Enterprise User attributes are shown to admins and in the access review, and never decide access.
 - Everything it sends that SuperBot doesn't keep (roles, phone numbers, Okta's placeholder password) is dropped, never stored or logged. Every change is in the audit log with the token as the actor.
 - A SCIM `DELETE` disables the user and keeps their data (a soft delete). Erasing them is an admin's separate step, after which the tenant sees 404 and provisioning them again makes a new user ([ADR 0102](../adr/0102-erasing-a-users-data.md)).
 

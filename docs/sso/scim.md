@@ -1,6 +1,6 @@
 # Provision users and teams with SCIM (Entra ID, Okta)
 
-Lets your IdP create SuperBot users when people are assigned the app, keep their name and email current, and disable them when they leave. Disabling ends their sessions at once. With `SCIM_GROUPS=on`, the groups it pushes become [teams](#groups-as-teams), and people join and leave them as the IdP says. With `SCIM_GROUP_ROLES=on` as well, an admin can [map a group to a custom role](#groups-to-roles). Design: [ADR 0023](../adr/0023-scim.md), [ADR 0095](../adr/0095-scim-groups-as-teams.md), [ADR 0138](../adr/0138-scim-group-role-mapping.md).
+Lets your IdP create SuperBot users when people are assigned the app, keep their name and email current, and disable them when they leave. Disabling ends their sessions at once. With `SCIM_GROUPS=on`, the groups it pushes become [teams](#groups-as-teams), and people join and leave them as the IdP says. With `SCIM_GROUP_ROLES=on` as well, an admin can [map a group to a custom role](#groups-to-roles). The [Enterprise User extension](#enterprise-attributes) (employee number, department, manager, …) is kept for admins and access reviews. Design: [ADR 0023](../adr/0023-scim.md), [ADR 0095](../adr/0095-scim-groups-as-teams.md), [ADR 0138](../adr/0138-scim-group-role-mapping.md), [ADR 0176](../adr/0176-scim-enterprise-user-extension.md).
 
 SCIM never gives anyone a role above `SCIM_DEFAULT_ROLE` (member, or readonly), never a team role, and never admin; admins promote people as before. The IdP can't name a role: only an admin's mapping can give one. [Bulk](#bulk) is supported, for clients that batch.
 
@@ -47,7 +47,7 @@ In the [Microsoft Entra admin center](https://entra.microsoft.com): **Identity �
 2. **Admin Credentials**: **Tenant URL** `https://superbot.example.com/scim/v2`, **Secret Token** the `sbp_…` token. **Test Connection**, then **Save**.
 3. **Mappings**:
    - **Provision Microsoft Entra ID Groups**: with `SCIM_GROUPS=on`, leave it **Yes** (keep `displayName → displayName`, `objectId → externalId`, `members → members`). Otherwise set **Enabled** to **No**.
-   - **Provision Microsoft Entra ID Users**: if the tenant links SSO (`--sso`), edit the **externalId** mapping: source attribute **objectId** (the default, `mailNickname`, is refused). Keep `userPrincipalName → userName`, `mail → emails[type eq "work"].value`, `Switch([IsSoftDeleted], …) → active`, and the name mappings. Others are ignored.
+   - **Provision Microsoft Entra ID Users**: if the tenant links SSO (`--sso`), edit the **externalId** mapping: source attribute **objectId** (the default, `mailNickname`, is refused). Keep `userPrincipalName → userName`, `mail → emails[type eq "work"].value`, `Switch([IsSoftDeleted], …) → active`, the name mappings, and the [enterprise ones](#enterprise-attributes) (`employeeId`, `department`, `companyName`, `manager`, …). Others are ignored.
 4. **Settings → Scope: Sync only assigned users and groups**. Assign people under **Users and groups**.
 5. **Provisioning Status: On**, **Save**. Entra syncs about every 40 minutes; **Provision on demand** does one person now.
 
@@ -83,13 +83,33 @@ Google pushes SCIM only to apps in its own catalog, so botd reads the Workspace 
 | Sets `active: false` | Disables the user, ends all sessions, closes open screens, and pauses the routines that run for them ([ADR 0047](../adr/0047-disabled-users-routines.md)). Stops every run and queued message on their Bots and the runs on others' Bots that are for them, ends those runs' Bot tokens, and suspends their machine (`MACHINE_ON_DISABLE`, [ADR 0124](../adr/0124-deprovisioning-stops-bots-and-machines.md)). Still listed, so the IdP can reactivate |
 | Sets `active: true` | Enables the user, and resumes the machine their deactivation suspended. Their paused routines stay paused until an admin resumes them (`botctl user resume-routines`) or hands them over (`botctl user handover`), unless `ROUTINES_ON_ENABLE=resume` |
 | Deletes (`DELETE`) | Disables the user, ends sessions, pauses their routines, stops their Bots' runs, and suspends their machine; the tenant no longer sees it. Nothing is destroyed. Provisioning the same `externalId` again brings back the same user, and their machine |
-| Sends `roles`, `groups` on a user, a password | Ignored |
+| Sends the Enterprise User extension | Kept and shown back, to admins and in the access review; never used to give access ([below](#enterprise-attributes)) |
+| Sends `roles`, `groups` on a user, a password, `title`, phone numbers | Ignored |
 
 **The IdP is in charge.** For users it provisioned, the IdP decides name, email, and `active`: an admin can disable one in SuperBot, but the IdP's next update can enable them again. Remove people in the IdP.
 
 **One person, one user.** Email never matches people. If a SuperBot user already has the email, the IdP gets a 409: link that user's SSO identity (`botctl user link <user> <provider> <subject>`) and retry, or change one of the emails. The owner account is never managed by SCIM.
 
 **Audit.** Every change is logged with the token as the actor: `botctl audit --method scim_token`, or `--actor system:scim:<token id>`. Each deactivation or deletion also records `user.deprovisioned`, with the Bots it stopped and what happened to the machine (`suspended`, `held` until it finishes building, `failed` and retried by the reconciler, `already_suspended`, `kept`, or `none`). Bad tokens are logged as `scim.auth_failed` (throttled), with `reason` `missing`, `unknown`, or `revoked`; a revoked token names which one, so you can find the IdP still sending it. A request with a valid token that's refused or fails (not a 404) is logged as `scim.request_failed` with its `status`, `reason` (the `scimType` in snake case, such as `uniqueness` or `invalid_value`, or `status_<code>`), `method` and `resource`, never its body; the [customer health score](../support/health-score.md#identity) counts them. Tokens themselves never are logged.
+
+## Enterprise attributes
+
+SuperBot keeps the [Enterprise User extension](https://www.rfc-editor.org/rfc/rfc7643#section-4.3) (`urn:ietf:params:scim:schemas:extension:enterprise:2.0:User`) on the users a tenant provisions, and lists it in `/Schemas` and in the User resource type's `schemaExtensions`, so Entra's SCIM Validator (schema discovery) and Okta's profile editor find it. Design: [ADR 0176](../adr/0176-scim-enterprise-user-extension.md).
+
+| Attribute | Entra's default source | Kept as |
+|-----------|------------------------|---------|
+| `employeeNumber` | `employeeId` | Text, up to 128 characters |
+| `costCenter` | `employeeOrgData.costCenter` | Text |
+| `organization` | `companyName` | Text |
+| `division` | `employeeOrgData.division` | Text |
+| `department` | `department` | Text |
+| `manager` | `manager` | Another user **this tenant** provisioned, by their SuperBot id |
+
+- **Every shape Entra and Okta send.** In a `POST` or `PUT`, the extension object under its URN. In a `PATCH`, the full path (`urn:…:enterprise:2.0:User:department`), the extension's URN with an object of attributes (only those sent change), a path-less `value` holding either, and the bare names Entra has sent (`manager`). `manager` takes `{"value": "<id>"}`, Entra's `[{"value": "<id>", "$ref": …}]`, or the id itself; `remove` clears an attribute. A `PUT` without the extension clears it, as RFC 7644 says a replace does.
+- **A manager is someone else in the tenant.** A `manager` that isn't a live user of the same tenant (unknown, the person themselves, deleted, or another tenant's) is dropped, and the user is saved without one. It is never refused, so a deactivation that carries a stale manager still goes through. Entra sends the manager once both people exist. A manager the tenant later deletes is no longer shown; the next write clears it.
+- **Shown, never used for access.** The attributes come back on every SCIM read, with `manager.displayName` and `$ref`. Admins see `department`, `employeeNumber` and `manager` on each person in the [access review](../adr/0099-access-review-report.md) (`scim_department` and `scim_manager` in its CSV), to route each person to their manager for sign-off. They aren't in the report's digest, so a department change doesn't make a signed-off review stale. No role, team, Bot or machine depends on them.
+- **Audited.** A change is in `user.updated`'s `changes`, like a name.
+- **Google Workspace** fills `employeeNumber` (the `organization` external id), `organization`, `department` and `costCenter` from the person's primary organization, and `manager` from their `manager` relation, once the manager has an account too ([guide](google-workspace.md)).
 
 ## Groups as teams
 
@@ -205,4 +225,5 @@ Bulk: at most 100 operations (`maxOperations`) and 1 MiB (`maxPayloadSize`) a re
 - **Bulk 200, but nothing changed**: read each operation's `status` and `response`; a 200 only means the request was read.
 - **Bulk 413**: more than 100 operations or 1 MiB. Split the request.
 - **Bulk 409 "bulkId:…"**: the operation names a `bulkId` no `POST` in the same request has, or whose `POST` failed.
+- **A manager doesn't show**: the manager isn't a user this tenant has provisioned (yet). Provision them, then use **Provision on demand** for the person (Entra) or push their profile again (Okta).
 - **409 creating a group**: this tenant already has a group with that name or `externalId`. Names are unique per tenant in any ASCII case (`Eng` and `ENG` clash; `Équipe` and `éQUIPE` don't).

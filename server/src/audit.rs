@@ -801,7 +801,7 @@ pub fn start_retention(app: Arc<App>, days: Option<u32>) {
     });
 }
 
-/// Deletes old events, but none the SIEM export hasn't delivered yet (ADR 0122). The
+/// Deletes old events, but none an export sink hasn't delivered yet (ADR 0122, ADR 0173). The
 /// event names the anchor the chain now starts from.
 pub fn prune(app: &App, days: u32) {
     let cutoff = now() - days as i64 * 86_400_000;
