@@ -8526,6 +8526,19 @@ impl Db {
         v.and_then(|v| v.parse().ok())
     }
 
+    /// The furthest any sink ever got, configured now or not: the last event delivered or
+    /// cut into a batch. Keys other than `except` that don't hold an id are skipped.
+    pub fn audit_export_furthest(&self, except: &str) -> rusqlite::Result<i64> {
+        let c = self.c();
+        let mut q = c.prepare("SELECT value FROM settings WHERE key LIKE 'audit\\_export:%' ESCAPE '\\' AND key != ?")?;
+        let values = q.query_map([format!("audit_export:{except}")], |r| r.get::<_, String>(0))?;
+        let mut furthest = 0;
+        for v in values {
+            furthest = furthest.max(v?.parse().unwrap_or(0));
+        }
+        Ok(furthest)
+    }
+
     pub fn set_audit_export_cursor(&self, sink: &str, delivered: i64) -> rusqlite::Result<()> {
         self.c().execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",

@@ -411,19 +411,19 @@ pub struct Exports {
 /// The cursor, beside the sinks', past which events carry their digest (ADR 0199).
 pub const DIGESTS: &str = "#digests";
 
-/// Saved the first time the export starts with digests: past everything any sink has
-/// delivered or cut a batch of, so a sink resending what it sent before sends the same
-/// lines, and no sink sends without its digest an event another sent with one. Every
-/// event after the first with a digest has one, which is what a check of the lines holds
-/// them to.
+/// Saved the first time the export starts with digests: past everything any sink, set
+/// now or before, has delivered or cut a batch of, so a sink resending what it sent
+/// before (an archive turned back on too) sends the same lines, and no sink sends
+/// without its digest an event another sent with one. Every event after it has one,
+/// which is what a check of the lines holds them to.
 fn digests_after(app: &App, sinks: &[Arc<Exporter>]) -> i64 {
     if let Some(after) = app.db.audit_export_cursor(DIGESTS) {
         return after;
     }
-    let cut = |x: &Exporter| app.db.audit_export_cursor(&format!("{}#batch", x.sink.id)).unwrap_or(0);
-    let after = sinks.iter().map(|x| x.delivered().max(cut(x))).max().unwrap_or(0);
-    match app.db.set_audit_export_cursor(DIGESTS, after) {
-        Ok(()) => after,
+    let saved = app.db.audit_export_furthest(DIGESTS);
+    let after = saved.map(|s| sinks.iter().map(|x| x.delivered()).fold(s, i64::max));
+    match after.and_then(|after| app.db.set_audit_export_cursor(DIGESTS, after).map(|()| after)) {
+        Ok(after) => after,
         Err(e) => {
             log_warn!("Audit export: couldn't save where events start carrying their digest ({e}); sending none until botd restarts and saves it.");
             i64::MAX
@@ -1085,6 +1085,20 @@ pub(crate) mod tests {
         let v = exported(erased, true);
         assert!(v["chainDigest"].is_string() && v.get("chainSalt").is_none(), "{v}");
         assert_eq!(check(&v), Ok(Bound::Fixed), "{v}");
+    }
+
+    #[test]
+    fn digests_start_past_every_sink_ever_set_and_stay_there() {
+        let app = crate::runner::test_app();
+        // An archive turned off for now, which had cut a batch to 100 and delivered to 80.
+        let old = "s3://s3.example.net/audit-archive/prod";
+        app.db.set_audit_export_cursor(old, 80).unwrap();
+        app.db.set_audit_export_cursor(&format!("{old}#batch"), 100).unwrap();
+        app.db.set_audit_export_cursor("https://siem.example.net:443/in", 50).unwrap();
+        app.db.set_setting(&format!("audit_export:{old}#checked"), r#"{"head":{"id":900}}"#);
+        assert_eq!(digests_after(&app, &[]), 100, "a batch it resends when back is the same as before");
+        app.db.set_audit_export_cursor(old, 400).unwrap();
+        assert_eq!(digests_after(&app, &[]), 100, "saved once");
     }
 
     #[test]
