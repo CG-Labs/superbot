@@ -129,6 +129,9 @@ pub const CAN_LOCKED_DOWN: &str = "locked_down";
 pub const CAN_SECCOMP: &str = "seccomp";
 /// Takes `HarnessPlan::npm_registry` and `HarnessPlan::ca` (ADR 0186).
 pub const CAN_HARNESS_MIRRORS: &str = "harness_mirrors";
+/// Lets its harness egress rules through to its team network's subnet, or stops
+/// letting them (`PUT /v1/team-network`, ADR 0202).
+pub const CAN_TEAM_NETWORK: &str = "team_network";
 
 /// The screen protocol this build speaks (ADR 0045). A request names it, an agent
 /// refuses any other, and botd treats an agent that reports another as outdated.
@@ -456,6 +459,10 @@ pub struct Heartbeat {
     /// The outbound allow-list it holds (ADR 0135). None before it could take one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_policy: Option<EgressReport>,
+    /// The team network subnet its egress rules let through (ADR 0202). None before it
+    /// could say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_network: Option<TeamNetworkReport>,
 }
 
 /// What a run may use on a machine (ADR 0135): shares of the machine's CPUs and memory
@@ -563,6 +570,31 @@ pub struct EgressReport {
 pub const EGRESS_STATE_ON: &str = "on";
 pub const EGRESS_STATE_OPEN: &str = "open";
 pub const EGRESS_STATE_FAILED: &str = "failed";
+
+/// The team network subnet a machine's harness egress rules should let through
+/// (ADR 0202). None: no team network's.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TeamNetworkRules {
+    pub subnet: Option<String>,
+}
+
+/// The team network subnet a machine's harness egress rules let through, as its
+/// egress script says, and whether they are loaded.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamNetworkReport {
+    #[serde(default)]
+    pub subnet: Option<String>,
+    /// `on`, `failed`, or `none` (no egress rules here, so nothing to let through).
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+pub const TEAM_RULES_ON: &str = "on";
+pub const TEAM_RULES_FAILED: &str = "failed";
+pub const TEAM_RULES_NONE: &str = "none";
 
 /// A machine's hardening (ADR 0126): each first-boot step's state (`ssh`, `kernel`,
 /// `updates`), whether this boot's harness egress rules are loaded, and whether

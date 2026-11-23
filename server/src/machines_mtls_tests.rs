@@ -40,6 +40,15 @@ pub(crate) async fn serve_with(f: impl FnOnce(Enrollment) -> Enrollment) -> Env 
 
 /// `serve_with`, with botd's auth settings changed by `tweak` too.
 pub(crate) async fn serve_with_auth(f: impl FnOnce(Enrollment) -> Enrollment, tweak: impl FnOnce(&mut crate::Auth) + Send + 'static) -> Env {
+    serve_with_control(f, |_| {}, tweak).await
+}
+
+/// `serve_with_auth`, with the control plane changed by `control` too.
+pub(crate) async fn serve_with_control(
+    f: impl FnOnce(Enrollment) -> Enrollment,
+    control: impl FnOnce(&mut ControlPlane),
+    tweak: impl FnOnce(&mut crate::Auth) + Send + 'static,
+) -> Env {
     let machine_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let agent_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let (mport, aport) = (
@@ -53,6 +62,7 @@ pub(crate) async fn serve_with_auth(f: impl FnOnce(Enrollment) -> Enrollment, tw
     let e = cp
         .enroll_with(f(Enrollment::for_tests(9, mport, aport).with_agent(AGENT.as_bytes())))
         .unwrap();
+    control(&mut cp);
     let cp = Arc::new(cp);
     let shared = cp.clone();
     let (port, app, owner, _, router) =
@@ -159,6 +169,7 @@ pub(crate) fn config(env: &Env, machine_id: &str, token: Option<&str>) -> Config
         teammate_stand_in: None,
         run_cgroups: false,
         nft: "/nonexistent/nft".into(),
+        egress_script: "/nonexistent/egress".into(),
     }
 }
 
@@ -1625,6 +1636,7 @@ fn agent_counts_programs_only_under_its_home_or_the_system() {
         teammate_stand_in: None,
         run_cgroups: false,
         nft: "/nonexistent/nft".into(),
+        egress_script: "/nonexistent/egress".into(),
     };
     assert_eq!(cfg.layout().botctl, None, "outside the home and the system's directories");
 

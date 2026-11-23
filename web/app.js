@@ -1768,8 +1768,8 @@ async function loadScim() {
     </tr>`).join("");
 }
 
-// SCIM groups mapped to custom roles (ADR 0138), and role groups (ADR 0180): listed and
-// removed here; made with botctl.
+// SCIM groups mapped to custom roles (ADR 0138), and role groups (ADR 0180, within a
+// team ADR 0206): listed and removed here; made with botctl.
 async function loadScimRoles() {
   let maps = [], groups = [];
   try {
@@ -1777,7 +1777,7 @@ async function loadScimRoles() {
     maps = r.mappings || [];
     groups = g.roleGroups || [];
     $("scim-roles-info").textContent = r.enabled
-      ? "Members of a mapped group, or of a role group, hold its custom role while they're in it. Map a team's group with botctl scim role map <team> <role> [--org]; declare a role group with botctl scim role-group add <tenant> <group> <role>. Never admin."
+      ? "Members of a mapped group, or of a role group, hold its custom role while they're in it. Map a team's group with botctl scim role map <team> <role> [--org]; declare a role group with botctl scim role-group add <tenant> <group> <role> [--team]. Never admin."
       : "Group roles are off (SCIM_GROUP_ROLES=on, with SCIM_GROUPS=on, turns them on). Roles that mappings and role groups gave are still taken back when people leave.";
     $("scim-roles-empty").textContent = "No groups are mapped to roles.";
   } catch (err) {
@@ -1791,7 +1791,7 @@ async function loadScimRoles() {
       <td class="actions"><button type="button" class="btn" data-act="unmap">Remove</button></td>
     </tr>`).join("") + groups.map((g) => `<tr data-role-group="${esc(g.id)}">
       <td>${esc(g.displayName)}</td><td>${esc(g.tenant)}</td><td>${esc(g.role ? g.role.name : "")}</td>
-      <td>Role group, across the server${g.state === "waiting" ? " (waiting for the IdP)" : ""}</td><td>${esc(String(g.grants))}</td>
+      <td>Role group, ${g.scope === "team" ? "in each member's team" : "across the server"}${g.state === "waiting" ? " (waiting for the IdP)" : ""}</td><td>${esc(String(g.grants))}</td>
       <td class="actions"><button type="button" class="btn" data-act="unmap">Remove</button></td>
     </tr>`).join("");
 }
