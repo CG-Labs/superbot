@@ -238,7 +238,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
     times: YYYY-MM-DD (UTC), RFC 3339, or unix milliseconds
   botctl support-bundle [-o <file>]                Save a support bundle for a ticket (ADR 0131): version,
                                                    redacted settings, health, recent logs and an audit
-                                                   summary, in a tar; no secrets, emails or chats
+                                                   summary, in a tar; no secrets, emails or chats. When botd
+                                                   is down: botd support bundle (or botd support check), ADR 0187
   botctl health-score [--days <n>] [json]          The customer health score (ADR 0144) for the last 30 days
                                                    (7 to 90): adoption, Bot runs, sign-in and SCIM, backups,
                                                    approvals and the license, each ok, watch or at risk
@@ -299,6 +300,7 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine upgrade <user>                    Upgrade its agent to botd's build now
   botctl machine upgrade <user> hold|release       Keep its agent at its build, or let it be upgraded again
   botctl machine harnesses <user>                  Install MACHINE_HARNESSES on it now, retrying failures
+  botctl machine mirror                            Fetch every harness file machines would, from the mirrors, and check each pin (ADR 0186)
   botctl machine legacy                            Machines whose agent is from before agent upgrades, and their rebuilds
   botctl machine rebuild <user> [--discard-work]   Wipe and reinstall it with today's agent (ADR 0056); same IP and firewall
   botctl machine rebuild <user> status|cancel      How its rebuild is going, or cancel one not yet sent
@@ -983,6 +985,7 @@ fn machine_request(args: &[&str]) -> Result<(&'static str, String), String> {
         ["upgrade", user, "hold"] => ("PUT", machine(user, "agent/hold")),
         ["upgrade", user, "release"] => ("DELETE", machine(user, "agent/hold")),
         ["harnesses", user] => ("POST", machine(user, "harnesses")),
+        ["mirror"] | ["mirror", "check"] => ("GET", "/api/machines/harness-mirror".into()),
         ["bot-user", user] => ("POST", machine(user, "bot-user")),
         ["folder", user] => ("GET", machine(user, "folder-sync")),
         ["sync", user] => ("POST", machine(user, "folder-sync")),
@@ -997,7 +1000,7 @@ fn machine_request(args: &[&str]) -> Result<(&'static str, String), String> {
         ["removals"] => ("GET", "/api/machines/teammate-removals?state=open".into()),
         ["removals", s @ ("pending" | "held" | "done" | "cancelled" | "open" | "all")] => ("GET", format!("/api/machines/teammate-removals?state={s}")),
         _ => {
-            return Err("Usage: botctl machine placement [<user>] | assign <user> | unassign <user> | agent <user> | upgrade <user> [hold|release] | harnesses <user> | legacy | rebuild <user> [--discard-work|status|cancel] | bot-user <user> | harness-login <user|me> <claude|codex> | harness-logins <user|me> | harness-logout <user|me> <harness> | folder <user> | sync <user> | screens <user> [close <bot>] | teammates <user> [remove <teammate> | logins <teammate> | logout <teammate> <harness>] | removals [pending|held|done|cancelled|open|all]".into());
+            return Err("Usage: botctl machine placement [<user>] | assign <user> | unassign <user> | agent <user> | upgrade <user> [hold|release] | harnesses <user> | mirror | legacy | rebuild <user> [--discard-work|status|cancel] | bot-user <user> | harness-login <user|me> <claude|codex> | harness-logins <user|me> | harness-logout <user|me> <harness> | folder <user> | sync <user> | screens <user> [close <bot>] | teammates <user> [remove <teammate> | logins <teammate> | logout <teammate> <harness>] | removals [pending|held|done|cancelled|open|all]".into());
         }
     })
 }
@@ -1550,6 +1553,18 @@ fn saml_summary(v: &Value) -> String {
         "  IdP-initiated sign-in:    {}\n",
         if v["idpInitiated"].as_str() == Some("restart") { "restarted as SP-initiated" } else { "refused (start from SuperBot)" }
     );
+    let authn = &v["authnContext"];
+    match authn["required"].as_array() {
+        Some(required) => {
+            let required: Vec<&str> = required.iter().filter_map(Value::as_str).collect();
+            out += &format!("  Authentication context:   one of {}\n", required.join(", "));
+            if let Some(m) = authn["methodsAttribute"].as_str() {
+                out += &format!("    Also read from attribute {m}\n");
+            }
+            out += if authn["requested"].as_bool().unwrap_or(false) { "    Requested in AuthnRequests (exact)\n" } else { "    Not requested: the IdP's own policy decides\n" };
+        }
+        None => out += "  Authentication context:   not checked (the IdP's MFA isn't required)\n",
+    }
     if let Some(g) = v["groupsAttribute"].as_str() {
         let required: Vec<&str> = v["requiredGroups"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
         out += &format!(
@@ -2114,7 +2129,7 @@ fn save_private(path: &str, bytes: &[u8]) -> Result<(), String> {
 
 fn support_bundle(rest: &[&str]) -> Result<String, String> {
     let out = bundle_out(rest)?;
-    let (code, head, body) = exchange_bytes(Cred::Operator, "GET", "/api/support/bundle")?;
+    let (code, head, body) = exchange_bytes(Cred::Operator, "GET", "/api/support/bundle").map_err(offline_hint)?;
     if !(200..300).contains(&code) {
         return Err(failure(code, &String::from_utf8_lossy(&body)));
     }
@@ -2124,6 +2139,15 @@ fn support_bundle(rest: &[&str]) -> Result<String, String> {
         "Saved {path} ({} KB). It has no secrets, emails or chats, but read it before you attach it to a ticket:\n  tar -tvf {path}\n  tar -xOf {path} | less",
         body.len().div_ceil(1024)
     ))
+}
+
+/// Says how to make a bundle without botd when it can't be reached (ADR 0187).
+fn offline_hint(e: String) -> String {
+    if e.starts_with("Can't reach the server") {
+        format!("{e}\nbotd isn't answering. On the server, botd support bundle makes one without it, and botd support check says what's wrong (docs/support/support-check.md).")
+    } else {
+        e
+    }
 }
 
 /// `botctl support-report`: needs no botd, only the ticket system's export.
@@ -2378,6 +2402,13 @@ mod tests {
     }
 
     #[test]
+    fn a_support_bundle_without_botd_points_at_the_offline_one() {
+        let hint = offline_hint("Can't reach the server: Connection refused (os error 111)".into());
+        assert!(hint.contains("botd support bundle") && hint.contains("docs/support/support-check.md"), "{hint}");
+        assert_eq!(offline_hint("Missing SUPERBOT_TOKEN".into()), "Missing SUPERBOT_TOKEN");
+    }
+
+    #[test]
     fn a_support_bundle_is_saved_where_asked_or_under_botds_plain_name() {
         assert_eq!(bundle_out(&[]), Ok(None));
         assert_eq!(bundle_out(&["-o", "t.tar"]), Ok(Some("t.tar")));
@@ -2596,6 +2627,7 @@ mod tests {
         assert_eq!(machine_request(&["upgrade", "u1", "hold"]).unwrap(), ("PUT", "/api/users/u1/machine/agent/hold".into()));
         assert_eq!(machine_request(&["upgrade", "u1", "release"]).unwrap(), ("DELETE", "/api/users/u1/machine/agent/hold".into()));
         assert_eq!(machine_request(&["harnesses", "u1"]).unwrap(), ("POST", "/api/users/u1/machine/harnesses".into()));
+        assert_eq!(machine_request(&["mirror"]).unwrap(), ("GET", "/api/machines/harness-mirror".into()));
         assert_eq!(machine_request(&["bot-user", "u1"]).unwrap(), ("POST", "/api/users/u1/machine/bot-user".into()));
         assert!(machine_request(&["upgrade", "u1", "now"]).is_err());
         assert_eq!(machine_request(&["folder", "u1"]).unwrap(), ("GET", "/api/users/u1/machine/folder-sync".into()));
@@ -3032,6 +3064,19 @@ mod tests {
         v["roleMappings"] = json!(2);
         let out = saml_summary(&v);
         assert!(out.contains("Required groups:          SuperBot Users, Admins\n  Group role mappings:      2 "), "{out}");
+    }
+
+    #[test]
+    fn saml_summary_shows_the_authentication_context_required() {
+        let mut v = json!({ "provider": "corp", "label": "Corp", "idp": null, "authnContext": null });
+        assert!(saml_summary(&v).contains("  Authentication context:   not checked (the IdP's MFA isn't required)\n"));
+        v["authnContext"] = json!({ "required": ["http://schemas.microsoft.com/claims/multipleauthn"], "methodsAttribute": null, "requested": true });
+        let out = saml_summary(&v);
+        assert!(out.contains("  Authentication context:   one of http://schemas.microsoft.com/claims/multipleauthn\n    Requested in AuthnRequests (exact)\n"), "{out}");
+        assert!(!out.contains("Also read from"), "{out}");
+        v["authnContext"] = json!({ "required": ["mfa", "urn:okta:loa:2fa:any"], "methodsAttribute": "amr", "requested": false });
+        let out = saml_summary(&v);
+        assert!(out.contains("  Authentication context:   one of mfa, urn:okta:loa:2fa:any\n    Also read from attribute amr\n    Not requested: the IdP's own policy decides\n"), "{out}");
     }
 
     #[test]

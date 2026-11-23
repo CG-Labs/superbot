@@ -191,7 +191,7 @@ fn cpus() -> Option<u64> {
 #[cfg(unix)]
 // statvfs's fields are 32-bit on macOS and 32-bit Linux.
 #[allow(clippy::useless_conversion)]
-fn disk(name: &'static str, path: &Path) -> Option<(DiskUse, u64)> {
+pub(crate) fn disk(name: &'static str, path: &Path) -> Option<(DiskUse, u64)> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     let dev = std::fs::metadata(path).ok()?.dev();
@@ -210,7 +210,7 @@ fn disk(name: &'static str, path: &Path) -> Option<(DiskUse, u64)> {
 }
 
 #[cfg(not(unix))]
-fn disk(_: &'static str, _: &Path) -> Option<(DiskUse, u64)> {
+pub(crate) fn disk(_: &'static str, _: &Path) -> Option<(DiskUse, u64)> {
     None
 }
 

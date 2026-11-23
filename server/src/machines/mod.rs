@@ -31,6 +31,7 @@ pub mod job;
 pub mod landing;
 pub mod linode;
 pub mod logins;
+pub mod mirror;
 pub mod offboard;
 pub mod placement;
 pub mod pki;
@@ -50,6 +51,8 @@ pub mod seccomp;
 pub mod s3_standin;
 pub mod screens;
 pub mod server_data;
+#[cfg(test)]
+pub mod standin_mirror;
 pub mod teammate;
 #[cfg(test)]
 pub mod teammates;

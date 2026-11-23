@@ -141,7 +141,7 @@ pub fn open_with(path: &Path, key: Option<&DbKey>) -> rusqlite::Result<Connectio
     keyed(Connection::open(path)?, key)
 }
 
-fn open_read_only(path: &Path, key: Option<&DbKey>) -> rusqlite::Result<Connection> {
+pub(crate) fn open_read_only(path: &Path, key: Option<&DbKey>) -> rusqlite::Result<Connection> {
     keyed(Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?, key)
 }
 

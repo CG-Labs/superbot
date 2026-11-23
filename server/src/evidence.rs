@@ -415,6 +415,7 @@ fn service_account(s: &Value) -> Value {
         "team": s["team"].is_object().then(|| json!({ "id": s["team"]["id"], "customRole": custom(&s["team"]["customRole"]) })),
         "owner": s["owner"]["id"],
         "ownerActive": s["ownerActive"],
+        "ownerOnTeam": s["ownerOnTeam"],
         "effective": s["effective"],
         "botAccess": { "bots": s["botAccess"]["bots"].as_array().map_or(0, Vec::len) },
         "tokens": s["tokens"].as_array().map(|ts| ts.iter().map(|t| json!({

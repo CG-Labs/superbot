@@ -166,6 +166,7 @@ async fn each_file_carries_its_controls_evidence() {
     // Service accounts (ADR 0165): ids, roles and token scopes, never their names or a token's.
     let s = &access["serviceAccounts"][0];
     assert_eq!((s["id"].as_str(), s["owner"].as_str(), s["role"].as_str(), s["tokens"][0]["scopes"].clone()), (Some(sa.as_str()), Some(users::OPERATOR), Some("readonly"), json!(["read"])), "{access}");
+    assert_eq!(s["ownerOnTeam"], Value::Null, "in no team: {access}");
     let text = access["serviceAccounts"].to_string();
     assert!(!text.contains("Nightly export") && !text.contains("Free text") && !text.contains("Cron job") && !text.contains("sbsa_"), "{text}");
     assert_eq!(access["period"]["counts"]["service_token.created"]["success"], 1, "{access}");

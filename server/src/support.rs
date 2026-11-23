@@ -266,7 +266,7 @@ fn documented(line: &str) -> Option<&str> {
 
 // The files
 
-fn rfc3339(ms: i64) -> String {
+pub(crate) fn rfc3339(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms).map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_default()
 }
 
@@ -420,7 +420,7 @@ fn logs(names: &[String]) -> (String, usize) {
 }
 
 /// JSON, pretty, with every string through botd's redaction once more.
-fn json_file(v: Value, names: &[String]) -> Vec<u8> {
+pub(crate) fn json_file(v: Value, names: &[String]) -> Vec<u8> {
     let v = redact::value(scrub_value(v, names));
     let mut s = serde_json::to_string_pretty(&v).unwrap_or_default();
     s.push('\n');

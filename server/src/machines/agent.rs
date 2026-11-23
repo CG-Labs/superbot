@@ -1423,6 +1423,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             wire::CAN_RUN_LIMITS,
             wire::CAN_EGRESS_POLICY,
             wire::CAN_LOCKED_DOWN,
+            wire::CAN_HARNESS_MIRRORS,
         ]
             .into_iter()
             .chain(a.upgrader.build.is_some().then_some(wire::CAN_UPGRADE))

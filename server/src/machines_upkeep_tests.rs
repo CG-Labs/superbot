@@ -22,6 +22,8 @@ set -eu
 here=$(dirname "$(dirname "$(readlink -f "$0")")")
 case "$1" in
 pack)
+  printf 'registry=%s\n' "${npm_config_registry:-}" > "$here/npm-saw"
+  [ -z "${NODE_EXTRA_CA_CERTS:-}" ] || cat "$NODE_EXTRA_CA_CERTS" >> "$here/npm-saw"
   cp "$here/pkgs/$2.tgz" "$4/$2.tgz"
   printf '[{"filename":"%s.tgz","integrity":"%s"}]\n' "$2" "$(cat "$here/pkgs/$2.sri")"
   ;;
@@ -187,6 +189,7 @@ async fn a_new_machine_installs_the_planned_harnesses_and_runs_bots_with_them() 
             downloads: [(std::env::consts::ARCH.to_string(), Download { url, sha256: sha })].into(),
         }),
         harnesses: vec![npm("claude", "fake-claude", "9.9.9", sri(&claude)), npm("codex", "fake-codex", "1.0.0", wrong)],
+        ..Default::default()
     };
     crate::machines::tools::check(&plan).unwrap();
     let planned = plan.clone();
@@ -248,6 +251,57 @@ async fn a_new_machine_installs_the_planned_harnesses_and_runs_bots_with_them() 
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("codex wasn't tried again");
+}
+
+#[tokio::test]
+async fn machines_install_harnesses_from_the_operators_mirrors_with_their_own_ca() {
+    use crate::machines::mirror::Mirrors;
+    use crate::machines::standin_mirror::Mirror;
+    let claude = package("fake-claude", "9.9.9", "claude", INSTALLED_CLAUDE);
+    let tarball = node_tarball(&[("fake-claude@9.9.9", &claude)]);
+    let mirror = Mirror::serve().await;
+    let mut node = mirror.node("0.0.1", &tarball);
+    for d in node.downloads.values_mut() {
+        d.url = format!("https://nodejs.org/dist/v0.0.1/node-v0.0.1-linux-{}.tar.xz", crate::machines::standin_mirror::node_arch());
+    }
+    let pin = mirror.package("fake-claude", "9.9.9", &claude);
+    let mirrors = Mirrors { node: Some(mirror.node_base()), npm: Some(mirror.registry()), ca: Some((mirror.ca_pem(), "/etc/superbot/mirror-ca.pem".into())) };
+    let plan = mirrors.apply(HarnessPlan { node: Some(node), harnesses: vec![npm("claude", "fake-claude", "9.9.9", pin)], ..Default::default() });
+    assert!(plan.node.as_ref().unwrap().downloads.values().all(|d| d.url.starts_with(&mirror.url)), "{plan:?}");
+    let planned = plan.clone();
+    let mut env = serve_with(move |mut e| {
+        e.upkeep.plan = Some(planned);
+        e.upkeep.mirrors = Some(mirrors);
+        e
+    })
+    .await;
+
+    // Before anything is installed, the check fetches what machines would and finds
+    // every pin there.
+    let (code, v) = json_call(&env, "GET", "/api/machines/harness-mirror", "").await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["mirrors"]["caFile"], "/etc/superbot/mirror-ca.pem", "{v}");
+
+    let (uid, mid, token) = machine_for(&env, "ada@example.com").await;
+    let m = agent_on(&mut env, &mid, &token, "#!/bin/sh\n").await;
+    let v = beat_until(&env, &uid, "claude installed from the mirror", |v| v["agent"]["harnesses"]["claude"]["state"] == "installed").await;
+    assert_eq!(v["agent"]["plan"].as_str(), Some(plan.id().as_str()), "{v}");
+
+    // Node.js came from the mirror, over its CA (which the machine CA isn't), and npm
+    // was pointed at the mirror's registry and told to trust that CA too.
+    let node_path = format!("/node/v0.0.1/node-v0.0.1-linux-{}.tar.xz", crate::machines::standin_mirror::node_arch());
+    assert!(mirror.calls().contains(&node_path), "{:?}", mirror.calls());
+    let saw = std::fs::read_to_string(m.cfg.tools.join("node-0.0.1/npm-saw")).unwrap();
+    assert!(saw.starts_with(&format!("registry={}\n", mirror.registry())), "{saw}");
+    assert!(saw.contains(&mirror.ca_pem()), "{saw}");
+    assert!(!m.cfg.tools.join(".dl").exists(), "the CA file goes with the downloads");
+
+    // A mirror that starts serving something else is caught by the check.
+    mirror.replace_tarball("fake-claude", "9.9.9", b"not claude");
+    let (_, v) = json_call(&env, "GET", "/api/machines/harness-mirror", "").await;
+    assert_eq!(v["ok"], false, "{v}");
+    assert!(v["items"][1]["error"].as_str().unwrap().contains("not the pinned"), "{v}");
 }
 
 /// A build of the agent: answers `--version` as the real one does.
@@ -408,4 +462,86 @@ async fn auto_upgrades_skip_held_machines_and_builds_that_failed() {
         heartbeats(&env.app, &env.cp).await;
     }
     assert_eq!(events(&env, "machine.agent_upgrade_requested").await.len(), 1, "a build that failed isn't tried again by itself");
+}
+
+/// The real npm, in a Node.js laid out as nodejs.org's tarballs are, installs a package
+/// from a stand-in registry over HTTPS with a CA of its own, through the agent's tools,
+/// and refuses one that isn't what was pinned. Needs `node`, `npm` and `xz`; CI runs it
+/// with no network at all (`server.yml`'s isolation job), so npm reaching anything but
+/// the mirror fails it: `cargo test -- --ignored real_npm_installs_from_a_mirror`.
+#[tokio::test]
+#[ignore]
+async fn real_npm_installs_from_a_mirror_with_no_network() {
+    use crate::machines::standin_mirror::{Mirror, node_arch};
+    use crate::machines::tools::Tools;
+    let which = |b: &str| {
+        let out = std::process::Command::new("sh").args(["-c", &format!("readlink -f \"$(command -v {b})\"")]).output().unwrap();
+        let p = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        assert!(!p.is_empty(), "{b} isn't on PATH");
+        std::path::PathBuf::from(p)
+    };
+    // .../lib/node_modules/npm/bin/npm-cli.js, and the node beside that prefix.
+    let npm_dir = which("npm").parent().unwrap().parent().unwrap().to_path_buf();
+    let beside = npm_dir.join("../../../bin/node");
+    let node_bin = if beside.is_file() { beside } else { which("node") };
+
+    let dir = crate::db::temp_path("real-npm");
+    let top = dir.join(format!("node-v0.0.2-linux-{}", node_arch()));
+    std::fs::create_dir_all(top.join("bin")).unwrap();
+    std::fs::create_dir_all(top.join("lib/node_modules")).unwrap();
+    std::fs::copy(&node_bin, top.join("bin/node")).unwrap();
+    sh(&dir, &format!("cp -a '{}' '{}/lib/node_modules/npm'", npm_dir.display(), top.display()));
+    sh(&top.join("bin"), "ln -s ../lib/node_modules/npm/bin/npm-cli.js npm && ln -s ../lib/node_modules/npm/bin/npx-cli.js npx");
+    sh(&dir, &format!("XZ_OPT='-0 -T0' tar -cJf node.tar.xz '{}'", top.file_name().unwrap().to_str().unwrap()));
+    let node_tarball = std::fs::read(dir.join("node.tar.xz")).unwrap();
+
+    let tgz = |manifest: String, file: &str, body: &str| {
+        let d = crate::db::temp_path("probe");
+        std::fs::create_dir_all(d.join("package")).unwrap();
+        std::fs::write(d.join("package/package.json"), manifest).unwrap();
+        exe(&d.join("package").join(file), body);
+        sh(&d, "tar -czf probe.tgz package");
+        std::fs::read(d.join("probe.tgz")).unwrap()
+    };
+    let probe = |name: &str, says: &str| {
+        let manifest = format!(r#"{{"name": "{name}", "version": "1.0.0", "bin": {{"pi": "cli.js", "codex": "cli.js"}}, "dependencies": {{"@corp/mirror-dep": "^1.0.0"}}}}"#);
+        tgz(manifest, "cli.js", &format!("#!/usr/bin/env node\nconsole.log({says:?} + require('@corp/mirror-dep'));\n"))
+    };
+    let mirror = Mirror::serve().await;
+    let node = mirror.node("0.0.2", &node_tarball);
+    // Like Claude Code's and Codex's platform packages: only the mirror has it, and npm fetches it itself.
+    let dep = tgz(r#"{"name": "@corp/mirror-dep", "version": "1.0.0", "main": "index.js"}"#.into(), "index.js", "module.exports = ', with its dependency';\n");
+    mirror.package("@corp/mirror-dep", "1.0.0", &dep);
+    let pin = mirror.package("@corp/mirror-probe", "1.0.0", &probe("@corp/mirror-probe", "from the mirror"));
+    mirror.package("other-probe", "1.0.0", &probe("other-probe", "not pinned"));
+    let wrong = format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode([3u8; 64]));
+    let plan = mirror.plan(&node, vec![("pi", "@corp/mirror-probe", "1.0.0", Some(pin)), ("codex", "other-probe", "1.0.0", Some(wrong))]);
+    crate::machines::tools::check(&plan).unwrap();
+
+    let tools = Tools::new(dir.join("tools"), None).unwrap();
+    tools.set_plan(plan).unwrap();
+    let worker = tokio::spawn(tools.clone().work());
+    let mut states = (String::new(), String::new());
+    for _ in 0..1200 {
+        let r = tools.report().1;
+        states = (r["pi"].state.clone(), r["codex"].state.clone());
+        if [&states.0, &states.1].iter().all(|s| *s == "installed" || *s == "failed") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    worker.abort();
+    let r = tools.report().1;
+    assert_eq!(states.0, "installed", "{:?}", r["pi"]);
+    assert_eq!(states.1, "failed", "{:?}", r["codex"]);
+    assert!(r["codex"].error.as_deref().unwrap_or("").contains("not the pinned"), "{:?}", r["codex"]);
+    let out = std::process::Command::new(tools.bin_dir().join("pi"))
+        .env("PATH", format!("{}:/usr/bin:/bin", tools.bin_dir().display()))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "from the mirror, with its dependency", "{}", String::from_utf8_lossy(&out.stderr));
+    let calls = mirror.calls();
+    assert!(calls.iter().any(|c| c == "/npm/@corp%2fmirror-probe"), "{calls:?}");
+    assert!(calls.iter().any(|c| c == "/npm/@corp/mirror-dep/-/mirror-dep-1.0.0.tgz"), "{calls:?}");
+    let _ = std::fs::remove_dir_all(dir);
 }
