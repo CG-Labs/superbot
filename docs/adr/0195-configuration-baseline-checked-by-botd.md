@@ -23,7 +23,7 @@ Each setting gets one of five statuses:
 - **pass** and **fail**: meets the baseline or doesn't. A value botd couldn't parse fails as `invalid` (botd wouldn't start with it, so this shows only a mismatch between the check and the running server).
 - **excepted**: fails, but is listed in `BASELINE_EXCEPTIONS`, for an exception approved under the policy.
 - **notApplicable**: the baseline doesn't ask for it here. The machine settings on a server with no control plane; `MACHINE_FIREWALL` on Incus (the baseline asks for it on Linode); `MACHINE_FIREWALL_EGRESS` without the firewall; `ISOLATION` when `MACHINE_ROUTING=on` runs every Bot on a machine; `AUTH_BREAK_GLASS` until an admin besides the owner has signed in.
-- **manual**: only a person can judge it, and the value is recorded for them. botd can't verify its own image's signature (`SUPERBOT_VERSION`), can't tell whether more than one customer shares the server (`TEAMS` when off), and can't read a contract (the retention periods).
+- **manual**: only a person can judge it, and the value is recorded for them. botd can't verify its own image's signature (`SUPERBOT_VERSION`), can't tell whether more than one customer shares the server (`TEAMS` when off) or whether teams need private services of their own (`MACHINE_TEAM_NETWORK` when off), and can't read a contract (the retention periods).
 
 `AUDIT_RETENTION_DAYS` passes when unset or at least 730 days, a 12-month observation period plus the year the retention policy keeps events after it; the bundle's `retention.json` already judges it against each period.
 
@@ -57,7 +57,7 @@ The digest is the SHA-256 of one line per setting, in the baseline's order: sett
 
 ## Consequences
 
-- CC5.1-1 stays Partial: the baseline and its exceptions still need approving, and the check run on each managed server quarterly and after changes. What a person checks by hand is now four settings, not 25.
+- CC5.1-1 stays Partial: the baseline and its exceptions still need approving, and the check run on each managed server quarterly and after changes. What a person checks by hand is now five settings, not 26.
 - A new baseline setting needs a rule in `SETTINGS` and `judge`, or the unit test fails; changing a rule changes the digest, so the first check after an upgrade may differ with no setting changed.
 - `baseline.json` names settings and their codes; it holds no secrets, addresses or names, as ADR 0142 requires.
 

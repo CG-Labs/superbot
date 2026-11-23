@@ -32,7 +32,7 @@ pub const MIN_AUDIT_DAYS: u32 = 730;
 
 /// Each setting the baseline names, in its table's order, with the value it asks for.
 /// A unit test holds this to the baseline's table.
-pub const SETTINGS: [(&str, &str); 25] = [
+pub const SETTINGS: [(&str, &str); 26] = [
     ("SUPERBOT_VERSION", "a released, signed version"),
     ("AUTH_MFA", "admins or all"),
     ("AUTH_BREAK_GLASS", "0 once another admin signs in"),
@@ -50,6 +50,7 @@ pub const SETTINGS: [(&str, &str); 25] = [
     ("MACHINE_TEAMMATE_USERS", "on"),
     ("MACHINE_FIREWALL", "on for Linode machines"),
     ("MACHINE_FIREWALL_EGRESS", "on with the firewall"),
+    ("MACHINE_TEAM_NETWORK", "vpc on Linode when teams need private services of their own"),
     ("MACHINE_ON_DISABLE", "suspend"),
     ("SUPERBOT_CHROMIUM_SANDBOX", "unset or on"),
     ("METRICS_LISTEN", "off, loopback, or with METRICS_TOKEN"),
@@ -209,6 +210,17 @@ fn judge(setting: &str, o: &Observed) -> (Status, String, &'static str) {
             Ok(None) => (NotApplicable, "off".into(), "only with MACHINE_FIREWALL=on"),
             Err(_) => invalid(),
         },
+        "MACHINE_TEAM_NETWORK" => {
+            let r = match crate::machines::team_network::Settings::from_env(var) {
+                Ok(Some(_)) => (Pass, "vpc".into(), "a team's machines reach its own VPC and no other team's"),
+                Ok(None) => (Manual, "off".into(), "needed when teams' machines must reach private services of their own, which botd can't tell"),
+                Err(_) => invalid(),
+            };
+            match var("MACHINE_PROVIDER").trim().to_ascii_lowercase().as_str() {
+                "" | "linode" => machines(r),
+                _ => (NotApplicable, r.1, "team networks are on Linode machines only"),
+            }
+        }
         "MACHINE_ON_DISABLE" => machines(match var("MACHINE_ON_DISABLE").trim().to_ascii_lowercase().as_str() {
             "" | "suspend" => (Pass, "suspend".into(), "a disabled user's machine is powered off"),
             "keep" => (Fail, "keep".into(), "a disabled user's machine keeps running"),
@@ -436,11 +448,12 @@ mod tests {
         let r = check(&observed(&get, &|_| false));
         assert!(r.ok(), "{:#?}", r.findings.iter().filter(|f| f.status == Status::Fail).collect::<Vec<_>>());
         let manual: Vec<_> = r.findings.iter().filter(|f| f.status == Status::Manual).map(|f| f.setting).collect();
-        assert_eq!(manual, ["SUPERBOT_VERSION", "CHAT_RETENTION_DAYS", "HARNESS_SESSION_RETENTION_DAYS", "TEAMMATE_FILES_RETENTION_DAYS"]);
+        assert_eq!(manual, ["SUPERBOT_VERSION", "MACHINE_TEAM_NETWORK", "CHAT_RETENTION_DAYS", "HARNESS_SESSION_RETENTION_DAYS", "TEAMMATE_FILES_RETENTION_DAYS"]);
         assert_eq!(status(&r, "CHAT_RETENTION_DAYS"), (Status::Manual, "90".into()));
         assert_eq!(status(&r, "MACHINE_BACKUP_AGE_RECIPIENTS"), (Status::Pass, "set".into()), "never the key itself");
         assert_eq!(status(&r, "MACHINE_FIREWALL_EGRESS"), (Status::Pass, "on".into()), "on by default with the firewall");
-        assert_eq!(r.count(Status::Pass), SETTINGS.len() - 4);
+        assert_eq!(status(&r, "MACHINE_TEAM_NETWORK"), (Status::Manual, "off".into()), "only some teams need one");
+        assert_eq!(r.count(Status::Pass), SETTINGS.len() - 5);
     }
 
     #[test]
@@ -454,7 +467,7 @@ mod tests {
         assert!(!r.ok());
         let fails: Vec<_> = r.findings.iter().filter(|f| f.status == Status::Fail).map(|f| f.setting).collect();
         assert_eq!(fails, ["AUTH_MFA", "AUTH_BREAK_GLASS", "SUPERBOT_DATABASE_ENCRYPTION", "SUPERBOT_BACKUP_ENCRYPTION", "SERVER_BACKUP_OFF_HOST", "ISOLATION", "EVIDENCE_BUNDLES"]);
-        for s in ["MACHINE_HARDENING", "MACHINE_TEAMMATE_USERS", "MACHINE_FIREWALL", "MACHINE_BACKUP_AGE_RECIPIENTS", "MACHINE_ON_DISABLE"] {
+        for s in ["MACHINE_HARDENING", "MACHINE_TEAMMATE_USERS", "MACHINE_FIREWALL", "MACHINE_BACKUP_AGE_RECIPIENTS", "MACHINE_TEAM_NETWORK", "MACHINE_ON_DISABLE"] {
             assert_eq!(status(&r, s).0, Status::NotApplicable, "{s} without machines");
         }
         assert_eq!(status(&r, "SERVER_BACKUP_OFF_HOST"), (Status::Fail, "auto".into()));
@@ -466,7 +479,7 @@ mod tests {
     #[test]
     fn each_rule_reads_the_value_as_botd_does() {
         type Case<'a> = (&'a [(&'a str, &'a str)], &'a str, Status, &'a str);
-        let cases: [Case; 17] = [
+        let cases: [Case; 20] = [
             (&[("AUTH_BREAK_GLASS", "off")], "AUTH_BREAK_GLASS", Status::Pass, "0"),
             (&[("SIGNIN_ALERTS", "no")], "SIGNIN_ALERTS", Status::Fail, "off"),
             (&[("TESTING_MODE", "yes")], "TESTING_MODE", Status::Fail, "on"),
@@ -481,6 +494,9 @@ mod tests {
             (&[("MACHINE_PROVIDER", "incus")], "MACHINE_FIREWALL", Status::NotApplicable, "off"),
             (&[("MACHINE_FIREWALL", "on"), ("MACHINE_CONTROL_URL", "https://192.0.2.1:8443"), ("MACHINE_FIREWALL_EGRESS", "off")], "MACHINE_FIREWALL_EGRESS", Status::Fail, "off"),
             (&[], "MACHINE_FIREWALL_EGRESS", Status::NotApplicable, "off"),
+            (&[("MACHINE_TEAM_NETWORK", "VPC")], "MACHINE_TEAM_NETWORK", Status::Pass, "vpc"),
+            (&[("MACHINE_TEAM_NETWORK", "vpc"), ("MACHINE_PROVIDER", "incus")], "MACHINE_TEAM_NETWORK", Status::NotApplicable, "vpc"),
+            (&[("MACHINE_TEAM_NETWORK", "yes")], "MACHINE_TEAM_NETWORK", Status::Fail, "invalid"),
             (&[("MACHINE_ON_DISABLE", "keep")], "MACHINE_ON_DISABLE", Status::Fail, "keep"),
             (&[("SUPERBOT_CHROMIUM_SANDBOX", "off")], "SUPERBOT_CHROMIUM_SANDBOX", Status::Fail, "off"),
             (&[("METRICS_LISTEN", "0.0.0.0:9464")], "METRICS_LISTEN", Status::Fail, "public"),

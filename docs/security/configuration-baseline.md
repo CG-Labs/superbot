@@ -42,7 +42,7 @@ botd checks itself against the table above ([ADR 0195](../adr/0195-configuration
 Quarterly, after every upgrade and after every production change, the operator:
 
 1. Runs `botctl evidence baseline` and saves its output.
-2. Checks by hand what it leaves to a person: `cosign verify` on the image the server runs, whether customers share the server (`TEAMS`), the retention periods against the [retention policy](policies/data-classification-and-retention.md#retention) and contracts, and that `MACHINE_BACKUP_AGE_RECIPIENTS`'s private key is kept off the host.
+2. Checks by hand what it leaves to a person: `cosign verify` on the image the server runs, whether customers share the server (`TEAMS`), whether teams need private services of their own (`MACHINE_TEAM_NETWORK`), the retention periods against the [retention policy](policies/data-classification-and-retention.md#retention) and contracts, and that `MACHINE_BACKUP_AGE_RECIPIENTS`'s private key is kept off the host.
 3. Fixes each deviation, or has an exception approved under the [information security policy](policies/information-security.md#exceptions) and lists the setting in `BASELINE_EXCEPTIONS` (comma-separated names), which turns its failure into "excepted". The check lists exceptions for settings the baseline doesn't have (a failure, to fix) and for settings that meet it anyway (to remove).
 
 The saved output, what was checked by hand and the approved exceptions go to the evidence store under CC5.1 ([evidence plan](soc2-evidence-plan.md#collection-calendar)). The monthly evidence bundle records the MFA policy, backup and database encryption and retention settings, and every change to them, between checks.
