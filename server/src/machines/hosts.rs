@@ -20,7 +20,7 @@
 use super::backup::{self, Move};
 use super::enroll;
 use super::placement::{self, Tenant};
-use super::provider::{HostStatus, Hosts};
+use super::provider::{HostStatus, Hosts, ProviderError};
 use super::{ControlPlane, SYSTEM, State, Step, conflict, event, next};
 use crate::audit::{Outcome, Who};
 use crate::db::{Machine, MachineHost, now};
@@ -454,11 +454,34 @@ fn occupants(app: &App, cp: &ControlPlane, h: &dyn Hosts, host: &str) -> Vec<Mac
     out
 }
 
+/// The machines whose failed restore onto `host` may have left its imported copy there,
+/// with the copy's id. Cleanup keeps a copy that is all that's left of its machine, and
+/// may fail to delete one, so each counts until the provider says it is gone.
+async fn leftover_copies(app: &App, cp: &ControlPlane, host: &str) -> Vec<(Machine, String)> {
+    let Some(p) = cp.provider.as_deref() else { return Vec::new() };
+    let mut out: Vec<(Machine, String)> = Vec::new();
+    for r in app.db.machine_restores_in("failed") {
+        if r.to_host.as_deref() != Some(host) {
+            continue;
+        }
+        let Some(m) = app.db.machine(&r.machine_id) else { continue };
+        let copy = backup::staging(p, &m, &r);
+        if out.iter().any(|(_, c)| *c == copy) {
+            continue;
+        }
+        if !matches!(p.get(&copy).await, Err(ProviderError::NotFound)) {
+            out.push((m, copy));
+        }
+    }
+    out
+}
+
 /// `PUT /api/machines/hosts/{name}/dedication` `{team, reason?}`: only the team's
 /// machines go on the host from now on, and the team's go only on hosts dedicated to it
 /// (ADR 0166): new machines, retries, restores onto another host, and a lost host's
 /// recovery. Refused while anyone else's machine is on it, sent there, or being restored
-/// there: move those first. Server admins only (rbac leaves it to Admin).
+/// there: move those first. Refused too while a failed restore of theirs may have left
+/// its copy there. Server admins only (rbac leaves it to Admin).
 pub async fn dedicate(
     AppS(app): AppS<AppState>,
     Extension(a): Extension<Arc<Auth>>,
@@ -494,6 +517,20 @@ pub async fn dedicate(
             others.len(),
             team.name,
             ids.iter().take(5).copied().collect::<Vec<_>>().join(", ")
+        )));
+    }
+    let left = leftover_copies(&app, cp, &row.name).await;
+    let others: Vec<&(Machine, String)> = left.iter().filter(|(m, _)| app.db.team_id_of(&m.user_id).as_deref() != Some(team.id.as_str())).collect();
+    if !others.is_empty() {
+        let ids: Vec<&str> = others.iter().map(|(m, _)| m.id.as_str()).collect();
+        let d = json!({ "team": team.id, "reason": "leftover_copies", "machines": ids.len(), "machineIds": ids.iter().take(20).collect::<Vec<_>>() });
+        record(&app, &by, "machine.host_dedication_refused", &row.name, Outcome::Denied, d);
+        return Err(conflict(format!(
+            "Host {} may still hold copies that failed restores left of {} machines of people not on team {}: {}. Delete them on the host first, or bring it back up if it isn't answering.",
+            row.name,
+            others.len(),
+            team.name,
+            others.iter().take(5).map(|(_, c)| c.as_str()).collect::<Vec<_>>().join(", ")
         )));
     }
     if app.db.machine_host_dedicate(&row.name, &team.id, by.actor.id.as_deref(), reason.as_deref()) {

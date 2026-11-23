@@ -184,6 +184,26 @@ async fn dedicating_is_refused_while_anyone_elses_machine_is_there_and_sharing_n
     sent.placed_on = None;
     sent.create_sent_at = None;
     assert!(env.app.db.save_machine(&sent, State::Pending));
+
+    // So does the copy a failed move of cy's onto b left there (botd stopped mid-restore,
+    // or deleting it failed): cy's disk, though her machine is on a. Until it is gone.
+    let n = crate::db::NewMachineRestore { id: "rleft", machine: &cym, backup_id: "bnone", by: None, rto_ms: None, from_host: Some("a"), to_host: Some("b"), reason: None };
+    assert!(env.app.db.machine_restore_start(&n).is_some());
+    assert!(env.app.db.machine_restore_move("rleft", &["importing"], "failed", Some("botd stopped mid-restore")));
+    let copy = format!("{}-restore", cym.label);
+    let disk = env.a.instance(&cym.label).unwrap();
+    env.b.w().instances.insert(copy.clone(), disk);
+    let (code, e) = dedicate(&env, "b", &acme, None).await;
+    assert_eq!(code, 409, "{e}");
+    assert!(e["error"].as_str().unwrap().contains(&format!("b/{copy}")) && e["error"].as_str().unwrap().contains("failed restores left"), "{e}");
+    let refused = events(&env, "machine.host_dedication_refused").await;
+    let left: Vec<&Value> = refused.iter().filter(|e| e["details"]["reason"] == "leftover_copies").collect();
+    assert_eq!((left.len(), &left[0]["details"]["machineIds"]), (1, &json!([cym.id])), "{refused:?}");
+    assert!(env.app.db.machine_host("b").unwrap().dedicated_team.is_none());
+    env.b.w().down = true;
+    assert_eq!(dedicate(&env, "b", &acme, None).await.0, 409, "b can't say the copy is gone");
+    env.b.w().down = false;
+    env.b.w().instances.remove(&copy);
     let (code, v) = dedicate(&env, "b", &acme, None).await;
     assert_eq!(code, 200, "{v}");
     assert_eq!(ask(&env, &ada).await.0, 202);

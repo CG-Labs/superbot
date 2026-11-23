@@ -579,7 +579,7 @@ fn provider_name(b: &MachineBackup) -> String {
 
 /// The imported copy's id while it is set up beside the machine: on the host the
 /// restore is onto, where the provider has several (ADR 0076).
-fn staging(p: &dyn MachineProvider, m: &Machine, r: &MachineRestore) -> String {
+pub(super) fn staging(p: &dyn MachineProvider, m: &Machine, r: &MachineRestore) -> String {
     let name = format!("{}-restore", m.label);
     match (p.hosts(), r.to_host.as_deref()) {
         (Some(h), Some(to)) => h.id_on(to, &name),

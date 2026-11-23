@@ -37,7 +37,8 @@ We chose option 2. Only that version makes "a kernel escape stays within one cus
 - It is refused (409, audited as `machine.host_dedication_refused`, outcome denied, with the machines' ids) while any of these belongs to someone who isn't on the team:
   - a machine on the host;
   - a create sent there but not yet answered (`placed_on`);
-  - a restore on its way there.
+  - a restore on its way there;
+  - the copy a failed restore onto the host may have left there. Cleanup after a restart keeps a copy that is all that's left of its machine, and may fail to delete one, while the machine's record still points at its old host. botd asks the host about each such copy. It counts the copy until the host says it is gone, so a host that doesn't answer is refused too.
 
   So a host is never dedicated with a stranger already on it. Move those machines first (`botctl machine restore <user> <backup-id> --host <other> --yes`).
 - It is also refused while the host is dedicated to another team; share it first. Dedicating it again to the same team changes nothing.
@@ -113,7 +114,7 @@ The console has no host view (hosts are botctl's, ADR 0081), so it isn't changed
   - routes: admins only, unknown host and team, a reason with a newline, unknown fields, idempotent and audited once, and refused while the host is dedicated to another team;
   - placement under spread: strangers and other teams skip an empty dedicated host; the team goes onto it though a shared host ties and comes first; once it is full, the team's request is refused naming the shared hosts, a retried create waits and is said once, and strangers are refused rather than placed there;
   - the view's `dedicated`, `misplaced` and warnings, and the two metrics, with no team id in labels;
-  - dedicating is refused while a stranger's machine is there, or a create sent there is unanswered; the refusal is audited as denied;
+  - dedicating is refused while a stranger's machine is there, a create sent there is unanswered, or a failed move left a stranger's copy there (also while the host can't say whether it is gone); the refusal is audited as denied;
   - sharing needs a reason, is audited once, and lets anyone back on;
   - a host dedicated to a team that is then deleted takes nobody and is warned about until shared;
   - the red-team case: no `--host` restore crosses teams either way; recovering a lost dedicated host onto a shared one skips every machine; by placement, the team's machines fill its other host and the rest wait, never placed on the shared host with room;
