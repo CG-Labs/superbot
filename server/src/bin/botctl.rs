@@ -152,6 +152,10 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl sso saml <provider>                       Native SAML: what to enter at the IdP, and its metadata
   botctl sso saml <provider> import [<file> | -] < metadata.xml
                                                    Import the IdP's SAML metadata (stdin by default)
+  botctl sso saml <provider> key next|promote|cancel|retire signing|encryption
+                                                   Roll over botd's own SP key: next publishes a new one,
+                                                   promote puts it in use once the IdP has it, retire
+                                                   drops the encryption key it replaced (ADR 0181)
   botctl sso role-mappings                         SAML groups mapped to custom roles (SSO_<ID>_GROUPS_ATTRIBUTE)
   botctl sso role map <provider> <group> <role>    Sign-ins listing <group> get <role> across the server.
                                                    Never admin, nor a role that acts on admins
@@ -1151,7 +1155,7 @@ fn sso_role_request(args: &[&str]) -> Result<(&'static str, String, Option<Strin
         ["role", "map", provider, group, role] => ("POST", "/api/sso/role-mappings".into(), Some(json!({ "provider": provider, "group": group, "role": role }).to_string())),
         ["role", "show", id] => ("GET", format!("/api/sso/role-mappings/{}", encode(id)), None),
         ["role", "unmap", id] => ("DELETE", format!("/api/sso/role-mappings/{}", encode(id)), None),
-        _ => return Err("Usage: botctl sso saml <provider> [json] | sso saml <provider> import [<file> | -] | sso role-mappings | sso role map <provider> <group> <role> | sso role show <id> | sso role unmap <id>".into()),
+        _ => return Err("Usage: botctl sso saml <provider> [json] | sso saml <provider> import [<file> | -] | sso saml <provider> key next|promote|cancel|retire signing|encryption | sso role-mappings | sso role map <provider> <group> <role> | sso role show <id> | sso role unmap <id>".into()),
     })
 }
 
@@ -1482,6 +1486,7 @@ fn saml_summary(v: &Value) -> String {
     } else if let Some(p) = key["problem"].as_str() {
         out += &format!("  SP signing key:           {p}\n");
     }
+    out += &rollover_lines(key);
     let enc = &v["spEncryptionKey"];
     if let Some(c) = enc["certificate"].as_object() {
         out += &format!(
@@ -1493,6 +1498,7 @@ fn saml_summary(v: &Value) -> String {
     } else if let Some(p) = enc["problem"].as_str() {
         out += &format!("  SP encryption key:        {p}\n");
     }
+    out += &rollover_lines(enc);
     out += &format!(
         "  Encrypted assertions:     {}\n",
         match v["encryptedAssertions"].as_str() {
@@ -1545,6 +1551,55 @@ fn saml_summary(v: &Value) -> String {
         out += &format!("    Certificate SHA-256 {} ({}), expires {}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]));
     }
     out
+}
+
+/// A generated SP key's rollover under its certificate line (ADR 0181): the next key, published
+/// beside it, and a replaced encryption key still decrypting; for encryption keys, when each last
+/// decrypted a sign-in, so it's plain when the IdP has moved to the next one.
+fn rollover_lines(key: &Value) -> String {
+    let used = |k: &Value| match k.get("lastUsedSecondsAgo") {
+        None => String::new(),
+        Some(Value::Null) => "; no sign-in decrypted with it since botd started".into(),
+        Some(s) => format!("; last decrypted a sign-in {} ago", ago(s.as_u64().unwrap_or(0))),
+    };
+    let mut out = String::new();
+    let rolling = key["next"].is_object() || key["previous"].is_object();
+    if rolling && key["certificate"].is_object() && key.get("lastUsedSecondsAgo").is_some() {
+        out += &format!("    In use{}\n", used(key));
+    }
+    let next = &key["next"];
+    if let Some(c) = next["certificate"].as_object() {
+        out += &format!("    Next: SHA-256 {}, expires {}: published, not yet in use{}\n", c["sha256"].as_str().unwrap_or_default(), day(&c["notAfter"]), used(next));
+    }
+    let prev = &key["previous"];
+    if let Some(c) = prev["certificate"].as_object() {
+        out += &format!("    Previous: SHA-256 {}: no longer published, still decrypts until retired{}\n", c["sha256"].as_str().unwrap_or_default(), used(prev));
+    }
+    out
+}
+
+fn ago(s: u64) -> String {
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m", s / 60),
+        3600..86_400 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86_400),
+    }
+}
+
+/// `botctl sso saml <provider> key <step> <use>`: the request for one step of a rollover (ADR 0181).
+fn saml_key_request(id: &str, step: &str, key_use: &str) -> Result<(&'static str, String), String> {
+    if !matches!(key_use, "signing" | "encryption") {
+        return Err("Usage: botctl sso saml <provider> key next|promote|cancel|retire signing|encryption".into());
+    }
+    let at = |end: &str| format!("/api/sso/{}/saml/keys/{key_use}/{end}", encode(id));
+    match step {
+        "next" => Ok(("POST", at("next"))),
+        "promote" => Ok(("POST", at("promote"))),
+        "cancel" => Ok(("DELETE", at("next"))),
+        "retire" => Ok(("DELETE", at("previous"))),
+        _ => Err("Usage: botctl sso saml <provider> key next|promote|cancel|retire signing|encryption".into()),
+    }
 }
 
 fn day(ms: &Value) -> String {
@@ -1891,6 +1946,18 @@ fn run(args: &[String]) -> Result<String, String> {
             };
             let res = api(Cred::Operator, "PUT", &format!("/api/sso/{}/saml/idp-metadata", encode(id)), Some(json!({ "xml": xml }).to_string()))?;
             Ok(format!("Imported.\n{}", saml_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)))
+        }
+        ["sso", "saml", id, "key", step, key_use] => {
+            let (method, path) = saml_key_request(id, step, key_use)?;
+            let res = api(Cred::Operator, method, &path, None)?;
+            let done = match *step {
+                "next" => format!("Made a next {key_use} key. Give the IdP SuperBot's metadata again (or the new certificate), then: botctl sso saml {id} key promote {key_use}"),
+                "promote" if *key_use == "encryption" => format!("Promoted. The replaced key still decrypts: once the IdP encrypts to the new one, botctl sso saml {id} key retire encryption"),
+                "promote" => "Promoted: botd signs with the new key.".into(),
+                "cancel" => "Cancelled: the next key is gone.".into(),
+                _ => "Retired: the previous key is gone.".into(),
+            };
+            Ok(format!("{done}\n{}", saml_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)))
         }
         ["sso", rest @ ..] => {
             let (method, path, body) = sso_role_request(rest)?;
@@ -2865,6 +2932,31 @@ mod tests {
         v["roleMappings"] = json!(2);
         let out = saml_summary(&v);
         assert!(out.contains("Required groups:          SuperBot Users, Admins\n  Group role mappings:      2 "), "{out}");
+    }
+
+    #[test]
+    fn saml_summary_shows_a_key_rollover_and_botctl_drives_it() {
+        let cert = |sha: &str| json!({ "sha256": sha, "subject": "CN=sp", "notAfter": 1_900_000_000_000_i64 });
+        let mut v = json!({ "provider": "corp", "label": "Corp", "idp": null, "encryptedAssertions": "allow" });
+        v["spKey"] = json!({ "from": "generated", "certificate": cert("12:34"), "next": { "certificate": cert("ab:01") } });
+        v["spEncryptionKey"] = json!({
+            "from": "generated", "certificate": cert("56:78"), "lastUsedSecondsAgo": 7200,
+            "next": null, "previous": { "certificate": cert("cd:02"), "lastUsedSecondsAgo": null },
+        });
+        let out = saml_summary(&v);
+        assert!(out.contains("SP signing certificate:   SHA-256 12:34 (generated), expires 2030-03-17\n    Next: SHA-256 ab:01, expires 2030-03-17: published, not yet in use\n"), "{out}");
+        assert!(out.contains("SP encryption certificate: SHA-256 56:78 (generated), expires 2030-03-17\n    In use; last decrypted a sign-in 2h ago\n"), "{out}");
+        assert!(out.contains("    Previous: SHA-256 cd:02: no longer published, still decrypts until retired; no sign-in decrypted with it since botd started\n"), "{out}");
+        v["spKey"] = json!({ "from": "secret", "certificate": cert("12:34") });
+        assert!(!saml_summary(&v).contains("    Next:"), "a configured key has no rollover here");
+
+        assert_eq!(saml_key_request("corp", "next", "signing"), Ok(("POST", "/api/sso/corp/saml/keys/signing/next".into())));
+        assert_eq!(saml_key_request("corp", "promote", "encryption"), Ok(("POST", "/api/sso/corp/saml/keys/encryption/promote".into())));
+        assert_eq!(saml_key_request("corp", "cancel", "signing"), Ok(("DELETE", "/api/sso/corp/saml/keys/signing/next".into())));
+        assert_eq!(saml_key_request("a b", "retire", "encryption"), Ok(("DELETE", "/api/sso/a%20b/saml/keys/encryption/previous".into())));
+        assert!(saml_key_request("corp", "rotate", "signing").is_err());
+        assert!(saml_key_request("corp", "next", "both").is_err());
+        assert_eq!((ago(59), ago(60), ago(7200), ago(200_000)), ("59s".into(), "1m".into(), "2h".into(), "2d".into()));
     }
 
     #[test]
