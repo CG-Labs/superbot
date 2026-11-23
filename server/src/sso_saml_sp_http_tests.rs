@@ -1276,3 +1276,177 @@ async fn an_idp_initiated_encrypted_assertion_restarts_too() {
     assert_eq!(to, "/login?error=sso_failed");
     assert_eq!(sp.last_failure().await["reason"], "unencrypted_assertion");
 }
+
+// Rolling over botd's own SP keys (ADR 0181)
+
+impl Sp {
+    async fn sp_metadata(&self) -> String {
+        http().get(format!("http://127.0.0.1:{}/api/auth/sso/{}/metadata", self.port, self.id)).send().await.unwrap().text().await.unwrap()
+    }
+
+    /// The certificates our metadata publishes for `key_use`, in order.
+    async fn published(&self, key_use: &str) -> Vec<String> {
+        let md = self.sp_metadata().await;
+        md.split(&format!(r#"<md:KeyDescriptor use="{key_use}">"#)).skip(1).map(|kd| kd.split("<ds:X509Certificate>").nth(1).unwrap().split('<').next().unwrap().to_string()).collect()
+    }
+
+    /// One step of a rollover, as botctl takes it: the status and the provider's view after.
+    async fn key_step(&self, method: &str, key_use: &str, end: &str) -> (u16, Value) {
+        let (code, body) = call(self.port, method, &format!("/api/sso/{}/saml/keys/{key_use}/{end}", self.id), &self.admin, "").await;
+        (code, serde_json::from_str(&body).unwrap_or(json!({ "error": body })))
+    }
+}
+
+fn sha_of(cert: &str) -> String {
+    crate::sso::xmldsig::Cert::from_base64(cert).unwrap().sha256
+}
+
+#[tokio::test]
+async fn an_encryption_key_rolls_over_without_refusing_a_sign_in() {
+    let sp = serve(&[("ENCRYPTED_ASSERTIONS", "require")]).await;
+    let u = sp.link();
+    let old = sp.enc_cert().await;
+    let signing = sp.published("signing").await;
+    let signs_in = |cert: &str| {
+        let cert = cert.to_string();
+        let sp = &sp;
+        async move {
+            let (code, to, head) = sp.sign_in(encrypted_to(&cert)).await;
+            (code == 200).then_some(()).and(signed_in_as(sp.port, &head).await).ok_or(to)
+        }
+    };
+    assert_eq!(signs_in(&old).await, Ok(u.id.clone()));
+
+    // A next key: published after the one in use, and it decrypts, before the IdP is told.
+    let (code, v) = sp.key_step("POST", "encryption", "next").await;
+    assert_eq!(code, 200, "{v}");
+    let next_sha = v["spEncryptionKey"]["next"]["certificate"]["sha256"].as_str().unwrap().to_string();
+    assert_eq!(v["spEncryptionKey"]["certificate"]["sha256"].as_str(), Some(sha_of(&old).as_str()), "the one in use stays");
+    let published = sp.published("encryption").await;
+    assert_eq!((published.len(), published[0] == old, sha_of(&published[1])), (2, true, next_sha.clone()));
+    assert_eq!(sp.published("signing").await, signing, "the signing key is left alone");
+    let made = &sp.audit("sso.saml_sp_key_created").await[0];
+    assert_eq!((made["details"]["use"].as_str(), made["details"]["stage"].as_str(), made["details"]["certificate"].as_str()), (Some("encryption"), Some("next"), Some(next_sha.as_str())));
+    assert_eq!(made["actorId"].as_str(), sp.app.db.users().iter().find(|u| u.role == Role::Admin).map(|u| u.id.as_str()), "made by the admin");
+    let next = published[1].clone();
+    let view = |sp: &Sp| {
+        let (port, id, admin) = (sp.port, sp.id.clone(), sp.admin.clone());
+        async move { serde_json::from_str::<Value>(&call(port, "GET", &format!("/api/sso/{id}/saml"), &admin, "").await.1).unwrap()["spEncryptionKey"].clone() }
+    };
+    assert_eq!(view(&sp).await["next"]["lastUsedSecondsAgo"], Value::Null, "the IdP hasn't used it yet");
+    assert_eq!(signs_in(&next).await, Ok(u.id.clone()), "an IdP that took up the new metadata early");
+    assert!(view(&sp).await["next"]["lastUsedSecondsAgo"].is_u64(), "now it has");
+    assert_eq!(signs_in(&old).await, Ok(u.id.clone()));
+    let (code, e) = sp.key_step("POST", "encryption", "next").await;
+    assert!(code == 409 && e["error"].as_str().unwrap().contains("already a next"), "{e}");
+
+    // Promoted: the new key is the one published; the old one still decrypts until retired.
+    let (code, v) = sp.key_step("POST", "encryption", "promote").await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!((v["spEncryptionKey"]["certificate"]["sha256"].as_str(), v["spEncryptionKey"]["next"].clone()), (Some(next_sha.as_str()), Value::Null));
+    assert_eq!(v["spEncryptionKey"]["previous"]["certificate"]["sha256"].as_str(), Some(sha_of(&old).as_str()));
+    assert_eq!(sp.published("encryption").await, vec![next.clone()], "never the previous key");
+    assert_eq!(sp.app.db.setting(&format!("sso_saml_sp_cert_{}_encryption", sp.id)), Some(next.clone()));
+    assert_eq!(sp.app.db.setting(&format!("sso_saml_sp_cert_{}_encryption_previous", sp.id)), Some(old.clone()));
+    assert!(sp.app.db.setting(&format!("sso_saml_sp_key_{}_encryption_next", sp.id)).is_none());
+    for stage in ["", "_previous"] {
+        let sealed = sp.app.db.setting(&format!("sso_saml_sp_key_{}_encryption{stage}", sp.id)).unwrap();
+        assert!(crate::secrets::sealed::is_sealed(&sealed), "sealed again where it now is: {stage}");
+    }
+    let promoted = &sp.audit("sso.saml_sp_key_promoted").await[0];
+    let d = &promoted["details"];
+    assert_eq!((d["use"].as_str(), d["certificate"].as_str(), d["replaced"].as_str(), d["previousKept"].as_bool()), (Some("encryption"), Some(next_sha.as_str()), Some(sha_of(&old).as_str()), Some(true)));
+    assert_eq!(signs_in(&old).await, Ok(u.id.clone()), "an IdP that hasn't refreshed yet");
+    assert!(view(&sp).await["previous"]["lastUsedSecondsAgo"].is_u64());
+    assert_eq!(signs_in(&next).await, Ok(u.id.clone()));
+    assert!(view(&sp).await["lastUsedSecondsAgo"].is_u64(), "the key in use, too");
+
+    // One rollover at a time: a second promotion waits for the previous key to be retired.
+    let (code, e) = sp.key_step("POST", "encryption", "promote").await;
+    assert!(code == 409 && e["error"].as_str().unwrap().contains("no next"), "{e}");
+    assert_eq!(sp.key_step("POST", "encryption", "next").await.0, 200);
+    let (code, e) = sp.key_step("POST", "encryption", "promote").await;
+    assert!(code == 409 && e["error"].as_str().unwrap().contains("retire it first"), "{e}");
+    let (code, v) = sp.key_step("DELETE", "encryption", "next").await;
+    assert_eq!((code, v["spEncryptionKey"]["next"].clone()), (200, Value::Null));
+    assert_eq!(sp.published("encryption").await, vec![next.clone()]);
+    let cancelled = &sp.audit("sso.saml_sp_key_retired").await[0];
+    assert_eq!(cancelled["details"]["stage"], "next");
+
+    // Retired: the old key is gone for good.
+    let (code, v) = sp.key_step("DELETE", "encryption", "previous").await;
+    assert_eq!((code, v["spEncryptionKey"]["previous"].clone()), (200, Value::Null));
+    let retired = &sp.audit("sso.saml_sp_key_retired").await[0];
+    assert_eq!((retired["details"]["stage"].as_str(), retired["details"]["certificate"].as_str()), (Some("previous"), Some(sha_of(&old).as_str())));
+    assert!(sp.app.db.setting(&format!("sso_saml_sp_key_{}_encryption_previous", sp.id)).is_none());
+    assert_eq!(signs_in(&old).await, Err("/login?error=sso_failed".to_string()));
+    assert_eq!(sp.last_failure().await["reason"], "bad_encryption");
+    assert_eq!(signs_in(&next).await, Ok(u.id.clone()));
+    assert_eq!(sp.key_step("DELETE", "encryption", "previous").await.0, 409, "nothing left to retire");
+}
+
+#[tokio::test]
+async fn a_signing_key_is_published_first_and_signs_only_once_promoted() {
+    let sp = serve_slo(&[("SIGN_REQUESTS", "true")]).await;
+    let old = sp.sp_cert().await;
+    let (code, v) = sp.key_step("POST", "signing", "next").await;
+    assert_eq!(code, 200, "{v}");
+    assert!(v["spKey"]["next"]["certificate"]["sha256"].is_string() && v["spKey"].get("previous").is_none(), "{v}");
+    let published = sp.published("signing").await;
+    assert_eq!((published.len(), sha_of(&published[0])), (2, old.sha256.clone()), "the one in use first");
+    let next = crate::sso::xmldsig::Cert::from_base64(&published[1]).unwrap();
+    let request = || async {
+        let (code, head, _) = crate::tests::call_with(sp.port, "GET", &format!("/api/auth/sso/{}/start", sp.id), "", "", "").await;
+        assert_eq!(code, 303);
+        let (_, query) = header(&head, "location").unwrap().split_once('?').map(|(a, b)| (a.to_string(), b.to_string())).unwrap();
+        crate::sso::saml_sp::from_redirect(&query).unwrap()
+    };
+    let r = request().await;
+    assert_eq!(r.verify(std::slice::from_ref(&old)), Ok(true), "still signed with the old key");
+    assert!(r.verify(std::slice::from_ref(&next)).is_err());
+
+    let (code, v) = sp.key_step("POST", "signing", "promote").await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["spKey"]["certificate"]["sha256"].as_str(), Some(next.sha256.as_str()));
+    assert_eq!(sp.published("signing").await, vec![published[1].clone()]);
+    let r = request().await;
+    assert_eq!(r.verify(std::slice::from_ref(&next)), Ok(true), "signed with the new key");
+    assert!(r.verify(std::slice::from_ref(&old)).is_err());
+    assert!(sp.app.db.setting(&format!("sso_saml_sp_key_{}_previous", sp.id)).is_none(), "a replaced signing key isn't kept");
+    let promoted = &sp.audit("sso.saml_sp_key_promoted").await[0];
+    assert_eq!((promoted["details"]["use"].as_str(), promoted["details"]["previousKept"].as_bool()), (Some("signing"), Some(false)));
+    assert_eq!(sp.key_step("DELETE", "signing", "previous").await.0, 409);
+
+    // Logout answers are signed with it too.
+    sp.link();
+    let (code, to) = sp.slo_get(&Logout::request(&sp.slo(), NAME_ID, None, db::now()).redirect()).await;
+    assert_eq!(code, 303, "{to}");
+    signed_redirect(&to, &next);
+}
+
+#[tokio::test]
+async fn rollovers_are_for_admins_and_botds_own_keys_in_use() {
+    let off = serve(&[]).await;
+    let (code, e) = off.key_step("POST", "encryption", "next").await;
+    assert!(code == 409 && e["error"].as_str().unwrap().contains("ENCRYPTED_ASSERTIONS is off"), "{e}");
+    assert!(off.app.db.setting(&format!("sso_saml_sp_key_{}_encryption_next", off.id)).is_none());
+    assert_eq!(off.key_step("POST", "both", "next").await.0, 400);
+    assert_eq!(call(off.port, "POST", "/api/sso/nope/saml/keys/signing/next", &off.admin, "").await.0, 400);
+    let member = off.app.db.create_user(None, Some("bob@example.com"), "Bob", Role::Member).unwrap();
+    let bob = session_for(off.port, &off.admin, &member.id).await;
+    for (method, end) in [("POST", "next"), ("POST", "promote"), ("DELETE", "next"), ("DELETE", "previous")] {
+        assert_eq!(call(off.port, method, &format!("/api/sso/{}/saml/keys/signing/{end}", off.id), &bob, "").await.0, 403, "{method} {end}");
+    }
+    assert!(off.audit("sso.saml_sp_key_created").await.iter().all(|e| e["details"]["stage"] == "current"), "nothing made for bob");
+
+    // A configured key is rolled over in .env, never here.
+    let dir = std::env::temp_dir().join(format!("saml-roll-{}", random_hex(4)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mine, _) = crate::sso::saml_sp::SpKey::generate("mine").unwrap();
+    let cert_file = dir.join("sp.pem");
+    std::fs::write(&cert_file, format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", mine.cert)).unwrap();
+    let configured = serve(&[("SP_CERT_FILE", &cert_file.to_string_lossy())]).await;
+    let (code, e) = configured.key_step("POST", "signing", "next").await;
+    assert!(code == 409 && e["error"].as_str().unwrap().contains("SP_CERT_FILE sets this signing key"), "{e}");
+    std::fs::remove_dir_all(dir).ok();
+}

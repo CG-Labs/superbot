@@ -4230,6 +4230,22 @@ impl Db {
         self.c().execute("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2", [key, value]).unwrap();
     }
 
+    /// Sets (Some) or removes (None) several settings in one transaction: all of them or none.
+    pub fn write_settings(&self, writes: &[(&str, Option<&str>)]) -> bool {
+        let c = self.c();
+        let Ok(tx) = c.unchecked_transaction() else { return false };
+        for (key, value) in writes {
+            let done = match value {
+                Some(v) => tx.execute("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2", [key, v]),
+                None => tx.execute("DELETE FROM settings WHERE key = ?", [key]),
+            };
+            if done.is_err() {
+                return false;
+            }
+        }
+        tx.commit().is_ok()
+    }
+
     // Bots
 
     pub fn bots(&self) -> Vec<Bot> {

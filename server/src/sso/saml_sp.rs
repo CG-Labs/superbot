@@ -128,10 +128,10 @@ pub struct Sp<'a> {
     pub acs: &'a str,
 }
 
-/// What our metadata adds with an SP key: its certificate (base64 DER), our SLO URL, and
-/// whether AuthnRequests are signed.
+/// What our metadata adds with an SP key: its certificate (base64 DER) and, during a rollover,
+/// the next key's after it (ADR 0181); our SLO URL; and whether AuthnRequests are signed.
 pub struct SpSigning<'a> {
-    pub cert: &'a str,
+    pub certs: &'a [&'a str],
     pub slo: &'a str,
     pub sign_requests: bool,
 }
@@ -343,16 +343,17 @@ fn encryption_methods() -> String {
 }
 
 /// Our metadata, for the IdP to import: who we are, where to post, and that assertions must
-/// be signed; with an SP key, also its certificate and where to send logout messages; with
-/// an encryption certificate (`encryption`, base64 DER), the key to encrypt assertions to.
-pub fn sp_metadata(sp: &Sp, signing: Option<&SpSigning>, encryption: Option<&str>) -> String {
+/// be signed; with an SP key, also its certificates and where to send logout messages; with
+/// encryption certificates (`encryption`, base64 DER), the keys to encrypt assertions to. During
+/// a rollover each use lists the key in use first, then the next one (ADR 0181).
+pub fn sp_metadata(sp: &Sp, signing: Option<&SpSigning>, encryption: &[&str]) -> String {
     let signed = signing.is_some_and(|s| s.sign_requests);
     let key_info = |cert: &str| format!(r#"<ds:KeyInfo xmlns:ds="{}"><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>"#, xmldsig::DSIG);
     let mut keys = String::new();
-    if let Some(s) = signing {
-        keys += &format!("\n    <md:KeyDescriptor use=\"signing\">{}</md:KeyDescriptor>", key_info(s.cert));
+    for cert in signing.map_or(&[][..], |s| s.certs) {
+        keys += &format!("\n    <md:KeyDescriptor use=\"signing\">{}</md:KeyDescriptor>", key_info(cert));
     }
-    if let Some(cert) = encryption {
+    for cert in encryption {
         keys += &format!("\n    <md:KeyDescriptor use=\"encryption\">{}{}</md:KeyDescriptor>", key_info(cert), encryption_methods());
     }
     if let Some(s) = signing {
@@ -635,9 +636,9 @@ pub struct Expect<'a> {
     pub request_id: Option<&'a str>,
     pub attributes: &'a Attributes,
     pub now_ms: i64,
-    /// Our encryption key, when the provider takes encrypted assertions (ADR 0150); without
-    /// one, an `EncryptedAssertion` is refused.
-    pub decrypt: Option<&'a SpKey>,
+    /// Our encryption keys, when the provider takes encrypted assertions (ADR 0150): the one in
+    /// use, then any a rollover holds beside it (ADR 0181). Empty: an `EncryptedAssertion` is refused.
+    pub decrypt: &'a [&'a SpKey],
     /// Refuse a plain assertion (`ENCRYPTED_ASSERTIONS=require`).
     pub require_encrypted: bool,
 }
@@ -652,6 +653,9 @@ pub struct Checked {
     /// The NameID as sent and the IdP's session, for single logout.
     pub login: SamlLogin,
     pub groups: Groups,
+    /// Which of `Expect::decrypt` opened the assertion or its NameID, if either was encrypted:
+    /// what tells an admin which key the IdP encrypts to (ADR 0181).
+    pub decrypted_with: Option<usize>,
 }
 
 pub(super) fn time(s: &str) -> Result<i64, Refused> {
@@ -781,33 +785,46 @@ fn read_name_id(n: Node) -> Result<NameId, Refused> {
 }
 
 /// The one identifier `parent` (an assertion's `Subject`, or a `LogoutRequest`) names the
-/// person by: a `NameID`, or an `EncryptedID` decrypted with `key` (ADR 0151). `parent` must be
-/// verified already: the ciphertext is part of what the IdP signed. Two identifiers are
+/// person by: a `NameID`, or an `EncryptedID` decrypted with one of `keys` (ADR 0151). `parent`
+/// must be verified already: the ciphertext is part of what the IdP signed. Two identifiers are
 /// refused as `wrapped`, an `EncryptedID` without a key as `encrypted_id`, and a `BaseID` or
 /// none as `missing_subject`.
-pub fn name_id(parent: Node, key: Option<&SpKey>) -> Result<NameId, Refused> {
+pub fn name_id(parent: Node, keys: &[&SpKey]) -> Result<NameId, Refused> {
+    name_id_with(parent, keys).map(|(n, _)| n)
+}
+
+/// `name_id`, and which of `keys` decrypted it, if it was encrypted.
+fn name_id_with(parent: Node, keys: &[&SpKey]) -> Result<(NameId, Option<usize>), Refused> {
     let ids: Vec<Node> = parent.children().filter(|c| c.is_element() && c.tag_name().namespace() == Some(ASSERTION) && matches!(c.tag_name().name(), "BaseID" | "NameID" | "EncryptedID")).collect();
     match ids.as_slice() {
-        [n] if n.tag_name().name() == "NameID" => read_name_id(*n),
-        [n] if n.tag_name().name() == "EncryptedID" => match key {
-            Some(k) => decrypted_name_id(*n, k),
-            None => Err(Refused("encrypted_id", None)),
-        },
+        [n] if n.tag_name().name() == "NameID" => Ok((read_name_id(*n)?, None)),
+        [n] if n.tag_name().name() == "EncryptedID" && keys.is_empty() => Err(Refused("encrypted_id", None)),
+        [n] if n.tag_name().name() == "EncryptedID" => decrypted_name_id(*n, keys).map(|(n, i)| (n, Some(i))),
         [_, _, ..] => Err(Refused("wrapped", None)),
         _ => Err(Refused("missing_subject", None)),
     }
 }
 
+/// Decrypts an `EncryptedAssertion` or `EncryptedID` with one of our keys (`xmlenc`), as a document
+/// of its own in the namespaces it was encrypted in, and which key opened it. An ECDSA key can't.
+fn decrypted(encrypted: Node, keys: &[&SpKey]) -> Result<(Zeroizing<String>, usize), Refused> {
+    let ours: Vec<&aws_lc_rs::rsa::OaepPrivateDecryptingKey> = keys.iter().filter_map(|k| k.decrypting()).collect();
+    if ours.len() != keys.len() {
+        return Err(Refused("no_sp_key", None));
+    }
+    let (plaintext, i) = super::xmlenc::decrypt(encrypted, &ours)?;
+    Ok((in_context(encrypted, &plaintext)?, i))
+}
+
 /// An `EncryptedID`'s NameID: decrypted with the same algorithms and single failure as an
 /// `EncryptedAssertion` (`xmlenc`), parsed with the same rules in the namespaces it was
 /// encrypted in, and holding exactly one `saml:NameID` with nothing beside it.
-fn decrypted_name_id(encrypted: Node, key: &SpKey) -> Result<NameId, Refused> {
-    let k = key.decrypting().ok_or(Refused("no_sp_key", None))?;
-    let plaintext = in_context(encrypted, &super::xmlenc::decrypt(encrypted, k)?)?;
+fn decrypted_name_id(encrypted: Node, keys: &[&SpKey]) -> Result<(NameId, usize), Refused> {
+    let (plaintext, i) = decrypted(encrypted, keys)?;
     let doc = xmldsig::parse(&plaintext)?;
     let kids: Vec<Node> = doc.root_element().children().filter(|c| !(c.is_text() && c.text().is_some_and(|t| t.trim().is_empty()))).collect();
     match kids.as_slice() {
-        [n] if is(*n, ASSERTION, "NameID") => read_name_id(*n),
+        [n] if is(*n, ASSERTION, "NameID") => Ok((read_name_id(*n)?, i)),
         _ => Err(Refused("wrapped", None)),
     }
 }
@@ -838,8 +855,8 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
     let assertions: Vec<Node> = doc.descendants().filter(|n| n.is_element() && matches!(n.tag_name().name(), "Assertion" | "EncryptedAssertion")).collect();
     let (found, key) = match (assertions.as_slice(), e.decrypt) {
         ([a], _) if is(*a, ASSERTION, "Assertion") && a.parent() == Some(response) => (*a, None),
-        ([a], None) if a.tag_name().name() == "EncryptedAssertion" => return Err(Refused("encrypted_assertion", None)),
-        ([a], Some(k)) if is(*a, ASSERTION, "EncryptedAssertion") && a.parent() == Some(response) => (*a, Some(k)),
+        ([a], []) if a.tag_name().name() == "EncryptedAssertion" => return Err(Refused("encrypted_assertion", None)),
+        ([a], k) if is(*a, ASSERTION, "EncryptedAssertion") && a.parent() == Some(response) => (*a, Some(k)),
         ([], _) => return Err(Refused("missing_assertion", None)),
         _ => return Err(Refused("wrapped", None)),
     };
@@ -854,11 +871,13 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
     // The assertion inside is read with the same rules as a posted one, and is signed or refused.
     let plaintext: Zeroizing<String>;
     let inner: roxmltree::Document;
+    let mut decrypted_with = None;
     let assertion = match key {
         None => found,
         Some(k) => {
             xmldsig::verify_enveloped(response, &e.idp.certs)?;
-            plaintext = in_context(found, &super::xmlenc::decrypt(found, k.decrypting().ok_or(Refused("no_sp_key", None))?)?)?;
+            let (p, i) = decrypted(found, k)?;
+            (plaintext, decrypted_with) = (p, Some(i));
             inner = xmldsig::parse(&plaintext)?;
             decrypted_assertion(&inner)?
         }
@@ -964,7 +983,8 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
         return Err(bad());
     };
 
-    let nid = name_id(subject, e.decrypt)?;
+    let (nid, id_with) = name_id_with(subject, e.decrypt)?;
+    let decrypted_with = decrypted_with.or(id_with);
     if nid.format.as_deref() == Some(TRANSIENT) {
         return Err(Refused("transient_subject", None));
     }
@@ -979,7 +999,7 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
     let session_index = kept(authn, "SessionIndex");
     let login = SamlLogin { name_id: nid.value, format: nid.format, name_qualifier: nid.name_qualifier, sp_name_qualifier: nid.sp_name_qualifier, session_index };
     let groups = e.attributes.groups.as_deref().map_or(Groups::NotRead, |n| groups(assertion, n));
-    Ok(Checked { claims, assertion_id, until_ms: until.min(now + 24 * 3600 * 1000), login, groups })
+    Ok(Checked { claims, assertion_id, until_ms: until.min(now + 24 * 3600 * 1000), login, groups, decrypted_with })
 }
 
 #[cfg(test)]
@@ -1197,7 +1217,7 @@ mod tests {
     fn check_at(xml: &str, now_ms: i64) -> Result<Checked, Refused> {
         let idp = idp();
         let attributes = Attributes::default();
-        check_response(&STANDARD.encode(xml), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms, decrypt: None, require_encrypted: false })
+        check_response(&STANDARD.encode(xml), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms, decrypt: &[], require_encrypted: false })
     }
 
     fn check(xml: &str) -> Result<Checked, Refused> {
@@ -1345,7 +1365,7 @@ mod tests {
         let (key, _) = SpKey::generate("sp").unwrap();
         let slo = "https://bot.example.com/api/auth/sso/okta/slo";
         for sign_requests in [false, true] {
-            let md = sp_metadata(&sp, Some(&SpSigning { cert: &key.cert, slo, sign_requests }), None);
+            let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&key.cert], slo, sign_requests }), &[]);
             let doc = roxmltree::Document::parse(&md).unwrap();
             let spsso = doc.descendants().find(|n| is(*n, METADATA, "SPSSODescriptor")).unwrap();
             assert_eq!(spsso.attribute("AuthnRequestsSigned"), Some(if sign_requests { "true" } else { "false" }));
@@ -1356,13 +1376,13 @@ mod tests {
             let order: Vec<&str> = elements(spsso).iter().map(|n| n.tag_name().name()).collect();
             assert_eq!(order, ["KeyDescriptor", "SingleLogoutService", "SingleLogoutService", "NameIDFormat", "AssertionConsumerService"], "schema order");
         }
-        assert!(!sp_metadata(&sp, None, None).contains("SingleLogoutService"), "no key, no logout");
+        assert!(!sp_metadata(&sp, None, &[]).contains("SingleLogoutService"), "no key, no logout");
     }
 
     #[test]
     fn writes_sp_metadata_and_a_redirect_authn_request() {
         let sp = Sp { entity_id: SP, acs: ACS };
-        let md = sp_metadata(&sp, None, None);
+        let md = sp_metadata(&sp, None, &[]);
         let doc = roxmltree::Document::parse(&md).unwrap();
         let root = doc.root_element();
         assert_eq!(root.attribute("entityID"), Some(SP));
@@ -1419,7 +1439,7 @@ mod tests {
         let mapped = Attributes { email: Some("work_mail".into()), name: None, groups: None };
         let mut custom = base();
         custom.attributes = vec![("email".into(), "personal@evil.example".into()), ("work_mail".into(), "ada@example.com".into())];
-        let c = check_response(&STANDARD.encode(custom.xml()), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &mapped, now_ms: NOW, decrypt: None, require_encrypted: false }).unwrap();
+        let c = check_response(&STANDARD.encode(custom.xml()), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &mapped, now_ms: NOW, decrypt: &[], require_encrypted: false }).unwrap();
         assert_eq!(c.claims.email.as_deref(), Some("ada@example.com"), "only the configured attribute");
         let mut unspecified = base();
         unspecified.name_id_format = "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified".into();
@@ -1430,7 +1450,7 @@ mod tests {
     fn groups_of(r: &Response, name: &str) -> Groups {
         let idp = idp();
         let attributes = Attributes { groups: Some(name.into()), ..Attributes::default() };
-        check_response(&STANDARD.encode(r.xml()), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: None, require_encrypted: false }).unwrap().groups
+        check_response(&STANDARD.encode(r.xml()), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: &[], require_encrypted: false }).unwrap().groups
     }
 
     #[test]
@@ -1466,7 +1486,7 @@ mod tests {
         // Added to the assertion after it was signed: refused before any group is read.
         let idp = idp();
         let attributes = Attributes { groups: Some("groups".into()), ..Attributes::default() };
-        let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: None, require_encrypted: false };
+        let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: &[], require_encrypted: false };
         let added = base().xml_with(|a| a.replace("</saml:AttributeStatement>", r#"<saml:Attribute Name="groups"><saml:AttributeValue>Admins</saml:AttributeValue></saml:Attribute></saml:AttributeStatement>"#));
         assert_eq!(check_response(&STANDARD.encode(added), &e).unwrap_err().0, "bad_signature");
 
@@ -1566,7 +1586,7 @@ mod tests {
         assert_eq!(with(|r| r.conditions_extra = "<saml:OneTimeUse/>".into()), "ok");
         assert_eq!(check("not xml").unwrap_err().0, "bad_response");
         assert_eq!(
-            check_response(&"A".repeat(MAX_RESPONSE + 4), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp(), request_id: Some(REQ), attributes: &Attributes::default(), now_ms: NOW, decrypt: None, require_encrypted: false }).unwrap_err().0,
+            check_response(&"A".repeat(MAX_RESPONSE + 4), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp(), request_id: Some(REQ), attributes: &Attributes::default(), now_ms: NOW, decrypt: &[], require_encrypted: false }).unwrap_err().0,
             "bad_response"
         );
     }
@@ -1575,7 +1595,7 @@ mod tests {
     fn check_unsolicited(xml: &str) -> Result<Checked, Refused> {
         let idp = idp();
         let attributes = Attributes::default();
-        check_response(&STANDARD.encode(xml), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: None, attributes: &attributes, now_ms: NOW, decrypt: None, require_encrypted: false })
+        check_response(&STANDARD.encode(xml), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: None, attributes: &attributes, now_ms: NOW, decrypt: &[], require_encrypted: false })
     }
 
     fn unsolicited() -> Response {
@@ -1643,7 +1663,7 @@ mod tests {
     fn check_enc(xml: &str, require: bool) -> Result<Checked, Refused> {
         let idp = idp();
         let attributes = Attributes::default();
-        let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: Some(&enc_keys()[0]), require_encrypted: require };
+        let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: &[&enc_keys()[0]], require_encrypted: require };
         check_response(&STANDARD.encode(xml), &e)
     }
 
@@ -1805,7 +1825,7 @@ mod tests {
         let ec = SpKey::from_pem(&ec_pem, &ec_cert).unwrap();
         let idp = idp();
         let attributes = Attributes::default();
-        let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: Some(&ec), require_encrypted: false };
+        let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: &[&ec], require_encrypted: false };
         assert_eq!(check_response(&STANDARD.encode(r.xml()), &e).unwrap_err().0, "no_sp_key", "an ECDSA key can't decrypt");
     }
 
@@ -1861,7 +1881,7 @@ mod tests {
             let idp = parse_idp_metadata(&metadata_signed_by(s), IDP, false).unwrap();
             let attributes = Attributes::default();
             let run = |xml: &str| {
-                let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: None, require_encrypted: false };
+                let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: &[], require_encrypted: false };
                 check_response(&STANDARD.encode(xml), &e).err().map_or("ok", |e| e.0)
             };
             let mut r = base();
@@ -1959,7 +1979,7 @@ mod tests {
         let sp = Sp { entity_id: SP, acs: ACS };
         let (sign, _) = SpKey::generate("sp").unwrap();
         let enc = &enc_keys()[0];
-        let md = sp_metadata(&sp, Some(&SpSigning { cert: &sign.cert, slo: "https://bot.example.com/slo", sign_requests: false }), Some(&enc.cert));
+        let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&sign.cert], slo: "https://bot.example.com/slo", sign_requests: false }), &[&enc.cert]);
         let doc = roxmltree::Document::parse(&md).unwrap();
         let spsso = doc.descendants().find(|n| is(*n, METADATA, "SPSSODescriptor")).unwrap();
         let order: Vec<String> = elements(spsso).iter().map(|n| format!("{}{}", n.tag_name().name(), n.attribute("use").map(|u| format!("/{u}")).unwrap_or_default())).collect();
@@ -1974,6 +1994,6 @@ mod tests {
         let mut r = encrypted();
         r.encrypt = Some(ok);
         assert_eq!(enc_reason(&r.xml()), "ok");
-        assert!(!sp_metadata(&sp, None, None).contains("encryption"), "off: nothing to encrypt to");
+        assert!(!sp_metadata(&sp, None, &[]).contains("encryption"), "off: nothing to encrypt to");
     }
 }

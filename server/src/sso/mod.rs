@@ -15,14 +15,16 @@
 //! is the service provider, sends an AuthnRequest with the HTTP-Redirect binding, and checks
 //! the signed response the IdP posts to `/acs` (`saml_sp`, `xmldsig`). Both end in the same
 //! identities, checks, and sessions as the rest. Native SAML also signs AuthnRequests when a
-//! provider asks, and does single logout at `/slo` (ADR 0137, `saml_slo`), and can require
-//! IdP groups and map them to custom roles (ADR 0160, `saml_roles`).
+//! provider asks, and does single logout at `/slo` (ADR 0137, `saml_slo`), can require
+//! IdP groups and map them to custom roles (ADR 0160, `saml_roles`), and rolls its own keys
+//! over without an outage (ADR 0181, `saml_keys`).
 
 pub mod apple;
 mod github;
 pub mod jwt;
 mod provider;
 mod saml;
+pub(crate) mod saml_keys;
 pub(crate) mod saml_roles;
 pub(crate) mod saml_slo;
 pub(crate) mod saml_sp;
@@ -32,7 +34,6 @@ pub(crate) mod xmlenc;
 use crate::audit::{Actor, ActorKind, Event, Outcome, Source, Who};
 use crate::db::{self, Identity, JitError, NewIdentity, User};
 use crate::rbac::Role;
-use crate::secrets::sealed::{SAML_SP_CERT_SETTING as SP_CERT_SETTING, SAML_SP_KEY_SETTING as SP_KEY_SETTING};
 use crate::users::{self, hash};
 use crate::{ApiError, AppState, Auth, Res, bad, not_found};
 use axum::Json;
@@ -1054,16 +1055,17 @@ async fn check_saml(a: &Auth, app: &AppState, p: &Provider, posted: &str, reques
     let Kind::SamlSp { sp_entity_id, attributes, encryption, .. } = &p.kind else {
         return Err((Refused("wrong_provider", None), true));
     };
-    let decrypt = match encryption {
-        Encryption::Off => None,
-        _ => match sp_encryption_key(app, p) {
-            Ok(k) => Some(k),
+    let (decrypt, held) = match encryption {
+        Encryption::Off => (vec![], None),
+        _ => match decrypt_keys(app, p) {
+            Ok(k) => k,
             Err(e) => {
                 crate::obs::log::log_warn!("SSO {}: can't decrypt assertions: {e}", p.id);
                 return Err((Refused("no_sp_key", None), false));
             }
         },
     };
+    let keys: Vec<&SpKey> = decrypt.iter().map(|(_, k)| k.as_ref()).collect();
     let acs = a.sso.acs_url(&p.id);
     let expect = saml_sp::Expect {
         sp: Sp { entity_id: sp_entity_id, acs: &acs },
@@ -1071,13 +1073,17 @@ async fn check_saml(a: &Auth, app: &AppState, p: &Provider, posted: &str, reques
         request_id,
         attributes,
         now_ms: at,
-        decrypt: decrypt.as_deref(),
+        decrypt: &keys,
         require_encrypted: *encryption == Encryption::Require,
     };
-    saml_sp::check_response(posted, &expect).map_err(|r| {
+    let checked = saml_sp::check_response(posted, &expect).map_err(|r| {
         let counts = r.0 != "idp_error";
         (r, counts)
-    })
+    })?;
+    if let (Some(h), Some(Some(stage))) = (held, checked.decrypted_with.map(|i| decrypt.get(i).and_then(|(s, _)| *s))) {
+        h.used(stage, at);
+    }
+    Ok(checked)
 }
 
 async fn finish_saml(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, f: &HashMap<String, String>) -> Response {
@@ -1220,21 +1226,24 @@ pub async fn saml_metadata(Extension(a): Extension<Arc<Auth>>, Path(id): Path<St
     let Kind::SamlSp { sp_entity_id, sign_requests, encryption, .. } = &p.kind else {
         return not_found("SAML provider").into_response();
     };
-    let key = a.app.as_ref().and_then(|app| sp_key(app, p).map_err(|e| crate::obs::log::log_warn!("SSO {id}: no SP key for the metadata: {e}")).ok());
+    let keys = a.app.as_ref().and_then(|app| published_keys(app, p, KeyUse::Signing).map_err(|e| crate::obs::log::log_warn!("SSO {id}: no SP key for the metadata: {e}")).ok());
     let enc = match (encryption, a.app.as_ref()) {
-        (Encryption::Off, _) | (_, None) => None,
-        (_, Some(app)) => sp_encryption_key(app, p).map_err(|e| crate::obs::log::log_warn!("SSO {id}: no SP encryption key for the metadata: {e}")).ok(),
+        (Encryption::Off, _) | (_, None) => vec![],
+        (_, Some(app)) => published_keys(app, p, KeyUse::Encryption).map_err(|e| crate::obs::log::log_warn!("SSO {id}: no SP encryption key for the metadata: {e}")).unwrap_or_default(),
     };
     let (acs, slo) = (a.sso.acs_url(&id), a.sso.slo_url(&id));
-    let signing = key.as_ref().map(|k| SpSigning { cert: &k.cert, slo: &slo, sign_requests: *sign_requests });
-    let md = saml_sp::sp_metadata(&Sp { entity_id: sp_entity_id, acs: &acs }, signing.as_ref(), enc.as_ref().map(|k| k.cert.as_str()));
+    let signing_certs: Vec<&str> = keys.iter().flatten().map(|k| k.cert.as_str()).collect();
+    let signing = keys.as_ref().map(|_| SpSigning { certs: &signing_certs, slo: &slo, sign_requests: *sign_requests });
+    let enc_certs: Vec<&str> = enc.iter().map(|k| k.cert.as_str()).collect();
+    let md = saml_sp::sp_metadata(&Sp { entity_id: sp_entity_id, acs: &acs }, signing.as_ref(), &enc_certs);
     ([(header::CONTENT_TYPE, "application/samlmetadata+xml")], md).into_response()
 }
 
 // Native SAML: our key and single logout (ADR 0137)
 
 /// A native SAML provider's SP signing key: `SSO_<ID>_PRIVATE_KEY` with `SP_CERT_FILE`, else
-/// made once and kept sealed in settings, so the certificate in our metadata stays the same.
+/// made once and kept sealed in settings, so the certificate in our metadata stays the same
+/// until an admin rolls it over (ADR 0181).
 fn sp_key(app: &AppState, p: &Provider) -> Result<Arc<SpKey>, String> {
     sp_key_for(app, p, KeyUse::Signing)
 }
@@ -1252,44 +1261,25 @@ fn sp_key_for(app: &AppState, p: &Provider, u: KeyUse) -> Result<Arc<SpKey>, Str
     if p.sp_cert_for(u).is_some() {
         return p.configured_sp_key(u);
     }
-    let mut held = p.sp_key_slot(u).lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(k) = held.as_ref() {
-        return Ok(k.clone());
-    }
-    let key = Arc::new(generated_sp_key(app, p, u)?);
-    *held = Some(key.clone());
-    Ok(key)
+    saml_keys::held(app, p, u).map(|h| h.current.clone())
 }
 
-/// The settings a generated key and its certificate are kept in. The encryption key's are the
-/// signing key's with `_encryption` after the id (ids have no `_`), so sealing, rotation and
-/// `SUPERBOT_FORGET_SEALED` treat both alike.
-pub(crate) fn sp_key_settings(provider: &str, u: KeyUse) -> (String, String) {
-    let suffix = match u {
-        KeyUse::Signing => "",
-        KeyUse::Encryption => "_encryption",
-    };
-    (format!("{SP_KEY_SETTING}{provider}{suffix}"), format!("{SP_CERT_SETTING}{provider}{suffix}"))
+/// The keys our metadata publishes for `u`: the one in use, then a rollover's next one.
+fn published_keys(app: &AppState, p: &Provider, u: KeyUse) -> Result<Vec<Arc<SpKey>>, String> {
+    if !p.saml_sp() || p.sp_cert_for(u).is_some() {
+        return sp_key_for(app, p, u).map(|k| vec![k]);
+    }
+    saml_keys::held(app, p, u).map(|h| h.published())
 }
 
-fn generated_sp_key(app: &AppState, p: &Provider, u: KeyUse) -> Result<SpKey, String> {
-    let (key_name, cert_name) = sp_key_settings(&p.id, u);
-    let context = crate::secrets::sealed::setting_context(&key_name);
-    let cipher = crate::secrets::sealed::cipher();
-    if let (Some(sealed), Some(cert)) = (app.db.setting(&key_name), app.db.setting(&cert_name)) {
-        let der = cipher.open(&context, &sealed).map_err(|e| format!("the generated SP {} key: {e}", u.as_str()))?;
-        return SpKey::from_der(&der, &cert);
+/// The keys an encrypted assertion or NameID may be decrypted with, in the order they're tried,
+/// each with its rollover stage when botd made it, and the rollover that holds them.
+fn decrypt_keys(app: &AppState, p: &Provider) -> Result<(Vec<(Option<saml_keys::Stage>, Arc<SpKey>)>, Option<Arc<saml_keys::Held>>), String> {
+    if !p.saml_sp() || p.sp_cert_for(KeyUse::Encryption).is_some() {
+        return sp_encryption_key(app, p).map(|k| (vec![(None, k)], None));
     }
-    let subject = match u {
-        KeyUse::Signing => format!("SuperBot SAML SP ({})", p.id),
-        KeyUse::Encryption => format!("SuperBot SAML SP encryption ({})", p.id),
-    };
-    let (key, der) = SpKey::generate(&subject)?;
-    app.db.set_setting(&key_name, &cipher.seal(&context, &der));
-    app.db.set_setting(&cert_name, &key.cert);
-    let details = json!({ "provider": p.id, "use": u.as_str(), "certificate": key.info.sha256, "notAfter": key.info.not_after * 1000 });
-    app.db.record(&Event::new(Actor::system("sso"), "sso.saml_sp_key_created").target("sso_provider", &p.id).details(details));
-    Ok(key)
+    let h = saml_keys::held(app, p, KeyUse::Encryption)?;
+    Ok((h.decrypting().into_iter().map(|(s, k)| (Some(s), k)).collect(), Some(h)))
 }
 
 /// Signing out of a session a native SAML IdP vouched for: a signed LogoutRequest to the
@@ -1368,8 +1358,15 @@ async fn slo(a: &Auth, source: &Source, id: &str, incoming: &saml_slo::Incoming<
     };
     let (slo_url, at) = (a.sso.slo_url(id), db::now());
     // An EncryptedID is decrypted with the key assertions are encrypted to, when there is one.
-    let decrypt = (*encryption != Encryption::Off).then(|| sp_encryption_key(app, p).map_err(|e| crate::obs::log::log_warn!("SSO {id}: can't decrypt logout NameIDs: {e}")).ok()).flatten();
-    let received = match saml_slo::receive(incoming, &saml_slo::Expect { idp: &idp, slo_url: &slo_url, now_ms: at, decrypt: decrypt.as_deref() }) {
+    let decrypt = match encryption {
+        Encryption::Off => vec![],
+        _ => decrypt_keys(app, p).map(|(k, _)| k).unwrap_or_else(|e| {
+            crate::obs::log::log_warn!("SSO {id}: can't decrypt logout NameIDs: {e}");
+            vec![]
+        }),
+    };
+    let keys: Vec<&SpKey> = decrypt.iter().map(|(_, k)| k.as_ref()).collect();
+    let received = match saml_slo::receive(incoming, &saml_slo::Expect { idp: &idp, slo_url: &slo_url, now_ms: at, decrypt: &keys }) {
         Ok(r) => r,
         Err(Refused(reason, detail)) => return slo_failed(a, source, id, reason, json!({ "detail": detail })),
     };
@@ -1460,15 +1457,35 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
         json!({ "entityId": m.entity_id, "ssoUrl": m.sso_url, "sloUrl": m.slo.as_ref().map(|s| &s.location), "certificates": certs, "loadedSecondsAgo": p.idp_age().map(|d| d.as_secs()) })
     });
     let key = a.app.as_ref().map(|app| sp_key(app, p));
+    // botd's own keys show their rollover too (ADR 0181).
+    let rollover = |v: &mut Value, u: KeyUse| {
+        use saml_keys::Stage;
+        let Some(app) = a.app.as_ref().filter(|_| p.sp_cert_for(u).is_none()) else { return };
+        let Ok(h) = saml_keys::held(app, p, u) else { return };
+        let now = db::now();
+        v["next"] = saml_keys::view(&h, u, Stage::Next, now, cert);
+        if u == KeyUse::Encryption {
+            v["previous"] = saml_keys::view(&h, u, Stage::Previous, now, cert);
+            v["lastUsedSecondsAgo"] = saml_keys::view(&h, u, Stage::Current, now, cert)["lastUsedSecondsAgo"].clone();
+        }
+    };
     let sp_key = match &key {
-        Some(Ok(k)) => json!({ "certificate": cert(&k.info), "from": if sp_cert.is_some() { "secret" } else { "generated" } }),
+        Some(Ok(k)) => {
+            let mut v = json!({ "certificate": cert(&k.info), "from": if sp_cert.is_some() { "secret" } else { "generated" } });
+            rollover(&mut v, KeyUse::Signing);
+            v
+        }
         Some(Err(e)) => json!({ "problem": e }),
         None => Value::Null,
     };
     let enc_key = match (encryption, a.app.as_ref()) {
         (Encryption::Off, _) | (_, None) => Value::Null,
         (_, Some(app)) => match sp_encryption_key(app, p) {
-            Ok(k) => json!({ "certificate": cert(&k.info), "from": if enc_cert.is_some() { "secret" } else { "generated" } }),
+            Ok(k) => {
+                let mut v = json!({ "certificate": cert(&k.info), "from": if enc_cert.is_some() { "secret" } else { "generated" } });
+                rollover(&mut v, KeyUse::Encryption);
+                v
+            }
             Err(e) => json!({ "problem": e }),
         },
     };
@@ -1533,6 +1550,39 @@ pub async fn saml_import(State(app): State<AppState>, Extension(a): Extension<Ar
     p.set_idp(m);
     app.db.record(&by.event("sso.saml_metadata_imported").target("sso_provider", &p.id).details(details));
     Ok(Json(saml_view(&a, p)))
+}
+
+/// A step in rolling over one of botd's own SP keys (ADR 0181), then the provider as
+/// `GET /api/sso/{id}/saml` shows it. `use` is `signing` or `encryption`.
+fn saml_key_change(app: &AppState, a: &Auth, by: &Who, id: &str, u: &str, c: saml_keys::Change) -> Res {
+    let p = saml_provider(a, id)?;
+    let u = match u {
+        "signing" => KeyUse::Signing,
+        "encryption" => KeyUse::Encryption,
+        _ => return Err(bad("the key must be signing or encryption")),
+    };
+    saml_keys::change(app, p, u, c, by)?;
+    Ok(Json(saml_view(a, p)))
+}
+
+/// `POST /api/sso/{id}/saml/keys/{use}/next`: makes a next key, published beside the one in use.
+pub async fn saml_key_next(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path((id, u)): Path<(String, String)>) -> Res {
+    saml_key_change(&app, &a, &by, &id, &u, saml_keys::Change::Next)
+}
+
+/// `POST /api/sso/{id}/saml/keys/{use}/promote`: puts the next key in use.
+pub async fn saml_key_promote(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path((id, u)): Path<(String, String)>) -> Res {
+    saml_key_change(&app, &a, &by, &id, &u, saml_keys::Change::Promote)
+}
+
+/// `DELETE /api/sso/{id}/saml/keys/{use}/next`: drops a next key that wasn't promoted.
+pub async fn saml_key_cancel(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path((id, u)): Path<(String, String)>) -> Res {
+    saml_key_change(&app, &a, &by, &id, &u, saml_keys::Change::Cancel)
+}
+
+/// `DELETE /api/sso/{id}/saml/keys/{use}/previous`: retires the encryption key a promotion replaced.
+pub async fn saml_key_retire(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path((id, u)): Path<(String, String)>) -> Res {
+    saml_key_change(&app, &a, &by, &id, &u, saml_keys::Change::Retire)
 }
 
 /// The user an identity belongs to: linked by an admin, or made now (just in time).
