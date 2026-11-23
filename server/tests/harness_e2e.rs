@@ -368,12 +368,12 @@ fn endpoint_route(harness: &str) {
         return;
     }
     let endpoint = fake_provider(Some("in-region"));
-    let (provider, secret, base, shell) = match harness {
+    let (provider, stored_as, base, shell) = match harness {
         "claude" => ("uk-claude", "E2E_UK_KEY", json!({ "protocol": "anthropic-messages", "baseUrl": format!("http://127.0.0.1:{}", endpoint.port) }), "${ANTHROPIC_API_KEY:-unset},${E2E_UK_KEY:-unset}"),
         _ => ("eu-responses", "E2E_EU_KEY", json!({ "protocol": "openai-responses", "baseUrl": format!("http://127.0.0.1:{}/v1", endpoint.port) }), "${SUPERBOT_PROVIDER_EU_RESPONSES_API_KEY:-unset},${E2E_EU_KEY:-unset}"),
     };
     let mut p = base;
-    (p["keySecret"], p["regions"]) = (json!(secret), json!(["gb-lon"]));
+    (p["keySecret"], p["regions"]) = (json!(stored_as), json!(["gb-lon"]));
     let tiers = json!({
         "default": "region-plan",
         "providers": { provider: p },
@@ -392,7 +392,7 @@ fn endpoint_route(harness: &str) {
     }
     let id = call(&b, "GET", "/api/bots", Value::Null)[0]["id"].as_str().unwrap().to_string();
     call(&b, "PUT", "/api/policy", json!({ "sandbox": false }));
-    call(&b, "PUT", &format!("/api/secrets/{secret}"), json!({ "value": "e2e-endpoint-key" }));
+    call(&b, "PUT", &format!("/api/secrets/{stored_as}"), json!({ "value": "e2e-endpoint-key" }));
     let n = |m: &FakeModel| m.calls.load(std::sync::atomic::Ordering::SeqCst);
 
     let r = run(&b, &id, &prompt(&format!("echo keys={shell}")), None, &|| {});
