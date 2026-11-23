@@ -53,6 +53,9 @@ pub const MAX_EXCEPTION_DAYS: i64 = 365;
 /// A baseline check may be from up to this long after the period: botd's monthly bundle,
 /// whose `baseline.json` this is, is made after its month ends (coverage warns past 7 days).
 pub const BASELINE_LATE_DAYS: i64 = 7;
+/// The longest period one bundle covers. Its rows are judged as of the period's end, so a
+/// longer period would let a late record cover the months before it.
+pub const MAX_PERIOD_DAYS: i64 = 31;
 
 /// Each file and the criteria and checklist rows it can be evidence for. The manifest maps
 /// a file to a row only while the register holds a current record for it (a role filled
@@ -1182,6 +1185,9 @@ fn read_capped(file: &str, max: u64) -> Result<Vec<u8>, String> {
 pub fn run(args: &[String], now: chrono::DateTime<chrono::Utc>) -> Result<String, String> {
     let a = parse_args(args)?;
     let p = Period::parse(a.from.as_deref(), a.to.as_deref(), now.date_naive())?;
+    if p.days() > MAX_PERIOD_DAYS {
+        return Err(format!("A register bundle covers one month at most ({MAX_PERIOD_DAYS} days), since what it shows is judged as of the period's end: make one for each month of {} to {}", p.from, p.to));
+    }
     let policies = match &a.policies {
         Some(dir) => read_policies(Path::new(dir))?,
         None => builtin_policies(),

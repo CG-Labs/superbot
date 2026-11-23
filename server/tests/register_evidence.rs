@@ -2,7 +2,8 @@
 //! policy files: the bundle checks with `tar`, `sha256sum -c` and `superbot-evidence
 //! coverage`, names nobody, flags a policy text changed since its approval and a server
 //! excepting a setting no exception approved, and is refused, writing nothing, for a
-//! register that doesn't hold together or a baseline from outside the period.
+//! register that doesn't hold together, a baseline from outside the period, or a period
+//! longer than a month.
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -197,6 +198,10 @@ fn a_register_that_doesnt_hold_together_or_a_baseline_from_another_month_writes_
     write(&dir, "old.json", &baseline("2026-11-08T00:00:00Z", &[]));
     let o = evidence(&dir, &[&["register", "register.json", "--baseline", "old.json", "-o", "out.tar"][..], &PERIOD].concat());
     assert!(o.status.code() == Some(1) && text(&o).contains("outside the period"), "{}", text(&o));
+    assert!(!dir.join("out.tar").exists());
+
+    let o = evidence(&dir, &["register", "register.json", "--from", "2026-05-01", "--to", "2026-11-01", "-o", "out.tar"]);
+    assert!(o.status.code() == Some(1) && text(&o).contains("one month at most"), "a late record can't cover earlier months: {}", text(&o));
     assert!(!dir.join("out.tar").exists());
 
     let o = evidence(&dir, &[&["register", "register.json", "-o", "out.tar"][..], &PERIOD].concat());
