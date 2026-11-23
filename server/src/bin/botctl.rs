@@ -98,6 +98,10 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    Pin their data to a region under an agreement (ADR 0129):
                                                    machines, backups and restores stay there or are refused.
                                                    Refused while any of it is elsewhere. Unpinning needs a reason
+  botctl user|team residency <user|team> report [--from <when>] [--to <when>] [--json] [-o <file>]
+                                                   A residency report for the customer (ADR 0155): where their
+                                                   data is, what the pin refused or held, with a digest.
+                                                   Markdown unless --json; the last 90 days by default
   botctl regions                                   The data regions offered, who and what is in each, the
                                                    hosts and backup store in each, and residency warnings
   botctl tiers                                     Every tier, its routes and limits, and the default
@@ -847,6 +851,27 @@ fn region_request(args: &[&str]) -> Option<(&'static str, String, Option<String>
         }
         _ => return None,
     })
+}
+
+/// `botctl user|team residency <key> report [--from <when>] [--to <when>] [--json] [-o <file>]`
+/// (ADR 0155): the path, and the file to save it in.
+fn residency_report_request<'a>(kind: &str, key: &str, rest: &[&'a str]) -> Result<(String, Option<&'a str>), String> {
+    let usage = || format!("Usage: botctl {kind} residency <{kind}> report [--from <when>] [--to <when>] [--json] [-o <file>]");
+    let (mut pairs, mut json, mut out) = (Vec::new(), false, None);
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "--json" => json = true,
+            f @ ("--from" | "--to") => pairs.push(format!("{}={}", &f[2..], encode(it.next().ok_or_else(usage)?))),
+            "-o" | "--out" => out = Some(*it.next().ok_or_else(usage)?),
+            _ => return Err(usage()),
+        }
+    }
+    if !json {
+        pairs.push("format=markdown".into());
+    }
+    let q = if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) };
+    Ok((format!("/api/{kind}s/{}/residency/report{q}", encode(key)), out))
 }
 
 /// `botctl machine egress ...` and `botctl user egress ...` (ADR 0135): the request to send.
@@ -1718,6 +1743,15 @@ fn run(args: &[String]) -> Result<String, String> {
         ["logout"] => op("POST", "/api/auth/logout", None).map(|_| "Signed out. Unset SUPERBOT_TOKEN.".into()),
         ["whoami"] => op("GET", "/api/auth/me", None),
         ["users"] | ["user", "list"] => op("GET", "/api/users", None),
+        [kind @ ("user" | "team"), "residency", key, "report", rest @ ..] => {
+            let (path, out) = residency_report_request(kind, key, rest)?;
+            let res = api(Cred::Operator, "GET", &path, None)?;
+            let res = if path.contains("format=markdown") { res } else { pretty(res) };
+            match out {
+                Some(file) => save_private(file, res.as_bytes()).map(|_| format!("Saved {file}.")),
+                None => Ok(res),
+            }
+        }
         [..] if region_request(&a).is_some() => {
             let (method, path, body) = region_request(&a).unwrap();
             op(method, &path, body)
@@ -2428,6 +2462,19 @@ mod tests {
         for other in [&["user", "residency", "u1", "pin", "gb-lon"][..], &["team", "residency", "t1", "unpin"], &["user", "residency"], &["bot", "residency", "b1"]] {
             assert_eq!(region_request(other), None, "{other:?}");
         }
+    }
+
+    #[test]
+    fn residency_report_commands() {
+        assert_eq!(residency_report_request("user", "ada@example.com", &[]), Ok(("/api/users/ada%40example.com/residency/report?format=markdown".into(), None)));
+        assert_eq!(
+            residency_report_request("team", "t1", &["--from", "2026-08-01", "--to", "2026-10-31", "--json", "-o", "r.json"]),
+            Ok(("/api/teams/t1/residency/report?from=2026-08-01&to=2026-10-31".into(), Some("r.json")))
+        );
+        for bad in [&["--from"][..], &["--json", "extra"], &["-o"]] {
+            assert!(residency_report_request("team", "t1", bad).unwrap_err().starts_with("Usage: botctl team residency <team> report"), "{bad:?}");
+        }
+        assert_eq!(region_request(&["user", "residency", "u1", "report"]), None, "the report isn't a pin or an unpin");
     }
 
     #[test]

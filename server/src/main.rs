@@ -118,6 +118,8 @@ mod machines_region_tests;
 mod machines_residency_tests;
 #[cfg(test)]
 mod residency_routes_http_tests;
+#[cfg(test)]
+mod residency_report_http_tests;
 mod passwd;
 mod plans;
 #[cfg(test)]
@@ -994,6 +996,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/region", get(machines::region::get_user).put(machines::region::set_user))
         .route("/users/{key}/machine/egress-policy", get(machines::egress_policy::get_user).put(machines::egress_policy::set_user))
         .route("/users/{key}/residency", get(machines::region::get_user).put(machines::residency::pin_user).delete(machines::residency::unpin_user))
+        .route("/users/{key}/residency/report", get(machines::residency_report::user))
         .route("/users/{key}/machine/suspend", post(machines::suspend))
         .route("/users/{key}/machine/resume", post(machines::resume))
         .route("/users/{key}/machine/resize", get(machines::resize::status).post(machines::resize))
@@ -1045,6 +1048,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/teams/{id}", get(teams::get).patch(teams::update).delete(teams::delete))
         .route("/teams/{id}/region", get(machines::region::get_team).put(machines::region::set_team))
         .route("/teams/{id}/residency", get(machines::region::get_team).put(machines::residency::pin_team).delete(machines::residency::unpin_team))
+        .route("/teams/{id}/residency/report", get(machines::residency_report::team))
         .route("/teams/{id}/members/{user}", put(teams::put_member).delete(teams::delete_member))
         .route("/team", get(teams::mine))
         .route("/team/leave", post(teams::leave_mine))
