@@ -29,6 +29,8 @@ const PUBLIC: &[(&str, &str)] = &[
     // The IdP's logout messages: signed, checked in `sso::saml_slo` (ADR 0137).
     ("GET", "/api/auth/sso/{id}/slo"),
     ("POST", "/api/auth/sso/{id}/slo"),
+    // The same over SOAP, server to server (ADR 0208).
+    ("POST", "/api/auth/sso/{id}/slo/soap"),
     ("POST", "/api/signups"),
     ("GET", "/api/signups/config"),
     // Stripe signs it; checked in `billing` (ADR 0040).

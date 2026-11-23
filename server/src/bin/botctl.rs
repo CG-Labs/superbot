@@ -8,6 +8,8 @@
 
 #[path = "../support_report.rs"]
 mod support_report;
+#[path = "../support_readiness.rs"]
+mod support_readiness;
 #[path = "../audit_line.rs"]
 #[allow(dead_code)]
 mod audit_line;
@@ -282,6 +284,15 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    ticket system's CSV export: tickets by month and severity,
                                                    response targets met and missed, and what's still open.
                                                    Reads only ids, severities, plans and times
+  botctl support-readiness [--docs <dir>] [--rota <rota.csv | ->] [--tams <tams.csv | ->] [--plan <plan>]...
+    [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [--hours <HH:MM-HH:MM>] [--weekdays <mon-fri>] [--utc-offset <+HH:MM>]
+    [--holidays <dates>] [--max-stretch <hours>] [--max-accounts <n>] [--column <field>=<header>]...
+    [--as-of <time>] [--markdown | --json]
+                                                   Is support ready to keep its promises (ADR 0211), offline:
+                                                   contact placeholders left in the playbooks, gaps in the
+                                                   on-call rota for the hours the plans sell, and every
+                                                   Enterprise customer with a TAM and a different backup.
+                                                   Exits 1 on a failure
   botctl incidents [json]                          Status page incidents (ADR 0090), open first
   botctl incident open "<title>" "<text>" [--impact <none|minor|major|critical|maintenance>]
     [--component <api|database|machines|runners|notifications>]... [--state <state>]
@@ -1814,6 +1825,11 @@ fn saml_summary(v: &Value) -> String {
         if v["singleLogout"].as_bool().unwrap_or(false) { "yes" } else { "no (the IdP's metadata has no HTTP-Redirect SingleLogoutService)" }
     );
     out += &format!(
+        "  Back-channel logout:      {}\n    SOAP SLO URL:            {}\n",
+        if v["backChannelLogout"].as_bool().unwrap_or(false) { "from the IdP, and to it" } else { "from the IdP only (its metadata has no SOAP SingleLogoutService)" },
+        s("sloSoapUrl")
+    );
+    out += &format!(
         "  IdP-initiated sign-in:    {}\n",
         if v["idpInitiated"].as_str() == Some("restart") { "restarted as SP-initiated" } else { "refused (start from SuperBot)" }
     );
@@ -1847,6 +1863,9 @@ fn saml_summary(v: &Value) -> String {
     out += &format!(":\n    Sign-in URL: {}\n", idp["ssoUrl"].as_str().unwrap_or_default());
     if let Some(slo) = idp["sloUrl"].as_str() {
         out += &format!("    Logout URL:  {slo}\n");
+    }
+    if let Some(slo) = idp["sloSoapUrl"].as_str() {
+        out += &format!("    SOAP logout URL:  {slo}\n");
     }
     for c in idp["certificates"].as_array().into_iter().flatten() {
         out += &format!("    Certificate SHA-256 {} ({}), expires {}{}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]), ending(c));
@@ -2154,6 +2173,15 @@ fn run(args: &[String]) -> Result<String, String> {
         [verb @ ("approve" | "deny"), id, rest @ ..] => decide(verb, id, rest),
         ["support-bundle", rest @ ..] => support_bundle(rest),
         ["support-report", rest @ ..] => support_report(rest, std::io::stdin()),
+        ["support-readiness", rest @ ..] => {
+            let (out, ready) = support_readiness(rest, std::io::stdin())?;
+            if !ready {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(out.as_bytes()).and_then(|_| stdout.flush());
+                std::process::exit(1);
+            }
+            Ok(out)
+        }
         ["health-score", "history", rest @ ..] => {
             let (path, json) = health_request_at(rest, "/api/support/health-score/history", "Usage: botctl health-score history [--days <n>] [json]")?;
             let res = api(Cred::Operator, "GET", &path, None)?;
@@ -2457,6 +2485,33 @@ fn support_report(rest: &[&str], mut stdin: impl Read) -> Result<String, String>
         support_report::Format::Markdown => report.markdown(),
         support_report::Format::Json => pretty(report.json().to_string()),
     })
+}
+
+/// `botctl support-readiness`: needs no botd, only the Provider's playbooks, rota and TAM
+/// list. The report, and whether it's ready: when not, it's still printed on stdout, and
+/// botctl exits 1, so it can gate a launch or run from cron.
+fn support_readiness(rest: &[&str], mut stdin: impl Read) -> Result<(String, bool), String> {
+    let (options, format) = support_readiness::parse_args(rest, chrono::Utc::now())?;
+    let mut read = |file: &str| -> Result<String, String> {
+        let mut text = String::new();
+        match file {
+            "-" => stdin.read_to_string(&mut text).map(drop).map_err(|e| format!("stdin: {e}"))?,
+            _ => text = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?,
+        }
+        Ok(text)
+    };
+    let inputs = support_readiness::Inputs {
+        docs: options.docs.as_deref().map(support_readiness::read_docs).transpose()?,
+        rota: options.rota.as_deref().map(&mut read).transpose()?,
+        tams: options.tams.as_deref().map(&mut read).transpose()?,
+    };
+    let readiness = support_readiness::check(&inputs, &options)?;
+    let out = match format {
+        support_readiness::Format::Text => readiness.text(),
+        support_readiness::Format::Markdown => readiness.markdown(),
+        support_readiness::Format::Json => pretty(readiness.json().to_string()),
+    };
+    Ok((out, readiness.ready()))
 }
 
 const INCIDENT_USAGE: &str = "Usage: botctl incident open \"<title>\" \"<text>\" [--impact <impact>] [--component <id>]... [--state <state>] | update <id> <state> \"<text>\" | resolve <id> \"<text>\" | edit <id> [--title <title>] [--impact <impact>] [--component <id>]... | delete <id> --yes | review <id> [--detected <time>] [--lead-hours <n>] [--json] [-o <file>]";
@@ -2837,6 +2892,33 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         assert!(support_report(&["/nonexistent/tickets.csv", "--plan", "pro"], std::io::empty()).unwrap_err().contains("/nonexistent/tickets.csv"));
         assert!(support_report(&[], std::io::empty()).unwrap_err().starts_with("Usage: botctl support-report"));
+    }
+
+    #[test]
+    fn support_readiness_reads_files_and_stdin_and_reports_a_gap() {
+        let dir = std::env::temp_dir().join(format!("botctl-support-readiness-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("more")).unwrap();
+        std::fs::write(dir.join("README.md"), "Write to the help desk.\n").unwrap();
+        std::fs::write(dir.join("more/tam.md"), "Your TAM is `<tam-name>`.\n").unwrap();
+        std::fs::write(dir.join("tams.csv"), "customer,tam,backup\nAcme,Ana,Bo\n").unwrap();
+        let (d, tams) = (dir.to_str().unwrap().to_string(), dir.join("tams.csv").to_str().unwrap().to_string());
+        let rota = "person,start,end,role\nAna,2026-11-02T00:00:00Z,2026-11-09T00:00:00Z,primary\nBo,2026-11-02T00:00:00Z,2026-11-09T00:00:00Z,secondary\n";
+        let args = ["--docs", &d, "--tams", &tams, "--rota", "-", "--from", "2026-11-02", "--to", "2026-11-08", "--max-accounts", "5"];
+        let (out, ready) = support_readiness(&args, rota.as_bytes()).unwrap();
+        assert!(ready);
+        assert!(out.starts_with("Support readiness as of ") && out.contains(": ready\n"), "{out}");
+        assert!(out.contains(", 2 pages"), "{out}");
+        let gap = "person,start,end\nAna,2026-11-02T00:00:00Z,2026-11-08T00:00:00Z\n";
+        let (out, ready) = support_readiness(&["--rota", "-", "--from", "2026-11-02", "--to", "2026-11-08", "--json"], gap.as_bytes()).unwrap();
+        let err: Value = serde_json::from_str(&out).unwrap();
+        assert!(!ready);
+        assert_eq!((err["ready"].clone(), err["rota"]["gaps"][0]["minutes"].clone()), (json!(false), json!(1440)), "{err}");
+        std::fs::write(dir.join("README.md"), "Write to `<support-email>`.\n").unwrap();
+        let (out, ready) = support_readiness(&["--docs", &d], std::io::empty()).unwrap();
+        assert!(!ready && out.contains("<support-email> is still a placeholder: README.md:1"), "{out}");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(support_readiness(&["--rota", "/nonexistent/rota.csv"], std::io::empty()).unwrap_err().contains("/nonexistent/rota.csv"));
+        assert!(support_readiness(&[], std::io::empty()).unwrap_err().contains("Usage: botctl support-readiness"));
     }
 
     #[test]
@@ -3528,19 +3610,24 @@ mod tests {
         assert!(out.contains("ACS URL (reply URL):      https://bots.example/api/auth/sso/corp/acs"), "{out}");
         assert!(out.contains("from botctl: not loaded yet."), "{out}");
         assert!(out.contains("Signs AuthnRequests:      no") && out.contains("Single logout:            no ("), "{out}");
+        assert!(out.contains("Back-channel logout:      from the IdP only ("), "{out}");
         assert!(out.contains("IdP-initiated sign-in:    refused (start from SuperBot)\n"), "{out}");
         v["idpInitiated"] = json!("restart");
         assert!(saml_summary(&v).contains("IdP-initiated sign-in:    restarted as SP-initiated\n"));
-        v["idp"] = json!({ "ssoUrl": "https://idp.example/sso", "sloUrl": "https://idp.example/slo", "certificates": [{ "sha256": "ab:cd", "subject": "CN=idp", "notAfter": 1_900_000_000_000_i64 }] });
+        v["idp"] = json!({ "ssoUrl": "https://idp.example/sso", "sloUrl": "https://idp.example/slo", "sloSoapUrl": "https://idp.example/soap", "certificates": [{ "sha256": "ab:cd", "subject": "CN=idp", "notAfter": 1_900_000_000_000_i64 }] });
         v["sloUrl"] = json!("https://bots.example/api/auth/sso/corp/slo");
+        v["sloSoapUrl"] = json!("https://bots.example/api/auth/sso/corp/slo/soap");
         v["signRequests"] = json!(true);
         v["singleLogout"] = json!(true);
+        v["backChannelLogout"] = json!(true);
         v["spKey"] = json!({ "from": "generated", "certificate": { "sha256": "12:34", "subject": "CN=sp", "notAfter": 1_900_000_000_000_i64 } });
         let out = saml_summary(&v);
         assert!(out.contains("Certificate SHA-256 ab:cd (CN=idp), expires 2030-03-17"), "{out}");
         assert!(out.contains("SLO URL (logout URL):     https://bots.example/api/auth/sso/corp/slo") && out.contains("    Logout URL:  https://idp.example/slo"), "{out}");
         assert!(out.contains("SP signing certificate:   SHA-256 12:34 (generated), expires 2030-03-17"), "{out}");
         assert!(out.contains("Signs AuthnRequests:      yes") && out.contains("Single logout:            yes\n"), "{out}");
+        assert!(out.contains("Back-channel logout:      from the IdP, and to it\n    SOAP SLO URL:            https://bots.example/api/auth/sso/corp/slo/soap\n"), "{out}");
+        assert!(out.contains("    SOAP logout URL:  https://idp.example/soap\n"), "{out}");
         assert!(out.contains("Encrypted assertions:     off") && !out.contains("SP encryption"), "{out}");
         v["encryptedAssertions"] = json!("require");
         v["spEncryptionKey"] = json!({ "from": "secret", "certificate": { "sha256": "56:78", "subject": "CN=enc", "notAfter": 1_900_000_000_000_i64 } });
