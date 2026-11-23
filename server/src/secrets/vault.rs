@@ -409,20 +409,24 @@ impl Inner {
     /// Vault revokes a token's leases with it, whatever their own TTL. A token that ends
     /// sooner is renewed (`renew-self`), else, when botd logs in, replaced by a new login;
     /// failing both, an error, so the run is refused rather than losing its credentials.
+    /// A token Vault refuses (rotated by Vault Agent, revoked) is replaced once, as for reads.
     async fn token_for(&self, run_for: Duration, fresh: bool) -> Result<Zeroizing<String>, Error> {
         let want = run_for.as_secs() + TOKEN_MARGIN.as_secs();
         let logs_in = !matches!(self.cfg.auth, Auth::Token { .. });
         let mut fresh = fresh;
         loop {
             let token = self.token(fresh).await?;
-            let (ttl, renewable) = self.token_life(&token, "auth/token/lookup-self", reqwest::Method::GET, None).await?;
+            let Some((ttl, renewable)) = self.token_life(&token, "auth/token/lookup-self", reqwest::Method::GET, None, fresh).await? else {
+                fresh = true;
+                continue;
+            };
             // 0: a token that never ends, such as a root token.
             if ttl == 0 || ttl >= want {
                 return Ok(token);
             }
             if renewable {
-                let (renewed, _) = self.token_life(&token, "auth/token/renew-self", reqwest::Method::POST, Some(want)).await?;
-                if renewed >= want {
+                let renewed = self.token_life(&token, "auth/token/renew-self", reqwest::Method::POST, Some(want), true).await?;
+                if renewed.is_some_and(|(t, _)| t >= want) {
                     return Ok(token);
                 }
             }
@@ -437,22 +441,26 @@ impl Inner {
     }
 
     /// Looks up or renews `token` itself: its remaining TTL in seconds and whether it is
-    /// renewable. Sent where the token was made (the auth namespace).
-    async fn token_life(&self, token: &str, path: &str, method: reqwest::Method, increment: Option<u64>) -> Result<(u64, bool), Error> {
+    /// renewable, or None if Vault refused the token and `last` is false. Sent where the
+    /// token was made (the auth namespace).
+    async fn token_life(&self, token: &str, path: &str, method: reqwest::Method, increment: Option<u64>, last: bool) -> Result<Option<(u64, bool)>, Error> {
         let mut r = self.request_in(self.auth_namespace(), method, path).header("X-Vault-Token", token);
         if let Some(n) = increment {
             r = r.json(&json!({ "increment": n }));
         }
         let res = r.send().await.map_err(|e| unavailable(path, e))?;
         let status = res.status();
+        if status == reqwest::StatusCode::FORBIDDEN && !last {
+            return Ok(None);
+        }
         if !status.is_success() {
             return Err(Error::Unavailable(format!("Vault answered {status} for {path}; botd's policy needs Vault's default policy, which allows it")));
         }
         let v: Value = res.json().await.map_err(|e| unavailable(path, e))?;
-        Ok(match increment {
+        Ok(Some(match increment {
             None => (v["data"]["ttl"].as_u64().unwrap_or(0), v["data"]["renewable"].as_bool().unwrap_or(false)),
             Some(_) => (v["auth"]["lease_duration"].as_u64().unwrap_or(0), v["auth"]["renewable"].as_bool().unwrap_or(false)),
-        })
+        }))
     }
 
     async fn read(&self, scope: Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error> {
@@ -944,6 +952,21 @@ pub(crate) mod tests {
         assert!(e.contains("ends in 600 s"), "{e}");
         assert_eq!(f.logins.load(Ordering::SeqCst), 2);
         super::super::leases::tests::wait_for(|| f.revoked.lock().unwrap().len() == 2);
+
+        // Vault Agent rotates the token file and revokes the old token: the next run's
+        // lookup is refused, the file read again, and the lease made with the new token.
+        let file = token_file("vault-outlive", "hvs.file-a\n");
+        f.tokens.lock().unwrap().push("hvs.file-a".into());
+        let pairs = [pairs[0], pairs[1], ("VAULT_TOKEN_FILE", file.to_str().unwrap()), pairs[3]];
+        let x = external::from_env(&settings(&pairs), &EnvStore::fixed(&pairs)).unwrap().unwrap();
+        let rc = x.run_credentials().unwrap();
+        drop(rc.issue("uout1", "bout1", false, RUN).unwrap().1);
+        std::fs::write(&file, "hvs.file-b\n").unwrap();
+        *f.tokens.lock().unwrap() = vec!["hvs.file-b".into()];
+        let issued = f.issued.load(Ordering::SeqCst);
+        drop(rc.issue("uout1", "bout1", false, RUN).unwrap().1);
+        assert_eq!(f.issued.load(Ordering::SeqCst), issued + 1);
+        super::super::leases::tests::wait_for(|| f.revoked.lock().unwrap().len() == 4);
     }
 
     #[test]
