@@ -181,8 +181,9 @@ pub fn server_secret(name: &str) -> bool {
 /// scrapers send to `/metrics` (ADR 0089), the error tracker's DSN (ADR 0113), the
 /// headers sent to the trace collector (ADR 0118) and the audit log's SIEM sink (ADR
 /// 0122), and the keys to the stores that hold every machine's backups (ADR 0071), the
-/// server's own (ADR 0109) and the audit archive (ADR 0154).
-pub const SERVER_SECRETS: [&str; 14] = [
+/// server's own (ADR 0109) and the audit archive (ADR 0154), and the service account
+/// key that reads the Google Workspace directory (ADR 0162).
+pub const SERVER_SECRETS: [&str; 15] = [
     "TURNSTILE_SECRET",
     "LINODE_TOKEN",
     "INCUS_CLIENT_KEY",
@@ -197,6 +198,7 @@ pub const SERVER_SECRETS: [&str; 14] = [
     "MACHINE_BACKUP_S3_SECRET_ACCESS_KEY",
     "SERVER_BACKUP_S3_SECRET_ACCESS_KEY",
     "AUDIT_EXPORT_S3_SECRET_ACCESS_KEY",
+    "GOOGLE_DIRECTORY_CREDENTIALS",
 ];
 
 /// Each Bot's own notification webhook URL: `NOTIFY_WEBHOOK_URL_BOT_<ID>` (ADR 0061).

@@ -264,7 +264,7 @@ botctl signup reject <id> --reason "Not a customer"
 
 ### SCIM provisioning
 
-Entra ID, Okta, or another SCIM 2.0 client creates, updates, disables, and deletes users at `/scim/v2`, and with `SCIM_GROUPS=on`, pushes groups as teams. Setup: [sso/scim.md](sso/scim.md). Design: [ADR 0023](adr/0023-scim.md), [ADR 0095](adr/0095-scim-groups-as-teams.md).
+Entra ID, Okta, or another SCIM 2.0 client creates, updates, disables, and deletes users at `/scim/v2`, and with `SCIM_GROUPS=on`, pushes groups as teams. Setup: [sso/scim.md](sso/scim.md). Design: [ADR 0023](adr/0023-scim.md), [ADR 0095](adr/0095-scim-groups-as-teams.md). Google Workspace, which pushes SCIM only to its catalog apps, is read instead: with `GOOGLE_DIRECTORY_SYNC=on`, a read-only service account provisions the people in chosen groups through the same code ([sso/google-workspace.md](sso/google-workspace.md), [ADR 0162](adr/0162-google-workspace-directory-sync.md)).
 
 ```sh
 botctl scim token create entra --sso entra          # the sbp_ token, once; --sso: externalId is the SSO subject
