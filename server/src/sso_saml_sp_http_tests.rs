@@ -1451,3 +1451,128 @@ async fn rollovers_are_for_admins_and_botds_own_keys_in_use() {
     assert!(code == 409 && e["error"].as_str().unwrap().contains("SP_CERT_FILE sets this signing key"), "{e}");
     std::fs::remove_dir_all(dir).ok();
 }
+
+// How people signed in at the IdP (ADR 0190)
+
+const MFA: &str = "http://schemas.microsoft.com/claims/multipleauthn";
+const AMR: &str = "http://schemas.microsoft.com/claims/authnmethodsreferences";
+const PASSWORD: &str = "http://schemas.microsoft.com/ws/2008/06/identity/authenticationmethod/password";
+
+impl Sp {
+    /// The AuthnRequest a web sign-in sends the IdP, as XML.
+    async fn authn_request(&self) -> String {
+        let (_, head, _) = crate::tests::call_with(self.port, "GET", &format!("/api/auth/sso/{}/start", self.id), "", "", "").await;
+        let to_idp = url::Url::parse(&header(&head, "location").unwrap()).unwrap();
+        let q: HashMap<_, _> = to_idp.query_pairs().into_owned().collect();
+        String::from_utf8(miniz_oxide::inflate::decompress_to_vec(&STANDARD.decode(&q["SAMLRequest"]).unwrap()).unwrap()).unwrap()
+    }
+
+    async fn view(&self) -> Value {
+        serde_json::from_str(&call(self.port, "GET", &format!("/api/sso/{}/saml", self.id), &self.admin, "").await.1).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn sign_ins_record_how_the_idp_says_people_signed_in() {
+    let sp = serve(&[]).await;
+    let u = sp.link();
+    assert_eq!(sp.view().await["authnContext"], Value::Null, "nothing required by default");
+    assert!(!sp.authn_request().await.contains("RequestedAuthnContext"));
+    let (code, _, head) = sp.sign_in(|_| {}).await;
+    assert_eq!((code, signed_in_as(sp.port, &head).await), (200, Some(u.id.clone())), "a password-only sign-in, as before");
+    let login = &sp.audit("auth.login").await[0];
+    assert_eq!(login["details"]["authnContext"], test_idp::PASSWORD_PROTECTED, "the class the IdP sent, as evidence");
+}
+
+#[tokio::test]
+async fn a_required_authn_context_keeps_out_sign_ins_without_it_before_just_in_time() {
+    let sp = serve_with(
+        &[("AUTHN_CONTEXT", &format!("{MFA},urn:oasis:names:tc:SAML:2.0:ac:classes:MobileTwoFactorContract")), ("AUTHN_METHODS_ATTRIBUTE", AMR), ("ALLOWED_DOMAINS", "example.com"), ("JIT_ROLE", "member")],
+        |a| a.limiter = users::Limiter::new(1000, 60_000),
+    )
+    .await;
+    let v = sp.view().await;
+    assert_eq!(v["authnContext"], json!({ "required": [MFA, "urn:oasis:names:tc:SAML:2.0:ac:classes:MobileTwoFactorContract"], "methodsAttribute": AMR, "requested": false }));
+    assert!(!sp.authn_request().await.contains("RequestedAuthnContext"), "not requested unless asked: Entra ID refuses a mismatch");
+
+    let refused = async |tweak: Box<dyn FnOnce(&mut Response)>| {
+        let (code, to, head) = sp.sign_in(tweak).await;
+        assert_eq!((code, to.as_str()), (303, "/login?error=sso_mfa_required"));
+        assert_eq!(signed_in_as(sp.port, &head).await, None);
+        let f = sp.last_failure().await;
+        assert_eq!((f["reason"].as_str(), f["subject"].as_str()), (Some("authn_context"), Some(STORED)));
+        f
+    };
+    let f = refused(Box::new(|_| {})).await;
+    assert_eq!((&f["authnContexts"], &f["authnMethods"]), (&json!([test_idp::PASSWORD_PROTECTED]), &json!([])), "says what the IdP sent");
+    let f = refused(Box::new(|r| r.multi_attributes = vec![(AMR.into(), vec![PASSWORD.into()])])).await;
+    assert_eq!(f["authnMethods"], json!([PASSWORD]));
+    refused(Box::new(|r| r.multi_attributes = vec![("amr".into(), vec![MFA.into()])])).await;
+    refused(Box::new(|r| r.authn_contexts = vec![MFA.to_ascii_uppercase()])).await;
+    // Named somewhere other than the signed assertion: changed after signing, or outside it.
+    let (request, relay, cookie) = sp.start().await;
+    let r = Response::new(&sp.acs(), &sp.entity(), &request, db::now());
+    let forged = r.xml_with(|a| a.replace(test_idp::PASSWORD_PROTECTED, MFA));
+    let (_, to, _) = sp.post(Some(&STANDARD.encode(forged)), Some(&relay), &cookie).await;
+    assert_eq!((to.as_str(), sp.last_failure().await["reason"].as_str()), ("/login?error=sso_failed", Some("bad_signature")));
+    assert!(sp.app.db.identity(IDP, STORED).is_none(), "no account made");
+
+    // The IdP vouches for MFA in the class or in its methods attribute: in.
+    let (code, _, head) = sp.sign_in(|r| r.multi_attributes = vec![(AMR.into(), vec![PASSWORD.into(), MFA.into()])]).await;
+    assert_eq!(code, 200, "{head}");
+    let uid = signed_in_as(sp.port, &head).await.expect("just in time, once the requirement is met");
+    assert_eq!(sp.app.db.user(&uid).unwrap().role, Role::Member);
+    assert_eq!(sp.audit("auth.login").await[0]["details"]["authnContext"], MFA, "the value that met it");
+    let (code, _, _) = sp.sign_in(|r| r.authn_contexts = vec!["urn:oasis:names:tc:SAML:2.0:ac:classes:MobileTwoFactorContract".into()]).await;
+    assert_eq!(code, 200);
+    assert_eq!(sp.audit("auth.login").await[0]["details"]["authnContext"], "urn:oasis:names:tc:SAML:2.0:ac:classes:MobileTwoFactorContract");
+    // Checked on every sign-in, not only the first.
+    refused(Box::new(|_| {})).await;
+}
+
+#[tokio::test]
+async fn a_requested_authn_context_is_asked_for_and_an_idp_that_cant_meet_it_says_so() {
+    let sp = serve_with(&[("AUTHN_CONTEXT", MFA), ("REQUEST_AUTHN_CONTEXT", "true"), ("SIGN_REQUESTS", "true")], |a| a.limiter = users::Limiter::new(1000, 60_000)).await;
+    let u = sp.link();
+    assert_eq!(sp.view().await["authnContext"]["requested"], true);
+    let request = sp.authn_request().await;
+    assert!(request.contains(&format!(r#"<samlp:RequestedAuthnContext Comparison="exact"><saml:AuthnContextClassRef>{MFA}</saml:AuthnContextClassRef></samlp:RequestedAuthnContext>"#)), "{request}");
+    // Still a signed request the IdP can check.
+    let (code, head, _) = crate::tests::call_with(sp.port, "GET", &format!("/api/auth/sso/{}/start", sp.id), "", "", "").await;
+    assert_eq!(code, 303);
+    let cert = sp.sp_cert().await;
+    let (_, redirected) = signed_redirect(&header(&head, "location").unwrap(), &cert);
+    assert!(redirected.xml.contains("RequestedAuthnContext"));
+
+    // ADFS and Entra ID answer NoAuthnContext when they can't: the person is told why.
+    let (request, relay, cookie) = sp.start().await;
+    let nested = r#"<samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Responder"><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:NoAuthnContext"/></samlp:StatusCode>"#;
+    let xml = Response::new(&sp.acs(), &sp.entity(), &request, db::now()).xml().replace(r#"<samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>"#, nested);
+    let (code, to, _) = sp.post(Some(&STANDARD.encode(xml)), Some(&relay), &cookie).await;
+    assert_eq!((code, to.as_str()), (303, "/login?error=sso_mfa_required"));
+    let f = sp.last_failure().await;
+    assert_eq!((f["reason"].as_str(), f["idpStatus"].as_str()), (Some("idp_error"), Some("Responder/NoAuthnContext")));
+    // A class it didn't ask for is still refused; the one it did, signs in.
+    sp.sign_in(|_| {}).await;
+    assert_eq!(sp.last_failure().await["reason"], "authn_context");
+    let (code, _, head) = sp.sign_in(|r| r.authn_contexts = vec![MFA.into()]).await;
+    assert_eq!((code, signed_in_as(sp.port, &head).await), (200, Some(u.id)));
+}
+
+#[tokio::test]
+async fn an_idp_initiated_post_restarts_and_the_restarted_sign_in_is_held_to_the_requirement() {
+    let sp = serve_with(&[("IDP_INITIATED", "restart"), ("AUTHN_CONTEXT", MFA)], |a| a.limiter = users::Limiter::new(1000, 60_000)).await;
+    let u = sp.link();
+    // The tile's response signs nobody in, so it isn't held to it: it only restarts.
+    let (code, to, _) = sp.post(Some(&sp.unsolicited().posted()), None, "").await;
+    assert_eq!((code, to.ends_with("/start")), (303, true), "{to}");
+    let (request, relay, binder) = sp.start().await;
+    let cookie = format!("{binder}; {RESTART}={}", sp.id);
+    let (_, to, _) = sp.post(Some(&Response::new(&sp.acs(), &sp.entity(), &request, db::now()).posted()), Some(&relay), &cookie).await;
+    assert_eq!(to, "/login?error=sso_mfa_required");
+    let (request, relay, binder) = sp.start().await;
+    let mut r = Response::new(&sp.acs(), &sp.entity(), &request, db::now());
+    r.authn_contexts = vec![MFA.into()];
+    let (code, _, head) = sp.post(Some(&r.posted()), Some(&relay), &binder).await;
+    assert_eq!((code, signed_in_as(sp.port, &head).await), (200, Some(u.id)));
+}
