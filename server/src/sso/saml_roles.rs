@@ -10,8 +10,9 @@
 //! who holds no custom role gets the first matching mapping's role, unless they're an admin
 //! or the owner account; someone whose grant's group the assertion no longer lists (or whose
 //! groups are unknown) loses it. Only what a mapping gave is taken away. Any change of the
-//! person's role by hand ends the mapping's claim on it, and that mapping gives nothing
-//! back until a sign-in no longer lists its group. Every change is audited.
+//! person's role by hand ends the mapping's claim on it, and no mapping, of any provider,
+//! gives them anything until a sign-in with that provider no longer lists its group. Every
+//! change is audited.
 
 use super::Provider;
 use super::saml_sp::{Groups, MAX_GROUP_LEN};
@@ -146,18 +147,23 @@ async fn take_away(app: &AppState, by: &Who, m: &SamlRoleMapping, user_id: &str,
 /// `user` just signed in with `p`, whose signed assertion put them in `groups`: their role
 /// follows `p`'s mappings. A grant from `p` stays while its group is listed and goes when
 /// it isn't, or the groups are unknown (`Groups::Unknown`, or not read at all); then the
-/// first of `p`'s mappings (oldest first) whose group is listed is tried. A grant from `p`
-/// an admin changed by hand holds everything as it is while its group is still listed.
+/// first of `p`'s mappings (oldest first) whose group is listed is tried. A grant an admin
+/// changed by hand holds everything as it is until a sign-in with its own provider no
+/// longer lists its group: no other provider can tell.
 /// Grants from another provider's mappings are left alone. Done before the session starts.
 pub(crate) async fn signed_in(app: &AppState, a: &Auth, source: &Source, p: &Provider, user: &User, groups: &Groups) {
     let _writes = a.sso.role_writes.lock().await;
+    // An unlink that won the lock already took away what the provider gave.
+    if !app.db.identities(&user.id).iter().any(|i| i.provider == p.id) {
+        return;
+    }
     let by = Who { actor: Actor::system("sso"), source: source.clone() };
     let listed = groups.listed();
     if let Some(id) = app.db.saml_role_released(&user.id)
-        && let Some(m) = app.db.saml_role_mapping(&id).filter(|m| m.provider == p.id)
+        && let Some(m) = app.db.saml_role_mapping(&id)
     {
         match listed {
-            Some(l) if !l.contains(&m.group) => {
+            Some(l) if m.provider == p.id && !l.contains(&m.group) => {
                 app.db.end_saml_role_release(&user.id, &m.id);
             }
             _ => return,

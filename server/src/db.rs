@@ -5375,7 +5375,8 @@ impl Db {
             let n = tx.execute(
                 "UPDATE users SET role_id = ?1, role = (SELECT base FROM roles WHERE id = ?1), updated_at = ?3
                  WHERE id = ?2 AND role_id IS NULL AND role != 'admin' AND id != ?4 AND status = 'active'
-                   AND EXISTS (SELECT 1 FROM roles WHERE id = ?1) AND EXISTS (SELECT 1 FROM saml_role_mappings WHERE id = ?5 AND role_id = ?1)",
+                   AND EXISTS (SELECT 1 FROM roles WHERE id = ?1) AND EXISTS (SELECT 1 FROM saml_role_mappings WHERE id = ?5 AND role_id = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM saml_role_grants WHERE user_id = ?2 AND released_at IS NOT NULL)",
                 params![m.role_id, user_id, at, crate::users::OPERATOR, m.id],
             )?;
             if n == 0 {
@@ -9863,7 +9864,7 @@ mod tests {
         assert!(matches!(db.create_saml_role_mapping("corp", "Ghosts", "rnone", None), Err(ScimRoleMapError::Gone)));
         let m = db.create_saml_role_mapping("corp", "Auditors", &r.id, Some("admin")).unwrap();
         assert!(matches!(db.create_saml_role_mapping("corp", "Auditors", &hand.id, None), Err(ScimRoleMapError::Taken)), "one role per group");
-        assert!(db.create_saml_role_mapping("okta", "Auditors", &r.id, None).is_ok(), "another provider's group of the same name");
+        let okta = db.create_saml_role_mapping("okta", "Auditors", &r.id, None).unwrap();
         assert!(matches!(db.delete_custom_role(&r.id), Err(RoleError::Mapped(2))));
         assert!(matches!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view", "machines.manage"])), Err(RoleError::Reaches { via: "saml", .. })), "checked as it's saved");
 
@@ -9894,7 +9895,12 @@ mod tests {
         db.update_user(&a.id, UserPatch { role: Some(Role::Readonly), ..Default::default() }).unwrap();
         assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Readonly, None));
         assert_eq!(db.saml_role_released(&a.id), Some(m.id.clone()));
-        // A grant replaces the release; disabled people get nothing.
+        // While it's held no mapping gives anything, another provider's included.
+        assert!(!db.grant_saml_role(&okta, &a.id), "another provider's mapping");
+        assert!(!db.grant_saml_role(&m, &a.id));
+        assert_eq!((db.saml_role_released(&a.id), db.user(&a.id).unwrap().role_id), (Some(m.id.clone()), None));
+        // Once it ends, mappings give again; disabled people get nothing.
+        assert!(db.end_saml_role_release(&a.id, &m.id));
         assert!(db.grant_saml_role(&m, &a.id) && db.saml_role_released(&a.id).is_none());
         assert!(db.revoke_saml_role(&m, &a.id).is_some());
         db.update_user(&a.id, UserPatch { status: Some("disabled"), ..Default::default() }).unwrap();

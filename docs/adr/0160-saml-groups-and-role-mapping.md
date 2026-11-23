@@ -43,7 +43,7 @@ An admin maps one provider's group to one custom role, across the server (org sc
 
 ### Every sign-in reconciles
 
-After the account is found and before the session starts, the provider's mappings are applied under one lock (`role_writes`, also taken by mapping writes):
+After the account is found and before the session starts, the provider's mappings are applied under one lock (`role_writes`, also taken by mapping writes and unlinking). Under the lock the person must still have an identity at the provider, so an unlink that finished while the sign-in waited isn't undone by it:
 
 1. A grant from this provider stays while the assertion lists its group. Otherwise it's taken away (`left_group`, or `groups_unknown` when the groups are unknown or the provider no longer reads them).
 2. Then, if the assertion lists a mapped group, the first such mapping (oldest first) gives its role, unless the person is an admin, the owner account, or already holds a custom role (by hand, from SCIM, or from another provider's group). Each skip is audited as `sso.saml_role_skipped` with its reason. The grant is one SQL update that repeats these checks, so it can't overwrite a change made meanwhile.
@@ -54,12 +54,12 @@ Grants from another provider's mappings are left alone; only the provider that g
 
 Each grant is a row in `saml_role_grants` (mapping, user, and the built-in role it replaced). Taking it away clears the role only if it is still the mapping's, and puts back the earlier built-in role (never admin). Built-in role changes are audited as `user.role_changed` and run the same offboarding as an admin's change (`users::lost_access`).
 
-Any change of that person's role by hand (giving a role, taking it away, setting the built-in role) *releases* the grant in the same transaction: nothing is taken back, and the release is remembered. While the IdP still lists the group (or the groups are unknown), the provider's mappings give that person nothing, so an admin's decision isn't undone at the next sign-in. Once a sign-in no longer lists the group, the release ends and mappings apply again.
+Any change of that person's role by hand (giving a role, taking it away, setting the built-in role) *releases* the grant in the same transaction: nothing is taken back, and the release is remembered. While it's held, no mapping gives that person anything, whichever provider it belongs to, so an admin's decision isn't undone at the next sign-in. The grant SQL refuses while a release is held, so this doesn't rest on the order of the checks. Only the provider that gave the role can say the person left its group: once a sign-in with it no longer lists the group, the release ends and mappings apply again. Unlinking that provider's identity, removing the mapping, or erasing the person ends it too.
 
 Grants also go when:
 
 - the mapping is removed (`mapping_removed`, for everyone it gave the role to);
-- an admin unlinks the person's last identity at that provider (`unlinked`): the IdP can't vouch for their groups any more;
+- an admin unlinks the person's last identity at that provider (`unlinked`): the IdP can't vouch for their groups any more. The identity is removed before the lock is taken, and sign-ins check for it under the lock, so a sign-in racing the unlink either runs first (and the unlink takes the role) or gives nothing;
 - the person is erased.
 
 ### Audit

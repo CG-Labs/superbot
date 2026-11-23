@@ -1096,3 +1096,20 @@ async fn a_provider_that_stops_reading_groups_takes_back_what_its_groups_gave() 
     let (_, v) = call(sp.port, "GET", &format!("/api/sso/role-mappings/{}", m.id), &sp.admin, "").await;
     assert_eq!(serde_json::from_str::<Value>(&v).unwrap()["active"], false, "{v}");
 }
+
+#[tokio::test]
+async fn a_change_by_hand_to_another_providers_grant_holds_against_this_ones_groups() {
+    let sp = serve(&[("GROUPS_ATTRIBUTE", "groups")]).await;
+    let u = sp.link();
+    let auditor = sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None).unwrap();
+    sp.app.db.create_saml_role_mapping(&sp.id, "Auditors", &auditor.id, None).unwrap();
+    let theirs = sp.app.db.create_saml_role_mapping("other", "Auditors", &auditor.id, None).unwrap();
+    assert!(sp.app.db.grant_saml_role(&theirs, &u.id));
+    let (code, e) = call(sp.port, "DELETE", &format!("/api/roles/{}/users/{}", auditor.id, u.id), &sp.admin, "").await;
+    assert_eq!(code, 200, "{e}");
+    let (code, _, _) = sp.sign_in(in_groups(&["Auditors"])).await;
+    assert_eq!(code, 200);
+    assert_eq!(sp.app.db.user(&u.id).unwrap().role_id, None, "only the other provider can say they left its group");
+    assert_eq!(sp.app.db.saml_role_released(&u.id), Some(theirs.id));
+    assert!(sp.audit("role.assigned").await.is_empty());
+}

@@ -135,7 +135,7 @@ botctl sso role unmap <id>                             # takes the role from all
 
 - Never admin, a built-in role, or a role with `bots.manage` or `machines.manage`, which reach admins. Such a mapping is refused and audited (`sso.saml_role_map_refused`), and a mapped role can't gain those permissions or be deleted.
 - Each sign-in applies the mappings. Someone in the group with no custom role gets it (the role's base becomes their built-in role). Admins, the owner account, and people with a custom role already are skipped (`sso.saml_role_skipped`). When a sign-in no longer lists the group, or the groups are unknown, the role goes and their earlier built-in role comes back.
-- Only what a mapping gave is taken away. If an admin changes that person's role by hand, the change stands: the group gives nothing back until a sign-in no longer lists it.
+- Only what a mapping gave is taken away. If an admin changes that person's role by hand, the change stands: no group, of any provider, gives them a role until a sign-in with the provider that gave it no longer lists its group.
 - The role also goes when the mapping is removed or the person's identity at the provider is unlinked. Making a mapping gives nothing until people sign in again. To end a role at once for someone who left the group, take it away by hand or use [SCIM group roles](scim.md).
 - Grants and removals are audited as `role.assigned` and `role.unassigned` with `via` = `saml`. Mapping changes are `sso.saml_role_mapped` and `sso.saml_role_unmapped`.
 
