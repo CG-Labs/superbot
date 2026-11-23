@@ -72,7 +72,7 @@ Okta sends its user id (`00u…`) as `externalId`. That is the `sub` in Okta's I
 
 ## Google Workspace
 
-Google has no generic SCIM client for custom apps. Put Entra ID or Okta in front of Google (they can sync from it), or use a provisioning connector that speaks SCIM 2.0. Use `--sso` only with the provider whose subjects the connector sends as `externalId`.
+Google pushes SCIM only to apps in its own catalog, so botd reads the Workspace directory instead: set `GOOGLE_DIRECTORY_SYNC=on`, and a read-only service account provisions the people in the groups you choose through the same code as SCIM. Setup: [google-workspace.md](google-workspace.md) ([ADR 0162](../adr/0162-google-workspace-directory-sync.md)). A SCIM connector in front of Google works too; use `--sso` only with the provider whose subjects it sends as `externalId`.
 
 ## What happens
 
