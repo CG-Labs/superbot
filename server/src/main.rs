@@ -26,6 +26,9 @@ mod audit_checkpoint;
 #[cfg(test)]
 mod audit_checkpoint_http_tests;
 mod audit_export;
+// botctl's `audit verify-lines` uses the rest.
+#[allow(dead_code)]
+mod audit_line;
 #[cfg(test)]
 mod audit_http_tests;
 #[cfg(test)]

@@ -37,7 +37,7 @@ const LAST_RETRY: Duration = Duration::from_secs(5 * 60);
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// Failed tries in a row before `audit.export_failing` is recorded.
 const FAILING_AFTER: u32 = 3;
-pub const SCHEMA: &str = "superbot.audit.v1";
+pub const SCHEMA: &str = crate::audit_line::SCHEMA;
 /// RFC 5424 facility 13, "log audit".
 const FACILITY: u8 = 13;
 /// SIEMs `AUDIT_EXPORT` takes at most, beside one archive (ADR 0191). Each holds
@@ -404,6 +404,31 @@ impl Exporter {
 /// cursor, retries and status, so one sink's outage never holds up the other.
 pub struct Exports {
     pub sinks: Vec<Arc<Exporter>>,
+    /// Events after this one go to every sink with their digest (ADR 0199).
+    pub digests_after: i64,
+}
+
+/// The cursor, beside the sinks', past which events carry their digest (ADR 0199).
+pub const DIGESTS: &str = "#digests";
+
+/// Saved the first time the export starts with digests: past everything any sink has
+/// delivered or cut a batch of, so a sink resending what it sent before sends the same
+/// lines, and no sink sends without its digest an event another sent with one. Every
+/// event after the first with a digest has one, which is what a check of the lines holds
+/// them to.
+fn digests_after(app: &App, sinks: &[Arc<Exporter>]) -> i64 {
+    if let Some(after) = app.db.audit_export_cursor(DIGESTS) {
+        return after;
+    }
+    let cut = |x: &Exporter| app.db.audit_export_cursor(&format!("{}#batch", x.sink.id)).unwrap_or(0);
+    let after = sinks.iter().map(|x| x.delivered().max(cut(x))).max().unwrap_or(0);
+    match app.db.set_audit_export_cursor(DIGESTS, after) {
+        Ok(()) => after,
+        Err(e) => {
+            log_warn!("Audit export: couldn't save where events start carrying their digest ({e}); sending none until botd restarts and saves it.");
+            i64::MAX
+        }
+    }
 }
 
 impl Exports {
@@ -425,6 +450,7 @@ impl Exports {
         let mut v = worst.unwrap_or_else(|| json!({ "enabled": false }));
         if !views.is_empty() {
             v["sinks"] = Value::Array(views);
+            v["digestsAfter"] = json!(self.digests_after);
         }
         v
     }
@@ -453,14 +479,15 @@ pub fn start(app: &Arc<App>, settings: Settings) {
             Arc::new(Exporter::new(sink, delivered))
         })
         .collect();
-    if app.audit_export.set(Arc::new(Exports { sinks: sinks.clone() })).is_ok() {
+    let after = digests_after(app, &sinks);
+    if app.audit_export.set(Arc::new(Exports { sinks: sinks.clone(), digests_after: after })).is_ok() {
         for x in sinks {
-            tokio::spawn(run(app.clone(), x));
+            tokio::spawn(run(app.clone(), x, after));
         }
     }
 }
 
-async fn run(app: Arc<App>, x: Arc<Exporter>) {
+async fn run(app: Arc<App>, x: Arc<Exporter>, sealed_after: i64) {
     let mut out = Out::new(&x.sink);
     let host = hostname();
     let mut wait = FIRST_RETRY;
@@ -504,7 +531,7 @@ async fn run(app: Arc<App>, x: Arc<Exporter>) {
                 };
                 let r = match cut {
                     Ok(()) => out
-                        .send(&x.sink, &rows, &extras, &host)
+                        .send(&x.sink, &rows, &extras, &host, sealed_after)
                         .await
                         .and_then(|object| app.db.set_audit_export_cursor(&x.sink.id, last).map(|()| object).map_err(|e| ("cursor_unsaved", format!("couldn't save the export cursor: {e}")))),
                     Err(e) => Err(e),
@@ -592,17 +619,29 @@ fn printable(s: &str, max: usize) -> String {
 /// One event as a JSON line: the API's shape, plus the schema and this host.
 #[cfg(test)]
 pub fn line(e: &AuditEvent, host: &str) -> String {
-    line_with(e, host, None)
+    line_with(e, host, None, true)
 }
 
-/// [`line`], with a checkpoint event's signed record and token (ADR 0149) as `checkpoint`.
-pub fn line_with(e: &AuditEvent, host: &str, checkpoint: Option<&Value>) -> String {
+/// [`line`], with a checkpoint event's signed record and token (ADR 0149) as `checkpoint`,
+/// and, when `sealed` (ADR 0199), the event's `chainDigest`, so the line's own fields give
+/// its hash. `chainSalt` goes too only when the line's fields give that digest under it:
+/// not once an erasure has cleared the salt, nor when the export redacted a secret
+/// recorded in clear before botd knew it, a guess at which the salt would let anyone test.
+pub fn line_with(e: &AuditEvent, host: &str, checkpoint: Option<&Value>, sealed: bool) -> String {
     let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
+    let digest = e.chain_digest.as_deref().filter(|_| sealed);
+    let salt = e.chain_salt.as_deref().filter(|s| digest.is_some_and(|d| crate::audit_line::digest(s, &v) == d));
     if let Some(o) = v.as_object_mut() {
         o.insert("schema".into(), json!(SCHEMA));
         o.insert("host".into(), json!(host));
         if let Some(c) = checkpoint {
             o.insert("checkpoint".into(), c.clone());
+        }
+        if let Some(d) = digest {
+            o.insert("chainDigest".into(), json!(d));
+        }
+        if let Some(s) = salt {
+            o.insert("chainSalt".into(), json!(s));
         }
     }
     v.to_string()
@@ -610,13 +649,13 @@ pub fn line_with(e: &AuditEvent, host: &str, checkpoint: Option<&Value>) -> Stri
 
 /// One event as an RFC 5424 message: facility "log audit", severity by outcome, the
 /// action as MSGID, and the JSON line as the text.
-pub fn syslog(e: &AuditEvent, host: &str, checkpoint: Option<&Value>) -> String {
+pub fn syslog(e: &AuditEvent, host: &str, checkpoint: Option<&Value>, sealed: bool) -> String {
     let severity = match e.outcome.as_str() {
         "denied" => 4,
         "failure" => 5,
         _ => 6,
     };
-    format!("<{}>1 {} {host} superbot {} {} - {}", FACILITY * 8 + severity, e.time, std::process::id(), printable(&e.action, 32), line_with(e, host, checkpoint))
+    format!("<{}>1 {} {host} superbot {} {} - {}", FACILITY * 8 + severity, e.time, std::process::id(), printable(&e.action, 32), line_with(e, host, checkpoint, sealed))
 }
 
 /// Checkpoint records to add to their events, by event id.
@@ -644,18 +683,19 @@ impl Out {
 
     /// Sends one batch: the archive's object when it wrote one. Failures carry a reason
     /// code for `audit.export_failing`.
-    async fn send(&mut self, sink: &Sink, rows: &[AuditEvent], extras: &Extras, host: &str) -> Result<Option<Value>, (&'static str, String)> {
+    /// `sealed_after`: events after it carry their digest ([`Exports::digests_after`]).
+    async fn send(&mut self, sink: &Sink, rows: &[AuditEvent], extras: &Extras, host: &str, sealed_after: i64) -> Result<Option<Value>, (&'static str, String)> {
         if let (Out::Archive(client), Kind::Archive(a)) = (&mut *self, &sink.kind) {
-            let body: String = rows.iter().map(|e| line_with(e, host, extras.get(&e.id)) + "\n").collect();
+            let body: String = rows.iter().map(|e| line_with(e, host, extras.get(&e.id), e.id > sealed_after) + "\n").collect();
             return client.send(a, rows, body.into_bytes()).await.map(Some);
         }
-        self.send_stream(sink, rows, extras, host).await.map(|()| None).map_err(|e| ("delivery_failed", e))
+        self.send_stream(sink, rows, extras, host, sealed_after).await.map(|()| None).map_err(|e| ("delivery_failed", e))
     }
 
-    async fn send_stream(&mut self, sink: &Sink, rows: &[AuditEvent], extras: &Extras, host: &str) -> Result<(), String> {
+    async fn send_stream(&mut self, sink: &Sink, rows: &[AuditEvent], extras: &Extras, host: &str, sealed_after: i64) -> Result<(), String> {
         match (self, &sink.kind) {
             (Out::Http(http), Kind::Webhook { url, headers, .. }) => {
-                let body: String = rows.iter().map(|e| line_with(e, host, extras.get(&e.id)) + "\n").collect();
+                let body: String = rows.iter().map(|e| line_with(e, host, extras.get(&e.id), e.id > sealed_after) + "\n").collect();
                 let mut req = http.post(url).header(reqwest::header::CONTENT_TYPE, "application/x-ndjson").body(body);
                 for (k, v) in headers {
                     req = req.header(k.as_str(), v.expose());
@@ -669,7 +709,7 @@ impl Out {
                 }
                 let mut frames = Vec::new();
                 for e in rows {
-                    let m = syslog(e, host, extras.get(&e.id));
+                    let m = syslog(e, host, extras.get(&e.id), e.id > sealed_after);
                     frames.extend(format!("{} ", m.len()).as_bytes());
                     frames.extend(m.as_bytes());
                 }
@@ -945,7 +985,7 @@ pub(crate) mod tests {
     fn retention_waits_for_the_slowest_sink_and_the_view_leads_with_the_worst() {
         let siem = Arc::new(Exporter::new(Sink::parse("https://siem.example.net/in", false).unwrap(), 9));
         let other = Arc::new(Exporter::new(Sink::parse("syslog+tls://logs.example.net", false).unwrap(), 4));
-        let xs = Exports { sinks: vec![siem.clone(), other.clone()] };
+        let xs = Exports { sinks: vec![siem.clone(), other.clone()], digests_after: 0 };
         assert_eq!(xs.delivered(), 4);
         assert!(xs.archive().is_none());
         let v = xs.view(10);
@@ -956,7 +996,7 @@ pub(crate) mod tests {
         let v = xs.view(10);
         assert_eq!((v["kind"].as_str(), v["failing"].as_bool(), v["lastError"].as_str()), (Some("webhook"), Some(true), Some("down")), "failing comes first: {v}");
         assert_eq!(v["sinks"][1]["failing"], false);
-        assert_eq!(Exports { sinks: vec![] }.view(1), json!({ "enabled": false }));
+        assert_eq!(Exports { sinks: vec![], digests_after: 0 }.view(1), json!({ "enabled": false }));
     }
 
     pub(crate) fn event(outcome: &str) -> AuditEvent {
@@ -985,6 +1025,8 @@ pub(crate) mod tests {
             on_behalf_of: None,
             chain_prev: Some(crate::audit_chain::GENESIS.into()),
             chain_hash: Some("ab".repeat(32)),
+            chain_digest: Some("cd".repeat(32)),
+            chain_salt: Some("ef".repeat(16)),
         }
     }
 
@@ -993,14 +1035,56 @@ pub(crate) mod tests {
         let l: Value = serde_json::from_str(&line(&event("failure"), "host-1")).unwrap();
         assert_eq!((l["schema"].as_str(), l["host"].as_str(), l["id"].as_i64(), l["action"].as_str()), (Some(SCHEMA), Some("host-1"), Some(7), Some("auth.login_failed")));
         assert_eq!((l["chainPrev"].as_str(), l["chainHash"].as_str()), (Some(crate::audit_chain::GENESIS), Some("ab".repeat(32).as_str())));
-        let m = syslog(&event("failure"), "host-1", None);
+        let m = syslog(&event("failure"), "host-1", None, true);
         assert!(m.starts_with(&format!("<109>1 1970-01-01T00:00:00.000Z host-1 superbot {} auth.login_failed - {{", std::process::id())), "{m}");
-        assert!(syslog(&event("denied"), "h", None).starts_with("<108>1 "));
-        assert!(syslog(&event("success"), "h", None).starts_with("<110>1 "));
+        assert!(syslog(&event("denied"), "h", None, true).starts_with("<108>1 "));
+        assert!(syslog(&event("success"), "h", None, true).starts_with("<110>1 "));
         assert!(!m.contains('\n'));
         assert_eq!(printable("a b\u{e9}", 32), "a-b-");
         assert_eq!(printable("", 32), "-");
         assert_eq!(printable(&"x".repeat(40), 32).len(), 32);
+    }
+
+    #[test]
+    fn a_line_carries_its_digest_and_its_salt_only_when_that_hides_nothing() {
+        use crate::audit::{Actor, Event};
+        use crate::audit_line::{Bound, check};
+        let app = crate::runner::test_app();
+        let read = |id: i64| app.db.audit_events(&Default::default(), 1000, false).into_iter().find(|e| e.id == id).unwrap();
+        let exported = |id: i64, sealed: bool| -> Value { serde_json::from_str(&line_with(&read(id), "h", None, sealed)).unwrap() };
+
+        let plain = app.db.try_record(&Event::new(Actor::system("test"), "test.plain").details(json!({ "n": 1 }))).unwrap();
+        let v = exported(plain, true);
+        assert!(v["chainDigest"].is_string() && v["chainSalt"].is_string(), "{v}");
+        assert_eq!(check(&v), Ok(Bound::All), "{v}");
+        let mut changed = v.clone();
+        changed["details"]["n"] = json!(2);
+        assert!(check(&changed).unwrap_err().contains("digest"));
+        let mut moved = v.clone();
+        moved["outcome"] = json!("failure");
+        assert!(check(&moved).unwrap_err().contains("chainHash"));
+        let before = exported(plain, false);
+        assert!(before.get("chainDigest").is_none() && before.get("chainSalt").is_none(), "at or before the marker: {before}");
+        assert_eq!(check(&before), Ok(Bound::None));
+
+        // A value that became a known secret after it was written is masked on the way
+        // out; its salt would let anyone test guesses at it against the digest.
+        let later = "became-secret-later-5d21ab";
+        let masked = app.db.try_record(&Event::new(Actor::system("test"), "test.masked").details(json!({ "note": later }))).unwrap();
+        crate::secrets::redact::register(later);
+        let v = exported(masked, true);
+        crate::secrets::redact::forget(later);
+        assert!(!v.to_string().contains(later), "{v}");
+        assert!(v["chainDigest"].is_string() && v.get("chainSalt").is_none(), "{v}");
+        assert_eq!(check(&v), Ok(Bound::Fixed), "{v}");
+
+        // Erased: no salt to send, and its erasable fields are rewritten.
+        let erased = app.db.try_record(&Event::new(Actor::system("test"), "test.erased").details(json!({ "name": "Ada" }))).unwrap();
+        app.db.execute_raw("DROP TRIGGER audit_events_no_update").unwrap();
+        app.db.execute_raw(&format!("UPDATE audit_events SET chain_salt = NULL, details = '{{\"name\":\"erased-1\"}}' WHERE id = {erased}")).unwrap();
+        let v = exported(erased, true);
+        assert!(v["chainDigest"].is_string() && v.get("chainSalt").is_none(), "{v}");
+        assert_eq!(check(&v), Ok(Bound::Fixed), "{v}");
     }
 
     #[test]

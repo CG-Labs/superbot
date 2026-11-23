@@ -739,6 +739,12 @@ pub struct AuditEvent {
     /// The hash chain (ADR 0122): the row before's hash, and this row's.
     pub chain_prev: Option<String>,
     pub chain_hash: Option<String>,
+    /// The salted digest of the fields an erasure may rewrite, and its salt (None once
+    /// erased). Only the export sends them (ADR 0199).
+    #[serde(skip)]
+    pub chain_digest: Option<String>,
+    #[serde(skip)]
+    pub chain_salt: Option<String>,
 }
 
 /// A person who can sign in. `operator` is the owner and break-glass account.
@@ -2132,6 +2138,8 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
         on_behalf_of: r.get("on_behalf_of")?,
         chain_prev: r.get("chain_prev")?,
         chain_hash: r.get("chain_hash")?,
+        chain_digest: r.get("chain_digest")?,
+        chain_salt: r.get("chain_salt")?,
     })
 }
 

@@ -17,14 +17,14 @@ use crate::db::{now, Db};
 use crate::runner::App;
 use rusqlite::types::Value as Sql;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use crate::audit_line::sha;
 use serde::Serialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 
 /// The link before the first row of a log that has never been pruned.
-pub const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+pub const GENESIS: &str = crate::audit_line::GENESIS;
 
 /// Columns nothing may change once written (the update trigger refuses it), hashed as stored.
 pub const FIXED: [&str; 11] = ["id", "at", "actor_kind", "action", "target_type", "bot_id", "outcome", "actor_role", "auth_method", "idp", "idp_provider"];
@@ -42,17 +42,6 @@ const DOMAIN: &str = "superbot-audit-chain-v1";
 const BATCH: i64 = 2_000;
 /// How often botd checks its own chain and records the head as a checkpoint.
 const CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
-
-fn sha(parts: &[&str]) -> String {
-    let mut h = Sha256::new();
-    for (i, p) in parts.iter().enumerate() {
-        if i > 0 {
-            h.update(b"\n");
-        }
-        h.update(p.as_bytes());
-    }
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
-}
 
 /// Values as a JSON array: unambiguous, with no raw newline in it. A BLOB is tagged, so
 /// it never hashes like the text of its hex; botd never writes one, so no seal changes.
