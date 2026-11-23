@@ -400,7 +400,7 @@ fn cell(s: &str) -> String {
 }
 
 fn share(part: u64, whole: u64) -> String {
-    if whole == 0 { part.to_string() } else { format!("{part} ({}%)", part * 100 / whole) }
+    (part * 100).checked_div(whole).map_or_else(|| part.to_string(), |pct| format!("{part} ({pct}%)"))
 }
 
 const TODO: &str = "_To fill in._";
@@ -439,14 +439,15 @@ impl Review {
             None => _ = writeln!(m, "| Detected | {TODO} When the alert fired or the first report came in (`--detected`) |"),
         }
         let _ = writeln!(m, "| Posted | {} UTC |", at(&s(&i["postedAt"])));
+        let from = if self.detected_at.is_some() { "detection" } else { "the first post" };
         if let Some(n) = t.to_identified_minutes {
-            let _ = writeln!(m, "| Identified | after {} |", duration(n));
+            let _ = writeln!(m, "| Identified | {} after {from} |", duration(n));
         }
         match i["resolvedAt"].as_str() {
             Some(r) => _ = writeln!(m, "| Resolved | {} UTC |", at(r)),
             None => _ = writeln!(m, "| Resolved | not yet |"),
         }
-        let _ = writeln!(m, "| Duration | {}{} |", duration(self.duration_minutes), if self.detected_at.is_some() { ", from detection" } else { ", from the first post" });
+        let _ = writeln!(m, "| Duration | {}, from {from} |", duration(self.duration_minutes));
 
         let _ = writeln!(m, "\n## Timeline (UTC)\n");
         let _ = writeln!(m, "Status page posts, botd's starts, and changes to its configuration from {} h before the start. Add what people did and decided.\n", self.lead_hours);

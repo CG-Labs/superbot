@@ -92,6 +92,7 @@ async fn a_review_sets_botds_records_beside_the_timeline() {
     assert!(lower.contains("cache-control: no-store"), "{head}");
     assert!(md.starts_with("# Incident review: Bot runs fail") && md.contains("## Actions") && md.contains("**missed 1 time**"), "{md}");
     assert!(md.contains("| Detected | _To fill in._"), "no detection time this time: {md}");
+    assert!(md.contains("| Identified | 30 min after the first post |") && md.contains("| Duration | 2 h 30 min, from the first post |"), "{md}");
 
     let (_, audit) = call(port, "GET", "/api/audit?action=status.incident_reviewed", &admin, "").await;
     let events = audit_list(&audit);
