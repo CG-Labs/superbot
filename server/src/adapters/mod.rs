@@ -189,9 +189,10 @@ pub(crate) fn secret_env() -> Vec<String> {
 }
 
 /// botd's secrets whose names depend on its settings: SSO providers', Bots' webhooks,
-/// and every machine backup store's, each data region's included (ADR 0117).
+/// every machine backup store's, each data region's included (ADR 0117), and each named
+/// audit export sink's headers (ADR 0191).
 fn named_secret(k: &str) -> bool {
-    k.starts_with("SSO_") || k.starts_with(crate::secrets::BOT_WEBHOOK_PREFIX) || k.starts_with("MACHINE_BACKUP_S3_")
+    k.starts_with("SSO_") || k.starts_with(crate::secrets::BOT_WEBHOOK_PREFIX) || k.starts_with("MACHINE_BACKUP_S3_") || k.starts_with("AUDIT_EXPORT_HEADERS_")
 }
 
 /// Tier endpoints' key secrets, and their `_FILE`: a run gets one only when routed to
@@ -895,6 +896,14 @@ mod tests {
             assert!(super::named_secret(k), "{k}");
         }
         assert!(!super::named_secret("MACHINE_REGIONS"));
+    }
+
+    #[test]
+    fn audit_sinks_headers_are_never_inherited() {
+        for k in ["AUDIT_EXPORT_HEADERS_SPLUNK", "AUDIT_EXPORT_HEADERS_SPLUNK_FILE", "AUDIT_EXPORT_HEADERS_FILE"] {
+            assert!(super::named_secret(k), "{k}");
+        }
+        assert!(!super::named_secret("AUDIT_EXPORT_START_SPLUNK"));
     }
 
     fn sandboxed(dir: &std::path::Path) -> RunInput {

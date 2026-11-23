@@ -172,7 +172,9 @@ pub fn server_secret(name: &str) -> bool {
     let bot_webhook = name.strip_prefix(BOT_WEBHOOK_PREFIX).is_some_and(|id| !id.is_empty());
     // A data region's own machine backup store (ADR 0117): MACHINE_BACKUP_S3_<REGION>_SECRET_ACCESS_KEY.
     let region_store = name.strip_prefix("MACHINE_BACKUP_S3_").and_then(|n| n.strip_suffix("_SECRET_ACCESS_KEY")).is_some_and(|r| !r.is_empty());
-    env_shaped(name) && (provider("_CLIENT_SECRET") || provider("_PRIVATE_KEY") || SERVER_SECRETS.contains(&name) || bot_webhook || region_store)
+    // A named audit export sink's own headers (ADR 0191): AUDIT_EXPORT_HEADERS_<NAME>.
+    let audit_sink = name.strip_prefix("AUDIT_EXPORT_HEADERS_").is_some_and(|n| !n.is_empty() && n != "FILE" && n.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()));
+    env_shaped(name) && (provider("_CLIENT_SECRET") || provider("_PRIVATE_KEY") || SERVER_SECRETS.contains(&name) || bot_webhook || region_store || audit_sink)
 }
 
 /// The Turnstile secret (ADR 0022), the Linode token, which can rent and delete every
@@ -182,7 +184,8 @@ pub fn server_secret(name: &str) -> bool {
 /// token that lets botd push to every registered phone (ADR 0080), the token
 /// scrapers send to `/metrics` (ADR 0089), the error tracker's DSN (ADR 0113), the
 /// headers sent to the trace collector (ADR 0118) and the audit log's SIEM sink (ADR
-/// 0122), and the keys to the stores that hold every machine's backups (ADR 0071), the
+/// 0122; each named sink's are `AUDIT_EXPORT_HEADERS_<NAME>`, ADR 0191), and the keys to
+/// the stores that hold every machine's backups (ADR 0071), the
 /// server's own (ADR 0109) and the audit archive (ADR 0154), and the service account
 /// key that reads the Google Workspace directory (ADR 0162).
 pub const SERVER_SECRETS: [&str; 15] = [
