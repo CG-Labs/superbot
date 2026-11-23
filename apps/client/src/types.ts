@@ -848,10 +848,20 @@ export interface AuditVerification {
   range?: { from: number | null; to: number | null } | null;
 }
 
-/** The SIEM export's progress (`GET /api/audit/siem`). */
-export type AuditExportState =
-  | { enabled: false }
-  | { enabled: true; kind: string; sink: string; delivered: number; pending: number; deliveredAt: number | null; failing: boolean; lastError: string | null; archive?: AuditArchiveState };
+/** One export sink's progress: a SIEM (`webhook`, `syslog`) or the S3 archive (`s3`). */
+export interface AuditExportSink {
+  kind: string;
+  sink: string;
+  delivered: number;
+  pending: number;
+  deliveredAt: number | null;
+  failing: boolean;
+  lastError: string | null;
+  archive?: AuditArchiveState;
+}
+
+/** The export's progress (`GET /api/audit/siem`): the sink in the worst state, and every sink under `sinks` (ADR 0173). */
+export type AuditExportState = { enabled: false } | ({ enabled: true; sinks?: AuditExportSink[] } & AuditExportSink);
 
 /** The S3 archive's settings and last object, when the export is `s3://` (ADR 0154). */
 export interface AuditArchiveState {

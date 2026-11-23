@@ -103,7 +103,7 @@ async fn groups_need_their_own_switch_and_discovery_says_so() {
     assert_eq!((code, one["meta"]["location"].clone()), (200, json!(format!("http://127.0.0.1:{port}/scim/v2/ResourceTypes/Group"))));
     let (_, _, schemas) = scim(port, &t, "GET", "/scim/v2/Schemas", Value::Null).await;
     let found: Vec<&str> = schemas["Resources"].as_array().unwrap().iter().filter_map(|s| s["id"].as_str()).collect();
-    assert_eq!(found, [scim::USER_SCHEMA, GROUP_SCHEMA]);
+    assert_eq!(found, [scim::USER_SCHEMA, scim::ENTERPRISE_SCHEMA, GROUP_SCHEMA]);
     let (code, _, s) = scim(port, &t, "GET", &format!("/scim/v2/Schemas/{GROUP_SCHEMA}"), Value::Null).await;
     let names: Vec<&str> = s["attributes"].as_array().unwrap().iter().filter_map(|a| a["name"].as_str()).collect();
     assert_eq!((code, names), (200, vec!["displayName", "members"]));

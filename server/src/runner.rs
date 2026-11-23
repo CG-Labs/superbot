@@ -278,8 +278,8 @@ pub struct App {
     pub evidence: OnceLock<Arc<crate::evidence::Settings>>,
     /// Whether the database is encrypted at rest, as found at startup (ADR 0116).
     pub database: OnceLock<crate::database_encryption::State>,
-    /// The audit log's SIEM export, when AUDIT_EXPORT is set (ADR 0122).
-    pub audit_export: OnceLock<Arc<crate::audit_export::Exporter>>,
+    /// The audit log's SIEM export and archive, when AUDIT_EXPORT is set (ADR 0122, ADR 0173).
+    pub audit_export: OnceLock<Arc<crate::audit_export::Exports>>,
     /// Signed checkpoints of the audit chain, and their timestamps (ADR 0149).
     pub audit_checkpoints: OnceLock<Arc<crate::audit_checkpoint::Checkpoints>>,
     closing: AtomicBool,

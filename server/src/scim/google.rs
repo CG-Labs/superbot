@@ -221,7 +221,7 @@ fn odd(what: &str) -> Failure {
 
 // What the directory holds.
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Person {
     id: String,
     email: String,
@@ -229,6 +229,13 @@ struct Person {
     family: Option<String>,
     full: Option<String>,
     active: bool,
+    /// From the primary organization (else the first), and the `organization` external id.
+    employee_number: Option<String>,
+    organization: Option<String>,
+    department: Option<String>,
+    cost_center: Option<String>,
+    /// The manager's primary email, from a `manager` relation.
+    manager: Option<String>,
 }
 
 #[derive(Debug)]
@@ -265,7 +272,24 @@ fn person(v: &Value) -> Option<Person> {
     let suspended = v["suspended"].as_bool().unwrap_or(false);
     let archived = v["archived"].as_bool().unwrap_or(false);
     let n = &v["name"];
-    Some(Person { id, email, given: clean(&n["givenName"], 100), family: clean(&n["familyName"], 100), full: clean(&n["fullName"], 100), active: !suspended && !archived })
+    let list = |k: &str| v[k].as_array().map(Vec::as_slice).unwrap_or_default();
+    let orgs = list("organizations");
+    let org = orgs.iter().find(|o| o["primary"] == true).or_else(|| orgs.first()).unwrap_or(&Value::Null);
+    let typed = |k: &str, t: &str| list(k).iter().find(|x| x["type"] == t).map(|x| &x["value"]).unwrap_or(&Value::Null);
+    let manager = typed("relations", "manager").as_str().map(str::to_ascii_lowercase).filter(|e| users::valid_email(e));
+    Some(Person {
+        id,
+        email,
+        given: clean(&n["givenName"], 100),
+        family: clean(&n["familyName"], 100),
+        full: clean(&n["fullName"], 100),
+        active: !suspended && !archived,
+        employee_number: clean(typed("externalIds", "organization"), 128),
+        organization: clean(&org["name"], 128),
+        department: clean(&org["department"], 128),
+        cost_center: clean(&org["costCenter"], 128),
+        manager,
+    })
 }
 
 /// A short, safe reason from an error body: Google's status and message, or OAuth's
@@ -449,7 +473,7 @@ impl Directory {
             }
             snap.groups.insert(key.clone(), group);
         }
-        let fields = "kind,nextPageToken,users(id,primaryEmail,name(givenName,familyName,fullName),suspended,archived)";
+        let fields = "kind,nextPageToken,users(id,primaryEmail,name(givenName,familyName,fullName),suspended,archived,organizations(primary,name,department,costCenter),externalIds(type,value),relations(type,value))";
         let query = [("customer", self.settings.customer.as_str()), ("maxResults", "500"), ("projection", "basic"), ("fields", fields)];
         let what = "the directory's users";
         for u in self.pages(&token, self.url(&["users"], &query)?, "admin#directory#users", "users", what).await? {
@@ -517,29 +541,50 @@ impl Plan {
     }
 }
 
-fn user_body(p: &Person, active: bool) -> Value {
+/// `manager`: the user id of their manager, when the tenant has them already.
+fn user_body(p: &Person, active: bool, manager: Option<&str>) -> Value {
     let mut name = Map::new();
     for (k, v) in [("givenName", &p.given), ("familyName", &p.family), ("formatted", &p.full)] {
         if let Some(v) = v {
             name.insert(k.into(), json!(v));
         }
     }
-    json!({
+    let mut ext = Map::new();
+    for (k, v) in [("employeeNumber", &p.employee_number), ("organization", &p.organization), ("department", &p.department), ("costCenter", &p.cost_center)] {
+        if let Some(v) = v {
+            ext.insert(k.into(), json!(v));
+        }
+    }
+    if let Some(m) = manager {
+        ext.insert("manager".into(), json!({ "value": m }));
+    }
+    let mut body = json!({
         "schemas": [USER_SCHEMA],
         "userName": p.email,
         "externalId": p.id,
         "name": name,
         "emails": [{ "value": p.email, "type": "work", "primary": true }],
         "active": active,
-    })
+    });
+    if !ext.is_empty() {
+        body["schemas"] = json!([USER_SCHEMA, ENTERPRISE_SCHEMA]);
+        body[ENTERPRISE_SCHEMA] = Value::Object(ext);
+    }
+    body
 }
 
 /// `people`: who should have an account. `live`: the tenant's users now. `gone`: Google
 /// id to user id, for disabled users a create takes back or on. `held`: whether a
-/// disabled user stays so.
+/// disabled user stays so. A manager is set once both people have an account, so a
+/// manager made in this pass is set on the next.
 fn plan(people: &[&Person], live: &[ScimUser], gone: &HashMap<String, String>, held: &dyn Fn(&str) -> bool) -> Plan {
     let mut p = Plan::default();
     let by_ext: HashMap<&str, &ScimUser> = live.iter().filter_map(|u| u.external_id.as_deref().map(|x| (x, u))).collect();
+    let by_email: HashMap<&str, &str> = people.iter().map(|p| (p.email.as_str(), p.id.as_str())).collect();
+    let manager = |person: &Person| {
+        let m = person.manager.as_deref().and_then(|e| by_email.get(e)).and_then(|id| by_ext.get(id)).map(|u| u.user.id.as_str());
+        m.filter(|_| person.manager.as_deref() != Some(person.email.as_str()))
+    };
     let mut kept: HashSet<&str> = HashSet::new();
     for person in people {
         if let Some(u) = by_ext.get(person.id.as_str()) {
@@ -549,7 +594,7 @@ fn plan(people: &[&Person], live: &[ScimUser], gone: &HashMap<String, String>, h
                 active = false;
                 p.held.push(u.user.id.clone());
             }
-            let body = user_body(person, active);
+            let body = user_body(person, active, manager(person));
             let now = Attrs::of(u);
             if from_resource(&body, Some(&now)).is_ok_and(|want| want == now) {
                 continue;
@@ -564,9 +609,9 @@ fn plan(people: &[&Person], live: &[ScimUser], gone: &HashMap<String, String>, h
             p.skipped += 1;
         } else if let Some(id) = gone.get(&person.id).filter(|id| held(id)) {
             p.held.push(id.clone());
-            p.create.push(user_body(person, false));
+            p.create.push(user_body(person, false, manager(person)));
         } else {
-            p.create.push(user_body(person, true));
+            p.create.push(user_body(person, true, manager(person)));
         }
     }
     p.delete = live.iter().filter(|u| !kept.contains(u.user.id.as_str())).map(|u| u.user.id.clone()).collect();
@@ -1093,6 +1138,7 @@ mod tests {
             display_name: "x",
             email: Some("x@example.com"),
             active: Some(true),
+            enterprise: &Default::default(),
         };
         let u = db.create_scim_user("t", &f, Role::Member, None).unwrap();
         db.scim_user("t", &u.id).unwrap()
@@ -1100,11 +1146,11 @@ mod tests {
 
     #[test]
     fn a_plan_creates_updates_holds_and_removes() {
-        let ada = Person { id: "1".into(), email: "ada@example.com".into(), given: Some("Ada".into()), family: None, full: None, active: true };
-        let bob = Person { id: "2".into(), email: "bob@example.com".into(), given: None, family: None, full: None, active: false };
-        let cy = Person { id: "3".into(), email: "cy@example.com".into(), given: None, family: None, full: None, active: true };
-        let new = Person { id: "4".into(), email: "new@example.com".into(), given: None, family: None, full: None, active: false };
-        let back = Person { id: "5".into(), email: "back@example.com".into(), given: None, family: None, full: None, active: true };
+        let ada = Person { id: "1".into(), email: "ada@example.com".into(), given: Some("Ada".into()), family: None, full: None, active: true, ..Default::default() };
+        let bob = Person { id: "2".into(), email: "bob@example.com".into(), given: None, family: None, full: None, active: false, ..Default::default() };
+        let cy = Person { id: "3".into(), email: "cy@example.com".into(), given: None, family: None, full: None, active: true, ..Default::default() };
+        let new = Person { id: "4".into(), email: "new@example.com".into(), given: None, family: None, full: None, active: false, ..Default::default() };
+        let back = Person { id: "5".into(), email: "back@example.com".into(), given: None, family: None, full: None, active: true, ..Default::default() };
         let t = template();
         let user = |id, ext, email, active| scim_user(&t, id, ext, email, active);
         let live = vec![user("u1", "1", "ada@example.com", true), user("u2", "2", "bob@example.com", true), user("u3", "3", "cy@example.com", false), user("u9", "9", "gone@example.com", true)];
@@ -1123,6 +1169,39 @@ mod tests {
         assert_eq!(plan(&[&ada], &[unchanged], &HashMap::new(), &|_| true), Plan::default());
         let p2 = plan(&[&cy], &live[2..3], &HashMap::new(), &|_| false);
         assert_eq!((p2.enable, p2.update[0].1["active"].as_bool()), (1, Some(true)));
+    }
+
+    #[test]
+    fn organizations_and_managers_become_the_enterprise_extension() {
+        let p = person(&json!({
+            "id": "7", "primaryEmail": "dee@example.com",
+            "organizations": [{ "name": "Other", "department": "Sales" }, { "primary": true, "name": "Example Ltd", "department": "Platform\u{7}", "costCenter": "CC-42" }],
+            "externalIds": [{ "type": "custom", "value": "x" }, { "type": "organization", "value": "E-0007" }],
+            "relations": [{ "type": "assistant", "value": "x@example.com" }, { "type": "manager", "value": "Ada@Example.com" }],
+        }))
+        .unwrap();
+        assert_eq!(
+            (p.organization.as_deref(), p.department.as_deref(), p.cost_center.as_deref(), p.employee_number.as_deref(), p.manager.as_deref()),
+            (Some("Example Ltd"), Some("Platform"), Some("CC-42"), Some("E-0007"), Some("ada@example.com"))
+        );
+        let bare = person(&json!({ "id": "8", "primaryEmail": "eve@example.com", "relations": [{ "type": "manager", "value": "not an email" }] })).unwrap();
+        assert_eq!((bare.department, bare.manager), (None, None));
+
+        // The manager is set once they have an account; never yourself.
+        let ada = Person { id: "1".into(), email: "ada@example.com".into(), active: true, ..Default::default() };
+        let dee = Person { manager: Some("ada@example.com".into()), ..p.clone() };
+        let selfish = Person { id: "9".into(), email: "sam@example.com".into(), active: true, manager: Some("sam@example.com".into()), ..Default::default() };
+        let first = plan(&[&ada, &dee], &[], &HashMap::new(), &|_| false);
+        let made = first.create.iter().find(|b| b["externalId"] == "7").unwrap();
+        assert_eq!(made[ENTERPRISE_SCHEMA], json!({ "employeeNumber": "E-0007", "organization": "Example Ltd", "department": "Platform", "costCenter": "CC-42" }));
+        assert_eq!(made["schemas"], json!([USER_SCHEMA, ENTERPRISE_SCHEMA]));
+        assert!(first.create.iter().find(|b| b["externalId"] == "1").unwrap().get(ENTERPRISE_SCHEMA).is_none());
+        let t = template();
+        let live = vec![scim_user(&t, "u1", "1", "ada@example.com", true), scim_user(&t, "u7", "7", "dee@example.com", true), scim_user(&t, "u9", "9", "sam@example.com", true)];
+        let next = plan(&[&ada, &dee, &selfish], &live, &HashMap::new(), &|_| false);
+        let ids: Vec<&str> = next.update.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["u7"], "Ada and Sam are unchanged: {:?}", next.update);
+        assert_eq!(next.update[0].1[ENTERPRISE_SCHEMA]["manager"], json!({ "value": "u1" }));
     }
 
     #[test]
