@@ -223,6 +223,8 @@ mod usage;
 mod usage_http_tests;
 #[cfg(test)]
 mod vault_auth_http_tests;
+#[cfg(test)]
+mod run_credentials_http_tests;
 mod storage;
 #[cfg(test)]
 mod storage_http_tests;

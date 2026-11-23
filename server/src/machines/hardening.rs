@@ -53,6 +53,7 @@ impl Settings {
     }
 
     /// The egress script with the deny lists filled in.
+    #[cfg(test)]
     pub fn egress_script(&self) -> String {
         self.egress_script_on(None)
     }

@@ -20,6 +20,7 @@
 //!   and over the ones they saved in botd (ADR 0174). Cached, failing closed and audited
 //!   like the others; values are redacted from that user's Bots.
 
+use super::leases::{self, RunCredentials};
 use super::{check_name, check_user_name, env_shaped, redact, server_secret, Error, Secret, SecretStore};
 use crate::audit::{Actor, Event, Outcome};
 use serde_json::json;
@@ -180,11 +181,13 @@ pub struct ExternalStore {
     names: Mutex<HashMap<Scope, (Instant, Vec<String>)>>,
     /// `SECRETS_USER_FOLDERS`: each user's own folder is read for their Bots (ADR 0174).
     user_folders: bool,
+    /// `VAULT_RUN_CREDENTIALS`: short-lived credentials made for each run (ADR 0185).
+    run_credentials: Option<Arc<RunCredentials>>,
 }
 
 impl ExternalStore {
     pub fn new(provider: Box<dyn Provider>, ttl: Duration) -> ExternalStore {
-        ExternalStore { provider, ttl, values: Mutex::default(), names: Mutex::default(), user_folders: false }
+        ExternalStore { provider, ttl, values: Mutex::default(), names: Mutex::default(), user_folders: false, run_credentials: None }
     }
 
     pub fn with_user_folders(mut self, on: bool) -> ExternalStore {
@@ -196,9 +199,19 @@ impl ExternalStore {
         self.user_folders
     }
 
+    pub fn with_run_credentials(mut self, rc: Option<RunCredentials>) -> ExternalStore {
+        self.run_credentials = rc.map(Arc::new);
+        self
+    }
+
+    pub fn run_credentials(&self) -> Option<&Arc<RunCredentials>> {
+        self.run_credentials.as_ref()
+    }
+
     pub fn describe(&self) -> String {
         let users = if self.user_folders { ", and users/<id> for each user's own" } else { "" };
-        format!("{}{users}, cached for {} s", self.provider.describe(), self.ttl.as_secs())
+        let runs = self.run_credentials.as_ref().map(|rc| format!(", {}", rc.describe())).unwrap_or_default();
+        format!("{}{users}, cached for {} s{runs}", self.provider.describe(), self.ttl.as_secs())
     }
 
     fn fresh(&self, at: Instant) -> bool {
@@ -420,6 +433,7 @@ pub fn from_env(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result
     let ttl = cache_ttl(&var("SECRETS_CACHE_SECONDS"))?;
     let users = user_folders(&var("SECRETS_USER_FOLDERS"))?;
     let chosen = var("SECRETS_BACKEND").trim().to_string();
+    let mut run_credentials = None;
     let provider: Box<dyn Provider> = match chosen.as_str() {
         "" | "local" => {
             warn_unused(var, "local");
@@ -428,7 +442,14 @@ pub fn from_env(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result
             }
             return Ok(None);
         }
-        "vault" => Box::new(super::vault::Vault::new(super::vault::Config::from_env(var, store)?)?),
+        "vault" => {
+            let v = super::vault::Vault::new(super::vault::Config::from_env(var, store)?)?;
+            let wanted = leases::parse(&var("VAULT_RUN_CREDENTIALS"))?;
+            if !wanted.is_empty() {
+                run_credentials = Some(RunCredentials::new(Arc::new(v.clone()), wanted));
+            }
+            Box::new(v)
+        }
         "azure-keyvault" => Box::new(super::azure::KeyVault::new(super::azure::Config::from_env(var, store)?)?),
         "gcp-secret-manager" => Box::new(super::gcp::SecretManager::new(super::gcp::Config::from_env(var, store)?)?),
         "aws" => {
@@ -439,7 +460,7 @@ pub fn from_env(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result
         other => return Err(format!("SECRETS_BACKEND must be local, vault, azure-keyvault, gcp-secret-manager or aws, not {other:?}")),
     };
     warn_unused(var, &chosen);
-    Ok(Some(Arc::new(ExternalStore::new(provider, ttl).with_user_folders(users))))
+    Ok(Some(Arc::new(ExternalStore::new(provider, ttl).with_user_folders(users).with_run_credentials(run_credentials))))
 }
 
 /// `SECRETS_USER_FOLDERS`: `1` reads each user's own folder too (ADR 0174); off by default.
@@ -453,8 +474,9 @@ pub fn user_folders(raw: &str) -> Result<bool, String> {
 
 /// The settings of backends other than `chosen` that are set: probably a mistake.
 pub fn unused_settings(var: &dyn Fn(&str) -> String, chosen: &str) -> Vec<&'static str> {
-    const KEYS: [(&str, &str); 8] = [
+    const KEYS: [(&str, &str); 9] = [
         ("vault", "VAULT_ADDR"),
+        ("vault", "VAULT_RUN_CREDENTIALS"),
         ("azure-keyvault", "AZURE_KEYVAULT_URL"),
         ("azure-keyvault", "AZURE_KEYVAULT_AUTH"),
         ("gcp-secret-manager", "GCP_SECRET_MANAGER_PROJECT"),
@@ -500,7 +522,8 @@ fn diagnose(x: Option<&ExternalStore>) -> serde_json::Value {
         Ok(n) => (true, Some(n), format!("{} answers: {n} names in its bots and server folders.", x.kind())),
         Err(e) => (false, None, format!("{} can't be read: {e}. Bot runs are refused until it answers (fail closed).", x.kind())),
     };
-    json!({ "backend": x.kind(), "description": x.describe(), "cacheSeconds": x.ttl.as_secs(), "userFolders": x.user_folders, "ok": ok, "names": names, "detail": detail })
+    let run_credentials = x.run_credentials.as_ref().map(|rc| rc.paths()).unwrap_or_default();
+    json!({ "backend": x.kind(), "description": x.describe(), "cacheSeconds": x.ttl.as_secs(), "userFolders": x.user_folders, "runCredentials": run_credentials, "ok": ok, "names": names, "detail": detail })
 }
 
 #[cfg(test)]
@@ -539,6 +562,10 @@ pub(crate) mod tests {
             }
             Ok(self.values.lock().unwrap().keys().filter(|(s, _)| *s == scope).map(|(_, n)| n.clone()).collect())
         }
+    }
+
+    pub(crate) fn diagnose_for(x: &ExternalStore) -> serde_json::Value {
+        diagnose(Some(x))
     }
 
     pub(crate) fn user(id: &str) -> Scope {
