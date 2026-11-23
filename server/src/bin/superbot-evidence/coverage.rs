@@ -298,11 +298,14 @@ fn from_entries(path: String, entries: Vec<(String, Vec<u8>)>) -> Option<Found> 
         [] => None,
         [top] if tops.len() == 1 => {
             let mut files = BTreeMap::new();
-            let mut nested = Vec::new();
+            let (mut nested, mut repeated) = (Vec::new(), BTreeSet::new());
             for (n, b) in &entries {
                 match n.strip_prefix(&format!("{top}/")) {
                     Some(file) if !file.is_empty() && !file.contains('/') => {
-                        files.insert(file.to_string(), b.clone());
+                        // `tar -x` keeps the last copy, so an earlier one is never checked.
+                        if files.insert(file.to_string(), b.clone()).is_some() {
+                            repeated.insert(file.to_string());
+                        }
                     }
                     Some("") => {}
                     _ => nested.push(n.clone()),
@@ -310,6 +313,7 @@ fn from_entries(path: String, entries: Vec<(String, Vec<u8>)>) -> Option<Found> 
             }
             let mut f = check(path, top, &files);
             f.problems.extend(nested.into_iter().map(|n| format!("{n} isn't a file of the bundle's folder")));
+            f.problems.extend(repeated.into_iter().map(|n| format!("{n} is in the tar more than once, so not every copy can be checked")));
             Some(f)
         }
         _ => Some(Found { path, name: bundles.join(", "), problems: vec!["the tar holds more than one folder; keep one bundle per tar, as made".into()], ..Found::default() }),
@@ -972,6 +976,12 @@ mod tests {
         let sum: u32 = link[..512].iter().enumerate().map(|(j, &c)| if (148..156).contains(&j) { 32 } else { u32::from(c) }).sum();
         link[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
         assert!(untar(&link).unwrap_err().contains("isn't a plain file"));
+
+        // A changed copy hidden before the original: only the last would reach the check.
+        let mut twice = vec![(format!("{name}/accepted-findings.json"), b"changed".to_vec())];
+        twice.extend(entries.iter().cloned());
+        let f = from_entries("d.tar".into(), untar(&crate::ustar::tar(&twice, 0)).unwrap()).unwrap();
+        assert!(!f.verified() && f.problems.iter().any(|x| x.contains("accepted-findings.json is in the tar more than once")), "{:?}", f.problems);
 
         let two = crate::ustar::tar(&[(format!("{name}/a"), vec![]), ("superbot-evidence-2027-01-01_2027-02-01-x/b".into(), vec![])], 0);
         assert!(from_entries("t.tar".into(), untar(&two).unwrap()).unwrap().problems[0].contains("more than one folder"));

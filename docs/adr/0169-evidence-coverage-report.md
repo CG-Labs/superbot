@@ -30,7 +30,7 @@ The store is searched to a depth of 8 (the plan's layout is `<criterion>/<month>
 
 A bundle **checks** only if all of these hold; each failure is listed, with the file:
 
-- `SHA256SUMS` exists, every line in it names a file that exists with that digest, and every other file is listed in it (a file added later fails).
+- `SHA256SUMS` exists, every line in it names a file that exists with that digest, and every other file is listed in it (a file added later fails); no file is in the tar twice, since `tar -x` keeps only the last copy and an earlier, changed one would go unchecked.
 - `manifest.json` is SuperBot's, its `kind` is the one the name says (botd's has none), it has a `format` and `createdAt`, and its period is the name's.
 - Every file the manifest lists exists with the manifest's digest, and every file other than the manifest and `SHA256SUMS` is listed in it. So an edit with `SHA256SUMS` rewritten to match still fails, unless the manifest is rewritten too, which changes the manifest's own digest; the report prints that digest for each bundle, to compare with what was recorded when it was made (botd's `evidence.bundle_created` event, the workflow's summary).
 - Every file its kind always has is there (for botd's, the six in the evidence plan's table; for the others, their tools' `SECTIONS`).
