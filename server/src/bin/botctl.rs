@@ -1546,6 +1546,18 @@ fn saml_summary(v: &Value) -> String {
         "  IdP-initiated sign-in:    {}\n",
         if v["idpInitiated"].as_str() == Some("restart") { "restarted as SP-initiated" } else { "refused (start from SuperBot)" }
     );
+    let authn = &v["authnContext"];
+    match authn["required"].as_array() {
+        Some(required) => {
+            let required: Vec<&str> = required.iter().filter_map(Value::as_str).collect();
+            out += &format!("  Authentication context:   one of {}\n", required.join(", "));
+            if let Some(m) = authn["methodsAttribute"].as_str() {
+                out += &format!("    Also read from attribute {m}\n");
+            }
+            out += if authn["requested"].as_bool().unwrap_or(false) { "    Requested in AuthnRequests (exact)\n" } else { "    Not requested: the IdP's own policy decides\n" };
+        }
+        None => out += "  Authentication context:   not checked (the IdP's MFA isn't required)\n",
+    }
     if let Some(g) = v["groupsAttribute"].as_str() {
         let required: Vec<&str> = v["requiredGroups"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
         out += &format!(
@@ -2950,6 +2962,19 @@ mod tests {
         v["roleMappings"] = json!(2);
         let out = saml_summary(&v);
         assert!(out.contains("Required groups:          SuperBot Users, Admins\n  Group role mappings:      2 "), "{out}");
+    }
+
+    #[test]
+    fn saml_summary_shows_the_authentication_context_required() {
+        let mut v = json!({ "provider": "corp", "label": "Corp", "idp": null, "authnContext": null });
+        assert!(saml_summary(&v).contains("  Authentication context:   not checked (the IdP's MFA isn't required)\n"));
+        v["authnContext"] = json!({ "required": ["http://schemas.microsoft.com/claims/multipleauthn"], "methodsAttribute": null, "requested": true });
+        let out = saml_summary(&v);
+        assert!(out.contains("  Authentication context:   one of http://schemas.microsoft.com/claims/multipleauthn\n    Requested in AuthnRequests (exact)\n"), "{out}");
+        assert!(!out.contains("Also read from"), "{out}");
+        v["authnContext"] = json!({ "required": ["mfa", "urn:okta:loa:2fa:any"], "methodsAttribute": "amr", "requested": false });
+        let out = saml_summary(&v);
+        assert!(out.contains("  Authentication context:   one of mfa, urn:okta:loa:2fa:any\n    Also read from attribute amr\n    Not requested: the IdP's own policy decides\n"), "{out}");
     }
 
     #[test]

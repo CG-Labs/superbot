@@ -399,7 +399,7 @@ const TYPES: [&str; 6] = ["entra", "google", "oidc", "apple", "github", "saml"];
 
 /// Settings that only mean something for some types. Set on another, they would look like
 /// a restriction that isn't there, so they are refused.
-const ONLY_FOR: [(&str, &[&str]); 29] = [
+const ONLY_FOR: [(&str, &[&str]); 32] = [
     ("TENANT", &["entra"]),
     ("ALLOWED_TENANTS", &["entra"]),
     ("AUTHORITY", &["entra"]),
@@ -429,11 +429,14 @@ const ONLY_FOR: [(&str, &[&str]); 29] = [
     ("GROUPS_ATTRIBUTE", &["saml"]),
     ("REQUIRED_GROUPS", &["saml"]),
     ("IDP_INITIATED", &["saml"]),
+    ("AUTHN_CONTEXT", &["saml"]),
+    ("AUTHN_METHODS_ATTRIBUTE", &["saml"]),
+    ("REQUEST_AUTHN_CONTEXT", &["saml"]),
 ];
 
 /// The SAML bridge's settings (with `ISSUER`), and native SAML's (without), so each refuses the other's.
 const SAML_BRIDGE_ONLY: [&str; 6] = ["CLIENT_ID", "IDP_ALIAS", "SCOPES", "SUBJECT_CLAIM", "EMAIL_CLAIM", "NAME_CLAIM"];
-const SAML_NATIVE_ONLY: [&str; 14] = [
+const SAML_NATIVE_ONLY: [&str; 17] = [
     "IDP_METADATA_URL",
     "IDP_METADATA_FILE",
     "SP_ENTITY_ID",
@@ -448,6 +451,9 @@ const SAML_NATIVE_ONLY: [&str; 14] = [
     "GROUPS_ATTRIBUTE",
     "REQUIRED_GROUPS",
     "IDP_INITIATED",
+    "AUTHN_CONTEXT",
+    "AUTHN_METHODS_ATTRIBUTE",
+    "REQUEST_AUTHN_CONTEXT",
 ];
 
 /// Claims people or their admins can change, so they can't be the subject.
@@ -568,7 +574,7 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
                     None => Ok(None),
                 }
             };
-            let attributes = saml_sp::Attributes { email: attribute("EMAIL_ATTRIBUTE")?, name: attribute("NAME_ATTRIBUTE")?, groups: attribute("GROUPS_ATTRIBUTE")? };
+            let attributes = saml_sp::Attributes { email: attribute("EMAIL_ATTRIBUTE")?, name: attribute("NAME_ATTRIBUTE")?, groups: attribute("GROUPS_ATTRIBUTE")?, authn_methods: attribute("AUTHN_METHODS_ATTRIBUTE")? };
             let mut required_groups: Vec<String> = Vec::new();
             for g in list(&key("REQUIRED_GROUPS")) {
                 let g = saml_roles::group_name(&g).map_err(|e| format!("{}: {e}", key("REQUIRED_GROUPS")))?;
@@ -621,7 +627,8 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
                 None => IdpInitiated::Off,
                 Some(v) => IdpInitiated::parse(&v).ok_or_else(|| format!("{} must be off or restart", key("IDP_INITIATED")))?,
             };
-            (Kind::SamlSp { entity_id, sp_entity_id, source, attributes, required_groups, allowed_domains, sign_requests, sp_cert, encryption, enc_cert, metadata_trust, idp_initiated }, saml::LABEL)
+            let authn_context = authn_context(&key, var, list, &attributes)?;
+            (Kind::SamlSp { entity_id, sp_entity_id, source, attributes, required_groups, allowed_domains, sign_requests, sp_cert, encryption, enc_cert, metadata_trust, idp_initiated, authn_context }, saml::LABEL)
         }
         "saml" => {
             if let Some(k) = SAML_NATIVE_ONLY.iter().find(|k| var(&key(k)).is_some()) {
@@ -729,6 +736,36 @@ fn metadata_trust(key: &dyn Fn(&str) -> String, var: &Var) -> Result<Option<saml
     }
 }
 
+/// Native SAML: `AUTHN_CONTEXT`, and the two settings that only mean something with it,
+/// `AUTHN_METHODS_ATTRIBUTE` and `REQUEST_AUTHN_CONTEXT` (ADR 0190).
+fn authn_context(key: &dyn Fn(&str) -> String, var: &Var, list: &List, attributes: &saml_sp::Attributes) -> Result<Option<saml_sp::AuthnContext>, String> {
+    let mut accepted: Vec<String> = Vec::new();
+    for v in list(&key("AUTHN_CONTEXT")) {
+        let v = saml_sp::authn_context_value(&v).map_err(|e| format!("{}: {e}", key("AUTHN_CONTEXT")))?;
+        if !accepted.contains(&v) {
+            accepted.push(v);
+        }
+    }
+    if accepted.len() > saml_sp::MAX_AUTHN_CONTEXTS {
+        return Err(format!("{}: at most {} values", key("AUTHN_CONTEXT"), saml_sp::MAX_AUTHN_CONTEXTS));
+    }
+    let request = match var(&key("REQUEST_AUTHN_CONTEXT")).map(|v| v.to_ascii_lowercase()).as_deref() {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return Err(format!("{} must be true or false", key("REQUEST_AUTHN_CONTEXT"))),
+    };
+    if accepted.is_empty() {
+        // Without a requirement, reading the methods or asking for a class would look like a check that isn't made.
+        for (k, set) in [("AUTHN_METHODS_ATTRIBUTE", attributes.authn_methods.is_some()), ("REQUEST_AUTHN_CONTEXT", var(&key("REQUEST_AUTHN_CONTEXT")).is_some())] {
+            if set {
+                return Err(format!("{} needs {}: the ways of signing in to require, like http://schemas.microsoft.com/claims/multipleauthn", key(k), key("AUTHN_CONTEXT")));
+            }
+        }
+        return Ok(None);
+    }
+    Ok(Some(saml_sp::AuthnContext { accepted, request }))
+}
+
 // Audit
 
 fn claim_details(d: &mut Value, c: &Claims) {
@@ -737,6 +774,9 @@ fn claim_details(d: &mut Value, c: &Claims) {
     d["tenant"] = json!(c.tenant);
     if let Some(u) = &c.username {
         d["username"] = json!(u);
+    }
+    if let Some(a) = &c.authn_context {
+        d["authnContext"] = json!(a);
     }
 }
 
@@ -861,7 +901,7 @@ pub async fn start(
         return no_store(ret.fail("sso_too_many"));
     }
     let mut url = Url::parse(&endpoint).expect("checked by secure_url");
-    if let Kind::SamlSp { sp_entity_id, sign_requests, .. } = &p.kind {
+    if let Kind::SamlSp { sp_entity_id, sign_requests, authn_context, .. } = &p.kind {
         let key = match (sign_requests, a.app.as_ref()) {
             (false, _) => None,
             (true, Some(app)) => match sp_key(app, p) {
@@ -873,7 +913,7 @@ pub async fn start(
             },
             (true, None) => return no_store(ret.fail("sso_failed")),
         };
-        let request = saml_sp::authn_request(&Sp { entity_id: sp_entity_id, acs: &sso.acs_url(&id) }, &nonce, &endpoint, at);
+        let request = saml_sp::authn_request(&Sp { entity_id: sp_entity_id, acs: &sso.acs_url(&id) }, &nonce, &endpoint, at, authn_context.as_ref());
         let query = saml_sp::redirect_query("SAMLRequest", &request, Some(&state), key.as_deref());
         let mut res = see(&saml_sp::with_redirect_query(&endpoint, &query));
         if matches!(ret, Return::Cookie { .. }) {
@@ -1124,8 +1164,10 @@ async fn finish_saml(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, f
                 a.limiter.fail(&ip, at);
             }
             let cancelled = status.as_deref().is_some_and(|s| s.contains("AuthnFailed") || s.contains("RequestDenied"));
+            // The IdP couldn't sign them in the way REQUEST_AUTHN_CONTEXT asked for (ADR 0190).
+            let weak = status.as_deref().is_some_and(|s| s.contains("NoAuthnContext"));
             failed(a, source, id, reason, None, status.map_or(json!({}), |s| json!({ "idpStatus": s })));
-            return ret.fail(if cancelled { "sso_cancelled" } else { "sso_failed" });
+            return ret.fail(if weak { "sso_mfa_required" } else if cancelled { "sso_cancelled" } else { "sso_failed" });
         }
     };
     let assertion = format!("{}|{}", checked.claims.issuer, checked.assertion_id);
@@ -1161,7 +1203,24 @@ async fn finish_saml(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, f
             return ret.fail("sso_not_allowed");
         }
     }
-    complete(a, app, source, id, p, &pending, checked.claims, Some(checked.login), Some(&checked.groups), at).await
+    let mut claims = checked.claims;
+    // Also before anyone is made just in time: only people who signed in the way the provider requires.
+    if let Kind::SamlSp { authn_context: Some(required), .. } = &p.kind {
+        match checked.authn.meets(required) {
+            Some(met) => claims.authn_context = Some(met.to_string()),
+            None => {
+                a.limiter.fail(&ip, at);
+                let seen = |v: &[String]| v.iter().map(|c| crate::audit::clip(c, 128)).collect::<Vec<_>>();
+                let mut extra = json!({ "authnContexts": seen(&checked.authn.classes) });
+                if let Kind::SamlSp { attributes: saml_sp::Attributes { authn_methods: Some(_), .. }, .. } = &p.kind {
+                    extra["authnMethods"] = json!(seen(&checked.authn.methods));
+                }
+                failed(a, source, id, "authn_context", Some(&claims), extra);
+                return ret.fail("sso_mfa_required");
+            }
+        }
+    }
+    complete(a, app, source, id, p, &pending, claims, Some(checked.login), Some(&checked.groups), at).await
 }
 
 /// A post that answers no sign-in this server holds. Refused as `unknown_state`, unless the
@@ -1450,7 +1509,7 @@ fn saml_provider<'a>(a: &'a Auth, id: &str) -> Result<&'a Arc<Provider>, ApiErro
 }
 
 fn saml_view(a: &Auth, p: &Provider) -> Value {
-    let Kind::SamlSp { entity_id, sp_entity_id, source, attributes, required_groups, sign_requests, sp_cert, encryption, enc_cert, metadata_trust, idp_initiated, .. } = &p.kind else {
+    let Kind::SamlSp { entity_id, sp_entity_id, source, attributes, required_groups, sign_requests, sp_cert, encryption, enc_cert, metadata_trust, idp_initiated, authn_context, .. } = &p.kind else {
         return json!({});
     };
     let cert = |c: &xmldsig::Cert| json!({ "sha256": c.sha256, "subject": c.subject, "notAfter": c.not_after * 1000 });
@@ -1511,6 +1570,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
         "groupsAttribute": attributes.groups, "requiredGroups": required_groups,
         "roleMappings": a.app.as_ref().map(|app| app.db.saml_role_mappings_of(&p.id).len()),
         "idpInitiated": idp_initiated.as_str(),
+        "authnContext": authn_context.as_ref().map(|c| json!({ "required": c.accepted, "methodsAttribute": attributes.authn_methods, "requested": c.request })),
     })
 }
 
@@ -2095,7 +2155,7 @@ mod tests {
         let p = s.provider("corp").unwrap();
         assert!(p.saml_sp() && !p.oidc() && !p.needs_secret());
         assert_eq!((p.type_name(), p.jit_role), ("saml", None), "audited as idp=saml, like the bridge");
-        assert!(matches!(&p.kind, Kind::SamlSp { entity_id, sp_entity_id, source: IdpSource::Saved, attributes, required_groups, allowed_domains, sign_requests: false, sp_cert: None, encryption: Encryption::Off, enc_cert: None, metadata_trust: None, idp_initiated: IdpInitiated::Off }
+        assert!(matches!(&p.kind, Kind::SamlSp { entity_id, sp_entity_id, source: IdpSource::Saved, attributes, required_groups, allowed_domains, sign_requests: false, sp_cert: None, encryption: Encryption::Off, enc_cert: None, metadata_trust: None, idp_initiated: IdpInitiated::Off, authn_context: None }
             if entity_id == ADFS && sp_entity_id == "https://bot.example.com/api/auth/sso/corp/metadata" && attributes.email.is_none() && attributes.groups.is_none() && required_groups.is_empty() && allowed_domains.is_empty()));
         assert_eq!((p.env_var(), s.slo_url("corp")), ("SSO_CORP_PRIVATE_KEY".to_string(), "https://bot.example.com/api/auth/sso/corp/slo".to_string()));
         assert_eq!(s.callback_url("corp"), "https://bot.example.com/api/auth/sso/corp/acs");
@@ -2175,6 +2235,40 @@ mod tests {
         }
         assert!(saml(&[("SSO_ADFS_GROUPS_ATTRIBUTE", "groups")]).is_err(), "native only: the bridge doesn't pass groups");
         assert!(entra(&[("SSO_ENTRA_REQUIRED_GROUPS", "Admins")]).is_err(), "SAML only");
+    }
+
+    #[test]
+    fn reads_the_authn_context_settings_and_refuses_unclear_ones() {
+        const MFA: &str = "http://schemas.microsoft.com/claims/multipleauthn";
+        let required = |s: &Sso| match &s.providers[0].kind {
+            Kind::SamlSp { authn_context, attributes, .. } => (authn_context.clone(), attributes.authn_methods.clone()),
+            _ => unreachable!(),
+        };
+        assert_eq!(required(&native(&[]).unwrap()), (None, None), "nothing required by default");
+        let s = native(&[("SSO_CORP_AUTHN_CONTEXT", "http://schemas.microsoft.com/claims/multipleauthn, urn:oasis:names:tc:SAML:2.0:ac:classes:MobileTwoFactorContract ,http://schemas.microsoft.com/claims/multipleauthn")]).unwrap();
+        let (c, m) = required(&s);
+        assert_eq!(c.unwrap(), saml_sp::AuthnContext { accepted: vec![MFA.into(), "urn:oasis:names:tc:SAML:2.0:ac:classes:MobileTwoFactorContract".into()], request: false }, "in order, each once, not requested by default");
+        assert_eq!(m, None);
+        let s = native(&[("SSO_CORP_AUTHN_CONTEXT", "mfa"), ("SSO_CORP_AUTHN_METHODS_ATTRIBUTE", "amr"), ("SSO_CORP_REQUEST_AUTHN_CONTEXT", "True")]).unwrap();
+        let (c, m) = required(&s);
+        assert_eq!((c.unwrap().request, m.as_deref()), (true, Some("amr")));
+        assert_eq!(required(&native(&[("SSO_CORP_AUTHN_CONTEXT", MFA), ("SSO_CORP_REQUEST_AUTHN_CONTEXT", "false")]).unwrap()).0.unwrap().request, false);
+        let many: &'static str = (0..=saml_sp::MAX_AUTHN_CONTEXTS).map(|i| format!("urn:c{i}")).collect::<Vec<_>>().join(",").leak();
+        for (vars, why) in [
+            (vec![("SSO_CORP_AUTHN_METHODS_ATTRIBUTE", "amr")], "a methods attribute with nothing to require"),
+            (vec![("SSO_CORP_REQUEST_AUTHN_CONTEXT", "true")], "asking for nothing"),
+            (vec![("SSO_CORP_REQUEST_AUTHN_CONTEXT", "false")], "a setting that looks like a check, without one"),
+            (vec![("SSO_CORP_AUTHN_CONTEXT", MFA), ("SSO_CORP_REQUEST_AUTHN_CONTEXT", "yes")], "not true or false"),
+            (vec![("SSO_CORP_AUTHN_CONTEXT", "multi factor")], "not a URI or token"),
+            (vec![("SSO_CORP_AUTHN_CONTEXT", many)], "too many"),
+            (vec![("SSO_CORP_AUTHN_CONTEXT", MFA), ("SSO_CORP_AUTHN_METHODS_ATTRIBUTE", "my methods")], "not an attribute name"),
+        ] {
+            assert!(native(&vars).is_err(), "{why}");
+        }
+        let e = native(&[("SSO_CORP_AUTHN_METHODS_ATTRIBUTE", "amr")]).err().unwrap();
+        assert!(e.contains("SSO_CORP_AUTHN_METHODS_ATTRIBUTE needs SSO_CORP_AUTHN_CONTEXT"), "{e}");
+        assert!(saml(&[("SSO_ADFS_AUTHN_CONTEXT", MFA)]).is_err(), "native only: the broker decides how people sign in");
+        assert!(entra(&[("SSO_ENTRA_AUTHN_CONTEXT", MFA)]).is_err(), "SAML only");
     }
 
     #[test]

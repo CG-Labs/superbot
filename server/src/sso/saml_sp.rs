@@ -28,6 +28,9 @@
 //! - **Groups**, only when the provider names a groups attribute (ADR 0160): every value of
 //!   it in the verified assertion. Entra's overage claim, or more than `MAX_GROUPS` values,
 //!   make the groups unknown, which the caller treats as in none.
+//! - **How they signed in** (ADR 0190): every `AuthnContextClassRef` of the verified
+//!   assertion's `AuthnStatement`s, and every value of the authentication methods attribute
+//!   when the provider names one. The caller holds them to `SSO_<ID>_AUTHN_CONTEXT`.
 //!
 //! With a provider's SP key (ADR 0137), AuthnRequests can be signed with the HTTP-Redirect
 //! binding's query signature, and our metadata publishes the key's certificate. The key may
@@ -75,11 +78,58 @@ pub const MAX_GROUP_LEN: usize = 256;
 
 /// Which assertion attributes hold the email and name. None: the usual names above.
 /// `groups` has no default: groups are read only from the attribute an admin names (ADR 0160).
+/// Nor has `authn_methods`, the attribute that lists how the person signed in (ADR 0190).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Attributes {
     pub email: Option<String>,
     pub name: Option<String>,
     pub groups: Option<String>,
+    pub authn_methods: Option<String>,
+}
+
+/// The most authentication context values a provider requires, or are read from one assertion.
+pub const MAX_AUTHN_CONTEXTS: usize = 16;
+/// The longest one: they're URIs or short tokens.
+pub const MAX_AUTHN_CONTEXT_LEN: usize = 256;
+
+/// How the person must have signed in at the IdP (`SSO_<ID>_AUTHN_CONTEXT`, ADR 0190): one of
+/// `accepted`, as an `AuthnContextClassRef` of the signed assertion or a value of its
+/// authentication methods attribute. With `request`, AuthnRequests ask the IdP for them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuthnContext {
+    pub accepted: Vec<String>,
+    pub request: bool,
+}
+
+/// What a signed assertion says about how the person signed in: its `AuthnContextClassRef`s,
+/// and the values of the provider's authentication methods attribute (empty without one).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Authn {
+    pub classes: Vec<String>,
+    pub methods: Vec<String>,
+}
+
+impl Authn {
+    /// The first of `required.accepted`, in the admin's order, that the assertion shows. Exact
+    /// matches only: these are URIs, and a near miss is another way of signing in.
+    pub fn meets<'a>(&self, required: &'a AuthnContext) -> Option<&'a str> {
+        required.accepted.iter().find(|a| self.classes.contains(a) || self.methods.contains(a)).map(String::as_str)
+    }
+
+    /// The class the IdP names first, for the audit log when nothing is required.
+    pub fn class(&self) -> Option<&str> {
+        self.classes.first().map(String::as_str)
+    }
+}
+
+/// A value as an admin writes it in `AUTHN_CONTEXT`: trimmed, non-empty, at most
+/// `MAX_AUTHN_CONTEXT_LEN` bytes, and printable ASCII with no spaces, as URIs are.
+pub fn authn_context_value(v: &str) -> Result<String, String> {
+    let v = v.trim();
+    if v.is_empty() || v.len() > MAX_AUTHN_CONTEXT_LEN || !v.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(format!("{v:?} is not an authentication context: a URI like urn:oasis:names:tc:SAML:2.0:ac:classes:MobileTwoFactorContract, or a method like mfa"));
+    }
+    Ok(v.to_string())
 }
 
 /// The groups a signed assertion puts the person in (ADR 0160).
@@ -601,10 +651,16 @@ pub fn request_id() -> String {
     format!("_{}", crate::random_hex(20))
 }
 
-/// The AuthnRequest XML. The NameID format is left to the IdP's settings for the app.
-pub fn authn_request(sp: &Sp, id: &str, destination: &str, now_ms: i64) -> String {
+/// The AuthnRequest XML. The NameID format is left to the IdP's settings for the app. With
+/// `authn` (ADR 0190), it asks for one of those classes, in that order, with `exact`
+/// comparison: the one comparison every IdP takes (Entra ID refuses the others).
+pub fn authn_request(sp: &Sp, id: &str, destination: &str, now_ms: i64, authn: Option<&AuthnContext>) -> String {
+    let requested = match authn.filter(|a| a.request && !a.accepted.is_empty()) {
+        Some(a) => format!(r#"<samlp:RequestedAuthnContext Comparison="exact">{}</samlp:RequestedAuthnContext>"#, a.accepted.iter().map(|c| format!("<saml:AuthnContextClassRef>{}</saml:AuthnContextClassRef>", escape(c))).collect::<String>()),
+        None => String::new(),
+    };
     format!(
-        r#"<samlp:AuthnRequest xmlns:samlp="{PROTOCOL}" xmlns:saml="{ASSERTION}" ID="{id}" Version="2.0" IssueInstant="{}" Destination="{}" AssertionConsumerServiceURL="{}" ProtocolBinding="{POST}"><saml:Issuer>{}</saml:Issuer><samlp:NameIDPolicy AllowCreate="true"/></samlp:AuthnRequest>"#,
+        r#"<samlp:AuthnRequest xmlns:samlp="{PROTOCOL}" xmlns:saml="{ASSERTION}" ID="{id}" Version="2.0" IssueInstant="{}" Destination="{}" AssertionConsumerServiceURL="{}" ProtocolBinding="{POST}"><saml:Issuer>{}</saml:Issuer><samlp:NameIDPolicy AllowCreate="true"/>{requested}</samlp:AuthnRequest>"#,
         instant(now_ms),
         escape(destination),
         escape(sp.acs),
@@ -656,6 +712,7 @@ pub struct Checked {
     /// Which of `Expect::decrypt` opened the assertion and its NameID, for those encrypted: what
     /// tells an admin which keys the IdP encrypts to (ADR 0181). Both, if they differ.
     pub decrypted_with: Vec<usize>,
+    pub authn: Authn,
 }
 
 pub(super) fn time(s: &str) -> Result<i64, Refused> {
@@ -716,6 +773,40 @@ fn groups(assertion: Node, name: &str) -> Groups {
         }
     }
     Groups::Listed(out)
+}
+
+/// Plain-text values, trimmed, each once, in order: at most `MAX_AUTHN_CONTEXTS`, none empty or
+/// longer than `MAX_AUTHN_CONTEXT_LEN`. Leaving one out only ever refuses a sign-in.
+fn authn_values<'a, 'i: 'a>(nodes: impl Iterator<Item = Node<'a, 'i>>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for v in nodes.filter_map(text_of).map(str::trim).filter(|v| !v.is_empty() && v.len() <= MAX_AUTHN_CONTEXT_LEN) {
+        if out.len() == MAX_AUTHN_CONTEXTS {
+            break;
+        }
+        if !out.iter().any(|o| o == v) {
+            out.push(v.to_string());
+        }
+    }
+    out
+}
+
+/// How the (verified) assertion says the person signed in (ADR 0190): the class of each
+/// `AuthnStatement`'s `AuthnContext`, and every value of the `methods` attribute, if named.
+/// A declaration (`AuthnContextDecl`, `AuthnContextDeclRef`) isn't read.
+fn read_authn(assertion: Node, methods: Option<&str>) -> Authn {
+    let classes = assertion
+        .children()
+        .filter(|c| is(*c, ASSERTION, "AuthnStatement"))
+        .filter_map(|s| only(s, ASSERTION, "AuthnContext"))
+        .filter_map(|c| only(c, ASSERTION, "AuthnContextClassRef"));
+    let methods: Vec<String> = match methods {
+        Some(name) => {
+            let attrs = assertion.children().filter(|c| is(*c, ASSERTION, "AttributeStatement")).flat_map(|s| s.children().filter(|c| is(*c, ASSERTION, "Attribute")));
+            authn_values(attrs.filter(|a| a.attribute("Name") == Some(name)).flat_map(|a| a.children().filter(|c| is(*c, ASSERTION, "AttributeValue"))))
+        }
+        None => Vec::new(),
+    };
+    Authn { classes: authn_values(classes), methods }
 }
 
 /// Every `ID`-like attribute at or under `n`.
@@ -996,11 +1087,12 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
     };
     let email = pick(&e.attributes.email, &EMAIL_ATTRIBUTES).filter(|m| m.len() <= 254 && crate::users::valid_email(m)).map(String::from);
     let name = pick(&e.attributes.name, &NAME_ATTRIBUTES).map(|n| crate::audit::clip(n, 100));
-    let claims = Claims { issuer: e.idp.entity_id.clone(), subject: super::saml::subject(raw), tenant: None, email, name, username: None };
+    let how = read_authn(assertion, e.attributes.authn_methods.as_deref());
+    let claims = Claims { issuer: e.idp.entity_id.clone(), subject: super::saml::subject(raw), tenant: None, email, name, username: None, authn_context: how.class().map(String::from) };
     let session_index = kept(authn, "SessionIndex");
     let login = SamlLogin { name_id: nid.value, format: nid.format, name_qualifier: nid.name_qualifier, sp_name_qualifier: nid.sp_name_qualifier, session_index };
     let groups = e.attributes.groups.as_deref().map_or(Groups::NotRead, |n| groups(assertion, n));
-    Ok(Checked { claims, assertion_id, until_ms: until.min(now + 24 * 3600 * 1000), login, groups, decrypted_with })
+    Ok(Checked { claims, assertion_id, until_ms: until.min(now + 24 * 3600 * 1000), login, groups, decrypted_with, authn: how })
 }
 
 #[cfg(test)]
@@ -1091,7 +1183,12 @@ pub mod test_idp {
         pub encrypt_to: String,
         /// Send the NameID as an `EncryptedID` to this certificate, inside what is signed.
         pub encrypt_name_id_to: Option<String>,
+        /// One `AuthnStatement` per class, in order. One starting with `<` is put in the
+        /// `AuthnContext` as it is, in place of a class.
+        pub authn_contexts: Vec<String>,
     }
+
+    pub const PASSWORD_PROTECTED: &str = "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport";
 
     impl Response {
         pub fn new(acs: &str, sp_entity: &str, request_id: &str, now_ms: i64) -> Response {
@@ -1120,6 +1217,7 @@ pub mod test_idp {
                 encrypt: None,
                 encrypt_to: String::new(),
                 encrypt_name_id_to: None,
+                authn_contexts: vec![PASSWORD_PROTECTED.into()],
             }
         }
 
@@ -1137,8 +1235,14 @@ pub mod test_idp {
             let single = self.attributes.iter().map(|(k, v)| format!(r#"<saml:Attribute Name="{k}">{}</saml:Attribute>"#, value(v)));
             let multi = self.multi_attributes.iter().map(|(k, vs)| format!(r#"<saml:Attribute Name="{k}">{}</saml:Attribute>"#, vs.iter().map(value).collect::<String>()));
             let attrs: String = single.chain(multi).collect();
+            let statements: String = self
+                .authn_contexts
+                .iter()
+                .map(|c| if c.starts_with('<') { c.clone() } else { format!("<saml:AuthnContextClassRef>{c}</saml:AuthnContextClassRef>") })
+                .map(|c| format!(r#"<saml:AuthnStatement AuthnInstant="{now}" SessionIndex="{si}"><saml:AuthnContext>{c}</saml:AuthnContext></saml:AuthnStatement>"#, now = instant(self.not_before + 60_000), si = self.session_index))
+                .collect();
             format!(
-                r#"<saml:Assertion ID="{aid}" Version="2.0" IssueInstant="{now}"><saml:Issuer>{iss}</saml:Issuer><saml:Subject>{nid}<saml:SubjectConfirmation Method="{BEARER}"><saml:SubjectConfirmationData{cirt} NotOnOrAfter="{cna}" Recipient="{rcp}"/></saml:SubjectConfirmation></saml:Subject><saml:Conditions NotBefore="{nb}" NotOnOrAfter="{na}"><saml:AudienceRestriction><saml:Audience>{aud}</saml:Audience></saml:AudienceRestriction>{extra}</saml:Conditions><saml:AuthnStatement AuthnInstant="{now}" SessionIndex="{si}"><saml:AuthnContext><saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement><saml:AttributeStatement>{attrs}</saml:AttributeStatement></saml:Assertion>"#,
+                r#"<saml:Assertion ID="{aid}" Version="2.0" IssueInstant="{now}"><saml:Issuer>{iss}</saml:Issuer><saml:Subject>{nid}<saml:SubjectConfirmation Method="{BEARER}"><saml:SubjectConfirmationData{cirt} NotOnOrAfter="{cna}" Recipient="{rcp}"/></saml:SubjectConfirmation></saml:Subject><saml:Conditions NotBefore="{nb}" NotOnOrAfter="{na}"><saml:AudienceRestriction><saml:Audience>{aud}</saml:Audience></saml:AudienceRestriction>{extra}</saml:Conditions>{statements}<saml:AttributeStatement>{attrs}</saml:AttributeStatement></saml:Assertion>"#,
                 aid = self.assertion_id,
                 now = instant(self.not_before + 60_000),
                 iss = self.issuer,
@@ -1150,7 +1254,6 @@ pub mod test_idp {
                 na = instant(self.not_on_or_after),
                 aud = self.audience,
                 extra = self.conditions_extra,
-                si = self.session_index,
             )
         }
 
@@ -1308,7 +1411,7 @@ mod tests {
             let key = SpKey::from_pem(&key_pem, &cert_pem).unwrap();
             assert_eq!(key.sig_alg(), sig_alg);
             assert!(key.decrypting().is_none(), "IdPs encrypt with RSA-OAEP only");
-            let xml = authn_request(&Sp { entity_id: SP, acs: ACS }, REQ, SSO_URL, NOW);
+            let xml = authn_request(&Sp { entity_id: SP, acs: ACS }, REQ, SSO_URL, NOW, None);
             let q = redirect_query("SAMLRequest", &xml, Some("s"), Some(&key));
             assert!(q.contains(&format!("SigAlg={}", form(sig_alg))), "{q}");
             let r = from_redirect(&q).unwrap();
@@ -1324,7 +1427,7 @@ mod tests {
     #[test]
     fn redirect_messages_are_signed_over_the_query_as_sent() {
         let (key, _) = SpKey::generate("sp").unwrap();
-        let xml = authn_request(&Sp { entity_id: SP, acs: ACS }, REQ, SSO_URL, NOW);
+        let xml = authn_request(&Sp { entity_id: SP, acs: ACS }, REQ, SSO_URL, NOW, None);
         let q = redirect_query("SAMLRequest", &xml, Some("state+/="), Some(&key));
         let names: Vec<&str> = q.split('&').map(|p| p.split('=').next().unwrap()).collect();
         assert_eq!(names, ["SAMLRequest", "RelayState", "SigAlg", "Signature"], "in the order the binding signs them");
@@ -1393,7 +1496,7 @@ mod tests {
 
         let id = request_id();
         assert!(id.starts_with('_') && id.len() == 41);
-        let xml = authn_request(&sp, &id, SSO_URL, NOW);
+        let xml = authn_request(&sp, &id, SSO_URL, NOW, None);
         let encoded = redirect_encode(&xml);
         let inflated = miniz_oxide::inflate::decompress_to_vec(&STANDARD.decode(encoded).unwrap()).unwrap();
         assert_eq!(String::from_utf8(inflated).unwrap(), xml, "raw DEFLATE, as the binding says");
@@ -1406,7 +1509,7 @@ mod tests {
         );
         assert_eq!(r.attribute("IssueInstant"), Some("2027-01-15T08:00:00Z"));
         assert_eq!(doc.descendants().find(|n| is(*n, ASSERTION, "Issuer")).and_then(|n| n.text()), Some(SP));
-        let odd = authn_request(&Sp { entity_id: "urn:a&b<c>", acs: ACS }, &id, SSO_URL, NOW);
+        let odd = authn_request(&Sp { entity_id: "urn:a&b<c>", acs: ACS }, &id, SSO_URL, NOW, None);
         assert!(roxmltree::Document::parse(&odd).is_ok(), "escaped");
     }
 
@@ -1437,7 +1540,7 @@ mod tests {
         no_attrs.attributes.clear();
         assert_eq!(check(&no_attrs.xml()).unwrap().claims.email, None);
         let idp = idp();
-        let mapped = Attributes { email: Some("work_mail".into()), name: None, groups: None };
+        let mapped = Attributes { email: Some("work_mail".into()), name: None, groups: None, authn_methods: None };
         let mut custom = base();
         custom.attributes = vec![("email".into(), "personal@evil.example".into()), ("work_mail".into(), "ada@example.com".into())];
         let c = check_response(&STANDARD.encode(custom.xml()), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &mapped, now_ms: NOW, decrypt: &[], require_encrypted: false }).unwrap();
@@ -1497,6 +1600,104 @@ mod tests {
         let wrapped = plain.xml().replace("</samlp:Response>", r#"<saml:AttributeStatement><saml:Attribute Name="groups"><saml:AttributeValue>Admins</saml:AttributeValue></saml:Attribute></saml:AttributeStatement></samlp:Response>"#);
         let c = check_response(&STANDARD.encode(wrapped), &e).unwrap();
         assert_eq!(c.groups, Groups::Listed(s(&["Users"])));
+    }
+
+    const MFA: &str = "http://schemas.microsoft.com/claims/multipleauthn";
+    const AMR: &str = "http://schemas.microsoft.com/claims/authnmethodsreferences";
+
+    fn authn_of(r: &Response, methods: Option<&str>) -> Authn {
+        let idp = idp();
+        let attributes = Attributes { authn_methods: methods.map(String::from), ..Attributes::default() };
+        check_response(&r.posted(), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: &[], require_encrypted: false }).unwrap().authn
+    }
+
+    fn required(accepted: &[&str]) -> AuthnContext {
+        AuthnContext { accepted: accepted.iter().map(|a| a.to_string()).collect(), request: false }
+    }
+
+    #[test]
+    fn how_someone_signed_in_comes_only_from_the_signed_assertion() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let a = authn_of(&base(), None);
+        assert_eq!((a.classes.clone(), a.methods.clone()), (s(&[PASSWORD_PROTECTED]), vec![]), "the class, and no methods unless an attribute is named");
+        assert_eq!(a.class(), Some(PASSWORD_PROTECTED));
+        assert_eq!(a.meets(&required(&[MFA])), None);
+        let c = check(&base().xml()).unwrap();
+        assert_eq!(c.claims.authn_context.as_deref(), Some(PASSWORD_PROTECTED), "kept for the audit log");
+
+        // Entra ID: a strong class, or its methods attribute naming multipleauthn.
+        let mut entra = base();
+        entra.authn_contexts = s(&[MFA]);
+        assert_eq!(authn_of(&entra, None).meets(&required(&["urn:x", MFA])), Some(MFA));
+        let mut amr = base();
+        amr.multi_attributes = vec![(AMR.into(), s(&["http://schemas.microsoft.com/ws/2008/06/identity/authenticationmethod/password", MFA]))];
+        assert_eq!(authn_of(&amr, None).meets(&required(&[MFA])), None, "the attribute counts only when it's named");
+        let a = authn_of(&amr, Some(AMR));
+        assert_eq!(a.methods.len(), 2);
+        assert_eq!(a.meets(&required(&[MFA])), Some(MFA));
+        assert_eq!(authn_of(&amr, Some("amr")).meets(&required(&[MFA])), None, "only that attribute");
+        // The admin's order decides which is recorded.
+        let mut both = amr.clone();
+        both.authn_contexts = s(&["urn:oasis:names:tc:SAML:2.0:ac:classes:MobileTwoFactorContract"]);
+        assert_eq!(authn_of(&both, Some(AMR)).meets(&required(&["urn:oasis:names:tc:SAML:2.0:ac:classes:MobileTwoFactorContract", MFA])), Some("urn:oasis:names:tc:SAML:2.0:ac:classes:MobileTwoFactorContract"));
+
+        // Exact matches only, every statement read, odd values left out.
+        let mut near = base();
+        near.authn_contexts = s(&[&MFA.to_uppercase(), &format!("{MFA}/x"), &format!("<saml:AuthnContextClassRef><b>{MFA}</b></saml:AuthnContextClassRef>")]);
+        assert_eq!(authn_of(&near, None).meets(&required(&[MFA])), None);
+        let mut second = base();
+        second.authn_contexts = s(&[PASSWORD_PROTECTED, MFA]);
+        assert_eq!(authn_of(&second, None).classes, s(&[PASSWORD_PROTECTED, MFA]));
+        let mut padded = base();
+        padded.authn_contexts = s(&[&format!("  {MFA}\n")]);
+        assert_eq!(authn_of(&padded, None).meets(&required(&[MFA])), Some(MFA), "trimmed, as text is everywhere else");
+        let mut long = base();
+        long.multi_attributes = vec![("amr".into(), vec!["m".repeat(MAX_AUTHN_CONTEXT_LEN + 1), "mfa".into(), "mfa".into()])];
+        assert_eq!(authn_of(&long, Some("amr")).methods, s(&["mfa"]), "too long is left out, duplicates once");
+        let mut many = base();
+        many.multi_attributes = vec![("amr".into(), (0..MAX_AUTHN_CONTEXTS).map(|i| format!("m{i}")).chain(["mfa".into()]).collect())];
+        let a = authn_of(&many, Some("amr"));
+        assert_eq!((a.methods.len(), a.meets(&required(&["mfa"]))), (MAX_AUTHN_CONTEXTS, None), "past the limit nothing more is read");
+        let mut none = base();
+        none.authn_contexts = s(&[""]);
+        assert_eq!(authn_of(&none, None), Authn::default());
+
+        // A declaration isn't a class, and a context naming two classes names none.
+        let mut decl = base();
+        decl.authn_contexts = s(&[&format!("<saml:AuthnContextDeclRef>{MFA}</saml:AuthnContextDeclRef>")]);
+        assert_eq!(authn_of(&decl, None), Authn::default());
+        let mut two = base();
+        two.authn_contexts = s(&[&format!("<saml:AuthnContextClassRef>{PASSWORD_PROTECTED}</saml:AuthnContextClassRef><saml:AuthnContextClassRef>{MFA}</saml:AuthnContextClassRef>")]);
+        assert_eq!(authn_of(&two, None), Authn::default());
+
+        // Added after signing, or outside the signed assertion: never read.
+        let added = base().xml_with(|a| a.replace(PASSWORD_PROTECTED, MFA));
+        assert_eq!(check(&added).unwrap_err().0, "bad_signature");
+        let outside = base().xml().replace("</samlp:Response>", &format!("<saml:AuthnStatement><saml:AuthnContext><saml:AuthnContextClassRef>{MFA}</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement></samlp:Response>"));
+        assert_eq!(check(&outside).unwrap().authn.classes, s(&[PASSWORD_PROTECTED]));
+    }
+
+    #[test]
+    fn authn_requests_ask_for_the_classes_only_when_told_to() {
+        let sp = Sp { entity_id: SP, acs: ACS };
+        let mut c = required(&[MFA, "urn:a&b"]);
+        assert!(!authn_request(&sp, REQ, SSO_URL, NOW, Some(&c)).contains("RequestedAuthnContext"), "required, but not requested");
+        c.request = true;
+        let xml = authn_request(&sp, REQ, SSO_URL, NOW, Some(&c));
+        assert!(xml.contains(&format!(r#"<samlp:NameIDPolicy AllowCreate="true"/><samlp:RequestedAuthnContext Comparison="exact"><saml:AuthnContextClassRef>{MFA}</saml:AuthnContextClassRef><saml:AuthnContextClassRef>urn:a&amp;b</saml:AuthnContextClassRef></samlp:RequestedAuthnContext></samlp:AuthnRequest>"#)), "after NameIDPolicy, as the schema orders them, in the admin's order: {xml}");
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        let refs: Vec<&str> = doc.descendants().filter(|n| is(*n, ASSERTION, "AuthnContextClassRef")).filter_map(|n| n.text()).collect();
+        assert_eq!(refs, [MFA, "urn:a&b"]);
+        assert!(!authn_request(&sp, REQ, SSO_URL, NOW, None).contains("RequestedAuthnContext"));
+    }
+
+    #[test]
+    fn authn_context_values_are_uris_or_tokens() {
+        assert_eq!(authn_context_value(&format!(" {MFA} ")).unwrap(), MFA);
+        assert_eq!(authn_context_value("mfa").unwrap(), "mfa");
+        for bad in ["", "  ", "two words", "tab\there", &"x".repeat(MAX_AUTHN_CONTEXT_LEN + 1), "caf\u{e9}"] {
+            assert!(authn_context_value(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
