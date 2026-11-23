@@ -103,6 +103,9 @@ pub struct NetworkMember {
     pub machine: String,
     pub config: String,
     pub interface: String,
+    /// The machine booted with it. An interface added to a running machine is inactive
+    /// until its next boot (ADR 0202), and can be taken off while inactive.
+    pub active: bool,
 }
 
 /// What to put on a machine that is wiped and reinstalled in place (ADR 0056): same
@@ -344,9 +347,15 @@ pub trait MachineProvider: Send + Sync {
     fn team_network_members<'a>(&'a self, _id: &'a str) -> Fut<'a, Vec<NetworkMember>> {
         Box::pin(async { Err(no_networks()) })
     }
-    /// Takes the interface off its machine, which must be powered off. Succeeds if it
-    /// is gone already.
+    /// Takes the interface off its machine, which must be powered off unless the
+    /// interface is inactive. Succeeds if it is gone already.
     fn leave_team_network<'a>(&'a self, _member: &'a NetworkMember) -> Fut<'a, ()> {
+        Box::pin(async { Err(no_networks()) })
+    }
+    /// Puts existing machine `machine` on network `network`'s subnet from its next boot
+    /// (ADR 0202), behind the same firewall, its public interface still the primary.
+    /// Succeeds if it is on that subnet already, or will be at its next boot.
+    fn join_team_network<'a>(&'a self, _machine: &'a str, _network: &'a TeamNetwork) -> Fut<'a, ()> {
         Box::pin(async { Err(no_networks()) })
     }
 

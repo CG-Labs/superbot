@@ -193,7 +193,7 @@ Unattended-Upgrade::Automatic-Reboot \"false\";
 Unattended-Upgrade::Remove-Unused-Kernel-Packages \"true\";
 ";
 
-pub const EGRESS_PATH: &str = "/usr/local/lib/superbot/egress";
+pub const EGRESS_PATH: &str = super::team_rules::EGRESS_SCRIPT;
 /// Loads the egress rules. Root and the OS's network daemons (DNS, DHCP, time, apt)
 /// pass; everyone else, the Bots' and teammates' users included, can't reach the deny
 /// lists. Loopback stays open, so Bots still reach botd through the agent, and so do
@@ -434,6 +434,21 @@ mod tests {
         let files = s.files(Some("10.248.0.0/22"));
         assert!(files.iter().any(|(p, _, c)| *p == EGRESS_PATH && c.contains("10.248.0.0/22 accept")));
         assert!(!s.files(None).iter().any(|(_, _, c)| c.contains("10.248.0.0/22")));
+    }
+
+    #[test]
+    fn an_agent_edits_the_script_into_the_one_a_first_boot_on_the_network_writes() {
+        use super::super::team_rules::{subnet_in, with_subnet};
+        let mut s = Settings::default_on();
+        s.deny.push("203.0.113.0/24".into());
+        for deny in [s.deny.clone(), vec!["fc00::/7".into()], vec![]] {
+            let s = Settings { deny };
+            let (off, on) = (s.egress_script(), s.egress_script_on(Some("10.248.0.0/22")));
+            assert_eq!(with_subnet(&off, Some("10.248.0.0/22")).as_deref(), Some(on.as_str()), "joining");
+            assert_eq!(with_subnet(&on, None).as_deref(), Some(off.as_str()), "leaving");
+            assert_eq!(with_subnet(&on, Some("172.20.0.0/16")), Some(s.egress_script_on(Some("172.20.0.0/16"))), "another team's");
+            assert_eq!((subnet_in(&off), subnet_in(&on).as_deref()), (None, Some("10.248.0.0/22")));
+        }
     }
 
     #[test]

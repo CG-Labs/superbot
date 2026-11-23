@@ -139,6 +139,7 @@ pub(crate) fn config(env: &Env, machine_id: &str, token: &str) -> Config {
         teammate_stand_in: None,
         run_cgroups: false,
         nft: "/nonexistent/nft".into(),
+        egress_script: "/nonexistent/egress".into(),
     }
 }
 

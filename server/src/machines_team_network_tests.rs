@@ -32,7 +32,7 @@ async fn serve() -> Env {
     let mut cp = ControlPlane::for_tests(p);
     let e = cp.enroll_with(Enrollment::for_tests(9, mport, 7443).with_agent(AGENT.as_bytes()).with_hardening()).unwrap();
     cp.firewall_with(Settings { sources: Vec::new(), ssh: Vec::new() }).unwrap();
-    cp.team_network = Some(team_network::Settings { subnet: team_network::DEFAULT_SUBNET.into() });
+    cp.team_network = Some(team_network::Settings { subnet: team_network::DEFAULT_SUBNET.into(), join: team_network::Join::NextBoot });
     let cp = Arc::new(cp);
     let held = cp.clone();
     let (port, app, owner, _) = crate::tests::serve_app_with(move |a| a.machines = cp).await;
@@ -128,7 +128,7 @@ async fn a_teams_machines_share_a_network_of_their_own_and_leave_it_with_the_tea
 
     // The substrate says so.
     let (_, s) = json_call(&env, "GET", "/api/machines/substrate", "").await;
-    assert_eq!(s["teamNetwork"], json!({ "kind": "vpc", "subnet": team_network::DEFAULT_SUBNET }), "{s}");
+    assert_eq!(s["teamNetwork"], json!({ "kind": "vpc", "subnet": team_network::DEFAULT_SUBNET, "join": "next-boot" }), "{s}");
 
     // Running, and the team's own service on its network: nothing to do.
     env.fake.join_network(&acme_net, "acme-database");
@@ -213,7 +213,7 @@ async fn a_machine_powered_off_to_leave_is_powered_on_again_whatever_happens_mea
 
     // Had he rejoined after the sweep looked, it backs off under the lock, on or off.
     let n = TeamNetwork { id: net.clone(), label: old.clone(), region: "gb-lon".into(), subnet_id: String::new(), subnet: String::new(), created: false };
-    let mem = NetworkMember { machine: pid(&env, &al), config: "c".into(), interface: "i".into() };
+    let mem = NetworkMember { machine: pid(&env, &al), config: "c".into(), interface: "i".into(), active: true };
     let leave_now = async || team_network::leave(&env.app, &env.cp, env.fake.as_ref(), &n, Some(&acme), &machine(&env, &al), &mem).await;
     assert_eq!(leave_now().await, team_network::Leave::Waiting);
     assert_eq!(machine(&env, &al).state, State::Running);
@@ -243,6 +243,197 @@ async fn a_machine_powered_off_to_leave_is_powered_on_again_whatever_happens_mea
         assert!(reconcile(&env).await.get("teamNetworks").is_none());
     }
     assert_eq!(machine(&env, &cy).state, State::Suspended, "a disabled user's machine is never powered on");
+}
+
+/// As if `uid`'s machine's agent had said its egress rules let `subnet` through.
+fn rules_say(env: &Env, uid: &str, state: &str, subnet: Option<&str>) {
+    let m = machine(env, uid);
+    let mut u = m.agent_upkeep.clone().unwrap_or_else(|| json!({}));
+    u["teamNetwork"] = json!({ "subnet": subnet, "state": state });
+    assert!(env.app.db.machine_upkeep_swap(&m.id, m.agent_upkeep.as_ref(), &u));
+}
+
+#[tokio::test]
+async fn a_machine_made_before_its_owner_joined_a_team_joins_its_network_at_its_next_boot() {
+    let env = serve().await;
+    let (_ada, _) = user_with(env.port, &env.admin, "ada@example.com", "member").await;
+    let (cy, _) = user_with(env.port, &env.admin, "cy@example.com", "member").await;
+    ask(&env, &cy).await;
+    let acme = team(&env, "Acme", "ada@example.com").await;
+    assert!(reconcile(&env).await.get("teamNetworks").is_none(), "Cy is on no team yet");
+    join(&env, &acme, &cy).await;
+    let cym = pid(&env, &cy);
+
+    // Not until her machine's egress rules let the subnet through.
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "waiting": 1 }));
+    rules_say(&env, &cy, "on", None);
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "waiting": 1 }));
+    rules_say(&env, &cy, "failed", Some(team_network::DEFAULT_SUBNET));
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "waiting": 1 }));
+    assert_eq!(env.fake.calls("join_team_network"), 0);
+    rules_say(&env, &cy, "on", Some(team_network::DEFAULT_SUBNET));
+
+    // Nor while it isn't behind the firewall, whose inbound drops keep teammates apart.
+    let fw = machine(&env, &cy).firewall_id.unwrap();
+    env.fake.detach_firewall(&fw, &cym).await.unwrap();
+    env.fake.fail_next("attach_firewall", crate::machines::provider::ProviderError::Api { status: 500, message: "try later".into() });
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "waiting": 1 }));
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "waiting": 1 }), "put back behind it this pass, after the sweep");
+    assert_eq!(env.fake.calls("join_team_network"), 0);
+
+    // Then it is put on, in use from its next boot; botd doesn't restart it for that.
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "joining": 1 }));
+    let net = env.fake.joining(&cym).expect("on Acme's network from its next boot");
+    assert_eq!(env.fake.network_of(&cym), None, "not in use yet");
+    let joining = events(&env, "machine.team_network_joining").await;
+    assert_eq!(joining.len(), 1, "{joining:?}");
+    assert_eq!((joining[0]["details"]["networkId"].as_str(), joining[0]["details"]["join"].as_str()), (Some(net.as_str()), Some("next-boot")));
+    for _ in 0..2 {
+        assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "pending": 1 }));
+    }
+    assert_eq!(machine(&env, &cy).state, State::Running);
+
+    // She leaves before it boots: taken off at once, never powered off.
+    let (code, _) = json_call(&env, "DELETE", &format!("/api/teams/{acme}/members/{cy}"), "").await;
+    assert!(code == 200 || code == 204);
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "left": 1 }));
+    assert_eq!((env.fake.joining(&cym), machine(&env, &cy).state), (None, State::Running));
+    let left = events(&env, "machine.team_network_left").await;
+    assert_eq!((left[0]["details"]["inUse"].as_bool(), left[0]["details"]["resuming"].as_bool()), (Some(false), Some(false)), "{left:?}");
+    assert!(events(&env, "machine.team_network_leaving").await.is_empty());
+
+    // Back on the team, a refusal is audited once however often it is tried.
+    join(&env, &acme, &cy).await;
+    let no = || crate::machines::provider::ProviderError::Api { status: 409, message: "it has more than one configuration profile".into() };
+    for _ in 0..2 {
+        env.fake.fail_next("join_team_network", no());
+        assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "errors": 1 }));
+    }
+    let failed: Vec<Value> = events(&env, "machine.team_network_joining").await.into_iter().filter(|e| e["outcome"] == "failure").collect();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(failed[0]["details"]["error"].as_str().unwrap().contains("configuration profile"), "{failed:?}");
+
+    // Joined, and in use once she restarts it herself.
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "joining": 1 }));
+    assert_eq!(json_call(&env, "POST", &format!("/api/users/{cy}/machine/suspend"), "").await.0, 200);
+    assert_eq!(reconcile(&env).await.get("teamNetworks"), None, "off: nothing to do yet");
+    assert_eq!(json_call(&env, "POST", &format!("/api/users/{cy}/machine/resume"), "").await.0, 200);
+    assert_eq!(env.fake.network_of(&cym).as_deref(), Some(net.as_str()));
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "joined": 1 }));
+    let joined = events(&env, "machine.team_network_joined").await;
+    assert_eq!((joined.len(), joined[0]["details"]["networkId"].as_str()), (1, Some(net.as_str())), "{joined:?}");
+    assert!(reconcile(&env).await.get("teamNetworks").is_none(), "audited once");
+}
+
+/// An egress script shaped as the first boot's (ADR 0126), whose rules go to `rules`.
+fn stand_in_egress(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join("egress");
+    let s = format!("#!/bin/sh\nset -e\n{{\n  cat <<'DENY'\n    ip daddr {{ 10.0.0.0/8 }} counter reject\nDENY\n}} > {}/rules\n", dir.display());
+    std::fs::write(&path, s).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn with_when_idle_a_machine_is_restarted_onto_its_teams_network_once_it_runs_nothing() {
+    use crate::machines_mtls_tests::{self as mtls, CHAT, agent_with_config, machine_for, send};
+    let mut env = mtls::serve_with_control(
+        |e| e,
+        |cp| {
+            cp.firewall_with(Settings { sources: Vec::new(), ssh: Vec::new() }).unwrap();
+            cp.team_network = Some(team_network::Settings { subnet: team_network::DEFAULT_SUBNET.into(), join: team_network::Join::WhenIdle });
+        },
+        |_| {},
+    )
+    .await;
+    let (_ada, _) = user_with(env.port, &env.admin, "ada@example.com", "member").await;
+    let (cy, mid, token) = machine_for(&env, "cy@example.com").await;
+    let dir = crate::db::temp_path("egress");
+    let script = stand_in_egress(&dir);
+    let m = agent_with_config(&mut env, &mid, &token, CHAT, |mut c| {
+        c.egress_script = script.clone();
+        c
+    })
+    .await;
+    let reconcile = async |env: &mtls::Env| {
+        let (code, r) = mtls::json_call(env, "POST", "/api/machines/reconcile", "").await;
+        assert_eq!(code, 200, "{r}");
+        r["teamNetworks"].clone()
+    };
+    let rules = async |env: &mtls::Env, want: Option<&str>| {
+        for _ in 0..400 {
+            crate::machines::heartbeats(&env.app, &env.cp).await;
+            let u = env.app.db.machine(&mid).unwrap().agent_upkeep.unwrap_or_default();
+            if u["teamNetwork"]["state"] == "on" && u["teamNetwork"]["subnet"].as_str() == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the rules never let {want:?} through");
+    };
+    let pid = env.app.db.machine(&mid).unwrap().provider_id.unwrap();
+    rules(&env, None).await;
+    assert!(mtls::events(&env, "machine.team_network_rules_loaded").await.is_empty(), "nothing to say yet");
+
+    // Cy joins a team: her agent lets its subnet through first, then the machine joins.
+    let (code, t) = mtls::json_call(&env, "POST", "/api/teams", &json!({ "name": "Acme", "owner": "ada@example.com", "machines": false }).to_string()).await;
+    assert_eq!(code, 201, "{t}");
+    let acme = t["id"].as_str().unwrap().to_string();
+    let (code, v) = mtls::json_call(&env, "PUT", &format!("/api/teams/{acme}/members/{cy}"), r#"{"role":"member"}"#).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(reconcile(&env).await, json!({ "waiting": 1 }));
+    rules(&env, Some(team_network::DEFAULT_SUBNET)).await;
+    let loaded = std::fs::read_to_string(dir.join("rules")).unwrap();
+    assert!(loaded.starts_with(&format!("    ip daddr {} accept\n", team_network::DEFAULT_SUBNET)), "before the denies: {loaded}");
+    let ev = mtls::events(&env, "machine.team_network_rules_loaded").await;
+    assert_eq!((ev.len(), ev[0]["details"]["subnet"].as_str()), (1, Some(team_network::DEFAULT_SUBNET)), "{ev:?}");
+    assert_eq!(reconcile(&env).await, json!({ "joining": 1 }));
+    let net = env.fake.joining(&pid).unwrap();
+
+    // Busy: left running until the run ends.
+    let bot = env.app.db.create_bot_owned("Cy's", "#fff", "waddle", "claude", None, false, &cy, crate::acl::Visibility::Shared);
+    let before = send(&env, &bot.id, "hello").await;
+    for _ in 0..400 {
+        if m.home.join("run.env").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(m.home.join("run.env").exists(), "the run started");
+    assert_eq!(reconcile(&env).await, json!({ "pending": 1 }));
+    assert_eq!(env.app.db.machine(&mid).unwrap().state, State::Running);
+    std::fs::write(m.home.join("go-ahead"), "hi").unwrap();
+    assert!(mtls::reply_after(&env, &bot.id, before).await.contains("said=hi"));
+
+    // Idle: powered off, then on again, on the network.
+    let mut r = json!({ "pending": 1 });
+    for _ in 0..100 {
+        r = reconcile(&env).await;
+        if r.get("restarting").is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(r, json!({ "pending": 1, "restarting": 1 }));
+    assert_eq!(env.app.db.machine(&mid).unwrap().state, State::Suspended);
+    assert_eq!(mtls::events(&env, "machine.team_network_restarting").await.len(), 1);
+    assert_eq!(reconcile(&env).await, json!({ "resumed": 1 }));
+    assert_eq!(env.app.db.machine(&mid).unwrap().state, State::Running);
+    assert_eq!(env.fake.network_of(&pid).as_deref(), Some(net.as_str()));
+    assert_eq!(reconcile(&env).await, json!({ "joined": 1 }));
+    assert_eq!(mtls::events(&env, "machine.team_network_joined").await.len(), 1);
+
+    // She leaves: off the network, and her rules no longer let it through.
+    let (code, _) = mtls::json_call(&env, "DELETE", &format!("/api/teams/{acme}/members/{cy}"), "").await;
+    assert!(code == 200 || code == 204);
+    assert_eq!(reconcile(&env).await, json!({ "leaving": 1 }));
+    assert_eq!(reconcile(&env).await, json!({ "left": 1, "resumed": 1 }));
+    rules(&env, None).await;
+    assert!(!std::fs::read_to_string(dir.join("rules")).unwrap().contains("accept"));
+    let ev = mtls::events(&env, "machine.team_network_rules_loaded").await;
+    assert_eq!((ev.len(), &ev[0]["details"]["subnet"]), (2, &Value::Null), "{ev:?}");
 }
 
 #[tokio::test]
