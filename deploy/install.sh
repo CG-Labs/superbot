@@ -44,6 +44,8 @@ TESTING_MODE_ON=false
 # installs or upgrades from a bundle deploy/offline-bundle.sh made, with no network at all.
 OFFLINE_BUNDLE=""
 OFFLINE_BUNDLE_SHA256=""
+# Set by offline_check_origin: whether the bundle's signature was verified.
+OFFLINE_SIGNED=false
 OFFLINE_DIR=""
 OFFLINE_RELEASE_FILE=${OFFLINE_RELEASE_FILE:-}
 OFFLINE_BINARIES=(botd botctl superbot-machine superbot-run)
@@ -1563,6 +1565,7 @@ offline_expected_sha256() {
 # is here, and its SHA-256. One of them is required.
 offline_check_origin() {
   local bundle=$1 want got signed=false root=()
+  OFFLINE_SIGNED=false
   if [[ -f "$bundle.sigstore.json" ]]; then
     if command -v cosign >/dev/null 2>&1; then
       # The operator's own copy of Sigstore's trusted root (cosign initialize on a connected
@@ -1576,7 +1579,8 @@ offline_check_origin() {
         --certificate-oidc-issuer "$OFFLINE_SIGNER_ISSUER" "$bundle" >/dev/null 2>&1 \
         || die "The bundle's signature ($bundle.sigstore.json) doesn't verify: don't install it (docs/ops/air-gapped.md#verifying-a-bundle)"
       log "Bundle signature verified (signed by $OFFLINE_SIGNER_IDENTITY_REGEXP)"
-      signed=true
+      # shellcheck disable=SC2034 # offline-bundle.sh push reads it
+      signed=true OFFLINE_SIGNED=true
     else
       warn "The bundle is signed, but cosign isn't installed here, so the signature isn't checked"
     fi

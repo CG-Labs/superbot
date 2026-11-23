@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (22 Nov 2026). Second slice of [#59](https://github.com/CG-Labs/superbot/issues/59) (M5, "Air-gapped self-host"). Builds on the offline bundle and `install.sh --offline` ([ADR 0128](0128-air-gapped-self-host.md)), image signing ([ADR 0101](0101-image-scanning-and-signing.md)) and GitHub releases from tags ([ADR 0111](0111-changelog-and-github-releases.md)). It closes the two follow-ups ADR 0128 left: release bundles made with every tag, and images in a registry mirror format.
+Accepted (22 Nov 2026). Second slice of [#59](https://github.com/CG-Labs/superbot/issues/59) (M5, "Air-gapped self-host"). Builds on the offline bundle and `install.sh --offline` ([ADR 0128](0128-air-gapped-self-host.md)), image signing ([ADR 0101](0101-image-scanning-and-signing.md)) and GitHub releases from tags ([ADR 0111](0111-changelog-and-github-releases.md)). It closes the two follow-ups ADR 0128 left: release bundles made with every tag, and images in a registry mirror format. Amended by [ADR 0147](0147-signatures-and-multi-arch-indexes-in-mirrors.md): bundles now carry the images' signatures and attestations, and `push` takes one bundle per arch, puts up the signed multi-arch index with them, and no longer uses skopeo.
 
 0140 was reserved for this work.
 
