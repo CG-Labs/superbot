@@ -225,10 +225,11 @@ fn read_jwt(method: JwtMethod, file: &std::path::Path) -> Result<Zeroizing<Strin
         return Err(not_jwt());
     }
     let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).filter(Value::is_object).ok_or_else(not_jwt)?;
-    if let Some(exp) = claims["exp"].as_i64() {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    // NumericDate may have a fraction (RFC 7519).
+    if let Some(exp) = claims["exp"].as_f64() {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
         if exp <= now {
-            return Err(Error::Unavailable(format!("Vault: the JWT in {setting} ({}) expired {} s ago; is the platform still renewing it?", file.display(), now - exp)));
+            return Err(Error::Unavailable(format!("Vault: the JWT in {setting} ({}) expired {} s ago; is the platform still renewing it?", file.display(), (now - exp) as u64)));
         }
     }
     Ok(Zeroizing::new(jwt.to_string()))
@@ -758,12 +759,15 @@ pub(crate) mod tests {
         let expired = jwt("system:serviceaccount:superbot:botd", -120);
         let pem = "-----BEGIN CERTIFICATE-----\nnot-a-jwt-but-private-looking-0123\n-----END CERTIFICATE-----\n";
         let missing = crate::db::temp_path("vault-jwt-missing").join("token");
+        let b64 = |v: Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string());
+        let fractional = format!("{}.{}.c2ln", b64(json!({ "alg": "RS256" })), b64(json!({ "sub": "botd", "exp": 1_700_000_000.5 })));
         for (file, err) in [
             (missing, "VAULT_JWT_FILE ("),
             (token_file("vault-jwt-empty", "\n"), "is empty"),
             (token_file("vault-jwt-pem", pem), "doesn't hold a JWT"),
             (token_file("vault-jwt-claims", "a.bm90LWpzb24.c"), "doesn't hold a JWT"),
             (token_file("vault-jwt-expired", &expired), "expired"),
+            (token_file("vault-jwt-fractional", &fractional), "expired"),
         ] {
             let s = vault(&url, &[("VAULT_AUTH", "jwt"), ("VAULT_JWT_ROLE", "botd"), ("VAULT_JWT_FILE", file.to_str().unwrap())], Duration::ZERO);
             let e = s.check().err().map(|e| e.to_string()).unwrap_or_default();

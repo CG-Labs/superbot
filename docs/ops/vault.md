@@ -82,19 +82,27 @@ SECRETS_BACKEND=vault
 VAULT_ADDR=https://vault.example.com:8200
 VAULT_AUTH=kubernetes
 VAULT_KUBERNETES_ROLE=superbot
+VAULT_KUBERNETES_TOKEN_FILE=/var/run/secrets/vault/token
 # VAULT_KUBERNETES_MOUNT=kubernetes
-# VAULT_KUBERNETES_TOKEN_FILE=/var/run/secrets/vault/token   # default: the pod's service account token
 ```
 
-Prefer a projected token with Vault's audience, mounted only into botd's container, over the default service account token:
+The role above asks for the audience `vault`, so give botd a projected token with that audience, mounted only into botd's container:
 
 ```yaml
-volumes:
-  - name: vault-token
-    projected:
-      sources:
-        - serviceAccountToken: { path: token, audience: vault, expirationSeconds: 3600 }
+spec:
+  serviceAccountName: botd
+  containers:
+    - name: botd
+      volumeMounts:
+        - { name: vault-token, mountPath: /var/run/secrets/vault, readOnly: true }
+  volumes:
+    - name: vault-token
+      projected:
+        sources:
+          - serviceAccountToken: { path: token, audience: vault, expirationSeconds: 3600 }
 ```
+
+Without `VAULT_KUBERNETES_TOKEN_FILE`, botd uses the pod's default service account token (`/var/run/secrets/kubernetes.io/serviceaccount/token`), whose audience is the Kubernetes API. That works only if the Vault role sets no `audience`.
 
 **JWT** (Vault checks the signature against an issuer it trusts: a cluster's OIDC issuer, GitHub Actions, SPIFFE, a cloud's workload identity):
 
