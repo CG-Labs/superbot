@@ -363,6 +363,12 @@ mod tests {
         assert_eq!(plan.id(), crate::adapters::install::plan(vec![claude, crate::adapters::install::install("hermes", None, None).unwrap()]).id());
     }
 
+    #[test]
+    fn only_admins_check_the_mirrors() {
+        let perm = crate::rbac::classify(&axum::http::Method::GET, "/api/machines/harness-mirror");
+        assert!(matches!(perm, crate::rbac::Perm::Admin));
+    }
+
     #[tokio::test]
     async fn the_check_fetches_everything_from_the_mirror_and_holds_it_to_the_pins() {
         let mirror = Mirror::serve().await;
