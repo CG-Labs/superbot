@@ -80,7 +80,7 @@ Pinning still checks only machines and backups (ADR 0129). A tenant whose plan h
 
 - A provider can hold a pinned tenant's model calls to endpoints in their region, fallbacks and Hermes's side tasks included, and show it from the audit log. The DPA's residency annex now says this, and still asks the provider to list the endpoints and their terms.
 - The guarantee is only as good as the operator's marks. botd checks that a route names a marked endpoint; it can't check the provider's terms or where a URL really resolves.
-- Pinned tenants can use only harnesses that take a named endpoint: Hermes Agent today. Claude Code and Codex routes are refused for them until those adapters can be pointed at a regional endpoint.
+- Pinned tenants can use only harnesses that take a named endpoint: Hermes Agent today. Claude Code and Codex routes are refused for them until those adapters can be pointed at a regional endpoint. (Since [ADR 0192](0192-in-region-claude-code-and-codex-routes.md) they can: a Claude Code route may name an `anthropic-messages` endpoint and a Codex route an `openai-responses` one.)
 - A pinned tenant on an open tier stops running. Operators who pin people on self-hosted servers need a managed tier with marked endpoints for them.
 
 ## Not covered
