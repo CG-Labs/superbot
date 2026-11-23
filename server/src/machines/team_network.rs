@@ -18,7 +18,7 @@ use crate::runner::App;
 use crate::AppState;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const DEFAULT_SUBNET: &str = "10.248.0.0/22";
 /// Where Linode lets a VPC subnet be: RFC 1918, but for 192.168.128.0/17, which its
@@ -87,8 +87,13 @@ fn team_part(team_id: &str) -> String {
     Sha256::digest(team_id.as_bytes()).iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
 
-fn prefix(cp: &ControlPlane) -> String {
-    format!("{}-team-", cp.label_prefix)
+/// The team part of a network label of ours, whatever MACHINE_LABEL_PREFIX was when it
+/// was made: a machine keeps its network after the prefix changes.
+fn team_part_of(label: &str) -> Option<&str> {
+    let (i, _) = label.rmatch_indices("-team-").next()?;
+    let rest = &label[i + "-team-".len()..];
+    let (t, region) = rest.split_once('-')?;
+    (t.len() == 12 && t.bytes().all(|b| b.is_ascii_hexdigit()) && !region.is_empty()).then_some(t)
 }
 
 /// The label of `team_id`'s network in `region`, or None if Linode wouldn't take it.
@@ -123,11 +128,11 @@ pub async fn ensure(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, 
 
 /// One pass: every machine of ours on a team network whose team its owner isn't on is
 /// taken off it. Anything else on a network, the team's own services, is left alone.
+/// Machines this powered off are powered on again once nothing has them to leave.
 pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
     let (Some(_), Some(p)) = (&cp.team_network, cp.provider.as_deref()) else { return json!({}) };
-    let prefix = prefix(cp);
-    let nets = match p.team_networks(&prefix).await {
-        Ok(n) => n,
+    let nets: Vec<(String, TeamNetwork)> = match p.team_networks("").await {
+        Ok(n) => n.into_iter().filter_map(|n| Some((team_part_of(&n.label)?.to_string(), n))).collect(),
         Err(e) => return json!({ "error": e.to_string() }),
     };
     let teams: HashMap<String, String> = app.db.teams().into_iter().map(|t| (team_part(&t.id), t.id)).collect();
@@ -138,18 +143,16 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
         .filter(|m| m.state != State::Destroyed && cp.owns(m))
         .filter_map(|m| Some((m.provider_id.clone()?, m)))
         .collect();
-    let (mut leaving, mut left, mut errors) = (0, 0, 0);
-    for n in &nets {
-        let team = n
-            .label
-            .strip_prefix(&prefix)
-            .and_then(|r| r.split_once('-'))
-            .and_then(|(t, _)| teams.get(t))
-            .cloned();
+    let (mut leaving, mut left, mut resumed, mut errors) = (0, 0, 0, 0);
+    let mut unseen = false;
+    let mut still_on: HashSet<String> = HashSet::new();
+    for (part, n) in &nets {
+        let team = teams.get(part).cloned();
         let members = match p.team_network_members(&n.id).await {
             Ok(m) => m,
             Err(_) => {
                 errors += 1;
+                unseen = true;
                 continue;
             }
         };
@@ -159,15 +162,31 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
                 continue;
             }
             match leave(app, cp, p, n, team.as_deref(), m, mem).await {
+                Leave::Left => {
+                    left += 1;
+                    continue;
+                }
                 Leave::Leaving => leaving += 1,
-                Leave::Left => left += 1,
                 Leave::Waiting => {}
                 Leave::Failed => errors += 1,
+            }
+            still_on.insert(m.id.clone());
+        }
+    }
+    // A network not looked at may still have a machine to take off: never power one on
+    // until every network has been.
+    if !unseen {
+        let waiting: Vec<String> = suspended(cp).iter().filter(|id| !still_on.contains(*id)).cloned().collect();
+        for id in waiting {
+            match resume(app, cp, &id).await {
+                Some(true) => resumed += 1,
+                Some(false) => errors += 1,
+                None => {}
             }
         }
     }
     let mut out = json!({});
-    for (k, v) in [("leaving", leaving), ("left", left), ("errors", errors)] {
+    for (k, v) in [("leaving", leaving), ("left", left), ("resumed", resumed), ("errors", errors)] {
         if v > 0 {
             out[k] = v.into();
         }
@@ -193,12 +212,12 @@ async fn leave(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, n: &T
             if super::act_if(app, cp, &by, &m.user_id, Step::Suspend, None, &still).await.is_err() {
                 return Leave::Failed;
             }
-            cp.network_suspended.lock().unwrap_or_else(|e| e.into_inner()).insert(m.id.clone());
+            suspended(cp).insert(m.id.clone());
             app.db.record(&event(&by, "machine.team_network_leaving", m, details()));
             Leave::Leaving
         }
         State::Suspended => {
-            let resume = {
+            {
                 let _g = cp.lock_ops().await;
                 if !app.db.machine(&m.id).is_some_and(|x| x.state == State::Suspended) {
                     return Leave::Waiting;
@@ -212,21 +231,37 @@ async fn leave(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, n: &T
                     app.db.record(&event(&by, "machine.team_network_left", m, d).outcome(Outcome::Failure));
                     return Leave::Failed;
                 }
-                let resume = cp.network_suspended.lock().unwrap_or_else(|e| e.into_inner()).remove(&m.id);
                 let mut d = details();
-                d["resuming"] = json!(resume);
+                d["resuming"] = json!(suspended(cp).contains(&m.id));
                 app.db.record(&event(&by, "machine.team_network_left", m, d));
-                resume
-            };
-            if resume {
-                let still = |x: &Machine| x.id == m.id && x.state == State::Suspended;
-                let _ = super::act_if(app, cp, &by, &m.user_id, Step::Resume, None, &still).await;
             }
             Leave::Left
         }
         // Being made, being destroyed or in error: once it is suspended or gone.
         _ => Leave::Waiting,
     }
+}
+
+fn suspended(cp: &ControlPlane) -> std::sync::MutexGuard<'_, HashSet<String>> {
+    cp.network_suspended.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Powers on machine `id`, which the sweep powered off and which has nothing left to
+/// leave. Some(true) once on, Some(false) if that failed (kept, to try again next pass),
+/// None if there was nothing to do: gone, or someone else already powered it on.
+async fn resume(app: &AppState, cp: &ControlPlane, id: &str) -> Option<bool> {
+    let m = app.db.machine(id).filter(|m| m.state == State::Suspended);
+    let Some(m) = m else {
+        suspended(cp).remove(id);
+        return None;
+    };
+    let still = |x: &Machine| x.id == m.id && x.state == State::Suspended;
+    let _ = super::act_if(app, cp, &system(&m), &m.user_id, Step::Resume, None, &still).await;
+    let on = app.db.machine(id).is_none_or(|x| x.state != State::Suspended);
+    if on {
+        suspended(cp).remove(id);
+    }
+    Some(on)
 }
 
 #[cfg(test)]
@@ -236,6 +271,18 @@ mod tests {
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> String {
         let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         move |k: &str| m.get(k).cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn a_networks_team_is_read_from_its_label_under_any_prefix() {
+        let t = team_part("team-1");
+        for prefix in ["superbot", "old-team-bot", "x"] {
+            let l = label(prefix, "team-1", "gb-lon").unwrap();
+            assert_eq!(team_part_of(&l), Some(t.as_str()), "{l}");
+        }
+        for l in ["superbot-team-abc-gb-lon", "superbot-team-0123456789ab", "office-vpc", "superbot-team-0123456789ag-gb-lon"] {
+            assert_eq!(team_part_of(l), None, "{l}");
+        }
     }
 
     #[test]

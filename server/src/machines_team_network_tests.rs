@@ -146,7 +146,7 @@ async fn a_teams_machines_share_a_network_of_their_own_and_leave_it_with_the_tea
     assert_eq!((leaving.len(), leaving[0]["targetId"].as_str()), (1, Some(machine(&env, &dee).id.as_str())));
     assert_eq!((leaving[0]["details"]["team"].as_str(), leaving[0]["details"]["ownersTeam"].as_str()), (Some(globex.as_str()), None));
     let r = reconcile(&env).await;
-    assert_eq!(r["teamNetworks"], json!({ "left": 1 }), "{r}");
+    assert_eq!(r["teamNetworks"], json!({ "left": 1, "resumed": 1 }), "{r}");
     assert_eq!(env.fake.network_of(&pid(&env, &dee)), None);
     let left = events(&env, "machine.team_network_left").await;
     assert_eq!((left.len(), left[0]["details"]["resuming"].as_bool()), (1, Some(true)), "{left:?}");
@@ -171,6 +171,46 @@ async fn a_teams_machines_share_a_network_of_their_own_and_leave_it_with_the_tea
         m.sort();
         m
     });
+}
+
+#[tokio::test]
+async fn a_machine_powered_off_to_leave_is_powered_on_again_whatever_happens_meanwhile() {
+    let env = serve().await;
+    let (ada, _) = user_with(env.port, &env.admin, "ada@example.com", "member").await;
+    let (al, _) = user_with(env.port, &env.admin, "al@example.com", "member").await;
+    let (bo, _) = user_with(env.port, &env.admin, "bo@example.com", "member").await;
+    let acme = team(&env, "Acme", "ada@example.com").await;
+    join(&env, &acme, &al).await;
+    join(&env, &acme, &bo).await;
+    for uid in [&ada, &al, &bo] {
+        ask(&env, uid).await;
+    }
+    let net = env.fake.network_of(&pid(&env, &ada)).unwrap();
+    let leave = async |uid: &str| assert!(matches!(json_call(&env, "DELETE", &format!("/api/teams/{acme}/members/{uid}"), "").await.0, 200 | 204));
+
+    // Made under another MACHINE_LABEL_PREFIX: its machines still leave it.
+    let old = env.fake.networks().into_iter().find(|n| n.id == net).unwrap().label.replacen("superbot", "oldbot", 1);
+    env.fake.relabel_network(&net, &old);
+
+    // Al rejoins before he is taken off: his machine is powered on, still on the network.
+    leave(&al).await;
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "leaving": 1 }));
+    assert_eq!(machine(&env, &al).state, State::Suspended);
+    join(&env, &acme, &al).await;
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "resumed": 1 }));
+    assert_eq!(machine(&env, &al).state, State::Running);
+    assert_eq!(env.fake.network_of(&pid(&env, &al)).as_deref(), Some(net.as_str()));
+
+    // Bo's machine won't boot at first: it is tried again until it does.
+    leave(&bo).await;
+    reconcile(&env).await;
+    env.fake.fail_next("boot", crate::machines::provider::ProviderError::Api { status: 500, message: "try later".into() });
+    let r = reconcile(&env).await;
+    assert_eq!(r["teamNetworks"], json!({ "left": 1, "errors": 1 }), "{r}");
+    assert_eq!((machine(&env, &bo).state, env.fake.network_of(&pid(&env, &bo))), (State::Suspended, None));
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "resumed": 1 }));
+    assert_eq!(machine(&env, &bo).state, State::Running);
+    assert!(reconcile(&env).await.get("teamNetworks").is_none(), "nothing left to do");
 }
 
 #[tokio::test]

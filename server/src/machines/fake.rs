@@ -233,6 +233,11 @@ impl Fake {
         self.state.lock().unwrap().networks.get_mut(id).unwrap().members.insert(member.into());
     }
 
+    /// As if network `id` was made under another label, e.g. another MACHINE_LABEL_PREFIX.
+    pub fn relabel_network(&self, id: &str, label: &str) {
+        self.state.lock().unwrap().networks.get_mut(id).unwrap().label = label.into();
+    }
+
     /// `plan`'s disk is `bytes` (None: the provider can't say).
     pub fn set_plan_disk(&self, plan: &str, bytes: Option<u64>) {
         self.state.lock().unwrap().disks.insert(plan.into(), bytes);
