@@ -29,7 +29,7 @@ With `GOOGLE_DIRECTORY_SYNC=on`, botd reads the directory every `GOOGLE_DIRECTOR
 
 There is no second implementation of provisioning. Roles (`SCIM_DEFAULT_ROLE`, never admin), the seat check, email conflicts (409, never matching on email), deprovisioning (sessions, routines, Bots, machine), restoring a deleted user by `externalId`, linking the SSO identity, team joins and leaves, group-to-role grants, and every audit event are SCIM's, for free and for good.
 
-The sync's writes go into one SCIM tenant, `GOOGLE_DIRECTORY_TENANT` (`google` by default), with the audit actor `scim:google-directory` and method `google_directory`. With `GOOGLE_DIRECTORY_SSO` (which must be a `google` provider), the tenant links each user's identity at that provider with the Directory id as subject, as `--sso` does for a token.
+The sync's writes go into one SCIM tenant, `GOOGLE_DIRECTORY_TENANT` (`google` by default), with the audit actor `scim:google-directory` and method `google_directory`. With `GOOGLE_DIRECTORY_SSO` (which must be a `google` provider), the tenant links each user's identity at that provider with the Directory id as subject, as `--sso` does for a token. SCIM links only the users it creates, so each pass also links users already in the tenant who lack it (as when `GOOGLE_DIRECTORY_SSO` is set after the first pass), audited as `user.identity_linked`.
 
 Unchanged people get no write: the plan compares SCIM's parse of the body it would send with the user as stored. A team is updated only if its name or members differ. Team groups are applied in two steps, removals then additions, so someone who moved between two team groups is moved in one pass. A person is on one team at most, so the first team group listed wins, and someone on a team the sync doesn't manage stays there (SCIM's own rule). A team group removed from the setting is deleted from the tenant as a SCIM group `DELETE` would be.
 
@@ -41,13 +41,13 @@ Two writers to one tenant would undo each other. botd refuses to start if a live
 
 A pass that can't read **everything** changes nobody. That covers a key that is missing or invalid, a refused token, a network error, any non-2xx answer, a group that doesn't exist (404), an answer without the expected `kind`, a page whose list isn't a list, a person without an id or a valid email, a page token that repeats, more than 2,000 pages, or a page over 16 MiB. A partial read would look like people leaving. Google omits empty lists, so the `kind` check is what tells "no members" from "not a members answer".
 
-Two guards stop a pass that read fine but would do damage. It may not remove or disable more than `GOOGLE_DIRECTORY_MAX_REMOVALS` people (10 by default; a deactivation of someone active, or a delete of someone active, counts). And it may not leave the tenant with nobody active when it has people (an empty group, or the wrong one). Either stops the pass before any write, audited as `denied`. An admin who has checked Google runs `botctl scim google sync --force`.
+Two guards stop a pass that read fine but would do damage. It may not remove or disable more than `GOOGLE_DIRECTORY_MAX_REMOVALS` people (10 by default; a deactivation of someone active, or a delete of someone active, counts). And it may not leave the tenant with nobody active when it has active people (an empty group, or the wrong one), counting who stays active here: held people don't. Either stops the pass before any write, audited as `denied`. Removals come last, and if earlier writes failed so that nobody would stay active, they wait too. An admin who has checked Google runs `botctl scim google sync --force`.
 
-A failed pass is tried again after 5 minutes (or the interval, if shorter). The last pass and the last good pass are in `GET /api/scim/google` and `botctl scim google`.
+A failed pass, or one with failed writes, is tried again after 5 minutes (or the interval, if shorter). The last pass and the last good pass are in `GET /api/scim/google` and `botctl scim google`.
 
 ### An admin's disable holds
 
-SCIM lets the IdP re-enable someone an admin disabled. A token-based IdP decides that, and its admins can see it. A pull every 30 minutes would silently undo an admin's emergency disable, so the sync is stricter. It enables a disabled user only if the newest event that disabled them was the sync's own (`user.disabled` or `scim.user_deleted` by `scim:google-directory`). An admin's disable, or one the audit log no longer shows, holds. The pass sends `active: false` for them and lists them as `held`. Enabling them by hand hands them back to the sync. This needs no new table: the audit log already records who disabled whom.
+SCIM lets the IdP re-enable someone an admin disabled. A token-based IdP decides that, and its admins can see it. A pull every 30 minutes would silently undo an admin's emergency disable, so the sync is stricter. It enables a disabled user only if the newest event that disabled them was the sync's own (`user.disabled` or `scim.user_deleted` by `scim:google-directory`). Taking a user back or on (`scim.user_restored`, `scim.user_linked`) changes no status by itself, so the search goes on past it. An admin's disable, or one the audit log no longer shows, holds. The pass sends `active: false` for them and lists them as `held`. Enabling them by hand hands them back to the sync. This needs no new table: the audit log already records who disabled whom.
 
 ### The key is a server secret
 
@@ -55,7 +55,7 @@ The service account's JSON key is `GOOGLE_DIRECTORY_CREDENTIALS`: `botctl secret
 
 ### Audit
 
-Each change is SCIM's own events by `scim:google-directory`. Each pass is `scim.google_sync` (target `scim_tenant:<tenant>`). On **success** it carries what was created, updated, enabled, disabled, deleted, held, skipped (suspended people who never had an account), outside the domain, and the team changes. On **failure** it carries `reason` and `detail` when nobody was changed, or the failed SCIM writes (`failed`, `failures`, at most 50, each also `scim.request_failed`). It is **denied** when a guard stopped it. An admin's request is `scim.google_sync_requested` (with `force`) by that admin, before the pass.
+Each change is SCIM's own events by `scim:google-directory`. Each pass is `scim.google_sync` (target `scim_tenant:<tenant>`). On **success** it carries what was created, updated, enabled, disabled, linked, deleted, held, skipped (suspended people who never had an account), outside the domain, and the team changes. On **failure** it carries `reason` and `detail` when nobody was changed, or the failed SCIM writes (`failed`, `failures`, at most 50, each also `scim.request_failed`). It is **denied** when a guard stopped it. An admin's request is `scim.google_sync_requested` (with `force`) by that admin, before the pass.
 
 ### Off by default, admins only
 

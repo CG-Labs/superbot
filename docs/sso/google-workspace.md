@@ -35,7 +35,7 @@ The service account then acts as an admin you name in `GOOGLE_DIRECTORY_ADMIN`. 
 ## 3. Choose the groups
 
 - **Who gets an account**: one or more groups, e.g. `superbot-users@example.com`. Nested groups count. Members from outside your Workspace never get one. A group with everyone in your organization as a member gives everyone an account.
-- **Teams** (optional, needs `SCIM_GROUPS=on`): groups that become SuperBot teams, e.g. `eng@example.com`. Their members get an account too. A person is on one team at most: if they are in two team groups, the first one listed wins.
+- **Teams** (optional, needs `SCIM_GROUPS=on`): groups that become SuperBot teams, e.g. `eng@example.com`. Their members get an account too. A person is on one team at most: if they are in two team groups, the first one listed wins. Two addresses of one Google group are one team.
 
 ## 4. Configure SuperBot
 
@@ -90,18 +90,18 @@ With `GOOGLE_DIRECTORY_SSO`, have someone in the group sign in with Google: they
 
 | In Google | In SuperBot |
 |-----------|-------------|
-| Someone is in a chosen group | A user with `SCIM_DEFAULT_ROLE`, keyed by their Directory id (never their email). With `GOOGLE_DIRECTORY_SSO`, their Google sign-in is linked |
+| Someone is in a chosen group | A user with `SCIM_DEFAULT_ROLE`, keyed by their Directory id (never their email). With `GOOGLE_DIRECTORY_SSO`, their Google sign-in is linked, also for users the tenant had before it was set |
 | Their name or primary email changes | The user is updated |
 | They are suspended or archived | The user is disabled, their sessions end, their Bots' runs stop, and their machine is suspended, as with SCIM ([ADR 0124](../adr/0124-deprovisioning-stops-bots-and-machines.md)) |
 | They are active again | The user is enabled again, if the sync disabled them (below) |
 | They leave every chosen group, or are deleted | The user is deleted from the tenant as with a SCIM `DELETE`: disabled, nothing destroyed. Added back, they return as the same user |
 | A team group's members change | People join and leave its team. A renamed group renames its team |
-| A team group leaves `GOOGLE_DIRECTORY_TEAM_GROUPS` | Its people leave the team, as when an IdP deletes a SCIM group |
+| A team group leaves `GOOGLE_DIRECTORY_TEAM_GROUPS` | Its people leave the team, as when an IdP deletes a SCIM group, and join the team of any other team group they're in, in the same pass |
 | A suspended person never had an account | Nothing: no account is made for them |
 
 **An admin's disable holds.** Google decides name, email, and who has access, with one exception. If an admin disables someone in SuperBot, the sync leaves them disabled even while Google has them active. It only enables people it disabled itself; if the audit log no longer shows who disabled someone, they stay disabled too. Each pass lists them as `held`. To let the sync manage them again, enable them (`botctl user enable` or the admin portal).
 
-**Fail-closed.** A pass that can't sign in, reach Google, find a group, or read every page of a list changes nobody, and the next pass tries again (in 5 minutes at most). So does a pass that would remove or disable more than `GOOGLE_DIRECTORY_MAX_REMOVALS` people, or everyone in the tenant, which is what an empty answer looks like. Check the groups in Google, then run `botctl scim google sync --force`.
+**Fail-closed.** A pass that can't sign in, reach Google, find a group, or read every page of a list changes nobody, and the next pass tries again (in 5 minutes at most, as after a pass with failed writes). So does a pass that would remove or disable more than `GOOGLE_DIRECTORY_MAX_REMOVALS` people, or leave nobody active in the tenant (people an admin disabled don't count as active), which is what an empty answer looks like. Removals come last, and wait too if earlier writes failed and nobody would stay active. Check the groups in Google, then run `botctl scim google sync --force`.
 
 **One person, one user.** Email never matches people. If a SuperBot user already has someone's email, that person's create fails (and is listed in the pass) until you link that user's Google identity (`botctl user link <user> <google provider> <directory id>`) or change one of the emails. The owner account is never managed.
 
@@ -109,7 +109,7 @@ With `GOOGLE_DIRECTORY_SSO`, have someone in the group sign in with Google: they
 
 Every change is audited as the SCIM events of the [SCIM guide](scim.md), with the actor `scim:google-directory`, method `google_directory`. Each pass is also `scim.google_sync` (target `scim_tenant:<tenant>`):
 
-- **success**: what it did: `created`, `updated`, `enabled`, `disabled`, `deleted`, `held`, `skippedSuspended`, `outsideDomain`, `teams`, how long it took, and what started it (`schedule` or `admin`, with `force`).
+- **success**: what it did: `created`, `updated`, `enabled`, `disabled`, `linked`, `deleted`, `held`, `skippedSuspended`, `outsideDomain`, `teams`, how long it took, and what started it (`schedule` or `admin`, with `force`).
 - **failure**: the `reason` and `detail` when nobody was changed, or the SCIM writes that failed (`failed`, `failures`; each also `scim.request_failed`).
 - **denied**: too many removals (`too_many_removals`, `would_remove_everyone`).
 
