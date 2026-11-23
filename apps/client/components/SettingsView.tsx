@@ -10,7 +10,7 @@ import { TwoFactorCard, type MfaApi } from "./TwoFactor";
 
 interface Props {
   onBack: () => void;
-  /** The signed-in server, for this phone's push notifications (ADR 0080), your second factor (ADR 0094) and your data's residency pin (ADR 0166). */
+  /** The signed-in server, for this phone's push notifications (ADR 0080), your second factor (ADR 0094) and your data's residency pin (ADR 0168). */
   api?: PushApi & MfaApi & ResidencyApi;
   /** Admins also set who must use two-factor authentication. */
   admin?: boolean;

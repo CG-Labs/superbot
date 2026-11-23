@@ -1,8 +1,8 @@
-# 0166: Residency in the app
+# 0168: Residency in the app
 
 ## Status
 
-Accepted (23 Nov 2026). The fourth slice of [#58](https://github.com/CG-Labs/superbot/issues/58) (M5, "Contractual data residency"). Builds on [ADR 0129](0129-contractual-data-residency.md) (residency pins), [ADR 0139](0139-in-region-model-routes.md) (in-region model routes), [ADR 0155](0155-residency-reports.md) (residency reports) and [ADR 0087](0087-team-accounts-and-machines.md) (teams). 0166 was reserved for this work.
+Accepted (23 Nov 2026). The fourth slice of [#58](https://github.com/CG-Labs/superbot/issues/58) (M5, "Contractual data residency"). Builds on [ADR 0129](0129-contractual-data-residency.md) (residency pins), [ADR 0139](0139-in-region-model-routes.md) (in-region model routes), [ADR 0155](0155-residency-reports.md) (residency reports) and [ADR 0087](0087-team-accounts-and-machines.md) (teams). 0168 was reserved for this work.
 
 ## Context
 

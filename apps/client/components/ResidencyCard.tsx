@@ -16,7 +16,7 @@ interface Props {
 }
 
 /**
- * The residency pin on your data (ADR 0166): where it must stay, whether it does, and the
+ * The residency pin on your data (ADR 0168): where it must stay, whether it does, and the
  * residency report to download. Nothing shows when nothing pins your data.
  */
 export function ResidencyCard({ api, save = saveCsv }: Props) {

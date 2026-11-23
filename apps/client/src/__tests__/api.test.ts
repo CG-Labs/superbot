@@ -354,7 +354,7 @@ describe("two-factor sign-in (ADR 0094)", () => {
   });
 });
 
-describe("your data's residency (ADR 0166)", () => {
+describe("your data's residency (ADR 0168)", () => {
   const realFetch = globalThis.fetch;
   afterEach(() => {
     globalThis.fetch = realFetch;

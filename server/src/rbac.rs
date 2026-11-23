@@ -322,7 +322,7 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         // Your own plan (ADR 0033). Every tier with its models is `tiers`, for admins.
         ("GET", ["me", "tier"]) => Read,
         ("GET", ["me", "usage"]) => Read,
-        // The residency pin on your own data, and its report (ADR 0166). Handlers refuse
+        // The residency pin on your own data, and its report (ADR 0168). Handlers refuse
         // Bots, and give a team's report only to its owners and admins.
         ("GET", ["me", "residency"] | ["me", "residency", "report"]) => Account,
         // Your own plan, and buying or managing it (ADR 0042). Handlers refuse Bots.

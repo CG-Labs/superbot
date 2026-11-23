@@ -1,4 +1,4 @@
-//! Residency for the people a pin holds (ADR 0166): the pin on their data, shown in the
+//! Residency for the people a pin holds (ADR 0168): the pin on their data, shown in the
 //! app, and the residency report (ADR 0155) on it, fetched by themselves. Your own pin's
 //! report is yours; your team's pin's report, which covers every member, is for the
 //! team's owners and admins, who already see its members' machines (ADR 0087). A pin's

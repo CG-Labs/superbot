@@ -527,7 +527,7 @@ export class SuperBotApi {
     }
   }
 
-  /** The residency pin on your data (ADR 0166). null from servers before it. */
+  /** The residency pin on your data (ADR 0168). null from servers before it. */
   async myResidency(): Promise<MyResidency | null> {
     try {
       return await this.request<MyResidency>("GET", "/api/me/residency");

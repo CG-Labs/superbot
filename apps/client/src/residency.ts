@@ -4,7 +4,7 @@ function day(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
 }
 
-/** What the residency card says about a pin (ADR 0166): whose it is, where your data is against it, and what isn't held. */
+/** What the residency card says about a pin (ADR 0168): whose it is, where your data is against it, and what isn't held. */
 export function residencyLines(v: MyResidency): { lines: string[]; warnings: string[] } {
   const p = v.pin;
   if (!p) return { lines: [], warnings: [] };

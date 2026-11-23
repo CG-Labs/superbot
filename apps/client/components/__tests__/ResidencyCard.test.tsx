@@ -23,7 +23,7 @@ function fakeApi(v: MyResidency | null) {
   };
 }
 
-describe("ResidencyCard (ADR 0166)", () => {
+describe("ResidencyCard (ADR 0168)", () => {
   it("shows nothing when nothing pins your data, or the server is from before it", async () => {
     for (const v of [null, { pin: null, ownPin: null, reports: [] }]) {
       const api = fakeApi(v as MyResidency | null);

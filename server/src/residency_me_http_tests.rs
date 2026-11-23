@@ -1,4 +1,4 @@
-//! Residency in the app (ADR 0166): the people a pin holds see it, and fetch the
+//! Residency in the app (ADR 0168): the people a pin holds see it, and fetch the
 //! residency report (ADR 0155) on their own pin, or on their team's as its owner or an
 //! admin. On the real router, with the in-memory provider for Linode.
 

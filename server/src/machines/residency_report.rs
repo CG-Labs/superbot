@@ -2,7 +2,7 @@
 //! now, what in the period the pin refused or held to its region, and what it doesn't
 //! cover, as JSON or Markdown, sealed with a SHA-256 digest a customer can check. Admins
 //! only, by RBAC's default arm; the people a pin holds get theirs from the app through
-//! `residency_me` (ADR 0166). Each report is audited as `residency.report_generated`.
+//! `residency_me` (ADR 0168). Each report is audited as `residency.report_generated`.
 
 use super::ControlPlane;
 use super::residency::{self, PINNED};
@@ -359,7 +359,7 @@ pub(super) fn query(q: &HashMap<String, String>, now: i64) -> Result<(bool, i64,
 }
 
 /// The report on `p` in the format `q` asks for, audited. `self_service`: asked for by
-/// someone the pin holds, from the app (ADR 0166), not by an admin.
+/// someone the pin holds, from the app (ADR 0168), not by an admin.
 pub(super) fn respond(app: &App, cp: &ControlPlane, by: &Who, p: &ResidencyPin, q: &HashMap<String, String>, self_service: bool) -> Result<Response, ApiError> {
     let now = crate::db::now();
     let (md, from, to) = query(q, now)?;

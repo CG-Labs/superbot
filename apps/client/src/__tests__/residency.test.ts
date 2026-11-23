@@ -16,7 +16,7 @@ function view(over: Partial<MyResidency> = {}): MyResidency {
   };
 }
 
-describe("residencyLines (ADR 0166)", () => {
+describe("residencyLines (ADR 0168)", () => {
   it("says nothing when nothing pins your data", () => {
     expect(residencyLines(view({ pin: null }))).toEqual({ lines: [], warnings: [] });
   });

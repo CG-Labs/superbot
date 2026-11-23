@@ -1170,7 +1170,7 @@ export interface OffboardingPreview {
   work: { machines: WorkPolicy | null; accounts: WorkPolicy | null };
 }
 
-/** The residency pin on your data, and where your data is against it (`GET /api/me/residency`, ADR 0166). */
+/** The residency pin on your data, and where your data is against it (`GET /api/me/residency`, ADR 0168). */
 export interface MyResidency {
   /** Your team's pin, else your own; null when nothing pins your data. */
   pin: {
