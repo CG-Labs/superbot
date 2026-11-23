@@ -20,7 +20,7 @@
 //! - Each lease is asked for with the longest the run may last (`RUN_TIMEOUT_MINUTES`),
 //!   so a backend whose leases end with something else (Vault's with botd's token) can
 //!   make sure that lives as long, or refuse the run.
-//! - With `AWS_RUN_CREDENTIALS` (ADR 0190) the leases are STS `AssumeRole` sessions,
+//! - With `AWS_RUN_CREDENTIALS` (ADR 0194) the leases are STS `AssumeRole` sessions,
 //!   which nothing can revoke: at run end they are audited as `secret.lease_released`
 //!   with when they expire, and their values stay redacted until then.
 
@@ -141,7 +141,7 @@ pub const VAULT: Syntax = Syntax {
 /// The variables AWS's SDKs and CLI read, and the fields of an STS session they come from.
 const AWS_KEYS: [(&str, &str); 3] = [("AWS_ACCESS_KEY_ID", "AccessKeyId"), ("AWS_SECRET_ACCESS_KEY", "SecretAccessKey"), ("AWS_SESSION_TOKEN", "SessionToken")];
 
-/// `AWS_RUN_CREDENTIALS` (ADR 0190): IAM roles botd assumes with STS for each run.
+/// `AWS_RUN_CREDENTIALS` (ADR 0194): IAM roles botd assumes with STS for each run.
 pub const AWS: Syntax = Syntax {
     key: "AWS_RUN_CREDENTIALS",
     what: "an IAM role's ARN like \"arn:aws:iam::123456789012:role/superbot-bots\" (with {owner} for the Bot owner's id in the role's name)",

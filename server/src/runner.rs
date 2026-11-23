@@ -1257,7 +1257,7 @@ impl App {
                 attempt_span.set("gen_ai.request.model", m);
             }
             let _traced = trace::run_attempt(&run_id, &attempt_span);
-            // A run stops when its first STS session expires, if that comes first (ADR 0190).
+            // A run stops when its first STS session expires, if that comes first (ADR 0194).
             let (timeout, credentials_end) = match leases.expires_first().map(|at| at.saturating_duration_since(Instant::now())) {
                 Some(left) if left < self.cfg.run_timeout => (left, true),
                 _ => (self.cfg.run_timeout, false),

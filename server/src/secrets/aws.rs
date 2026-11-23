@@ -10,7 +10,7 @@
 //! keys are renewed two thirds of the way through their life, and once more whenever
 //! Secrets Manager says they have expired.
 //!
-//! It is also the `leases::Issuer` of `AWS_RUN_CREDENTIALS` (ADR 0190): an STS
+//! It is also the `leases::Issuer` of `AWS_RUN_CREDENTIALS` (ADR 0194): an STS
 //! `AssumeRole` session for each run, signed with the same keys, named after the Bot so
 //! CloudTrail shows whose run did what, and lasting as long as the longest run.
 
@@ -590,7 +590,7 @@ impl Inner {
         unreachable!("the second pass returns")
     }
 
-    /// A new STS session as `role_arn` for one run of `bot_id` (ADR 0190), lasting
+    /// A new STS session as `role_arn` for one run of `bot_id` (ADR 0194), lasting
     /// `run_for` (at least STS's 15 minutes), signed with botd's own keys. When STS says
     /// those have lapsed, gets new ones and asks once more.
     async fn assume_role(&self, role_arn: &str, fields: &[String], run_for: Duration, bot_id: &str) -> Result<Lease, Error> {

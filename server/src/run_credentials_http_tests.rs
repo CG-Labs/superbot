@@ -4,7 +4,7 @@
 //! a saved secret of that name; a lease that can't be made refuses the run, audited as
 //! `secrets_unavailable`, and the Bot says so. A plan's model provider key may come only
 //! from a lease; if that lease gives it empty, the run is refused. A run whose lease
-//! can't be revoked (an STS session, ADR 0190) stops when it expires.
+//! can't be revoked (an STS session, ADR 0194) stops when it expires.
 
 use crate::acl::Visibility;
 use crate::secrets::leases::tests::{fake, set_for_owner, wait_for};

@@ -194,7 +194,7 @@ botd's access above already covers them on Azure and Google; on AWS, add `superb
 
 ## Short-lived AWS credentials for each run
 
-Off by default ([ADR 0190](../adr/0190-sts-sessions-for-each-run.md)); only with `SECRETS_BACKEND=aws`. With `AWS_RUN_CREDENTIALS`, botd assumes an IAM role with STS (`AssumeRole`) as each run starts and gives the run that session's keys. A key a Bot leaks stops working soon after its run. No Vault is needed; for Vault's engines, see [Vault](vault.md#short-lived-credentials-for-each-run).
+Off by default ([ADR 0194](../adr/0194-sts-sessions-for-each-run.md)); only with `SECRETS_BACKEND=aws`. With `AWS_RUN_CREDENTIALS`, botd assumes an IAM role with STS (`AssumeRole`) as each run starts and gives the run that session's keys. A key a Bot leaks stops working soon after its run. No Vault is needed; for Vault's engines, see [Vault](vault.md#short-lived-credentials-for-each-run).
 
 Make a role for the Bots, with only what they need, that botd's identity may assume:
 
