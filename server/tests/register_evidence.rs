@@ -109,7 +109,7 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
     let dir = temp();
     write(&dir, "register.json", &register());
     write(&dir, "baseline-a.json", &baseline("2026-10-05T10:00:00Z", &["TEAMS"]));
-    write(&dir, "baseline-b.json", &baseline("2026-10-06T10:00:00Z", &["AUTH_MFA"]));
+    write(&dir, "baseline-b.json", &baseline("2026-11-01T00:00:05Z", &["AUTH_MFA"]));
     let pol = policies();
     let o = evidence(&dir, &[&["register", "register.json", "--policies", pol.to_str().unwrap(), "--baseline", "baseline-a.json", "--baseline", "baseline-b.json", "-o", "register.tar"][..], &PERIOD].concat());
     let out = text(&o);
@@ -194,7 +194,7 @@ fn a_register_that_doesnt_hold_together_or_a_baseline_from_another_month_writes_
     assert!(!dir.join("out.tar").exists());
 
     write(&dir, "register.json", &register());
-    write(&dir, "old.json", &baseline("2026-09-30T23:59:59Z", &[]));
+    write(&dir, "old.json", &baseline("2026-11-08T00:00:00Z", &[]));
     let o = evidence(&dir, &[&["register", "register.json", "--baseline", "old.json", "-o", "out.tar"][..], &PERIOD].concat());
     assert!(o.status.code() == Some(1) && text(&o).contains("outside the period"), "{}", text(&o));
     assert!(!dir.join("out.tar").exists());

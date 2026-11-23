@@ -50,6 +50,9 @@ pub const QUARTER_DAYS: i64 = 92;
 pub const GRACE_DAYS: i64 = 30;
 /// An exception's end is at most a year after its approval.
 pub const MAX_EXCEPTION_DAYS: i64 = 365;
+/// A baseline check may be from up to this long after the period: botd's monthly bundle,
+/// whose `baseline.json` this is, is made after its month ends (coverage warns past 7 days).
+pub const BASELINE_LATE_DAYS: i64 = 7;
 
 /// Each file and the criteria and checklist rows it can be evidence for. The manifest maps
 /// a file to a row only while the register holds a current record for it (a role filled
@@ -471,6 +474,9 @@ pub fn parse(bytes: &[u8], policies: &[Policy]) -> Result<Register, String> {
         if let Some(by) = &x.accepted_by {
             known(&what, by, &mut bad);
         }
+        if x.accepted_at.is_some_and(|a| a < x.identified) || x.accepted_until.is_some_and(|u| x.accepted_at.is_none_or(|a| u <= a)) {
+            bad.push(format!("{what}: acceptedAt can't be before identified, and acceptedUntil comes after acceptedAt"));
+        }
         if x.closed.is_some_and(|c| c < x.identified) || x.reviewed.iter().any(|d| *d < x.identified) {
             bad.push(format!("{what}: reviewed and closed can't be before identified"));
         }
@@ -540,8 +546,8 @@ pub fn baseline(file: &str, bytes: &[u8], p: &Period) -> Result<Baseline, String
     let v: Value = serde_json::from_slice(bytes).map_err(|_| format!("{file} isn't JSON: give `botctl evidence baseline json`'s output, or baseline.json from an evidence bundle"))?;
     let at = v["checkedAt"].as_str().ok_or(format!("{file} doesn't say when it was checked (checkedAt): is it a baseline check?"))?;
     let t = chrono::DateTime::parse_from_rfc3339(at).map_err(|_| format!("{file}: checkedAt isn't a time"))?.with_timezone(&chrono::Utc);
-    if t.timestamp_millis() < p.start_ms() || t.timestamp_millis() >= p.end_ms() {
-        return Err(format!("{file} was checked at {at:.40}, outside the period {} to {}", p.from, p.to));
+    if t.timestamp_millis() < p.start_ms() || t.timestamp_millis() >= p.end_ms() + BASELINE_LATE_DAYS * 86_400_000 {
+        return Err(format!("{file} was checked at {at:.40}, outside the period {} to {} (or the {BASELINE_LATE_DAYS} days after it, when its evidence bundle is made)", p.from, p.to));
     }
     let excepted = v["exceptions"]["excepted"].as_array().ok_or(format!("{file} has no exceptions.excepted list: is it a baseline check?"))?;
     let excepted: Vec<String> = excepted.iter().map(|s| s.as_str().filter(|s| setting_name(s)).map(String::from).ok_or(format!("{file}: an excepted setting isn't a setting's name"))).collect::<Result<_, _>>()?;
@@ -600,8 +606,11 @@ impl Check<'_> {
         self.r.roles.iter().filter(move |x| x.role == role && x.from <= d && x.until.is_none_or(|u| d < u))
     }
 
-    /// The role, of `roles`, that `person` held or deputised on `d`.
+    /// The role, of `roles`, that `person` held or deputised on `d`, while personnel.
     fn held(&self, person: &str, roles: &[&str], d: NaiveDate) -> Option<String> {
+        if !self.personnel_on(person, d) {
+            return None;
+        }
         roles.iter().find_map(|role| {
             self.assignments_on(role, d).find_map(|x| {
                 if x.holder == person {
@@ -823,7 +832,7 @@ impl Check<'_> {
     pub fn risks(&self) -> (Value, Vec<&'static str>) {
         let cut = self.cut();
         let open: Vec<&Risk> = self.r.risks.iter().filter(|x| x.identified < cut && x.closed.is_none_or(|c| c >= cut)).collect();
-        let (mut overdue, mut unapproved, mut no_date, mut lapsed, mut no_controls) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut overdue, mut unapproved, mut not_accepted, mut no_date, mut lapsed, mut no_controls) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut out = Vec::new();
         for x in &open {
             let last = x.reviewed.iter().copied().filter(|d| *d < cut).max().unwrap_or(x.identified).max(x.identified);
@@ -832,10 +841,16 @@ impl Check<'_> {
             }
             let score = x.likelihood * x.impact;
             let above = self.r.risk_appetite.is_none_or(|a| score > a);
+            let acceptance = x.accepted_by.as_deref().zip(x.accepted_at).filter(|(_, at)| *at < cut);
             if x.treatment == "accept" {
-                let by = x.accepted_by.as_deref().zip(x.accepted_at).and_then(|(by, at)| self.held(by, &["Management"], at));
-                if above && by.is_none() {
+                let management = acceptance.and_then(|(by, at)| self.held(by, &["Management"], at));
+                let owner = acceptance.and_then(|(by, at)| self.held(by, &[x.owner.as_str()], at));
+                if acceptance.is_none() {
+                    not_accepted.push(json!(x.id));
+                } else if above && management.is_none() {
                     unapproved.push(json!(x.id));
+                } else if !above && management.is_none() && owner.is_none() {
+                    not_accepted.push(json!(x.id));
                 }
                 match x.accepted_until {
                     None => no_date.push(json!(x.id)),
@@ -850,7 +865,7 @@ impl Check<'_> {
                 "id": x.id, "owner": x.owner, "likelihood": x.likelihood, "impact": x.impact, "score": score, "aboveAppetite": above,
                 "treatment": x.treatment, "controls": x.controls, "fraud": x.fraud,
                 "identified": ds(x.identified), "lastReviewed": ds(last), "reviewDue": ds(plus(last, YEAR_DAYS)),
-                "acceptedBy": x.accepted_by, "acceptedAt": x.accepted_at.map(ds), "acceptedUntil": x.accepted_until.map(ds),
+                "acceptedBy": acceptance.map(|(by, _)| by), "acceptedAt": acceptance.map(|(_, at)| ds(at)), "acceptedUntil": acceptance.and(x.accepted_until).map(ds),
             }));
         }
         let mut reviews: Vec<&RiskReview> = self.r.risk_reviews.iter().filter(|v| v.at < cut).collect();
@@ -868,10 +883,10 @@ impl Check<'_> {
             rows.push("CC3.3-1");
         }
         let v = json!({
-            "basis": "the risks open at the period's end (identified before it, not closed), each reviewed within a year; the register reviewed in full within a year; an accepted risk scoring above the appetite (all of them when none is set) accepted by someone holding or deputising Management that day, with a review date not passed; risks reduced name the checklist rows of their controls; the yearly assessment includes fraud",
+            "basis": "the risks open at the period's end (identified before it, not closed), each reviewed within a year; the register reviewed in full within a year; an accepted risk has an acceptance dated before the period's end, by someone holding or deputising Management that day when it scores above the appetite (all of them when none is set), and otherwise Management or the risk's owner role, with a review date not passed; risks reduced name the checklist rows of their controls; the yearly assessment includes fraud",
             "riskAppetite": self.r.risk_appetite,
             "summary": { "open": open.len(), "closed": self.r.risks.iter().filter(|x| x.closed.is_some_and(|c| c < cut)).count(), "accepted": open.iter().filter(|x| x.treatment == "accept").count(), "fraud": fraud.len(), "lastFullReview": last_full.map(ds) },
-            "exceptions": { "noFullReview": no_full, "reviewOverdue": overdue, "acceptedWithoutManagement": unapproved, "acceptanceNoReviewDate": no_date, "acceptanceLapsed": lapsed, "reducedWithoutControls": no_controls, "noFraudRisk": no_fraud },
+            "exceptions": { "noFullReview": no_full, "reviewOverdue": overdue, "acceptedWithoutManagement": unapproved, "notAccepted": not_accepted, "acceptanceNoReviewDate": no_date, "acceptanceLapsed": lapsed, "reducedWithoutControls": no_controls, "noFraudRisk": no_fraud },
             "fullReviews": reviews.iter().map(|v| json!({ "at": ds(v.at), "by": v.by, "heldRole": self.held(&v.by, &["Security owner", "Management"], v.at) })).collect::<Vec<_>>(),
             "risks": out,
         });
@@ -995,14 +1010,14 @@ impl Check<'_> {
             .baselines
             .iter()
             .map(|b| {
-                let missing: Vec<&String> = b.excepted.iter().filter(|s| !self.r.exceptions.iter().any(|x| x.setting.as_deref() == Some(s.as_str()) && self.exception_on(x, b.checked_on))).collect();
+                let missing: Vec<&String> = b.excepted.iter().filter(|s| !self.r.exceptions.iter().any(|x| x.approved_at < cut && x.setting.as_deref() == Some(s.as_str()) && self.exception_on(x, b.checked_on))).collect();
                 unapproved.extend(missing.iter().map(|s| json!(format!("{s} on {} (checked {})", b.file, b.checked_at))));
                 json!({ "file": b.file, "bytes": b.bytes, "sha256": b.sha256, "checkedAt": b.checked_at, "digest": b.digest, "excepted": b.excepted, "notInRegister": missing })
             })
             .collect();
         let rows = if self.baselines.is_empty() { vec![] } else { vec!["CC5.1-1"] };
         let v = json!({
-            "basis": format!("exceptions in force at some time in the period: approved by someone holding or deputising the Security owner or Management that day, ending at most {MAX_EXCEPTION_DAYS} days after approval, and reviewed within each quarter while in force (information security policy); and each server's baseline check given, every setting it found excepted (BASELINE_EXCEPTIONS) held to an exception in force for that setting on the day it was checked"),
+            "basis": format!("exceptions in force at some time in the period: approved by someone holding or deputising the Security owner or Management that day, ending at most {MAX_EXCEPTION_DAYS} days after approval, and reviewed within each quarter while in force (information security policy); and each server's baseline check given, every setting it found excepted (BASELINE_EXCEPTIONS) held to an exception approved before the period's end and in force for that setting on the day it was checked (a check up to {BASELINE_LATE_DAYS} days after the period, such as an evidence bundle's, counts)"),
             "summary": { "inPeriod": out.len(), "inForceAtEnd": out.iter().filter(|x| x["inForceAtEnd"] == true).count(), "baselineChecks": checks.len() },
             "exceptions": { "overAYear": long, "approverNotInRole": wrong, "reviewOverdue": overdue, "baselineExceptionNotApproved": unapproved },
             "baselineChecks": checks,
@@ -1380,6 +1395,7 @@ mod tests {
             assert_eq!(ex["acceptedWithoutManagement"], json!(["R-03"]), "R-04 is within the appetite");
             assert_eq!(ex["acceptanceLapsed"], json!(["R-03 (until 2027-03-15)"]));
             assert_eq!(ex["acceptanceNoReviewDate"], json!(["R-04"]));
+            assert_eq!(ex["notAccepted"], json!(["R-04"]), "an accepted risk needs a dated acceptance, even within the appetite");
             assert_eq!(ex["noFraudRisk"], json!(["no open risk is marked fraud"]));
             assert_eq!(ex["noFullReview"], json!(["none in the year to 2027-04-01 (last 2026-01-15)"]));
             assert_eq!((r["summary"]["open"].as_u64(), r["summary"]["closed"].as_u64()), (Some(4), Some(1)));
@@ -1390,7 +1406,15 @@ mod tests {
         let mut small = good();
         small["risks"][2]["likelihood"] = json!(1);
         small["risks"][2]["acceptedBy"] = json!("p-eng");
-        check(&small, &|c| assert_eq!(c.risks().0["exceptions"]["acceptedWithoutManagement"], json!([]), "within the appetite"));
+        check(&small, &|c| assert_eq!((c.risks().0["exceptions"]["acceptedWithoutManagement"].clone(), c.risks().0["exceptions"]["notAccepted"].clone()), (json!([]), json!(["R-03"])), "within the appetite, but p-eng isn't the owner's role"));
+        small["risks"][2]["owner"] = json!("Engineering lead");
+        check(&small, &|c| assert_eq!(c.risks().0["exceptions"]["notAccepted"], json!([]), "the owner accepts it within the appetite"));
+        let mut late = good();
+        late["risks"][2]["acceptedAt"] = json!("2027-04-02");
+        check(&late, &|c| assert_eq!(c.risks().0["exceptions"]["notAccepted"], json!(["R-03"]), "an acceptance after the period doesn't count for it"));
+        let mut gone = good();
+        gone["people"][0]["left"] = json!("2027-01-02");
+        check(&gone, &|c| assert_eq!(c.risks().0["exceptions"]["acceptedWithoutManagement"], json!(["R-03"]), "someone who had left holds no role"));
         small["riskAppetite"] = Value::Null;
         check(&small, &|c| assert_eq!(c.risks().0["exceptions"]["acceptedWithoutManagement"], json!(["R-03"]), "with no appetite every acceptance needs management"));
         small["risks"][2]["acceptedBy"] = json!("p-sec");
@@ -1442,7 +1466,8 @@ mod tests {
         let json_check = |at: &str, excepted: &[&str]| serde_json::to_vec(&json!({ "format": 1, "checkedAt": at, "digest": ZERO, "ok": true, "exceptions": { "deviations": [], "excepted": excepted, "unknownExceptions": [] } })).unwrap();
         let b1 = baseline("/srv/evidence/baseline-a.json", &json_check("2027-03-10T09:00:00Z", &["MACHINE_ON_DISABLE", "TEAMS"]), &period()).unwrap();
         assert_eq!((b1.file.as_str(), b1.checked_on), ("baseline-a.json", d("2027-03-10")), "the file's name, never its folder");
-        let b2 = baseline("b.json", &json_check("2027-03-02T09:00:00Z", &[]), &period()).unwrap();
+        let b2 = baseline("b.json", &json_check("2027-04-01T00:00:05Z", &[]), &period()).unwrap();
+        assert_eq!(b2.checked_on, d("2027-04-01"), "the month's evidence bundle, made on the 1st");
         let bs = [b1, b2];
         let c = Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &bs };
         let (x, rows) = c.exceptions();
@@ -1457,7 +1482,8 @@ mod tests {
         for (bytes, want) in [
             (b"nope".to_vec(), "isn't JSON"),
             (serde_json::to_vec(&json!({ "exceptions": { "excepted": [] } })).unwrap(), "checkedAt"),
-            (json_check("2027-04-01T00:00:00Z", &[]), "outside the period"),
+            (json_check("2027-04-08T00:00:00Z", &[]), "outside the period"),
+            (json_check("2027-02-28T23:59:59Z", &[]), "outside the period"),
             (serde_json::to_vec(&json!({ "checkedAt": "2027-03-02T00:00:00Z" })).unwrap(), "exceptions.excepted"),
             (json_check("2027-03-02T00:00:00Z", &["a b"]), "isn't a setting's name"),
         ] {

@@ -92,8 +92,9 @@ role its header names, within a year, and with --policies, of the text in force)
 everyone's acknowledgements and training, the open risks and their reviews, a management
 review each quarter, vendors assessed before use and reviewed yearly, and exceptions
 approved, ended within a year and reviewed quarterly; with each --baseline (botctl
-evidence baseline json, or an evidence bundle's baseline.json, checked in the period),
-every setting the server excepted held to an exception in force. Refuses a register that
+evidence baseline json, or the month's evidence bundle's baseline.json, checked in the
+period or the 7 days after it), every setting the server excepted held to an exception in
+force. Refuses a register that
 doesn't hold together (unknown people, roles or policies, ids that aren't plain), listing
 every problem. People are named by register id; names, titles and notes stay out. No
 token and no network.";
