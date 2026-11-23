@@ -632,20 +632,34 @@ fn since_key(sink: &str) -> String {
     format!("audit_export:{sink}#checked")
 }
 
-pub fn last_pass(app: &App, sink: &str) -> Option<Since> {
-    let raw: Option<String> = app.db.with_conn(|c| c.query_row("SELECT value FROM settings WHERE key = ?", [since_key(sink)], |r| r.get(0)).optional()).ok().flatten();
-    let v: Value = serde_json::from_str(&raw?).ok()?;
-    let head = Link::parse(&format!("{}:{}", v["id"].as_i64()?, v["hash"].as_str()?)).ok()?;
-    Some(Since { head, at: v["at"].as_i64()? })
+fn read_pass(c: &rusqlite::Connection, sink: &str) -> rusqlite::Result<Option<Since>> {
+    let raw: Option<String> = c.query_row("SELECT value FROM settings WHERE key = ?", [since_key(sink)], |r| r.get(0)).optional()?;
+    let parsed = || -> Option<Since> {
+        let v: Value = serde_json::from_str(raw.as_deref()?).ok()?;
+        let head = Link::parse(&format!("{}:{}", v["id"].as_i64()?, v["hash"].as_str()?)).ok()?;
+        Some(Since { head, at: v["at"].as_i64()? })
+    };
+    Ok(parsed())
 }
 
-fn save_pass(app: &App, sink: &str, s: &Since) -> rusqlite::Result<()> {
+pub fn last_pass(app: &App, sink: &str) -> Option<Since> {
+    app.db.with_conn(|c| read_pass(c, sink)).ok().flatten()
+}
+
+/// Only a pass further on than the saved one replaces it: checks can overlap (the daily
+/// one and one by hand), and the one that began first may finish last.
+fn save_pass(app: &App, sink: &str, s: &Since) -> rusqlite::Result<bool> {
     let v = json!({ "id": s.head.id, "hash": s.head.hash, "at": s.at }).to_string();
-    app.db.with_conn(|c| c.execute("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2", [since_key(sink), v]).map(|_| ()))
+    app.db.with_conn(|c| {
+        if read_pass(c, sink)?.is_some_and(|old| (old.head.id, old.at) >= (s.head.id, s.at)) {
+            return Ok(false);
+        }
+        c.execute("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2", [since_key(sink), v]).map(|_| true)
+    })
 }
 
 /// Saves a passing check's head as where the next daily check picks up. A check that
-/// failed, or reached nothing, leaves the last pass as it was.
+/// failed, reached nothing, or was overtaken leaves the last pass as it was.
 fn passed(app: &App, sink: &str, c: &Checked, at: i64) {
     let Some(head) = c.head.clone().filter(|_| c.ok) else { return };
     if let Err(e) = save_pass(app, sink, &Since { head, at }) {
@@ -1053,6 +1067,22 @@ mod tests {
         let mut rebuilt = local(9);
         rebuilt.hashes.insert(5, Some(hash(50)));
         assert_eq!(reasons(&resume(9, &[(4, 6), (7, 9)], &pass, &rebuilt)), ["mismatch"]);
+    }
+
+    #[test]
+    fn an_overtaken_check_doesnt_move_the_last_pass_back() {
+        let app = crate::runner::test_app();
+        let pass = |id: i64, at: i64| Since { head: Link { id, hash: hash(id) }, at };
+        assert_eq!(last_pass(&app, "s3://x"), None);
+        assert!(save_pass(&app, "s3://x", &pass(9, 2_000)).unwrap());
+        // Began first, finished last: older, and not saved over the newer one.
+        assert!(!save_pass(&app, "s3://x", &pass(6, 1_000)).unwrap());
+        assert!(!save_pass(&app, "s3://x", &pass(9, 1_000)).unwrap());
+        assert_eq!(last_pass(&app, "s3://x"), Some(pass(9, 2_000)));
+        // Nothing new since, a day on: the same head, a later start.
+        assert!(save_pass(&app, "s3://x", &pass(9, 3_000)).unwrap());
+        assert!(save_pass(&app, "s3://x", &pass(12, 2_500)).unwrap());
+        assert_eq!((last_pass(&app, "s3://x"), last_pass(&app, "s3://y")), (Some(pass(12, 2_500)), None), "kept per archive");
     }
 
     #[test]
