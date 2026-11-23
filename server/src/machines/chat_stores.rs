@@ -39,19 +39,24 @@ const SUFFIX: &str = ".sqlite";
 const ACTOR: &str = "residency";
 pub const MOVED: &str = "residency.chats_moved";
 pub const BACKUP_FAILED: &str = "residency.chat_store_backup_failed";
+pub const FORGOTTEN: &str = "residency.chat_store_forgotten";
+const FORGET: &str = "REGION_DATA_FORGET";
 
-/// REGION_DATA_DIRS and REGION_DATA_BACKUPS.
+/// REGION_DATA_DIRS, REGION_DATA_BACKUPS and REGION_DATA_FORGET.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     /// Each region's folder, canonical, in the order given.
     pub dirs: Vec<(String, PathBuf)>,
     /// Backups of each store kept in its folder.
     pub keep: usize,
+    /// Regions dropped from REGION_DATA_DIRS whose store is gone for good: botd stops
+    /// recording them though nothing shows they held no chats.
+    pub forget: Vec<String>,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { dirs: Vec::new(), keep: DEFAULT_KEEP }
+        Settings { dirs: Vec::new(), keep: DEFAULT_KEEP, forget: Vec::new() }
     }
 }
 
@@ -67,9 +72,10 @@ impl Settings {
             "" => DEFAULT_KEEP,
             v => v.parse::<usize>().ok().filter(|n| (1..=MAX_KEEP).contains(n)).ok_or_else(|| format!("REGION_DATA_BACKUPS must be 1 to {MAX_KEEP}, not \"{}\"", clip(v, 20)))?,
         };
+        let forget: Vec<String> = var(FORGET).split(',').map(str::trim).filter(|r| !r.is_empty()).map(str::to_string).collect();
         let entries: Vec<&str> = raw.split(',').map(str::trim).filter(|e| !e.is_empty()).collect();
         if entries.is_empty() {
-            return Ok(Settings { dirs: Vec::new(), keep });
+            return Ok(Settings { dirs: Vec::new(), keep, forget });
         }
         if !control_plane {
             return Err(format!("{SETTING} holds pinned people's chats, and residency pins need the control plane (MACHINE_PROVIDER, ADR 0129)"));
@@ -106,7 +112,10 @@ impl Settings {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).map_err(|e| format!("{SETTING}: {}: {e}", path.display()))?;
             dirs.push((region.to_string(), path));
         }
-        Ok(Settings { dirs, keep })
+        if let Some((r, _)) = dirs.iter().find(|(r, _)| forget.contains(r)) {
+            return Err(format!("{FORGET} names {r}, which {SETTING} still keeps chats for"));
+        }
+        Ok(Settings { dirs, keep, forget })
     }
 
     /// For the startup log.
@@ -133,10 +142,16 @@ pub fn open(db: &Db, s: &Settings, previous: Option<&DbKey>) -> Result<Vec<Strin
             log_info!("Regional chat stores: {} brought under botd's database key (ADR 0215).", path.display());
         }
     }
-    let attached = db.attach_chat_stores(&s.dirs, key.map(DbKey::raw))?;
+    let attached = db.attach_chat_stores(&s.dirs, &s.forget, key.map(DbKey::raw))?;
+    for (region, path) in &attached.forgotten {
+        db.record(&Who::system(ACTOR).event(FORGOTTEN).details(json!({ "region": region, "path": path, "named": s.forget.contains(region) })));
+    }
     let mut lines = vec![format!("Regional chat stores: {} (ADR 0215).", s.describe())];
     lines.extend(attached.created.iter().map(|r| format!("Regional chat stores: made {r}'s store.")));
-    lines.extend(attached.forgotten.iter().map(|(r, p)| format!("Regional chat stores: {r} is no longer in {SETTING} and its store ({p}) held no chats, so botd stopped recording it.")));
+    lines.extend(attached.forgotten.iter().map(|(r, p)| {
+        let why = if s.forget.contains(r) { format!("is named in {FORGET}") } else { "held no chats".into() };
+        format!("Regional chat stores: {r} is no longer in {SETTING} and its store ({p}) {why}, so botd stopped recording it. Its folder's backups/ is left for you to delete.")
+    }));
     let scrubbed = db.scrub_chat_stores().map_err(|e| format!("chat stores: {e}"))?;
     if scrubbed > 0 {
         lines.push(format!("Regional chat stores: redacted {scrubbed} saved rows."));
@@ -289,7 +304,8 @@ pub fn warnings(app: &App, at: i64) -> Vec<String> {
 
 /// Where the chats of Bots `owners` own are against a pin to `region`: in its store, in
 /// botd's own database (in the region only when botd's own data is, `server_in`), or in
-/// another region's store.
+/// another region's store; and the backups of other stores made before those chats left
+/// them (`earlierCopies`), which hold them until they age out.
 pub fn against(app: &App, region: &str, owners: &[String], server_in: bool) -> Value {
     let (mut store, mut database, mut elsewhere) = (0, 0, 0);
     for c in app.db.chat_counts(owners) {
@@ -299,29 +315,64 @@ pub fn against(app: &App, region: &str, owners: &[String], server_in: bool) -> V
             None => database += c.messages,
         }
     }
-    let has = app.db.chat_stores().into_iter().find(|s| s.region == region);
-    let last = has.as_ref().and_then(|s| backups(s).first().map(|(t, _)| *t));
+    let stores = app.db.chat_stores();
+    let earlier: Vec<Value> = app
+        .db
+        .chat_moves_out(owners, region)
+        .into_iter()
+        .filter_map(|(r, moved_at)| {
+            let n = stores.iter().find(|s| s.region == r).map_or(0, |s| backups(s).iter().filter(|(t, _)| *t <= moved_at).count());
+            (n > 0).then(|| json!({ "region": r, "backups": n, "movedAt": moved_at }))
+        })
+        .collect();
+    let has = stores.iter().find(|s| s.region == region);
+    let last = has.and_then(|s| backups(s).first().map(|(t, _)| *t));
     json!({
         "store": has.is_some(),
         "messages": { "inStore": store, "inServerDatabase": database, "elsewhere": elsewhere },
-        "inRegion": elsewhere == 0 && (database == 0 || server_in),
+        "inRegion": elsewhere == 0 && (database == 0 || server_in) && earlier.is_empty(),
+        "earlierCopies": earlier,
         "lastBackupAt": last,
     })
 }
 
-/// Report warnings about `chats` (`against`): messages still to move, or in another
-/// region's store.
-pub fn report_warnings(chats: &Value, region: &str, server_in: bool, at: i64) -> Vec<String> {
-    let m = &chats["messages"];
+/// Why `user_id`'s chats aren't where a pin to `region` keeps them: some are in another
+/// region's store, or, when `region` has a store, not in it (a move that failed). Like
+/// `residency::outside`, these make the pin unkept, but they aren't checked before a pin,
+/// whose own move puts them there.
+pub fn outside(app: &App, region: &str, user_id: &str) -> Vec<String> {
+    let has = app.db.chat_stores().iter().any(|s| s.region == region);
+    let (mut database, mut elsewhere) = (0, 0);
+    for c in app.db.chat_counts(&[user_id.to_string()]) {
+        match c.region.as_deref() {
+            Some(r) if r == region => {}
+            Some(_) => elsewhere += c.messages,
+            None => database += c.messages,
+        }
+    }
     let mut out = Vec::new();
-    if m["inStore"].as_i64().is_some_and(|n| n > 0) && chats["lastBackupAt"].as_i64().is_none_or(|t| at - t > BACKUP_STALE_MS) {
+    if has && database > 0 {
+        out.push(format!("{database} of their chat messages are in botd's own database, not {region}'s chat store (ADR 0215)"));
+    }
+    if elsewhere > 0 {
+        out.push(format!("{elsewhere} of their chat messages are in another region's chat store (ADR 0215)"));
+    }
+    out
+}
+
+/// Report warnings about `chats` (`against`): no recent backup of the region's store, and
+/// other stores' backups that still hold their chats.
+pub fn report_warnings(chats: &Value, region: &str, at: i64) -> Vec<String> {
+    let mut out = Vec::new();
+    if chats["messages"]["inStore"].as_i64().is_some_and(|n| n > 0) && chats["lastBackupAt"].as_i64().is_none_or(|t| at - t > BACKUP_STALE_MS) {
         out.push(format!("{region}'s chat store has no backup from the last day (ADR 0215)"));
     }
-    if chats["store"] == true && !server_in && let Some(n) = m["inServerDatabase"].as_i64().filter(|n| *n > 0) {
-        out.push(format!("{n} of their chat messages are still in botd's own database; they move to {region}'s chat store on the next pass (ADR 0215)"));
-    }
-    if let Some(n) = m["elsewhere"].as_i64().filter(|n| *n > 0) {
-        out.push(format!("{n} of their chat messages are in another region's chat store; they move on the next pass (ADR 0215)"));
+    for e in chats["earlierCopies"].as_array().into_iter().flatten() {
+        out.push(format!(
+            "{} backups of {}'s chat store were made before their chats moved out of it and still hold them, until botd deletes them as newer ones are made (REGION_DATA_BACKUPS, ADR 0215)",
+            e["backups"],
+            e["region"].as_str().unwrap_or_default(),
+        ));
     }
     out
 }
@@ -372,6 +423,11 @@ mod tests {
         assert!(with(&one, true, require, &data).unwrap_err().contains("RESIDENCY_SERVER_DATA=require"));
         let keep = |v: &str| with(&[("REGION_DATA_BACKUPS", v)], true, ServerData::default(), &data);
         assert_eq!(keep("30").unwrap().keep, 30);
+        let forget = with(&[(FORGET, " us-east , gb-lon ")], true, ServerData::default(), &data).unwrap();
+        assert_eq!(forget.forget, vec!["us-east", "gb-lon"], "read without REGION_DATA_DIRS too, to retire the last store");
+        let both = [(SETTING, format!("gb-lon={}", lon.display())), (FORGET, "gb-lon".to_string())];
+        let both: Vec<(&str, &str)> = both.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert!(with(&both, true, ServerData::default(), &data).unwrap_err().contains("REGION_DATA_FORGET names gb-lon, which REGION_DATA_DIRS still keeps chats for"));
         assert!(keep("0").unwrap_err().contains("must be 1 to 365") && keep("x").is_err());
     }
 
@@ -385,7 +441,7 @@ mod tests {
         let db = Db::open(&t.path().join("app.sqlite")).unwrap();
         let dir = t.path().join("lon");
         std::fs::create_dir_all(&dir).unwrap();
-        db.attach_chat_stores(&[("gb-lon".into(), dir.clone())], None).unwrap();
+        db.attach_chat_stores(&[("gb-lon".into(), dir.clone())], &[], None).unwrap();
         let day = BACKUP_EVERY_MS;
         let start = chrono::DateTime::parse_from_rfc3339("2026-11-01T03:00:00Z").unwrap().timestamp_millis();
         for i in 0..4 {

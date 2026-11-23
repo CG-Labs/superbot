@@ -132,7 +132,7 @@ pub async fn view(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>,
         reports.push("user");
     }
     let you = residency_report::person(&app, cp, &u.id, &p.region).unwrap_or(Value::Null);
-    let kept = outside(&app, cp, &u.id, &p.region).is_empty() && cp.server_data.refuses(&p.region).is_empty();
+    let kept = outside(&app, cp, &u.id, &p.region).is_empty() && super::chat_stores::outside(&app, &p.region, &u.id).is_empty() && cp.server_data.refuses(&p.region).is_empty();
     let status = if kept { "kept" } else { "data_outside" };
     let sd = &cp.server_data;
     let server_data = json!({

@@ -221,7 +221,7 @@ fn not_covered(server_data: &Value, chats: &Value) -> Vec<String> {
     if server_data["inRegion"] != true {
         let why: Vec<&str> = server_data["outside"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
         let what = if chats["store"] == true && chats["inRegion"] == true {
-            "botd's own database apart from chats, which are in the region's chat store (accounts, routines, approvals, the audit log)"
+            "botd's own database apart from chats, which are in the region's chat store (accounts, routines, approvals, the audit log; its server backups also hold chats from before they moved there)"
         } else {
             "botd's own database (accounts, chats, routines, the audit log)"
         };
@@ -242,7 +242,8 @@ pub fn build(app: &App, cp: &ControlPlane, p: &ResidencyPin, from: i64, to: i64,
     let mut outside = Vec::new();
     for v in &people {
         let who = v["name"].as_str().unwrap_or_default();
-        outside.extend(residency::outside(app, cp, v["id"].as_str().unwrap_or_default(), region).into_iter().map(|w| format!("{who}: {w}")));
+        let id = v["id"].as_str().unwrap_or_default();
+        outside.extend(residency::outside(app, cp, id, region).into_iter().chain(super::chat_stores::outside(app, region, id)).map(|w| format!("{who}: {w}")));
     }
     let mut warnings = residency::unready(cp, region);
     warnings.extend(residency::route_gaps(app, &ids, region).into_iter().map(|g| format!("{g}, so their Bots' runs are refused (ADR 0139)")));
@@ -253,7 +254,7 @@ pub fn build(app: &App, cp: &ControlPlane, p: &ResidencyPin, from: i64, to: i64,
     }
     let server_in = server_data["inRegion"] == true;
     let chats = super::chat_stores::against(app, region, &ids, server_in);
-    warnings.extend(super::chat_stores::report_warnings(&chats, region, server_in, crate::db::now()));
+    warnings.extend(super::chat_stores::report_warnings(&chats, region, crate::db::now()));
     let hosts = cp.hosts().map(|h| h.configured().into_iter().filter(|c| c.region.as_deref() == Some(region)).map(|c| c.name).collect::<Vec<_>>());
     let pinned_by = p.pinned_by.as_deref().map(|id| json!({ "id": id, "name": app.db.user(id).map(|u| u.name) }));
     let kept_from = p.kept_from.as_deref().map(|t| json!({ "id": t, "name": app.db.team(t).map(|t| t.name) }));

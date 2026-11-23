@@ -303,6 +303,7 @@ fn unkept_line(app: &App, cp: &ControlPlane, p: &ResidencyPin, name: &str, peopl
     why.extend(cp.server_data.refuses(&p.region));
     for id in people {
         why.extend(outside(app, cp, id, &p.region));
+        why.extend(super::chat_stores::outside(app, &p.region, id));
     }
     (!why.is_empty()).then(|| format!("{name} is {}, but {}. Backups, restores and new machines that can't stay there are refused (ADR 0129).", pinned_to(p), why.join("; ")))
 }

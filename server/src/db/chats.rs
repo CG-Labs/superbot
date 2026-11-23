@@ -13,9 +13,11 @@
 //! sequence, so botd's table never hands the same id out again.
 //!
 //! `place_chats` moves rows whose Bot belongs elsewhere now (a pin made or ended, a
-//! member joining or leaving a pinned team, a Bot given away): copied, then deleted from
-//! where they were, in one transaction. A crash mid-commit can leave a copy in both
-//! places; the next pass deletes the one in the wrong place.
+//! member joining or leaving a pinned team, a Bot given away): copied and committed, then
+//! deleted from where they were in a second transaction. A transaction across attached
+//! WAL files commits each file on its own, so one transaction could commit the delete
+//! without the copy; two can at worst leave a copy in both places, and the next pass
+//! deletes the one in the wrong place.
 
 use super::{Db, now};
 use crate::database_encryption::{self, Format};
@@ -27,13 +29,20 @@ use std::path::{Path, PathBuf};
 pub(super) const TABLE: &str = "{messages}";
 
 /// botd's record of each store it has kept chats in, so a store that goes missing (an
-/// unmounted volume, a dropped setting) stops botd instead of hiding those chats.
+/// unmounted volume, a dropped setting) stops botd instead of hiding those chats; and of
+/// when each Bot's chat last left a store, as that store's earlier backups still hold it.
 const RECORDS: &str = "CREATE TABLE IF NOT EXISTS main.chat_stores (
   region TEXT PRIMARY KEY,
   store_id TEXT NOT NULL,
   path TEXT NOT NULL,
   added_at INTEGER NOT NULL
-)";
+);
+CREATE TABLE IF NOT EXISTS main.chat_moves_out (
+  bot_id TEXT NOT NULL,
+  region TEXT NOT NULL,
+  moved_at INTEGER NOT NULL,
+  PRIMARY KEY (bot_id, region)
+);";
 
 /// A region's chat store, attached to botd's connection as `schema`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -177,8 +186,10 @@ impl Db {
     /// attaches them, keyed with `key` (SQLCipher's raw key; None: plain, as botd's own
     /// database). Called once at startup, with no stores too, so a store that held chats and
     /// was dropped from REGION_DATA_DIRS stops botd. Refuses a recorded store whose file is
-    /// missing or isn't the one recorded, rather than start an empty one in its place.
-    pub fn attach_chat_stores(&self, dirs: &[(String, PathBuf)], key: Option<&str>) -> Result<Attached, String> {
+    /// missing or isn't the one recorded, rather than start an empty one in its place. A
+    /// dropped store whose file is gone is forgotten only when named in `forget`
+    /// (REGION_DATA_FORGET): nothing shows whether it still held chats.
+    pub fn attach_chat_stores(&self, dirs: &[(String, PathBuf)], forget: &[String], key: Option<&str>) -> Result<Attached, String> {
         if self.5.get().is_some() {
             return Err("chat stores are attached once, at startup".into());
         }
@@ -191,17 +202,36 @@ impl Db {
         };
         let mut out = Attached::default();
         // Forgotten only once every store checks out, so a start that fails changes nothing.
-        for (region, _, path) in recorded.iter().filter(|(r, _, _)| !dirs.iter().any(|(d, _)| d == r)) {
+        for (region, id, path) in recorded.iter().filter(|(r, _, _)| !dirs.iter().any(|(d, _)| d == r)) {
             let p = Path::new(path);
-            if database_encryption::format(p)? != Format::Missing {
+            if database_encryption::format(p)? == Format::Missing {
+                if !forget.contains(region) {
+                    return Err(format!(
+                        "REGION_DATA_DIRS no longer names {region}, and its chat store (store {id}, last at {path}) is gone, so nothing shows whether it still held chats. \
+                         Put {region}=<its folder> back with the volume mounted. If its chats are lost for good, add {region} to REGION_DATA_FORGET (ADR 0215)."
+                    ));
+                }
+            } else {
                 c.execute("ATTACH DATABASE ?1 AS chats_dropped KEY ?2", params![path, key.unwrap_or("")]).map_err(|err| not_a_store(p, &err))?;
-                let n = c.query_row(
-                    "SELECT CASE WHEN EXISTS (SELECT 1 FROM chats_dropped.sqlite_master WHERE type = 'table' AND name = 'messages') THEN (SELECT COUNT(*) FROM chats_dropped.messages) ELSE 0 END",
-                    [],
-                    |r| r.get::<_, i64>(0),
-                );
+                let has = |t: &str| c.query_row("SELECT COUNT(*) FROM chats_dropped.sqlite_master WHERE type = 'table' AND name = ?1", [t], |r| r.get::<_, i64>(0)).map(|n| n > 0);
+                let n = match has("messages") {
+                    Ok(true) => c.query_row("SELECT COUNT(*) FROM chats_dropped.messages", [], |r| r.get::<_, i64>(0)),
+                    Ok(false) => Ok(0),
+                    Err(err) => Err(err),
+                };
+                let own: rusqlite::Result<Option<String>> = match has("chat_store") {
+                    Ok(true) => c.query_row("SELECT id FROM chats_dropped.chat_store LIMIT 1", [], |r| r.get(0)).optional(),
+                    Ok(false) => Ok(None),
+                    Err(err) => Err(err),
+                };
                 c.execute("DETACH DATABASE chats_dropped", []).map_err(e)?;
-                let n = n.map_err(|err| not_a_store(p, &err))?;
+                let (n, own) = (n.map_err(|err| not_a_store(p, &err))?, own.map_err(|err| not_a_store(p, &err))?);
+                if own.as_deref() != Some(id.as_str()) && !forget.contains(region) {
+                    return Err(format!(
+                        "REGION_DATA_DIRS no longer names {region}, and {path} isn't its chat store (store {id}) any more, so nothing shows whether that still held chats. \
+                         Put {region}=<its folder> back with the store in it. If its chats are lost for good, add {region} to REGION_DATA_FORGET (ADR 0215)."
+                    ));
+                }
                 if n > 0 {
                     return Err(format!(
                         "REGION_DATA_DIRS no longer names {region}, but its chat store ({path}) still holds {n} messages of pinned people's chats. \
@@ -355,18 +385,38 @@ impl Db {
             pinned_region("b.id")
         ))?;
         let cols = &set.cols;
+        let here = |to: &str| format!("bot_id IN (SELECT bot_id FROM temp.chat_place WHERE schema = {})", literal(to));
+        let pairs: Vec<(&str, &str)> = schemas(&set.stores).flat_map(|to| schemas(&set.stores).filter(move |f| *f != to).map(move |from| (from, to))).collect();
+        for &(from, to) in &pairs {
+            let here = here(to);
+            tx.execute(&format!("INSERT OR IGNORE INTO {to}.messages ({cols}) SELECT {cols} FROM {from}.messages WHERE {here}"), [])?;
+        }
+        tx.commit()?;
+        #[cfg(test)]
+        if tests::CRASH_AFTER_COPY.with(|c| c.replace(false)) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let tx = c.unchecked_transaction()?;
         let mut moves = Vec::new();
-        for to in schemas(&set.stores) {
-            for from in schemas(&set.stores).filter(|s| *s != to) {
-                let here = format!("bot_id IN (SELECT bot_id FROM temp.chat_place WHERE schema = {})", literal(to));
-                let bots: i64 = tx.query_row(&format!("SELECT COUNT(DISTINCT bot_id) FROM {from}.messages WHERE {here}"), [], |r| r.get(0))?;
-                if bots == 0 {
-                    continue;
-                }
-                tx.execute(&format!("INSERT OR IGNORE INTO {to}.messages ({cols}) SELECT {cols} FROM {from}.messages WHERE {here}"), [])?;
-                let messages = tx.execute(&format!("DELETE FROM {from}.messages WHERE {here} AND id IN (SELECT id FROM {to}.messages)"), [])?;
-                moves.push(ChatMove { from: region_of(&set.stores, from).map(str::to_string), to: region_of(&set.stores, to).map(str::to_string), bots: bots as usize, messages });
+        let at = now();
+        for &(from, to) in &pairs {
+            let copied = format!("{} AND id IN (SELECT id FROM {to}.messages)", here(to));
+            let bots: i64 = tx.query_row(&format!("SELECT COUNT(DISTINCT bot_id) FROM {from}.messages WHERE {copied}"), [], |r| r.get(0))?;
+            if bots == 0 {
+                continue;
             }
+            let from_region = region_of(&set.stores, from).map(str::to_string);
+            if let Some(r) = &from_region {
+                tx.execute(
+                    &format!(
+                        "INSERT INTO main.chat_moves_out (bot_id, region, moved_at) SELECT DISTINCT bot_id, ?1, ?2 FROM {from}.messages WHERE {copied}
+                         ON CONFLICT(bot_id, region) DO UPDATE SET moved_at = excluded.moved_at"
+                    ),
+                    params![r, at],
+                )?;
+            }
+            let messages = tx.execute(&format!("DELETE FROM {from}.messages WHERE {copied}"), [])?;
+            moves.push(ChatMove { from: from_region, to: region_of(&set.stores, to).map(str::to_string), bots: bots as usize, messages });
         }
         for s in &set.stores {
             tx.execute(&format!("DELETE FROM {}.messages WHERE bot_id NOT IN (SELECT id FROM main.bots)", s.schema), [])?;
@@ -393,6 +443,20 @@ impl Db {
                 (n > 0).then(|| ChatCount { region: region_of(stores, s).map(str::to_string), messages: n })
             })
             .collect()
+    }
+
+    /// When the chats of Bots `owners` own last left each store other than `except`'s, as
+    /// `(region, moved_at)`: that store's backups from before then still hold them.
+    pub fn chat_moves_out(&self, owners: &[String], except: &str) -> Vec<(String, i64)> {
+        let owners = serde_json::to_string(owners).unwrap_or_else(|_| "[]".into());
+        let c = self.c();
+        let Ok(mut s) = c.prepare(
+            "SELECT region, MAX(moved_at) FROM main.chat_moves_out WHERE region != ?2
+             AND bot_id IN (SELECT id FROM main.bots WHERE owner_id IN (SELECT value FROM json_each(?1))) GROUP BY region ORDER BY region",
+        ) else {
+            return Vec::new();
+        };
+        s.query_map(params![owners, except], |r| Ok((r.get(0)?, r.get(1)?))).map(|rows| rows.flatten().collect()).unwrap_or_default()
     }
 
     /// Every store and how many messages it holds.
@@ -457,6 +521,12 @@ mod tests {
     use crate::acl::Visibility;
     use crate::db::PinOn;
     use crate::rbac::Role;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Stops the next `place_chats` between its copy and its delete, as a crash would.
+        pub(super) static CRASH_AFTER_COPY: Cell<bool> = const { Cell::new(false) };
+    }
 
     struct Dirs {
         dir: super::Scratch,
@@ -484,7 +554,7 @@ mod tests {
         /// botd with both stores, as at startup.
         fn up(&self) -> Db {
             let db = self.db();
-            db.attach_chat_stores(&self.both(), None).unwrap();
+            db.attach_chat_stores(&self.both(), &[], None).unwrap();
             db
         }
     }
@@ -506,13 +576,13 @@ mod tests {
     fn without_stores_everything_stays_in_botds_own_table() {
         let d = Dirs::new();
         let db = d.db();
-        assert_eq!(db.attach_chat_stores(&[], None).unwrap(), Attached::default());
+        assert_eq!(db.attach_chat_stores(&[], &[], None).unwrap(), Attached::default());
         let u = user(&db, "ada");
         db.pin_residency(PinOn::User, &u, "gb-lon", "DPA-1", None).unwrap();
         let m = db.add_message(&bot_of(&db, &u), "user", "hi", None, false, None);
         assert_eq!(db.chat_place_of(m.id), Some(None));
         assert!(db.place_chats().unwrap().is_empty() && db.chat_stores().is_empty());
-        assert!(db.attach_chat_stores(&[], None).unwrap_err().contains("once"));
+        assert!(db.attach_chat_stores(&[], &[], None).unwrap_err().contains("once"));
     }
 
     #[test]
@@ -522,7 +592,7 @@ mod tests {
         let (ada, cy) = (user(&db, "ada"), user(&db, "cy"));
         let (ada_bot, cy_bot) = (bot_of(&db, &ada), bot_of(&db, &cy));
         let before = db.add_message(&ada_bot, "user", "before the store", None, false, None);
-        assert_eq!(db.attach_chat_stores(&d.both(), None).unwrap().created, vec!["gb-lon", "de-fra-2"]);
+        assert_eq!(db.attach_chat_stores(&d.both(), &[], None).unwrap().created, vec!["gb-lon", "de-fra-2"]);
         db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
 
         let m = db.add_message(&ada_bot, "user", "in London", None, false, Some("queued"));
@@ -611,6 +681,38 @@ mod tests {
     }
 
     #[test]
+    fn a_move_stopped_between_copy_and_delete_loses_nothing() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        let bot = bot_of(&db, &ada);
+        let m = db.add_message(&bot, "user", "x", None, false, None);
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        CRASH_AFTER_COPY.with(|c| c.set(true));
+        assert!(db.place_chats().is_err());
+        assert_eq!(rows_in(&d.lon.join("chats.sqlite")), 1, "the copy is committed first");
+        assert_eq!(db.c().query_row("SELECT COUNT(*) FROM main.messages WHERE id = ?1", [m.id], |r| r.get::<_, i64>(0)).unwrap(), 1, "and the original is still there");
+        let moves = db.place_chats().unwrap();
+        assert_eq!((moves[0].messages, db.message_count(&bot), db.chat_place_of(m.id)), (1, 1, Some(Some("gb-lon".into()))));
+    }
+
+    #[test]
+    fn a_chat_leaving_a_store_is_recorded_for_that_stores_earlier_backups() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        db.add_message(&bot_of(&db, &ada), "user", "x", None, false, None);
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        db.place_chats().unwrap();
+        assert!(db.chat_moves_out(std::slice::from_ref(&ada), "gb-lon").is_empty(), "moving out of botd's own database isn't a store's");
+        db.pin_residency(PinOn::User, &ada, "de-fra-2", "DPA-2", None).unwrap();
+        db.place_chats().unwrap();
+        let out = db.chat_moves_out(std::slice::from_ref(&ada), "de-fra-2");
+        assert!(out.len() == 1 && out[0].0 == "gb-lon" && now() - out[0].1 < 60_000, "{out:?}");
+        assert!(db.chat_moves_out(std::slice::from_ref(&ada), "gb-lon").is_empty(), "not a copy outside a pin back to gb-lon");
+    }
+
+    #[test]
     fn a_store_that_goes_missing_or_isnt_the_one_recorded_stops_botd() {
         let d = Dirs::new();
         {
@@ -619,7 +721,7 @@ mod tests {
             db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
             db.add_message(&bot_of(&db, &ada), "user", "x", None, false, None);
         }
-        let start = |dirs: &[(String, PathBuf)]| d.db().attach_chat_stores(dirs, None);
+        let start = |dirs: &[(String, PathBuf)]| d.db().attach_chat_stores(dirs, &[], None);
 
         // Dropped from REGION_DATA_DIRS while it holds chats.
         let e = start(&d.both()[1..]).unwrap_err();
@@ -634,7 +736,7 @@ mod tests {
         let e = start(&[("gb-lon".into(), d.fra.clone()), ("de-fra-2".into(), d.fra.clone())]).unwrap_err();
         assert!(e.contains("de-fra-2's chat store, not gb-lon's"), "{e}");
         let other = super::Scratch::new();
-        Db::open(&other.path().join("app.sqlite")).unwrap().attach_chat_stores(&[("gb-lon".into(), other.path().to_path_buf())], None).unwrap();
+        Db::open(&other.path().join("app.sqlite")).unwrap().attach_chat_stores(&[("gb-lon".into(), other.path().to_path_buf())], &[], None).unwrap();
         std::fs::copy(other.path().join("chats.sqlite"), &lon).unwrap();
         let e = start(&d.both()).unwrap_err();
         assert!(e.contains("but botd keeps gb-lon's chats in store"), "{e}");
@@ -647,7 +749,7 @@ mod tests {
         std::fs::remove_file(&lon).unwrap();
         std::fs::rename(&kept, &lon).unwrap();
         let db = d.db();
-        assert_eq!(db.attach_chat_stores(&d.both(), None).unwrap(), Attached::default());
+        assert_eq!(db.attach_chat_stores(&d.both(), &[], None).unwrap(), Attached::default());
         assert_eq!(db.chat_store_counts().iter().map(|(s, n)| (s.region.as_str(), *n)).collect::<Vec<_>>(), vec![("gb-lon", 1), ("de-fra-2", 0)]);
     }
 
@@ -655,11 +757,24 @@ mod tests {
     fn an_empty_store_dropped_from_the_settings_is_forgotten() {
         let d = Dirs::new();
         drop(d.up());
-        let a = d.db().attach_chat_stores(&d.both()[..1], None).unwrap();
+        let a = d.db().attach_chat_stores(&d.both()[..1], &[], None).unwrap();
         assert_eq!(a.forgotten.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>(), vec!["de-fra-2"]);
         assert!(a.created.is_empty());
         // Named again later, its old file is adopted.
-        assert_eq!(d.db().attach_chat_stores(&d.both(), None).unwrap(), Attached::default());
+        assert_eq!(d.db().attach_chat_stores(&d.both(), &[], None).unwrap(), Attached::default());
+
+        // Dropped with its file gone, or another file in its place: nothing shows it was
+        // empty, so it is forgotten only when named in REGION_DATA_FORGET.
+        let fra = d.fra.join("chats.sqlite");
+        std::fs::rename(&fra, d.dir.path().join("fra-kept.sqlite")).unwrap();
+        let e = d.db().attach_chat_stores(&d.both()[..1], &[], None).unwrap_err();
+        assert!(e.contains("no longer names de-fra-2, and its chat store") && e.contains("REGION_DATA_FORGET"), "{e}");
+        Connection::open(&fra).unwrap().execute_batch("CREATE TABLE t (x)").unwrap();
+        let e = d.db().attach_chat_stores(&d.both()[..1], &[], None).unwrap_err();
+        assert!(e.contains("isn't its chat store"), "{e}");
+        std::fs::remove_file(&fra).unwrap();
+        let a = d.db().attach_chat_stores(&d.both()[..1], &["de-fra-2".into()], None).unwrap();
+        assert_eq!(a.forgotten.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>(), vec!["de-fra-2"]);
     }
 
     #[test]
@@ -684,7 +799,7 @@ mod tests {
         let here = [("gb-lon".to_string(), dir.path().to_path_buf())];
         {
             let db = Db::open_keyed(&dir.path().join("app.sqlite"), &key);
-            db.attach_chat_stores(&here, Some(key.raw())).unwrap();
+            db.attach_chat_stores(&here, &[], Some(key.raw())).unwrap();
             let ada = user(&db, "ada");
             db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
             let m = db.add_message(&bot_of(&db, &ada), "user", "secret chat", None, false, None);
@@ -694,7 +809,7 @@ mod tests {
         assert_eq!(format(&store).unwrap(), Format::Encrypted);
         assert!(!std::fs::read(&store).unwrap().windows(11).any(|w| w == b"secret chat"));
         let other = DbKey::derive(&MasterKey::generate());
-        let e = Db::open_keyed(&dir.path().join("app.sqlite"), &key).attach_chat_stores(&here, Some(other.raw())).unwrap_err();
+        let e = Db::open_keyed(&dir.path().join("app.sqlite"), &key).attach_chat_stores(&here, &[], Some(other.raw())).unwrap_err();
         assert!(e.contains("doesn't open with botd's database key"), "{e}");
     }
 
@@ -705,7 +820,7 @@ mod tests {
         let dir = super::Scratch::new();
         let (old, new) = (DbKey::derive(&MasterKey::generate()), DbKey::derive(&MasterKey::generate()));
         let here = [("gb-lon".to_string(), dir.path().to_path_buf())];
-        Db::open(&dir.path().join("app.sqlite")).unwrap().attach_chat_stores(&here, None).unwrap();
+        Db::open(&dir.path().join("app.sqlite")).unwrap().attach_chat_stores(&here, &[], None).unwrap();
         let store = dir.path().join("chats.sqlite");
         assert!(!prepare_store(&store, None, None).unwrap(), "plain stays plain without a key");
 
