@@ -856,3 +856,243 @@ async fn metadata_from_a_url_is_checked_each_time_it_is_fetched() {
     assert_eq!((refused[0]["details"]["reason"].as_str(), refused[0]["details"]["kept"].as_bool()), (Some("bad_signature"), Some(true)));
     std::fs::remove_dir_all(dir).ok();
 }
+
+// Groups: required groups and group-to-role mapping (ADR 0160)
+
+fn in_groups(groups: &[&str]) -> impl FnOnce(&mut Response) + use<> {
+    let groups: Vec<String> = groups.iter().map(|g| g.to_string()).collect();
+    move |r| r.multi_attributes = vec![("groups".into(), groups)]
+}
+
+/// Entra's overage claim: too many groups to list, so none are.
+fn overage(r: &mut Response) {
+    r.multi_attributes = vec![("groups".into(), vec!["Auditors".into()]), (crate::sso::saml_sp::GROUPS_OVERAGE.into(), vec!["https://graph.example/v1.0/users/x/getMemberObjects".into()])];
+}
+
+#[tokio::test]
+async fn required_groups_keep_out_anyone_in_none_of_them_before_just_in_time() {
+    let sp = serve_with(&[("GROUPS_ATTRIBUTE", "groups"), ("REQUIRED_GROUPS", "SuperBot Users,Admins"), ("ALLOWED_DOMAINS", "example.com"), ("JIT_ROLE", "member")], |a| a.limiter = users::Limiter::new(1000, 60_000)).await;
+    let refused = async |tweak: Box<dyn FnOnce(&mut Response)>, reason: &str| {
+        let (code, to, head) = sp.sign_in(tweak).await;
+        assert_eq!((code, to.as_str()), (303, "/login?error=sso_not_allowed"), "{reason}");
+        assert_eq!(signed_in_as(sp.port, &head).await, None);
+        let f = sp.last_failure().await;
+        assert_eq!((f["reason"].as_str(), f["subject"].as_str()), (Some(reason), Some(STORED)));
+        f
+    };
+    refused(Box::new(|r| r.multi_attributes.clear()), "not_in_group").await;
+    refused(Box::new(in_groups(&[])), "not_in_group").await;
+    refused(Box::new(in_groups(&["Everyone", "Engineering"])), "not_in_group").await;
+    refused(Box::new(in_groups(&["superbot users", "ADMINS"])), "not_in_group").await;
+    // Only the named attribute counts.
+    refused(Box::new(|r| r.multi_attributes = vec![("memberOf".into(), vec!["Admins".into()])]), "not_in_group").await;
+    let f = refused(Box::new(overage), "groups_unknown").await;
+    assert_eq!(f["groups"], "overage");
+    let many: Vec<String> = (0..=crate::sso::saml_sp::MAX_GROUPS).map(|i| format!("g{i}")).chain(["Admins".into()]).collect();
+    let f = refused(Box::new(move |r| r.multi_attributes = vec![("groups".into(), many)]), "groups_unknown").await;
+    assert_eq!(f["groups"], "too_many");
+    assert!(sp.app.db.identity(IDP, STORED).is_none(), "no account made");
+
+    let (code, _, head) = sp.sign_in(in_groups(&["Everyone", "Admins"])).await;
+    assert_eq!(code, 200);
+    let uid = signed_in_as(sp.port, &head).await.expect("in a required group");
+    assert_eq!(sp.app.db.user(&uid).unwrap().role, Role::Member);
+    // Checked on every sign-in, not only the first.
+    refused(Box::new(in_groups(&["Everyone"])), "not_in_group").await;
+}
+
+#[tokio::test]
+async fn only_admins_map_a_saml_group_and_only_to_a_safe_custom_role() {
+    let sp = serve(&[("GROUPS_ATTRIBUTE", "groups")]).await;
+    let (port, admin, id) = (sp.port, sp.admin.clone(), sp.id.clone());
+    sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None).unwrap();
+    sp.app.db.create_custom_role("Ops", "", Role::Member, &["bots.manage"], None).unwrap();
+    let map = async |body: Value| call(port, "POST", "/api/sso/role-mappings", &admin, &body.to_string()).await;
+    for (body, code) in [
+        (json!({ "provider": id, "group": "Admins", "role": "admin" }), 400),
+        (json!({ "provider": id, "group": "Admins", "role": "member" }), 400),
+        (json!({ "provider": id, "group": "Admins", "role": "Ops" }), 400),
+        (json!({ "provider": id, "group": "Admins", "role": "Nobody" }), 404),
+        (json!({ "provider": id, "group": "  ", "role": "Auditor" }), 400),
+        (json!({ "provider": id, "group": "Auditors" }), 400),
+        (json!({ "provider": "nope", "group": "Auditors", "role": "Auditor" }), 400),
+        (json!({ "provider": id, "group": "Auditors", "role": "Auditor", "scope": "team" }), 400),
+    ] {
+        let (got, e) = map(body.clone()).await;
+        assert_eq!(got, code, "{body} {e}");
+    }
+    let refused = sp.audit("sso.saml_role_map_refused").await;
+    let reasons: Vec<&str> = refused.iter().filter_map(|e| e["details"]["reason"].as_str()).collect();
+    assert_eq!(reasons, ["reaches_admins", "built_in", "admin"]);
+    assert!(refused.iter().all(|e| e["outcome"] == "denied"));
+    assert_eq!(refused[0]["details"]["permissions"], json!(["bots.manage"]));
+
+    let (code, m) = map(json!({ "provider": id, "group": "Auditors", "role": "Auditor" })).await;
+    assert_eq!(code, 201, "{m}");
+    let m: Value = serde_json::from_str(&m).unwrap();
+    assert_eq!((m["group"].as_str(), m["role"]["name"].as_str(), m["groupsAttribute"].as_str(), m["active"].as_bool(), m["grants"].as_u64()), (Some("Auditors"), Some("Auditor"), Some("groups"), Some(true), Some(0)));
+    assert_eq!(sp.audit("sso.saml_role_mapped").await[0]["details"]["group"], "Auditors");
+    assert_eq!(map(json!({ "provider": id, "group": "Auditors", "role": "Auditor" })).await.0, 409, "one role per group");
+    let (code, all) = call(port, "GET", "/api/sso/role-mappings", &sp.admin, "").await;
+    assert_eq!(code, 200);
+    let all: Value = serde_json::from_str(&all).unwrap();
+    assert_eq!((all["mappings"].as_array().unwrap().len(), all["providers"][0]["groupsAttribute"].as_str()), (1, Some("groups")));
+    let (_, saml) = call(port, "GET", &format!("/api/sso/{id}/saml"), &sp.admin, "").await;
+    assert_eq!(serde_json::from_str::<Value>(&saml).unwrap()["roleMappings"], 1);
+
+    let member = sp.app.db.create_user(None, Some("bob@example.com"), "Bob", Role::Member).unwrap();
+    let bob = session_for(port, &sp.admin, &member.id).await;
+    assert_eq!(call(port, "GET", "/api/sso/role-mappings", &bob, "").await.0, 403);
+    assert_eq!(call(port, "GET", &format!("/api/sso/role-mappings/{}", m["id"].as_str().unwrap()), &bob, "").await.0, 403);
+    assert_eq!(call(port, "POST", "/api/sso/role-mappings", &bob, &json!({ "provider": id, "group": "Ops", "role": "Auditor" }).to_string()).await.0, 403);
+    assert_eq!(call(port, "DELETE", &format!("/api/sso/role-mappings/{}", m["id"].as_str().unwrap()), &bob, "").await.0, 403);
+    assert_eq!(call(port, "DELETE", "/api/sso/role-mappings/gmnope", &sp.admin, "").await.0, 404);
+
+    // A provider that reads no groups has nothing to map.
+    let plain = serve(&[]).await;
+    plain.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None).unwrap();
+    let (code, e) = call(plain.port, "POST", "/api/sso/role-mappings", &plain.admin, &json!({ "provider": plain.id, "group": "Auditors", "role": "Auditor" }).to_string()).await;
+    assert_eq!(code, 409, "{e}");
+    assert!(e.contains("GROUPS_ATTRIBUTE"), "{e}");
+}
+
+#[tokio::test]
+async fn a_mapped_saml_group_gives_its_role_only_while_sign_ins_list_it() {
+    let sp = serve(&[("GROUPS_ATTRIBUTE", "groups")]).await;
+    let (port, admin, id) = (sp.port, sp.admin.clone(), sp.id.clone());
+    let auditor = sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None).unwrap();
+    let (code, m) = call(port, "POST", "/api/sso/role-mappings", &admin, &json!({ "provider": id, "group": "Auditors", "role": auditor.id }).to_string()).await;
+    assert_eq!(code, 201, "{m}");
+    let mid = serde_json::from_str::<Value>(&m).unwrap()["id"].as_str().unwrap().to_string();
+    let u = sp.app.db.create_user(None, Some("ada@example.com"), "Ada", Role::Readonly).unwrap();
+    let (code, i) = call(port, "POST", &format!("/api/users/{}/identities", u.id), &admin, &json!({ "provider": id, "subject": NAME_ID }).to_string()).await;
+    assert_eq!(code, 201, "{i}");
+    let roles = || {
+        let u = sp.app.db.user(&u.id).unwrap();
+        (u.role, u.role_id)
+    };
+    let given = (Role::Member, Some(auditor.id.clone()));
+    let sign_in = async |tweak: Box<dyn FnOnce(&mut Response)>| {
+        let (code, _, head) = sp.sign_in(tweak).await;
+        assert_eq!(code, 200);
+        assert_eq!(signed_in_as(port, &head).await.as_deref(), Some(u.id.as_str()));
+    };
+
+    // Not in the group: nothing.
+    sign_in(Box::new(in_groups(&["Everyone"]))).await;
+    assert_eq!(roles(), (Role::Readonly, None));
+    // In it: the role, its base role, and the audit trail.
+    sign_in(Box::new(in_groups(&["Everyone", "Auditors"]))).await;
+    assert_eq!(roles(), given);
+    let a = &sp.audit("role.assigned").await[0]["details"];
+    assert_eq!((a["via"].as_str(), a["mapping"].as_str(), a["group"].as_str(), a["provider"].as_str()), (Some("saml"), Some(mid.as_str()), Some("Auditors"), Some(id.as_str())));
+    let changed = &sp.audit("user.role_changed").await[0]["details"];
+    assert_eq!((changed["reason"].as_str(), changed["from"].as_str(), changed["to"].as_str()), (Some("saml_group"), Some("readonly"), Some("member")));
+    let (_, held) = call(port, "GET", &format!("/api/sso/role-mappings/{mid}"), &admin, "").await;
+    let held: Value = serde_json::from_str(&held).unwrap();
+    assert_eq!((held["holders"][0]["user"]["id"].as_str(), held["holders"][0]["priorRole"].as_str(), held["grants"].as_u64()), (Some(u.id.as_str()), Some("readonly"), Some(1)));
+    let (_, r) = call(port, "GET", &format!("/api/roles/{}", auditor.id), &admin, "").await;
+    assert_eq!(serde_json::from_str::<Value>(&r).unwrap()["samlMappings"], 1, "{r}");
+    // Again: nothing new.
+    sign_in(Box::new(in_groups(&["Auditors"]))).await;
+    assert_eq!((roles(), sp.audit("role.assigned").await.len()), (given.clone(), 1));
+
+    // The role can't grow to act on admins, nor go, while a group maps to it.
+    let (code, e) = call(port, "PATCH", &format!("/api/roles/{}", auditor.id), &admin, &json!({ "permissions": ["audit.view", "bots.manage"] }).to_string()).await;
+    assert_eq!(code, 409, "{e}");
+    assert!(e.contains("SAML"), "{e}");
+    assert_eq!(call(port, "DELETE", &format!("/api/roles/{}", auditor.id), &admin, "").await.0, 409);
+
+    // Leaving the group takes it back to what they had before.
+    sign_in(Box::new(in_groups(&["Everyone"]))).await;
+    assert_eq!(roles(), (Role::Readonly, None));
+    let gone = &sp.audit("role.unassigned").await[0]["details"];
+    assert_eq!((gone["via"].as_str(), gone["reason"].as_str()), (Some("saml"), Some("left_group")));
+    // Groups the IdP couldn't list count as none.
+    sign_in(Box::new(in_groups(&["Auditors"]))).await;
+    assert_eq!(roles(), given);
+    sign_in(Box::new(overage)).await;
+    assert_eq!(roles(), (Role::Readonly, None));
+    assert_eq!(sp.audit("role.unassigned").await[0]["details"]["reason"], "groups_unknown");
+    // Group names are exact.
+    sign_in(Box::new(in_groups(&["auditors"]))).await;
+    assert_eq!(roles(), (Role::Readonly, None));
+
+    // An admin's change by hand stands while the group still lists them.
+    sign_in(Box::new(in_groups(&["Auditors"]))).await;
+    assert_eq!(roles(), given);
+    let (code, e) = call(port, "PATCH", &format!("/api/users/{}", u.id), &admin, &json!({ "role": "member" }).to_string()).await;
+    assert_eq!(code, 200, "{e}");
+    assert_eq!(roles(), (Role::Member, None));
+    sign_in(Box::new(in_groups(&["Auditors"]))).await;
+    assert_eq!(roles(), (Role::Member, None), "not given back");
+    sign_in(Box::new(overage)).await;
+    sign_in(Box::new(in_groups(&["Auditors"]))).await;
+    assert_eq!(roles(), (Role::Member, None), "unknown groups don't end the hand change");
+    sign_in(Box::new(in_groups(&["Everyone"]))).await;
+    assert_eq!(roles(), (Role::Member, None), "nothing to take: it was never the group's");
+    // Once a sign-in no longer lists the group, it maps again.
+    sign_in(Box::new(in_groups(&["Auditors"]))).await;
+    assert_eq!(roles(), given);
+    // So does unassigning the custom role by hand: the base role stays.
+    let (code, e) = call(port, "DELETE", &format!("/api/roles/{}/users/{}", auditor.id, u.id), &admin, "").await;
+    assert_eq!(code, 200, "{e}");
+    assert_eq!(sp.audit("role.unassigned").await[0]["details"]["samlMapping"], mid.as_str());
+    sign_in(Box::new(in_groups(&["Auditors"]))).await;
+    assert_eq!(roles().1, None, "held by the hand change");
+    sign_in(Box::new(in_groups(&[]))).await;
+    sign_in(Box::new(in_groups(&["Auditors"]))).await;
+    assert_eq!(roles(), given);
+
+    // Admins are never touched; it is audited.
+    let boss = sp.app.db.create_user(None, Some("boss@example.com"), "Boss", Role::Admin).unwrap();
+    call(port, "POST", &format!("/api/users/{}/identities", boss.id), &admin, &json!({ "provider": id, "subject": "00u1BOSS" }).to_string()).await;
+    let (code, _, _) = sp
+        .sign_in(|r| {
+            r.name_id = "00u1BOSS".into();
+            r.attributes = vec![("email".into(), "boss@example.com".into())];
+            r.multi_attributes = vec![("groups".into(), vec!["Auditors".into()])];
+        })
+        .await;
+    assert_eq!(code, 200);
+    assert_eq!((sp.app.db.user(&boss.id).unwrap().role, sp.app.db.user(&boss.id).unwrap().role_id), (Role::Admin, None));
+    assert_eq!(sp.audit("sso.saml_role_skipped").await[0]["details"]["reason"], "admin");
+
+    // Unlinking their identity at this provider takes it back.
+    let iid = serde_json::from_str::<Value>(&i).unwrap()["id"].as_str().unwrap().to_string();
+    let (code, e) = call(port, "DELETE", &format!("/api/users/{}/identities/{iid}", u.id), &admin, "").await;
+    assert_eq!(code, 200, "{e}");
+    let before = (Role::Member, None);
+    assert_eq!(roles(), before, "back to the role they had when it was given");
+    assert_eq!(sp.audit("role.unassigned").await[0]["details"]["reason"], "unlinked");
+    call(port, "POST", &format!("/api/users/{}/identities", u.id), &admin, &json!({ "provider": id, "subject": NAME_ID }).to_string()).await;
+    sign_in(Box::new(in_groups(&["Auditors"]))).await;
+    assert_eq!(roles(), given);
+
+    // Removing the mapping takes the role from everyone it gave it to.
+    let (code, gone) = call(port, "DELETE", &format!("/api/sso/role-mappings/{mid}"), &admin, "").await;
+    assert_eq!(code, 200, "{gone}");
+    assert_eq!(serde_json::from_str::<Value>(&gone).unwrap()["revoked"], json!([u.id]));
+    assert_eq!(roles(), before);
+    assert_eq!(sp.audit("role.unassigned").await[0]["details"]["reason"], "mapping_removed");
+    assert_eq!(sp.audit("sso.saml_role_unmapped").await.len(), 1);
+    sign_in(Box::new(in_groups(&["Auditors"]))).await;
+    assert_eq!(roles(), before);
+    assert_eq!(call(port, "DELETE", &format!("/api/roles/{}", auditor.id), &admin, "").await.0, 200);
+}
+
+#[tokio::test]
+async fn a_provider_that_stops_reading_groups_takes_back_what_its_groups_gave() {
+    let sp = serve(&[]).await;
+    let u = sp.link();
+    let auditor = sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None).unwrap();
+    // Mapped while it read groups, then restarted without.
+    let m = sp.app.db.create_saml_role_mapping(&sp.id, "Auditors", &auditor.id, None).unwrap();
+    assert!(sp.app.db.grant_saml_role(&m, &u.id));
+    let (code, _, _) = sp.sign_in(in_groups(&["Auditors"])).await;
+    assert_eq!(code, 200);
+    assert_eq!((sp.app.db.user(&u.id).unwrap().role, sp.app.db.user(&u.id).unwrap().role_id), (Role::Member, None));
+    assert_eq!(sp.audit("role.unassigned").await[0]["details"]["reason"], "groups_unknown");
+    let (_, v) = call(sp.port, "GET", &format!("/api/sso/role-mappings/{}", m.id), &sp.admin, "").await;
+    assert_eq!(serde_json::from_str::<Value>(&v).unwrap()["active"], false, "{v}");
+}

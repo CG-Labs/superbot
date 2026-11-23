@@ -15,13 +15,15 @@
 //! is the service provider, sends an AuthnRequest with the HTTP-Redirect binding, and checks
 //! the signed response the IdP posts to `/acs` (`saml_sp`, `xmldsig`). Both end in the same
 //! identities, checks, and sessions as the rest. Native SAML also signs AuthnRequests when a
-//! provider asks, and does single logout at `/slo` (ADR 0137, `saml_slo`).
+//! provider asks, and does single logout at `/slo` (ADR 0137, `saml_slo`), and can require
+//! IdP groups and map them to custom roles (ADR 0160, `saml_roles`).
 
 pub mod apple;
 mod github;
 pub mod jwt;
 mod provider;
 mod saml;
+pub(crate) mod saml_roles;
 pub(crate) mod saml_slo;
 pub(crate) mod saml_sp;
 pub(crate) mod xmldsig;
@@ -131,6 +133,9 @@ pub struct Sso {
     http: OnceLock<reqwest::Client>,
     /// Least time between JWKS fetches for a key id we don't know.
     pub refresh_gap: Duration,
+    /// Held while SAML group-to-role mappings change or a sign-in applies them (ADR 0160),
+    /// so a grant can't land on a mapping being removed.
+    pub(crate) role_writes: tokio::sync::Mutex<()>,
 }
 
 impl Default for Sso {
@@ -146,6 +151,7 @@ impl Default for Sso {
             logouts: Mutex::default(),
             http: OnceLock::new(),
             refresh_gap: Duration::from_secs(60),
+            role_writes: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -383,7 +389,7 @@ const TYPES: [&str; 6] = ["entra", "google", "oidc", "apple", "github", "saml"];
 
 /// Settings that only mean something for some types. Set on another, they would look like
 /// a restriction that isn't there, so they are refused.
-const ONLY_FOR: [(&str, &[&str]); 26] = [
+const ONLY_FOR: [(&str, &[&str]); 28] = [
     ("TENANT", &["entra"]),
     ("ALLOWED_TENANTS", &["entra"]),
     ("AUTHORITY", &["entra"]),
@@ -410,11 +416,13 @@ const ONLY_FOR: [(&str, &[&str]); 26] = [
     ("SP_ENCRYPTION_CERT_FILE", &["saml"]),
     ("METADATA_SIGNING_CERT_FILE", &["saml"]),
     ("SIGNED_METADATA", &["saml"]),
+    ("GROUPS_ATTRIBUTE", &["saml"]),
+    ("REQUIRED_GROUPS", &["saml"]),
 ];
 
 /// The SAML bridge's settings (with `ISSUER`), and native SAML's (without), so each refuses the other's.
 const SAML_BRIDGE_ONLY: [&str; 6] = ["CLIENT_ID", "IDP_ALIAS", "SCOPES", "SUBJECT_CLAIM", "EMAIL_CLAIM", "NAME_CLAIM"];
-const SAML_NATIVE_ONLY: [&str; 11] = [
+const SAML_NATIVE_ONLY: [&str; 13] = [
     "IDP_METADATA_URL",
     "IDP_METADATA_FILE",
     "SP_ENTITY_ID",
@@ -426,6 +434,8 @@ const SAML_NATIVE_ONLY: [&str; 11] = [
     "SP_ENCRYPTION_CERT_FILE",
     "METADATA_SIGNING_CERT_FILE",
     "SIGNED_METADATA",
+    "GROUPS_ATTRIBUTE",
+    "REQUIRED_GROUPS",
 ];
 
 /// Claims people or their admins can change, so they can't be the subject.
@@ -546,7 +556,17 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
                     None => Ok(None),
                 }
             };
-            let attributes = saml_sp::Attributes { email: attribute("EMAIL_ATTRIBUTE")?, name: attribute("NAME_ATTRIBUTE")? };
+            let attributes = saml_sp::Attributes { email: attribute("EMAIL_ATTRIBUTE")?, name: attribute("NAME_ATTRIBUTE")?, groups: attribute("GROUPS_ATTRIBUTE")? };
+            let mut required_groups: Vec<String> = Vec::new();
+            for g in list(&key("REQUIRED_GROUPS")) {
+                let g = saml_roles::group_name(&g).map_err(|e| format!("{}: {e}", key("REQUIRED_GROUPS")))?;
+                if !required_groups.contains(&g) {
+                    required_groups.push(g);
+                }
+            }
+            if !required_groups.is_empty() && attributes.groups.is_none() {
+                return Err(format!("{} needs {}: the assertion attribute the IdP sends groups in, like groups", key("REQUIRED_GROUPS"), key("GROUPS_ATTRIBUTE")));
+            }
             let allowed_domains = domains("ALLOWED_DOMAINS")?;
             if jit_role.is_some() && allowed_domains.is_empty() {
                 return Err(format!("{} without {} would let anyone SAML IdP {entity_id} signs in get an account: list your email domains, or link people instead", key("JIT_ROLE"), key("ALLOWED_DOMAINS")));
@@ -585,7 +605,7 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
                 return Err(format!("{} must be an RSA certificate: IdPs encrypt to it with RSA-OAEP", key("SP_ENCRYPTION_CERT_FILE")));
             }
             let metadata_trust = metadata_trust(&key, var)?;
-            (Kind::SamlSp { entity_id, sp_entity_id, source, attributes, allowed_domains, sign_requests, sp_cert, encryption, enc_cert, metadata_trust }, saml::LABEL)
+            (Kind::SamlSp { entity_id, sp_entity_id, source, attributes, required_groups, allowed_domains, sign_requests, sp_cert, encryption, enc_cert, metadata_trust }, saml::LABEL)
         }
         "saml" => {
             if let Some(k) = SAML_NATIVE_ONLY.iter().find(|k| var(&key(k)).is_some()) {
@@ -947,14 +967,15 @@ async fn finish(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, q: &Ha
             return ret.fail(if matches!(e.0, "wrong_domain" | "email_unverified" | "wrong_org" | "not_brokered") { "sso_wrong_account" } else { "sso_failed" });
         }
     };
-    complete(a, app, source, id, p, &pending, claims, None, at)
+    complete(a, app, source, id, p, &pending, claims, None, None, at).await
 }
 
 /// The end of every sign-in, once the IdP vouched for `claims`: the linked (or just-in-time)
 /// user, if active, gets a session cookie, or a one-time code for the app that started.
-/// `saml` is a native SAML sign-in's NameID and IdP session, kept with the session.
+/// `saml` is a native SAML sign-in's NameID and IdP session, kept with the session, and
+/// `groups` the groups its assertion listed, which its role mappings follow (ADR 0160).
 #[allow(clippy::too_many_arguments)]
-fn complete(a: &Auth, app: &AppState, source: &Source, id: &str, p: &Provider, pending: &Pending, mut claims: Claims, saml: Option<db::SamlLogin>, at: i64) -> Response {
+async fn complete(a: &Auth, app: &AppState, source: &Source, id: &str, p: &Provider, pending: &Pending, mut claims: Claims, saml: Option<db::SamlLogin>, groups: Option<&saml_sp::Groups>, at: i64) -> Response {
     let (sso, ret) = (&a.sso, &pending.ret);
     if claims.name.is_none() {
         claims.name = pending.name.clone();
@@ -965,6 +986,13 @@ fn complete(a: &Auth, app: &AppState, source: &Source, id: &str, p: &Provider, p
             failed(a, source, id, reason, Some(&claims), json!({}));
             return ret.fail(code);
         }
+    };
+    let user = match groups {
+        Some(g) => {
+            saml_roles::signed_in(app, a, source, p, &user, g).await;
+            app.db.user(&user.id).unwrap_or(user)
+        }
+        None => user,
     };
     match ret {
         Return::Cookie { .. } => {
@@ -1083,7 +1111,23 @@ async fn finish_saml(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, f
         failed(a, source, id, e.0, Some(&checked.claims), json!({}));
         return ret.fail("sso_wrong_account");
     }
-    complete(a, app, source, id, p, &pending, checked.claims, Some(checked.login), at)
+    // Before anyone is made just in time: only people the IdP puts in a required group.
+    if let Kind::SamlSp { required_groups, .. } = &p.kind
+        && !required_groups.is_empty()
+    {
+        let refusal = match &checked.groups {
+            saml_sp::Groups::Listed(g) if g.iter().any(|g| required_groups.contains(g)) => None,
+            saml_sp::Groups::Listed(_) => Some(("not_in_group", json!({}))),
+            saml_sp::Groups::Unknown(why) => Some(("groups_unknown", json!({ "groups": why }))),
+            saml_sp::Groups::NotRead => Some(("groups_unknown", json!({ "groups": "not_read" }))),
+        };
+        if let Some((reason, extra)) = refusal {
+            a.limiter.fail(&ip, at);
+            failed(a, source, id, reason, Some(&checked.claims), extra);
+            return ret.fail("sso_not_allowed");
+        }
+    }
+    complete(a, app, source, id, p, &pending, checked.claims, Some(checked.login), Some(&checked.groups), at).await
 }
 
 /// `GET /api/auth/sso/{id}/metadata`: our SAML SP metadata, for the IdP to import. With our
@@ -1326,7 +1370,7 @@ fn saml_provider<'a>(a: &'a Auth, id: &str) -> Result<&'a Arc<Provider>, ApiErro
 }
 
 fn saml_view(a: &Auth, p: &Provider) -> Value {
-    let Kind::SamlSp { entity_id, sp_entity_id, source, sign_requests, sp_cert, encryption, enc_cert, metadata_trust, .. } = &p.kind else {
+    let Kind::SamlSp { entity_id, sp_entity_id, source, attributes, required_groups, sign_requests, sp_cert, encryption, enc_cert, metadata_trust, .. } = &p.kind else {
         return json!({});
     };
     let cert = |c: &xmldsig::Cert| json!({ "sha256": c.sha256, "subject": c.subject, "notAfter": c.not_after * 1000 });
@@ -1362,6 +1406,8 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
         "metadataSigningCertificates": metadata_trust.as_ref().map(|t| t.certs.iter().map(cert).collect::<Vec<_>>()),
         "idpEntityId": entity_id, "source": source.name(), "from": from, "idp": idp,
         "audience": p.audience(), "jitRole": p.jit_role.map(Role::as_str),
+        "groupsAttribute": attributes.groups, "requiredGroups": required_groups,
+        "roleMappings": a.app.as_ref().map(|app| app.db.saml_role_mappings_of(&p.id).len()),
     })
 }
 
@@ -1515,11 +1561,13 @@ pub async fn link_identity(
     Ok((StatusCode::CREATED, Json(identity_view(&i))))
 }
 
-/// `DELETE /api/users/{key}/identities/{id}`. The user's sessions stay; revoke them separately.
-pub async fn unlink_identity(State(app): State<AppState>, Extension(by): Extension<Who>, Path((key, id)): Path<(String, String)>) -> Res {
+/// `DELETE /api/users/{key}/identities/{id}`. The user's sessions stay; revoke them
+/// separately. A role a SAML group gave them through that provider goes (ADR 0160).
+pub async fn unlink_identity(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path((key, id)): Path<(String, String)>) -> Res {
     let u = users::need_user_key(&app, &key)?;
     let i = app.db.unlink_identity(&u.id, &id).ok_or_else(|| not_found("Identity"))?;
     app.db.record(&by.event("user.identity_unlinked").target("user", &u.id).details(json!({ "identity": i.id, "provider": i.provider, "issuer": i.issuer, "subject": i.subject })));
+    saml_roles::unlinked(&app, &a, &by, &u.id, &i.provider).await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -1911,8 +1959,8 @@ mod tests {
         let p = s.provider("corp").unwrap();
         assert!(p.saml_sp() && !p.oidc() && !p.needs_secret());
         assert_eq!((p.type_name(), p.jit_role), ("saml", None), "audited as idp=saml, like the bridge");
-        assert!(matches!(&p.kind, Kind::SamlSp { entity_id, sp_entity_id, source: IdpSource::Saved, attributes, allowed_domains, sign_requests: false, sp_cert: None, encryption: Encryption::Off, enc_cert: None, metadata_trust: None }
-            if entity_id == ADFS && sp_entity_id == "https://bot.example.com/api/auth/sso/corp/metadata" && attributes.email.is_none() && allowed_domains.is_empty()));
+        assert!(matches!(&p.kind, Kind::SamlSp { entity_id, sp_entity_id, source: IdpSource::Saved, attributes, required_groups, allowed_domains, sign_requests: false, sp_cert: None, encryption: Encryption::Off, enc_cert: None, metadata_trust: None }
+            if entity_id == ADFS && sp_entity_id == "https://bot.example.com/api/auth/sso/corp/metadata" && attributes.email.is_none() && attributes.groups.is_none() && required_groups.is_empty() && allowed_domains.is_empty()));
         assert_eq!((p.env_var(), s.slo_url("corp")), ("SSO_CORP_PRIVATE_KEY".to_string(), "https://bot.example.com/api/auth/sso/corp/slo".to_string()));
         assert_eq!(s.callback_url("corp"), "https://bot.example.com/api/auth/sso/corp/acs");
         assert!(p.not_ready().unwrap().contains("botctl sso saml corp import"), "not offered until its metadata is imported");
@@ -1955,6 +2003,26 @@ mod tests {
         assert!(saml(&[("SSO_ADFS_IDP_METADATA_URL", "https://idp.example/m")]).is_err(), "a native setting on the bridge");
         assert!(saml(&[("SSO_ADFS_SP_ENTITY_ID", "urn:x")]).is_err());
         assert!(saml(&[("SSO_ADFS_SIGN_REQUESTS", "true")]).is_err(), "Keycloak signs the bridge's requests");
+    }
+
+    #[test]
+    fn reads_the_group_settings_and_refuses_unclear_ones() {
+        let s = native(&[("SSO_CORP_GROUPS_ATTRIBUTE", "http://schemas.microsoft.com/ws/2008/06/identity/claims/groups"), ("SSO_CORP_REQUIRED_GROUPS", "SuperBot Users, Admins ,SuperBot Users")]).unwrap();
+        assert!(matches!(&s.providers[0].kind, Kind::SamlSp { attributes, required_groups, .. }
+            if attributes.groups.as_deref() == Some("http://schemas.microsoft.com/ws/2008/06/identity/claims/groups") && required_groups == &["SuperBot Users", "Admins"]));
+        let s = native(&[("SSO_CORP_GROUPS_ATTRIBUTE", "groups")]).unwrap();
+        assert!(matches!(&s.providers[0].kind, Kind::SamlSp { attributes, required_groups, .. } if attributes.groups.as_deref() == Some("groups") && required_groups.is_empty()), "groups read, nobody kept out");
+        let long: &'static str = "g".repeat(saml_sp::MAX_GROUP_LEN + 1).leak();
+        for (vars, why) in [
+            (vec![("SSO_CORP_REQUIRED_GROUPS", "Admins")], "required groups with no attribute to read them from"),
+            (vec![("SSO_CORP_GROUPS_ATTRIBUTE", "my groups")], "not an attribute name"),
+            (vec![("SSO_CORP_GROUPS_ATTRIBUTE", "groups"), ("SSO_CORP_REQUIRED_GROUPS", long)], "a group longer than is ever read"),
+            (vec![("SSO_CORP_GROUPS_ATTRIBUTE", "groups"), ("SSO_CORP_REQUIRED_GROUPS", "Admins\u{7}")], "a control character"),
+        ] {
+            assert!(native(&vars).is_err(), "{why}");
+        }
+        assert!(saml(&[("SSO_ADFS_GROUPS_ATTRIBUTE", "groups")]).is_err(), "native only: the bridge doesn't pass groups");
+        assert!(entra(&[("SSO_ENTRA_REQUIRED_GROUPS", "Admins")]).is_err(), "SAML only");
     }
 
     #[test]
