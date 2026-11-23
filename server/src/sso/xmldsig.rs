@@ -360,6 +360,31 @@ pub fn verify_enveloped(signed: Node, certs: &[Cert]) -> Result<bool, Invalid> {
     if certs.iter().any(|c| c.verifies(alg, info.as_bytes(), &value)) { Ok(true) } else { Err(Invalid("bad_signature")) }
 }
 
+/// `xml` (one message, whose root has `ID` = `id` and an `Issuer` first) with an enveloped
+/// signature after its Issuer, as SAML's schema places it: exactly the shape
+/// `verify_enveloped` takes, SHA-256 digest, `sign` making the `alg` signature over the
+/// canonical SignedInfo, and `cert` (base64 DER) in its KeyInfo. For the SOAP binding, which
+/// has no signature of its own (ADR 0208).
+pub fn sign_enveloped(xml: &str, id: &str, alg: &str, cert: &str, sign: impl Fn(&[u8]) -> Vec<u8>) -> Result<String, Invalid> {
+    let doc = parse(xml)?;
+    let root = doc.root_element();
+    if root.attribute("ID") != Some(id) {
+        return Err(Invalid("bad_response"));
+    }
+    let first = root.first_element_child().ok_or(Invalid("bad_response"))?;
+    let digest = STANDARD.encode(Sha256::digest(exc_c14n(root, None, &[])?.as_bytes()));
+    let signed_info = format!(
+        r##"<ds:SignedInfo xmlns:ds="{DSIG}"><ds:CanonicalizationMethod Algorithm="{EXC_C14N}"/><ds:SignatureMethod Algorithm="{alg}"/><ds:Reference URI="#{id}"><ds:Transforms><ds:Transform Algorithm="{ENVELOPED}"/><ds:Transform Algorithm="{EXC_C14N}"/></ds:Transforms><ds:DigestMethod Algorithm="{SHA256}"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo>"##
+    );
+    let info = parse(&signed_info)?;
+    let value = STANDARD.encode(sign(exc_c14n(info.root_element(), None, &[])?.as_bytes()));
+    // Inside the Signature, which declares ds:, the SignedInfo canonicalizes the same.
+    let body = signed_info.replacen(&format!(r#"<ds:SignedInfo xmlns:ds="{DSIG}">"#), "<ds:SignedInfo>", 1);
+    let sig = format!(r#"<ds:Signature xmlns:ds="{DSIG}">{body}<ds:SignatureValue>{value}</ds:SignatureValue><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>"#);
+    let at = first.range().end;
+    Ok(format!("{}{sig}{}", &xml[..at], &xml[at..]))
+}
+
 #[cfg(test)]
 pub mod test_signer {
     //! Signs SAML the way an IdP does, with a fresh key (RSA, or ECDSA on P-256 or P-384) and

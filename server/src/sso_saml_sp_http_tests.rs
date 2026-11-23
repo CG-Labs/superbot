@@ -531,6 +531,233 @@ async fn refusals_before_a_signature_is_checked_are_logged_sparingly() {
     assert_eq!(failed[0]["details"]["reason"], "no_slo");
 }
 
+// Back-channel (SOAP) logout (ADR 0208)
+
+impl Sp {
+    fn slo_soap(&self) -> String {
+        format!("{}/soap", self.slo())
+    }
+
+    /// The IdP's server at our SOAP SLO URL: the status, the content type, and the body.
+    async fn soap(&self, envelope: &str) -> (u16, String, String) {
+        let res = http().post(self.slo_soap()).header("content-type", "text/xml; charset=utf-8").header("soapaction", crate::sso::saml_slo::SOAP_ACTION).body(envelope.to_string()).send().await.unwrap();
+        assert!(res.headers().get("set-cookie").is_none(), "{:?}", res.headers());
+        let ty = res.headers().get("content-type").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+        (res.status().as_u16(), ty, res.text().await.unwrap())
+    }
+
+    /// A client-app sign-in in the IdP session `index`: its bearer token.
+    async fn app_token(&self, index: &str) -> String {
+        let verifier = "v".repeat(64);
+        let start = format!("/api/auth/sso/{}/start?session=token&redirect=superbot%3A%2F%2Fauth&challenge={}&state=st-1&label=Phone", self.id, s256(&verifier));
+        let (code, head, _) = crate::tests::call_with(self.port, "GET", &start, "", "", "").await;
+        assert_eq!(code, 303, "{head}");
+        let to_idp = url::Url::parse(&header(&head, "location").unwrap()).unwrap();
+        let q: HashMap<_, _> = to_idp.query_pairs().into_owned().collect();
+        let request = String::from_utf8(miniz_oxide::inflate::decompress_to_vec(&STANDARD.decode(&q["SAMLRequest"]).unwrap()).unwrap()).unwrap();
+        let id = request.split(" ID=\"").nth(1).unwrap().split('"').next().unwrap();
+        let mut r = Response::new(&self.acs(), &self.entity(), id, db::now());
+        r.session_index = index.into();
+        let (code, to, _) = self.post(Some(&r.posted()), Some(&q["RelayState"]), "").await;
+        assert_eq!(code, 303, "{to}");
+        let back: HashMap<_, _> = url::Url::parse(&to).unwrap().query_pairs().into_owned().collect();
+        let (code, res) = call(self.port, "POST", "/api/auth/login", "", &json!({ "sso": back["code"], "verifier": verifier }).to_string()).await;
+        assert_eq!(code, 200, "{res}");
+        format!("Bearer {}", serde_json::from_str::<Value>(&res).unwrap()["token"].as_str().unwrap())
+    }
+
+    /// The newest `action` event, waiting for one botd records in the background.
+    async fn audited(&self, action: &str, after: usize) -> Value {
+        for _ in 0..100 {
+            let all = self.audit(action).await;
+            if all.len() > after {
+                return all[0].clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("no {action} event");
+    }
+}
+
+/// The LogoutResponse in a SOAP answer, after checking it is signed by `cert`.
+fn signed_soap_answer(body: &str, cert: &crate::sso::xmldsig::Cert) -> String {
+    let doc = crate::sso::xmldsig::parse(body).unwrap();
+    let m = doc.descendants().find(|n| crate::sso::xmldsig::is(*n, crate::sso::saml_sp::PROTOCOL, "LogoutResponse")).expect("a LogoutResponse");
+    assert!(crate::sso::xmldsig::is(m.parent().unwrap(), crate::sso::saml_slo::SOAP11, "Body"), "{body}");
+    assert_eq!(crate::sso::xmldsig::verify_enveloped(m, std::slice::from_ref(cert)), Ok(true), "signed by our key");
+    body[m.range()].to_string()
+}
+
+#[tokio::test]
+async fn an_idp_logout_request_over_soap_revokes_the_sessions_it_names_and_is_answered_signed() {
+    // The IdP's metadata has no SLO URL at all: the answer goes back on the same connection.
+    let sp = serve(&[]).await;
+    let u = sp.link();
+    let (first, second) = (sp.cookie("_s1").await, sp.cookie("_s2").await);
+    let cert = sp.sp_cert().await;
+    let md = http().get(format!("http://127.0.0.1:{}/api/auth/sso/{}/metadata", sp.port, sp.id)).send().await.unwrap().text().await.unwrap();
+    assert!(md.contains(&format!(r#"<md:SingleLogoutService Binding="urn:oasis:names:tc:SAML:2.0:bindings:SOAP" Location="{}"/>"#, sp.slo_soap())), "{md}");
+    let now = db::now();
+    let request = |index: Option<&str>| Logout { relay: None, ..Logout::request(&sp.slo_soap(), NAME_ID, index, now) };
+
+    let l = request(Some("_s1"));
+    let (code, ty, body) = sp.soap(&l.soap()).await;
+    assert_eq!((code, ty.as_str()), (200, "text/xml; charset=utf-8"), "{body}");
+    let answer = signed_soap_answer(&body, &cert);
+    assert!(answer.contains(&format!(r#"InResponseTo="{}""#, l.id)) && answer.contains("status:Success") && !answer.contains("Destination="), "{answer}");
+    assert_eq!((sp.who(&first).await, sp.who(&second).await), (None, Some(u.id.clone())));
+    let slo = &sp.audit("auth.slo").await[0];
+    assert_eq!((slo["actorId"].as_str(), slo["details"]["binding"].as_str(), slo["details"]["revoked"].as_u64()), (Some(u.id.as_str()), Some("soap"), Some(1)));
+
+    // Refusals are SOAP faults, audited like the front channel's, with the binding.
+    let fault = |code: u16, body: &str| {
+        assert_eq!(code, 500, "{body}");
+        assert!(body.contains("<soap11:Fault>") && !body.contains("LogoutResponse"), "{body}");
+    };
+    let (code, _, body) = sp.soap(&l.soap()).await;
+    fault(code, &body);
+    let failed = &sp.audit("auth.slo_failed").await[0]["details"];
+    assert_eq!((failed["reason"].as_str(), failed["binding"].as_str()), (Some("replayed"), Some("soap")));
+    let (code, _, body) = sp.soap(&Logout { signer: None, ..request(None) }.soap()).await;
+    fault(code, &body);
+    assert_eq!(sp.audit("auth.slo_failed").await[0]["details"]["reason"], "unsigned");
+    let (code, _, body) = sp.soap(&Logout { relay: None, ..Logout::request(&sp.slo(), NAME_ID, None, now) }.soap()).await;
+    fault(code, &body);
+    assert_eq!(sp.audit("auth.slo_failed").await[0]["details"]["reason"], "wrong_destination", "signed for the front channel's URL");
+    let header = request(None).soap().replacen("<soap11:Body>", r#"<soap11:Header><x:Sec xmlns:x="urn:x" soap11:mustUnderstand="1"/></soap11:Header><soap11:Body>"#, 1);
+    let (code, _, body) = sp.soap(&header).await;
+    assert!(code == 500 && body.contains("soap11:MustUnderstand"), "{body}");
+    // Over the front channel's binding, a SOAP envelope is just a bad form.
+    assert_eq!(http().post(sp.slo()).header("content-type", "text/xml").body(request(None).soap()).send().await.unwrap().status().as_u16(), 415);
+    assert_eq!(http().get(sp.slo_soap()).send().await.unwrap().status().as_u16(), 405);
+    assert_eq!(sp.who(&second).await, Some(u.id.clone()));
+
+    // No SessionIndex: every session Ada has from this IdP.
+    let (code, _, body) = sp.soap(&request(None).soap()).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(sp.who(&second).await, None);
+}
+
+/// A stand-in for the IdP's SOAP SLO URL: what it was sent, and what it answers.
+#[derive(Clone, Default)]
+struct SoapIdp {
+    got: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// `ok`, `fault`, `other` (answers another request) or `partial`.
+    answer: Arc<std::sync::Mutex<&'static str>>,
+}
+
+impl SoapIdp {
+    async fn start() -> (SoapIdp, String) {
+        let idp = SoapIdp { answer: Arc::new(std::sync::Mutex::new("ok")), ..Default::default() };
+        let state = idp.clone();
+        let app = axum::Router::new().route(
+            "/soap",
+            axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+                let state = state.clone();
+                async move {
+                    let action = headers.get("soapaction").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+                    state.got.lock().unwrap().push((action, body.clone()));
+                    let id = body.split(" ID=\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+                    let answer = *state.answer.lock().unwrap();
+                    let mut r = Logout { destination: None, ..Logout::response("", &id, db::now()) };
+                    match answer {
+                        "fault" => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, crate::sso::saml_slo::soap_fault("x")),
+                        "other" => r.in_response_to = "_not-yours".into(),
+                        "partial" => r.status = "urn:oasis:names:tc:SAML:2.0:status:Responder".into(),
+                        _ => {}
+                    }
+                    (axum::http::StatusCode::OK, r.soap())
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://127.0.0.1:{}/soap", listener.local_addr().unwrap().port());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (idp, url)
+    }
+
+    fn last(&self) -> (String, String) {
+        self.got.lock().unwrap().last().cloned().expect("a SOAP request")
+    }
+}
+
+#[tokio::test]
+async fn signing_out_without_a_browser_sends_the_idp_a_logout_request_over_soap() {
+    let (stub, soap_url) = SoapIdp::start().await;
+    let sp = serve(&[]).await;
+    let xml = test_idp::with_soap_slo(&test_idp::with_slo(&test_idp::metadata()), &soap_url);
+    let (code, view) = call(sp.port, "PUT", &format!("/api/sso/{}/saml/idp-metadata", sp.id), &sp.admin, &json!({ "xml": xml }).to_string()).await;
+    assert_eq!(code, 200, "{view}");
+    let view: Value = serde_json::from_str(&view).unwrap();
+    assert_eq!((view["backChannelLogout"].as_bool(), view["sloSoapUrl"].as_str(), view["idp"]["sloSoapUrl"].as_str()), (Some(true), Some(sp.slo_soap().as_str()), Some(soap_url.as_str())));
+    let u = sp.link();
+    let cert = sp.sp_cert().await;
+
+    // The phone app signs out: botd tells the IdP itself, and answers the app at once.
+    let token = sp.app_token("_s1").await;
+    let (code, body) = call(sp.port, "POST", "/api/auth/logout", &token, "").await;
+    assert_eq!((code, serde_json::from_str::<Value>(&body).unwrap()), (200, json!({ "ok": true })), "nothing for the app to follow");
+    let done = sp.audited("auth.slo_response", 0).await;
+    let (action, sent) = stub.last();
+    assert_eq!(action, crate::sso::saml_slo::SOAP_ACTION);
+    let doc = crate::sso::xmldsig::parse(&sent).unwrap();
+    let m = doc.descendants().find(|n| crate::sso::xmldsig::is(*n, crate::sso::saml_sp::PROTOCOL, "LogoutRequest")).expect("a LogoutRequest");
+    assert!(crate::sso::xmldsig::is(m.parent().unwrap(), crate::sso::saml_slo::SOAP11, "Body"));
+    assert_eq!(crate::sso::xmldsig::verify_enveloped(m, std::slice::from_ref(&cert)), Ok(true), "signed by our key");
+    assert_eq!(m.attribute("Destination"), Some(soap_url.as_str()));
+    assert!(sent.contains(&format!(">{NAME_ID}</saml:NameID>")) && sent.contains("<samlp:SessionIndex>_s1</samlp:SessionIndex>"), "{sent}");
+    let id = m.attribute("ID").unwrap().to_string();
+    let logout = &sp.audit("auth.logout").await[0];
+    assert_eq!((logout["actorId"].as_str(), logout["details"]["slo"].as_str(), logout["details"]["sloBinding"].as_str()), (Some(u.id.as_str()), Some(id.as_str()), Some("soap")));
+    let d = &done["details"];
+    assert_eq!((done["outcome"].as_str(), d["requestId"].as_str(), d["status"].as_str(), d["binding"].as_str()), (Some("success"), Some(id.as_str()), Some("Success"), Some("soap")));
+    assert_eq!((done["targetType"].as_str(), done["targetId"].as_str()), (Some("session"), logout["targetId"].as_str()));
+    assert_eq!(call(sp.port, "GET", "/api/auth/me", &token, "").await.0, 401, "signed out here first");
+
+    // A browser, with the front channel there, still goes to the IdP itself.
+    let cookie = sp.cookie("_s2").await;
+    let (_, _, body) = crate::tests::call_with(sp.port, "POST", "/api/auth/logout", "", &cookie, "").await;
+    assert!(serde_json::from_str::<Value>(&body).unwrap()["logoutUrl"].as_str().unwrap().starts_with(test_idp::SLO_URL), "{body}");
+    assert_eq!(stub.got.lock().unwrap().len(), 1);
+
+    // Answers that don't say it worked are audited as failures, with why.
+    for (answer, status, reason) in [("partial", "Responder", None), ("fault", "none", Some("soap_fault")), ("other", "none", Some("unknown_request"))] {
+        *stub.answer.lock().unwrap() = answer;
+        let before = sp.audit("auth.slo_response").await.len();
+        let token = sp.app_token("_s3").await;
+        assert_eq!(call(sp.port, "POST", "/api/auth/logout", &token, "").await.0, 200);
+        let e = sp.audited("auth.slo_response", before).await;
+        assert_eq!((e["outcome"].as_str(), e["details"]["status"].as_str(), e["details"]["reason"].as_str()), (Some("failure"), Some(status), reason), "{answer}");
+    }
+}
+
+#[tokio::test]
+async fn a_browser_signs_out_over_soap_when_the_idp_has_no_front_channel() {
+    let (stub, soap_url) = SoapIdp::start().await;
+    let sp = serve(&[]).await;
+    let xml = test_idp::with_soap_slo(&test_idp::metadata(), &soap_url);
+    let (code, view) = call(sp.port, "PUT", &format!("/api/sso/{}/saml/idp-metadata", sp.id), &sp.admin, &json!({ "xml": xml }).to_string()).await;
+    assert_eq!(code, 200, "{view}");
+    let view: Value = serde_json::from_str(&view).unwrap();
+    assert_eq!((view["singleLogout"].as_bool(), view["backChannelLogout"].as_bool()), (Some(false), Some(true)));
+    sp.link();
+    let cookie = sp.cookie("_s1").await;
+    let (code, _, body) = crate::tests::call_with(sp.port, "POST", "/api/auth/logout", "", &cookie, "").await;
+    assert_eq!((code, serde_json::from_str::<Value>(&body).unwrap()), (200, json!({ "ok": true })));
+    assert_eq!(sp.audited("auth.slo_response", 0).await["outcome"], "success");
+    assert!(stub.last().1.contains("<samlp:SessionIndex>_s1</samlp:SessionIndex>"));
+    // An IdP that is down: the sign-out here stands, and the failure is audited.
+    let down = serve(&[]).await;
+    let xml = test_idp::with_soap_slo(&test_idp::metadata(), "http://127.0.0.1:9/soap");
+    call(down.port, "PUT", &format!("/api/sso/{}/saml/idp-metadata", down.id), &down.admin, &json!({ "xml": xml }).to_string()).await;
+    down.link();
+    let cookie = down.cookie("_s1").await;
+    assert_eq!(crate::tests::call_with(down.port, "POST", "/api/auth/logout", "", &cookie, "").await.0, 200);
+    assert_eq!(down.who(&cookie).await, None);
+    let e = down.audited("auth.slo_response", 0).await;
+    assert_eq!((e["outcome"].as_str(), e["details"]["reason"].as_str()), (Some("failure"), Some("unreachable")));
+}
+
 // Encrypted assertions (ADR 0150)
 
 impl Sp {
