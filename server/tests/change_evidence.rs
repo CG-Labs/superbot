@@ -3,8 +3,11 @@
 //! headers and no further than the period needs, a rate limit waited out, the token sent
 //! on every request and never written, and a bundle any `tar` and `sha256sum -c` accept,
 //! holding each merged pull request's approvals and checks, the exceptions an auditor
-//! samples, the branch's protection and the CI runs on it. Also checks the workflow that
-//! runs it monthly asks for read access only.
+//! samples, the branch's protection and the CI runs on it. ADR 0154: `superbot-evidence
+//! vulnerabilities` against the same stand-in, with Dependabot alerts over two pages and
+//! code scanning alerts judged against their remediation windows, the accepted findings
+//! read from the repository, and a token without Dependabot access recorded, not fatal.
+//! Also checks the workflow that runs both monthly asks for read access only.
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri, header};
@@ -23,6 +26,8 @@ const HEAD102: &str = "a102a102a102a102a102a102a102a102a102a102";
 const HEAD101: &str = "a101a101a101a101a101a101a101a101a101a101";
 const DIRECT: &str = "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0";
 const PUSHED_LATER: &str = "e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0";
+/// A token the stand-in refuses Dependabot alerts to, as GitHub does without the permission.
+const NO_DEPENDABOT: &str = "test-token-no-dependabot-7c1d";
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
@@ -51,7 +56,7 @@ fn reply(status: u16, body: String, link: Option<String>) -> Response {
 
 async fn github(State(m): State<Arc<Mock>>, uri: Uri, headers: HeaderMap) -> Response {
     let auth = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).map(String::from);
-    m.requests.lock().unwrap().push((uri.to_string(), auth));
+    m.requests.lock().unwrap().push((uri.to_string(), auth.clone()));
     let q: HashMap<String, String> = url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()).into_owned().collect();
     let base = m.base.lock().unwrap().clone();
     let path = uri.path();
@@ -121,6 +126,28 @@ async fn github(State(m): State<Arc<Mock>>, uri: Uri, headers: HeaderMap) -> Res
             _ => ok("statuses-101-page2.json"),
         },
         r if r == format!("/commits/{DIRECT}/pulls") => ok("commit-pulls-direct.json"),
+        "/dependabot/alerts" => {
+            if auth.as_deref() == Some(&format!("Bearer {NO_DEPENDABOT}")) {
+                return reply(403, r#"{"message":"Resource not accessible by integration"}"#.into(), None);
+            }
+            assert_eq!((q["sort"].as_str(), q["direction"].as_str()), ("created", "asc"));
+            match q.get("after").map(String::as_str) {
+                None => reply(200, fixture("dependabot-alerts-page1.json"), Some(format!("<{base}{REPO}/dependabot/alerts?sort=created&direction=asc&per_page=100&after=k1>; rel=\"next\""))),
+                _ => ok("dependabot-alerts-page2.json"),
+            }
+        }
+        "/code-scanning/alerts" => {
+            assert_eq!(q["ref"].as_str(), "refs/heads/main", "the default branch's analysis");
+            ok("code-scanning-alerts.json")
+        }
+        "/contents/.cargo/audit.toml" | "/contents/.grype.yaml" => {
+            assert_eq!(q["ref"].as_str(), "main");
+            use base64::Engine;
+            let text = fs::read(repo().join(rest.trim_start_matches("/contents/"))).unwrap();
+            let b64 = base64::engine::general_purpose::STANDARD.encode(text);
+            let wrapped: Vec<String> = b64.as_bytes().chunks(60).map(|c| String::from_utf8_lossy(c).into_owned()).collect();
+            reply(200, serde_json::json!({ "path": rest, "sha": "0123abcd", "content": wrapped.join("\n"), "encoding": "base64" }).to_string(), None)
+        }
         _ => reply(404, r#"{"message":"Not Found"}"#.into(), None),
     }
 }
@@ -156,6 +183,18 @@ fn export(dir: &Path, api: &str, env: &[(&str, &str)], args: &[&str]) -> Output 
         cmd.env(k, v);
     }
     cmd.args(["github", "--repo", "example-org/example-repo", "--from", "2026-10-01", "--to", "2026-11-01"]).args(args).output().unwrap()
+}
+
+fn export_vulns(dir: &Path, api: &str, token: &str, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_superbot-evidence"))
+        .current_dir(dir)
+        .env_remove("GH_TOKEN")
+        .env("GITHUB_TOKEN", token)
+        .env("GITHUB_API_URL", api)
+        .args(["vulnerabilities", "--repo", "example-org/example-repo", "--from", "2026-10-01", "--to", "2026-11-01"])
+        .args(args)
+        .output()
+        .unwrap()
 }
 
 fn text(o: &Output) -> (String, String) {
@@ -292,6 +331,75 @@ fn refuses_without_a_token_off_https_and_with_a_token_on_the_command_line() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn exports_vulnerability_alerts_judged_against_their_windows_as_a_checkable_bundle() {
+    let m = serve();
+    let api = m.base.lock().unwrap().clone();
+    let dir = temp();
+    let o = export_vulns(&dir, &api, TOKEN, &["-o", "vulns.tar"]);
+    let (out, err) = text(&o);
+    assert!(o.status.success(), "superbot-evidence failed:\n{out}\n{err}");
+    assert!(out.contains("6 alerts open at some time in the period: 4 closed in it (2 fixed, 2 dismissed), 2 open at its end."), "{out}");
+    assert!(out.contains("Closed after their due date: dependabot#2"), "{out}");
+    assert!(out.contains("Open past their due date at the period's end: dependabot#5"), "{out}");
+    assert!(out.contains("Dismissed without a reason: code-scanning#12"), "{out}");
+    assert!(out.contains(".cargo/audit.toml: 1 accepted findings, 0 without a reason."), "{out}");
+    let requests = m.requests.lock().unwrap().clone();
+    assert!(requests.iter().all(|(_, auth)| auth.as_deref() == Some(&format!("Bearer {TOKEN}"))));
+    assert!(requests.iter().any(|(u, _)| u.contains("after=k1")), "the second page of Dependabot alerts is read");
+
+    let tar = dir.join("vulns.tar");
+    let raw = fs::read(&tar).unwrap();
+    assert!(!raw.windows(TOKEN.len()).any(|w| w == TOKEN.as_bytes()), "the token is never written");
+    for never in ["never kept", "maintainer@example.com"] {
+        assert!(!raw.windows(never.len()).any(|w| w == never.as_bytes()), "{never:?} is in the bundle");
+    }
+    assert!(Command::new("tar").arg("-xf").arg(&tar).current_dir(&dir).status().unwrap().success(), "any tar reads it");
+    let folder = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).find(|p| p.is_dir()).unwrap();
+    let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.starts_with("superbot-vulns-2026-10-01_2026-11-01-"), "{name}");
+    let check = Command::new("sha256sum").args(["-c", "SHA256SUMS"]).current_dir(&folder).output().unwrap();
+    assert!(check.status.success(), "sha256sum -c: {}", String::from_utf8_lossy(&check.stdout));
+
+    let manifest = json(&folder, "manifest.json");
+    assert_eq!((manifest["kind"].as_str(), manifest["format"].as_u64(), manifest["alerts"].as_u64()), (Some("vulnerability-management"), Some(1), Some(6)));
+    assert_eq!(manifest["windows"]["days"], serde_json::json!({ "critical": 30, "high": 30, "medium": 90, "low": 90 }));
+    assert_eq!((manifest["source"]["dependabot"].as_bool(), manifest["source"]["codeScanning"].as_bool()), (Some(true), Some(true)));
+    let files: Vec<&str> = manifest["files"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+    assert_eq!(files, ["README.txt", "vulnerability-alerts.json", "accepted-findings.json"]);
+    assert_eq!(manifest["files"][1]["checklist"], serde_json::json!(["CC4.2-1", "CC7.1-2", "CC7.1-3"]));
+
+    let v = json(&folder, "vulnerability-alerts.json");
+    let ids: Vec<&str> = v["alerts"].as_array().unwrap().iter().map(|a| a["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["dependabot#5", "dependabot#2", "dependabot#3", "code-scanning#11", "code-scanning#12", "dependabot#4"], "open in the period, oldest first; not #1, closed before it, or #6, opened after");
+    let by = &v["summary"]["bySeverity"];
+    assert_eq!((by["critical"]["closed"].as_u64(), by["critical"]["closedLate"].as_u64(), by["critical"]["closedWithinWindow"].as_u64()), (Some(2), Some(1), Some(1)), "dependabot#2 took 35 days; code-scanning#11 one");
+    assert_eq!((by["high"]["overdueAtEnd"].as_u64(), by["medium"]["openAtEnd"].as_u64(), by["medium"]["overdueAtEnd"].as_u64()), (Some(1), Some(1), Some(0)), "code-scanning#12 is a warning, so Medium, and closed");
+    assert_eq!(v["exceptions"]["closedLate"], serde_json::json!(["dependabot#2"]));
+    let a3 = &v["alerts"][2];
+    assert_eq!((a3["dismissedReason"].as_str(), a3["dismissedBy"].as_str(), a3["advisory"]["ghsa"].as_str()), (Some("tolerable_risk"), Some("maintainer-m"), Some("GHSA-xxxx-xxxx-0003")));
+    assert_eq!(v["alerts"][3]["rule"]["tool"], "Grype");
+    assert_eq!((v["sources"]["dependabot"]["alertsRead"].as_u64(), v["sources"]["codeScanning"]["inPeriod"].as_u64()), (Some(6), Some(2)));
+    assert_eq!(v["periodCovered"]["days"], 31);
+
+    let acc = json(&folder, "accepted-findings.json");
+    let cargo = &acc["files"][0];
+    assert_eq!((cargo["tool"].as_str(), cargo["blobSha"].as_str(), cargo["withoutReason"].as_u64()), (Some("cargo-audit"), Some("0123abcd"), Some(0)));
+    assert!(cargo["findings"][0]["id"].as_str().unwrap().starts_with("RUSTSEC-"));
+    let grype = &acc["files"][1];
+    assert!(grype["total"].as_u64().unwrap() >= 1 && grype["withoutReason"] == 0, "{grype}");
+
+    let o = export_vulns(&dir, &api, NO_DEPENDABOT, &["-o", "limited.tar", "--windows", "high=60"]);
+    let (out, err) = text(&o);
+    assert!(o.status.success(), "a source the token can't read is recorded, not fatal:\n{out}\n{err}");
+    assert!(out.contains("Dependabot alerts weren't readable (GitHub answered 403)"), "{out}");
+    let o = export_vulns(&dir, &api, TOKEN, &["-o", "limited.tar"]);
+    assert!(!o.status.success() && text(&o).1.contains("limited.tar"), "never over an existing file");
+    let o = export_vulns(&dir, &api, TOKEN, &["--windows", "high=0"]);
+    assert!(!o.status.success() && text(&o).1.contains("--windows"), "{:?}", text(&o));
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The workflow that runs it monthly: read access only, the export pinned to this
 /// repository's own code, dispatch inputs through the environment, never into the script.
 #[test]
@@ -299,13 +407,14 @@ fn the_monthly_workflow_reads_only() {
     let wf = fs::read_to_string(repo().join(".github/workflows/change-evidence.yml")).expect(".github/workflows/change-evidence.yml exists");
     let perms: Vec<&str> = wf.lines().skip_while(|l| *l != "permissions:").skip(1).take_while(|l| l.starts_with("  ")).map(str::trim).collect();
     assert!(!perms.is_empty(), "a top-level permissions block");
-    for want in ["contents: read", "pull-requests: read", "actions: read", "checks: read", "statuses: read"] {
+    for want in ["contents: read", "pull-requests: read", "actions: read", "checks: read", "statuses: read", "security-events: read", "vulnerability-alerts: read"] {
         assert!(perms.contains(&want), "permissions need {want}: {perms:?}");
     }
     assert!(perms.iter().all(|p| p.ends_with(": read")), "read access only: {perms:?}");
     assert!(!wf.contains("write"), "nothing in it may write");
     assert!(wf.contains("cron:") && wf.contains("workflow_dispatch:"), "monthly, and on demand");
     assert!(wf.contains("--bin superbot-evidence"), "builds the exporter from this commit");
+    assert!(wf.contains("superbot-evidence\" github ") && wf.contains("superbot-evidence\" vulnerabilities "), "exports both bundles");
     assert!(wf.contains("GITHUB_TOKEN: ${{ github.token }}"), "uses the workflow's own token");
     let indent = |l: &str| l.len() - l.trim_start().len();
     let mut block: Option<usize> = None;
