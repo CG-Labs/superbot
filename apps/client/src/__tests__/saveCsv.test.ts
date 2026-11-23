@@ -2,6 +2,7 @@ import { Share } from "react-native";
 import * as Sharing from "expo-sharing";
 import { saveCsv } from "../saveCsv";
 import { saveCsv as saveCsvWeb } from "../saveCsv.web";
+import { MARKDOWN } from "../fileTypes";
 
 const mockFiles: { uri: string; created?: unknown; text?: string }[] = [];
 jest.mock("expo-file-system", () => ({
@@ -34,6 +35,15 @@ describe("saveCsv on phones", () => {
     await saveCsv("superbot-audit-x.csv", CSV);
     expect(mockFiles[0]).toMatchObject({ uri: "file:///cache/superbot-audit-x.csv", created: { overwrite: true }, text: CSV });
     expect(Sharing.shareAsync).toHaveBeenCalledWith("file:///cache/superbot-audit-x.csv", expect.objectContaining({ mimeType: "text/csv" }));
+  });
+
+  it("shares other kinds of file as what they are", async () => {
+    await saveCsv("superbot-residency-user-20261123.md", "# Report\n", "Save residency report", MARKDOWN);
+    expect(Sharing.shareAsync).toHaveBeenCalledWith("file:///cache/superbot-residency-user-20261123.md", {
+      mimeType: "text/markdown",
+      UTI: "net.daringfireball.markdown",
+      dialogTitle: "Save residency report",
+    });
   });
 
   it("shares the text where file sharing isn't available", async () => {
@@ -78,5 +88,7 @@ describe("saveCsv on web", () => {
     expect(URL.revokeObjectURL).not.toHaveBeenCalled();
     jest.runAllTimers();
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:x");
+    await saveCsvWeb("r.md", "# Report\n", undefined, MARKDOWN);
+    expect(blob?.type).toBe("text/markdown;charset=utf-8");
   });
 });

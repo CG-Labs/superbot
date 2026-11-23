@@ -3,7 +3,8 @@
 //! people across the server, or to a team's members within their team. The built-in
 //! roles are presets of the same permissions and can't be changed. Everything here is
 //! for admins only (`rbac::classify` leaves `/api/roles` to Admin), and audited. A SCIM
-//! group can be mapped to a role (ADR 0138); its members hold it while in the group.
+//! group can be mapped to a role (ADR 0138), and so can a native SAML provider's group
+//! across the server (ADR 0160); their members hold it while in the group.
 
 use crate::audit::Who;
 use crate::db::{CustomRole, RoleError, User};
@@ -50,6 +51,7 @@ fn view(app: &AppState, r: &CustomRole) -> Value {
         "permissions": perms.names(), "unknown": unknown,
         "effective": rbac::granted(Principal::User(r.base), perms),
         "users": users.len(), "teamMembers": teams.len(), "scimMappings": app.db.scim_role_mappings_of_role(&r.id).len(),
+        "samlMappings": app.db.saml_role_mappings_of_role(&r.id).len(),
         "createdAt": r.created_at, "createdBy": r.created_by, "updatedAt": r.updated_at,
     })
 }
@@ -63,6 +65,11 @@ fn scim_source(app: &AppState, user_id: &str, scope: &str) -> Option<String> {
     app.db.scim_role_grants_of_user(user_id).into_iter().find(|g| g.scope == scope).map(|g| g.mapping_id)
 }
 
+/// The SAML mapping that gave `user_id` their role across the server, if one did (ADR 0160).
+fn saml_source(app: &AppState, user_id: &str) -> Option<String> {
+    app.db.saml_role_grant_of_user(user_id).map(|g| g.mapping_id)
+}
+
 fn need_role(app: &AppState, key: &str) -> Res<CustomRole> {
     app.db.find_custom_role(key).ok_or_else(|| not_found("Role"))
 }
@@ -72,9 +79,10 @@ fn role_error(e: RoleError) -> ApiError {
         RoleError::NameTaken => conflict("A role with that name exists already."),
         RoleError::NotFound => not_found("Role"),
         RoleError::InUse(n) => conflict(format!("{n} {} still {} this role. Take it away from them first.", if n == 1 { "person" } else { "people" }, if n == 1 { "has" } else { "have" })),
-        RoleError::Mapped(n) => conflict(format!("{n} SCIM {} to this role. Remove {} first.", if n == 1 { "group is mapped" } else { "groups are mapped" }, if n == 1 { "that mapping" } else { "those mappings" })),
-        RoleError::Reaches { mapping, scope, perms } => conflict(format!(
-            "A SCIM group is mapped to this role {}, where {} would act on admins. Remove mapping {mapping} first, or leave {} out.",
+        RoleError::Mapped(n) => conflict(format!("{n} {} to this role. Remove {} first.", if n == 1 { "SCIM group or SAML group is mapped" } else { "SCIM groups or SAML groups are mapped" }, if n == 1 { "that mapping" } else { "those mappings" })),
+        RoleError::Reaches { via, mapping, scope, perms } => conflict(format!(
+            "A {} group is mapped to this role {}, where {} would act on admins. Remove mapping {mapping} first, or leave {} out.",
+            if via == "saml" { "SAML" } else { "SCIM" },
             if scope == "org" { "across the server" } else { "in its team" },
             perms.join(" and "),
             if perms.len() == 1 { "it" } else { "them" },
@@ -159,6 +167,7 @@ pub async fn get(State(app): State<AppState>, Path(key): Path<String>) -> Res {
         "users": users.iter().filter_map(|id| app.db.user(id)).map(|u| {
             let mut p = person(&u);
             p["scimMapping"] = json!(scim_source(&app, &u.id, "org"));
+            p["samlMapping"] = json!(saml_source(&app, &u.id));
             p
         }).collect::<Vec<_>>(),
         "teams": teams.iter().filter_map(|(t, u)| Some(json!({ "team": { "id": t, "name": app.db.team(t)?.name }, "user": person(&app.db.user(u)?), "scimMapping": scim_source(&app, u, "team") }))).collect::<Vec<_>>(),
@@ -225,9 +234,10 @@ pub async fn assign(State(app): State<AppState>, Extension(by): Extension<Who>, 
     // now. What to audit comes from what they held as it was written.
     let g = app.db.give_user_custom_role(&before.id, &r.id).ok_or_else(|| not_found("Role"))?;
     let (had, was) = (g.before.0, g.before.1.unwrap_or(before.role));
-    if had.as_deref() != Some(r.id.as_str()) || g.taken.is_some() {
+    if had.as_deref() != Some(r.id.as_str()) || g.taken.is_some() || g.taken_saml.is_some() {
         let from = summary(&app, had.as_deref());
-        app.db.record(&by.event("role.assigned").target("role", &r.id).details(json!({ "name": r.name, "user": before.id, "scope": "org", "from": from, "takenFromScim": g.taken })));
+        let d = json!({ "name": r.name, "user": before.id, "scope": "org", "from": from, "takenFromScim": g.taken, "takenFromSaml": g.taken_saml });
+        app.db.record(&by.event("role.assigned").target("role", &r.id).details(d));
     }
     let after = need_user_key(&app, &before.id)?;
     if was != after.role {
@@ -242,11 +252,11 @@ pub async fn assign(State(app): State<AppState>, Extension(by): Extension<Who>, 
 pub async fn unassign(State(app): State<AppState>, Extension(by): Extension<Who>, Path((key, user)): Path<(String, String)>) -> Res {
     let r = need_role(&app, &key)?;
     let u = need_user_key(&app, &user)?;
-    let scim = scim_source(&app, &u.id, "org");
+    let (scim, saml) = (scim_source(&app, &u.id, "org"), saml_source(&app, &u.id));
     if !app.db.clear_user_custom_role(&u.id, &r.id) {
         return Err(ApiError(StatusCode::NOT_FOUND, "They don't have this role.".into()));
     }
-    app.db.record(&by.event("role.unassigned").target("role", &r.id).details(json!({ "name": r.name, "user": u.id, "scope": "org", "keeps": u.role, "scimMapping": scim })));
+    app.db.record(&by.event("role.unassigned").target("role", &r.id).details(json!({ "name": r.name, "user": u.id, "scope": "org", "keeps": u.role, "scimMapping": scim, "samlMapping": saml })));
     let after = need_user_key(&app, &u.id)?;
     Ok(Json(json!({ "user": user_view(&after), "role": Value::Null })))
 }

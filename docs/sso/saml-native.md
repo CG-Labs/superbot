@@ -106,6 +106,39 @@ People disabled in SuperBot, by an admin or by SCIM deprovisioning ([SCIM](scim.
 
 **Moving from the bridge.** Identities are stored the same way (the IdP's entity ID and the lowercased NameID), so links carry over: remove `ISSUER`, `CLIENT_ID`, `IDP_ALIAS` and the client secret, add the metadata, and register SuperBot at the IdP in place of Keycloak.
 
+## Groups
+
+SuperBot can read the groups the IdP puts in the signed assertion, to require a group for sign-in and to give a custom role to everyone in a group ([ADR 0160](../adr/0160-saml-groups-and-role-mapping.md)). Name the attribute the IdP sends them in; nothing is read without it:
+
+```bash
+SSO_CORP_GROUPS_ATTRIBUTE=groups                  # Okta: a group attribute statement named groups
+# Entra ID: Token configuration → Add groups claim → "Groups assigned to the application", group ID:
+# SSO_CORP_GROUPS_ATTRIBUTE=http://schemas.microsoft.com/ws/2008/06/identity/claims/groups
+SSO_CORP_REQUIRED_GROUPS=SuperBot Users           # optional: only people in one of these sign in
+```
+
+- Names are exact, case included. Entra ID sends group object ids, so use those.
+- Only the signed assertion counts. Empty values, values over 256 bytes, and values with markup inside are skipped.
+- If someone is in too many groups, Entra ID sends a link instead of the groups (an overage). Over 500 values is treated the same way. Their groups are then *unknown*, which counts as no groups. Send only the groups assigned to the application to stay under the limit.
+
+**Required groups.** With `SSO_CORP_REQUIRED_GROUPS`, someone in none of the groups is refused before their account is looked up, so just in time never makes them an account, and someone who left the group can't sign in again. The audit log has `not_in_group` or `groups_unknown`, and the page says they aren't allowed. A role a group they left gave them goes even so. Sessions they already have aren't ended: deprovision them (SCIM, or `botctl user disable`).
+
+**Groups mapped to custom roles.** An admin maps a group to a [custom role](../adr/0123-custom-roles.md), across the server:
+
+```bash
+botctl role add "Auditor" --perms audit.view
+botctl sso role map corp "SuperBot Auditors" Auditor   # or a group's object id for Entra ID
+botctl sso role-mappings                               # every mapping, and the providers that read groups
+botctl sso role show <id>                              # who it gave the role to
+botctl sso role unmap <id>                             # takes the role from all of them
+```
+
+- Never admin, a built-in role, or a role with `bots.manage` or `machines.manage`, which reach admins. Such a mapping is refused and audited (`sso.saml_role_map_refused`), and a mapped role can't gain those permissions or be deleted.
+- Each sign-in applies the mappings. Someone in the group with no custom role gets it (the role's base becomes their built-in role). Admins, the owner account, and people with a custom role already are skipped (`sso.saml_role_skipped`). When a sign-in no longer lists the group, or the groups are unknown, the role goes and their earlier built-in role comes back.
+- Only what a mapping gave is taken away. If an admin changes that person's role by hand, the change stands: no group, of any provider, gives them a role until a sign-in with the provider that gave it no longer lists its group.
+- The role also goes when the mapping is removed or the person's identity at the provider is unlinked. Making a mapping gives nothing until people sign in again. To end a role at once for someone who left the group, take it away by hand or use [SCIM group roles](scim.md).
+- Grants and removals are audited as `role.assigned` and `role.unassigned` with `via` = `saml`. Mapping changes are `sso.saml_role_mapped` and `sso.saml_role_unmapped`.
+
 ## All settings
 
 `<ID>` is the provider id in capitals.
@@ -130,6 +163,8 @@ People disabled in SuperBot, by an admin or by SCIM deprovisioning ([SCIM](scim.
 | `SSO_<ID>_ENCRYPTION_PRIVATE_KEY` | | With `SP_ENCRYPTION_CERT_FILE`: its private key (PKCS #8 PEM), as env, `_FILE`, or `botctl secret set`. |
 | `SSO_<ID>_METADATA_SIGNING_CERT_FILE` | | The certificates (PEM, one or more) the IdP signs its metadata with. Metadata is then checked on every load ([below](#signed-idp-metadata)). |
 | `SSO_<ID>_SIGNED_METADATA` | `require` with the file, else `off` | `require`: refuse unsigned metadata; `allow`: take it unchecked. Badly signed metadata is refused either way. |
+| `SSO_<ID>_GROUPS_ATTRIBUTE` | | The assertion attribute with the person's groups ([above](#groups)). No default: without it, groups aren't read. |
+| `SSO_<ID>_REQUIRED_GROUPS` | | Only people in one of these groups sign in, comma separated (exact). Needs `GROUPS_ATTRIBUTE`. |
 
 The bridge's settings (`CLIENT_ID`, `IDP_ALIAS`, `SCOPES`, `*_CLAIM`) are refused on a native provider, and the native ones on a bridge provider, so a provider is never half of each. There is no client secret.
 
@@ -221,6 +256,8 @@ Every refused sign-in is in the audit log with a reason (`botctl audit --action 
 | `email_unverified`, `wrong_domain` | No email attribute was sent, or it isn't in `ALLOWED_DOMAINS`. Set `SSO_<ID>_EMAIL_ATTRIBUTE` if the IdP uses another name. |
 | `idp_error` | The IdP said no (`idpStatus` has its status code), for example someone not assigned to the app. |
 | `user_disabled` | The person is disabled in SuperBot. |
+| `not_in_group` | `SSO_<ID>_REQUIRED_GROUPS` is set and the assertion lists none of them. Check the name or id (exact, case included) and that the IdP sends the attribute `GROUPS_ATTRIBUTE` names. |
+| `groups_unknown` | The IdP couldn't list the groups: `groups` = `overage` (Entra ID: send only groups assigned to the application) or `too_many` (over 500). |
 
 Refused logout messages are audited as `auth.slo_failed` (`botctl audit --action auth.slo_failed`), and the browser sees a short error. Those before the signature check (including `not_ready` and `no_slo`) are throttled the same way.
 
