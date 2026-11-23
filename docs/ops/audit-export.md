@@ -1,6 +1,6 @@
 # Audit log: SIEM export and tamper evidence
 
-Every audit event is sealed onto a hash chain as it is written, so a changed, removed, added or reordered event shows. Every hour botd signs a checkpoint of the chain's head, and can have each one timestamped by an RFC 3161 time-stamping authority (TSA). botd can also send every event to your SIEM as it happens: JSON lines over HTTPS, or RFC 5424 syslog over TLS. Or it can archive them in batches to an S3 bucket with Object Lock, where nobody can change or delete them until their retention ends ([below](#archive-events-to-write-once-s3)), or do both at once ([below](#a-siem-and-an-archive-together)). The chain and checkpoints are always on and need nothing. Timestamps and the export are off until you set them. Design: [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md), [ADR 0149](../adr/0149-signed-and-timestamped-audit-checkpoints.md), [ADR 0154](../adr/0154-write-once-s3-audit-archive.md), [ADR 0163](../adr/0163-checking-the-audit-archive.md), [ADR 0173](../adr/0173-an-archive-alongside-a-siem.md) and [ADR 0183](../adr/0183-daily-check-of-new-archive-objects.md).
+Every audit event is sealed onto a hash chain as it is written, so a changed, removed, added or reordered event shows. Every hour botd signs a checkpoint of the chain's head, and can have each one timestamped by an RFC 3161 time-stamping authority (TSA). botd can also send every event to your SIEM as it happens: JSON lines over HTTPS, or RFC 5424 syslog over TLS. Or it can archive them in batches to an S3 bucket with Object Lock, where nobody can change or delete them until their retention ends ([below](#archive-events-to-write-once-s3)), or do both at once ([below](#a-siem-and-an-archive-together)), and send to up to four SIEMs, each with its own token ([below](#several-siems)). The chain and checkpoints are always on and need nothing. Timestamps and the export are off until you set them. Design: [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md), [ADR 0149](../adr/0149-signed-and-timestamped-audit-checkpoints.md), [ADR 0154](../adr/0154-write-once-s3-audit-archive.md), [ADR 0163](../adr/0163-checking-the-audit-archive.md), [ADR 0173](../adr/0173-an-archive-alongside-a-siem.md), [ADR 0183](../adr/0183-daily-check-of-new-archive-objects.md) and [ADR 0191](../adr/0191-several-siems-with-their-own-headers.md).
 
 ## Check the chain
 
@@ -130,10 +130,10 @@ In `.env` (installer) or `deploy/docker/.env` (Compose), then restart botd:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `AUDIT_EXPORT` | `off` | Where to send events. `https://<collector>/<path>`: JSON lines. `syslog+tls://<host>[:6514]`: syslog over TLS. `http://` and `syslog+tcp://` work only to loopback. Add `,s3://<bucket>/<prefix>` to archive them too ([below](#a-siem-and-an-archive-together)) |
+| `AUDIT_EXPORT` | `off` | Where to send events. `https://<collector>/<path>`: JSON lines. `syslog+tls://<host>[:6514]`: syslog over TLS. `http://` and `syslog+tcp://` work only to loopback. Add `,s3://<bucket>/<prefix>` to archive them too ([below](#a-siem-and-an-archive-together)). Any entry can be named, `<name>=<url>`, and several SIEMs must be ([below](#several-siems)) |
 | `AUDIT_EXPORT_INSECURE` | `off` | `on` allows `http://` and `syslog+tcp://` to any host, for a collector on a private network such as the Compose network |
-| `AUDIT_EXPORT_HEADERS` or `AUDIT_EXPORT_HEADERS_FILE` | none | HTTPS only: headers, `name=value` pairs split by commas, such as `Authorization=Bearer <token>`. A secret: redacted everywhere, and no Bot's harness gets it. With `SECRETS_BACKEND=vault` it can live in Vault ([vault.md](vault.md)) |
-| `AUDIT_EXPORT_START` | `all` | For a new sink: `all` sends the history still in the database first, `new` only events from now on |
+| `AUDIT_EXPORT_HEADERS` or `AUDIT_EXPORT_HEADERS_FILE` | none | HTTPS only: headers, `name=value` pairs split by commas, such as `Authorization=Bearer <token>`. A secret: redacted everywhere, and no Bot's harness gets it. With `SECRETS_BACKEND=vault` it can live in Vault ([vault.md](vault.md)). For one SIEM only; with several, each has its own `AUDIT_EXPORT_HEADERS_<NAME>` |
+| `AUDIT_EXPORT_START` | `all` | For a new sink: `all` sends the history still in the database first, `new` only events from now on. A named sink can have its own, `AUDIT_EXPORT_START_<NAME>` |
 
 A bad value stops botd at startup with a message naming the setting. URLs with a username, password, query or fragment are refused, so put tokens in `AUDIT_EXPORT_HEADERS`.
 
@@ -163,7 +163,7 @@ Events are scrubbed when they are recorded: passwords, tokens, message text and 
 - A failure is retried with backoff from 1 second up to 5 minutes, for as long as it takes. Events wait in the database meanwhile, and retention (`AUDIT_RETENTION_DAYS`) never deletes an event the sink hasn't taken, so a long outage grows the table instead of losing events.
 - An event botd can't read from the database (a damaged row) is a failure too: export stops before it and retries, rather than skip it. `botctl audit verify` names the row.
 - After 3 failures in a row botd logs a warning and records `audit.export_failing` with a `reason` of `delivery_failed`, `unreadable`, `cursor_unsaved` or, for the S3 archive, `not_write_once`; `audit.export_recovered` follows when delivery resumes.
-- `botctl audit siem` (or `GET /api/audit/siem`) shows the sink, the last delivered id, how many are pending, whether it's failing, and the last error. With metrics on, `/metrics` has `superbot_audit_export_pending_events`, `superbot_audit_export_failing` and `superbot_audit_export_last_delivery_timestamp_seconds`, each labelled with the sink's `kind` (`webhook`, `syslog` or `s3`). Alert on `superbot_audit_export_failing == 1` or a growing pending count.
+- `botctl audit siem` (or `GET /api/audit/siem`) shows the sink, the last delivered id, how many are pending, whether it's failing, and the last error. With metrics on, `/metrics` has `superbot_audit_export_pending_events`, `superbot_audit_export_failing` and `superbot_audit_export_last_delivery_timestamp_seconds`, each labelled with the sink's `kind` (`webhook`, `syslog` or `s3`) and, for a named sink, its `name`. Alert on `superbot_audit_export_failing == 1` or a growing pending count.
 
 ### Examples
 
@@ -190,7 +190,7 @@ With Compose, run the collector on the `superbot_default` network and set `AUDIT
 
 ### Changing the sink
 
-The cursor is kept per sink URL. A new URL starts as `AUDIT_EXPORT_START` says; switching back to an old URL resumes where it stopped. To send everything again to the same sink, use a different path or remove its row from `settings` while botd is stopped. The row's key is `audit_export:` and the sink with its port always written, defaults included, and for a webhook its path: `https://<collector>/ingest` is saved as `audit_export:https://<collector>:443/ingest`, and `syslog+tls://<host>` as `audit_export:syslog+tls://<host>:6514`.
+The cursor is kept per sink URL. A new URL starts as `AUDIT_EXPORT_START` (or its `AUDIT_EXPORT_START_<NAME>`) says; switching back to an old URL resumes where it stopped. A name isn't part of the cursor, so naming a running sink, or renaming it, resumes it. To send everything again to the same sink, use a different path or remove its row from `settings` while botd is stopped. The row's key is `audit_export:` and the sink with its port always written, defaults included, and for a webhook its path: `https://<collector>/ingest` is saved as `audit_export:https://<collector>:443/ingest`, and `syslog+tls://<host>` as `audit_export:syslog+tls://<host>:6514`.
 
 ## Archive events to write-once S3
 
@@ -294,12 +294,33 @@ AUDIT_EXPORT_S3_ACCESS_KEY_ID=<key id>
 AUDIT_EXPORT_S3_SECRET_ACCESS_KEY=<secret>
 ```
 
-- **One of each.** At most one SIEM (`https://`, `syslog+tls://`, or their plain forms) and one `s3://` archive, in either order. Two SIEMs, two archives or an empty entry stop botd at startup. A comma in a webhook's path is written `%2C`.
+- **One archive.** One `s3://` archive at most, in any place in the list, beside up to four SIEMs (`https://`, `syslog+tls://`, or their plain forms; [below](#several-siems)). Two archives or an empty entry stop botd at startup. A comma in a webhook's path is written `%2C`.
 - **Each on its own.** Each sink has its own cursor, retries, `audit.export_failing` and `audit.export_recovered` (with `kind` in their details), so a SIEM outage doesn't stop the archive, and the archive's batching doesn't slow the SIEM. Both get the same lines, so `host` and `id` match across them.
 - **Retention waits for both.** `AUDIT_RETENTION_DAYS` never deletes an event either sink hasn't taken.
 - **Adding one keeps the other.** Cursors are kept per sink, so adding an archive beside a running SIEM (or the other way round) resumes the one that was there. The new one starts as `AUDIT_EXPORT_START` says: with `all`, the default, the archive starts with the history still in the database.
 - **Status.** `botctl audit siem` (`GET /api/audit/siem`) leads with the sink in the worst state, failing first and then furthest behind, so its `failing` and `pending` cover both, and lists each under `sinks`. The app's audit log shows a `SIEM export` and an `Archive` line. In `/metrics`, each sink is its own series by `kind`.
 - **Checks.** `botctl audit verify --archive` checks the archive as above, and the daily check reads what is new in it. Pins from the SIEM (`--pin`) and the archive check can be used together.
+
+## Several SIEMs
+
+Your own SIEM and an MDR provider's collector, a SIEM and a data lake, or the SIEM you use and the one you're moving to: list up to four in `AUDIT_EXPORT`, each with a name, and give each webhook its own headers. An archive can sit beside them as above.
+
+```sh
+AUDIT_EXPORT=splunk=https://<splunk-host>:8088/services/collector/raw,mdr=https://<mdr-collector>/ingest,soc=syslog+tls://<syslog-host>:6514,s3://<bucket>/<prefix>
+AUDIT_EXPORT_HEADERS_SPLUNK=Authorization=Splunk <hec-token>,X-Splunk-Request-Channel=<channel-guid>
+AUDIT_EXPORT_HEADERS_MDR=Authorization=Bearer <mdr-token>
+AUDIT_EXPORT_START_MDR=new
+```
+
+- **Names.** `<name>=<url>`: 1 to 24 letters and digits, starting with a letter, case-insensitive (shown in lowercase). Not `file`. With more than one SIEM, every SIEM needs one; the archive may have one too. Two sinks with the same name, or the same URL listed twice, stop botd at startup.
+- **Headers.** `AUDIT_EXPORT_HEADERS_<NAME>` (or `_FILE`), the name in capitals, goes to that webhook and no other. It's a secret like `AUDIT_EXPORT_HEADERS`: redacted, never given to a Bot, and with Vault it lives in the server folder as `AUDIT_EXPORT_HEADERS_<NAME>`. With several SIEMs, `AUDIT_EXPORT_HEADERS` stops botd, since it would go to all of them. A webhook with no headers of its own sends none. Syslog and the archive take no headers.
+- **Where each starts.** `AUDIT_EXPORT_START_<NAME>` (`all` or `new`) is for that sink when it is new; otherwise `AUDIT_EXPORT_START` applies. Above, the MDR gets only what happens from now on, while a new archive still gets the history.
+- **Each on its own.** As with an archive: each SIEM has its own cursor (by URL, so naming a running sink resumes it), retries and failure events, so one outage doesn't hold up the others. `audit.export_failing` and `audit.export_recovered` carry the `name`. Every SIEM gets the same lines, so `host`, `id` and `chainHash` match across them and pins can come from any.
+- **Retention waits for all of them.** A SIEM that stays down grows the table for every sink: alert on each one's `pending`.
+- **Status.** `botctl audit siem` leads with the sink in the worst state and lists each under `sinks`, with its `name`. The app's audit log shows a line per sink, such as `SIEM export (splunk)`. In `/metrics`, each named sink's series has a `name` label as well as `kind`.
+- **A misspelt name** in `AUDIT_EXPORT_HEADERS_<NAME>` isn't caught at startup: that webhook sends no headers, its SIEM refuses them, and the export shows as failing for that sink.
+
+A single SIEM needs no name, so settings from before keep working. To move to several, name the one you have (it resumes where it was) and move its `AUDIT_EXPORT_HEADERS` to `AUDIT_EXPORT_HEADERS_<NAME>`.
 
 ## Retention and erasure
 
