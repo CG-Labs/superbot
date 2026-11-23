@@ -153,6 +153,8 @@ pub struct ObjectVersion {
     pub version: String,
     pub latest: bool,
     pub marker: bool,
+    /// `LastModified`, in ms: when the store took it, which no writer can set.
+    pub modified: Option<i64>,
 }
 
 /// The `<Version>`s and `<DeleteMarker>`s of a `ListVersionsResult`, in its order.
@@ -172,7 +174,8 @@ fn listed_versions(xml: &str) -> Vec<ObjectVersion> {
         let end = rest[start..].find(close).map_or(rest.len(), |e| start + e);
         let item = &rest[start..end];
         if let (Some(key), Some(version)) = (tag(item, "Key"), tag(item, "VersionId")) {
-            out.push(ObjectVersion { key, version, latest: tag(item, "IsLatest").as_deref() == Some("true"), marker });
+            let modified = tag(item, "LastModified").and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok()).map(|t| t.timestamp_millis());
+            out.push(ObjectVersion { key, version, latest: tag(item, "IsLatest").as_deref() == Some("true"), marker, modified });
         }
         rest = &rest[end..];
     }
@@ -533,11 +536,12 @@ mod tests {
         let xml = "<ListVersionsResult><Name>b</Name>\
             <DeleteMarker><Key>a&amp;b</Key><VersionId>3</VersionId><IsLatest>true</IsLatest></DeleteMarker>\
             <Version><Key>a&amp;b</Key><VersionId>2</VersionId><IsLatest>false</IsLatest></Version>\
-            <Version><Key>a&amp;b</Key><VersionId>1</VersionId><IsLatest>false</IsLatest></Version>\
+            <Version><Key>a&amp;b</Key><VersionId>1</VersionId><IsLatest>false</IsLatest><LastModified>2026-11-23T07:00:00.000Z</LastModified></Version>\
             <Version><Key>c</Key><VersionId>null</VersionId><IsLatest>true</IsLatest></Version></ListVersionsResult>";
         let v = listed_versions(xml);
         let got: Vec<(&str, &str, bool, bool)> = v.iter().map(|v| (v.key.as_str(), v.version.as_str(), v.latest, v.marker)).collect();
         assert_eq!(got, [("a&b", "3", true, true), ("a&b", "2", false, false), ("a&b", "1", false, false), ("c", "null", true, false)]);
+        assert_eq!(v.iter().map(|v| v.modified).collect::<Vec<_>>(), [None, None, Some(1_795_417_200_000), None]);
         assert!(listed_versions("<ListVersionsResult></ListVersionsResult>").is_empty());
     }
 }

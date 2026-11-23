@@ -33,6 +33,21 @@ export function verificationLine(v: AuditVerification | null): ChainLine {
   return { label: "Last check", text: `Broken${where}${part ? `, ${part}` : ""}, ${when(v.at)}`, tone: "bad" };
 }
 
+/** The archive's part of the last check, when it read the archive (ADR 0183); null otherwise. */
+export function archiveCheckLine(v: AuditVerification | null): ChainLine | null {
+  const a = v?.archive;
+  if (!v || !a) return null;
+  const label = "Archive check";
+  if (!a.ok) {
+    const p = a.firstProblem;
+    const what = p ? `${p.reason}${p.id != null ? ` at event ${p.id}` : ""}: ${p.error}` : (a.error ?? "it couldn't be read");
+    return { label, text: `Broken, ${a.problems} problem${a.problems === 1 ? "" : "s"}. First: ${what}`, tone: "bad" };
+  }
+  const read = a.after != null ? `${a.objects} new object${a.objects === 1 ? "" : "s"} read` : `all ${a.objects} objects read`;
+  const to = a.head ? `Intact to event ${a.head.id}` : "Intact, nothing archived yet";
+  return { label, text: `${to}: ${read}, ${when(v.at)}`, tone: "ok" };
+}
+
 export function checkpointLine(c: AuditCheckpoint | null, everyMinutes: number): ChainLine {
   const how = everyMinutes > 0 ? `every ${everyMinutes} min` : "on request only";
   if (!c) return { label: "Last checkpoint", text: `None yet (${how})`, tone: "dim" };
@@ -70,8 +85,10 @@ function sinkLine(x: AuditExportSink): ChainLine {
 
 /** Every line, in the order the panel shows them. */
 export function chainLines(s: AuditChainState): ChainLine[] {
+  const archive = archiveCheckLine(s.verification);
   return [
     verificationLine(s.verification),
+    ...(archive ? [archive] : []),
     { label: "Head", text: s.head ? `Event ${s.head.id} · ${shortHash(s.head.hash)}` : "No events yet", tone: "dim" },
     checkpointLine(s.checkpoints.last, s.checkpoints.everyMinutes),
     timestampLine(s),

@@ -49,6 +49,8 @@ pub struct World {
     /// Those versions' bodies, and each key's version ids in the order written.
     pub bodies: BTreeMap<(String, String), Vec<u8>>,
     pub history: BTreeMap<String, Vec<String>>,
+    /// When each version and delete marker was written, in ms: listed as `LastModified`.
+    pub written: BTreeMap<(String, String), i64>,
     next: u32,
 }
 
@@ -64,7 +66,9 @@ impl World {
         }
         if marker {
             self.next += 1;
-            self.old.push((key.into(), format!("v{}", self.next), true));
+            let v = format!("v{}", self.next);
+            self.written.insert((key.into(), v.clone()), crate::db::now());
+            self.old.push((key.into(), v, true));
         }
     }
 }
@@ -229,7 +233,11 @@ async fn handle(State(world): State<Arc<Mutex<World>>>, method: Method, uri: Uri
             let mut out = String::from("<ListVersionsResult>");
             for (k, v, marker, latest) in found.iter().take(page) {
                 let tag = if *marker { "DeleteMarker" } else { "Version" };
-                out.push_str(&format!("<{tag}><Key>{}</Key><VersionId>{v}</VersionId><IsLatest>{latest}</IsLatest></{tag}>", k.replace('&', "&amp;")));
+                let modified = w.written.get(&(k.clone(), v.clone())).map(|at| {
+                    let at = chrono::DateTime::from_timestamp_millis(*at).unwrap_or_default().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                    format!("<LastModified>{at}</LastModified>")
+                });
+                out.push_str(&format!("<{tag}><Key>{}</Key><VersionId>{v}</VersionId><IsLatest>{latest}</IsLatest>{}</{tag}>", k.replace('&', "&amp;"), modified.unwrap_or_default()));
             }
             if found.len() > page {
                 let (k, v, _, _) = &found[page - 1];
@@ -296,6 +304,7 @@ async fn handle(State(world): State<Arc<Mutex<World>>>, method: Method, uri: Uri
             let meta: Vec<(String, String)> = headers.iter().filter(|(k, _)| k.as_str().starts_with("x-amz-meta-")).map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_string())).collect();
             w.versions.insert((key.clone(), version.clone()), (body.len(), meta.clone(), lock.clone()));
             w.bodies.insert((key.clone(), version.clone()), body.to_vec());
+            w.written.insert((key.clone(), version.clone()), crate::db::now());
             w.history.entry(key.clone()).or_default().push(version.clone());
             w.meta.insert(key.clone(), (meta, version.clone()));
             match lock {

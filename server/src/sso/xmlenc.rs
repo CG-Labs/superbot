@@ -127,10 +127,12 @@ fn encrypted_key(k: Node) -> Result<(&'static OaepAlgorithm, Vec<u8>), Invalid> 
     Ok((alg, cipher_value(value.ok_or_else(bad)?)?))
 }
 
-/// Decrypts `encrypted` (a `saml:EncryptedAssertion` or `EncryptedID`) with `key`. Its children are one
-/// `EncryptedData` and, beside it or in its `KeyInfo`, the `EncryptedKey`s that carry its
-/// content key. Returns the plaintext: the serialized element, still to be checked.
-pub fn decrypt(encrypted: Node, key: &OaepPrivateDecryptingKey) -> Result<Zeroizing<Vec<u8>>, Invalid> {
+/// Decrypts `encrypted` (a `saml:EncryptedAssertion` or `EncryptedID`) with one of `ours` (several
+/// during a rollover of our key, ADR 0181). Its children are one `EncryptedData` and, beside it
+/// or in its `KeyInfo`, the `EncryptedKey`s that carry its content key. Every key of ours is
+/// tried on every `EncryptedKey`, so the work doesn't depend on which one opens. Returns the
+/// plaintext (the serialized element, still to be checked) and the index of the key that opened it.
+pub fn decrypt(encrypted: Node, ours: &[&OaepPrivateDecryptingKey]) -> Result<(Zeroizing<Vec<u8>>, usize), Invalid> {
     let mut data = None;
     let mut keys = Vec::new();
     for c in elements(encrypted) {
@@ -162,7 +164,7 @@ pub fn decrypt(encrypted: Node, key: &OaepPrivateDecryptingKey) -> Result<Zeroiz
             _ => return Err(bad()),
         }
     }
-    if keys.is_empty() || keys.len() > MAX_KEYS {
+    if keys.is_empty() || keys.len() > MAX_KEYS || ours.is_empty() {
         return Err(bad());
     }
     let keys: Vec<(&OaepAlgorithm, Vec<u8>)> = keys.into_iter().map(encrypted_key).collect::<Result<_, _>>()?;
@@ -175,15 +177,17 @@ pub fn decrypt(encrypted: Node, key: &OaepPrivateDecryptingKey) -> Result<Zeroiz
     let len = cipher_alg.key_len();
     let mut content_key = Zeroizing::new(vec![0u8; len]);
     SystemRandom::new().fill(&mut content_key).map_err(|_| bad())?;
-    let mut out = Zeroizing::new(vec![0u8; key.min_output_size()]);
-    let mut found = false;
-    for (alg, wrapped) in &keys {
-        if let Ok(k) = key.decrypt(alg, wrapped, &mut out, None)
-            && k.len() == len
-            && !found
-        {
-            content_key.copy_from_slice(k);
-            found = true;
+    let mut found = None;
+    for (i, key) in ours.iter().enumerate() {
+        let mut out = Zeroizing::new(vec![0u8; key.min_output_size()]);
+        for (alg, wrapped) in &keys {
+            if let Ok(k) = key.decrypt(alg, wrapped, &mut out, None)
+                && k.len() == len
+                && found.is_none()
+            {
+                content_key.copy_from_slice(k);
+                found = Some(i);
+            }
         }
     }
     let opener = LessSafeKey::new(UnboundKey::new(cipher_alg, &content_key).map_err(|_| bad())?);
@@ -192,7 +196,7 @@ pub fn decrypt(encrypted: Node, key: &OaepPrivateDecryptingKey) -> Result<Zeroiz
     let n = opener.open_in_place(nonce, Aad::empty(), body).map_err(|_| bad())?.len();
     sealed.copy_within(GCM_IV..GCM_IV + n, 0);
     sealed.truncate(n);
-    Ok(sealed)
+    Ok((sealed, found.unwrap_or(0)))
 }
 
 #[cfg(test)]
@@ -318,9 +322,14 @@ mod tests {
     }
 
     fn open(xml: &str, key: &SpKey) -> Result<String, &'static str> {
+        open_with(xml, &[key]).map(|(p, _)| p)
+    }
+
+    fn open_with(xml: &str, ours: &[&SpKey]) -> Result<(String, usize), &'static str> {
         let doc = roxmltree::Document::parse(xml).map_err(|_| "xml")?;
         let enc = doc.descendants().find(|n| n.tag_name().name() == "EncryptedAssertion").unwrap();
-        decrypt(enc, key.decrypting().unwrap()).map(|p| String::from_utf8(p.to_vec()).unwrap()).map_err(|e| e.0)
+        let ours: Vec<_> = ours.iter().map(|k| k.decrypting().unwrap()).collect();
+        decrypt(enc, &ours).map(|(p, i)| (String::from_utf8(p.to_vec()).unwrap(), i)).map_err(|e| e.0)
     }
 
     fn sealed(e: &Encrypt) -> String {
@@ -428,5 +437,18 @@ mod tests {
         let theirs = Encrypt::default().encrypted_key(&keys()[1].cert, &[1; 32]);
         let rollover = xml.replace("</saml:EncryptedAssertion>", &format!("{theirs}</saml:EncryptedAssertion>"));
         assert_eq!(open(&rollover, key).as_deref(), Ok(ASSERTION));
+    }
+
+    #[test]
+    fn opens_with_whichever_of_our_keys_it_was_encrypted_to() {
+        let [key, other] = keys();
+        let xml = sealed(&Encrypt::default());
+        assert_eq!(open_with(&xml, &[key, other]), Ok((ASSERTION.to_string(), 0)));
+        assert_eq!(open_with(&xml, &[other, key]), Ok((ASSERTION.to_string(), 1)), "a rollover's other key: says which");
+        assert_eq!(open_with(&xml, &[other]), Err("bad_encryption"));
+        assert_eq!(open_with(&xml, &[]), Err("bad_encryption"), "no key of ours");
+        // Encrypted to both (an IdP that knows our current and next key): the first of ours.
+        let both = xml.replace("</saml:EncryptedAssertion>", &format!("{}</saml:EncryptedAssertion>", Encrypt::default().encrypted_key(&other.cert, &[9; 32])));
+        assert_eq!(open_with(&both, &[key, other]).map(|(_, i)| i), Ok(0));
     }
 }

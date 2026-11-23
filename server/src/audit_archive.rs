@@ -67,6 +67,8 @@ pub struct Archive {
     pub retain_days: Option<u32>,
     /// How long the oldest waiting event waits for more before its batch goes.
     pub batch_ms: i64,
+    /// Whether botd's daily self-check also checks objects new since its last pass (ADR 0183).
+    pub daily_check: bool,
 }
 
 impl std::fmt::Debug for Archive {
@@ -78,8 +80,8 @@ impl std::fmt::Debug for Archive {
 impl Archive {
     /// `AUDIT_EXPORT=s3://<bucket>[/<prefix>]` and the `AUDIT_EXPORT_S3_*` settings:
     /// `_ENDPOINT`, `_REGION` (us-east-1), `_LOCK` (bucket), `_RETAIN_DAYS`,
-    /// `_BATCH_SECONDS` (300), and the keys `_ACCESS_KEY_ID` and `_SECRET_ACCESS_KEY` from
-    /// the secret store.
+    /// `_BATCH_SECONDS` (300), `_CHECK` (daily), and the keys `_ACCESS_KEY_ID` and
+    /// `_SECRET_ACCESS_KEY` from the secret store.
     pub fn from_env(raw: &str, get: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result<Archive, String> {
         let bad = |why: &str| format!("AUDIT_EXPORT must be s3://<bucket>[/<prefix>] for the S3 archive: {why}");
         let u = url::Url::parse(raw.trim()).map_err(|_| bad("it isn't a URL"))?;
@@ -123,6 +125,11 @@ impl Archive {
                 _ => return Err(format!("AUDIT_EXPORT_S3_BATCH_SECONDS must be from 0 to {MAX_BATCH_SECONDS}")),
             },
         };
+        let daily_check = match get("AUDIT_EXPORT_S3_CHECK").trim().to_ascii_lowercase().as_str() {
+            "" | "daily" => true,
+            "off" => false,
+            other => return Err(format!("AUDIT_EXPORT_S3_CHECK must be daily or off, not \"{}\"", crate::audit::clip(other, 40))),
+        };
 
         let name = "AUDIT_EXPORT_S3";
         let endpoint = get("AUDIT_EXPORT_S3_ENDPOINT");
@@ -138,7 +145,7 @@ impl Archive {
         let access = key("AUDIT_EXPORT_S3_ACCESS_KEY_ID")?;
         let region = Some(get("AUDIT_EXPORT_S3_REGION")).filter(|r| !r.trim().is_empty()).unwrap_or("us-east-1".into());
         let s3 = s3::Settings::named(name, &endpoint, &bucket, &region, &access, &secret)?;
-        Ok(Archive { s3, bucket, prefix, lock, retain_days, batch_ms })
+        Ok(Archive { s3, bucket, prefix, lock, retain_days, batch_ms, daily_check })
     }
 
     /// What logs, the API and the audit log show.
@@ -158,7 +165,8 @@ impl Archive {
             (Lock::Off, _) => "not locked (AUDIT_EXPORT_S3_LOCK=off)".to_string(),
             (l, d) => format!("each locked in {} mode for {} days", l.name(), d.unwrap_or_default()),
         };
-        format!("as JSON-lines objects at {} every {} s or {MAX_EVENTS} events, {lock}", self.s3.endpoint, self.batch_ms / 1000)
+        let check = if self.daily_check { "new objects checked daily" } else { "not checked daily (AUDIT_EXPORT_S3_CHECK=off)" };
+        format!("as JSON-lines objects at {} every {} s or {MAX_EVENTS} events, {lock}, {check}", self.s3.endpoint, self.batch_ms / 1000)
     }
 
     /// `<prefix>/<yyyy>/<mm>/<dd>/<first id>-<last id>.jsonl`, dated by the first event,
@@ -177,6 +185,7 @@ impl Archive {
             "lock": self.lock.name(),
             "retainDays": self.retain_days,
             "batchSeconds": self.batch_ms / 1000,
+            "dailyCheck": self.daily_check,
             "lastObject": last,
         })
     }
@@ -314,6 +323,9 @@ pub(crate) mod tests {
         assert_eq!((c.lock, c.retain_days, c.batch_ms), (Lock::Compliance, Some(2555), 0));
         assert!(c.describe().contains("compliance mode for 2555 days"), "{}", c.describe());
         assert_eq!(archive(&[("AUDIT_EXPORT_S3_LOCK", "off")]).unwrap().lock, Lock::Off);
+        assert!(a.daily_check && a.describe().contains("new objects checked daily"), "{}", a.describe());
+        let unchecked = archive(&[("AUDIT_EXPORT_S3_CHECK", "Off")]).unwrap();
+        assert!(!unchecked.daily_check && unchecked.describe().contains("AUDIT_EXPORT_S3_CHECK=off"), "{}", unchecked.describe());
 
         for (vars, why) in [
             (vec![("AUDIT_EXPORT", "s3://No_Caps/x")], "bucket name"),
@@ -328,6 +340,7 @@ pub(crate) mod tests {
             (vec![("AUDIT_EXPORT_S3_LOCK", "compliance"), ("AUDIT_EXPORT_S3_RETAIN_DAYS", "40000")], "from 1"),
             (vec![("AUDIT_EXPORT_S3_RETAIN_DAYS", "30")], "goes with"),
             (vec![("AUDIT_EXPORT_S3_BATCH_SECONDS", "-1")], "BATCH_SECONDS"),
+            (vec![("AUDIT_EXPORT_S3_CHECK", "hourly")], "AUDIT_EXPORT_S3_CHECK must be daily or off"),
             (vec![("AUDIT_EXPORT_S3_ENDPOINT", "http://s3.example.net")], "AUDIT_EXPORT_S3_ENDPOINT"),
             (vec![("AUDIT_EXPORT_S3_ENDPOINT", " ")], "AUDIT_EXPORT_S3_ENDPOINT is needed"),
         ] {
