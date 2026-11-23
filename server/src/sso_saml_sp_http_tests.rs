@@ -1113,3 +1113,33 @@ async fn a_change_by_hand_to_another_providers_grant_holds_against_this_ones_gro
     assert_eq!(sp.app.db.saml_role_released(&u.id), Some(theirs.id));
     assert!(sp.audit("role.assigned").await.is_empty());
 }
+
+#[tokio::test]
+async fn a_sign_in_refused_for_required_groups_still_takes_back_what_a_left_group_gave() {
+    let sp = serve_with(&[("GROUPS_ATTRIBUTE", "groups"), ("REQUIRED_GROUPS", "SuperBot Users")], |a| a.limiter = users::Limiter::new(1000, 60_000)).await;
+    let u = sp.link();
+    let auditor = sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None).unwrap();
+    sp.app.db.create_saml_role_mapping(&sp.id, "Auditors", &auditor.id, None).unwrap();
+    let role_id = || sp.app.db.user(&u.id).unwrap().role_id;
+
+    // Refused: never given anything.
+    let (_, to, _) = sp.sign_in(in_groups(&["Auditors"])).await;
+    assert_eq!((to.as_str(), role_id()), ("/login?error=sso_not_allowed", None));
+    let (code, _, _) = sp.sign_in(in_groups(&["SuperBot Users", "Auditors"])).await;
+    assert_eq!((code, role_id()), (200, Some(auditor.id.clone())));
+    // Refused, but still in the mapped group: kept.
+    let (_, to, _) = sp.sign_in(in_groups(&["Auditors"])).await;
+    assert_eq!((to.as_str(), role_id()), ("/login?error=sso_not_allowed", Some(auditor.id.clone())));
+    // Refused, and out of it too: taken back.
+    let (_, to, _) = sp.sign_in(in_groups(&["Everyone"])).await;
+    assert_eq!((to.as_str(), role_id()), ("/login?error=sso_not_allowed", None));
+    let gone = &sp.audit("role.unassigned").await[0]["details"];
+    assert_eq!((gone["reason"].as_str(), gone["via"].as_str()), (Some("left_group"), Some("saml")));
+    assert_eq!(sp.app.db.user(&u.id).unwrap().role, Role::Member);
+    // Unknown groups count as none here too.
+    let (code, _, _) = sp.sign_in(in_groups(&["SuperBot Users", "Auditors"])).await;
+    assert_eq!((code, role_id()), (200, Some(auditor.id.clone())));
+    let (_, to, _) = sp.sign_in(overage).await;
+    assert_eq!((to.as_str(), role_id()), ("/login?error=sso_not_allowed", None));
+    assert_eq!(sp.audit("role.unassigned").await[0]["details"]["reason"], "groups_unknown");
+}

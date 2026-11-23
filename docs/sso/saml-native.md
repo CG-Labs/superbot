@@ -121,7 +121,7 @@ SSO_CORP_REQUIRED_GROUPS=SuperBot Users           # optional: only people in one
 - Only the signed assertion counts. Empty values, values over 256 bytes, and values with markup inside are skipped.
 - If someone is in too many groups, Entra ID sends a link instead of the groups (an overage). Over 500 values is treated the same way. Their groups are then *unknown*, which counts as no groups. Send only the groups assigned to the application to stay under the limit.
 
-**Required groups.** With `SSO_CORP_REQUIRED_GROUPS`, someone in none of the groups is refused before their account is looked up, so just in time never makes them an account, and someone who left the group can't sign in again. The audit log has `not_in_group` or `groups_unknown`, and the page says they aren't allowed. Sessions they already have aren't ended: deprovision them (SCIM, or `botctl user disable`).
+**Required groups.** With `SSO_CORP_REQUIRED_GROUPS`, someone in none of the groups is refused before their account is looked up, so just in time never makes them an account, and someone who left the group can't sign in again. The audit log has `not_in_group` or `groups_unknown`, and the page says they aren't allowed. A role a group they left gave them goes even so. Sessions they already have aren't ended: deprovision them (SCIM, or `botctl user disable`).
 
 **Groups mapped to custom roles.** An admin maps a group to a [custom role](../adr/0123-custom-roles.md), across the server:
 

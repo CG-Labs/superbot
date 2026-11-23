@@ -151,7 +151,8 @@ async fn take_away(app: &AppState, by: &Who, m: &SamlRoleMapping, user_id: &str,
 /// changed by hand holds everything as it is until a sign-in with its own provider no
 /// longer lists its group: no other provider can tell.
 /// Grants from another provider's mappings are left alone. Done before the session starts.
-pub(crate) async fn signed_in(app: &AppState, a: &Auth, source: &Source, p: &Provider, user: &User, groups: &Groups) {
+/// `give` false, for a sign-in refused after the IdP vouched for the groups: only take away.
+pub(crate) async fn signed_in(app: &AppState, a: &Auth, source: &Source, p: &Provider, user: &User, groups: &Groups, give: bool) {
     let _writes = a.sso.role_writes.lock().await;
     // An unlink that won the lock already took away what the provider gave.
     if !app.db.identities(&user.id).iter().any(|i| i.provider == p.id) {
@@ -177,7 +178,7 @@ pub(crate) async fn signed_in(app: &AppState, a: &Auth, source: &Source, p: &Pro
         }
         take_away(app, &by, &m, &user.id, if listed.is_some() { LEFT_GROUP } else { GROUPS_UNKNOWN }).await;
     }
-    let Some(listed) = listed else { return };
+    let Some(listed) = listed.filter(|_| give) else { return };
     let Some(m) = app.db.saml_role_mappings_of(&p.id).into_iter().find(|m| listed.contains(&m.group)) else { return };
     let Some(role) = app.db.custom_role(&m.role_id) else { return };
     if let Err(reason) = grant(app, &by, &m, &role, &user.id).await {

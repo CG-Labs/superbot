@@ -31,6 +31,7 @@ The risk is the same as in ADR 0138: if the IdP could name roles, whoever edits 
 
 - Checked on every sign-in, after the assertion and the email are checked and before the account is looked up. So someone outside every required group is never made a user by just-in-time sign-up, and a linked user who left the group can't sign in.
 - Refusals are `auth.login_failed` with reason `not_in_group`, or `groups_unknown` with `groups` = `overage`, `too_many` or `not_read`. The sign-in page says `sso_not_allowed`. These are vouched for by the IdP's signature, so they aren't throttled away, but they count towards the address's failed sign-ins.
+- A refused sign-in still carries groups the IdP signed. For someone already linked, it takes away what a group they left gave (step 1 below), and gives nothing.
 - Leaving the group doesn't end sessions already made; that is still offboarding's job (SCIM, or an admin).
 
 ### Mapping a group to a custom role

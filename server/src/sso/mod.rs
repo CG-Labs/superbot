@@ -989,7 +989,7 @@ async fn complete(a: &Auth, app: &AppState, source: &Source, id: &str, p: &Provi
     };
     let user = match groups {
         Some(g) => {
-            saml_roles::signed_in(app, a, source, p, &user, g).await;
+            saml_roles::signed_in(app, a, source, p, &user, g, true).await;
             app.db.user(&user.id).unwrap_or(user)
         }
         None => user,
@@ -1124,6 +1124,12 @@ async fn finish_saml(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, f
         if let Some((reason, extra)) = refusal {
             a.limiter.fail(&ip, at);
             failed(a, source, id, reason, Some(&checked.claims), extra);
+            // The IdP still vouched for their groups: what a group they left gave goes now.
+            if let Some((i, user)) = app.db.identity(&checked.claims.issuer, &checked.claims.subject)
+                && i.provider == p.id
+            {
+                saml_roles::signed_in(app, a, source, p, &user, &checked.groups, false).await;
+            }
             return ret.fail("sso_not_allowed");
         }
     }
