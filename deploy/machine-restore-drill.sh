@@ -41,8 +41,10 @@ POLL=${SUPERBOT_DRILL_POLL_SECONDS:-10}
 GRACE=${SUPERBOT_DRILL_GRACE_SECONDS:-180}
 
 step() { printf '==> drill: %s\n' "$*"; }
+# The record line superbot-evidence drills --record reads (ADR 0177); the last one printed counts.
 fail() {
   printf 'DRILL FAILED: %s\n' "$*" >&2
+  printf '{"superbotDrill":1,"drill":"machine-restore","finishedAt":"%s","passed":false}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   exit 1
 }
 api() { "$BOTCTL" "$@" || fail "botctl $*"; }
@@ -91,6 +93,6 @@ TOOK=$(jq -r '.restore.durationMs' <<<"$R")
 RTO=$(jq -r '.restore.rtoMs' <<<"$R")
 [[ "$TOOK" =~ ^[0-9]+$ && "$RTO" =~ ^[0-9]+$ ]] || fail "botd recorded no timing for $RESTORE"
 step "restore $RESTORE took $((TOOK / 1000)) s of an RTO of $((RTO / 60000)) minutes"
-jq -c '{restoreId: .restore.id, backupId: .restore.backupId, tier: .restore.tier, durationMs: .restore.durationMs, rtoMs: .restore.rtoMs}' <<<"$R"
+jq -c '{superbotDrill: 1, drill: "machine-restore", finishedAt: (now | todate), passed: (.restore.durationMs <= .restore.rtoMs), restoreId: .restore.id, backupId: .restore.backupId, tier: .restore.tier, durationMs: .restore.durationMs, rtoMs: .restore.rtoMs}' <<<"$R"
 ((TOOK <= RTO)) || fail "past the RTO"
 step "passed"

@@ -37,7 +37,14 @@ chmod 0711 "$WORK"
 install -d -m 0700 "$WORK/plain"
 
 step() { printf '\n==> drill: %s\n' "$*"; }
-fail() { printf 'DRILL FAILED: %s\n' "$*" >&2; journalctl -u superbot -u superbot-backup --no-pager -n 40 >&2 || true; exit 1; }
+# The record line superbot-evidence drills --record reads (ADR 0177); the last one printed counts.
+record() { printf '{"superbotDrill":1,"drill":"server-restore","finishedAt":"%s",%s}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1"; }
+fail() {
+  printf 'DRILL FAILED: %s\n' "$*" >&2
+  journalctl -u superbot -u superbot-backup --no-pager -n 40 >&2 || true
+  record '"passed":false'
+  exit 1
+}
 
 home() { user_home; }
 setting() { sed -n "s/^$1=//p" "$(home)/superbot/.env" | tail -n 1 | tr -d "\"'"; }
@@ -184,3 +191,4 @@ systemctl start superbot-backup.service
 ((RTO <= RTO_BUDGET)) || fail "restore took ${RTO}s (budget ${RTO_BUDGET}s)"
 
 step "passed: restore took ${RTO}s (budget ${RTO_BUDGET}s); next backup in ${next_in}s (RPO budget ${RPO_BUDGET}s)"
+record "\"passed\":true,\"durationMs\":$((RTO * 1000)),\"rtoMs\":$((RTO_BUDGET * 1000)),\"nextBackupInSeconds\":$next_in,\"rpoBudgetSeconds\":$RPO_BUDGET"
