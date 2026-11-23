@@ -37,13 +37,15 @@ botd also refuses to start in some unsafe setups whatever the baseline says: an 
 
 ## Checking a server
 
+botd checks itself against the table above ([ADR 0195](../adr/0195-configuration-baseline-checked-by-botd.md)). `botctl evidence baseline` (`GET /api/evidence/baseline`, admins) reads each setting as botd runs with it, through the same code botd started with, and says whether it meets the baseline, doesn't, is excepted, doesn't apply to this server (the machine settings on a server without machines, `MACHINE_FIREWALL` on Incus, `ISOLATION` when every Bot runs on a machine), or needs a person (the image's signature, `TEAMS`, the retention periods a contract sets). It shows values only as codes (`on`, `required`, `admins`, `set`), never a secret, address or name, exits non-zero on a deviation, and is audited as `evidence.baseline_checked` with the counts, the settings that fail and a digest of every setting's value. Each month's [evidence bundle](soc2-evidence-plan.md#the-evidence-bundle) carries the same check as `baseline.json`, so the settings are on record between checks too.
+
 Quarterly, after every upgrade and after every production change, the operator:
 
-1. Runs `botctl setup`, `botctl backups`, `botctl database`, `botctl retention`, `botctl machine recovery` and `botctl evidence`, and saves the output.
-2. Saves the server's settings with every secret value removed (keys, tokens, passwords, bucket credentials).
-3. Compares both with the table above, and records each difference with what was done about it: fixed, or an exception approved under the [information security policy](policies/information-security.md#exceptions).
+1. Runs `botctl evidence baseline` and saves its output.
+2. Checks by hand what it leaves to a person: `cosign verify` on the image the server runs, whether customers share the server (`TEAMS`), whether teams need private services of their own (`MACHINE_TEAM_NETWORK`), the retention periods against the [retention policy](policies/data-classification-and-retention.md#retention) and contracts, and that `MACHINE_BACKUP_AGE_RECIPIENTS`'s private key is kept off the host.
+3. Fixes each deviation, or has an exception approved under the [information security policy](policies/information-security.md#exceptions) and lists the setting in `BASELINE_EXCEPTIONS` (comma-separated names), which turns its failure into "excepted". The check lists exceptions for settings the baseline doesn't have (a failure, to fix) and for settings that meet it anyway (to remove).
 
-The saved output, the comparison and any exceptions go to the evidence store under CC5.1 ([evidence plan](soc2-evidence-plan.md#collection-calendar)). The monthly evidence bundle records the MFA policy, backup and database encryption and retention settings, and every change to them, between checks.
+The saved output, what was checked by hand and the approved exceptions go to the evidence store under CC5.1 ([evidence plan](soc2-evidence-plan.md#collection-calendar)). The monthly evidence bundle records the MFA policy, backup and database encryption and retention settings, and every change to them, between checks.
 
 ## Changing the baseline
 

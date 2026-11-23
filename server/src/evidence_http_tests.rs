@@ -13,7 +13,7 @@ use crate::*;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const FILES: [&str; 9] = ["README.txt", "access-review.json", "changes.json", "backups.json", "retention.json", "sign-ins-and-alerts.json", "audit-summary.json", "manifest.json", "SHA256SUMS"];
+const FILES: [&str; 10] = ["README.txt", "access-review.json", "changes.json", "backups.json", "retention.json", "sign-ins-and-alerts.json", "audit-summary.json", "baseline.json", "manifest.json", "SHA256SUMS"];
 
 /// A `GET`'s status, response head and body bytes.
 async fn fetch(port: u16, path: &str, auth: &str) -> (u16, String, Vec<u8>) {
@@ -65,7 +65,7 @@ async fn only_admins_get_it_and_its_digests_are_audited() {
     let path = format!("/api/roles/{}/users/{delegate_id}", parse(&role)["id"].as_str().unwrap());
     assert_eq!(call(port, "PUT", &path, &admin, "").await.0, 200);
     let bot = app.db.create_bot("Walker", "#fff", "waddle", "claude", None, false);
-    for route in ["/api/evidence", "/api/evidence/bundle"] {
+    for route in ["/api/evidence", "/api/evidence/bundle", "/api/evidence/baseline"] {
         for (who, auth) in [("member", member.as_str()), ("readonly", readonly.as_str()), ("custom role", delegate.as_str()), ("bot", key.auth(&bot.id).as_str())] {
             assert_eq!(call(port, "GET", route, auth, "").await.0, 403, "{who} {route}");
         }
@@ -206,6 +206,42 @@ async fn each_file_carries_its_controls_evidence() {
     }
     let want: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(summary["digest"].as_str(), Some(want.as_str()), "the digest is reproducible from the audit log");
+
+    // The configuration baseline as botd ran (ADR 0195): every setting, and the MFA policy
+    // in force, here off, as a deviation.
+    let baseline = parse(file(&f, "baseline.json"));
+    assert_eq!(baseline["settings"].as_array().unwrap().len(), crate::baseline::SETTINGS.len());
+    let row = baseline["settings"].as_array().unwrap().iter().find(|s| s["setting"] == "AUTH_MFA").cloned().unwrap();
+    assert_eq!((row["status"].as_str(), row["value"].as_str()), (Some("fail"), Some("off")), "{row}");
+    assert!(baseline["exceptions"]["deviations"].as_array().unwrap().contains(&json!("AUTH_MFA")), "{baseline}");
+    assert_eq!(baseline["ok"], false);
+    let manifest = parse(file(&f, "manifest.json"));
+    let listed = manifest["files"].as_array().unwrap().iter().find(|x| x["name"] == "baseline.json").cloned().unwrap();
+    assert_eq!((listed["criteria"].clone(), listed["checklist"].clone()), (json!(["CC5.1"]), json!(["CC5.1-1"])));
+}
+
+#[tokio::test]
+async fn the_baseline_check_is_audited_with_its_digest_and_follows_the_mfa_policy() {
+    let (port, app, admin, _) = serve_app().await;
+    let (code, body) = call(port, "GET", "/api/evidence/baseline", &admin, "").await;
+    assert_eq!(code, 200, "{body}");
+    let r = parse(&body);
+    assert_eq!(r["format"], crate::baseline::FORMAT);
+    assert_eq!(r["settings"].as_array().unwrap().len(), crate::baseline::SETTINGS.len());
+    assert_eq!(r["counts"].as_object().unwrap().values().filter_map(Value::as_u64).sum::<u64>(), crate::baseline::SETTINGS.len() as u64);
+    let (_, audit) = call(port, "GET", &format!("/api/audit?action={}", crate::baseline::CHECKED), &admin, "").await;
+    let events = audit_list(&audit);
+    assert_eq!(events.len(), 1, "{events:?}");
+    let d = &events[0]["details"];
+    assert_eq!((d["digest"].clone(), d["ok"].clone(), d["counts"].clone()), (r["digest"].clone(), r["ok"].clone(), r["counts"].clone()));
+    assert!(d["deviations"].as_array().unwrap().contains(&json!("AUTH_MFA")), "{d}");
+    assert!(d.get("settings").is_none(), "counts and names only: {d}");
+
+    // An admin's policy, as the route reads it; over HTTP this admin would now need a second factor.
+    let r2 = crate::baseline::run(&app, crate::mfa::Policy::Admins).view("now");
+    let row = r2["settings"].as_array().unwrap().iter().find(|s| s["setting"] == "AUTH_MFA").cloned().unwrap();
+    assert_eq!((row["status"].as_str(), row["value"].as_str()), (Some("pass"), Some("admins")), "{row}");
+    assert_ne!(r2["digest"], r["digest"], "a different setting, a different digest");
 }
 
 #[tokio::test]
