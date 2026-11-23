@@ -940,6 +940,46 @@ export interface AccessReviewPerson {
   machine: { id: string; provider: string; state: string; enrollment: string; assignedAt: number | null } | null;
 }
 
+/** A live service account token in the access review: never its secret, hash or address. */
+export interface AccessReviewServiceToken {
+  id: string;
+  name: string;
+  /** `sbsa_…` and its last four characters. */
+  preview: string;
+  /** Null: everything the account holds. */
+  scopes: string[] | null;
+  createdAt: number;
+  expiresAt: number;
+  lastUsedAt: number | null;
+  /** Rotated: still works until it expires. */
+  replaced: boolean;
+}
+
+/** Why a reviewer should look at a service account twice (ADR 0165). */
+export type AccessReviewServiceFlag = "disabled" | "owner_inactive" | "unscoped_token" | "unused_token";
+
+/** One live service account in `GET /api/access-review` (ADR 0165). */
+export interface AccessReviewServiceAccount {
+  id: string;
+  name: string;
+  description: string;
+  role: Role;
+  status: "active" | "disabled";
+  createdAt: number;
+  createdBy: string | null;
+  customRole: { id: string; name: string; permissions: string[] } | null;
+  team: { id: string; name: string; role: string; customRole?: { id: string; name: string; permissions: string[] } } | null;
+  owner: { id: string; name: string; email: string | null; status: string } | null;
+  ownerActive: boolean;
+  permissions: string[];
+  teamPermissions: string[];
+  /** What its tokens can use today, capped by its owner. */
+  effective: string[];
+  botAccess: AccessReviewPerson["botAccess"];
+  tokens: AccessReviewServiceToken[];
+  flags: (AccessReviewServiceFlag | string)[];
+}
+
 export interface AccessReviewSignOff {
   eventId: number;
   at: number;
@@ -960,6 +1000,10 @@ export interface AccessReviewSummary {
   browserSessions: number;
   apiAccess: number;
   machines: number;
+  /** Servers from before ADR 0165 leave these out. */
+  serviceAccounts?: number;
+  serviceApiAccess?: number;
+  serviceAccountsFlagged?: number;
 }
 
 /** `GET /api/access-review` (admins, ADR 0099): everyone, by SCIM tenant then team, and past sign-offs. */
@@ -970,6 +1014,8 @@ export interface AccessReview {
   digest: string;
   summary: AccessReviewSummary;
   groups: { tenant: string | null; team: { id: string; name: string } | null; people: AccessReviewPerson[] }[];
+  /** Live service accounts, by name. Servers from before ADR 0165 leave it out. */
+  serviceAccounts?: AccessReviewServiceAccount[];
   reviews: AccessReviewSignOff[];
 }
 
