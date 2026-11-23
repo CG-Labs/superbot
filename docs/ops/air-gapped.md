@@ -1,6 +1,6 @@
 # Air-gapped installs
 
-SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md), signatures and multi-arch indexes in mirrors in [ADR 0147](../adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md), and how every release's bundles are checked end to end in [ADR 0172](../adr/0172-release-bundles-checked-end-to-end.md).
+SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md), signatures and multi-arch indexes in mirrors in [ADR 0147](../adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md), how every release's bundles are checked end to end in [ADR 0172](../adr/0172-release-bundles-checked-end-to-end.md), and harness installs on users' machines from your own mirrors in [ADR 0186](../adr/0186-harness-installs-from-internal-mirrors.md).
 
 ## What a bundle holds
 
@@ -33,7 +33,7 @@ The bundle carries SuperBot, not the operating system. Install these on the serv
 
 The installer lists anything missing and stops before it changes anything.
 
-**Harness CLIs** (Claude Code, Codex, Pi, Hermes Agent) are not in the bundle for the bash install: install them from your npm or Python mirror, system-wide, as in [deploy/README.md](../../deploy/README.md#one-unix-account-per-user). `--with-hermes` downloads Hermes Agent, so it is refused with `--offline`, and the console's *Install* buttons for harness CLIs download too: don't use them. The published image already has Claude Code, Codex and Pi and the screens, so [Docker Compose](#docker-compose) is the simpler path when you need them. It doesn't have Hermes Agent: for Hermes, build your own image on the connected side (`docker build --build-arg HARNESSES="claude codex pi hermes" -t superbot-hermes:<version> .`) and bundle it with `--image superbot=superbot-hermes:<version> --allow-unsigned` (it is your image, so there is no release signature to check). After loading it, set `SUPERBOT_IMAGE=superbot-hermes:<version>` in `.env` as well as `SUPERBOT_VERSION`, so Compose runs your image instead of the published one.
+**Harness CLIs** (Claude Code, Codex, Pi, Hermes Agent) are not in the bundle for the bash install: install them from your npm or Python mirror, system-wide, as in [deploy/README.md](../../deploy/README.md#one-unix-account-per-user). `--with-hermes` downloads Hermes Agent, so it is refused with `--offline`. Users' own machines install their harness CLIs from your mirrors instead ([below](#harness-clis-on-users-machines)). The published image already has Claude Code, Codex and Pi and the screens, so [Docker Compose](#docker-compose) is the simpler path when you need them. It doesn't have Hermes Agent: for Hermes, build your own image on the connected side (`docker build --build-arg HARNESSES="claude codex pi hermes" -t superbot-hermes:<version> .`) and bundle it with `--image superbot=superbot-hermes:<version> --allow-unsigned` (it is your image, so there is no release signature to check). After loading it, set `SUPERBOT_IMAGE=superbot-hermes:<version>` in `.env` as well as `SUPERBOT_VERSION`, so Compose runs your image instead of the published one.
 
 ## Getting a bundle
 
@@ -183,6 +183,37 @@ The first checks the index's signature; each arch's image (`...@sha256:<its dige
 - **Doing it yourself:** the images are OCI archives and the signatures OCI layouts, so after extracting a bundle any tool that copies OCI layouts with their referrers can push them; then check the digests yourself.
 - Bundles made before ADR 0147 have no signatures or `superbot-oci` (set `SUPERBOT_OCI`): their images go up alone, one arch per path (`--registry registry.corp.example/superbot/arm64`), and `cosign verify` against the mirror finds nothing; `images/<name>.cosign.json` is the record of the check. Bundles made before ADR 0140 (with `docker save` images) can't be pushed with their digests: `push` refuses them. Use `load` for those, or a newer bundle.
 
+## Harness CLIs on users' machines
+
+With a control plane (`MACHINE_CONTROL_URL`), each user's machine installs the harness CLIs in `MACHINE_HARNESSES` by itself ([ADR 0039](../adr/0039-machine-harnesses-and-agent-upgrades.md)): Node.js from nodejs.org, then Claude Code, Codex and Pi from npm's registry. Neither is reachable here, so point machines at your own copies:
+
+```sh
+MACHINE_NODE_MIRROR=https://mirror.corp.example/nodejs/dist
+MACHINE_NPM_REGISTRY=https://mirror.corp.example/api/npm/npm-remote/
+MACHINE_MIRROR_CA_FILE=/etc/superbot/mirror-ca.pem
+```
+
+- **`MACHINE_NODE_MIRROR`** is laid out as `https://nodejs.org/dist`: machines fetch `<mirror>/v<version>/node-v<version>-linux-x64.tar.xz` (or `-arm64`). An Artifactory or Nexus generic remote of `https://nodejs.org/dist`, or a folder of those files on any web server inside the network, does.
+- **`MACHINE_NPM_REGISTRY`** is an npm registry: an Artifactory, Nexus or Verdaccio remote of `https://registry.npmjs.org`, or one you filled on the connected side. Machines fetch the harnesses and everything they depend on from it, and nothing from npm's registry.
+- **`MACHINE_MIRROR_CA_FILE`** (optional) is the CA, PEM, one or more certificates, that the mirrors' certificates are signed by, if machines don't already trust it. Machines trust it besides their own roots, for these downloads only; botd checks it at start.
+- Both must be `https://`, with no login in the URL: the mirrors must serve these files to machines without one. All three need `MACHINE_CONTROL_URL`, and botd won't start with a value it can't use.
+- **Incus containers** never reach private addresses ([guide](incus-containers.md)), so open each mirror's address and port, exactly, with `INCUS_EGRESS_ALLOW=10.0.0.20:443` (comma-separated, IPv6 as `[fd00::20]:443`). Only TCP to those ports opens. `botctl machine mirror` fails, naming the address to add, while one is still closed.
+- **Linode machines'** outbound rules ([ADR 0179](../adr/0179-outbound-rules-at-the-provider.md)) drop private addresses too, with no per-address exception; `botctl machine mirror` says so. Put the mirrors on addresses those rules don't hold, or set `MACHINE_FIREWALL_EGRESS=off`.
+
+**The pins don't change.** Node.js is still checked against the SHA-256 botd pins for its version, and each npm harness's package against its pinned SHA-512, wherever it came from, so a mirror can serve them but can't change them: a file that differs fails that harness's install, with the reason in `botctl machine agent <user>`. The packages a harness depends on are checked against the SHA-512 your registry lists for them, as they would be against npm's. To change what a machine installs, change `MACHINE_HARNESSES` (`name@version=<checksum>`), never the mirror.
+
+**Check the mirrors before machines need them:**
+
+```sh
+botctl machine mirror
+```
+
+botd fetches every file the harness plan names, from where machines would and trusting what they would: each arch's Node.js tarball, and each npm harness's package document and tarball. It checks each against its pin and answers with an entry per file (`ok`, and an `error` saying what is missing or different), and `"ok": true` only when every one passed. `blocked` lists any mirror address the machines' firewall would drop, which botd, outside it, still reaches, including where the mirror redirects (`redirects`) and any Incus host's address. Nothing is installed or changed. botd must reach the mirrors as machines do. With a remote that fetches from upstream on first use, this fills it too. Run it after every upgrade, since a release can move a pin, then `botctl machine harnesses <user>` sends a machine the plan now.
+
+**Agents:** a machine's agent needs this release or later to use the npm registry or the CA, since older ones would refuse the plan or fetch from npm's registry: botd doesn't send them a plan with mirrors in it, and `botctl machine harnesses <user>` says to upgrade first. Agents upgrade from botd itself, over the control plane, so `botctl machine upgrade <user>` (or `MACHINE_AGENT_UPGRADES=auto`) works with no internet. A mirror for Node.js alone needs no upgrade.
+
+**Hermes Agent** has no npm package: its installer, pinned by SHA-256, clones its code from GitHub and its Python packages from PyPI, which no mirror setting covers. Leave `hermes` out of `MACHINE_HARNESSES` on machines without the internet, and set it explicitly: unset, it defaults to the managed tiers' harness, Hermes on the shipped plans. botd's startup log and `botctl machine mirror` name any harness still fetched from the internet.
+
 ## Model providers
 
 Bots need a model provider, and in an air-gapped network it must be one inside it: a self-hosted model server with an OpenAI-compatible API (vLLM, Ollama, TGI, ...), or a provider's private endpoint reachable from your network. Model provider URLs must be `https://`, or `http://` on the server itself ([ADR 0097](../adr/0097-model-providers-over-https.md)):
@@ -198,7 +229,8 @@ Logins that go through a vendor's website (`claude login`, `codex login`) don't 
 |---------|---------|
 | License | Works: checked against keys built into botd, no phone-home ([below](#license-and-seats)) |
 | Sign-in | Password, TOTP, and SSO against an identity provider inside your network (ADFS, Keycloak or another OIDC/SAML IdP); cloud IdPs (Entra, Google, GitHub, Apple) only if the server can reach them |
-| Harness CLI installs (console buttons), `--with-hermes` | Download from the internet: install from your mirror instead |
+| Harness CLIs on this server, `--with-hermes` | Download from the internet: install from your npm mirror instead, or use the published image |
+| Harness CLIs on users' machines | Claude Code, Codex and Pi from your Node.js and npm mirrors ([above](#harness-clis-on-users-machines)); Hermes Agent needs GitHub and PyPI |
 | Billing (Stripe), push notifications (`PUSH_PROVIDER=expo`), Turnstile on the sign-up form | Need the internet: leave them off (the default) |
 | Managed machines on Linode | Need the internet: use Incus hosts inside your network, or none |
 | Off-host backups | An S3-compatible store inside your network (MinIO, Ceph) |
