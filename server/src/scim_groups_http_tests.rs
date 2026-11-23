@@ -698,8 +698,15 @@ async fn a_removal_that_cant_keep_the_teams_residency_pin_fails_so_the_idp_retri
     assert!(failed.len() >= 3 && failed.iter().all(|e| e["outcome"] == "failure" && e["details"]["reason"] == "scim"), "{failed:?}");
     assert!(events(port, &admin, "action=team.member_left").await.is_empty());
 
-    // The IdP's retry, once it can: Al leaves pinned.
+    // The IdP's retries, once it can: Al leaves pinned, and Ada's DELETE finishes.
+    let (other, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    assert_eq!(scim(port, &other, "DELETE", &format!("/scim/v2/Users/{ada}"), Value::Null).await.0, 404, "another tenant's retry finds nothing");
+    assert_eq!(scim(port, &t, "DELETE", &format!("/scim/v2/Users/{ada}"), Value::Null).await.0, 500, "still failing");
     app.db.fail_pin_saves(false);
+    assert_eq!(scim(port, &t, "DELETE", &format!("/scim/v2/Users/{ada}"), Value::Null).await.0, 204);
+    assert_eq!(app.db.team_id_of(&ada), None);
+    assert!(app.db.residency_pin(crate::db::PinOn::User, &ada).is_some_and(|p| p.kept_from.as_deref() == Some(id.as_str())));
+    assert_eq!(scim(port, &t, "DELETE", &format!("/scim/v2/Users/{ada}"), Value::Null).await.0, 404, "then she's gone");
     assert_eq!(scim(port, &t, "PATCH", &format!("{GROUPS}/{id}"), remove(&[&al])).await.0, 204);
     let p = app.db.residency_pin(crate::db::PinOn::User, &al).expect("Al's kept pin");
     assert_eq!((p.region.as_str(), p.kept_from.as_deref()), ("gb-lon", Some(id.as_str())));

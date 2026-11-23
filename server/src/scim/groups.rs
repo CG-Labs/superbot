@@ -629,6 +629,15 @@ pub async fn delete(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// Whether `user_id`, a user this tenant deleted, is still on a team its group made:
+/// their DELETE couldn't take them off (ADR 0171).
+pub fn left_behind(app: &AppState, a: &Auth, c: &Caller, user_id: &str) -> bool {
+    let tenant = &c.token.tenant;
+    a.scim.groups
+        && app.db.scim_user(tenant, user_id).is_none()
+        && app.db.team_id_of(user_id).is_some_and(|t| app.db.scim_group(tenant, &t).is_some() && app.db.scim_group_members(tenant, &t, true).iter().any(|u| u.id == user_id))
+}
+
 /// A SCIM DELETE of a user takes them off a team their tenant's group put them on: the
 /// IdP has them in no group any more. An error when that failed (ADR 0171): they stay
 /// on the team, disabled.
