@@ -1564,8 +1564,8 @@ mod tests {
         assert!(![crate::changes::PREFIX, crate::vulns::PREFIX, crate::drills::PREFIX, "superbot-evidence-"].iter().any(|p| b.name.starts_with(p)));
         let entries = crate::coverage::untar(&b.tar).unwrap();
         let all: String = entries.iter().map(|(_, x)| String::from_utf8_lossy(x).into_owned()).collect();
-        for secret in ["Alice", "Example", "Cross-user", "secret reasoning", "Signup abuse"] {
-            assert!(!all.contains(secret), "{secret} is in the bundle");
+        for never in ["Alice", "Example", "Cross-user", "secret reasoning", "Signup abuse"] {
+            assert!(!all.contains(never), "{never:?} is in the bundle");
         }
         let manifest: Value = serde_json::from_slice(&entries.iter().find(|(n, _)| n.ends_with("/manifest.json")).unwrap().1).unwrap();
         assert_eq!((manifest["kind"].as_str(), manifest["source"]["registerSha256"].as_str()), (Some("policy-register"), Some(sha256(&bytes).as_str())));
