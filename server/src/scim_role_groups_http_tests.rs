@@ -98,7 +98,8 @@ async fn role_groups_are_off_by_default_and_never_reach_admins() {
         (json!({ "tenant": "entra", "displayName": "Auditors", "role": "nope" }), 404, "unknown role"),
         (json!({ "tenant": "entra", "role": audit }), 400, "a displayName is needed"),
         (json!({ "tenant": "entra", "displayName": "Auditors" }), 400, "a role is needed"),
-        (json!({ "tenant": "entra", "displayName": "Auditors", "role": audit, "scope": "team" }), 400, "unknown field"),
+        (json!({ "tenant": "entra", "displayName": "Auditors", "role": audit, "kind": "team" }), 400, "unknown field"),
+        (json!({ "tenant": "entra", "displayName": "Auditors", "role": audit, "scope": "everywhere" }), 400, "org or team"),
         (json!({ "tenant": "Not a tenant", "displayName": "Auditors", "role": audit }), 400, "tenant names are checked"),
         (json!({ "tenant": "entra", "displayName": "eng", "role": audit }), 409, "Eng is a team group already"),
     ] {
@@ -427,7 +428,7 @@ async fn with_group_roles_off_a_declared_group_is_still_no_team_but_gives_nothin
     let fay = person(port, &t, "fay@example.com").await;
     let audit = role(port, &admin, "Auditor", "member", &["audit.view"]).await;
     // Declared while group roles were on.
-    let g = app.db.declare_scim_role_group("okta", "Auditors", None, &audit, None).unwrap();
+    let g = app.db.declare_scim_role_group("okta", "org", "Auditors", None, &audit, None).unwrap();
     let id = push(port, &t, "Auditors", &[&fay]).await;
     assert_eq!(id, g.id);
     assert!(app.db.teams().is_empty());
