@@ -66,6 +66,15 @@ describe("residencyLines (ADR 0168)", () => {
     const host = residencyLines(view({ status: "data_outside" }));
     expect(host.warnings).toEqual(["Some of your data is outside gb-lon. Your admins see a warning about it."]);
   });
+
+  it("says where the server's own copy of your account and chats is, when the server says (ADR 0184)", () => {
+    expect(residencyLines(view({ serverData: { region: "gb-lon", inRegion: true } })).lines).toContain("SuperBot's own copy of your account and chats is in gb-lon.");
+    const elsewhere = residencyLines(view({ serverData: { region: "de-fra-2", inRegion: false } }));
+    expect(elsewhere.lines).toContain("SuperBot's own copy of your account and chats isn't held to gb-lon; it is in de-fra-2. Your agreement says where it is.");
+    expect(elsewhere.warnings).toEqual([]);
+    expect(residencyLines(view({ serverData: { region: null, inRegion: false } })).lines).toContain("SuperBot's own copy of your account and chats isn't held to gb-lon. Your agreement says where it is.");
+    expect(residencyLines(view()).lines.some((l) => l.includes("SuperBot's own copy"))).toBe(false);
+  });
 });
 
 describe("reports", () => {

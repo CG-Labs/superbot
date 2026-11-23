@@ -31,6 +31,9 @@ export function residencyLines(v: MyResidency): { lines: string[]; warnings: str
     else warnings.push(`${b.outside} of your computer's ${b.kept} backups are outside ${p.region}. Your admins see a warning about it.`);
   }
   if (v.status === "data_outside" && warnings.length === 0) warnings.push(`Some of your data is outside ${p.region}. Your admins see a warning about it.`);
+  const s = v.serverData;
+  if (s?.inRegion) lines.push(`SuperBot's own copy of your account and chats is in ${p.region}.`);
+  else if (s) lines.push(`SuperBot's own copy of your account and chats isn't held to ${p.region}${s.region ? `; it is in ${s.region}` : ""}. Your agreement says where it is.`);
   if (v.modelRoutes && !v.modelRoutes.inRegion) {
     warnings.push(`Your plan has no AI model in ${p.region}, so your Bots don't run until your admin adds one. Nothing is sent outside the region instead.`);
   } else if (v.modelRoutes?.inRegion) {
