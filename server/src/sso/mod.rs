@@ -803,7 +803,9 @@ pub async fn start(
     if a.limiter.blocked(&ip, at).is_some() {
         return no_store(ret.fail("sso_too_many"));
     }
-    let endpoint = match p.authorization_endpoint(sso.http(), sso.refresh_gap).await.inspect_err(|_| audit_metadata_refusal(&a, p)) {
+    let endpoint = p.authorization_endpoint(sso.http(), sso.refresh_gap).await;
+    audit_metadata_refusal(&a, p);
+    let endpoint = match endpoint {
         Ok(e) => e,
         Err(e) => {
             crate::obs::log::log_warn!("SSO {id}: discovery failed: {e}");
@@ -1291,9 +1293,12 @@ async fn slo(a: &Auth, source: &Source, id: &str, incoming: &saml_slo::Incoming<
     }
 }
 
-/// The IdP metadata, auditing metadata from the URL refused for its signature or validity.
+/// The IdP metadata, auditing metadata from the URL refused for its signature or validity,
+/// also when the last good copy is used instead.
 async fn idp_metadata(a: &Auth, p: &Provider) -> Result<Arc<saml_sp::IdpMetadata>, jwt::Invalid> {
-    p.idp_metadata(a.sso.http(), a.sso.refresh_gap).await.inspect_err(|_| audit_metadata_refusal(a, p))
+    let m = p.idp_metadata(a.sso.http(), a.sso.refresh_gap).await;
+    audit_metadata_refusal(a, p);
+    m
 }
 
 fn audit_metadata_refusal(a: &Auth, p: &Provider) {

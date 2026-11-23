@@ -536,6 +536,14 @@ impl Provider {
         self.idp.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(_, at)| at.elapsed())
     }
 
+    /// Makes the loaded IdP metadata look `by` older, so tests can reach a refresh.
+    #[cfg(test)]
+    pub fn age_idp(&self, by: Duration) {
+        if let Some((_, at)) = self.idp.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            *at = at.checked_sub(by).unwrap_or(*at);
+        }
+    }
+
     pub fn set_idp(&self, m: IdpMetadata) {
         *self.idp.lock().unwrap_or_else(|e| e.into_inner()) = Some((Arc::new(m), Instant::now()));
     }

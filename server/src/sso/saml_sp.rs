@@ -167,7 +167,9 @@ fn check_signed(root: Node, entity: Node, t: &MetadataTrust, now_ms: i64) -> Res
     if !signed {
         return if t.require { Err(MetadataRefused { reason: "unsigned", message: "it isn't signed, and signed metadata is required".into() }) } else { Ok(()) };
     }
-    for n in &path {
+    // Every descriptor from the entity up to the root: a signed root covers a nested
+    // EntitiesDescriptor's validUntil too.
+    for n in entity.ancestors().filter(Node::is_element) {
         if let Some(v) = n.attribute("validUntil") {
             let until = time(v).map_err(|_| MetadataRefused::bad(format!("its validUntil ({v}) isn't a date")))?;
             if until <= now_ms {
@@ -1730,6 +1732,17 @@ mod tests {
         let other_signed = format!(r#"<md:EntitiesDescriptor xmlns:md="{METADATA}">{}{entity}</md:EntitiesDescriptor>"#, signed_metadata(&other, anchor));
         assert_eq!(load(&other_signed, &t).unwrap_err(), "unsigned", "another entity's signature vouches not for ours");
         assert_eq!(load(&aggregate(&entity), &t).unwrap_err(), "unsigned");
+
+        // A signed root covers the validUntil of every descriptor between it and our entity.
+        let nested = |until: i64| {
+            format!(
+                r#"<md:EntitiesDescriptor xmlns:md="{METADATA}" validUntil="{}"><md:EntitiesDescriptor validUntil="{}">{entity}</md:EntitiesDescriptor></md:EntitiesDescriptor>"#,
+                instant(NOW + 86_400_000),
+                instant(until)
+            )
+        };
+        assert!(load(&signed_metadata(&nested(NOW + 1_000), anchor), &t).is_ok());
+        assert_eq!(load(&signed_metadata(&nested(NOW - 1_000), anchor), &t).unwrap_err(), "expired", "an expired middle level");
     }
 
     #[test]

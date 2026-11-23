@@ -748,7 +748,7 @@ async fn ecdsa_idp_keys_and_an_ecdsa_sp_key_sign_in_and_out() {
 }
 
 /// A native provider whose metadata must be signed by test signer 1, with no metadata yet.
-async fn serve_trusting(mode: &str, source: Option<(&str, String)>) -> (Sp, std::path::PathBuf) {
+async fn serve_trusting(mode: &str, source: Option<(&str, String)>) -> (Sp, std::path::PathBuf, Arc<crate::sso::Provider>) {
     let dir = std::env::temp_dir().join(format!("saml-md-{}", random_hex(4)));
     std::fs::create_dir_all(&dir).unwrap();
     let anchor = dir.join("anchor.pem");
@@ -763,13 +763,14 @@ async fn serve_trusting(mode: &str, source: Option<(&str, String)>) -> (Sp, std:
         (format!("SSO_{up}_SIGNED_METADATA"), mode.into()),
     ]);
     vars.extend(source.map(|(k, v)| (format!("SSO_{up}_{k}"), v)));
-    let (port, app, admin) = serve_vars(vars).await;
-    (Sp { port, app, admin, id, sp_entity: None }, dir)
+    let mut provider = None;
+    let (port, app, admin) = serve_vars_with(vars, |a| provider = a.sso.providers.first().cloned()).await;
+    (Sp { port, app, admin, id, sp_entity: None }, dir, provider.unwrap())
 }
 
 #[tokio::test]
 async fn imported_metadata_must_be_signed_and_a_bad_copy_keeps_the_last_good_one() {
-    let (sp, dir) = serve_trusting("require", None).await;
+    let (sp, dir, _) = serve_trusting("require", None).await;
     let signer = |i: usize| crate::sso::xmldsig::test_signer::signer(i);
     let import = |xml: String| {
         let (port, admin, id) = (sp.port, sp.admin.clone(), sp.id.clone());
@@ -807,7 +808,7 @@ async fn imported_metadata_must_be_signed_and_a_bad_copy_keeps_the_last_good_one
     assert_eq!(code, 400);
     assert_eq!(sp.audit("sso.saml_metadata_refused").await.len(), 3);
 
-    let (allow, allow_dir) = serve_trusting("allow", None).await;
+    let (allow, allow_dir, _) = serve_trusting("allow", None).await;
     let (code, _) = call(allow.port, "PUT", &format!("/api/sso/{}/saml/idp-metadata", allow.id), &allow.admin, &json!({ "xml": test_idp::metadata() }).to_string()).await;
     assert_eq!(code, 200, "allow: unsigned is taken");
     let forged = test_idp::signed_metadata(&test_idp::metadata(), signer(0));
@@ -826,7 +827,7 @@ async fn metadata_from_a_url_is_checked_each_time_it_is_fetched() {
     let s = served.clone();
     let app = axum::Router::new().route("/md", axum::routing::get(move || std::future::ready(s.lock().unwrap().clone())));
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let (sp, dir) = serve_trusting("require", Some(("IDP_METADATA_URL", format!("http://127.0.0.1:{idp_port}/md")))).await;
+    let (sp, dir, provider) = serve_trusting("require", Some(("IDP_METADATA_URL", format!("http://127.0.0.1:{idp_port}/md")))).await;
 
     // Badly signed: no sign-in, and the refusal is audited.
     let (code, head, _) = crate::tests::call_with(sp.port, "GET", &format!("/api/auth/sso/{}/start", sp.id), "", "", "").await;
@@ -840,7 +841,18 @@ async fn metadata_from_a_url_is_checked_each_time_it_is_fetched() {
     let u = sp.link();
     let (code, _, head) = sp.sign_in(|_| {}).await;
     assert_eq!(code, 200);
-    assert_eq!(signed_in_as(sp.port, &head).await, Some(u.id));
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(u.id.clone()));
     assert_eq!(sp.audit("sso.saml_metadata_refused").await.len(), 1);
+
+    // A day later the refresh is badly signed: refused and audited, and the good copy still signs in.
+    *served.lock().unwrap() = test_idp::signed_metadata(&test_idp::metadata_with(IDP, &[signer(2)], ""), signer(0));
+    provider.age_idp(std::time::Duration::from_secs(25 * 3600));
+    let (code, _, head) = sp.sign_in(|_| {}).await;
+    assert_eq!(code, 200, "the last good copy");
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(u.id));
+    let refused = sp.audit("sso.saml_metadata_refused").await;
+    // Tests retry at once (no refresh gap), so the start and the ACS each fetch it.
+    assert!(refused.len() > 1, "{refused:?}");
+    assert_eq!((refused[0]["details"]["reason"].as_str(), refused[0]["details"]["kept"].as_bool()), (Some("bad_signature"), Some(true)));
     std::fs::remove_dir_all(dir).ok();
 }
