@@ -774,12 +774,26 @@ impl Tools {
     /// Installs a bundle's tree in `prefix` (ADR 0210). The download is checked against
     /// its pin, then swapped in by `swap_in`: here when the agent can write beside
     /// `prefix`, otherwise outside its unit through systemd, as `useradd` is (ADR 0043).
-    /// Its program is linked first, and linked back if the swap fails.
+    /// Its program is linked first, and linked back if the swap fails. The swap's files
+    /// are in a folder of their own, not `.dl`, which every install starts by clearing.
     async fn bundle(&self, h: &HarnessInstall, downloads: &BTreeMap<String, wire::Download>, prefix: &str, bin: &str, readable: &[String], after: Option<&str>) -> Result<(), String> {
         let arch = std::env::consts::ARCH;
         let d = downloads.get(arch).ok_or(format!("botd serves no {} bundle for {arch}", h.name))?;
-        let file = self.download(&d.url, &d.sha256, hermes_bundle::MAX_BUNDLE).await?;
-        let dl = self.dir.join(".dl");
+        self.wait_for_swap(&h.name).await?;
+        let dl = self.dir.join(format!(".swap-{}", h.name));
+        let _ = std::fs::remove_dir_all(&dl);
+        std::fs::DirBuilder::new().mode(0o700).create(&dl).map_err(|e| format!("{}: {e}", dl.display()))?;
+        let res = self.bundle_in(h, d, &dl, prefix, bin, readable, after).await;
+        let _ = blocking(move || std::fs::remove_dir_all(dl).map_err(|e| e.to_string())).await;
+        res
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn bundle_in(&self, h: &HarnessInstall, d: &wire::Download, dl: &Path, prefix: &str, bin: &str, readable: &[String], after: Option<&str>) -> Result<(), String> {
+        let arch = std::env::consts::ARCH;
+        let got = self.download(&d.url, &d.sha256, hermes_bundle::MAX_BUNDLE).await?;
+        let file = dl.join("bundle.tar.gz");
+        std::fs::rename(&got, &file).map_err(|e| format!("{}: {e}", file.display()))?;
         let after = match after {
             Some(body) => {
                 let f = dl.join("after.sh");
@@ -819,11 +833,36 @@ impl Tools {
         Ok(())
     }
 
+    /// Waits for a swap of `name` that outlived the agent which started it: its unit
+    /// runs on through an agent restart, and uses the files `bundle` would clear.
+    async fn wait_for_swap(&self, name: &str) -> Result<(), String> {
+        let unit = format!("superbot-swap-{name}.service");
+        let started = std::time::Instant::now();
+        loop {
+            let active = tokio::process::Command::new("systemctl")
+                .args(["is-active", "--quiet", &unit])
+                .env_clear()
+                .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await
+                .is_ok_and(|s| s.success());
+            if !active {
+                return Ok(());
+            }
+            if started.elapsed() > STEP_TIMEOUT {
+                return Err(format!("{unit} from an earlier install is still running"));
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+
     /// `swap_in` as `superbot-machine swap-in`, in a unit of its own: the agent's unit
-    /// can't write `/opt`. The unit's name is fixed, so a swap still running from before
-    /// a restart makes this one fail rather than run beside it.
+    /// can't write `/opt`. The unit's name is fixed, so two swaps never run at once.
     async fn swap_outside(&self, swap: &Swap) -> Result<(), String> {
-        let spec = self.dir.join(".dl").join("swap.json");
+        let spec = swap.file.with_file_name("swap.json");
         std::fs::write(&spec, serde_json::to_vec(swap).map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", spec.display()))?;
         let exe = std::env::current_exe().map_err(|e| format!("the agent's own path: {e}"))?;
         let unit = format!("--unit=superbot-swap-{}", swap.name);
@@ -1181,7 +1220,7 @@ mod tests {
         assert!(err.contains("not the pinned"), "{err}");
         assert_eq!(std::fs::read_to_string(dest.join("marker")).unwrap(), "kept");
         assert_eq!(leftovers(), 0);
-        assert!(!dir.join("tools/.dl").exists());
+        assert!(!dir.join("tools/.dl").exists() && !dir.join("tools/.swap-hermes").exists());
 
         // An install cut short by a restart, after it moved the tree before it aside: the
         // next one puts that tree back before anything else, and clears the stage.
