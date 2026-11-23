@@ -77,6 +77,37 @@ impl Settings {
         out
     }
 
+    /// The client certificate and key for HOST (with its port), as one PEM: the first
+    /// `NAME.cert` with its `NAME.key`, from the certs.d folders in order. As in containers/image,
+    /// either file without the other is an error.
+    pub fn client_pem(&self, host: &str) -> Result<Option<(PathBuf, Vec<u8>)>, String> {
+        let mut found = None;
+        for d in &self.cert_dirs {
+            let Ok(rd) = std::fs::read_dir(d.join(host)) else { continue };
+            let mut files: Vec<PathBuf> = rd.filter_map(Result::ok).map(|e| e.path()).collect();
+            files.sort();
+            for p in &files {
+                let (ext, other) = match p.extension().and_then(|e| e.to_str()) {
+                    Some("cert") => ("cert", "key"),
+                    Some("key") => ("key", "cert"),
+                    _ => continue,
+                };
+                let pair = p.with_extension(other);
+                if !files.contains(&pair) {
+                    return Err(format!("{} has no {} beside it", p.display(), pair.display()));
+                }
+                if ext == "cert" && found.is_none() {
+                    let read = |f: &PathBuf| std::fs::read(f).map_err(|e| format!("{}: {e}", f.display()));
+                    let mut pem = read(p)?;
+                    pem.push(b'\n');
+                    pem.extend(read(&pair)?);
+                    found = Some((p.clone(), pem));
+                }
+            }
+        }
+        Ok(found)
+    }
+
     /// Whether registries.conf lets HOST/PATH be reached over plain HTTP.
     pub fn insecure(&self, host: &str, path: &str) -> bool {
         let texts: Vec<String> = self.registries_confs.iter().filter_map(|f| std::fs::read_to_string(f).ok()).collect();

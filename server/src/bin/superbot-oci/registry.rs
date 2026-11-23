@@ -170,6 +170,9 @@ impl Client {
         if !certs.is_empty() {
             b = b.tls_certs_merge(certs);
         }
+        if let Some((path, pem)) = settings.client_pem(&repo.host)? {
+            b = b.identity(reqwest::Identity::from_pem(&pem).map_err(|e| format!("{}: {e}", path.display()))?);
+        }
         // As containers/image: an insecure registry's certificate isn't checked, and plain HTTP
         // is tried only if HTTPS doesn't answer at all.
         let insecure = settings.insecure(&repo.host, &repo.path);

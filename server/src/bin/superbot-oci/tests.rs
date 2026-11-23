@@ -49,12 +49,16 @@ struct Mode {
     page_loop: bool,
     /// HTTPS only, with a self-signed certificate.
     tls: bool,
+    /// With `tls`: a client certificate from the fake's own CA is required.
+    client_cert: bool,
 }
 
 struct Fake {
     store: Mutex<Store>,
     mode: Mode,
     addr: String,
+    /// With `client_cert`: a certificate (PEM) the fake accepts, and its key.
+    client: Option<(String, String)>,
 }
 
 const TOKEN: &str = "t0ken";
@@ -226,7 +230,24 @@ async fn handle(State(f): State<Arc<Fake>>, method: Method, uri: Uri, headers: H
 async fn serve(mode: Mode) -> Arc<Fake> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let f = Arc::new(Fake { store: Mutex::new(Store::default()), mode, addr });
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut client = None;
+    let mut verifier = None;
+    if mode.client_cert {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca = rcgen::CertificateParams::new(vec![]).unwrap();
+        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca.self_signed(&ca_key).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_cert.der().clone()).unwrap();
+        verifier = Some(rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone()).build().unwrap());
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut leaf = rcgen::CertificateParams::new(vec!["operator".into()]).unwrap();
+        leaf.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let cert = leaf.signed_by(&key, &rcgen::Issuer::new(ca, ca_key)).unwrap();
+        client = Some((cert.pem(), key.serialize_pem()));
+    }
+    let f = Arc::new(Fake { store: Mutex::new(Store::default()), mode, addr, client });
     let app = axum::Router::new().fallback(handle).with_state(f.clone());
     if !mode.tls {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -234,12 +255,13 @@ async fn serve(mode: Mode) -> Arc<Fake> {
     }
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.signing_key.serialize_der().into());
-    let tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(vec![ck.cert.der().clone()], key)
-        .unwrap();
+    let tls = rustls::ServerConfig::builder_with_provider(provider).with_safe_default_protocol_versions().unwrap();
+    let tls = match verifier {
+        Some(v) => tls.with_client_cert_verifier(v),
+        None => tls.with_no_client_auth(),
+    }
+    .with_single_cert(vec![ck.cert.der().clone()], key)
+    .unwrap();
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
     tokio::spawn(async move {
         loop {
@@ -798,6 +820,24 @@ async fn an_insecure_registry_on_https_is_reached_without_checking_its_certifica
     assert_eq!((got.referrers, got.attestations), (5, 1), "insecure = true, as skopeo reads it: a self-signed certificate is accepted");
     let e = fetch::fetch(&Settings::default(), &repo(&src, REPO), &p.index, &p.arm64, &tmp("tls").join("o")).await.unwrap_err();
     assert!(e.contains("https://") && e.to_lowercase().contains("certificate"), "without it, the certificate is checked: {e}");
+}
+
+#[tokio::test]
+async fn a_registry_that_wants_a_client_certificate_gets_the_one_in_certs_d() {
+    let src = serve(Mode { tls: true, client_cert: true, ..Mode::default() }).await;
+    let p = publish(&src, false);
+    assert!(fetch::fetch(&cfg_for(&src), &repo(&src, REPO), &p.index, &p.arm64, &tmp("mtls").join("o")).await.is_err(), "no client certificate, no connection");
+    let certs = tmp("certs.d");
+    let host = certs.join(&src.addr);
+    std::fs::create_dir_all(&host).unwrap();
+    let (cert, key) = src.client.clone().unwrap();
+    std::fs::write(host.join("client.cert"), cert).unwrap();
+    let cfg = Settings { cert_dirs: vec![certs.clone()], ..cfg_for(&src) };
+    let e = fetch::fetch(&cfg, &repo(&src, REPO), &p.index, &p.arm64, &tmp("mtls").join("o")).await.unwrap_err();
+    assert!(e.contains("client.cert has no") && e.contains("client.key"), "a certificate without its key is refused, as containers does: {e}");
+    std::fs::write(host.join("client.key"), key).unwrap();
+    let got = fetch::fetch(&cfg, &repo(&src, REPO), &p.index, &p.arm64, &tmp("mtls").join("o")).await.unwrap();
+    assert_eq!((got.referrers, got.attestations), (5, 1), "client.cert and client.key from certs.d/HOST, as skopeo uses them");
 }
 
 #[tokio::test]
