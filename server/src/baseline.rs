@@ -1,4 +1,4 @@
-//! The configuration baseline, checked by botd itself (ADR 0192). Each setting in
+//! The configuration baseline, checked by botd itself (ADR 0195). Each setting in
 //! `docs/security/configuration-baseline.md` has a rule here that reads the value botd
 //! runs with, through the same parser botd started with, and judges it: meets the
 //! baseline, doesn't, excepted (`BASELINE_EXCEPTIONS`), doesn't apply to this server

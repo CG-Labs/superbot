@@ -3,7 +3,7 @@
 //! roles, admins, second factors), the versions deployed and configuration changes,
 //! backup and restore runs, retention settings and passes, sign-in and alert events, a
 //! summary of the period's audit log with a digest, the configuration baseline checked
-//! when it was made (ADR 0192), and a manifest with every file's
+//! when it was made (ADR 0195), and a manifest with every file's
 //! SHA-256. Made on request by `GET /api/evidence/bundle` (admins), which `botctl evidence
 //! bundle` saves, and, with `EVIDENCE_BUNDLES=monthly`, by botd itself for each month
 //! into `EVIDENCE_DIR`, with retention. Each bundle is audited with its digests.
@@ -111,7 +111,7 @@ pub const SECTIONS: [Section; 5] = [
 pub const SUMMARY_CRITERIA: [&str; 3] = ["CC2.1", "CC4.1", "CC7.2"];
 
 /// `baseline.json`: every setting of the configuration baseline checked as botd runs
-/// when the bundle is made (ADR 0192).
+/// when the bundle is made (ADR 0195).
 pub const BASELINE_FILE: &str = "baseline.json";
 pub const BASELINE_CRITERIA: [&str; 1] = ["CC5.1"];
 pub const BASELINE_ROWS: [&str; 1] = ["CC5.1-1"];
@@ -153,7 +153,7 @@ of createdAt, which is after the period.
   audit-summary.json        every audit event in the period, counted, and a digest of them
   baseline.json             each setting of the configuration baseline as botd ran when
                             this bundle was made: meets it, doesn't, excepted, not
-                            applicable, or for a person to judge (ADR 0192)
+                            applicable, or for a person to judge (ADR 0195)
   manifest.json             what is in this bundle, the period, and each file's SHA-256
   SHA256SUMS                the same digests, for `sha256sum -c SHA256SUMS`
 

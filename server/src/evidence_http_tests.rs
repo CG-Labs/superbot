@@ -207,7 +207,7 @@ async fn each_file_carries_its_controls_evidence() {
     let want: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(summary["digest"].as_str(), Some(want.as_str()), "the digest is reproducible from the audit log");
 
-    // The configuration baseline as botd ran (ADR 0192): every setting, and the MFA policy
+    // The configuration baseline as botd ran (ADR 0195): every setting, and the MFA policy
     // in force, here off, as a deviation.
     let baseline = parse(file(&f, "baseline.json"));
     assert_eq!(baseline["settings"].as_array().unwrap().len(), crate::baseline::SETTINGS.len());

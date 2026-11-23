@@ -37,7 +37,7 @@ pub const EVIDENCE: [Expected; 6] = [
     Expected { file: "audit-summary.json", criteria: &["CC2.1", "CC4.1", "CC7.2"], rows: &[] },
 ];
 
-/// Files of botd's bundle that bundles made before them lack (ADR 0192): checked like
+/// Files of botd's bundle that bundles made before them lack (ADR 0195): checked like
 /// the rest when listed, never required, so only the test against the evidence plan
 /// reads this.
 #[cfg(test)]
@@ -827,7 +827,7 @@ mod tests {
         check(format!("{name}.tar"), &name, &files)
     }
 
-    /// botd's bundles gained `baseline.json` (ADR 0192): one with it checks and counts its
+    /// botd's bundles gained `baseline.json` (ADR 0195): one with it checks and counts its
     /// deviations, and one made before it still checks.
     #[test]
     fn botds_baseline_file_is_checked_when_there_and_never_required() {

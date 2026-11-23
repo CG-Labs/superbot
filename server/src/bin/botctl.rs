@@ -255,7 +255,7 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl evidence                                  The evidence bundle schedule (EVIDENCE_BUNDLES), where
                                                    bundles are written and those kept (ADR 0142)
   botctl evidence baseline [json]                  Check this server against the configuration baseline
-                                                   (ADR 0192): each setting meets it, doesn't, is excepted
+                                                   (ADR 0195): each setting meets it, doesn't, is excepted
                                                    (BASELINE_EXCEPTIONS), doesn't apply, or needs a person;
                                                    audited, and exits non-zero on a deviation
   botctl evidence bundle [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]
