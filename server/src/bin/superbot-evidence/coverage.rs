@@ -284,6 +284,7 @@ pub fn check(path: String, name: &str, files: &BTreeMap<String, Vec<u8>>) -> Fou
     f.format = m["format"].as_u64();
     match f.format {
         None => f.problems.push("manifest.json has no format".into()),
+        Some(0) => f.problems.push("manifest.json's format (0) isn't one any superbot-evidence made".into()),
         Some(n) if n > kind.format => f.warnings.push(format!("its format ({n}) is newer than this tool knows ({}); use a newer superbot-evidence", kind.format)),
         Some(_) => {}
     }
@@ -963,6 +964,7 @@ mod tests {
         rewrite(&|m| m["files"].as_array_mut().unwrap().retain(|f| f["name"] != "backups.json"), "backups.json isn't in manifest.json");
         rewrite(&|m| m["product"] = json!("Other"), "isn't a SuperBot manifest");
         rewrite(&|m| _ = m.as_object_mut().unwrap().remove("format"), "no format");
+        rewrite(&|m| m["format"] = json!(0), "format (0) isn't one");
         rewrite(&|m| _ = m.as_object_mut().unwrap().remove("createdAt"), "when it was made");
         // A bundle without one of its kind's files, consistently sealed, still fails.
         tamper(
