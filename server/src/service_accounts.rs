@@ -343,7 +343,11 @@ fn need_account(app: &AppState, c: &Caller, by: &Who, key: &str) -> Res<ServiceA
 
 /// What `roles` hold that `owner` doesn't, where the service account would act.
 fn missing(db: &crate::db::Db, owner: &User, roles: &Roles) -> Vec<&'static str> {
-    let cap = ceiling(db, owner, roles.team.as_ref().map(|t| t.id.as_str()));
+    beyond(roles, ceiling(db, owner, roles.team.as_ref().map(|t| t.id.as_str())))
+}
+
+/// What `roles` hold beyond `cap`, the owner's `ceiling` where the account would act.
+fn beyond(roles: &Roles, cap: Scope) -> Vec<&'static str> {
     roles.holds().names().into_iter().filter(|n| Perm::parse(n).is_some_and(|p| !cap.has(p))).collect()
 }
 
@@ -376,10 +380,12 @@ fn choices(app: &AppState, me: &User) -> Value {
     let db = &app.db;
     let custom = db.custom_roles();
     let fits = |team: Option<&crate::db::Team>| -> Vec<String> {
+        // The same for every role here, so read once per team.
+        let cap = ceiling(db, me, team.map(|t| t.id.as_str()));
         let built_in = [Role::Readonly, Role::Member].into_iter().map(|role| (role.as_str().to_string(), Roles { role, custom: None, team: team.cloned() }));
         // A read-only custom role in a team changes nothing, so `create` refuses it there.
         let customs = custom.iter().filter(|r| team.is_none() || r.base != Role::Readonly).map(|r| (r.id.clone(), Roles { role: r.base, custom: Some(r.clone()), team: team.cloned() }));
-        built_in.chain(customs).filter(|(_, roles)| missing(db, me, roles).is_empty()).map(|(id, _)| id).collect()
+        built_in.chain(customs).filter(|(_, roles)| beyond(roles, cap).is_empty()).map(|(id, _)| id).collect()
     };
     let teams: Vec<crate::db::Team> = if me.role == Role::Admin {
         db.teams()
