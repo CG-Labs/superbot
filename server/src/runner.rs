@@ -1109,8 +1109,8 @@ impl App {
             Place::Here => space,
         };
         // Short-lived credentials, made last so no wait outlives them, and revoked when
-        // `_leases` drops as the run ends, however it ends (ADR 0185).
-        let (space, _leases) = match crate::secrets::leases::for_run(&bot.owner_id, &bot.id, for_other.is_none(), self.cfg.run_timeout) {
+        // `leases` drops as the run ends, however it ends (ADR 0185).
+        let (space, leases) = match crate::secrets::leases::for_run(&bot.owner_id, &bot.id, for_other.is_none(), self.cfg.run_timeout) {
             Ok((creds, leases)) => {
                 if let Some(e) = wiring.endpoints.iter().find(|e| leases.cleared().contains(&e.key_secret)) {
                     let e = crate::secrets::Error::Unavailable(format!("the lease gave an empty {}, the key for model provider {}", e.key_secret, e.name));
@@ -1261,7 +1261,11 @@ impl App {
                 attempt_span.set("gen_ai.request.model", m);
             }
             let _traced = trace::run_attempt(&run_id, &attempt_span);
-            let timeout = self.cfg.run_timeout;
+            // A run stops when its first STS session expires, if that comes first (ADR 0194).
+            let (timeout, credentials_end) = match leases.expires_first().map(|at| at.saturating_duration_since(Instant::now())) {
+                Some(left) if left < self.cfg.run_timeout => (left, true),
+                _ => (self.cfg.run_timeout, false),
+            };
             let timer = tokio::spawn({
                 let abort_tx = abort_tx.clone();
                 async move {
@@ -1521,6 +1525,7 @@ impl App {
                     "I stopped: approvals were turned on while I was working without them. Send the task again and I'll ask before risky steps.",
                     true,
                 ),
+                Some("timeout") if credentials_end => self.say(&id, "The short-lived cloud credentials for this task expired, so I stopped. Send it again and I'll get new ones.", true),
                 Some("timeout") => {
                     let mins = self.cfg.run_timeout.as_secs() / 60;
                     self.say(&id, &format!("I hit the {mins} minute limit for one task and stopped."), true)
