@@ -329,4 +329,60 @@ if (parse_args --database-encryption maybe && check_backup_target) 2>/dev/null; 
 grep -q -- '--database-encryption auto|required|off' <<<"$(usage)" || fail "the help has no --database-encryption"
 ok "upgrades keep the database setting unless asked, warn when it's plain, and write the flag as given"
 
+# --source-dir (and any separate checkout, picked up on its own) syncs over the live install
+# with rsync --delete: runtime state must survive it, neither deleted nor overwritten.
+command -v rsync >/dev/null || fail "these checks need rsync"
+src="$T/src" H="$T/live"
+live="$H/superbot"
+user_home() { echo "$H"; }
+mkdir -p "$src/server/src" "$src/data" "$live/.git" "$live/server/src"
+echo '[workspace]' >"$src/Cargo.toml"
+echo 'fn main() {}' >"$src/server/src/main.rs"
+echo 'NEW=1' >"$src/.env.example"
+echo 'AUTH_PASSWORD=checkout' >"$src/.env"
+echo checkout >"$src/data/app.sqlite"
+echo 'fn old() {}' >"$live/server/src/old.rs"
+echo 'OLD_SETTING=1' >"$live/.env.example"
+state=(.env.local data/app.sqlite data/license.key data/evidence/b.tar workspace/users/u1/notes.md
+  backups/superbot-20260101T000000Z.tar.gz.age license/license.key config/tiers.json metrics-token)
+put_state() { local f; for f in "${state[@]}"; do mkdir -p "$(dirname "$live/$f")" && echo "live $f" >"$live/$f"; done; }
+put_state
+printf 'AUTH_PASSWORD=live\nDATA_DIR=%s\nWORKSPACE_DIR=./workspace\nLICENSE_KEY_FILE="%s"\nTIERS_FILE=config/tiers.json\n' \
+  "$live/data" "$live/license/license.key" >"$live/.env"
+sync_live() { (INSTALL_DIR=$src OFFLINE_BUNDLE="" DRY_RUN=false sync_repo) >/dev/null 2>"$T/err" || { cat "$T/err" >&2; fail "sync_repo failed"; }; }
+survives() {
+  local f
+  for f in "${state[@]}"; do
+    [[ "$(cat "$live/$f" 2>/dev/null)" == "live $f" ]] || fail "--source-dir deleted or overwrote $f"
+  done
+  grep -qx 'AUTH_PASSWORD=live' "$live/.env" || fail "--source-dir overwrote .env"
+}
+sync_live
+survives
+[[ "$(cat "$live/.env.example")" == NEW=1 && -f "$live/server/src/main.rs" ]] || fail "--source-dir didn't copy the checkout"
+[[ ! -e "$live/server/src/old.rs" ]] || fail "--source-dir no longer removes files the checkout dropped"
+# DATA_DIR moved inside the install folder, with botd's default BACKUP_DIR beside it.
+printf 'DATA_DIR=./state/data\n' >>"$live/.env"
+state+=(state/data/app.sqlite state/backups/superbot-20260102T000000Z.tar.gz)
+put_state
+sync_live
+survives
+# A quoted value keeps the quotes inside it, and a file reached through a linked folder keeps
+# the link, even when the link leads outside the install folder.
+mkdir -p "$T/outside" && echo outside >"$T/outside/plans.json" && ln -s "$T/outside" "$live/linked"
+printf "TIERS_FILE=\"./config/customer's.json\"\nMACHINE_MIRROR_CA_FILE=./linked/plans.json\n" >>"$live/.env"
+state+=("config/customer's.json")
+put_state
+sync_live
+survives
+[[ -L "$live/linked" && "$(cat "$live/linked/plans.json")" == outside ]] || fail "--source-dir removed the link to a configured file"
+# A first sync, onto a folder with no .git yet, doesn't overwrite either.
+rm -rf "$live/.git"
+sync_live
+survives
+printf 'EVIDENCE_DIR=%s/\n' "$live" >>"$live/.env"
+if (INSTALL_DIR=$src OFFLINE_BUNDLE="" DRY_RUN=false sync_repo) >/dev/null 2>"$T/err"; then fail "a setting pointing at the install folder itself was synced over"; fi
+grep -q 'which --source-dir syncs over' "$T/err" || { cat "$T/err" >&2; fail "no word about the setting at the install folder"; }
+ok "--source-dir keeps .env, data, the workspace, backups and every state path .env names inside the install"
+
 echo "all install checks passed"

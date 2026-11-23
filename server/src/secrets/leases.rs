@@ -20,19 +20,24 @@
 //! - Each lease is asked for with the longest the run may last (`RUN_TIMEOUT_MINUTES`),
 //!   so a backend whose leases end with something else (Vault's with botd's token) can
 //!   make sure that lives as long, or refuse the run.
+//! - With `AWS_RUN_CREDENTIALS` (ADR 0194) the leases are STS `AssumeRole` sessions,
+//!   which nothing can revoke: at run end they are audited as `secret.lease_released`
+//!   with when they expire, and their values stay redacted until then.
 
 use super::external::{self, Scope};
 use super::{check_name, redact, Error, Secret};
 use crate::audit::{Event, Outcome};
 use serde_json::json;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 /// The most paths one run asks for.
 pub const MAX_PATHS: usize = 16;
 /// Stands for the Bot owner's id in a path.
 pub const OWNER: &str = "{owner}";
+/// A lease's TTL as kept here, at most a year, so arithmetic on it can't overflow.
+const MAX_TTL: u64 = 86_400 * 366;
 
 /// One field of a lease, as the backend answered.
 #[derive(Debug)]
@@ -56,10 +61,14 @@ pub struct Lease {
 /// A backend that makes and revokes leases. Errors carry no value.
 pub trait Issuer: Send + Sync {
     fn kind(&self) -> &'static str;
-    /// A new lease from `path`, with the value of each of `fields`, that nothing but its
-    /// own TTL or a revoke ends within `run_for`.
-    fn issue(&self, path: &str, fields: &[String], run_for: Duration) -> Result<Lease, Error>;
+    /// A new lease from `path` for a run of `bot_id`, with the value of each of `fields`,
+    /// that nothing but its own TTL or a revoke ends within `run_for`.
+    fn issue(&self, path: &str, fields: &[String], run_for: Duration, bot_id: &str) -> Result<Lease, Error>;
     fn revoke(&self, lease_id: &str) -> Result<(), Error>;
+    /// False when leases can't be ended early (STS sessions): they last their TTL.
+    fn revocable(&self) -> bool {
+        true
+    }
 }
 
 /// One path and the environment variables its fields become.
@@ -87,39 +96,111 @@ fn path_ok(p: &str) -> bool {
     !plain.is_empty() && plain.split('/').all(|part| !part.is_empty() && part != "." && part != ".." && part.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
 }
 
+/// An IAM role's ARN, `arn:<partition>:iam::<account>:role/<path/name>`, where `{owner}`
+/// may stand in the role's path or name.
+fn role_arn_ok(p: &str) -> bool {
+    let plain = p.replace(OWNER, "x");
+    let parts: Vec<&str> = plain.splitn(6, ':').collect();
+    let ["arn", partition, "iam", "", account, resource] = parts[..] else { return false };
+    let role = resource.strip_prefix("role/").unwrap_or_default();
+    matches!(partition, "aws" | "aws-cn" | "aws-us-gov")
+        && account.len() == 12
+        && account.bytes().all(|b| b.is_ascii_digit())
+        && !role.is_empty()
+        && plain.len() <= 2048
+        && role.split('/').all(|part| !part.is_empty())
+        && role.bytes().all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-/".contains(&b))
+}
+
+/// How one backend's run credentials setting is written.
+pub struct Syntax {
+    pub key: &'static str,
+    /// What an entry starts with, for errors.
+    what: &'static str,
+    path_ok: fn(&str) -> bool,
+    /// The fields an entry may name; any field name if empty.
+    fields: &'static [&'static str],
+    /// What an entry that names no variables gives; none if empty.
+    defaults: &'static [(&'static str, &'static str)],
+    /// Names botd may sign in with that a lease may still give: the run's own, never botd's.
+    own: &'static [&'static str],
+    example: &'static str,
+}
+
+/// `VAULT_RUN_CREDENTIALS` (ADR 0185).
+pub const VAULT: Syntax = Syntax {
+    key: "VAULT_RUN_CREDENTIALS",
+    what: "a Vault path like \"aws/creds/bots\" (letters, digits, . _ - and /, with {owner} for the Bot owner's id)",
+    path_ok,
+    fields: &[],
+    defaults: &[],
+    own: &[],
+    example: "AWS_ACCESS_KEY_ID=access_key",
+};
+
+/// The variables AWS's SDKs and CLI read, and the fields of an STS session they come from.
+const AWS_KEYS: [(&str, &str); 3] = [("AWS_ACCESS_KEY_ID", "AccessKeyId"), ("AWS_SECRET_ACCESS_KEY", "SecretAccessKey"), ("AWS_SESSION_TOKEN", "SessionToken")];
+
+/// `AWS_RUN_CREDENTIALS` (ADR 0194): IAM roles botd assumes with STS for each run.
+pub const AWS: Syntax = Syntax {
+    key: "AWS_RUN_CREDENTIALS",
+    what: "an IAM role's ARN like \"arn:aws:iam::123456789012:role/superbot-bots\" (with {owner} for the Bot owner's id in the role's name)",
+    path_ok: role_arn_ok,
+    fields: &["AccessKeyId", "SecretAccessKey", "SessionToken"],
+    defaults: &AWS_KEYS,
+    own: &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"],
+    example: "AWS_ACCESS_KEY_ID=AccessKeyId",
+};
+
 /// `VAULT_RUN_CREDENTIALS`: entries separated by `;` or new lines, each a path and the
 /// variables it gives, `NAME=field`, separated by spaces:
 /// `aws/creds/bots AWS_ACCESS_KEY_ID=access_key AWS_SECRET_ACCESS_KEY=secret_key`.
 pub fn parse(raw: &str) -> Result<Vec<Wanted>, String> {
-    const KEY: &str = "VAULT_RUN_CREDENTIALS";
+    parse_as(&VAULT, raw)
+}
+
+/// A run credentials setting written as `syntax` says: entries separated by `;` or new
+/// lines, each a path (or role) and the variables it gives, `NAME=field`.
+pub fn parse_as(syntax: &Syntax, raw: &str) -> Result<Vec<Wanted>, String> {
+    let key = syntax.key;
     let mut out: Vec<Wanted> = Vec::new();
     for entry in raw.split([';', '\n']).map(str::trim).filter(|e| !e.is_empty()) {
         let mut parts = entry.split_whitespace();
         let path = parts.next().unwrap_or_default().trim_matches('/');
-        if !path_ok(path) {
-            return Err(format!("{KEY}: {path:?} must be a Vault path like \"aws/creds/bots\" (letters, digits, . _ - and /, with {OWNER} for the Bot owner's id)"));
+        if !(syntax.path_ok)(path) {
+            return Err(format!("{key}: {path:?} must be {}", syntax.what));
         }
-        let mut names = Vec::new();
+        let mut pairs: Vec<(String, String)> = Vec::new();
         for pair in parts {
             let Some((name, field)) = pair.split_once('=') else {
-                return Err(format!("{KEY}: {pair:?} after {path} must be NAME=field, like AWS_ACCESS_KEY_ID=access_key"));
+                return Err(format!("{key}: {pair:?} after {path} must be NAME=field, like {}", syntax.example));
             };
-            check_name(name).map_err(|e| format!("{KEY}: {name}: {e}"))?;
-            if !field_ok(field) {
-                return Err(format!("{KEY}: {field:?} must be a field name like \"access_key\""));
+            pairs.push((name.to_string(), field.to_string()));
+        }
+        if pairs.is_empty() {
+            pairs = syntax.defaults.iter().map(|(n, f)| (n.to_string(), f.to_string())).collect();
+        }
+        let mut names = Vec::new();
+        for (name, field) in pairs {
+            if !syntax.own.contains(&name.as_str()) {
+                check_name(&name).map_err(|e| format!("{key}: {name}: {e}"))?;
             }
-            if out.iter().flat_map(|w| &w.names).chain(&names).any(|(n, _): &(String, String)| n == name) {
-                return Err(format!("{KEY}: {name} is given twice"));
+            if !field_ok(&field) || (!syntax.fields.is_empty() && !syntax.fields.contains(&field.as_str())) {
+                let like = if syntax.fields.is_empty() { "like \"access_key\"".to_string() } else { format!("one of {}", syntax.fields.join(", ")) };
+                return Err(format!("{key}: {field:?} must be a field name {like}"));
             }
-            names.push((name.to_string(), field.to_string()));
+            if out.iter().flat_map(|w| &w.names).chain(&names).any(|(n, _): &(String, String)| *n == name) {
+                return Err(format!("{key}: {name} is given twice"));
+            }
+            names.push((name, field));
         }
         if names.is_empty() {
-            return Err(format!("{KEY}: {path} gives no variables; add NAME=field after it"));
+            return Err(format!("{key}: {path} gives no variables; add NAME=field after it"));
         }
         out.push(Wanted { path: path.to_string(), names });
     }
     if out.len() > MAX_PATHS {
-        return Err(format!("{KEY}: at most {MAX_PATHS} paths, not {}", out.len()));
+        return Err(format!("{key}: at most {MAX_PATHS} paths, not {}", out.len()));
     }
     Ok(out)
 }
@@ -138,6 +219,9 @@ struct Held {
     bot_id: String,
     owner: Option<String>,
     values: Vec<Zeroizing<String>>,
+    /// When the backend ends it by itself: for leases that can't be revoked.
+    expires: Instant,
+    expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl Leases {
@@ -149,6 +233,16 @@ impl Leases {
     /// older one of the same name would pair with the fresh ones.
     pub fn cleared(&self) -> &[String] {
         &self.cleared
+    }
+
+    /// When the first of these leases that can't be revoked expires (STS sessions): the run
+    /// must stop by then, or it would go on with keys that no longer work. None for leases
+    /// that are revoked at run end.
+    pub fn expires_first(&self) -> Option<Instant> {
+        if self.issuer.as_ref().is_none_or(|i| i.revocable()) {
+            return None;
+        }
+        self.held.iter().map(|h| h.expires).min()
     }
 
     #[cfg(test)]
@@ -165,7 +259,14 @@ impl Leases {
 impl Drop for Leases {
     fn drop(&mut self) {
         let (Some(issuer), held) = (self.issuer.take(), std::mem::take(&mut self.held)) else { return };
+        forget_expired();
         if held.is_empty() {
+            return;
+        }
+        if !issuer.revocable() {
+            for h in held {
+                release(issuer.kind(), h);
+            }
             return;
         }
         // Off the run's task: revoking waits on Vault, and the run has already ended.
@@ -203,6 +304,35 @@ fn release_value(v: &str) {
             redact::forget(v);
         }
     }
+}
+
+/// Values of ended runs' leases that can't be revoked, and when they stop working.
+static EXPIRING: Mutex<Vec<(Instant, Vec<Zeroizing<String>>)>> = Mutex::new(Vec::new());
+
+/// Lets the redactor forget values whose lease has expired. Run as leases are made and
+/// let go, so a value may stay redacted past its expiry until the next run: harmless.
+fn forget_expired() {
+    let now = Instant::now();
+    let due: Vec<_> = {
+        let mut expiring = EXPIRING.lock().unwrap_or_else(|e| e.into_inner());
+        let (due, rest) = std::mem::take(&mut *expiring).into_iter().partition(|(at, _)| *at <= now);
+        *expiring = rest;
+        due
+    };
+    for v in due.iter().flat_map(|(_, vs)| vs) {
+        release_value(v);
+    }
+}
+
+/// A run's lease that can't be revoked: audited with when it expires, and its values kept
+/// redacted until then.
+fn release(store: &str, h: Held) {
+    let (e, mut d) = event("secret.lease_released", store, &h.path, &h.bot_id, h.owner.as_deref());
+    d["leaseId"] = json!(h.id);
+    d["revocable"] = json!(false);
+    d["expiresAt"] = json!(h.expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    external::audit(e.details(d));
+    EXPIRING.lock().unwrap_or_else(|e| e.into_inner()).push((h.expires, h.values));
 }
 
 fn event(action: &str, store: &str, path: &str, bot_id: &str, owner: Option<&str>) -> (Event, serde_json::Value) {
@@ -267,6 +397,7 @@ impl RunCredentials {
     /// folders, ADR 0174). `run_for` is the longest the run may last. On an error the
     /// leases already made are revoked.
     pub fn issue(&self, owner: &str, bot_id: &str, owner_keys: bool, run_for: Duration) -> Result<(Vec<(String, Secret)>, Leases), Error> {
+        forget_expired();
         let mut leases = Leases { issuer: Some(Arc::clone(&self.issuer)), held: Vec::new(), cleared: Vec::new() };
         let mut env = Vec::new();
         let owner_ok = owner_keys && Scope::user(owner).is_some();
@@ -280,7 +411,7 @@ impl RunCredentials {
             let (e, mut d) = event("secret.lease_issued", self.issuer.kind(), &path, bot_id, owner_id);
             d["names"] = json!(w.names.iter().map(|(n, _)| n).collect::<Vec<_>>());
             let fields: Vec<String> = w.names.iter().map(|(_, f)| f.clone()).collect();
-            let lease = match self.issuer.issue(&path, &fields, run_for) {
+            let lease = match self.issuer.issue(&path, &fields, run_for, bot_id) {
                 Ok(l) => l,
                 Err(err) => {
                     d["error"] = json!(err.kind());
@@ -291,7 +422,16 @@ impl RunCredentials {
             d["leaseId"] = json!(lease.id);
             d["ttl"] = json!(lease.ttl);
             d["renewable"] = json!(lease.renewable);
-            let mut held = Held { id: lease.id, path: path.clone(), bot_id: bot_id.to_string(), owner: owner_id.map(String::from), values: Vec::new() };
+            let ttl = lease.ttl.min(MAX_TTL);
+            let mut held = Held {
+                id: lease.id,
+                path: path.clone(),
+                bot_id: bot_id.to_string(),
+                owner: owner_id.map(String::from),
+                values: Vec::new(),
+                expires: Instant::now() + Duration::from_secs(ttl),
+                expires_at: chrono::Utc::now() + chrono::Duration::seconds(ttl as i64),
+            };
             let mut missing = Vec::new();
             for ((name, field), got) in w.names.iter().zip(lease.fields) {
                 match got {
@@ -356,9 +496,8 @@ fn active(#[allow(unused_variables)] owner: &str) -> Option<Arc<RunCredentials>>
 pub(crate) mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Mutex;
-    use std::time::Instant;
 
     /// A backend that makes leases in memory and records what it revoked.
     #[derive(Default)]
@@ -373,6 +512,9 @@ pub(crate) mod tests {
         pub same: AtomicBool,
         /// The `run_for` of each lease asked for.
         pub run_for: Mutex<Vec<Duration>>,
+        /// Leases can't be revoked and last `ttl` seconds (900 if 0), as STS sessions.
+        pub unrevocable: AtomicBool,
+        pub ttl: AtomicU64,
     }
 
     /// The longest a test's run may last.
@@ -382,7 +524,10 @@ pub(crate) mod tests {
         fn kind(&self) -> &'static str {
             "fake"
         }
-        fn issue(&self, path: &str, fields: &[String], run_for: Duration) -> Result<Lease, Error> {
+        fn revocable(&self) -> bool {
+            !self.unrevocable.load(Ordering::SeqCst)
+        }
+        fn issue(&self, path: &str, fields: &[String], run_for: Duration, _bot_id: &str) -> Result<Lease, Error> {
             self.run_for.lock().unwrap().push(run_for);
             if self.down.load(Ordering::SeqCst) {
                 return Err(Error::Unavailable("fake is down".into()));
@@ -399,7 +544,11 @@ pub(crate) mod tests {
                     None => Field::Missing,
                 })
                 .collect();
-            Ok(Lease { id: format!("{path}/lease{n}"), ttl: 900, renewable: true, fields })
+            let ttl = match self.ttl.load(Ordering::SeqCst) {
+                0 => 900,
+                t => t,
+            };
+            Ok(Lease { id: format!("{path}/lease{n}"), ttl, renewable: true, fields })
         }
         fn revoke(&self, lease_id: &str) -> Result<(), Error> {
             if self.revoke_down.load(Ordering::SeqCst) {
@@ -493,6 +642,7 @@ pub(crate) mod tests {
         );
         assert_ne!(env(&e1), env(&e2), "each run its own");
         assert_eq!((l1.len(), l2.len()), (2, 2));
+        assert!(l1.expires_first().is_none() && Leases::none().expires_first().is_none(), "revoked at run end: no deadline of their own");
         assert_eq!(l1.cleared(), ["CLOUD_SESSION_TOKEN"], "an empty field is taken out of the run, not left to an older value");
         assert_eq!(redact::text("key aws-run-secret-0a1b-0 here"), "key [redacted] here", "redacted while the lease lives");
 
@@ -597,5 +747,74 @@ pub(crate) mod tests {
         assert_eq!((ev[0].outcome, ev[0].details["error"].as_str()), (Outcome::Failure, Some("unavailable")));
         assert_eq!(redact::text("stuck-run-token-31-0"), redact::MARK, "it lives until its TTL, so it stays redacted");
         redact::forget("stuck-run-token-31-0");
+    }
+
+    #[test]
+    fn aws_roles_are_checked_and_default_to_the_sdks_names() {
+        let w = parse_as(&AWS, "arn:aws:iam::123456789012:role/superbot-bots;\n arn:aws-us-gov:iam::123456789012:role/team/u-{owner} OWN_KEY_ID=AccessKeyId OWN_SECRET=SecretAccessKey OWN_TOKEN=SessionToken").unwrap();
+        assert_eq!(w[0].path, "arn:aws:iam::123456789012:role/superbot-bots");
+        assert_eq!(w[0].names, [pair("AWS_ACCESS_KEY_ID", "AccessKeyId"), pair("AWS_SECRET_ACCESS_KEY", "SecretAccessKey"), pair("AWS_SESSION_TOKEN", "SessionToken")], "an entry naming no variables gets the ones AWS's SDKs read");
+        assert!(w[1].per_owner());
+        super::super::keep_from_bots(&["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"], &[]);
+        assert!(check_name("AWS_ACCESS_KEY_ID").is_err(), "botd signs in with it, so no store gives it");
+        assert!(parse_as(&AWS, "arn:aws:iam::123456789012:role/superbot-bots").is_ok(), "but a run's own session may");
+        assert!(parse("aws/creds/bots AWS_ACCESS_KEY_ID=access_key").unwrap_err().contains("reserved"), "Vault's setting has no such exception");
+        for (raw, err) in [
+            ("aws/creds/bots", "IAM role's ARN"),
+            ("arn:aws:iam::12345:role/r", "IAM role's ARN"),
+            ("arn:aws:iam::{owner}:role/r", "IAM role's ARN"),
+            ("arn:aws:sts::123456789012:role/r", "IAM role's ARN"),
+            ("arn:aws:iam::123456789012:user/r", "IAM role's ARN"),
+            ("arn:aws:iam::123456789012:role/", "IAM role's ARN"),
+            ("arn:aws:iam::123456789012:role/a//b", "IAM role's ARN"),
+            ("arn:aws:iam::123456789012:role/a*b", "IAM role's ARN"),
+            ("arn:evil:iam::123456789012:role/r", "IAM role's ARN"),
+            ("arn:aws:iam::123456789012:role/r X_KEY=Expiration", "one of AccessKeyId, SecretAccessKey, SessionToken"),
+            ("arn:aws:iam::123456789012:role/r X_KEY", "like AWS_ACCESS_KEY_ID=AccessKeyId"),
+            ("arn:aws:iam::123456789012:role/a; arn:aws:iam::123456789012:role/b", "AWS_ACCESS_KEY_ID is given twice"),
+            ("arn:aws:iam::123456789012:role/r PATH=AccessKeyId", "PATH"),
+        ] {
+            let e = parse_as(&AWS, raw).unwrap_err();
+            assert!(e.starts_with("AWS_RUN_CREDENTIALS: ") && e.contains(err), "{raw}: {e}");
+        }
+    }
+
+    #[test]
+    fn leases_that_cant_be_revoked_stay_redacted_until_they_expire() {
+        let f = fake(&[("sts/role/r", &[("SessionToken", Some("sts-run-session-6c5d"))])]);
+        f.unrevocable.store(true, Ordering::SeqCst);
+        f.ttl.store(1, Ordering::SeqCst);
+        f.same.store(true, Ordering::SeqCst);
+        let rc = RunCredentials::new(f.clone(), parse("sts/role/r STS_RUN_TOKEN=SessionToken").unwrap());
+        let (_, l) = rc.issue("uexp6", "bexp6", true, RUN).unwrap();
+        let first = l.expires_first().expect("the run must stop by then");
+        assert!(first <= Instant::now() + Duration::from_secs(1));
+        drop(l);
+        assert!(f.revoked.lock().unwrap().is_empty(), "never asked to revoke");
+        let ev: Vec<_> = external::tests::audited("sts/role/r").into_iter().filter(|e| e.action == "secret.lease_released").collect();
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!((ev[0].details["leaseId"].as_str(), ev[0].details["revocable"].as_bool()), (Some("sts/role/r/lease0"), Some(false)));
+        let at = chrono::DateTime::parse_from_rfc3339(ev[0].details["expiresAt"].as_str().unwrap()).unwrap();
+        assert!((at.timestamp() - chrono::Utc::now().timestamp()).abs() <= 2, "{at}");
+        assert!(!external::tests::audited("sts/role/r").iter().any(|e| e.action == "secret.lease_revoked"));
+        assert_eq!(redact::text("sts-run-session-6c5d"), redact::MARK, "it still works, so it stays redacted");
+
+        std::thread::sleep(Duration::from_millis(1100));
+        f.ttl.store(3600, Ordering::SeqCst);
+        let (_, live) = rc.issue("uexp6", "bexp6", true, RUN).unwrap();
+        assert_eq!(redact::text("sts-run-session-6c5d"), redact::MARK, "the first expired, but a live lease has the same value");
+        drop(live);
+        forget_expired();
+        assert_eq!(redact::text("sts-run-session-6c5d"), redact::MARK, "the second ended its run but hasn't expired");
+        {
+            let mut expiring = EXPIRING.lock().unwrap();
+            for (at, vs) in expiring.iter_mut() {
+                if vs.iter().any(|v| v.as_str() == "sts-run-session-6c5d") {
+                    *at = Instant::now();
+                }
+            }
+        }
+        forget_expired();
+        assert_eq!(redact::text("sts-run-session-6c5d"), "sts-run-session-6c5d", "forgotten once every lease that had it expired");
     }
 }

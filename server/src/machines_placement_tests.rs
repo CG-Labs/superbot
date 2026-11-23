@@ -229,6 +229,7 @@ async fn a_create_whose_answer_was_lost_is_adopted_where_it_landed_not_made_agai
         authorized_keys: vec![],
         user_data: None,
         firewall_id: Some("superbot-fw".into()),
+        subnet_id: None,
     };
     env.cp.hosts().unwrap().create_on("a", &spec).await.unwrap();
     m.create_sent_at = Some(crate::db::now());
