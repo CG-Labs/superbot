@@ -24,6 +24,9 @@
 //!   `EncryptedID` (ADR 0151), read only from the verified assertion, decrypted like an
 //!   assertion and holding exactly one NameID. The caller then refuses a second use of the
 //!   assertion's ID, and keeps the NameID and `SessionIndex` for single logout (`saml_slo`).
+//! - **Groups**, only when the provider names a groups attribute (ADR 0160): every value of
+//!   it in the verified assertion. Entra's overage claim, or more than `MAX_GROUPS` values,
+//!   make the groups unknown, which the caller treats as in none.
 //!
 //! With a provider's SP key (ADR 0137), AuthnRequests can be signed with the HTTP-Redirect
 //! binding's query signature, and our metadata publishes the key's certificate. The key may
@@ -62,11 +65,42 @@ pub const EMAIL_ATTRIBUTES: [&str; 4] = ["email", "mail", "http://schemas.xmlsoa
 /// The same for a display name. Entra's `.../claims/name` is the UPN, so it isn't one.
 pub const NAME_ATTRIBUTES: [&str; 4] = ["displayName", "name", "http://schemas.microsoft.com/identity/claims/displayname", "urn:oid:2.16.840.1.113730.3.1.241"];
 
+/// Entra ID sends this instead of the groups when someone is in more than it puts in a token.
+pub const GROUPS_OVERAGE: &str = "http://schemas.microsoft.com/claims/groups.link";
+/// More group values than this and the list is taken as unknown, not cut short.
+pub const MAX_GROUPS: usize = 500;
+/// The longest group value read. Longer ones are left out.
+pub const MAX_GROUP_LEN: usize = 256;
+
 /// Which assertion attributes hold the email and name. None: the usual names above.
+/// `groups` has no default: groups are read only from the attribute an admin names (ADR 0160).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Attributes {
     pub email: Option<String>,
     pub name: Option<String>,
+    pub groups: Option<String>,
+}
+
+/// The groups a signed assertion puts the person in (ADR 0160).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Groups {
+    /// The provider names no groups attribute.
+    NotRead,
+    /// Every value of the attribute, as sent, without duplicates. Empty when it's missing.
+    Listed(Vec<String>),
+    /// The IdP left groups out (Entra's overage claim), or sent more than `MAX_GROUPS`:
+    /// `overage` or `too_many`.
+    Unknown(&'static str),
+}
+
+impl Groups {
+    /// The groups, when the assertion says which they are.
+    pub fn listed(&self) -> Option<&[String]> {
+        match self {
+            Groups::Listed(g) => Some(g),
+            _ => None,
+        }
+    }
 }
 
 /// What we need from the IdP's metadata.
@@ -587,6 +621,7 @@ pub struct Checked {
     pub until_ms: i64,
     /// The NameID as sent and the IdP's session, for single logout.
     pub login: SamlLogin,
+    pub groups: Groups,
 }
 
 pub(super) fn time(s: &str) -> Result<i64, Refused> {
@@ -624,6 +659,29 @@ fn attribute<'a>(assertion: Node<'a, '_>, names: &[&str]) -> Option<&'a str> {
         let a = attrs.iter().find(|a| a.attribute("Name") == Some(*name))?;
         a.children().find(|c| is(*c, ASSERTION, "AttributeValue")).and_then(text_of).map(str::trim).filter(|v| !v.is_empty())
     })
+}
+
+/// Every value of every `name` attribute in the (verified) assertion's attribute statements.
+/// Values that aren't plain text, are empty, or are longer than `MAX_GROUP_LEN` are left out:
+/// a group never matched only takes access away.
+fn groups(assertion: Node, name: &str) -> Groups {
+    let attrs: Vec<Node> = assertion.children().filter(|c| is(*c, ASSERTION, "AttributeStatement")).flat_map(|s| s.children().filter(|c| is(*c, ASSERTION, "Attribute"))).collect();
+    if attrs.iter().any(|a| a.attribute("Name") == Some(GROUPS_OVERAGE)) {
+        return Groups::Unknown("overage");
+    }
+    let values = attrs.iter().filter(|a| a.attribute("Name") == Some(name)).flat_map(|a| a.children().filter(|c| is(*c, ASSERTION, "AttributeValue")));
+    let mut out: Vec<String> = Vec::new();
+    for (n, v) in values.enumerate() {
+        if n >= MAX_GROUPS {
+            return Groups::Unknown("too_many");
+        }
+        if let Some(v) = text_of(v).map(str::trim).filter(|v| !v.is_empty() && v.len() <= MAX_GROUP_LEN)
+            && !out.iter().any(|o| o == v)
+        {
+            out.push(v.to_string());
+        }
+    }
+    Groups::Listed(out)
 }
 
 /// Every `ID`-like attribute at or under `n`.
@@ -890,7 +948,8 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
     let claims = Claims { issuer: e.idp.entity_id.clone(), subject: super::saml::subject(raw), tenant: None, email, name, username: None };
     let session_index = kept(authn, "SessionIndex");
     let login = SamlLogin { name_id: nid.value, format: nid.format, name_qualifier: nid.name_qualifier, sp_name_qualifier: nid.sp_name_qualifier, session_index };
-    Ok(Checked { claims, assertion_id, until_ms: until.min(now + 24 * 3600 * 1000), login })
+    let groups = e.attributes.groups.as_deref().map_or(Groups::NotRead, |n| groups(assertion, n));
+    Ok(Checked { claims, assertion_id, until_ms: until.min(now + 24 * 3600 * 1000), login, groups })
 }
 
 #[cfg(test)]
@@ -956,6 +1015,8 @@ pub mod test_idp {
         pub status: String,
         pub session_index: String,
         pub attributes: Vec<(String, String)>,
+        /// Attributes with several values each (`groups`), after `attributes`.
+        pub multi_attributes: Vec<(String, Vec<String>)>,
         /// More inside Conditions, before signing.
         pub conditions_extra: String,
         /// Sign the assertion, the response, either, or both.
@@ -988,6 +1049,7 @@ pub mod test_idp {
                 status: SUCCESS.into(),
                 session_index: format!("_s{}", crate::random_hex(8)),
                 attributes: vec![("email".into(), "ada@example.com".into()), ("displayName".into(), "Ada Lovelace".into())],
+                multi_attributes: Vec::new(),
                 conditions_extra: String::new(),
                 sign_assertion: true,
                 sign_response: false,
@@ -1008,8 +1070,10 @@ pub mod test_idp {
         }
 
         pub fn assertion(&self) -> String {
-            let attrs: String =
-                self.attributes.iter().map(|(k, v)| format!(r#"<saml:Attribute Name="{k}"><saml:AttributeValue xsi:type="xs:string">{v}</saml:AttributeValue></saml:Attribute>"#)).collect();
+            let value = |v: &String| format!(r#"<saml:AttributeValue xsi:type="xs:string">{v}</saml:AttributeValue>"#);
+            let single = self.attributes.iter().map(|(k, v)| format!(r#"<saml:Attribute Name="{k}">{}</saml:Attribute>"#, value(v)));
+            let multi = self.multi_attributes.iter().map(|(k, vs)| format!(r#"<saml:Attribute Name="{k}">{}</saml:Attribute>"#, vs.iter().map(value).collect::<String>()));
+            let attrs: String = single.chain(multi).collect();
             format!(
                 r#"<saml:Assertion ID="{aid}" Version="2.0" IssueInstant="{now}"><saml:Issuer>{iss}</saml:Issuer><saml:Subject>{nid}<saml:SubjectConfirmation Method="{BEARER}"><saml:SubjectConfirmationData InResponseTo="{cirt}" NotOnOrAfter="{cna}" Recipient="{rcp}"/></saml:SubjectConfirmation></saml:Subject><saml:Conditions NotBefore="{nb}" NotOnOrAfter="{na}"><saml:AudienceRestriction><saml:Audience>{aud}</saml:Audience></saml:AudienceRestriction>{extra}</saml:Conditions><saml:AuthnStatement AuthnInstant="{now}" SessionIndex="{si}"><saml:AuthnContext><saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement><saml:AttributeStatement>{attrs}</saml:AttributeStatement></saml:Assertion>"#,
                 aid = self.assertion_id,
@@ -1310,7 +1374,7 @@ mod tests {
         no_attrs.attributes.clear();
         assert_eq!(check(&no_attrs.xml()).unwrap().claims.email, None);
         let idp = idp();
-        let mapped = Attributes { email: Some("work_mail".into()), name: None };
+        let mapped = Attributes { email: Some("work_mail".into()), name: None, groups: None };
         let mut custom = base();
         custom.attributes = vec![("email".into(), "personal@evil.example".into()), ("work_mail".into(), "ada@example.com".into())];
         let c = check_response(&STANDARD.encode(custom.xml()), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: REQ, attributes: &mapped, now_ms: NOW, decrypt: None, require_encrypted: false }).unwrap();
@@ -1318,6 +1382,58 @@ mod tests {
         let mut unspecified = base();
         unspecified.name_id_format = "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified".into();
         assert!(check(&unspecified.xml()).is_ok());
+        assert_eq!(c.groups, Groups::NotRead, "no groups attribute named, none read");
+    }
+
+    fn groups_of(r: &Response, name: &str) -> Groups {
+        let idp = idp();
+        let attributes = Attributes { groups: Some(name.into()), ..Attributes::default() };
+        check_response(&STANDARD.encode(r.xml()), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: REQ, attributes: &attributes, now_ms: NOW, decrypt: None, require_encrypted: false }).unwrap().groups
+    }
+
+    #[test]
+    fn groups_come_only_from_the_named_attribute_of_the_signed_assertion() {
+        let s = |v: &[&str]| v.iter().map(|g| g.to_string()).collect::<Vec<_>>();
+        let mut r = base();
+        r.multi_attributes = vec![("groups".into(), s(&["Engineering", " Auditors ", "Engineering", "", &"x".repeat(MAX_GROUP_LEN + 1)])), ("roles".into(), s(&["Admins"]))];
+        // Trimmed, deduplicated, empty and overlong values left out, other attributes ignored.
+        assert_eq!(groups_of(&r, "groups"), Groups::Listed(s(&["Engineering", "Auditors"])));
+        assert_eq!(groups_of(&r, "roles"), Groups::Listed(s(&["Admins"])));
+        assert_eq!(groups_of(&r, "memberOf"), Groups::Listed(vec![]), "missing: in no groups");
+        // The same attribute twice: both are signed, so both count.
+        r.multi_attributes.push(("groups".into(), s(&["Support"])));
+        assert_eq!(groups_of(&r, "groups"), Groups::Listed(s(&["Engineering", "Auditors", "Support"])));
+        // Case matters: group names are compared as the IdP sends them.
+        assert!(!groups_of(&r, "groups").listed().unwrap().contains(&"engineering".to_string()));
+
+        // Entra's overage claim, or too many values: unknown, never a partial list.
+        let mut over = base();
+        over.multi_attributes = vec![("groups".into(), s(&["Engineering"])), (GROUPS_OVERAGE.into(), s(&["https://graph.microsoft.com/v1.0/users/x/getMemberObjects"]))];
+        assert_eq!(groups_of(&over, "groups"), Groups::Unknown("overage"));
+        let mut many = base();
+        many.multi_attributes = vec![("groups".into(), (0..=MAX_GROUPS).map(|i| format!("g{i}")).collect())];
+        assert_eq!(groups_of(&many, "groups"), Groups::Unknown("too_many"));
+        many.multi_attributes[0].1.pop();
+        assert_eq!(groups_of(&many, "groups").listed().map(<[String]>::len), Some(MAX_GROUPS));
+
+        // A value with markup inside isn't a group name, even signed.
+        let mut marked = base();
+        marked.multi_attributes = vec![("groups".into(), s(&["<b>Admins</b>", "Users"]))];
+        assert_eq!(groups_of(&marked, "groups"), Groups::Listed(s(&["Users"])));
+
+        // Added to the assertion after it was signed: refused before any group is read.
+        let idp = idp();
+        let attributes = Attributes { groups: Some("groups".into()), ..Attributes::default() };
+        let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: REQ, attributes: &attributes, now_ms: NOW, decrypt: None, require_encrypted: false };
+        let added = base().xml_with(|a| a.replace("</saml:AttributeStatement>", r#"<saml:Attribute Name="groups"><saml:AttributeValue>Admins</saml:AttributeValue></saml:Attribute></saml:AttributeStatement>"#));
+        assert_eq!(check_response(&STANDARD.encode(added), &e).unwrap_err().0, "bad_signature");
+
+        // Groups outside the signed assertion are never read.
+        let mut plain = base();
+        plain.multi_attributes = vec![("groups".into(), s(&["Users"]))];
+        let wrapped = plain.xml().replace("</samlp:Response>", r#"<saml:AttributeStatement><saml:Attribute Name="groups"><saml:AttributeValue>Admins</saml:AttributeValue></saml:Attribute></saml:AttributeStatement></samlp:Response>"#);
+        let c = check_response(&STANDARD.encode(wrapped), &e).unwrap();
+        assert_eq!(c.groups, Groups::Listed(s(&["Users"])));
     }
 
     #[test]
