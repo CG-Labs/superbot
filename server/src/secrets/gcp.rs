@@ -8,15 +8,22 @@
 //! in with the metadata server's service account (Compute Engine, GKE workload identity,
 //! Cloud Run) or a service account key, and gets a new token two thirds of the way
 //! through each one's life and once more whenever Secret Manager refuses it.
+//!
+//! It is also the `leases::Issuer` of `GCP_RUN_CREDENTIALS` (ADR 0203): an access token
+//! of a service account botd impersonates (IAM Credentials' `generateAccessToken`), made
+//! for each run with botd's own token, lasting the longest the run may. Google can't
+//! revoke one, so it is let go at its expiry.
 
 use super::external::{Provider, Scope};
 use super::http::{self, Bearer, Worker};
+use super::leases::{Field, Issuer, Lease};
 use super::{Error, SecretStore};
 use aws_lc_rs::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use zeroize::Zeroizing;
 
 /// Secret Manager's longest secret id.
@@ -24,6 +31,14 @@ const MAX_ID: usize = 255;
 const METADATA_HOST: &str = "169.254.169.254";
 const TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 const SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
+const IAM_CREDENTIALS: &str = "https://iamcredentials.googleapis.com";
+/// An impersonated token's shortest life; its longest without the organization policy
+/// `constraints/iam.allowServiceAccountCredentialLifetimeExtension`, and with it.
+const MIN_LIFETIME: u64 = 300;
+const DEFAULT_LIFETIME: u64 = 3600;
+const MAX_LIFETIME: u64 = 43_200;
+/// A service account id's longest: what `{owner}` may make of the part before the `@`.
+const MAX_ACCOUNT_ID: usize = 30;
 
 pub struct ServiceAccount {
     pub email: String,
@@ -45,6 +60,8 @@ pub struct Config {
     pub parent: String,
     pub prefix: String,
     pub auth: Auth,
+    /// IAM Credentials, for `GCP_RUN_CREDENTIALS`; no trailing slash.
+    pub iam_endpoint: String,
 }
 
 fn prefix_setting(raw: &str) -> Result<String, String> {
@@ -133,7 +150,11 @@ impl Config {
             None => format!("projects/{project}"),
             Some(l) => format!("projects/{project}/locations/{l}"),
         };
-        Ok(Config { endpoint, parent, prefix: prefix_setting(&var("GCP_SECRET_MANAGER_PREFIX"))?, auth })
+        let iam_endpoint = match var("GCP_IAM_CREDENTIALS_ENDPOINT").trim() {
+            "" => IAM_CREDENTIALS.to_string(),
+            e => http::base_url("GCP_IAM_CREDENTIALS_ENDPOINT", e, IAM_CREDENTIALS)?,
+        };
+        Ok(Config { endpoint, parent, prefix: prefix_setting(&var("GCP_SECRET_MANAGER_PREFIX"))?, auth, iam_endpoint })
     }
 }
 
@@ -157,9 +178,10 @@ struct Inner {
     token: Mutex<Option<Bearer>>,
 }
 
+#[derive(Clone)]
 pub struct SecretManager {
     inner: Arc<Inner>,
-    worker: Worker,
+    worker: Arc<Worker>,
 }
 
 fn unavailable(what: &str, e: impl std::fmt::Display) -> Error {
@@ -170,7 +192,7 @@ impl SecretManager {
     pub fn new(cfg: Config) -> Result<SecretManager, String> {
         let http = http::client("GCP Secret Manager", None, false)?;
         let local = http::client("GCP Secret Manager", None, true)?;
-        Ok(SecretManager { inner: Arc::new(Inner { cfg, http, local, token: Mutex::new(None) }), worker: Worker::new("GCP Secret Manager", "gcp-secrets")? })
+        Ok(SecretManager { inner: Arc::new(Inner { cfg, http, local, token: Mutex::new(None) }), worker: Arc::new(Worker::new("GCP Secret Manager", "gcp-secrets")?) })
     }
 }
 
@@ -301,6 +323,64 @@ impl Inner {
         }
         Err(Error::Unavailable("GCP Secret Manager: listing secrets ran past 1000 pages".into()))
     }
+
+    /// A new access token of `email` for one run of `bot_id` (ADR 0203), lasting `run_for`
+    /// (at least Google's 5 minutes), asked for with botd's own token. When Google refuses
+    /// that token, gets a new one and asks once more.
+    async fn impersonate(&self, email: &str, fields: &[String], run_for: Duration, bot_id: &str) -> Result<Lease, Error> {
+        let secs = run_for.as_secs().max(MIN_LIFETIME);
+        if secs > MAX_LIFETIME {
+            return Err(Error::Unavailable(format!("GCP IAM: a run may last {secs} s (RUN_TIMEOUT_MINUTES), longer than Google's longest access token ({MAX_LIFETIME} s), so GCP_RUN_CREDENTIALS can't cover it")));
+        }
+        if email.split_once('@').is_none_or(|(account, _)| account.len() > MAX_ACCOUNT_ID) {
+            return Err(Error::Unavailable(format!("GCP IAM: {email} can't be a service account: its id, before the @, is at most {MAX_ACCOUNT_ID} characters")));
+        }
+        let what = format!("generateAccessToken for {email}");
+        let url = format!("{}/v1/projects/-/serviceAccounts/{email}:generateAccessToken", self.cfg.iam_endpoint);
+        let body = json!({ "scope": [SCOPE], "lifetime": format!("{secs}s") });
+        for fresh in [false, true] {
+            let token = self.token(fresh).await?;
+            let res = self.http.post(&url).bearer_auth(token.as_str()).json(&body).send().await.map_err(|e| iam_unavailable(&what, e))?;
+            let status = res.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED && !fresh {
+                continue;
+            }
+            let reply = Zeroizing::new(res.bytes().await.map_err(|e| iam_unavailable(&what, e))?.to_vec());
+            if status.is_success() {
+                return token_lease(&reply, email, fields, secs, bot_id, &what);
+            }
+            let hint = match status.as_u16() {
+                403 => "; botd's service account needs roles/iam.serviceAccountTokenCreator on it, and the IAM Service Account Credentials API must be on in botd's project".to_string(),
+                404 => "; is there a service account by that email?".to_string(),
+                400 if secs > DEFAULT_LIFETIME => format!("; a token of more than {DEFAULT_LIFETIME} s needs the organization policy constraints/iam.allowServiceAccountCredentialLifetimeExtension to list the service account, or keep RUN_TIMEOUT_MINUTES at 60 or less"),
+                _ => String::new(),
+            };
+            return Err(Error::Unavailable(format!("GCP IAM answered {status}{} for {what}{hint}", http::error_code(&reply))));
+        }
+        unreachable!("the second pass returns")
+    }
+}
+
+fn iam_unavailable(what: &str, e: impl std::fmt::Display) -> Error {
+    Error::Unavailable(format!("GCP IAM: {what}: {e}"))
+}
+
+/// A run's lease from `generateAccessToken`'s answer: the token under each field asked
+/// for, and how long it lasts. A token that ends before the run could is refused. Google
+/// gives a token no id, so the lease's is the account and `superbot-<bot id>-<random>`,
+/// for SuperBot's own audit log.
+fn token_lease(body: &[u8], email: &str, fields: &[String], run_for: u64, bot_id: &str, what: &str) -> Result<Lease, Error> {
+    let bad = |why: &str| Error::Unavailable(format!("GCP IAM: {what} {why}"));
+    let v: Value = serde_json::from_slice(body).map_err(|_| bad("answered with something that isn't JSON"))?;
+    let token = v["accessToken"].as_str().filter(|t| !t.is_empty() && t.len() <= 8192 && t.bytes().all(|b| b.is_ascii_graphic())).ok_or_else(|| bad("gave no access token"))?;
+    let expires = v["expireTime"].as_str().and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok()).ok_or_else(|| bad("gave a token with no expiry"))?;
+    let ttl = u64::try_from(expires.timestamp() - chrono::Utc::now().timestamp()).unwrap_or(0);
+    // A minute's slack for clocks; Google makes what was asked for or refuses.
+    if ttl + 60 < run_for {
+        return Err(bad(&format!("gave a token that ends in {ttl} s, but a run may last {run_for} s (RUN_TIMEOUT_MINUTES)")));
+    }
+    let fields = fields.iter().map(|f| if f == "accessToken" { Field::Value(Zeroizing::new(token.to_string())) } else { Field::Missing }).collect();
+    Ok(Lease { id: format!("{email}/{}", super::aws::session_name(bot_id)), ttl, renewable: false, fields })
 }
 
 /// A signed JWT that trades for an access token (RFC 7523), good for an hour.
@@ -343,6 +423,25 @@ impl Provider for SecretManager {
     }
 }
 
+impl Issuer for SecretManager {
+    fn kind(&self) -> &'static str {
+        "gcp-secret-manager"
+    }
+
+    fn issue(&self, email: &str, fields: &[String], run_for: Duration, bot_id: &str) -> Result<Lease, Error> {
+        let (inner, email, fields, bot_id) = (Arc::clone(&self.inner), email.to_string(), fields.to_vec(), bot_id.to_string());
+        self.worker.run(async move { inner.impersonate(&email, &fields, run_for, &bot_id).await })
+    }
+
+    fn revoke(&self, _lease_id: &str) -> Result<(), Error> {
+        Err(Error::Unavailable("GCP IAM: an impersonated access token can't be revoked; it lasts until it expires".into()))
+    }
+
+    fn revocable(&self) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::env::EnvStore;
@@ -379,6 +478,10 @@ mod tests {
         /// The service account's public key, to check the JWTs it signs.
         public_key: Mutex<Vec<u8>>,
         audiences: Mutex<Vec<String>>,
+        /// Each `generateAccessToken`: the caller's `Authorization`, the account, the body.
+        impersonated: Mutex<Vec<(String, String, Value)>>,
+        /// The access tokens made for runs.
+        run_tokens: Mutex<Vec<String>>,
     }
 
     type F = Arc<Fake>;
@@ -469,13 +572,42 @@ mod tests {
         (StatusCode::OK, Json(json!({ "secrets": page, "nextPageToken": next, "totalSize": ids.len() })))
     }
 
+    /// IAM Credentials' `projects/-/serviceAccounts/<email>:generateAccessToken`. Accounts
+    /// named `denied`, `missing` and `odd` are refused or answered oddly, `short` gets a
+    /// token of ten minutes, and lifetimes over an hour are refused, as without the
+    /// organization policy that allows them.
+    async fn iam(State(f): State<F>, Path(rest): Path<String>, h: HeaderMap, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+        if let Err(e) = authorized(&f, &h) {
+            return e;
+        }
+        let Some(email) = rest.strip_prefix("projects/-/serviceAccounts/").and_then(|r| r.strip_suffix(":generateAccessToken")) else {
+            return (StatusCode::NOT_FOUND, Json(json!({})));
+        };
+        let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+        f.impersonated.lock().unwrap().push((auth, email.to_string(), body.clone()));
+        let refuse = |code: StatusCode, status: &str| (code, Json(json!({ "error": { "code": code.as_u16(), "status": status, "message": "quoting-the-request" } })));
+        let lifetime: i64 = body["lifetime"].as_str().and_then(|l| l.strip_suffix('s')).and_then(|l| l.parse().ok()).unwrap_or(3600);
+        match email.split('@').next().unwrap_or_default() {
+            "denied" => return refuse(StatusCode::FORBIDDEN, "PERMISSION_DENIED"),
+            "missing" => return refuse(StatusCode::NOT_FOUND, "NOT_FOUND"),
+            "odd" => return (StatusCode::OK, Json(json!({ "expireTime": "2030-01-01T00:00:00Z" }))),
+            _ if lifetime > 3600 => return refuse(StatusCode::BAD_REQUEST, "INVALID_ARGUMENT"),
+            _ => {}
+        }
+        let lifetime = if email.starts_with("short@") { 600 } else { lifetime };
+        let token = format!("ya29.run-{}", crate::random_hex(8));
+        f.run_tokens.lock().unwrap().push(token.clone());
+        let at = (chrono::Utc::now() + chrono::Duration::seconds(lifetime)).to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        (StatusCode::OK, Json(json!({ "accessToken": token, "expireTime": at })))
+    }
+
     fn stand_in() -> (String, F) {
         let f = F::default();
         f.expires_in.store(3599, Ordering::SeqCst);
         let app = axum::Router::new()
             .route("/computeMetadata/v1/instance/service-accounts/default/token", axum::routing::get(metadata_token))
             .route("/token", axum::routing::post(oauth_token))
-            .route("/v1/{*rest}", axum::routing::get(api))
+            .route("/v1/{*rest}", axum::routing::get(api).post(iam))
             .with_state(Arc::clone(&f));
         (serve(app), f)
     }
@@ -615,6 +747,125 @@ mod tests {
         redact::forget("the-sealed-fallback-gcp");
     }
 
+    use super::super::leases::tests::RUN;
+    use super::super::leases::RunCredentials;
+
+    /// `SECRETS_BACKEND=gcp-secret-manager` on the stand-in, with the metadata server and `GCP_RUN_CREDENTIALS`.
+    fn run_credentials(url: &str, accounts: &str) -> Arc<RunCredentials> {
+        let host = url.trim_start_matches("http://");
+        let pairs = [
+            ("SECRETS_BACKEND", "gcp-secret-manager"),
+            ("GCP_SECRET_MANAGER_PROJECT", "proj-1"),
+            ("GCP_SECRET_MANAGER_ENDPOINT", url),
+            ("GCP_IAM_CREDENTIALS_ENDPOINT", url),
+            ("GCE_METADATA_HOST", host),
+            ("GCP_RUN_CREDENTIALS", accounts),
+        ];
+        let x = super::super::external::from_env(&settings(&pairs), &EnvStore::fixed(&pairs)).unwrap().unwrap();
+        Arc::clone(x.run_credentials().expect("GCP_RUN_CREDENTIALS is read with SECRETS_BACKEND=gcp-secret-manager"))
+    }
+
+    fn values(env: &[(String, super::super::Secret)]) -> HashMap<String, String> {
+        env.iter().map(|(k, v)| (k.clone(), v.expose().to_string())).collect()
+    }
+
+    #[test]
+    fn each_run_gets_its_own_token_of_the_service_account_it_impersonates() {
+        let (url, f) = stand_in();
+        let rc = run_credentials(&url, "superbot-bots@proj-1.iam.gserviceaccount.com; superbot-u-{owner}@proj-1.iam.gserviceaccount.com OWN_GCP_TOKEN=accessToken");
+        assert!(rc.describe().contains("superbot-bots@proj-1.iam.gserviceaccount.com, superbot-u-{owner}@proj-1.iam.gserviceaccount.com"));
+        let (e1, l1) = rc.issue("ugcp7", "bgcp7", true, RUN).unwrap();
+        let (e2, l2) = rc.issue("ugcp7", "bgcp7", false, Duration::from_secs(60)).unwrap();
+        let (v1, v2) = (values(&e1), values(&e2));
+        let mut names: Vec<&str> = v1.keys().map(String::as_str).collect();
+        names.sort();
+        assert_eq!(names, ["CLOUDSDK_AUTH_ACCESS_TOKEN", "GOOGLE_OAUTH_ACCESS_TOKEN", "OWN_GCP_TOKEN"]);
+        assert_eq!(v1["CLOUDSDK_AUTH_ACCESS_TOKEN"], v1["GOOGLE_OAUTH_ACCESS_TOKEN"], "one token for gcloud and Terraform");
+        assert_ne!(v1["CLOUDSDK_AUTH_ACCESS_TOKEN"], v1["OWN_GCP_TOKEN"]);
+        assert_eq!(v2.len(), 2, "a run for someone else gets no owner's account");
+        assert_ne!(v1["GOOGLE_OAUTH_ACCESS_TOKEN"], v2["GOOGLE_OAUTH_ACCESS_TOKEN"], "each run its own token");
+        assert!(f.run_tokens.lock().unwrap().contains(&v1["OWN_GCP_TOKEN"]), "the token Google made");
+        assert_eq!(redact::text(&format!("leaked {}", v1["OWN_GCP_TOKEN"])), format!("leaked {}", redact::MARK));
+
+        let calls = f.impersonated.lock().unwrap().clone();
+        assert_eq!(calls.iter().map(|(_, sa, _)| sa.as_str()).collect::<Vec<_>>(), ["superbot-bots@proj-1.iam.gserviceaccount.com", "superbot-u-ugcp7@proj-1.iam.gserviceaccount.com", "superbot-bots@proj-1.iam.gserviceaccount.com"]);
+        let botd = f.tokens.lock().unwrap().clone();
+        assert!(calls.iter().all(|(auth, ..)| botd.iter().any(|t| *auth == format!("Bearer {t}"))), "asked with botd's own token from the metadata server, checked by the stand-in");
+        assert_eq!(calls[0].2, json!({ "scope": [SCOPE], "lifetime": "3600s" }), "as long as the longest run");
+        assert_eq!(calls[2].2["lifetime"], "300s", "at least Google's 5 minutes");
+
+        let ev: Vec<_> = audited("superbot-bots@proj-1.iam.gserviceaccount.com").into_iter().filter(|e| e.bot_id.as_deref() == Some("bgcp7")).collect();
+        let issued = ev.iter().find(|e| e.action == "secret.lease_issued").unwrap();
+        let id = issued.details["leaseId"].as_str().unwrap();
+        assert!(id.starts_with("superbot-bots@proj-1.iam.gserviceaccount.com/superbot-bgcp7-"), "{id}");
+        assert_eq!((issued.details["store"].as_str(), issued.details["renewable"].as_bool()), (Some("gcp-secret-manager"), Some(false)));
+        assert_eq!(issued.details["names"], json!(["CLOUDSDK_AUTH_ACCESS_TOKEN", "GOOGLE_OAUTH_ACCESS_TOKEN"]));
+        assert!((3590..=3600).contains(&issued.details["ttl"].as_u64().unwrap()));
+        assert!(!format!("{ev:?}").contains(&v1["GOOGLE_OAUTH_ACCESS_TOKEN"]), "never a value");
+
+        drop(l1);
+        drop(l2);
+        let released: Vec<_> = audited("superbot-u-ugcp7@proj-1.iam.gserviceaccount.com").into_iter().filter(|e| e.action == "secret.lease_released").collect();
+        assert_eq!((released.len(), released[0].details["revocable"].as_bool()), (1, Some(false)));
+        assert_eq!(released[0].details["userId"], "ugcp7");
+        assert!(released[0].details["expiresAt"].as_str().is_some());
+        assert_eq!(redact::text(&v1["OWN_GCP_TOKEN"]), redact::MARK, "it works until it expires, so it stays redacted");
+    }
+
+    #[test]
+    fn google_refusing_or_odd_refuses_the_run() {
+        let (url, f) = stand_in();
+        let sa = |name: &str| format!("{name}@proj-1.iam.gserviceaccount.com");
+        for (name, run_for, err) in [
+            ("denied", RUN, "403 Forbidden (PERMISSION_DENIED) for generateAccessToken for denied@proj-1.iam.gserviceaccount.com; botd's service account needs roles/iam.serviceAccountTokenCreator"),
+            ("missing", RUN, "404 Not Found (NOT_FOUND) for generateAccessToken for missing@proj-1.iam.gserviceaccount.com; is there a service account"),
+            ("hour", Duration::from_secs(7200), "(INVALID_ARGUMENT) for generateAccessToken for hour@proj-1.iam.gserviceaccount.com; a token of more than 3600 s needs the organization policy constraints/iam.allowServiceAccountCredentialLifetimeExtension"),
+            ("short", RUN, "but a run may last 3600 s"),
+            ("odd", RUN, "gave no access token"),
+            ("long", Duration::from_secs(43_201), "longer than Google's longest access token"),
+            ("abcdefghijklmnopqrstuvwxyz-{owner}", RUN, "at most 30 characters"),
+        ] {
+            let rc = run_credentials(&url, &sa(name));
+            let e = rc.issue("ugcp8", "bgcp8", true, run_for).err().unwrap().to_string();
+            assert!(e.contains(err) && !e.contains("quoting"), "{name}: {e}");
+            let path = sa(&name.replace("{owner}", "ugcp8"));
+            assert!(audited(&path).iter().any(|e| e.action == "secret.lease_issued" && e.outcome == Outcome::Failure), "{name}");
+        }
+        assert!(!f.impersonated.lock().unwrap().iter().any(|(_, sa, _)| sa.starts_with("long@") || sa.starts_with("abcdef")), "never asked for what Google can't make");
+
+        // Google refuses botd's token: it signs in again and asks once more.
+        let rc = run_credentials(&url, &sa("superbot-bots"));
+        rc.issue("ugcp8", "bgcp8", true, RUN).unwrap();
+        f.tokens.lock().unwrap().clear();
+        let before = f.sign_ins.load(Ordering::SeqCst);
+        rc.issue("ugcp8", "bgcp8", true, RUN).unwrap();
+        assert_eq!(f.sign_ins.load(Ordering::SeqCst), before + 1);
+        let (auth, ..) = f.impersonated.lock().unwrap().last().unwrap().clone();
+        assert_eq!(auth, format!("Bearer {}", f.tokens.lock().unwrap()[0]), "with the new token");
+
+        f.down.store(true, Ordering::SeqCst);
+        assert!(matches!(rc.issue("ugcp8", "bgcp8", true, RUN), Err(Error::Unavailable(_))), "Google down: refused, never a run without its token");
+    }
+
+    #[test]
+    fn run_credentials_settings_are_checked() {
+        let base = [("SECRETS_BACKEND", "gcp-secret-manager"), ("GCP_SECRET_MANAGER_PROJECT", "proj-1")];
+        let with = |extra: &[(&str, &str)]| {
+            let pairs = [&base[..], extra].concat();
+            super::super::external::from_env(&settings(&pairs), &EnvStore::fixed(&pairs))
+        };
+        let x = with(&[("GCP_RUN_CREDENTIALS", "superbot-bots@proj-1.iam.gserviceaccount.com")]).unwrap().unwrap();
+        assert_eq!(x.run_credentials().unwrap().names(), ["CLOUDSDK_AUTH_ACCESS_TOKEN", "GOOGLE_OAUTH_ACCESS_TOKEN"]);
+        assert!(with(&[]).unwrap().unwrap().run_credentials().is_none(), "off unless set");
+        let e = with(&[("GCP_RUN_CREDENTIALS", "arn:aws:iam::123456789012:role/r")]).err().unwrap();
+        assert!(e.contains("GCP_RUN_CREDENTIALS") && e.contains("service account's email"), "{e}");
+        let e = with(&[("GCP_IAM_CREDENTIALS_ENDPOINT", "http://iamcredentials.example.com")]).err().unwrap();
+        assert!(e.contains("GCP_IAM_CREDENTIALS_ENDPOINT") && e.contains("must use https"), "{e}");
+        let var = settings(&[("GCP_RUN_CREDENTIALS", "superbot-bots@proj-1.iam.gserviceaccount.com")]);
+        assert_eq!(super::super::external::unused_settings(&var, "aws"), ["GCP_RUN_CREDENTIALS"], "only SECRETS_BACKEND=gcp-secret-manager reads it");
+        assert!(super::super::external::unused_settings(&var, "gcp-secret-manager").is_empty());
+    }
+
     #[test]
     fn crc32c_is_castagnoli() {
         assert_eq!(crc32c(b"123456789"), 0xE306_9283);
@@ -627,6 +878,7 @@ mod tests {
         let c = ok(&[("GCP_SECRET_MANAGER_PROJECT", "proj-1")]).unwrap();
         assert_eq!((c.endpoint.as_str(), c.parent.as_str(), c.prefix.as_str()), ("https://secretmanager.googleapis.com", "projects/proj-1", "superbot"));
         assert!(matches!(&c.auth, Auth::Metadata { host } if host == METADATA_HOST));
+        assert_eq!(c.iam_endpoint, "https://iamcredentials.googleapis.com");
         let c = ok(&[("GCP_SECRET_MANAGER_PROJECT", "proj-1"), ("GCP_SECRET_MANAGER_LOCATION", "europe-west2")]).unwrap();
         assert_eq!((c.endpoint.as_str(), c.parent.as_str()), ("https://secretmanager.europe-west2.rep.googleapis.com", "projects/proj-1/locations/europe-west2"));
         let p = ("GCP_SECRET_MANAGER_PROJECT", "proj-1");

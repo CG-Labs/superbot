@@ -229,6 +229,37 @@ AWS_RUN_CREDENTIALS="arn:aws:iam::<account>:role/superbot-bots"
 - **Redaction**: the keys are redacted from everything botd saves and shows until the session expires.
 - **Order**: these win over static secrets of the same name, and runs never inherit these names from botd's own environment.
 
+## Short-lived GCP credentials for each run
+
+Off by default ([ADR 0203](../adr/0203-gcp-service-account-tokens-for-each-run.md)); only with `SECRETS_BACKEND=gcp-secret-manager`. With `GCP_RUN_CREDENTIALS`, botd impersonates a service account as each run starts (IAM Credentials' `generateAccessToken`) and gives the run that account's access token. No service account key is made or stored, and a token a Bot leaks stops working soon after its run. No Vault is needed; for Vault's GCP engine, see [Vault](vault.md#short-lived-credentials-for-each-run).
+
+Make a service account for the Bots, with only the roles they need, and let botd's own service account make tokens for it:
+
+```sh
+gcloud services enable iamcredentials.googleapis.com
+gcloud iam service-accounts create superbot-bots
+gcloud iam service-accounts add-iam-policy-binding superbot-bots@<project>.iam.gserviceaccount.com \
+  --member=serviceAccount:<botd's account> --role=roles/iam.serviceAccountTokenCreator
+```
+
+Then in `.env`:
+
+```sh
+GCP_RUN_CREDENTIALS="superbot-bots@<project>.iam.gserviceaccount.com"
+# or several, naming the variable each gives:
+# GCP_RUN_CREDENTIALS="superbot-bots@<project>.iam.gserviceaccount.com; superbot-u-{owner}@<project>.iam.gserviceaccount.com OWN_GCP_TOKEN=accessToken"
+```
+
+- **Format**: entries separated by `;` or new lines. Each is a service account's email, then `NAME=accessToken` pairs. An entry with no pairs gives the token as `CLOUDSDK_AUTH_ACCESS_TOKEN`, which gcloud reads, and `GOOGLE_OAUTH_ACCESS_TOKEN`, which Terraform's Google provider reads. Google's client libraries read neither; code using them builds credentials from one of these variables. At most 16 accounts; each name once.
+- **`{owner}`** before the `@` is the Bot owner's id (`botctl users`), so each user's Bots can have their own account (`superbot-u-{owner}`). Grant botd the Token Creator role on each one; Google has no wildcard for it. A service account id is at most 30 characters, so a longer one is refused before any request. Those accounts are used only for runs that get the owner's own secrets, not a teammate's run of an isolated shared Bot.
+- **Token length**: each token lasts as long as the longest run (`RUN_TIMEOUT_MINUTES`, 60 by default), at least Google's 5 minutes. Google allows an hour unless the organization policy `constraints/iam.allowServiceAccountCredentialLifetimeExtension` lists the account, which allows up to 12 hours; keep `RUN_TIMEOUT_MINUTES` at 60 or less otherwise. A run timeout longer than 12 hours can't be covered, so those runs are refused. A run also stops when its token expires, and the Bot says its credentials expired and to send the task again.
+- **Can't be revoked**: Google can't end one token early. When the run ends, botd audits `secret.lease_released` with the token's expiry (`expiresAt`), and the token works until then. In an emergency, disable the service account (`gcloud iam service-accounts disable ...`) or put an IAM deny policy on it: that stops every token it has.
+- **Fails closed**: if Google refuses (botd lacks the role, the API is off, no such account, a lifetime the policy doesn't allow), the run doesn't start (`bot.run_refused`, reason `secrets_unavailable`), and the error names what to check. botd makes no token at startup, so a wrong email or role shows on the first run.
+- **Audit**: `botctl audit --action 'secret.lease_*'` shows each token made (`secret.lease_issued`, with the account, a `leaseId` of `<email>/superbot-<bot id>-<random>`, TTL and the variable names) and let go (`secret.lease_released`), never a token. Google's own audit logs record the call as botd's account using the Bots' account.
+- **Redaction**: the token is redacted from everything botd saves and shows until it expires.
+- **Order**: these win over static secrets of the same name, and runs never inherit these names from botd's own environment.
+- **Private Service Connect**: set `GCP_IAM_CREDENTIALS_ENDPOINT` to its endpoint (https only).
+
 ## Day to day
 
 - **Rotate**: add a new version (`az keyvault secret set ...`, `gcloud secrets versions add ...`, `aws secretsmanager put-secret-value ...`). botd uses it within `SECRETS_CACHE_SECONDS`, with no restart. Settings botd reads only at startup (Stripe, Linode, Incus, Turnstile, metrics and backup keys) need a restart.

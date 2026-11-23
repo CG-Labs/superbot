@@ -359,7 +359,7 @@ fn xml_error(body: &str) -> String {
 
 /// `superbot-<bot id>-<random>`: STS's session name, at most 64 of `\w+=,.@-`, which
 /// CloudTrail shows on everything the session does.
-fn session_name(bot_id: &str) -> String {
+pub(crate) fn session_name(bot_id: &str) -> String {
     let bot: String = bot_id.chars().filter(|c| c.is_ascii_alphanumeric() || "+=,.@_-".contains(*c)).take(46).collect();
     let bot = if bot.is_empty() { "run".to_string() } else { bot };
     format!("superbot-{bot}-{}", crate::random_hex(4))
