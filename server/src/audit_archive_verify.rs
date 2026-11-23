@@ -34,8 +34,8 @@ const MAX_LISTED: usize = 20;
 /// one before: an object is missing, or isn't botd's), `checkpoint`, `behind` (the archive
 /// ends before the last event botd delivered to it), `start` (it begins after the first
 /// event botd sent it), or, against this server's log,
-/// `mismatch` (the event here has another hash) and `missing` (it's gone, and retention
-/// didn't delete it).
+/// `mismatch` (the event here has another hash), `contents` (it has the same hash, but the
+/// archive's copy says something else) and `missing` (it's gone, and retention didn't delete it).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Problem {
@@ -77,6 +77,8 @@ pub struct Checked {
     /// Events whose hash this server's log has (`matched`), had before retention deleted
     /// them (`gone`), differs from (`mismatched`) or lacks (`missing`).
     pub matched: u64,
+    /// Events with this server's hash but other contents: a changed copy in the archive.
+    pub altered: u64,
     pub gone: u64,
     pub mismatched: u64,
     pub missing: u64,
@@ -146,6 +148,8 @@ struct Line {
     hash: String,
     action: String,
     details: Value,
+    /// The whole line, to compare with this server's row.
+    raw: Value,
 }
 
 fn lines(body: &[u8]) -> Result<Vec<Line>, String> {
@@ -160,7 +164,7 @@ fn lines(body: &[u8]) -> Result<Vec<Line>, String> {
         let (Some(id), Some(prev), Some(hash)) = (v["id"].as_i64(), v["chainPrev"].as_str(), v["chainHash"].as_str()) else {
             return Err(bad("has no id, chainPrev or chainHash"));
         };
-        out.push(Line { id, prev: prev.into(), hash: hash.into(), action: v["action"].as_str().unwrap_or_default().into(), details: v["details"].clone() });
+        out.push(Line { id, prev: prev.into(), hash: hash.into(), action: v["action"].as_str().unwrap_or_default().into(), details: v["details"].clone(), raw: v });
     }
     if out.is_empty() {
         return Err("it holds no events".into());
@@ -168,9 +172,33 @@ fn lines(body: &[u8]) -> Result<Vec<Line>, String> {
     Ok(out)
 }
 
-/// The hashes this server's log holds for the events from `lo` to `hi`, by id. A hash that
-/// isn't text counts as none.
-pub type Local = BTreeMap<i64, Option<String>>;
+/// What this server's log holds for the events from `lo` to `hi`, by id: each hash (one
+/// that isn't text counts as none), and each row as the export writes it.
+#[derive(Clone, Debug, Default)]
+pub struct Local {
+    pub hashes: BTreeMap<i64, Option<String>>,
+    pub rows: BTreeMap<i64, Row>,
+}
+
+/// A row of this server's log, in the export's shape. `erased`: an erasure has cleared
+/// its salt, so only the fields it can't rewrite are still the archive's.
+#[derive(Clone, Debug)]
+pub struct Row {
+    pub event: Value,
+    pub erased: bool,
+}
+
+/// [`crate::audit_chain::FIXED`] and [`crate::audit_chain::ERASABLE`], as the export names them.
+const FIXED_FIELDS: [&str; 11] = ["id", "at", "actorKind", "action", "targetType", "botId", "outcome", "actorRole", "authMethod", "idp", "idpProvider"];
+const ERASABLE_FIELDS: [&str; 10] = ["actorId", "actorName", "actorSubject", "targetId", "ip", "userAgent", "details", "actorEmail", "sessionId", "onBehalfOf"];
+
+/// The first field the hash covers in which the archive's event differs from this server's
+/// row with the same hash. The archive's hashes aren't bound to its contents on their own:
+/// the salted digest that binds them stays here.
+fn differing(archived: &Value, row: &Row) -> Option<&'static str> {
+    let fields = FIXED_FIELDS.iter().chain(if row.erased { [].iter() } else { ERASABLE_FIELDS.iter() }).chain(["chainPrev"].iter());
+    fields.copied().find(|f| archived.get(*f).unwrap_or(&Value::Null) != row.event.get(*f).unwrap_or(&Value::Null))
+}
 
 /// Walks the archive's objects in id order, as [`crate::audit_chain::Verifier`] walks rows.
 pub struct Walker<'a> {
@@ -307,9 +335,15 @@ impl<'a> Walker<'a> {
     }
 
     fn compare(&mut self, key: &str, e: &Line, local: &Local, anchor: Option<&Link>) {
-        let differs = match (local.get(&e.id), anchor) {
+        let differs = match (local.hashes.get(&e.id), anchor) {
             (Some(Some(h)), _) if *h == e.hash => {
-                self.rep.matched += 1;
+                match local.rows.get(&e.id).and_then(|r| differing(&e.raw, r)) {
+                    None => self.rep.matched += 1,
+                    Some(field) => {
+                        self.rep.altered += 1;
+                        self.problem(Some(key), Some(e.id), "contents", format!("event {}'s {field} in {key} differs from this server's, under the same hash: the archive's copy was changed", e.id));
+                    }
+                }
                 return;
             }
             (Some(_), _) => Some(("mismatch", format!("event {} here doesn't have the hash the archive holds", e.id))),
@@ -439,17 +473,33 @@ fn objects(prefix: &str, listed: Vec<ObjectVersion>, w: &mut Walker) -> Vec<Obje
 }
 
 fn local(app: &App, lo: i64, hi: i64) -> rusqlite::Result<Local> {
-    app.db.with_conn(|c| {
-        let mut s = c.prepare("SELECT id, chain_hash FROM audit_events WHERE id BETWEEN ?1 AND ?2")?;
-        s.query_map([lo, hi], |r| {
+    let (hashes, erased) = app.db.with_conn(|c| {
+        let mut s = c.prepare("SELECT id, chain_hash, chain_salt IS NULL FROM audit_events WHERE id BETWEEN ?1 AND ?2")?;
+        let mut hashes = BTreeMap::new();
+        let mut erased = std::collections::BTreeSet::new();
+        for row in s.query_map([lo, hi], |r| {
             let hash = match r.get::<_, Sql>(1)? {
                 Sql::Text(t) => Some(t),
                 _ => None,
             };
-            Ok((r.get::<_, i64>(0)?, hash))
-        })?
-        .collect()
-    })
+            Ok((r.get::<_, i64>(0)?, hash, r.get::<_, bool>(2)?))
+        })? {
+            let (id, hash, no_salt) = row?;
+            hashes.insert(id, hash);
+            if no_salt {
+                erased.insert(id);
+            }
+        }
+        Ok::<_, rusqlite::Error>((hashes, erased))
+    })?;
+    let filter = crate::audit::Filter { after: Some(lo - 1), before: Some(hi.saturating_add(1)), ..Default::default() };
+    let rows = app
+        .db
+        .try_audit_events(&filter, hi - lo + 1, true)?
+        .into_iter()
+        .map(|e| (e.id, Row { erased: erased.contains(&e.id), event: serde_json::to_value(&e).unwrap_or(Value::Null) }))
+        .collect();
+    Ok(Local { hashes, rows })
 }
 
 /// Checks the archive `a` within `range` against itself and this server's log, trusting
@@ -513,7 +563,7 @@ pub async fn check(app: &App, a: &Archive, delivered: i64, batches: bool, start:
 pub fn summary(c: &Checked) -> Value {
     serde_json::json!({
         "ok": c.ok, "archive": c.archive, "objects": c.objects, "events": c.events, "first": c.first, "head": c.head, "delivered": c.delivered, "start": c.start,
-        "matched": c.matched, "gone": c.gone, "mismatched": c.mismatched, "missing": c.missing, "locked": c.locked, "lockExpired": c.lock_expired,
+        "matched": c.matched, "altered": c.altered, "gone": c.gone, "mismatched": c.mismatched, "missing": c.missing, "locked": c.locked, "lockExpired": c.lock_expired,
         "checkpoints": c.checkpoints, "problems": c.problems, "firstProblem": c.first_problems.first(), "error": c.error,
     })
 }
@@ -556,7 +606,11 @@ mod tests {
     }
 
     fn local(to: i64) -> Local {
-        (1..=to).map(|i| (i, Some(hash(i)))).collect()
+        hashes(1..=to)
+    }
+
+    fn hashes(ids: impl Iterator<Item = i64>) -> Local {
+        Local { hashes: ids.map(|i| (i, Some(hash(i)))).collect(), ..Default::default() }
     }
 
     fn walk(objects: &[(i64, i64)], lock: &str, delivered: i64, here: &Local) -> Checked {
@@ -609,8 +663,8 @@ mod tests {
     #[test]
     fn this_servers_log_is_held_to_the_archive() {
         let mut here = local(6);
-        here.insert(4, Some(hash(40)));
-        here.remove(&5);
+        here.hashes.insert(4, Some(hash(40)));
+        here.hashes.remove(&5);
         let c = walk(&[(1, 6)], "bucket", 6, &here);
         assert_eq!((c.matched, c.mismatched, c.missing, c.local_breaks.clone()), (4, 1, 1, vec![4, 5]));
         assert_eq!(reasons(&c), ["mismatch", "missing"]);
@@ -618,7 +672,7 @@ mod tests {
         let a = archive("bucket");
         let mut w = Walker::new(&a, 6, &[]);
         let anchor = Link { id: 3, hash: hash(3) };
-        let here: Local = (4..=6).map(|i| (i, Some(hash(i)))).collect();
+        let here = hashes(4..=6);
         w.object("prod/2026/11/23/00000000000000000001-00000000000000000006.jsonl", (1, 6), &meta(1, 6), &body(1..=6), &here, Some(&anchor));
         let c = w.finish(Range::default(), true);
         assert_eq!((c.ok, c.gone, c.matched), (true, 3, 3), "{c:?}");
@@ -709,6 +763,52 @@ mod tests {
         let c = w.finish(Range::default(), true);
         assert_eq!((reasons(&c), c.repeated, c.checkpoints), (vec!["checkpoint"], 3, 1), "{c:?}");
         assert!(c.first_problems[0].error.contains("(signature), repeated in prod/2026/11/24/"), "{c:?}");
+    }
+
+    #[test]
+    fn an_archived_copy_must_say_what_this_servers_row_says() {
+        let a = archive("bucket");
+        let key = "prod/2026/11/23/00000000000000000001-00000000000000000003.jsonl";
+        let row = |id: i64, details: Value, erased: bool| {
+            let mut v: Value = serde_json::from_str(&line(id)).unwrap();
+            v["details"] = details;
+            v.as_object_mut().unwrap().remove("schema");
+            Row { event: v, erased }
+        };
+        let mut here = local(3);
+        here.rows = (1..=3).map(|i| (i, row(i, json!({}), false))).collect();
+        let mut w = Walker::new(&a, 3, &[]);
+        w.object(key, (1, 3), &meta(1, 3), &body(1..=3), &here, None);
+        let c = w.finish(Range::default(), true);
+        assert_eq!((c.ok, c.matched, c.altered), (true, 3, 0), "{c:?}");
+        // Same hashes, other details: the archive's copy was changed.
+        here.rows.insert(2, row(2, json!({ "n": 1 }), false));
+        let mut w = Walker::new(&a, 3, &[]);
+        w.object(key, (1, 3), &meta(1, 3), &body(1..=3), &here, None);
+        let c = w.finish(Range::default(), true);
+        assert_eq!((reasons(&c), c.altered, c.local_breaks.clone()), (vec!["contents"], 1, vec![]), "{c:?}");
+        assert!(c.first_problems[0].error.contains("event 2's details"), "{c:?}");
+        // Erased here since: only the fields an erasure can't rewrite are compared.
+        here.rows.insert(2, row(2, json!({ "n": 1 }), true));
+        let mut w = Walker::new(&a, 3, &[]);
+        w.object(key, (1, 3), &meta(1, 3), &body(1..=3), &here, None);
+        assert!(w.finish(Range::default(), true).ok);
+        let mut r = row(2, json!({}), true);
+        r.event["action"] = json!("test.other");
+        here.rows.insert(2, r);
+        let mut w = Walker::new(&a, 3, &[]);
+        w.object(key, (1, 3), &meta(1, 3), &body(1..=3), &here, None);
+        assert!(w.finish(Range::default(), true).first_problems[0].error.contains("event 2's action"));
+    }
+
+    #[test]
+    fn compared_fields_are_the_chains_columns() {
+        let camel = |c: &str| {
+            let mut parts = c.split('_');
+            parts.next().unwrap().to_string() + &parts.map(|p| p[..1].to_uppercase() + &p[1..]).collect::<String>()
+        };
+        assert_eq!(FIXED_FIELDS.to_vec(), crate::audit_chain::FIXED.iter().map(|c| camel(c)).collect::<Vec<_>>());
+        assert_eq!(ERASABLE_FIELDS.to_vec(), crate::audit_chain::ERASABLE.iter().map(|c| camel(c)).collect::<Vec<_>>());
     }
 
     #[test]

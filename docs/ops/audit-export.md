@@ -237,13 +237,14 @@ This checks the chain as usual and also reads the whole archive (`GET /api/audit
 - the chain runs from event to event and object to object with no gap;
 - every signed checkpoint in the archive holds under the trusted keys (botd's own, or `--key`);
 - the archive begins with the first event botd sent it, and reaches the last event botd says it delivered;
-- every archived event has the same hash in this server's log. This catches a log rebuilt after an event was changed: its own chain verifies, but it no longer matches what was archived. It's the same as pinning every event (`--pin`).
+- every archived event has the same hash in this server's log. This catches a log rebuilt after an event was changed: its own chain verifies, but it no longer matches what was archived. It's the same as pinning every event (`--pin`). While the event is still here, what the archive says it was must also match this server's row: its fields, and, unless an erasure has since rewritten them, the personal ones.
 
-The check fails, and exits 1, if any of that doesn't hold. `firstBroken` then names the first event here that differs from the archive (reason `archive`). The answer's `archive` block counts `objects`, `events`, `matched`, `gone` (deleted here by retention, with the anchor's hash still checked), `mismatched`, `missing`, `locked`, `lockExpired` and `checkpoints`. It also counts `repeated` (events a restarted export wrote twice), `retried` (extra identical versions of an object) and `hidden` (objects behind a delete marker, which are still read). `firstProblems` lists the first 20 problems, each with a `key`, `id` and one of these reasons:
+The check fails, and exits 1, if any of that doesn't hold. `firstBroken` then names the first event here that differs from the archive (reason `archive`). The answer's `archive` block counts `objects`, `events`, `matched`, `gone` (deleted here by retention, with the anchor's hash still checked), `mismatched`, `altered`, `missing`, `locked`, `lockExpired` and `checkpoints`. It also counts `repeated` (events a restarted export wrote twice), `retried` (extra identical versions of an object) and `hidden` (objects behind a delete marker, which are still read). `firstProblems` lists the first 20 problems, each with a `key`, `id` and one of these reasons:
 
 | Reason | Meaning |
 |---|---|
 | `mismatch`, `missing` | An archived event has another hash in this server's log, or isn't in it, and retention didn't delete it |
+| `contents` | An archived event has this server's hash but says something else: the archive's copy was changed. Events retention deleted here can't be compared this way |
 | `link` | An event doesn't link to the one before it: an object is missing, or isn't botd's |
 | `behind` | The archive ends before the last event botd delivered to it: objects are missing at the end |
 | `start` | The archive begins after the first event botd sent it: objects are missing at the start. Archives started before this check was added aren't asked |

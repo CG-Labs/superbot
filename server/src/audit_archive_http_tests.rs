@@ -344,6 +344,21 @@ async fn checking_the_archive_catches_its_first_objects_gone_and_reads_null_vers
         archive_round(&app, &x, 2).await;
     }
     let c = machines::s3::S3::new(fresh.settings()).unwrap();
+    // A batch copied to a new key, its details changed and its hashes kept: what it says
+    // no longer matches this server's rows under those hashes.
+    let original = fresh.keys()[0].clone();
+    let copy = format!("audit/prod/2099/01/01/{}", original.rsplit('/').next().unwrap());
+    let (meta, _) = fresh.w().meta[&original].clone();
+    let changed = String::from_utf8(fresh.w().objects[&original].clone()).unwrap().replacen("\"details\":{\"n\":0}", "\"details\":{\"n\":7}", 1);
+    let sum = base64::engine::general_purpose::STANDARD.encode(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, changed.as_bytes()).as_ref());
+    let mut h: Vec<(&str, String)> = meta.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    h.push(("x-amz-checksum-sha256", sum));
+    c.put_with(&copy, changed.into_bytes(), &h).await.unwrap();
+    let v = verify_archive(port, &admin, "").await;
+    assert_eq!((reasons(&v), v["archive"]["altered"].as_u64()), (vec!["contents".to_string()], Some(1)), "{v}");
+    assert!(v["firstBroken"].is_null(), "this server's log is fine: {v}");
+    c.delete(&copy).await.unwrap();
+    assert_eq!(verify_archive(port, &admin, "").await["archive"]["ok"], true);
     c.delete(&fresh.keys()[0]).await.unwrap();
     let v = verify_archive(port, &admin, "").await;
     assert_eq!((v["archive"]["ok"].as_bool(), reasons(&v)), (Some(false), vec!["start".to_string()]), "{v}");
