@@ -29,6 +29,10 @@ name = "superbot-site"
 path = "src/bin/superbot-site/main.rs"
 
 [[bin]]
+name = "superbot-oci"
+path = "src/bin/superbot-oci/main.rs"
+
+[[bin]]
 name = "superbot-evidence"
 path = "src/bin/superbot-evidence/main.rs"
 

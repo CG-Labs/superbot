@@ -19,6 +19,7 @@
       <a href="#service-accounts" data-tab="service-accounts">Service accounts</a>
       <a href="#audit" data-tab="audit">Audit log</a>
       <a href="#status" data-tab="status">Status</a>
+      <a href="#support" data-tab="support">Support</a>
       <a href="#settings" data-tab="settings">Settings</a>
       <a href="#setup" data-tab="setup">Setup <span class="count" id="setup-count"></span></a>
     </nav>
@@ -222,6 +223,32 @@
       </form>
       <div id="incidents-list"></div>
       <div class="empty" id="incidents-empty" hidden></div>
+    </section>
+
+    <section id="tab-support" hidden>
+      <div class="bar">
+        <span class="hint">The customer health score for the last 30 days, from what botd records: counts and reason codes only, no one named.</span>
+        <a class="btn push" id="sup-bundle" href="/api/support/bundle" download title="Version, settings with secrets redacted, health, recent logs and an audit summary, for a support ticket. Audited.">Download support bundle</a>
+      </div>
+      <div class="card" id="sup-score"></div>
+      <table class="grid">
+        <thead><tr><th>Signal</th><th>Weight</th><th>Status</th><th>What botd saw</th></tr></thead>
+        <tbody id="sup-signals"></tbody>
+      </table>
+      <h2>History</h2>
+      <div class="bar">
+        <select id="sup-days" title="Days shown">
+          <option value="30">Last 30 days</option>
+          <option value="90" selected>Last 90 days</option>
+          <option value="365">Last year</option>
+        </select>
+        <span class="hint" id="sup-trend"></span>
+      </div>
+      <table class="grid">
+        <thead><tr><th>Day</th><th>Score</th><th>Band</th><th>At risk</th><th>Worth a look</th></tr></thead>
+        <tbody id="sup-history"></tbody>
+      </table>
+      <div class="empty" id="sup-history-empty" hidden></div>
     </section>
 
     <section id="tab-settings" hidden>
