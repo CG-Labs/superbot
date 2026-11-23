@@ -4,6 +4,8 @@ name: change-evidence
 # 1st of each month, exports last month's merged pull requests (reviews, approvers, checks,
 # merge commits), commits without one, the protection on the default branch and every CI
 # run on it, as a bundle with SHA-256 digests, built by superbot-evidence from this commit.
+# It also exports every Dependabot and code scanning alert open last month, judged against
+# the remediation windows, and the findings the repository accepts (ADR 0086).
 # The security owner copies the artifact to the evidence store before it expires. Run it by
 # hand for another period (whole UTC days; to is not included). Read access only: the
 # token can see the repository and nothing it does changes it.
@@ -27,6 +29,8 @@ permissions:
   actions: read
   checks: read
   statuses: read
+  security-events: read
+  vulnerability-alerts: read
 
 concurrency:
   group: change-evidence
@@ -65,7 +69,29 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           rm summary.txt
-      - name: Keep the bundle
+      - name: Export the period's vulnerability alerts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          FROM: ${{ inputs.from }}
+          TO: ${{ inputs.to }}
+        run: |
+          set -euo pipefail
+          period=()
+          if [[ -n "${FROM:-}" || -n "${TO:-}" ]]; then
+            period=(--from "$FROM" --to "$TO")
+          fi
+          cd "$RUNNER_TEMP/evidence"
+          "$GITHUB_WORKSPACE/target/release/superbot-evidence" vulnerabilities --repo "$GITHUB_REPOSITORY" "${period[@]}" | tee summary.txt
+          {
+            echo '## Vulnerability-management evidence'
+            echo
+            echo '```'
+            cat summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm summary.txt
+      - name: Keep the bundles
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: change-evidence

@@ -8,6 +8,8 @@
 //! - reading the agent's key, its records, or its process's memory and environment;
 //! - raising its privileges, with a sudo rule, a setuid-root program and a program
 //!   with file capabilities all there to use, and the agent refusing a user that has one;
+//! - reaching the kernel interfaces the seccomp filter refuses (keyrings, eBPF, perf,
+//!   userfaultfd, io_uring, file handles, the kernel log; ADR 0156);
 //! - getting past the outbound allow-list and the deny rules, or changing them;
 //! - exhausting the machine: a fork bomb, a memory balloon and a CPU spin, beside a run
 //!   that must still finish and an agent that must still answer.
@@ -166,6 +168,7 @@ async fn a_locked_down_run_cant_gain_privileges_or_share_its_files() {
     host.env.insert("PATH".into(), "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".into());
     let script = format!(
         r#"{R}echo "nnp=$(awk '/^NoNewPrivs/ {{print $2}}' /proc/self/status)"
+echo "seccomp=$(awk '/^Seccomp:/ {{print $2}}' /proc/self/status)"
 echo "umask=$(umask)"
 touch made; echo "made=$(stat -c %a made)"
 mkdir folder; echo "folder=$(stat -c %a folder)"
@@ -177,6 +180,7 @@ sh -c 'echo "child=$(awk "/^NoNewPrivs/ {{print \$2}}" /proc/self/status)"'
     assert!(ran.ok, "{}", ran.out);
     assert_eq!(ran.said("nnp"), "1", "{}", ran.out);
     assert_eq!(ran.said("child"), "1", "kept across every exec: {}", ran.out);
+    assert_eq!(ran.said("seccomp"), "2", "under the filter (ADR 0156): {}", ran.out);
     assert_eq!((ran.said("umask"), ran.said("made"), ran.said("folder")), ("0077", "600", "700"));
     // Whether or not this user may sudo, a locked-down run can't.
     assert_eq!(ran.said("sudo"), "denied", "{}", ran.out);
@@ -260,6 +264,91 @@ echo "amb=$(awk '/^CapAmb/ {{print $2}}' /proc/self/status)"
     assert_eq!(runas::privileged(&u.name, u.ids).as_deref(), Some("is in the adm group"));
 }
 
+/// Calls each interface the seccomp filter refuses (ADR 0156), and one it doesn't, with
+/// arguments that get past the kernel's own first checks, and prints `name=ok` or the
+/// error's name. `@...@` are this architecture's numbers.
+const SYSCALL_PROBE: &str = r#"import ctypes, errno
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+def call(nr, *args):
+    ctypes.set_errno(0)
+    a = [ctypes.c_long(x) if isinstance(x, int) else x for x in args]
+    r = libc.syscall(ctypes.c_long(nr), *a)
+    return "ok" if r >= 0 else errno.errorcode.get(ctypes.get_errno(), str(ctypes.get_errno()))
+params = ctypes.create_string_buffer(120)
+for k, v in [
+    ("keyctl", call(@KEYCTL@, 0, -3, 0)),
+    ("add_key", call(@ADD_KEY@, b"user", b"sbrt", b"x", 1, -2)),
+    ("io_uring", call(@IO_URING_SETUP@, 1, params)),
+    ("userfaultfd", call(@USERFAULTFD@, 1)),
+    ("perf", call(@PERF@, 0, 0, -1, -1, 0)),
+    ("bpf", call(@BPF@, 5, 0, 0)),
+    ("syslog", call(@SYSLOG@, 10, 0, 0)),
+    ("handle", call(@HANDLE@, -100, 0, 0)),
+    ("getpid", call(@GETPID@)),
+]:
+    print(f"{k}={v}")
+"#;
+
+#[tokio::test]
+#[ignore = "needs root on a throwaway host: SUPERBOT_MACHINE_BOT_USER_TEST=1, as CI's isolation job runs it"]
+async fn as_root_red_team_a_run_cant_reach_the_kernels_riskier_interfaces() {
+    if !as_root() {
+        return;
+    }
+    assert!(Command::new("python3").arg("-V").output().is_ok_and(|o| o.status.success()), "the probe needs python3");
+    let u = User::new("sbrt-sys");
+    let probe = crate::db::temp_path("rt-syscalls").with_extension("py");
+    let text = [
+        ("@KEYCTL@", libc::SYS_keyctl),
+        ("@ADD_KEY@", libc::SYS_add_key),
+        ("@IO_URING_SETUP@", libc::SYS_io_uring_setup),
+        ("@USERFAULTFD@", libc::SYS_userfaultfd),
+        ("@PERF@", libc::SYS_perf_event_open),
+        ("@BPF@", libc::SYS_bpf),
+        ("@SYSLOG@", libc::SYS_syslog),
+        ("@HANDLE@", libc::SYS_open_by_handle_at),
+        ("@GETPID@", libc::SYS_getpid),
+    ]
+    .iter()
+    .fold(SYSCALL_PROBE.to_string(), |t, (k, nr)| t.replace(k, &nr.to_string()));
+    std::fs::write(&probe, text).unwrap();
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let script = format!(
+        "python3 {}\nif unshare -Ur true 2>/dev/null; then echo userns=ok; else echo userns=denied; fi\necho seccomp=$(awk '/^Seccomp:/ {{print $2}}' /proc/self/status)\n",
+        probe.display()
+    );
+
+    // The same user with nothing holding it back, so each probe can tell.
+    let plain = Command::new("runuser").args(["-u", &u.name, "--", "sh", "-c", &script]).current_dir(&u.home).output().unwrap();
+    let plain = Ran { ok: plain.status.success(), out: String::from_utf8_lossy(&plain.stdout).into_owned(), limited: None };
+    assert!(plain.ok, "{}", plain.out);
+    assert_eq!(plain.said("seccomp"), "0", "{}", plain.out);
+    for (k, refused) in [("keyctl", "EPERM"), ("add_key", "EPERM"), ("io_uring", "ENOSYS"), ("perf", "EPERM")] {
+        assert_ne!(plain.said(k), refused, "{k} answers without the filter: {}", plain.out);
+    }
+
+    let ran = run_job(&u.host(), &script, &u.home, 60).await;
+    let _ = std::fs::remove_file(&probe);
+    assert!(ran.ok, "{}", ran.out);
+    assert_eq!(ran.said("seccomp"), "2", "{}", ran.out);
+    for (k, refused) in [
+        ("keyctl", "EPERM"),
+        ("add_key", "EPERM"),
+        ("io_uring", "ENOSYS"),
+        ("userfaultfd", "EPERM"),
+        ("perf", "EPERM"),
+        ("bpf", "EPERM"),
+        ("syslog", "EPERM"),
+        ("handle", "EPERM"),
+    ] {
+        assert_eq!(ran.said(k), refused, "{k}: {}", ran.out);
+    }
+    // What isn't refused still works, user namespaces for harness sandboxes included.
+    assert_eq!(ran.said("getpid"), "ok", "{}", ran.out);
+    assert_eq!(ran.said("userns"), plain.said("userns"), "sandboxes start as they did: {}", ran.out);
+}
+
 /// The stand-in Pi of the machine test: a Bot that tries everything, as whichever user
 /// it runs as, and says what it got. `@...@` are filled in by `probe`.
 const MACHINE_PROBE: &str = r#"#!/bin/sh
@@ -289,6 +378,7 @@ out="$out signal=$(r kill -0 @PID@)"
 out="$out sudo=$(r sudo -n true)"
 out="$out suid=$(@SUID@ -u 2>/dev/null || echo none)"
 out="$out nnp=$(awk '/^NoNewPrivs/ {print $2}' /proc/self/status)"
+out="$out seccomp=$(awk '/^Seccomp:/ {print $2}' /proc/self/status)"
 out="$out umask=$(umask)"
 out="$out tmp=$(stat -c %u:%a "$TMPDIR" 2>/dev/null || echo none)"
 out="$out drop=$(stat -c %a "$drop") others=$o"
@@ -366,6 +456,7 @@ async fn as_root_red_team_bots_cant_reach_another_persons_files_or_the_agents_se
         assert_eq!(said(reply, "uid"), uid.to_string(), "{reply}");
         assert_eq!(said(reply, "suid"), uid.to_string(), "no way up: {reply}");
         assert_eq!(said(reply, "nnp"), "1", "{reply}");
+        assert_eq!(said(reply, "seccomp"), "2", "under the filter (ADR 0156): {reply}");
         assert_eq!(said(reply, "umask"), "0077", "{reply}");
         assert_eq!(said(reply, "tmp"), format!("{uid}:700"), "its own TMPDIR: {reply}");
         assert_eq!(said(reply, "drop"), "600", "{reply}");
