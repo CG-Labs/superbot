@@ -53,6 +53,7 @@ pub mod seccomp;
 pub mod s3_standin;
 pub mod screens;
 pub mod server_data;
+pub mod chat_stores;
 #[cfg(test)]
 pub mod standin_mirror;
 pub mod team_network;
@@ -232,6 +233,8 @@ pub struct ControlPlane {
     /// Whether a leaver's kept residency pin ends once their machine data is gone
     /// (RESIDENCY_KEPT_PINS, ADR 0205).
     pub kept_pins: residency::KeptPins,
+    /// Pinned people's chats in a database in their region (REGION_DATA_DIRS, ADR 0215).
+    pub chat_stores: chat_stores::Settings,
     /// A network of its own per team (MACHINE_TEAM_NETWORK, ADR 0189). None: off.
     pub team_network: Option<team_network::Settings>,
     /// Machines powered off to take them off a team network they no longer belong on,
@@ -272,6 +275,7 @@ impl Default for ControlPlane {
             suspend_on_disable: true,
             server_data: server_data::ServerData::default(),
             kept_pins: residency::KeptPins::default(),
+            chat_stores: chat_stores::Settings::default(),
             team_network: None,
             network_suspended: Default::default(),
             network_joining: Default::default(),
@@ -1263,9 +1267,13 @@ pub async fn reconcile(app: &AppState, cp: &ControlPlane) -> Value {
     let networks = team_network::sweep(app, cp).await;
     let disabled = crate::deprovision::sweep(app, cp).await;
     let kept_pins_ended = residency::end_kept(app, cp).await;
+    let chats_moved: usize = chat_stores::place(&app.db).iter().map(|m| m.messages).sum();
     let mut out = json!({ "checked": ids.len(), "changed": changed });
     if kept_pins_ended > 0 {
         out["keptPinsEnded"] = kept_pins_ended.into();
+    }
+    if chats_moved > 0 {
+        out["chatsMoved"] = chats_moved.into();
     }
     if teams != json!({}) {
         out["teams"] = teams;

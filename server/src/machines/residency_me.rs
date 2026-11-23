@@ -97,7 +97,8 @@ fn own_pin_fields(app: &App, cp: &ControlPlane, p: &ResidencyPin, v: &mut Value)
 
 /// `GET /api/me/residency`: the pin that holds your data (your team's, else your own), or
 /// null; whether your machine and backups are in its region, your plan's model routes are
-/// held there, and botd's own copy of your account and chats is (ADR 0184); and which
+/// held there, and botd's own copy of your account and chats is (ADR 0184), and whether
+/// your Bots' chats are kept in the region's own chat store (ADR 0215); and which
 /// reports you can get.
 pub async fn view(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>) -> Res {
     let u = me(&c)?;
@@ -138,6 +139,7 @@ pub async fn view(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>,
         "region": sd.region, "inRegion": sd.outside(&p.region).is_empty(), "backupsInRegion": sd.backups_in(&p.region),
         "required": sd.policy == super::server_data::Policy::Require,
     });
+    let chats = super::chat_stores::against(&app, &p.region, std::slice::from_ref(&u.id), server_data["inRegion"] == true);
     Ok(Json(json!({
         "pin": pin,
         "ownPin": own_pin,
@@ -146,6 +148,7 @@ pub async fn view(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>,
         "backups": you["backups"],
         "modelRoutes": { "inRegion": you["modelRoutes"]["inRegion"], "gap": you["modelRoutes"]["gap"] },
         "serverData": server_data,
+        "chats": { "store": chats["store"], "inRegion": chats["inRegion"] },
         "reports": reports,
     })))
 }

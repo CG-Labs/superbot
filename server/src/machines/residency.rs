@@ -19,7 +19,8 @@
 //! Someone leaving a pinned team keeps its pin as their own (ADR 0171), and with
 //! RESIDENCY_STARTUP=refuse botd won't start while it can't keep a pin. A kept pin ends
 //! by itself once botd holds none of their machine data, unless RESIDENCY_KEPT_PINS=keep
-//! (ADR 0205).
+//! (ADR 0205). A pinned person's chats are kept in their region's chat store when it has
+//! one (REGION_DATA_DIRS, ADR 0215), moved there when the pin is made and back when it ends.
 
 use super::backup::{self, Offsite};
 use super::{ControlPlane, conflict, event, region};
@@ -471,6 +472,7 @@ pub async fn end_kept(app: &App, cp: &ControlPlane) -> usize {
 /// (ADR 0184).
 pub fn warnings(app: &App, cp: &ControlPlane) -> Vec<String> {
     let mut out: Vec<String> = app.tiers().unknown_regions(&cp.regions).into_iter().map(|w| format!("The tiers file's {w} (ADR 0139).")).collect();
+    out.extend(super::chat_stores::warnings(app, crate::db::now()));
     let pins = app.db.residency_pins();
     let earlier = if pins.is_empty() { 0 } else { cp.server_data.earlier_copies(app) };
     if earlier > 0 {
@@ -620,6 +622,7 @@ pub async fn pin_user(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Aut
     app.db.pin_residency(PinOn::User, &u.id, &region, &reference, by.actor.id.as_deref()).map_err(not_saved)?;
     let d = json!({ "region": region, "reference": reference, "regionFrom": from, "renewed": own.is_some(), "userEmail": u.email });
     app.db.record(&by.event("user.residency_pinned").target("user", &u.id).details(d));
+    super::chat_stores::place(&app.db);
     let u = app.db.user(&u.id).ok_or_else(|| not_found("User"))?;
     Ok(Json(region::user_view(&app, cp, &u)))
 }
@@ -638,6 +641,7 @@ pub async fn unpin_user(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<A
     }
     let d = json!({ "region": p.region, "reference": p.reference, "pinnedAt": p.pinned_at, "pinnedBy": p.pinned_by, "reason": reason, "userEmail": u.email });
     app.db.record(&by.event("user.residency_unpinned").target("user", &u.id).details(d));
+    super::chat_stores::place(&app.db);
     Ok(Json(region::user_view(&app, cp, &u)))
 }
 
@@ -698,6 +702,7 @@ pub async fn pin_team(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Aut
     app.db.pin_residency(PinOn::Team, &t.id, &region, &reference, by.actor.id.as_deref()).map_err(not_saved)?;
     let d = json!({ "region": region, "reference": reference, "regionFrom": from, "renewed": own.is_some(), "members": app.db.team_members(&t.id).len() });
     app.db.record(&crate::teams::team_event(&by, "team.residency_pinned", &t.id, d));
+    super::chat_stores::place(&app.db);
     let t = app.db.team(&t.id).ok_or_else(|| not_found("Team"))?;
     Ok(Json(region::team_region_view(&app, cp, &t)))
 }
@@ -716,6 +721,7 @@ pub async fn unpin_team(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<A
     }
     let d = json!({ "region": p.region, "reference": p.reference, "pinnedAt": p.pinned_at, "pinnedBy": p.pinned_by, "reason": reason });
     app.db.record(&crate::teams::team_event(&by, "team.residency_unpinned", &t.id, d));
+    super::chat_stores::place(&app.db);
     Ok(Json(region::team_region_view(&app, cp, &t)))
 }
 

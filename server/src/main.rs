@@ -434,6 +434,8 @@ async fn main() {
     let mut keys = secrets::Keys::locate(&data_dir).unwrap_or_else(|e| exit(format!("Secrets: {e}")));
     let (db_key, db_start) =
         database_encryption::prepare(&db_path, db_policy, &mut keys).unwrap_or_else(|e| exit(format!("Database encryption: {e}")));
+    // Regional chat stores mid-rotation are re-encrypted under the new key too (ADR 0215).
+    let previous_db_key = keys.previous.as_ref().map(|(k, _)| database_encryption::DbKey::derive(k));
     if let Some(k) = db_key {
         database_encryption::install(k);
     }
@@ -477,6 +479,12 @@ async fn main() {
         .unwrap_or_else(|e| exit(format!("Server data region: {e}")));
     log_info!("Server data region: {} (ADR 0184).", control_plane.server_data.describe());
     control_plane.kept_pins = machines::residency::KeptPins::parse(&env("RESIDENCY_KEPT_PINS", "")).unwrap_or_else(|e| exit(e));
+    control_plane.chat_stores =
+        machines::chat_stores::Settings::from_env(&|k| env(k, ""), control_plane.enabled(), &control_plane.regions, &control_plane.server_data, &data_dir)
+            .unwrap_or_else(|e| exit(format!("Regional chat stores: {e}")));
+    for line in machines::chat_stores::open(&db, &control_plane.chat_stores, previous_db_key.as_ref()).unwrap_or_else(|e| exit(format!("Regional chat stores: {e}"))) {
+        log_info!("{line}");
+    }
     // Machine enrollment's CA key is derived from the master key (ADR 0031).
     let bin_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
     // Users' machines get the managed tiers' default harnesses unless told otherwise (ADR 0079).
@@ -866,6 +874,7 @@ async fn main() {
         app.db.metrics().want_tiers();
     }
     app.db.tracer().start(&observe.traces);
+    machines::chat_stores::start(app.clone(), control_plane.clone());
     machines::start(app.clone(), control_plane);
     if policy.mode == policy::Mode::Bypass {
         log_warn!(

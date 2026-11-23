@@ -319,6 +319,9 @@ pub async fn list(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>)
             if let Some(b) = backups.as_ref().and_then(|b| b.as_array()).and_then(|b| b.iter().find(|x| x["region"] == json!(r))) {
                 v["backups"] = b.clone();
             }
+            if let Some(c) = super::chat_stores::region_view(&app, r) {
+                v["chatStore"] = c;
+            }
             v
         })
         .collect();
@@ -332,6 +335,7 @@ pub async fn list(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>)
             "pins": super::residency::pins_view(&app), "warnings": super::residency::warnings(&app, cp), "startup": super::residency::startup().as_str(),
             "keptPins": cp.kept_pins.as_str(),
             "serverData": cp.server_data.summary(&app),
+            "chatStores": super::chat_stores::summary(&app, cp),
         },
     })))
 }
