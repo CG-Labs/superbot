@@ -304,6 +304,79 @@ async fn machines_install_harnesses_from_the_operators_mirrors_with_their_own_ca
     assert!(v["items"][1]["error"].as_str().unwrap().contains("not the pinned"), "{v}");
 }
 
+#[tokio::test]
+async fn machines_install_hermes_from_botds_bundle_over_mutual_tls() {
+    use crate::adapters::install;
+    use crate::machines::hermes_bundle::standin;
+    use crate::machines::hermes_serve::Bundles;
+    let arch = std::env::consts::ARCH;
+    let dir = crate::db::temp_path("hermes-bundles");
+    std::fs::create_dir_all(&dir).unwrap();
+    let body = standin::good(arch, "#!/bin/sh\necho 'Hermes Agent v0.23.3'\n");
+    let file = dir.join(format!("superbot-hermes-v0.23.3-{arch}.tar.gz"));
+    std::fs::write(&file, &body).unwrap();
+    std::fs::write(dir.join(format!("superbot-hermes-v0.23.3-{arch}.tar.gz.sha256")), format!("{}\n", hex(&body))).unwrap();
+    let setting = file.display().to_string();
+    let mut env = serve_with(move |mut e| {
+        let url = e.url.clone();
+        let var = |k: &str| match k {
+            "MACHINE_HERMES_BUNDLE" => setting.clone(),
+            "MACHINE_CONTROL_URL" => url.clone(),
+            _ => String::new(),
+        };
+        let hermes = Bundles::from_env(&var).unwrap().unwrap();
+        let mut plan = hermes.apply(install::plan(vec![install::install("hermes", None, None).unwrap()])).unwrap();
+        // The stand-in tree has no Hermes for hermes-share.sh to share; its own test
+        // runs it.
+        if let InstallSource::Bundle { after, .. } = &mut plan.harnesses[0].source {
+            *after = Some("touch \"$HOME/.hermes/superbot/shared\"\n".into());
+        }
+        e.upkeep.plan = Some(plan);
+        e.upkeep.hermes = Some(hermes);
+        e
+    })
+    .await;
+    assert_eq!(standin::COMMIT, install::install("hermes", None, None).unwrap().version, "the stand-in is the pinned commit");
+
+    // The check reads the file again and finds the SHA-256 the plan pins.
+    let (code, v) = json_call(&env, "GET", "/api/machines/harness-mirror", "").await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!((v["ok"].clone(), v["items"][0]["arch"].clone()), (json!(true), json!(arch)), "{v}");
+    assert!(v["items"][0]["note"].as_str().unwrap().contains("MACHINE_HERMES_BUNDLE"), "{v}");
+
+    // Only a machine with its certificate gets it.
+    let anyone = reqwest::Client::builder()
+        .tls_backend_preconfigured(pki::client_config(&pki::cert_der(env.e.ca_pem()).unwrap(), None).unwrap())
+        .build()
+        .unwrap();
+    let r = anyone.get(format!("{}/v1/hermes/{arch}", env.e.url)).send().await.unwrap();
+    assert_eq!(r.status(), 401);
+
+    let (uid, mid, token) = machine_for(&env, "ada@example.com").await;
+    let m = agent_on(&mut env, &mid, &token, "#!/bin/sh\n").await;
+    m.agent.tools.set_root(dir.join("root"));
+    let v = beat_until(&env, &uid, "hermes installed from the bundle", |v| {
+        let s = &v["agent"]["harnesses"]["hermes"]["state"];
+        assert_ne!(s, "failed", "{v}");
+        s == "installed"
+    })
+    .await;
+    assert_eq!(v["agent"]["harnesses"]["hermes"]["version"], standin::COMMIT, "{v}");
+    let out = std::process::Command::new(m.cfg.tools.join("bin/hermes")).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "Hermes Agent v0.23.3");
+    let prefix = dir.join("root/opt/hermes");
+    assert!(prefix.join(".hermes/superbot/shared").exists(), "its after script ran in the prefix");
+    assert_eq!(std::fs::read_dir(dir.join("root/opt")).unwrap().count(), 1, "nothing is left beside it");
+    assert_eq!(events(&env, "machine.harness_installed").await.len(), 1);
+
+    // A file changed on disk after botd checked it is caught by the check.
+    std::fs::write(&file, b"something else").unwrap();
+    let (_, v) = json_call(&env, "GET", "/api/machines/harness-mirror", "").await;
+    assert_eq!(v["ok"], false, "{v}");
+    assert!(v["items"][0]["error"].as_str().unwrap().contains("restart botd"), "{v}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A build of the agent: answers `--version` as the real one does.
 fn build(version: &str, tag: &str) -> &'static [u8] {
     Box::leak(format!("#!/bin/sh\n# {tag}\necho 'superbot-machine {version}'\n").into_bytes().into_boxed_slice())

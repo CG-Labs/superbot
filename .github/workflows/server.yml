@@ -151,6 +151,14 @@ jobs:
             ip link set lo up
             if curl -sS -m 5 -o /dev/null https://registry.npmjs.org/ 2>/dev/null; then echo "the network is up" >&2; exit 1; fi
             exec /tmp/botd-tests --ignored --exact machines_upkeep_tests::real_npm_installs_from_a_mirror_with_no_network'
+      # ADR 0210: their Hermes Agent comes from botd's Hermes bundle, with no network.
+      - name: Machines install Hermes Agent from botd's bundle with no network
+        run: |
+          sudo env "PATH=$PATH" unshare --net -- sh -c '
+            set -e
+            ip link set lo up
+            if curl -sS -m 5 -o /dev/null https://github.com/ 2>/dev/null; then echo "the network is up" >&2; exit 1; fi
+            exec /tmp/botd-tests --exact machines_upkeep_tests::machines_install_hermes_from_botds_bundle_over_mutual_tls'
       # ADR 0166: no restore or recovery puts a team's machine on a shared host, or
       # anyone else's on a team's dedicated host. Placement only, so not as root.
       - name: "Red team: no restore or recovery crosses a team's dedicated hosts"

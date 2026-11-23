@@ -108,7 +108,7 @@ impl Mirrors {
         let unmirrored = unmirrored(plan);
         if !unmirrored.is_empty() {
             s.push_str(&format!(
-                "; {} still download from the internet (Hermes Agent's installer reaches GitHub and PyPI): leave them out of MACHINE_HARNESSES on a network without it",
+                "; {} still download from the internet (Hermes Agent's installer reaches GitHub and PyPI): set MACHINE_HERMES_BUNDLE, or leave them out of MACHINE_HARNESSES, on a network without it",
                 unmirrored.join(", ")
             ));
         }
@@ -211,8 +211,9 @@ async fn npm(http: &reqwest::Client, registry: &str, package: &str, version: &st
 }
 
 /// Fetches everything `plan` names from where machines would, with the CA they'd
-/// trust, and checks each against its pin.
-pub async fn check(plan: &HarnessPlan) -> Value {
+/// trust, and checks each against its pin. The Hermes bundles botd serves (`hermes`)
+/// are read again from disk: machines fetch them from botd itself.
+pub async fn check(plan: &HarnessPlan, hermes: Option<&super::hermes_serve::Bundles>) -> Value {
     // Every redirect followed, so `reach` checks where the files really came from.
     let hops = Arc::new(Mutex::new(Vec::<String>::new()));
     let seen = hops.clone();
@@ -254,6 +255,17 @@ pub async fn check(plan: &HarnessPlan) -> Value {
                 let mut v = item(json!({ "name": h.name, "version": h.version, "url": url }), res);
                 v["note"] = json!("Its installer then downloads from GitHub and PyPI, which no mirror setting covers.");
                 items.push(v);
+            }
+            InstallSource::Bundle { downloads, .. } => {
+                for (arch, d) in downloads {
+                    let res = match hermes {
+                        Some(b) => b.recheck(arch, &d.sha256).await,
+                        None => Err("botd serves no Hermes bundles (MACHINE_HERMES_BUNDLE)".into()),
+                    };
+                    let mut v = item(json!({ "name": h.name, "version": h.version, "arch": arch, "url": d.url }), res);
+                    v["note"] = json!("Served by botd from MACHINE_HERMES_BUNDLE, to enrolled machines over the machine port.");
+                    items.push(v);
+                }
             }
         }
     }
@@ -353,7 +365,7 @@ pub async fn check_now(AppS(app): AppS<AppState>) -> Res<Json<Value>> {
         .plan
         .clone()
         .ok_or_else(|| ApiError(StatusCode::CONFLICT, "MACHINE_HARNESSES is none, so machines get no harnesses to check.".into()))?;
-    let mut v = check(&plan).await;
+    let mut v = check(&plan, e.upkeep.hermes.as_ref()).await;
     if let Some(out) = Outbound::from_env(&|k| std::env::var(k).unwrap_or_default()) {
         reach(&mut v, &out).await;
     }
@@ -470,7 +482,7 @@ mod tests {
         mirror.package("fake-codex", "1.0.0", b"codex's tarball");
         let plan = mirror.plan(&node, vec![("claude", "@corp/fake-claude", "9.9.9", Some(good.clone())), ("codex", "fake-codex", "1.0.0", None)]);
 
-        let v = check(&plan).await;
+        let v = check(&plan, None).await;
         assert_eq!(v["ok"], true, "{v}");
         assert_eq!(v["items"].as_array().unwrap().len(), 3, "{v}");
         assert!(v["items"][1]["url"].as_str().unwrap().starts_with(&mirror.url), "{v}");
@@ -478,7 +490,7 @@ mod tests {
         assert!(calls.iter().any(|c| c == "/npm/@corp%2ffake-claude"), "scoped packages are asked for as npm does: {calls:?}");
 
         // No CA: the mirror's certificate isn't trusted.
-        let v = check(&HarnessPlan { ca: None, ..plan.clone() }).await;
+        let v = check(&HarnessPlan { ca: None, ..plan.clone() }, None).await;
         assert_eq!(v["ok"], false);
         assert!(v["items"][0]["error"].as_str().unwrap().contains("couldn't fetch"), "{v}");
 
@@ -488,7 +500,7 @@ mod tests {
         let wrong_pin = format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode([1u8; 64]));
         let mut bad = mirror.plan(&node, vec![("claude", "@corp/fake-claude", "9.9.9", Some(wrong_pin)), ("codex", "fake-codex", "1.0.0", None), ("pi", "fake-codex", "2.0.0", None)]);
         bad.node.as_mut().unwrap().downloads.values_mut().for_each(|d| d.sha256 = "b".repeat(64));
-        let v = check(&bad).await;
+        let v = check(&bad, None).await;
         assert_eq!(v["ok"], false);
         let errors: Vec<&str> = v["items"].as_array().unwrap().iter().map(|i| i["error"].as_str().unwrap_or("")).collect();
         assert!(errors[0].contains("not the pinned"), "{errors:?}");
@@ -515,7 +527,7 @@ mod tests {
             .unwrap()
         };
 
-        let mut v = check(&plan).await;
+        let mut v = check(&plan, None).await;
         assert_eq!(v["ok"], true, "{v}");
         reach(&mut v, &incus("")).await;
         assert_eq!(v["ok"], false, "{v}");
@@ -523,7 +535,7 @@ mod tests {
         assert_eq!(blocked.len(), 1, "one place, however many files: {v}");
         assert!(blocked[0]["error"].as_str().unwrap().contains(&format!("add {here} to INCUS_EGRESS_ALLOW")), "{v}");
 
-        let mut v = check(&plan).await;
+        let mut v = check(&plan, None).await;
         reach(&mut v, &incus(&here)).await;
         assert_eq!(v["ok"], true, "{v}");
         assert_eq!(v["blocked"], json!([]));
@@ -537,7 +549,7 @@ mod tests {
                 ("MACHINE_FIREWALL_EGRESS", egress.to_string()),
             ]))
         };
-        let mut v = check(&plan).await;
+        let mut v = check(&plan, None).await;
         reach(&mut v, &linode("").unwrap()).await;
         assert_eq!(v["ok"], false, "{v}");
         assert!(v["blocked"][0]["error"].as_str().unwrap().contains("MACHINE_FIREWALL_EGRESS=off"), "{v}");
@@ -551,7 +563,7 @@ mod tests {
             ("INCUS_HOSTS", "b=https://127.0.0.1:8443".into()),
         ]))
         .unwrap();
-        let mut v = check(&plan).await;
+        let mut v = check(&plan, None).await;
         reach(&mut v, &fleet).await;
         assert_eq!(v["blocked"].as_array().unwrap().len(), 1, "{v}");
     }
@@ -568,7 +580,7 @@ mod tests {
         let other = url::Url::parse(&mirror.other).unwrap();
         let there = format!("{}:{}", other.host_str().unwrap(), other.port().unwrap());
 
-        let mut v = check(&plan).await;
+        let mut v = check(&plan, None).await;
         assert_eq!(v["ok"], true, "the redirected tarball is still the pinned one: {v}");
         assert_eq!(v["redirects"], json!([format!("{}/stored/npm/fake-codex/-/fake-codex-1.0.0.tgz", mirror.other)]));
         let incus = Outbound::from_env(&env(&[

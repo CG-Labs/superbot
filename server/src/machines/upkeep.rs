@@ -15,6 +15,7 @@
 //! the new agent; the agent puts the old one back if none does in time.
 
 use super::enroll::{self, Enrollment};
+use super::hermes_serve::{self, Bundles};
 use super::mirror::{self, Mirrors};
 use super::wire::{self, HarnessPlan, HarnessStatus, Heartbeat, UpgradeRequest};
 use super::{ControlPlane, event, system};
@@ -69,6 +70,8 @@ pub struct Upkeep {
     pub defaulted: bool,
     /// Where machines fetch the plan's Node.js and npm harnesses instead (ADR 0186).
     pub mirrors: Option<Mirrors>,
+    /// Where machines fetch Hermes Agent instead of from its installer (ADR 0210).
+    pub hermes: Option<Bundles>,
 }
 
 /// `claude,codex@0.172.0,hermes@<commit>=<sha256>`: commas or spaces between. `none`:
@@ -106,8 +109,10 @@ impl Upkeep {
         let rebuilds = super::rebuild::Rebuilds::parse(&var("MACHINE_LEGACY_REBUILDS"))?;
         let raw = var("MACHINE_HARNESSES");
         let mirrors = Mirrors::from_env(var)?;
-        let plan = parse_harnesses(&raw)?.map(|p| mirrored(&mirrors, p));
-        Ok(Upkeep { plan, upgrades, rebuilds, unset: raw.trim().is_empty(), defaulted: false, mirrors })
+        let hermes = Bundles::from_env(var)?;
+        let mut u = Upkeep { plan: None, upgrades, rebuilds, unset: raw.trim().is_empty(), defaulted: false, mirrors, hermes };
+        u.plan = parse_harnesses(&raw)?.map(|p| u.served(p)).transpose()?;
+        Ok(u)
     }
 
     /// With MACHINE_HARNESSES unset, every machine gets the managed tiers' default
@@ -119,7 +124,8 @@ impl Upkeep {
         }
         self.plan = parse_harnesses(&harnesses.join(","))
             .map_err(|e| format!("the managed tiers' default harnesses: {e}"))?
-            .map(|p| mirrored(&self.mirrors, p));
+            .map(|p| self.served(p))
+            .transpose()?;
         self.defaulted = self.plan.is_some();
         Ok(())
     }
@@ -133,18 +139,24 @@ impl Upkeep {
         let harnesses = self.plan.as_ref().map_or("none".into(), |p| names(p).join(", "));
         let harnesses = if self.defaulted { format!("{harnesses} (the managed tiers' default; MACHINE_HARNESSES=none for none)") } else { harnesses };
         let mirrors = self.mirrors.as_ref().map_or(String::new(), |m| format!("; {}", m.describe(self.plan.as_ref())));
+        let hermes = self.hermes.as_ref().map_or(String::new(), |h| format!("; {}", h.describe(self.plan.as_ref())));
         format!(
-            "harnesses on machines: {harnesses}{mirrors}; agent upgrades: {}; rebuilds of old machines: {}",
+            "harnesses on machines: {harnesses}{mirrors}{hermes}; agent upgrades: {}; rebuilds of old machines: {}",
             self.upgrades.as_str(),
             self.rebuilds.as_str()
         )
     }
-}
 
-fn mirrored(mirrors: &Option<Mirrors>, plan: HarnessPlan) -> HarnessPlan {
-    match mirrors {
-        Some(m) => m.apply(plan),
-        None => plan,
+    /// `plan` from where machines fetch it: the mirrors, and botd's Hermes bundles.
+    fn served(&self, plan: HarnessPlan) -> Result<HarnessPlan, String> {
+        let plan = match &self.mirrors {
+            Some(m) => m.apply(plan),
+            None => plan,
+        };
+        let Some(h) = &self.hermes else { return Ok(plan) };
+        let plan = h.apply(plan)?;
+        super::tools::check(&plan).map_err(|e| format!("MACHINE_HERMES_BUNDLE: {e}"))?;
+        Ok(plan)
     }
 }
 
@@ -371,10 +383,13 @@ async fn send_plan(app: &App, e: &Enrollment, m: &Machine, plan: &HarnessPlan, b
 }
 
 /// Whether an agent that says `can` installs `plan`. One from before ADR 0186 would
-/// refuse a plan with mirrors in it, or fetch it from the internet.
+/// refuse a plan with mirrors in it, or fetch it from the internet; one from before
+/// ADR 0210 would refuse a Hermes bundle.
 fn takes(plan: &HarnessPlan, can: &[String]) -> bool {
     let has = |c: &str| can.iter().any(|x| x == c);
-    has(wire::CAN_HARNESSES) && (!mirror::needs_agent_support(plan) || has(wire::CAN_HARNESS_MIRRORS))
+    has(wire::CAN_HARNESSES)
+        && (!mirror::needs_agent_support(plan) || has(wire::CAN_HARNESS_MIRRORS))
+        && (!hermes_serve::bundled(plan) || has(wire::CAN_HARNESS_BUNDLES))
 }
 
 /// Whether the agent should be sent the plan now.
@@ -555,6 +570,12 @@ pub async fn harnesses_now(
             "Its agent can't install harnesses: it was installed before ADR 0039. Rebuild it with today's agent: botctl machine rebuild <user> (ADR 0056).".into(),
         ));
     }
+    if hermes_serve::bundled(plan) && !hb.can.iter().any(|c| c == wire::CAN_HARNESS_BUNDLES) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Its agent can't install Hermes Agent from MACHINE_HERMES_BUNDLE: it is older than ADR 0210. Upgrade it first: botctl machine upgrade <user>.".into(),
+        ));
+    }
     if !takes(plan, &hb.can) {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -624,6 +645,49 @@ mod tests {
         u.default_to(&["hermes", "pi"]).unwrap();
         assert!(u.plan.as_ref().unwrap().npm_registry.is_some());
         assert!(u.describe().contains("hermes still download"), "{}", u.describe());
+    }
+
+    #[test]
+    fn hermes_bundles_go_into_the_plan_and_only_to_agents_that_take_them() {
+        use crate::machines::hermes_bundle::standin;
+        use sha2::{Digest, Sha256};
+        use wire::InstallSource;
+        let dir = crate::db::temp_path("upkeep-hermes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("superbot-hermes-v0.23.3-x86_64.tar.gz");
+        let body = standin::good("x86_64", "#!/bin/sh\n");
+        std::fs::write(&file, &body).unwrap();
+        let sha: String = Sha256::digest(&body).iter().map(|b| format!("{b:02x}")).collect();
+        let setting = format!("{}={sha}", file.display());
+        let env = move |harnesses: &'static str| {
+            let setting = setting.clone();
+            move |k: &str| match k {
+                "MACHINE_HARNESSES" => harnesses.into(),
+                "MACHINE_HERMES_BUNDLE" => setting.clone(),
+                "MACHINE_CONTROL_URL" => "https://10.0.0.5:8443".into(),
+                _ => String::new(),
+            }
+        };
+        let u = Upkeep::from_env(&env("claude,hermes")).unwrap();
+        let p = u.plan.clone().unwrap();
+        assert!(matches!(p.harnesses[0].source, InstallSource::Npm { .. }));
+        assert!(matches!(p.harnesses[1].source, InstallSource::Bundle { .. }), "{p:?}");
+        assert!(u.describe().contains("Hermes Agent on machines from botd's Hermes bundles: x86_64"), "{}", u.describe());
+        assert!(!u.describe().contains("still download"), "{}", u.describe());
+        let can = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(takes(&p, &can(&[wire::CAN_HARNESSES, wire::CAN_HARNESS_BUNDLES])));
+        assert!(!takes(&p, &can(&[wire::CAN_HARNESSES, wire::CAN_HARNESS_MIRRORS])), "an agent from before ADR 0210 isn't sent it");
+        let without = Upkeep::from_env(&env("claude")).unwrap().plan.unwrap();
+        assert!(takes(&without, &can(&[wire::CAN_HARNESSES])), "without Hermes in the plan, the bundles change nothing");
+        assert_eq!(without, parse_harnesses("claude").unwrap().unwrap(), "nor the plan's id");
+
+        // The managed tiers' default goes through them too.
+        let mut u = Upkeep::from_env(&env("")).unwrap();
+        u.default_to(&["hermes"]).unwrap();
+        assert!(matches!(u.plan.unwrap().harnesses[0].source, InstallSource::Bundle { .. }));
+        let pinned = Upkeep::from_env(&env("hermes@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")).unwrap_err();
+        assert!(pinned.contains("but machines' plan pins bbbbbbbbbbbb"), "{pinned}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

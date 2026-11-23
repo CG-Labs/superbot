@@ -4,6 +4,8 @@
 //!   superbot-machine run      enroll if needed, then serve (systemd runs this)
 //!   superbot-machine enroll   enroll now and exit (a token from an admin, by hand)
 //!   superbot-machine status   ask the control plane how it sees this machine
+//!   superbot-machine swap-in F  put a checked bundle's tree in place (ADR 0210); the agent
+//!                             runs this through systemd when its unit can't write there
 //!
 //! `run` returns after an upgrade (ADR 0039) so systemd starts the new binary.
 //!
@@ -17,6 +19,8 @@ mod cgroup;
 mod display;
 #[path = "../machines/egress_allow.rs"]
 mod egress_allow;
+#[path = "../machines/hermes_bundle.rs"]
+mod hermes_bundle;
 #[path = "../machines/job.rs"]
 mod job;
 #[path = "../machines/landing.rs"]
@@ -57,6 +61,15 @@ async fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
     if matches!(cmd.as_str(), "-V" | "--version" | "version") {
         println!("superbot-machine {}", agent::VERSION);
+        return;
+    }
+    if cmd == "swap-in" {
+        let spec = std::env::args().nth(2).unwrap_or_else(|| fail("usage: superbot-machine swap-in <file>"));
+        let swap: tools::Swap = std::fs::read(&spec)
+            .map_err(|e| format!("{spec}: {e}"))
+            .and_then(|b| serde_json::from_slice(&b).map_err(|e| format!("{spec}: {e}")))
+            .unwrap_or_else(|e| fail(&e));
+        tools::swap_in(&swap).await.unwrap_or_else(|e| fail(&e));
         return;
     }
     if !matches!(cmd.as_str(), "run" | "enroll" | "status") {

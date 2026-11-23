@@ -91,7 +91,7 @@ Hermes writes some files that every run reads as `0600`, such as its install's `
     - re-runs the install with the bundle, which says Hermes is already installed.
   - By hand, as root with no network: a fresh install, a replacement of another commit, a rollback when the final check fails, and a rollback when sharing fails.
 - Not covered:
-  - Hermes Agent on users' own machines without the internet. Their agent still runs Hermes's installer. A follow-up could have botd serve this bundle's tree to them.
+  - Hermes Agent on users' own machines without the internet. Their agent still runs Hermes's installer. A follow-up could have botd serve this bundle's tree to them. [ADR 0210](0210-hermes-agent-on-air-gapped-machines.md) does.
   - Docker Compose, which still needs a custom image for Hermes.
   - The Hermes bundle in `offline-release-check`. Its signature is checked when it is attached, but the weekly end-to-end check doesn't install it yet.
   - npm registries that need a login.

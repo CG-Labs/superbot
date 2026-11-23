@@ -129,6 +129,8 @@ pub const CAN_LOCKED_DOWN: &str = "locked_down";
 pub const CAN_SECCOMP: &str = "seccomp";
 /// Takes `HarnessPlan::npm_registry` and `HarnessPlan::ca` (ADR 0186).
 pub const CAN_HARNESS_MIRRORS: &str = "harness_mirrors";
+/// Installs `InstallSource::Bundle` from botd's machine port (ADR 0210).
+pub const CAN_HARNESS_BUNDLES: &str = "harness_bundles";
 /// Lets its harness egress rules through to its team network's subnet, or stops
 /// letting them (`PUT /v1/team-network`, ADR 0202).
 pub const CAN_TEAM_NETWORK: &str = "team_network";
@@ -868,6 +870,21 @@ pub enum InstallSource {
         sha256: String,
         args: Vec<String>,
         bin: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+    },
+    /// A Hermes bundle (ADR 0200) botd serves (ADR 0210): checked against the SHA-256
+    /// for this machine's arch, unpacked and checked, then swapped into `prefix`, the
+    /// only place its tree runs. `bin` and `readable` are under `prefix`: the program,
+    /// and the folders opened to every account, since Bots run as their own users.
+    /// `after` runs as for `Script`, with HOME `prefix`. Only an agent that says
+    /// `CAN_HARNESS_BUNDLES` is sent one.
+    Bundle {
+        downloads: BTreeMap<String, Download>,
+        prefix: String,
+        bin: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        readable: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         after: Option<String>,
     },

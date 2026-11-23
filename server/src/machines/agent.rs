@@ -943,6 +943,11 @@ impl Agent {
             team_rules: Mutex::new(last_team_rules(&cfg_state_dir)),
             team_loading: tokio::sync::Mutex::new(()),
         });
+        let me = Arc::downgrade(&a);
+        a.tools.set_control(
+            &a.cfg.control_url,
+            Box::new(move || me.upgrade().ok_or_else(|| "the agent is stopping".to_string()).and_then(|a| control_client(&a, None))),
+        );
         a.home_use.refresh(&a.home_roots(), false);
         let mut tmps = vec![a.cfg.home.join(TMP)];
         if let Ok(homes) = std::fs::read_dir(a.teammates.root()) {
@@ -1551,6 +1556,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             wire::CAN_EGRESS_POLICY,
             wire::CAN_LOCKED_DOWN,
             wire::CAN_HARNESS_MIRRORS,
+            wire::CAN_HARNESS_BUNDLES,
             wire::CAN_TEAM_NETWORK,
         ]
             .into_iter()
@@ -2101,16 +2107,26 @@ async fn set_harnesses(State(a): State<Arc<Agent>>, Json(plan): Json<wire::Harne
     }
 }
 
+/// A client for botd's machine port over the CA-pinned channel, with this machine's
+/// certificate. `timeout`: for the whole request; without one, a download as large as
+/// a bundle (ADR 0210) may take as long as it keeps moving.
+fn control_client(a: &Agent, timeout: Option<Duration>) -> Result<reqwest::Client, String> {
+    let config = pki::client_config(&a.cfg.ca(), Some(a.identity().chain()))?;
+    let b = reqwest::Client::builder()
+        .tls_backend_preconfigured(config)
+        .connect_timeout(Duration::from_secs(10));
+    match timeout {
+        Some(t) => b.timeout(t),
+        None => b.read_timeout(Duration::from_secs(60)),
+    }
+    .build()
+    .map_err(|e| e.to_string())
+}
+
 /// botd's `/v1/agent` or `/v1/botctl`, over the CA-pinned channel, with this machine's
 /// certificate.
 async fn fetch(a: &Agent, path: &str) -> Result<Vec<u8>, String> {
-    let config = pki::client_config(&a.cfg.ca(), Some(a.identity().chain()))?;
-    let http = reqwest::Client::builder()
-        .tls_backend_preconfigured(config)
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(600))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let http = control_client(a, Some(Duration::from_secs(600)))?;
     let mut r = http
         .get(format!("{}{path}", a.cfg.control_url))
         .send()
