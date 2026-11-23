@@ -123,8 +123,9 @@ async fn push_cosign_tag(c: &Client, t: &str, copies: Vec<Source<'_>>) -> Result
             c.push_blob(d, &layout.path(d)?).await?;
         }
     }
+    // The merged manifest is the mirror's when it has one, which may be Docker's type, not the bundles'.
     let bytes = serde_json::to_vec(&manifest).expect("json");
-    c.put_manifest(t, &bytes, &first.media_type).await?;
+    c.put_manifest(t, &bytes, manifest["mediaType"].as_str().unwrap_or(&first.media_type)).await?;
     Ok(true)
 }
 

@@ -28,6 +28,8 @@ struct Store {
     writes: usize,
     /// The Authorization header on each blob upload.
     upload_auth: Vec<String>,
+    /// Every request that reached the registry.
+    requests: usize,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -107,6 +109,7 @@ impl Store {
 }
 
 async fn handle(State(f): State<Arc<Fake>>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
+    f.store.lock().unwrap().requests += 1;
     let path = uri.path();
     let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default();
     if path == "/token" {
@@ -147,6 +150,10 @@ async fn handle(State(f): State<Arc<Fake>>, method: Method, uri: Uri, headers: H
         if method == Method::PUT {
             let Ok(m) = serde_json::from_slice::<Value>(&body) else { return reply(StatusCode::BAD_REQUEST, &[], b"MANIFEST_INVALID".to_vec()) };
             let d = sha256_digest(&body);
+            let sent = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default();
+            if m["mediaType"].as_str().is_some_and(|t| t != sent) {
+                return reply(StatusCode::BAD_REQUEST, &[], b"MANIFEST_INVALID: mediaType doesn't match Content-Type".to_vec());
+            }
             if reference.starts_with("sha256:") && reference != d {
                 return reply(StatusCode::BAD_REQUEST, &[], b"DIGEST_INVALID".to_vec());
             }
@@ -651,6 +658,11 @@ async fn a_registry_on_https_cant_send_us_to_http() {
 
 /// A cosign `.sig` manifest for SIGS, each a layer, with a config that lists them as cosign's does.
 fn legacy_sig(s: &mut Store, repo: &str, sigs: &[&str]) -> String {
+    legacy_sig_as(s, repo, sigs, OCI_MANIFEST)
+}
+
+/// ... as a manifest of media type MT, as older cosign writes Docker's.
+fn legacy_sig_as(s: &mut Store, repo: &str, sigs: &[&str], mt: &str) -> String {
     let layers: Vec<Value> = sigs
         .iter()
         .map(|sig| {
@@ -662,7 +674,39 @@ fn legacy_sig(s: &mut Store, repo: &str, sigs: &[&str]) -> String {
         "history": sigs.iter().map(|_| json!({ "created": "0001-01-01T00:00:00Z" })).collect::<Vec<_>>() });
     let cb = serde_json::to_vec(&config).unwrap();
     let cd = s.blob(&cb);
-    s.manifest(repo, &json!({ "schemaVersion": 2, "mediaType": OCI_MANIFEST, "config": { "mediaType": "application/vnd.oci.image.config.v1+json", "digest": cd, "size": cb.len() }, "layers": layers })).0
+    s.manifest(repo, &json!({ "schemaVersion": 2, "mediaType": mt, "config": { "mediaType": "application/vnd.oci.image.config.v1+json", "digest": cd, "size": cb.len() }, "layers": layers })).0
+}
+
+#[tokio::test]
+async fn bundles_with_different_legacy_signatures_for_one_index_keep_them_all() {
+    let src = serve(Mode::default()).await;
+    let p = publish(&src, false);
+    let cfg0 = settings(&[&src], None);
+    let t = format!("{}.sig", p.index.replacen(':', "-", 1));
+    let mut units = Vec::new();
+    for (sig, image) in [("by alice", &p.arm64), ("by bob", &p.amd64)] {
+        let d = legacy_sig(&mut src.store.lock().unwrap(), REPO, &[sig]);
+        src.store.lock().unwrap().tags.insert((REPO.into(), t.clone()), d);
+        units.push(unit(&src, &p, image, &cfg0).await);
+    }
+    // Either order, onto an empty mirror: both signatures, in the order the bundles were given.
+    for (order, want) in [([0, 1], ["by alice", "by bob"]), ([1, 0], ["by bob", "by alice"])] {
+        let mirror = serve(Mode::default()).await;
+        let cfg = settings(&[&src, &mirror], None);
+        let dirs = order.map(|i| units[i].clone());
+        push::push(&cfg, &repo(&mirror, "m/app"), "1", &dirs, false).await.unwrap();
+        assert_eq!(sig_layers(&mirror.store.lock().unwrap(), "m/app", &t), want);
+        let before = mirror.store.lock().unwrap().tags[&("m/app".to_string(), t.clone())].clone();
+        push::push(&cfg, &repo(&mirror, "m/app"), "1", &[dirs[1].clone(), dirs[0].clone()], false).await.unwrap();
+        assert_eq!(mirror.store.lock().unwrap().tags[&("m/app".to_string(), t.clone())], before, "the same bundles again, any order, change nothing");
+    }
+    // A mirror whose tag older cosign wrote as Docker's type: merged into it, and sent as that type.
+    let mirror = serve(Mode::default()).await;
+    let cfg = settings(&[&src, &mirror], None);
+    let d = legacy_sig_as(&mut mirror.store.lock().unwrap(), "m/app", &["by carol"], "application/vnd.docker.distribution.manifest.v2+json");
+    mirror.store.lock().unwrap().tags.insert(("m/app".into(), t.clone()), d);
+    push::push(&cfg, &repo(&mirror, "m/app"), "1", &units, false).await.unwrap();
+    assert_eq!(sig_layers(&mirror.store.lock().unwrap(), "m/app", &t), ["by carol", "by alice", "by bob"]);
 }
 
 fn sig_layers(s: &Store, repo: &str, tag: &str) -> Vec<String> {
@@ -767,6 +811,36 @@ async fn logs_in_with_the_operators_credentials() {
     assert!(e.contains("wants a login"), "{e}");
 }
 
+#[tokio::test]
+async fn a_registry_whose_rule_is_secure_is_never_reached_over_plain_http() {
+    let mirror = serve(Mode { login: true, ..Mode::default() }).await;
+    let src = serve(Mode::default()).await;
+    let p = publish(&src, false);
+    let cfg = settings(&[&src, &mirror], Some(LOGIN));
+    let units = [unit(&src, &p, &p.amd64, &cfg).await, unit(&src, &p, &p.arm64, &cfg).await];
+    let host_wide = format!("[[registry]]\nlocation = \"{}\"\ninsecure = true\n", mirror.addr);
+    let secure_path = format!("[[registry]]\nprefix = \"{0}/secure\"\nlocation = \"{0}/secure\"\n", mirror.addr);
+    let secure_host = format!("[[registry]]\nlocation = \"{}\"\ninsecure = false\n", mirror.addr);
+    let d = tmp("secure");
+    let write = |name: &str, text: &str| {
+        std::fs::write(d.join(name), text).unwrap();
+        d.join(name)
+    };
+    // A more specific secure registry in the same file, and a later file that makes the host secure.
+    let same_file = vec![write("one.conf", &format!("{host_wide}\n{secure_path}"))];
+    let later_file = vec![write("main.conf", &host_wide), write("drop-in.conf", &secure_host)];
+    for (confs, path) in [(same_file.clone(), "secure/app"), (later_file, "open/app")] {
+        let cfg = Settings { registries_confs: confs, ..cfg.clone() };
+        let before = mirror.store.lock().unwrap().requests;
+        let e = push::push(&cfg, &repo(&mirror, path), "1", &units, false).await.unwrap_err();
+        assert!(e.contains(&format!("https://{}", mirror.addr)), "{e}");
+        assert_eq!(mirror.store.lock().unwrap().requests, before, "nothing, and so no login, went over plain HTTP: {e}");
+    }
+    let cfg = Settings { registries_confs: same_file, ..cfg.clone() };
+    push::push(&cfg, &repo(&mirror, "open/app"), "1", &units, false).await.unwrap();
+    assert!(mirror.store.lock().unwrap().requests > 0, "the rest of the host is still insecure");
+}
+
 #[test]
 fn registries_conf_marks_registries_insecure_as_containers_does() {
     let v2 = "unqualified-search-registries = [\"docker.io\"]\n\n[[registry]]\nlocation = \"lab.test:5000\" # plain HTTP\ninsecure = true\n\n[[registry]]\nprefix = \"corp.test/team\"\nlocation = \"mirror.corp.test/team\"\ninsecure = true\n[[registry.mirror]]\nlocation = \"other.test\"\ninsecure = false\n\n[[registry]]\nlocation = \"*.dev.test\"\ninsecure = true\n\n[[registry]]\nlocation = \"tls.test\"\n";
@@ -783,6 +857,13 @@ fn registries_conf_marks_registries_insecure_as_containers_does() {
     let wide = "[[registry]]\nlocation = \"*.corp.test\"\ninsecure = true\n[[registry]]\nlocation = \"reg.corp.test\"\ninsecure = false\n[[registry]]\nprefix = \"lab.test/secure\"\nlocation = \"lab.test/secure\"\n";
     assert!(one(wide, "old.corp.test", "a") && !one(wide, "reg.corp.test", "a"), "insecure = false for one host wins over *.corp.test");
     assert!(one(v2, "lab.test:5000", "secure/a"));
+    let host_then_path = format!("{v2}\n[[registry]]\nprefix = \"lab.test:5000/secure\"\nlocation = \"lab.test:5000/secure\"\ninsecure = false\n");
+    assert!(!one(&host_then_path, "lab.test:5000", "secure/a"), "a path's secure registry wins over its host's insecure one");
+    assert!(one(&host_then_path, "lab.test:5000", "other/a") && one(&host_then_path, "lab.test:5000", "securer/a"));
+    let wildcard_then_host = [wide.to_string(), "[[registry]]\nlocation = \"*.corp.test\"\ninsecure = false\n".to_string()];
+    assert!(!insecure_in(&wildcard_then_host, "old.corp.test", "a"), "a later file's wildcard replaces an earlier one's");
+    let v1_then_v2 = [v1.to_string(), "[[registry]]\nlocation = \"old.test:5000\"\n".to_string()];
+    assert!(!insecure_in(&v1_then_v2, "old.test:5000", "a") && insecure_in(&v1_then_v2, "older.test", "a"), "a later v2 registry replaces a v1 insecure entry");
     let both = [v2.to_string(), "[[registry]]\nlocation = \"lab.test:5000\"\ninsecure = false\n".to_string()];
     assert!(!insecure_in(&both, "lab.test:5000", "a"), "a drop-in that says insecure = false wins");
     assert!(insecure_in(&both, "corp.test", "team/a"), "and leaves the others alone");
