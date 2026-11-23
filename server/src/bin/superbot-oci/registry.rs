@@ -179,14 +179,13 @@ impl Client {
         // is tried only if HTTPS doesn't answer at all.
         let insecure = settings.insecure(&repo.host, &repo.path);
         let builder = || {
-            let mut b = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(30)).user_agent(concat!("superbot-oci/", env!("CARGO_PKG_VERSION")));
-            if !certs.is_empty() {
-                b = b.tls_certs_merge(certs.clone());
-            }
-            b.tls_danger_accept_invalid_certs(insecure)
+            let b = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(30)).user_agent(concat!("superbot-oci/", env!("CARGO_PKG_VERSION")));
+            if certs.is_empty() { b } else { b.tls_certs_merge(certs.clone()) }
         };
+        // Other hosts trust the registry's CAs too, but `insecure` is for the registry alone:
+        // a token service elsewhere gets the login, so its certificate is always checked.
         let elsewhere = builder().build().map_err(|e| e.to_string())?;
-        let mut b = builder();
+        let mut b = builder().tls_danger_accept_invalid_certs(insecure);
         if let Some((path, pem)) = settings.client_pem(&repo.host)? {
             b = b.identity(reqwest::Identity::from_pem(&pem).map_err(|e| format!("{}: {e}", path.display()))?);
         }

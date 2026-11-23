@@ -30,6 +30,8 @@ struct Store {
     upload_auth: Vec<String>,
     /// Every request that reached the registry.
     requests: usize,
+    /// Requests that reached its token service.
+    token_logins: usize,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -64,6 +66,8 @@ struct Fake {
     addr: String,
     /// With `client_cert`: a certificate (PEM) the fake accepts, and its key.
     client: Option<(String, String)>,
+    /// With `tls`: the CA (PEM) its certificate is from, for `127.0.0.1` and `localhost`.
+    ca: Option<String>,
 }
 
 const TOKEN: &str = "t0ken";
@@ -122,6 +126,9 @@ async fn handle(State(f): State<Arc<Fake>>, method: Method, uri: Uri, headers: H
     let path = uri.path();
     let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default();
     let elsewhere = format!("{}://localhost:{}", if f.mode.tls { "https" } else { "http" }, f.addr.rsplit_once(':').unwrap().1);
+    if path.starts_with("/token") {
+        f.store.lock().unwrap().token_logins += 1;
+    }
     if path == "/token-first" {
         return reply(StatusCode::TEMPORARY_REDIRECT, &[("location", format!("/token?{}", uri.query().unwrap_or_default()))], vec![]);
     }
@@ -247,36 +254,41 @@ async fn serve(mode: Mode) -> Arc<Fake> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let mut ca = rcgen::CertificateParams::new(vec![]).unwrap();
+    ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_cert = ca.self_signed(&ca_key).unwrap();
+    let issuer = rcgen::Issuer::new(ca, ca_key);
+    let leaf = |names: Vec<String>, usage| {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut p = rcgen::CertificateParams::new(names).unwrap();
+        p.extended_key_usages = vec![usage];
+        (p.signed_by(&key, &issuer).unwrap(), key)
+    };
     let mut client = None;
     let mut verifier = None;
     if mode.client_cert {
-        let ca_key = rcgen::KeyPair::generate().unwrap();
-        let mut ca = rcgen::CertificateParams::new(vec![]).unwrap();
-        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let ca_cert = ca.self_signed(&ca_key).unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca_cert.der().clone()).unwrap();
         verifier = Some(rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone()).build().unwrap());
-        let key = rcgen::KeyPair::generate().unwrap();
-        let mut leaf = rcgen::CertificateParams::new(vec!["operator".into()]).unwrap();
-        leaf.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-        let cert = leaf.signed_by(&key, &rcgen::Issuer::new(ca, ca_key)).unwrap();
+        let (cert, key) = leaf(vec!["operator".into()], rcgen::ExtendedKeyUsagePurpose::ClientAuth);
         client = Some((cert.pem(), key.serialize_pem()));
     }
-    let f = Arc::new(Fake { store: Mutex::new(Store::default()), mode, addr, client });
+    let (server_cert, server_key) = leaf(vec!["localhost".into(), "127.0.0.1".into()], rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+    let ca = mode.tls.then(|| ca_cert.pem());
+    let f = Arc::new(Fake { store: Mutex::new(Store::default()), mode, addr, client, ca });
     let app = axum::Router::new().fallback(handle).with_state(f.clone());
     if !mode.tls {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         return f;
     }
-    let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.signing_key.serialize_der().into());
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(server_key.serialize_der().into());
     let tls = rustls::ServerConfig::builder_with_provider(provider).with_safe_default_protocol_versions().unwrap();
     let tls = match verifier {
         Some(v) => tls.with_client_cert_verifier(v),
         None => tls.with_no_client_auth(),
     }
-    .with_single_cert(vec![ck.cert.der().clone()], key)
+    .with_single_cert(vec![server_cert.der().clone()], key)
     .unwrap();
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
     tokio::spawn(async move {
@@ -856,16 +868,32 @@ async fn a_registry_that_wants_a_client_certificate_gets_the_one_in_certs_d() {
     assert_eq!((got.referrers, got.attestations), (5, 1), "client.cert and client.key from certs.d/HOST, as skopeo uses them");
 }
 
-/// certs.d with each fake's client certificate under its address.
+/// certs.d with each fake's CA, and its client certificate if it has one, under its address.
 fn certs_d(regs: &[&Fake]) -> PathBuf {
     let d = tmp("certs.d");
     for r in regs {
-        let (cert, key) = r.client.clone().unwrap();
-        std::fs::create_dir_all(d.join(&r.addr)).unwrap();
-        std::fs::write(d.join(&r.addr).join("client.cert"), cert).unwrap();
-        std::fs::write(d.join(&r.addr).join("client.key"), key).unwrap();
+        let h = d.join(&r.addr);
+        std::fs::create_dir_all(&h).unwrap();
+        std::fs::write(h.join("ca.crt"), r.ca.clone().unwrap()).unwrap();
+        if let Some((cert, key)) = r.client.clone() {
+            std::fs::write(h.join("client.cert"), cert).unwrap();
+            std::fs::write(h.join("client.key"), key).unwrap();
+        }
     }
     d
+}
+
+#[tokio::test]
+async fn insecure_is_for_the_registry_alone_not_its_token_service_elsewhere() {
+    let src = serve(Mode { login: true, token_elsewhere: true, tls: true, ..Mode::default() }).await;
+    let p = publish(&src, false);
+    let cfg = settings(&[&src], Some(LOGIN));
+    let e = fetch::fetch(&cfg, &repo(&src, REPO), &p.index, &p.arm64, &tmp("tokentls").join("o")).await.unwrap_err();
+    assert!(e.contains("token service") && e.to_lowercase().contains("certificate"), "the login isn't sent to a token service whose certificate can't be checked: {e}");
+    assert_eq!(src.store.lock().unwrap().token_logins, 0);
+    let cfg = Settings { cert_dirs: vec![certs_d(&[&src])], ..cfg };
+    let got = fetch::fetch(&cfg, &repo(&src, REPO), &p.index, &p.arm64, &tmp("tokentls").join("o")).await.unwrap();
+    assert_eq!((got.referrers, got.attestations), (5, 1), "with the registry's CA in certs.d it is checked and trusted");
 }
 
 #[tokio::test]
