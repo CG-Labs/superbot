@@ -353,3 +353,36 @@ describe("two-factor sign-in (ADR 0094)", () => {
     ]);
   });
 });
+
+describe("your data's residency (ADR 0168)", () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  it("reads the pin, and is null on servers before it", async () => {
+    const pin = { pin: { on: "user", region: "gb-lon", pinnedAt: 1, reference: "DPA-1" }, ownPin: null, reports: ["user"] };
+    globalThis.fetch = jest.fn(async () => ({ ok: true, status: 200, json: async () => pin })) as unknown as typeof fetch;
+    const api = new SuperBotApi({ baseUrl: BASE, cookie: true });
+    expect(await api.myResidency()).toEqual(pin);
+    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toBe(`${BASE}/api/me/residency`);
+    globalThis.fetch = jest.fn(async () => ({ ok: false, status: 404, json: async () => ({}) })) as unknown as typeof fetch;
+    expect(await api.myResidency()).toBeNull();
+    globalThis.fetch = jest.fn(async () => ({ ok: false, status: 500, json: async () => ({ error: "boom" }) })) as unknown as typeof fetch;
+    await expect(api.myResidency()).rejects.toThrow("boom");
+  });
+
+  it("fetches a report as Markdown under the name the server gave it, and says why when it can't", async () => {
+    globalThis.fetch = jest.fn(async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-disposition": 'attachment; filename="superbot-residency-team-t1-20261123.md"' }),
+      text: async () => "# Data residency report\n",
+    })) as unknown as typeof fetch;
+    const api = new SuperBotApi({ baseUrl: BASE, cookie: true });
+    expect(await api.myResidencyReport("team")).toEqual({ text: "# Data residency report\n", fileName: "superbot-residency-team-t1-20261123.md" });
+    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toBe(`${BASE}/api/me/residency/report?format=markdown&on=team`);
+    globalThis.fetch = jest.fn(async () => ({ ok: false, status: 429, json: async () => ({ error: "Try again in 60 seconds." }) })) as unknown as typeof fetch;
+    await expect(api.myResidencyReport("user")).rejects.toThrow("Try again in 60 seconds.");
+  });
+});
