@@ -11277,6 +11277,9 @@ mod tests {
         assert!(db.residency_pin(PinOn::User, &ada.id).is_none());
         assert!(matches!(db.remove_team_member_keeping_pin(&t.id, &dee.id, true, false), Ok((true, None))));
         assert!(db.residency_pin(PinOn::User, &dee.id).is_none());
+        // No team pin: nothing to keep.
+        db.unpin_residency(PinOn::Team, &t.id).unwrap();
+        assert!(matches!(db.remove_team_member_keeping_pin(&t.id, &ada.id, true, true), Ok((true, None))));
     }
 
     #[test]
@@ -11325,9 +11328,6 @@ mod tests {
         assert!(db.residency_pin(PinOn::Team, &t.id).is_some());
         // Someone who never had data ends at once.
         assert!(db.end_kept_pin(&cy.id).unwrap().is_some());
-        // No team pin: nothing to keep.
-        db.unpin_residency(PinOn::Team, &t.id).unwrap();
-        assert!(matches!(db.remove_team_member_keeping_pin(&t.id, &ada.id, true, true), Ok((true, None))));
     }
 
     #[test]
