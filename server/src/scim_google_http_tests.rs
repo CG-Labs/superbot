@@ -346,6 +346,25 @@ async fn an_admins_disable_holds() {
 }
 
 #[tokio::test]
+async fn taking_on_a_disabled_google_user_keeps_them_disabled() {
+    let g = google_stand_in().await;
+    let w = world(&g, true, |_| {}).await;
+    let sso = w.sso.clone().unwrap();
+    let (_, made) = call(w.port, "POST", "/api/users", &w.admin, r#"{"email":"fay@example.com","name":"Fay"}"#).await;
+    let fay = parse(&made)["id"].as_str().unwrap().to_string();
+    assert_eq!(call(w.port, "POST", &format!("/api/users/{fay}/identities"), &w.admin, &json!({ "provider": sso, "subject": "106" }).to_string()).await.0, 201);
+    assert_eq!(call(w.port, "PATCH", &format!("/api/users/{fay}"), &w.admin, r#"{"status":"disabled"}"#).await.0, 200);
+    g.set(|d| d.users.push(person("106", "fay@example.com", "Fay", false)));
+    g.members("staff@example.com", vec![member("101"), member("102"), member("106")]);
+    let res = synced(&w).await;
+    assert_eq!(res["held"], json!([fay]), "{res}");
+    assert_eq!(uid(&w, "106"), fay, "SCIM takes on the user her identity is linked to");
+    assert!(!active(&w, "106"), "an admin disabled her before the sync took her on");
+    synced(&w).await;
+    assert!(!active(&w, "106"), "and the pass after that too");
+}
+
+#[tokio::test]
 async fn people_already_here_get_their_google_identity() {
     let g = google_stand_in().await;
     let w = world(&g, true, |_| {}).await;

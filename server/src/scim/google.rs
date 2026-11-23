@@ -535,7 +535,8 @@ fn user_body(p: &Person, active: bool) -> Value {
 }
 
 /// `people`: who should have an account. `live`: the tenant's users now. `gone`: Google
-/// id to user id, for people the tenant deleted. `held`: whether a disabled user stays so.
+/// id to user id, for disabled users a create takes back or on. `held`: whether a
+/// disabled user stays so.
 fn plan(people: &[&Person], live: &[ScimUser], gone: &HashMap<String, String>, held: &dyn Fn(&str) -> bool) -> Plan {
     let mut p = Plan::default();
     let by_ext: HashMap<&str, &ScimUser> = live.iter().filter_map(|u| u.external_id.as_deref().map(|x| (x, u))).collect();
@@ -714,10 +715,19 @@ async fn apply(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Caller, snap: S
     let outside = members.iter().filter(|id| !snap.people.contains_key(**id)).count() + snap.groups.values().map(|g| g.outside).sum::<usize>();
     let people: Vec<&Person> = snap.people.values().filter(|p| everyone || members.contains(p.id.as_str())).collect();
     let live = all_users(app, tenant);
+    // A create takes back a user the tenant deleted, or takes on the one their Google
+    // identity is linked to already (as after a just-in-time sign-in).
+    let taken = |p: &Person| -> Option<User> {
+        if let Some(u) = app.db.scim_find(tenant, &ScimKey::ExternalId(p.id.clone())).filter(|u| u.deleted_at.is_some()) {
+            return Some(u.user);
+        }
+        let l = sso_link(a, &c.token, Some(&p.id)).ok().flatten()?;
+        app.db.identity(&l.issuer, &l.subject).map(|(_, u)| u)
+    };
     let gone: HashMap<String, String> = people
         .iter()
         .filter(|p| p.active && !live.iter().any(|u| u.external_id.as_deref() == Some(p.id.as_str())))
-        .filter_map(|p| app.db.scim_find(tenant, &ScimKey::ExternalId(p.id.clone())).filter(|u| u.deleted_at.is_some()).map(|u| (p.id.clone(), u.user.id)))
+        .filter_map(|p| taken(p).filter(|u| !u.active()).map(|u| (p.id.clone(), u.id)))
         .collect();
     let plan = plan(&people, &live, &gone, &|id| held(app, id));
     let active_now = live.iter().filter(|u| u.user.active()).count();
