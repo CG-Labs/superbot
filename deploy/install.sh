@@ -1079,7 +1079,7 @@ stop_for_hermes() {
 }
 
 hermes_failed() {
-  hermes_put_back
+  hermes_put_back || true
   if [[ "$HERMES_STOPPED" == true ]]; then
     warn "Starting superbot again with the Hermes Agent it had"
     systemctl start superbot.service || true
@@ -1181,15 +1181,15 @@ install_hermes_shared() {
     [[ "$ok" == true ]] || hermes_failed "Hermes Agent did not install"
   fi
   env HOME="$HERMES_SHARED_DIR" sh "$share" >/dev/null || hermes_failed "Couldn't share Hermes Agent's environment"
-  chmod -R go-w "$HERMES_SHARED_DIR"
+  chmod -R go-w "$HERMES_SHARED_DIR" || hermes_failed "Couldn't make Hermes Agent writable by root only"
   # Hermes writes some files every run reads as 0600 (its install's facts.json, its checkout's
   # stamps), so other accounts must be given them. Only the parts runs use: not the install's
   # own data root (its .env, sessions and memories).
   for d in .hermes/hermes-agent .hermes/installs .hermes/tools .local/share/uv; do
-    [[ ! -d "$HERMES_SHARED_DIR/$d" ]] || chmod -R a+rX "$HERMES_SHARED_DIR/$d"
+    [[ ! -d "$HERMES_SHARED_DIR/$d" ]] || chmod -R a+rX "$HERMES_SHARED_DIR/$d" || hermes_failed "Couldn't make Hermes Agent readable by other accounts"
   done
-  chmod go+rx "$HERMES_SHARED_DIR/.hermes" "$HERMES_SHARED_DIR/.hermes/superbot"
-  ln -sfn "$wrapper" /usr/local/bin/hermes
+  chmod go+rx "$HERMES_SHARED_DIR/.hermes" "$HERMES_SHARED_DIR/.hermes/superbot" || hermes_failed "Couldn't make Hermes Agent readable by other accounts"
+  ln -sfn "$wrapper" /usr/local/bin/hermes || hermes_failed "Couldn't link /usr/local/bin/hermes"
   probe=$(mktemp -d)
   chmod 0777 "$probe"
   sudo -u nobody env HOME="$probe" HERMES_HOME="$probe/hermes" /usr/local/bin/hermes --version >/dev/null \
@@ -1218,18 +1218,22 @@ install_hermes_from_bundle() {
     mv -- "$HERMES_SHARED_DIR" "$HERMES_STAGE/previous" || hermes_failed "Couldn't move the Hermes Agent in $HERMES_SHARED_DIR aside"
     HERMES_PREVIOUS="$HERMES_STAGE/previous"
   fi
-  chown root:root "$tree/hermes"
-  chmod 0755 "$tree/hermes"
+  chown root:root "$tree/hermes" || hermes_failed "Couldn't make root own Hermes Agent's tree"
+  chmod 0755 "$tree/hermes" || hermes_failed "Couldn't set the permissions of Hermes Agent's tree"
   mv -- "$tree/hermes" "$HERMES_SHARED_DIR" || hermes_failed "Couldn't move Hermes Agent into $HERMES_SHARED_DIR"
 }
 
-# The Hermes Agent install_hermes_from_bundle moved aside, back in $HERMES_SHARED_DIR.
+# The Hermes Agent install_hermes_from_bundle moved aside, back in $HERMES_SHARED_DIR. If that
+# fails, HERMES_PREVIOUS stays set, so cleanup_offline keeps it for the operator.
 hermes_put_back() {
   [[ -n "$HERMES_PREVIOUS" && -e "$HERMES_PREVIOUS" ]] || return 0
   warn "Putting back the Hermes Agent $HERMES_SHARED_DIR had"
-  rm -rf -- "$HERMES_SHARED_DIR"
-  mv -- "$HERMES_PREVIOUS" "$HERMES_SHARED_DIR" || warn "Couldn't put it back: it is in $HERMES_PREVIOUS"
-  HERMES_PREVIOUS=""
+  if rm -rf -- "$HERMES_SHARED_DIR" && mv -- "$HERMES_PREVIOUS" "$HERMES_SHARED_DIR"; then
+    HERMES_PREVIOUS=""
+  else
+    warn "Couldn't put it back: it is in $HERMES_PREVIOUS; move it to $HERMES_SHARED_DIR by hand"
+    return 1
+  fi
 }
 
 # An upgrade without --with-hermes keeps the Hermes Agent it has; say so when this release
@@ -1842,16 +1846,39 @@ hermes_tar_ok() {
   [[ -z "$HERMES_TREE_PROBLEM" ]]
 }
 
-# Whether the relative path $1 stays inside the folder it starts from, read lexically.
-path_stays_inside() {
-  local part kept=() parts=()
-  IFS=/ read -ra parts <<<"$1"
-  for part in "${parts[@]}"; do
+# Whether the link target $4, in folder $3 of ROOT (a tree to live at DEST), stays inside it,
+# following every link on the way as the kernel would once the tree is at DEST: a link that is
+# fine read alone (b -> a/../x) can still leave through another (a -> .).
+link_stays_inside() {
+  local root=$1 dest=$2 dir=$3 target=$4 part next hops=0 kept=() todo=() more=()
+  if [[ "$target" == /* ]]; then
+    [[ "$target" == "$dest" || "$target" == "$dest"/* ]] || return 1
+    target=${target#"$dest"}
+  else
+    IFS=/ read -ra kept <<<"$dir"
+  fi
+  IFS=/ read -ra todo <<<"$target"
+  while ((${#todo[@]})); do
+    part=${todo[0]}
+    todo=("${todo[@]:1}")
     case $part in
-      '' | .) ;;
-      ..) ((${#kept[@]})) || return 1; unset 'kept[-1]' ;;
-      *) kept+=("$part") ;;
+      '' | .) continue ;;
+      ..) ((${#kept[@]})) || return 1; unset 'kept[-1]'; kept=("${kept[@]}"); continue ;;
     esac
+    next="$root$(printf '/%s' "${kept[@]}" "$part")"
+    if [[ -L "$next" ]]; then
+      ((++hops <= 40)) || return 1
+      target=$(readlink -- "$next") || return 1
+      if [[ "$target" == /* ]]; then
+        [[ "$target" == "$dest" || "$target" == "$dest"/* ]] || return 1
+        target=${target#"$dest"}
+        kept=()
+      fi
+      IFS=/ read -ra more <<<"$target"
+      todo=("${more[@]}" "${todo[@]}")
+    else
+      kept+=("$part")
+    fi
   done
 }
 
@@ -1860,7 +1887,7 @@ path_stays_inside() {
 # it reaches the rest of the host or a path from the machine that built it. SKIP... are paths
 # in ROOT left unchecked (they aren't bundled).
 hermes_tree_ok() {
-  local root=$1 dest=$2 odd link target dir p skip prune=()
+  local root=$1 dest=$2 odd link target dir skip prune=()
   shift 2
   for skip in "$@"; do prune+=(-path "$root/$skip" -prune -o); done
   HERMES_TREE_PROBLEM=""
@@ -1871,14 +1898,8 @@ hermes_tree_ok() {
   while IFS= read -r -d '' link && IFS= read -r -d '' target; do
     dir=""
     [[ "$link" != */* ]] || dir=${link%/*}
-    case $target in
-      *$'\n'*) HERMES_TREE_PROBLEM="the link $link has a newline in its target"; return 1 ;;
-      "$dest") p=. ;;
-      "$dest"/*) p=${target#"$dest"/} ;;
-      /*) HERMES_TREE_PROBLEM="the link $link points outside $dest, to $target"; return 1 ;;
-      *) p="$dir/$target" ;;
-    esac
-    path_stays_inside "$p" || { HERMES_TREE_PROBLEM="the link $link points outside $dest, to $target"; return 1; }
+    [[ "$target" != *$'\n'* ]] || { HERMES_TREE_PROBLEM="the link $link has a newline in its target"; return 1; }
+    link_stays_inside "$root" "$dest" "$dir" "$target" || { HERMES_TREE_PROBLEM="the link $link points outside $dest, to $target"; return 1; }
   done < <(find "$root" "${prune[@]}" -type l -printf '%P\0%l\0')
 }
 
@@ -1933,8 +1954,19 @@ prepare_hermes_bundle() {
 cleanup_offline() {
   [[ -z "${OFFLINE_TMP:-}" ]] || rm -rf -- "$OFFLINE_TMP"
   if [[ -n "${HERMES_STAGE:-}" ]]; then
-    hermes_put_back
-    rm -rf -- "$HERMES_STAGE"
+    # An exit with the old Hermes Agent aside is a failure hermes_failed didn't see: put it
+    # back, and start botd again if it was stopped for the swap. One that can't be put back
+    # stays in the staging folder.
+    local stuck=false
+    if [[ -n "${HERMES_PREVIOUS:-}" ]]; then
+      hermes_put_back || stuck=true
+      [[ "$HERMES_STOPPED" != true ]] || systemctl start superbot.service || true
+    fi
+    if [[ "$stuck" == true ]]; then
+      rm -rf -- "$HERMES_STAGE/bundle" "$HERMES_STAGE/tree"
+    else
+      rm -rf -- "$HERMES_STAGE"
+    fi
   fi
 }
 

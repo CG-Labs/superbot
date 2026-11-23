@@ -43,7 +43,7 @@ Then it reads `hermes.tar`'s listing. Only files, folders, symlinks and hard lin
 Hermes's install itself happens after the new binaries are in place, where `--with-hermes` always ran:
 
 - It unpacks `hermes.tar` into a 0700 staging folder beside `/opt/hermes` (`/opt/.superbot-hermes.*`).
-- It checks the files again: only files, folders and links, none setuid. Every link must stay inside the tree, and absolute links must point under `/opt/hermes`. The links are read lexically, so the check doesn't depend on what is on the host.
+- It checks the files again: only files, folders and links, none setuid. Every link must stay inside the tree, and absolute links must point under `/opt/hermes`. Each link is followed through the tree as it will be at `/opt/hermes`, every link on the way included, so the check doesn't depend on what is on the host, and two links can't combine to leave (`a -> .` with `b -> a/../x`).
 - It stops botd, moves the old `/opt/hermes` aside, and moves the new tree in.
 - It runs `hermes-share.sh`, makes the tree readable by every account, links `/usr/local/bin/hermes`, and runs Hermes as `nobody`.
 - Only then does it delete the old tree. On any failure, the old tree goes back and botd starts again with it. The staging folder is always removed.
@@ -79,7 +79,7 @@ Hermes writes some files that every run reads as `0600`, such as its install's `
     - a Hermes bundle builds from a stand-in tree with relative links, absolute links, a hard link and caches; the caches are left out and everything is owned by 0;
     - `verify` passes it;
     - refused: a changed `hermes.tar`, a setuid file, a pipe, paths outside `hermes/`, `..`, a hard link out, another kind, another prefix, a non-commit, a missing `hermes.tar`, no SHA-256;
-    - the unpacked tree's link check: links to `/etc`, `../..` escapes, another folder, `/opt/hermes/../etc`;
+    - the unpacked tree's link check: links to `/etc`, `../..` escapes, another folder, `/opt/hermes/../etc`, links that leave only through another link (relative or absolute), and a loop;
     - the bundle builder refuses: another commit, a tree for another place, a folder with another name, a link out, and building without root;
     - the installer refuses another arch, a commit it doesn't pin, and the main bundle's SHA-256 used for the Hermes bundle;
     - the flags matrix;

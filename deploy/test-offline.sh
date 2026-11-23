@@ -233,7 +233,7 @@ cp "$HB" "$T/hanchor.tar.gz"
 refused "$T/hanchor.tar.gz" "Nothing to check" "a Hermes bundle with no SHA-256 or signature beside it"
 ok "changed trees, setuid files, special files, paths outside hermes/, '..', hard links out, other kinds, places and commits are refused"
 
-# The tree as files, once unpacked: links must stay inside, read lexically.
+# The tree as files, once unpacked: links must stay inside, followed through other links.
 rm -rf "$T/hv" && mkdir -p "$T/hv" && tar -xOf "$HB" "$HTOP/hermes.tar" | tar -x -C "$T/hv"
 hermes_tree_ok "$T/hv/hermes" /opt/hermes || fail "a good Hermes tree was refused: $HERMES_TREE_PROBLEM"
 for bad in /etc ../../.. ../.hermes/../../x /opt/hermes-other/x /opt/hermes/../etc; do
@@ -243,9 +243,21 @@ for bad in /etc ../../.. ../.hermes/../../x /opt/hermes-other/x /opt/hermes/../e
 done
 ln -sfn ../hermes-agent "$T/hv/hermes/.hermes/bad"
 hermes_tree_ok "$T/hv/hermes" /opt/hermes || fail "a relative link inside was refused: $HERMES_TREE_PROBLEM"
-rm "$T/hv/hermes/.hermes/bad" && mkfifo "$T/hv/hermes/pipe"
+ln -sfn . "$T/hv/hermes/.hermes/dot"
+ln -sfn dot/../hermes-agent "$T/hv/hermes/.hermes/bad"
+hermes_tree_ok "$T/hv/hermes" /opt/hermes || fail "a link through a link inside was refused: $HERMES_TREE_PROBLEM"
+for chain in "dot/../../.. dot" "dot/../../x dot" "up/../x /opt/hermes" "up/../../x .." "loop loop2"; do
+  read -r bad via <<<"$chain"
+  rm -f "$T/hv/hermes/.hermes/bad" "$T/hv/hermes/.hermes/up" "$T/hv/hermes/.hermes/loop" "$T/hv/hermes/.hermes/loop2"
+  [[ $via == dot ]] || ln -sfn "$via" "$T/hv/hermes/.hermes/${bad%%/*}"
+  [[ $bad != loop ]] || ln -sfn loop "$T/hv/hermes/.hermes/loop2"
+  ln -sfn "$bad" "$T/hv/hermes/.hermes/bad"
+  if hermes_tree_ok "$T/hv/hermes" /opt/hermes; then fail "a link out through another link was taken: bad -> $bad, via $via"; fi
+done
+rm -f "$T/hv/hermes/.hermes/bad" "$T/hv/hermes/.hermes/up" "$T/hv/hermes/.hermes/loop" "$T/hv/hermes/.hermes/loop2" "$T/hv/hermes/.hermes/dot"
+mkfifo "$T/hv/hermes/pipe"
 if hermes_tree_ok "$T/hv/hermes" /opt/hermes; then fail "a pipe in the tree was taken"; fi
-ok "an unpacked Hermes tree's links stay inside it, absolute ones inside /opt/hermes"
+ok "an unpacked Hermes tree's links stay inside it, absolute ones inside /opt/hermes, even followed through other links"
 
 wrong=$(HMANIFEST=1 hremake harch sed -i "s/^arch=.*/arch=$other/" MANIFEST)
 "$DIR/offline-bundle.sh" verify "$wrong" >/dev/null || fail "verify (on any machine) refused another arch's Hermes bundle"
@@ -262,6 +274,33 @@ fi
 (DRY_RUN=true HERMES_BUNDLE=$HB HERMES_BUNDLE_SHA256=$(cut -c1-64 "$HB.sha256") OFFLINE_BUNDLE_SHA256=$(cut -c1-64 "$B.sha256") prepare_hermes_bundle) >/dev/null 2>&1 \
   || fail "a Hermes bundle wasn't checked against its own --hermes-bundle-sha256"
 ok "the installer takes only this host's arch and the commit it pins, checked against the Hermes bundle's own SHA-256"
+
+# An exit with the old Hermes Agent moved aside (a failure hermes_failed didn't see) puts it back
+# and starts botd again; when it can't be put back, it is kept where it is, for the operator, and
+# botd still starts (its other harnesses don't need Hermes).
+swap() {
+  rm -rf "$T/hswap" && mkdir -p "$T/hswap/stage/previous" "$T/hswap/stage/bundle" "$T/hswap/opt/hermes"
+  echo old >"$T/hswap/stage/previous/marker"
+  echo new >"$T/hswap/opt/hermes/marker"
+}
+swap
+out=$( (HERMES_SHARED_DIR=$T/hswap/opt/hermes HERMES_STAGE=$T/hswap/stage HERMES_PREVIOUS=$T/hswap/stage/previous HERMES_STOPPED=true OFFLINE_TMP=""
+  systemctl() { echo "systemctl $*"; }
+  cleanup_offline) 2>&1)
+grep -q "systemctl start superbot.service" <<<"$out" || fail "botd wasn't started again after the old Hermes Agent was put back"
+[[ "$(cat "$T/hswap/opt/hermes/marker")" == old && ! -e "$T/hswap/stage" ]] || fail "the old Hermes Agent wasn't put back, or the staging was left"
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  swap
+  chmod 0555 "$T/hswap/opt"
+  out=$( (HERMES_SHARED_DIR=$T/hswap/opt/hermes HERMES_STAGE=$T/hswap/stage HERMES_PREVIOUS=$T/hswap/stage/previous HERMES_STOPPED=true OFFLINE_TMP=""
+    systemctl() { echo "systemctl $*"; }
+    cleanup_offline) 2>&1)
+  chmod 0755 "$T/hswap/opt"
+  grep -Fq "it is in $T/hswap/stage/previous" <<<"$out" || fail "a Hermes Agent that couldn't be put back wasn't named"
+  [[ "$(cat "$T/hswap/stage/previous/marker")" == old && ! -e "$T/hswap/stage/bundle" ]] || fail "a Hermes Agent that couldn't be put back was deleted"
+  grep -q "systemctl start superbot.service" <<<"$out" || fail "botd wasn't started again when the old Hermes Agent couldn't be put back"
+fi
+ok "an exit mid-swap puts the old Hermes Agent back and starts botd again, or keeps it when it can't"
 
 # An upgrade without --with-hermes says when the Hermes Agent it keeps isn't the one pinned.
 fake_hermes "$T/hpinned" "$(printf 'd%.0s' {1..40})"
