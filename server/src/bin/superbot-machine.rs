@@ -28,6 +28,8 @@ mod pki;
 mod sandbox;
 #[path = "../machines/runas.rs"]
 mod runas;
+#[path = "../machines/seccomp.rs"]
+mod seccomp;
 #[path = "../machines/teammates.rs"]
 mod teammates;
 #[path = "../machines/terminal.rs"]

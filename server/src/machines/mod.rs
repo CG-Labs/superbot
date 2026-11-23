@@ -43,6 +43,7 @@ pub mod resize;
 pub mod route;
 pub mod runas;
 pub mod s3;
+pub mod seccomp;
 #[cfg(test)]
 pub mod s3_standin;
 pub mod screens;

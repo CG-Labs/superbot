@@ -309,7 +309,7 @@ impl Screens {
             .kill_on_drop(true);
         // SAFETY: only async-signal-safe calls; std drops to the user before it.
         unsafe {
-            c.pre_exec(runas::no_new_privs);
+            c.pre_exec(runas::confine);
         }
         c
     }
