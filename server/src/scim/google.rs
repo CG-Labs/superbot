@@ -1048,7 +1048,8 @@ async fn push_role_groups(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Call
         let v = json!({ "schemas": [groups::GROUP_SCHEMA], "displayName": key, "externalId": g.id, "members": members.iter().map(|m| json!({ "value": m })).collect::<Vec<_>>() });
         let body = Ok(Bytes::from(v.to_string()));
         if declared.provisioned_at.is_none() {
-            let ok = t.note(app, c, "POST", "/Groups", groups::create(st(), ex(), ca(), HeaderMap::new(), body).await);
+            let d = groups::Doc { display_name: key.clone(), external_id: Some(g.id.clone()), members: Some(members) };
+            let ok = t.note(app, c, "POST", "/Groups", role_groups::push_declared(app, a, c, &declared.id, &d).await);
             t.role_groups_created += ok as usize;
             continue;
         }

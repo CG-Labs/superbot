@@ -35,14 +35,14 @@ A role group follows ADR 0138's org-scope rules, unchanged:
 
 ### When it goes
 
-- **The IdP deletes it**: its members leave it and lose its role (reason `group_removed`), and the declaration goes back to waiting with what the admin declared, so pushing it again makes it a role group again, never a team.
+- **The IdP deletes it**: its members leave it and lose its role (reason `group_removed`), and the declaration goes back to waiting with the name and `externalId` the admin declared (the name unless another role group took it after the IdP renamed this one), so pushing it again makes it a role group again, never a team.
 - **An admin removes the declaration**: the role goes from everyone it gave it to (`role_group_removed`); the answer's `wasPushed` warns that an IdP still pushing the group will make it a team on its next `POST`.
-- **An admin changes its role**: `PATCH /api/scim/role-groups/{id}` takes the old role (`role_changed`) and offers the new one to every member.
+- **An admin changes its role**: `PATCH /api/scim/role-groups/{id}` saves and checks the new role first, so a refused change leaves every grant as it was, then takes the old role (`role_changed`) and offers the new one to every member.
 - **A SCIM `DELETE` of the user**: they leave every role group, losing its role (`user_deleted`).
 
 ### Google Workspace
 
-`GOOGLE_DIRECTORY_ROLE_GROUPS` names group emails (needs `SCIM_GROUPS=on` and `SCIM_GROUP_ROLES=on`, none also a team group, at most 50 groups across the three lists). Being in one gives no account; only the people the other two lists bring in are members. The admin declares each one in the sync's tenant by its email. Each pass pushes a declared group (`displayName` the email, `externalId` the Directory id), updates it when its members change, and deletes a pushed one no longer listed. A listed group nobody declared is never pushed, since it would become a team; the pass's summary names it in `roleGroups.undeclared`.
+`GOOGLE_DIRECTORY_ROLE_GROUPS` names group emails (needs `SCIM_GROUPS=on` and `SCIM_GROUP_ROLES=on`, none also a team group, at most 50 groups across the three lists). Being in one gives no account; only the people the other two lists bring in are members. The admin declares each one in the sync's tenant by its email. Each pass pushes a declared group (`displayName` the email, `externalId` the Directory id), updates it when its members change, and deletes a pushed one no longer listed. A listed group nobody declared is never pushed, since it would become a team; the pass's summary names it in `roleGroups.undeclared`. A push takes on only the declaration the pass read, checked again under the group write lock, so one removed during the pass is skipped rather than made a team.
 
 ### Audit
 

@@ -245,18 +245,40 @@ fn record_update(app: &AppState, c: &Caller, before: &ScimRoleGroup, after: &Sci
 /// None: no role group has this group's name or `externalId`, so it is a team. A role
 /// group the IdP has already is a 409, as for teams.
 pub(super) async fn create(app: &AppState, a: &Auth, c: &Caller, base: &str, d: &groups::Doc) -> ScimRes<Option<Response>> {
-    let tenant = c.token.tenant.as_str();
+    match waiting_for(app, &c.token.tenant, d)? {
+        Some(g) => adopt(app, a, c, base, &g, d).await.map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The waiting declaration a `POST /Groups` of `d` takes on, if any.
+fn waiting_for(app: &AppState, tenant: &str, d: &groups::Doc) -> ScimRes<Option<ScimRoleGroup>> {
     let by_ext = d.external_id.as_deref().and_then(|x| app.db.scim_role_group_find(tenant, Some(x), None));
     let by_name = app.db.scim_role_group_find(tenant, None, Some(&d.display_name));
-    let waiting = match (by_ext, by_name) {
-        (Some(g), _) if g.provisioned_at.is_none() => g,
-        (Some(_), _) => return Err(uniqueness("A group with this externalId exists already")),
-        (None, Some(g)) if g.provisioned_at.is_none() && g.declared_external_id.is_none() => g,
-        (None, Some(_)) => return Err(uniqueness("A group with this displayName exists already")),
-        (None, None) => return Ok(None),
-    };
-    if team_has(app, tenant, Some(&d.display_name), None) {
-        return Err(uniqueness("A group with this displayName exists already"));
+    match (by_ext, by_name) {
+        (Some(g), _) if g.provisioned_at.is_none() => Ok(Some(g)),
+        (Some(_), _) => Err(uniqueness("A group with this externalId exists already")),
+        (None, Some(g)) if g.provisioned_at.is_none() && g.declared_external_id.is_none() => Ok(Some(g)),
+        (None, Some(_)) => Err(uniqueness("A group with this displayName exists already")),
+        (None, None) => Ok(None),
+    }
+}
+
+/// For the Google sync: `POST /Groups` of `d`, which must take on the waiting declaration
+/// `id`. If it has gone or changed since the sync read it, nothing is written: the push
+/// would otherwise make a team.
+pub(crate) async fn push_declared(app: &AppState, a: &Auth, c: &Caller, id: &str, d: &groups::Doc) -> ScimRes<Response> {
+    let _writes = a.scim.group_writes.lock().await;
+    match waiting_for(app, &c.token.tenant, d)? {
+        Some(g) if g.id == id => adopt(app, a, c, &base_url(&HeaderMap::new()), &g, d).await,
+        _ => Err(ScimError::new(StatusCode::CONFLICT, None, "The role group's declaration changed during the pass, so the group wasn't pushed. The next pass tries again.")),
+    }
+}
+
+async fn adopt(app: &AppState, a: &Auth, c: &Caller, base: &str, waiting: &ScimRoleGroup, d: &groups::Doc) -> ScimRes<Response> {
+    let tenant = c.token.tenant.as_str();
+    if team_has(app, tenant, Some(&d.display_name), d.external_id.as_deref()) {
+        return Err(uniqueness("A group with this displayName or externalId exists already"));
     }
     let new = d.members.clone().unwrap_or_default();
     check_new(app, c, &new)?;
@@ -267,13 +289,13 @@ pub(super) async fn create(app: &AppState, a: &Auth, c: &Caller, base: &str, d: 
         "tenant": tenant, "roleGroup": g.id, "externalId": g.external_id, "displayName": g.display_name, "role": role_ref(role.as_ref()), "declaredBy": g.created_by,
     })));
     let moved = change_members(app, a, c, &g, &[], &new).await;
-    record_update(app, c, &waiting, &g, &moved);
+    record_update(app, c, waiting, &g, &moved);
     let body = resource(app, base, &app.db.scim_role_group(&g.id).unwrap_or(g), true);
     let mut r = scim_json(StatusCode::CREATED, body.clone());
     if let Some(Ok(at)) = body["meta"]["location"].as_str().map(HeaderValue::from_str) {
         r.headers_mut().insert(header::LOCATION, at);
     }
-    Ok(Some(r))
+    Ok(r)
 }
 
 /// Saves a PUT's or PATCH's attributes and members. `externalId` can be set once.
@@ -350,7 +372,8 @@ fn need(app: &AppState, id: &str) -> Res<ScimRoleGroup> {
 fn view(app: &AppState, g: &ScimRoleGroup) -> Value {
     let role = app.db.custom_role(&g.role_id);
     json!({
-        "id": g.id, "tenant": g.tenant, "displayName": g.display_name, "externalId": g.external_id, "declaredExternalId": g.declared_external_id,
+        "id": g.id, "tenant": g.tenant, "displayName": g.display_name, "externalId": g.external_id,
+        "declaredDisplayName": g.declared_display_name, "declaredExternalId": g.declared_external_id,
         "role": role_ref(role.as_ref()), "applies": role.as_ref().map_or(vec![], |r| r.perms().names()),
         "state": if g.provisioned_at.is_some() { "pushed" } else { "waiting" }, "pushedAt": g.provisioned_at,
         "members": app.db.scim_role_group_members(&g.tenant, &g.id).len(), "grants": app.db.scim_role_group_grants(&g.id).len(),
@@ -478,17 +501,20 @@ pub async fn update_api(State(app): State<AppState>, Extension(a): Extension<Arc
     if before.role_id == role.id {
         return Ok(Json(view(&app, &before)));
     }
+    // The new role is saved, and checked, first: a role edited or deleted meanwhile leaves
+    // every grant as it was. Taking away goes by the old role, which `before` holds.
+    let g = app.db.set_scim_role_group_role(&before.id, &role.id).map_err(|e| match e {
+        ScimRoleGroupError::Reaches(reach) => refused(&app, &by, "reaches_admins", json!({ "role": { "id": role.id, "name": role.name }, "permissions": reach }), reaches_msg(&role, &reach)),
+        ScimRoleGroupError::Gone => not_found("Role group or role"),
+        e => ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")),
+    })?;
+    let role = app.db.custom_role(&role.id).unwrap_or(role);
     let mut revoked = Vec::new();
     for h in app.db.scim_role_group_grants(&before.id) {
         if take_away(&app, &by, &before, &h.user_id, ROLE_CHANGED).await {
             revoked.push(h.user_id);
         }
     }
-    let g = app.db.set_scim_role_group_role(&before.id, &role.id).map_err(|e| match e {
-        ScimRoleGroupError::Reaches(reach) => refused(&app, &by, "reaches_admins", json!({ "role": { "id": role.id, "name": role.name }, "permissions": reach }), reaches_msg(&role, &reach)),
-        ScimRoleGroupError::Gone => not_found("Role group"),
-        e => ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")),
-    })?;
     let (mut granted, mut skips) = (Vec::new(), Vec::new());
     if g.provisioned_at.is_some() {
         for u in app.db.scim_role_group_members(&g.tenant, &g.id) {

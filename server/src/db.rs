@@ -1856,6 +1856,8 @@ pub struct ScimRoleGroup {
     pub id: String,
     pub tenant: String,
     pub display_name: String,
+    /// What the admin declared, given back when the IdP deletes the group.
+    pub declared_display_name: String,
     /// The IdP's, once it pushed the group; until then the declared one, if any.
     pub external_id: Option<String>,
     /// What the admin declared: the IdP's group must carry it to be taken on.
@@ -1873,6 +1875,7 @@ fn scim_role_group_row(r: &Row) -> rusqlite::Result<ScimRoleGroup> {
         id: r.get("id")?,
         tenant: r.get("tenant")?,
         display_name: r.get("display_name")?,
+        declared_display_name: r.get("declared_display_name")?,
         external_id: r.get("external_id")?,
         declared_external_id: r.get("declared_external_id")?,
         role_id: r.get("role_id")?,
@@ -2179,6 +2182,7 @@ fn migrate_scim_role_groups(c: &Connection, _fresh: bool) -> rusqlite::Result<()
           id TEXT PRIMARY KEY,
           tenant TEXT NOT NULL,
           display_name TEXT NOT NULL COLLATE NOCASE,
+          declared_display_name TEXT NOT NULL,
           external_id TEXT,
           declared_external_id TEXT,
           role_id TEXT NOT NULL REFERENCES roles(id),
@@ -5582,7 +5586,7 @@ impl Db {
             return Err(ScimRoleGroupError::Reaches(reach));
         }
         tx.execute(
-            "INSERT INTO scim_role_groups (id, tenant, display_name, external_id, declared_external_id, role_id, created_at, created_by, updated_at) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?6)",
+            "INSERT INTO scim_role_groups (id, tenant, display_name, declared_display_name, external_id, declared_external_id, role_id, created_at, created_by, updated_at) VALUES (?1, ?2, ?3, ?3, ?4, ?4, ?5, ?6, ?7, ?6)",
             params![id, tenant, display_name, external_id, role_id, at, by],
         )
         .map_err(scim_role_group_error)?;
@@ -5607,12 +5611,22 @@ impl Db {
     }
 
     /// The IdP deleted it: it waits again, with what was declared and nobody in it. What
-    /// it gave must have been taken away first.
+    /// it gave must have been taken away first. Its declared name comes back unless another
+    /// role group of the tenant has taken it since the IdP renamed this one.
     pub fn reset_scim_role_group(&self, id: &str) -> bool {
         let c = self.c();
         let Ok(tx) = c.unchecked_transaction() else { return false };
         let ok = tx.execute("DELETE FROM scim_role_group_members WHERE group_id = ?", [id]).is_ok()
-            && tx.execute("UPDATE scim_role_groups SET provisioned_at = NULL, external_id = declared_external_id, updated_at = ?1 WHERE id = ?2", params![now(), id]).unwrap_or(0) == 1;
+            && tx
+                .execute(
+                    "UPDATE scim_role_groups SET provisioned_at = NULL, external_id = declared_external_id, updated_at = ?1,
+                       display_name = CASE WHEN EXISTS (SELECT 1 FROM scim_role_groups o WHERE o.tenant = scim_role_groups.tenant AND o.id != scim_role_groups.id AND o.display_name = scim_role_groups.declared_display_name)
+                         THEN display_name ELSE declared_display_name END
+                     WHERE id = ?2",
+                    params![now(), id],
+                )
+                .unwrap_or(0)
+                == 1;
         ok && tx.commit().is_ok()
     }
 

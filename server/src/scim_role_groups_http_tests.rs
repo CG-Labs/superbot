@@ -283,6 +283,33 @@ async fn an_idp_delete_puts_the_declaration_back_to_waiting() {
 }
 
 #[tokio::test]
+async fn a_role_group_never_shares_a_teams_id_and_a_reset_restores_its_declared_name() {
+    let (port, app, admin) = serve(true).await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "entra" })).await;
+    let ivy = person(port, &t, "ivy@example.com").await;
+    let (code, _, _) = scim(port, &t, "POST", GROUPS, group_body("Eng", Some("x1"), &[&ivy])).await;
+    assert_eq!(code, 201);
+    let audit = role(port, &admin, "Auditor", "member", &["audit.view"]).await;
+    let gid = declared(port, &admin, "entra", "Auditors", &audit).await;
+    let (code, _, v) = scim(port, &t, "POST", GROUPS, group_body("Auditors", Some("x1"), &[&ivy])).await;
+    assert_eq!(code, 409, "Eng has that externalId: {v}");
+    assert_eq!(app.db.scim_role_group(&gid).unwrap().provisioned_at, None, "still waiting");
+    let (code, _, _) = scim(port, &t, "POST", GROUPS, group_body("Auditors", Some("x2"), &[&ivy])).await;
+    assert_eq!(code, 201);
+    assert_eq!(role_of(&app, &ivy), Some(audit.clone()));
+
+    // Entra renames it, then deletes it: the declaration waits under the name declared.
+    let rename = json!({ "schemas": [PATCH_OP], "Operations": [{ "op": "replace", "path": "displayName", "value": "Audit team" }] });
+    assert_eq!(scim(port, &t, "PATCH", &format!("{GROUPS}/{gid}"), rename).await.0, 204);
+    assert_eq!(scim(port, &t, "DELETE", &format!("{GROUPS}/{gid}"), Value::Null).await.0, 204);
+    let (_, v) = json_call(port, "GET", &format!("{ROLE_GROUPS}/{gid}"), &admin, "").await;
+    assert_eq!((v["state"].as_str(), v["displayName"].as_str(), v["externalId"].clone()), (Some("waiting"), Some("Auditors"), Value::Null), "{v}");
+    let (code, _, g) = scim(port, &t, "POST", GROUPS, group_body("Auditors", Some("x3"), &[&ivy])).await;
+    assert_eq!((code, g["id"].as_str()), (201, Some(gid.as_str())), "pushed again by its declared name, it's the role group: {g}");
+    assert_eq!(app.db.teams().len(), 1);
+}
+
+#[tokio::test]
 async fn role_groups_skip_admins_and_hold_their_role_still() {
     let (port, app, admin) = serve(true).await;
     let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
