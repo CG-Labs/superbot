@@ -36,6 +36,7 @@ Acme (corp): ready
   Encrypted assertions:     off
   Signs AuthnRequests:      no
   Single logout:            yes
+  IdP-initiated sign-in:    refused (start from SuperBot)
   IdP metadata from url (https://acme.okta.example/app/exk1abc/sso/saml/metadata):
     Sign-in URL: https://acme.okta.example/app/acme_superbot_1/exk1abc/sso/saml
     Logout URL:  https://acme.okta.example/app/exk1abc/slo/saml
@@ -71,13 +72,14 @@ Whatever the IdP:
 4. **Show Advanced Settings**: **Response** Signed, **Assertion Signature** Signed, **Signature Algorithm** RSA-SHA256, **Assertion Encryption** Unencrypted (or Encrypted, [below](#encrypted-assertions)).
 5. **Attribute Statements**: `email` → `user.email`, `displayName` → `user.displayName`.
 6. **Assignments**: only the people or groups who should use SuperBot.
+7. The app's tile on the Okta dashboard posts an unsolicited response, which SuperBot refuses by default: see [app tiles](#idp-initiated-sign-in-app-tiles).
 
 On the app's **Sign On** tab, the **Metadata URL** is `SSO_CORP_IDP_METADATA_URL` and the **Issuer** (`http://www.okta.com/exk…`) is `SSO_CORP_IDP_ENTITY_ID`.
 
 ### Microsoft Entra ID
 
 1. **Entra admin center → Enterprise applications → New application → Create your own application**, named SuperBot, **Integrate any other application you don't find in the gallery (Non-gallery)**.
-2. **Single sign-on → SAML → Basic SAML Configuration**: **Identifier (Entity ID)** the SP entity ID, **Reply URL (Assertion Consumer Service URL)** the ACS URL. Leave the sign-on and relay state URLs empty; the **Logout Url** is the SLO URL if you want [single logout](#single-logout).
+2. **Single sign-on → SAML → Basic SAML Configuration**: **Identifier (Entity ID)** the SP entity ID, **Reply URL (Assertion Consumer Service URL)** the ACS URL. Set **Sign on URL** to `https://superbot.example.com/api/auth/sso/corp/start`, so the My Apps tile starts the sign-in at SuperBot ([app tiles](#idp-initiated-sign-in-app-tiles)), and leave **Relay State** empty. The **Logout Url** is the SLO URL if you want [single logout](#single-logout).
 3. **Attributes & Claims → Unique User Identifier (Name ID)**: **Name identifier format** Persistent, **Source attribute** `user.objectid`. The default (`user.userprincipalname`) can change and move to someone else.
 4. Keep the default claims: Entra sends the email as `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress` (from `user.mail`) and the name as `http://schemas.microsoft.com/identity/claims/displayname`, which SuperBot reads without settings.
 5. **SAML Certificates**: **Signing Option** Sign SAML assertion (or Sign SAML response and assertion), **Signing Algorithm** SHA-256. Leave **Token encryption** off: Entra ID encrypts with AES-CBC, which SuperBot refuses.
@@ -139,6 +141,26 @@ botctl sso role unmap <id>                             # takes the role from all
 - The role also goes when the mapping is removed or the person's identity at the provider is unlinked. Making a mapping gives nothing until people sign in again. To end a role at once for someone who left the group, take it away by hand or use [SCIM group roles](scim.md).
 - Grants and removals are audited as `role.assigned` and `role.unassigned` with `via` = `saml`. Mapping changes are `sso.saml_role_mapped` and `sso.saml_role_unmapped`.
 
+## IdP-initiated sign-in (app tiles)
+
+A tile on the IdP's portal (the Okta dashboard, Microsoft My Apps, the OneLogin portal) usually posts a signed response straight to SuperBot without SuperBot asking for one. Such an *unsolicited* response isn't tied to the browser it arrives in, so accepting it as a sign-in would let anyone with an account at your IdP sign someone else's browser in as themselves (login CSRF). SuperBot never does that ([ADR 0175](../adr/0175-saml-idp-initiated-sign-in-restarted.md)). By default the tile shows "That sign-in expired". Make tiles work in one of two ways.
+
+**At the IdP: point the tile at SuperBot's start URL.** No setting needed; the tile then does what the sign-in button does.
+
+- **Entra ID**: **Basic SAML Configuration → Sign on URL**: `https://superbot.example.com/api/auth/sso/corp/start`.
+- **Okta**: on the SAML app, **General → App Settings**, untick **Display application icon to users**. Then add a **Bookmark App** from the catalog with that URL, assigned to the same people.
+- **OneLogin** and others: if the app can start the sign-in at the SP (a login URL, or "SAML initiator: Service Provider"), use that URL.
+
+**At SuperBot: restart the sign-in.**
+
+```bash
+SSO_CORP_IDP_INITIATED=restart
+```
+
+An unsolicited response is checked as fully as any other: the IdP's signature, issuer, audience, ACS URL, time, NameID and encryption. It must answer no request (no `InResponseTo`). Then its assertion is spent, botd audits `auth.saml_idp_initiated` with the subject the IdP named, and the browser goes to the start URL. The IdP already has a session, so it answers at once, and that answer signs the person in like any other sign-in. Nothing from the tile's response is used for the session, and its `RelayState` is ignored, so people land where any sign-in lands.
+
+If the IdP answers SuperBot's request with another unsolicited response, it ignores AuthnRequests. Restarting again would loop, so the sign-in fails with `idp_initiated_loop` in the audit log. Fix the app at the IdP so it takes SP-initiated sign-ins. `botctl sso saml corp` shows the setting.
+
 ## All settings
 
 `<ID>` is the provider id in capitals.
@@ -165,6 +187,7 @@ botctl sso role unmap <id>                             # takes the role from all
 | `SSO_<ID>_SIGNED_METADATA` | `require` with the file, else `off` | `require`: refuse unsigned metadata; `allow`: take it unchecked. Badly signed metadata is refused either way. |
 | `SSO_<ID>_GROUPS_ATTRIBUTE` | | The assertion attribute with the person's groups ([above](#groups)). No default: without it, groups aren't read. |
 | `SSO_<ID>_REQUIRED_GROUPS` | | Only people in one of these groups sign in, comma separated (exact). Needs `GROUPS_ATTRIBUTE`. |
+| `SSO_<ID>_IDP_INITIATED` | `off` | `restart`: an unsolicited response from an IdP's app tile starts an SP-initiated sign-in ([above](#idp-initiated-sign-in-app-tiles)). `off` refuses it. |
 
 The bridge's settings (`CLIENT_ID`, `IDP_ALIAS`, `SCOPES`, `*_CLAIM`) are refused on a native provider, and the native ones on a bridge provider, so a provider is never half of each. There is no client secret.
 
@@ -231,7 +254,7 @@ SuperBot doesn't ask single sign-on sign-ins for its own second factor: the IdP'
 
 ## Troubleshooting
 
-Every refused sign-in is in the audit log with a reason (`botctl audit --action auth.login_failed`, `idp` = `saml`). Failures nobody vouched for, such as bad signatures, are logged at most once a minute per address, with a count of those skipped. People see a short message on the sign-in page.
+Every refused sign-in is in the audit log with a reason (`botctl audit --action auth.login_failed`, `idp` = `saml`; `idpInitiated` is true for posts from an app tile). Failures nobody vouched for, such as bad signatures, are logged at most once a minute per address, with a count of those skipped. People see a short message on the sign-in page.
 
 | Reason | Fix |
 |--------|-----|
@@ -249,7 +272,8 @@ Every refused sign-in is in the audit log with a reason (`botctl audit --action 
 | `wrong_audience` | The IdP's audience (entity ID) isn't the SP entity ID botctl shows. |
 | `wrong_recipient`, `wrong_destination` | The IdP's ACS (reply) URL isn't the one botctl shows, often because `SSO_PUBLIC_URL` differs from the address people use. |
 | `wrong_issuer` | `SSO_<ID>_IDP_ENTITY_ID` isn't the IdP's entity ID. |
-| `in_response_to_mismatch`, `unknown_state` | Not an answer to a sign-in this browser started: IdP-initiated sign-in (from the IdP's app tile) isn't supported; start from SuperBot. Or the sign-in took over 10 minutes. |
+| `in_response_to_mismatch`, `unknown_state` | Not an answer to a sign-in this browser started. Either it came from the IdP's app tile (see [app tiles](#idp-initiated-sign-in-app-tiles)), or the sign-in took over 10 minutes. |
+| `idp_initiated_loop` | With `IDP_INITIATED=restart`, the IdP answered SuperBot's request with another unsolicited response: it ignores AuthnRequests. Fix the app at the IdP, or point the tile at the start URL. |
 | `expired`, `not_yet_valid` | Clocks differ by more than two minutes: fix NTP. |
 | `replayed` | The same assertion was posted twice. |
 | `transient_subject`, `missing_subject` | Use a persistent NameID. |
