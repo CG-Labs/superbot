@@ -512,6 +512,8 @@ export interface CustomRole {
   teamMembers: number;
   /** Time-bound (ADR 0197): given only by hand, with an end at most this many days away. */
   maxDays?: number | null;
+  /** People may ask for it (ADR 0209). Only a time-bound role can be. */
+  requestable?: boolean;
   createdAt: number;
   createdBy: string | null;
   updatedAt: number;
@@ -654,6 +656,77 @@ export interface RoleDraft {
   permissions: string[];
   /** Null: no limit. */
   maxDays?: number | null;
+  /** People may ask for it (ADR 0209); needs `maxDays`. */
+  requestable?: boolean;
+}
+
+export type RoleRequestStatus = "pending" | "approved" | "denied" | "cancelled" | "lapsed";
+
+/** A request for a role (ADR 0209), for `hours` from when an admin approves it. */
+export interface RoleRequest {
+  id: string;
+  role: { id: string; name: string; maxDays: number | null; permissions: string[]; applies: string[] } | null;
+  scope: "org" | "team";
+  team: { id: string; name: string | null } | null;
+  user: { id: string; name: string; email: string | null } | null;
+  hours: number;
+  reason: string;
+  status: RoleRequestStatus;
+  createdAt: number;
+  /** When it lapses if nobody decides. */
+  expiresAt: number;
+  decidedAt: number | null;
+  decidedBy: { id: string; name?: string; email?: string | null } | null;
+  note: string | null;
+  /** When the role it gave ends. */
+  grantedUntil: number | null;
+  /** While pending: what they hold in its scope now. */
+  current?: CustomRoleRef | null;
+}
+
+/** Whether you may ask for a role in one scope, and why not. */
+export interface RequestOffer {
+  ok: boolean;
+  why: string | null;
+}
+
+/** A role you may request, from `GET /api/me/role-requests`. */
+export interface RequestableRole {
+  id: string;
+  name: string;
+  description: string;
+  base: RoleBase;
+  permissions: string[];
+  teamPermissions: string[];
+  maxDays: number;
+  maxHours: number;
+  org: RequestOffer;
+  /** Null when you're on no team. */
+  team: RequestOffer | null;
+}
+
+/** `GET /api/me/role-requests`. */
+export interface MyRoleRequests {
+  requestable: RequestableRole[];
+  team: { id: string; name: string } | null;
+  requests: RoleRequest[];
+  pendingDays: number;
+  maxPending: number;
+}
+
+/** `POST /api/me/role-requests`. */
+export interface RoleRequestDraft {
+  role: string;
+  scope: "org" | "team";
+  hours: number;
+  reason: string;
+}
+
+/** `GET /api/role-requests` (admins). */
+export interface RoleRequestsView {
+  requests: RoleRequest[];
+  pending: number;
+  pendingDays: number;
 }
 
 /** How a role is given by hand (ADR 0197): until when, and why, for the audit log. */

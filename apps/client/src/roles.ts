@@ -1,4 +1,4 @@
-import type { CustomRole, RoleBase, RoleDraft, RolesView } from "./types";
+import type { CustomRole, RoleBase, RoleDraft, RoleRequest, RolesView } from "./types";
 
 /** Names a custom role can't take, as the server refuses them (ADR 0123). */
 export const RESERVED_ROLE_NAMES = ["admin", "member", "readonly", "read-only", "owner", "bot", "none"];
@@ -23,7 +23,7 @@ export function emptyDraft(): RoleDraft {
 }
 
 export function draftOf(r: CustomRole): RoleDraft {
-  return { name: r.name, description: r.description, base: r.base, permissions: [...r.permissions], maxDays: r.maxDays ?? null };
+  return { name: r.name, description: r.description, base: r.base, permissions: [...r.permissions], maxDays: r.maxDays ?? null, requestable: !!r.requestable };
 }
 
 const HOUR = 60 * 60_000;
@@ -125,6 +125,7 @@ export function draftChanges(r: CustomRole, draft: RoleDraft): Partial<RoleDraft
   const same = draft.permissions.length === r.permissions.length && draft.permissions.every((p) => r.permissions.includes(p));
   if (!same || r.unknown.length > 0) out.permissions = draft.permissions;
   if (draft.maxDays !== undefined && draft.maxDays !== (r.maxDays ?? null)) out.maxDays = draft.maxDays;
+  if (draft.requestable !== undefined && draft.requestable !== !!r.requestable) out.requestable = draft.requestable;
   return Object.keys(out).length ? out : null;
 }
 
@@ -140,4 +141,59 @@ export function baseChangeWarning(r: CustomRole, draft: RoleDraft): string | nul
 export function holdersLabel(r: Pick<CustomRole, "users" | "teamMembers">): string {
   const parts = [r.users && `${r.users} ${r.users === 1 ? "person" : "people"}`, r.teamMembers && `${r.teamMembers} in a team`].filter(Boolean);
   return parts.length ? parts.join(" · ") : "Nobody has it";
+}
+
+/** How long a role can be asked for (ADR 0209), in hours. */
+export const REQUEST_HOURS = [1, 4, 8, 24, 72, 168, 720];
+
+/** "1 hour", "8 hours", "1 day", "3 days", "30 hours". */
+export function hoursLabel(hours: number): string {
+  if (hours % 24 === 0) return `${hours / 24} day${hours === 24 ? "" : "s"}`;
+  return `${hours} hour${hours === 1 ? "" : "s"}`;
+}
+
+/** The lengths a role can be asked for, within its limit. */
+export function requestChoices(maxHours: number): { value: string; label: string }[] {
+  return REQUEST_HOURS.filter((h) => h <= maxHours).map((h) => ({ value: String(h), label: hoursLabel(h) }));
+}
+
+/** What an admin can approve a request for: as asked, or shorter. */
+export function approveChoices(asked: number): { value: string; label: string }[] {
+  return [{ value: String(asked), label: `${hoursLabel(asked)} (as asked)` }, ...REQUEST_HOURS.filter((h) => h < asked).reverse().map((h) => ({ value: String(h), label: hoursLabel(h) }))];
+}
+
+/** Why the request can't be sent yet, or null. */
+export function requestDraftError(draft: { role: string; reason: string }): string | null {
+  if (!draft.role) return "Pick a role.";
+  const reason = draft.reason.trim();
+  if (!reason) return "Say why you need it.";
+  if ([...reason].length > 500) return "Reasons are at most 500 characters.";
+  return null;
+}
+
+/** Where a request is: "Waiting for an admin", "Approved · ends in 3 hours", "Denied: <note>", "Withdrawn", "Lapsed". */
+export function requestStatusLabel(q: Pick<RoleRequest, "status" | "grantedUntil" | "note" | "expiresAt">, now: number): string {
+  switch (q.status) {
+    case "pending": {
+      const days = Math.max(1, Math.ceil((q.expiresAt - now) / DAY));
+      return `Waiting for an admin · lapses in ${days} day${days === 1 ? "" : "s"}`;
+    }
+    case "approved": {
+      const ends = endsLabel(q.grantedUntil, now);
+      return ends ? `Approved · ${ends}` : "Approved";
+    }
+    case "denied":
+      return q.note ? `Denied: ${q.note}` : "Denied";
+    case "cancelled":
+      return "Withdrawn";
+    default:
+      return "Lapsed: nobody decided in time";
+  }
+}
+
+/** "Ada (ada@example.com) asks for On-call for 8 hours, in Ops". */
+export function requestSummary(q: Pick<RoleRequest, "user" | "role" | "hours" | "team">): string {
+  const who = q.user ? (q.user.name && q.user.email ? `${q.user.name} (${q.user.email})` : q.user.name || q.user.email || q.user.id) : "Someone";
+  const place = q.team ? `, in ${q.team.name ?? "their team"}` : ", across the server";
+  return `${who} asks for ${q.role?.name ?? "a role"} for ${hoursLabel(q.hours)}${place}`;
 }

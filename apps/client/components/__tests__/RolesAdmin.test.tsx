@@ -2,7 +2,7 @@ import React from "react";
 import { render, screen, userEvent, waitFor } from "@testing-library/react-native";
 import { RolesAdmin } from "../RolesAdmin";
 import type { SuperBotApi } from "../../src/api";
-import type { AdminUser, CustomRole, RolesView, Team } from "../../src/types";
+import type { AdminUser, CustomRole, RoleRequest, RolesView, Team } from "../../src/types";
 
 jest.mock("../../src/dialogs", () => ({ confirmAsync: jest.fn(async () => true) }));
 
@@ -61,6 +61,9 @@ function mockApi() {
     unassignRole: jest.fn(async () => {}),
     assignTeamRole: jest.fn(async () => ({ applies: ["users.manage"] })),
     unassignTeamRole: jest.fn(async () => {}),
+    roleRequests: jest.fn(async () => ({ requests: [] as RoleRequest[], pending: 0, pendingDays: 7 })),
+    approveRoleRequest: jest.fn(async () => ({})),
+    denyRoleRequest: jest.fn(async () => ({})),
   };
 }
 
@@ -211,5 +214,82 @@ describe("RolesAdmin: time-bound roles (ADR 0197)", () => {
     await u.clear(screen.getByLabelText("Most days it can be given for"));
     await u.press(screen.getByLabelText("Save"));
     await waitFor(() => expect(api.updateRole).toHaveBeenCalledWith("r1", { maxDays: null }));
+  });
+});
+
+describe("RolesAdmin: requests for roles (ADR 0209)", () => {
+  const NOW = Date.UTC(2026, 10, 23, 12);
+  beforeEach(() => jest.spyOn(Date, "now").mockReturnValue(NOW));
+  afterEach(() => jest.restoreAllMocks());
+
+  const request = (r: Partial<RoleRequest> = {}): RoleRequest => ({
+    id: "q1",
+    role: { id: "r1", name: "Support", maxDays: 1, permissions: ["users.manage"], applies: ["users.manage"] },
+    scope: "org",
+    team: null,
+    user: { id: "u3", name: "Cy", email: "cy@example.com" },
+    hours: 8,
+    reason: "Incident 42",
+    status: "pending",
+    createdAt: NOW,
+    expiresAt: NOW + 7 * 86_400_000,
+    decidedAt: null,
+    decidedBy: null,
+    note: null,
+    grantedUntil: null,
+    current: null,
+    ...r,
+  });
+
+  it("makes a time-bound role requestable, and never one with no limit", async () => {
+    const api = mockApi();
+    const u = userEvent.setup();
+    await show(api);
+    await u.press(await screen.findByLabelText("New role"));
+    await u.type(screen.getByLabelText("Role name"), "On-call");
+    expect(screen.getByRole("checkbox", { name: "People may request it" })).toBeDisabled();
+    await u.type(screen.getByLabelText("Most days it can be given for"), "1");
+    await u.press(screen.getByRole("checkbox", { name: "People may request it" }));
+    await u.press(screen.getByLabelText("Create role"));
+    expect(api.createRole).toHaveBeenCalledWith({ name: "On-call", description: "", base: "member", permissions: [], maxDays: 1, requestable: true });
+  });
+
+  it("stops a role being requestable when its limit is lifted", async () => {
+    const api = mockApi();
+    api.roles.mockResolvedValue({ ...VIEW, roles: [{ ...SUPPORT, maxDays: 7, requestable: true }] });
+    const u = userEvent.setup();
+    await show(api);
+    await u.press(await screen.findByLabelText("Role Support"));
+    expect(screen.getByRole("checkbox", { name: "People may request it" })).toBeChecked();
+    await u.clear(screen.getByLabelText("Most days it can be given for"));
+    await u.press(screen.getByLabelText("Save"));
+    await waitFor(() => expect(api.updateRole).toHaveBeenCalledWith("r1", { maxDays: null, requestable: false }));
+  });
+
+  it("approves a pending request for less than asked, or denies it with a note", async () => {
+    const api = mockApi();
+    api.roleRequests.mockResolvedValue({ requests: [request(), request({ id: "q2", user: { id: "u4", name: "Rex", email: "rex@example.com" }, team: { id: "t1", name: "Ops" }, scope: "team" })], pending: 2, pendingDays: 7 });
+    const u = userEvent.setup();
+    await show(api);
+    expect(await screen.findByText("Requests (2)")).toBeTruthy();
+    expect(screen.getByText("Cy (cy@example.com) asks for Support for 8 hours, across the server")).toBeTruthy();
+    expect(screen.getByText("Rex (rex@example.com) asks for Support for 8 hours, in Ops")).toBeTruthy();
+    expect(screen.getAllByText("“Incident 42”")).toHaveLength(2);
+    // As asked, or shorter: never longer.
+    expect(screen.queryByRole("radio", { name: "1 day" })).toBeNull();
+    await u.press(screen.getAllByRole("radio", { name: "4 hours" })[0]);
+    await u.press(screen.getByLabelText("Approve Cy's request"));
+    await waitFor(() => expect(api.approveRoleRequest).toHaveBeenCalledWith("q1", { hours: 4, note: undefined }));
+    await u.type(screen.getByLabelText("Note for Rex"), "Use the runbook");
+    await u.press(screen.getByLabelText("Deny Rex's request"));
+    await waitFor(() => expect(api.denyRoleRequest).toHaveBeenCalledWith("q2", "Use the runbook"));
+  });
+
+  it("leaves your own request to another admin", async () => {
+    const api = mockApi();
+    api.roleRequests.mockResolvedValue({ requests: [request({ user: { id: "me", name: "Me", email: "me@example.com" } })], pending: 1, pendingDays: 7 });
+    await show(api);
+    expect(await screen.findByText(/another admin decides it/)).toBeTruthy();
+    expect(screen.queryByLabelText("Approve Me's request")).toBeNull();
   });
 });

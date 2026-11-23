@@ -3,6 +3,7 @@ import { ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, Text, Text
 import type { SuperBotApi } from "../src/api";
 import { confirmAsync } from "../src/dialogs";
 import {
+  approveChoices,
   BASES,
   baseChangeWarning,
   defaultEnd,
@@ -18,11 +19,13 @@ import {
   MAX_DAYS_HINT,
   parseMaxDays,
   permissionLabel,
+  requestStatusLabel,
+  requestSummary,
   teamPermissions,
   togglePermission,
 } from "../src/roles";
 import { colors } from "../src/theme";
-import type { AdminUser, BuiltInRole, CustomRole, RoleDraft, RoleGiving, RolesView, Team } from "../src/types";
+import type { AdminUser, BuiltInRole, CustomRole, RoleDraft, RoleGiving, RoleRequest, RolesView, Team } from "../src/types";
 import { Chips } from "./Chips";
 
 interface Props {
@@ -125,7 +128,8 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
 
   const maxDays = parseMaxDays(limit);
   const invalid = draftError(view, draft, role?.id) ?? (maxDays === undefined ? MAX_DAYS_HINT : null);
-  const changes = role ? draftChanges(role, { ...draft, maxDays }) : null;
+  const requestable = !!maxDays && !!draft.requestable;
+  const changes = role ? draftChanges(role, { ...draft, maxDays, requestable }) : null;
   const effective = effectivePermissions(view, draft.base, draft.permissions);
   const inTeam = teamPermissions(view, draft.permissions);
 
@@ -137,7 +141,14 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
     void run(async () => {
       const saved = role
         ? await api.updateRole(role.id, changes ?? {})
-        : await api.createRole({ ...draft, name: draft.name.trim(), description: draft.description.trim(), ...(maxDays ? { maxDays } : {}) });
+        : await api.createRole({
+            name: draft.name.trim(),
+            description: draft.description.trim(),
+            base: draft.base,
+            permissions: draft.permissions,
+            ...(maxDays ? { maxDays } : {}),
+            ...(requestable ? { requestable } : {}),
+          });
       await onSaved(saved.id);
     });
   };
@@ -277,6 +288,22 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
             ? `Time-bound: given only by hand, for at most ${maxDays} day${maxDays === 1 ? "" : "s"} at a time, then it ends by itself. Never to SCIM or SAML groups or service accounts.`
             : "Blank: it can be given with no end. Set days to make it time-bound, for elevated access."}
         </Text>
+        <Pressable
+          style={[styles.perm, !maxDays && styles.disabled]}
+          disabled={busy || !maxDays}
+          onPress={() => setDraft({ ...draft, requestable: !draft.requestable })}
+          accessibilityRole="checkbox"
+          accessibilityState={{ checked: requestable, disabled: busy || !maxDays }}
+          accessibilityLabel="People may request it"
+        >
+          <Text style={[styles.check, requestable && styles.checkOn]}>{requestable ? "✓" : ""}</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.text}>People may request it</Text>
+            <Text style={styles.dim}>
+              {maxDays ? "Anyone it fits can ask for it, with a reason, from Settings. An admin approves each request; it ends by itself." : "Only a time-bound role can be requested. Set days first."}
+            </Text>
+          </View>
+        </Pressable>
       </Section>
 
       <Section title="Permissions">
@@ -432,6 +459,68 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
   );
 }
 
+/** One pending request: approve it for as long as asked or shorter, or deny it with a note. */
+function RequestRow({ api, q, meId, onDecided }: { api: SuperBotApi; q: RoleRequest; meId?: string | null; onDecided: () => Promise<void> }) {
+  const [hours, setHours] = useState(String(q.hours));
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const yours = !!meId && q.user?.id === meId;
+  const name = q.user ? personName(q.user) : "them";
+
+  const decide = async (approve: boolean) => {
+    const title = approve ? `Give ${q.role?.name ?? "the role"} to ${name}?` : `Deny ${name}'s request?`;
+    const body = approve ? "It starts now and ends by itself. The audit log keeps the request and your approval." : "They see your note. They can ask again.";
+    if (!(await confirmAsync(title, body, approve ? "Approve" : "Deny"))) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const why = note.trim() || undefined;
+      if (approve) await api.approveRoleRequest(q.id, { hours: Number(hours), note: why });
+      else await api.denyRoleRequest(q.id, why);
+      await onDecided();
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <View style={styles.request} accessibilityLabel={`Request from ${name}`}>
+      <Text style={styles.text}>{requestSummary(q)}</Text>
+      <Text style={styles.dim}>“{q.reason}”</Text>
+      <Text style={styles.faint}>
+        {q.current ? `Has ${q.current.name} now. ` : ""}
+        {q.role?.applies.length ? `Adds: ${q.role.applies.join(", ")}. ` : ""}
+        {requestStatusLabel(q, Date.now())}
+      </Text>
+      {error ? <Text style={styles.error}>{error}</Text> : null}
+      {yours ? (
+        <Text style={styles.faint}>Your own request: another admin decides it.</Text>
+      ) : (
+        <>
+          <Chips options={approveChoices(q.hours)} value={hours} onChange={setHours} disabled={busy} />
+          <TextInput
+            style={styles.input}
+            value={note}
+            onChangeText={setNote}
+            placeholder="Note (optional, they see it)"
+            placeholderTextColor={colors.textFaint}
+            maxLength={500}
+            editable={!busy}
+            accessibilityLabel={`Note for ${name}`}
+          />
+          <View style={styles.row}>
+            <Button label="Approve" a11y={`Approve ${name}'s request`} primary disabled={busy} onPress={() => void decide(true)} />
+            <Button label="Deny" a11y={`Deny ${name}'s request`} danger disabled={busy} onPress={() => void decide(false)} />
+          </View>
+        </>
+      )}
+    </View>
+  );
+}
+
 /** Custom roles (ADR 0123, 0132): build them from the fixed permissions, see what they add up to, and give them. */
 export function RolesAdmin({ api, meId, onBack }: Props) {
   const { width } = useWindowDimensions();
@@ -439,6 +528,15 @@ export function RolesAdmin({ api, meId, onBack }: Props) {
   const [view, setView] = useState<RolesView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [picked, setPicked] = useState<Picked>(null);
+  const [requests, setRequests] = useState<RoleRequest[]>([]);
+
+  const loadRequests = useCallback(async () => {
+    try {
+      setRequests((await api.roleRequests("pending")).requests);
+    } catch {
+      setRequests([]);
+    }
+  }, [api]);
 
   const load = useCallback(async () => {
     try {
@@ -447,7 +545,8 @@ export function RolesAdmin({ api, meId, onBack }: Props) {
     } catch (err) {
       setError(message(err));
     }
-  }, [api]);
+    await loadRequests();
+  }, [api, loadRequests]);
 
   useEffect(() => {
     void load();
@@ -490,6 +589,15 @@ export function RolesAdmin({ api, meId, onBack }: Props) {
           {!view && !error ? <ActivityIndicator color={colors.textDim} style={{ marginTop: 20 }} /> : null}
           {view ? (
             <ScrollView contentContainerStyle={{ gap: 4, paddingBottom: 24 }}>
+              {requests.length ? (
+                <>
+                  <Text style={styles.sectionTitle}>Requests ({requests.length})</Text>
+                  {requests.map((q) => (
+                    <RequestRow key={q.id} api={api} q={q} meId={meId} onDecided={load} />
+                  ))}
+                  <View style={{ height: 12 }} />
+                </>
+              ) : null}
               <Text style={styles.sectionTitle}>Built in</Text>
               {view.builtIn.map((r) => (
                 <Pressable
@@ -553,6 +661,7 @@ const styles = StyleSheet.create({
   detailPane: { flex: 1 },
   listRow: { padding: 12, borderRadius: 14, gap: 2 },
   selected: { backgroundColor: colors.bgActive },
+  request: { padding: 12, borderRadius: 14, gap: 6, borderWidth: 1, borderColor: colors.border },
   wrap: { gap: 16 },
   name: { color: colors.text, fontSize: 22, fontWeight: "600" },
   text: { color: colors.text },
