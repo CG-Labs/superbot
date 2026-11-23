@@ -32,7 +32,7 @@ async fn serve() -> Env {
     let mut cp = ControlPlane::for_tests(p);
     let e = cp.enroll_with(Enrollment::for_tests(9, mport, 7443).with_agent(AGENT.as_bytes()).with_hardening()).unwrap();
     cp.firewall_with(Settings { sources: Vec::new(), ssh: Vec::new() }).unwrap();
-    cp.team_network = Some(team_network::Settings { subnet: team_network::DEFAULT_SUBNET.into(), join: team_network::Join::NextBoot });
+    cp.team_network = Some(team_network::Settings { kind: team_network::Kind::Vpc, subnet: team_network::DEFAULT_SUBNET.into(), join: team_network::Join::NextBoot });
     let cp = Arc::new(cp);
     let held = cp.clone();
     let (port, app, owner, _) = crate::tests::serve_app_with(move |a| a.machines = cp).await;
@@ -343,7 +343,7 @@ async fn with_when_idle_a_machine_is_restarted_onto_its_teams_network_once_it_ru
         |e| e,
         |cp| {
             cp.firewall_with(Settings { sources: Vec::new(), ssh: Vec::new() }).unwrap();
-            cp.team_network = Some(team_network::Settings { subnet: team_network::DEFAULT_SUBNET.into(), join: team_network::Join::WhenIdle });
+            cp.team_network = Some(team_network::Settings { kind: team_network::Kind::Vpc, subnet: team_network::DEFAULT_SUBNET.into(), join: team_network::Join::WhenIdle });
         },
         |_| {},
     )

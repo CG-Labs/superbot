@@ -702,3 +702,83 @@ async fn a_host_says_its_cpus_load_memory_and_pool_space() {
     s.w().down = true;
     assert!(incus(&s).host_use().await.is_err());
 }
+
+#[tokio::test]
+async fn a_team_subnet_has_its_router_first_and_meets_nothing_eth0_reaches() {
+    assert_eq!(router_of("10.248.0.0/22").as_deref(), Some("10.248.0.1/22"));
+    assert_eq!(router_of("192.168.4.0/29").as_deref(), Some("192.168.4.1/29"));
+    assert_eq!(router_of("fd00::/64"), None, "IPv4 only");
+    assert_eq!(subnet_of("10.248.0.1/22").as_deref(), Some("10.248.0.0/22"));
+    assert_eq!(subnet_of("10.20.0.1/24").as_deref(), Some("10.20.0.0/24"));
+    assert!(overlap("10.248.0.0/22", "10.248.3.0/24") && !overlap("10.248.0.0/22", "10.248.4.0/24"));
+    assert!(!overlap("10.248.0.0/22", "fd00::/8"));
+
+    let standin = StandIn::start().await;
+    let s = standin.settings(Some(("10.9.0.5".parse().unwrap(), 8444)));
+    let make = |s: Settings| Incus::new(s, standin.credentials()).unwrap();
+    assert!(make(s.clone()).with_team_subnet("10.248.0.0/22").is_ok(), "apart from botd, the host and the private ranges' carve-outs");
+    let e = make(s.clone()).with_team_subnet("10.9.0.0/16").err().unwrap();
+    assert!(e.contains("meets 10.9.0.5, which containers reach botd"), "{e}");
+    let mut deny = s.clone();
+    deny.deny.push("10.248.2.0/24".into());
+    let e = make(deny).with_team_subnet("10.248.0.0/22").err().unwrap();
+    assert!(e.contains("meets 10.248.2.0/24"), "{e}");
+}
+
+#[tokio::test]
+async fn a_team_network_is_an_isolated_ovn_network_with_its_own_acl() {
+    let s = StandIn::start().await;
+    s.w().projects.insert("superbot".into(), json!({ "restricted": "true", "restricted.networks.access": "incusbr0" }));
+    let p = incus(&s).with_team_subnet("10.248.0.0/22").unwrap();
+    let n = p.ensure_team_network("superbot-team-0123456789ab-local", "local", "10.248.0.0/22").await.unwrap();
+    assert_eq!(
+        n,
+        TeamNetwork {
+            id: "superbot-team-0123456789ab-local".into(),
+            label: "superbot-team-0123456789ab-local".into(),
+            region: "local".into(),
+            subnet_id: "superbot-team-0123456789ab-local".into(),
+            subnet: "10.248.0.0/22".into(),
+            created: true,
+        }
+    );
+    assert_eq!(s.w().projects["superbot"]["restricted.networks.access"], "incusbr0,superbot-team-0123456789ab-local");
+    // Made once: asked again, the same, and the project and ACL aren't written again.
+    let again = p.ensure_team_network(&n.label, "local", "10.248.0.0/22").await.unwrap();
+    assert_eq!(again, TeamNetwork { created: false, ..n.clone() });
+    assert_eq!((s.calls("PUT", "/1.0/projects/").len(), s.calls("PUT", "/1.0/network-acls/").len()), (1, 0));
+    assert_eq!(p.team_networks("superbot-").await.unwrap(), [TeamNetwork { created: false, ..n.clone() }]);
+    assert!(p.team_networks("other-").await.unwrap().is_empty());
+
+    // Another subnet or region than asked for, or a network botd didn't make, is refused.
+    let e = p.ensure_team_network(&n.label, "local", "10.249.0.0/22").await.unwrap_err();
+    assert!(e.to_string().contains("not MACHINE_TEAM_NETWORK_SUBNET's 10.249.0.0/22"), "{e}");
+    let e = p.ensure_team_network(&n.label, "node2", "10.248.0.0/22").await.unwrap_err();
+    assert!(e.to_string().contains("is for local, not node2"), "{e}");
+    s.w().networks.insert("superbot-team-ffffffffffff-local".into(), json!({ "type": "ovn", "config": { "ipv4.address": "10.248.0.1/22" } }));
+    let e = p.ensure_team_network("superbot-team-ffffffffffff-local", "local", "10.248.0.0/22").await.unwrap_err();
+    assert!(e.to_string().contains("isn't an OVN network botd made for a team"), "{e}");
+
+    // A project with networks of its own, or no access list, is left alone.
+    s.w().projects.insert("superbot".into(), json!({ "restricted": "true", "features.networks": "true", "restricted.networks.access": "incusbr0" }));
+    p.ensure_team_network("superbot-team-aaaaaaaaaaaa-local", "local", "10.248.0.0/22").await.unwrap();
+    assert_eq!(s.w().projects["superbot"]["restricted.networks.access"], "incusbr0");
+
+    // Members: the NIC on it, plugged in and out of a running container; never eth0.
+    p.create_firewall("superbot-fw", &[], &[agent_rule()]).await.unwrap();
+    p.create(&CreateSpec { subnet_id: Some(n.subnet_id.clone()), ..spec("superbot-m1", "c1-m2-d20") }).await.unwrap();
+    p.create(&spec("superbot-m2", "c1-m2-d20")).await.unwrap();
+    let members = p.team_network_members(&n.id).await.unwrap();
+    assert_eq!(members, [NetworkMember { machine: "superbot-m1".into(), config: String::new(), interface: "eth1".into(), active: true }]);
+    let e = p.leave_team_network(&NetworkMember { interface: "eth0".into(), ..members[0].clone() }).await.unwrap_err();
+    assert!(e.to_string().contains("eth0 is the machine's own NIC"), "{e}");
+    p.leave_team_network(&members[0]).await.unwrap();
+    let i = s.instance("superbot-m1").unwrap();
+    assert!(i.body["devices"].get("eth1").is_none() && i.status == "Running", "{}", i.body["devices"]);
+    assert!(p.team_network_members(&n.id).await.unwrap().is_empty());
+    p.join_team_network("superbot-m2", &n).await.unwrap();
+    assert_eq!(s.instance("superbot-m2").unwrap().body["devices"]["eth1"], p.team_nic(&n.id));
+    p.join_team_network("superbot-m2", &n).await.unwrap();
+    assert_eq!(s.calls("PUT", "/1.0/instances/superbot-m2").len(), 1, "on it already: nothing asked");
+    assert!(p.team_network_hotplug());
+}

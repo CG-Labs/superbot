@@ -421,8 +421,8 @@ impl ControlPlane {
                 return Err(format!("MACHINE_FIREWALL=on needs the control plane: {NEEDS_IT}"));
             }
             firewall::egress_from_env(&var)?;
-            if team_network::Settings::from_env(&var)?.is_some() {
-                return Err(format!("MACHINE_TEAM_NETWORK=vpc needs the control plane: {NEEDS_IT}"));
+            if let Some(n) = team_network::Settings::from_env(&var)? {
+                return Err(format!("MACHINE_TEAM_NETWORK={} needs the control plane: {NEEDS_IT}", n.kind.as_str()));
             }
             return Ok(ControlPlane::default());
         };
@@ -432,6 +432,9 @@ impl ControlPlane {
         }
         crate::secrets::redact::register(&token);
         let team_network = team_network::Settings::from_env(&var)?;
+        if team_network.as_ref().is_some_and(|n| n.kind != team_network::Kind::Vpc) {
+            return Err("MACHINE_TEAM_NETWORK=ovn is for MACHINE_PROVIDER=incus; on Linode a team's network is a VPC (MACHINE_TEAM_NETWORK=vpc)".into());
+        }
         if team_network.is_some() && firewall::Settings::from_env(&var)?.is_none() {
             return Err("MACHINE_TEAM_NETWORK=vpc needs MACHINE_FIREWALL=on: the firewall's inbound drops are what keep teammates' machines apart on their network".into());
         }
@@ -475,10 +478,14 @@ impl ControlPlane {
         if !firewall::egress_from_env(var)? {
             return Err("MACHINE_FIREWALL_EGRESS=off can't be kept with MACHINE_PROVIDER=incus: the network ACL always drops containers' traffic to private addresses and INCUS_EGRESS_DENY".into());
         }
-        if team_network::Settings::from_env(var)?.is_some() {
-            return Err("MACHINE_TEAM_NETWORK=vpc is for Linode; with MACHINE_PROVIDER=incus there are no team networks yet, and containers are kept apart by port isolation and the network ACL".into());
+        let team_network = team_network::Settings::from_env(var)?;
+        if team_network.as_ref().is_some_and(|n| n.kind != team_network::Kind::Ovn) {
+            return Err("MACHINE_TEAM_NETWORK=vpc is for Linode; with MACHINE_PROVIDER=incus a team's network is an OVN network (MACHINE_TEAM_NETWORK=ovn)".into());
         }
-        let p = incus::fleet::Fleet::from_env(store, var)?;
+        let mut p = incus::fleet::Fleet::from_env(store, var)?;
+        if let Some(n) = &team_network {
+            p = p.with_team_subnet(&n.subnet)?;
+        }
         let mut tags: Vec<String> = Vec::new();
         for r in provider::Hosts::configured(&p).into_iter().filter_map(|h| h.region) {
             if !tags.contains(&r) {
@@ -486,6 +493,7 @@ impl ControlPlane {
             }
         }
         let mut cp = ControlPlane::configured(Arc::new(p), var)?;
+        cp.team_network = team_network;
         cp.regions = list(&var("MACHINE_REGIONS"));
         if tags.is_empty() {
             if cp.regions.is_empty() {
@@ -2277,14 +2285,23 @@ mod tests {
         let e = with(&certs, &[("INCUS_REGION", "gb-lon"), ("MACHINE_REGIONS", "gb-lon,de-fra-2")]).err().unwrap();
         assert!(e.contains("no Incus host is in \"de-fra-2\"; hosts are in gb-lon"), "{e}");
         assert!(with(&certs, &[("INCUS_REGION", "GB LON")]).err().unwrap().contains("INCUS_REGION: \"GB LON\" isn't a region id"));
+        let cp = with(&certs, &[("MACHINE_TEAM_NETWORK", "ovn")]).unwrap();
+        assert_eq!(cp.team_network.as_ref().map(|s| (s.kind, s.subnet.as_str())), Some((team_network::Kind::Ovn, team_network::DEFAULT_SUBNET)));
+        assert_eq!(cp.need().unwrap().settings()["teamNetwork"]["subnet"], team_network::DEFAULT_SUBNET);
+        assert!(cp.need().unwrap().team_network_hotplug(), "a container's NIC is plugged and unplugged as it runs");
 
         for (store, extra, want) in [
             (&certs, &[("MACHINE_FIREWALL", "")][..], "MACHINE_FIREWALL=on"),
             (&certs, &[("MACHINE_CONTROL_URL", ""), ("MACHINE_FIREWALL", "")][..], "MACHINE_CONTROL_URL"),
             // The network ACL always drops outbound to private addresses (ADR 0179).
             (&certs, &[("MACHINE_FIREWALL_EGRESS", "off")][..], "MACHINE_FIREWALL_EGRESS=off can't be kept"),
-            // No team networks on Incus yet (ADR 0189).
+            // On Incus a team's network is an OVN network (ADR 0212), whose subnet is
+            // apart from what containers reach or are kept off through eth0.
             (&certs, &[("MACHINE_TEAM_NETWORK", "vpc")][..], "MACHINE_TEAM_NETWORK=vpc is for Linode"),
+            (&certs, &[("MACHINE_TEAM_NETWORK", "ovn"), ("MACHINE_CONTROL_URL", "https://10.248.0.9:8444")][..], "meets 10.248.0.9, which containers reach botd"),
+            (&certs, &[("MACHINE_TEAM_NETWORK", "ovn"), ("INCUS_EGRESS_ALLOW", "10.248.1.20:443")][..], "meets 10.248.1.20"),
+            (&certs, &[("MACHINE_TEAM_NETWORK", "ovn"), ("INCUS_EGRESS_DENY", "10.248.2.0/24")][..], "meets 10.248.2.0/24, which containers are kept off"),
+            (&certs, &[("MACHINE_TEAM_NETWORK", "ovn"), ("INCUS_URL", "https://10.248.3.3:8443")][..], "meets 10.248.3.3/32"),
             (&certs, &[("INCUS_URL", "")][..], "INCUS_URL"),
             (&certs, &[("MACHINE_TIERS", "starter=g6-standard-1")][..], "isn't an Incus plan"),
             (&certs, &[("MACHINE_REGIONS", "Node 1")][..], "MACHINE_REGIONS"),
@@ -2555,6 +2572,8 @@ mod tests {
         let err = ControlPlane::from_env(&EnvStore::fixed(&[]), vars("", "", "vpc")).err().unwrap();
         assert!(err.contains("MACHINE_TEAM_NETWORK=vpc needs the control plane"), "{err}");
         let err = ControlPlane::from_env(&token, vars("on", "", "mesh")).err().unwrap();
-        assert!(err.contains("off or vpc"), "{err}");
+        assert!(err.contains("off, vpc or ovn"), "{err}");
+        let err = ControlPlane::from_env(&token, vars("on", "", "ovn")).err().unwrap();
+        assert!(err.contains("MACHINE_TEAM_NETWORK=ovn is for MACHINE_PROVIDER=incus"), "{err}");
     }
 }
