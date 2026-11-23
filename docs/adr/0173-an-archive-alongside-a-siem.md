@@ -45,4 +45,4 @@ Naming option 1, count option 1, running option 1.
 - Both sinks get the same lines, so an event's `host` and `id` match across them, and the archive can be held to what the SIEM saw.
 - A long outage at either sink grows the table for both, as with one sink: alert on each sink's `pending`.
 - The startup summary's `auditExport` is now a list of `{kind, sink}`, or null when off.
-- Later: more than one SIEM (per-sink headers), per-sink start positions, and a daily automatic check of new archive objects.
+- Later: more than one SIEM (per-sink headers), per-sink start positions, and a daily automatic check of new archive objects. The daily check came in [ADR 0183](0183-daily-check-of-new-archive-objects.md); several SIEMs, with their own headers and starts, in [ADR 0191](0191-several-siems-with-their-own-headers.md).

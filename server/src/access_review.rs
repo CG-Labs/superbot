@@ -5,7 +5,8 @@
 //! arm. Metadata only: never a token, code, secret or IP address. Service accounts are
 //! reviewed beside people: owner, roles, what their tokens can use today, Bot access,
 //! and each live token's scopes, expiry and last use.
-//! Design: docs/adr/0099-access-review-report.md, docs/adr/0165-service-accounts-in-access-reviews.md.
+//! Design: docs/adr/0099-access-review-report.md, docs/adr/0165-service-accounts-in-access-reviews.md,
+//! docs/adr/0188-service-accounts-off-their-team-in-access-reviews.md.
 
 use crate::acl::Viewer;
 use crate::db::{self, ServiceAccount, Session, User};
@@ -101,13 +102,15 @@ fn bot_view(b: &db::Bot, access: crate::acl::Access, of: &str, grant: Option<&cr
 }
 
 /// Why a reviewer should look at a service account twice. Codes; the app words them.
-fn service_flags(sa: &ServiceAccount, owner_active: bool, live: &[&db::ServiceToken], at: i64) -> Vec<&'static str> {
+fn service_flags(sa: &ServiceAccount, h: &crate::service_accounts::Holdings, live: &[&db::ServiceToken], at: i64) -> Vec<&'static str> {
     let mut out = Vec::new();
     if !sa.user.active() {
         out.push("disabled");
     }
-    if !owner_active {
+    if !h.owner_active {
         out.push("owner_inactive");
+    } else if h.owner_on_team == Some(false) {
+        out.push("owner_off_team");
     }
     if live.iter().any(|t| t.scopes.is_none()) {
         out.push("unscoped_token");
@@ -143,16 +146,17 @@ fn service(app: &App, sa: &ServiceAccount, at: i64, names: &HashMap<&str, &str>,
         "team": team,
         "owner": h.owner.as_ref().map(|o| json!({ "id": o.id, "name": o.name, "email": o.email, "status": o.status })),
         "ownerActive": h.owner_active,
+        "ownerOnTeam": h.owner_on_team,
         "permissions": h.org.names(), "teamPermissions": h.in_team.names(), "effective": h.effective.names(),
         "botAccess": { "all": false, "bots": bots },
         "tokens": live.iter().map(|t| json!({
             "id": t.id, "name": t.name, "preview": crate::service_accounts::token_preview(t), "scopes": t.scopes,
             "createdAt": t.created_at, "expiresAt": t.expires_at, "lastUsedAt": t.last_used_at, "replaced": t.rotated_to.is_some(),
         })).collect::<Vec<_>>(),
-        "flags": service_flags(sa, h.owner_active, &live, at),
+        "flags": service_flags(sa, &h, &live, at),
     });
     // Not when a token was last used, so a script calling during the review changes nothing.
-    let stable = json!([
+    let mut stable = json!([
         u.id, u.role, u.status,
         h.org_role.as_ref().map(|r| json!([r.id, r.perms().names()])),
         h.team.as_ref().map(|t| json!([t.id, h.team_role.as_ref().map(|r| json!([r.id, r.perms().in_team().names()]))])),
@@ -160,6 +164,12 @@ fn service(app: &App, sa: &ServiceAccount, at: i64, names: &HashMap<&str, &str>,
         bots.iter().map(|b| json!([b["id"], b["access"], b["grant"]])).collect::<Vec<_>>(),
         live.iter().map(|t| json!([t.id, t.scopes, t.expires_at, t.rotated_to.is_some()])).collect::<Vec<_>>(),
     ]);
+    // Only while it acts in no team, so accounts whose owner is on it keep their digests.
+    if h.owner_on_team == Some(false) {
+        if let Some(a) = stable.as_array_mut() {
+            a.push(json!({ "ownerOnTeam": false }));
+        }
+    }
     (view, stable)
 }
 
@@ -249,6 +259,12 @@ impl Report {
     /// Each live service account as the report shows it, by name.
     pub fn service_accounts(&self) -> impl Iterator<Item = &Value> {
         self.services.iter().map(|s| &s.0)
+    }
+
+    /// What the digest covers for service account `id`.
+    #[cfg(test)]
+    pub(crate) fn service_held(&self, id: &str) -> Option<&Value> {
+        self.services.iter().find(|s| s.0["id"] == id).map(|s| &s.1)
     }
 
     /// Counts a reviewer looks at first, also kept on the sign-off.
