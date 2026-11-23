@@ -4,9 +4,9 @@
 //! admin as an `access_review.completed` audit event. Admins only, by RBAC's default
 //! arm. Metadata only: never a token, code, secret or IP address. Service accounts are
 //! reviewed beside people: owner, roles, what their tokens can use today, Bot access,
-//! and each live token's scopes, expiry and last use.
+//! and each live token's scopes, expiry and last use. A custom role that ends says when.
 //! Design: docs/adr/0099-access-review-report.md, docs/adr/0165-service-accounts-in-access-reviews.md,
-//! docs/adr/0188-service-accounts-off-their-team-in-access-reviews.md.
+//! docs/adr/0188-service-accounts-off-their-team-in-access-reviews.md, docs/adr/0197-time-bound-custom-roles.md.
 
 use crate::acl::Viewer;
 use crate::db::{self, ServiceAccount, Session, User};
@@ -173,13 +173,15 @@ fn service(app: &App, sa: &ServiceAccount, at: i64, names: &HashMap<&str, &str>,
     (view, stable)
 }
 
-/// A role cell: the built-in role, and a custom role with its permissions when there is one.
+/// A role cell: the built-in role, and a custom role with its permissions when there is
+/// one, and its end when it has one (ADR 0197).
 fn with_custom(p: &Value) -> String {
     let role = p["role"].as_str().unwrap_or_default();
     match p["customRole"]["name"].as_str() {
         Some(name) => {
             let perms: Vec<&str> = p["customRole"]["permissions"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
-            format!("{role}; {name}: {}", perms.join(" "))
+            let ends = p["customRole"]["expiresAt"].as_i64().map(|t| format!(" until {}", rfc3339(t))).unwrap_or_default();
+            format!("{role}; {name}: {}{ends}", perms.join(" "))
         }
         None => role.to_string(),
     }
@@ -207,7 +209,14 @@ fn person(app: &App, cfg: &SessionConfig, u: &User, at: i64, names: &HashMap<&st
     // Custom roles (ADR 0123): across the server, and within their team.
     let custom = u.role_id.as_deref().and_then(|id| app.db.custom_role(id));
     let team_custom = member.as_ref().and_then(|m| m.role_id.as_deref()).and_then(|id| app.db.custom_role(id));
-    let role_view = |r: &crate::db::CustomRole, perms: crate::rbac::Perms| json!({ "id": r.id, "name": r.name, "permissions": perms.names() });
+    let ends = (u.role_expires_at, member.as_ref().and_then(|m| m.role_expires_at));
+    let role_view = |r: &crate::db::CustomRole, perms: crate::rbac::Perms, ends: Option<i64>| {
+        let mut v = json!({ "id": r.id, "name": r.name, "permissions": perms.names() });
+        if let Some(t) = ends {
+            v["expiresAt"] = json!(t);
+        }
+        v
+    };
     let mut view = json!({
         "id": u.id, "name": u.name, "email": u.email, "role": u.role, "status": u.status, "breakGlass": u.id == OPERATOR, "tier": u.tier,
         "createdAt": u.created_at,
@@ -224,10 +233,10 @@ fn person(app: &App, cfg: &SessionConfig, u: &User, at: i64, names: &HashMap<&st
         "sessions": browsers.iter().map(|s| session_view(s, cfg)).collect::<Vec<_>>(),
         "apiTokens": tokens.iter().map(|s| session_view(s, cfg)).collect::<Vec<_>>(),
         "machine": machine.as_ref().map(|m| json!({ "id": m.id, "provider": m.provider, "state": m.state.as_str(), "enrollment": m.enrollment, "assignedAt": m.assigned_at })),
-        "customRole": custom.as_ref().map(|r| role_view(r, r.perms())),
+        "customRole": custom.as_ref().map(|r| role_view(r, r.perms(), ends.0)),
     });
     if let Some(r) = &team_custom {
-        view["team"]["customRole"] = role_view(r, r.perms().in_team());
+        view["team"]["customRole"] = role_view(r, r.perms().in_team(), ends.1);
     }
     let ids = |list: &[&Session]| list.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
     let mut stable = json!([
@@ -245,6 +254,10 @@ fn person(app: &App, cfg: &SessionConfig, u: &User, at: i64, names: &HashMap<&st
         let held = |r: &Option<crate::db::CustomRole>, team: bool| r.as_ref().map(|r| json!([r.id, if team { r.perms().in_team() } else { r.perms() }.names()]));
         if let Some(a) = stable.as_array_mut() {
             a.push(json!([held(&custom, false), held(&team_custom, true)]));
+            // Only when one ends (ADR 0197), so held roles that don't keep their digests.
+            if ends.0.is_some() || ends.1.is_some() {
+                a.push(json!({ "ends": [ends.0, ends.1] }));
+            }
         }
     }
     Row { tenant: scim.map(|s| s.tenant), team, view, stable }

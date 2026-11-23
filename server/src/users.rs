@@ -329,7 +329,7 @@ pub fn user_view(u: &User) -> Value {
         "id": u.id, "email": u.email, "name": u.name, "role": u.role, "status": u.status,
         "breakGlass": u.id == OPERATOR, "idpIssuer": u.idp_issuer, "idpSubject": u.idp_subject,
         "createdAt": u.created_at, "updatedAt": u.updated_at, "lastLoginAt": u.last_login_at,
-        "tier": u.tier, "region": u.region, "erasedAt": u.erased_at, "erasedAs": u.erased_as, "roleId": u.role_id,
+        "tier": u.tier, "region": u.region, "erasedAt": u.erased_at, "erasedAs": u.erased_as, "roleId": u.role_id, "roleExpiresAt": u.role_expires_at,
     })
 }
 
@@ -356,7 +356,7 @@ fn admin_view(a: &Auth, u: &User, identities: &[db::Identity], pending: Option<&
     v["pendingCodes"] = pending.map_or(Value::Null, |(n, exp)| json!({ "count": n, "expiresAt": exp }));
     v["mfa"] = json!({ "enabled": mfa_since.is_some(), "enabledAt": mfa_since });
     if let Some(app) = &a.app {
-        v["customRole"] = crate::roles::summary(app, u.role_id.as_deref());
+        v["customRole"] = crate::roles::held(app, u.role_id.as_deref(), u.role_expires_at);
         v["permissions"] = json!(rbac::granted(Principal::User(u.role), app.db.user_perms(u)));
         v["plan"] = crate::tier_usage(app, &u.id);
         if a.machines.enabled() {
@@ -537,7 +537,7 @@ pub async fn me(Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Call
         "user": c.user.as_ref().map(user_view),
         "role": match c.principal { Principal::User(r) => json!(r), Principal::Bot => json!("bot") },
         "permissions": c.permissions(),
-        "customRole": a.app.as_ref().map_or(Value::Null, |app| crate::roles::summary(app, c.user.as_ref().and_then(|u| u.role_id.as_deref()))),
+        "customRole": a.app.as_ref().map_or(Value::Null, |app| c.user.as_ref().map_or(Value::Null, |u| crate::roles::held(app, u.role_id.as_deref(), u.role_expires_at))),
         "method": c.method,
         "session": c.session.as_ref().map(|s| session_view(s, &a.sessions)),
         "breakGlass": a.break_glass,

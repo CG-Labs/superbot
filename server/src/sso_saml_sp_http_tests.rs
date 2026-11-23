@@ -905,8 +905,8 @@ async fn required_groups_keep_out_anyone_in_none_of_them_before_just_in_time() {
 async fn only_admins_map_a_saml_group_and_only_to_a_safe_custom_role() {
     let sp = serve(&[("GROUPS_ATTRIBUTE", "groups")]).await;
     let (port, admin, id) = (sp.port, sp.admin.clone(), sp.id.clone());
-    sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None).unwrap();
-    sp.app.db.create_custom_role("Ops", "", Role::Member, &["bots.manage"], None).unwrap();
+    sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None, None).unwrap();
+    sp.app.db.create_custom_role("Ops", "", Role::Member, &["bots.manage"], None, None).unwrap();
     let map = async |body: Value| call(port, "POST", "/api/sso/role-mappings", &admin, &body.to_string()).await;
     for (body, code) in [
         (json!({ "provider": id, "group": "Admins", "role": "admin" }), 400),
@@ -950,7 +950,7 @@ async fn only_admins_map_a_saml_group_and_only_to_a_safe_custom_role() {
 
     // A provider that reads no groups has nothing to map.
     let plain = serve(&[]).await;
-    plain.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None).unwrap();
+    plain.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None, None).unwrap();
     let (code, e) = call(plain.port, "POST", "/api/sso/role-mappings", &plain.admin, &json!({ "provider": plain.id, "group": "Auditors", "role": "Auditor" }).to_string()).await;
     assert_eq!(code, 409, "{e}");
     assert!(e.contains("GROUPS_ATTRIBUTE"), "{e}");
@@ -960,7 +960,7 @@ async fn only_admins_map_a_saml_group_and_only_to_a_safe_custom_role() {
 async fn a_mapped_saml_group_gives_its_role_only_while_sign_ins_list_it() {
     let sp = serve(&[("GROUPS_ATTRIBUTE", "groups")]).await;
     let (port, admin, id) = (sp.port, sp.admin.clone(), sp.id.clone());
-    let auditor = sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None).unwrap();
+    let auditor = sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None, None).unwrap();
     let (code, m) = call(port, "POST", "/api/sso/role-mappings", &admin, &json!({ "provider": id, "group": "Auditors", "role": auditor.id }).to_string()).await;
     assert_eq!(code, 201, "{m}");
     let mid = serde_json::from_str::<Value>(&m).unwrap()["id"].as_str().unwrap().to_string();
@@ -1085,7 +1085,7 @@ async fn a_mapped_saml_group_gives_its_role_only_while_sign_ins_list_it() {
 async fn a_provider_that_stops_reading_groups_takes_back_what_its_groups_gave() {
     let sp = serve(&[]).await;
     let u = sp.link();
-    let auditor = sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None).unwrap();
+    let auditor = sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None, None).unwrap();
     // Mapped while it read groups, then restarted without.
     let m = sp.app.db.create_saml_role_mapping(&sp.id, "Auditors", &auditor.id, None).unwrap();
     assert!(sp.app.db.grant_saml_role(&m, &u.id));
@@ -1101,7 +1101,7 @@ async fn a_provider_that_stops_reading_groups_takes_back_what_its_groups_gave() 
 async fn a_change_by_hand_to_another_providers_grant_holds_against_this_ones_groups() {
     let sp = serve(&[("GROUPS_ATTRIBUTE", "groups")]).await;
     let u = sp.link();
-    let auditor = sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None).unwrap();
+    let auditor = sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None, None).unwrap();
     sp.app.db.create_saml_role_mapping(&sp.id, "Auditors", &auditor.id, None).unwrap();
     let theirs = sp.app.db.create_saml_role_mapping("other", "Auditors", &auditor.id, None).unwrap();
     assert!(sp.app.db.grant_saml_role(&theirs, &u.id));
@@ -1118,7 +1118,7 @@ async fn a_change_by_hand_to_another_providers_grant_holds_against_this_ones_gro
 async fn a_sign_in_refused_for_required_groups_still_takes_back_what_a_left_group_gave() {
     let sp = serve_with(&[("GROUPS_ATTRIBUTE", "groups"), ("REQUIRED_GROUPS", "SuperBot Users")], |a| a.limiter = users::Limiter::new(1000, 60_000)).await;
     let u = sp.link();
-    let auditor = sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None).unwrap();
+    let auditor = sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None, None).unwrap();
     sp.app.db.create_saml_role_mapping(&sp.id, "Auditors", &auditor.id, None).unwrap();
     let role_id = || sp.app.db.user(&u.id).unwrap().role_id;
 

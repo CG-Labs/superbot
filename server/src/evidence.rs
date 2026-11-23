@@ -377,7 +377,15 @@ pub struct Inputs {
 
 fn person(p: &Value) -> Value {
     let len = |k: &str| p[k].as_array().map_or(0, Vec::len);
-    let custom = |c: &Value| c.is_object().then(|| json!({ "id": c["id"], "permissions": c["permissions"] }));
+    let custom = |c: &Value| {
+        c.is_object().then(|| {
+            let mut v = json!({ "id": c["id"], "permissions": c["permissions"] });
+            if c["expiresAt"].is_i64() {
+                v["expiresAt"] = c["expiresAt"].clone();
+            }
+            v
+        })
+    };
     json!({
         "id": p["id"],
         "role": p["role"],

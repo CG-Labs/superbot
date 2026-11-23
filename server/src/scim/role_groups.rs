@@ -69,6 +69,7 @@ fn write_error(e: ScimRoleGroupError) -> ScimError {
         ScimRoleGroupError::ExternalId => uniqueness("Another group in this tenant has this externalId."),
         ScimRoleGroupError::Gone => missing("Group"),
         ScimRoleGroupError::Reaches(_) => server_error("The role group's role reaches admins"),
+        ScimRoleGroupError::TimeBound => server_error("The role group's role is time-bound"),
         ScimRoleGroupError::Db(e) => {
             crate::obs::log::log_warn!("scim: database error: {e}");
             server_error("Database error")
@@ -477,6 +478,7 @@ pub async fn create_api(State(app): State<AppState>, Extension(a): Extension<Arc
         ScimRoleGroupError::ExternalId => conflict(format!("Tenant {tenant} has a role group with this externalId already.")),
         ScimRoleGroupError::Reaches(reach) => refused(&app, &by, "reaches_admins", json!({ "role": { "id": role.id, "name": role.name }, "permissions": reach }), reaches_msg(&role, &reach)),
         ScimRoleGroupError::Gone => not_found("Role"),
+        ScimRoleGroupError::TimeBound => crate::roles::standing_refused(&role, "a SCIM role group"),
         ScimRoleGroupError::Db(e) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, e),
     })?;
     app.db.record(&by.event("scim.role_group_declared").target("scim_role_group", &g.id).details(json!({
@@ -518,6 +520,7 @@ pub async fn update_api(State(app): State<AppState>, Extension(a): Extension<Arc
     let g = app.db.set_scim_role_group_role(&before.id, &role.id).map_err(|e| match e {
         ScimRoleGroupError::Reaches(reach) => refused(&app, &by, "reaches_admins", json!({ "role": { "id": role.id, "name": role.name }, "permissions": reach }), reaches_msg(&role, &reach)),
         ScimRoleGroupError::Gone => not_found("Role group or role"),
+        ScimRoleGroupError::TimeBound => crate::roles::standing_refused(&role, "a SCIM role group"),
         e => ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")),
     })?;
     let role = app.db.custom_role(&role.id).unwrap_or(role);

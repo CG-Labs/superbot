@@ -1,11 +1,16 @@
 import {
   baseChangeWarning,
+  defaultEnd,
   draftChanges,
   draftError,
   draftOf,
   effectivePermissions,
   emptyDraft,
+  endChoices,
+  endsAt,
+  endsLabel,
   holdersLabel,
+  parseMaxDays,
   permissionLabel,
   teamPermissions,
   togglePermission,
@@ -113,5 +118,53 @@ describe("custom roles (ADR 0123, 0132)", () => {
     expect(holdersLabel({ users: 1, teamMembers: 0 })).toBe("1 person");
     expect(holdersLabel({ users: 2, teamMembers: 1 })).toBe("2 people · 1 in a team");
     expect(holdersLabel({ users: 0, teamMembers: 3 })).toBe("3 in a team");
+  });
+});
+
+describe("time-bound roles (ADR 0197)", () => {
+  const H = 3_600_000;
+  const D = 24 * H;
+
+  it("offers ends within a role's limit, and no end only without one", () => {
+    expect(endChoices().map((c) => c.value)).toEqual(["none", "8h", "1d", "7d", "30d", "90d"]);
+    expect(endChoices(null)[0]).toEqual({ value: "none", label: "No end" });
+    expect(endChoices(7).map((c) => c.value)).toEqual(["8h", "1d", "7d"]);
+    expect(endChoices(1).map((c) => c.value)).toEqual(["8h", "1d"]);
+    expect(defaultEnd()).toBe("none");
+    expect(defaultEnd(30)).toBe("8h");
+  });
+
+  it("turns a choice into an end", () => {
+    expect(endsAt("none", 1_000)).toBeNull();
+    expect(endsAt("8h", 1_000)).toBe(1_000 + 8 * H);
+    expect(endsAt("7d", 0)).toBe(7 * D);
+    expect(endsAt("nope", 0)).toBeNull();
+  });
+
+  it("says when a role ends", () => {
+    expect(endsLabel(null, 0)).toBe("");
+    expect(endsLabel(undefined, 0)).toBe("");
+    expect(endsLabel(0, 1)).toBe("ended");
+    expect(endsLabel(30 * 60_000, 0)).toBe("ends within the hour");
+    expect(endsLabel(H, 0)).toBe("ends in 1 hour");
+    expect(endsLabel(30 * H, 0)).toBe("ends in 30 hours");
+    expect(endsLabel(3 * D, 0)).toBe("ends in 3 days");
+  });
+
+  it("reads a limit as the server checks it", () => {
+    expect(parseMaxDays("")).toBeNull();
+    expect(parseMaxDays(" 7 ")).toBe(7);
+    expect(parseMaxDays("365")).toBe(365);
+    for (const bad of ["0", "366", "1.5", "-1", "a week"]) expect(parseMaxDays(bad)).toBeUndefined();
+  });
+
+  it("sends a new limit only when it changed", () => {
+    const r = role({ maxDays: 7 });
+    expect(draftOf(r).maxDays).toBe(7);
+    expect(draftChanges(r, draftOf(r))).toBeNull();
+    expect(draftChanges(r, { ...draftOf(r), maxDays: null })).toEqual({ maxDays: null });
+    expect(draftChanges(r, { ...draftOf(r), maxDays: undefined })).toBeNull();
+    expect(draftChanges(role(), { ...draftOf(role()), maxDays: 30 })).toEqual({ maxDays: 30 });
+    expect(draftChanges(role(), draftOf(role()))).toBeNull();
   });
 });

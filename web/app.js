@@ -241,13 +241,16 @@ function effectivePerms(base, perms) {
   const preset = roles.builtIn.find((b) => b.id === base)?.permissions || [];
   return [...preset, ...roles.permissions.map((p) => p.name).filter((p) => perms.includes(p) && !preset.includes(p))];
 }
-const customRoleOptions = (current) => `<option value="">None</option>${roles.roles.map((r) => `<option value="${esc(r.id)}" ${r.id === current ? "selected" : ""}>${esc(r.name)}</option>`).join("")}`;
+// Time-bound roles (ADR 0197) need an end, so they're given from the Roles tab.
+const customRoleOptions = (current) =>
+  `<option value="">None</option>${roles.roles.filter((r) => !r.maxDays || r.id === current).map((r) => `<option value="${esc(r.id)}" ${r.id === current ? "selected" : ""}>${esc(r.name)}</option>`).join("")}`;
+const until = (role) => (role?.expiresAt ? `<div class="sub" title="It ends by itself (ADR 0197)">Until ${esc(fmt(role.expiresAt))}</div>` : "");
 
 function customRoleCell(u) {
   const can = u.permissions ? `<div class="sub" title="What they can do across the server">Can do: ${esc(permNames(u.permissions))}</div>` : "";
   if (!roles.roles.length && !u.customRole) return can;
   const locked = u.breakGlass || u.id === me.user?.id;
-  return `<select data-act="custom-role" title="Custom role" ${locked ? "disabled" : ""}>${customRoleOptions(u.roleId)}</select>${can}`;
+  return `<select data-act="custom-role" title="Custom role" ${locked ? "disabled" : ""}>${customRoleOptions(u.roleId)}</select>${until(u.customRole)}${can}`;
 }
 
 async function setCustomRole(u, id) {
@@ -660,7 +663,7 @@ function teamCustomRoleCell(m) {
   if (!roles.roles.length && !m.customRole) return "";
   const r = roles.roles.find((x) => x.id === m.customRole?.id);
   const applies = r ? `<div class="sub">Here: ${esc(permNames(teamPerms(r.permissions)))}</div>` : "";
-  return `<select data-act="team-custom-role" title="Custom role within this team">${customRoleOptions(m.customRole?.id)}</select>${applies}`;
+  return `<select data-act="team-custom-role" title="Custom role within this team">${customRoleOptions(m.customRole?.id)}</select>${until(m.customRole)}${applies}`;
 }
 
 $("teams-list").addEventListener("change", async (e) => {
@@ -737,13 +740,27 @@ async function loadRoles({ keepForm = false } = {}) {
 const tags = (list) => `<div class="tags">${list.map((p) => `<span class="tag">${esc(p)}</span>`).join("")}</div>`;
 const holdersText = (r) => [r.users && `${r.users} ${r.users === 1 ? "person" : "people"}`, r.teamMembers && `${r.teamMembers} in a team`].filter(Boolean).join(" · ") || "nobody has it";
 const who = (p) => `${esc(p.name || p.email || p.id)}${p.email && p.name ? ` <span class="sub">${esc(p.email)}</span>` : ""}`;
+const HOUR = 3600000;
+const ENDS = [["", "No end", null], ["8h", "8 hours", 8 * HOUR], ["1d", "1 day", 24 * HOUR], ["7d", "7 days", 7 * 24 * HOUR], ["30d", "30 days", 30 * 24 * HOUR], ["90d", "90 days", 90 * 24 * HOUR]];
+// A time-bound role is never given with no end, nor past its limit.
+const endChoices = (r) => ENDS.filter(([, , ms]) => (r.maxDays ? ms && ms <= r.maxDays * 24 * HOUR : true));
+const endFields = (r) => `<select name="for" title="When it ends by itself">${endChoices(r).map(([v, label]) => `<option value="${v}">${label}</option>`).join("")}</select>
+      <input name="reason" placeholder="Why (optional, audited)" maxlength="500" />`;
+function giving(f, r) {
+  const ms = endChoices(r).find(([v]) => v === f.for.value)?.[2];
+  const body = {};
+  if (ms) body.expiresAt = Date.now() + ms;
+  if (f.reason.value.trim()) body.reason = f.reason.value.trim();
+  return body;
+}
+const endsText = (h) => (h.expiresAt ? ` · until ${esc(fmt(h.expiresAt))}` : "");
 
 function roleCard(r) {
   const d = rolesTab.details[r.id] || { holders: { users: [], teams: [] } };
   const held = r.users + r.teamMembers > 0;
   const givable = rolesTab.teams.flatMap((t) => t.members.filter((m) => !d.holders.teams.some((h) => h.team.id === t.id && h.user.id === m.id)).map((m) => [t, m]));
   return `<div class="card" data-role="${esc(r.id)}">
-    <div class="bar"><b>${esc(r.name)}</b> <span class="sub">${esc(baseName(r.base))} + ${esc(permNames(r.permissions))} · ${esc(holdersText(r))}</span>
+    <div class="bar"><b>${esc(r.name)}</b> <span class="sub">${esc(baseName(r.base))} + ${esc(permNames(r.permissions))} · ${esc(holdersText(r))}${r.maxDays ? ` · time-bound, at most ${r.maxDays} day${r.maxDays === 1 ? "" : "s"}` : ""}</span>
       <button type="button" class="btn push" data-act="edit-role">Edit</button>
       <button type="button" class="btn" data-act="delete-role" ${held ? 'disabled title="Take it away from everyone first"' : ""}>Delete</button></div>
     ${r.description ? `<p class="hint">${esc(r.description)}</p>` : ""}
@@ -751,15 +768,17 @@ function roleCard(r) {
     <span class="sub">Within a team: ${esc(permNames(teamPerms(r.permissions)))}</span>
     ${r.unknown.length ? `<p class="warn">Unknown here, so they grant nothing: ${esc(r.unknown.join(", "))}. Saving drops them.</p>` : ""}
     <ul class="holders">
-      ${d.holders.users.map((u) => `<li data-user="${esc(u.id)}">${who(u)} <span class="sub">across the server</span> <button type="button" class="btn push" data-act="unassign-role">Take away</button></li>`).join("")}
-      ${d.holders.teams.map((h) => `<li data-user="${esc(h.user.id)}" data-team="${esc(h.team.id)}">${who(h.user)} <span class="sub">in ${esc(h.team.name)}</span> <button type="button" class="btn push" data-act="unassign-team-role">Take away</button></li>`).join("")}
+      ${d.holders.users.map((u) => `<li data-user="${esc(u.id)}">${who(u)} <span class="sub">across the server${endsText(u)}</span> <button type="button" class="btn push" data-act="renew-role" title="Set its end to the one picked below">Change end</button> <button type="button" class="btn" data-act="unassign-role">Take away</button></li>`).join("")}
+      ${d.holders.teams.map((h) => `<li data-user="${esc(h.user.id)}" data-team="${esc(h.team.id)}">${who(h.user)} <span class="sub">in ${esc(h.team.name)}${endsText(h)}</span> <button type="button" class="btn push" data-act="renew-team-role" title="Set its end to the one picked in the team form below">Change end</button> <button type="button" class="btn" data-act="unassign-team-role">Take away</button></li>`).join("")}
     </ul>
     <form class="bar" data-act="give-role" autocomplete="off">
       <input name="user" class="wide" list="role-people" placeholder="Give across the server: email or id" required spellcheck="false" />
+      ${endFields(r)}
       <button type="submit" class="btn">Give</button>
     </form>
     ${givable.length ? `<form class="bar" data-act="give-team-role">
       <select name="member" title="A team's member">${givable.map(([t, m]) => `<option value="${esc(t.id)}|${esc(m.id)}">${esc(t.name)}: ${esc(m.name || m.email || m.id)}${m.customRole ? ` (has ${esc(m.customRole.name)})` : ""}</option>`).join("")}</select>
+      ${endFields(r)}
       <button type="submit" class="btn">Give within the team</button>
     </form>` : ""}
   </div>`;
@@ -782,6 +801,7 @@ function renderRoleForm() {
   $("role-name").value = r?.name || "";
   $("role-description").value = r?.description || "";
   $("role-base").value = r?.base || "member";
+  $("role-max-days").value = r?.maxDays || "";
   $("role-perms").innerHTML = roles.permissions.map((p) => `<label><input type="checkbox" value="${esc(p.name)}" ${r?.permissions.includes(p.name) ? "checked" : ""} />
     <span><code>${esc(p.name)}</code>${p.team ? ' <span class="tag">also within a team</span>' : ""}<span class="sub">${esc(p.description)}</span></span></label>`).join("");
   showRoleEffective();
@@ -801,7 +821,8 @@ $("role-cancel").addEventListener("click", () => {
 
 $("role-form").addEventListener("submit", async (e) => {
   e.preventDefault();
-  const body = { name: $("role-name").value.trim(), description: $("role-description").value.trim(), base: $("role-base").value, permissions: checkedPerms() };
+  const days = $("role-max-days").value.trim();
+  const body = { name: $("role-name").value.trim(), description: $("role-description").value.trim(), base: $("role-base").value, permissions: checkedPerms(), maxDays: days ? Number(days) : null };
   const r = roles.roles.find((x) => x.id === rolesTab.editing);
   if (rolesTab.editing && !r) return fail(new Error("That role didn't load. Reload the page before saving."));
   try {
@@ -849,6 +870,14 @@ $("roles-list").addEventListener("click", async (e) => {
       if (!confirm(`Take ${r.name} away? They keep ${baseName(r.base).toLowerCase()} as their role.`)) return;
       await api("DELETE", `/api/roles/${key(r.id)}/users/${key(li.dataset.user)}`);
     }
+    if (b.dataset.act === "renew-role" || b.dataset.act === "renew-team-role") {
+      const card = b.closest("[data-role]");
+      const f = (b.dataset.act === "renew-team-role" && card.querySelector("form[data-act=give-team-role]")) || card.querySelector("form[data-act=give-role]");
+      const body = giving(f, r);
+      if (!confirm(`Change when ${r.name} ends for them? ${body.expiresAt ? `It will end ${fmt(body.expiresAt)}.` : "It will have no end."}`)) return;
+      if (b.dataset.act === "renew-role") await api("PUT", `/api/roles/${key(r.id)}/users/${key(li.dataset.user)}`, body);
+      else await api("PUT", `/api/roles/${key(r.id)}/teams/${key(li.dataset.team)}/users/${key(li.dataset.user)}`, body);
+    }
     if (b.dataset.act === "unassign-team-role") {
       if (!confirm(`Take ${r.name} away within this team? Their role across the server doesn't change.`)) return;
       await api("DELETE", `/api/roles/${key(r.id)}/teams/${key(li.dataset.team)}/users/${key(li.dataset.user)}`);
@@ -872,11 +901,11 @@ $("roles-list").addEventListener("submit", async (e) => {
       const u = rolesTab.people.find((x) => (x.email || "").toLowerCase() === target.toLowerCase() || x.id === target);
       if (!u) return fail(new Error(rolesTab.people.length ? `Nobody here is ${target}. Pick someone from the list.` : "People didn't load, so they can't be checked. Reload the page."));
       if (u.role === "admin" && !confirm(`Give ${r.name} to ${u.name}? They stop being an admin: their role becomes ${baseName(r.base).toLowerCase()}, with ${r.name}'s permissions on top.`)) return;
-      await api("PUT", `/api/roles/${key(r.id)}/users/${key(u.id)}`);
+      await api("PUT", `/api/roles/${key(r.id)}/users/${key(u.id)}`, giving(f, r));
     }
     if (f.dataset.act === "give-team-role") {
       const [team, user] = f.member.value.split("|");
-      await api("PUT", `/api/roles/${key(r.id)}/teams/${key(team)}/users/${key(user)}`);
+      await api("PUT", `/api/roles/${key(r.id)}/teams/${key(team)}/users/${key(user)}`, giving(f, r));
     }
   } catch (err) {
     fail(err);
