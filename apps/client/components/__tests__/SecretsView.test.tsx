@@ -123,6 +123,26 @@ describe("SecretsView (ADR 0044)", () => {
     expect(screen.getByText(/Read-only accounts can't add or change secrets/)).toBeOnTheScreen();
   });
 
+  it("shows a secret an admin keeps in your external folder as theirs to change (ADR 0174)", async () => {
+    const api = fakeApi([
+      { name: "ANTHROPIC_API_KEY", overrides: false, store: "vault", saved: false },
+      { name: "OPENAI_API_KEY", createdAt: NOV3, updatedAt: NOV3, store: "aws", saved: true },
+    ]);
+    const confirm = jest.fn(async () => false);
+    const user = userEvent.setup();
+    await render(<SecretsView api={api} onBack={jest.fn()} canWrite confirm={confirm} />);
+    expect(await screen.findByText("Set for you by an admin in HashiCorp Vault")).toBeOnTheScreen();
+    expect(screen.getByText("Set for you by an admin in AWS Secrets Manager · it wins over the one you saved here")).toBeOnTheScreen();
+    for (const name of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]) {
+      expect(screen.queryByRole("button", { name: `Replace ${name}` })).toBeNull();
+    }
+    expect(screen.queryByRole("button", { name: "Delete ANTHROPIC_API_KEY" })).toBeNull();
+    await user.press(screen.getByRole("button", { name: "Delete OPENAI_API_KEY" }));
+    expect(confirm).toHaveBeenCalledWith("Delete OPENAI_API_KEY?", "Your Bots keep the value an admin set for you in AWS Secrets Manager. This can't be undone.");
+    await user.type(screen.getByLabelText("Secret name"), "ANTHROPIC_API_KEY");
+    expect(screen.getByText("An admin set ANTHROPIC_API_KEY for you in HashiCorp Vault. That value wins, so one saved here isn't used.")).toBeOnTheScreen();
+  });
+
   it("says what the server refused", async () => {
     const api = fakeApi();
     api.setMySecret.mockRejectedValueOnce(new ApiError("OPENAI_API_KEY is SuperBot's own; no Bot gets it.", 400));
