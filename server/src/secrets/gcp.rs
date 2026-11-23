@@ -175,13 +175,13 @@ impl SecretManager {
 }
 
 impl Inner {
-    fn secret_id(&self, scope: Scope, name: &str) -> Option<String> {
-        let id = format!("{}-{}-{name}", self.cfg.prefix, scope.as_str());
+    fn secret_id(&self, scope: &Scope, name: &str) -> Option<String> {
+        let id = format!("{}-{}-{name}", self.cfg.prefix, scope.folder('-'));
         (id.len() <= MAX_ID).then_some(id)
     }
 
-    fn name_in(&self, scope: Scope, id: &str) -> Option<String> {
-        id.strip_prefix(&format!("{}-{}-", self.cfg.prefix, scope.as_str())).filter(|n| !n.is_empty()).map(String::from)
+    fn name_in(&self, scope: &Scope, id: &str) -> Option<String> {
+        id.strip_prefix(&format!("{}-{}-", self.cfg.prefix, scope.folder('-'))).filter(|n| !n.is_empty()).map(String::from)
     }
 
     fn method(&self) -> &'static str {
@@ -247,7 +247,7 @@ impl Inner {
     }
 
     async fn read(&self, scope: Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error> {
-        let Some(id) = self.secret_id(scope, name) else { return Ok(None) };
+        let Some(id) = self.secret_id(&scope, name) else { return Ok(None) };
         let path = format!("{}/secrets/{id}/versions/latest:access", self.cfg.parent);
         // A disabled or destroyed latest version answers 400 (FAILED_PRECONDITION), which
         // fails closed like any other refusal; only a secret with no versions is "not there".
@@ -288,7 +288,7 @@ impl Inner {
             };
             for s in secrets {
                 let name = s["name"].as_str().and_then(|n| n.rsplit_once("/secrets/")).ok_or_else(odd)?.1;
-                if let Some(name) = self.name_in(scope, name) {
+                if let Some(name) = self.name_in(&scope, name) {
                     out.push(name);
                 }
             }
@@ -534,6 +534,18 @@ mod tests {
         for v in [bot_value.as_str(), "linode-from-gcp-1", "sealed-but-shadowed-gcp"] {
             redact::forget(v);
         }
+    }
+
+    #[test]
+    fn reads_each_users_own_folder() {
+        let (url, f) = stand_in();
+        let value = format!("ua1-gcp-{}", crate::random_hex(10));
+        put(&f, "secrets/superbot-users-ua1-OPENAI_API_KEY", &value);
+        put(&f, "secrets/superbot-users-ua1-LINODE_TOKEN", "never-from-a-users-folder");
+        put(&f, "secrets/superbot-users-ub1-OPENAI_API_KEY", "ub1-own-openai");
+        put(&f, "secrets/superbot-users-ua10-OPENAI_API_KEY", "not-ua1s");
+        let x = super::super::external::tests::users_on(store(&url, &[], Duration::from_secs(60)));
+        super::super::external::tests::reads_users_folders(&x, &value);
     }
 
     #[test]

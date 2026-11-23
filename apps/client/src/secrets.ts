@@ -34,9 +34,28 @@ function day(seconds: number): string {
   return new Date(seconds * 1000).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
 }
 
-/** When a secret was saved, and when its value was last replaced. */
+const STORES: Record<string, string> = {
+  vault: "HashiCorp Vault",
+  "azure-keyvault": "Azure Key Vault",
+  "gcp-secret-manager": "GCP Secret Manager",
+  aws: "AWS Secrets Manager",
+};
+
+/** The external store an admin keeps this secret in for you (ADR 0174), or null if it is saved here. */
+export function managedIn(s: PersonalSecret): string | null {
+  if (!s.store || s.store === "sealed") return null;
+  return STORES[s.store] ?? s.store;
+}
+
+/** When a secret was saved, and when its value was last replaced; or who keeps it, if not you. */
 export function savedLine(s: PersonalSecret): string {
+  const store = managedIn(s);
+  if (store) {
+    const line = `Set for you by an admin in ${store}`;
+    return s.saved ? `${line} · it wins over the one you saved here` : line;
+  }
   const created = s.createdAt ?? s.updatedAt;
+  if (created === undefined) return "Saved";
   const saved = `Saved ${day(created)}`;
-  return s.updatedAt > created && day(s.updatedAt) !== day(created) ? `${saved} · replaced ${day(s.updatedAt)}` : saved;
+  return s.updatedAt !== undefined && s.updatedAt > created && day(s.updatedAt) !== day(created) ? `${saved} · replaced ${day(s.updatedAt)}` : saved;
 }
