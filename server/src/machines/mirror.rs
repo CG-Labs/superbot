@@ -253,6 +253,74 @@ pub async fn check(plan: &HarnessPlan) -> Value {
     json!({ "ok": ok, "npmRegistry": registry, "ca": plan.ca.is_some(), "items": items })
 }
 
+/// The provider firewall's outbound rules for machines, when they bind root: the
+/// addresses they drop, what is carved out of them, and how to open one more.
+pub struct Outbound {
+    pub deny: Vec<String>,
+    pub open: Vec<(std::net::IpAddr, u16)>,
+    pub fix: fn(std::net::SocketAddr) -> String,
+}
+
+impl Outbound {
+    /// Incus containers' network ACL (ADR 0065), or Linode's outbound rules (ADR 0179).
+    pub fn from_env(var: &dyn Fn(&str) -> String) -> Option<Outbound> {
+        if var("MACHINE_PROVIDER").trim() == "incus" {
+            let s = super::incus::Settings::from_env(var).ok()?;
+            return Some(Outbound {
+                open: s.open(),
+                deny: s.deny,
+                fix: |a| format!("Incus containers' firewall drops it: add {a} to INCUS_EGRESS_ALLOW."),
+            });
+        }
+        if !super::firewall::egress_from_env(var).ok()? {
+            return None;
+        }
+        Some(Outbound {
+            deny: super::firewall::egress_deny(var).ok()?,
+            open: super::firewall::control_from_env(var).into_iter().collect(),
+            fix: |a| format!("Machines' provider firewall drops {a} (ADR 0179): put the mirror on an address it doesn't hold, or set MACHINE_FIREWALL_EGRESS=off."),
+        })
+    }
+}
+
+/// Where `check` fetched from that machines can't reach: the check runs on botd,
+/// outside the machines' firewall, so a mirror on a private address passes here but
+/// not there.
+pub async fn reach(v: &mut Value, out: &Outbound) {
+    let mut urls: Vec<String> = vec![v["npmRegistry"].as_str().unwrap_or(NPM_REGISTRY).to_string()];
+    for i in v["items"].as_array().into_iter().flatten() {
+        if i["note"].is_null()
+            && let Some(u) = i["url"].as_str()
+        {
+            urls.push(u.to_string());
+        }
+    }
+    let mut places: Vec<(String, u16)> = urls
+        .iter()
+        .filter_map(|u| url::Url::parse(u).ok())
+        .filter_map(|u| Some((u.host_str()?.trim_matches(['[', ']']).to_string(), u.port_or_known_default()?)))
+        .collect();
+    places.sort();
+    places.dedup();
+    let mut blocked = Vec::new();
+    for (host, port) in places {
+        let Ok(addrs) = tokio::net::lookup_host((host.as_str(), port)).await else { continue };
+        for a in addrs {
+            if super::incus::drops(&out.deny, &out.open, a.ip(), port) {
+                blocked.push(json!({
+                    "host": host,
+                    "address": a.to_string(),
+                    "error": format!("Machines can't reach {host} at {a}. {}", (out.fix)(a)),
+                }));
+            }
+        }
+    }
+    if !blocked.is_empty() {
+        v["ok"] = json!(false);
+    }
+    v["blocked"] = json!(blocked);
+}
+
 /// `GET /api/machines/harness-mirror` (admins): `check` on the harness plan machines
 /// get. Nothing is installed or changed.
 pub async fn check_now(AppS(app): AppS<AppState>) -> Res<Json<Value>> {
@@ -264,6 +332,9 @@ pub async fn check_now(AppS(app): AppS<AppState>) -> Res<Json<Value>> {
         .clone()
         .ok_or_else(|| ApiError(StatusCode::CONFLICT, "MACHINE_HARNESSES is none, so machines get no harnesses to check.".into()))?;
     let mut v = check(&plan).await;
+    if let Some(out) = Outbound::from_env(&|k| std::env::var(k).unwrap_or_default()) {
+        reach(&mut v, &out).await;
+    }
     v["mirrors"] = json!({
         "node": e.upkeep.mirrors.as_ref().and_then(|m| m.node.clone()),
         "npm": e.upkeep.mirrors.as_ref().and_then(|m| m.npm.clone()),
@@ -402,5 +473,53 @@ mod tests {
         assert!(errors[1].contains("not the pinned"), "{errors:?}");
         assert!(errors[2].contains("not the listed"), "{errors:?}");
         assert!(errors[3].contains("has no fake-codex@2.0.0"), "{errors:?}");
+    }
+
+    #[tokio::test]
+    async fn the_check_says_when_machines_firewall_drops_the_mirror() {
+        let mirror = Mirror::serve().await;
+        let node = mirror.node("0.0.1", b"a node tarball");
+        let pin = mirror.package("fake-codex", "1.0.0", b"codex's tarball");
+        let plan = mirror.plan(&node, vec![("codex", "fake-codex", "1.0.0", Some(pin))]);
+        let at = url::Url::parse(&mirror.url).unwrap();
+        let here = format!("{}:{}", at.host_str().unwrap(), at.port().unwrap());
+        let incus = |allow: &str| {
+            Outbound::from_env(&env(&[
+                ("MACHINE_PROVIDER", "incus".into()),
+                ("INCUS_URL", "https://192.0.2.50".into()),
+                ("INCUS_EGRESS_DENY", "127.0.0.0/8".into()),
+                ("INCUS_EGRESS_ALLOW", allow.to_string()),
+            ]))
+            .unwrap()
+        };
+
+        let mut v = check(&plan).await;
+        assert_eq!(v["ok"], true, "{v}");
+        reach(&mut v, &incus("")).await;
+        assert_eq!(v["ok"], false, "{v}");
+        let blocked = v["blocked"].as_array().unwrap();
+        assert_eq!(blocked.len(), 1, "one place, however many files: {v}");
+        assert!(blocked[0]["error"].as_str().unwrap().contains(&format!("add {here} to INCUS_EGRESS_ALLOW")), "{v}");
+
+        let mut v = check(&plan).await;
+        reach(&mut v, &incus(&here)).await;
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["blocked"], json!([]));
+
+        // Linode's outbound rules (ADR 0179), with loopback in MACHINE_EGRESS_DENY.
+        let linode = |egress: &str| {
+            Outbound::from_env(&env(&[
+                ("MACHINE_FIREWALL", "on".into()),
+                ("MACHINE_CONTROL_URL", "https://192.0.2.1:8444".into()),
+                ("MACHINE_EGRESS_DENY", "127.0.0.0/8".into()),
+                ("MACHINE_FIREWALL_EGRESS", egress.to_string()),
+            ]))
+        };
+        let mut v = check(&plan).await;
+        reach(&mut v, &linode("").unwrap()).await;
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(v["blocked"][0]["error"].as_str().unwrap().contains("MACHINE_FIREWALL_EGRESS=off"), "{v}");
+        assert!(linode("off").is_none(), "no outbound rules, nothing to check");
+        assert!(Outbound::from_env(&env(&[])).is_none());
     }
 }
