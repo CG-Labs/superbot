@@ -162,6 +162,7 @@ fn every_link_in_the_playbooks_resolves() {
     files.push(repo().join("docs/adr/0144-tam-programme-and-health-score.md"));
     files.push(repo().join("docs/adr/0157-health-score-history-and-console.md"));
     files.push(repo().join("docs/adr/0167-support-report-from-ticket-exports.md"));
+    files.push(repo().join("docs/adr/0187-offline-support-check-and-bundle.md"));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links:\n{}", bad.join("\n"));
 }
@@ -312,4 +313,27 @@ fn the_support_report_page_documents_every_option_and_field() {
     for page in ["severity.md", "qbr-template.md", "health-check.md"] {
         assert!(read(page).contains("(support-report.md"), "{page} doesn't point at the support report");
     }
+}
+
+#[test]
+fn the_support_check_page_documents_every_check_and_option() {
+    let code = fs::read_to_string(repo().join("server/src/support_check.rs")).unwrap();
+    let usage = code.split("const USAGE: &str = \"").nth(1).unwrap().split("\n\n").next().unwrap();
+    let page = read("support-check.md");
+    let options: HashSet<&str> = usage.split(|c: char| c.is_whitespace() || "[]|".contains(c)).filter(|w| w.starts_with('-') && w.len() > 1).collect();
+    assert!(options.len() >= 7, "the usage's options: {options:?}");
+    for o in options {
+        assert!(page.contains(&format!("`{o}")), "support-check.md doesn't explain {o}");
+    }
+    let ids: HashSet<&str> = code.split("Finding::new(\"").skip(1).map(|r| r.split('"').next().unwrap()).collect();
+    assert_eq!(ids.len(), 7, "the checks: {ids:?}");
+    let headings = anchors(&page);
+    for id in ids {
+        assert!(headings.contains(id), "support-check.md has no section for the {id} check");
+    }
+    for runbook in ["runbook-upgrade.md", "runbook-server-restore.md", "runbook-machine-down.md"] {
+        assert!(read(runbook).contains("botd support check"), "{runbook} doesn't start from the support check");
+    }
+    assert!(read("runbook-upgrade.md").contains("--before-upgrade"), "the upgrade runbook checks before it upgrades");
+    assert!(read("support-bundle.md").contains("(support-check.md#the-offline-bundle)"), "the support bundle points at the offline one");
 }
