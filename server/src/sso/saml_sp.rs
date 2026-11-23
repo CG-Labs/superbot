@@ -1027,9 +1027,16 @@ pub mod test_idp {
     }
 
     /// The parts of a response, each one replaceable before it is signed.
+    /// An `InResponseTo` value that is sent, but empty.
+    pub const EMPTY_IN_RESPONSE_TO: &str = "(empty)";
+
     /// An `InResponseTo` attribute, or none for an empty one (an unsolicited response).
     fn in_response_to(id: &str) -> String {
-        if id.is_empty() { String::new() } else { format!(r#" InResponseTo="{id}""#) }
+        match id {
+            "" => String::new(),
+            EMPTY_IN_RESPONSE_TO => r#" InResponseTo="""#.into(),
+            _ => format!(r#" InResponseTo="{id}""#),
+        }
     }
 
     #[derive(Clone)]
@@ -1590,8 +1597,15 @@ mod tests {
         let mut half = unsolicited();
         half.in_response_to = REQ.into();
         assert_eq!(check_unsolicited(&half.xml()).unwrap_err().0, "in_response_to_mismatch", "the response answers a request");
-        let xml = unsolicited().xml().replacen("<saml:SubjectConfirmationData ", r#"<saml:SubjectConfirmationData InResponseTo="" "#, 1);
-        assert!(check_unsolicited(&xml).is_err(), "an empty InResponseTo is not an absent one");
+        // An empty InResponseTo, signed by the IdP, is not an absent one.
+        let mut empty = unsolicited();
+        empty.confirm_in_response_to = EMPTY_IN_RESPONSE_TO.into();
+        assert!(empty.xml().contains(r#"<saml:SubjectConfirmationData InResponseTo="" "#));
+        assert_eq!(check_unsolicited(&empty.xml()).unwrap_err().0, "in_response_to_mismatch", "on the confirmation");
+        let mut empty = unsolicited();
+        empty.in_response_to = EMPTY_IN_RESPONSE_TO.into();
+        assert!(empty.xml().contains(r#" InResponseTo="">"#));
+        assert_eq!(check_unsolicited(&empty.xml()).unwrap_err().0, "in_response_to_mismatch", "on the response");
         // Everything else holds as for a solicited one.
         let with = |f: fn(&mut Response)| {
             let mut r = unsolicited();

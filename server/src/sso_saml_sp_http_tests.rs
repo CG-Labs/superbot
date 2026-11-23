@@ -1176,24 +1176,31 @@ async fn an_idp_initiated_post_restarts_as_an_sp_initiated_sign_in() {
     assert_eq!(v["idpInitiated"], "restart");
 
     // The tile's post signs nobody in: it sends the browser to start a sign-in of our own,
-    // whatever RelayState the IdP sent (Okta's default RelayState, say).
+    // whatever RelayState the IdP sent (Okta's default RelayState, say). It names someone else
+    // (Mallory, linked too), so only the later answer can say who gets the session.
     let logins = || async { audit_list(&call(sp.port, "GET", "/api/audit?action=auth.login", &sp.admin, "").await.1).len() };
     let before = logins().await;
-    let tile = sp.unsolicited();
+    let mallory = sp.app.db.create_user(None, Some("mallory@example.com"), "Mallory", Role::Member).unwrap();
+    sp.app.db.link_identity(&mallory.id, &NewIdentity { provider: &sp.id, issuer: IDP, subject: "mallory-1", tenant: None, email: None, created_by: Some("test") }).unwrap();
+    let mut tile = sp.unsolicited();
+    tile.name_id = "mallory-1".into();
+    tile.attributes = vec![("email".into(), "mallory@example.com".into())];
     let (code, to, head) = sp.post(Some(&tile.posted()), Some("https://evil.example/next"), "").await;
     assert_eq!((code, to), (303, format!("http://127.0.0.1:{}/api/auth/sso/{}/start", sp.port, sp.id)));
     assert!(signed_in_as(sp.port, &head).await.is_none());
     let marker = set_cookies(&head).into_iter().find(|c| c.starts_with(&format!("{RESTART}="))).expect("restart marker");
+    assert!(marker.starts_with(&format!("{RESTART}={};", sp.id)), "it names the provider: {marker}");
     assert!(marker.contains("Max-Age=120") && marker.contains("SameSite=None") && marker.contains("Secure") && marker.contains("HttpOnly"), "{marker}");
     let restarted = &sp.audit("auth.saml_idp_initiated").await[0];
     let d = &restarted["details"];
-    assert_eq!((d["outcome"].as_str(), d["subject"].as_str(), d["issuer"].as_str(), d["assertion"].as_str()), (Some("restarted"), Some(STORED), Some(IDP), Some(tile.assertion_id.as_str())));
-    assert_eq!((restarted["actorSubject"].as_str(), restarted["idpProvider"].as_str()), (Some(format!("{IDP}|{STORED}").as_str()), Some(sp.id.as_str())));
+    assert_eq!((d["outcome"].as_str(), d["subject"].as_str(), d["issuer"].as_str(), d["assertion"].as_str()), (Some("restarted"), Some("mallory-1"), Some(IDP), Some(tile.assertion_id.as_str())));
+    assert_eq!((restarted["actorSubject"].as_str(), restarted["idpProvider"].as_str()), (Some(format!("{IDP}|mallory-1").as_str()), Some(sp.id.as_str())));
     assert_eq!(logins().await, before);
 
-    // The browser follows it, and the IdP answers that request: signed in, marker cleared.
+    // The browser follows it, and the IdP answers that request for whoever this browser is at
+    // the IdP (Ada): she is signed in, not the tile's Mallory, and the marker is cleared.
     let (request, relay, binder) = sp.start().await;
-    let cookie = format!("{binder}; {RESTART}=1");
+    let cookie = format!("{binder}; {RESTART}={}", sp.id);
     let (code, _, head) = sp.post(Some(&Response::new(&sp.acs(), &sp.entity(), &request, db::now()).posted()), Some(&relay), &cookie).await;
     assert_eq!(code, 200);
     assert_eq!(signed_in_as(sp.port, &head).await, Some(u.id.clone()));
@@ -1206,11 +1213,15 @@ async fn an_idp_initiated_post_restarts_as_an_sp_initiated_sign_in() {
     assert_eq!((f["reason"].as_str(), f["idpInitiated"].as_bool()), (Some("replayed"), Some(true)));
 
     // An IdP that answers our request unsolicited again would go round forever: refused.
-    let (_, to, head) = sp.post(Some(&sp.unsolicited().posted()), None, &format!("{RESTART}=1")).await;
+    let (_, to, head) = sp.post(Some(&sp.unsolicited().posted()), None, &format!("{RESTART}={}", sp.id)).await;
     assert_eq!(to, "/login?error=sso_failed");
     assert_eq!(sp.last_failure().await["reason"], "idp_initiated_loop");
     assert!(set_cookies(&head).iter().any(|c| c.starts_with(&format!("{RESTART}=;"))), "the marker goes, so the next tile works");
     assert_eq!(sp.audit("auth.saml_idp_initiated").await.len(), 1);
+    // A marker another provider's restart left isn't a loop here.
+    let (code, to, _) = sp.post(Some(&sp.unsolicited().posted()), None, &format!("{RESTART}=other")).await;
+    assert_eq!((code, to.ends_with("/start")), (303, true), "{to}");
+    assert_eq!(sp.audit("auth.saml_idp_initiated").await.len(), 2);
 }
 
 #[tokio::test]

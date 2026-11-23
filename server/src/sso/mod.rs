@@ -65,6 +65,7 @@ const BINDER: &str = "__Host-superbot_sso";
 const SAML_BINDER: &str = "__Host-superbot_saml";
 /// Set on a browser sent from an unsolicited response to start a sign-in (ADR 0175), so an
 /// IdP that answers that sign-in unsolicited again is refused instead of sent round again.
+/// Its value is the provider's id: another provider's tile isn't a loop.
 const SAML_RESTART: &str = "__Host-superbot_saml_restart";
 const RESTART_TTL_S: i64 = 120;
 /// Where an IdP's metadata imported with botctl is kept (the `settings` table), by provider id.
@@ -208,8 +209,7 @@ fn saml_binder_cookie(value: &str, max_age_s: i64) -> HeaderValue {
     HeaderValue::from_str(&format!("{SAML_BINDER}={value}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age={max_age_s}")).unwrap()
 }
 
-fn saml_restart_cookie(max_age_s: i64) -> HeaderValue {
-    let value = if max_age_s > 0 { "1" } else { "" };
+fn saml_restart_cookie(value: &str, max_age_s: i64) -> HeaderValue {
     HeaderValue::from_str(&format!("{SAML_RESTART}={value}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age={max_age_s}")).unwrap()
 }
 
@@ -1041,7 +1041,7 @@ pub async fn acs(Extension(a): Extension<Arc<Auth>>, Extension(source): Extensio
     let restarting = res.headers().get_all(header::SET_COOKIE).iter().any(|c| c.as_bytes().starts_with(SAML_RESTART.as_bytes()));
     res.headers_mut().append(header::SET_COOKIE, saml_binder_cookie("", 0));
     if !restarting {
-        res.headers_mut().append(header::SET_COOKIE, saml_restart_cookie(0));
+        res.headers_mut().append(header::SET_COOKIE, saml_restart_cookie("", 0));
     }
     no_store(res)
 }
@@ -1198,7 +1198,7 @@ async fn unsolicited(a: &Auth, app: &AppState, source: &Source, headers: &Header
     }
     // The IdP answered the sign-in this browser was just sent to start with another unsolicited
     // response: it ignores our AuthnRequests, and restarting again would go round forever.
-    if read_cookie(headers, SAML_RESTART).is_some() {
+    if read_cookie(headers, SAML_RESTART) == Some(id) {
         failed(a, source, id, "idp_initiated_loop", Some(&checked.claims), json!({ "idpInitiated": true }));
         return see("/login?error=sso_failed");
     }
@@ -1207,7 +1207,7 @@ async fn unsolicited(a: &Auth, app: &AppState, source: &Source, headers: &Header
     let actor = Actor { kind: ActorKind::User, subject: Some(checked.claims.key()), method: Some("sso".into()), idp: Some("saml".into()), idp_provider: Some(id.into()), ..Default::default() };
     a.record(Who { actor, source: source.clone() }.event("auth.saml_idp_initiated").target("sso_provider", id).details(d));
     let mut res = see(&format!("{}/api/auth/sso/{id}/start", a.sso.public_url));
-    res.headers_mut().insert(header::SET_COOKIE, saml_restart_cookie(RESTART_TTL_S));
+    res.headers_mut().insert(header::SET_COOKIE, saml_restart_cookie(id, RESTART_TTL_S));
     res
 }
 
