@@ -450,6 +450,10 @@ async fn main() {
     }
     let server_backups = server_backups::ServerBackups::from_env(&startup_store, &|k| env(k, ""), &data_dir)
         .unwrap_or_else(|e| exit(format!("Server backups: {e}")));
+    let off_host = server_backups.target.as_ref().map(|t| (t.source, t.destination()));
+    control_plane.server_data = machines::server_data::ServerData::from_env(&|k| env(k, ""), &control_plane.regions, off_host)
+        .unwrap_or_else(|e| exit(format!("Server data region: {e}")));
+    log_info!("Server data region: {} (ADR 0184).", control_plane.server_data.describe());
     // Machine enrollment's CA key is derived from the master key (ADR 0031).
     let bin_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
     // Users' machines get the managed tiers' default harnesses unless told otherwise (ADR 0079).
@@ -1015,6 +1019,9 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/auth/sso/{id}/slo", get(sso::slo_get).post(sso::slo_post))
         .route("/sso/{id}/saml", get(sso::saml_status))
         .route("/sso/{id}/saml/idp-metadata", put(sso::saml_import))
+        .route("/sso/{id}/saml/keys/{use}/next", post(sso::saml_key_next).delete(sso::saml_key_cancel))
+        .route("/sso/{id}/saml/keys/{use}/promote", post(sso::saml_key_promote))
+        .route("/sso/{id}/saml/keys/{use}/previous", delete(sso::saml_key_retire))
         .route("/sso/role-mappings", get(sso::saml_roles::list).post(sso::saml_roles::create))
         .route("/sso/role-mappings/{id}", get(sso::saml_roles::get).delete(sso::saml_roles::delete))
         .route("/users", get(users::list_users).post(users::create_user))

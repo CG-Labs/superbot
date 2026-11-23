@@ -97,6 +97,42 @@ impl Settings {
     }
 }
 
+/// MACHINE_FIREWALL_EGRESS (ADR 0179): whether the provider firewall also keeps every
+/// process on a machine, root included, off the machines' deny list. On unless `off`,
+/// and only with MACHINE_FIREWALL=on.
+pub fn egress_from_env(var: &dyn Fn(&str) -> String) -> Result<bool, String> {
+    let raw = var("MACHINE_FIREWALL_EGRESS");
+    let firewall = Settings::from_env(var)?.is_some();
+    if raw.trim().is_empty() {
+        return Ok(firewall);
+    }
+    let on = flag("MACHINE_FIREWALL_EGRESS", &raw)?;
+    if !firewall {
+        return Err("MACHINE_FIREWALL_EGRESS needs MACHINE_FIREWALL=on".into());
+    }
+    Ok(on)
+}
+
+/// What the provider firewall keeps machines off on the way out: the same list as the
+/// harness egress rules inside them (ADR 0126), the built-in private, shared and
+/// link-local ranges and MACHINE_EGRESS_DENY.
+pub fn egress_deny(var: &dyn Fn(&str) -> String) -> Result<Vec<String>, String> {
+    Ok(super::hardening::Settings::from_env(var)?
+        .unwrap_or_else(super::hardening::Settings::default_on)
+        .deny)
+}
+
+/// botd's machine address and port from MACHINE_CONTROL_URL, when it names an address.
+pub fn control_from_env(var: &dyn Fn(&str) -> String) -> Option<(IpAddr, u16)> {
+    let u = url::Url::parse(var("MACHINE_CONTROL_URL").trim()).ok()?;
+    let ip = match u.host()? {
+        url::Host::Ipv4(a) => IpAddr::V4(a),
+        url::Host::Ipv6(a) => IpAddr::V6(a),
+        url::Host::Domain(_) => return None,
+    };
+    Some((ip, u.port_or_known_default()?))
+}
+
 pub struct Firewall {
     pub label: String,
     pub tag: String,
@@ -186,14 +222,11 @@ pub async fn ensure(
         Some(f) => f,
         None => match p.create_firewall(&fw.label, std::slice::from_ref(&fw.tag), &fw.rules).await {
             Ok(f) => {
-                record(
-                    app,
-                    by,
-                    "machine.firewall_created",
-                    &f.id,
-                    Outcome::Success,
-                    json!({ "label": fw.label, "rules": rules_json(&fw.rules) }),
-                );
+                let mut details = json!({ "label": fw.label, "rules": rules_json(&fw.rules) });
+                if let Some(o) = p.firewall_egress() {
+                    details["outbound"] = o;
+                }
+                record(app, by, "machine.firewall_created", &f.id, Outcome::Success, details);
                 return Ok(f.id);
             }
             // Made meanwhile, or by a create whose answer was lost.
@@ -218,14 +251,11 @@ async fn repair(
 ) -> Result<(), ProviderError> {
     if found.rules.as_deref() != Some(&fw.rules[..]) {
         p.set_firewall_rules(&found.id, &fw.rules).await?;
-        record(
-            app,
-            by,
-            "machine.firewall_updated",
-            &found.id,
-            Outcome::Success,
-            json!({ "label": found.label, "rules": rules_json(&fw.rules), "was": found.rules.as_deref().map(rules_json) }),
-        );
+        let mut details = json!({ "label": found.label, "rules": rules_json(&fw.rules), "was": found.rules.as_deref().map(rules_json) });
+        if let Some(o) = p.firewall_egress() {
+            details["outbound"] = o;
+        }
+        record(app, by, "machine.firewall_updated", &found.id, Outcome::Success, details);
     }
     if !found.enabled {
         p.enable_firewall(&found.id).await?;
@@ -481,6 +511,43 @@ mod tests {
             (s.sources.as_slice(), s.ssh.len()),
             (&["198.51.100.9/32".to_string(), "2001:db8::9/128".into()][..], 0)
         );
+    }
+
+    #[test]
+    fn provider_egress_is_on_with_the_firewall_unless_turned_off() {
+        assert_eq!(egress_from_env(&vars(&[])), Ok(false));
+        assert_eq!(egress_from_env(&vars(&[("MACHINE_FIREWALL", "on"), ("MACHINE_CONTROL_URL", "https://192.0.2.1:8443")])), Ok(true));
+        assert_eq!(egress_from_env(&vars(&[("MACHINE_FIREWALL", "on"), ("MACHINE_CONTROL_URL", "https://192.0.2.1:8443"), ("MACHINE_FIREWALL_EGRESS", "on")])), Ok(true));
+        assert_eq!(egress_from_env(&vars(&[("MACHINE_FIREWALL", "on"), ("MACHINE_CONTROL_URL", "https://192.0.2.1:8443"), ("MACHINE_FIREWALL_EGRESS", "off")])), Ok(false));
+        let e = egress_from_env(&vars(&[("MACHINE_FIREWALL_EGRESS", "off")])).unwrap_err();
+        assert!(e.contains("MACHINE_FIREWALL=on"), "{e}");
+        assert!(egress_from_env(&vars(&[("MACHINE_FIREWALL", "on"), ("MACHINE_CONTROL_URL", "https://192.0.2.1:8443"), ("MACHINE_FIREWALL_EGRESS", "drop")])).is_err());
+    }
+
+    #[test]
+    fn provider_egress_denies_what_the_machines_own_rules_deny() {
+        let private: Vec<String> = super::super::incus::PRIVATE.iter().map(|s| s.to_string()).collect();
+        assert_eq!(egress_deny(&vars(&[])).unwrap(), private);
+        assert_eq!(egress_deny(&vars(&[("MACHINE_HARDENING", "off")])).unwrap(), private, "the built-in ranges either way");
+        let with = egress_deny(&vars(&[("MACHINE_EGRESS_DENY", "203.0.113.0/24, 10.9.0.0/16")])).unwrap();
+        assert!(with.contains(&"203.0.113.0/24".to_string()));
+        assert!(!with.contains(&"10.9.0.0/16".to_string()), "inside 10/8 already: {with:?}");
+        assert!(egress_deny(&vars(&[("MACHINE_EGRESS_DENY", "example.com")])).is_err());
+        assert!(egress_deny(&vars(&[("MACHINE_HARDENING", "off"), ("MACHINE_EGRESS_DENY", "203.0.113.0/24")])).is_err());
+    }
+
+    #[test]
+    fn the_control_plane_is_read_only_when_it_is_an_address() {
+        assert_eq!(
+            control_from_env(&vars(&[("MACHINE_CONTROL_URL", "https://10.1.2.3:8443")])),
+            Some(("10.1.2.3".parse().unwrap(), 8443))
+        );
+        assert_eq!(
+            control_from_env(&vars(&[("MACHINE_CONTROL_URL", "https://[fd00::7]")])),
+            Some(("fd00::7".parse().unwrap(), 443))
+        );
+        assert_eq!(control_from_env(&vars(&[("MACHINE_CONTROL_URL", "https://cp.example:8443")])), None);
+        assert_eq!(control_from_env(&vars(&[])), None);
     }
 
     #[test]

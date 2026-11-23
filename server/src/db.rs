@@ -4360,6 +4360,22 @@ impl Db {
         self.c().execute("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2", [key, value]).unwrap();
     }
 
+    /// Sets (Some) or removes (None) several settings in one transaction: all of them or none.
+    pub fn write_settings(&self, writes: &[(&str, Option<&str>)]) -> bool {
+        let c = self.c();
+        let Ok(tx) = c.unchecked_transaction() else { return false };
+        for (key, value) in writes {
+            let done = match value {
+                Some(v) => tx.execute("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2", [key, v]),
+                None => tx.execute("DELETE FROM settings WHERE key = ?", [key]),
+            };
+            if done.is_err() {
+                return false;
+            }
+        }
+        tx.commit().is_ok()
+    }
+
     // Bots
 
     pub fn bots(&self) -> Vec<Bot> {
@@ -9360,6 +9376,14 @@ impl Db {
         let c = self.c();
         let mut s = c.prepare("SELECT * FROM server_backups WHERE destination = ? AND archive = ? ORDER BY started_at DESC, id DESC").unwrap();
         s.query_map([destination, archive], server_backup_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Finished copies not to `destination` (None: to anywhere) and not deleted: made to
+    /// a store botd no longer copies to (ADR 0184).
+    pub fn server_backups_done_elsewhere(&self, destination: Option<&str>) -> i64 {
+        self.c()
+            .query_row("SELECT COUNT(*) FROM server_backups WHERE state = 'done' AND destination IS NOT ?", [destination], |r| r.get(0))
+            .unwrap_or(0)
     }
 
     /// Every copy in `state`, oldest archive first.

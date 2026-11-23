@@ -48,6 +48,8 @@ struct State {
     disks: HashMap<String, Option<u64>>,
     /// One-shot hooks run as an operation starts, before it's done.
     during: HashMap<&'static str, Box<dyn FnOnce() + Send>>,
+    /// What `firewall_egress` reports, as Linode's outbound rules would be.
+    egress: Option<serde_json::Value>,
 }
 
 /// Linode's disks for the default tiers' plans, in GiB.
@@ -157,6 +159,11 @@ impl Fake {
             .values()
             .cloned()
             .collect()
+    }
+
+    /// Reports `rules` as the outbound rules its firewalls carry (ADR 0179).
+    pub fn set_firewall_egress(&self, rules: serde_json::Value) {
+        self.state.lock().unwrap().egress = Some(rules);
     }
 
     pub fn firewalls(&self) -> Vec<FakeFirewall> {
@@ -331,6 +338,10 @@ impl MachineProvider for Fake {
     }
 
     /// As Linode's: when the last one succeeded is set with `set`.
+    fn firewall_egress(&self) -> Option<serde_json::Value> {
+        self.state.lock().unwrap().egress.clone()
+    }
+
     fn reports_backups(&self) -> bool {
         true
     }

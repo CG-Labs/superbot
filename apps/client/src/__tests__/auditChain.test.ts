@@ -1,4 +1,4 @@
-import { chainLines, checkpointLine, exportLine, exportLines, shortHash, timestampLine, verificationLine } from "../auditChain";
+import { archiveCheckLine, chainLines, checkpointLine, exportLine, exportLines, shortHash, timestampLine, verificationLine } from "../auditChain";
 import type { AuditChainState, AuditCheckpoint } from "../types";
 
 const HASH = "ab".repeat(32);
@@ -92,5 +92,17 @@ describe("audit chain lines (ADR 0149)", () => {
 
   it("lists every part in order", () => {
     expect(chainLines(chainState()).map((l) => l.label)).toEqual(["Last check", "Head", "Last checkpoint", "Timestamps", "SIEM export"]);
+  });
+
+  it("shows the archive's part of the last check, new objects only or all of them (ADR 0183)", () => {
+    const v = chainState().verification!;
+    expect(archiveCheckLine(v)).toBeNull();
+    const archive = { ok: true, objects: 3, skipped: 40, head: { id: 43, hash: HASH }, after: 37, problems: 0, firstProblem: null };
+    expect(archiveCheckLine({ ...v, archive })).toMatchObject({ label: "Archive check", tone: "ok", text: expect.stringContaining("Intact to event 43: 3 new objects read") });
+    expect(archiveCheckLine({ ...v, archive: { ...archive, after: null, objects: 43 } })!.text).toContain("all 43 objects read");
+    const broken = { ...archive, ok: false, problems: 2, firstProblem: { key: null, id: 37, reason: "mismatch", error: "the log was rebuilt" } };
+    expect(archiveCheckLine({ ...v, archive: broken })).toMatchObject({ tone: "bad", text: "Broken, 2 problems. First: mismatch at event 37: the log was rebuilt" });
+    expect(archiveCheckLine({ ...v, archive: { ...broken, problems: 0, firstProblem: null, error: "s3:ListBucketVersions" } })!.text).toContain("First: s3:ListBucketVersions");
+    expect(chainLines(chainState({ verification: { ...v, archive } })).map((l) => l.label).slice(0, 2)).toEqual(["Last check", "Archive check"]);
   });
 });
