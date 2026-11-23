@@ -323,3 +323,111 @@ async fn a_pinned_team_keeps_members_and_its_region_in_it_and_cant_be_deleted_un
     let reference = app.db.residency_pin(PinOn::Team, &beta).unwrap().reference;
     assert!(reference.starts_with("MSA-8, signed by ") && !reference.contains("dan@example.com"), "{reference}");
 }
+
+#[tokio::test]
+async fn someone_leaving_a_pinned_team_keeps_its_pin_unless_they_are_erased() {
+    let (port, app, admin) = linode().await;
+    let (ada, ada_s) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (bea, bea_s) = user_with(port, &admin, "bea@example.com", "member").await;
+    let (cy, _) = user_with(port, &admin, "cy@example.com", "member").await;
+    let (code, t) = call_json(port, "POST", "/api/teams", &admin, &json!({ "name": "Acme", "owner": "ada@example.com" }).to_string()).await;
+    assert_eq!(code, 201, "{t}");
+    let team = t["id"].as_str().unwrap().to_string();
+    for u in [&bea, &cy] {
+        assert_eq!(call(port, "PUT", &format!("/api/teams/{team}/members/{u}"), &admin, "{}").await.0, 200);
+    }
+    assert_eq!(call(port, "PUT", &format!("/api/teams/{team}/residency"), &admin, &pin("gb-lon", "MSA-7")).await.0, 200);
+    assert_eq!(app.db.user(&bea).unwrap().region, None, "held by the team's region while on it");
+
+    // Taken off the team: its pin stays on her data as her own, audited.
+    assert_eq!(call(port, "DELETE", &format!("/api/teams/{team}/members/{bea}"), &admin, "").await.0, 200);
+    let kept = audit(port, &admin, "user.residency_pin_kept").await;
+    let d = &kept[0]["details"];
+    assert_eq!((kept.len(), kept[0]["targetId"].as_str(), d["region"].as_str(), d["reference"].as_str()), (1, Some(bea.as_str()), Some("gb-lon"), Some("MSA-7")), "{kept:?}");
+    assert_eq!((d["team"].as_str(), d["teamName"].as_str(), d["reason"].as_str()), (Some(team.as_str()), Some("Acme"), Some("removed")), "{d}");
+    let (_, u) = call_json(port, "GET", &format!("/api/users/{bea}"), &admin, "").await;
+    assert_eq!((u["residency"]["subjectType"].as_str(), u["residency"]["region"].as_str(), u["residency"]["keptFrom"].as_str()), (Some("user"), Some("gb-lon"), Some(team.as_str())), "{u}");
+    assert_eq!(app.db.user(&bea).unwrap().region.as_deref(), Some("gb-lon"));
+    assert_eq!(app.db.user_machine(&bea).unwrap().region, "gb-lon", "her suspended machine is still held");
+    let (code, v) = call_json(port, "PUT", &format!("/api/users/{bea}/region"), &admin, r#"{"region":"de-fra-2"}"#).await;
+    assert!(code == 409 && v["error"].as_str().unwrap().contains("Their data is pinned to gb-lon (MSA-7)"), "{v}");
+    let (_, r) = call_json(port, "GET", "/api/regions", &admin, "").await;
+    assert_eq!(r["residency"]["startup"].as_str(), Some("warn"), "{r}");
+    assert!(r["residency"]["pins"].as_array().unwrap().iter().any(|p| p["name"] == "bea" && p["keptFrom"] == team.as_str()), "{r}");
+
+    // She sees her pin and where it came from, but not the team's agreement, which she
+    // never managed; her report leaves it out too. An admin's has it.
+    let (code, me) = call_json(port, "GET", "/api/me/residency", &bea_s, "").await;
+    assert_eq!(code, 200, "{me}");
+    assert_eq!((me["pin"]["on"].as_str(), me["pin"]["keptFrom"]["team"]["name"].as_str(), me["reports"].clone()), (Some("user"), Some("Acme"), json!(["user"])), "{me}");
+    assert!(me["pin"].get("reference").is_none(), "{me}");
+    let (code, r) = call_json(port, "GET", "/api/me/residency/report?on=user", &bea_s, "").await;
+    assert_eq!(code, 200, "{r}");
+    assert_eq!((r["pin"]["reference"].clone(), r["pin"]["keptFrom"]["name"].as_str()), (Value::Null, Some("Acme")), "{r}");
+    let changes = r["activity"]["pinChanges"].as_array().unwrap();
+    assert!(changes.iter().any(|c| c["action"] == "user.residency_pin_kept" && c["reference"].is_null()), "{r}");
+    assert!(!r.to_string().contains("MSA-7"), "{r}");
+    let (code, md) = call(port, "GET", "/api/me/residency/report?on=user&format=markdown", &bea_s, "").await;
+    assert!(code == 200 && md.contains("kept from team Acme's pin when they left it") && !md.contains("MSA-7"), "{md}");
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{bea}/residency/report"), &admin, "").await;
+    assert_eq!(r["pin"]["reference"].as_str(), Some("MSA-7"), "{r}");
+    assert!(r["activity"]["pinChanges"].as_array().unwrap().iter().any(|c| c["action"] == "user.residency_pin_kept" && c["reference"] == "MSA-7"), "{r}");
+    assert!(r["notCovered"][3].as_str().unwrap().contains("a pin of their own, kept from the team's"), "{r}");
+
+    // An admin renewing it makes it hers, with its own agreement she sees.
+    assert_eq!(call(port, "PUT", &format!("/api/users/{bea}/residency"), &admin, &pin("gb-lon", "DPA-bea")).await.0, 200);
+    let (_, me) = call_json(port, "GET", "/api/me/residency", &bea_s, "").await;
+    assert_eq!((me["pin"]["reference"].as_str(), me["pin"].get("keptFrom")), (Some("DPA-bea"), None), "{me}");
+
+    // Someone being erased keeps nothing: their pin would go with them.
+    let (code, v) = call_json(port, "POST", &format!("/api/users/{cy}/erase"), &admin, r#"{"destroyMachine":true}"#).await;
+    assert_eq!(code, 200, "{v}");
+    assert!(app.db.residency_pin(PinOn::User, &cy).is_none());
+    assert_eq!(audit(port, &admin, "user.residency_pin_kept").await.len(), 1);
+
+    // The last member leaving deletes the team and its pin, and keeps it on her data.
+    let (code, v) = call_json(port, "POST", "/api/team/leave", &ada_s, "").await;
+    assert_eq!(code, 200, "{v}");
+    assert!(app.db.team(&team).is_none() && app.db.residency_pin(PinOn::Team, &team).is_none());
+    let p = app.db.residency_pin(PinOn::User, &ada).unwrap();
+    assert_eq!((p.region.as_str(), p.reference.as_str(), p.kept_from.as_deref()), ("gb-lon", "MSA-7", Some(team.as_str())));
+    let kept = audit(port, &admin, "user.residency_pin_kept").await;
+    assert_eq!((kept.len(), kept[0]["targetId"].as_str(), kept[0]["details"]["reason"].as_str()), (2, Some(ada.as_str()), Some("left")), "{kept:?}");
+    let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
+    assert_eq!((me["pin"]["keptFrom"]["team"]["id"].as_str(), me["pin"]["keptFrom"]["team"]["name"].clone()), (Some(team.as_str()), Value::Null), "the team is gone: {me}");
+}
+
+#[tokio::test]
+async fn with_residency_startup_refuse_botd_wont_start_while_a_pin_cant_be_kept() {
+    use crate::machines::residency::{Startup, at_startup};
+    let env = incus(false).await;
+    let (fra, _) = user_with(env.port, &env.admin, "fra@example.com", "member").await;
+    let (lon, _) = user_with(env.port, &env.admin, "lon@example.com", "member").await;
+    machine_for(&env, &env.a, "a", &lon, false).await;
+    // London has a store and her machine is there: a pin it keeps. Her open plan has no
+    // model route held there, but runs are refused one by one, so that doesn't stop botd.
+    assert_eq!(json_call(&env, "PUT", &format!("/api/users/{lon}/residency"), &pin("gb-lon", "DPA-lon")).await.0, 200);
+    let w = at_startup(&env.app, &env.cp, Startup::Refuse).unwrap();
+    assert!(w.len() == 1 && w[0].contains("User lon") && w[0].contains("ADR 0139"), "{w:?}");
+
+    // Frankfurt has no backup store, and fra was pinned there before it went.
+    assert_eq!(json_call(&env, "PUT", &format!("/api/users/{fra}/region"), r#"{"region":"de-fra-2"}"#).await.0, 200);
+    machine_for(&env, &env.b, "b", &fra, true).await;
+    env.app.db.pin_residency(PinOn::User, &fra, "de-fra-2", "DPA-fra", None).unwrap();
+    let w = at_startup(&env.app, &env.cp, Startup::Warn).unwrap();
+    assert!(w.iter().any(|w| w.contains("User fra is pinned to de-fra-2 (DPA-fra), but machine backups have no store in de-fra-2")), "{w:?}");
+    assert!(events(&env, "residency.startup_refused").await.is_empty(), "warn only warns");
+
+    let e = at_startup(&env.app, &env.cp, Startup::Refuse).unwrap_err();
+    assert!(e.starts_with("RESIDENCY_STARTUP=refuse, and this server can't keep 1 residency pin: User fra is pinned to de-fra-2"), "{e}");
+    assert!(e.contains("RESIDENCY_STARTUP=warn to unpin with a reason") && !e.contains("User lon"), "{e}");
+    let refused = events(&env, "residency.startup_refused").await;
+    assert_eq!((refused.len(), refused[0]["outcome"].as_str(), refused[0]["actorKind"].as_str()), (1, Some("denied"), Some("system")), "{refused:?}");
+    let d = &refused[0]["details"];
+    assert_eq!((d["policy"].as_str(), d["pins"].as_array().map(Vec::len), d["pins"][0]["subjectId"].as_str(), d["pins"][0]["reference"].as_str()), (Some("refuse"), Some(1), Some(fra.as_str()), Some("DPA-fra")), "{d}");
+    assert!(d["pins"][0]["error"].as_str().unwrap().contains("no store in de-fra-2"), "{d}");
+
+    // Unpinned with a reason (started with warn to do it), it starts again.
+    assert_eq!(json_call(&env, "DELETE", &format!("/api/users/{fra}/residency"), r#"{"reason":"store retired; customer told"}"#).await.0, 200);
+    assert!(at_startup(&env.app, &env.cp, Startup::Refuse).is_ok());
+}

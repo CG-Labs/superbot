@@ -650,8 +650,11 @@ async fn main() {
     for w in auth_state.machines.offsite.as_deref().map(|o| [o.warnings(), o.unreachable(&recorded)].concat()).unwrap_or_default() {
         log_warn!("WARNING: {w}");
     }
+    let residency_startup = machines::residency::Startup::parse(&env("RESIDENCY_STARTUP", "")).unwrap_or_else(|e| exit(e));
+    machines::residency::set_startup(residency_startup);
     if auth_state.machines.enabled() {
-        for w in machines::residency::warnings(&app, &auth_state.machines) {
+        let warnings = machines::residency::at_startup(&app, &auth_state.machines, residency_startup).unwrap_or_else(|e| exit(e));
+        for w in warnings {
             log_warn!("WARNING: {w}");
         }
     }

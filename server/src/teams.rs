@@ -419,12 +419,24 @@ pub(crate) async fn join_from_scim(app: &AppState, by: &Who, team: &Team, user: 
 /// them stop, ADR 0052's and 0066's offboarding removes them from teammates' machines
 /// and accounts (and teammates from theirs), and the machine the team gave them is
 /// suspended and, after TEAM_MACHINE_DAYS, destroyed. The IdP taking someone out of a
-/// group takes them off even as the last owner: deprovisioning can't wait for one.
+/// group takes them off even as the last owner: deprovisioning can't wait for one. A
+/// pinned team's pin stays on the leaver's data as their own (ADR 0171), unless they are
+/// being erased.
 pub async fn leave(app: &AppState, by: &Who, team_id: &str, user_id: &str, reason: &str) -> bool {
     let Some(member) = app.db.team_member(user_id).filter(|m| m.team_id == team_id) else { return false };
     let tier = app.tier_of(user_id).name.clone();
-    if !app.db.remove_team_member(team_id, user_id, reason != "team_deleted" && reason != SCIM) {
-        return false;
+    let keep_owner = reason != "team_deleted" && reason != SCIM;
+    match app.db.remove_team_member_keeping_pin(team_id, user_id, keep_owner, reason != ERASED) {
+        Ok((false, _)) => return false,
+        Ok((true, kept)) => {
+            if let Some(p) = kept {
+                crate::machines::residency::kept_for_leaver(app, by, team_id, user_id, reason, &p);
+            }
+        }
+        Err(e) => {
+            crate::obs::log::log_warn!("WARNING: {user_id} wasn't taken off team {team_id}: keeping the team's residency pin on their data failed, so nothing changed: {e}");
+            return false;
+        }
     }
     crate::scim::roles::left(app, by, team_id, user_id).await;
     let mates: HashSet<String> = app.db.team_members(team_id).into_iter().map(|m| m.user_id).collect();
