@@ -22,7 +22,7 @@ What Bulk must not be is a second way in: every check a single request gets (the
 
 - **Tenant scoping** is the handlers': another tenant's user or group is 404, a group member who isn't this tenant's user is 400, an email another user has is 409.
 - **Deprovisioning** (`active: false`, `DELETE`) runs ADR 0124's step, with `user.deprovisioned` (`via: scim` or `scim_delete`), and enabling resumes the machine.
-- **Audit**: each operation records the events its single request would, with the token as the actor. The request as a whole also records **`scim.bulk`**: `tenant`, `operations` (sent), `run`, `failed`, `failOnErrors`, `stopped` (`failOnErrors`, `rateLimited`, or null) and `results` (each operation's method, path with `bulkId`s resolved, `bulkId`, and status), outcome `failure` if any failed. Request bodies are never logged.
+- **Audit**: each operation records the events its single request would, with the token as the actor. That includes the guard's `scim.request_failed` for a failed operation (not a 404, nor a 429, as for single requests), with the operation's method and resource, since the Bulk request itself is 200 and the guard sees no failure. The request as a whole also records **`scim.bulk`**: `tenant`, `operations` (sent), `run`, `failed`, `failOnErrors`, `stopped` (`failOnErrors`, `rateLimited`, or null) and `results` (each operation's method, path with `bulkId`s resolved, `bulkId`, and status), outcome `failure` if any failed. Request bodies are never logged.
 - **Groups** follow `SCIM_GROUPS`: off, a group operation gets the same 501 as `POST /Groups`.
 
 The group code is untouched: Bulk calls its public handlers.

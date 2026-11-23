@@ -149,7 +149,7 @@ The IdP takes the team on when it pushes the group with that `externalId` (or, w
 
 **The answer** is 200 with a `BulkResponse` whenever the request was read, even if every operation failed, so read each one's `status`: what its own request would have answered (`201`, `200`, `204`, `404`, ...). Results are in the order the operations ran; any not listed weren't run. Each has its `method`, `bulkId` (if sent), `status`, `location` (except a failed `POST`), and, on failure, `response` with the SCIM error.
 
-**Audit.** Each operation logs what its own request would. The whole request is also `scim.bulk`, with how many operations were sent, run and failed, why it stopped (`failOnErrors`, `rateLimited`), and each operation's method, path, `bulkId` and status.
+**Audit.** Each operation logs what its own request would, including `scim.request_failed` when it fails with anything but a 404 or a 429, so failed operations count in the health score though the Bulk request itself is 200. The whole request is also `scim.bulk`, with how many operations were sent, run and failed, why it stopped (`failOnErrors`, `rateLimited`), and each operation's method, path, `bulkId` and status.
 
 ## Groups to roles
 

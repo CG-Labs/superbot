@@ -358,6 +358,7 @@ async fn bulk_operations_count_against_the_tenants_rate_limit() {
     let (code, head, _) = bulk(w.port, &a, req(json!([{ "method": "DELETE", "path": "/Users/x" }]))).await;
     assert_eq!((code, header(&head, "retry-after").is_some()), (429, true), "the tenant is over its limit");
     assert_eq!(statuses(&ran(w.port, &b, req(json!([{ "method": "DELETE", "path": "/Users/x" }]))).await), ["404"], "other tenants aren't slowed");
+    assert!(events(w.port, &w.admin, "action=scim.request_failed").await.is_empty(), "a 429 isn't a failed request, in Bulk or not");
 }
 
 #[tokio::test]
@@ -401,6 +402,15 @@ async fn tenants_stay_apart_in_bulk() {
     }
     let e = &events(w.port, &w.admin, "action=scim.bulk").await[0];
     assert_eq!((e["actorId"].as_str(), e["details"]["tenant"].as_str(), e["details"]["failed"].clone()), (Some(format!("scim:{b_id}").as_str()), Some("b"), json!(8)));
+    // Each failed operation is a failed SCIM request for the health score, as on its own; 404s aren't.
+    let mut failed: Vec<(Option<&str>, Option<u64>, Option<&str>, Option<&str>)> = Vec::new();
+    let list = events(w.port, &w.admin, "action=scim.request_failed").await;
+    for e in &list {
+        assert_eq!((e["actorId"].as_str(), e["details"]["tenant"].as_str()), (Some(format!("scim:{b_id}").as_str()), Some("b")), "{e}");
+        failed.push((e["details"]["method"].as_str(), e["details"]["status"].as_u64(), e["details"]["resource"].as_str(), (e["details"]["status"] == 409).then(|| e["details"]["reason"].as_str()).flatten()));
+    }
+    failed.sort();
+    assert_eq!(failed, [(Some("POST"), Some(400), Some("Groups"), None), (Some("POST"), Some(409), Some("Users"), Some("uniqueness"))], "{list:#?}");
 
     // bulkIds live only in their own request: b can't reach what a's request made.
     let made = ran(w.port, &a, req(json!([{ "method": "POST", "path": "/Users", "bulkId": "new", "data": okta_user("new@example.com", "x2") }]))).await;

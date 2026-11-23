@@ -314,22 +314,17 @@ struct Done {
     made: Option<String>,
 }
 
-async fn done(op: &Op, location: Option<String>, res: ScimRes) -> Done {
+async fn done(op: &Op, location: Option<String>, r: Response) -> Done {
     let mut entry = json!({ "method": op.method.name() });
     if let Some(b) = &op.bulk_id {
         entry["bulkId"] = json!(b);
     }
-    let (status, location, body, ok) = match res {
-        Ok(r) => {
-            let status = r.status();
-            let at = r.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()).map(String::from);
-            let bytes = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap_or_default();
-            let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-            let at = at.or_else(|| body["meta"]["location"].as_str().map(String::from)).or(location);
-            (status, at, body, status.is_success())
-        }
-        Err(e) => (e.status, location, e.body(), false),
-    };
+    let status = r.status();
+    let at = r.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()).map(String::from);
+    let bytes = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap_or_default();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let ok = status.is_success();
+    let location = at.or_else(|| body["meta"]["location"].as_str().map(String::from)).or(location);
     entry["status"] = json!(status.as_u16().to_string());
     if let Some(l) = location {
         entry["location"] = json!(l);
@@ -387,17 +382,22 @@ pub async fn bulk(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>
             (None, Some(r)) => Err(ScimError::new(StatusCode::CONFLICT, None, format!("bulkId:{r}: the POST that defines it failed, so this operation was not run."))),
             (None, None) => dispatch(&app, &a, &c, &headers, op, id.clone(), &resolve(&op.data, &made)).await,
         };
-        let d = done(op, location, res).await;
+        let path = match &id {
+            Some(id) => format!("/{}/{id}", op.kind.endpoint()),
+            None => format!("/{}", op.kind.endpoint()),
+        };
+        let r = res.unwrap_or_else(IntoResponse::into_response);
+        // As the guard would for the operation's own request, which records nothing for its 429s.
+        if limited.is_none() {
+            request_failed(&app, &c.who, tenant, op.method.name(), &path, &r);
+        }
+        let d = done(op, location, r).await;
         if let (Some(b), Some(new)) = (&op.bulk_id, &d.made) {
             made.insert(b.clone(), new.clone());
         }
         if !d.ok {
             failed += 1;
         }
-        let path = match &id {
-            Some(id) => format!("/{}/{id}", op.kind.endpoint()),
-            None => format!("/{}", op.kind.endpoint()),
-        };
         audit.push(json!({ "method": op.method.name(), "path": path, "bulkId": op.bulk_id, "status": d.entry["status"] }));
         results.push(d.entry);
         if stopped == Some(Stopped::RateLimited) {
