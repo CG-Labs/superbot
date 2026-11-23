@@ -50,7 +50,8 @@ ARM=sha256:$(printf 'arm' | sha256sum | cut -c1-64)
 index_json() {
   printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"digest":"%s","platform":{"os":"linux","architecture":"amd64"}},{"digest":"%s","platform":{"os":"linux","architecture":"arm64"}}]}' "$1" "$2"
 }
-index_json "$AMD" "$ARM" >"$T/reg/index.json"
+# With a trailing newline, as some registries serve it: the digest is of every byte.
+{ index_json "$AMD" "$ARM"; echo; } >"$T/reg/index.json"
 INDEX=sha256:$(sha256sum <"$T/reg/index.json" | cut -c1-64)
 
 # skopeo inspect --raw docker://REF: the registry's index for any tag, unless STUB_RAW names
@@ -188,7 +189,7 @@ index_json "$AMD" "$other" >"$T/reg/index.json"
 INDEX=sha256:$(sha256sum <"$T/reg/index.json" | cut -c1-64)
 release "$T/armdiff" true
 refused "an arch's image that differs" "linux/arm64 image is $other, but the aarch64 bundle carries $ARM" online "$T/armdiff" --any-binary-arch
-index_json "$AMD" "$ARM" >"$T/reg/index.json"
+{ index_json "$AMD" "$ARM"; echo; } >"$T/reg/index.json"
 INDEX=sha256:$(sha256sum <"$T/reg/index.json" | cut -c1-64)
 ok "a tag that moved, an image signature that fails, and an arch's image that differs from the bundle's are refused"
 
@@ -197,7 +198,14 @@ refused "keyless with no trusted root" "give --trusted-root" stubbed "$CHECK" of
 RAW="$T/reg/moved.json" refused "a mirror naming another digest" "not the signed index $INDEX" offline "$T/good"
 FAIL="verify-attestation" refused "no verified provenance in the mirror" "no verified build provenance" offline "$T/good"
 FAIL="verify localhost:5002/mirror/superbot@$ARM" refused "an image in the mirror whose signature fails" "cosign verify failed for localhost:5002/mirror/superbot@$ARM" offline "$T/good"
+cp "$T/good/release-check.expected" "$T/exp.bak"
+sed -i '/^image /d' "$T/good/release-check.expected"
+refused "a record without its image lines" 'records images "", but the bundles hold "superbot"' offline "$T/good"
+cp "$T/exp.bak" "$T/good/release-check.expected"
+echo "image other reg.test/cg/other:1 $INDEX" >>"$T/good/release-check.expected"
+refused "a record naming an image the bundles don't hold" 'records images "other superbot"' offline "$T/good"
+cp "$T/exp.bak" "$T/good/release-check.expected"
 printf '%064d  x\n' 0 >"$T/sum"
 sed -i "s/^bundle aarch64 .*/bundle aarch64 $(cut -c1-64 "$T/sum")/" "$T/good/release-check.expected"
 refused "a bundle that changed after the online check" "doesn't verify offline" offline "$T/good"
-ok "offline, a missing online record or trusted root, a mirror naming another digest, an unverified image or provenance, and a changed bundle are refused"
+ok "offline, a missing or cut-short online record or trusted root, a mirror naming another digest, an unverified image or provenance, and a changed bundle are refused"
