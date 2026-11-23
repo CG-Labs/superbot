@@ -193,6 +193,37 @@ describe("personal secrets (ADR 0029, 0044)", () => {
   });
 });
 
+describe("service accounts (ADR 0143, 0152)", () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  it("calls the service-account routes with escaped ids and only the fields given", async () => {
+    const fetchMock = jest.fn(async () => ({ ok: true, status: 200, json: async () => ({ token: "sbsa_x", serviceAccounts: [] }) }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const api = new SuperBotApi({ baseUrl: BASE, token: "sbs_" + "a".repeat(64) });
+    const last = () => fetchMock.mock.lastCall as unknown as [string, RequestInit];
+
+    await api.serviceAccounts();
+    expect(last()[0]).toBe(`${BASE}/api/service-accounts`);
+    await api.createServiceAccount({ name: "CI", description: "", role: "readonly", team: null });
+    expect(last()).toEqual([`${BASE}/api/service-accounts`, expect.objectContaining({ method: "POST", body: JSON.stringify({ name: "CI", description: "", role: "readonly", team: null }) })]);
+    await api.updateServiceAccount("s/1", { status: "disabled" });
+    expect(last()).toEqual([`${BASE}/api/service-accounts/s%2F1`, expect.objectContaining({ method: "PATCH", body: JSON.stringify({ status: "disabled" }) })]);
+    await api.serviceAccount("s/1");
+    expect(last()[0]).toBe(`${BASE}/api/service-accounts/s%2F1`);
+    expect((await api.createServiceToken("sa1", { scopes: ["read"], expiresInDays: 7 })).token).toBe("sbsa_x");
+    expect(last()).toEqual([`${BASE}/api/service-accounts/sa1/tokens`, expect.objectContaining({ method: "POST", body: JSON.stringify({ scopes: ["read"], expiresInDays: 7 }) })]);
+    await api.rotateServiceToken("sa1", "st1", { keepOldMinutes: 60 });
+    expect(last()).toEqual([`${BASE}/api/service-accounts/sa1/tokens/st1/rotate`, expect.objectContaining({ method: "POST", body: JSON.stringify({ keepOldMinutes: 60 }) })]);
+    await api.revokeServiceToken("sa1", "st1");
+    expect(last()).toEqual([`${BASE}/api/service-accounts/sa1/tokens/st1`, expect.objectContaining({ method: "DELETE" })]);
+    await api.deleteServiceAccount("sa1");
+    expect(last()).toEqual([`${BASE}/api/service-accounts/sa1`, expect.objectContaining({ method: "DELETE" })]);
+  });
+});
+
 describe("SuperBotApi policy editor (ADR 0049)", () => {
   const realFetch = globalThis.fetch;
   afterEach(() => {
