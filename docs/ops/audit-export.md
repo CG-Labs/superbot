@@ -1,6 +1,6 @@
 # Audit log: SIEM export and tamper evidence
 
-Every audit event is sealed onto a hash chain as it is written, so a changed, removed, added or reordered event shows. Every hour botd signs a checkpoint of the chain's head, and can have each one timestamped by an RFC 3161 time-stamping authority (TSA). botd can also send every event to your SIEM as it happens: JSON lines over HTTPS, or RFC 5424 syslog over TLS. Or it can archive them in batches to an S3 bucket with Object Lock, where nobody can change or delete them until their retention ends ([below](#archive-events-to-write-once-s3)), or do both at once ([below](#a-siem-and-an-archive-together)), and send to up to four SIEMs, each with its own token ([below](#several-siems)). The chain and checkpoints are always on and need nothing. Timestamps and the export are off until you set them. Design: [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md), [ADR 0149](../adr/0149-signed-and-timestamped-audit-checkpoints.md), [ADR 0154](../adr/0154-write-once-s3-audit-archive.md), [ADR 0163](../adr/0163-checking-the-audit-archive.md), [ADR 0173](../adr/0173-an-archive-alongside-a-siem.md), [ADR 0183](../adr/0183-daily-check-of-new-archive-objects.md) and [ADR 0191](../adr/0191-several-siems-with-their-own-headers.md).
+Every audit event is sealed onto a hash chain as it is written, so a changed, removed, added or reordered event shows. Every hour botd signs a checkpoint of the chain's head, and can have each one timestamped by an RFC 3161 time-stamping authority (TSA). botd can also send every event to your SIEM as it happens: JSON lines over HTTPS, or RFC 5424 syslog over TLS. Or it can archive them in batches to an S3 bucket with Object Lock, where nobody can change or delete them until their retention ends ([below](#archive-events-to-write-once-s3)), or do both at once ([below](#a-siem-and-an-archive-together)), and send to up to four SIEMs, each with its own token ([below](#several-siems)). The chain and checkpoints are always on and need nothing. Timestamps and the export are off until you set them. Design: [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md), [ADR 0149](../adr/0149-signed-and-timestamped-audit-checkpoints.md), [ADR 0154](../adr/0154-write-once-s3-audit-archive.md), [ADR 0163](../adr/0163-checking-the-audit-archive.md), [ADR 0173](../adr/0173-an-archive-alongside-a-siem.md), [ADR 0183](../adr/0183-daily-check-of-new-archive-objects.md), [ADR 0191](../adr/0191-several-siems-with-their-own-headers.md), [ADR 0199](../adr/0199-self-checking-audit-lines.md) and [ADR 0207](../adr/0207-checking-timestamps-from-exported-lines.md).
 
 ## Check the chain
 
@@ -109,7 +109,7 @@ jq -r .checkpoint.timestamp.token line.json | base64 -d > token.der
 openssl ts -verify -token_in -in token.der -data stamped -CAfile <tsa-ca.pem>
 ```
 
-Then compare the statement's `seq` and `hash` with that event in your SIEM: they must be its `id` and `chainHash`. Keep the TSA's certificates: a token can be checked for as long as its chain can.
+Then compare the statement's `seq` and `hash` with that event in your SIEM: they must be its `id` and `chainHash`. Keep the TSA's certificates: a token can be checked for as long as its chain can. `botctl audit verify-lines --timestamp-ca <tsa-ca.pem>` does all of this for every line at once ([below](#check-exported-events-without-botd)), and the archive check does it from the archive.
 
 ### Failures
 
@@ -239,10 +239,11 @@ This checks the chain as usual and also reads the whole archive (`GET /api/audit
 - each object is what its key and metadata say, and is locked (unless the lock is `off`);
 - the chain runs from event to event and object to object with no gap;
 - every signed checkpoint in the archive holds under the trusted keys (botd's own, or `--key`);
+- every checkpoint's RFC 3161 timestamp in the archive holds: the token the line carries is the one its event recorded (by SHA-256, which the chain covers), it stamps that checkpoint's statement and signature at the time recorded, and its TSA's certificate signed it, chaining to `AUDIT_TIMESTAMP_CA_FILE` when that is set. The token isn't covered by any hash, so a changed one would otherwise go unseen;
 - the archive begins with the first event botd sent it, and reaches the last event botd says it delivered;
 - every archived event has the same hash in this server's log. This catches a log rebuilt after an event was changed: its own chain verifies, but it no longer matches what was archived. It's the same as pinning every event (`--pin`). While the event is still here, what the archive says it was must also match this server's row: its fields, and, unless an erasure has since rewritten them, the personal ones.
 
-The check fails, and exits 1, if any of that doesn't hold. `firstBroken` then names the first event here that differs from the archive (reason `archive`). The answer's `archive` block counts `objects`, `events`, `matched`, `gone` (deleted here by retention, with the anchor's hash still checked), `mismatched`, `altered`, `missing`, `locked`, `lockExpired` and `checkpoints`. It also counts `repeated` (events a restarted export wrote twice), `retried` (extra identical versions of an object) and `hidden` (objects behind a delete marker, which are still read). `bound`, `boundFixed` and `unbound` count the copies whose hash vouches for every field (they have `chainSalt`), only the fields no erasure changes (erased or redacted on the way out), or nothing (sent before `digestsAfter`). `firstProblems` lists the first 20 problems, each with a `key`, `id` and one of these reasons:
+The check fails, and exits 1, if any of that doesn't hold. `firstBroken` then names the first event here that differs from the archive (reason `archive`). The answer's `archive` block counts `objects`, `events`, `matched`, `gone` (deleted here by retention, with the anchor's hash still checked), `mismatched`, `altered`, `missing`, `locked`, `lockExpired`, `checkpoints`, `timestamps` and `trustedTimestamps` (null without `AUDIT_TIMESTAMP_CA_FILE`), with the newest timestamp as `lastTimestamp`. It also counts `repeated` (events a restarted export wrote twice), `retried` (extra identical versions of an object) and `hidden` (objects behind a delete marker, which are still read). `bound`, `boundFixed` and `unbound` count the copies whose hash vouches for every field (they have `chainSalt`), only the fields no erasure changes (erased or redacted on the way out), or nothing (sent before `digestsAfter`). `firstProblems` lists the first 20 problems, each with a `key`, `id` and one of these reasons:
 
 | Reason | Meaning |
 |---|---|
@@ -257,6 +258,7 @@ The check fails, and exits 1, if any of that doesn't hold. `firstBroken` then na
 | `metadata`, `order` | An object's key or metadata doesn't match its events, or they're out of order |
 | `unlocked` | An object has no lock. An ended lock is only counted, as `lockExpired` |
 | `checkpoint` | A signed checkpoint in the archive doesn't hold, even in a repeated batch |
+| `timestamp` | A checkpoint's timestamp in the archive doesn't hold, even in a repeated batch: its token isn't the one recorded, is missing, doesn't stamp that checkpoint, or its TSA isn't trusted. The error says which |
 | `stray` | A key under the prefix that botd didn't write |
 | `unreadable` | An object couldn't be read or parsed |
 
@@ -280,7 +282,8 @@ If it fails:
 
 - `error` naming `s3:ListBucketVersions`: grant that right on the bucket (archives set up before the daily check may lack it), or set `AUDIT_EXPORT_S3_CHECK=off`.
 - `mismatch` or `missing` at the head it carried on from, or at an archived event: this server's log no longer says what was archived. Treat it as tampering until shown otherwise: compare the archive's copy of that event with the log, and with your SIEM's copy if there is one.
-- `contents`, `digest`, `unbound`, `overwritten`, `stray`: someone wrote to the archive with its key. The first version of each object is still what's checked. Find who used the key, then rotate it.
+- `timestamp` with `untrusted`: if you changed TSA, `AUDIT_TIMESTAMP_CA_FILE` must still hold the old TSA's CA as well as the new one's. Otherwise, as below.
+- `contents`, `digest`, `unbound`, `overwritten`, `stray`, `timestamp`: someone wrote to the archive with its key. The first version of each object is still what's checked. Find who used the key, then rotate it.
 - `link` or `behind`: new objects are missing. Check the export's status (`botctl audit siem`) first.
 
 Erased users' data stays in locked objects until their lock ends, like a SIEM or a backup: choose the period with your DPA in mind.
@@ -332,7 +335,7 @@ A single SIEM needs no name, so settings from before keep working. To move to se
 
 ```sh
 aws s3 cp --recursive s3://<bucket>/<prefix>/ ./audit/
-botctl audit verify-lines ./audit/ --key <checkpoint public key hex> --digests-after <id>
+botctl audit verify-lines ./audit/ --key <checkpoint public key hex> --digests-after <id> --timestamp-ca <tsa-ca.pem>
 
 # A SIEM export, as JSON lines or syslog, from a file or stdin
 zcat siem-export-2026-11.jsonl.gz | botctl audit verify-lines - --key <checkpoint public key hex> --digests-after <id>
@@ -346,16 +349,17 @@ It reads files, directories (their `.jsonl`, `.ndjson`, `.json` and `.log` files
 - copies of one event against each other (`conflict`);
 - the chain from event to event, with no gap (`link`);
 - that every event after `--digests-after` carries `chainDigest` (`unbound`). Take it from `digestsAfter` in `botctl audit siem` once, and keep it with the checkpoint key. It never changes. Without it, the first line with a digest stands in for it, so lines stripped of every digest bind nothing, and still pass;
-- each signed checkpoint (`checkpoint`), under the keys given with `--key` (from `botctl audit key`, or the `audit.checkpoint_key` events in your SIEM). Without `--key` a checkpoint is checked under the key in it, which only shows it agrees with whoever signed it.
+- each signed checkpoint (`checkpoint`), under the keys given with `--key` (from `botctl audit key`, or the `audit.checkpoint_key` events in your SIEM). Without `--key` a checkpoint is checked under the key in it, which only shows it agrees with whoever signed it;
+- each checkpoint's RFC 3161 timestamp (`timestamp`), as the [archive check](#check-the-archive) does: the token is the one its event recorded, stamps that checkpoint at the time recorded, and chains to the CA certificates given with `--timestamp-ca` (a PEM file, as `AUDIT_TIMESTAMP_CA_FILE`; repeat it for several TSAs). Without `--timestamp-ca` a token is checked under the certificate it carries, which only shows it agrees with whoever signed it. When the checkpoint's own event isn't among the lines, the record the timestamp line carries stands in for it, and its signature must hold under `--key`.
 
-It prints a JSON report: per host, `events`, `copies`, `first` and `firstPrev` (the genesis hash for a log never pruned), `head`, `bound`, `boundFixed` and `unbound` (as for the [archive check](#check-the-archive)), `checkpoints` and their `checkpointKeys`, and the first 20 `firstProblems`, each with `id`, `at` (`<file>:<line>`) and `reason`. It exits 1 if anything doesn't hold, or if no events were found.
+It prints a JSON report: per host, `events`, `copies`, `first` and `firstPrev` (the genesis hash for a log never pruned), `head`, `bound`, `boundFixed` and `unbound` (as for the [archive check](#check-the-archive)), `checkpoints` and their `checkpointKeys`, `timestamps`, `trustedTimestamps` (null without `--timestamp-ca`), `lastTimestamp`, `unstamped` (checkpoints made with a TSA whose timestamp isn't among the lines, which isn't a failure: it may not be exported yet), and the first 20 `firstProblems`, each with `id`, `at` (`<file>:<line>`) and `reason`. It exits 1 if anything doesn't hold, or if no events were found.
 
 What it can't tell you:
 
 - that nothing is missing at the start or the end. Compare `first` and `head` with what botd says it delivered (`botctl audit siem`), or pin a head kept elsewhere: the last `audit.checkpoint` you trust signs it;
 - what a line without `chainSalt` said in its personal fields and `details`. Those are erased or redacted events, and `boundFixed` counts them;
 - anything about events sent before `digestsAfter`, beyond their links. Check them with `botctl audit verify --archive` while their rows are still here;
-- RFC 3161 timestamps. Check those with OpenSSL ([above](#check-a-checkpoint-without-botd)).
+- whether a TSA certificate was revoked. It checks the TSA's chain at the token's time, so a certificate that has since expired still holds, and it reads no revocation list.
 
 ## Retention and erasure
 
