@@ -295,3 +295,57 @@ async fn checking_the_archive_catches_a_forged_version_a_gap_and_a_stray_key() {
     assert!(reasons(&v).contains(&"behind".to_string()), "{v}");
     assert!(v["archive"]["delivered"].as_i64().unwrap() >= delivered);
 }
+
+#[tokio::test]
+async fn checking_the_archive_catches_its_first_objects_gone_and_reads_null_versions() {
+    let (port, app, admin, _) = serve_app().await;
+    let s = StandIn::start().await;
+    export_to(&app, &vars(&s, &[("AUDIT_EXPORT_S3_LOCK", "off")]));
+    let x = app.audit_export.get().unwrap().clone();
+    for _ in 0..3 {
+        archive_round(&app, &x, 2).await;
+    }
+    let v = verify_archive(port, &admin, "").await;
+    assert_eq!((v["archive"]["ok"].as_bool(), v["archive"]["start"].as_i64(), v["archive"]["first"].as_i64()), (Some(true), Some(1), Some(1)), "{v}");
+
+    // Written before versioning was on, the first object's version is `null`; a different
+    // version over it is caught, not read in its place.
+    let first = s.keys()[0].clone();
+    {
+        let mut w = s.w();
+        let v = w.history[&first][0].clone();
+        w.history.insert(first.clone(), vec!["null".into()]);
+        let b = w.bodies.remove(&(first.clone(), v.clone())).unwrap();
+        w.bodies.insert((first.clone(), "null".into()), b);
+        let st = w.versions.remove(&(first.clone(), v)).unwrap();
+        w.versions.insert((first.clone(), "null".into()), st);
+        w.meta.get_mut(&first).unwrap().1 = "null".into();
+        w.versioning = Some("Enabled");
+    }
+    let c = machines::s3::S3::new(s.settings()).unwrap();
+    let (meta, _) = s.w().meta[&first].clone();
+    let body = String::from_utf8(s.w().objects[&first].clone()).unwrap().replace("test.archive", "test.innocent");
+    use base64::Engine;
+    let sum = base64::engine::general_purpose::STANDARD.encode(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, body.as_bytes()).as_ref());
+    let mut h: Vec<(&str, String)> = meta.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    h.push(("x-amz-checksum-sha256", sum));
+    c.put_with(&first, body.into_bytes(), &h).await.unwrap();
+    let v = verify_archive(port, &admin, "").await;
+    assert_eq!(reasons(&v), ["overwritten"], "{v}");
+    assert!(s.w().calls.iter().any(|c| c.contains("versionId=null")), "the null version is read by its id");
+
+    // The first objects gone for good: the rest still links up and reaches the end, yet
+    // the archive no longer begins where botd started it.
+    let fresh = StandIn::start().await;
+    let (port, app, admin, _) = serve_app().await;
+    export_to(&app, &vars(&fresh, &[("AUDIT_EXPORT_S3_LOCK", "off")]));
+    let x = app.audit_export.get().unwrap().clone();
+    for _ in 0..3 {
+        archive_round(&app, &x, 2).await;
+    }
+    let c = machines::s3::S3::new(fresh.settings()).unwrap();
+    c.delete(&fresh.keys()[0]).await.unwrap();
+    let v = verify_archive(port, &admin, "").await;
+    assert_eq!((v["archive"]["ok"].as_bool(), reasons(&v)), (Some(false), vec!["start".to_string()]), "{v}");
+    assert_eq!(v["archive"]["firstProblems"][0]["id"].as_i64(), Some(1), "{v}");
+}

@@ -32,7 +32,8 @@ const MAX_LISTED: usize = 20;
 /// from the one botd wrote), `metadata` (its key or metadata doesn't match its events),
 /// `unlocked`, `order` (its events are out of order), `link` (an event doesn't link to the
 /// one before: an object is missing, or isn't botd's), `checkpoint`, `behind` (the archive
-/// ends before the last event botd delivered to it), or, against this server's log,
+/// ends before the last event botd delivered to it), `start` (it begins after the first
+/// event botd sent it), or, against this server's log,
 /// `mismatch` (the event here has another hash) and `missing` (it's gone, and retention
 /// didn't delete it).
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -70,6 +71,9 @@ pub struct Checked {
     pub head: Option<Link>,
     /// The last event botd had delivered to the archive when the check began.
     pub delivered: i64,
+    /// The first event of the first batch botd cut for this archive, where it must begin.
+    /// None for an archive started before botd recorded it.
+    pub start: Option<i64>,
     /// Events whose hash this server's log has (`matched`), had before retention deleted
     /// them (`gone`), differs from (`mismatched`) or lacks (`missing`).
     pub matched: u64,
@@ -183,6 +187,11 @@ impl<'a> Walker<'a> {
         Walker { rep: Checked { archive: a.shown(), delivered, ..Default::default() }, lock: a.lock, keys, last: None }
     }
 
+    pub fn starting_at(mut self, start: Option<i64>) -> Walker<'a> {
+        self.rep.start = start;
+        self
+    }
+
     fn problem(&mut self, key: Option<&str>, id: Option<i64>, reason: &'static str, error: String) {
         self.rep.problems += 1;
         if self.rep.first_problems.len() < MAX_LISTED {
@@ -266,6 +275,12 @@ impl<'a> Walker<'a> {
             self.compare(key, e, local, anchor);
             if self.rep.head.as_ref().is_some_and(|h| e.id <= h.id) {
                 self.rep.repeated += 1;
+                // Its details aren't covered by the hash compared, so its signature still must hold.
+                if e.action == crate::audit_checkpoint::CHECKPOINT
+                    && let Err(f) = crate::audit_checkpoint::check_signed(e.id, Some(&e.prev), Some(&e.details), None, self.keys)
+                {
+                    self.problem(k, Some(e.id), "checkpoint", format!("checkpoint {} ({}), repeated in {key}: {}", e.id, f.reason, f.error));
+                }
                 continue;
             }
             let before = self.last.take();
@@ -331,6 +346,15 @@ impl<'a> Walker<'a> {
             let error = format!("botd delivered events up to {d} to the archive, but it ends at {head}: objects are missing from it");
             self.problem(None, Some(head + 1), "behind", error);
         }
+        if let (Some(s), Some(first)) = (self.rep.start, self.rep.first)
+            && self.rep.error.is_none()
+            && first > s
+            && range.from.is_none_or(|f| f <= s)
+            && range.to.is_none_or(|t| s <= t)
+        {
+            let error = format!("botd's first batch for this archive began at event {s}, but the archive begins at {first}: objects are missing from its start");
+            self.problem(None, Some(s), "start", error);
+        }
         let mut rep = self.rep;
         rep.ok = rep.problems == 0 && rep.error.is_none();
         rep
@@ -352,9 +376,10 @@ struct Read {
     overwritten: Option<String>,
 }
 
+/// `version` as listed, `null` included: an object written before versioning was on has
+/// that id, and reading without one would give the newest version instead.
 async fn body(s3: &S3, key: &str, version: &str) -> Result<(Meta, Vec<u8>), String> {
-    let version = Some(version).filter(|v| *v != "null");
-    let res = s3.get_version(key, version).await?;
+    let res = s3.get_version(key, Some(version)).await?;
     if res.content_length().is_some_and(|n| n as usize > MAX_OBJECT_BYTES) {
         return Err(format!("{key} is larger than any batch botd writes"));
     }
@@ -429,10 +454,11 @@ fn local(app: &App, lo: i64, hi: i64) -> rusqlite::Result<Local> {
 
 /// Checks the archive `a` within `range` against itself and this server's log, trusting
 /// checkpoints signed by `keys`. `delivered`: how far botd says it got, read before the
-/// listing; `batches`: whether it has cut any batch for this archive.
-pub async fn check(app: &App, a: &Archive, delivered: i64, batches: bool, range: Range, keys: &[Vec<u8>]) -> Checked {
+/// listing; `batches`: whether it has cut any batch for this archive; `start`: the first
+/// event of its first batch, if recorded.
+pub async fn check(app: &App, a: &Archive, delivered: i64, batches: bool, start: Option<i64>, range: Range, keys: &[Vec<u8>]) -> Checked {
     use futures_util::StreamExt;
-    let mut w = Walker::new(a, delivered, keys);
+    let mut w = Walker::new(a, delivered, keys).starting_at(start);
     let s3 = match S3::new(a.s3.clone()) {
         Ok(s) => s.called("the audit archive"),
         Err(e) => {
@@ -486,7 +512,7 @@ pub async fn check(app: &App, a: &Archive, delivered: i64, batches: bool, range:
 /// What `audit.verified` records of an archive check: counts and the first problem.
 pub fn summary(c: &Checked) -> Value {
     serde_json::json!({
-        "ok": c.ok, "archive": c.archive, "objects": c.objects, "events": c.events, "first": c.first, "head": c.head, "delivered": c.delivered,
+        "ok": c.ok, "archive": c.archive, "objects": c.objects, "events": c.events, "first": c.first, "head": c.head, "delivered": c.delivered, "start": c.start,
         "matched": c.matched, "gone": c.gone, "mismatched": c.mismatched, "missing": c.missing, "locked": c.locked, "lockExpired": c.lock_expired,
         "checkpoints": c.checkpoints, "problems": c.problems, "firstProblem": c.first_problems.first(), "error": c.error,
     })
@@ -674,7 +700,32 @@ mod tests {
         let mut w = Walker::new(&a, 3, &trusted);
         let mut forged = cp(2, &key);
         forged["at"] = json!(1);
-        w.object(key3, (1, 3), &meta(1, 3), &lines_with(forged), &local(3), None);
+        w.object(key3, (1, 3), &meta(1, 3), &lines_with(forged.clone()), &local(3), None);
         assert!(w.finish(Range::default(), true).first_problems[0].error.contains("(signature)"));
+        // A repeat of the batch, with the same hashes but a forged checkpoint, is still checked.
+        let mut w = Walker::new(&a, 3, &trusted);
+        w.object(key3, (1, 3), &meta(1, 3), &lines_with(cp(2, &key)), &local(3), None);
+        w.object("prod/2026/11/24/00000000000000000001-00000000000000000003.jsonl", (1, 3), &meta(1, 3), &lines_with(forged), &local(3), None);
+        let c = w.finish(Range::default(), true);
+        assert_eq!((reasons(&c), c.repeated, c.checkpoints), (vec!["checkpoint"], 3, 1), "{c:?}");
+        assert!(c.first_problems[0].error.contains("(signature), repeated in prod/2026/11/24/"), "{c:?}");
+    }
+
+    #[test]
+    fn the_archive_must_begin_where_botd_started_it() {
+        let a = archive("bucket");
+        let walk_from = |start: i64, objects: &[(i64, i64)], range: Range| {
+            let mut w = Walker::new(&a, 9, &[]).starting_at(Some(start));
+            for &(f, t) in objects {
+                w.object(&format!("prod/2026/11/23/{f:020}-{t:020}.jsonl"), (f, t), &meta(f, t), &body(f..=t), &local(9), None);
+            }
+            w.finish(range, true)
+        };
+        let c = walk_from(1, &[(4, 6), (7, 9)], Range::default());
+        assert_eq!((c.ok, reasons(&c), c.first_problems[0].id), (false, vec!["start"], Some(1)), "{c:?}");
+        assert!(walk_from(1, &[(1, 3), (4, 9)], Range::default()).ok);
+        assert!(walk_from(4, &[(4, 6), (7, 9)], Range::default()).ok, "started later (AUDIT_EXPORT_START=new, or after retention)");
+        assert!(walk_from(1, &[(4, 6), (7, 9)], Range { from: Some(4), to: None }).ok, "a range from later doesn't ask");
+        assert!(walk(&[(4, 9)], "bucket", 9, &local(9)).ok, "no start recorded");
     }
 }

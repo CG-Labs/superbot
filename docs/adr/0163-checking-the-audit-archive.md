@@ -45,24 +45,24 @@ botd lists every version under `<prefix>/` and groups the versions by key. Keys 
 
 - **Shape**: the key's ids, `-first-id`, `-last-id`, `-events`, `-chain-prev`, `-chain-head` and `-schema` match the body (`metadata`), and ids rise within it (`order`).
 - **Lock**: unless the lock is `off`, the version has a lock mode and a retain-until date (`unlocked`). A date that has passed is counted (`lockExpired`) but isn't a failure: the operator chose the period.
-- **Chain**: each event's `chainPrev` is the previous event's `chainHash`, across objects too (`link`). An event at or below the head so far is a repeat that a restarted export can leave. Repeats are counted and still compared with the log, but they don't move the chain.
+- **Chain**: each event's `chainPrev` is the previous event's `chainHash`, across objects too (`link`). An event at or below the head so far is a repeat that a restarted export can leave. Repeats are counted and still compared with the log, and a repeated checkpoint's signature must still hold, since its details aren't covered by the hash compared. They don't move the chain.
 - **Checkpoints**: each `audit.checkpoint` must hold its own signature under a trusted key (botd's current and past keys, or `--key`). If it links to the event before it, it must also name that event (`checkpoint`). This reuses `audit_checkpoint::check_signed`, the same code the log check runs. Timestamp tokens aren't checked here.
 - **The log**: each event's hash must equal this server's `chain_hash` for that id (`mismatch`), or the id must be at or below the anchor retention keeps, with the anchor's own hash equal (`gone`). Otherwise it's `missing`.
-- **Completeness**: if the archive ends before the `delivered` cursor read when the check started, it's `behind`. This only applies when botd has cut a batch for this archive and the cursor is in range. With `AUDIT_EXPORT_START=new`, an empty archive is fine.
+- **Completeness**: if the archive ends before the `delivered` cursor read when the check started, it's `behind`. This only applies when botd has cut a batch for this archive and the cursor is in range. With `AUDIT_EXPORT_START=new`, an empty archive is fine. botd also saves the first event of the first batch it ever cuts for an archive (`<sink>#start`, beside its cursors). A check whose range covers that event fails as `start` if the archive begins later: its first objects are gone. Starting from `new`, or after retention deleted older events, is fine, since that event is where it began. Archives started before botd saved it aren't asked.
 
 ### The answer
 
-`Report` gains an `archive` block: the counts, `first`, `head`, `delivered`, `problems`, and the first 20 `firstProblems` (`key`, `id`, `reason`, `error`). Each `mismatch` or `missing` event also breaks the log check with reason `archive`, so `firstBroken` and `audit.verified`'s reason name it. Any archive problem fails the check, so `botctl` exits 1. `archive=on` with no S3 archive configured is a 409; any value other than `on` or `off` is a 400. The archive check is admin-only, like `verify`.
+`Report` gains an `archive` block: the counts, `first`, `head`, `delivered`, `start`, `problems`, and the first 20 `firstProblems` (`key`, `id`, `reason`, `error`). Each `mismatch` or `missing` event also breaks the log check with reason `archive`, so `firstBroken` and `audit.verified`'s reason name it. Any archive problem fails the check, so `botctl` exits 1. `archive=on` with no S3 archive configured is a 409; any value other than `on` or `off` is a 400. The archive check is admin-only, like `verify`.
 
 ### The S3 client
 
-`object_versions(prefix)` returns every version and delete marker with `IsLatest`, in listing order. `get_version(key, version)` reads one version. The backup code's `versions()` now uses the same parser.
+`object_versions(prefix)` returns every version and delete marker with `IsLatest`, in listing order. `get_version(key, version)` reads one version, by the id the listing gave, `null` included (an object written before versioning was on). The backup code's `versions()` now uses the same parser.
 
 ## What it proves
 
 - **A rebuilt log**: someone with `app.sqlite` changes an event and reseals the chain from there. The log check passes, but every event they changed that the archive holds fails as `mismatch`. They can't change the archive's locked versions.
 - **A forged archive object**: someone with the archive's key adds a version or a new key. The first version still decides, the new version is `overwritten`, and a new key is `stray`, or breaks the chain as `link` if it's named like botd's.
-- **A missing object**: in compliance mode it can't be deleted. In governance mode, or with the lock off, it shows as `link` at the next object, or `behind` at the end.
+- **A missing object**: in compliance mode it can't be deleted. In governance mode, or with the lock off, it shows as `link` at the next object, `behind` at the end, or `start` at the beginning.
 - **It doesn't prove** anything about events not yet archived (up to `AUDIT_EXPORT_S3_BATCH_SECONDS` plus any outage). It doesn't help against someone who controls botd while the check runs, since botd does the reading. For that, use the archive's own copy with checkpoints checked by OpenSSL, as ADR 0149 shows, or pin from a SIEM.
 
 ## Consequences
