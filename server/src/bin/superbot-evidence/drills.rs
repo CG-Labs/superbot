@@ -419,7 +419,7 @@ fn ci_file(c: Option<&Collected>) -> Value {
         "collected": true,
         "repository": c.repo["fullName"],
         "branch": c.branch,
-        "basis": "a drill's run counts when its workflow ran on the branch in the period and the job attempted the drill (jobs that skip the drill's timing step, such as Incus versions botd refuses, don't, and are counted per workflow); it passed when its drill step succeeded, which each drill allows only within its objective; seconds is the step's duration, which includes setting up, so it is at most the restore time the drill checks",
+        "basis": "a drill's run counts when its workflow ran on the branch in the period and the job attempted the drill (jobs that skip the drill's timing step, such as Incus versions botd refuses, don't, and are counted per workflow); it passed when its drill step succeeded, which each drill allows only within its objective; seconds is the step's duration, which includes setting up, so it is at least the restore time the drill checks",
         "workflows": sources,
         "summary": { "runs": c.executions.len(), "byDrill": by },
         "exceptions": exceptions,
