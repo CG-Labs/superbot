@@ -248,14 +248,21 @@ fn suspended(cp: &ControlPlane) -> std::sync::MutexGuard<'_, HashSet<String>> {
 
 /// Powers on machine `id`, which the sweep powered off and which has nothing left to
 /// leave. Some(true) once on, Some(false) if that failed (kept, to try again next pass),
-/// None if there was nothing to do: gone, or someone else already powered it on.
+/// None if there was nothing to do: gone, someone else already powered it on, or it
+/// has to stay off now for another reason.
 async fn resume(app: &AppState, cp: &ControlPlane, id: &str) -> Option<bool> {
-    let m = app.db.machine(id).filter(|m| m.state == State::Suspended);
+    let active = |user_id: &str| app.db.user(user_id).is_some_and(|u| u.active());
+    let m = app.db.machine(id).filter(|m| {
+        m.state == State::Suspended
+            && active(&m.user_id)
+            && !app.db.disable_hold(&m.id)
+            && !app.db.team_machine(&m.id).is_some_and(|t| t.released_at.is_some())
+    });
     let Some(m) = m else {
         suspended(cp).remove(id);
         return None;
     };
-    let still = |x: &Machine| x.id == m.id && x.state == State::Suspended;
+    let still = |x: &Machine| x.id == m.id && x.state == State::Suspended && active(&x.user_id);
     let _ = super::act_if(app, cp, &system(&m), &m.user_id, Step::Resume, None, &still).await;
     let on = app.db.machine(id).is_none_or(|x| x.state != State::Suspended);
     if on {

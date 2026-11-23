@@ -179,10 +179,12 @@ async fn a_machine_powered_off_to_leave_is_powered_on_again_whatever_happens_mea
     let (ada, _) = user_with(env.port, &env.admin, "ada@example.com", "member").await;
     let (al, _) = user_with(env.port, &env.admin, "al@example.com", "member").await;
     let (bo, _) = user_with(env.port, &env.admin, "bo@example.com", "member").await;
+    let (cy, _) = user_with(env.port, &env.admin, "cy@example.com", "member").await;
     let acme = team(&env, "Acme", "ada@example.com").await;
     join(&env, &acme, &al).await;
     join(&env, &acme, &bo).await;
-    for uid in [&ada, &al, &bo] {
+    join(&env, &acme, &cy).await;
+    for uid in [&ada, &al, &bo, &cy] {
         ask(&env, uid).await;
     }
     let net = env.fake.network_of(&pid(&env, &ada)).unwrap();
@@ -211,6 +213,17 @@ async fn a_machine_powered_off_to_leave_is_powered_on_again_whatever_happens_mea
     assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "resumed": 1 }));
     assert_eq!(machine(&env, &bo).state, State::Running);
     assert!(reconcile(&env).await.get("teamNetworks").is_none(), "nothing left to do");
+
+    // Cy's won't boot either, and she is disabled before the retry: it stays off.
+    leave(&cy).await;
+    reconcile(&env).await;
+    env.fake.fail_next("boot", crate::machines::provider::ProviderError::Api { status: 500, message: "try later".into() });
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "left": 1, "errors": 1 }));
+    env.app.db.update_user(&cy, crate::db::UserPatch { status: Some("disabled"), ..Default::default() }).unwrap();
+    for _ in 0..2 {
+        assert!(reconcile(&env).await.get("teamNetworks").is_none());
+    }
+    assert_eq!(machine(&env, &cy).state, State::Suspended, "a disabled user's machine is never powered on");
 }
 
 #[tokio::test]
