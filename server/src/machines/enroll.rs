@@ -502,6 +502,7 @@ impl Enrollment {
     }
 
     /// cloud-init user data that installs the agent and enrolls the machine on first boot.
+    #[cfg(test)]
     pub fn user_data(&self, m: &Machine, token: &str) -> String {
         self.user_data_on(m, token, None)
     }
