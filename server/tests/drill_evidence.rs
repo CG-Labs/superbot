@@ -283,6 +283,9 @@ esac
         let r = last_record(&o.stdout);
         assert_eq!((r["passed"].as_bool(), r["durationMs"].as_u64()), (Some(false), took), "{mode}: {r}");
         assert_eq!(String::from_utf8_lossy(&o.stdout).matches("superbotDrill").count(), 1, "{mode}: one record");
+        if mode == "slow" {
+            fs::write(dir.join("slow.log"), &o.stdout).unwrap();
+        }
     }
 
     let script = fs::read_to_string(root.join("deploy/backup-drill.sh")).unwrap();
@@ -310,6 +313,16 @@ esac
     assert_eq!((ci["collected"].as_bool(), ci["exceptions"]["notRunInPeriod"].clone()), (Some(false), json!([])));
     let manifest = json_in(&folder, "manifest.json");
     assert_eq!((manifest["source"]["ci"].as_bool(), manifest["files"][1]["checklist"].clone()), (Some(false), json!([])), "no CI runs read, so ci-drills.json maps no rows");
+
+    // The slow machine drill's saved output keeps its timing in the bundle and is over its objective.
+    fs::remove_dir_all(&folder).unwrap();
+    let o = evidence(&dir, &env, &["drills", "--no-ci", "--record", "slow.log", "--from", &from, "--to", &to, "-o", "slow.tar"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let op = json_in(&unpack(&dir, &dir.join("slow.tar")), "operator-drills.json");
+    let slow = &op["records"][0];
+    assert_eq!((slow["durationMs"].as_u64(), slow["withinObjective"].as_bool(), slow["restoreId"].as_str()), (Some(4_000_000), Some(false), Some("r1")), "{op:#}");
+    let over = format!("machine-restore {}", slow["finishedAt"].as_str().unwrap());
+    assert_eq!((op["exceptions"]["overObjective"].clone(), op["exceptions"]["failed"].clone()), (json!([over]), json!([over])), "{op:#}");
 
     let o = evidence(&dir, &[], &["drills", "--no-ci", "--repo", "example-org/example-repo", "--record", "machine.log"]);
     assert!(!o.status.success() && text(&o).contains("--no-ci reads only the drill records"), "{}", text(&o));
