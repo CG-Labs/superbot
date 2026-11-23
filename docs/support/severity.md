@@ -41,7 +41,7 @@ Each update says what's known, what's being done, and when the next update comes
 
 These are response targets. Resolution depends on the cause; for an outage the [SLO](../slo.md) and the plan's [RPO and RTO](../security/machine-recovery-objectives.md) are the commitments. Severity 1 and 2 are worked continuously during the plan's hours (Severity 1 around the clock where the plan has it) until there's a fix or a workaround, after which the ticket can drop a level.
 
-A response target is missed when the first human answer is late; misses are counted per month in the Provider's support report. Only a written agreement turns these targets into an SLA with credits; until then, they are what the Provider runs to, like the SLO's objectives.
+A response target is missed when the first human answer is late; misses are counted per month in the Provider's [support report](support-report.md) (`botctl support-report`). Only a written agreement turns these targets into an SLA with credits; until then, they are what the Provider runs to, like the SLO's objectives.
 
 ## Enterprise defaults
 
