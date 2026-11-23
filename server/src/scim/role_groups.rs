@@ -489,7 +489,8 @@ pub async fn get_api(State(app): State<AppState>, Path(id): Path<String>) -> Res
 }
 
 /// `PATCH /api/scim/role-groups/{id} {role}`: the group gives another role. What the old
-/// one gave is taken away, then its members are offered the new one.
+/// one gave is taken away, then its members are offered the new one. Sent again, it
+/// finishes what a restart cut short.
 pub async fn update_api(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
     only_fields(&v, &["role"])?;
     if !a.scim.group_roles {
@@ -498,13 +499,10 @@ pub async fn update_api(State(app): State<AppState>, Extension(a): Extension<Arc
     let role = pick_role(&app, &by, &v["role"])?;
     let _writes = a.scim.group_writes.lock().await;
     let before = need(&app, &id)?;
-    // A grant still on another role is left from a change cut short (a restart while it
-    // took roles away), so the same change again finishes it.
-    let new_id = role.id.clone();
-    let stale = |g: &ScimRoleGroup| app.db.scim_role_group_grants(&g.id).into_iter().filter(|h| h.role_id != new_id).collect::<Vec<_>>();
-    if before.role_id == role.id && stale(&before).is_empty() {
-        return Ok(Json(view(&app, &before)));
-    }
+    // The same role again isn't a no-op: it finishes a change cut short by a restart,
+    // taking away grants still on another role and offering it to members without one.
+    // Skips were audited by the change itself, so only a real change audits them again.
+    let changed = before.role_id != role.id;
     // The new role is saved, and checked, first: a role edited or deleted meanwhile leaves
     // every grant as it was. Each grant records the role it gave, which is what goes.
     let g = app.db.set_scim_role_group_role(&before.id, &role.id).map_err(|e| match e {
@@ -514,7 +512,7 @@ pub async fn update_api(State(app): State<AppState>, Extension(a): Extension<Arc
     })?;
     let role = app.db.custom_role(&role.id).unwrap_or(role);
     let mut revoked = Vec::new();
-    for h in stale(&g) {
+    for h in app.db.scim_role_group_grants(&g.id).into_iter().filter(|h| h.role_id != g.role_id) {
         if take_away(&app, &by, &g, &h.user_id, ROLE_CHANGED).await {
             revoked.push(h.user_id);
         }
@@ -526,7 +524,9 @@ pub async fn update_api(State(app): State<AppState>, Extension(a): Extension<Arc
             match grant(&app, &by, &g, &role, &u.id).await {
                 Ok(()) => granted.push(u.id),
                 Err(reason) => {
-                    skipped(&app, &by, &g, &role, &u.id, reason);
+                    if changed {
+                        skipped(&app, &by, &g, &role, &u.id, reason);
+                    }
                     skips.push(json!({ "user": u.id, "reason": reason }));
                 }
             }
@@ -535,10 +535,12 @@ pub async fn update_api(State(app): State<AppState>, Extension(a): Extension<Arc
     for id in revoked.iter().filter(|id| !granted.contains(id)) {
         reoffer(&app, &a, &by, id).await;
     }
-    let from = app.db.custom_role(&before.role_id);
-    app.db.record(&by.event("scim.role_group_changed").target("scim_role_group", &g.id).details(json!({
-        "tenant": g.tenant, "roleGroup": g.id, "displayName": g.display_name, "from": role_ref(from.as_ref()), "to": role_ref(Some(&role)), "revoked": revoked, "granted": granted,
-    })));
+    if changed || !revoked.is_empty() || !granted.is_empty() {
+        let from = app.db.custom_role(&before.role_id);
+        app.db.record(&by.event("scim.role_group_changed").target("scim_role_group", &g.id).details(json!({
+            "tenant": g.tenant, "roleGroup": g.id, "displayName": g.display_name, "from": role_ref(from.as_ref()), "to": role_ref(Some(&role)), "revoked": revoked, "granted": granted,
+        })));
+    }
     let mut out = view(&app, &g);
     out["revoked"] = json!(revoked);
     out["granted"] = json!(granted);

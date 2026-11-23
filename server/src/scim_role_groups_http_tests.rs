@@ -338,9 +338,22 @@ async fn a_role_change_cut_short_is_finished_by_the_same_change_again() {
     let gone = &events(port, &admin, "action=role.unassigned").await[0];
     assert_eq!(gone["targetId"].as_str(), Some(audit.as_str()), "the role it gave goes: {gone}");
 
-    // Again, there's nothing left to do.
+    // Cut short after the old role went but before the new one came: again gives it.
+    let ben = person(port, &t, "ben@example.com").await;
+    let add = json!({ "schemas": [PATCH_OP], "Operations": [{ "op": "add", "path": "members", "value": [{ "value": ben }] }] });
+    assert_eq!(scim(port, &t, "PATCH", &format!("{GROUPS}/{gid}"), add).await.0, 204);
+    let g = app.db.scim_role_group(&gid).unwrap();
+    assert!(app.db.revoke_scim_role_group(&g, &ben, false).is_some());
+    assert_eq!(role_of(&app, &ben), None);
     let (code, v) = json_call(port, "PATCH", &format!("{ROLE_GROUPS}/{gid}"), &admin, &json!({ "role": review }).to_string()).await;
-    assert_eq!((code, v.get("revoked")), (200, None), "{v}");
+    assert_eq!((code, v["revoked"].clone(), v["granted"].clone()), (200, json!([]), json!([ben])), "{v}");
+    assert_eq!(role_of(&app, &ben), Some(review.clone()));
+
+    // Again, there's nothing left to do, and nothing is audited.
+    let changes = events(port, &admin, "action=scim.role_group_changed").await.len();
+    let (code, v) = json_call(port, "PATCH", &format!("{ROLE_GROUPS}/{gid}"), &admin, &json!({ "role": review }).to_string()).await;
+    assert_eq!((code, v["revoked"].clone(), v["granted"].clone()), (200, json!([]), json!([])), "{v}");
+    assert_eq!(events(port, &admin, "action=scim.role_group_changed").await.len(), changes);
     // Leaving the group takes away the role it gave.
     let leave = json!({ "schemas": [PATCH_OP], "Operations": [{ "op": "remove", "path": format!("members[value eq \"{ann}\"]") }] });
     assert_eq!(scim(port, &t, "PATCH", &format!("{GROUPS}/{gid}"), leave).await.0, 204);

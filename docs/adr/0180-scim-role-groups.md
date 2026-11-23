@@ -37,7 +37,7 @@ A role group follows ADR 0138's org-scope rules, unchanged:
 
 - **The IdP deletes it**: its members leave it and lose its role (reason `group_removed`), and the declaration goes back to waiting with the name and `externalId` the admin declared (each unless another role group or a team group took it after the IdP changed this one; then it keeps the IdP's), so pushing it again makes it a role group again, never a team.
 - **An admin removes the declaration**: the role goes from everyone it gave it to (`role_group_removed`); the answer's `wasPushed` warns that an IdP still pushing the group will make it a team on its next `POST`.
-- **An admin changes its role**: `PATCH /api/scim/role-groups/{id}` saves and checks the new role first, so a refused change leaves every grant as it was, then takes the old role (`role_changed`) and offers the new one to every member. If the server stops part way, the same change again takes away the grants still on another role and finishes it.
+- **An admin changes its role**: `PATCH /api/scim/role-groups/{id}` saves and checks the new role first, so a refused change leaves every grant as it was, then takes the old role (`role_changed`) and offers the new one to every member. If the server stops part way, the same change again finishes it: it takes away grants still on another role and offers the role to members without one, auditing only what it changes.
 - **A SCIM `DELETE` of the user**: they leave every role group, losing its role (`user_deleted`).
 
 ### Google Workspace
