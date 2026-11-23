@@ -739,6 +739,12 @@ pub struct AuditEvent {
     /// The hash chain (ADR 0122): the row before's hash, and this row's.
     pub chain_prev: Option<String>,
     pub chain_hash: Option<String>,
+    /// The salted digest of the fields an erasure may rewrite, and its salt (None once
+    /// erased). Only the export sends them (ADR 0199).
+    #[serde(skip)]
+    pub chain_digest: Option<String>,
+    #[serde(skip)]
+    pub chain_salt: Option<String>,
 }
 
 /// A person who can sign in. `operator` is the owner and break-glass account.
@@ -2132,12 +2138,14 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
         on_behalf_of: r.get("on_behalf_of")?,
         chain_prev: r.get("chain_prev")?,
         chain_hash: r.get("chain_hash")?,
+        chain_digest: r.get("chain_digest")?,
+        chain_salt: r.get("chain_salt")?,
     })
 }
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 63] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 64] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -2201,7 +2209,37 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 63] = [
     migrate_scim_enterprise,
     migrate_scim_role_groups,
     migrate_scim_token_expiry,
+    migrate_saml_cert_notices,
 ];
+
+/// Which expiry notice was audited for each certificate a native SAML provider uses
+/// (ADR 0198): `expiring`, then `expired`, once each.
+fn migrate_saml_cert_notices(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS saml_cert_notices (
+          provider TEXT NOT NULL,
+          role TEXT NOT NULL,
+          sha256 TEXT NOT NULL,
+          notice TEXT NOT NULL,
+          at INTEGER NOT NULL,
+          PRIMARY KEY (provider, role, sha256)
+        );",
+    )
+}
+
+/// Claims `notice` (`expiring` or `expired`) for one of a SAML provider's certificates, on
+/// `c` (inside the transaction that audits it): `expiring` only if it had no notice, `expired`
+/// only if it hadn't had that one. False when it was already given.
+pub(crate) fn claim_saml_cert_notice(c: &Connection, provider: &str, role: &str, sha256: &str, notice: &str, at: i64) -> rusqlite::Result<bool> {
+    let sql = if notice == "expired" {
+        "INSERT INTO saml_cert_notices (provider, role, sha256, notice, at) VALUES (?1, ?2, ?3, 'expired', ?4)
+         ON CONFLICT (provider, role, sha256) DO UPDATE SET notice = 'expired', at = excluded.at WHERE notice <> 'expired'"
+    } else {
+        "INSERT INTO saml_cert_notices (provider, role, sha256, notice, at) VALUES (?1, ?2, ?3, 'expiring', ?4)
+         ON CONFLICT (provider, role, sha256) DO NOTHING"
+    };
+    Ok(c.execute(sql, params![provider, role, sha256, at])? == 1)
+}
 
 /// SCIM tokens expire and rotate (ADR 0196). Tokens made before this keep a null
 /// `expires_at` and work as before: expiring them on upgrade would stop deprovisioning.
@@ -8516,6 +8554,19 @@ impl Db {
     pub fn audit_export_cursor(&self, sink: &str) -> Option<i64> {
         let v: Option<String> = self.c().query_row("SELECT value FROM settings WHERE key = ?", [format!("audit_export:{sink}")], |r| r.get(0)).optional().ok().flatten();
         v.and_then(|v| v.parse().ok())
+    }
+
+    /// The furthest any sink ever got, configured now or not: the last event delivered or
+    /// cut into a batch. Keys other than `except` that don't hold an id are skipped.
+    pub fn audit_export_furthest(&self, except: &str) -> rusqlite::Result<i64> {
+        let c = self.c();
+        let mut q = c.prepare("SELECT value FROM settings WHERE key LIKE 'audit\\_export:%' ESCAPE '\\' AND key != ?")?;
+        let values = q.query_map([format!("audit_export:{except}")], |r| r.get::<_, String>(0))?;
+        let mut furthest = 0;
+        for v in values {
+            furthest = furthest.max(v?.parse().unwrap_or(0));
+        }
+        Ok(furthest)
     }
 
     pub fn set_audit_export_cursor(&self, sink: &str, delivered: i64) -> rusqlite::Result<()> {

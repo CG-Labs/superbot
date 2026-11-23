@@ -105,7 +105,7 @@ async fn checkpoints_are_signed_timestamped_exported_and_checked() {
     let line = sent.iter().find(|e| e["action"] == "audit.checkpoint" && e["id"] == id).unwrap();
     let c = &line["checkpoint"];
     let public = audit_checkpoint::parse_public_key(c["publicKey"].as_str().unwrap()).unwrap();
-    assert!(audit_checkpoint::signed(&public, c["statement"].as_str().unwrap(), c["signature"].as_str().unwrap()), "{line}");
+    assert!(crate::audit_line::signed(&public, c["statement"].as_str().unwrap(), c["signature"].as_str().unwrap()), "{line}");
     assert_eq!(c["hash"], line["chainPrev"], "it signs the head it follows");
     let line = sent.iter().find(|e| e["action"] == "audit.checkpoint_timestamped").unwrap();
     let c = &line["checkpoint"];
