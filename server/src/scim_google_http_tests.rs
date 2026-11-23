@@ -332,6 +332,9 @@ async fn an_admins_disable_holds() {
     let res = synced(&w).await;
     assert_eq!(res["held"], json!([ada]), "{res}");
     assert!(!active(&w, "101"), "removed and added back, she still waits for an admin");
+    let res = synced(&w).await;
+    assert_eq!((res["held"].clone(), res["enabled"].as_u64()), (json!([ada]), Some(0)), "{res}");
+    assert!(!active(&w, "101"), "taking her back was no enable: the pass after still holds");
 
     assert_eq!(call(w.port, "PATCH", &format!("/api/users/{ada}"), &w.admin, r#"{"status":"active"}"#).await.0, 200);
     g.user("101", |u| u["suspended"] = json!(true));
@@ -339,6 +342,66 @@ async fn an_admins_disable_holds() {
     g.user("101", |u| u["suspended"] = json!(false));
     synced(&w).await;
     assert!(active(&w, "101"), "once enabled, she follows Google again");
+}
+
+#[tokio::test]
+async fn people_already_here_get_their_google_identity() {
+    let g = google_stand_in().await;
+    let w = world(&g, true, |_| {}).await;
+    synced(&w).await;
+    let ada = uid(&w, "101");
+    let i = w.app.db.identities(&ada).remove(0);
+    w.app.db.unlink_identity(&ada, &i.id).unwrap();
+    let res = synced(&w).await;
+    assert_eq!(res["linked"], 1, "{res}");
+    let ids = w.app.db.identities(&ada);
+    assert_eq!((ids.len(), ids[0].subject.as_str()), (1, "101"), "she signs in with Google again");
+    let ev = w.app.db.audit_events(&crate::audit::Filter { actions: vec!["user.identity_linked".into()], target_id: Some(ada.clone()), ..Default::default() }, 1, false);
+    assert_eq!(ev[0].actor_id.as_deref(), Some(google::ACTOR_ID));
+    assert_eq!(synced(&w).await["linked"], 0);
+}
+
+#[tokio::test]
+async fn the_last_active_person_stays_without_force() {
+    let g = google_stand_in().await;
+    let w = world(&g, false, |s| s.teams = vec![]).await;
+    synced(&w).await;
+    let bob = uid(&w, "102");
+    assert_eq!(call(w.port, "PATCH", &format!("/api/users/{bob}"), &w.admin, r#"{"status":"disabled"}"#).await.0, 200);
+    g.members("staff@example.com", vec![member("102")]);
+    let (code, res) = sync(&w, "").await;
+    assert_eq!(code, 409, "{res}");
+    assert!(res["error"].as_str().unwrap().contains("remove all 1"), "Google has Bob active, but he stays disabled here: {res}");
+    assert!(active(&w, "101"));
+
+    g.set(|d| d.users.push(person("106", "fay@example.com", "Fay", false)));
+    g.members("staff@example.com", vec![member("102"), member("106")]);
+    assert_eq!(call(w.port, "POST", "/api/users", &w.admin, r#"{"email":"fay@example.com"}"#).await.0, 201);
+    let (code, res) = sync(&w, "").await;
+    assert_eq!((code, res["created"].as_u64(), res["deleted"].as_u64(), res["failed"].as_u64()), (200, Some(0), Some(0), Some(2)), "{res}");
+    assert!(active(&w, "101"), "Fay's account failed, so Ada isn't removed");
+}
+
+#[tokio::test]
+async fn team_groups_move_and_aliases_are_one_team() {
+    let g = google_stand_in().await;
+    let w = world(&g, false, |s| s.teams.push("platform@example.com".into())).await;
+    g.set(|d| {
+        let eng = d.groups["eng@example.com"].clone();
+        d.groups.insert("platform@example.com".into(), eng);
+    });
+    let res = synced(&w).await;
+    assert_eq!(res["teams"]["created"], 1, "{res}");
+    assert_eq!(team_members(&w), vec!["ada@example.com", "eve@example.com"]);
+    let again = synced(&w).await;
+    assert_eq!(again["teams"]["updated"], 0, "the alias never empties the team: {again}");
+    assert_eq!(team_members(&w), vec!["ada@example.com", "eve@example.com"]);
+
+    let old = w.app.db.scim_group_find(TENANT, Some("g2"), None).unwrap();
+    w.app.db.save_scim_group(TENANT, &old.team_id, Some("g-old"), "Old", "Old", false).unwrap();
+    let res = synced(&w).await;
+    assert_eq!((res["teams"]["created"].as_u64(), res["teams"]["deleted"].as_u64()), (Some(1), Some(1)), "{res}");
+    assert_eq!(team_members(&w), vec!["ada@example.com", "eve@example.com"], "people on a team no longer wanted join the new one in the same pass");
 }
 
 #[tokio::test]

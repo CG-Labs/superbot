@@ -503,6 +503,18 @@ impl Plan {
     fn removals(&self, live: &[ScimUser]) -> usize {
         self.disable + self.delete.iter().filter(|id| live.iter().any(|u| &u.user.id == *id && u.user.active())).count()
     }
+
+    /// Users active once every write went through: held people stay disabled.
+    fn active_after(&self, live: &[ScimUser]) -> usize {
+        let set = |on: bool| -> HashSet<&str> { self.update.iter().filter(|(_, v)| v["active"] == on).map(|(id, _)| id.as_str()).collect() };
+        let (on, off) = (set(true), set(false));
+        let gone: HashSet<&str> = self.delete.iter().map(String::as_str).collect();
+        let stays = |u: &ScimUser| {
+            let id = u.user.id.as_str();
+            (u.user.active() || on.contains(id)) && !off.contains(id) && !gone.contains(id)
+        };
+        live.iter().filter(|u| stays(u)).count() + self.create.iter().filter(|v| v["active"] == true).count()
+    }
 }
 
 fn user_body(p: &Person, active: bool) -> Value {
@@ -562,6 +574,8 @@ fn plan(people: &[&Person], live: &[ScimUser], gone: &HashMap<String, String>, h
 
 /// Whether a disabled user stays disabled: yes, unless the newest thing that disabled
 /// them was this sync. An admin's disable, or one the log no longer shows, holds.
+/// Taking a user back or on changes no status by itself (an enable is logged as its
+/// own event), so the search goes on past it to whoever disabled them.
 fn held(app: &AppState, user_id: &str) -> bool {
     let f = crate::audit::Filter {
         actions: ["user.enabled", "user.disabled", "user.created", "scim.user_deleted", "scim.user_restored", "scim.user_linked"].map(String::from).to_vec(),
@@ -573,8 +587,9 @@ fn held(app: &AppState, user_id: &str) -> bool {
         let ours = e.actor_id.as_deref() == Some(ACTOR_ID);
         match e.action.as_str() {
             "user.enabled" => return false,
-            "scim.user_deleted" if ours => continue,
-            "user.disabled" | "user.created" | "scim.user_restored" | "scim.user_linked" if ours => return false,
+            "scim.user_deleted" | "scim.user_restored" | "scim.user_linked" if ours => continue,
+            "user.disabled" if ours => return false,
+            "user.created" if ours => return e.details["active"] == json!(false),
             _ => return true,
         }
     }
@@ -612,6 +627,9 @@ struct Tally {
     created: usize,
     updated: usize,
     deleted: usize,
+    enabled: usize,
+    disabled: usize,
+    linked: usize,
     teams_created: usize,
     teams_updated: usize,
     teams_deleted: usize,
@@ -702,12 +720,12 @@ async fn apply(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Caller, snap: S
         .filter_map(|p| app.db.scim_find(tenant, &ScimKey::ExternalId(p.id.clone())).filter(|u| u.deleted_at.is_some()).map(|u| (p.id.clone(), u.user.id)))
         .collect();
     let plan = plan(&people, &live, &gone, &|id| held(app, id));
-    if !force && !live.is_empty() && !people.iter().any(|p| p.active) {
+    let active_now = live.iter().filter(|u| u.user.active()).count();
+    if !force && active_now > 0 && plan.active_after(&live) == 0 {
         return Err(fail(
             "would_remove_everyone",
             format!(
-                "Google lists nobody active in the groups, so this pass would remove all {} of the tenant's people. Nobody was changed. Check the groups, then run botctl scim google sync --force.",
-                live.len()
+                "Nobody in the groups would stay active, so this pass would remove all {active_now} of the tenant's active people. Nobody was changed. Check the groups, then run botctl scim google sync --force."
             ),
         ));
     }
@@ -735,22 +753,43 @@ async fn apply(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Caller, snap: S
         let path = format!("/Users/{id}");
         let ok = t.note(app, c, "PUT", &path, replace_user(st(), ex(), ca(), headers.clone(), Path(id.clone()), body(v)).await);
         t.updated += ok as usize;
+        match (ok, live.iter().find(|u| &u.user.id == id).map(|u| u.user.active()), v["active"].as_bool()) {
+            (true, Some(false), Some(true)) => t.enabled += 1,
+            (true, Some(true), Some(false)) => t.disabled += 1,
+            _ => {}
+        }
+    }
+    if c.token.sso_provider.is_some() {
+        link(a, app, c, &people, &all_users(app, tenant), &mut t);
     }
     if a.scim.groups {
         teams(a, app, d, c, &snap, &people, &mut t).await;
     }
-    for id in &plan.delete {
-        let path = format!("/Users/{id}");
-        let ok = t.note(app, c, "DELETE", &path, delete_user(st(), ex(), ca(), Path(id.clone())).await);
-        t.deleted += ok as usize;
+    let doomed: HashSet<&str> = plan.delete.iter().map(String::as_str).collect();
+    let now = all_users(app, tenant);
+    let last = now.iter().any(|u| u.user.active() && doomed.contains(u.user.id.as_str())) && !now.iter().any(|u| u.user.active() && !doomed.contains(u.user.id.as_str()));
+    if !force && last {
+        let e = ScimError::new(
+            StatusCode::CONFLICT,
+            None,
+            "Nobody would stay active after these removals (writes before them failed), so nobody was removed. Run botctl scim google sync --force to remove them anyway.",
+        );
+        t.note(app, c, "DELETE", "/Users", Err(e));
+    } else {
+        for id in &plan.delete {
+            let path = format!("/Users/{id}");
+            let ok = t.note(app, c, "DELETE", &path, delete_user(st(), ex(), ca(), Path(id.clone())).await);
+            t.deleted += ok as usize;
+        }
     }
     Ok(json!({
         "people": people.len(),
         "outsideDomain": outside,
         "created": t.created,
         "updated": t.updated,
-        "enabled": plan.enable,
-        "disabled": plan.disable,
+        "enabled": t.enabled,
+        "disabled": t.disabled,
+        "linked": t.linked,
         "deleted": t.deleted,
         "held": plan.held.iter().take(MAX_LISTED).collect::<Vec<_>>(),
         "heldCount": plan.held.len(),
@@ -759,6 +798,45 @@ async fn apply(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Caller, snap: S
         "failed": t.failed,
         "failures": t.failures,
     }))
+}
+
+/// Links each user in scope to their Google identity, if they don't have it yet: as
+/// after GOOGLE_DIRECTORY_SSO is set on a tenant that already synced, or for a user
+/// taken back. SCIM links only the users it creates.
+fn link(a: &Auth, app: &AppState, c: &Caller, people: &[&Person], live: &[ScimUser], t: &mut Tally) {
+    let ids: HashSet<&str> = people.iter().map(|p| p.id.as_str()).collect();
+    for u in live.iter().filter(|u| u.external_id.as_deref().is_some_and(|x| ids.contains(x))) {
+        let path = format!("/Users/{}", u.user.id);
+        let l = match sso_link(a, &c.token, u.external_id.as_deref()) {
+            Ok(Some(l)) => l,
+            Ok(None) => return,
+            Err(e) => {
+                t.note(app, c, "PUT", &path, Err(e));
+                continue;
+            }
+        };
+        match app.db.identity(&l.issuer, &l.subject) {
+            Some((_, owner)) if owner.id == u.user.id => continue,
+            Some(_) => {
+                t.note(app, c, "PUT", &path, Err(uniqueness("This person's Google identity is linked to another user. Unlink it there first.")));
+                continue;
+            }
+            None => {}
+        }
+        let i = NewIdentity { provider: &l.provider, issuer: &l.issuer, subject: &l.subject, tenant: l.tenant.as_deref(), email: None, created_by: c.who.actor.id.as_deref() };
+        match app.db.link_identity(&u.user.id, &i) {
+            Ok(i) => {
+                app.db.record(
+                    &c.who
+                        .event("user.identity_linked")
+                        .target("user", &u.user.id)
+                        .details(json!({ "identity": i.id, "provider": l.provider, "issuer": l.issuer, "subject": l.subject, "tenant": l.tenant })),
+                );
+                t.linked += 1;
+            }
+            Err(e) => _ = t.note(app, c, "PUT", &path, Err(ScimError::new(StatusCode::CONFLICT, Some("uniqueness"), e))),
+        }
+    }
 }
 
 /// The tenant's live users, every page.
@@ -774,19 +852,24 @@ fn all_users(app: &AppState, tenant: &str) -> Vec<ScimUser> {
     }
 }
 
-/// The team groups: people leave first, so someone who moved between two of them joins
-/// the new one in the same pass; then each team gets its name and members. A person is
-/// on one team at most, so the first team group listed wins, and someone on a team the
-/// sync doesn't manage stays there.
+/// The team groups: teams no longer wanted go and people leave first, so someone who
+/// moved between two of them joins the new one in the same pass; then each team gets its
+/// name and members. A person is on one team at most, so the first team group listed
+/// wins, and someone on a team the sync doesn't manage stays there. Two addresses of one
+/// Google group are one team.
 async fn teams(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Caller, snap: &Snapshot, people: &[&Person], t: &mut Tally) {
     let s = &d.settings;
     let tenant = s.tenant.as_str();
     let user_of = |gid: &str| app.db.scim_find(tenant, &ScimKey::ExternalId(gid.to_string())).filter(|u| u.deleted_at.is_none()).map(|u| u.user.id);
     let in_scope: HashSet<&str> = people.iter().map(|p| p.id.as_str()).collect();
     let mut claimed: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     let mut wanted: Vec<(&Group, Option<ScimGroup>, Vec<String>)> = Vec::new();
     for key in &s.teams {
         let Some(g) = snap.groups.get(key) else { continue };
+        if !seen.insert(g.id.as_str()) {
+            continue;
+        }
         let ids: Vec<&str> = if g.everyone { people.iter().map(|p| p.id.as_str()).collect() } else { g.users.iter().map(String::as_str).filter(|id| in_scope.contains(id)).collect() };
         let mut users: Vec<String> = Vec::new();
         for uid in ids.into_iter().filter_map(user_of) {
@@ -804,6 +887,11 @@ async fn teams(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Caller, snap: &
         let v = json!({ "schemas": [groups::GROUP_SCHEMA], "displayName": g.name, "externalId": g.id, "members": members.iter().map(|m| json!({ "value": m })).collect::<Vec<_>>() });
         Ok(Bytes::from(v.to_string()))
     };
+    for x in app.db.scim_groups(tenant).into_iter().filter(|x| x.provisioned_at.is_some() && !x.external_id.as_deref().is_some_and(|e| seen.contains(e))) {
+        let path = format!("/Groups/{}", x.team_id);
+        let ok = t.note(app, c, "DELETE", &path, groups::delete(st(), ex(), ca(), Path(x.team_id.clone())).await);
+        t.teams_deleted += ok as usize;
+    }
     for (g, existing, users) in &wanted {
         let Some(x) = existing else { continue };
         let now: Vec<String> = app.db.scim_group_members(tenant, &x.team_id, true).into_iter().map(|u| u.id).collect();
@@ -838,12 +926,6 @@ async fn teams(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Caller, snap: &
             }
         }
     }
-    let kept: HashSet<&str> = wanted.iter().map(|(g, ..)| g.id.as_str()).collect();
-    for x in app.db.scim_groups(tenant).into_iter().filter(|x| x.provisioned_at.is_some() && !x.external_id.as_deref().is_some_and(|e| kept.contains(e))) {
-        let path = format!("/Groups/{}", x.team_id);
-        let ok = t.note(app, c, "DELETE", &path, groups::delete(st(), ex(), ca(), Path(x.team_id.clone())).await);
-        t.teams_deleted += ok as usize;
-    }
 }
 
 /// Passes every GOOGLE_DIRECTORY_INTERVAL_MINUTES, the first a minute after start, and
@@ -855,6 +937,7 @@ pub fn start(a: Arc<Auth>) {
         loop {
             let wait = match run(&a, &d, Trigger::Schedule).await {
                 Err(f) if f.reason != "running" => RETRY.min(d.settings.interval),
+                Ok(summary) if summary["failed"].as_u64().unwrap_or(0) > 0 => RETRY.min(d.settings.interval),
                 _ => d.settings.interval,
             };
             tokio::time::sleep(wait).await;
@@ -1020,7 +1103,7 @@ mod tests {
         assert_eq!(p.create.len(), 1);
         assert_eq!((p.create[0]["externalId"].as_str(), p.create[0]["active"].as_bool()), (Some("5"), Some(false)));
         assert_eq!(p.delete, vec!["u9".to_string()]);
-        assert_eq!(p.removals(&live), 2);
+        assert_eq!((p.removals(&live), p.active_after(&live)), (2, 1));
         let mut unchanged = user("u1", "1", "ada@example.com", true);
         unchanged.given_name = Some("Ada".into());
         assert_eq!(plan(&[&ada], &[unchanged], &HashMap::new(), &|_| true), Plan::default());
