@@ -18,6 +18,7 @@ How customers get help with SuperBot, how fast, and how the Provider runs suppor
 | [Quarterly business review](qbr-template.md) | The template for the review with the customer's owner and sponsor |
 | [Incidents and their reviews](incident-review.md) | `botctl incident`: posting and updating the status page from the server, and `botctl incident review`, a draft of the post-incident review from botd's records |
 | [Support report](support-report.md) | `botctl support-report`: tickets by month and severity from the ticket system's export, response targets met and missed, and what's still open |
+| [Support readiness](readiness.md) | `botctl support-readiness`: contact placeholders left, gaps in the on-call rota for the hours the plans sell, and every Enterprise customer with a TAM and a different backup |
 
 Runbooks for the incidents support sees most:
 
@@ -57,6 +58,7 @@ Check `<status-page-url>` (the server's `/status`) first: a known incident there
 - Keep [tiers](tiers.md) in step with the published plans (`/pricing`, from the tiers file, [ADR 0121](../adr/0121-published-plans.md)) and the [SLO](../slo.md). A plan's support line can also go in its `features` in the tiers file, so buyers see it on `/pricing`.
 - Name a TAM and a backup for each Enterprise customer before its kickoff ([TAM programme](tam.md)), and keep each TAM's accounts few enough to hold the [cadence](tam.md#cadence).
 - Staff an on-call rota before selling Severity 1 response outside business hours. Response targets are a promise only once the rota exists.
+- Check all three with `botctl support-readiness` before selling a plan and each month ([support readiness](readiness.md#when-to-run-it)): the contacts filled in, the rota without gaps, and the TAM list.
 - Run the [support report](support-report.md#each-month) each month, and look into every missed response target.
 - Draft each Severity 1's review with `botctl incident review` ([incident reviews](incident-review.md#finishing-the-review)), and look into every missed status page target it flags.
 - Review this folder with the rest of the [security pack](../security/README.md) at least once a year, and after any incident whose review changes a runbook.
