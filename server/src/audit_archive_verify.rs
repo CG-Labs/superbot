@@ -197,7 +197,37 @@ const ERASABLE_FIELDS: [&str; 10] = ["actorId", "actorName", "actorSubject", "ta
 /// the salted digest that binds them stays here.
 fn differing(archived: &Value, row: &Row) -> Option<&'static str> {
     let fields = FIXED_FIELDS.iter().chain(if row.erased { [].iter() } else { ERASABLE_FIELDS.iter() }).chain(["chainPrev"].iter());
-    fields.copied().find(|f| archived.get(*f).unwrap_or(&Value::Null) != row.event.get(*f).unwrap_or(&Value::Null))
+    fields.copied().find(|f| {
+        let (a, h) = (archived.get(*f).unwrap_or(&Value::Null), row.event.get(*f).unwrap_or(&Value::Null));
+        if *f == "details" { !redacted_from(a, h) } else { a != h }
+    })
+}
+
+/// Whether `archived` is `here` as the export wrote it: equal, except that each
+/// `[redacted]` in an archived string stands for whatever a secret known then covered.
+fn redacted_from(archived: &Value, here: &Value) -> bool {
+    match (archived, here) {
+        (Value::String(a), Value::String(h)) => redacted_text(a, h),
+        (Value::Array(a), Value::Array(h)) => a.len() == h.len() && a.iter().zip(h).all(|(a, h)| redacted_from(a, h)),
+        (Value::Object(a), Value::Object(h)) => a.len() == h.len() && a.iter().all(|(k, v)| h.get(k).is_some_and(|h| redacted_from(v, h))),
+        _ => archived == here,
+    }
+}
+
+fn redacted_text(archived: &str, here: &str) -> bool {
+    let parts: Vec<&str> = archived.split(crate::secrets::redact::MARK).collect();
+    let [first, middle @ .., last] = parts.as_slice() else { return archived == here };
+    if here.len() < first.len() + last.len() || !here.starts_with(first) || !here.ends_with(last) {
+        return false;
+    }
+    let mut rest = &here[first.len()..here.len() - last.len()];
+    for p in middle {
+        match rest.find(p) {
+            Some(i) => rest = &rest[i + p.len()..],
+            None => return false,
+        }
+    }
+    true
 }
 
 /// Walks the archive's objects in id order, as [`crate::audit_chain::Verifier`] walks rows.
@@ -472,34 +502,40 @@ fn objects(prefix: &str, listed: Vec<ObjectVersion>, w: &mut Walker) -> Vec<Obje
     out
 }
 
+/// One query, so an erasure can't land between reading a row's salt and its fields.
+/// `details` is read as stored: the export redacted it with the secrets known then.
 fn local(app: &App, lo: i64, hi: i64) -> rusqlite::Result<Local> {
-    let (hashes, erased) = app.db.with_conn(|c| {
-        let mut s = c.prepare("SELECT id, chain_hash, chain_salt IS NULL FROM audit_events WHERE id BETWEEN ?1 AND ?2")?;
-        let mut hashes = BTreeMap::new();
-        let mut erased = std::collections::BTreeSet::new();
-        for row in s.query_map([lo, hi], |r| {
-            let hash = match r.get::<_, Sql>(1)? {
+    use crate::audit_chain::{ERASABLE, FIXED};
+    let cols: Vec<&str> = FIXED.iter().chain(ERASABLE.iter()).copied().collect();
+    let fields: Vec<&str> = FIXED_FIELDS.iter().chain(ERASABLE_FIELDS.iter()).copied().collect();
+    let sql = format!("SELECT chain_hash, chain_salt IS NULL, chain_prev, {} FROM audit_events WHERE id BETWEEN ?1 AND ?2", cols.join(", "));
+    let json = |col: &str, v: Sql| match (col, v) {
+        ("details", Sql::Text(t)) => serde_json::from_str(&t).unwrap_or(Value::Null),
+        (_, Sql::Integer(n)) => Value::from(n),
+        (_, Sql::Real(f)) => Value::from(f),
+        (_, Sql::Text(t)) => Value::String(t),
+        _ => Value::Null,
+    };
+    app.db.with_conn(|c| {
+        let mut s = c.prepare(&sql)?;
+        let mut rows = s.query([lo, hi])?;
+        let mut out = Local::default();
+        while let Some(r) = rows.next()? {
+            let mut event = serde_json::Map::new();
+            event.insert("chainPrev".into(), json("chain_prev", r.get(2)?));
+            for (i, (col, field)) in cols.iter().zip(&fields).enumerate() {
+                event.insert(field.to_string(), json(col, r.get(3 + i)?));
+            }
+            let Some(id) = event["id"].as_i64() else { continue };
+            let hash = match r.get::<_, Sql>(0)? {
                 Sql::Text(t) => Some(t),
                 _ => None,
             };
-            Ok((r.get::<_, i64>(0)?, hash, r.get::<_, bool>(2)?))
-        })? {
-            let (id, hash, no_salt) = row?;
-            hashes.insert(id, hash);
-            if no_salt {
-                erased.insert(id);
-            }
+            out.hashes.insert(id, hash);
+            out.rows.insert(id, Row { event: Value::Object(event), erased: r.get(1)? });
         }
-        Ok::<_, rusqlite::Error>((hashes, erased))
-    })?;
-    let filter = crate::audit::Filter { after: Some(lo - 1), before: Some(hi.saturating_add(1)), ..Default::default() };
-    let rows = app
-        .db
-        .try_audit_events(&filter, hi - lo + 1, true)?
-        .into_iter()
-        .map(|e| (e.id, Row { erased: erased.contains(&e.id), event: serde_json::to_value(&e).unwrap_or(Value::Null) }))
-        .collect();
-    Ok(Local { hashes, rows })
+        Ok(out)
+    })
 }
 
 /// Checks the archive `a` within `range` against itself and this server's log, trusting
@@ -799,6 +835,20 @@ mod tests {
         let mut w = Walker::new(&a, 3, &[]);
         w.object(key, (1, 3), &meta(1, 3), &body(1..=3), &here, None);
         assert!(w.finish(Range::default(), true).first_problems[0].error.contains("event 2's action"));
+    }
+
+    #[test]
+    fn details_may_have_been_redacted_on_the_way_out() {
+        let row = |details: Value| Row { event: json!({ "details": details }), erased: false };
+        let archived = |details: Value| json!({ "details": details });
+        let here = json!({ "k": "token sk-live-0123456789 for b", "n": [1, "x"] });
+        assert_eq!(differing(&archived(here.clone()), &row(here.clone())), None);
+        assert_eq!(differing(&archived(json!({ "k": "token [redacted] for b", "n": [1, "x"] })), &row(here.clone())), None, "a secret known when it was exported");
+        assert_eq!(differing(&archived(json!({ "k": "[redacted][redacted]", "n": [1, "x"] })), &row(here.clone())), None);
+        for forged in [json!({ "k": "token [redacted] for c", "n": [1, "x"] }), json!({ "k": "token for b", "n": [1, "x"] }), json!({ "k": "token [redacted] for b", "n": [1] }), json!({ "k": "[redacted]" })] {
+            assert_eq!(differing(&archived(forged.clone()), &row(here.clone())), Some("details"), "{forged}");
+        }
+        assert!(!redacted_text("ab[redacted]ba", "aba"), "the ends can't overlap");
     }
 
     #[test]

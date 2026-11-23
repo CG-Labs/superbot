@@ -343,6 +343,14 @@ async fn checking_the_archive_catches_its_first_objects_gone_and_reads_null_vers
     for _ in 0..3 {
         archive_round(&app, &x, 2).await;
     }
+    // A value archived in the clear that becomes a known secret later is no false alarm.
+    let later = "archived-then-secret-7a41c9";
+    app.db.record(&Event::new(Actor::system("test"), "test.archive").details(json!({ "note": later })));
+    until("archived", || x.delivered() >= app.db.audit_head()).await;
+    crate::secrets::redact::register(later);
+    let v = verify_archive(port, &admin, "").await;
+    crate::secrets::redact::forget(later);
+    assert_eq!(v["archive"]["ok"], true, "{v}");
     let c = machines::s3::S3::new(fresh.settings()).unwrap();
     // A batch copied to a new key, its details changed and its hashes kept: what it says
     // no longer matches this server's rows under those hashes.
