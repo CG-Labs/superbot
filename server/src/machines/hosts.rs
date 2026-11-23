@@ -454,23 +454,32 @@ fn occupants(app: &App, cp: &ControlPlane, h: &dyn Hosts, host: &str) -> Vec<Mac
     out
 }
 
-/// The machines whose failed restore onto `host` may have left its imported copy there,
-/// with the copy's id. Cleanup keeps a copy that is all that's left of its machine, and
-/// may fail to delete one, so each counts until the provider says it is gone.
-async fn leftover_copies(app: &App, cp: &ControlPlane, host: &str) -> Vec<(Machine, String)> {
+/// How long dedicating may spend, under the ops lock, asking a host about leftover copies.
+const LEFTOVER_CHECKS: Duration = Duration::from_millis(if cfg!(test) { 500 } else { 20_000 });
+
+/// The machines of people not on `team` whose failed restore onto `host` may have left
+/// its imported copy there, with the copy's id. Cleanup keeps a copy that is all that's
+/// left of its machine, and may fail to delete one, so each counts until the provider
+/// says it is gone, and so does each not asked about by `deadline`.
+async fn leftover_copies(app: &App, cp: &ControlPlane, host: &str, team: &str, deadline: tokio::time::Instant) -> Vec<(Machine, String)> {
     let Some(p) = cp.provider.as_deref() else { return Vec::new() };
     let mut out: Vec<(Machine, String)> = Vec::new();
+    let mut gone: Vec<String> = Vec::new();
     for r in app.db.machine_restores_in("failed") {
         if r.to_host.as_deref() != Some(host) {
             continue;
         }
         let Some(m) = app.db.machine(&r.machine_id) else { continue };
-        let copy = backup::staging(p, &m, &r);
-        if out.iter().any(|(_, c)| *c == copy) {
+        if app.db.team_id_of(&m.user_id).as_deref() == Some(team) {
             continue;
         }
-        if !matches!(p.get(&copy).await, Err(ProviderError::NotFound)) {
-            out.push((m, copy));
+        let copy = backup::staging(p, &m, &r);
+        if gone.contains(&copy) || out.iter().any(|(_, c)| *c == copy) {
+            continue;
+        }
+        match tokio::time::timeout_at(deadline, p.get(&copy)).await {
+            Ok(Err(ProviderError::NotFound)) => gone.push(copy),
+            _ => out.push((m, copy)),
         }
     }
     out
@@ -519,8 +528,7 @@ pub async fn dedicate(
             ids.iter().take(5).copied().collect::<Vec<_>>().join(", ")
         )));
     }
-    let left = leftover_copies(&app, cp, &row.name).await;
-    let others: Vec<&(Machine, String)> = left.iter().filter(|(m, _)| app.db.team_id_of(&m.user_id).as_deref() != Some(team.id.as_str())).collect();
+    let others = leftover_copies(&app, cp, &row.name, &team.id, tokio::time::Instant::now() + LEFTOVER_CHECKS).await;
     if !others.is_empty() {
         let ids: Vec<&str> = others.iter().map(|(m, _)| m.id.as_str()).collect();
         let d = json!({ "team": team.id, "reason": "leftover_copies", "machines": ids.len(), "machineIds": ids.iter().take(20).collect::<Vec<_>>() });

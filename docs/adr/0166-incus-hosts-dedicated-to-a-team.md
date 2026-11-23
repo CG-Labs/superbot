@@ -38,7 +38,7 @@ We chose option 2. Only that version makes "a kernel escape stays within one cus
   - a machine on the host;
   - a create sent there but not yet answered (`placed_on`);
   - a restore on its way there;
-  - the copy a failed restore onto the host may have left there. Cleanup after a restart keeps a copy that is all that's left of its machine, and may fail to delete one, while the machine's record still points at its old host. botd asks the host about each such copy. It counts the copy until the host says it is gone, so a host that doesn't answer is refused too.
+  - the copy a failed restore onto the host may have left there. Cleanup after a restart keeps a copy that is all that's left of its machine, and may fail to delete one, while the machine's record still points at its old host. botd asks the host about each such copy. It counts the copy until the host says it is gone, so a host that doesn't answer is refused too. The team's own copies aren't asked about, and all the asking shares one 20-second limit, since it holds the ops lock that every machine change waits on.
 
   So a host is never dedicated with a stranger already on it. Move those machines first (`botctl machine restore <user> <backup-id> --host <other> --yes`).
 - It is also refused while the host is dedicated to another team; share it first. Dedicating it again to the same team changes nothing.

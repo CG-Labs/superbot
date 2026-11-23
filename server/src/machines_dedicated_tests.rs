@@ -203,6 +203,11 @@ async fn dedicating_is_refused_while_anyone_elses_machine_is_there_and_sharing_n
     env.b.w().down = true;
     assert_eq!(dedicate(&env, "b", &acme, None).await.0, 409, "b can't say the copy is gone");
     env.b.w().down = false;
+    env.b.w().stall_instances = true;
+    let asked = std::time::Instant::now();
+    assert_eq!(dedicate(&env, "b", &acme, None).await.0, 409, "b doesn't answer in time");
+    assert!(asked.elapsed() < Duration::from_secs(10), "bounded, under the ops lock: {:?}", asked.elapsed());
+    env.b.w().stall_instances = false;
     env.b.w().instances.remove(&copy);
     let (code, v) = dedicate(&env, "b", &acme, None).await;
     assert_eq!(code, 200, "{v}");

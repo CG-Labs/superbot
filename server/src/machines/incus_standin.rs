@@ -90,6 +90,8 @@ pub struct World {
     pub pool_resources: Value,
     /// `GET .../resources` is recorded and never answered.
     pub stall_resources: bool,
+    /// `GET /1.0/instances/<name>` is recorded and never answered.
+    pub stall_instances: bool,
     ops: BTreeMap<String, Op>,
     trusted: Vec<String>,
     next_ip: u8,
@@ -512,7 +514,8 @@ fn respond(world: &Mutex<World>, peer: pki::Peer, method: Method, uri: Uri, head
         body: body.clone(),
         if_match: header("if-match"),
     });
-    if w.stall_resources && uri.path().ends_with("/resources") {
+    let one_instance = method == Method::GET && uri.path().strip_prefix("/1.0/instances/").is_some_and(|n| !n.is_empty() && !n.contains('/'));
+    if (w.stall_resources && uri.path().ends_with("/resources")) || (w.stall_instances && one_instance) {
         let mut r = Response::default();
         r.extensions_mut().insert(Stall);
         return r;
