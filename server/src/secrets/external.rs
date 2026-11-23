@@ -15,8 +15,12 @@
 //!   Cache hits aren't, so the log grows with the cache time, not with runs.
 //! - Read-only: `botctl secret set` and the API still save into the sealed store,
 //!   which a value of the same name here shadows.
+//! - With `SECRETS_USER_FOLDERS=1`, a third kind of folder: `users/<user id>` holds one
+//!   user's own secrets, which reach only Bots that user owns, over the server-wide ones
+//!   and over the ones they saved in botd (ADR 0174). Cached, failing closed and audited
+//!   like the others; values are redacted from that user's Bots.
 
-use super::{check_name, env_shaped, redact, server_secret, Error, Secret, SecretStore};
+use super::{check_name, check_user_name, env_shaped, redact, server_secret, Error, Secret, SecretStore};
 use crate::audit::{Actor, Event, Outcome};
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
@@ -25,21 +29,61 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 /// Which folder of the backend a name lives in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Scope {
     /// Server-wide secrets that reach Bots.
     Bots,
     /// botd's own; no Bot gets them.
     Server,
+    /// One user's own, for their Bots only (ADR 0174). Only made by `Scope::user`, so
+    /// the id is always safe in a path or a secret name.
+    User(String),
 }
 
+/// The longest user id that names a folder. botd's own are much shorter (`u` and 8 hex).
+const MAX_USER_ID: usize = 64;
+
 impl Scope {
+    /// The shared folders, checked at startup. Users' folders are read when their Bots run.
     pub const ALL: [Scope; 2] = [Scope::Bots, Scope::Server];
 
-    pub fn as_str(self) -> &'static str {
+    /// A user's folder, or None for an id that can't name one: only `a-z` and `0-9`, so
+    /// it means the same in every backend, Key Vault's case-blind names included.
+    pub fn user(id: &str) -> Option<Scope> {
+        let ok = !id.is_empty() && id.len() <= MAX_USER_ID && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+        ok.then(|| Scope::User(id.to_string()))
+    }
+
+    pub fn as_str(&self) -> &'static str {
         match self {
             Scope::Bots => "bots",
             Scope::Server => "server",
+            Scope::User(_) => "users",
+        }
+    }
+
+    /// The folder under the prefix, its parts joined with `sep`: `bots`, `server`, or
+    /// `users<sep><id>`.
+    pub fn folder(&self, sep: char) -> String {
+        match self {
+            Scope::User(id) => format!("users{sep}{id}"),
+            s => s.as_str().to_string(),
+        }
+    }
+
+    fn user_id(&self) -> Option<&str> {
+        match self {
+            Scope::User(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Whether `name` may be read from this folder: a name is only read from its own
+    /// shared folder, and a user's folder holds only names a user may save.
+    fn holds(&self, name: &str) -> bool {
+        match self {
+            Scope::User(_) => check_user_name(name).is_ok(),
+            s => scope_of(name).as_ref() == Some(s),
         }
     }
 }
@@ -125,8 +169,8 @@ fn write_audit(db: &crate::db::Db, events: &[Event], dropped: u64) {
     }
 }
 
-/// Each name's answer (a value, or "not there") and when it was read.
-type Answers = HashMap<String, (Instant, Option<Zeroizing<String>>)>;
+/// Each name's answer (a value, or "not there") in each folder, and when it was read.
+type Answers = HashMap<(Scope, String), (Instant, Option<Zeroizing<String>>)>;
 
 /// A `Provider` with a cache, fail-closed reads and audited reads; see the module docs.
 pub struct ExternalStore {
@@ -134,19 +178,44 @@ pub struct ExternalStore {
     ttl: Duration,
     values: Mutex<Answers>,
     names: Mutex<HashMap<Scope, (Instant, Vec<String>)>>,
+    /// `SECRETS_USER_FOLDERS`: each user's own folder is read for their Bots (ADR 0174).
+    user_folders: bool,
 }
 
 impl ExternalStore {
     pub fn new(provider: Box<dyn Provider>, ttl: Duration) -> ExternalStore {
-        ExternalStore { provider, ttl, values: Mutex::default(), names: Mutex::default() }
+        ExternalStore { provider, ttl, values: Mutex::default(), names: Mutex::default(), user_folders: false }
+    }
+
+    pub fn with_user_folders(mut self, on: bool) -> ExternalStore {
+        self.user_folders = on;
+        self
+    }
+
+    pub fn user_folders(&self) -> bool {
+        self.user_folders
     }
 
     pub fn describe(&self) -> String {
-        format!("{}, cached for {} s", self.provider.describe(), self.ttl.as_secs())
+        let users = if self.user_folders { ", and users/<id> for each user's own" } else { "" };
+        format!("{}{users}, cached for {} s", self.provider.describe(), self.ttl.as_secs())
     }
 
     fn fresh(&self, at: Instant) -> bool {
         at.elapsed() < self.ttl
+    }
+
+    /// Drops answers past their time as new ones come in, so the cache holds the users
+    /// whose Bots ran lately, not everyone who ever had one.
+    fn prune<K, V>(&self, cached: &mut HashMap<K, (Instant, V)>) {
+        cached.retain(|_, (at, _)| self.fresh(*at));
+    }
+
+    /// Drops everything cached from `user_id`'s folder, when the user is deleted.
+    pub fn forget_user(&self, user_id: &str) {
+        let Some(scope) = Scope::user(user_id) else { return };
+        self.values.lock().unwrap_or_else(|e| e.into_inner()).retain(|(s, _), _| *s != scope);
+        self.names.lock().unwrap_or_else(|e| e.into_inner()).remove(&scope);
     }
 
     /// Startup check: lists both folders straight from the backend, so botd refuses to
@@ -154,60 +223,115 @@ impl ExternalStore {
     pub fn check(&self) -> Result<usize, Error> {
         let mut n = 0;
         for scope in Scope::ALL {
-            let names = self.list_from_backend(scope)?;
+            let names = self.list_from_backend(&scope)?;
             n += names.len();
         }
         Ok(n)
     }
 
-    fn list_from_backend(&self, scope: Scope) -> Result<Vec<String>, Error> {
-        match self.provider.list(scope) {
+    /// The audit details every read of `scope` carries; a user's folder names its user.
+    fn details(&self, scope: &Scope, op: &str) -> serde_json::Value {
+        let mut d = json!({ "store": self.provider.kind(), "scope": scope.as_str(), "op": op });
+        if let Some(id) = scope.user_id() {
+            d["userId"] = json!(id);
+        }
+        d
+    }
+
+    fn list_from_backend(&self, scope: &Scope) -> Result<Vec<String>, Error> {
+        let target = Event::new(actor(), "secret.read").target("secret_folder", &scope.folder('/'));
+        let mut details = self.details(scope, "list");
+        match self.provider.list(scope.clone()) {
             Ok(names) => {
-                let mut names: Vec<String> = names.into_iter().filter(|n| scope_of(n) == Some(scope)).collect();
+                let mut names: Vec<String> = names.into_iter().filter(|n| scope.holds(n)).collect();
                 names.sort();
                 names.dedup();
-                self.names.lock().unwrap_or_else(|e| e.into_inner()).insert(scope, (Instant::now(), names.clone()));
-                audit(
-                    Event::new(actor(), "secret.read")
-                        .target("secret_folder", scope.as_str())
-                        .details(json!({ "store": self.provider.kind(), "scope": scope.as_str(), "op": "list", "names": names.len() })),
-                );
+                let mut cached = self.names.lock().unwrap_or_else(|e| e.into_inner());
+                self.prune(&mut cached);
+                cached.insert(scope.clone(), (Instant::now(), names.clone()));
+                drop(cached);
+                details["names"] = json!(names.len());
+                audit(target.details(details));
                 Ok(names)
             }
             Err(e) => {
-                self.names.lock().unwrap_or_else(|e| e.into_inner()).remove(&scope);
-                audit(
-                    Event::new(actor(), "secret.read")
-                        .target("secret_folder", scope.as_str())
-                        .outcome(Outcome::Failure)
-                        .details(json!({ "store": self.provider.kind(), "scope": scope.as_str(), "op": "list", "error": e.kind() })),
-                );
+                self.names.lock().unwrap_or_else(|e| e.into_inner()).remove(scope);
+                details["error"] = json!(e.kind());
+                audit(target.outcome(Outcome::Failure).details(details));
                 Err(e)
             }
         }
     }
 
-    fn fetch(&self, scope: Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error> {
-        let got = self.provider.read(scope, name);
+    fn fetch(&self, scope: &Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error> {
+        let got = self.provider.read(scope.clone(), name);
+        let key = (scope.clone(), name.to_string());
         let details = |found: Option<bool>, err: Option<&Error>| {
-            json!({ "store": self.provider.kind(), "scope": scope.as_str(), "op": "read", "found": found, "error": err.map(Error::kind) })
+            let mut d = self.details(scope, "read");
+            d["found"] = json!(found);
+            d["error"] = json!(err.map(Error::kind));
+            d
         };
         match got {
             Ok(v) => {
                 if let Some(v) = &v {
-                    redact::register(v);
+                    match scope.user_id() {
+                        // Like a value the user saved in botd: redacted from their Bots,
+                        // not from everyone's (ADR 0029).
+                        Some(id) => redact::register_for(id, v),
+                        None => redact::register(v),
+                    }
                 }
-                self.values.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), (Instant::now(), v.clone()));
+                let mut cached = self.values.lock().unwrap_or_else(|e| e.into_inner());
+                self.prune(&mut cached);
+                cached.insert(key, (Instant::now(), v.clone()));
+                drop(cached);
                 audit(Event::new(actor(), "secret.read").target("secret", name).details(details(Some(v.is_some()), None)));
                 Ok(v)
             }
             Err(e) => {
                 // Fail closed: what was cached is dropped, not served past its time.
-                self.values.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
+                self.values.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
                 audit(Event::new(actor(), "secret.read").target("secret", name).outcome(Outcome::Failure).details(details(None, Some(&e))));
                 Err(e)
             }
         }
+    }
+
+    fn get_in(&self, scope: &Scope, name: &str) -> Result<Option<Secret>, Error> {
+        if !scope.holds(name) {
+            return Ok(None);
+        }
+        let key = (scope.clone(), name.to_string());
+        let cached = self.values.lock().unwrap_or_else(|e| e.into_inner()).get(&key).filter(|(at, _)| self.fresh(*at)).map(|(_, v)| v.clone());
+        let v = match cached {
+            Some(v) => v,
+            None => self.fetch(scope, name)?,
+        };
+        Ok(v.map(|v| Secret::new(v.as_str())))
+    }
+
+    fn names_in(&self, scope: &Scope) -> Result<Vec<String>, Error> {
+        let cached = self.names.lock().unwrap_or_else(|e| e.into_inner()).get(scope).filter(|(at, _)| self.fresh(*at)).map(|(_, n)| n.clone());
+        match cached {
+            Some(n) => Ok(n),
+            None => self.list_from_backend(scope),
+        }
+    }
+
+    /// The folder of `user_id`'s own secrets, if user folders are on and the id can name one.
+    fn user_scope(&self, user_id: &str) -> Option<Scope> {
+        if self.user_folders { Scope::user(user_id) } else { None }
+    }
+
+    /// Names in `user_id`'s own folder; none while user folders are off. Never values.
+    pub fn user_names(&self, user_id: &str) -> Result<Vec<String>, Error> {
+        self.user_scope(user_id).map_or(Ok(Vec::new()), |s| self.names_in(&s))
+    }
+
+    /// The value of `name` in `user_id`'s own folder.
+    pub fn user_get(&self, user_id: &str, name: &str) -> Result<Option<Secret>, Error> {
+        self.user_scope(user_id).map_or(Ok(None), |s| self.get_in(&s, name))
     }
 }
 
@@ -217,27 +341,19 @@ impl SecretStore for ExternalStore {
     }
 
     fn get(&self, name: &str) -> Result<Option<Secret>, Error> {
-        let Some(scope) = scope_of(name) else { return Ok(None) };
-        let cached = self.values.lock().unwrap_or_else(|e| e.into_inner()).get(name).filter(|(at, _)| self.fresh(*at)).map(|(_, v)| v.clone());
-        let v = match cached {
-            Some(v) => v,
-            None => self.fetch(scope, name)?,
-        };
-        Ok(v.map(|v| Secret::new(v.as_str())))
+        match scope_of(name) {
+            Some(scope) => self.get_in(&scope, name),
+            None => Ok(None),
+        }
     }
 
     fn names(&self) -> Result<Vec<String>, Error> {
         let mut out = Vec::new();
         for scope in Scope::ALL {
-            let cached = self.names.lock().unwrap_or_else(|e| e.into_inner()).get(&scope).filter(|(at, _)| self.fresh(*at)).map(|(_, n)| n.clone());
-            out.extend(match cached {
-                Some(n) => n,
-                None => self.list_from_backend(scope)?,
-            });
+            out.extend(self.names_in(&scope)?);
         }
         Ok(out)
     }
-
 }
 
 /// One `ExternalStore` used both at startup and by `Secrets`.
@@ -302,10 +418,14 @@ pub fn cache_ttl(raw: &str) -> Result<Duration, String> {
 /// backend that isn't the one chosen are warned about, not used.
 pub fn from_env(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result<Option<Arc<ExternalStore>>, String> {
     let ttl = cache_ttl(&var("SECRETS_CACHE_SECONDS"))?;
+    let users = user_folders(&var("SECRETS_USER_FOLDERS"))?;
     let chosen = var("SECRETS_BACKEND").trim().to_string();
     let provider: Box<dyn Provider> = match chosen.as_str() {
         "" | "local" => {
             warn_unused(var, "local");
+            if users {
+                crate::obs::log::log_warn!("Secrets backend: SECRETS_USER_FOLDERS=1 is set, but SECRETS_BACKEND is local, so users' secrets stay in the sealed store (ADR 0174).");
+            }
             return Ok(None);
         }
         "vault" => Box::new(super::vault::Vault::new(super::vault::Config::from_env(var, store)?)?),
@@ -319,7 +439,16 @@ pub fn from_env(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result
         other => return Err(format!("SECRETS_BACKEND must be local, vault, azure-keyvault, gcp-secret-manager or aws, not {other:?}")),
     };
     warn_unused(var, &chosen);
-    Ok(Some(Arc::new(ExternalStore::new(provider, ttl))))
+    Ok(Some(Arc::new(ExternalStore::new(provider, ttl).with_user_folders(users))))
+}
+
+/// `SECRETS_USER_FOLDERS`: `1` reads each user's own folder too (ADR 0174); off by default.
+pub fn user_folders(raw: &str) -> Result<bool, String> {
+    match raw.trim() {
+        "" | "0" => Ok(false),
+        "1" => Ok(true),
+        other => Err(format!("SECRETS_USER_FOLDERS must be 1 or 0, not {other:?}")),
+    }
 }
 
 /// The settings of backends other than `chosen` that are set: probably a mistake.
@@ -371,7 +500,7 @@ fn diagnose(x: Option<&ExternalStore>) -> serde_json::Value {
         Ok(n) => (true, Some(n), format!("{} answers: {n} names in its bots and server folders.", x.kind())),
         Err(e) => (false, None, format!("{} can't be read: {e}. Bot runs are refused until it answers (fail closed).", x.kind())),
     };
-    json!({ "backend": x.kind(), "description": x.describe(), "cacheSeconds": x.ttl.as_secs(), "ok": ok, "names": names, "detail": detail })
+    json!({ "backend": x.kind(), "description": x.describe(), "cacheSeconds": x.ttl.as_secs(), "userFolders": x.user_folders, "ok": ok, "names": names, "detail": detail })
 }
 
 #[cfg(test)]
@@ -400,7 +529,8 @@ pub(crate) mod tests {
             if self.down.load(Ordering::SeqCst) {
                 return Err(Error::Unavailable("fake is down".into()));
             }
-            Ok(self.values.lock().unwrap().get(&(scope, name.to_string())).map(|v| Zeroizing::new(v.clone())))
+            // Empty is "no value", as the real backends answer for a deleted version or empty field.
+            Ok(self.values.lock().unwrap().get(&(scope, name.to_string())).filter(|v| !v.is_empty()).map(|v| Zeroizing::new(v.clone())))
         }
         fn list(&self, scope: Scope) -> Result<Vec<String>, Error> {
             self.lists.fetch_add(1, Ordering::SeqCst);
@@ -411,10 +541,167 @@ pub(crate) mod tests {
         }
     }
 
+    pub(crate) fn user(id: &str) -> Scope {
+        Scope::user(id).unwrap()
+    }
+
+    /// `x`, with users' folders on, for a provider's own tests.
+    pub(crate) fn users_on(x: Arc<ExternalStore>) -> ExternalStore {
+        Arc::try_unwrap(x).ok().expect("not shared yet").with_user_folders(true)
+    }
+
+    /// What a provider's own tests check about a users' folders: each user reads only
+    /// theirs, only names a user may have, and the shared folders don't see them.
+    pub(crate) fn reads_users_folders(x: &ExternalStore, value: &str) {
+        assert_eq!(x.user_names("ua1").unwrap(), ["OPENAI_API_KEY"], "LINODE_TOKEN is botd's own, never a user's");
+        assert_eq!(x.user_get("ua1", "OPENAI_API_KEY").unwrap().unwrap().expose(), value);
+        assert!(x.user_get("ua1", "LINODE_TOKEN").unwrap().is_none());
+        assert_eq!(x.user_get("ub1", "OPENAI_API_KEY").unwrap().unwrap().expose(), "ub1-own-openai");
+        assert!(x.user_names("uc1").unwrap().is_empty() && x.user_get("uc1", "OPENAI_API_KEY").unwrap().is_none(), "no folder: nothing");
+        assert!(x.user_names("ua").unwrap().is_empty(), "not a prefix match on another user's id");
+        assert_eq!(x.check().unwrap(), 0, "users' folders aren't the shared ones");
+        assert!(x.get("OPENAI_API_KEY").unwrap().is_none());
+        assert_eq!(redact::text_for(&["ua1"], value), redact::MARK);
+        redact::forget_for("ua1", value);
+        redact::forget_for("ub1", "ub1-own-openai");
+    }
+
+    /// A store over `fake` with users' folders on, and a `Secrets` that reads it as
+    /// `secrets::init` does: environment, then it, then the sealed stores.
+    fn with_users(values: &[(Scope, &str, &str)], ttl: Duration) -> (Arc<Fake>, Arc<ExternalStore>, super::super::Secrets) {
+        use super::super::{env::EnvStore, sealed, Secrets};
+        let (f, _) = fake(&[], ttl);
+        for (s, n, v) in values {
+            f.values.lock().unwrap().insert((s.clone(), n.to_string()), v.to_string());
+        }
+        let x = Arc::new(ExternalStore::new(Box::new(Arc::clone(&f)), ttl).with_user_folders(true));
+        let path = crate::db::temp_path("user-folders").join("app.sqlite");
+        let sealed = sealed::SealedStore::new(sealed::connect(&path).unwrap(), sealed::cipher());
+        let users = sealed::UserSecrets::new(sealed::connect(&path).unwrap(), sealed::cipher());
+        let s = Secrets::new(vec![Box::new(EnvStore::fixed(&[])), Box::new(Shared(Arc::clone(&x))), Box::new(sealed)]).with_users(users).with_user_folders(Arc::clone(&x));
+        (f, x, s)
+    }
+
+    fn env_of(s: &super::super::Secrets, owner: &str) -> Vec<(String, String)> {
+        let mut e: Vec<_> = s.try_harness_env_for(owner).unwrap().into_iter().map(|(k, v)| (k, v.expose().to_string())).collect();
+        e.sort();
+        e
+    }
+
+    #[test]
+    fn user_ids_name_folders_only_when_safe_everywhere() {
+        assert_eq!(user("u1a2b3c4d").folder('/'), "users/u1a2b3c4d");
+        assert_eq!(user("operator").folder('-'), "users-operator");
+        assert_eq!(Scope::Bots.folder('/'), "bots");
+        for bad in ["", "U1", "u-1", "u_1", "u/1", "../u", "u 1", "ü", &"a".repeat(65)] {
+            assert_eq!(Scope::user(bad), None, "{bad:?}");
+        }
+        assert!(Scope::user(&"a".repeat(64)).is_some());
+        assert!(user("ua").holds("OPENAI_API_KEY") && !user("ua").holds("LINODE_TOKEN") && !user("ua").holds("PATH") && !user("ua").holds("SSO_X_CLIENT_SECRET"));
+        assert_eq!(user_folders("").unwrap(), false);
+        assert_eq!(user_folders(" 1 ").unwrap(), true);
+        assert!(user_folders("yes").unwrap_err().contains("must be 1 or 0"));
+    }
+
+    #[test]
+    fn a_users_folder_reaches_only_their_bots_over_everything_else() {
+        let ua = format!("ua-ext-{}", crate::random_hex(10));
+        let ub = "ub-ext-value-1";
+        let (_, x, s) = with_users(
+            &[
+                (Scope::Bots, "OPENAI_API_KEY", "team-ext-openai-1"),
+                (Scope::Bots, "GH_TOKEN", "team-ext-gh-1"),
+                (user("ua"), "OPENAI_API_KEY", &ua),
+                (user("ua"), "LINODE_TOKEN", "never-from-a-users-folder"),
+                (user("ua"), "PATH", "/never"),
+                (user("ua"), "GH_TOKEN", ""),
+                (user("ub"), "GH_TOKEN", ub),
+            ],
+            Duration::from_secs(60),
+        );
+        s.user_put("ua", "OPENAI_API_KEY", "ua-sealed-but-shadowed").unwrap();
+        s.user_put("ua", "NPM_TOKEN", "ua-sealed-npm-1").unwrap();
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(env_of(&s, "ua"), [pair("GH_TOKEN", "team-ext-gh-1"), pair("NPM_TOKEN", "ua-sealed-npm-1"), pair("OPENAI_API_KEY", &ua)], "the folder beats the sealed copy and the team's");
+        assert_eq!(env_of(&s, "ub"), [pair("GH_TOKEN", ub), pair("OPENAI_API_KEY", "team-ext-openai-1")], "none of A's");
+        assert_eq!(env_of(&s, "uc"), [pair("GH_TOKEN", "team-ext-gh-1"), pair("OPENAI_API_KEY", "team-ext-openai-1")]);
+        assert_eq!(env_of(&s, "U-C"), env_of(&s, "uc"), "an id that can't name a folder reads none");
+        assert!(s.try_harness_env().unwrap().iter().all(|(_, v)| v.expose() != ua), "never server-wide");
+        assert_eq!(redact::text_for(&["ua"], &ua), redact::MARK, "redacted from A's Bots");
+        assert_eq!(redact::text(&ua), ua.as_str(), "not from everyone's");
+
+        let listed: Vec<_> = s.user_list("ua").unwrap().into_iter().map(|l| (l.name, l.store, l.saved, l.overrides)).collect();
+        assert_eq!(listed, [("NPM_TOKEN".to_string(), "sealed", true, false), ("OPENAI_API_KEY".to_string(), "fake", true, true)], "GH_TOKEN is listed in the folder but has no value, so the team's wins and it isn't shown");
+        let b = &s.user_list("ub").unwrap()[0];
+        assert_eq!((b.name.as_str(), b.store, b.saved, b.created_at), ("GH_TOKEN", "fake", false, None));
+        assert!(serde_json::to_value(b).unwrap().get("createdAt").is_none(), "no dates for a value botd never saved");
+        assert_eq!(s.user_forget("ua").unwrap(), 2, "only what botd saved; the folder is the backend's");
+        assert!(!x.values.lock().unwrap().keys().any(|(sc, _)| *sc == user("ua")) && !x.names.lock().unwrap().contains_key(&user("ua")), "nor its cache");
+        assert_eq!(env_of(&s, "ua"), [pair("GH_TOKEN", "team-ext-gh-1"), pair("OPENAI_API_KEY", &ua)]);
+        redact::forget_for("ua", &ua);
+        redact::forget_for("ub", ub);
+        redact::forget_for("ua", "ua-sealed-npm-1");
+        redact::forget_for("ua", "ua-sealed-but-shadowed");
+        redact::forget("team-ext-openai-1");
+        redact::forget("team-ext-gh-1");
+    }
+
+    #[test]
+    fn a_users_folder_is_cached_audited_and_fails_closed() {
+        let (f, x, s) = with_users(&[(user("uaudit"), "AUDIT_USER_TOKEN", "user-audit-value-1")], Duration::from_millis(300));
+        for _ in 0..3 {
+            assert_eq!(env_of(&s, "uaudit"), [("AUDIT_USER_TOKEN".to_string(), "user-audit-value-1".to_string())]);
+        }
+        let ev = audited("AUDIT_USER_TOKEN");
+        assert_eq!(ev.len(), 1, "cached: {ev:?}");
+        assert_eq!(ev[0].details, json!({ "store": "fake", "scope": "users", "op": "read", "userId": "uaudit", "found": true, "error": null }));
+        let listed = audited("users/uaudit");
+        assert_eq!((listed.len(), listed[0].details["userId"].as_str(), listed[0].details["names"].as_u64()), (1, Some("uaudit"), Some(1)));
+        assert!(!format!("{ev:?}{listed:?}").contains("user-audit-value-1"));
+
+        f.down.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(matches!(s.try_harness_env_for("uaudit"), Err(Error::Unavailable(_))), "a run is refused, not started without the user's keys");
+        assert!(s.harness_env_for("uaudit").is_empty());
+        assert!(matches!(s.user_list("uaudit"), Err(Error::Unavailable(_))));
+        assert!(s.user_save("uaudit", "SAVED_WHILE_DOWN_TOKEN", "saved-while-down-1").is_ok(), "saving into botd doesn't need the backend");
+        f.down.store(false, Ordering::SeqCst);
+        assert_eq!(env_of(&s, "uaudit").len(), 2);
+
+        // Answers past their time are dropped as new ones come in, not kept for every user ever seen.
+        std::thread::sleep(Duration::from_millis(350));
+        x.user_names("uother").unwrap();
+        x.user_get("uother", "OTHER_TOKEN").unwrap();
+        assert!(!x.names.lock().unwrap().contains_key(&user("uaudit")) && !x.values.lock().unwrap().keys().any(|(sc, _)| *sc == user("uaudit")));
+
+        // Off: no user folder is ever asked for.
+        let lists = f.lists.load(Ordering::SeqCst);
+        let off = ExternalStore::new(Box::new(Arc::clone(&f)), Duration::ZERO);
+        assert!(off.user_names("uaudit").unwrap().is_empty() && off.user_get("uaudit", "AUDIT_USER_TOKEN").unwrap().is_none());
+        assert_eq!(f.lists.load(Ordering::SeqCst), lists);
+        assert!(!x.describe().is_empty() && x.describe().contains("users/<id>") && !off.describe().contains("users/<id>"));
+        redact::forget_for("uaudit", "user-audit-value-1");
+        redact::forget_for("uaudit", "saved-while-down-1");
+    }
+
+    #[test]
+    fn user_folders_are_a_startup_setting() {
+        let env = super::super::env::EnvStore::fixed(&[]);
+        let var = super::super::http::tests::settings(&[("SECRETS_BACKEND", "gcp-secret-manager"), ("GCP_SECRET_MANAGER_PROJECT", "proj-1"), ("SECRETS_USER_FOLDERS", "1")]);
+        let x = from_env(&var, &env).unwrap().unwrap();
+        assert!(x.user_folders() && diagnose(Some(&x))["userFolders"] == true);
+        let var = super::super::http::tests::settings(&[("SECRETS_BACKEND", "gcp-secret-manager"), ("GCP_SECRET_MANAGER_PROJECT", "proj-1")]);
+        assert!(!from_env(&var, &env).unwrap().unwrap().user_folders(), "off by default");
+        let var = super::super::http::tests::settings(&[("SECRETS_BACKEND", "vault"), ("VAULT_ADDR", "https://v"), ("VAULT_TOKEN", "t"), ("SECRETS_USER_FOLDERS", "true")]);
+        assert!(from_env(&var, &env).err().unwrap().contains("SECRETS_USER_FOLDERS"));
+        let var = super::super::http::tests::settings(&[("SECRETS_USER_FOLDERS", "1")]);
+        assert!(from_env(&var, &env).unwrap().is_none(), "local: warned about, nothing to read");
+    }
+
     pub(crate) fn fake(values: &[(Scope, &str, &str)], ttl: Duration) -> (Arc<Fake>, Arc<ExternalStore>) {
         let f = Arc::new(Fake::default());
         for (s, n, v) in values {
-            f.values.lock().unwrap().insert((*s, n.to_string()), v.to_string());
+            f.values.lock().unwrap().insert((s.clone(), n.to_string()), v.to_string());
         }
         (Arc::clone(&f), Arc::new(ExternalStore::new(Box::new(f), ttl)))
     }

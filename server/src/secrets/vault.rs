@@ -257,8 +257,8 @@ impl Inner {
         format!("{}/v1/{path}", self.cfg.addr)
     }
 
-    fn secret_path(&self, kind: &str, scope: Scope, name: &str) -> String {
-        format!("{}/{kind}/{}/{}/{name}", self.cfg.mount, self.cfg.prefix, scope.as_str())
+    fn secret_path(&self, kind: &str, scope: &Scope, name: &str) -> String {
+        format!("{}/{kind}/{}/{}/{name}", self.cfg.mount, self.cfg.prefix, scope.folder('/'))
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -390,7 +390,7 @@ impl Inner {
     }
 
     async fn read(&self, scope: Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error> {
-        let path = self.secret_path("data", scope, name);
+        let path = self.secret_path("data", &scope, name);
         let (_, body) = self.get(&path).await?;
         let Some(body) = body else { return Ok(None) };
         let data = &body["data"]["data"];
@@ -410,7 +410,7 @@ impl Inner {
     }
 
     async fn list(&self, scope: Scope) -> Result<Vec<String>, Error> {
-        let path = format!("{}/metadata/{}/{}/", self.cfg.mount, self.cfg.prefix, scope.as_str());
+        let path = format!("{}/metadata/{}/{}/", self.cfg.mount, self.cfg.prefix, scope.folder('/'));
         let (_, body) = self.get(&format!("{path}?list=true")).await?;
         let Some(body) = body else { return Ok(Vec::new()) };
         let keys = body["data"]["keys"].as_array().ok_or_else(|| Error::Unavailable(format!("Vault: listing {path} gave no keys")))?;
@@ -641,6 +641,19 @@ pub(crate) mod tests {
         redact::forget(&bot_value);
         redact::forget("linode-from-vault-1");
         redact::forget("sealed-but-shadowed");
+    }
+
+    #[test]
+    fn reads_each_users_own_folder() {
+        let (url, f) = stand_in();
+        f.tokens.lock().unwrap().push("hvs.users".into());
+        let value = format!("ua1-vault-{}", crate::random_hex(10));
+        put(&f, "users/ua1/OPENAI_API_KEY", &value);
+        put(&f, "users/ua1/LINODE_TOKEN", "never-from-a-users-folder");
+        put(&f, "users/ub1/OPENAI_API_KEY", "ub1-own-openai");
+        put(&f, "users/ua10/OPENAI_API_KEY", "not-ua1s");
+        let x = external::tests::users_on(vault(&url, &[("VAULT_TOKEN", "hvs.users")], Duration::from_secs(60)));
+        external::tests::reads_users_folders(&x, &value);
     }
 
     #[test]

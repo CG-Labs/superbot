@@ -386,8 +386,8 @@ impl SecretsManager {
 
 impl Inner {
     /// The secret's name, or None if it would be too long to exist.
-    fn secret_id(&self, scope: Scope, name: &str) -> Option<String> {
-        let id = format!("{}/{}/{name}", self.cfg.prefix, scope.as_str());
+    fn secret_id(&self, scope: &Scope, name: &str) -> Option<String> {
+        let id = format!("{}/{}/{name}", self.cfg.prefix, scope.folder('/'));
         (id.len() <= MAX_NAME).then_some(id)
     }
 
@@ -522,7 +522,7 @@ impl Inner {
     }
 
     async fn read(&self, scope: Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error> {
-        let Some(id) = self.secret_id(scope, name) else { return Ok(None) };
+        let Some(id) = self.secret_id(&scope, name) else { return Ok(None) };
         match self.call("GetSecretValue", &json!({ "SecretId": id }), &id).await? {
             Reply::Ok(body) => value(&id, &body),
             Reply::Refused(_, code) if code == NOT_FOUND => Ok(None),
@@ -552,7 +552,7 @@ impl Inner {
     }
 
     async fn list(&self, scope: Scope) -> Result<Vec<String>, Error> {
-        let head = format!("{}/{}/", self.cfg.prefix, scope.as_str());
+        let head = format!("{}/{}/", self.cfg.prefix, scope.folder('/'));
         let mut out = Vec::new();
         let mut next: Option<String> = None;
         for _ in 0..1000 {
@@ -921,6 +921,18 @@ mod tests {
         for v in [bot_value.as_str(), "ant-from-aws-1", "linode-from-aws-1", "sealed-but-shadowed-aws"] {
             redact::forget(v);
         }
+    }
+
+    #[test]
+    fn reads_each_users_own_folder() {
+        let (url, _, f) = stand_in();
+        let value = format!("ua1-aws-{}", crate::random_hex(10));
+        put(&f, "superbot/users/ua1/OPENAI_API_KEY", &value);
+        put(&f, "superbot/users/ua1/LINODE_TOKEN", "never-from-a-users-folder");
+        put(&f, "superbot/users/ub1/OPENAI_API_KEY", "ub1-own-openai");
+        put(&f, "superbot/users/ua10/OPENAI_API_KEY", "not-ua1s");
+        let x = super::super::external::tests::users_on(store(&url, &[], Duration::from_secs(60)));
+        super::super::external::tests::reads_users_folders(&x, &value);
     }
 
     #[test]
