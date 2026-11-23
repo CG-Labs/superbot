@@ -297,7 +297,7 @@ pub async fn user(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>,
     cp.need()?;
     let u = need_user_key(&app, &key)?;
     let p = app.db.residency_pin(PinOn::User, &u.id).ok_or_else(|| match app.db.team_id_of(&u.id).filter(|t| app.db.residency_pin(PinOn::Team, t).is_some()) {
-        Some(t) => not_found(&format!("A pin of their own (their team's is reported with botctl team residency {t} report); residency pin on this user")),
+        Some(t) => ApiError(StatusCode::NOT_FOUND, format!("{} has no residency pin of their own. Their team's pin has its own report: botctl team residency {t} report", u.name)),
         None => not_found("Residency pin on this user"),
     })?;
     respond(&app, cp, &by, &p, &q)
