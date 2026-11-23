@@ -241,7 +241,7 @@ Facts to check against, as of November 2026. Confirm each provider's current ter
 - **OpenAI's API** offers data residency per project to eligible customers, by arrangement with OpenAI. Its Europe region stores and processes in the EEA or Switzerland. Its UK region stores in the UK but does not promise processing there. Some system data is excluded.
 - **Routers** (for example OpenRouter) forward to upstream providers. Treat them as having no region unless their terms say otherwise.
 
-Mark an endpoint as in the Agreed Region only if the provider's terms for that endpoint promise processing there, not only storage. With Hermes Agent, the harness's side tasks (summaries, titles, image analysis) use the run's own endpoint, and the keys of the harness's built-in providers are left out of the run. Claude Code and Codex routes name no endpoint from the routing file, so they don't run for a covered team or user.
+Mark an endpoint as in the Agreed Region only if the provider's terms for that endpoint promise processing there, not only storage. With Hermes Agent, the harness's side tasks (summaries, titles, image analysis) use the run's own endpoint, and the keys of the harness's built-in providers are left out of the run. With Claude Code, every model call goes to the route's endpoint, its own background traffic to Anthropic (telemetry, error reports, WebFetch's host check) is off, and no saved login or cloud setting can send calls elsewhere ([ADR 0193](../adr/0193-in-region-claude-code-routes.md)). Codex routes name no endpoint from the routing file, so they don't run for a covered team or user.
 
 ### IV.5 Evidence
 
