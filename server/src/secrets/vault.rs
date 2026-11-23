@@ -189,7 +189,7 @@ impl Config {
 
 struct Token {
     value: Zeroizing<String>,
-    /// When to log in again (AppRole), before the lease runs out.
+    /// When to log in again (AppRole, Kubernetes, JWT), before the lease runs out.
     renew_at: Option<Instant>,
 }
 
