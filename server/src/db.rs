@@ -1503,6 +1503,22 @@ fn scim_token_row(r: &Row) -> rusqlite::Result<ScimToken> {
     })
 }
 
+/// Claims `notice` for a token, on `c` (inside the transaction that audits it): only
+/// while it's still unrevoked, unrotated, and its last notice is `from`.
+pub(crate) fn claim_scim_token_notice(c: &Connection, id: &str, from: Option<&str>, notice: &str) -> rusqlite::Result<bool> {
+    let n = c.execute(
+        "UPDATE scim_tokens SET expiry_notice = ?1 WHERE id = ?2 AND revoked_at IS NULL AND rotated_to IS NULL AND coalesce(expiry_notice, '') = coalesce(?3, '')",
+        params![notice, id, from],
+    )?;
+    Ok(n == 1)
+}
+
+/// A tenant's tokens, read on `c`.
+pub(crate) fn scim_tenant_tokens(c: &Connection, tenant: &str) -> rusqlite::Result<Vec<ScimToken>> {
+    let mut s = c.prepare("SELECT * FROM scim_tokens WHERE tenant = ? ORDER BY created_at, id")?;
+    s.query_map([tenant], scim_token_row)?.collect()
+}
+
 /// A user as a SCIM tenant provisioned it: the SCIM attributes botd has no column for
 /// on `users`, and whether the IdP deleted it (users themselves are never deleted).
 #[derive(Clone, Debug)]
@@ -7717,12 +7733,14 @@ impl Db {
             .collect()
     }
 
-    /// Records that `notice` was audited for a token, unless another pass did first.
-    pub fn set_scim_token_notice(&self, id: &str, from: Option<&str>, notice: &str) -> bool {
+    #[cfg(test)]
+    pub fn conn_for_tests(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.c()
-            .execute("UPDATE scim_tokens SET expiry_notice = ?1 WHERE id = ?2 AND coalesce(expiry_notice, '') = coalesce(?3, '')", params![notice, id, from])
-            .unwrap_or(0)
-            == 1
+    }
+
+    #[cfg(test)]
+    pub fn set_scim_token_notice(&self, id: &str, notice: Option<&str>) {
+        self.c().execute("UPDATE scim_tokens SET expiry_notice = ?1 WHERE id = ?2", params![notice, id]).unwrap();
     }
 
     #[cfg(test)]

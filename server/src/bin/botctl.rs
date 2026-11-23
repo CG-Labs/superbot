@@ -1347,8 +1347,13 @@ fn scim_created(res: &Value) -> String {
         res["token"].as_str().unwrap_or_default(),
     );
     if let Some(old) = res["replaced"]["id"].as_str() {
-        let hours = (res["replaced"]["endsAt"].as_i64().unwrap_or_default() - now_ms()) / 3_600_000;
-        out.push_str(&if hours > 0 { format!("\nThe old token {old} keeps working for about {hours} more hours: update the IdP before then.") } else { format!("\nThe old token {old} stopped working.") });
+        let left = res["replaced"]["endsAt"].as_i64().unwrap_or_default() - now_ms();
+        let (hours, minutes) = (left / 3_600_000, (left + 59_999) / 60_000);
+        out.push_str(&match left {
+            l if l <= 0 => format!("\nThe old token {old} stopped working."),
+            _ if hours >= 1 => format!("\nThe old token {old} keeps working for about {hours} more hours: update the IdP before then."),
+            _ => format!("\nThe old token {old} keeps working for about {minutes} more minutes: update the IdP before then."),
+        });
     }
     if let Some(p) = t["ssoProvider"].as_str() {
         out.push_str(&format!("\nexternalId must be each person's subject in the SSO provider {p} (Entra: map objectId to externalId)."));
@@ -3222,6 +3227,8 @@ mod tests {
         assert!(out.starts_with("Rotated") && out.contains("st3 keeps working for about 24 more hours"), "{out}");
         let now = scim_created(&json!({ "token": "sbp_n", "enabled": true, "scimToken": { "id": "st4", "tenant": "okta" }, "replaced": { "id": "st3", "endsAt": 0 } }));
         assert!(now.contains("st3 stopped working"), "{now}");
+        let hour = scim_created(&json!({ "token": "sbp_n", "enabled": true, "scimToken": { "id": "st4", "tenant": "okta" }, "replaced": { "id": "st3", "endsAt": now_ms() + 3_600_000 - 5_000 } }));
+        assert!(hour.contains("st3 keeps working for about 60 more minutes"), "a one-hour overlap isn't over: {hour}");
     }
 
     #[test]

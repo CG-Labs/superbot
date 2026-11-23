@@ -194,3 +194,36 @@ async fn the_health_score_watches_a_tenant_about_to_lose_provisioning() {
     assert_eq!(i["facts"]["scimReasons"], json!([{ "code": "expired_token", "count": 1 }]), "{i:#}");
     assert_eq!(i["status"], "watch");
 }
+
+/// A notice is claimed only for a token still unrevoked, unrotated and owed it, in the
+/// transaction that records it, so one retired meanwhile gets none and one not recorded
+/// stays owed.
+#[tokio::test]
+async fn a_notice_is_claimed_only_while_the_token_is_still_owed_it() {
+    let (port, app, admin) = serve().await;
+    let (_, a) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    let (_, b) = token(port, &admin, json!({ "tenant": "entra" })).await;
+    let soon = db::now() + 3 * DAY;
+    app.db.set_scim_token_expiry(&a, Some(soon));
+    app.db.set_scim_token_expiry(&b, Some(soon));
+    assert_eq!(app.db.scim_tokens_due_notice(db::now(), 14 * DAY).len(), 2);
+
+    // Rotated and revoked after the pass read them: the claim fails, nothing is recorded.
+    assert_eq!(rotate(port, &admin, &a, json!({})).await.0, 201);
+    assert_eq!(call(port, "DELETE", &format!("/api/scim/tokens/{b}"), &admin, "").await.0, 200);
+    let tx = app.db.conn_for_tests();
+    assert!(!db::claim_scim_token_notice(&tx, &a, None, "expiring").unwrap());
+    assert!(!db::claim_scim_token_notice(&tx, &b, None, "expiring").unwrap());
+    drop(tx);
+
+    // Another pass's claim (a marker it saw changed) is never taken twice.
+    let (_, c) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    app.db.set_scim_token_expiry(&c, Some(soon));
+    app.db.set_scim_token_notice(&c, Some("expiring"));
+    let tx = app.db.conn_for_tests();
+    assert!(!db::claim_scim_token_notice(&tx, &c, None, "expiring").unwrap());
+    drop(tx);
+    app.db.set_scim_token_notice(&c, None);
+    assert_eq!(scim::expiry_notices(&app, db::now()), 1, "still owed, so recorded");
+    assert_eq!(events(port, &admin, "action=scim.token_expiring").await.len(), 1);
+}
