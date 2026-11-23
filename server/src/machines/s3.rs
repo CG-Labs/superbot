@@ -43,7 +43,7 @@ impl std::fmt::Debug for Settings {
 }
 
 /// S3 bucket names: 3 to 63 lowercase letters, digits, dots and dashes.
-fn bucket_name(b: &str) -> bool {
+pub fn bucket_name(b: &str) -> bool {
     (3..=63).contains(&b.len())
         && b.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'.' || c == b'-')
         && b.starts_with(|c: char| c.is_ascii_alphanumeric())
@@ -146,11 +146,11 @@ pub fn tag(xml: &str, name: &str) -> Option<String> {
     )
 }
 
-/// S3's error body in a few words, never the request.
-fn refusal(status: reqwest::StatusCode, body: &str) -> String {
+/// S3's error body in a few words, never the request. `what` names the store.
+fn refusal(what: &str, status: reqwest::StatusCode, body: &str) -> String {
     let code = tag(body, "Code").unwrap_or_else(|| status.canonical_reason().unwrap_or("error").into());
     let msg = tag(body, "Message").map(|m| format!(": {m}")).unwrap_or_default();
-    crate::audit::clip(&format!("the backup store refused ({}): {code}{msg}", status.as_u16()), 300)
+    crate::audit::clip(&format!("{what} refused ({}): {code}{msg}", status.as_u16()), 300)
 }
 
 pub struct S3 {
@@ -158,6 +158,8 @@ pub struct S3 {
     http: reqwest::Client,
     /// Bytes per part of a multipart upload.
     pub part_size: usize,
+    /// What errors call the store.
+    what: &'static str,
 }
 
 impl std::fmt::Debug for S3 {
@@ -174,10 +176,21 @@ impl S3 {
             .user_agent(concat!("superbot-botd/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| format!("backup store client: {e}"))?;
-        Ok(S3 { s, http, part_size: PART_SIZE })
+        Ok(S3 { s, http, part_size: PART_SIZE, what: "the backup store" })
+    }
+
+    /// The same client, with errors calling the store `what` ("the audit archive").
+    pub fn called(mut self, what: &'static str) -> S3 {
+        self.what = what;
+        self
     }
 
     async fn send(&self, method: Method, key: Option<&str>, query: &[(&str, &str)], body: Vec<u8>) -> Result<reqwest::Response, String> {
+        self.send_with(method, key, query, &[], body).await
+    }
+
+    /// `send`, with more headers (lowercase names), all of them signed.
+    async fn send_with(&self, method: Method, key: Option<&str>, query: &[(&str, &str)], extra: &[(&str, String)], body: Vec<u8>) -> Result<reqwest::Response, String> {
         let uri = match key {
             None => format!("/{}", encode(&self.s.bucket, false)),
             Some(k) => format!("/{}/{}", encode(&self.s.bucket, false), encode(k, true)),
@@ -185,31 +198,49 @@ impl S3 {
         let q = canonical_query(query);
         let payload = sha256_hex(&body);
         let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let headers = [("host", self.s.host.as_str()), ("x-amz-content-sha256", payload.as_str()), ("x-amz-date", amz_date.as_str())];
+        let mut headers = vec![("host", self.s.host.as_str()), ("x-amz-content-sha256", payload.as_str()), ("x-amz-date", amz_date.as_str())];
+        headers.extend(extra.iter().map(|(k, v)| (*k, v.as_str())));
         let scope = Scope { amz_date: &amz_date, region: &self.s.region, service: "s3" };
         let (signed, sig) = sigv4::signature(&self.s.secret, &scope, method.as_str(), &uri, &q, &headers, &payload);
         let auth = scope.authorization(&self.s.access_key, &signed, &sig);
         let url = if q.is_empty() { format!("{}{uri}", self.s.endpoint) } else { format!("{}{uri}?{q}", self.s.endpoint) };
-        let res = self
-            .http
-            .request(method, url)
-            .header("x-amz-content-sha256", &payload)
-            .header("x-amz-date", &amz_date)
-            .header("authorization", auth)
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| format!("couldn't reach the backup store: {}", e.without_url()))?;
+        let mut req = self.http.request(method, url).header("x-amz-content-sha256", &payload).header("x-amz-date", &amz_date).header("authorization", auth);
+        for (k, v) in extra {
+            req = req.header(*k, v);
+        }
+        let res = req.body(body).send().await.map_err(|e| format!("couldn't reach {}: {}", self.what, e.without_url()))?;
         if res.status().is_success() {
             return Ok(res);
         }
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        Err(refusal(status, &text))
+        Err(refusal(self.what, status, &text))
     }
 
-    async fn text(res: reqwest::Response) -> Result<String, String> {
-        res.text().await.map_err(|e| format!("the backup store's answer was cut off: {}", e.without_url()))
+    async fn text(&self, res: reqwest::Response) -> Result<String, String> {
+        res.text().await.map_err(|e| format!("{}'s answer was cut off: {}", self.what, e.without_url()))
+    }
+
+    /// A small object in one request, with more headers (lowercase names, signed):
+    /// Object Lock retention, a checksum, metadata. The answer's headers.
+    pub async fn put_with(&self, key: &str, body: Vec<u8>, headers: &[(&str, String)]) -> Result<reqwest::header::HeaderMap, String> {
+        self.send_with(Method::PUT, Some(key), &[], headers, body).await.map(|r| r.headers().clone())
+    }
+
+    /// An object's headers, of one version when given.
+    pub async fn head(&self, key: &str, version: Option<&str>) -> Result<reqwest::header::HeaderMap, String> {
+        let q: Vec<(&str, &str)> = version.map(|v| ("versionId", v)).into_iter().collect();
+        self.send(Method::HEAD, Some(key), &q, Vec::new()).await.map(|r| r.headers().clone())
+    }
+
+    /// The bucket's Object Lock configuration (`GET ?object-lock`), or None when it has
+    /// none: Object Lock was never turned on.
+    pub async fn object_lock(&self) -> Result<Option<String>, String> {
+        match self.send(Method::GET, None, &[("object-lock", "")], Vec::new()).await {
+            Ok(res) => Ok(Some(self.text(res).await?)),
+            Err(e) if e.contains("ObjectLockConfigurationNotFound") || e.contains("(404)") || e.contains("(501)") => Ok(None),
+            Err(e) => Err(format!("{e} (botd asks whether the bucket is write-once: s3:GetBucketObjectLockConfiguration)")),
+        }
     }
 
     /// A small object in one request.
@@ -241,7 +272,7 @@ impl S3 {
                 q.push(("continuation-token", t));
             }
             let res = self.send(Method::GET, None, &q, Vec::new()).await?;
-            let xml = S3::text(res).await?;
+            let xml = self.text(res).await?;
             keys.extend(xml.split("<Contents>").skip(1).filter_map(|c| tag(c, "Key")));
             token = match (tag(&xml, "IsTruncated").as_deref(), tag(&xml, "NextContinuationToken")) {
                 (Some("true"), Some(t)) if !t.is_empty() && token.as_deref() != Some(t.as_str()) => Some(t),
@@ -256,7 +287,7 @@ impl S3 {
     /// versioning at all says it doesn't implement it.
     pub async fn versioned(&self) -> Result<bool, String> {
         match self.send(Method::GET, None, &[("versioning", "")], Vec::new()).await {
-            Ok(res) => Ok(matches!(tag(&S3::text(res).await?, "Status").as_deref(), Some("Enabled" | "Suspended"))),
+            Ok(res) => Ok(matches!(tag(&self.text(res).await?, "Status").as_deref(), Some("Enabled" | "Suspended"))),
             Err(e) if e.contains("(501)") || e.contains("NotImplemented") => Ok(false),
             Err(e) => Err(format!("{e} (botd asks whether the bucket keeps old versions: s3:GetBucketVersioning)")),
         }
@@ -273,7 +304,7 @@ impl S3 {
                 q.push(("version-id-marker", v));
             }
             let res = self.send(Method::GET, None, &q, Vec::new()).await?;
-            let xml = S3::text(res).await?;
+            let xml = self.text(res).await?;
             for item in xml.split("<Version>").skip(1).chain(xml.split("<DeleteMarker>").skip(1)) {
                 if let (Some(k), Some(v)) = (tag(item, "Key"), tag(item, "VersionId")) {
                     out.push((k, v));
@@ -311,7 +342,7 @@ impl S3 {
     /// such as one cut off by a restart. Returns how many went.
     pub async fn abort_unfinished(&self, key: &str, before: i64) -> Result<usize, String> {
         let res = self.send(Method::GET, None, &[("prefix", key), ("uploads", "")], Vec::new()).await?;
-        let xml = S3::text(res).await?;
+        let xml = self.text(res).await?;
         let mut gone = 0;
         for u in xml.split("<Upload>").skip(1) {
             let started = tag(u, "Initiated").and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok()).map(|t| t.timestamp_millis());
@@ -329,7 +360,7 @@ impl S3 {
     /// Starts writing `key` in parts.
     pub async fn upload(&self, key: &str) -> Result<Upload<'_>, String> {
         let res = self.send(Method::POST, Some(key), &[("uploads", "")], Vec::new()).await?;
-        let xml = S3::text(res).await?;
+        let xml = self.text(res).await?;
         let id = tag(&xml, "UploadId").filter(|i| !i.is_empty()).ok_or("the backup store didn't start the upload")?;
         Ok(Upload {
             s3: self,
@@ -407,9 +438,9 @@ impl Upload<'_> {
         xml.push_str("</CompleteMultipartUpload>");
         let res = self.s3.send(Method::POST, Some(&self.key), &[("uploadId", &self.id)], xml.into_bytes()).await?;
         // S3 may answer 200 and still fail the upload.
-        let body = S3::text(res).await?;
+        let body = self.s3.text(res).await?;
         if body.contains("<Error>") {
-            return Err(refusal(reqwest::StatusCode::OK, &body));
+            return Err(refusal(self.s3.what, reqwest::StatusCode::OK, &body));
         }
         Ok(())
     }
@@ -453,7 +484,7 @@ mod tests {
     fn reads_tags() {
         assert_eq!(tag("<a><UploadId>x&amp;y</UploadId></a>", "UploadId").as_deref(), Some("x&y"));
         assert_eq!(tag("<a></a>", "UploadId"), None);
-        let r = refusal(reqwest::StatusCode::FORBIDDEN, "<Error><Code>AccessDenied</Code><Message>no</Message></Error>");
+        let r = refusal("the backup store", reqwest::StatusCode::FORBIDDEN, "<Error><Code>AccessDenied</Code><Message>no</Message></Error>");
         assert_eq!(r, "the backup store refused (403): AccessDenied: no");
     }
 }
