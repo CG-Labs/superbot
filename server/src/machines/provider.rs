@@ -61,6 +61,8 @@ pub struct CreateSpec {
     pub user_data: Option<String>,
     /// The firewall the machine is behind from its first boot (ADR 0035).
     pub firewall_id: Option<String>,
+    /// The subnet of its team's own network it joins from its first boot (ADR 0189).
+    pub subnet_id: Option<String>,
 }
 
 /// The user data holds a live enrollment token, so it never reaches a log.
@@ -75,8 +77,32 @@ impl fmt::Debug for CreateSpec {
             .field("authorized_keys", &self.authorized_keys.len())
             .field("user_data", &self.user_data.as_ref().map(|_| "[redacted]"))
             .field("firewall_id", &self.firewall_id)
+            .field("subnet_id", &self.subnet_id)
             .finish()
     }
+}
+
+/// A team's own network at the provider (ADR 0189): a Linode VPC, and the subnet its
+/// machines join.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TeamNetwork {
+    pub id: String,
+    pub label: String,
+    pub region: String,
+    pub subnet_id: String,
+    /// The subnet's range, canonical. In a listing, empty if the VPC has lost its subnet.
+    pub subnet: String,
+    /// Made by this call, not found.
+    pub created: bool,
+}
+
+/// One interface on a team network: the machine, and the interface's own ids, which
+/// taking it off needs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetworkMember {
+    pub machine: String,
+    pub config: String,
+    pub interface: String,
 }
 
 /// What to put on a machine that is wiped and reinstalled in place (ADR 0056): same
@@ -189,6 +215,10 @@ fn unsupported() -> ProviderError {
     ProviderError::Api { status: 501, message: "this provider can't export or import machines".into() }
 }
 
+fn no_networks() -> ProviderError {
+    ProviderError::Api { status: 501, message: "this provider has no team networks".into() }
+}
+
 pub trait MachineProvider: Send + Sync {
     /// Stored with each machine, e.g. `linode`.
     fn name(&self) -> &'static str;
@@ -296,6 +326,28 @@ pub trait MachineProvider: Send + Sync {
     /// stays stopped until `boot`. Everything on the old one's disks is lost.
     fn replace_with<'a>(&'a self, _id: &'a str, _staging: &'a str, _spec: &'a RestoreSpec) -> Fut<'a, ProviderMachine> {
         Box::pin(async { Err(unsupported()) })
+    }
+
+    // Team networks (ADR 0189): a network of its own per team and region, which only
+    // the team's machines join. Providers without them refuse.
+
+    /// The network called `label` in `region`, made with one subnet, `subnet`, if it
+    /// isn't there. One that is there must be in `region` and have that subnet.
+    fn ensure_team_network<'a>(&'a self, _label: &'a str, _region: &'a str, _subnet: &'a str) -> Fut<'a, TeamNetwork> {
+        Box::pin(async { Err(no_networks()) })
+    }
+    /// Every network whose label starts with `prefix`.
+    fn team_networks<'a>(&'a self, _prefix: &'a str) -> Fut<'a, Vec<TeamNetwork>> {
+        Box::pin(async { Err(no_networks()) })
+    }
+    /// Every interface on network `id`, on any of its subnets, whoever's machine it is.
+    fn team_network_members<'a>(&'a self, _id: &'a str) -> Fut<'a, Vec<NetworkMember>> {
+        Box::pin(async { Err(no_networks()) })
+    }
+    /// Takes the interface off its machine, which must be powered off. Succeeds if it
+    /// is gone already.
+    fn leave_team_network<'a>(&'a self, _member: &'a NetworkMember) -> Fut<'a, ()> {
+        Box::pin(async { Err(no_networks()) })
     }
 
     // Firewalls (ADR 0035). Labels are unique per account, as machines' are.

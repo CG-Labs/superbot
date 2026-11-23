@@ -103,6 +103,8 @@ mod machines_lockdown_tests;
 #[cfg(test)]
 mod machines_mtls_tests;
 #[cfg(test)]
+mod machines_team_network_tests;
+#[cfg(test)]
 mod machines_logins_tests;
 #[cfg(test)]
 mod machines_upkeep_tests;

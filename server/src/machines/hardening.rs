@@ -53,9 +53,19 @@ impl Settings {
     }
 
     /// The egress script with the deny lists filled in.
+    #[cfg(test)]
     pub fn egress_script(&self) -> String {
+        self.egress_script_on(None)
+    }
+
+    /// The egress script for a machine on its team's network (ADR 0189): `team`, the
+    /// subnet, is let through before the deny lists, for every user.
+    pub fn egress_script_on(&self, team: Option<&str>) -> String {
         let (v4, v6): (Vec<&str>, Vec<&str>) = self.deny.iter().map(String::as_str).partition(|c| !c.contains(':'));
         let mut lines = String::new();
+        if let Some(subnet) = team {
+            lines.push_str(&format!("    ip daddr {subnet} accept\n"));
+        }
         if !v4.is_empty() {
             lines.push_str(&format!("    ip daddr {{ {} }} counter reject\n", v4.join(", ")));
         }
@@ -65,13 +75,14 @@ impl Settings {
         EGRESS.replace("{deny}\n", &lines)
     }
 
-    /// Each file the first boot writes for it: path, mode and content.
-    pub fn files(&self) -> Vec<(&'static str, &'static str, String)> {
+    /// Each file the first boot writes for it: path, mode and content. `team`: the
+    /// subnet of the team network it is on, if any.
+    pub fn files(&self, team: Option<&str>) -> Vec<(&'static str, &'static str, String)> {
         vec![
             (SSH_PATH, "0644", SSH.to_string()),
             (SYSCTL_PATH, "0644", SYSCTL.to_string()),
             (APT_PATH, "0644", APT.to_string()),
-            (EGRESS_PATH, "0755", self.egress_script()),
+            (EGRESS_PATH, "0755", self.egress_script_on(team)),
             (EGRESS_UNIT_PATH, "0644", EGRESS_UNIT.to_string()),
         ]
     }
@@ -410,6 +421,19 @@ mod tests {
         let script = s.egress_script();
         assert!(!script.lines().any(|l| l.starts_with("    ip daddr {") && l.ends_with("counter reject")), "{script}");
         assert!(script.contains("    ip6 daddr { fc00::/7 } counter reject\n"), "{script}");
+    }
+
+    #[test]
+    fn a_machine_on_its_teams_network_lets_everyone_reach_that_subnet_and_no_more() {
+        let s = Settings::default_on();
+        let script = s.egress_script_on(Some("10.248.0.0/22"));
+        let team = script.find("    ip daddr 10.248.0.0/22 accept\n").expect(&script);
+        assert!(team < script.find("counter reject").unwrap(), "before the deny lists: {script}");
+        assert!(script.contains("10.0.0.0/8"), "the rest of 10/8 still denied");
+        assert!(!s.egress_script().contains("10.248.0.0/22"), "off its team's network, nothing let through");
+        let files = s.files(Some("10.248.0.0/22"));
+        assert!(files.iter().any(|(p, _, c)| *p == EGRESS_PATH && c.contains("10.248.0.0/22 accept")));
+        assert!(!s.files(None).iter().any(|(_, _, c)| c.contains("10.248.0.0/22")));
     }
 
     #[test]
