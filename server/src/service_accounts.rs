@@ -454,6 +454,8 @@ pub struct Holdings {
     pub effective: Scope,
     pub owner: Option<User>,
     pub owner_active: bool,
+    /// Whether its owner is an admin or on its team, so it acts there (ADR 0182); None in no team.
+    pub owner_on_team: Option<bool>,
 }
 
 pub fn holdings(db: &crate::db::Db, sa: &ServiceAccount) -> Holdings {
@@ -464,6 +466,7 @@ pub fn holdings(db: &crate::db::Db, sa: &ServiceAccount) -> Holdings {
         Some(o) if owner_active && sa.user.active() => roles.holds().and(ceiling(db, o, roles.team.as_ref().map(|t| t.id.as_str()))),
         _ => Scope::NONE,
     };
+    let owner_on_team = roles.team.as_ref().map(|t| owner.as_ref().is_some_and(|o| on_team(db, o, &t.id)));
     Holdings {
         org_role: roles.org_role().cloned(),
         team_role: roles.team_role().cloned(),
@@ -473,6 +476,7 @@ pub fn holdings(db: &crate::db::Db, sa: &ServiceAccount) -> Holdings {
         effective,
         owner,
         owner_active,
+        owner_on_team,
     }
 }
 
@@ -508,7 +512,7 @@ fn view(app: &AppState, sa: &ServiceAccount, refused: &[ServiceRefusal]) -> Valu
         "customRole": role_summary(h.org_role.as_ref()), "team": h.team.as_ref().map(|t| json!({ "id": t.id, "name": t.name })),
         "teamRole": role_summary(h.team_role.as_ref()),
         "owner": h.owner.as_ref().map(person), "ownerActive": h.owner_active,
-        "ownerOnTeam": h.team.as_ref().map(|t| h.owner.as_ref().is_some_and(|o| on_team(&app.db, o, &t.id))),
+        "ownerOnTeam": h.owner_on_team,
         "permissions": h.org.names(), "teamPermissions": h.in_team.names(),
         "effective": h.effective.names(),
         "tokens": tokens.iter().filter(|t| token_state(t, at) == "active").count(),

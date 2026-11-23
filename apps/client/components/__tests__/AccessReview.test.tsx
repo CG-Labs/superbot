@@ -111,6 +111,33 @@ describe("AccessReview", () => {
     expect(card.getByText(/^Token: Nightly sbsa_…ab12: everything it holds; expires .*; never used$/)).toBeOnTheScreen();
   });
 
+  it("flags a service account whose owner is off its team", async () => {
+    const sa = {
+      id: "sa2",
+      name: "Sync",
+      description: "",
+      role: "member" as const,
+      status: "active" as const,
+      createdAt: 0,
+      createdBy: "u1",
+      customRole: null,
+      team: { id: "t1", name: "Research", role: "member" },
+      owner: { id: "u2", name: "Bo", email: "bo@example.com", status: "active" },
+      ownerActive: true,
+      ownerOnTeam: false,
+      permissions: ["account", "read", "write"],
+      teamPermissions: [],
+      effective: ["account", "read", "write"],
+      botAccess: { all: false, bots: [] },
+      tokens: [],
+      flags: ["owner_off_team"],
+    };
+    await open(fakeApi(report({ serviceAccounts: [sa], summary: { ...report().summary, serviceAccounts: 1 } })));
+    const card = within(screen.getByLabelText("Access of service account Sync"));
+    expect(card.getByText("member, in Research (acts in no team)")).toBeOnTheScreen();
+    expect(card.getByText("Owner off its team")).toBeOnTheScreen();
+  });
+
   it("leaves the section out when there are no service accounts", async () => {
     await open();
     expect(screen.queryByText(/^Service accounts/)).toBeNull();

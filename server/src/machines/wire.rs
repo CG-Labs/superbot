@@ -127,6 +127,8 @@ pub const CAN_LOCKED_DOWN: &str = "locked_down";
 /// Every such process also runs under a seccomp filter that refuses the kernel
 /// interfaces a run never needs (ADR 0156).
 pub const CAN_SECCOMP: &str = "seccomp";
+/// Takes `HarnessPlan::npm_registry` and `HarnessPlan::ca` (ADR 0186).
+pub const CAN_HARNESS_MIRRORS: &str = "harness_mirrors";
 
 /// The screen protocol this build speaks (ADR 0045). A request names it, an agent
 /// refuses any other, and botd treats an agent that reports another as outdated.
@@ -764,12 +766,21 @@ pub struct SyncReport {
 /// The harness CLIs a machine should have (ADR 0039): pinned versions, each checked
 /// against a checksum where its source has one. botd builds it from its adapters'
 /// pins; the agent installs it without knowing what a harness is.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HarnessPlan {
     /// Node.js, for `Npm` sources. None when none is planned.
     pub node: Option<NodeRuntime>,
     pub harnesses: Vec<HarnessInstall>,
+    /// The npm registry `Npm` sources come from (MACHINE_NPM_REGISTRY, ADR 0186), an
+    /// https URL ending in `/`. None: npm's own. Left out when None, so a plan without
+    /// mirrors has the id and JSON it always had, and agents from before it take it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub npm_registry: Option<String>,
+    /// CA certificates (PEM) the plan's downloads and registry may be signed by,
+    /// besides the system's (MACHINE_MIRROR_CA_FILE, ADR 0186).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
 }
 
 impl HarnessPlan {

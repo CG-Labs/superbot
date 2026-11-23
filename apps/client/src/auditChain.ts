@@ -69,14 +69,15 @@ export function exportLine(x: AuditExportState): ChainLine {
   return sinkLine(x);
 }
 
-/** One line per sink: a SIEM and an archive side by side (ADR 0173). */
+/** One line per sink: SIEMs and an archive side by side (ADR 0173, ADR 0191). */
 export function exportLines(x: AuditExportState): ChainLine[] {
   if (!x.enabled || !x.sinks?.length) return [exportLine(x)];
   return x.sinks.map(sinkLine);
 }
 
 function sinkLine(x: AuditExportSink): ChainLine {
-  const label = x.kind === "s3" ? "Archive" : "SIEM export";
+  const kind = x.kind === "s3" ? "Archive" : "SIEM export";
+  const label = x.name ? `${kind} (${x.name})` : kind;
   if (x.failing) return { label, text: `Failing to ${x.sink}: ${x.lastError ?? "no answer"}. ${x.pending} waiting.`, tone: "bad" };
   const a = x.archive;
   const lock = !a ? "" : a.lock === "off" ? ", objects not locked" : a.lastObject?.retainUntil ? `, last object locked (${a.lastObject.lockMode ?? a.lock}) until ${when(a.lastObject.retainUntil)}` : "";

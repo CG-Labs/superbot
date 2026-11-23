@@ -45,7 +45,7 @@ fn plans_parse_strictly() {
 #[test]
 fn egress_keeps_containers_off_private_and_host_addresses() {
     let deny: Vec<String> = PRIVATE.iter().map(|s| s.to_string()).chain(["203.0.113.5/32".to_string()]).collect();
-    let rules = egress(&deny, None);
+    let rules = egress(&deny, &[]);
     assert_eq!(rules.len(), 4, "TCP and UDP, for each family: {rules:?}");
     assert!(rules.iter().all(|r| r.action == "drop" && r.enabled && r.destination_port.is_empty()));
     let v4 = &rules[0].destination;
@@ -56,7 +56,7 @@ fn egress_keeps_containers_off_private_and_host_addresses() {
 
     // botd on a private address: only its machine port is left open, over TCP.
     let control: IpAddr = "10.1.2.3".parse().unwrap();
-    let rules = egress(&deny, Some((control, 8444)));
+    let rules = egress(&deny, &[(control, 8444)]);
     let v4 = &rules[0].destination;
     assert!(!v4.split(',').any(|d| d == "10.0.0.0/8"));
     assert!(v4.split(',').any(|d| d == "10.0.0.0-10.1.2.2"), "{v4}");
@@ -67,14 +67,52 @@ fn egress_keeps_containers_off_private_and_host_addresses() {
 
     // On a public address it was never denied, so nothing is carved.
     let public: IpAddr = "198.51.100.7".parse().unwrap();
-    assert_eq!(egress(&deny, Some((public, 8444))), egress(&deny, None));
+    assert_eq!(egress(&deny, &[(public, 8444)]), egress(&deny, &[]));
 
     // Ranges at either end of a block.
     assert_eq!(span("10.0.0.0/8"), Some((false, 0x0a00_0000, 0x0aff_ffff)));
     assert_eq!(span("fe80::/10").map(|s| s.0), Some(true));
-    let edge = egress(&["10.0.0.0/8".into()], Some(("10.0.0.0".parse().unwrap(), 1)));
+    let edge = egress(&["10.0.0.0/8".into()], &[("10.0.0.0".parse().unwrap(), 1)]);
     assert_eq!(edge[0].destination, "10.0.0.1-10.255.255.255");
     assert_eq!(edge.iter().find(|r| !r.destination_port.is_empty()).unwrap().destination_port, "2-65535");
+    let edge = egress(&["10.0.0.0/8".into()], &[("10.255.255.255".parse().unwrap(), 65535)]);
+    assert_eq!(edge[0].destination, "10.0.0.0-10.255.255.254");
+    assert_eq!(edge.iter().find(|r| !r.destination_port.is_empty()).unwrap().destination_port, "1-65534");
+}
+
+#[test]
+fn egress_opens_only_the_allowed_ports_on_internal_mirrors() {
+    let deny: Vec<String> = PRIVATE.iter().map(|s| s.to_string()).collect();
+    let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+    // botd and a mirror on one host, another mirror beside it, one on IPv6, one public.
+    let open = [
+        (ip("10.1.2.3"), 8444),
+        (ip("10.1.2.3"), 443),
+        (ip("10.1.2.5"), 8081),
+        (ip("fd00::20"), 443),
+        (ip("198.51.100.7"), 443),
+    ];
+    let rules = egress(&deny, &open);
+    let v4 = &rules[0].destination;
+    for d in ["10.0.0.0-10.1.2.2", "10.1.2.4", "10.1.2.6-10.255.255.255", "192.168.0.0/16"] {
+        assert!(v4.split(',').any(|x| x == d), "{d} in {v4}");
+    }
+    assert!(rules[2].destination.split(',').any(|x| x == "fc00::-fd00::1f"), "{}", rules[2].destination);
+    let tcp = |d: &str| rules.iter().find(|r| r.destination == d && r.protocol == "tcp").map(|r| r.destination_port.clone());
+    assert_eq!(tcp("10.1.2.3").as_deref(), Some("1-442,444-8443,8445-65535"));
+    assert_eq!(tcp("10.1.2.5").as_deref(), Some("1-8080,8082-65535"));
+    assert_eq!(tcp("fd00::20").as_deref(), Some("1-442,444-65535"));
+    assert_eq!(tcp("198.51.100.7"), None, "public, never denied");
+    for d in ["10.1.2.3", "10.1.2.5", "fd00::20"] {
+        assert!(rules.iter().any(|r| r.destination == d && r.protocol == "udp" && r.destination_port.is_empty()), "no udp to {d}");
+    }
+    assert_eq!(egress(&deny, &[(ip("10.1.2.3"), 443), (ip("10.1.2.3"), 443)]), egress(&deny, &[(ip("10.1.2.3"), 443)]));
+
+    assert_eq!(egress_allow(" 10.0.0.20:443, [fd00::20]:8443,10.0.0.20:443 ").unwrap(), vec![(ip("10.0.0.20"), 443), (ip("fd00::20"), 8443)]);
+    assert_eq!(egress_allow("").unwrap(), vec![]);
+    for bad in ["10.0.0.20", "10.0.0.0/8:443", "mirror.internal:443", "10.0.0.20:0", "0.0.0.0:443", "fd00::20:443"] {
+        assert!(egress_allow(bad).unwrap_err().contains("INCUS_EGRESS_ALLOW"), "{bad}");
+    }
 }
 
 #[test]
@@ -87,6 +125,7 @@ fn settings_come_from_the_environment() {
         ("INCUS_URL", "https://192.0.2.50"),
         ("MACHINE_CONTROL_URL", "https://10.9.8.7:8444"),
         ("INCUS_EGRESS_DENY", "198.51.100.0/24, 2001:db8::1"),
+        ("INCUS_EGRESS_ALLOW", "10.0.0.20:443"),
     ]))
     .unwrap();
     assert_eq!(s.url, "https://192.0.2.50:8443");
@@ -96,6 +135,8 @@ fn settings_come_from_the_environment() {
         assert!(s.deny.contains(&c.to_string()), "{c} denied: {:?}", s.deny);
     }
     assert_eq!(s.control, Some(("10.9.8.7".parse().unwrap(), 8444)));
+    assert_eq!(s.allow, vec![("10.0.0.20".parse().unwrap(), 443)]);
+    assert_eq!(s.open().len(), 2);
 
     let local = Settings::from_env(&env(&[("INCUS_URL", "https://[2001:db8::50]:9443/"), ("INCUS_IMAGE_SERVER", "local")])).unwrap();
     assert_eq!(local.url, "https://[2001:db8::50]:9443");
