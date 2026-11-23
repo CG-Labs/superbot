@@ -31,6 +31,8 @@ sudo deploy/install.sh --domain bots.example.com --tz UTC
 
 If flags are omitted, the script prompts on a TTY. The checkout must not be owned by (or live under the home of) the service user; the installer refuses it otherwise.
 
+Run from a checkout (or with `--source-dir <path>`), the installer syncs it over `/home/superbot/superbot` and removes files the checkout doesn't have, but never touches runtime state there: `.env` and `.env.*` (except `.env.example`), `data/`, `workspace/`, `backups/`, `logs/`, `secrets/`, `license.key`, `metrics-token`, `tiers.json`, SQLite files, every `*_DIR` and `*_FILE` that `.env` points inside the folder (such as `DATA_DIR`, `WORKSPACE_DIR`, `BACKUP_DIR`, `LICENSE_KEY_FILE`, `TIERS_FILE`), and `backups/` beside a moved `DATA_DIR`, where botd keeps archives by default. The checkout's own `.env` or `data/` are never copied in. A setting that points at the folder itself stops the installer.
+
 ## What it does
 
 1. Creates user `superbot` (override with `--user`)
@@ -106,7 +108,7 @@ The installer builds the Expo client (`apps/client`) from the same commit as `bo
 | `--isolation` / `--no-isolation` | Each user's Bots run as their own Unix account, or not ([below](#one-unix-account-per-user)). On for new installs; upgrades keep what they had |
 | `--no-client` | Skip building the web client |
 | `--dry-run` | Print steps only |
-| `--source-dir` | Copy a local tree instead of cloning |
+| `--source-dir` | Copy a local tree instead of cloning, keeping the install's runtime state ([above](#from-a-local-checkout)) |
 
 ## Hermes Agent
 
