@@ -69,7 +69,7 @@ Restart botd. Its log says `Google Workspace sync: on, ...`. botd refuses to sta
 | `GOOGLE_DIRECTORY_SYNC` | `off` | `on` needs `SCIM=on`. |
 | `GOOGLE_DIRECTORY_GROUPS` | | Group emails, comma separated. Their members get an account. |
 | `GOOGLE_DIRECTORY_TEAM_GROUPS` | | Group emails that become teams too. Needs `SCIM_GROUPS=on`. |
-| `GOOGLE_DIRECTORY_ROLE_GROUPS` | | Group emails that are [role groups](scim.md#role-groups): they give a custom role across the server and are no team. Needs `SCIM_GROUPS=on` and `SCIM_GROUP_ROLES=on`. Being in one gives no account. Not also a team group. At most 50 groups across the three lists. |
+| `GOOGLE_DIRECTORY_ROLE_GROUPS` | | Group emails that are [role groups](scim.md#role-groups): they give a custom role, across the server or (declared with `--team`) within each member's team, and are no team. Needs `SCIM_GROUPS=on` and `SCIM_GROUP_ROLES=on`. Being in one gives no account. Not also a team group. At most 50 groups across the three lists. |
 | `GOOGLE_DIRECTORY_ADMIN` | | The admin the service account acts as (option A). Empty for option B. |
 | `GOOGLE_DIRECTORY_SSO` | | A Google provider from `SSO_PROVIDERS`. Each user's Directory id is their `sub` there, so their sign-in is linked to the account. |
 | `GOOGLE_DIRECTORY_TENANT` | `google` | The SCIM tenant the users and teams belong to. No SCIM token may use it. |
@@ -83,9 +83,10 @@ New users get `SCIM_DEFAULT_ROLE` (member, or readonly). The sync never makes ad
 
 ```bash
 botctl scim role-group add google auditors@example.com Auditor
+botctl scim role-group add google team-leads@example.com Lead --team   # Lead within each member's team
 ```
 
-The next pass pushes it with its members who have an account, and they hold the role while they're in it, whatever team they're on. A listed group nobody declared is never pushed (it would become a team) and is named in the pass's `roleGroups.undeclared`. A declared group taken off the list is deleted on the next pass: its members lose the role, and the declaration waits again.
+The next pass pushes it with its members who have an account, and they hold the role while they're in it, whatever team they're on; a [team role group](scim.md#team-role-groups)'s members hold it within the team they're on, if it's one of `GOOGLE_DIRECTORY_TEAM_GROUPS` ([ADR 0206](../adr/0206-scim-team-role-groups.md)). A listed group nobody declared is never pushed (it would become a team) and is named in the pass's `roleGroups.undeclared`. A declared group taken off the list is deleted on the next pass: its members lose the role, and the declaration waits again.
 
 ## 5. Check it
 
