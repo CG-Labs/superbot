@@ -4,7 +4,9 @@
 //! can't sign in. It acts only through its API tokens: random, kept as hashes, shown once,
 //! scoped, always expiring, rotatable and revocable. Whatever its role says, a request
 //! never gets more than its owner (the person who made it, or an admin's pick) holds now.
-//! Admins manage every service account; someone with `users.manage` only those they own.
+//! Admins manage every service account; someone with `users.manage` only those they own,
+//! and only in the team they're on; a team's account acts there only while its owner is
+//! (ADR 0182).
 //! A Bot's manager can grant one viewer or operator on the Bot, never beyond what its
 //! owner can do with that Bot (ADR 0170).
 
@@ -111,13 +113,25 @@ pub fn person_only(method: &Method, path: &str) -> Option<&'static str> {
 
 /// The member a team's service account is in its team, so team routes see it as one (a
 /// plain member with its team role), though it holds no seat and isn't on the team's list.
+/// None while its owner isn't on that team (an admin owner is on every one): it never sees
+/// a team its owner can't (ADR 0182).
 pub fn team_seat(app: &AppState, u: &User) -> Option<TeamMember> {
     if !u.service {
         return None;
     }
     let sa = app.db.service_account(&u.id).filter(|s| s.deleted_at.is_none())?;
     let team = app.db.team(sa.team_id.as_deref()?)?;
+    let owner = owner_of(&app.db, &sa.owner_id)?;
+    if !on_team(&app.db, &owner, &team.id) {
+        return None;
+    }
     Some(TeamMember { user_id: u.id.clone(), team_id: team.id, role: crate::teams::MEMBER.into(), joined_at: u.created_at, added_by: sa.created_by, role_id: sa.team_role_id })
+}
+
+/// Whether `owner` can lend a service account a place in `team`: an admin in any, anyone
+/// else only in the team they're on (ADR 0182).
+pub fn on_team(db: &crate::db::Db, owner: &User, team: &str) -> bool {
+    owner.role == Role::Admin || db.team_member(&owner.id).is_some_and(|m| m.team_id == team)
 }
 
 /// `serviceAccount` in `GET /api/auth/me`: the token, its owner, and what it may use now.
@@ -327,15 +341,68 @@ fn need_account(app: &AppState, c: &Caller, by: &Who, key: &str) -> Res<ServiceA
     Err(refuse(app, by, "service_account_owner", Some(&sa.user.id), json!({}), "Only an admin, or the person who owns it, can manage a service account.".into()))
 }
 
+/// What `roles` hold that `owner` doesn't, where the service account would act.
+fn missing(db: &crate::db::Db, owner: &User, roles: &Roles) -> Vec<&'static str> {
+    let cap = ceiling(db, owner, roles.team.as_ref().map(|t| t.id.as_str()));
+    roles.holds().names().into_iter().filter(|n| Perm::parse(n).is_some_and(|p| !cap.has(p))).collect()
+}
+
 /// Refuses roles that would give a service account more than `owner` holds.
 fn within(app: &AppState, by: &Who, owner: &User, roles: &Roles, target: Option<&str>) -> Res<()> {
-    let cap = ceiling(&app.db, owner, roles.team.as_ref().map(|t| t.id.as_str()));
-    let missing: Vec<&str> = roles.holds().names().into_iter().filter(|n| Perm::parse(n).is_some_and(|p| !cap.has(p))).collect();
+    let missing = missing(&app.db, owner, roles);
     if missing.is_empty() {
         return Ok(());
     }
     let msg = format!("A service account can't hold more than its owner. {} doesn't hold: {}.", owner.name, missing.join(", "));
     Err(refuse(app, by, "service_account_escalation", target, json!({ "owner": owner.id, "missing": missing }), msg))
+}
+
+/// Refuses a delegate putting a service account in a team they aren't on (ADR 0182). Admins
+/// may; the account then acts in no team until its owner is on it (`team_seat`).
+fn in_own_team(app: &AppState, c: &Caller, by: &Who, owner: &User, team: Option<&crate::db::Team>, target: Option<&str>) -> Res<()> {
+    match team {
+        Some(t) if !c.admin() && !on_team(&app.db, owner, &t.id) => {
+            Err(refuse(app, by, "service_account_team", target, json!({ "team": t.id }), "You can put a service account only in the team you're on.".into()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `choices` in `GET /api/service-accounts` (ADR 0182): what the caller may give a service
+/// account they own, as `create` would decide it. The roles across the server, each team
+/// they may put one in with the roles allowed there, and those roles' names and permissions,
+/// so a delegate's form offers only what the server takes without reading every role.
+fn choices(app: &AppState, me: &User) -> Value {
+    let db = &app.db;
+    let custom = db.custom_roles();
+    let fits = |team: Option<&crate::db::Team>| -> Vec<String> {
+        let built_in = [Role::Readonly, Role::Member].into_iter().map(|role| (role.as_str().to_string(), Roles { role, custom: None, team: team.cloned() }));
+        // A read-only custom role in a team changes nothing, so `create` refuses it there.
+        let customs = custom.iter().filter(|r| team.is_none() || r.base != Role::Readonly).map(|r| (r.id.clone(), Roles { role: r.base, custom: Some(r.clone()), team: team.cloned() }));
+        built_in.chain(customs).filter(|(_, roles)| missing(db, me, roles).is_empty()).map(|(id, _)| id).collect()
+    };
+    let teams: Vec<crate::db::Team> = if me.role == Role::Admin {
+        db.teams()
+    } else {
+        db.team_member(&me.id).and_then(|m| db.team(&m.team_id)).into_iter().collect()
+    };
+    let server = fits(None);
+    let in_teams: Vec<(crate::db::Team, Vec<String>)> = teams.into_iter().map(|t| {
+        let ids = fits(Some(&t));
+        (t, ids)
+    }).collect();
+    let offered = |id: &str| server.iter().chain(in_teams.iter().flat_map(|(_, ids)| ids)).any(|i| i == id);
+    let mut roles = vec![
+        json!({ "id": "readonly", "name": "Read-only", "base": "readonly", "builtIn": true, "permissions": [] }),
+        json!({ "id": "member", "name": "Member", "base": "member", "builtIn": true, "permissions": [] }),
+    ];
+    roles.extend(custom.iter().filter(|r| offered(&r.id)).map(|r| {
+        json!({ "id": r.id, "name": r.name, "description": r.description, "base": r.base, "builtIn": false, "permissions": r.perms().names() })
+    }));
+    json!({
+        "roles": roles, "server": server,
+        "teams": in_teams.iter().map(|(t, ids)| json!({ "id": t.id, "name": t.name, "roles": ids })).collect::<Vec<_>>(),
+    })
 }
 
 // Views.
@@ -435,6 +502,7 @@ fn view(app: &AppState, sa: &ServiceAccount, refused: &[ServiceRefusal]) -> Valu
         "customRole": role_summary(h.org_role.as_ref()), "team": h.team.as_ref().map(|t| json!({ "id": t.id, "name": t.name })),
         "teamRole": role_summary(h.team_role.as_ref()),
         "owner": h.owner.as_ref().map(person), "ownerActive": h.owner_active,
+        "ownerOnTeam": h.team.as_ref().map(|t| h.owner.as_ref().is_some_and(|o| on_team(&app.db, o, &t.id))),
         "permissions": h.org.names(), "teamPermissions": h.in_team.names(),
         "effective": h.effective.names(),
         "tokens": tokens.iter().filter(|t| token_state(t, at) == "active").count(),
@@ -458,12 +526,17 @@ fn no_store(code: StatusCode, v: Value) -> Response {
 // The admin API.
 
 /// `GET /api/service-accounts`: every live one for admins; for anyone else, the ones they
-/// own. With what a token can be scoped to, and how long tokens may last.
+/// own (`view` says which). With what a token can be scoped to, how long tokens may last,
+/// and the roles and teams the caller may give the ones they own (`choices`, ADR 0182).
 pub async fn list(State(app): State<AppState>, Extension(c): Extension<Caller>) -> Json<Value> {
     let me = c.user.as_ref().map(|u| u.id.as_str());
     let refused = app.db.service_refusals(refusals_since(crate::db::now()), None);
     let list: Vec<Value> = app.db.service_accounts().iter().filter(|s| s.deleted_at.is_none() && (c.admin() || Some(s.owner_id.as_str()) == me)).map(|s| view(&app, s, &refused)).collect();
-    Json(json!({ "serviceAccounts": list, "scopes": scope_names(), "defaultDays": DEFAULT_DAYS, "maxDays": MAX_DAYS, "refusalDays": REFUSAL_DAYS }))
+    Json(json!({
+        "serviceAccounts": list, "view": if c.admin() { "all" } else { "own" },
+        "choices": caller_person(&c).ok().map(|u| choices(&app, &u)),
+        "scopes": scope_names(), "defaultDays": DEFAULT_DAYS, "maxDays": MAX_DAYS, "refusalDays": REFUSAL_DAYS,
+    }))
 }
 
 /// `POST /api/service-accounts` `{name, description?, role?, team?}`. `role` is member,
@@ -480,6 +553,7 @@ pub async fn create(State(app): State<AppState>, Extension(c): Extension<Caller>
     if roles.team_role().is_some() && role == Role::Readonly {
         return Err(conflict("A read-only role changes nothing, in a team too. Give it a role based on member."));
     }
+    in_own_team(&app, &c, &by, &owner, roles.team.as_ref(), None)?;
     within(&app, &by, &owner, &roles, None)?;
     let org = roles.org_role().map(|r| r.id.as_str());
     let team_arg = roles.team.as_ref().map(|t| (t.id.as_str(), roles.team_role().map(|r| r.id.as_str())));
@@ -546,6 +620,9 @@ pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>
     let ids = |r: &Roles| (r.role, r.org_role().map(|c| c.id.clone()), r.team.as_ref().map(|t| t.id.clone()), r.team_role().map(|c| c.id.clone()));
     let (role_now, org_now, team_now, team_role_now) = ids(&now);
     let roles_changed = ids(&was) != ids(&now);
+    if team_now != before.team_id {
+        in_own_team(&app, &c, &by, &owner, now.team.as_ref(), Some(&id))?;
+    }
     if roles_changed || p.owner.is_some() {
         within(&app, &by, &owner, &now, Some(&id))?;
     }
