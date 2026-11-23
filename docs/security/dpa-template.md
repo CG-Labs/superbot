@@ -245,6 +245,7 @@ Mark an endpoint as in the Agreed Region only if the provider's terms for that e
 
 On request **[or: every [period]]**, under [Section 9](#9-assistance-records-and-audits), the Provider gives the Customer:
 
+- the residency report for each pin (`botctl team residency <team> report`, or the admin API, [ADR 0155](../adr/0155-residency-reports.md)): where each covered person's machine, host and backups are, whether all of it is in the Agreed Region, the pin's changes, what it refused and how many runs it held to in-region routes in the period, and what it doesn't cover, sealed with a SHA-256 digest the Customer can check (`jq -cjS 'del(.digest)' report.json | sha256sum`);
 - the audit log entries for the covered team and users, filtered by action and exported as CSV: `user.residency_pinned`, `team.residency_pinned`, `user.residency_unpinned`, `team.residency_unpinned`, the `*_pin_refused` and `*_change_refused` entries, `team.join_refused`, `team.delete_refused` and `machine.residency_refused`, and `bot.run_refused` with reason `residency_pinned`; each run's `harness.invoked` entry shows the regions it was held to and any fallback left out;
 - the regions view (`botctl regions`, or the admin API): each pin, its reference, and any warning that the Service can't keep it;
 - for each machine, its region and host, and for each backup, the store and region it was kept in.

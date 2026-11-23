@@ -9321,6 +9321,29 @@ impl Db {
         s.query_map([], residency_pin_row).unwrap().filter_map(Result::ok).collect()
     }
 
+    /// Audit events from `from` (inclusive) to `to` (exclusive), unix ms, that bear on
+    /// residency pins (ADR 0155): those whose action is one of `actions`, and
+    /// `harness.invoked` only for runs held to a region. Oldest first, at most `limit`.
+    pub fn residency_audit(&self, from: i64, to: i64, actions: &[&str], limit: i64) -> rusqlite::Result<Vec<AuditEvent>> {
+        use rusqlite::types::Value as V;
+        let marks = vec!["?"; actions.len().max(1)].join(", ");
+        let sql = format!(
+            "SELECT * FROM audit_events WHERE at >= ? AND at < ? AND (action IN ({marks})
+               OR (action = 'harness.invoked' AND json_valid(details) AND json_extract(details, '$.residency') IS NOT NULL))
+             ORDER BY id ASC LIMIT ?"
+        );
+        let mut args = vec![V::Integer(from), V::Integer(to)];
+        args.extend(actions.iter().map(|a| V::Text(a.to_string())));
+        if actions.is_empty() {
+            args.push(V::Null);
+        }
+        args.push(V::Integer(limit));
+        let c = self.c();
+        let mut s = c.prepare(&sql)?;
+        let rows = s.query_map(rusqlite::params_from_iter(args), audit_row)?;
+        rows.collect()
+    }
+
     /// Sets the user's or team's own data region to `region` and pins them there (or
     /// replaces the pin's reference), both or neither. Err: they're gone, or the write failed.
     pub fn pin_residency(&self, kind: PinOn, id: &str, region: &str, reference: &str, by: Option<&str>) -> Result<(), String> {
