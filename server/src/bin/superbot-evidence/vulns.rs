@@ -273,18 +273,14 @@ pub fn tally(alerts: &[Value]) -> (Value, Value) {
 pub fn cargo_audit_accepted(text: &str) -> Vec<Value> {
     let (mut out, mut inside, mut notes) = (Vec::new(), false, Vec::<String>::new());
     for line in text.lines().map(str::trim) {
-        if !inside {
-            inside = line.starts_with("ignore") && line.contains('[');
-            if !inside {
-                continue;
-            }
-            let after = line.split_once('[').map_or("", |(_, r)| r);
-            if after.contains(']') {
-                out.extend(after.split(']').next().unwrap_or_default().split(',').filter_map(quoted).map(|id| json!({ "id": id, "reason": Value::Null, "hasReason": false })));
-                inside = false;
-            }
+        let line = if inside {
+            line
+        } else if line.starts_with("ignore") && line.contains('[') {
+            inside = true;
+            line.split_once('[').map_or("", |(_, r)| r.trim())
+        } else {
             continue;
-        }
+        };
         if let Some(c) = line.strip_prefix('#') {
             notes.push(c.trim().to_string());
             continue;
@@ -312,12 +308,39 @@ fn yaml_value(s: &str) -> String {
     quoted(s).unwrap_or_else(|| s.to_string())
 }
 
+/// A YAML block scalar's header (`>`, `|-`, `>+2`, then perhaps a comment), unquoted:
+/// Some(true) when its lines fold.
+fn block_header(v: &str) -> Option<bool> {
+    let head = v.split(" #").next().unwrap_or_default().trim();
+    let fold = match head.chars().next()? {
+        '>' => true,
+        '|' => false,
+        _ => return None,
+    };
+    head[1..].chars().all(|c| c == '-' || c == '+' || c.is_ascii_digit()).then_some(fold)
+}
+
 /// `.grype.yaml`'s `ignore:` list: each entry's vulnerability, package, location and reason.
 pub fn grype_accepted(text: &str) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     let mut inside = false;
+    // A block scalar reason (`reason: >` or `|`): the key's indent, whether lines fold, and the lines so far.
+    let mut block: Option<(usize, bool, Vec<String>)> = None;
+    let indent = |l: &str| l.len() - l.trim_start().len();
     for raw in text.lines() {
         let line = raw.trim();
+        if let Some((at, fold, lines)) = &mut block {
+            if line.is_empty() || indent(raw) > *at {
+                lines.push(line.to_string());
+                continue;
+            }
+            let joined = lines.join(if *fold { " " } else { "\n" }).trim().to_string();
+            if let Some(e) = out.last_mut().filter(|_| !joined.is_empty()) {
+                e["reason"] = json!(joined);
+                e["hasReason"] = json!(true);
+            }
+            block = None;
+        }
         if line.starts_with('#') || line.is_empty() {
             continue;
         }
@@ -337,6 +360,13 @@ pub fn grype_accepted(text: &str) -> Vec<Value> {
         }
         let Some(e) = out.last_mut() else { continue };
         let Some((k, v)) = field.split_once(':') else { continue };
+        if k.trim() == "reason" {
+            if let Some(fold) = block_header(v) {
+                let key_at = indent(raw) + if item { 2 } else { 0 };
+                block = Some((key_at, fold, Vec::new()));
+                continue;
+            }
+        }
         let v = yaml_value(v);
         match k.trim() {
             "vulnerability" if !v.is_empty() => e["id"] = json!(v),
@@ -347,6 +377,13 @@ pub fn grype_accepted(text: &str) -> Vec<Value> {
                 e["hasReason"] = json!(true);
             }
             _ => {}
+        }
+    }
+    if let Some((_, fold, lines)) = block {
+        let joined = lines.join(if fold { " " } else { "\n" }).trim().to_string();
+        if let Some(e) = out.last_mut().filter(|_| !joined.is_empty()) {
+            e["reason"] = json!(joined);
+            e["hasReason"] = json!(true);
         }
     }
     out
@@ -526,8 +563,12 @@ pub fn summary(c: &Collected) -> String {
         }
     }
     for f in &c.accepted {
+        let path = f["path"].as_str().unwrap_or_default();
         if f["available"] == true {
-            out += &format!("\n  {}: {} accepted findings, {} without a reason.", f["path"].as_str().unwrap_or_default(), f["total"], f["withoutReason"]);
+            out += &format!("\n  {path}: {} accepted findings, {} without a reason.", f["total"], f["withoutReason"]);
+        } else {
+            let why = f["status"].as_u64().map_or_else(|| f["why"].as_str().unwrap_or("unreadable").to_string(), |s| format!("GitHub answered {s}"));
+            out += &format!("\n  {path} wasn't readable ({why}): its accepted findings aren't in the bundle.");
         }
     }
     out
@@ -666,6 +707,13 @@ mod tests {
         let grype = grype_accepted(include_str!("../../../../.grype.yaml"));
         assert!(!grype.is_empty() && grype.iter().all(|f| f["hasReason"] == true && f["id"].is_string() && f["package"].is_string()), "{grype:?}");
         assert_eq!(grype[0]["location"], "/usr/bin/age*");
+        let opening = cargo_audit_accepted("ignore = [\"RUSTSEC-1\",\n  # why two\n  \"RUSTSEC-2\",\n]\n");
+        assert_eq!(opening.iter().map(|f| f["id"].as_str().unwrap()).collect::<Vec<_>>(), ["RUSTSEC-1", "RUSTSEC-2"], "an entry on the opening line counts");
+        let blocks = grype_accepted("ignore:\n  - vulnerability: CVE-4\n    reason: >\n      folded over\n      two lines\n    package:\n      name: zlib\n  - vulnerability: CVE-5\n    reason: |-\n      kept\n      apart\n  - vulnerability: CVE-6\n    reason: >\n");
+        assert_eq!(blocks.iter().map(|f| (f["id"].as_str().unwrap(), f["reason"].as_str(), f["hasReason"].as_bool().unwrap())).collect::<Vec<_>>(), [("CVE-4", Some("folded over two lines"), true), ("CVE-5", Some("kept\napart"), true), ("CVE-6", None, false)], "block scalars keep their text, and an empty one is no reason");
+        assert_eq!(blocks[0]["package"], "zlib");
+        let quoted_marks = grype_accepted("ignore:\n  - vulnerability: CVE-7\n    reason: \"> 30 days needed upstream\"\n  - vulnerability: CVE-8\n    reason: |-  # a comment\n      kept\n");
+        assert_eq!(quoted_marks.iter().map(|f| f["reason"].as_str()).collect::<Vec<_>>(), [Some("> 30 days needed upstream"), Some("kept")], "a quoted reason starting with > is text, not a block");
         let g = grype_accepted("ignore:\n  # CVE-YYYY-NNNNN example\n  - vulnerability: CVE-1\n    package:\n      name: zlib\n  - vulnerability: \"CVE-2\"\n    reason: 'fixed upstream'\nother:\n  - vulnerability: CVE-3\n");
         assert_eq!(g.iter().map(|f| (f["id"].as_str().unwrap(), f["reason"].as_str())).collect::<Vec<_>>(), [("CVE-1", None), ("CVE-2", Some("fixed upstream"))]);
     }
@@ -701,6 +749,7 @@ mod tests {
         assert_eq!(c.accepted[1]["available"], true, "decoded across GitHub's line breaks");
         let s = summary(&c);
         assert!(s.contains("Dependabot alerts weren't readable (GitHub answered 403)") && s.contains("1 alerts open"), "{s}");
+        assert!(s.contains(".cargo/audit.toml wasn't readable (GitHub answered 404)"), "{s}");
         let mut broken = Fake(HashMap::new());
         broken.0.insert("/repos/o/r".into(), Ok((json!({ "default_branch": "main" }), None)));
         assert_eq!(collect(&mut broken, &o, i64::MAX).err().map(|f| f.status), Some(500), "a server error is a failure, not a gap");
