@@ -4,12 +4,16 @@
 //! protection, and every CI run on the branch. `vulnerabilities` (ADR 0086): every
 //! Dependabot and code scanning alert open in the period, judged against its severity's
 //! remediation window, and the findings accepted with a reason. Each is a dated bundle
-//! with SHA-256 digests beside botd's evidence bundles (ADR 0142).
+//! with SHA-256 digests beside botd's evidence bundles (ADR 0142). `coverage` (ADR 0166):
+//! checks every bundle in an evidence store against its digests and reports the days of
+//! an observation period each kind of bundle, checklist row and criterion has none for.
 //!
 //! Reads GitHub only, with a token from `GITHUB_TOKEN` (or `GH_TOKEN`), never from the
 //! command line. Run by the `change-evidence` workflow each month, or by an operator.
+//! `coverage` reads local files only.
 
 mod changes;
+mod coverage;
 mod github;
 #[path = "../../evidence_period.rs"]
 mod period;
@@ -20,13 +24,15 @@ mod vulns;
 use std::io::Write;
 use std::process::ExitCode;
 
-const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0086).
+const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0086), and its coverage (ADR 0166).
 
   superbot-evidence github --repo <owner/name> [--branch <name>]
                     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>] [--no-titles]
   superbot-evidence vulnerabilities --repo <owner/name> [--branch <name>]
                     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]
                     [--windows critical=30,high=30,medium=90,low=90]
+  superbot-evidence coverage <evidence store> [--from <YYYY-MM-DD> --to <YYYY-MM-DD>]
+                    [--checklist <soc2-readiness-checklist.md>] [--json] [-o <file>]
 
 Writes one bundle for the period (whole UTC days, --to not included; neither: last month):
 every pull request merged into the branch (default: the repository's default branch) with
@@ -47,7 +53,16 @@ for Medium and Low) and whether it was fixed or dismissed in time or overdue at 
 period's end; and the findings .cargo/audit.toml and .grype.yaml accept, with their
 reasons. Needs read access to Metadata, Contents, Dependabot alerts and Code scanning
 alerts (in a workflow: contents, security-events and vulnerability-alerts read). What the
-token can't read is recorded in the bundle, not skipped silently.";
+token can't read is recorded in the bundle, not skipped silently.
+
+coverage reads every bundle in an evidence store (as .tar files or unpacked folders, at any
+depth): botd's evidence bundles and both bundles above. It checks each against its
+SHA256SUMS and manifest, and reports, for the period (neither: from the first bundle to the
+last), the days each kind of bundle, each checklist row and each criterion has no verified
+evidence for, month by month, with each manifest's SHA-256 to compare with what was recorded
+when it was made. --checklist also lists the rows no bundle collects evidence for. Markdown,
+or --json. Exits 0 when complete, 2 when a bundle fails or a day is missing, 1 on an error.
+No token and no network; it writes nothing into the store.";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Kind {
@@ -205,6 +220,18 @@ fn vulnerabilities(a: &Args, p: period::Period, gh: &mut github::GitHub, token: 
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "coverage") {
+        return match coverage::run(&args[1..], chrono::Utc::now()) {
+            Ok((out, complete)) => {
+                println!("{out}");
+                if complete { ExitCode::SUCCESS } else { ExitCode::from(2) }
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match run(&args) {
         Ok(out) => {
             println!("{out}");

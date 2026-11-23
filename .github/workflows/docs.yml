@@ -24,6 +24,7 @@ on:
       - 'server/tests/release_workflow.rs'
       - 'server/tests/offline_release.rs'
       - 'server/tests/change_evidence.rs'
+      - 'server/tests/evidence_coverage.rs'
       - 'server/tests/fixtures/github/**'
       - 'server/src/bin/superbot-evidence/**'
       - 'CHANGELOG.md'
@@ -45,6 +46,7 @@ on:
       - 'server/tests/release_workflow.rs'
       - 'server/tests/offline_release.rs'
       - 'server/tests/change_evidence.rs'
+      - 'server/tests/evidence_coverage.rs'
       - 'server/tests/fixtures/github/**'
       - 'server/src/bin/superbot-evidence/**'
       - 'CHANGELOG.md'
@@ -82,6 +84,8 @@ jobs:
       # ADR 0148: the change-management bundle matches the evidence plan, and its workflow only reads.
       - run: cargo test --locked --bin superbot-evidence
       - run: cargo test --test change_evidence
+      # ADR 0166: the coverage report over the real botd's evidence bundles.
+      - run: cargo test --test evidence_coverage
 
   site:
     runs-on: ubuntu-latest
