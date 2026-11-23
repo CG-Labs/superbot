@@ -75,11 +75,14 @@ pub fn digest(report: &Value) -> String {
 /// day): by default the last 90 days, never past `now` and at most 400 days long.
 fn period(q: &HashMap<String, String>, now: i64) -> Result<(i64, i64), String> {
     let to = q.get("to").map(|v| audit::parse_time(v, true)).transpose()?.unwrap_or(now).min(now);
-    let from = q.get("from").map(|v| audit::parse_time(v, false)).transpose()?.unwrap_or(to - DEFAULT_DAYS * DAY_MS);
+    let from = match q.get("from") {
+        Some(v) => audit::parse_time(v, false)?,
+        None => to.checked_sub(DEFAULT_DAYS * DAY_MS).ok_or("to is out of range")?,
+    };
     if from >= to {
         return Err("from must be before to, and before now".into());
     }
-    if to - from > MAX_DAYS * DAY_MS {
+    if to.checked_sub(from).is_none_or(|span| span > MAX_DAYS * DAY_MS) {
         return Err(format!("A report covers at most {MAX_DAYS} days"));
     }
     Ok((from, to))
@@ -401,6 +404,10 @@ mod tests {
         assert!(period(&q(&[("from", "2026-11-02"), ("to", "2026-11-01")]), now).is_err());
         assert!(period(&q(&[("from", "2024-01-01")]), now).unwrap_err().contains("400 days"));
         assert!(period(&q(&[("from", "yesterday")]), now).is_err());
+        let (min, max) = (i64::MIN.to_string(), i64::MAX.to_string());
+        assert!(period(&q(&[("from", &min)]), now).unwrap_err().contains("400 days"), "no overflow past the cap");
+        assert!(period(&q(&[("to", &min)]), now).is_err(), "no overflow working out the default start");
+        assert!(period(&q(&[("from", &min), ("to", &max)]), now).is_err());
     }
 
     #[test]
