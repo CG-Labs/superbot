@@ -138,6 +138,8 @@ async fn each_file_carries_its_controls_evidence() {
     app.db.record(&sys("chat.pruned").details(json!({ "deleted": 7 })));
     app.db.record(&Event::new(Actor::system("sso"), "auth.login_failed").outcome(Outcome::Failure).details(json!({ "reason": "not_linked" })));
     app.db.record(&Event::new(Actor::system("signin-watch"), "auth.suspicious_sign_in").outcome(Outcome::Denied).details(json!({ "pattern": "burst_ip", "failures": 12 })));
+    let sa = crate::service_accounts_http_tests::account(port, &admin, json!({ "name": "Nightly export", "description": "Free text" })).await;
+    let _ = crate::service_accounts_http_tests::token(port, &admin, &sa, json!({ "name": "Cron job", "scopes": ["read"] })).await;
     let (code, body) = call(port, "GET", "/api/access-review", &admin, "").await;
     assert_eq!(code, 200, "{body}");
     let digest = parse(&body)["digest"].as_str().unwrap().to_string();
@@ -161,6 +163,12 @@ async fn each_file_carries_its_controls_evidence() {
     assert_eq!(signoff["details"]["digest"].as_str(), Some(digest.as_str()), "{signoff}");
     assert!(signoff["details"].get("notes").is_none(), "notes are free text: {signoff}");
     assert!(access["period"]["counts"]["user.created"]["success"].as_u64() >= Some(2), "{access}");
+    // Service accounts (ADR 0165): ids, roles and token scopes, never their names or a token's.
+    let s = &access["serviceAccounts"][0];
+    assert_eq!((s["id"].as_str(), s["owner"].as_str(), s["role"].as_str(), s["tokens"][0]["scopes"].clone()), (Some(sa.as_str()), Some(users::OPERATOR), Some("readonly"), json!(["read"])), "{access}");
+    let text = access["serviceAccounts"].to_string();
+    assert!(!text.contains("Nightly export") && !text.contains("Free text") && !text.contains("Cron job") && !text.contains("sbsa_"), "{text}");
+    assert_eq!(access["period"]["counts"]["service_token.created"]["success"], 1, "{access}");
     assert_eq!(access["periodCovered"]["days"], 1);
 
     let changes = parse(file(&f, "changes.json"));

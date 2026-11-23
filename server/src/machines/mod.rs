@@ -39,6 +39,7 @@ pub mod rebuild;
 pub mod recovery;
 pub mod region;
 pub mod residency;
+pub mod residency_me;
 pub mod residency_report;
 pub mod resize;
 pub mod route;

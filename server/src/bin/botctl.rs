@@ -148,6 +148,11 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl sso saml <provider>                       Native SAML: what to enter at the IdP, and its metadata
   botctl sso saml <provider> import [<file> | -] < metadata.xml
                                                    Import the IdP's SAML metadata (stdin by default)
+  botctl sso role-mappings                         SAML groups mapped to custom roles (SSO_<ID>_GROUPS_ATTRIBUTE)
+  botctl sso role map <provider> <group> <role>    Sign-ins listing <group> get <role> across the server.
+                                                   Never admin, nor a role that acts on admins
+  botctl sso role show <id>                        A mapping and who it gave the role to
+  botctl sso role unmap <id>                       Takes the role from everyone the mapping gave it to
   botctl scim tokens                               SCIM tokens (never their values), and whether SCIM is on
   botctl scim token create <tenant> [--sso <provider>] [--label "<text>"]
                                                    A bearer token for an IdP's SCIM app, shown once.
@@ -1104,6 +1109,17 @@ fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
     })
 }
 
+/// `botctl sso role-mappings` and `botctl sso role ...`: SAML groups mapped to custom roles (ADR 0160).
+fn sso_role_request(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
+    Ok(match args {
+        ["role-mappings"] | ["role", "list"] => ("GET", "/api/sso/role-mappings".into(), None),
+        ["role", "map", provider, group, role] => ("POST", "/api/sso/role-mappings".into(), Some(json!({ "provider": provider, "group": group, "role": role }).to_string())),
+        ["role", "show", id] => ("GET", format!("/api/sso/role-mappings/{}", encode(id)), None),
+        ["role", "unmap", id] => ("DELETE", format!("/api/sso/role-mappings/{}", encode(id)), None),
+        _ => return Err("Usage: botctl sso saml <provider> [json] | sso saml <provider> import [<file> | -] | sso role-mappings | sso role map <provider> <group> <role> | sso role show <id> | sso role unmap <id>".into()),
+    })
+}
+
 /// `botctl roles` and `botctl role ...`: custom roles (ADR 0123, 0132). The server checks
 /// every name and permission; this only shapes the request.
 fn role_request(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
@@ -1467,6 +1483,14 @@ fn saml_summary(v: &Value) -> String {
         yes(v["signRequests"].as_bool().unwrap_or(false)),
         if v["singleLogout"].as_bool().unwrap_or(false) { "yes" } else { "no (the IdP's metadata has no HTTP-Redirect SingleLogoutService)" }
     );
+    if let Some(g) = v["groupsAttribute"].as_str() {
+        let required: Vec<&str> = v["requiredGroups"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        out += &format!(
+            "  Groups attribute:         {g}\n  Required groups:          {}\n  Group role mappings:      {} (botctl sso role-mappings)\n",
+            if required.is_empty() { "none (anyone the IdP signs in)".into() } else { required.join(", ") },
+            v["roleMappings"].as_u64().unwrap_or(0)
+        );
+    }
     let from = v["from"].as_str().map(|f| format!(" ({f})")).unwrap_or_default();
     out += &format!("  IdP metadata from {}{from}", s("source"));
     let idp = &v["idp"];
@@ -1828,7 +1852,10 @@ fn run(args: &[String]) -> Result<String, String> {
             let res = api(Cred::Operator, "PUT", &format!("/api/sso/{}/saml/idp-metadata", encode(id)), Some(json!({ "xml": xml }).to_string()))?;
             Ok(format!("Imported.\n{}", saml_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)))
         }
-        ["sso", ..] => Err("Usage: botctl sso saml <provider> [json] | sso saml <provider> import [<file> | -]".into()),
+        ["sso", rest @ ..] => {
+            let (method, path, body) = sso_role_request(rest)?;
+            op(method, &path, body)
+        }
         ["setup", "json"] => op("GET", "/api/setup", None),
         ["setup", rest @ ..] => {
             let (method, body) = setup_request(rest)?;
@@ -2741,6 +2768,32 @@ mod tests {
         v["metadataSigningCertificates"] = json!([{ "sha256": "9a:bc", "subject": "CN=metadata", "notAfter": 1_900_000_000_000_i64 }]);
         let out = saml_summary(&v);
         assert!(out.contains("IdP metadata signature:   required\n    Trusted signer: SHA-256 9a:bc (CN=metadata), expires 2030-03-17"), "{out}");
+        assert!(!out.contains("Groups attribute"), "{out}");
+        v["groupsAttribute"] = json!("groups");
+        v["requiredGroups"] = json!([]);
+        v["roleMappings"] = json!(0);
+        assert!(saml_summary(&v).contains("Groups attribute:         groups\n  Required groups:          none (anyone the IdP signs in)\n  Group role mappings:      0 (botctl sso role-mappings)\n"));
+        v["requiredGroups"] = json!(["SuperBot Users", "Admins"]);
+        v["roleMappings"] = json!(2);
+        let out = saml_summary(&v);
+        assert!(out.contains("Required groups:          SuperBot Users, Admins\n  Group role mappings:      2 "), "{out}");
+    }
+
+    #[test]
+    fn sso_role_commands() {
+        let req = |a: &[&str]| sso_role_request(a).map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())));
+        assert_eq!(req(&["role-mappings"]), Ok(("GET", "/api/sso/role-mappings".into(), None)));
+        assert_eq!(req(&["role", "list"]), Ok(("GET", "/api/sso/role-mappings".into(), None)));
+        assert_eq!(
+            req(&["role", "map", "corp", "SuperBot Auditors", "Auditor"]),
+            Ok(("POST", "/api/sso/role-mappings".into(), Some(json!({ "provider": "corp", "group": "SuperBot Auditors", "role": "Auditor" }))))
+        );
+        assert_eq!(req(&["role", "show", "gm 1"]), Ok(("GET", "/api/sso/role-mappings/gm%201".into(), None)));
+        assert_eq!(req(&["role", "unmap", "gm1"]), Ok(("DELETE", "/api/sso/role-mappings/gm1".into(), None)));
+        assert!(req(&["role", "map", "corp", "Auditors"]).is_err());
+        assert!(req(&["role", "map", "corp", "Auditors", "Auditor", "--org"]).is_err());
+        assert!(req(&["role", "unmap"]).is_err());
+        assert!(req(&[]).unwrap_err().contains("sso saml <provider>"));
     }
 
     #[test]
