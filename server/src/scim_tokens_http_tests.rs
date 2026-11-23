@@ -185,8 +185,9 @@ async fn the_health_score_watches_a_tenant_about_to_lose_provisioning() {
 
     app.db.set_scim_token_expiry(&id, Some(db::now() + 5 * DAY));
     let i = identity(&score().await);
-    assert_eq!((i["status"].as_str(), i["facts"]["scimTenantsExpiring"].clone()), (Some("watch"), json!(["okta"])), "{i:#}");
-    assert!(i["summary"].as_str().unwrap().contains("okta"), "{i:#}");
+    assert_eq!((i["status"].as_str(), i["facts"]["scimTenantsExpiring"].clone()), (Some("watch"), json!(1)), "{i:#}");
+    let summary = i["summary"].as_str().unwrap();
+    assert!(summary.contains("1 tenant ends") && !summary.contains("okta"), "{i:#}");
 
     app.db.set_scim_token_expiry(&id, Some(db::now() - 1));
     assert_eq!(scim(port, &t, "GET", USERS, Value::Null).await.0, 401);

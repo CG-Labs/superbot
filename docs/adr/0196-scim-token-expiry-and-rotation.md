@@ -46,7 +46,7 @@ These are audit events rather than emails because the audit log is where SCIM's 
 The same facts show where admins look:
 
 - `GET /api/scim/tokens` gives each token a `state` (`active`, `expiring`, `rotated`, `expired`, `revoked`, `no_expiry`) and lists `expiringTenants`: tenants with a working token whose every working token ends within 14 days. The console's SCIM section says so above the table.
-- The [health score](../support/health-score.md#identity)'s `identity` signal is at least **watch** while any tenant is in `expiringTenants` (`scimTenantsExpiring`), and counts requests with an expired token as `expired_token`, as it counts revoked ones.
+- The [health score](../support/health-score.md#identity)'s `identity` signal is at least **watch** while any tenant is in `expiringTenants` (`scimTenantsExpiring`, only a count, since health reports go into support bundles and a tenant's name can identify a customer), and counts requests with an expired token as `expired_token`, as it counts revoked ones.
 
 ## Consequences
 

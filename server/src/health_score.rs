@@ -333,7 +333,7 @@ fn identity(i: &Inputs) -> Judged {
     let facts = json!({
         "ssoAttempts": attempts, "ssoFailed": sso_failed, "ssoFailedPercent": one_place(p), "ssoReasons": top(&i.sso_failed),
         "scimTokenUsed": i.scim_token_used, "scimFailed": scim_failed, "scimReasons": top(&i.scim_failed), "scimUnauthenticated": i.scim_unauthenticated,
-        "scimTenantsExpiring": i.scim_expiring,
+        "scimTenantsExpiring": i.scim_expiring.len(),
     });
     let scim_used = i.scim_token_used || scim_failed > 0 || !i.scim_expiring.is_empty();
     if attempts == 0 && !scim_used {
@@ -356,7 +356,7 @@ fn identity(i: &Inputs) -> Judged {
         parts.push(format!("{} failed", plural(scim_failed, "SCIM request", "SCIM requests")));
     }
     if !i.scim_expiring.is_empty() {
-        parts.push(format!("the SCIM tokens of {} end within {} days", i.scim_expiring.join(", "), crate::scim::WARN_DAYS));
+        parts.push(format!("every SCIM token of {} ends within {} days", plural(i.scim_expiring.len() as u64, "tenant", "tenants"), crate::scim::WARN_DAYS));
     }
     let summary = format!("In the last {} days, {}.", i.days, parts.join("; "));
     Judged { status: sso.max(scim), summary, facts }
