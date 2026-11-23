@@ -236,6 +236,26 @@ async fn an_approval_checks_everything_again_as_it_gives_the_role() {
     assert_eq!(call(port, "POST", &format!("/api/role-requests/{id}/approve"), &admin, "{}").await.0, 409, "every handler lapses what's due first");
     assert_eq!(app.db.role_request(&id).unwrap().status, "lapsed");
     assert_eq!(events(port, &admin, "role.request_lapsed").await[0]["details"]["why"].as_str(), Some("disabled"));
+
+    // Undone before the sweep: the change itself ends the request, so it can't come back.
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{bo}"), &admin, r#"{"status":"active"}"#).await.0, 200);
+    let bo_auth = crate::users_http_tests::signed_in(port, &admin, &bo).await.unwrap();
+    let id = asked(port, &bo_auth, json!({ "role": oncall, "hours": 2, "reason": "x" })).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/roles/{oncall}"), &admin, r#"{"requestable":false}"#).await.0, 200);
+    assert_eq!(call(port, "PATCH", &format!("/api/roles/{oncall}"), &admin, r#"{"requestable":true}"#).await.0, 200);
+    assert_eq!(app.db.role_request(&id).unwrap().status, "pending", "not swept yet");
+    let (code, v) = json_call(port, "POST", &format!("/api/role-requests/{id}/approve"), &admin, "{}").await;
+    assert_eq!((code, v["error"].as_str()), (409, Some("This request lapsed already.")), "{v}");
+    assert_eq!(events(port, &admin, "role.request_lapsed").await[0]["details"]["why"].as_str(), Some("not_requestable"));
+
+    let id = asked(port, &bo_auth, json!({ "role": oncall, "hours": 2, "reason": "x" })).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{bo}"), &admin, r#"{"status":"disabled"}"#).await.0, 200);
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{bo}"), &admin, r#"{"status":"active"}"#).await.0, 200);
+    // Even without the handlers' sweep, the database won't approve it.
+    assert!(matches!(app.db.approve_role_request(&id, None, None, None, |_| Ok(())), Err(db::RoleRequestError::NotPending(s)) if s == "lapsed"));
+    assert_eq!(role_requests::lapse_due(&app), 1);
+    assert_eq!(events(port, &admin, "role.request_lapsed").await[0]["details"]["why"].as_str(), Some("disabled"));
+    assert!(app.db.user(&bo).unwrap().role_id.is_none());
 }
 
 #[tokio::test]
@@ -323,6 +343,21 @@ async fn requests_are_withdrawn_denied_or_lapse_and_each_is_audited() {
     let (code, v) = ask(port, &bo_auth, json!({ "role": oncall, "hours": 1, "reason": "x" })).await;
     assert_eq!(code, 409, "{v}");
     assert!(v["error"].as_str().unwrap().contains("Withdraw one first"), "{v}");
+}
+
+#[tokio::test]
+async fn asking_and_withdrawing_is_capped_each_day() {
+    let (port, _, admin, _) = serve_app().await;
+    let (_, bo_auth) = user_with(port, &admin, "bo@example.com", "member").await;
+    let oncall = requestable(port, &admin, "On-call", "member", &["machines.manage"], 1).await;
+    for _ in 0..role_requests::MAX_DAILY {
+        let id = asked(port, &bo_auth, json!({ "role": oncall, "hours": 1, "reason": "x" })).await;
+        assert_eq!(call(port, "POST", &format!("/api/me/role-requests/{id}/cancel"), &bo_auth, "").await.0, 200);
+    }
+    let (code, v) = ask(port, &bo_auth, json!({ "role": oncall, "hours": 1, "reason": "x" })).await;
+    assert_eq!(code, 429, "withdrawing doesn't free the day's requests: {v}");
+    assert!(v["error"].as_str().unwrap().contains("Try again tomorrow"), "{v}");
+    assert_eq!(events(port, &admin, "role.requested").await.len(), role_requests::MAX_DAILY);
 }
 
 #[tokio::test]

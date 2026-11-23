@@ -25,6 +25,9 @@ use std::collections::HashMap;
 pub const PENDING_DAYS: i64 = 7;
 /// The most pending requests one person may have.
 pub const MAX_PENDING: usize = 5;
+/// The most requests one person may make in a day, withdrawn ones too, so asking and
+/// withdrawing can't flood the notification email and webhook.
+pub const MAX_DAILY: usize = 10;
 const STATUSES: [&str; 5] = ["pending", "approved", "denied", "cancelled", "lapsed"];
 
 fn conflict(msg: impl Into<String>) -> ApiError {
@@ -147,6 +150,7 @@ fn request_error(app: &App, e: RoleRequestError, q: Option<&RoleRequest>, you: b
     match e {
         RoleRequestError::Duplicate => conflict("You've asked for this role there already. Wait for an admin, or withdraw that request."),
         RoleRequestError::TooMany(n) => conflict(format!("You have {n} pending requests, the most there may be. Withdraw one first.")),
+        RoleRequestError::TooOften(n) => ApiError(StatusCode::TOO_MANY_REQUESTS, format!("You've made {n} requests in the last day, the most there may be. Try again tomorrow.")),
         RoleRequestError::NotPending(s) => conflict(match s.as_str() {
             "lapsed" => "This request lapsed already.".to_string(),
             "cancelled" => "This request was withdrawn already.".to_string(),
@@ -257,7 +261,7 @@ pub async fn create(State(app): State<AppState>, Extension(c): Extension<Caller>
         return Err(conflict(why(code, &r, u, true)));
     }
     let lapses = crate::db::now() + PENDING_DAYS * crate::roles::DAY;
-    let q = app.db.create_role_request(&u.id, &r.id, team.as_deref(), hours, &reason, lapses, MAX_PENDING).map_err(|e| request_error(&app, e, None, true))?;
+    let q = app.db.create_role_request(&u.id, &r.id, team.as_deref(), hours, &reason, lapses, MAX_PENDING, MAX_DAILY).map_err(|e| request_error(&app, e, None, true))?;
     let d = json!({ "request": q.id, "name": r.name, "user": u.id, "scope": scope(&q), "team": q.team_id, "hours": hours, "reason": reason, "lapsesAt": q.expires_at });
     app.db.record(&by.event("role.requested").target("role", &r.id).details(d));
     let who = u.email.clone().unwrap_or_else(|| u.name.clone());

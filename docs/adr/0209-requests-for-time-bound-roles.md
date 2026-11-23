@@ -29,7 +29,7 @@ Regulated customers (SOX, SOC 2 CC6.2/CC6.3, ISO 27001 A.5.18, PCI DSS 7.2) want
   - Across the server, the role's base must be the person's built-in role. A read-only person asks only for roles built on read-only, so a request can't turn read-only into member.
   - In a team, it's only the team they're on, and never for a read-only person, since team permissions do nothing for them.
   - If they hold another custom role in that scope, they're refused. If they hold the same role with an end, asking again renews it (a new end, from approval). If they hold it with no end, there's nothing to ask for.
-- At most one pending request per person, role and scope (a unique partial index), and at most 5 pending per person.
+- At most one pending request per person, role and scope (a unique partial index), at most 5 pending per person, and at most 10 requests per person in a day, withdrawn ones too (429). The daily cap bounds the alerts below: asking and withdrawing over and over can't flood the email list or webhook.
 - Read-only people can ask. This is the one write the "read-only changes nothing" review test allows, because asking changes no access until an admin approves.
 - A new request goes to the server's notification email list and webhook (`notify::alert`), with the role, scope, hours and reason, so it doesn't wait for someone to open the Roles screen.
 
@@ -40,7 +40,7 @@ Regulated customers (SOX, SOC 2 CC6.2/CC6.3, ISO 27001 A.5.18, PCI DSS 7.2) want
 - An approver can shorten the time, never lengthen it. The time runs from approval, not from the request, so a request approved late still gets the hours asked.
 - Approval checks everything again, in one transaction with the write: the role is still requestable and within its (maybe lowered) limit; the person is active, not an admin, and their base and team still fit; they hold no other role there. It then writes the role and its end the way ADR 0197 does (two statements, since the trigger clears an end when the role changes), drops any SCIM or SAML grant for that scope as giving a role by hand does, and marks the request approved with `grantedUntil`. A refused approval leaves the request pending, with the reason.
 - The person withdraws their own pending request with `POST /api/me/role-requests/{id}/cancel`.
-- Undecided requests lapse after 7 days. They lapse at once when the role stops being requestable or the person is disabled. The ADR 0197 sweep (every 60 seconds) and every request handler run the lapse first.
+- Undecided requests lapse after 7 days. They lapse at once when the role stops being requestable or the person is disabled: SQLite triggers on `roles` and `users` mark the pending requests the moment that changes, so making the role requestable again, or enabling the person again, before the sweep can't bring them back, and approval refuses a marked request in its transaction. The ADR 0197 sweep (every 60 seconds) and every request handler then close and audit them.
 - Deleting a role, team or person deletes their requests (`ON DELETE CASCADE`). Erasing a person deletes the person's requests and replaces them as decider with their pseudonym.
 
 ### Evidence

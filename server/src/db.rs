@@ -847,6 +847,8 @@ pub enum RoleRequestError {
     Duplicate,
     /// They have this many pending requests, the most there may be.
     TooMany(usize),
+    /// They made this many requests in the last day, the most there may be.
+    TooOften(usize),
     /// It was decided, withdrawn or lapsed already: its status.
     NotPending(String),
     /// What, read in the same transaction, makes it one that can't be given (`role_requests::why`).
@@ -2384,8 +2386,21 @@ fn migrate_role_requests(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
           decided_at INTEGER,
           decided_by TEXT,
           note TEXT,
-          granted_until INTEGER
+          granted_until INTEGER,
+          lapse TEXT
         );
+        -- A pending request lapses the moment its role stops being requestable or its person
+        -- stops being active, even if that's undone before the sweep audits it.
+        CREATE TRIGGER IF NOT EXISTS role_requests_lapse_role AFTER UPDATE OF requestable, max_days ON roles
+        WHEN NEW.requestable = 0 OR NEW.max_days IS NULL
+        BEGIN
+          UPDATE role_requests SET lapse = COALESCE(lapse, 'not_requestable') WHERE role_id = NEW.id AND status = 'pending';
+        END;
+        CREATE TRIGGER IF NOT EXISTS role_requests_lapse_user AFTER UPDATE OF status ON users
+        WHEN NEW.status != 'active'
+        BEGIN
+          UPDATE role_requests SET lapse = COALESCE(lapse, 'disabled') WHERE user_id = NEW.id AND status = 'pending';
+        END;
         CREATE UNIQUE INDEX IF NOT EXISTS role_requests_one_pending ON role_requests(user_id, role_id, COALESCE(team_id, '')) WHERE status = 'pending';
         CREATE INDEX IF NOT EXISTS role_requests_status ON role_requests(status, created_at);
         CREATE INDEX IF NOT EXISTS role_requests_user ON role_requests(user_id, created_at);",
@@ -5834,8 +5849,10 @@ impl Db {
 
     /// Files a pending request, lapsing at `expires_at`. Refused, in the same transaction,
     /// when the role isn't requestable or allows fewer hours, when they have a pending
-    /// request for it in this scope, or `max_pending` pending requests of any kind.
-    pub fn create_role_request(&self, user_id: &str, role_id: &str, team_id: Option<&str>, hours: i64, reason: &str, expires_at: i64, max_pending: usize) -> Result<RoleRequest, RoleRequestError> {
+    /// request for it in this scope, `max_pending` pending requests of any kind, or made
+    /// `max_daily` requests in the last day, withdrawn ones too.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_role_request(&self, user_id: &str, role_id: &str, team_id: Option<&str>, hours: i64, reason: &str, expires_at: i64, max_pending: usize, max_daily: usize) -> Result<RoleRequest, RoleRequestError> {
         let err = |e: rusqlite::Error| RoleRequestError::Db(e.to_string());
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(err)?;
@@ -5848,6 +5865,10 @@ impl Db {
         let pending: i64 = tx.query_row("SELECT COUNT(*) FROM role_requests WHERE user_id = ? AND status = 'pending'", [user_id], |r| r.get(0)).map_err(err)?;
         if pending as usize >= max_pending {
             return Err(RoleRequestError::TooMany(pending as usize));
+        }
+        let today: i64 = tx.query_row("SELECT COUNT(*) FROM role_requests WHERE user_id = ?1 AND created_at > ?2", params![user_id, now() - 86_400_000], |r| r.get(0)).map_err(err)?;
+        if today as usize >= max_daily {
+            return Err(RoleRequestError::TooOften(today as usize));
         }
         let id = format!("rq{}", crate::random_hex(5));
         let res = tx.execute(
@@ -5899,9 +5920,9 @@ impl Db {
         let Ok(tx) = c.unchecked_transaction() else { return Vec::new() };
         let res = (|| {
             let mut s = tx.prepare(
-                "SELECT q.*, CASE WHEN q.expires_at <= ?1 THEN 'expired' WHEN r.requestable = 0 OR r.max_days IS NULL THEN 'not_requestable' ELSE 'disabled' END AS why
+                "SELECT q.*, CASE WHEN q.lapse IS NOT NULL THEN q.lapse WHEN q.expires_at <= ?1 THEN 'expired' WHEN r.requestable = 0 OR r.max_days IS NULL THEN 'not_requestable' ELSE 'disabled' END AS why
                  FROM role_requests q JOIN roles r ON r.id = q.role_id JOIN users u ON u.id = q.user_id
-                 WHERE q.status = 'pending' AND (q.expires_at <= ?1 OR r.requestable = 0 OR r.max_days IS NULL OR u.status != 'active')
+                 WHERE q.status = 'pending' AND (q.lapse IS NOT NULL OR q.expires_at <= ?1 OR r.requestable = 0 OR r.max_days IS NULL OR u.status != 'active')
                  ORDER BY q.created_at, q.id",
             )?;
             let rows = s.query_map([at], |r| Ok((role_request_row(r)?, r.get::<_, String>("why")?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -5936,7 +5957,8 @@ impl Db {
         if q.status != "pending" {
             return Err(RoleRequestError::NotPending(q.status));
         }
-        if q.expires_at <= at {
+        let lapse: Option<String> = tx.query_row("SELECT lapse FROM role_requests WHERE id = ?", [id], |r| r.get(0)).map_err(err)?;
+        if q.expires_at <= at || lapse.is_some() {
             return Err(RoleRequestError::NotPending("lapsed".into()));
         }
         let role = tx.query_row("SELECT * FROM roles WHERE id = ?", [&q.role_id], custom_role_row).optional().map_err(err)?.ok_or(RoleRequestError::NotFound)?;
