@@ -227,6 +227,7 @@ impl StandIn {
             image_server: Some(super::incus::DEFAULT_IMAGE_SERVER.into()),
             deny,
             control,
+            allow: Vec::new(),
         }
     }
 

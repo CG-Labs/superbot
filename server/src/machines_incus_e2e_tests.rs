@@ -51,6 +51,8 @@ struct Env {
     /// A port on the control plane's host that isn't the machine port.
     decoy_port: u16,
     decoy_hits: Arc<AtomicUsize>,
+    /// Another port on that host, in INCUS_EGRESS_ALLOW, as an internal mirror would be.
+    mirror_port: u16,
     started: Instant,
     /// Off-host backups are on, encrypted to this.
     backup_identity: Option<age::x25519::Identity>,
@@ -142,6 +144,9 @@ async fn serve_with(extra: Vec<(&'static str, String)>) -> Env {
             hits.fetch_add(1, Ordering::SeqCst);
         }
     });
+    let mirror = TcpListener::bind((gateway, 0)).await.unwrap();
+    let mirror_port = mirror.local_addr().unwrap().port();
+    tokio::spawn(async move { while mirror.accept().await.is_ok() {} });
 
     let tiers = format!(
         "starter=c{}-m{}-d{},max=c{}-m{}-d{}",
@@ -153,6 +158,7 @@ async fn serve_with(extra: Vec<(&'static str, String)>) -> Env {
         ("MACHINE_LISTEN", format!("{gateway}:{machine_port}")),
         ("MACHINE_FIREWALL", "on".into()),
         ("MACHINE_FIREWALL_SOURCES", format!("{gateway}/32")),
+        ("INCUS_EGRESS_ALLOW", format!("{gateway}:{mirror_port}")),
         ("MACHINE_TIERS", tiers),
         ("MACHINE_LABEL_PREFIX", PREFIX.into()),
     ]);
@@ -184,7 +190,7 @@ async fn serve_with(extra: Vec<(&'static str, String)>) -> Env {
     crate::machines::hosts::load(&app, &cp).unwrap();
     tokio::spawn(enroll::serve(machine_listener, app.clone(), e, None));
     let (_, admin) = user_with(port, &owner, "ops@example.com", "admin").await;
-    Env { port, app, admin, incus, gateway, machine_port, decoy_port, decoy_hits, started, backup_identity }
+    Env { port, app, admin, incus, gateway, machine_port, decoy_port, decoy_hits, mirror_port, started, backup_identity }
 }
 
 async fn json_call(env: &Env, method: &str, path: &str, body: &str) -> (u16, Value) {
@@ -391,6 +397,7 @@ async fn real_incus_containers_enroll_stay_apart_and_follow_the_lifecycle() {
         assert!(!reaches(&env, &a, host, port).await, "A reached {why} at {host}:{port}");
     }
     assert_eq!(env.decoy_hits.load(Ordering::SeqCst), 0);
+    assert!(reaches(&env, &a, &gw, env.mirror_port).await, "A reaches the mirror port INCUS_EGRESS_ALLOW opens");
     let (code, out) = sh(&env, &a, &format!("ping -c 1 -W 2 {gw}")).await;
     assert_eq!(code, 0, "control: A pings the gateway: {out}");
     let (code, _) = sh(&env, &a, &format!("ping -c 1 -W 2 {b4}")).await;
