@@ -3,7 +3,7 @@
 //! headers and no further than the period needs, a rate limit waited out, the token sent
 //! on every request and never written, and a bundle any `tar` and `sha256sum -c` accept,
 //! holding each merged pull request's approvals and checks, the exceptions an auditor
-//! samples, the branch's protection and the CI runs on it. ADR 0154: `superbot-evidence
+//! samples, the branch's protection and the CI runs on it. ADR 0086: `superbot-evidence
 //! vulnerabilities` against the same stand-in, with Dependabot alerts over two pages and
 //! code scanning alerts judged against their remediation windows, the accepted findings
 //! read from the repository, and a token without Dependabot access recorded, not fatal.

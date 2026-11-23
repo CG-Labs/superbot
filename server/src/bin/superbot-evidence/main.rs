@@ -1,7 +1,7 @@
 //! superbot-evidence: exports SOC 2 evidence from GitHub. `github` (ADR 0148): for a
 //! period, every pull request merged into the branch with its reviews, approvers, required
 //! checks and merge commit, the commits that reached the branch without one, the branch's
-//! protection, and every CI run on the branch. `vulnerabilities` (ADR 0154): every
+//! protection, and every CI run on the branch. `vulnerabilities` (ADR 0086): every
 //! Dependabot and code scanning alert open in the period, judged against its severity's
 //! remediation window, and the findings accepted with a reason. Each is a dated bundle
 //! with SHA-256 digests beside botd's evidence bundles (ADR 0142).
@@ -20,7 +20,7 @@ mod vulns;
 use std::io::Write;
 use std::process::ExitCode;
 
-const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0154).
+const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0086).
 
   superbot-evidence github --repo <owner/name> [--branch <name>]
                     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>] [--no-titles]

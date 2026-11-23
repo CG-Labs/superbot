@@ -1,4 +1,4 @@
-//! Vulnerability-management evidence (ADR 0154): for a period, every Dependabot and code
+//! Vulnerability-management evidence (ADR 0086): for a period, every Dependabot and code
 //! scanning alert that was open at any time in it, each judged against the remediation
 //! window for its severity (the information security policy's: 30 days for Critical and
 //! High, 90 for Medium and Low), and the findings the repository accepts with a reason
@@ -40,7 +40,7 @@ const README: &str = "SuperBot vulnerability-management evidence bundle
 =================================================
 
 Made by superbot-evidence from the GitHub API with a read-only token, for a SOC 2 Type II
-evidence store (docs/security/soc2-evidence-plan.md, ADR 0154). It covers the period in
+evidence store (docs/security/soc2-evidence-plan.md, ADR 0086). It covers the period in
 manifest.json: from its first day (00:00 UTC) up to, not including, its last. Alerts are
 judged as of the period's end; their state now and the accepted findings are as of
 createdAt, which may be after the period.

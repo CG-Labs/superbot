@@ -5,7 +5,7 @@ name: change-evidence
 # merge commits), commits without one, the protection on the default branch and every CI
 # run on it, as a bundle with SHA-256 digests, built by superbot-evidence from this commit.
 # It also exports every Dependabot and code scanning alert open last month, judged against
-# the remediation windows, and the findings the repository accepts (ADR 0154).
+# the remediation windows, and the findings the repository accepts (ADR 0086).
 # The security owner copies the artifact to the evidence store before it expires. Run it by
 # hand for another period (whole UTC days; to is not included). Read access only: the
 # token can see the repository and nothing it does changes it.
