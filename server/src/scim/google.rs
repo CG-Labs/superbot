@@ -325,13 +325,7 @@ impl Directory {
         let json = key()?.ok_or(format!("GOOGLE_DIRECTORY_SYNC=on needs the service account's JSON key: botctl secret set {CREDENTIALS} < key.json, or {CREDENTIALS}_FILE"))?;
         service_account(&json)?;
         let loopback = url::Url::parse(&settings.api).ok().and_then(|u| u.host_str().map(crate::is_loopback_host)).unwrap_or(false);
-        let http = reqwest::Client::builder()
-            .https_only(!loopback)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| e.to_string())?;
+        let http = reqwest::Client::builder().https_only(!loopback).connect_timeout(CONNECT_TIMEOUT).timeout(TIMEOUT).redirect(reqwest::redirect::Policy::none()).build().map_err(|e| e.to_string())?;
         Ok(Directory { settings, key, http, running: tokio::sync::Mutex::new(()), last: std::sync::Mutex::new(None), last_success: std::sync::Mutex::new(None) })
     }
 
@@ -361,7 +355,10 @@ impl Directory {
         let status = res.status();
         let body = Zeroizing::new(read(res, "the access token").await?);
         if !status.is_success() {
-            return Err(fail("sign_in", format!("Google refused the service account ({status}, {}). Check domain-wide delegation of the two read-only scopes, and GOOGLE_DIRECTORY_ADMIN.", google_error(&body))));
+            return Err(fail(
+                "sign_in",
+                format!("Google refused the service account ({status}, {}). Check domain-wide delegation of the two read-only scopes, and GOOGLE_DIRECTORY_ADMIN.", google_error(&body)),
+            ));
         }
         let v: Value = serde_json::from_slice(&body).map_err(|_| odd("the access token"))?;
         let token = v["access_token"].as_str().filter(|t| !t.is_empty()).ok_or_else(|| odd("the access token"))?;
@@ -682,13 +679,7 @@ pub async fn run(a: &Arc<Auth>, d: &Directory, trigger: Trigger) -> Result<Value
             }
             let changed = ["created", "updated", "deleted"].iter().map(|k| details[*k].as_u64().unwrap_or(0)).sum::<u64>();
             if changed > 0 || details["failed"].as_u64().unwrap_or(0) > 0 {
-                crate::obs::log::log_info!(
-                    "Google Workspace sync: {} created, {} updated, {} deleted, {} failed.",
-                    details["created"],
-                    details["updated"],
-                    details["deleted"],
-                    details["failed"]
-                );
+                crate::obs::log::log_info!("Google Workspace sync: {} created, {} updated, {} deleted, {} failed.", details["created"], details["updated"], details["deleted"], details["failed"]);
             }
         }
         Err(f) => crate::obs::log::log_warn!("Google Workspace sync: {}", f.detail),
@@ -714,7 +705,10 @@ async fn apply(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Caller, snap: S
     if !force && !live.is_empty() && !people.iter().any(|p| p.active) {
         return Err(fail(
             "would_remove_everyone",
-            format!("Google lists nobody active in the groups, so this pass would remove all {} of the tenant's people. Nobody was changed. Check the groups, then run botctl scim google sync --force.", live.len()),
+            format!(
+                "Google lists nobody active in the groups, so this pass would remove all {} of the tenant's people. Nobody was changed. Check the groups, then run botctl scim google sync --force.",
+                live.len()
+            ),
         ));
     }
     let removals = plan.removals(&live);
@@ -970,7 +964,10 @@ mod tests {
         assert!(!person(&json!({ "id": "1", "primaryEmail": "a@example.com", "archived": true })).unwrap().active);
         assert!(person(&json!({ "id": "1/2", "primaryEmail": "a@example.com" })).is_none());
         assert!(person(&json!({ "id": "1", "primaryEmail": "nope" })).is_none());
-        assert_eq!(google_error(br#"{"error":{"code":403,"message":"Not Authorized to access this resource/api","status":"PERMISSION_DENIED"}}"#), "PERMISSION_DENIED: Not Authorized to access this resource/api");
+        assert_eq!(
+            google_error(br#"{"error":{"code":403,"message":"Not Authorized to access this resource/api","status":"PERMISSION_DENIED"}}"#),
+            "PERMISSION_DENIED: Not Authorized to access this resource/api"
+        );
         assert_eq!(google_error(br#"{"error":"unauthorized_client","error_description":"Client is unauthorized"}"#), "unauthorized_client: Client is unauthorized");
         assert_eq!(google_error(b"<html>"), "no reason given");
     }

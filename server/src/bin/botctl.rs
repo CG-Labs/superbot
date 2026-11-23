@@ -161,6 +161,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    team, or with --org across the server. Never admin
   botctl scim role show <id>                       A mapping and who it gave the role to
   botctl scim role unmap <id>                      Takes the role from everyone the mapping gave it to
+  botctl scim google                               The Google Workspace sync: settings and last passes
+  botctl scim google sync [--force]                A pass now. --force lets one that removes more
+                                                   people than GOOGLE_DIRECTORY_MAX_REMOVALS go ahead
   botctl sessions [<user>]                         Live sessions
   botctl session revoke <id>
   botctl session revoke-all <user>
@@ -1048,8 +1051,8 @@ fn signup_request(args: &[&str]) -> Result<(&'static str, String, Option<String>
     })
 }
 
-/// `botctl scim ...`: SCIM provisioning tokens (ADR 0023), and links from SCIM groups to
-/// teams (ADR 0095).
+/// `botctl scim ...`: SCIM provisioning tokens (ADR 0023), links from SCIM groups to
+/// teams (ADR 0095), and the Google Workspace sync (ADR 0162).
 fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
     Ok(match args {
         [] | ["tokens"] | ["token", "list"] => ("GET", "/api/scim/tokens".into(), None),
@@ -1071,8 +1074,11 @@ fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
             ("POST", "/api/scim/tokens".into(), Some(body.to_string()))
         }
         ["token", "revoke", id] => ("DELETE", format!("/api/scim/tokens/{}", encode(id)), None),
+        ["google"] | ["google", "status"] => ("GET", "/api/scim/google".into(), None),
+        ["google", "sync"] => ("POST", "/api/scim/google/sync".into(), None),
+        ["google", "sync", "--force"] => ("POST", "/api/scim/google/sync".into(), Some(json!({ "force": true }).to_string())),
         _ => {
-            return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team> | role-mappings | role map <team> <role> [--org] | role show <id> | role unmap <id>".into());
+            return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team> | role-mappings | role map <team> <role> [--org] | role show <id> | role unmap <id> | google [status] | google sync [--force]".into());
         }
     })
 }
@@ -2742,6 +2748,11 @@ mod tests {
         assert_eq!(req(&["role", "map", "t1", "auditor", "--org"]), Ok(("POST", "/api/scim/role-mappings".into(), Some(json!({ "team": "t1", "role": "auditor", "scope": "org" })))));
         assert_eq!(req(&["role", "show", "sm 1"]), Ok(("GET", "/api/scim/role-mappings/sm%201".into(), None)));
         assert_eq!(req(&["role", "unmap", "sm1"]), Ok(("DELETE", "/api/scim/role-mappings/sm1".into(), None)));
+        assert_eq!(req(&["google"]), Ok(("GET", "/api/scim/google".into(), None)));
+        assert_eq!(req(&["google", "status"]), Ok(("GET", "/api/scim/google".into(), None)));
+        assert_eq!(req(&["google", "sync"]), Ok(("POST", "/api/scim/google/sync".into(), None)));
+        assert_eq!(req(&["google", "sync", "--force"]), Ok(("POST", "/api/scim/google/sync".into(), Some(json!({ "force": true })))));
+        assert!(req(&["google", "sync", "--hard"]).is_err());
         assert!(req(&["role", "map", "t1"]).is_err());
         assert!(req(&["role", "map", "--org", "t1"]).is_err());
         assert!(req(&["role", "map", "t1", "auditor", "--team"]).is_err());

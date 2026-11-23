@@ -168,7 +168,8 @@ async fn google_stand_in() -> Google {
         .route("/admin/directory/v1/groups/{id}/members", get(members))
         .with_state(dir.clone());
     tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
-    let key = json!({ "type": "service_account", "client_email": "sync@project-1.iam.gserviceaccount.com", "private_key": pem, "private_key_id": "k1", "token_uri": format!("{url}/token") }).to_string();
+    let key =
+        json!({ "type": "service_account", "client_email": "sync@project-1.iam.gserviceaccount.com", "private_key": pem, "private_key_id": "k1", "token_uri": format!("{url}/token") }).to_string();
     Google { url, dir, key }
 }
 

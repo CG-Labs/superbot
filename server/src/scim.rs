@@ -1114,6 +1114,8 @@ mod tests {
             assert!(!s.enabled && !s.groups && !s.group_roles && vars.contains_key("SCIM"), "{name}");
             assert!(text.contains("SCIM_GROUPS"), "{name} documents SCIM_GROUPS");
             assert!(text.contains("SCIM_GROUP_ROLES"), "{name} documents SCIM_GROUP_ROLES");
+            assert!(google::Settings::from_env(&|k| get(k).to_string(), &s, &|_| None).unwrap_or_else(|e| panic!("{name}: {e}")).is_none(), "{name}");
+            assert!(vars.contains_key("GOOGLE_DIRECTORY_SYNC") && text.contains("GOOGLE_DIRECTORY_GROUPS"), "{name} documents the Google Workspace sync");
         }
     }
 
