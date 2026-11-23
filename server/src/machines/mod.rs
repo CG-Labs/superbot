@@ -395,6 +395,7 @@ impl ControlPlane {
             if firewall::Settings::from_env(&var)?.is_some() {
                 return Err(format!("MACHINE_FIREWALL=on needs the control plane: {NEEDS_IT}"));
             }
+            firewall::egress_from_env(&var)?;
             return Ok(ControlPlane::default());
         };
         let token = token.expose().trim().to_string();
@@ -402,8 +403,14 @@ impl ControlPlane {
             return Err("LINODE_TOKEN is empty or has spaces in it".into());
         }
         crate::secrets::redact::register(&token);
-        let mut cp =
-            ControlPlane::configured(Arc::new(linode::Linode::new(&token, linode::API_URL)), &var)?;
+        let mut api = linode::Linode::new(&token, linode::API_URL);
+        if firewall::egress_from_env(&var)? {
+            api = api.with_outbound(linode::outbound(
+                &firewall::egress_deny(&var)?,
+                firewall::control_from_env(&var),
+            )?);
+        }
+        let mut cp = ControlPlane::configured(Arc::new(api), &var)?;
         cp.regions = list(&var("MACHINE_REGIONS"));
         if cp.regions.is_empty() {
             return Err("MACHINE_REGIONS is needed with LINODE_TOKEN, e.g. gb-lon or gb-lon,de-fra-2 (the first is the default)".into());
@@ -430,6 +437,9 @@ impl ControlPlane {
         }
         if firewall::Settings::from_env(var)?.is_none() {
             return Err("MACHINE_PROVIDER=incus needs MACHINE_FIREWALL=on: the firewall is what keeps containers off each other, the host, and private addresses".into());
+        }
+        if !firewall::egress_from_env(var)? {
+            return Err("MACHINE_FIREWALL_EGRESS=off can't be kept with MACHINE_PROVIDER=incus: the network ACL always drops containers' traffic to private addresses and INCUS_EGRESS_DENY".into());
         }
         let p = incus::fleet::Fleet::from_env(store, var)?;
         let mut tags: Vec<String> = Vec::new();
@@ -727,7 +737,13 @@ impl ControlPlane {
                     r => format!("{} via {}", r.as_str(), self.link.name()),
                 },
                 self.enrollment.as_ref().map_or("off (set MACHINE_CONTROL_URL)".into(), |e| e.describe()),
-                self.firewall.as_ref().map_or("off (set MACHINE_FIREWALL=on)".into(), |f| f.describe())
+                self.firewall.as_ref().map_or("off (set MACHINE_FIREWALL=on)".into(), |f| {
+                    match p.firewall_egress().and_then(|o| o.as_array().map(Vec::len)) {
+                        Some(0) => format!("{}; outbound open (MACHINE_FIREWALL_EGRESS=off)", f.describe()),
+                        Some(_) => format!("{}; outbound TCP and UDP dropped to the machines' deny list", f.describe()),
+                        None => f.describe(),
+                    }
+                })
             ),
         }
     }
@@ -1919,7 +1935,7 @@ pub async fn substrate(Extension(a): Extension<Arc<Auth>>, Query(q): Query<HashM
         "image": cp.image,
         "backups": cp.backups,
         "enrollment": cp.enrollment.is_some(),
-        "firewall": cp.firewall.as_ref().map(|f| json!({ "label": f.label, "rules": firewall::rules_json(&f.rules) })),
+        "firewall": cp.firewall.as_ref().map(|f| json!({ "label": f.label, "rules": firewall::rules_json(&f.rules), "outbound": p.firewall_egress() })),
         "settings": p.settings(),
     });
     if q.get("check").is_some_and(|c| matches!(c.as_str(), "1" | "true" | "yes")) {
@@ -2206,6 +2222,8 @@ mod tests {
         for (store, extra, want) in [
             (&certs, &[("MACHINE_FIREWALL", "")][..], "MACHINE_FIREWALL=on"),
             (&certs, &[("MACHINE_CONTROL_URL", ""), ("MACHINE_FIREWALL", "")][..], "MACHINE_CONTROL_URL"),
+            // The network ACL always drops outbound to private addresses (ADR 0179).
+            (&certs, &[("MACHINE_FIREWALL_EGRESS", "off")][..], "MACHINE_FIREWALL_EGRESS=off can't be kept"),
             (&certs, &[("INCUS_URL", "")][..], "INCUS_URL"),
             (&certs, &[("MACHINE_TIERS", "starter=g6-standard-1")][..], "isn't an Incus plan"),
             (&certs, &[("MACHINE_REGIONS", "Node 1")][..], "MACHINE_REGIONS"),
@@ -2412,5 +2430,39 @@ mod tests {
         let fw = cp.firewall.as_ref().unwrap();
         assert_eq!(fw.rules[0].sources, ["127.0.0.1/32"], "the control URL's address");
         assert!(cp.describe().contains("firewall"), "{}", cp.describe());
+        assert!(cp.describe().contains("outbound TCP and UDP dropped"), "{}", cp.describe());
+    }
+
+    #[test]
+    fn linodes_firewall_drops_outbound_to_the_deny_list_unless_turned_off() {
+        let token = EnvStore::fixed(&[("LINODE_TOKEN", "firewall-test-token-71c3")]);
+        let vars = |egress: &'static str, url: &'static str, deny: &'static str| {
+            move |k: &str| match k {
+                "MACHINE_REGIONS" => "gb-lon".to_string(),
+                "MACHINE_FIREWALL" => "on".to_string(),
+                "MACHINE_CONTROL_URL" => url.to_string(),
+                "MACHINE_FIREWALL_EGRESS" => egress.to_string(),
+                "MACHINE_EGRESS_DENY" => deny.to_string(),
+                _ => String::new(),
+            }
+        };
+        let on = ControlPlane::from_env(&token, vars("", "https://192.0.2.1:8443", "203.0.113.0/24")).unwrap();
+        let rules = on.need().unwrap().firewall_egress().unwrap();
+        assert_eq!(rules.as_array().unwrap().len(), 2, "TCP and UDP, no way through for a public botd: {rules}");
+        assert!(rules[0]["to"].as_array().unwrap().iter().any(|c| c == "203.0.113.0/24"), "{rules}");
+        assert!(rules[0]["to"].as_array().unwrap().iter().any(|c| c == "169.254.0.0/16"), "{rules}");
+        let private = ControlPlane::from_env(&token, vars("on", "https://10.1.2.3:8443", "")).unwrap();
+        let rules = private.need().unwrap().firewall_egress().unwrap();
+        assert_eq!((rules[0]["action"].as_str(), rules[0]["ports"].as_str()), (Some("ACCEPT"), Some("8443")), "{rules}");
+        let off = ControlPlane::from_env(&token, vars("off", "https://10.1.2.3:8443", "")).unwrap();
+        assert_eq!(off.need().unwrap().firewall_egress(), Some(json!([])));
+        let mut cp = off;
+        cp.enroll_with(enroll::Enrollment::for_tests(3, 8443, 7443)).unwrap();
+        assert!(cp.describe().contains("MACHINE_FIREWALL_EGRESS=off"), "{}", cp.describe());
+        let err = ControlPlane::from_env(&token, vars("maybe", "https://192.0.2.1:8443", "")).err().unwrap();
+        assert!(err.contains("MACHINE_FIREWALL_EGRESS"), "{err}");
+        let alone = |k: &str| if k == "MACHINE_FIREWALL_EGRESS" { "on".to_string() } else { String::new() };
+        let err = ControlPlane::from_env(&EnvStore::fixed(&[]), alone).err().unwrap();
+        assert!(err.contains("MACHINE_FIREWALL=on"), "{err}");
     }
 }
