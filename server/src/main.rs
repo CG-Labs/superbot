@@ -216,6 +216,8 @@ mod billing_mail_http_tests;
 mod usage;
 #[cfg(test)]
 mod usage_http_tests;
+#[cfg(test)]
+mod vault_auth_http_tests;
 mod storage;
 #[cfg(test)]
 mod storage_http_tests;
