@@ -2,6 +2,8 @@
 
 The settings every managed SuperBot server runs with, and how to check each one. The [information security policy](policies/information-security.md#configuration-baseline) requires this baseline and a check of each server against it at least quarterly and after every upgrade; the [change management policy](policies/change-management.md#production-changes) checks it after every production change. Part of the [security pack](README.md) and the SOC 2 Type II programme ([#57](https://github.com/CG-Labs/superbot/issues/57)), checklist row CC5.1-1. **Draft, not adopted. SuperBot is not SOC 2 certified.**
 
+botd checks itself against this table ([ADR 0193](../adr/0193-configuration-baseline-checked-by-botd.md)): `botctl baseline` shows each setting as `pass`, `fail`, `exception` (failing under an approved exception), `manual` (for a person to check: botd can't see an image's signature or a contract) or `not_applicable` (no machines, say), and exits 1 while one fails. A test holds botd's rules to this table, so a row added here needs a rule there.
+
 A self-hosting customer can use it as a starting point for their own. Settings are in the server's `.env` (Compose) or the installer's env file; each is described in [`.env.example`](../../.env.example) or the [install guide](../../deploy/README.md). Many protections are off by default so that a first install works anywhere; the managed service turns them on.
 
 ## Settings
@@ -31,18 +33,22 @@ A self-hosting customer can use it as a starting point for their own. Settings a
 | `AUDIT_RETENTION_DAYS` | Empty, or at least the observation period plus a year | Audit events outlive the audit that samples them ([retention](policies/data-classification-and-retention.md#retention)) | `botctl retention`; the bundle's `retention.json` says whether the period plus a year is kept |
 | `CHAT_RETENTION_DAYS`, `HARNESS_SESSION_RETENTION_DAYS`, `TEAMMATE_FILES_RETENTION_DAYS` | What the [retention policy](policies/data-classification-and-retention.md#retention) and customers' contracts say | Data isn't kept longer than agreed (C1.2-1) | `botctl retention` |
 | `EVIDENCE_BUNDLES` | `monthly` | Each month's evidence is written on the 1st ([ADR 0142](../adr/0142-type-ii-evidence-bundles.md)) | `botctl evidence` |
+| `CONFIG_BASELINE` | `on` or `required` | botd checks itself against this table at every start, so after every upgrade and change of settings, and audits it ([ADR 0193](../adr/0193-configuration-baseline-checked-by-botd.md)) | `botctl baseline`; the bundle's `baseline.json` |
 
 botd also refuses to start in some unsafe setups whatever the baseline says: an SSO provider making accounts without an allow-list ([ADR 0103](../adr/0103-sso-jit-needs-an-allow-list.md)), or a model provider over plain HTTP ([ADR 0097](../adr/0097-model-providers-over-https.md)).
 
 ## Checking a server
 
-Quarterly, after every upgrade and after every production change, the operator:
+With `CONFIG_BASELINE=on`, botd checks at every start, which follows every upgrade and every change of settings: it logs one line with the result and a warning for each failing setting, and audits the check as `server.baseline_checked` (who, `ok`, counts, the failing and waived settings, and a digest of the result, never an observed value). `required` also refuses to start while a setting fails. `botctl baseline` checks on request, audited the same way. The digest depends only on the settings, so two checks with the same digest found the same server.
 
-1. Runs `botctl setup`, `botctl backups`, `botctl database`, `botctl retention`, `botctl machine recovery` and `botctl evidence`, and saves the output.
-2. Saves the server's settings with every secret value removed (keys, tokens, passwords, bucket credentials).
-3. Compares both with the table above, and records each difference with what was done about it: fixed, or an exception approved under the [information security policy](policies/information-security.md#exceptions).
+An approved exception (under the [information security policy](policies/information-security.md#exceptions)) goes in `CONFIG_BASELINE_EXCEPTIONS`, a comma-separated list of settings from this table: botd reports the setting as `exception` rather than `fail`, and warns when a listed setting no longer fails, so the exception is removed. botd refuses to start on a name that isn't in the table.
 
-The saved output, the comparison and any exceptions go to the evidence store under CC5.1 ([evidence plan](soc2-evidence-plan.md#collection-calendar)). The monthly evidence bundle records the MFA policy, backup and database encryption and retention settings, and every change to them, between checks.
+Quarterly, the operator:
+
+1. Runs `botctl baseline` and saves the output, and checks each `manual` row by hand: the image's signature, the retention days against the policy and contracts, and whether more than one customer shares the server.
+2. Records each `fail` and `exception` with what was done about it: fixed, or the approved exception.
+
+The output, the manual checks and any exceptions go to the evidence store under CC5.1 ([evidence plan](soc2-evidence-plan.md#collection-calendar)). Between checks, the monthly evidence bundle's `baseline.json` holds the server checked as of the bundle's making and every check in its month, and its other files record the MFA policy, backup and database encryption and retention settings, and every change to them.
 
 ## Changing the baseline
 
