@@ -1106,7 +1106,7 @@ impl App {
         };
         // Short-lived credentials, made last so no wait outlives them, and revoked when
         // `_leases` drops as the run ends, however it ends (ADR 0185).
-        let (space, _leases) = match crate::secrets::leases::for_run(&bot.owner_id, &bot.id, for_other.is_none()) {
+        let (space, _leases) = match crate::secrets::leases::for_run(&bot.owner_id, &bot.id, for_other.is_none(), self.cfg.run_timeout) {
             Ok((creds, leases)) => {
                 if let Some(e) = wiring.endpoints.iter().find(|e| leases.cleared().contains(&e.key_secret)) {
                     let e = crate::secrets::Error::Unavailable(format!("the lease gave an empty {}, the key for model provider {}", e.key_secret, e.name));

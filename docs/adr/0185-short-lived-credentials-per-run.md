@@ -48,6 +48,8 @@ A plan's model provider key (a tier endpoint's `keySecret`, ADR 0077) may be one
 
 If a lease can't be revoked (Vault down, botd stopped mid-run), it lasts until its TTL. So **the Vault role's TTL is the longest a credential can outlive its run**: set it a little over the longest run (`RUN_TIMEOUT_MINUTES`, 60 by default), not a day. Renewing leases for very long runs is left out; a role with a long `max_ttl` and a short `default_ttl` isn't needed while botd revokes at run end.
 
+Vault also revokes a token's leases when the token itself ends, whatever their TTL, and botd's AppRole, Kubernetes or JWT token lives about an hour; logging in again later doesn't extend the token that made a lease. So before each lease botd checks the token it will use (`auth/token/lookup-self`, in Vault's default policy). If the token ends before the run could (`RUN_TIMEOUT_MINUTES` plus five minutes), botd renews it to that (`renew-self`), else logs in again for a new token, else refuses the run (`secrets_unavailable`, naming the token's max TTL). A token that never ends, such as a root token, needs neither. Renewing to the run's length, once per lease, needs no background renewer and leaves the token ending soon after its last run.
+
 ### Audit and redaction
 
 - `secret.lease_issued` for each lease made or refused: target the path (`secret_lease`), the Bot, `store`, `path`, `names`, `leaseId`, `ttl`, `renewable`, and `userId` for a path with `{owner}`. Failures carry the error's kind and, for missing fields, which.

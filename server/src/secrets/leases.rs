@@ -17,12 +17,16 @@
 //!   redactor doesn't grow with every run.
 //! - A lease botd couldn't revoke (it stopped, Vault was down) ends at its TTL: the
 //!   Vault role's `default_ttl` is the longest a credential outlives its run.
+//! - Each lease is asked for with the longest the run may last (`RUN_TIMEOUT_MINUTES`),
+//!   so a backend whose leases end with something else (Vault's with botd's token) can
+//!   make sure that lives as long, or refuse the run.
 
 use super::external::{self, Scope};
 use super::{check_name, redact, Error, Secret};
 use crate::audit::{Event, Outcome};
 use serde_json::json;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use zeroize::Zeroizing;
 
 /// The most paths one run asks for.
@@ -52,8 +56,9 @@ pub struct Lease {
 /// A backend that makes and revokes leases. Errors carry no value.
 pub trait Issuer: Send + Sync {
     fn kind(&self) -> &'static str;
-    /// A new lease from `path`, with the value of each of `fields`.
-    fn issue(&self, path: &str, fields: &[String]) -> Result<Lease, Error>;
+    /// A new lease from `path`, with the value of each of `fields`, that nothing but its
+    /// own TTL or a revoke ends within `run_for`.
+    fn issue(&self, path: &str, fields: &[String], run_for: Duration) -> Result<Lease, Error>;
     fn revoke(&self, lease_id: &str) -> Result<(), Error>;
 }
 
@@ -259,8 +264,9 @@ impl RunCredentials {
 
     /// New leases for one run of `bot_id`, owned by `owner`, and the variables they give.
     /// Paths with `{owner}` only when `owner_keys` and the id can name one (as for users'
-    /// folders, ADR 0174). On an error the leases already made are revoked.
-    pub fn issue(&self, owner: &str, bot_id: &str, owner_keys: bool) -> Result<(Vec<(String, Secret)>, Leases), Error> {
+    /// folders, ADR 0174). `run_for` is the longest the run may last. On an error the
+    /// leases already made are revoked.
+    pub fn issue(&self, owner: &str, bot_id: &str, owner_keys: bool, run_for: Duration) -> Result<(Vec<(String, Secret)>, Leases), Error> {
         let mut leases = Leases { issuer: Some(Arc::clone(&self.issuer)), held: Vec::new(), cleared: Vec::new() };
         let mut env = Vec::new();
         let owner_ok = owner_keys && Scope::user(owner).is_some();
@@ -274,7 +280,7 @@ impl RunCredentials {
             let (e, mut d) = event("secret.lease_issued", self.issuer.kind(), &path, bot_id, owner_id);
             d["names"] = json!(w.names.iter().map(|(n, _)| n).collect::<Vec<_>>());
             let fields: Vec<String> = w.names.iter().map(|(_, f)| f.clone()).collect();
-            let lease = match self.issuer.issue(&path, &fields) {
+            let lease = match self.issuer.issue(&path, &fields, run_for) {
                 Ok(l) => l,
                 Err(err) => {
                     d["error"] = json!(err.kind());
@@ -326,9 +332,9 @@ fn keep_from_inheritance(rc: &RunCredentials) {
 
 /// The short-lived credentials for one run, from the backend botd runs with; none if
 /// `VAULT_RUN_CREDENTIALS` isn't set. Hold the `Leases` until the run ends.
-pub fn for_run(owner: &str, bot_id: &str, owner_keys: bool) -> Result<(Vec<(String, Secret)>, Leases), Error> {
+pub fn for_run(owner: &str, bot_id: &str, owner_keys: bool, run_for: Duration) -> Result<(Vec<(String, Secret)>, Leases), Error> {
     match active(owner) {
-        Some(rc) => rc.issue(owner, bot_id, owner_keys),
+        Some(rc) => rc.issue(owner, bot_id, owner_keys, run_for),
         None => Ok((Vec::new(), Leases::none())),
     }
 }
@@ -352,7 +358,7 @@ pub(crate) mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     /// A backend that makes leases in memory and records what it revoked.
     #[derive(Default)]
@@ -365,13 +371,19 @@ pub(crate) mod tests {
         pub revoke_down: AtomicBool,
         /// Every lease from a path has the same values, as a role that hands out one user would.
         pub same: AtomicBool,
+        /// The `run_for` of each lease asked for.
+        pub run_for: Mutex<Vec<Duration>>,
     }
+
+    /// The longest a test's run may last.
+    pub(crate) const RUN: Duration = Duration::from_secs(3600);
 
     impl Issuer for Fake {
         fn kind(&self) -> &'static str {
             "fake"
         }
-        fn issue(&self, path: &str, fields: &[String]) -> Result<Lease, Error> {
+        fn issue(&self, path: &str, fields: &[String], run_for: Duration) -> Result<Lease, Error> {
+            self.run_for.lock().unwrap().push(run_for);
             if self.down.load(Ordering::SeqCst) {
                 return Err(Error::Unavailable("fake is down".into()));
             }
@@ -472,8 +484,8 @@ pub(crate) mod tests {
         let rc = RunCredentials::new(f.clone(), wanted);
         assert!(rc.describe().contains("aws/creds/bots, database/creds/u-{owner}"));
 
-        let (e1, l1) = rc.issue("ulease1", "blease1", true).unwrap();
-        let (e2, l2) = rc.issue("ulease1", "blease1", true).unwrap();
+        let (e1, l1) = rc.issue("ulease1", "blease1", true, RUN).unwrap();
+        let (e2, l2) = rc.issue("ulease1", "blease1", true, RUN).unwrap();
         assert_eq!(
             env(&e1),
             [pair("CLOUD_KEY_ID", "AKIAleases-0"), pair("CLOUD_SECRET_KEY", "aws-run-secret-0a1b-0"), pair("PGPASSWORD", "db-run-pass-9f8e-1"), pair("PGUSER", "v-ulease1-user-1")],
@@ -507,18 +519,18 @@ pub(crate) mod tests {
     fn owners_paths_only_for_their_own_keys() {
         let f = fake(&[("shared/creds/r", &[("token", Some("shared-run-token-77"))]), ("db/creds/uown2", &[("password", Some("own-run-pass-77"))])]);
         let rc = RunCredentials::new(f.clone(), parse("shared/creds/r SHARED_TOKEN=token; db/creds/{owner} OWN_PASSWORD=password").unwrap());
-        let (e, l) = rc.issue("uown2", "bown2", false).unwrap();
+        let (e, l) = rc.issue("uown2", "bown2", false, RUN).unwrap();
         assert_eq!(env(&e).into_iter().map(|(k, _)| k).collect::<Vec<_>>(), ["SHARED_TOKEN"], "a run for someone else gets no owner's lease");
         assert_eq!(l.len(), 1);
-        let (e, _) = rc.issue("U-OWN2", "bown2", true).unwrap();
+        let (e, _) = rc.issue("U-OWN2", "bown2", true, RUN).unwrap();
         assert_eq!(e.len(), 1, "an id that can't be part of a path gets none of its own");
-        let (e, _) = rc.issue("uown2", "bown2", true).unwrap();
+        let (e, _) = rc.issue("uown2", "bown2", true, RUN).unwrap();
         assert_eq!(e.len(), 2);
         assert_eq!(rc.names_for("uown2", false), ["SHARED_TOKEN"], "known before any lease, for the plan's key check");
         assert_eq!(rc.names_for("U-OWN2", true), ["SHARED_TOKEN"]);
         assert_eq!(rc.names_for("uown2", true), ["SHARED_TOKEN", "OWN_PASSWORD"]);
         assert!(names_for_run("uown2", true).is_empty());
-        let (e, l) = for_run("uown2", "bown2", true).unwrap();
+        let (e, l) = for_run("uown2", "bown2", true, RUN).unwrap();
         assert!(e.is_empty() && l.is_empty(), "nothing set: nothing asked for");
     }
 
@@ -526,7 +538,7 @@ pub(crate) mod tests {
     fn a_lease_that_cant_be_made_refuses_the_run_and_revokes_the_rest() {
         let f = fake(&[("first/creds/r", &[("token", Some("first-run-token-55"))]), ("second/creds/r", &[("username", Some("second-user-55"))])]);
         let rc = RunCredentials::new(f.clone(), parse("first/creds/r FIRST_TOKEN=token; second/creds/r SECOND_USER=username SECOND_PASSWORD=password").unwrap());
-        let err = rc.issue("ufail3", "bfail3", true).err().unwrap();
+        let err = rc.issue("ufail3", "bfail3", true, RUN).err().unwrap();
         assert!(matches!(&err, Error::Unavailable(m) if m.contains("has no field password")), "{err:?}");
         wait_for(|| f.revoked.lock().unwrap().len() == 2);
         assert!(f.revoked.lock().unwrap().iter().any(|l| l.starts_with("first/")) && f.revoked.lock().unwrap().iter().any(|l| l.starts_with("second/")), "both, the one with the missing field too");
@@ -535,7 +547,7 @@ pub(crate) mod tests {
 
         f.down.store(true, Ordering::SeqCst);
         let before = f.revoked.lock().unwrap().len();
-        assert!(matches!(rc.issue("ufail3", "bfail3", true), Err(Error::Unavailable(_))));
+        assert!(matches!(rc.issue("ufail3", "bfail3", true, RUN), Err(Error::Unavailable(_))));
         assert!(external::tests::audited("first/creds/r").iter().any(|e| e.outcome == Outcome::Failure && e.details["error"] == "unavailable"));
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(f.revoked.lock().unwrap().len(), before, "nothing was made, nothing to revoke");
@@ -546,8 +558,8 @@ pub(crate) mod tests {
         let f = fake(&[("shared/creds/same", &[("token", Some("same-lease-value-8a7b"))]), ("shared/creds/known", &[("token", Some("known-before-8a7b"))])]);
         f.same.store(true, Ordering::SeqCst);
         let rc = RunCredentials::new(f.clone(), parse("shared/creds/same SAME_TOKEN=token").unwrap());
-        let (_, l1) = rc.issue("usame5", "bsame5", true).unwrap();
-        let (_, l2) = rc.issue("usame5", "bsame5", true).unwrap();
+        let (_, l1) = rc.issue("usame5", "bsame5", true, RUN).unwrap();
+        let (_, l2) = rc.issue("usame5", "bsame5", true, RUN).unwrap();
         drop(l1);
         wait_for(|| f.revoked.lock().unwrap().len() == 1);
         assert_eq!(redact::text("same-lease-value-8a7b"), redact::MARK, "the other run's lease still has it");
@@ -557,7 +569,7 @@ pub(crate) mod tests {
 
         redact::register("known-before-8a7b");
         let rc = RunCredentials::new(f.clone(), parse("shared/creds/known KNOWN_TOKEN=token").unwrap());
-        drop(rc.issue("usame5", "bsame5", true).unwrap().1);
+        drop(rc.issue("usame5", "bsame5", true, RUN).unwrap().1);
         wait_for(|| f.revoked.lock().unwrap().len() == 3);
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(redact::text("known-before-8a7b"), redact::MARK, "botd knew it before the lease: revoking doesn't forget it");
@@ -578,7 +590,7 @@ pub(crate) mod tests {
         let f = fake(&[("stuck/creds/r", &[("token", Some("stuck-run-token-31"))])]);
         let rc = RunCredentials::new(f.clone(), parse("stuck/creds/r STUCK_TOKEN=token").unwrap());
         f.revoke_down.store(true, Ordering::SeqCst);
-        let (_, l) = rc.issue("ustuck4", "bstuck4", true).unwrap();
+        let (_, l) = rc.issue("ustuck4", "bstuck4", true, RUN).unwrap();
         drop(l);
         wait_for(|| external::tests::audited("stuck/creds/r").iter().any(|e| e.action == "secret.lease_revoked"));
         let ev: Vec<_> = external::tests::audited("stuck/creds/r").into_iter().filter(|e| e.action == "secret.lease_revoked").collect();

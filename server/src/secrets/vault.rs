@@ -189,6 +189,10 @@ impl Config {
     }
 }
 
+/// How much longer than a run the token that makes its leases must live: the run's
+/// end, its harness's exit and the revoke all come after the timeout.
+const TOKEN_MARGIN: Duration = Duration::from_secs(300);
+
 struct Token {
     value: Zeroizing<String>,
     /// When to log in again (AppRole, Kubernetes, JWT), before the lease runs out.
@@ -372,31 +376,88 @@ impl Inner {
     }
 
     /// GETs `path`; when Vault refuses the token, gets a new one and asks once more.
-    async fn get(&self, path: &str) -> Result<(reqwest::StatusCode, Option<Value>), Error> {
+    async fn get(&self, path: &str) -> Result<Option<Value>, Error> {
         for fresh in [false, true] {
             let token = self.token(fresh).await?;
-            let res = self.request(reqwest::Method::GET, path).header("X-Vault-Token", token.as_str()).send().await.map_err(|e| unavailable(path, e))?;
-            let status = res.status();
-            if status == reqwest::StatusCode::FORBIDDEN && !fresh {
-                continue;
+            if let Some(v) = self.get_with(path, &token, fresh).await? {
+                return Ok(v);
             }
-            if status == reqwest::StatusCode::NOT_FOUND {
-                return Ok((status, None));
-            }
-            if !status.is_success() {
-                return Err(Error::Unavailable(format!("Vault answered {status} for {path}")));
-            }
-            let body = Zeroizing::new(res.bytes().await.map_err(|e| unavailable(path, e))?.to_vec());
-            let v: Value = serde_json::from_slice(&body).map_err(|e| unavailable(path, e))?;
-            return Ok((status, Some(v)));
         }
         unreachable!("the second pass returns")
     }
 
+    /// GETs `path` with `token`: the answer (None for 404), or None if Vault refused the
+    /// token and `last` is false.
+    async fn get_with(&self, path: &str, token: &str, last: bool) -> Result<Option<Option<Value>>, Error> {
+        let res = self.request(reqwest::Method::GET, path).header("X-Vault-Token", token).send().await.map_err(|e| unavailable(path, e))?;
+        let status = res.status();
+        if status == reqwest::StatusCode::FORBIDDEN && !last {
+            return Ok(None);
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Some(None));
+        }
+        if !status.is_success() {
+            return Err(Error::Unavailable(format!("Vault answered {status} for {path}")));
+        }
+        let body = Zeroizing::new(res.bytes().await.map_err(|e| unavailable(path, e))?.to_vec());
+        let v: Value = serde_json::from_slice(&body).map_err(|e| unavailable(path, e))?;
+        Ok(Some(Some(v)))
+    }
+
+    /// A token that lives at least `run_for` and a margin more, so the leases it makes do:
+    /// Vault revokes a token's leases with it, whatever their own TTL. A token that ends
+    /// sooner is renewed (`renew-self`), else, when botd logs in, replaced by a new login;
+    /// failing both, an error, so the run is refused rather than losing its credentials.
+    async fn token_for(&self, run_for: Duration, fresh: bool) -> Result<Zeroizing<String>, Error> {
+        let want = run_for.as_secs() + TOKEN_MARGIN.as_secs();
+        let logs_in = !matches!(self.cfg.auth, Auth::Token { .. });
+        let mut fresh = fresh;
+        loop {
+            let token = self.token(fresh).await?;
+            let (ttl, renewable) = self.token_life(&token, "auth/token/lookup-self", reqwest::Method::GET, None).await?;
+            // 0: a token that never ends, such as a root token.
+            if ttl == 0 || ttl >= want {
+                return Ok(token);
+            }
+            if renewable {
+                let (renewed, _) = self.token_life(&token, "auth/token/renew-self", reqwest::Method::POST, Some(want)).await?;
+                if renewed >= want {
+                    return Ok(token);
+                }
+            }
+            if fresh || !logs_in {
+                return Err(Error::Unavailable(format!(
+                    "Vault: botd's token ends in {ttl} s and can't be renewed past that, but a run may last {} s (RUN_TIMEOUT_MINUTES), and Vault would revoke its leases with the token; raise the token's TTL or max TTL",
+                    run_for.as_secs()
+                )));
+            }
+            fresh = true;
+        }
+    }
+
+    /// Looks up or renews `token` itself: its remaining TTL in seconds and whether it is
+    /// renewable. Sent where the token was made (the auth namespace).
+    async fn token_life(&self, token: &str, path: &str, method: reqwest::Method, increment: Option<u64>) -> Result<(u64, bool), Error> {
+        let mut r = self.request_in(self.auth_namespace(), method, path).header("X-Vault-Token", token);
+        if let Some(n) = increment {
+            r = r.json(&json!({ "increment": n }));
+        }
+        let res = r.send().await.map_err(|e| unavailable(path, e))?;
+        let status = res.status();
+        if !status.is_success() {
+            return Err(Error::Unavailable(format!("Vault answered {status} for {path}; botd's policy needs Vault's default policy, which allows it")));
+        }
+        let v: Value = res.json().await.map_err(|e| unavailable(path, e))?;
+        Ok(match increment {
+            None => (v["data"]["ttl"].as_u64().unwrap_or(0), v["data"]["renewable"].as_bool().unwrap_or(false)),
+            Some(_) => (v["auth"]["lease_duration"].as_u64().unwrap_or(0), v["auth"]["renewable"].as_bool().unwrap_or(false)),
+        })
+    }
+
     async fn read(&self, scope: Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error> {
         let path = self.secret_path("data", &scope, name);
-        let (_, body) = self.get(&path).await?;
-        let Some(body) = body else { return Ok(None) };
+        let Some(body) = self.get(&path).await? else { return Ok(None) };
         let data = &body["data"]["data"];
         if data.is_null() && body["data"]["metadata"].is_object() {
             // A deleted version: no value until a new one is written.
@@ -415,15 +476,22 @@ impl Inner {
 
     async fn list(&self, scope: Scope) -> Result<Vec<String>, Error> {
         let path = format!("{}/metadata/{}/{}/", self.cfg.mount, self.cfg.prefix, scope.folder('/'));
-        let (_, body) = self.get(&format!("{path}?list=true")).await?;
-        let Some(body) = body else { return Ok(Vec::new()) };
+        let Some(body) = self.get(&format!("{path}?list=true")).await? else { return Ok(Vec::new()) };
         let keys = body["data"]["keys"].as_array().ok_or_else(|| Error::Unavailable(format!("Vault: listing {path} gave no keys")))?;
         Ok(keys.iter().filter_map(Value::as_str).filter(|k| !k.ends_with('/')).map(String::from).collect())
     }
 
-    /// A new lease from a dynamic secrets engine: `GET <path>` (ADR 0185).
-    async fn issue(&self, path: &str, fields: &[String]) -> Result<Lease, Error> {
-        let (_, body) = self.get(path).await?;
+    /// A new lease from a dynamic secrets engine: `GET <path>` (ADR 0185), made with a
+    /// token that outlives the run (`token_for`).
+    async fn issue(&self, path: &str, fields: &[String], run_for: Duration) -> Result<Lease, Error> {
+        let mut body = None;
+        for fresh in [false, true] {
+            let token = self.token_for(run_for, fresh).await?;
+            if let Some(b) = self.get_with(path, &token, fresh).await? {
+                body = b;
+                break;
+            }
+        }
         let body = body.ok_or_else(|| Error::Unavailable(format!("Vault: nothing at {path}; is the secrets engine mounted there, with that role?")))?;
         let Some(id) = body["lease_id"].as_str().filter(|s| !s.is_empty()) else {
             return Err(Error::Unavailable(format!("Vault: {path} gave no lease; VAULT_RUN_CREDENTIALS is for dynamic secrets, keep static ones in the bots folder")));
@@ -472,9 +540,9 @@ impl Issuer for Vault {
         "vault"
     }
 
-    fn issue(&self, path: &str, fields: &[String]) -> Result<Lease, Error> {
+    fn issue(&self, path: &str, fields: &[String], run_for: Duration) -> Result<Lease, Error> {
         let (path, fields) = (path.to_string(), fields.to_vec());
-        self.run(move |i| async move { i.issue(&path, &fields).await })
+        self.run(move |i| async move { i.issue(&path, &fields, run_for).await })
     }
 
     fn revoke(&self, lease_id: &str) -> Result<(), Error> {
@@ -554,6 +622,12 @@ pub(crate) mod tests {
         creds: Mutex<HashMap<String, Value>>,
         issued: AtomicUsize,
         pub revoked: Mutex<Vec<String>>,
+        /// token → (TTL left in seconds, renewable); a token not here never ends.
+        ttls: Mutex<HashMap<String, (u64, bool)>>,
+        /// The most `renew-self` gives (0: no limit), as a token's max TTL.
+        max_ttl: AtomicUsize,
+        /// (token, TTL asked for) of each `renew-self`.
+        renewals: Mutex<Vec<(String, u64)>>,
     }
 
     pub(crate) type F = Arc<Fake>;
@@ -641,7 +715,37 @@ pub(crate) mod tests {
         let n = f.logins.fetch_add(1, Ordering::SeqCst);
         let token = format!("hvs.{method}-{n}");
         f.tokens.lock().unwrap().push(token.clone());
-        (StatusCode::OK, Json(json!({ "auth": { "client_token": token, "lease_duration": f.lease.load(Ordering::SeqCst), "renewable": true } })))
+        let lease = f.lease.load(Ordering::SeqCst);
+        f.ttls.lock().unwrap().insert(token.clone(), (lease as u64, true));
+        (StatusCode::OK, Json(json!({ "auth": { "client_token": token, "lease_duration": lease, "renewable": true } })))
+    }
+
+    fn token_of(h: &HeaderMap) -> String {
+        h.get("x-vault-token").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string()
+    }
+
+    async fn lookup_self(State(f): State<F>, h: HeaderMap) -> (StatusCode, Json<Value>) {
+        if let Err(e) = check(&f, &h) {
+            return e;
+        }
+        let (ttl, renewable) = f.ttls.lock().unwrap().get(&token_of(&h)).copied().unwrap_or((0, false));
+        (StatusCode::OK, Json(json!({ "data": { "ttl": ttl, "renewable": renewable } })))
+    }
+
+    async fn renew_self(State(f): State<F>, h: HeaderMap, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+        if let Err(e) = check(&f, &h) {
+            return e;
+        }
+        let token = token_of(&h);
+        let asked = body["increment"].as_u64().unwrap_or(0);
+        f.renewals.lock().unwrap().push((token.clone(), asked));
+        let mut ttls = f.ttls.lock().unwrap();
+        let Some(t) = ttls.get_mut(&token).filter(|t| t.1) else {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "errors": ["lease is not renewable"] })));
+        };
+        let max = f.max_ttl.load(Ordering::SeqCst) as u64;
+        t.0 = if max > 0 { asked.min(max) } else { asked };
+        (StatusCode::OK, Json(json!({ "auth": { "client_token": token, "lease_duration": t.0, "renewable": true } })))
     }
 
     /// A dynamic secrets engine: each GET makes a new lease, its values numbered.
@@ -674,6 +778,8 @@ pub(crate) mod tests {
             .route("/v1/secret/data/{*rest}", axum::routing::get(data))
             .route("/v1/secret/metadata/{*rest}", axum::routing::get(metadata))
             .route("/v1/auth/{mount}/login", axum::routing::post(login))
+            .route("/v1/auth/token/lookup-self", axum::routing::get(lookup_self))
+            .route("/v1/auth/token/renew-self", axum::routing::post(renew_self))
             .route("/v1/{engine}/creds/{role}", axum::routing::get(creds))
             .route("/v1/sys/leases/revoke/{*lease}", axum::routing::put(revoke))
             .with_state(Arc::clone(&f));
@@ -762,7 +868,7 @@ pub(crate) mod tests {
         let rc = x.run_credentials().expect("set");
         assert!(x.describe().contains("short-lived credentials for each run from aws/creds/bots, database/creds/u-{owner}"), "{}", x.describe());
 
-        let (env, leases) = rc.issue("ulv1", "blv1", true).unwrap();
+        let (env, leases) = rc.issue("ulv1", "blv1", true, super::super::leases::tests::RUN).unwrap();
         let mut env: Vec<_> = env.into_iter().map(|(k, v)| (k, v.expose().to_string())).collect();
         env.sort();
         let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
@@ -773,7 +879,7 @@ pub(crate) mod tests {
         assert_eq!(*f.revoked.lock().unwrap(), ["aws/creds/bots/l0", "database/creds/u-ulv1/l1"]);
 
         // Vault refuses botd's token: the revoke fails and is audited, and the lease ends at its TTL.
-        let (_, l) = rc.issue("ulv1", "blv1", false).unwrap();
+        let (_, l) = rc.issue("ulv1", "blv1", false, super::super::leases::tests::RUN).unwrap();
         assert_eq!(l.len(), 1, "a run for someone else: the shared role only");
         f.tokens.lock().unwrap().clear();
         drop(l);
@@ -785,7 +891,7 @@ pub(crate) mod tests {
         for (path, err) in [("secret/data/superbot/bots/STATIC_TOKEN", "gave no lease"), ("nope/creds/r", "nothing at nope/creds/r")] {
             let pairs = [("SECRETS_BACKEND", "vault"), ("VAULT_ADDR", url.as_str()), ("VAULT_TOKEN", "hvs.leases"), ("VAULT_RUN_CREDENTIALS", &format!("{path} X_TOKEN=value"))];
             let x = external::from_env(&settings(&pairs), &EnvStore::fixed(&pairs)).unwrap().unwrap();
-            let e = x.run_credentials().unwrap().issue("ulv1", "blv1", true).err().unwrap().to_string();
+            let e = x.run_credentials().unwrap().issue("ulv1", "blv1", true, super::super::leases::tests::RUN).err().unwrap().to_string();
             assert!(e.contains(err), "{path}: {e}");
         }
         assert!(external::from_env(&settings(&[pairs[0], pairs[1], pairs[2], ("VAULT_RUN_CREDENTIALS", "aws/creds/bots PATH=x")]), &EnvStore::fixed(&pairs)).err().unwrap().contains("VAULT_RUN_CREDENTIALS: PATH"));
@@ -799,6 +905,45 @@ pub(crate) mod tests {
         for v in ["AKIAvault-2", "vault-aws-secret-4c3d-2"] {
             redact::forget(v);
         }
+    }
+
+    #[test]
+    fn a_runs_leases_are_made_with_a_token_that_outlives_the_run() {
+        use super::super::leases::tests::RUN;
+        let (url, f) = stand_in();
+        f.creds.lock().unwrap().insert("aws/creds/outlive".into(), json!({ "access_key": "AKIAoutlive" }));
+        let pairs = [("SECRETS_BACKEND", "vault"), ("VAULT_ADDR", url.as_str()), ("VAULT_AUTH", "approle"), ("VAULT_ROLE_ID", "role-1"), ("VAULT_SECRET_ID", "secret-id-1"), ("VAULT_RUN_CREDENTIALS", "aws/creds/outlive OUTLIVE_KEY_ID=access_key")];
+        let x = external::from_env(&settings(&pairs), &EnvStore::fixed(&pairs)).unwrap().unwrap();
+        let rc = x.run_credentials().unwrap();
+        let want = RUN.as_secs() + TOKEN_MARGIN.as_secs();
+
+        // The login's hour is shorter than the run and the margin: renewed to cover both.
+        let (_, l) = rc.issue("uout1", "bout1", false, RUN).unwrap();
+        assert_eq!(*f.renewals.lock().unwrap(), [("hvs.approle-0".to_string(), want)]);
+        drop(l);
+        // A short run needs no renewal.
+        drop(rc.issue("uout1", "bout1", false, Duration::from_secs(60)).unwrap().1);
+        assert_eq!(f.renewals.lock().unwrap().len(), 1);
+
+        // The token's max TTL is too short: a new login is tried, then the run is refused
+        // before any lease is made.
+        f.max_ttl.store(1000, Ordering::SeqCst);
+        f.ttls.lock().unwrap().insert("hvs.approle-0".into(), (900, true));
+        let issued = f.issued.load(Ordering::SeqCst);
+        let e = rc.issue("uout1", "bout1", false, RUN).err().unwrap().to_string();
+        assert!(e.contains("RUN_TIMEOUT_MINUTES") && e.contains("max TTL"), "{e}");
+        assert_eq!(f.logins.load(Ordering::SeqCst), 2, "logged in again for a token with longer to live");
+        assert_eq!(f.issued.load(Ordering::SeqCst), issued, "no lease that would end with the token");
+
+        // A static token that ends too soon and can't be renewed: refused, no login.
+        f.tokens.lock().unwrap().push("hvs.static-short".into());
+        f.ttls.lock().unwrap().insert("hvs.static-short".into(), (600, false));
+        let pairs = [pairs[0], pairs[1], ("VAULT_TOKEN", "hvs.static-short"), pairs[5]];
+        let x = external::from_env(&settings(&pairs), &EnvStore::fixed(&pairs)).unwrap().unwrap();
+        let e = x.run_credentials().unwrap().issue("uout1", "bout1", false, RUN).err().unwrap().to_string();
+        assert!(e.contains("ends in 600 s"), "{e}");
+        assert_eq!(f.logins.load(Ordering::SeqCst), 2);
+        super::super::leases::tests::wait_for(|| f.revoked.lock().unwrap().len() == 2);
     }
 
     #[test]

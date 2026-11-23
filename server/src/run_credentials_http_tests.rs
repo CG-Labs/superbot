@@ -94,6 +94,7 @@ async fn a_run_gets_a_new_lease_revoked_when_it_ends_and_none_refuses_it() {
     assert_eq!(run(port, &app, &ada, &bot.id).await, "lease=[redacted] session=none");
     wait_for(|| f.revoked.lock().unwrap().len() == 2);
     assert_eq!(f.issued.load(Ordering::SeqCst), 2, "a new lease for each run");
+    assert_eq!(*f.run_for.lock().unwrap(), [app.cfg.run_timeout; 2], "asked to outlast the longest run");
 
     f.down.store(true, Ordering::SeqCst);
     let reply = run(port, &app, &ada, &bot.id).await;
