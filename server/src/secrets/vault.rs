@@ -548,7 +548,7 @@ impl Issuer for Vault {
         "vault"
     }
 
-    fn issue(&self, path: &str, fields: &[String], run_for: Duration) -> Result<Lease, Error> {
+    fn issue(&self, path: &str, fields: &[String], run_for: Duration, _bot_id: &str) -> Result<Lease, Error> {
         let (path, fields) = (path.to_string(), fields.to_vec());
         self.run(move |i| async move { i.issue(&path, &fields, run_for).await })
     }
