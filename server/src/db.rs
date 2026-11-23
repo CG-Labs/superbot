@@ -10581,6 +10581,23 @@ impl Db {
             .map_err(|e| e.to_string())
     }
 
+    /// Ends `user_id`'s pin if it is still one kept from a team (ADR 0171) and they have
+    /// no machine that isn't destroyed and no machine backup not yet deleted, all in one
+    /// statement (ADR 0205). Ok(Some): the pin that ended.
+    pub fn end_kept_pin(&self, user_id: &str) -> Result<Option<ResidencyPin>, String> {
+        self.c()
+            .query_row(
+                "DELETE FROM residency_pins WHERE subject_type = 'user' AND subject_id = ?1 AND kept_from IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM machines WHERE user_id = ?1 AND state <> 'destroyed')
+                   AND NOT EXISTS (SELECT 1 FROM machine_backups WHERE user_id = ?1 AND state <> 'deleted')
+                 RETURNING *",
+                [user_id],
+                residency_pin_row,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
     /// Deletes the team, its invites and its residency pin (ADR 0129). Its members must
     /// have left first.
     pub fn delete_team(&self, id: &str) -> bool {
@@ -11263,6 +11280,54 @@ mod tests {
         // No team pin: nothing to keep.
         db.unpin_residency(PinOn::Team, &t.id).unwrap();
         assert!(matches!(db.remove_team_member_keeping_pin(&t.id, &ada.id, true, true), Ok((true, None))));
+    }
+
+    #[test]
+    fn a_kept_pin_ends_only_once_no_machine_or_backup_of_theirs_is_left() {
+        let db = Db::open(&temp_path("pin-kept-end").join("app.sqlite")).unwrap();
+        let t = db.create_team("Acme", None);
+        let [ada, bea, cy] = ["ada", "bea", "cy"].map(|n| db.create_user(None, Some(&format!("{n}@example.com")), n, Role::Member).unwrap());
+        for u in [&ada, &bea, &cy] {
+            assert!(db.add_team_member(&t.id, &u.id, "member", None));
+        }
+        db.pin_residency(PinOn::Team, &t.id, "gb-lon", "MSA-7", None).unwrap();
+        let new = NewMachine { user_id: &bea.id, provider: "fake", label_prefix: "superbot", tier: "starter", plan: "g6-standard-1", region: "gb-lon", created_by: None };
+        let mut m = db.add_machine(&new).unwrap();
+        for u in [&ada, &bea, &cy] {
+            assert!(db.remove_team_member_keeping_pin(&t.id, &u.id, false, true).unwrap().1.is_some());
+        }
+
+        // A machine that isn't destroyed holds it, in any state.
+        assert!(matches!(db.end_kept_pin(&bea.id), Ok(None)));
+        let from = m.state;
+        m.state = MachineState::Destroying;
+        assert!(db.save_machine(&m, from));
+        assert!(matches!(db.end_kept_pin(&bea.id), Ok(None)));
+        // So does a backup not yet deleted, a failed one too.
+        let b = NewMachineBackup { id: "b1", machine: &m, object_key: "t/b1.incus", store_region: None, encrypted: false, created_by: None };
+        db.machine_backup_start(&b).unwrap();
+        assert!(db.machine_backup_end("b1", None, Some("botd stopped")));
+        m.state = MachineState::Destroyed;
+        assert!(db.save_machine(&m, MachineState::Destroying));
+        assert!(matches!(db.end_kept_pin(&bea.id), Ok(None)));
+        assert!(db.residency_pin(PinOn::User, &bea.id).is_some());
+        // Once it's deleted, the kept pin ends, and the region it set stays.
+        assert!(db.machine_backup_deleted("b1"));
+        let ended = db.end_kept_pin(&bea.id).unwrap().unwrap();
+        assert_eq!((ended.region.as_str(), ended.reference.as_str(), ended.kept_from.as_deref()), ("gb-lon", "MSA-7", Some(t.id.as_str())));
+        assert!(db.residency_pin(PinOn::User, &bea.id).is_none());
+        assert_eq!(db.user(&bea.id).unwrap().region.as_deref(), Some("gb-lon"));
+        assert!(matches!(db.end_kept_pin(&bea.id), Ok(None)), "once");
+
+        // A renewed pin isn't kept any more, and stays; so does a team's.
+        db.pin_residency(PinOn::User, &ada.id, "gb-lon", "DPA-ada", None).unwrap();
+        assert!(matches!(db.end_kept_pin(&ada.id), Ok(None)));
+        assert_eq!(db.residency_pin(PinOn::User, &ada.id).unwrap().reference, "DPA-ada");
+        db.pin_residency(PinOn::Team, &t.id, "gb-lon", "MSA-7", None).unwrap();
+        assert!(matches!(db.end_kept_pin(&t.id), Ok(None)));
+        assert!(db.residency_pin(PinOn::Team, &t.id).is_some());
+        // Someone who never had data ends at once.
+        assert!(db.end_kept_pin(&cy.id).unwrap().is_some());
     }
 
     #[test]
