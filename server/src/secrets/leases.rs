@@ -242,6 +242,12 @@ impl RunCredentials {
         self.wanted.iter().flat_map(|w| w.names.iter().map(|(n, _)| n.clone())).collect()
     }
 
+    /// The variables `issue` sets or clears for a run with the same `owner` and `owner_keys`.
+    pub fn names_for(&self, owner: &str, owner_keys: bool) -> Vec<String> {
+        let owner_ok = owner_keys && Scope::user(owner).is_some();
+        self.wanted.iter().filter(|w| owner_ok || !w.per_owner()).flat_map(|w| w.names.iter().map(|(n, _)| n.clone())).collect()
+    }
+
     pub fn paths(&self) -> Vec<&str> {
         self.wanted.iter().map(|w| w.path.as_str()).collect()
     }
@@ -321,14 +327,23 @@ fn keep_from_inheritance(rc: &RunCredentials) {
 /// The short-lived credentials for one run, from the backend botd runs with; none if
 /// `VAULT_RUN_CREDENTIALS` isn't set. Hold the `Leases` until the run ends.
 pub fn for_run(owner: &str, bot_id: &str, owner_keys: bool) -> Result<(Vec<(String, Secret)>, Leases), Error> {
-    #[cfg(test)]
-    if let Some(rc) = tests::for_owner(owner) {
-        return rc.issue(owner, bot_id, owner_keys);
-    }
-    match ACTIVE.get() {
+    match active(owner) {
         Some(rc) => rc.issue(owner, bot_id, owner_keys),
         None => Ok((Vec::new(), Leases::none())),
     }
+}
+
+/// The variables `for_run` will set or clear for such a run, before any lease is made.
+pub fn names_for_run(owner: &str, owner_keys: bool) -> Vec<String> {
+    active(owner).map(|rc| rc.names_for(owner, owner_keys)).unwrap_or_default()
+}
+
+fn active(#[allow(unused_variables)] owner: &str) -> Option<Arc<RunCredentials>> {
+    #[cfg(test)]
+    if let Some(rc) = tests::for_owner(owner) {
+        return Some(rc);
+    }
+    ACTIVE.get().cloned()
 }
 
 #[cfg(test)]
@@ -499,6 +514,10 @@ pub(crate) mod tests {
         assert_eq!(e.len(), 1, "an id that can't be part of a path gets none of its own");
         let (e, _) = rc.issue("uown2", "bown2", true).unwrap();
         assert_eq!(e.len(), 2);
+        assert_eq!(rc.names_for("uown2", false), ["SHARED_TOKEN"], "known before any lease, for the plan's key check");
+        assert_eq!(rc.names_for("U-OWN2", true), ["SHARED_TOKEN"]);
+        assert_eq!(rc.names_for("uown2", true), ["SHARED_TOKEN", "OWN_PASSWORD"]);
+        assert!(names_for_run("uown2", true).is_empty());
         let (e, l) = for_run("uown2", "bown2", true).unwrap();
         assert!(e.is_empty() && l.is_empty(), "nothing set: nothing asked for");
     }

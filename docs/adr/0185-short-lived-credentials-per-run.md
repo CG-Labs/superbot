@@ -44,6 +44,8 @@ Leases are made last, after any wait for a slot, so a queued run never starts wi
 
 Like the rest of the external store: if a lease can't be made (Vault down, policy refuses, no engine at the path, an answer that isn't a lease, a missing field), the run is refused with `secrets_unavailable` and the Bot says the secret store can't be read. Leases already made for that run are revoked.
 
+A plan's model provider key (a tier endpoint's `keySecret`, ADR 0077) may be one of these names. The plan's check that its provider has a key, made before any lease, counts a name the run's leases will give; once they are made, a provider key whose field came back empty refuses the run the same way, rather than starting it without a key or with a saved one under it.
+
 If a lease can't be revoked (Vault down, botd stopped mid-run), it lasts until its TTL. So **the Vault role's TTL is the longest a credential can outlive its run**: set it a little over the longest run (`RUN_TIMEOUT_MINUTES`, 60 by default), not a day. Renewing leases for very long runs is left out; a role with a long `max_ttl` and a short `default_ttl` isn't needed while botd revokes at run end.
 
 ### Audit and redaction

@@ -196,6 +196,7 @@ VAULT_RUN_CREDENTIALS="aws/creds/bots AWS_ACCESS_KEY_ID=access_key AWS_SECRET_AC
 - **Order**: these win over static secrets of the same name, and runs never inherit these names from botd's own environment. A field that is null or empty (`security_token` for an IAM user) leaves the name unset in the run, even if a static secret has it; a field that isn't in the answer refuses the run, as it is probably a typo.
 - **TTL**: botd revokes each lease when its run ends. If it can't (Vault down, botd stopped mid-run), the lease ends at the role's TTL. Set `default_ttl` a little over your longest run (`RUN_TIMEOUT_MINUTES`, 60 by default), not a day, and no shorter, or a credential can lapse mid-run.
 - **Fails closed**: if a lease can't be made, the run doesn't start (`bot.run_refused`, reason `secrets_unavailable`) and leases already made for it are revoked.
+- **Model provider keys**: a plan's provider key (`keySecret` in the tiers file) can come from a lease alone. If the lease gives it empty, the run is refused as above.
 - **Audit**: `botctl audit --action 'secret.lease_*'` shows each lease made (`secret.lease_issued`, with path, lease id, TTL and the variable names) and revoked (`secret.lease_revoked`), never a value. For a lease botd couldn't revoke, `vault lease revoke <lease id>` ends it now.
 - **Redaction**: the values are redacted from everything botd saves and shows while a lease that has them lives, and forgotten once Vault has revoked the last one (unless botd knew the value already).
 
