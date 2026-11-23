@@ -510,20 +510,24 @@ pub async fn login(Extension(a): Extension<Arc<Auth>>, Extension(source): Extens
 
 /// Ends the current session. Always clears the cookie.
 /// Ends the caller's session. One a native SAML IdP vouched for, in the browser, also gets
-/// `logoutUrl`: the signed LogoutRequest that ends the IdP's session (ADR 0137).
+/// `logoutUrl`: the signed LogoutRequest that ends the IdP's session (ADR 0137). Without a
+/// browser, botd sends it to the IdP over SOAP itself, when the IdP takes that (ADR 0208).
 pub async fn logout(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> Response {
     let mut logout_url = None;
     if let Some(s) = &c.session
         && app.db.revoke_session(&s.id, &s.user_id, "logout")
     {
-        let slo = if s.kind == "cookie" && s.method == "sso" { crate::sso::logout_request(&a, &app, s).await } else { None };
-        let details = slo.as_ref().map(|(_, id)| json!({ "provider": s.idp_provider, "slo": id }));
+        let slo = if s.method == "sso" { crate::sso::logout_request(&a, &app, s).await } else { None };
+        let details = slo.as_ref().map(|l| json!({ "provider": s.idp_provider, "slo": l.id(), "sloBinding": l.binding() }));
         let mut e = by.event("auth.logout").target("session", &s.id);
         if let Some(d) = details {
             e = e.details(d);
         }
         app.db.record(&e);
-        logout_url = slo.map(|(url, _)| url);
+        logout_url = slo.and_then(|l| match l {
+            crate::sso::IdpLogout::Redirect { url, .. } => Some(url),
+            crate::sso::IdpLogout::BackChannel { .. } => None,
+        });
     }
     let mut body = json!({ "ok": true });
     if let Some(u) = logout_url {

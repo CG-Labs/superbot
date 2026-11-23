@@ -329,6 +329,11 @@ impl Sso {
         format!("{}/api/auth/sso/{id}/slo", self.public_url)
     }
 
+    /// Native SAML: where the IdP sends logout messages over SOAP, server to server (ADR 0208).
+    pub fn slo_soap_url(&self, id: &str) -> String {
+        format!("{}/api/auth/sso/{id}/slo/soap", self.public_url)
+    }
+
     /// Loads IdP metadata imported with botctl, at startup.
     pub fn load_saved(&self, db: &db::Db) {
         for p in self.providers.iter().filter(|p| matches!(&p.kind, Kind::SamlSp { source: IdpSource::Saved, .. })) {
@@ -1293,9 +1298,9 @@ pub async fn saml_metadata(Extension(a): Extension<Arc<Auth>>, Path(id): Path<St
         (Encryption::Off, _) | (_, None) => vec![],
         (_, Some(app)) => published_keys(app, p, KeyUse::Encryption).map_err(|e| crate::obs::log::log_warn!("SSO {id}: no SP encryption key for the metadata: {e}")).unwrap_or_default(),
     };
-    let (acs, slo) = (a.sso.acs_url(&id), a.sso.slo_url(&id));
+    let (acs, slo, slo_soap) = (a.sso.acs_url(&id), a.sso.slo_url(&id), a.sso.slo_soap_url(&id));
     let signing_certs: Vec<&str> = keys.iter().flatten().map(|k| k.cert.as_str()).collect();
-    let signing = keys.as_ref().map(|_| SpSigning { certs: &signing_certs, slo: &slo, sign_requests: *sign_requests });
+    let signing = keys.as_ref().map(|_| SpSigning { certs: &signing_certs, slo: &slo, slo_soap: &slo_soap, sign_requests: *sign_requests });
     let enc_certs: Vec<&str> = enc.iter().map(|k| k.cert.as_str()).collect();
     let md = saml_sp::sp_metadata(&Sp { entity_id: sp_entity_id, acs: &acs }, signing.as_ref(), &enc_certs);
     ([(header::CONTENT_TYPE, "application/samlmetadata+xml")], md).into_response()
@@ -1344,10 +1349,35 @@ fn decrypt_keys(app: &AppState, p: &Provider) -> Result<(Vec<(Option<saml_keys::
     Ok((h.decrypting().into_iter().map(|(s, k)| (Some(s), k)).collect(), Some(h)))
 }
 
-/// Signing out of a session a native SAML IdP vouched for: a signed LogoutRequest to the
-/// IdP's SLO URL, for the browser to follow, and its ID. The session is revoked already; this
-/// ends the person's IdP session too. None when the IdP has no SLO URL or we can't sign.
-pub async fn logout_request(a: &Auth, app: &AppState, s: &db::Session) -> Option<(String, String)> {
+/// How signing out of SuperBot also signs the person out of their native SAML IdP.
+pub enum IdpLogout {
+    /// The browser follows `url`, a signed LogoutRequest over HTTP-Redirect (ADR 0137).
+    Redirect { url: String, id: String },
+    /// botd sent the LogoutRequest itself, over SOAP (ADR 0208); the answer is audited when it comes.
+    BackChannel { id: String },
+}
+
+impl IdpLogout {
+    pub fn id(&self) -> &str {
+        match self {
+            IdpLogout::Redirect { id, .. } | IdpLogout::BackChannel { id } => id,
+        }
+    }
+
+    pub fn binding(&self) -> &'static str {
+        match self {
+            IdpLogout::Redirect { .. } => "redirect",
+            IdpLogout::BackChannel { .. } => "soap",
+        }
+    }
+}
+
+/// Signing out of a session a native SAML IdP vouched for. The session is revoked already;
+/// this ends the person's IdP session too. A browser session goes to the IdP's SLO URL with a
+/// signed LogoutRequest. Without a browser to send (the phone app, `botctl`), or an IdP with
+/// only a SOAP SLO URL, botd sends it over SOAP itself, in the background (ADR 0208). None when
+/// the IdP has neither, or we can't sign.
+pub async fn logout_request(a: &Arc<Auth>, app: &AppState, s: &db::Session) -> Option<IdpLogout> {
     let p = a.sso.provider(s.idp_provider.as_deref()?)?;
     let Kind::SamlSp { sp_entity_id, .. } = &p.kind else { return None };
     let login = app.db.saml_session(&s.id)?;
@@ -1356,7 +1386,20 @@ pub async fn logout_request(a: &Auth, app: &AppState, s: &db::Session) -> Option
         Some(m) => m,
         None => tokio::time::timeout(Duration::from_secs(3), idp_metadata(a, p)).await.ok()?.ok()?,
     };
-    let slo = idp.slo.clone()?;
+    let browser = s.kind == "cookie";
+    let slo = match (&idp.slo, &idp.slo_soap) {
+        (Some(slo), _) if browser => slo.clone(),
+        (_, Some(soap)) => {
+            let key = sp_key(app, p).map_err(|e| crate::obs::log::log_warn!("SSO {}: no back-channel logout: {e}", p.id)).ok()?;
+            let id = saml_sp::request_id();
+            let xml = saml_slo::logout_request(sp_entity_id, &id, soap, &login, db::now());
+            let signed = key.sign_enveloped(&xml, &id).map_err(|e| crate::obs::log::log_warn!("SSO {}: no back-channel logout: {e}", p.id)).ok()?;
+            let (a, provider, url, session, request) = (a.clone(), p.id.clone(), soap.clone(), s.id.clone(), id.clone());
+            tokio::spawn(async move { back_channel_logout(&a, &provider, &idp, &url, &session, &request, &signed).await });
+            return Some(IdpLogout::BackChannel { id });
+        }
+        _ => return None,
+    };
     let key = sp_key(app, p).map_err(|e| crate::obs::log::log_warn!("SSO {}: no single logout: {e}", p.id)).ok()?;
     let (id, at) = (saml_sp::request_id(), db::now());
     {
@@ -1369,13 +1412,75 @@ pub async fn logout_request(a: &Auth, app: &AppState, s: &db::Session) -> Option
     }
     let xml = saml_slo::logout_request(sp_entity_id, &id, &slo.location, &login, at);
     let url = saml_sp::with_redirect_query(&slo.location, &saml_sp::redirect_query("SAMLRequest", &xml, None, Some(&key)));
-    Some((url, id))
+    Some(IdpLogout::Redirect { url, id })
+}
+
+/// Posts our signed LogoutRequest `signed` (ID `request`) to the IdP's SOAP SLO URL and audits
+/// its answer as `auth.slo_response`, against the session that was signed out. Its body is read
+/// up to `MAX_RESPONSE`, and redirects aren't followed: the URL is the one the metadata names.
+async fn back_channel_logout(a: &Auth, provider: &str, idp: &saml_sp::IdpMetadata, url: &str, session: &str, request: &str, signed: &str) {
+    let sent = a
+        .sso
+        .http()
+        .post(url)
+        .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+        .header("SOAPAction", saml_slo::SOAP_ACTION)
+        .body(saml_slo::soap_envelope(signed))
+        .send()
+        .await;
+    let answer = match sent {
+        Err(e) => Err(Refused("unreachable", Some(crate::audit::clip(&e.without_url().to_string(), 128)))),
+        // SOAP 1.1 faults come with a 500, so the body is read either way.
+        Ok(res) => match capped_body(res, saml_sp::MAX_RESPONSE).await {
+            Some((code, body)) => saml_slo::receive_soap_response(&body, idp, request, db::now()).map_err(|r| if r.0 == "bad_message" && !code.is_success() { Refused("http_error", Some(code.as_u16().to_string())) } else { r }),
+            None => Err(Refused("bad_message", None)),
+        },
+    };
+    let (outcome, mut details) = match &answer {
+        Ok(status) => (if status.is_none() { Outcome::Success } else { Outcome::Failure }, json!({ "status": status.as_deref().unwrap_or("Success") })),
+        Err(Refused(reason, detail)) => {
+            crate::obs::log::log_warn!("SSO {provider}: the IdP's back-channel logout answer: {reason}");
+            (Outcome::Failure, json!({ "status": "none", "reason": reason, "detail": detail }))
+        }
+    };
+    if let Value::Object(d) = &mut details {
+        d.extend([("provider".into(), json!(provider)), ("idp".into(), json!("saml")), ("requestId".into(), json!(request)), ("binding".into(), json!("soap"))]);
+    }
+    let actor = Actor { idp: Some("saml".into()), idp_provider: Some(provider.into()), ..Actor::system("sso") };
+    a.record(Event::new(actor, "auth.slo_response").target("session", session).outcome(outcome).details(details));
+}
+
+/// A response's status and body, or None when it's over `max` bytes or not UTF-8.
+async fn capped_body(mut res: reqwest::Response, max: usize) -> Option<(StatusCode, String)> {
+    let code = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut body = Vec::new();
+    while let Some(chunk) = res.chunk().await.ok()? {
+        if body.len() + chunk.len() > max {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).ok().map(|b| (code, b))
 }
 
 /// Refused logout messages anyone can send: the ones before the IdP's signature was checked.
-const SLO_UNVOUCHED: [&str; 9] = ["not_ready", "no_slo", "no_sp_key", "bad_message", "wrapped", "unsigned", "bad_signature", "bad_algorithm", "weak_algorithm"];
+const SLO_UNVOUCHED: [&str; 10] = ["not_ready", "no_slo", "no_sp_key", "bad_message", "must_understand", "wrapped", "unsigned", "bad_signature", "bad_algorithm", "weak_algorithm"];
 
 fn slo_failed(a: &Auth, source: &Source, provider: &str, reason: &str, extra: Value) -> Response {
+    slo_refused(a, source, provider, reason, extra);
+    let body = "SuperBot couldn't use that logout message. Sign out of SuperBot itself to end your session there.";
+    no_store((StatusCode::BAD_REQUEST, body).into_response())
+}
+
+/// The same over SOAP (ADR 0208): a SOAP 1.1 fault, which comes with a 500.
+fn soap_failed(a: &Auth, source: &Source, provider: &str, reason: &str, mut extra: Value) -> Response {
+    extra["binding"] = json!("soap");
+    slo_refused(a, source, provider, reason, extra);
+    no_store((StatusCode::INTERNAL_SERVER_ERROR, [(header::CONTENT_TYPE, "text/xml; charset=utf-8")], saml_slo::soap_fault(reason)).into_response())
+}
+
+/// `auth.slo_failed`, throttled per address for messages nobody vouched for.
+fn slo_refused(a: &Auth, source: &Source, provider: &str, reason: &str, extra: Value) {
     let mut d = json!({ "provider": provider, "idp": idp_type(a, provider), "reason": reason });
     if let (Value::Object(d), Value::Object(e)) = (&mut d, extra) {
         d.extend(e);
@@ -1388,8 +1493,6 @@ fn slo_failed(a: &Auth, source: &Source, provider: &str, reason: &str, extra: Va
         let actor = Actor { kind: ActorKind::User, method: Some("sso".into()), idp: idp_type(a, provider).map(String::from), idp_provider: Some(provider.into()), ..Default::default() };
         a.record(Who { actor, source: source.clone() }.event("auth.slo_failed").outcome(Outcome::Failure).details(d));
     }
-    let body = "SuperBot couldn't use that logout message. Sign out of SuperBot itself to end your session there.";
-    no_store((StatusCode::BAD_REQUEST, body).into_response())
 }
 
 /// `GET /api/auth/sso/{id}/slo`: a logout message over the HTTP-Redirect binding.
@@ -1419,44 +1522,20 @@ async fn slo(a: &Auth, source: &Source, id: &str, incoming: &saml_slo::Incoming<
         }
     };
     let (slo_url, at) = (a.sso.slo_url(id), db::now());
-    // An EncryptedID is decrypted with the key assertions are encrypted to, when there is one.
-    let decrypt = match encryption {
-        Encryption::Off => vec![],
-        _ => decrypt_keys(app, p).map(|(k, _)| k).unwrap_or_else(|e| {
-            crate::obs::log::log_warn!("SSO {id}: can't decrypt logout NameIDs: {e}");
-            vec![]
-        }),
-    };
+    let decrypt = logout_decrypt_keys(app, p, *encryption);
     let keys: Vec<&SpKey> = decrypt.iter().map(|(_, k)| k.as_ref()).collect();
     let received = match saml_slo::receive(incoming, &saml_slo::Expect { idp: &idp, slo_url: &slo_url, now_ms: at, decrypt: &keys }) {
         Ok(r) => r,
         Err(Refused(reason, detail)) => return slo_failed(a, source, id, reason, json!({ "detail": detail })),
     };
-    let actor = |subject: Option<String>| Actor { kind: ActorKind::User, subject, method: Some("sso".into()), idp: Some("saml".into()), idp_provider: Some(id.into()), ..Default::default() };
     match received {
         saml_slo::Received::Request { id: request_id, name_id, session_indexes, relay, issued_ms, until_ms } => {
             if let Err(reason) = a.sso.first_use(&format!("slo|{}|{request_id}", idp.entity_id), until_ms, at) {
                 return slo_failed(a, source, id, reason, json!({ "requestId": request_id }));
             }
-            let subject = format!("{}|{}", idp.entity_id, saml::subject(&name_id));
-            let named = |l: Option<&db::SamlLogin>| session_indexes.is_empty() || l.and_then(|l| l.session_index.as_ref()).is_none_or(|i| session_indexes.contains(i));
-            // Codes first, as when an admin revokes: a redemption holds them until its session exists.
-            a.sso.handoffs.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, h| !(h.provider == id && h.claims.key() == subject && named(h.saml.as_ref())));
-            // Only sessions from before the request was issued: replayed after a restart, which
-            // forgets used IDs, it finds nothing left to revoke.
-            let revoked = app.db.revoke_saml_sessions(id, &subject, &session_indexes, issued_ms + saml_sp::SKEW_MS, "saml_logout");
-            let mut users: Vec<&str> = revoked.iter().map(|s| s.user_id.as_str()).collect();
-            users.sort_unstable();
-            users.dedup();
-            let sessions: Vec<&str> = revoked.iter().map(|s| s.id.as_str()).collect();
-            let details = json!({
-                "provider": id, "idp": "saml", "issuer": idp.entity_id, "subject": saml::subject(&name_id), "requestId": request_id,
-                "sessionIndexes": session_indexes, "sessions": sessions, "users": users, "revoked": sessions.len(),
-            });
-            let mut actor = actor(Some(subject.clone()));
-            actor.id = (users.len() == 1).then(|| users[0].to_string());
-            a.record(Who { actor, source: source.clone() }.event("auth.slo").details(details));
-            let answer = saml_slo::logout_response(sp_entity_id, &saml_sp::request_id(), &idp_slo.response, &request_id, at);
+            let binding = if matches!(incoming, saml_slo::Incoming::Redirect(_)) { "redirect" } else { "post" };
+            idp_signed_out(a, app, source, id, &idp, &request_id, &name_id, &session_indexes, issued_ms, binding);
+            let answer = saml_slo::logout_response(sp_entity_id, &saml_sp::request_id(), Some(&idp_slo.response), &request_id, at);
             let query = saml_sp::redirect_query("SAMLResponse", &answer, relay.as_deref(), Some(&key));
             // The browser's own cookie is left alone: its session may not be one the IdP named.
             no_store(see(&saml_sp::with_redirect_query(&idp_slo.response, &query)))
@@ -1470,11 +1549,96 @@ async fn slo(a: &Auth, source: &Source, id: &str, incoming: &saml_slo::Incoming<
                 return slo_failed(a, source, id, "unknown_request", json!({ "inResponseTo": in_response_to }));
             };
             let outcome = if status.is_none() { Outcome::Success } else { Outcome::Failure };
-            let details = json!({ "provider": id, "idp": "saml", "requestId": in_response_to, "status": status.as_deref().unwrap_or("Success") });
-            a.record(Who { actor: actor(None), source: source.clone() }.event("auth.slo_response").target("session", &pending.session).outcome(outcome).details(details));
+            let details = json!({ "provider": id, "idp": "saml", "requestId": in_response_to, "status": status.as_deref().unwrap_or("Success"), "binding": "redirect" });
+            a.record(Who { actor: slo_actor(id, None), source: source.clone() }.event("auth.slo_response").target("session", &pending.session).outcome(outcome).details(details));
             no_store(see("/login"))
         }
     }
+}
+
+/// `POST /api/auth/sso/{id}/slo/soap`: the IdP's LogoutRequest over SOAP, server to server
+/// (ADR 0208), checked as on the front channel except that only an enveloped signature can
+/// sign it. The sessions it names are revoked, and the answer is our signed LogoutResponse in
+/// the SOAP response. Refusals are SOAP faults. The IdP needs no SLO URL of its own for this.
+pub async fn slo_soap(Extension(a): Extension<Arc<Auth>>, Extension(source): Extension<Source>, Path(id): Path<String>, body: axum::body::Bytes) -> Response {
+    let (a, id) = (a.as_ref(), id.as_str());
+    let Some(app) = a.app.as_ref() else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
+    let Some(p) = a.sso.provider(id).filter(|p| p.saml_sp()) else { return not_found("SAML provider").into_response() };
+    let Kind::SamlSp { sp_entity_id, encryption, .. } = &p.kind else { return not_found("SAML provider").into_response() };
+    let Ok(idp) = idp_metadata(a, p).await else { return soap_failed(a, &source, id, "not_ready", json!({})) };
+    let key = match sp_key(app, p) {
+        Ok(k) => k,
+        Err(e) => {
+            crate::obs::log::log_warn!("SSO {id}: can't answer a SOAP logout: {e}");
+            return soap_failed(a, &source, id, "no_sp_key", json!({}));
+        }
+    };
+    let Ok(xml) = std::str::from_utf8(&body) else { return soap_failed(a, &source, id, "bad_message", json!({})) };
+    let (slo_url, at) = (a.sso.slo_soap_url(id), db::now());
+    let decrypt = logout_decrypt_keys(app, p, *encryption);
+    let keys: Vec<&SpKey> = decrypt.iter().map(|(_, k)| k.as_ref()).collect();
+    let (request_id, name_id, session_indexes, issued_ms) = match saml_slo::receive(&saml_slo::Incoming::Soap(xml), &saml_slo::Expect { idp: &idp, slo_url: &slo_url, now_ms: at, decrypt: &keys }) {
+        Ok(saml_slo::Received::Request { id: request_id, name_id, session_indexes, issued_ms, until_ms, .. }) => {
+            if let Err(reason) = a.sso.first_use(&format!("slo|{}|{request_id}", idp.entity_id), until_ms, at) {
+                return soap_failed(a, &source, id, reason, json!({ "requestId": request_id }));
+            }
+            (request_id, name_id, session_indexes, issued_ms)
+        }
+        Ok(saml_slo::Received::Response { .. }) => return soap_failed(a, &source, id, "bad_message", json!({})),
+        Err(Refused(reason, detail)) => return soap_failed(a, &source, id, reason, json!({ "detail": detail })),
+    };
+    idp_signed_out(a, app, &source, id, &idp, &request_id, &name_id, &session_indexes, issued_ms, "soap");
+    let answer_id = saml_sp::request_id();
+    let answer = saml_slo::logout_response(sp_entity_id, &answer_id, None, &request_id, at);
+    match key.sign_enveloped(&answer, &answer_id) {
+        Ok(signed) => no_store(([(header::CONTENT_TYPE, "text/xml; charset=utf-8")], saml_slo::soap_envelope(&signed)).into_response()),
+        Err(e) => {
+            // The sessions are revoked: only the answer is missing.
+            crate::obs::log::log_warn!("SSO {id}: can't answer a SOAP logout: {e}");
+            no_store((StatusCode::INTERNAL_SERVER_ERROR, [(header::CONTENT_TYPE, "text/xml; charset=utf-8")], saml_slo::soap_fault("no_sp_key")).into_response())
+        }
+    }
+}
+
+fn slo_actor(provider: &str, subject: Option<String>) -> Actor {
+    Actor { kind: ActorKind::User, subject, method: Some("sso".into()), idp: Some("saml".into()), idp_provider: Some(provider.into()), ..Default::default() }
+}
+
+/// The keys an `EncryptedID` in a logout message is decrypted with: those assertions are
+/// encrypted to, when the provider has encryption on.
+fn logout_decrypt_keys(app: &AppState, p: &Provider, encryption: Encryption) -> Vec<(Option<saml_keys::Stage>, Arc<SpKey>)> {
+    match encryption {
+        Encryption::Off => vec![],
+        _ => decrypt_keys(app, p).map(|(k, _)| k).unwrap_or_else(|e| {
+            crate::obs::log::log_warn!("SSO {}: can't decrypt logout NameIDs: {e}", p.id);
+            vec![]
+        }),
+    }
+}
+
+/// The IdP signed `name_id` out, in the IdP sessions `session_indexes` (all, if none): revokes
+/// the SuperBot sessions they made and drops their unredeemed app codes, then audits `auth.slo`
+/// with the binding it came over (`redirect`, `post` or `soap`).
+#[allow(clippy::too_many_arguments)]
+fn idp_signed_out(a: &Auth, app: &AppState, source: &Source, id: &str, idp: &saml_sp::IdpMetadata, request_id: &str, name_id: &str, session_indexes: &[String], issued_ms: i64, binding: &str) {
+    let subject = format!("{}|{}", idp.entity_id, saml::subject(name_id));
+    let named = |l: Option<&db::SamlLogin>| session_indexes.is_empty() || l.and_then(|l| l.session_index.as_ref()).is_none_or(|i| session_indexes.contains(i));
+    // Codes first, as when an admin revokes: a redemption holds them until its session exists.
+    a.sso.handoffs.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, h| !(h.provider == id && h.claims.key() == subject && named(h.saml.as_ref())));
+    // Only sessions from before the request was issued: replayed after a restart, which
+    // forgets used IDs, it finds nothing left to revoke.
+    let revoked = app.db.revoke_saml_sessions(id, &subject, session_indexes, issued_ms + saml_sp::SKEW_MS, "saml_logout");
+    let mut users: Vec<&str> = revoked.iter().map(|s| s.user_id.as_str()).collect();
+    users.sort_unstable();
+    users.dedup();
+    let sessions: Vec<&str> = revoked.iter().map(|s| s.id.as_str()).collect();
+    let details = json!({
+        "provider": id, "idp": "saml", "issuer": idp.entity_id, "subject": saml::subject(name_id), "requestId": request_id,
+        "sessionIndexes": session_indexes, "sessions": sessions, "users": users, "revoked": sessions.len(), "binding": binding,
+    });
+    let mut actor = slo_actor(id, Some(subject.clone()));
+    actor.id = (users.len() == 1).then(|| users[0].to_string());
+    a.record(Who { actor, source: source.clone() }.event("auth.slo").details(details));
 }
 
 /// The IdP metadata, auditing metadata from the URL refused for its signature or validity,
@@ -1520,7 +1684,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
     };
     let idp = p.idp_loaded().map(|m| {
         let certs: Vec<Value> = m.certs.iter().map(cert).collect();
-        json!({ "entityId": m.entity_id, "ssoUrl": m.sso_url, "sloUrl": m.slo.as_ref().map(|s| &s.location), "certificates": certs, "loadedSecondsAgo": p.idp_age().map(|d| d.as_secs()) })
+        json!({ "entityId": m.entity_id, "ssoUrl": m.sso_url, "sloUrl": m.slo.as_ref().map(|s| &s.location), "sloSoapUrl": m.slo_soap, "certificates": certs, "loadedSecondsAgo": p.idp_age().map(|d| d.as_secs()) })
     });
     let key = a.app.as_ref().map(|app| sp_key(app, p));
     // botd's own keys show their rollover too (ADR 0181).
@@ -1557,6 +1721,8 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
         },
     };
     let slo = p.idp_loaded().is_some_and(|m| m.slo.is_some()) && matches!(key, Some(Ok(_)));
+    // Signing out where there's no browser reaches the IdP only over its SOAP URL (ADR 0208).
+    let back_channel = p.idp_loaded().is_some_and(|m| m.slo_soap.is_some()) && matches!(key, Some(Ok(_)));
     let from = match source {
         IdpSource::Url(u) => Some(u.clone()),
         IdpSource::File(f) => Some(f.clone()),
@@ -1566,6 +1732,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
         "provider": p.id, "label": p.label, "ready": p.ready(), "problem": p.not_ready(),
         "spEntityId": sp_entity_id, "acsUrl": a.sso.acs_url(&p.id), "metadataUrl": a.sso.sp_metadata_url(&p.id),
         "sloUrl": a.sso.slo_url(&p.id), "signRequests": sign_requests, "spKey": sp_key, "singleLogout": slo,
+        "sloSoapUrl": a.sso.slo_soap_url(&p.id), "backChannelLogout": back_channel,
         "encryptedAssertions": encryption.as_str(), "spEncryptionKey": enc_key,
         "signedMetadata": metadata_trust.as_ref().map_or("off", |t| if t.require { "require" } else { "allow" }),
         "metadataSigningCertificates": metadata_trust.as_ref().map(|t| t.certs.iter().map(cert).collect::<Vec<_>>()),
