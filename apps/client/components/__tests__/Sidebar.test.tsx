@@ -31,13 +31,14 @@ function setup(me: Me) {
     onOpenAudit: jest.fn(),
     onOpenAccessReview: jest.fn(),
     onOpenRoles: jest.fn(),
+    onOpenServiceAccounts: jest.fn(),
     onOpenConsole: jest.fn(),
   };
   return props;
 }
 
 describe("Sidebar admin entries", () => {
-  it("shows admins the users, roles, the audit log, the access review, and a link to the admin console", async () => {
+  it("shows admins the users, roles, service accounts, the audit log, the access review, and a link to the admin console", async () => {
     const props = setup({ name: "Owner", role: "admin", permissions: ALL });
     const user = userEvent.setup();
     await render(<Sidebar {...props} />);
@@ -51,6 +52,8 @@ describe("Sidebar admin entries", () => {
     expect(props.onOpenUsers).toHaveBeenCalledTimes(1);
     await user.press(screen.getByText("Roles"));
     expect(props.onOpenRoles).toHaveBeenCalledTimes(1);
+    await user.press(screen.getByText("Service accounts"));
+    expect(props.onOpenServiceAccounts).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("link", { name: "Finish server setup" })).toBeNull();
   });
 
@@ -65,6 +68,7 @@ describe("Sidebar admin entries", () => {
 
   it.each([
     ["member", { name: "Alex", role: "member", permissions: ["account", "read", "review", "write", "approve"] }],
+    ["a delegate with users.manage", { name: "Del", role: "member", permissions: ["account", "read", "review", "write", "approve", "users.manage"] }],
     ["read-only", { name: "Rae", role: "readonly", permissions: ["account", "read", "review"] }],
     ["a Bot", { name: "Scout", role: "bot", permissions: ["account", "read", "write"] }],
     ["a server from before roles", { name: "You" }],
@@ -77,6 +81,7 @@ describe("Sidebar admin entries", () => {
     expect(screen.queryByText("Access review")).toBeNull();
     expect(screen.queryByText("Users")).toBeNull();
     expect(screen.queryByText("Roles")).toBeNull();
+    expect(screen.queryByText("Service accounts")).toBeNull();
     expect(screen.getByText("Approvals")).toBeOnTheScreen();
   });
 });

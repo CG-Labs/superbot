@@ -39,10 +39,12 @@ pub mod rebuild;
 pub mod recovery;
 pub mod region;
 pub mod residency;
+pub mod residency_report;
 pub mod resize;
 pub mod route;
 pub mod runas;
 pub mod s3;
+pub mod seccomp;
 #[cfg(test)]
 pub mod s3_standin;
 pub mod screens;

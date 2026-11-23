@@ -124,6 +124,12 @@ jobs:
         run: |
           sudo SUPERBOT_MACHINE_BOT_USER_TEST=1 /tmp/botd-tests --ignored --exact \
             machines_redteam_tests::as_root_red_team_a_run_cant_raise_its_privileges
+      # ADR 0156: the seccomp filter refuses keyrings, eBPF, perf, userfaultfd,
+      # io_uring, file handles and the kernel log, and leaves user namespaces alone.
+      - name: "Red team: a run can't reach the kernel's riskier interfaces"
+        run: |
+          sudo SUPERBOT_MACHINE_BOT_USER_TEST=1 /tmp/botd-tests --ignored --exact \
+            machines_redteam_tests::as_root_red_team_a_run_cant_reach_the_kernels_riskier_interfaces
       - name: "Red team: Bots can't reach another person's files or the agent's secrets"
         run: |
           sudo SUPERBOT_MACHINE_BOT_USER_TEST=1 /tmp/botd-tests --ignored --exact \
