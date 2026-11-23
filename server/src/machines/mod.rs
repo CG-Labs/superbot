@@ -54,6 +54,7 @@ pub mod server_data;
 #[cfg(test)]
 pub mod standin_mirror;
 pub mod team_network;
+pub mod team_rules;
 pub mod teammate;
 #[cfg(test)]
 pub mod teammates;
@@ -234,6 +235,11 @@ pub struct ControlPlane {
     /// Machines powered off to take them off a team network they no longer belong on,
     /// to power on again once they are off it.
     network_suspended: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Machines put on their team's network since they booted, to audit once they use
+    /// it (ADR 0202).
+    network_joining: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The last reason each machine couldn't join its team's network, audited once.
+    network_join_refused: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// One change at a time, from handlers and the reconciler alike, so two can't
     /// race on one machine. Changes are rare and admin-driven; this is cheap.
     ops: tokio::sync::Mutex<()>,
@@ -266,6 +272,8 @@ impl Default for ControlPlane {
             kept_pins: residency::KeptPins::default(),
             team_network: None,
             network_suspended: Default::default(),
+            network_joining: Default::default(),
+            network_join_refused: Default::default(),
             ops: tokio::sync::Mutex::new(()),
             provider_seen: Default::default(),
         }
@@ -1294,6 +1302,7 @@ pub async fn heartbeats(app: &AppState, cp: &ControlPlane) -> Option<usize> {
             botuser::follow_up(app, e, &m, &hb).await;
             if let Some(m) = app.db.machine(&m.id) {
                 egress_policy::follow_up(app, e, &m, &hb).await;
+                team_network::follow_up(app, cp, e, &m, &hb).await;
             }
             folder::follow_up(app, e, &m, &hb);
             true

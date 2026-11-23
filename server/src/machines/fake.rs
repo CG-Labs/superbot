@@ -42,6 +42,9 @@ pub struct FakeNetwork {
     pub subnet_id: String,
     pub subnet: String,
     pub members: BTreeSet<String>,
+    /// Machines given an interface while running (ADR 0202): inactive, and members only
+    /// from their next boot.
+    pub pending: BTreeSet<String>,
 }
 
 #[derive(Default)]
@@ -164,6 +167,7 @@ impl Fake {
         }
         for n in s.networks.values_mut() {
             n.members.remove(id);
+            n.pending.remove(id);
         }
     }
 
@@ -225,6 +229,11 @@ impl Fake {
     /// The team network `machine` is on, if any.
     pub fn network_of(&self, machine: &str) -> Option<String> {
         self.state.lock().unwrap().networks.values().find(|n| n.members.contains(machine)).map(|n| n.id.clone())
+    }
+
+    /// The team network `machine` joins at its next boot, if any.
+    pub fn joining(&self, machine: &str) -> Option<String> {
+        self.state.lock().unwrap().networks.values().find(|n| n.pending.contains(machine)).map(|n| n.id.clone())
     }
 
     /// Puts `member` on network `id` behind the control plane's back: a machine of
@@ -378,8 +387,19 @@ impl MachineProvider for Fake {
         Box::pin(async move { self.update("shutdown", id, |m| m.status = "offline".into()) })
     }
 
+    /// Interfaces added since its last boot come into use.
     fn boot<'a>(&'a self, id: &'a str) -> Fut<'a, ()> {
-        Box::pin(async move { self.update("boot", id, |m| m.status = "booting".into()) })
+        Box::pin(async move {
+            self.with("boot", |s| {
+                s.machines.get_mut(id).ok_or(ProviderError::NotFound)?.status = "booting".into();
+                for n in s.networks.values_mut() {
+                    if n.pending.remove(id) {
+                        n.members.insert(id.into());
+                    }
+                }
+                Ok(())
+            })
+        })
     }
 
     fn enable_backups<'a>(&'a self, id: &'a str) -> Fut<'a, ()> {
@@ -404,6 +424,7 @@ impl MachineProvider for Fake {
                 }
                 for n in s.networks.values_mut() {
                     n.members.remove(id);
+                    n.pending.remove(id);
                 }
                 Ok(())
             })
@@ -429,7 +450,15 @@ impl MachineProvider for Fake {
                 if created {
                     s.next += 1;
                     let id = (700 + s.next).to_string();
-                    let n = FakeNetwork { id: id.clone(), label: label.into(), region: region.into(), subnet_id: (800 + s.next).to_string(), subnet: subnet.into(), members: BTreeSet::new() };
+                    let n = FakeNetwork {
+                        id: id.clone(),
+                        label: label.into(),
+                        region: region.into(),
+                        subnet_id: (800 + s.next).to_string(),
+                        subnet: subnet.into(),
+                        members: BTreeSet::new(),
+                        pending: BTreeSet::new(),
+                    };
                     s.networks.insert(id, n);
                 }
                 let n = s.networks.values().find(|n| n.label == label).unwrap();
@@ -451,20 +480,43 @@ impl MachineProvider for Fake {
         Box::pin(async move {
             self.with("team_network_members", |s| {
                 let n = s.networks.get(id).ok_or(ProviderError::NotFound)?;
-                Ok(n.members.iter().map(|m| NetworkMember { machine: m.clone(), config: format!("{m}-config"), interface: format!("{m}-vpc") }).collect())
+                let member = |m: &String, active: bool| NetworkMember { machine: m.clone(), config: format!("{m}-config"), interface: format!("{m}-vpc"), active };
+                let on = |m: &String| s.machines.get(m).is_none_or(|x| x.status != "offline");
+                Ok(n.members.iter().map(|m| member(m, on(m))).chain(n.pending.iter().map(|m| member(m, false))).collect())
             })
         })
     }
 
-    /// As Linode's: never while the machine is on.
+    /// As Linode's: never while it is in use, by a machine that booted with it.
     fn leave_team_network<'a>(&'a self, m: &'a NetworkMember) -> Fut<'a, ()> {
         Box::pin(async move {
             self.with("leave_team_network", |s| {
-                if s.machines.get(&m.machine).is_some_and(|x| x.status != "offline") {
+                let on = s.machines.get(&m.machine).is_some_and(|x| x.status != "offline");
+                if on && s.networks.values().any(|n| n.members.contains(&m.machine)) {
                     return Err(refused("Cannot delete an active interface."));
                 }
                 for n in s.networks.values_mut() {
                     n.members.remove(&m.machine);
+                    n.pending.remove(&m.machine);
+                }
+                Ok(())
+            })
+        })
+    }
+
+    /// As Linode's: in use from the machine's next boot.
+    fn join_team_network<'a>(&'a self, machine: &'a str, network: &'a TeamNetwork) -> Fut<'a, ()> {
+        Box::pin(async move {
+            self.with("join_team_network", |s| {
+                if !s.machines.contains_key(machine) {
+                    return Err(ProviderError::NotFound);
+                }
+                if s.networks.values().any(|n| n.id != network.id && (n.members.contains(machine) || n.pending.contains(machine))) {
+                    return Err(ProviderError::Api { status: 409, message: "it is on another VPC; it leaves that one first".into() });
+                }
+                let n = s.networks.values_mut().find(|n| n.subnet_id == network.subnet_id).ok_or_else(|| refused("subnet_id: Not found"))?;
+                if !n.members.contains(machine) {
+                    n.pending.insert(machine.into());
                 }
                 Ok(())
             })
