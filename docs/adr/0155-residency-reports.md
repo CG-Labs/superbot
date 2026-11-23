@@ -49,7 +49,7 @@ JSON by default. `?format=markdown` gives a readable document (an attachment wit
 
 - **No signature by botd.** The digest proves the document is whole; that it came from the provider rests on the audit log entry and the channel it was sent over. Signing it with the audit checkpoint key is possible later.
 - **No history of where a machine was.** Machines and backups are reported as they are now; the past is in the refusals and the audit log. A pin is refused while any data is outside (ADR 0129), so "kept now" plus "pinned since" is the claim.
-- **No self-service.** Customers don't fetch it themselves yet; showing the pin and its report in the app is still to do.
+- **No self-service.** Customers don't fetch it themselves yet; showing the pin and its report in the app is still to do. **Done** in [ADR 0168](0168-residency-in-the-app.md).
 
 ## Consequences
 

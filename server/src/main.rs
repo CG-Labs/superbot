@@ -127,6 +127,8 @@ mod machines_residency_tests;
 mod residency_routes_http_tests;
 #[cfg(test)]
 mod residency_report_http_tests;
+#[cfg(test)]
+mod residency_me_http_tests;
 mod passwd;
 mod plans;
 #[cfg(test)]
@@ -958,6 +960,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/me/tier", get(my_tier))
         .route("/me/usage", get(usage::mine))
+        .route("/me/residency", get(machines::residency_me::view))
+        .route("/me/residency/report", get(machines::residency_me::report))
         .route("/tiers", get(list_tiers))
         .route("/tiers/{name}/move-bots", post(move_bots))
         .route("/usage", get(admin_usage))
@@ -989,6 +993,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/auth/sso/{id}/slo", get(sso::slo_get).post(sso::slo_post))
         .route("/sso/{id}/saml", get(sso::saml_status))
         .route("/sso/{id}/saml/idp-metadata", put(sso::saml_import))
+        .route("/sso/role-mappings", get(sso::saml_roles::list).post(sso::saml_roles::create))
+        .route("/sso/role-mappings/{id}", get(sso::saml_roles::get).delete(sso::saml_roles::delete))
         .route("/users", get(users::list_users).post(users::create_user))
         .route("/users/{key}", get(users::get_user).patch(users::update_user))
         .route("/users/{key}/login-codes", post(users::create_login_code))

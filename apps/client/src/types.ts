@@ -1169,3 +1169,26 @@ export interface OffboardingPreview {
   /** What becomes of their work: on teammates' machines, and on their accounts on this server. Each null when that cleanup is off. */
   work: { machines: WorkPolicy | null; accounts: WorkPolicy | null };
 }
+
+/** The residency pin on your data, and where your data is against it (`GET /api/me/residency`, ADR 0168). */
+export interface MyResidency {
+  /** Your team's pin, else your own; null when nothing pins your data. */
+  pin: {
+    on: "user" | "team";
+    region: string;
+    /** Unix ms. */
+    pinnedAt: number;
+    /** The agreement it is under: your own pin's, or your team's for its owners and admins. */
+    reference?: string;
+    team?: { id: string; name: string | null };
+  } | null;
+  /** Your own pin, when your team's holds your data too. */
+  ownPin: { region: string; pinnedAt: number; reference: string } | null;
+  status?: "kept" | "data_outside";
+  /** `inRegion` checks the host it is on too: `hostRegion` is null for a host with no region, `host` null off Incus. */
+  machine?: { id: string; state: string; region: string; inRegion: boolean; host?: string | null; hostRegion?: string | null } | null;
+  backups?: { kept: number; inRegion: number; outside: number };
+  modelRoutes?: { inRegion: boolean; gap: string | null };
+  /** The pins whose residency report you can get. */
+  reports: ("user" | "team")[];
+}
