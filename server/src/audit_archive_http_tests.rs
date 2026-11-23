@@ -698,6 +698,9 @@ async fn checkpoint_timestamps_are_checked_from_the_archive_and_without_botd() {
         (Some(true), Some(1), Some(1), Some(id), Some(stamp)),
         "{v}"
     );
+    let chain = parse(&call(port, "GET", "/api/audit/chain", &admin, "").await.1);
+    let saved = &chain["verification"]["archive"];
+    assert_eq!((saved["timestamps"].as_u64(), saved["lastTimestamp"]["checkpoint"].as_i64()), (Some(1), Some(id)), "the saved check: {chain}");
     let trust = || Trust::from_pem(&fake.ca_pem).unwrap();
     let r = offline(&s, trust());
     assert_eq!((r.ok, r.hosts[0].timestamps, r.hosts[0].trusted_timestamps, r.hosts[0].unstamped), (true, 1, Some(1), 0), "{r:?}");

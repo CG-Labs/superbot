@@ -856,7 +856,7 @@ pub fn summary(c: &Checked) -> Value {
         "ok": c.ok, "archive": c.archive, "objects": c.objects, "skipped": c.skipped, "events": c.events, "first": c.first, "head": c.head, "delivered": c.delivered, "start": c.start, "after": c.after,
         "matched": c.matched, "altered": c.altered, "gone": c.gone, "mismatched": c.mismatched, "missing": c.missing, "locked": c.locked, "lockExpired": c.lock_expired,
         "bound": c.bound, "boundFixed": c.bound_fixed, "unbound": c.unbound,
-        "checkpoints": c.checkpoints, "timestamps": c.timestamps, "trustedTimestamps": c.trusted_timestamps, "problems": c.problems, "firstProblem": c.first_problems.first(), "error": c.error,
+        "checkpoints": c.checkpoints, "timestamps": c.timestamps, "trustedTimestamps": c.trusted_timestamps, "lastTimestamp": c.last_timestamp, "problems": c.problems, "firstProblem": c.first_problems.first(), "error": c.error,
     })
 }
 
