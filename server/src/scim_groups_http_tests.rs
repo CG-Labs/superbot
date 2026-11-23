@@ -671,3 +671,37 @@ async fn a_post_that_stopped_partway_is_finished_by_the_retry() {
     let (code, _, again) = scim(port, &t, "POST", GROUPS, json!({ "displayName": "ops" })).await;
     assert_eq!((code, again["id"].as_str()), (201, Some(ops.as_str())), "{again}");
 }
+
+#[tokio::test]
+async fn a_removal_that_cant_keep_the_teams_residency_pin_fails_so_the_idp_retries() {
+    let (port, app, admin) = serve().await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "entra" })).await;
+    let ada = person(port, &t, "ada@contoso.example", "ada").await;
+    let al = person(port, &t, "al@contoso.example", "al").await;
+    let (_, _, g) = scim(port, &t, "POST", GROUPS, json!({ "displayName": "Eng" })).await;
+    let id = g["id"].as_str().unwrap().to_string();
+    assert_eq!(scim(port, &t, "PATCH", &format!("{GROUPS}/{id}"), add(&[&ada, &al])).await.0, 204);
+    app.db.pin_residency(crate::db::PinOn::Team, &id, "gb-lon", "MSA-7", None).unwrap();
+
+    // Keeping the pin on a leaver's data fails: a 500 each time, and they stay on the
+    // team with the group still linked, rather than leaving unpinned.
+    app.db.fail_pin_saves(true);
+    let (code, head, body) = scim(port, &t, "PATCH", &format!("{GROUPS}/{id}"), remove(&[&al])).await;
+    assert_eq!(code, 500, "{body}");
+    is_scim_error(&head, &body, 500);
+    assert_eq!(scim(port, &t, "DELETE", &format!("{GROUPS}/{id}"), Value::Null).await.0, 500);
+    assert!(app.db.scim_group("entra", &id).is_some());
+    assert_eq!(scim(port, &t, "DELETE", &format!("/scim/v2/Users/{ada}"), Value::Null).await.0, 500);
+    assert!(!app.db.user(&ada).unwrap().active(), "the rest of the user's deletion still happened");
+    assert_eq!(on_team(&app, &id).len(), 2);
+    let failed = events(port, &admin, "action=team.member_leave_failed").await;
+    assert!(failed.len() >= 3 && failed.iter().all(|e| e["outcome"] == "failure" && e["details"]["reason"] == "scim"), "{failed:?}");
+    assert!(events(port, &admin, "action=team.member_left").await.is_empty());
+
+    // The IdP's retry, once it can: Al leaves pinned.
+    app.db.fail_pin_saves(false);
+    assert_eq!(scim(port, &t, "PATCH", &format!("{GROUPS}/{id}"), remove(&[&al])).await.0, 204);
+    let p = app.db.residency_pin(crate::db::PinOn::User, &al).expect("Al's kept pin");
+    assert_eq!((p.region.as_str(), p.kept_from.as_deref()), ("gb-lon", Some(id.as_str())));
+    assert_eq!(app.db.team_id_of(&al), None);
+}

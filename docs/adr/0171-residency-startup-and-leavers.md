@@ -41,7 +41,7 @@ For leavers:
 ### A leaver keeps the team's pin
 
 - When someone leaves a pinned team for any reason but erasure (they leave, an admin or a team admin removes them, the last member leaves and the team is deleted, or SCIM removes them from the group, deletes them or deletes the group), the team's pin is copied to them: same region and reference, `pinnedBy` the admin who pinned the team, `pinnedAt` the time they left, and `keptFrom` the team's id. Their own data region is set to the pinned region, as pinning does.
-- The removal and the copy are one database transaction. If the copy fails, they stay on the team, and the failure is logged; the IdP's retry or the person tries again.
+- The removal and the copy are one database transaction. If the copy fails, they stay on the team, and the failure is logged and audited as `team.member_leave_failed` (outcome failure). The person or admin sees the leave refused. SCIM answers 500 rather than success, so the IdP retries: a group PATCH or PUT stops there, a group DELETE leaves the group linked, and a user DELETE still disables them (they stay on the team, held by its pin).
 - If they already have their own pin (it must agree with the team's, ADR 0129), it stays as it is.
 - An erasure keeps nothing: the pin would be deleted with the rest of their data.
 - It is audited as `user.residency_pin_kept`, on the user, with the region, reference, team, team name and the leave's reason. The actor is whoever caused the leave.
@@ -52,7 +52,7 @@ For leavers:
 A team pin's reference is shown only to admins and the team's owners and admins (ADR 0129, 0168). A leaver who was an ordinary member shouldn't learn it by leaving. So for a kept pin:
 
 - `GET /api/me/residency` shows `keptFrom` (the team's id and name, null once the team is gone) instead of `reference`;
-- the leaver's own self-service report has `reference: null` in the pin and in its pin changes;
+- the leaver's own self-service report has `reference: null` in the pin and in its pin changes while the pin is kept, and on its `user.residency_pin_kept` change always, even after an admin renews the pin;
 - admins see the reference everywhere as before, with `keptFrom` on the pin in user views, `GET /api/regions` and reports.
 
 ### Reports
@@ -76,5 +76,6 @@ The report's pin has `keptFrom`. `user.residency_pin_kept` is one of the pin cha
 
 - Unit (`residency.rs`): `RESIDENCY_STARTUP` parsing. (`db.rs`): the leave and the kept pin happen together or not at all; an existing own pin is left alone; erasure and a refused last-owner leave keep nothing; renewing clears `keptFrom`.
 - End to end on the real router (`machines_residency_tests.rs`):
-  - with the in-memory Linode provider, a member taken off a pinned team keeps its pin, audited, with her region held and a region change refused; she sees `keptFrom` and not the reference in the app and in her report (JSON and Markdown), while an admin's report has it; renewing makes it hers; an erased member keeps nothing; the last member leaving deletes the team and keeps the pin on her data;
+  - with the in-memory Linode provider, a member taken off a pinned team keeps its pin, audited, with her region held and a region change refused; she sees `keptFrom` and not the reference in the app and in her report (JSON and Markdown), while an admin's report has it; renewing makes it hers, and her report's history still leaves the team's reference out; an erased member keeps nothing; the last member leaving deletes the team and keeps the pin on her data;
+  - (`scim_groups_http_tests.rs`) when the pin can't be saved, a SCIM group PATCH, group DELETE and user DELETE each answer 500, audit `team.member_leave_failed`, and leave the person on the team with the group linked; the IdP's retry then succeeds and keeps the pin;
   - with the Incus and S3 stand-ins, a pin whose region lost its store: `warn` only warns; `refuse` returns the reason and audits `residency.startup_refused` with the pin; a kept pin whose only gap is a model route doesn't refuse; after an unpin it starts.

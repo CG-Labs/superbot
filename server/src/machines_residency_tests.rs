@@ -378,6 +378,13 @@ async fn someone_leaving_a_pinned_team_keeps_its_pin_unless_they_are_erased() {
     assert_eq!(call(port, "PUT", &format!("/api/users/{bea}/residency"), &admin, &pin("gb-lon", "DPA-bea")).await.0, 200);
     let (_, me) = call_json(port, "GET", "/api/me/residency", &bea_s, "").await;
     assert_eq!((me["pin"]["reference"].as_str(), me["pin"].get("keptFrom")), (Some("DPA-bea"), None), "{me}");
+    // Her report's history still never shows the team's agreement; an admin's does.
+    for format in ["json", "markdown"] {
+        let (code, r) = call(port, "GET", &format!("/api/me/residency/report?on=user&format={format}"), &bea_s, "").await;
+        assert!(code == 200 && r.contains("DPA-bea") && r.contains("user.residency_pin_kept") && !r.contains("MSA-7"), "{format}: {r}");
+    }
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{bea}/residency/report"), &admin, "").await;
+    assert!(r["activity"]["pinChanges"].as_array().unwrap().iter().any(|c| c["action"] == "user.residency_pin_kept" && c["reference"] == "MSA-7"), "{r}");
 
     // Someone being erased keeps nothing: their pin would go with them.
     let (code, v) = call_json(port, "POST", &format!("/api/users/{cy}/erase"), &admin, r#"{"destroyMachine":true}"#).await;

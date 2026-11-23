@@ -36,6 +36,7 @@ const PIN_CHANGES: [&str; 7] = [
     "team.residency_unpinned",
     "team.residency_pin_refused",
 ];
+const KEPT: &str = "user.residency_pin_kept";
 const REFUSALS: [&str; 6] = ["machine.residency_refused", "bot.run_refused", "user.region_change_refused", "team.region_change_refused", "team.join_refused", "team.delete_refused"];
 
 const NOT_COVERED: [&str; 4] = [
@@ -150,6 +151,7 @@ fn held_here(app: &App, e: &AuditEvent, p: &ResidencyPin, people: &HashSet<Strin
     owner.as_deref().is_some_and(|o| people.contains(o))
 }
 
+/// With `reference` false, the reference is left out (null).
 fn change_view(e: &AuditEvent, reference: bool) -> Value {
     json!({
         "at": e.at, "time": e.time, "action": e.action, "outcome": e.outcome,
@@ -158,7 +160,10 @@ fn change_view(e: &AuditEvent, reference: bool) -> Value {
     })
 }
 
-fn activity(app: &App, p: &ResidencyPin, people: &HashSet<String>, from: i64, to: i64, reference: bool) -> Result<Value, String> {
+/// `self_service`: for someone the pin holds, who never sees the reference a pin kept
+/// from their former team carries, even once it has been renewed (ADR 0129, 0171).
+fn activity(app: &App, p: &ResidencyPin, people: &HashSet<String>, from: i64, to: i64, self_service: bool) -> Result<Value, String> {
+    let hidden = self_service && p.kept_from.is_some();
     let actions: Vec<&str> = PIN_CHANGES.iter().chain(REFUSALS.iter()).copied().collect();
     let events = app.db.residency_audit(from, to, &actions, MAX_EVENTS as i64 + 1).map_err(|e| e.to_string())?;
     let truncated = events.len() > MAX_EVENTS;
@@ -167,7 +172,7 @@ fn activity(app: &App, p: &ResidencyPin, people: &HashSet<String>, from: i64, to
     for e in events.iter().take(MAX_EVENTS) {
         if PIN_CHANGES.contains(&e.action.as_str()) {
             if on_subject(e, p) {
-                changes.push(change_view(e, reference));
+                changes.push(change_view(e, !hidden && !(self_service && e.action == KEPT)));
             }
         } else if e.action == "harness.invoked" {
             held += u64::from(held_here(app, e, p, people, &mut owners));
@@ -207,9 +212,11 @@ pub(super) fn person(app: &App, cp: &ControlPlane, id: &str, region: &str) -> Op
     }))
 }
 
-/// The report on `p` for `from`..`to`, generated at `now`, with its digest. Without
-/// `reference`, the pin's reference is left out (null).
-pub fn build(app: &App, cp: &ControlPlane, p: &ResidencyPin, from: i64, to: i64, now: i64, reference: bool) -> Result<Value, String> {
+/// The report on `p` for `from`..`to`, generated at `now`, with its digest. For
+/// `self_service` (someone the pin holds, ADR 0168), a team's reference on a pin kept
+/// from it is left out (null): only the team's owners and admins see it (ADR 0129, 0171).
+pub fn build(app: &App, cp: &ControlPlane, p: &ResidencyPin, from: i64, to: i64, now: i64, self_service: bool) -> Result<Value, String> {
+    let reference = !(self_service && p.kept_from.is_some());
     let (name, ids) = residency::held_by(app, p).ok_or("Whom this pin is on is gone")?;
     let region = p.region.as_str();
     let people: Vec<Value> = ids.iter().filter_map(|id| person(app, cp, id, region)).collect();
@@ -238,7 +245,7 @@ pub fn build(app: &App, cp: &ControlPlane, p: &ResidencyPin, from: i64, to: i64,
         "warnings": warnings,
         "region": { "id": region, "offered": cp.regions.iter().any(|r| r == region), "hosts": hosts, "backupStore": cp.offsite.as_deref().map(|o| o.in_region(region)) },
         "people": people,
-        "activity": activity(app, p, &set, from, to, reference)?,
+        "activity": activity(app, p, &set, from, to, self_service)?,
         "notCovered": NOT_COVERED,
     });
     report["digest"] = json!(digest(&report));
@@ -376,10 +383,7 @@ pub(super) fn query(q: &HashMap<String, String>, now: i64) -> Result<(bool, i64,
 pub(super) fn respond(app: &App, cp: &ControlPlane, by: &Who, p: &ResidencyPin, q: &HashMap<String, String>, self_service: bool) -> Result<Response, ApiError> {
     let now = crate::db::now();
     let (md, from, to) = query(q, now)?;
-    // A pin kept from a team someone left carries the team's agreement, which only its
-    // owners and admins see (ADR 0129, 0171).
-    let reference = !(self_service && p.kept_from.is_some());
-    let r = build(app, cp, p, from, to, now, reference).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("The residency report couldn't be made: {e}")))?;
+    let r = build(app, cp, p, from, to, now, self_service).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("The residency report couldn't be made: {e}")))?;
     let d = json!({
         "region": p.region, "reference": p.reference, "from": from, "to": to, "status": r["status"], "digest": r["digest"],
         "format": if md { "markdown" } else { "json" }, "truncated": r["activity"]["truncated"], "selfService": self_service,

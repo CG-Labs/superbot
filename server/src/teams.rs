@@ -421,21 +421,32 @@ pub(crate) async fn join_from_scim(app: &AppState, by: &Who, team: &Team, user: 
 /// suspended and, after TEAM_MACHINE_DAYS, destroyed. The IdP taking someone out of a
 /// group takes them off even as the last owner: deprovisioning can't wait for one. A
 /// pinned team's pin stays on the leaver's data as their own (ADR 0171), unless they are
-/// being erased.
+/// being erased. False when they weren't on it, or couldn't be taken off.
 pub async fn leave(app: &AppState, by: &Who, team_id: &str, user_id: &str, reason: &str) -> bool {
-    let Some(member) = app.db.team_member(user_id).filter(|m| m.team_id == team_id) else { return false };
+    try_leave(app, by, team_id, user_id, reason).await.unwrap_or(false)
+}
+
+/// [`leave`], with an error when they are on the team but couldn't be taken off (the
+/// database failed, or keeping the team's pin on their data did): nothing has changed,
+/// it's logged and audited as `team.member_leave_failed`, and the caller should report
+/// it (SCIM answers 500, so the IdP retries). Ok(false): they weren't on the team.
+pub async fn try_leave(app: &AppState, by: &Who, team_id: &str, user_id: &str, reason: &str) -> Result<bool, String> {
+    let Some(member) = app.db.team_member(user_id).filter(|m| m.team_id == team_id) else { return Ok(false) };
     let tier = app.tier_of(user_id).name.clone();
     let keep_owner = reason != "team_deleted" && reason != SCIM;
     match app.db.remove_team_member_keeping_pin(team_id, user_id, keep_owner, reason != ERASED) {
-        Ok((false, _)) => return false,
+        Ok((false, _)) => return Ok(false),
         Ok((true, kept)) => {
             if let Some(p) = kept {
                 crate::machines::residency::kept_for_leaver(app, by, team_id, user_id, reason, &p);
             }
         }
         Err(e) => {
-            crate::obs::log::log_warn!("WARNING: {user_id} wasn't taken off team {team_id}: keeping the team's residency pin on their data failed, so nothing changed: {e}");
-            return false;
+            let error = format!("{user_id} couldn't be taken off team {team_id}, so nothing changed: {e}");
+            crate::obs::log::log_warn!("WARNING: {error}");
+            let d = json!({ "user": user_id, "role": member.role, "reason": reason, "error": e });
+            app.db.record(&team_event(by, "team.member_leave_failed", team_id, d).outcome(Outcome::Failure));
+            return Err(error);
         }
     }
     crate::scim::roles::left(app, by, team_id, user_id).await;
@@ -471,7 +482,7 @@ pub async fn leave(app: &AppState, by: &Who, team_id: &str, user_id: &str, reaso
     release(app, by, team_id, user_id).await;
     crate::team_billing::member_changed(app, team_id, user_id, &tier, "left");
     app.send(json!({ "type": "resync" }));
-    true
+    Ok(true)
 }
 
 /// The machine `team_id` gave `user_id`, given back: suspended now, destroyed later.

@@ -994,6 +994,8 @@ pub async fn patch_user(State(app): State<AppState>, Extension(a): Extension<Arc
 
 /// `DELETE /scim/v2/Users/{id}`: the user is disabled, their sessions end, and the tenant
 /// can't see them any more. Nothing is destroyed: the user and its audit history stay.
+/// When taking them off their group's team fails (ADR 0171), the rest still happens and
+/// the answer is a 500.
 pub async fn delete_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Path(id): Path<String>) -> ScimRes {
     let before = need(&app, &c, &id)?;
     if !app.db.delete_scim_user(&c.token.tenant, &id) {
@@ -1015,9 +1017,10 @@ pub async fn delete_user(State(app): State<AppState>, Extension(a): Extension<Ar
         crate::machines::screens::rotate_all(&app).await;
     }
     crate::machines::offboard::left(&app, &c.who, &id, crate::machines::offboard::DEPROVISIONED);
-    groups::user_deleted(&app, &a, &c, &id).await;
+    let left = groups::user_deleted(&app, &a, &c, &id).await;
     roles::user_deleted(&app, &a, &c.who, &id).await;
     crate::deprovision::user_disabled(&app, &c.who, &id, crate::deprovision::SCIM_DELETE).await;
+    left.map_err(server_error)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

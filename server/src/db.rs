@@ -9688,6 +9688,13 @@ impl Db {
         self.remove_team_member_keeping_pin(team_id, user_id, keep_owner, false).unwrap().0
     }
 
+    /// Makes every new residency pin fail to save, or stops that.
+    #[cfg(test)]
+    pub fn fail_pin_saves(&self, on: bool) {
+        let sql = if on { "CREATE TRIGGER pins_full BEFORE INSERT ON residency_pins BEGIN SELECT RAISE(ABORT, 'disk full'); END;" } else { "DROP TRIGGER pins_full;" };
+        self.c().execute_batch(sql).unwrap();
+    }
+
     /// Takes a member off a team. With `keep_owner`, not its last owner while others
     /// remain, in the same statement. With `keep_pin`, in the same transaction, the
     /// team's residency pin is copied to the leaver as their own (ADR 0171), with their
