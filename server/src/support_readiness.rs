@@ -407,6 +407,7 @@ fn rota(csv: &str, o: &Options) -> Result<Rota, String> {
             }
             let role = match cell(Field::Role) {
                 Some(r) => parse_role(r).ok_or("a role that isn't primary, secondary or a level")?,
+                None if col.contains_key(Field::Role.name()) => return Err("no role"),
                 None => Role::Primary,
             };
             Ok((person, role, start, end))
@@ -485,7 +486,7 @@ fn rota(csv: &str, o: &Options) -> Result<Rota, String> {
             }
         }
         for (s, e) in merged {
-            if e > o.from && s < o.to && (e - s).num_hours() > o.max_stretch_hours {
+            if e > o.from && s < o.to && e - s > TimeDelta::hours(o.max_stretch_hours) {
                 stretches.push((name.clone(), s, e));
             }
         }
@@ -530,6 +531,7 @@ fn tams(csv: &str, o: &Options) -> Result<Tams, String> {
     }
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     let mut people: BTreeMap<String, (String, usize, usize)> = BTreeMap::new();
+    let mut counted: BTreeSet<(String, String, bool)> = BTreeSet::new();
     let (mut no_tam, mut no_backup, mut duplicates, mut skipped, mut customers) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0);
     for (line, r) in body {
         let cell = |f: Field| col.get(f.name()).and_then(|&c| r.get(c)).map(|s| s.trim()).filter(|s| !normalize(s).is_empty());
@@ -545,6 +547,9 @@ fn tams(csv: &str, o: &Options) -> Result<Tams, String> {
         }
         let (tam, backup) = (cell(Field::Tam), cell(Field::Backup));
         let mut count = |name: &str, backup: bool| {
+            if !counted.insert((normalize(name), normalize(customer), backup)) {
+                return;
+            }
             let e = people.entry(normalize(name)).or_insert_with(|| (name.to_string(), 0, 0));
             if backup { e.2 += 1 } else { e.1 += 1 }
         };
@@ -887,6 +892,7 @@ Di Evans,,,2026-11-02T00:00:00Z,2026-11-09T00:00:00Z,3
 Ed Fox,,,2026-11-03T00:00:00Z,2026-11-02T00:00:00Z,1
 Fi Gray,,,soon,2026-11-02T00:00:00Z,1
 Gu Hall,,,2026-11-02T00:00:00Z,2026-11-03T00:00:00Z,shadow
+Hu Ito,,,2026-11-07T08:00:00Z,2026-11-07T12:00:00Z,
 ";
 
     #[test]
@@ -917,7 +923,7 @@ Gu Hall,,,2026-11-02T00:00:00Z,2026-11-03T00:00:00Z,shadow
         // Ana's Monday to Thursday is 72 h, 25.5 of it business hours (3 × 8.5).
         assert_eq!(ana["outsideBusinessHours"].as_f64(), Some(72.0 - 25.5 + 36.0));
         let skipped: Vec<(u64, &str)> = rota["skipped"].as_array().unwrap().iter().map(|s| (s["line"].as_u64().unwrap(), s["reason"].as_str().unwrap())).collect();
-        assert_eq!(skipped, vec![(9, "no person"), (10, "an end that isn't after its start"), (11, "a time that can't be read"), (12, "a role that isn't primary, secondary or a level")]);
+        assert_eq!(skipped, vec![(9, "no person"), (10, "an end that isn't after its start"), (11, "a time that can't be read"), (12, "a role that isn't primary, secondary or a level"), (13, "no role")]);
         assert_eq!((v["ready"].clone(), v["failures"].clone(), v["warnings"].clone()), (json!(false), json!(1), json!(3)));
         let all = format!("{v}{}{}", r.text(), r.markdown());
         for never in ["example.com", "7700", "Di Evans"] {
@@ -964,6 +970,8 @@ Gu Hall,,,2026-11-02T00:00:00Z,2026-11-03T00:00:00Z,shadow
         let v = rota_of(csv, &week()).json();
         assert_eq!(v["rota"]["longStretches"], json!([{ "person": "Ana", "start": "2026-10-30T00:00:00Z", "end": "2026-11-09T00:00:00Z", "hours": 240.0 }]));
         assert_eq!(v["rota"]["load"][0]["primaryHours"].as_f64(), Some(168.0), "load counts only the period");
+        let just_over = "person,start,end\nAna,2026-11-02T00:00:00Z,2026-11-09T00:30:00Z\n";
+        assert_eq!(rota_of(just_over, &week()).json()["rota"]["longStretches"][0]["hours"].as_f64(), Some(168.5), "half an hour over a week is over");
         let mut o = week();
         o.max_stretch_hours = 300;
         assert_eq!(rota_of(csv, &o).json()["rota"]["longStretches"], json!([]));
@@ -1016,6 +1024,11 @@ Hooli,Bo Chen,,Cy Diaz
         let r = check(&Inputs { tams: Some(TAMS.into()), ..Default::default() }, &o).unwrap();
         assert_eq!(r.json()["tams"]["overCapacity"], json!([]));
         assert!(r.text().contains("give --max-accounts"));
+        o.max_accounts = Some(1);
+        let twice = "customer,tam,backup\nAcme,Ana,Bo\nACME,ana,Bo\n";
+        let v = check(&Inputs { tams: Some(twice.into()), ..Default::default() }, &o).unwrap().json();
+        assert_eq!((v["tams"]["overCapacity"].clone(), v["tams"]["duplicates"].clone()), (json!([]), json!(["ACME"])), "a customer listed twice is one account");
+        assert_eq!(v["tams"]["load"][0], json!({ "person": "Ana", "tamFor": 1, "backupFor": 0 }));
         let e = check(&Inputs { tams: Some("customer,tam\nAcme,Ana\n".into()), ..Default::default() }, &o).unwrap_err();
         assert!(e.contains("no backup column"), "{e}");
     }

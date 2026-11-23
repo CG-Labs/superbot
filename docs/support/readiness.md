@@ -2,7 +2,7 @@
 
 Whether the Provider can keep what these playbooks promise ([ADR 0211](../adr/0211-support-readiness-check.md)): its own contacts filled in, an on-call rota that covers the hours its plans sell Severity 1 response in, and a TAM and a different backup TAM for every Enterprise customer, none of them over the accounts a TAM covers. [Response targets](severity.md#targets-not-resolution-times) are a promise only once these exist.
 
-`botctl support-readiness` checks them. It runs anywhere `botctl` does, needs no botd and no sign-in, and reaches no paging tool or CRM: the support manager exports the rota and the TAM list, runs it, and fixes what it reports. It exits 1 when any check fails, so it can gate a launch or run from cron.
+`botctl support-readiness` checks them. It runs anywhere `botctl` does, needs no botd and no sign-in, and reaches no paging tool or CRM: the support manager exports the rota and the TAM list, runs it, and fixes what it reports. It prints the report on stdout either way and exits 1 when any check fails, so it can gate a launch or run from cron.
 
 ## Running it
 
@@ -56,7 +56,7 @@ The rota is the on-call engineer's ([escalation](escalation.md#inside-the-provid
 | `end` | End, Ends, End time, End at, End date, Until, To, Shift end, On call end | Yes |
 | `role` | Role, Level, Escalation level, Layer, Position, Rota role | No: without it every shift is primary |
 
-A role is primary (`primary`, `1`, `Level 1`, `L1`) or secondary (`secondary`, `backup`, `2`). Later escalation levels (`3`, `manager`) are read and counted, but aren't cover: they're the [escalation](escalation.md) after the on-call engineer. People are matched by name, ignoring case and punctuation. Times are RFC 3339 or a date and time, as in the [support report](support-report.md#the-export). A row it can't read (no person, a time it can't read, an end not after its start, a role it doesn't know) is skipped and named by its line, as a warning.
+A role is primary (`primary`, `1`, `Level 1`, `L1`) or secondary (`secondary`, `backup`, `2`). Later escalation levels (`3`, `manager`) are read and counted, but aren't cover: they're the [escalation](escalation.md) after the on-call engineer. People are matched by name, ignoring case and punctuation. Times are RFC 3339 or a date and time, as in the [support report](support-report.md#the-export). A row it can't read (no person, a time it can't read, an end not after its start, a role it doesn't know, or no role in a rota that has a role column) is skipped and named by its line, as a warning.
 
 What it checks, from `--from` to `--to`:
 
@@ -80,7 +80,7 @@ What it checks:
 - **Every customer has a TAM** (a failure for each that doesn't).
 - **Every customer has a backup TAM who isn't the TAM** (a failure for each that doesn't).
 - **No TAM over `--max-accounts`** (a failure for each who is).
-- **Each customer once** (a warning for a customer listed twice, ignoring case and punctuation: which TAM is it?). A row with no customer is skipped and named by its line, as a warning.
+- **Each customer once** (a warning for a customer listed twice, ignoring case and punctuation: which TAM is it?). It counts once towards each person's accounts. A row with no customer is skipped and named by its line, as a warning.
 
 Each person's accounts as TAM and as backup are listed beside the findings.
 

@@ -2093,7 +2093,15 @@ fn run(args: &[String]) -> Result<String, String> {
         [verb @ ("approve" | "deny"), id, rest @ ..] => decide(verb, id, rest),
         ["support-bundle", rest @ ..] => support_bundle(rest),
         ["support-report", rest @ ..] => support_report(rest, std::io::stdin()),
-        ["support-readiness", rest @ ..] => support_readiness(rest, std::io::stdin()),
+        ["support-readiness", rest @ ..] => {
+            let (out, ready) = support_readiness(rest, std::io::stdin())?;
+            if !ready {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(out.as_bytes()).and_then(|_| stdout.flush());
+                std::process::exit(1);
+            }
+            Ok(out)
+        }
         ["health-score", "history", rest @ ..] => {
             let (path, json) = health_request_at(rest, "/api/support/health-score/history", "Usage: botctl health-score history [--days <n>] [json]")?;
             let res = api(Cred::Operator, "GET", &path, None)?;
@@ -2400,8 +2408,9 @@ fn support_report(rest: &[&str], mut stdin: impl Read) -> Result<String, String>
 }
 
 /// `botctl support-readiness`: needs no botd, only the Provider's playbooks, rota and TAM
-/// list. Exits 1 when a check fails, so it can gate a launch or run from cron.
-fn support_readiness(rest: &[&str], mut stdin: impl Read) -> Result<String, String> {
+/// list. The report, and whether it's ready: when not, it's still printed on stdout, and
+/// botctl exits 1, so it can gate a launch or run from cron.
+fn support_readiness(rest: &[&str], mut stdin: impl Read) -> Result<(String, bool), String> {
     let (options, format) = support_readiness::parse_args(rest, chrono::Utc::now())?;
     let mut read = |file: &str| -> Result<String, String> {
         let mut text = String::new();
@@ -2422,7 +2431,7 @@ fn support_readiness(rest: &[&str], mut stdin: impl Read) -> Result<String, Stri
         support_readiness::Format::Markdown => readiness.markdown(),
         support_readiness::Format::Json => pretty(readiness.json().to_string()),
     };
-    if readiness.ready() { Ok(out) } else { Err(out) }
+    Ok((out, readiness.ready()))
 }
 
 const INCIDENT_USAGE: &str = "Usage: botctl incident open \"<title>\" \"<text>\" [--impact <impact>] [--component <id>]... [--state <state>] | update <id> <state> \"<text>\" | resolve <id> \"<text>\" | edit <id> [--title <title>] [--impact <impact>] [--component <id>]... | delete <id> --yes | review <id> [--detected <time>] [--lead-hours <n>] [--json] [-o <file>]";
@@ -2806,7 +2815,7 @@ mod tests {
     }
 
     #[test]
-    fn support_readiness_reads_files_and_stdin_and_fails_on_a_gap() {
+    fn support_readiness_reads_files_and_stdin_and_reports_a_gap() {
         let dir = std::env::temp_dir().join(format!("botctl-support-readiness-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("more")).unwrap();
         std::fs::write(dir.join("README.md"), "Write to the help desk.\n").unwrap();
@@ -2815,14 +2824,18 @@ mod tests {
         let (d, tams) = (dir.to_str().unwrap().to_string(), dir.join("tams.csv").to_str().unwrap().to_string());
         let rota = "person,start,end,role\nAna,2026-11-02T00:00:00Z,2026-11-09T00:00:00Z,primary\nBo,2026-11-02T00:00:00Z,2026-11-09T00:00:00Z,secondary\n";
         let args = ["--docs", &d, "--tams", &tams, "--rota", "-", "--from", "2026-11-02", "--to", "2026-11-08", "--max-accounts", "5"];
-        let out = support_readiness(&args, rota.as_bytes()).unwrap();
+        let (out, ready) = support_readiness(&args, rota.as_bytes()).unwrap();
+        assert!(ready);
         assert!(out.starts_with("Support readiness as of ") && out.contains(": ready\n"), "{out}");
         assert!(out.contains(", 2 pages"), "{out}");
         let gap = "person,start,end\nAna,2026-11-02T00:00:00Z,2026-11-08T00:00:00Z\n";
-        let err: Value = serde_json::from_str(&support_readiness(&["--rota", "-", "--from", "2026-11-02", "--to", "2026-11-08", "--json"], gap.as_bytes()).unwrap_err()).unwrap();
+        let (out, ready) = support_readiness(&["--rota", "-", "--from", "2026-11-02", "--to", "2026-11-08", "--json"], gap.as_bytes()).unwrap();
+        let err: Value = serde_json::from_str(&out).unwrap();
+        assert!(!ready);
         assert_eq!((err["ready"].clone(), err["rota"]["gaps"][0]["minutes"].clone()), (json!(false), json!(1440)), "{err}");
         std::fs::write(dir.join("README.md"), "Write to `<support-email>`.\n").unwrap();
-        assert!(support_readiness(&["--docs", &d], std::io::empty()).unwrap_err().contains("<support-email> is still a placeholder: README.md:1"));
+        let (out, ready) = support_readiness(&["--docs", &d], std::io::empty()).unwrap();
+        assert!(!ready && out.contains("<support-email> is still a placeholder: README.md:1"), "{out}");
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(support_readiness(&["--rota", "/nonexistent/rota.csv"], std::io::empty()).unwrap_err().contains("/nonexistent/rota.csv"));
         assert!(support_readiness(&[], std::io::empty()).unwrap_err().contains("Usage: botctl support-readiness"));
