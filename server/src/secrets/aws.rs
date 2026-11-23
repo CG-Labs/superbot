@@ -1474,9 +1474,9 @@ mod tests {
         assert!(super::super::check_name("AWS_ACCESS_KEY_ID").is_err(), "still never from a store");
         assert!(with(&[]).unwrap().unwrap().run_credentials().is_none(), "off unless set");
         let e = with(&[("AWS_RUN_CREDENTIALS", "aws/creds/bots")]).err().unwrap();
-        assert!(e.contains("AWS_RUN_CREDENTIALS") && e.contains("IAM role's ARN"), "{e}");
+        assert!(e.contains("AWS_RUN_CREDENTIALS") && e.contains("IAM role's ARN"));
         let e = with(&[("AWS_ENDPOINT_URL_STS", "http://sts.example.com")]).err().unwrap();
-        assert!(e.contains("AWS_ENDPOINT_URL_STS"), "{e}");
+        assert!(e.contains("AWS_ENDPOINT_URL_STS"));
         let var = settings(&[("AWS_RUN_CREDENTIALS", "arn:aws:iam::123456789012:role/r")]);
         assert_eq!(super::super::external::unused_settings(&var, "vault"), ["AWS_RUN_CREDENTIALS"], "only SECRETS_BACKEND=aws reads it");
         assert!(super::super::external::unused_settings(&var, "aws").is_empty());
