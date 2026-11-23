@@ -43,6 +43,7 @@ use super::landing::Landing;
 use super::pki::{self, Peer};
 use super::runas::{self, Ids};
 use super::seccomp;
+use super::team_rules;
 use super::teammates::{Files, Teammate, Teammates};
 use super::terminal::Logins;
 use super::tools::Tools;
@@ -113,6 +114,9 @@ pub struct Config {
     pub run_cgroups: bool,
     /// The nft that loads the outbound allow-list (ADR 0135).
     pub nft: PathBuf,
+    /// The first boot's harness egress script (ADR 0126), which a team network's subnet
+    /// is let through in (ADR 0202).
+    pub egress_script: PathBuf,
 }
 
 /// Where harnesses and botctl may live, besides the Bots' home: the system's program
@@ -251,6 +255,7 @@ impl Config {
                 Some(_) => return Err("SUPERBOT_RUN_CGROUPS must be delegated or off".into()),
             },
             nft: "nft".into(),
+            egress_script: team_rules::EGRESS_SCRIPT.into(),
         })
     }
 
@@ -664,6 +669,11 @@ pub struct Agent {
     egress: Mutex<Egress>,
     /// One load of the allow-list's rules at a time.
     egress_loading: tokio::sync::Mutex<()>,
+    /// How the last change to the team network's subnet in the egress rules went
+    /// (ADR 0202).
+    team_rules: Mutex<Option<wire::TeamNetworkReport>>,
+    /// One such change at a time.
+    team_loading: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -929,6 +939,8 @@ impl Agent {
             cgroups,
             egress: Mutex::new(egress),
             egress_loading: tokio::sync::Mutex::new(()),
+            team_rules: Mutex::new(None),
+            team_loading: tokio::sync::Mutex::new(()),
         });
         a.home_use.refresh(&a.home_roots(), false);
         let mut tmps = vec![a.cfg.home.join(TMP)];
@@ -1189,6 +1201,27 @@ impl Agent {
         report
     }
 
+    /// The team network subnet the egress script lets through now (ADR 0202).
+    fn team_report(&self) -> wire::TeamNetworkReport {
+        let last = self.team_rules.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        team_report(read_script(&self.cfg.egress_script), last.as_ref())
+    }
+
+    /// Lets `subnet` through in the egress script, and no other team subnet, then loads
+    /// it again.
+    async fn apply_team_rules(&self, subnet: Option<String>) -> wire::TeamNetworkReport {
+        let _one = self.team_loading.lock().await;
+        let (script, state) = (self.cfg.egress_script.clone(), self.cfg.state_dir.join(TEAM_RULES_STATE));
+        let report = tokio::task::spawn_blocking(move || load_team_rules(&script, &state, subnet.as_deref()))
+            .await
+            .unwrap_or_else(|e| team_failed(None, e.to_string()));
+        if let Some(e) = &report.error {
+            eprintln!("Team network: {e}");
+        }
+        *self.team_rules.lock().unwrap_or_else(|e| e.into_inner()) = Some(report.clone());
+        report
+    }
+
     /// Rotates when due. Returns whether it did.
     pub async fn rotate_if_due(&self) -> Result<bool, Failed> {
         let id = self.identity();
@@ -1201,6 +1234,83 @@ impl Agent {
             permanent: false,
         })?;
         Ok(true)
+    }
+}
+
+/// Where the egress script, run by the agent, says how it went: the unit's own place,
+/// under /run, is read-only to the agent.
+const TEAM_RULES_STATE: &str = "egress-reload";
+/// The most of an egress script read: the first boot's is a few kilobytes.
+const SCRIPT_MAX: u64 = 256 * 1024;
+
+/// The egress script, None if there is none: the machine wasn't hardened.
+fn read_script(path: &Path) -> Result<Option<String>, String> {
+    use std::io::Read;
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("couldn't read the egress script: {e}")),
+    };
+    let mut s = String::new();
+    f.take(SCRIPT_MAX).read_to_string(&mut s).map_err(|e| format!("couldn't read the egress script: {e}"))?;
+    Ok(Some(s))
+}
+
+fn team_failed(subnet: Option<String>, error: String) -> wire::TeamNetworkReport {
+    wire::TeamNetworkReport { subnet, state: wire::TEAM_RULES_FAILED.into(), error: Some(error) }
+}
+
+const NOT_OURS: &str = "the egress script isn't the one the first boot wrote";
+
+/// What `script` lets through, and `last`'s state if it was the change that left it so.
+fn team_report(script: Result<Option<String>, String>, last: Option<&wire::TeamNetworkReport>) -> wire::TeamNetworkReport {
+    let s = match script {
+        Ok(None) => return wire::TeamNetworkReport { subnet: None, state: wire::TEAM_RULES_NONE.into(), error: None },
+        Ok(Some(s)) => s,
+        Err(e) => return team_failed(None, e),
+    };
+    if !team_rules::editable(&s) {
+        return team_failed(None, NOT_OURS.into());
+    }
+    let subnet = team_rules::subnet_in(&s);
+    match last {
+        Some(l) if l.subnet == subnet => l.clone(),
+        _ => wire::TeamNetworkReport { subnet, state: wire::TEAM_RULES_ON.into(), error: None },
+    }
+}
+
+/// Writes `subnet` into the egress script at `path` in place of any other, then runs
+/// it, as the unit does at boot: it replaces the rules' table whole, in one transaction.
+fn load_team_rules(path: &Path, state: &Path, subnet: Option<&str>) -> wire::TeamNetworkReport {
+    let old = match read_script(path) {
+        Ok(None) => return wire::TeamNetworkReport { subnet: None, state: wire::TEAM_RULES_NONE.into(), error: None },
+        Ok(Some(s)) => s,
+        Err(e) => return team_failed(None, e),
+    };
+    let Some(new) = team_rules::with_subnet(&old, subnet) else {
+        return team_failed(None, NOT_OURS.into());
+    };
+    let now = team_rules::subnet_in(&new);
+    if new != old {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = path.with_extension("new");
+        let wrote = std::fs::write(&tmp, &new)
+            .and_then(|()| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)))
+            .and_then(|()| std::fs::rename(&tmp, path));
+        if let Err(e) = wrote {
+            let _ = std::fs::remove_file(&tmp);
+            return team_failed(team_rules::subnet_in(&old), format!("couldn't write the egress script: {e}"));
+        }
+    }
+    let _ = std::fs::create_dir_all(state);
+    match std::process::Command::new(path).env("SUPERBOT_HARDENING_STATE", state).stdin(std::process::Stdio::null()).output() {
+        Ok(o) if o.status.success() => wire::TeamNetworkReport { subnet: now, state: wire::TEAM_RULES_ON.into(), error: None },
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let why = err.trim().lines().last().map_or(format!("it exited with {}", o.status), String::from);
+            team_failed(now, format!("the egress rules didn't load: {}", why.chars().take(200).collect::<String>()))
+        }
+        Err(e) => team_failed(now, format!("the egress script didn't start: {e}")),
     }
 }
 
@@ -1424,6 +1534,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             wire::CAN_EGRESS_POLICY,
             wire::CAN_LOCKED_DOWN,
             wire::CAN_HARNESS_MIRRORS,
+            wire::CAN_TEAM_NETWORK,
         ]
             .into_iter()
             .chain(a.upgrader.build.is_some().then_some(wire::CAN_UPGRADE))
@@ -1449,6 +1560,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             Err(e) => Cgroups::unavailable(e.clone()),
         }),
         egress_policy: Some(a.egress().report),
+        team_network: Some(a.team_report()),
     })
 }
 
@@ -2350,6 +2462,17 @@ async fn put_egress_policy(State(a): State<Arc<Agent>>, Json(p): Json<wire::Egre
     Json(a.apply_egress(p).await).into_response()
 }
 
+/// `PUT /v1/team-network`: lets the harness egress rules through to the team network's
+/// subnet, or to none (ADR 0202). Only a private IPv4 network is taken. Answers how the
+/// rules stand once they are loaded.
+async fn put_team_network(State(a): State<Arc<Agent>>, Json(r): Json<wire::TeamNetworkRules>) -> Response {
+    let subnet = match r.subnet.as_deref().map(team_rules::subnet).transpose() {
+        Ok(s) => s,
+        Err(e) => return refuse(StatusCode::BAD_REQUEST, e),
+    };
+    Json(a.apply_team_rules(subnet).await).into_response()
+}
+
 /// `POST /v1/retention`: deletes old harness session files and archived teammates' work
 /// (ADR 0112). botd sends it only while none of the Bots it sweeps for is running.
 async fn retention(State(a): State<Arc<Agent>>, Json(r): Json<wire::RetentionRequest>) -> Response {
@@ -2409,6 +2532,7 @@ pub fn router(a: Arc<Agent>) -> Router {
         .route("/v1/teammates/{user}/purge", post(purge_teammate))
         .route("/v1/retention", post(retention))
         .route("/v1/egress-policy", axum::routing::put(put_egress_policy))
+        .route("/v1/team-network", axum::routing::put(put_team_network))
         .layer(DefaultBodyLimit::max(MAX_RELAY_BODY))
         .with_state(a)
 }
@@ -2574,6 +2698,62 @@ pub async fn run(cfg: Config) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An egress script shaped as the first boot's: it writes its heredoc where the rules
+    /// go, and fails when told to.
+    fn stand_in_egress(dir: &Path, fail: bool) -> PathBuf {
+        let path = dir.join("egress");
+        let tail = if fail { "echo 'nft: syntax error' >&2\nexit 1\n" } else { "" };
+        let s = format!("#!/bin/sh\nset -e\n{{\n  cat <<'DENY'\n    ip daddr {{ 10.0.0.0/8 }} counter reject\nDENY\n}} > \"$SUPERBOT_HARDENING_STATE/rules\"\n{tail}");
+        std::fs::write(&path, s).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_team_subnet_is_written_into_the_egress_script_and_loaded() {
+        let dir = std::env::temp_dir().join(format!("sb-agent-team-rules-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("state");
+        let script = stand_in_egress(&dir, false);
+        let none = || team_report(read_script(&script), None);
+        assert_eq!((none().state.as_str(), none().subnet), (wire::TEAM_RULES_ON, None));
+
+        let r = load_team_rules(&script, &state, Some("10.248.0.0/22"));
+        assert_eq!((r.state.as_str(), r.subnet.as_deref(), r.error), (wire::TEAM_RULES_ON, Some("10.248.0.0/22"), None));
+        let rules = std::fs::read_to_string(state.join("rules")).unwrap();
+        assert!(rules.starts_with("    ip daddr 10.248.0.0/22 accept\n    ip daddr { 10.0.0.0/8 }"), "before the denies: {rules}");
+        assert_eq!(none().subnet.as_deref(), Some("10.248.0.0/22"), "read back from the script");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&script).unwrap().permissions().mode() & 0o777, 0o755);
+        assert!(!script.with_extension("new").exists());
+
+        let r = load_team_rules(&script, &state, None);
+        assert_eq!((r.state.as_str(), r.subnet), (wire::TEAM_RULES_ON, None));
+        assert!(!std::fs::read_to_string(state.join("rules")).unwrap().contains("accept"), "withdrawn");
+
+        // A script that fails to load says so, and goes on saying so until a change.
+        let script = stand_in_egress(&dir, true);
+        let r = load_team_rules(&script, &state, Some("10.248.0.0/22"));
+        assert_eq!((r.state.as_str(), r.subnet.as_deref()), (wire::TEAM_RULES_FAILED, Some("10.248.0.0/22")));
+        assert!(r.error.as_deref().unwrap().ends_with("nft: syntax error"), "{:?}", r.error);
+        assert_eq!(team_report(read_script(&script), Some(&r)), r);
+        assert_eq!(team_report(read_script(&script), Some(&team_failed(None, "old".into()))).state, wire::TEAM_RULES_ON);
+
+        // No script: nothing to let through. Someone else's script: left alone.
+        let gone = dir.join("missing");
+        assert_eq!(load_team_rules(&gone, &state, Some("10.248.0.0/22")).state, wire::TEAM_RULES_NONE);
+        assert!(!gone.exists());
+        let theirs = dir.join("theirs");
+        std::fs::write(&theirs, "#!/bin/sh\nexit 0\n").unwrap();
+        let r = load_team_rules(&theirs, &state, Some("10.248.0.0/22"));
+        assert_eq!((r.state.as_str(), r.error.as_deref()), (wire::TEAM_RULES_FAILED, Some(NOT_OURS)));
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "#!/bin/sh\nexit 0\n");
+        assert_eq!(team_report(read_script(&theirs), None).state, wire::TEAM_RULES_FAILED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_job_cant_move_its_home_path_or_temporary_folder() {

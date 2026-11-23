@@ -734,7 +734,9 @@ impl MachineProvider for Linode {
                     let Some(machine) = l["id"].as_u64() else { continue };
                     for i in l["interfaces"].as_array().into_iter().flatten() {
                         if let (Some(interface), Some(config)) = (i["id"].as_u64(), i["config_id"].as_u64()) {
-                            out.push(NetworkMember { machine: machine.to_string(), config: config.to_string(), interface: interface.to_string() });
+                            // Unsaid is taken as active: it is left only once the machine is off.
+                            let active = i["active"].as_bool().unwrap_or(true);
+                            out.push(NetworkMember { machine: machine.to_string(), config: config.to_string(), interface: interface.to_string(), active });
                         }
                     }
                 }
@@ -755,6 +757,39 @@ impl MachineProvider for Linode {
                 Ok(_) | Err(ProviderError::NotFound) => Ok(()),
                 Err(e) => Err(e),
             }
+        })
+    }
+
+    /// Configuration-profile interfaces, as a create's are (ADR 0189), appended to the
+    /// Linode's one profile: its public interface first if the profile lists none (an
+    /// empty list is Linode's public default, and a VPC interface alone would become
+    /// the primary), then the VPC's. Linode puts them in place at the next boot.
+    fn join_team_network<'a>(&'a self, machine: &'a str, n: &'a TeamNetwork) -> Fut<'a, ()> {
+        Box::pin(async move {
+            let id = path_id(machine)?;
+            let subnet: u64 = path_id(&n.subnet_id)?.parse().unwrap_or_default();
+            let refused = |message: String| ProviderError::Api { status: 409, message };
+            let l = self.call(Method::GET, &format!("/linode/instances/{id}"), None, None).await?;
+            if l["interface_generation"] == "linode" {
+                return Err(refused("it has Linode interfaces, each with a firewall of its own, not configuration-profile ones; rebuild or recreate it to join its team's network".into()));
+            }
+            let configs = self.all(&format!("/linode/instances/{id}/configs"), None).await?;
+            let [c] = configs.as_slice() else {
+                return Err(refused(format!("it has {} configuration profiles; one is needed to know which it boots", configs.len())));
+            };
+            let config = c["id"].as_u64().ok_or_else(|| ProviderError::Transport("Linode sent a configuration profile we couldn't read".into()))?;
+            let interfaces = c["interfaces"].as_array().cloned().unwrap_or_default();
+            if let Some(v) = interfaces.iter().find(|i| i["purpose"] == "vpc") {
+                return if v["subnet_id"].as_u64() == Some(subnet) { Ok(()) } else { Err(refused("it is on another VPC; it leaves that one first".into())) };
+            }
+            let path = format!("/linode/instances/{id}/configs/{config}/interfaces");
+            if interfaces.is_empty() {
+                self.call(Method::POST, &path, None, Some(&json!({ "purpose": "public" }))).await?;
+            } else if interfaces[0]["purpose"] != "public" {
+                return Err(refused("its first interface isn't its public one, which must stay the primary".into()));
+            }
+            self.call(Method::POST, &path, None, Some(&json!({ "purpose": "vpc", "subnet_id": subnet }))).await?;
+            Ok(())
         })
     }
 
@@ -976,6 +1011,12 @@ mod tests {
                     record(&s, "GET", format!("/linode/instances/{id}"), &h, Value::Null);
                     match id {
                         7 => (StatusCode::OK, Json(instance(7, "superbot-m7", "running"))),
+                        21..=25 => (StatusCode::OK, Json(instance(id, &format!("superbot-m{id}"), "running"))),
+                        26 => {
+                            let mut m = instance(26, "superbot-m26", "running");
+                            m["interface_generation"] = json!("linode");
+                            (StatusCode::OK, Json(m))
+                        }
                         6 => {
                             let mut m = instance(6, "superbot-m6", "running");
                             m["backups"] = json!({ "available": true, "enabled": true, "last_successful": "2026-11-21T03:14:07",
@@ -999,10 +1040,28 @@ mod tests {
                     let b = serde_json::from_slice(&body).unwrap_or(Value::Null);
                     record(&s, "POST", format!("/linode/instances/{id}/{action}"), &h, b);
                     match id {
-                        7 => (StatusCode::OK, Json(json!({}))),
+                        7 | 21..=26 => (StatusCode::OK, Json(json!({}))),
                         8 => (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "errors": [{ "reason": "Too many requests" }] }))),
                         _ => (StatusCode::BAD_REQUEST, Json(json!({ "errors": [{ "reason": "Linode busy." }] }))),
                     }
+                })
+                // Configuration profiles for joining a team's VPC (ADR 0202): 21 lists no
+                // interfaces (Linode's public default), 22 its public one, 23 is on the
+                // VPC already, 24 has two profiles, 25 is on another VPC.
+                .get(move |State(s): State<Seen>, h: HeaderMap, Path((id, action)): Path<(u64, String)>| async move {
+                    record(&s, "GET", format!("/linode/instances/{id}/{action}"), &h, Value::Null);
+                    let config = |n: u64, interfaces: Value| json!({ "id": n, "label": "My Ubuntu Profile", "interfaces": interfaces });
+                    let public = json!({ "id": 1, "purpose": "public", "primary": false, "active": true });
+                    let vpc = |subnet: u64| json!({ "id": 2, "purpose": "vpc", "subnet_id": subnet, "vpc_id": 5, "active": false });
+                    let data = match (id, action.as_str()) {
+                        (21, "configs") => json!([config(210, json!([]))]),
+                        (22, "configs") => json!([config(220, json!([public]))]),
+                        (23, "configs") => json!([config(230, json!([public, vpc(50)]))]),
+                        (24, "configs") => json!([config(240, json!([])), config(241, json!([]))]),
+                        (25, "configs") => json!([config(250, json!([public, vpc(70)]))]),
+                        _ => return (StatusCode::NOT_FOUND, Json(json!({ "errors": [{ "reason": "Not found" }] }))),
+                    };
+                    (StatusCode::OK, Json(json!({ "data": data, "page": 1, "pages": 1, "results": 1 })))
                 })
                 .delete(move |State(s): State<Seen>, h: HeaderMap, Path((id, action)): Path<(u64, String)>| async move {
                     record(&s, "DELETE", format!("/linode/instances/{id}/{action}"), &h, Value::Null);
@@ -1061,6 +1120,7 @@ mod tests {
                         ] },
                         { "id": 51, "label": "services", "ipv4": "10.250.0.0/24", "linodes": [
                             { "id": 30, "interfaces": [{ "id": 3001, "active": true, "config_id": 300 }] },
+                            { "id": 31, "interfaces": [{ "id": 3101, "active": false, "config_id": 310 }] },
                         ] },
                     ], "page": 1, "pages": 1, "results": 2 })))
                 })
@@ -1635,10 +1695,11 @@ mod tests {
         assert_eq!(
             members,
             [
-                NetworkMember { machine: "7".into(), config: "70".into(), interface: "701".into() },
-                NetworkMember { machine: "30".into(), config: "300".into(), interface: "3001".into() },
+                NetworkMember { machine: "7".into(), config: "70".into(), interface: "701".into(), active: true },
+                NetworkMember { machine: "30".into(), config: "300".into(), interface: "3001".into(), active: true },
+                NetworkMember { machine: "31".into(), config: "310".into(), interface: "3101".into(), active: false },
             ],
-            "every subnet's; an interface of another kind has no profile to take it off"
+            "every subnet's; an interface of another kind has no profile to take it off; one added since its boot is inactive"
         );
         api.leave_team_network(&members[0]).await.unwrap();
         let gone = NetworkMember { machine: "9".into(), ..members[0].clone() };
@@ -1660,6 +1721,39 @@ mod tests {
             ]
         );
         assert!(seen[0].2.is_none(), "every VPC, filtered here");
+    }
+
+    #[tokio::test]
+    async fn an_existing_linode_joins_its_teams_vpc_at_its_next_boot() {
+        let (api, seen) = fake_api().await;
+        let n = TeamNetwork { id: "5".into(), label: "superbot-team-a-gb-lon".into(), region: "gb-lon".into(), subnet_id: "50".into(), subnet: "10.248.0.0/22".into(), created: false };
+        // No interfaces listed: its public one is put first, then the VPC's.
+        api.join_team_network("21", &n).await.unwrap();
+        // Its public one listed already: only the VPC's.
+        api.join_team_network("22", &n).await.unwrap();
+        // On it already, or joining at its next boot: nothing to do.
+        api.join_team_network("23", &n).await.unwrap();
+        let refused = |r: Result<(), ProviderError>, why: &str| match r {
+            Err(ProviderError::Api { status: 409, message }) => assert!(message.contains(why), "{message}"),
+            other => panic!("{why}: {other:?}"),
+        };
+        refused(api.join_team_network("24", &n).await, "2 configuration profiles");
+        refused(api.join_team_network("25", &n).await, "another VPC");
+        refused(api.join_team_network("26", &n).await, "Linode interfaces");
+        assert!(api.join_team_network("../21", &n).await.is_err());
+        assert!(api.join_team_network("21", &TeamNetwork { subnet_id: "5/0".into(), ..n.clone() }).await.is_err());
+        let seen = seen.lock().unwrap();
+        let posts: Vec<(&str, &Value)> = seen.iter().filter(|s| s.0 == "POST").map(|s| (s.1.as_str(), &s.3)).collect();
+        assert_eq!(
+            posts,
+            [
+                ("/linode/instances/21/configs/210/interfaces", &json!({ "purpose": "public" })),
+                ("/linode/instances/21/configs/210/interfaces", &json!({ "purpose": "vpc", "subnet_id": 50 })),
+                ("/linode/instances/22/configs/220/interfaces", &json!({ "purpose": "vpc", "subnet_id": 50 })),
+            ],
+            "public first, the primary; nothing sent for one refused or on it already"
+        );
+        assert!(!seen.iter().any(|s| s.1.contains("..")), "a bad id never reaches a path");
     }
 
     #[test]

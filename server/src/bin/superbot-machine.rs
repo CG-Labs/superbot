@@ -30,6 +30,8 @@ mod sandbox;
 mod runas;
 #[path = "../machines/seccomp.rs"]
 mod seccomp;
+#[path = "../machines/team_rules.rs"]
+mod team_rules;
 #[path = "../machines/teammates.rs"]
 mod teammates;
 #[path = "../machines/terminal.rs"]
