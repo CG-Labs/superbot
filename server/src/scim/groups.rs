@@ -7,10 +7,12 @@
 //! (ADR 0093) follow. SCIM never gives a team role: members join as `member`, and a
 //! team the IdP made has no owner until a server admin names one. An admin can map a
 //! group to a custom role (ADR 0138, `roles`), which its members get and lose with it.
-//! Off unless SCIM_GROUPS=on as well as SCIM=on.
+//! A group an admin declared a role group (ADR 0180, `role_groups`) is no team: these
+//! handlers pass it there. Off unless SCIM_GROUPS=on as well as SCIM=on.
 
+use super::role_groups;
 use super::*;
-use crate::db::{ScimGroup, ScimGroupConflict, Team};
+use crate::db::{ScimGroup, ScimGroupConflict, ScimRoleGroup, Team};
 use crate::teams;
 use std::collections::HashSet;
 
@@ -163,14 +165,14 @@ pub fn resource(app: &AppState, base: &str, g: &ScimGroup, members: bool) -> Val
 fn group_resource_type(base: &str) -> Value {
     json!({
         "schemas": ["urn:ietf:params:scim:schemas:core:2.0:ResourceType"],
-        "id": "Group", "name": "Group", "endpoint": "/Groups", "description": "SuperBot teams",
+        "id": "Group", "name": "Group", "endpoint": "/Groups", "description": "SuperBot teams, and role groups an admin declared",
         "schema": GROUP_SCHEMA, "schemaExtensions": [],
         "meta": { "resourceType": "ResourceType", "location": format!("{base}/ResourceTypes/Group") },
     })
 }
 
 fn group_schema(base: &str) -> Value {
-    let mut members = attribute("members", "complex", false, "none", "The people on the team this tenant provisioned. Others on the team are never shown or changed.");
+    let mut members = attribute("members", "complex", false, "none", "The people on the team (or in the role group) this tenant provisioned. Others on the team are never shown or changed.");
     members["multiValued"] = json!(true);
     let mut reference = attribute("$ref", "reference", false, "none", "The user's location");
     reference["referenceTypes"] = json!(["User"]);
@@ -182,7 +184,7 @@ fn group_schema(base: &str) -> Value {
     members["subAttributes"] = json!([value, display, reference, attribute("type", "string", false, "none", "User; groups in groups aren't supported")]);
     json!({
         "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Schema"],
-        "id": GROUP_SCHEMA, "name": "Group", "description": "A SuperBot team",
+        "id": GROUP_SCHEMA, "name": "Group", "description": "A SuperBot team, or a role group an admin declared",
         "attributes": [attribute("displayName", "string", true, "server", "Unique in the tenant, any case; the team's name"), members],
         "meta": { "resourceType": "Schema", "location": format!("{base}/Schemas/{GROUP_SCHEMA}") },
     })
@@ -289,7 +291,7 @@ impl Patched {
         }
     }
 
-    fn replace(&mut self, ids: Vec<String>) {
+    pub(super) fn replace(&mut self, ids: Vec<String>) {
         self.members.clear();
         self.add(ids);
     }
@@ -465,17 +467,45 @@ pub async fn list(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>
     }
     let filter = q.iter().find(|(k, _)| k.eq_ignore_ascii_case("filter")).map(|(_, v)| v.as_str()).filter(|f| !f.trim().is_empty());
     let clauses = filter.map(parse_filter).transpose().map_err(|e| ScimError::new(StatusCode::BAD_REQUEST, Some("invalidFilter"), e))?.unwrap_or_default();
-    let all: Vec<ScimGroup> = app.db.scim_groups(&c.token.tenant).into_iter().filter(|g| matches(&app, g, &clauses)).collect();
+    let teams = app.db.scim_groups(&c.token.tenant).into_iter().filter(|g| matches(&app, g, &clauses)).map(Listed::Team);
+    let roles = role_groups::all_pushed(&app, &c.token.tenant).into_iter().filter(|g| role_groups::matches(&app, g, &clauses)).map(Listed::Role);
+    let mut all: Vec<Listed> = teams.chain(roles).collect();
+    all.sort_by(|a, b| a.order().cmp(&b.order()));
     let base = base_url(&headers);
     let members = wants_members(&q);
-    let page: Vec<Value> = all.iter().skip((start - 1) as usize).take(count as usize).map(|g| resource(&app, &base, g, members)).collect();
+    let page: Vec<Value> = all.iter().skip((start - 1) as usize).take(count as usize).map(|g| g.resource(&app, &base, members)).collect();
     Ok(super::list(page, all.len() as i64, start))
+}
+
+/// A tenant's group in a list: a team, or a role group.
+enum Listed {
+    Team(ScimGroup),
+    Role(ScimRoleGroup),
+}
+
+impl Listed {
+    fn order(&self) -> (i64, &str) {
+        match self {
+            Listed::Team(g) => (g.created_at, &g.team_id),
+            Listed::Role(g) => (g.provisioned_at.unwrap_or(g.created_at), &g.id),
+        }
+    }
+
+    fn resource(&self, app: &AppState, base: &str, members: bool) -> Value {
+        match self {
+            Listed::Team(g) => resource(app, base, g, members),
+            Listed::Role(g) => role_groups::resource(app, base, g, members),
+        }
+    }
 }
 
 /// `GET /scim/v2/Groups/{id}`, with its members unless `excludedAttributes=members`.
 pub async fn get(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> ScimRes {
     if !a.scim.groups {
         return Err(missing("Group"));
+    }
+    if let Some(g) = role_groups::pushed(&app, &c.token.tenant, &id) {
+        return Ok(scim_json(StatusCode::OK, role_groups::resource(&app, &base_url(&headers), &g, wants_members(&q))));
     }
     let (g, _) = need(&app, &c, &id)?;
     Ok(scim_json(StatusCode::OK, resource(&app, &base_url(&headers), &g, wants_members(&q))))
@@ -493,6 +523,9 @@ pub async fn create(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
     let d = from_resource(&parse_body(body)?, None)?;
     let tenant = c.token.tenant.as_str();
     let _writes = a.scim.group_writes.lock().await;
+    if let Some(r) = role_groups::create(&app, &a, &c, &base_url(&headers), &d).await? {
+        return Ok(r);
+    }
     let by_ext = d.external_id.as_deref().and_then(|x| app.db.scim_group_find(tenant, Some(x), None));
     let by_name = app.db.scim_group_find(tenant, None, Some(&d.display_name));
     let waiting = match (&by_ext, &by_name) {
@@ -550,6 +583,10 @@ async fn update(app: &AppState, a: &Auth, c: &Caller, before: &ScimGroup, team: 
     {
         return Err(ScimError::new(StatusCode::BAD_REQUEST, Some("mutability"), "externalId can't change once set. Delete the group and push it again."));
     }
+    let renamed = !p.display_name.eq_ignore_ascii_case(&before.display_name);
+    if role_groups::role_group_has(app, &c.token.tenant, renamed.then_some(p.display_name.as_str()), p.external_id.as_deref().filter(|_| before.external_id.is_none()), None) {
+        return Err(uniqueness("Another group in this tenant has this displayName or externalId."));
+    }
     let (gone, new) = p.delta(members);
     check_new(app, c, Some(&team.id), &new)?;
     let g = app.db.save_scim_group(&c.token.tenant, &team.id, p.external_id.as_deref(), &p.display_name, &team_name(&p.display_name), true).map_err(group_conflict)?;
@@ -567,6 +604,17 @@ pub async fn replace(State(app): State<AppState>, Extension(a): Extension<Arc<Au
     }
     let v = parse_body(body)?;
     let _writes = a.scim.group_writes.lock().await;
+    if let Some(before) = role_groups::pushed(&app, &c.token.tenant, &id) {
+        let d = from_resource(&v, None)?;
+        let mut p = role_groups::patched(&app, &before);
+        p.display_name = d.display_name;
+        p.external_id = d.external_id.or_else(|| before.external_id.clone());
+        if let Some(m) = d.members {
+            p.replace(m);
+        }
+        let g = role_groups::update(&app, &a, &c, &before, &p).await?;
+        return Ok(scim_json(StatusCode::OK, role_groups::resource(&app, &base_url(&headers), &g, true)));
+    }
     let (before, team) = need(&app, &c, &id)?;
     let d = from_resource(&v, Some(&before))?;
     let members: Vec<String> = app.db.scim_group_members(&c.token.tenant, &team.id, true).into_iter().map(|u| u.id).collect();
@@ -585,6 +633,12 @@ pub async fn patch(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
     }
     let v = parse_body(body)?;
     let _writes = a.scim.group_writes.lock().await;
+    if let Some(before) = role_groups::pushed(&app, &c.token.tenant, &id) {
+        let mut p = role_groups::patched(&app, &before);
+        apply_patch(&mut p, &v)?;
+        role_groups::update(&app, &a, &c, &before, &p).await?;
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
     let (before, team) = need(&app, &c, &id)?;
     let members: Vec<String> = app.db.scim_group_members(&c.token.tenant, &team.id, true).into_iter().map(|u| u.id).collect();
     let mut p = Patched::new(&before.display_name, before.external_id.as_deref(), &members);
@@ -603,6 +657,9 @@ pub async fn delete(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
         return Err(off());
     }
     let _writes = a.scim.group_writes.lock().await;
+    if let Some(g) = role_groups::pushed(&app, &c.token.tenant, &id) {
+        return role_groups::delete(&app, &a, &c, &g).await;
+    }
     let (g, team) = need(&app, &c, &id)?;
     let members: Vec<String> = app.db.scim_group_members(&c.token.tenant, &team.id, true).into_iter().map(|u| u.id).collect();
     let moved = change_members(&app, &a, &c, &team, &members, &[]).await?;
@@ -689,6 +746,9 @@ pub async fn link(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>
     let external_id = clean("externalId", 256)?;
     let display_name = clean("displayName", MAX_NAME)?.unwrap_or_else(|| team.name.clone());
     let _writes = a.scim.group_writes.lock().await;
+    if role_groups::role_group_has(&app, &tenant, Some(&display_name), external_id.as_deref(), None) {
+        return Err(ApiError(StatusCode::CONFLICT, format!("Tenant {tenant} has a role group with this displayName or externalId. A group is a team or a role group, not both.")));
+    }
     let g = app.db.link_scim_group(&tenant, &team.id, external_id.as_deref(), &display_name, by.actor.id.as_deref()).map_err(|e| match e {
         ScimGroupConflict::Team => ApiError(StatusCode::CONFLICT, "This team is linked to a SCIM group already. Unlink it first.".into()),
         ScimGroupConflict::DisplayName => ApiError(StatusCode::CONFLICT, format!("Tenant {tenant} has a group with this displayName already.")),

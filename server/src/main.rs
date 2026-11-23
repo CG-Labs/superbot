@@ -173,6 +173,8 @@ mod scim_google_http_tests;
 #[cfg(test)]
 mod scim_group_roles_http_tests;
 #[cfg(test)]
+mod scim_role_groups_http_tests;
+#[cfg(test)]
 mod scim_groups_http_tests;
 #[cfg(test)]
 mod scim_http_tests;
@@ -222,6 +224,8 @@ mod usage;
 mod usage_http_tests;
 #[cfg(test)]
 mod vault_auth_http_tests;
+#[cfg(test)]
+mod run_credentials_http_tests;
 mod storage;
 #[cfg(test)]
 mod storage_http_tests;
@@ -452,6 +456,10 @@ async fn main() {
     }
     let server_backups = server_backups::ServerBackups::from_env(&startup_store, &|k| env(k, ""), &data_dir)
         .unwrap_or_else(|e| exit(format!("Server backups: {e}")));
+    let off_host = server_backups.target.as_ref().map(|t| (t.source, t.destination()));
+    control_plane.server_data = machines::server_data::ServerData::from_env(&|k| env(k, ""), &control_plane.regions, off_host)
+        .unwrap_or_else(|e| exit(format!("Server data region: {e}")));
+    log_info!("Server data region: {} (ADR 0184).", control_plane.server_data.describe());
     // Machine enrollment's CA key is derived from the master key (ADR 0031).
     let bin_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
     // Users' machines get the managed tiers' default harnesses unless told otherwise (ADR 0079).
@@ -1017,6 +1025,9 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/auth/sso/{id}/slo", get(sso::slo_get).post(sso::slo_post))
         .route("/sso/{id}/saml", get(sso::saml_status))
         .route("/sso/{id}/saml/idp-metadata", put(sso::saml_import))
+        .route("/sso/{id}/saml/keys/{use}/next", post(sso::saml_key_next).delete(sso::saml_key_cancel))
+        .route("/sso/{id}/saml/keys/{use}/promote", post(sso::saml_key_promote))
+        .route("/sso/{id}/saml/keys/{use}/previous", delete(sso::saml_key_retire))
         .route("/sso/role-mappings", get(sso::saml_roles::list).post(sso::saml_roles::create))
         .route("/sso/role-mappings/{id}", get(sso::saml_roles::get).delete(sso::saml_roles::delete))
         .route("/users", get(users::list_users).post(users::create_user))
@@ -1142,6 +1153,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/scim/groups/{team}", delete(scim::groups::unlink))
         .route("/scim/role-mappings", get(scim::roles::list).post(scim::roles::create))
         .route("/scim/role-mappings/{id}", get(scim::roles::get).delete(scim::roles::delete))
+        .route("/scim/role-groups", get(scim::role_groups::list).post(scim::role_groups::create_api))
+        .route("/scim/role-groups/{id}", get(scim::role_groups::get_api).patch(scim::role_groups::update_api).delete(scim::role_groups::delete_api))
         .route("/scim/google", get(scim::google::status))
         .route("/scim/google/sync", post(scim::google::sync))
         .route("/status/incidents", get(status::list).post(status::create))

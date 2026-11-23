@@ -193,7 +193,7 @@ The bridge's settings (`CLIENT_ID`, `IDP_ALIAS`, `SCOPES`, `*_CLAIM`) are refuse
 
 ## The SP key
 
-Each native provider has a signing key and certificate of its own ([ADR 0137](../adr/0137-saml-signed-requests-and-single-logout.md)). botd makes them the first time they're needed (RSA-3072, the certificate valid for 20 years), keeps the key sealed in its database, audits `sso.saml_sp_key_created`, and publishes the certificate and the SLO URL in the SP metadata. `botctl sso saml corp` shows its SHA-256. To use your own, set `SSO_CORP_SP_CERT_FILE=/etc/superbot/corp-sp.pem` and the key as `SSO_CORP_PRIVATE_KEY` (`botctl secret set SSO_CORP_PRIVATE_KEY < corp-sp.key`); the provider isn't offered until the key is set and matches the certificate. botd reads it once, so restart botd after changing it. Your own key may be RSA (2048 bits or more) or ECDSA P-256 or P-384 (PKCS #8): botd then signs with `ecdsa-sha256` or `ecdsa-sha384`. Generated keys are always RSA, which every IdP takes.
+Each native provider has a signing key and certificate of its own ([ADR 0137](../adr/0137-saml-signed-requests-and-single-logout.md)). botd makes them the first time they're needed (RSA-3072, the certificate valid for 20 years), keeps the key sealed in its database, audits `sso.saml_sp_key_created`, and publishes the certificate and the SLO URL in the SP metadata. `botctl sso saml corp` shows its SHA-256. To replace it, [roll it over](#rolling-over-superbots-keys). To use your own, set `SSO_CORP_SP_CERT_FILE=/etc/superbot/corp-sp.pem` and the key as `SSO_CORP_PRIVATE_KEY` (`botctl secret set SSO_CORP_PRIVATE_KEY < corp-sp.key`); the provider isn't offered until the key is set and matches the certificate. botd reads it once, so restart botd after changing it. Your own key may be RSA (2048 bits or more) or ECDSA P-256 or P-384 (PKCS #8): botd then signs with `ecdsa-sha256` or `ecdsa-sha384`. Generated keys are always RSA, which every IdP takes.
 
 If your IdP imported SuperBot's metadata before this key existed, import it again (or add the certificate and the SLO URL by hand) before turning on signed requests or single logout.
 
@@ -217,7 +217,28 @@ What botd takes and refuses:
 - **The IdP's signature still counts.** Anyone can encrypt to SuperBot's public certificate, so the assertion inside must be signed by the IdP, exactly as a plain one. A signature on the response is checked before anything is decrypted. The decrypted assertion goes through every other check: one assertion only, no assertion inside it, signatures only where they belong, IDs unique across the response and the assertion.
 - **Encrypted NameIDs** (`EncryptedID`), in assertions and in the IdP's LogoutRequests, are decrypted the same way, with the same key and algorithms ([ADR 0151](../adr/0151-saml-encrypted-nameids-ecdsa-and-signed-metadata.md)). They need `ENCRYPTED_ASSERTIONS=allow` or `require`, even if the IdP encrypts only the NameID. With it `off`, they're refused (`encrypted_id`). They're read only after the IdP's signature over them is checked. Inside there must be exactly one `NameID`, and a subject with two identifiers is refused (`wrapped`).
 
-To use your own key, set `SSO_CORP_SP_ENCRYPTION_CERT_FILE=/etc/superbot/corp-enc.pem` and `botctl secret set SSO_CORP_ENCRYPTION_PRIVATE_KEY < corp-enc.key`. It must be another key than the signing one, and RSA (IdPs encrypt to it with RSA-OAEP). The provider isn't offered until the key is set and matches. To change keys, give the IdP the new certificate first; botd decrypts only with the key it has.
+To use your own key, set `SSO_CORP_SP_ENCRYPTION_CERT_FILE=/etc/superbot/corp-enc.pem` and `botctl secret set SSO_CORP_ENCRYPTION_PRIVATE_KEY < corp-enc.key`. It must be another key than the signing one, and RSA (IdPs encrypt to it with RSA-OAEP). The provider isn't offered until the key is set and matches. To change the keys botd made, [roll them over](#rolling-over-superbots-keys).
+
+## Rolling over SuperBot's keys
+
+The keys botd makes can be replaced without a failed sign-in, on a schedule or after a suspected leak ([ADR 0181](../adr/0181-saml-sp-key-rollover.md)). Each provider's signing and encryption keys roll over separately; replace `encryption` with `signing` below for the signing key.
+
+1. **Make the next key.** `botctl sso saml corp key next encryption`. botd makes a new key and publishes its certificate in the SP metadata after the one in use. A next encryption key decrypts from now on, too; a next signing key doesn't sign yet. Audited as `sso.saml_sp_key_created` with `stage` = `next`.
+2. **Give it to the IdP.** An IdP that reads SuperBot's metadata URL picks it up by itself. Otherwise import the metadata again or upload the new certificate (`botctl sso saml corp` shows both SHA-256s). For encryption, switch the IdP's encryption certificate to the new one; for signing, add it beside the old one.
+3. **Promote it.** `botctl sso saml corp key promote encryption`. The next key becomes the one in use, and the metadata publishes only it. A replaced encryption key is kept as *previous*: no longer published, but it still decrypts, so an IdP that hasn't switched yet keeps working. A replaced signing key is dropped. Audited as `sso.saml_sp_key_promoted`.
+4. **Retire the old encryption key.** Once nothing is encrypted to it, `botctl sso saml corp key retire encryption`. Audited as `sso.saml_sp_key_retired`.
+
+`botctl sso saml corp` shows each stage under the certificate it belongs to, and for encryption keys when each last decrypted a sign-in:
+
+```console
+  SP encryption certificate: SHA-256 4b:7e:… (generated), expires 2046-11-21
+    In use; last decrypted a sign-in 3m ago
+    Previous: SHA-256 a0:19:…: no longer published, still decrypts until retired; last decrypted a sign-in 2d ago
+```
+
+Promote once the next key has decrypted a sign-in (the IdP has it), and retire once the previous one hasn't for as long as your IdP takes to switch. These times are kept in memory, so they start over when botd restarts. `botctl sso saml corp key cancel encryption` drops a next key you haven't promoted. One rollover at a time: botd refuses a second next key, and a promotion while a previous key is still there.
+
+The keys of each stage are sealed in botd's database like the first one, and rotating the master key covers them. Keys from `SSO_<ID>_SP_CERT_FILE` or `SSO_<ID>_SP_ENCRYPTION_CERT_FILE` are yours, so botd refuses to roll them over. To change one, add the new certificate at the IdP first (for encryption, IdPs take only one, so do it when you change the key), then change the file and the secret together and restart botd.
 
 ## IdP keys: RSA and ECDSA
 
@@ -264,7 +285,7 @@ Every refused sign-in is in the audit log with a reason (`botctl audit --action 
 | `weak_algorithm`, `bad_algorithm` | Use RSA-SHA256 or ECDSA with SHA-256/384 (SHA-1 is refused), and AES-GCM if you encrypt (AES-CBC is refused). |
 | `encrypted_assertion` | The IdP encrypts but `SSO_<ID>_ENCRYPTED_ASSERTIONS` is `off`: turn it on ([above](#encrypted-assertions)), or turn off encryption at the IdP. |
 | `unencrypted_assertion` | `ENCRYPTED_ASSERTIONS=require`, but the IdP sent a plain assertion: turn on encryption at the IdP. |
-| `bad_encryption` | botd couldn't decrypt: the IdP encrypts to another certificate (import SuperBot's metadata again), or the encrypted data is malformed. |
+| `bad_encryption` | botd couldn't decrypt: the IdP encrypts to another certificate (import SuperBot's metadata again; after a [key rollover](#rolling-over-superbots-keys), it may still use a retired key), or the encrypted data is malformed. |
 | `weak_key_transport` | The IdP wraps the key with RSA PKCS #1 v1.5: choose RSA-OAEP. (AES-CBC content shows as `weak_algorithm`: choose AES-GCM.) |
 | `encrypted_id` | The IdP encrypts the NameID but `SSO_<ID>_ENCRYPTED_ASSERTIONS` is `off`: set it to `allow`, and give the IdP SuperBot's encryption certificate. |
 | `no_sp_key` | botd has no decryption key: with `SP_ENCRYPTION_CERT_FILE`, set `SSO_<ID>_ENCRYPTION_PRIVATE_KEY` (`botctl sso saml <id>` shows the problem). |

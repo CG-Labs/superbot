@@ -7,7 +7,8 @@
 //!
 //! With `SECRETS_BACKEND=vault`, `azure-keyvault`, `gcp-secret-manager` or `aws`, an
 //! `external::ExternalStore` over that secrets manager sits between the two (ADR 0125,
-//! ADR 0136, ADR 0146). Values never leave botd except into a harness's environment;
+//! ADR 0136, ADR 0146). With Vault, `leases` also makes short-lived credentials for each
+//! run (ADR 0185). Values never leave botd except into a harness's environment;
 //! the API lists names only. Every known value is redacted from saved text, events,
 //! and the audit log (`redact`). See docs/adr/0010-secrets.md.
 
@@ -18,6 +19,7 @@ pub mod external;
 pub mod gcp;
 mod http;
 pub mod key;
+pub mod leases;
 pub mod redact;
 pub mod sealed;
 pub mod vault;
@@ -656,6 +658,9 @@ pub fn init(db_path: &Path, keys: Keys, external: Option<Arc<external::ExternalS
     let user_folders = external.as_ref().filter(|x| x.user_folders()).map(Arc::clone);
     if let Some(x) = external {
         external::set_active(&x);
+        if let Some(rc) = x.run_credentials() {
+            leases::set_active(rc);
+        }
         stores.push(Box::new(external::Shared(x)));
     }
     stores.push(Box::new(store));

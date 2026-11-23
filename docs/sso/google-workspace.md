@@ -56,6 +56,8 @@ GOOGLE_DIRECTORY_ADMIN=superbot-reader@example.com    # option A only
 GOOGLE_DIRECTORY_GROUPS=superbot-users@example.com
 # SCIM_GROUPS=on
 # GOOGLE_DIRECTORY_TEAM_GROUPS=eng@example.com,design@example.com
+# SCIM_GROUP_ROLES=on
+# GOOGLE_DIRECTORY_ROLE_GROUPS=auditors@example.com     # role groups: declare each one (below)
 # With Sign in with Google (google.md), people sign in to the account the sync made:
 # GOOGLE_DIRECTORY_SSO=google
 ```
@@ -66,7 +68,8 @@ Restart botd. Its log says `Google Workspace sync: on, ...`. botd refuses to sta
 |---------|---------|---|
 | `GOOGLE_DIRECTORY_SYNC` | `off` | `on` needs `SCIM=on`. |
 | `GOOGLE_DIRECTORY_GROUPS` | | Group emails, comma separated. Their members get an account. |
-| `GOOGLE_DIRECTORY_TEAM_GROUPS` | | Group emails that become teams too. Needs `SCIM_GROUPS=on`. At most 50 groups across both lists. |
+| `GOOGLE_DIRECTORY_TEAM_GROUPS` | | Group emails that become teams too. Needs `SCIM_GROUPS=on`. |
+| `GOOGLE_DIRECTORY_ROLE_GROUPS` | | Group emails that are [role groups](scim.md#role-groups): they give a custom role across the server and are no team. Needs `SCIM_GROUPS=on` and `SCIM_GROUP_ROLES=on`. Being in one gives no account. Not also a team group. At most 50 groups across the three lists. |
 | `GOOGLE_DIRECTORY_ADMIN` | | The admin the service account acts as (option A). Empty for option B. |
 | `GOOGLE_DIRECTORY_SSO` | | A Google provider from `SSO_PROVIDERS`. Each user's Directory id is their `sub` there, so their sign-in is linked to the account. |
 | `GOOGLE_DIRECTORY_TENANT` | `google` | The SCIM tenant the users and teams belong to. No SCIM token may use it. |
@@ -74,7 +77,15 @@ Restart botd. Its log says `Google Workspace sync: on, ...`. botd refuses to sta
 | `GOOGLE_DIRECTORY_INTERVAL_MINUTES` | `30` | 5 to 1440. The first pass runs a minute after botd starts. |
 | `GOOGLE_DIRECTORY_MAX_REMOVALS` | `10` | A pass that would remove or disable more people than this changes nobody until an admin forces it. |
 
-New users get `SCIM_DEFAULT_ROLE` (member, or readonly). The sync never makes admins and never changes roles. Promote people with `botctl user role`.
+New users get `SCIM_DEFAULT_ROLE` (member, or readonly). The sync never makes admins. Promote people with `botctl user role`.
+
+**Role groups.** Declare each group in `GOOGLE_DIRECTORY_ROLE_GROUPS` in the sync's tenant, by its email, with the custom role it gives ([ADR 0180](../adr/0180-scim-role-groups.md)):
+
+```bash
+botctl scim role-group add google auditors@example.com Auditor
+```
+
+The next pass pushes it with its members who have an account, and they hold the role while they're in it, whatever team they're on. A listed group nobody declared is never pushed (it would become a team) and is named in the pass's `roleGroups.undeclared`. A declared group taken off the list is deleted on the next pass: its members lose the role, and the declaration waits again.
 
 ## 5. Check it
 
@@ -98,6 +109,7 @@ With `GOOGLE_DIRECTORY_SSO`, have someone in the group sign in with Google: they
 | They leave every chosen group, or are deleted | The user is deleted from the tenant as with a SCIM `DELETE`: disabled, nothing destroyed. Added back, they return as the same user |
 | A team group's members change | People join and leave its team. A renamed group renames its team |
 | A team group leaves `GOOGLE_DIRECTORY_TEAM_GROUPS` | Its people leave the team, as when an IdP deletes a SCIM group, and join the team of any other team group they're in, in the same pass |
+| A declared role group's members change | People with an account gain or lose its role, as with a SCIM role group |
 | A suspended person never had an account | Nothing: no account is made for them |
 
 **An admin's disable holds.** Google decides name, email, and who has access, with one exception. If an admin disables someone in SuperBot, the sync leaves them disabled even while Google has them active. It only enables people it disabled itself, also when it takes on someone who signed in with Google before and was disabled; if the audit log no longer shows who disabled someone, they stay disabled too. Each pass lists them as `held`. To let the sync manage them again, enable them (`botctl user enable` or the admin portal).
@@ -110,7 +122,7 @@ With `GOOGLE_DIRECTORY_SSO`, have someone in the group sign in with Google: they
 
 Every change is audited as the SCIM events of the [SCIM guide](scim.md), with the actor `scim:google-directory`, method `google_directory`. Each pass is also `scim.google_sync` (target `scim_tenant:<tenant>`):
 
-- **success**: what it did: `created`, `updated`, `enabled`, `disabled`, `linked`, `deleted`, `held`, `skippedSuspended`, `outsideDomain`, `teams`, how long it took, and what started it (`schedule` or `admin`, with `force`).
+- **success**: what it did: `created`, `updated`, `enabled`, `disabled`, `linked`, `deleted`, `held`, `skippedSuspended`, `outsideDomain`, `teams`, `roleGroups` (with `undeclared`), how long it took, and what started it (`schedule` or `admin`, with `force`).
 - **failure**: the `reason` and `detail` when nobody was changed, or the SCIM writes that failed (`failed`, `failures`; each also `scim.request_failed`).
 - **denied**: too many removals (`too_many_removals`, `would_remove_everyone`).
 
