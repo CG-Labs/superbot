@@ -267,6 +267,11 @@ fn tail(b: &[u8]) -> String {
 
 /// A download client trusting the system's roots, `extra_root` and `ca` (a bundle).
 pub fn download_client(extra_root: Option<&str>, ca: Option<&str>) -> Result<reqwest::Client, String> {
+    download_builder(extra_root, ca)?.build().map_err(|e| e.to_string())
+}
+
+/// `download_client`'s settings, before it is built.
+pub fn download_builder(extra_root: Option<&str>, ca: Option<&str>) -> Result<reqwest::ClientBuilder, String> {
     let mut b = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .read_timeout(Duration::from_secs(60));
@@ -277,7 +282,7 @@ pub fn download_client(extra_root: Option<&str>, ca: Option<&str>) -> Result<req
     if let Some(pem) = ca {
         b = b.tls_certs_merge(reqwest::Certificate::from_pem_bundle(pem.as_bytes()).map_err(|e| e.to_string())?);
     }
-    b.build().map_err(|e| e.to_string())
+    Ok(b)
 }
 
 impl Tools {

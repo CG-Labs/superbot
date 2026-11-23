@@ -16,6 +16,7 @@ use axum::http::StatusCode;
 use base64::Engine;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256, Sha512};
+use std::sync::{Arc, Mutex};
 
 /// npm's own registry, what a plan without MACHINE_NPM_REGISTRY uses.
 pub const NPM_REGISTRY: &str = "https://registry.npmjs.org/";
@@ -212,7 +213,14 @@ async fn npm(http: &reqwest::Client, registry: &str, package: &str, version: &st
 /// Fetches everything `plan` names from where machines would, with the CA they'd
 /// trust, and checks each against its pin.
 pub async fn check(plan: &HarnessPlan) -> Value {
-    let http = match tools::download_client(None, plan.ca.as_deref()) {
+    // Every redirect followed, so `reach` checks where the files really came from.
+    let hops = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = hops.clone();
+    let follow = reqwest::redirect::Policy::custom(move |a| {
+        seen.lock().unwrap().push(a.url().to_string());
+        if a.previous().len() >= 10 { a.error("too many redirects") } else { a.follow() }
+    });
+    let http = match tools::download_builder(None, plan.ca.as_deref()).and_then(|b| b.redirect(follow).build().map_err(|e| e.to_string())) {
         Ok(h) => h,
         Err(e) => return json!({ "ok": false, "error": format!("the mirrors' CA: {e}"), "items": [] }),
     };
@@ -250,7 +258,10 @@ pub async fn check(plan: &HarnessPlan) -> Value {
         }
     }
     let ok = items.iter().all(|i| i["ok"] == true);
-    json!({ "ok": ok, "npmRegistry": registry, "ca": plan.ca.is_some(), "items": items })
+    let mut redirects = hops.lock().unwrap().clone();
+    redirects.sort();
+    redirects.dedup();
+    json!({ "ok": ok, "npmRegistry": registry, "ca": plan.ca.is_some(), "items": items, "redirects": redirects })
 }
 
 /// The provider firewall's outbound rules for machines, when they bind root: the
@@ -266,9 +277,19 @@ impl Outbound {
     pub fn from_env(var: &dyn Fn(&str) -> String) -> Option<Outbound> {
         if var("MACHINE_PROVIDER").trim() == "incus" {
             let s = super::incus::Settings::from_env(var).ok()?;
+            // As the fleet does: every container is also kept off every INCUS_HOSTS host.
+            let mut deny = s.deny.clone();
+            for (_, url) in var("INCUS_HOSTS").split(',').filter_map(|e| e.split_once('=')) {
+                let url = url.trim().to_string();
+                if let Ok(h) = super::incus::Settings::from_env(&|k| if k == "INCUS_URL" { url.clone() } else { var(k) }) {
+                    deny.extend(h.deny);
+                }
+            }
+            deny.sort();
+            deny.dedup();
             return Some(Outbound {
                 open: s.open(),
-                deny: s.deny,
+                deny,
                 fix: |a| format!("Incus containers' firewall drops it: add {a} to INCUS_EGRESS_ALLOW."),
             });
         }
@@ -295,6 +316,7 @@ pub async fn reach(v: &mut Value, out: &Outbound) {
             urls.push(u.to_string());
         }
     }
+    urls.extend(v["redirects"].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from));
     let mut places: Vec<(String, u16)> = urls
         .iter()
         .filter_map(|u| url::Url::parse(u).ok())
@@ -521,5 +543,45 @@ mod tests {
         assert!(v["blocked"][0]["error"].as_str().unwrap().contains("MACHINE_FIREWALL_EGRESS=off"), "{v}");
         assert!(linode("off").is_none(), "no outbound rules, nothing to check");
         assert!(Outbound::from_env(&env(&[])).is_none());
+
+        // Another Incus host on the mirror's address: containers are kept off it too.
+        let fleet = Outbound::from_env(&env(&[
+            ("MACHINE_PROVIDER", "incus".into()),
+            ("INCUS_URL", "https://192.0.2.50".into()),
+            ("INCUS_HOSTS", "b=https://127.0.0.1:8443".into()),
+        ]))
+        .unwrap();
+        let mut v = check(&plan).await;
+        reach(&mut v, &fleet).await;
+        assert_eq!(v["blocked"].as_array().unwrap().len(), 1, "{v}");
+    }
+
+    #[tokio::test]
+    async fn the_check_follows_redirects_and_checks_where_they_go() {
+        let mirror = Mirror::serve().await;
+        let node = mirror.node("0.0.1", b"a node tarball");
+        let pin = mirror.package("fake-codex", "1.0.0", b"codex's tarball");
+        mirror.redirect_to_other("/npm/fake-codex/-/fake-codex-1.0.0.tgz");
+        let plan = mirror.plan(&node, vec![("codex", "fake-codex", "1.0.0", Some(pin))]);
+        let at = url::Url::parse(&mirror.url).unwrap();
+        let here = format!("{}:{}", at.host_str().unwrap(), at.port().unwrap());
+        let other = url::Url::parse(&mirror.other).unwrap();
+        let there = format!("{}:{}", other.host_str().unwrap(), other.port().unwrap());
+
+        let mut v = check(&plan).await;
+        assert_eq!(v["ok"], true, "the redirected tarball is still the pinned one: {v}");
+        assert_eq!(v["redirects"], json!([format!("{}/stored/npm/fake-codex/-/fake-codex-1.0.0.tgz", mirror.other)]));
+        let incus = Outbound::from_env(&env(&[
+            ("MACHINE_PROVIDER", "incus".into()),
+            ("INCUS_URL", "https://192.0.2.50".into()),
+            ("INCUS_EGRESS_DENY", "127.0.0.0/8".into()),
+            ("INCUS_EGRESS_ALLOW", here),
+        ]))
+        .unwrap();
+        reach(&mut v, &incus).await;
+        assert_eq!(v["ok"], false, "{v}");
+        let blocked = v["blocked"].as_array().unwrap();
+        assert_eq!(blocked.len(), 1, "{v}");
+        assert_eq!(blocked[0]["address"], json!(there), "{v}");
     }
 }

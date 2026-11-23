@@ -20,11 +20,15 @@ struct World {
     calls: Vec<String>,
     /// `Mirror::url`, for the tarballs' URLs.
     base: String,
+    /// Paths answered with a 302 to a URL.
+    redirects: BTreeMap<String, String>,
 }
 
 pub struct Mirror {
     /// `https://127.0.0.1:<port>`, or empty for `ca_only`.
     pub url: String,
+    /// The same server on another port, as a mirror's separate storage would be.
+    pub other: String,
     ca_pem: String,
     world: Arc<Mutex<World>>,
 }
@@ -51,6 +55,9 @@ async fn handle(axum::extract::State(w): axum::extract::State<Arc<Mutex<World>>>
     let path = uri.path().to_string();
     let mut w = w.lock().unwrap();
     w.calls.push(path.clone());
+    if let Some(to) = w.redirects.get(&path) {
+        return (StatusCode::FOUND, [("location", to.clone())]).into_response();
+    }
     if let Some(b) = w.files.get(&path) {
         return (StatusCode::OK, b.clone()).into_response();
     }
@@ -73,12 +80,14 @@ async fn handle(axum::extract::State(w): axum::extract::State<Arc<Mutex<World>>>
 impl Mirror {
     /// A CA and nothing serving: for settings that only read its certificate.
     pub fn ca_only() -> Mirror {
-        Mirror { url: String::new(), ca_pem: ca().0.pem(), world: Default::default() }
+        Mirror { url: String::new(), other: String::new(), ca_pem: ca().0.pem(), world: Default::default() }
     }
 
     pub async fn serve() -> Mirror {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other = format!("https://127.0.0.1:{}", second.local_addr().unwrap().port());
         let (ca_cert, issuer) = ca();
         let key = rcgen::KeyPair::generate().unwrap();
         let mut p = rcgen::CertificateParams::new(vec!["127.0.0.1".into(), "localhost".into()]).unwrap();
@@ -95,18 +104,29 @@ impl Mirror {
         let url = format!("https://127.0.0.1:{port}");
         let world = Arc::new(Mutex::new(World { base: url.clone(), ..Default::default() }));
         let app = axum::Router::new().fallback(handle).with_state(world.clone());
-        tokio::spawn(async move {
-            loop {
-                let Ok((tcp, _)) = listener.accept().await else { return };
-                let (acceptor, app) = (acceptor.clone(), app.clone());
-                tokio::spawn(async move {
-                    let Ok(stream) = acceptor.accept(tcp).await else { return };
-                    let svc = hyper_util::service::TowerToHyperService::new(app);
-                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(stream), svc).await;
-                });
-            }
-        });
-        Mirror { url, ca_pem: ca_cert.pem(), world }
+        for listener in [listener, second] {
+            let (acceptor, app) = (acceptor.clone(), app.clone());
+            tokio::spawn(async move {
+                loop {
+                    let Ok((tcp, _)) = listener.accept().await else { return };
+                    let (acceptor, app) = (acceptor.clone(), app.clone());
+                    tokio::spawn(async move {
+                        let Ok(stream) = acceptor.accept(tcp).await else { return };
+                        let svc = hyper_util::service::TowerToHyperService::new(app);
+                        let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(stream), svc).await;
+                    });
+                }
+            });
+        }
+        Mirror { url, other, ca_pem: ca_cert.pem(), world }
+    }
+
+    /// Answers `path` with a redirect to `/stored<path>` on `other`, which serves it.
+    pub fn redirect_to_other(&self, path: &str) {
+        let mut w = self.world.lock().unwrap();
+        let body = w.files[path].clone();
+        w.files.insert(format!("/stored{path}"), body);
+        w.redirects.insert(path.into(), format!("{}/stored{path}", self.other));
     }
 
     pub fn ca_pem(&self) -> String {
