@@ -6,7 +6,7 @@
 use crate::machines::enroll::{self, Enrollment};
 use crate::machines::fake::Fake;
 use crate::machines::firewall::Settings;
-use crate::machines::provider::MachineProvider;
+use crate::machines::provider::{MachineProvider, NetworkMember, TeamNetwork};
 use crate::machines::team_network;
 use crate::machines::{ControlPlane, State};
 use crate::tests::{audit_list, call};
@@ -19,6 +19,7 @@ struct Env {
     app: AppState,
     admin: String,
     fake: Arc<Fake>,
+    cp: Arc<ControlPlane>,
 }
 
 const AGENT: &str = "stand-in for the superbot-machine binary";
@@ -33,10 +34,11 @@ async fn serve() -> Env {
     cp.firewall_with(Settings { sources: Vec::new(), ssh: Vec::new() }).unwrap();
     cp.team_network = Some(team_network::Settings { subnet: team_network::DEFAULT_SUBNET.into() });
     let cp = Arc::new(cp);
+    let held = cp.clone();
     let (port, app, owner, _) = crate::tests::serve_app_with(move |a| a.machines = cp).await;
     tokio::spawn(enroll::serve(machine_listener, app.clone(), e, None));
     let (_, admin) = user_with(port, &owner, "ops@example.com", "admin").await;
-    Env { port, app, admin, fake }
+    Env { port, app, admin, fake, cp: held }
 }
 
 async fn json_call(env: &Env, method: &str, path: &str, body: &str) -> (u16, Value) {
@@ -208,6 +210,17 @@ async fn a_machine_powered_off_to_leave_is_powered_on_again_whatever_happens_mea
     assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "resumed": 1 }));
     assert_eq!(machine(&env, &al).state, State::Running);
     assert_eq!(env.fake.network_of(&pid(&env, &al)).as_deref(), Some(net.as_str()));
+
+    // Had he rejoined after the sweep looked, it backs off under the lock, on or off.
+    let n = TeamNetwork { id: net.clone(), label: old.clone(), region: "gb-lon".into(), subnet_id: String::new(), subnet: String::new(), created: false };
+    let mem = NetworkMember { machine: pid(&env, &al), config: "c".into(), interface: "i".into() };
+    let leave_now = async || team_network::leave(&env.app, &env.cp, env.fake.as_ref(), &n, Some(&acme), &machine(&env, &al), &mem).await;
+    assert_eq!(leave_now().await, team_network::Leave::Waiting);
+    assert_eq!(machine(&env, &al).state, State::Running);
+    assert_eq!(json_call(&env, "POST", &format!("/api/users/{al}/machine/suspend"), "").await.0, 200);
+    assert_eq!(leave_now().await, team_network::Leave::Waiting);
+    assert_eq!(env.fake.network_of(&pid(&env, &al)).as_deref(), Some(net.as_str()), "still on it");
+    assert_eq!(json_call(&env, "POST", &format!("/api/users/{al}/machine/resume"), "").await.0, 200);
 
     // Bo's machine won't boot at first: it is tried again until it does.
     leave(&bo).await;

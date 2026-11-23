@@ -201,7 +201,8 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
     out
 }
 
-enum Leave {
+#[derive(Debug, PartialEq)]
+pub(crate) enum Leave {
     Leaving,
     Left,
     Waiting,
@@ -210,14 +211,17 @@ enum Leave {
 
 /// Takes `m` off `n`. Its interface can only go while it is off, so a running machine
 /// is suspended first, and the next pass, once it is off, removes it.
-async fn leave(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, n: &TeamNetwork, team: Option<&str>, m: &Machine, mem: &NetworkMember) -> Leave {
+pub(crate) async fn leave(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, n: &TeamNetwork, team: Option<&str>, m: &Machine, mem: &NetworkMember) -> Leave {
     let by = system(m);
     let details = || json!({ "team": team, "networkId": n.id, "label": n.label, "ownersTeam": app.db.team_id_of(&m.user_id) });
+    // Checked again under `ops`, which joining a team waits on too: one who rejoined
+    // since the sweep looked keeps their network.
+    let due = || team.is_none() || app.db.team_id_of(&m.user_id).as_deref() != team;
     match m.state {
         State::Running => {
-            let still = |x: &Machine| x.id == m.id && x.state == State::Running;
+            let still = |x: &Machine| x.id == m.id && x.state == State::Running && due();
             if super::act_if(app, cp, &by, &m.user_id, Step::Suspend, None, &still).await.is_err() {
-                return Leave::Failed;
+                return if due() { Leave::Failed } else { Leave::Waiting };
             }
             suspended(cp).insert(m.id.clone());
             app.db.record(&event(&by, "machine.team_network_leaving", m, details()));
@@ -226,7 +230,7 @@ async fn leave(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, n: &T
         State::Suspended => {
             {
                 let _g = cp.lock_ops().await;
-                if !app.db.machine(&m.id).is_some_and(|x| x.state == State::Suspended) {
+                if !app.db.machine(&m.id).is_some_and(|x| x.state == State::Suspended) || !due() {
                     return Leave::Waiting;
                 }
                 if !p.get(&mem.machine).await.is_ok_and(|pm| pm.status == "offline") {
