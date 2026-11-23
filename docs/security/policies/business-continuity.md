@@ -49,10 +49,10 @@ botd is one process with one database: there is no failover, so losing the serve
 
 | Test | How often | Evidence |
 |------|-----------|----------|
-| Backup and restore drills in CI: the installer drill, the Compose drill and the scripts' tests, each within a 5-minute restore budget ([drills](../../ops/backup-restore.md#drills)) | Every change to the server, installer or image | Workflow runs of `server.yml` and `docker.yml` |
-| Incus container restore and host-loss drill in CI, against the RTO ([`incus-e2e.yml`](../../../.github/workflows/incus-e2e.yml)) | Changes to machine code, and weekly | The workflow's `restore-drill-*` and `host-drill-*` artifacts |
-| Restore of the newest off-site server archive onto a scratch server, timed to `/healthz` | Quarterly, and after a big upgrade | Date, the archive's newest audit time, time taken |
-| Restore of a drill machine on the production tier and host ([`deploy/machine-restore-drill.sh`](../../../deploy/machine-restore-drill.sh)) | Monthly | The script's last line (`durationMs`, `rtoMs`) and the `machine.restored` audit event |
+| Backup and restore drills in CI: the installer drill, the Compose drill and the scripts' tests, each within a 5-minute restore budget ([drills](../../ops/backup-restore.md#drills)) | Every change to the server, installer or image | Workflow runs of `server.yml` and `docker.yml`, each drill step's result and time in the monthly drill bundle ([ADR 0177](../../adr/0177-restore-drill-evidence.md)) |
+| Incus container restore and host-loss drill in CI, against the RTO ([`incus-e2e.yml`](../../../.github/workflows/incus-e2e.yml)) | Changes to machine code, and weekly | The workflow's `restore-drill-*` and `host-drill-*` artifacts, with their digests in the monthly drill bundle |
+| Restore of the newest off-site server archive onto a scratch server, timed to `/healthz` | Quarterly, and after a big upgrade | Date, the archive's newest audit time, time taken; where [`deploy/backup-drill.sh`](../../../deploy/backup-drill.sh) is run, its saved output, given to `superbot-evidence drills --record` |
+| Restore of a drill machine on the production tier and host ([`deploy/machine-restore-drill.sh`](../../../deploy/machine-restore-drill.sh)) | Monthly | The script's saved output, whose record line (`durationMs`, `rtoMs`) `superbot-evidence drills --record` puts in the drill bundle, and the `machine.restored` audit event |
 | The host-loss drill on production hardware, full size | Yearly | Drill record with timings against the RTO |
 | A tabletop of this plan with every role | Yearly | Record and actions, as an incident review |
 

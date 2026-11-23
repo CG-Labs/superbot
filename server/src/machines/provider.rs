@@ -226,6 +226,12 @@ pub trait MachineProvider: Send + Sync {
     fn settings(&self) -> serde_json::Value {
         serde_json::json!({})
     }
+    /// The outbound rules the provider puts on the machines' firewall beside the
+    /// inbound ones (ADR 0179), for audit events and admins. None: the provider keeps
+    /// them elsewhere, or has none.
+    fn firewall_egress(&self) -> Option<serde_json::Value> {
+        None
+    }
     /// Asks the provider whether it is set up as the control plane needs: a list of
     /// `{check, ok, detail}`.
     fn preflight<'a>(&'a self) -> Fut<'a, Vec<serde_json::Value>> {

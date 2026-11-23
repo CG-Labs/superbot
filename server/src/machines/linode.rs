@@ -9,6 +9,7 @@ use super::provider::{
 use base64::Engine;
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
+use std::net::IpAddr;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -21,6 +22,78 @@ pub struct Linode {
     token: Zeroizing<String>,
     base: String,
     http: reqwest::Client,
+    /// What the machines' firewall drops on the way out (ADR 0179). Empty: nothing.
+    outbound: Vec<Outbound>,
+}
+
+/// Linode takes at most this many addresses in one rule.
+pub const MAX_ADDRESSES: usize = 255;
+pub const CONTROL_RULE: &str = "control-plane-port";
+
+/// One outbound rule of the machines' firewall (ADR 0179): `action` (`ACCEPT` or
+/// `DROP`) for `protocol` (`TCP` or `UDP`) to `destinations` (canonical CIDRs,
+/// sorted), on `ports` or, when None, every port. Linode applies them in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Outbound {
+    pub label: String,
+    pub action: String,
+    pub protocol: String,
+    pub ports: Option<String>,
+    pub destinations: Vec<String>,
+}
+
+/// The outbound rules that keep every process on a Linode, root included, off `deny`:
+/// TCP and UDP dropped there, but for TCP to botd's machine port (`control`) when
+/// botd's address falls inside it, which is let through first. ICMP stays open, as
+/// IPv6 neighbour discovery needs it, and so does Linode's metadata service, which
+/// its firewall never filters.
+pub fn outbound(deny: &[String], control: Option<(IpAddr, u16)>) -> Result<Vec<Outbound>, String> {
+    let mut deny = deny.to_vec();
+    deny.sort();
+    deny.dedup();
+    if deny.is_empty() {
+        return Ok(Vec::new());
+    }
+    if deny.len() > MAX_ADDRESSES {
+        return Err(format!(
+            "MACHINE_EGRESS_DENY: Linode's firewall takes at most {MAX_ADDRESSES} ranges in a rule, and the machines' deny list has {}; join ranges, or set MACHINE_FIREWALL_EGRESS=off",
+            deny.len()
+        ));
+    }
+    let mut out = Vec::new();
+    if let Some((ip, port)) = control {
+        let (v6, n) = super::incus::number(ip);
+        let inside = deny
+            .iter()
+            .filter_map(|c| super::incus::span(c))
+            .any(|(is6, lo, hi)| is6 == v6 && (lo..=hi).contains(&n));
+        if inside {
+            out.push(Outbound {
+                label: CONTROL_RULE.into(),
+                action: "ACCEPT".into(),
+                protocol: "TCP".into(),
+                ports: Some(port.to_string()),
+                destinations: vec![super::firewall::cidr(&ip.to_string())?],
+            });
+        }
+    }
+    for protocol in ["TCP", "UDP"] {
+        out.push(Outbound {
+            label: format!("no-private-{}", protocol.to_ascii_lowercase()),
+            action: "DROP".into(),
+            protocol: protocol.into(),
+            ports: None,
+            destinations: deny.clone(),
+        });
+    }
+    Ok(out)
+}
+
+pub fn outbound_json(rules: &[Outbound]) -> Value {
+    json!(rules
+        .iter()
+        .map(|r| json!({ "label": r.label, "action": r.action, "protocol": r.protocol, "ports": r.ports, "to": r.destinations }))
+        .collect::<Vec<_>>())
 }
 
 impl std::fmt::Debug for Linode {
@@ -43,7 +116,27 @@ impl Linode {
             token: Zeroizing::new(token.trim().to_string()),
             base: base.trim_end_matches('/').to_string(),
             http,
+            outbound: Vec::new(),
         }
+    }
+
+    /// The machines' firewall drops `rules`' traffic on the way out, and a firewall
+    /// without exactly these is set again.
+    pub fn with_outbound(mut self, rules: Vec<Outbound>) -> Linode {
+        self.outbound = rules;
+        self
+    }
+
+    fn firewall(&self, v: &Value) -> Result<ProviderFirewall, ProviderError> {
+        let id = v["id"]
+            .as_u64()
+            .ok_or_else(|| ProviderError::Transport("Linode sent a firewall we couldn't read".into()))?;
+        Ok(ProviderFirewall {
+            id: id.to_string(),
+            label: v["label"].as_str().unwrap_or_default().into(),
+            rules: our_rules(&v["rules"], &self.outbound),
+            enabled: v["status"] == "enabled",
+        })
     }
 
     async fn call(
@@ -121,32 +214,82 @@ impl Linode {
     }
 }
 
-/// Our rules as Linode's: inbound dropped but for each rule, outbound open.
-fn rules_body(rules: &[FirewallRule]) -> Value {
+fn addresses(cidrs: &[String]) -> Value {
+    let (v6, v4): (Vec<&String>, Vec<&String>) = cidrs.iter().partition(|s| s.contains(':'));
+    let mut addresses = json!({});
+    if !v4.is_empty() {
+        addresses["ipv4"] = json!(v4);
+    }
+    if !v6.is_empty() {
+        addresses["ipv6"] = json!(v6);
+    }
+    addresses
+}
+
+/// A rule's addresses, canonical and sorted, or None if one isn't an address.
+fn read_addresses(a: &Value) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for family in ["ipv4", "ipv6"] {
+        for a in a[family].as_array().into_iter().flatten() {
+            out.push(super::firewall::cidr(a.as_str()?).ok()?);
+        }
+    }
+    out.sort();
+    out.dedup();
+    Some(out)
+}
+
+/// Our rules as Linode's: inbound dropped but for each rule, outbound open but for
+/// `outbound`, in order.
+fn rules_body(rules: &[FirewallRule], outbound: &[Outbound]) -> Value {
     let inbound: Vec<Value> = rules
         .iter()
         .map(|r| {
-            let (v6, v4): (Vec<&String>, Vec<&String>) =
-                r.sources.iter().partition(|s| s.contains(':'));
-            let mut addresses = json!({});
-            if !v4.is_empty() {
-                addresses["ipv4"] = json!(v4);
-            }
-            if !v6.is_empty() {
-                addresses["ipv6"] = json!(v6);
-            }
-            json!({ "label": r.label, "action": "ACCEPT", "protocol": "TCP", "ports": r.ports, "addresses": addresses })
+            json!({ "label": r.label, "action": "ACCEPT", "protocol": "TCP", "ports": r.ports, "addresses": addresses(&r.sources) })
         })
         .collect();
-    json!({ "inbound_policy": "DROP", "outbound_policy": "ACCEPT", "inbound": inbound, "outbound": [] })
+    let outbound: Vec<Value> = outbound
+        .iter()
+        .map(|o| {
+            let mut v = json!({ "label": o.label, "action": o.action, "protocol": o.protocol, "addresses": addresses(&o.destinations) });
+            if let Some(p) = &o.ports {
+                v["ports"] = json!(p);
+            }
+            v
+        })
+        .collect();
+    json!({ "inbound_policy": "DROP", "outbound_policy": "ACCEPT", "inbound": inbound, "outbound": outbound })
 }
 
-/// Linode's rules as ours, or None if they aren't of the shape we make.
-fn our_rules(r: &Value) -> Option<Vec<FirewallRule>> {
-    if r["inbound_policy"] != "DROP"
-        || r["outbound_policy"] != "ACCEPT"
-        || r["outbound"].as_array().is_some_and(|a| !a.is_empty())
-    {
+/// One of Linode's outbound rules as ours. No ports, or all of them, is every port.
+fn read_outbound(x: &Value) -> Option<Outbound> {
+    let action = x["action"].as_str().filter(|a| matches!(*a, "ACCEPT" | "DROP"))?;
+    let protocol = x["protocol"].as_str().filter(|p| matches!(*p, "TCP" | "UDP"))?;
+    let ports = match &x["ports"] {
+        Value::Null => None,
+        Value::String(p) => Some(p.replace(' ', "")).filter(|p| !p.is_empty() && p != "1-65535"),
+        _ => return None,
+    };
+    Some(Outbound {
+        label: x["label"].as_str()?.into(),
+        action: action.into(),
+        protocol: protocol.into(),
+        ports,
+        destinations: read_addresses(&x["addresses"])?,
+    })
+}
+
+/// Linode's rules as ours, or None if they aren't of the shape we make: outbound must
+/// be exactly `outbound`, in the same order.
+fn our_rules(r: &Value, outbound: &[Outbound]) -> Option<Vec<FirewallRule>> {
+    if r["inbound_policy"] != "DROP" || r["outbound_policy"] != "ACCEPT" {
+        return None;
+    }
+    let out = match &r["outbound"] {
+        Value::Null => Vec::new(),
+        v => v.as_array()?.iter().map(read_outbound).collect::<Option<Vec<_>>>()?,
+    };
+    if out != outbound {
         return None;
     }
     r["inbound"]
@@ -156,33 +299,13 @@ fn our_rules(r: &Value) -> Option<Vec<FirewallRule>> {
             if x["action"] != "ACCEPT" || x["protocol"] != "TCP" {
                 return None;
             }
-            let mut sources = Vec::new();
-            for family in ["ipv4", "ipv6"] {
-                for a in x["addresses"][family].as_array().into_iter().flatten() {
-                    sources.push(super::firewall::cidr(a.as_str()?).ok()?);
-                }
-            }
-            sources.sort();
-            sources.dedup();
             Some(FirewallRule {
                 label: x["label"].as_str()?.into(),
                 ports: x["ports"].as_str()?.replace(' ', ""),
-                sources,
+                sources: read_addresses(&x["addresses"])?,
             })
         })
         .collect()
-}
-
-fn firewall(v: &Value) -> Result<ProviderFirewall, ProviderError> {
-    let id = v["id"]
-        .as_u64()
-        .ok_or_else(|| ProviderError::Transport("Linode sent a firewall we couldn't read".into()))?;
-    Ok(ProviderFirewall {
-        id: id.to_string(),
-        label: v["label"].as_str().unwrap_or_default().into(),
-        rules: our_rules(&v["rules"]),
-        enabled: v["status"] == "enabled",
-    })
 }
 
 /// Linode's `{"errors": [{"field", "reason"}]}`, as one of ours.
@@ -289,6 +412,17 @@ impl MachineProvider for Linode {
 
     fn substrate(&self) -> &'static str {
         "vm"
+    }
+
+    fn settings(&self) -> Value {
+        json!({
+            "firewallEgress": if self.outbound.is_empty() { "off" } else { "on" },
+            "egressRules": outbound_json(&self.outbound),
+        })
+    }
+
+    fn firewall_egress(&self) -> Option<Value> {
+        Some(outbound_json(&self.outbound))
     }
 
     fn create<'a>(&'a self, spec: &'a CreateSpec) -> Fut<'a, ProviderMachine> {
@@ -463,7 +597,7 @@ impl MachineProvider for Linode {
         Box::pin(async move {
             let filter = json!({ "label": label });
             for f in self.all("/networking/firewalls", Some(&filter)).await? {
-                let f = firewall(&f)?;
+                let f = self.firewall(&f)?;
                 if f.label == label {
                     return Ok(Some(f));
                 }
@@ -482,7 +616,7 @@ impl MachineProvider for Linode {
                     None,
                 )
                 .await?;
-            firewall(&v)
+            self.firewall(&v)
         })
     }
 
@@ -493,8 +627,8 @@ impl MachineProvider for Linode {
         rules: &'a [FirewallRule],
     ) -> Fut<'a, ProviderFirewall> {
         Box::pin(async move {
-            let body = json!({ "label": label, "tags": tags, "rules": rules_body(rules) });
-            firewall(
+            let body = json!({ "label": label, "tags": tags, "rules": rules_body(rules, &self.outbound) });
+            self.firewall(
                 &self
                     .call(Method::POST, "/networking/firewalls", None, Some(&body))
                     .await?,
@@ -508,7 +642,7 @@ impl MachineProvider for Linode {
                 Method::PUT,
                 &format!("/networking/firewalls/{}/rules", path_id(id)?),
                 None,
-                Some(&rules_body(rules)),
+                Some(&rules_body(rules, &self.outbound)),
             )
             .await
             .map(drop)
@@ -1054,7 +1188,7 @@ mod tests {
     fn only_our_shape_of_rules_reads_as_ours() {
         let base = json!({ "inbound_policy": "DROP", "outbound_policy": "ACCEPT", "outbound": [], "inbound": [
             { "label": "a", "action": "ACCEPT", "protocol": "TCP", "ports": "7443", "addresses": { "ipv4": ["192.0.2.1/32"] } }] });
-        assert!(our_rules(&base).is_some());
+        assert!(our_rules(&base, &[]).is_some());
         for (path, v) in [
             ("/inbound_policy", json!("ACCEPT")),
             ("/outbound_policy", json!("DROP")),
@@ -1065,8 +1199,120 @@ mod tests {
         ] {
             let mut r = base.clone();
             *r.pointer_mut(path).unwrap() = v;
-            assert_eq!(our_rules(&r), None, "{path}");
+            assert_eq!(our_rules(&r, &[]), None, "{path}");
         }
+    }
+
+    fn private() -> Vec<String> {
+        crate::machines::incus::PRIVATE.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn outbound_drops_tcp_and_udp_to_the_deny_list() {
+        let deny = [private(), vec!["203.0.113.0/24".into()]].concat();
+        let rules = outbound(&deny, Some(("198.51.100.9".parse().unwrap(), 8443))).unwrap();
+        let mut sorted = deny.clone();
+        sorted.sort();
+        assert_eq!(
+            rules,
+            ["TCP", "UDP"].map(|p| Outbound {
+                label: format!("no-private-{}", p.to_ascii_lowercase()),
+                action: "DROP".into(),
+                protocol: p.into(),
+                ports: None,
+                destinations: sorted.clone(),
+            }),
+            "a public control plane needs no way through"
+        );
+        assert_eq!(outbound(&[], None).unwrap(), [], "nothing to deny, nothing sent");
+        let many: Vec<String> = (0..=MAX_ADDRESSES).map(|i| format!("198.51.{}.{}/32", i / 256, i % 256)).collect();
+        let e = outbound(&many, None).unwrap_err();
+        assert!(e.contains("255") && e.contains("MACHINE_FIREWALL_EGRESS=off"), "{e}");
+    }
+
+    #[test]
+    fn a_control_plane_on_a_denied_address_keeps_only_its_port() {
+        for (ip, cidr) in [("10.1.2.3", "10.1.2.3/32"), ("fd00::7", "fd00::7/128")] {
+            let rules = outbound(&private(), Some((ip.parse().unwrap(), 8443))).unwrap();
+            assert_eq!(rules.len(), 3, "{rules:?}");
+            assert_eq!(
+                rules[0],
+                Outbound {
+                    label: CONTROL_RULE.into(),
+                    action: "ACCEPT".into(),
+                    protocol: "TCP".into(),
+                    ports: Some("8443".into()),
+                    destinations: vec![cidr.into()],
+                },
+                "first, so Linode lets it through before the drops"
+            );
+            assert!(rules[1..].iter().all(|r| r.action == "DROP" && r.ports.is_none()));
+        }
+        let v6_in_v4 = outbound(&["10.0.0.0/8".into()], Some(("fd00::7".parse().unwrap(), 8443))).unwrap();
+        assert_eq!(v6_in_v4.len(), 2, "an address of the other family is never inside");
+    }
+
+    #[test]
+    fn outbound_reads_back_in_linodes_spelling_and_in_order() {
+        let ours = outbound(&private(), Some(("10.1.2.3".parse().unwrap(), 8443))).unwrap();
+        let body = rules_body(&[], &ours);
+        assert_eq!(body["outbound_policy"], "ACCEPT");
+        assert_eq!(
+            body["outbound"][0],
+            json!({ "label": CONTROL_RULE, "action": "ACCEPT", "protocol": "TCP", "ports": "8443", "addresses": { "ipv4": ["10.1.2.3/32"] } })
+        );
+        assert_eq!(
+            body["outbound"][1]["addresses"],
+            json!({ "ipv4": ["10.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16"], "ipv6": ["fc00::/7", "fe80::/10"] })
+        );
+        assert!(body["outbound"][1].get("ports").is_none(), "every port");
+        assert_eq!(our_rules(&body, &ours), Some(vec![]), "what we send reads back as ours");
+
+        let mut linode = body.clone();
+        linode["outbound"][1]["ports"] = json!("1-65535");
+        linode["outbound"][2]["ports"] = Value::Null;
+        linode["outbound"][1]["addresses"]["ipv6"] = json!(["FE80::/10", "fc00::/7"]);
+        assert_eq!(our_rules(&linode, &ours), Some(vec![]), "Linode's spelling of every port and an address");
+
+        let mut swapped = body.clone();
+        swapped["outbound"].as_array_mut().unwrap().swap(0, 1);
+        assert_eq!(our_rules(&swapped, &ours), None, "a drop before the control plane's way through cuts it off");
+        let mut fewer = body.clone();
+        fewer["outbound"].as_array_mut().unwrap().pop();
+        assert_eq!(our_rules(&fewer, &ours), None, "UDP open again");
+        let mut narrower = body.clone();
+        narrower["outbound"][1]["addresses"]["ipv4"].as_array_mut().unwrap().remove(2);
+        assert_eq!(our_rules(&narrower, &ours), None, "metadata's range let through");
+        let mut icmp = body.clone();
+        icmp["outbound"][2]["protocol"] = json!("ICMP");
+        assert_eq!(our_rules(&icmp, &ours), None);
+        assert_eq!(our_rules(&rules_body(&[], &[]), &ours), None, "a firewall from before this is set again");
+        assert_eq!(our_rules(&body, &[]), None, "and set back when it's turned off");
+    }
+
+    #[tokio::test]
+    async fn the_firewall_is_made_and_set_with_its_outbound_rules() {
+        let (api, seen) = fake_api().await;
+        let ours = outbound(&private(), None).unwrap();
+        let api = api.with_outbound(ours.clone());
+        let rule = FirewallRule { label: "agent-from-control-plane".into(), ports: "7443".into(), sources: vec!["192.0.2.1/32".into()] };
+        let made = api.create_firewall("superbot-fw", &["superbot".into()], std::slice::from_ref(&rule)).await.unwrap();
+        assert_eq!(made.rules, Some(vec![rule.clone()]), "made with them, read back as ours");
+        let found = api.find_firewall("superbot-fw").await.unwrap().unwrap();
+        assert_eq!(found.rules, None, "one without them is not ours, so the reconciler sets it again");
+        api.set_firewall_rules(&found.id, std::slice::from_ref(&rule)).await.unwrap();
+        assert_eq!(api.firewall_egress(), Some(outbound_json(&ours)));
+        assert_eq!(api.settings()["firewallEgress"], "on");
+        assert_eq!(Linode::new(TOKEN, "http://127.0.0.1:1").settings()["firewallEgress"], "off");
+
+        let seen = seen.lock().unwrap();
+        for i in [0, 2] {
+            let rules = if i == 0 { &seen[i].3["rules"] } else { &seen[i].3 };
+            assert_eq!(rules["outbound"].as_array().unwrap().len(), 2, "{}: {rules}", seen[i].1);
+            assert_eq!(rules["outbound"][0]["action"], "DROP");
+            assert_eq!(rules["outbound"][1]["protocol"], "UDP");
+        }
+        assert_eq!(seen[2].1, "/networking/firewalls/77/rules");
     }
 
     #[test]
