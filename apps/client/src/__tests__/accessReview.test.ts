@@ -1,5 +1,18 @@
-import { botAccessLabel, csvFileName, flags, groupLabel, lastLoginLabel, machineLabel, signInsLabel } from "../accessReview";
-import type { AccessReviewPerson, AccessReviewSession } from "../types";
+import {
+  botAccessLabel,
+  csvFileName,
+  effectiveLabel,
+  flags,
+  groupLabel,
+  lastLoginLabel,
+  machineLabel,
+  ownerLabel,
+  serviceFlags,
+  serviceRoleLabel,
+  serviceTokenLabel,
+  signInsLabel,
+} from "../accessReview";
+import type { AccessReviewPerson, AccessReviewServiceAccount, AccessReviewServiceToken, AccessReviewSession } from "../types";
 
 const session = (id: string, kind: string): AccessReviewSession => ({ id, kind, method: "code", createdAt: 0, lastSeenAt: 0, endsAt: 1 });
 
@@ -60,6 +73,49 @@ describe("access review labels", () => {
     expect(signInsLabel(person({ apiTokens: [session("a", "token"), session("b", "token")], sessions: [session("c", "cookie")] }))).toBe("2 API tokens, 1 browser session");
     expect(machineLabel(person())).toBe("No machine");
     expect(machineLabel(person({ machine: { id: "m1", provider: "incus", state: "running", enrollment: "enrolled", assignedAt: 3 } }))).toBe("running, Bots run on it");
+  });
+
+  it("words a service account's owner, roles, flags and tokens", () => {
+    const sa = (p: Partial<AccessReviewServiceAccount> = {}): AccessReviewServiceAccount => ({
+      id: "sa1",
+      name: "CI",
+      description: "",
+      role: "member",
+      status: "active",
+      createdAt: 0,
+      createdBy: null,
+      customRole: null,
+      team: null,
+      owner: { id: "u1", name: "Ada", email: "ada@example.com", status: "active" },
+      ownerActive: true,
+      permissions: ["account", "read"],
+      teamPermissions: [],
+      effective: ["account", "read"],
+      botAccess: { all: false, bots: [] },
+      tokens: [],
+      flags: [],
+      ...p,
+    });
+    expect(ownerLabel(sa())).toBe("Ada");
+    expect(ownerLabel(sa({ ownerActive: false }))).toBe("Ada (inactive)");
+    expect(ownerLabel(sa({ owner: null }))).toBe("No owner");
+    expect(serviceRoleLabel(sa())).toBe("member");
+    expect(serviceRoleLabel(sa({ role: "readonly", customRole: { id: "r1", name: "Exporter", permissions: [] } }))).toBe("readonly · Exporter");
+    const team = { id: "t1", name: "Alpha", role: "member", customRole: { id: "r2", name: "Ops", permissions: [] } };
+    expect(serviceRoleLabel(sa({ team }))).toBe("member · Ops, in Alpha");
+    expect(effectiveLabel(sa())).toBe("account, read");
+    expect(effectiveLabel(sa({ effective: [] }))).toBe("Nothing");
+    expect(serviceFlags(sa({ flags: ["owner_inactive", "unscoped_token", "unused_token", "disabled", "new_one"] }))).toEqual([
+      "Owner inactive",
+      "Token with everything",
+      "Token unused 90 days",
+      "Disabled",
+      "new_one",
+    ]);
+    const t: AccessReviewServiceToken = { id: "st1", name: "Nightly", preview: "sbsa_…ab12", scopes: ["read", "write"], createdAt: 0, expiresAt: 9, lastUsedAt: 5, replaced: false };
+    const date = (ms: number) => `t${ms}`;
+    expect(serviceTokenLabel(t, date)).toBe("Nightly sbsa_…ab12: read, write; expires t9; last used t5");
+    expect(serviceTokenLabel({ ...t, scopes: null, lastUsedAt: null, replaced: true }, date)).toBe("Nightly sbsa_…ab12: everything it holds; replaced, works until t9; never used");
   });
 
   it("names the export as the server does", () => {

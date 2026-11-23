@@ -79,6 +79,43 @@ describe("AccessReview", () => {
     expect(screen.getByText("None yet.")).toBeOnTheScreen();
   });
 
+  it("lists service accounts with their owner, what they can use, flags and tokens", async () => {
+    const sa = {
+      id: "sa1",
+      name: "CI deploy",
+      description: "Deploys main",
+      role: "member" as const,
+      status: "active" as const,
+      createdAt: 0,
+      createdBy: "u1",
+      customRole: null,
+      team: { id: "t1", name: "Research", role: "member" },
+      owner: { id: "u1", name: "Ada", email: "ada@example.com", status: "disabled" },
+      ownerActive: false,
+      permissions: ["account", "read", "write"],
+      teamPermissions: [],
+      effective: [],
+      botAccess: { all: false, bots: [] },
+      tokens: [{ id: "st1", name: "Nightly", preview: "sbsa_…ab12", scopes: null, createdAt: 0, expiresAt: Date.UTC(2027, 0, 1), lastUsedAt: null, replaced: false }],
+      flags: ["owner_inactive", "unscoped_token"],
+    };
+    const r = report({ serviceAccounts: [sa], summary: { ...report().summary, serviceAccounts: 1, serviceApiAccess: 1 } });
+    await open(fakeApi(r));
+    expect(screen.getByText(/1 service accounts with 1 live tokens/)).toBeOnTheScreen();
+    const card = within(screen.getByLabelText("Access of service account CI deploy"));
+    expect(card.getByText("member, in Research")).toBeOnTheScreen();
+    expect(card.getByText("Owner inactive")).toBeOnTheScreen();
+    expect(card.getByText("Token with everything")).toBeOnTheScreen();
+    expect(card.getByText("Owner: Ada (inactive)")).toBeOnTheScreen();
+    expect(card.getByText("Can use today: Nothing")).toBeOnTheScreen();
+    expect(card.getByText(/^Token: Nightly sbsa_…ab12: everything it holds; expires .*; never used$/)).toBeOnTheScreen();
+  });
+
+  it("leaves the section out when there are no service accounts", async () => {
+    await open();
+    expect(screen.queryByText(/^Service accounts/)).toBeNull();
+  });
+
   it("signs off on the report it shows, with notes, and lists the sign-off", async () => {
     const { api, user } = await open();
     await user.type(screen.getByLabelText("Review notes"), "checked");

@@ -940,6 +940,46 @@ export interface AccessReviewPerson {
   machine: { id: string; provider: string; state: string; enrollment: string; assignedAt: number | null } | null;
 }
 
+/** A live service account token in the access review: never its secret, hash or address. */
+export interface AccessReviewServiceToken {
+  id: string;
+  name: string;
+  /** `sbsa_…` and its last four characters. */
+  preview: string;
+  /** Null: everything the account holds. */
+  scopes: string[] | null;
+  createdAt: number;
+  expiresAt: number;
+  lastUsedAt: number | null;
+  /** Rotated: still works until it expires. */
+  replaced: boolean;
+}
+
+/** Why a reviewer should look at a service account twice (ADR 0165). */
+export type AccessReviewServiceFlag = "disabled" | "owner_inactive" | "unscoped_token" | "unused_token";
+
+/** One live service account in `GET /api/access-review` (ADR 0165). */
+export interface AccessReviewServiceAccount {
+  id: string;
+  name: string;
+  description: string;
+  role: Role;
+  status: "active" | "disabled";
+  createdAt: number;
+  createdBy: string | null;
+  customRole: { id: string; name: string; permissions: string[] } | null;
+  team: { id: string; name: string; role: string; customRole?: { id: string; name: string; permissions: string[] } } | null;
+  owner: { id: string; name: string; email: string | null; status: string } | null;
+  ownerActive: boolean;
+  permissions: string[];
+  teamPermissions: string[];
+  /** What its tokens can use today, capped by its owner. */
+  effective: string[];
+  botAccess: AccessReviewPerson["botAccess"];
+  tokens: AccessReviewServiceToken[];
+  flags: (AccessReviewServiceFlag | string)[];
+}
+
 export interface AccessReviewSignOff {
   eventId: number;
   at: number;
@@ -960,6 +1000,10 @@ export interface AccessReviewSummary {
   browserSessions: number;
   apiAccess: number;
   machines: number;
+  /** Servers from before ADR 0165 leave these out. */
+  serviceAccounts?: number;
+  serviceApiAccess?: number;
+  serviceAccountsFlagged?: number;
 }
 
 /** `GET /api/access-review` (admins, ADR 0099): everyone, by SCIM tenant then team, and past sign-offs. */
@@ -970,6 +1014,8 @@ export interface AccessReview {
   digest: string;
   summary: AccessReviewSummary;
   groups: { tenant: string | null; team: { id: string; name: string } | null; people: AccessReviewPerson[] }[];
+  /** Live service accounts, by name. Servers from before ADR 0165 leave it out. */
+  serviceAccounts?: AccessReviewServiceAccount[];
   reviews: AccessReviewSignOff[];
 }
 
@@ -1168,4 +1214,27 @@ export interface OffboardingPreview {
   machine: { fate: "suspend" | "destroy" | "kept" | "none"; days?: number };
   /** What becomes of their work: on teammates' machines, and on their accounts on this server. Each null when that cleanup is off. */
   work: { machines: WorkPolicy | null; accounts: WorkPolicy | null };
+}
+
+/** The residency pin on your data, and where your data is against it (`GET /api/me/residency`, ADR 0168). */
+export interface MyResidency {
+  /** Your team's pin, else your own; null when nothing pins your data. */
+  pin: {
+    on: "user" | "team";
+    region: string;
+    /** Unix ms. */
+    pinnedAt: number;
+    /** The agreement it is under: your own pin's, or your team's for its owners and admins. */
+    reference?: string;
+    team?: { id: string; name: string | null };
+  } | null;
+  /** Your own pin, when your team's holds your data too. */
+  ownPin: { region: string; pinnedAt: number; reference: string } | null;
+  status?: "kept" | "data_outside";
+  /** `inRegion` checks the host it is on too: `hostRegion` is null for a host with no region, `host` null off Incus. */
+  machine?: { id: string; state: string; region: string; inRegion: boolean; host?: string | null; hostRegion?: string | null } | null;
+  backups?: { kept: number; inRegion: number; outside: number };
+  modelRoutes?: { inRegion: boolean; gap: string | null };
+  /** The pins whose residency report you can get. */
+  reports: ("user" | "team")[];
 }

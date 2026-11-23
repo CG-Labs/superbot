@@ -858,10 +858,10 @@ pub enum RoleError {
     NotFound,
     /// Still given to this many people, across the server or in a team.
     InUse(usize),
-    /// This many SCIM groups map to it (ADR 0138).
+    /// This many SCIM (ADR 0138) and SAML (ADR 0160) groups map to it.
     Mapped(usize),
-    /// A SCIM group maps to it in `scope`, where these permissions would reach admins.
-    Reaches { mapping: String, scope: String, perms: Vec<&'static str> },
+    /// A SCIM or SAML group (`via`) maps to it in `scope`, where these permissions would reach admins.
+    Reaches { via: &'static str, mapping: String, scope: String, perms: Vec<&'static str> },
     Db(String),
 }
 
@@ -1787,8 +1787,47 @@ pub enum ScimRoleMapError {
     Db(String),
 }
 
-/// What taking a SCIM grant away did: whether the role was still theirs to clear, and,
-/// across the server, their built-in role before and after.
+/// A native SAML provider's group mapped to a custom role across the server (ADR 0160):
+/// people the IdP's signed assertion puts in `group` get the role when they sign in, and
+/// lose it when a later sign-in no longer does.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SamlRoleMapping {
+    pub id: String,
+    pub provider: String,
+    pub group: String,
+    pub role_id: String,
+    pub created_at: i64,
+    pub created_by: Option<String>,
+}
+
+fn saml_role_mapping_row(r: &Row) -> rusqlite::Result<SamlRoleMapping> {
+    Ok(SamlRoleMapping { id: r.get("id")?, provider: r.get("provider")?, group: r.get("group_name")?, role_id: r.get("role_id")?, created_at: r.get("created_at")?, created_by: r.get("created_by")? })
+}
+
+/// A role a SAML mapping gave someone, at most one per person (a person holds one custom
+/// role across the server). `prior_role` is their built-in role before, given back after.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SamlRoleGrant {
+    pub mapping_id: String,
+    pub user_id: String,
+    pub prior_role: Option<Role>,
+    pub granted_at: i64,
+}
+
+fn saml_role_grant_row(r: &Row) -> rusqlite::Result<SamlRoleGrant> {
+    let prior: Option<String> = r.get("prior_role")?;
+    Ok(SamlRoleGrant {
+        mapping_id: r.get("mapping_id")?,
+        user_id: r.get("user_id")?,
+        prior_role: prior.as_deref().and_then(Role::parse).filter(|r| *r != Role::Admin),
+        granted_at: r.get("granted_at")?,
+    })
+}
+
+/// What taking a SCIM (or SAML) grant away did: whether the role was still theirs to clear,
+/// and, across the server, their built-in role before and after.
 #[derive(Debug, PartialEq)]
 pub struct ScimRevoked {
     pub cleared: bool,
@@ -1797,11 +1836,13 @@ pub struct ScimRevoked {
 }
 
 /// A role given or taken away by hand: what they held just before, read in the same
-/// transaction as the write, and the SCIM mapping whose claim on it ended, if one had.
+/// transaction as the write, and the SCIM (or, across the server, SAML) mapping whose claim
+/// on it ended, if one had.
 #[derive(Debug, PartialEq)]
 pub struct ByHand<T> {
     pub before: T,
     pub taken: Option<String>,
+    pub taken_saml: Option<String>,
 }
 
 fn session_row(r: &Row) -> rusqlite::Result<Session> {
@@ -1922,7 +1963,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 58] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 59] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1980,8 +2021,37 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 58] = [
     migrate_user_last_seen,
     migrate_audit_checkpoints,
     migrate_health_scores,
+    migrate_saml_group_roles,
     migrate_machine_host_dedication,
 ];
+
+/// Native SAML groups mapped to custom roles across the server (ADR 0160): one role per
+/// provider and group, and the grants they made, one per person. A grant whose role was
+/// then changed by hand is kept as released (`released_at`), so the group doesn't give it
+/// back until a sign-in no longer lists the group. A mapped role can't be deleted. Grants
+/// are taken away before their mapping is deleted.
+fn migrate_saml_group_roles(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS saml_role_mappings (
+          id TEXT PRIMARY KEY,
+          provider TEXT NOT NULL,
+          group_name TEXT NOT NULL,
+          role_id TEXT NOT NULL REFERENCES roles(id),
+          created_at INTEGER NOT NULL,
+          created_by TEXT,
+          UNIQUE (provider, group_name)
+        );
+        CREATE INDEX IF NOT EXISTS saml_role_mappings_role ON saml_role_mappings(role_id);
+        CREATE TABLE IF NOT EXISTS saml_role_grants (
+          mapping_id TEXT NOT NULL REFERENCES saml_role_mappings(id) ON DELETE CASCADE,
+          user_id TEXT PRIMARY KEY,
+          prior_role TEXT,
+          granted_at INTEGER NOT NULL,
+          released_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS saml_role_grants_mapping ON saml_role_grants(mapping_id);",
+    )
+}
 
 /// A host an admin dedicated to one team (ADR 0166): only that team's machines go
 /// there, and the team's machines go nowhere else. No foreign key: a host dedicated to
@@ -4889,6 +4959,7 @@ impl Db {
                 set("role", &v.as_str())?;
                 set("role_id", &None::<String>)?;
                 Self::drop_scim_grant_in(&tx, id, "org")?;
+                Self::drop_saml_grant_in(&tx, id)?;
             }
             if let Some(v) = p.status { set("status", &v)? }
             if let Some(v) = &p.tier { set("tier", v)? }
@@ -4949,7 +5020,13 @@ impl Db {
             let maps = st.query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>).map_err(|e| RoleError::Db(e.to_string()))?;
             drop(st);
             if let Some((mapping, scope, perms)) = maps.into_iter().map(|(m, sc)| { let p = new.reaching_admins(sc == "team"); (m, sc, p) }).find(|(_, _, p)| !p.is_empty()) {
-                return Err(RoleError::Reaches { mapping, scope, perms });
+                return Err(RoleError::Reaches { via: "scim", mapping, scope, perms });
+            }
+            // SAML mappings give the role across the server (ADR 0160).
+            let saml: Option<String> = tx.query_row("SELECT id FROM saml_role_mappings WHERE role_id = ? ORDER BY created_at, id LIMIT 1", [id], |r| r.get(0)).optional().map_err(|e| RoleError::Db(e.to_string()))?;
+            let perms = new.reaching_admins(false);
+            if let Some(mapping) = saml.filter(|_| !perms.is_empty()) {
+                return Err(RoleError::Reaches { via: "saml", mapping, scope: "org".into(), perms });
             }
         }
         let res = (|| {
@@ -4992,7 +5069,9 @@ impl Db {
         if held > 0 {
             return Err(RoleError::InUse(held as usize));
         }
-        let mapped: i64 = tx.query_row("SELECT COUNT(*) FROM scim_role_mappings WHERE role_id = ?", [id], |r| r.get(0)).map_err(|e| RoleError::Db(e.to_string()))?;
+        let mapped: i64 = tx
+            .query_row("SELECT (SELECT COUNT(*) FROM scim_role_mappings WHERE role_id = ?1) + (SELECT COUNT(*) FROM saml_role_mappings WHERE role_id = ?1)", [id], |r| r.get(0))
+            .map_err(|e| RoleError::Db(e.to_string()))?;
         if mapped > 0 {
             return Err(RoleError::Mapped(mapped as usize));
         }
@@ -5018,9 +5097,10 @@ impl Db {
     }
 
     /// Runs `write`, and when it changed a row, ends a SCIM group's claim on `user_id`'s
-    /// role in `scope` (ADR 0138), in one transaction: a role given or taken away by hand
-    /// is never one SCIM takes away later. `held` reads, in the same transaction, what they
-    /// held before. None if nothing changed.
+    /// role in `scope` (ADR 0138), and across the server a SAML group's (ADR 0160), in one
+    /// transaction: a role given or taken away by hand is never one a group takes away
+    /// later. `held` reads, in the same transaction, what they held before. None if
+    /// nothing changed.
     fn by_hand<T>(&self, user_id: &str, scope: &str, held: impl FnOnce(&Connection) -> rusqlite::Result<T>, write: impl FnOnce(&Connection) -> rusqlite::Result<usize>) -> Option<ByHand<T>> {
         let c = self.c();
         let tx = c.unchecked_transaction().ok()?;
@@ -5029,7 +5109,8 @@ impl Db {
             return None;
         }
         let taken = Self::drop_scim_grant_in(&tx, user_id, scope).ok()?;
-        tx.commit().ok().map(|_| ByHand { before, taken })
+        let taken_saml = if scope == "org" { Self::drop_saml_grant_in(&tx, user_id).ok()? } else { None };
+        tx.commit().ok().map(|_| ByHand { before, taken, taken_saml })
     }
 
     /// Gives `user_id` the role across the server, its base becoming their built-in role, in
@@ -5227,6 +5308,139 @@ impl Db {
         }
     }
 
+    // Native SAML groups mapped to custom roles (ADR 0160).
+
+    /// A hand change of `user_id`'s role across the server: the SAML grant they held (its
+    /// mapping) is released, not forgotten, so the group doesn't give the role back while
+    /// it still lists them.
+    fn drop_saml_grant_in(c: &Connection, user_id: &str) -> rusqlite::Result<Option<String>> {
+        c.query_row("UPDATE saml_role_grants SET released_at = ?2 WHERE user_id = ?1 AND released_at IS NULL RETURNING mapping_id", params![user_id, now()], |r| r.get(0)).optional()
+    }
+
+    /// The mapping whose grant to `user_id` an admin's hand change released, if any.
+    pub fn saml_role_released(&self, user_id: &str) -> Option<String> {
+        self.c().query_row("SELECT mapping_id FROM saml_role_grants WHERE user_id = ? AND released_at IS NOT NULL", [user_id], |r| r.get(0)).optional().ok().flatten()
+    }
+
+    /// Forgets a released grant: the person left the group, so it may give the role again.
+    pub fn end_saml_role_release(&self, user_id: &str, mapping_id: &str) -> bool {
+        self.c().execute("DELETE FROM saml_role_grants WHERE user_id = ?1 AND mapping_id = ?2 AND released_at IS NOT NULL", [user_id, mapping_id]).unwrap_or(0) > 0
+    }
+
+    pub fn saml_role_mappings(&self) -> Vec<SamlRoleMapping> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM saml_role_mappings ORDER BY provider, created_at, id").unwrap();
+        s.query_map([], saml_role_mapping_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// A provider's mappings, oldest first: the order in which a sign-in tries them.
+    pub fn saml_role_mappings_of(&self, provider: &str) -> Vec<SamlRoleMapping> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM saml_role_mappings WHERE provider = ? ORDER BY created_at, id").unwrap();
+        s.query_map([provider], saml_role_mapping_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn saml_role_mappings_of_role(&self, role_id: &str) -> Vec<SamlRoleMapping> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM saml_role_mappings WHERE role_id = ? ORDER BY created_at, id").unwrap();
+        s.query_map([role_id], saml_role_mapping_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn saml_role_mapping(&self, id: &str) -> Option<SamlRoleMapping> {
+        self.c().query_row("SELECT * FROM saml_role_mappings WHERE id = ?", [id], saml_role_mapping_row).optional().ok().flatten()
+    }
+
+    /// Maps `provider`'s `group` to a role, while it exists and its permissions, as they are
+    /// now, don't reach admins across the server.
+    pub fn create_saml_role_mapping(&self, provider: &str, group: &str, role_id: &str, by: Option<&str>) -> Result<SamlRoleMapping, ScimRoleMapError> {
+        let id = format!("gm{}", crate::random_hex(5));
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(|e| ScimRoleMapError::Db(e.to_string()))?;
+        let perms = role_perms_in(&tx, role_id).map_err(|e| ScimRoleMapError::Db(e.to_string()))?.ok_or(ScimRoleMapError::Gone)?;
+        let reach = perms.reaching_admins(false);
+        if !reach.is_empty() {
+            return Err(ScimRoleMapError::Reaches(reach));
+        }
+        tx.execute("INSERT INTO saml_role_mappings (id, provider, group_name, role_id, created_at, created_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![id, provider, group, role_id, now(), by])
+            .map_err(|e| if constraint(&e) { ScimRoleMapError::Taken } else { ScimRoleMapError::Db(e.to_string()) })?;
+        tx.commit().map_err(|e| ScimRoleMapError::Db(e.to_string()))?;
+        drop(c);
+        self.saml_role_mapping(&id).ok_or(ScimRoleMapError::Gone)
+    }
+
+    /// Deletes a mapping, with any grant rows left (its grants are taken away first).
+    pub fn delete_saml_role_mapping(&self, id: &str) -> bool {
+        self.c().execute("DELETE FROM saml_role_mappings WHERE id = ?", [id]).unwrap_or(0) > 0
+    }
+
+    pub fn saml_role_grants(&self, mapping_id: &str) -> Vec<SamlRoleGrant> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM saml_role_grants WHERE mapping_id = ? AND released_at IS NULL ORDER BY granted_at, user_id").unwrap();
+        s.query_map([mapping_id], saml_role_grant_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// The grant a SAML mapping made to `user_id` and still holds, if one did.
+    pub fn saml_role_grant_of_user(&self, user_id: &str) -> Option<SamlRoleGrant> {
+        self.c().query_row("SELECT * FROM saml_role_grants WHERE user_id = ? AND released_at IS NULL", [user_id], saml_role_grant_row).optional().ok().flatten()
+    }
+
+    /// Gives `user_id` the mapping's role across the server and records that the SAML
+    /// group gave it, in one transaction, only while the mapping and role exist, the role
+    /// doesn't reach admins, and the person is active, holds no custom role, and isn't an
+    /// admin or the owner account. The role's base becomes their built-in role; the one
+    /// they had is kept to give back.
+    pub fn grant_saml_role(&self, m: &SamlRoleMapping, user_id: &str) -> bool {
+        let c = self.c();
+        let Ok(tx) = c.unchecked_transaction() else { return false };
+        let at = now();
+        let res = (|| {
+            if role_perms_in(&tx, &m.role_id)?.is_none_or(|p| !p.reaching_admins(false).is_empty()) {
+                return Ok(false);
+            }
+            let prior: Option<String> = tx.query_row("SELECT role FROM users WHERE id = ?", [user_id], |r| r.get(0)).optional()?;
+            let n = tx.execute(
+                "UPDATE users SET role_id = ?1, role = (SELECT base FROM roles WHERE id = ?1), updated_at = ?3
+                 WHERE id = ?2 AND role_id IS NULL AND role != 'admin' AND id != ?4 AND status = 'active'
+                   AND EXISTS (SELECT 1 FROM roles WHERE id = ?1) AND EXISTS (SELECT 1 FROM saml_role_mappings WHERE id = ?5 AND role_id = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM saml_role_grants WHERE user_id = ?2 AND released_at IS NOT NULL)",
+                params![m.role_id, user_id, at, crate::users::OPERATOR, m.id],
+            )?;
+            if n == 0 {
+                return Ok(false);
+            }
+            tx.execute("INSERT OR REPLACE INTO saml_role_grants (mapping_id, user_id, prior_role, granted_at, released_at) VALUES (?1, ?2, ?3, ?4, NULL)", params![m.id, user_id, prior, at])?;
+            Ok::<_, rusqlite::Error>(true)
+        })();
+        matches!(res, Ok(true)) && tx.commit().is_ok()
+    }
+
+    /// Takes away what the mapping gave `user_id`, and forgets the grant, in one
+    /// transaction. Only a role they still hold from it is cleared, and their built-in role
+    /// goes back to the one they had before (never admin). None if it gave them nothing.
+    pub fn revoke_saml_role(&self, m: &SamlRoleMapping, user_id: &str) -> Option<ScimRevoked> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().ok()?;
+        let res = (|| {
+            let prior: Option<Option<String>> =
+                tx.query_row("DELETE FROM saml_role_grants WHERE mapping_id = ?1 AND user_id = ?2 AND released_at IS NULL RETURNING prior_role", [&m.id, user_id], |r| r.get(0)).optional()?;
+            let Some(prior) = prior else { return Ok(None) };
+            let role = |tx: &Connection| tx.query_row("SELECT role FROM users WHERE id = ?", [user_id], |r| r.get::<_, String>(0)).optional();
+            let before = role(&tx)?;
+            let prior = prior.filter(|p| Role::parse(p).is_some_and(|r| r != Role::Admin));
+            let n = tx.execute(
+                "UPDATE users SET role_id = NULL, role = coalesce(?1, role), updated_at = ?2 WHERE id = ?3 AND role_id = ?4",
+                params![prior, now(), user_id, m.role_id],
+            )?;
+            let after = role(&tx)?;
+            let parse = |r: Option<String>| r.as_deref().and_then(Role::parse);
+            Ok::<_, rusqlite::Error>(Some(ScimRevoked { cleared: n > 0, role_before: parse(before), role_after: parse(after) }))
+        })();
+        match res {
+            Ok(Some(r)) => tx.commit().ok().map(|_| r),
+            _ => None,
+        }
+    }
+
     /// What a person's custom role across the server adds. Nothing without one.
     pub fn user_perms(&self, u: &User) -> crate::rbac::Perms {
         u.role_id.as_deref().and_then(|id| self.custom_role(id)).map_or(crate::rbac::Perms::NONE, |r| r.perms())
@@ -5404,6 +5618,11 @@ impl Db {
         self.c().execute("UPDATE service_tokens SET expires_at = ?1 WHERE id = ?2", params![expires_at, id]).unwrap();
     }
 
+    #[cfg(test)]
+    pub fn set_service_token_created(&self, id: &str, created_at: i64) {
+        self.c().execute("UPDATE service_tokens SET created_at = ?1 WHERE id = ?2", params![created_at, id]).unwrap();
+    }
+
     /// Notes a token's use, at most once a minute, so a busy integration doesn't write on
     /// every request.
     pub fn touch_service_token(&self, id: &str, at: i64, ip: Option<&str>) {
@@ -5578,6 +5797,7 @@ impl Db {
             &[&user_id, &ERASED_NAME, &at, &by, &pseudonym],
         )?;
         run("DELETE FROM scim_role_grants WHERE user_id = ?", &[&user_id])?;
+        run("DELETE FROM saml_role_grants WHERE user_id = ?", &[&user_id])?;
         out.audit_events = Self::pseudonymise_audit(&tx, &scrub, &theirs).map_err(db_err)?;
         tx.commit().map_err(db_err)?;
         Ok(out)
@@ -9685,6 +9905,68 @@ mod tests {
     }
 
     #[test]
+    fn saml_role_grants_only_ever_take_back_what_they_gave() {
+        let db = Db::open(&temp_path("saml-roles").join("app.sqlite")).unwrap();
+        let a = db.create_user(None, Some("a@example.com"), "A", Role::Readonly).unwrap();
+        let b = db.create_user(None, Some("b@example.com"), "B", Role::Member).unwrap();
+        let boss = db.create_user(None, Some("boss@example.com"), "Boss", Role::Admin).unwrap();
+        let r = db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None).unwrap();
+        let hand = db.create_custom_role("Hand", "", Role::Member, &["users.manage"], None).unwrap();
+        let ops = db.create_custom_role("Ops", "", Role::Member, &["bots.manage"], None).unwrap();
+        assert!(matches!(db.create_saml_role_mapping("corp", "Ops", &ops.id, None), Err(ScimRoleMapError::Reaches(p)) if p == ["bots.manage"]), "never a role that reaches admins");
+        assert!(matches!(db.create_saml_role_mapping("corp", "Ghosts", "rnone", None), Err(ScimRoleMapError::Gone)));
+        let m = db.create_saml_role_mapping("corp", "Auditors", &r.id, Some("admin")).unwrap();
+        assert!(matches!(db.create_saml_role_mapping("corp", "Auditors", &hand.id, None), Err(ScimRoleMapError::Taken)), "one role per group");
+        let okta = db.create_saml_role_mapping("okta", "Auditors", &r.id, None).unwrap();
+        assert!(matches!(db.delete_custom_role(&r.id), Err(RoleError::Mapped(2))));
+        assert!(matches!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view", "machines.manage"])), Err(RoleError::Reaches { via: "saml", .. })), "checked as it's saved");
+
+        assert!(db.grant_saml_role(&m, &a.id));
+        assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Member, Some(r.id.clone())));
+        assert!(!db.grant_saml_role(&m, &a.id), "once");
+        assert!(!db.grant_saml_role(&m, &boss.id), "never an admin");
+        assert!(!db.grant_saml_role(&m, crate::users::OPERATOR), "never the owner account");
+        assert!(db.give_user_custom_role(&b.id, &hand.id).is_some());
+        assert!(!db.grant_saml_role(&m, &b.id), "never over a role given by hand");
+        assert_eq!(db.saml_role_grants(&m.id).len(), 1);
+        let back = db.revoke_saml_role(&m, &a.id).unwrap();
+        assert_eq!((back.cleared, back.role_before, back.role_after), (true, Some(Role::Member), Some(Role::Readonly)));
+        assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Readonly, None));
+        assert!(db.revoke_saml_role(&m, &a.id).is_none(), "nothing left to take");
+
+        // Changed by hand: released, not taken back, and held until the group is left.
+        assert!(db.grant_saml_role(&m, &a.id));
+        let g = db.give_user_custom_role(&a.id, &hand.id).unwrap();
+        assert_eq!((g.taken, g.taken_saml.as_deref()), (None, Some(m.id.as_str())));
+        assert!(db.revoke_saml_role(&m, &a.id).is_none());
+        assert_eq!(db.user(&a.id).unwrap().role_id, Some(hand.id.clone()));
+        assert_eq!((db.saml_role_grant_of_user(&a.id).is_none(), db.saml_role_released(&a.id)), (true, Some(m.id.clone())));
+        assert!(db.end_saml_role_release(&a.id, &m.id) && db.saml_role_released(&a.id).is_none());
+        assert!(db.clear_user_custom_role(&a.id, &hand.id));
+        // A built-in role set by hand releases it too.
+        assert!(db.grant_saml_role(&m, &a.id));
+        db.update_user(&a.id, UserPatch { role: Some(Role::Readonly), ..Default::default() }).unwrap();
+        assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Readonly, None));
+        assert_eq!(db.saml_role_released(&a.id), Some(m.id.clone()));
+        // While it's held no mapping gives anything, another provider's included.
+        assert!(!db.grant_saml_role(&okta, &a.id), "another provider's mapping");
+        assert!(!db.grant_saml_role(&m, &a.id));
+        assert_eq!((db.saml_role_released(&a.id), db.user(&a.id).unwrap().role_id), (Some(m.id.clone()), None));
+        // Once it ends, mappings give again; disabled people get nothing.
+        assert!(db.end_saml_role_release(&a.id, &m.id));
+        assert!(db.grant_saml_role(&m, &a.id) && db.saml_role_released(&a.id).is_none());
+        assert!(db.revoke_saml_role(&m, &a.id).is_some());
+        db.update_user(&a.id, UserPatch { status: Some("disabled"), ..Default::default() }).unwrap();
+        assert!(!db.grant_saml_role(&m, &a.id), "only active people");
+
+        // The mapping removed between the read and the grant: nothing given.
+        db.update_user(&a.id, UserPatch { status: Some("active"), ..Default::default() }).unwrap();
+        assert!(db.delete_saml_role_mapping(&m.id));
+        assert!(!db.grant_saml_role(&m, &a.id));
+        assert_eq!(db.user(&a.id).unwrap().role_id, None);
+    }
+
+    #[test]
     fn scim_role_grants_only_ever_take_back_what_they_gave() {
         let db = Db::open(&temp_path("scim-roles").join("app.sqlite")).unwrap();
         let a = db.create_user(None, Some("a@example.com"), "A", Role::Readonly).unwrap();
@@ -9720,7 +10002,7 @@ mod tests {
         // An admin confirms it just as SCIM takes it away: written back, from what was there then.
         assert!(db.grant_scim_role(&org, &a.id));
         assert!(db.revoke_scim_role(&org, &a.id, false).is_some());
-        assert_eq!(db.give_user_custom_role(&a.id, &r.id), Some(ByHand { before: (None, Some(Role::Readonly)), taken: None }));
+        assert_eq!(db.give_user_custom_role(&a.id, &r.id), Some(ByHand { before: (None, Some(Role::Readonly)), taken: None, taken_saml: None }));
         assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Member, Some(r.id.clone())));
         assert!(db.clear_user_custom_role(&a.id, &r.id));
 
@@ -9735,14 +10017,14 @@ mod tests {
         assert_eq!(db.team_member(&b.id).unwrap().role_id, Some(r.id.clone()));
         assert!(db.revoke_scim_role(&in_team, &b.id, true).is_none(), "a leave that a rejoin overtook takes nothing");
         assert_eq!(db.team_member(&b.id).unwrap().role_id, Some(r.id.clone()));
-        assert_eq!(db.give_team_custom_role(&team.id, &b.id, Some(&r.id)), Some(ByHand { before: Some(r.id.clone()), taken: Some(in_team.id.clone()) }), "the same role, now by hand");
+        assert_eq!(db.give_team_custom_role(&team.id, &b.id, Some(&r.id)), Some(ByHand { before: Some(r.id.clone()), taken: Some(in_team.id.clone()), taken_saml: None }), "the same role, now by hand");
         assert!(db.revoke_scim_role(&in_team, &b.id, false).is_none());
         assert_eq!(db.team_member(&b.id).unwrap().role_id, Some(r.id.clone()), "kept by hand");
         // An admin confirms the role SCIM gave just as SCIM takes it away: it is still theirs.
         assert!(db.set_team_custom_role(&team.id, &b.id, None));
         assert!(db.grant_scim_role(&in_team, &b.id));
         assert!(db.revoke_scim_role(&in_team, &b.id, false).is_some());
-        assert_eq!(db.give_team_custom_role(&team.id, &b.id, Some(&r.id)), Some(ByHand { before: None, taken: None }), "it says what was there as it wrote");
+        assert_eq!(db.give_team_custom_role(&team.id, &b.id, Some(&r.id)), Some(ByHand { before: None, taken: None, taken_saml: None }), "it says what was there as it wrote");
         assert_eq!(db.team_member(&b.id).unwrap().role_id, Some(r.id.clone()));
         assert!(db.remove_team_member(&team.id, &b.id, false));
         assert!(!db.grant_scim_role(&in_team, &b.id), "only on the team");

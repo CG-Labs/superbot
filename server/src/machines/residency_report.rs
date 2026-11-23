@@ -1,7 +1,8 @@
 //! The residency report (ADR 0155): for one pin (ADR 0129), where the data it holds is
 //! now, what in the period the pin refused or held to its region, and what it doesn't
 //! cover, as JSON or Markdown, sealed with a SHA-256 digest a customer can check. Admins
-//! only, by RBAC's default arm. Each report is audited as `residency.report_generated`.
+//! only, by RBAC's default arm; the people a pin holds get theirs from the app through
+//! `residency_me` (ADR 0168). Each report is audited as `residency.report_generated`.
 
 use super::ControlPlane;
 use super::residency::{self, PINNED};
@@ -183,7 +184,7 @@ fn activity(app: &App, p: &ResidencyPin, people: &HashSet<String>, from: i64, to
     Ok(json!({ "pinChanges": changes, "refusals": refusals, "heldRuns": held, "truncated": truncated }))
 }
 
-fn person(app: &App, cp: &ControlPlane, id: &str, region: &str) -> Option<Value> {
+pub(super) fn person(app: &App, cp: &ControlPlane, id: &str, region: &str) -> Option<Value> {
     let u = app.db.user(id)?;
     let machine = app.db.user_machine(id).map(|m| {
         let host = residency::host_of(cp, &m);
@@ -334,7 +335,7 @@ pub async fn user(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>,
         Some(t) => ApiError(StatusCode::NOT_FOUND, format!("{} has no residency pin of their own. Their team's pin has its own report: botctl team residency {t} report", u.name)),
         None => not_found("Residency pin on this user"),
     })?;
-    respond(&app, cp, &by, &p, &q)
+    respond(&app, cp, &by, &p, &q, false)
 }
 
 /// `GET /api/teams/{id}/residency/report[?from=&to=&format=markdown]`.
@@ -343,21 +344,29 @@ pub async fn team(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>,
     cp.need()?;
     let t = app.db.team(id.trim()).ok_or_else(|| not_found("Team"))?;
     let p = app.db.residency_pin(PinOn::Team, &t.id).ok_or_else(|| not_found("Residency pin on this team"))?;
-    respond(&app, cp, &by, &p, &q)
+    respond(&app, cp, &by, &p, &q, false)
 }
 
-fn respond(app: &App, cp: &ControlPlane, by: &Who, p: &ResidencyPin, q: &HashMap<String, String>) -> Result<Response, ApiError> {
+/// `?format=` (Markdown or not) and the period, as of `now`.
+pub(super) fn query(q: &HashMap<String, String>, now: i64) -> Result<(bool, i64, i64), ApiError> {
     let md = match q.get("format").map(String::as_str) {
         None | Some("json") => false,
         Some("markdown" | "md") => true,
         Some(_) => return Err(bad("format must be json or markdown")),
     };
-    let now = crate::db::now();
     let (from, to) = period(q, now).map_err(bad)?;
+    Ok((md, from, to))
+}
+
+/// The report on `p` in the format `q` asks for, audited. `self_service`: asked for by
+/// someone the pin holds, from the app (ADR 0168), not by an admin.
+pub(super) fn respond(app: &App, cp: &ControlPlane, by: &Who, p: &ResidencyPin, q: &HashMap<String, String>, self_service: bool) -> Result<Response, ApiError> {
+    let now = crate::db::now();
+    let (md, from, to) = query(q, now)?;
     let r = build(app, cp, p, from, to, now).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("The residency report couldn't be made: {e}")))?;
     let d = json!({
         "region": p.region, "reference": p.reference, "from": from, "to": to, "status": r["status"], "digest": r["digest"],
-        "format": if md { "markdown" } else { "json" }, "truncated": r["activity"]["truncated"],
+        "format": if md { "markdown" } else { "json" }, "truncated": r["activity"]["truncated"], "selfService": self_service,
     });
     app.db.record(&by.event(GENERATED).target(p.subject_type.as_str(), &p.subject_id).details(d));
     if !md {
