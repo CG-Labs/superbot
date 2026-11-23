@@ -1,0 +1,172 @@
+//! A stand-in for an operator's mirrors, for tests (ADR 0186): HTTPS on loopback with a
+//! CA of its own, Node.js tarballs laid out as nodejs.org/dist and npm packages as a
+//! registry serves them (a package document per name, scoped names as `@scope%2fname`,
+//! tarballs under `<name>/-/`). Every path asked for is recorded.
+
+use super::wire::{Download, HarnessInstall, HarnessPlan, InstallSource, NodeRuntime};
+use axum::http::{StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
+use base64::Engine;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256, Sha512};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+#[derive(Default)]
+struct World {
+    files: BTreeMap<String, Vec<u8>>,
+    /// By name, then version: the tarball's path and the SHA-512 the document lists.
+    packages: BTreeMap<String, BTreeMap<String, (String, String)>>,
+    calls: Vec<String>,
+    /// `Mirror::url`, for the tarballs' URLs.
+    base: String,
+}
+
+pub struct Mirror {
+    /// `https://127.0.0.1:<port>`, or empty for `ca_only`.
+    pub url: String,
+    ca_pem: String,
+    world: Arc<Mutex<World>>,
+}
+
+fn sri(b: &[u8]) -> String {
+    format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode(Sha512::digest(b)))
+}
+
+/// nodejs.org's name for this machine's arch.
+pub fn node_arch() -> &'static str {
+    if std::env::consts::ARCH == "aarch64" { "arm64" } else { "x64" }
+}
+
+fn ca() -> (rcgen::Certificate, rcgen::Issuer<'static, rcgen::KeyPair>) {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut p = rcgen::CertificateParams::new(vec![]).unwrap();
+    p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    p.distinguished_name.push(rcgen::DnType::CommonName, "Stand-in mirror CA");
+    let cert = p.self_signed(&key).unwrap();
+    (cert, rcgen::Issuer::new(p, key))
+}
+
+async fn handle(axum::extract::State(w): axum::extract::State<Arc<Mutex<World>>>, uri: Uri) -> Response {
+    let path = uri.path().to_string();
+    let mut w = w.lock().unwrap();
+    w.calls.push(path.clone());
+    if let Some(b) = w.files.get(&path) {
+        return (StatusCode::OK, b.clone()).into_response();
+    }
+    let name = path.strip_prefix("/npm/").map(|n| n.replace("%2f", "/").replace("%2F", "/"));
+    if let Some(versions) = name.as_ref().and_then(|n| w.packages.get(n)) {
+        let base = w.base.clone();
+        let versions: serde_json::Map<String, Value> = versions
+            .iter()
+            .map(|(v, (tarball, integrity))| {
+                (v.clone(), json!({ "name": name, "version": v, "dist": { "tarball": format!("{base}{tarball}"), "integrity": integrity } }))
+            })
+            .collect();
+        let latest = versions.keys().last().cloned();
+        let doc = json!({ "name": name, "dist-tags": { "latest": latest }, "versions": versions });
+        return ([("content-type", "application/json")], doc.to_string()).into_response();
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
+impl Mirror {
+    /// A CA and nothing serving: for settings that only read its certificate.
+    pub fn ca_only() -> Mirror {
+        Mirror { url: String::new(), ca_pem: ca().0.pem(), world: Default::default() }
+    }
+
+    pub async fn serve() -> Mirror {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (ca_cert, issuer) = ca();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut p = rcgen::CertificateParams::new(vec!["127.0.0.1".into(), "localhost".into()]).unwrap();
+        p.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let cert = p.signed_by(&key, &issuer).unwrap();
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let tls = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.der().clone()], rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()))
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+        let url = format!("https://127.0.0.1:{port}");
+        let world = Arc::new(Mutex::new(World { base: url.clone(), ..Default::default() }));
+        let app = axum::Router::new().fallback(handle).with_state(world.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else { return };
+                let (acceptor, app) = (acceptor.clone(), app.clone());
+                tokio::spawn(async move {
+                    let Ok(stream) = acceptor.accept(tcp).await else { return };
+                    let svc = hyper_util::service::TowerToHyperService::new(app);
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(stream), svc).await;
+                });
+            }
+        });
+        Mirror { url, ca_pem: ca_cert.pem(), world }
+    }
+
+    pub fn ca_pem(&self) -> String {
+        self.ca_pem.clone()
+    }
+
+    /// Where `MACHINE_NODE_MIRROR` would point.
+    pub fn node_base(&self) -> String {
+        format!("{}/node", self.url)
+    }
+
+    /// Where `MACHINE_NPM_REGISTRY` would point.
+    pub fn registry(&self) -> String {
+        format!("{}/npm/", self.url)
+    }
+
+    /// Serves `tarball` as Node.js `version` for this arch, and pins it.
+    pub fn node(&self, version: &str, tarball: &[u8]) -> NodeRuntime {
+        let path = format!("/node/v{version}/node-v{version}-linux-{}.tar.xz", node_arch());
+        self.world.lock().unwrap().files.insert(path.clone(), tarball.to_vec());
+        let sha256 = Sha256::digest(tarball).iter().map(|b| format!("{b:02x}")).collect();
+        NodeRuntime { version: version.into(), downloads: [(std::env::consts::ARCH.to_string(), Download { url: format!("{}{path}", self.url), sha256 })].into() }
+    }
+
+    /// Publishes `tarball` as `name@version`; returns its SHA-512.
+    pub fn package(&self, name: &str, version: &str, tarball: &[u8]) -> String {
+        let file = name.rsplit('/').next().unwrap();
+        let path = format!("/npm/{name}/-/{file}-{version}.tgz");
+        let integrity = sri(tarball);
+        let mut w = self.world.lock().unwrap();
+        w.files.insert(path.clone(), tarball.to_vec());
+        w.packages.entry(name.into()).or_default().insert(version.into(), (path, integrity.clone()));
+        integrity
+    }
+
+    /// Serves other bytes for `name@version`, still listed with the old SHA-512.
+    pub fn replace_tarball(&self, name: &str, version: &str, tarball: &[u8]) {
+        let mut w = self.world.lock().unwrap();
+        let path = w.packages[name][version].0.clone();
+        w.files.insert(path, tarball.to_vec());
+    }
+
+    /// A plan of npm harnesses `(name, package, version, pin)` on `node`, from here.
+    pub fn plan(&self, node: &NodeRuntime, npm: Vec<(&str, &str, &str, Option<String>)>) -> HarnessPlan {
+        HarnessPlan {
+            node: Some(node.clone()),
+            harnesses: npm
+                .into_iter()
+                .map(|(name, package, version, integrity)| HarnessInstall {
+                    name: name.into(),
+                    version: version.into(),
+                    source: InstallSource::Npm { package: package.into(), integrity },
+                })
+                .collect(),
+            npm_registry: Some(self.registry()),
+            ca: Some(self.ca_pem()),
+        }
+    }
+
+    pub fn calls(&self) -> Vec<String> {
+        self.world.lock().unwrap().calls.clone()
+    }
+}

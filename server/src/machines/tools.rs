@@ -61,6 +61,8 @@ pub struct Tools {
     saved: Mutex<Saved>,
     wake: tokio::sync::Notify,
     http: reqwest::Client,
+    /// The CA `http` trusts besides the system's, for a client that adds a plan's.
+    extra_root: Option<String>,
     /// Jobs that may be using the tools, and whether an install is replacing some.
     gate: Mutex<Gate>,
     gate_open: tokio::sync::Notify,
@@ -132,6 +134,33 @@ fn https(url: &str) -> bool {
     }) && url.len() <= 2048
 }
 
+/// The largest `HarnessPlan::ca`.
+pub const MAX_CA: usize = 64 << 10;
+
+/// An npm registry as a plan names it: https, no login, query or fragment, ending in `/`.
+pub fn registry_url(url: &str) -> bool {
+    https(url) && url.ends_with('/') && url::Url::parse(url).is_ok_and(|u| u.query().is_none() && u.fragment().is_none())
+}
+
+/// How many certificates `pem` holds: one or more, each one X.509 can parse, and
+/// nothing else but whitespace between them.
+pub fn ca_bundle(pem: &str) -> Result<usize, String> {
+    use rustls::pki_types::pem::PemObject;
+    if pem.len() > MAX_CA || pem.contains('\0') {
+        return Err(format!("it isn't a PEM bundle of certificates under {} KiB", MAX_CA >> 10));
+    }
+    let mut n = 0;
+    for der in rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes()) {
+        let der = der.map_err(|_| "it holds something that isn't a PEM certificate".to_string())?;
+        x509_parser::parse_x509_certificate(&der).map_err(|_| "one of its certificates doesn't parse".to_string())?;
+        n += 1;
+    }
+    if n == 0 || pem.matches("-----BEGIN ").count() != n {
+        return Err("it must hold PEM certificates (-----BEGIN CERTIFICATE-----) and nothing else".into());
+    }
+    Ok(n)
+}
+
 /// A path under a folder: relative, with no `..`.
 fn relative(p: &str) -> bool {
     !p.is_empty()
@@ -182,6 +211,12 @@ pub fn check(plan: &HarnessPlan) -> Result<(), String> {
             }
         }
     }
+    if plan.npm_registry.as_deref().is_some_and(|r| !registry_url(r)) {
+        return Err("the npm registry must be an https URL ending in /, with no login, query or fragment.".into());
+    }
+    if let Some(ca) = &plan.ca {
+        ca_bundle(ca).map_err(|e| format!("The mirrors' CA: {e}."))?;
+    }
     match &plan.node {
         None if npm => Err("npm harnesses need Node.js in the plan.".into()),
         None => Ok(()),
@@ -230,18 +265,27 @@ fn tail(b: &[u8]) -> String {
     s[start..].to_string()
 }
 
+/// A download client trusting the system's roots, `extra_root` and `ca` (a bundle).
+pub fn download_client(extra_root: Option<&str>, ca: Option<&str>) -> Result<reqwest::Client, String> {
+    let mut b = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(60));
+    if let Some(pem) = extra_root {
+        let c = reqwest::Certificate::from_pem(pem.as_bytes()).map_err(|e| e.to_string())?;
+        b = b.tls_certs_merge([c]);
+    }
+    if let Some(pem) = ca {
+        b = b.tls_certs_merge(reqwest::Certificate::from_pem_bundle(pem.as_bytes()).map_err(|e| e.to_string())?);
+    }
+    b.build().map_err(|e| e.to_string())
+}
+
 impl Tools {
     /// `extra_root`: a CA trusted for downloads besides the system's (the control
     /// plane's, so botd could serve them too).
     pub fn new(dir: PathBuf, extra_root: Option<&str>) -> Result<Arc<Tools>, String> {
         std::fs::create_dir_all(dir.join("bin")).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let mut b = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            .read_timeout(Duration::from_secs(60));
-        if let Some(pem) = extra_root {
-            let c = reqwest::Certificate::from_pem(pem.as_bytes()).map_err(|e| e.to_string())?;
-            b = b.tls_certs_merge([c]);
-        }
+        let http = download_client(extra_root, None)?;
         let saved = std::fs::read(dir.join(STATE_FILE))
             .ok()
             .and_then(|b| serde_json::from_slice::<Saved>(&b).ok())
@@ -250,7 +294,8 @@ impl Tools {
             dir,
             saved: Mutex::new(saved),
             wake: tokio::sync::Notify::new(),
-            http: b.build().map_err(|e| e.to_string())?,
+            http,
+            extra_root: extra_root.map(String::from),
             gate: Mutex::default(),
             gate_open: tokio::sync::Notify::new(),
             open: Default::default(),
@@ -488,8 +533,11 @@ impl Tools {
     async fn download(&self, url: &str, sha256: &str, max: u64) -> Result<PathBuf, String> {
         let file = self.dir.join(".dl").join(format!("download-{}", now_ms()));
         let res = async {
-            let mut r = self
-                .http
+            let http = match self.ca() {
+                Some(ca) => download_client(self.extra_root.as_deref(), Some(&ca))?,
+                None => self.http.clone(),
+            };
+            let mut r = http
                 .get(url)
                 .send()
                 .await
@@ -592,8 +640,15 @@ impl Tools {
         Ok(())
     }
 
-    fn npm_env(&self) -> Vec<(&'static str, String)> {
-        vec![
+    /// The plan's mirrors' CA, if it names one.
+    fn ca(&self) -> Option<String> {
+        self.lock().plan.as_ref().and_then(|p| p.ca.clone())
+    }
+
+    /// npm's environment. With the plan's registry, npm asks it and nothing else; with
+    /// its CA, written into `.dl`, Node trusts that besides its own roots.
+    fn npm_env(&self) -> Result<Vec<(&'static str, String)>, String> {
+        let mut env = vec![
             ("PATH", self.path()),
             ("HOME", self.dir.display().to_string()),
             ("LANG", "C.UTF-8".into()),
@@ -601,14 +656,24 @@ impl Tools {
             ("npm_config_update_notifier", "false".into()),
             ("npm_config_fund", "false".into()),
             ("npm_config_audit", "false".into()),
-        ]
+        ];
+        let (registry, ca) = self.lock().plan.as_ref().map_or((None, None), |p| (p.npm_registry.clone(), p.ca.clone()));
+        if let Some(r) = registry {
+            env.push(("npm_config_registry", r));
+        }
+        if let Some(ca) = ca {
+            let file = self.dir.join(".dl").join("mirror-ca.pem");
+            std::fs::write(&file, ca).map_err(|e| format!("{}: {e}", file.display()))?;
+            env.push(("NODE_EXTRA_CA_CERTS", file.display().to_string()));
+        }
+        Ok(env)
     }
 
     /// `npm pack`s the package, checks the tarball against the pinned SHA-512 (or, with
     /// none pinned, against what the registry says), then installs that tarball.
     async fn npm(&self, package: &str, version: &str, integrity: Option<&str>) -> Result<(), String> {
         let npm = self.bin_dir().join("npm").display().to_string();
-        let (env, dl) = (self.npm_env(), self.dir.join(".dl"));
+        let (env, dl) = (self.npm_env()?, self.dir.join(".dl"));
         let spec = format!("{package}@{version}");
         let out = self
             .run(&npm, &["pack", &spec, "--pack-destination", &dl.display().to_string(), "--json"], &env, &dl)
@@ -685,7 +750,7 @@ mod tests {
             version: "24.22.3".into(),
             downloads: BTreeMap::from([("x86_64".into(), wire::Download { url: "https://nodejs.org/n.tar.xz".into(), sha256: "a".repeat(64) })]),
         });
-        let plan = |harnesses: Vec<HarnessInstall>, node: Option<NodeRuntime>| HarnessPlan { node, harnesses };
+        let plan = |harnesses: Vec<HarnessInstall>, node: Option<NodeRuntime>| HarnessPlan { node, harnesses, ..Default::default() };
         assert!(check(&plan(vec![npm("claude", "@anthropic-ai/claude-code", "2.1.329")], node.clone())).is_ok());
         assert!(check(&plan(vec![], None)).is_ok());
         for (h, why) in [
@@ -780,6 +845,7 @@ mod tests {
                 source: InstallSource::Npm { package: "@anthropic-ai/claude-code".into(), integrity },
                 ..npm("claude", "@anthropic-ai/claude-code", "2.1.329")
             }],
+            ..Default::default()
         };
         let sum = |b: u8| Some(format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode([b; 64])));
         t.set_plan(with(sum(1))).unwrap();
@@ -814,7 +880,7 @@ mod tests {
             source: InstallSource::Npm { package: "@anthropic-ai/claude-code".into(), integrity },
             ..npm("claude", "@anthropic-ai/claude-code", "2.1.329")
         };
-        let on = |n: NodeRuntime, integrity: Option<String>| HarnessPlan { node: Some(n), harnesses: vec![claude_with(integrity)] };
+        let on = |n: NodeRuntime, integrity: Option<String>| HarnessPlan { node: Some(n), harnesses: vec![claude_with(integrity)], ..Default::default() };
         {
             let mut s = t.lock();
             s.node = Some("24.22.3".into());
@@ -851,7 +917,7 @@ mod tests {
             let (h, node) = t.next().unwrap();
             assert!(t.replaces(&h, node.as_ref()), "running Bots use the old Node.js");
         }
-        let only_node = HarnessPlan { node: Some(node("24.22.5", 'c')), harnesses: vec![] };
+        let only_node = HarnessPlan { node: Some(node("24.22.5", 'c')), harnesses: vec![], ..Default::default() };
         t.set_plan(only_node.clone()).unwrap();
         assert_eq!(t.node_due(), only_node.node, "even with no npm harness planned");
     }
@@ -869,7 +935,7 @@ mod tests {
             downloads: BTreeMap::from([(std::env::consts::ARCH.into(), wire::Download { url: "https://nodejs.org/n.tar.xz".into(), sha256: "a".repeat(64) })]),
         };
         let unpinned = npm("claude", "@anthropic-ai/claude-code", "2.1.329");
-        let plan = |h: HarnessInstall| HarnessPlan { node: Some(node.clone()), harnesses: vec![h] };
+        let plan = |h: HarnessInstall| HarnessPlan { node: Some(node.clone()), harnesses: vec![h], ..Default::default() };
         t.set_plan(plan(unpinned.clone())).unwrap();
         let (h, _) = t.next().unwrap();
         t.finish(&h, Ok(h.version.clone()));

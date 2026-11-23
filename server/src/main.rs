@@ -1051,6 +1051,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/machine/backups", get(machines::backup::list).post(machines::backup::create))
         .route("/users/{key}/machine/restore", get(machines::backup::restore_status).post(machines::backup::restore_request))
         .route("/users/{key}/machine/harnesses", post(machines::upkeep::harnesses_now))
+        .route("/machines/harness-mirror", get(machines::mirror::check_now))
         .route("/users/{key}/machine/bot-user", post(machines::botuser::now_for))
         .route("/users/{key}/machine/screens", get(machines::screens::list))
         .route("/users/{key}/machine/screens/{bot}", axum::routing::delete(machines::screens::close_now))
