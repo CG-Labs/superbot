@@ -6,7 +6,9 @@ import type {
   AppState,
   Approval,
   ApprovalScope,
+  AuditChainState,
   AuditPage,
+  AuditVerifyReport,
   BillingEmails,
   BillingView,
   BotAccessView,
@@ -42,6 +44,9 @@ import type {
   RolesView,
   Routine,
   ServerConfig,
+  ServiceAccount,
+  ServiceAccountsView,
+  MintedServiceToken,
   SessionView,
   SetupStatus,
   SignupApproval,
@@ -693,6 +698,16 @@ export class SuperBotApi {
     return res.text();
   }
 
+  /** The hash chain's head, signed checkpoints, timestamps, export lag and last check (ADR 0149). */
+  async auditChain(): Promise<AuditChainState> {
+    return this.request<AuditChainState>("GET", "/api/audit/chain");
+  }
+
+  /** Checks the whole chain now; the server records the result. */
+  async auditVerify(): Promise<AuditVerifyReport> {
+    return this.request<AuditVerifyReport>("GET", "/api/audit/verify");
+  }
+
   // The access review: admins only (ADR 0099).
 
   async accessReview(): Promise<AccessReview> {
@@ -754,6 +769,45 @@ export class SuperBotApi {
 
   async unassignTeamRole(id: string, team: string, user: string): Promise<void> {
     await this.request("DELETE", `/api/roles/${encodeURIComponent(id)}/teams/${encodeURIComponent(team)}/users/${encodeURIComponent(user)}`);
+  }
+
+  // Service accounts: admins in the apps (ADR 0143, 0152).
+
+  async serviceAccounts(): Promise<ServiceAccountsView> {
+    return this.request<ServiceAccountsView>("GET", "/api/service-accounts");
+  }
+
+  /** The account with its tokens, never their secrets. */
+  async serviceAccount(id: string): Promise<ServiceAccount> {
+    return this.request<ServiceAccount>("GET", `/api/service-accounts/${encodeURIComponent(id)}`);
+  }
+
+  async createServiceAccount(body: { name: string; description: string; role: string; team: string | null }): Promise<ServiceAccount> {
+    return this.request<ServiceAccount>("POST", "/api/service-accounts", body);
+  }
+
+  /** `status: "disabled"` stops its tokens and work until it's enabled again. */
+  async updateServiceAccount(id: string, patch: Partial<{ name: string; description: string; role: string; team: string | null; owner: string; status: ServiceAccount["status"] }>): Promise<ServiceAccount> {
+    return this.request<ServiceAccount>("PATCH", `/api/service-accounts/${encodeURIComponent(id)}`, patch);
+  }
+
+  /** For good: its tokens are revoked. */
+  async deleteServiceAccount(id: string): Promise<{ tokensRevoked: number }> {
+    return this.request<{ tokensRevoked: number }>("DELETE", `/api/service-accounts/${encodeURIComponent(id)}`);
+  }
+
+  /** The reply is the only time the token's secret is sent. `scopes` left out: all the account holds. */
+  async createServiceToken(id: string, body: { name?: string; scopes?: string[]; expiresInDays?: number }): Promise<MintedServiceToken> {
+    return this.request<MintedServiceToken>("POST", `/api/service-accounts/${encodeURIComponent(id)}/tokens`, body);
+  }
+
+  /** A new token with the same name and scopes; the old one stops now, or after `keepOldMinutes`. */
+  async rotateServiceToken(id: string, token: string, body: { expiresInDays?: number; keepOldMinutes?: number }): Promise<MintedServiceToken> {
+    return this.request<MintedServiceToken>("POST", `/api/service-accounts/${encodeURIComponent(id)}/tokens/${encodeURIComponent(token)}/rotate`, body);
+  }
+
+  async revokeServiceToken(id: string, token: string): Promise<void> {
+    await this.request("DELETE", `/api/service-accounts/${encodeURIComponent(id)}/tokens/${encodeURIComponent(token)}`);
   }
 
   /** Every team, as server admins see them. */

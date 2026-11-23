@@ -502,6 +502,11 @@ mod tests {
             ("GET", "/api/audit/export.csv", Perm::ViewAudit),
             ("GET", "/api/audit/verify", Perm::Admin),
             ("GET", "/api/audit/siem", Perm::Admin),
+            // The chain's state and its signed checkpoints (ADR 0149).
+            ("GET", "/api/audit/chain", Perm::Admin),
+            ("GET", "/api/audit/checkpoints", Perm::Admin),
+            ("POST", "/api/audit/checkpoints", Perm::Admin),
+            ("GET", "/api/audit/checkpoints/key", Perm::Admin),
             // The access-review report, its export and sign-off (ADR 0099).
             ("GET", "/api/access-review", Perm::ViewAudit),
             ("GET", "/api/access-review/export.csv", Perm::ViewAudit),

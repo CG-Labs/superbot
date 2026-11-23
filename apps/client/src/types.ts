@@ -517,6 +517,95 @@ export interface RolesView {
   roles: CustomRole[];
 }
 
+/** Someone named in an admin view. */
+export interface PersonRef {
+  id: string;
+  name: string;
+  email: string | null;
+}
+
+/** A service account (ADR 0143): a non-human caller that acts only through its tokens. Never an admin. */
+export interface ServiceAccount {
+  id: string;
+  name: string;
+  description: string;
+  role: RoleBase;
+  status: "active" | "disabled";
+  /** Its custom role across the server; null within a team. */
+  customRole: CustomRoleRef | null;
+  team: { id: string; name: string } | null;
+  /** Its custom role within `team`. */
+  teamRole: CustomRoleRef | null;
+  owner: PersonRef | null;
+  /** False once the owner is disabled or gone: they lend nothing, so its tokens are refused. */
+  ownerActive: boolean;
+  /** What it holds across the server, and within its team. */
+  permissions: string[];
+  teamPermissions: string[];
+  /** What its tokens can use today: what it holds, within what its owner holds now. */
+  effective: string[];
+  /** Live tokens. */
+  tokens: number;
+  lastUsedAt: number | null;
+  createdAt: number;
+  createdBy: string | null;
+  updatedAt: number;
+  /** Only from `GET /api/service-accounts/{id}`, newest first. */
+  tokenList?: ServiceToken[];
+}
+
+/** A service account's API token, never its secret. */
+export interface ServiceToken {
+  id: string;
+  accountId: string;
+  name: string;
+  /** `sbsa_…` and its last four characters. */
+  preview: string;
+  /** Null: all its account holds. */
+  scopes: string[] | null;
+  state: "active" | "expired" | "revoked";
+  createdAt: number;
+  createdBy: string | null;
+  expiresAt: number;
+  lastUsedAt: number | null;
+  lastUsedIp: string | null;
+  revokedAt: number | null;
+  revokedBy: string | null;
+  revokedReason: string | null;
+  /** The token that replaced it; it may still work until `expiresAt`. */
+  rotatedTo: string | null;
+}
+
+/** `GET /api/service-accounts`. */
+export interface ServiceAccountsView {
+  serviceAccounts: ServiceAccount[];
+  /** Every permission a token can be scoped to. */
+  scopes: string[];
+  defaultDays: number;
+  maxDays: number;
+}
+
+/** The form for `POST /api/service-accounts`, and `PATCH` with what changed. */
+export interface ServiceAccountDraft {
+  name: string;
+  description: string;
+  /** `member`, `readonly`, or a custom role's id. */
+  role: string;
+  /** A team's id, or "" for across the server. */
+  team: string;
+  /** The owner's email or id; only admins change it. */
+  owner: string;
+}
+
+/** The reply to making or rotating a token: the only time its secret is sent. */
+export interface MintedServiceToken {
+  token: string;
+  tokenInfo: ServiceToken;
+  serviceAccount: { id: string; name: string };
+  /** On rotate: the old token, and when it stops. */
+  replaced?: { id: string; endsAt: number };
+}
+
 /** `POST /api/roles`, and `PATCH` with any of it. */
 export interface RoleDraft {
   name: string;
@@ -706,6 +795,110 @@ export interface AuditEvent {
 export interface AuditPage {
   events: AuditEvent[];
   nextBefore: number | null;
+}
+
+/** A row on the audit log's hash chain and its hash (ADR 0122). */
+export interface ChainLink {
+  id: number;
+  hash: string;
+}
+
+/** A signed checkpoint of the chain's head, and its RFC 3161 timestamp (ADR 0149). */
+export interface AuditCheckpoint {
+  /** The `audit.checkpoint` event that carries it. */
+  id: number;
+  at: number;
+  /** The event it signs, and that event's hash. */
+  seq: number;
+  hash: string;
+  keyId: string;
+  publicKey: string;
+  signature: string;
+  statement: string;
+  timestamp: {
+    /** "off" (no TSA when it was made), "pending" or "stamped". */
+    status: "off" | "pending" | "stamped";
+    tsa: string | null;
+    time: number | null;
+    tries: number;
+    error: string | null;
+  };
+}
+
+/** The last `audit.verified` check. */
+export interface AuditVerification {
+  id: number;
+  at: number;
+  by: string | null;
+  ok: boolean;
+  /** Why it failed: `contents`, `link`, `pin`, `checkpoint`, `timestamp`, ... */
+  reason: string | null;
+  checked: number;
+  broken: number;
+  firstBroken: { id: number; reason: string } | null;
+  /** Set when only part of the log was checked (`--from`/`--to`); null bounds are open. */
+  range?: { from: number | null; to: number | null } | null;
+}
+
+/** The SIEM export's progress (`GET /api/audit/siem`). */
+export type AuditExportState =
+  | { enabled: false }
+  | { enabled: true; kind: string; sink: string; delivered: number; pending: number; deliveredAt: number | null; failing: boolean; lastError: string | null; archive?: AuditArchiveState };
+
+/** The S3 archive's settings and last object, when the export is `s3://` (ADR 0154). */
+export interface AuditArchiveState {
+  endpoint: string;
+  bucket: string;
+  prefix: string;
+  lock: "bucket" | "compliance" | "governance" | "off";
+  retainDays: number | null;
+  batchSeconds: number;
+  lastObject: { key: string; version: string | null; events: number; lockMode?: string; retainUntil?: number } | null;
+}
+
+/** `GET /api/audit/chain`: the chain's state for admins (ADR 0149). */
+export interface AuditChainState {
+  head: ChainLink | null;
+  events: number;
+  anchor: ChainLink | null;
+  checkpoints: {
+    everyMinutes: number;
+    count: number;
+    key: { id: string; publicKey: string; algorithm: string };
+    last: AuditCheckpoint | null;
+    /** Events since the last checkpoint. */
+    behind: number;
+  };
+  timestamps: {
+    enabled: boolean;
+    tsa: string | null;
+    trustAnchors: number;
+    stamped: number;
+    pending: number;
+    failing: boolean;
+    failingSince: number | null;
+    lastError: string | null;
+    last: { checkpoint: number; event: number | null; time: number | null; tsa: string | null } | null;
+  };
+  export: AuditExportState;
+  verification: AuditVerification | null;
+}
+
+/** `GET /api/audit/verify`: a check of the chain, its checkpoints and timestamps. */
+export interface AuditVerifyReport {
+  ok: boolean;
+  checked: number;
+  broken: number;
+  firstBroken: { id: number; reason: string } | null;
+  head: ChainLink | null;
+  error?: string;
+  checkpoints?: {
+    checked: number;
+    timestamped: number;
+    trustedTimestamps: number | null;
+    broken: number;
+    firstBroken: { id: number; reason: string; error: string } | null;
+  };
 }
 
 /** A live sign-in in the access review: metadata only, never the token. */

@@ -1,5 +1,5 @@
 // The admin console (ADR 0032): people, requests for access, machines, teams, custom roles,
-// the audit log, and server settings. Chat, Bots, approvals of Bot actions, and screens are in the app
+// service accounts, the audit log, and server settings. Chat, Bots, approvals of Bot actions, and screens are in the app
 // at /app/. The server decides what each role may do; this page only shows admin tools.
 
 const $ = (id) => document.getElementById(id);
@@ -38,8 +38,13 @@ function notice(msg, isError = true) {
 }
 const fail = (err) => notice(err.message || String(err));
 
-// Shown-once values: sign-in codes and SCIM tokens. Closing forgets them; the server keeps only hashes.
-function showOnce({ title, note, value, link, lines = false }) {
+// Shown-once values: sign-in codes, SCIM tokens and service account tokens. Closing forgets them; the server keeps only hashes.
+// Two requests can finish while one is open, so later values wait their turn instead of
+// replacing a secret that hasn't been copied yet.
+const onceQueue = [];
+function showOnce(shown) {
+  if (!$("once").hidden) return void onceQueue.push(shown);
+  const { title, note, value, link, lines = false } = shown;
   $("once-title").textContent = title;
   $("once-note").textContent = note;
   $("once-value").textContent = value;
@@ -53,6 +58,7 @@ function closeOnce() {
   $("once").hidden = true;
   $("once-value").textContent = "";
   $("once-copy-link").dataset.link = "";
+  if (onceQueue.length) showOnce(onceQueue.shift());
 }
 async function copy(text, done, shown = $("once-value")) {
   try {
@@ -876,6 +882,279 @@ $("roles-list").addEventListener("submit", async (e) => {
     fail(err);
   }
   loadRoles({ keepForm: true });
+});
+
+// Service accounts (ADR 0143, 0152): scripts' and integrations' own identities, never admin,
+// acting only through tokens that are shown once, always expire, and rotate or revoke here.
+
+const saTab = { view: { serviceAccounts: [], scopes: [], defaultDays: 90, maxDays: 365 }, details: {}, people: [], teams: [], editing: null };
+
+async function loadServiceAccounts({ keepForm = false } = {}) {
+  try {
+    const [view, , people, allTeams] = await Promise.all([
+      api("GET", "/api/service-accounts"),
+      loadRoleList(),
+      api("GET", "/api/users").catch(() => []),
+      api("GET", "/api/teams").then((v) => v.teams || []).catch(() => []),
+    ]);
+    const details = await Promise.all(view.serviceAccounts.map((s) => api("GET", `/api/service-accounts/${key(s.id)}`).catch(() => ({ ...s, loadFailed: true }))));
+    saTab.view = view;
+    saTab.details = Object.fromEntries(details.map((d) => [d.id, d]));
+    saTab.people = people;
+    saTab.teams = allTeams;
+    $("sa-empty").textContent = "No service accounts yet. Make one above for each script or integration that calls the API.";
+  } catch (err) {
+    $("sa-empty").textContent = err.message;
+    fail(err);
+  }
+  renderServiceAccounts(keepForm);
+}
+
+const SA_KEEP = { 0: "stop the old one now", 60: "keep the old one 1 hour", 1440: "keep the old one 1 day" };
+function saDays() {
+  const { defaultDays, maxDays } = saTab.view;
+  return [...new Set([7, 30, 90, 365, defaultDays])].filter((d) => d >= 1 && d <= maxDays).sort((a, b) => a - b);
+}
+const daysOptions = () => saDays().map((d) => `<option value="${d}" ${d === saTab.view.defaultDays ? "selected" : ""}>${d === 365 ? "1 year" : `${d} days`}</option>`).join("");
+const saRoleKey = (s) => s.customRole?.id || s.teamRole?.id || s.role;
+function saRoleText(s) {
+  const base = baseName(s.role);
+  if (!s.team) return s.customRole?.name || base;
+  return `${base}${s.teamRole ? ` + ${s.teamRole.name}` : ""} in ${s.team.name}`;
+}
+const scopesText = (scopes) => (scopes == null ? "everything it holds" : scopes.filter((x) => x !== "account").join(", ") || "only who it is");
+const lastUsed = (at, ip) => (at ? `last used ${fmt(at)}${ip ? ` from ${ip}` : ""}` : "never used");
+function tokenState(t) {
+  if (t.state === "revoked") return `${t.revokedReason === "rotated" ? "Rotated" : "Revoked"} ${fmt(t.revokedAt)}`;
+  if (t.state === "expired" || t.expiresAt <= Date.now()) return `Expired ${fmt(t.expiresAt)}`;
+  if (t.rotatedTo) return `Replaced; works until ${fmt(t.expiresAt)}`;
+  return `Expires ${fmt(t.expiresAt)}`;
+}
+const liveToken = (t) => t.state === "active" && t.expiresAt > Date.now();
+const heldScopes = (s) => saTab.view.scopes.filter((x) => x !== "account" && (s.permissions.includes(x) || s.teamPermissions.includes(x)));
+
+function tokenRow(t, active) {
+  const soon = liveToken(t) && !t.rotatedTo && t.expiresAt - Date.now() < 7 * 86400000;
+  const actions = !liveToken(t) ? "" : (!t.rotatedTo && active ? `<select name="keep" title="The old token">${Object.entries(SA_KEEP).map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select>
+      <select name="days" title="The new token expires in">${daysOptions()}</select>
+      <button type="button" class="btn" data-act="rotate-token">Rotate</button>` : "") + '<button type="button" class="btn" data-act="revoke-token">Revoke</button>';
+  return `<tr data-token="${esc(t.id)}" class="${liveToken(t) ? "" : "revoked"}">
+    <td>${esc(t.name)} <span class="sub"><code>${esc(t.preview)}</code></span></td>
+    <td>${esc(scopesText(t.scopes))}</td>
+    <td class="${soon ? "warn-text" : ""}">${esc(tokenState(t))}</td>
+    <td>${esc(lastUsed(t.lastUsedAt, t.lastUsedIp))}</td>
+    <td class="actions">${actions}</td>
+  </tr>`;
+}
+
+function saCard(s) {
+  const d = saTab.details[s.id] || s;
+  const active = s.status === "active";
+  const tokens = d.tokenList || [];
+  const held = heldScopes(s);
+  const owner = s.owner ? s.owner.name || s.owner.email || s.owner.id : "nobody";
+  return `<div class="card" data-sa="${esc(s.id)}">
+    <div class="bar"><b>${esc(s.name)}</b> <span class="sub">${esc(saRoleText(s))} · ${active ? "active" : "disabled"} · owned by ${esc(owner)} · ${esc(lastUsed(s.lastUsedAt))}</span>
+      <button type="button" class="btn push" data-act="edit-sa">Edit</button>
+      <button type="button" class="btn" data-act="${active ? "disable-sa" : "enable-sa"}">${active ? "Disable" : "Enable"}</button>
+      <button type="button" class="btn" data-act="delete-sa">Delete</button></div>
+    ${s.description ? `<p class="hint">${esc(s.description)}</p>` : ""}
+    ${!s.ownerActive ? '<p class="warn">Its owner is disabled or gone, so its tokens are refused. Edit it to give it an active owner.</p>' : ""}
+    ${!active ? '<p class="warn">Disabled: its tokens don\'t work. Enable it to use or make tokens.</p>' : ""}
+    <span class="sub">Can use today:</span>${s.effective.length ? tags(s.effective) : ' <span class="sub">nothing</span>'}
+    ${s.team ? `<span class="sub">In ${esc(s.team.name)}: ${esc(permNames(s.teamPermissions))}</span>` : ""}
+    ${d.loadFailed ? '<p class="warn">Its tokens didn\'t load. <button type="button" class="btn" data-act="reload-sa">Reload</button></p>' : tokens.length ? `<table class="grid"><thead><tr><th>Token</th><th>Scopes</th><th>State</th><th>Use</th><th></th></tr></thead><tbody>${tokens.map((t) => tokenRow(t, active)).join("")}</tbody></table>` : '<p class="hint">No tokens yet.</p>'}
+    ${active ? `<form class="bar" data-act="new-token" autocomplete="off">
+      <input name="name" placeholder="Token name (optional), e.g. CI" maxlength="60" />
+      <span class="sub">Scopes (none: everything it holds):</span>
+      ${held.map((x) => `<label><input type="checkbox" name="scope" value="${esc(x)}" /> <code>${esc(x)}</code></label>`).join("")}
+      <select name="days" title="Expires in">${daysOptions()}</select>
+      <button type="submit" class="btn">Make token</button>
+    </form>` : ""}
+  </div>`;
+}
+
+// `keepForm` keeps unsaved edits when only tokens or status changed.
+function renderServiceAccounts(keepForm = false) {
+  const list = saTab.view.serviceAccounts;
+  const drafts = keepForm ? tokenDrafts() : {};
+  $("sa-empty").hidden = list.length > 0;
+  $("sa-list").innerHTML = list.map(saCard).join("")
+    + `<datalist id="sa-people">${saTab.people.filter((u) => u.status === "active").map((u) => `<option value="${esc(u.email || u.id)}">${esc(u.name)}</option>`).join("")}</datalist>`;
+  for (const [id, d] of Object.entries(drafts)) {
+    const f = $("sa-list").querySelector(`[data-sa="${CSS.escape(id)}"] form[data-act=new-token]`);
+    if (!f) continue;
+    f.elements.name.value = d.name;
+    if ([...f.days.options].some((o) => o.value === d.days)) f.days.value = d.days;
+    for (const i of f.querySelectorAll("input[name=scope]")) i.checked = d.scopes.includes(i.value);
+  }
+  renderSaForm(!keepForm);
+}
+
+// What's typed or picked in each account's new-token form, so a refresh keeps it.
+function tokenDrafts() {
+  const out = {};
+  for (const f of $("sa-list").querySelectorAll("form[data-act=new-token]")) {
+    out[f.closest("[data-sa]").dataset.sa] = { name: f.elements.name.value, days: f.days.value, scopes: [...f.querySelectorAll("input[name=scope]:checked")].map((i) => i.value) };
+  }
+  return out;
+}
+
+// `reset` fills the fields from the account being edited (or empties them); without it the
+// pickers are refreshed and what's typed or picked stays.
+function renderSaForm(reset = true) {
+  const s = saTab.view.serviceAccounts.find((x) => x.id === saTab.editing);
+  const role = reset ? (s ? saRoleKey(s) : "readonly") : $("sa-role").value || "readonly";
+  const team = reset ? s?.team?.id || "" : $("sa-team").value;
+  const days = reset ? String(saTab.view.defaultDays) : $("sa-first-days").value || String(saTab.view.defaultDays);
+  // The account's own role and team stay offered even when roles or teams didn't load, so a
+  // save never quietly drops them.
+  const held = s && (s.customRole || s.teamRole);
+  const roleList = [["readonly", "Read-only"], ["member", "Member"], ...roles.roles.map((r) => [r.id, `${r.name} (${baseName(r.base).toLowerCase()} +)`])];
+  if (held && !roleList.some(([v]) => v === held.id)) roleList.push([held.id, held.name]);
+  $("sa-role").innerHTML = roleList.map(([v, l]) => `<option value="${esc(v)}" ${v === role ? "selected" : ""}>${esc(l)}</option>`).join("");
+  const teamList = saTab.teams.map((t) => [t.id, t.name]);
+  if (s?.team && !teamList.some(([v]) => v === s.team.id)) teamList.push([s.team.id, s.team.name]);
+  $("sa-team").innerHTML = `<option value="">Across the server</option>${teamList.map(([v, l]) => `<option value="${esc(v)}" ${v === team ? "selected" : ""}>${esc(l)}</option>`).join("")}`;
+  $("sa-first-days").innerHTML = daysOptions();
+  $("sa-first-days").value = days;
+  if (!reset) return;
+  $("sa-form-title").textContent = s ? `Edit ${s.name}` : "New service account";
+  $("sa-save").textContent = s ? "Save" : "Create service account";
+  $("sa-cancel").hidden = !s;
+  $("sa-first").hidden = !!s;
+  $("sa-owner-label").hidden = !s;
+  $("sa-name").value = s?.name || "";
+  $("sa-description").value = s?.description || "";
+  $("sa-owner").value = s?.owner ? s.owner.email || s.owner.id : "";
+}
+
+$("sa-cancel").addEventListener("click", () => {
+  saTab.editing = null;
+  renderSaForm();
+});
+
+$("sa-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = { name: $("sa-name").value.trim(), description: $("sa-description").value.trim(), role: $("sa-role").value, team: $("sa-team").value || null };
+  const custom = roles.roles.find((r) => r.id === body.role);
+  if (custom && body.team && custom.base === "readonly") return fail(new Error("A read-only role changes nothing in a team. Pick one based on member."));
+  const s = saTab.view.serviceAccounts.find((x) => x.id === saTab.editing);
+  if (saTab.editing && !s) return fail(new Error("That service account didn't load. Reload the page before saving."));
+  if ($("sa-save").disabled) return;
+  $("sa-save").disabled = true;
+  try {
+    if (s) {
+      const patch = {};
+      if (body.name !== s.name) patch.name = body.name;
+      if (body.description !== s.description) patch.description = body.description;
+      if (body.role !== saRoleKey(s) || body.team !== (s.team?.id || null)) Object.assign(patch, { role: body.role, team: body.team });
+      const owner = $("sa-owner").value.trim();
+      if (owner && owner.toLowerCase() !== (s.owner?.email || s.owner?.id || "").toLowerCase()) patch.owner = owner;
+      if (Object.keys(patch).length) await api("PATCH", `/api/service-accounts/${key(s.id)}`, patch);
+      notice(`Saved ${body.name}.`, false);
+    } else {
+      const made = await api("POST", "/api/service-accounts", body);
+      if ($("sa-first-token").checked) {
+        try {
+          const r = await api("POST", `/api/service-accounts/${key(made.id)}/tokens`, { expiresInDays: Number($("sa-first-days").value) });
+          showToken(r);
+        } catch (err) {
+          fail(new Error(`Made ${made.name}, but not its token: ${err.message}`));
+        }
+      } else {
+        notice(`Made ${made.name}.`, false);
+      }
+    }
+    saTab.editing = null;
+  } catch (err) {
+    return fail(err);
+  } finally {
+    $("sa-save").disabled = false;
+  }
+  loadServiceAccounts();
+});
+
+function showToken(r) {
+  const ends = r.replaced ? ` The old token stops ${r.replaced.endsAt <= Date.now() + 1000 ? "now" : fmt(r.replaced.endsAt)}.` : "";
+  showOnce({
+    title: `Token for ${r.serviceAccount.name}`,
+    note: `Copy it now: it can't be shown again. ${scopesText(r.tokenInfo.scopes)}, expires ${fmt(r.tokenInfo.expiresAt)}.${ends} Send it as Authorization: Bearer, or set it as SUPERBOT_TOKEN for botctl.`,
+    value: r.token,
+  });
+}
+
+const saOf = (el) => saTab.view.serviceAccounts.find((s) => s.id === el.closest("[data-sa]").dataset.sa);
+
+$("sa-list").addEventListener("click", async (e) => {
+  const b = e.target.closest("button[data-act]");
+  if (!b) return;
+  const s = saOf(b);
+  if (!s) return;
+  if (b.dataset.act === "reload-sa") return loadServiceAccounts({ keepForm: true });
+  if (b.dataset.act === "edit-sa") {
+    saTab.editing = s.id;
+    renderSaForm();
+    $("sa-name").focus();
+    return;
+  }
+  let resetsForm = false;
+  let acted = true;
+  b.disabled = true;
+  try {
+    const row = b.closest("tr[data-token]");
+    const t = row && (saTab.details[s.id]?.tokenList || []).find((x) => x.id === row.dataset.token);
+    if (b.dataset.act === "disable-sa") {
+      if (!confirm(`Disable ${s.name}? Its tokens stop working and its runs stop until it's enabled again. Its routines pause.`)) return (acted = false);
+      await api("PATCH", `/api/service-accounts/${key(s.id)}`, { status: "disabled" });
+    }
+    if (b.dataset.act === "enable-sa") await api("PATCH", `/api/service-accounts/${key(s.id)}`, { status: "active" });
+    if (b.dataset.act === "delete-sa") {
+      if (!confirm(`Delete ${s.name}? For good: all its tokens are revoked and its runs stop. The audit log keeps naming it.`)) return (acted = false);
+      await api("DELETE", `/api/service-accounts/${key(s.id)}`);
+      if (saTab.editing === s.id) {
+        saTab.editing = null;
+        resetsForm = true;
+      }
+    }
+    if (b.dataset.act === "revoke-token" && t) {
+      if (!confirm(`Revoke ${t.name}? It stops working at once. Whatever uses it needs a new token.`)) return (acted = false);
+      await api("DELETE", `/api/service-accounts/${key(s.id)}/tokens/${key(t.id)}`);
+    }
+    if (b.dataset.act === "rotate-token" && t) {
+      const keepOldMinutes = Number(row.querySelector("[name=keep]").value);
+      if (!keepOldMinutes && !confirm(`Rotate ${t.name}? The old token stops at once.`)) return (acted = false);
+      const r = await api("POST", `/api/service-accounts/${key(s.id)}/tokens/${key(t.id)}/rotate`, { expiresInDays: Number(row.querySelector("[name=days]").value), keepOldMinutes });
+      showToken(r);
+    }
+  } catch (err) {
+    fail(err);
+  } finally {
+    b.disabled = false;
+    if (acted) loadServiceAccounts({ keepForm: !resetsForm });
+  }
+});
+
+$("sa-list").addEventListener("submit", async (e) => {
+  const f = e.target.closest("form[data-act=new-token]");
+  if (!f) return;
+  e.preventDefault();
+  const s = saOf(f);
+  const submit = f.querySelector("button[type=submit]");
+  if (submit.disabled) return;
+  submit.disabled = true;
+  const body = { expiresInDays: Number(f.days.value) };
+  const name = f.elements.name.value.trim();
+  const scopes = [...f.querySelectorAll("input[name=scope]:checked")].map((i) => i.value);
+  if (name) body.name = name;
+  if (scopes.length) body.scopes = scopes;
+  try {
+    showToken(await api("POST", `/api/service-accounts/${key(s.id)}/tokens`, body));
+    f.reset();
+  } catch (err) {
+    fail(err);
+  }
+  loadServiceAccounts({ keepForm: true });
 });
 
 // Audit log: append-only record of sign-ins and admin actions (docs/adr/0009-audit-events.md),
@@ -1924,7 +2203,7 @@ $("sup-days").addEventListener("change", loadHistory);
 
 // Tabs, from the address bar's #fragment so a reload keeps your place.
 
-const TABS = { users: loadUsers, requests: loadRequests, machines: loadMachines, teams: loadTeams, roles: loadRoles, audit: () => loadAudit(), status: loadStatus, support: loadSupport, settings: loadSettings, setup: loadSetup };
+const TABS = { users: loadUsers, requests: loadRequests, machines: loadMachines, teams: loadTeams, roles: loadRoles, "service-accounts": () => loadServiceAccounts({ keepForm: true }), audit: () => loadAudit(), status: loadStatus, support: loadSupport, settings: loadSettings, setup: loadSetup };
 
 // `#audit?target=approval:<id>`: a notification's link to one approval's trail (ADR 0061).
 function showTab() {
