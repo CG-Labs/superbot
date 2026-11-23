@@ -15,6 +15,9 @@ mod acl_http_tests;
 mod adapters;
 mod approvals;
 mod audit;
+mod audit_archive;
+#[cfg(test)]
+mod audit_archive_http_tests;
 mod audit_chain;
 #[cfg(test)]
 mod audit_chain_http_tests;
