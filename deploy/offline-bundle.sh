@@ -4,7 +4,10 @@
 # `install.sh --offline`, which checks it the same way `verify` does.
 #   deploy/offline-bundle.sh build --out DIR [--version V] [--bin-dir DIR] [--client-dir DIR] [--arch A]
 #                                  [--image NAME=REF]... [--image-identity ID | --image-key FILE] [--allow-unsigned]
-#   deploy/offline-bundle.sh verify BUNDLE [--sha256 HEX]
+#   deploy/offline-bundle.sh hermes --out DIR [--tree /opt/hermes]
+#                                  # a Hermes bundle: Hermes Agent at the pinned commit, installed here for
+#                                  # /opt/hermes (as root, connected), for install.sh --offline --with-hermes
+#   deploy/offline-bundle.sh verify BUNDLE [--sha256 HEX]   # an offline bundle or a Hermes bundle
 #   deploy/offline-bundle.sh load BUNDLE [--sha256 HEX]      # docker load its images, no network
 #   deploy/offline-bundle.sh push BUNDLE... --registry HOST[:PORT][/PATH] [--sha256 HEX]...
 #                                  # copy its images, signatures and attestations to a registry mirror,
@@ -21,7 +24,7 @@ DOCKER_FILES=(docker-compose.yml Caddyfile .env.example init.sh seccomp-chromium
 IMAGE_ISSUER=https://token.actions.githubusercontent.com
 
 usage() {
-  sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # The first of SUPERBOT_OCI and CANDIDATES (then superbot-oci on PATH) that runs here: one
@@ -321,9 +324,132 @@ verify_args() {
 
 cmd_verify() {
   verify_args "$@"
+  if offline_archive_ok "$BUNDLE" superbot-hermes >/dev/null; then
+    OFFLINE_ANY_ARCH=1 hermes_unpack_bundle "$BUNDLE" "$OFFLINE_TMP" "$OFFLINE_BUNDLE_SHA256"
+    sed 's/^/    /' "$HERMES_BUNDLE_DIR/MANIFEST"
+    log "$BUNDLE is a good Hermes bundle"
+    return
+  fi
   OFFLINE_ANY_ARCH=1 offline_unpack_bundle "$BUNDLE" "$OFFLINE_TMP"
   sed 's/^/    /' "$OFFLINE_DIR/MANIFEST"
   log "$BUNDLE is a good bundle"
+}
+
+# The value of FIELD in server/src/adapters/install.rs's pin for BIN, as
+# deploy/install-harness-clis.sh reads it.
+harness_pin() {
+  local pins v
+  pins="$(repo_root)/server/src/adapters/install.rs"
+  [[ -f "$pins" ]] || die "No $pins: run hermes from a checkout of the release tag"
+  v=$(awk -v bin="$1" -v field="$2" '
+    index($0, "bin: \"" bin "\"") { found = 1 }
+    found && index($0, field ": \"") { sub(".*" field ": \"", ""); sub("\".*", ""); print; exit }
+  ' "$pins")
+  [[ -n "$v" ]] || die "No $2 for $1 in $pins"
+  printf '%s\n' "$v"
+}
+
+# Hermes Agent's pinned installer, run as root with HOME=$HERMES_SHARED_DIR as install.sh
+# --with-hermes runs it, but in a mount namespace of its own whose $HERMES_SHARED_DIR is TREE,
+# so this machine's own /opt is never touched. Then hermes-share.sh, and hermes --version with
+# no network, as a Bot would run it.
+hermes_install_tree() {
+  local tree=$1 commit=$2 sha=$3 installer
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "hermes installs Hermes Agent for $HERMES_SHARED_DIR, so it runs as root: sudo $0 hermes ... (or give --tree)"
+  local c
+  for c in curl git unshare mount sha256sum; do command -v "$c" >/dev/null 2>&1 || die "hermes needs $c"; done
+  installer="$OFFLINE_TMP/hermes-install.sh"
+  curl -fsSL --retry 3 "https://raw.githubusercontent.com/NousResearch/hermes-agent/$commit/scripts/install.sh" -o "$installer" \
+    || die "Couldn't download Hermes Agent's installer for $commit"
+  printf '%s  %s\n' "$sha" "$installer" | sha256sum -c --quiet - || die "Hermes Agent's installer doesn't match the pinned SHA-256 ($sha)"
+  # Copied out first: the namespace's $HERMES_SHARED_DIR parent is empty, and this checkout may be under it.
+  install -m 0644 "$DIR/hermes-share.sh" "$OFFLINE_TMP/hermes-share.sh"
+  log "Installing Hermes Agent ${commit:0:12} for $HERMES_SHARED_DIR (in a mount namespace of its own; about 2.5 GB)"
+  # shellcheck disable=SC2016 # expanded by the inner bash
+  unshare --mount --propagation private -- bash -euo pipefail -c '
+    tree=$1 dest=$2 installer=$3 share=$4 commit=$5
+    path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    mount -t tmpfs -o mode=0755 superbot-hermes "$(dirname "$dest")"
+    mkdir "$dest"
+    mount --bind "$tree" "$dest"
+    env -i HOME="$dest" SHELL=/bin/bash PATH="$path" LANG=C.UTF-8 TERM=dumb \
+      bash "$installer" --non-interactive --skip-browser --skip-computer-use --commit "$commit"
+    env -i HOME="$dest" PATH="$path" sh "$share" >/dev/null
+    probe=$(mktemp -d)
+    unshare --net -- env -i HOME="$probe" HERMES_HOME="$probe/hermes" PATH="$path" "$dest/.hermes/superbot/hermes" --version
+    rm -rf "$probe"
+  ' _ "$tree" "$HERMES_SHARED_DIR" "$installer" "$OFFLINE_TMP/hermes-share.sh" "$commit" \
+    || die "Hermes Agent didn't install, or didn't run with no network"
+}
+
+# A Hermes bundle: Hermes Agent at the pinned commit, as its own installer leaves it with
+# HOME=$HERMES_SHARED_DIR, for install.sh --offline --with-hermes --hermes-bundle. Its Python,
+# packages and Node.js tools are inside that folder and its links point inside it, so it runs
+# there, and only there, with no network. Caches are left out.
+cmd_hermes() {
+  local out="" tree="" arch commit tag sha top stage name parent skip excludes=()
+  local unbundled=(.cache .hermes/cache/uv .hermes/cache/pnpm)
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --out) out=$2; shift 2 ;;
+      --tree) tree=$2; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$out" ]] || die "hermes needs --out DIR"
+  arch=$(uname -m)
+  [[ "$arch" =~ ^(x86_64|aarch64)$ ]] || die "Hermes bundles are for x86_64 or aarch64, not $arch"
+  commit=$(harness_pin hermes version) tag=$(harness_pin hermes tag) sha=$(harness_pin hermes sha256)
+  [[ "$commit" == "$HERMES_COMMIT" ]] || die "install.sh pins Hermes Agent $HERMES_COMMIT, but server/src/adapters/install.rs pins $commit: bundle the pinned one (unset HERMES_COMMIT)"
+  [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Hermes Agent's pinned tag \"$tag\" isn't a stable release"
+  OFFLINE_TMP=$(mktemp -d)
+  trap cleanup_offline EXIT
+  chmod 0755 "$OFFLINE_TMP"
+  if [[ -z "$tree" ]]; then
+    parent="$OFFLINE_TMP/root"
+    install -d -m 0755 "$parent/hermes"
+    hermes_install_tree "$parent/hermes" "$commit" "$sha"
+  else
+    [[ "$(basename "$tree")" == hermes && -d "$tree" ]] || die "--tree must be a folder named hermes, as $HERMES_SHARED_DIR is"
+    parent=$(cd "$(dirname "$tree")" && pwd)
+  fi
+  [[ "$(hermes_installed "$parent/hermes")" == "$commit" ]] || die "$parent/hermes isn't Hermes Agent $commit"
+  if ! compgen -G "$parent/hermes/.hermes/installs/*/facts.json" >/dev/null \
+    || ! grep -qF "\"$HERMES_SHARED_DIR/.hermes/installs/" "$parent"/hermes/.hermes/installs/*/facts.json; then
+    die "$parent/hermes wasn't installed for $HERMES_SHARED_DIR (its installs/*/facts.json name another place), so it wouldn't run there"
+  fi
+  [[ -x "$parent/hermes/.hermes/superbot/hermes" ]] || die "$parent/hermes has no .hermes/superbot/hermes: run deploy/hermes-share.sh with HOME=$HERMES_SHARED_DIR"
+
+  hermes_tree_ok "$parent/hermes" "$HERMES_SHARED_DIR" "${unbundled[@]}" || die "Not bundling $parent/hermes: $HERMES_TREE_PROBLEM"
+
+  top="superbot-hermes-$tag-$arch"
+  stage="$OFFLINE_TMP/$top"
+  mkdir -p "$stage"
+  log "Packing Hermes Agent $tag"
+  for skip in "${unbundled[@]}"; do excludes+=("--exclude=hermes/$skip"); done
+  tar -C "$parent" --owner=0 --group=0 --numeric-owner --sort=name --anchored "${excludes[@]}" \
+    -cf "$stage/hermes.tar" hermes || die "Couldn't pack $parent/hermes"
+  if [[ -z "$tree" ]]; then rm -rf -- "$parent"; fi
+  hermes_tar_ok "$stage/hermes.tar" || die "Not bundling $parent/hermes: $HERMES_TREE_PROBLEM"
+  {
+    echo format=1
+    echo kind=hermes
+    echo "hermes_tag=$tag"
+    echo "hermes_commit=$commit"
+    echo "prefix=$HERMES_SHARED_DIR"
+    echo "arch=$arch"
+    echo "commit=$(git -C "$(repo_root)" rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } >"$stage/MANIFEST"
+  (cd "$stage" && sha256sum hermes.tar MANIFEST) >"$OFFLINE_TMP/SHA256SUMS"
+  mv "$OFFLINE_TMP/SHA256SUMS" "$stage/SHA256SUMS"
+  mkdir -p "$out"
+  name="$top.tar.gz"
+  tar -C "$OFFLINE_TMP" --owner=0 --group=0 --numeric-owner --sort=name -czf "$out/$name" "$top"
+  (cd "$out" && sha256sum "$name" >"$name.sha256")
+  log "Hermes bundle: $out/$name"
+  log "SHA-256: $(awk '{ print $1 }' "$out/$name.sha256") (publish this where the operator can check it)"
 }
 
 cmd_load() {
@@ -502,9 +628,10 @@ cmd_push() {
 
 case "${1:-}" in
   build) shift; cmd_build "$@" ;;
+  hermes) shift; cmd_hermes "$@" ;;
   verify) shift; cmd_verify "$@" ;;
   load) shift; cmd_load "$@" ;;
   push) shift; cmd_push "$@" ;;
   -h|--help|"") usage ;;
-  *) die "Unknown command: $1 (build, verify, load or push)" ;;
+  *) die "Unknown command: $1 (build, hermes, verify, load or push)" ;;
 esac

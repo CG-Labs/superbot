@@ -17,9 +17,12 @@ name: offline
 # It signs those two bundles with the same key and runs deploy/offline-release-check.sh on them,
 # as for a published release: connected, then, inside the namespace, offline against the mirror
 # (docs/adr/0172-release-bundles-checked-end-to-end.md).
+# It builds a Hermes bundle, connected, and installs Hermes Agent from it with no network; an
+# upgrade without --with-hermes keeps it (docs/adr/0200-hermes-agent-bundle-for-air-gapped-installs.md).
 # release-bundle: for every v* tag, once the docker workflow has published and signed that tag's
-# images (or by hand, for a published release), bundles them for each arch, signs each bundle
-# with cosign keylessly under this workflow's identity, and attaches both to the release.
+# images (or by hand, for a published release), bundles them for each arch, with a Hermes bundle
+# for each arch, signs each bundle with cosign keylessly under this workflow's identity, and
+# attaches them to the release.
 # release-check: then checks what was attached end to end, against ghcr.io and with no network
 # (offline-release-check.yml, which also runs weekly on the latest release).
 
@@ -31,6 +34,7 @@ on:
       - 'deploy/offline-bundle.sh'
       - 'deploy/test-offline.sh'
       - 'deploy/superbot*.sh'
+      - 'deploy/hermes-share.sh'
       - 'deploy/*.service'
       - 'deploy/*.timer'
       - 'server/**'
@@ -48,6 +52,7 @@ on:
       - 'deploy/offline-bundle.sh'
       - 'deploy/test-offline.sh'
       - 'deploy/superbot*.sh'
+      - 'deploy/hermes-share.sh'
       - 'deploy/*.service'
       - 'deploy/*.timer'
       - 'server/**'
@@ -85,7 +90,7 @@ jobs:
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -114,7 +119,7 @@ jobs:
           curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
           curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
           sudo apt-get update -qq
-          sudo apt-get install -y -qq caddy sqlite3 age bubblewrap socat acl shellcheck skopeo jq
+          sudo apt-get install -y -qq caddy sqlite3 age bubblewrap socat acl shellcheck skopeo jq libatomic1
       - name: ShellCheck
         run: shellcheck -x -S style deploy/install.sh deploy/offline-bundle.sh deploy/test-offline.sh deploy/offline-release-check.sh deploy/test-offline-release-check.sh
       - name: Bundle checks without root (tampering, downgrades, certificates, the Caddyfile, a dry run)
@@ -260,6 +265,49 @@ jobs:
           fi
           grep -Fq "newer than the bundle's $OLD" /tmp/offline-downgrade.log
           grep -qx "version=$NEW" /usr/local/share/superbot/offline-release
+          sudo systemctl is-active --quiet superbot
+      # Connected, as an operator makes it once per Hermes pin; then nothing below has a network.
+      - name: A Hermes bundle, built with the network
+        run: |
+          set -euo pipefail
+          df -h / | tail -n 1
+          sudo deploy/offline-bundle.sh hermes --out "$RUNNER_TEMP/h"
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/h"
+          hb=$(ls "$RUNNER_TEMP"/h/superbot-hermes-*-"$(uname -m)".tar.gz)
+          deploy/offline-bundle.sh verify "$hb"
+          echo "HB=$hb" >>"$GITHUB_ENV"
+          ls -l "$RUNNER_TEMP/h"
+          df -h / | tail -n 1
+      - name: Install Hermes Agent from its bundle with no network; an upgrade without it keeps it
+        run: |
+          set -euo pipefail
+          arch=$(uname -m)
+          commit=$(sed -n 's/^HERMES_COMMIT=.*:-\([0-9a-f]\{40\}\)}.*/\1/p' deploy/install.sh)
+          [[ $commit =~ ^[0-9a-f]{40}$ ]]
+          upgrade() {
+            sudo ip netns exec offline bash deploy/install.sh --offline "$RUNNER_TEMP/b/superbot-offline-$NEW-$arch.tar.gz" --upgrade \
+              --domain offline.test --tls-cert "$RUNNER_TEMP/tls.pem" --tls-key "$RUNNER_TEMP/tls.key" --non-interactive --tz UTC "$@"
+          }
+          if sudo ip netns exec offline curl -sS --max-time 5 https://github.com >/dev/null 2>&1; then echo "the network is still up" >&2; exit 1; fi
+          upgrade --with-hermes --hermes-bundle "$HB" | tee /tmp/offline-hermes.log
+          grep -Fq "Hermes bundle: Hermes Agent" /tmp/offline-hermes.log
+          grep -Fq "Installing Hermes Agent ${commit:0:12} system-wide in /opt/hermes from the Hermes bundle" /tmp/offline-hermes.log
+          [[ $(readlink /usr/local/bin/hermes) == /opt/hermes/.hermes/superbot/hermes ]]
+          [[ $(sudo stat -c '%U %a' /opt/hermes) == 'root 755' ]]
+          if ls -d /opt/.superbot-hermes.* 2>/dev/null; then echo "the Hermes bundle's staging was left behind" >&2; exit 1; fi
+          probe=$(mktemp -d) && chmod 0777 "$probe"
+          sudo ip netns exec offline sudo -u nobody env HOME="$probe" HERMES_HOME="$probe/h" /usr/local/bin/hermes --version | tee /tmp/offline-hermes-version.log
+          grep -q '^Hermes Agent v' /tmp/offline-hermes-version.log
+          sudo ip netns exec offline sudo -u superbot env HOME="$probe" HERMES_HOME="$probe/s" hermes --version >/dev/null
+          sudo rm -rf "$probe"
+          sudo systemctl is-active --quiet superbot
+          sudo touch /opt/hermes/.ci-marker
+          upgrade | tee /tmp/offline-hermes-kept.log
+          if grep -E 'Installing Hermes Agent|Unpacking Hermes Agent|this release pins' /tmp/offline-hermes-kept.log; then echo "an upgrade without --with-hermes touched Hermes Agent" >&2; exit 1; fi
+          sudo test -e /opt/hermes/.ci-marker
+          upgrade --with-hermes --hermes-bundle "$HB" | tee /tmp/offline-hermes-again.log
+          grep -Fq "Hermes Agent ${commit:0:12} is already installed in /opt/hermes" /tmp/offline-hermes-again.log
+          sudo test -e /opt/hermes/.ci-marker
           sudo systemctl is-active --quiet superbot
       - name: Load the bundle's images into Docker with no network
         run: |
@@ -408,6 +456,20 @@ jobs:
           cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
           deploy/offline-bundle.sh verify "$f"
           cat "$f.sha256" >>"$GITHUB_STEP_SUMMARY"
+      # Hermes Agent at the pinned commit, for --offline --with-hermes (ADR 0200).
+      - name: Bundle Hermes Agent, and sign it
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          sudo deploy/offline-bundle.sh hermes --out "$RUNNER_TEMP/h"
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/h"
+          for f in "$RUNNER_TEMP"/h/superbot-hermes-*-"$ARCH".tar.gz; do
+            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
+            deploy/offline-bundle.sh verify "$f"
+            cat "$f.sha256" >>"$GITHUB_STEP_SUMMARY"
+            mv "$f" "$f.sha256" "$f.sigstore.json" dist/
+          done
       # The release workflow makes the release from the same tag, usually long before this.
       - name: Attach to the release
         env:
@@ -418,6 +480,7 @@ jobs:
           for _ in $(seq 1 60); do gh release view "$TAG" >/dev/null 2>&1 && break; sleep 10; done
           gh release view "$TAG" >/dev/null || { echo "::error::No GitHub release for $TAG: the release workflow makes it"; exit 1; }
           gh release upload "$TAG" dist/superbot-offline-* --clobber
+          gh release upload "$TAG" dist/superbot-hermes-* --clobber
 
   release-check:
     # What release-bundle attached, checked end to end as a customer uses it (ADR 0172).

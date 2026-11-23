@@ -59,6 +59,17 @@ TLS_DIR=${TLS_DIR:-/etc/caddy/superbot-tls}
 # Hermes Agent release --with-hermes installs: the commit of tag v0.23.3 (NousResearch/hermes-agent),
 # as server/src/adapters/install.rs pins it. Change it with deploy/hermes-pin.sh bump.
 HERMES_COMMIT=${HERMES_COMMIT:-caafe5389ae585ef77387a962aee05b1bcf17029}
+# --hermes-bundle: Hermes Agent for --offline --with-hermes, already installed for /opt/hermes
+# on a connected machine by deploy/offline-bundle.sh hermes
+# (docs/adr/0200-hermes-agent-bundle-for-air-gapped-installs.md).
+HERMES_BUNDLE=""
+HERMES_BUNDLE_SHA256=""
+# Set by prepare_hermes_bundle: the checked bundle's root, inside HERMES_STAGE (beside
+# HERMES_SHARED_DIR, so the new tree moves into place in one rename).
+HERMES_STAGE=""
+HERMES_BUNDLE_DIR=""
+# The tree install_hermes_shared moved aside, put back if the new one fails.
+HERMES_PREVIOUS=""
 SHARE_DIR=${SHARE_DIR:-/usr/local/share/superbot}
 SYSTEMD_DIR=${SYSTEMD_DIR:-/etc/systemd/system}
 CLIENT_DIR=${CLIENT_DIR:-/var/www/superbot-app}
@@ -124,7 +135,8 @@ Usage: install.sh [options]
   --backup-off-host auto|on|off
                       SERVER_BACKUP_OFF_HOST: copy when a store is set (auto, the default),
                       refuse to start without one (on), or never copy (off)
-  --with-hermes       Also install the Hermes Agent CLI (about 2.5 GB; HERMES_COMMIT pins it)
+  --with-hermes       Also install the Hermes Agent CLI (about 2.5 GB; HERMES_COMMIT pins it).
+                      With --offline, from --hermes-bundle
   --license-file PATH Install the license key CG-Labs sent. SuperBot has no free tier: without a
                       license, Bots don't run unless testing mode is on
   --testing-mode      Set TESTING_MODE=on: no license, billing off, for test servers only
@@ -139,6 +151,11 @@ Usage: install.sh [options]
                       or certificate authority. Needs the system packages already installed
                       (docs/ops/air-gapped.md), and --tls-cert/--tls-key with --domain
   --bundle-sha256 HEX The bundle's SHA-256, from where it was published (else BUNDLE.sha256)
+  --hermes-bundle FILE
+                      With --offline --with-hermes: install Hermes Agent from this Hermes bundle
+                      (deploy/offline-bundle.sh hermes), checked like the bundle
+  --hermes-bundle-sha256 HEX
+                      The Hermes bundle's SHA-256, from where it was published (else FILE.sha256)
   --tls-cert PATH, --tls-key PATH
                       Serve --domain with this certificate (PEM, full chain) and key instead of
                       getting one from Let's Encrypt
@@ -180,6 +197,8 @@ parse_args() {
       --no-client) BUILD_CLIENT=false; shift ;;
       --offline) OFFLINE_BUNDLE=$2; shift 2 ;;
       --bundle-sha256) OFFLINE_BUNDLE_SHA256=$2; shift 2 ;;
+      --hermes-bundle) HERMES_BUNDLE=$2; shift 2 ;;
+      --hermes-bundle-sha256) HERMES_BUNDLE_SHA256=$2; shift 2 ;;
       --tls-cert) TLS_CERT=$2; shift 2 ;;
       --tls-key) TLS_KEY=$2; shift 2 ;;
       --dry-run) DRY_RUN=true; shift ;;
@@ -1060,6 +1079,7 @@ stop_for_hermes() {
 }
 
 hermes_failed() {
+  hermes_put_back || true
   if [[ "$HERMES_STOPPED" == true ]]; then
     warn "Starting superbot again with the Hermes Agent it had"
     systemctl start superbot.service || true
@@ -1081,7 +1101,10 @@ fetch_hermes_installer() {
 # the hermes Bots run in ~/.hermes/superbot, which botd gets on PATH through .env. With
 # per-user accounts, which can't read botd's home, it goes system-wide instead.
 install_hermes() {
-  [[ "$WITH_HERMES" == true ]] || return 0
+  if [[ "$WITH_HERMES" != true ]]; then
+    hermes_pin_notice
+    return 0
+  fi
   [[ "$HERMES_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "HERMES_COMMIT must be a full commit SHA"
   local home env_file bin_path url share wrapper cur installer ok
   home=$(user_home)
@@ -1090,8 +1113,15 @@ install_hermes() {
   url="https://raw.githubusercontent.com/NousResearch/hermes-agent/$HERMES_COMMIT/scripts/install.sh"
   share="$(trusted_deploy_dir)/hermes-share.sh"
   wrapper="$home/.hermes/superbot/hermes"
-  if [[ "$(isolation_mode)" == users ]]; then
+  # A Hermes bundle was installed for $HERMES_SHARED_DIR, so it goes there with or without
+  # per-user accounts; botd finds it on PATH as /usr/local/bin/hermes.
+  if [[ "$(isolation_mode)" == users || -n "$HERMES_BUNDLE" ]]; then
     install_hermes_shared "$url" "$share"
+    if [[ -n "$HERMES_BUNDLE" && "$(isolation_mode)" != users ]]; then
+      cur=$(env_value "$env_file" PATH 2>/dev/null || true)
+      [[ ":$cur:" != *":$home/.hermes/superbot:"* ]] \
+        || warn "$env_file puts $home/.hermes/superbot on PATH, so botd runs the Hermes Agent there, not the one in $HERMES_SHARED_DIR: remove it from PATH"
+    fi
     return
   fi
   if [[ "$DRY_RUN" == true ]]; then
@@ -1127,14 +1157,17 @@ install_hermes() {
 # Each run has its own HERMES_HOME (the Bot's folder), holding the Bot's own record of the
 # install; the environment is the install's one, read-only to them.
 install_hermes_shared() {
-  local url=$1 share=$2 probe installer ok wrapper="$HERMES_SHARED_DIR/.hermes/superbot/hermes"
+  local url=$1 share=$2 probe installer ok d wrapper="$HERMES_SHARED_DIR/.hermes/superbot/hermes" from=$1
+  [[ -z "$HERMES_BUNDLE" ]] || from="the Hermes bundle $HERMES_BUNDLE"
   if [[ "$DRY_RUN" == true ]]; then
     log "[dry-run] would share its environment across Bots with $share"
-    log "[dry-run] would install Hermes Agent $HERMES_COMMIT system-wide in $HERMES_SHARED_DIR from $url, linked from /usr/local/bin/hermes"
+    log "[dry-run] would install Hermes Agent $HERMES_COMMIT system-wide in $HERMES_SHARED_DIR from $from, linked from /usr/local/bin/hermes"
     return
   fi
   if [[ "$(hermes_installed "$HERMES_SHARED_DIR")" == "$HERMES_COMMIT" ]] && env HOME="$HERMES_SHARED_DIR" sh "$share" >/dev/null 2>&1; then
     log "Hermes Agent ${HERMES_COMMIT:0:12} is already installed in $HERMES_SHARED_DIR"
+  elif [[ -n "$HERMES_BUNDLE" ]]; then
+    install_hermes_from_bundle
   else
     apt-get install -y -qq libatomic1 xz-utils
     installer=$(fetch_hermes_installer "$url")
@@ -1148,14 +1181,75 @@ install_hermes_shared() {
     [[ "$ok" == true ]] || hermes_failed "Hermes Agent did not install"
   fi
   env HOME="$HERMES_SHARED_DIR" sh "$share" >/dev/null || hermes_failed "Couldn't share Hermes Agent's environment"
-  chmod -R go-w "$HERMES_SHARED_DIR"
-  chmod go+rx "$HERMES_SHARED_DIR/.hermes" "$HERMES_SHARED_DIR/.hermes/superbot"
-  ln -sfn "$wrapper" /usr/local/bin/hermes
+  chmod -R go-w "$HERMES_SHARED_DIR" || hermes_failed "Couldn't make Hermes Agent writable by root only"
+  # Hermes writes some files every run reads as 0600 (its install's facts.json, its checkout's
+  # stamps), so other accounts must be given them. Only the parts runs use: not the install's
+  # own data root (its .env, sessions and memories).
+  for d in .hermes/hermes-agent .hermes/installs .hermes/tools .local/share/uv; do
+    [[ ! -d "$HERMES_SHARED_DIR/$d" ]] || chmod -R a+rX "$HERMES_SHARED_DIR/$d" || hermes_failed "Couldn't make Hermes Agent readable by other accounts"
+  done
+  chmod go+rx "$HERMES_SHARED_DIR/.hermes" "$HERMES_SHARED_DIR/.hermes/superbot" || hermes_failed "Couldn't make Hermes Agent readable by other accounts"
+  ln -sfn "$wrapper" /usr/local/bin/hermes || hermes_failed "Couldn't link /usr/local/bin/hermes"
   probe=$(mktemp -d)
   chmod 0777 "$probe"
   sudo -u nobody env HOME="$probe" HERMES_HOME="$probe/hermes" /usr/local/bin/hermes --version >/dev/null \
     || { rm -rf "$probe"; hermes_failed "Hermes Agent did not install for other accounts"; }
   rm -rf "$probe"
+  if [[ -n "$HERMES_PREVIOUS" ]]; then
+    rm -rf -- "$HERMES_PREVIOUS"
+    HERMES_PREVIOUS=""
+  fi
+}
+
+# The checked Hermes bundle's tree, unpacked beside $HERMES_SHARED_DIR, checked again as files,
+# and moved into its place; the tree it replaces is kept until the new one runs for other
+# accounts (hermes_put_back). Bots' own Hermes data is in their folders, never in it.
+install_hermes_from_bundle() {
+  local tree="$HERMES_STAGE/tree"
+  log "Unpacking Hermes Agent ${HERMES_COMMIT:0:12} from $HERMES_BUNDLE"
+  mkdir -m 0700 "$tree"
+  tar -xf "$HERMES_BUNDLE_DIR/hermes.tar" -C "$tree" --no-same-owner || die "Couldn't unpack Hermes Agent from $HERMES_BUNDLE"
+  rm -f -- "$HERMES_BUNDLE_DIR/hermes.tar"
+  hermes_tree_ok "$tree/hermes" "$HERMES_SHARED_DIR" || die "Refusing $HERMES_BUNDLE: $HERMES_TREE_PROBLEM"
+  [[ "$(hermes_installed "$tree/hermes")" == "$HERMES_COMMIT" ]] || die "Refusing $HERMES_BUNDLE: its checkout isn't Hermes Agent $HERMES_COMMIT"
+  stop_for_hermes
+  log "Installing Hermes Agent ${HERMES_COMMIT:0:12} system-wide in $HERMES_SHARED_DIR from the Hermes bundle"
+  if [[ -e "$HERMES_SHARED_DIR" || -L "$HERMES_SHARED_DIR" ]]; then
+    mv -- "$HERMES_SHARED_DIR" "$HERMES_STAGE/previous" || hermes_failed "Couldn't move the Hermes Agent in $HERMES_SHARED_DIR aside"
+    HERMES_PREVIOUS="$HERMES_STAGE/previous"
+  fi
+  chown root:root "$tree/hermes" || hermes_failed "Couldn't make root own Hermes Agent's tree"
+  chmod 0755 "$tree/hermes" || hermes_failed "Couldn't set the permissions of Hermes Agent's tree"
+  mv -- "$tree/hermes" "$HERMES_SHARED_DIR" || hermes_failed "Couldn't move Hermes Agent into $HERMES_SHARED_DIR"
+}
+
+# The Hermes Agent install_hermes_from_bundle moved aside, back in $HERMES_SHARED_DIR. If that
+# fails, HERMES_PREVIOUS stays set, so cleanup_offline keeps it for the operator.
+hermes_put_back() {
+  [[ -n "$HERMES_PREVIOUS" && -e "$HERMES_PREVIOUS" ]] || return 0
+  warn "Putting back the Hermes Agent $HERMES_SHARED_DIR had"
+  if rm -rf -- "$HERMES_SHARED_DIR" && mv -- "$HERMES_PREVIOUS" "$HERMES_SHARED_DIR"; then
+    HERMES_PREVIOUS=""
+  else
+    warn "Couldn't put it back: it is in $HERMES_PREVIOUS; move it to $HERMES_SHARED_DIR by hand"
+    return 1
+  fi
+}
+
+# An upgrade without --with-hermes keeps the Hermes Agent it has; say so when this release
+# pins another one, since botd's Hermes adapter expects the pinned one.
+hermes_pin_notice() {
+  local d c
+  for d in "$HERMES_SHARED_DIR" "$(user_home 2>/dev/null || true)"; do
+    [[ -n "$d" ]] || continue
+    c=$(hermes_installed "$d")
+    [[ -n "$c" && "$c" != "$HERMES_COMMIT" ]] || continue
+    if [[ -n "$OFFLINE_BUNDLE" ]]; then
+      warn "Hermes Agent ${c:0:12} is installed in $d, but this release pins ${HERMES_COMMIT:0:12}: re-run with --with-hermes --hermes-bundle <its Hermes bundle> (docs/ops/air-gapped.md#hermes-agent)"
+    else
+      warn "Hermes Agent ${c:0:12} is installed in $d, but this release pins ${HERMES_COMMIT:0:12}: re-run with --with-hermes"
+    fi
+  done
 }
 
 service_unit_fixed() {
@@ -1567,11 +1661,17 @@ EOF
 check_offline_flags() {
   if [[ -z "$OFFLINE_BUNDLE" ]]; then
     [[ -z "$OFFLINE_BUNDLE_SHA256" ]] || die "--bundle-sha256 needs --offline"
+    [[ -z "$HERMES_BUNDLE$HERMES_BUNDLE_SHA256" ]] || die "--hermes-bundle is for --offline installs: online, --with-hermes runs Hermes Agent's own installer"
     return 0
   fi
   [[ -f "$OFFLINE_BUNDLE" && -r "$OFFLINE_BUNDLE" ]] || die "--offline: can't read $OFFLINE_BUNDLE"
   [[ -z "$INSTALL_DIR" ]] || die "--offline installs from the bundle, not --source-dir"
-  [[ "$WITH_HERMES" != true ]] || die "--with-hermes downloads Hermes Agent, so it can't run --offline: use the published image, which has it (docs/ops/air-gapped.md)"
+  [[ "$WITH_HERMES" != true || -n "$HERMES_BUNDLE" ]] \
+    || die "--with-hermes --offline needs --hermes-bundle: Hermes Agent's own installer downloads from GitHub and PyPI, so make a Hermes bundle on a connected machine with deploy/offline-bundle.sh hermes, or download the release's (docs/ops/air-gapped.md#hermes-agent)"
+  [[ -z "$HERMES_BUNDLE" || "$WITH_HERMES" == true ]] || die "--hermes-bundle needs --with-hermes"
+  [[ -z "$HERMES_BUNDLE_SHA256" || -n "$HERMES_BUNDLE" ]] || die "--hermes-bundle-sha256 needs --hermes-bundle"
+  [[ -z "$HERMES_BUNDLE" || ( -f "$HERMES_BUNDLE" && -r "$HERMES_BUNDLE" ) ]] || die "--hermes-bundle: can't read $HERMES_BUNDLE"
+  [[ -z "$HERMES_BUNDLE_SHA256" || "$HERMES_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--hermes-bundle-sha256 must be 64 lowercase hex digits"
   [[ -z "$DOMAIN" || -n "$TLS_CERT" ]] || die "--offline with --domain needs --tls-cert and --tls-key: there is no Let's Encrypt without a network"
   [[ -z "$OFFLINE_BUNDLE_SHA256" || "$OFFLINE_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--bundle-sha256 must be 64 lowercase hex digits"
 }
@@ -1613,17 +1713,19 @@ install_tls_files() {
 
 manifest_value() { sed -n "s/^$2=//p" "$1" | tail -n 1; }
 
-# The bundle's own SHA-256: --bundle-sha256, else BUNDLE.sha256 beside it.
+# The bundle's own SHA-256: SHA256 ($2, else --bundle-sha256), else BUNDLE.sha256 beside it.
 offline_expected_sha256() {
-  if [[ -n "$OFFLINE_BUNDLE_SHA256" ]]; then
-    printf '%s\n' "$OFFLINE_BUNDLE_SHA256"
+  local given=${2-$OFFLINE_BUNDLE_SHA256}
+  if [[ -n "$given" ]]; then
+    printf '%s\n' "$given"
   elif [[ -f "$1.sha256" ]]; then
     awk 'NR == 1 { print $1 }' "$1.sha256"
   fi
 }
 
 # Who made the bundle, before anything in it is read: its signature, if it has one and cosign
-# is here, and its SHA-256. One of them is required.
+# is here, and its SHA-256 (SHA256, else --bundle-sha256, else BUNDLE.sha256). One of them is
+# required.
 offline_check_origin() {
   local bundle=$1 want got signed=false root=()
   OFFLINE_SIGNED=false
@@ -1646,9 +1748,9 @@ offline_check_origin() {
       warn "The bundle is signed, but cosign isn't installed here, so the signature isn't checked"
     fi
   fi
-  want=$(offline_expected_sha256 "$bundle")
+  want=$(offline_expected_sha256 "$bundle" "${@:2}")
   if [[ -z "$want" ]]; then
-    [[ "$signed" == true ]] || die "Nothing to check the bundle against: give --bundle-sha256 (from where it was published) or put $bundle.sha256 beside it"
+    [[ "$signed" == true ]] || die "Nothing to check $bundle against: give its SHA-256 (from where it was published) or put $bundle.sha256 beside it"
     return 0
   fi
   [[ "$want" =~ ^[0-9a-f]{64}$ ]] || die "$bundle.sha256 doesn't hold a SHA-256"
@@ -1657,38 +1759,45 @@ offline_check_origin() {
   log "Bundle SHA-256 matches ($got)"
 }
 
-# One top folder, superbot-offline-*, of plain files and folders: no links, devices, absolute
-# names or "..". Prints the top folder.
+# One top folder, PREFIX-* (superbot-offline by default), of plain files and folders: no links,
+# devices, absolute names or "..". Prints the top folder.
 offline_archive_ok() {
-  local archive=$1 entries names top
+  local archive=$1 prefix=${2:-superbot-offline} entries names top
   entries=$(tar -tvf "$archive" 2>/dev/null) && names=$(tar -tf "$archive" 2>/dev/null) || return 1
   [[ -n "$names" ]] || return 1
   awk '{ t = substr($0, 1, 1) } t != "-" && t != "d" { bad = 1 } END { exit bad }' <<<"$entries" || return 1
   ! grep -Eq '^/|(^|/)\.\.(/|$)' <<<"$names" || return 1
   top=$(awk -F/ 'NR == 1 { print $1 }' <<<"$names")
-  [[ "$top" =~ ^superbot-offline-[0-9A-Za-z._+-]+$ ]] || return 1
+  [[ "$top" =~ ^$prefix-[0-9A-Za-z._+-]+$ ]] || return 1
   awk -F/ -v top="$top" '$1 != top { bad = 1 } END { exit bad }' <<<"$names" || return 1
   printf '%s\n' "$top"
+}
+
+# BUNDLE's unpacked ROOT: format 1, and every file in SHA256SUMS with the right hash, and
+# nothing else there.
+offline_check_sums() {
+  local bundle=$1 dir=$2 listed actual
+  [[ -f "$dir/MANIFEST" && -f "$dir/SHA256SUMS" ]] || die "Refusing $bundle: no MANIFEST or SHA256SUMS"
+  [[ "$(manifest_value "$dir/MANIFEST" format)" == 1 ]] || die "Refusing $bundle: bundle format $(manifest_value "$dir/MANIFEST" format), this installer reads 1"
+  ! grep -Evq '^[0-9a-f]{64}  [^[:space:][:cntrl:]\\]+$' "$dir/SHA256SUMS" || die "Refusing $bundle: SHA256SUMS has a line that isn't a hash and a plain path"
+  ! grep -Eq '  (/|(.*/)?\.\.(/|$))' "$dir/SHA256SUMS" || die "Refusing $bundle: SHA256SUMS names a path outside the bundle"
+  (cd "$dir" && sha256sum --check --strict --quiet SHA256SUMS) || die "Refusing $bundle: files don't match SHA256SUMS"
+  listed=$(sed 's/^[0-9a-f]*  //' "$dir/SHA256SUMS" | LC_ALL=C sort)
+  actual=$(cd "$dir" && find . -type f ! -path ./SHA256SUMS -printf '%P\n' | LC_ALL=C sort)
+  [[ "$listed" == "$actual" ]] || die "Refusing $bundle: it holds files SHA256SUMS doesn't list, or lists files it doesn't hold"
 }
 
 # Checks BUNDLE and unpacks it into DEST (an empty folder), setting OFFLINE_DIR to its root.
 # Every file must be in SHA256SUMS with the right hash, and nothing else may be there.
 offline_unpack_bundle() {
-  local bundle=$1 dest=$2 top root arch listed actual
+  local bundle=$1 dest=$2 top root arch
   offline_check_origin "$bundle"
   top=$(offline_archive_ok "$bundle") || die "Refusing $bundle: not an offline bundle (one superbot-offline-* folder of plain files)"
   tar -xf "$bundle" -C "$dest" --no-same-owner --no-same-permissions || die "Couldn't unpack $bundle"
   root="$dest/$top"
   find "$root" -type d -exec chmod 0755 {} +
   find "$root" -type f -exec chmod 0644 {} +
-  [[ -f "$root/MANIFEST" && -f "$root/SHA256SUMS" ]] || die "Refusing $bundle: no MANIFEST or SHA256SUMS"
-  [[ "$(manifest_value "$root/MANIFEST" format)" == 1 ]] || die "Refusing $bundle: bundle format $(manifest_value "$root/MANIFEST" format), this installer reads 1"
-  ! grep -Evq '^[0-9a-f]{64}  [^[:space:][:cntrl:]\\]+$' "$root/SHA256SUMS" || die "Refusing $bundle: SHA256SUMS has a line that isn't a hash and a plain path"
-  ! grep -Eq '  (/|(.*/)?\.\.(/|$))' "$root/SHA256SUMS" || die "Refusing $bundle: SHA256SUMS names a path outside the bundle"
-  (cd "$root" && sha256sum --check --strict --quiet SHA256SUMS) || die "Refusing $bundle: files don't match SHA256SUMS"
-  listed=$(sed 's/^[0-9a-f]*  //' "$root/SHA256SUMS" | LC_ALL=C sort)
-  actual=$(cd "$root" && find . -type f ! -path ./SHA256SUMS -printf '%P\n' | LC_ALL=C sort)
-  [[ "$listed" == "$actual" ]] || die "Refusing $bundle: it holds files SHA256SUMS doesn't list, or lists files it doesn't hold"
+  offline_check_sums "$bundle" "$root"
   OFFLINE_VERSION=$(manifest_value "$root/MANIFEST" version)
   [[ "$OFFLINE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]] || die "Refusing $bundle: version \"$OFFLINE_VERSION\" isn't a version"
   arch=$(manifest_value "$root/MANIFEST" arch)
@@ -1708,8 +1817,157 @@ offline_unpack_bundle() {
   log "Offline bundle $OFFLINE_VERSION ($arch, commit $(manifest_value "$root/MANIFEST" commit)) checked"
 }
 
+# --- Hermes bundles (docs/adr/0200-hermes-agent-bundle-for-air-gapped-installs.md) ----------
+# superbot-hermes-<tag>-<arch>/ with MANIFEST, SHA256SUMS and hermes.tar: Hermes Agent as its
+# own installer left it with HOME=/opt/hermes, made by deploy/offline-bundle.sh hermes.
+
+# A Hermes bundle's hermes.tar, before it is unpacked: one hermes/ folder of files, folders,
+# symbolic and hard links (Hermes's Python and Node.js trees are full of links), with no
+# absolute names, "..", special files or setuid and setgid bits, and hard links only to its
+# own files. The symbolic links' targets are checked once unpacked (hermes_tree_ok). Sets
+# HERMES_TREE_PROBLEM when it fails.
+hermes_tar_ok() {
+  local tar=$1 entries names targets
+  HERMES_TREE_PROBLEM=""
+  if ! entries=$(tar -tvf "$tar" 2>/dev/null) || ! names=$(tar -tf "$tar" 2>/dev/null) || [[ -z "$names" ]]; then
+    HERMES_TREE_PROBLEM="hermes.tar can't be read"
+  elif grep -Evq '^hermes(/|$)' <<<"$names"; then
+    HERMES_TREE_PROBLEM="hermes.tar holds files outside one hermes/ folder"
+  elif grep -Eq '(^|/)\.\.(/|$)' <<<"$names"; then
+    HERMES_TREE_PROBLEM="hermes.tar names a path with .."
+  elif ! awk '{ t = substr($0, 1, 1) } t != "-" && t != "d" && t != "l" && t != "h" { bad = 1 } END { exit bad }' <<<"$entries"; then
+    HERMES_TREE_PROBLEM="hermes.tar holds devices, pipes or other special files"
+  elif ! awk 'substr($0, 4, 1) ~ /[sS]/ || substr($0, 7, 1) ~ /[sS]/ { bad = 1 } END { exit bad }' <<<"$entries"; then
+    HERMES_TREE_PROBLEM="hermes.tar holds a setuid or setgid file"
+  elif targets=$(sed -n 's/^h.* link to //p' <<<"$entries") && [[ -n "$targets" ]] \
+    && ! awk '!/^hermes\// || /(^|\/)\.\.(\/|$)/ { bad = 1 } END { exit bad }' <<<"$targets"; then
+    HERMES_TREE_PROBLEM="hermes.tar holds a hard link to a file outside it"
+  fi
+  [[ -z "$HERMES_TREE_PROBLEM" ]]
+}
+
+# Whether the link target $4, in folder $3 of ROOT (a tree to live at DEST), stays inside it,
+# following every link on the way as the kernel would once the tree is at DEST: a link that is
+# fine read alone (b -> a/../x) can still leave through another (a -> .).
+link_stays_inside() {
+  local root=$1 dest=$2 dir=$3 target=$4 part next hops=0 kept=() todo=() more=()
+  if [[ "$target" == /* ]]; then
+    [[ "$target" == "$dest" || "$target" == "$dest"/* ]] || return 1
+    target=${target#"$dest"}
+  else
+    IFS=/ read -ra kept <<<"$dir"
+  fi
+  IFS=/ read -ra todo <<<"$target"
+  while ((${#todo[@]})); do
+    part=${todo[0]}
+    todo=("${todo[@]:1}")
+    case $part in
+      '' | .) continue ;;
+      ..) ((${#kept[@]})) || return 1; unset 'kept[-1]'; kept=("${kept[@]}"); continue ;;
+    esac
+    next="$root$(printf '/%s' "${kept[@]}" "$part")"
+    if [[ -L "$next" ]]; then
+      ((++hops <= 40)) || return 1
+      target=$(readlink -- "$next") || return 1
+      if [[ "$target" == /* ]]; then
+        [[ "$target" == "$dest" || "$target" == "$dest"/* ]] || return 1
+        target=${target#"$dest"}
+        kept=()
+      fi
+      IFS=/ read -ra more <<<"$target"
+      todo=("${more[@]}" "${todo[@]}")
+    else
+      kept+=("$part")
+    fi
+  done
+}
+
+# ROOT, a Hermes tree unpacked to live at DEST: files, folders and symbolic links only, none
+# setuid or setgid, and every link pointing inside it (absolute ones into DEST), so nothing in
+# it reaches the rest of the host or a path from the machine that built it. SKIP... are paths
+# in ROOT left unchecked (they aren't bundled).
+hermes_tree_ok() {
+  local root=$1 dest=$2 odd link target dir skip prune=()
+  shift 2
+  for skip in "$@"; do prune+=(-path "$root/$skip" -prune -o); done
+  HERMES_TREE_PROBLEM=""
+  odd=$(find "$root" "${prune[@]}" ! -type f ! -type d ! -type l -print -quit)
+  [[ -z "$odd" ]] || { HERMES_TREE_PROBLEM="it holds a special file: ${odd#"$root"/}"; return 1; }
+  odd=$(find "$root" "${prune[@]}" -perm /6000 -print -quit)
+  [[ -z "$odd" ]] || { HERMES_TREE_PROBLEM="it holds a setuid or setgid file: ${odd#"$root"/}"; return 1; }
+  while IFS= read -r -d '' link && IFS= read -r -d '' target; do
+    dir=""
+    [[ "$link" != */* ]] || dir=${link%/*}
+    [[ "$target" != *$'\n'* ]] || { HERMES_TREE_PROBLEM="the link $link has a newline in its target"; return 1; }
+    link_stays_inside "$root" "$dest" "$dir" "$target" || { HERMES_TREE_PROBLEM="the link $link points outside $dest, to $target"; return 1; }
+  done < <(find "$root" "${prune[@]}" -type l -printf '%P\0%l\0')
+}
+
+# Checks a Hermes bundle and unpacks it into DEST (an empty folder), setting HERMES_BUNDLE_DIR to
+# its root: its signature or SHA-256 (SHA256, else BUNDLE.sha256), one superbot-hermes-* folder
+# of plain files, SHA256SUMS, its MANIFEST and its hermes.tar. Leaves the tree packed.
+hermes_unpack_bundle() {
+  local bundle=$1 dest=$2 sha=${3:-} top root arch commit
+  offline_check_origin "$bundle" "$sha"
+  top=$(offline_archive_ok "$bundle" superbot-hermes) || die "Refusing $bundle: not a Hermes bundle (one superbot-hermes-* folder of plain files)"
+  tar -xf "$bundle" -C "$dest" --no-same-owner --no-same-permissions || die "Couldn't unpack $bundle"
+  root="$dest/$top"
+  find "$root" -type d -exec chmod 0755 {} +
+  find "$root" -type f -exec chmod 0644 {} +
+  offline_check_sums "$bundle" "$root"
+  [[ "$(manifest_value "$root/MANIFEST" kind)" == hermes ]] || die "Refusing $bundle: its MANIFEST isn't a Hermes bundle's (kind=hermes)"
+  arch=$(manifest_value "$root/MANIFEST" arch)
+  [[ "$arch" =~ ^(x86_64|aarch64)$ ]] || die "Refusing $bundle: arch \"$arch\" isn't x86_64 or aarch64"
+  [[ "${OFFLINE_ANY_ARCH:-}" == 1 || "$arch" == "$(uname -m)" ]] || die "This Hermes bundle is for $arch, but this host is $(uname -m)"
+  commit=$(manifest_value "$root/MANIFEST" hermes_commit)
+  [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || die "Refusing $bundle: hermes_commit \"$commit\" isn't a full commit"
+  [[ "$(manifest_value "$root/MANIFEST" prefix)" == "$HERMES_SHARED_DIR" ]] \
+    || die "Refusing $bundle: it was installed for $(manifest_value "$root/MANIFEST" prefix), not $HERMES_SHARED_DIR"
+  [[ -f "$root/hermes.tar" ]] || die "Refusing $bundle: no hermes.tar"
+  hermes_tar_ok "$root/hermes.tar" || die "Refusing $bundle: $HERMES_TREE_PROBLEM"
+  HERMES_BUNDLE_DIR=$root
+  log "Hermes bundle: Hermes Agent $(manifest_value "$root/MANIFEST" hermes_tag) (${commit:0:12}, $arch) checked"
+}
+
+# Before anything changes: the Hermes bundle checked, for the Hermes Agent this installer pins,
+# in a root-only folder beside HERMES_SHARED_DIR (so its tree moves into place in one rename).
+prepare_hermes_bundle() {
+  [[ -n "$HERMES_BUNDLE" ]] || return 0
+  local commit signed=$OFFLINE_SIGNED
+  if [[ "$DRY_RUN" == true ]]; then
+    HERMES_STAGE=$(mktemp -d)
+  else
+    install -d -m 0755 -o root -g root "$(dirname "$HERMES_SHARED_DIR")"
+    HERMES_STAGE=$(mktemp -d "$(dirname "$HERMES_SHARED_DIR")/.superbot-hermes.XXXXXX")
+  fi
+  trap cleanup_offline EXIT
+  chmod 0700 "$HERMES_STAGE"
+  mkdir "$HERMES_STAGE/bundle"
+  hermes_unpack_bundle "$HERMES_BUNDLE" "$HERMES_STAGE/bundle" "$HERMES_BUNDLE_SHA256"
+  # shellcheck disable=SC2034 # offline-bundle.sh push reads it, for the main bundle
+  OFFLINE_SIGNED=$signed
+  commit=$(manifest_value "$HERMES_BUNDLE_DIR/MANIFEST" hermes_commit)
+  [[ "$commit" == "$HERMES_COMMIT" ]] \
+    || die "The Hermes bundle holds Hermes Agent ${commit:0:12}, but this installer pins ${HERMES_COMMIT:0:12}: use the Hermes bundle made for this release (docs/ops/air-gapped.md#hermes-agent)"
+}
+
 cleanup_offline() {
   [[ -z "${OFFLINE_TMP:-}" ]] || rm -rf -- "$OFFLINE_TMP"
+  if [[ -n "${HERMES_STAGE:-}" ]]; then
+    # An exit with the old Hermes Agent aside is a failure hermes_failed didn't see: put it
+    # back, and start botd again if it was stopped for the swap. One that can't be put back
+    # stays in the staging folder.
+    local stuck=false
+    if [[ -n "${HERMES_PREVIOUS:-}" ]]; then
+      hermes_put_back || stuck=true
+      [[ "$HERMES_STOPPED" != true ]] || systemctl start superbot.service || true
+    fi
+    if [[ "$stuck" == true ]]; then
+      rm -rf -- "$HERMES_STAGE/bundle" "$HERMES_STAGE/tree"
+    else
+      rm -rf -- "$HERMES_STAGE"
+    fi
+  fi
 }
 
 offline_release_file() { printf '%s\n' "${OFFLINE_RELEASE_FILE:-$SHARE_DIR/offline-release}"; }
@@ -1782,6 +2040,8 @@ check_offline_tools() {
   fi
   [[ -z "$DOMAIN" ]] || command -v caddy >/dev/null 2>&1 || missing+=(caddy)
   [[ "$ENABLE_UFW" != true ]] || command -v ufw >/dev/null 2>&1 || missing+=(ufw)
+  # The Node.js in Hermes Agent's tools needs it; the online installer apt-gets it.
+  [[ "$WITH_HERMES" != true ]] || [[ "$(ldconfig -p 2>/dev/null)" == *libatomic.so.1* ]] || missing+=(libatomic1)
   if [[ ${#missing[@]} -gt 0 ]]; then
     if [[ "$DRY_RUN" == true ]]; then
       warn "[dry-run] missing, to install from your mirror first: ${missing[*]}"
@@ -1825,6 +2085,7 @@ main() {
   check_tls_files
   if [[ -n "$OFFLINE_BUNDLE" ]]; then
     prepare_offline
+    prepare_hermes_bundle
   else
     detect_source_dir
   fi
