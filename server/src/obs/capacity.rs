@@ -31,6 +31,9 @@ pub fn render(app: &AppState, out: &mut String) {
             .count();
         family(out, "superbot_incus_machines_waiting_for_room", "gauge", "Machines waiting to be made because no Incus host has room for them (ADR 0081).");
         sample(out, "superbot_incus_machines_waiting_for_room", &[], waiting as f64);
+        let misplaced = placement::misplaced(app, cp, h).len();
+        family(out, "superbot_incus_machines_misplaced", "gauge", "Machines on an Incus host their team's dedication doesn't allow, left there by a team change until moved (ADR 0166).");
+        sample(out, "superbot_incus_machines_misplaced", &[], misplaced as f64);
         let metrics = app.db.metrics();
         if metrics.wants_host_use() {
             for l in loads.iter().filter(|l| l.status != HostStatus::Lost) {
@@ -58,6 +61,9 @@ fn render_loads(loads: &[HostLoad], out: &mut String) {
     });
     each(out, "superbot_incus_host_open", "1 if new machines may go on the Incus host: up, answered its last check and not drained (ADR 0081).", &|l| {
         Some(l.closed().is_none() as u8 as f64)
+    });
+    each(out, "superbot_incus_host_dedicated", "1 if the Incus host is dedicated to one team, whose machines go only on such hosts (ADR 0166).", &|l| {
+        Some(l.dedicated.is_some() as u8 as f64)
     });
     each(out, "superbot_incus_host_machines", "Machines on the Incus host, as placement counts them.", &|l| Some(l.machines as f64));
     each(out, "superbot_incus_host_max_machines", "The Incus host's INCUS_MAX_MACHINES.", &|l| l.max_machines.map(|n| n as f64));
