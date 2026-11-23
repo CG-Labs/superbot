@@ -19,7 +19,7 @@
 
 use super::backup::{self, Move};
 use super::enroll;
-use super::placement;
+use super::placement::{self, Tenant};
 use super::provider::{HostStatus, Hosts};
 use super::{ControlPlane, SYSTEM, State, Step, conflict, event, next};
 use crate::audit::{Outcome, Who};
@@ -28,6 +28,7 @@ use crate::notify::{self, Alert};
 use crate::runner::App;
 use crate::{AppState, Auth, Res, bad, not_found};
 use axum::Json;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Path, Query, State as AppS};
 use axum::http::StatusCode;
 use serde::Deserialize;
@@ -123,7 +124,34 @@ pub fn load(app: &App, cp: &ControlPlane) -> Result<usize, String> {
     if moved > 0 {
         crate::obs::log::log_info!("Incus hosts: {moved} machines from before there were several hosts are on {first} (INCUS_HOST_NAME).");
     }
+    for w in dedication_warnings(app, cp) {
+        crate::obs::log::log_warn!("WARNING: {w}");
+    }
     Ok(moved)
+}
+
+/// What an admin should fix about dedicated hosts (ADR 0166): hosts dedicated to a team
+/// that is gone, which take nothing, and machines on hosts they shouldn't be on.
+pub fn dedication_warnings(app: &App, cp: &ControlPlane) -> Vec<String> {
+    let Some(h) = cp.hosts() else { return Vec::new() };
+    let mut out: Vec<String> = app
+        .db
+        .machine_hosts()
+        .into_iter()
+        .filter(|r| r.state != "lost" && r.dedicated_team.as_deref().is_some_and(|t| app.db.team(t).is_none()))
+        .map(|r| format!("Incus host {} is dedicated to a team that no longer exists, so no new machine goes there. Share it: botctl machine host share {} --reason <text>.", r.name, r.name))
+        .collect();
+    let misplaced = placement::misplaced(app, cp, h);
+    if !misplaced.is_empty() {
+        let first = &misplaced[0];
+        out.push(format!(
+            "{} machines are on hosts their team's dedication doesn't allow, such as {} ({}); `botctl machine hosts` lists them. Move each with botctl machine restore <user> <backup-id> --host <name> --yes.",
+            misplaced.len(),
+            first.machine_id,
+            first.reason
+        ));
+    }
+    out
 }
 
 fn record(app: &App, by: &Who, action: &str, host: &str, outcome: Outcome, details: Value) {
@@ -218,9 +246,10 @@ pub(super) fn restore_move(app: &App, cp: &ControlPlane, m: &Machine, host: Opti
         };
     };
     let from = machine_host(h, m).unwrap_or_else(|| h.host_of(&m.label));
+    let tenant = Tenant::of(app, &m.user_id);
     let to = match host {
         Some(t) => t.to_string(),
-        None if h.status(&from) == Some(HostStatus::Lost) => placement::choose(app, cp, &m.plan, &m.region, Some(&from))
+        None if h.status(&from) == Some(HostStatus::Lost) => placement::choose(app, cp, &m.plan, &m.region, &tenant, Some(&from))
             .map_err(|why| conflict(format!("Its host {from} was declared lost, and there's nowhere to restore it. {why}")))?,
         None => from.clone(),
     };
@@ -237,7 +266,7 @@ pub(super) fn restore_move(app: &App, cp: &ControlPlane, m: &Machine, host: Opti
         )));
     }
     if to != from {
-        placement::fits(app, cp, &m.plan, &m.region, &to).map_err(conflict)?;
+        placement::fits(app, cp, &m.plan, &m.region, &tenant, &to).map_err(conflict)?;
     }
     Ok(Move { from: Some(from), to: Some(to), reason: None })
 }
@@ -272,17 +301,38 @@ pub fn view(app: &App, cp: &ControlPlane) -> Option<Value> {
     rest.sort_by_key(|r| (r.created_at, r.name.clone()));
     out.extend(rest.into_iter().map(|r| row_view(app, cp, h, r, false)));
     let mut v = json!({ "hosts": out, "policy": h.policy(), "downMinutes": h.down_after_ms() / 60_000 });
+    v["misplaced"] = json!(placement::misplaced(app, cp, h).iter().map(placement::Misplaced::view).collect::<Vec<_>>());
+    v["dedicationWarnings"] = json!(dedication_warnings(app, cp));
     if let (Some((tier, plan)), Some(region)) = (cp.tiers.first(), cp.regions.first()) {
-        match placement::choose(app, cp, plan, region, None) {
+        // For someone in no team; each team with hosts of its own below.
+        let nobody = Tenant::default();
+        match placement::choose(app, cp, plan, region, &nobody, None) {
             Ok(host) => v["placement"] = json!(host),
             Err(why) => (v["placement"], v["placementRefused"]) = (Value::Null, json!(why)),
         }
         v["placementFor"] = json!({ "tier": tier, "plan": plan, "region": region });
+        let mut teams: Vec<String> = rows.values().filter_map(|r| r.dedicated_team.clone()).collect();
+        teams.sort();
+        teams.dedup();
+        v["dedicated"] = json!(teams
+            .iter()
+            .map(|team| {
+                let t = Tenant { team: Some(team.clone()), own_hosts: true };
+                let mut names: Vec<&str> = rows.values().filter(|r| r.dedicated_team.as_deref() == Some(team)).map(|r| r.name.as_str()).collect();
+                names.sort();
+                let mut d = json!({ "team": team, "name": app.db.team(team).map(|t| t.name), "hosts": names });
+                match placement::choose(app, cp, plan, region, &t, None) {
+                    Ok(host) => d["placement"] = json!(host),
+                    Err(why) => (d["placement"], d["placementRefused"]) = (Value::Null, json!(why)),
+                }
+                d
+            })
+            .collect::<Vec<_>>());
         if h.tagged() {
             v["regions"] = json!(cp
                 .regions
                 .iter()
-                .map(|r| match placement::choose(app, cp, plan, r, None) {
+                .map(|r| match placement::choose(app, cp, plan, r, &nobody, None) {
                     Ok(host) => json!({ "region": r, "placement": host }),
                     Err(why) => json!({ "region": r, "placement": null, "placementRefused": why }),
                 })
@@ -331,10 +381,7 @@ pub async fn drain(
 ) -> Res {
     let cp = need_hosts(&a)?;
     let h = cp.hosts().ok_or_else(|| not_found("Incus host"))?;
-    let reason = req.reason.as_deref().map(str::trim).filter(|r| !r.is_empty()).map(|r| crate::audit::clip(r, 200).to_string());
-    if reason.as_deref().is_some_and(|r| r.chars().any(char::is_control)) {
-        return Err(bad("reason: one line of text"));
-    }
+    let reason = one_line(req.reason.as_deref())?;
     let _g = cp.ops.lock().await;
     let row = drainable(&app, h, &name)?;
     if app.db.machine_host_drain(&row.name, by.actor.id.as_deref(), reason.as_deref()) {
@@ -353,6 +400,133 @@ pub async fn undrain(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth
     if app.db.machine_host_undrain(&row.name) {
         let d = json!({ "drainedAt": row.drained_at, "drainedBy": row.drained_by, "reason": row.drain_reason });
         record(&app, &by, "machine.host_undrained", &row.name, Outcome::Success, d);
+    }
+    Ok(Json(host_view(&app, cp, &row.name)))
+}
+
+/// `{team, reason?}`: the team a host is dedicated to, and why, such as the agreement.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DedicateBody {
+    team: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// `{reason}`: why a dedicated host is shared again.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareBody {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// One line of up to 200 characters, or none.
+fn one_line(raw: Option<&str>) -> Res<Option<String>> {
+    let r = raw.map(str::trim).filter(|r| !r.is_empty()).map(|r| crate::audit::clip(r, 200).to_string());
+    if r.as_deref().is_some_and(|r| r.chars().any(char::is_control)) {
+        return Err(bad("reason: one line of text"));
+    }
+    Ok(r)
+}
+
+/// Every machine that isn't destroyed and is on `host`, was sent there, or is being
+/// restored onto it.
+fn occupants(app: &App, cp: &ControlPlane, h: &dyn Hosts, host: &str) -> Vec<Machine> {
+    let mut out: Vec<Machine> = app
+        .db
+        .machines(None)
+        .into_iter()
+        .filter(|m| cp.owns(m) && m.state != State::Destroyed)
+        .filter(|m| match machine_host(h, m) {
+            Some(on) => on == host,
+            None => m.placed_on.as_deref() == Some(host),
+        })
+        .collect();
+    for r in ["importing", "replacing"].into_iter().flat_map(|s| app.db.machine_restores_in(s)) {
+        if r.to_host.as_deref() == Some(host)
+            && !out.iter().any(|m| m.id == r.machine_id)
+            && let Some(m) = app.db.machine(&r.machine_id)
+        {
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// `PUT /api/machines/hosts/{name}/dedication` `{team, reason?}`: only the team's
+/// machines go on the host from now on, and the team's go only on hosts dedicated to it
+/// (ADR 0166): new machines, retries, restores onto another host, and a lost host's
+/// recovery. Refused while anyone else's machine is on it, sent there, or being restored
+/// there: move those first. Server admins only (rbac leaves it to Admin).
+pub async fn dedicate(
+    AppS(app): AppS<AppState>,
+    Extension(a): Extension<Arc<Auth>>,
+    Extension(by): Extension<Who>,
+    Path(name): Path<String>,
+    Json(req): Json<DedicateBody>,
+) -> Res {
+    let cp = need_hosts(&a)?;
+    let h = cp.hosts().ok_or_else(|| not_found("Incus host"))?;
+    let reason = one_line(req.reason.as_deref())?;
+    let _g = cp.ops.lock().await;
+    let row = drainable(&app, h, &name)?;
+    let team = app.db.team(req.team.trim()).ok_or_else(|| not_found("Team"))?;
+    match row.dedicated_team.as_deref() {
+        Some(t) if t == team.id => return Ok(Json(host_view(&app, cp, &row.name))),
+        Some(_) => {
+            return Err(conflict(format!(
+                "Host {} is dedicated to another team. Share it first (botctl machine host share {} --reason <text>).",
+                row.name, row.name
+            )));
+        }
+        None => {}
+    }
+    let here = occupants(&app, cp, h, &row.name);
+    let others: Vec<&Machine> = here.iter().filter(|m| app.db.team_id_of(&m.user_id).as_deref() != Some(team.id.as_str())).collect();
+    if !others.is_empty() {
+        let ids: Vec<&str> = others.iter().map(|m| m.id.as_str()).collect();
+        let d = json!({ "team": team.id, "reason": "other_tenants", "machines": ids.len(), "machineIds": ids.iter().take(20).collect::<Vec<_>>() });
+        record(&app, &by, "machine.host_dedication_refused", &row.name, Outcome::Denied, d);
+        return Err(conflict(format!(
+            "Host {} has {} machines of people not on team {}, such as {}. Move them to other hosts first (botctl machine restore <user> <backup-id> --host <name> --yes), or wait for restores onto it to finish.",
+            row.name,
+            others.len(),
+            team.name,
+            ids.iter().take(5).copied().collect::<Vec<_>>().join(", ")
+        )));
+    }
+    if app.db.machine_host_dedicate(&row.name, &team.id, by.actor.id.as_deref(), reason.as_deref()) {
+        let d = json!({ "team": team.id, "teamName": team.name, "reason": reason, "machines": here.len() });
+        record(&app, &by, "machine.host_dedicated", &row.name, Outcome::Success, d);
+    }
+    Ok(Json(host_view(&app, cp, &row.name)))
+}
+
+/// `DELETE /api/machines/hosts/{name}/dedication` `{reason}`: anyone's new machines may
+/// go on the host again, and its team's may go on shared hosts if it has no other. The
+/// reason is required: a dedication is often a promise to a customer. Works on a lost
+/// host or one no longer configured too, so a team whose only host was lost can be let
+/// onto shared ones.
+pub async fn share(
+    AppS(app): AppS<AppState>,
+    Extension(a): Extension<Arc<Auth>>,
+    Extension(by): Extension<Who>,
+    Path(name): Path<String>,
+    body: Result<Json<ShareBody>, JsonRejection>,
+) -> Res {
+    let cp = need_hosts(&a)?;
+    let h = cp.hosts().ok_or_else(|| not_found("Incus host"))?;
+    let raw = body.ok().and_then(|Json(b)| b.reason);
+    let reason = one_line(raw.as_deref())?.ok_or_else(|| bad("Send {\"reason\": \"<why the host is shared again>\"}."))?;
+    let _g = cp.ops.lock().await;
+    let row = app.db.machine_host(name.trim()).ok_or_else(|| not_found("Incus host"))?;
+    if app.db.machine_host_share(&row.name) {
+        let d = json!({
+            "team": row.dedicated_team, "dedicatedAt": row.dedicated_at, "dedicatedBy": row.dedicated_by,
+            "dedicationReason": row.dedication_reason, "reason": reason, "machines": occupants(&app, cp, h, &row.name).len(),
+        });
+        record(&app, &by, "machine.host_shared", &row.name, Outcome::Success, d);
     }
     Ok(Json(host_view(&app, cp, &row.name)))
 }
@@ -491,9 +665,11 @@ pub async fn recover(
                     continue;
                 }
                 // Each placed with the ones before it counted, so a host isn't filled past its room.
+                // A team with hosts of its own gets only those (ADR 0166).
+                let tenant = Tenant::of(&app, &m.user_id);
                 let target = match &to {
-                    Some(t) => placement::fits(&app, cp, &m.plan, &m.region, t).map(|()| t.clone()),
-                    None => placement::choose(&app, cp, &m.plan, &m.region, Some(&name)),
+                    Some(t) => placement::fits(&app, cp, &m.plan, &m.region, &tenant, t).map(|()| t.clone()),
+                    None => placement::choose(&app, cp, &m.plan, &m.region, &tenant, Some(&name)),
                 };
                 let t = match target {
                     Ok(t) => t,
