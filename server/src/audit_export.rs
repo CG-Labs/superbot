@@ -67,7 +67,7 @@ impl Sink {
         }
     }
 
-    fn archive(&self) -> Option<&crate::audit_archive::Archive> {
+    pub(crate) fn archive(&self) -> Option<&crate::audit_archive::Archive> {
         match &self.kind {
             Kind::Archive(a) => Some(a),
             _ => None,
@@ -298,6 +298,7 @@ async fn run(app: Arc<App>, x: Arc<Exporter>) {
     // The archive sends a batch as it was first cut, across retries and restarts, so a
     // retry writes the same object. The batch's last id is saved before its first try.
     let batch_key = format!("{}#batch", x.sink.id);
+    let start_key = format!("{}#start", x.sink.id);
     let mut retry_to: Option<i64> = x.sink.archive().and_then(|_| app.db.audit_export_cursor(&batch_key)).filter(|&b| b > x.delivered());
     loop {
         if let Some(a) = x.sink.archive()
@@ -322,7 +323,14 @@ async fn run(app: Arc<App>, x: Arc<Exporter>) {
                 // Delivered only once the cursor is saved; if it can't be, the batch goes again.
                 let extras = crate::audit_checkpoint::export_extras(&app.db, &rows);
                 let cut = match x.sink.archive().is_some() && retry_to.is_none() {
-                    true => app.db.set_audit_export_cursor(&batch_key, last).map_err(|e| ("cursor_unsaved", format!("couldn't save the archive's next batch: {e}"))),
+                    true => {
+                        // Where the archive begins (ADR 0163), saved once with the first batch it ever gets.
+                        let first = match app.db.audit_export_cursor(&batch_key) {
+                            None => app.db.set_audit_export_cursor(&start_key, rows[0].id).map_err(|e| ("cursor_unsaved", format!("couldn't save where the archive starts: {e}"))),
+                            Some(_) => Ok(()),
+                        };
+                        first.and_then(|()| app.db.set_audit_export_cursor(&batch_key, last).map_err(|e| ("cursor_unsaved", format!("couldn't save the archive's next batch: {e}"))))
+                    }
                     false => Ok(()),
                 };
                 let r = match cut {

@@ -18,6 +18,7 @@ mod audit;
 mod audit_archive;
 #[cfg(test)]
 mod audit_archive_http_tests;
+mod audit_archive_verify;
 mod audit_chain;
 #[cfg(test)]
 mod audit_chain_http_tests;

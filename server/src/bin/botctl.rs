@@ -197,13 +197,16 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl deny <id> [--remember | --remember-global]
   botctl audit [<limit>] [filters]                 Recent audit events, newest first
   botctl audit export [filters] > audit.csv        All matching events as CSV, oldest first
-  botctl audit verify [--pin <id>:<hash>]... [--from <id>] [--to <id>] [--key <hex>]...
+  botctl audit verify [--pin <id>:<hash>]... [--from <id>] [--to <id>] [--key <hex>]... [--archive]
                                                    Check the audit log's hash chain, its signed
                                                    checkpoints and their timestamps; names the first
                                                    break, exits 1 if there is one. --pin: a hash kept
                                                    elsewhere (your SIEM) the row must still have.
                                                    --from/--to: only those event ids. --key: trust only
-                                                   this checkpoint key (from botctl audit key)
+                                                   this checkpoint key (from botctl audit key).
+                                                   --archive: also read the write-once S3 archive,
+                                                   check it has no gaps, and hold every event here
+                                                   to the hash it has there
   botctl audit siem                                The SIEM export: sink, delivered, pending, failing
   botctl audit chain                               The chain's state: head, last checkpoint and
                                                    timestamp, export lag, last check
@@ -822,9 +825,10 @@ fn audit_query(rest: &[&str]) -> Result<String, String> {
     Ok(if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) })
 }
 
-/// `botctl audit verify [--pin <id>:<hash>]... [--from <id>] [--to <id>] [--key <hex>]...`:
+/// `botctl audit verify [--pin <id>:<hash>]... [--from <id>] [--to <id>] [--key <hex>]... [--archive]`:
 /// hashes kept elsewhere (a SIEM, an earlier check) to hold the chain to, the event ids
-/// to check, and the checkpoint keys to trust instead of botd's own.
+/// to check, the checkpoint keys to trust instead of botd's own, and whether to read the
+/// write-once archive too (ADR 0163).
 fn verify_query(rest: &[&str]) -> Result<String, String> {
     let (mut pins, mut keys, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
     let mut it = rest.iter();
@@ -832,6 +836,7 @@ fn verify_query(rest: &[&str]) -> Result<String, String> {
         match *a {
             "--pin" => pins.push(encode(it.next().ok_or("--pin needs <event id>:<hash>")?)),
             "--key" => keys.push(encode(it.next().ok_or("--key needs a public key in hex (botctl audit key)")?)),
+            "--archive" => pairs.push("archive=on".into()),
             o @ ("--from" | "--to") => {
                 let id = it.next().filter(|v| v.parse::<i64>().is_ok()).ok_or_else(|| format!("{o} needs an event id"))?;
                 pairs.push(format!("{}={id}", &o[2..]));
@@ -2563,6 +2568,7 @@ mod tests {
         let key = "ab".repeat(32);
         assert_eq!(verify_query(&["--from", "10", "--to", "20", "--key", &key, "--pin", "12:ab"]).unwrap(), format!("?pin=12:ab&from=10&to=20&key={key}"));
         assert!(verify_query(&["--from", "x"]).is_err() && verify_query(&["--to"]).is_err() && verify_query(&["--key"]).is_err());
+        assert_eq!(verify_query(&["--archive", "--from", "10"]).unwrap(), "?archive=on&from=10");
     }
 
     #[test]
