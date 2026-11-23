@@ -17,6 +17,8 @@ mod cgroup;
 mod display;
 #[path = "../machines/egress_allow.rs"]
 mod egress_allow;
+#[path = "../machines/hermes_bundle.rs"]
+mod hermes_bundle;
 #[path = "../machines/job.rs"]
 mod job;
 #[path = "../machines/landing.rs"]

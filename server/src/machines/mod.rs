@@ -22,6 +22,8 @@ pub mod fake;
 pub mod firewall;
 pub mod folder;
 pub mod hardening;
+pub mod hermes_bundle;
+pub mod hermes_serve;
 pub mod hosts;
 pub mod incus;
 #[cfg(test)]

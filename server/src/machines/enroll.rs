@@ -1305,6 +1305,24 @@ async fn voxl_binary(AxState(p): AxState<Arc<Port>>) -> Response {
     binary(&p.e.voxl, VOXL_BIN)
 }
 
+/// `GET /v1/hermes/{arch}`: a Hermes bundle from MACHINE_HERMES_BUNDLE (ADR 0210),
+/// for enrolled machines only: it is a build of Hermes Agent and its packages, not
+/// code botd publishes. The agent checks the SHA-256 its plan pins.
+async fn hermes_bundle(
+    AxState(p): AxState<Arc<Port>>,
+    Extension(peer): Extension<Peer>,
+    Path(arch): Path<String>,
+) -> Response {
+    let id = peer.cert.as_ref().and_then(|der| p.app.db.machine_cert(&pki::fingerprint(der))).map(|c| c.machine_id);
+    if let Err(r) = authenticate(&p, &peer, id.as_deref().unwrap_or_default()) {
+        return r;
+    }
+    let Some(b) = p.e.upkeep.hermes.as_ref().and_then(|h| h.by_arch.get(&arch)) else {
+        return reply(StatusCode::NOT_FOUND, "This server serves no Hermes bundle for that arch (MACHINE_HERMES_BUNDLE).");
+    };
+    super::hermes_serve::body(&b.file).await.unwrap_or_else(|e| reply(StatusCode::INTERNAL_SERVER_ERROR, &e))
+}
+
 /// Headers a Bot's call carries through the relay; nothing else crosses.
 const RELAYED: [header::HeaderName; 4] = [
     header::AUTHORIZATION,
@@ -1396,6 +1414,7 @@ pub fn router(app: AppState, e: Arc<Enrollment>, api: Option<Api>) -> axum::Rout
         .route("/v1/agent", get(agent_binary))
         .route("/v1/botctl", get(botctl_binary))
         .route("/v1/voxl", get(voxl_binary))
+        .route("/v1/hermes/{arch}", get(hermes_bundle))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(Arc::new(Port { app, e, api }))
 }

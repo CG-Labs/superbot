@@ -69,6 +69,8 @@ roxmltree = "0.21"
 miniz_oxide = "0.8"
 qrcode = { version = "0.15", default-features = false, features = ["svg"] }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
 
 [dev-dependencies]
 tokio = { version = "1.54.1", features = ["test-util"] }

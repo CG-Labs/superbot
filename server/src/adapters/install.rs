@@ -166,6 +166,27 @@ const HERMES_SHARED_BIN: &str = ".hermes/superbot/hermes";
 /// Hermes's own launcher there, which runs a Bot's own environment.
 const HERMES_LAUNCHER: &str = ".hermes/hermes-agent/.hermes/bin/hermes";
 
+/// Where a Hermes bundle's tree runs, and only there (ADR 0200).
+pub const HERMES_PREFIX: &str = "/opt/hermes";
+/// What other accounts run in it: the checkout, its installs, its tools and uv's
+/// Python, as `deploy/install.sh` opens them. Hermes's own data root stays closed.
+const HERMES_READABLE: [&str; 4] = [".hermes/hermes-agent", ".hermes/installs", ".hermes/tools", ".local/share/uv"];
+
+/// `h`, Hermes at its commit, from Hermes bundles botd serves (ADR 0210) instead of
+/// its installer: `downloads` by arch, each pinned to its bundle's SHA-256.
+pub fn hermes_from_bundles(h: &HarnessInstall, downloads: std::collections::BTreeMap<String, Download>) -> HarnessInstall {
+    HarnessInstall {
+        source: InstallSource::Bundle {
+            downloads,
+            prefix: HERMES_PREFIX.into(),
+            bin: HERMES_SHARED_BIN.into(),
+            readable: HERMES_READABLE.map(String::from).into(),
+            after: Some(HERMES_SHARE.into()),
+        },
+        ..h.clone()
+    }
+}
+
 /// `plan` as an agent that says `can` takes it: one that can't run an `after` script
 /// installs Hermes with its own launcher, and each Bot builds its own environment.
 pub fn plan_for(plan: &HarnessPlan, can: &[String]) -> HarnessPlan {
