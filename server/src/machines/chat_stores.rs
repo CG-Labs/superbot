@@ -188,7 +188,7 @@ fn backups(store: &ChatStore) -> Vec<(i64, PathBuf)> {
 }
 
 /// Copies `store` into its folder's `backups/` as `chats-<UTC stamp>.sqlite`, under the
-/// same key, with SQLite's online backup (one step, so writes meanwhile can't tear it),
+/// same key, with botd's online backup (one read transaction, so writes meanwhile can't tear it),
 /// then keeps the newest `keep`. The path written.
 pub fn back_up(store: &ChatStore, key: Option<&DbKey>, keep: usize, at: i64) -> Result<PathBuf, String> {
     let dir = backups_dir(store);
@@ -201,16 +201,15 @@ pub fn back_up(store: &ChatStore, key: Option<&DbKey>, keep: usize, at: i64) -> 
     let (partial, done) = (dir.join(format!(".partial-{name}")), dir.join(&name));
     let db = |e: rusqlite::Error| format!("backing up {}: {e}", store.path.display());
     let r = (|| {
-        let src = database_encryption::open_with(&store.path, key).map_err(db)?;
-        let mut dst = database_encryption::open_with(&partial, key).map_err(db)?;
-        let step = rusqlite::backup::Backup::new(&src, &mut dst).map_err(db)?.step(-1).map_err(db)?;
-        if step != rusqlite::backup::StepResult::Done {
-            return Err(format!("backing up {}: the store was busy ({step:?}); tried again on the next check", store.path.display()));
-        }
+        let _ = std::fs::remove_file(&partial);
+        database_encryption::backup(&store.path, &partial, key).map_err(|e| format!("backing up {}: {e}", store.path.display()))?;
+        let dst = database_encryption::open_with(&partial, key).map_err(db)?;
         let check: String = dst.query_row("PRAGMA integrity_check", [], |r| r.get(0)).map_err(db)?;
         if check != "ok" {
             return Err(format!("backing up {}: the copy failed its integrity check ({check})", store.path.display()));
         }
+        // A single self-contained file, with no -wal beside it to lose in the rename.
+        dst.query_row("PRAGMA journal_mode=DELETE", [], |_| Ok(())).map_err(db)?;
         drop(dst);
         std::fs::File::open(&partial).and_then(|f| f.sync_all()).map_err(io(&partial))?;
         std::fs::rename(&partial, &done).map_err(io(&done))
@@ -400,5 +399,9 @@ mod tests {
         let copy = rusqlite::Connection::open(dir.join("backups").join(&names[0])).unwrap();
         let region: String = copy.query_row("SELECT region FROM chat_store", [], |r| r.get(0)).unwrap();
         assert_eq!(region, "gb-lon", "a backup is the store itself, ready to put back");
+        let mode: String = copy.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        assert_eq!(mode, "delete", "one self-contained file");
+        let files: Vec<String> = std::fs::read_dir(dir.join("backups")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(files.len(), 2, "no -wal, -shm or partial copies left: {files:?}");
     }
 }

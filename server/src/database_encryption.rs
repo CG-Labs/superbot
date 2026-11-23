@@ -150,7 +150,13 @@ pub fn prepare_store(path: &Path, key: Option<&DbKey>, previous: Option<&DbKey>)
     let shown = path.display();
     match (format(path)?, key) {
         (Format::Missing, _) | (Format::Plain, None) => Ok(false),
-        (Format::Plain, Some(k)) => reencrypt(path, None, Some(k), None).map(|_| true).map_err(|e| format!("{shown}: {e}")),
+        (Format::Plain, Some(k)) => {
+            let is_store = open_read_only(path, None).and_then(|c| c.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'chat_store'", [], |r| r.get::<_, i64>(0)));
+            if is_store.map_err(|e| format!("{shown}: {e}"))? == 0 {
+                return Err(format!("{shown} isn't a chat store botd made; botd changes nothing in it (ADR 0215)"));
+            }
+            reencrypt(path, None, Some(k), None).map(|_| true).map_err(|e| format!("{shown}: {e}"))
+        }
         (Format::Encrypted, None) => Err(format!("{shown} is encrypted but botd's database isn't; a chat store is kept like botd's own database (ADR 0215)")),
         (Format::Encrypted, Some(k)) if opens(path, k) => Ok(false),
         (Format::Encrypted, Some(k)) => match previous.filter(|p| opens(path, p)) {

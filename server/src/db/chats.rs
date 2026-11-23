@@ -697,4 +697,34 @@ mod tests {
         let e = Db::open_keyed(&dir.path().join("app.sqlite"), &key).attach_chat_stores(&here, Some(other.raw())).unwrap_err();
         assert!(e.contains("doesn't open with botd's database key"), "{e}");
     }
+
+    #[test]
+    fn startup_brings_a_store_under_botds_key_and_changes_no_other_file() {
+        use crate::database_encryption::{DbKey, format, opens, prepare_store};
+        use crate::secrets::key::MasterKey;
+        let dir = super::Scratch::new();
+        let (old, new) = (DbKey::derive(&MasterKey::generate()), DbKey::derive(&MasterKey::generate()));
+        let here = [("gb-lon".to_string(), dir.path().to_path_buf())];
+        Db::open(&dir.path().join("app.sqlite")).unwrap().attach_chat_stores(&here, None).unwrap();
+        let store = dir.path().join("chats.sqlite");
+        assert!(!prepare_store(&store, None, None).unwrap(), "plain stays plain without a key");
+
+        // A plain store is encrypted once botd's database is, then re-keyed mid-rotation.
+        assert!(prepare_store(&store, Some(&old), None).unwrap());
+        assert!(format(&store).unwrap() == Format::Encrypted && opens(&store, &old));
+        assert!(!prepare_store(&store, Some(&old), None).unwrap(), "already under the key");
+        assert!(prepare_store(&store, Some(&new), Some(&old)).unwrap());
+        assert!(opens(&store, &new) && !opens(&store, &old));
+        let e = prepare_store(&store, Some(&old), None).unwrap_err();
+        assert!(e.contains("doesn't open with botd's database key"), "{e}");
+        assert!(prepare_store(&store, None, None).unwrap_err().contains("is encrypted but botd's database isn't"));
+
+        // Some other plain file in the folder is refused, untouched.
+        let foreign = dir.path().join("other.sqlite");
+        Connection::open(&foreign).unwrap().execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);").unwrap();
+        let before = std::fs::read(&foreign).unwrap();
+        let e = prepare_store(&foreign, Some(&new), None).unwrap_err();
+        assert!(e.contains("isn't a chat store botd made"), "{e}");
+        assert_eq!(std::fs::read(&foreign).unwrap(), before);
+    }
 }
