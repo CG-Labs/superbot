@@ -5,9 +5,11 @@
 //! scoped, always expiring, rotatable and revocable. Whatever its role says, a request
 //! never gets more than its owner (the person who made it, or an admin's pick) holds now.
 //! Admins manage every service account; someone with `users.manage` only those they own.
+//! A Bot's manager can grant one viewer or operator on the Bot, never beyond what its
+//! owner can do with that Bot (ADR 0170).
 
 use crate::audit::{Actor, ActorKind, Outcome, Source, Who};
-use crate::db::{CustomRole, NewServiceToken, ServiceAccount, ServiceAccountPatch, ServiceToken, TeamMember, User};
+use crate::db::{CustomRole, NewServiceToken, ServiceAccount, ServiceAccountPatch, ServiceRefusal, ServiceToken, TeamMember, User};
 use crate::rbac::{Perm, Perms, Principal, Role, Scope, PERMS};
 use crate::users::{self, Caller, ServiceCaller};
 use crate::{bad, not_found, ApiError, AppState, Res};
@@ -28,13 +30,21 @@ const DAY: i64 = 24 * 60 * 60_000;
 
 // Authentication.
 
+/// Why a token made no caller, with its account and its own id when it's a real token,
+/// so the refusal counts against that account (ADR 0170).
+#[derive(Debug, PartialEq)]
+pub struct Refused {
+    pub reason: &'static str,
+    pub account: Option<(String, String)>,
+}
+
 /// The caller a service account's token makes, or why it makes none. Read on every
 /// request, so a revoked token, a disabled account, or an owner who lost access stops
 /// working at once.
-pub fn authenticate(app: &AppState, token: &str, source: &Source, at: i64) -> Result<Caller, &'static str> {
-    let t = app.db.service_token_by_hash(&users::hash(token)).ok_or("unknown_token")?;
-    let id = t.id.clone();
-    let c = caller(app, t, at)?;
+pub fn authenticate(app: &AppState, token: &str, source: &Source, at: i64) -> Result<Caller, Refused> {
+    let t = app.db.service_token_by_hash(&users::hash(token)).ok_or(Refused { reason: "unknown_token", account: None })?;
+    let (id, account) = (t.id.clone(), t.account_id.clone());
+    let c = caller(app, t, at).map_err(|reason| Refused { reason, account: Some((account, id.clone())) })?;
     app.db.touch_service_token(&id, at, source.ip.as_deref());
     Ok(c)
 }
@@ -393,7 +403,30 @@ pub fn holdings(db: &crate::db::Db, sa: &ServiceAccount) -> Holdings {
     }
 }
 
-fn view(app: &AppState, sa: &ServiceAccount) -> Value {
+/// How far back a service account's refusals are counted (ADR 0170).
+pub const REFUSAL_DAYS: i64 = 30;
+
+fn refusals_since(at: i64) -> i64 {
+    at - REFUSAL_DAYS * DAY
+}
+
+/// `refusals` in its views: how often it was refused in the last `REFUSAL_DAYS`, by
+/// reason, and when last. `rows` may hold other accounts' too.
+fn refusals_view(id: &str, rows: &[ServiceRefusal]) -> Value {
+    let mine: Vec<&ServiceRefusal> = rows.iter().filter(|r| r.account == id).collect();
+    let by: Map<String, Value> = mine.iter().map(|r| (r.reason.clone(), json!(r.n))).collect();
+    json!({ "days": REFUSAL_DAYS, "total": mine.iter().map(|r| r.n).sum::<u64>(), "byReason": by, "lastAt": mine.iter().map(|r| r.last_at).max() })
+}
+
+/// The Bots it reaches while enabled (ADR 0170): by its role, team and grants, within its
+/// owner's access now.
+fn bots_view(app: &AppState, sa: &ServiceAccount) -> Value {
+    let grants = app.db.user_grants(&sa.user.id);
+    let bots = crate::acl::Viewer::service(&app.db, &sa.user.id, sa.user.role).bots(&app.db);
+    json!(bots.iter().map(|(b, access)| json!({ "id": b.id, "name": b.name, "owner": b.owner_id, "access": access, "grant": grants.get(&b.id) })).collect::<Vec<_>>())
+}
+
+fn view(app: &AppState, sa: &ServiceAccount, refused: &[ServiceRefusal]) -> Value {
     let h = holdings(&app.db, sa);
     let at = crate::db::now();
     let tokens = app.db.service_tokens(&sa.user.id);
@@ -406,8 +439,14 @@ fn view(app: &AppState, sa: &ServiceAccount) -> Value {
         "effective": h.effective.names(),
         "tokens": tokens.iter().filter(|t| token_state(t, at) == "active").count(),
         "lastUsedAt": tokens.iter().filter_map(|t| t.last_used_at).max(),
+        "refusals": refusals_view(&sa.user.id, refused),
         "createdAt": sa.user.created_at, "createdBy": sa.created_by, "updatedAt": sa.user.updated_at,
     })
+}
+
+/// `view`, with its own refusals read now.
+fn view_one(app: &AppState, sa: &ServiceAccount) -> Value {
+    view(app, sa, &app.db.service_refusals(refusals_since(crate::db::now()), Some(&sa.user.id)))
 }
 
 fn no_store(code: StatusCode, v: Value) -> Response {
@@ -422,8 +461,9 @@ fn no_store(code: StatusCode, v: Value) -> Response {
 /// own. With what a token can be scoped to, and how long tokens may last.
 pub async fn list(State(app): State<AppState>, Extension(c): Extension<Caller>) -> Json<Value> {
     let me = c.user.as_ref().map(|u| u.id.as_str());
-    let list: Vec<Value> = app.db.service_accounts().iter().filter(|s| s.deleted_at.is_none() && (c.admin() || Some(s.owner_id.as_str()) == me)).map(|s| view(&app, s)).collect();
-    Json(json!({ "serviceAccounts": list, "scopes": scope_names(), "defaultDays": DEFAULT_DAYS, "maxDays": MAX_DAYS }))
+    let refused = app.db.service_refusals(refusals_since(crate::db::now()), None);
+    let list: Vec<Value> = app.db.service_accounts().iter().filter(|s| s.deleted_at.is_none() && (c.admin() || Some(s.owner_id.as_str()) == me)).map(|s| view(&app, s, &refused)).collect();
+    Json(json!({ "serviceAccounts": list, "scopes": scope_names(), "defaultDays": DEFAULT_DAYS, "maxDays": MAX_DAYS, "refusalDays": REFUSAL_DAYS }))
 }
 
 /// `POST /api/service-accounts` `{name, description?, role?, team?}`. `role` is member,
@@ -448,15 +488,17 @@ pub async fn create(State(app): State<AppState>, Extension(c): Extension<Caller>
         "name": sa.user.name, "role": role, "customRole": role_summary(roles.org_role()), "team": roles.team.as_ref().map(|t| &t.id),
         "teamRole": role_summary(roles.team_role()), "owner": owner.id, "permissions": roles.holds().names(),
     })));
-    Ok((StatusCode::CREATED, Json(view(&app, &sa))))
+    Ok((StatusCode::CREATED, Json(view(&app, &sa, &[]))))
 }
 
-/// `GET /api/service-accounts/{id}`: the account and its tokens (never their secrets).
+/// `GET /api/service-accounts/{id}`: the account, its tokens (never their secrets), and
+/// the Bots it reaches.
 pub async fn get(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
     let sa = need_account(&app, &c, &by, &key)?;
-    let mut v = view(&app, &sa);
+    let mut v = view_one(&app, &sa);
     let at = crate::db::now();
     v["tokenList"] = json!(app.db.service_tokens(&sa.user.id).iter().map(|t| token_view(t, at)).collect::<Vec<_>>());
+    v["bots"] = bots_view(&app, &sa);
     Ok(Json(v))
 }
 
@@ -534,15 +576,24 @@ pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>
     if !changes.is_empty() {
         app.db.record(&by.event("service_account.updated").target("service_account", &id).details(json!({ "name": after.user.name, "changes": changes })));
     }
-    // Another team shares other Bots with it: runs it asked for on Bots it can no longer
-    // operate stop.
+    // In another team, its grants on the old team's Bots reach nothing: they go, as a
+    // person's do when they leave (ADR 0170).
+    let mut dropped = 0;
     if before.team_id != after.team_id {
-        let viewer = crate::acl::Viewer::User { id: id.clone(), role: after.user.role };
+        dropped = drop_grants(&app, &by, &id, "team_changed", |bot| !app.db.same_team(&bot.owner_id, &id));
+    }
+    // Another team, or another owner, reaches other Bots: runs it asked for on Bots it can
+    // no longer operate stop.
+    if before.team_id != after.team_id || before.owner_id != after.owner_id {
+        let viewer = crate::acl::Viewer::service(&app.db, &id, after.user.role);
         for bot in app.db.bots() {
             if app.live_run(&bot.id).is_some() && app.requested_by(&bot) == id && viewer.access(&app.db, &bot) < crate::acl::Access::Operate {
                 app.stop(&bot.id);
             }
         }
+    }
+    if dropped > 0 {
+        app.send(json!({ "type": "resync" }));
     }
     if before.user.status != after.user.status {
         if after.user.active() {
@@ -554,18 +605,45 @@ pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>
             app.db.record(&by.event("service_account.disabled").target("service_account", &id).details(json!({ "name": after.user.name, "routinesPaused": paused, "runsStopped": stopped })));
         }
     }
-    Ok(Json(view(&app, &after)))
+    Ok(Json(view_one(&app, &after)))
 }
 
-/// `DELETE /api/service-accounts/{id}`: for good. Its tokens are revoked, it's disabled and
-/// the work it asked for stops; the audit log keeps naming it.
+/// Takes away the account's grants on the Bots `which` picks, each audited as
+/// `bot.access_revoked` with `reason`. Returns how many went.
+fn drop_grants(app: &AppState, by: &Who, id: &str, reason: &str, which: impl Fn(&crate::db::Bot) -> bool) -> usize {
+    let mut n = 0;
+    for (bot_id, level) in app.db.user_grants(id) {
+        if !app.db.bot(&bot_id).is_some_and(|b| which(&b)) || app.db.remove_grant(&bot_id, id).is_none() {
+            continue;
+        }
+        let d = json!({ "user": id, "kind": "service_account", "level": level, "reason": reason });
+        app.db.record(&by.event("bot.access_revoked").target("bot", &bot_id).bot(&bot_id).details(d));
+        n += 1;
+    }
+    n
+}
+
+/// `DELETE /api/service-accounts/{id}`: for good. Its tokens are revoked, its Bot grants
+/// taken away, it's disabled and the work it asked for stops; the audit log keeps naming it.
 pub async fn delete(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
     let sa = need_account(&app, &c, &by, &key)?;
     let revoked = app.db.delete_service_account(&sa.user.id, by.actor.id.as_deref()).ok_or_else(|| not_found("Service account"))?;
+    let grants = drop_grants(&app, &by, &sa.user.id, "service_account_deleted", |_| true);
+    if grants > 0 {
+        app.send(json!({ "type": "resync" }));
+    }
     let paused = crate::handover::user_disabled(&app, &by, &sa.user.id);
     let stopped = app.stop_for_user(&sa.user.id);
-    app.db.record(&by.event("service_account.deleted").target("service_account", &sa.user.id).details(json!({ "name": sa.user.name, "tokensRevoked": revoked, "routinesPaused": paused, "runsStopped": stopped })));
-    Ok(Json(json!({ "ok": true, "tokensRevoked": revoked })))
+    app.db.record(&by.event("service_account.deleted").target("service_account", &sa.user.id).details(json!({
+        "name": sa.user.name, "tokensRevoked": revoked, "grantsRemoved": grants, "routinesPaused": paused, "runsStopped": stopped,
+    })));
+    Ok(Json(json!({ "ok": true, "tokensRevoked": revoked, "grantsRemoved": grants })))
+}
+
+/// The service account a Bot grant names (ADR 0170): a live one, by id. People are found
+/// by `find_user`, which never returns one.
+pub fn grantee(db: &crate::db::Db, key: &str) -> Option<User> {
+    db.service_account(key.trim()).filter(|s| s.deleted_at.is_none()).map(|s| s.user)
 }
 
 /// `GET /api/service-accounts/{id}/tokens`: newest first, revoked and expired ones too.

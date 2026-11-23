@@ -427,7 +427,9 @@ pub async fn leave(app: &AppState, by: &Who, team_id: &str, user_id: &str, reaso
         return false;
     }
     crate::scim::roles::left(app, by, team_id, user_id).await;
-    let mates: HashSet<String> = app.db.team_members(team_id).into_iter().map(|m| m.user_id).collect();
+    let mut mates: HashSet<String> = app.db.team_members(team_id).into_iter().map(|m| m.user_id).collect();
+    // The team's service accounts were their teammates for sharing: grants to them go too (ADR 0170).
+    mates.extend(app.db.team_service_accounts(team_id));
     let mut touched = Vec::new();
     for bot in app.db.bots() {
         let theirs = bot.owner_id == user_id;
@@ -437,7 +439,10 @@ pub async fn leave(app: &AppState, by: &Who, team_id: &str, user_id: &str, reaso
         for g in app.db.grants(&bot.id) {
             if (theirs && mates.contains(&g.user_id)) || (!theirs && g.user_id == user_id) {
                 app.db.remove_grant(&bot.id, &g.user_id);
-                let d = json!({ "user": g.user_id, "level": g.level, "reason": LEFT_TEAM, "team": team_id });
+                let mut d = json!({ "user": g.user_id, "level": g.level, "reason": LEFT_TEAM, "team": team_id });
+                if app.db.user(&g.user_id).is_some_and(|u| u.service) {
+                    d["kind"] = json!("service_account");
+                }
                 app.db.record(&by.event("bot.access_revoked").target("bot", &bot.id).bot(&bot.id).details(d));
             }
         }
@@ -822,7 +827,8 @@ pub async fn offboarding(State(app): State<AppState>, Extension(c): Extension<Ca
     } else {
         None
     };
-    let mates: HashSet<String> = app.db.team_members(&t.id).into_iter().map(|m| m.user_id).filter(|id| *id != u.id).collect();
+    let mut mates: HashSet<String> = app.db.team_members(&t.id).into_iter().map(|m| m.user_id).filter(|id| *id != u.id).collect();
+    mates.extend(app.db.team_service_accounts(&t.id));
     let mut grants = 0;
     for bot in app.db.bots() {
         let theirs = bot.owner_id == u.id;

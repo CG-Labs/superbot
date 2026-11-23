@@ -256,7 +256,8 @@ pub fn apply_bot_patch(o: &BotSettings, v: &Value) -> Result<BotSettings, String
 
 /// The people who can answer a Bot's approvals: its owner and those it grants operator,
 /// while active, allowed to approve, and still able to operate it. Admins aren't added
-/// for every Bot; list them in `email.to`.
+/// for every Bot; list them in `email.to`. Never a service account granted operator: only
+/// a person decides an approval (ADR 0143, 0170).
 pub fn deciders(db: &Db, bot: &Bot) -> Vec<User> {
     let mut ids = vec![bot.owner_id.clone()];
     for g in db.grants(&bot.id).into_iter().filter(|g| g.level == Grant::Operator) {
@@ -266,7 +267,7 @@ pub fn deciders(db: &Db, bot: &Bot) -> Vec<User> {
     }
     ids.into_iter()
         .filter_map(|id| db.user(&id))
-        .filter(|u| u.active() && rbac::allows(Principal::User(u.role), Perm::Approve) && Viewer::person(db, &u.id).access(db, bot) >= Access::Operate)
+        .filter(|u| !u.service && u.active() && rbac::allows(Principal::User(u.role), Perm::Approve) && Viewer::person(db, &u.id).access(db, bot) >= Access::Operate)
         .collect()
 }
 

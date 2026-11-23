@@ -75,7 +75,7 @@ impl Grant {
         }
     }
 
-    fn access(self) -> Access {
+    pub fn access(self) -> Access {
         match self {
             Grant::Viewer => Access::View,
             Grant::Operator => Access::Operate,
@@ -167,12 +167,26 @@ impl Viewer {
         Viewer::person(db, &bot.owner_id)
     }
 
-    /// A user's access as their role is now. Disabled or gone: none.
+    /// A user's access as their role is now. Disabled or gone: none. A service account's
+    /// is capped by its owner's (`service`).
     pub fn person(db: &Db, user_id: &str) -> Viewer {
         match db.user(user_id) {
             Some(u) if !u.active() => Viewer::Nobody,
+            Some(u) if u.service => Viewer::service(db, &u.id, u.role),
             Some(u) if u.role == Role::Admin => Viewer::All,
             Some(u) => Viewer::User { id: u.id, role: u.role },
+            None => Viewer::Nobody,
+        }
+    }
+
+    /// A service account's access (ADR 0170): what its role, team and grants give it, never
+    /// more than its owner's now. A deleted account, or an owner who is disabled, erased or
+    /// not a person, reaches nothing. Whether the account itself is enabled is the caller's
+    /// to check, so the access review can show what enabling one would bring back.
+    pub fn service(db: &Db, id: &str, role: Role) -> Viewer {
+        let owner = db.service_account(id).filter(|s| s.deleted_at.is_none()).and_then(|s| db.user(&s.owner_id)).filter(|o| !o.service && o.erased_at.is_none());
+        match owner {
+            Some(o) => Viewer::User { id: id.to_string(), role }.within(Viewer::person(db, &o.id)),
             None => Viewer::Nobody,
         }
     }
@@ -386,6 +400,35 @@ mod tests {
         assert_eq!(ada.clone().within(ada.clone()), ada);
         db.update_user("bea", crate::db::UserPatch { status: Some("disabled"), ..Default::default() }).unwrap();
         assert_eq!(ada.within(Viewer::person(&db, "bea")), Viewer::Nobody, "a disabled asker reaches nothing");
+    }
+
+    #[test]
+    fn a_service_account_reaches_no_more_than_its_owner() {
+        let db = Db::open(&crate::db::temp_path("acl-service").join("app.sqlite")).unwrap();
+        for (id, role) in [("ada", Role::Member), ("bea", Role::Member), ("root", Role::Admin)] {
+            db.create_user(Some(id), None, id, role).unwrap();
+        }
+        let sa = db.create_service_account("CI", "", Role::Member, None, None, "ada", Some("ada")).unwrap().user.id;
+        let ledger = db.create_bot_owned("Ledger", "#fff", "waddle", "claude", None, false, "ada", Visibility::Private);
+        let scout = db.create_bot_owned("Scout", "#fff", "waddle", "claude", None, false, "bea", Visibility::Private);
+        db.set_grant(&ledger.id, &sa, Grant::Operator, "ada");
+        db.set_grant(&scout.id, &sa, Grant::Operator, "bea");
+        let v = Viewer::person(&db, &sa);
+        assert!(matches!(v, Viewer::Within(..)), "{v:?}");
+        assert_eq!((v.access(&db, &ledger), v.access(&db, &scout)), (Operate, HIDDEN), "never a Bot its owner can't see");
+        db.set_grant(&scout.id, "ada", Grant::Viewer, "bea");
+        assert_eq!(v.access(&db, &scout), View, "nor more than its owner may do with it");
+        assert_eq!(v.bots(&db).into_iter().map(|(b, a)| (b.name, a)).collect::<Vec<_>>(), vec![("Ledger".to_string(), Operate), ("Scout".to_string(), View)]);
+
+        // An admin owner caps nothing; a disabled owner, or a deleted account, reaches nothing.
+        db.update_service_account(&sa, &crate::db::ServiceAccountPatch { owner: Some("root".into()), ..Default::default() }).unwrap();
+        assert_eq!(Viewer::person(&db, &sa), Viewer::User { id: sa.clone(), role: Role::Member });
+        db.update_service_account(&sa, &crate::db::ServiceAccountPatch { owner: Some("ada".into()), ..Default::default() }).unwrap();
+        db.update_user("ada", crate::db::UserPatch { status: Some("disabled"), ..Default::default() }).unwrap();
+        assert_eq!(Viewer::person(&db, &sa), Viewer::Nobody);
+        db.update_user("ada", crate::db::UserPatch { status: Some("active"), ..Default::default() }).unwrap();
+        db.delete_service_account(&sa, None).unwrap();
+        assert_eq!(Viewer::service(&db, &sa, Role::Member), Viewer::Nobody);
     }
 
     #[test]

@@ -1335,12 +1335,22 @@ impl Auth {
 
     /// Logs a bad password, code, or token, throttled per IP. Never logs what was sent.
     fn login_failed(&self, source: &Source, method: &str, reason: Option<&str>) {
+        self.login_failed_for(source, method, reason, None);
+    }
+
+    /// `login_failed`, for a real service token (ADR 0170): `(account, token)`. The event
+    /// names the account, and is throttled per account, so the refusals it folds in are
+    /// that account's and its refusal counts add up.
+    fn login_failed_for(&self, source: &Source, method: &str, reason: Option<&str>, service: Option<(&str, &str)>) {
         // Not guesses: the right password refused for want of a second factor, and any password
         // once break-glass is off (browsers resend one they cached before, on every request).
         if !matches!(reason, Some("mfa_required" | "break_glass_off")) {
             signin_watch::failed(self, source, method, (method == "password").then_some(users::OPERATOR));
         }
-        let client = format!("{}|{method}", source.ip.as_deref().unwrap_or(""));
+        let mut client = format!("{}|{method}", source.ip.as_deref().unwrap_or(""));
+        if let Some((account, _)) = service {
+            client = format!("{client}|{account}");
+        }
         let Some(missed) = self.logins.failure(&client, db::now()) else { return };
         let actor = match method {
             "bot_token" => Actor::bot(None, None),
@@ -1353,7 +1363,14 @@ impl Auth {
         if let Some(r) = reason {
             details["reason"] = json!(r);
         }
-        self.record(who.event("auth.login_failed").outcome(Outcome::Failure).details(details));
+        let mut e = who.event("auth.login_failed").outcome(Outcome::Failure);
+        if let Some((account, token)) = service {
+            details["serviceAccount"] = json!(account);
+            // The token's id. Not under a key with "token" in it, which the log redacts.
+            details["via"] = json!(token);
+            e = e.target("service_account", account);
+        }
+        self.record(e.details(details));
     }
 
     /// The live session for a token, or why there isn't one.
@@ -1641,7 +1658,10 @@ fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<
             let Some(app) = a.app.as_ref() else { return fail(service_accounts::METHOD, Some("bad_token"), false) };
             return match service_accounts::authenticate(app, t, source, db::now()) {
                 Ok(c) => Ok(c),
-                Err(reason) => fail(service_accounts::METHOD, Some(reason), false),
+                Err(r) => {
+                    a.login_failed_for(source, service_accounts::METHOD, Some(r.reason), r.account.as_ref().map(|(sa, t)| (sa.as_str(), t.as_str())));
+                    Err(Box::new(unauthorized(a, req, false)))
+                }
             };
         }
         return match a.session(t) {
@@ -1951,7 +1971,7 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
                         }
                     } else if let Some(t) = service.as_deref() {
                         match service_accounts::recheck(&app, t, db::now()).filter(|sc| sc.can(Perm::Read)).and_then(|sc| sc.user) {
-                            Some(u) => Viewer::User { id: u.id, role: u.role },
+                            Some(u) => Viewer::service(&app.db, &u.id, u.role),
                             None => break,
                         }
                     } else {
@@ -2240,6 +2260,8 @@ fn viewer(app: &App, c: &Caller, _by: &Who) -> Viewer {
         (Principal::Bot, Some(b)) if c.bot_for.as_deref().is_some_and(|u| app.acting_for(&b) != u) => Viewer::Nobody,
         (Principal::Bot, Some(b)) => app.bot_viewer(&b),
         (Principal::Bot, None) => Viewer::Nobody,
+        // Never more than its owner can do with each Bot (ADR 0170).
+        _ if c.service.is_some() => c.user.as_ref().map_or(Viewer::Nobody, |u| Viewer::service(&app.db, &u.id, u.role)),
         _ => Viewer::of(c),
     }
 }
@@ -2527,9 +2549,15 @@ async fn delete_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
 
 fn person(u: Option<db::User>, id: &str) -> Value {
     match u {
+        Some(u) if u.service => json!({ "id": u.id, "name": u.name, "email": null, "kind": "service_account" }),
         Some(u) => json!({ "id": u.id, "name": u.name, "email": u.email }),
         None => json!({ "id": id, "name": null, "email": null }),
     }
+}
+
+/// Whom a grant names: a person by id or email, or a live service account by id (ADR 0170).
+fn grantee(app: &App, key: &str) -> Option<db::User> {
+    app.db.find_user(key).or_else(|| service_accounts::grantee(&app.db, key))
 }
 
 /// Who can see a Bot. Grants are only shown to those who can change them.
@@ -2632,6 +2660,9 @@ async fn update_access(State(app): State<AppState>, Extension(c): Extension<Call
                 return Err(ApiError(StatusCode::FORBIDDEN, "Only an admin can change who owns a Bot.".into()));
             }
             let key = o.as_str().map(str::trim).filter(|k| !k.is_empty()).ok_or_else(|| bad("owner must be a user id or email"))?;
+            if app.db.find_user(key).is_none() && service_accounts::grantee(&app.db, key).is_some() {
+                return Err(ApiError(StatusCode::CONFLICT, "A service account can't own a Bot. Grant it viewer or operator instead.".into()));
+            }
             let u = app.db.find_user(key).ok_or_else(|| not_found("User"))?;
             if !u.active() {
                 return Err(bad("That user is disabled"));
@@ -2664,23 +2695,45 @@ async fn put_grant(State(app): State<AppState>, Extension(c): Extension<Caller>,
     need_user(c.principal)?;
     let (bot, access) = need_bot_access(&app, &c, &by, &id, Access::Manage)?;
     let level = v["level"].as_str().and_then(acl::Grant::parse).ok_or_else(|| bad("level must be viewer or operator"))?;
-    let u = app.db.find_user(&key).ok_or_else(|| not_found("User"))?;
+    let u = grantee(&app, &key).ok_or_else(|| not_found("User"))?;
     if u.id == bot.owner_id {
         return Err(ApiError(StatusCode::CONFLICT, "That user owns this Bot already.".into()));
     }
+    let mut details = json!({ "user": u.id, "level": level });
+    if u.service {
+        details["kind"] = json!("service_account");
+    }
+    let refused = |reason: &str, extra: Value| {
+        let mut d = details.clone();
+        d["reason"] = json!(reason);
+        if let (Some(d), Value::Object(e)) = (d.as_object_mut(), extra) {
+            d.extend(e);
+        }
+        app.db.record(&by.event("bot.access_refused").target("bot", &id).bot(&id).outcome(Outcome::Denied).details(d));
+    };
     // A grant reaches only the owner's team (ADR 0087). Only admins learn the person exists.
     if !app.db.same_team(&bot.owner_id, &u.id) {
-        let details = json!({ "reason": "other_team", "user": u.id, "level": level });
-        app.db.record(&by.event("bot.access_refused").target("bot", &id).bot(&id).outcome(Outcome::Denied).details(details));
+        refused("other_team", json!({}));
         return Err(match c.principal {
             Principal::User(Role::Admin) => ApiError(StatusCode::CONFLICT, "They aren't on this Bot's owner's team, so a grant wouldn't reach them.".into()),
             _ => not_found("User"),
         });
     }
+    // A service account never gets more than its owner can do with this Bot (ADR 0170).
+    if u.service {
+        let owner = app.db.service_account(&u.id).map(|s| s.owner_id);
+        let has = owner.as_deref().map_or(Access::None, |o| Viewer::person(&app.db, o).access(&app.db, &bot));
+        if has < level.access() {
+            refused("service_account_owner", json!({ "owner": owner, "ownerAccess": has }));
+            let can = if level == acl::Grant::Operator { "use" } else { "see" };
+            return Err(ApiError(StatusCode::CONFLICT, format!("Its owner can't {can} this Bot, and a service account never gets more than its owner.")));
+        }
+    }
     let by_id = c.user.as_ref().map_or(users::OPERATOR, |u| u.id.as_str());
     let before = app.db.set_grant(&id, &u.id, level, by_id);
     if before != Some(level) {
-        app.db.record(&by.event("bot.access_granted").target("bot", &id).bot(&id).details(json!({ "user": u.id, "level": level, "from": before })));
+        details["from"] = json!(before);
+        app.db.record(&by.event("bot.access_granted").target("bot", &id).bot(&id).details(details));
         acl_changed(&app, &by, &id, before == Some(acl::Grant::Operator) && level == acl::Grant::Viewer).await;
     }
     Ok(Json(access_view(&app, &bot, access)))
@@ -2689,9 +2742,13 @@ async fn put_grant(State(app): State<AppState>, Extension(c): Extension<Caller>,
 async fn delete_grant(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path((id, key)): Path<(String, String)>) -> Res {
     need_user(c.principal)?;
     let (bot, access) = need_bot_access(&app, &c, &by, &id, Access::Manage)?;
-    let u = app.db.find_user(&key).ok_or_else(|| not_found("User"))?;
+    let u = grantee(&app, &key).ok_or_else(|| not_found("User"))?;
     let level = app.db.remove_grant(&id, &u.id).ok_or_else(|| not_found("Grant"))?;
-    app.db.record(&by.event("bot.access_revoked").target("bot", &id).bot(&id).details(json!({ "user": u.id, "level": level })));
+    let mut details = json!({ "user": u.id, "level": level });
+    if u.service {
+        details["kind"] = json!("service_account");
+    }
+    app.db.record(&by.event("bot.access_revoked").target("bot", &id).bot(&id).details(details));
     acl_changed(&app, &by, &id, true).await;
     Ok(Json(access_view(&app, &bot, access)))
 }

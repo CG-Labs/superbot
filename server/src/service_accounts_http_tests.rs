@@ -620,3 +620,199 @@ async fn disabling_its_owner_stops_its_runs() {
     until("its run went on after its owner was disabled", || !app.busy(&desk)).await;
     assert_eq!(events(port, &admin, "user.deprovisioned").await[0]["details"]["runsForThemStopped"], json!([desk]));
 }
+
+fn access_of(list: &Value, bot: &str) -> Option<String> {
+    list.as_array().unwrap().iter().find(|b| b["id"] == bot).and_then(|b| b["access"].as_str()).map(String::from)
+}
+
+#[tokio::test]
+async fn bot_owners_grant_service_accounts_never_beyond_their_owner() {
+    let (port, app, admin, _) = serve_app().await;
+    let (ana, ana_auth) = user_with(port, &admin, "ana@example.com", "member").await;
+    let (bea, bea_auth) = user_with(port, &admin, "bea@example.com", "member").await;
+    let ledger = app.db.create_bot_owned("Ledger", "#fff", "waddle", "claude", None, false, &ana, Visibility::Private).id;
+    let scout = app.db.create_bot_owned("Scout", "#fff", "waddle", "claude", None, false, &bea, Visibility::Private).id;
+    let sa = account(port, &admin, json!({ "name": "Ana's CI", "role": "member" })).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, &body_owner(&ana)).await.0, 200);
+    let (tok, _) = token(port, &admin, &sa, json!({})).await;
+    let grant = |bot: &str| format!("/api/bots/{bot}/grants/{sa}");
+    assert_eq!(call(port, "GET", &format!("/api/bots/{ledger}/messages"), &tok, "").await.0, 404, "a private Bot, before any grant");
+
+    // Ana grants her own Bot to her service account.
+    let (code, v) = json_call(port, "PUT", &grant(&ledger), &ana_auth, r#"{"level":"operator"}"#).await;
+    assert_eq!(code, 200, "{v}");
+    let g = v["grants"].as_array().unwrap().iter().find(|g| g["user"]["id"] == json!(sa)).cloned().unwrap();
+    assert_eq!((g["level"].as_str(), g["user"]["kind"].as_str(), g["user"]["name"].as_str()), (Some("operator"), Some("service_account"), Some("Ana's CI")), "{v}");
+    let granted = events(port, &admin, "bot.access_granted").await;
+    assert_eq!((granted[0]["details"]["user"].as_str(), granted[0]["details"]["kind"].as_str(), granted[0]["actorId"].as_str()), (Some(sa.as_str()), Some("service_account"), Some(ana.as_str())));
+    let (_, list) = json_call(port, "GET", "/api/bots", &tok, "").await;
+    assert_eq!(access_of(&list, &ledger).as_deref(), Some("operate"), "{list}");
+    assert_eq!(call(port, "POST", &format!("/api/bots/{ledger}/read"), &tok, "").await.0, 200, "it can operate it");
+    assert_eq!(call(port, "PUT", &format!("/api/bots/{ledger}/grants/{bea}"), &tok, r#"{"level":"viewer"}"#).await.0, 403, "but never manage it");
+
+    // Bea can't give it more than Ana can do with Bea's Bot.
+    let (code, v) = json_call(port, "PUT", &grant(&scout), &bea_auth, r#"{"level":"viewer"}"#).await;
+    assert_eq!(code, 409, "{v}");
+    let refused = events(port, &admin, "bot.access_refused").await;
+    assert_eq!((refused[0]["details"]["reason"].as_str(), refused[0]["details"]["owner"].as_str(), refused[0]["details"]["ownerAccess"].as_str()), (Some("service_account_owner"), Some(ana.as_str()), Some("none")), "{refused:?}");
+    assert_eq!(call(port, "PUT", &format!("/api/bots/{scout}/grants/{ana}"), &bea_auth, r#"{"level":"viewer"}"#).await.0, 200);
+    assert_eq!(call(port, "PUT", &grant(&scout), &bea_auth, r#"{"level":"operator"}"#).await.0, 409, "Ana only views it");
+    assert_eq!(call(port, "PUT", &grant(&scout), &bea_auth, r#"{"level":"viewer"}"#).await.0, 200);
+    assert_eq!(call(port, "GET", &format!("/api/bots/{scout}/messages"), &tok, "").await.0, 200);
+    assert_eq!(call(port, "POST", &format!("/api/bots/{scout}/read"), &tok, "").await.0, 403);
+
+    // Checked again on every request: Ana losing the Bot takes it from her service account at once.
+    assert_eq!(call(port, "PUT", &format!("/api/bots/{scout}/grants/{ana}"), &bea_auth, r#"{"level":"operator"}"#).await.0, 200);
+    assert_eq!(call(port, "PUT", &grant(&scout), &bea_auth, r#"{"level":"operator"}"#).await.0, 200);
+    assert_eq!(call(port, "POST", &format!("/api/bots/{scout}/read"), &tok, "").await.0, 200);
+    assert_eq!(call(port, "PUT", &format!("/api/bots/{scout}/grants/{ana}"), &bea_auth, r#"{"level":"viewer"}"#).await.0, 200);
+    assert_eq!(call(port, "POST", &format!("/api/bots/{scout}/read"), &tok, "").await.0, 403, "only what Ana can do now");
+    assert_eq!(call(port, "DELETE", &format!("/api/bots/{scout}/grants/{ana}"), &bea_auth, "").await.0, 200);
+    assert_eq!(call(port, "GET", &format!("/api/bots/{scout}/messages"), &tok, "").await.0, 404);
+    let (_, list) = json_call(port, "GET", "/api/bots", &tok, "").await;
+    assert_eq!((access_of(&list, &scout), access_of(&list, &ledger).as_deref()), (None, Some("operate")), "{list}");
+
+    // Its views and the access review show what it reaches, with its grants.
+    let (_, v) = json_call(port, "GET", &format!("/api/service-accounts/{sa}"), &admin, "").await;
+    assert_eq!(v["bots"], json!([{ "id": ledger, "name": "Ledger", "owner": ana, "access": "operate", "grant": "operator" }]), "{v}");
+    let (_, review) = json_call(port, "GET", "/api/access-review", &admin, "").await;
+    let row = review["serviceAccounts"].as_array().unwrap().iter().find(|s| s["id"] == json!(sa)).cloned().unwrap();
+    let reached: Vec<&str> = row["botAccess"]["bots"].as_array().unwrap().iter().filter_map(|b| b["id"].as_str()).collect();
+    assert_eq!(reached, [ledger.as_str()], "{row}");
+
+    // It never decides approvals, though it may operate the Bot.
+    let bot = app.db.bot(&ledger).unwrap();
+    assert!(notify::deciders(&app.db, &bot).iter().all(|u| u.id != sa));
+    // It can't own a Bot.
+    let (code, v) = json_call(port, "PATCH", &format!("/api/bots/{ledger}/access"), &admin, &json!({ "owner": sa }).to_string()).await;
+    assert_eq!(code, 409, "{v}");
+    assert_eq!(app.db.bot(&ledger).unwrap().owner_id, ana);
+
+    // Revoked, and gone with the account.
+    assert_eq!(call(port, "DELETE", &grant(&scout), &bea_auth, "").await.0, 200);
+    let revoked = events(port, &admin, "bot.access_revoked").await;
+    assert_eq!((revoked[0]["details"]["user"].as_str(), revoked[0]["details"]["kind"].as_str()), (Some(sa.as_str()), Some("service_account")));
+    let (code, v) = json_call(port, "DELETE", &format!("/api/service-accounts/{sa}"), &admin, "").await;
+    assert_eq!((code, v["grantsRemoved"].clone()), (200, json!(1)), "{v}");
+    assert!(app.db.user_grants(&sa).is_empty());
+    let revoked = events(port, &admin, "bot.access_revoked").await;
+    assert_eq!((revoked[0]["targetId"].as_str(), revoked[0]["details"]["reason"].as_str()), (Some(ledger.as_str()), Some("service_account_deleted")));
+    assert_eq!(events(port, &admin, "service_account.deleted").await[0]["details"]["grantsRemoved"], json!(1));
+    assert_eq!(call(port, "PUT", &grant(&ledger), &ana_auth, r#"{"level":"viewer"}"#).await.0, 404, "a deleted one can't be granted");
+}
+
+#[tokio::test]
+async fn a_service_account_reaches_no_bot_its_owner_cannot() {
+    let (port, app, admin, _) = serve_app().await;
+    let (ada, ada_auth) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (bea, _) = user_with(port, &admin, "bea@example.com", "member").await;
+    let (code, t) = json_call(port, "POST", "/api/teams", &admin, &json!({ "name": "Alpha", "owner": ada }).to_string()).await;
+    assert_eq!(code, 201, "{t}");
+    let team = t["id"].as_str().unwrap().to_string();
+    let shared = app.db.create_bot_owned("Alpha ops", "#fff", "waddle", "claude", None, false, &ada, Visibility::Shared).id;
+    let private = app.db.create_bot_owned("Alpha desk", "#fff", "waddle", "claude", None, false, &ada, Visibility::Private).id;
+    let sa = account(port, &admin, json!({ "name": "Alpha bot", "role": "member", "team": team })).await;
+    let (tok, _) = token(port, &admin, &sa, json!({})).await;
+    assert_eq!(call(port, "PUT", &format!("/api/bots/{private}/grants/{sa}"), &admin, r#"{"level":"viewer"}"#).await.0, 200);
+    let (_, list) = json_call(port, "GET", "/api/bots", &tok, "").await;
+    assert!(access_of(&list, &shared).is_some() && access_of(&list, &private).is_some(), "{list}");
+
+    // Handed to Bea, who isn't on the team, it reaches none of the team's Bots, though its grant stays.
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, &body_owner(&bea)).await.0, 200);
+    let (_, list) = json_call(port, "GET", "/api/bots", &tok, "").await;
+    assert!(access_of(&list, &shared).is_none() && access_of(&list, &private).is_none(), "{list}");
+    assert_eq!(call(port, "GET", &format!("/api/bots/{shared}/messages"), &tok, "").await.0, 404);
+    assert_eq!(app.db.grant(&private, &sa), Some(acl::Grant::Viewer));
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, &body_owner(users::OPERATOR)).await.0, 200);
+    assert_eq!(call(port, "GET", &format!("/api/bots/{private}/messages"), &tok, "").await.0, 200, "an admin owner caps nothing");
+
+    // Out of the team, its grants on the team's Bots go, as a leaver's do.
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, r#"{"team":null}"#).await.0, 200);
+    assert_eq!(app.db.grant(&private, &sa), None);
+    let revoked = events(port, &admin, "bot.access_revoked").await;
+    assert_eq!((revoked[0]["details"]["user"].as_str(), revoked[0]["details"]["reason"].as_str()), (Some(sa.as_str()), Some("team_changed")));
+
+    // And when a person leaves, their Bots' grants to the team's service accounts go too.
+    let back = json!({ "team": team }).to_string();
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, &back).await.0, 200);
+    let (code, v) = json_call(port, "PUT", &format!("/api/teams/{team}/members/{bea}"), &admin, "{}").await;
+    assert!(code == 200 || code == 201, "{v}");
+    let beas = app.db.create_bot_owned("Bea's", "#fff", "waddle", "claude", None, false, &bea, Visibility::Private).id;
+    assert_eq!(call(port, "PUT", &format!("/api/bots/{beas}/grants/{sa}"), &admin, r#"{"level":"operator"}"#).await.0, 200);
+    let (code, preview) = json_call(port, "GET", &format!("/api/team/members/{bea}/offboarding"), &ada_auth, "").await;
+    assert_eq!((code, preview["grants"].clone()), (200, json!(1)), "the preview counts it: {preview}");
+    let (code, v) = json_call(port, "DELETE", &format!("/api/teams/{team}/members/{bea}"), &admin, "").await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(app.db.grant(&beas, &sa), None);
+    let revoked = events(port, &admin, "bot.access_revoked").await;
+    assert_eq!((revoked[0]["details"]["user"].as_str(), revoked[0]["details"]["reason"].as_str(), revoked[0]["details"]["kind"].as_str()), (Some(sa.as_str()), Some("left_team"), Some("service_account")), "{revoked:?}");
+}
+
+#[tokio::test]
+async fn with_open_shared_bots_its_queued_work_is_checked_when_it_starts() {
+    use crate::deprovision_http_tests::{held_claude, run_token, send, until};
+    let (port, app, admin, _) = serve_app().await;
+    assert_ne!(app.shared_bots(), acl::SharedBots::Isolated, "open, as self-hosted without routing");
+    let env = held_claude(&app);
+    let (ana, ana_auth) = user_with(port, &admin, "ana@example.com", "member").await;
+    let (bea, _) = user_with(port, &admin, "bea@example.com", "member").await;
+    let desk = app.db.create_bot_owned("Desk", "#fff", "waddle", "claude", None, false, &ana, Visibility::Private).id;
+    let sa = account(port, &admin, json!({ "name": "Ana's CI", "role": "member" })).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, &body_owner(&ana)).await.0, 200);
+    assert_eq!(call(port, "PUT", &format!("/api/bots/{desk}/grants/{sa}"), &ana_auth, r#"{"level":"operator"}"#).await.0, 200);
+    let (tok, _) = token(port, &admin, &sa, json!({})).await;
+
+    // Ana's run, with the account's message waiting behind it.
+    send(port, &ana_auth, &desk, "mine").await;
+    run_token(&env).await;
+    send(port, &tok, &desk, "the script's").await;
+    // Handed to Bea, who can't use Desk: the sweep leaves Ana's run, and the queued one is refused when it starts.
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, &body_owner(&bea)).await.0, 200);
+    assert!(app.live_run(&desk).is_some(), "Ana's own run goes on");
+    std::fs::write(app.cfg.bin_dir.join("claude.go"), "").unwrap();
+    until("its queued message was never refused", || !app.busy(&desk)).await;
+    let refused = events(port, &admin, "bot.run_refused").await;
+    assert!(refused.iter().any(|e| e["details"]["reason"] == "asker_lost_access" && e["details"]["forUser"] == sa.as_str()), "{refused:?}");
+    assert_eq!(events(port, &admin, "harness.invoked").await.len(), 1, "only Ana's ran");
+}
+
+#[tokio::test]
+async fn refusals_are_counted_per_service_account() {
+    let (port, app, admin, _) = serve_app().await;
+    let sa = account(port, &admin, json!({ "name": "Flaky", "role": "member" })).await;
+    let other = account(port, &admin, json!({ "name": "Quiet", "role": "member" })).await;
+    let (read, _) = token(port, &admin, &sa, json!({ "scopes": ["read"] })).await;
+    let (old, v) = token(port, &admin, &sa, json!({})).await;
+    let old_id = v["tokenInfo"]["id"].as_str().unwrap().to_string();
+
+    for _ in 0..2 {
+        assert_eq!(call(port, "GET", "/api/users", &read, "").await.0, 403, "its role has no users.manage");
+    }
+    assert_eq!(call(port, "POST", "/api/bots/b1/read", &read, "").await.0, 403, "its token has no write");
+    assert_eq!(call(port, "POST", "/api/bots", &read, "{}").await.0, 403);
+    assert_eq!(call(port, "DELETE", &format!("/api/service-accounts/{sa}/tokens/{old_id}"), &admin, "").await.0, 200);
+    assert_eq!(call(port, "GET", "/api/bots", &old, "").await.0, 401);
+    // A token no one has counts against no one.
+    assert_eq!(call(port, "GET", "/api/bots", "Bearer sbsa_0000000000000000000000000000000000000000000000000000000000000000", "").await.0, 401);
+
+    // A refused token's event names its account and the token, never the secret.
+    let failed = events(port, &admin, "auth.login_failed").await;
+    let e = failed.iter().find(|e| e["details"]["reason"] == "revoked").unwrap();
+    assert_eq!((e["targetType"].as_str(), e["targetId"].as_str(), e["details"]["serviceAccount"].as_str(), e["details"]["via"].as_str()), (Some("service_account"), Some(sa.as_str()), Some(sa.as_str()), Some(old_id.as_str())), "{e}");
+    assert!(failed.iter().any(|e| e["details"]["reason"] == "unknown_token" && e["targetId"].is_null()), "{failed:?}");
+    // Refusals a throttled event stands for count under its reason.
+    let who = audit::Who { actor: audit::Actor::system("test"), source: audit::Source::default() };
+    app.db.record(&who.event("auth.login_failed").outcome(audit::Outcome::Failure).target("service_account", &sa).details(json!({ "method": "service_token", "reason": "revoked", "unloggedSinceLast": 3 })));
+
+    let (_, v) = json_call(port, "GET", &format!("/api/service-accounts/{sa}"), &admin, "").await;
+    let r = &v["refusals"];
+    assert_eq!((r["days"].clone(), r["total"].clone(), r["byReason"].clone()), (json!(30), json!(9), json!({ "role": 2, "token_scope": 1, "service_account": 1, "revoked": 5 })), "{v}");
+    assert!(r["lastAt"].is_i64(), "{v}");
+    let (_, list) = json_call(port, "GET", "/api/service-accounts", &admin, "").await;
+    let of = |id: &str| list["serviceAccounts"].as_array().unwrap().iter().find(|s| s["id"] == json!(id)).unwrap()["refusals"].clone();
+    assert_eq!((of(&sa)["total"].clone(), of(&other), list["refusalDays"].clone()), (json!(9), json!({ "days": 30, "total": 0, "byReason": {}, "lastAt": null }), json!(30)), "{list}");
+    // A person's refusals aren't a service account's.
+    let (_, plain) = user_with(port, &admin, "plain@example.com", "member").await;
+    assert_eq!(call(port, "GET", "/api/users", &plain, "").await.0, 403);
+    assert_eq!(app.db.service_refusals(0, None).iter().map(|r| r.n).sum::<u64>(), 9);
+}
