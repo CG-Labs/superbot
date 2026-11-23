@@ -630,25 +630,7 @@ impl Tools {
 
     /// Runs a program with only `env`, and returns its stdout.
     async fn run(&self, program: &str, args: &[&str], env: &[(&str, String)], cwd: &Path) -> Result<Vec<u8>, String> {
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.args(args)
-            .current_dir(cwd)
-            .env_clear()
-            .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let child = cmd.spawn().map_err(|e| format!("couldn't start {program}: {e}"))?;
-        let out = tokio::time::timeout(STEP_TIMEOUT, child.wait_with_output())
-            .await
-            .map_err(|_| format!("{program} took over {} minutes", STEP_TIMEOUT.as_secs() / 60))?
-            .map_err(|e| format!("{program}: {e}"))?;
-        if !out.status.success() {
-            let why = tail(&out.stderr);
-            return Err(format!("{program} {} failed ({}): {why}", args.first().unwrap_or(&""), out.status));
-        }
-        Ok(out.stdout)
+        run_step(program, args, env, cwd).await
     }
 
     /// PATH for installers: the tools first, so npm finds this node.
@@ -790,87 +772,212 @@ impl Tools {
     }
 
     /// Installs a bundle's tree in `prefix` (ADR 0210). The download is checked against
-    /// its pin, then unpacked and checked in a root-only folder beside `prefix`, so it
-    /// moves into place in one rename. The tree there before is put back if anything
-    /// after that fails, kept where it is if even that fails, and removed once nothing
-    /// has.
+    /// its pin, then swapped in by `swap_in`: here when the agent can write beside
+    /// `prefix`, otherwise outside its unit through systemd, as `useradd` is (ADR 0043).
+    /// Its program is linked first, and linked back if the swap fails.
     async fn bundle(&self, h: &HarnessInstall, downloads: &BTreeMap<String, wire::Download>, prefix: &str, bin: &str, readable: &[String], after: Option<&str>) -> Result<(), String> {
         let arch = std::env::consts::ARCH;
         let d = downloads.get(arch).ok_or(format!("botd serves no {} bundle for {arch}", h.name))?;
         let file = self.download(&d.url, &d.sha256, hermes_bundle::MAX_BUNDLE).await?;
-        let dest = self.rooted(prefix);
-        let parent = dest.parent().ok_or("a bundle's prefix needs a parent folder")?.to_path_buf();
-        std::fs::create_dir_all(&parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-        let stage = parent.join(format!(".superbot-{}.{}", h.name, now_ms()));
-        std::fs::DirBuilder::new().mode(0o700).create(&stage).map_err(|e| format!("{}: {e}", stage.display()))?;
-        let (tree, previous) = (stage.join("tree"), stage.join("previous"));
-        let mut stuck = false;
-        let res = async {
-            std::fs::create_dir(&tree).map_err(|e| format!("{}: {e}", tree.display()))?;
-            let (f, t, p) = (file.clone(), tree.clone(), prefix.to_string());
-            let m = blocking(move || {
-                let (m, _) = hermes_bundle::read(&f, Some(&t)).map_err(|e| format!("the bundle: {e}"))?;
-                hermes_bundle::tree_ok(&t.join(hermes_bundle::TOP), &p).map_err(|e| format!("the bundle's tree: {e}"))?;
-                Ok(m)
-            })
-            .await?;
-            let _ = std::fs::remove_file(&file);
-            if (m.commit.as_str(), m.prefix.as_str(), m.arch.as_str()) != (h.version.as_str(), prefix, arch) {
-                return Err(format!(
-                    "the bundle holds {} {} for {} on {}, not {} for {prefix} on {arch}",
-                    h.name, m.commit, m.prefix, m.arch, h.version
-                ));
+        let dl = self.dir.join(".dl");
+        let after = match after {
+            Some(body) => {
+                let f = dl.join("after.sh");
+                std::fs::write(&f, body).map_err(|e| format!("{}: {e}", f.display()))?;
+                Some(f)
             }
-            let had = std::fs::symlink_metadata(&dest).is_ok();
-            if had {
-                std::fs::rename(&dest, &previous).map_err(|e| format!("couldn't move {} aside: {e}", dest.display()))?;
-            }
-            let res = self.settle(&tree.join(hermes_bundle::TOP), &dest, bin, readable, after).await;
-            if let Err(e) = res {
-                let d = dest.clone();
-                let _ = blocking(move || std::fs::remove_dir_all(d).map_err(|e| e.to_string())).await;
-                if had && let Err(back) = std::fs::rename(&previous, &dest) {
-                    stuck = true;
-                    return Err(format!("{e}; the {} before it couldn't be put back ({back}) and is in {}", h.name, previous.display()));
+            None => None,
+        };
+        let swap = Swap {
+            name: h.name.clone(),
+            file,
+            commit: h.version.clone(),
+            arch: arch.into(),
+            prefix: prefix.into(),
+            dest: self.rooted(prefix),
+            bin: bin.into(),
+            readable: readable.to_vec(),
+            after,
+            path: self.path(),
+            probe: dl.join("probe"),
+        };
+        let link = self.bin_dir().join(&h.name);
+        let before = std::fs::read_link(&link).ok();
+        symlink(&swap.dest.join(bin), &link)?;
+        let res = if writable_beside(&swap.dest) { swap_in(&swap).await } else { self.swap_outside(&swap).await };
+        if let Err(e) = res {
+            match before {
+                Some(t) => symlink(&t, &link)?,
+                None => {
+                    let _ = std::fs::remove_file(&link);
                 }
-                return Err(e);
             }
-            Ok(())
+            return Err(e);
         }
-        .await;
-        let (s, t) = (stage.clone(), tree.clone());
-        let _ = blocking(move || std::fs::remove_dir_all(if stuck { t } else { s }).map_err(|e| e.to_string())).await;
-        res?;
-        symlink(&dest.join(bin), &self.bin_dir().join(&h.name))?;
         let old = self.dir.join("scripts").join(&h.name);
         let _ = blocking(move || std::fs::remove_dir_all(old).map_err(|e| e.to_string())).await;
         Ok(())
     }
 
-    /// Moves a checked tree to `dest`, runs `after` there, opens what other accounts
-    /// run to them, and checks the program answers `--version` with a home of its own.
-    async fn settle(&self, tree: &Path, dest: &Path, bin: &str, readable: &[String], after: Option<&str>) -> Result<(), String> {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(tree, std::fs::Permissions::from_mode(0o755)).map_err(|e| format!("{}: {e}", tree.display()))?;
-        std::fs::rename(tree, dest).map_err(|e| format!("couldn't move the bundle's tree to {}: {e}", dest.display()))?;
-        let env = [("PATH", self.path()), ("HOME", dest.display().to_string()), ("LANG", "C.UTF-8".into())];
-        if let Some(body) = after {
-            let file = self.dir.join(".dl").join("after.sh");
-            std::fs::write(&file, body).map_err(|e| format!("{}: {e}", file.display()))?;
-            self.run("bash", &[&file.display().to_string()], &env, dest).await?;
+    /// `swap_in` as `superbot-machine swap-in`, in a unit of its own: the agent's unit
+    /// can't write `/opt`. The unit's name is fixed, so a swap still running from before
+    /// a restart makes this one fail rather than run beside it.
+    async fn swap_outside(&self, swap: &Swap) -> Result<(), String> {
+        let spec = self.dir.join(".dl").join("swap.json");
+        std::fs::write(&spec, serde_json::to_vec(swap).map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", spec.display()))?;
+        let exe = std::env::current_exe().map_err(|e| format!("the agent's own path: {e}"))?;
+        let unit = format!("--unit=superbot-swap-{}", swap.name);
+        let limit = format!("--property=RuntimeMaxSec={}", STEP_TIMEOUT.as_secs());
+        let (exe, spec) = (exe.display().to_string(), spec.display().to_string());
+        let args = ["--quiet", "--wait", "--collect", "--pipe", &unit, &limit, "--", &exe, "swap-in", &spec];
+        self.run("systemd-run", &args, &[("PATH", "/usr/sbin:/usr/bin:/sbin:/bin".into())], &self.dir).await.map(|_| ())
+    }
+}
+
+/// A checked bundle download, and where and how `swap_in` puts its tree.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Swap {
+    pub name: String,
+    pub file: PathBuf,
+    pub commit: String,
+    pub arch: String,
+    /// Where the tree was made to run, as its `MANIFEST` must say.
+    pub prefix: String,
+    /// Where it goes: `prefix`, except in tests.
+    pub dest: PathBuf,
+    pub bin: String,
+    pub readable: Vec<String>,
+    pub after: Option<PathBuf>,
+    pub path: String,
+    /// An empty home for the `--version` check.
+    pub probe: PathBuf,
+}
+
+/// Whether this process can make folders beside `dest`.
+fn writable_beside(dest: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(parent) = dest.parent() else { return false };
+    if std::fs::create_dir_all(parent).is_err() {
+        return false;
+    }
+    let Ok(c) = std::ffi::CString::new(parent.as_os_str().as_bytes()) else { return false };
+    // SAFETY: `c` is a valid NUL-terminated path.
+    unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
+}
+
+/// What an install cut short left beside `dest`: the tree before it goes back, and the
+/// stage goes. Until the install is recorded, the tree it was replacing is the one kept.
+fn recover(dest: &Path, name: &str) -> Result<(), String> {
+    let parent = dest.parent().ok_or("a bundle's prefix needs a parent folder")?;
+    let mark = format!(".superbot-{name}.");
+    let Ok(entries) = std::fs::read_dir(parent) else { return Ok(()) };
+    for e in entries.flatten().filter(|e| e.file_name().to_string_lossy().starts_with(&mark)) {
+        let (stage, previous) = (e.path(), e.path().join("previous"));
+        if std::fs::symlink_metadata(&previous).is_ok() {
+            if std::fs::symlink_metadata(dest).is_ok() {
+                std::fs::remove_dir_all(dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+            }
+            std::fs::rename(&previous, dest).map_err(|e| format!("couldn't put {} back from {}: {e}", dest.display(), previous.display()))?;
         }
-        let (d, r, b) = (dest.to_path_buf(), readable.to_vec(), bin.to_string());
-        blocking(move || hermes_bundle::open_up(&d, &r, &b)).await?;
-        let target = dest.join(bin);
-        if !runnable(&target) {
-            return Err(format!("the bundle left no program at {bin}"));
+        std::fs::remove_dir_all(&stage).map_err(|e| format!("{}: {e}", stage.display()))?;
+    }
+    Ok(())
+}
+
+/// Puts a checked bundle's tree in place. It is unpacked and checked in a root-only
+/// folder beside `dest`, so it moves into place in one rename. The tree there before
+/// is put back if anything after that fails, kept in the stage if even that fails
+/// (the next install puts it back), and removed once nothing has.
+pub async fn swap_in(s: &Swap) -> Result<(), String> {
+    let dest = s.dest.clone();
+    let name = s.name.clone();
+    blocking(move || recover(&dest, &name)).await?;
+    let parent = s.dest.parent().ok_or("a bundle's prefix needs a parent folder")?.to_path_buf();
+    let stage = parent.join(format!(".superbot-{}.{}", s.name, now_ms()));
+    std::fs::DirBuilder::new().mode(0o700).create(&stage).map_err(|e| format!("{}: {e}", stage.display()))?;
+    let (tree, previous) = (stage.join("tree"), stage.join("previous"));
+    let mut stuck = false;
+    let res = async {
+        std::fs::create_dir(&tree).map_err(|e| format!("{}: {e}", tree.display()))?;
+        let (f, t, p) = (s.file.clone(), tree.clone(), s.prefix.clone());
+        let m = blocking(move || {
+            let (m, _) = hermes_bundle::read(&f, Some(&t)).map_err(|e| format!("the bundle: {e}"))?;
+            hermes_bundle::tree_ok(&t.join(hermes_bundle::TOP), &p).map_err(|e| format!("the bundle's tree: {e}"))?;
+            Ok(m)
+        })
+        .await?;
+        let _ = std::fs::remove_file(&s.file);
+        if (m.commit.as_str(), m.prefix.as_str(), m.arch.as_str()) != (s.commit.as_str(), s.prefix.as_str(), s.arch.as_str()) {
+            return Err(format!(
+                "the bundle holds {} {} for {} on {}, not {} for {} on {}",
+                s.name, m.commit, m.prefix, m.arch, s.commit, s.prefix, s.arch
+            ));
         }
-        let probe = self.dir.join(".dl").join("probe");
-        std::fs::create_dir_all(&probe).map_err(|e| format!("{}: {e}", probe.display()))?;
-        let env = [("PATH", self.path()), ("HOME", probe.display().to_string()), ("LANG", "C.UTF-8".into())];
-        self.run(&target.display().to_string(), &["--version"], &env, &probe).await?;
+        let had = std::fs::symlink_metadata(&s.dest).is_ok();
+        if had {
+            std::fs::rename(&s.dest, &previous).map_err(|e| format!("couldn't move {} aside: {e}", s.dest.display()))?;
+        }
+        if let Err(e) = settle(s, &tree.join(hermes_bundle::TOP)).await {
+            let d = s.dest.clone();
+            let _ = blocking(move || std::fs::remove_dir_all(d).map_err(|e| e.to_string())).await;
+            if had && let Err(back) = std::fs::rename(&previous, &s.dest) {
+                stuck = true;
+                return Err(format!("{e}; the {} before it couldn't be put back ({back}) and is in {}", s.name, previous.display()));
+            }
+            return Err(e);
+        }
         Ok(())
     }
+    .await;
+    let (st, t) = (stage.clone(), tree.clone());
+    let _ = blocking(move || std::fs::remove_dir_all(if stuck { t } else { st }).map_err(|e| e.to_string())).await;
+    res
+}
+
+/// Moves a checked tree to its place, runs `after` there, opens what other accounts
+/// run to them, and checks the program answers `--version` with a home of its own.
+async fn settle(s: &Swap, tree: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let dest = &s.dest;
+    std::fs::set_permissions(tree, std::fs::Permissions::from_mode(0o755)).map_err(|e| format!("{}: {e}", tree.display()))?;
+    std::fs::rename(tree, dest).map_err(|e| format!("couldn't move the bundle's tree to {}: {e}", dest.display()))?;
+    if let Some(after) = &s.after {
+        let env = [("PATH", s.path.clone()), ("HOME", dest.display().to_string()), ("LANG", "C.UTF-8".into())];
+        run_step("bash", &[&after.display().to_string()], &env, dest).await?;
+    }
+    let (d, r, b) = (dest.clone(), s.readable.clone(), s.bin.clone());
+    blocking(move || hermes_bundle::open_up(&d, &r, &b)).await?;
+    let target = dest.join(&s.bin);
+    if !runnable(&target) {
+        return Err(format!("the bundle left no program at {}", s.bin));
+    }
+    std::fs::create_dir_all(&s.probe).map_err(|e| format!("{}: {e}", s.probe.display()))?;
+    let env = [("PATH", s.path.clone()), ("HOME", s.probe.display().to_string()), ("LANG", "C.UTF-8".into())];
+    run_step(&target.display().to_string(), &["--version"], &env, &s.probe).await?;
+    Ok(())
+}
+
+/// Runs a program with only `env`, and returns its stdout.
+async fn run_step(program: &str, args: &[&str], env: &[(&str, String)], cwd: &Path) -> Result<Vec<u8>, String> {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = cmd.spawn().map_err(|e| format!("couldn't start {program}: {e}"))?;
+    let out = tokio::time::timeout(STEP_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| format!("{program} took over {} minutes", STEP_TIMEOUT.as_secs() / 60))?
+        .map_err(|e| format!("{program}: {e}"))?;
+    if !out.status.success() {
+        let why = tail(&out.stderr);
+        return Err(format!("{program} {} failed ({}): {why}", args.first().unwrap_or(&""), out.status));
+    }
+    Ok(out.stdout)
 }
 
 /// `f` on a thread that may block.
@@ -1030,12 +1137,21 @@ mod tests {
         };
         let (opt, dest) = (dir.join("root/opt"), dir.join("root/opt/hermes"));
         std::fs::create_dir_all(dest.join("old")).unwrap();
-        std::fs::create_dir_all(dir.join("tools/scripts/hermes/.hermes")).unwrap();
+        let script = dir.join("tools/scripts/hermes/.hermes/superbot/hermes");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        symlink(&script, &dir.join("tools/bin/hermes")).unwrap();
         let leftovers = || std::fs::read_dir(&opt).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name() != "hermes").count();
         let commit = hermes_bundle::standin::COMMIT;
+        let after = "touch \"$HOME/.hermes/superbot/shared\"\n";
+
+        // A failed install leaves the installer's Hermes linked, and the tree before it.
+        let url = serve_once(body.clone()).await;
+        assert!(t.install(&hermes(&url, commit, "exit 3\n"), None).await.is_err());
+        assert_eq!(std::fs::read_link(dir.join("tools/bin/hermes")).unwrap(), script);
+        assert!(dest.join("old").exists() && script.parent().unwrap().exists());
+        assert_eq!(leftovers(), 0);
 
         let url = serve_once(body.clone()).await;
-        let after = "touch \"$HOME/.hermes/superbot/shared\"\n";
         assert_eq!(t.install(&hermes(&url, commit, after), None).await.unwrap(), commit);
         let out = std::process::Command::new(dir.join("tools/bin/hermes")).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hermes 0.23.3");
@@ -1066,6 +1182,36 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dest.join("marker")).unwrap(), "kept");
         assert_eq!(leftovers(), 0);
         assert!(!dir.join("tools/.dl").exists());
+
+        // An install cut short by a restart, after it moved the tree before it aside: the
+        // next one puts that tree back before anything else, and clears the stage.
+        let cut = opt.join(".superbot-hermes.1");
+        std::fs::create_dir_all(&cut).unwrap();
+        std::fs::rename(&dest, cut.join("previous")).unwrap();
+        std::fs::create_dir_all(dest.join(".hermes")).unwrap();
+        let url = serve_once(body.clone()).await;
+        assert!(t.install(&hermes(&url, &"b".repeat(40), after), None).await.is_err());
+        assert_eq!(std::fs::read_to_string(dest.join("marker")).unwrap(), "kept");
+        assert_eq!(leftovers(), 0);
+
+        // What `superbot-machine swap-in` reads, when the agent's unit can't write there.
+        let swap = Swap {
+            name: "hermes".into(),
+            file: dir.join("b.tar.gz"),
+            commit: commit.into(),
+            arch: arch.into(),
+            prefix: "/opt/hermes".into(),
+            dest: dest.clone(),
+            bin: ".hermes/superbot/hermes".into(),
+            readable: vec![],
+            after: None,
+            path: "/usr/bin:/bin".into(),
+            probe: dir.join("probe"),
+        };
+        let back: Swap = serde_json::from_slice(&serde_json::to_vec(&swap).unwrap()).unwrap();
+        assert_eq!((back.dest, back.prefix), (dest.clone(), swap.prefix));
+        std::fs::write(dir.join("file"), "").unwrap();
+        assert!(writable_beside(&dest) && !writable_beside(&dir.join("file/hermes")));
         let _ = std::fs::remove_dir_all(dir);
     }
 
