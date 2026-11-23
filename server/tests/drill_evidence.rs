@@ -83,7 +83,12 @@ async fn github(State(m): State<Arc<Mock>>, uri: Uri, headers: HeaderMap) -> Res
                     step("A lost host's container is restored onto another host and enrolls anew", "success", "2026-10-06T05:52:30Z", "2026-10-06T05:55:00Z"),
                 ])
             };
-            reply(200, json!({ "jobs": [incus(3011, "stable"), incus(3012, "7.0")] }))
+            let too_old = job(3013, "Containers on Incus (ubuntu)", vec![
+                step("Containers enroll, stay apart, follow the lifecycle, and are backed up and restored", "success", "2026-10-06T05:44:00Z", "2026-10-06T05:45:00Z"),
+                step("A lost host's container is restored onto another host and enrolls anew", "skipped", "2026-10-06T05:45:00Z", "2026-10-06T05:45:00Z"),
+                step("The restore drill's timing (ADR 0074)", "skipped", "2026-10-06T05:45:00Z", "2026-10-06T05:45:00Z"),
+            ]);
+            reply(200, json!({ "jobs": [incus(3011, "stable"), incus(3012, "7.0"), too_old] }))
         }
         "/actions/runs/301/artifacts" => reply(200, json!({ "artifacts": [
             { "id": 1, "name": "restore-drill-stable", "size_in_bytes": 180, "digest": "sha256:aaaa", "created_at": "2026-10-06T06:00:00Z", "expires_at": "2027-01-04T06:00:00Z", "expired": false },
@@ -160,13 +165,13 @@ fn exports_cis_restore_drills_and_the_operators_records_as_a_checkable_bundle() 
         "machine-restore: 2 runs, 2 passed, 0 failed",
         "Not run in the period: compose-restore",
         "Failing at the period's end: server-restore",
-        "Artifacts already expired on GitHub: host-loss#301/3011 host-drill-stable, host-loss#301/3012 host-drill-stable",
+        "Artifacts already expired on GitHub: host-loss#301/3011 host-drill-stable",
+        "Passed without its drill artifact: host-loss#301/3012",
         "docker.yml's runs weren't readable (GitHub answered 403)",
         "2 operator drill records; over their objective: server-restore 2026-10-21T08:00:00Z.",
     ] {
         assert!(out.contains(want), "{want}\n{out}");
     }
-    assert!(!out.contains("Passed without its drill artifact"), "artifacts belong to the run, so each matrix job has them: {out}");
     let requests = m.requests.lock().unwrap().clone();
     assert!(requests.iter().all(|(_, a)| a.as_deref() == Some(&format!("Bearer {TOKEN}"))), "every request carries the token");
     assert!(!requests.iter().any(|(u, _)| u.contains("/runs/101/artifacts")), "no artifacts are listed for a drill that keeps none");
@@ -195,7 +200,9 @@ fn exports_cis_restore_drills_and_the_operators_records_as_a_checkable_bundle() 
     let first = &ci["executions"][0];
     assert_eq!((first["outcome"].as_str(), first["seconds"].as_u64(), first["run"]["event"].as_str()), (Some("passed"), Some(165), Some("push")));
     let restore = &ci["executions"][3];
-    assert_eq!((restore["artifacts"][0]["name"].as_str(), restore["artifacts"][0]["digest"].as_str()), (Some("restore-drill-stable"), Some("sha256:aaaa")), "the drill's own artifact, with GitHub's digest");
+    assert_eq!((restore["artifacts"][0]["name"].as_str(), restore["artifacts"][0]["digest"].as_str(), restore["artifacts"].as_array().map(Vec::len)), (Some("restore-drill-stable"), Some("sha256:aaaa"), Some(1)), "the job's own artifact, with GitHub's digest");
+    assert_eq!(ci["executions"][4]["artifacts"][0]["name"], "restore-drill-7.0");
+    assert_eq!(ci["workflows"][2]["jobsNotAttempting"], 2, "the Incus version botd refuses restores nothing, so isn't a drill run");
     assert_eq!(ci["summary"]["byDrill"]["server-restore"]["lastOutcome"], "failed");
     assert_eq!(ci["exceptions"]["failed"], json!(["server-restore#102/1021"]));
     assert_eq!((ci["workflows"][1]["available"].as_bool(), ci["workflows"][1]["status"].as_u64()), (Some(false), Some(403)));
@@ -250,7 +257,10 @@ case "$*" in
   "machine recovery") echo '{"objectives":[{"tier":"pro","rtoMs":3600000}]}' ;;
   "machine backups drill@example.com") echo '{"backups":[{"id":"b9","state":"done"}]}' ;;
   "machine restore drill@example.com b9 --yes") echo '{"restore":{"id":"r1"}}' ;;
-  "machine restore drill@example.com status") echo '{"restore":{"id":"r1","state":"done","backupId":"b9","tier":"pro","createdAt":1,"rtoMs":3600000,"durationMs":412000}}' ;;
+  "machine restore drill@example.com status")
+    [[ "${DRILL_MODE:-}" == status-fails ]] && { echo "botd unreachable" >&2; exit 1; }
+    took=412000; [[ "${DRILL_MODE:-}" == slow ]] && took=4000000
+    echo '{"restore":{"id":"r1","state":"done","backupId":"b9","tier":"pro","createdAt":1,"rtoMs":3600000,"durationMs":'"$took"'}}' ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
 esac
 "#,
@@ -264,13 +274,23 @@ esac
     let o = Command::new("bash").arg(root.join("deploy/machine-restore-drill.sh")).args(["drill@example.com", "--yes"]).env("BOTCTL", &botctl).env("SUPERBOT_DRILL_POLL_SECONDS", "0").output().unwrap();
     assert!(o.status.success(), "{}", text(&o));
     fs::write(dir.join("machine.log"), &o.stdout).unwrap();
+    // A drill that fails still ends with its record: one too slow keeps its timing, and one
+    // whose botctl fails inside a command substitution (set -e, not fail) still says it failed.
+    let last_record = |out: &[u8]| -> Value { String::from_utf8_lossy(out).lines().rev().find_map(|l| serde_json::from_str::<Value>(l).ok().filter(|v| v.get("superbotDrill").is_some())).expect("a record line") };
+    for (mode, took) in [("slow", Some(4_000_000)), ("status-fails", None)] {
+        let o = Command::new("bash").arg(root.join("deploy/machine-restore-drill.sh")).args(["drill@example.com", "--yes"]).env("BOTCTL", &botctl).env("DRILL_MODE", mode).env("SUPERBOT_DRILL_POLL_SECONDS", "0").output().unwrap();
+        assert!(!o.status.success(), "{mode}: {}", text(&o));
+        let r = last_record(&o.stdout);
+        assert_eq!((r["passed"].as_bool(), r["durationMs"].as_u64()), (Some(false), took), "{mode}: {r}");
+        assert_eq!(String::from_utf8_lossy(&o.stdout).matches("superbotDrill").count(), 1, "{mode}: one record");
+    }
 
     let script = fs::read_to_string(root.join("deploy/backup-drill.sh")).unwrap();
     let record_fn = script.lines().find(|l| l.starts_with("record() {")).expect("backup-drill.sh has a record function");
-    let o = Command::new("bash").arg("-c").arg(format!("{record_fn}\nRTO=97 RTO_BUDGET=300 next_in=3500 RPO_BUDGET=87300\nrecord \"\\\"passed\\\":true,\\\"durationMs\\\":$((RTO * 1000)),\\\"rtoMs\\\":$((RTO_BUDGET * 1000)),\\\"nextBackupInSeconds\\\":$next_in,\\\"rpoBudgetSeconds\\\":$RPO_BUDGET\"")).output().unwrap();
-    assert!(o.status.success(), "{}", text(&o));
-    let call = script.lines().find(|l| l.starts_with("record \"\\\"passed\\\":true")).expect("backup-drill.sh records a pass");
+    let call = script.lines().find(|l| l.starts_with("record \"\\\"passed\\\":$PASSED,")).expect("backup-drill.sh records the timed restore");
     assert!(call.contains("$((RTO * 1000))") && call.contains("$((RTO_BUDGET * 1000))"), "{call}");
+    let o = Command::new("bash").arg("-c").arg(format!("{record_fn}\nRTO=97 RTO_BUDGET=300 next_in=3500 RPO_BUDGET=87300 PASSED=true\n{call}")).output().unwrap();
+    assert!(o.status.success(), "{}", text(&o));
     fs::write(dir.join("server.log"), &o.stdout).unwrap();
 
     let today = chrono::Utc::now().date_naive();

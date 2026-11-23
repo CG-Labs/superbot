@@ -39,13 +39,16 @@ pub const SECTIONS: [Section; 2] = [
 ];
 
 /// A restore drill CI runs: the workflow, the job (by name prefix, so each matrix job
-/// counts), the step that is the drill, and the artifacts that keep its timing.
+/// counts), the step that is the drill, and the artifacts that keep its timing. A job that
+/// skipped `attempted` didn't attempt the drill: the Incus versions botd refuses pass the
+/// drill's step by checking the refusal, and restore nothing.
 pub struct Drill {
     pub id: &'static str,
     pub title: &'static str,
     pub workflow: &'static str,
     pub job: &'static str,
     pub step: &'static str,
+    pub attempted: Option<&'static str>,
     pub artifacts: &'static [&'static str],
     pub objective: &'static str,
 }
@@ -57,6 +60,7 @@ pub const DRILLS: [Drill; 4] = [
         workflow: "server.yml",
         job: "backup-drill",
         step: "Backup and restore drill",
+        attempted: None,
         artifacts: &[],
         objective: "deploy/backup-drill.sh fails the step unless the restore takes at most SUPERBOT_DRILL_RTO_SECONDS (300) and the next backup is due within the RPO (ADR 0030)",
     },
@@ -66,6 +70,7 @@ pub const DRILLS: [Drill; 4] = [
         workflow: "docker.yml",
         job: "compose-smoke",
         step: "Smoke test",
+        attempted: None,
         artifacts: &[],
         objective: "deploy/docker/smoke-test.sh fails the step unless the restore takes at most SMOKE_RTO_SECONDS (ADR 0030)",
     },
@@ -75,6 +80,7 @@ pub const DRILLS: [Drill; 4] = [
         workflow: "incus-e2e.yml",
         job: "Containers on Incus",
         step: "Containers enroll",
+        attempted: Some("The restore drill's timing"),
         artifacts: &["restore-drill-"],
         objective: "the test fails the step unless botd records the restore within its tier's RTO (ADR 0074)",
     },
@@ -84,6 +90,7 @@ pub const DRILLS: [Drill; 4] = [
         workflow: "incus-e2e.yml",
         job: "Containers on Incus",
         step: "A lost host's container",
+        attempted: Some("The restore drill's timing"),
         artifacts: &["host-drill-"],
         objective: "the test fails the step unless the container is restored onto another host and enrolls anew within its tier's RTO (ADR 0076)",
     },
@@ -132,6 +139,7 @@ pub struct Workflow {
     pub runs: Result<Vec<Value>, (u16, String)>,
     pub truncated: bool,
     pub in_progress: usize,
+    pub not_attempted: usize,
 }
 
 pub struct Collected {
@@ -147,9 +155,27 @@ fn workflows() -> Vec<&'static str> {
     out
 }
 
-/// A drill's step in one job of one run: its result, timing and the run's artifacts.
+/// A matrix job's variant, from its name's last parentheses (`Containers on Incus (zabbly)`),
+/// or the job's whole name.
+pub fn variant(job: &str) -> &str {
+    job.strip_suffix(')').and_then(|j| j.rsplit_once(" (")).map_or(job, |(_, v)| v)
+}
+
+fn find_step<'a>(job: &'a Value, prefix: &str) -> Option<&'a Value> {
+    job["steps"].as_array().into_iter().flatten().find(|s| s["name"].as_str().is_some_and(|n| n.starts_with(prefix)))
+}
+
+/// Whether the job attempted the drill at all (see `Drill::attempted`).
+pub fn attempted(d: &Drill, job: &Value) -> bool {
+    d.attempted.and_then(|p| find_step(job, p)).is_none_or(|s| s["conclusion"] != "skipped")
+}
+
+/// A drill's step in one job of one run: its result, timing and the job's own artifacts
+/// (named for its matrix variant, as `restore-drill-zabbly`).
 pub fn execution(d: &Drill, run: &Value, job: &Value, artifacts: &[Value], now_ms: i64) -> Value {
-    let step = job["steps"].as_array().into_iter().flatten().find(|s| s["name"].as_str().is_some_and(|n| n.starts_with(d.step)));
+    let step = find_step(job, d.step);
+    let job_name = job["name"].as_str().unwrap_or_default();
+    let own = |n: &str| d.artifacts.iter().any(|p| if job_name.ends_with(')') { n.strip_prefix(p) == Some(variant(job_name)) } else { n.starts_with(p) });
     let (started, completed) = match step {
         Some(s) => (ms(&s["started_at"]), ms(&s["completed_at"])),
         None => (ms(&job["started_at"]), ms(&job["completed_at"])),
@@ -165,7 +191,7 @@ pub fn execution(d: &Drill, run: &Value, job: &Value, artifacts: &[Value], now_m
     };
     let kept: Vec<Value> = artifacts
         .iter()
-        .filter(|a| a["name"].as_str().is_some_and(|n| d.artifacts.iter().any(|p| n.starts_with(p))))
+        .filter(|a| a["name"].as_str().is_some_and(own))
         .map(|a| {
             json!({
                 "id": a["id"], "name": a["name"], "bytes": a["size_in_bytes"], "digest": a["digest"],
@@ -183,6 +209,7 @@ pub fn execution(d: &Drill, run: &Value, job: &Value, artifacts: &[Value], now_m
         "stepConclusion": conclusion,
         "jobConclusion": job["conclusion"],
         "job": job["name"],
+        "variant": variant(job_name),
         "startedAt": started.map(rfc3339),
         "completedAt": completed.map(rfc3339),
         "seconds": started.zip(completed).map(|(s, c)| ((c - s).max(0) + 500) / 1000),
@@ -232,11 +259,11 @@ pub fn collect(api: &mut dyn Api, o: &Options, now_ms: i64) -> Result<Collected,
         let (list, truncated) = match runs(api, repo, file, &branch, &o.period)? {
             Ok(v) => v,
             Err(e) => {
-                wfs.push(Workflow { file, runs: Err(e), truncated: false, in_progress: 0 });
+                wfs.push(Workflow { file, runs: Err(e), truncated: false, in_progress: 0, not_attempted: 0 });
                 continue;
             }
         };
-        let mut in_progress = 0;
+        let (mut in_progress, mut not_attempted) = (0, 0);
         for run in &list {
             if run["status"] != "completed" {
                 in_progress += 1;
@@ -244,14 +271,16 @@ pub fn collect(api: &mut dyn Api, o: &Options, now_ms: i64) -> Result<Collected,
             }
             let id = run["id"].as_u64().unwrap_or_default();
             let jobs = all(api, &format!("/repos/{repo}/actions/runs/{id}/jobs?filter=latest&per_page=100"), Some("jobs"))?;
-            let matching: Vec<(&Drill, &Value)> = drills.iter().flat_map(|d| jobs.iter().filter(|j| j["name"].as_str().is_some_and(|n| n.starts_with(d.job))).map(move |j| (*d, j))).collect();
+            let all_matching: Vec<(&Drill, &Value)> = drills.iter().flat_map(|d| jobs.iter().filter(|j| j["name"].as_str().is_some_and(|n| n.starts_with(d.job))).map(move |j| (*d, j))).collect();
+            let matching: Vec<(&Drill, &Value)> = all_matching.iter().copied().filter(|(d, j)| attempted(d, j)).collect();
+            not_attempted += all_matching.len() - matching.len();
             if matching.is_empty() {
                 continue;
             }
             let artifacts = if matching.iter().any(|(d, _)| !d.artifacts.is_empty()) { all(api, &format!("/repos/{repo}/actions/runs/{id}/artifacts?per_page=100"), Some("artifacts"))? } else { Vec::new() };
             executions.extend(matching.iter().map(|(d, j)| execution(d, run, j, &artifacts, now_ms)));
         }
-        wfs.push(Workflow { file, runs: Ok(list), truncated, in_progress });
+        wfs.push(Workflow { file, runs: Ok(list), truncated, in_progress, not_attempted });
     }
     executions.sort_by_key(|e| (ms(&e["run"]["createdAt"]), e["id"].as_str().map(String::from)));
     let repo_view = json!({ "fullName": info["full_name"], "private": info["private"], "defaultBranch": info["default_branch"], "url": info["html_url"] });
@@ -328,14 +357,20 @@ pub fn tally(executions: &[Value], collected: bool) -> (Value, Value) {
         let count = |o: &str| of.iter().filter(|e| e["outcome"] == o).count();
         let passed: Vec<u64> = of.iter().filter(|e| e["outcome"] == "passed").filter_map(|e| e["seconds"].as_u64()).collect();
         let finished: Vec<&&Value> = of.iter().filter(|e| matches!(e["outcome"].as_str(), Some("passed" | "failed"))).collect();
-        let last = finished.last().map(|e| e["outcome"].clone());
+        // Each matrix variant's latest result: one passing doesn't hide another still failing.
+        let mut latest: BTreeMap<&str, &str> = BTreeMap::new();
+        for e in &finished {
+            latest.insert(e["variant"].as_str().unwrap_or_default(), e["outcome"].as_str().unwrap_or_default());
+        }
+        let failing: Vec<&str> = latest.iter().filter(|(_, o)| **o == "failed").map(|(v, _)| *v).collect();
+        let last = if failing.is_empty() { finished.last().map(|e| e["outcome"].clone()) } else { Some(json!("failed")) };
         by.insert(
             d.id.into(),
             json!({
                 "title": d.title, "workflow": format!(".github/workflows/{}", d.workflow), "job": d.job, "step": d.step, "objective": d.objective,
                 "runs": of.len(), "passed": count("passed"), "failed": count("failed"), "notReached": count("not reached"), "cancelled": count("cancelled"),
                 "lastPassedAt": of.iter().rev().find(|e| e["outcome"] == "passed").map(|e| e["completedAt"].clone()),
-                "lastOutcome": last,
+                "lastOutcome": last, "failingVariants": failing,
                 "medianSeconds": median(passed.clone()), "longestSeconds": passed.iter().max(),
             }),
         );
@@ -344,7 +379,7 @@ pub fn tally(executions: &[Value], collected: bool) -> (Value, Value) {
         } else if collected && count("passed") == 0 {
             no_pass.push(json!(d.id));
         }
-        if finished.last().is_some_and(|e| e["outcome"] == "failed") {
+        if !failing.is_empty() {
             failing_at_end.push(json!(d.id));
         }
     }
@@ -372,7 +407,7 @@ fn ci_file(c: Option<&Collected>) -> Value {
         .workflows
         .iter()
         .map(|w| match &w.runs {
-            Ok(r) => json!({ "workflow": format!(".github/workflows/{}", w.file), "available": true, "runs": r.len(), "inProgress": w.in_progress, "truncated": w.truncated }),
+            Ok(r) => json!({ "workflow": format!(".github/workflows/{}", w.file), "available": true, "runs": r.len(), "inProgress": w.in_progress, "jobsNotAttempting": w.not_attempted, "truncated": w.truncated }),
             Err((status, message)) => json!({ "workflow": format!(".github/workflows/{}", w.file), "available": false, "status": status, "message": message, "why": "reading workflow runs needs actions read access" }),
         })
         .collect();
@@ -380,7 +415,7 @@ fn ci_file(c: Option<&Collected>) -> Value {
         "collected": true,
         "repository": c.repo["fullName"],
         "branch": c.branch,
-        "basis": "a drill's run counts when its workflow ran on the branch in the period; it passed when its drill step succeeded, which each drill allows only within its objective; seconds is the step's duration, which includes setting up, so it is at most the restore time the drill checks",
+        "basis": "a drill's run counts when its workflow ran on the branch in the period and the job attempted the drill (jobs that skip the drill's timing step, such as Incus versions botd refuses, don't, and are counted per workflow); it passed when its drill step succeeded, which each drill allows only within its objective; seconds is the step's duration, which includes setting up, so it is at most the restore time the drill checks",
         "workflows": sources,
         "summary": { "runs": c.executions.len(), "byDrill": by },
         "exceptions": exceptions,
@@ -556,6 +591,12 @@ mod tests {
         assert_eq!((m["artifacts"][0]["digest"].as_str(), m["artifacts"][0]["expired"].as_bool()), (Some("sha256:feed"), Some(false)));
         let h = execution(&DRILLS[3], &run(1, "2026-10-06T05:41:00Z"), &j, &arts, now);
         assert_eq!((h["outcome"].as_str(), h["id"].as_str(), h["artifacts"][0]["expired"].as_bool()), (Some("failed"), Some("host-loss#1/11"), Some(true)), "expired by the time of the export");
+        let mut too_old = incus_job(14, "success", "skipped");
+        too_old["steps"].as_array_mut().unwrap().push(step("The restore drill's timing (ADR 0074)", "skipped", "2026-10-06T05:55:00Z", "2026-10-06T05:55:00Z"));
+        assert!(!attempted(&DRILLS[2], &too_old) && !attempted(&DRILLS[3], &too_old), "a version botd refuses restores nothing");
+        assert!(attempted(&DRILLS[2], &j) && attempted(&DRILLS[0], &too_old));
+        let other = execution(&DRILLS[2], &run(1, "2026-10-06T05:41:00Z"), &job(15, "Containers on Incus (lts)", j["steps"].as_array().unwrap().clone()), &arts, now);
+        assert_eq!((other["artifacts"].as_array().map(Vec::len), other["variant"].as_str()), (Some(0), Some("lts")), "another variant's artifact isn't this job's");
         let skipped = execution(&DRILLS[3], &run(1, "2026-10-06T05:41:00Z"), &incus_job(12, "failure", "skipped"), &[], now);
         assert_eq!(skipped["outcome"], "not reached");
         let renamed = execution(&DRILLS[0], &run(2, "2026-10-07T00:00:00Z"), &job(13, "backup-drill", vec![step("Something else", "success", "2026-10-07T00:00:00Z", "2026-10-07T00:01:00Z")]), &[], now);
@@ -586,6 +627,12 @@ mod tests {
         assert_eq!(none["notRunInPeriod"], json!([]), "not judged when CI wasn't read");
         let only_fail = vec![e(3, 2, &fail, &[])];
         assert_eq!(tally(&only_fail, true).1["noPassInPeriod"], json!(["host-loss"]));
+        let mut lts = incus_job(3, "failure", "skipped");
+        lts["name"] = json!("Containers on Incus (lts)");
+        let siblings = vec![e(2, 3, &lts, &[]), e(2, 3, &pass, &[])];
+        let (by, ex) = tally(&siblings, true);
+        assert_eq!((by["machine-restore"]["lastOutcome"].as_str(), by["machine-restore"]["failingVariants"].clone()), (Some("failed"), json!(["lts"])), "a passing sibling doesn't hide a failing variant");
+        assert_eq!(ex["failingAtEnd"], json!(["machine-restore"]));
     }
 
     fn out(lines: &[&str]) -> Vec<u8> {
@@ -669,13 +716,13 @@ mod tests {
         f.0.insert("/repos/o/r/actions/runs/5/jobs?filter=latest&per_page=100".into(), Ok((json!({ "jobs": [job(50, "backup-drill", vec![step("Backup and restore drill (installer units)", "success", "2026-10-02T00:01:00Z", "2026-10-02T00:03:10Z")]), job(51, "rust", vec![])] }), None)));
         f.0.insert(list("docker.yml"), Err(403));
         f.0.insert(list("incus-e2e.yml"), Ok((json!({ "total_count": 1, "workflow_runs": [run(9, "2026-10-06T05:41:00Z")] }), None)));
-        f.0.insert("/repos/o/r/actions/runs/9/jobs?filter=latest&per_page=100".into(), Ok((json!({ "jobs": [incus_job(90, "success", "success"), incus_job(91, "success", "success")] }), None)));
+        f.0.insert("/repos/o/r/actions/runs/9/jobs?filter=latest&per_page=100".into(), Ok((json!({ "jobs": [incus_job(90, "success", "success"), incus_job(91, "success", "success"), job(92, "Containers on Incus (ubuntu)", vec![step("Containers enroll", "success", "2026-10-06T05:44:00Z", "2026-10-06T05:45:00Z"), step("The restore drill's timing", "skipped", "2026-10-06T05:45:00Z", "2026-10-06T05:45:00Z")])] }), None)));
         f.0.insert("/repos/o/r/actions/runs/9/artifacts?per_page=100".into(), Ok((json!({ "artifacts": [artifact("restore-drill-stable", "2027-01-01T00:00:00Z")] }), None)));
         let o = Options { repo: "o/r".into(), branch: None, period: period() };
         let c = collect(&mut f, &o, period().end_ms()).unwrap();
         assert_eq!(c.executions.iter().map(|e| e["id"].as_str().unwrap()).collect::<Vec<_>>(), ["server-restore#5/50", "host-loss#9/90", "host-loss#9/91", "machine-restore#9/90", "machine-restore#9/91"], "each matrix job counts; run 6 is before the period");
         assert_eq!(c.executions[0]["seconds"], 130);
-        assert_eq!((c.workflows[0].in_progress, c.workflows[1].runs.as_ref().err().map(|e| e.0)), (1, Some(403)));
+        assert_eq!((c.workflows[0].in_progress, c.workflows[1].runs.as_ref().err().map(|e| e.0), c.workflows[2].not_attempted), (1, Some(403), 2));
         let s = summary(Some(&c), &[]);
         assert!(s.contains("5 drill runs in CI on main") && s.contains("docker.yml's runs weren't readable (GitHub answered 403)") && s.contains("Not run in the period: compose-restore") && s.contains("Passed without its drill artifact: host-loss#9/90, host-loss#9/91"), "{s}");
         let ci = ci_file(Some(&c));
@@ -699,6 +746,9 @@ mod tests {
             let job_line = wf.lines().any(|l| l.trim() == format!("{}:", d.job) || l.trim().strip_prefix("name: ").is_some_and(|n| n.starts_with(d.job)));
             assert!(job_line, "{}: no job named {} in {}", d.id, d.job, d.workflow);
             assert!(wf.lines().any(|l| l.trim().strip_prefix("- name: ").is_some_and(|n| n.starts_with(d.step))), "{}: no step named {}… in {}", d.id, d.step, d.workflow);
+            if let Some(a) = d.attempted {
+                assert!(wf.lines().any(|l| l.trim().strip_prefix("- name: ").is_some_and(|n| n.starts_with(a))), "{}: no step named {a}… in {}", d.id, d.workflow);
+            }
             for a in d.artifacts {
                 assert!(wf.contains(&format!("name: {a}")), "{}: {} keeps no {a} artifact", d.id, d.workflow);
             }
