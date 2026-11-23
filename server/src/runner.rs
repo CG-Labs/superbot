@@ -963,11 +963,15 @@ impl App {
         let off_team =
             (asker != bot.owner_id && self.db.user(&asker).is_some() && !self.db.same_team(&bot.owner_id, &asker)).then(|| asker.clone());
         let for_other = Some(asker.clone()).filter(|a| isolated && *a != bot.owner_id);
-        let refusal = if isolated { self.wont_run(&bot, for_other.as_deref()) } else { off_team.as_deref().and_then(|a| self.wont_run(&bot, Some(a))) };
+        // A service account reaches a Bot only through its grants, within its owner's
+        // access (ADR 0170), whatever SHARED_BOTS is: both may have changed while it waited.
+        let service = (asker != bot.owner_id && self.db.user(&asker).is_some_and(|u| u.service)).then(|| asker.clone());
+        let checked = if isolated { for_other.clone() } else { off_team.or(service.clone()) };
+        let refusal = if isolated { self.wont_run(&bot, checked.as_deref()) } else { checked.as_deref().and_then(|a| self.wont_run(&bot, Some(a))) };
         if let Some((reason, text)) = refusal {
             self.give_back_routine(&bot, msg);
             let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
-            self.db.record(&e.details(json!({ "reason": reason, "owner": bot.owner_id, "forUser": for_other.or(off_team), "messageId": msg.id })));
+            self.db.record(&e.details(json!({ "reason": reason, "owner": bot.owner_id, "forUser": checked, "messageId": msg.id })));
             // A routine of a disabled owner keeps firing; one bubble says it.
             if self.db.last_message(&bot.id).is_none_or(|m| m.text != text) {
                 self.say(&bot.id, &text, true);
@@ -1004,7 +1008,7 @@ impl App {
         let owner = bot.owner_id.clone();
         let _measure_again = self.storage.forget_on_drop(&owner);
         // The owner, a routine's author or the asker may have been turned off meanwhile.
-        if waited && let Some((reason, user, text)) = self.refused_after_wait(&bot, msg, &by, for_other.as_deref()) {
+        if waited && let Some((reason, user, text)) = self.refused_after_wait(&bot, msg, &by, for_other.as_deref().or(service.as_deref())) {
             self.give_back(&bot, msg, &period.key);
             let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
             self.db.record(&e.details(json!({ "reason": reason, "owner": bot.owner_id, "forUser": user, "messageId": msg.id })));

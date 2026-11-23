@@ -439,7 +439,10 @@ pub async fn leave(app: &AppState, by: &Who, team_id: &str, user_id: &str, reaso
         for g in app.db.grants(&bot.id) {
             if (theirs && mates.contains(&g.user_id)) || (!theirs && g.user_id == user_id) {
                 app.db.remove_grant(&bot.id, &g.user_id);
-                let d = json!({ "user": g.user_id, "level": g.level, "reason": LEFT_TEAM, "team": team_id });
+                let mut d = json!({ "user": g.user_id, "level": g.level, "reason": LEFT_TEAM, "team": team_id });
+                if app.db.user(&g.user_id).is_some_and(|u| u.service) {
+                    d["kind"] = json!("service_account");
+                }
                 app.db.record(&by.event("bot.access_revoked").target("bot", &bot.id).bot(&bot.id).details(d));
             }
         }

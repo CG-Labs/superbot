@@ -745,7 +745,35 @@ async fn a_service_account_reaches_no_bot_its_owner_cannot() {
     assert_eq!(code, 200, "{v}");
     assert_eq!(app.db.grant(&beas, &sa), None);
     let revoked = events(port, &admin, "bot.access_revoked").await;
-    assert_eq!((revoked[0]["details"]["user"].as_str(), revoked[0]["details"]["reason"].as_str()), (Some(sa.as_str()), Some("left_team")), "{revoked:?}");
+    assert_eq!((revoked[0]["details"]["user"].as_str(), revoked[0]["details"]["reason"].as_str(), revoked[0]["details"]["kind"].as_str()), (Some(sa.as_str()), Some("left_team"), Some("service_account")), "{revoked:?}");
+}
+
+#[tokio::test]
+async fn with_open_shared_bots_its_queued_work_is_checked_when_it_starts() {
+    use crate::deprovision_http_tests::{held_claude, run_token, send, until};
+    let (port, app, admin, _) = serve_app().await;
+    assert_ne!(app.shared_bots(), acl::SharedBots::Isolated, "open, as self-hosted without routing");
+    let env = held_claude(&app);
+    let (ana, ana_auth) = user_with(port, &admin, "ana@example.com", "member").await;
+    let (bea, _) = user_with(port, &admin, "bea@example.com", "member").await;
+    let desk = app.db.create_bot_owned("Desk", "#fff", "waddle", "claude", None, false, &ana, Visibility::Private).id;
+    let sa = account(port, &admin, json!({ "name": "Ana's CI", "role": "member" })).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, &body_owner(&ana)).await.0, 200);
+    assert_eq!(call(port, "PUT", &format!("/api/bots/{desk}/grants/{sa}"), &ana_auth, r#"{"level":"operator"}"#).await.0, 200);
+    let (tok, _) = token(port, &admin, &sa, json!({})).await;
+
+    // Ana's run, with the account's message waiting behind it.
+    send(port, &ana_auth, &desk, "mine").await;
+    run_token(&env).await;
+    send(port, &tok, &desk, "the script's").await;
+    // Handed to Bea, who can't use Desk: the sweep leaves Ana's run, and the queued one is refused when it starts.
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, &body_owner(&bea)).await.0, 200);
+    assert!(app.live_run(&desk).is_some(), "Ana's own run goes on");
+    std::fs::write(app.cfg.bin_dir.join("claude.go"), "").unwrap();
+    until("its queued message was never refused", || !app.busy(&desk)).await;
+    let refused = events(port, &admin, "bot.run_refused").await;
+    assert!(refused.iter().any(|e| e["details"]["reason"] == "asker_lost_access" && e["details"]["forUser"] == sa.as_str()), "{refused:?}");
+    assert_eq!(events(port, &admin, "harness.invoked").await.len(), 1, "only Ana's ran");
 }
 
 #[tokio::test]
