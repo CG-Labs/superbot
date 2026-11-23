@@ -253,7 +253,7 @@ pub fn build(app: &App, cp: &ControlPlane, p: &ResidencyPin, from: i64, to: i64,
     }
     let server_in = server_data["inRegion"] == true;
     let chats = super::chat_stores::against(app, region, &ids, server_in);
-    warnings.extend(super::chat_stores::report_warnings(&chats, region, server_in));
+    warnings.extend(super::chat_stores::report_warnings(&chats, region, server_in, crate::db::now()));
     let hosts = cp.hosts().map(|h| h.configured().into_iter().filter(|c| c.region.as_deref() == Some(region)).map(|c| c.name).collect::<Vec<_>>());
     let pinned_by = p.pinned_by.as_deref().map(|id| json!({ "id": id, "name": app.db.user(id).map(|u| u.name) }));
     let kept_from = p.kept_from.as_deref().map(|t| json!({ "id": t, "name": app.db.team(t).map(|t| t.name) }));

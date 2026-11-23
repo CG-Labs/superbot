@@ -666,3 +666,64 @@ async fn with_residency_server_data_require_every_pin_is_held_to_botds_own_regio
     let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
     assert!(regions["residency"]["warnings"].to_string().contains("botd's own database and files are in gb-lon"), "{regions}");
 }
+
+#[tokio::test]
+async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_back_when_unpinned() {
+    use crate::machines::chat_stores::{self, MOVED, Settings};
+    let scratch = crate::db::Scratch::new();
+    let lon = scratch.path().join("lon");
+    std::fs::create_dir_all(&lon).unwrap();
+    let settings = Settings { dirs: vec![("gb-lon".into(), lon.clone())], keep: 7 };
+    let set = settings.clone();
+    let (port, app, admin, _) = linode_set(move |cp| cp.chat_stores = set).await;
+    let lines = chat_stores::open(&app.db, &settings, None).unwrap();
+    assert!(lines.iter().any(|l| l.contains("made gb-lon's store")), "{lines:?}");
+    let (ada, ada_s) = user_with(port, &admin, "ada@example.com", "member").await;
+    let bot = app.db.create_bot_owned("B", "#fff", "waddle", "claude", None, false, &ada, crate::acl::Visibility::Private).id;
+    for text in ["hello", "a contract draft"] {
+        app.db.add_message(&bot, "user", text, None, false, None);
+    }
+    let in_store = || rusqlite::Connection::open(lon.join("chats.sqlite")).unwrap().query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0)).unwrap();
+    assert_eq!(in_store(), 0, "unpinned: chats stay in botd's own database");
+
+    // A pin moves her chats into London's store, audited; reads see them as before.
+    assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("gb-lon", "DPA-1")).await.0, 200);
+    assert_eq!(in_store(), 2);
+    assert_eq!(app.db.messages(&bot, 10).len(), 2);
+    let moved = audit(port, &admin, MOVED).await;
+    assert_eq!((moved[0]["details"]["to"].as_str(), moved[0]["details"]["messages"].as_i64(), moved[0]["actorId"].as_str()), (Some("gb-lon"), Some(2), Some("residency")), "{moved:?}");
+    // New messages go straight there.
+    app.db.add_message(&bot, "assistant", "noted", None, false, None);
+    assert_eq!(in_store(), 3);
+
+    // The report, the app and the regions page say so.
+    let (code, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!(code, 200, "{r}");
+    let c = &r["chats"];
+    assert_eq!((c["store"].as_bool(), c["inRegion"].as_bool(), c["messages"]["inStore"].as_i64(), c["messages"]["inServerDatabase"].as_i64()), (Some(true), Some(true), Some(3), Some(0)), "{r}");
+    assert!(r["notCovered"][0].as_str().unwrap().starts_with("botd's own database apart from chats"), "{r}");
+    assert!(r["warnings"].to_string().contains("gb-lon's chat store has no backup from the last day"), "{r}");
+    assert_eq!(r["digest"].as_str(), Some(crate::machines::residency_report::digest(&r).as_str()), "the digest covers it");
+    let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
+    assert!(md.contains("## Chats") && md.contains("- **Messages in it:** 3"), "{md}");
+    let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
+    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true }), "{me}");
+    let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
+    let lon_row = regions["regions"].as_array().unwrap().iter().find(|x| x["id"] == "gb-lon").unwrap();
+    assert_eq!(lon_row["chatStore"]["messages"].as_i64(), Some(3), "{regions}");
+    assert_eq!(regions["residency"]["chatStores"]["stores"][0]["region"].as_str(), Some("gb-lon"), "{regions}");
+
+    // A backup is made in the region's folder, not with server backups.
+    let at = crate::db::now();
+    let done = chat_stores::backup_pass(&app.db, 7, at);
+    let path = done[0].1.as_ref().unwrap();
+    assert!(path.starts_with(lon.join("backups")), "{path:?}");
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!(r["chats"]["lastBackupAt"].as_i64().map(|t| t / 1000), Some(at / 1000), "{r}");
+    assert!(!r["warnings"].to_string().contains("chat store"), "{r}");
+
+    // Unpinned, they come back.
+    assert_eq!(call(port, "DELETE", &format!("/api/users/{ada}/residency"), &admin, r#"{"reason":"contract ended"}"#).await.0, 200);
+    assert_eq!(in_store(), 0);
+    assert_eq!(app.db.messages(&bot, 10).len(), 3);
+}

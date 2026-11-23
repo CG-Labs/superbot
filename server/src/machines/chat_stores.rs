@@ -312,9 +312,12 @@ pub fn against(app: &App, region: &str, owners: &[String], server_in: bool) -> V
 
 /// Report warnings about `chats` (`against`): messages still to move, or in another
 /// region's store.
-pub fn report_warnings(chats: &Value, region: &str, server_in: bool) -> Vec<String> {
+pub fn report_warnings(chats: &Value, region: &str, server_in: bool, at: i64) -> Vec<String> {
     let m = &chats["messages"];
     let mut out = Vec::new();
+    if m["inStore"].as_i64().is_some_and(|n| n > 0) && chats["lastBackupAt"].as_i64().is_none_or(|t| at - t > BACKUP_STALE_MS) {
+        out.push(format!("{region}'s chat store has no backup from the last day (ADR 0215)"));
+    }
     if chats["store"] == true && !server_in && let Some(n) = m["inServerDatabase"].as_i64().filter(|n| *n > 0) {
         out.push(format!("{n} of their chat messages are still in botd's own database; they move to {region}'s chat store on the next pass (ADR 0215)"));
     }
