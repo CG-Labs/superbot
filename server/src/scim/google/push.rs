@@ -94,9 +94,17 @@ struct State {
     last_notification: Option<i64>,
     /// What Google said changed since the last pass started.
     pending: BTreeSet<&'static str>,
+    last_started: Option<tokio::time::Instant>,
     refused: u64,
     stopping: HashSet<String>,
     stopped: u64,
+}
+
+impl State {
+    /// Channels that haven't ended: a failed renewal keeps old ones past their end.
+    fn live(&self, now: i64) -> usize {
+        self.channels.iter().filter(|c| c.expires_at.is_none_or(|e| e > now)).count()
+    }
 }
 
 /// Push's channels and what they've delivered.
@@ -118,20 +126,41 @@ impl Push {
 
     /// Sleeps for `wait`, or until Google pushes a change and the burst settles; then
     /// says which. A change pushed while a pass ran ends the wait at once.
-    pub async fn wait(&self, wait: Duration, last_started: Option<tokio::time::Instant>) -> Trigger {
-        tokio::select! {
-            _ = tokio::time::sleep(wait) => Trigger::Schedule,
-            _ = self.nudge.notified() => {
-                let gap = last_started.map(|t| MIN_GAP.saturating_sub(t.elapsed())).unwrap_or_default();
-                tokio::time::sleep(SETTLE.max(gap)).await;
-                Trigger::Push
+    pub async fn wait(&self, wait: Duration) -> Trigger {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => return Trigger::Schedule,
+                _ = self.nudge.notified() => {}
+            }
+            // A nudge whose change a pass has since read (one pushed while the last burst
+            // settled, say) starts nothing.
+            let Some(gap) = self.pass_due() else { continue };
+            tokio::time::sleep(SETTLE.max(gap)).await;
+            if self.pass_due().is_some() {
+                return Trigger::Push;
             }
         }
     }
 
-    /// What Google said changed since the last pass started, for its audit event.
-    pub fn take_pending(&self) -> Vec<&'static str> {
-        std::mem::take(&mut self.state().pending).into_iter().collect()
+    /// How long until a pushed pass may start, if one is owed.
+    fn pass_due(&self) -> Option<Duration> {
+        let s = self.state();
+        (!s.pending.is_empty()).then(|| s.last_started.map(|t| MIN_GAP.saturating_sub(t.elapsed())).unwrap_or_default())
+    }
+
+    /// Called as a pass starts reading: returns what Google said changed since the last
+    /// one did, for its audit event, and starts the gap before the next pushed pass.
+    pub fn begin(&self) -> Vec<&'static str> {
+        let mut s = self.state();
+        s.last_started = Some(tokio::time::Instant::now());
+        std::mem::take(&mut s.pending).into_iter().collect()
+    }
+
+    /// Lets a test's next pushed pass start without the gap after the passes it set up with.
+    #[cfg(test)]
+    pub(crate) fn forget_last_pass(&self) {
+        self.state().last_started = None;
     }
 
     fn note(&self, change: &str) {
@@ -149,7 +178,7 @@ impl Push {
         json!({
             "enabled": true,
             "address": address,
-            "watching": !s.channels.is_empty(),
+            "watching": s.live(crate::db::now()) > 0,
             "channels": s.channels.iter().map(|c| json!({ "event": c.event, "expiresAt": c.expires_at })).collect::<Vec<_>>(),
             "renewedAt": s.renewed_at,
             "failure": s.failure,
@@ -278,7 +307,7 @@ pub async fn renew(a: &Arc<Auth>, d: &Directory) -> Duration {
                 let mut st = d.push.state();
                 let first = st.failure.is_none();
                 st.failure = Some(json!({ "reason": f.reason, "detail": f.detail, "at": now }));
-                (first, st.channels.len(), st.channels.iter().filter_map(|c| c.expires_at).min())
+                (first, st.live(now), st.channels.iter().filter_map(|c| c.expires_at).filter(|e| *e > now).min())
             };
             if first {
                 let details = json!({ "tenant": s.tenant, "address": address, "reason": f.reason, "detail": f.detail, "channelsLeft": left, "channelsEnd": until });
@@ -417,18 +446,42 @@ mod tests {
         use tokio::time::Instant;
         let p = Push::new(Some("https://superbot.example.com/scim/google/push".into()));
         let hour = Duration::from_secs(3600);
-        assert!(matches!(p.wait(Duration::from_secs(1), None).await, Trigger::Schedule));
+        assert!(matches!(p.wait(Duration::from_secs(1)).await, Trigger::Schedule));
         p.note("update");
         p.note("delete");
         p.note("makeAdmin");
         let t = Instant::now();
-        assert!(matches!(p.wait(hour, None).await, Trigger::Push), "a change pushed before the wait began still counts");
+        assert!(matches!(p.wait(hour).await, Trigger::Push), "a change pushed before the wait began still counts");
         assert!((SETTLE..SETTLE + Duration::from_secs(1)).contains(&t.elapsed()), "{:?}", t.elapsed());
-        assert_eq!(p.take_pending(), vec!["delete", "other", "update"]);
-        assert!(p.take_pending().is_empty());
+        assert_eq!(p.begin(), vec!["delete", "other", "update"]);
+        assert!(p.begin().is_empty());
+
+        // The nudges left by the burst start no second pass: that one read their changes.
+        let t = Instant::now();
+        assert!(matches!(p.wait(Duration::from_secs(60)).await, Trigger::Schedule));
+        assert_eq!(t.elapsed(), Duration::from_secs(60));
+
+        // A pass that started long ago (waiting for the lock, say) doesn't count: the gap
+        // runs from when the last one began reading.
+        tokio::time::sleep(MIN_GAP).await;
         let started = Instant::now();
+        p.begin();
         p.note("add");
-        assert!(matches!(p.wait(hour, Some(started)).await, Trigger::Push));
+        assert!(matches!(p.wait(hour).await, Trigger::Push));
         assert!((MIN_GAP..MIN_GAP + Duration::from_secs(1)).contains(&started.elapsed()), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn channels_past_their_end_arent_watching() {
+        let p = Push::new(Some("https://superbot.example.com/scim/google/push".into()));
+        let now = crate::db::now();
+        let channel = |expires_at| Channel { id: format!("{PREFIX}00"), resource_id: "r".into(), event: "update", expires_at };
+        p.state().channels = vec![channel(Some(now - 1_000)), channel(Some(now - 1))];
+        assert_eq!(p.status()["watching"], false, "a failed renewal keeps ended channels");
+        assert_eq!(p.state().live(now), 0);
+        p.state().channels.push(channel(Some(now + 60_000)));
+        assert_eq!(p.status()["watching"], true);
+        p.state().channels = vec![channel(None)];
+        assert_eq!(p.status()["watching"], true, "no end given");
     }
 }

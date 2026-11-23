@@ -734,6 +734,7 @@ async fn google_pushes_a_change_and_a_pass_runs_at_once() {
     assert_eq!(events(w.port, &w.admin, "action=scim.google_sync").await.len(), 1, "no pass for any of them");
 
     // Bob is suspended in Google, which says so: a pass runs within seconds, not 30 minutes.
+    w.dir().push.forget_last_pass();
     google::start(w.auth.clone());
     g.user("102", |u| u["suspended"] = json!(true));
     assert_eq!(notify(&w, &id, &token, "update", &resource).await, 200);
@@ -757,7 +758,7 @@ async fn channels_left_from_before_are_stopped_and_push_off_starts_no_pass() {
     eventually("the leftover channel is stopped", || stopped(&g).contains(&(old.clone(), "r-old".into()))).await;
     let p = push_status(&w).await;
     assert_eq!((p["leftoversStopped"].as_u64(), p["notifications"].as_u64()), (Some(1), Some(1)), "a leftover's change still counts: {p}");
-    assert_eq!(w.dir().push.take_pending(), vec!["update"]);
+    assert_eq!(w.dir().push.begin(), vec!["update"]);
     for (id, _, _) in channels(&g) {
         assert!(!stopped(&g).iter().any(|(s, _)| *s == id), "today's channels are kept");
     }
@@ -768,7 +769,7 @@ async fn channels_left_from_before_are_stopped_and_push_off_starts_no_pass() {
     assert_eq!(push_status(&off).await, json!({ "enabled": false }));
     assert_eq!(notify(&off, &old, &token, "update", "r-old").await, 200);
     eventually("the channel is stopped", || stopped(&g2).len() == 1).await;
-    assert!(off.dir().push.take_pending().is_empty());
+    assert!(off.dir().push.begin().is_empty());
     assert_eq!(google::push::renew(&off.auth, &off.dir()).await, std::time::Duration::from_secs(6 * 3600), "nothing to renew");
     assert!(g2.dir.lock().unwrap().watches.is_empty());
 

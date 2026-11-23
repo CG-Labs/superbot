@@ -18,7 +18,7 @@ ADR 0162 rejected push as the only mechanism because notifications are hints, no
 
 With `GOOGLE_DIRECTORY_PUSH=on` (off by default; needs `GOOGLE_DIRECTORY_SYNC=on` and an https `PUBLIC_URL`), a notification starts **the same full pass as the schedule**, with the same fail-closed reads, removal guards, held disables and audit. botd reads nothing from the notification but its channel id, token and resource state; the user id and email in its body are ignored. So a forged, replayed or reordered notification can do no more than start a pass early, the result never depends on which notifications arrived or in what order, and the schedule keeps running: losing push loses speed, never correctness.
 
-Passes are coalesced. A pass starts 5 seconds after the first notification (a bulk suspension becomes one pass), at least 30 seconds after the previous pass started, and a notification during a pass leaves one more pass to run after it. A pushed pass waits for one already running rather than being dropped, since that pass may have read the directory before the change. The audit event `scim.google_sync` gets `trigger: "push"` and `pushed`, the kinds of change Google sent (`add`, `update`, `delete`, `undelete`).
+Passes are coalesced. A pass starts 5 seconds after the first notification (a bulk suspension becomes one pass), at least 30 seconds after the previous pass began reading (of any trigger, timed from when it got the lock), and a notification during a pass leaves one more pass to run after it; notifications whose changes a pass has already read start nothing more. A pushed pass waits for one already running rather than being dropped, since that pass may have read the directory before the change. The audit event `scim.google_sync` gets `trigger: "push"` and `pushed`, the kinds of change Google sent (`add`, `update`, `delete`, `undelete`).
 
 ### Channels
 
@@ -38,7 +38,7 @@ Deriving rather than storing tokens means **no new table**: botd knows its chann
 
 ### Status
 
-`GET /api/scim/google` (and `botctl scim google`) gains `push`: whether it's on, the address, whether it's watching, each channel's event and end, when channels were last made, the last failure, how many notifications came and when the last did, how many were refused, and how many leftover channels were stopped. No channel ids or tokens.
+`GET /api/scim/google` (and `botctl scim google`) gains `push`: whether it's on, the address, whether it's watching (a channel that hasn't ended; a failed renewal keeps ended ones), each channel's event and end, when channels were last made, the last failure, how many notifications came and when the last did, how many were refused, and how many leftover channels were stopped. No channel ids or tokens.
 
 ## Consequences
 

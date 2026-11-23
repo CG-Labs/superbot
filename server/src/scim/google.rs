@@ -774,7 +774,7 @@ pub async fn run(a: &Arc<Auth>, d: &Directory, trigger: Trigger) -> Result<Value
     };
     let mut base = json!({ "tenant": s.tenant, "trigger": name, "force": force });
     // Taken as the pass starts: a change pushed from here on gets a pass of its own.
-    let pushed = d.push.take_pending();
+    let pushed = d.push.begin();
     if !pushed.is_empty() {
         base["pushed"] = json!(pushed);
     }
@@ -1111,11 +1111,10 @@ pub fn start(a: Arc<Auth>) {
     let Some(d) = a.scim.google.clone() else { return };
     push::start(a.clone(), d.clone());
     tokio::spawn(async move {
-        let mut trigger = d.push.wait(FIRST_PASS, None).await;
+        let mut trigger = d.push.wait(FIRST_PASS).await;
         loop {
-            let started = tokio::time::Instant::now();
             let wait = next_wait(&run(&a, &d, trigger).await, d.settings.interval);
-            trigger = d.push.wait(wait, Some(started)).await;
+            trigger = d.push.wait(wait).await;
         }
     });
 }
