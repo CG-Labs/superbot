@@ -199,8 +199,10 @@ fn clip(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 fn random_bytes(n: usize) -> Vec<u8> {
-    let mut b = vec![0u8; n];
-    aws_lc_rs::rand::fill(&mut b).expect("random bytes");
+    use std::io::Read;
+    let mut b = Vec::with_capacity(n);
+    std::fs::File::open("/dev/urandom").and_then(|f| f.take(n as u64).read_to_end(&mut b)).expect("read /dev/urandom");
+    assert_eq!(b.len(), n, "short read from /dev/urandom");
     b
 }
 
