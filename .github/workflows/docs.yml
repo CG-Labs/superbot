@@ -10,7 +10,8 @@ name: docs
 # workflow checks CHANGELOG.md and publishes only from checked tags (ADR 0111), and that every
 # tag gets signed offline bundles once its images are published (ADR 0140), and that the
 # change-evidence workflow only reads and its bundle still matches the evidence plan
-# (ADR 0148), and that the drill bundle reads the drill scripts' records (ADR 0177). The site job
+# (ADR 0148), that the drill bundle reads the drill scripts' records (ADR 0177), and that the
+# register bundle checks against the real policy files (ADR 0204). The site job
 # builds the public site and docs portal from docs/ and fails on any broken internal link
 # (ADR 0119); the site is kept as an artifact, never published from here.
 on:
@@ -26,6 +27,7 @@ on:
       - 'server/tests/change_evidence.rs'
       - 'server/tests/evidence_coverage.rs'
       - 'server/tests/drill_evidence.rs'
+      - 'server/tests/register_evidence.rs'
       - 'deploy/backup-drill.sh'
       - 'deploy/machine-restore-drill.sh'
       - 'server/tests/fixtures/github/**'
@@ -51,6 +53,7 @@ on:
       - 'server/tests/change_evidence.rs'
       - 'server/tests/evidence_coverage.rs'
       - 'server/tests/drill_evidence.rs'
+      - 'server/tests/register_evidence.rs'
       - 'deploy/backup-drill.sh'
       - 'deploy/machine-restore-drill.sh'
       - 'server/tests/fixtures/github/**'
@@ -94,6 +97,8 @@ jobs:
       - run: cargo test --test evidence_coverage
       # ADR 0177: the drill bundle from a stand-in GitHub and the real drill scripts' records.
       - run: cargo test --test drill_evidence
+      # ADR 0204: the register bundle from a register, the real policy files and baseline checks.
+      - run: cargo test --test register_evidence
 
   site:
     runs-on: ubuntu-latest

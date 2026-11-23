@@ -23,9 +23,9 @@ Owners are roles from the [checklist's owner table](../soc2-readiness-checklist.
 
 This repository is public, so it holds the policy text and nothing about the people who run a service ([`AGENTS.md`](../../../AGENTS.md)). To adopt the set, a provider:
 
-1. **Names a person for each role** in the information security policy's [roles table](information-security.md#roles-and-responsibilities), starting with the security owner, in a private policy register kept outside this repository.
+1. **Names a person for each role** in the information security policy's [roles table](information-security.md#roles-and-responsibilities), starting with the security owner, in a private policy register kept outside this repository. Its format and a template are in [the policy register](../policy-register.md), and `superbot-evidence register` checks it against these policies' cadences each month ([ADR 0204](../../adr/0204-policy-register-checked-and-bundled.md)).
 2. **Fills in its choices.** Text in square brackets, such as `[N] hours`, is the provider's to decide; each placeholder suggests a value where one is common.
-3. **Approves each policy** by recording in the register the policy, the commit of this repository it was approved at, the approver's role and name, and the date. The commit fixes the exact text approved; a later change here is a new version that needs approving again.
+3. **Approves each policy** by recording in the register the policy, the commit of this repository it was approved at and the file's SHA-256, the approver, and the date. The commit fixes the exact text approved; a later change here is a new version that needs approving again.
 4. **Communicates them**: every person with access acknowledges the information security and acceptable use policies at hire and yearly, and the register keeps the acknowledgements.
 5. **Starts collecting evidence** the same day, following the [evidence plan](../soc2-evidence-plan.md).
 
