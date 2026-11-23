@@ -117,6 +117,11 @@ impl ServerData {
         }
     }
 
+    /// Whether server backups' off-host copies, if any, are in `region`.
+    pub fn backups_in(&self, region: &str) -> bool {
+        self.copies_outside(region).is_none()
+    }
+
     /// Why botd's own data isn't in `region`, as the operator states it. Empty: it is.
     pub fn outside(&self, region: &str) -> Vec<String> {
         let mut out = Vec::new();
@@ -227,6 +232,8 @@ mod tests {
         let sd = with(&[("SERVER_DATA_REGION", "gb-lon"), ("MACHINE_BACKUP_S3_DATA_REGION", "de-fra-2")], Some(Source::Machines)).unwrap();
         assert_eq!(sd.outside("gb-lon"), vec!["server backups are copied off the host to a store in de-fra-2 (MACHINE_BACKUP_S3_DATA_REGION)"]);
         assert!(sd.refuses("gb-lon").is_empty() && sd.refuses("de-fra-2").is_empty(), "report only shows, never refuses");
+        assert!(!sd.backups_in("gb-lon") && sd.backups_in("de-fra-2"), "botd's region can match while its backups are elsewhere");
+        assert!(with(&[], None).unwrap().backups_in("gb-lon"), "archives kept on botd's host are where botd is");
     }
 
     #[test]

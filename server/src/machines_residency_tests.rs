@@ -480,9 +480,10 @@ async fn reports_and_the_app_say_whether_botds_own_data_is_in_a_pins_region() {
 
     // People see it in the app.
     let (_, me) = call_json(port, "GET", "/api/me/residency", &lon_s, "").await;
-    assert_eq!(me["serverData"], json!({ "region": "gb-lon", "inRegion": true }), "{me}");
+    assert_eq!(me["serverData"], json!({ "region": "gb-lon", "inRegion": true, "backupsInRegion": true, "required": false }), "{me}");
     let (_, me) = call_json(port, "GET", "/api/me/residency", &fra_s, "").await;
-    assert_eq!(me["serverData"], json!({ "region": "gb-lon", "inRegion": false }), "{me}");
+    assert_eq!(me["serverData"], json!({ "region": "gb-lon", "inRegion": false, "backupsInRegion": true, "required": false }), "{me}");
+    assert_eq!(me["status"].as_str(), Some("kept"), "report mode: {me}");
 
     // A copy made to a store botd no longer copies to is a warning: botd can't say where it is.
     let n = crate::db::NewServerBackup { id: "sb-old", archive: "superbot-20261101-031500.tar.gz.age", destination: "https://old-s3/b/server/", object_key: "server/a", created_at: 1, encrypted_by: Some("archive") };
@@ -496,14 +497,16 @@ async fn reports_and_the_app_say_whether_botds_own_data_is_in_a_pins_region() {
     let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
     let s = &regions["residency"]["serverData"];
     assert_eq!((s["region"].as_str(), s["policy"].as_str(), s["earlierCopies"].as_i64()), (Some("gb-lon"), Some("report"), Some(1)), "{regions}");
-    assert!(!regions["residency"]["warnings"].to_string().contains("botd's own"), "report mode adds no warnings: {regions}");
+    let w = regions["residency"]["warnings"].to_string();
+    assert!(!w.contains("botd's own"), "report mode adds no warnings about botd's region: {regions}");
+    assert!(w.contains("1 server backup copies were made to a store botd no longer copies to") && !w.contains("old-s3"), "{regions}");
 }
 
 #[tokio::test]
 async fn with_residency_server_data_require_every_pin_is_held_to_botds_own_region() {
     use crate::machines::residency::{Startup, at_startup};
     let (port, app, admin, cp) = linode_with(in_london(ServerDataPolicy::Require)).await;
-    let (fra, _) = user_with(port, &admin, "fra@example.com", "member").await;
+    let (fra, fra_s) = user_with(port, &admin, "fra@example.com", "member").await;
     user_with(port, &admin, "lon@example.com", "member").await;
 
     // A user or team pinned elsewhere is refused and audited.
@@ -539,6 +542,8 @@ async fn with_residency_server_data_require_every_pin_is_held_to_botds_own_regio
     assert!(r["outside"].to_string().contains("botd: botd's own database and files are in gb-lon (RESIDENCY_SERVER_DATA=require, ADR 0184)"), "{r}");
     let (_, md) = call(port, "GET", &format!("/api/users/{fra}/residency/report?format=markdown"), &admin, "").await;
     assert!(md.contains("- **In the pinned region:** no") && md.contains("- Outside: botd's own database and files are in gb-lon"), "{md}");
+    let (_, me) = call_json(port, "GET", "/api/me/residency", &fra_s, "").await;
+    assert_eq!((me["status"].as_str(), me["serverData"]["required"].as_bool(), me["serverData"]["inRegion"].as_bool()), (Some("data_outside"), Some(true), Some(false)), "the app sees what the report does: {me}");
     let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
     assert!(regions["residency"]["warnings"].to_string().contains("botd's own database and files are in gb-lon"), "{regions}");
 }

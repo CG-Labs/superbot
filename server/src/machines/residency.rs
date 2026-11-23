@@ -393,10 +393,19 @@ pub fn kept_for_leaver(app: &App, by: &Who, team_id: &str, user_id: &str, reason
 
 /// Warnings for startup and admins: pins whose region this server can't keep now, or
 /// whose data is outside it. Their backups and restores are refused until fixed. Also
-/// pins whose people's plans have no model route there (ADR 0139), whose runs are refused.
+/// pins whose people's plans have no model route there (ADR 0139), whose runs are refused,
+/// and, while there are pins, server backup copies left in a store botd no longer uses
+/// (ADR 0184).
 pub fn warnings(app: &App, cp: &ControlPlane) -> Vec<String> {
     let mut out: Vec<String> = app.tiers().unknown_regions(&cp.regions).into_iter().map(|w| format!("The tiers file's {w} (ADR 0139).")).collect();
-    for p in app.db.residency_pins() {
+    let pins = app.db.residency_pins();
+    let earlier = if pins.is_empty() { 0 } else { cp.server_data.earlier_copies(app) };
+    if earlier > 0 {
+        out.push(format!(
+            "{earlier} server backup copies were made to a store botd no longer copies to. botd doesn't delete them or know their region, so pinned people's chats and accounts may be there too; delete them in that store (ADR 0184)."
+        ));
+    }
+    for p in pins {
         let Some((name, people)) = held_by(app, &p) else { continue };
         out.extend(unkept_line(app, cp, &p, &name, &people));
         let gaps = route_gaps(app, &people, &p.region);

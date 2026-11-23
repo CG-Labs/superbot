@@ -36,14 +36,14 @@ All three are the operator's statement, as a host's `INCUS_REGION` tag is. botd 
 
 botd's own data is in a pin's region when `SERVER_DATA_REGION` is that region and server backups' off-host copies, if any, go to a store said to be there. Otherwise each reason is named: the region isn't stated, botd is in another region, or the copies go to a store in another region or none.
 
-Copies made earlier to a store botd no longer copies to (the store was changed) aren't deleted by botd and their region isn't known. They are counted and shown as a warning in reports and `GET /api/regions`, without the store's address. They don't make a pin unkept, since nothing in botd can clear them; the operator deletes them in the old store.
+Copies made earlier to a store botd no longer copies to (the store was changed) aren't deleted by botd and their region isn't known. They are counted and shown as a warning in reports and, while there are pins, in `GET /api/regions` and the startup log, without the store's address. They don't make a pin unkept, since nothing in botd can clear them; the operator deletes them in the old store.
 
 ### `report` (the default)
 
 botd shows where its own data is and changes nothing else:
 
 - the residency report has a `serverData` section: the stated region, where server backups are copied, the policy, whether it is in the pin's region and why not, and the count of earlier copies. Its Markdown has a "botd's own data" section. The "not covered" list names botd's own data, with why, only when it isn't in the pin's region. The report's `status` is unchanged: it is about the pin's people's data;
-- `GET /api/me/residency` has `serverData: {region, inRegion}`, and the app's residency card says whether SuperBot's own copy of their account and chats is in the region;
+- `GET /api/me/residency` has `serverData: {region, inRegion, backupsInRegion, required}`, and the app's residency card says whether SuperBot's own copy of their account and chats is in the region, or that it is but its backups aren't;
 - `GET /api/regions` has `residency.serverData`: the region, the copies' store, the policy and earlier copies.
 
 ### `require`
@@ -52,7 +52,7 @@ Every pin on the server is held to botd's own region. This is the "dedicated dep
 
 - botd refuses to start unless `SERVER_DATA_REGION` is set and server backups' off-host copies, if any, go to a store in it;
 - a pin to another region is refused (409, `user.residency_pin_refused` or `team.residency_pin_refused`, reason `server_data_outside`), after the region-ready check;
-- a pin made to another region before (before `require`, or before `SERVER_DATA_REGION` changed) is one botd can't keep: it is warned about at startup and in `GET /api/regions`, refuses startup under `RESIDENCY_STARTUP=refuse` (ADR 0171), and its report's `status` is `data_outside` with botd's reasons in `outside`.
+- a pin made to another region before (before `require`, or before `SERVER_DATA_REGION` changed) is one botd can't keep: it is warned about at startup and in `GET /api/regions`, refuses startup under `RESIDENCY_STARTUP=refuse` (ADR 0171), and its report's `status` is `data_outside` with botd's reasons in `outside`. The app's `status` agrees, and the card shows it as a warning rather than a line.
 
 A provider with customers in two regions runs one botd in each, each with `require`.
 
