@@ -13,7 +13,8 @@
 //! no backup store there) or while any of their data is still elsewhere. Unpinning needs
 //! a reason. Every pin, unpin and refusal is audited. A pinned person's Bot runs take only
 //! model routes the tiers file marks as in the region, or are refused (ADR 0139, in the
-//! runner). botd's own database is where ADR 0117 says.
+//! runner). botd's own database and server backups are where the operator runs botd;
+//! with RESIDENCY_SERVER_DATA=require, pins are held to that region too (ADR 0184).
 //!
 //! Someone leaving a pinned team keeps its pin as their own (ADR 0171), and with
 //! RESIDENCY_STARTUP=refuse botd won't start while it can't keep a pin.
@@ -291,10 +292,12 @@ pub(super) fn route_gaps(app: &App, people: &[String], region: &str) -> Vec<Stri
     gaps
 }
 
-/// Why this server can't keep `p` now (ADR 0129): its region isn't ready, or some of the
-/// data it holds is outside it, as one line. None: it can, or whom it is on is gone.
+/// Why this server can't keep `p` now (ADR 0129): its region isn't ready, some of the
+/// data it holds is outside it, or, with RESIDENCY_SERVER_DATA=require, botd's own data
+/// is (ADR 0184), as one line. None: it can, or whom it is on is gone.
 fn unkept_line(app: &App, cp: &ControlPlane, p: &ResidencyPin, name: &str, people: &[String]) -> Option<String> {
     let mut why = unready(cp, &p.region);
+    why.extend(cp.server_data.refuses(&p.region));
     for id in people {
         why.extend(outside(app, cp, id, &p.region));
     }
@@ -371,7 +374,7 @@ pub fn at_startup(app: &App, cp: &ControlPlane, policy: Startup) -> Result<Vec<S
     app.db.record(&by.event("residency.startup_refused").outcome(Outcome::Denied).details(json!({ "policy": policy.as_str(), "pins": pins })));
     let lines: Vec<&str> = unkept.iter().map(|(_, why)| why.as_str()).collect();
     Err(format!(
-        "RESIDENCY_STARTUP=refuse, and this server can't keep {} residency pin{}: {} Put back the regions, host tags or backup stores they need, or start with RESIDENCY_STARTUP=warn to unpin with a reason (botctl user|team residency ... unpin) (ADR 0171).",
+        "RESIDENCY_STARTUP=refuse, and this server can't keep {} residency pin{}: {} Put back the regions, host tags, backup stores or server data region they need, or start with RESIDENCY_STARTUP=warn to unpin with a reason (botctl user|team residency ... unpin) (ADR 0171).",
         unkept.len(),
         if unkept.len() == 1 { "" } else { "s" },
         lines.join(" ")
@@ -461,6 +464,18 @@ fn pin_body(cp: &ControlPlane, body: Result<Json<PinBody>, JsonRejection>) -> Re
     Ok((region, text(&b.reference, "reference", 200)?))
 }
 
+/// Why a pin to `region` is refused for botd's own data (RESIDENCY_SERVER_DATA=require,
+/// ADR 0184). None: it isn't.
+fn server_data_refusal(cp: &ControlPlane, region: &str) -> Option<String> {
+    let why = cp.server_data.refuses(region);
+    (!why.is_empty()).then(|| {
+        format!(
+            "{region} can't hold pinned data on this server: {}. RESIDENCY_SERVER_DATA=require holds every pin to the region botd's own database and server backups are in (ADR 0184).",
+            why.join("; ")
+        )
+    })
+}
+
 /// A pin or unpin that wasn't saved: nothing changed, and nothing is audited as done.
 fn not_saved(e: String) -> ApiError {
     ApiError(axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("The residency pin couldn't be saved, so nothing changed: {e}"))
@@ -498,6 +513,9 @@ pub async fn pin_user(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Aut
     let why = unready(cp, &region);
     if !why.is_empty() {
         return Err(refuse("region_not_ready", format!("{region} can't keep pinned data on this server yet: {} (ADR 0129).", why.join("; "))));
+    }
+    if let Some(why) = server_data_refusal(cp, &region) {
+        return Err(refuse("server_data_outside", why));
     }
     let why = outside(&app, cp, &u.id, &region);
     if !why.is_empty() {
@@ -559,6 +577,9 @@ pub async fn pin_team(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Aut
     let why = unready(cp, &region);
     if !why.is_empty() {
         return Err(refuse("region_not_ready", format!("{region} can't keep pinned data on this server yet: {} (ADR 0129).", why.join("; ")), Value::Null));
+    }
+    if let Some(why) = server_data_refusal(cp, &region) {
+        return Err(refuse("server_data_outside", why, Value::Null));
     }
     let mut blocked = Vec::new();
     for m in app.db.team_members(&t.id) {

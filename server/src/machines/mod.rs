@@ -49,6 +49,7 @@ pub mod seccomp;
 #[cfg(test)]
 pub mod s3_standin;
 pub mod screens;
+pub mod server_data;
 pub mod teammate;
 #[cfg(test)]
 pub mod teammates;
@@ -219,6 +220,8 @@ pub struct ControlPlane {
     /// off when they are disabled or deprovisioned, and back on when enabled; `keep`
     /// leaves it running, unreachable from botd.
     pub suspend_on_disable: bool,
+    /// Where botd's own data is, and whether residency pins are held to it (ADR 0184).
+    pub server_data: server_data::ServerData,
     /// One change at a time, from handlers and the reconciler alike, so two can't
     /// race on one machine. Changes are rare and admin-driven; this is cheap.
     ops: tokio::sync::Mutex<()>,
@@ -247,6 +250,7 @@ impl Default for ControlPlane {
             firewall_settings: None,
             offsite: None,
             suspend_on_disable: true,
+            server_data: server_data::ServerData::default(),
             ops: tokio::sync::Mutex::new(()),
             provider_seen: Default::default(),
         }

@@ -92,8 +92,9 @@ fn own_pin_fields(app: &App, p: &ResidencyPin, v: &mut Value) {
 }
 
 /// `GET /api/me/residency`: the pin that holds your data (your team's, else your own), or
-/// null; whether your machine and backups are in its region and your plan's model routes
-/// are held there; and which reports you can get.
+/// null; whether your machine and backups are in its region, your plan's model routes are
+/// held there, and botd's own copy of your account and chats is (ADR 0184); and which
+/// reports you can get.
 pub async fn view(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>) -> Res {
     let u = me(&c)?;
     let cp = &*a.machines;
@@ -134,6 +135,7 @@ pub async fn view(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>,
         "machine": you["machine"],
         "backups": you["backups"],
         "modelRoutes": { "inRegion": you["modelRoutes"]["inRegion"], "gap": you["modelRoutes"]["gap"] },
+        "serverData": { "region": cp.server_data.region, "inRegion": cp.server_data.outside(&p.region).is_empty() },
         "reports": reports,
     })))
 }
