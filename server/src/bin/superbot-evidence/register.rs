@@ -645,10 +645,10 @@ impl Check<'_> {
         let mut any = false;
         for role in ROLES {
             let (mut held, mut deputised) = (BTreeSet::new(), BTreeSet::new());
-            let mut flagged = BTreeSet::new();
+            let (mut flagged, mut overlap_flagged) = (BTreeSet::new(), false);
             for d in period_days(&p) {
                 let on: Vec<&Role> = self.assignments_on(role, d).collect();
-                if on.len() > 1 && flagged.insert("overlap") {
+                if on.len() > 1 && !std::mem::replace(&mut overlap_flagged, true) {
                     overlapping.push(json!(format!("{role} on {d}: {}", on.iter().map(|x| x.holder.as_str()).collect::<Vec<_>>().join(", "))));
                 }
                 for x in &on {
