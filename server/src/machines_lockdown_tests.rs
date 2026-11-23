@@ -132,6 +132,7 @@ async fn machines_come_up_behind_one_firewall_that_lets_in_only_the_control_plan
         (1, Some("firewall"), Some(fw.id.as_str())),
         "{made:?}"
     );
+    assert!(made[0]["details"].get("outbound").is_none(), "a provider with no outbound rules of its own says none");
 
     let (_, _, b) = request(&env, "bea@example.com").await;
     let b = machine(&env, &b);
@@ -465,4 +466,20 @@ async fn the_token_is_kept_nowhere_but_the_machine() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn the_firewalls_outbound_rules_are_in_its_audit_events() {
+    let env = serve(on(), None).await;
+    let outbound = json!([{ "label": "no-private-tcp", "action": "DROP", "protocol": "TCP", "ports": null, "to": ["10.0.0.0/8"] }]);
+    env.fake.set_firewall_egress(outbound.clone());
+    request(&env, "ada@example.com").await;
+    let made = events(&env, "machine.firewall_created").await;
+    assert_eq!(made[0]["details"]["outbound"], outbound, "{made:?}");
+    let id = env.fake.firewalls()[0].id.clone();
+    env.fake.set_firewall_rules(&id, &[]).await.unwrap();
+    reconcile(&env).await;
+    let updated = events(&env, "machine.firewall_updated").await;
+    assert_eq!(updated.len(), 1, "{updated:?}");
+    assert_eq!(updated[0]["details"]["outbound"], outbound, "set again with them: {updated:?}");
 }

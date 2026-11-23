@@ -45,6 +45,16 @@ fail() {
   printf 'DRILL FAILED: %s\n' "$*" >&2
   exit 1
 }
+# The record line superbot-evidence drills --record reads (ADR 0177); the last one printed counts.
+# Any other exit, by fail or by set -e inside a command substitution, prints a failed one.
+RECORDED=false
+on_exit() {
+  local status=$?
+  if ((status != 0)) && ! $RECORDED; then
+    printf '{"superbotDrill":1,"drill":"machine-restore","finishedAt":"%s","passed":false}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  fi
+}
+trap on_exit EXIT
 api() { "$BOTCTL" "$@" || fail "botctl $*"; }
 
 step "objectives"
@@ -91,6 +101,7 @@ TOOK=$(jq -r '.restore.durationMs' <<<"$R")
 RTO=$(jq -r '.restore.rtoMs' <<<"$R")
 [[ "$TOOK" =~ ^[0-9]+$ && "$RTO" =~ ^[0-9]+$ ]] || fail "botd recorded no timing for $RESTORE"
 step "restore $RESTORE took $((TOOK / 1000)) s of an RTO of $((RTO / 60000)) minutes"
-jq -c '{restoreId: .restore.id, backupId: .restore.backupId, tier: .restore.tier, durationMs: .restore.durationMs, rtoMs: .restore.rtoMs}' <<<"$R"
+jq -c '{superbotDrill: 1, drill: "machine-restore", finishedAt: (now | todate), passed: (.restore.durationMs <= .restore.rtoMs), restoreId: .restore.id, backupId: .restore.backupId, tier: .restore.tier, durationMs: .restore.durationMs, rtoMs: .restore.rtoMs}' <<<"$R"
+RECORDED=true
 ((TOOK <= RTO)) || fail "past the RTO"
 step "passed"
