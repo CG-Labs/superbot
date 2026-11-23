@@ -164,8 +164,10 @@ pub struct Inputs {
     /// Whether a SCIM token was used in the window.
     pub scim_token_used: bool,
     /// SCIM requests with a valid token that were refused or failed, by reason, and
-    /// requests with a revoked token (`revoked_token`).
+    /// requests with a revoked or expired token (`revoked_token`, `expired_token`).
     pub scim_failed: Tally,
+    /// SCIM tenants whose every working token ends within `scim::WARN_DAYS` (ADR 0196).
+    pub scim_expiring: Vec<String>,
     /// Requests with no token or an unknown one: anyone can send those, so they're only counted.
     pub scim_unauthenticated: u64,
     pub approvals_requested: u64,
@@ -211,8 +213,8 @@ impl Inputs {
             }
             // Bad tokens are throttled per address whatever the reason, so the ones not
             // logged may be guesses as well as a revoked token: they're only counted.
-            ("scim.auth_failed", _) if code == "revoked" => {
-                bump(&mut self.scim_failed, "revoked_token".into());
+            ("scim.auth_failed", _) if code == "revoked" || code == "expired" => {
+                bump(&mut self.scim_failed, format!("{code}_token"));
                 self.scim_unauthenticated += c.skipped;
             }
             ("scim.auth_failed", _) => self.scim_unauthenticated += c.n + c.skipped,
@@ -234,7 +236,9 @@ pub fn gather(app: &App, now_ms: i64, days: i64) -> Inputs {
         i.add(&c);
     }
     i.approvals_pending = app.db.approvals_pending().0;
-    i.scim_token_used = app.db.scim_tokens().iter().any(|t| t.last_used_at.is_some_and(|u| u >= from));
+    let tokens = app.db.scim_tokens();
+    i.scim_token_used = tokens.iter().any(|t| t.last_used_at.is_some_and(|u| u >= from));
+    i.scim_expiring = crate::scim::tenants_expiring(&tokens, now_ms);
     i.server_backups = app.server_backups.get().map(|sb| {
         let st = crate::server_backups::status(app, sb);
         ServerBackups {
@@ -329,8 +333,9 @@ fn identity(i: &Inputs) -> Judged {
     let facts = json!({
         "ssoAttempts": attempts, "ssoFailed": sso_failed, "ssoFailedPercent": one_place(p), "ssoReasons": top(&i.sso_failed),
         "scimTokenUsed": i.scim_token_used, "scimFailed": scim_failed, "scimReasons": top(&i.scim_failed), "scimUnauthenticated": i.scim_unauthenticated,
+        "scimTenantsExpiring": i.scim_expiring.len(),
     });
-    let scim_used = i.scim_token_used || scim_failed > 0;
+    let scim_used = i.scim_token_used || scim_failed > 0 || !i.scim_expiring.is_empty();
     if attempts == 0 && !scim_used {
         return Judged { status: Status::NotApplicable, summary: format!("No single sign-on or SCIM in the last {} days.", i.days), facts };
     }
@@ -338,6 +343,7 @@ fn identity(i: &Inputs) -> Judged {
     let scim = match scim_failed {
         n if n >= SCIM_RISK => Status::Risk,
         n if n >= SCIM_WATCH => Status::Watch,
+        _ if !i.scim_expiring.is_empty() => Status::Watch,
         _ if scim_used => Status::Ok,
         _ => Status::NotApplicable,
     };
@@ -348,6 +354,9 @@ fn identity(i: &Inputs) -> Judged {
     }
     if scim_used {
         parts.push(format!("{} failed", plural(scim_failed, "SCIM request", "SCIM requests")));
+    }
+    if !i.scim_expiring.is_empty() {
+        parts.push(format!("every SCIM token of {} ends within {} days", plural(i.scim_expiring.len() as u64, "tenant", "tenants"), crate::scim::WARN_DAYS));
     }
     let summary = format!("In the last {} days, {}.", i.days, parts.join("; "));
     Judged { status: sso.max(scim), summary, facts }

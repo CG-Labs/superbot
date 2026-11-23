@@ -1476,6 +1476,14 @@ pub struct ScimToken {
     pub last_used_at: Option<i64>,
     pub revoked_at: Option<i64>,
     pub revoked_by: Option<String>,
+    /// When it stops working (ADR 0196). None only for tokens made before tokens expired.
+    pub expires_at: Option<i64>,
+    /// The token that replaced it: a rotated token works until its `expires_at`, at most
+    /// the overlap the rotation gave.
+    pub rotated_to: Option<String>,
+    /// The last expiry notice audited for it: `expiring`, then `expired`.
+    #[serde(skip)]
+    pub expiry_notice: Option<String>,
 }
 
 fn scim_token_row(r: &Row) -> rusqlite::Result<ScimToken> {
@@ -1489,7 +1497,26 @@ fn scim_token_row(r: &Row) -> rusqlite::Result<ScimToken> {
         last_used_at: r.get("last_used_at")?,
         revoked_at: r.get("revoked_at")?,
         revoked_by: r.get("revoked_by")?,
+        expires_at: r.get("expires_at")?,
+        rotated_to: r.get("rotated_to")?,
+        expiry_notice: r.get("expiry_notice")?,
     })
+}
+
+/// Claims `notice` for a token, on `c` (inside the transaction that audits it): only
+/// while it's still unrevoked, unrotated, and its last notice is `from`.
+pub(crate) fn claim_scim_token_notice(c: &Connection, id: &str, from: Option<&str>, notice: &str) -> rusqlite::Result<bool> {
+    let n = c.execute(
+        "UPDATE scim_tokens SET expiry_notice = ?1 WHERE id = ?2 AND revoked_at IS NULL AND rotated_to IS NULL AND coalesce(expiry_notice, '') = coalesce(?3, '')",
+        params![notice, id, from],
+    )?;
+    Ok(n == 1)
+}
+
+/// A tenant's tokens, read on `c`.
+pub(crate) fn scim_tenant_tokens(c: &Connection, tenant: &str) -> rusqlite::Result<Vec<ScimToken>> {
+    let mut s = c.prepare("SELECT * FROM scim_tokens WHERE tenant = ? ORDER BY created_at, id")?;
+    s.query_map([tenant], scim_token_row)?.collect()
 }
 
 /// A user as a SCIM tenant provisioned it: the SCIM attributes botd has no column for
@@ -2110,7 +2137,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 62] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 63] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -2173,7 +2200,22 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 62] = [
     migrate_residency_kept_from,
     migrate_scim_enterprise,
     migrate_scim_role_groups,
+    migrate_scim_token_expiry,
 ];
+
+/// SCIM tokens expire and rotate (ADR 0196). Tokens made before this keep a null
+/// `expires_at` and work as before: expiring them on upgrade would stop deprovisioning.
+fn migrate_scim_token_expiry(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('scim_tokens') WHERE name = 'expires_at'", [], |r| r.get(0))?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch(
+        "ALTER TABLE scim_tokens ADD COLUMN expires_at INTEGER;
+        ALTER TABLE scim_tokens ADD COLUMN rotated_to TEXT;
+        ALTER TABLE scim_tokens ADD COLUMN expiry_notice TEXT;",
+    )
+}
 
 /// SCIM role groups (ADR 0180): groups an admin declared to give a custom role across
 /// the server, not teams; who the IdP put in each (any number of groups a person); and
@@ -7581,7 +7623,7 @@ impl Db {
 
     /// A tenant's first token sets its SSO provider for good: a token naming another gets
     /// `Err` with the tenant's provider. Checked and written in one transaction.
-    pub fn create_scim_token(&self, tenant: &str, label: Option<&str>, sso_provider: Option<&str>, token_hash: &str, by: Option<&str>) -> Result<ScimToken, Option<String>> {
+    pub fn create_scim_token(&self, tenant: &str, label: Option<&str>, sso_provider: Option<&str>, token_hash: &str, by: Option<&str>, expires_at: i64) -> Result<ScimToken, Option<String>> {
         let id = format!("st{}", crate::random_hex(4));
         let c = self.c();
         let tx = c.unchecked_transaction().unwrap();
@@ -7593,8 +7635,8 @@ impl Db {
             return Err(first);
         }
         tx.execute(
-            "INSERT INTO scim_tokens (id, tenant, label, sso_provider, token_hash, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            params![id, tenant, label, sso_provider, token_hash, now(), by],
+            "INSERT INTO scim_tokens (id, tenant, label, sso_provider, token_hash, created_at, created_by, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![id, tenant, label, sso_provider, token_hash, now(), by, expires_at],
         )
         .unwrap();
         let t = tx.query_row("SELECT * FROM scim_tokens WHERE id = ?", [&id], scim_token_row).unwrap();
@@ -7613,9 +7655,18 @@ impl Db {
         s.query_map([], scim_token_row).unwrap().filter_map(Result::ok).collect()
     }
 
-    /// The unrevoked token with this hash. Records use, at most once a minute.
+    /// The unrevoked, unexpired token with this hash. Records use, at most once a minute.
     pub fn live_scim_token(&self, token_hash: &str, at: i64) -> Option<ScimToken> {
-        let t = self.c().query_row("SELECT * FROM scim_tokens WHERE token_hash = ? AND revoked_at IS NULL", [token_hash], scim_token_row).optional().ok().flatten()?;
+        let t = self
+            .c()
+            .query_row(
+                "SELECT * FROM scim_tokens WHERE token_hash = ?1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?2)",
+                params![token_hash, at],
+                scim_token_row,
+            )
+            .optional()
+            .ok()
+            .flatten()?;
         let _ = self.c().execute("UPDATE scim_tokens SET last_used_at = ?1 WHERE id = ?2 AND coalesce(last_used_at, 0) <= ?1 - 60000", params![at, t.id]);
         Some(t)
     }
@@ -7623,6 +7674,78 @@ impl Db {
     /// The token with this hash, revoked or not: a revoked token still in use is worth an alert.
     pub fn scim_token_by_hash(&self, token_hash: &str) -> Option<ScimToken> {
         self.c().query_row("SELECT * FROM scim_tokens WHERE token_hash = ?", [token_hash], scim_token_row).optional().ok().flatten()
+    }
+
+    /// Replaces a live, unrotated token with a new one of the same tenant, label and SSO
+    /// link, in one transaction (ADR 0196). The old one is revoked now, or with
+    /// `keep_until`, expires then unless it would sooner. None if the old one was revoked,
+    /// expired or rotated meanwhile.
+    pub fn rotate_scim_token(&self, old: &str, token_hash: &str, expires_at: i64, keep_until: Option<i64>, by: Option<&str>) -> Option<ScimToken> {
+        let id = format!("st{}", crate::random_hex(4));
+        let at = now();
+        let c = self.c();
+        let tx = c.unchecked_transaction().ok()?;
+        let changed = match keep_until {
+            Some(until) => tx.execute(
+                "UPDATE scim_tokens SET expires_at = CASE WHEN expires_at IS NULL OR expires_at > ?1 THEN ?1 ELSE expires_at END, rotated_to = ?2
+                 WHERE id = ?3 AND revoked_at IS NULL AND rotated_to IS NULL AND (expires_at IS NULL OR expires_at > ?4)",
+                params![until, id, old, at],
+            ),
+            None => tx.execute(
+                "UPDATE scim_tokens SET revoked_at = ?1, revoked_by = ?2, rotated_to = ?3
+                 WHERE id = ?4 AND revoked_at IS NULL AND rotated_to IS NULL AND (expires_at IS NULL OR expires_at > ?1)",
+                params![at, by, id, old],
+            ),
+        }
+        .ok()?;
+        if changed == 0 {
+            return None;
+        }
+        tx.execute(
+            "INSERT INTO scim_tokens (id, tenant, label, sso_provider, token_hash, created_at, created_by, expires_at)
+             SELECT ?1, tenant, label, sso_provider, ?2, ?3, ?4, ?5 FROM scim_tokens WHERE id = ?6",
+            params![id, token_hash, at, by, expires_at, old],
+        )
+        .ok()?;
+        let t = tx.query_row("SELECT * FROM scim_tokens WHERE id = ?", [&id], scim_token_row).ok()?;
+        tx.commit().ok()?;
+        Some(t)
+    }
+
+    /// Unrevoked, unrotated tokens owed an expiry notice at `at`: `expiring` once within
+    /// `warn_ms` of their end, then `expired` once they've ended.
+    pub fn scim_tokens_due_notice(&self, at: i64, warn_ms: i64) -> Vec<(ScimToken, &'static str)> {
+        let c = self.c();
+        let mut s = c
+            .prepare(
+                "SELECT * FROM scim_tokens WHERE revoked_at IS NULL AND rotated_to IS NULL AND expires_at IS NOT NULL
+                 AND ((expires_at <= ?1 AND coalesce(expiry_notice, '') <> 'expired') OR (expires_at > ?1 AND expires_at <= ?1 + ?2 AND expiry_notice IS NULL))
+                 ORDER BY expires_at, id",
+            )
+            .unwrap();
+        s.query_map(params![at, warn_ms], scim_token_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|t| {
+                let notice = if t.expires_at.is_some_and(|e| e <= at) { "expired" } else { "expiring" };
+                (t, notice)
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub fn conn_for_tests(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.c()
+    }
+
+    #[cfg(test)]
+    pub fn set_scim_token_notice(&self, id: &str, notice: Option<&str>) {
+        self.c().execute("UPDATE scim_tokens SET expiry_notice = ?1 WHERE id = ?2", params![notice, id]).unwrap();
+    }
+
+    #[cfg(test)]
+    pub fn set_scim_token_expiry(&self, id: &str, expires_at: Option<i64>) {
+        self.c().execute("UPDATE scim_tokens SET expires_at = ?1 WHERE id = ?2", params![expires_at, id]).unwrap();
     }
 
     /// False if it was already revoked or doesn't exist.

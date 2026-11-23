@@ -181,6 +181,8 @@ mod scim_role_groups_http_tests;
 mod scim_groups_http_tests;
 #[cfg(test)]
 mod scim_http_tests;
+#[cfg(test)]
+mod scim_tokens_http_tests;
 mod screen;
 mod secrets;
 mod server_backups;
@@ -829,6 +831,7 @@ async fn main() {
         "databaseEncryption": database_summary,
     })));
     license::start(app.clone());
+    scim::start(app.clone());
     log_info!("Audit export: {} (ADR 0122).", audit_export.describe());
     audit_export::start(&app, audit_export);
     log_info!("Audit checkpoints: {} (ADR 0149).", audit_checkpoints.describe());
@@ -1154,6 +1157,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/signups/{id}/reject", post(signups::reject))
         .route("/scim/tokens", get(scim::list_tokens).post(scim::create_token))
         .route("/scim/tokens/{id}", delete(scim::revoke_token))
+        .route("/scim/tokens/{id}/rotate", post(scim::rotate_token))
         .route("/scim/groups", get(scim::groups::list_links).post(scim::groups::link))
         .route("/scim/groups/{team}", delete(scim::groups::unlink))
         .route("/scim/role-mappings", get(scim::roles::list).post(scim::roles::create))

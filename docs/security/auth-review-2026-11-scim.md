@@ -17,7 +17,7 @@ A pen-test style review of the SCIM 2.0 provisioning stub ([ADR 0023](../adr/002
 | SCIM-07 | Info | `scim.rs` `guard` | With `SCIM=off`, `/scim/v2` answers anyone with a 404 saying SCIM is off. | Accepted. It helps setup and shows no data. |
 | SCIM-08 | Info | `scim.rs` `conflict` | A 409 tells a token holder that an email belongs to some SuperBot user, or that a person is managed by another tenant. | Accepted. The IdP admin needs it to fix the mapping; no ids or attributes outside the tenant are returned. |
 | SCIM-09 | Info | `scim.rs` `apply_patch` | SCIM sets emails as the IdP sends them, unverified. An IdP can claim an address nobody uses yet, so a later sign-up or JIT sign-in with it is refused. | Accepted. The IdP is the authority for its people; emails stay unique and never match identities. |
-| SCIM-10 | Info | ADR 0023 | Tokens don't expire. | Accepted. A tenant can hold several tokens for rotation; `botctl scim tokens` shows last use. Expiry and scopes are M5. |
+| SCIM-10 | Info | ADR 0023 | Tokens don't expire. | **Fixed in M5** ([ADR 0196](../adr/0196-scim-token-expiry-and-rotation.md)): new tokens expire (default 365 days, at most 730), rotate with an overlap (`botctl scim token rotate`), and their end is audited 14 days ahead and when it comes. Tokens made before then keep working, flagged `no_expiry`, until rotated. Scopes are still open. |
 | SCIM-11 | Info | `main.rs` `cors_layer` | `OPTIONS` on any route, `/scim/v2` included, is answered by the CORS layer before auth: 200, empty. | Accepted. No data; the walk test pins it. |
 | SCIM-12 | Info | `scim.rs` `parse_filter` | An unsupported filter's error repeats up to 100 characters of it. | Accepted. JSON, `no-store`, to the token holder only. |
 

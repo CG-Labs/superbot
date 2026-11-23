@@ -162,10 +162,14 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl sso role show <id>                        A mapping and who it gave the role to
   botctl sso role unmap <id>                       Takes the role from everyone the mapping gave it to
   botctl scim tokens                               SCIM tokens (never their values), and whether SCIM is on
-  botctl scim token create <tenant> [--sso <provider>] [--label "<text>"]
+  botctl scim token create <tenant> [--sso <provider>] [--label "<text>"] [--days <n>]
                                                    A bearer token for an IdP's SCIM app, shown once.
                                                    <tenant> names the IdP connection (e.g. entra);
-                                                   --sso: externalId is the person's subject there
+                                                   --sso: externalId is the person's subject there;
+                                                   expires in --days (default 365, at most 730)
+  botctl scim token rotate <id> [--days <n>] [--keep-old-hours <n>]
+                                                   A new token for the same tenant, shown once; the
+                                                   old one works for 24 more hours (0 to 168)
   botctl scim token revoke <id>                    The IdP's users stay as they are
   botctl scim groups                               SCIM groups and the teams they are (SCIM_GROUPS=on)
   botctl scim group link <tenant> <team> [--external-id <id>] [--name "<group name>"]
@@ -1136,6 +1140,7 @@ fn signup_request(args: &[&str]) -> Result<(&'static str, String, Option<String>
 /// teams (ADR 0095), group roles (ADR 0138), role groups (ADR 0180), and the Google
 /// Workspace sync (ADR 0162).
 fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
+    let number = |rest: &[&str], opt: &str| -> Result<Option<i64>, String> { flag(rest, opt).map(|v| v.parse::<i64>().map_err(|_| format!("{opt} takes a whole number"))).transpose() };
     Ok(match args {
         [] | ["tokens"] | ["token", "list"] => ("GET", "/api/scim/tokens".into(), None),
         ["groups"] | ["group", "list"] => ("GET", "/api/scim/groups".into(), None),
@@ -1160,15 +1165,19 @@ fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
         ["role-group", "set-role", id, role] => ("PATCH", format!("/api/scim/role-groups/{}", encode(id)), Some(json!({ "role": role }).to_string())),
         ["role-group", "remove", id] => ("DELETE", format!("/api/scim/role-groups/{}", encode(id)), None),
         ["token", "create", tenant, rest @ ..] if !tenant.starts_with("--") => {
-            let body = json!({ "tenant": tenant, "sso": flag(rest, "--sso"), "label": flag(rest, "--label") });
+            let body = json!({ "tenant": tenant, "sso": flag(rest, "--sso"), "label": flag(rest, "--label"), "expiresInDays": number(rest, "--days")? });
             ("POST", "/api/scim/tokens".into(), Some(body.to_string()))
+        }
+        ["token", "rotate", id, rest @ ..] if !id.starts_with("--") && rest.chunks(2).all(|p| matches!(p, ["--days" | "--keep-old-hours", _])) => {
+            let body = json!({ "expiresInDays": number(rest, "--days")?, "keepOldHours": number(rest, "--keep-old-hours")? });
+            ("POST", format!("/api/scim/tokens/{}/rotate", encode(id)), Some(body.to_string()))
         }
         ["token", "revoke", id] => ("DELETE", format!("/api/scim/tokens/{}", encode(id)), None),
         ["google"] | ["google", "status"] => ("GET", "/api/scim/google".into(), None),
         ["google", "sync"] => ("POST", "/api/scim/google/sync".into(), Some(json!({}).to_string())),
         ["google", "sync", "--force"] => ("POST", "/api/scim/google/sync".into(), Some(json!({ "force": true }).to_string())),
         _ => {
-            return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team> | role-mappings | role map <team> <role> [--org] | role show <id> | role unmap <id> | role-groups | role-group add <tenant> <group> <role> [--external-id ID] | role-group show <id> | role-group set-role <id> <role> | role-group remove <id> | google [status] | google sync [--force]".into());
+            return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] [--days N] | token rotate <id> [--days N] [--keep-old-hours N] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team> | role-mappings | role map <team> <role> [--org] | role show <id> | role unmap <id> | role-groups | role-group add <tenant> <group> <role> [--external-id ID] | role-group show <id> | role-group set-role <id> <role> | role-group remove <id> | google [status] | google sync [--force]".into());
         }
     })
 }
@@ -1329,15 +1338,27 @@ fn service_token_created(res: &Value) -> String {
     out
 }
 
-/// What `botctl scim token create` prints: the token once, and where the IdP sends it.
+/// What `botctl scim token create` and `rotate` print: the token once, where the IdP
+/// sends it, when it expires, and when the token it replaced stops.
 fn scim_created(res: &Value) -> String {
     let t = &res["scimToken"];
+    let days = (t["expiresAt"].as_i64().unwrap_or_default() - now_ms() + 12 * 3_600_000) / 86_400_000;
     let mut out = format!(
-        "Created SCIM token {} for tenant {}.\n\n{}\n\nIt is shown only once; paste it into the IdP's provisioning settings as the secret (bearer) token.\nTenant URL: https://<your-host>/scim/v2",
+        "{} SCIM token {} for tenant {}, for {days} days.\n\n{}\n\nIt is shown only once; paste it into the IdP's provisioning settings as the secret (bearer) token.\nTenant URL: https://<your-host>/scim/v2",
+        if res["replaced"].is_object() { "Rotated: new" } else { "Created" },
         t["id"].as_str().unwrap_or_default(),
         t["tenant"].as_str().unwrap_or_default(),
         res["token"].as_str().unwrap_or_default(),
     );
+    if let Some(old) = res["replaced"]["id"].as_str() {
+        let left = res["replaced"]["endsAt"].as_i64().unwrap_or_default() - now_ms();
+        let (hours, minutes) = (left / 3_600_000, (left + 59_999) / 60_000);
+        out.push_str(&match left {
+            l if l <= 0 => format!("\nThe old token {old} stopped working."),
+            _ if hours >= 1 => format!("\nThe old token {old} keeps working for about {hours} more hours: update the IdP before then."),
+            _ => format!("\nThe old token {old} keeps working for about {minutes} more minutes: update the IdP before then."),
+        });
+    }
     if let Some(p) = t["ssoProvider"].as_str() {
         out.push_str(&format!("\nexternalId must be each person's subject in the SSO provider {p} (Entra: map objectId to externalId)."));
     }
@@ -1847,7 +1868,7 @@ fn run(args: &[String]) -> Result<String, String> {
             let (method, path, body) = scim_request(rest)?;
             let res = api(Cred::Operator, method, &path, body)?;
             match rest {
-                ["token", "create", ..] => Ok(scim_created(&serde_json::from_str(&res).map_err(|e| e.to_string())?)),
+                ["token", "create" | "rotate", ..] => Ok(scim_created(&serde_json::from_str(&res).map_err(|e| e.to_string())?)),
                 ["token", "revoke", ..] => Ok("Revoked. The IdP can't provision with it any more; its users stay as they are.".into()),
                 _ => Ok(pretty(res)),
             }
@@ -3215,11 +3236,20 @@ mod tests {
     fn scim_commands() {
         let req = |a: &[&str]| scim_request(a).map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())));
         assert_eq!(req(&["tokens"]), Ok(("GET", "/api/scim/tokens".into(), None)));
-        assert_eq!(req(&["token", "create", "okta"]), Ok(("POST", "/api/scim/tokens".into(), Some(json!({ "tenant": "okta", "sso": null, "label": null })))));
+        assert_eq!(req(&["token", "create", "okta"]), Ok(("POST", "/api/scim/tokens".into(), Some(json!({ "tenant": "okta", "sso": null, "label": null, "expiresInDays": null })))));
         assert_eq!(
-            req(&["token", "create", "entra", "--sso", "work", "--label", "Entra prod"]),
-            Ok(("POST", "/api/scim/tokens".into(), Some(json!({ "tenant": "entra", "sso": "work", "label": "Entra prod" }))))
+            req(&["token", "create", "entra", "--sso", "work", "--label", "Entra prod", "--days", "90"]),
+            Ok(("POST", "/api/scim/tokens".into(), Some(json!({ "tenant": "entra", "sso": "work", "label": "Entra prod", "expiresInDays": 90 }))))
         );
+        assert!(req(&["token", "create", "okta", "--days", "soon"]).is_err());
+        assert_eq!(req(&["token", "rotate", "st1"]), Ok(("POST", "/api/scim/tokens/st1/rotate".into(), Some(json!({ "expiresInDays": null, "keepOldHours": null })))));
+        assert_eq!(
+            req(&["token", "rotate", "st 1", "--keep-old-hours", "0", "--days", "180"]),
+            Ok(("POST", "/api/scim/tokens/st%201/rotate".into(), Some(json!({ "expiresInDays": 180, "keepOldHours": 0 }))))
+        );
+        assert!(req(&["token", "rotate"]).is_err());
+        assert!(req(&["token", "rotate", "st1", "--keep-old"]).is_err());
+        assert!(req(&["token", "rotate", "st1", "--label", "x"]).is_err());
         assert_eq!(req(&["token", "revoke", "st1"]), Ok(("DELETE", "/api/scim/tokens/st1".into(), None)));
         assert!(req(&["token", "create"]).is_err());
         assert!(req(&["token", "create", "--sso", "work"]).is_err());
@@ -3272,6 +3302,15 @@ mod tests {
         assert!(out.contains("sbp_x") && out.contains("shown only once") && out.contains("/scim/v2") && out.contains("objectId") && out.contains("SCIM=on"), "{out}");
         let on = scim_created(&json!({ "token": "sbp_y", "enabled": true, "scimToken": { "id": "st2", "tenant": "okta" } }));
         assert!(!on.contains("SCIM=on") && !on.contains("objectId"), "{on}");
+        let year = json!({ "token": "sbp_z", "enabled": true, "scimToken": { "id": "st3", "tenant": "okta", "expiresAt": now_ms() + 365 * 86_400_000 } });
+        assert!(scim_created(&year).contains("for 365 days"), "{}", scim_created(&year));
+        let rotated = json!({ "token": "sbp_n", "enabled": true, "scimToken": { "id": "st4", "tenant": "okta", "expiresAt": now_ms() + 86_400_000 }, "replaced": { "id": "st3", "endsAt": now_ms() + 24 * 3_600_000 + 60_000 } });
+        let out = scim_created(&rotated);
+        assert!(out.starts_with("Rotated") && out.contains("st3 keeps working for about 24 more hours"), "{out}");
+        let now = scim_created(&json!({ "token": "sbp_n", "enabled": true, "scimToken": { "id": "st4", "tenant": "okta" }, "replaced": { "id": "st3", "endsAt": 0 } }));
+        assert!(now.contains("st3 stopped working"), "{now}");
+        let hour = scim_created(&json!({ "token": "sbp_n", "enabled": true, "scimToken": { "id": "st4", "tenant": "okta" }, "replaced": { "id": "st3", "endsAt": now_ms() + 3_600_000 - 5_000 } }));
+        assert!(hour.contains("st3 keeps working for about 60 more minutes"), "a one-hour overlap isn't over: {hour}");
     }
 
     #[test]
