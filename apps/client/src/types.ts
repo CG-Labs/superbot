@@ -1288,6 +1288,15 @@ export interface MyResidency {
   machine?: { id: string; state: string; region: string; inRegion: boolean; host?: string | null; hostRegion?: string | null } | null;
   backups?: { kept: number; inRegion: number; outside: number };
   modelRoutes?: { inRegion: boolean; gap: string | null };
+  /** Where the server's own copy of your account and chats is, as its operator states it (ADR 0184). Missing from servers before it. */
+  serverData?: {
+    region: string | null;
+    inRegion: boolean;
+    /** Whether the server's backups are kept in the pin's region too (they can be elsewhere while `region` matches). */
+    backupsInRegion?: boolean;
+    /** The server holds every pin to its own region (RESIDENCY_SERVER_DATA=require), so being outside it is a fault. */
+    required?: boolean;
+  };
   /** The pins whose residency report you can get. */
   reports: ("user" | "team")[];
 }
