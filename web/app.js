@@ -2111,7 +2111,8 @@ function renderStatus() {
   $("incidents-list").innerHTML = incidents.incidents.map((i) => `<div class="card" data-incident="${esc(i.id)}">
       <div class="bar"><b>${esc(i.title)}</b>
         <span class="sub">${esc(IMPACTS[i.impact] || i.impact)} · ${esc(i.state)}${i.components.length ? ` · ${esc(i.components.map(componentName).join(", "))}` : ""}${i.resolvedAt ? ` · resolved ${esc(fmt(i.resolvedAt))}` : ""}</span>
-        <button type="button" class="btn push" data-act="delete-incident" title="For one posted by mistake. Resolve real ones.">Delete</button></div>
+        <a class="btn push" href="/api/status/incidents/${key(i.id)}/review?format=markdown" download title="A draft of the incident review from botd's records (ADR 0201), as Markdown. Names nobody. Audited.">Draft review</a>
+        <button type="button" class="btn" data-act="delete-incident" title="For one posted by mistake. Resolve real ones.">Delete</button></div>
       ${i.updates.map((u) => `<p class="use"><b>${esc(u.state)}</b> ${esc(u.body)} <span class="sub">${esc(fmt(u.createdAt))}</span></p>`).join("")}
       <form class="bar" data-act="incident-update" autocomplete="off">
         <select name="state" title="State">${stateOptions(i.state === "resolved" ? "resolved" : i.state)}</select>

@@ -30,7 +30,7 @@ A TAM doesn't replace support: tickets still go to `<support-email>` or `<suppor
 | Quarterly | [Business review](qbr-template.md) | The customer's sponsor and owner | The review document, actions with owners |
 | Twice a year | Restore drill on their deployment, times recorded against the RTO | The Provider's on-call engineer and the customer's owner | Drill record |
 | Before each upgrade | Release notes and any action needed; the change window | The customer's owner | Agreed window |
-| Within 5 business days of a Severity 1 | The incident review, shared and walked through | The customer's owner and sponsor | Actions with owners |
+| Within 5 business days of a Severity 1 | The incident review ([drafted from botd's records](incident-review.md#the-review-draft)), shared and walked through | The customer's owner and sponsor | Actions with owners |
 
 The health score is a prompt, not a verdict: a TAM who sees a signal at risk calls the customer before the next scheduled check-in, and a TAM who knows something the score can't (a reorganisation, a merger, a champion leaving) acts on that too.
 
