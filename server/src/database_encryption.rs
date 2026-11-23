@@ -99,6 +99,11 @@ impl DbKey {
         let hex: Zeroizing<String> = Zeroizing::new(tag.as_ref().iter().map(|b| format!("{b:02x}")).collect());
         DbKey(Zeroizing::new(format!("x'{}'", hex.as_str())))
     }
+
+    /// The key as SQLCipher takes it in `ATTACH ... KEY`.
+    pub(crate) fn raw(&self) -> &str {
+        self.0.as_str()
+    }
 }
 
 /// What a database file is, from its first bytes.
@@ -130,6 +135,29 @@ static KEY: OnceLock<DbKey> = OnceLock::new();
 
 pub fn install(key: DbKey) {
     let _ = KEY.set(key);
+}
+
+/// The key botd's database is open with. None: it is plain.
+pub fn installed() -> Option<&'static DbKey> {
+    KEY.get()
+}
+
+/// Brings a region's chat store (ADR 0215) under `key`, botd's own database key: encrypts
+/// a plain one when botd's is encrypted, and re-encrypts one `previous` opens, mid-rotation
+/// (ADR 0096), with the same verified copy as botd's own. No plain copy is kept: the store
+/// holds only chats, already in its region's backups. True if it changed.
+pub fn prepare_store(path: &Path, key: Option<&DbKey>, previous: Option<&DbKey>) -> Result<bool, String> {
+    let shown = path.display();
+    match (format(path)?, key) {
+        (Format::Missing, _) | (Format::Plain, None) => Ok(false),
+        (Format::Plain, Some(k)) => reencrypt(path, None, Some(k), None).map(|_| true).map_err(|e| format!("{shown}: {e}")),
+        (Format::Encrypted, None) => Err(format!("{shown} is encrypted but botd's database isn't; a chat store is kept like botd's own database (ADR 0215)")),
+        (Format::Encrypted, Some(k)) if opens(path, k) => Ok(false),
+        (Format::Encrypted, Some(k)) => match previous.filter(|p| opens(path, p)) {
+            Some(p) => reencrypt(path, Some(p), Some(k), None).map(|_| true).map_err(|e| format!("{shown}: {e}")),
+            None => Err(format!("{shown} doesn't open with botd's database key: {WRONG_KEY}")),
+        },
+    }
 }
 
 /// A connection to botd's database: with its key when it is encrypted.

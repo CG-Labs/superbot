@@ -13,6 +13,11 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+mod chats;
+pub use chats::{ChatMove, ChatStore};
+#[cfg(test)]
+pub(crate) use chats::Scratch;
+
 #[derive(Clone, Serialize)]
 pub struct Bot {
     pub id: String,
@@ -252,7 +257,8 @@ pub type SeatCap = Box<dyn Fn() -> Option<u32> + Send + Sync>;
 /// The connection, and the seat limit every way of adding or re-enabling a user checks
 /// under the same lock. Unset (as in most tests): no limit.
 /// `.2`: TEAMS=on (ADR 0087), so people in no team share Bots with nobody.
-pub struct Db(Mutex<Connection>, std::sync::OnceLock<SeatCap>, std::sync::atomic::AtomicBool, crate::obs::Metrics, crate::obs::trace::Tracer);
+/// `.5`: the regions' chat stores attached at startup (ADR 0215).
+pub struct Db(Mutex<Connection>, std::sync::OnceLock<SeatCap>, std::sync::atomic::AtomicBool, crate::obs::Metrics, crate::obs::trace::Tracer, std::sync::OnceLock<chats::ChatStores>);
 
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -4643,7 +4649,7 @@ impl Db {
             tx.pragma_update(None, "user_version", i as i64 + 1)?;
             tx.commit()?;
         }
-        Ok(Db(Mutex::new(c), std::sync::OnceLock::new(), std::sync::atomic::AtomicBool::new(false), crate::obs::Metrics::default(), crate::obs::trace::Tracer::default()))
+        Ok(Db(Mutex::new(c), std::sync::OnceLock::new(), std::sync::atomic::AtomicBool::new(false), crate::obs::Metrics::default(), crate::obs::trace::Tracer::default(), std::sync::OnceLock::new()))
     }
 
     fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -4873,18 +4879,20 @@ impl Db {
         let owners: Vec<&str> = owners.iter().map(String::as_str).collect();
         let question = question.map(|q| redact::value_for(&owners, q.clone()).to_string());
         let c = self.c();
-        c.execute(
-            "INSERT INTO messages (bot_id, role, text, question, error, status, from_bot, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            params![bot_id, role, redact::text_for(&owners, text), question, error, status, from_bot, now()],
-        )
-        .unwrap();
-        let id = c.last_insert_rowid();
+        let id = self
+            .insert_chat_message(
+                &c,
+                bot_id,
+                &["bot_id", "role", "text", "question", "error", "status", "from_bot", "created_at"],
+                params![bot_id, role, redact::text_for(&owners, text), question, error, status, from_bot, now()],
+            )
+            .unwrap();
         drop(c);
         self.message(id).unwrap()
     }
 
     pub fn last_id(&self) -> i64 {
-        self.c().query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| r.get(0)).unwrap_or(0)
+        self.top_message_id(&self.c())
     }
 
     /// The Bot's chat bubbles written after message `after`.
@@ -4895,7 +4903,7 @@ impl Db {
     }
 
     pub fn set_status(&self, id: i64, status: &str) {
-        self.c().execute("UPDATE messages SET status = ? WHERE id = ?", params![status, id]).unwrap();
+        self.on_chats(&self.c(), "UPDATE {messages} SET status = ? WHERE id = ?", params![status, id]).unwrap();
     }
 
     /// Free text (name, email, user agent) is masked as `record` masks it.
@@ -4905,13 +4913,13 @@ impl Db {
             *v = audit::redact_text(v);
         }
         let who = serde_json::to_value(&who).map(|v| redact::value(v).to_string()).unwrap_or_default();
-        self.c().execute("UPDATE messages SET requested_by = ? WHERE id = ?", params![who, id]).unwrap();
+        self.on_chats(&self.c(), "UPDATE {messages} SET requested_by = ? WHERE id = ?", params![who, id]).unwrap();
     }
 
     pub fn set_question(&self, id: i64, q: &Value) {
         let owner = self.message(id).and_then(|m| self.bot_owner(&m.bot_id));
         let q = redact::value_for(owner.as_deref().as_slice(), q.clone()).to_string();
-        self.c().execute("UPDATE messages SET question = ? WHERE id = ?", params![q, id]).unwrap();
+        self.on_chats(&self.c(), "UPDATE {messages} SET question = ? WHERE id = ?", params![q, id]).unwrap();
     }
 
     /// Who owns a Bot: whose own secrets are redacted from what it writes (ADR 0029).
@@ -5014,11 +5022,8 @@ impl Db {
             s.query_map(params![cutoff, at, id, limit], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
         };
         let mut deleted = 0;
-        {
-            let mut del = tx.prepare("DELETE FROM messages WHERE id = ?")?;
-            for (_, id) in &ids {
-                deleted += del.execute([id])?;
-            }
+        for (_, id) in &ids {
+            deleted += self.on_chats(&tx, "DELETE FROM {messages} WHERE id = ?", &[id])?;
         }
         tx.commit()?;
         Ok((deleted, ids.last().copied()))
@@ -5070,7 +5075,12 @@ impl Db {
     /// Deletes the Bot unless its chat is held (`bot_chat_held`), in one statement, so a hold
     /// placed at any moment before wins. Whether it was deleted.
     pub fn delete_bot_unless_held(&self, id: &str) -> bool {
-        self.c().execute(&format!("DELETE FROM bots WHERE id = ?1 AND NOT {HELD_CHAT}"), [id]).unwrap() > 0
+        let c = self.c();
+        let gone = c.execute(&format!("DELETE FROM bots WHERE id = ?1 AND NOT {HELD_CHAT}"), [id]).unwrap() > 0;
+        if gone {
+            self.on_chats(&c, "DELETE FROM {messages} WHERE bot_id = ?1", &[&id]).unwrap();
+        }
+        gone
     }
 
     /// Whether there was a hold to release.
@@ -5084,18 +5094,14 @@ impl Db {
         let mut c = self.c();
         let tx = c.transaction().unwrap();
         for i in 0..n {
-            tx.execute(
-                "INSERT INTO messages (bot_id, role, text, from_bot, created_at) VALUES (?1, 'user', ?2, ?3, ?4)",
-                params![bot_id, format!("old {i}"), from_bot, at],
-            )
-            .unwrap();
+            self.insert_chat_message(&tx, bot_id, &["bot_id", "role", "text", "from_bot", "created_at"], params![bot_id, "user", format!("old {i}"), from_bot, at]).unwrap();
         }
         tx.commit().unwrap();
     }
 
     #[cfg(test)]
     pub fn set_message_time(&self, id: i64, at: i64) {
-        self.c().execute("UPDATE messages SET created_at = ?1 WHERE id = ?2", params![at, id]).unwrap();
+        self.on_chats(&self.c(), "UPDATE {messages} SET created_at = ?1 WHERE id = ?2", params![at, id]).unwrap();
     }
 
     #[cfg(test)]
@@ -7029,15 +7035,18 @@ impl Db {
             }
         }
         out.routines = run("DELETE FROM routines WHERE author_id = ?", &[&user_id])?;
-        out.messages = run(
-            &format!(
-                "UPDATE messages SET text = '{ERASED_TEXT}', question = NULL, requested_by = NULL
-                 WHERE role IN ('user', 'routine') AND {SENT_BY_ANY}
-                    OR from_bot IN (SELECT value FROM json_each(?2))"
-            ),
-            &[&user_id, &bots_json],
-        )?;
-        run(&format!("UPDATE messages SET requested_by = NULL WHERE {SENT_BY_ANY}"), &[&user_id])?;
+        out.messages = self
+            .on_chats(
+                &tx,
+                &format!(
+                    "UPDATE {{messages}} SET text = '{ERASED_TEXT}', question = NULL, requested_by = NULL
+                     WHERE role IN ('user', 'routine') AND {SENT_BY_ANY}
+                        OR from_bot IN (SELECT value FROM json_each(?2))"
+                ),
+                &[&user_id, &bots_json],
+            )
+            .map_err(db_err)?;
+        self.on_chats(&tx, &format!("UPDATE {{messages}} SET requested_by = NULL WHERE {SENT_BY_ANY}"), &[&user_id]).map_err(db_err)?;
         out.approvals = run("UPDATE approvals SET decided_by = ?2, note = NULL WHERE decided_by = ?1", &[&user_id, &pseudonym])?;
         out.disk_reports = run(
             "UPDATE machines SET disk_files = NULL, disk_files_partial = 0, disk_files_at = NULL WHERE user_id = ? AND (disk_files IS NOT NULL OR disk_files_at IS NOT NULL)",
