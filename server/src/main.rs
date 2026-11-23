@@ -988,6 +988,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/auth/sso/{id}/slo", get(sso::slo_get).post(sso::slo_post))
         .route("/sso/{id}/saml", get(sso::saml_status))
         .route("/sso/{id}/saml/idp-metadata", put(sso::saml_import))
+        .route("/sso/role-mappings", get(sso::saml_roles::list).post(sso::saml_roles::create))
+        .route("/sso/role-mappings/{id}", get(sso::saml_roles::get).delete(sso::saml_roles::delete))
         .route("/users", get(users::list_users).post(users::create_user))
         .route("/users/{key}", get(users::get_user).patch(users::update_user))
         .route("/users/{key}/login-codes", post(users::create_login_code))

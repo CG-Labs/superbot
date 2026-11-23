@@ -46,12 +46,15 @@ pub enum Kind {
     /// `SSO_<ID>_PRIVATE_KEY` with `sp_cert` (base64 DER) when that is set, else generated.
     /// `encryption` takes encrypted assertions (ADR 0150) with a key of their own, likewise
     /// `SSO_<ID>_ENCRYPTION_PRIVATE_KEY` with `enc_cert`, else generated. With `metadata_trust`,
-    /// the IdP metadata's signature is checked against its certificates (ADR 0151).
+    /// the IdP metadata's signature is checked against its certificates (ADR 0151). With
+    /// `attributes.groups`, only people in one of `required_groups` (if any) sign in, and
+    /// group-to-role mappings apply (ADR 0160).
     SamlSp {
         entity_id: String,
         sp_entity_id: String,
         source: IdpSource,
         attributes: Attributes,
+        required_groups: Vec<String>,
         allowed_domains: Vec<String>,
         sign_requests: bool,
         sp_cert: Option<String>,
