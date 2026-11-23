@@ -154,14 +154,14 @@ impl KeyVault {
 
 impl Inner {
     /// The Key Vault name for `name` in `scope`, or None if it would be too long to exist.
-    fn vault_id(&self, scope: Scope, name: &str) -> Option<String> {
-        let n = format!("{}-{}-{}", self.cfg.prefix, scope.as_str(), name.replace('_', "-"));
+    fn vault_id(&self, scope: &Scope, name: &str) -> Option<String> {
+        let n = format!("{}-{}-{}", self.cfg.prefix, scope.folder('-'), name.replace('_', "-"));
         (n.len() <= MAX_NAME).then_some(n)
     }
 
     /// The secret name back to botd's `NAME`, if it is in `scope`'s folder.
-    fn name_in(&self, scope: Scope, secret: &str) -> Option<String> {
-        let head = format!("{}-{}-", self.cfg.prefix, scope.as_str());
+    fn name_in(&self, scope: &Scope, secret: &str) -> Option<String> {
+        let head = format!("{}-{}-", self.cfg.prefix, scope.folder('-'));
         let rest = secret.get(..head.len()).filter(|h| h.eq_ignore_ascii_case(&head)).map(|_| &secret[head.len()..])?;
         (!rest.is_empty()).then(|| rest.replace('-', "_").to_ascii_uppercase())
     }
@@ -264,7 +264,7 @@ impl Inner {
     }
 
     async fn read(&self, scope: Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error> {
-        let Some(id) = self.vault_id(scope, name) else { return Ok(None) };
+        let Some(id) = self.vault_id(&scope, name) else { return Ok(None) };
         let url = format!("{}/secrets/{id}?api-version={API_VERSION}", self.cfg.url);
         let Some(body) = self.get(&url, &id).await? else { return Ok(None) };
         let v: Value = serde_json::from_slice(&body).map_err(|e| unavailable(&id, e))?;
@@ -300,7 +300,7 @@ impl Inner {
             for item in items {
                 let id = item["id"].as_str().and_then(|id| id.split_once("/secrets/")).map(|(_, s)| s).filter(|s| !s.is_empty() && !s.contains('/'));
                 let id = id.ok_or_else(|| Error::Unavailable("Azure Key Vault: listing secrets gave an entry with no secret id".into()))?;
-                if let Some(name) = self.name_in(scope, id) {
+                if let Some(name) = self.name_in(&scope, id) {
                     out.push(name);
                 }
             }
@@ -631,10 +631,15 @@ mod tests {
         let (url, _) = stand_in();
         let kv = KeyVault::new(config(&url, &[("AZURE_KEYVAULT_PREFIX", "Acme-SuperBot")])).unwrap();
         let i = &kv.inner;
-        assert_eq!(i.vault_id(Scope::Bots, "OPENAI_API_KEY").as_deref(), Some("acme-superbot-bots-OPENAI-API-KEY"));
-        assert_eq!(i.name_in(Scope::Bots, "ACME-SUPERBOT-BOTS-openai-api-key").as_deref(), Some("OPENAI_API_KEY"));
-        assert_eq!(i.name_in(Scope::Server, "acme-superbot-bots-X"), None);
-        assert_eq!(i.vault_id(Scope::Server, &"A".repeat(120)), None, "too long to exist in Key Vault");
+        assert_eq!(i.vault_id(&Scope::Bots, "OPENAI_API_KEY").as_deref(), Some("acme-superbot-bots-OPENAI-API-KEY"));
+        assert_eq!(i.name_in(&Scope::Bots, "ACME-SUPERBOT-BOTS-openai-api-key").as_deref(), Some("OPENAI_API_KEY"));
+        assert_eq!(i.name_in(&Scope::Server, "acme-superbot-bots-X"), None);
+        assert_eq!(i.vault_id(&Scope::Server, &"A".repeat(120)), None, "too long to exist in Key Vault");
+        let ua1 = Scope::user("ua1").unwrap();
+        assert_eq!(i.vault_id(&ua1, "OPENAI_API_KEY").as_deref(), Some("acme-superbot-users-ua1-OPENAI-API-KEY"));
+        assert_eq!(i.name_in(&ua1, "ACME-SUPERBOT-USERS-UA1-openai-api-key").as_deref(), Some("OPENAI_API_KEY"));
+        assert_eq!(i.name_in(&ua1, "acme-superbot-users-ua10-OPENAI-API-KEY"), None, "another user's, whose id starts the same");
+        assert_eq!(i.name_in(&Scope::Bots, "acme-superbot-users-ua1-X"), None);
         assert_eq!(resource_of(&url::Url::parse("https://kv1.vault.azure.cn").unwrap()), "https://vault.azure.cn");
         assert_eq!(resource_of(&url::Url::parse("https://kv1.vault.usgovcloudapi.net").unwrap()), "https://vault.usgovcloudapi.net");
     }
