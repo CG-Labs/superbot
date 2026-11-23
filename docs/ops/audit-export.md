@@ -1,6 +1,6 @@
 # Audit log: SIEM export and tamper evidence
 
-Every audit event is sealed onto a hash chain as it is written, so a changed, removed, added or reordered event shows. Every hour botd signs a checkpoint of the chain's head, and can have each one timestamped by an RFC 3161 time-stamping authority (TSA). botd can also send every event to your SIEM as it happens: JSON lines over HTTPS, or RFC 5424 syslog over TLS. Or it can archive them in batches to an S3 bucket with Object Lock, where nobody can change or delete them until their retention ends ([below](#archive-events-to-write-once-s3)). The chain and checkpoints are always on and need nothing. Timestamps and the export are off until you set them. Design: [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md), [ADR 0149](../adr/0149-signed-and-timestamped-audit-checkpoints.md) and [ADR 0154](../adr/0154-write-once-s3-audit-archive.md).
+Every audit event is sealed onto a hash chain as it is written, so a changed, removed, added or reordered event shows. Every hour botd signs a checkpoint of the chain's head, and can have each one timestamped by an RFC 3161 time-stamping authority (TSA). botd can also send every event to your SIEM as it happens: JSON lines over HTTPS, or RFC 5424 syslog over TLS. Or it can archive them in batches to an S3 bucket with Object Lock, where nobody can change or delete them until their retention ends ([below](#archive-events-to-write-once-s3)). The chain and checkpoints are always on and need nothing. Timestamps and the export are off until you set them. Design: [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md), [ADR 0149](../adr/0149-signed-and-timestamped-audit-checkpoints.md), [ADR 0154](../adr/0154-write-once-s3-audit-archive.md) and [ADR 0163](../adr/0163-checking-the-audit-archive.md).
 
 ## Check the chain
 
@@ -21,12 +21,13 @@ It prints the result and exits 1 if the chain is broken. The same is `GET /api/a
   - `pin`: it differs from a hash you gave (below).
   - `checkpoint`: a signed checkpoint doesn't hold (below).
   - `timestamp`: a checkpoint's RFC 3161 token doesn't hold (below).
+  - `archive`: it differs from the write-once archive, with `--archive` ([below](#check-the-archive)).
 - `error`: the log couldn't be read to the end. The check fails.
 - `checkpoints`: what the check found about checkpoints and timestamps (below).
 
 `--from <id>` and `--to <id>` check only those events, which is quicker on a large log. A range starting after the first event takes that event's link as stored. If erased events in the range are named by an erasure after `--to`, the check carries on to the head, and `range` in the answer shows that.
 
-botd also checks itself a minute after starting and then once a day. Each check, and each one through the API, is recorded as `audit.verified` with the result and the head's hash; a failed check's `reason` is the first break's code (`contents`, `link`, `pin`, `unsealed`, `erased`, `checkpoint`, `timestamp`) or `unreadable`, which `botctl support-bundle` shows. A broken chain logs a warning that links here.
+botd also checks itself a minute after starting and then once a day. Each check, and each one through the API, is recorded as `audit.verified` with the result and the head's hash; a failed check's `reason` is the first break's code (`contents`, `link`, `pin`, `unsealed`, `erased`, `checkpoint`, `timestamp`, `archive`) or `unreadable`, which `botctl support-bundle` shows. A broken chain logs a warning that links here.
 
 `botctl audit chain` (or `GET /api/audit/chain`) shows it all at once: the head, the last checkpoint and timestamp, how many events since, whether timestamping is failing, how far the export is behind, and the last check's result. In the app, the audit log's **Chain** button shows the same, with **Check now**.
 
@@ -40,7 +41,7 @@ botctl audit verify --pin 4182:3f1c...e9a0 --pin 9921:77ab...0c12
 
 Each pin is `match`, `mismatch`, `gone` (older than what retention deleted), `missing` (newer than that, yet not there) or `outside` (not in `--from`/`--to`). A mismatch or a missing event fails the check: the history on the host is not the one your SIEM saw.
 
-Without a SIEM, signed and timestamped checkpoints (next) do part of this job.
+Without a SIEM, signed and timestamped checkpoints (next) do part of this job, and a write-once archive does it for every event ([below](#check-the-archive)).
 
 ## Checkpoints and timestamps
 
@@ -222,7 +223,41 @@ The key botd uses needs, on the bucket (`arn:aws:s3:::<bucket>`), `s3:GetBucketO
 - **Retries** write the same events to the same key, even after a restart (botd saves each batch's last id before writing it), so an object written whose cursor wasn't saved gets a second version of the same events, not an overlapping object.
 - **Status**: `botctl audit siem` shows `kind: "s3"` and `archive`, with the bucket, lock and the last object written (key, version, events, lock mode and `retainUntil`). The app's audit log says when the last object's lock ends.
 
-Read it back with any S3 tool, for example `aws s3 cp --recursive s3://<bucket>/<prefix>/ ./audit/`, then `cat audit/*/*/*/*.jsonl | jq -c '{id, chainPrev, chainHash}'` to see the chain run through. Pin a hash from it with `botctl audit verify --pin <id>:<chainHash>`.
+Read it back with any S3 tool, for example `aws s3 cp --recursive s3://<bucket>/<prefix>/ ./audit/`, then `cat audit/*/*/*/*.jsonl | jq -c '{id, chainPrev, chainHash}'` to see the chain run through. Or let botd check all of it (next).
+
+### Check the archive
+
+```sh
+botctl audit verify --archive
+```
+
+This checks the chain as usual and also reads the whole archive (`GET /api/audit/verify?archive=on`). botd lists every version of every object under the prefix. For each object it reads the version written first, which Object Lock keeps whatever was written to that key later. Then it checks:
+
+- each object is what its key and metadata say, and is locked (unless the lock is `off`);
+- the chain runs from event to event and object to object with no gap;
+- every signed checkpoint in the archive holds under the trusted keys (botd's own, or `--key`);
+- the archive begins with the first event botd sent it, and reaches the last event botd says it delivered;
+- every archived event has the same hash in this server's log. This catches a log rebuilt after an event was changed: its own chain verifies, but it no longer matches what was archived. It's the same as pinning every event (`--pin`). While the event is still here, what the archive says it was must also match this server's row: its fields, and, unless an erasure has since rewritten them, the personal ones.
+
+The check fails, and exits 1, if any of that doesn't hold. `firstBroken` then names the first event here that differs from the archive (reason `archive`). The answer's `archive` block counts `objects`, `events`, `matched`, `gone` (deleted here by retention, with the anchor's hash still checked), `mismatched`, `altered`, `missing`, `locked`, `lockExpired` and `checkpoints`. It also counts `repeated` (events a restarted export wrote twice), `retried` (extra identical versions of an object) and `hidden` (objects behind a delete marker, which are still read). `firstProblems` lists the first 20 problems, each with a `key`, `id` and one of these reasons:
+
+| Reason | Meaning |
+|---|---|
+| `mismatch`, `missing` | An archived event has another hash in this server's log, or isn't in it, and retention didn't delete it |
+| `contents` | An archived event has this server's hash but says something else: the archive's copy was changed. Events retention deleted here can't be compared this way |
+| `link` | An event doesn't link to the one before it: an object is missing, or isn't botd's |
+| `behind` | The archive ends before the last event botd delivered to it: objects are missing at the end |
+| `start` | The archive begins after the first event botd sent it: objects are missing at the start. Archives started before this check was added aren't asked |
+| `overwritten` | A later version of an object differs from the one botd wrote. The first one is what's checked |
+| `metadata`, `order` | An object's key or metadata doesn't match its events, or they're out of order |
+| `unlocked` | An object has no lock. An ended lock is only counted, as `lockExpired` |
+| `checkpoint` | A signed checkpoint in the archive doesn't hold, even in a repeated batch |
+| `stray` | A key under the prefix that botd didn't write |
+| `unreadable` | An object couldn't be read or parsed |
+
+`--from` and `--to` read only the objects that hold those events, and every event in that range that botd has delivered must be there (`start` or `behind` otherwise; for an archive started before botd recorded where it began, only when the range reads something or reaches the last event delivered), and `--pin` and `--key` work as usual. The check costs one listing plus one `GET` per object (more for objects with several versions), four at a time. A year of 5-minute batches is about 100,000 objects, so use a range for frequent checks and run the whole archive less often, for example weekly from cron. `audit.verified` records the result.
+
+For this, the key botd uses also needs `s3:ListBucketVersions` on the bucket; export works without it. Without it the check fails, and the error names the missing right. It still needs no delete rights.
 
 Erased users' data stays in locked objects until their lock ends, like a SIEM or a backup: choose the period with your DPA in mind.
 

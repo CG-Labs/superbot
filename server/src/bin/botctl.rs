@@ -174,6 +174,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    team, or with --org across the server. Never admin
   botctl scim role show <id>                       A mapping and who it gave the role to
   botctl scim role unmap <id>                      Takes the role from everyone the mapping gave it to
+  botctl scim google                               The Google Workspace sync: settings and last passes
+  botctl scim google sync [--force]                A pass now. --force lets one that removes more
+                                                   people than GOOGLE_DIRECTORY_MAX_REMOVALS go ahead
   botctl sessions [<user>]                         Live sessions
   botctl session revoke <id>
   botctl session revoke-all <user>
@@ -199,13 +202,16 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl deny <id> [--remember | --remember-global]
   botctl audit [<limit>] [filters]                 Recent audit events, newest first
   botctl audit export [filters] > audit.csv        All matching events as CSV, oldest first
-  botctl audit verify [--pin <id>:<hash>]... [--from <id>] [--to <id>] [--key <hex>]...
+  botctl audit verify [--pin <id>:<hash>]... [--from <id>] [--to <id>] [--key <hex>]... [--archive]
                                                    Check the audit log's hash chain, its signed
                                                    checkpoints and their timestamps; names the first
                                                    break, exits 1 if there is one. --pin: a hash kept
                                                    elsewhere (your SIEM) the row must still have.
                                                    --from/--to: only those event ids. --key: trust only
-                                                   this checkpoint key (from botctl audit key)
+                                                   this checkpoint key (from botctl audit key).
+                                                   --archive: also read the write-once S3 archive,
+                                                   check it has no gaps, and hold every event here
+                                                   to the hash it has there
   botctl audit siem                                The SIEM export: sink, delivered, pending, failing
   botctl audit chain                               The chain's state: head, last checkpoint and
                                                    timestamp, export lag, last check
@@ -824,9 +830,10 @@ fn audit_query(rest: &[&str]) -> Result<String, String> {
     Ok(if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) })
 }
 
-/// `botctl audit verify [--pin <id>:<hash>]... [--from <id>] [--to <id>] [--key <hex>]...`:
+/// `botctl audit verify [--pin <id>:<hash>]... [--from <id>] [--to <id>] [--key <hex>]... [--archive]`:
 /// hashes kept elsewhere (a SIEM, an earlier check) to hold the chain to, the event ids
-/// to check, and the checkpoint keys to trust instead of botd's own.
+/// to check, the checkpoint keys to trust instead of botd's own, and whether to read the
+/// write-once archive too (ADR 0163).
 fn verify_query(rest: &[&str]) -> Result<String, String> {
     let (mut pins, mut keys, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
     let mut it = rest.iter();
@@ -834,6 +841,7 @@ fn verify_query(rest: &[&str]) -> Result<String, String> {
         match *a {
             "--pin" => pins.push(encode(it.next().ok_or("--pin needs <event id>:<hash>")?)),
             "--key" => keys.push(encode(it.next().ok_or("--key needs a public key in hex (botctl audit key)")?)),
+            "--archive" => pairs.push("archive=on".into()),
             o @ ("--from" | "--to") => {
                 let id = it.next().filter(|v| v.parse::<i64>().is_ok()).ok_or_else(|| format!("{o} needs an event id"))?;
                 pairs.push(format!("{}={id}", &o[2..]));
@@ -1104,8 +1112,8 @@ fn signup_request(args: &[&str]) -> Result<(&'static str, String, Option<String>
     })
 }
 
-/// `botctl scim ...`: SCIM provisioning tokens (ADR 0023), and links from SCIM groups to
-/// teams (ADR 0095).
+/// `botctl scim ...`: SCIM provisioning tokens (ADR 0023), links from SCIM groups to
+/// teams (ADR 0095), and the Google Workspace sync (ADR 0162).
 fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
     Ok(match args {
         [] | ["tokens"] | ["token", "list"] => ("GET", "/api/scim/tokens".into(), None),
@@ -1127,8 +1135,11 @@ fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
             ("POST", "/api/scim/tokens".into(), Some(body.to_string()))
         }
         ["token", "revoke", id] => ("DELETE", format!("/api/scim/tokens/{}", encode(id)), None),
+        ["google"] | ["google", "status"] => ("GET", "/api/scim/google".into(), None),
+        ["google", "sync"] => ("POST", "/api/scim/google/sync".into(), Some(json!({}).to_string())),
+        ["google", "sync", "--force"] => ("POST", "/api/scim/google/sync".into(), Some(json!({ "force": true }).to_string())),
         _ => {
-            return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team> | role-mappings | role map <team> <role> [--org] | role show <id> | role unmap <id>".into());
+            return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team> | role-mappings | role map <team> <role> [--org] | role show <id> | role unmap <id> | google [status] | google sync [--force]".into());
         }
     })
 }
@@ -2565,6 +2576,7 @@ mod tests {
         let key = "ab".repeat(32);
         assert_eq!(verify_query(&["--from", "10", "--to", "20", "--key", &key, "--pin", "12:ab"]).unwrap(), format!("?pin=12:ab&from=10&to=20&key={key}"));
         assert!(verify_query(&["--from", "x"]).is_err() && verify_query(&["--to"]).is_err() && verify_query(&["--key"]).is_err());
+        assert_eq!(verify_query(&["--archive", "--from", "10"]).unwrap(), "?archive=on&from=10");
     }
 
     #[test]
@@ -2984,6 +2996,11 @@ mod tests {
         assert_eq!(req(&["role", "map", "t1", "auditor", "--org"]), Ok(("POST", "/api/scim/role-mappings".into(), Some(json!({ "team": "t1", "role": "auditor", "scope": "org" })))));
         assert_eq!(req(&["role", "show", "sm 1"]), Ok(("GET", "/api/scim/role-mappings/sm%201".into(), None)));
         assert_eq!(req(&["role", "unmap", "sm1"]), Ok(("DELETE", "/api/scim/role-mappings/sm1".into(), None)));
+        assert_eq!(req(&["google"]), Ok(("GET", "/api/scim/google".into(), None)));
+        assert_eq!(req(&["google", "status"]), Ok(("GET", "/api/scim/google".into(), None)));
+        assert_eq!(req(&["google", "sync"]), Ok(("POST", "/api/scim/google/sync".into(), Some(json!({})))));
+        assert_eq!(req(&["google", "sync", "--force"]), Ok(("POST", "/api/scim/google/sync".into(), Some(json!({ "force": true })))));
+        assert!(req(&["google", "sync", "--hard"]).is_err());
         assert!(req(&["role", "map", "t1"]).is_err());
         assert!(req(&["role", "map", "--org", "t1"]).is_err());
         assert!(req(&["role", "map", "t1", "auditor", "--team"]).is_err());

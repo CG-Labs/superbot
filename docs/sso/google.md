@@ -84,6 +84,8 @@ Unlinking (`botctl user unlink`) stops new sign-ins; `botctl session revoke-all`
 
 **Or just in time** (Workspace only). With `SSO_GOOGLE_HOSTED_DOMAINS=example.com` and `SSO_GOOGLE_JIT_ROLE=member`, anyone in your Workspace becomes a member on first sign-in. If someone's email already belongs to another SuperBot user, sign-in is refused until an admin links them. To narrow it to some people, in the [Google Admin console](https://admin.google.com) restrict access to the app under **Security → API controls → App access control**.
 
+**Or from your directory** (Workspace only). With `GOOGLE_DIRECTORY_SYNC=on` and `GOOGLE_DIRECTORY_SSO=google`, botd reads the people in groups you choose from your Workspace directory, makes their users, and links each one's Google sign-in; suspending someone in Google disables them here ([guide](google-workspace.md)).
+
 A person can have Google and Microsoft (or any other provider) identities linked to the same user: link each one.
 
 ## Apps
