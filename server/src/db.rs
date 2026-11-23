@@ -10057,6 +10057,12 @@ impl Db {
     }
 }
 
+/// How many schema changes this botd knows. A database whose `PRAGMA user_version` is past
+/// it was made by a newer botd.
+pub fn schema_version() -> i64 {
+    MIGRATIONS.len() as i64
+}
+
 #[cfg(test)]
 impl Db {
     /// A database encrypted under `key` (ADR 0116), without setting the process's key.
