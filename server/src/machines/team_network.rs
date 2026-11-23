@@ -113,10 +113,17 @@ pub fn subnet_for<'a>(app: &App, cp: &'a ControlPlane, m: &Machine) -> Option<&'
 pub async fn ensure(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, m: &Machine, by: &Who) -> Result<Option<TeamNetwork>, ProviderError> {
     let Some(s) = &cp.team_network else { return Ok(None) };
     let Some(team) = app.db.team_id_of(&m.user_id) else { return Ok(None) };
-    let label = label(&cp.label_prefix, &team, &m.region).ok_or_else(|| ProviderError::Api {
-        status: 400,
-        message: format!("a team network's label in {} would be longer than Linode takes; shorten MACHINE_LABEL_PREFIX", m.region),
-    })?;
+    // One made under an earlier MACHINE_LABEL_PREFIX is still the team's, with whatever
+    // the operator put on it: never a second one beside it.
+    let part = team_part(&team);
+    let earlier = p.team_networks("").await?.into_iter().find(|n| n.region == m.region && team_part_of(&n.label) == Some(part.as_str()));
+    let label = match earlier {
+        Some(n) => n.label,
+        None => label(&cp.label_prefix, &team, &m.region).ok_or_else(|| ProviderError::Api {
+            status: 400,
+            message: format!("a team network's label in {} would be longer than Linode takes; shorten MACHINE_LABEL_PREFIX", m.region),
+        })?,
+    };
     let n = p.ensure_team_network(&label, &m.region, &s.subnet).await?;
     if n.created {
         app.db.record(&by.event("machine.team_network_created").target("team_network", &n.id).details(json!({

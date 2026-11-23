@@ -701,15 +701,28 @@ impl MachineProvider for Linode {
         })
     }
 
+    /// Every VPC whose label starts with `prefix`, even one whose `machines` subnet was
+    /// renamed or removed (its subnet left empty): machines on it still have to leave.
     fn team_networks<'a>(&'a self, prefix: &'a str) -> Fut<'a, Vec<TeamNetwork>> {
         Box::pin(async move {
-            Ok(self
-                .all("/vpcs", None)
-                .await?
-                .iter()
-                .filter(|v| v["label"].as_str().is_some_and(|l| l.starts_with(prefix)))
-                .filter_map(|v| network(v, false).ok())
-                .collect())
+            let mut out = Vec::new();
+            for v in self.all("/vpcs", None).await? {
+                if !v["label"].as_str().is_some_and(|l| l.starts_with(prefix)) {
+                    continue;
+                }
+                out.push(match network(&v, false) {
+                    Ok(n) => n,
+                    Err(_) => TeamNetwork {
+                        id: v["id"].as_u64().ok_or_else(|| ProviderError::Transport("Linode sent a VPC we couldn't read".into()))?.to_string(),
+                        label: v["label"].as_str().unwrap_or_default().into(),
+                        region: v["region"].as_str().unwrap_or_default().into(),
+                        subnet_id: String::new(),
+                        subnet: String::new(),
+                        created: false,
+                    },
+                });
+            }
+            Ok(out)
         })
     }
 
@@ -1612,7 +1625,12 @@ mod tests {
         let (api, seen) = fake_api().await;
         let nets = api.team_networks("superbot-team-").await.unwrap();
         let labels: Vec<&str> = nets.iter().map(|n| n.label.as_str()).collect();
-        assert_eq!(labels, ["superbot-team-a-gb-lon", "superbot-team-far-gb-lon", "superbot-team-odd-gb-lon"], "ours only, each with its subnet");
+        assert_eq!(
+            labels,
+            ["superbot-team-a-gb-lon", "superbot-team-bare-gb-lon", "superbot-team-far-gb-lon", "superbot-team-odd-gb-lon"],
+            "ours only, and one whose subnet is gone too: its machines may still have to leave"
+        );
+        assert_eq!((nets[0].subnet.as_str(), nets[1].subnet.as_str(), nets[1].subnet_id.as_str()), ("10.248.0.0/22", "", ""));
         let members = api.team_network_members("5").await.unwrap();
         assert_eq!(
             members,

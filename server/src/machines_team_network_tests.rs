@@ -193,6 +193,12 @@ async fn a_machine_powered_off_to_leave_is_powered_on_again_whatever_happens_mea
     // Made under another MACHINE_LABEL_PREFIX: its machines still leave it.
     let old = env.fake.networks().into_iter().find(|n| n.id == net).unwrap().label.replacen("superbot", "oldbot", 1);
     env.fake.relabel_network(&net, &old);
+    // And a new teammate's machine joins it, not a second one under the new prefix.
+    let (dot, _) = user_with(env.port, &env.admin, "dot@example.com", "member").await;
+    join(&env, &acme, &dot).await;
+    ask(&env, &dot).await;
+    assert_eq!(env.fake.network_of(&pid(&env, &dot)).as_deref(), Some(net.as_str()));
+    assert_eq!(env.fake.networks().len(), 1);
 
     // Al rejoins before he is taken off: his machine is powered on, still on the network.
     leave(&al).await;

@@ -90,7 +90,7 @@ pub struct TeamNetwork {
     pub label: String,
     pub region: String,
     pub subnet_id: String,
-    /// The subnet's range, canonical.
+    /// The subnet's range, canonical. In a listing, empty if the VPC has lost its subnet.
     pub subnet: String,
     /// Made by this call, not found.
     pub created: bool,

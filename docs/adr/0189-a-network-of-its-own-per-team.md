@@ -41,7 +41,7 @@ We chose option 3.
 
 The team is the machine owner's team, as a member or as its service account: the same as ADR 0166's placement.
 
-- **One VPC per team and region**, labelled `<MACHINE_LABEL_PREFIX>-team-<first 12 hex digits of SHA-256 of the team id>-<region>`. The label says which team without naming it, and is the same every time, so it is how botd finds the VPC again. It has one subnet, `machines`, with `MACHINE_TEAM_NETWORK_SUBNET`.
+- **One VPC per team and region**, labelled `<MACHINE_LABEL_PREFIX>-team-<first 12 hex digits of SHA-256 of the team id>-<region>`. The label says which team without naming it, and is the same every time, so it is how botd finds the VPC again. A team's VPC made under an earlier `MACHINE_LABEL_PREFIX` is found by its `-team-<digest>-<region>` ending and reused, never doubled. It has one subnet, `machines`, with `MACHINE_TEAM_NETWORK_SUBNET`.
 - It is made when the team's first machine in that region is, before the create is sent, and audited as `machine.team_network_created` (target `team_network`, with the team, label, region, subnet and the machine it was made for). It is found by its label after that. A create that loses a race to another finds the winner's.
 - A VPC by that label in another region, or whose `machines` subnet has another range, is a refusal, not adopted. A VPC with no `machines` subnet gets one.
 - If the network can't be made, the create isn't sent. The machine fails with "The team's network couldn't be set up", audited as `machine.create_failed` with step `network`, as a firewall that can't be set up is (ADR 0035). A machine is never made off its team's network by accident.
@@ -60,7 +60,7 @@ People in no team get no VPC interface, as before.
 
 ### Leaving
 
-Every reconcile lists the VPCs whose labels end in `-team-<12 hex digits>-<region>`, whatever prefix they were made under (a machine keeps its network when `MACHINE_LABEL_PREFIX` changes), and each one's interfaces. For each interface on one of our machines whose owner isn't on the VPC's team (they left, moved teams, or the team is gone):
+Every reconcile lists the VPCs whose labels end in `-team-<12 hex digits>-<region>`, whatever prefix they were made under (a machine keeps its network when `MACHINE_LABEL_PREFIX` changes), including one whose `machines` subnet was renamed or removed, and each one's interfaces on every subnet. For each interface on one of our machines whose owner isn't on the VPC's team (they left, moved teams, or the team is gone):
 
 - A running machine is suspended through the normal suspend path, audited as `machine.suspended` and `machine.team_network_leaving` (with the VPC's team and the owner's team now).
 - Once it is suspended and Linode says it is off, its VPC interface is removed, audited as `machine.team_network_left`. If the sweep was what suspended it, it is resumed (`resuming: true`); so is one whose owner rejoined the team before it was taken off. A resume that fails is tried again every pass until it works, unless the machine must stay off by then: its owner disabled, a disable hold on it, or its team machine given back; and none is tried in a pass that couldn't read every network's members, since that machine might still be on one it must leave. A machine its owner or an admin had suspended stays off. botd remembers which machines it suspended only in memory, so after a restart such a machine stays suspended for its owner to resume.
