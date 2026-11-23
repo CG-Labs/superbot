@@ -399,17 +399,20 @@ install_rustup_user() {
 # neither overwritten from the checkout nor removed by --delete: .env, data, the workspace,
 # backups, and every *_DIR or *_FILE that .env (read as botd reads it, from the install
 # folder) points inside the install folder, with botd's default BACKUP_DIR beside DATA_DIR.
+# A path is kept as configured (and through any link on the way to it) and as resolved.
 state_excludes() {
-  local root=$1 env_file=$1/.env line key value abs rel data_dir="" backup_dir=""
+  local root env_file=$1/.env line key value abs rel part prefix data_dir="" backup_dir="" lexical resolved
   local -a fixed=(.env '.env.*' data workspace backups logs secrets backup-identity.txt license.key \
     metrics-token tiers.json '*.sqlite' '*.sqlite-*') named=()
-  root=$(realpath -m -- "$root")
+  root=$(realpath -m -s -- "$1")
+  resolved=$(realpath -m -- "$1")
   printf '%s\n' --include=/.env.example
   for rel in "${fixed[@]}"; do printf -- '--exclude=/%s\n' "$rel"; done
   [[ -f "$env_file" ]] || return 0
   while IFS= read -r line; do
     key=${line%%=*}
-    value=$(tr -d "\"'" <<<"${line#*=}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    value=$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<<"${line#*=}")
+    [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]] && value=${BASH_REMATCH[1]}
     [[ -n "$value" ]] || continue
     case $key in
       DATA_DIR) data_dir=$value ;;
@@ -420,15 +423,33 @@ state_excludes() {
   [[ -n "$backup_dir" ]] || named+=("$(dirname -- "${data_dir:-./data}")/backups")
   for value in "${named[@]}"; do
     [[ "$value" == /* ]] && abs=$value || abs=$root/$value
+    lexical=$(realpath -m -s -- "$abs")
     abs=$(realpath -m -- "$abs")
-    [[ "$abs" != "$root" ]] || die "$env_file points a setting at $root itself, which --source-dir syncs over. Keep runtime state in a folder of its own."
-    case $abs in
-      "$root"/*) rel=${abs#"$root"/} ;;
-      *) continue ;;
+    if [[ "$lexical" == "$root" || "$abs" == "$resolved" ]]; then
+      die "$env_file points a setting at $root itself, which --source-dir syncs over. Keep runtime state in a folder of its own."
+    fi
+    case $lexical in
+      "$root"/*)
+        rel=${lexical#"$root"/} prefix=""
+        while IFS= read -r -d / part; do
+          prefix+=$part
+          [[ ! -L "$root/$prefix" ]] || rsync_exclude "$prefix"
+          prefix+=/
+        done <<<"$rel/"
+        rsync_exclude "$rel"
+        ;;
     esac
-    rel=${rel//\\/\\\\} rel=${rel//\*/\\*} rel=${rel//\?/\\?} rel=${rel//\[/\\[}
-    printf -- '--exclude=/%s\n' "$rel"
+    case $abs in
+      "$resolved"/*) rsync_exclude "${abs#"$resolved"/}" ;;
+    esac
   done
+}
+
+# An anchored rsync exclude for one literal path under the synced folder.
+rsync_exclude() {
+  local rel=$1
+  rel=${rel//\\/\\\\} rel=${rel//\*/\\*} rel=${rel//\?/\\?} rel=${rel//\[/\\[}
+  printf -- '--exclude=/%s\n' "$rel"
 }
 
 # shellcheck disable=SC2016

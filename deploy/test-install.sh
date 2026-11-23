@@ -367,6 +367,15 @@ state+=(state/data/app.sqlite state/backups/superbot-20260102T000000Z.tar.gz)
 put_state
 sync_live
 survives
+# A quoted value keeps the quotes inside it, and a file reached through a linked folder keeps
+# the link, even when the link leads outside the install folder.
+mkdir -p "$T/outside" && echo outside >"$T/outside/plans.json" && ln -s "$T/outside" "$live/linked"
+printf "TIERS_FILE=\"./config/customer's.json\"\nMACHINE_MIRROR_CA_FILE=./linked/plans.json\n" >>"$live/.env"
+state+=("config/customer's.json")
+put_state
+sync_live
+survives
+[[ -L "$live/linked" && "$(cat "$live/linked/plans.json")" == outside ]] || fail "--source-dir removed the link to a configured file"
 # A first sync, onto a folder with no .git yet, doesn't overwrite either.
 rm -rf "$live/.git"
 sync_live
