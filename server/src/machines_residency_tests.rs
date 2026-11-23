@@ -239,10 +239,15 @@ async fn linode() -> (u16, AppState, String) {
 
 /// As `linode`, with botd's own data where `server_data` says (ADR 0184).
 async fn linode_with(server_data: ServerData) -> (u16, AppState, String, Arc<ControlPlane>) {
+    linode_set(|cp| cp.server_data = server_data).await
+}
+
+/// As `linode`, with the control plane as `set` leaves it.
+async fn linode_set(set: impl FnOnce(&mut ControlPlane)) -> (u16, AppState, String, Arc<ControlPlane>) {
     let fake = Arc::new(Fake::default());
     let p: Arc<dyn MachineProvider> = fake;
     let mut cp = ControlPlane::for_tests(p);
-    cp.server_data = server_data;
+    set(&mut cp);
     let cp = Arc::new(cp);
     let shared = cp.clone();
     let (port, app, owner, _) = serve_app_with(move |a| a.machines = shared).await;
@@ -417,6 +422,120 @@ async fn someone_leaving_a_pinned_team_keeps_its_pin_unless_they_are_erased() {
     assert_eq!((kept.len(), kept[0]["targetId"].as_str(), kept[0]["details"]["reason"].as_str()), (2, Some(ada.as_str()), Some("left")), "{kept:?}");
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
     assert_eq!((me["pin"]["keptFrom"]["team"]["id"].as_str(), me["pin"]["keptFrom"]["team"]["name"].clone()), (Some(team.as_str()), Value::Null), "the team is gone: {me}");
+}
+
+async fn reconcile_as(port: u16, admin: &str) -> Value {
+    let (code, r) = call_json(port, "POST", "/api/machines/reconcile", admin, "").await;
+    assert_eq!(code, 200, "{r}");
+    r
+}
+
+/// Bea, taken off team Acme after it was pinned to London (MSA-7), keeping its pin, with
+/// her machine still there. Her id, session and the team's id.
+async fn bea_kept_acmes_pin(port: u16, admin: &str) -> (String, String, String) {
+    user_with(port, admin, "ada@example.com", "member").await;
+    let (bea, bea_s) = user_with(port, admin, "bea@example.com", "member").await;
+    let (code, t) = call_json(port, "POST", "/api/teams", admin, &json!({ "name": "Acme", "owner": "ada@example.com" }).to_string()).await;
+    assert_eq!(code, 201, "{t}");
+    let team = t["id"].as_str().unwrap().to_string();
+    assert_eq!(call(port, "PUT", &format!("/api/teams/{team}/members/{bea}"), admin, "{}").await.0, 200);
+    assert_eq!(call(port, "PUT", &format!("/api/teams/{team}/residency"), admin, &pin("gb-lon", "MSA-7")).await.0, 200);
+    assert_eq!(call(port, "DELETE", &format!("/api/teams/{team}/members/{bea}"), admin, "").await.0, 200);
+    (bea, bea_s, team)
+}
+
+#[tokio::test]
+async fn a_kept_pin_ends_by_itself_once_the_leavers_machine_is_gone() {
+    use crate::machines::residency::KEPT_PIN_ENDED;
+    let (port, app, admin) = linode().await;
+    let (bea, bea_s, team) = bea_kept_acmes_pin(port, &admin).await;
+
+    // Her machine is still there: the pin holds it, and she's told it ends once it's gone.
+    let r = reconcile_as(port, &admin).await;
+    assert!(r.get("keptPinsEnded").is_none(), "{r}");
+    assert!(app.db.user_machine(&bea).is_some() && app.db.residency_pin(PinOn::User, &bea).is_some());
+    let (_, me) = call_json(port, "GET", "/api/me/residency", &bea_s, "").await;
+    assert_eq!(me["pin"]["keptFrom"]["endsWhenDataGone"].as_bool(), Some(true), "{me}");
+    let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
+    assert_eq!(regions["residency"]["keptPins"].as_str(), Some("end"), "{regions}");
+
+    // Destroyed: the next pass ends it, audited by botd itself, and her region stays.
+    assert_eq!(call(port, "DELETE", &format!("/api/users/{bea}/machine"), &admin, "").await.0, 200);
+    let r = reconcile_as(port, &admin).await;
+    assert_eq!(r["keptPinsEnded"].as_u64(), Some(1), "{r}");
+    let ended = audit(port, &admin, KEPT_PIN_ENDED).await;
+    let d = &ended[0]["details"];
+    assert_eq!((ended.len(), ended[0]["targetId"].as_str(), ended[0]["actorKind"].as_str(), ended[0]["actorId"].as_str()), (1, Some(bea.as_str()), Some("system"), Some("residency")), "{ended:?}");
+    assert_eq!((d["reason"].as_str(), d["region"].as_str(), d["reference"].as_str(), d["keptFrom"].as_str(), d["teamName"].as_str()), (Some("data_gone"), Some("gb-lon"), Some("MSA-7"), Some(team.as_str()), Some("Acme")), "{d}");
+    assert!(app.db.residency_pin(PinOn::User, &bea).is_none());
+    assert_eq!(app.db.user(&bea).unwrap().region.as_deref(), Some("gb-lon"));
+    let (_, me) = call_json(port, "GET", "/api/me/residency", &bea_s, "").await;
+    assert_eq!(me["pin"], Value::Null, "{me}");
+    reconcile_as(port, &admin).await;
+    assert_eq!(audit(port, &admin, KEPT_PIN_ENDED).await.len(), 1, "once");
+    // Nothing holds her region now.
+    assert_eq!(call(port, "PUT", &format!("/api/users/{bea}/region"), &admin, r#"{"region":"de-fra-2"}"#).await.0, 200);
+
+    // A later pin of her own: her report lists the end without the team's agreement; an admin's has it.
+    assert_eq!(call(port, "PUT", &format!("/api/users/{bea}/residency"), &admin, &pin("de-fra-2", "DPA-bea")).await.0, 200);
+    for format in ["json", "markdown"] {
+        let (code, r) = call(port, "GET", &format!("/api/me/residency/report?on=user&format={format}"), &bea_s, "").await;
+        assert!(code == 200 && r.contains(KEPT_PIN_ENDED) && r.contains("DPA-bea") && !r.contains("MSA-7"), "{format}: {r}");
+    }
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{bea}/residency/report"), &admin, "").await;
+    assert!(r["activity"]["pinChanges"].as_array().unwrap().iter().any(|c| c["action"] == KEPT_PIN_ENDED && c["reference"] == "MSA-7" && c["reason"] == "data_gone"), "{r}");
+    // An ordinary pin never ends by itself, with no machine data either.
+    reconcile_as(port, &admin).await;
+    assert_eq!(app.db.residency_pin(PinOn::User, &bea).unwrap().reference, "DPA-bea");
+}
+
+#[tokio::test]
+async fn with_residency_kept_pins_keep_a_leavers_pin_stays_until_unpinned() {
+    use crate::machines::residency::{KEPT_PIN_ENDED, KeptPins};
+    let (port, app, admin, _) = linode_set(|cp| cp.kept_pins = KeptPins::Keep).await;
+    let (bea, bea_s, _) = bea_kept_acmes_pin(port, &admin).await;
+    let (_, me) = call_json(port, "GET", "/api/me/residency", &bea_s, "").await;
+    assert_eq!(me["pin"]["keptFrom"]["endsWhenDataGone"].as_bool(), Some(false), "{me}");
+
+    assert_eq!(call(port, "DELETE", &format!("/api/users/{bea}/machine"), &admin, "").await.0, 200);
+    let r = reconcile_as(port, &admin).await;
+    assert!(r.get("keptPinsEnded").is_none(), "{r}");
+    assert!(app.db.residency_pin(PinOn::User, &bea).is_some() && audit(port, &admin, KEPT_PIN_ENDED).await.is_empty());
+    // Admins are told it holds nothing now.
+    let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
+    assert_eq!(regions["residency"]["keptPins"].as_str(), Some("keep"), "{regions}");
+    let w = regions["residency"]["warnings"].to_string();
+    assert!(w.contains("User bea is pinned to gb-lon (MSA-7), kept from their former team's pin, and botd holds none of their machine data") && w.contains("RESIDENCY_KEPT_PINS=keep"), "{regions}");
+    assert_eq!(call(port, "DELETE", &format!("/api/users/{bea}/residency"), &admin, r#"{"reason":"left Acme; nothing left"}"#).await.0, 200);
+    let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
+    assert!(!regions["residency"]["warnings"].to_string().contains("RESIDENCY_KEPT_PINS"), "{regions}");
+}
+
+#[tokio::test]
+async fn a_kept_pin_waits_for_the_leavers_backups_to_be_deleted() {
+    use crate::machines::residency::KEPT_PIN_ENDED;
+    let env = incus(true).await;
+    let (bea, _) = user_with(env.port, &env.admin, "bea@example.com", "member").await;
+    let m = machine_for(&env, &env.a, "a", &bea, true).await;
+    back_up(&env, &bea).await;
+    let t = env.app.db.create_team("Acme", None);
+    assert!(env.app.db.add_team_member(&t.id, &bea, "member", None));
+    env.app.db.pin_residency(PinOn::Team, &t.id, "gb-lon", "MSA-7", None).unwrap();
+    assert!(env.app.db.remove_team_member_keeping_pin(&t.id, &bea, false, true).unwrap().1.is_some());
+
+    // Her machine is destroyed, but its backup is still in London's store: still held.
+    assert_eq!(json_call(&env, "DELETE", &format!("/api/users/{bea}/machine"), "").await.0, 200);
+    reconcile(&env).await;
+    assert!(env.app.db.user_machine(&bea).is_none());
+    assert!(env.app.db.residency_pin(PinOn::User, &bea).is_some() && events(&env, KEPT_PIN_ENDED).await.is_empty());
+
+    // Once its backups are deleted, it ends.
+    let (code, v) = json_call(&env, "DELETE", &format!("/api/machines/{}/backups", m.id), "").await;
+    assert_eq!(code, 200, "{v}");
+    let r = reconcile(&env).await;
+    assert_eq!(r["keptPinsEnded"].as_u64(), Some(1), "{r}");
+    assert!(env.app.db.residency_pin(PinOn::User, &bea).is_none());
+    assert_eq!(events(&env, KEPT_PIN_ENDED).await[0]["details"]["keptFrom"].as_str(), Some(t.id.as_str()));
 }
 
 #[tokio::test]

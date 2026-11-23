@@ -6,6 +6,7 @@
 //! People only, never Bots. Reports are audited as admins' are, marked `selfService`,
 //! and limited per person, since each one reads the audit log for its period.
 
+use super::ControlPlane;
 use super::residency::{self, outside};
 use super::residency_report;
 use crate::audit::Who;
@@ -83,10 +84,13 @@ fn pick(app: &App, u: &User, on: Option<&str>) -> Res<ResidencyPin> {
 
 /// Your own pin's reference, or for one kept from a team you left (ADR 0171) that team
 /// instead: its reference is the team's agreement, which only the team's owners and
-/// admins see (ADR 0129).
-fn own_pin_fields(app: &App, p: &ResidencyPin, v: &mut Value) {
+/// admins see (ADR 0129). `endsWhenDataGone`: it ends by itself once botd holds none of
+/// their machine data (ADR 0205).
+fn own_pin_fields(app: &App, cp: &ControlPlane, p: &ResidencyPin, v: &mut Value) {
     match &p.kept_from {
-        Some(t) => v["keptFrom"] = json!({ "team": { "id": t, "name": app.db.team(t).map(|t| t.name) } }),
+        Some(t) => {
+            v["keptFrom"] = json!({ "team": { "id": t, "name": app.db.team(t).map(|t| t.name) }, "endsWhenDataGone": cp.kept_pins == residency::KeptPins::End })
+        }
         None => v["reference"] = json!(p.reference),
     }
 }
@@ -112,11 +116,11 @@ pub async fn view(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>,
                 pin["reference"] = json!(p.reference);
             }
         }
-        PinOn::User => own_pin_fields(&app, &p, &mut pin),
+        PinOn::User => own_pin_fields(&app, cp, &p, &mut pin),
     }
     let own_pin = own.as_ref().filter(|_| p.subject_type == PinOn::Team).map(|o| {
         let mut v = json!({ "region": o.region, "pinnedAt": o.pinned_at });
-        own_pin_fields(&app, o, &mut v);
+        own_pin_fields(&app, cp, o, &mut v);
         v
     });
     let mut reports = Vec::new();

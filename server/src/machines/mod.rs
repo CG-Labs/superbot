@@ -226,6 +226,9 @@ pub struct ControlPlane {
     pub suspend_on_disable: bool,
     /// Where botd's own data is, and whether residency pins are held to it (ADR 0184).
     pub server_data: server_data::ServerData,
+    /// Whether a leaver's kept residency pin ends once their machine data is gone
+    /// (RESIDENCY_KEPT_PINS, ADR 0205).
+    pub kept_pins: residency::KeptPins,
     /// A network of its own per team (MACHINE_TEAM_NETWORK, ADR 0189). None: off.
     pub team_network: Option<team_network::Settings>,
     /// Machines powered off to take them off a team network they no longer belong on,
@@ -260,6 +263,7 @@ impl Default for ControlPlane {
             offsite: None,
             suspend_on_disable: true,
             server_data: server_data::ServerData::default(),
+            kept_pins: residency::KeptPins::default(),
             team_network: None,
             network_suspended: Default::default(),
             ops: tokio::sync::Mutex::new(()),
@@ -1248,7 +1252,11 @@ pub async fn reconcile(app: &AppState, cp: &ControlPlane) -> Value {
     let teams = crate::teams::sweep(app, cp).await;
     let networks = team_network::sweep(app, cp).await;
     let disabled = crate::deprovision::sweep(app, cp).await;
+    let kept_pins_ended = residency::end_kept(app, cp).await;
     let mut out = json!({ "checked": ids.len(), "changed": changed });
+    if kept_pins_ended > 0 {
+        out["keptPinsEnded"] = kept_pins_ended.into();
+    }
     if teams != json!({}) {
         out["teams"] = teams;
     }

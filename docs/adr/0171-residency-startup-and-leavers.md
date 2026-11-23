@@ -63,14 +63,14 @@ The report's pin has `keptFrom`. `user.residency_pin_kept` is one of the pin cha
 
 - An operator who sells residency to everyone on a server can make a misconfigured region stop the server, not only the pinned tenants' backups.
 - Data made under a team's agreement stays held after its people leave, including when the IdP removes them, with no manual step and an audit entry for each.
-- Leavers' pins accumulate. Each needs an admin to unpin it, with a reason, once their machine and backups are gone or the agreement no longer covers them. A leaver joining a team pinned to another region is refused until then.
+- Leavers' pins accumulate. Each needs an admin to unpin it, with a reason, once their machine and backups are gone or the agreement no longer covers them. A leaver joining a team pinned to another region is refused until then. (Since [ADR 0205](0205-ending-a-kept-pin-once-the-data-is-gone.md), a kept pin ends by itself once their machine data is gone, unless `RESIDENCY_KEPT_PINS=keep`.)
 - The DPA's annex no longer asks the Provider to pin leavers by hand.
 
 ## Not done (still on #58)
 
 - A data region for botd's own database and server backups, or a dedicated deployment per region.
 - In-region routes for Claude Code and Codex.
-- Ending a kept pin by itself once the leaver's machine and backups are gone.
+- Ending a kept pin by itself once the leaver's machine and backups are gone. **Done** in [ADR 0205](0205-ending-a-kept-pin-once-the-data-is-gone.md) (`RESIDENCY_KEPT_PINS`).
 
 ## Tests
 

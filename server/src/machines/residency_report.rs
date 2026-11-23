@@ -27,9 +27,10 @@ const MAX_DAYS: i64 = 400;
 /// Events read for one report. Past this the activity is marked `truncated`.
 const MAX_EVENTS: usize = 100_000;
 
-const PIN_CHANGES: [&str; 7] = [
+const PIN_CHANGES: [&str; 8] = [
     "user.residency_pinned",
     "user.residency_pin_kept",
+    residency::KEPT_PIN_ENDED,
     "user.residency_unpinned",
     "user.residency_pin_refused",
     "team.residency_pinned",
@@ -42,7 +43,7 @@ const REFUSALS: [&str; 6] = ["machine.residency_refused", "bot.run_refused", "us
 const NOT_COVERED: [&str; 3] = [
     "What a Bot's own tools send over the network; outbound allow-lists are the control for that (ADR 0135).",
     "Push, email, webhooks, payments and sign-in providers, as the DPA's subprocessor annex lists them.",
-    "People who have left a pinned team: their data is held by a pin of their own, kept from the team's when they left, with its own report (ADR 0171).",
+    "People who have left a pinned team: their data is held by a pin of their own, kept from the team's when they left, with its own report, until botd holds none of their machine data unless the operator keeps such pins (ADR 0171, ADR 0205).",
 ];
 
 fn rfc3339(ms: i64) -> String {
@@ -171,7 +172,8 @@ fn activity(app: &App, p: &ResidencyPin, people: &HashSet<String>, from: i64, to
     for e in events.iter().take(MAX_EVENTS) {
         if PIN_CHANGES.contains(&e.action.as_str()) {
             if on_subject(e, p) {
-                changes.push(change_view(e, !hidden && !(self_service && e.action == KEPT)));
+                let team_reference = e.action == KEPT || e.action == residency::KEPT_PIN_ENDED;
+                changes.push(change_view(e, !hidden && !(self_service && team_reference)));
             }
         } else if e.action == "harness.invoked" {
             held += u64::from(held_here(app, e, p, people, &mut owners));
