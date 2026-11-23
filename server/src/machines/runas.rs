@@ -77,11 +77,19 @@ pub fn name_of(uid: u32) -> Option<String> {
 
 /// For `pre_exec`, once a process is a Bot's or a teammate's user (ADR 0145): no
 /// setuid program or file capability raises it again (sudo, su, pkexec, newgrp), and
-/// what it makes, in /tmp too, is its own alone. Only async-signal-safe calls.
+/// what it makes, in /tmp too, is its own alone; and the kernel interfaces a run never
+/// needs are refused (ADR 0156). Only async-signal-safe calls.
 pub fn lock_down() -> io::Result<()> {
     // SAFETY: umask can't fail.
     unsafe { libc::umask(0o077) };
-    no_new_privs()
+    confine()
+}
+
+/// `lock_down` without the umask, for programs that set their files' modes as they
+/// need (X's sockets): no new privileges, then the seccomp filter. Async-signal-safe.
+pub fn confine() -> io::Result<()> {
+    no_new_privs()?;
+    super::seccomp::install()
 }
 
 /// The OOM score a Bot's or teammate's process starts at (ADR 0145): above the
@@ -115,8 +123,7 @@ pub fn become_user(uid: u32, gid: u32) -> io::Result<()> {
     Ok(())
 }
 
-/// `lock_down` without the umask, for programs that set their files' modes as they
-/// need (X's sockets). Async-signal-safe.
+/// Sets no new privileges on this process. Async-signal-safe.
 pub fn no_new_privs() -> io::Result<()> {
     // SAFETY: a plain prctl on this process.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
