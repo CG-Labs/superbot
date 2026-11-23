@@ -72,7 +72,7 @@ A target counts the clock for targets like `1 h, 24×7`, and only business hours
 
 ## Each month
 
-1. On the first business day, export last month's tickets and run `botctl support-report <export> --from <last month> --to <last month>`.
+1. On the first business day, export every ticket that was open at any time last month: opened before its end and not resolved before its start, older ones included. A filter on "created last month" leaves out older tickets closed in the month or still open at its end, so the closed counts and what's open would be short. Run `botctl support-report <export> --from <last month> --to <last month>`.
 2. For each missed ticket: was it real (not a severity changed later, or an auto-reply counted as the answer)? If real, why, and is it a staffing, rota or routing problem? Note the cause in the ticket.
 3. If the period's percentage for Severity 1 or 2 is below the Provider's goal, or misses cluster on nights, weekends or one queue, raise it with the support manager ([escalation](escalation.md)). Response targets are a promise only once the [on-call rota](README.md#for-the-provider) exists.
-4. For each Enterprise customer with a review coming, run it for their quarter with `--customer`, their `--target`s and `--markdown`, and give it to their [TAM](tam.md).
+4. For each Enterprise customer with a review coming, run it on such an export for their quarter with `--customer`, their `--target`s and `--markdown`, and give it to their [TAM](tam.md).

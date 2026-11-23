@@ -269,8 +269,9 @@ pub fn parse_time(s: &str, offset: FixedOffset) -> Option<DateTime<Utc>> {
 /// ticket systems use for priorities.
 pub fn parse_severity(s: &str) -> Option<u8> {
     let lower = s.trim().to_ascii_lowercase();
-    if let Some(d) = lower.chars().find(char::is_ascii_digit) {
-        return d.to_digit(10).map(|d| d as u8).filter(|d| (1..=4).contains(d));
+    if let Some(at) = lower.find(|c: char| c.is_ascii_digit()) {
+        let n: String = lower[at..].chars().take_while(char::is_ascii_digit).collect();
+        return n.parse::<u8>().ok().filter(|d| (1..=4).contains(d));
     }
     Some(match lower.as_str() {
         "critical" | "urgent" | "emergency" | "highest" | "blocker" => 1,
@@ -327,19 +328,23 @@ impl Field {
 }
 
 fn normalize(h: &str) -> String {
-    let s: String = h.trim().trim_start_matches('\u{feff}').to_ascii_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' }).collect();
+    let s: String = h.trim().trim_start_matches('\u{feff}').to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { ' ' }).collect();
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// RFC 4180 records: quoted fields with commas, quotes and line breaks. The delimiter is
-/// the header line's commonest of comma, semicolon and tab.
-pub fn parse_csv(text: &str) -> Result<Vec<Vec<String>>, String> {
+/// RFC 4180 records, each with the line it starts on: quoted fields with commas, quotes
+/// and line breaks. The delimiter is the header line's commonest of comma, semicolon and tab.
+pub fn parse_csv(text: &str) -> Result<Vec<(usize, Vec<String>)>, String> {
     let text = text.trim_start_matches('\u{feff}');
     let header = text.lines().next().unwrap_or("");
     let delim = [',', ';', '\t'].into_iter().max_by_key(|d| header.matches(*d).count()).unwrap_or(',');
     let (mut rows, mut row, mut field) = (Vec::new(), Vec::new(), String::new());
     let (mut quoted, mut chars) = (false, text.chars().peekable());
+    let (mut line, mut start) = (1, 1);
     while let Some(c) = chars.next() {
+        if c == '\n' {
+            line += 1;
+        }
         match (quoted, c) {
             (true, '"') if chars.peek() == Some(&'"') => {
                 chars.next();
@@ -352,7 +357,8 @@ pub fn parse_csv(text: &str) -> Result<Vec<Vec<String>>, String> {
             (false, '\r') if chars.peek() == Some(&'\n') => {}
             (false, '\n') => {
                 row.push(std::mem::take(&mut field));
-                rows.push(std::mem::take(&mut row));
+                rows.push((start, std::mem::take(&mut row)));
+                start = line;
             }
             (false, c) => field.push(c),
         }
@@ -362,9 +368,9 @@ pub fn parse_csv(text: &str) -> Result<Vec<Vec<String>>, String> {
     }
     if !field.is_empty() || !row.is_empty() {
         row.push(field);
-        rows.push(row);
+        rows.push((start, row));
     }
-    rows.retain(|r| r.iter().any(|f| !f.trim().is_empty()));
+    rows.retain(|(_, r)| r.iter().any(|f| !f.trim().is_empty()));
     Ok(rows)
 }
 
@@ -532,7 +538,7 @@ pub struct Report {
 /// The report on `csv`'s tickets, as `o` says.
 pub fn report(csv: &str, o: &Options) -> Result<Report, String> {
     let rows = parse_csv(csv)?;
-    let (header, body) = rows.split_first().ok_or("the CSV is empty")?;
+    let ((_, header), body) = rows.split_first().ok_or("the CSV is empty")?;
     let headers: Vec<String> = header.iter().map(|h| normalize(h)).collect();
     let mut col = BTreeMap::new();
     for f in Field::ALL {
@@ -569,10 +575,13 @@ pub fn report(csv: &str, o: &Options) -> Result<Report, String> {
     let (mut missed, mut plans, mut skipped) = (Vec::new(), BTreeSet::new(), Vec::new());
     let mut open_at_end = col.contains_key("resolved").then_some([0u32; 4]);
     let wanted = o.customer.as_deref().map(normalize);
+    if wanted.as_deref() == Some("") {
+        return Err("--customer needs a name with letters or digits in it".into());
+    }
     let offset = o.calendar.offset;
 
-    for (i, r) in body.iter().enumerate() {
-        let line = i + 2;
+    for (line, r) in body {
+        let line = *line;
         let cell = |f: Field| col.get(f.name()).and_then(|&c| r.get(c)).map(|s| s.trim()).filter(|s| !s.is_empty());
         if let Some(w) = &wanted {
             if cell(Field::Customer).map(normalize).as_ref() != Some(w) {
@@ -869,6 +878,8 @@ mod tests {
             assert_eq!(parse_severity(s), Some(want), "{s}");
         }
         assert_eq!(parse_severity("5"), None);
+        assert_eq!(parse_severity("10"), None);
+        assert_eq!(parse_severity("Sev 24"), None);
         assert_eq!(parse_severity("whenever"), None);
         assert_eq!(Plan::parse("Self-host (licensed)"), Some(Plan::SelfHost));
         assert_eq!(Plan::parse("Max"), Some(Plan::Max));
@@ -904,8 +915,8 @@ mod tests {
     #[test]
     fn csv_handles_quotes_line_breaks_and_semicolons() {
         let rows = parse_csv("\u{feff}id,subject\r\n1,\"Hello, \"\"world\"\"\nagain\"\r\n\r\n2,x").unwrap();
-        assert_eq!(rows, vec![vec!["id", "subject"], vec!["1", "Hello, \"world\"\nagain"], vec!["2", "x"]]);
-        assert_eq!(parse_csv("a;b\n1;2,5\n").unwrap(), vec![vec!["a", "b"], vec!["1", "2,5"]]);
+        assert_eq!(rows, vec![(1, vec!["id".to_string(), "subject".into()]), (2, vec!["1".into(), "Hello, \"world\"\nagain".into()]), (5, vec!["2".into(), "x".into()])], "each record with the line it starts on");
+        assert_eq!(parse_csv("a;b\n1;2,5\n").unwrap(), vec![(1, vec!["a".to_string(), "b".into()]), (2, vec!["1".into(), "2,5".into()])]);
         assert!(parse_csv("a\n\"open").is_err());
     }
 
@@ -973,6 +984,29 @@ T-8,Bad time,hu@example.com,Acme,Low,yesterday,,,enterprise
         assert_eq!(v["openAtEnd"], Value::Null, "no resolved column, so no backlog");
         o.as_of = t("2026-09-01T10:59:00Z");
         assert_eq!(report(csv, &o).unwrap().json()["totals"]["severities"][0]["waiting"], 1);
+    }
+
+    #[test]
+    fn customers_with_non_ascii_names_stay_apart() {
+        let csv = "id,severity,opened,first response,organisation\nA,1,2026-09-01T10:00:00Z,2026-09-01T10:10:00Z,北京\nB,1,2026-09-01T10:00:00Z,2026-09-01T10:10:00Z,上海\nC,1,2026-09-01T10:00:00Z,2026-09-01T10:10:00Z,Zürich AG\n";
+        let mut o = opts("2026-11-02T09:00:00Z");
+        o.plan = Some(Plan::Pro);
+        for (name, want) in [("北京", 1), ("上海", 1), ("zürich ag", 1), ("Zurich AG", 0)] {
+            o.customer = Some(name.into());
+            assert_eq!(report(csv, &o).unwrap().json()["totals"]["met"], want, "{name}");
+        }
+        o.customer = Some("—".into());
+        assert!(report(csv, &o).is_err(), "a name with nothing to match");
+    }
+
+    #[test]
+    fn skipped_rows_are_named_by_the_line_they_start_on() {
+        let csv = "id,subject,severity,opened,first response\nA,\"two\nlines\",1,2026-09-01T10:00:00Z,\n\nB,x,10,2026-09-01T10:00:00Z,\nC,x,1,soon,\n";
+        let mut o = opts("2026-11-02T09:00:00Z");
+        o.plan = Some(Plan::Pro);
+        let v = report(csv, &o).unwrap().json();
+        let lines: Vec<(u64, &str)> = v["skipped"].as_array().unwrap().iter().map(|s| (s["line"].as_u64().unwrap(), s["reason"].as_str().unwrap())).collect();
+        assert_eq!(lines, vec![(5, "a severity that isn't 1 to 4"), (6, "a time that can't be read")]);
     }
 
     #[test]
