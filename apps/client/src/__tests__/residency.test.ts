@@ -96,6 +96,24 @@ describe("residencyLines (ADR 0168)", () => {
   });
 });
 
+describe("chats in the region's own database (ADR 0215)", () => {
+  it("says chats are kept in the region and leaves them out of the server's copy", () => {
+    const held = residencyLines(view({ serverData: { region: "de-fra-2", inRegion: false }, chats: { store: true, inRegion: true } }));
+    expect(held.lines).toContain("Your chats are kept in gb-lon, in a database of their own there.");
+    expect(held.lines).toContain("SuperBot's own copy of your account isn't in gb-lon; it is in de-fra-2. Your agreement says where it is.");
+    expect(held.warnings).toEqual([]);
+  });
+
+  it("says when they are still moving, and says nothing without a store", () => {
+    const moving = residencyLines(view({ serverData: { region: "de-fra-2", inRegion: false }, chats: { store: true, inRegion: false } }));
+    expect(moving.lines).toContain("Your chats are being moved to gb-lon's own database.");
+    expect(moving.lines).toContain("SuperBot's own copy of your account and chats isn't in gb-lon; it is in de-fra-2. Your agreement says where it is.");
+    const none = residencyLines(view({ serverData: { region: "gb-lon", inRegion: true }, chats: { store: false, inRegion: true } }));
+    expect(none.lines.some((l) => l.startsWith("Your chats"))).toBe(false);
+    expect(none.lines).toContain("SuperBot's own copy of your account and chats is in gb-lon.");
+  });
+});
+
 describe("reports", () => {
   it("labels each and names its file", () => {
     expect(reportLabel("user")).toBe("Download your report");
