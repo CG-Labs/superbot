@@ -6,6 +6,9 @@
 //! approvals, policy, users, and sessions from a shell on the server (`SUPERBOT_TOKEN`
 //! from `botctl login`, or the break-glass `SUPERBOT_PASSWORD`).
 
+#[path = "../support_report.rs"]
+mod support_report;
+
 use serde_json::{json, Map, Value};
 use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
@@ -215,6 +218,13 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    approvals and the license, each ok, watch or at risk
   botctl health-score history [--days <n>] [json]  The score botd recorded each day (ADR 0157) for the last
                                                    90 days (1 to 3650), and what got worse or better
+  botctl support-report <tickets.csv | -> [--plan <plan>] [--customer <name>] [--from <YYYY-MM> --to <YYYY-MM>]
+    [--hours <HH:MM-HH:MM>] [--weekdays <mon-fri>] [--utc-offset <+HH:MM>] [--holidays <dates>]
+    [--target <sev>=<30m|1h|4bh|1bd>]... [--column <field>=<header>]... [--as-of <time>] [--markdown | --json]
+                                                   The Provider's support report (ADR 0167), offline, from a
+                                                   ticket system's CSV export: tickets by month and severity,
+                                                   response targets met and missed, and what's still open.
+                                                   Reads only ids, severities, plans and times
   botctl evidence                                  The evidence bundle schedule (EVIDENCE_BUNDLES), where
                                                    bundles are written and those kept (ADR 0142)
   botctl evidence bundle [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]
@@ -1722,6 +1732,7 @@ fn run(args: &[String]) -> Result<String, String> {
         ["approvals", status] => op("GET", &format!("/api/approvals?status={status}"), None),
         [verb @ ("approve" | "deny"), id, rest @ ..] => decide(verb, id, rest),
         ["support-bundle", rest @ ..] => support_bundle(rest),
+        ["support-report", rest @ ..] => support_report(rest, std::io::stdin()),
         ["health-score", "history", rest @ ..] => {
             let (path, json) = health_request_at(rest, "/api/support/health-score/history", "Usage: botctl health-score history [--days <n>] [json]")?;
             let res = api(Cred::Operator, "GET", &path, None)?;
@@ -1953,6 +1964,22 @@ fn support_bundle(rest: &[&str]) -> Result<String, String> {
     ))
 }
 
+/// `botctl support-report`: needs no botd, only the ticket system's export.
+fn support_report(rest: &[&str], mut stdin: impl Read) -> Result<String, String> {
+    let (file, options, format) = support_report::parse_args(rest, chrono::Utc::now())?;
+    let mut csv = String::new();
+    match file.as_str() {
+        "-" => stdin.read_to_string(&mut csv).map(drop).map_err(|e| format!("stdin: {e}"))?,
+        _ => csv = std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?,
+    }
+    let report = support_report::report(&csv, &options)?;
+    Ok(match format {
+        support_report::Format::Text => report.text(),
+        support_report::Format::Markdown => report.markdown(),
+        support_report::Format::Json => pretty(report.json().to_string()),
+    })
+}
+
 /// `botctl health-score [--days <n>] [json]`: the path, and whether to print the JSON.
 fn health_request(rest: &[&str]) -> Result<(String, bool), String> {
     health_request_at(rest, "/api/support/health-score", "Usage: botctl health-score [--days <n>] [json]")
@@ -2122,6 +2149,24 @@ mod tests {
 
     /// Held by tests that set botctl's environment variables.
     static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn support_report_reads_a_file_or_stdin_without_botd() {
+        let csv = "id,severity,opened,first response\nT-9,2,2026-09-01T10:00:00Z,2026-09-01T10:30:00Z\n";
+        let period = ["--plan", "max", "--from", "2026-09", "--to", "2026-09"];
+        let from_stdin = support_report(&[&["-"][..], &period].concat(), csv.as_bytes()).unwrap();
+        assert!(from_stdin.contains("1 of 1 answered within target (100%)."), "{from_stdin}");
+        let file = std::env::temp_dir().join(format!("botctl-support-report-{}.csv", std::process::id()));
+        std::fs::write(&file, csv).unwrap();
+        let path = file.to_str().unwrap();
+        let md = support_report(&[&[path, "--markdown"][..], &period].concat(), std::io::empty()).unwrap();
+        assert!(md.contains("| 2026-09 | 2 | 1 | 1 | 0 | 0 | 30 min |"), "{md}");
+        let json: Value = serde_json::from_str(&support_report(&[&[path, "--json"][..], &period].concat(), std::io::empty()).unwrap()).unwrap();
+        assert_eq!(json["totals"]["metPercent"], 100);
+        std::fs::remove_file(&file).unwrap();
+        assert!(support_report(&["/nonexistent/tickets.csv", "--plan", "pro"], std::io::empty()).unwrap_err().contains("/nonexistent/tickets.csv"));
+        assert!(support_report(&[], std::io::empty()).unwrap_err().starts_with("Usage: botctl support-report"));
+    }
 
     #[test]
     fn a_failure_shows_the_servers_error() {

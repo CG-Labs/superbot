@@ -39,7 +39,7 @@ What the technical account manager (TAM) checks each month for an Enterprise cus
 ## 6. The account
 
 - [ ] License (self-host): `botctl license` end date and seats; a renewal within 90 days is with the account owner.
-- [ ] Open tickets: none past their response target, none open for more than a month without a plan.
+- [ ] Tickets: last month's [support report](support-report.md) for the customer (`botctl support-report <export> --customer "<customer>"`) has no miss without a cause; none open past its response target, none open for more than a month without a plan.
 - [ ] Anything from the customer since last time: changes to their IdP, network, team or plans that SuperBot should know about.
 
 ## Afterwards
