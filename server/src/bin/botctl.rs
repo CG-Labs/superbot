@@ -1423,6 +1423,17 @@ fn saml_summary(v: &Value) -> String {
             _ => "off",
         }
     );
+    out += &format!(
+        "  IdP metadata signature:   {}\n",
+        match v["signedMetadata"].as_str() {
+            Some("require") => "required",
+            Some("allow") => "checked when signed",
+            _ => "not checked",
+        }
+    );
+    for c in v["metadataSigningCertificates"].as_array().into_iter().flatten() {
+        out += &format!("    Trusted signer: SHA-256 {} ({}), expires {}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]));
+    }
     let yes = |b: bool| if b { "yes" } else { "no" };
     out += &format!(
         "  Signs AuthnRequests:      {}\n  Single logout:            {}\n",
@@ -2605,6 +2616,11 @@ mod tests {
         assert!(out.contains("SP encryption certificate: SHA-256 56:78 (secret), expires 2030-03-17") && out.contains("Encrypted assertions:     required"), "{out}");
         v["spEncryptionKey"] = json!({ "problem": "not offered until SSO_CORP_ENCRYPTION_PRIVATE_KEY is set" });
         assert!(saml_summary(&v).contains("SP encryption key:        not offered until SSO_CORP_ENCRYPTION_PRIVATE_KEY"));
+        assert!(saml_summary(&v).contains("IdP metadata signature:   not checked\n"));
+        v["signedMetadata"] = json!("require");
+        v["metadataSigningCertificates"] = json!([{ "sha256": "9a:bc", "subject": "CN=metadata", "notAfter": 1_900_000_000_000_i64 }]);
+        let out = saml_summary(&v);
+        assert!(out.contains("IdP metadata signature:   required\n    Trusted signer: SHA-256 9a:bc (CN=metadata), expires 2030-03-17"), "{out}");
     }
 
     #[test]

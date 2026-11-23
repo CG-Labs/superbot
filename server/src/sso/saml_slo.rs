@@ -15,10 +15,12 @@
 //!   `NotOnOrAfter` not passed. The caller refuses an ID seen before (replay), and a response
 //!   to a request it didn't send.
 //!
-//! A LogoutRequest names a NameID (an encrypted one is refused) and maybe `SessionIndex`es;
-//! the caller revokes the SuperBot sessions signed in with them, then answers.
+//! A LogoutRequest names a NameID and maybe `SessionIndex`es; the caller revokes the SuperBot
+//! sessions signed in with them, then answers. An `EncryptedID` is decrypted with the
+//! provider's encryption key (ADR 0151), after the signature over it is checked, and refused
+//! (`encrypted_id`) when the provider has none.
 
-use super::saml_sp::{self, ASSERTION, IdpMetadata, MAX_RESPONSE, PROTOCOL, Refused, SKEW_MS, SUCCESS, escape, instant, issuer_is, only, text_of, time};
+use super::saml_sp::{self, ASSERTION, IdpMetadata, MAX_RESPONSE, PROTOCOL, Refused, SKEW_MS, SUCCESS, SpKey, escape, instant, issuer_is, only, text_of, time};
 use super::xmldsig::{self, is};
 use crate::db::SamlLogin;
 use roxmltree::Node;
@@ -43,6 +45,8 @@ pub struct Expect<'a> {
     /// Our SLO URL: the `Destination`.
     pub slo_url: &'a str,
     pub now_ms: i64,
+    /// Our encryption key, when the provider has one (ADR 0150), for an `EncryptedID` (ADR 0151).
+    pub decrypt: Option<&'a SpKey>,
 }
 
 /// A logout message that passed. `until_ms` is how long to remember its ID to refuse it again.
@@ -130,17 +134,14 @@ pub fn receive(incoming: &Incoming, e: &Expect) -> Result<Received, Refused> {
     {
         return Err(Refused("expired", None));
     }
-    if root.children().any(|c| is(c, ASSERTION, "EncryptedID")) {
-        return Err(Refused("encrypted_id", None));
-    }
-    let name_id = only(root, ASSERTION, "NameID").and_then(text_of).filter(|n| !n.is_empty() && n.len() <= 255 && n.trim() == *n).ok_or(Refused("missing_subject", None))?;
+    let name_id = saml_sp::name_id(root, e.decrypt)?;
     let indexes: Vec<Node> = root.children().filter(|c| is(*c, PROTOCOL, "SessionIndex")).collect();
     if indexes.len() > MAX_INDEXES {
         return Err(bad());
     }
     let session_indexes = indexes.into_iter().map(|n| text_of(n).map(str::trim).filter(|i| !i.is_empty() && i.len() <= 1024).map(String::from)).collect::<Option<Vec<_>>>().ok_or_else(bad)?;
     let relay = relay.filter(|r| r.len() <= 80);
-    Ok(Received::Request { id, name_id: name_id.to_string(), session_indexes, relay, issued_ms: issued, until_ms })
+    Ok(Received::Request { id, name_id: name_id.value, session_indexes, relay, issued_ms: issued, until_ms })
 }
 
 fn name_id_xml(l: &SamlLogin) -> String {
@@ -185,7 +186,7 @@ pub mod test_idp {
 
     use super::*;
     use crate::sso::saml_sp::test_idp::IDP;
-    use crate::sso::xmldsig::test_signer::signers;
+    use crate::sso::xmldsig::test_signer::signer;
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
 
@@ -203,6 +204,8 @@ pub mod test_idp {
         /// Which test key signs it (0 is the IdP's), or none.
         pub signer: Option<usize>,
         pub relay: Option<String>,
+        /// Send the NameID as an `EncryptedID` to this certificate.
+        pub encrypt_name_id_to: Option<String>,
     }
 
     impl Logout {
@@ -218,6 +221,7 @@ pub mod test_idp {
                 status: SUCCESS.into(),
                 signer: Some(0),
                 relay: Some("idp-relay".into()),
+                encrypt_name_id_to: None,
             }
         }
 
@@ -234,9 +238,14 @@ pub mod test_idp {
             let at = instant(self.issued_ms);
             if self.is_request() {
                 let indexes: String = self.session_indexes.iter().map(|i| format!("<samlp:SessionIndex>{i}</samlp:SessionIndex>")).collect();
+                let plain = format!(r#"<saml:NameID Format="urn:oasis:names:tc:SAML:2.0:nameid-format:persistent">{}</saml:NameID>"#, self.name_id);
+                let name_id = match &self.encrypt_name_id_to {
+                    Some(cert) => crate::sso::xmlenc::test_encrypter::Encrypt::default().encrypt_as("saml:EncryptedID", &plain, cert),
+                    None => plain,
+                };
                 format!(
-                    r#"<samlp:LogoutRequest xmlns:samlp="{PROTOCOL}" xmlns:saml="{ASSERTION}" ID="{}" Version="2.0" IssueInstant="{at}"{dest}><saml:Issuer>{}</saml:Issuer><saml:NameID Format="urn:oasis:names:tc:SAML:2.0:nameid-format:persistent">{}</saml:NameID>{indexes}</samlp:LogoutRequest>"#,
-                    self.id, self.issuer, self.name_id
+                    r#"<samlp:LogoutRequest xmlns:samlp="{PROTOCOL}" xmlns:saml="{ASSERTION}" ID="{}" Version="2.0" IssueInstant="{at}"{dest}><saml:Issuer>{}</saml:Issuer>{name_id}{indexes}</samlp:LogoutRequest>"#,
+                    self.id, self.issuer
                 )
             } else {
                 format!(
@@ -262,8 +271,8 @@ pub mod test_idp {
                 q += &format!("&RelayState={}", enc(r));
             }
             if let Some(s) = self.signer {
-                q += &format!("&SigAlg={}", enc(xmldsig::RSA_SHA256));
-                let sig = signers()[s].rsa_sha256(q.as_bytes());
+                q += &format!("&SigAlg={}", enc(signer(s).alg));
+                let sig = signer(s).sign_raw(q.as_bytes());
                 q += &format!("&Signature={}", enc(&sig));
             }
             q
@@ -273,7 +282,7 @@ pub mod test_idp {
         pub fn post(&self) -> HashMap<String, String> {
             let xml = self.xml();
             let xml = match self.signer {
-                Some(s) => signers()[s].sign(&xml, &self.id),
+                Some(s) => signer(s).sign(&xml, &self.id),
                 None => xml,
             };
             let mut f = HashMap::from([(self.param().to_string(), STANDARD.encode(xml))]);
@@ -289,7 +298,7 @@ mod tests {
     use super::*;
     use crate::sso::saml_sp::test_idp::{IDP, metadata, with_slo};
     use crate::sso::saml_sp::{SpKey, parse_idp_metadata};
-    use crate::sso::xmldsig::test_signer::signers;
+    use crate::sso::xmldsig::test_signer::{signer, signers};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
 
@@ -301,11 +310,11 @@ mod tests {
     }
 
     fn redirect(l: &Logout) -> Result<Received, &'static str> {
-        receive(&Incoming::Redirect(&l.redirect()), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW }).map_err(|e| e.0)
+        receive(&Incoming::Redirect(&l.redirect()), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).map_err(|e| e.0)
     }
 
     fn post(l: &Logout) -> Result<Received, &'static str> {
-        receive(&Incoming::Post(&l.post()), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW }).map_err(|e| e.0)
+        receive(&Incoming::Post(&l.post()), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).map_err(|e| e.0)
     }
 
     fn request() -> Logout {
@@ -339,24 +348,24 @@ mod tests {
         let signed = l.redirect();
         let forged = Logout { name_id: "00u1EVE".into(), signer: None, ..l.clone() }.redirect();
         let q = format!("{}&{}", forged.split('&').next().unwrap(), signed.split_once('&').unwrap().1);
-        assert_eq!(receive(&Incoming::Redirect(&q), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW }).unwrap_err().0, "bad_signature");
+        assert_eq!(receive(&Incoming::Redirect(&q), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "bad_signature");
         let mut form = l.post();
         let xml = String::from_utf8(STANDARD.decode(&form["SAMLRequest"]).unwrap()).unwrap().replace("00u1ADA", "00u1EVE");
         form.insert("SAMLRequest".into(), STANDARD.encode(xml));
-        assert_eq!(receive(&Incoming::Post(&form), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW }).unwrap_err().0, "bad_signature");
+        assert_eq!(receive(&Incoming::Post(&form), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "bad_signature");
 
         // A signature over another element, or a second message beside the signed one.
         let mut form = l.post();
         let xml = String::from_utf8(STANDARD.decode(&form["SAMLRequest"]).unwrap()).unwrap();
         let moved = xml.replacen("<ds:Signature", "<samlp:Extensions><ds:Signature", 1).replacen("</ds:Signature>", "</ds:Signature></samlp:Extensions>", 1);
         form.insert("SAMLRequest".into(), STANDARD.encode(moved));
-        assert_eq!(receive(&Incoming::Post(&form), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW }).unwrap_err().0, "wrapped");
+        assert_eq!(receive(&Incoming::Post(&form), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "wrapped");
         let doubled = xml.replacen("<saml:NameID", &format!(r#"<samlp:Extensions><x ID="{}"/></samlp:Extensions><saml:NameID"#, l.id), 1);
         form.insert("SAMLRequest".into(), STANDARD.encode(doubled));
-        assert_eq!(receive(&Incoming::Post(&form), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW }).unwrap_err().0, "wrapped");
+        assert_eq!(receive(&Incoming::Post(&form), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "wrapped");
         let comment = xml.replace("00u1ADA-Persistent", "00u1ADA<!---->-Persistent");
         form.insert("SAMLRequest".into(), STANDARD.encode(comment));
-        assert_eq!(receive(&Incoming::Post(&form), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW }).unwrap_err().0, "bad_message");
+        assert_eq!(receive(&Incoming::Post(&form), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "bad_message");
     }
 
     #[test]
@@ -377,17 +386,64 @@ mod tests {
         let l = request();
         let encrypted = l.xml().replacen(r#"<saml:NameID Format="urn:oasis:names:tc:SAML:2.0:nameid-format:persistent">00u1ADA-Persistent</saml:NameID>"#, "<saml:EncryptedID><x/></saml:EncryptedID>", 1);
         let q = l.redirect_xml(&encrypted);
-        assert_eq!(receive(&Incoming::Redirect(&q), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW }).unwrap_err().0, "encrypted_id");
+        assert_eq!(receive(&Incoming::Redirect(&q), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "encrypted_id");
         let expired = l.xml().replacen(r#" Version="2.0""#, &format!(r#" Version="2.0" NotOnOrAfter="{}""#, instant(NOW - SKEW_MS - 1)), 1);
-        assert_eq!(receive(&Incoming::Redirect(&l.redirect_xml(&expired)), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW }).unwrap_err().0, "expired");
+        assert_eq!(receive(&Incoming::Redirect(&l.redirect_xml(&expired)), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "expired");
         let dtd = format!(r#"<!DOCTYPE r [<!ENTITY x SYSTEM "file:///etc/passwd">]>{}"#, l.xml());
-        assert_eq!(receive(&Incoming::Redirect(&l.redirect_xml(&dtd)), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW }).unwrap_err().0, "bad_message");
+        assert_eq!(receive(&Incoming::Redirect(&l.redirect_xml(&dtd)), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "bad_message");
         let authn = l.xml().replace("LogoutRequest", "AuthnRequest");
-        assert_eq!(receive(&Incoming::Redirect(&l.redirect_xml(&authn)), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW }).unwrap_err().0, "bad_message");
+        assert_eq!(receive(&Incoming::Redirect(&l.redirect_xml(&authn)), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "bad_message");
         let as_response = Logout::response(SLO, "_ours", NOW);
         let swapped = Logout { signer: None, ..l.clone() }.redirect().replacen("SAMLRequest=", "SAMLResponse=", 1);
-        assert_eq!(receive(&Incoming::Redirect(&swapped), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW }).unwrap_err().0, "bad_message", "a request posing as a response");
+        assert_eq!(receive(&Incoming::Redirect(&swapped), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "bad_message", "a request posing as a response");
         assert!(redirect(&as_response).is_ok());
+    }
+
+    #[test]
+    fn encrypted_name_ids_in_logout_requests_are_decrypted_with_our_key() {
+        let (key, _) = SpKey::generate("SuperBot SAML SP encryption (okta)").unwrap();
+        let (other, _) = SpKey::generate("someone else").unwrap();
+        let mut l = request();
+        l.encrypt_name_id_to = Some(key.cert.clone());
+        let with = |k: Option<&SpKey>, form: &HashMap<String, String>| receive(&Incoming::Post(form), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: k }).map_err(|e| e.0);
+        let form = l.post();
+        assert!(matches!(with(Some(&key), &form), Ok(Received::Request { name_id, .. }) if name_id == "00u1ADA-Persistent"), "over HTTP-POST");
+        let q = l.redirect();
+        let got = receive(&Incoming::Redirect(&q), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: Some(&key) }).map_err(|e| e.0);
+        assert!(matches!(got, Ok(Received::Request { name_id, .. }) if name_id == "00u1ADA-Persistent"), "over HTTP-Redirect");
+        assert_eq!(with(None, &form), Err("encrypted_id"), "no encryption key: refused, as before");
+        assert_eq!(with(Some(&other), &form), Err("bad_encryption"), "encrypted to another key");
+
+        // Checked after the signature: an EncryptedID added beside the signed NameID is wrapping.
+        let mut unsigned = l.clone();
+        unsigned.signer = None;
+        assert_eq!(with(Some(&key), &unsigned.post()), Err("unsigned"));
+        let plain = request().post();
+        let xml = String::from_utf8(STANDARD.decode(&plain["SAMLRequest"]).unwrap()).unwrap();
+        let extra = crate::sso::xmlenc::test_encrypter::Encrypt::default().encrypt_as("saml:EncryptedID", r#"<saml:NameID>00u1EVE</saml:NameID>"#, &key.cert);
+        let both = xml.replacen("<saml:NameID", &format!("{extra}<saml:NameID"), 1);
+        let mut form = plain.clone();
+        form.insert("SAMLRequest".into(), STANDARD.encode(both));
+        assert_eq!(with(Some(&key), &form), Err("bad_signature"), "the signature covers the identifiers");
+        let r = request();
+        let both = r.xml().replacen("<saml:NameID", &format!("{extra}<saml:NameID"), 1);
+        form.insert("SAMLRequest".into(), STANDARD.encode(signer(0).sign(&both, &r.id)));
+        assert_eq!(with(Some(&key), &form), Err("wrapped"), "two identifiers, both signed");
+    }
+
+    #[test]
+    fn ecdsa_signed_logout_requests_verify_against_an_ecdsa_idp_certificate() {
+        for s in [2, 3] {
+            let md = crate::sso::saml_sp::test_idp::metadata_signed_by(s);
+            let idp = parse_idp_metadata(&with_slo(&md), IDP, false).unwrap();
+            let mut l = request();
+            l.signer = Some(s);
+            for incoming in [Incoming::Redirect(&l.redirect()), Incoming::Post(&l.post())] {
+                assert!(matches!(receive(&incoming, &Expect { idp: &idp, slo_url: SLO, now_ms: NOW, decrypt: None }), Ok(Received::Request { .. })), "signer {s}");
+            }
+            l.signer = Some(if s == 2 { 3 } else { 2 });
+            assert_eq!(receive(&Incoming::Redirect(&l.redirect()), &Expect { idp: &idp, slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "bad_signature", "the other curve's key");
+        }
     }
 
     #[test]
