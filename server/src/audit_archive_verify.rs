@@ -9,19 +9,28 @@
 //! must reach as far as botd says it delivered. Then every event in it must have the same
 //! hash in this server's log, which catches a log rebuilt from a changed event on: its
 //! own chain holds, but it no longer matches what was archived.
+//!
+//! botd's daily self-check does the same for what is new since its last pass (ADR 0183):
+//! objects past the head that pass reached, picking the chain up from it, and any object
+//! the store says was written to since, wherever its events fall.
 
 use crate::audit_archive::{Archive, Lock};
 use crate::audit_chain::{Link, Range};
+use crate::audit_export::Exporter;
 use crate::db::now;
 use crate::machines::s3::{ObjectVersion, S3};
 use crate::runner::App;
 use rusqlite::types::Value as Sql;
+use rusqlite::OptionalExtension;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 /// Objects read at once.
 const PARALLEL: usize = 4;
+/// How far the store's clock may run behind botd's: an object written this long before
+/// the last pass began is still read as new.
+const CLOCK_SKEW_MS: i64 = 60 * 60 * 1000;
 /// Far above what 10,000 events take; an object larger than this isn't botd's.
 const MAX_OBJECT_BYTES: usize = 256 * 1024 * 1024;
 /// Problems the report lists; it counts them all.
@@ -74,6 +83,9 @@ pub struct Checked {
     /// The first event of the first batch botd cut for this archive, where it must begin.
     /// None for an archive started before botd recorded it.
     pub start: Option<i64>,
+    /// The head of the last passing check, which this one picked up from: only what is
+    /// new since was read. None for a check of the whole archive.
+    pub after: Option<i64>,
     /// Events whose hash this server's log has (`matched`), had before retention deleted
     /// them (`gone`), differs from (`mismatched`) or lacks (`missing`).
     pub matched: u64,
@@ -250,6 +262,17 @@ impl<'a> Walker<'a> {
         self
     }
 
+    /// Carries on from the last passing check: the next event must link to its head, and
+    /// events up to it are repeats, still compared with the log.
+    pub fn resuming(mut self, since: Option<&Since>) -> Walker<'a> {
+        if let Some(s) = since {
+            self.rep.after = Some(s.head.id);
+            self.rep.head = Some(s.head.clone());
+            self.last = Some(s.head.clone());
+        }
+        self
+    }
+
     fn problem(&mut self, key: Option<&str>, id: Option<i64>, reason: &'static str, error: String) {
         self.rep.problems += 1;
         if self.rep.first_problems.len() < MAX_LISTED {
@@ -396,6 +419,27 @@ impl<'a> Walker<'a> {
         }
     }
 
+    /// Resuming: the head the last pass reached must still have its hash in this server's
+    /// log. A log rebuilt from any event up to it changes that hash, so this catches one
+    /// rebuilt where the objects already checked, which aren't read again.
+    pub fn head_held(&mut self, here: Option<&Option<String>>, anchor: Option<&Link>) {
+        let Some(id) = self.rep.after else { return };
+        let Some(head) = self.rep.head.clone().filter(|h| h.id == id) else { return };
+        let error = match (here, anchor) {
+            (Some(Some(h)), _) if *h == head.hash => return,
+            (Some(_), _) => ("mismatch", format!("event {id}, where the last check of the archive ended, no longer has the hash it had then here: the log was rebuilt")),
+            (None, Some(a)) if a.id == id && a.hash != head.hash => ("mismatch", format!("the anchor, event {id}, where the last check of the archive ended, no longer has the hash it had then")),
+            (None, Some(a)) if id <= a.id => return,
+            (None, _) => ("missing", format!("event {id}, where the last check of the archive ended, isn't in this server's log, and retention didn't delete it")),
+        };
+        match error.0 {
+            "mismatch" => self.rep.mismatched += 1,
+            _ => self.rep.missing += 1,
+        }
+        self.rep.local_breaks.push(id);
+        self.problem(None, Some(id), error.0, error.1);
+    }
+
     /// The archive couldn't be listed, or the log read: the check fails.
     pub fn fail(&mut self, error: String) {
         self.rep.error = Some(crate::secrets::redact::text(&error).into_owned());
@@ -419,7 +463,8 @@ impl<'a> Walker<'a> {
             };
             self.problem(None, Some(from), "behind", error);
         }
-        if let (Some(l), Some(first)) = (lo.filter(|_| start.is_some()), self.rep.first)
+        // Resuming, the start was checked before, and a gap after the head is a `link`.
+        if let (Some(l), Some(first)) = (lo.filter(|_| start.is_some() && self.rep.after.is_none()), self.rep.first)
             && self.rep.error.is_none()
             && first > l
             && l <= hi
@@ -442,6 +487,9 @@ struct Object {
     named: (i64, i64),
     versions: Vec<String>,
     hidden: bool,
+    /// When the store last took a version or delete marker of it, in ms; `i64::MAX` when
+    /// the listing doesn't say, so it always counts as new.
+    modified: i64,
 }
 
 /// One object read: its first version's headers and body, and whether a later version differs.
@@ -497,11 +545,12 @@ fn objects(prefix: &str, listed: Vec<ObjectVersion>, w: &mut Walker) -> Vec<Obje
         let Some(named) = ids(prefix, &v.key) else {
             if !v.marker && !by_key.contains_key(&v.key) {
                 w.stray(&v.key);
-                by_key.insert(v.key.clone(), Object { key: v.key, named: (0, -1), versions: Vec::new(), hidden: false });
+                by_key.insert(v.key.clone(), Object { key: v.key, named: (0, -1), versions: Vec::new(), hidden: false, modified: 0 });
             }
             continue;
         };
-        let o = by_key.entry(v.key.clone()).or_insert_with(|| Object { key: v.key.clone(), named, versions: Vec::new(), hidden: false });
+        let o = by_key.entry(v.key.clone()).or_insert_with(|| Object { key: v.key.clone(), named, versions: Vec::new(), hidden: false, modified: 0 });
+        o.modified = o.modified.max(v.modified.unwrap_or(i64::MAX));
         if v.marker {
             o.hidden |= v.latest;
         } else {
@@ -549,13 +598,88 @@ fn local(app: &App, lo: i64, hi: i64) -> rusqlite::Result<Local> {
     })
 }
 
+/// What botd knew of the archive when a check began, read before the listing so that
+/// what was delivered by then is in it.
+#[derive(Clone, Debug)]
+pub struct Basis {
+    /// How far botd says it got.
+    pub delivered: i64,
+    /// Whether it has cut any batch for this archive.
+    pub batches: bool,
+    /// The first event of its first batch, if recorded.
+    pub start: Option<i64>,
+}
+
+impl Basis {
+    pub fn read(app: &App, x: &Exporter) -> Basis {
+        Basis {
+            delivered: x.delivered(),
+            batches: app.db.audit_export_cursor(&format!("{}#batch", x.sink.id)).is_some(),
+            start: app.db.audit_export_cursor(&format!("{}#start", x.sink.id)),
+        }
+    }
+}
+
+/// Where the last passing check of an archive got to: its head, and when it began (ms).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Since {
+    pub head: Link,
+    pub at: i64,
+}
+
+/// Beside the sink's cursors, so another archive starts with a whole check.
+fn since_key(sink: &str) -> String {
+    format!("audit_export:{sink}#checked")
+}
+
+pub fn last_pass(app: &App, sink: &str) -> Option<Since> {
+    let raw: Option<String> = app.db.with_conn(|c| c.query_row("SELECT value FROM settings WHERE key = ?", [since_key(sink)], |r| r.get(0)).optional()).ok().flatten();
+    let v: Value = serde_json::from_str(&raw?).ok()?;
+    let head = Link::parse(&format!("{}:{}", v["id"].as_i64()?, v["hash"].as_str()?)).ok()?;
+    Some(Since { head, at: v["at"].as_i64()? })
+}
+
+fn save_pass(app: &App, sink: &str, s: &Since) -> rusqlite::Result<()> {
+    let v = json!({ "id": s.head.id, "hash": s.head.hash, "at": s.at }).to_string();
+    app.db.with_conn(|c| c.execute("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2", [since_key(sink), v]).map(|_| ()))
+}
+
+/// Saves a passing check's head as where the next daily check picks up. A check that
+/// failed, or reached nothing, leaves the last pass as it was.
+fn passed(app: &App, sink: &str, c: &Checked, at: i64) {
+    let Some(head) = c.head.clone().filter(|_| c.ok) else { return };
+    if let Err(e) = save_pass(app, sink, &Since { head, at }) {
+        crate::obs::log::log_warn!("Audit archive: couldn't save how far its check got ({e}); the next daily check reads from the last pass.");
+    }
+}
+
+/// `archive=on`: the whole archive, or `range`. A whole check that passes is where the
+/// daily check picks up next.
+pub async fn check_by_hand(app: &App, x: &Exporter, a: &Archive, range: Range, keys: &[Vec<u8>]) -> Checked {
+    let at = now();
+    let c = check(app, a, &Basis::read(app, x), range, None, keys).await;
+    if range.from.is_none() && range.to.is_none() {
+        passed(app, &x.sink.id, &c, at);
+    }
+    c
+}
+
+/// The daily check: what is new since the last pass, or the whole archive before the first.
+pub async fn check_new(app: &App, x: &Exporter, a: &Archive, keys: &[Vec<u8>]) -> Checked {
+    let at = now();
+    let since = last_pass(app, &x.sink.id);
+    let c = check(app, a, &Basis::read(app, x), Range::default(), since.as_ref(), keys).await;
+    passed(app, &x.sink.id, &c, at);
+    c
+}
+
 /// Checks the archive `a` within `range` against itself and this server's log, trusting
-/// checkpoints signed by `keys`. `delivered`: how far botd says it got, read before the
-/// listing; `batches`: whether it has cut any batch for this archive; `start`: the first
-/// event of its first batch, if recorded.
-pub async fn check(app: &App, a: &Archive, delivered: i64, batches: bool, start: Option<i64>, range: Range, keys: &[Vec<u8>]) -> Checked {
+/// checkpoints signed by `keys`. With `since`, only objects past its head, or written to
+/// since it began, are read, and the chain carries on from its head.
+pub async fn check(app: &App, a: &Archive, basis: &Basis, range: Range, since: Option<&Since>, keys: &[Vec<u8>]) -> Checked {
     use futures_util::StreamExt;
-    let mut w = Walker::new(a, delivered, keys).starting_at(start);
+    let (delivered, batches) = (basis.delivered, basis.batches);
+    let mut w = Walker::new(a, delivered, keys).starting_at(basis.start).resuming(since);
     let s3 = match S3::new(a.s3.clone()) {
         Ok(s) => s.called("the audit archive"),
         Err(e) => {
@@ -571,12 +695,22 @@ pub async fn check(app: &App, a: &Archive, delivered: i64, batches: bool, start:
         }
     };
     let mut todo = Vec::new();
+    let old = |o: &Object| since.is_some_and(|s| o.named.1 <= s.head.id && o.modified < s.at - CLOCK_SKEW_MS);
     for o in objects(&a.prefix, listed, &mut w) {
-        if range.from.is_some_and(|f| o.named.1 < f) || range.to.is_some_and(|t| o.named.0 > t) {
+        if range.from.is_some_and(|f| o.named.1 < f) || range.to.is_some_and(|t| o.named.0 > t) || old(&o) {
             w.skipped();
         } else {
             w.versions(o.versions.len() as u64 - 1, o.hidden);
             todo.push(o);
+        }
+    }
+    if let Some(s) = since {
+        match local(app, s.head.id, s.head.id) {
+            Ok(here) => w.head_held(here.hashes.get(&s.head.id), app.db.audit_chain_anchor().as_ref()),
+            Err(e) => {
+                w.fail(format!("couldn't read event {} of the audit log: {e}", s.head.id));
+                return w.finish(range, batches);
+            }
         }
     }
     let s3 = &s3;
@@ -609,7 +743,7 @@ pub async fn check(app: &App, a: &Archive, delivered: i64, batches: bool, start:
 /// What `audit.verified` records of an archive check: counts and the first problem.
 pub fn summary(c: &Checked) -> Value {
     serde_json::json!({
-        "ok": c.ok, "archive": c.archive, "objects": c.objects, "events": c.events, "first": c.first, "head": c.head, "delivered": c.delivered, "start": c.start,
+        "ok": c.ok, "archive": c.archive, "objects": c.objects, "skipped": c.skipped, "events": c.events, "first": c.first, "head": c.head, "delivered": c.delivered, "start": c.start, "after": c.after,
         "matched": c.matched, "altered": c.altered, "gone": c.gone, "mismatched": c.mismatched, "missing": c.missing, "locked": c.locked, "lockExpired": c.lock_expired,
         "checkpoints": c.checkpoints, "problems": c.problems, "firstProblem": c.first_problems.first(), "error": c.error,
     })
@@ -888,6 +1022,62 @@ mod tests {
         assert!(walk_from(4, &[(4, 6), (7, 9)], Range::default()).ok, "started later (AUDIT_EXPORT_START=new, or after retention)");
         assert!(walk_from(1, &[(4, 6), (7, 9)], Range { from: Some(4), to: None }).ok, "a range from later doesn't ask");
         assert!(walk(&[(4, 9)], "bucket", 9, &local(9)).ok, "no start recorded");
+    }
+
+    #[test]
+    fn a_daily_check_carries_on_from_the_last_pass() {
+        let a = archive("bucket");
+        let since = |hash_of_6: String| Since { head: Link { id: 6, hash: hash_of_6 }, at: now() };
+        let pass = since(hash(6));
+        let resume = |delivered: i64, objects: &[(i64, i64)], s: &Since, here: &Local| {
+            let mut w = Walker::new(&a, delivered, &[]).starting_at(Some(1)).resuming(Some(s));
+            w.head_held(here.hashes.get(&s.head.id), None);
+            for &(f, t) in objects {
+                w.object(&format!("prod/2026/11/24/{f:020}-{t:020}.jsonl"), (f, t), &meta(f, t), &body(f..=t), here, None);
+            }
+            w.finish(Range::default(), true)
+        };
+        let c = resume(9, &[(7, 9)], &pass, &local(9));
+        assert!(c.ok, "{c:?}");
+        assert_eq!((c.after, c.first, c.head.as_ref().map(|h| h.id), c.events, c.matched), (Some(6), Some(7), Some(9), 3, 3));
+        // Nothing new is fine while botd delivered nothing more, and `behind` once it did.
+        assert!(resume(6, &[], &pass, &local(6)).ok);
+        let c = resume(9, &[], &pass, &local(9));
+        assert_eq!((reasons(&c), c.first_problems[0].id), (vec!["behind"], Some(7)), "{c:?}");
+        // A gap right after the head is a `link`, not a `start`.
+        let c = resume(9, &[(8, 9)], &pass, &local(9));
+        assert_eq!((reasons(&c), c.first_problems[0].id), (vec!["link"], Some(8)), "{c:?}");
+        // A copy of events already checked, read because it was written since: repeats, still compared.
+        let c = resume(9, &[(4, 6), (7, 9)], &pass, &local(9));
+        assert_eq!((c.ok, c.repeated, c.matched), (true, 3, 6), "{c:?}");
+        let mut rebuilt = local(9);
+        rebuilt.hashes.insert(5, Some(hash(50)));
+        assert_eq!(reasons(&resume(9, &[(4, 6), (7, 9)], &pass, &rebuilt)), ["mismatch"]);
+    }
+
+    #[test]
+    fn the_last_pass_must_still_hold_in_this_servers_log() {
+        let a = archive("bucket");
+        let pass = Since { head: Link { id: 6, hash: hash(6) }, at: now() };
+        let held = |here: Option<&Option<String>>, anchor: Option<&Link>| {
+            let mut w = Walker::new(&a, 6, &[]).resuming(Some(&pass));
+            w.head_held(here, anchor);
+            w.finish(Range::default(), true)
+        };
+        assert!(held(Some(&Some(hash(6))), None).ok);
+        // Rebuilt from any event up to it: the head's hash here changed.
+        let c = held(Some(&Some(hash(60))), None);
+        assert_eq!((reasons(&c), c.local_breaks.clone(), c.mismatched), (vec!["mismatch"], vec![6], 1), "{c:?}");
+        assert!(c.first_problems[0].error.contains("the log was rebuilt"), "{c:?}");
+        assert_eq!(reasons(&held(None, None)), ["missing"]);
+        // Deleted by retention since: the anchor's hash is checked when it is the head.
+        assert!(held(None, Some(&Link { id: 9, hash: hash(9) })).ok);
+        assert!(held(None, Some(&Link { id: 6, hash: hash(6) })).ok);
+        assert_eq!(reasons(&held(None, Some(&Link { id: 6, hash: hash(60) }))), ["mismatch"]);
+        // A whole check has no last pass to hold.
+        let mut w = Walker::new(&a, 0, &[]);
+        w.head_held(Some(&Some(hash(60))), None);
+        assert!(w.finish(Range::default(), false).ok);
     }
 
     #[test]
