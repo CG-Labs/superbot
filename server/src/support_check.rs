@@ -603,12 +603,19 @@ fn check_backups(s: &Settings, now_ms: i64, before_upgrade: bool, copies: Option
     f.details(details)
 }
 
+/// A setting as botd's license loader reads it, with `LICENSE_KEY_FILE` taken from where
+/// the service runs.
+fn license_setting(s: &Settings, k: &str) -> String {
+    let v = s.get(k);
+    if k == "LICENSE_KEY_FILE" && !v.is_empty() { s.resolve(&v).display().to_string() } else { v }
+}
+
 /// The license as botd would load it, and the licensee's name to hide in a bundle.
 fn check_license(s: &Settings, data_dir: &Path, now_ms: i64) -> (Finding, Vec<String>) {
     let lic = crate::license::Licensing::new(crate::license::trusted(), data_dir);
     let testing = crate::license::testing_flag(&s.get("TESTING_MODE"));
     lic.set_testing(*testing.as_ref().unwrap_or(&false));
-    lic.load(|k| s.get(k));
+    lic.load(|k| license_setting(s, k));
     let st = lic.status();
     let names: Vec<String> = st.claims.as_ref().map(|c| c.sub.trim().to_string()).filter(|n| n.len() >= 2).into_iter().collect();
     let details = json!({ "mode": st.mode, "edition": st.edition(), "expiresAt": st.expires_at().map(support::rfc3339) });
@@ -1020,6 +1027,9 @@ mod tests {
         assert_eq!(home.data_dir(), PathBuf::from("/home/superbot/superbot/state"), "relative to where the unit runs botd");
         assert_eq!(home.backup_dir(), Some(PathBuf::from("/var/backups/superbot")));
         assert_eq!(home.resolve("keys/master.key"), PathBuf::from("/home/superbot/superbot/keys/master.key"));
+        let lic: BTreeMap<String, String> = [("LICENSE_KEY_FILE", "license.key")].map(|(k, v)| (k.to_string(), v.to_string())).into();
+        assert_eq!(license_setting(&Settings::new(None, Some(PathBuf::from("/home/superbot")), lic.clone()), "LICENSE_KEY_FILE"), "/home/superbot/superbot/license.key");
+        assert_eq!(license_setting(&Settings::new(None, None, lic), "LICENSE_KEY_FILE"), "license.key", "without --home, as botd would from here");
         assert_eq!(Settings::new(None, None, BTreeMap::new()).data_dir(), PathBuf::from("data"), "botd's own default");
         assert!(Settings::load(None, Some("/nonexistent/.env")).err().unwrap().contains("/nonexistent/.env"));
     }
