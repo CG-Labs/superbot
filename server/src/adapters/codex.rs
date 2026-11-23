@@ -8,6 +8,7 @@
 //! Sandbox (ADR 0055): `workspace-write` with the network on, else none at all.
 
 use super::{output, short, str_of, Adapter, AgentEvent, ModelOption, RunInput, Usage};
+use crate::tiers::{Endpoint, Protocol};
 use serde_json::Value;
 
 #[derive(Default)]
@@ -34,7 +35,50 @@ fn sandbox_config(s: &super::Sandbox) -> Vec<String> {
     c.into_iter().flat_map(|v| ["-c".to_string(), v]).collect()
 }
 
+/// The tiers file's endpoint the run's route names (ADR 0192), if any.
+fn endpoint(input: &RunInput) -> Option<&Endpoint> {
+    let p = input.provider.as_deref()?;
+    input.endpoints.iter().find(|e| e.name == p)
+}
+
+/// A tier endpoint's id in Codex: prefixed, so it never shadows a built-in.
+fn provider_id(name: &str) -> String {
+    format!("superbot-{name}")
+}
+
+/// Where Codex reads a tier endpoint's key from (`env_key`).
+fn key_var(name: &str) -> String {
+    format!("SUPERBOT_PROVIDER_{}_API_KEY", name.to_ascii_uppercase().replace('-', "_"))
+}
+
+/// `-c` overrides that make the endpoint the run's model provider (ADR 0192). They outrank
+/// the Bot's own `config.toml`. The key is set empty in what Codex's shell commands get, as
+/// Codex hands them variables named like keys by default. A run held to a data region
+/// also sends Codex's own analytics nowhere.
+fn endpoint_config(e: &Endpoint, held: bool) -> Vec<String> {
+    let q = |s: &str| Value::String(s.into()).to_string();
+    let (id, key) = (provider_id(&e.name), key_var(&e.name));
+    let mut c = vec![
+        format!("model_provider={}", q(&id)),
+        format!("model_providers.{id}={{name={},base_url={},env_key={},wire_api=\"responses\"}}", q(&id), q(&e.base_url), q(&key)),
+        format!("shell_environment_policy.set.{key}=\"\""),
+    ];
+    if held {
+        c.push("analytics.enabled=false".into());
+    }
+    c.into_iter().flat_map(|v| ["-c".to_string(), v]).collect()
+}
+
 impl Adapter for Codex {
+    fn endpoint_protocols(&self) -> &'static [Protocol] {
+        &[Protocol::OpenaiResponses]
+    }
+
+    fn env(&self, input: &RunInput) -> Vec<(String, String)> {
+        let Some(e) = endpoint(input) else { return Vec::new() };
+        vec![(key_var(&e.name), input.env.get(&e.key_secret).cloned().unwrap_or_default())]
+    }
+
     /// `~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<session>.jsonl` (or `.jsonl.zst`), and
     /// the same files once archived. Its indexes (`history.jsonl`, `session_index.jsonl`,
     /// `state_*.sqlite`) have no session id in their names, so they stay.
@@ -58,6 +102,9 @@ impl Adapter for Codex {
             None => a.push("--dangerously-bypass-approvals-and-sandbox".into()),
         }
         a.extend(["-c".into(), format!("developer_instructions={}", Value::String(input.system.clone()))]);
+        if let Some(e) = endpoint(input) {
+            a.extend(endpoint_config(e, !input.held_to.is_empty()));
+        }
         if let Some(m) = &input.model {
             a.extend(["-m".into(), m.clone()]);
         }

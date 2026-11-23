@@ -129,9 +129,10 @@ fn managed_config(input: &RunInput, secret_names: &[String]) -> Value {
             .endpoints
             .iter()
             .map(|e| {
+                // The tiers file gives Hermes no Responses endpoints (`endpoint_protocols`).
                 let transport = match e.protocol {
                     Protocol::AnthropicMessages => "anthropic_messages",
-                    Protocol::OpenaiChat => "chat_completions",
+                    Protocol::OpenaiChat | Protocol::OpenaiResponses => "chat_completions",
                 };
                 let (id, key) = (provider_id(&e.name), key_var(&e.name));
                 let entry = json!({
@@ -214,6 +215,10 @@ impl Adapter for Hermes {
 
     fn supports_provider(&self) -> bool {
         true
+    }
+
+    fn endpoint_protocols(&self) -> &'static [Protocol] {
+        &[Protocol::AnthropicMessages, Protocol::OpenaiChat]
     }
 
     /// `SUPERBOT_HERMES_BASE_URL` gets the prompts and the provider key, so it is held to

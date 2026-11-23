@@ -178,6 +178,28 @@ async fn a_harness_logs_in_on_the_users_machine_and_only_then_runs_there() {
 }
 
 #[tokio::test]
+async fn a_route_to_a_tier_endpoint_needs_no_login_on_the_machine() {
+    let mut env = serve_with(|e| e.with_logins()).await;
+    let tiers = r#"{
+      "providers": { "uk-claude": { "protocol": "anthropic-messages", "baseUrl": "https://uk.claude.example", "keySecret": "LOGINS_E2E_UK_KEY", "regions": ["gb-lon"] } },
+      "tiers": [{ "name": "pro", "label": "Pro", "routes": [{ "harness": "claude", "provider": "uk-claude", "model": "claude-sonnet-5-5" }] }]
+    }"#;
+    env.app.tiers.set(Arc::new(crate::tiers::Tiers::parse(tiers, None).unwrap())).unwrap();
+    let (user, mid, token) = machine_for(&env, "ada@example.com").await;
+    agent_with(&mut env, &mid, &token, CLAUDE).await;
+    crate::secrets::global().user_put(&user, "LOGINS_E2E_UK_KEY", "sk-uk-test-4c1d").unwrap();
+    let bot = owned_bot(&env, &user);
+
+    // Not logged in there, but the route brings its key (ADR 0192).
+    let before = send(&env, &bot, "hello").await;
+    assert_eq!(reply_after(&env, &bot, before).await, "ran on the machine");
+    assert_eq!(refusals(&events(&env, "bot.run_refused").await, "harness_not_logged_in"), 0);
+    let invoked = events(&env, "harness.invoked").await;
+    assert_eq!(invoked[0]["details"]["provider"], "uk-claude", "{}", invoked[0]);
+    crate::secrets::global().user_delete(&user, "LOGINS_E2E_UK_KEY").unwrap();
+}
+
+#[tokio::test]
 async fn a_login_can_be_stopped_and_only_known_harnesses_log_in() {
     let mut env = serve_with(|e| e.with_logins()).await;
     let (user, mid, token) = machine_for(&env, "ada@example.com").await;
