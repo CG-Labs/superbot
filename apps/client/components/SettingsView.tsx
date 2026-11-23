@@ -6,12 +6,13 @@ import { useAppLock } from "./AppLock";
 import { Chips } from "./Chips";
 import { PushCard, type PushApi } from "./PushCard";
 import { ResidencyCard, type ResidencyApi } from "./ResidencyCard";
+import { RoleRequestsCard, type RoleRequestsApi } from "./RoleRequestsCard";
 import { TwoFactorCard, type MfaApi } from "./TwoFactor";
 
 interface Props {
   onBack: () => void;
-  /** The signed-in server, for this phone's push notifications (ADR 0080), your second factor (ADR 0094) and your data's residency pin (ADR 0168). */
-  api?: PushApi & MfaApi & ResidencyApi;
+  /** The signed-in server, for this phone's push notifications (ADR 0080), your second factor (ADR 0094), your data's residency pin (ADR 0168) and requests for roles (ADR 0209). */
+  api?: PushApi & MfaApi & ResidencyApi & RoleRequestsApi;
   /** Admins also set who must use two-factor authentication. */
   admin?: boolean;
 }
@@ -31,6 +32,7 @@ export function SettingsView({ onBack, api, admin = false }: Props) {
         {api ? <PushCard api={api} /> : null}
         {api ? <TwoFactorCard api={api} admin={admin} /> : null}
         {api ? <ResidencyCard api={api} /> : null}
+        {api && !admin ? <RoleRequestsCard api={api} /> : null}
       </ScrollView>
     </View>
   );

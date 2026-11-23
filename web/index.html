@@ -112,6 +112,11 @@
 
     <section id="tab-roles" hidden>
       <p class="hint">A custom role is a base role (member or read-only) plus permissions an admin gives away; it never adds up to admin. Given across the server, its base becomes the person's role. Given within a team, only its team permissions apply, there. Changes apply at once and are audited.</p>
+      <div id="role-requests" hidden>
+        <h2>Requests for roles</h2>
+        <p class="hint">People ask for a requestable, time-bound role with a reason (ADR 0209). Approve it for as long as asked or shorter, from now; it ends by itself. Nobody decides their own. Undecided requests lapse in 7 days.</p>
+        <div id="role-requests-list"></div>
+      </div>
       <div id="roles-list"></div>
       <div class="empty" id="roles-empty" hidden></div>
       <form class="card" id="role-form" autocomplete="off">
@@ -127,6 +132,7 @@
           <label title="Time-bound (ADR 0197): given only by hand, with an end at most this many days away. Never to SCIM or SAML groups or service accounts.">Time limit
             <input id="role-max-days" type="number" min="1" max="365" step="1" placeholder="None" />
           </label>
+          <label title="People may ask for it from the app's Settings, with a reason; an admin approves each request (ADR 0209). Only a time-bound role can be requested."><input id="role-requestable" type="checkbox" /> People may request it</label>
         </div>
         <div class="bar"><input id="role-description" class="wide" placeholder="What it's for (optional)" maxlength="500" /></div>
         <div class="perms" id="role-perms"></div>

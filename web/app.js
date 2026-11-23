@@ -716,19 +716,23 @@ $("add-team").addEventListener("submit", async (e) => {
 
 // Roles tab: build, change and delete custom roles, and give them to people.
 
-const rolesTab = { details: {}, people: [], teams: [], editing: null };
+const rolesTab = { details: {}, people: [], teams: [], requests: [], requestsError: null, editing: null };
 
 async function loadRoles({ keepForm = false } = {}) {
   try {
     roles = await api("GET", "/api/roles");
-    const [details, people, allTeams] = await Promise.all([
+    const [details, people, allTeams, requests] = await Promise.all([
       Promise.all(roles.roles.map((r) => api("GET", `/api/roles/${key(r.id)}`))),
       api("GET", "/api/users").catch(() => []),
       api("GET", "/api/teams").then((v) => v.teams || []).catch(() => []),
+      // Servers from before requests for roles (ADR 0209) have none; any other failure is shown.
+      api("GET", "/api/role-requests?status=pending").then((v) => ({ list: v.requests || [] }), (err) => ({ list: [], error: err.status === 404 ? null : err.message })),
     ]);
     rolesTab.details = Object.fromEntries(details.map((d) => [d.id, d]));
     rolesTab.people = people;
     rolesTab.teams = allTeams;
+    rolesTab.requests = requests.list;
+    rolesTab.requestsError = requests.error || null;
     $("roles-empty").textContent = "No custom roles yet. Make one below to give part of admin away.";
   } catch (err) {
     $("roles-empty").textContent = err.message;
@@ -755,12 +759,31 @@ function giving(f, r) {
 }
 const endsText = (h) => (h.expiresAt ? ` · until ${esc(fmt(h.expiresAt))}` : "");
 
+// Requests for roles (ADR 0209): approve for as long as asked or shorter, or deny with a note.
+const hoursText = (h) => (h % 24 === 0 ? `${h / 24} day${h === 24 ? "" : "s"}` : `${h} hour${h === 1 ? "" : "s"}`);
+const SHORTER = [720, 168, 72, 24, 8, 4, 1];
+function requestCard(q) {
+  const where = q.team ? `in ${esc(q.team.name || "their team")}` : "across the server";
+  const yours = q.user?.id === me.user?.id;
+  const choices = [[q.hours, `${hoursText(q.hours)} (as asked)`], ...SHORTER.filter((h) => h < q.hours).map((h) => [h, hoursText(h)])];
+  return `<div class="card" data-request="${esc(q.id)}">
+    <div class="bar">${q.user ? who(q.user) : "Someone"} <span class="sub">asks for <b>${esc(q.role?.name || "a role")}</b> for ${esc(hoursText(q.hours))}, ${where} · lapses ${esc(fmt(q.expiresAt))}</span></div>
+    <p class="hint">“${esc(q.reason)}”${q.current ? ` · has ${esc(q.current.name)} now` : ""}${q.role?.applies?.length ? ` · adds ${esc(q.role.applies.join(", "))}` : ""}</p>
+    ${yours ? '<p class="sub">Your own request: another admin decides it.</p>' : `<form class="bar" data-act="decide-request" autocomplete="off">
+      <select name="hours" title="How long it's given for, from now">${choices.map(([h, label]) => `<option value="${h}">${esc(label)}</option>`).join("")}</select>
+      <input name="note" class="wide" placeholder="Note (optional, they see it)" maxlength="500" />
+      <button type="submit" class="btn primary" value="approve">Approve</button>
+      <button type="submit" class="btn" value="deny">Deny</button>
+    </form>`}
+  </div>`;
+}
+
 function roleCard(r) {
   const d = rolesTab.details[r.id] || { holders: { users: [], teams: [] } };
   const held = r.users + r.teamMembers > 0;
   const givable = rolesTab.teams.flatMap((t) => t.members.filter((m) => !d.holders.teams.some((h) => h.team.id === t.id && h.user.id === m.id)).map((m) => [t, m]));
   return `<div class="card" data-role="${esc(r.id)}">
-    <div class="bar"><b>${esc(r.name)}</b> <span class="sub">${esc(baseName(r.base))} + ${esc(permNames(r.permissions))} · ${esc(holdersText(r))}${r.maxDays ? ` · time-bound, at most ${r.maxDays} day${r.maxDays === 1 ? "" : "s"}` : ""}</span>
+    <div class="bar"><b>${esc(r.name)}</b> <span class="sub">${esc(baseName(r.base))} + ${esc(permNames(r.permissions))} · ${esc(holdersText(r))}${r.maxDays ? ` · time-bound, at most ${r.maxDays} day${r.maxDays === 1 ? "" : "s"}` : ""}${r.requestable ? " · people may request it" : ""}</span>
       <button type="button" class="btn push" data-act="edit-role">Edit</button>
       <button type="button" class="btn" data-act="delete-role" ${held ? 'disabled title="Take it away from everyone first"' : ""}>Delete</button></div>
     ${r.description ? `<p class="hint">${esc(r.description)}</p>` : ""}
@@ -786,6 +809,10 @@ function roleCard(r) {
 
 // `keepForm` keeps unsaved edits when only the holders changed.
 function renderRoles(keepForm = false) {
+  $("role-requests").hidden = !rolesTab.requests.length && !rolesTab.requestsError;
+  $("role-requests-list").innerHTML = (rolesTab.requestsError
+    ? `<div class="card"><p class="warn" role="alert">Couldn't load requests for roles: ${esc(rolesTab.requestsError)}</p><div class="bar"><button type="button" class="btn" id="role-requests-retry">Try again</button></div></div>`
+    : "") + rolesTab.requests.map(requestCard).join("");
   $("roles-empty").hidden = roles.roles.length > 0;
   $("roles-list").innerHTML = roles.roles.map(roleCard).join("")
     + `<datalist id="role-people">${rolesTab.people.filter((u) => !u.breakGlass && u.id !== me.user?.id).map((u) => `<option value="${esc(u.email || u.id)}">${esc(u.name)}</option>`).join("")}</datalist>`;
@@ -802,6 +829,8 @@ function renderRoleForm() {
   $("role-description").value = r?.description || "";
   $("role-base").value = r?.base || "member";
   $("role-max-days").value = r?.maxDays || "";
+  $("role-requestable").checked = !!r?.requestable;
+  showRequestable();
   $("role-perms").innerHTML = roles.permissions.map((p) => `<label><input type="checkbox" value="${esc(p.name)}" ${r?.permissions.includes(p.name) ? "checked" : ""} />
     <span><code>${esc(p.name)}</code>${p.team ? ' <span class="tag">also within a team</span>' : ""}<span class="sub">${esc(p.description)}</span></span></label>`).join("");
   showRoleEffective();
@@ -812,6 +841,13 @@ function showRoleEffective() {
   const perms = checkedPerms();
   $("role-effective").textContent = `Can do: ${effectivePerms($("role-base").value, perms).join(", ")}. Within a team: ${permNames(teamPerms(perms))}.`;
 }
+// Only a time-bound role can be requested.
+function showRequestable() {
+  const limited = !!$("role-max-days").value.trim();
+  $("role-requestable").disabled = !limited;
+  if (!limited) $("role-requestable").checked = false;
+}
+$("role-max-days").addEventListener("input", showRequestable);
 $("role-perms").addEventListener("change", showRoleEffective);
 $("role-base").addEventListener("change", showRoleEffective);
 $("role-cancel").addEventListener("click", () => {
@@ -822,7 +858,7 @@ $("role-cancel").addEventListener("click", () => {
 $("role-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const days = $("role-max-days").value.trim();
-  const body = { name: $("role-name").value.trim(), description: $("role-description").value.trim(), base: $("role-base").value, permissions: checkedPerms(), maxDays: days ? Number(days) : null };
+  const body = { name: $("role-name").value.trim(), description: $("role-description").value.trim(), base: $("role-base").value, permissions: checkedPerms(), maxDays: days ? Number(days) : null, requestable: !!days && $("role-requestable").checked };
   const r = roles.roles.find((x) => x.id === rolesTab.editing);
   if (rolesTab.editing && !r) return fail(new Error("That role didn't load. Reload the page before saving."));
   try {
@@ -842,6 +878,35 @@ $("role-form").addEventListener("submit", async (e) => {
 });
 
 const roleOf = (el) => roles.roles.find((r) => r.id === el.closest("[data-role]").dataset.role);
+
+$("role-requests-list").addEventListener("click", (e) => {
+  if (e.target.closest("#role-requests-retry")) loadRoles({ keepForm: true });
+});
+$("role-requests-list").addEventListener("submit", async (e) => {
+  const f = e.target.closest("form[data-act=decide-request]");
+  if (!f) return;
+  e.preventDefault();
+  const q = rolesTab.requests.find((x) => x.id === f.closest("[data-request]").dataset.request);
+  if (!q) return;
+  const approve = e.submitter?.value !== "deny";
+  const name = q.user?.name || q.user?.email || "them";
+  const note = f.note.value.trim();
+  try {
+    if (approve) {
+      const hours = Number(f.hours.value);
+      if (!confirm(`Give ${q.role?.name || "the role"} to ${name} for ${hoursText(hours)}, from now? It ends by itself.`)) return;
+      await api("POST", `/api/role-requests/${key(q.id)}/approve`, note ? { hours, note } : { hours });
+      notice(`Gave ${q.role?.name || "the role"} to ${name} for ${hoursText(hours)}.`, false);
+    } else {
+      if (!confirm(`Deny ${name}'s request for ${q.role?.name || "a role"}? They see your note and can ask again.`)) return;
+      await api("POST", `/api/role-requests/${key(q.id)}/deny`, note ? { note } : {});
+      notice(`Denied ${name}'s request.`, false);
+    }
+  } catch (err) {
+    fail(err);
+  }
+  loadRoles({ keepForm: true });
+});
 
 $("roles-list").addEventListener("click", async (e) => {
   const b = e.target.closest("button[data-act]");

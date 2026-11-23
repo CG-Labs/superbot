@@ -1,4 +1,5 @@
 import {
+  approveChoices,
   baseChangeWarning,
   defaultEnd,
   draftChanges,
@@ -10,8 +11,13 @@ import {
   endsAt,
   endsLabel,
   holdersLabel,
+  hoursLabel,
   parseMaxDays,
   permissionLabel,
+  requestChoices,
+  requestDraftError,
+  requestStatusLabel,
+  requestSummary,
   teamPermissions,
   togglePermission,
 } from "../roles";
@@ -104,6 +110,13 @@ describe("custom roles (ADR 0123, 0132)", () => {
     expect(draftChanges(old, { ...draftOf(old), name: "Help desk" })).toEqual({ name: "Help desk", permissions: old.permissions });
   });
 
+  it("sends requestable only when it changes", () => {
+    const r = role({ maxDays: 1 });
+    expect(draftOf(r).requestable).toBe(false);
+    expect(draftChanges(r, { ...draftOf(r), requestable: true })).toEqual({ requestable: true });
+    expect(draftChanges(role({ maxDays: 1, requestable: true }), { ...draftOf(r), requestable: true })).toBeNull();
+  });
+
   it("warns before a new base moves the people who have it", () => {
     expect(baseChangeWarning(role({ users: 2 }), draftOf(role()))).toBeNull();
     expect(baseChangeWarning(role(), { ...draftOf(role()), base: "readonly" })).toBeNull();
@@ -166,5 +179,56 @@ describe("time-bound roles (ADR 0197)", () => {
     expect(draftChanges(r, { ...draftOf(r), maxDays: undefined })).toBeNull();
     expect(draftChanges(role(), { ...draftOf(role()), maxDays: 30 })).toEqual({ maxDays: 30 });
     expect(draftChanges(role(), draftOf(role()))).toBeNull();
+  });
+});
+
+describe("requests for roles (ADR 0209)", () => {
+  const NOW = 1_000_000_000_000;
+  const HOUR = 3_600_000;
+
+  it("says how long in hours or days", () => {
+    expect(hoursLabel(1)).toBe("1 hour");
+    expect(hoursLabel(8)).toBe("8 hours");
+    expect(hoursLabel(24)).toBe("1 day");
+    expect(hoursLabel(72)).toBe("3 days");
+    expect(hoursLabel(30)).toBe("30 hours");
+  });
+
+  it("offers only lengths within the role's limit", () => {
+    expect(requestChoices(24).map((c) => c.value)).toEqual(["1", "4", "8", "24"]);
+    expect(requestChoices(7 * 24).map((c) => c.label)).toEqual(["1 hour", "4 hours", "8 hours", "1 day", "3 days", "7 days"]);
+  });
+
+  it("approves for as asked or shorter, never longer", () => {
+    expect(approveChoices(8).map((c) => c.value)).toEqual(["8", "4", "1"]);
+    expect(approveChoices(8)[0].label).toBe("8 hours (as asked)");
+    expect(approveChoices(1).map((c) => c.value)).toEqual(["1"]);
+    expect(approveChoices(30).map((c) => c.value)).toEqual(["30", "24", "8", "4", "1"]);
+  });
+
+  it("needs a role and a reason", () => {
+    expect(requestDraftError({ role: "", reason: "x" })).toMatch(/role/);
+    expect(requestDraftError({ role: "r1", reason: "  " })).toMatch(/why/);
+    expect(requestDraftError({ role: "r1", reason: "x".repeat(501) })).toMatch(/500/);
+    expect(requestDraftError({ role: "r1", reason: "Incident 42" })).toBeNull();
+  });
+
+  it("says where a request is", () => {
+    const q = { status: "pending" as const, grantedUntil: null, note: null, expiresAt: NOW + 6.5 * 24 * HOUR };
+    expect(requestStatusLabel(q, NOW)).toBe("Waiting for an admin · lapses in 7 days");
+    expect(requestStatusLabel({ ...q, expiresAt: NOW + HOUR }, NOW)).toBe("Waiting for an admin · lapses in 1 day");
+    expect(requestStatusLabel({ ...q, status: "approved", grantedUntil: NOW + 3 * HOUR }, NOW)).toMatch(/^Approved · ends/);
+    expect(requestStatusLabel({ ...q, status: "approved", grantedUntil: NOW - HOUR }, NOW)).toMatch(/^Approved/);
+    expect(requestStatusLabel({ ...q, status: "denied", note: "Use the runbook" }, NOW)).toBe("Denied: Use the runbook");
+    expect(requestStatusLabel({ ...q, status: "denied" }, NOW)).toBe("Denied");
+    expect(requestStatusLabel({ ...q, status: "cancelled" }, NOW)).toBe("Withdrawn");
+    expect(requestStatusLabel({ ...q, status: "lapsed" }, NOW)).toMatch(/^Lapsed/);
+  });
+
+  it("sums up who asks for what, where", () => {
+    const q = { user: { id: "u1", name: "Ada", email: "ada@example.com" }, role: { id: "r1", name: "On-call", maxDays: 1, permissions: [], applies: [] }, hours: 8, team: null };
+    expect(requestSummary(q)).toBe("Ada (ada@example.com) asks for On-call for 8 hours, across the server");
+    expect(requestSummary({ ...q, team: { id: "t1", name: "Ops" } })).toBe("Ada (ada@example.com) asks for On-call for 8 hours, in Ops");
+    expect(requestSummary({ ...q, user: null, role: null })).toBe("Someone asks for a role for 8 hours, across the server");
   });
 });

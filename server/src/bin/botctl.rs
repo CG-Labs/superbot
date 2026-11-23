@@ -68,19 +68,31 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl roles                                     Custom roles (ADR 0123), the permissions they're built from,
                                                    and the built-in roles as presets of them
   botctl role show <role>                          A role (id or name), its effective permissions, and who has it
-  botctl role add "<name>" [--base member|readonly] [--perms <a,b>] [--description "<text>"] [--max-days <n>]
+  botctl role add "<name>" [--base member|readonly] [--perms <a,b>] [--description "<text>"] [--max-days <n>] [--requestable yes|no]
                                                    A role on member (default) or read-only, plus permissions:
                                                    users.manage, bots.manage, audit.view, billing.manage,
                                                    signups.approve, machines.manage. With --max-days it is
                                                    time-bound (ADR 0197): given only by hand, for at most <n> days
-  botctl role edit <role> [--name "<name>"] [--base member|readonly] [--perms <a,b>|none] [--description "<text>"] [--max-days <n>|none]
-                                                   A new base applies at once to everyone who has it
+  botctl role edit <role> [--name "<name>"] [--base member|readonly] [--perms <a,b>|none] [--description "<text>"] [--max-days <n>|none] [--requestable yes|no]
+                                                   A new base applies at once to everyone who has it. With
+                                                   --requestable yes people may ask for it (ADR 0209); only
+                                                   a time-bound role can be
   botctl role rm <role>                            Delete it, once nobody has it
   botctl role assign <role> <user> [--team <team>] [--for <n>h|<n>d] [--reason "<text>"]
                                                    Give it across the server (its base becomes their role), or
                                                    with --team only in that team (its team permissions). With
                                                    --for it ends by itself; a time-bound role needs it
   botctl role unassign <role> <user> [--team <team>]  Take it away; across the server they keep its base
+  botctl role request <role> --for <n>h|<n>d --reason "<text>" [--team]
+                                                   Ask for a requestable role (ADR 0209) for that long from
+                                                   when an admin approves it; with --team, in your own team
+  botctl role my-requests                          The roles you may request, and your requests
+  botctl role withdraw <request>                   Withdraw your pending request
+  botctl role requests [pending|approved|denied|cancelled|lapsed|all]
+                                                   Requests for roles (admins); pending ones by default
+  botctl role approve <request> [--for <n>h|<n>d] [--note "<text>"]
+                                                   Give the role for the time asked, or less (--for)
+  botctl role deny <request> [--note "<text>"]     Turn it down
   botctl service-accounts                          Service accounts (ADR 0143): non-human callers for scripts
                                                    and integrations. Admins see all; others with users.manage
                                                    the ones they own
@@ -1344,7 +1356,7 @@ fn role_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
 
 /// `role_request` with `now` (Unix ms) for `--for`.
 fn role_request_at(args: &[&str], now: i64) -> Result<(&'static str, String, Option<String>), String> {
-    const USAGE: &str = "Usage: botctl roles | role show <role> | role add \"<name>\" [--base member|readonly] [--perms a,b] [--description TEXT] [--max-days N] | role edit <role> [--name NAME] [--base B] [--perms a,b|none] [--description TEXT] [--max-days N|none] | role rm <role> | role assign <role> <user> [--team <team>] [--for <n>h|<n>d] [--reason TEXT] | role unassign <role> <user> [--team <team>]";
+    const USAGE: &str = "Usage: botctl roles | role show <role> | role add \"<name>\" [--base member|readonly] [--perms a,b] [--description TEXT] [--max-days N] | role edit <role> [--name NAME] [--base B] [--perms a,b|none] [--description TEXT] [--max-days N|none] | role rm <role> | role assign <role> <user> [--team <team>] [--for <n>h|<n>d] [--reason TEXT] | role unassign <role> <user> [--team <team>] | role request <role> --for <n>h|<n>d --reason TEXT [--team] | role requests [pending|approved|denied|cancelled|lapsed|all] | role my-requests | role approve <request> [--for <n>h|<n>d] [--note TEXT] | role deny <request> [--note TEXT] | role withdraw <request>";
     let max_days = |v: &str| -> Result<Value, String> {
         if v == "none" {
             return Ok(Value::Null);
@@ -1369,7 +1381,15 @@ fn role_request_at(args: &[&str], now: i64) -> Result<(&'static str, String, Opt
         }
         json!(v.split(',').map(str::trim).filter(|p| !p.is_empty()).collect::<Vec<_>>())
     };
+    let requestable = |v: &str| match v {
+        "yes" => Ok(json!(true)),
+        "no" => Ok(json!(false)),
+        _ => Err(format!("--requestable is yes or no. {USAGE}")),
+    };
+    // Requests for roles (ADR 0209) are in hours, from when they're approved.
+    let hours = |v: &str| -> Result<i64, String> { until(v).map(|t| (t - now) / (60 * 60_000)) };
     let at = |id: &str| format!("/api/roles/{}", encode(id));
+    let request_at = |id: &str, verb: &str| format!("/api/role-requests/{}/{verb}", encode(id));
     let holder = |id: &str, user: &str, rest: &[&str]| match flag(rest, "--team") {
         Some(team) => format!("{}/teams/{}/users/{}", at(id), encode(team), encode(user)),
         None => format!("{}/users/{}", at(id), encode(user)),
@@ -1387,15 +1407,18 @@ fn role_request_at(args: &[&str], now: i64) -> Result<(&'static str, String, Opt
         [] | ["list"] => ("GET", "/api/roles".into(), None),
         ["show", id] => ("GET", at(id), None),
         ["add", name, rest @ ..] if !name.starts_with("--") => {
-            known(rest, &["--base", "--perms", "--description", "--max-days"])?;
+            known(rest, &["--base", "--perms", "--description", "--max-days", "--requestable"])?;
             let mut body = json!({ "name": name, "base": flag(rest, "--base"), "description": flag(rest, "--description"), "permissions": perms(flag(rest, "--perms").unwrap_or("none")) });
             if let Some(v) = flag(rest, "--max-days") {
                 body["maxDays"] = max_days(v)?;
             }
+            if let Some(v) = flag(rest, "--requestable") {
+                body["requestable"] = requestable(v)?;
+            }
             ("POST", "/api/roles".into(), Some(body.to_string()))
         }
         ["edit", id, rest @ ..] if !id.starts_with("--") && !rest.is_empty() => {
-            known(rest, &["--name", "--base", "--perms", "--description", "--max-days"])?;
+            known(rest, &["--name", "--base", "--perms", "--description", "--max-days", "--requestable"])?;
             let mut body = Map::new();
             for (opt, field) in [("--name", "name"), ("--base", "base"), ("--description", "description")] {
                 if let Some(v) = flag(rest, opt) {
@@ -1407,6 +1430,9 @@ fn role_request_at(args: &[&str], now: i64) -> Result<(&'static str, String, Opt
             }
             if let Some(v) = flag(rest, "--max-days") {
                 body.insert("maxDays".into(), max_days(v)?);
+            }
+            if let Some(v) = flag(rest, "--requestable") {
+                body.insert("requestable".into(), requestable(v)?);
             }
             ("PATCH", at(id), Some(Value::Object(body).to_string()))
         }
@@ -1426,6 +1452,36 @@ fn role_request_at(args: &[&str], now: i64) -> Result<(&'static str, String, Opt
             known(rest, &["--team"])?;
             ("DELETE", holder(id, user, rest), None)
         }
+        ["request", id, rest @ ..] if !id.starts_with("--") => {
+            let team = rest.contains(&"--team");
+            let rest: Vec<&str> = rest.iter().copied().filter(|a| *a != "--team").collect();
+            known(&rest, &["--for", "--reason"])?;
+            let (Some(f), Some(reason)) = (flag(&rest, "--for"), flag(&rest, "--reason")) else {
+                return Err(format!("A request needs --for and --reason. {USAGE}"));
+            };
+            let body = json!({ "role": id, "scope": if team { "team" } else { "org" }, "hours": hours(f)?, "reason": reason });
+            ("POST", "/api/me/role-requests".into(), Some(body.to_string()))
+        }
+        ["requests"] => ("GET", "/api/role-requests".into(), None),
+        ["requests", status] if !status.starts_with("--") => ("GET", format!("/api/role-requests?status={}", encode(status)), None),
+        ["my-requests"] => ("GET", "/api/me/role-requests".into(), None),
+        ["approve", id, rest @ ..] if !id.starts_with("--") => {
+            known(rest, &["--for", "--note"])?;
+            let mut body = Map::new();
+            if let Some(v) = flag(rest, "--for") {
+                body.insert("hours".into(), json!(hours(v)?));
+            }
+            if let Some(v) = flag(rest, "--note") {
+                body.insert("note".into(), json!(v));
+            }
+            ("POST", request_at(id, "approve"), Some(Value::Object(body).to_string()))
+        }
+        ["deny", id, rest @ ..] if !id.starts_with("--") => {
+            known(rest, &["--note"])?;
+            let body = flag(rest, "--note").map_or_else(|| json!({}), |n| json!({ "note": n }));
+            ("POST", request_at(id, "deny"), Some(body.to_string()))
+        }
+        ["withdraw", id] => ("POST", format!("/api/me/role-requests/{}/cancel", encode(id)), None),
         _ => return Err(USAGE.into()),
     })
 }
@@ -1446,6 +1502,21 @@ fn role_assigned(verb: &str, res: &Value) -> String {
         _ => format!("Taken away. {who} keeps {} as their role.", res["user"]["role"].as_str().unwrap_or_default()),
     };
     if verb == "assign" { said + &ends } else { said }
+}
+
+/// What `botctl role request|approve|deny|withdraw` prints (ADR 0209).
+fn role_request_said(verb: &str, res: &Value) -> String {
+    let q = if verb == "approve" { &res["request"] } else { res };
+    let (id, name) = (q["id"].as_str().unwrap_or_default(), q["role"]["name"].as_str().unwrap_or_default());
+    let who = q["user"]["email"].as_str().or(q["user"]["name"].as_str()).unwrap_or_default();
+    let place = q["team"]["name"].as_str().map(|t| format!(" in {t}")).unwrap_or_default();
+    let when = |ms: Option<i64>| ms.and_then(chrono::DateTime::from_timestamp_millis).map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default();
+    match verb {
+        "request" => format!("Asked for {name}{place} for {} hours ({id}). An admin decides; it lapses {} if nobody does.", q["hours"], when(q["expiresAt"].as_i64())),
+        "approve" => format!("Approved. {who} has {name}{place} until {}.", when(q["grantedUntil"].as_i64())),
+        "deny" => format!("Denied {who}'s request for {name}{place}."),
+        _ => format!("Withdrawn: your request for {name}{place}."),
+    }
 }
 
 /// `botctl service-accounts` and `botctl service-account ...` (ADR 0143). The server checks
@@ -2100,6 +2171,7 @@ fn run(args: &[String]) -> Result<String, String> {
             match rest.first() {
                 Some(&("rm" | "delete")) => Ok("Deleted.".into()),
                 Some(&verb @ ("assign" | "unassign")) => Ok(role_assigned(verb, &serde_json::from_str(&res).map_err(|e| e.to_string())?)),
+                Some(&verb @ ("request" | "approve" | "deny" | "withdraw")) => Ok(role_request_said(verb, &serde_json::from_str(&res).map_err(|e| e.to_string())?)),
                 _ => Ok(pretty(res)),
             }
         }
@@ -3808,6 +3880,49 @@ mod tests {
         assert_eq!(role_assigned("unassign", &team), "Taken away from ada@example.com in Ops.");
         let ends = json!({ "user": { "email": "ada@example.com", "role": "readonly" }, "role": { "name": "Auditor", "expiresAt": 1_795_000_000_000i64 } });
         assert_eq!(role_assigned("assign", &ends), "ada@example.com has Auditor now; their role is readonly. It ends 2026-11-18 11:06 UTC.");
+    }
+
+    #[test]
+    fn role_request_commands() {
+        let at = |a: &[&str]| role_request_at(a, 1_000).map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())));
+        assert_eq!(
+            at(&["request", "On-call", "--for", "8h", "--reason", "Incident 42"]),
+            Ok(("POST", "/api/me/role-requests".into(), Some(json!({ "role": "On-call", "scope": "org", "hours": 8, "reason": "Incident 42" }))))
+        );
+        assert_eq!(
+            at(&["request", "Team helpdesk", "--team", "--for", "2d", "--reason", "Onboarding"]),
+            Ok(("POST", "/api/me/role-requests".into(), Some(json!({ "role": "Team helpdesk", "scope": "team", "hours": 48, "reason": "Onboarding" }))))
+        );
+        assert_eq!(at(&["requests"]), Ok(("GET", "/api/role-requests".into(), None)));
+        assert_eq!(at(&["requests", "all"]), Ok(("GET", "/api/role-requests?status=all".into(), None)));
+        assert_eq!(at(&["my-requests"]), Ok(("GET", "/api/me/role-requests".into(), None)));
+        assert_eq!(at(&["approve", "rq1"]), Ok(("POST", "/api/role-requests/rq1/approve".into(), Some(json!({})))));
+        assert_eq!(at(&["approve", "rq1", "--for", "4h", "--note", "Shorter"]), Ok(("POST", "/api/role-requests/rq1/approve".into(), Some(json!({ "hours": 4, "note": "Shorter" })))));
+        assert_eq!(at(&["deny", "rq1", "--note", "Use the runbook"]), Ok(("POST", "/api/role-requests/rq1/deny".into(), Some(json!({ "note": "Use the runbook" })))));
+        assert_eq!(at(&["withdraw", "rq1"]), Ok(("POST", "/api/me/role-requests/rq1/cancel".into(), None)));
+        assert_eq!(at(&["edit", "r1", "--requestable", "yes"]), Ok(("PATCH", "/api/roles/r1".into(), Some(json!({ "requestable": true })))));
+        assert_eq!(at(&["add", "On-call", "--max-days", "1", "--requestable", "no"]).unwrap().2.unwrap()["requestable"], false);
+        for bad in [
+            &["request", "On-call"][..],
+            &["request", "On-call", "--for", "8h"],
+            &["request", "On-call", "--reason", "x"],
+            &["request", "On-call", "--for", "8", "--reason", "x"],
+            &["request", "--for", "8h", "--reason", "x"],
+            &["approve", "rq1", "--hours", "4"],
+            &["deny", "rq1", "--for", "4h"],
+            &["edit", "r1", "--requestable", "maybe"],
+            &["withdraw"],
+        ] {
+            assert!(at(bad).is_err(), "{bad:?}");
+        }
+
+        let q = json!({ "id": "rq1", "role": { "name": "On-call" }, "user": { "email": "ada@example.com" }, "hours": 8, "expiresAt": 1_795_000_000_000i64, "grantedUntil": 1_795_000_000_000i64, "team": null });
+        assert_eq!(role_request_said("request", &q), "Asked for On-call for 8 hours (rq1). An admin decides; it lapses 2026-11-18 11:06 UTC if nobody does.");
+        assert_eq!(role_request_said("approve", &json!({ "request": q })), "Approved. ada@example.com has On-call until 2026-11-18 11:06 UTC.");
+        assert_eq!(role_request_said("deny", &q), "Denied ada@example.com's request for On-call.");
+        let mut team = q.clone();
+        team["team"] = json!({ "name": "Ops" });
+        assert_eq!(role_request_said("withdraw", &team), "Withdrawn: your request for On-call in Ops.");
     }
 
     #[test]

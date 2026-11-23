@@ -26,6 +26,7 @@ import type {
   ModelOption,
   MyTeamInvite,
   MyResidency,
+  MyRoleRequests,
   MyUsage,
   OffboardingPreview,
   NewPolicyRule,
@@ -43,6 +44,10 @@ import type {
   Role,
   RoleDraft,
   RoleGiving,
+  RoleRequest,
+  RoleRequestDraft,
+  RoleRequestStatus,
+  RoleRequestsView,
   RolesView,
   Routine,
   ServerConfig,
@@ -788,6 +793,35 @@ export class SuperBotApi {
 
   async unassignTeamRole(id: string, team: string, user: string): Promise<void> {
     await this.request("DELETE", `/api/roles/${encodeURIComponent(id)}/teams/${encodeURIComponent(team)}/users/${encodeURIComponent(user)}`);
+  }
+
+  // Requests for roles (ADR 0209): anyone asks, admins decide.
+
+  /** The roles you may request, and your requests. */
+  async myRoleRequests(): Promise<MyRoleRequests> {
+    return this.request<MyRoleRequests>("GET", "/api/me/role-requests");
+  }
+
+  async requestRole(draft: RoleRequestDraft): Promise<RoleRequest> {
+    return this.request<RoleRequest>("POST", "/api/me/role-requests", draft);
+  }
+
+  async withdrawRoleRequest(id: string): Promise<RoleRequest> {
+    return this.request<RoleRequest>("POST", `/api/me/role-requests/${encodeURIComponent(id)}/cancel`);
+  }
+
+  /** Admins: pending requests by default. */
+  async roleRequests(status: RoleRequestStatus | "all" = "pending"): Promise<RoleRequestsView> {
+    return this.request<RoleRequestsView>("GET", `/api/role-requests?status=${encodeURIComponent(status)}`);
+  }
+
+  /** Gives the role for the hours asked, or `hours` when fewer. */
+  async approveRoleRequest(id: string, body: { hours?: number; note?: string } = {}): Promise<{ request: RoleRequest; role: CustomRoleRef }> {
+    return this.request<{ request: RoleRequest; role: CustomRoleRef }>("POST", `/api/role-requests/${encodeURIComponent(id)}/approve`, body);
+  }
+
+  async denyRoleRequest(id: string, note?: string): Promise<RoleRequest> {
+    return this.request<RoleRequest>("POST", `/api/role-requests/${encodeURIComponent(id)}/deny`, note ? { note } : {});
   }
 
   // Service accounts: admins in the apps (ADR 0143, 0152).

@@ -147,7 +147,7 @@ async fn the_console_is_an_admin_page_without_chat_bots_or_screens() {
         assert!(!CONSOLE_JS.contains(gone) && !html.contains(gone), "{gone} is still in the console");
     }
     let calls = api_calls(CONSOLE_JS);
-    for want in ["/api/users", "/api/signups/x/approve", "/api/machines", "/api/users/x/machine/suspend", "/api/audit", "/api/audit/export.csv", "/api/policy", "/api/secrets/x", "/api/scim/tokens", "/api/setup", "/api/license", "/api/teams", "/api/teams/x/members/x", "/api/roles", "/api/roles/x/users/x", "/api/roles/x/teams/x/users/x", "/api/service-accounts", "/api/service-accounts/x", "/api/service-accounts/x/tokens", "/api/service-accounts/x/tokens/x", "/api/service-accounts/x/tokens/x/rotate"] {
+    for want in ["/api/users", "/api/signups/x/approve", "/api/machines", "/api/users/x/machine/suspend", "/api/audit", "/api/audit/export.csv", "/api/policy", "/api/secrets/x", "/api/scim/tokens", "/api/setup", "/api/license", "/api/teams", "/api/teams/x/members/x", "/api/roles", "/api/roles/x/users/x", "/api/roles/x/teams/x/users/x", "/api/role-requests", "/api/role-requests/x/approve", "/api/role-requests/x/deny", "/api/service-accounts", "/api/service-accounts/x", "/api/service-accounts/x/tokens", "/api/service-accounts/x/tokens/x", "/api/service-accounts/x/tokens/x/rotate"] {
         assert!(calls.iter().any(|(_, p)| p == want) || html.contains(want), "the console lost {want}: {calls:?}");
     }
 }
