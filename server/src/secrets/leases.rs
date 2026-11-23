@@ -235,6 +235,16 @@ impl Leases {
         &self.cleared
     }
 
+    /// When the first of these leases that can't be revoked expires (STS sessions): the run
+    /// must stop by then, or it would go on with keys that no longer work. None for leases
+    /// that are revoked at run end.
+    pub fn expires_first(&self) -> Option<Instant> {
+        if self.issuer.as_ref().is_none_or(|i| i.revocable()) {
+            return None;
+        }
+        self.held.iter().map(|h| h.expires).min()
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.held.len()
@@ -632,6 +642,7 @@ pub(crate) mod tests {
         );
         assert_ne!(env(&e1), env(&e2), "each run its own");
         assert_eq!((l1.len(), l2.len()), (2, 2));
+        assert!(l1.expires_first().is_none() && Leases::none().expires_first().is_none(), "revoked at run end: no deadline of their own");
         assert_eq!(l1.cleared(), ["CLOUD_SESSION_TOKEN"], "an empty field is taken out of the run, not left to an older value");
         assert_eq!(redact::text("key aws-run-secret-0a1b-0 here"), "key [redacted] here", "redacted while the lease lives");
 
@@ -776,6 +787,8 @@ pub(crate) mod tests {
         f.same.store(true, Ordering::SeqCst);
         let rc = RunCredentials::new(f.clone(), parse("sts/role/r STS_RUN_TOKEN=SessionToken").unwrap());
         let (_, l) = rc.issue("uexp6", "bexp6", true, RUN).unwrap();
+        let first = l.expires_first().expect("the run must stop by then");
+        assert!(first <= Instant::now() + Duration::from_secs(1));
         drop(l);
         assert!(f.revoked.lock().unwrap().is_empty(), "never asked to revoke");
         let ev: Vec<_> = external::tests::audited("sts/role/r").into_iter().filter(|e| e.action == "secret.lease_released").collect();
