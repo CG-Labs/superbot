@@ -125,7 +125,7 @@ pub fn team_seat(app: &AppState, u: &User) -> Option<TeamMember> {
     if !on_team(&app.db, &owner, &team.id) {
         return None;
     }
-    Some(TeamMember { user_id: u.id.clone(), team_id: team.id, role: crate::teams::MEMBER.into(), joined_at: u.created_at, added_by: sa.created_by, role_id: sa.team_role_id })
+    Some(TeamMember { user_id: u.id.clone(), team_id: team.id, role: crate::teams::MEMBER.into(), joined_at: u.created_at, added_by: sa.created_by, role_id: sa.team_role_id, role_expires_at: None })
 }
 
 /// Whether `owner` can lend a service account a place in `team`: an admin in any, anyone
@@ -257,6 +257,7 @@ fn parse_role(app: &AppState, v: &Value) -> Res<(Role, Option<CustomRole>)> {
         Some(Role::Admin) => Err(bad("A service account can never be an admin. Give it member, readonly, or a custom role.")),
         Some(r) => Ok((r, None)),
         None => match app.db.find_custom_role(key).filter(|_| !key.is_empty()) {
+            Some(r) if r.max_days.is_some() => Err(crate::roles::standing_refused(&r, "a service account")),
             Some(r) => Ok((r.base, Some(r))),
             None => Err(bad("role must be member, readonly, or a custom role's id or name")),
         },
@@ -384,7 +385,8 @@ fn choices(app: &AppState, me: &User) -> Value {
         let cap = ceiling(db, me, team.map(|t| t.id.as_str()));
         let built_in = [Role::Readonly, Role::Member].into_iter().map(|role| (role.as_str().to_string(), Roles { role, custom: None, team: team.cloned() }));
         // A read-only custom role in a team changes nothing, so `create` refuses it there.
-        let customs = custom.iter().filter(|r| team.is_none() || r.base != Role::Readonly).map(|r| (r.id.clone(), Roles { role: r.base, custom: Some(r.clone()), team: team.cloned() }));
+        // Nor a time-bound one, which only a person holds, until its end (ADR 0197).
+        let customs = custom.iter().filter(|r| r.max_days.is_none() && (team.is_none() || r.base != Role::Readonly)).map(|r| (r.id.clone(), Roles { role: r.base, custom: Some(r.clone()), team: team.cloned() }));
         built_in.chain(customs).filter(|(_, roles)| beyond(roles, cap).is_empty()).map(|(id, _)| id).collect()
     };
     let teams: Vec<crate::db::Team> = if me.role == Role::Admin {

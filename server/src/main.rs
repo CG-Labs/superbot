@@ -832,6 +832,7 @@ async fn main() {
     })));
     license::start(app.clone());
     scim::start(app.clone());
+    roles::start(app.clone());
     log_info!("Audit export: {} (ADR 0122).", audit_export.describe());
     audit_export::start(&app, audit_export);
     log_info!("Audit checkpoints: {} (ADR 0149).", audit_checkpoints.describe());

@@ -457,3 +457,173 @@ async fn the_access_review_shows_custom_roles() {
     let (_, csv) = call(port, "GET", "/api/access-review/export.csv", &admin, "").await;
     assert!(csv.contains("readonly; Auditor: audit.view"), "{csv}");
 }
+
+/// A role given until an end (ADR 0197): the end shows wherever the role does, it grants
+/// nothing once it passes, in the same session and before any sweep, and the sweep takes
+/// it away, audited as the server's.
+#[tokio::test]
+async fn a_role_given_until_an_end_stops_when_it_passes() {
+    let (port, app, admin, _) = serve_app().await;
+    let (bo, bo_auth) = user_with(port, &admin, "bo@example.com", "member").await;
+    let auditor = role(port, &admin, "Auditor", "readonly", &["audit.view"]).await;
+    let ends = db::now() + 2 * roles::DAY;
+    let path = format!("/api/roles/{auditor}/users/{bo}");
+    let body = json!({ "expiresAt": ends, "reason": "Q3 SOX walkthrough" }).to_string();
+    let (code, v) = json_call(port, "PUT", &path, &admin, &body).await;
+    assert_eq!((code, v["role"]["expiresAt"].as_i64(), v["user"]["roleExpiresAt"].as_i64()), (200, Some(ends), Some(ends)), "{v}");
+    let (_, me) = json_call(port, "GET", "/api/auth/me", &bo_auth, "").await;
+    assert_eq!(me["customRole"], json!({ "id": auditor, "name": "Auditor", "expiresAt": ends }));
+    let (_, u) = json_call(port, "GET", &format!("/api/users/{bo}"), &admin, "").await;
+    assert_eq!(u["customRole"]["expiresAt"].as_i64(), Some(ends), "{u}");
+    let (_, r) = json_call(port, "GET", &format!("/api/roles/{auditor}"), &admin, "").await;
+    assert_eq!(r["holders"]["users"][0]["expiresAt"].as_i64(), Some(ends), "{r}");
+    assert_eq!(call(port, "GET", "/api/audit", &bo_auth, "").await.0, 200);
+    let given = events(port, &admin, "role.assigned").await;
+    assert_eq!((given[0]["details"]["expiresAt"].as_i64(), given[0]["details"]["reason"].as_str()), (Some(ends), Some("Q3 SOX walkthrough")));
+
+    // Given again, the end moves, audited with the end it had.
+    let later = ends + roles::DAY;
+    assert_eq!(call(port, "PUT", &path, &admin, &json!({ "expiresAt": later }).to_string()).await.0, 200);
+    let given = events(port, &admin, "role.assigned").await;
+    assert_eq!((given.len(), given[0]["details"]["expiresAt"].as_i64(), given[0]["details"]["from"]["expiresAt"].as_i64()), (2, Some(later), Some(ends)));
+    // The same end again changes nothing, so isn't audited.
+    assert_eq!(call(port, "PUT", &path, &admin, &json!({ "expiresAt": later }).to_string()).await.0, 200);
+    assert_eq!(events(port, &admin, "role.assigned").await.len(), 2);
+
+    let past = db::now() - 1;
+    app.db.move_role_end(&bo, past);
+    assert_eq!(call(port, "GET", "/api/audit", &bo_auth, "").await.0, 403, "at once, in the same session");
+    let (_, me) = json_call(port, "GET", "/api/auth/me", &bo_auth, "").await;
+    assert_eq!((me["customRole"].clone(), me["permissions"].clone()), (Value::Null, json!(["account", "read", "review"])), "its base stays");
+    assert!(events(port, &admin, "role.expired").await.is_empty(), "not swept yet");
+    assert_eq!(roles::expire_due(&app), 1);
+    let expired = events(port, &admin, "role.expired").await;
+    assert_eq!(expired.len(), 1);
+    let e = &expired[0];
+    assert_eq!((e["targetId"].as_str(), e["actorKind"].as_str(), e["actorId"].as_str()), (Some(auditor.as_str()), Some("system"), Some("roles")), "{e}");
+    assert_eq!(e["details"], json!({ "name": "Auditor", "user": bo, "scope": "org", "expiresAt": past, "keeps": "readonly" }));
+    assert_eq!(roles::expire_due(&app), 0, "once");
+    assert_eq!(app.db.user(&bo).unwrap().role, Role::Readonly);
+    assert_eq!(call(port, "DELETE", &format!("/api/roles/{auditor}"), &admin, "").await.0, 200, "nobody holds it");
+}
+
+#[tokio::test]
+async fn ends_are_checked_and_a_time_bound_role_needs_one_within_its_limit() {
+    let (port, _, admin, _) = serve_app().await;
+    let (bo, _) = user_with(port, &admin, "bo@example.com", "member").await;
+    let (cy, _) = user_with(port, &admin, "cy@example.com", "member").await;
+    for (body, why) in [
+        (json!({ "name": "X", "permissions": [], "maxDays": 0 }), "at least a day"),
+        (json!({ "name": "X", "permissions": [], "maxDays": 366 }), "at most a year"),
+        (json!({ "name": "X", "permissions": [], "maxDays": "7" }), "a number"),
+        (json!({ "name": "X", "permissions": [], "maxDays": 1.5 }), "whole days"),
+    ] {
+        assert_eq!(call(port, "POST", "/api/roles", &admin, &body.to_string()).await.0, 400, "{why}");
+    }
+    let (code, v) = json_call(port, "POST", "/api/roles", &admin, r#"{"name":"Break glass","base":"member","permissions":["users.manage","machines.manage"],"maxDays":7}"#).await;
+    assert_eq!((code, v["maxDays"].as_i64()), (201, Some(7)), "{v}");
+    let tb = v["id"].as_str().unwrap().to_string();
+    assert_eq!(events(port, &admin, "role.created").await[0]["details"]["maxDays"], 7);
+    let plain = role(port, &admin, "Auditor", "readonly", &["audit.view"]).await;
+
+    let day = roles::DAY;
+    let now = db::now();
+    let give = |role: &str, user: &str| format!("/api/roles/{role}/users/{user}");
+    for (role, body, why) in [
+        (&tb, String::new(), "a time-bound role needs an end"),
+        (&tb, json!({ "expiresAt": null }).to_string(), "a time-bound role needs an end"),
+        (&tb, json!({ "expiresAt": now + 8 * day }).to_string(), "beyond its limit"),
+        (&plain, json!({ "expiresAt": now - 1 }).to_string(), "an end gone already"),
+        (&plain, json!({ "expiresAt": now + 366 * day }).to_string(), "beyond a year"),
+        (&plain, json!({ "expiresAt": "tomorrow" }).to_string(), "a time"),
+        (&plain, json!({ "until": now + day }).to_string(), "unknown field"),
+        (&plain, json!({ "reason": 5 }).to_string(), "reason is text"),
+        (&plain, "[]".to_string(), "an object"),
+    ] {
+        let (code, v) = json_call(port, "PUT", &give(role, &bo), &admin, &body).await;
+        assert_eq!(code, 400, "{why}: {v}");
+    }
+    let (_, v) = json_call(port, "PUT", &give(&tb, &bo), &admin, "").await;
+    assert!(v["error"].as_str().unwrap().contains("at most 7 days"), "{v}");
+    assert_eq!(call(port, "PUT", &give(&tb, &bo), &admin, &json!({ "expiresAt": now + 6 * day }).to_string()).await.0, 200);
+    // A role with no limit can still be given with no end, as before.
+    assert_eq!(call(port, "PUT", &give(&plain, &cy), &admin, "").await.0, 200);
+
+    // The limit can't shrink under someone who holds it longer, nor be set on a role held with no end.
+    let (code, v) = json_call(port, "PATCH", &format!("/api/roles/{tb}"), &admin, r#"{"maxDays":3}"#).await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("1 holds it with no end or a later one"), "{v}");
+    let (code, v) = json_call(port, "PATCH", &format!("/api/roles/{plain}"), &admin, r#"{"maxDays":30}"#).await;
+    assert_eq!(code, 409, "{v}");
+    assert_eq!(call(port, "PATCH", &format!("/api/roles/{tb}"), &admin, r#"{"maxDays":10}"#).await.0, 200);
+    let updated = events(port, &admin, "role.updated").await;
+    assert_eq!(updated[0]["details"]["changes"]["maxDays"], json!({ "from": 7, "to": 10 }));
+    let (code, v) = json_call(port, "PATCH", &format!("/api/roles/{tb}"), &admin, r#"{"maxDays":null}"#).await;
+    assert_eq!((code, v["maxDays"].clone()), (200, Value::Null), "{v}");
+    assert_eq!(call(port, "PATCH", &format!("/api/roles/{tb}"), &admin, r#"{"maxDays":7}"#).await.0, 200);
+
+    // Service accounts hold their role for as long as they exist, so never a time-bound one.
+    let (code, v) = json_call(port, "POST", "/api/service-accounts", &admin, &json!({ "name": "CI", "role": tb }).to_string()).await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("time-bound"), "{v}");
+    let (_, list) = json_call(port, "GET", "/api/service-accounts", &admin, "").await;
+    assert!(!list["choices"].to_string().contains(&tb), "not offered: {list}");
+    assert!(list["choices"]["server"].to_string().contains(&plain), "{list}");
+}
+
+#[tokio::test]
+async fn a_team_role_can_end_too() {
+    let (port, app, admin, _) = serve_app().await;
+    let (ada, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (cy, cy_auth) = user_with(port, &admin, "cy@example.com", "member").await;
+    let (_, t) = json_call(port, "POST", "/api/teams", &admin, &json!({ "name": "Alpha", "owner": ada }).to_string()).await;
+    let team = t["id"].as_str().unwrap().to_string();
+    assert_eq!(call(port, "PUT", &format!("/api/teams/{team}/members/{cy}"), &admin, r#"{"role":"member"}"#).await.0, 200);
+    let people = role(port, &admin, "Team people", "member", &["users.manage"]).await;
+    let path = format!("/api/roles/{people}/teams/{team}/users/{cy}");
+    assert_eq!(call(port, "PUT", &path, &admin, &json!({ "expiresAt": db::now() - 1 }).to_string()).await.0, 400);
+    let ends = db::now() + roles::DAY;
+    let (code, v) = json_call(port, "PUT", &path, &admin, &json!({ "expiresAt": ends, "reason": "Onboarding week" }).to_string()).await;
+    assert_eq!((code, v["role"]["expiresAt"].as_i64()), (200, Some(ends)), "{v}");
+    let (_, mine) = json_call(port, "GET", "/api/team", &cy_auth, "").await;
+    assert_eq!((mine["customRole"]["expiresAt"].as_i64(), mine["permissions"].clone()), (Some(ends), json!(["users.manage"])), "{mine}");
+    let (_, r) = json_call(port, "GET", &format!("/api/roles/{people}"), &admin, "").await;
+    assert_eq!(r["holders"]["teams"][0]["expiresAt"].as_i64(), Some(ends), "{r}");
+    assert_eq!(call(port, "POST", "/api/team/invites", &cy_auth, r#"{"email":"new@example.com"}"#).await.0, 201);
+
+    app.db.move_role_end(&cy, db::now() - 1);
+    assert_eq!(call(port, "POST", "/api/team/invites", &cy_auth, r#"{"email":"two@example.com"}"#).await.0, 403);
+    let (_, mine) = json_call(port, "GET", "/api/team", &cy_auth, "").await;
+    assert_eq!((mine["customRole"].clone(), mine["permissions"].clone()), (Value::Null, json!([])), "{mine}");
+    // Any roles route sweeps first, so what it shows is what's held.
+    let (_, r) = json_call(port, "GET", &format!("/api/roles/{people}"), &admin, "").await;
+    assert_eq!(r["teamMembers"], 0, "{r}");
+    let expired = events(port, &admin, "role.expired").await;
+    assert_eq!((expired[0]["details"]["scope"].as_str(), expired[0]["details"]["team"].as_str(), expired[0]["details"]["user"].as_str()), (Some("team"), Some(team.as_str()), Some(cy.as_str())));
+    assert!(app.db.team_member(&cy).is_some(), "still on the team");
+}
+
+#[tokio::test]
+async fn the_access_review_shows_when_a_role_ends() {
+    let (port, app, admin, _) = serve_app().await;
+    let (bo, _) = user_with(port, &admin, "bo@example.com", "member").await;
+    let r = role(port, &admin, "Auditor", "readonly", &["audit.view"]).await;
+    give(port, &admin, &r, &bo).await;
+    let digest = |v: &Value| v["digest"].as_str().unwrap().to_string();
+    let standing = parse(&call(port, "GET", "/api/access-review", &admin, "").await.1);
+    let ends = db::now() + 3 * roles::DAY;
+    assert_eq!(call(port, "PUT", &format!("/api/roles/{r}/users/{bo}"), &admin, &json!({ "expiresAt": ends }).to_string()).await.0, 200);
+    let (_, report) = json_call(port, "GET", "/api/access-review", &admin, "").await;
+    assert_ne!(digest(&report), digest(&standing), "an end is part of what was signed off");
+    let me = report["groups"].as_array().unwrap().iter().flat_map(|g| g["people"].as_array().unwrap().clone()).find(|p| p["id"] == bo.as_str()).unwrap();
+    assert_eq!(me["customRole"], json!({ "id": r, "name": "Auditor", "permissions": ["audit.view"], "expiresAt": ends }));
+    let (_, csv) = call(port, "GET", "/api/access-review/export.csv", &admin, "").await;
+    assert!(csv.contains("readonly; Auditor: audit.view until 20"), "{csv}");
+    // A later end makes an earlier sign-off stale.
+    assert_eq!(call(port, "PUT", &format!("/api/roles/{r}/users/{bo}"), &admin, &json!({ "expiresAt": ends + roles::DAY }).to_string()).await.0, 200);
+    assert_ne!(digest(&parse(&call(port, "GET", "/api/access-review", &admin, "").await.1)), digest(&report));
+    // Back to no end, the digest is the one a standing role has.
+    assert_eq!(call(port, "PUT", &format!("/api/roles/{r}/users/{bo}"), &admin, "").await.0, 200);
+    assert_eq!(digest(&parse(&call(port, "GET", "/api/access-review", &admin, "").await.1)), digest(&standing));
+    assert!(app.db.user(&bo).unwrap().role_expires_at.is_none());
+}

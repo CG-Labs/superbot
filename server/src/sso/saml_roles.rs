@@ -298,6 +298,7 @@ pub async fn create(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
         ScimRoleMapError::Taken => conflict(format!("{}'s group \"{group}\" is mapped to a role already. Remove that mapping first.", p.id)),
         ScimRoleMapError::Gone => not_found("Role"),
         ScimRoleMapError::Reaches(reach) => reaches(&role, reach),
+        ScimRoleMapError::TimeBound => crate::roles::standing_refused(&role, "a SAML group"),
         ScimRoleMapError::Db(e) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, e),
     })?;
     let role = app.db.custom_role(&m.role_id);
