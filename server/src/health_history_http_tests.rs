@@ -45,11 +45,11 @@ async fn it_shows_the_days_recorded_and_the_trend() {
     assert_eq!((r["days"].as_i64(), r["points"].as_array().map(Vec::len), r["trend"].clone()), (Some(90), Some(0), Value::Null), "{r:#}");
     assert_eq!((r["recording"].as_bool(), r["keepDays"].as_u64()), (Some(true), Some(400)));
 
-    assert!(app.db.health_score_record(&past(120, 95, "healthy", json!({ "runs": "ok" }))), "older than the window");
-    assert!(app.db.health_score_record(&past(40, 92, "healthy", json!({ "adoption": "ok", "runs": "ok", "backups": "ok" }))));
-    assert!(app.db.health_score_record(&past(10, 71, "watch", json!({ "adoption": "watch", "runs": "ok", "backups": "ok" }))));
-    assert!(health_history::record(&app, db::now()), "today's, from the live score");
-    assert!(!health_history::record(&app, db::now()), "once a day");
+    assert!(app.db.health_score_record(&past(120, 95, "healthy", json!({ "runs": "ok" }))).unwrap(), "older than the window");
+    assert!(app.db.health_score_record(&past(40, 92, "healthy", json!({ "adoption": "ok", "runs": "ok", "backups": "ok" }))).unwrap());
+    assert!(app.db.health_score_record(&past(10, 71, "watch", json!({ "adoption": "watch", "runs": "ok", "backups": "ok" }))).unwrap());
+    assert!(health_history::record(&app, db::now()).unwrap(), "today's, from the live score");
+    assert!(!health_history::record(&app, db::now()).unwrap(), "once a day");
 
     let (code, body) = call(port, "GET", "/api/support/health-score/history", &admin, "").await;
     assert_eq!(code, 200, "{body}");

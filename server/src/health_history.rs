@@ -82,19 +82,27 @@ pub fn day_of(report: &Value, at: i64) -> HealthScoreDay {
 }
 
 /// Records today's score unless today has one. True if it recorded one.
-pub fn record(app: &App, now_ms: i64) -> bool {
-    if app.db.health_scores_since(&date_of(now_ms)).iter().any(|d| d.day == date_of(now_ms)) {
-        return false;
+pub fn record(app: &App, now_ms: i64) -> rusqlite::Result<bool> {
+    let today = date_of(now_ms);
+    if app.db.health_scores_since(&today)?.iter().any(|d| d.day == today) {
+        return Ok(false);
     }
     let report = health_score::build(app, now_ms, health_score::DEFAULT_DAYS);
     app.db.health_score_record(&day_of(&report, now_ms))
 }
 
-/// One pass: today's score, then the days past `keep_days` go.
+/// One pass: today's score, then the days past `keep_days` go. Failures are logged, so a
+/// day missed for a full disk or a broken database says so.
 pub fn tick(app: &App, s: Settings, now_ms: i64) -> (bool, usize) {
     let Some(keep) = s.keep_days else { return (false, 0) };
-    let recorded = record(app, now_ms);
-    let pruned = app.db.health_scores_prune(&date_of(now_ms - i64::from(keep) * DAY_MS));
+    let recorded = record(app, now_ms).unwrap_or_else(|e| {
+        crate::obs::log::log_warn!("Health score history: couldn't record today's score: {e}");
+        false
+    });
+    let pruned = app.db.health_scores_prune(&date_of(now_ms - i64::from(keep) * DAY_MS)).unwrap_or_else(|e| {
+        crate::obs::log::log_warn!("Health score history: couldn't delete days past {keep}: {e}");
+        0
+    });
     (recorded, pruned)
 }
 
@@ -162,10 +170,10 @@ pub fn trend(days: &[HealthScoreDay]) -> Value {
 }
 
 /// The last `days` of recorded scores, oldest first, with the trend across them.
-pub fn history(app: &App, now_ms: i64, days: i64) -> Value {
-    let rows = app.db.health_scores_since(&date_of(now_ms - (days - 1) * DAY_MS));
+pub fn history(app: &App, now_ms: i64, days: i64) -> rusqlite::Result<Value> {
+    let rows = app.db.health_scores_since(&date_of(now_ms - (days - 1) * DAY_MS))?;
     let s = settings();
-    json!({
+    Ok(json!({
         "recording": s.keep_days.is_some(),
         "keepDays": s.keep_days,
         "windowDays": health_score::DEFAULT_DAYS,
@@ -174,7 +182,7 @@ pub fn history(app: &App, now_ms: i64, days: i64) -> Value {
             "date": d.day, "score": d.score, "band": d.band, "windowDays": d.window_days, "signals": statuses(d),
         })).collect::<Vec<_>>(),
         "trend": trend(&rows),
-    })
+    }))
 }
 
 /// `days` from 1 to `MAX_DAYS`, `DEFAULT_DAYS` if not given.
@@ -191,8 +199,10 @@ pub fn days(q: &HashMap<String, String>) -> Result<i64, String> {
 /// `GET /api/support/health-score/history[?days=90]` (admins).
 pub async fn get(State(app): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Res {
     let days = days(&q).map_err(bad)?;
-    let v = tokio::task::spawn_blocking(move || history(&app, now(), days))
+    let v = tokio::task::spawn_blocking(move || history(&app, now(), days).map_err(|e| e.to_string()))
         .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r)
         .map_err(|e| crate::ApiError(axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't read the health score history: {e}")))?;
     Ok(Json(v))
 }
@@ -251,16 +261,25 @@ mod tests {
     #[test]
     fn one_score_a_day_and_old_days_go() {
         let app = crate::runner::test_app();
-        assert!(record(&app, DAY0));
-        assert!(!record(&app, DAY0 + 3_600_000), "the first of the day stays");
-        assert_eq!(app.db.health_scores_since("2000-01-01").len(), 1);
+        assert_eq!(record(&app, DAY0), Ok(true));
+        assert_eq!(record(&app, DAY0 + 3_600_000), Ok(false), "the first of the day stays");
+        assert_eq!(app.db.health_scores_since("2000-01-01").unwrap().len(), 1);
         for n in 1..=5 {
             assert_eq!(tick(&app, Settings { keep_days: Some(3) }, DAY0 + n * DAY_MS).0, true);
         }
-        let kept: Vec<String> = app.db.health_scores_since("2000-01-01").into_iter().map(|d| d.day).collect();
+        let kept: Vec<String> = app.db.health_scores_since("2000-01-01").unwrap().into_iter().map(|d| d.day).collect();
         assert_eq!(kept, [date_of(DAY0 + 2 * DAY_MS), date_of(DAY0 + 3 * DAY_MS), date_of(DAY0 + 4 * DAY_MS), date_of(DAY0 + 5 * DAY_MS)], "today and the 3 days before");
         assert_eq!(tick(&app, Settings { keep_days: None }, DAY0 + 9 * DAY_MS), (false, 0), "off records and deletes nothing");
-        assert_eq!(app.db.health_scores_since("2000-01-01").len(), 4);
+        assert_eq!(app.db.health_scores_since("2000-01-01").unwrap().len(), 4);
+    }
+
+    #[test]
+    fn a_broken_table_is_an_error_not_an_empty_history() {
+        let app = crate::runner::test_app();
+        app.db.execute_raw("DROP TABLE health_scores").unwrap();
+        assert!(record(&app, DAY0).is_err());
+        assert_eq!(tick(&app, Settings::default(), DAY0), (false, 0), "logged, and the loop goes on");
+        assert!(history(&app, DAY0, 90).is_err());
     }
 
     #[test]

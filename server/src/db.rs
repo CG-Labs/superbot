@@ -9501,28 +9501,25 @@ pub struct HealthScoreDay {
 
 impl Db {
     /// Records a day's score. False if that day already has one: the first of the day stays.
-    pub fn health_score_record(&self, d: &HealthScoreDay) -> bool {
+    pub fn health_score_record(&self, d: &HealthScoreDay) -> rusqlite::Result<bool> {
         self.c()
             .execute(
                 "INSERT OR IGNORE INTO health_scores (day, at, window_days, score, band, signals) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![d.day, d.at, d.window_days, d.score, d.band, d.signals],
             )
-            .unwrap_or(0)
-            > 0
+            .map(|n| n > 0)
     }
 
     /// The days from `from` (`YYYY-MM-DD`), oldest first.
-    pub fn health_scores_since(&self, from: &str) -> Vec<HealthScoreDay> {
+    pub fn health_scores_since(&self, from: &str) -> rusqlite::Result<Vec<HealthScoreDay>> {
         let c = self.c();
-        let Ok(mut s) = c.prepare("SELECT day, at, window_days, score, band, signals FROM health_scores WHERE day >= ? ORDER BY day") else { return Vec::new() };
-        s.query_map([from], |r| Ok(HealthScoreDay { day: r.get(0)?, at: r.get(1)?, window_days: r.get(2)?, score: r.get(3)?, band: r.get(4)?, signals: r.get(5)? }))
-            .map(|rows| rows.filter_map(Result::ok).collect())
-            .unwrap_or_default()
+        let mut s = c.prepare("SELECT day, at, window_days, score, band, signals FROM health_scores WHERE day >= ? ORDER BY day")?;
+        s.query_map([from], |r| Ok(HealthScoreDay { day: r.get(0)?, at: r.get(1)?, window_days: r.get(2)?, score: r.get(3)?, band: r.get(4)?, signals: r.get(5)? }))?.collect()
     }
 
     /// Deletes the days before `before` (`YYYY-MM-DD`); how many went.
-    pub fn health_scores_prune(&self, before: &str) -> usize {
-        self.c().execute("DELETE FROM health_scores WHERE day < ?", [before]).unwrap_or(0)
+    pub fn health_scores_prune(&self, before: &str) -> rusqlite::Result<usize> {
+        self.c().execute("DELETE FROM health_scores WHERE day < ?", [before])
     }
 }
 

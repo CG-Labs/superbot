@@ -451,7 +451,7 @@ pub fn build(app: &App, vars: &[(String, String)], setup: Value, now_ms: i64) ->
         ("config.json", json_file(config, &names)),
         ("health.json", json_file(health(app, setup, now_ms), &names)),
         ("health-score.json", json_file(crate::health_score::build(app, now_ms, crate::health_score::DEFAULT_DAYS), &names)),
-        ("health-score-history.json", json_file(crate::health_history::history(app, now_ms, crate::health_history::DEFAULT_DAYS), &names)),
+        ("health-score-history.json", json_file(crate::health_history::history(app, now_ms, crate::health_history::DEFAULT_DAYS).unwrap_or_else(|e| json!({ "error": e.to_string() })), &names)),
         ("logs.jsonl", redact::text(&logs).into_owned().into_bytes()),
         ("audit-summary.json", json_file(audit, &names)),
     ];
