@@ -210,8 +210,8 @@ async fn each_file_carries_its_controls_evidence() {
     // in force, here off, as a deviation.
     let baseline = parse(file(&f, "baseline.json"));
     assert_eq!(baseline["settings"].as_array().unwrap().len(), crate::baseline::SETTINGS.len());
-    let mfa = baseline["settings"].as_array().unwrap().iter().find(|s| s["setting"] == "AUTH_MFA").cloned().unwrap();
-    assert_eq!((mfa["status"].as_str(), mfa["value"].as_str()), (Some("fail"), Some("off")), "{mfa}");
+    let row = baseline["settings"].as_array().unwrap().iter().find(|s| s["setting"] == "AUTH_MFA").cloned().unwrap();
+    assert_eq!((row["status"].as_str(), row["value"].as_str()), (Some("fail"), Some("off")), "{row}");
     assert!(baseline["exceptions"]["deviations"].as_array().unwrap().contains(&json!("AUTH_MFA")), "{baseline}");
     assert_eq!(baseline["ok"], false);
     let manifest = parse(file(&f, "manifest.json"));
@@ -238,8 +238,8 @@ async fn the_baseline_check_is_audited_with_its_digest_and_follows_the_mfa_polic
 
     // An admin's policy, as the route reads it; over HTTP this admin would now need a second factor.
     let r2 = crate::baseline::run(&app, crate::mfa::Policy::Admins).view("now");
-    let mfa = r2["settings"].as_array().unwrap().iter().find(|s| s["setting"] == "AUTH_MFA").cloned().unwrap();
-    assert_eq!((mfa["status"].as_str(), mfa["value"].as_str()), (Some("pass"), Some("admins")), "{mfa}");
+    let row = r2["settings"].as_array().unwrap().iter().find(|s| s["setting"] == "AUTH_MFA").cloned().unwrap();
+    assert_eq!((row["status"].as_str(), row["value"].as_str()), (Some("pass"), Some("admins")), "{row}");
     assert_ne!(r2["digest"], r["digest"], "a different setting, a different digest");
 }
 
