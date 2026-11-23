@@ -17,7 +17,9 @@
 //! with RESIDENCY_SERVER_DATA=require, pins are held to that region too (ADR 0184).
 //!
 //! Someone leaving a pinned team keeps its pin as their own (ADR 0171), and with
-//! RESIDENCY_STARTUP=refuse botd won't start while it can't keep a pin.
+//! RESIDENCY_STARTUP=refuse botd won't start while it can't keep a pin. A kept pin ends
+//! by itself once botd holds none of their machine data, unless RESIDENCY_KEPT_PINS=keep
+//! (ADR 0205).
 
 use super::backup::{self, Offsite};
 use super::{ControlPlane, conflict, event, region};
@@ -391,6 +393,77 @@ pub fn kept_for_leaver(app: &App, by: &Who, team_id: &str, user_id: &str, reason
     app.db.record(&by.event("user.residency_pin_kept").target("user", user_id).details(d));
 }
 
+/// What becomes of a pin a leaver kept from their team (ADR 0171) once botd holds none
+/// of their machine data (`RESIDENCY_KEPT_PINS`, ADR 0205): it ends (the default), or
+/// stays until an admin unpins it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeptPins {
+    #[default]
+    End,
+    Keep,
+}
+
+impl KeptPins {
+    pub fn parse(v: &str) -> Result<KeptPins, String> {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "" | "end" => Ok(KeptPins::End),
+            "keep" => Ok(KeptPins::Keep),
+            v => Err(format!("RESIDENCY_KEPT_PINS must be end or keep, not \"{}\"", crate::audit::clip(v, 20))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeptPins::End => "end",
+            KeptPins::Keep => "keep",
+        }
+    }
+}
+
+/// The audit action for a kept pin that ended by itself (ADR 0205).
+pub const KEPT_PIN_ENDED: &str = "user.residency_pin_ended";
+
+/// Whether botd holds none of `user_id`'s machine data: no machine that isn't
+/// destroyed, and no machine backup not yet deleted (a running or failed one counts).
+fn no_machine_data(app: &App, user_id: &str) -> bool {
+    app.db.user_machine(user_id).is_none() && app.db.user_machine_backups_kept(user_id).is_empty()
+}
+
+/// With `KeptPins::End`, ends every pin kept for a leaver (ADR 0171) whose machine is
+/// destroyed and whose backups are all deleted, each checked and ended in one statement
+/// so a machine or backup made meanwhile keeps it. A renewed pin isn't kept any more and
+/// stays. Each is audited as `user.residency_pin_ended` by `residency`, with reason
+/// `data_gone`. Their own data region stays as it was, as after an unpin. Returns how
+/// many ended.
+pub async fn end_kept(app: &App, cp: &ControlPlane) -> usize {
+    if cp.kept_pins == KeptPins::Keep {
+        return 0;
+    }
+    let mut ended = 0;
+    for p in app.db.residency_pins().into_iter().filter(|p| p.subject_type == PinOn::User && p.kept_from.is_some()) {
+        if !no_machine_data(app, &p.subject_id) {
+            continue;
+        }
+        let _g = cp.lock_ops().await;
+        let p = match app.db.end_kept_pin(&p.subject_id) {
+            Ok(Some(p)) => p,
+            Ok(None) => continue,
+            Err(e) => {
+                crate::obs::log::log_warn!("Residency: the pin kept for user {} couldn't be ended: {e} (ADR 0205).", p.subject_id);
+                continue;
+            }
+        };
+        let team = p.kept_from.as_deref().unwrap_or_default();
+        let d = json!({
+            "region": p.region, "reference": p.reference, "keptFrom": team, "teamName": app.db.team(team).map(|t| t.name),
+            "pinnedAt": p.pinned_at, "pinnedBy": p.pinned_by, "reason": "data_gone", "userEmail": app.db.user(&p.subject_id).and_then(|u| u.email),
+        });
+        app.db.record(&Who::system("residency").event(KEPT_PIN_ENDED).target("user", &p.subject_id).details(d));
+        ended += 1;
+    }
+    ended
+}
+
 /// Warnings for startup and admins: pins whose region this server can't keep now, or
 /// whose data is outside it. Their backups and restores are refused until fixed. Also
 /// pins whose people's plans have no model route there (ADR 0139), whose runs are refused,
@@ -408,6 +481,12 @@ pub fn warnings(app: &App, cp: &ControlPlane) -> Vec<String> {
     for p in pins {
         let Some((name, people)) = held_by(app, &p) else { continue };
         out.extend(unkept_line(app, cp, &p, &name, &people));
+        if cp.kept_pins == KeptPins::Keep && p.kept_from.is_some() && no_machine_data(app, &p.subject_id) {
+            out.push(format!(
+                "{name} is {}, kept from their former team's pin, and botd holds none of their machine data any more. With RESIDENCY_KEPT_PINS=keep it stays until an admin unpins it with a reason (ADR 0205).",
+                pinned_to(&p)
+            ));
+        }
         let gaps = route_gaps(app, &people, &p.region);
         if !gaps.is_empty() {
             out.push(format!(
@@ -676,6 +755,15 @@ mod tests {
         assert_eq!(Startup::parse("REFUSE"), Ok(Startup::Refuse));
         assert!(Startup::parse("strict").unwrap_err().contains("must be warn or refuse, not \"strict\""));
         assert_eq!(Startup::default().as_str(), "warn");
+    }
+
+    #[test]
+    fn residency_kept_pins_end_unless_set_to_keep() {
+        assert_eq!(KeptPins::parse(""), Ok(KeptPins::End));
+        assert_eq!(KeptPins::parse(" End "), Ok(KeptPins::End));
+        assert_eq!(KeptPins::parse("KEEP"), Ok(KeptPins::Keep));
+        assert!(KeptPins::parse("never").unwrap_err().contains("must be end or keep, not \"never\""));
+        assert_eq!((KeptPins::default().as_str(), KeptPins::Keep.as_str()), ("end", "keep"));
     }
 
     #[test]

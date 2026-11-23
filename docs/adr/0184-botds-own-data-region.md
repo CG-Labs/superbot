@@ -71,7 +71,7 @@ Running botd where `SERVER_DATA_REGION` says is the operator's part, as is where
 
 - In-region routes for Claude Code and Codex (they take no named endpoint yet). **Done** in [ADR 0192](0192-in-region-claude-code-and-codex-routes.md).
 - Splitting botd's database by region, so one server can hold two regions' chats.
-- Ending a kept pin by itself once the leaver's machine and backups are gone (ADR 0171).
+- Ending a kept pin by itself once the leaver's machine and backups are gone (ADR 0171). **Done** in [ADR 0205](0205-ending-a-kept-pin-once-the-data-is-gone.md).
 
 ## Tests
 
