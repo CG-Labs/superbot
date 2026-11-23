@@ -1972,7 +1972,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 58] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 59] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -2031,6 +2031,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 58] = [
     migrate_audit_checkpoints,
     migrate_health_scores,
     migrate_saml_group_roles,
+    migrate_machine_host_dedication,
 ];
 
 /// Native SAML groups mapped to custom roles across the server (ADR 0160): one role per
@@ -2058,6 +2059,22 @@ fn migrate_saml_group_roles(c: &Connection, _fresh: bool) -> rusqlite::Result<()
           released_at INTEGER
         );
         CREATE INDEX IF NOT EXISTS saml_role_grants_mapping ON saml_role_grants(mapping_id);",
+    )
+}
+
+/// A host an admin dedicated to one team (ADR 0166): only that team's machines go
+/// there, and the team's machines go nowhere else. No foreign key: a host dedicated to
+/// a team that is then deleted stays closed to everyone until an admin shares it.
+fn migrate_machine_host_dedication(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machine_hosts') WHERE name = 'dedicated_team'", [], |r| r.get(0))?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch(
+        "ALTER TABLE machine_hosts ADD COLUMN dedicated_team TEXT;
+        ALTER TABLE machine_hosts ADD COLUMN dedicated_at INTEGER;
+        ALTER TABLE machine_hosts ADD COLUMN dedicated_by TEXT;
+        ALTER TABLE machine_hosts ADD COLUMN dedication_reason TEXT;",
     )
 }
 
@@ -2848,6 +2865,11 @@ pub struct MachineHost {
     pub drained_at: Option<i64>,
     pub drained_by: Option<String>,
     pub drain_reason: Option<String>,
+    /// The team it is dedicated to (ADR 0166). None: shared.
+    pub dedicated_team: Option<String>,
+    pub dedicated_at: Option<i64>,
+    pub dedicated_by: Option<String>,
+    pub dedication_reason: Option<String>,
     pub created_at: i64,
 }
 
@@ -2866,6 +2888,10 @@ fn machine_host_row(r: &Row) -> rusqlite::Result<MachineHost> {
         drained_at: r.get("drained_at")?,
         drained_by: r.get("drained_by")?,
         drain_reason: r.get("drain_reason")?,
+        dedicated_team: r.get("dedicated_team")?,
+        dedicated_at: r.get("dedicated_at")?,
+        dedicated_by: r.get("dedicated_by")?,
+        dedication_reason: r.get("dedication_reason")?,
         created_at: r.get("created_at")?,
     })
 }
@@ -9156,6 +9182,28 @@ impl Db {
     pub fn machine_host_undrain(&self, name: &str) -> bool {
         self.c()
             .execute("UPDATE machine_hosts SET drained_at = NULL, drained_by = NULL, drain_reason = NULL WHERE name = ? AND drained_at IS NOT NULL", [name])
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Dedicated to `team`, if it is shared now (ADR 0166). Returns whether this call did it.
+    pub fn machine_host_dedicate(&self, name: &str, team: &str, by: Option<&str>, reason: Option<&str>) -> bool {
+        self.c()
+            .execute(
+                "UPDATE machine_hosts SET dedicated_team = ?, dedicated_at = ?, dedicated_by = ?, dedication_reason = ? WHERE name = ? AND dedicated_team IS NULL",
+                params![team, now(), by, reason, name],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Shared again. Returns whether it was dedicated.
+    pub fn machine_host_share(&self, name: &str) -> bool {
+        self.c()
+            .execute(
+                "UPDATE machine_hosts SET dedicated_team = NULL, dedicated_at = NULL, dedicated_by = NULL, dedication_reason = NULL WHERE name = ? AND dedicated_team IS NOT NULL",
+                [name],
+            )
             .unwrap_or(0)
             == 1
     }
