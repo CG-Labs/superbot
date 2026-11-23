@@ -37,6 +37,12 @@ pub const EVIDENCE: [Expected; 6] = [
     Expected { file: "audit-summary.json", criteria: &["CC2.1", "CC4.1", "CC7.2"], rows: &[] },
 ];
 
+/// Files of botd's bundle that bundles made before them lack (ADR 0195): checked like
+/// the rest when listed, never required, so only the test against the evidence plan
+/// reads this.
+#[cfg(test)]
+pub const EVIDENCE_LATER: [Expected; 1] = [Expected { file: "baseline.json", criteria: &["CC5.1"], rows: &["CC5.1-1"] }];
+
 /// One kind of bundle the evidence plan collects monthly.
 #[derive(Debug)]
 pub struct Kind {
@@ -90,7 +96,7 @@ pub fn expected(kind: &str) -> Vec<(&'static str, &'static [&'static str], &'sta
 }
 
 /// The files whose `exceptions` an auditor samples first.
-const EXCEPTION_FILES: [&str; 4] = ["pull-requests.json", "vulnerability-alerts.json", "ci-drills.json", "operator-drills.json"];
+const EXCEPTION_FILES: [&str; 5] = ["pull-requests.json", "vulnerability-alerts.json", "ci-drills.json", "operator-drills.json", "baseline.json"];
 
 /// A bundle file larger than this isn't read: no bundle comes near it.
 const MAX_TAR: u64 = 256 << 20;
@@ -821,6 +827,27 @@ mod tests {
         check(format!("{name}.tar"), &name, &files)
     }
 
+    /// botd's bundles gained `baseline.json` (ADR 0195): one with it checks and counts its
+    /// deviations, and one made before it still checks.
+    #[test]
+    fn botds_baseline_file_is_checked_when_there_and_never_required() {
+        let (name, mut files) = bundle(&KINDS[0], p("2027-01-01", "2027-02-01"), "2027-02-01T00:05:00Z");
+        assert!(check(format!("{name}.tar"), &name, &files).verified(), "a bundle without it");
+        let body = json_file(&json!({ "ok": false, "exceptions": { "deviations": ["AUTH_MFA", "TEAMS"], "excepted": ["MACHINE_ON_DISABLE"], "unknownExceptions": [] } }));
+        let mut m: Value = serde_json::from_slice(&files["manifest.json"]).unwrap();
+        let e = &EVIDENCE_LATER[0];
+        m["files"].as_array_mut().unwrap().push(json!({ "name": e.file, "sha256": sha256(&body), "criteria": e.criteria, "checklist": e.rows }));
+        files.insert(e.file.into(), body);
+        files.insert("manifest.json".into(), json_file(&m));
+        seal(&mut files);
+        let f = check(format!("{name}.tar"), &name, &files);
+        assert!(f.verified(), "{:?}", f.problems);
+        assert_eq!((f.exceptions["baseline.json"]["deviations"], f.exceptions["baseline.json"]["excepted"]), (2, 1));
+        assert!(f.files.iter().any(|(n, _, rows)| n == "baseline.json" && rows == &["CC5.1-1".to_string()]));
+        files.insert(e.file.into(), b"{}\n".to_vec());
+        assert!(!check(format!("{name}.tar"), &name, &files).verified(), "changed after it was made");
+    }
+
     #[test]
     fn a_bundle_checks_against_its_digests_and_manifest() {
         let f = month(&KINDS[1], "2027-01-01", "2027-02-01");
@@ -1138,8 +1165,8 @@ mod tests {
         let plan = include_str!("../../../../docs/security/soc2-evidence-plan.md");
         let section = plan.split("## The evidence bundle").nth(1).and_then(|s| s.split("\n## ").next()).unwrap();
         let rows: Vec<&str> = section.lines().filter(|l| l.starts_with("| `")).collect();
-        assert_eq!(rows.len(), EVIDENCE.len());
-        for e in &EVIDENCE {
+        assert_eq!(rows.len(), EVIDENCE.len() + EVIDENCE_LATER.len());
+        for e in EVIDENCE.iter().chain(&EVIDENCE_LATER) {
             let line = rows.iter().find(|l| l.starts_with(&format!("| `{}` |", e.file))).unwrap_or_else(|| panic!("{}", e.file));
             let cells: Vec<&str> = line.split('|').map(str::trim).collect();
             let ids = |s: &str| -> Vec<String> { s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty() && x != "None").collect() };
@@ -1147,6 +1174,7 @@ mod tests {
             assert_eq!(ids(cells[4]), e.rows.iter().map(|s| s.to_string()).collect::<Vec<_>>(), "{}", e.file);
         }
         let botd = include_str!("../../evidence.rs");
+        assert!(botd.contains("pub const BASELINE_FILE: &str = \"baseline.json\";") && botd.contains("BASELINE_CRITERIA: [&str; 1] = [\"CC5.1\"]") && botd.contains("BASELINE_ROWS: [&str; 1] = [\"CC5.1-1\"]"));
         assert!(botd.contains(&format!("pub const FORMAT: u32 = {};", KINDS[0].format)));
         assert!(botd.contains(&format!("const PREFIX: &str = \"{}\";", KINDS[0].prefix)));
     }

@@ -258,6 +258,10 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    Reads only ids, severities, plans and times
   botctl evidence                                  The evidence bundle schedule (EVIDENCE_BUNDLES), where
                                                    bundles are written and those kept (ADR 0142)
+  botctl evidence baseline [json]                  Check this server against the configuration baseline
+                                                   (ADR 0195): each setting meets it, doesn't, is excepted
+                                                   (BASELINE_EXCEPTIONS), doesn't apply, or needs a person;
+                                                   audited, and exits non-zero on a deviation
   botctl evidence bundle [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]
                                                    Save a SOC 2 evidence bundle for a period (last month
                                                    by default; to isn't included): access review, versions,
@@ -1902,6 +1906,23 @@ fn run(args: &[String]) -> Result<String, String> {
         }
         ["evidence"] => op("GET", "/api/evidence", None),
         ["evidence", "bundle", rest @ ..] => evidence_bundle(rest),
+        ["evidence", "baseline", rest @ ..] => {
+            let json = match rest {
+                [] => false,
+                ["json"] => true,
+                _ => return Err("Usage: botctl evidence baseline [json]".into()),
+            };
+            let res = api(Cred::Operator, "GET", "/api/evidence/baseline", None)?;
+            let v: Value = serde_json::from_str(&res).map_err(|e| e.to_string())?;
+            let out = if json { pretty(res) } else { baseline_summary(&v) };
+            // A deviation exits non-zero, so a cron job or the change checklist notices,
+            // with the report still on stdout for `> baseline.txt` to keep.
+            if v["ok"] == false {
+                println!("{}", out.trim_end());
+                std::process::exit(2);
+            }
+            Ok(out)
+        }
         ["audit", "export", rest @ ..] => api(Cred::Operator, "GET", &format!("/api/audit/export.csv{}", audit_query(rest)?), None),
         ["audit", "verify", rest @ ..] => {
             let res = op("GET", &format!("/api/audit/verify{}", verify_query(rest)?), None)?;
@@ -2225,6 +2246,46 @@ fn history_summary(v: &Value) -> String {
 }
 
 /// The health score for a person: the score and band, then each signal on a line.
+/// `botctl evidence baseline`: a line per setting, deviations first, then what to do.
+fn baseline_summary(v: &Value) -> String {
+    let c = &v["counts"];
+    let mut out = format!(
+        "Configuration baseline (docs/security/configuration-baseline.md), checked {}: {} meet it, {} don't, {} excepted, {} not applicable, {} to judge by hand\n",
+        v["checkedAt"].as_str().unwrap_or("now"),
+        c["pass"],
+        c["fail"],
+        c["excepted"],
+        c["notApplicable"],
+        c["manual"]
+    );
+    let settings = v["settings"].as_array().cloned().unwrap_or_default();
+    let width = settings.iter().filter_map(|s| s["setting"].as_str()).map(str::len).max().unwrap_or(0);
+    for want in ["fail", "excepted", "manual", "notApplicable", "pass"] {
+        for s in settings.iter().filter(|s| s["status"] == want) {
+            let status = match want {
+                "fail" => "FAIL",
+                "excepted" => "EXCEPTED",
+                "manual" => "CHECK",
+                "notApplicable" => "n/a",
+                _ => "ok",
+            };
+            let (setting, value, note) = (s["setting"].as_str().unwrap_or(""), s["value"].as_str().unwrap_or(""), s["note"].as_str().unwrap_or(""));
+            out.push_str(&format!("  {status:<8}  {setting:<width$}  {value} (baseline: {}); {note}\n", s["baseline"].as_str().unwrap_or("")));
+        }
+    }
+    let names = |a: &Value| a.as_array().map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+    let unknown = names(&v["exceptions"]["unknownExceptions"]);
+    if !unknown.is_empty() {
+        out.push_str(&format!("BASELINE_EXCEPTIONS names settings the baseline doesn't have: {unknown}.\n"));
+    }
+    let unneeded = names(&v["unneededExceptions"]);
+    if !unneeded.is_empty() {
+        out.push_str(&format!("Excepted but meeting the baseline, so the exception can go: {unneeded}.\n"));
+    }
+    out.push_str(&format!("Digest {}. Fix each FAIL or approve an exception for it (BASELINE_EXCEPTIONS); save this output with the quarterly check.\n", v["digest"].as_str().unwrap_or("")));
+    out
+}
+
 fn health_summary(v: &Value) -> String {
     let score = v["score"].as_u64().map_or("no score".to_string(), |s| format!("{s}/100"));
     let band = v["band"].as_str().unwrap_or("unknown").replace('_', " ");
@@ -2428,6 +2489,27 @@ mod tests {
         );
         let off = history_summary(&json!({ "days": 7, "recording": false, "points": [], "trend": null }));
         assert_eq!(off, "Customer health history: last 7 days, 0 days recorded\nbotd isn't recording the score (HEALTH_SCORE_HISTORY_DAYS=0).\n");
+    }
+
+    #[test]
+    fn the_baseline_reads_as_a_line_per_setting_deviations_first() {
+        let v = json!({
+            "checkedAt": "2027-01-01T00:00:00Z", "ok": false, "digest": "ab12",
+            "counts": { "pass": 1, "fail": 1, "excepted": 0, "notApplicable": 0, "manual": 1 },
+            "settings": [
+                { "setting": "AUTH_MFA", "status": "pass", "value": "admins", "baseline": "admins or all", "note": "n1" },
+                { "setting": "TEAMS", "status": "manual", "value": "off", "baseline": "on when customers share the server", "note": "n2" },
+                { "setting": "EVIDENCE_BUNDLES", "status": "fail", "value": "off", "baseline": "monthly", "note": "n3" },
+            ],
+            "exceptions": { "deviations": ["EVIDENCE_BUNDLES"], "excepted": [], "unknownExceptions": ["NOPE"] },
+            "unneededExceptions": ["AUTH_MFA"],
+        });
+        let out = baseline_summary(&v);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].contains("1 meet it, 1 don't, 0 excepted, 0 not applicable, 1 to judge by hand"), "{out}");
+        assert!(lines[1].starts_with("  FAIL      EVIDENCE_BUNDLES  off (baseline: monthly); n3"), "{out}");
+        assert!(lines[2].starts_with("  CHECK     TEAMS") && lines[3].starts_with("  ok        AUTH_MFA"), "{out}");
+        assert!(out.contains("doesn't have: NOPE.") && out.contains("exception can go: AUTH_MFA.") && out.contains("Digest ab12."), "{out}");
     }
 
     #[test]
