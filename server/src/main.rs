@@ -1116,7 +1116,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
             "/scim/v2/Groups/{id}",
             get(scim::groups::get).put(scim::groups::replace).patch(scim::groups::patch).delete(scim::groups::delete).layer(DefaultBodyLimit::max(scim::groups::MAX_BODY)),
         )
-        // Bulk's maxPayloadSize (ADR 0149); each operation keeps its endpoint's own limit.
+        // Bulk's maxPayloadSize (ADR 0153); each operation keeps its endpoint's own limit.
         .route("/scim/v2/Bulk", post(scim::bulk::bulk).fallback(scim::bulk::only_post).layer(DefaultBodyLimit::max(scim::bulk::MAX_PAYLOAD)))
         .route("/scim/v2", any(scim::unknown))
         .route("/scim/v2/{*rest}", any(scim::unknown))
