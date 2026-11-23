@@ -42,6 +42,7 @@ use super::job;
 use super::landing::Landing;
 use super::pki::{self, Peer};
 use super::runas::{self, Ids};
+use super::seccomp;
 use super::teammates::{Files, Teammate, Teammates};
 use super::terminal::Logins;
 use super::tools::Tools;
@@ -1425,6 +1426,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
         ]
             .into_iter()
             .chain(a.upgrader.build.is_some().then_some(wire::CAN_UPGRADE))
+            .chain(seccomp::SUPPORTED.then_some(wire::CAN_SECCOMP))
             .map(String::from)
             .collect(),
         build: a.upgrader.build.clone(),

@@ -138,8 +138,11 @@ pub async fn follow_up(app: &App, e: &Enrollment, m: &Machine, hb: &Heartbeat) {
 pub fn upkeep_json(hb: &Heartbeat) -> Value {
     match &hb.bot_user {
         Some(s) => {
-            let locked = hb.can.iter().any(|c| c == wire::CAN_LOCKED_DOWN);
-            json!({ "state": s.state, "user": s.user, "uid": s.uid, "error": s.error, "at": s.at, "lockedDown": locked })
+            let can = |c: &str| hb.can.iter().any(|h| h == c);
+            json!({
+                "state": s.state, "user": s.user, "uid": s.uid, "error": s.error, "at": s.at,
+                "lockedDown": can(wire::CAN_LOCKED_DOWN), "seccomp": can(wire::CAN_SECCOMP),
+            })
         }
         None => Value::Null,
     }
@@ -149,7 +152,7 @@ pub fn upkeep_json(hb: &Heartbeat) -> Value {
 pub fn observed(app: &App, m: &Machine, by: &Who, old: Option<&Value>, new: &Value) {
     let state = |v: Option<&Value>| v.and_then(|v| v["state"].as_str()).map(String::from);
     let (was, now) = (state(old), state(Some(new)));
-    let d = || json!({ "user": new["user"], "uid": new["uid"], "lockedDown": new["lockedDown"] });
+    let d = || json!({ "user": new["user"], "uid": new["uid"], "lockedDown": new["lockedDown"], "seccomp": new["seccomp"] });
     match now.as_deref() {
         Some(wire::BOT_USER_READY) if was.as_deref() != Some(wire::BOT_USER_READY) => {
             app.db.record(&event(by, "machine.bot_user_ready", m, d()));
@@ -287,6 +290,9 @@ mod tests {
         assert_eq!(upkeep_json(&h)["lockedDown"], false, "an agent from before ADR 0145");
         h.can.push(wire::CAN_LOCKED_DOWN.into());
         assert_eq!(upkeep_json(&h)["lockedDown"], true);
+        assert_eq!(upkeep_json(&h)["seccomp"], false, "an agent from before ADR 0156");
+        h.can.push(wire::CAN_SECCOMP.into());
+        assert_eq!(upkeep_json(&h)["seccomp"], true);
         assert_eq!(upkeep_json(&hb(true, 0, None)), Value::Null);
     }
 
