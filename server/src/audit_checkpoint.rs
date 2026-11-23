@@ -21,7 +21,7 @@ use crate::obs::log::{log_info, log_warn};
 use crate::obs::metrics;
 use crate::runner::App;
 use crate::tsa;
-use aws_lc_rs::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 use base64::Engine;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -72,7 +72,7 @@ fn b64() -> base64::engine::GeneralPurpose {
 
 /// The key's id: the first 8 bytes of its SHA-256, hex.
 pub fn key_id(public: &[u8]) -> String {
-    hex(&Sha256::digest(public)[..8])
+    crate::audit_line::key_id(public)
 }
 
 /// An Ed25519 public key, as 64 hex digits.
@@ -85,7 +85,7 @@ pub fn parse_public_key(s: &str) -> Result<Vec<u8>, String> {
 
 /// What a checkpoint signs.
 pub fn statement(seq: i64, hash: &str, at: i64, key: &str) -> String {
-    format!("{DOMAIN}\nseq={seq}\nhash={hash}\nat={at}\nkey={key}")
+    crate::audit_line::statement(seq, hash, at, key)
 }
 
 /// What a checkpoint's RFC 3161 token stamps: the statement and its signature.
@@ -116,11 +116,6 @@ impl Key {
     pub fn sign(&self, message: &str) -> String {
         hex(self.pair.sign(message.as_bytes()).as_ref())
     }
-}
-
-/// Whether `signature` (hex) is `public`'s over `message`.
-pub fn signed(public: &[u8], message: &str, signature: &str) -> bool {
-    unhex(signature).is_some_and(|s| UnparsedPublicKey::new(&ED25519, public).verify(message.as_bytes(), &s).is_ok())
 }
 
 /// Where to get timestamps: the URL, and what the API, logs and events show of it.
@@ -773,25 +768,7 @@ pub fn check_checkpoint(id: i64, prev: Option<&str>, d: Option<&Value>, before: 
 /// The part of [`check_checkpoint`] that needs only the event: it names the head it is
 /// sealed onto, and one of `keys` signed it. What the archive check uses (ADR 0163).
 pub fn check_signed(id: i64, prev: Option<&str>, d: Option<&Value>, before: Option<i64>, keys: &[Vec<u8>]) -> Result<(), Fault> {
-    let malformed = || fault(id, "malformed", "the checkpoint's details are missing a field");
-    let d = d.ok_or_else(malformed)?;
-    let s = |k: &str| d[k].as_str().ok_or_else(malformed);
-    let n = |k: &str| d[k].as_i64().ok_or_else(malformed);
-    let (seq, hash, at, kid, public, signature) = (n("seq")?, s("hash")?, n("at")?, s("keyId")?, s("publicKey")?, s("signature")?);
-    if Some(hash) != prev || before.is_some_and(|b| b != seq) {
-        return Err(fault(id, "head", format!("it signs event {seq}'s hash, not the head it is sealed onto")));
-    }
-    let public = parse_public_key(public).map_err(|e| fault(id, "malformed", e))?;
-    if key_id(&public) != kid {
-        return Err(fault(id, "key", format!("its key id {kid} isn't its key's")));
-    }
-    if !keys.contains(&public) {
-        return Err(fault(id, "key", format!("signed by key {kid}, which isn't trusted")));
-    }
-    if !signed(&public, &statement(seq, hash, at, kid), signature) {
-        return Err(fault(id, "signature", "its signature doesn't verify"));
-    }
-    Ok(())
+    crate::audit_line::check_checkpoint(prev, d, before, Some(keys)).map(|_| ()).map_err(|(reason, e)| fault(id, reason, e))
 }
 
 /// Checks the `audit.checkpoint_timestamped` event `id` against the checkpoint record it
@@ -968,6 +945,7 @@ pub fn render(app: &App, out: &mut String) {
 mod tests {
     use super::*;
     use crate::audit_chain::{Options, Range, verify_with};
+    use crate::audit_line::signed;
     use crate::tsa::fake::FakeTsa;
 
     fn settings(vars: &[(&str, &str)]) -> Result<Settings, String> {

@@ -352,8 +352,8 @@ async fn checking_the_archive_catches_its_first_objects_gone_and_reads_null_vers
     crate::secrets::redact::forget(later);
     assert_eq!(v["archive"]["ok"], true, "{v}");
     let c = machines::s3::S3::new(fresh.settings()).unwrap();
-    // A batch copied to a new key, its details changed and its hashes kept: what it says
-    // no longer matches this server's rows under those hashes.
+    // A batch copied to a new key, its details changed and its hashes kept: the line no
+    // longer follows from its own digest, and no longer matches this server's rows.
     let original = fresh.keys()[0].clone();
     let copy = format!("audit/prod/2099/01/01/{}", original.rsplit('/').next().unwrap());
     let (meta, _) = fresh.w().meta[&original].clone();
@@ -363,7 +363,7 @@ async fn checking_the_archive_catches_its_first_objects_gone_and_reads_null_vers
     h.push(("x-amz-checksum-sha256", sum));
     c.put_with(&copy, changed.into_bytes(), &h).await.unwrap();
     let v = verify_archive(port, &admin, "").await;
-    assert_eq!((reasons(&v), v["archive"]["altered"].as_u64()), (vec!["contents".to_string()], Some(1)), "{v}");
+    assert_eq!((reasons(&v), v["archive"]["altered"].as_u64()), (vec!["digest".to_string(), "contents".to_string()], Some(1)), "{v}");
     assert!(v["firstBroken"].is_null(), "this server's log is fine: {v}");
     c.delete(&copy).await.unwrap();
     assert_eq!(verify_archive(port, &admin, "").await["archive"]["ok"], true);
@@ -455,7 +455,7 @@ async fn the_daily_check_reads_whats_new_since_its_last_pass() {
     c.put_with(&copy, changed.into_bytes(), &h).await.unwrap();
     crate::audit_chain::daily(&app).await;
     let (outcome, d) = last_verified(&app);
-    assert_eq!((outcome.as_str(), d["reason"].as_str(), d["archive"]["firstProblem"]["reason"].as_str()), ("failure", Some("archive"), Some("contents")), "{d}");
+    assert_eq!((outcome.as_str(), d["reason"].as_str(), d["archive"]["firstProblem"]["reason"].as_str()), ("failure", Some("archive"), Some("digest")), "{d}");
     assert_eq!(crate::audit_archive_verify::last_pass(&app, &sink), Some(next.clone()), "a failed check doesn't move the last pass");
 
     // Off: the daily check leaves the archive alone.
@@ -573,4 +573,98 @@ async fn an_archive_beside_a_siem_gets_every_event_while_the_siem_is_down() {
     assert!(to_siem.windows(2).all(|w| w[1] == w[0] + 1) && to_siem[0] == 1 && *to_siem.last().unwrap() == head, "{to_siem:?}");
     assert_eq!(to_siem, to_archive);
     assert_eq!((app.db.audit_export_cursor(&siem.sink.id), app.db.audit_export_cursor(&archive.sink.id)), (Some(head), Some(head)), "a cursor each");
+}
+
+/// Writes `body` to `key` as botd would, its metadata copied from `like`.
+async fn put_like(s: &StandIn, like: &str, key: &str, body: String) {
+    use base64::Engine;
+    let (meta, _) = s.w().meta[like].clone();
+    let sum = base64::engine::general_purpose::STANDARD.encode(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, body.as_bytes()).as_ref());
+    let mut h: Vec<(&str, String)> = meta.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    h.push(("x-amz-checksum-sha256", sum));
+    machines::s3::S3::new(s.settings()).unwrap().put_with(key, body.into_bytes(), &h).await.unwrap();
+}
+
+/// Every archived line, checked as `botctl audit verify-lines` would, with no botd.
+fn offline(s: &StandIn) -> crate::audit_line::Report {
+    let mut l = crate::audit_line::Lines::new(None);
+    for (key, body) in s.w().objects.iter().filter(|(k, _)| k.starts_with("audit/prod/")) {
+        for (n, line) in String::from_utf8_lossy(body).lines().enumerate() {
+            l.line(line, &format!("{key}:{}", n + 1));
+        }
+    }
+    l.finish()
+}
+
+#[tokio::test]
+async fn archived_lines_vouch_for_themselves_once_retention_has_taken_the_rows() {
+    let (port, app, admin, _) = serve_app().await;
+    let s = StandIn::start().await;
+    // A fresh log, so it can start with old events.
+    app.db.execute_raw("DROP TRIGGER audit_events_no_delete").unwrap();
+    app.db.execute_raw("DELETE FROM audit_events").unwrap();
+    let old = db::now() - 40 * 86_400_000;
+    let ids: Vec<i64> = (0..6).map(|i| app.db.record_at(&Event::new(Actor::system("test"), "test.old").details(json!({ "n": i })), old).unwrap()).collect();
+    // A batch of the first two was cut before the upgrade: it goes again as it was, with
+    // no digests, and the events after it carry theirs.
+    let marker = ids[1];
+    let sink = format!("s3://{}/backups/audit/prod", s.url.trim_start_matches("http://"));
+    app.db.set_audit_export_cursor(&format!("{sink}#batch"), marker).unwrap();
+    export_to(&app, &vars(&s, &[("AUDIT_EXPORT_S3_LOCK", "off"), ("AUDIT_EXPORT_START", "all")]));
+    let x = app.audit_export.get().unwrap().clone();
+    until("archived", || x.delivered() >= app.db.audit_head()).await;
+    assert_eq!(app.db.audit_export_cursor(crate::audit_export::DIGESTS), Some(marker));
+    let siem = parse(&call(port, "GET", "/api/audit/siem", &admin, "").await.1);
+    assert_eq!(siem["digestsAfter"].as_i64(), Some(marker), "{siem}");
+    let sent = archived(&s);
+    assert_eq!(sent[0]["id"].as_i64(), Some(ids[0]), "{sent:?}");
+    assert!(sent.iter().all(|e| e["chainDigest"].is_string() == (e["id"].as_i64().unwrap() > marker)), "{sent:?}");
+    assert!(sent.iter().filter(|e| e["id"].as_i64().unwrap() > marker).all(|e| e["chainSalt"].is_string()));
+
+    let r = offline(&s);
+    assert!(r.ok, "{r:?}");
+    assert_eq!((r.hosts.len(), r.hosts[0].first, r.hosts[0].unbound, r.hosts[0].bound as usize), (1, Some(ids[0]), 2, sent.len() - 2), "{r:?}");
+    let v = verify_archive(port, &admin, "").await;
+    assert_eq!((v["archive"]["ok"].as_bool(), v["archive"]["unbound"].as_u64(), v["archive"]["digestsAfter"].as_i64()), (Some(true), Some(2), Some(marker)), "{v}");
+
+    // Retention takes the old rows. Nothing here can say what they were any more.
+    app.db.set_audit_retention(Some(30));
+    crate::audit::prune(&app, 30);
+    let left = app.db.audit_chain_rows(i64::MIN, 1000).unwrap();
+    assert!(left.iter().all(|r| r.id > ids[5]), "{:?}", left.iter().map(|r| r.id).collect::<Vec<_>>());
+    assert_eq!(verify_archive(port, &admin, "").await["archive"]["ok"], true);
+
+    // A copy of an archived batch, the third event's details changed and its hashes kept: once
+    // the row was gone this went unseen; its own digest gives it away now.
+    let original = s.keys().into_iter().find(|k| String::from_utf8_lossy(&s.w().objects[k]).contains("\"details\":{\"n\":2}")).unwrap();
+    let body = String::from_utf8(s.w().objects[&original].clone()).unwrap();
+    let forged = format!("audit/prod/2099/01/01/{}", original.rsplit('/').next().unwrap());
+    put_like(&s, &original, &forged, body.replacen("\"details\":{\"n\":2}", "\"details\":{\"n\":7}", 1)).await;
+    let v = verify_archive(port, &admin, "").await;
+    assert_eq!((v["ok"].as_bool(), reasons(&v)), (Some(false), vec!["digest".to_string()]), "{v}");
+    assert_eq!(v["archive"]["firstProblems"][0]["id"].as_i64(), Some(ids[2]), "{v}");
+    assert!(v["firstBroken"].is_null(), "this server's log is fine: {v}");
+    let r = offline(&s);
+    assert!(!r.ok && r.hosts[0].first_problems.iter().any(|p| p.reason == "digest" && p.id == Some(ids[2])), "{r:?}");
+    machines::s3::S3::new(s.settings()).unwrap().delete(&forged).await.unwrap();
+    assert_eq!(verify_archive(port, &admin, "").await["archive"]["ok"], true);
+
+    // The same copy with its digest and salt stripped, to pass as written before them.
+    let stripped: Vec<String> = body
+        .lines()
+        .map(|l| {
+            let mut e: Value = serde_json::from_str(l).unwrap();
+            if e["id"] == ids[2] {
+                let o = e.as_object_mut().unwrap();
+                o.remove("chainDigest");
+                o.remove("chainSalt");
+            }
+            e.to_string()
+        })
+        .collect();
+    put_like(&s, &original, &forged, stripped.join("\n") + "\n").await;
+    let v = verify_archive(port, &admin, "").await;
+    assert_eq!((reasons(&v), v["archive"]["unbound"].as_u64()), (vec!["unbound".to_string()], Some(3)), "{v}");
+    let r = offline(&s);
+    assert!(!r.ok && r.hosts[0].first_problems.iter().any(|p| p.reason == "unbound" && p.id == Some(ids[2])), "{r:?}");
 }
