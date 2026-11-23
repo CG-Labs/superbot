@@ -1,4 +1,4 @@
-//! The audit log's write-once archive (ADR 0153): the SIEM export's third sink,
+//! The audit log's write-once archive (ADR 0154): the SIEM export's third sink,
 //! `AUDIT_EXPORT=s3://<bucket>[/<prefix>]`. Events go out in batches, one JSON-lines
 //! object per batch, to any S3-compatible store, each object locked with S3 Object
 //! Lock so nobody (botd, root on the host, whoever holds the store's keys) can change

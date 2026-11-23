@@ -756,7 +756,7 @@ export type AuditExportState =
   | { enabled: false }
   | { enabled: true; kind: string; sink: string; delivered: number; pending: number; deliveredAt: number | null; failing: boolean; lastError: string | null; archive?: AuditArchiveState };
 
-/** The S3 archive's settings and last object, when the export is `s3://` (ADR 0153). */
+/** The S3 archive's settings and last object, when the export is `s3://` (ADR 0154). */
 export interface AuditArchiveState {
   endpoint: string;
   bucket: string;

@@ -1,4 +1,4 @@
-//! The audit log's write-once S3 archive (ADR 0153) against the S3 stand-in: it refuses
+//! The audit log's write-once S3 archive (ADR 0154) against the S3 stand-in: it refuses
 //! a bucket that isn't write-once, writes every event once, in order, in locked
 //! objects, retries a batch as the same object, and catches a store that drops the lock.
 

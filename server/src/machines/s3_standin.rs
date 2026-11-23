@@ -141,7 +141,8 @@ fn signed(method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8]) -> bool 
     let pairs: Vec<(&str, &str)> = values.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let query: Vec<(String, String)> = url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()).into_owned().collect();
     let q: Vec<(&str, &str)> = query.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let (_, sig) = s3::signature(SECRET, region, &amz_date, method.as_str(), uri.path(), &s3::canonical_query(&q), &pairs, &payload);
+    let scope = crate::sigv4::Scope { amz_date: &amz_date, region, service: "s3" };
+    let (_, sig) = crate::sigv4::signature(SECRET, &scope, method.as_str(), uri.path(), &s3::canonical_query(&q), &pairs, &payload);
     !names.is_empty() && names.contains("host") && sig == field("Signature")
 }
 

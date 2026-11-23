@@ -7,7 +7,7 @@
 //!   message, the JSON line as its text.
 //! - Plain `http://` and `syslog+tcp://` to loopback, or with `AUDIT_EXPORT_INSECURE=on`.
 //! - `s3://<bucket>[/<prefix>]`: batches as JSON-lines objects in an S3-compatible
-//!   store, each locked with S3 Object Lock ([`crate::audit_archive`], ADR 0153).
+//!   store, each locked with S3 Object Lock ([`crate::audit_archive`], ADR 0154).
 //!
 //! Off unless `AUDIT_EXPORT` is set. Delivery is at least once, in id order: a cursor
 //! in the database (per sink) moves only when a batch is accepted, a failed batch is
@@ -198,7 +198,7 @@ struct State {
     failures: u32,
     failing_since: Option<i64>,
     last_error: Option<String>,
-    /// The archive's last object (ADR 0153).
+    /// The archive's last object (ADR 0154).
     archived: Option<Value>,
 }
 
