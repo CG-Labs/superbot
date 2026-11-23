@@ -215,7 +215,7 @@ async fn an_update_that_leaves_active_alone_cannot_undo_an_admins_disable() {
     assert!(stale.user.active());
     assert_eq!(call(port, "PATCH", &format!("/api/users/{id}"), &admin, r#"{"status":"disabled"}"#).await.0, 200);
     assert!(!app.db.user(&id).unwrap().active());
-    let rename = db::ScimFields { user_name: &stale.user_name, external_id: stale.external_id.as_deref(), given_name: Some("Ada"), family_name: Some("King"), scim_display_name: None, formatted: None, display_name: "Ada King", email: stale.user.email.as_deref(), active: None };
+    let rename = db::ScimFields { user_name: &stale.user_name, external_id: stale.external_id.as_deref(), given_name: Some("Ada"), family_name: Some("King"), scim_display_name: None, formatted: None, display_name: "Ada King", email: stale.user.email.as_deref(), active: None, enterprise: &stale.enterprise };
     app.db.save_scim_user("okta", &id, &rename, false).unwrap();
     assert!(!app.db.user(&id).unwrap().active(), "the disable stands");
     assert_eq!(app.db.user(&id).unwrap().name, "Ada King");
@@ -255,11 +255,17 @@ async fn discovery_describes_users_only() {
 
     let (_, _, types) = scim(port, &t, "GET", "/scim/v2/ResourceTypes", Value::Null).await;
     assert_eq!((types["totalResults"].clone(), types["Resources"][0]["endpoint"].clone()), (json!(1), json!("/Users")));
+    assert_eq!(types["Resources"][0]["schemaExtensions"], json!([{ "schema": scim::ENTERPRISE_SCHEMA, "required": false }]));
     assert_eq!(scim(port, &t, "GET", "/scim/v2/ResourceTypes/User", Value::Null).await.0, 200);
     assert_eq!(scim(port, &t, "GET", "/scim/v2/ResourceTypes/Group", Value::Null).await.0, 404);
     let (_, _, schemas) = scim(port, &t, "GET", "/scim/v2/Schemas", Value::Null).await;
-    assert_eq!(schemas["Resources"][0]["id"], scim::USER_SCHEMA);
+    assert_eq!((schemas["totalResults"].clone(), schemas["Resources"][0]["id"].as_str(), schemas["Resources"][1]["id"].as_str()), (json!(2), Some(scim::USER_SCHEMA), Some(scim::ENTERPRISE_SCHEMA)));
     assert_eq!(scim(port, &t, "GET", &format!("/scim/v2/Schemas/{}", scim::USER_SCHEMA), Value::Null).await.0, 200);
+    let (code, _, ext) = scim(port, &t, "GET", &format!("/scim/v2/Schemas/{}", scim::ENTERPRISE_SCHEMA), Value::Null).await;
+    let names: Vec<&str> = ext["attributes"].as_array().unwrap().iter().filter_map(|a| a["name"].as_str()).collect();
+    assert_eq!((code, names), (200, vec!["employeeNumber", "costCenter", "organization", "division", "department", "manager"]));
+    let manager = &ext["attributes"][5]["subAttributes"];
+    assert_eq!((manager[0]["mutability"].as_str(), manager[1]["mutability"].as_str(), manager[2]["mutability"].as_str()), (Some("readWrite"), Some("readOnly"), Some("readOnly")));
 
     // Groups: an empty list for connection tests, and a clear refusal for the rest.
     let (code, _, groups) = scim(port, &t, "GET", "/scim/v2/Groups?startIndex=1&count=100", Value::Null).await;
@@ -420,7 +426,7 @@ async fn entra_patches_deletes_softly_and_provisions_again() {
     let kept = app.db.user(&id).expect("never destroyed");
     assert!(!kept.active());
     // An update that read the user before the DELETE can't bring them back.
-    let stale = db::ScimFields { user_name: "grace@contoso.example", external_id: Some("grace"), given_name: None, family_name: None, scim_display_name: None, formatted: None, display_name: "Grace", email: None, active: Some(true) };
+    let stale = db::ScimFields { user_name: "grace@contoso.example", external_id: Some("grace"), given_name: None, family_name: None, scim_display_name: None, formatted: None, display_name: "Grace", email: None, active: Some(true), enterprise: &Default::default() };
     assert_eq!(app.db.save_scim_user("entra", &id, &stale, false), Err(db::ScimConflict::Gone));
     assert!(!app.db.user(&id).unwrap().active());
     let deleted = &events(port, &admin, "action=scim.user_deleted").await[0];
@@ -684,4 +690,109 @@ async fn refused_requests_are_audited_once_with_their_reason_and_lookups_arent()
     assert_eq!(identity["status"], "watch", "{identity:#}");
     let reasons: Vec<_> = identity["facts"]["scimReasons"].as_array().unwrap().iter().map(|r| r["code"].as_str().unwrap()).collect();
     assert_eq!(reasons, ["invalid_syntax", "uniqueness"], "codes the score keeps, not [text]");
+}
+
+const EXT: &str = scim::ENTERPRISE_SCHEMA;
+
+/// A user with Entra's default enterprise mappings: employeeId, department, companyName,
+/// and the manager, by their id here.
+fn entra_user(user_name: &str, external_id: &str, ext: Value) -> Value {
+    json!({
+        "schemas": [scim::USER_SCHEMA, EXT],
+        "externalId": external_id, "userName": user_name, "active": true, "displayName": user_name.split('@').next().unwrap(),
+        "emails": [{ "primary": true, "type": "work", "value": user_name }],
+        EXT: ext,
+    })
+}
+
+#[tokio::test]
+async fn the_enterprise_extension_is_kept_patched_and_shown_to_reviewers() {
+    let (port, app, admin) = serve(|_| {}).await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "entra" })).await;
+    let (code, _, boss) = scim(port, &t, "POST", USERS, entra_user("ada@contoso.example", "ada", json!({ "department": "Engineering" }))).await;
+    assert_eq!(code, 201, "{boss}");
+    let boss = boss["id"].as_str().unwrap().to_string();
+    let ext = json!({ "employeeNumber": "E-0042", "costCenter": "CC-7", "organization": "Contoso", "division": "Cloud", "department": "Platform", "manager": { "value": boss } });
+    let (code, _, u) = scim(port, &t, "POST", USERS, entra_user("grace@contoso.example", "grace", ext)).await;
+    assert_eq!(code, 201, "{u}");
+    let id = u["id"].as_str().unwrap().to_string();
+    assert_eq!(u["schemas"], json!([scim::USER_SCHEMA, EXT]));
+    let base = format!("http://127.0.0.1:{port}/scim/v2");
+    assert_eq!(
+        u[EXT],
+        json!({ "employeeNumber": "E-0042", "costCenter": "CC-7", "organization": "Contoso", "division": "Cloud", "department": "Platform",
+                "manager": { "value": boss, "$ref": format!("{base}/Users/{boss}"), "displayName": "ada" } })
+    );
+    // Entra's validator reads back what it added, by the joining property.
+    let (_, _, found) = scim(port, &t, "GET", "/scim/v2/Users?filter=userName+eq+%22grace%40contoso.example%22", Value::Null).await;
+    assert_eq!(found["Resources"][0][EXT]["department"], "Platform");
+    // Without any, the extension is left out.
+    let (_, _, plain) = scim(port, &t, "POST", USERS, okta_user("bob@contoso.example", "bob")).await;
+    assert_eq!((plain["schemas"].clone(), plain.get(EXT)), (json!([scim::USER_SCHEMA]), None));
+
+    // PATCH in each shape Entra and Okta send: the full path, Entra's bare manager with a
+    // list, a path-less object of full paths, the extension's URN, and remove.
+    let patch = json!({ "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], "Operations": [
+        { "op": "Replace", "path": format!("{EXT}:department"), "value": "Data" },
+        { "op": "Add", "path": "manager", "value": [{ "$ref": null, "value": boss }] },
+        { "op": "Replace", "value": { format!("{EXT}:costCenter"): "CC-8", "displayName": "Grace H" } },
+        { "op": "replace", "path": EXT, "value": { "division": "Edge" } },
+        { "op": "Remove", "path": format!("{EXT}:employeeNumber") },
+    ]});
+    let (code, _, u) = scim(port, &t, "PATCH", &format!("{USERS}/{id}"), patch).await;
+    assert_eq!(code, 200, "{u}");
+    assert_eq!((u[EXT]["department"].as_str(), u[EXT]["costCenter"].as_str(), u[EXT]["division"].as_str(), u[EXT]["organization"].as_str()), (Some("Data"), Some("CC-8"), Some("Edge"), Some("Contoso")));
+    assert_eq!((u[EXT].get("employeeNumber"), u[EXT]["manager"]["value"].as_str(), u["displayName"].as_str()), (None, Some(boss.as_str()), Some("Grace H")));
+    let changes = &events(port, &admin, "action=user.updated").await[0]["details"]["changes"];
+    assert_eq!((changes["department"].clone(), changes["employeeNumber"]["to"].clone()), (json!({ "from": "Platform", "to": "Data" }), Value::Null), "{changes}");
+    assert!(changes.get("manager").is_none(), "an unchanged manager isn't a change: {changes}");
+
+    // A manager must be someone else this tenant has: anyone else is dropped, never refused,
+    // so a deactivation that carries one still goes through.
+    let (o, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    let (_, _, outsider) = scim(port, &o, "POST", USERS, okta_user("eve@other.example", "eve")).await;
+    for stranger in [json!("nobody"), json!({ "value": id }), json!({ "value": outsider["id"] })] {
+        let op = json!({ "Operations": [{ "op": "replace", "path": format!("{EXT}:manager"), "value": stranger }, { "op": "replace", "path": "active", "value": false }] });
+        let (code, _, u) = scim(port, &t, "PATCH", &format!("{USERS}/{id}"), op).await;
+        assert_eq!((code, u[EXT].get("manager"), u["active"].clone()), (200, None, json!(false)), "{stranger}: {u}");
+        assert!(!app.db.user(&id).unwrap().active());
+    }
+    let on = json!({ "Operations": [{ "op": "replace", "path": "active", "value": true }, { "op": "add", "path": format!("{EXT}:manager.value"), "value": boss }] });
+    assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{id}"), on).await.2[EXT]["manager"]["value"], boss.as_str());
+
+    // Bad values are refused like any other attribute.
+    for bad in [
+        json!({ "Operations": [{ "op": "replace", "path": format!("{EXT}:department"), "value": "x".repeat(129) }] }),
+        json!({ "Operations": [{ "op": "replace", "path": format!("{EXT}:department"), "value": 7 }] }),
+        json!({ "Operations": [{ "op": "add", "path": "manager", "value": [{ "value": boss }, { "value": boss }] }] }),
+        json!({ "Operations": [{ "op": "replace", "path": EXT, "value": "Platform" }] }),
+    ] {
+        let (code, head, body) = scim(port, &t, "PATCH", &format!("{USERS}/{id}"), bad.clone()).await;
+        assert_eq!((code, body["scimType"].as_str()), (400, Some("invalidValue")), "{bad}");
+        is_scim_error(&head, &body, 400);
+    }
+
+    // The access review shows reviewers each person's department and manager, outside its digest.
+    let (_, r) = call(port, "GET", "/api/access-review", &admin, "").await;
+    let r = parse(&r);
+    let digest = r["digest"].as_str().unwrap().to_string();
+    let grace = r["groups"].as_array().unwrap().iter().flat_map(|g| g["people"].as_array().unwrap().clone()).find(|p| p["id"] == id.as_str()).unwrap();
+    assert_eq!((grace["scim"]["department"].as_str(), grace["scim"]["employeeNumber"].clone()), (Some("Data"), Value::Null));
+    assert_eq!(grace["scim"]["manager"], json!({ "id": boss, "name": "ada" }));
+    let (code, _, csv) = call_with(port, "GET", "/api/access-review/export.csv", &admin, "", "").await;
+    assert_eq!(code, 200);
+    let row = csv.split("\r\n").find(|l| l.contains(&id)).unwrap();
+    assert!(row.contains(&format!(",Data,ada ({boss}),person,")), "{row}");
+    let dept = json!({ "Operations": [{ "op": "replace", "path": format!("{EXT}:department"), "value": "Research" }] });
+    assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{id}"), dept).await.0, 200);
+    let (_, again) = call(port, "GET", "/api/access-review", &admin, "").await;
+    assert_eq!(parse(&again)["digest"].as_str(), Some(digest.as_str()), "a department grants nothing, so the sign-off stays good");
+
+    // A manager the tenant deletes is no longer shown; a PUT without the extension clears it.
+    assert_eq!(scim(port, &t, "DELETE", &format!("{USERS}/{boss}"), Value::Null).await.0, 204);
+    let (_, _, u) = scim(port, &t, "GET", &format!("{USERS}/{id}"), Value::Null).await;
+    assert_eq!((u[EXT].get("manager"), u[EXT]["department"].as_str()), (None, Some("Research")), "{u}");
+    let (code, _, u) = scim(port, &t, "PUT", &format!("{USERS}/{id}"), okta_user("grace@contoso.example", "grace")).await;
+    assert_eq!((code, u.get(EXT), u["schemas"].clone()), (200, None, json!([scim::USER_SCHEMA])), "{u}");
+    assert!(app.db.scim_user("entra", &id).unwrap().enterprise.is_empty());
 }
