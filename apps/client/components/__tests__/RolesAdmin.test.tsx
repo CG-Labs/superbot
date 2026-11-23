@@ -188,6 +188,20 @@ describe("RolesAdmin: time-bound roles (ADR 0197)", () => {
     await waitFor(() => expect(api.assignTeamRole).toHaveBeenCalledWith("r1", "t1", "u3", { expiresAt: NOW + 7 * 86_400_000 }));
   });
 
+  it("changes when a holder's role ends without taking it away", async () => {
+    const api = mockApi();
+    const u = userEvent.setup();
+    await show(api);
+    await u.press(await screen.findByLabelText("Role Support"));
+    await u.press(await screen.findByRole("radio", { name: "30 days" }));
+    await u.press(screen.getByLabelText("Change end for Sam"));
+    await waitFor(() => expect(api.assignRole).toHaveBeenCalledWith("r1", "u0", { expiresAt: NOW + 30 * 86_400_000 }));
+    await u.press(screen.getByRole("radio", { name: "No end" }));
+    await u.press(screen.getByLabelText("Change end for Bo in Ops"));
+    await waitFor(() => expect(api.assignTeamRole).toHaveBeenCalledWith("r1", "t1", "u1", undefined));
+    expect(api.unassignRole).not.toHaveBeenCalled();
+  });
+
   it("lifts a limit", async () => {
     const api = mockApi();
     api.roles.mockResolvedValue({ ...VIEW, roles: [{ ...SUPPORT, maxDays: 7 }] });

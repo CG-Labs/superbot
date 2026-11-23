@@ -39,7 +39,7 @@ Two things are missing:
 - A role can have `maxDays` (1 to 365), set on create or with `PATCH`, or cleared with `null`. A time-bound role:
   - is given only by hand, and only with an end at most `maxDays` days away. The limit is checked in the same SQL statement that writes the role, so a limit set at the same moment can't be raced;
   - can't be mapped to a SCIM group (ADR 0138), a SCIM role group (ADR 0180) or a SAML group (ADR 0160), since a group gives standing access;
-  - can't be held by a service account (ADR 0143), which holds its role for as long as it exists, and isn't offered to them.
+  - can't be held by a service account (ADR 0143), which holds its role for as long as it exists, and isn't offered to them. The service account write checks this again in its own transaction, so a limit set after the handler's check can't slip through.
 - Making a role time-bound, or lowering its limit, is refused with 409 while anyone holds it with no end or with a later end than the new limit allows, while a service account holds it, or while a group is mapped to it. The count is taken in the same transaction as the write.
 - `role.created` and `role.updated` record `maxDays`.
 
@@ -47,7 +47,7 @@ Two things are missing:
 
 - `GET /api/roles/{id}` holders, `customRole` in the admin user views, `/api/auth/me` and `/api/team`, and the user's `roleExpiresAt`.
 - The access review shows `customRole.expiresAt` and `team.customRole.expiresAt`. The digest covers the ends only when there is one, so reports with no ended roles keep their digests, and moving an end makes an earlier sign-off stale (409). The CSV role cells end with ` until <RFC 3339>`.
-- The app and the console offer an end (8 hours, 1 day, 7 days, 30 days, 90 days, or none) and a reason when giving a role, and only ends within the limit for a time-bound role, starting at the shortest. They show "ends in 3 days" beside each holder, and a time limit field on the role. The console's user and team dropdowns don't offer time-bound roles, since those need an end; they're given from the Roles tab.
+- The app and the console offer an end (8 hours, 1 day, 7 days, 30 days, 90 days, or none) and a reason when giving a role, and only ends within the limit for a time-bound role, starting at the shortest. They show "ends in 3 days" beside each holder, with **Change end** to give it again with the end picked, and a time limit field on the role. The console's user and team dropdowns don't offer time-bound roles, since those need an end; they're given from the Roles tab.
 - `botctl role assign <role> <user> [--team T] [--for 8h|7d] [--reason TEXT]`, and `botctl role add|edit --max-days N|none`.
 
 ## Alternatives considered

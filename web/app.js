@@ -768,8 +768,8 @@ function roleCard(r) {
     <span class="sub">Within a team: ${esc(permNames(teamPerms(r.permissions)))}</span>
     ${r.unknown.length ? `<p class="warn">Unknown here, so they grant nothing: ${esc(r.unknown.join(", "))}. Saving drops them.</p>` : ""}
     <ul class="holders">
-      ${d.holders.users.map((u) => `<li data-user="${esc(u.id)}">${who(u)} <span class="sub">across the server${endsText(u)}</span> <button type="button" class="btn push" data-act="unassign-role">Take away</button></li>`).join("")}
-      ${d.holders.teams.map((h) => `<li data-user="${esc(h.user.id)}" data-team="${esc(h.team.id)}">${who(h.user)} <span class="sub">in ${esc(h.team.name)}${endsText(h)}</span> <button type="button" class="btn push" data-act="unassign-team-role">Take away</button></li>`).join("")}
+      ${d.holders.users.map((u) => `<li data-user="${esc(u.id)}">${who(u)} <span class="sub">across the server${endsText(u)}</span> <button type="button" class="btn push" data-act="renew-role" title="Set its end to the one picked below">Change end</button> <button type="button" class="btn" data-act="unassign-role">Take away</button></li>`).join("")}
+      ${d.holders.teams.map((h) => `<li data-user="${esc(h.user.id)}" data-team="${esc(h.team.id)}">${who(h.user)} <span class="sub">in ${esc(h.team.name)}${endsText(h)}</span> <button type="button" class="btn push" data-act="renew-team-role" title="Set its end to the one picked below">Change end</button> <button type="button" class="btn" data-act="unassign-team-role">Take away</button></li>`).join("")}
     </ul>
     <form class="bar" data-act="give-role" autocomplete="off">
       <input name="user" class="wide" list="role-people" placeholder="Give across the server: email or id" required spellcheck="false" />
@@ -869,6 +869,13 @@ $("roles-list").addEventListener("click", async (e) => {
     if (b.dataset.act === "unassign-role") {
       if (!confirm(`Take ${r.name} away? They keep ${baseName(r.base).toLowerCase()} as their role.`)) return;
       await api("DELETE", `/api/roles/${key(r.id)}/users/${key(li.dataset.user)}`);
+    }
+    if (b.dataset.act === "renew-role" || b.dataset.act === "renew-team-role") {
+      const f = b.closest("[data-role]").querySelector("form[data-act=give-role]");
+      const body = giving(f, r);
+      if (!confirm(`Change when ${r.name} ends for them? ${body.expiresAt ? `It will end ${fmt(body.expiresAt)}.` : "It will have no end."}`)) return;
+      if (b.dataset.act === "renew-role") await api("PUT", `/api/roles/${key(r.id)}/users/${key(li.dataset.user)}`, body);
+      else await api("PUT", `/api/roles/${key(r.id)}/teams/${key(li.dataset.team)}/users/${key(li.dataset.user)}`, body);
     }
     if (b.dataset.act === "unassign-team-role") {
       if (!confirm(`Take ${r.name} away within this team? Their role across the server doesn't change.`)) return;

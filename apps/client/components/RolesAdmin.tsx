@@ -190,6 +190,21 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
     });
   };
 
+  /** Gives it again to someone who holds it, so its end becomes the one picked above. */
+  const renew = async (userId: string, name: string, team?: string) => {
+    if (!role) return;
+    const at = endsAt(ends, Date.now());
+    const body = at == null ? "It will have no end." : `It will end on ${new Date(at).toLocaleString()}.`;
+    if (!(await confirmAsync(`Change when ${name}'s ${role.name} ends?`, body, "Change"))) return;
+    void run(async () => {
+      if (team) await api.assignTeamRole(role.id, team, userId, giving());
+      else await api.assignRole(role.id, userId, giving());
+      setReason("");
+      await onSaved(role.id);
+      await loadHolders();
+    });
+  };
+
   const giveInTeam = (team: Team, userId: string) => {
     if (!role) return;
     void run(async () => {
@@ -318,7 +333,7 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
               accessibilityLabel="Why it's given"
             />
             <Text style={styles.faint}>
-              {role.maxDays ? `Time-bound: it ends by itself within ${role.maxDays} day${role.maxDays === 1 ? "" : "s"}. ` : ""}Giving it again to someone who has it moves the end.
+              {role.maxDays ? `Time-bound: it ends by itself within ${role.maxDays} day${role.maxDays === 1 ? "" : "s"}. ` : ""}"Change end" sets it for someone who has it already.
             </Text>
           </Section>
 
@@ -333,6 +348,7 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
                     {u.email && u.name ? <Text style={styles.faint}> · {u.email}</Text> : null}
                     {u.expiresAt ? <Text style={styles.faint}> · {endsLabel(u.expiresAt, now)}</Text> : null}
                   </Text>
+                  <Button label="Change end" a11y={`Change end for ${personName(u)}`} disabled={busy} onPress={() => void renew(u.id, personName(u))} />
                   <Button label="Take away" a11y={`Take away from ${personName(u)}`} disabled={busy} onPress={() => void takeAway(u.id, personName(u))} />
                 </View>
               ))
@@ -379,6 +395,7 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
                     {h.expiresAt ? ` · ${endsLabel(h.expiresAt, now)}` : ""}
                   </Text>
                 </Text>
+                <Button label="Change end" a11y={`Change end for ${personName(h.user)} in ${h.team.name}`} disabled={busy} onPress={() => void renew(h.user.id, personName(h.user), h.team.id)} />
                 <Button label="Take away" a11y={`Take away from ${personName(h.user)} in ${h.team.name}`} disabled={busy} onPress={() => void takeAway(h.user.id, personName(h.user), h.team.id)} />
               </View>
             ))}
