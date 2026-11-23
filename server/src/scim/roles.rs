@@ -153,7 +153,7 @@ pub(crate) async fn left(app: &AppState, by: &Who, team_id: &str, user_id: &str)
         }
     }
     super::role_groups::left_team(app, by, team_id, user_id);
-    app.db.end_scim_join(user_id);
+    app.db.end_scim_join(team_id, user_id);
 }
 
 /// Whether a mapping of the group `team_id` is gave `user_id` their role across the server.

@@ -430,7 +430,7 @@ async fn change_members(app: &AppState, a: &Auth, c: &Caller, team: &Team, gone:
                 m.added.push(id.clone())
             }
             Err(e) => {
-                app.db.end_scim_join(id);
+                app.db.end_scim_join(&team.id, id);
                 if !(e.0 == StatusCode::CONFLICT && app.db.team_id_of(id).as_deref() == Some(team.id.as_str())) {
                     return Err(uniqueness(format!("{id}: {}", e.1)));
                 }
@@ -441,7 +441,7 @@ async fn change_members(app: &AppState, a: &Auth, c: &Caller, team: &Team, gone:
         if app.db.team_id_of(&id).as_deref() == Some(team.id.as_str()) {
             offer_joined(app, a, c, team, &id).await;
         } else {
-            app.db.end_scim_join(&id);
+            app.db.end_scim_join(&team.id, &id);
         }
     }
     Ok(m)
@@ -452,7 +452,7 @@ async fn change_members(app: &AppState, a: &Auth, c: &Caller, team: &Team, gone:
 async fn offer_joined(app: &AppState, a: &Auth, c: &Caller, team: &Team, user_id: &str) {
     super::roles::joined(app, a, &c.who, &c.token.tenant, &team.id, user_id).await;
     role_groups::joined_team(app, a, &c.who, user_id).await;
-    app.db.end_scim_join(user_id);
+    app.db.end_scim_join(&team.id, user_id);
 }
 
 fn need(app: &AppState, c: &Caller, id: &str) -> ScimRes<(ScimGroup, Team)> {

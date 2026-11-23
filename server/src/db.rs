@@ -6032,8 +6032,10 @@ impl Db {
         self.c().execute("INSERT OR REPLACE INTO scim_pending_joins (user_id, team_id, at) VALUES (?1, ?2, ?3)", params![user_id, team_id, now()]).is_ok()
     }
 
-    pub fn end_scim_join(&self, user_id: &str) {
-        let _ = self.c().execute("DELETE FROM scim_pending_joins WHERE user_id = ?", [user_id]);
+    /// Clears `user_id`'s pending join to `team_id`, and only that team's: a leave from an
+    /// old team must not clear a join to a new one that started meanwhile.
+    pub fn end_scim_join(&self, team_id: &str, user_id: &str) {
+        let _ = self.c().execute("DELETE FROM scim_pending_joins WHERE user_id = ? AND team_id = ?", [user_id, team_id]);
     }
 
     /// Who SCIM put on `team_id` without finishing the join's role offers: a restart cut it short.

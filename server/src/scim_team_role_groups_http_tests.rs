@@ -334,6 +334,9 @@ async fn a_retried_join_finishes_what_a_restart_cut_short() {
     // Nia's join was saved, then the server restarted before her roles were offered.
     assert!(app.db.begin_scim_join(&eng, &nia) && app.db.add_team_member(&eng, &nia, teams::MEMBER, None));
     assert_eq!((team_role(&app, &nia), org_role(&app, &nia)), (None, None));
+    // A leave from another team, finishing late, leaves this join pending.
+    app.db.end_scim_join("t-old-team", &nia);
+    assert_eq!(app.db.scim_pending_joins(&eng), vec![nia.clone()]);
 
     // Okta's PUT names both again: Nia's join finishes, Oli's removed role stays removed.
     let body = json!({ "displayName": "Eng", "members": [{ "value": nia }, { "value": oli }] });
