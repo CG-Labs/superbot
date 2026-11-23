@@ -223,8 +223,12 @@ pub fn execution(d: &Drill, run: &Value, job: &Value, artifacts: &[Value], now_m
     })
 }
 
+/// The runs and whether the listing was truncated, or the status and message GitHub
+/// refused the listing with.
+type Runs = Result<(Vec<Value>, bool), (u16, String)>;
+
 /// Runs of `file` on `branch` created in the period, oldest first.
-fn runs(api: &mut dyn Api, repo: &str, file: &str, branch: &str, p: &Period) -> Result<Result<(Vec<Value>, bool), (u16, String)>, Failure> {
+fn runs(api: &mut dyn Api, repo: &str, file: &str, branch: &str, p: &Period) -> Result<Runs, Failure> {
     let last = p.to.pred_opt().unwrap_or(p.to);
     let created = format!("{}T00:00:00Z..{last}T23:59:59Z", p.from);
     let first = format!("/repos/{repo}/actions/workflows/{file}/runs?branch={}&created={}&exclude_pull_requests=true&per_page=100", enc(branch), enc(&created));
