@@ -1351,28 +1351,31 @@ pub async fn rotate_token(State(app): State<AppState>, Extension(a): Extension<A
 /// Audits each token's coming end once, `WARN_DAYS` ahead, as `scim.token_expiring`, and
 /// its end once, as `scim.token_expired`, with whether its tenant still has a working
 /// token: without one, the IdP can't deprovision anyone. Rotated and revoked tokens end
-/// as planned and get neither. Returns how many were recorded.
+/// as planned and get neither. Each notice is claimed, and its tenant read, in the
+/// transaction that records it: a notice that can't be recorded stays owed, and a token
+/// rotated or revoked meanwhile gets none. Returns how many were recorded.
 pub fn expiry_notices(app: &AppState, at: i64) -> usize {
-    let due = app.db.scim_tokens_due_notice(at, WARN_DAYS * DAY_MS);
-    if due.is_empty() {
-        return 0;
-    }
-    let tokens = app.db.scim_tokens();
     let who = Who::system("scim");
     let mut n = 0;
-    for (t, notice) in due {
-        if !app.db.set_scim_token_notice(&t.id, t.expiry_notice.as_deref(), notice) {
-            continue;
-        }
-        let (working, ends) = tenant_ends(&tokens, &t.tenant, at);
+    for (t, notice) in app.db.scim_tokens_due_notice(at, WARN_DAYS * DAY_MS) {
         let (action, outcome) = if notice == "expired" { ("scim.token_expired", Outcome::Failure) } else { ("scim.token_expiring", Outcome::Success) };
-        let details = json!({
-            "tenant": t.tenant, "label": t.label, "expiresAt": t.expires_at,
-            "daysLeft": t.expires_at.map(|e| ((e - at).max(0) + DAY_MS - 1) / DAY_MS),
-            "tenantWorking": working, "tenantEndsAt": if working { ends } else { Some(at) },
+        let e = who.event(action).target("scim_token", &t.id).outcome(outcome);
+        let recorded = app.db.record_with(&e, |c, _, _| {
+            if !db::claim_scim_token_notice(c, &t.id, t.expiry_notice.as_deref(), notice)? {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            let (working, ends) = tenant_ends(&db::scim_tenant_tokens(c, &t.tenant)?, &t.tenant, at);
+            Ok(crate::audit::scrub(json!({
+                "tenant": t.tenant, "label": t.label, "expiresAt": t.expires_at,
+                "daysLeft": t.expires_at.map(|e| ((e - at).max(0) + DAY_MS - 1) / DAY_MS),
+                "tenantWorking": working, "tenantEndsAt": if working { ends } else { Some(at) },
+            })))
         });
-        app.db.record(&who.event(action).target("scim_token", &t.id).outcome(outcome).details(details));
-        n += 1;
+        match recorded {
+            Ok(_) => n += 1,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(err) => crate::obs::log::log_warn!("scim: could not record {action} for token {}: {err}; it stays owed", t.id),
+        }
     }
     n
 }
