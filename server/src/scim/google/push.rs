@@ -157,6 +157,15 @@ impl Push {
         std::mem::take(&mut s.pending).into_iter().collect()
     }
 
+    /// Changes a pass took but didn't apply, owed another pass.
+    pub fn give_back(&self, changes: &[&'static str]) {
+        if changes.is_empty() {
+            return;
+        }
+        self.state().pending.extend(changes);
+        self.nudge.notify_one();
+    }
+
     /// Lets a test's next pushed pass start without the gap after the passes it set up with.
     #[cfg(test)]
     pub(crate) fn forget_last_pass(&self) {
@@ -469,6 +478,20 @@ mod tests {
         p.note("add");
         assert!(matches!(p.wait(hour).await, Trigger::Push));
         assert!((MIN_GAP..MIN_GAP + Duration::from_secs(1)).contains(&started.elapsed()), "{:?}", started.elapsed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_change_a_failed_pass_took_gets_another() {
+        let p = Push::new(Some("https://superbot.example.com/scim/google/push".into()));
+        p.note("update");
+        let taken = p.begin();
+        p.give_back(&[]);
+        assert!(matches!(p.wait(Duration::from_secs(60)).await, Trigger::Schedule), "the note's nudge was spent by that pass");
+        p.give_back(&taken);
+        let t = tokio::time::Instant::now();
+        assert!(matches!(p.wait(Duration::from_secs(3600)).await, Trigger::Push));
+        assert!(t.elapsed() < MIN_GAP + SETTLE, "{:?}", t.elapsed());
+        assert_eq!(p.begin(), vec!["update"]);
     }
 
     #[test]

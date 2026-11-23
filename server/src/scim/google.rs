@@ -782,6 +782,11 @@ pub async fn run(a: &Arc<Auth>, d: &Directory, trigger: Trigger) -> Result<Value
         Ok(snap) => apply(a, &app, d, &c, snap, force).await,
         Err(f) => Err(f),
     };
+    // The schedule retries its own passes sooner, but not an admin's: one that took a
+    // pushed change and didn't apply it gives the change back for a pushed pass.
+    if matches!(trigger, Trigger::Admin { .. }) && retry_soon(&result) {
+        d.push.give_back(&pushed);
+    }
     let mut details = base;
     details["ms"] = json!(started.elapsed().as_millis() as u64);
     details["at"] = json!(crate::db::now());
@@ -1121,10 +1126,13 @@ pub fn start(a: Arc<Auth>) {
 
 /// A pass that failed, or wrote with failures, is tried again sooner than the interval.
 fn next_wait(result: &Result<Value, Failure>, interval: Duration) -> Duration {
+    if retry_soon(result) { RETRY.min(interval) } else { interval }
+}
+
+fn retry_soon(result: &Result<Value, Failure>) -> bool {
     match result {
-        Err(f) if f.reason != "running" => RETRY.min(interval),
-        Ok(summary) if summary["failed"].as_u64().unwrap_or(0) > 0 => RETRY.min(interval),
-        _ => interval,
+        Err(f) => f.reason != "running",
+        Ok(summary) => summary["failed"].as_u64().unwrap_or(0) > 0,
     }
 }
 
