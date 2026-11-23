@@ -146,6 +146,38 @@ pub fn tag(xml: &str, name: &str) -> Option<String> {
     )
 }
 
+/// One version of an object, or a delete marker, as a listing of versions gives it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObjectVersion {
+    pub key: String,
+    pub version: String,
+    pub latest: bool,
+    pub marker: bool,
+}
+
+/// The `<Version>`s and `<DeleteMarker>`s of a `ListVersionsResult`, in its order.
+fn listed_versions(xml: &str) -> Vec<ObjectVersion> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    loop {
+        let (v, d) = (rest.find("<Version>"), rest.find("<DeleteMarker>"));
+        let (at, marker) = match (v, d) {
+            (Some(v), Some(d)) => (v.min(d), d < v),
+            (Some(v), None) => (v, false),
+            (None, Some(d)) => (d, true),
+            (None, None) => return out,
+        };
+        let (open, close) = if marker { ("<DeleteMarker>", "</DeleteMarker>") } else { ("<Version>", "</Version>") };
+        let start = at + open.len();
+        let end = rest[start..].find(close).map_or(rest.len(), |e| start + e);
+        let item = &rest[start..end];
+        if let (Some(key), Some(version)) = (tag(item, "Key"), tag(item, "VersionId")) {
+            out.push(ObjectVersion { key, version, latest: tag(item, "IsLatest").as_deref() == Some("true"), marker });
+        }
+        rest = &rest[end..];
+    }
+}
+
 /// S3's error body in a few words, never the request. `what` names the store.
 fn refusal(what: &str, status: reqwest::StatusCode, body: &str) -> String {
     let code = tag(body, "Code").unwrap_or_else(|| status.canonical_reason().unwrap_or("error").into());
@@ -295,6 +327,12 @@ impl S3 {
 
     /// Every version and delete marker of every key under `prefix`, as `(key, version id)`.
     pub async fn versions(&self, prefix: &str) -> Result<Vec<(String, String)>, String> {
+        Ok(self.object_versions(prefix).await?.into_iter().map(|v| (v.key, v.version)).collect())
+    }
+
+    /// Every version and delete marker of every key under `prefix`, in the store's order:
+    /// by key, newest first within one.
+    pub async fn object_versions(&self, prefix: &str) -> Result<Vec<ObjectVersion>, String> {
         let mut out = Vec::new();
         let mut after: Option<(String, String)> = None;
         loop {
@@ -305,18 +343,20 @@ impl S3 {
             }
             let res = self.send(Method::GET, None, &q, Vec::new()).await?;
             let xml = self.text(res).await?;
-            for item in xml.split("<Version>").skip(1).chain(xml.split("<DeleteMarker>").skip(1)) {
-                if let (Some(k), Some(v)) = (tag(item, "Key"), tag(item, "VersionId")) {
-                    out.push((k, v));
-                }
-            }
+            out.extend(listed_versions(&xml));
             let next = (tag(&xml, "NextKeyMarker"), tag(&xml, "NextVersionIdMarker"));
             after = match (tag(&xml, "IsTruncated").as_deref(), next) {
                 (Some("true"), (Some(k), Some(v))) if !k.is_empty() && after.as_ref() != Some(&(k.clone(), v.clone())) => Some((k, v)),
-                (Some("true"), _) => return Err("the backup store's listing of versions was cut off without a way to go on".into()),
+                (Some("true"), _) => return Err(format!("{}'s listing of versions was cut off without a way to go on", self.what)),
                 _ => return Ok(out),
             };
         }
+    }
+
+    /// One version of an object (the current one when `version` is None), to read.
+    pub async fn get_version(&self, key: &str, version: Option<&str>) -> Result<reqwest::Response, String> {
+        let q: Vec<(&str, &str)> = version.map(|v| ("versionId", v)).into_iter().collect();
+        self.send(Method::GET, Some(key), &q, Vec::new()).await
     }
 
     /// Deletes one version for good, or a delete marker. Succeeds if it is already gone.
@@ -486,5 +526,18 @@ mod tests {
         assert_eq!(tag("<a></a>", "UploadId"), None);
         let r = refusal("the backup store", reqwest::StatusCode::FORBIDDEN, "<Error><Code>AccessDenied</Code><Message>no</Message></Error>");
         assert_eq!(r, "the backup store refused (403): AccessDenied: no");
+    }
+
+    #[test]
+    fn reads_versions_in_order() {
+        let xml = "<ListVersionsResult><Name>b</Name>\
+            <DeleteMarker><Key>a&amp;b</Key><VersionId>3</VersionId><IsLatest>true</IsLatest></DeleteMarker>\
+            <Version><Key>a&amp;b</Key><VersionId>2</VersionId><IsLatest>false</IsLatest></Version>\
+            <Version><Key>a&amp;b</Key><VersionId>1</VersionId><IsLatest>false</IsLatest></Version>\
+            <Version><Key>c</Key><VersionId>null</VersionId><IsLatest>true</IsLatest></Version></ListVersionsResult>";
+        let v = listed_versions(xml);
+        let got: Vec<(&str, &str, bool, bool)> = v.iter().map(|v| (v.key.as_str(), v.version.as_str(), v.latest, v.marker)).collect();
+        assert_eq!(got, [("a&b", "3", true, true), ("a&b", "2", false, false), ("a&b", "1", false, false), ("c", "null", true, false)]);
+        assert!(listed_versions("<ListVersionsResult></ListVersionsResult>").is_empty());
     }
 }

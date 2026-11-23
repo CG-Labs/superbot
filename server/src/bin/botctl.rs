@@ -173,6 +173,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    team, or with --org across the server. Never admin
   botctl scim role show <id>                       A mapping and who it gave the role to
   botctl scim role unmap <id>                      Takes the role from everyone the mapping gave it to
+  botctl scim google                               The Google Workspace sync: settings and last passes
+  botctl scim google sync [--force]                A pass now. --force lets one that removes more
+                                                   people than GOOGLE_DIRECTORY_MAX_REMOVALS go ahead
   botctl sessions [<user>]                         Live sessions
   botctl session revoke <id>
   botctl session revoke-all <user>
@@ -197,13 +200,16 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl deny <id> [--remember | --remember-global]
   botctl audit [<limit>] [filters]                 Recent audit events, newest first
   botctl audit export [filters] > audit.csv        All matching events as CSV, oldest first
-  botctl audit verify [--pin <id>:<hash>]... [--from <id>] [--to <id>] [--key <hex>]...
+  botctl audit verify [--pin <id>:<hash>]... [--from <id>] [--to <id>] [--key <hex>]... [--archive]
                                                    Check the audit log's hash chain, its signed
                                                    checkpoints and their timestamps; names the first
                                                    break, exits 1 if there is one. --pin: a hash kept
                                                    elsewhere (your SIEM) the row must still have.
                                                    --from/--to: only those event ids. --key: trust only
-                                                   this checkpoint key (from botctl audit key)
+                                                   this checkpoint key (from botctl audit key).
+                                                   --archive: also read the write-once S3 archive,
+                                                   check it has no gaps, and hold every event here
+                                                   to the hash it has there
   botctl audit siem                                The SIEM export: sink, delivered, pending, failing
   botctl audit chain                               The chain's state: head, last checkpoint and
                                                    timestamp, export lag, last check
@@ -290,6 +296,10 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    capacity, and where a new machine goes (ADR 0081); check asks each now
   botctl machine host drain <name> [--reason <text>]  Place nothing new on the host; its machines stay until moved (ADR 0081)
   botctl machine host undrain <name>               New machines may go on it again
+  botctl machine host dedicate <name> <team-id> [--reason <text>]
+                                                   Only that team's machines go on the host, and its machines only on
+                                                   hosts dedicated to it (ADR 0166); refused while others' are there
+  botctl machine host share <name> --reason <text> Anyone's machines may go on the host again
   botctl machine host recover <name> [--to <host>] [--identity <age-key-file>] --yes
                                                    Declare a host that doesn't answer lost, and restore its machines from
                                                    their newest off-host backups onto another host; they enroll anew
@@ -818,9 +828,10 @@ fn audit_query(rest: &[&str]) -> Result<String, String> {
     Ok(if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) })
 }
 
-/// `botctl audit verify [--pin <id>:<hash>]... [--from <id>] [--to <id>] [--key <hex>]...`:
+/// `botctl audit verify [--pin <id>:<hash>]... [--from <id>] [--to <id>] [--key <hex>]... [--archive]`:
 /// hashes kept elsewhere (a SIEM, an earlier check) to hold the chain to, the event ids
-/// to check, and the checkpoint keys to trust instead of botd's own.
+/// to check, the checkpoint keys to trust instead of botd's own, and whether to read the
+/// write-once archive too (ADR 0163).
 fn verify_query(rest: &[&str]) -> Result<String, String> {
     let (mut pins, mut keys, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
     let mut it = rest.iter();
@@ -828,6 +839,7 @@ fn verify_query(rest: &[&str]) -> Result<String, String> {
         match *a {
             "--pin" => pins.push(encode(it.next().ok_or("--pin needs <event id>:<hash>")?)),
             "--key" => keys.push(encode(it.next().ok_or("--key needs a public key in hex (botctl audit key)")?)),
+            "--archive" => pairs.push("archive=on".into()),
             o @ ("--from" | "--to") => {
                 let id = it.next().filter(|v| v.parse::<i64>().is_ok()).ok_or_else(|| format!("{o} needs an event id"))?;
                 pairs.push(format!("{}={id}", &o[2..]));
@@ -1062,12 +1074,20 @@ fn backup_request(args: &[&str], read: impl Fn(&str) -> Result<String, String>) 
             ("PUT", format!("/api/machines/hosts/{}/drain", encode(name)), Some(json!({ "reason": flag(rest, "--reason") }).to_string()))
         }
         ["host", "undrain", name] if !name.starts_with("--") => ("DELETE", format!("/api/machines/hosts/{}/drain", encode(name)), None),
+        ["host", "dedicate", name, team, rest @ ..] if !name.starts_with("--") && !team.starts_with("--") => {
+            let body = json!({ "team": team, "reason": flag(rest, "--reason") });
+            ("PUT", format!("/api/machines/hosts/{}/dedication", encode(name)), Some(body.to_string()))
+        }
+        ["host", "share", name, rest @ ..] if !name.starts_with("--") => {
+            let reason = flag(rest, "--reason").ok_or("A dedication is often a promise to a customer: say why it ends with --reason <text>")?;
+            ("DELETE", format!("/api/machines/hosts/{}/dedication", encode(name)), Some(json!({ "reason": reason }).to_string()))
+        }
         ["host", "recover", _, ..] => {
             return Err("Recovering declares the host lost for good and restores its machines elsewhere from their backups; add --yes".into());
         }
         ["restore", _, _, ..] => return Err("Restoring replaces the machine and everything on it since the backup; add --yes".into()),
         _ => return Err(
-            "Usage: botctl machine backups [<user>] | backup <user> | recovery | restore <user> <backup-id> [--identity <file>] [--host <name>] --yes | restore <user> status | delete-backups <machine-id> --yes | hosts [check] | host drain <name> [--reason <text>] | host undrain <name> | host recover <name> [--to <host>] [--identity <file>] --yes"
+            "Usage: botctl machine backups [<user>] | backup <user> | recovery | restore <user> <backup-id> [--identity <file>] [--host <name>] --yes | restore <user> status | delete-backups <machine-id> --yes | hosts [check] | host drain <name> [--reason <text>] | host undrain <name> | host dedicate <name> <team-id> [--reason <text>] | host share <name> --reason <text> | host recover <name> [--to <host>] [--identity <file>] --yes"
                 .into(),
         ),
     })
@@ -1090,8 +1110,8 @@ fn signup_request(args: &[&str]) -> Result<(&'static str, String, Option<String>
     })
 }
 
-/// `botctl scim ...`: SCIM provisioning tokens (ADR 0023), and links from SCIM groups to
-/// teams (ADR 0095).
+/// `botctl scim ...`: SCIM provisioning tokens (ADR 0023), links from SCIM groups to
+/// teams (ADR 0095), and the Google Workspace sync (ADR 0162).
 fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
     Ok(match args {
         [] | ["tokens"] | ["token", "list"] => ("GET", "/api/scim/tokens".into(), None),
@@ -1113,8 +1133,11 @@ fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
             ("POST", "/api/scim/tokens".into(), Some(body.to_string()))
         }
         ["token", "revoke", id] => ("DELETE", format!("/api/scim/tokens/{}", encode(id)), None),
+        ["google"] | ["google", "status"] => ("GET", "/api/scim/google".into(), None),
+        ["google", "sync"] => ("POST", "/api/scim/google/sync".into(), Some(json!({}).to_string())),
+        ["google", "sync", "--force"] => ("POST", "/api/scim/google/sync".into(), Some(json!({ "force": true }).to_string())),
         _ => {
-            return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team> | role-mappings | role map <team> <role> [--org] | role show <id> | role unmap <id>".into());
+            return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team> | role-mappings | role map <team> <role> [--org] | role show <id> | role unmap <id> | google [status] | google sync [--force]".into());
         }
     })
 }
@@ -2483,6 +2506,16 @@ mod tests {
         assert_eq!(serde_json::from_str::<serde_json::Value>(&b.unwrap()).unwrap(), json!({ "reason": null }));
         assert_eq!(backup_request(&["host", "undrain", "b"], read).unwrap(), ("DELETE", "/api/machines/hosts/b/drain".into(), None));
         assert!(backup_request(&["host", "undrain"], read).is_err());
+        let (m, p, b) = backup_request(&["host", "dedicate", "b", "t1", "--reason", "MSA-7"], read).unwrap();
+        assert_eq!((m, p.as_str()), ("PUT", "/api/machines/hosts/b/dedication"));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&b.unwrap()).unwrap(), json!({ "team": "t1", "reason": "MSA-7" }));
+        let (_, _, b) = backup_request(&["host", "dedicate", "b", "t1"], read).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&b.unwrap()).unwrap(), json!({ "team": "t1", "reason": null }));
+        assert!(backup_request(&["host", "dedicate", "b"], read).is_err(), "a team is needed");
+        let (m, p, b) = backup_request(&["host", "share", "b", "--reason", "contract ended"], read).unwrap();
+        assert_eq!((m, p.as_str()), ("DELETE", "/api/machines/hosts/b/dedication"));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&b.unwrap()).unwrap(), json!({ "reason": "contract ended" }));
+        assert!(backup_request(&["host", "share", "b"], read).unwrap_err().contains("--reason"));
         assert_eq!(login_base("me"), "/api/machine");
         assert_eq!(login_base("a@example.com"), "/api/users/a%40example.com/machine");
     }
@@ -2541,6 +2574,7 @@ mod tests {
         let key = "ab".repeat(32);
         assert_eq!(verify_query(&["--from", "10", "--to", "20", "--key", &key, "--pin", "12:ab"]).unwrap(), format!("?pin=12:ab&from=10&to=20&key={key}"));
         assert!(verify_query(&["--from", "x"]).is_err() && verify_query(&["--to"]).is_err() && verify_query(&["--key"]).is_err());
+        assert_eq!(verify_query(&["--archive", "--from", "10"]).unwrap(), "?archive=on&from=10");
     }
 
     #[test]
@@ -2960,6 +2994,11 @@ mod tests {
         assert_eq!(req(&["role", "map", "t1", "auditor", "--org"]), Ok(("POST", "/api/scim/role-mappings".into(), Some(json!({ "team": "t1", "role": "auditor", "scope": "org" })))));
         assert_eq!(req(&["role", "show", "sm 1"]), Ok(("GET", "/api/scim/role-mappings/sm%201".into(), None)));
         assert_eq!(req(&["role", "unmap", "sm1"]), Ok(("DELETE", "/api/scim/role-mappings/sm1".into(), None)));
+        assert_eq!(req(&["google"]), Ok(("GET", "/api/scim/google".into(), None)));
+        assert_eq!(req(&["google", "status"]), Ok(("GET", "/api/scim/google".into(), None)));
+        assert_eq!(req(&["google", "sync"]), Ok(("POST", "/api/scim/google/sync".into(), Some(json!({})))));
+        assert_eq!(req(&["google", "sync", "--force"]), Ok(("POST", "/api/scim/google/sync".into(), Some(json!({ "force": true })))));
+        assert!(req(&["google", "sync", "--hard"]).is_err());
         assert!(req(&["role", "map", "t1"]).is_err());
         assert!(req(&["role", "map", "--org", "t1"]).is_err());
         assert!(req(&["role", "map", "t1", "auditor", "--team"]).is_err());

@@ -46,6 +46,9 @@ pub struct World {
     pub meta: BTreeMap<String, (Vec<(String, String)>, String)>,
     /// Every version written with a checksum: `(key, version)` to its size, metadata and lock.
     pub versions: BTreeMap<(String, String), Stored>,
+    /// Those versions' bodies, and each key's version ids in the order written.
+    pub bodies: BTreeMap<(String, String), Vec<u8>>,
+    pub history: BTreeMap<String, Vec<String>>,
     next: u32,
 }
 
@@ -192,16 +195,44 @@ async fn handle(State(world): State<Arc<Mutex<World>>>, method: Method, uri: Uri
             let prefix = query.get("prefix").cloned().unwrap_or_default();
             let after = (query.get("key-marker").cloned().unwrap_or_default(), query.get("version-id-marker").cloned().unwrap_or_default());
             let page = w.page.unwrap_or(1000);
-            let mut found: Vec<(String, String, bool)> = w.objects.keys().map(|k| (k.clone(), "current".to_string(), false)).chain(w.old.iter().cloned()).collect();
-            found.retain(|(k, v, _)| k.starts_with(&prefix) && (k.clone(), v.clone()) > after);
-            found.sort();
+            // Keys written with a checksum list their real versions, newest first, as S3
+            // does; others list the current object as `current`, then what `old` holds.
+            let mut found: Vec<(String, String, bool, bool)> = Vec::new();
+            let keys: std::collections::BTreeSet<&String> = w.objects.keys().chain(w.history.keys()).chain(w.old.iter().map(|(k, _, _)| k)).collect();
+            for k in keys.into_iter().filter(|k| k.starts_with(&prefix)) {
+                match w.history.get(k) {
+                    Some(written) => {
+                        let gone = !w.objects.contains_key(k);
+                        let markers: Vec<&(String, String, bool)> = w.old.iter().filter(|(o, _, m)| o == k && *m).collect();
+                        for (i, (_, v, _)) in markers.iter().rev().enumerate() {
+                            found.push((k.clone(), v.clone(), true, gone && i == 0));
+                        }
+                        for (i, v) in written.iter().rev().enumerate() {
+                            found.push((k.clone(), v.clone(), false, !gone && i == 0));
+                        }
+                    }
+                    None => {
+                        let mut mine: Vec<(String, String, bool, bool)> = w.old.iter().filter(|(o, _, _)| o == k).map(|(o, v, m)| (o.clone(), v.clone(), *m, false)).collect();
+                        if w.objects.contains_key(k) {
+                            mine.push((k.clone(), "current".into(), false, true));
+                        }
+                        mine.sort();
+                        found.extend(mine);
+                    }
+                }
+            }
+            if !after.0.is_empty()
+                && let Some(i) = found.iter().position(|(k, v, _, _)| (k, v) == (&after.0, &after.1))
+            {
+                found.drain(..=i);
+            }
             let mut out = String::from("<ListVersionsResult>");
-            for (k, v, marker) in found.iter().take(page) {
+            for (k, v, marker, latest) in found.iter().take(page) {
                 let tag = if *marker { "DeleteMarker" } else { "Version" };
-                out.push_str(&format!("<{tag}><Key>{}</Key><VersionId>{v}</VersionId></{tag}>", k.replace('&', "&amp;")));
+                out.push_str(&format!("<{tag}><Key>{}</Key><VersionId>{v}</VersionId><IsLatest>{latest}</IsLatest></{tag}>", k.replace('&', "&amp;")));
             }
             if found.len() > page {
-                let (k, v, _) = &found[page - 1];
+                let (k, v, _, _) = &found[page - 1];
                 out.push_str(&format!("<IsTruncated>true</IsTruncated><NextKeyMarker>{}</NextKeyMarker><NextVersionIdMarker>{v}</NextVersionIdMarker>", k.replace('&', "&amp;")));
             } else {
                 out.push_str("<IsTruncated>false</IsTruncated>");
@@ -264,6 +295,8 @@ async fn handle(State(world): State<Arc<Mutex<World>>>, method: Method, uri: Uri
             let version = format!("v{}", w.next);
             let meta: Vec<(String, String)> = headers.iter().filter(|(k, _)| k.as_str().starts_with("x-amz-meta-")).map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_string())).collect();
             w.versions.insert((key.clone(), version.clone()), (body.len(), meta.clone(), lock.clone()));
+            w.bodies.insert((key.clone(), version.clone()), body.to_vec());
+            w.history.entry(key.clone()).or_default().push(version.clone());
             w.meta.insert(key.clone(), (meta, version.clone()));
             match lock {
                 Some(l) => w.locks.insert(key.clone(), l),
@@ -329,12 +362,33 @@ async fn handle(State(world): State<Arc<Mutex<World>>>, method: Method, uri: Uri
             StatusCode::NO_CONTENT.into_response()
         }
         ("DELETE", false) => {
+            if w.versioning != Some("Enabled") {
+                w.history.remove(&key);
+                w.bodies.retain(|(k, _), _| *k != key);
+            }
             w.keep(&key, true);
             w.objects.remove(&key);
             StatusCode::NO_CONTENT.into_response()
         }
-        ("GET", false) => match w.objects.get(&key) {
-            Some(b) => (StatusCode::OK, b.clone()).into_response(),
+        ("GET", false) => match query.get("versionId").map(|v| w.bodies.get(&(key.clone(), v.clone()))).unwrap_or_else(|| w.objects.get(&key)) {
+            Some(b) => {
+                // As S3 does: the version's metadata and lock come with its body.
+                let mut res = (StatusCode::OK, b.clone()).into_response();
+                let version = query.get("versionId").cloned().or_else(|| w.meta.get(&key).map(|(_, v)| v.clone()));
+                let stored = version.and_then(|v| w.versions.get(&(key.clone(), v.clone())).map(|s| (v, s.clone())));
+                if let Some((version, (_, meta, lock))) = stored {
+                    let mut h = vec![("x-amz-version-id".to_string(), version)];
+                    h.extend(meta);
+                    if let Some((mode, until)) = lock {
+                        h.push(("x-amz-object-lock-mode".into(), mode));
+                        h.push(("x-amz-object-lock-retain-until-date".into(), until));
+                    }
+                    for (k, v) in h {
+                        res.headers_mut().insert(axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+                    }
+                }
+                res
+            }
             None => error(StatusCode::NOT_FOUND, "NoSuchKey"),
         },
         _ => error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed"),

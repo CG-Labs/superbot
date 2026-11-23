@@ -11,6 +11,11 @@
 //!
 //! With hosts tagged by data region (ADR 0117), only hosts in the machine's region are
 //! considered: one with no room there waits or is refused, never placed elsewhere.
+//!
+//! A host an admin dedicated to a team (ADR 0166) takes only that team's machines, and
+//! a team with hosts of its own has its machines placed only there: with no room on
+//! them it waits or is refused, never placed on a shared host. So a kernel escape from
+//! a container on a dedicated host stays within one customer.
 
 use super::provider::{HostStatus, Hosts, Policy, Resources};
 use super::{ControlPlane, State};
@@ -34,7 +39,30 @@ pub struct HostLoad {
     pub used: Resources,
     /// Its data region, if hosts are tagged (ADR 0117).
     pub region: Option<String>,
+    /// The team it is dedicated to (ADR 0166). None: shared.
+    pub dedicated: Option<String>,
 }
+
+/// Whose machine is being placed, for hosts dedicated to a team (ADR 0166): its owner's
+/// team, and whether that team has hosts of its own.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Tenant {
+    pub team: Option<String>,
+    pub own_hosts: bool,
+}
+
+impl Tenant {
+    /// `user_id`'s: their team's (as a member or its service account), if any. A team's
+    /// hosts count while dedicated to it, lost or unconfigured ones too, so losing its
+    /// only host never sends its machines to a shared one.
+    pub fn of(app: &App, user_id: &str) -> Tenant {
+        let team = app.db.team_id_of(user_id);
+        let own_hosts = team.as_deref().is_some_and(|t| app.db.machine_hosts().iter().any(|r| r.dedicated_team.as_deref() == Some(t)));
+        Tenant { team, own_hosts }
+    }
+}
+
+const OWN_HOSTS: &str = "this team's machines go only on its own hosts";
 
 fn ratio(used: u64, cap: u64) -> f64 {
     if cap == 0 { f64::INFINITY } else { used as f64 / cap as f64 }
@@ -57,6 +85,16 @@ impl HostLoad {
         match &self.region {
             Some(r) if r != region => Some(format!("{} is in {r}", self.name)),
             _ => None,
+        }
+    }
+
+    /// Why `t`'s machine can't go here, with hosts dedicated to teams (ADR 0166).
+    pub fn not_for(&self, t: &Tenant) -> Option<String> {
+        match (&self.dedicated, &t.team) {
+            (Some(d), Some(team)) if d == team => None,
+            (Some(_), _) => Some(format!("{} is dedicated to another team", self.name)),
+            (None, _) if t.own_hosts => Some(format!("{} is shared, and {OWN_HOSTS}", self.name)),
+            (None, _) => None,
         }
     }
 
@@ -94,7 +132,7 @@ impl HostLoad {
         });
         json!({
             "machines": self.machines, "allocated": self.used, "capacity": self.capacity, "maxMachines": self.max_machines,
-            "free": free, "open": self.closed().is_none(), "closed": self.closed(), "region": self.region,
+            "free": free, "open": self.closed().is_none(), "closed": self.closed(), "region": self.region, "dedicatedTo": self.dedicated,
         })
     }
 }
@@ -136,6 +174,7 @@ pub fn loads(app: &App, cp: &ControlPlane, h: &dyn Hosts) -> Vec<HostLoad> {
                 machines: 0,
                 used: Resources::default(),
                 region: c.region,
+                dedicated: row.and_then(|r| r.dedicated_team.clone()),
             }
         })
         .collect();
@@ -181,15 +220,16 @@ pub fn waiting(last_error: &str) -> bool {
     last_error.starts_with(NO_ROOM)
 }
 
-/// The host a new machine of `plan` goes on, other than `except`, by INCUS_PLACEMENT;
-/// or why none can take it. With tagged hosts, only one in `region` (ADR 0117).
-pub fn choose(app: &App, cp: &ControlPlane, plan: &str, region: &str, except: Option<&str>) -> Result<String, String> {
+/// The host a new machine of `plan` for `t` goes on, other than `except`, by
+/// INCUS_PLACEMENT; or why none can take it. With tagged hosts, only one in `region`
+/// (ADR 0117); with dedicated hosts, only one `t` may use (ADR 0166).
+pub fn choose(app: &App, cp: &ControlPlane, plan: &str, region: &str, t: &Tenant, except: Option<&str>) -> Result<String, String> {
     let Some(h) = cp.hosts() else { return Err(none(plan, None, Vec::new())) };
     let within = h.tagged().then_some(region);
     let want = need(cp, plan);
     let (mut fits, mut why) = (Vec::new(), Vec::new());
     for (i, l) in loads(app, cp, h).into_iter().filter(|l| Some(l.name.as_str()) != except).enumerate() {
-        match l.elsewhere(region).or_else(|| l.closed()).map(Err).unwrap_or_else(|| l.room(want)) {
+        match l.elsewhere(region).or_else(|| l.not_for(t)).or_else(|| l.closed()).map(Err).unwrap_or_else(|| l.room(want)) {
             Ok(load) => fits.push((load, l.machines, i, l.name)),
             Err(e) => why.push(e),
         }
@@ -200,15 +240,18 @@ pub fn choose(app: &App, cp: &ControlPlane, plan: &str, region: &str, except: Op
     fits.into_iter().next().map(|f| f.3).ok_or_else(|| none(plan, within, why))
 }
 
-/// Whether a machine of `plan` whose data stays in `region` may go on `host`: in that
-/// region (with tagged hosts), open, with room.
-pub fn fits(app: &App, cp: &ControlPlane, plan: &str, region: &str, host: &str) -> Result<(), String> {
+/// Whether a machine of `plan` for `t` whose data stays in `region` may go on `host`:
+/// in that region (with tagged hosts), one `t` may use (ADR 0166), open, with room.
+pub fn fits(app: &App, cp: &ControlPlane, plan: &str, region: &str, t: &Tenant, host: &str) -> Result<(), String> {
     let Some(h) = cp.hosts() else { return Ok(()) };
     let l = loads(app, cp, h).into_iter().find(|l| l.name == host).ok_or_else(|| format!("There's no Incus host \"{}\".", crate::audit::clip(host, 40)))?;
     if let Some(r) = &l.region
         && r != region
     {
         return Err(format!("Host {host} is in {r}, and this machine's data stays in {region} (ADR 0117)."));
+    }
+    if let Some(why) = l.not_for(t) {
+        return Err(format!("Host {why} (ADR 0166)."));
     }
     match l.closed() {
         Some(why) => Err(format!("Host {why}; nothing new goes there.")),
@@ -247,6 +290,48 @@ pub fn grow(app: &App, cp: &ControlPlane, host: &str, m: &Machine, to: &str) -> 
     Ok(())
 }
 
+/// A machine on a host its team's dedication doesn't allow (ADR 0166). Placement never
+/// puts one there; a person who joins or leaves a team leaves their machine where it
+/// was, until an admin moves it with a restore onto another host.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Misplaced {
+    pub machine_id: String,
+    pub user_id: String,
+    pub host: String,
+    pub reason: String,
+}
+
+impl Misplaced {
+    pub fn view(&self) -> Value {
+        json!({ "machineId": self.machine_id, "userId": self.user_id, "host": self.host, "reason": self.reason })
+    }
+}
+
+/// Every machine that isn't destroyed and is on (or sent to) a host it shouldn't be:
+/// one dedicated to another team, or a shared one while its team has hosts of its own.
+pub fn misplaced(app: &App, cp: &ControlPlane, h: &dyn Hosts) -> Vec<Misplaced> {
+    let rows = app.db.machine_hosts();
+    if rows.iter().all(|r| r.dedicated_team.is_none()) {
+        return Vec::new();
+    }
+    let dedicated: HashMap<&str, &str> = rows.iter().filter_map(|r| Some((r.name.as_str(), r.dedicated_team.as_deref()?))).collect();
+    let teams = app.db.team_ids();
+    let mut out = Vec::new();
+    for m in app.db.machines(None).into_iter().filter(|m| cp.owns(m) && m.state != State::Destroyed) {
+        let Some(host) = m.provider_id.as_deref().map(|p| h.host_of(p)).or_else(|| m.placed_on.clone()) else { continue };
+        let team = teams.get(&m.user_id).map(String::as_str);
+        let reason = match (dedicated.get(host.as_str()), team) {
+            (Some(d), Some(t)) if *d == t => continue,
+            (Some(_), Some(_)) => format!("{host} is dedicated to another team"),
+            (Some(_), None) => format!("{host} is dedicated to a team its owner isn't on"),
+            (None, Some(t)) if dedicated.values().any(|d| *d == t) => format!("{host} is shared, and its owner's team has hosts of its own"),
+            (None, _) => continue,
+        };
+        out.push(Misplaced { machine_id: m.id, user_id: m.user_id, host, reason });
+    }
+    out
+}
+
 /// A machine (or a request for one, `m` None) that couldn't be placed: audited and
 /// alerted.
 pub fn failed(app: &crate::AppState, by: &Who, user_id: &str, m: Option<&Machine>, plan: &str, why: &str) {
@@ -256,10 +341,13 @@ pub fn failed(app: &crate::AppState, by: &Who, user_id: &str, m: Option<&Machine
         None => e.target("user", user_id),
     };
     app.db.record(&e.details(json!({ "userId": user_id, "plan": plan, "error": why })));
-    let lines = vec![
+    let mut lines = vec![
         why.to_string(),
         "Add capacity (INCUS_CAPACITY, or another host in INCUS_HOSTS), undrain a host, or free room; `botctl machine hosts` shows each host's load.".into(),
     ];
+    if why.contains(OWN_HOSTS) {
+        lines.push("Its team's machines go only on the hosts dedicated to it: add room there, or dedicate another (`botctl machine host dedicate <name> <team>`, ADR 0166).".into());
+    }
     let a = Alert {
         event: "machine.placement_failed".into(),
         title: "No Incus host has room for a machine".into(),
@@ -287,7 +375,23 @@ mod tests {
             machines,
             used: r(used),
             region: None,
+            dedicated: None,
         }
+    }
+
+    #[test]
+    fn dedicated_hosts_take_only_their_teams_machines_and_such_teams_go_nowhere_else() {
+        let t = |team: Option<&str>, own_hosts| Tenant { team: team.map(String::from), own_hosts };
+        let shared = host("a", None, None, 0, (0, 0, 0));
+        let acme = HostLoad { dedicated: Some("acme".into()), ..host("b", None, None, 0, (0, 0, 0)) };
+        assert_eq!(shared.not_for(&t(None, false)), None, "no team, shared host");
+        assert_eq!(shared.not_for(&t(Some("globex"), false)), None, "a team without hosts of its own uses shared ones");
+        assert_eq!(acme.not_for(&t(Some("acme"), true)), None);
+        assert_eq!(acme.not_for(&t(Some("globex"), false)).as_deref(), Some("b is dedicated to another team"));
+        assert_eq!(acme.not_for(&t(None, false)).as_deref(), Some("b is dedicated to another team"), "people in no team too");
+        assert_eq!(shared.not_for(&t(Some("acme"), true)).as_deref(), Some("a is shared, and this team's machines go only on its own hosts"));
+        assert_eq!(acme.view()["dedicatedTo"], "acme");
+        assert!(shared.view()["dedicatedTo"].is_null());
     }
 
     #[test]

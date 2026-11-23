@@ -18,6 +18,7 @@ mod audit;
 mod audit_archive;
 #[cfg(test)]
 mod audit_archive_http_tests;
+mod audit_archive_verify;
 mod audit_chain;
 #[cfg(test)]
 mod audit_chain_http_tests;
@@ -86,6 +87,8 @@ mod machines_bot_user_tests;
 mod machines_egress_policy_tests;
 #[cfg(test)]
 mod machines_hardening_tests;
+#[cfg(test)]
+mod machines_dedicated_tests;
 #[cfg(test)]
 mod machines_hosts_tests;
 #[cfg(test)]
@@ -166,6 +169,8 @@ mod scim;
 #[cfg(test)]
 mod scim_bulk_http_tests;
 #[cfg(test)]
+mod scim_google_http_tests;
+#[cfg(test)]
 mod scim_group_roles_http_tests;
 #[cfg(test)]
 mod scim_groups_http_tests;
@@ -214,6 +219,8 @@ mod billing_mail_http_tests;
 mod usage;
 #[cfg(test)]
 mod usage_http_tests;
+#[cfg(test)]
+mod vault_auth_http_tests;
 mod storage;
 #[cfg(test)]
 mod storage_http_tests;
@@ -352,6 +359,8 @@ async fn main() {
     let teams = teams::Settings::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Teams: {e}")));
     let resume_routines = handover::resume_on_enable(&env("ROUTINES_ON_ENABLE", "")).unwrap_or_else(|e| exit(e));
     let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", ""), &env("SCIM_GROUPS", ""), &env("SCIM_GROUP_ROLES", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
+    let google_directory = scim::google::Settings::from_env(&|k| env(k, ""), &scim, &|p| sso.provider(p).map(|p| p.type_name()))
+        .unwrap_or_else(|e| exit(format!("Google Workspace sync: {e}")));
     let tiers = tiers::Tiers::from_env(|k| env(k, "")).unwrap_or_else(|e| exit(format!("Tiers: {e}")));
     for name in adapters::NAMES {
         adapters::get(name).expect("listed adapter").check_env(&|k| env(k, "")).unwrap_or_else(|e| exit(e));
@@ -629,6 +638,10 @@ async fn main() {
     // that break-glass signs in as.
     users::ensure_operator(&app.db, &env("USER_NAME", "Owner"), std::env::var("OWNER_EMAIL").ok().as_deref());
 
+    let mut scim = scim;
+    if let Some(s) = google_directory {
+        scim.google = Some(Arc::new(scim::google::Directory::new(&app, s).unwrap_or_else(|e| exit(format!("Google Workspace sync: {e}")))));
+    }
     let auth_state = Arc::new(Auth {
         password: password.clone(),
         break_glass,
@@ -696,6 +709,11 @@ async fn main() {
         ),
         false => log_info!("SCIM: off (SCIM=off)."),
     }
+    match &auth_state.scim.google {
+        Some(d) => log_info!("Google Workspace sync: {} (ADR 0162).", d.describe()),
+        None => log_info!("Google Workspace sync: off (GOOGLE_DIRECTORY_SYNC=off)."),
+    }
+    scim::google::start(auth_state.clone());
     log_info!(
         "Sign-ups: {}.",
         match (auth_state.signups.enabled, auth_state.signups.turnstile.is_some()) {
@@ -1059,6 +1077,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/machines/hosts", get(machines::hosts::list))
         .route("/machines/hosts/{name}/recover", post(machines::hosts::recover))
         .route("/machines/hosts/{name}/drain", put(machines::hosts::drain).delete(machines::hosts::undrain))
+        .route("/machines/hosts/{name}/dedication", put(machines::hosts::dedicate).delete(machines::hosts::share))
         .route("/machines/legacy", get(machines::rebuild::legacy_list))
         .route("/machines/reconcile", post(machines::reconcile_now))
         .route("/machines/teammate-removals", get(machines::offboard::list_all))
@@ -1119,6 +1138,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/scim/groups/{team}", delete(scim::groups::unlink))
         .route("/scim/role-mappings", get(scim::roles::list).post(scim::roles::create))
         .route("/scim/role-mappings/{id}", get(scim::roles::get).delete(scim::roles::delete))
+        .route("/scim/google", get(scim::google::status))
+        .route("/scim/google/sync", post(scim::google::sync))
         .route("/status/incidents", get(status::list).post(status::create))
         .route("/status/incidents/{id}", patch(status::edit).delete(status::delete))
         .route("/status/incidents/{id}/updates", post(status::add_update))

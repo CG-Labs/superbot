@@ -3,30 +3,87 @@
 //! Each secret is one KV v2 secret, `<VAULT_KV_MOUNT>/<VAULT_KV_PREFIX>/<bots|server>/<NAME>`,
 //! whose field `VAULT_KV_FIELD` (`value`) holds the value. botd signs in with a token
 //! (`VAULT_TOKEN`, or `VAULT_TOKEN_FILE`, read again whenever Vault refuses the one it
-//! has, so Vault Agent can rotate it) or AppRole (`VAULT_ROLE_ID`, `VAULT_SECRET_ID`,
-//! each also `_FILE`), logging in again before the token's lease runs out and once more
-//! when Vault refuses it. Requests run on a runtime of their own (`http::Worker`).
+//! has, so Vault Agent can rotate it), AppRole (`VAULT_ROLE_ID`, `VAULT_SECRET_ID`,
+//! each also `_FILE`), or a JWT the platform keeps in a file: Kubernetes service account
+//! tokens (`VAULT_AUTH=kubernetes`) or any OIDC/JWT issuer (`VAULT_AUTH=jwt`, ADR 0159),
+//! read again at each login. botd logs in again before the token's lease runs out and
+//! once more when Vault refuses it, in `VAULT_AUTH_NAMESPACE` if the auth method is
+//! mounted somewhere other than the secrets. Requests run on a runtime of their own
+//! (`http::Worker`).
 
 use super::external::{self, Provider, Scope};
 use super::http::Worker;
 use super::{Error, SecretStore};
 use crate::audit::{Event, Outcome};
+use base64::Engine;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
+/// Where Kubernetes mounts a pod's service account token.
+pub const KUBERNETES_TOKEN_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+
+/// Vault auth methods that take a JWT and a role (`auth/<mount>/login` with `role`, `jwt`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JwtMethod {
+    /// Vault's `kubernetes` method: a service account token, checked by Vault with the TokenReview API.
+    Kubernetes,
+    /// Vault's `jwt` method: any issuer Vault trusts (Kubernetes OIDC, GitHub Actions, SPIFFE, ...).
+    Jwt,
+}
+
+impl JwtMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JwtMethod::Kubernetes => "kubernetes",
+            JwtMethod::Jwt => "jwt",
+        }
+    }
+
+    /// The setting naming the file the JWT is read from.
+    fn file_setting(self) -> &'static str {
+        match self {
+            JwtMethod::Kubernetes => "VAULT_KUBERNETES_TOKEN_FILE",
+            JwtMethod::Jwt => "VAULT_JWT_FILE",
+        }
+    }
+}
+
 pub enum Auth {
     /// The token itself, or the file that holds it (read again when Vault refuses it).
     Token { value: Option<Zeroizing<String>>, file: Option<PathBuf> },
     AppRole { mount: String, role_id: Zeroizing<String>, secret_id: Zeroizing<String> },
+    /// A JWT read from `file` at each login, so the platform can rotate it. `role` is None
+    /// only for `jwt`, whose mount then uses its `default_role`.
+    Jwt { method: JwtMethod, mount: String, role: Option<String>, file: PathBuf },
+}
+
+/// A role name: letters, digits, `.`, `_`, `-` and `@`, up to 128.
+fn role_setting(key: &str, raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    if v.is_empty() || v.len() > 128 || !v.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-@".contains(&b)) {
+        return Err(format!("{key} must be a Vault role name like \"superbot\" (letters, digits, . _ - @), not {v:?}"));
+    }
+    Ok(v.to_string())
+}
+
+/// A namespace for logins only: `root` for none, else a Vault path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthNamespace {
+    /// The same as the secrets (`VAULT_NAMESPACE`).
+    Same,
+    Root,
+    Path(String),
 }
 
 pub struct Config {
     /// `scheme://host[:port]`, no trailing slash.
     pub addr: String,
     pub namespace: Option<String>,
+    /// Where the auth method is mounted, when that isn't `namespace` (Vault Enterprise, HCP).
+    pub auth_namespace: AuthNamespace,
     pub mount: String,
     pub prefix: String,
     pub field: String,
@@ -67,6 +124,23 @@ impl Config {
             "" => None,
             ns => Some(path_setting("VAULT_NAMESPACE", ns, "admin")?),
         };
+        let auth_namespace = match var("VAULT_AUTH_NAMESPACE").trim() {
+            "" => AuthNamespace::Same,
+            "root" | "/" => AuthNamespace::Root,
+            ns => AuthNamespace::Path(path_setting("VAULT_AUTH_NAMESPACE", ns, "admin")?),
+        };
+        let jwt = |method: JwtMethod, mount_key: &str, role_key: &str, file: String| -> Result<Auth, String> {
+            let role = match var(role_key).trim() {
+                "" if method == JwtMethod::Jwt => None,
+                "" => return Err(format!("VAULT_AUTH={} needs {role_key}, the Vault role botd logs in as", method.as_str())),
+                r => Some(role_setting(role_key, r)?),
+            };
+            let file = file.trim();
+            if file.is_empty() {
+                return Err(format!("VAULT_AUTH={} needs {}, the file the platform keeps the JWT in", method.as_str(), method.file_setting()));
+            }
+            Ok(Auth::Jwt { method, mount: path_setting(mount_key, &var(mount_key), method.as_str())?, role, file: PathBuf::from(file) })
+        };
         let auth = match var("VAULT_AUTH").trim() {
             "" | "token" => {
                 let file = var("VAULT_TOKEN_FILE");
@@ -79,8 +153,17 @@ impl Config {
                 role_id: secret("VAULT_ROLE_ID")?.ok_or("VAULT_AUTH=approle needs VAULT_ROLE_ID (or VAULT_ROLE_ID_FILE)")?,
                 secret_id: secret("VAULT_SECRET_ID")?.ok_or("VAULT_AUTH=approle needs VAULT_SECRET_ID (or VAULT_SECRET_ID_FILE)")?,
             },
-            other => return Err(format!("VAULT_AUTH must be token or approle, not {other:?}")),
+            "kubernetes" => {
+                let file = var("VAULT_KUBERNETES_TOKEN_FILE");
+                let file = if file.trim().is_empty() { KUBERNETES_TOKEN_FILE.to_string() } else { file };
+                jwt(JwtMethod::Kubernetes, "VAULT_KUBERNETES_MOUNT", "VAULT_KUBERNETES_ROLE", file)?
+            }
+            "jwt" => jwt(JwtMethod::Jwt, "VAULT_JWT_MOUNT", "VAULT_JWT_ROLE", var("VAULT_JWT_FILE"))?,
+            other => return Err(format!("VAULT_AUTH must be token, approle, kubernetes or jwt, not {other:?}")),
         };
+        if auth_namespace != AuthNamespace::Same && matches!(auth, Auth::Token { .. }) {
+            return Err("VAULT_AUTH_NAMESPACE is where botd logs in, so it needs VAULT_AUTH=approle, kubernetes or jwt; a token needs no login".into());
+        }
         let field = var("VAULT_KV_FIELD");
         let field = match field.trim() {
             "" => "value".to_string(),
@@ -94,6 +177,7 @@ impl Config {
         Ok(Config {
             addr,
             namespace,
+            auth_namespace,
             mount: path_setting("VAULT_KV_MOUNT", &var("VAULT_KV_MOUNT"), "secret")?,
             prefix: path_setting("VAULT_KV_PREFIX", &var("VAULT_KV_PREFIX"), "superbot")?,
             field,
@@ -105,7 +189,7 @@ impl Config {
 
 struct Token {
     value: Zeroizing<String>,
-    /// When to log in again (AppRole), before the lease runs out.
+    /// When to log in again (AppRole, Kubernetes, JWT), before the lease runs out.
     renew_at: Option<Instant>,
 }
 
@@ -122,6 +206,33 @@ pub struct Vault {
 
 fn unavailable(what: &str, e: impl std::fmt::Display) -> Error {
     Error::Unavailable(format!("Vault: {what}: {e}"))
+}
+
+/// The JWT in `file`, read at each login because the platform rotates it. Checked to be
+/// a compact JWT that hasn't expired, so a wrong path or a file nobody renews any more is
+/// named in the error rather than sent. Errors never quote the file.
+fn read_jwt(method: JwtMethod, file: &std::path::Path) -> Result<Zeroizing<String>, Error> {
+    let setting = method.file_setting();
+    let text = Zeroizing::new(std::fs::read_to_string(file).map_err(|e| unavailable(&format!("{setting} ({})", file.display()), e))?);
+    let jwt = text.trim();
+    if jwt.is_empty() {
+        return Err(Error::Unavailable(format!("Vault: {setting} ({}) is empty", file.display())));
+    }
+    let not_jwt = || Error::Unavailable(format!("Vault: {setting} ({}) doesn't hold a JWT", file.display()));
+    let parts: Vec<&str> = jwt.split('.').collect();
+    let base64url = |p: &&str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if parts.len() != 3 || !parts.iter().all(base64url) {
+        return Err(not_jwt());
+    }
+    let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).filter(Value::is_object).ok_or_else(not_jwt)?;
+    // NumericDate may have a fraction (RFC 7519).
+    if let Some(exp) = claims["exp"].as_f64() {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+        if exp <= now {
+            return Err(Error::Unavailable(format!("Vault: the JWT in {setting} ({}) expired {} s ago; is the platform still renewing it?", file.display(), (now - exp) as u64)));
+        }
+    }
+    Ok(Zeroizing::new(jwt.to_string()))
 }
 
 impl Vault {
@@ -151,11 +262,24 @@ impl Inner {
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        self.request_in(self.cfg.namespace.as_deref(), method, path)
+    }
+
+    fn request_in(&self, namespace: Option<&str>, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         let mut r = self.http.request(method, self.url(path));
-        if let Some(ns) = &self.cfg.namespace {
+        if let Some(ns) = namespace {
             r = r.header("X-Vault-Namespace", ns);
         }
         r
+    }
+
+    /// The namespace logins are sent to.
+    fn auth_namespace(&self) -> Option<&str> {
+        match &self.cfg.auth_namespace {
+            AuthNamespace::Same => self.cfg.namespace.as_deref(),
+            AuthNamespace::Root => None,
+            AuthNamespace::Path(ns) => Some(ns),
+        }
     }
 
     /// The token to send; a new one if `fresh` (Vault refused the last) or it is due.
@@ -176,33 +300,69 @@ impl Inner {
                 Token { value: Zeroizing::new(v.to_string()), renew_at: None }
             }
             Auth::Token { .. } => return Err(Error::Unavailable("Vault: no token".into())),
-            Auth::AppRole { mount, role_id, secret_id } => self.login(mount, role_id, secret_id).await?,
+            Auth::AppRole { mount, role_id, secret_id } => {
+                let body = Zeroizing::new(json!({ "role_id": role_id.as_str(), "secret_id": secret_id.as_str() }).to_string());
+                self.login("approle", mount, None, async { Ok::<_, Error>(body) }).await?
+            }
+            Auth::Jwt { method, mount, role, file } => {
+                let body = async {
+                    let jwt = read_jwt(*method, file)?;
+                    // A JWT is base64url and dots, so it needs no escaping; roles are checked at startup.
+                    let role = role.as_deref().map(|r| format!(",\"role\":\"{r}\"")).unwrap_or_default();
+                    Ok(Zeroizing::new(format!("{{\"jwt\":\"{}\"{role}}}", jwt.as_str())))
+                };
+                self.login(method.as_str(), mount, role.as_deref(), body).await?
+            }
         };
         let value = t.value.clone();
         *self.token.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
         Ok(value)
     }
 
-    async fn login(&self, mount: &str, role_id: &str, secret_id: &str) -> Result<Token, Error> {
+    /// Logs in at `auth/<mount>/login` with the JSON `body`, in the auth namespace, and
+    /// audits it as `secret.vault_login` with the method and role, never a credential.
+    async fn login(&self, method: &'static str, mount: &str, role: Option<&str>, body: impl std::future::Future<Output = Result<Zeroizing<String>, Error>>) -> Result<Token, Error> {
+        let what = match method {
+            "approle" => "AppRole login",
+            "kubernetes" => "Kubernetes login",
+            _ => "JWT login",
+        };
+        let namespace = self.auth_namespace();
         let result = async {
-            let body = json!({ "role_id": role_id, "secret_id": secret_id });
-            let res = self.request(reqwest::Method::POST, &format!("auth/{mount}/login")).json(&body).send().await.map_err(|e| unavailable("AppRole login", e))?;
+            let body = body.await?;
+            let res = self
+                .request_in(namespace, reqwest::Method::POST, &format!("auth/{mount}/login"))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.as_str().to_owned())
+                .send()
+                .await
+                .map_err(|e| unavailable(what, e))?;
             let status = res.status();
             if !status.is_success() {
-                return Err(Error::Unavailable(format!("Vault: AppRole login answered {status}")));
+                return Err(Error::Unavailable(format!("Vault: {what} at auth/{mount} answered {status}")));
             }
-            let v: Value = res.json().await.map_err(|e| unavailable("AppRole login", e))?;
-            let value = v["auth"]["client_token"].as_str().filter(|t| !t.is_empty()).ok_or_else(|| Error::Unavailable("Vault: AppRole login gave no token".into()))?;
+            let v: Value = res.json().await.map_err(|e| unavailable(what, e))?;
+            let value = v["auth"]["client_token"].as_str().filter(|t| !t.is_empty()).ok_or_else(|| Error::Unavailable(format!("Vault: {what} gave no token")))?;
             // Log in again two thirds of the way through the lease, so a token never lapses mid-run.
             let lease = v["auth"]["lease_duration"].as_u64().unwrap_or(0);
             let renew_at = (lease > 0).then(|| Instant::now() + Duration::from_secs(lease) * 2 / 3);
             Ok(Token { value: Zeroizing::new(value.to_string()), renew_at })
         }
         .await;
+        let mut details = json!({ "method": method });
+        if let Some(role) = role {
+            details["role"] = json!(role);
+        }
+        if let Some(ns) = namespace {
+            details["namespace"] = json!(ns);
+        }
         let e = Event::new(external::actor(), "secret.vault_login").target("vault_auth", mount);
         external::audit(match &result {
-            Ok(_) => e.details(json!({ "method": "approle" })),
-            Err(err) => e.outcome(Outcome::Failure).details(json!({ "method": "approle", "error": err.kind() })),
+            Ok(_) => e.details(details),
+            Err(err) => {
+                details["error"] = json!(err.kind());
+                e.outcome(Outcome::Failure).details(details)
+            }
         });
         result
     }
@@ -269,9 +429,19 @@ impl Provider for Vault {
             Auth::Token { file: Some(_), .. } => "token from VAULT_TOKEN_FILE".to_string(),
             Auth::Token { .. } => "token".to_string(),
             Auth::AppRole { mount, .. } => format!("AppRole at auth/{mount}"),
+            Auth::Jwt { method, mount, role, file } => {
+                let role = role.as_deref().map_or_else(|| "its default role".to_string(), |r| format!("role {r}"));
+                let kind = if *method == JwtMethod::Kubernetes { "Kubernetes" } else { "JWT" };
+                format!("{kind} login as {role} at auth/{mount} with the token in {}", file.display())
+            }
+        };
+        let auth_ns = match &c.auth_namespace {
+            AuthNamespace::Same => String::new(),
+            AuthNamespace::Root => " in the root namespace".to_string(),
+            AuthNamespace::Path(n) => format!(" in namespace {n}"),
         };
         let ns = c.namespace.as_deref().map(|n| format!(", namespace {n}")).unwrap_or_default();
-        format!("HashiCorp Vault at {}{ns}, KV v2 {}/{}/{{bots,server}}/<NAME> field {:?}, {auth}", c.addr, c.mount, c.prefix, c.field)
+        format!("HashiCorp Vault at {}{ns}, KV v2 {}/{}/{{bots,server}}/<NAME> field {:?}, {auth}{auth_ns}", c.addr, c.mount, c.prefix, c.field)
     }
 
     fn read(&self, scope: Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error> {
@@ -285,7 +455,7 @@ impl Provider for Vault {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::env::EnvStore;
     use super::super::external::{tests::audited, ExternalStore};
     use super::super::{redact, sealed, Secrets};
@@ -298,21 +468,34 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use super::super::http::MAX_REQUESTS;
 
-    /// A stand-in for Vault's KV v2 and AppRole APIs: no real Vault, account or network.
+    /// A stand-in for Vault's KV v2, AppRole, Kubernetes and JWT APIs: no real Vault,
+    /// cluster, account or network.
     #[derive(Default)]
-    struct Fake {
+    pub(crate) struct Fake {
         /// `<mount>/<path>` → fields.
         kv: Mutex<HashMap<String, Value>>,
-        tokens: Mutex<Vec<String>>,
-        logins: AtomicUsize,
+        pub tokens: Mutex<Vec<String>>,
+        /// JWTs a `kubernetes` or `jwt` mount accepts: (mount, role, JWT).
+        pub jwts: Mutex<Vec<(String, Option<String>, String)>>,
+        pub logins: AtomicUsize,
         reads: AtomicUsize,
         down: AtomicBool,
         namespaces: Mutex<Vec<String>>,
+        /// The namespace each login was sent to ("" for none).
+        pub login_namespaces: Mutex<Vec<String>>,
         lease: AtomicUsize,
         delay_ms: AtomicUsize,
     }
 
-    type F = Arc<Fake>;
+    pub(crate) type F = Arc<Fake>;
+
+    /// A compact JWT for `sub` that expires `exp_in` seconds from now. Unsigned: the
+    /// stand-in, like Vault's role, only compares it.
+    pub(crate) fn jwt(sub: &str, exp_in: i64) -> String {
+        let b64 = |v: Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string());
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        format!("{}.{}.{}", b64(json!({ "alg": "RS256", "kid": "k1" })), b64(json!({ "iss": "https://kubernetes.default.svc", "sub": sub, "exp": now + exp_in })), crate::random_hex(16))
+    }
 
     fn check(f: &Fake, h: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
         if f.down.load(Ordering::SeqCst) {
@@ -370,33 +553,52 @@ mod tests {
         (StatusCode::OK, Json(json!({ "data": { "keys": keys } })))
     }
 
-    async fn login(State(f): State<F>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
-        if body["role_id"] != "role-1" || body["secret_id"] != "secret-id-1" {
-            return (StatusCode::BAD_REQUEST, Json(json!({ "errors": ["invalid role or secret ID"] })));
-        }
+    /// `auth/approle/login` takes `role-1` and `secret-id-1`; any other mount takes the JWTs in `jwts`.
+    async fn login(State(f): State<F>, Path(mount): Path<String>, h: HeaderMap, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+        f.login_namespaces.lock().unwrap().push(h.get("x-vault-namespace").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string());
+        let method = if mount == "approle" {
+            if body["role_id"] != "role-1" || body["secret_id"] != "secret-id-1" {
+                return (StatusCode::BAD_REQUEST, Json(json!({ "errors": ["invalid role or secret ID"] })));
+            }
+            "approle"
+        } else {
+            let role = body.get("role").and_then(Value::as_str);
+            let ok = f.jwts.lock().unwrap().iter().any(|(m, r, j)| *m == mount && r.as_deref() == role && body["jwt"] == j.as_str());
+            if !ok {
+                return (StatusCode::FORBIDDEN, Json(json!({ "errors": ["permission denied"] })));
+            }
+            "jwt"
+        };
         let n = f.logins.fetch_add(1, Ordering::SeqCst);
-        let token = format!("hvs.approle-{n}");
+        let token = format!("hvs.{method}-{n}");
         f.tokens.lock().unwrap().push(token.clone());
         (StatusCode::OK, Json(json!({ "auth": { "client_token": token, "lease_duration": f.lease.load(Ordering::SeqCst), "renewable": true } })))
     }
 
     /// Starts the stand-in on its own thread and runtime; returns its address.
-    fn stand_in() -> (String, F) {
+    pub(crate) fn stand_in() -> (String, F) {
         let f = F::default();
         f.lease.store(3600, Ordering::SeqCst);
         let app = axum::Router::new()
             .route("/v1/secret/data/{*rest}", axum::routing::get(data))
             .route("/v1/secret/metadata/{*rest}", axum::routing::get(metadata))
-            .route("/v1/auth/approle/login", axum::routing::post(login))
+            .route("/v1/auth/{mount}/login", axum::routing::post(login))
             .with_state(Arc::clone(&f));
         (super::super::http::tests::serve(app), f)
     }
 
-    fn put(f: &Fake, path: &str, value: &str) {
+    pub(crate) fn put(f: &Fake, path: &str, value: &str) {
         f.kv.lock().unwrap().insert(format!("superbot/{path}"), json!({ "value": value }));
     }
 
-    fn vault(url: &str, extra: &[(&str, &str)], ttl: Duration) -> Arc<ExternalStore> {
+    /// A temporary file holding `text`, for token and JWT files.
+    pub(crate) fn token_file(label: &str, text: &str) -> PathBuf {
+        let file = crate::db::temp_path(label).join("token");
+        std::fs::write(&file, text).unwrap();
+        file
+    }
+
+    pub(crate) fn vault(url: &str, extra: &[(&str, &str)], ttl: Duration) -> Arc<ExternalStore> {
         let mut pairs = vec![("SECRETS_BACKEND", "vault"), ("VAULT_ADDR", url)];
         pairs.extend_from_slice(extra);
         let var = settings(&pairs);
@@ -488,6 +690,93 @@ mod tests {
         assert!(matches!(bad.check(), Err(Error::Unavailable(_))));
         assert!(audited("approle").iter().any(|e| e.outcome == Outcome::Failure));
         redact::forget("smtp-from-vault-1");
+    }
+
+    #[test]
+    fn kubernetes_logs_in_with_the_service_account_token_and_rereads_it_when_it_rotates() {
+        let (url, f) = stand_in();
+        put(&f, "bots/K8S_API_KEY", "k8s-vault-value-1");
+        let first = jwt("system:serviceaccount:superbot:botd", 3600);
+        f.jwts.lock().unwrap().push(("k8s-rotate".into(), Some("superbot".into()), first.clone()));
+        let file = token_file("vault-k8s", &format!("{first}\n"));
+        let s = vault(&url, &[("VAULT_AUTH", "kubernetes"), ("VAULT_KUBERNETES_ROLE", "superbot"), ("VAULT_KUBERNETES_MOUNT", "k8s-rotate"), ("VAULT_KUBERNETES_TOKEN_FILE", file.to_str().unwrap())], Duration::ZERO);
+        assert!(s.describe().contains("Kubernetes login as role superbot at auth/k8s-rotate with the token in"), "{}", s.describe());
+        assert_eq!(s.get("K8S_API_KEY").unwrap().unwrap().expose(), "k8s-vault-value-1");
+        s.get("K8S_API_KEY").unwrap();
+        assert_eq!(f.logins.load(Ordering::SeqCst), 1, "the Vault token is kept while its lease runs");
+
+        // The kubelet rotates the projected token, and Vault's token is revoked: botd reads the file again.
+        let second = jwt("system:serviceaccount:superbot:botd", 3600);
+        *f.jwts.lock().unwrap() = vec![("k8s-rotate".into(), Some("superbot".into()), second.clone())];
+        std::fs::write(&file, &second).unwrap();
+        f.tokens.lock().unwrap().clear();
+        assert_eq!(s.get("K8S_API_KEY").unwrap().unwrap().expose(), "k8s-vault-value-1", "refused: logs in with the new token and retries");
+        assert_eq!(f.logins.load(Ordering::SeqCst), 2);
+
+        // A token Vault no longer accepts fails closed.
+        f.jwts.lock().unwrap().clear();
+        f.tokens.lock().unwrap().clear();
+        let e = s.get("K8S_API_KEY").err().unwrap().to_string();
+        assert!(e.contains("Kubernetes login at auth/k8s-rotate answered 403"), "{e}");
+        let ev = audited("k8s-rotate");
+        assert!(ev.iter().all(|e| e.action == "secret.vault_login" && e.details["method"] == "kubernetes" && e.details["role"] == "superbot"), "{ev:?}");
+        assert_eq!((ev.iter().filter(|e| e.outcome == Outcome::Success).count(), ev.iter().filter(|e| e.outcome == Outcome::Failure).count()), (2, 1), "{ev:?}");
+        let logged = format!("{ev:?}{e}");
+        assert!(!logged.contains(&first) && !logged.contains(&second) && !logged.contains("hvs."), "no JWT or Vault token in the audit log or errors");
+        redact::forget("k8s-vault-value-1");
+    }
+
+    #[test]
+    fn jwt_logs_in_with_the_default_role_in_the_auth_namespace() {
+        let (url, f) = stand_in();
+        put(&f, "server/SMTP_PASSWORD", "jwt-smtp-value-1");
+        let token = jwt("repo:acme/infra:environment:prod", 600);
+        f.jwts.lock().unwrap().push(("oidc-ns".into(), None, token.clone()));
+        let file = token_file("vault-jwt", &token);
+        let pairs = [("VAULT_AUTH", "jwt"), ("VAULT_JWT_MOUNT", "oidc-ns"), ("VAULT_JWT_FILE", file.to_str().unwrap()), ("VAULT_NAMESPACE", "admin/team-a"), ("VAULT_AUTH_NAMESPACE", "admin")];
+        let s = vault(&url, &pairs, Duration::ZERO);
+        assert!(s.describe().contains("JWT login as its default role at auth/oidc-ns") && s.describe().contains("in namespace admin"), "{}", s.describe());
+        assert_eq!(s.get("SMTP_PASSWORD").unwrap().unwrap().expose(), "jwt-smtp-value-1");
+        assert_eq!(*f.login_namespaces.lock().unwrap(), ["admin"], "logged in where the auth method is mounted");
+        assert!(f.namespaces.lock().unwrap().iter().all(|n| n == "admin/team-a"), "and read where the secrets are");
+        let ev = audited("oidc-ns");
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0].details, json!({ "method": "jwt", "namespace": "admin" }));
+
+        // `root`: the login carries no namespace; AppRole follows the same setting.
+        f.login_namespaces.lock().unwrap().clear();
+        let root = vault(&url, &[pairs[0], pairs[1], pairs[2], pairs[3], ("VAULT_AUTH_NAMESPACE", "root")], Duration::ZERO);
+        assert!(root.get("SMTP_PASSWORD").unwrap().is_some());
+        let approle = vault(&url, &[("VAULT_AUTH", "approle"), ("VAULT_ROLE_ID", "role-1"), ("VAULT_SECRET_ID", "secret-id-1"), ("VAULT_NAMESPACE", "admin/team-a"), ("VAULT_AUTH_NAMESPACE", "admin/auth")], Duration::ZERO);
+        assert!(approle.get("SMTP_PASSWORD").unwrap().is_some());
+        assert_eq!(*f.login_namespaces.lock().unwrap(), ["", "admin/auth"]);
+        redact::forget("jwt-smtp-value-1");
+    }
+
+    #[test]
+    fn jwt_files_that_cant_be_used_fail_closed_before_anything_is_sent() {
+        let (url, f) = stand_in();
+        let expired = jwt("system:serviceaccount:superbot:botd", -120);
+        let pem = "-----BEGIN CERTIFICATE-----\nnot-a-jwt-but-private-looking-0123\n-----END CERTIFICATE-----\n";
+        let missing = crate::db::temp_path("vault-jwt-missing").join("token");
+        let b64 = |v: Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string());
+        let fractional = format!("{}.{}.c2ln", b64(json!({ "alg": "RS256" })), b64(json!({ "sub": "botd", "exp": 1_700_000_000.5 })));
+        for (file, err) in [
+            (missing, "VAULT_JWT_FILE ("),
+            (token_file("vault-jwt-empty", "\n"), "is empty"),
+            (token_file("vault-jwt-pem", pem), "doesn't hold a JWT"),
+            (token_file("vault-jwt-claims", "a.bm90LWpzb24.c"), "doesn't hold a JWT"),
+            (token_file("vault-jwt-expired", &expired), "expired"),
+            (token_file("vault-jwt-fractional", &fractional), "expired"),
+        ] {
+            let s = vault(&url, &[("VAULT_AUTH", "jwt"), ("VAULT_JWT_ROLE", "botd"), ("VAULT_JWT_FILE", file.to_str().unwrap())], Duration::ZERO);
+            let e = s.check().err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(e.contains(err), "{file:?}: {e}");
+            assert!(!e.contains("private-looking") && !e.contains(&expired), "the file is never quoted: {e}");
+        }
+        assert_eq!(f.logins.load(Ordering::SeqCst), 0, "nothing was sent to Vault");
+        assert!(f.login_namespaces.lock().unwrap().is_empty());
+        assert!(audited("jwt").iter().any(|e| e.outcome == Outcome::Failure && e.details["error"] == "unavailable" && e.details["role"] == "botd"));
     }
 
     #[test]
@@ -594,8 +883,15 @@ mod tests {
             (vec![("VAULT_ADDR", "https://vault.example.com/ui")], "just the scheme"),
             (vec![("VAULT_ADDR", "https://v"), ("VAULT_KV_PREFIX", "a/../b")], "VAULT_KV_PREFIX"),
             (vec![("VAULT_ADDR", "https://v"), ("VAULT_KV_MOUNT", "a b")], "VAULT_KV_MOUNT"),
-            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "kubernetes")], "token or approle"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "ldap")], "token, approle, kubernetes or jwt"),
             (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "approle")], "VAULT_ROLE_ID"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "kubernetes")], "needs VAULT_KUBERNETES_ROLE"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "kubernetes"), ("VAULT_KUBERNETES_ROLE", "bad role")], "VAULT_KUBERNETES_ROLE must be a Vault role name"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "kubernetes"), ("VAULT_KUBERNETES_ROLE", "r"), ("VAULT_KUBERNETES_MOUNT", "../k8s")], "VAULT_KUBERNETES_MOUNT"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "jwt")], "needs VAULT_JWT_FILE"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "jwt"), ("VAULT_JWT_FILE", "/f"), ("VAULT_JWT_ROLE", "r\"}")], "VAULT_JWT_ROLE must be"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "jwt"), ("VAULT_JWT_FILE", "/f"), ("VAULT_AUTH_NAMESPACE", "a/../b")], "VAULT_AUTH_NAMESPACE"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH_NAMESPACE", "admin")], "needs VAULT_AUTH=approle, kubernetes or jwt"),
             (vec![("VAULT_ADDR", "https://v"), ("VAULT_CACERT", "/nonexistent/ca.pem")], "VAULT_CACERT"),
         ] {
             let e = ok(&pairs).err().unwrap_or_default();
@@ -603,11 +899,24 @@ mod tests {
         }
         let none = EnvStore::fixed(&[]);
         assert!(Config::from_env(&settings(&[("VAULT_ADDR", "https://v")]), &none).err().unwrap().contains("VAULT_TOKEN"));
+        // Kubernetes and JWT need no secret in the environment: the JWT is in a file.
+        let c = Config::from_env(&settings(&[("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "kubernetes"), ("VAULT_KUBERNETES_ROLE", "superbot@prod")]), &none).unwrap();
+        assert!(matches!(&c.auth, Auth::Jwt { method: JwtMethod::Kubernetes, mount, role: Some(r), file } if mount == "kubernetes" && r == "superbot@prod" && file.to_str() == Some(KUBERNETES_TOKEN_FILE)));
+        assert_eq!(c.auth_namespace, AuthNamespace::Same);
+        let c = Config::from_env(&settings(&[("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "jwt"), ("VAULT_JWT_FILE", " /run/oidc/token "), ("VAULT_AUTH_NAMESPACE", "/")]), &none).unwrap();
+        assert!(matches!(&c.auth, Auth::Jwt { method: JwtMethod::Jwt, mount, role: None, file } if mount == "jwt" && file.to_str() == Some("/run/oidc/token")));
+        assert_eq!(c.auth_namespace, AuthNamespace::Root);
     }
 
     #[test]
     fn vault_credentials_never_reach_bots() {
-        for name in ["VAULT_TOKEN", "VAULT_SECRET_ID", "VAULT_ROLE_ID"] {
+        // `VAULT_JWT_FILE` would otherwise be offered to Bots as `VAULT_JWT`, read from the file.
+        let file = token_file("vault-jwt-bots", &jwt("system:serviceaccount:superbot:botd", 3600));
+        for var in ["VAULT_JWT_FILE", "VAULT_KUBERNETES_TOKEN_FILE"] {
+            let s = Secrets::new(vec![Box::new(EnvStore::fixed(&[(var, file.to_str().unwrap())]))]);
+            assert!(s.try_harness_env().unwrap().is_empty() && s.try_inherited_harness_env().unwrap().is_empty() && s.list().unwrap().is_empty(), "{var}");
+        }
+        for name in ["VAULT_TOKEN", "VAULT_SECRET_ID", "VAULT_ROLE_ID", "VAULT_JWT", "VAULT_KUBERNETES_TOKEN"] {
             assert!(super::super::check_name(name).is_err(), "{name} is reserved");
             let s = Secrets::new(vec![Box::new(EnvStore::fixed(&[(name, "hvs.0123456789abcdef")]))]);
             assert!(s.harness_env().is_empty() && s.inherited_harness_env().is_empty() && s.list().unwrap().is_empty(), "{name}");
