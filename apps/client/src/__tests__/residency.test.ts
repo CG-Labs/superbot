@@ -51,6 +51,17 @@ describe("residencyLines (ADR 0168)", () => {
     expect(residencyLines(back).lines[1]).toBe("Your own data is also pinned to gb-lon, kept from Acme's pin when you left it.");
   });
 
+  it("says a kept pin ends by itself once your computer and backups are gone, when the server says so (ADR 0205)", () => {
+    const ENDS = "That pin ends by itself once your computer and its backups are gone.";
+    const kept = (endsWhenDataGone?: boolean) => view({ pin: { on: "user", region: "gb-lon", pinnedAt: AT, keptFrom: { team: { id: "t1", name: "Acme" }, endsWhenDataGone } } });
+    expect(residencyLines(kept(true)).lines[1]).toBe(ENDS);
+    expect(residencyLines(kept(false)).lines).not.toContain(ENDS);
+    expect(residencyLines(kept()).lines).not.toContain(ENDS);
+    const back = view({ pin: { on: "team", region: "gb-lon", pinnedAt: AT, team: { id: "t1", name: "Acme" } }, ownPin: { region: "gb-lon", pinnedAt: AT, keptFrom: { team: { id: "t1", name: "Acme" }, endsWhenDataGone: true } } });
+    expect(residencyLines(back).lines[2]).toBe(ENDS);
+    expect(residencyLines(view()).lines).not.toContain(ENDS);
+  });
+
   it("warns about data outside the region and runs held back for want of a model there", () => {
     const { warnings } = residencyLines(
       view({ status: "data_outside", machine: { id: "m1", state: "running", region: "de-fra-2", inRegion: false }, backups: { kept: 4, inRegion: 3, outside: 1 }, modelRoutes: { inRegion: false, gap: "open routing" } }),

@@ -17,6 +17,7 @@ export function residencyLines(v: MyResidency): { lines: string[]; warnings: str
   const whose = p.on === "team" ? `Your team${p.team?.name ? `, ${p.team.name},` : ""} has its data` : "Your data is";
   const lines = [`${whose} pinned to ${p.region}${under(p.reference, p.keptFrom)}, since ${day(p.pinnedAt)}.`];
   if (v.ownPin) lines.push(`Your own data is also pinned to ${v.ownPin.region}${under(v.ownPin.reference, v.ownPin.keptFrom)}.`);
+  if ((p.keptFrom ?? v.ownPin?.keptFrom)?.endsWhenDataGone) lines.push("That pin ends by itself once your computer and its backups are gone.");
   const warnings: string[] = [];
   if (v.machine) {
     const m = v.machine;

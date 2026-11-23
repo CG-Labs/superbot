@@ -330,6 +330,7 @@ pub async fn list(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>)
         "backups": cp.offsite.as_deref().map(|off| json!({ "residency": off.s.residency, "dataRegion": off.s.default_region, "warnings": off.warnings() })),
         "residency": {
             "pins": super::residency::pins_view(&app), "warnings": super::residency::warnings(&app, cp), "startup": super::residency::startup().as_str(),
+            "keptPins": cp.kept_pins.as_str(),
             "serverData": cp.server_data.summary(&app),
         },
     })))

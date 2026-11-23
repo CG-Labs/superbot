@@ -1298,6 +1298,8 @@ export interface OffboardingPreview {
 /** The team a pin was kept from when you left it; `name` is null once the team is gone. */
 export interface KeptFrom {
   team: { id: string; name: string | null };
+  /** It ends by itself once the server holds none of your computer's data (ADR 0205). Missing from servers before it. */
+  endsWhenDataGone?: boolean;
 }
 
 export interface MyResidency {

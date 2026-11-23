@@ -87,7 +87,7 @@ A run routed to an endpoint brings its key, so it needs no harness login. botd d
 ## Not done (still on #58)
 
 - Splitting botd's database by region, so one server can hold two regions' chats.
-- Ending a kept pin by itself once the leaver's machine and backups are gone (ADR 0171).
+- Ending a kept pin by itself once the leaver's machine and backups are gone (ADR 0171). **Done** in [ADR 0205](0205-ending-a-kept-pin-once-the-data-is-gone.md).
 
 ## Tests
 
