@@ -161,6 +161,7 @@ fn every_link_in_the_playbooks_resolves() {
     files.push(repo().join("docs/adr/0131-support-bundle.md"));
     files.push(repo().join("docs/adr/0144-tam-programme-and-health-score.md"));
     files.push(repo().join("docs/adr/0157-health-score-history-and-console.md"));
+    files.push(repo().join("docs/adr/0167-support-report-from-ticket-exports.md"));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links:\n{}", bad.join("\n"));
 }
@@ -291,5 +292,24 @@ fn the_tam_cadence_runs_kickoff_health_checks_and_reviews() {
     for page in ["health-check.md", "qbr-template.md"] {
         let md = read(page);
         assert!(md.contains("botctl health-score"), "{page} doesn't start from the health score");
+    }
+}
+
+#[test]
+fn the_support_report_page_documents_every_option_and_field() {
+    let code = fs::read_to_string(repo().join("server/src/support_report.rs")).unwrap();
+    let usage = code.split("pub const USAGE: &str = \"").nth(1).unwrap().split("\";").next().unwrap();
+    let page = read("support-report.md");
+    let options: HashSet<&str> = usage.split(|c: char| c.is_whitespace() || "[]|".contains(c)).filter(|w| w.starts_with("--")).collect();
+    assert!(options.len() >= 12, "the usage's options: {options:?}");
+    for o in options {
+        assert!(page.contains(&format!("`{o}")), "support-report.md doesn't explain {o}");
+    }
+    let fields = code.split("fn name(self) -> &'static str {").nth(1).unwrap().split("\n    }\n").next().unwrap();
+    for f in fields.split("=> \"").skip(1).map(|r| r.split('"').next().unwrap()) {
+        assert!(page.contains(&format!("| `{f}` |")), "support-report.md has no row for the {f} field");
+    }
+    for page in ["severity.md", "qbr-template.md", "health-check.md"] {
+        assert!(read(page).contains("(support-report.md"), "{page} doesn't point at the support report");
     }
 }
