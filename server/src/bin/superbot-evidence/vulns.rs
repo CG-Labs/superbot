@@ -303,9 +303,22 @@ fn quoted(s: &str) -> Option<String> {
     (!inner.is_empty()).then(|| inner.to_string())
 }
 
+/// A one-line YAML scalar: a quoted string's inside, or plain text up to a ` #` comment.
 fn yaml_value(s: &str) -> String {
     let s = s.trim();
-    quoted(s).unwrap_or_else(|| s.to_string())
+    if let Some(q) = s.chars().next().filter(|c| *c == '"' || *c == '\'') {
+        if let Some(end) = s[1..].find(q) {
+            return s[1..1 + end].to_string();
+        }
+    }
+    uncomment(s).to_string()
+}
+
+fn uncomment(s: &str) -> &str {
+    if s.starts_with('#') {
+        return "";
+    }
+    s.split(" #").next().unwrap_or_default().trim()
 }
 
 /// A YAML block scalar's header (`>`, `|-`, `>+2`, then perhaps a comment), unquoted:
@@ -345,7 +358,7 @@ pub fn grype_accepted(text: &str) -> Vec<Value> {
             continue;
         }
         if !raw.starts_with(' ') && !raw.starts_with('-') {
-            inside = line == "ignore:";
+            inside = uncomment(line) == "ignore:";
             continue;
         }
         if !inside {
@@ -713,6 +726,8 @@ mod tests {
         assert_eq!(blocks.iter().map(|f| (f["id"].as_str().unwrap(), f["reason"].as_str(), f["hasReason"].as_bool().unwrap())).collect::<Vec<_>>(), [("CVE-4", Some("folded over two lines"), true), ("CVE-5", Some("kept\napart"), true), ("CVE-6", None, false)], "block scalars keep their text, and an empty one is no reason");
         assert_eq!(blocks[0]["package"], "zlib");
         let quoted_marks = grype_accepted("ignore:\n  - vulnerability: CVE-7\n    reason: \"> 30 days needed upstream\"\n  - vulnerability: CVE-8\n    reason: |-  # a comment\n      kept\n");
+        let commented = grype_accepted("ignore: # accepted findings\n  - vulnerability: CVE-9 # note\n    reason: \"a # in quotes\" # note\n");
+        assert_eq!((commented.len(), commented[0]["id"].as_str(), commented[0]["reason"].as_str()), (1, Some("CVE-9"), Some("a # in quotes")), "comments after a key or value are not part of it");
         assert_eq!(quoted_marks.iter().map(|f| f["reason"].as_str()).collect::<Vec<_>>(), [Some("> 30 days needed upstream"), Some("kept")], "a quoted reason starting with > is text, not a block");
         let g = grype_accepted("ignore:\n  # CVE-YYYY-NNNNN example\n  - vulnerability: CVE-1\n    package:\n      name: zlib\n  - vulnerability: \"CVE-2\"\n    reason: 'fixed upstream'\nother:\n  - vulnerability: CVE-3\n");
         assert_eq!(g.iter().map(|f| (f["id"].as_str().unwrap(), f["reason"].as_str())).collect::<Vec<_>>(), [("CVE-1", None), ("CVE-2", Some("fixed upstream"))]);
