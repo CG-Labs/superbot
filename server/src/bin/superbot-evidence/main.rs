@@ -9,10 +9,13 @@
 //! dated bundle with SHA-256 digests beside botd's evidence bundles (ADR 0142). `coverage` (ADR 0169):
 //! checks every bundle in an evidence store against its digests and reports the days of
 //! an observation period each kind of bundle, checklist row and criterion has none for.
+//! `register` (ADR 0204): checks the security owner's private policy register (role
+//! holders, policy approvals, acknowledgements and training, risks, management reviews,
+//! vendors, exceptions) against the policies' cadences, as a bundle naming people by id.
 //!
 //! Reads GitHub only, with a token from `GITHUB_TOKEN` (or `GH_TOKEN`), never from the
 //! command line. Run by the `change-evidence` workflow each month, or by an operator.
-//! `coverage` reads local files only, and so does `drills --no-ci`.
+//! `coverage` and `register` read local files only, and so does `drills --no-ci`.
 
 mod changes;
 mod coverage;
@@ -20,6 +23,7 @@ mod drills;
 mod github;
 #[path = "../../evidence_period.rs"]
 mod period;
+mod register;
 #[path = "../../ustar.rs"]
 mod ustar;
 mod vulns;
@@ -27,7 +31,7 @@ mod vulns;
 use std::io::Write;
 use std::process::ExitCode;
 
-const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0086), restore drills (ADR 0177), and its coverage (ADR 0169).
+const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0086), restore drills (ADR 0177), the policy register (ADR 0204), and its coverage (ADR 0169).
 
   superbot-evidence github --repo <owner/name> [--branch <name>]
                     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>] [--no-titles]
@@ -38,6 +42,8 @@ const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, AD
                     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>] [--no-ci]
   superbot-evidence coverage <evidence store> [--from <YYYY-MM-DD> --to <YYYY-MM-DD>]
                     [--checklist <soc2-readiness-checklist.md>] [--json] [-o <file>]
+  superbot-evidence register <register.json> [--policies <folder>] [--baseline <file>]...
+                    [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]
 
 Writes one bundle for the period (whole UTC days, --to not included; neither: last month):
 every pull request merged into the branch (default: the repository's default branch) with
@@ -77,7 +83,21 @@ last), the days each kind of bundle, each checklist row and each criterion has n
 evidence for, month by month, with each manifest's SHA-256 to compare with what was recorded
 when it was made. --checklist also lists the rows no bundle collects evidence for. Markdown,
 or --json. Exits 0 when complete, 2 when a bundle fails or a day is missing, 1 on an error.
-No token and no network; it writes nothing into the store.";
+No token and no network; it writes nothing into the store.
+
+register reads the security owner's policy register (docs/security/policy-register.md; a
+JSON file kept outside this repository) and writes one bundle for the period (a month at
+most, judged as of its end) of what it shows: each role's holder and deputy every day, each policy's latest approval (by the
+role its header names, within a year, and with --policies, of the text in force),
+everyone's acknowledgements and training, the open risks and their reviews, a management
+review each quarter, vendors assessed before use and reviewed yearly, and exceptions
+approved, ended within a year and reviewed quarterly; with each --baseline (botctl
+evidence baseline json, or the month's evidence bundle's baseline.json, checked in the
+period or the 7 days after it), every setting the server excepted held to an exception in
+force. Refuses a register that
+doesn't hold together (unknown people, roles or policies, ids that aren't plain), listing
+every problem. People are named by register id; names, titles and notes stay out. No
+token and no network.";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Kind {
@@ -314,6 +334,18 @@ fn drills(a: &Args, p: period::Period, gh: Option<(&mut github::GitHub, &str)>, 
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "register") {
+        return match register::run(&args[1..], chrono::Utc::now()) {
+            Ok(out) => {
+                println!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if args.first().is_some_and(|a| a == "coverage") {
         return match coverage::run(&args[1..], chrono::Utc::now()) {
             Ok((out, complete)) => {

@@ -1,0 +1,54 @@
+{
+  "superbotRegister": 1,
+  "notes": "Template (docs/security/policy-register.md). Copy it out of the repository, replace every <...> placeholder, the dates and the zero digests, and keep it private. Check it with: superbot-evidence register <register.json> --policies docs/security/policies",
+  "riskAppetite": 9,
+  "people": [
+    { "id": "person-1", "name": "<name>", "joined": "2026-12-01" },
+    { "id": "person-2", "name": "<name>", "joined": "2026-12-01" },
+    { "id": "person-3", "name": "<name>", "joined": "2026-12-01" }
+  ],
+  "roles": [
+    { "role": "Management", "holder": "person-1", "deputy": "person-2", "from": "2026-12-01" },
+    { "role": "Security owner", "holder": "person-2", "deputy": "person-1", "from": "2026-12-01" },
+    { "role": "Engineering lead", "holder": "person-3", "deputy": "person-2", "from": "2026-12-01" },
+    { "role": "Operator", "holder": "person-3", "deputy": "person-2", "from": "2026-12-01" },
+    { "role": "People lead", "holder": "person-1", "deputy": "person-2", "from": "2026-12-01" },
+    { "role": "Privacy lead", "holder": "person-2", "deputy": "person-1", "from": "2026-12-01" }
+  ],
+  "policyApprovals": [
+    { "policy": "information-security", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "approvedBy": "person-1", "approvedAt": "2026-12-01" },
+    { "policy": "access-control", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "approvedBy": "person-1", "approvedAt": "2026-12-01" },
+    { "policy": "change-management", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "approvedBy": "person-1", "approvedAt": "2026-12-01" },
+    { "policy": "incident-response", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "approvedBy": "person-1", "approvedAt": "2026-12-01" },
+    { "policy": "business-continuity", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "approvedBy": "person-1", "approvedAt": "2026-12-01" },
+    { "policy": "vendor-management", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "approvedBy": "person-1", "approvedAt": "2026-12-01" },
+    { "policy": "data-classification-and-retention", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "approvedBy": "person-1", "approvedAt": "2026-12-01" },
+    { "policy": "acceptable-use", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "approvedBy": "person-1", "approvedAt": "2026-12-01" }
+  ],
+  "acknowledgements": [
+    { "person": "person-1", "policy": "information-security", "at": "2026-12-01" },
+    { "person": "person-1", "policy": "acceptable-use", "at": "2026-12-01" }
+  ],
+  "training": [
+    { "person": "person-1", "course": "security-awareness", "at": "2026-12-01" }
+  ],
+  "risks": [
+    { "id": "R-01", "title": "A user reads another user's data", "owner": "Engineering lead", "likelihood": 2, "impact": 5, "treatment": "reduce", "controls": ["CC6.1-1", "CC6.8-2", "CC3.2-2"], "identified": "2026-12-01" },
+    { "id": "R-02", "title": "A harness vendor changes its CLI or security model", "owner": "Engineering lead", "likelihood": 4, "impact": 3, "treatment": "reduce", "controls": ["CC8.1-1", "CC7.1-1"], "identified": "2026-12-01" },
+    { "id": "R-03", "title": "A host or the database is lost", "owner": "Operator", "likelihood": 2, "impact": 4, "treatment": "reduce", "controls": ["A1.2-1", "A1.3-1"], "identified": "2026-12-01" },
+    { "id": "R-04", "title": "Someone with operator access misuses it", "owner": "Security owner", "likelihood": 1, "impact": 5, "treatment": "reduce", "controls": ["CC6.3-2", "CC7.2-2", "CC8.1-1"], "fraud": true, "identified": "2026-12-01" },
+    { "id": "R-05", "title": "Stolen cards or fake sign-ups run up model spend", "owner": "Management", "likelihood": 3, "impact": 3, "treatment": "accept", "fraud": true, "identified": "2026-12-01", "acceptedBy": "person-1", "acceptedAt": "2026-12-01", "acceptedUntil": "2027-06-01" }
+  ],
+  "riskReviews": [
+    { "at": "2026-12-01", "by": "person-2" }
+  ],
+  "managementReviews": [
+    { "at": "2026-12-01", "attendees": ["person-1", "person-2"], "minutesSha256": "0000000000000000000000000000000000000000000000000000000000000000" }
+  ],
+  "vendors": [
+    { "id": "hosting", "tier": "critical", "hosting": true, "since": "2026-12-01", "assessed": "2026-12-01", "approvedBy": "person-2", "notes": "<the hosting provider; its SOC 2 or ISO 27001 report reviewed>" },
+    { "id": "code-host", "tier": "high", "since": "2026-12-01", "assessed": "2026-12-01", "approvedBy": "person-2" },
+    { "id": "model-provider", "tier": "high", "since": "2026-12-01", "assessed": "2026-12-01", "approvedBy": "person-2" }
+  ],
+  "exceptions": []
+}
