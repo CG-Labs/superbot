@@ -300,6 +300,33 @@ fn the_release_check_reads_ghcr_anonymously_and_verifies_offline() {
     }
 }
 
+// ADR 0200: a Hermes bundle per arch is made, signed and attached with the release's bundles,
+// and CI installs Hermes Agent from one with no network.
+#[test]
+fn hermes_bundles_are_signed_released_and_installed_with_no_network() {
+    let yaml = read(".github/workflows/offline.yml");
+    let all = jobs(&yaml);
+    let s = steps(job(&all, "release-bundle"));
+    let at = |want: &str| s.iter().position(|step| step.contains(want)).unwrap_or_else(|| panic!("release-bundle must have `{want}`"));
+    let hermes = at("sudo deploy/offline-bundle.sh hermes --out");
+    let upload = at(r#"gh release upload "$TAG" dist/superbot-hermes-* --clobber"#);
+    assert!(hermes < upload, "Hermes bundles are made before they are attached");
+    for want in [r#"cosign sign-blob --yes --bundle "$f.sigstore.json" "$f""#, r#"deploy/offline-bundle.sh verify "$f""#, r#"mv "$f" "$f.sha256" "$f.sigstore.json" dist/"#] {
+        assert!(s[hermes].contains(want), "each Hermes bundle is signed, verified and attached with its signature: `{want}`");
+    }
+    let s = steps(job(&all, "install-offline"));
+    let at = |want: &str| s.iter().position(|step| step.contains(want)).unwrap_or_else(|| panic!("install-offline must have `{want}`"));
+    let build = at("sudo deploy/offline-bundle.sh hermes --out");
+    let install = at(r#"--with-hermes --hermes-bundle "$HB""#);
+    assert!(at("Install from the bundle with no network") < build && build < install, "botd installs offline, then Hermes is bundled, then installed offline");
+    assert!(s[build].contains(r#"deploy/offline-bundle.sh verify "$hb""#), "CI verifies the Hermes bundle it made");
+    for want in ["sudo ip netns exec offline bash deploy/install.sh", "the network is still up", "sudo -u nobody", "is already installed in /opt/hermes", "an upgrade without --with-hermes touched Hermes Agent"] {
+        assert!(s[install].contains(want), "the Hermes install step must have `{want}`");
+    }
+    let on: String = yaml.lines().take_while(|l| !l.starts_with("permissions:")).collect::<Vec<_>>().join("\n");
+    assert_eq!(on.matches("'deploy/hermes-share.sh'").count(), 2, "pushes and pull requests that change hermes-share.sh, which Hermes bundles run, run offline.yml");
+}
+
 #[test]
 fn the_reader_joins_folded_values() {
     let job = ["  a:", "    if: >-", "      one ||", "      two", "    runs-on: x", "    steps:", "      - run: true"];
