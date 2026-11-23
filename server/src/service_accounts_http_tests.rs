@@ -20,21 +20,21 @@ async fn events(port: u16, admin: &str, action: &str) -> Vec<Value> {
     audit_list(&body)
 }
 
-async fn role(port: u16, admin: &str, name: &str, base: &str, perms: &[&str]) -> String {
+pub(crate) async fn role(port: u16, admin: &str, name: &str, base: &str, perms: &[&str]) -> String {
     let (code, v) = json_call(port, "POST", "/api/roles", admin, &json!({ "name": name, "base": base, "permissions": perms }).to_string()).await;
     assert_eq!(code, 201, "{v}");
     v["id"].as_str().unwrap().to_string()
 }
 
 /// A new service account. Returns its id.
-async fn account(port: u16, who: &str, body: Value) -> String {
+pub(crate) async fn account(port: u16, who: &str, body: Value) -> String {
     let (code, v) = json_call(port, "POST", "/api/service-accounts", who, &body.to_string()).await;
     assert_eq!(code, 201, "{v}");
     v["id"].as_str().unwrap().to_string()
 }
 
 /// A new token for `sa`. Returns its Authorization and the reply.
-async fn token(port: u16, who: &str, sa: &str, body: Value) -> (String, Value) {
+pub(crate) async fn token(port: u16, who: &str, sa: &str, body: Value) -> (String, Value) {
     let (code, head, v) = call_with(port, "POST", &format!("/api/service-accounts/{sa}/tokens"), who, "", &body.to_string()).await;
     assert_eq!(code, 201, "{v}");
     assert!(head.to_ascii_lowercase().contains("cache-control: no-store"), "{head}");

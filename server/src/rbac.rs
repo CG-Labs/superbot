@@ -322,6 +322,9 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         // Your own plan (ADR 0033). Every tier with its models is `tiers`, for admins.
         ("GET", ["me", "tier"]) => Read,
         ("GET", ["me", "usage"]) => Read,
+        // The residency pin on your own data, and its report (ADR 0168). Handlers refuse
+        // Bots, and give a team's report only to its owners and admins.
+        ("GET", ["me", "residency"] | ["me", "residency", "report"]) => Account,
         // Your own plan, and buying or managing it (ADR 0042). Handlers refuse Bots.
         ("GET", ["billing"]) => Read,
         ("POST", ["billing", "checkout" | "portal"]) => Write,
@@ -562,6 +565,10 @@ mod tests {
             ("GET", "/api/usage", Perm::ManageBilling),
             // Your own usage this billing period; anyone's is for admins (ADR 0050).
             ("GET", "/api/me/usage", Perm::Read),
+            ("GET", "/api/me/residency", Perm::Account),
+            ("GET", "/api/me/residency/report", Perm::Account),
+            ("POST", "/api/me/residency/report", Perm::Admin),
+            ("GET", "/api/me/residency/other", Perm::Admin),
             ("GET", "/api/users/u1/usage", Perm::ManageBilling),
             // Your own plan's checkout and billing portal (ADR 0042).
             ("GET", "/api/billing", Perm::Read),
