@@ -314,6 +314,14 @@ fn conflict(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::CONFLICT, msg.into())
 }
 
+/// A role that became time-bound between its check and the write (ADR 0197) is refused.
+fn write_error(e: String) -> ApiError {
+    if e == crate::db::SA_TIME_BOUND {
+        return conflict("That role is time-bound now, and a service account holds its role with no end. Pick another.");
+    }
+    ApiError(StatusCode::INTERNAL_SERVER_ERROR, e)
+}
+
 fn refuse(app: &AppState, by: &Who, limit: &str, target: Option<&str>, extra: Value, msg: String) -> ApiError {
     let mut d = json!({ "reason": "delegate_limit", "limit": limit });
     if let (Some(o), Value::Object(e)) = (d.as_object_mut(), extra) {
@@ -569,7 +577,7 @@ pub async fn create(State(app): State<AppState>, Extension(c): Extension<Caller>
     within(&app, &by, &owner, &roles, None)?;
     let org = roles.org_role().map(|r| r.id.as_str());
     let team_arg = roles.team.as_ref().map(|t| (t.id.as_str(), roles.team_role().map(|r| r.id.as_str())));
-    let sa = app.db.create_service_account(&name, &description, role, org, team_arg, &owner.id, by.actor.id.as_deref()).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let sa = app.db.create_service_account(&name, &description, role, org, team_arg, &owner.id, by.actor.id.as_deref()).map_err(write_error)?;
     app.db.record(&by.event("service_account.created").target("service_account", &sa.user.id).details(json!({
         "name": sa.user.name, "role": role, "customRole": role_summary(roles.org_role()), "team": roles.team.as_ref().map(|t| &t.id),
         "teamRole": role_summary(roles.team_role()), "owner": owner.id, "permissions": roles.holds().names(),
@@ -642,7 +650,7 @@ pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>
         p.role = Some((role_now, org_now));
         p.team = Some(team_now.map(|t| (t, team_role_now)));
     }
-    app.db.update_service_account(&id, &p).map_err(|_| not_found("Service account"))?;
+    app.db.update_service_account(&id, &p).map_err(|e| if e == "not found" { not_found("Service account") } else { write_error(e) })?;
     let after = app.db.service_account(&id).ok_or_else(|| not_found("Service account"))?;
     let mut changes = Map::new();
     let mut change = |k: &str, from: Value, to: Value| {

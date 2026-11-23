@@ -926,6 +926,10 @@ fn role_perms_in(c: &Connection, role_id: &str) -> rusqlite::Result<Option<crate
 /// than its limit from `?2`, now (`?5` is a day). Checked as it's written, against an edit.
 const GIVABLE: &str = "EXISTS (SELECT 1 FROM roles WHERE id = ?1 AND (max_days IS NULL OR (?4 IS NOT NULL AND ?4 <= ?2 + max_days * ?5)))";
 
+/// What a service account write returns when a role it would give became time-bound
+/// (ADR 0197) after it was checked: service accounts hold roles with no end.
+pub const SA_TIME_BOUND: &str = "time-bound";
+
 /// Whether a custom role is time-bound (ADR 0197), read in `c`'s transaction. A group
 /// holds what it maps while people are in it, so it is never given one.
 fn role_time_bound_in(c: &Connection, role_id: &str) -> rusqlite::Result<bool> {
@@ -6168,6 +6172,11 @@ impl Db {
         {
             let c = self.c();
             let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
+            for r in [role_id, team.and_then(|t| t.1)].into_iter().flatten() {
+                if role_time_bound_in(&tx, r).map_err(|e| e.to_string())? {
+                    return Err(SA_TIME_BOUND.into());
+                }
+            }
             tx.execute(
                 "INSERT INTO users (id, email, display_name, role, role_id, kind, created_at, updated_at) VALUES (?1, NULL, ?2, ?3, ?4, 'service', ?5, ?5)",
                 params![id, name, role.as_str(), role_id, at],
@@ -6205,7 +6214,13 @@ impl Db {
         let at = now();
         let res = (|| {
             if tx.execute("UPDATE service_accounts SET user_id = user_id WHERE user_id = ?1 AND deleted_at IS NULL", [id])? == 0 {
-                return Ok(false);
+                return Ok(Some(false));
+            }
+            let roles = [p.role.as_ref().and_then(|r| r.1.as_deref()), p.team.as_ref().and_then(|t| t.as_ref()).and_then(|t| t.1.as_deref())];
+            for r in roles.into_iter().flatten() {
+                if role_time_bound_in(&tx, r)? {
+                    return Ok(None);
+                }
             }
             let set = |col: &str, v: &dyn rusqlite::ToSql| tx.execute(&format!("UPDATE users SET {col} = ?1, updated_at = ?2 WHERE id = ?3"), params![v, at, id]);
             if let Some(v) = &p.name { set("display_name", v)?; }
@@ -6221,11 +6236,12 @@ impl Db {
                 own("team_id", &team.as_ref().map(|t| t.0.clone()))?;
                 own("team_role_id", &team.as_ref().and_then(|t| t.1.clone()))?;
             }
-            Ok::<_, rusqlite::Error>(true)
+            Ok::<_, rusqlite::Error>(Some(true))
         })();
         match res {
-            Ok(true) => tx.commit().map_err(|e| e.to_string()),
-            Ok(false) => Err("not found".into()),
+            Ok(Some(true)) => tx.commit().map_err(|e| e.to_string()),
+            Ok(Some(false)) => Err("not found".into()),
+            Ok(None) => Err(SA_TIME_BOUND.into()),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -10941,6 +10957,27 @@ mod tests {
         db.give_team_custom_role_until(&team.id, &b.id, &other.id, Some(soon)).unwrap();
         assert!(db.set_team_custom_role(&team.id, &b.id, None));
         assert_eq!(db.stored_role_ends(&b.id).1, None, "taken away in the team");
+    }
+
+    #[test]
+    fn a_role_made_time_bound_after_its_check_is_never_saved_on_a_service_account() {
+        let db = Db::open(&temp_path("time-bound-sa").join("app.sqlite")).unwrap();
+        let owner = db.create_user(None, Some("o@example.com"), "O", Role::Admin).unwrap();
+        let team = db.create_team("Eng", None);
+        let r = db.create_custom_role("Break glass", "", Role::Member, &["users.manage"], None).unwrap();
+        let sa = db.create_service_account("CI", "", Role::Member, None, None, &owner.id, None).unwrap();
+        // The handler checked `r` while it had no limit; one is set before the write.
+        db.update_custom_role(&r.id, None, None, None, None, Some(Some(7))).unwrap();
+        assert_eq!(db.create_service_account("X", "", Role::Member, Some(&r.id), None, &owner.id, None).err().as_deref(), Some(SA_TIME_BOUND));
+        assert_eq!(db.create_service_account("X", "", Role::Member, None, Some((&team.id, Some(&r.id))), &owner.id, None).err().as_deref(), Some(SA_TIME_BOUND));
+        let org = ServiceAccountPatch { role: Some((Role::Member, Some(r.id.clone()))), ..Default::default() };
+        assert_eq!(db.update_service_account(&sa.user.id, &org).err().as_deref(), Some(SA_TIME_BOUND));
+        let in_team = ServiceAccountPatch { team: Some(Some((team.id.clone(), Some(r.id.clone())))), ..Default::default() };
+        assert_eq!(db.update_service_account(&sa.user.id, &in_team).err().as_deref(), Some(SA_TIME_BOUND));
+        let sa = db.service_account(&sa.user.id).unwrap();
+        assert_eq!((sa.user.role_id, sa.team_id), (None, None), "nothing saved");
+        assert_eq!(db.service_accounts().len(), 1);
+        assert_eq!(db.update_service_account(&sa.user.id, &ServiceAccountPatch { name: Some("CI 2".into()), ..Default::default() }), Ok(()));
     }
 
     #[test]
