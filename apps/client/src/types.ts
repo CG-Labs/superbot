@@ -897,6 +897,9 @@ export interface AuditArchiveCheck {
   skipped?: number;
   head: ChainLink | null;
   after?: number | null;
+  /** Checkpoint timestamps checked from the archive, and how many chain to AUDIT_TIMESTAMP_CA_FILE; null when it isn't set (ADR 0207). */
+  timestamps?: number;
+  trustedTimestamps?: number | null;
   problems: number;
   firstProblem: { key: string | null; id: number | null; reason: string; error: string } | null;
   error?: string | null;
