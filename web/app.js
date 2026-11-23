@@ -1718,7 +1718,8 @@ async function loadScim() {
   try {
     const r = await api("GET", "/api/scim/tokens");
     scimTokens = r.tokens || [];
-    $("scim-info").textContent = `${r.enabled ? "SCIM is on" : "SCIM is off (set SCIM=on to turn it on)"}. Provisioned people get the ${ROLES[r.defaultRole] || r.defaultRole} role. Endpoint: ${location.origin}/scim/v2`;
+    const expiring = (r.expiringTenants || []).length ? ` Every token of ${r.expiringTenants.join(", ")} ends within ${r.warnDays} days: rotate one, or provisioning and deprovisioning stop.` : "";
+    $("scim-info").textContent = `${r.enabled ? "SCIM is on" : "SCIM is off (set SCIM=on to turn it on)"}. Provisioned people get the ${ROLES[r.defaultRole] || r.defaultRole} role. Endpoint: ${location.origin}/scim/v2.${expiring}`;
     $("scim-empty").textContent = "No SCIM tokens.";
   } catch (err) {
     scimTokens = [];
@@ -1727,10 +1728,14 @@ async function loadScim() {
   }
   loadScimRoles();
   $("scim-empty").hidden = scimTokens.length > 0;
-  $("scim-rows").innerHTML = scimTokens.map((t) => `<tr data-token="${esc(t.id)}" class="${t.revokedAt ? "revoked" : ""}">
+  const ends = (t) => t.state === "no_expiry" ? "Never (rotate it)" : `${fmt(t.expiresAt)}${t.state === "expiring" ? " (soon)" : t.state === "rotated" ? " (rotated)" : ""}`;
+  const actions = (t) => t.state === "revoked" ? `Revoked ${esc(fmt(t.revokedAt))}`
+    : t.state === "expired" ? "Expired"
+    : `${t.state === "rotated" ? "" : '<button type="button" class="btn" data-act="rotate">Rotate</button> '}<button type="button" class="btn" data-act="revoke">Revoke</button>`;
+  $("scim-rows").innerHTML = scimTokens.map((t) => `<tr data-token="${esc(t.id)}" class="${t.state === "revoked" || t.state === "expired" ? "revoked" : ""}">
       <td>${esc(t.tenant)}</td><td>${esc(t.label || "")}</td><td>${esc(t.ssoProvider || "")}</td>
-      <td>${esc(fmt(t.createdAt))}</td><td>${esc(fmt(t.lastUsedAt))}</td>
-      <td class="actions">${t.revokedAt ? `Revoked ${esc(fmt(t.revokedAt))}` : '<button type="button" class="btn" data-act="revoke">Revoke</button>'}</td>
+      <td>${esc(fmt(t.createdAt))}</td><td>${esc(fmt(t.lastUsedAt))}</td><td>${esc(ends(t))}</td>
+      <td class="actions">${actions(t)}</td>
     </tr>`).join("");
 }
 
@@ -1794,6 +1799,19 @@ $("scim-form").addEventListener("submit", async (e) => {
 });
 
 $("scim-rows").addEventListener("click", async (e) => {
+  const r = e.target.closest("button[data-act=rotate]");
+  if (r) {
+    const tok = scimTokens.find((x) => x.id === r.closest("tr").dataset.token);
+    if (!tok || !confirm(`Make a new ${tok.tenant} token? This one keeps working for 24 hours, so paste the new one into the identity provider before then.`)) return;
+    try {
+      const res = await api("POST", `/api/scim/tokens/${key(tok.id)}/rotate`, {});
+      showOnce({ title: `New SCIM token for ${res.scimToken.tenant}`, note: `Paste it into your identity provider's provisioning settings now. It can't be shown again. The old one stops at ${fmt(res.replaced.endsAt)}.`, value: res.token });
+    } catch (err) {
+      fail(err);
+    }
+    loadScim();
+    return;
+  }
   const t = e.target.closest("button[data-act=revoke]");
   if (!t) return;
   const tok = scimTokens.find((x) => x.id === t.closest("tr").dataset.token);

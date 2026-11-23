@@ -2,15 +2,15 @@
 //! creates, updates, deactivates, and deletes SuperBot users under `/scim/v2`, and with
 //! SCIM_GROUPS=on, pushes groups as teams (`groups`). The core User and Group schemas,
 //! the Enterprise User extension (ADR 0176), and Bulk (`bulk`); sorting and ETags are
-//! not supported. Each IdP connection is a tenant
-//! with its own bearer tokens (`sbp_`, stored hashed), and sees only the users it
+//! not supported. Each IdP connection is a tenant with its own bearer tokens (`sbp_`,
+//! stored hashed, expiring and rotatable, ADR 0195), and sees only the users it
 //! provisioned and the groups it made or an admin linked to it. The IdP never names a
 //! role: with SCIM_GROUP_ROLES=on, an admin may map a group to a custom role, never
 //! admin, and its members get and lose it with the group (`roles`), or declare a group a
 //! role group that gives a role and is no team (`role_groups`).
 //! Design: docs/adr/0023-scim.md, docs/adr/0095-scim-groups-as-teams.md,
 //! docs/adr/0138-scim-group-role-mapping.md, docs/adr/0176-scim-enterprise-user-extension.md,
-//! docs/adr/0180-scim-role-groups.md.
+//! docs/adr/0180-scim-role-groups.md, docs/adr/0195-scim-token-expiry-and-rotation.md.
 
 pub mod bulk;
 pub mod google;
@@ -53,6 +53,20 @@ const RATE_WINDOW_MS: i64 = 60_000;
 const FAIL_LIMIT: u32 = 20;
 const FAIL_WINDOW_MS: i64 = 10 * 60_000;
 const DOCS: &str = "https://github.com/CG-Labs/superbot/blob/main/docs/sso/scim.md";
+const DAY_MS: i64 = 86_400_000;
+const HOUR_MS: i64 = 3_600_000;
+/// A new token's life when the admin doesn't say. IdPs don't rotate SCIM secrets
+/// themselves, so it's long enough to be done by hand once a year.
+pub const DEFAULT_TOKEN_DAYS: i64 = 365;
+pub const MAX_TOKEN_DAYS: i64 = 730;
+/// How long before its end a token is audited as `scim.token_expiring`.
+pub const WARN_DAYS: i64 = 14;
+/// How long a rotated token keeps working by default, so the new one can be pasted into
+/// the IdP first, and at most.
+const DEFAULT_KEEP_HOURS: i64 = 24;
+const MAX_KEEP_HOURS: i64 = 168;
+/// How often expiry notices are looked for.
+const NOTICE_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
 
 pub struct Scim {
     /// SCIM=on. Off by default: `/scim/v2` answers 404.
@@ -271,16 +285,20 @@ fn actor(a: &Auth, t: &ScimToken) -> Actor {
     }
 }
 
-/// A missing, unknown, or revoked token, throttled per IP. Never what was sent; for a
-/// revoked one, which token it was, since a revoked token still in use may have leaked.
-fn auth_failed(a: &Auth, app: &AppState, source: &Source, reason: &str, revoked: Option<&ScimToken>) {
+/// A missing, unknown, revoked, or expired token, throttled per IP. Never what was sent;
+/// for a known one, which token it was: a revoked token still in use may have leaked, and
+/// an expired one means the IdP's provisioning has stopped.
+fn auth_failed(a: &Auth, app: &AppState, source: &Source, reason: &str, known: Option<&ScimToken>) {
     let Some(missed) = a.logins.failure(&format!("{}|scim", source.ip.as_deref().unwrap_or("")), db::now()) else { return };
     let actor = Actor { kind: ActorKind::System, id: Some("scim".into()), method: Some("scim_token".into()), ..Default::default() };
     let who = Who { actor, source: source.clone() };
     let mut details = json!({ "reason": reason, "unloggedSinceLast": missed });
     let mut e = who.event("scim.auth_failed").outcome(Outcome::Failure);
-    if let Some(t) = revoked {
+    if let Some(t) = known {
         details["tenant"] = json!(t.tenant);
+        if t.rotated_to.is_some() {
+            details["rotatedTo"] = json!(t.rotated_to);
+        }
         e = e.target("scim_token", &t.id);
     }
     app.db.record(&e.details(details));
@@ -321,13 +339,14 @@ pub async fn guard(State(a): State<Arc<Auth>>, mut req: Request, next: Next) -> 
             return too_many(retry);
         }
         a.scim.failures.fail(&ip, at);
-        let revoked = hash.as_deref().and_then(|h| app.db.scim_token_by_hash(h));
-        let reason = match (&revoked, token.is_empty()) {
-            (Some(_), _) => "revoked",
+        let known = hash.as_deref().and_then(|h| app.db.scim_token_by_hash(h));
+        let reason = match (&known, token.is_empty()) {
+            (Some(k), _) if k.revoked_at.is_some() => "revoked",
+            (Some(_), _) => "expired",
             (None, true) => "missing",
             (None, false) => "unknown",
         };
-        auth_failed(&a, &app, &source, reason, revoked.as_ref());
+        auth_failed(&a, &app, &source, reason, known.as_ref());
         let mut r = ScimError::new(StatusCode::UNAUTHORIZED, None, "A valid SCIM bearer token is required.").into_response();
         r.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer realm=\"SuperBot SCIM\""));
         return r;
@@ -1197,20 +1216,80 @@ fn tenant_name(v: &Value) -> Res<String> {
     ok.then(|| t.to_string()).ok_or_else(|| bad("tenant must be 1 to 32 lowercase letters, digits, or dashes, like entra or okta"))
 }
 
-/// `GET /api/scim/tokens`: every token (never a value), and whether SCIM is on.
-pub async fn list_tokens(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>) -> Json<Value> {
-    Json(json!({ "enabled": a.scim.enabled, "defaultRole": a.scim.default_role, "groups": a.scim.groups, "groupRoles": a.scim.group_roles, "tokens": app.db.scim_tokens() }))
+/// Where a token is at `at`: `revoked`, `expired` (a rotated one whose overlap ended
+/// too), `rotated` (still working until its `expiresAt`), `expiring` (within WARN_DAYS),
+/// `active`, or `no_expiry` (made before tokens expired).
+pub fn token_state(t: &ScimToken, at: i64) -> &'static str {
+    match (t.revoked_at, t.expires_at, &t.rotated_to) {
+        (Some(_), _, _) => "revoked",
+        (None, Some(e), _) if e <= at => "expired",
+        (None, _, Some(_)) => "rotated",
+        (None, None, None) => "no_expiry",
+        (None, Some(e), None) if e - at <= WARN_DAYS * DAY_MS => "expiring",
+        _ => "active",
+    }
 }
 
-/// `POST /api/scim/tokens {tenant, label?, sso?}`. `sso` names a configured SSO provider
-/// whose subjects this tenant's `externalId`s are; a tenant's first token sets it for
-/// good. The token is returned once; only its hash is kept.
+/// Whether the tenant has a working token, and when its provisioning stops if nobody
+/// rotates: the latest end of its working tokens, None if one never expires.
+fn tenant_ends(tokens: &[ScimToken], tenant: &str, at: i64) -> (bool, Option<i64>) {
+    let live: Vec<&ScimToken> = tokens.iter().filter(|t| t.tenant == tenant && t.revoked_at.is_none() && t.expires_at.is_none_or(|e| e > at)).collect();
+    let ends = if live.iter().any(|t| t.expires_at.is_none()) { None } else { live.iter().filter_map(|t| t.expires_at).max() };
+    (!live.is_empty(), ends)
+}
+
+/// Tenants with a working token whose every working token ends within WARN_DAYS: their
+/// provisioning, deprovisioning included, stops then unless someone rotates.
+pub fn tenants_expiring(tokens: &[ScimToken], at: i64) -> Vec<String> {
+    let mut names: Vec<String> = tokens.iter().map(|t| t.tenant.clone()).collect();
+    names.sort();
+    names.dedup();
+    names.retain(|n| matches!(tenant_ends(tokens, n, at), (true, Some(e)) if e - at <= WARN_DAYS * DAY_MS));
+    names
+}
+
+fn token_view(t: &ScimToken, at: i64) -> Value {
+    let mut v = json!(t);
+    v["state"] = json!(token_state(t, at));
+    v
+}
+
+/// `GET /api/scim/tokens`: every token (never a value) with its state, whether SCIM is
+/// on, and the tenants whose tokens all end within WARN_DAYS.
+pub async fn list_tokens(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>) -> Json<Value> {
+    let at = db::now();
+    let tokens = app.db.scim_tokens();
+    Json(json!({
+        "enabled": a.scim.enabled, "defaultRole": a.scim.default_role, "groups": a.scim.groups, "groupRoles": a.scim.group_roles,
+        "tokens": tokens.iter().map(|t| token_view(t, at)).collect::<Vec<_>>(),
+        "expiringTenants": tenants_expiring(&tokens, at), "warnDays": WARN_DAYS, "defaultDays": DEFAULT_TOKEN_DAYS, "maxDays": MAX_TOKEN_DAYS,
+    }))
+}
+
+/// A whole number from `lo` to `hi`, or `default` when it's missing.
+fn whole(v: &Value, name: &str, lo: i64, hi: i64, default: i64) -> Res<i64> {
+    match v {
+        Value::Null => Ok(default),
+        Value::Number(n) => n.as_i64().filter(|d| (lo..=hi).contains(d)).ok_or_else(|| bad(format!("{name} must be a whole number, {lo} to {hi}"))),
+        _ => Err(bad(format!("{name} must be a whole number, {lo} to {hi}"))),
+    }
+}
+
+fn token_days(v: &Value) -> Res<i64> {
+    whole(v, "expiresInDays", 1, MAX_TOKEN_DAYS, DEFAULT_TOKEN_DAYS)
+}
+
+/// `POST /api/scim/tokens {tenant, label?, sso?, expiresInDays?}`. `sso` names a
+/// configured SSO provider whose subjects this tenant's `externalId`s are; a tenant's
+/// first token sets it for good. It expires after `expiresInDays` (default 365, at most
+/// 730). The token is returned once; only its hash is kept.
 pub async fn create_token(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<Response> {
     let tenant = tenant_name(&v["tenant"])?;
     if a.scim.google.as_ref().is_some_and(|g| g.settings.tenant == tenant) {
         return Err(ApiError(StatusCode::CONFLICT, format!("Tenant {tenant} is the Google Workspace sync's (GOOGLE_DIRECTORY_TENANT), and it must be its only writer. Use another tenant name.")));
     }
     let label = users::clean_label(&v["label"]);
+    let expires_at = db::now() + token_days(&v["expiresInDays"])? * DAY_MS;
     let sso = match &v["sso"] {
         Value::Null => None,
         Value::String(s) if s.trim().is_empty() => None,
@@ -1225,14 +1304,88 @@ pub async fn create_token(State(app): State<AppState>, Extension(a): Extension<A
         p.issuer_for(None).map_err(|e| bad(format!("SCIM can't link {pid}: {e}")))?;
     }
     let token = users::new_secret(TOKEN_PREFIX);
-    let t = app.db.create_scim_token(&tenant, label.as_deref(), sso.as_deref(), &users::hash(&token), by.actor.id.as_deref()).map_err(|first| {
+    let t = app.db.create_scim_token(&tenant, label.as_deref(), sso.as_deref(), &users::hash(&token), by.actor.id.as_deref(), expires_at).map_err(|first| {
         let had = first.map_or("no SSO provider".to_string(), |p| format!("the SSO provider {p}"));
         ApiError(StatusCode::CONFLICT, format!("Tenant {tenant} links {had}; its tokens all must. Use a new tenant name for another link."))
     })?;
-    app.db.record(&by.event("scim.token_created").target("scim_token", &t.id).details(json!({ "tenant": t.tenant, "label": t.label, "sso": t.sso_provider })));
-    let mut res = (StatusCode::CREATED, Json(json!({ "token": token, "scimToken": t, "enabled": a.scim.enabled }))).into_response();
+    app.db.record(&by.event("scim.token_created").target("scim_token", &t.id).details(json!({ "tenant": t.tenant, "label": t.label, "sso": t.sso_provider, "expiresAt": t.expires_at })));
+    let mut res = (StatusCode::CREATED, Json(json!({ "token": token, "scimToken": token_view(&t, db::now()), "enabled": a.scim.enabled }))).into_response();
     res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(res)
+}
+
+/// `POST /api/scim/tokens/{id}/rotate {expiresInDays?, keepOldHours?}`: a new token for
+/// the same tenant, label and SSO link. The old one keeps working for `keepOldHours`
+/// (default 24, at most 168; 0 stops it now), so the new one can be pasted into the IdP
+/// before it stops, and is never rotated again. The new token is returned once.
+pub async fn rotate_token(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res<Response> {
+    if !v.is_object() && !v.is_null() {
+        return Err(bad("Send an object: {expiresInDays?, keepOldHours?}"));
+    }
+    if let Some(k) = v.as_object().and_then(|o| o.keys().find(|k| !["expiresInDays", "keepOldHours"].contains(&k.as_str()))) {
+        return Err(bad(format!("Unknown field {k}: send expiresInDays and keepOldHours only")));
+    }
+    let at = db::now();
+    let old = app.db.scim_token(&id).ok_or_else(|| not_found("SCIM token"))?;
+    if matches!(token_state(&old, at), "revoked" | "expired" | "rotated") {
+        return Err(ApiError(StatusCode::CONFLICT, "This token is revoked, expired, or rotated already. Make a new one with botctl scim token create.".into()));
+    }
+    let expires_at = at + token_days(&v["expiresInDays"])? * DAY_MS;
+    let keep = whole(&v["keepOldHours"], "keepOldHours", 0, MAX_KEEP_HOURS, DEFAULT_KEEP_HOURS)?;
+    let keep_until = (keep > 0).then_some(at + keep * HOUR_MS);
+    let token = users::new_secret(TOKEN_PREFIX);
+    let t = app
+        .db
+        .rotate_scim_token(&old.id, &users::hash(&token), expires_at, keep_until, by.actor.id.as_deref())
+        .ok_or_else(|| ApiError(StatusCode::CONFLICT, "This token was revoked, expired, or rotated meanwhile.".into()))?;
+    let old_ends = keep_until.map_or(at, |u| old.expires_at.map_or(u, |e| e.min(u)));
+    app.db.record(&by.event("scim.token_rotated").target("scim_token", &old.id).details(json!({
+        "tenant": old.tenant, "label": old.label, "to": t.id, "oldEndsAt": old_ends, "expiresAt": t.expires_at,
+    })));
+    let replaced = json!({ "id": old.id, "endsAt": old_ends });
+    let mut res = (StatusCode::CREATED, Json(json!({ "token": token, "scimToken": token_view(&t, at), "replaced": replaced, "enabled": a.scim.enabled }))).into_response();
+    res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(res)
+}
+
+/// Audits each token's coming end once, `WARN_DAYS` ahead, as `scim.token_expiring`, and
+/// its end once, as `scim.token_expired`, with whether its tenant still has a working
+/// token: without one, the IdP can't deprovision anyone. Rotated and revoked tokens end
+/// as planned and get neither. Returns how many were recorded.
+pub fn expiry_notices(app: &AppState, at: i64) -> usize {
+    let due = app.db.scim_tokens_due_notice(at, WARN_DAYS * DAY_MS);
+    if due.is_empty() {
+        return 0;
+    }
+    let tokens = app.db.scim_tokens();
+    let who = Who::system("scim");
+    let mut n = 0;
+    for (t, notice) in due {
+        if !app.db.set_scim_token_notice(&t.id, t.expiry_notice.as_deref(), notice) {
+            continue;
+        }
+        let (working, ends) = tenant_ends(&tokens, &t.tenant, at);
+        let (action, outcome) = if notice == "expired" { ("scim.token_expired", Outcome::Failure) } else { ("scim.token_expiring", Outcome::Success) };
+        let details = json!({
+            "tenant": t.tenant, "label": t.label, "expiresAt": t.expires_at,
+            "daysLeft": t.expires_at.map(|e| ((e - at).max(0) + DAY_MS - 1) / DAY_MS),
+            "tenantWorking": working, "tenantEndsAt": if working { ends } else { Some(at) },
+        });
+        app.db.record(&who.event(action).target("scim_token", &t.id).outcome(outcome).details(details));
+        n += 1;
+    }
+    n
+}
+
+/// Looks for expiry notices now and every 10 minutes.
+pub fn start(app: AppState) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(NOTICE_EVERY);
+        loop {
+            tick.tick().await;
+            expiry_notices(&app, db::now());
+        }
+    });
 }
 
 /// `DELETE /api/scim/tokens/{id}`. The tenant's users stay as they are.
