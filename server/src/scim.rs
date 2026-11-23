@@ -6,13 +6,16 @@
 //! with its own bearer tokens (`sbp_`, stored hashed), and sees only the users it
 //! provisioned and the groups it made or an admin linked to it. The IdP never names a
 //! role: with SCIM_GROUP_ROLES=on, an admin may map a group to a custom role, never
-//! admin, and its members get and lose it with the group (`roles`).
+//! admin, and its members get and lose it with the group (`roles`), or declare a group a
+//! role group that gives a role and is no team (`role_groups`).
 //! Design: docs/adr/0023-scim.md, docs/adr/0095-scim-groups-as-teams.md,
-//! docs/adr/0138-scim-group-role-mapping.md, docs/adr/0176-scim-enterprise-user-extension.md.
+//! docs/adr/0138-scim-group-role-mapping.md, docs/adr/0176-scim-enterprise-user-extension.md,
+//! docs/adr/0180-scim-role-groups.md.
 
 pub mod bulk;
 pub mod google;
 pub mod groups;
+pub mod role_groups;
 pub mod roles;
 
 use crate::audit::{Actor, ActorKind, Outcome, Source, Who};
@@ -1165,6 +1168,7 @@ pub async fn delete_user(State(app): State<AppState>, Extension(a): Extension<Ar
     crate::machines::offboard::left(&app, &c.who, &id, crate::machines::offboard::DEPROVISIONED);
     let left = groups::user_deleted(&app, &a, &c, &id).await;
     roles::user_deleted(&app, &a, &c.who, &id).await;
+    role_groups::user_deleted(&app, &a, &c.who, &id).await;
     crate::deprovision::user_disabled(&app, &c.who, &id, crate::deprovision::SCIM_DELETE).await;
     left.map_err(server_error)?;
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -1261,6 +1265,7 @@ mod tests {
             assert!(text.contains("SCIM_GROUP_ROLES"), "{name} documents SCIM_GROUP_ROLES");
             assert!(google::Settings::from_env(&|k| get(k).to_string(), &s, &|_| None).unwrap_or_else(|e| panic!("{name}: {e}")).is_none(), "{name}");
             assert!(vars.contains_key("GOOGLE_DIRECTORY_SYNC") && text.contains("GOOGLE_DIRECTORY_GROUPS"), "{name} documents the Google Workspace sync");
+            assert!(text.contains("GOOGLE_DIRECTORY_ROLE_GROUPS"), "{name} documents the sync's role groups");
         }
     }
 

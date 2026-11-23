@@ -1734,24 +1734,30 @@ async function loadScim() {
     </tr>`).join("");
 }
 
-// SCIM groups mapped to custom roles (ADR 0138): listed and removed here; made with botctl.
+// SCIM groups mapped to custom roles (ADR 0138), and role groups (ADR 0180): listed and
+// removed here; made with botctl.
 async function loadScimRoles() {
-  let maps = [];
+  let maps = [], groups = [];
   try {
-    const r = await api("GET", "/api/scim/role-mappings");
+    const [r, g] = await Promise.all([api("GET", "/api/scim/role-mappings"), api("GET", "/api/scim/role-groups")]);
     maps = r.mappings || [];
+    groups = g.roleGroups || [];
     $("scim-roles-info").textContent = r.enabled
-      ? "Members of a mapped group hold its custom role while they're in it. Map one with botctl scim role map <team> <role> [--org]. Never admin."
-      : "Group roles are off (SCIM_GROUP_ROLES=on, with SCIM_GROUPS=on, turns them on). Roles that mappings gave are still taken back when people leave.";
+      ? "Members of a mapped group, or of a role group, hold its custom role while they're in it. Map a team's group with botctl scim role map <team> <role> [--org]; declare a role group with botctl scim role-group add <tenant> <group> <role>. Never admin."
+      : "Group roles are off (SCIM_GROUP_ROLES=on, with SCIM_GROUPS=on, turns them on). Roles that mappings and role groups gave are still taken back when people leave.";
     $("scim-roles-empty").textContent = "No groups are mapped to roles.";
   } catch (err) {
     $("scim-roles-info").textContent = "";
     $("scim-roles-empty").textContent = err.message;
   }
-  $("scim-roles-empty").hidden = maps.length > 0;
+  $("scim-roles-empty").hidden = maps.length + groups.length > 0;
   $("scim-roles-rows").innerHTML = maps.map((m) => `<tr data-mapping="${esc(m.id)}">
       <td>${esc(m.group || m.team.name || m.team.id)}</td><td>${esc(m.tenant)}</td><td>${esc(m.role ? m.role.name : "")}</td>
       <td>${m.scope === "org" ? "Across the server" : "In its team"}</td><td>${esc(String(m.grants))}</td>
+      <td class="actions"><button type="button" class="btn" data-act="unmap">Remove</button></td>
+    </tr>`).join("") + groups.map((g) => `<tr data-role-group="${esc(g.id)}">
+      <td>${esc(g.displayName)}</td><td>${esc(g.tenant)}</td><td>${esc(g.role ? g.role.name : "")}</td>
+      <td>Role group, across the server${g.state === "waiting" ? " (waiting for the IdP)" : ""}</td><td>${esc(String(g.grants))}</td>
       <td class="actions"><button type="button" class="btn" data-act="unmap">Remove</button></td>
     </tr>`).join("");
 }
@@ -1759,9 +1765,15 @@ async function loadScimRoles() {
 $("scim-roles-rows").addEventListener("click", async (e) => {
   const t = e.target.closest("button[data-act=unmap]");
   if (!t) return;
-  const id = t.closest("tr").dataset.mapping;
+  const row = t.closest("tr");
+  if (row.dataset.roleGroup) {
+    if (!confirm("Remove this role group? Everyone it gave the role to loses it, and if the IdP still pushes the group it becomes a team. Take it out of the IdP's provisioning first. Roles given by hand stay.")) return;
+    try { await api("DELETE", `/api/scim/role-groups/${key(row.dataset.roleGroup)}`); } catch (err) { fail(err); }
+    loadScimRoles();
+    return;
+  }
   if (!confirm("Remove this mapping? Everyone it gave the role to loses it. Roles given by hand stay.")) return;
-  try { await api("DELETE", `/api/scim/role-mappings/${key(id)}`); } catch (err) { fail(err); }
+  try { await api("DELETE", `/api/scim/role-mappings/${key(row.dataset.mapping)}`); } catch (err) { fail(err); }
   loadScimRoles();
 });
 
