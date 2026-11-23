@@ -123,6 +123,9 @@ pub struct Provider {
     pub(super) sp_key: Mutex<Option<Arc<SpKey>>>,
     /// Native SAML: our encryption key, likewise (ADR 0150).
     pub(super) enc_key: Mutex<Option<Arc<SpKey>>>,
+    /// Native SAML: botd's generated keys and their rollovers, signing then encryption, once
+    /// loaded (ADR 0181). Configured keys are in `sp_key` and `enc_key` instead.
+    pub(super) held: [Mutex<Option<Arc<super::saml_keys::Held>>>; 2],
     /// Native SAML: metadata from the URL refused for its signature or validity, not yet audited.
     metadata_refused: Mutex<Option<MetadataRefused>>,
 }
@@ -269,7 +272,7 @@ async fn get_text(http: &reqwest::Client, url: &str) -> Result<String, Invalid> 
 
 impl Provider {
     pub fn new(id: &str, label: &str, kind: Kind, client_id: &str, scopes: &str, jit_role: Option<Role>) -> Provider {
-        Provider { id: id.into(), label: label.into(), kind, client_id: client_id.into(), scopes: scopes.into(), jit_role, cache: Default::default(), idp: Mutex::default(), sp_key: Mutex::default(), enc_key: Mutex::default(), metadata_refused: Mutex::default() }
+        Provider { id: id.into(), label: label.into(), kind, client_id: client_id.into(), scopes: scopes.into(), jit_role, cache: Default::default(), idp: Mutex::default(), sp_key: Mutex::default(), enc_key: Mutex::default(), held: Default::default(), metadata_refused: Mutex::default() }
     }
 
     pub fn type_name(&self) -> &'static str {

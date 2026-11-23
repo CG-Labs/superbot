@@ -381,6 +381,127 @@ async fn checking_the_archive_catches_its_first_objects_gone_and_reads_null_vers
     assert_eq!(v["archive"]["firstProblems"][0]["id"].as_i64(), Some(from), "{v}");
 }
 
+/// The last `audit.verified` event's details and outcome.
+fn last_verified(app: &App) -> (String, Value) {
+    let e = app.db.audit_events(&crate::audit::Filter { actions: vec!["audit.verified".into()], ..Default::default() }, 1, false).remove(0);
+    (e.outcome, e.details)
+}
+
+/// The keys botd read a version of, in order.
+fn read_keys(s: &StandIn) -> Vec<String> {
+    s.w().calls.iter().filter(|c| c.starts_with("GET /backups/audit/prod/") && c.contains("versionId=")).map(|c| c["GET /backups/".len()..].split('?').next().unwrap().to_string()).collect()
+}
+
+/// As if every version so far was written two days ago.
+fn age_store(s: &StandIn) {
+    for at in s.w().written.values_mut() {
+        *at -= 2 * 86_400_000;
+    }
+}
+
+#[tokio::test]
+async fn the_daily_check_reads_whats_new_since_its_last_pass() {
+    let (port, app, admin, _) = serve_app().await;
+    let s = StandIn::start().await;
+    s.w().versioning = Some("Enabled");
+    s.w().object_lock = Some(DEFAULT_RETENTION.into());
+    export_to(&app, &vars(&s, &[]));
+    let x = app.audit_export.get().unwrap().clone();
+    let sink = x.archive().unwrap().0.sink.id.clone();
+    for _ in 0..3 {
+        archive_round(&app, &x, 2).await;
+    }
+
+    // The first daily check has no pass to carry on from, so it reads the whole archive.
+    let before = s.keys();
+    crate::audit_chain::daily(&app).await;
+    let (outcome, d) = last_verified(&app);
+    assert_eq!((outcome.as_str(), d["archive"]["ok"].as_bool(), d["archive"]["after"].as_i64()), ("success", Some(true), None), "{d}");
+    let checked = d["archive"]["objects"].as_u64().unwrap();
+    assert!(checked >= before.len() as u64, "{d}");
+    let pass = crate::audit_archive_verify::last_pass(&app, &sink).expect("a pass saved");
+    assert_eq!(Some(pass.head.id), d["archive"]["head"]["id"].as_i64());
+    let chain = parse(&call(port, "GET", "/api/audit/chain", &admin, "").await.1);
+    assert_eq!(chain["verification"]["archive"]["ok"], true, "the app shows the archive's part: {chain}");
+
+    // A day on: only the objects archived since are read, and the chain picks up from the head.
+    age_store(&s);
+    archive_round(&app, &x, 2).await;
+    archive_round(&app, &x, 2).await;
+    s.w().calls.clear();
+    crate::audit_chain::daily(&app).await;
+    let (outcome, d) = last_verified(&app);
+    let a = &d["archive"];
+    assert_eq!((outcome.as_str(), a["ok"].as_bool(), a["after"].as_i64()), ("success", Some(true), Some(pass.head.id)), "{d}");
+    let read = read_keys(&s);
+    assert!(!read.is_empty() && read.iter().all(|k| !before.contains(k)), "only new objects: {read:?}");
+    assert_eq!((a["objects"].as_u64(), a["skipped"].as_u64()), (Some(read.len() as u64), Some(checked)), "{a}");
+    assert!(a["first"].as_i64() > Some(pass.head.id), "{a}");
+    let next = crate::audit_archive_verify::last_pass(&app, &sink).unwrap();
+    assert!(next.head.id > pass.head.id && next.at > pass.at);
+
+    // A batch already checked, copied to a new key with its details changed: the store says
+    // it was written since, so it's read, and it no longer says what this server's rows do.
+    age_store(&s);
+    let original = before.iter().find(|k| String::from_utf8_lossy(&s.w().objects[*k]).contains("\"details\":{\"n\":0}")).unwrap().clone();
+    let copy = format!("audit/prod/2099/01/01/{}", original.rsplit('/').next().unwrap());
+    let (meta, _) = s.w().meta[&original].clone();
+    let changed = String::from_utf8(s.w().objects[&original].clone()).unwrap().replacen("\"details\":{\"n\":0}", "\"details\":{\"n\":7}", 1);
+    use base64::Engine;
+    let sum = base64::engine::general_purpose::STANDARD.encode(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, changed.as_bytes()).as_ref());
+    let mut h: Vec<(&str, String)> = meta.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    h.push(("x-amz-checksum-sha256", sum));
+    let c = machines::s3::S3::new(s.settings()).unwrap();
+    c.put_with(&copy, changed.into_bytes(), &h).await.unwrap();
+    crate::audit_chain::daily(&app).await;
+    let (outcome, d) = last_verified(&app);
+    assert_eq!((outcome.as_str(), d["reason"].as_str(), d["archive"]["firstProblem"]["reason"].as_str()), ("failure", Some("archive"), Some("contents")), "{d}");
+    assert_eq!(crate::audit_archive_verify::last_pass(&app, &sink), Some(next.clone()), "a failed check doesn't move the last pass");
+
+    // Off: the daily check leaves the archive alone.
+    let (_, app2, _, _) = serve_app().await;
+    let s2 = StandIn::start().await;
+    export_to(&app2, &vars(&s2, &[("AUDIT_EXPORT_S3_LOCK", "off"), ("AUDIT_EXPORT_S3_CHECK", "off")]));
+    let x2 = app2.audit_export.get().unwrap().clone();
+    archive_round(&app2, &x2, 2).await;
+    crate::audit_chain::daily(&app2).await;
+    let (outcome, d) = last_verified(&app2);
+    assert_eq!((outcome.as_str(), d.get("archive")), ("success", None), "{d}");
+    assert!(read_keys(&s2).is_empty());
+}
+
+#[tokio::test]
+async fn the_daily_check_catches_a_log_rebuilt_where_it_already_checked() {
+    let (port, app, admin, _) = serve_app().await;
+    let s = StandIn::start().await;
+    export_to(&app, &vars(&s, &[("AUDIT_EXPORT_S3_LOCK", "off")]));
+    let x = app.audit_export.get().unwrap().clone();
+    let sink = x.archive().unwrap().0.sink.id.clone();
+    for _ in 0..3 {
+        archive_round(&app, &x, 2).await;
+    }
+    // A whole check by hand that passes is where the daily check picks up, too.
+    assert_eq!(verify_archive(port, &admin, "").await["archive"]["ok"], true);
+    let pass = crate::audit_archive_verify::last_pass(&app, &sink).expect("a pass saved");
+    assert!(verify_archive(port, &admin, "&from=2").await["archive"]["ok"] == true);
+    assert_eq!(crate::audit_archive_verify::last_pass(&app, &sink), Some(pass.clone()), "a range doesn't move it");
+    age_store(&s);
+    s.w().calls.clear();
+
+    // Someone with the database changes an event the last pass covered and rebuilds the
+    // chain from it. Those objects aren't read again, but the head they reached moved.
+    app.db.execute_raw("DROP TRIGGER audit_events_no_update").unwrap();
+    app.db.execute_raw("UPDATE audit_events SET details = '{\"n\":99}' WHERE id = 2").unwrap();
+    assert!(crate::audit_chain::reseal_from(&app.db, 2) > 0);
+    crate::audit_chain::daily(&app).await;
+    let (outcome, d) = last_verified(&app);
+    assert_eq!((outcome.as_str(), d["reason"].as_str()), ("failure", Some("archive")), "{d}");
+    let first = &d["archive"]["firstProblem"];
+    assert_eq!((first["reason"].as_str(), first["id"].as_i64()), (Some("mismatch"), Some(pass.head.id)), "{d}");
+    assert!(first["error"].as_str().unwrap().contains("the log was rebuilt"), "{d}");
+    assert!(read_keys(&s).iter().all(|k| crate::audit_archive_verify::ids("audit/prod", k).unwrap().1 > pass.head.id), "objects already checked aren't read again");
+}
+
 /// A webhook collector that answers 503 while `down` is set, then takes every batch.
 async fn flaky_collector(down: Arc<std::sync::atomic::AtomicBool>) -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
     let got: Arc<std::sync::Mutex<Vec<Value>>> = Default::default();

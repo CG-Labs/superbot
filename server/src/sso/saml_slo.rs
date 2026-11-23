@@ -45,8 +45,9 @@ pub struct Expect<'a> {
     /// Our SLO URL: the `Destination`.
     pub slo_url: &'a str,
     pub now_ms: i64,
-    /// Our encryption key, when the provider has one (ADR 0150), for an `EncryptedID` (ADR 0151).
-    pub decrypt: Option<&'a SpKey>,
+    /// Our encryption keys, when the provider has one (ADR 0150), for an `EncryptedID` (ADR 0151):
+    /// the one in use, then any a rollover holds beside it (ADR 0181).
+    pub decrypt: &'a [&'a SpKey],
 }
 
 /// A logout message that passed. `until_ms` is how long to remember its ID to refuse it again.
@@ -310,11 +311,11 @@ mod tests {
     }
 
     fn redirect(l: &Logout) -> Result<Received, &'static str> {
-        receive(&Incoming::Redirect(&l.redirect()), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).map_err(|e| e.0)
+        receive(&Incoming::Redirect(&l.redirect()), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: &[] }).map_err(|e| e.0)
     }
 
     fn post(l: &Logout) -> Result<Received, &'static str> {
-        receive(&Incoming::Post(&l.post()), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).map_err(|e| e.0)
+        receive(&Incoming::Post(&l.post()), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: &[] }).map_err(|e| e.0)
     }
 
     fn request() -> Logout {
@@ -348,24 +349,24 @@ mod tests {
         let signed = l.redirect();
         let forged = Logout { name_id: "00u1EVE".into(), signer: None, ..l.clone() }.redirect();
         let q = format!("{}&{}", forged.split('&').next().unwrap(), signed.split_once('&').unwrap().1);
-        assert_eq!(receive(&Incoming::Redirect(&q), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "bad_signature");
+        assert_eq!(receive(&Incoming::Redirect(&q), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: &[] }).unwrap_err().0, "bad_signature");
         let mut form = l.post();
         let xml = String::from_utf8(STANDARD.decode(&form["SAMLRequest"]).unwrap()).unwrap().replace("00u1ADA", "00u1EVE");
         form.insert("SAMLRequest".into(), STANDARD.encode(xml));
-        assert_eq!(receive(&Incoming::Post(&form), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "bad_signature");
+        assert_eq!(receive(&Incoming::Post(&form), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: &[] }).unwrap_err().0, "bad_signature");
 
         // A signature over another element, or a second message beside the signed one.
         let mut form = l.post();
         let xml = String::from_utf8(STANDARD.decode(&form["SAMLRequest"]).unwrap()).unwrap();
         let moved = xml.replacen("<ds:Signature", "<samlp:Extensions><ds:Signature", 1).replacen("</ds:Signature>", "</ds:Signature></samlp:Extensions>", 1);
         form.insert("SAMLRequest".into(), STANDARD.encode(moved));
-        assert_eq!(receive(&Incoming::Post(&form), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "wrapped");
+        assert_eq!(receive(&Incoming::Post(&form), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: &[] }).unwrap_err().0, "wrapped");
         let doubled = xml.replacen("<saml:NameID", &format!(r#"<samlp:Extensions><x ID="{}"/></samlp:Extensions><saml:NameID"#, l.id), 1);
         form.insert("SAMLRequest".into(), STANDARD.encode(doubled));
-        assert_eq!(receive(&Incoming::Post(&form), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "wrapped");
+        assert_eq!(receive(&Incoming::Post(&form), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: &[] }).unwrap_err().0, "wrapped");
         let comment = xml.replace("00u1ADA-Persistent", "00u1ADA<!---->-Persistent");
         form.insert("SAMLRequest".into(), STANDARD.encode(comment));
-        assert_eq!(receive(&Incoming::Post(&form), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "bad_message");
+        assert_eq!(receive(&Incoming::Post(&form), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: &[] }).unwrap_err().0, "bad_message");
     }
 
     #[test]
@@ -386,16 +387,16 @@ mod tests {
         let l = request();
         let encrypted = l.xml().replacen(r#"<saml:NameID Format="urn:oasis:names:tc:SAML:2.0:nameid-format:persistent">00u1ADA-Persistent</saml:NameID>"#, "<saml:EncryptedID><x/></saml:EncryptedID>", 1);
         let q = l.redirect_xml(&encrypted);
-        assert_eq!(receive(&Incoming::Redirect(&q), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "encrypted_id");
+        assert_eq!(receive(&Incoming::Redirect(&q), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: &[] }).unwrap_err().0, "encrypted_id");
         let expired = l.xml().replacen(r#" Version="2.0""#, &format!(r#" Version="2.0" NotOnOrAfter="{}""#, instant(NOW - SKEW_MS - 1)), 1);
-        assert_eq!(receive(&Incoming::Redirect(&l.redirect_xml(&expired)), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "expired");
+        assert_eq!(receive(&Incoming::Redirect(&l.redirect_xml(&expired)), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: &[] }).unwrap_err().0, "expired");
         let dtd = format!(r#"<!DOCTYPE r [<!ENTITY x SYSTEM "file:///etc/passwd">]>{}"#, l.xml());
-        assert_eq!(receive(&Incoming::Redirect(&l.redirect_xml(&dtd)), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "bad_message");
+        assert_eq!(receive(&Incoming::Redirect(&l.redirect_xml(&dtd)), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: &[] }).unwrap_err().0, "bad_message");
         let authn = l.xml().replace("LogoutRequest", "AuthnRequest");
-        assert_eq!(receive(&Incoming::Redirect(&l.redirect_xml(&authn)), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "bad_message");
+        assert_eq!(receive(&Incoming::Redirect(&l.redirect_xml(&authn)), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: &[] }).unwrap_err().0, "bad_message");
         let as_response = Logout::response(SLO, "_ours", NOW);
         let swapped = Logout { signer: None, ..l.clone() }.redirect().replacen("SAMLRequest=", "SAMLResponse=", 1);
-        assert_eq!(receive(&Incoming::Redirect(&swapped), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "bad_message", "a request posing as a response");
+        assert_eq!(receive(&Incoming::Redirect(&swapped), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: &[] }).unwrap_err().0, "bad_message", "a request posing as a response");
         assert!(redirect(&as_response).is_ok());
     }
 
@@ -405,11 +406,11 @@ mod tests {
         let (other, _) = SpKey::generate("someone else").unwrap();
         let mut l = request();
         l.encrypt_name_id_to = Some(key.cert.clone());
-        let with = |k: Option<&SpKey>, form: &HashMap<String, String>| receive(&Incoming::Post(form), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: k }).map_err(|e| e.0);
+        let with = |k: Option<&SpKey>, form: &HashMap<String, String>| receive(&Incoming::Post(form), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: k.as_slice() }).map_err(|e| e.0);
         let form = l.post();
         assert!(matches!(with(Some(&key), &form), Ok(Received::Request { name_id, .. }) if name_id == "00u1ADA-Persistent"), "over HTTP-POST");
         let q = l.redirect();
-        let got = receive(&Incoming::Redirect(&q), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: Some(&key) }).map_err(|e| e.0);
+        let got = receive(&Incoming::Redirect(&q), &Expect { idp: &idp(), slo_url: SLO, now_ms: NOW, decrypt: &[&key] }).map_err(|e| e.0);
         assert!(matches!(got, Ok(Received::Request { name_id, .. }) if name_id == "00u1ADA-Persistent"), "over HTTP-Redirect");
         assert_eq!(with(None, &form), Err("encrypted_id"), "no encryption key: refused, as before");
         assert_eq!(with(Some(&other), &form), Err("bad_encryption"), "encrypted to another key");
@@ -439,10 +440,10 @@ mod tests {
             let mut l = request();
             l.signer = Some(s);
             for incoming in [Incoming::Redirect(&l.redirect()), Incoming::Post(&l.post())] {
-                assert!(matches!(receive(&incoming, &Expect { idp: &idp, slo_url: SLO, now_ms: NOW, decrypt: None }), Ok(Received::Request { .. })), "signer {s}");
+                assert!(matches!(receive(&incoming, &Expect { idp: &idp, slo_url: SLO, now_ms: NOW, decrypt: &[] }), Ok(Received::Request { .. })), "signer {s}");
             }
             l.signer = Some(if s == 2 { 3 } else { 2 });
-            assert_eq!(receive(&Incoming::Redirect(&l.redirect()), &Expect { idp: &idp, slo_url: SLO, now_ms: NOW, decrypt: None }).unwrap_err().0, "bad_signature", "the other curve's key");
+            assert_eq!(receive(&Incoming::Redirect(&l.redirect()), &Expect { idp: &idp, slo_url: SLO, now_ms: NOW, decrypt: &[] }).unwrap_err().0, "bad_signature", "the other curve's key");
         }
     }
 
