@@ -1,12 +1,14 @@
 //! `superbot-evidence coverage` (ADR 0169): checks an evidence store against an
 //! observation period. Every bundle in it (botd's evidence bundles, ADR 0142; the
-//! change-management bundles, ADR 0148; the vulnerability bundles, ADR 0086) is checked
+//! change-management bundles, ADR 0148; the vulnerability bundles, ADR 0086; the restore
+//! drill bundles, ADR 0177) is checked
 //! against its own `SHA256SUMS` and manifest, and the report says which days of the period
 //! each kind of bundle, each readiness checklist row and each criterion has evidence for,
 //! and where the gaps are. Reads local files only: no token, no network, nothing written
 //! into the store.
 
 use crate::changes::{self, json_file, rfc3339, sha256};
+use crate::drills;
 use crate::period::Period;
 use crate::vulns;
 use chrono::{Datelike, NaiveDate};
@@ -48,7 +50,7 @@ pub struct Kind {
     pub made_by: &'static str,
 }
 
-pub const KINDS: [Kind; 3] = [
+pub const KINDS: [Kind; 4] = [
     Kind { id: "evidence", prefix: "superbot-evidence-", manifest_kind: None, format: 2, title: "Evidence bundle", made_by: "botd (EVIDENCE_BUNDLES=monthly, or botctl evidence bundle)" },
     Kind {
         id: "change-management",
@@ -66,6 +68,14 @@ pub const KINDS: [Kind; 3] = [
         title: "Vulnerability bundle",
         made_by: "superbot-evidence vulnerabilities (the change-evidence workflow)",
     },
+    Kind {
+        id: "recovery-drills",
+        prefix: drills::PREFIX,
+        manifest_kind: Some("recovery-drills"),
+        format: drills::FORMAT as u64,
+        title: "Drill bundle",
+        made_by: "superbot-evidence drills (the change-evidence workflow, with the operator's drill records)",
+    },
 ];
 
 /// Each file a kind always has, with its criteria and rows.
@@ -74,12 +84,13 @@ pub fn expected(kind: &str) -> Vec<(&'static str, &'static [&'static str], &'sta
         "evidence" => EVIDENCE.iter().map(|e| (e.file, e.criteria, e.rows)).collect(),
         "change-management" => changes::SECTIONS.iter().map(|s| (s.file, s.criteria, s.rows)).collect(),
         "vulnerability-management" => vulns::SECTIONS.iter().map(|s| (s.file, s.criteria, s.rows)).collect(),
+        "recovery-drills" => drills::SECTIONS.iter().map(|s| (s.file, s.criteria, s.rows)).collect(),
         _ => Vec::new(),
     }
 }
 
 /// The files whose `exceptions` an auditor samples first.
-const EXCEPTION_FILES: [&str; 2] = ["pull-requests.json", "vulnerability-alerts.json"];
+const EXCEPTION_FILES: [&str; 4] = ["pull-requests.json", "vulnerability-alerts.json", "ci-drills.json", "operator-drills.json"];
 
 /// A bundle file larger than this isn't read: no bundle comes near it.
 const MAX_TAR: u64 = 256 << 20;
@@ -738,12 +749,13 @@ pub fn run(args: &[String], now: chrono::DateTime<chrono::Utc>) -> Result<(Strin
     let s = &r["summary"];
     Ok((
         format!(
-            "Saved {file}: {} to {} (not included), {} of {} bundles check, {} of 3 kinds and {} of {} checklist rows cover every day; {}.\nSHA-256: {}",
+            "Saved {file}: {} to {} (not included), {} of {} bundles check, {} of {} kinds and {} of {} checklist rows cover every day; {}.\nSHA-256: {}",
             p.from,
             p.to,
             s["verified"],
             s["bundles"],
             s["kindsComplete"],
+            KINDS.len(),
             s["rowsComplete"],
             s["rows"],
             if complete { "complete".to_string() } else { format!("{} problems", r["problems"].as_array().map_or(0, Vec::len)) },
@@ -897,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn real_change_and_vulnerability_bundles_check() {
+    fn real_change_vulnerability_and_drill_bundles_check() {
         let period = p("2027-01-01", "2027-02-01");
         let now = d("2027-02-01").and_hms_opt(4, 17, 0).unwrap().and_utc().timestamp_millis();
         let src = changes::Source { api_host: "api.github.com".into(), requests: 1, scopes: None };
@@ -913,7 +925,8 @@ mod tests {
             runs_truncated: false,
         };
         let v = vulns::Collected { repo: json!({ "fullName": "example-org/example-repo" }), branch: "main".into(), dependabot: Ok(0), code_scanning: Ok(0), alerts: vec![], accepted: vec![], as_of: now };
-        for tar in [changes::build(&c, &period, &src, now).tar, vulns::build(&v, &period, &vulns::Windows::default(), &src, now).tar] {
+        let d = drills::Collected { repo: json!({ "fullName": "example-org/example-repo" }), branch: "main".into(), workflows: vec![], executions: vec![] };
+        for tar in [changes::build(&c, &period, &src, now).tar, vulns::build(&v, &period, &vulns::Windows::default(), &src, now).tar, drills::build(Some(&d), &[], &period, &src, now).tar, drills::build(None, &[], &period, &src, now).tar] {
             let f = from_entries("b.tar".into(), untar(&tar).unwrap()).expect("a bundle");
             assert!(f.verified(), "{}: {:?}", f.name, f.problems);
             assert_eq!(f.period, Some(period));
@@ -1036,6 +1049,7 @@ mod tests {
         for (from, to) in [("2027-01-01", "2027-02-01"), ("2027-02-01", "2027-03-01"), ("2027-03-01", "2027-04-01")] {
             found.push(month(&KINDS[0], from, to));
             found.push(month(&KINDS[2], from, to));
+            found.push(month(&KINDS[3], from, to));
         }
         // Change management: January only, and a tampered February.
         found.push(month(&KINDS[1], "2027-01-01", "2027-02-01"));
@@ -1052,9 +1066,9 @@ mod tests {
         assert!(problems.iter().any(|x| x.contains("superbot-changes-2027-02-01") && x.contains("changed after")), "{problems:?}");
         assert!(problems.iter().any(|x| x == "No verified change-management bundle covers 2027-02-01 to 2027-04-01 (59 days)"), "{problems:?}");
         assert_eq!(problems.len(), 2, "{problems:?}");
-        assert_eq!(r["summary"]["inPeriod"], 7);
+        assert_eq!(r["summary"]["inPeriod"], 10);
         assert_eq!(r["summary"]["failed"], 1);
-        assert_eq!(r["summary"]["kindsComplete"], 2);
+        assert_eq!(r["summary"]["kindsComplete"], 3);
         assert_eq!(r["summary"]["exceptionsInBundles"], 2);
 
         let kind = |id: &str| r["kinds"].as_array().unwrap().iter().find(|k| k["kind"] == id).unwrap().clone();
@@ -1070,6 +1084,8 @@ mod tests {
         assert_eq!(row("CC8.1-2")["complete"], true);
         assert_eq!(strings(&row("CC8.1-2")["from"]), ["change-management", "evidence"]);
         assert_eq!(row("CC4.2-1")["complete"], true);
+        assert_eq!((row("A1.3-1")["complete"].as_bool(), strings(&row("A1.3-1")["from"])), (Some(true), vec!["recovery-drills".to_string()]));
+        assert_eq!(row("CC9.1-2")["coveredDays"], 90);
         let crit = r["criteria"].as_array().unwrap().iter().find(|c| c["criterion"] == "CC3.4").unwrap().clone();
         assert_eq!(crit["complete"], false);
 
@@ -1079,7 +1095,7 @@ mod tests {
         assert!(strings(&r["warnings"]).iter().any(|w| w.starts_with("CC6.2-1 is named by a bundle")));
 
         let md = markdown(&r);
-        for want in ["**Not complete:** 2 problems", "| 2027-02 | complete | missing | complete |", "| CC8.1-1 | change-management | 31 of 90 | 2027-02-01 to 2027-04-01 |", "| CC1.1-1 | Gap |", "**no**", "yes, outside the period", "noIndependentApproval 2"] {
+        for want in ["**Not complete:** 2 problems", "| 2027-02 | complete | missing | complete | complete |", "| CC8.1-1 | change-management | 31 of 90 | 2027-02-01 to 2027-04-01 |", "| CC1.1-1 | Gap |", "**no**", "yes, outside the period", "noIndependentApproval 2"] {
             assert!(md.contains(want), "{want}\n{md}");
         }
 
