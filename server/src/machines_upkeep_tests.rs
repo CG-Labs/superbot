@@ -495,16 +495,23 @@ async fn real_npm_installs_from_a_mirror_with_no_network() {
     sh(&dir, &format!("XZ_OPT='-0 -T0' tar -cJf node.tar.xz '{}'", top.file_name().unwrap().to_str().unwrap()));
     let node_tarball = std::fs::read(dir.join("node.tar.xz")).unwrap();
 
-    let probe = |name: &str, says: &str| {
+    let tgz = |manifest: String, file: &str, body: &str| {
         let d = crate::db::temp_path("probe");
         std::fs::create_dir_all(d.join("package")).unwrap();
-        std::fs::write(d.join("package/package.json"), format!(r#"{{"name": "{name}", "version": "1.0.0", "bin": {{"pi": "cli.js", "codex": "cli.js"}}}}"#)).unwrap();
-        exe(&d.join("package/cli.js"), &format!("#!/usr/bin/env node\nconsole.log({says:?});\n"));
+        std::fs::write(d.join("package/package.json"), manifest).unwrap();
+        exe(&d.join("package").join(file), body);
         sh(&d, "tar -czf probe.tgz package");
         std::fs::read(d.join("probe.tgz")).unwrap()
     };
+    let probe = |name: &str, says: &str| {
+        let manifest = format!(r#"{{"name": "{name}", "version": "1.0.0", "bin": {{"pi": "cli.js", "codex": "cli.js"}}, "dependencies": {{"@corp/mirror-dep": "^1.0.0"}}}}"#);
+        tgz(manifest, "cli.js", &format!("#!/usr/bin/env node\nconsole.log({says:?} + require('@corp/mirror-dep'));\n"))
+    };
     let mirror = Mirror::serve().await;
     let node = mirror.node("0.0.2", &node_tarball);
+    // Like Claude Code's and Codex's platform packages: only the mirror has it, and npm fetches it itself.
+    let dep = tgz(r#"{"name": "@corp/mirror-dep", "version": "1.0.0", "main": "index.js"}"#.into(), "index.js", "module.exports = ', with its dependency';\n");
+    mirror.package("@corp/mirror-dep", "1.0.0", &dep);
     let pin = mirror.package("@corp/mirror-probe", "1.0.0", &probe("@corp/mirror-probe", "from the mirror"));
     mirror.package("other-probe", "1.0.0", &probe("other-probe", "not pinned"));
     let wrong = format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode([3u8; 64]));
@@ -532,7 +539,9 @@ async fn real_npm_installs_from_a_mirror_with_no_network() {
         .env("PATH", format!("{}:/usr/bin:/bin", tools.bin_dir().display()))
         .output()
         .unwrap();
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "from the mirror", "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(mirror.calls().iter().any(|c| c == "/npm/@corp%2fmirror-probe"), "{:?}", mirror.calls());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "from the mirror, with its dependency", "{}", String::from_utf8_lossy(&out.stderr));
+    let calls = mirror.calls();
+    assert!(calls.iter().any(|c| c == "/npm/@corp%2fmirror-probe"), "{calls:?}");
+    assert!(calls.iter().any(|c| c == "/npm/@corp/mirror-dep/-/mirror-dep-1.0.0.tgz"), "{calls:?}");
     let _ = std::fs::remove_dir_all(dir);
 }
