@@ -1,10 +1,23 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
-import { botAccessLabel, csvFileName, flags, groupLabel, lastLoginLabel, machineLabel, signInsLabel } from "../src/accessReview";
+import {
+  botAccessLabel,
+  csvFileName,
+  effectiveLabel,
+  flags,
+  groupLabel,
+  lastLoginLabel,
+  machineLabel,
+  ownerLabel,
+  serviceFlags,
+  serviceRoleLabel,
+  serviceTokenLabel,
+  signInsLabel,
+} from "../src/accessReview";
 import { ApiError, type SuperBotApi } from "../src/api";
 import { saveCsv } from "../src/saveCsv";
 import { colors } from "../src/theme";
-import type { AccessReview as Report, AccessReviewPerson, AccessReviewSignOff } from "../src/types";
+import type { AccessReview as Report, AccessReviewPerson, AccessReviewServiceAccount, AccessReviewSignOff } from "../src/types";
 
 interface Props {
   api: SuperBotApi;
@@ -25,20 +38,53 @@ function Person({ p }: { p: AccessReviewPerson }) {
         {p.team ? <Text style={styles.dim}>· team {p.team.role}</Text> : null}
       </View>
       {p.email ? <Text style={styles.faint}>{p.email}</Text> : null}
-      {marks.length ? (
-        <View style={styles.tags}>
-          {marks.map((m) => (
-            <Text key={m} style={styles.tag}>
-              {m}
-            </Text>
-          ))}
-        </View>
-      ) : null}
+      <Tags marks={marks} />
       <Text style={styles.line}>Last sign-in: {lastLoginLabel(p)}</Text>
       <Text style={styles.line}>Second factor: {p.mfa.enabled ? "on" : "off"}</Text>
       <Text style={styles.line}>Bots: {botAccessLabel(p)}</Text>
       <Text style={styles.line}>Signed in: {signInsLabel(p)}</Text>
       <Text style={styles.line}>Machine: {machineLabel(p)}</Text>
+    </View>
+  );
+}
+
+function Tags({ marks }: { marks: string[] }) {
+  if (!marks.length) return null;
+  return (
+    <View style={styles.tags}>
+      {marks.map((m) => (
+        <Text key={m} style={styles.tag}>
+          {m}
+        </Text>
+      ))}
+    </View>
+  );
+}
+
+/** A service account (ADR 0165): who owns it, what it can use today, its Bots and live tokens. */
+function ServiceAccount({ s }: { s: AccessReviewServiceAccount }) {
+  return (
+    <View style={styles.person} accessibilityLabel={`Access of service account ${s.name}`}>
+      <View style={styles.rowTop}>
+        <Text style={styles.name} numberOfLines={1}>
+          {s.name}
+        </Text>
+        <Text style={styles.dim}>{serviceRoleLabel(s)}</Text>
+      </View>
+      {s.description ? <Text style={styles.faint}>{s.description}</Text> : null}
+      <Tags marks={serviceFlags(s)} />
+      <Text style={styles.line}>Owner: {ownerLabel(s)}</Text>
+      <Text style={styles.line}>Can use today: {effectiveLabel(s)}</Text>
+      <Text style={styles.line}>Bots: {botAccessLabel(s)}</Text>
+      {s.tokens.length ? (
+        s.tokens.map((t) => (
+          <Text key={t.id} style={styles.line}>
+            Token: {serviceTokenLabel(t)}
+          </Text>
+        ))
+      ) : (
+        <Text style={styles.line}>Tokens: none live</Text>
+      )}
     </View>
   );
 }
@@ -147,6 +193,7 @@ export function AccessReview({ api, onBack }: Props) {
             <Text style={styles.line}>
               {s.people} people: {s.active} active, {s.disabled} disabled, {s.admins} admins, {s.activeWithoutMfa} active without a second factor,{" "}
               {s.scimManaged} from SCIM, {s.apiAccess} API tokens, {s.machines} machines.
+              {s.serviceAccounts ? ` ${s.serviceAccounts} service accounts with ${s.serviceApiAccess ?? 0} live tokens.` : ""}
             </Text>
           ) : null}
           <View style={styles.card}>
@@ -188,6 +235,16 @@ export function AccessReview({ api, onBack }: Props) {
               ))}
             </View>
           ))}
+          {report.serviceAccounts?.length ? (
+            <View style={styles.group}>
+              <Text style={styles.section}>
+                Service accounts <Text style={styles.dim}>({report.serviceAccounts.length})</Text>
+              </Text>
+              {report.serviceAccounts.map((sa) => (
+                <ServiceAccount key={sa.id} s={sa} />
+              ))}
+            </View>
+          ) : null}
           <View style={styles.group}>
             <Text style={styles.section}>Past sign-offs</Text>
             {report.reviews.length ? report.reviews.map((r) => <SignOff key={r.eventId} r={r} />) : <Text style={styles.faint}>None yet.</Text>}
