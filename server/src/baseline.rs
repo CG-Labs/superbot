@@ -465,7 +465,8 @@ mod tests {
 
     #[test]
     fn each_rule_reads_the_value_as_botd_does() {
-        let cases: [(&[(&str, &str)], &str, Status, &str); 17] = [
+        type Case<'a> = (&'a [(&'a str, &'a str)], &'a str, Status, &'a str);
+        let cases: [Case; 17] = [
             (&[("AUTH_BREAK_GLASS", "off")], "AUTH_BREAK_GLASS", Status::Pass, "0"),
             (&[("SIGNIN_ALERTS", "no")], "SIGNIN_ALERTS", Status::Fail, "off"),
             (&[("TESTING_MODE", "yes")], "TESTING_MODE", Status::Fail, "on"),
