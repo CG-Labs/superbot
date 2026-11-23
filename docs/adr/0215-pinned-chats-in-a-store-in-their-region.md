@@ -73,7 +73,7 @@ A pin holds a person's or team's machines, machine backups and model calls in a 
 - When botd's own data isn't in the pin's region but all the pin's chats are in the region's store, "not covered" says botd's own database apart from chats, and that its server backups still hold chats from before they moved.
 - Warnings: another store's backups that still hold the chats (until botd deletes them as newer ones are made), and no backup of the region's store from the last day. Earlier copies are disclosed, not counted as unkept: they go by themselves within `REGION_DATA_BACKUPS` days.
 - `GET /api/regions` shows each region's `chatStore` (messages, backups, newest backup) and `residency.chatStores` (all stores and `keep`).
-- `GET /api/me/residency` gives `chats: {store, inRegion}`, and the app tells people their chats are kept in the region, in a database of their own there, or that they are being moved.
+- `GET /api/me/residency` gives `chats: {store, inRegion, moving, earlierBackups}`. The app tells people their chats are kept in the region, in a database of their own there, or that they are still being moved; once the move is done, it says how many backups from before it still hold earlier copies in another region, instead of saying they are moving.
 
 ## Consequences
 
@@ -109,4 +109,4 @@ A pin holds a person's or team's machines, machine backups and model calls in a 
   - backups are named by time, made once a day, the newest kept, each a self-contained copy of the store.
 - Unit (`residency_report.rs`): "not covered" leaves chats out only when they are all in the region's store; the Markdown "Chats" section.
 - End to end on the real router (`machines_residency_tests.rs`), with the in-memory Linode provider: a person's messages stay in botd's own database until she is pinned; the pin moves them into London's store, audited as `residency.chats_moved` by the system; new messages go straight there; the report, its Markdown and digest, `GET /api/me/residency` and `GET /api/regions` show the store; a backup is made in the region's folder and clears the report's warning; a message left out of the store makes the pin `data_outside` in the report, the app and the regions warnings until the next reconcile pass moves it (`chatsMoved: 1`); unpinning brings the messages back; pinned to Frankfurt instead, they go to its store, and the report lists London's earlier backup, doesn't claim them all in the region, and stays `kept`.
-- Client (`residency.test.ts`): the lines about chats kept in the region, being moved, or nothing without a store, and the server-copy line without "and chats" when they are held.
+- Client (`residency.test.ts`): the lines about chats kept in the region, being moved, kept with older backups elsewhere, or nothing without a store, and the server-copy line without "and chats" when they are held.

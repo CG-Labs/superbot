@@ -148,9 +148,20 @@ pub async fn view(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>,
         "backups": you["backups"],
         "modelRoutes": { "inRegion": you["modelRoutes"]["inRegion"], "gap": you["modelRoutes"]["gap"] },
         "serverData": server_data,
-        "chats": { "store": chats["store"], "inRegion": chats["inRegion"] },
+        "chats": chats_view(&chats),
         "reports": reports,
     })))
+}
+
+/// What the app says about your chats (ADR 0215): whether the region has a store, whether
+/// they are all in the region, whether some are still to move there, and how many backups
+/// of another region's store still hold them from before they moved out.
+fn chats_view(c: &Value) -> Value {
+    let m = &c["messages"];
+    let n = |k: &str| m[k].as_i64().unwrap_or(0);
+    let moving = n("elsewhere") > 0 || (c["store"] == true && n("inServerDatabase") > 0);
+    let earlier: i64 = c["earlierCopies"].as_array().into_iter().flatten().filter_map(|e| e["backups"].as_i64()).sum();
+    json!({ "store": c["store"], "inRegion": c["inRegion"], "moving": moving, "earlierBackups": earlier })
 }
 
 /// `GET /api/me/residency/report[?on=user|team&from=&to=&format=markdown]`: the residency

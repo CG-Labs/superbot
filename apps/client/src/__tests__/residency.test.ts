@@ -104,6 +104,16 @@ describe("chats in the region's own database (ADR 0215)", () => {
     expect(held.warnings).toEqual([]);
   });
 
+  it("says when the move is done but older backups elsewhere still hold copies", () => {
+    const done = residencyLines(view({ serverData: { region: "de-fra-2", inRegion: false }, chats: { store: true, inRegion: false, moving: false, earlierBackups: 2 } }));
+    expect(done.lines).toContain("Your chats are kept in gb-lon, in a database of their own there.");
+    expect(done.lines).toContain("2 backups from before they moved still hold earlier copies in another region until they are deleted.");
+    expect(done.lines.some((l) => l.includes("being moved"))).toBe(false);
+    expect(done.lines).toContain("SuperBot's own copy of your account isn't in gb-lon; it is in de-fra-2. Your agreement says where it is.");
+    const one = residencyLines(view({ chats: { store: true, inRegion: false, moving: false, earlierBackups: 1 } }));
+    expect(one.lines).toContain("A backup from before they moved still holds earlier copies in another region until it is deleted.");
+  });
+
   it("says when they are still moving, and says nothing without a store", () => {
     const moving = residencyLines(view({ serverData: { region: "de-fra-2", inRegion: false }, chats: { store: true, inRegion: false } }));
     expect(moving.lines).toContain("Your chats are being moved to gb-lon's own database.");
