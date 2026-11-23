@@ -99,6 +99,19 @@ pub struct Startup {
     /// MACHINE_FIREWALL_EGRESS, as the control plane read it.
     pub firewall_egress: bool,
     pub evidence_monthly: bool,
+    /// The retention days botd parsed, which reach the database only when the retention
+    /// jobs start, after the check at start. None reads the database.
+    pub retention: Option<Retention>,
+}
+
+/// AUDIT_RETENTION_DAYS, CHAT_RETENTION_DAYS, HARNESS_SESSION_RETENTION_DAYS and
+/// TEAMMATE_FILES_RETENTION_DAYS as parsed: None keeps forever.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Retention {
+    pub audit: Option<u32>,
+    pub chat: Option<u32>,
+    pub sessions: Option<u32>,
+    pub teammate_files: Option<u32>,
 }
 
 /// The users' machines, when the control plane is on.
@@ -426,7 +439,14 @@ pub fn evaluate(f: &Facts, exceptions: &[&'static str], now_ms: i64) -> Report {
 
 /// This server's facts now: what it parsed at startup, and what the database says.
 pub fn facts(app: &App, s: &Startup) -> Facts {
-    let setting = |k: &str| app.db.setting(k).and_then(|v| v.parse::<u32>().ok()).filter(|d| *d > 0);
+    let setting = |k: &str| app.db.setting(k).and_then(|v| v.parse::<u32>().ok());
+    let r = s.retention.unwrap_or_else(|| Retention {
+        audit: app.db.audit_retention(),
+        chat: app.db.chat_retention(),
+        sessions: setting(crate::file_retention::SESSIONS_KEY),
+        teammate_files: setting(crate::file_retention::FILES_KEY),
+    });
+    let kept = |d: Option<u32>| d.filter(|d| *d > 0);
     let cp = app.control_plane.get().filter(|cp| cp.enabled());
     let machines = cp.map(|cp| {
         let e = cp.enrollment.as_deref();
@@ -459,10 +479,10 @@ pub fn facts(app: &App, s: &Startup) -> Facts {
         teams: app.teams.get().is_some_and(|t| t.strict),
         chromium_sandbox: s.chromium_sandbox,
         metrics: s.metrics,
-        audit_days: app.db.audit_retention(),
-        chat_days: app.db.chat_retention(),
-        sessions_days: setting(crate::file_retention::SESSIONS_KEY),
-        teammate_files_days: setting(crate::file_retention::FILES_KEY),
+        audit_days: kept(r.audit),
+        chat_days: kept(r.chat),
+        sessions_days: kept(r.sessions),
+        teammate_files_days: kept(r.teammate_files),
         evidence_monthly: s.evidence_monthly,
         mode: s.settings.mode,
     }

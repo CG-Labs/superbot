@@ -81,6 +81,28 @@ fn on_checks_at_start_and_audits_it() {
     assert_eq!(later.digest, e.details["digest"].as_str().unwrap(), "the same settings, the same digest");
 }
 
+/// The retention jobs write the settings to the database after the check at start, so the
+/// check judges what botd parsed: a fix isn't refused for the old value, nor a regression
+/// passed for it.
+#[test]
+fn the_check_at_start_judges_the_retention_just_parsed_not_the_last_start() {
+    let app = runner::test_app();
+    app.db.set_audit_retention(Some(30));
+    let all = vec!["SUPERBOT_DATABASE_ENCRYPTION", "SUPERBOT_BACKUP_ENCRYPTION", "SERVER_BACKUP_OFF_HOST", "ISOLATION"];
+    let fixed = baseline::Retention { audit: Some(730), chat: Some(365), ..Default::default() };
+    assert_eq!(baseline::at_startup(&app, Startup { retention: Some(fixed), ..passing(Mode::Required, all.clone()) }), Ok(()));
+    let r = baseline::check(&app, db::now());
+    let observed = |r: &baseline::Report, s: &str| r.checks.iter().find(|c| c.setting == s).map(|c| (c.status, c.observed.clone())).unwrap();
+    assert_eq!(observed(&r, "AUDIT_RETENTION_DAYS"), (baseline::Status::Pass, "730 days".into()));
+    assert_eq!(observed(&r, "CHAT_RETENTION_DAYS").1, "365 days");
+    assert_eq!(app.db.audit_retention(), Some(30), "checking deletes nothing and changes no setting");
+
+    let worse = runner::test_app();
+    let short = baseline::Retention { audit: Some(30), ..Default::default() };
+    let err = baseline::at_startup(&worse, Startup { retention: Some(short), ..passing(Mode::Required, all) }).unwrap_err();
+    assert!(err.contains("AUDIT_RETENTION_DAYS"), "an audit log kept forever until now doesn't hide the new 30 days: {err}");
+}
+
 #[test]
 fn off_checks_nothing_at_start() {
     let app = runner::test_app();

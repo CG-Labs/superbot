@@ -788,6 +788,7 @@ async fn main() {
         metrics: observe.metrics.as_ref().map(|m| (m.addr.ip().is_loopback(), m.token.is_some())),
         firewall_egress: machines::firewall::egress_from_env(&|k| env(k, "")).unwrap_or(false),
         evidence_monthly: evidence.monthly,
+        retention: Some(config_baseline::Retention { audit: retention, chat: chat_retention, sessions: session_retention, teammate_files: teammate_files_retention }),
     };
     config_baseline::at_startup(&app, baseline).unwrap_or_else(|e| exit(e));
     let router = router(app.clone(), auth_state);
