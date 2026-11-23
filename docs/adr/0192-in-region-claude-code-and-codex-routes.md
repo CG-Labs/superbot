@@ -44,7 +44,7 @@ For a run routed to an endpoint:
 - `ANTHROPIC_BASE_URL` is the endpoint's `baseUrl`. `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` are empty, and `CLAUDE_CODE_USE_BEDROCK`, `_VERTEX` and `_FOUNDRY` are `0`, so neither a login nor the person's own cloud setup takes the run elsewhere.
 - The same values, except the key, are in the run's flag settings' `env`, which outrank the Bot's and the user's settings files.
 - `CLAUDE_ENV_FILE` is a file botd writes beside the run's settings, which unsets the key and tokens before each Bash command, so the agent's shell doesn't see them.
-- Where Claude Code's sandbox can start (ADR 0055), which needs bubblewrap, `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` as well, so hooks and MCP servers don't get the key either. Elsewhere the scrub would stop Claude Code from starting, so it is left off.
+- Where the computer has said Claude Code's sandbox can start (ADR 0055), which needs bubblewrap, `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` as well, so hooks and MCP servers don't get the key either. Elsewhere, including a machine agent too old to say, the scrub could stop Claude Code from starting, so it is left off.
 - When the run is held, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and `skipWebFetchPreflight: true`, so Claude Code itself calls only the endpoint.
 
 The key is never in the command line, where other users of the host could read it.
