@@ -193,11 +193,11 @@ VAULT_RUN_CREDENTIALS="aws/creds/bots AWS_ACCESS_KEY_ID=access_key AWS_SECRET_AC
 
 - **Format**: entries separated by `;` or new lines. Each is a Vault path, then `NAME=field` pairs: the variable the run gets and the field of Vault's answer it comes from. At most 16 paths; each name once.
 - **`{owner}`** is the Bot owner's id (`botctl users`), so each user's Bots can get their own role. Those paths are read only for runs that get the owner's own secrets, not a teammate's run of an isolated shared Bot.
-- **Order**: these win over static secrets of the same name. A field that is null or empty (`security_token` for an IAM user) isn't set; a field that isn't in the answer refuses the run, as it is probably a typo.
+- **Order**: these win over static secrets of the same name, and runs never inherit these names from botd's own environment. A field that is null or empty (`security_token` for an IAM user) leaves the name unset in the run, even if a static secret has it; a field that isn't in the answer refuses the run, as it is probably a typo.
 - **TTL**: botd revokes each lease when its run ends. If it can't (Vault down, botd stopped mid-run), the lease ends at the role's TTL. Set `default_ttl` a little over your longest run (`RUN_TIMEOUT_MINUTES`, 60 by default), not a day, and no shorter, or a credential can lapse mid-run.
 - **Fails closed**: if a lease can't be made, the run doesn't start (`bot.run_refused`, reason `secrets_unavailable`) and leases already made for it are revoked.
 - **Audit**: `botctl audit --action 'secret.lease_*'` shows each lease made (`secret.lease_issued`, with path, lease id, TTL and the variable names) and revoked (`secret.lease_revoked`), never a value. For a lease botd couldn't revoke, `vault lease revoke <lease id>` ends it now.
-- **Redaction**: the values are redacted from everything botd saves and shows while the lease lives, and forgotten once Vault has revoked it.
+- **Redaction**: the values are redacted from everything botd saves and shows while a lease that has them lives, and forgotten once Vault has revoked the last one (unless botd knew the value already).
 
 botd doesn't make a lease at startup, so a wrong path or missing policy shows on the first run. The startup line and `botctl secrets backend` list the paths (`runCredentials`). Only `SECRETS_BACKEND=vault` reads the setting.
 

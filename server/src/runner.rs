@@ -1108,6 +1108,9 @@ impl App {
         let (space, _leases) = match crate::secrets::leases::for_run(&bot.owner_id, &bot.id, for_other.is_none()) {
             Ok((creds, leases)) => {
                 let (cwd, mut env) = space;
+                for name in leases.cleared() {
+                    env.remove(name);
+                }
                 env.extend(creds.into_iter().map(|(k, v)| (k, v.expose().to_string())));
                 ((cwd, env), leases)
             }

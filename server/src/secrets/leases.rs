@@ -9,8 +9,12 @@
 //!   the run (`secrets_unavailable`), and the leases already made for it are revoked.
 //! - Each lease made, refused and revoked is audited (`secret.lease_issued`,
 //!   `secret.lease_revoked`) with its path and lease id, never a value.
-//! - Values are redacted from everyone's text while the lease lives, and forgotten once
-//!   Vault has revoked it, so the redactor doesn't grow with every run.
+//! - A name whose field is empty (AWS's `security_token` for an IAM user) is taken out
+//!   of the run, so it never pairs a stale value with the fresh ones; the listed names
+//!   are kept from what botd starts at all (`adapters::withhold`), so none is inherited.
+//! - Values are redacted from everyone's text while a lease that has them lives, and
+//!   forgotten once Vault has revoked the last one, unless botd knew them already, so the
+//!   redactor doesn't grow with every run.
 //! - A lease botd couldn't revoke (it stopped, Vault was down) ends at its TTL: the
 //!   Vault role's `default_ttl` is the longest a credential outlives its run.
 
@@ -18,7 +22,7 @@ use super::external::{self, Scope};
 use super::{check_name, redact, Error, Secret};
 use crate::audit::{Event, Outcome};
 use serde_json::json;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use zeroize::Zeroizing;
 
 /// The most paths one run asks for.
@@ -119,6 +123,8 @@ pub fn parse(raw: &str) -> Result<Vec<Wanted>, String> {
 pub struct Leases {
     issuer: Option<Arc<dyn Issuer>>,
     held: Vec<Held>,
+    /// Names whose field was empty: the run must not have them at all.
+    cleared: Vec<String>,
 }
 
 struct Held {
@@ -131,7 +137,13 @@ struct Held {
 
 impl Leases {
     pub fn none() -> Leases {
-        Leases { issuer: None, held: Vec::new() }
+        Leases { issuer: None, held: Vec::new(), cleared: Vec::new() }
+    }
+
+    /// Names to take out of the run's environment: their lease gave no value, and an
+    /// older one of the same name would pair with the fresh ones.
+    pub fn cleared(&self) -> &[String] {
+        &self.cleared
     }
 
     #[cfg(test)]
@@ -160,6 +172,34 @@ impl Drop for Leases {
     }
 }
 
+/// Each lease value the redactor knows because of leases: how many live leases have it,
+/// and whether a lease taught it (so revoking may forget it) or botd knew it already.
+static LEASED: Mutex<Vec<(String, usize, bool)>> = Mutex::new(Vec::new());
+
+fn hold_value(v: &str) {
+    let mut leased = LEASED.lock().unwrap_or_else(|e| e.into_inner());
+    match leased.iter_mut().find(|(k, ..)| k == v) {
+        Some((_, n, _)) => *n += 1,
+        None => {
+            let ours = !redact::known().iter().any(|k| k == v.trim());
+            redact::register(v);
+            leased.push((v.to_string(), 1, ours));
+        }
+    }
+}
+
+fn release_value(v: &str) {
+    let mut leased = LEASED.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(i) = leased.iter().position(|(k, ..)| k == v) else { return };
+    leased[i].1 -= 1;
+    if leased[i].1 == 0 {
+        let (_, _, ours) = leased.swap_remove(i);
+        if ours {
+            redact::forget(v);
+        }
+    }
+}
+
 fn event(action: &str, store: &str, path: &str, bot_id: &str, owner: Option<&str>) -> (Event, serde_json::Value) {
     let mut d = json!({ "store": store, "path": path });
     if let Some(o) = owner {
@@ -174,7 +214,7 @@ fn revoke(issuer: &dyn Issuer, h: Held) {
     match issuer.revoke(&h.id) {
         Ok(()) => {
             for v in &h.values {
-                redact::forget(v);
+                release_value(v);
             }
             external::audit(e.details(d));
         }
@@ -197,6 +237,11 @@ impl RunCredentials {
         RunCredentials { issuer, wanted }
     }
 
+    /// Every variable a run may get from a lease.
+    pub fn names(&self) -> Vec<String> {
+        self.wanted.iter().flat_map(|w| w.names.iter().map(|(n, _)| n.clone())).collect()
+    }
+
     pub fn paths(&self) -> Vec<&str> {
         self.wanted.iter().map(|w| w.path.as_str()).collect()
     }
@@ -210,7 +255,7 @@ impl RunCredentials {
     /// Paths with `{owner}` only when `owner_keys` and the id can name one (as for users'
     /// folders, ADR 0174). On an error the leases already made are revoked.
     pub fn issue(&self, owner: &str, bot_id: &str, owner_keys: bool) -> Result<(Vec<(String, Secret)>, Leases), Error> {
-        let mut leases = Leases { issuer: Some(Arc::clone(&self.issuer)), held: Vec::new() };
+        let mut leases = Leases { issuer: Some(Arc::clone(&self.issuer)), held: Vec::new(), cleared: Vec::new() };
         let mut env = Vec::new();
         let owner_ok = owner_keys && Scope::user(owner).is_some();
         for w in &self.wanted {
@@ -239,11 +284,11 @@ impl RunCredentials {
             for ((name, field), got) in w.names.iter().zip(lease.fields) {
                 match got {
                     Field::Value(v) => {
-                        redact::register(&v);
+                        hold_value(&v);
                         env.push((name.clone(), Secret::new(v.as_str())));
                         held.values.push(v);
                     }
-                    Field::Empty => {}
+                    Field::Empty => leases.cleared.push(name.clone()),
                     Field::Missing => missing.push(field.as_str()),
                 }
             }
@@ -263,7 +308,14 @@ impl RunCredentials {
 static ACTIVE: OnceLock<Arc<RunCredentials>> = OnceLock::new();
 
 pub(crate) fn set_active(rc: &Arc<RunCredentials>) {
+    keep_from_inheritance(rc);
     let _ = ACTIVE.set(Arc::clone(rc));
+}
+
+/// A name a lease gives reaches a run only from that lease: never inherited from
+/// botd's own environment, where an older value could pair with the fresh ones.
+fn keep_from_inheritance(rc: &RunCredentials) {
+    crate::adapters::withhold(rc.names());
 }
 
 /// The short-lived credentials for one run, from the backend botd runs with; none if
@@ -296,6 +348,8 @@ pub(crate) mod tests {
         pub issued: AtomicUsize,
         pub down: AtomicBool,
         pub revoke_down: AtomicBool,
+        /// Every lease from a path has the same values, as a role that hands out one user would.
+        pub same: AtomicBool,
     }
 
     impl Issuer for Fake {
@@ -312,6 +366,7 @@ pub(crate) mod tests {
             let fields = fields
                 .iter()
                 .map(|f| match have.iter().find(|(k, _)| k == f) {
+                    Some((_, Some(v))) if self.same.load(Ordering::SeqCst) => Field::Value(Zeroizing::new(v.clone())),
                     Some((_, Some(v))) => Field::Value(Zeroizing::new(format!("{v}-{n}"))),
                     Some((_, None)) => Field::Empty,
                     None => Field::Missing,
@@ -411,6 +466,7 @@ pub(crate) mod tests {
         );
         assert_ne!(env(&e1), env(&e2), "each run its own");
         assert_eq!((l1.len(), l2.len()), (2, 2));
+        assert_eq!(l1.cleared(), ["CLOUD_SESSION_TOKEN"], "an empty field is taken out of the run, not left to an older value");
         assert_eq!(redact::text("key aws-run-secret-0a1b-0 here"), "key [redacted] here", "redacted while the lease lives");
 
         let ev: Vec<_> = external::tests::audited("aws/creds/bots").into_iter().filter(|e| e.details["leaseId"] == "aws/creds/bots/lease0").collect();
@@ -464,6 +520,38 @@ pub(crate) mod tests {
         assert!(external::tests::audited("first/creds/r").iter().any(|e| e.outcome == Outcome::Failure && e.details["error"] == "unavailable"));
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(f.revoked.lock().unwrap().len(), before, "nothing was made, nothing to revoke");
+    }
+
+    #[test]
+    fn a_value_stays_redacted_while_any_lease_or_botd_still_knows_it() {
+        let f = fake(&[("shared/creds/same", &[("token", Some("same-lease-value-8a7b"))]), ("shared/creds/known", &[("token", Some("known-before-8a7b"))])]);
+        f.same.store(true, Ordering::SeqCst);
+        let rc = RunCredentials::new(f.clone(), parse("shared/creds/same SAME_TOKEN=token").unwrap());
+        let (_, l1) = rc.issue("usame5", "bsame5", true).unwrap();
+        let (_, l2) = rc.issue("usame5", "bsame5", true).unwrap();
+        drop(l1);
+        wait_for(|| f.revoked.lock().unwrap().len() == 1);
+        assert_eq!(redact::text("same-lease-value-8a7b"), redact::MARK, "the other run's lease still has it");
+        drop(l2);
+        wait_for(|| f.revoked.lock().unwrap().len() == 2);
+        wait_for(|| redact::text("same-lease-value-8a7b") == "same-lease-value-8a7b");
+
+        redact::register("known-before-8a7b");
+        let rc = RunCredentials::new(f.clone(), parse("shared/creds/known KNOWN_TOKEN=token").unwrap());
+        drop(rc.issue("usame5", "bsame5", true).unwrap().1);
+        wait_for(|| f.revoked.lock().unwrap().len() == 3);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(redact::text("known-before-8a7b"), redact::MARK, "botd knew it before the lease: revoking doesn't forget it");
+        redact::forget("known-before-8a7b");
+    }
+
+    #[test]
+    fn leased_names_are_never_inherited_from_botd() {
+        let rc = RunCredentials::new(fake(&[]), parse("x/creds/r INHERIT_LEASED_ONE=a INHERIT_LEASED_TWO=b").unwrap());
+        assert!(!crate::adapters::withheld("INHERIT_LEASED_ONE"));
+        keep_from_inheritance(&rc);
+        let host = crate::adapters::local_host();
+        assert!(["INHERIT_LEASED_ONE", "INHERIT_LEASED_TWO"].iter().all(|n| host.remove.iter().any(|r| r == n)), "removed from what botd starts");
     }
 
     #[test]
