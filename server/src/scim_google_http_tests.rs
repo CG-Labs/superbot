@@ -179,6 +179,7 @@ fn settings(g: &Google) -> Settings {
         customer: "my_customer".into(),
         groups: vec!["staff@example.com".into()],
         teams: vec!["eng@example.com".into()],
+        role_groups: vec![],
         sso: None,
         admin: Some("admin@example.com".into()),
         api: g.url.clone(),
@@ -218,6 +219,7 @@ async fn world(g: &Google, with_sso: bool, tweak: impl FnOnce(&mut Settings)) ->
     let (port, app, admin, _) = serve_app_with(|a| {
         a.scim.enabled = true;
         a.scim.groups = true;
+        a.scim.group_roles = !s.role_groups.is_empty();
         if with_sso {
             let id = google_sso(a);
             s.sso = Some(id.clone());
@@ -446,6 +448,51 @@ async fn team_groups_move_and_aliases_are_one_team() {
     let res = synced(&w).await;
     assert_eq!((res["teams"]["created"].as_u64(), res["teams"]["deleted"].as_u64()), (Some(1), Some(1)), "{res}");
     assert_eq!(team_members(&w), vec!["ada@example.com", "eve@example.com"], "people on a team no longer wanted join the new one in the same pass");
+}
+
+#[tokio::test]
+async fn declared_role_groups_give_roles_and_undeclared_ones_are_never_pushed() {
+    let g = google_stand_in().await;
+    g.set(|d| {
+        d.groups.insert("auditors@example.com".into(), ("g3".into(), "Auditors".into(), vec![member("101"), member("104")]));
+        d.groups.insert("billing@example.com".into(), ("g4".into(), "Billing".into(), vec![member("102")]));
+    });
+    let w = world(&g, false, |s| s.role_groups = vec!["auditors@example.com".into(), "billing@example.com".into()]).await;
+    let (code, v) = call(w.port, "POST", "/api/roles", &w.admin, r#"{"name":"Auditor","base":"member","permissions":["audit.view"]}"#).await;
+    assert_eq!(code, 201, "{v}");
+    let auditor = parse(&v)["id"].as_str().unwrap().to_string();
+    let (code, v) = call(w.port, "POST", "/api/scim/role-groups", &w.admin, &json!({ "tenant": TENANT, "displayName": "Auditors@example.com", "role": "Auditor" }).to_string()).await;
+    assert_eq!(code, 201, "{v}");
+    let gid = parse(&v)["id"].as_str().unwrap().to_string();
+
+    let res = synced(&w).await;
+    assert_eq!((res["created"].as_u64(), res["teams"]["created"].as_u64()), (Some(3), Some(1)), "{res}");
+    assert_eq!(res["roleGroups"], json!({ "created": 1, "updated": 0, "deleted": 0, "undeclared": ["billing@example.com"] }), "{res}");
+    assert!(user_of(&w, "104").is_none(), "a role group gives no account");
+    let ada = uid(&w, "101");
+    assert_eq!(w.app.db.user(&ada).unwrap().role_id.as_deref(), Some(auditor.as_str()));
+    assert_eq!(team_members(&w), vec!["ada@example.com", "eve@example.com"], "and Ada is still on her team");
+    let rg = w.app.db.scim_role_group(&gid).unwrap();
+    assert_eq!((rg.external_id.as_deref(), rg.provisioned_at.is_some()), (Some("g3"), true));
+    assert!(w.app.db.scim_group_find(TENANT, Some("g4"), None).is_none(), "Billing never became a team");
+    let (_, status) = call(w.port, "GET", "/api/scim/google", &w.admin, "").await;
+    assert_eq!(parse(&status)["roleGroups"], json!(["auditors@example.com", "billing@example.com"]));
+
+    let again = synced(&w).await;
+    assert_eq!((again["roleGroups"]["created"].as_u64(), again["roleGroups"]["updated"].as_u64()), (Some(0), Some(0)), "{again}");
+
+    g.members("auditors@example.com", vec![member("102")]);
+    let res = synced(&w).await;
+    assert_eq!(res["roleGroups"]["updated"], 1, "{res}");
+    let bob = uid(&w, "102");
+    assert_eq!((w.app.db.user(&ada).unwrap().role_id, w.app.db.user(&bob).unwrap().role_id), (None, Some(auditor.clone())));
+
+    // A pushed role group the directory no longer has is deleted, and its declaration waits.
+    w.app.db.save_scim_role_group(&gid, Some("g-old"), "auditors@example.com", false).unwrap();
+    let res = synced(&w).await;
+    assert_eq!((res["roleGroups"]["deleted"].as_u64(), res["roleGroups"]["created"].as_u64()), (Some(1), Some(1)), "{res}");
+    assert_eq!(w.app.db.scim_role_group(&gid).unwrap().external_id.as_deref(), Some("g3"));
+    assert_eq!(w.app.db.user(&bob).unwrap().role_id.as_deref(), Some(auditor.as_str()));
 }
 
 #[tokio::test]
