@@ -147,13 +147,13 @@ fn skipped(app: &AppState, by: &Who, g: &ScimRoleGroup, role: &CustomRole, user_
 /// Takes away what the group gave `user_id`; their built-in role goes back to the one
 /// they had. Whether it had given them anything.
 async fn take_away(app: &AppState, by: &Who, g: &ScimRoleGroup, user_id: &str, reason: &str) -> bool {
-    let Some(r) = app.db.revoke_scim_role_group(g, user_id, reason == LEFT_GROUP) else { return false };
-    let role = app.db.custom_role(&g.role_id);
+    let Some((given, r)) = app.db.revoke_scim_role_group(g, user_id, reason == LEFT_GROUP) else { return false };
+    let role = app.db.custom_role(&given);
     let d = json!({
         "name": role.as_ref().map(|r| r.name.clone()), "user": user_id, "scope": "org", "via": "scim", "roleGroup": g.id, "tenant": g.tenant,
         "reason": reason, "held": r.cleared, "keeps": r.role_after,
     });
-    app.db.record(&by.event("role.unassigned").target("role", &g.role_id).details(d));
+    app.db.record(&by.event("role.unassigned").target("role", &given).details(d));
     if r.role_before != r.role_after {
         app.db.record(&by.event("user.role_changed").target("user", user_id).details(json!({ "from": r.role_before, "to": r.role_after, "role": role_ref(role.as_ref()), "reason": "scim_group" })));
         users::lost_access(app, by, user_id, crate::machines::offboard::ACCESS_LOST).await;
@@ -498,11 +498,15 @@ pub async fn update_api(State(app): State<AppState>, Extension(a): Extension<Arc
     let role = pick_role(&app, &by, &v["role"])?;
     let _writes = a.scim.group_writes.lock().await;
     let before = need(&app, &id)?;
-    if before.role_id == role.id {
+    // A grant still on another role is left from a change cut short (a restart while it
+    // took roles away), so the same change again finishes it.
+    let new_id = role.id.clone();
+    let stale = |g: &ScimRoleGroup| app.db.scim_role_group_grants(&g.id).into_iter().filter(|h| h.role_id != new_id).collect::<Vec<_>>();
+    if before.role_id == role.id && stale(&before).is_empty() {
         return Ok(Json(view(&app, &before)));
     }
     // The new role is saved, and checked, first: a role edited or deleted meanwhile leaves
-    // every grant as it was. Taking away goes by the old role, which `before` holds.
+    // every grant as it was. Each grant records the role it gave, which is what goes.
     let g = app.db.set_scim_role_group_role(&before.id, &role.id).map_err(|e| match e {
         ScimRoleGroupError::Reaches(reach) => refused(&app, &by, "reaches_admins", json!({ "role": { "id": role.id, "name": role.name }, "permissions": reach }), reaches_msg(&role, &reach)),
         ScimRoleGroupError::Gone => not_found("Role group or role"),
@@ -510,14 +514,15 @@ pub async fn update_api(State(app): State<AppState>, Extension(a): Extension<Arc
     })?;
     let role = app.db.custom_role(&role.id).unwrap_or(role);
     let mut revoked = Vec::new();
-    for h in app.db.scim_role_group_grants(&before.id) {
-        if take_away(&app, &by, &before, &h.user_id, ROLE_CHANGED).await {
+    for h in stale(&g) {
+        if take_away(&app, &by, &g, &h.user_id, ROLE_CHANGED).await {
             revoked.push(h.user_id);
         }
     }
     let (mut granted, mut skips) = (Vec::new(), Vec::new());
     if g.provisioned_at.is_some() {
-        for u in app.db.scim_role_group_members(&g.tenant, &g.id) {
+        let holds: HashSet<String> = app.db.scim_role_group_grants(&g.id).into_iter().map(|h| h.user_id).collect();
+        for u in app.db.scim_role_group_members(&g.tenant, &g.id).into_iter().filter(|u| !holds.contains(&u.id)) {
             match grant(&app, &by, &g, &role, &u.id).await {
                 Ok(()) => granted.push(u.id),
                 Err(reason) => {

@@ -1887,12 +1887,15 @@ fn scim_role_group_row(r: &Row) -> rusqlite::Result<ScimRoleGroup> {
 }
 
 /// The role a role group gave someone, one per person, so taking it away touches only
-/// what the group gave. `prior_role` is their built-in role before, given back after.
+/// what the group gave. `role_id` is the role it gave, which stays the one taken away
+/// even after the group names another. `prior_role` is their built-in role before, given
+/// back after.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScimRoleGroupGrant {
     pub group_id: String,
     pub user_id: String,
+    pub role_id: String,
     pub prior_role: Option<Role>,
     pub granted_at: i64,
 }
@@ -1902,6 +1905,7 @@ fn scim_role_group_grant_row(r: &Row) -> rusqlite::Result<ScimRoleGroupGrant> {
     Ok(ScimRoleGroupGrant {
         group_id: r.get("group_id")?,
         user_id: r.get("user_id")?,
+        role_id: r.get("role_id")?,
         prior_role: prior.as_deref().and_then(Role::parse).filter(|r| *r != Role::Admin),
         granted_at: r.get("granted_at")?,
     })
@@ -2204,6 +2208,7 @@ fn migrate_scim_role_groups(c: &Connection, _fresh: bool) -> rusqlite::Result<()
         CREATE TABLE IF NOT EXISTS scim_role_group_grants (
           group_id TEXT NOT NULL REFERENCES scim_role_groups(id) ON DELETE CASCADE,
           user_id TEXT PRIMARY KEY,
+          role_id TEXT NOT NULL,
           prior_role TEXT,
           granted_at INTEGER NOT NULL
         );
@@ -5612,15 +5617,20 @@ impl Db {
 
     /// The IdP deleted it: it waits again, with what was declared and nobody in it. What
     /// it gave must have been taken away first. Its declared name comes back unless another
-    /// role group of the tenant has taken it since the IdP renamed this one.
+    /// role group or a team group of the tenant has taken it since the IdP renamed this one;
+    /// likewise its declared externalId.
     pub fn reset_scim_role_group(&self, id: &str) -> bool {
         let c = self.c();
         let Ok(tx) = c.unchecked_transaction() else { return false };
         let ok = tx.execute("DELETE FROM scim_role_group_members WHERE group_id = ?", [id]).is_ok()
             && tx
                 .execute(
-                    "UPDATE scim_role_groups SET provisioned_at = NULL, external_id = declared_external_id, updated_at = ?1,
+                    "UPDATE scim_role_groups SET provisioned_at = NULL, updated_at = ?1,
+                       external_id = CASE WHEN EXISTS (SELECT 1 FROM scim_groups t WHERE t.tenant = scim_role_groups.tenant AND t.external_id = scim_role_groups.declared_external_id)
+                           OR EXISTS (SELECT 1 FROM scim_role_groups o WHERE o.tenant = scim_role_groups.tenant AND o.id != scim_role_groups.id AND o.external_id = scim_role_groups.declared_external_id)
+                         THEN external_id ELSE declared_external_id END,
                        display_name = CASE WHEN EXISTS (SELECT 1 FROM scim_role_groups o WHERE o.tenant = scim_role_groups.tenant AND o.id != scim_role_groups.id AND o.display_name = scim_role_groups.declared_display_name)
+                           OR EXISTS (SELECT 1 FROM scim_groups t WHERE t.tenant = scim_role_groups.tenant AND t.display_name = scim_role_groups.declared_display_name)
                          THEN display_name ELSE declared_display_name END
                      WHERE id = ?2",
                     params![now(), id],
@@ -5726,7 +5736,10 @@ impl Db {
             if n == 0 {
                 return Ok(false);
             }
-            tx.execute("INSERT OR REPLACE INTO scim_role_group_grants (group_id, user_id, prior_role, granted_at) VALUES (?1, ?2, ?3, ?4)", params![g.id, user_id, prior, at])?;
+            tx.execute(
+                "INSERT OR REPLACE INTO scim_role_group_grants (group_id, user_id, role_id, prior_role, granted_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![g.id, user_id, g.role_id, prior, at],
+            )?;
             Ok::<_, rusqlite::Error>(true)
         })();
         matches!(res, Ok(true)) && tx.commit().is_ok()
@@ -5734,26 +5747,28 @@ impl Db {
 
     /// Takes away what the group gave `user_id`, and forgets the grant, in one transaction.
     /// Only the role they still hold from it is cleared, and their built-in role goes back
-    /// to the one they had before. None if it gave them nothing. `left`: they left the
-    /// group, so nothing is taken if they're in it again (an add that raced the removal).
-    pub fn revoke_scim_role_group(&self, g: &ScimRoleGroup, user_id: &str, left: bool) -> Option<ScimRevoked> {
+    /// to the one they had before. The role taken is the one the grant gave, which may
+    /// not be the group's role any more. None if it gave them nothing. `left`: they left
+    /// the group, so nothing is taken if they're in it again (an add that raced the removal).
+    pub fn revoke_scim_role_group(&self, g: &ScimRoleGroup, user_id: &str, left: bool) -> Option<(String, ScimRevoked)> {
         let c = self.c();
         let tx = c.unchecked_transaction().ok()?;
         let res = (|| {
             if left && tx.query_row("SELECT EXISTS (SELECT 1 FROM scim_role_group_members WHERE group_id = ?1 AND user_id = ?2)", [&g.id, user_id], |r| r.get::<_, bool>(0))? {
                 return Ok(None);
             }
-            let prior: Option<Option<String>> =
-                tx.query_row("DELETE FROM scim_role_group_grants WHERE group_id = ?1 AND user_id = ?2 RETURNING prior_role", [&g.id, user_id], |r| r.get(0)).optional()?;
-            let Some(prior) = prior else { return Ok(None) };
+            let grant: Option<(String, Option<String>)> = tx
+                .query_row("DELETE FROM scim_role_group_grants WHERE group_id = ?1 AND user_id = ?2 RETURNING role_id, prior_role", [&g.id, user_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            let Some((given, prior)) = grant else { return Ok(None) };
             let role = |tx: &Connection| tx.query_row("SELECT role FROM users WHERE id = ?", [user_id], |r| r.get::<_, String>(0)).optional();
             let before = role(&tx)?;
             // Never back to admin: a grant is never made to one, so a prior admin is a hand edit.
             let prior = prior.filter(|p| Role::parse(p).is_some_and(|r| r != Role::Admin));
-            let n = tx.execute("UPDATE users SET role_id = NULL, role = coalesce(?1, role), updated_at = ?2 WHERE id = ?3 AND role_id = ?4", params![prior, now(), user_id, g.role_id])?;
+            let n = tx.execute("UPDATE users SET role_id = NULL, role = coalesce(?1, role), updated_at = ?2 WHERE id = ?3 AND role_id = ?4", params![prior, now(), user_id, given])?;
             let after = role(&tx)?;
             let parse = |r: Option<String>| r.as_deref().and_then(Role::parse);
-            Ok::<_, rusqlite::Error>(Some(ScimRevoked { cleared: n > 0, role_before: parse(before), role_after: parse(after) }))
+            Ok::<_, rusqlite::Error>(Some((given, ScimRevoked { cleared: n > 0, role_before: parse(before), role_after: parse(after) })))
         })();
         match res {
             Ok(Some(r)) => tx.commit().ok().map(|_| r),

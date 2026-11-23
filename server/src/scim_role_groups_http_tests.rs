@@ -307,6 +307,44 @@ async fn a_role_group_never_shares_a_teams_id_and_a_reset_restores_its_declared_
     let (code, _, g) = scim(port, &t, "POST", GROUPS, group_body("Auditors", Some("x3"), &[&ivy])).await;
     assert_eq!((code, g["id"].as_str()), (201, Some(gid.as_str())), "pushed again by its declared name, it's the role group: {g}");
     assert_eq!(app.db.teams().len(), 1);
+
+    // Renamed again, a team takes the declared name meanwhile: the reset keeps the IdP's.
+    let rename = json!({ "schemas": [PATCH_OP], "Operations": [{ "op": "replace", "path": "displayName", "value": "Audit team" }] });
+    assert_eq!(scim(port, &t, "PATCH", &format!("{GROUPS}/{gid}"), rename).await.0, 204);
+    assert_eq!(scim(port, &t, "POST", GROUPS, group_body("Auditors", Some("x4"), &[])).await.0, 201);
+    assert_eq!(scim(port, &t, "DELETE", &format!("{GROUPS}/{gid}"), Value::Null).await.0, 204);
+    let (_, v) = json_call(port, "GET", &format!("{ROLE_GROUPS}/{gid}"), &admin, "").await;
+    assert_eq!((v["state"].as_str(), v["displayName"].as_str()), (Some("waiting"), Some("Audit team")), "never the team's name: {v}");
+}
+
+#[tokio::test]
+async fn a_role_change_cut_short_is_finished_by_the_same_change_again() {
+    let (port, app, admin) = serve(true).await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    let ann = person(port, &t, "ann@example.com").await;
+    let audit = role(port, &admin, "Auditor", "member", &["audit.view"]).await;
+    let review = role(port, &admin, "Reviewer", "member", &["audit.view"]).await;
+    let gid = declared(port, &admin, "okta", "Auditors", &audit).await;
+    push(port, &t, "Auditors", &[&ann]).await;
+    assert_eq!(role_of(&app, &ann), Some(audit.clone()));
+
+    // The new role was saved, then the server stopped before it took the old one away.
+    app.db.set_scim_role_group_role(&gid, &review).unwrap();
+    assert_eq!(role_of(&app, &ann), Some(audit.clone()));
+    let (code, v) = json_call(port, "PATCH", &format!("{ROLE_GROUPS}/{gid}"), &admin, &json!({ "role": review }).to_string()).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!((v["revoked"].clone(), v["granted"].clone()), (json!([ann]), json!([ann])), "{v}");
+    assert_eq!(role_of(&app, &ann), Some(review.clone()));
+    let gone = &events(port, &admin, "action=role.unassigned").await[0];
+    assert_eq!(gone["targetId"].as_str(), Some(audit.as_str()), "the role it gave goes: {gone}");
+
+    // Again, there's nothing left to do.
+    let (code, v) = json_call(port, "PATCH", &format!("{ROLE_GROUPS}/{gid}"), &admin, &json!({ "role": review }).to_string()).await;
+    assert_eq!((code, v.get("revoked")), (200, None), "{v}");
+    // Leaving the group takes away the role it gave.
+    let leave = json!({ "schemas": [PATCH_OP], "Operations": [{ "op": "remove", "path": format!("members[value eq \"{ann}\"]") }] });
+    assert_eq!(scim(port, &t, "PATCH", &format!("{GROUPS}/{gid}"), leave).await.0, 204);
+    assert_eq!(role_of(&app, &ann), None);
 }
 
 #[tokio::test]

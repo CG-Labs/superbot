@@ -30,14 +30,14 @@ A role group follows ADR 0138's org-scope rules, unchanged:
 
 - never `admin`, a built-in role, or a role holding `rbac::REACHES_ADMINS` permissions across the server (400, `scim.role_map_refused` with `kind: "role_group"`); a role a role group gives can't gain them (409), nor be deleted (409);
 - never over an admin, the owner account, or anyone with a custom role already (by hand, a mapping, or another role group), each skip audited as `scim.role_skipped`;
-- each grant is a row (`scim_role_group_grants`, one per person, with the built-in role it replaced); any change of that person's role by hand deletes it, so only untouched grants are taken back, and losing one puts back the built-in role;
+- each grant is a row (`scim_role_group_grants`, one per person, with the role it gave and the built-in role it replaced), and taking it away clears the role it gave, even if the group names another by then; any change of that person's role by hand deletes it, so only untouched grants are taken back, and losing one puts back the built-in role;
 - `SCIM_GROUP_ROLES=off` gives nothing and declares nothing, but taking away still runs, and a declared group the IdP pushes is still a role group, never a team.
 
 ### When it goes
 
-- **The IdP deletes it**: its members leave it and lose its role (reason `group_removed`), and the declaration goes back to waiting with the name and `externalId` the admin declared (the name unless another role group took it after the IdP renamed this one), so pushing it again makes it a role group again, never a team.
+- **The IdP deletes it**: its members leave it and lose its role (reason `group_removed`), and the declaration goes back to waiting with the name and `externalId` the admin declared (each unless another role group or a team group took it after the IdP changed this one; then it keeps the IdP's), so pushing it again makes it a role group again, never a team.
 - **An admin removes the declaration**: the role goes from everyone it gave it to (`role_group_removed`); the answer's `wasPushed` warns that an IdP still pushing the group will make it a team on its next `POST`.
-- **An admin changes its role**: `PATCH /api/scim/role-groups/{id}` saves and checks the new role first, so a refused change leaves every grant as it was, then takes the old role (`role_changed`) and offers the new one to every member.
+- **An admin changes its role**: `PATCH /api/scim/role-groups/{id}` saves and checks the new role first, so a refused change leaves every grant as it was, then takes the old role (`role_changed`) and offers the new one to every member. If the server stops part way, the same change again takes away the grants still on another role and finishes it.
 - **A SCIM `DELETE` of the user**: they leave every role group, losing its role (`user_deleted`).
 
 ### Google Workspace
