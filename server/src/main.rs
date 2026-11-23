@@ -15,9 +15,15 @@ mod acl_http_tests;
 mod adapters;
 mod approvals;
 mod audit;
+mod audit_archive;
+#[cfg(test)]
+mod audit_archive_http_tests;
 mod audit_chain;
 #[cfg(test)]
 mod audit_chain_http_tests;
+mod audit_checkpoint;
+#[cfg(test)]
+mod audit_checkpoint_http_tests;
 mod audit_export;
 #[cfg(test)]
 mod audit_http_tests;
@@ -118,6 +124,8 @@ mod machines_region_tests;
 mod machines_residency_tests;
 #[cfg(test)]
 mod residency_routes_http_tests;
+#[cfg(test)]
+mod residency_report_http_tests;
 mod passwd;
 mod plans;
 #[cfg(test)]
@@ -154,6 +162,8 @@ mod runner;
 mod sandbox;
 mod scim;
 #[cfg(test)]
+mod scim_bulk_http_tests;
+#[cfg(test)]
 mod scim_group_roles_http_tests;
 #[cfg(test)]
 mod scim_groups_http_tests;
@@ -168,6 +178,7 @@ mod service_accounts_http_tests;
 #[cfg(test)]
 mod server_backups_http_tests;
 mod setup;
+mod sigv4;
 #[cfg(test)]
 mod setup_http_tests;
 #[cfg(test)]
@@ -189,6 +200,7 @@ mod support;
 mod support_http_tests;
 mod stripe;
 mod tiers;
+mod tsa;
 mod billing;
 mod billing_mail;
 #[cfg(test)]
@@ -272,8 +284,9 @@ fn env(key: &str, default: &str) -> String {
 
 pub fn random_bytes(n: usize) -> Vec<u8> {
     use std::io::Read;
-    let mut b = vec![0u8; n];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).expect("read /dev/urandom");
+    let mut b = Vec::with_capacity(n);
+    std::fs::File::open("/dev/urandom").and_then(|f| f.take(n as u64).read_to_end(&mut b)).expect("read /dev/urandom");
+    assert_eq!(b.len(), n, "short read from /dev/urandom");
     b
 }
 
@@ -318,7 +331,7 @@ async fn main() {
     obs::log::set_format(observe.log);
     match (&external, external_names) {
         (Some(x), Some(n)) => log_info!("Secrets backend: {} ({n} names; SECRETS_BACKEND, ADR 0125).", x.describe()),
-        _ => log_info!("Secrets backend: local (the environment and the sealed store; SECRETS_BACKEND=vault, azure-keyvault or gcp-secret-manager adds one, ADR 0125, ADR 0136)."),
+        _ => log_info!("Secrets backend: local (the environment and the sealed store; SECRETS_BACKEND=vault, azure-keyvault, gcp-secret-manager or aws adds one, ADR 0125, ADR 0136, ADR 0146)."),
     }
     obs::errors::install_panic_hook();
     obs::errors::start(&observe.errors);
@@ -360,6 +373,7 @@ async fn main() {
         std::process::exit(1);
     });
     let audit_export = audit_export::Settings::from_env(&|k| env(k, ""), &startup_store).unwrap_or_else(|e| exit(format!("Audit export: {e}")));
+    let audit_checkpoints = audit_checkpoint::Settings::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Audit checkpoints: {e}")));
     let chat_retention = retention::days("CHAT_RETENTION_DAYS", &env("CHAT_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
     let session_retention = retention::days("HARNESS_SESSION_RETENTION_DAYS", &env("HARNESS_SESSION_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
     let teammate_files_retention = retention::days("TEAMMATE_FILES_RETENTION_DAYS", &env("TEAMMATE_FILES_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
@@ -747,6 +761,8 @@ async fn main() {
         "sessionMaxMinutes": sessions.max_ms / 60_000,
         "auditRetentionDays": retention,
         "auditExport": audit_export.sink.as_ref().map(|s| json!({ "kind": s.kind(), "sink": s.shown })),
+        "auditCheckpointMinutes": audit_checkpoints.every,
+        "auditTimestamps": audit_checkpoints.tsa.as_ref().map(|t| json!({ "tsa": t.shown, "trustAnchors": audit_checkpoints.trust.len() })),
         "chatRetentionDays": chat_retention,
         "harnessSessionRetentionDays": session_retention,
         "teammateFilesRetentionDays": teammate_files_retention,
@@ -777,6 +793,8 @@ async fn main() {
     license::start(app.clone());
     log_info!("Audit export: {} (ADR 0122).", audit_export.describe());
     audit_export::start(&app, audit_export);
+    log_info!("Audit checkpoints: {} (ADR 0149).", audit_checkpoints.describe());
+    audit_checkpoint::start(&app, audit_checkpoints);
     audit::start_retention(app.clone(), retention);
     secrets::external::start_audit(app.clone());
     audit_chain::start(app.clone());
@@ -920,6 +938,9 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/audit/export.csv", get(export_audit))
         .route("/audit/verify", get(audit_chain::get))
         .route("/audit/siem", get(audit_export::get))
+        .route("/audit/chain", get(audit_checkpoint::get_chain))
+        .route("/audit/checkpoints", get(audit_checkpoint::get_list).post(audit_checkpoint::post))
+        .route("/audit/checkpoints/key", get(audit_checkpoint::get_key))
         .route("/access-review", get(access_review::get))
         .route("/access-review/export.csv", get(access_review::export))
         .route("/access-review/complete", post(access_review::complete))
@@ -987,6 +1008,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/region", get(machines::region::get_user).put(machines::region::set_user))
         .route("/users/{key}/machine/egress-policy", get(machines::egress_policy::get_user).put(machines::egress_policy::set_user))
         .route("/users/{key}/residency", get(machines::region::get_user).put(machines::residency::pin_user).delete(machines::residency::unpin_user))
+        .route("/users/{key}/residency/report", get(machines::residency_report::user))
         .route("/users/{key}/machine/suspend", post(machines::suspend))
         .route("/users/{key}/machine/resume", post(machines::resume))
         .route("/users/{key}/machine/resize", get(machines::resize::status).post(machines::resize))
@@ -1038,6 +1060,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/teams/{id}", get(teams::get).patch(teams::update).delete(teams::delete))
         .route("/teams/{id}/region", get(machines::region::get_team).put(machines::region::set_team))
         .route("/teams/{id}/residency", get(machines::region::get_team).put(machines::residency::pin_team).delete(machines::residency::unpin_team))
+        .route("/teams/{id}/residency/report", get(machines::residency_report::team))
         .route("/teams/{id}/members/{user}", put(teams::put_member).delete(teams::delete_member))
         .route("/team", get(teams::mine))
         .route("/team/leave", post(teams::leave_mine))
@@ -1106,6 +1129,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
             "/scim/v2/Groups/{id}",
             get(scim::groups::get).put(scim::groups::replace).patch(scim::groups::patch).delete(scim::groups::delete).layer(DefaultBodyLimit::max(scim::groups::MAX_BODY)),
         )
+        // Bulk's maxPayloadSize (ADR 0153); each operation keeps its endpoint's own limit.
+        .route("/scim/v2/Bulk", post(scim::bulk::bulk).fallback(scim::bulk::only_post).layer(DefaultBodyLimit::max(scim::bulk::MAX_PAYLOAD)))
         .route("/scim/v2", any(scim::unknown))
         .route("/scim/v2/{*rest}", any(scim::unknown))
         .route_layer(middleware::from_fn(obs::note_route))

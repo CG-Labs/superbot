@@ -1922,7 +1922,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 56] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 57] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1978,6 +1978,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 56] = [
     migrate_scim_group_roles,
     migrate_service_accounts,
     migrate_user_last_seen,
+    migrate_audit_checkpoints,
     migrate_health_scores,
 ];
 
@@ -1992,6 +1993,39 @@ fn migrate_health_scores(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
           band TEXT NOT NULL,
           signals TEXT NOT NULL
         );",
+    )
+}
+
+/// Signed checkpoints of the audit chain's head, and their RFC 3161 tokens (ADR 0149). A
+/// row is keyed by the `audit.checkpoint` event that carries it. What was signed never
+/// changes, and a token once stored stays; pruning deletes a row with its event, or its
+/// timestamp event when that came later.
+fn migrate_audit_checkpoints(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS audit_checkpoints (
+          event_id INTEGER PRIMARY KEY,
+          at INTEGER NOT NULL,
+          seq INTEGER NOT NULL,
+          hash TEXT NOT NULL,
+          key_id TEXT NOT NULL,
+          public_key TEXT NOT NULL,
+          signature TEXT NOT NULL,
+          tsa_status TEXT NOT NULL,
+          tsa TEXT,
+          tsa_token TEXT,
+          tsa_time INTEGER,
+          tsa_nonce TEXT,
+          tsa_tries INTEGER NOT NULL DEFAULT 0,
+          tsa_error TEXT,
+          tsa_event_id INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS audit_checkpoints_pending ON audit_checkpoints(tsa_status, event_id);
+        CREATE TRIGGER IF NOT EXISTS audit_checkpoints_signed BEFORE UPDATE ON audit_checkpoints
+          WHEN NEW.event_id IS NOT OLD.event_id OR NEW.at IS NOT OLD.at OR NEW.seq IS NOT OLD.seq OR NEW.hash IS NOT OLD.hash
+            OR NEW.key_id IS NOT OLD.key_id OR NEW.public_key IS NOT OLD.public_key OR NEW.signature IS NOT OLD.signature
+            OR (OLD.tsa_token IS NOT NULL AND (NEW.tsa_token IS NOT OLD.tsa_token OR NEW.tsa_time IS NOT OLD.tsa_time
+              OR NEW.tsa_nonce IS NOT OLD.tsa_nonce OR NEW.tsa_event_id IS NOT OLD.tsa_event_id OR NEW.tsa_status IS NOT OLD.tsa_status))
+          BEGIN SELECT RAISE(ABORT, 'audit checkpoints are signed: only a missing timestamp can be added'); END;",
     )
 }
 
@@ -3977,6 +4011,12 @@ impl Db {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The connection, for a module that keeps its own table (audit checkpoints, ADR 0149).
+    /// `f` must not call back into `Db`: the connection is held until it returns.
+    pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> T) -> T {
+        f(&self.c())
+    }
+
     /// Set once, by the app, from its license (ADR 0038).
     pub fn set_seat_cap(&self, cap: SeatCap) {
         let _ = self.1.set(cap);
@@ -5552,7 +5592,7 @@ impl Db {
     fn pseudonymise_audit(c: &Connection, s: &Scrub, named: &Scrub) -> rusqlite::Result<usize> {
         c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", params![AUDIT_ERASING, s.pseudonym])?;
         let mut sql = String::from(
-            "SELECT id, actor_id, actor_name, actor_email, actor_subject, target_id, on_behalf_of, ip, user_agent, session_id, details FROM audit_events
+            "SELECT id, actor_id, actor_name, actor_email, actor_subject, target_id, on_behalf_of, ip, user_agent, session_id, details, action FROM audit_events
              WHERE action != ?2 AND (actor_id = ?1 OR target_id = ?1 OR on_behalf_of = ?1 OR instr(details, ?1) > 0",
         );
         let mut args: Vec<String> = vec![s.id.clone(), crate::audit_chain::ERASED.into()];
@@ -5565,14 +5605,14 @@ impl Db {
             sql.push_str(&format!(" OR actor_subject = ?{n} OR instr(details, ?{n}) > 0", n = args.len()));
         }
         sql.push(')');
-        type Row = (i64, [Option<String>; 9], String);
+        type Row = (i64, [Option<String>; 9], String, String);
         let rows: Vec<Row> = {
             let mut st = c.prepare(&sql)?;
-            let rows = st.query_map(rusqlite::params_from_iter(&args), |r| Ok((r.get(0)?, [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?], r.get(10)?)))?;
+            let rows = st.query_map(rusqlite::params_from_iter(&args), |r| Ok((r.get(0)?, [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?], r.get(10)?, r.get(11)?)))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
         let mut cleared = Vec::new();
-        for (id, [actor_id, name, email, subject, target, behalf, ip, agent, session], details) in rows {
+        for (id, [actor_id, name, email, subject, target, behalf, ip, agent, session], details, action) in rows {
             let is = |v: &Option<String>| v.as_deref() == Some(s.id.as_str());
             // A visitor without an account (a signup) is known only by the email they gave.
             let visitor = actor_id.is_none() && email.as_deref().is_some_and(|e| s.emails.contains(&e.to_lowercase()));
@@ -5585,7 +5625,11 @@ impl Db {
             let email_match = email.as_deref().is_some_and(|e| s.emails.contains(&e.to_lowercase()));
             let subject_match = subject.as_deref().is_some_and(|x| s.exact.contains(&x.to_lowercase()));
             let mut d: Value = serde_json::from_str(&details).unwrap_or(Value::Null);
-            let changed = s.value(&mut d);
+            // A checkpoint's details are signed hashes and numbers, and its timestamp's are
+            // the TSA's (ADR 0149): a match in them is a coincidence, and rewriting them
+            // would break what a check holds them to.
+            let signed = [crate::audit_checkpoint::CHECKPOINT, crate::audit_checkpoint::TIMESTAMPED].contains(&action.as_str());
+            let changed = !signed && s.value(&mut d);
             let next = (
                 swap(actor_id.clone()),
                 mine(name.clone(), false),
@@ -7286,6 +7330,27 @@ impl Db {
 
     /// [`Db::try_record`] as of `at` (unix ms), for tests of what happens to old events.
     pub(crate) fn record_at(&self, e: &audit::Event, at: i64) -> rusqlite::Result<i64> {
+        self.record_sealed(e, at, |_, _, _| Ok(None))
+    }
+
+    /// Records `e` with details `details` makes inside the audit log's write lock, from the
+    /// new event's id and the head it seals onto, in the same transaction as anything
+    /// it writes: a checkpoint signs that head (ADR 0149). Its details are stored as
+    /// they come, so they must hold nothing personal or secret.
+    pub(crate) fn record_with(
+        &self,
+        e: &audit::Event,
+        details: impl FnOnce(&Connection, i64, Option<&crate::audit_chain::Link>) -> rusqlite::Result<serde_json::Value>,
+    ) -> rusqlite::Result<i64> {
+        self.record_sealed(e, now(), |c, id, head| details(c, id, head).map(Some))
+    }
+
+    fn record_sealed(
+        &self,
+        e: &audit::Event,
+        at: i64,
+        hook: impl FnOnce(&Connection, i64, Option<&crate::audit_chain::Link>) -> rusqlite::Result<Option<serde_json::Value>>,
+    ) -> rusqlite::Result<i64> {
         let o = |v: &Option<String>, max: usize| v.as_deref().map(|s| audit::clip(s, max));
         let a = &e.actor;
         let bot_actor = matches!(a.kind, audit::ActorKind::Bot).then_some(a.id.as_deref()).flatten();
@@ -7327,7 +7392,7 @@ impl Db {
             ("session_id", v(o(&a.session, 64))),
             ("on_behalf_of", v(o(&a.on_behalf_of, 128))),
         ];
-        let res = crate::audit_chain::insert(&self.c(), &cols);
+        let res = crate::audit_chain::insert_with(&self.c(), &cols, hook);
         let reason = e.details.get("reason").and_then(|r| r.as_str());
         self.metrics().audited(&e.action, e.outcome.as_str(), reason);
         crate::obs::trace::audited(&e.action, e.outcome.as_str(), reason);
@@ -7520,6 +7585,9 @@ impl Db {
             tx.query_row("SELECT id, chain_hash FROM audit_events WHERE id < ? ORDER BY id DESC LIMIT 1", [end], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
         let Some((last, hash)) = last else { return Ok((0, None)) };
         let n = tx.execute("DELETE FROM audit_events WHERE id <= ?", [last])?;
+        // A record outlives its checkpoint while its timestamp event is still in the log, so that
+        // event's export and check still have the token.
+        tx.execute("DELETE FROM audit_checkpoints WHERE event_id <= ?1 AND (tsa_event_id IS NULL OR tsa_event_id <= ?1)", [last])?;
         let anchor = hash.map(|hash| crate::audit_chain::Link { id: last, hash });
         if let Some(a) = &anchor {
             crate::audit_chain::set_anchor(&tx, a)?;
@@ -9266,6 +9334,29 @@ impl Db {
         let c = self.c();
         let mut s = c.prepare("SELECT * FROM residency_pins ORDER BY pinned_at, subject_type, subject_id").unwrap();
         s.query_map([], residency_pin_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Audit events from `from` (inclusive) to `to` (exclusive), unix ms, that bear on
+    /// residency pins (ADR 0155): those whose action is one of `actions`, and
+    /// `harness.invoked` only for runs held to a region. Oldest first, at most `limit`.
+    pub fn residency_audit(&self, from: i64, to: i64, actions: &[&str], limit: i64) -> rusqlite::Result<Vec<AuditEvent>> {
+        use rusqlite::types::Value as V;
+        let marks = vec!["?"; actions.len().max(1)].join(", ");
+        let sql = format!(
+            "SELECT * FROM audit_events WHERE at >= ? AND at < ? AND (action IN ({marks})
+               OR (action = 'harness.invoked' AND json_valid(details) AND json_extract(details, '$.residency') IS NOT NULL))
+             ORDER BY id ASC LIMIT ?"
+        );
+        let mut args = vec![V::Integer(from), V::Integer(to)];
+        args.extend(actions.iter().map(|a| V::Text(a.to_string())));
+        if actions.is_empty() {
+            args.push(V::Null);
+        }
+        args.push(V::Integer(limit));
+        let c = self.c();
+        let mut s = c.prepare(&sql)?;
+        let rows = s.query_map(rusqlite::params_from_iter(args), audit_row)?;
+        rows.collect()
     }
 
     /// Sets the user's or team's own data region to `region` and pins them there (or

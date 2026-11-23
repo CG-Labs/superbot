@@ -82,30 +82,35 @@ pub fn unready(cp: &ControlPlane, region: &str) -> Vec<String> {
 }
 
 /// Whether a backup recorded in `store_region`'s store (None: the default store) is in `region`.
-fn stored_in(off: Option<&Offsite>, store_region: Option<&str>, region: &str) -> bool {
+pub(super) fn stored_in(off: Option<&Offsite>, store_region: Option<&str>, region: &str) -> bool {
     match store_region {
         Some(r) => r == region,
         None => off.is_some_and(|o| o.s.default_region.as_deref() == Some(region)),
     }
 }
 
+/// The Incus host `m` is on now and that host's data region, when botd's hosts hold it.
+pub(super) fn host_of(cp: &ControlPlane, m: &Machine) -> Option<(String, Option<String>)> {
+    let h = cp.hosts().filter(|_| cp.owns(m))?;
+    let host = m.provider_id.as_deref().map(|p| h.host_of(p)).or_else(|| m.placed_on.clone())?;
+    let region = h.configured().into_iter().find(|c| c.name == host).and_then(|c| c.region);
+    Some((host, region))
+}
+
 /// What of `user_id`'s data is outside `region` now: their machine (by its record, and by
 /// its host's tag now, since a machine made before hosts were tagged may be on any host),
 /// and backups in a store elsewhere that aren't deleted. A failed one counts: its upload
 /// may have finished before it failed. Empty: all of it is in.
-fn outside(app: &App, cp: &ControlPlane, user_id: &str, region: &str) -> Vec<String> {
+pub(super) fn outside(app: &App, cp: &ControlPlane, user_id: &str, region: &str) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(m) = app.db.user_machine(user_id) {
         if m.region != region {
             out.push(format!("their machine is in {}", m.region));
-        } else if let Some(h) = cp.hosts().filter(|_| cp.owns(&m)) {
-            let host = m.provider_id.as_deref().map(|p| h.host_of(p)).or_else(|| m.placed_on.clone());
-            if let Some(host) = host {
-                match h.configured().into_iter().find(|c| c.name == host).and_then(|c| c.region) {
-                    Some(r) if r == region => {}
-                    Some(r) => out.push(format!("their machine is on host {host}, in {r}")),
-                    None => out.push(format!("their machine is on host {host}, which has no data region")),
-                }
+        } else if let Some((host, r)) = host_of(cp, &m) {
+            match r {
+                Some(r) if r == region => {}
+                Some(r) => out.push(format!("their machine is on host {host}, in {r}")),
+                None => out.push(format!("their machine is on host {host}, which has no data region")),
             }
         }
     }
@@ -122,7 +127,7 @@ fn outside(app: &App, cp: &ControlPlane, user_id: &str, region: &str) -> Vec<Str
     out
 }
 
-fn pinned_to(p: &ResidencyPin) -> String {
+pub(super) fn pinned_to(p: &ResidencyPin) -> String {
     format!("pinned to {} ({})", p.region, p.reference)
 }
 
@@ -263,22 +268,33 @@ pub fn check_join(app: &App, cp: &ControlPlane, t: &Team, u: &User) -> Result<()
     }
 }
 
+/// Whom `p` is on, as "User <name>" or "Team <name>", and the people whose data it
+/// holds now: the user, or the team's members. None: they are gone.
+pub(super) fn held_by(app: &App, p: &ResidencyPin) -> Option<(String, Vec<String>)> {
+    match p.subject_type {
+        PinOn::User => app.db.user(&p.subject_id).map(|u| (format!("User {}", u.name), vec![u.id])),
+        PinOn::Team => app.db.team(&p.subject_id).map(|t| (format!("Team {}", t.name), app.db.team_members(&t.id).into_iter().map(|m| m.user_id).collect())),
+    }
+}
+
+/// Why `people`'s plans have no model route in `region` (ADR 0139), each once.
+pub(super) fn route_gaps(app: &App, people: &[String], region: &str) -> Vec<String> {
+    let mut gaps: Vec<String> = Vec::new();
+    for id in people {
+        if let Some(g) = app.tiers().residency_gap(app.tier_of(id), region).filter(|g| !gaps.contains(g)) {
+            gaps.push(g);
+        }
+    }
+    gaps
+}
+
 /// Warnings for startup and admins: pins whose region this server can't keep now, or
 /// whose data is outside it. Their backups and restores are refused until fixed. Also
 /// pins whose people's plans have no model route there (ADR 0139), whose runs are refused.
 pub fn warnings(app: &App, cp: &ControlPlane) -> Vec<String> {
     let mut out: Vec<String> = app.tiers().unknown_regions(&cp.regions).into_iter().map(|w| format!("The tiers file's {w} (ADR 0139).")).collect();
     for p in app.db.residency_pins() {
-        let (name, people): (String, Vec<String>) = match p.subject_type {
-            PinOn::User => match app.db.user(&p.subject_id) {
-                Some(u) => (format!("User {}", u.name), vec![u.id]),
-                None => continue,
-            },
-            PinOn::Team => match app.db.team(&p.subject_id) {
-                Some(t) => (format!("Team {}", t.name), app.db.team_members(&t.id).into_iter().map(|m| m.user_id).collect()),
-                None => continue,
-            },
-        };
+        let Some((name, people)) = held_by(app, &p) else { continue };
         let mut why = unready(cp, &p.region);
         for id in &people {
             why.extend(outside(app, cp, id, &p.region));
@@ -286,12 +302,7 @@ pub fn warnings(app: &App, cp: &ControlPlane) -> Vec<String> {
         if !why.is_empty() {
             out.push(format!("{name} is {}, but {}. Backups, restores and new machines that can't stay there are refused (ADR 0129).", pinned_to(&p), why.join("; ")));
         }
-        let mut gaps: Vec<String> = Vec::new();
-        for id in &people {
-            if let Some(g) = app.tiers().residency_gap(app.tier_of(id), &p.region).filter(|g| !gaps.contains(g)) {
-                gaps.push(g);
-            }
-        }
+        let gaps = route_gaps(app, &people, &p.region);
         if !gaps.is_empty() {
             out.push(format!(
                 "{name} is {}, but {}. Their Bots' runs are refused until the tiers file routes them through a provider whose regions include {} (ADR 0139).",

@@ -5,12 +5,13 @@
 //! 2. `SealedStore`: values the operator saves with `botctl secret set` or the API,
 //!    encrypted in SQLite with the master key (see `key`, `sealed`).
 //!
-//! With `SECRETS_BACKEND=vault`, `azure-keyvault` or `gcp-secret-manager`, an
+//! With `SECRETS_BACKEND=vault`, `azure-keyvault`, `gcp-secret-manager` or `aws`, an
 //! `external::ExternalStore` over that secrets manager sits between the two (ADR 0125,
-//! ADR 0136); AWS Secrets Manager would be another `external::Provider`. Values never leave botd except into a harness's environment;
+//! ADR 0136, ADR 0146). Values never leave botd except into a harness's environment;
 //! the API lists names only. Every known value is redacted from saved text, events,
 //! and the audit log (`redact`). See docs/adr/0010-secrets.md.
 
+pub mod aws;
 pub mod azure;
 pub mod env;
 pub mod external;
@@ -24,7 +25,7 @@ pub mod vault;
 use env::EnvStore;
 use serde::Serialize;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use zeroize::Zeroizing;
 
 /// A secret value. Zeroed when dropped; never printed by `{:?}`.
@@ -120,6 +121,33 @@ const RESERVED: [&str; 21] = ["VAULT_TOKEN", "VAULT_ROLE_ID", "VAULT_SECRET_ID",
 const RESERVED_PREFIXES: [&str; 7] = ["SUPERBOT_", "BOT_", "SSO_", "LD_", "DYLD_", "AGENT_BROWSER_", "VOXL_"];
 pub const MAX_VALUE: usize = 64 * 1024;
 
+/// The credentials botd signs in to its external store with, when their names depend on
+/// its settings (AWS's chain, ADR 0146), and the settings that lead to them. Reserved
+/// like `RESERVED`, and kept from everything botd starts, from startup on.
+static SIGN_IN: RwLock<(Vec<&'static str>, Vec<&'static str>)> = RwLock::new((Vec::new(), Vec::new()));
+
+pub(crate) fn keep_from_bots(reserved: &[&'static str], settings: &[&'static str]) {
+    let mut guard = SIGN_IN.write().unwrap_or_else(|e| e.into_inner());
+    let (names, others) = &mut *guard;
+    for (have, add) in [(names, reserved), (others, settings)] {
+        for n in add {
+            if !have.contains(n) {
+                have.push(n);
+            }
+        }
+    }
+}
+
+/// What `keep_from_bots` keeps from what botd starts: the names, their `_FILE`, the settings.
+pub(crate) fn sign_in_env() -> Vec<String> {
+    let s = SIGN_IN.read().unwrap_or_else(|e| e.into_inner());
+    s.0.iter().flat_map(|n| [n.to_string(), format!("{n}_FILE")]).chain(s.1.iter().map(|n| n.to_string())).collect()
+}
+
+fn signs_in_with(name: &str) -> bool {
+    SIGN_IN.read().unwrap_or_else(|e| e.into_inner()).0.contains(&name)
+}
+
 pub(crate) fn env_shaped(name: &str) -> bool {
     !name.is_empty() && name.len() <= 128 && name.bytes().enumerate().all(|(i, b)| b == b'_' || b.is_ascii_uppercase() || (i > 0 && b.is_ascii_digit()))
 }
@@ -128,7 +156,7 @@ pub fn check_name(name: &str) -> Result<(), Error> {
     if !env_shaped(name) {
         return Err(Error::Invalid("Use an environment variable name: A-Z, 0-9, and _, not starting with a digit.".into()));
     }
-    if RESERVED.contains(&name) || RESERVED_PREFIXES.iter().any(|p| name.starts_with(p)) {
+    if RESERVED.contains(&name) || RESERVED_PREFIXES.iter().any(|p| name.starts_with(p)) || signs_in_with(name) {
         return Err(Error::Invalid(format!("{name} is reserved by SuperBot.")));
     }
     Ok(())
@@ -152,9 +180,9 @@ pub fn server_secret(name: &str) -> bool {
 /// token that lets botd push to every registered phone (ADR 0080), the token
 /// scrapers send to `/metrics` (ADR 0089), the error tracker's DSN (ADR 0113), the
 /// headers sent to the trace collector (ADR 0118) and the audit log's SIEM sink (ADR
-/// 0122), and the keys to the stores that hold every machine's backups (ADR 0071) and
-/// the server's own (ADR 0109).
-pub const SERVER_SECRETS: [&str; 13] = [
+/// 0122), and the keys to the stores that hold every machine's backups (ADR 0071), the
+/// server's own (ADR 0109) and the audit archive (ADR 0154).
+pub const SERVER_SECRETS: [&str; 14] = [
     "TURNSTILE_SECRET",
     "LINODE_TOKEN",
     "INCUS_CLIENT_KEY",
@@ -168,6 +196,7 @@ pub const SERVER_SECRETS: [&str; 13] = [
     "AUDIT_EXPORT_HEADERS",
     "MACHINE_BACKUP_S3_SECRET_ACCESS_KEY",
     "SERVER_BACKUP_S3_SECRET_ACCESS_KEY",
+    "AUDIT_EXPORT_S3_SECRET_ACCESS_KEY",
 ];
 
 /// Each Bot's own notification webhook URL: `NOTIFY_WEBHOOK_URL_BOT_<ID>` (ADR 0061).

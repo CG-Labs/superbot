@@ -98,6 +98,10 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    Pin their data to a region under an agreement (ADR 0129):
                                                    machines, backups and restores stay there or are refused.
                                                    Refused while any of it is elsewhere. Unpinning needs a reason
+  botctl user|team residency <user|team> report [--from <when>] [--to <when>] [--json] [-o <file>]
+                                                   A residency report for the customer (ADR 0155): where their
+                                                   data is, what the pin refused or held, with a digest.
+                                                   Markdown unless --json; the last 90 days by default
   botctl regions                                   The data regions offered, who and what is in each, the
                                                    hosts and backup store in each, and residency warnings
   botctl tiers                                     Every tier, its routes and limits, and the default
@@ -185,10 +189,19 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl deny <id> [--remember | --remember-global]
   botctl audit [<limit>] [filters]                 Recent audit events, newest first
   botctl audit export [filters] > audit.csv        All matching events as CSV, oldest first
-  botctl audit verify [--pin <id>:<hash>]...       Check the audit log's hash chain; names the first
-                                                   broken link, exits 1 if there is one. --pin: a hash
-                                                   kept elsewhere (your SIEM) the row must still have
+  botctl audit verify [--pin <id>:<hash>]... [--from <id>] [--to <id>] [--key <hex>]...
+                                                   Check the audit log's hash chain, its signed
+                                                   checkpoints and their timestamps; names the first
+                                                   break, exits 1 if there is one. --pin: a hash kept
+                                                   elsewhere (your SIEM) the row must still have.
+                                                   --from/--to: only those event ids. --key: trust only
+                                                   this checkpoint key (from botctl audit key)
   botctl audit siem                                The SIEM export: sink, delivered, pending, failing
+  botctl audit chain                               The chain's state: head, last checkpoint and
+                                                   timestamp, export lag, last check
+  botctl audit key                                 The public key checkpoints are signed with
+  botctl audit checkpoint                          Sign a checkpoint of the head now
+  botctl audit checkpoints [<limit>]               Recent checkpoints, with their RFC 3161 tokens
     filters: --from <time> --to <time> --action <a,b.*> --actor <user|bot|system[:id]>
              --actor user:<email> --method <password,code,sso,none,bot_token,scim_token>
              --idp <entra|google|oidc|github|apple|saml> --idp-provider <id> --subject <issuer|sub>
@@ -280,7 +293,7 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine removals [<state>]                Teammate removals: open (default), pending, held, done, cancelled, all
   botctl secrets                                   List secret names (never values)
   botctl secrets backend                           Where botd reads secrets from (local, Vault, Azure Key
-                                                   Vault, GCP Secret Manager) and whether it answers now
+                                                   Vault, GCP or AWS Secrets Manager) and whether it answers now
   botctl secret set <NAME> < value-file            Save a secret, encrypted; Bots get it as $NAME
   botctl secret rm <NAME>                          Delete a saved secret
 
@@ -790,18 +803,30 @@ fn audit_query(rest: &[&str]) -> Result<String, String> {
     Ok(if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) })
 }
 
-/// `botctl audit verify [--pin <id>:<hash>]...`: hashes kept elsewhere (a SIEM, an
-/// earlier check) to hold the chain to.
+/// `botctl audit verify [--pin <id>:<hash>]... [--from <id>] [--to <id>] [--key <hex>]...`:
+/// hashes kept elsewhere (a SIEM, an earlier check) to hold the chain to, the event ids
+/// to check, and the checkpoint keys to trust instead of botd's own.
 fn verify_query(rest: &[&str]) -> Result<String, String> {
-    let mut pins = Vec::new();
+    let (mut pins, mut keys, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match *a {
             "--pin" => pins.push(encode(it.next().ok_or("--pin needs <event id>:<hash>")?)),
+            "--key" => keys.push(encode(it.next().ok_or("--key needs a public key in hex (botctl audit key)")?)),
+            o @ ("--from" | "--to") => {
+                let id = it.next().filter(|v| v.parse::<i64>().is_ok()).ok_or_else(|| format!("{o} needs an event id"))?;
+                pairs.push(format!("{}={id}", &o[2..]));
+            }
             other => return Err(format!("Unknown audit verify option \"{other}\". See botctl admin.")),
         }
     }
-    Ok(if pins.is_empty() { String::new() } else { format!("?pin={}", pins.join(",")) })
+    if !pins.is_empty() {
+        pairs.insert(0, format!("pin={}", pins.join(",")));
+    }
+    if !keys.is_empty() {
+        pairs.push(format!("key={}", keys.join(",")));
+    }
+    Ok(if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) })
 }
 
 fn flag<'a>(rest: &[&'a str], name: &str) -> Option<&'a str> {
@@ -828,6 +853,27 @@ fn region_request(args: &[&str]) -> Option<(&'static str, String, Option<String>
         }
         _ => return None,
     })
+}
+
+/// `botctl user|team residency <key> report [--from <when>] [--to <when>] [--json] [-o <file>]`
+/// (ADR 0155): the path, and the file to save it in.
+fn residency_report_request<'a>(kind: &str, key: &str, rest: &[&'a str]) -> Result<(String, Option<&'a str>), String> {
+    let usage = || format!("Usage: botctl {kind} residency <{kind}> report [--from <when>] [--to <when>] [--json] [-o <file>]");
+    let (mut pairs, mut json, mut out) = (Vec::new(), false, None);
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "--json" => json = true,
+            f @ ("--from" | "--to") => pairs.push(format!("{}={}", &f[2..], encode(it.next().ok_or_else(usage)?))),
+            "-o" | "--out" => out = Some(*it.next().ok_or_else(usage)?),
+            _ => return Err(usage()),
+        }
+    }
+    if !json {
+        pairs.push("format=markdown".into());
+    }
+    let q = if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) };
+    Ok((format!("/api/{kind}s/{}/residency/report{q}", encode(key)), out))
 }
 
 /// `botctl machine egress ...` and `botctl user egress ...` (ADR 0135): the request to send.
@@ -1325,7 +1371,7 @@ fn setup_summary(s: &Value) -> String {
     out
 }
 
-/// Where botd reads secrets from and whether it answers (ADR 0125, ADR 0136); an error
+/// Where botd reads secrets from and whether it answers (ADR 0125, ADR 0136, ADR 0146); an error
 /// when it doesn't, so scripts can check it.
 fn backend_summary(b: &Value) -> Result<String, String> {
     if b.is_null() {
@@ -1404,6 +1450,17 @@ fn saml_summary(v: &Value) -> String {
             _ => "off",
         }
     );
+    out += &format!(
+        "  IdP metadata signature:   {}\n",
+        match v["signedMetadata"].as_str() {
+            Some("require") => "required",
+            Some("allow") => "checked when signed",
+            _ => "not checked",
+        }
+    );
+    for c in v["metadataSigningCertificates"].as_array().into_iter().flatten() {
+        out += &format!("    Trusted signer: SHA-256 {} ({}), expires {}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]));
+    }
     let yes = |b: bool| if b { "yes" } else { "no" };
     out += &format!(
         "  Signs AuthnRequests:      {}\n  Single logout:            {}\n",
@@ -1684,6 +1741,14 @@ fn run(args: &[String]) -> Result<String, String> {
             if serde_json::from_str::<Value>(&res).ok().and_then(|v| v["ok"].as_bool()) == Some(false) { Err(res) } else { Ok(res) }
         }
         ["audit", "siem"] => op("GET", "/api/audit/siem", None),
+        ["audit", "chain"] => op("GET", "/api/audit/chain", None),
+        ["audit", "key"] => op("GET", "/api/audit/checkpoints/key", None),
+        ["audit", "checkpoint"] => op("POST", "/api/audit/checkpoints", None),
+        ["audit", "checkpoints"] => op("GET", "/api/audit/checkpoints", None),
+        ["audit", "checkpoints", limit] => {
+            let n: u32 = limit.parse().map_err(|_| format!("{limit} isn't a number of checkpoints"))?;
+            op("GET", &format!("/api/audit/checkpoints?limit={n}"), None)
+        }
         ["audit", rest @ ..] => op("GET", &format!("/api/audit{}", audit_query(rest)?), None),
         ["retention"] => op("GET", "/api/retention", None),
         ["retention", "hold", bot, reason] => op("PUT", &format!("/api/retention/holds/{}", encode(bot)), Some(json!({ "reason": reason }).to_string())),
@@ -1696,6 +1761,15 @@ fn run(args: &[String]) -> Result<String, String> {
         ["logout"] => op("POST", "/api/auth/logout", None).map(|_| "Signed out. Unset SUPERBOT_TOKEN.".into()),
         ["whoami"] => op("GET", "/api/auth/me", None),
         ["users"] | ["user", "list"] => op("GET", "/api/users", None),
+        [kind @ ("user" | "team"), "residency", key, "report", rest @ ..] => {
+            let (path, out) = residency_report_request(kind, key, rest)?;
+            let res = api(Cred::Operator, "GET", &path, None)?;
+            let res = if path.contains("format=markdown") { res } else { pretty(res) };
+            match out {
+                Some(file) => save_private(file, res.as_bytes()).map(|_| format!("Saved {file}.")),
+                None => Ok(res),
+            }
+        }
         [..] if region_request(&a).is_some() => {
             let (method, path, body) = region_request(&a).unwrap();
             op(method, &path, body)
@@ -2392,6 +2466,9 @@ mod tests {
         assert_eq!(verify_query(&[]).unwrap(), "");
         assert_eq!(verify_query(&["--pin", "12:ab", "--pin", "13:cd"]).unwrap(), "?pin=12:ab,13:cd");
         assert!(verify_query(&["--pin"]).is_err() && verify_query(&["--all"]).is_err());
+        let key = "ab".repeat(32);
+        assert_eq!(verify_query(&["--from", "10", "--to", "20", "--key", &key, "--pin", "12:ab"]).unwrap(), format!("?pin=12:ab&from=10&to=20&key={key}"));
+        assert!(verify_query(&["--from", "x"]).is_err() && verify_query(&["--to"]).is_err() && verify_query(&["--key"]).is_err());
     }
 
     #[test]
@@ -2469,6 +2546,19 @@ mod tests {
         for other in [&["user", "residency", "u1", "pin", "gb-lon"][..], &["team", "residency", "t1", "unpin"], &["user", "residency"], &["bot", "residency", "b1"]] {
             assert_eq!(region_request(other), None, "{other:?}");
         }
+    }
+
+    #[test]
+    fn residency_report_commands() {
+        assert_eq!(residency_report_request("user", "ada@example.com", &[]), Ok(("/api/users/ada%40example.com/residency/report?format=markdown".into(), None)));
+        assert_eq!(
+            residency_report_request("team", "t1", &["--from", "2026-08-01", "--to", "2026-10-31", "--json", "-o", "r.json"]),
+            Ok(("/api/teams/t1/residency/report?from=2026-08-01&to=2026-10-31".into(), Some("r.json")))
+        );
+        for bad in [&["--from"][..], &["--json", "extra"], &["-o"]] {
+            assert!(residency_report_request("team", "t1", bad).unwrap_err().starts_with("Usage: botctl team residency <team> report"), "{bad:?}");
+        }
+        assert_eq!(region_request(&["user", "residency", "u1", "report"]), None, "the report isn't a pin or an unpin");
     }
 
     #[test]
@@ -2646,6 +2736,11 @@ mod tests {
         assert!(out.contains("SP encryption certificate: SHA-256 56:78 (secret), expires 2030-03-17") && out.contains("Encrypted assertions:     required"), "{out}");
         v["spEncryptionKey"] = json!({ "problem": "not offered until SSO_CORP_ENCRYPTION_PRIVATE_KEY is set" });
         assert!(saml_summary(&v).contains("SP encryption key:        not offered until SSO_CORP_ENCRYPTION_PRIVATE_KEY"));
+        assert!(saml_summary(&v).contains("IdP metadata signature:   not checked\n"));
+        v["signedMetadata"] = json!("require");
+        v["metadataSigningCertificates"] = json!([{ "sha256": "9a:bc", "subject": "CN=metadata", "notAfter": 1_900_000_000_000_i64 }]);
+        let out = saml_summary(&v);
+        assert!(out.contains("IdP metadata signature:   required\n    Trusted signer: SHA-256 9a:bc (CN=metadata), expires 2030-03-17"), "{out}");
     }
 
     #[test]
