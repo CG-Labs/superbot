@@ -22,7 +22,7 @@ docker compose run --rm --no-deps -T -v "$PWD/botd.log:/tmp/botd.log:ro" botd bo
 
 | Option | What it does |
 |---|---|
-| `--home <dir>` | The installer's layout: settings from `<dir>/superbot/.env` (if it's there), `DATA_DIR` and `BACKUP_DIR` defaulting to `<dir>/superbot/data` and `<dir>/superbot/backups`, the master key to `<dir>/.config/superbot/master.key` |
+| `--home <dir>` | The installer's layout: settings from `<dir>/superbot/.env` (if it's there), `DATA_DIR` and `BACKUP_DIR` defaulting to `<dir>/superbot/data` and `<dir>/superbot/backups`, the master key to `<dir>/.config/superbot/master.key`. Relative paths in `.env` are taken from `<dir>/superbot`, where the service runs botd |
 | `--env-file <file>` | Settings from this file, over botd's environment (Compose's container already has them) |
 | `--before-upgrade` | `check` only: stricter about backups (none, or none in the last hour, is a failure or a warning) and disk space (room for a backup and the upgrade) |
 | `--json` | `check` only: the findings as JSON, for scripts |

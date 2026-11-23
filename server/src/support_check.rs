@@ -130,16 +130,25 @@ impl Settings {
         self.from_file.get(k).or_else(|| self.process.get(k)).map(|v| v.trim().to_string()).unwrap_or_default()
     }
 
+    /// A path setting as botd sees it: with `--home`, a relative one is under the install
+    /// directory, where the installer's unit runs botd (`WorkingDirectory`).
+    pub fn resolve(&self, v: &str) -> PathBuf {
+        match &self.home {
+            Some(h) if Path::new(v).is_relative() => h.join("superbot").join(v),
+            _ => PathBuf::from(v),
+        }
+    }
+
     fn path(&self, k: &str, under_home: &[&str]) -> Option<PathBuf> {
         let v = self.get(k);
         if !v.is_empty() {
-            return Some(PathBuf::from(v));
+            return Some(self.resolve(&v));
         }
         self.home.as_ref().map(|h| under_home.iter().fold(h.clone(), |p, part| p.join(part)))
     }
 
     pub fn data_dir(&self) -> PathBuf {
-        self.path("DATA_DIR", &["superbot", "data"]).unwrap_or_else(|| PathBuf::from("data"))
+        self.path("DATA_DIR", &["superbot", "data"]).unwrap_or_else(|| self.resolve("data"))
     }
 
     pub fn backup_dir(&self) -> Option<PathBuf> {
@@ -327,7 +336,7 @@ fn find_key(s: &Settings, inline: &str, file: &str, default: Option<PathBuf>, da
         }
         return MasterKey::parse(&text).map(|k| Some((k, inline.to_string()))).map_err(|e| format!("{inline}: {e}"));
     }
-    let Some(path) = Some(path).filter(|p| !p.is_empty()).map(PathBuf::from).or(default) else { return Ok(None) };
+    let Some(path) = Some(path).filter(|p| !p.is_empty()).map(|p| s.resolve(&p)).or(default) else { return Ok(None) };
     let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     if real(&path).starts_with(real(data_dir)) {
         return Err(format!("{} is inside DATA_DIR, which backups copy. Keep the master key elsewhere.", path.display()));
@@ -1006,6 +1015,11 @@ mod tests {
         let home = Settings::new(None, Some(PathBuf::from("/home/superbot")), BTreeMap::new());
         assert_eq!(home.data_dir(), PathBuf::from("/home/superbot/superbot/data"));
         assert_eq!(home.backup_dir(), Some(PathBuf::from("/home/superbot/superbot/backups")));
+        let relative: BTreeMap<String, String> = [("DATA_DIR", "state"), ("BACKUP_DIR", "/var/backups/superbot")].map(|(k, v)| (k.to_string(), v.to_string())).into();
+        let home = Settings::new(None, Some(PathBuf::from("/home/superbot")), relative);
+        assert_eq!(home.data_dir(), PathBuf::from("/home/superbot/superbot/state"), "relative to where the unit runs botd");
+        assert_eq!(home.backup_dir(), Some(PathBuf::from("/var/backups/superbot")));
+        assert_eq!(home.resolve("keys/master.key"), PathBuf::from("/home/superbot/superbot/keys/master.key"));
         assert_eq!(Settings::new(None, None, BTreeMap::new()).data_dir(), PathBuf::from("data"), "botd's own default");
         assert!(Settings::load(None, Some("/nonexistent/.env")).err().unwrap().contains("/nonexistent/.env"));
     }

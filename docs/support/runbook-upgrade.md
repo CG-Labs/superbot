@@ -50,7 +50,14 @@ Restore the backup taken just before the upgrade, **with the version it was made
 
 1. **Stop botd and the backup timer**: `sudo systemctl stop superbot superbot-backup.timer` (Compose: `docker compose stop botd backup`). The upgraded botd mustn't write any more, and the timer mustn't take a backup of the upgraded data.
 2. **Restore the archive first**, with the tools installed now ([server restore](runbook-server-restore.md), steps for the same host). Installing the previous version restarts botd, so it must find the restored data, never the upgraded one.
-3. **Then install the previous version**: the installer from the previous release's tag or commit, or the previous offline bundle (both start botd again), or `SUPERBOT_VERSION` set back in `.env` and `docker compose up -d` (Compose).
+3. **Then install the previous version**, building that version's code, not just its installer: the installer fetches `main` unless told otherwise, which would build the new version and change the restored database again. Check out the previous tag and install from that checkout, which starts botd again:
+
+   ```sh
+   git clone --depth 1 --branch <previous-tag> https://github.com/CG-Labs/superbot.git /tmp/superbot-previous
+   sudo /tmp/superbot-previous/deploy/install.sh --upgrade --source-dir /tmp/superbot-previous
+   ```
+
+   Air-gapped: `sudo ./deploy/install.sh --upgrade --offline <previous-bundle>` from the previous bundle. Compose: set `SUPERBOT_VERSION` back in `.env`, then `docker compose up -d`.
 4. **Check it**: `sudo botd support check --home /home/superbot` (Compose: `docker compose exec botd botd support check`). The database's schema must match this botd's. If it says **made by a newer botd**, the restore didn't take: stop botd at once and restore again. Then run the after-upgrade checks above.
 
 Never start an older botd on a database a newer one has changed, and never set `PRAGMA user_version` by hand: the older botd doesn't know the new tables and columns, and what it writes may not be readable by either version.
