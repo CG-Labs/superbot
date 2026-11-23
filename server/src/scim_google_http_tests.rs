@@ -7,7 +7,7 @@
 use crate::db::ScimKey;
 use crate::scim::google::{self, Directory, Settings};
 use crate::scim_http_tests::{events, session_for, token};
-use crate::tests::{call, serve_app_with};
+use crate::tests::{call, call_with, serve_app_and_auth, serve_app_with};
 use crate::users_http_tests::parse;
 use crate::*;
 use aws_lc_rs::encoding::AsDer;
@@ -33,6 +33,12 @@ struct Dir {
     refuse: bool,
     subjects: Vec<Option<String>>,
     public_key: Vec<u8>,
+    /// Each watch asked for: its query and body.
+    watches: Vec<(HashMap<String, String>, Value)>,
+    /// Each channels.stop body.
+    stops: Vec<Value>,
+    /// Watches refused (403) once this many have been made.
+    watch_limit: Option<usize>,
 }
 
 type D = Arc<Mutex<Dir>>;
@@ -139,6 +145,29 @@ async fn members(St(d): St<D>, h: HeaderMap, UrlPath(id): UrlPath<String>, Query
     (StatusCode::OK, Json(page(m, &q, "admin#directory#members", "members")))
 }
 
+async fn watch(St(d): St<D>, h: HeaderMap, Query(q): Query<HashMap<String, String>>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+    let mut d = d.lock().unwrap();
+    if let Err(e) = gate(&d, &h) {
+        return e;
+    }
+    if d.watch_limit.is_some_and(|n| d.watches.len() >= n) {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": { "code": 403, "status": "PERMISSION_DENIED", "message": "Not Authorized to access this resource/api" } })));
+    }
+    d.watches.push((q.clone(), body.clone()));
+    let expires = db::now() + 6 * 3_600_000;
+    let event = q.get("event").cloned().unwrap_or_default();
+    (StatusCode::OK, Json(json!({ "kind": "api#channel", "id": body["id"], "resourceId": format!("r-{event}"), "token": body["token"], "expiration": expires.to_string() })))
+}
+
+async fn stop_channel(St(d): St<D>, h: HeaderMap, Json(body): Json<Value>) -> (StatusCode, String) {
+    let mut d = d.lock().unwrap();
+    if let Err((code, _)) = gate(&d, &h) {
+        return (code, String::new());
+    }
+    d.stops.push(body);
+    (StatusCode::NO_CONTENT, String::new())
+}
+
 /// staff@ holds Ada, Bob, Cy (suspended), someone from outside, and eng@; eng@
 /// ("Engineering", a team group) holds Ada, Eve, and someone not in the directory.
 /// Dee is in neither.
@@ -166,6 +195,8 @@ async fn google_stand_in() -> Google {
         .route("/admin/directory/v1/users", get(users))
         .route("/admin/directory/v1/groups/{key}", get(group))
         .route("/admin/directory/v1/groups/{id}/members", get(members))
+        .route("/admin/directory/v1/users/watch", post(watch))
+        .route("/admin/directory_v1/channels/stop", post(stop_channel))
         .with_state(dir.clone());
     tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
     let key =
@@ -185,6 +216,7 @@ fn settings(g: &Google) -> Settings {
         api: g.url.clone(),
         interval: std::time::Duration::from_secs(1800),
         max_removals: 10,
+        push: None,
     }
 }
 
@@ -209,6 +241,13 @@ struct World {
     app: AppState,
     admin: String,
     sso: Option<String>,
+    auth: Arc<Auth>,
+}
+
+impl World {
+    fn dir(&self) -> Arc<Directory> {
+        self.auth.scim.google.clone().unwrap()
+    }
 }
 
 async fn world(g: &Google, with_sso: bool, tweak: impl FnOnce(&mut Settings)) -> World {
@@ -216,7 +255,7 @@ async fn world(g: &Google, with_sso: bool, tweak: impl FnOnce(&mut Settings)) ->
     tweak(&mut s);
     let key = g.key.clone();
     let mut sso = None;
-    let (port, app, admin, _) = serve_app_with(|a| {
+    let (port, app, admin, _, _, auth) = serve_app_and_auth(|a| {
         a.scim.enabled = true;
         a.scim.groups = true;
         a.scim.group_roles = !s.role_groups.is_empty();
@@ -229,7 +268,7 @@ async fn world(g: &Google, with_sso: bool, tweak: impl FnOnce(&mut Settings)) ->
         a.scim.google = Some(Arc::new(d));
     })
     .await;
-    World { port, app, admin, sso }
+    World { port, app, admin, sso, auth }
 }
 
 async fn sync(w: &World, body: &str) -> (u16, Value) {
@@ -611,4 +650,161 @@ async fn departments_and_managers_follow_google() {
     assert_eq!((bob.enterprise.department.as_deref(), bob.enterprise.cost_center.clone(), bob.enterprise.manager.clone()), (Some("Support"), None, None));
     let upd = w.app.db.audit_events(&crate::audit::Filter { actions: vec!["user.updated".into()], target_id: Some(bob.user.id.clone()), ..Default::default() }, 1, false);
     assert_eq!(upd[0].details["changes"]["department"], json!({ "from": "Sales", "to": "Support" }), "{:?}", upd[0].details);
+}
+
+// Push (ADR 0216): Google's watch channels start a pass at once.
+
+const ADDRESS: &str = "https://superbot.example.com/scim/google/push";
+
+/// A notification as Google sends one, to botd's push address.
+async fn notify(w: &World, id: &str, token: &str, change: &str, resource: &str) -> u16 {
+    let extra = format!("X-Goog-Channel-ID: {id}\r\nX-Goog-Channel-Token: {token}\r\nX-Goog-Resource-State: {change}\r\nX-Goog-Resource-ID: {resource}\r\nX-Goog-Message-Number: 2\r\n");
+    let body = json!({ "kind": "admin#directory#user", "id": "102", "etag": "e", "primaryEmail": "bob@example.com" }).to_string();
+    call_with(w.port, "POST", google::push::PATH, "", &extra, &body).await.0
+}
+
+/// The channel ids, tokens and resource ids of the last round of watches.
+fn channels(g: &Google) -> Vec<(String, String, String)> {
+    let d = g.dir.lock().unwrap();
+    d.watches[d.watches.len() - 4..].iter().map(|(q, b)| (b["id"].as_str().unwrap().into(), b["token"].as_str().unwrap().into(), format!("r-{}", q["event"]))).collect()
+}
+
+fn stopped(g: &Google) -> Vec<(String, String)> {
+    g.dir.lock().unwrap().stops.iter().map(|s| (s["id"].as_str().unwrap().into(), s["resourceId"].as_str().unwrap().into())).collect()
+}
+
+async fn push_status(w: &World) -> Value {
+    let (code, status) = call(w.port, "GET", "/api/scim/google", &w.admin, "").await;
+    assert_eq!(code, 200, "{status}");
+    parse(&status)["push"].clone()
+}
+
+async fn eventually(what: &str, f: impl Fn() -> bool) {
+    for _ in 0..200 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("{what}");
+}
+
+#[tokio::test]
+async fn google_pushes_a_change_and_a_pass_runs_at_once() {
+    let g = google_stand_in().await;
+    let w = world(&g, false, |s| s.push = Some(ADDRESS.into())).await;
+    synced(&w).await;
+
+    let next = google::push::renew(&w.auth, &w.dir()).await;
+    assert!(next > std::time::Duration::from_secs(4 * 3600), "{next:?}");
+    let watches = g.dir.lock().unwrap().watches.clone();
+    assert_eq!(watches.iter().map(|(q, _)| q["event"].as_str()).collect::<Vec<_>>(), ["add", "update", "delete", "undelete"]);
+    for (q, b) in &watches {
+        assert_eq!((q["customer"].as_str(), b["type"].as_str(), b["address"].as_str(), b["params"]["ttl"].as_str()), ("my_customer", Some("web_hook"), Some(ADDRESS), Some("21600")), "{b}");
+    }
+    let first = channels(&g);
+    let ev = events(w.port, &w.admin, "action=scim.google_push_watching").await;
+    assert_eq!((ev.len(), ev[0]["details"]["recovered"].as_bool(), ev[0]["actorId"].as_str()), (1, Some(false), Some(google::ACTOR_ID)), "{ev:?}");
+    let p = push_status(&w).await;
+    assert_eq!((p["enabled"].as_bool(), p["watching"].as_bool(), p["address"].as_str(), p["channels"].as_array().map(Vec::len)), (Some(true), Some(true), Some(ADDRESS), Some(4)), "{p}");
+
+    // New channels before the old ones end, which are then stopped; renewals aren't audited.
+    google::push::renew(&w.auth, &w.dir()).await;
+    let mut gone = stopped(&g);
+    gone.sort();
+    let mut want: Vec<(String, String)> = first.iter().map(|(id, _, r)| (id.clone(), r.clone())).collect();
+    want.sort();
+    assert_eq!(gone, want);
+    assert_eq!(events(w.port, &w.admin, "action=scim.google_push_watching").await.len(), 1);
+
+    // Google's first message on a channel says it started: no pass.
+    let (id, token, resource) = channels(&g)[1].clone();
+    assert_eq!(notify(&w, &id, &token, "sync", &resource).await, 200);
+    assert_eq!(push_status(&w).await["notifications"], 0);
+
+    // Only channels botd made are taken.
+    assert_eq!(notify(&w, &id, "forged", "update", &resource).await, 401);
+    assert_eq!(notify(&w, &first[1].0, &token, "update", &resource).await, 401, "a token is its own channel's");
+    assert_eq!(notify(&w, "someone-elses", &token, "update", &resource).await, 401);
+    assert_eq!(notify(&w, "", "", "update", "").await, 401);
+    let refused = events(w.port, &w.admin, "action=scim.google_push_refused").await;
+    assert_eq!((refused.len(), refused[0]["details"]["reason"].as_str(), refused[0]["outcome"].as_str()), (1, Some("bad_token"), Some("failure")), "throttled per address: {refused:?}");
+    let p = push_status(&w).await;
+    assert_eq!((p["refused"].as_u64(), p["notifications"].as_u64()), (Some(4), Some(0)), "{p}");
+    assert_eq!(events(w.port, &w.admin, "action=scim.google_sync").await.len(), 1, "no pass for any of them");
+
+    // Bob is suspended in Google, which says so: a pass runs within seconds, not 30 minutes.
+    google::start(w.auth.clone());
+    g.user("102", |u| u["suspended"] = json!(true));
+    assert_eq!(notify(&w, &id, &token, "update", &resource).await, 200);
+    eventually("Bob is disabled by a pushed pass", || !active(&w, "102")).await;
+    let ev = events(w.port, &w.admin, "action=scim.google_sync").await;
+    assert_eq!((ev[0]["details"]["trigger"].as_str(), ev[0]["details"]["pushed"].clone(), ev[0]["details"]["disabled"].as_u64()), (Some("push"), json!(["update"]), Some(1)), "{}", ev[0]);
+    let p = push_status(&w).await;
+    assert_eq!(p["notifications"], 1, "{p}");
+    assert!(p["lastNotificationAt"].is_i64(), "{p}");
+}
+
+#[tokio::test]
+async fn channels_left_from_before_are_stopped_and_push_off_starts_no_pass() {
+    let g = google_stand_in().await;
+    let w = world(&g, false, |s| s.push = Some(ADDRESS.into())).await;
+    google::push::renew(&w.auth, &w.dir()).await;
+    // A channel botd made before a restart: its token still checks out.
+    let old = format!("superbot-{}", "0a".repeat(16));
+    let token = google::push::channel_token(&old);
+    assert_eq!(notify(&w, &old, &token, "update", "r-old").await, 200);
+    eventually("the leftover channel is stopped", || stopped(&g).contains(&(old.clone(), "r-old".into()))).await;
+    let p = push_status(&w).await;
+    assert_eq!((p["leftoversStopped"].as_u64(), p["notifications"].as_u64()), (Some(1), Some(1)), "a leftover's change still counts: {p}");
+    assert_eq!(w.dir().push.take_pending(), vec!["update"]);
+    for (id, _, _) in channels(&g) {
+        assert!(!stopped(&g).iter().any(|(s, _)| *s == id), "today's channels are kept");
+    }
+
+    // Push turned off: channels from when it was on are stopped, and start no pass.
+    let g2 = google_stand_in().await;
+    let off = world(&g2, false, |_| {}).await;
+    assert_eq!(push_status(&off).await, json!({ "enabled": false }));
+    assert_eq!(notify(&off, &old, &token, "update", "r-old").await, 200);
+    eventually("the channel is stopped", || stopped(&g2).len() == 1).await;
+    assert!(off.dir().push.take_pending().is_empty());
+    assert_eq!(google::push::renew(&off.auth, &off.dir()).await, std::time::Duration::from_secs(6 * 3600), "nothing to renew");
+    assert!(g2.dir.lock().unwrap().watches.is_empty());
+
+    // The sync off: nothing there.
+    let (port, ..) = serve_app_with(|a| a.scim.enabled = true).await;
+    let extra = format!("X-Goog-Channel-ID: {old}\r\nX-Goog-Channel-Token: {token}\r\nX-Goog-Resource-State: update\r\n");
+    assert_eq!(call_with(port, "POST", google::push::PATH, "", &extra, "{}").await.0, 404);
+}
+
+#[tokio::test]
+async fn a_watch_that_fails_keeps_the_old_channels_and_is_audited_once() {
+    let g = google_stand_in().await;
+    let w = world(&g, false, |s| s.push = Some(ADDRESS.into())).await;
+    google::push::renew(&w.auth, &w.dir()).await;
+    let old = channels(&g);
+
+    // Two new channels, then Google refuses: the two are stopped, the old four kept.
+    g.set(|d| d.watch_limit = Some(6));
+    assert_eq!(google::push::renew(&w.auth, &w.dir()).await, std::time::Duration::from_secs(300));
+    let made: Vec<String> = g.dir.lock().unwrap().watches[4..].iter().map(|(_, b)| b["id"].as_str().unwrap().to_string()).collect();
+    assert_eq!(stopped(&g).into_iter().map(|(id, _)| id).collect::<Vec<_>>(), made);
+    let p = push_status(&w).await;
+    assert_eq!((p["watching"].as_bool(), p["failure"]["reason"].as_str()), (Some(true), Some("forbidden")), "{p}");
+    let (id, token, resource) = old[1].clone();
+    assert_eq!(notify(&w, &id, &token, "update", &resource).await, 200, "the old channels still deliver");
+    assert_eq!(push_status(&w).await["notifications"], 1);
+    google::push::renew(&w.auth, &w.dir()).await;
+    let failed = events(w.port, &w.admin, "action=scim.google_push_failed").await;
+    assert_eq!((failed.len(), failed[0]["outcome"].as_str(), failed[0]["details"]["channelsLeft"].as_u64()), (1, Some("failure"), Some(4)), "once per failure: {failed:?}");
+
+    // Google lets it again: new channels, the old ones stopped, and it says so.
+    g.set(|d| d.watch_limit = None);
+    google::push::renew(&w.auth, &w.dir()).await;
+    let gone = stopped(&g);
+    assert!(old.iter().all(|(id, _, _)| gone.iter().any(|(s, _)| s == id)), "{gone:?}");
+    let ev = events(w.port, &w.admin, "action=scim.google_push_watching").await;
+    assert_eq!((ev.len(), ev[0]["details"]["recovered"].as_bool()), (2, Some(true)), "{ev:?}");
+    assert!(push_status(&w).await["failure"].is_null());
 }

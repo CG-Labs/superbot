@@ -1220,6 +1220,12 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route_layer(middleware::from_fn(obs::note_route))
         .layer(DefaultBodyLimit::max(billing::MAX_BODY))
         .layer(Extension(auth_state.clone()));
+    // Google's watch channels carry a token botd gave each one; no session (ADR 0216).
+    let google_push_routes = Router::new()
+        .route(scim::google::push::PATH, post(scim::google::push::receive))
+        .route_layer(middleware::from_fn(obs::note_route))
+        .layer(DefaultBodyLimit::max(scim::google::push::MAX_BODY))
+        .layer(Extension(auth_state.clone()));
     Router::new()
         .route("/healthz", get(|| async { Json(json!({ "ok": true })) }))
         // Open to anyone, like /healthz: no tenant data (ADR 0090).
@@ -1228,6 +1234,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         // Open too: the tiers' published prices and limits (ADR 0121).
         .route("/pricing", get(plans::html_page))
         .merge(scim_routes)
+        .merge(google_push_routes)
         .merge(billing_routes)
         .merge(
             Router::new()
@@ -3667,6 +3674,12 @@ mod tests {
 
     /// `serve_app_with`, and the router it serves, for botd's machine port.
     pub(super) async fn serve_app_and_router(tweak: impl FnOnce(&mut Auth)) -> (u16, AppState, String, BotKey, Router) {
+        let (port, app, password, bot, r, _) = serve_app_and_auth(tweak).await;
+        (port, app, password, bot, r)
+    }
+
+    /// `serve_app_and_router`, and the `Auth` it serves, for background tasks.
+    pub(super) async fn serve_app_and_auth(tweak: impl FnOnce(&mut Auth)) -> (u16, AppState, String, BotKey, Router, Arc<Auth>) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let password = random_hex(16);
@@ -3682,12 +3695,12 @@ mod tests {
         let _ = app.control_plane.set(auth.machines.clone());
         let auth = Arc::new(auth);
         let bot = BotKey(app.cfg.bot_key.clone(), Some(app.clone()));
-        let r = router(app.clone(), auth);
+        let r = router(app.clone(), auth.clone());
         let served = r.clone();
         tokio::spawn(async move {
             axum::serve(listener, served.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
         });
-        (port, app, basic(&password), bot, r)
+        (port, app, basic(&password), bot, r, auth)
     }
 
     pub(super) async fn call(port: u16, method: &str, path: &str, authorization: &str, body: &str) -> (u16, String) {
