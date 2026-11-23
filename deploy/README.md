@@ -238,7 +238,10 @@ botctl machine agent <user>               # its build, harnesses and upgrade, ag
 botctl machine upgrade <user>             # upgrade its agent now
 botctl machine upgrade <user> hold        # keep it at its build (release: let it go)
 botctl machine harnesses <user>           # install MACHINE_HARNESSES now, retrying failures
+botctl machine mirror                     # fetch every harness file machines would and check each pin
 ```
+
+On a network without the internet, point machines at your own mirrors with `MACHINE_NODE_MIRROR`, `MACHINE_NPM_REGISTRY` and `MACHINE_MIRROR_CA_FILE`; the pins stay the same ([air-gapped guide](../docs/ops/air-gapped.md#harness-clis-on-users-machines), [ADR 0186](../docs/adr/0186-harness-installs-from-internal-mirrors.md)).
 
 Each step is audited as `machine.harness_*` and `machine.agent_upgrade*`. Machines enrolled before this change can't replace their own agent: rebuild them (below). Harnesses there need a login (below) or an API key in the user's secrets. Design: [ADR 0039](../docs/adr/0039-machine-harnesses-and-agent-upgrades.md).
 

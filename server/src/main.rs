@@ -795,7 +795,7 @@ async fn main() {
         "sessionIdleMinutes": sessions.idle_ms / 60_000,
         "sessionMaxMinutes": sessions.max_ms / 60_000,
         "auditRetentionDays": retention,
-        "auditExport": (!audit_export.sinks.is_empty()).then(|| audit_export.sinks.iter().map(|s| json!({ "kind": s.kind(), "sink": s.shown })).collect::<Vec<_>>()),
+        "auditExport": (!audit_export.sinks.is_empty()).then(|| audit_export.sinks.iter().map(|s| json!({ "kind": s.kind(), "name": s.name, "sink": s.shown })).collect::<Vec<_>>()),
         "auditCheckpointMinutes": audit_checkpoints.every,
         "auditTimestamps": audit_checkpoints.tsa.as_ref().map(|t| json!({ "tsa": t.shown, "trustAnchors": audit_checkpoints.trust.len() })),
         "chatRetentionDays": chat_retention,
@@ -1066,6 +1066,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/machine/backups", get(machines::backup::list).post(machines::backup::create))
         .route("/users/{key}/machine/restore", get(machines::backup::restore_status).post(machines::backup::restore_request))
         .route("/users/{key}/machine/harnesses", post(machines::upkeep::harnesses_now))
+        .route("/machines/harness-mirror", get(machines::mirror::check_now))
         .route("/users/{key}/machine/bot-user", post(machines::botuser::now_for))
         .route("/users/{key}/machine/screens", get(machines::screens::list))
         .route("/users/{key}/machine/screens/{bot}", axum::routing::delete(machines::screens::close_now))

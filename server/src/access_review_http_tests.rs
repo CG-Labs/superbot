@@ -230,6 +230,61 @@ async fn service_accounts_are_reviewed_with_their_owner_tokens_and_bots() {
 }
 
 #[tokio::test]
+async fn a_service_account_whose_owner_is_off_its_team_is_flagged() {
+    use crate::service_accounts_http_tests::account;
+    let (port, app, admin, _) = serve_app().await;
+    let (ana, _) = user_with(port, &admin, "ana@example.com", "member").await;
+    let (bo, _) = user_with(port, &admin, "bo@example.com", "member").await;
+    let (code, t) = call(port, "POST", "/api/teams", &admin, &json!({ "name": "Alpha", "owner": bo }).to_string()).await;
+    assert_eq!(code, 201, "{t}");
+    let alpha = parse(&t)["id"].as_str().unwrap().to_string();
+    let (code, body) = call(port, "PUT", &format!("/api/teams/{alpha}/members/{ana}"), &admin, "{}").await;
+    assert!(code == 200 || code == 201, "{body}");
+    let anas = account(port, &admin, json!({ "name": "Ana's sync", "role": "member", "team": alpha })).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{anas}"), &admin, &json!({ "owner": ana }).to_string()).await.0, 200);
+    let admins = account(port, &admin, json!({ "name": "Alpha ops", "role": "member", "team": alpha })).await;
+    let loose = account(port, &admin, json!({ "name": "Loose" })).await;
+
+    let held = || access_review::build_with(&app, &Default::default()).service_held(&anas).cloned().unwrap();
+    let held_on = held();
+    let on = report(port, &admin).await;
+    let s = service(&on, &anas);
+    assert_eq!((s["ownerOnTeam"].clone(), s["flags"].clone()), (json!(true), json!([])), "{s}");
+    assert_eq!(service(&on, &admins)["ownerOnTeam"], json!(true), "an admin owner is on every team");
+    assert_eq!(service(&on, &loose)["ownerOnTeam"], Value::Null, "in no team, there's nothing to be on");
+
+    // Ana leaves Alpha: her account acts in no team, so the reviewer is told and the old digest is stale.
+    assert_eq!(call(port, "DELETE", &format!("/api/teams/{alpha}/members/{ana}"), &admin, "").await.0, 200);
+    let off = report(port, &admin).await;
+    let s = service(&off, &anas);
+    assert_eq!((s["ownerOnTeam"].clone(), s["flags"].clone(), s["team"]["id"].as_str()), (json!(false), json!(["owner_off_team"]), Some(alpha.as_str())), "{s}");
+    assert_eq!(service(&off, &admins)["flags"], json!([]));
+    assert_eq!(off["summary"]["serviceAccountsFlagged"], 1);
+    assert_ne!(off["digest"], on["digest"]);
+    // Her own row changes too; the account's part of the digest must change by itself, and only by this.
+    let mut held_off = held();
+    assert_eq!(held_off.as_array_mut().unwrap().pop(), Some(json!({ "ownerOnTeam": false })), "{held_off}");
+    assert_eq!(held_off, held_on, "nothing else it holds changed");
+    let (code, res) = call(port, "POST", "/api/access-review/complete", &admin, &json!({ "digest": on["digest"] }).to_string()).await;
+    assert_eq!(code, 409, "{res}");
+    let (code, _, csv) = call_with(port, "GET", &format!("/api/access-review/export.csv?digest={}", off["digest"].as_str().unwrap()), &admin, "", "").await;
+    assert_eq!(code, 200, "{csv}");
+    let row = csv.split("\r\n").find(|l| l.contains(&anas)).unwrap();
+    assert!(row.ends_with(&format!(",owner_off_team,{}", off["digest"].as_str().unwrap())), "{row}");
+
+    // An inactive owner lends nothing anywhere: that flag says it, not both.
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{ana}"), &admin, r#"{"status":"disabled"}"#).await.0, 200);
+    assert_eq!(service(&report(port, &admin).await, &anas)["flags"], json!(["owner_inactive"]));
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{ana}"), &admin, r#"{"status":"active"}"#).await.0, 200);
+
+    // Back on the team, it acts there again, and the report is as it was.
+    assert!(app.db.add_team_member(&alpha, &ana, "member", None));
+    let back = report(port, &admin).await;
+    assert_eq!((service(&back, &anas)["ownerOnTeam"].clone(), service(&back, &anas)["flags"].clone()), (json!(true), json!([])));
+    assert_eq!(held(), held_on);
+}
+
+#[tokio::test]
 async fn the_csv_has_a_row_per_service_account() {
     use crate::service_accounts_http_tests::{account, token};
     let (port, _, admin, _) = serve_app().await;
