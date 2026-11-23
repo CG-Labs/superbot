@@ -123,7 +123,7 @@ The IdP takes the team on when it pushes the group with that `externalId` (or, w
 
 ## Bulk
 
-`POST /scim/v2/Bulk` ([RFC 7644 section 3.7](https://www.rfc-editor.org/rfc/rfc7644#section-3.7)) sends many user and group changes in one request. Entra ID and Okta don't use it; other SCIM clients, connectors and sync scripts can. Design: [ADR 0149](../adr/0149-scim-bulk.md).
+`POST /scim/v2/Bulk` ([RFC 7644 section 3.7](https://www.rfc-editor.org/rfc/rfc7644#section-3.7)) sends many user and group changes in one request. Entra ID and Okta don't use it; other SCIM clients, connectors and sync scripts can. Design: [ADR 0141](../adr/0141-scim-bulk.md).
 
 ```json
 {

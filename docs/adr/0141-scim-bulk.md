@@ -1,10 +1,10 @@
-# 0149: SCIM Bulk
+# 0141: SCIM Bulk
 
 ## Status
 
 Accepted (22 Nov 2026). Part of SCIM provisioning in M5, [#51](https://github.com/CG-Labs/superbot/issues/51). Builds on the SCIM stub and its review ([ADR 0023](0023-scim.md), [ADR 0026](0026-scim-review-hardening.md)), groups as teams ([ADR 0095](0095-scim-groups-as-teams.md)) and deprovisioning ([ADR 0124](0124-deprovisioning-stops-bots-and-machines.md)).
 
-Numbering: 0149 was reserved for this change; lower numbers are held by other open pull requests.
+Numbering: first merged as 0149, renumbered to 0141 because 0149 was also taken by the audit checkpoints ADR.
 
 ## Context
 
