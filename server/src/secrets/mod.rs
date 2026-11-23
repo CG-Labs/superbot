@@ -229,23 +229,33 @@ fn check_value(v: &str) -> Result<(), Error> {
 #[serde(rename_all = "camelCase")]
 pub struct UserListed {
     pub name: String,
-    pub created_at: i64,
-    pub updated_at: i64,
+    /// When the user saved it in botd; none for a value only in their external folder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
     /// A server-wide secret of this name also reaches Bots; for this user's Bots, theirs
     /// wins. Their Bots see that name in their environment anyway, so this tells them
     /// nothing new about the server's secrets.
     pub overrides: bool,
+    /// Where the value their Bots get comes from: `sealed` (saved in botd), or the
+    /// external store holding their folder (ADR 0174), which they can't change here.
+    pub store: &'static str,
+    /// They saved one in botd. False for a value only in their external folder.
+    pub saved: bool,
 }
 
 pub struct Secrets {
     stores: Vec<Box<dyn SecretStore>>,
     /// Each user's own (ADR 0029). None: no store for them here.
     users: Option<sealed::UserSecrets>,
+    /// The external store whose `users/<id>` folders hold users' own too (ADR 0174).
+    user_folders: Option<Arc<external::ExternalStore>>,
 }
 
 impl Secrets {
     pub fn new(stores: Vec<Box<dyn SecretStore>>) -> Secrets {
-        Secrets { stores, users: None }
+        Secrets { stores, users: None, user_folders: None }
     }
 
     pub fn with_users(mut self, users: sealed::UserSecrets) -> Secrets {
@@ -253,20 +263,49 @@ impl Secrets {
         self
     }
 
+    pub fn with_user_folders(mut self, x: Arc<external::ExternalStore>) -> Secrets {
+        self.user_folders = Some(x);
+        self
+    }
+
     fn users(&self) -> Result<&sealed::UserSecrets, Error> {
         self.users.as_ref().ok_or(Error::ReadOnly)
     }
 
-    pub fn user_list(&self, user_id: &str) -> Result<Vec<UserListed>, Error> {
+    fn server_names_for_bots(&self) -> Vec<String> {
+        self.list().unwrap_or_default().into_iter().filter(|l| l.for_bots).map(|l| l.name).collect()
+    }
+
+    /// What the user saved in botd, without asking an external store.
+    fn sealed_user_list(&self, user_id: &str, server: &[String]) -> Result<Vec<UserListed>, Error> {
         let rows = self.users()?.names(user_id)?;
-        let server: Vec<String> = self.list().unwrap_or_default().into_iter().filter(|l| l.for_bots).map(|l| l.name).collect();
         Ok(rows
             .into_iter()
             .map(|(name, created_at, updated_at)| {
                 let overrides = server.contains(&name);
-                UserListed { name, created_at, updated_at, overrides }
+                UserListed { name, created_at: Some(created_at), updated_at: Some(updated_at), overrides, store: "sealed", saved: true }
             })
             .collect())
+    }
+
+    /// The user's secrets: what they saved in botd and what their external folder holds,
+    /// one entry per name, marked with the store whose value wins. Fails closed like a
+    /// run would when the external store can't answer.
+    pub fn user_list(&self, user_id: &str) -> Result<Vec<UserListed>, Error> {
+        let server = self.server_names_for_bots();
+        let mut out = self.sealed_user_list(user_id, &server)?;
+        let Some(x) = &self.user_folders else { return Ok(out) };
+        for name in x.user_names(user_id)? {
+            match out.iter_mut().find(|l| l.name == name) {
+                Some(l) => l.store = x.kind(),
+                None => {
+                    let overrides = server.contains(&name);
+                    out.push(UserListed { name, created_at: None, updated_at: None, overrides, store: x.kind(), saved: false });
+                }
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
     }
 
     #[cfg(test)]
@@ -282,7 +321,8 @@ impl Secrets {
         check_value(value)?;
         redact::register_for(user_id, value);
         let replaced = self.users()?.put(user_id, name, value)?;
-        let listed = self.user_list(user_id)?.into_iter().find(|l| l.name == name).ok_or_else(|| Error::Store(format!("{name} was not saved")))?;
+        let server = self.server_names_for_bots();
+        let listed = self.sealed_user_list(user_id, &server)?.into_iter().find(|l| l.name == name).ok_or_else(|| Error::Store(format!("{name} was not saved")))?;
         Ok((listed, replaced))
     }
 
@@ -308,22 +348,33 @@ impl Secrets {
     }
 
     /// `harness_env_for`, or the error of an external store that couldn't answer, so a
-    /// run can be refused rather than started without its keys (ADR 0125).
+    /// run can be refused rather than started without its keys (ADR 0125). The owner's
+    /// external folder wins over what they saved in botd, as the external store wins
+    /// over the sealed one for server-wide secrets (ADR 0174).
     pub fn try_harness_env_for(&self, owner: &str) -> Result<Vec<(String, Secret)>, Error> {
         let mut out = self.try_harness_env()?;
-        let Ok(users) = self.users() else { return Ok(out) };
-        for (name, ..) in users.names(owner).unwrap_or_default() {
-            if check_user_name(&name).is_err() {
-                continue;
-            }
-            match users.get(owner, &name) {
-                Ok(Some(v)) => {
-                    out.retain(|(n, _)| *n != name);
-                    out.push((name, v));
+        let mut over = |name: String, v: Secret| {
+            out.retain(|(n, _)| *n != name);
+            out.push((name, v));
+        };
+        if let Ok(users) = self.users() {
+            for (name, ..) in users.names(owner).unwrap_or_default() {
+                if check_user_name(&name).is_err() {
+                    continue;
                 }
-                Ok(None) => {}
-                // The error text can name the user, so only its kind is logged.
-                Err(e) => crate::obs::log::log_warn!("A user's secret {name} couldn't be read ({}).", e.kind()),
+                match users.get(owner, &name) {
+                    Ok(Some(v)) => over(name, v),
+                    Ok(None) => {}
+                    // The error text can name the user, so only its kind is logged.
+                    Err(e) => crate::obs::log::log_warn!("A user's secret {name} couldn't be read ({}).", e.kind()),
+                }
+            }
+        }
+        if let Some(x) = &self.user_folders {
+            for name in x.user_names(owner)? {
+                if let Some(v) = x.user_get(owner, &name)? {
+                    over(name, v);
+                }
             }
         }
         Ok(out)
@@ -595,12 +646,16 @@ pub fn init(db_path: &Path, keys: Keys, external: Option<Arc<external::ExternalS
     let users = sealed::UserSecrets::new(sealed::connect(db_path)?, Arc::clone(&cipher));
     let stored = store.names().map_err(|e| e.to_string())?.len();
     let mut stores: Vec<Box<dyn SecretStore>> = vec![Box::new(env)];
+    let user_folders = external.as_ref().filter(|x| x.user_folders()).map(Arc::clone);
     if let Some(x) = external {
         external::set_active(&x);
         stores.push(Box::new(external::Shared(x)));
     }
     stores.push(Box::new(store));
-    let secrets = Secrets::new(stores).with_users(users);
+    let mut secrets = Secrets::new(stores).with_users(users);
+    if let Some(x) = user_folders {
+        secrets = secrets.with_user_folders(x);
+    }
     secrets.register_all();
     let redacted = redact::scrub_rows(&c).map_err(|e| format!("database: {e}"))?;
     // After a rotation too, so values sealed under the old key don't linger in free pages.
