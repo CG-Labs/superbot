@@ -424,6 +424,18 @@ pub(crate) mod tests {
         PENDING.lock().unwrap().iter().filter(|e| e.target_id.as_deref() == Some(name)).cloned().collect()
     }
 
+    /// Writes the waiting events whose target is one of `targets` to `db`, as `flush_audit`
+    /// does, and leaves every other test's in the queue.
+    pub(crate) fn flush_audit_for(db: &crate::db::Db, targets: &[&str]) {
+        let mine: Vec<Event> = {
+            let mut q = PENDING.lock().unwrap();
+            let (mine, rest): (Vec<Event>, Vec<Event>) = q.drain(..).partition(|e| e.target_id.as_deref().is_some_and(|t| targets.contains(&t)));
+            q.extend(rest);
+            mine
+        };
+        write_audit(db, &mine, 0);
+    }
+
     #[test]
     fn waiting_events_are_written_to_the_audit_log() {
         let db = crate::db::Db::open(&crate::db::temp_path("secrets-audit").join("app.sqlite")).unwrap();
