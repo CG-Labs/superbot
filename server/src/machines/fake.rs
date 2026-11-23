@@ -7,8 +7,8 @@
 //! taken by itself.
 
 use super::provider::{
-    CreateSpec, FirewallDevices, FirewallRule, Fut, MachineProvider, ProviderError, ProviderFirewall,
-    ProviderMachine, RebuildSpec,
+    CreateSpec, FirewallDevices, FirewallRule, Fut, MachineProvider, NetworkMember, ProviderError, ProviderFirewall,
+    ProviderMachine, RebuildSpec, TeamNetwork,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
@@ -32,6 +32,18 @@ pub struct FakeFirewall {
     pub others: usize,
 }
 
+/// A team network as Linode's VPCs are (ADR 0189): one subnet our machines join, and
+/// whatever else is on it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FakeNetwork {
+    pub id: String,
+    pub label: String,
+    pub region: String,
+    pub subnet_id: String,
+    pub subnet: String,
+    pub members: BTreeSet<String>,
+}
+
 #[derive(Default)]
 struct State {
     next: u64,
@@ -50,6 +62,7 @@ struct State {
     during: HashMap<&'static str, Box<dyn FnOnce() + Send>>,
     /// What `firewall_egress` reports, as Linode's outbound rules would be.
     egress: Option<serde_json::Value>,
+    networks: BTreeMap<String, FakeNetwork>,
 }
 
 /// Linode's disks for the default tiers' plans, in GiB.
@@ -149,6 +162,9 @@ impl Fake {
         for f in s.firewalls.values_mut() {
             f.machines.remove(id);
         }
+        for n in s.networks.values_mut() {
+            n.members.remove(id);
+        }
     }
 
     pub fn machines(&self) -> Vec<ProviderMachine> {
@@ -202,6 +218,21 @@ impl Fake {
         id
     }
 
+    pub fn networks(&self) -> Vec<FakeNetwork> {
+        self.state.lock().unwrap().networks.values().cloned().collect()
+    }
+
+    /// The team network `machine` is on, if any.
+    pub fn network_of(&self, machine: &str) -> Option<String> {
+        self.state.lock().unwrap().networks.values().find(|n| n.members.contains(machine)).map(|n| n.id.clone())
+    }
+
+    /// Puts `member` on network `id` behind the control plane's back: a machine of
+    /// someone's, or a team's own service.
+    pub fn join_network(&self, id: &str, member: &str) {
+        self.state.lock().unwrap().networks.get_mut(id).unwrap().members.insert(member.into());
+    }
+
     /// `plan`'s disk is `bytes` (None: the provider can't say).
     pub fn set_plan_disk(&self, plan: &str, bytes: Option<u64>) {
         self.state.lock().unwrap().disks.insert(plan.into(), bytes);
@@ -243,6 +274,10 @@ fn view(f: &FakeFirewall) -> ProviderFirewall {
     }
 }
 
+fn net_view(n: &FakeNetwork, created: bool) -> TeamNetwork {
+    TeamNetwork { id: n.id.clone(), label: n.label.clone(), region: n.region.clone(), subnet_id: n.subnet_id.clone(), subnet: n.subnet.clone(), created }
+}
+
 impl MachineProvider for Fake {
     fn name(&self) -> &'static str {
         "fake"
@@ -263,6 +298,12 @@ impl MachineProvider for Fake {
                 {
                     return Err(refused("firewall_id: Not found"));
                 }
+                let net = match &spec.subnet_id {
+                    None => None,
+                    Some(sub) => Some(
+                        s.networks.values().find(|n| n.subnet_id == *sub).map(|n| n.id.clone()).ok_or_else(|| refused("subnet_id: Not found"))?,
+                    ),
+                };
                 if let Some(ud) = &spec.user_data {
                     s.user_data.insert(spec.label.clone(), ud.clone());
                 }
@@ -282,6 +323,9 @@ impl MachineProvider for Fake {
                 };
                 if let Some(fw) = &spec.firewall_id {
                     s.firewalls.get_mut(fw).unwrap().machines.insert(id.clone());
+                }
+                if let Some(n) = net {
+                    s.networks.get_mut(&n).unwrap().members.insert(id.clone());
                 }
                 s.machines.insert(id, m.clone());
                 Ok(m)
@@ -353,6 +397,9 @@ impl MachineProvider for Fake {
                 for f in s.firewalls.values_mut() {
                     f.machines.remove(id);
                 }
+                for n in s.networks.values_mut() {
+                    n.members.remove(id);
+                }
                 Ok(())
             })
         })
@@ -365,6 +412,55 @@ impl MachineProvider for Fake {
                 m.status = "rebuilding".into();
                 let label = m.label.clone();
                 s.user_data.insert(label, spec.user_data.clone());
+                Ok(())
+            })
+        })
+    }
+
+    fn ensure_team_network<'a>(&'a self, label: &'a str, region: &'a str, subnet: &'a str) -> Fut<'a, TeamNetwork> {
+        Box::pin(async move {
+            self.with("ensure_team_network", |s| {
+                let created = !s.networks.values().any(|n| n.label == label);
+                if created {
+                    s.next += 1;
+                    let id = (700 + s.next).to_string();
+                    let n = FakeNetwork { id: id.clone(), label: label.into(), region: region.into(), subnet_id: (800 + s.next).to_string(), subnet: subnet.into(), members: BTreeSet::new() };
+                    s.networks.insert(id, n);
+                }
+                let n = s.networks.values().find(|n| n.label == label).unwrap();
+                if n.region != region || n.subnet != subnet {
+                    return Err(ProviderError::Api { status: 409, message: format!("VPC {label} is {} in {}", n.subnet, n.region) });
+                }
+                Ok(net_view(n, created))
+            })
+        })
+    }
+
+    fn team_networks<'a>(&'a self, prefix: &'a str) -> Fut<'a, Vec<TeamNetwork>> {
+        Box::pin(async move {
+            self.with("team_networks", |s| Ok(s.networks.values().filter(|n| n.label.starts_with(prefix)).map(|n| net_view(n, false)).collect()))
+        })
+    }
+
+    fn team_network_members<'a>(&'a self, id: &'a str) -> Fut<'a, Vec<NetworkMember>> {
+        Box::pin(async move {
+            self.with("team_network_members", |s| {
+                let n = s.networks.get(id).ok_or(ProviderError::NotFound)?;
+                Ok(n.members.iter().map(|m| NetworkMember { machine: m.clone(), config: format!("{m}-config"), interface: format!("{m}-vpc") }).collect())
+            })
+        })
+    }
+
+    /// As Linode's: never while the machine is on.
+    fn leave_team_network<'a>(&'a self, m: &'a NetworkMember) -> Fut<'a, ()> {
+        Box::pin(async move {
+            self.with("leave_team_network", |s| {
+                if s.machines.get(&m.machine).is_some_and(|x| x.status != "offline") {
+                    return Err(refused("Cannot delete an active interface."));
+                }
+                for n in s.networks.values_mut() {
+                    n.members.remove(&m.machine);
+                }
                 Ok(())
             })
         })

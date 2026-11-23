@@ -3,8 +3,8 @@
 //! Authorization header and nowhere else: not in errors, logs, or `Debug`.
 
 use super::provider::{
-    CreateSpec, FirewallDevices, FirewallRule, Fut, MachineProvider, ProviderError, ProviderFirewall,
-    ProviderMachine, RebuildSpec,
+    CreateSpec, FirewallDevices, FirewallRule, Fut, MachineProvider, NetworkMember, ProviderError, ProviderFirewall,
+    ProviderMachine, RebuildSpec, TeamNetwork,
 };
 use base64::Engine;
 use reqwest::{Method, StatusCode};
@@ -87,6 +87,31 @@ pub fn outbound(deny: &[String], control: Option<(IpAddr, u16)>) -> Result<Vec<O
         });
     }
     Ok(out)
+}
+
+/// `rules` letting TCP and UDP through to the team networks' subnet (ADR 0189), after
+/// botd's port and before the drops. A Linode reaches that range only on its own
+/// team's VPC, which only its team's machines join; on any other the range has no
+/// route. With no outbound rules (MACHINE_FIREWALL_EGRESS=off) there is nothing to let
+/// through.
+pub fn with_team_subnet(mut rules: Vec<Outbound>, subnet: &str) -> Vec<Outbound> {
+    if rules.is_empty() {
+        return rules;
+    }
+    let at = rules.iter().take_while(|r| r.label == CONTROL_RULE).count();
+    for (i, protocol) in ["TCP", "UDP"].into_iter().enumerate() {
+        rules.insert(
+            at + i,
+            Outbound {
+                label: format!("team-network-{}", protocol.to_ascii_lowercase()),
+                action: "ACCEPT".into(),
+                protocol: protocol.into(),
+                ports: None,
+                destinations: vec![subnet.to_string()],
+            },
+        );
+    }
+    rules
 }
 
 pub fn outbound_json(rules: &[Outbound]) -> Value {
@@ -383,6 +408,31 @@ fn time(s: &str) -> Option<i64> {
         .ok()
 }
 
+/// The subnet of a team's VPC that its machines join (ADR 0189).
+pub const SUBNET_LABEL: &str = "machines";
+
+/// A VPC as a team network: its `machines` subnet, which must have a range.
+fn network(v: &Value, created: bool) -> Result<TeamNetwork, ProviderError> {
+    let bad = || ProviderError::Transport("Linode sent a VPC we couldn't read".into());
+    let id = v["id"].as_u64().ok_or_else(bad)?;
+    let label = v["label"].as_str().unwrap_or_default().to_string();
+    let subnet = v["subnets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|s| s["label"] == SUBNET_LABEL)
+        .ok_or_else(|| ProviderError::Api { status: 409, message: format!("VPC {label} has no {SUBNET_LABEL} subnet") })?;
+    let range = subnet["ipv4"].as_str().and_then(|r| super::firewall::cidr(r).ok()).ok_or_else(bad)?;
+    Ok(TeamNetwork {
+        id: id.to_string(),
+        label,
+        region: v["region"].as_str().unwrap_or_default().into(),
+        subnet_id: subnet["id"].as_u64().ok_or_else(bad)?.to_string(),
+        subnet: range,
+        created,
+    })
+}
+
 /// Linode ids are numbers; anything else never reaches a URL path.
 fn path_id(id: &str) -> Result<&str, ProviderError> {
     if !id.is_empty() && id.len() <= 20 && id.bytes().all(|b| b.is_ascii_digit()) {
@@ -447,6 +497,16 @@ impl MachineProvider for Linode {
             }
             if let Some(fw) = &spec.firewall_id {
                 body["firewall_id"] = json!(path_id(fw)?.parse::<u64>().unwrap_or_default());
+            }
+            // Configuration-profile interfaces, so the Linode's one firewall covers the
+            // VPC interface too, inbound and outbound. The public one stays first, the
+            // primary: the internet and botd are reached through it.
+            if let Some(subnet) = &spec.subnet_id {
+                body["interface_generation"] = json!("legacy_config");
+                body["interfaces"] = json!([
+                    { "purpose": "public" },
+                    { "purpose": "vpc", "subnet_id": path_id(subnet)?.parse::<u64>().unwrap_or_default() },
+                ]);
             }
             machine(
                 &self
@@ -590,6 +650,98 @@ impl MachineProvider for Linode {
             )
             .await
             .map(drop)
+        })
+    }
+
+    /// VPCs are free. Labels are unique per account, so a create that lost a race finds
+    /// the winner's.
+    fn ensure_team_network<'a>(&'a self, label: &'a str, region: &'a str, subnet: &'a str) -> Fut<'a, TeamNetwork> {
+        Box::pin(async move {
+            let filter = json!({ "label": label });
+            let found = self.all("/vpcs", Some(&filter)).await?.into_iter().find(|v| v["label"] == label);
+            let v = match found {
+                Some(v) => v,
+                None => {
+                    let body = json!({
+                        "label": label, "region": region, "description": "SuperBot: one team's machines (ADR 0189)",
+                        "subnets": [{ "label": SUBNET_LABEL, "ipv4": subnet }],
+                    });
+                    match self.call(Method::POST, "/vpcs", None, Some(&body)).await {
+                        Ok(v) => return network(&v, true),
+                        Err(ProviderError::LabelTaken) => self
+                            .all("/vpcs", Some(&filter))
+                            .await?
+                            .into_iter()
+                            .find(|v| v["label"] == label)
+                            .ok_or(ProviderError::LabelTaken)?,
+                        Err(e) => return Err(e),
+                    }
+                }
+            };
+            if v["region"] != region {
+                return Err(ProviderError::Api { status: 409, message: format!("VPC {label} is in {}, not {region}", v["region"].as_str().unwrap_or("?")) });
+            }
+            let n = match network(&v, false) {
+                Err(ProviderError::Api { status: 409, .. }) => {
+                    let id = v["id"].as_u64().unwrap_or_default();
+                    let body = json!({ "label": SUBNET_LABEL, "ipv4": subnet });
+                    self.call(Method::POST, &format!("/vpcs/{id}/subnets"), None, Some(&body)).await?;
+                    let v = self.call(Method::GET, &format!("/vpcs/{id}"), None, None).await?;
+                    network(&v, false)?
+                }
+                n => n?,
+            };
+            if n.subnet != subnet {
+                return Err(ProviderError::Api {
+                    status: 409,
+                    message: format!("VPC {label}'s {SUBNET_LABEL} subnet is {}, not MACHINE_TEAM_NETWORK_SUBNET's {subnet}", n.subnet),
+                });
+            }
+            Ok(n)
+        })
+    }
+
+    fn team_networks<'a>(&'a self, prefix: &'a str) -> Fut<'a, Vec<TeamNetwork>> {
+        Box::pin(async move {
+            Ok(self
+                .all("/vpcs", None)
+                .await?
+                .iter()
+                .filter(|v| v["label"].as_str().is_some_and(|l| l.starts_with(prefix)))
+                .filter_map(|v| network(v, false).ok())
+                .collect())
+        })
+    }
+
+    fn team_network_members<'a>(&'a self, id: &'a str) -> Fut<'a, Vec<NetworkMember>> {
+        Box::pin(async move {
+            let mut out = Vec::new();
+            for s in self.all(&format!("/vpcs/{}/subnets", path_id(id)?), None).await? {
+                for l in s["linodes"].as_array().into_iter().flatten() {
+                    let Some(machine) = l["id"].as_u64() else { continue };
+                    for i in l["interfaces"].as_array().into_iter().flatten() {
+                        if let (Some(interface), Some(config)) = (i["id"].as_u64(), i["config_id"].as_u64()) {
+                            out.push(NetworkMember { machine: machine.to_string(), config: config.to_string(), interface: interface.to_string() });
+                        }
+                    }
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    fn leave_team_network<'a>(&'a self, m: &'a NetworkMember) -> Fut<'a, ()> {
+        Box::pin(async move {
+            let path = format!(
+                "/linode/instances/{}/configs/{}/interfaces/{}",
+                path_id(&m.machine)?,
+                path_id(&m.config)?,
+                path_id(&m.interface)?
+            );
+            match self.call(Method::DELETE, &path, None, None).await {
+                Ok(_) | Err(ProviderError::NotFound) => Ok(()),
+                Err(e) => Err(e),
+            }
         })
     }
 
@@ -838,6 +990,70 @@ mod tests {
                         8 => (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "errors": [{ "reason": "Too many requests" }] }))),
                         _ => (StatusCode::BAD_REQUEST, Json(json!({ "errors": [{ "reason": "Linode busy." }] }))),
                     }
+                })
+                .delete(move |State(s): State<Seen>, h: HeaderMap, Path((id, action)): Path<(u64, String)>| async move {
+                    record(&s, "DELETE", format!("/linode/instances/{id}/{action}"), &h, Value::Null);
+                    match id {
+                        7 => (StatusCode::OK, Json(json!({}))),
+                        8 => (StatusCode::BAD_REQUEST, Json(json!({ "errors": [{ "reason": "Cannot delete an active interface." }] }))),
+                        _ => (StatusCode::NOT_FOUND, Json(json!({ "errors": [{ "reason": "Not found" }] }))),
+                    }
+                }),
+            )
+            // VPCs, as Linode answers: `superbot-team-a-gb-lon` is there with its subnet,
+            // `-bare-` has none yet, `-far-` is in another region, `-odd-` has another
+            // range, and `office` isn't ours.
+            .route(
+                "/v4/vpcs",
+                get(move |State(s): State<Seen>, h: HeaderMap, Query(q): Query<HashMap<String, String>>| async move {
+                    record(&s, "GET", format!("/vpcs?page={}&page_size={}", q["page"], q["page_size"]), &h, Value::Null);
+                    let vpc = |id: u64, label: &str, region: &str, subnets: Value| json!({ "id": id, "label": label, "region": region, "subnets": subnets });
+                    let machines = |id: u64, range: &str| json!([{ "id": id, "label": "machines", "ipv4": range, "linodes": [] }]);
+                    let all = [
+                        vpc(5, "superbot-team-a-gb-lon", "gb-lon", machines(50, "10.248.0.0/22")),
+                        vpc(6, "superbot-team-bare-gb-lon", "gb-lon", json!([])),
+                        vpc(7, "superbot-team-far-gb-lon", "us-east", machines(70, "10.248.0.0/22")),
+                        vpc(8, "superbot-team-odd-gb-lon", "gb-lon", machines(80, "10.9.0.0/24")),
+                        vpc(4, "office", "gb-lon", machines(40, "10.248.0.0/22")),
+                    ];
+                    let label = h.get("x-filter").and_then(|f| serde_json::from_str::<Value>(f.to_str().unwrap()).ok()).map(|f| f["label"].clone());
+                    let data: Vec<Value> = all.into_iter().filter(|v| label.as_ref().is_none_or(|l| v["label"] == *l)).collect();
+                    (StatusCode::OK, Json(json!({ "data": data, "page": 1, "pages": 1, "results": 1 })))
+                })
+                .post(move |State(s): State<Seen>, h: HeaderMap, Json(b): Json<Value>| async move {
+                    record(&s, "POST", "/vpcs".into(), &h, b.clone());
+                    if b["label"] == "taken-vpc" {
+                        return (StatusCode::BAD_REQUEST, Json(json!({ "errors": [{ "field": "label", "reason": "Label must be unique among your VPCs" }] })));
+                    }
+                    (StatusCode::OK, Json(json!({ "id": 9, "label": b["label"], "region": b["region"],
+                        "subnets": [{ "id": 90, "label": b["subnets"][0]["label"], "ipv4": b["subnets"][0]["ipv4"], "linodes": [] }] })))
+                }),
+            )
+            .route(
+                "/v4/vpcs/{id}",
+                get(move |State(s): State<Seen>, h: HeaderMap, Path(id): Path<u64>| async move {
+                    record(&s, "GET", format!("/vpcs/{id}"), &h, Value::Null);
+                    (StatusCode::OK, Json(json!({ "id": id, "label": "superbot-team-bare-gb-lon", "region": "gb-lon",
+                        "subnets": [{ "id": 61, "label": "machines", "ipv4": "10.248.0.0/22" }] })))
+                }),
+            )
+            .route(
+                "/v4/vpcs/{id}/subnets",
+                get(move |State(s): State<Seen>, h: HeaderMap, Path(id): Path<u64>| async move {
+                    record(&s, "GET", format!("/vpcs/{id}/subnets"), &h, Value::Null);
+                    (StatusCode::OK, Json(json!({ "data": [
+                        { "id": 50, "label": "machines", "ipv4": "10.248.0.0/22", "linodes": [
+                            { "id": 7, "interfaces": [{ "id": 701, "active": true, "config_id": 70 }] },
+                            { "id": 12, "interfaces": [{ "id": 1201, "active": false, "config_id": null }] },
+                        ] },
+                        { "id": 51, "label": "services", "ipv4": "10.250.0.0/24", "linodes": [
+                            { "id": 30, "interfaces": [{ "id": 3001, "active": true, "config_id": 300 }] },
+                        ] },
+                    ], "page": 1, "pages": 1, "results": 2 })))
+                })
+                .post(move |State(s): State<Seen>, h: HeaderMap, Path(id): Path<u64>, Json(b): Json<Value>| async move {
+                    record(&s, "POST", format!("/vpcs/{id}/subnets"), &h, b.clone());
+                    (StatusCode::OK, Json(json!({ "id": 61, "label": b["label"], "ipv4": b["ipv4"] })))
                 }),
             )
             .route(
@@ -945,6 +1161,7 @@ mod tests {
             authorized_keys: vec!["ssh-ed25519 AAAAC3Nza test@example".into()],
             user_data: None,
             firewall_id: None,
+            subnet_id: None,
         }
     }
 
@@ -1313,6 +1530,118 @@ mod tests {
             assert_eq!(rules["outbound"][1]["protocol"], "UDP");
         }
         assert_eq!(seen[2].1, "/networking/firewalls/77/rules");
+    }
+
+    #[test]
+    fn the_team_subnet_is_let_through_after_botds_port_and_before_the_drops() {
+        let public = with_team_subnet(outbound(&private(), None).unwrap(), "10.248.0.0/22");
+        let labels: Vec<&str> = public.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["team-network-tcp", "team-network-udp", "no-private-tcp", "no-private-udp"]);
+        assert!(public[..2].iter().all(|r| r.action == "ACCEPT" && r.ports.is_none() && r.destinations == ["10.248.0.0/22"]));
+        let private_botd = with_team_subnet(outbound(&private(), Some(("10.1.2.3".parse().unwrap(), 8443))).unwrap(), "10.248.0.0/22");
+        let labels: Vec<&str> = private_botd.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, [CONTROL_RULE, "team-network-tcp", "team-network-udp", "no-private-tcp", "no-private-udp"]);
+        assert_eq!(with_team_subnet(Vec::new(), "10.248.0.0/22"), [], "outbound open: nothing to let through");
+        let body = rules_body(&[], &private_botd);
+        assert_eq!(our_rules(&body, &private_botd), Some(vec![]), "reads back as ours");
+        assert_eq!(our_rules(&body, &outbound(&private(), Some(("10.1.2.3".parse().unwrap(), 8443))).unwrap()), None, "and a firewall without it is set again");
+    }
+
+    #[tokio::test]
+    async fn a_machine_joins_its_teams_subnet_from_its_first_boot() {
+        let (api, seen) = fake_api().await;
+        api.create(&CreateSpec { subnet_id: Some("50".into()), firewall_id: Some("77".into()), ..spec("superbot-m1") }).await.unwrap();
+        api.create(&spec("superbot-m2")).await.unwrap();
+        assert!(api.create(&CreateSpec { subnet_id: Some("../5".into()), ..spec("superbot-m3") }).await.is_err(), "ids are checked");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        let b = &seen[0].3;
+        assert_eq!(b["interfaces"], json!([{ "purpose": "public" }, { "purpose": "vpc", "subnet_id": 50 }]), "public first: the primary");
+        assert_eq!(b["interface_generation"], "legacy_config", "so the Linode's firewall covers the VPC interface");
+        assert_eq!(b["firewall_id"], 77);
+        assert!(seen[1].3.get("interfaces").is_none() && seen[1].3.get("interface_generation").is_none(), "no team, Linode's defaults");
+    }
+
+    #[tokio::test]
+    async fn a_teams_vpc_is_found_or_made_with_its_subnet() {
+        let (api, seen) = fake_api().await;
+        let found = api.ensure_team_network("superbot-team-a-gb-lon", "gb-lon", "10.248.0.0/22").await.unwrap();
+        assert_eq!(
+            found,
+            TeamNetwork { id: "5".into(), label: "superbot-team-a-gb-lon".into(), region: "gb-lon".into(), subnet_id: "50".into(), subnet: "10.248.0.0/22".into(), created: false }
+        );
+        let made = api.ensure_team_network("superbot-team-new-gb-lon", "gb-lon", "10.248.0.0/22").await.unwrap();
+        assert_eq!((made.id.as_str(), made.subnet_id.as_str(), made.created), ("9", "90", true));
+        let bare = api.ensure_team_network("superbot-team-bare-gb-lon", "gb-lon", "10.248.0.0/22").await.unwrap();
+        assert_eq!((bare.id.as_str(), bare.subnet_id.as_str(), bare.created), ("6", "61", false), "its subnet added");
+        let far = api.ensure_team_network("superbot-team-far-gb-lon", "gb-lon", "10.248.0.0/22").await.unwrap_err();
+        assert!(far.to_string().contains("is in us-east, not gb-lon"), "{far}");
+        let odd = api.ensure_team_network("superbot-team-odd-gb-lon", "gb-lon", "10.248.0.0/22").await.unwrap_err();
+        assert!(odd.to_string().contains("is 10.9.0.0/24, not MACHINE_TEAM_NETWORK_SUBNET's 10.248.0.0/22"), "{odd}");
+        assert_eq!(api.ensure_team_network("taken-vpc", "gb-lon", "10.248.0.0/22").await, Err(ProviderError::LabelTaken), "lost a race to a VPC we can't see");
+
+        let seen = seen.lock().unwrap();
+        let calls: Vec<(&str, &str)> = seen.iter().map(|(m, p, _, _)| (m.as_str(), p.as_str())).collect();
+        assert_eq!(
+            calls,
+            [
+                ("GET", "/vpcs?page=1&page_size=500"),
+                ("GET", "/vpcs?page=1&page_size=500"),
+                ("POST", "/vpcs"),
+                ("GET", "/vpcs?page=1&page_size=500"),
+                ("POST", "/vpcs/6/subnets"),
+                ("GET", "/vpcs/6"),
+                ("GET", "/vpcs?page=1&page_size=500"),
+                ("GET", "/vpcs?page=1&page_size=500"),
+                ("GET", "/vpcs?page=1&page_size=500"),
+                ("POST", "/vpcs"),
+                ("GET", "/vpcs?page=1&page_size=500"),
+            ]
+        );
+        assert_eq!(seen[0].2.as_deref(), Some(r#"{"label":"superbot-team-a-gb-lon"}"#), "found by its exact label");
+        assert_eq!(
+            seen[2].3,
+            json!({ "label": "superbot-team-new-gb-lon", "region": "gb-lon", "description": "SuperBot: one team's machines (ADR 0189)",
+                "subnets": [{ "label": "machines", "ipv4": "10.248.0.0/22" }] })
+        );
+        assert_eq!(seen[4].3, json!({ "label": "machines", "ipv4": "10.248.0.0/22" }));
+    }
+
+    #[tokio::test]
+    async fn team_networks_their_members_and_leaving() {
+        let (api, seen) = fake_api().await;
+        let nets = api.team_networks("superbot-team-").await.unwrap();
+        let labels: Vec<&str> = nets.iter().map(|n| n.label.as_str()).collect();
+        assert_eq!(labels, ["superbot-team-a-gb-lon", "superbot-team-far-gb-lon", "superbot-team-odd-gb-lon"], "ours only, each with its subnet");
+        let members = api.team_network_members("5").await.unwrap();
+        assert_eq!(
+            members,
+            [
+                NetworkMember { machine: "7".into(), config: "70".into(), interface: "701".into() },
+                NetworkMember { machine: "30".into(), config: "300".into(), interface: "3001".into() },
+            ],
+            "every subnet's; an interface of another kind has no profile to take it off"
+        );
+        api.leave_team_network(&members[0]).await.unwrap();
+        let gone = NetworkMember { machine: "9".into(), ..members[0].clone() };
+        api.leave_team_network(&gone).await.unwrap();
+        let active = NetworkMember { machine: "8".into(), ..members[0].clone() };
+        assert!(matches!(api.leave_team_network(&active).await, Err(ProviderError::Api { status: 400, .. })));
+        assert!(api.leave_team_network(&NetworkMember { config: "../1".into(), ..members[0].clone() }).await.is_err());
+        assert!(api.team_network_members("../5").await.is_err());
+        let seen = seen.lock().unwrap();
+        let paths: Vec<&str> = seen.iter().map(|s| s.1.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "/vpcs?page=1&page_size=500",
+                "/vpcs/5/subnets",
+                "/linode/instances/7/configs/70/interfaces/701",
+                "/linode/instances/9/configs/70/interfaces/701",
+                "/linode/instances/8/configs/70/interfaces/701",
+            ]
+        );
+        assert!(seen[0].2.is_none(), "every VPC, filtered here");
     }
 
     #[test]
