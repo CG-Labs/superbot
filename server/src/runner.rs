@@ -997,7 +997,8 @@ impl App {
         }
         let period = self.billing_period(&bot.owner_id, crate::db::now());
         let storage = crate::storage::check(self, &bot.owner_id).await;
-        let Some((tier, route, wiring, held)) = self.tier_route(&bot, msg, &by, &asker, &people, &period, &space.1, storage.as_ref()) else { return };
+        let leased = crate::secrets::leases::names_for_run(&bot.owner_id, for_other.is_none());
+        let Some((tier, route, wiring, held)) = self.tier_route(&bot, msg, &by, &asker, &people, &period, &space.1, &leased, storage.as_ref()) else { return };
         trace::note("superbot.tier", &tier);
         let placed_at = self.db.placed_at(&bot.owner_id);
         let Some(place) = self.place(&bot, msg, &by, &period.key, bin, for_other.as_deref()).await else { return };
@@ -1102,6 +1103,23 @@ impl App {
                 Err(e) => return self.refuse_for_secrets(&bot, msg, &by, &e, Some(&period.key)),
             },
             Place::Here => space,
+        };
+        // Short-lived credentials, made last so no wait outlives them, and revoked when
+        // `_leases` drops as the run ends, however it ends (ADR 0185).
+        let (space, _leases) = match crate::secrets::leases::for_run(&bot.owner_id, &bot.id, for_other.is_none(), self.cfg.run_timeout) {
+            Ok((creds, leases)) => {
+                if let Some(e) = wiring.endpoints.iter().find(|e| leases.cleared().contains(&e.key_secret)) {
+                    let e = crate::secrets::Error::Unavailable(format!("the lease gave an empty {}, the key for model provider {}", e.key_secret, e.name));
+                    return self.refuse_for_secrets(&bot, msg, &by, &e, Some(&period.key));
+                }
+                let (cwd, mut env) = space;
+                for name in leases.cleared() {
+                    env.remove(name);
+                }
+                env.extend(creds.into_iter().map(|(k, v)| (k, v.expose().to_string())));
+                ((cwd, env), leases)
+            }
+            Err(e) => return self.refuse_for_secrets(&bot, msg, &by, &e, Some(&period.key)),
         };
         let mut spot = self.spot(&bot, bot_dir.clone(), space, place, for_other.as_deref());
         spot.for_other = for_other.clone();
@@ -2147,6 +2165,7 @@ impl App {
         people: &[String],
         period: &usage::Period,
         env: &HashMap<String, String>,
+        leased: &[String],
         storage: Option<&(storage::Measured, u64, storage::State)>,
     ) -> Option<(String, Route, Wiring, Option<Held>)> {
         let tier = self.tier_of(&bot.owner_id);
@@ -2199,7 +2218,8 @@ impl App {
             }
         };
         let route = held.as_ref().map_or(route, |h| h.route.clone());
-        let has_key = |k: &str| tier_key(env, k).is_some();
+        // A key a lease gives is checked once the lease is made, in `run_one`.
+        let has_key = |k: &str| leased.iter().any(|n| n == k) || tier_key(env, k).is_some();
         // A held route's fallbacks are exactly its own, so the harness's settings add none.
         let wiring = match self.tiers().wiring(&route, tier.managed() || held.is_some(), has_key) {
             Ok(w) => w,
