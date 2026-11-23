@@ -1,6 +1,6 @@
 # Air-gapped installs
 
-SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md), signatures and multi-arch indexes in mirrors in [ADR 0147](../adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md), how every release's bundles are checked end to end in [ADR 0172](../adr/0172-release-bundles-checked-end-to-end.md), and harness installs on users' machines from your own mirrors in [ADR 0186](../adr/0186-harness-installs-from-internal-mirrors.md).
+SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md), signatures and multi-arch indexes in mirrors in [ADR 0147](../adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md), how every release's bundles are checked end to end in [ADR 0172](../adr/0172-release-bundles-checked-end-to-end.md), harness installs on users' machines from your own mirrors in [ADR 0186](../adr/0186-harness-installs-from-internal-mirrors.md), and Hermes Agent from a Hermes bundle in [ADR 0200](../adr/0200-hermes-agent-bundle-for-air-gapped-installs.md).
 
 ## What a bundle holds
 
@@ -33,7 +33,7 @@ The bundle carries SuperBot, not the operating system. Install these on the serv
 
 The installer lists anything missing and stops before it changes anything.
 
-**Harness CLIs** (Claude Code, Codex, Pi, Hermes Agent) are not in the bundle for the bash install: install them from your npm or Python mirror, system-wide, as in [deploy/README.md](../../deploy/README.md#one-unix-account-per-user). `--with-hermes` downloads Hermes Agent, so it is refused with `--offline`. Users' own machines install their harness CLIs from your mirrors instead ([below](#harness-clis-on-users-machines)). The published image already has Claude Code, Codex and Pi and the screens, so [Docker Compose](#docker-compose) is the simpler path when you need them. It doesn't have Hermes Agent: for Hermes, build your own image on the connected side (`docker build --build-arg HARNESSES="claude codex pi hermes" -t superbot-hermes:<version> .`) and bundle it with `--image superbot=superbot-hermes:<version> --allow-unsigned` (it is your image, so there is no release signature to check). After loading it, set `SUPERBOT_IMAGE=superbot-hermes:<version>` in `.env` as well as `SUPERBOT_VERSION`, so Compose runs your image instead of the published one.
+**Harness CLIs** (Claude Code, Codex, Pi) are not in the bundle for the bash install: install them from your npm mirror, system-wide, as in [deploy/README.md](../../deploy/README.md#one-unix-account-per-user). **Hermes Agent** comes from its own [Hermes bundle](#hermes-agent): `--with-hermes` with `--offline` needs `--hermes-bundle`. Users' own machines install their harness CLIs from your mirrors instead ([below](#harness-clis-on-users-machines)). The published image already has Claude Code, Codex and Pi and the screens, so [Docker Compose](#docker-compose) is the simpler path when you need them. It doesn't have Hermes Agent: for Hermes with Compose, build your own image on the connected side (`docker build --build-arg HARNESSES="claude codex pi hermes" -t superbot-hermes:<version> .`) and bundle it with `--image superbot=superbot-hermes:<version> --allow-unsigned` (it is your image, so there is no release signature to check). After loading it, set `SUPERBOT_IMAGE=superbot-hermes:<version>` in `.env` as well as `SUPERBOT_VERSION`, so Compose runs your image instead of the published one.
 
 ## Getting a bundle
 
@@ -123,6 +123,39 @@ sudo bash install.sh --offline superbot-offline-0.2.0-x86_64.tar.gz --upgrade \
 ```
 
 The same checks run, then the binaries, client, site and templates are replaced and botd restarts; `.env`, the database, the master key, the license and per-user accounts stay. Back up first (`botctl backups`, [backup-restore.md](backup-restore.md)) and read the release's notes in the [changelog](../../CHANGELOG.md). The installed version is recorded in `/usr/local/share/superbot/offline-release`; a bundle **older** than it is refused, because a database a newer botd changed may not open with an older one. To go back, restore a backup made on the older version.
+
+## Hermes Agent
+
+Hermes Agent has no npm package, and its own installer downloads from GitHub, PyPI and more. So it comes in a bundle of its own, `superbot-hermes-<tag>-<arch>.tar.gz`, with `.sha256` and, on a release, `.sigstore.json` beside it. Every release has one per arch, attached to it and signed like the main bundle. It holds Hermes Agent at the commit that release pins, as its installer leaves it in `/opt/hermes`: the checkout, its Python, packages and Node.js tools. It is about 1 GB, and 2.7 GB unpacked. It is the same from release to release until the pin moves, so you only carry a new one in when the installer asks for it.
+
+**Your own**, from a checkout of the same release tag, on a connected Ubuntu machine with the server's arch (as root: it installs into a private mount namespace, so the machine's own `/opt` is untouched; it needs `curl`, `git` and `unshare`):
+
+```sh
+sudo deploy/offline-bundle.sh hermes --out dist
+```
+
+It runs Hermes's installer for the pinned commit, after checking its SHA-256. It then checks that Hermes runs with no network and packs it. Verify a Hermes bundle as any other, with `cosign verify-blob` (same identity) and `deploy/offline-bundle.sh verify`, and record its SHA-256.
+
+**Install or upgrade** with the main bundle (install `libatomic1` from your mirror first; it needs about 4 GB free under `/opt` while it runs, plus 2.7 GB when it replaces an earlier Hermes):
+
+```sh
+sudo bash install.sh --offline superbot-offline-0.2.0-x86_64.tar.gz --bundle-sha256 <recorded sha-256> \
+  --with-hermes --hermes-bundle superbot-hermes-v0.23.3-x86_64.tar.gz --hermes-bundle-sha256 <its recorded sha-256> \
+  --domain bots.corp.example --tls-cert /root/bots.pem --tls-key /root/bots.key
+```
+
+(add `--upgrade` on a server that is already installed). Before anything changes, the installer checks:
+
+- the Hermes bundle's SHA-256 or signature, as for the main bundle;
+- its files against `SHA256SUMS`;
+- that its `MANIFEST` is for this arch, for `/opt/hermes`, and for the exact commit this release pins;
+- that its tree holds only files, folders and links that stay inside `/opt/hermes`, none setuid.
+
+Then it stops botd, swaps the tree into `/opt/hermes` (root-owned, linked from `/usr/local/bin/hermes`) and checks that another account can run it. If anything fails, it puts the previous `/opt/hermes` back. Hermes always goes in `/opt/hermes` this way, with or without per-user accounts. Bots' own Hermes data is in their folders, not there, so replacing it loses nothing. If `/opt/hermes` already holds the pinned commit, it says so and leaves it.
+
+An `--upgrade` without `--with-hermes` keeps the Hermes Agent you have. When the new release pins another commit, the installer says so: re-run with `--with-hermes --hermes-bundle` and that release's Hermes bundle.
+
+Hermes Agent on users' own machines still needs the internet ([below](#harness-clis-on-users-machines)).
 
 ## Docker Compose
 
@@ -229,7 +262,8 @@ Logins that go through a vendor's website (`claude login`, `codex login`) don't 
 |---------|---------|
 | License | Works: checked against keys built into botd, no phone-home ([below](#license-and-seats)) |
 | Sign-in | Password, TOTP, and SSO against an identity provider inside your network (ADFS, Keycloak or another OIDC/SAML IdP); cloud IdPs (Entra, Google, GitHub, Apple) only if the server can reach them |
-| Harness CLIs on this server, `--with-hermes` | Download from the internet: install from your npm mirror instead, or use the published image |
+| Harness CLIs on this server | Claude Code, Codex and Pi download from the internet: install from your npm mirror instead, or use the published image |
+| `--with-hermes` | Downloads Hermes Agent: with `--offline`, give `--hermes-bundle` ([Hermes Agent](#hermes-agent)) |
 | Harness CLIs on users' machines | Claude Code, Codex and Pi from your Node.js and npm mirrors ([above](#harness-clis-on-users-machines)); Hermes Agent needs GitHub and PyPI |
 | Billing (Stripe), push notifications (`PUSH_PROVIDER=expo`), Turnstile on the sign-up form | Need the internet: leave them off (the default) |
 | Managed machines on Linode | Need the internet: use Incus hosts inside your network, or none |
