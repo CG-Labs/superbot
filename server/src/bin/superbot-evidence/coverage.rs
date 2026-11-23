@@ -332,7 +332,8 @@ pub fn scan(store: &Path) -> Result<(Vec<Found>, Vec<String>), String> {
                 continue;
             }
             if meta.is_dir() {
-                if kind_of(&name).is_some() && (p.join("manifest.json").exists() || p.join("SHA256SUMS").exists()) {
+                // Named as a bundle is enough: one that lost its manifest and sums must still fail.
+                if kind_of(&name).is_some() {
                     found.push(folder(rel(store, &p), &name, &p));
                 } else if depth < MAX_DEPTH {
                     walk(store, &p, depth + 1, found, other)?;
@@ -351,6 +352,8 @@ pub fn scan(store: &Path) -> Result<(Vec<Found>, Vec<String>), String> {
                     Err(why) if kind_of(&name).is_some() => found.push(Found { path: rel(store, &p), name: name.trim_end_matches(".tar").into(), problems: vec![format!("it can't be read: {why}")], ..Found::default() }),
                     Err(_) => other.push(rel(store, &p)),
                 }
+            } else {
+                other.push(rel(store, &p));
             }
         }
         Ok(())
@@ -528,7 +531,7 @@ pub fn report(found: &[Found], other: &[String], p: &Period, checklist: Option<&
                 "path": f.path, "name": f.name, "kind": f.kind.map(|k| k.id),
                 "period": f.period.map(|b| json!({ "from": b.from.to_string(), "to": b.to.to_string() })),
                 "createdAt": f.created, "format": f.format, "manifestSha256": f.manifest_sha256,
-                "verified": f.verified(), "inPeriod": used.iter().any(|u| std::ptr::eq(*u, f)),
+                "verified": f.verified(), "inPeriod": f.period.is_some_and(|b| b.from < p.to && b.to > p.from),
                 "problems": f.problems, "warnings": f.warnings, "exceptions": f.exceptions,
             })
         })
@@ -781,6 +784,16 @@ mod tests {
         (name, files)
     }
 
+    /// One tar entry with the given type flag, without the end-of-archive blocks.
+    fn entry(name: &str, flag: u8, data: &[u8]) -> Vec<u8> {
+        let mut t = crate::ustar::tar(&[(name.to_string(), data.to_vec())], 0);
+        t.truncate(t.len() - 1024);
+        t[156] = flag;
+        let sum: u32 = t[..512].iter().enumerate().map(|(j, &c)| if (148..156).contains(&j) { 32 } else { u32::from(c) }).sum();
+        t[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        t
+    }
+
     fn seal(files: &mut BTreeMap<String, Vec<u8>>) {
         files.remove("SHA256SUMS");
         let sums: String = files.iter().map(|(n, b)| format!("{}  {n}\n", sha256(b))).collect();
@@ -912,7 +925,7 @@ mod tests {
         assert_eq!(untar(&tar).unwrap().len(), files.len());
         assert!(from_entries("v.tar".into(), untar(&tar).unwrap()).unwrap().verified());
 
-        // GNU tar's `./` names, a directory entry, and a long name in a pax header.
+        // GNU tar's `./` names and a directory entry.
         let mut repacked = vec![(format!("./{name}/README.txt"), b"readme\n".to_vec())];
         repacked.extend(entries.iter().filter(|(n, _)| !n.ends_with("README.txt")).cloned());
         let mut raw = crate::ustar::tar(&repacked, 0);
@@ -926,6 +939,27 @@ mod tests {
         all.resize(all.len() + 1024, 0);
         let f = from_entries("v.tar".into(), untar(&all).unwrap()).unwrap();
         assert!(f.verified(), "{:?}", f.problems);
+
+        // Long names: a pax header's path and a GNU long name each name the next file; a
+        // pax header without a path leaves the next file's own name.
+        let long = format!("{name}/{}", "x".repeat(120));
+        let pax = |kv: &str| {
+            let rest = format!(" {kv}\n");
+            let mut n = rest.len() + 1;
+            while format!("{n}{rest}").len() != n {
+                n += 1;
+            }
+            format!("{n}{rest}").into_bytes()
+        };
+        let mut t = entry("PaxHeaders/a", b'x', &pax(&format!("path={long}")));
+        t.extend(entry("short-a", b'0', b"one"));
+        t.extend(entry("././@LongLink", b'L', format!("{name}/gnu-{}\0", "y".repeat(110)).as_bytes()));
+        t.extend(entry("short-b", b'0', b"two"));
+        t.extend(entry("PaxHeaders/c", b'x', &pax("mtime=0")));
+        t.extend(entry(&format!("{name}/own"), b'0', b"three"));
+        t.resize(t.len() + 1024, 0);
+        let got: Vec<(String, Vec<u8>)> = untar(&t).unwrap();
+        assert_eq!(got, vec![(long, b"one".to_vec()), (format!("{name}/gnu-{}", "y".repeat(110)), b"two".to_vec()), (format!("{name}/own"), b"three".to_vec())]);
 
         let mut broken = tar.clone();
         broken[600] ^= 1;
@@ -942,6 +976,26 @@ mod tests {
         let two = crate::ustar::tar(&[(format!("{name}/a"), vec![]), ("superbot-evidence-2027-01-01_2027-02-01-x/b".into(), vec![])], 0);
         assert!(from_entries("t.tar".into(), untar(&two).unwrap()).unwrap().problems[0].contains("more than one folder"));
         assert!(from_entries("o.tar".into(), untar(&crate::ustar::tar(&[("photos/a.jpg".into(), vec![1])], 0)).unwrap()).is_none());
+    }
+
+    #[test]
+    fn a_damaged_folder_still_counts_and_other_files_are_listed() {
+        let store = std::env::temp_dir().join(format!("coverage-scan-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&store);
+        let (name, files) = bundle(&KINDS[0], p("2027-01-01", "2027-02-01"), "2027-02-01T00:01:00Z");
+        let damaged = store.join("2027-01").join(&name);
+        std::fs::create_dir_all(&damaged).unwrap();
+        std::fs::write(damaged.join("backups.json"), &files["backups.json"]).unwrap();
+        std::fs::write(store.join("notes.txt"), "by hand").unwrap();
+        std::fs::write(store.join(".partial.tar"), "half").unwrap();
+        let (found, other) = scan(&store).unwrap();
+        let _ = std::fs::remove_dir_all(&store);
+        assert_eq!(found.len(), 1);
+        assert!(!found[0].verified() && found[0].problems.iter().any(|x| x.contains("no SHA256SUMS")) && found[0].problems.iter().any(|x| x.contains("no manifest.json")), "{:?}", found[0].problems);
+        assert_eq!(other, ["notes.txt"]);
+        let r = report(&found, &other, &p("2027-01-01", "2027-02-01"), None, 0);
+        assert_eq!((r["bundles"][0]["verified"].as_bool(), r["bundles"][0]["inPeriod"].as_bool()), (Some(false), Some(true)));
+        assert_eq!(r["summary"]["otherFiles"], 1);
     }
 
     #[test]

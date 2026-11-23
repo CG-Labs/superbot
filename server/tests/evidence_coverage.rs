@@ -144,6 +144,7 @@ fn coverage_checks_botds_bundles_and_finds_each_missing_day() {
     let (code, r) = report(&[s, "--from", &from, "--to", &to, "--json", "--checklist", checklist]);
     assert_eq!(code, Some(2), "{r:#}");
     assert_eq!((r["summary"]["bundles"].as_u64(), r["summary"]["verified"].as_u64(), r["summary"]["failed"].as_u64()), (Some(2), Some(2), Some(0)), "{r:#}");
+    assert_eq!(r["otherFiles"], serde_json::json!(["notes.txt"]), "the note is passed over, the partial file skipped");
     let got: Vec<&str> = r["bundles"].as_array().unwrap().iter().filter_map(|b| b["manifestSha256"].as_str()).collect();
     assert_eq!(got, manifests.iter().map(String::as_str).collect::<Vec<_>>(), "each manifest's digest is the one botd recorded");
     assert!(r["bundles"][0]["path"].as_str().unwrap().ends_with(".tar"));
