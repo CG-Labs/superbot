@@ -355,6 +355,56 @@ fn hermes_two_providers() {
     pass("with no fallback left the run ends in an error");
 }
 
+/// A Claude Code or Codex route to a tiers-file endpoint (ADR 0192), through the real
+/// CLI: its model calls reach only that endpoint, with its key, though botd's environment
+/// and the harness's own settings in HOME point at another (the server's fake model);
+/// and a shell command the agent runs sees no key.
+fn endpoint_route(harness: &str) {
+    if !wanted(harness, harness) {
+        return;
+    }
+    if real() {
+        println!("SKIP {harness}: the endpoint route test needs the fake models");
+        return;
+    }
+    let endpoint = fake_provider(Some("in-region"));
+    let (provider, secret, base, shell) = match harness {
+        "claude" => ("uk-claude", "E2E_UK_KEY", json!({ "protocol": "anthropic-messages", "baseUrl": format!("http://127.0.0.1:{}", endpoint.port) }), "${ANTHROPIC_API_KEY:-unset},${E2E_UK_KEY:-unset}"),
+        _ => ("eu-responses", "E2E_EU_KEY", json!({ "protocol": "openai-responses", "baseUrl": format!("http://127.0.0.1:{}/v1", endpoint.port) }), "${SUPERBOT_PROVIDER_EU_RESPONSES_API_KEY:-unset},${E2E_EU_KEY:-unset}"),
+    };
+    let mut p = base;
+    (p["keySecret"], p["regions"]) = (json!(secret), json!(["gb-lon"]));
+    let tiers = json!({
+        "default": "region-plan",
+        "providers": { provider: p },
+        "tiers": [{ "name": "region-plan", "routes": [{ "harness": harness, "provider": provider, "model": MODEL }] }]
+    });
+    let file = std::env::temp_dir().join(format!("superbot-e2e-tiers-{}-{}.json", std::process::id(), free_port()));
+    std::fs::write(&file, tiers.to_string()).unwrap();
+    let b = start_with(harness, None, &[("TIERS_FILE", file.to_str().unwrap())]);
+    let _ = std::fs::remove_file(&file);
+    let server = b.model.as_ref().unwrap();
+    // The harness's own settings name the server's model too; botd's run settings outrank them.
+    if harness == "claude" {
+        let user = json!({ "env": { "ANTHROPIC_BASE_URL": format!("http://127.0.0.1:{}", server.port), "ANTHROPIC_AUTH_TOKEN": "e2e-user-token" } });
+        std::fs::create_dir_all(b.dir.join("home/.claude")).unwrap();
+        std::fs::write(b.dir.join("home/.claude/settings.json"), user.to_string()).unwrap();
+    }
+    let id = call(&b, "GET", "/api/bots", Value::Null)[0]["id"].as_str().unwrap().to_string();
+    call(&b, "PUT", "/api/policy", json!({ "sandbox": false }));
+    call(&b, "PUT", &format!("/api/secrets/{secret}"), json!({ "value": "e2e-endpoint-key" }));
+    let n = |m: &FakeModel| m.calls.load(std::sync::atomic::Ordering::SeqCst);
+
+    let r = run(&b, &id, &prompt(&format!("echo keys={shell}")), None, &|| {});
+    assert!(r.text.contains(&format!("[in-region] {DONE}")), "{harness} didn't reach its endpoint (result {}): {}", r.result, r.text);
+    assert!(r.text.contains("keys=unset,unset"), "{harness}: the agent's shell saw a key: {}", r.text);
+    assert!(!endpoint.keys().is_empty() && endpoint.keys().iter().all(|k| k == "e2e-endpoint-key"), "{harness}: {:?}", endpoint.keys());
+    assert_eq!(n(server), 0, "{harness} reached the model its own settings name");
+    let d = details(&audit(&b, "harness.invoked")[0]);
+    assert_eq!((d["tier"].as_str(), d["provider"].as_str()), (Some("region-plan"), Some(provider)), "{d}");
+    println!("PASS {harness}: a route to a tiers-file endpoint reaches only it, with its key, and no key in the shell");
+}
+
 /// Tools other than the shell that each harness reports through its hook and that the
 /// canary counts, with the Bot model that makes the CLI offer it (ADR 0063).
 fn other_tools(harness: &str) -> Vec<(&'static str, Option<&'static str>)> {
@@ -392,6 +442,18 @@ fn claude_code_hooks_hold() {
 fn codex_hooks_hold() {
     approvals_hold("codex", "codex");
     unhooked_runs_stop("codex", "codex");
+}
+
+#[test]
+#[ignore = "needs the Claude Code CLI; see the harness-e2e workflow"]
+fn claude_code_routes_to_a_tier_endpoint() {
+    endpoint_route("claude");
+}
+
+#[test]
+#[ignore = "needs the Codex CLI; see the harness-e2e workflow"]
+fn codex_routes_to_a_tier_endpoint() {
+    endpoint_route("codex");
 }
 
 #[test]

@@ -703,8 +703,19 @@ mod tests {
         assert_eq!(job.env["ANTHROPIC_API_KEY"], "sk-tier-not-real");
         assert!(!job.env.contains_key("TIER_UK_KEY"), "only under the name Claude Code reads");
         assert_eq!((job.env["ANTHROPIC_AUTH_TOKEN"].as_str(), job.env["CLAUDE_CODE_OAUTH_TOKEN"].as_str()), ("", ""));
-        assert_eq!(job.env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1", "kept from its Bash tool, hooks and MCP servers");
         assert!(!job.args.iter().any(|a| a.contains("sk-tier")), "never in the arguments");
+        // Kept from its Bash tool by a file sourced before each command; with no sandbox
+        // (so maybe no bubblewrap) no scrub, which would stop Claude Code from starting.
+        let file = i.config_dir.join("claude-endpoint-bash-env.sh");
+        assert_eq!(job.env["CLAUDE_ENV_FILE"], file.display().to_string());
+        let [f] = job.files.as_slice() else { panic!("{:?}", job.files.len()) };
+        assert_eq!((f.path.as_str(), f.body.as_str()), (job.env["CLAUDE_ENV_FILE"].as_str(), "unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN\n"));
+        assert!(!job.env.contains_key("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"));
+        let mut boxed = on_endpoint(&dir, "uk-claude", crate::tiers::Protocol::AnthropicMessages, "TIER_UK_KEY", false);
+        boxed.sandbox = Some(Sandbox { writable: Vec::new() });
+        let job_boxed = job_for(get("claude").unwrap().as_mut(), &boxed, &mut Vec::new());
+        assert_eq!(job_boxed.env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1", "where its sandbox starts, hooks and MCP servers don't get it either");
+        assert_eq!(settings(&job_boxed)["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1");
         // The same in flag settings, which outrank the Bot's own settings files.
         let s = settings(&job);
         assert_eq!(s["env"]["ANTHROPIC_BASE_URL"], "https://uk-claude.example/v1");
@@ -725,7 +736,7 @@ mod tests {
         (own.provider, own.endpoints) = (None, Vec::new());
         let job = job_for(get("claude").unwrap().as_mut(), &own, &mut Vec::new());
         assert_eq!(job.env["ANTHROPIC_API_KEY"], "sk-own-not-real");
-        assert!(!job.env.contains_key("ANTHROPIC_BASE_URL") && settings(&job).get("env").is_none());
+        assert!(!job.env.contains_key("ANTHROPIC_BASE_URL") && settings(&job).get("env").is_none() && job.files.is_empty());
     }
 
     #[test]

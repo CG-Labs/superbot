@@ -37,13 +37,23 @@ fn endpoint(input: &RunInput) -> Option<&Endpoint> {
     input.endpoints.iter().find(|e| e.name == p)
 }
 
+/// Sourced before each of Claude Code's Bash commands on a tier endpoint, so they don't
+/// see its key (ADR 0192).
+fn bash_env_file(input: &RunInput) -> std::path::PathBuf {
+    input.config_dir.join("claude-endpoint-bash-env.sh")
+}
+
+const BASH_ENV: &str = "unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN\n";
+
 /// The environment of a run on a tier endpoint, set in `--settings` too, where it outranks
 /// the user's and the workspace's settings files, so a Bot can't send its calls elsewhere:
 /// the endpoint's URL, every other way Claude Code reaches a model off (a bearer token, a
-/// login's token, Bedrock, Vertex, Foundry), and the key kept from its Bash tool, hooks and
-/// MCP servers. A run held to a data region also stops Claude Code's own traffic to
-/// Anthropic (telemetry, error reports, update and feature checks).
-fn endpoint_env(e: &Endpoint, held: bool) -> Vec<(&'static str, String)> {
+/// login's token, Bedrock, Vertex, Foundry), and the key kept from its Bash tool. Where
+/// its sandbox can start, so can its credential scrub, which keeps the key from hooks and
+/// MCP servers too; without bubblewrap Claude Code refuses to start with the scrub on. A
+/// run held to a data region also stops Claude Code's own traffic to Anthropic
+/// (telemetry, error reports, update and feature checks).
+fn endpoint_env(e: &Endpoint, input: &RunInput) -> Vec<(&'static str, String)> {
     let mut env = vec![
         ("ANTHROPIC_BASE_URL", e.base_url.clone()),
         ("ANTHROPIC_AUTH_TOKEN", String::new()),
@@ -51,9 +61,12 @@ fn endpoint_env(e: &Endpoint, held: bool) -> Vec<(&'static str, String)> {
         ("CLAUDE_CODE_USE_BEDROCK", "0".into()),
         ("CLAUDE_CODE_USE_VERTEX", "0".into()),
         ("CLAUDE_CODE_USE_FOUNDRY", "0".into()),
-        ("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "1".into()),
+        ("CLAUDE_ENV_FILE", bash_env_file(input).display().to_string()),
     ];
-    if held {
+    if input.sandbox.is_some() {
+        env.push(("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "1".into()));
+    }
+    if !input.held_to.is_empty() {
         env.push(("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".into()));
     }
     env
@@ -72,9 +85,13 @@ impl Adapter for Claude {
     /// the arguments, which other accounts on the host can see.
     fn env(&self, input: &RunInput) -> Vec<(String, String)> {
         let Some(e) = endpoint(input) else { return Vec::new() };
-        let mut env: Vec<(String, String)> = endpoint_env(e, !input.held_to.is_empty()).into_iter().map(|(k, v)| (k.into(), v)).collect();
+        let mut env: Vec<(String, String)> = endpoint_env(e, input).into_iter().map(|(k, v)| (k.into(), v)).collect();
         env.push(("ANTHROPIC_API_KEY".into(), input.env.get(&e.key_secret).cloned().unwrap_or_default()));
         env
+    }
+
+    fn files(&self, input: &RunInput) -> Vec<(std::path::PathBuf, String)> {
+        endpoint(input).map(|_| (bash_env_file(input), BASH_ENV.to_string())).into_iter().collect()
     }
 
     fn args(&mut self, input: &RunInput, _out: &mut Vec<AgentEvent>) -> Vec<String> {
@@ -103,11 +120,10 @@ impl Adapter for Claude {
             settings.insert("cleanupPeriodDays".into(), json!(days.max(1)));
         }
         if let Some(e) = endpoint(input) {
-            let held = !input.held_to.is_empty();
-            let env: serde_json::Map<String, Value> = endpoint_env(e, held).into_iter().map(|(k, v)| (k.into(), json!(v))).collect();
+            let env: serde_json::Map<String, Value> = endpoint_env(e, input).into_iter().map(|(k, v)| (k.into(), json!(v))).collect();
             settings.insert("env".into(), Value::Object(env));
             // WebFetch otherwise asks Anthropic's API whether each domain is safe.
-            if held {
+            if !input.held_to.is_empty() {
                 settings.insert("skipWebFetchPreflight".into(), json!(true));
             }
         }
