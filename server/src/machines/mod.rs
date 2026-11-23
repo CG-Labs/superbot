@@ -849,7 +849,7 @@ async fn provision(
             return m;
         }
         // Where it goes (ADR 0081). With no room anywhere it waits, said once.
-        let host = match p.hosts().map(|_| placement::choose(app, cp, &m.plan, &m.region, None)) {
+        let host = match p.hosts().map(|_| placement::choose(app, cp, &m.plan, &m.region, &placement::Tenant::of(app, &m.user_id), None)) {
             None => None,
             Some(Ok(h)) => Some(h),
             Some(Err(why)) => {
@@ -1535,7 +1535,7 @@ pub(crate) async fn request_as(app: &AppState, cp: &ControlPlane, by: &Who, key:
             residency::refused_request(&app, &by, &u.id, &pin, &why);
             return Err(conflict(why));
         }
-        match p.hosts().map(|_| placement::choose(&app, cp, plan, region, None)) {
+        match p.hosts().map(|_| placement::choose(&app, cp, plan, region, &placement::Tenant::of(&app, &u.id), None)) {
             Some(Err(why)) => {
                 placement::failed(&app, &by, &u.id, None, plan, &why);
                 Err(conflict(why))

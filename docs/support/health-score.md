@@ -89,6 +89,6 @@ At a [health check](health-check.md), a fall of 10 points or more since the last
 
 ## What it isn't
 
-- **Not a measure of support.** Tickets, response times and satisfaction live in the support system, which botd can't see. Put them beside the score in the [review](qbr-template.md).
+- **Not a measure of support.** Tickets, response times and satisfaction live in the support system, which botd can't see. The [support report](support-report.md) counts tickets and response targets from its export; put it beside the score in the [review](qbr-template.md).
 - **Not a full archive.** History keeps each day's score, band and signal statuses, not the counts behind them; the support bundle and the report for a window carry those. Copy the score into the customer's record at each check too, since history goes after `HEALTH_SCORE_HISTORY_DAYS`.
 - **Not the status page.** An outage shows on `/status`; the score shows what the last weeks were like for the customer's people.

@@ -327,3 +327,27 @@ tests:
             exp_annotations:
               summary: "Incus hosts are nearly out of room (cpus)"
               description: "Less than 15% of the open Incus hosts' cpus is left for new machines (INCUS_CAPACITY, INCUS_MAX_MACHINES). Add capacity or a host, or undrain one, before placement starts refusing machines."
+
+  # A machine left on another team's dedicated host (ADR 0166) opens a ticket after 15
+  # minutes, and closes once it is moved.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_incus_machines_misplaced{job="superbot",instance="botd:9464"}'
+        values: '0x5 2x30 0x10'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SuperBotMachinesOnAnotherTeamsHost
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: SuperBotMachinesOnAnotherTeamsHost
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: botd:9464
+            exp_annotations:
+              summary: "Machines are on Incus hosts their team's dedication doesn't allow"
+              description: "2 machines are on a host dedicated to another team, or on a shared host while their team has hosts of its own, since their owner joined or left a team. botctl machine hosts lists them under misplaced; move each with botctl machine restore <user> <backup-id> --host <name> --yes."
+      - eval_time: 45m
+        alertname: SuperBotMachinesOnAnotherTeamsHost
+        exp_alerts: []
