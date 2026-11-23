@@ -395,6 +395,42 @@ install_rustup_user() {
     printf '%s\n' '. "$HOME/.cargo/env"' >>"$home/.bashrc"
 }
 
+# rsync arguments that keep the install's runtime state out of a --source-dir sync, so it's
+# neither overwritten from the checkout nor removed by --delete: .env, data, the workspace,
+# backups, and every *_DIR or *_FILE that .env (read as botd reads it, from the install
+# folder) points inside the install folder, with botd's default BACKUP_DIR beside DATA_DIR.
+state_excludes() {
+  local root=$1 env_file=$1/.env line key value abs rel data_dir="" backup_dir=""
+  local -a fixed=(.env '.env.*' data workspace backups logs secrets backup-identity.txt license.key \
+    metrics-token tiers.json '*.sqlite' '*.sqlite-*') named=()
+  root=$(realpath -m -- "$root")
+  printf '%s\n' --include=/.env.example
+  for rel in "${fixed[@]}"; do printf -- '--exclude=/%s\n' "$rel"; done
+  [[ -f "$env_file" ]] || return 0
+  while IFS= read -r line; do
+    key=${line%%=*}
+    value=$(tr -d "\"'" <<<"${line#*=}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [[ -n "$value" ]] || continue
+    case $key in
+      DATA_DIR) data_dir=$value ;;
+      BACKUP_DIR) backup_dir=$value ;;
+    esac
+    named+=("$value")
+  done < <(grep -E '^[A-Z0-9_]+_(DIR|FILE)=' "$env_file" || true)
+  [[ -n "$backup_dir" ]] || named+=("$(dirname -- "${data_dir:-./data}")/backups")
+  for value in "${named[@]}"; do
+    [[ "$value" == /* ]] && abs=$value || abs=$root/$value
+    abs=$(realpath -m -- "$abs")
+    [[ "$abs" != "$root" ]] || die "$env_file points a setting at $root itself, which --source-dir syncs over. Keep runtime state in a folder of its own."
+    case $abs in
+      "$root"/*) rel=${abs#"$root"/} ;;
+      *) continue ;;
+    esac
+    rel=${rel//\\/\\\\} rel=${rel//\*/\\*} rel=${rel//\?/\\?} rel=${rel//\[/\\[}
+    printf -- '--exclude=/%s\n' "$rel"
+  done
+}
+
 # shellcheck disable=SC2016
 sync_repo() {
   local home repo_path
@@ -410,15 +446,19 @@ sync_repo() {
     return
   fi
   if [[ -n "$INSTALL_DIR" ]]; then
-    log "Syncing $INSTALL_DIR -> $repo_path"
+    local keep_list
+    local -a keep
+    keep_list=$(state_excludes "$repo_path") || exit 1
+    mapfile -t keep <<<"$keep_list"
+    log "Syncing $INSTALL_DIR -> $repo_path, keeping its .env, data, workspace, backups and other runtime state"
     if [[ "$DRY_RUN" == true ]]; then
       return
     fi
     mkdir -p "$(dirname "$repo_path")"
     if [[ -d "$repo_path/.git" ]]; then
-      rsync -a --delete --exclude target --exclude node_modules --exclude dist-app --exclude .git "$INSTALL_DIR/" "$repo_path/"
+      rsync -a --delete --exclude target --exclude node_modules --exclude dist-app --exclude .git "${keep[@]}" "$INSTALL_DIR/" "$repo_path/"
     else
-      rsync -a --exclude target --exclude node_modules --exclude dist-app "$INSTALL_DIR/" "$repo_path/"
+      rsync -a --exclude target --exclude node_modules --exclude dist-app "${keep[@]}" "$INSTALL_DIR/" "$repo_path/"
     fi
     return
   fi

@@ -217,9 +217,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - name: Install age and sqlite3
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq age sqlite3
-      - name: Installer checks without root (pipes under pipefail, web client archive, loud client failures, backup keys)
+      - name: Install age, sqlite3 and rsync
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq age sqlite3 rsync
+      - name: Installer checks without root (pipes under pipefail, web client archive, loud client failures, backup keys, --source-dir keeps state)
         run: deploy/test-install.sh
       - name: Piped dry run on a fresh host (no user, no clone)
         run: |
