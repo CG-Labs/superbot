@@ -840,10 +840,20 @@ export interface AuditVerification {
   range?: { from: number | null; to: number | null } | null;
 }
 
-/** The SIEM export's progress (`GET /api/audit/siem`). */
-export type AuditExportState =
-  | { enabled: false }
-  | { enabled: true; kind: string; sink: string; delivered: number; pending: number; deliveredAt: number | null; failing: boolean; lastError: string | null; archive?: AuditArchiveState };
+/** One export sink's progress: a SIEM (`webhook`, `syslog`) or the S3 archive (`s3`). */
+export interface AuditExportSink {
+  kind: string;
+  sink: string;
+  delivered: number;
+  pending: number;
+  deliveredAt: number | null;
+  failing: boolean;
+  lastError: string | null;
+  archive?: AuditArchiveState;
+}
+
+/** The export's progress (`GET /api/audit/siem`): the sink in the worst state, and every sink under `sinks` (ADR 0173). */
+export type AuditExportState = { enabled: false } | ({ enabled: true; sinks?: AuditExportSink[] } & AuditExportSink);
 
 /** The S3 archive's settings and last object, when the export is `s3://` (ADR 0154). */
 export interface AuditArchiveState {
@@ -1217,6 +1227,11 @@ export interface OffboardingPreview {
 }
 
 /** The residency pin on your data, and where your data is against it (`GET /api/me/residency`, ADR 0168). */
+/** The team a pin was kept from when you left it; `name` is null once the team is gone. */
+export interface KeptFrom {
+  team: { id: string; name: string | null };
+}
+
 export interface MyResidency {
   /** Your team's pin, else your own; null when nothing pins your data. */
   pin: {
@@ -1227,9 +1242,11 @@ export interface MyResidency {
     /** The agreement it is under: your own pin's, or your team's for its owners and admins. */
     reference?: string;
     team?: { id: string; name: string | null };
+    /** Your own pin, kept from a team you left (ADR 0171): shown instead of its reference. */
+    keptFrom?: KeptFrom;
   } | null;
   /** Your own pin, when your team's holds your data too. */
-  ownPin: { region: string; pinnedAt: number; reference: string } | null;
+  ownPin: { region: string; pinnedAt: number; reference?: string; keptFrom?: KeptFrom } | null;
   status?: "kept" | "data_outside";
   /** `inRegion` checks the host it is on too: `hostRegion` is null for a host with no region, `host` null off Incus. */
   machine?: { id: string; state: string; region: string; inRegion: boolean; host?: string | null; hostRegion?: string | null } | null;

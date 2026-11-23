@@ -19,7 +19,8 @@
 //!   `Destination` (if present) and a bearer `SubjectConfirmationData`'s `Recipient` are our
 //!   ACS URL; an `AudienceRestriction` names our entity ID; `NotBefore`/`NotOnOrAfter` hold
 //!   (with `SKEW_MS`); the response's and the confirmation's `InResponseTo` are the ID of the
-//!   AuthnRequest this browser started. Unsolicited (IdP-initiated) responses are refused.
+//!   AuthnRequest this browser started. An unsolicited (IdP-initiated) response must have no
+//!   `InResponseTo` on either instead, and only ever restarts a sign-in (ADR 0175).
 //! - **Someone.** A NameID that isn't transient. With an encryption key it may be an
 //!   `EncryptedID` (ADR 0151), read only from the verified assertion, decrypted like an
 //!   assertion and holding exactly one NameID. The caller then refuses a second use of the
@@ -299,6 +300,34 @@ impl Encryption {
             Encryption::Off => "off",
             Encryption::Allow => "allow",
             Encryption::Require => "require",
+        }
+    }
+}
+
+/// What a native provider does with an unsolicited response, as an IdP's app tile posts
+/// (`SSO_<ID>_IDP_INITIATED`, ADR 0175). Off: refused like any post botd didn't ask for.
+/// Restart: once it checks out as the IdP's, for us, now, and unused, the browser starts an
+/// SP-initiated sign-in. It never signs anyone in itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum IdpInitiated {
+    #[default]
+    Off,
+    Restart,
+}
+
+impl IdpInitiated {
+    pub fn parse(s: &str) -> Option<IdpInitiated> {
+        match s.to_ascii_lowercase().as_str() {
+            "off" => Some(IdpInitiated::Off),
+            "restart" => Some(IdpInitiated::Restart),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IdpInitiated::Off => "off",
+            IdpInitiated::Restart => "restart",
         }
     }
 }
@@ -601,8 +630,9 @@ impl From<Invalid> for Refused {
 pub struct Expect<'a> {
     pub sp: Sp<'a>,
     pub idp: &'a IdpMetadata,
-    /// The ID of the AuthnRequest this browser's sign-in sent.
-    pub request_id: &'a str,
+    /// The ID of the AuthnRequest this browser's sign-in sent. None: an unsolicited response
+    /// (ADR 0175), which must answer no request at all.
+    pub request_id: Option<&'a str>,
     pub attributes: &'a Attributes,
     pub now_ms: i64,
     /// Our encryption key, when the provider takes encrypted assertions (ADR 0150); without
@@ -860,7 +890,7 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
     if response.children().any(|c| is(c, ASSERTION, "Issuer")) && !issuer_is(response, &e.idp.entity_id) {
         return Err(Refused("wrong_issuer", None));
     }
-    if response.attribute("InResponseTo") != Some(e.request_id) {
+    if response.attribute("InResponseTo") != e.request_id {
         return Err(Refused("in_response_to_mismatch", None));
     }
     if assertion.attribute("Version") != Some("2.0") {
@@ -907,7 +937,7 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
         {
             return Err(Refused("not_yet_valid", None));
         }
-        if d.attribute("InResponseTo") != Some(e.request_id) {
+        if d.attribute("InResponseTo") != e.request_id {
             return Err(Refused("in_response_to_mismatch", None));
         }
         Ok(na)
@@ -997,6 +1027,18 @@ pub mod test_idp {
     }
 
     /// The parts of a response, each one replaceable before it is signed.
+    /// An `InResponseTo` value that is sent, but empty.
+    pub const EMPTY_IN_RESPONSE_TO: &str = "(empty)";
+
+    /// An `InResponseTo` attribute, or none for an empty one (an unsolicited response).
+    fn in_response_to(id: &str) -> String {
+        match id {
+            "" => String::new(),
+            EMPTY_IN_RESPONSE_TO => r#" InResponseTo="""#.into(),
+            _ => format!(r#" InResponseTo="{id}""#),
+        }
+    }
+
     #[derive(Clone)]
     pub struct Response {
         pub id: String,
@@ -1075,12 +1117,12 @@ pub mod test_idp {
             let multi = self.multi_attributes.iter().map(|(k, vs)| format!(r#"<saml:Attribute Name="{k}">{}</saml:Attribute>"#, vs.iter().map(value).collect::<String>()));
             let attrs: String = single.chain(multi).collect();
             format!(
-                r#"<saml:Assertion ID="{aid}" Version="2.0" IssueInstant="{now}"><saml:Issuer>{iss}</saml:Issuer><saml:Subject>{nid}<saml:SubjectConfirmation Method="{BEARER}"><saml:SubjectConfirmationData InResponseTo="{cirt}" NotOnOrAfter="{cna}" Recipient="{rcp}"/></saml:SubjectConfirmation></saml:Subject><saml:Conditions NotBefore="{nb}" NotOnOrAfter="{na}"><saml:AudienceRestriction><saml:Audience>{aud}</saml:Audience></saml:AudienceRestriction>{extra}</saml:Conditions><saml:AuthnStatement AuthnInstant="{now}" SessionIndex="{si}"><saml:AuthnContext><saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement><saml:AttributeStatement>{attrs}</saml:AttributeStatement></saml:Assertion>"#,
+                r#"<saml:Assertion ID="{aid}" Version="2.0" IssueInstant="{now}"><saml:Issuer>{iss}</saml:Issuer><saml:Subject>{nid}<saml:SubjectConfirmation Method="{BEARER}"><saml:SubjectConfirmationData{cirt} NotOnOrAfter="{cna}" Recipient="{rcp}"/></saml:SubjectConfirmation></saml:Subject><saml:Conditions NotBefore="{nb}" NotOnOrAfter="{na}"><saml:AudienceRestriction><saml:Audience>{aud}</saml:Audience></saml:AudienceRestriction>{extra}</saml:Conditions><saml:AuthnStatement AuthnInstant="{now}" SessionIndex="{si}"><saml:AuthnContext><saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement><saml:AttributeStatement>{attrs}</saml:AttributeStatement></saml:Assertion>"#,
                 aid = self.assertion_id,
                 now = instant(self.not_before + 60_000),
                 iss = self.issuer,
                 nid = self.name_id_xml(),
-                cirt = self.confirm_in_response_to,
+                cirt = in_response_to(&self.confirm_in_response_to),
                 cna = instant(self.confirm_not_on_or_after),
                 rcp = self.recipient,
                 nb = instant(self.not_before),
@@ -1112,10 +1154,10 @@ pub mod test_idp {
             };
             let dest = self.destination.as_ref().map(|d| format!(r#" Destination="{d}""#)).unwrap_or_default();
             let xml = format!(
-                r#"<samlp:Response xmlns:samlp="{PROTOCOL}" xmlns:saml="{ASSERTION}" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" ID="{}" Version="2.0" IssueInstant="{}"{dest} InResponseTo="{}"><saml:Issuer>{}</saml:Issuer><samlp:Status><samlp:StatusCode Value="{}"/></samlp:Status>{assertion}</samlp:Response>"#,
+                r#"<samlp:Response xmlns:samlp="{PROTOCOL}" xmlns:saml="{ASSERTION}" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" ID="{}" Version="2.0" IssueInstant="{}"{dest}{}><saml:Issuer>{}</saml:Issuer><samlp:Status><samlp:StatusCode Value="{}"/></samlp:Status>{assertion}</samlp:Response>"#,
                 self.id,
                 instant(self.not_before + 60_000),
-                self.in_response_to,
+                in_response_to(&self.in_response_to),
                 self.issuer,
                 self.status
             );
@@ -1155,7 +1197,7 @@ mod tests {
     fn check_at(xml: &str, now_ms: i64) -> Result<Checked, Refused> {
         let idp = idp();
         let attributes = Attributes::default();
-        check_response(&STANDARD.encode(xml), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: REQ, attributes: &attributes, now_ms, decrypt: None, require_encrypted: false })
+        check_response(&STANDARD.encode(xml), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms, decrypt: None, require_encrypted: false })
     }
 
     fn check(xml: &str) -> Result<Checked, Refused> {
@@ -1377,7 +1419,7 @@ mod tests {
         let mapped = Attributes { email: Some("work_mail".into()), name: None, groups: None };
         let mut custom = base();
         custom.attributes = vec![("email".into(), "personal@evil.example".into()), ("work_mail".into(), "ada@example.com".into())];
-        let c = check_response(&STANDARD.encode(custom.xml()), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: REQ, attributes: &mapped, now_ms: NOW, decrypt: None, require_encrypted: false }).unwrap();
+        let c = check_response(&STANDARD.encode(custom.xml()), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &mapped, now_ms: NOW, decrypt: None, require_encrypted: false }).unwrap();
         assert_eq!(c.claims.email.as_deref(), Some("ada@example.com"), "only the configured attribute");
         let mut unspecified = base();
         unspecified.name_id_format = "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified".into();
@@ -1388,7 +1430,7 @@ mod tests {
     fn groups_of(r: &Response, name: &str) -> Groups {
         let idp = idp();
         let attributes = Attributes { groups: Some(name.into()), ..Attributes::default() };
-        check_response(&STANDARD.encode(r.xml()), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: REQ, attributes: &attributes, now_ms: NOW, decrypt: None, require_encrypted: false }).unwrap().groups
+        check_response(&STANDARD.encode(r.xml()), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: None, require_encrypted: false }).unwrap().groups
     }
 
     #[test]
@@ -1424,7 +1466,7 @@ mod tests {
         // Added to the assertion after it was signed: refused before any group is read.
         let idp = idp();
         let attributes = Attributes { groups: Some("groups".into()), ..Attributes::default() };
-        let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: REQ, attributes: &attributes, now_ms: NOW, decrypt: None, require_encrypted: false };
+        let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: None, require_encrypted: false };
         let added = base().xml_with(|a| a.replace("</saml:AttributeStatement>", r#"<saml:Attribute Name="groups"><saml:AttributeValue>Admins</saml:AttributeValue></saml:Attribute></saml:AttributeStatement>"#));
         assert_eq!(check_response(&STANDARD.encode(added), &e).unwrap_err().0, "bad_signature");
 
@@ -1513,8 +1555,8 @@ mod tests {
         assert_eq!(check(&bare).unwrap_err(), Refused("idp_error", Some("Responder/RequestDenied".into())), "a failure without an assertion keeps its reason");
         let mut unsolicited = base();
         unsolicited.in_response_to = String::new();
-        let xml = unsolicited.xml().replace(r#" InResponseTo="""#, "");
-        assert_eq!(check(&xml).unwrap_err().0, "in_response_to_mismatch", "IdP-initiated");
+        unsolicited.confirm_in_response_to = String::new();
+        assert_eq!(check(&unsolicited.xml()).unwrap_err().0, "in_response_to_mismatch", "IdP-initiated");
         assert_eq!(check_at(&base().xml(), NOW + 3_600_000).unwrap_err().0, "expired", "an old response posted later");
         assert_eq!(
             with(|r| { r.conditions_extra = "<saml:AudienceRestriction><saml:Audience>https://other-sp.example</saml:Audience></saml:AudienceRestriction>".into() }),
@@ -1524,9 +1566,60 @@ mod tests {
         assert_eq!(with(|r| r.conditions_extra = "<saml:OneTimeUse/>".into()), "ok");
         assert_eq!(check("not xml").unwrap_err().0, "bad_response");
         assert_eq!(
-            check_response(&"A".repeat(MAX_RESPONSE + 4), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp(), request_id: REQ, attributes: &Attributes::default(), now_ms: NOW, decrypt: None, require_encrypted: false }).unwrap_err().0,
+            check_response(&"A".repeat(MAX_RESPONSE + 4), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp(), request_id: Some(REQ), attributes: &Attributes::default(), now_ms: NOW, decrypt: None, require_encrypted: false }).unwrap_err().0,
             "bad_response"
         );
+    }
+
+    /// Checked as an unsolicited response (ADR 0175): no request to answer.
+    fn check_unsolicited(xml: &str) -> Result<Checked, Refused> {
+        let idp = idp();
+        let attributes = Attributes::default();
+        check_response(&STANDARD.encode(xml), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: None, attributes: &attributes, now_ms: NOW, decrypt: None, require_encrypted: false })
+    }
+
+    fn unsolicited() -> Response {
+        let mut r = base();
+        r.in_response_to = String::new();
+        r.confirm_in_response_to = String::new();
+        r
+    }
+
+    #[test]
+    fn unsolicited_responses_answer_no_request_and_are_checked_in_full() {
+        let c = check_unsolicited(&unsolicited().xml()).unwrap();
+        assert_eq!(c.claims.subject, "00u1ada-persistent");
+        // An answer to some request (another browser's, or one that expired) is not unsolicited.
+        assert_eq!(check_unsolicited(&base().xml()).unwrap_err().0, "in_response_to_mismatch");
+        let mut half = unsolicited();
+        half.confirm_in_response_to = REQ.into();
+        assert_eq!(check_unsolicited(&half.xml()).unwrap_err().0, "in_response_to_mismatch", "the signed confirmation answers a request");
+        let mut half = unsolicited();
+        half.in_response_to = REQ.into();
+        assert_eq!(check_unsolicited(&half.xml()).unwrap_err().0, "in_response_to_mismatch", "the response answers a request");
+        // An empty InResponseTo, signed by the IdP, is not an absent one.
+        let mut empty = unsolicited();
+        empty.confirm_in_response_to = EMPTY_IN_RESPONSE_TO.into();
+        assert!(empty.xml().contains(r#"<saml:SubjectConfirmationData InResponseTo="" "#));
+        assert_eq!(check_unsolicited(&empty.xml()).unwrap_err().0, "in_response_to_mismatch", "on the confirmation");
+        let mut empty = unsolicited();
+        empty.in_response_to = EMPTY_IN_RESPONSE_TO.into();
+        assert!(empty.xml().contains(r#" InResponseTo="">"#));
+        assert_eq!(check_unsolicited(&empty.xml()).unwrap_err().0, "in_response_to_mismatch", "on the response");
+        // Everything else holds as for a solicited one.
+        let with = |f: fn(&mut Response)| {
+            let mut r = unsolicited();
+            f(&mut r);
+            check_unsolicited(&r.xml()).err().map_or("ok", |e| e.0)
+        };
+        assert_eq!(with(|r| r.sign_assertion = false), "unsigned");
+        assert_eq!(with(|r| r.signer = 1), "bad_signature");
+        assert_eq!(with(|r| r.audience = "https://other.example/sp".into()), "wrong_audience");
+        assert_eq!(with(|r| r.recipient = "https://other.example/acs".into()), "wrong_recipient");
+        assert_eq!(with(|r| r.destination = Some("https://other.example/acs".into())), "wrong_destination");
+        assert_eq!(with(|r| r.issuer = "https://evil.example/saml".into()), "wrong_issuer");
+        assert_eq!(with(|r| r.confirm_not_on_or_after = NOW - 300_000), "expired");
+        assert_eq!(with(|r| r.name_id_format = TRANSIENT.into()), "transient_subject");
     }
 
     // Encrypted assertions (ADR 0150)
@@ -1550,7 +1643,7 @@ mod tests {
     fn check_enc(xml: &str, require: bool) -> Result<Checked, Refused> {
         let idp = idp();
         let attributes = Attributes::default();
-        let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: REQ, attributes: &attributes, now_ms: NOW, decrypt: Some(&enc_keys()[0]), require_encrypted: require };
+        let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: Some(&enc_keys()[0]), require_encrypted: require };
         check_response(&STANDARD.encode(xml), &e)
     }
 
@@ -1712,7 +1805,7 @@ mod tests {
         let ec = SpKey::from_pem(&ec_pem, &ec_cert).unwrap();
         let idp = idp();
         let attributes = Attributes::default();
-        let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: REQ, attributes: &attributes, now_ms: NOW, decrypt: Some(&ec), require_encrypted: false };
+        let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: Some(&ec), require_encrypted: false };
         assert_eq!(check_response(&STANDARD.encode(r.xml()), &e).unwrap_err().0, "no_sp_key", "an ECDSA key can't decrypt");
     }
 
@@ -1768,7 +1861,7 @@ mod tests {
             let idp = parse_idp_metadata(&metadata_signed_by(s), IDP, false).unwrap();
             let attributes = Attributes::default();
             let run = |xml: &str| {
-                let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: REQ, attributes: &attributes, now_ms: NOW, decrypt: None, require_encrypted: false };
+                let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: None, require_encrypted: false };
                 check_response(&STANDARD.encode(xml), &e).err().map_or("ok", |e| e.0)
             };
             let mut r = base();

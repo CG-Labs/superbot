@@ -201,7 +201,12 @@ fn person(app: &App, cfg: &SessionConfig, u: &User, at: i64, names: &HashMap<&st
     let mut view = json!({
         "id": u.id, "name": u.name, "email": u.email, "role": u.role, "status": u.status, "breakGlass": u.id == OPERATOR, "tier": u.tier,
         "createdAt": u.created_at,
-        "scim": scim.as_ref().map(|s| json!({ "tenant": s.tenant, "deleted": s.deleted_at.is_some() })),
+        // The IdP's department and manager help reviewers but grant nothing, so they stay out of `stable`.
+        "scim": scim.as_ref().map(|s| json!({
+            "tenant": s.tenant, "deleted": s.deleted_at.is_some(),
+            "department": s.enterprise.department, "employeeNumber": s.enterprise.employee_number,
+            "manager": s.enterprise.manager.as_ref().map(|id| json!({ "id": id, "name": s.manager_name })),
+        })),
         "team": member.as_ref().zip(team.as_ref()).map(|(m, t)| json!({ "id": t.0, "name": t.1, "role": m.role })),
         "mfa": { "enabled": mfa_at.is_some(), "enabledAt": mfa_at },
         "lastLogin": u.last_login_at.map(|at| json!({ "at": at, "method": u.last_login_method, "idpProvider": u.last_login_idp_provider })),
@@ -323,6 +328,8 @@ impl Report {
                 s(&p["machine"]["id"]),
                 s(&p["machine"]["state"]),
                 time(&p["machine"]["assignedAt"]),
+                s(&p["scim"]["department"]),
+                p["scim"]["manager"]["id"].as_str().map(|id| c(&format!("{} ({id})", p["scim"]["manager"]["name"].as_str().unwrap_or("")))).unwrap_or_default(),
                 "person".into(),
                 String::new(),
                 String::new(),
@@ -377,6 +384,8 @@ impl Report {
                 String::new(),
                 String::new(),
                 String::new(),
+                String::new(),
+                String::new(),
                 "service_account".into(),
                 c(&owner),
                 c(&words(&p["effective"])),
@@ -393,7 +402,7 @@ impl Report {
 
 pub const CSV_HEADER: &str = "generated_at,scim_tenant,team,team_role,user_id,name,email,role,status,scim_managed,break_glass,mfa,mfa_enabled_at,\
 last_sign_in_at,last_sign_in_method,bot_access,browser_sessions,api_tokens,machine_id,machine_state,machine_assigned_at,\
-kind,owner,effective_permissions,service_tokens,service_flags,report_digest\r\n";
+scim_department,scim_manager,kind,owner,effective_permissions,service_tokens,service_flags,report_digest\r\n";
 
 fn rfc3339(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms).map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)).unwrap_or_default()

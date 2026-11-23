@@ -42,6 +42,15 @@ describe("residencyLines (ADR 0168)", () => {
     ]);
   });
 
+  it("names the team a pin was kept from when you left it, never its reference (ADR 0171)", () => {
+    const kept = view({ pin: { on: "user", region: "gb-lon", pinnedAt: AT, keptFrom: { team: { id: "t1", name: "Acme" } } } });
+    expect(residencyLines(kept).lines[0]).toBe("Your data is pinned to gb-lon, kept from Acme's pin when you left it, since 2026-11-22.");
+    const gone = view({ pin: { on: "user", region: "gb-lon", pinnedAt: AT, keptFrom: { team: { id: "t1", name: null } } } });
+    expect(residencyLines(gone).lines[0]).toBe("Your data is pinned to gb-lon, kept from your former team's pin when you left it, since 2026-11-22.");
+    const back = view({ pin: { on: "team", region: "gb-lon", pinnedAt: AT, team: { id: "t1", name: "Acme" } }, ownPin: { region: "gb-lon", pinnedAt: AT, keptFrom: { team: { id: "t1", name: "Acme" } } } });
+    expect(residencyLines(back).lines[1]).toBe("Your own data is also pinned to gb-lon, kept from Acme's pin when you left it.");
+  });
+
   it("warns about data outside the region and runs held back for want of a model there", () => {
     const { warnings } = residencyLines(
       view({ status: "data_outside", machine: { id: "m1", state: "running", region: "de-fra-2", inRegion: false }, backups: { kept: 4, inRegion: 3, outside: 1 }, modelRoutes: { inRegion: false, gap: "open routing" } }),

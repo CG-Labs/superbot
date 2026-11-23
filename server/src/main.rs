@@ -663,8 +663,11 @@ async fn main() {
     for w in auth_state.machines.offsite.as_deref().map(|o| [o.warnings(), o.unreachable(&recorded)].concat()).unwrap_or_default() {
         log_warn!("WARNING: {w}");
     }
+    let residency_startup = machines::residency::Startup::parse(&env("RESIDENCY_STARTUP", "")).unwrap_or_else(|e| exit(e));
+    machines::residency::set_startup(residency_startup);
     if auth_state.machines.enabled() {
-        for w in machines::residency::warnings(&app, &auth_state.machines) {
+        let warnings = machines::residency::at_startup(&app, &auth_state.machines, residency_startup).unwrap_or_else(|e| exit(e));
+        for w in warnings {
             log_warn!("WARNING: {w}");
         }
     }
@@ -780,7 +783,7 @@ async fn main() {
         "sessionIdleMinutes": sessions.idle_ms / 60_000,
         "sessionMaxMinutes": sessions.max_ms / 60_000,
         "auditRetentionDays": retention,
-        "auditExport": audit_export.sink.as_ref().map(|s| json!({ "kind": s.kind(), "sink": s.shown })),
+        "auditExport": (!audit_export.sinks.is_empty()).then(|| audit_export.sinks.iter().map(|s| json!({ "kind": s.kind(), "sink": s.shown })).collect::<Vec<_>>()),
         "auditCheckpointMinutes": audit_checkpoints.every,
         "auditTimestamps": audit_checkpoints.tsa.as_ref().map(|t| json!({ "tsa": t.shown, "trustAnchors": audit_checkpoints.trust.len() })),
         "chatRetentionDays": chat_retention,

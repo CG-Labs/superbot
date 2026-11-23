@@ -72,7 +72,7 @@ Erasing a user ([ADR 0102](0102-erasing-a-users-data.md)) deletes their own pin,
 
 botd logs a warning at startup for each pin its settings can't keep (for example, a store removed after the pin was made), and for each pinned person with data outside the region. `GET /api/regions` shows the same list under `residency.warnings`.
 
-botd still starts. Refusing to start would take every other tenant down for one tenant's missing store. Each action on the pinned tenant's data is refused instead, which is fail-closed for that tenant. A server-wide startup refusal is still available with `MACHINE_BACKUP_RESIDENCY=strict`.
+botd still starts. Refusing to start would take every other tenant down for one tenant's missing store. Each action on the pinned tenant's data is refused instead, which is fail-closed for that tenant. A server-wide startup refusal is still available with `MACHINE_BACKUP_RESIDENCY=strict`. (Since [ADR 0171](0171-residency-startup-and-leavers.md), `RESIDENCY_STARTUP=refuse` makes botd refuse to start while any pin can't be kept.)
 
 ### Where it shows
 
@@ -91,7 +91,7 @@ Said plainly in the [DPA annex](../security/dpa-template.md#annex-iv-data-reside
   - Routers such as OpenRouter forward to upstream providers; treat them as having no region unless their own terms say otherwise.
   - Harness logins with a person's own subscription go to that provider under their account, wherever it processes.
 - **Other services.** Push, email, webhooks, Stripe and sign-in providers are wherever Annex III says.
-- **Leaving a team.** A member who leaves a pinned team is no longer held by its pin. Their machine and backups stay where they are, and their region becomes their own or the default, as ADR 0117 says. Pin them individually first if the agreement covers them after they leave.
+- **Leaving a team.** A member who leaves a pinned team is no longer held by its pin. Their machine and backups stay where they are, and their region becomes their own or the default, as ADR 0117 says. Pin them individually first if the agreement covers them after they leave. (Since [ADR 0171](0171-residency-startup-and-leavers.md), a leaver keeps the team's pin as their own.)
 - **Other team deletions.** A team deleted because its last member left or was erased, or by the identity provider (a SCIM group delete), takes its pin with it; members leave as above. Only an admin's delete is refused.
 
 ## Consequences
@@ -106,8 +106,8 @@ Said plainly in the [DPA annex](../security/dpa-template.md#annex-iv-data-reside
 - Hold a pinned tenant's model routes to providers and endpoints the operator marks as in the region, and refuse runs otherwise. **Done** in [ADR 0139](0139-in-region-model-routes.md).
 - A data region for botd's own database and server backups, or a documented dedicated deployment per region (enterprise dedicated hosting, M5).
 - Show the pin to the customer in the app. **Done** in [ADR 0168](0168-residency-in-the-app.md).
-- An option to refuse startup when a pin can't be kept.
-- Keep a leaver's pin, or refuse the leave or a SCIM group delete, when the agreement says so.
+- An option to refuse startup when a pin can't be kept. **Done** in [ADR 0171](0171-residency-startup-and-leavers.md) (`RESIDENCY_STARTUP=refuse`).
+- Keep a leaver's pin, or refuse the leave or a SCIM group delete, when the agreement says so. **Done** in [ADR 0171](0171-residency-startup-and-leavers.md): a leaver always keeps the team's pin as their own.
 
 ## Tests
 

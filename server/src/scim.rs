@@ -1,13 +1,14 @@
 //! SCIM 2.0 provisioning (RFC 7643, RFC 7644): an enterprise IdP (Entra ID, Okta, ...)
 //! creates, updates, deactivates, and deletes SuperBot users under `/scim/v2`, and with
-//! SCIM_GROUPS=on, pushes groups as teams (`groups`). The core User and Group schemas
-//! only, and Bulk (`bulk`); sorting and ETags are not supported. Each IdP connection is a tenant
+//! SCIM_GROUPS=on, pushes groups as teams (`groups`). The core User and Group schemas,
+//! the Enterprise User extension (ADR 0176), and Bulk (`bulk`); sorting and ETags are
+//! not supported. Each IdP connection is a tenant
 //! with its own bearer tokens (`sbp_`, stored hashed), and sees only the users it
 //! provisioned and the groups it made or an admin linked to it. The IdP never names a
 //! role: with SCIM_GROUP_ROLES=on, an admin may map a group to a custom role, never
 //! admin, and its members get and lose it with the group (`roles`).
 //! Design: docs/adr/0023-scim.md, docs/adr/0095-scim-groups-as-teams.md,
-//! docs/adr/0138-scim-group-role-mapping.md.
+//! docs/adr/0138-scim-group-role-mapping.md, docs/adr/0176-scim-enterprise-user-extension.md.
 
 pub mod bulk;
 pub mod google;
@@ -15,7 +16,7 @@ pub mod groups;
 pub mod roles;
 
 use crate::audit::{Actor, ActorKind, Outcome, Source, Who};
-use crate::db::{self, NewIdentity, ScimConflict, ScimFields, ScimKey, ScimToken, ScimUser, User};
+use crate::db::{self, Enterprise, NewIdentity, ScimConflict, ScimFields, ScimKey, ScimToken, ScimUser, User};
 use crate::rbac::Role;
 use crate::users::{self, Limiter};
 use crate::{bad, not_found, ApiError, AppState, Auth, Res};
@@ -35,6 +36,9 @@ pub const TOKEN_PREFIX: &str = "sbp_";
 pub const MAX_BODY: usize = 64 * 1024;
 const CONTENT_TYPE: &str = "application/scim+json";
 pub const USER_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:User";
+pub const ENTERPRISE_SCHEMA: &str = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User";
+/// The longest Enterprise User string kept. Entra's longest source (department) is 64.
+const ENTERPRISE_MAX: usize = 128;
 const LIST_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:ListResponse";
 const ERROR_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:Error";
 const MAX_COUNT: i64 = 200;
@@ -380,7 +384,7 @@ fn user_resource_type(base: &str) -> Value {
     json!({
         "schemas": ["urn:ietf:params:scim:schemas:core:2.0:ResourceType"],
         "id": "User", "name": "User", "endpoint": "/Users", "description": "People who can sign in to SuperBot",
-        "schema": USER_SCHEMA, "schemaExtensions": [],
+        "schema": USER_SCHEMA, "schemaExtensions": [{ "schema": ENTERPRISE_SCHEMA, "required": false }],
         "meta": { "resourceType": "ResourceType", "location": format!("{base}/ResourceTypes/User") },
     })
 }
@@ -429,9 +433,38 @@ fn user_schema(base: &str) -> Value {
     })
 }
 
+fn enterprise_schema(base: &str) -> Value {
+    let text = |name: &str, d: &str| attribute(name, "string", false, "none", d);
+    let read_only = |mut v: Value| {
+        v["mutability"] = json!("readOnly");
+        v
+    };
+    let mut reference = attribute("$ref", "reference", false, "none", "The manager's SCIM resource");
+    reference["referenceTypes"] = json!(["User"]);
+    let mut manager = attribute("manager", "complex", false, "none", "The person's manager: another user this tenant provisioned. Anyone else is dropped.");
+    manager["subAttributes"] = json!([
+        text("value", "The manager's id in SuperBot"),
+        read_only(reference),
+        read_only(text("displayName", "The manager's shown name")),
+    ]);
+    json!({
+        "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Schema"],
+        "id": ENTERPRISE_SCHEMA, "name": "EnterpriseUser", "description": "Enterprise User: kept for admins and access reviews, never used to grant access",
+        "attributes": [
+            text("employeeNumber", "The organization's number for the person"),
+            text("costCenter", "Cost center"),
+            text("organization", "Organization"),
+            text("division", "Division"),
+            text("department", "Department"),
+            manager,
+        ],
+        "meta": { "resourceType": "Schema", "location": format!("{base}/Schemas/{ENTERPRISE_SCHEMA}") },
+    })
+}
+
 pub async fn schemas(Extension(a): Extension<Arc<Auth>>, headers: HeaderMap) -> Response {
     let base = base_url(&headers);
-    let mut all = vec![user_schema(&base)];
+    let mut all = vec![user_schema(&base), enterprise_schema(&base)];
     all.extend(groups::schemas(&a, &base));
     let n = all.len() as i64;
     list(all, n, 1)
@@ -441,6 +474,7 @@ pub async fn schema(Extension(a): Extension<Arc<Auth>>, headers: HeaderMap, Path
     let base = base_url(&headers);
     match id.as_str() {
         USER_SCHEMA => Ok(scim_json(StatusCode::OK, user_schema(&base))),
+        ENTERPRISE_SCHEMA => Ok(scim_json(StatusCode::OK, enterprise_schema(&base))),
         _ => groups::schema(&a, &base, &id).map(|s| scim_json(StatusCode::OK, s)).ok_or_else(|| missing("Schema")),
     }
 }
@@ -533,6 +567,20 @@ pub fn resource(base: &str, s: &ScimUser) -> Value {
     if let Some(e) = &u.email {
         v["emails"] = json!([{ "value": e, "type": "work", "primary": true }]);
     }
+    if !s.enterprise.is_empty() {
+        let e = &s.enterprise;
+        let mut ext = Map::new();
+        for (k, x) in [("employeeNumber", &e.employee_number), ("costCenter", &e.cost_center), ("organization", &e.organization), ("division", &e.division), ("department", &e.department)] {
+            if let Some(x) = x {
+                ext.insert(k.into(), json!(x));
+            }
+        }
+        if let Some(m) = &e.manager {
+            ext.insert("manager".into(), json!({ "value": m, "$ref": format!("{base}/Users/{m}"), "displayName": s.manager_name }));
+        }
+        v["schemas"] = json!([USER_SCHEMA, ENTERPRISE_SCHEMA]);
+        v[ENTERPRISE_SCHEMA] = Value::Object(ext);
+    }
     v
 }
 
@@ -548,6 +596,7 @@ pub struct Attrs {
     pub formatted: Option<String>,
     pub email: Option<String>,
     pub active: bool,
+    pub enterprise: Enterprise,
 }
 
 impl Attrs {
@@ -561,6 +610,7 @@ impl Attrs {
             formatted: s.formatted.clone(),
             email: s.user.email.clone(),
             active: s.user.active(),
+            enterprise: s.enterprise.clone(),
         }
     }
 
@@ -675,15 +725,82 @@ pub fn from_resource(v: &Value, current: Option<&Attrs>) -> ScimRes<Attrs> {
         ..Attrs::default()
     };
     set_name(&mut a, attr(v, "name"))?;
+    set_enterprise(&mut a.enterprise, "replace", attr(v, ENTERPRISE_SCHEMA))?;
     Ok(a)
+}
+
+/// The Enterprise User attribute an extension sub-path names, lowercase, without the
+/// URN: `department`, `manager`, `manager.value`.
+fn enterprise_attr(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "employeenumber" => "employeeNumber",
+        "costcenter" => "costCenter",
+        "organization" => "organization",
+        "division" => "division",
+        "department" => "department",
+        "manager" => "manager",
+        "manager.value" => "manager.value",
+        _ => return None,
+    })
+}
+
+/// The whole extension object: `replace` (and a POST or PUT) sets what it holds and
+/// keeps what it leaves out of a PATCH; a POST or PUT starts from nothing.
+fn set_enterprise(e: &mut Enterprise, op: &str, v: &Value) -> ScimRes<()> {
+    match v {
+        Value::Null => Ok(()),
+        Value::Object(o) => {
+            for (k, x) in o {
+                if let Some(name) = enterprise_attr(&k.to_ascii_lowercase()) {
+                    set_enterprise_attr(e, op, name, x)?;
+                }
+            }
+            Ok(())
+        }
+        _ => Err(invalid(format!("{ENTERPRISE_SCHEMA} must be an object"))),
+    }
+}
+
+/// A manager reference: `{"value": id}`, Entra's `[{"value": id, "$ref": ...}]`, or the id
+/// itself. Whether it names someone in the tenant is checked when it's saved. `None` when
+/// it holds only the read-only `$ref` or `displayName`, which leave the manager as it is.
+fn manager_id(v: &Value) -> ScimRes<Option<Option<String>>> {
+    match v {
+        Value::Array(l) if l.len() > 1 => Err(invalid("manager takes one manager")),
+        Value::Array(l) => l.first().map_or(Ok(Some(None)), manager_id),
+        Value::Object(o) if !o.keys().any(|k| k.eq_ignore_ascii_case("value")) => Ok(None),
+        Value::Object(_) => text(attr(v, "value"), "manager.value", 64).map(Some),
+        v => text(v, "manager.value", 64).map(Some),
+    }
+}
+
+fn set_enterprise_attr(e: &mut Enterprise, op: &str, name: &str, v: &Value) -> ScimRes<()> {
+    let remove = op == "remove";
+    let field = |v: &Value| if remove { Ok(None) } else { text(v, name, ENTERPRISE_MAX) };
+    match name {
+        "employeeNumber" => e.employee_number = field(v)?,
+        "costCenter" => e.cost_center = field(v)?,
+        "organization" => e.organization = field(v)?,
+        "division" => e.division = field(v)?,
+        "department" => e.department = field(v)?,
+        _ if remove => e.manager = None,
+        _ => {
+            if let Some(m) = manager_id(v)? {
+                e.manager = m;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Applies a PatchOp (RFC 7644 section 3.5.2): `add` and `replace` of `active`,
 /// `userName`, `externalId`, `displayName`, `name` and its parts, and `emails`
 /// (whole, or `emails[type eq "work"].value`); `remove` of the optional ones. With no
 /// `path`, the value is an object of attributes (Okta's deactivation). `op` is any case
-/// (Entra sends `Replace`). Attributes SuperBot doesn't keep (title, phone numbers, the
-/// enterprise extension, roles, groups, a password) are ignored and never stored.
+/// (Entra sends `Replace`). The Enterprise User extension's attributes, by their full
+/// path (`urn:...:enterprise:2.0:User:department`), the extension's URN with an object,
+/// or their bare names as Entra has sent them (`manager`). Attributes SuperBot doesn't
+/// keep (title, phone numbers, roles, groups, a password) are ignored and never stored.
 pub fn apply_patch(a: &mut Attrs, v: &Value) -> ScimRes<()> {
     let syntax = |d: &str| ScimError::new(StatusCode::BAD_REQUEST, Some("invalidSyntax"), d);
     let ops = v.as_object().and_then(|o| o.iter().find(|(k, _)| k.eq_ignore_ascii_case("Operations"))).map(|(_, ops)| ops);
@@ -749,7 +866,18 @@ fn apply_path(a: &mut Attrs, op: &str, path: &str, v: &Value) -> ScimRes<()> {
         "name.formatted" => a.formatted = if remove { None } else { text(v, "name.formatted", 100)? },
         "emails" => a.email = if remove { None } else { pick_email(v)? },
         "emails[type eq \"work\"].value" | "emails[primary eq true].value" | "emails.value" => a.email = if remove { None } else { email(v, "emails.value")? },
-        _ => {}
+        p => {
+            let ext = ENTERPRISE_SCHEMA.to_ascii_lowercase();
+            if p == ext {
+                if remove || v.is_null() {
+                    a.enterprise = Enterprise::default();
+                } else {
+                    set_enterprise(&mut a.enterprise, op, v)?;
+                }
+            } else if let Some(name) = enterprise_attr(p.strip_prefix(&format!("{ext}:")).unwrap_or(p)) {
+                set_enterprise_attr(&mut a.enterprise, op, name, v)?;
+            }
+        }
     }
     Ok(())
 }
@@ -784,6 +912,7 @@ fn fields<'a>(d: &'a Attrs, shown: &'a str, active: Option<bool>) -> ScimFields<
         display_name: shown,
         email: d.email.as_deref(),
         active,
+        enterprise: &d.enterprise,
     }
 }
 
@@ -808,6 +937,13 @@ async fn changed(app: &AppState, a: &Auth, c: &Caller, before_user: &User, befor
         diff("familyName", json!(b.family_name), json!(after.family_name));
         diff("displayName", json!(b.display_name), json!(after.display_name));
         diff("formatted", json!(b.formatted), json!(after.formatted));
+        let (was, now) = (&b.enterprise, &after.enterprise);
+        diff("employeeNumber", json!(was.employee_number), json!(now.employee_number));
+        diff("costCenter", json!(was.cost_center), json!(now.cost_center));
+        diff("organization", json!(was.organization), json!(now.organization));
+        diff("division", json!(was.division), json!(now.division));
+        diff("department", json!(was.department), json!(now.department));
+        diff("manager", json!(was.manager), json!(now.manager));
     }
     if !changes.is_empty() {
         app.db.record(&ev("user.updated").details(json!({ "changes": changes, "tenant": c.token.tenant })));
@@ -998,8 +1134,16 @@ pub async fn patch_user(State(app): State<AppState>, Extension(a): Extension<Arc
 
 /// `DELETE /scim/v2/Users/{id}`: the user is disabled, their sessions end, and the tenant
 /// can't see them any more. Nothing is destroyed: the user and its audit history stay.
+/// When taking them off their group's team fails (ADR 0171), the rest still happens and
+/// the answer is a 500. The IdP's retry of that DELETE finishes taking them off.
 pub async fn delete_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Path(id): Path<String>) -> ScimRes {
-    let before = need(&app, &c, &id)?;
+    let Some(before) = app.db.scim_user(&c.token.tenant, &id) else {
+        if groups::left_behind(&app, &a, &c, &id) {
+            groups::user_deleted(&app, &a, &c, &id).await.map_err(server_error)?;
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        }
+        return Err(missing("User"));
+    };
     if !app.db.delete_scim_user(&c.token.tenant, &id) {
         return Err(missing("User"));
     }
@@ -1019,9 +1163,10 @@ pub async fn delete_user(State(app): State<AppState>, Extension(a): Extension<Ar
         crate::machines::screens::rotate_all(&app).await;
     }
     crate::machines::offboard::left(&app, &c.who, &id, crate::machines::offboard::DEPROVISIONED);
-    groups::user_deleted(&app, &a, &c, &id).await;
+    let left = groups::user_deleted(&app, &a, &c, &id).await;
     roles::user_deleted(&app, &a, &c.who, &id).await;
     crate::deprovision::user_disabled(&app, &c.who, &id, crate::deprovision::SCIM_DELETE).await;
+    left.map_err(server_error)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

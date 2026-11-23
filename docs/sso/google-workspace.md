@@ -92,6 +92,7 @@ With `GOOGLE_DIRECTORY_SSO`, have someone in the group sign in with Google: they
 |-----------|-------------|
 | Someone is in a chosen group | A user with `SCIM_DEFAULT_ROLE`, keyed by their Directory id (never their email). With `GOOGLE_DIRECTORY_SSO`, their Google sign-in is linked, also for users the tenant had before it was set |
 | Their name or primary email changes | The user is updated |
+| Their primary organization, `organization` external id, or `manager` relation changes | Their [enterprise attributes](scim.md#enterprise-attributes) follow: `organization` (its name), `department`, `costCenter`, `employeeNumber`, and `manager` once the manager has an account here too (a manager added in the same pass is set on the next). Shown to admins and in the access review; never used for access ([ADR 0176](../adr/0176-scim-enterprise-user-extension.md)) |
 | They are suspended or archived | The user is disabled, their sessions end, their Bots' runs stop, and their machine is suspended, as with SCIM ([ADR 0124](../adr/0124-deprovisioning-stops-bots-and-machines.md)) |
 | They are active again | The user is enabled again, if the sync disabled them (below) |
 | They leave every chosen group, or are deleted | The user is deleted from the tenant as with a SCIM `DELETE`: disabled, nothing destroyed. Added back, they return as the same user |

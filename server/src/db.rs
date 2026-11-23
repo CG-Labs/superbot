@@ -178,6 +178,18 @@ impl Scrub {
     }
 }
 
+/// An employee number in a change to the erased person's record, whatever its length:
+/// `Scrub` skips values too short to match safely, and one character is a valid number.
+fn pseudonymise_employee_number(d: &mut Value, pseudonym: &str) -> bool {
+    let Some(c) = d.pointer_mut("/changes/employeeNumber").and_then(Value::as_object_mut) else { return false };
+    let mut changed = false;
+    for v in c.values_mut().filter(|v| v.as_str().is_some_and(|v| v != pseudonym)) {
+        *v = Value::String(pseudonym.into());
+        changed = true;
+    }
+    changed
+}
+
 /// `hay` with each `needle` (lowercase) replaced, in any case. Outside ASCII, where case
 /// changes lengths, a string that contains it is replaced whole.
 fn replace_ci(hay: &str, needle: &str, with: &str) -> String {
@@ -1497,14 +1509,22 @@ pub struct ScimUser {
     pub created_at: i64,
     pub updated_at: i64,
     pub deleted_at: Option<i64>,
+    pub enterprise: Enterprise,
+    /// The shown name of `enterprise.manager`.
+    pub manager_name: Option<String>,
 }
 
 /// The columns of a `users` row joined with its `scim_users` row, the SCIM ones prefixed.
 const SCIM_USER_SELECT: &str = "SELECT u.*, l.tenant AS scim_tenant, l.external_id AS scim_external_id, l.user_name AS scim_user_name,
   l.given_name AS scim_given_name, l.family_name AS scim_family_name, l.display_name AS scim_display_name,
   l.formatted AS scim_formatted, l.created_at AS scim_created_at,
-  l.updated_at AS scim_updated_at, l.deleted_at AS scim_deleted_at
-  FROM scim_users l JOIN users u ON u.id = l.user_id";
+  l.updated_at AS scim_updated_at, l.deleted_at AS scim_deleted_at,
+  l.employee_number AS scim_employee_number, l.cost_center AS scim_cost_center, l.organization AS scim_organization,
+  l.division AS scim_division, l.department AS scim_department,
+  m.user_id AS scim_manager, mu.display_name AS scim_manager_name
+  FROM scim_users l JOIN users u ON u.id = l.user_id
+  LEFT JOIN scim_users m ON m.user_id = l.manager_id AND m.tenant = l.tenant AND m.deleted_at IS NULL AND m.user_id <> l.user_id
+  LEFT JOIN users mu ON mu.id = m.user_id";
 
 fn scim_user_row(r: &Row) -> rusqlite::Result<ScimUser> {
     Ok(ScimUser {
@@ -1519,7 +1539,36 @@ fn scim_user_row(r: &Row) -> rusqlite::Result<ScimUser> {
         created_at: r.get("scim_created_at")?,
         updated_at: r.get("scim_updated_at")?,
         deleted_at: r.get("scim_deleted_at")?,
+        enterprise: Enterprise {
+            employee_number: r.get("scim_employee_number")?,
+            cost_center: r.get("scim_cost_center")?,
+            organization: r.get("scim_organization")?,
+            division: r.get("scim_division")?,
+            department: r.get("scim_department")?,
+            manager: r.get("scim_manager")?,
+        },
+        manager_name: r.get("scim_manager_name")?,
     })
+}
+
+/// The Enterprise User extension (RFC 7643 section 4.3) as a tenant set it. `manager` is
+/// the user id of someone this tenant provisioned and hasn't deleted; read back, a
+/// manager who has since been deleted (or moved tenant) is None.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Enterprise {
+    pub employee_number: Option<String>,
+    pub cost_center: Option<String>,
+    pub organization: Option<String>,
+    pub division: Option<String>,
+    pub department: Option<String>,
+    pub manager: Option<String>,
+}
+
+impl Enterprise {
+    pub fn is_empty(&self) -> bool {
+        *self == Enterprise::default()
+    }
 }
 
 /// How a SCIM tenant looks users up: `userName` (any case) or `externalId` (exactly).
@@ -1544,6 +1593,7 @@ pub struct ScimFields<'a> {
     /// None leaves the status as it is now, so an update that doesn't change `active`
     /// can't undo an admin's disable that landed after it read the user.
     pub active: Option<bool>,
+    pub enterprise: &'a Enterprise,
 }
 
 /// Why a SCIM write was refused: something unique is someone else's already.
@@ -1972,7 +2022,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 59] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 61] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -2032,7 +2082,28 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 59] = [
     migrate_health_scores,
     migrate_saml_group_roles,
     migrate_machine_host_dedication,
+    migrate_residency_kept_from,
+    migrate_scim_enterprise,
 ];
+
+/// The SCIM Enterprise User extension on provisioned users (ADR 0176). `manager_id` is
+/// another user of the same tenant; it isn't a foreign key, since a manager's SCIM
+/// DELETE keeps their row, and reads show a manager only while they're live there.
+fn migrate_scim_enterprise(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('scim_users') WHERE name = 'department'", [], |r| r.get(0))?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch(
+        "ALTER TABLE scim_users ADD COLUMN employee_number TEXT;
+        ALTER TABLE scim_users ADD COLUMN cost_center TEXT;
+        ALTER TABLE scim_users ADD COLUMN organization TEXT;
+        ALTER TABLE scim_users ADD COLUMN division TEXT;
+        ALTER TABLE scim_users ADD COLUMN department TEXT;
+        ALTER TABLE scim_users ADD COLUMN manager_id TEXT;
+        CREATE INDEX IF NOT EXISTS scim_users_manager ON scim_users(manager_id) WHERE manager_id IS NOT NULL;",
+    )
+}
 
 /// Native SAML groups mapped to custom roles across the server (ADR 0160): one role per
 /// provider and group, and the grants they made, one per person. A grant whose role was
@@ -2242,6 +2313,15 @@ fn migrate_residency_pins(c: &Connection, _fresh: bool) -> rusqlite::Result<()> 
           PRIMARY KEY (subject_type, subject_id)
         );",
     )
+}
+
+/// A user's pin kept from their team's when they left it (ADR 0171): the team it came from.
+fn migrate_residency_kept_from(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('residency_pins') WHERE name = 'kept_from'", [], |r| r.get(0))?;
+    if !has {
+        c.execute_batch("ALTER TABLE residency_pins ADD COLUMN kept_from TEXT;")?;
+    }
+    Ok(())
 }
 
 /// Machines suspended because their user was disabled (ADR 0124), so enabling them
@@ -5794,6 +5874,7 @@ impl Db {
         out.mfa = run("DELETE FROM user_mfa WHERE user_id = ?", &[&user_id])? > 0;
         out.recovery_codes = run("DELETE FROM mfa_recovery_codes WHERE user_id = ?", &[&user_id])?;
         out.scim = run("DELETE FROM scim_users WHERE user_id = ?", &[&user_id])? > 0;
+        run("UPDATE scim_users SET manager_id = NULL WHERE manager_id = ?", &[&user_id])?;
         out.grants = run("DELETE FROM bot_grants WHERE user_id = ?", &[&user_id])?;
         out.team_invites = match &u.email {
             Some(e) => run("DELETE FROM team_invites WHERE email = ?", &[e])?,
@@ -5851,7 +5932,7 @@ impl Db {
     /// `user.updated` and identity events about them recorded, so erasing scrubs old values
     /// a change left in the log.
     fn past_identifiers(c: &Connection, user_id: &str, emails: &mut Vec<String>, exact: &mut Vec<String>, subjects: &mut Vec<String>) -> rusqlite::Result<()> {
-        const KEYS: [&str; 9] = ["name", "email", "userName", "externalId", "subject", "givenName", "familyName", "displayName", "formatted"];
+        const KEYS: [&str; 10] = ["name", "email", "userName", "externalId", "subject", "givenName", "familyName", "displayName", "formatted", "employeeNumber"];
         let mut st = c.prepare("SELECT details FROM audit_events WHERE target_type = 'user' AND target_id = ? AND action IN ('user.created', 'user.updated', 'user.identity_linked', 'user.identity_unlinked')")?;
         let rows = st.query_map([user_id], |r| r.get::<_, String>(0))?;
         for d in rows {
@@ -5918,7 +5999,7 @@ impl Db {
             // the TSA's (ADR 0149): a match in them is a coincidence, and rewriting them
             // would break what a check holds them to.
             let signed = [crate::audit_checkpoint::CHECKPOINT, crate::audit_checkpoint::TIMESTAMPED].contains(&action.as_str());
-            let changed = !signed && s.value(&mut d);
+            let changed = !signed && (s.value(&mut d) | (is(&target) && pseudonymise_employee_number(&mut d, &s.pseudonym)));
             let next = (
                 swap(actor_id.clone()),
                 mine(name.clone(), false),
@@ -7209,6 +7290,14 @@ impl Db {
              ON CONFLICT (user_id) DO UPDATE SET external_id = ?3, user_name = ?4, given_name = ?5, family_name = ?6, display_name = ?7, formatted = ?8,
                updated_at = ?9, deleted_at = NULL",
             params![user_id, tenant, f.external_id, f.user_name, f.given_name, f.family_name, f.scim_display_name, f.formatted, at],
+        )?;
+        let e = f.enterprise;
+        // A manager must be someone else this tenant has, checked in the write's transaction.
+        tx.execute(
+            "UPDATE scim_users SET employee_number = ?2, cost_center = ?3, organization = ?4, division = ?5, department = ?6,
+               manager_id = (SELECT m.user_id FROM scim_users m WHERE m.user_id = ?7 AND m.tenant = ?8 AND m.deleted_at IS NULL AND m.user_id <> ?1)
+             WHERE user_id = ?1",
+            params![user_id, e.employee_number, e.cost_center, e.organization, e.division, e.department, e.manager, tenant],
         )?;
         Ok(())
     }
@@ -9519,6 +9608,8 @@ pub struct ResidencyPin {
     pub reference: String,
     pub pinned_by: Option<String>,
     pub pinned_at: i64,
+    /// A user's pin kept from their team's when they left it (ADR 0171): that team's id.
+    pub kept_from: Option<String>,
 }
 
 fn residency_pin_row(r: &Row) -> rusqlite::Result<ResidencyPin> {
@@ -9530,6 +9621,7 @@ fn residency_pin_row(r: &Row) -> rusqlite::Result<ResidencyPin> {
         reference: r.get("reference")?,
         pinned_by: r.get("pinned_by")?,
         pinned_at: r.get("pinned_at")?,
+        kept_from: r.get("kept_from")?,
     })
 }
 
@@ -9688,7 +9780,7 @@ impl Db {
         }
         tx.execute(
             "INSERT INTO residency_pins (subject_type, subject_id, region, reference, pinned_by, pinned_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT (subject_type, subject_id) DO UPDATE SET region = excluded.region, reference = excluded.reference, pinned_by = excluded.pinned_by, pinned_at = excluded.pinned_at",
+             ON CONFLICT (subject_type, subject_id) DO UPDATE SET region = excluded.region, reference = excluded.reference, pinned_by = excluded.pinned_by, pinned_at = excluded.pinned_at, kept_from = NULL",
             params![kind.as_str(), id, region, reference, by, at],
         )
         .map_err(|e| e.to_string())?;
@@ -9761,10 +9853,28 @@ impl Db {
             > 0
     }
 
-    /// Takes a member off a team. With `keep_owner`, not its last owner while others
-    /// remain, in the same statement.
+    /// Takes a member off a team, keeping no pin.
+    #[cfg(test)]
     pub fn remove_team_member(&self, team_id: &str, user_id: &str, keep_owner: bool) -> bool {
-        self.c()
+        self.remove_team_member_keeping_pin(team_id, user_id, keep_owner, false).unwrap().0
+    }
+
+    /// Makes every new residency pin fail to save, or stops that.
+    #[cfg(test)]
+    pub fn fail_pin_saves(&self, on: bool) {
+        let sql = if on { "CREATE TRIGGER pins_full BEFORE INSERT ON residency_pins BEGIN SELECT RAISE(ABORT, 'disk full'); END;" } else { "DROP TRIGGER pins_full;" };
+        self.c().execute_batch(sql).unwrap();
+    }
+
+    /// Takes a member off a team. With `keep_owner`, not its last owner while others
+    /// remain, in the same statement. With `keep_pin`, in the same transaction, the
+    /// team's residency pin is copied to the leaver as their own (ADR 0171), with their
+    /// own data region set to it, unless they have a pin of their own already. Ok:
+    /// whether they were taken off, and the pin kept. Err: nothing changed.
+    pub fn remove_team_member_keeping_pin(&self, team_id: &str, user_id: &str, keep_owner: bool, keep_pin: bool) -> Result<(bool, Option<ResidencyPin>), String> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
+        let gone = tx
             .execute(
                 "DELETE FROM team_members WHERE team_id = ?1 AND user_id = ?2
                  AND (NOT ?3 OR role != 'owner'
@@ -9772,8 +9882,30 @@ impl Db {
                       OR (SELECT COUNT(*) FROM team_members WHERE team_id = ?1) = 1)",
                 params![team_id, user_id, keep_owner],
             )
-            .unwrap()
-            > 0
+            .map_err(|e| e.to_string())?
+            > 0;
+        if !gone {
+            return Ok((false, None));
+        }
+        let pin = |kind: &str, id: &str| {
+            tx.query_row("SELECT * FROM residency_pins WHERE subject_type = ?1 AND subject_id = ?2", params![kind, id], residency_pin_row).optional().map_err(|e| e.to_string())
+        };
+        let kept = match (keep_pin, pin("team", team_id)?, pin("user", user_id)?) {
+            (true, Some(team), None) => {
+                let at = now();
+                tx.execute("UPDATE users SET region = ?1, updated_at = CASE WHEN region IS ?1 THEN updated_at ELSE ?2 END WHERE id = ?3", params![team.region, at, user_id])
+                    .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "INSERT INTO residency_pins (subject_type, subject_id, region, reference, pinned_by, pinned_at, kept_from) VALUES ('user', ?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![user_id, team.region, team.reference, team.pinned_by, at, team_id],
+                )
+                .map_err(|e| e.to_string())?;
+                pin("user", user_id)?
+            }
+            _ => None,
+        };
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok((true, kept))
     }
 
     /// Invites `email`, or renews a pending invite with the new role and expiry.
@@ -10151,6 +10283,50 @@ mod tests {
         assert!(db.residency_pin(PinOn::User, &u.id).is_some());
         db.c().execute_batch("DROP TRIGGER pins_kept;").unwrap();
         assert_eq!((db.unpin_residency(PinOn::User, &u.id), db.unpin_residency(PinOn::User, &u.id)), (Ok(true), Ok(false)));
+    }
+
+    #[test]
+    fn a_leaver_keeps_the_teams_pin_with_the_leave_or_neither_happens() {
+        let db = Db::open(&temp_path("pin-kept").join("app.sqlite")).unwrap();
+        let t = db.create_team("Acme", None);
+        let [ada, bea, cy, dee] = ["ada", "bea", "cy", "dee"].map(|n| db.create_user(None, Some(&format!("{n}@example.com")), n, Role::Member).unwrap());
+        assert!(db.add_team_member(&t.id, &ada.id, "owner", None));
+        for u in [&bea, &cy, &dee] {
+            assert!(db.add_team_member(&t.id, &u.id, "member", None));
+        }
+        db.pin_residency(PinOn::Team, &t.id, "gb-lon", "MSA-7", Some(&ada.id)).unwrap();
+
+        // Kept: the team's region and reference, who pinned it, and where it came from.
+        let (gone, kept) = db.remove_team_member_keeping_pin(&t.id, &bea.id, true, true).unwrap();
+        let kept = kept.unwrap();
+        assert!(gone && db.team_member(&bea.id).is_none());
+        assert_eq!((kept.subject_type, kept.region.as_str(), kept.reference.as_str()), (PinOn::User, "gb-lon", "MSA-7"));
+        assert_eq!((kept.pinned_by.as_deref(), kept.kept_from.as_deref()), (Some(ada.id.as_str()), Some(t.id.as_str())));
+        assert_eq!(db.user(&bea.id).unwrap().region.as_deref(), Some("gb-lon"), "their own region holds it");
+        // An admin renewing it makes it their own pin, no longer kept from the team.
+        db.pin_residency(PinOn::User, &bea.id, "gb-lon", "DPA-bea", None).unwrap();
+        assert_eq!(db.residency_pin(PinOn::User, &bea.id).unwrap().kept_from, None);
+
+        // Their own pin already holds them: left as it is.
+        db.pin_residency(PinOn::User, &cy.id, "gb-lon", "DPA-cy", None).unwrap();
+        assert!(matches!(db.remove_team_member_keeping_pin(&t.id, &cy.id, true, true), Ok((true, None))));
+        assert_eq!(db.residency_pin(PinOn::User, &cy.id).unwrap().reference, "DPA-cy");
+
+        // The pin can't be kept: they stay on the team, and nothing is pinned.
+        db.c().execute_batch("CREATE TRIGGER pins_full BEFORE INSERT ON residency_pins BEGIN SELECT RAISE(ABORT, 'disk full'); END;").unwrap();
+        assert!(db.remove_team_member_keeping_pin(&t.id, &dee.id, true, true).unwrap_err().contains("disk full"));
+        assert!(db.team_member(&dee.id).is_some() && db.residency_pin(PinOn::User, &dee.id).is_none());
+        assert_eq!(db.user(&dee.id).unwrap().region, None, "the region rolled back with it");
+        db.c().execute_batch("DROP TRIGGER pins_full;").unwrap();
+
+        // Not kept when asked not to (an erasure), nor for the last owner who may not go.
+        assert!(!db.remove_team_member_keeping_pin(&t.id, &ada.id, true, true).unwrap().0, "the last owner, with others on the team");
+        assert!(db.residency_pin(PinOn::User, &ada.id).is_none());
+        assert!(matches!(db.remove_team_member_keeping_pin(&t.id, &dee.id, true, false), Ok((true, None))));
+        assert!(db.residency_pin(PinOn::User, &dee.id).is_none());
+        // No team pin: nothing to keep.
+        db.unpin_residency(PinOn::Team, &t.id).unwrap();
+        assert!(matches!(db.remove_team_member_keeping_pin(&t.id, &ada.id, true, true), Ok((true, None))));
     }
 
     #[test]
@@ -11161,6 +11337,54 @@ mod tests {
         assert!(!db.finish_approval(&a.id, "denied", "user", None, None));
         assert_eq!(db.approval(&a.id).unwrap().status, "approved");
         assert!(db.approvals(Some("pending"), None, 10).is_empty());
+    }
+
+    #[test]
+    fn a_scim_manager_is_someone_else_live_in_the_same_tenant() {
+        fn fields<'a>(user_name: &'a str, enterprise: &'a Enterprise) -> ScimFields<'a> {
+            ScimFields {
+                user_name,
+                external_id: None,
+                given_name: None,
+                family_name: None,
+                scim_display_name: None,
+                formatted: None,
+                display_name: user_name,
+                email: None,
+                active: Some(true),
+                enterprise,
+            }
+        }
+        fn with(manager: &str) -> Enterprise {
+            Enterprise { department: Some("Eng".into()), employee_number: Some("E-1".into()), manager: Some(manager.into()), ..Default::default() }
+        }
+        let db = Db::open(&temp_path("scim-manager").join("app.sqlite")).unwrap();
+        let none = Enterprise::default();
+        let boss = db.create_scim_user("entra", &fields("boss", &none), Role::Member, None).unwrap();
+        let other = db.create_scim_user("okta", &fields("other", &none), Role::Member, None).unwrap();
+        let ada = db.create_scim_user("entra", &fields("ada", &none), Role::Member, None).unwrap();
+        let manager_of = |db: &Db| db.scim_user("entra", &ada.id).map(|u| (u.enterprise.manager, u.manager_name));
+
+        for not_one in [other.id.as_str(), ada.id.as_str(), "nobody"] {
+            db.save_scim_user("entra", &ada.id, &fields("ada", &with(not_one)), false).unwrap();
+            assert_eq!(manager_of(&db), Some((None, None)), "{not_one}");
+            assert_eq!(db.scim_user("entra", &ada.id).unwrap().enterprise.department.as_deref(), Some("Eng"), "the rest is kept");
+        }
+        db.save_scim_user("entra", &ada.id, &fields("ada", &with(&boss.id)), false).unwrap();
+        assert_eq!(manager_of(&db), Some((Some(boss.id.clone()), Some("boss".into()))));
+        assert!(db.delete_scim_user("entra", &boss.id));
+        assert_eq!(manager_of(&db), Some((None, None)), "a deleted manager isn't shown");
+        db.save_scim_user("entra", &boss.id, &fields("boss", &none), true).unwrap();
+        assert_eq!(manager_of(&db), Some((Some(boss.id.clone()), Some("boss".into()))), "taken back, shown again");
+
+        let changed = json!({ "changes": { "employeeNumber": { "from": null, "to": "7" } } });
+        db.record(&audit::Event::new(audit::Actor::system("scim"), "user.updated").target("user", &boss.id).details(changed));
+        db.erase_user(&boss.id, "erased-1", None, &[]).unwrap();
+        assert_eq!(manager_of(&db), Some((None, None)));
+        let d: String = db.c().query_row("SELECT details FROM audit_events WHERE action = 'user.updated'", [], |r| r.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&d).unwrap()["changes"]["employeeNumber"], json!({ "from": null, "to": "erased-1" }), "even one character is scrubbed");
+        let stale: Option<String> = db.c().query_row("SELECT manager_id FROM scim_users WHERE user_id = ?", [&ada.id], |r| r.get(0)).unwrap();
+        assert_eq!(stale, None, "erasing someone clears them as a manager");
     }
 
     #[test]

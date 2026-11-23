@@ -3,7 +3,7 @@
 
 use super::github::{self, GitHub};
 use super::jwt::{self, Invalid, Jwks, Token};
-use super::saml_sp::{self, Attributes, Encryption, IdpMetadata, KeyUse, MetadataRefused, MetadataTrust, SpKey};
+use super::saml_sp::{self, Attributes, Encryption, IdpInitiated, IdpMetadata, KeyUse, MetadataRefused, MetadataTrust, SpKey};
 use super::{apple, saml};
 use crate::rbac::Role;
 use serde_json::Value;
@@ -48,7 +48,8 @@ pub enum Kind {
     /// `SSO_<ID>_ENCRYPTION_PRIVATE_KEY` with `enc_cert`, else generated. With `metadata_trust`,
     /// the IdP metadata's signature is checked against its certificates (ADR 0151). With
     /// `attributes.groups`, only people in one of `required_groups` (if any) sign in, and
-    /// group-to-role mappings apply (ADR 0160).
+    /// group-to-role mappings apply (ADR 0160). `idp_initiated` says what an unsolicited
+    /// response does (ADR 0175).
     SamlSp {
         entity_id: String,
         sp_entity_id: String,
@@ -61,6 +62,7 @@ pub enum Kind {
         encryption: Encryption,
         enc_cert: Option<String>,
         metadata_trust: Option<MetadataTrust>,
+        idp_initiated: IdpInitiated,
     },
 }
 

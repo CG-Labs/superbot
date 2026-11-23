@@ -27,21 +27,23 @@ const MAX_DAYS: i64 = 400;
 /// Events read for one report. Past this the activity is marked `truncated`.
 const MAX_EVENTS: usize = 100_000;
 
-const PIN_CHANGES: [&str; 6] = [
+const PIN_CHANGES: [&str; 7] = [
     "user.residency_pinned",
+    "user.residency_pin_kept",
     "user.residency_unpinned",
     "user.residency_pin_refused",
     "team.residency_pinned",
     "team.residency_unpinned",
     "team.residency_pin_refused",
 ];
+const KEPT: &str = "user.residency_pin_kept";
 const REFUSALS: [&str; 6] = ["machine.residency_refused", "bot.run_refused", "user.region_change_refused", "team.region_change_refused", "team.join_refused", "team.delete_refused"];
 
 const NOT_COVERED: [&str; 4] = [
     "botd's own database (accounts, chats, routines, the audit log), its files and server backups, which are where the operator runs botd (ADR 0129).",
     "What a Bot's own tools send over the network; outbound allow-lists are the control for that (ADR 0135).",
     "Push, email, webhooks, payments and sign-in providers, as the DPA's subprocessor annex lists them.",
-    "People who have left a pinned team: its pin no longer holds their data, and they aren't in this report.",
+    "People who have left a pinned team: their data is held by a pin of their own, kept from the team's when they left, with its own report (ADR 0171).",
 ];
 
 fn rfc3339(ms: i64) -> String {
@@ -149,15 +151,19 @@ fn held_here(app: &App, e: &AuditEvent, p: &ResidencyPin, people: &HashSet<Strin
     owner.as_deref().is_some_and(|o| people.contains(o))
 }
 
-fn change_view(e: &AuditEvent) -> Value {
+/// With `reference` false, the reference is left out (null).
+fn change_view(e: &AuditEvent, reference: bool) -> Value {
     json!({
         "at": e.at, "time": e.time, "action": e.action, "outcome": e.outcome,
         "actor": { "kind": e.actor_kind, "id": e.actor_id, "name": e.actor_name },
-        "region": e.details["region"], "reference": e.details["reference"], "reason": e.details["reason"],
+        "region": e.details["region"], "reference": if reference { e.details["reference"].clone() } else { Value::Null }, "reason": e.details["reason"],
     })
 }
 
-fn activity(app: &App, p: &ResidencyPin, people: &HashSet<String>, from: i64, to: i64) -> Result<Value, String> {
+/// `self_service`: for someone the pin holds, who never sees the reference a pin kept
+/// from their former team carries, even once it has been renewed (ADR 0129, 0171).
+fn activity(app: &App, p: &ResidencyPin, people: &HashSet<String>, from: i64, to: i64, self_service: bool) -> Result<Value, String> {
+    let hidden = self_service && p.kept_from.is_some();
     let actions: Vec<&str> = PIN_CHANGES.iter().chain(REFUSALS.iter()).copied().collect();
     let events = app.db.residency_audit(from, to, &actions, MAX_EVENTS as i64 + 1).map_err(|e| e.to_string())?;
     let truncated = events.len() > MAX_EVENTS;
@@ -166,7 +172,7 @@ fn activity(app: &App, p: &ResidencyPin, people: &HashSet<String>, from: i64, to
     for e in events.iter().take(MAX_EVENTS) {
         if PIN_CHANGES.contains(&e.action.as_str()) {
             if on_subject(e, p) {
-                changes.push(change_view(e));
+                changes.push(change_view(e, !hidden && !(self_service && e.action == KEPT)));
             }
         } else if e.action == "harness.invoked" {
             held += u64::from(held_here(app, e, p, people, &mut owners));
@@ -206,8 +212,11 @@ pub(super) fn person(app: &App, cp: &ControlPlane, id: &str, region: &str) -> Op
     }))
 }
 
-/// The report on `p` for `from`..`to`, generated at `now`, with its digest.
-pub fn build(app: &App, cp: &ControlPlane, p: &ResidencyPin, from: i64, to: i64, now: i64) -> Result<Value, String> {
+/// The report on `p` for `from`..`to`, generated at `now`, with its digest. For
+/// `self_service` (someone the pin holds, ADR 0168), a team's reference on a pin kept
+/// from it is left out (null): only the team's owners and admins see it (ADR 0129, 0171).
+pub fn build(app: &App, cp: &ControlPlane, p: &ResidencyPin, from: i64, to: i64, now: i64, self_service: bool) -> Result<Value, String> {
+    let reference = !(self_service && p.kept_from.is_some());
     let (name, ids) = residency::held_by(app, p).ok_or("Whom this pin is on is gone")?;
     let region = p.region.as_str();
     let people: Vec<Value> = ids.iter().filter_map(|id| person(app, cp, id, region)).collect();
@@ -220,19 +229,23 @@ pub fn build(app: &App, cp: &ControlPlane, p: &ResidencyPin, from: i64, to: i64,
     warnings.extend(residency::route_gaps(app, &ids, region).into_iter().map(|g| format!("{g}, so their Bots' runs are refused (ADR 0139)")));
     let hosts = cp.hosts().map(|h| h.configured().into_iter().filter(|c| c.region.as_deref() == Some(region)).map(|c| c.name).collect::<Vec<_>>());
     let pinned_by = p.pinned_by.as_deref().map(|id| json!({ "id": id, "name": app.db.user(id).map(|u| u.name) }));
+    let kept_from = p.kept_from.as_deref().map(|t| json!({ "id": t, "name": app.db.team(t).map(|t| t.name) }));
     let set: HashSet<String> = ids.into_iter().collect();
     let mut report = json!({
         "format": FORMAT,
         "generatedAt": now, "generatedTime": rfc3339(now),
         "period": { "from": from, "to": to, "fromTime": rfc3339(from), "toTime": rfc3339(to) },
         "subject": { "type": p.subject_type.as_str(), "id": p.subject_id, "name": name },
-        "pin": { "region": p.region, "reference": p.reference, "pinnedAt": p.pinned_at, "pinnedTime": rfc3339(p.pinned_at), "pinnedBy": pinned_by },
+        "pin": {
+            "region": p.region, "reference": reference.then_some(&p.reference), "pinnedAt": p.pinned_at, "pinnedTime": rfc3339(p.pinned_at),
+            "pinnedBy": pinned_by, "keptFrom": kept_from,
+        },
         "status": if outside.is_empty() { "kept" } else { "data_outside" },
         "outside": outside,
         "warnings": warnings,
         "region": { "id": region, "offered": cp.regions.iter().any(|r| r == region), "hosts": hosts, "backupStore": cp.offsite.as_deref().map(|o| o.in_region(region)) },
         "people": people,
-        "activity": activity(app, p, &set, from, to)?,
+        "activity": activity(app, p, &set, from, to, self_service)?,
         "notCovered": NOT_COVERED,
     });
     report["digest"] = json!(digest(&report));
@@ -254,9 +267,16 @@ pub fn markdown(r: &Value) -> String {
     let mut out = String::from("# Data residency report\n\n");
     let pin = &r["pin"];
     out += &format!("- **Subject:** {} ({} `{}`)\n", c(&r["subject"]["name"]), c(&r["subject"]["type"]), c(&r["subject"]["id"]));
-    out += &format!("- **Pinned to:** {} under {}, since {}", c(&pin["region"]), c(&pin["reference"]), c(&pin["pinnedTime"]));
+    out += &format!("- **Pinned to:** {}", c(&pin["region"]));
+    if pin["reference"].is_string() {
+        out += &format!(" under {}", c(&pin["reference"]));
+    }
+    out += &format!(", since {}", c(&pin["pinnedTime"]));
     if let Some(by) = pin["pinnedBy"]["name"].as_str().or(pin["pinnedBy"]["id"].as_str()) {
         out += &format!(", by {}", cell(&json!(by)));
+    }
+    if let Some(t) = pin["keptFrom"]["name"].as_str().or(pin["keptFrom"]["id"].as_str()) {
+        out += &format!(", kept from team {}'s pin when they left it", cell(&json!(t)));
     }
     out += &format!("\n- **Period:** {} to {}\n- **Generated:** {}\n", c(&r["period"]["fromTime"]), c(&r["period"]["toTime"]), c(&r["generatedTime"]));
     let kept = r["status"] == "kept";
@@ -363,7 +383,7 @@ pub(super) fn query(q: &HashMap<String, String>, now: i64) -> Result<(bool, i64,
 pub(super) fn respond(app: &App, cp: &ControlPlane, by: &Who, p: &ResidencyPin, q: &HashMap<String, String>, self_service: bool) -> Result<Response, ApiError> {
     let now = crate::db::now();
     let (md, from, to) = query(q, now)?;
-    let r = build(app, cp, p, from, to, now).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("The residency report couldn't be made: {e}")))?;
+    let r = build(app, cp, p, from, to, now, self_service).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("The residency report couldn't be made: {e}")))?;
     let d = json!({
         "region": p.region, "reference": p.reference, "from": from, "to": to, "status": r["status"], "digest": r["digest"],
         "format": if md { "markdown" } else { "json" }, "truncated": r["activity"]["truncated"], "selfService": self_service,
