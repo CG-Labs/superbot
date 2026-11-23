@@ -61,6 +61,13 @@ async fn a_users_report_shows_where_their_data_is_what_was_refused_and_held_and_
     };
     env.app.db.record(&run_refused(&fra));
     env.app.db.record(&run_refused("someone-else"));
+    // A run that carried her, refused over her region under another pin (a team's that
+    // agrees with hers), and a held run of a Bot since deleted: both by the people recorded.
+    let team_pin = json!([{ "region": "de-fra-2", "pinnedOn": "team", "subjectId": "t-other", "reference": "y" }]);
+    let d = json!({ "reason": "residency_pinned", "pins": team_pin, "pinnedRegions": ["de-fra-2"], "people": ["someone-else", fra] });
+    env.app.db.record(&by.event("bot.run_refused").outcome(Outcome::Denied).details(d));
+    env.app.db.record(&by.event("harness.invoked").bot("b-gone").details(json!({ "residency": { "regions": ["de-fra-2"], "people": [fra] } })));
+    env.app.db.record(&by.event("harness.invoked").bot("b-gone").details(json!({ "forUser": fra, "residency": { "regions": ["de-fra-2"], "people": ["someone-else"] } })));
 
     let (code, r) = json_call(&env, "GET", &report, "").await;
     assert_eq!(code, 200, "{r}");
@@ -85,13 +92,13 @@ async fn a_users_report_shows_where_their_data_is_what_was_refused_and_held_and_
     assert_eq!(
         refusals(&r),
         [
-            ("bot.run_refused".to_string(), Some("run".to_string()), 1),
+            ("bot.run_refused".to_string(), Some("run".to_string()), 2),
             ("machine.residency_refused".to_string(), Some("move".to_string()), 1),
             ("user.region_change_refused".to_string(), None, 1),
         ],
         "{r}"
     );
-    assert_eq!((r["activity"]["heldRuns"].as_u64(), r["activity"]["truncated"].as_bool()), (Some(1), Some(false)), "{r}");
+    assert_eq!((r["activity"]["heldRuns"].as_u64(), r["activity"]["truncated"].as_bool()), (Some(2), Some(false)), "{r}");
     assert!(r["notCovered"][0].as_str().unwrap().contains("botd's own database"), "{r}");
 
     // The digest is over the report without it, and the report is audited with it.
@@ -110,6 +117,10 @@ async fn a_users_report_shows_where_their_data_is_what_was_refused_and_held_and_
     assert!(md.starts_with("# Data residency report") && md.contains("under DPA-2026-014") && md.contains("| `machine.residency_refused` | move | 1 |"), "{md}");
     let md_digest = &events(&env, residency_report::GENERATED).await[0]["details"]["digest"];
     assert!(md.contains(&format!("Digest: `{}`", md_digest.as_str().unwrap())), "{md}");
+    // It carries the JSON it seals, so the customer can check the digest.
+    let start = md.find("```json\n").unwrap() + "```json\n".len();
+    let sealed: Value = serde_json::from_str(&md[start..start + md[start..].find("\n```\n").unwrap()]).unwrap();
+    assert_eq!((sealed["digest"].clone(), residency_report::digest(&sealed)), (md_digest.clone(), md_digest.as_str().unwrap().to_string()));
 
     // A period before the pin has none of it; bad queries are refused.
     let (code, old) = json_call(&env, "GET", &format!("{report}?from=2020-01-01&to=2020-06-01"), "").await;

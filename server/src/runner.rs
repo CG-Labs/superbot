@@ -1020,7 +1020,7 @@ impl App {
             self.give_back(&bot, msg, &period.key);
             let regions: Vec<&str> = since.iter().map(|p| p.region.as_str()).collect();
             let pins: Vec<Value> = since.iter().map(|p| json!({ "region": p.region, "pinnedOn": p.subject_type, "subjectId": p.subject_id, "reference": p.reference })).collect();
-            let details = json!({ "reason": crate::machines::residency::PINNED, "owner": bot.owner_id, "pinnedRegions": regions, "pins": pins, "heldTo": held_to, "whileQueued": true, "forUser": (asker != bot.owner_id).then_some(&asker), "messageId": msg.id });
+            let details = json!({ "reason": crate::machines::residency::PINNED, "owner": bot.owner_id, "pinnedRegions": regions, "pins": pins, "people": people, "heldTo": held_to, "whileQueued": true, "forUser": (asker != bot.owner_id).then_some(&asker), "messageId": msg.id });
             self.db.record(&by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied).details(details));
             let text = format!("This run's data was pinned to {} under a residency agreement while it waited, so I didn't run it on the route it had. Send it again (ADR 0139).", regions.join(" and "));
             self.say(&bot.id, &text, true);
@@ -1286,6 +1286,7 @@ impl App {
             if let Some(h) = &held {
                 invoked["residency"] = json!({
                     "regions": h.regions,
+                    "people": people,
                     "fallbackOutsideRegion": h.outside,
                     "insteadOf": h.instead_of.as_ref().map(|r| json!({ "model": r.model, "provider": r.provider })),
                 });
@@ -2188,7 +2189,7 @@ impl App {
                         regions.join(" and ")
                     );
                     let pins: Vec<Value> = pins.iter().map(|p| json!({ "region": p.region, "pinnedOn": p.subject_type, "subjectId": p.subject_id, "reference": p.reference })).collect();
-                    let more = json!({ "harness": bot.harness, "pinnedRegions": regions, "pins": pins, "forUser": (asker != bot.owner_id).then_some(asker), "error": e });
+                    let more = json!({ "harness": bot.harness, "pinnedRegions": regions, "pins": pins, "people": people, "forUser": (asker != bot.owner_id).then_some(asker), "error": e });
                     return refused(crate::machines::residency::PINNED, text, None, None, more);
                 }
             }

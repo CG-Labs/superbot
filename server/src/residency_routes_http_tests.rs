@@ -92,6 +92,7 @@ async fn a_pinned_persons_runs_take_only_in_region_routes_or_are_refused() {
     assert_eq!((d["provider"].as_str(), d["model"].as_str()), (Some("uk-claude"), Some("claude-sonnet-4-5")), "{d}");
     assert_eq!(d["fallback"], json!([{ "provider": "eu-gpt", "model": "gpt-5-mini" }]), "{d}");
     assert_eq!(d["residency"]["regions"], json!(["gb-lon"]));
+    assert_eq!(d["residency"]["people"], json!([ada_id]), "the people it carried, for residency reports (ADR 0155)");
     assert_eq!(d["residency"]["fallbackOutsideRegion"], json!([{ "provider": "us-gpt", "model": "gpt-5" }]));
     assert_eq!(d["residency"]["insteadOf"], json!({ "provider": "us-gpt", "model": "gpt-5" }));
 
@@ -106,6 +107,7 @@ async fn a_pinned_persons_runs_take_only_in_region_routes_or_are_refused() {
     let d = &refused[0]["details"];
     assert_eq!((d["reason"].as_str(), refused[0]["outcome"].as_str()), (Some("residency_pinned"), Some("denied")), "{d}");
     assert_eq!((d["pinnedRegions"].clone(), d["pins"][0]["reference"].as_str(), d["pins"][0]["pinnedOn"].as_str()), (json!(["gb-lon"]), Some("DPA-7"), Some("user")));
+    assert_eq!(d["people"], json!([ada_id]), "{d}");
     assert!(d["error"].as_str().unwrap().contains("names no provider from the tiers file"), "{d}");
     assert_eq!(runs().await, before, "a refused run isn't counted");
 
@@ -276,6 +278,7 @@ async fn a_pin_made_while_a_run_waits_refuses_it() {
     let refused = audit(port, &admin, &format!("action=bot.run_refused&bot={y}")).await;
     let d = &refused[0]["details"];
     assert_eq!((d["reason"].as_str(), d["whileQueued"].as_bool(), d["heldTo"].clone()), (Some("residency_pinned"), Some(true), json!([])), "{d}");
+    assert!(d["people"].as_array().is_some_and(|p| p.contains(&json!(ada_id))), "{d}");
     assert!(audit(port, &admin, &format!("action=harness.invoked&bot={y}")).await.is_empty(), "Y didn't start");
     assert_eq!(runs().await, Some(1), "only X's run counts");
 

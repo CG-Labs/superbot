@@ -89,8 +89,24 @@ fn on_subject(e: &AuditEvent, p: &ResidencyPin) -> bool {
     e.target_type.as_deref() == Some(p.subject_type.as_str()) && e.target_id.as_deref() == Some(p.subject_id.as_str())
 }
 
-/// Whether a refusal was this pin's: on the pinned user or team, naming the pin among a
-/// run's pins, or about one of its people's machines or regions in its region.
+fn has_region(v: &Value, region: &str) -> bool {
+    v.as_array().is_some_and(|r| r.iter().any(|r| r.as_str() == Some(region)))
+}
+
+/// Whether any of the people a run carried when it was recorded (`people`, else its
+/// owner and asker) is one of `covered`.
+fn carried(d: &Value, people: &Value, covered: &HashSet<String>) -> bool {
+    let named = |v: &Value| v.as_str().is_some_and(|u| covered.contains(u));
+    match people.as_array() {
+        Some(list) => list.iter().any(named),
+        None => named(&d["owner"]) || named(&d["forUser"]),
+    }
+}
+
+/// Whether a refusal was this pin's: on the pinned user or team, a run that carried one
+/// of its people and was refused over its region (whichever pin the run named: a
+/// member's own and their team's can agree), or about one of its people's machines or
+/// regions in its region.
 fn refused_here(e: &AuditEvent, p: &ResidencyPin, people: &HashSet<String>) -> bool {
     let d = &e.details;
     if d["reason"].as_str() != Some(PINNED) {
@@ -103,16 +119,23 @@ fn refused_here(e: &AuditEvent, p: &ResidencyPin, people: &HashSet<String>) -> b
     if d["pins"].as_array().is_some_and(|a| a.iter().any(names_pin)) {
         return true;
     }
+    if has_region(&d["pinnedRegions"], &p.region) && carried(d, &d["people"], people) {
+        return true;
+    }
     let person = |s: Option<&str>| s.is_some_and(|s| people.contains(s));
     d["pinnedRegion"].as_str() == Some(p.region.as_str()) && (person(d["userId"].as_str()) || (e.target_type.as_deref() == Some("user") && person(e.target_id.as_deref())))
 }
 
-/// Whether a run was held to this pin's region for one of its people: their Bot, or
-/// asked for by them.
+/// Whether a run was held to this pin's region for one of its people, by the people it
+/// carried as recorded then. Runs recorded before `residency.people` fall back to the
+/// asker and the Bot's owner now.
 fn held_here(app: &App, e: &AuditEvent, p: &ResidencyPin, people: &HashSet<String>, owners: &mut HashMap<String, Option<String>>) -> bool {
     let d = &e.details;
-    if !d["residency"]["regions"].as_array().is_some_and(|r| r.iter().any(|r| r.as_str() == Some(p.region.as_str()))) {
+    if !has_region(&d["residency"]["regions"], &p.region) {
         return false;
+    }
+    if d["residency"]["people"].is_array() {
+        return carried(d, &d["residency"]["people"], people);
     }
     if d["forUser"].as_str().is_some_and(|u| people.contains(u)) {
         return true;
@@ -283,11 +306,19 @@ pub fn markdown(r: &Value) -> String {
     }
     list(&mut out, "\nNot covered by the pin", &r["notCovered"], "");
     out += &format!(
-        "---\n\nDigest: `{}`\n\nThe SHA-256 of the JSON report ({}) without its `digest`, keys sorted, no spaces: `jq -cjS 'del(.digest)' report.json | sha256sum`.\n",
+        "---\n\nDigest: `{}`\n\nThe SHA-256 of the JSON report ({}) below without its `digest`, keys sorted, no spaces. To check it, save the JSON as `report.json` and run `jq -cjS 'del(.digest)' report.json | sha256sum`.\n\n## The JSON report\n\n",
         c(&r["digest"]),
         FORMAT
     );
+    let json = serde_json::to_string_pretty(r).unwrap_or_default();
+    let fence = "`".repeat(longest_backtick_run(&json).max(2) + 1);
+    out += &format!("{fence}json\n{json}\n{fence}\n");
     out
+}
+
+/// The longest run of backticks in `s`, so a fence around it is longer.
+fn longest_backtick_run(s: &str) -> usize {
+    s.split(|c| c != '`').map(str::len).max().unwrap_or(0)
 }
 
 /// `GET /api/users/{key}/residency/report[?from=&to=&format=markdown]`: the report on
@@ -377,5 +408,17 @@ mod tests {
         assert_eq!(cell(&json!("a|b\nc")), "a\\|b c");
         assert_eq!(cell(&Value::Null), "-");
         assert_eq!(cell(&json!(3)), "3");
+    }
+
+    #[test]
+    fn the_markdown_carries_the_json_it_seals_in_a_fence_nothing_inside_can_close() {
+        let mut r = json!({ "subject": { "name": "a ```` b" }, "notCovered": [] });
+        r["digest"] = json!(digest(&r));
+        let md = markdown(&r);
+        let start = md.find("`````json\n").expect(&md) + "`````json\n".len();
+        let end = start + md[start..].find("\n`````\n").expect(&md);
+        let back: Value = serde_json::from_str(&md[start..end]).unwrap();
+        assert_eq!(back, r);
+        assert_eq!(digest(&back), r["digest"].as_str().unwrap());
     }
 }

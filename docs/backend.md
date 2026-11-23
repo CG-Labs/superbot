@@ -315,7 +315,7 @@ Each user is on a **tier** (a plan). A tier lists the harness and model **routes
   - a run waiting for a slot when someone it carries is pinned to a region its route wasn't held to is refused the same way (`whileQueued: true`) when its turn comes.
 
   `GET /api/regions` and the startup log warn about pinned people whose plan has no route in their region, and about `regions` that aren't in `MACHINE_REGIONS`.
-- **Audit**: `harness.invoked` records the tier and route, with `fallback` and `fallbackSkipped`, and for a held run `residency` (`regions`, `fallbackOutsideRegion`, `insteadOf`); refusals are `bot.run_refused` with reason `tier_harness`, `tier_limit`, `tier_token_limit`, `provider_key_missing`, or `residency_pinned`.
+- **Audit**: `harness.invoked` records the tier and route, with `fallback` and `fallbackSkipped`, and for a held run `residency` (`regions`, `people` it carried, `fallbackOutsideRegion`, `insteadOf`); refusals are `bot.run_refused` with reason `tier_harness`, `tier_limit`, `tier_token_limit`, `provider_key_missing`, or `residency_pinned`.
 
 ### Usage and token metering
 

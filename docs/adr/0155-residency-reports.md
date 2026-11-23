@@ -28,8 +28,8 @@ A pin holds a tenant's machines, backups and model calls to a region, and audits
 - **Region**: whether it is offered, the Incus hosts in it, and whether off-host backups have a store there.
 - **Activity in the period**, from the audit log:
   - pin changes on the subject: pinned, renewed, unpinned (with the reason), refused;
-  - refusals the pin caused, counted by event and kind: `machine.residency_refused` (by `action`), `bot.run_refused` with reason `residency_pinned` (run, or pinned while queued), and region changes, joins and team deletes refused as `residency_pinned`. A refusal counts when it is on the subject, names the pin among a run's pins, or is about one of its people in its region;
-  - runs held to in-region routes: `harness.invoked` with `residency.regions` including the region, for one of its people's Bots or asked for by one of them;
+  - refusals the pin caused, counted by event and kind: `machine.residency_refused` (by `action`), `bot.run_refused` with reason `residency_pinned` (run, or pinned while queued), and region changes, joins and team deletes refused as `residency_pinned`. A refusal counts when it is on the subject, names the pin among a run's pins, or is about one of its people in its region. A run refusal also counts when its `pinnedRegions` include the region and it carried one of the pin's people, whichever pin it named: a member's own pin and their team's agree on the region, and the run names only the team's;
+  - runs held to in-region routes: `harness.invoked` with `residency.regions` including the region and `residency.people` (the people the run carried, now recorded on held runs and on residency run refusals) including one of the pin's people. Counting by who was recorded at the time keeps past counts fixed when a Bot is deleted or handed over. Runs recorded before this fall back to the asker and the Bot's owner now;
   - `truncated` when the period has more matching events than one report reads (100,000).
 - **Not covered**: botd's own database and server backups, what Bots' tools send, other subprocessors, and people who have left a pinned team.
 
@@ -43,7 +43,7 @@ The digest seals the document, not the state: `generatedAt` is inside it, so two
 
 ### Formats
 
-JSON by default. `?format=markdown` gives a readable document (an attachment with a dated name) with tables per person and per refusal, and the digest of the JSON it was made from at the end. `botctl user|team residency <key> report [--from <when>] [--to <when>] [--json] [-o <file>]` prints or saves either; Markdown unless `--json`.
+JSON by default. `?format=markdown` gives a readable document (an attachment with a dated name) with tables per person and per refusal, then the digest and the exact JSON it seals, in a fence no value inside can close, so the customer can check a Markdown report too. `botctl user|team residency <key> report [--from <when>] [--to <when>] [--json] [-o <file>]` prints or saves either; Markdown unless `--json`.
 
 ### What it doesn't do
 
@@ -59,8 +59,9 @@ JSON by default. `?format=markdown` gives a readable document (an attachment wit
 
 ## Tests
 
-- Unit (`residency_report.rs`): the digest is over sorted, compact JSON without itself; periods (default, end of day, never past now, at most 400 days, bad input); Markdown table cells.
+- Unit (`residency_report.rs`): the digest is over sorted, compact JSON without itself; periods (default, end of day, never past now, at most 400 days, bad input); Markdown table cells; the JSON in the Markdown reads back with the same digest, even with backticks in a name.
+- The route tests (`residency_routes_http_tests.rs`) check that held runs and residency run refusals record `people`.
 - End to end (`residency_report_http_tests.rs`), on the real router with the Incus and S3 stand-ins and the fake Linode:
-  - a pinned user's report: 404 before the pin, 403 for a member; machine, host and backups in the region; the open plan's route warning; the pin's change, a refused move, a refused region change and a refused run counted, another pin's refusal and a run held elsewhere not; one held run; the digest checks and is audited; Markdown carries the reference, a refusal row and the digest; a period before the pin is empty; bad format and periods refused; a backup in another region's store turns the status to `data_outside`;
+  - a pinned user's report: 404 before the pin, 403 for a member; machine, host and backups in the region; the open plan's route warning; the pin's change, a refused move, a refused region change, a refused run naming her pin and one naming an agreeing team pin that carried her counted, another pin's refusal and runs held elsewhere or for others not; held runs counted by the people recorded, a deleted Bot's included; the digest checks and is audited; Markdown carries the reference, a refusal row, the digest and the JSON it seals; a period before the pin is empty; bad format and periods refused; a backup in another region's store turns the status to `data_outside`;
   - a team's report covers both members, counts the refused team delete and region change, and a member's own report points to the team's.
 - botctl (`residency_report_commands`).
