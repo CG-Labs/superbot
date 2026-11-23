@@ -306,7 +306,7 @@ fn record_update(app: &AppState, c: &Caller, before: &ScimRoleGroup, after: &Sci
         return;
     }
     app.db.record(&c.who.event("scim.group_updated").target("scim_role_group", &after.id).details(json!({
-        "tenant": after.tenant, "kind": "role", "roleGroup": after.id, "changes": changes, "added": moved.added, "removed": moved.removed, "granted": moved.granted, "revoked": moved.revoked,
+        "tenant": after.tenant, "kind": "role", "roleGroup": after.id, "scope": after.scope, "changes": changes, "added": moved.added, "removed": moved.removed, "granted": moved.granted, "revoked": moved.revoked,
     })));
 }
 
@@ -358,7 +358,7 @@ async fn adopt(app: &AppState, a: &Auth, c: &Caller, base: &str, waiting: &ScimR
     let g = app.db.save_scim_role_group(&waiting.id, external_id.as_deref(), &d.display_name, true).map_err(write_error)?;
     let role = app.db.custom_role(&g.role_id);
     app.db.record(&c.who.event("scim.role_group_adopted").target("scim_role_group", &g.id).details(json!({
-        "tenant": tenant, "roleGroup": g.id, "externalId": g.external_id, "displayName": g.display_name, "role": role_ref(role.as_ref()), "declaredBy": g.created_by,
+        "tenant": tenant, "roleGroup": g.id, "scope": g.scope, "externalId": g.external_id, "displayName": g.display_name, "role": role_ref(role.as_ref()), "declaredBy": g.created_by,
     })));
     let moved = change_members(app, a, c, &g, &[], &new).await;
     record_update(app, c, waiting, &g, &moved);
@@ -416,7 +416,7 @@ pub(super) async fn delete(app: &AppState, a: &Auth, c: &Caller, g: &ScimRoleGro
         reoffer(app, a, &c.who, id, &g.scope).await;
     }
     app.db.record(&c.who.event("scim.group_deleted").target("scim_role_group", &g.id).details(json!({
-        "tenant": g.tenant, "kind": "role", "roleGroup": g.id, "externalId": g.external_id, "displayName": g.display_name, "removed": members, "revoked": revoked,
+        "tenant": g.tenant, "kind": "role", "roleGroup": g.id, "scope": g.scope, "externalId": g.external_id, "displayName": g.display_name, "removed": members, "revoked": revoked,
     })));
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -683,7 +683,7 @@ pub async fn update_api(State(app): State<AppState>, Extension(a): Extension<Arc
     if changed || !revoked.is_empty() || !granted.is_empty() {
         let from = app.db.custom_role(&before.role_id);
         app.db.record(&by.event("scim.role_group_changed").target("scim_role_group", &g.id).details(json!({
-            "tenant": g.tenant, "roleGroup": g.id, "displayName": g.display_name, "from": role_ref(from.as_ref()), "to": role_ref(Some(&role)), "revoked": revoked, "granted": granted,
+            "tenant": g.tenant, "roleGroup": g.id, "scope": g.scope, "displayName": g.display_name, "from": role_ref(from.as_ref()), "to": role_ref(Some(&role)), "revoked": revoked, "granted": granted,
         })));
     }
     let mut out = view(&app, &g);
@@ -714,7 +714,7 @@ pub async fn delete_api(State(app): State<AppState>, Extension(a): Extension<Arc
     }
     let pushed = g.provisioned_at.is_some();
     app.db.record(&by.event("scim.role_group_removed").target("scim_role_group", &g.id).details(json!({
-        "tenant": g.tenant, "roleGroup": g.id, "displayName": g.display_name, "externalId": g.external_id, "role": role_ref(app.db.custom_role(&g.role_id).as_ref()), "revoked": revoked, "wasPushed": pushed,
+        "tenant": g.tenant, "roleGroup": g.id, "scope": g.scope, "displayName": g.display_name, "externalId": g.external_id, "role": role_ref(app.db.custom_role(&g.role_id).as_ref()), "revoked": revoked, "wasPushed": pushed,
     })));
     Ok(Json(json!({ "ok": true, "revoked": revoked, "wasPushed": pushed })))
 }

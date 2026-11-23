@@ -312,3 +312,59 @@ async fn leaving_a_mapped_team_hands_on_to_an_org_role_group() {
     assert_eq!(scim(port, &t, "DELETE", &format!("{GROUPS}/{eng}"), Value::Null).await.0, 204);
     assert_eq!(org_role(&app, &lee), Some(reader.clone()));
 }
+
+#[tokio::test]
+async fn a_retried_join_finishes_what_a_restart_cut_short() {
+    let (port, app, admin) = serve().await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "entra" })).await;
+    let nia = person(port, &t, "nia@example.com").await;
+    let oli = person(port, &t, "oli@example.com").await;
+    let eng = push(port, &t, "Eng", &[]).await;
+    let lead = role(port, &admin, "Lead", &["users.manage"]).await;
+    let audit = role(port, &admin, "Auditor", &["audit.view"]).await;
+    let (code, v) = json_call(port, "POST", "/api/scim/role-mappings", &admin, &json!({ "team": eng, "role": audit, "scope": "org" }).to_string()).await;
+    assert_eq!(code, 201, "{v}");
+    declared(port, &admin, "entra", "Leads", &lead).await;
+    push(port, &t, "Leads", &[&nia, &oli]).await;
+
+    // A join saved before the restart, its roles not yet offered.
+    for id in [&nia, &oli] {
+        assert!(app.db.add_team_member(&eng, id, teams::MEMBER, None));
+    }
+    assert_eq!((team_role(&app, &nia), org_role(&app, &nia)), (None, None));
+    let skips = events(port, &admin, "action=scim.role_skipped").await.len();
+
+    // Entra retries its PATCH: the join finishes, quietly.
+    members(port, &t, &eng, "Add", &[&nia]).await;
+    assert_eq!((team_role(&app, &nia), org_role(&app, &nia)), (Some((eng.clone(), lead.clone())), Some(audit.clone())));
+    assert_eq!(team_role(&app, &oli), None, "only who the request names");
+    // Okta's PUT names everyone.
+    let body = json!({ "displayName": "Eng", "members": [{ "value": nia }, { "value": oli }] });
+    assert_eq!(scim(port, &t, "PUT", &format!("{GROUPS}/{eng}"), body.clone()).await.0, 200);
+    assert_eq!((team_role(&app, &oli), org_role(&app, &oli)), (Some((eng.clone(), lead.clone())), Some(audit.clone())));
+    assert_eq!(scim(port, &t, "PUT", &format!("{GROUPS}/{eng}"), body).await.0, 200);
+    assert_eq!(events(port, &admin, "action=scim.role_skipped").await.len(), skips, "a retry audits no skips");
+    assert_eq!(events(port, &admin, "action=role.assigned").await.iter().filter(|e| e["details"]["user"] == oli.as_str()).count(), 2, "given once each");
+}
+
+#[tokio::test]
+async fn role_group_events_say_their_scope() {
+    let (port, _, admin) = serve().await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    let pam = person(port, &t, "pam@example.com").await;
+    push(port, &t, "Eng", &[&pam]).await;
+    let lead = role(port, &admin, "Lead", &["users.manage"]).await;
+    let biller = role(port, &admin, "Biller", &["billing.manage"]).await;
+    let gid = declared(port, &admin, "okta", "Leads", &lead).await;
+    push(port, &t, "Leads", &[&pam]).await;
+    let body = json!({ "schemas": [PATCH_OP], "Operations": [{ "op": "replace", "path": "displayName", "value": "Team Leads" }] });
+    assert_eq!(scim(port, &t, "PATCH", &format!("{GROUPS}/{gid}"), body).await.0, 204);
+    assert_eq!(json_call(port, "PATCH", &format!("{ROLE_GROUPS}/{gid}"), &admin, &json!({ "role": biller }).to_string()).await.0, 200);
+    assert_eq!(scim(port, &t, "DELETE", &format!("{GROUPS}/{gid}"), Value::Null).await.0, 204);
+    assert_eq!(json_call(port, "DELETE", &format!("{ROLE_GROUPS}/{gid}"), &admin, "").await.0, 200);
+    for action in ["scim.role_group_adopted", "scim.group_updated", "scim.role_group_changed", "scim.group_deleted", "scim.role_group_removed"] {
+        let all = events(port, &admin, &format!("action={action}")).await;
+        let e = all.iter().find(|e| e["details"]["roleGroup"] == gid.as_str()).unwrap_or_else(|| panic!("{action}: {all:?}"));
+        assert_eq!(e["details"]["scope"], "team", "{action}: {e}");
+    }
+}

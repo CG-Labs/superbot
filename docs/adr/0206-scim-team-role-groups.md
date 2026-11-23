@@ -28,7 +28,7 @@ A team role group follows a team mapping's rules (ADR 0138):
 
 ### Following the person
 
-- **Onto a team.** When SCIM puts someone on a team (after the team group's mappings), the team role groups they're in are offered, without auditing skips again. When an admin links a team to the tenant, its members are offered them.
+- **Onto a team.** When SCIM puts someone on a team (after the team group's mappings), the team role groups they're in are offered, without auditing skips again. When an admin links a team to the tenant, its members are offered them. A join is saved before the machine work it waits on, so a restart there leaves the person on the team without those offers; the IdP's retry names them again, and a PATCH or PUT naming someone already on the team offers them the team group's mappings and their team role groups again, quietly (this also closes the same gap for ADR 0138's mappings).
 - **Off a team.** Leaving a team, by any path, takes the team role with the membership; the grant goes with it (`left_team`). Moving to another of the tenant's teams offers it there.
 - **Team unlinked.** An admin unlinking the team takes back the team roles the tenant's team role groups gave in it (`team_unlinked`): the team isn't the tenant's any more.
 
