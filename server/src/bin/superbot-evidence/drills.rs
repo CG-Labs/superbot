@@ -223,8 +223,12 @@ pub fn execution(d: &Drill, run: &Value, job: &Value, artifacts: &[Value], now_m
     })
 }
 
+/// The runs and whether the listing was truncated, or the status and message GitHub
+/// refused the listing with.
+type Runs = Result<(Vec<Value>, bool), (u16, String)>;
+
 /// Runs of `file` on `branch` created in the period, oldest first.
-fn runs(api: &mut dyn Api, repo: &str, file: &str, branch: &str, p: &Period) -> Result<Result<(Vec<Value>, bool), (u16, String)>, Failure> {
+fn runs(api: &mut dyn Api, repo: &str, file: &str, branch: &str, p: &Period) -> Result<Runs, Failure> {
     let last = p.to.pred_opt().unwrap_or(p.to);
     let created = format!("{}T00:00:00Z..{last}T23:59:59Z", p.from);
     let first = format!("/repos/{repo}/actions/workflows/{file}/runs?branch={}&created={}&exclude_pull_requests=true&per_page=100", enc(branch), enc(&created));
@@ -415,7 +419,7 @@ fn ci_file(c: Option<&Collected>) -> Value {
         "collected": true,
         "repository": c.repo["fullName"],
         "branch": c.branch,
-        "basis": "a drill's run counts when its workflow ran on the branch in the period and the job attempted the drill (jobs that skip the drill's timing step, such as Incus versions botd refuses, don't, and are counted per workflow); it passed when its drill step succeeded, which each drill allows only within its objective; seconds is the step's duration, which includes setting up, so it is at most the restore time the drill checks",
+        "basis": "a drill's run counts when its workflow ran on the branch in the period and the job attempted the drill (jobs that skip the drill's timing step, such as Incus versions botd refuses, don't, and are counted per workflow); it passed when its drill step succeeded, which each drill allows only within its objective; seconds is the step's duration, which includes setting up, so it is at least the restore time the drill checks",
         "workflows": sources,
         "summary": { "runs": c.executions.len(), "byDrill": by },
         "exceptions": exceptions,
