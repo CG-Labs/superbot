@@ -51,7 +51,7 @@ elf_arch() {
 # The newest GLIBC_2.N symbol version FILE asks for, or nothing.
 glibc_needed() { { grep -aoE 'GLIBC_2\.[0-9]+' "$1" || true; } | sort -uV | tail -n 1 | sed 's/^GLIBC_//'; }
 
-version_le() { [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" == "$1" ]]; }
+version_le() { local v; mapfile -t v < <(printf '%s\n' "$1" "$2" | sort -V); [[ "${v[0]}" == "$1" ]]; }
 
 # cosign arguments for a bundle's signature (verify-blob) and an image's (verify).
 blob_check_args() {
@@ -152,8 +152,9 @@ cmd_online() {
     log "$(basename "$b"): SHA-256 $got, signature verified"
     "$DIR/offline-bundle.sh" verify "$(bundle_path "$STAGE" "$VERSION" "$a")" --sha256 "$got" >"$WORK/verify.log" 2>&1 \
       || { cat "$WORK/verify.log" >&2; die "$(basename "$b") isn't a good bundle"; }
-    [[ -n "$KEY" ]] || grep -Fq 'Bundle signature verified' "$WORK/verify.log" \
-      || { cat "$WORK/verify.log" >&2; die "The installer didn't check $(basename "$b")'s signature"; }
+    if [[ -z "$KEY" ]] && ! grep -Fq 'Bundle signature verified' "$WORK/verify.log"; then
+      cat "$WORK/verify.log" >&2; die "The installer didn't check $(basename "$b")'s signature"
+    fi
 
     # verify checked every file against SHA256SUMS; these are the same bytes, read once more.
     extracted="$WORK/x-$a"
@@ -261,8 +262,9 @@ cmd_offline() {
     fi
     SIGSTORE_TRUSTED_ROOT=$TRUSTED_ROOT "$DIR/offline-bundle.sh" verify "$b" --sha256 "$sum" >"$WORK/verify.log" 2>&1 \
       || { cat "$WORK/verify.log" >&2; die "$(basename "$b") doesn't verify offline"; }
-    [[ -n "$KEY" ]] || grep -Fq 'Bundle signature verified' "$WORK/verify.log" \
-      || { cat "$WORK/verify.log" >&2; die "The installer didn't check $(basename "$b")'s signature offline"; }
+    if [[ -z "$KEY" ]] && ! grep -Fq 'Bundle signature verified' "$WORK/verify.log"; then
+      cat "$WORK/verify.log" >&2; die "The installer didn't check $(basename "$b")'s signature offline"
+    fi
     log "$(basename "$b"): signature and every file verified with no network"
     push+=("$b") sums+=(--sha256 "$sum")
   done
