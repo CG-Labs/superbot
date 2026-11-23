@@ -9,10 +9,12 @@
 //! read again at each login. botd logs in again before the token's lease runs out and
 //! once more when Vault refuses it, in `VAULT_AUTH_NAMESPACE` if the auth method is
 //! mounted somewhere other than the secrets. Requests run on a runtime of their own
-//! (`http::Worker`).
+//! (`http::Worker`). It is also the `leases::Issuer` of `VAULT_RUN_CREDENTIALS`: a new
+//! lease from a dynamic secrets engine for each run, revoked when the run ends (ADR 0185).
 
 use super::external::{self, Provider, Scope};
 use super::http::Worker;
+use super::leases::{Field, Issuer, Lease};
 use super::{Error, SecretStore};
 use crate::audit::{Event, Outcome};
 use base64::Engine;
@@ -199,9 +201,11 @@ struct Inner {
     token: Mutex<Option<Token>>,
 }
 
+/// Clones share one client, token and runtime: the store and the run credentials' issuer.
+#[derive(Clone)]
 pub struct Vault {
     inner: Arc<Inner>,
-    worker: Worker,
+    worker: Arc<Worker>,
 }
 
 fn unavailable(what: &str, e: impl std::fmt::Display) -> Error {
@@ -238,7 +242,7 @@ fn read_jwt(method: JwtMethod, file: &std::path::Path) -> Result<Zeroizing<Strin
 impl Vault {
     pub fn new(cfg: Config) -> Result<Vault, String> {
         let http = super::http::client("Vault", cfg.ca.as_deref().map(|pem| ("VAULT_CACERT", pem)), false)?;
-        Ok(Vault { inner: Arc::new(Inner { cfg, http, token: Mutex::new(None) }), worker: Worker::new("Vault", "vault")? })
+        Ok(Vault { inner: Arc::new(Inner { cfg, http, token: Mutex::new(None) }), worker: Arc::new(Worker::new("Vault", "vault")?) })
     }
 
     /// Runs `f` on Vault's runtime and waits for it (`http::Worker::run`).
@@ -416,6 +420,67 @@ impl Inner {
         let keys = body["data"]["keys"].as_array().ok_or_else(|| Error::Unavailable(format!("Vault: listing {path} gave no keys")))?;
         Ok(keys.iter().filter_map(Value::as_str).filter(|k| !k.ends_with('/')).map(String::from).collect())
     }
+
+    /// A new lease from a dynamic secrets engine: `GET <path>` (ADR 0185).
+    async fn issue(&self, path: &str, fields: &[String]) -> Result<Lease, Error> {
+        let (_, body) = self.get(path).await?;
+        let body = body.ok_or_else(|| Error::Unavailable(format!("Vault: nothing at {path}; is the secrets engine mounted there, with that role?")))?;
+        let Some(id) = body["lease_id"].as_str().filter(|s| !s.is_empty()) else {
+            return Err(Error::Unavailable(format!("Vault: {path} gave no lease; VAULT_RUN_CREDENTIALS is for dynamic secrets, keep static ones in the bots folder")));
+        };
+        let data = &body["data"];
+        let fields = fields
+            .iter()
+            .map(|f| match data.get(f.as_str()) {
+                None => Field::Missing,
+                Some(Value::Null) => Field::Empty,
+                Some(Value::String(s)) if s.is_empty() => Field::Empty,
+                Some(Value::String(s)) => Field::Value(Zeroizing::new(s.clone())),
+                Some(Value::Number(n)) => Field::Value(Zeroizing::new(n.to_string())),
+                Some(_) => Field::Missing,
+            })
+            .collect();
+        Ok(Lease { id: id.to_string(), ttl: body["lease_duration"].as_u64().unwrap_or(0), renewable: body["renewable"].as_bool().unwrap_or(false), fields })
+    }
+
+    /// `PUT sys/leases/revoke/<lease id>`, so botd's policy can allow revoking only the
+    /// leases of the paths it reads. When Vault refuses the token, gets a new one and asks once more.
+    async fn revoke(&self, lease_id: &str) -> Result<(), Error> {
+        let ok = !lease_id.is_empty() && lease_id.split('/').all(|p| !p.is_empty() && p != "." && p != ".." && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)));
+        if !ok {
+            return Err(Error::Unavailable("Vault: a lease id that can't be part of a path".into()));
+        }
+        let path = format!("sys/leases/revoke/{lease_id}");
+        for fresh in [false, true] {
+            let token = self.token(fresh).await?;
+            let res = self.request(reqwest::Method::PUT, &path).header("X-Vault-Token", token.as_str()).send().await.map_err(|e| unavailable("sys/leases/revoke", e))?;
+            let status = res.status();
+            if status == reqwest::StatusCode::FORBIDDEN && !fresh {
+                continue;
+            }
+            if !status.is_success() {
+                return Err(Error::Unavailable(format!("Vault answered {status} for sys/leases/revoke")));
+            }
+            return Ok(());
+        }
+        unreachable!("the second pass returns")
+    }
+}
+
+impl Issuer for Vault {
+    fn kind(&self) -> &'static str {
+        "vault"
+    }
+
+    fn issue(&self, path: &str, fields: &[String]) -> Result<Lease, Error> {
+        let (path, fields) = (path.to_string(), fields.to_vec());
+        self.run(move |i| async move { i.issue(&path, &fields).await })
+    }
+
+    fn revoke(&self, lease_id: &str) -> Result<(), Error> {
+        let lease_id = lease_id.to_string();
+        self.run(move |i| async move { i.revoke(&lease_id).await })
+    }
 }
 
 impl Provider for Vault {
@@ -485,6 +550,10 @@ pub(crate) mod tests {
         pub login_namespaces: Mutex<Vec<String>>,
         lease: AtomicUsize,
         delay_ms: AtomicUsize,
+        /// `<engine>/creds/<role>` → the fields each lease from it has.
+        creds: Mutex<HashMap<String, Value>>,
+        issued: AtomicUsize,
+        pub revoked: Mutex<Vec<String>>,
     }
 
     pub(crate) type F = Arc<Fake>;
@@ -575,6 +644,28 @@ pub(crate) mod tests {
         (StatusCode::OK, Json(json!({ "auth": { "client_token": token, "lease_duration": f.lease.load(Ordering::SeqCst), "renewable": true } })))
     }
 
+    /// A dynamic secrets engine: each GET makes a new lease, its values numbered.
+    async fn creds(State(f): State<F>, Path((engine, role)): Path<(String, String)>, h: HeaderMap) -> (StatusCode, Json<Value>) {
+        if let Err(e) = check(&f, &h) {
+            return e;
+        }
+        let path = format!("{engine}/creds/{role}");
+        let Some(fields) = f.creds.lock().unwrap().get(&path).cloned() else {
+            return (StatusCode::NOT_FOUND, Json(json!({ "errors": [] })));
+        };
+        let n = f.issued.fetch_add(1, Ordering::SeqCst);
+        let data: serde_json::Map<String, Value> = fields.as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().map_or(Value::Null, |v| json!(format!("{v}-{n}"))))).collect();
+        (StatusCode::OK, Json(json!({ "lease_id": format!("{path}/l{n}"), "lease_duration": 900, "renewable": true, "data": data })))
+    }
+
+    async fn revoke(State(f): State<F>, Path(lease): Path<String>, h: HeaderMap) -> (StatusCode, Json<Value>) {
+        if let Err(e) = check(&f, &h) {
+            return e;
+        }
+        f.revoked.lock().unwrap().push(lease);
+        (StatusCode::NO_CONTENT, Json(json!({})))
+    }
+
     /// Starts the stand-in on its own thread and runtime; returns its address.
     pub(crate) fn stand_in() -> (String, F) {
         let f = F::default();
@@ -583,6 +674,8 @@ pub(crate) mod tests {
             .route("/v1/secret/data/{*rest}", axum::routing::get(data))
             .route("/v1/secret/metadata/{*rest}", axum::routing::get(metadata))
             .route("/v1/auth/{mount}/login", axum::routing::post(login))
+            .route("/v1/{engine}/creds/{role}", axum::routing::get(creds))
+            .route("/v1/sys/leases/revoke/{*lease}", axum::routing::put(revoke))
             .with_state(Arc::clone(&f));
         (super::super::http::tests::serve(app), f)
     }
@@ -654,6 +747,58 @@ pub(crate) mod tests {
         put(&f, "users/ua10/OPENAI_API_KEY", "not-ua1s");
         let x = external::tests::users_on(vault(&url, &[("VAULT_TOKEN", "hvs.users")], Duration::from_secs(60)));
         external::tests::reads_users_folders(&x, &value);
+    }
+
+    #[test]
+    fn runs_get_short_lived_credentials_that_are_revoked_when_they_end() {
+        let (url, f) = stand_in();
+        f.tokens.lock().unwrap().push("hvs.leases".into());
+        f.creds.lock().unwrap().insert("aws/creds/bots".into(), json!({ "access_key": "AKIAvault", "secret_key": "vault-aws-secret-4c3d", "security_token": null }));
+        f.creds.lock().unwrap().insert("database/creds/u-ulv1".into(), json!({ "username": "v-ulv1", "password": "vault-db-pass-4c3d" }));
+        put(&f, "bots/STATIC_TOKEN", "static-kv-value-1");
+        let creds = "aws/creds/bots CLOUD_KEY_ID=access_key CLOUD_SECRET_KEY=secret_key CLOUD_SESSION_TOKEN=security_token; database/creds/u-{owner} PGUSER=username PGPASSWORD=password";
+        let pairs = [("SECRETS_BACKEND", "vault"), ("VAULT_ADDR", url.as_str()), ("VAULT_TOKEN", "hvs.leases"), ("VAULT_RUN_CREDENTIALS", creds)];
+        let x = external::from_env(&settings(&pairs), &EnvStore::fixed(&pairs)).unwrap().unwrap();
+        let rc = x.run_credentials().expect("set");
+        assert!(x.describe().contains("short-lived credentials for each run from aws/creds/bots, database/creds/u-{owner}"), "{}", x.describe());
+
+        let (env, leases) = rc.issue("ulv1", "blv1", true).unwrap();
+        let mut env: Vec<_> = env.into_iter().map(|(k, v)| (k, v.expose().to_string())).collect();
+        env.sort();
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(env, [pair("CLOUD_KEY_ID", "AKIAvault-0"), pair("CLOUD_SECRET_KEY", "vault-aws-secret-4c3d-0"), pair("PGPASSWORD", "vault-db-pass-4c3d-1"), pair("PGUSER", "v-ulv1-1")]);
+        assert_eq!(leases.len(), 2);
+        drop(leases);
+        super::super::leases::tests::wait_for(|| f.revoked.lock().unwrap().len() == 2);
+        assert_eq!(*f.revoked.lock().unwrap(), ["aws/creds/bots/l0", "database/creds/u-ulv1/l1"]);
+
+        // Vault refuses botd's token: the revoke fails and is audited, and the lease ends at its TTL.
+        let (_, l) = rc.issue("ulv1", "blv1", false).unwrap();
+        assert_eq!(l.len(), 1, "a run for someone else: the shared role only");
+        f.tokens.lock().unwrap().clear();
+        drop(l);
+        super::super::leases::tests::wait_for(|| external::tests::audited("aws/creds/bots").iter().any(|e| e.details["leaseId"] == "aws/creds/bots/l2" && e.action == "secret.lease_revoked"));
+        assert!(external::tests::audited("aws/creds/bots").iter().any(|e| e.details["leaseId"] == "aws/creds/bots/l2" && e.outcome == Outcome::Failure), "a token Vault won't take: the lease is left to its TTL, and audited");
+        f.tokens.lock().unwrap().push("hvs.leases".into());
+
+        // A KV path, or one with no engine, isn't a lease.
+        for (path, err) in [("secret/data/superbot/bots/STATIC_TOKEN", "gave no lease"), ("nope/creds/r", "nothing at nope/creds/r")] {
+            let pairs = [("SECRETS_BACKEND", "vault"), ("VAULT_ADDR", url.as_str()), ("VAULT_TOKEN", "hvs.leases"), ("VAULT_RUN_CREDENTIALS", &format!("{path} X_TOKEN=value"))];
+            let x = external::from_env(&settings(&pairs), &EnvStore::fixed(&pairs)).unwrap().unwrap();
+            let e = x.run_credentials().unwrap().issue("ulv1", "blv1", true).err().unwrap().to_string();
+            assert!(e.contains(err), "{path}: {e}");
+        }
+        assert!(external::from_env(&settings(&[pairs[0], pairs[1], pairs[2], ("VAULT_RUN_CREDENTIALS", "aws/creds/bots PATH=x")]), &EnvStore::fixed(&pairs)).err().unwrap().contains("VAULT_RUN_CREDENTIALS: PATH"));
+        assert!(external::from_env(&settings(&pairs[..3]), &EnvStore::fixed(&pairs)).unwrap().unwrap().run_credentials().is_none(), "off unless set");
+        let v = Vault::new(Config::from_env(&settings(&pairs), &EnvStore::fixed(&pairs)).unwrap()).unwrap();
+        for bad in ["", "../sys/x", "a//b", "a b"] {
+            assert!(Issuer::revoke(&v, bad).is_err(), "{bad:?} never reaches a URL");
+        }
+        let d = external::tests::diagnose_for(&x);
+        assert_eq!(d["runCredentials"], json!(["aws/creds/bots", "database/creds/u-{owner}"]));
+        for v in ["AKIAvault-2", "vault-aws-secret-4c3d-2"] {
+            redact::forget(v);
+        }
     }
 
     #[test]

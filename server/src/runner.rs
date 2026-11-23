@@ -1103,6 +1103,16 @@ impl App {
             },
             Place::Here => space,
         };
+        // Short-lived credentials, made last so no wait outlives them, and revoked when
+        // `_leases` drops as the run ends, however it ends (ADR 0185).
+        let (space, _leases) = match crate::secrets::leases::for_run(&bot.owner_id, &bot.id, for_other.is_none()) {
+            Ok((creds, leases)) => {
+                let (cwd, mut env) = space;
+                env.extend(creds.into_iter().map(|(k, v)| (k, v.expose().to_string())));
+                ((cwd, env), leases)
+            }
+            Err(e) => return self.refuse_for_secrets(&bot, msg, &by, &e, Some(&period.key)),
+        };
         let mut spot = self.spot(&bot, bot_dir.clone(), space, place, for_other.as_deref());
         spot.for_other = for_other.clone();
         // With per-user accounts the harness keeps its state in its account's folder, and

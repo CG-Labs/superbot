@@ -11,7 +11,7 @@ One KV v2 secret per name, with the value in the field `value`:
 | `secret/superbot/bots/<NAME>` | Server-wide keys for Bots: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`, ... | Yes, at the start of each run |
 | `secret/superbot/server/<NAME>` | botd's own: `LINODE_TOKEN`, `INCUS_CLIENT_KEY`, `SSO_<ID>_CLIENT_SECRET`, `SMTP_PASSWORD`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `TURNSTILE_SECRET`, `METRICS_TOKEN`, `AUDIT_EXPORT_HEADERS`, backup store keys, ... | Never |
 
-A name in the wrong folder is ignored. `AUTH_PASSWORD`, `SUPERBOT_MASTER_KEY` and the Vault credentials stay in `.env`: botd needs them before it can reach Vault. Each user's own secrets can be in Vault too: see [each user's own secrets](#each-users-own-secrets).
+A name in the wrong folder is ignored. `AUTH_PASSWORD`, `SUPERBOT_MASTER_KEY` and the Vault credentials stay in `.env`: botd needs them before it can reach Vault. Each user's own secrets can be in Vault too: see [each user's own secrets](#each-users-own-secrets). Runs can also get credentials Vault makes for them alone: see [short-lived credentials for each run](#short-lived-credentials-for-each-run).
 
 Order: a value in botd's environment wins, then Vault, then the sealed store (`botctl secret set`). `botctl secrets` shows where each name comes from and what it shadows.
 
@@ -162,6 +162,44 @@ The policy above already covers `superbot/users/*`. Who may write each folder is
 - **When someone leaves**: deleting the user in botd drops what they saved in the app, not their Vault folder. Delete it with `vault kv metadata delete` for each name.
 
 `botctl secrets backend` and the startup line say whether user folders are on. They check only the shared folders.
+
+## Short-lived credentials for each run
+
+Off by default ([ADR 0185](../adr/0185-short-lived-credentials-per-run.md)). With `VAULT_RUN_CREDENTIALS`, botd asks one of Vault's dynamic secrets engines (AWS, database, GCP, Azure, ...) for a new credential as each run starts. The run gets it as environment variables, and botd revokes the lease when the run ends, however it ends. A key a Bot leaks stops working with the run.
+
+```sh
+vault secrets enable aws
+vault write aws/config/root access_key=... secret_key=... region=eu-west-2
+vault write aws/roles/bots credential_type=iam_user policy_arns=arn:aws:iam::aws:policy/ReadOnlyAccess \
+  default_ttl=75m max_ttl=75m
+
+vault secrets enable database
+vault write database/roles/u-u1a2b3c4d db_name=app default_ttl=75m max_ttl=75m \
+  creation_statements="CREATE ROLE \"{{name}}\" LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}'; GRANT app_read TO \"{{name}}\";"
+
+vault policy write superbot-runs - <<'EOF'
+path "aws/creds/bots"                       { capabilities = ["read"] }
+path "database/creds/u-*"                   { capabilities = ["read"] }
+path "sys/leases/revoke/aws/creds/bots/*"   { capabilities = ["update"] }
+path "sys/leases/revoke/database/creds/u-*" { capabilities = ["update"] }
+EOF
+```
+
+botd revokes with `sys/leases/revoke/<lease id>`, so the policy lets it revoke only leases from its own paths. Add `superbot-runs` to botd's role (`token_policies=superbot,superbot-runs`), then in `.env`:
+
+```sh
+VAULT_RUN_CREDENTIALS="aws/creds/bots AWS_ACCESS_KEY_ID=access_key AWS_SECRET_ACCESS_KEY=secret_key AWS_SESSION_TOKEN=security_token; database/creds/u-{owner} PGUSER=username PGPASSWORD=password"
+```
+
+- **Format**: entries separated by `;` or new lines. Each is a Vault path, then `NAME=field` pairs: the variable the run gets and the field of Vault's answer it comes from. At most 16 paths; each name once.
+- **`{owner}`** is the Bot owner's id (`botctl users`), so each user's Bots can get their own role. Those paths are read only for runs that get the owner's own secrets, not a teammate's run of an isolated shared Bot.
+- **Order**: these win over static secrets of the same name. A field that is null or empty (`security_token` for an IAM user) isn't set; a field that isn't in the answer refuses the run, as it is probably a typo.
+- **TTL**: botd revokes each lease when its run ends. If it can't (Vault down, botd stopped mid-run), the lease ends at the role's TTL. Set `default_ttl` a little over your longest run (`RUN_TIMEOUT_MINUTES`, 60 by default), not a day, and no shorter, or a credential can lapse mid-run.
+- **Fails closed**: if a lease can't be made, the run doesn't start (`bot.run_refused`, reason `secrets_unavailable`) and leases already made for it are revoked.
+- **Audit**: `botctl audit --action 'secret.lease_*'` shows each lease made (`secret.lease_issued`, with path, lease id, TTL and the variable names) and revoked (`secret.lease_revoked`), never a value. For a lease botd couldn't revoke, `vault lease revoke <lease id>` ends it now.
+- **Redaction**: the values are redacted from everything botd saves and shows while the lease lives, and forgotten once Vault has revoked it.
+
+botd doesn't make a lease at startup, so a wrong path or missing policy shows on the first run. The startup line and `botctl secrets backend` list the paths (`runCredentials`). Only `SECRETS_BACKEND=vault` reads the setting.
 
 ## Day to day
 
