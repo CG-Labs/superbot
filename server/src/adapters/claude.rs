@@ -49,7 +49,7 @@ const BASH_ENV: &str = "unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE
 /// the user's and the workspace's settings files, so a Bot can't send its calls elsewhere:
 /// the endpoint's URL, every other way Claude Code reaches a model off (a bearer token, a
 /// login's token, Bedrock, Vertex, Foundry), and the key kept from its Bash tool. Where
-/// its sandbox can start, so can its credential scrub, which keeps the key from hooks and
+/// the computer said its sandbox can start, so can its credential scrub, which keeps the key from hooks and
 /// MCP servers too; without bubblewrap Claude Code refuses to start with the scrub on. A
 /// run held to a data region also stops Claude Code's own traffic to Anthropic
 /// (telemetry, error reports, update and feature checks).
@@ -63,7 +63,7 @@ fn endpoint_env(e: &Endpoint, input: &RunInput) -> Vec<(&'static str, String)> {
         ("CLAUDE_CODE_USE_FOUNDRY", "0".into()),
         ("CLAUDE_ENV_FILE", bash_env_file(input).display().to_string()),
     ];
-    if input.sandbox.is_some() {
+    if input.sandbox.as_ref().is_some_and(|s| s.verified) {
         env.push(("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "1".into()));
     }
     if !input.held_to.is_empty() {

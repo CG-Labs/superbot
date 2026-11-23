@@ -112,6 +112,9 @@ pub struct Sandbox {
     /// Folders outside `cwd` the run writes to: its memory and facts files' folders and
     /// package caches. Each exists where the run happens.
     pub writable: Vec<PathBuf>,
+    /// The computer said it has what the sandbox needs. False on a machine agent from
+    /// before it said, where the sandbox may not start.
+    pub verified: bool,
 }
 
 /// `host:port` of botd's API as the run reaches it, for a sandbox that only lets
@@ -712,10 +715,15 @@ mod tests {
         assert_eq!((f.path.as_str(), f.body.as_str()), (job.env["CLAUDE_ENV_FILE"].as_str(), "unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN\n"));
         assert!(!job.env.contains_key("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"));
         let mut boxed = on_endpoint(&dir, "uk-claude", crate::tiers::Protocol::AnthropicMessages, "TIER_UK_KEY", false);
-        boxed.sandbox = Some(Sandbox { writable: Vec::new() });
+        boxed.sandbox = Some(Sandbox { writable: Vec::new(), verified: true });
         let job_boxed = job_for(get("claude").unwrap().as_mut(), &boxed, &mut Vec::new());
         assert_eq!(job_boxed.env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1", "where its sandbox starts, hooks and MCP servers don't get it either");
         assert_eq!(settings(&job_boxed)["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1");
+        // A machine agent too old to say what it has: the sandbox settings go, the scrub doesn't.
+        boxed.sandbox = Some(Sandbox { writable: Vec::new(), verified: false });
+        let job_unverified = job_for(get("claude").unwrap().as_mut(), &boxed, &mut Vec::new());
+        assert!(settings(&job_unverified)["sandbox"].is_object() && !job_unverified.env.contains_key("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"));
+        assert!(job_unverified.env.contains_key("CLAUDE_ENV_FILE"));
         // The same in flag settings, which outrank the Bot's own settings files.
         let s = settings(&job);
         assert_eq!(s["env"]["ANTHROPIC_BASE_URL"], "https://uk-claude.example/v1");
@@ -892,7 +900,7 @@ mod tests {
     fn sandboxed(dir: &std::path::Path) -> RunInput {
         let mut i = input(dir, None);
         i.env.insert("BOT_API".into(), "http://127.0.0.1:3000".into());
-        i.sandbox = Some(Sandbox { writable: vec!["/data/bots/b1".into(), "/home/superbot/.npm".into()] });
+        i.sandbox = Some(Sandbox { writable: vec!["/data/bots/b1".into(), "/home/superbot/.npm".into()], verified: true });
         i
     }
 

@@ -171,7 +171,8 @@ impl Spot {
         }
         writable.extend(self.caches.iter().cloned());
         // An older agent can't say; the settings do no harm where the sandbox can't start.
-        (Some(Sandbox { writable }), if self.sandbox_host.is_some() { "on" } else { "unverified" })
+        let verified = self.sandbox_host.is_some();
+        (Some(Sandbox { writable, verified }), if verified { "on" } else { "unverified" })
     }
 }
 
