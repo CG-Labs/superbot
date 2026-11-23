@@ -326,6 +326,7 @@ impl Report {
                 String::new(),
                 String::new(),
                 String::new(),
+                String::new(),
                 c(&self.digest),
             ];
             out.push_str(&cells.join(","));
@@ -379,6 +380,7 @@ impl Report {
                 c(&owner),
                 c(&words(&p["effective"])),
                 c(&tokens),
+                c(&words(&p["flags"])),
                 c(&self.digest),
             ];
             out.push_str(&cells.join(","));
@@ -390,7 +392,7 @@ impl Report {
 
 pub const CSV_HEADER: &str = "generated_at,scim_tenant,team,team_role,user_id,name,email,role,status,scim_managed,break_glass,mfa,mfa_enabled_at,\
 last_sign_in_at,last_sign_in_method,bot_access,browser_sessions,api_tokens,machine_id,machine_state,machine_assigned_at,\
-kind,owner,effective_permissions,service_tokens,report_digest\r\n";
+kind,owner,effective_permissions,service_tokens,service_flags,report_digest\r\n";
 
 fn rfc3339(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms).map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)).unwrap_or_default()

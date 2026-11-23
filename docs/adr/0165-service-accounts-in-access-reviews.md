@@ -36,9 +36,9 @@ With no service accounts listed, the digest is worked out exactly as before. Rep
 
 ### In the CSV and the evidence bundle
 
-The CSV export gets one row per service account after the people, and four columns before `report_digest`: `kind` (`person` or `service_account`), `owner` (name, id, and `inactive` when it lends nothing), `effective_permissions`, and `service_tokens` (each live token's name, preview, scopes, expiry and last use). People's rows leave the new cells empty. Service accounts' rows leave the email, second-factor, sign-in and machine cells empty, because they have none. Every row still starts with when the report was made and ends with its digest.
+The CSV export gets one row per service account after the people, and five columns before `report_digest`: `kind` (`person` or `service_account`), `owner` (name, id, and `inactive` when it lends nothing), `effective_permissions`, `service_tokens` (each live token's name, preview, scopes, expiry and last use), and `service_flags` (the same codes as the report). People's rows leave the new cells empty. Service accounts' rows leave the email, second-factor, sign-in and machine cells empty, because they have none. Every row still starts with when the report was made and ends with its digest.
 
-The evidence bundle's `access-review.json` gets `serviceAccounts` with ids, roles, owner id, `effective`, token ids, scopes and dates, and flags. As for people, no names, descriptions or token names are included, since they're free text. The section's period events now count `service_account.*` and `service_token.*`.
+The evidence bundle's `access-review.json` gets `serviceAccounts` with ids, roles, owner id, `effective`, token ids, scopes and dates, and flags. As for people, no names, descriptions or token names are included, since they're free text. The section's period events now count `service_account.*` and `service_token.*`. The bundle's `format` goes from 1 to 2, since `access-review.json` and its summary changed shape.
 
 ### In the app
 
@@ -55,6 +55,6 @@ The access-review screen gets a **Service accounts** section after the people. E
 ## Consequences
 
 - A sign-off now covers non-human access: every service account, its owner, what it can use, and its live tokens. Changing any of it makes the sign-off stale.
-- The CSV has four more columns. Tools that read it by column name keep working. Tools that read it by position need the new layout.
+- The CSV has five more columns. Tools that read it by column name keep working. Tools that read it by position need the new layout.
 - Each report reads every service account's tokens and works out its Bot access. That is a few more queries per account, which is fine at the scale of one report.
 - Still to do for #53: letting a service account own Bots or be granted one, per-account refusal counts, and a delegate's view of the service accounts they own in the app.

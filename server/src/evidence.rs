@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Bumped when a file's shape changes, so tools reading bundles can tell them apart.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 pub const CREATED: &str = "evidence.bundle_created";
 pub const FAILED: &str = "evidence.bundle_failed";
 pub const PRUNED: &str = "evidence.bundles_pruned";
