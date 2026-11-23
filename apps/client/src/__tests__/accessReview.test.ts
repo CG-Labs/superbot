@@ -103,10 +103,13 @@ describe("access review labels", () => {
     expect(serviceRoleLabel(sa({ role: "readonly", customRole: { id: "r1", name: "Exporter", permissions: [] } }))).toBe("readonly · Exporter");
     const team = { id: "t1", name: "Alpha", role: "member", customRole: { id: "r2", name: "Ops", permissions: [] } };
     expect(serviceRoleLabel(sa({ team }))).toBe("member · Ops, in Alpha");
+    expect(serviceRoleLabel(sa({ team, ownerOnTeam: true }))).toBe("member · Ops, in Alpha");
+    expect(serviceRoleLabel(sa({ team, ownerOnTeam: false }))).toBe("member · Ops, in Alpha (acts in no team)");
     expect(effectiveLabel(sa())).toBe("account, read");
     expect(effectiveLabel(sa({ effective: [] }))).toBe("Nothing");
-    expect(serviceFlags(sa({ flags: ["owner_inactive", "unscoped_token", "unused_token", "disabled", "new_one"] }))).toEqual([
+    expect(serviceFlags(sa({ flags: ["owner_inactive", "owner_off_team", "unscoped_token", "unused_token", "disabled", "new_one"] }))).toEqual([
       "Owner inactive",
+      "Owner off its team",
       "Token with everything",
       "Token unused 90 days",
       "Disabled",

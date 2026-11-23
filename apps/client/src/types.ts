@@ -1018,7 +1018,7 @@ export interface AccessReviewServiceToken {
 }
 
 /** Why a reviewer should look at a service account twice (ADR 0165). */
-export type AccessReviewServiceFlag = "disabled" | "owner_inactive" | "unscoped_token" | "unused_token";
+export type AccessReviewServiceFlag = "disabled" | "owner_inactive" | "owner_off_team" | "unscoped_token" | "unused_token";
 
 /** One live service account in `GET /api/access-review` (ADR 0165). */
 export interface AccessReviewServiceAccount {
@@ -1033,6 +1033,8 @@ export interface AccessReviewServiceAccount {
   team: { id: string; name: string; role: string; customRole?: { id: string; name: string; permissions: string[] } } | null;
   owner: { id: string; name: string; email: string | null; status: string } | null;
   ownerActive: boolean;
+  /** Whether its owner is an admin or on its team, so it acts there; null in no team, absent from older servers (ADR 0188). */
+  ownerOnTeam?: boolean | null;
   permissions: string[];
   teamPermissions: string[];
   /** What its tokens can use today, capped by its owner. */
