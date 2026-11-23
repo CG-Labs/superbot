@@ -25,6 +25,8 @@ interface Props {
   /** Admins: who has access, to review and sign off (ADR 0099). */
   onOpenAccessReview?: () => void;
   onOpenRoles?: () => void;
+  /** Admins: scripts' and integrations' own identities and tokens (ADR 0143, 0152). */
+  onOpenServiceAccounts?: () => void;
   /** The server's admin console (ADR 0027), in a new tab or the system browser. */
   onOpenConsole?: () => void;
   /** Set while the server's setup wizard waits for an admin (ADR 0034); opens it in the console. */
@@ -32,7 +34,7 @@ interface Props {
   compact?: boolean;
 }
 
-export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOpenPlan, onOpenSecrets, onOpenTeam, onOpenSettings, onOpenUsers, onOpenAudit, onOpenAccessReview, onOpenRoles, onOpenConsole, onOpenSetup, compact }: Props) {
+export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOpenPlan, onOpenSecrets, onOpenTeam, onOpenSettings, onOpenUsers, onOpenAudit, onOpenAccessReview, onOpenRoles, onOpenServiceAccounts, onOpenConsole, onOpenSetup, compact }: Props) {
   const {
     bots,
     activeId,
@@ -163,6 +165,11 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOp
           {onOpenRoles ? (
             <Pressable style={styles.approvalsBtn} onPress={onOpenRoles} accessibilityRole="button">
               <Text style={styles.hiddenText}>Roles</Text>
+            </Pressable>
+          ) : null}
+          {onOpenServiceAccounts ? (
+            <Pressable style={styles.approvalsBtn} onPress={onOpenServiceAccounts} accessibilityRole="button">
+              <Text style={styles.hiddenText}>Service accounts</Text>
             </Pressable>
           ) : null}
           {onOpenAudit ? (
