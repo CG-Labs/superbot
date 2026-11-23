@@ -663,7 +663,7 @@ impl SoapIdp {
                     match answer {
                         "fault" => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, crate::sso::saml_slo::soap_fault("x")),
                         "other" => r.in_response_to = "_not-yours".into(),
-                        "partial" => r.status = "urn:oasis:names:tc:SAML:2.0:status:Responder".into(),
+                        "partial" => r.sub_status = Some("urn:oasis:names:tc:SAML:2.0:status:PartialLogout".into()),
                         _ => {}
                     }
                     (axum::http::StatusCode::OK, r.soap())
@@ -721,7 +721,7 @@ async fn signing_out_without_a_browser_sends_the_idp_a_logout_request_over_soap(
     assert_eq!(stub.got.lock().unwrap().len(), 1);
 
     // Answers that don't say it worked are audited as failures, with why.
-    for (answer, status, reason) in [("partial", "Responder", None), ("fault", "none", Some("soap_fault")), ("other", "none", Some("unknown_request"))] {
+    for (answer, status, reason) in [("partial", "Success/PartialLogout", None), ("fault", "none", Some("soap_fault")), ("other", "none", Some("unknown_request"))] {
         *stub.answer.lock().unwrap() = answer;
         let before = sp.audit("auth.slo_response").await.len();
         let token = sp.app_token("_s3").await;

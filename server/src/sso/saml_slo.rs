@@ -145,7 +145,7 @@ pub fn receive(incoming: &Incoming, e: &Expect) -> Result<Received, Refused> {
     if !request {
         let in_response_to = root.attribute("InResponseTo").filter(|i| !i.is_empty()).ok_or(Refused("unknown_request", None))?.to_string();
         let code = only(root, PROTOCOL, "Status").and_then(|s| only(s, PROTOCOL, "StatusCode")).ok_or_else(bad)?;
-        let status = (code.attribute("Value") != Some(SUCCESS)).then(|| status_codes(code));
+        let status = incomplete(code);
         return Ok(Received::Response { id, in_response_to, status, until_ms });
     }
     if let Some(na) = root.attribute("NotOnOrAfter")
@@ -278,7 +278,13 @@ pub fn receive_soap_response(body: &str, idp: &IdpMetadata, request_id: &str, no
         return Err(Refused("expired", None));
     }
     let code = only(m, PROTOCOL, "Status").and_then(|s| only(s, PROTOCOL, "StatusCode")).ok_or_else(bad)?;
-    Ok((code.attribute("Value") != Some(SUCCESS)).then(|| status_codes(code)))
+    Ok(incomplete(code))
+}
+
+/// None when the IdP ended everything: `Success` with no second-level code. `Success/PartialLogout`
+/// says some of the person's other sessions at the IdP are still open.
+fn incomplete(code: Node) -> Option<String> {
+    (code.attribute("Value") != Some(SUCCESS) || only(code, PROTOCOL, "StatusCode").is_some()).then(|| status_codes(code))
 }
 
 /// A status's codes, top level first, without their URN prefix: `Responder/PartialLogout`.
@@ -309,6 +315,8 @@ pub mod test_idp {
         pub session_indexes: Vec<String>,
         pub in_response_to: String,
         pub status: String,
+        /// A second-level status code inside it.
+        pub sub_status: Option<String>,
         /// Which test key signs it (0 is the IdP's), or none.
         pub signer: Option<usize>,
         pub relay: Option<String>,
@@ -327,6 +335,7 @@ pub mod test_idp {
                 session_indexes: session_index.into_iter().map(String::from).collect(),
                 in_response_to: String::new(),
                 status: SUCCESS.into(),
+                sub_status: None,
                 signer: Some(0),
                 relay: Some("idp-relay".into()),
                 encrypt_name_id_to: None,
@@ -357,8 +366,12 @@ pub mod test_idp {
                 )
             } else {
                 format!(
-                    r#"<samlp:LogoutResponse xmlns:samlp="{PROTOCOL}" xmlns:saml="{ASSERTION}" ID="{}" Version="2.0" IssueInstant="{at}"{dest} InResponseTo="{}"><saml:Issuer>{}</saml:Issuer><samlp:Status><samlp:StatusCode Value="{}"/></samlp:Status></samlp:LogoutResponse>"#,
-                    self.id, self.in_response_to, self.issuer, self.status
+                    r#"<samlp:LogoutResponse xmlns:samlp="{PROTOCOL}" xmlns:saml="{ASSERTION}" ID="{}" Version="2.0" IssueInstant="{at}"{dest} InResponseTo="{}"><saml:Issuer>{}</saml:Issuer><samlp:Status><samlp:StatusCode Value="{}">{}</samlp:StatusCode></samlp:Status></samlp:LogoutResponse>"#,
+                    self.id,
+                    self.in_response_to,
+                    self.issuer,
+                    self.status,
+                    self.sub_status.as_ref().map(|c| format!(r#"<samlp:StatusCode Value="{c}"/>"#)).unwrap_or_default()
                 )
             }
         }
@@ -411,6 +424,7 @@ pub mod test_idp {
 
 #[cfg(test)]
 mod tests {
+    const PARTIAL: &str = "urn:oasis:names:tc:SAML:2.0:status:PartialLogout";
     use super::test_idp::Logout;
     use super::*;
     use crate::sso::saml_sp::test_idp::{IDP, metadata, with_slo};
@@ -570,6 +584,8 @@ mod tests {
         assert!(matches!(post(&r), Ok(Received::Response { status: None, .. })));
         let partial = Logout { status: "urn:oasis:names:tc:SAML:2.0:status:Responder".into(), ..r.clone() };
         assert!(matches!(redirect(&partial), Ok(Received::Response { status: Some(s), .. }) if s == "Responder"));
+        let partial = Logout { sub_status: Some(PARTIAL.into()), ..r.clone() };
+        assert!(matches!(redirect(&partial), Ok(Received::Response { status: Some(s), .. }) if s == "Success/PartialLogout"));
         let mut unsigned = r.clone();
         unsigned.signer = None;
         assert_eq!(redirect(&unsigned), Err("unsigned"));
@@ -649,6 +665,7 @@ mod tests {
         assert_eq!(got(&soap_answer(|_| {})), Ok(None), "signed");
         assert_eq!(got(&soap_answer(|r| r.signer = None)), Ok(None), "unsigned: the TLS connection to the IdP's URL vouches for it");
         assert_eq!(got(&soap_answer(|r| r.status = "urn:oasis:names:tc:SAML:2.0:status:Responder".into())), Ok(Some("Responder".into())));
+        assert_eq!(got(&soap_answer(|r| r.sub_status = Some(PARTIAL.into()))), Ok(Some("Success/PartialLogout".into())), "some IdP sessions are still open");
         assert_eq!(got(&soap_answer(|r| r.signer = Some(1))), Err("bad_signature"), "signed, but not by the IdP");
         assert_eq!(got(&soap_answer(|r| r.issuer = "https://evil.example".into())), Err("wrong_issuer"));
         assert_eq!(got(&soap_answer(|r| r.in_response_to = "_other".into())), Err("unknown_request"));
