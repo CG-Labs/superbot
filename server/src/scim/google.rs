@@ -935,14 +935,19 @@ pub fn start(a: Arc<Auth>) {
     tokio::spawn(async move {
         tokio::time::sleep(FIRST_PASS).await;
         loop {
-            let wait = match run(&a, &d, Trigger::Schedule).await {
-                Err(f) if f.reason != "running" => RETRY.min(d.settings.interval),
-                Ok(summary) if summary["failed"].as_u64().unwrap_or(0) > 0 => RETRY.min(d.settings.interval),
-                _ => d.settings.interval,
-            };
+            let wait = next_wait(&run(&a, &d, Trigger::Schedule).await, d.settings.interval);
             tokio::time::sleep(wait).await;
         }
     });
+}
+
+/// A pass that failed, or wrote with failures, is tried again sooner than the interval.
+fn next_wait(result: &Result<Value, Failure>, interval: Duration) -> Duration {
+    match result {
+        Err(f) if f.reason != "running" => RETRY.min(interval),
+        Ok(summary) if summary["failed"].as_u64().unwrap_or(0) > 0 => RETRY.min(interval),
+        _ => interval,
+    }
 }
 
 // Admin API.
@@ -1108,6 +1113,16 @@ mod tests {
         assert_eq!(plan(&[&ada], &[unchanged], &HashMap::new(), &|_| true), Plan::default());
         let p2 = plan(&[&cy], &live[2..3], &HashMap::new(), &|_| false);
         assert_eq!((p2.enable, p2.update[0].1["active"].as_bool()), (1, Some(true)));
+    }
+
+    #[test]
+    fn failed_writes_are_retried_sooner() {
+        let hour = Duration::from_secs(3600);
+        assert_eq!(next_wait(&Ok(json!({ "failed": 0 })), hour), hour);
+        assert_eq!(next_wait(&Ok(json!({ "failed": 2 })), hour), RETRY);
+        assert_eq!(next_wait(&Err(fail("unreachable", "")), hour), RETRY);
+        assert_eq!(next_wait(&Err(fail("running", "")), hour), hour);
+        assert_eq!(next_wait(&Ok(json!({ "failed": 1 })), Duration::from_secs(60)), Duration::from_secs(60));
     }
 
     #[test]
