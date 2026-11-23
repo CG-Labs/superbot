@@ -759,6 +759,9 @@ async fn the_enterprise_extension_is_kept_patched_and_shown_to_reviewers() {
     }
     let on = json!({ "Operations": [{ "op": "replace", "path": "active", "value": true }, { "op": "add", "path": format!("{EXT}:manager.value"), "value": boss }] });
     assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{id}"), on).await.2[EXT]["manager"]["value"], boss.as_str());
+    // Only the read-only parts of a manager leave it as it is.
+    let label = json!({ "Operations": [{ "op": "add", "path": "manager", "value": { "displayName": "someone", "$ref": "x" } }] });
+    assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{id}"), label).await.2[EXT]["manager"]["value"], boss.as_str());
 
     // Bad values are refused like any other attribute.
     for bad in [
@@ -795,4 +798,10 @@ async fn the_enterprise_extension_is_kept_patched_and_shown_to_reviewers() {
     let (code, _, u) = scim(port, &t, "PUT", &format!("{USERS}/{id}"), okta_user("grace@contoso.example", "grace")).await;
     assert_eq!((code, u.get(EXT), u["schemas"].clone()), (200, None, json!([scim::USER_SCHEMA])), "{u}");
     assert!(app.db.scim_user("entra", &id).unwrap().enterprise.is_empty());
+    // So does replacing the extension with null.
+    let back = json!({ "Operations": [{ "op": "add", "path": format!("{EXT}:department"), "value": "Research" }] });
+    assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{id}"), back).await.2[EXT]["department"], "Research");
+    let null = json!({ "Operations": [{ "op": "replace", "path": EXT, "value": null }] });
+    let (code, _, u) = scim(port, &t, "PATCH", &format!("{USERS}/{id}"), null).await;
+    assert_eq!((code, u.get(EXT)), (200, None), "{u}");
 }

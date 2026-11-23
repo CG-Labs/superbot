@@ -178,6 +178,18 @@ impl Scrub {
     }
 }
 
+/// An employee number in a change to the erased person's record, whatever its length:
+/// `Scrub` skips values too short to match safely, and one character is a valid number.
+fn pseudonymise_employee_number(d: &mut Value, pseudonym: &str) -> bool {
+    let Some(c) = d.pointer_mut("/changes/employeeNumber").and_then(Value::as_object_mut) else { return false };
+    let mut changed = false;
+    for v in c.values_mut().filter(|v| v.as_str().is_some_and(|v| v != pseudonym)) {
+        *v = Value::String(pseudonym.into());
+        changed = true;
+    }
+    changed
+}
+
 /// `hay` with each `needle` (lowercase) replaced, in any case. Outside ASCII, where case
 /// changes lengths, a string that contains it is replaced whole.
 fn replace_ci(hay: &str, needle: &str, with: &str) -> String {
@@ -5987,7 +5999,7 @@ impl Db {
             // the TSA's (ADR 0149): a match in them is a coincidence, and rewriting them
             // would break what a check holds them to.
             let signed = [crate::audit_checkpoint::CHECKPOINT, crate::audit_checkpoint::TIMESTAMPED].contains(&action.as_str());
-            let changed = !signed && s.value(&mut d);
+            let changed = !signed && (s.value(&mut d) | (is(&target) && pseudonymise_employee_number(&mut d, &s.pseudonym)));
             let next = (
                 swap(actor_id.clone()),
                 mine(name.clone(), false),
@@ -11365,8 +11377,12 @@ mod tests {
         db.save_scim_user("entra", &boss.id, &fields("boss", &none), true).unwrap();
         assert_eq!(manager_of(&db), Some((Some(boss.id.clone()), Some("boss".into()))), "taken back, shown again");
 
+        let changed = json!({ "changes": { "employeeNumber": { "from": null, "to": "7" } } });
+        db.record(&audit::Event::new(audit::Actor::system("scim"), "user.updated").target("user", &boss.id).details(changed));
         db.erase_user(&boss.id, "erased-1", None, &[]).unwrap();
         assert_eq!(manager_of(&db), Some((None, None)));
+        let d: String = db.c().query_row("SELECT details FROM audit_events WHERE action = 'user.updated'", [], |r| r.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&d).unwrap()["changes"]["employeeNumber"], json!({ "from": null, "to": "erased-1" }), "even one character is scrubbed");
         let stale: Option<String> = db.c().query_row("SELECT manager_id FROM scim_users WHERE user_id = ?", [&ada.id], |r| r.get(0)).unwrap();
         assert_eq!(stale, None, "erasing someone clears them as a manager");
     }

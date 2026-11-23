@@ -762,13 +762,15 @@ fn set_enterprise(e: &mut Enterprise, op: &str, v: &Value) -> ScimRes<()> {
 }
 
 /// A manager reference: `{"value": id}`, Entra's `[{"value": id, "$ref": ...}]`, or the id
-/// itself. Whether it names someone in the tenant is checked when it's saved.
-fn manager_id(v: &Value) -> ScimRes<Option<String>> {
+/// itself. Whether it names someone in the tenant is checked when it's saved. `None` when
+/// it holds only the read-only `$ref` or `displayName`, which leave the manager as it is.
+fn manager_id(v: &Value) -> ScimRes<Option<Option<String>>> {
     match v {
         Value::Array(l) if l.len() > 1 => Err(invalid("manager takes one manager")),
-        Value::Array(l) => l.first().map_or(Ok(None), manager_id),
-        Value::Object(_) => text(attr(v, "value"), "manager.value", 64),
-        v => text(v, "manager.value", 64),
+        Value::Array(l) => l.first().map_or(Ok(Some(None)), manager_id),
+        Value::Object(o) if !o.keys().any(|k| k.eq_ignore_ascii_case("value")) => Ok(None),
+        Value::Object(_) => text(attr(v, "value"), "manager.value", 64).map(Some),
+        v => text(v, "manager.value", 64).map(Some),
     }
 }
 
@@ -781,7 +783,12 @@ fn set_enterprise_attr(e: &mut Enterprise, op: &str, name: &str, v: &Value) -> S
         "organization" => e.organization = field(v)?,
         "division" => e.division = field(v)?,
         "department" => e.department = field(v)?,
-        _ => e.manager = if remove { None } else { manager_id(v)? },
+        _ if remove => e.manager = None,
+        _ => {
+            if let Some(m) = manager_id(v)? {
+                e.manager = m;
+            }
+        }
     }
     Ok(())
 }
@@ -862,7 +869,7 @@ fn apply_path(a: &mut Attrs, op: &str, path: &str, v: &Value) -> ScimRes<()> {
         p => {
             let ext = ENTERPRISE_SCHEMA.to_ascii_lowercase();
             if p == ext {
-                if remove {
+                if remove || v.is_null() {
                     a.enterprise = Enterprise::default();
                 } else {
                     set_enterprise(&mut a.enterprise, op, v)?;
