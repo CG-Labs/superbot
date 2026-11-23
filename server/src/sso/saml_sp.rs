@@ -792,12 +792,15 @@ fn authn_values<'a, 'i: 'a>(nodes: impl Iterator<Item = Node<'a, 'i>>) -> Vec<St
 
 /// How the (verified) assertion says the person signed in (ADR 0190): the class of each
 /// `AuthnStatement`'s `AuthnContext`, and every value of the `methods` attribute, if named.
-/// A declaration (`AuthnContextDecl`, `AuthnContextDeclRef`) isn't read.
+/// A context with a declaration (`AuthnContextDecl`, `AuthnContextDeclRef`) names no class:
+/// the declaration may say something else, and it isn't read.
 fn read_authn(assertion: Node, methods: Option<&str>) -> Authn {
+    let declared = |c: Node| c.children().any(|d| is(d, ASSERTION, "AuthnContextDecl") || is(d, ASSERTION, "AuthnContextDeclRef"));
     let classes = assertion
         .children()
         .filter(|c| is(*c, ASSERTION, "AuthnStatement"))
         .filter_map(|s| only(s, ASSERTION, "AuthnContext"))
+        .filter(|c| !declared(*c))
         .filter_map(|c| only(c, ASSERTION, "AuthnContextClassRef"));
     let methods: Vec<String> = match methods {
         Some(name) => {
@@ -1662,10 +1665,20 @@ mod tests {
         none.authn_contexts = s(&[""]);
         assert_eq!(authn_of(&none, None), Authn::default());
 
-        // A declaration isn't a class, and a context naming two classes names none.
+        // A declaration isn't a class, a context with one beside its class names none, and nor
+        // does one naming two classes. Another statement's plain class still counts.
         let mut decl = base();
         decl.authn_contexts = s(&[&format!("<saml:AuthnContextDeclRef>{MFA}</saml:AuthnContextDeclRef>")]);
         assert_eq!(authn_of(&decl, None), Authn::default());
+        let class = format!("<saml:AuthnContextClassRef>{MFA}</saml:AuthnContextClassRef>");
+        for beside in ["<saml:AuthnContextDeclRef>urn:example:decl</saml:AuthnContextDeclRef>", "<saml:AuthnContextDecl><x:Any xmlns:x=\"urn:example:decl\"/></saml:AuthnContextDecl>"] {
+            let mut mixed = base();
+            mixed.authn_contexts = s(&[&format!("{class}{beside}")]);
+            assert_eq!(authn_of(&mixed, None), Authn::default(), "{beside}");
+            assert_eq!(authn_of(&mixed, None).meets(&required(&[MFA])), None);
+            mixed.authn_contexts = s(&[&format!("{class}{beside}"), PASSWORD_PROTECTED]);
+            assert_eq!(authn_of(&mixed, None).classes, s(&[PASSWORD_PROTECTED]));
+        }
         let mut two = base();
         two.authn_contexts = s(&[&format!("<saml:AuthnContextClassRef>{PASSWORD_PROTECTED}</saml:AuthnContextClassRef><saml:AuthnContextClassRef>{MFA}</saml:AuthnContextClassRef>")]);
         assert_eq!(authn_of(&two, None), Authn::default());
