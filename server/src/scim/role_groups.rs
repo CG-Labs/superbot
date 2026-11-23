@@ -10,6 +10,12 @@
 //! line is offered. Like a mapping (ADR 0138): never over an admin, the owner or a role
 //! given by hand, only what it gave is taken back, and SCIM_GROUP_ROLES=off gives nothing
 //! but still takes away. Until the IdP pushes it, a declaration is unseen by the IdP.
+//!
+//! A team role group (ADR 0206) gives its role within the team each member is on instead,
+//! when that team is one of the tenant's team groups: "Support Leads" inside the team
+//! groups, without being a team. It follows a team mapping's rules (never over a team role
+//! held already, nor to read-only people, nor a role reaching admins in a team), one team
+//! role each, and its grant goes when they leave the group or the team.
 
 use super::groups::{self, Clause, Patched, GROUP_SCHEMA};
 use super::*;
@@ -22,6 +28,10 @@ pub const USER_DELETED: &str = "user_deleted";
 pub const GROUP_GONE: &str = "group_removed";
 pub const REMOVED: &str = "role_group_removed";
 pub const ROLE_CHANGED: &str = "role_changed";
+pub const LEFT_TEAM: &str = "left_team";
+pub const TEAM_UNLINKED: &str = "team_unlinked";
+pub const ORG: &str = "org";
+pub const TEAM: &str = "team";
 const MAX_NAME: usize = 256;
 
 // Reading, for SCIM: only the role groups the IdP has pushed.
@@ -105,10 +115,24 @@ fn role_ref(role: Option<&CustomRole>) -> Value {
     role.map_or(Value::Null, |r| json!({ "id": r.id, "name": r.name }))
 }
 
-/// Gives `user_id` the group's role across the server, or says why not: they aren't in
-/// it, are an admin or the owner account, hold a custom role already (by hand, a mapping
-/// or another role group), or the role now reaches admins. Audited as any grant is.
+/// What reaches admins in the group's scope.
+fn reaching(role: &CustomRole, scope: &str) -> Vec<&'static str> {
+    role.perms().reaching_admins(scope == TEAM)
+}
+
+/// What the role gives in the group's scope.
+fn applies(role: &CustomRole, scope: &str) -> Vec<&'static str> {
+    if scope == TEAM { role.perms().in_team().names() } else { role.perms().names() }
+}
+
+/// Gives `user_id` the group's role in its scope, or says why not. Across the server: they
+/// aren't in it, are an admin or the owner account, hold a custom role already (by hand,
+/// a mapping or another role group), or the role now reaches admins. Within a team: see
+/// [`grant_in_team`]. Audited as any grant is.
 async fn grant(app: &AppState, by: &Who, g: &ScimRoleGroup, role: &CustomRole, user_id: &str) -> Result<(), &'static str> {
+    if g.scope == TEAM {
+        return grant_in_team(app, by, g, role, user_id);
+    }
     let before = app.db.user(user_id).ok_or("gone")?;
     if !app.db.scim_role_group_has(&g.id, user_id) {
         return Err("not_in_group");
@@ -139,15 +163,49 @@ async fn grant(app: &AppState, by: &Who, g: &ScimRoleGroup, role: &CustomRole, u
     Ok(())
 }
 
+/// The team `user_id` is on, if it is one of `tenant`'s team groups: the only team a
+/// tenant's team role group gives a role in.
+fn tenant_team(app: &AppState, tenant: &str, user_id: &str) -> Option<crate::db::TeamMember> {
+    app.db.team_member(user_id).filter(|m| app.db.scim_group_of_team(&m.team_id).is_some_and(|s| s.tenant == tenant))
+}
+
+/// Gives `user_id` a team role group's role within their team, or says why not: they
+/// aren't in the group, aren't on one of the tenant's team groups, are read-only (a team
+/// role does nothing for them), hold a team role already (by hand, a mapping or another
+/// team role group), or the role now reaches admins in a team.
+fn grant_in_team(app: &AppState, by: &Who, g: &ScimRoleGroup, role: &CustomRole, user_id: &str) -> Result<(), &'static str> {
+    let u = app.db.user(user_id).ok_or("gone")?;
+    if !app.db.scim_role_group_has(&g.id, user_id) {
+        return Err("not_in_group");
+    }
+    let member = tenant_team(app, &g.tenant, user_id).ok_or("not_on_team")?;
+    if u.role == Role::Readonly {
+        return Err("readonly");
+    }
+    if member.role_id.is_some() {
+        return Err("has_role");
+    }
+    if !reaching(role, TEAM).is_empty() {
+        return Err("reaches_admins");
+    }
+    let team = app.db.grant_scim_team_role_group(g, user_id).ok_or("changed")?;
+    let d = json!({ "name": role.name, "user": user_id, "scope": TEAM, "team": team, "applies": applies(role, TEAM), "from": null, "via": "scim", "roleGroup": g.id, "tenant": g.tenant });
+    app.db.record(&by.event("role.assigned").target("role", &role.id).details(d));
+    Ok(())
+}
+
 fn skipped(app: &AppState, by: &Who, g: &ScimRoleGroup, role: &CustomRole, user_id: &str, reason: &str) {
     app.db.record(&by.event("scim.role_skipped").target("scim_role_group", &g.id).details(json!({
-        "roleGroup": g.id, "tenant": g.tenant, "role": role_ref(Some(role)), "scope": "org", "user": user_id, "reason": reason,
+        "roleGroup": g.id, "tenant": g.tenant, "role": role_ref(Some(role)), "scope": g.scope, "user": user_id, "reason": reason,
     })));
 }
 
-/// Takes away what the group gave `user_id`; their built-in role goes back to the one
-/// they had. Whether it had given them anything.
+/// Takes away what the group gave `user_id`; across the server their built-in role goes
+/// back to the one they had. Whether it had given them anything.
 async fn take_away(app: &AppState, by: &Who, g: &ScimRoleGroup, user_id: &str, reason: &str) -> bool {
+    if g.scope == TEAM {
+        return take_away_in_team(app, by, g, user_id, reason, None);
+    }
     let Some((given, r)) = app.db.revoke_scim_role_group(g, user_id, reason == LEFT_GROUP) else { return false };
     let role = app.db.custom_role(&given);
     let d = json!({
@@ -162,14 +220,27 @@ async fn take_away(app: &AppState, by: &Who, g: &ScimRoleGroup, user_id: &str, r
     true
 }
 
-/// A role group's role just went from `user_id`: the next role group they're in, oldest
-/// declared first, that can give them one does. Skips here aren't audited; each group
-/// audited them when it was offered.
-async fn reoffer(app: &AppState, a: &Auth, by: &Who, user_id: &str) {
+/// Takes away the team role a team role group gave `user_id`. `left_team`: only a grant in
+/// that team, which they just left. Whether it had given them anything.
+fn take_away_in_team(app: &AppState, by: &Who, g: &ScimRoleGroup, user_id: &str, reason: &str, left_team: Option<&str>) -> bool {
+    let Some((given, team, held)) = app.db.revoke_scim_team_role_group(g, user_id, reason == LEFT_GROUP, left_team) else { return false };
+    let role = app.db.custom_role(&given);
+    let d = json!({
+        "name": role.as_ref().map(|r| r.name.clone()), "user": user_id, "scope": TEAM, "team": team, "via": "scim", "roleGroup": g.id, "tenant": g.tenant,
+        "reason": reason, "held": held,
+    });
+    app.db.record(&by.event("role.unassigned").target("role", &given).details(d));
+    true
+}
+
+/// A role in `scope` just went from `user_id` (a role group's, or a mapping's): the next
+/// role group of that scope they're in, oldest declared first, that can give them one
+/// does. Skips here aren't audited; each group audited them when it was offered.
+async fn reoffer(app: &AppState, a: &Auth, by: &Who, user_id: &str, scope: &str) {
     if !a.scim.group_roles {
         return;
     }
-    for g in app.db.scim_role_groups_of_user(user_id).into_iter().filter(|g| g.provisioned_at.is_some()) {
+    for g in app.db.scim_role_groups_of_user(user_id).into_iter().filter(|g| g.provisioned_at.is_some() && g.scope == scope) {
         let Some(role) = app.db.custom_role(&g.role_id) else { continue };
         if grant(app, by, &g, &role, user_id).await.is_ok() {
             return;
@@ -210,7 +281,7 @@ async fn change_members(app: &AppState, a: &Auth, c: &Caller, g: &ScimRoleGroup,
         }
         if take_away(app, &c.who, g, id, LEFT_GROUP).await {
             m.revoked.push(id.clone());
-            reoffer(app, a, &c.who, id).await;
+            reoffer(app, a, &c.who, id, &g.scope).await;
         }
     }
     for id in new {
@@ -235,7 +306,7 @@ fn record_update(app: &AppState, c: &Caller, before: &ScimRoleGroup, after: &Sci
         return;
     }
     app.db.record(&c.who.event("scim.group_updated").target("scim_role_group", &after.id).details(json!({
-        "tenant": after.tenant, "kind": "role", "roleGroup": after.id, "changes": changes, "added": moved.added, "removed": moved.removed, "granted": moved.granted, "revoked": moved.revoked,
+        "tenant": after.tenant, "kind": "role", "roleGroup": after.id, "scope": after.scope, "changes": changes, "added": moved.added, "removed": moved.removed, "granted": moved.granted, "revoked": moved.revoked,
     })));
 }
 
@@ -287,7 +358,7 @@ async fn adopt(app: &AppState, a: &Auth, c: &Caller, base: &str, waiting: &ScimR
     let g = app.db.save_scim_role_group(&waiting.id, external_id.as_deref(), &d.display_name, true).map_err(write_error)?;
     let role = app.db.custom_role(&g.role_id);
     app.db.record(&c.who.event("scim.role_group_adopted").target("scim_role_group", &g.id).details(json!({
-        "tenant": tenant, "roleGroup": g.id, "externalId": g.external_id, "displayName": g.display_name, "role": role_ref(role.as_ref()), "declaredBy": g.created_by,
+        "tenant": tenant, "roleGroup": g.id, "scope": g.scope, "externalId": g.external_id, "displayName": g.display_name, "role": role_ref(role.as_ref()), "declaredBy": g.created_by,
     })));
     let moved = change_members(app, a, c, &g, &[], &new).await;
     record_update(app, c, waiting, &g, &moved);
@@ -342,10 +413,10 @@ pub(super) async fn delete(app: &AppState, a: &Auth, c: &Caller, g: &ScimRoleGro
         return Err(server_error("The role group wasn't reset"));
     }
     for id in &revoked {
-        reoffer(app, a, &c.who, id).await;
+        reoffer(app, a, &c.who, id, &g.scope).await;
     }
     app.db.record(&c.who.event("scim.group_deleted").target("scim_role_group", &g.id).details(json!({
-        "tenant": g.tenant, "kind": "role", "roleGroup": g.id, "externalId": g.external_id, "displayName": g.display_name, "removed": members, "revoked": revoked,
+        "tenant": g.tenant, "kind": "role", "roleGroup": g.id, "scope": g.scope, "externalId": g.external_id, "displayName": g.display_name, "removed": members, "revoked": revoked,
     })));
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -359,7 +430,8 @@ pub(crate) async fn user_deleted(app: &AppState, a: &Auth, by: &Who, user_id: &s
         app.db.remove_scim_role_group_member(&g.id, user_id);
         take_away(app, by, &g, user_id, USER_DELETED).await;
     }
-    if let Some(g) = app.db.scim_role_group_grant_of_user(user_id).and_then(|h| app.db.scim_role_group(&h.group_id)) {
+    let left = [app.db.scim_role_group_grant_of_user(user_id), app.db.scim_team_role_group_grant_of_user(user_id)];
+    for g in left.into_iter().flatten().filter_map(|h| app.db.scim_role_group(&h.group_id)) {
         take_away(app, by, &g, user_id, USER_DELETED).await;
     }
 }
@@ -367,7 +439,52 @@ pub(crate) async fn user_deleted(app: &AppState, a: &Auth, by: &Who, user_id: &s
 /// Whether a SCIM DELETE of `user_id` left them in a role group, or holding what one gave:
 /// a restart cut it short, so a retried DELETE or a restore finishes it first.
 pub(crate) fn left_behind(app: &AppState, user_id: &str) -> bool {
-    !app.db.scim_role_groups_of_user(user_id).is_empty() || app.db.scim_role_group_grant_of_user(user_id).is_some()
+    !app.db.scim_role_groups_of_user(user_id).is_empty() || app.db.scim_role_group_grant_of_user(user_id).is_some() || app.db.scim_team_role_group_grant_of_user(user_id).is_some()
+}
+
+// Teams (ADR 0206): a team role group follows its members onto and off the tenant's teams.
+
+/// SCIM just put `user_id` on a team (after the team group's mappings were offered): the
+/// team role groups they're in are offered, oldest declared first. Callers hold the group
+/// write lock.
+pub(crate) async fn joined_team(app: &AppState, a: &Auth, by: &Who, user_id: &str) {
+    reoffer(app, a, by, user_id, TEAM).await;
+}
+
+/// `user_id` left `team_id`, by SCIM or any other way: what a team role group gave them
+/// there goes. Their team role went with their membership already; this forgets the
+/// grant and audits it.
+pub(crate) fn left_team(app: &AppState, by: &Who, team_id: &str, user_id: &str) {
+    if let Some(g) = app.db.scim_team_role_group_grant_of_user(user_id).filter(|h| h.team_id.as_deref() == Some(team_id)).and_then(|h| app.db.scim_role_group(&h.group_id)) {
+        take_away_in_team(app, by, &g, user_id, LEFT_TEAM, Some(team_id));
+    }
+}
+
+/// `team_id` is no longer one of a tenant's team groups (an admin unlinked it): the team
+/// roles team role groups gave there go, since they gave them as that tenant's.
+pub(crate) fn team_unlinked(app: &AppState, by: &Who, team_id: &str) {
+    for h in app.db.scim_team_role_group_grants_in(team_id) {
+        if let Some(g) = app.db.scim_role_group(&h.group_id) {
+            take_away_in_team(app, by, &g, &h.user_id, TEAM_UNLINKED, None);
+        }
+    }
+}
+
+/// `team_id` just became a team group (an admin linked it): its members in the tenant's
+/// team role groups are offered them. Callers hold the group write lock.
+pub(crate) async fn team_linked(app: &AppState, a: &Auth, by: &Who, team_id: &str) {
+    for m in app.db.team_members(team_id) {
+        reoffer(app, a, by, &m.user_id, TEAM).await;
+    }
+}
+
+/// A mapping's role in `scope` was taken from these people while they stay where they
+/// are (the mapping was removed, or its group unlinked): the role groups they're in are
+/// offered, as when a role group's role goes. Callers hold the group write lock.
+pub(crate) async fn after_mapping(app: &AppState, a: &Auth, by: &Who, scope: &str, users: &[String]) {
+    for id in users {
+        reoffer(app, a, by, id, scope).await;
+    }
 }
 
 // Admin API (under /api, admins only).
@@ -383,9 +500,9 @@ fn need(app: &AppState, id: &str) -> Res<ScimRoleGroup> {
 fn view(app: &AppState, g: &ScimRoleGroup) -> Value {
     let role = app.db.custom_role(&g.role_id);
     json!({
-        "id": g.id, "tenant": g.tenant, "displayName": g.display_name, "externalId": g.external_id,
+        "id": g.id, "tenant": g.tenant, "scope": g.scope, "displayName": g.display_name, "externalId": g.external_id,
         "declaredDisplayName": g.declared_display_name, "declaredExternalId": g.declared_external_id,
-        "role": role_ref(role.as_ref()), "applies": role.as_ref().map_or(vec![], |r| r.perms().names()),
+        "role": role_ref(role.as_ref()), "applies": role.as_ref().map_or(vec![], |r| applies(r, &g.scope)),
         "state": if g.provisioned_at.is_some() { "pushed" } else { "waiting" }, "pushedAt": g.provisioned_at,
         "members": app.db.scim_role_group_members(&g.tenant, &g.id).len(), "grants": app.db.scim_role_group_grants(&g.id).len(),
         "createdAt": g.created_at, "createdBy": g.created_by,
@@ -394,8 +511,8 @@ fn view(app: &AppState, g: &ScimRoleGroup) -> Value {
 
 /// Refuses a role, audited like a refused mapping: SCIM never gives admin, a built-in
 /// role, or what reaches admins.
-fn refused(app: &AppState, by: &Who, reason: &str, details: Value, msg: String) -> ApiError {
-    let mut d = json!({ "reason": reason, "kind": "role_group", "scope": "org" });
+fn refused(app: &AppState, by: &Who, scope: &str, reason: &str, details: Value, msg: String) -> ApiError {
+    let mut d = json!({ "reason": reason, "kind": "role_group", "scope": scope });
     if let (Some(d), Value::Object(x)) = (d.as_object_mut(), details) {
         d.extend(x);
     }
@@ -403,30 +520,36 @@ fn refused(app: &AppState, by: &Who, reason: &str, details: Value, msg: String) 
     bad(msg)
 }
 
-fn reaches_msg(role: &CustomRole, reach: &[&str]) -> String {
+fn reaches_msg(role: &CustomRole, scope: &str, reach: &[&str]) -> String {
     format!(
-        "{} holds {}, which {} on admins, so a SCIM role group can't give it. Give it by hand, or pick a role without {}.",
+        "{} holds {}, which {} on admins {}, so a SCIM role group can't give it. Give it by hand, or pick a role without {}.",
         role.name,
         reach.join(" and "),
         if reach.len() == 1 { "acts" } else { "act" },
+        if scope == TEAM { "in a team" } else { "across the server" },
         if reach.len() == 1 { "it" } else { "them" },
     )
 }
 
-/// The custom role a request names, refused (and audited) if SCIM may not give it.
-fn pick_role(app: &AppState, by: &Who, v: &Value) -> Res<CustomRole> {
+/// The custom role a request names, refused (and audited) if SCIM may not give it in `scope`.
+fn pick_role(app: &AppState, by: &Who, scope: &str, v: &Value) -> Res<CustomRole> {
     let key = v.as_str().map(str::trim).filter(|k| !k.is_empty()).ok_or_else(|| bad("role must be a custom role's id or name"))?;
     match Role::parse(key) {
-        Some(Role::Admin) => return Err(refused(app, by, "admin", json!({ "role": key }), "A SCIM role group can never give admin. Give admin by hand.".into())),
-        Some(_) => return Err(refused(app, by, "built_in", json!({ "role": key }), "A SCIM role group gives only a custom role. Members keep their built-in role as it is.".into())),
+        Some(Role::Admin) => return Err(refused(app, by, scope, "admin", json!({ "role": key }), "A SCIM role group can never give admin. Give admin by hand.".into())),
+        Some(_) => return Err(refused(app, by, scope, "built_in", json!({ "role": key }), "A SCIM role group gives only a custom role. Members keep their built-in role as it is.".into())),
         None => {}
     }
     let role = app.db.find_custom_role(key).ok_or_else(|| not_found("Role"))?;
-    let reach = role.perms().reaching_admins(false);
+    let reach = reaching(&role, scope);
     if !reach.is_empty() {
-        return Err(refused(app, by, "reaches_admins", json!({ "role": { "id": role.id, "name": role.name }, "permissions": reach }), reaches_msg(&role, &reach)));
+        return Err(reaches(app, by, scope, &role, reach));
     }
     Ok(role)
+}
+
+fn reaches(app: &AppState, by: &Who, scope: &str, role: &CustomRole, reach: Vec<&'static str>) -> ApiError {
+    let msg = reaches_msg(role, scope, &reach);
+    refused(app, by, scope, "reaches_admins", json!({ "role": { "id": role.id, "name": role.name }, "permissions": reach }), msg)
 }
 
 fn clean(v: &Value, k: &str, max: usize) -> Res<Option<String>> {
@@ -457,32 +580,39 @@ pub async fn list(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>
     Json(json!({ "enabled": a.scim.group_roles, "groups": a.scim.groups, "roleGroups": all }))
 }
 
-/// `POST /api/scim/role-groups {tenant, displayName, externalId?, role}`: declares that
-/// the tenant's group with this `externalId` (or, with none, this `displayName`) is a
-/// role group giving `role` across the server. It waits, unseen, until the IdP pushes it.
+/// `POST /api/scim/role-groups {tenant, displayName, externalId?, role, scope?}`: declares
+/// that the tenant's group with this `externalId` (or, with none, this `displayName`) is a
+/// role group giving `role` across the server (`scope: "org"`, the default) or within the
+/// team each member is on (`"team"`, ADR 0206). It waits, unseen, until the IdP pushes it.
 pub async fn create_api(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
-    only_fields(&v, &["tenant", "displayName", "externalId", "role"])?;
+    only_fields(&v, &["tenant", "displayName", "externalId", "role", "scope"])?;
     if !a.scim.group_roles {
         return Err(off());
     }
+    let scope = match &v["scope"] {
+        Value::Null => ORG,
+        Value::String(s) if s.trim() == ORG => ORG,
+        Value::String(s) if s.trim() == TEAM => TEAM,
+        _ => return Err(bad("scope must be org (across the server) or team (within the team each member is on)")),
+    };
     let tenant = tenant_name(&v["tenant"])?;
     let display_name = clean(&v, "displayName", MAX_NAME)?.ok_or_else(|| bad("displayName is required: the group's name as the IdP pushes it"))?;
     let external_id = clean(&v, "externalId", 256)?;
-    let role = pick_role(&app, &by, &v["role"])?;
+    let role = pick_role(&app, &by, scope, &v["role"])?;
     let _writes = a.scim.group_writes.lock().await;
     if team_has(&app, &tenant, Some(&display_name), external_id.as_deref()) {
         return Err(conflict(format!("Tenant {tenant} has a team group with this displayName or externalId. A group is a team or a role group, not both.")));
     }
-    let g = app.db.declare_scim_role_group(&tenant, &display_name, external_id.as_deref(), &role.id, by.actor.id.as_deref()).map_err(|e| match e {
+    let g = app.db.declare_scim_role_group(&tenant, scope, &display_name, external_id.as_deref(), &role.id, by.actor.id.as_deref()).map_err(|e| match e {
         ScimRoleGroupError::DisplayName => conflict(format!("Tenant {tenant} has a role group with this displayName already.")),
         ScimRoleGroupError::ExternalId => conflict(format!("Tenant {tenant} has a role group with this externalId already.")),
-        ScimRoleGroupError::Reaches(reach) => refused(&app, &by, "reaches_admins", json!({ "role": { "id": role.id, "name": role.name }, "permissions": reach }), reaches_msg(&role, &reach)),
+        ScimRoleGroupError::Reaches(reach) => reaches(&app, &by, scope, &role, reach),
         ScimRoleGroupError::Gone => not_found("Role"),
         ScimRoleGroupError::TimeBound => crate::roles::standing_refused(&role, "a SCIM role group"),
         ScimRoleGroupError::Db(e) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, e),
     })?;
     app.db.record(&by.event("scim.role_group_declared").target("scim_role_group", &g.id).details(json!({
-        "tenant": tenant, "roleGroup": g.id, "displayName": g.display_name, "externalId": g.external_id, "role": role_ref(Some(&role)), "applies": role.perms().names(),
+        "tenant": tenant, "roleGroup": g.id, "scope": g.scope, "displayName": g.display_name, "externalId": g.external_id, "role": role_ref(Some(&role)), "applies": applies(&role, scope),
     })));
     Ok((StatusCode::CREATED, Json(view(&app, &g))))
 }
@@ -496,7 +626,7 @@ pub async fn get_api(State(app): State<AppState>, Path(id): Path<String>) -> Res
         json!({ "id": id, "name": u.as_ref().map(|u| u.name.clone()), "email": u.and_then(|u| u.email) })
     };
     v["people"] = json!(app.db.scim_role_group_members(&g.tenant, &g.id).iter().map(|u| person(&u.id)).collect::<Vec<_>>());
-    v["holders"] = json!(app.db.scim_role_group_grants(&g.id).iter().map(|h| json!({ "user": person(&h.user_id), "grantedAt": h.granted_at, "priorRole": h.prior_role })).collect::<Vec<_>>());
+    v["holders"] = json!(app.db.scim_role_group_grants(&g.id).iter().map(|h| json!({ "user": person(&h.user_id), "grantedAt": h.granted_at, "priorRole": h.prior_role, "team": h.team_id })).collect::<Vec<_>>());
     Ok(Json(v))
 }
 
@@ -508,7 +638,9 @@ pub async fn update_api(State(app): State<AppState>, Extension(a): Extension<Arc
     if !a.scim.group_roles {
         return Err(off());
     }
-    let role = pick_role(&app, &by, &v["role"])?;
+    // A group's scope is fixed when it's declared, so it can be read before the lock.
+    let scope = need(&app, &id)?.scope;
+    let role = pick_role(&app, &by, &scope, &v["role"])?;
     let _writes = a.scim.group_writes.lock().await;
     let before = need(&app, &id)?;
     // The same role again isn't a no-op: it finishes a change cut short by a restart,
@@ -518,7 +650,7 @@ pub async fn update_api(State(app): State<AppState>, Extension(a): Extension<Arc
     // The new role is saved, and checked, first: a role edited or deleted meanwhile leaves
     // every grant as it was. Each grant records the role it gave, which is what goes.
     let g = app.db.set_scim_role_group_role(&before.id, &role.id).map_err(|e| match e {
-        ScimRoleGroupError::Reaches(reach) => refused(&app, &by, "reaches_admins", json!({ "role": { "id": role.id, "name": role.name }, "permissions": reach }), reaches_msg(&role, &reach)),
+        ScimRoleGroupError::Reaches(reach) => reaches(&app, &by, &scope, &role, reach),
         ScimRoleGroupError::Gone => not_found("Role group or role"),
         ScimRoleGroupError::TimeBound => crate::roles::standing_refused(&role, "a SCIM role group"),
         e => ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")),
@@ -546,12 +678,12 @@ pub async fn update_api(State(app): State<AppState>, Extension(a): Extension<Arc
         }
     }
     for id in revoked.iter().filter(|id| !granted.contains(id)) {
-        reoffer(&app, &a, &by, id).await;
+        reoffer(&app, &a, &by, id, &g.scope).await;
     }
     if changed || !revoked.is_empty() || !granted.is_empty() {
         let from = app.db.custom_role(&before.role_id);
         app.db.record(&by.event("scim.role_group_changed").target("scim_role_group", &g.id).details(json!({
-            "tenant": g.tenant, "roleGroup": g.id, "displayName": g.display_name, "from": role_ref(from.as_ref()), "to": role_ref(Some(&role)), "revoked": revoked, "granted": granted,
+            "tenant": g.tenant, "roleGroup": g.id, "scope": g.scope, "displayName": g.display_name, "from": role_ref(from.as_ref()), "to": role_ref(Some(&role)), "revoked": revoked, "granted": granted,
         })));
     }
     let mut out = view(&app, &g);
@@ -578,11 +710,11 @@ pub async fn delete_api(State(app): State<AppState>, Extension(a): Extension<Arc
         return Err(not_found("Role group"));
     }
     for id in &revoked {
-        reoffer(&app, &a, &by, id).await;
+        reoffer(&app, &a, &by, id, &g.scope).await;
     }
     let pushed = g.provisioned_at.is_some();
     app.db.record(&by.event("scim.role_group_removed").target("scim_role_group", &g.id).details(json!({
-        "tenant": g.tenant, "roleGroup": g.id, "displayName": g.display_name, "externalId": g.external_id, "role": role_ref(app.db.custom_role(&g.role_id).as_ref()), "revoked": revoked, "wasPushed": pushed,
+        "tenant": g.tenant, "roleGroup": g.id, "scope": g.scope, "displayName": g.display_name, "externalId": g.external_id, "role": role_ref(app.db.custom_role(&g.role_id).as_ref()), "revoked": revoked, "wasPushed": pushed,
     })));
     Ok(Json(json!({ "ok": true, "revoked": revoked, "wasPushed": pushed })))
 }

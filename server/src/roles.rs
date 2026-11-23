@@ -104,11 +104,12 @@ fn person(u: &User) -> Value {
     json!({ "id": u.id, "name": u.name, "email": u.email })
 }
 
-/// The SCIM mapping (ADR 0138) or role group (ADR 0180) that gave `user_id` their role
-/// in `scope`, if one did.
+/// The SCIM mapping (ADR 0138) or role group (ADR 0180, within a team ADR 0206) that
+/// gave `user_id` their role in `scope`, if one did.
 fn scim_source(app: &AppState, user_id: &str, scope: &str) -> Option<String> {
     let mapped = app.db.scim_role_grants_of_user(user_id).into_iter().find(|g| g.scope == scope).map(|g| g.mapping_id);
-    mapped.or_else(|| (scope == "org").then(|| app.db.scim_role_group_grant_of_user(user_id)).flatten().map(|g| g.group_id))
+    let group = || if scope == "org" { app.db.scim_role_group_grant_of_user(user_id) } else { app.db.scim_team_role_group_grant_of_user(user_id) };
+    mapped.or_else(|| group().map(|g| g.group_id))
 }
 
 /// The SAML mapping that gave `user_id` their role across the server, if one did (ADR 0160).
