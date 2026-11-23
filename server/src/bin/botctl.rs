@@ -291,7 +291,7 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine removals [<state>]                Teammate removals: open (default), pending, held, done, cancelled, all
   botctl secrets                                   List secret names (never values)
   botctl secrets backend                           Where botd reads secrets from (local, Vault, Azure Key
-                                                   Vault, GCP Secret Manager) and whether it answers now
+                                                   Vault, GCP or AWS Secrets Manager) and whether it answers now
   botctl secret set <NAME> < value-file            Save a secret, encrypted; Bots get it as $NAME
   botctl secret rm <NAME>                          Delete a saved secret
 
@@ -1369,7 +1369,7 @@ fn setup_summary(s: &Value) -> String {
     out
 }
 
-/// Where botd reads secrets from and whether it answers (ADR 0125, ADR 0136); an error
+/// Where botd reads secrets from and whether it answers (ADR 0125, ADR 0136, ADR 0146); an error
 /// when it doesn't, so scripts can check it.
 fn backend_summary(b: &Value) -> Result<String, String> {
     if b.is_null() {
@@ -1448,6 +1448,17 @@ fn saml_summary(v: &Value) -> String {
             _ => "off",
         }
     );
+    out += &format!(
+        "  IdP metadata signature:   {}\n",
+        match v["signedMetadata"].as_str() {
+            Some("require") => "required",
+            Some("allow") => "checked when signed",
+            _ => "not checked",
+        }
+    );
+    for c in v["metadataSigningCertificates"].as_array().into_iter().flatten() {
+        out += &format!("    Trusted signer: SHA-256 {} ({}), expires {}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]));
+    }
     let yes = |b: bool| if b { "yes" } else { "no" };
     out += &format!(
         "  Signs AuthnRequests:      {}\n  Single logout:            {}\n",
@@ -2652,6 +2663,11 @@ mod tests {
         assert!(out.contains("SP encryption certificate: SHA-256 56:78 (secret), expires 2030-03-17") && out.contains("Encrypted assertions:     required"), "{out}");
         v["spEncryptionKey"] = json!({ "problem": "not offered until SSO_CORP_ENCRYPTION_PRIVATE_KEY is set" });
         assert!(saml_summary(&v).contains("SP encryption key:        not offered until SSO_CORP_ENCRYPTION_PRIVATE_KEY"));
+        assert!(saml_summary(&v).contains("IdP metadata signature:   not checked\n"));
+        v["signedMetadata"] = json!("require");
+        v["metadataSigningCertificates"] = json!([{ "sha256": "9a:bc", "subject": "CN=metadata", "notAfter": 1_900_000_000_000_i64 }]);
+        let out = saml_summary(&v);
+        assert!(out.contains("IdP metadata signature:   required\n    Trusted signer: SHA-256 9a:bc (CN=metadata), expires 2030-03-17"), "{out}");
     }
 
     #[test]

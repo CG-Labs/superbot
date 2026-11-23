@@ -156,6 +156,8 @@ mod runner;
 mod sandbox;
 mod scim;
 #[cfg(test)]
+mod scim_bulk_http_tests;
+#[cfg(test)]
 mod scim_group_roles_http_tests;
 #[cfg(test)]
 mod scim_groups_http_tests;
@@ -170,6 +172,7 @@ mod service_accounts_http_tests;
 #[cfg(test)]
 mod server_backups_http_tests;
 mod setup;
+mod sigv4;
 #[cfg(test)]
 mod setup_http_tests;
 #[cfg(test)]
@@ -322,7 +325,7 @@ async fn main() {
     obs::log::set_format(observe.log);
     match (&external, external_names) {
         (Some(x), Some(n)) => log_info!("Secrets backend: {} ({n} names; SECRETS_BACKEND, ADR 0125).", x.describe()),
-        _ => log_info!("Secrets backend: local (the environment and the sealed store; SECRETS_BACKEND=vault, azure-keyvault or gcp-secret-manager adds one, ADR 0125, ADR 0136)."),
+        _ => log_info!("Secrets backend: local (the environment and the sealed store; SECRETS_BACKEND=vault, azure-keyvault, gcp-secret-manager or aws adds one, ADR 0125, ADR 0136, ADR 0146)."),
     }
     obs::errors::install_panic_hook();
     obs::errors::start(&observe.errors);
@@ -1117,6 +1120,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
             "/scim/v2/Groups/{id}",
             get(scim::groups::get).put(scim::groups::replace).patch(scim::groups::patch).delete(scim::groups::delete).layer(DefaultBodyLimit::max(scim::groups::MAX_BODY)),
         )
+        // Bulk's maxPayloadSize (ADR 0153); each operation keeps its endpoint's own limit.
+        .route("/scim/v2/Bulk", post(scim::bulk::bulk).fallback(scim::bulk::only_post).layer(DefaultBodyLimit::max(scim::bulk::MAX_PAYLOAD)))
         .route("/scim/v2", any(scim::unknown))
         .route("/scim/v2/{*rest}", any(scim::unknown))
         .route_layer(middleware::from_fn(obs::note_route))

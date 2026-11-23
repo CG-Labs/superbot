@@ -3,9 +3,10 @@
 //!
 //! It takes only what SAML IdPs send: one enveloped `ds:Signature` per signed element, one
 //! `Reference` to that element's own `ID`, the transforms enveloped-signature then Exclusive
-//! C14N, RSA with SHA-256 or SHA-512, and keys from the configured IdP certificates (never
-//! from `KeyInfo`). Anything else is refused, not interpreted. The HTTP-Redirect binding's
-//! detached signature over a query string (ADR 0137) is checked with the same algorithms and keys.
+//! C14N, RSA with SHA-256 or SHA-512 or ECDSA on P-256 with SHA-256 or P-384 with SHA-384
+//! (ADR 0151), and keys from the configured IdP certificates (never from `KeyInfo`). Anything
+//! else is refused, not interpreted. The HTTP-Redirect binding's detached signature over a
+//! query string (ADR 0137) is checked with the same algorithms and keys.
 //!
 //! Documents are parsed with `roxmltree`, which refuses DTDs (so no entities, external or
 //! otherwise). Comments and processing instructions are refused outright: canonicalization
@@ -15,7 +16,7 @@ use super::jwt::Invalid;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use roxmltree::{Document, Node, ParsingOptions};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 
 pub const DSIG: &str = "http://www.w3.org/2000/09/xmldsig#";
 pub const EXC_C14N: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
@@ -23,11 +24,17 @@ const ENVELOPED: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
 pub const RSA_SHA256: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
 const RSA_SHA512: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512";
 const RSA_SHA1: &str = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
+pub const ECDSA_SHA256: &str = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256";
+pub const ECDSA_SHA384: &str = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384";
+const ECDSA_SHA1: &str = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha1";
 const SHA256: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
+const SHA384: &str = "http://www.w3.org/2001/04/xmldsig-more#sha384";
 const SHA512: &str = "http://www.w3.org/2001/04/xmlenc#sha512";
 const SHA1: &str = "http://www.w3.org/2000/09/xmldsig#sha1";
 /// A SAML response has a few dozen elements; this bounds what a hostile one costs to parse.
 const MAX_NODES: u32 = 10_000;
+/// Deeper than any SAML message or metadata nests; canonicalization recurses this far at most.
+const MAX_DEPTH: usize = 128;
 
 /// Parses `xml` with no DTD, no comments, and no processing instructions.
 pub fn parse(xml: &str) -> Result<Document<'_>, Invalid> {
@@ -96,11 +103,14 @@ fn escape_attr(s: &str, out: &mut String) {
 /// except `skip` (the enveloped signature). `inclusive` is the transform's PrefixList.
 pub fn exc_c14n(apex: Node, skip: Option<Node>, inclusive: &[String]) -> Result<String, Invalid> {
     let mut out = String::new();
-    c14n_element(apex, skip, inclusive, &[], &mut out)?;
+    c14n_element(apex, skip, inclusive, &[], 0, &mut out)?;
     Ok(out)
 }
 
-fn c14n_element(n: Node, skip: Option<Node>, inclusive: &[String], rendered: &[(String, String)], out: &mut String) -> Result<(), Invalid> {
+fn c14n_element(n: Node, skip: Option<Node>, inclusive: &[String], rendered: &[(String, String)], depth: usize, out: &mut String) -> Result<(), Invalid> {
+    if depth > MAX_DEPTH {
+        return Err(Invalid("bad_response"));
+    }
     let text = n.document().input_text();
     let scope: Vec<(&str, &str)> = n.namespaces().map(|ns| (ns.name().unwrap_or(""), ns.uri())).filter(|(p, _)| *p != "xml").collect();
     let bound = |p: &str| scope.iter().find(|(q, _)| *q == p).map(|(_, u)| *u);
@@ -163,7 +173,7 @@ fn c14n_element(n: Node, skip: Option<Node>, inclusive: &[String], rendered: &[(
     for c in n.children() {
         if c.is_element() {
             if Some(c) != skip {
-                c14n_element(c, skip, inclusive, &now, out)?;
+                c14n_element(c, skip, inclusive, &now, depth + 1, out)?;
             }
         } else if let Some(t) = c.text().filter(|_| c.is_text()) {
             escape_text(t, out);
@@ -175,10 +185,20 @@ fn c14n_element(n: Node, skip: Option<Node>, inclusive: &[String], rendered: &[(
     Ok(())
 }
 
-/// An IdP signing certificate from its metadata: RSA, at least 2048 bits.
+/// What a certificate's key is. Each signature algorithm is tried only with keys of its kind.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum KeyKind {
+    Rsa,
+    P256,
+    P384,
+}
+
+/// An IdP signing certificate from its metadata: RSA of at least 2048 bits, or ECDSA on
+/// P-256 or P-384 (ADR 0151).
 #[derive(Clone, Debug)]
 pub struct Cert {
-    /// The RSAPublicKey (PKCS #1) inside the certificate.
+    pub kind: KeyKind,
+    /// The RSAPublicKey (PKCS #1), or the uncompressed EC point, inside the certificate.
     key: Vec<u8>,
     /// SHA-256 of the certificate, as admins compare it with the IdP's console.
     pub sha256: String,
@@ -200,16 +220,43 @@ impl Cert {
             return Err("a certificate has trailing bytes".into());
         }
         let spki = c.public_key();
-        let bits = match spki.parsed() {
-            Ok(x509_parser::public_key::PublicKey::RSA(k)) => k.key_size(),
-            _ => return Err("only RSA signing certificates are supported".into()),
+        let kind = match spki.parsed() {
+            Ok(x509_parser::public_key::PublicKey::RSA(k)) if k.key_size() < 2048 => return Err(format!("a {}-bit RSA key is too short (2048 at least)", k.key_size())),
+            Ok(x509_parser::public_key::PublicKey::RSA(_)) => KeyKind::Rsa,
+            Ok(x509_parser::public_key::PublicKey::EC(_)) => match spki.algorithm.parameters.as_ref().and_then(|p| p.as_oid().ok()).map(|o| o.to_id_string()).as_deref() {
+                Some("1.2.840.10045.3.1.7") => KeyKind::P256,
+                Some("1.3.132.0.34") => KeyKind::P384,
+                _ => return Err("only P-256 and P-384 ECDSA certificates are supported".into()),
+            },
+            _ => return Err("only RSA and ECDSA (P-256, P-384) signing certificates are supported".into()),
         };
-        if bits < 2048 {
-            return Err(format!("a {bits}-bit RSA key is too short (2048 at least)"));
-        }
         let sha256 = Sha256::digest(&der).iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":");
-        Ok(Cert { key: spki.subject_public_key.data.to_vec(), sha256, subject: c.subject().to_string(), not_after: c.validity().not_after.timestamp() })
+        Ok(Cert { kind, key: spki.subject_public_key.data.to_vec(), sha256, subject: c.subject().to_string(), not_after: c.validity().not_after.timestamp() })
     }
+
+    /// Whether `signature` over `data` is this key's, by `alg` (which must be for its kind).
+    fn verifies(&self, alg: (KeyKind, &'static dyn aws_lc_rs::signature::VerificationAlgorithm), data: &[u8], signature: &[u8]) -> bool {
+        self.kind == alg.0 && aws_lc_rs::signature::UnparsedPublicKey::new(alg.1, &self.key).verify(data, signature).is_ok()
+    }
+}
+
+/// The certificates in a PEM file (or one base64 DER certificate without armour), for a
+/// trust anchor that may hold several during a rollover.
+pub fn certs_from_pem(pem: &str) -> Result<Vec<Cert>, String> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    if !pem.contains(BEGIN) {
+        return Ok(vec![Cert::from_base64(pem)?]);
+    }
+    let mut certs = Vec::new();
+    let mut rest = pem;
+    while let Some(b) = rest.find(BEGIN) {
+        let after = &rest[b + BEGIN.len()..];
+        let e = after.find(END).ok_or("a certificate has no END line")?;
+        certs.push(Cert::from_base64(&after[..e])?);
+        rest = &after[e + END.len()..];
+    }
+    Ok(certs)
 }
 
 /// The PrefixList of a c14n transform's `InclusiveNamespaces`, the only child it may have.
@@ -221,12 +268,17 @@ fn inclusive_prefixes(method: Node) -> Result<Vec<String>, Invalid> {
     }
 }
 
-/// The RSA verification `alg` (a SignatureMethod URI) names: SHA-256 or SHA-512, never SHA-1.
-fn rsa_algorithm(alg: &str) -> Result<&'static aws_lc_rs::signature::RsaParameters, Invalid> {
+/// The key kind and verification `alg` (a SignatureMethod or SigAlg URI) names: RSA with
+/// SHA-256 or SHA-512, or ECDSA on P-256 with SHA-256 or P-384 with SHA-384, never SHA-1.
+/// ECDSA signatures are `r || s` of the curve's size, as XML-DSig 1.1 has them, not DER.
+fn signature_algorithm(alg: &str) -> Result<(KeyKind, &'static dyn aws_lc_rs::signature::VerificationAlgorithm), Invalid> {
+    use aws_lc_rs::signature as s;
     match alg {
-        RSA_SHA256 => Ok(&aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA256),
-        RSA_SHA512 => Ok(&aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA512),
-        RSA_SHA1 => Err(Invalid("weak_algorithm")),
+        RSA_SHA256 => Ok((KeyKind::Rsa, &s::RSA_PKCS1_2048_8192_SHA256)),
+        RSA_SHA512 => Ok((KeyKind::Rsa, &s::RSA_PKCS1_2048_8192_SHA512)),
+        ECDSA_SHA256 => Ok((KeyKind::P256, &s::ECDSA_P256_SHA256_FIXED)),
+        ECDSA_SHA384 => Ok((KeyKind::P384, &s::ECDSA_P384_SHA384_FIXED)),
+        RSA_SHA1 | ECDSA_SHA1 => Err(Invalid("weak_algorithm")),
         _ => Err(Invalid("bad_algorithm")),
     }
 }
@@ -234,9 +286,8 @@ fn rsa_algorithm(alg: &str) -> Result<&'static aws_lc_rs::signature::RsaParamete
 /// A detached signature over `data` by one of `certs`, as the HTTP-Redirect binding signs its
 /// query string: the same algorithms and keys as an enveloped signature, and no XML.
 pub fn verify_raw(alg: &str, data: &[u8], signature: &[u8], certs: &[Cert]) -> Result<(), Invalid> {
-    let rsa = rsa_algorithm(alg)?;
-    let ok = certs.iter().any(|c| aws_lc_rs::signature::UnparsedPublicKey::new(rsa, &c.key).verify(data, signature).is_ok());
-    if ok { Ok(()) } else { Err(Invalid("bad_signature")) }
+    let alg = signature_algorithm(alg)?;
+    if certs.iter().any(|c| c.verifies(alg, data, signature)) { Ok(()) } else { Err(Invalid("bad_signature")) }
 }
 
 fn algorithm<'a>(n: Node<'a, '_>, name: &str) -> Result<&'a str, Invalid> {
@@ -271,7 +322,7 @@ pub fn verify_enveloped(signed: Node, certs: &[Cert]) -> Result<bool, Invalid> {
         return Err(Invalid("bad_algorithm"));
     }
     let signed_info_prefixes = inclusive_prefixes(c14n)?;
-    let rsa = rsa_algorithm(algorithm(method, "SignatureMethod")?)?;
+    let alg = signature_algorithm(algorithm(method, "SignatureMethod")?)?;
     if !is(reference, DSIG, "Reference") {
         return Err(Invalid("bad_signature"));
     }
@@ -295,6 +346,7 @@ pub fn verify_enveloped(signed: Node, certs: &[Cert]) -> Result<bool, Invalid> {
     let canonical = exc_c14n(signed, Some(sig), &reference_prefixes)?;
     let digest = match algorithm(digest_method, "DigestMethod")? {
         SHA256 => Sha256::digest(canonical.as_bytes()).to_vec(),
+        SHA384 => Sha384::digest(canonical.as_bytes()).to_vec(),
         SHA512 => Sha512::digest(canonical.as_bytes()).to_vec(),
         SHA1 => return Err(Invalid("weak_algorithm")),
         _ => return Err(Invalid("bad_algorithm")),
@@ -305,57 +357,85 @@ pub fn verify_enveloped(signed: Node, certs: &[Cert]) -> Result<bool, Invalid> {
     }
     let info = exc_c14n(signed_info, None, &signed_info_prefixes)?;
     let value = base64(value.text().unwrap_or("")).ok_or(Invalid("bad_signature"))?;
-    let ok = certs.iter().any(|c| aws_lc_rs::signature::UnparsedPublicKey::new(rsa, &c.key).verify(info.as_bytes(), &value).is_ok());
-    if ok { Ok(true) } else { Err(Invalid("bad_signature")) }
+    if certs.iter().any(|c| c.verifies(alg, info.as_bytes(), &value)) { Ok(true) } else { Err(Invalid("bad_signature")) }
 }
 
 #[cfg(test)]
 pub mod test_signer {
-    //! Signs SAML the way an IdP does, with a fresh RSA key and a self-signed certificate.
+    //! Signs SAML the way an IdP does, with a fresh key (RSA, or ECDSA on P-256 or P-384) and
+    //! a self-signed certificate.
 
     use super::*;
     use aws_lc_rs::rand::SystemRandom;
     use aws_lc_rs::rsa::KeyPair;
+    use aws_lc_rs::signature::EcdsaKeyPair;
     use std::sync::OnceLock;
 
+    enum Key {
+        Rsa(KeyPair),
+        Ec(EcdsaKeyPair),
+    }
+
     pub struct Signer {
-        pair: KeyPair,
+        key: Key,
+        /// The SignatureMethod (and SigAlg) it signs with.
+        pub alg: &'static str,
         /// The certificate, base64 DER, as metadata carries it.
         pub cert: String,
     }
 
     impl Signer {
-        fn new(cn: &str) -> Signer {
-            let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).unwrap();
+        fn new(cn: &str, kind: KeyKind) -> Signer {
+            let rc = match kind {
+                KeyKind::Rsa => &rcgen::PKCS_RSA_SHA256,
+                KeyKind::P256 => &rcgen::PKCS_ECDSA_P256_SHA256,
+                KeyKind::P384 => &rcgen::PKCS_ECDSA_P384_SHA384,
+            };
+            let key = rcgen::KeyPair::generate_for(rc).unwrap();
             let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
             params.distinguished_name.push(rcgen::DnType::CommonName, cn);
             let cert = params.self_signed(&key).unwrap();
-            let pair = KeyPair::from_pkcs8(&key.serialize_der()).unwrap();
-            assert_eq!(pair.public_modulus_len(), 256);
-            Signer { pair, cert: STANDARD.encode(cert.der()) }
+            let der = key.serialize_der();
+            let (key, alg) = match kind {
+                KeyKind::Rsa => (Key::Rsa(KeyPair::from_pkcs8(&der).unwrap()), RSA_SHA256),
+                KeyKind::P256 => (Key::Ec(EcdsaKeyPair::from_pkcs8(&aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED_SIGNING, &der).unwrap()), ECDSA_SHA256),
+                KeyKind::P384 => (Key::Ec(EcdsaKeyPair::from_pkcs8(&aws_lc_rs::signature::ECDSA_P384_SHA384_FIXED_SIGNING, &der).unwrap()), ECDSA_SHA384),
+            };
+            Signer { key, alg, cert: STANDARD.encode(cert.der()) }
         }
 
         pub fn cert(&self) -> Cert {
             Cert::from_base64(&self.cert).unwrap()
         }
 
-        pub fn rsa_sha256(&self, data: &[u8]) -> String {
-            let mut sig = vec![0; self.pair.public_modulus_len()];
-            self.pair.sign(&aws_lc_rs::signature::RSA_PKCS1_SHA256, &SystemRandom::new(), data, &mut sig).unwrap();
-            STANDARD.encode(sig)
+        /// A signature over `data` with `alg`, base64.
+        pub fn sign_raw(&self, data: &[u8]) -> String {
+            match &self.key {
+                Key::Rsa(pair) => {
+                    let mut sig = vec![0; pair.public_modulus_len()];
+                    pair.sign(&aws_lc_rs::signature::RSA_PKCS1_SHA256, &SystemRandom::new(), data, &mut sig).unwrap();
+                    STANDARD.encode(sig)
+                }
+                Key::Ec(pair) => STANDARD.encode(pair.sign(&SystemRandom::new(), data).unwrap()),
+            }
         }
 
         /// `xml` with an enveloped signature added to the element whose ID is `id`, right
-        /// after its first child (the Issuer), as IdPs place it.
+        /// after its first child (the Issuer), as IdPs place it. P-384 keys digest with SHA-384.
         pub fn sign(&self, xml: &str, id: &str) -> String {
             let doc = parse(xml).unwrap();
             let el = doc.descendants().find(|n| n.attribute("ID") == Some(id)).unwrap();
-            let digest = STANDARD.encode(Sha256::digest(exc_c14n(el, None, &[]).unwrap().as_bytes()));
+            let canonical = exc_c14n(el, None, &[]).unwrap();
+            let (digest_alg, digest) = match self.alg {
+                ECDSA_SHA384 => (SHA384, STANDARD.encode(Sha384::digest(canonical.as_bytes()))),
+                _ => (SHA256, STANDARD.encode(Sha256::digest(canonical.as_bytes()))),
+            };
             let signed_info = format!(
-                r##"<ds:SignedInfo xmlns:ds="{DSIG}"><ds:CanonicalizationMethod Algorithm="{EXC_C14N}"/><ds:SignatureMethod Algorithm="{RSA_SHA256}"/><ds:Reference URI="#{id}"><ds:Transforms><ds:Transform Algorithm="{ENVELOPED}"/><ds:Transform Algorithm="{EXC_C14N}"/></ds:Transforms><ds:DigestMethod Algorithm="{SHA256}"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo>"##
+                r##"<ds:SignedInfo xmlns:ds="{DSIG}"><ds:CanonicalizationMethod Algorithm="{EXC_C14N}"/><ds:SignatureMethod Algorithm="{}"/><ds:Reference URI="#{id}"><ds:Transforms><ds:Transform Algorithm="{ENVELOPED}"/><ds:Transform Algorithm="{EXC_C14N}"/></ds:Transforms><ds:DigestMethod Algorithm="{digest_alg}"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo>"##,
+                self.alg
             );
             let info = parse(&signed_info).unwrap();
-            let value = self.rsa_sha256(exc_c14n(info.root_element(), None, &[]).unwrap().as_bytes());
+            let value = self.sign_raw(exc_c14n(info.root_element(), None, &[]).unwrap().as_bytes());
             let body = signed_info.replacen(&format!(r#"<ds:SignedInfo xmlns:ds="{DSIG}">"#), "<ds:SignedInfo>", 1);
             let sig = format!(
                 r#"<ds:Signature xmlns:ds="{DSIG}">{body}<ds:SignatureValue>{value}</ds:SignatureValue><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>"#,
@@ -370,13 +450,24 @@ pub mod test_signer {
     /// Two IdP keys, made once per test run (RSA key generation is slow).
     pub fn signers() -> &'static [Signer; 2] {
         static S: OnceLock<[Signer; 2]> = OnceLock::new();
-        S.get_or_init(|| [Signer::new("idp.example"), Signer::new("other.example")])
+        S.get_or_init(|| [Signer::new("idp.example", KeyKind::Rsa), Signer::new("other.example", KeyKind::Rsa)])
+    }
+
+    /// Two ECDSA IdP keys: P-256 and P-384.
+    pub fn ec_signers() -> &'static [Signer; 2] {
+        static S: OnceLock<[Signer; 2]> = OnceLock::new();
+        S.get_or_init(|| [Signer::new("ec256.idp.example", KeyKind::P256), Signer::new("ec384.idp.example", KeyKind::P384)])
+    }
+
+    /// Every test key by number: the two RSA ones, then P-256 and P-384.
+    pub fn signer(i: usize) -> &'static Signer {
+        if i < 2 { &signers()[i] } else { &ec_signers()[i - 2] }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_signer::signers;
+    use super::test_signer::{ec_signers, signers};
     use super::*;
 
     fn c14n(xml: &str, inclusive: &[&str]) -> String {
@@ -484,24 +575,91 @@ mod tests {
     fn verifies_a_detached_signature_with_the_same_rules() {
         let [idp, other] = signers();
         let data = b"SAMLRequest=abc&RelayState=x&SigAlg=y";
-        let sig = STANDARD.decode(idp.rsa_sha256(data)).unwrap();
+        let sig = STANDARD.decode(idp.sign_raw(data)).unwrap();
         assert_eq!(verify_raw(RSA_SHA256, data, &sig, &[other.cert(), idp.cert()]), Ok(()));
         assert_eq!(verify_raw(RSA_SHA256, data, &sig, &[other.cert()]), Err(Invalid("bad_signature")));
         assert_eq!(verify_raw(RSA_SHA256, b"SAMLRequest=abd&RelayState=x&SigAlg=y", &sig, &[idp.cert()]), Err(Invalid("bad_signature")));
         assert_eq!(verify_raw(RSA_SHA256, data, &sig, &[]), Err(Invalid("bad_signature")));
         assert_eq!(verify_raw(RSA_SHA1, data, &sig, &[idp.cert()]), Err(Invalid("weak_algorithm")));
-        assert_eq!(verify_raw("http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256", data, &sig, &[idp.cert()]), Err(Invalid("bad_algorithm")));
+        assert_eq!(verify_raw(ECDSA_SHA256, data, &sig, &[idp.cert()]), Err(Invalid("bad_signature")), "an ECDSA algorithm never tries an RSA key");
+        assert_eq!(verify_raw("http://www.w3.org/2001/04/xmldsig-more#rsa-md5", data, &sig, &[idp.cert()]), Err(Invalid("bad_algorithm")));
     }
 
     #[test]
-    fn certificates_must_be_rsa_2048_or_more() {
+    fn certificates_must_be_rsa_2048_or_more_or_p256_or_p384() {
         let c = signers()[0].cert();
-        assert_eq!(c.sha256.len(), 95);
+        assert_eq!((c.sha256.len(), c.kind), (95, KeyKind::Rsa));
         assert!(c.subject.contains("idp.example") && c.not_after > 0);
         assert!(Cert::from_base64("not base64!").is_err());
         assert!(Cert::from_base64("AAAA").is_err());
-        let ec = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let ec_cert = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap().self_signed(&ec).unwrap();
-        assert!(Cert::from_base64(&STANDARD.encode(ec_cert.der())).unwrap_err().contains("only RSA"));
+        let cert_for = |alg: &'static rcgen::SignatureAlgorithm| {
+            let k = rcgen::KeyPair::generate_for(alg).unwrap();
+            STANDARD.encode(rcgen::CertificateParams::new(Vec::<String>::new()).unwrap().self_signed(&k).unwrap().der())
+        };
+        assert_eq!(Cert::from_base64(&cert_for(&rcgen::PKCS_ECDSA_P256_SHA256)).unwrap().kind, KeyKind::P256);
+        assert_eq!(Cert::from_base64(&cert_for(&rcgen::PKCS_ECDSA_P384_SHA384)).unwrap().kind, KeyKind::P384);
+        assert!(Cert::from_base64(&cert_for(&rcgen::PKCS_ED25519)).unwrap_err().contains("only RSA and ECDSA"));
+    }
+
+    #[test]
+    fn verifies_ecdsa_signatures_with_keys_of_their_curve_only() {
+        let [p256, p384] = ec_signers();
+        let [rsa, _] = signers();
+        for s in [p256, p384] {
+            let signed = s.sign(DOC, "a1");
+            let doc = parse(&signed).unwrap();
+            assert_eq!(verify_enveloped(assertion(&doc), &[rsa.cert(), s.cert()]), Ok(true), "{}", s.alg);
+            assert_eq!(verify_enveloped(assertion(&doc), &[rsa.cert()]), Err(Invalid("bad_signature")), "{}", s.alg);
+            let changed = signed.replacen("<a:Subject>ada<", "<a:Subject>eve<", 1);
+            assert_eq!(verify_enveloped(assertion(&parse(&changed).unwrap()), &[s.cert()]), Err(Invalid("bad_signature")), "{}", s.alg);
+        }
+        assert!(p384.sign(DOC, "a1").contains(SHA384), "P-384 digests with SHA-384");
+        let signed = p256.sign(DOC, "a1");
+        let doc = parse(&signed).unwrap();
+        assert_eq!(verify_enveloped(assertion(&doc), &[p384.cert()]), Err(Invalid("bad_signature")), "another curve's key");
+        // ecdsa-sha384 on a P-256 key, or ecdsa-sha256 named for a P-384 signature: never mixed.
+        let swapped = signed.replacen(ECDSA_SHA256, ECDSA_SHA384, 1);
+        assert_eq!(verify_enveloped(assertion(&parse(&swapped).unwrap()), &[p256.cert(), p384.cert()]), Err(Invalid("bad_signature")));
+        let sha1 = signed.replacen(ECDSA_SHA256, ECDSA_SHA1, 1);
+        assert_eq!(verify_enveloped(assertion(&parse(&sha1).unwrap()), &[p256.cert()]), Err(Invalid("weak_algorithm")));
+
+        let data = b"SAMLResponse=abc&SigAlg=y";
+        let raw = STANDARD.decode(p256.sign_raw(data)).unwrap();
+        assert_eq!(raw.len(), 64, "r || s, not DER");
+        assert_eq!(verify_raw(ECDSA_SHA256, data, &raw, &[rsa.cert(), p256.cert()]), Ok(()));
+        assert_eq!(verify_raw(RSA_SHA256, data, &raw, &[p256.cert()]), Err(Invalid("bad_signature")), "an RSA algorithm never tries an EC key");
+        assert_eq!(verify_raw(ECDSA_SHA384, data, &STANDARD.decode(p384.sign_raw(data)).unwrap(), &[p384.cert()]), Ok(()));
+        // The same signature DER-encoded, as some libraries make it: not what XML-DSig sends.
+        let der = {
+            let int = |b: &[u8]| {
+                let b = &b[b.iter().position(|x| *x != 0).unwrap_or(b.len() - 1)..];
+                let pad = b[0] & 0x80 != 0;
+                [vec![2, (b.len() + pad as usize) as u8], if pad { vec![0] } else { vec![] }, b.to_vec()].concat()
+            };
+            let body = [int(&raw[..32]), int(&raw[32..])].concat();
+            [vec![0x30, body.len() as u8], body].concat()
+        };
+        assert_eq!(verify_raw(ECDSA_SHA256, data, &der, &[p256.cert()]), Err(Invalid("bad_signature")));
+        assert_eq!(verify_raw(ECDSA_SHA1, data, &raw, &[p256.cert()]), Err(Invalid("weak_algorithm")));
+    }
+
+    #[test]
+    fn reads_every_certificate_in_a_pem_file() {
+        let [a, b] = signers();
+        let pem = |c: &str| format!("-----BEGIN CERTIFICATE-----\n{c}\n-----END CERTIFICATE-----\n");
+        let both = certs_from_pem(&format!("old one\n{}new one\n{}", pem(&a.cert), pem(&b.cert))).unwrap();
+        assert_eq!(both.iter().map(|c| c.sha256.clone()).collect::<Vec<_>>(), [a.cert().sha256, b.cert().sha256]);
+        assert_eq!(certs_from_pem(&a.cert).unwrap()[0].sha256, a.cert().sha256, "base64 DER without armour");
+        assert!(certs_from_pem("-----BEGIN CERTIFICATE-----\nAAAA").is_err());
+        assert!(certs_from_pem("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----").is_err());
+    }
+
+    #[test]
+    fn canonicalization_refuses_absurd_nesting() {
+        let deep = format!(r#"<r ID="x">{}{}</r>"#, "<a>".repeat(MAX_DEPTH + 1), "</a>".repeat(MAX_DEPTH + 1));
+        let doc = parse(&deep).unwrap();
+        assert_eq!(exc_c14n(doc.root_element(), None, &[]).err(), Some(Invalid("bad_response")));
+        let fine = format!(r#"<r ID="x">{}{}</r>"#, "<a>".repeat(MAX_DEPTH), "</a>".repeat(MAX_DEPTH));
+        assert!(exc_c14n(parse(&fine).unwrap().root_element(), None, &[]).is_ok());
     }
 }

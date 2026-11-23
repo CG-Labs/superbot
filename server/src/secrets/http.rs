@@ -1,4 +1,4 @@
-//! What the external secrets clients share (ADR 0125, ADR 0136): a small runtime of
+//! What the external secrets clients share (ADR 0125, ADR 0136, ADR 0146): a small runtime of
 //! their own that requests run on, so a store read from inside botd's async code never
 //! blocks on a runtime it is part of; an HTTP client that never follows redirects, so a
 //! token is never sent anywhere else; bearer tokens renewed before they lapse; and
@@ -123,13 +123,19 @@ impl Bearer {
     /// A token that lasts `lifetime` seconds is renewed two thirds of the way through,
     /// so it never lapses mid-run. Unknown lifetimes are renewed after five minutes.
     pub fn new(value: &str, lifetime: Option<u64>) -> Bearer {
-        let secs = lifetime.filter(|s| *s > 0).unwrap_or(300);
-        Bearer { value: Zeroizing::new(value.to_string()), renew_at: Some(Instant::now() + Duration::from_secs(secs) * 2 / 3) }
+        Bearer { value: Zeroizing::new(value.to_string()), renew_at: Some(renew_at(lifetime)) }
     }
 
     pub fn fresh(&self) -> bool {
         self.renew_at.is_none_or(|at| Instant::now() < at)
     }
+}
+
+/// When to renew a credential that lasts `lifetime` seconds: two thirds of the way
+/// through, or after five minutes if its lifetime is unknown.
+pub(crate) fn renew_at(lifetime: Option<u64>) -> Instant {
+    let secs = lifetime.filter(|s| *s > 0).unwrap_or(300);
+    Instant::now() + Duration::from_secs(secs) * 2 / 3
 }
 
 /// A number of seconds sent as a number or a string, as token endpoints do.
@@ -142,11 +148,14 @@ pub(crate) fn seconds(v: &Value) -> Option<u64> {
 /// never the description, which could quote what was sent.
 pub(crate) fn error_code(body: &[u8]) -> String {
     let v: Value = serde_json::from_slice(body).unwrap_or_default();
-    let code = [&v["error"]["code"], &v["error"]["status"], &v["error"]]
-        .into_iter()
-        .find_map(Value::as_str)
-        .filter(|c| !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)));
-    code.map(|c| format!(" ({c})")).unwrap_or_default()
+    let code = [&v["error"]["code"], &v["error"]["status"], &v["error"]].into_iter().find_map(Value::as_str);
+    code.map(code_suffix).unwrap_or_default()
+}
+
+/// ` (<code>)` for an error code that is safe to log, else nothing.
+pub(crate) fn code_suffix(code: &str) -> String {
+    let safe = !code.is_empty() && code.len() <= 64 && code.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b));
+    if safe { format!(" ({code})") } else { String::new() }
 }
 
 /// Audits a sign-in to a backend: `secret.backend_login`, with the method, never a credential.
