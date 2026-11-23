@@ -253,6 +253,45 @@ pub async fn check(plan: &HarnessPlan) -> Value {
     json!({ "ok": ok, "npmRegistry": registry, "ca": plan.ca.is_some(), "items": items })
 }
 
+/// Where `check` fetched from that Incus containers can't reach: the check runs on
+/// botd, outside their rules, so a mirror on a private address passes here but not
+/// there until INCUS_EGRESS_ALLOW opens it.
+pub async fn incus_reach(v: &mut Value, s: &super::incus::Settings) {
+    let mut urls: Vec<String> = vec![v["npmRegistry"].as_str().unwrap_or(NPM_REGISTRY).to_string()];
+    for i in v["items"].as_array().into_iter().flatten() {
+        if i["note"].is_null()
+            && let Some(u) = i["url"].as_str()
+        {
+            urls.push(u.to_string());
+        }
+    }
+    let mut places: Vec<(String, u16)> = urls
+        .iter()
+        .filter_map(|u| url::Url::parse(u).ok())
+        .filter_map(|u| Some((u.host_str()?.trim_matches(['[', ']']).to_string(), u.port_or_known_default()?)))
+        .collect();
+    places.sort();
+    places.dedup();
+    let open = s.open();
+    let mut blocked = Vec::new();
+    for (host, port) in places {
+        let Ok(addrs) = tokio::net::lookup_host((host.as_str(), port)).await else { continue };
+        for a in addrs {
+            if super::incus::drops(&s.deny, &open, a.ip(), port) {
+                blocked.push(json!({
+                    "host": host,
+                    "address": a.to_string(),
+                    "error": format!("Incus containers can't reach {host} at {a}: their firewall drops it. Add {a} to INCUS_EGRESS_ALLOW."),
+                }));
+            }
+        }
+    }
+    if !blocked.is_empty() {
+        v["ok"] = json!(false);
+    }
+    v["incusBlocked"] = json!(blocked);
+}
+
 /// `GET /api/machines/harness-mirror` (admins): `check` on the harness plan machines
 /// get. Nothing is installed or changed.
 pub async fn check_now(AppS(app): AppS<AppState>) -> Res<Json<Value>> {
@@ -264,6 +303,12 @@ pub async fn check_now(AppS(app): AppS<AppState>) -> Res<Json<Value>> {
         .clone()
         .ok_or_else(|| ApiError(StatusCode::CONFLICT, "MACHINE_HARNESSES is none, so machines get no harnesses to check.".into()))?;
     let mut v = check(&plan).await;
+    let var = |k: &str| std::env::var(k).unwrap_or_default();
+    if var("MACHINE_PROVIDER").trim() == "incus"
+        && let Ok(s) = super::incus::Settings::from_env(&var)
+    {
+        incus_reach(&mut v, &s).await;
+    }
     v["mirrors"] = json!({
         "node": e.upkeep.mirrors.as_ref().and_then(|m| m.node.clone()),
         "npm": e.upkeep.mirrors.as_ref().and_then(|m| m.npm.clone()),
@@ -402,5 +447,36 @@ mod tests {
         assert!(errors[1].contains("not the pinned"), "{errors:?}");
         assert!(errors[2].contains("not the listed"), "{errors:?}");
         assert!(errors[3].contains("has no fake-codex@2.0.0"), "{errors:?}");
+    }
+
+    #[tokio::test]
+    async fn the_check_says_when_incus_containers_cant_reach_the_mirror() {
+        let mirror = Mirror::serve().await;
+        let node = mirror.node("0.0.1", b"a node tarball");
+        let pin = mirror.package("fake-codex", "1.0.0", b"codex's tarball");
+        let plan = mirror.plan(&node, vec![("codex", "fake-codex", "1.0.0", Some(pin))]);
+        let at = url::Url::parse(&mirror.url).unwrap();
+        let here = format!("{}:{}", at.host_str().unwrap(), at.port().unwrap());
+        let settings = |allow: &str| {
+            let pairs = [
+                ("INCUS_URL", "https://192.0.2.50".to_string()),
+                ("INCUS_EGRESS_DENY", "127.0.0.0/8".into()),
+                ("INCUS_EGRESS_ALLOW", allow.to_string()),
+            ];
+            crate::machines::incus::Settings::from_env(&env(&pairs)).unwrap()
+        };
+
+        let mut v = check(&plan).await;
+        assert_eq!(v["ok"], true, "{v}");
+        incus_reach(&mut v, &settings("")).await;
+        assert_eq!(v["ok"], false, "{v}");
+        let blocked = v["incusBlocked"].as_array().unwrap();
+        assert_eq!(blocked.len(), 1, "one place, however many files: {v}");
+        assert!(blocked[0]["error"].as_str().unwrap().contains(&format!("Add {here} to INCUS_EGRESS_ALLOW")), "{v}");
+
+        let mut v = check(&plan).await;
+        incus_reach(&mut v, &settings(&here)).await;
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["incusBlocked"], json!([]));
     }
 }

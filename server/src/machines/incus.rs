@@ -230,6 +230,12 @@ fn span(cidr: &str) -> Option<(bool, u128, u128)> {
     Some((v6, n & !host, n | host))
 }
 
+/// Whether `egress(deny, open)` drops TCP to `ip`:`port`.
+pub fn drops(deny: &[String], open: &[(IpAddr, u16)], ip: IpAddr, port: u16) -> bool {
+    let (v6, n) = number(ip);
+    !open.contains(&(ip, port)) && deny.iter().filter_map(|c| span(c)).any(|(is6, lo, hi)| is6 == v6 && (lo..=hi).contains(&n))
+}
+
 fn piece(v6: bool, lo: u128, hi: u128) -> String {
     if lo == hi {
         address(v6, lo).to_string()
@@ -239,11 +245,12 @@ fn piece(v6: bool, lo: u128, hi: u128) -> String {
 }
 
 /// The outbound rules every container gets: TCP and UDP dropped to `deny`, but for
-/// `control` (botd's machine address and port) when it falls inside it. Everything
-/// else outbound is allowed, so harnesses reach their APIs and package mirrors.
-pub fn egress(deny: &[String], control: Option<(IpAddr, u16)>) -> Vec<Rule> {
+/// the TCP addresses and ports in `open` (botd's machine port, INCUS_EGRESS_ALLOW)
+/// that fall inside it. Everything else outbound is allowed, so harnesses reach
+/// their APIs and package mirrors.
+pub fn egress(deny: &[String], open: &[(IpAddr, u16)]) -> Vec<Rule> {
     let mut out = Vec::new();
-    let mut carved = false;
+    let mut carved = std::collections::BTreeMap::<IpAddr, Vec<u16>>::new();
     for (v6, family) in [(false, "IPv4"), (true, "IPv6")] {
         let mut dest = Vec::new();
         for c in deny {
@@ -251,20 +258,29 @@ pub fn egress(deny: &[String], control: Option<(IpAddr, u16)>) -> Vec<Rule> {
             if is6 != v6 {
                 continue;
             }
-            let inside = control
-                .map(|(ip, _)| number(ip))
-                .filter(|(c6, n)| *c6 == v6 && (lo..=hi).contains(n));
-            match inside {
-                None => dest.push(c.clone()),
-                Some((_, n)) => {
-                    carved = true;
-                    if n > lo {
-                        dest.push(piece(v6, lo, n - 1));
-                    }
-                    if n < hi {
-                        dest.push(piece(v6, n + 1, hi));
-                    }
+            let mut holes: Vec<u128> = Vec::new();
+            for &(ip, port) in open {
+                let (o6, n) = number(ip);
+                if o6 == v6 && (lo..=hi).contains(&n) {
+                    holes.push(n);
+                    carved.entry(ip).or_default().push(port);
                 }
+            }
+            holes.sort();
+            holes.dedup();
+            if holes.is_empty() {
+                dest.push(c.clone());
+                continue;
+            }
+            let mut from = Some(lo);
+            for n in holes {
+                if let Some(f) = from.filter(|f| *f < n) {
+                    dest.push(piece(v6, f, n - 1));
+                }
+                from = n.checked_add(1).filter(|f| *f <= hi);
+            }
+            if let Some(f) = from.filter(|f| *f <= hi) {
+                dest.push(piece(v6, f, hi));
             }
         }
         if dest.is_empty() {
@@ -281,19 +297,25 @@ pub fn egress(deny: &[String], control: Option<(IpAddr, u16)>) -> Vec<Rule> {
             });
         }
     }
-    if let (true, Some((ip, port))) = (carved, control) {
-        let ports: Vec<String> = [(1u32, port as u32 - 1), (port as u32 + 1, 65535)]
-            .into_iter()
-            .filter(|(lo, hi)| lo <= hi)
-            .map(|(lo, hi)| if lo == hi { lo.to_string() } else { format!("{lo}-{hi}") })
-            .collect();
+    for (ip, mut open) in carved {
+        open.sort();
+        open.dedup();
+        let mut ports = Vec::new();
+        let mut from = 1u32;
+        for p in open.iter().map(|p| *p as u32).chain([65536]) {
+            if from < p {
+                ports.push(if from == p - 1 { from.to_string() } else { format!("{from}-{}", p - 1) });
+            }
+            from = p + 1;
+        }
+        let which: Vec<String> = open.iter().map(u16::to_string).collect();
         if !ports.is_empty() {
             out.push(Rule {
                 action: "drop".into(),
                 protocol: "tcp".into(),
                 destination: ip.to_string(),
                 destination_port: ports.join(","),
-                description: "superbot: only the machine port on the control plane".into(),
+                description: format!("superbot: only tcp port {} on {ip}", which.join(",")),
                 enabled: true,
                 ..Rule::default()
             });
@@ -302,7 +324,7 @@ pub fn egress(deny: &[String], control: Option<(IpAddr, u16)>) -> Vec<Rule> {
             action: "drop".into(),
             protocol: "udp".into(),
             destination: ip.to_string(),
-            description: "superbot: no udp to the control plane".into(),
+            description: format!("superbot: no udp to {ip}"),
             enabled: true,
             ..Rule::default()
         });
@@ -428,11 +450,39 @@ pub struct Settings {
     pub deny: Vec<String>,
     /// botd's machine address and port, when it is an IP.
     pub control: Option<(IpAddr, u16)>,
+    /// INCUS_EGRESS_ALLOW: TCP addresses and ports containers reach though `deny`
+    /// holds them, such as internal mirrors (ADR 0186).
+    pub allow: Vec<(IpAddr, u16)>,
+}
+
+impl Settings {
+    /// Everything carved out of `deny`: botd's machine port, then INCUS_EGRESS_ALLOW.
+    pub fn open(&self) -> Vec<(IpAddr, u16)> {
+        self.control.into_iter().chain(self.allow.iter().copied()).collect()
+    }
+}
+
+/// INCUS_EGRESS_ALLOW: comma-separated `address:port`, IPv6 in brackets, e.g.
+/// `10.0.0.20:443,[fd00::20]:8443`. Exact addresses only, so no range is opened.
+pub fn egress_allow(raw: &str) -> Result<Vec<(IpAddr, u16)>, String> {
+    let mut out = Vec::new();
+    for a in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let sa: std::net::SocketAddr = a
+            .parse()
+            .map_err(|_| format!("INCUS_EGRESS_ALLOW: {a:?} isn't an address and port, e.g. 10.0.0.20:443 or [fd00::20]:443"))?;
+        if sa.port() == 0 || sa.ip().is_unspecified() {
+            return Err(format!("INCUS_EGRESS_ALLOW: {a:?} needs a real address and port"));
+        }
+        out.push((sa.ip(), sa.port()));
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 impl Settings {
     /// INCUS_URL (needed), INCUS_PROJECT, INCUS_NETWORK, INCUS_STORAGE_POOL,
-    /// INCUS_IMAGE_SERVER, INCUS_EGRESS_DENY, and MACHINE_CONTROL_URL.
+    /// INCUS_IMAGE_SERVER, INCUS_EGRESS_DENY, INCUS_EGRESS_ALLOW, and MACHINE_CONTROL_URL.
     pub fn from_env(var: &dyn Fn(&str) -> String) -> Result<Settings, String> {
         let or = |k: &str, d: &str| Some(var(k).trim().to_string()).filter(|v| !v.is_empty()).unwrap_or_else(|| d.into());
         let raw = var("INCUS_URL");
@@ -471,8 +521,9 @@ impl Settings {
         let control = url::Url::parse(var("MACHINE_CONTROL_URL").trim())
             .ok()
             .and_then(|u| Some((ip_of(&u.host()?.to_owned())?, u.port_or_known_default()?)));
+        let allow = egress_allow(&var("INCUS_EGRESS_ALLOW"))?;
         let [project, network, pool] = <[String; 3]>::try_from(names).unwrap();
-        Ok(Settings { url, project, network, pool, image_server, deny, control })
+        Ok(Settings { url, project, network, pool, image_server, deny, control, allow })
     }
 }
 
@@ -706,7 +757,7 @@ impl Incus {
             .user_agent(concat!("superbot-botd/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| format!("Incus client: {e}"))?;
-        let egress = egress(&s.deny, s.control);
+        let egress = egress(&s.deny, &s.open());
         Ok(Incus { s, egress, pin, http, stream })
     }
 
@@ -1210,6 +1261,7 @@ impl MachineProvider for Incus {
             "imageServer": self.s.image_server.as_deref().unwrap_or("local"),
             "egressDenied": self.s.deny,
             "controlPlane": self.s.control.map(|(ip, port)| format!("{ip}:{port}")),
+            "egressAllowed": self.s.allow.iter().map(|(ip, port)| std::net::SocketAddr::new(*ip, *port).to_string()).collect::<Vec<_>>(),
             "egressRules": self.egress.iter().map(Rule::json).collect::<Vec<_>>(),
             "isolation": [
                 "unprivileged, with its own id range (security.idmap.isolated)",

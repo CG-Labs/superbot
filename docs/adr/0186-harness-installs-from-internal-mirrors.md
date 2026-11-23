@@ -42,6 +42,14 @@ An empty or stale remote only shows up when a machine fails. So botd can fetch e
 
 It answers with an entry per file and `ok` overall. Admins only: the route isn't in RBAC's delegable list, so it falls to admin, as other new routes do. `botctl machine mirror` calls it. It changes nothing and isn't audited, like other reads. With a remote that fetches on first use, it also fills the remote.
 
+### Incus containers reach private mirrors only where the operator opens them
+
+Incus containers drop all TCP and UDP to private, shared and link-local ranges and the Incus host ([ADR 0065](0065-incus-container-machines.md)), root's included. The one hole was botd's machine port, carved from the ranges when `MACHINE_CONTROL_URL` is a private IP. An internal mirror is almost always on a private address, so its downloads were dropped, and the check couldn't see it: it runs on botd, outside the containers' rules.
+
+`INCUS_EGRESS_ALLOW` takes exact `address:port` pairs (`10.0.0.20:443,[fd00::20]:443`), carved the same way: that address is taken out of the ranges, then every other TCP port on it and all UDP to it are dropped. No ranges, no host names, no UDP: a name could move to another address, and a range would open more than one mirror. It applies to every container, like the deny list, and shows in `botctl machine substrate`. With `MACHINE_PROVIDER=incus` the check resolves each place it fetched from and fails, saying what to add, for any address the containers' rules would drop. The machines' own allow-lists ([ADR 0135](0135-run-limits-and-egress-allow-lists.md)) don't apply to root, which installs the harnesses, so they need no entry.
+
+Considered instead: opening mirrors' addresses automatically from their URLs. botd would resolve the host names when it builds the rules, so the rules would silently follow DNS, and a typo'd URL would open whatever it names. The operator naming the address keeps the hole explicit and narrow.
+
 ### Hermes Agent stays as it is
 
 Hermes has no npm package. Its pinned installer clones from GitHub and installs from PyPI, which a URL rewrite can't cover. Mirroring it would mean a git mirror, a PyPI mirror and changes to its installer's arguments, a separate piece of work. botd's startup line and the check name any harness still fetched from the internet. The guide says to leave `hermes` out of `MACHINE_HARNESSES` there, and to set it explicitly, since unset it defaults to the managed tiers' harness, Hermes on the shipped plans.
@@ -62,5 +70,6 @@ Hermes has no npm package. Its pinned installer clones from GitHub and installs 
   - the plan rewrite keeps every pin and id, and agents without `harness_mirrors` aren't sent a plan with a registry or CA;
   - the check against a stand-in HTTPS mirror with a CA of its own: scoped names asked for as npm does, a missing CA, a pin the registry doesn't list, a tarball that differs, a wrong Node.js, an unknown version;
   - end to end on loopback with botd, the real agent over mutual TLS and the stand-in mirror: Node.js comes from the mirror over its CA, npm is given the registry and the CA, the check passes, then fails once the mirror's file changes;
-  - the real npm, in a Node.js laid out as nodejs.org's tarballs are, installs a package from the stand-in registry and refuses one that isn't pinned. CI runs this as root with networking off (`server.yml`, isolation job), and it fails without the CA.
+  - the real npm, in a Node.js laid out as nodejs.org's tarballs are, installs a package and a dependency only the stand-in registry has, and refuses one that isn't pinned. CI runs this as root with networking off (`server.yml`, isolation job), and it fails without the CA or the dependency;
+  - `INCUS_EGRESS_ALLOW`: parsing, the rules for several addresses and ports (botd and a mirror on one host, IPv6, a public one, the ends of a range), and the check failing until the mirror's address is allowed. On a real Incus host (`incus-e2e`), a container reaches the allowed port on botd's host and still not the other ports.
 - Not covered: Hermes Agent on machines without the internet, registries that need a login, and the machines' own OS packages (their image and apt mirror are the operator's, as for the server).
