@@ -67,7 +67,7 @@ impl Sink {
         }
     }
 
-    fn archive(&self) -> Option<&crate::audit_archive::Archive> {
+    pub(crate) fn archive(&self) -> Option<&crate::audit_archive::Archive> {
         match &self.kind {
             Kind::Archive(a) => Some(a),
             _ => None,

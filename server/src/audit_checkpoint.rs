@@ -758,6 +758,21 @@ fn fault(id: i64, reason: &'static str, error: impl Into<String>) -> Fault {
 /// Checks the `audit.checkpoint` event `id`, sealed onto `prev` after event `before`,
 /// against its details, its signature, the keys trusted, and its record.
 pub fn check_checkpoint(id: i64, prev: Option<&str>, d: Option<&Value>, before: Option<i64>, found: Option<&Checkpoint>, keys: &[Vec<u8>]) -> Result<(), Fault> {
+    check_signed(id, prev, d, before, keys)?;
+    let d = d.ok_or_else(|| fault(id, "malformed", "the checkpoint's details are missing a field"))?;
+    let (s, n) = (|k: &str| d[k].as_str().unwrap_or_default(), |k: &str| d[k].as_i64().unwrap_or_default());
+    let Some(c) = found else {
+        return Err(fault(id, "record", "its record, with any timestamp, is gone"));
+    };
+    if (c.seq, c.hash.as_str(), c.at, c.key_id.as_str(), c.public_key.as_str(), c.signature.as_str()) != (n("seq"), s("hash"), n("at"), s("keyId"), s("publicKey"), s("signature")) {
+        return Err(fault(id, "record", "its record differs from the event"));
+    }
+    Ok(())
+}
+
+/// The part of [`check_checkpoint`] that needs only the event: it names the head it is
+/// sealed onto, and one of `keys` signed it. What the archive check uses (ADR 0163).
+pub fn check_signed(id: i64, prev: Option<&str>, d: Option<&Value>, before: Option<i64>, keys: &[Vec<u8>]) -> Result<(), Fault> {
     let malformed = || fault(id, "malformed", "the checkpoint's details are missing a field");
     let d = d.ok_or_else(malformed)?;
     let s = |k: &str| d[k].as_str().ok_or_else(malformed);
@@ -775,12 +790,6 @@ pub fn check_checkpoint(id: i64, prev: Option<&str>, d: Option<&Value>, before: 
     }
     if !signed(&public, &statement(seq, hash, at, kid), signature) {
         return Err(fault(id, "signature", "its signature doesn't verify"));
-    }
-    let Some(c) = found else {
-        return Err(fault(id, "record", "its record, with any timestamp, is gone"));
-    };
-    if (c.seq, c.hash.as_str(), c.at, c.key_id.as_str(), c.public_key.as_str(), c.signature.as_str()) != (seq, hash, at, kid, d["publicKey"].as_str().unwrap_or_default(), signature) {
-        return Err(fault(id, "record", "its record differs from the event"));
     }
     Ok(())
 }

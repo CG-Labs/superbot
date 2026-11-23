@@ -356,6 +356,10 @@ pub struct Report {
     /// The signed checkpoints, and their timestamps, on the part of the chain walked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoints: Option<crate::audit_checkpoint::Checked>,
+    /// The write-once archive, when the check reads it too (ADR 0163). Each event here
+    /// that differs from it, or is missing, also counts as broken, with reason `archive`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive: Option<crate::audit_archive_verify::Checked>,
     /// Set when the log couldn't be read to the end; the check then fails.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -368,6 +372,16 @@ impl Report {
         if self.first_broken.as_ref().is_none_or(|b| id < b.id) {
             self.first_broken = Some(Broken { id, reason });
         }
+    }
+
+    /// Adds the archive's check: the check holds only if both do.
+    pub fn with_archive(mut self, a: crate::audit_archive_verify::Checked) -> Report {
+        for &id in &a.local_breaks {
+            self.broke(id, "archive");
+        }
+        self.ok = self.broken == 0 && self.error.is_none() && a.ok;
+        self.archive = Some(a);
+        self
     }
 }
 
@@ -576,6 +590,8 @@ pub struct Options {
     pub keys: Option<Vec<Vec<u8>>>,
     /// What a checkpoint's RFC 3161 token must chain to (`AUDIT_TIMESTAMP_CA_FILE`).
     pub trust: crate::tsa::Trust,
+    /// Read the write-once archive and hold the log to it too (ADR 0163).
+    pub archive: bool,
 }
 
 /// Checks the whole chain, with its checkpoints, against `pins`.
@@ -650,12 +666,17 @@ pub fn summary(r: &Report) -> Value {
         _ if r.ok => None,
         (Some(b), _) => Some(b.reason),
         (None, Some(_)) => Some("unreadable"),
+        (None, None) if r.archive.as_ref().is_some_and(|a| !a.ok) => Some("archive"),
         (None, None) => Some("broken"),
     };
-    json!({
+    let mut v = json!({
         "ok": r.ok, "reason": reason, "checked": r.checked, "erased": r.erased, "broken": r.broken, "firstBroken": r.first_broken,
         "head": r.head, "anchor": r.anchor, "pins": r.pins, "range": r.range, "checkpoints": r.checkpoints, "error": r.error,
-    })
+    });
+    if let Some(a) = &r.archive {
+        v["archive"] = crate::audit_archive_verify::summary(a);
+    }
+    v
 }
 
 /// Checks the chain once a day and records `audit.verified` with the head's hash: a
@@ -683,13 +704,17 @@ pub fn checked(app: &App, by: &crate::audit::Who, r: &Report) {
     if let Some(b) = &r.first_broken {
         crate::obs::log::log_warn!("WARNING: the audit log's hash chain is broken at event {} ({}); see docs/ops/audit-export.md.", b.id, b.reason);
     }
+    if let Some(a) = r.archive.as_ref().filter(|a| !a.ok) {
+        let first = a.first_problems.first().map(|p| format!(" first: {} ({})", p.error, p.reason)).or_else(|| a.error.clone().map(|e| format!(" {e}"))).unwrap_or_default();
+        crate::obs::log::log_warn!("WARNING: the audit archive {} doesn't hold ({} problems);{first}; see docs/ops/audit-export.md.", a.archive, a.problems);
+    }
     let outcome = if r.ok { Outcome::Success } else { Outcome::Failure };
     app.db.record(&by.event("audit.verified").target("audit", "chain").outcome(outcome).details(summary(r)));
 }
 
 /// The options `GET /api/audit/verify` takes: `pin=<id>:<hash>` (repeatable, or split by
-/// commas; at most 100), `from=<id>` and `to=<id>`, and `key=<hex>` (repeatable; at most
-/// 10): the checkpoint keys to trust instead of botd's own.
+/// commas; at most 100), `from=<id>` and `to=<id>`, `key=<hex>` (repeatable; at most
+/// 10): the checkpoint keys to trust instead of botd's own, and `archive=on`.
 pub fn options(q: &[(String, String)]) -> Result<Options, String> {
     fn all<'q>(q: &'q [(String, String)], name: &'q str) -> impl Iterator<Item = &'q str> {
         q.iter().filter(move |(k, _)| k == name).flat_map(|(_, v)| v.split(',')).map(str::trim).filter(|s| !s.is_empty())
@@ -715,12 +740,19 @@ pub fn options(q: &[(String, String)]) -> Result<Options, String> {
     if keys.len() > 10 {
         return Err("At most 10 keys".into());
     }
-    Ok(Options { pins, range, keys: (!keys.is_empty()).then_some(keys), trust: Default::default() })
+    let archive = match all(q, "archive").collect::<Vec<_>>().as_slice() {
+        [] | ["off"] => false,
+        ["on"] => true,
+        _ => return Err("archive is on or off, once at most".into()),
+    };
+    Ok(Options { pins, range, keys: (!keys.is_empty()).then_some(keys), trust: Default::default(), archive })
 }
 
-/// `GET /api/audit/verify[?pin=<id>:<hash>&from=<id>&to=<id>&key=<hex>]`: checks the
-/// chain, each pinned hash, from a SIEM or an earlier check, against the row there now,
-/// and every signed checkpoint and timestamp token on the way. Admins only.
+/// `GET /api/audit/verify[?pin=<id>:<hash>&from=<id>&to=<id>&key=<hex>&archive=on]`:
+/// checks the chain, each pinned hash, from a SIEM or an earlier check, against the row
+/// there now, and every signed checkpoint and timestamp token on the way; with
+/// `archive=on`, also the write-once archive, and every event in it against the row here
+/// (ADR 0163). Admins only.
 pub async fn get(
     axum::extract::State(app): axum::extract::State<Arc<App>>,
     axum::Extension(by): axum::Extension<crate::audit::Who>,
@@ -728,8 +760,25 @@ pub async fn get(
 ) -> Result<axum::Json<Report>, (axum::http::StatusCode, String)> {
     let mut o = options(&q).map_err(|m| (axum::http::StatusCode::BAD_REQUEST, m))?;
     o.trust = crate::audit_checkpoint::trust(&app);
+    let archive = match o.archive {
+        false => None,
+        true => {
+            let Some((x, a)) = app.audit_export.get().and_then(|x| x.sink.archive().map(|a| (x, a))) else {
+                return Err((axum::http::StatusCode::CONFLICT, "There is no archive to check: archive=on needs AUDIT_EXPORT=s3://<bucket>/<prefix>".into()));
+            };
+            // Read before the listing, so what was delivered by then is in it.
+            let delivered = x.delivered();
+            let batches = app.db.audit_export_cursor(&format!("{}#batch", x.sink.id)).is_some();
+            let keys = o.keys.clone().unwrap_or_else(|| crate::audit_checkpoint::trusted_keys(&app.db));
+            Some(crate::audit_archive_verify::check(&app, a, delivered, batches, o.range, &keys).await)
+        }
+    };
     let a = app.clone();
     let r = tokio::task::spawn_blocking(move || verify_with(&a.db, &o)).await.map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let r = match archive {
+        Some(c) => r.with_archive(c),
+        None => r,
+    };
     checked(&app, &by, &r);
     Ok(axum::Json(r))
 }
