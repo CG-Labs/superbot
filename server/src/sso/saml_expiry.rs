@@ -5,9 +5,8 @@
 //! and the certificates its metadata is signed by, when that is checked. botd never refuses a
 //! signature for a certificate's dates (SAML trusts the key the metadata names, not the
 //! certificate's validity), so an expiry doesn't stop botd. It stops the other side: some IdPs
-//! refuse an SP certificate past its end (ADFS refuses to encrypt to one), and an IdP replaces
-//! its own certificate when it ends, which signs nobody in until botd has the new one, unless
-//! botd reads its metadata from a URL.
+//! refuse an SP certificate past its end, and an IdP replaces its own certificate when it ends,
+//! which signs nobody in until botd has the new one, unless botd reads its metadata from a URL.
 //!
 //! Each certificate in use is judged on its own: `expiring` within [`WARN_DAYS`] of its end,
 //! then `expired`. A certificate is *covered* when another of the same kind isn't ending: an

@@ -52,7 +52,7 @@ You can set up the IdP first and fill in the two IdP settings after: until botd 
 botctl sso saml corp import < idp-metadata.xml
 ```
 
-With a URL, botd refreshes the metadata daily (keeping the last good copy if the IdP is down), so certificate rollovers need nothing from you. With a file or an import, add the new certificate before the IdP switches to it: metadata may list several.
+With a URL, botd refreshes the metadata daily (keeping the last good copy if the IdP is down), so certificate rollovers need nothing from you. With a file or an import, add the new certificate before the IdP switches to it: metadata may list several. botd warns 30 days before any certificate ends ([below](#certificates-that-are-ending)).
 
 ## 2. Register SuperBot at your IdP
 
@@ -197,7 +197,7 @@ The bridge's settings (`CLIENT_ID`, `IDP_ALIAS`, `SCOPES`, `*_CLAIM`) are refuse
 
 ## The SP key
 
-Each native provider has a signing key and certificate of its own ([ADR 0137](../adr/0137-saml-signed-requests-and-single-logout.md)). botd makes them the first time they're needed (RSA-3072, the certificate valid for 20 years), keeps the key sealed in its database, audits `sso.saml_sp_key_created`, and publishes the certificate and the SLO URL in the SP metadata. `botctl sso saml corp` shows its SHA-256. To replace it, [roll it over](#rolling-over-superbots-keys). To use your own, set `SSO_CORP_SP_CERT_FILE=/etc/superbot/corp-sp.pem` and the key as `SSO_CORP_PRIVATE_KEY` (`botctl secret set SSO_CORP_PRIVATE_KEY < corp-sp.key`); the provider isn't offered until the key is set and matches the certificate. botd reads it once, so restart botd after changing it. Your own key may be RSA (2048 bits or more) or ECDSA P-256 or P-384 (PKCS #8): botd then signs with `ecdsa-sha256` or `ecdsa-sha384`. Generated keys are always RSA, which every IdP takes.
+Each native provider has a signing key and certificate of its own ([ADR 0137](../adr/0137-saml-signed-requests-and-single-logout.md)). botd makes them the first time they're needed (RSA-3072, the certificate valid for 20 years), keeps the key sealed in its database, audits `sso.saml_sp_key_created`, and publishes the certificate and the SLO URL in the SP metadata. `botctl sso saml corp` shows its SHA-256. To replace it, [roll it over](#rolling-over-superbots-keys). botd warns before a certificate of its own ends, a configured one included ([below](#certificates-that-are-ending)). To use your own, set `SSO_CORP_SP_CERT_FILE=/etc/superbot/corp-sp.pem` and the key as `SSO_CORP_PRIVATE_KEY` (`botctl secret set SSO_CORP_PRIVATE_KEY < corp-sp.key`); the provider isn't offered until the key is set and matches the certificate. botd reads it once, so restart botd after changing it. Your own key may be RSA (2048 bits or more) or ECDSA P-256 or P-384 (PKCS #8): botd then signs with `ecdsa-sha256` or `ecdsa-sha384`. Generated keys are always RSA, which every IdP takes.
 
 If your IdP imported SuperBot's metadata before this key existed, import it again (or add the certificate and the SLO URL by hand) before turning on signed requests or single logout.
 
@@ -243,6 +243,43 @@ The keys botd makes can be replaced without a failed sign-in, on a schedule or a
 Promote once the next key has decrypted a sign-in (the IdP has it), and retire once the previous one hasn't for as long as your IdP takes to switch. These times are kept in memory, so they start over when botd restarts. `botctl sso saml corp key cancel encryption` drops a next key you haven't promoted. One rollover at a time: botd refuses a second next key, and a promotion while a previous key is still there.
 
 The keys of each stage are sealed in botd's database like the first one, and rotating the master key covers them. Keys from `SSO_<ID>_SP_CERT_FILE` or `SSO_<ID>_SP_ENCRYPTION_CERT_FILE` are yours, so botd refuses to roll them over. To change one, add the new certificate at the IdP first (for encryption, IdPs take only one, so do it when you change the key), then change the file and the secret together and restart botd.
+
+## Certificates that are ending
+
+botd warns before any certificate a provider depends on ends ([ADR 0198](../adr/0198-saml-certificate-expiry-warnings.md)). That covers its own signing and encryption certificates, the IdP's signing certificates in the metadata in use, and the trusted signers in `METADATA_SIGNING_CERT_FILE`. botd never refuses a signature because a certificate has expired: the metadata says which key to trust. But an IdP replaces its certificate when it ends, and some IdPs refuse an expired SP certificate. Either way, sign-ins stop on that day unless someone acted first. The usual case is an IdP rollover (Entra ID every three years, ADFS yearly) while botd reads the metadata from a file or an import, which nothing refreshes.
+
+From 30 days before its end, a certificate is *expiring*; after it, *expired*. `botctl sso saml corp` lists each one with what to do, and adds the time left after its date:
+
+```console
+Acme (corp): ready
+  …
+  IdP entity ID:            http://www.okta.com/exk1abc
+  Certificate warnings:
+    IdP signing certificate SHA-256 3f:a1:… expires 2026-12-20 (in 27 days)
+      Renew it at the IdP, then import its new metadata (listing both certificates) before the IdP switches: botctl sso saml corp import < metadata.xml.
+  SP signing certificate:   SHA-256 9c:02:… (generated), expires 2046-11-21
+  …
+    Certificate SHA-256 3f:a1:… (CN=acme), expires 2026-12-20 (in 27 days)
+```
+
+A certificate is *covered* when another of the same kind isn't ending. For example, the IdP's next certificate is already in its metadata, or botd's [next key](#rolling-over-superbots-keys) is published. The warning names it (`replacement`) and says what's left to do: nothing for the IdP's, or promote botd's next key once the IdP has it.
+
+botd checks at startup and every hour. With a metadata URL, it reads the metadata again first when its daily refresh is due, so a certificate the IdP has already replaced isn't reported. Each certificate is audited once as each notice comes due, and logged as a warning:
+
+- `sso.saml_certificate_expiring`, when it's 30 days from its end (`daysLeft`);
+- `sso.saml_certificate_expired`, once it has ended. The outcome is `failure` if nothing replaces it, and `success` if something does.
+
+Each has the provider, `role` (`sp_signing`, `sp_encryption`, `idp_signing` or `metadata_signing`), `stage` (`current` or `next` for a key botd made), `from` (where it comes from: `generated`, `secret`, `url`, `file` or `botctl`), the `certificate`'s SHA-256, its `subject`, `notAfter` and `replacement`. Alert on them in your SIEM (`botctl audit --action sso.saml_certificate_expiring`). The view (`GET /api/sso/<id>/saml`) gives every certificate `expiry` and `daysLeft`, and lists the warnings as `certificateWarnings`.
+
+What to do, by certificate:
+
+| Certificate | What to do |
+|-------------|------------|
+| botd's, generated | [Roll it over](#rolling-over-superbots-keys): `key next`, give the IdP the new metadata, `key promote`. Generated certificates last 20 years, so this is rare. |
+| botd's, from `SP_CERT_FILE` or `SP_ENCRYPTION_CERT_FILE` | Make a new key and certificate, give the IdP the new certificate first, then change the file and the secret together and restart botd. |
+| The IdP's, metadata from a URL | Renew it at the IdP. botd picks up the new certificate from the metadata by itself. |
+| The IdP's, from a file or an import | Renew it at the IdP, and give botd metadata that lists both certificates (a new file and a restart, or `botctl sso saml corp import`) before the IdP switches. Better: use the metadata URL. |
+| A trusted metadata signer | Add the IdP's or federation's next metadata signing certificate to `METADATA_SIGNING_CERT_FILE` and restart botd before it switches, or botd refuses the metadata it signs. |
 
 ## IdP keys: RSA and ECDSA
 
@@ -314,7 +351,7 @@ Every refused sign-in is in the audit log with a reason (`botctl audit --action 
 |--------|-----|
 | `not_linked` | Link the person, or turn on just in time. The event has the `subject` and the IdP's entity ID as `issuer`. |
 | `unsigned` | The IdP signs only the response, or nothing: sign the assertion. |
-| `bad_signature` | The IdP signed with a certificate botd doesn't have: refresh or import the metadata (`botctl sso saml <id>` shows the certificates in use). |
+| `bad_signature` | The IdP signed with a certificate botd doesn't have: refresh or import the metadata (`botctl sso saml <id>` shows the certificates in use). Often its certificate rolled over: look for `sso.saml_certificate_expiring` ([above](#certificates-that-are-ending)). |
 | `weak_algorithm`, `bad_algorithm` | Use RSA-SHA256 or ECDSA with SHA-256/384 (SHA-1 is refused), and AES-GCM if you encrypt (AES-CBC is refused). |
 | `encrypted_assertion` | The IdP encrypts but `SSO_<ID>_ENCRYPTED_ASSERTIONS` is `off`: turn it on ([above](#encrypted-assertions)), or turn off encryption at the IdP. |
 | `unencrypted_assertion` | `ENCRYPTED_ASSERTIONS=require`, but the IdP sent a plain assertion: turn on encryption at the IdP. |
