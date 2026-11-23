@@ -496,6 +496,9 @@ pub struct Settings {
     pub image_server: Option<String>,
     /// What containers never reach, canonical CIDRs.
     pub deny: Vec<String>,
+    /// The part of `deny` named for this host: INCUS_EGRESS_DENY and the Incus hosts,
+    /// kept even where an entry repeats one of PRIVATE's ranges.
+    pub kept: Vec<String>,
     /// botd's machine address and port, when it is an IP.
     pub control: Option<(IpAddr, u16)>,
     /// INCUS_EGRESS_ALLOW: TCP addresses and ports containers reach though `deny`
@@ -559,11 +562,14 @@ impl Settings {
                 Some(s.trim_end_matches('/').to_string())
             }
         };
-        let mut deny: Vec<String> = PRIVATE.iter().map(|s| s.to_string()).collect();
+        let mut kept = Vec::new();
         for c in var("INCUS_EGRESS_DENY").split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            deny.push(super::firewall::cidr(c).map_err(|e| format!("INCUS_EGRESS_DENY: {e}"))?);
+            kept.push(super::firewall::cidr(c).map_err(|e| format!("INCUS_EGRESS_DENY: {e}"))?);
         }
-        deny.push(super::firewall::cidr(&host_ip.to_string())?);
+        kept.push(super::firewall::cidr(&host_ip.to_string())?);
+        kept.sort();
+        kept.dedup();
+        let mut deny: Vec<String> = PRIVATE.iter().map(|s| s.to_string()).chain(kept.iter().cloned()).collect();
         deny.sort();
         deny.dedup();
         let control = url::Url::parse(var("MACHINE_CONTROL_URL").trim())
@@ -571,7 +577,7 @@ impl Settings {
             .and_then(|u| Some((ip_of(&u.host()?.to_owned())?, u.port_or_known_default()?)));
         let allow = egress_allow(&var("INCUS_EGRESS_ALLOW"))?;
         let [project, network, pool] = <[String; 3]>::try_from(names).unwrap();
-        Ok(Settings { url, project, network, pool, image_server, deny, control, allow })
+        Ok(Settings { url, project, network, pool, image_server, deny, kept, control, allow })
     }
 }
 
@@ -823,7 +829,7 @@ impl Incus {
                 return Err(why(&format!("{ip}, which containers reach botd or an INCUS_EGRESS_ALLOW address at")));
             }
         }
-        if let Some(c) = self.s.deny.iter().filter(|c| !PRIVATE.contains(&c.as_str())).find(|c| overlap(subnet, c)) {
+        if let Some(c) = self.s.kept.iter().find(|c| overlap(subnet, c)) {
             return Err(why(&format!("{c}, which containers are kept off (INCUS_EGRESS_DENY or an Incus host)")));
         }
         self.team_subnet = Some(subnet.to_string());
@@ -1803,8 +1809,9 @@ impl MachineProvider for Incus {
             let n = name(label)?;
             let router = router_of(subnet).ok_or_else(|| api(400, format!("{subnet} isn't an IPv4 range a team network can have")))?;
             self.check_team(subnet).await?;
+            // A restricted project sees only the networks its access list names, so it
+            // comes before looking; the ACL waits until the network is known to match.
             self.allow_network(n).await?;
-            self.ensure_team_acl(n, subnet).await?;
             let path = format!("/1.0/networks/{n}");
             let mut created = false;
             let v = match self.call(Method::GET, &path, &[], None, None).await {
@@ -1842,6 +1849,7 @@ impl MachineProvider for Incus {
             if t.subnet != subnet {
                 return Err(refused(format!("team network {n}'s subnet is {}, not MACHINE_TEAM_NETWORK_SUBNET's {subnet}", t.subnet)));
             }
+            self.ensure_team_acl(n, subnet).await?;
             Ok(t)
         })
     }

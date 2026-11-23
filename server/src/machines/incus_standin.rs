@@ -229,6 +229,7 @@ impl StandIn {
             pool: "default".into(),
             image_server: Some(super::incus::DEFAULT_IMAGE_SERVER.into()),
             deny,
+            kept: vec!["127.0.0.1/32".into()],
             control,
             allow: Vec::new(),
         }

@@ -199,9 +199,11 @@ impl Fleet {
         let every: Vec<String> = built.iter().filter_map(|(_, s, _)| host_cidr(&s.url)).collect();
         let mut members = Vec::new();
         for (name, mut s, c) in built {
-            s.deny.extend(every.iter().cloned());
-            s.deny.sort();
-            s.deny.dedup();
+            for d in [&mut s.deny, &mut s.kept] {
+                d.extend(every.iter().cloned());
+                d.sort();
+                d.dedup();
+            }
             let (key, raw) = own("INCUS_CAPACITY", &name);
             let cap = Some(raw.trim()).filter(|r| !r.is_empty()).map(capacity).transpose().map_err(|e| format!("{key}: {e}"))?;
             let (key, raw) = own("INCUS_MAX_MACHINES", &name);

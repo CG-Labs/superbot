@@ -720,9 +720,13 @@ async fn a_team_subnet_has_its_router_first_and_meets_nothing_eth0_reaches() {
     let e = make(s.clone()).with_team_subnet("10.9.0.0/16").err().unwrap();
     assert!(e.contains("meets 10.9.0.5, which containers reach botd"), "{e}");
     let mut deny = s.clone();
-    deny.deny.push("10.248.2.0/24".into());
+    deny.kept.push("10.248.2.0/24".into());
     let e = make(deny).with_team_subnet("10.248.0.0/22").err().unwrap();
     assert!(e.contains("meets 10.248.2.0/24"), "{e}");
+    let mut deny = s.clone();
+    deny.kept.push("10.0.0.0/8".into());
+    let e = make(deny).with_team_subnet("10.248.0.0/22").err().unwrap();
+    assert!(e.contains("meets 10.0.0.0/8"), "named in INCUS_EGRESS_DENY, a private range is kept: {e}");
 }
 
 #[tokio::test]
@@ -755,6 +759,8 @@ async fn a_team_network_is_an_isolated_ovn_network_with_its_own_acl() {
     assert!(e.to_string().contains("not MACHINE_TEAM_NETWORK_SUBNET's 10.249.0.0/22"), "{e}");
     let e = p.ensure_team_network(&n.label, "node2", "10.248.0.0/22").await.unwrap_err();
     assert!(e.to_string().contains("is for local, not node2"), "{e}");
+    assert_eq!(s.calls("PUT", "/1.0/network-acls/").len(), 0, "refused: the ACL its members use is left alone");
+    assert_eq!(s.w().acls[n.id.as_str()]["egress"][0]["destination"], "10.248.0.0/22");
     s.w().networks.insert("superbot-team-ffffffffffff-local".into(), json!({ "type": "ovn", "config": { "ipv4.address": "10.248.0.1/22" } }));
     let e = p.ensure_team_network("superbot-team-ffffffffffff-local", "local", "10.248.0.0/22").await.unwrap_err();
     assert!(e.to_string().contains("isn't an OVN network botd made for a team"), "{e}");
