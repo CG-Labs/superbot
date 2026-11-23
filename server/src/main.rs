@@ -39,6 +39,9 @@ mod backup_encryption_http_tests;
 mod interface_http_tests;
 #[cfg(test)]
 mod command_analysis_http_tests;
+mod config_baseline;
+#[cfg(test)]
+mod config_baseline_http_tests;
 mod chromium;
 mod cron;
 mod handover;
@@ -405,6 +408,7 @@ async fn main() {
     };
     let data_dir = root("DATA_DIR", "data");
     let evidence = evidence::Settings::from_env(&|k| env(k, ""), &data_dir).unwrap_or_else(|e| exit(format!("Evidence bundles: {e}")));
+    let baseline = config_baseline::Settings::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Configuration baseline: {e}")));
     let health_history = health_history::Settings::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Health score history: {e}")));
     let workspace = root("WORKSPACE_DIR", "workspace");
     let db_path = paths::child(&data_dir, "app.sqlite").unwrap();
@@ -774,6 +778,18 @@ async fn main() {
         "unencrypted": backup_targets.iter().filter(|t| !t.encrypted).map(|t| t.id).collect::<Vec<_>>(),
     });
     let _ = app.server_backups.set(Arc::new(server_backups));
+    let baseline = config_baseline::Startup {
+        settings: baseline,
+        mfa_pinned,
+        break_glass,
+        signin_alerts: auth_state.watch.settings.enabled,
+        testing,
+        chromium_sandbox,
+        metrics: observe.metrics.as_ref().map(|m| (m.addr.ip().is_loopback(), m.token.is_some())),
+        firewall_egress: machines::firewall::egress_from_env(&|k| env(k, "")).unwrap_or(false),
+        evidence_monthly: evidence.monthly,
+    };
+    config_baseline::at_startup(&app, baseline).unwrap_or_else(|e| exit(e));
     let router = router(app.clone(), auth_state);
     let policy = app.db.global_policy();
     app.db.record(&Event::new(Actor::system("server"), "server.started").details(json!({
@@ -984,6 +1000,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/support/health-score/history", get(health_history::get))
         .route("/evidence", get(evidence::get))
         .route("/evidence/bundle", get(evidence::bundle))
+        .route("/baseline", get(config_baseline::get))
         .route("/secrets", get(list_secrets))
         .route("/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/me/tier", get(my_tier))

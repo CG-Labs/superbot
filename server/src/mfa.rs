@@ -156,8 +156,9 @@ fn recovery_hashes(user_id: &str, codes: &[String]) -> Vec<String> {
 
 // Policy: who must have a second factor to sign in with a password or code.
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Policy {
+    #[default]
     Off,
     /// Admins, which includes the owner (break-glass) account.
     Admins,

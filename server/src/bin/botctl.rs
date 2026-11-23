@@ -258,6 +258,11 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    by default; to isn't included): access review, versions,
                                                    backups, retention, sign-ins and alerts, with SHA-256
                                                    digests; no secrets, names, emails or chats
+  botctl baseline                                  This server checked against the configuration baseline
+                                                   (docs/security/configuration-baseline.md, ADR 0193):
+                                                   each setting passes, fails, is waived by an exception,
+                                                   is for a person to check or doesn't apply; audited, and
+                                                   exits 1 while a setting fails
   botctl retention                                 How long chat history, harness session files,
                                                    teammates' archived work and the audit log are kept
                                                    (CHAT_RETENTION_DAYS, HARNESS_SESSION_RETENTION_DAYS,
@@ -1889,6 +1894,11 @@ fn run(args: &[String]) -> Result<String, String> {
             op("GET", &format!("/api/audit/checkpoints?limit={n}"), None)
         }
         ["audit", rest @ ..] => op("GET", &format!("/api/audit{}", audit_query(rest)?), None),
+        ["baseline"] => {
+            let res = op("GET", "/api/baseline", None)?;
+            // A failing setting is a failure, so a cron job or CI step notices.
+            if serde_json::from_str::<Value>(&res).ok().and_then(|v| v["ok"].as_bool()) == Some(false) { Err(res) } else { Ok(res) }
+        }
         ["retention"] => op("GET", "/api/retention", None),
         ["retention", "hold", bot, reason] => op("PUT", &format!("/api/retention/holds/{}", encode(bot)), Some(json!({ "reason": reason }).to_string())),
         ["retention", "release", bot] => op("DELETE", &format!("/api/retention/holds/{}", encode(bot)), None),
