@@ -261,6 +261,12 @@ impl Report {
         self.services.iter().map(|s| &s.0)
     }
 
+    /// What the digest covers for service account `id`.
+    #[cfg(test)]
+    pub(crate) fn service_held(&self, id: &str) -> Option<&Value> {
+        self.services.iter().find(|s| s.0["id"] == id).map(|s| &s.1)
+    }
+
     /// Counts a reviewer looks at first, also kept on the sign-off.
     pub fn summary(&self) -> Value {
         let count = |f: &dyn Fn(&Value) -> bool| self.people().filter(|p| f(p)).count();

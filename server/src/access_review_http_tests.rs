@@ -245,6 +245,8 @@ async fn a_service_account_whose_owner_is_off_its_team_is_flagged() {
     let admins = account(port, &admin, json!({ "name": "Alpha ops", "role": "member", "team": alpha })).await;
     let loose = account(port, &admin, json!({ "name": "Loose" })).await;
 
+    let held = || access_review::build_with(&app, &Default::default()).service_held(&anas).cloned().unwrap();
+    let held_on = held();
     let on = report(port, &admin).await;
     let s = service(&on, &anas);
     assert_eq!((s["ownerOnTeam"].clone(), s["flags"].clone()), (json!(true), json!([])), "{s}");
@@ -259,6 +261,10 @@ async fn a_service_account_whose_owner_is_off_its_team_is_flagged() {
     assert_eq!(service(&off, &admins)["flags"], json!([]));
     assert_eq!(off["summary"]["serviceAccountsFlagged"], 1);
     assert_ne!(off["digest"], on["digest"]);
+    // Her own row changes too; the account's part of the digest must change by itself, and only by this.
+    let mut held_off = held();
+    assert_eq!(held_off.as_array_mut().unwrap().pop(), Some(json!({ "ownerOnTeam": false })), "{held_off}");
+    assert_eq!(held_off, held_on, "nothing else it holds changed");
     let (code, res) = call(port, "POST", "/api/access-review/complete", &admin, &json!({ "digest": on["digest"] }).to_string()).await;
     assert_eq!(code, 409, "{res}");
     let (code, _, csv) = call_with(port, "GET", &format!("/api/access-review/export.csv?digest={}", off["digest"].as_str().unwrap()), &admin, "", "").await;
@@ -275,6 +281,7 @@ async fn a_service_account_whose_owner_is_off_its_team_is_flagged() {
     assert!(app.db.add_team_member(&alpha, &ana, "member", None));
     let back = report(port, &admin).await;
     assert_eq!((service(&back, &anas)["ownerOnTeam"].clone(), service(&back, &anas)["flags"].clone()), (json!(true), json!([])));
+    assert_eq!(held(), held_on);
 }
 
 #[tokio::test]
