@@ -12,7 +12,9 @@ sudo botd support check --home /home/superbot
 sudo botd support check --home /home/superbot --before-upgrade
 sudo botd support bundle --home /home/superbot          # saves superbot-support-offline-<time>.tar here
 
-# Compose, from deploy/docker (works with botd stopped)
+# Compose, from deploy/docker: in the running botd container while it runs...
+docker compose exec botd botd support check
+# ...and in a new one, with the same settings and volumes, while it's stopped
 docker compose run --rm --no-deps botd botd support check
 docker compose logs --no-color --tail 2000 botd > botd.log
 docker compose run --rm --no-deps -T -v "$PWD/botd.log:/tmp/botd.log:ro" botd botd support bundle --logs /tmp/botd.log -o - > support.tar
@@ -41,7 +43,7 @@ ok    data_dir    /home/superbot/superbot/data: 9 entries
 ok    disk        31.2 GiB free of 49.1 GiB (64%) where DATA_DIR is
 ok    database    encrypted, 48.0 MiB (WAL 4.0 MiB), schema 61 of 61, integrity ok; last started by botd 0.1.0 at 2026-11-20 09:12 UTC
 ok    master_key  found, from /home/superbot/.config/superbot/master.key
-warn  backups     14 archives in /home/superbot/superbot/backups; the newest, superbot-20261123-031512.tar.gz.age, is 4.8 hours old and encrypted; botd copies them off this host
+warn  backups     14 archives in /home/superbot/superbot/backups; the newest, superbot-20261123-031512.tar.gz.age, is 4.8 hours old and encrypted; botd copied the newest off this host
                   Take one just before the upgrade, so undoing it loses nothing. Back up now: ...
 ok    license     Licensed to <licensee> (enterprise, 250 seats) until 2027-06-30.
 
@@ -54,7 +56,7 @@ Each finding is `ok`, `info` (worth knowing, nothing to do), `warn` (look at it)
 
 ### botd
 
-Whether botd is running on this `DATA_DIR`: the process holding its data lock (from `/proc/locks`) and whether `GET /healthz` answers on `HOST`:`PORT` (a wildcard `HOST` is checked on `127.0.0.1`). Not running is a warning: it's why you're here, or expected while you restore. Running without answering usually means it's still starting (schema changes on a large database take a while); if it stays like that, read its log lines. `/healthz` answering with nothing holding the lock means that botd uses another `DATA_DIR`: point the check at its settings.
+Whether botd is running on this `DATA_DIR`: the process holding its data lock (from `/proc/locks`) and whether `GET /healthz` answers on `HOST`:`PORT` (a wildcard `HOST` is checked on `127.0.0.1`). Not running is a warning: it's why you're here, or expected while you restore. Running without answering usually means it's still starting (schema changes on a large database take a while); if it stays like that, read its log lines. `/healthz` answering with nothing holding the lock means that botd uses another `DATA_DIR`: point the check at its settings. In a container of its own (`docker compose run`), it can't see the botd container's process or loopback port, so it says so (info) instead of guessing: `docker compose ps` says whether botd runs, and while it does, run the check in it with `docker compose exec`.
 
 ### data_dir
 
@@ -82,7 +84,7 @@ Where the master key is, as botd finds it: `SUPERBOT_MASTER_KEY`, `SUPERBOT_MAST
 
 ### backups
 
-The archives `superbot-backup` left in `BACKUP_DIR` ([backup and restore](../ops/backup-restore.md)): how many, the newest's age, whether it's encrypted, and whether they leave the host (`SERVER_BACKUP_S3_*` or the machine backups' store, or `SERVER_BACKUP_OFF_HOST=off` for your own copies). A warning past 26 hours (the daily timer missed) or when they stay on the host, a failure past 7 days; before an upgrade, none is a failure and none in the last hour a warning. Without `BACKUP_DIR` (no `--home` or `--env-file`), it says it didn't look.
+The archives `superbot-backup` left in `BACKUP_DIR` ([backup and restore](../ops/backup-restore.md)): how many, the newest's age, whether it's encrypted, and whether they leave the host. With a store (`SERVER_BACKUP_S3_*` or the machine backups'), it reads botd's record of the copies it made (`botctl backups`): ok only when a finished copy is of the newest archive, a warning when the newest copy is older, there's none, or the record can't be read (then it says the copies are unconfirmed), with how many failed since. `SERVER_BACKUP_OFF_HOST=off` turns botd's copies off even with a store; copies you make yourself can't be seen here, so that's info, never ok. A warning past 26 hours (the daily timer missed) or when they stay on the host, a failure past 7 days; before an upgrade, none is a failure and none in the last hour a warning. Without `BACKUP_DIR` (no `--home` or `--env-file`), it says it didn't look.
 
 ### license
 

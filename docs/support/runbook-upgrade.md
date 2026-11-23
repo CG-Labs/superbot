@@ -9,7 +9,7 @@ The rule: **back up just before, check before and after, and go back by restorin
 When an upgrade has gone wrong:
 
 1. **Is botd up?** `systemctl status superbot` (installer) or `docker compose ps` (Compose). If it answers `/healthz` but something broke, skip to [up but broken](#up-but-broken).
-2. **Why it stopped:** `sudo botd support check --home /home/superbot` (Compose: `docker compose run --rm --no-deps botd botd support check`) says, without botd, whether the database opens, its schema against this botd's, the master key, disk, backups and the license ([support check](support-check.md)). Its last log lines say the rest: `journalctl -u superbot -n 200` or `docker compose logs --tail 200 botd`.
+2. **Why it stopped:** `sudo botd support check --home /home/superbot` (Compose: `docker compose exec botd botd support check` while botd runs, `docker compose run --rm --no-deps botd botd support check` while it's stopped) says, without botd, whether the database opens, its schema against this botd's, the master key, disk, backups and the license ([support check](support-check.md)). Its last log lines say the rest: `journalctl -u superbot -n 200` or `docker compose logs --tail 200 botd`.
 3. **Get a bundle for the ticket:** `sudo botd support bundle --home /home/superbot` (Compose: [support check](support-check.md#run-it)). It has the check's findings, redacted settings and the newest log lines.
 4. **Decide:** fix forward if the cause is clear and quick (below), otherwise [go back](#going-back) now. Don't keep a Severity 2 open while debugging.
 
@@ -48,10 +48,10 @@ Something works differently, or a feature fails, with botd up: a support bundle 
 
 Restore the backup taken just before the upgrade, **with the version it was made on**. Everything since the backup is lost, which is why it's taken just before.
 
-1. Install the previous version: the installer from the previous release's tag or commit, or `SUPERBOT_VERSION` set back (Compose), or the previous offline bundle. Don't start it yet if you can avoid it: stop it (`sudo systemctl stop superbot superbot-backup.timer`, or `docker compose stop botd backup`).
-2. Restore the archive ([server restore](runbook-server-restore.md), steps for the same host).
-3. `botd support check`: the database's schema must match this botd's. If it says **made by a newer botd**, the data is still the upgraded one: the restore didn't take, so do it again.
-4. Start botd and run the after-upgrade checks above.
+1. **Stop botd and the backup timer**: `sudo systemctl stop superbot superbot-backup.timer` (Compose: `docker compose stop botd backup`). The upgraded botd mustn't write any more, and the timer mustn't take a backup of the upgraded data.
+2. **Restore the archive first**, with the tools installed now ([server restore](runbook-server-restore.md), steps for the same host). Installing the previous version restarts botd, so it must find the restored data, never the upgraded one.
+3. **Then install the previous version**: the installer from the previous release's tag or commit, or the previous offline bundle (both start botd again), or `SUPERBOT_VERSION` set back in `.env` and `docker compose up -d` (Compose).
+4. **Check it**: `sudo botd support check --home /home/superbot` (Compose: `docker compose exec botd botd support check`). The database's schema must match this botd's. If it says **made by a newer botd**, the restore didn't take: stop botd at once and restore again. Then run the after-upgrade checks above.
 
 Never start an older botd on a database a newer one has changed, and never set `PRAGMA user_version` by hand: the older botd doesn't know the new tables and columns, and what it writes may not be readable by either version.
 

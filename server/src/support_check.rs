@@ -34,6 +34,8 @@ const BACKUP_FRESH_MS: i64 = HOUR_MS;
 const LICENSE_SOON_MS: i64 = 14 * DAY_MS;
 const LOG_LINES: usize = 2_000;
 const LOG_LINE_CHARS: usize = 2_000;
+/// What is read of a `--logs` file, from its end: enough for `LOG_LINES` long lines.
+const LOG_TAIL_BYTES: u64 = 8 << 20;
 const DOC: &str = "docs/support/support-check.md";
 
 const USAGE: &str = "Usage: botd support check [--before-upgrade] [--json] [--home <dir> | --env-file <file>]
@@ -276,6 +278,8 @@ fn check_botd(s: &Settings, data_dir: &Path) -> Finding {
             .fix("It may still be starting: schema changes on a large database take a while. If it stays like this, read its newest log lines (journalctl -u superbot -n 200, or docker compose logs --tail 200 botd)."),
         (None, true) => Finding::new("botd", Level::Warn, format!("/healthz answers on {addr}, but nothing holds this DATA_DIR's lock"))
             .fix("That botd uses another DATA_DIR. Point this check at its settings with --home or --env-file."),
+        (None, false) if Path::new("/.dockerenv").exists() => Finding::new("botd", Level::Info, "not seen from this container: a separate container can't see the botd service's process or its loopback port")
+            .fix("docker compose ps says whether botd runs. While it does, run this check in it: docker compose exec botd botd support check."),
         (None, false) => Finding::new("botd", Level::Warn, "isn't running")
             .fix("Start it (sudo systemctl start superbot, or docker compose up -d). If it stops again, its last log lines say why; botd support bundle collects them for a ticket."),
     };
@@ -377,10 +381,20 @@ fn check_master_key(keys: &Keys, format: Option<Format>) -> Finding {
 /// When botd last started on a database, and its version.
 type LastStart = Option<(i64, String)>;
 
+/// What botd recorded of copying archives off the host (ADR 0109): the newest finished
+/// copy's archive and time, and the copies that failed since.
+#[derive(Clone, Debug, Default)]
+struct Copies {
+    newest: Option<(String, i64)>,
+    failed_since: i64,
+}
+
 struct Database {
     finding: Finding,
     format: Option<Format>,
     bytes: u64,
+    /// None when the database couldn't be read.
+    copies: Option<Copies>,
 }
 
 fn check_database(data_dir: &Path, keys: &Keys) -> Database {
@@ -390,14 +404,14 @@ fn check_database(data_dir: &Path, keys: &Keys) -> Database {
     let (bytes, wal) = (size(&path), size(&data_dir.join("app.sqlite-wal")));
     let format = match database_encryption::format(&path) {
         Ok(f) => f,
-        Err(e) => return Database { finding: Finding::new("database", Level::Fail, e).fix("Run this as the user botd runs as, or as root."), format: None, bytes },
+        Err(e) => return Database { finding: Finding::new("database", Level::Fail, e).fix("Run this as the user botd runs as, or as root."), format: None, bytes, copies: None },
     };
     let restore = "Restore the newest good backup: docs/support/runbook-server-restore.md. Never edit app.sqlite by hand.";
     let key: Option<DbKey> = match format {
         Format::Missing => {
             let f = Finding::new("database", Level::Warn, format!("no database at {shown}"))
                 .fix("A new install makes one at first start. After a restore, the archive didn't land in this DATA_DIR: check DATA_DIR and restore again.");
-            return Database { finding: f, format: Some(format), bytes };
+            return Database { finding: f, format: Some(format), bytes, copies: None };
         }
         Format::Plain => None,
         Format::Encrypted => {
@@ -408,13 +422,13 @@ fn check_database(data_dir: &Path, keys: &Keys) -> Database {
                     let summary = if keys.all().next().is_none() { "encrypted, and no master key was found to open it" } else { "encrypted, and the master key doesn't open it (wrong key)" };
                     let f = Finding::new("database", Level::Fail, summary)
                         .fix("Use the master key this database was made with (the one kept off-host with the backups). If it's lost, the database can't be read.");
-                    return Database { finding: f, format: Some(format), bytes };
+                    return Database { finding: f, format: Some(format), bytes, copies: None };
                 }
             }
         }
     };
     let encrypted = format == Format::Encrypted;
-    let read = || -> rusqlite::Result<(i64, String, LastStart)> {
+    let read = || -> rusqlite::Result<(i64, String, LastStart, Copies)> {
         let c = database_encryption::open_read_only(&path, key.as_ref())?;
         let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         let integrity: String = c.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
@@ -422,13 +436,18 @@ fn check_database(data_dir: &Path, keys: &Keys) -> Database {
             .query_row("SELECT at, details FROM audit_events WHERE action = 'server.started' ORDER BY id DESC LIMIT 1", [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
             .ok()
             .map(|(at, d)| (at, serde_json::from_str::<Value>(&d).ok().and_then(|v| v["version"].as_str().map(String::from)).unwrap_or_default()));
-        Ok((version, integrity, started))
+        let newest = c
+            .query_row("SELECT archive, created_at FROM server_backups WHERE state = 'done' ORDER BY created_at DESC LIMIT 1", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .ok();
+        let since = newest.as_ref().map_or(0, |(_, at)| *at);
+        let failed_since = c.query_row("SELECT COUNT(*) FROM server_backups WHERE state = 'failed' AND created_at > ?", [since], |r| r.get(0)).unwrap_or(0);
+        Ok((version, integrity, started, Copies { newest, failed_since }))
     };
-    let (version, integrity, started) = match read() {
+    let (version, integrity, started, off_host) = match read() {
         Ok(r) => r,
         Err(e) => {
             let f = Finding::new("database", Level::Fail, format!("{shown} can't be read: {e}")).fix(restore);
-            return Database { finding: f, format: Some(format), bytes };
+            return Database { finding: f, format: Some(format), bytes, copies: None };
         }
     };
     let ours = crate::db::schema_version();
@@ -485,10 +504,22 @@ fn check_database(data_dir: &Path, keys: &Keys) -> Database {
     if !fixes.is_empty() {
         f = f.fix(fixes.join(" "));
     }
-    Database { finding: f, format: Some(format), bytes }
+    Database { finding: f, format: Some(format), bytes, copies: Some(off_host) }
 }
 
-fn check_backups(s: &Settings, now_ms: i64, before_upgrade: bool) -> Finding {
+/// Whether the archives leave the host, as botd is set to copy them and as it recorded doing it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum OffHost {
+    /// botd copied the newest archive.
+    Copied,
+    /// botd is set to copy them, but its record shows no copy of the newest, or can't be read.
+    Unconfirmed,
+    /// `SERVER_BACKUP_OFF_HOST=off`: the operator copies them, which this check can't see.
+    ByOperator,
+    None,
+}
+
+fn check_backups(s: &Settings, now_ms: i64, before_upgrade: bool, copies: Option<&Copies>) -> Finding {
     let back_up = "Back up now: sudo systemctl start superbot-backup.service (Compose: docker compose exec botd superbot-backup).";
     let Some(dir) = s.backup_dir() else {
         return Finding::new("backups", Level::Info, "BACKUP_DIR isn't set here, so local archives weren't looked at")
@@ -505,12 +536,16 @@ fn check_backups(s: &Settings, now_ms: i64, before_upgrade: bool) -> Finding {
         return Finding::new("backups", level, format!("no archives in {shown}")).fix(back_up);
     };
     let age = (now_ms - newest.created_at).max(0);
-    let off_host = if !s.get("SERVER_BACKUP_S3_BUCKET").is_empty() || !s.get("MACHINE_BACKUP_S3_BUCKET").is_empty() {
-        Some("botd")
-    } else if s.get("SERVER_BACKUP_OFF_HOST").eq_ignore_ascii_case("off") {
-        Some("you")
+    let store = !s.get("SERVER_BACKUP_S3_BUCKET").is_empty() || !s.get("MACHINE_BACKUP_S3_BUCKET").is_empty();
+    let copied = copies.and_then(|c| c.newest.as_ref());
+    let off_host = if s.get("SERVER_BACKUP_OFF_HOST").eq_ignore_ascii_case("off") {
+        OffHost::ByOperator
+    } else if !store {
+        OffHost::None
+    } else if copied.is_some_and(|(_, at)| *at >= newest.created_at) {
+        OffHost::Copied
     } else {
-        None
+        OffHost::Unconfirmed
     };
     let mut summary = format!(
         "{} archive{} in {shown}; the newest, {}, is {} old{}",
@@ -520,20 +555,38 @@ fn check_backups(s: &Settings, now_ms: i64, before_upgrade: bool) -> Finding {
         hours(age),
         if newest.encrypted { " and encrypted" } else { "" }
     );
-    summary.push_str(match off_host {
-        Some("botd") => "; botd copies them off this host",
-        Some(_) => "; copied off this host by you (SERVER_BACKUP_OFF_HOST=off)",
-        None => "; they stay on this host",
+    let failed = copies.map_or(0, |c| c.failed_since);
+    summary.push_str(&match (off_host, copied, copies) {
+        (OffHost::Copied, _, _) => "; botd copied the newest off this host".to_string(),
+        (OffHost::Unconfirmed, _, None) => "; botd is set to copy them off this host, but its record of copies couldn't be read, so that's unconfirmed".to_string(),
+        (OffHost::Unconfirmed, Some((name, at)), _) => format!("; botd's newest copy off this host is of {name}, {} old", hours((now_ms - at).max(0))),
+        (OffHost::Unconfirmed, None, _) => "; botd is set to copy them off this host, but has no finished copy".to_string(),
+        (OffHost::ByOperator, _, _) => "; botd doesn't copy them off this host (SERVER_BACKUP_OFF_HOST=off), and copies you make aren't checked here".to_string(),
+        (OffHost::None, _, _) => "; they stay on this host".to_string(),
     });
-    let details = json!({ "archives": archives.len(), "newest": newest.name, "ageHours": age / HOUR_MS, "encrypted": newest.encrypted, "offHost": off_host });
+    if failed > 0 && off_host != OffHost::ByOperator {
+        summary.push_str(&format!(" ({failed} failed since)"));
+    }
+    let off_host_word = match off_host {
+        OffHost::Copied => "copied",
+        OffHost::Unconfirmed => "unconfirmed",
+        OffHost::ByOperator => "operator",
+        OffHost::None => "none",
+    };
+    let details = json!({ "archives": archives.len(), "newest": newest.name, "ageHours": age / HOUR_MS, "encrypted": newest.encrypted, "offHost": off_host_word, "copiesFailedSince": failed });
     let f = if age > BACKUP_LOST_MS {
         Finding::new("backups", Level::Fail, summary).fix(format!("Backups have stopped: journalctl -u superbot-backup (or docker compose logs backup) says why. {back_up}"))
     } else if age > BACKUP_STALE_MS {
         Finding::new("backups", Level::Warn, summary).fix(format!("The daily backup missed its run: journalctl -u superbot-backup says why. {back_up}"))
     } else if before_upgrade && age > BACKUP_FRESH_MS {
         Finding::new("backups", Level::Warn, summary).fix(format!("Take one just before the upgrade, so undoing it loses nothing. {back_up}"))
-    } else if off_host.is_none() {
+    } else if off_host == OffHost::None {
         Finding::new("backups", Level::Warn, summary).fix("A lost host loses them too: give botd a store (SERVER_BACKUP_S3_*, docs/ops/backup-restore.md#off-site-copies).")
+    } else if off_host == OffHost::Unconfirmed {
+        Finding::new("backups", Level::Warn, summary)
+            .fix("botd copies each archive within a minute while it runs. With it up, botctl backups shows the store, its copies and their errors; botctl backups copy copies the newest now.")
+    } else if off_host == OffHost::ByOperator {
+        Finding::new("backups", Level::Info, summary).fix("Check your own copies (rclone, restic, rsync) hold this archive.")
     } else {
         Finding::new("backups", Level::Ok, summary)
     };
@@ -588,7 +641,7 @@ pub fn run(s: &Settings, before_upgrade: bool, now_ms: i64) -> Report {
         check_disk(&data_dir, db.bytes, before_upgrade),
         db.finding,
         check_master_key(&keys, db.format),
-        check_backups(s, now_ms, before_upgrade),
+        check_backups(s, now_ms, before_upgrade, db.copies.as_ref()),
         license,
     ];
     Report { before_upgrade, at: now_ms, data_dir, source: s.source(), findings, names }
@@ -661,7 +714,7 @@ impl Logs {
     fn read(&self) -> Result<String, String> {
         match self {
             Logs::None => Err("no logs: pass --logs <file>, e.g. docker compose logs --no-color --tail 2000 botd > botd.log".into()),
-            Logs::File(p) => std::fs::read(p).map(|b| String::from_utf8_lossy(&b).into_owned()).map_err(|e| format!("{}: {e}", p.display())),
+            Logs::File(p) => tail(p, LOG_TAIL_BYTES).map_err(|e| format!("{}: {e}", p.display())),
             Logs::Journal => {
                 let o = std::process::Command::new("journalctl")
                     .args(["-u", "superbot", "-n", &LOG_LINES.to_string(), "-o", "cat", "--no-pager", "-q"])
@@ -680,15 +733,32 @@ impl Logs {
     }
 }
 
+/// The last `max` bytes of a file, from its first whole line, so a large log isn't read whole.
+fn tail(path: &Path, max: u64) -> std::io::Result<String> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let start = len.saturating_sub(max);
+    f.seek(SeekFrom::Start(start))?;
+    let mut b = Vec::with_capacity((len - start) as usize);
+    f.take(max).read_to_end(&mut b)?;
+    if start > 0 {
+        let first = b.iter().position(|&c| c == b'\n').map_or(b.len(), |i| i + 1);
+        b.drain(..first);
+    }
+    Ok(String::from_utf8_lossy(&b).into_owned())
+}
+
 /// The newest `LOG_LINES` lines, each cut to `LOG_LINE_CHARS` and redacted, and how many.
 fn scrub_logs(text: &str, names: &[String]) -> (String, usize) {
     let lines: Vec<&str> = text.lines().collect();
     let kept = &lines[lines.len().saturating_sub(LOG_LINES)..];
     let mut out = String::new();
     for l in kept {
-        let cut: String = l.chars().take(LOG_LINE_CHARS).collect();
-        out.push_str(&support::hide(&redact::text(&support::scrub_text(&cut)), names));
-        if cut.len() < l.len() {
+        let clean = support::hide(&redact::text(&support::scrub_text(l)), names);
+        let cut: String = clean.chars().take(LOG_LINE_CHARS).collect();
+        out.push_str(&cut);
+        if cut.len() < clean.len() {
             out.push('…');
         }
         out.push('\n');
@@ -955,6 +1025,12 @@ mod tests {
         let srv = Server::new("check-ok");
         drop(crate::db::Db::open(&srv.data.join("app.sqlite")).unwrap());
         srv.archive(10 * 60_000, ".tar.gz.age");
+        let db = crate::db::Db::open(&srv.data.join("app.sqlite")).unwrap();
+        let newest = crate::server_backups::archives(&srv.backups).pop().unwrap();
+        let copy = crate::db::NewServerBackup { id: "sb1", archive: &newest.name, destination: "s3/b/server", object_key: "k", created_at: newest.created_at, encrypted_by: Some("archive") };
+        let started = db.server_backup_start(&copy).unwrap();
+        assert!(db.server_backup_end(&started.id, Some((1, "00", None)), None));
+        drop(db);
         let r = run(&srv.settings(&[("SERVER_BACKUP_S3_BUCKET", "b")]), true, crate::db::now());
         for id in ["data_dir", "database", "master_key", "backups"] {
             assert_eq!(finding(&r, id).level, Level::Ok, "{id}: {:?}", finding(&r, id));
@@ -964,7 +1040,7 @@ mod tests {
         assert_eq!(db.details["integrity"], true);
         assert_eq!(finding(&r, "license").level, Level::Info, "testing mode");
         assert_eq!(finding(&r, "botd").level, Level::Warn, "nothing runs on it");
-        assert!(finding(&r, "backups").summary.contains("encrypted; botd copies them off this host"));
+        assert!(finding(&r, "backups").summary.contains("encrypted; botd copied the newest off this host"), "{}", finding(&r, "backups").summary);
         assert!(!r.failed());
         let text = r.text();
         assert!(text.contains("before an upgrade") && text.contains("ok    database") && text.contains("docs/support/support-check.md"), "{text}");
@@ -1042,10 +1118,34 @@ mod tests {
         assert_eq!(level(&off, true), Level::Fail, "none before an upgrade");
         std::fs::write(srv.backups.join(".partial-abc"), b"x").unwrap();
         srv.archive(3 * HOUR_MS, ".tar.gz");
-        assert_eq!(level(&off, false), Level::Ok);
+        let f = finding(&run(&off, false, crate::db::now()), "backups").clone();
+        assert_eq!(f.level, Level::Warn, "a bucket set but no database to confirm a copy: {f:?}");
+        assert!(f.summary.contains("unconfirmed"), "{}", f.summary);
+
+        let db = crate::db::Db::open(&srv.data.join("app.sqlite")).unwrap();
+        let newest = crate::server_backups::archives(&srv.backups).pop().unwrap();
+        let failed = db.server_backup_start(&crate::db::NewServerBackup { id: "f1", archive: &newest.name, destination: "s3/b", object_key: "k1", created_at: newest.created_at, encrypted_by: None }).unwrap();
+        assert!(db.server_backup_end(&failed.id, None, Some("upload refused")));
+        drop(db);
+        let f = finding(&run(&off, false, crate::db::now()), "backups").clone();
+        assert_eq!(f.level, Level::Warn, "only a failed copy: {f:?}");
+        assert!(f.summary.contains("has no finished copy") && f.summary.contains("1 failed since"), "{}", f.summary);
+
+        let db = crate::db::Db::open(&srv.data.join("app.sqlite")).unwrap();
+        let done = db.server_backup_start(&crate::db::NewServerBackup { id: "d1", archive: &newest.name, destination: "s3/b", object_key: "k2", created_at: newest.created_at, encrypted_by: None }).unwrap();
+        assert!(db.server_backup_end(&done.id, Some((1, "00", None)), None));
+        drop(db);
+        assert_eq!(level(&off, false), Level::Ok, "botd copied the newest");
         assert_eq!(level(&off, true), Level::Warn, "take a fresh one first");
+        srv.archive(10 * 60_000, ".tar.gz");
+        let f = finding(&run(&off, false, crate::db::now()), "backups").clone();
+        assert_eq!(f.level, Level::Warn, "a newer archive than the newest copy");
+        assert!(f.summary.contains(&format!("newest copy off this host is of {}", newest.name)), "{}", f.summary);
+
         assert_eq!(level(&srv.settings(&[]), false), Level::Warn, "they stay on this host");
-        assert_eq!(level(&srv.settings(&[("SERVER_BACKUP_OFF_HOST", "off")]), false), Level::Ok, "copied by the operator");
+        let by_you = finding(&run(&srv.settings(&[("SERVER_BACKUP_S3_BUCKET", "b"), ("SERVER_BACKUP_OFF_HOST", "off")]), false, crate::db::now()), "backups").clone();
+        assert_eq!(by_you.level, Level::Info, "off wins over a bucket, and the operator's copies aren't seen");
+        assert!(by_you.summary.contains("doesn't copy them") && by_you.summary.contains("aren't checked"), "{}", by_you.summary);
         let stale = Server::new("check-backups-stale");
         stale.archive(2 * DAY_MS, ".tar.gz");
         assert_eq!(level(&stale.settings(&[("SERVER_BACKUP_S3_BUCKET", "b")]), false), Level::Warn);
@@ -1155,6 +1255,27 @@ mod tests {
         assert!(String::from_utf8_lossy(&untar(&b.tar)[4].1).starts_with("# no logs: pass --logs"));
         redact::forget(&api_key);
         redact::forget(&password);
+    }
+
+    #[test]
+    fn a_secret_across_the_cut_is_redacted_whole() {
+        let secret = format!("passphrase words {}", crate::random_hex(8));
+        redact::register(&secret);
+        let line = format!("{}{secret} tail", "x".repeat(LOG_LINE_CHARS - 5));
+        let (out, _) = scrub_logs(&line, &[]);
+        assert!(!out.contains(&secret[..5]) && out.contains("[red"), "{out}");
+        redact::forget(&secret);
+    }
+
+    #[test]
+    fn only_the_end_of_a_large_log_file_is_read() {
+        let dir = crate::db::temp_path("check-tail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("big.log");
+        std::fs::write(&f, (0..10_000).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        let t = tail(&f, 100).unwrap();
+        assert!(t.len() <= 100 && t.starts_with("line ") && t.ends_with("line 9999\n"), "{t}");
+        assert_eq!(tail(&f, 1 << 20).unwrap().lines().count(), 10_000, "a small file is read whole");
     }
 
     #[test]
