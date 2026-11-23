@@ -67,6 +67,17 @@ groups:
           summary: "Incus hosts are nearly out of room ({{ $labels.resource }})"
           description: "Less than 15% of the open Incus hosts' {{ $labels.resource }} is left for new machines (INCUS_CAPACITY, INCUS_MAX_MACHINES). Add capacity or a host, or undrain one, before placement starts refusing machines."
 
+      # A machine is on a host dedicated to another team, or on a shared host while its
+      # team has hosts of its own (ADR 0166): someone joined or left a team.
+      - alert: SuperBotMachinesOnAnotherTeamsHost
+        expr: max by (job, instance) (superbot_incus_machines_misplaced{job="superbot"}) > 0
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Machines are on Incus hosts their team's dedication doesn't allow
+          description: "{{ $value }} machines are on a host dedicated to another team, or on a shared host while their team has hosts of its own, since their owner joined or left a team. botctl machine hosts lists them under misplaced; move each with botctl machine restore <user> <backup-id> --host <name> --yes."
+
       # Nowhere for a new machine at all.
       - alert: SuperBotNoOpenIncusHost
         expr: sum by (job, instance) (superbot_incus_host_open{job="superbot"}) == 0
