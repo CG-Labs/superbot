@@ -42,9 +42,11 @@ The external folder wins over the sealed copy for the same reason the external s
 
 As for the shared folders: answers and name lists are cached for `SECRETS_CACHE_SECONDS`, per folder; once the cache runs out, a backend that can't answer is an error, and the run is refused with `secrets_unavailable` rather than started without the owner's keys or with the sealed copy under them. Reads that reach the backend are `secret.read` with `scope: users` and `userId`, the list's target is the folder (`users/<id>`), never a value. Values are redacted from that user's Bots (`redact::register_for`), as a value they saved in botd is, not from everyone's.
 
+Answers past their time are dropped as new ones are cached, and deleting a user drops what was cached from their folder, so the cache follows the users whose Bots ran lately, not everyone who ever had one.
+
 ### In the client and API
 
-`GET /api/me/secrets` (and the admin's `GET /api/users/{key}/secrets`) list the folder's names too, one entry per name, with `store` (`sealed` or the backend) and `saved` (whether the user also saved one in botd). Entries only in the folder have no dates. The client shows them as set by an admin in that store, without Replace; Delete is offered only for a saved copy, which it removes. Saving still goes into the sealed store, and doesn't need the backend. The list fails closed like a run would: `503` while the backend can't answer.
+`GET /api/me/secrets` (and the admin's `GET /api/users/{key}/secrets`) list the folder's names that have a value too (a deleted version or empty field doesn't win in a run, so it isn't shown), one entry per name, with `store` (`sealed` or the backend) and `saved` (whether the user also saved one in botd). Entries only in the folder have no dates. The client shows them as set by an admin in that store, without Replace; Delete is offered only for a saved copy, which it removes. Saving still goes into the sealed store, and doesn't need the backend. The list fails closed like a run would: `503` while the backend can't answer.
 
 ## Consequences
 

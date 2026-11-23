@@ -71,7 +71,13 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
     try {
       const saved = await api.setMySecret(target, sent);
       resetForm();
-      setNotice(exists ? `Replaced ${saved.name}. Your Bots get the new value on their next run.` : `Saved ${saved.name}. Your Bots get it on their next run.`);
+      setNotice(
+        existingIn
+          ? `Saved ${saved.name} here, but your Bots keep the value an admin set for you in ${existingIn}.`
+          : exists
+            ? `Replaced ${saved.name}. Your Bots get the new value on their next run.`
+            : `Saved ${saved.name}. Your Bots get it on their next run.`,
+      );
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

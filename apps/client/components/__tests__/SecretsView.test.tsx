@@ -141,6 +141,10 @@ describe("SecretsView (ADR 0044)", () => {
     expect(confirm).toHaveBeenCalledWith("Delete OPENAI_API_KEY?", "Your Bots keep the value an admin set for you in AWS Secrets Manager. This can't be undone.");
     await user.type(screen.getByLabelText("Secret name"), "ANTHROPIC_API_KEY");
     expect(screen.getByText("An admin set ANTHROPIC_API_KEY for you in HashiCorp Vault. That value wins, so one saved here isn't used.")).toBeOnTheScreen();
+    await user.type(screen.getByLabelText("Secret value"), "sk-local");
+    await user.press(screen.getByRole("button", { name: "Save new value for ANTHROPIC_API_KEY" }));
+    expect(api.setMySecret).toHaveBeenCalledWith("ANTHROPIC_API_KEY", "sk-local");
+    expect(await screen.findByText("Saved ANTHROPIC_API_KEY here, but your Bots keep the value an admin set for you in HashiCorp Vault.")).toBeOnTheScreen();
   });
 
   it("says what the server refused", async () => {

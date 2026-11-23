@@ -296,6 +296,10 @@ impl Secrets {
         let mut out = self.sealed_user_list(user_id, &server)?;
         let Some(x) = &self.user_folders else { return Ok(out) };
         for name in x.user_names(user_id)? {
+            // A listed name with no value (deleted version, empty field) doesn't win in a run either.
+            if x.user_get(user_id, &name)?.is_none() {
+                continue;
+            }
             match out.iter_mut().find(|l| l.name == name) {
                 Some(l) => l.store = x.kind(),
                 None => {
@@ -333,6 +337,9 @@ impl Secrets {
 
     /// Drops every secret a user saved. For when the user is deleted.
     pub fn user_forget(&self, user_id: &str) -> Result<usize, Error> {
+        if let Some(x) = &self.user_folders {
+            x.forget_user(user_id);
+        }
         let Ok(users) = self.users() else { return Ok(0) };
         let names = users.names(user_id)?;
         for (n, ..) in &names {

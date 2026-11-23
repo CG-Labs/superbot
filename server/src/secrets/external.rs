@@ -205,6 +205,19 @@ impl ExternalStore {
         at.elapsed() < self.ttl
     }
 
+    /// Drops answers past their time as new ones come in, so the cache holds the users
+    /// whose Bots ran lately, not everyone who ever had one.
+    fn prune<K, V>(&self, cached: &mut HashMap<K, (Instant, V)>) {
+        cached.retain(|_, (at, _)| self.fresh(*at));
+    }
+
+    /// Drops everything cached from `user_id`'s folder, when the user is deleted.
+    pub fn forget_user(&self, user_id: &str) {
+        let Some(scope) = Scope::user(user_id) else { return };
+        self.values.lock().unwrap_or_else(|e| e.into_inner()).retain(|(s, _), _| *s != scope);
+        self.names.lock().unwrap_or_else(|e| e.into_inner()).remove(&scope);
+    }
+
     /// Startup check: lists both folders straight from the backend, so botd refuses to
     /// start on a backend it can't reach or sign in to. Returns how many names it has.
     pub fn check(&self) -> Result<usize, Error> {
@@ -233,7 +246,10 @@ impl ExternalStore {
                 let mut names: Vec<String> = names.into_iter().filter(|n| scope.holds(n)).collect();
                 names.sort();
                 names.dedup();
-                self.names.lock().unwrap_or_else(|e| e.into_inner()).insert(scope.clone(), (Instant::now(), names.clone()));
+                let mut cached = self.names.lock().unwrap_or_else(|e| e.into_inner());
+                self.prune(&mut cached);
+                cached.insert(scope.clone(), (Instant::now(), names.clone()));
+                drop(cached);
                 details["names"] = json!(names.len());
                 audit(target.details(details));
                 Ok(names)
@@ -266,7 +282,10 @@ impl ExternalStore {
                         None => redact::register(v),
                     }
                 }
-                self.values.lock().unwrap_or_else(|e| e.into_inner()).insert(key, (Instant::now(), v.clone()));
+                let mut cached = self.values.lock().unwrap_or_else(|e| e.into_inner());
+                self.prune(&mut cached);
+                cached.insert(key, (Instant::now(), v.clone()));
+                drop(cached);
                 audit(Event::new(actor(), "secret.read").target("secret", name).details(details(Some(v.is_some()), None)));
                 Ok(v)
             }
@@ -510,7 +529,8 @@ pub(crate) mod tests {
             if self.down.load(Ordering::SeqCst) {
                 return Err(Error::Unavailable("fake is down".into()));
             }
-            Ok(self.values.lock().unwrap().get(&(scope, name.to_string())).map(|v| Zeroizing::new(v.clone())))
+            // Empty is "no value", as the real backends answer for a deleted version or empty field.
+            Ok(self.values.lock().unwrap().get(&(scope, name.to_string())).filter(|v| !v.is_empty()).map(|v| Zeroizing::new(v.clone())))
         }
         fn list(&self, scope: Scope) -> Result<Vec<String>, Error> {
             self.lists.fetch_add(1, Ordering::SeqCst);
@@ -587,13 +607,14 @@ pub(crate) mod tests {
     fn a_users_folder_reaches_only_their_bots_over_everything_else() {
         let ua = format!("ua-ext-{}", crate::random_hex(10));
         let ub = "ub-ext-value-1";
-        let (_, _, s) = with_users(
+        let (_, x, s) = with_users(
             &[
                 (Scope::Bots, "OPENAI_API_KEY", "team-ext-openai-1"),
                 (Scope::Bots, "GH_TOKEN", "team-ext-gh-1"),
                 (user("ua"), "OPENAI_API_KEY", &ua),
                 (user("ua"), "LINODE_TOKEN", "never-from-a-users-folder"),
                 (user("ua"), "PATH", "/never"),
+                (user("ua"), "GH_TOKEN", ""),
                 (user("ub"), "GH_TOKEN", ub),
             ],
             Duration::from_secs(60),
@@ -610,11 +631,12 @@ pub(crate) mod tests {
         assert_eq!(redact::text(&ua), ua.as_str(), "not from everyone's");
 
         let listed: Vec<_> = s.user_list("ua").unwrap().into_iter().map(|l| (l.name, l.store, l.saved, l.overrides)).collect();
-        assert_eq!(listed, [("NPM_TOKEN".to_string(), "sealed", true, false), ("OPENAI_API_KEY".to_string(), "fake", true, true)]);
+        assert_eq!(listed, [("NPM_TOKEN".to_string(), "sealed", true, false), ("OPENAI_API_KEY".to_string(), "fake", true, true)], "GH_TOKEN is listed in the folder but has no value, so the team's wins and it isn't shown");
         let b = &s.user_list("ub").unwrap()[0];
         assert_eq!((b.name.as_str(), b.store, b.saved, b.created_at), ("GH_TOKEN", "fake", false, None));
         assert!(serde_json::to_value(b).unwrap().get("createdAt").is_none(), "no dates for a value botd never saved");
         assert_eq!(s.user_forget("ua").unwrap(), 2, "only what botd saved; the folder is the backend's");
+        assert!(!x.values.lock().unwrap().keys().any(|(sc, _)| *sc == user("ua")) && !x.names.lock().unwrap().contains_key(&user("ua")), "nor its cache");
         assert_eq!(env_of(&s, "ua"), [pair("GH_TOKEN", "team-ext-gh-1"), pair("OPENAI_API_KEY", &ua)]);
         redact::forget_for("ua", &ua);
         redact::forget_for("ub", ub);
@@ -645,6 +667,12 @@ pub(crate) mod tests {
         assert!(s.user_save("uaudit", "SAVED_WHILE_DOWN_TOKEN", "saved-while-down-1").is_ok(), "saving into botd doesn't need the backend");
         f.down.store(false, Ordering::SeqCst);
         assert_eq!(env_of(&s, "uaudit").len(), 2);
+
+        // Answers past their time are dropped as new ones come in, not kept for every user ever seen.
+        std::thread::sleep(Duration::from_millis(350));
+        x.user_names("uother").unwrap();
+        x.user_get("uother", "OTHER_TOKEN").unwrap();
+        assert!(!x.names.lock().unwrap().contains_key(&user("uaudit")) && !x.values.lock().unwrap().keys().any(|(sc, _)| *sc == user("uaudit")));
 
         // Off: no user folder is ever asked for.
         let lists = f.lists.load(Ordering::SeqCst);
