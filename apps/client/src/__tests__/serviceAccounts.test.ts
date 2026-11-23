@@ -4,6 +4,7 @@ import {
   draftChanges,
   draftError,
   draftOf,
+  rebaseDraft,
   emptyDraft,
   expiresSoon,
   expiryChoices,
@@ -146,5 +147,12 @@ describe("service accounts (ADR 0143, 0152)", () => {
     expect(lastUsedLabel(null)).toBe("Never used");
     expect(lastUsedLabel(NOW, "203.0.113.9")).toMatch(/^Last used .* from 203\.0\.113\.9$/);
     expect(lastUsedLabel(NOW)).not.toMatch(/from/);
+  });
+
+  it("rebases a draft so untouched fields take another admin's newer values", () => {
+    const was = { name: "HR sync", description: "", role: "member", team: "", owner: "ada@example.com" };
+    const now = { ...was, role: "readonly", owner: "bo@example.com" };
+    expect(rebaseDraft({ ...was, name: "Payroll" }, was, now)).toEqual({ ...now, name: "Payroll" });
+    expect(rebaseDraft({ ...was, role: "r1" }, was, now)).toEqual({ ...now, role: "r1" });
   });
 });

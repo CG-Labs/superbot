@@ -34,6 +34,16 @@ export function draftOf(sa: ServiceAccount): ServiceAccountDraft {
   return { name: sa.name, description: sa.description, role: roleKey(sa), team: sa.team?.id ?? "", owner: sa.owner?.email || sa.owner?.id || "" };
 }
 
+/**
+ * Moves a draft from the account as it was (`was`) to the account as it is now (`now`): fields
+ * the admin left alone take the new values, so saving never puts back another admin's change.
+ */
+export function rebaseDraft(draft: ServiceAccountDraft, was: ServiceAccountDraft, now: ServiceAccountDraft): ServiceAccountDraft {
+  const out = { ...draft };
+  for (const k of Object.keys(now) as (keyof ServiceAccountDraft)[]) if (draft[k] === was[k]) out[k] = now[k];
+  return out;
+}
+
 /** "Read-only", "Help desk", "Member in Ops", or "Member + Help desk in Ops". */
 export function roleLabel(sa: Pick<ServiceAccount, "role" | "customRole" | "teamRole" | "team">): string {
   const builtIn = BUILT_IN_ROLES.find((r) => r.value === sa.role)?.label ?? sa.role;

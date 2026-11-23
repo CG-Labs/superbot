@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { COPY_LABEL, copyText } from "../src/clipboard";
@@ -16,6 +16,7 @@ import {
   expiryChoices,
   heldScopes,
   lastUsedLabel,
+  rebaseDraft,
   roleLabel,
   scopesLabel,
   toggleScope,
@@ -257,6 +258,7 @@ function AccountDetail({
 }) {
   const [full, setFull] = useState<ServiceAccount | null>(null);
   const [draft, setDraft] = useState<ServiceAccountDraft>(draftOf(account));
+  const base = useRef(draftOf(account));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(notice);
   const [tokenName, setTokenName] = useState("");
@@ -266,7 +268,14 @@ function AccountDetail({
   const [keepOld, setKeepOld] = useState(0);
   const [rotateDays, setRotateDays] = useState(view.defaultDays);
 
-  const loadFull = useCallback(async () => setFull(await api.serviceAccount(account.id)), [api, account.id]);
+  const loadFull = useCallback(async () => {
+    const next = await api.serviceAccount(account.id);
+    const was = base.current;
+    const now = draftOf(next);
+    base.current = now;
+    setDraft((d) => rebaseDraft(d, was, now));
+    setFull(next);
+  }, [api, account.id]);
   useEffect(() => {
     loadFull().catch((err) => setError(message(err)));
   }, [loadFull]);

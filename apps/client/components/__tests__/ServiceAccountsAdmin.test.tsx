@@ -245,6 +245,17 @@ describe("ServiceAccountsAdmin (ADR 0143, 0152)", () => {
     expect(await screen.findByText(/can't hold more than its owner/)).toBeTruthy();
   });
 
+  it("doesn't undo another admin's change when saving from a stale list", async () => {
+    const api = mockApi();
+    api.serviceAccount.mockResolvedValue({ ...SA, role: "readonly", tokenList: [TOKEN] });
+    const u = userEvent.setup();
+    await open(api, u);
+    await u.clear(screen.getByLabelText("Service account name"));
+    await u.type(screen.getByLabelText("Service account name"), "Payroll");
+    await u.press(screen.getByLabelText("Save"));
+    await waitFor(() => expect(api.updateServiceAccount).toHaveBeenCalledWith("sa1", { name: "Payroll" }));
+  });
+
   it("warns when the owner can no longer lend access", async () => {
     const api = mockApi({ ...VIEW, serviceAccounts: [{ ...SA, ownerActive: false, effective: [] }] });
     const u = userEvent.setup();
