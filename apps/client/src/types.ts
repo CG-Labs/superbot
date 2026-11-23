@@ -547,6 +547,11 @@ export interface ServiceAccount {
   owner: PersonRef | null;
   /** False once the owner is disabled or gone: they lend nothing, so its tokens are refused. */
   ownerActive: boolean;
+  /**
+   * In a team: whether its owner is an admin or on that team. While false it acts in no team
+   * (ADR 0182). Null in none; servers from before ADR 0182 leave it out.
+   */
+  ownerOnTeam?: boolean | null;
   /** What it holds across the server, and within its team. */
   permissions: string[];
   teamPermissions: string[];
@@ -587,10 +592,33 @@ export interface ServiceToken {
 /** `GET /api/service-accounts`. */
 export interface ServiceAccountsView {
   serviceAccounts: ServiceAccount[];
+  /** `all` for admins; `own` for a delegate, who sees only the ones they own (ADR 0182). */
+  view?: "all" | "own";
+  /** What the caller may give the ones they own (ADR 0182). Servers from before it leave it out. */
+  choices?: ServiceAccountChoices | null;
   /** Every permission a token can be scoped to. */
   scopes: string[];
   defaultDays: number;
   maxDays: number;
+}
+
+/** A role the caller may give a service account: built in (`readonly`, `member`) or custom. */
+export interface ServiceAccountRoleChoice {
+  id: string;
+  name: string;
+  base: RoleBase;
+  builtIn: boolean;
+  /** What a custom role adds to its base. */
+  permissions: string[];
+}
+
+/** `choices` in `GET /api/service-accounts`: as the server would take them from the caller. */
+export interface ServiceAccountChoices {
+  roles: ServiceAccountRoleChoice[];
+  /** Role ids allowed across the server. */
+  server: string[];
+  /** Teams the caller may put one in (an admin: any; anyone else: their own), with the roles allowed there. */
+  teams: { id: string; name: string; roles: string[] }[];
 }
 
 /** The form for `POST /api/service-accounts`, and `PATCH` with what changed. */
@@ -1260,6 +1288,15 @@ export interface MyResidency {
   machine?: { id: string; state: string; region: string; inRegion: boolean; host?: string | null; hostRegion?: string | null } | null;
   backups?: { kept: number; inRegion: number; outside: number };
   modelRoutes?: { inRegion: boolean; gap: string | null };
+  /** Where the server's own copy of your account and chats is, as its operator states it (ADR 0184). Missing from servers before it. */
+  serverData?: {
+    region: string | null;
+    inRegion: boolean;
+    /** Whether the server's backups are kept in the pin's region too (they can be elsewhere while `region` matches). */
+    backupsInRegion?: boolean;
+    /** The server holds every pin to its own region (RESIDENCY_SERVER_DATA=require), so being outside it is a fault. */
+    required?: boolean;
+  };
   /** The pins whose residency report you can get. */
   reports: ("user" | "team")[];
 }

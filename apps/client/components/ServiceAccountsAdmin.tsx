@@ -4,9 +4,9 @@ import type { SuperBotApi } from "../src/api";
 import { COPY_LABEL, copyText } from "../src/clipboard";
 import { confirmAsync } from "../src/dialogs";
 import {
-  BUILT_IN_ROLES,
   KEEP_OLD,
   canRotate,
+  choiceError,
   createBody,
   draftChanges,
   draftError,
@@ -14,21 +14,37 @@ import {
   emptyDraft,
   expiresSoon,
   expiryChoices,
+  formChoices,
   heldScopes,
+  keptRole,
   lastUsedLabel,
   rebaseDraft,
   roleLabel,
+  roleOptions,
   scopesLabel,
+  teamOptions,
   toggleScope,
   tokenStatus,
 } from "../src/serviceAccounts";
 import { colors } from "../src/theme";
-import type { CustomRole, MintedServiceToken, ServiceAccount, ServiceAccountDraft, ServiceAccountsView, Team } from "../src/types";
+import type { CustomRole, MintedServiceToken, ServiceAccount, ServiceAccountChoices, ServiceAccountDraft, ServiceAccountsView, Team } from "../src/types";
 import { Chips } from "./Chips";
 
 interface Props {
   api: SuperBotApi;
   onBack: () => void;
+  /** An admin manages every account and its owner; anyone else with users.manage only their own (ADR 0182). */
+  admin: boolean;
+}
+
+/** The account's own role and team, kept in the pickers when they're no longer offered. */
+type Kept = { role: { id: string; name: string }; team: { id: string; name: string } | null };
+
+/** The custom roles `draftError` checks against, with the account's own if it's no longer offered. */
+function customRoles(choices: ServiceAccountChoices, sa?: ServiceAccount): { id: string; base: ServiceAccount["role"] }[] {
+  const out = choices.roles.filter((r) => !r.builtIn).map((r) => ({ id: r.id, base: r.base }));
+  const own = sa?.customRole ?? sa?.teamRole;
+  return own && !out.some((r) => r.id === own.id) ? [...out, { id: own.id, base: sa!.role }] : out;
 }
 
 type Picked = { kind: "account"; id: string } | { kind: "new" } | null;
@@ -97,23 +113,27 @@ function TokenReveal({ minted, onDone }: { minted: MintedServiceToken; onDone: (
   );
 }
 
-/** Name, description, role and team; on an existing account, the owner too. */
+/** Name, description, role and team; on an existing account, for an admin, the owner too. */
 function AccountForm({
   draft,
   setDraft,
-  roles,
-  teams,
+  choices,
+  kept,
   busy,
   editing,
+  admin,
 }: {
   draft: ServiceAccountDraft;
   setDraft: (d: ServiceAccountDraft) => void;
-  roles: CustomRole[];
-  teams: Team[];
+  choices: ServiceAccountChoices;
+  kept?: Kept;
   busy: boolean;
   editing: boolean;
+  admin: boolean;
 }) {
-  const custom = roles.find((r) => r.id === draft.role);
+  const custom = choices.roles.find((r) => r.id === draft.role && !r.builtIn);
+  const teams = teamOptions(choices, kept?.team);
+  const keepRole = kept && draft.team === (kept.team?.id ?? "") ? kept.role : null;
   return (
     <>
       <Section title="Name">
@@ -138,7 +158,7 @@ function AccountForm({
         />
       </Section>
       <Section title="Role">
-        <Chips options={[...BUILT_IN_ROLES, ...roles.map((r) => ({ value: r.id, label: r.name }))]} value={draft.role} onChange={(role) => setDraft({ ...draft, role })} disabled={busy} />
+        <Chips options={roleOptions(choices, draft.team, keepRole)} value={draft.role} onChange={(role) => setDraft({ ...draft, role })} disabled={busy} />
         <Text style={styles.faint}>
           {custom
             ? `${custom.base === "readonly" ? "Read-only" : "Member"} + ${custom.permissions.join(", ") || "nothing"}${draft.team ? ", only its team permissions, in its team" : ""}.`
@@ -148,13 +168,15 @@ function AccountForm({
           Never admin, and never more than its owner holds.
         </Text>
       </Section>
-      {teams.length ? (
+      {teams.length > 1 ? (
         <Section title="Where">
-          <Chips options={[{ value: "", label: "Across the server" }, ...teams.map((t) => ({ value: t.id, label: t.name }))]} value={draft.team} onChange={(team) => setDraft({ ...draft, team })} disabled={busy} />
-          <Text style={styles.faint}>{draft.team ? "Acts in that team as a member, without a seat, and reaches the Bots shared with it." : "In no team, like a person in none."}</Text>
+          <Chips options={teams} value={draft.team} onChange={(team) => setDraft({ ...draft, team })} disabled={busy} />
+          <Text style={styles.faint}>
+            {draft.team ? "Acts in that team as a member, without a seat, and reaches the Bots shared with it, while its owner is on it." : "In no team, like a person in none."}
+          </Text>
         </Section>
       ) : null}
-      {editing ? (
+      {editing && admin ? (
         <Section title="Owner">
           <TextInput
             style={styles.input}
@@ -173,13 +195,13 @@ function AccountForm({
   );
 }
 
-function NewAccount({ api, view, roles, teams, onBusy, onCreated }: { api: SuperBotApi; view: ServiceAccountsView; roles: CustomRole[]; teams: Team[]; onBusy: (busy: boolean) => void; onCreated: (account: ServiceAccount, minted: MintedServiceToken | null, error: string | null) => Promise<void> }) {
+function NewAccount({ api, view, choices, admin, onBusy, onCreated }: { api: SuperBotApi; view: ServiceAccountsView; choices: ServiceAccountChoices; admin: boolean; onBusy: (busy: boolean) => void; onCreated: (account: ServiceAccount, minted: MintedServiceToken | null, error: string | null) => Promise<void> }) {
   const [draft, setDraft] = useState<ServiceAccountDraft>(emptyDraft());
   const [firstToken, setFirstToken] = useState(true);
   const [days, setDays] = useState(view.defaultDays);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const invalid = draftError(draft, roles);
+  const invalid = draftError(draft, customRoles(choices)) ?? choiceError(draft, choices);
 
   const create = async () => {
     setBusy(true);
@@ -212,7 +234,7 @@ function NewAccount({ api, view, roles, teams, onBusy, onCreated }: { api: Super
         <Text style={styles.faint}>For a script or integration: it can&apos;t sign in, takes no seat, and acts only through tokens you make for it. You own it.</Text>
       </View>
       {error ? <Text style={styles.error}>{error}</Text> : null}
-      <AccountForm draft={draft} setDraft={setDraft} roles={roles} teams={teams} busy={busy} editing={false} />
+      <AccountForm draft={draft} setDraft={setDraft} choices={choices} busy={busy} editing={false} admin={admin} />
       <Section title="First token">
         <Pressable style={styles.perm} onPress={() => setFirstToken(!firstToken)} accessibilityRole="checkbox" accessibilityState={{ checked: firstToken }} accessibilityLabel="Make a token now">
           <Text style={[styles.check, firstToken && styles.checkOn]}>{firstToken ? "✓" : ""}</Text>
@@ -232,8 +254,8 @@ function AccountDetail({
   api,
   view,
   account,
-  roles,
-  teams,
+  choices,
+  admin,
   minted,
   onMinted,
   onDismissMinted,
@@ -245,8 +267,8 @@ function AccountDetail({
   api: SuperBotApi;
   view: ServiceAccountsView;
   account: ServiceAccount;
-  roles: CustomRole[];
-  teams: Team[];
+  choices: ServiceAccountChoices;
+  admin: boolean;
   minted: MintedServiceToken | null;
   onMinted: (m: MintedServiceToken) => void;
   onDismissMinted: () => void;
@@ -284,7 +306,8 @@ function AccountDetail({
   const active = sa.status === "active";
   const held = heldScopes(view, sa);
   const changes = draftChanges(sa, draft);
-  const invalid = draftError(draft, roles);
+  const invalid = draftError(draft, customRoles(choices, sa)) ?? choiceError(draft, choices, draftOf(sa));
+  const kept: Kept = { role: keptRole(sa), team: sa.team };
   const tokens = full?.tokenList;
 
   const run = async (action: () => Promise<unknown>) => {
@@ -361,7 +384,10 @@ function AccountDetail({
       </View>
       {minted && minted.serviceAccount.id === sa.id ? <TokenReveal minted={minted} onDone={onDismissMinted} /> : null}
       {error ? <Text style={styles.error}>{error}</Text> : null}
-      {!sa.ownerActive ? <Text style={styles.warn}>Its owner is disabled or gone, so its tokens are refused. Give it an active owner below.</Text> : null}
+      {!sa.ownerActive ? <Text style={styles.warn}>Its owner is disabled or gone, so its tokens are refused. {admin ? "Give it an active owner below." : "Ask an admin to give it another owner."}</Text> : null}
+      {sa.ownerActive && sa.team && sa.ownerOnTeam === false ? (
+        <Text style={styles.warn}>Its owner isn&apos;t on {sa.team.name}, so it acts in no team: it doesn&apos;t see the team or the Bots shared with it until they are.</Text>
+      ) : null}
       {!active ? <Text style={styles.warn}>Disabled: its tokens don&apos;t work. Enable it to use or make tokens.</Text> : null}
 
       <Section title="Can use today">
@@ -441,7 +467,7 @@ function AccountDetail({
       ) : null}
 
       <Section title="Settings">
-        <AccountForm draft={draft} setDraft={setDraft} roles={roles} teams={teams} busy={busy} editing />
+        <AccountForm draft={draft} setDraft={setDraft} choices={choices} kept={kept} busy={busy} editing admin={admin} />
         <View style={styles.row}>
           <Button label="Save" primary disabled={busy || !!invalid || !changes} onPress={() => void save()} />
           {invalid ? <Text style={styles.faint}>{invalid}</Text> : null}
@@ -456,8 +482,11 @@ function AccountDetail({
   );
 }
 
-/** Service accounts (ADR 0143, 0152): make them, give them a role, and issue, rotate and revoke their tokens. */
-export function ServiceAccountsAdmin({ api, onBack }: Props) {
+/**
+ * Service accounts (ADR 0143, 0152): make them, give them a role, and issue, rotate and revoke
+ * their tokens. Admins see every one; a delegate sees and manages the ones they own (ADR 0182).
+ */
+export function ServiceAccountsAdmin({ api, onBack, admin }: Props) {
   const { width } = useWindowDimensions();
   const wide = width >= 900;
   const [view, setView] = useState<ServiceAccountsView | null>(null);
@@ -480,9 +509,18 @@ export function ServiceAccountsAdmin({ api, onBack }: Props) {
 
   useEffect(() => {
     void load();
+  }, [load]);
+
+  // Only a server from before ADR 0182 sends no choices; then an admin reads every role and team.
+  const needLists = admin && !!view && !view.choices;
+  useEffect(() => {
+    if (!needLists) return;
     api.roles().then((r) => setRoles(r.roles), () => setRoles([]));
     api.teams().then(setTeams, () => setTeams([]));
-  }, [api, load]);
+  }, [api, needLists]);
+
+  const choices = view ? formChoices(view, roles, teams) : null;
+  const own = !admin || view?.view === "own";
 
   const pick = (p: Picked) => {
     if (busy) return;
@@ -492,14 +530,14 @@ export function ServiceAccountsAdmin({ api, onBack }: Props) {
   };
 
   const account = picked?.kind === "account" ? view?.serviceAccounts.find((s) => s.id === picked.id) : undefined;
-  const detail = !view ? null : account ? (
+  const detail = !view || !choices ? null : account ? (
     <AccountDetail
       key={account.id}
       api={api}
       view={view}
       account={account}
-      roles={roles}
-      teams={teams}
+      choices={choices}
+      admin={admin}
       minted={minted}
       onMinted={setMinted}
       onDismissMinted={() => setMinted(null)}
@@ -516,8 +554,8 @@ export function ServiceAccountsAdmin({ api, onBack }: Props) {
     <NewAccount
       api={api}
       view={view}
-      roles={roles}
-      teams={teams}
+      choices={choices}
+      admin={admin}
       onBusy={setBusy}
       onCreated={async (made, m, tokenError) => {
         await load();
@@ -536,7 +574,7 @@ export function ServiceAccountsAdmin({ api, onBack }: Props) {
         <Pressable onPress={onBack} disabled={busy} accessibilityState={{ disabled: busy }} accessibilityRole="button" accessibilityLabel="Back to Bots">
           <Text style={styles.back}>‹ Bots</Text>
         </Pressable>
-        <Text style={styles.title}>Service accounts</Text>
+        <Text style={styles.title}>{own ? "Your service accounts" : "Service accounts"}</Text>
         <Button label="New service account" primary disabled={!view || busy} onPress={() => pick({ kind: "new" })} />
       </View>
       <View style={styles.body}>
@@ -559,13 +597,18 @@ export function ServiceAccountsAdmin({ api, onBack }: Props) {
                     {s.name}
                     {s.status === "disabled" ? <Text style={styles.warn}> · disabled</Text> : null}
                     {!s.ownerActive ? <Text style={styles.warn}> · owner inactive</Text> : null}
+                    {s.ownerActive && s.ownerOnTeam === false ? <Text style={styles.warn}> · owner off its team</Text> : null}
                   </Text>
                   <Text style={styles.faint}>
                     {roleLabel(s)} · {s.tokens} live {s.tokens === 1 ? "token" : "tokens"} · {lastUsedLabel(s.lastUsedAt).toLowerCase()}
                   </Text>
                 </Pressable>
               ))}
-              {!view.serviceAccounts.length ? <Text style={styles.empty}>No service accounts yet. Make one for each script or integration that calls the API.</Text> : null}
+              {!view.serviceAccounts.length ? (
+                <Text style={styles.empty}>
+                  {own ? "You own no service accounts yet. Make one for each script or integration of yours that calls the API." : "No service accounts yet. Make one for each script or integration that calls the API."}
+                </Text>
+              ) : null}
             </ScrollView>
           ) : null}
         </View>

@@ -8981,6 +8981,14 @@ impl Db {
         s.query_map([destination, archive], server_backup_row).unwrap().filter_map(Result::ok).collect()
     }
 
+    /// Finished copies not to `destination` (None: to anywhere) and not deleted: made to
+    /// a store botd no longer copies to (ADR 0184).
+    pub fn server_backups_done_elsewhere(&self, destination: Option<&str>) -> i64 {
+        self.c()
+            .query_row("SELECT COUNT(*) FROM server_backups WHERE state = 'done' AND destination IS NOT ?", [destination], |r| r.get(0))
+            .unwrap_or(0)
+    }
+
     /// Every copy in `state`, oldest archive first.
     pub fn server_backups_in(&self, state: &str) -> Vec<ServerBackup> {
         let c = self.c();
