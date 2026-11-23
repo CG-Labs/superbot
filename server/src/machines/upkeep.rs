@@ -187,6 +187,7 @@ fn upkeep_json(hb: &Heartbeat) -> Value {
         "teammates": hb.teammates,
         "hardening": hb.hardening,
         "egressPolicy": egress, "runLimits": limits,
+        "teamNetwork": hb.team_network,
     })
 }
 
@@ -233,6 +234,7 @@ pub fn observe(app: &App, machine_id: &str, hb: &Heartbeat) {
         super::botuser::observed(app, &m, &by, m.agent_upkeep.as_ref().map(|v| &v["botUser"]), &new["botUser"]);
         super::hardening::observed(app, &m, &by, m.agent_upkeep.as_ref().map(|v| &v["hardening"]), &new["hardening"]);
         super::egress_policy::observed(app, &m, &by, m.agent_upkeep.as_ref(), &new);
+        super::team_network::observed(app, &m, &by, m.agent_upkeep.as_ref(), &new);
     }
     let (Some(id), Some(report)) = (&m.upgrade_id, hb.upgrade.as_ref()) else { return };
     if report.id != *id {

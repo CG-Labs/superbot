@@ -9,16 +9,25 @@
 //!
 //! A machine whose owner is no longer on the network's team is taken off it: powered
 //! off, its interface removed, and powered on again if this is what powered it off.
+//!
+//! A machine made before its owner's team had a network, or before they joined the team,
+//! joins it without a rebuild (ADR 0202): its agent lets the subnet through in its
+//! egress rules first, then the machine is given an interface on the subnet, in use
+//! from its next boot. With MACHINE_TEAM_NETWORK_JOIN=when-idle, botd powers it off and
+//! on again once it runs nothing; with `next-boot`, the default, it waits for one.
 
+use super::enroll::Enrollment;
 use super::provider::{MachineProvider, NetworkMember, ProviderError, TeamNetwork};
+use super::wire::{self, Heartbeat, TeamNetworkReport, TeamNetworkRules};
 use super::{ControlPlane, State, Step, event, system};
 use crate::audit::{Outcome, Who};
-use crate::db::Machine;
+use crate::db::{Machine, now};
 use crate::runner::App;
 use crate::AppState;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 pub const DEFAULT_SUBNET: &str = "10.248.0.0/22";
 /// Where Linode lets a VPC subnet be: RFC 1918, but for 192.168.128.0/17, which its
@@ -29,23 +38,58 @@ const LONGEST: u32 = 29;
 /// A VPC label's longest.
 const MAX_LABEL: usize = 64;
 
+/// How a machine already made joins its team's network (MACHINE_TEAM_NETWORK_JOIN,
+/// ADR 0202).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Join {
+    /// It doesn't: only a rebuild or a new machine puts it on, as before ADR 0202.
+    Off,
+    /// It is given the interface, in use from its next boot.
+    NextBoot,
+    /// And botd powers it off and on again once it runs nothing.
+    WhenIdle,
+}
+
+impl Join {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Join::Off => "off",
+            Join::NextBoot => "next-boot",
+            Join::WhenIdle => "when-idle",
+        }
+    }
+
+    fn parse(v: &str) -> Result<Join, String> {
+        match v.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "" | "next-boot" => Ok(Join::NextBoot),
+            "off" => Ok(Join::Off),
+            "when-idle" => Ok(Join::WhenIdle),
+            v => Err(format!("MACHINE_TEAM_NETWORK_JOIN must be off, next-boot or when-idle, not \"{}\"", crate::audit::clip(v, 20))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     /// The range of every team network's subnet, canonical. Every team's is the same:
     /// VPCs are apart, so the same range on two never meets.
     pub subnet: String,
+    pub join: Join,
 }
 
 impl Settings {
-    /// MACHINE_TEAM_NETWORK (`off`, the default, or `vpc`) and
-    /// MACHINE_TEAM_NETWORK_SUBNET. Whether the provider and the firewall allow it is
-    /// the control plane's to check.
+    /// MACHINE_TEAM_NETWORK (`off`, the default, or `vpc`),
+    /// MACHINE_TEAM_NETWORK_SUBNET and MACHINE_TEAM_NETWORK_JOIN. Whether the provider
+    /// and the firewall allow it is the control plane's to check.
     pub fn from_env(var: &dyn Fn(&str) -> String) -> Result<Option<Settings>, String> {
         let raw = var("MACHINE_TEAM_NETWORK_SUBNET");
         match var("MACHINE_TEAM_NETWORK").trim().to_ascii_lowercase().as_str() {
             "" | "off" => {
                 if !raw.trim().is_empty() {
                     return Err("MACHINE_TEAM_NETWORK_SUBNET needs MACHINE_TEAM_NETWORK=vpc".into());
+                }
+                if !var("MACHINE_TEAM_NETWORK_JOIN").trim().is_empty() {
+                    return Err("MACHINE_TEAM_NETWORK_JOIN needs MACHINE_TEAM_NETWORK=vpc".into());
                 }
                 return Ok(None);
             }
@@ -73,11 +117,12 @@ impl Settings {
                 return Err(format!("MACHINE_TEAM_NETWORK_SUBNET: {subnet} meets MACHINE_EGRESS_DENY's {c}; pick a range the deny list doesn't name"));
             }
         }
-        Ok(Some(Settings { subnet }))
+        let join = Join::parse(&var("MACHINE_TEAM_NETWORK_JOIN"))?;
+        Ok(Some(Settings { subnet, join }))
     }
 
     pub fn view(&self) -> Value {
-        json!({ "kind": "vpc", "subnet": self.subnet })
+        json!({ "kind": "vpc", "subnet": self.subnet, "join": self.join.as_str() })
     }
 }
 
@@ -136,8 +181,10 @@ pub async fn ensure(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, 
 /// One pass: every machine of ours on a team network whose team its owner isn't on is
 /// taken off it. Anything else on a network, the team's own services, is left alone.
 /// Machines this powered off are powered on again once nothing has them to leave.
+/// Then, unless MACHINE_TEAM_NETWORK_JOIN=off, a team member's machine on no network
+/// joins its team's (ADR 0202).
 pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
-    let (Some(_), Some(p)) = (&cp.team_network, cp.provider.as_deref()) else { return json!({}) };
+    let (Some(s), Some(p)) = (&cp.team_network, cp.provider.as_deref()) else { return json!({}) };
     let nets: Vec<(String, TeamNetwork)> = match p.team_networks("").await {
         Ok(n) => n.into_iter().filter_map(|n| Some((team_part_of(&n.label)?.to_string(), n))).collect(),
         Err(e) => return json!({ "error": e.to_string() }),
@@ -151,8 +198,13 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
         .filter_map(|m| Some((m.provider_id.clone()?, m)))
         .collect();
     let (mut leaving, mut left, mut resumed, mut errors) = (0, 0, 0, 0);
+    let (mut joining, mut joined, mut pending, mut restarting, mut waiting) = (0, 0, 0, 0, 0);
     let mut unseen = false;
     let mut still_on: HashSet<String> = HashSet::new();
+    // Machines with an interface on some network, in use or not: none joins another.
+    let mut on_one: HashSet<String> = HashSet::new();
+    // Running on their team's network's subnet without using it yet: a boot away.
+    let mut to_boot: Vec<(TeamNetwork, String, Machine)> = Vec::new();
     for (part, n) in &nets {
         let team = teams.get(part).cloned();
         let members = match p.team_network_members(&n.id).await {
@@ -165,7 +217,20 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
         };
         for mem in &members {
             let Some(m) = ours.get(&mem.machine) else { continue };
-            if team.is_some() && app.db.team_id_of(&m.user_id) == team {
+            on_one.insert(m.id.clone());
+            if let Some(t) = team.as_deref().filter(|t| app.db.team_id_of(&m.user_id).as_deref() == Some(*t)) {
+                if mem.active {
+                    if joined_now(app, cp, n, t, m) {
+                        joined += 1;
+                    }
+                } else {
+                    // Also after a restart of botd, which remembers joins only in memory.
+                    joining_set(cp).insert(m.id.clone());
+                    if m.state == State::Running {
+                        pending += 1;
+                        to_boot.push((n.clone(), t.to_string(), m.clone()));
+                    }
+                }
                 continue;
             }
             match leave(app, cp, p, n, team.as_deref(), m, mem).await {
@@ -181,24 +246,247 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
         }
     }
     // A network not looked at may still have a machine to take off: never power one on
-    // until every network has been.
+    // until every network has been. Nor join one to a network: it may be on another.
     if !unseen {
-        let waiting: Vec<String> = suspended(cp).iter().filter(|id| !still_on.contains(*id)).cloned().collect();
-        for id in waiting {
+        let off: Vec<String> = suspended(cp).iter().filter(|id| !still_on.contains(*id)).cloned().collect();
+        for id in off {
             match resume(app, cp, &id).await {
                 Some(true) => resumed += 1,
                 Some(false) => errors += 1,
                 None => {}
             }
         }
+        if s.join != Join::Off {
+            let off_all: Vec<&Machine> = ours.values().filter(|m| !on_one.contains(&m.id)).collect();
+            for m in off_all {
+                match join(app, cp, p, s, m).await {
+                    Joined::Joining => joining += 1,
+                    Joined::Waiting => waiting += 1,
+                    Joined::Failed => errors += 1,
+                    Joined::Nothing => {}
+                }
+            }
+        }
+        if s.join == Join::WhenIdle {
+            for (n, team, m) in &to_boot {
+                match restart(app, cp, p, n, team, m).await {
+                    Restart::Restarting => restarting += 1,
+                    Restart::Waiting => {}
+                    Restart::Failed => errors += 1,
+                }
+            }
+        }
     }
     let mut out = json!({});
-    for (k, v) in [("leaving", leaving), ("left", left), ("resumed", resumed), ("errors", errors)] {
+    for (k, v) in [
+        ("leaving", leaving),
+        ("left", left),
+        ("resumed", resumed),
+        ("joining", joining),
+        ("pending", pending),
+        ("restarting", restarting),
+        ("joined", joined),
+        ("waiting", waiting),
+        ("errors", errors),
+    ] {
         if v > 0 {
             out[k] = v.into();
         }
     }
     out
+}
+
+/// Records that `m`, which botd put on `n`, now uses it. Whether it did.
+fn joined_now(app: &App, cp: &ControlPlane, n: &TeamNetwork, team: &str, m: &Machine) -> bool {
+    if !joining_set(cp).remove(&m.id) {
+        return false;
+    }
+    let d = json!({ "team": team, "networkId": n.id, "label": n.label, "subnet": n.subnet });
+    app.db.record(&event(&system(m), "machine.team_network_joined", m, d));
+    true
+}
+
+#[derive(Debug, PartialEq)]
+enum Joined {
+    Joining,
+    Waiting,
+    Failed,
+    Nothing,
+}
+
+/// Why `m` can't be put on `subnet` yet, if it can't: its egress rules must let the
+/// subnet through first, or there must be none. botd knows what they let through from
+/// its agent's heartbeats, the last of which still holds for a machine powered off.
+pub fn rules_waiting(m: &Machine, subnet: &str) -> Option<&'static str> {
+    let r = m.agent_upkeep.as_ref().map(|u| &u["teamNetwork"]).filter(|r| !r.is_null());
+    let Some(r) = r else {
+        return Some("its agent hasn't said what its egress rules let through; upgrade it");
+    };
+    match r["state"].as_str() {
+        Some(wire::TEAM_RULES_NONE) => None,
+        Some(wire::TEAM_RULES_ON) if r["subnet"] == subnet => None,
+        Some(wire::TEAM_RULES_FAILED) => Some("its egress rules didn't take the subnet"),
+        _ => Some("its egress rules don't let the subnet through yet"),
+    }
+}
+
+/// Puts `m` on its owner's team's network from its next boot, if it should be on one.
+async fn join(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, s: &Settings, m: &Machine) -> Joined {
+    let active = |x: &Machine| matches!(x.state, State::Running | State::Suspended);
+    let Some(team) = app.db.team_id_of(&m.user_id) else { return Joined::Nothing };
+    if !active(m) || m.provider_id.is_none() {
+        return Joined::Nothing;
+    }
+    if rules_waiting(m, &s.subnet).is_some() || !behind_firewall(cp, p, m).await {
+        return Joined::Waiting;
+    }
+    let by = system(m);
+    // Under the lock team changes take: one who left the team meanwhile isn't put on.
+    let _g = cp.lock_ops().await;
+    let Some(m) = app.db.machine(&m.id).filter(|x| active(x) && app.db.team_id_of(&x.user_id).as_deref() == Some(team.as_str())) else {
+        return Joined::Nothing;
+    };
+    let pid = m.provider_id.clone().unwrap_or_default();
+    let tried = match ensure(app, cp, p, &m, &by).await {
+        Ok(Some(n)) => p.join_team_network(&pid, &n).await.map(|()| n),
+        Ok(None) => return Joined::Nothing,
+        Err(e) => Err(e),
+    };
+    match tried {
+        Ok(n) => {
+            refusals(cp).remove(&m.id);
+            joining_set(cp).insert(m.id.clone());
+            let d = json!({
+                "team": team, "networkId": n.id, "label": n.label, "subnet": n.subnet, "join": s.join.as_str(),
+                "poweredOff": m.state == State::Suspended,
+            });
+            app.db.record(&event(&by, "machine.team_network_joining", &m, d));
+            Joined::Joining
+        }
+        Err(e) => {
+            // Once per reason, not every pass.
+            let why = e.to_string();
+            if refusals(cp).insert(m.id.clone(), why.clone()).as_deref() != Some(why.as_str()) {
+                let d = json!({ "team": team, "join": s.join.as_str(), "error": why });
+                app.db.record(&event(&by, "machine.team_network_joining", &m, d).outcome(Outcome::Failure));
+            }
+            Joined::Failed
+        }
+    }
+}
+
+/// Whether the provider says `m` is behind the machines' firewall, whose inbound drops
+/// are what keep teammates' machines apart on the VPC. A machine whose firewall failed
+/// to attach waits until the firewall sweep puts it behind.
+async fn behind_firewall(cp: &ControlPlane, p: &dyn MachineProvider, m: &Machine) -> bool {
+    let (Some(_), Some(fw), Some(pid)) = (&cp.firewall, m.firewall_id.as_deref(), m.provider_id.as_deref()) else { return false };
+    p.firewall_devices(fw).await.is_ok_and(|d| d.machines.iter().any(|x| x == pid))
+}
+
+#[derive(Debug, PartialEq)]
+enum Restart {
+    Restarting,
+    Waiting,
+    Failed,
+}
+
+/// Powers off `m`, on `n`'s subnet but not using it yet, once its agent says it runs
+/// nothing, so the sweep powers it on again on the network (MACHINE_TEAM_NETWORK_JOIN=
+/// when-idle). A run that starts between that answer and the power-off ends with it, as
+/// a rebuild's would.
+async fn restart(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, n: &TeamNetwork, team: &str, m: &Machine) -> Restart {
+    let Some(e) = cp.enrollment.as_deref() else { return Restart::Waiting };
+    if m.enrollment != "enrolled" || !behind_firewall(cp, p, m).await {
+        return Restart::Waiting;
+    }
+    match super::enroll::heartbeat(app, e, m).await {
+        Ok(hb) if hb.jobs == 0 => {}
+        _ => return Restart::Waiting,
+    }
+    let by = system(m);
+    let due = |x: &Machine| app.db.team_id_of(&x.user_id).as_deref() == Some(team);
+    let still = |x: &Machine| x.id == m.id && x.state == State::Running && due(x);
+    if super::act_if(app, cp, &by, &m.user_id, Step::Suspend, None, &still).await.is_err() {
+        return if app.db.machine(&m.id).is_some_and(|x| still(&x)) { Restart::Failed } else { Restart::Waiting };
+    }
+    suspended(cp).insert(m.id.clone());
+    let d = json!({ "team": team, "networkId": n.id, "label": n.label, "subnet": n.subnet });
+    app.db.record(&event(&by, "machine.team_network_restarting", m, d));
+    Restart::Restarting
+}
+
+fn joining_set(cp: &ControlPlane) -> std::sync::MutexGuard<'_, HashSet<String>> {
+    cp.network_joining.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn refusals(cp: &ControlPlane) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
+    cp.network_join_refused.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// The team network's subnet in machines' own egress rules (ADR 0202).
+
+/// When each machine was last sent which subnet, so a failing agent isn't sent it on
+/// every heartbeat.
+static SENT: Mutex<Option<HashMap<String, (Option<String>, i64)>>> = Mutex::new(None);
+const RESEND_MS: i64 = 10 * 60_000;
+
+/// What `m`'s egress rules should let through: its owner's team's subnet, or none.
+/// None with team networks off, or joining off: nothing is asked of machines then.
+fn wanted(app: &App, cp: &ControlPlane, m: &Machine) -> Option<Option<String>> {
+    let s = cp.team_network.as_ref().filter(|s| s.join != Join::Off)?;
+    Some(app.db.team_id_of(&m.user_id).map(|_| s.subnet.clone()))
+}
+
+/// After a heartbeat: sends the agent the subnet its egress rules should let through
+/// if they let another through, or failed to load, at most every `RESEND_MS` for the
+/// same one. A machine with no egress rules has nothing to let through.
+pub async fn follow_up(app: &App, cp: &ControlPlane, e: &Enrollment, m: &Machine, hb: &Heartbeat) {
+    let Some(want) = wanted(app, cp, m) else { return };
+    if !hb.can.iter().any(|c| c == wire::CAN_TEAM_NETWORK) {
+        return;
+    }
+    let Some(r) = &hb.team_network else { return };
+    if r.state == wire::TEAM_RULES_NONE || (r.subnet == want && r.state == wire::TEAM_RULES_ON) {
+        return;
+    }
+    let at = now();
+    {
+        let mut sent = SENT.lock().unwrap_or_else(|e| e.into_inner());
+        let sent = sent.get_or_insert_with(HashMap::new);
+        if sent.get(&m.id).is_some_and(|(s, when)| *s == want && at - when < RESEND_MS) {
+            return;
+        }
+        sent.insert(m.id.clone(), (want.clone(), at));
+    }
+    let _ = push(app, e, m, want).await;
+}
+
+/// Sends `m`'s agent the subnet its egress rules should let through. Its answer: how
+/// they stand there.
+pub async fn push(app: &App, e: &Enrollment, m: &Machine, subnet: Option<String>) -> Result<TeamNetworkReport, String> {
+    match e.call_agent(app, m, reqwest::Method::PUT, "/v1/team-network", &TeamNetworkRules { subnet }).await {
+        Ok((200, body)) => serde_json::from_value(body).map_err(|_| "its agent's answer wasn't a report".to_string()),
+        Ok((code, body)) => Err(body["error"].as_str().map_or(format!("it answered {code}"), String::from)),
+        Err(e) => Err(e),
+    }
+}
+
+/// Audits a change in what a machine's egress rules let through, or a failure to.
+pub fn observed(app: &App, m: &Machine, by: &Who, old: Option<&Value>, new: &Value) {
+    let (was, now) = (old.map(|o| &o["teamNetwork"]).filter(|w| !w.is_null()), &new["teamNetwork"]);
+    if now.is_null() || was.is_some_and(|w| w["subnet"] == now["subnet"] && w["state"] == now["state"] && w["error"] == now["error"]) {
+        return;
+    }
+    // A machine first heard from with nothing let through has nothing to say.
+    if was.is_none() && now["subnet"].is_null() && now["state"] != wire::TEAM_RULES_FAILED {
+        return;
+    }
+    let d = json!({ "subnet": now["subnet"], "from": was.map(|w| w["subnet"].clone()), "error": now["error"] });
+    match now["state"].as_str() {
+        Some(wire::TEAM_RULES_FAILED) => app.db.record(&event(by, "machine.team_network_rules_failed", m, d).outcome(Outcome::Failure)),
+        Some(wire::TEAM_RULES_ON) => app.db.record(&event(by, "machine.team_network_rules_loaded", m, d)),
+        _ => {}
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -209,8 +497,9 @@ pub(crate) enum Leave {
     Failed,
 }
 
-/// Takes `m` off `n`. Its interface can only go while it is off, so a running machine
-/// is suspended first, and the next pass, once it is off, removes it.
+/// Takes `m` off `n`. An interface in use can only go while the machine is off, so a
+/// running machine is suspended first, and the next pass, once it is off, removes it.
+/// One added since it booted (ADR 0202) goes at once.
 pub(crate) async fn leave(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, n: &TeamNetwork, team: Option<&str>, m: &Machine, mem: &NetworkMember) -> Leave {
     let by = system(m);
     let details = || json!({ "team": team, "networkId": n.id, "label": n.label, "ownersTeam": app.db.team_id_of(&m.user_id) });
@@ -218,6 +507,23 @@ pub(crate) async fn leave(app: &AppState, cp: &ControlPlane, p: &dyn MachineProv
     // since the sweep looked keeps their network.
     let due = || team.is_none() || app.db.team_id_of(&m.user_id).as_deref() != team;
     match m.state {
+        State::Running if !mem.active => {
+            let _g = cp.lock_ops().await;
+            if !app.db.machine(&m.id).is_some_and(|x| x.state == State::Running) || !due() {
+                return Leave::Waiting;
+            }
+            let mut d = details();
+            if let Err(e) = p.leave_team_network(mem).await {
+                d["error"] = json!(e.to_string());
+                app.db.record(&event(&by, "machine.team_network_left", m, d).outcome(Outcome::Failure));
+                return Leave::Failed;
+            }
+            joining_set(cp).remove(&m.id);
+            d["resuming"] = json!(false);
+            d["inUse"] = json!(false);
+            app.db.record(&event(&by, "machine.team_network_left", m, d));
+            Leave::Left
+        }
         State::Running => {
             let still = |x: &Machine| x.id == m.id && x.state == State::Running && due();
             if super::act_if(app, cp, &by, &m.user_id, Step::Suspend, None, &still).await.is_err() {
@@ -313,7 +619,7 @@ mod tests {
         assert!(e.contains("off or vpc"), "{e}");
         let on = Settings::from_env(&vars(&[("MACHINE_TEAM_NETWORK", "VPC")])).unwrap().unwrap();
         assert_eq!(on.subnet, DEFAULT_SUBNET);
-        assert_eq!(on.view(), json!({ "kind": "vpc", "subnet": DEFAULT_SUBNET }));
+        assert_eq!(on.view(), json!({ "kind": "vpc", "subnet": DEFAULT_SUBNET, "join": "next-boot" }));
         let with = |s: &str| Settings::from_env(&vars(&[("MACHINE_TEAM_NETWORK", "vpc"), ("MACHINE_TEAM_NETWORK_SUBNET", s)]));
         assert_eq!(with("172.20.0.0/16").unwrap().unwrap().subnet, "172.20.0.0/16");
         assert_eq!(with(" 192.168.4.0/24 ").unwrap().unwrap().subnet, "192.168.4.0/24");

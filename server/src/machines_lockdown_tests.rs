@@ -421,6 +421,7 @@ async fn machines_that_dont_enroll_in_time_are_reported() {
         teammate_stand_in: None,
         run_cgroups: false,
         nft: "/nonexistent/nft".into(),
+        egress_script: "/nonexistent/egress".into(),
     };
     agent::enroll(&cfg).await.unwrap();
     let row = env.app.db.machine(&mid).unwrap();
