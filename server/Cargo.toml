@@ -28,6 +28,10 @@ path = "src/bin/superbot-run.rs"
 name = "superbot-site"
 path = "src/bin/superbot-site/main.rs"
 
+[[bin]]
+name = "superbot-evidence"
+path = "src/bin/superbot-evidence/main.rs"
+
 [dependencies]
 age = { version = "0.12", default-features = false }
 aws-lc-rs = "1"
@@ -54,6 +58,7 @@ tokio-stream = { version = "0.1.19", features = ["sync"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6.8", features = ["catch-panic", "cors"] }
 url = "2"
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["aws-lc-rs", "std"] }
 x509-parser = { version = "0.18", default-features = false }
 zeroize = "1.9.2"
 roxmltree = "0.21"

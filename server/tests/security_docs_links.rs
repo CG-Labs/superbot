@@ -528,8 +528,34 @@ fn the_type_ii_evidence_plan_covers_every_criterion() {
     }
 }
 
+/// The settings in the first column of the configuration baseline's table, in backticks.
+fn baseline_settings(md: &str) -> Vec<String> {
+    md.lines()
+        .filter_map(|l| l.strip_prefix("| `"))
+        .flat_map(|first| first.split(" |").next().unwrap_or_default().split(", ").map(|s| s.trim_matches('`').to_string()).collect::<Vec<_>>())
+        .collect()
+}
+
+#[test]
+fn the_configuration_baseline_names_only_documented_settings() {
+    let md = fs::read_to_string(pack().join("configuration-baseline.md")).expect("docs/security/configuration-baseline.md exists");
+    assert!(md.contains("not SOC 2 certified"), "the baseline must say plainly that SuperBot is not certified");
+    assert_eq!(certification_claims(&md), Vec::<usize>::new(), "the baseline must not claim a certification (lines listed)");
+    let documented = fs::read_to_string(repo().join(".env.example")).unwrap() + &fs::read_to_string(repo().join("deploy/README.md")).unwrap();
+    let settings = baseline_settings(&md);
+    assert!(settings.len() >= 15, "the baseline's table lists the settings: {settings:?}");
+    for s in &settings {
+        assert!(s.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'), "`{s}` isn't a setting's name");
+        assert!(documented.contains(&format!("{s}=")) || documented.contains(&format!("`{s}`")), "the baseline names `{s}`, which neither .env.example nor deploy/README.md documents");
+    }
+    for want in ["AUTH_MFA", "SUPERBOT_BACKUP_ENCRYPTION", "SUPERBOT_DATABASE_ENCRYPTION", "SERVER_BACKUP_OFF_HOST", "MACHINE_FIREWALL", "MACHINE_BOT_USER", "MACHINE_TEAMMATE_USERS", "TEAMS"] {
+        assert!(settings.iter().any(|s| s == want), "the baseline must set {want}, which the information security policy names");
+    }
+}
+
 #[test]
 fn the_checker_catches_what_it_should() {
+    assert_eq!(baseline_settings("| Setting | x |\n| `A_B` | on |\n| `C`, `D_2` | x |\nnot `E`\n"), vec!["A_B", "C", "D_2"]);
     assert_eq!(certification_claims("We are SOC 2 certified.\nSuperBot is not SOC 2 certified.\nNo one here is certified.\n`certified`\n"), vec![1]);
     assert_eq!(adr_refs("See ADR 0089 and [ADR 0090](x.md), not ADR 12 or `ADR 0001`."), vec![(1, "0089".to_string()), (1, "0090".to_string())]);
     let md = "`server/src/a.rs` `actions/checkout@v4` `/api/x` `docs/sso/` `deploy/a b`\n```\n`web/x.js`\n```\n";

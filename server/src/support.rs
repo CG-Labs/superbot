@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// Bumped when a file's shape changes, so support tools can tell bundles apart.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 const AUDIT_DAYS: i64 = 7;
 /// Newest events read for the summary; older ones in the window are counted as truncated.
 const AUDIT_SCAN: i64 = 20_000;
@@ -55,6 +55,8 @@ you send it: every file is plain text.
                       and the approval policy
   health.json         the status page's checks and open incidents, the setup checklist,
                       license, approvals waiting, runs, machines, database and backups
+  health-score.json   the customer health score for the last 30 days and the signals
+                      behind it: counts and reason codes only
   logs.jsonl          the newest lines botd logged since it started (at most 2,000)
   audit-summary.json  the last 7 days of the audit log, counted by action and outcome,
                       and the newest failures and denials (no names, emails or addresses)
@@ -445,6 +447,7 @@ pub fn build(app: &App, vars: &[(String, String)], setup: Value, now_ms: i64) ->
         ("version.json", json_file(version(app, started.as_ref(), now_ms), &names)),
         ("config.json", json_file(config, &names)),
         ("health.json", json_file(health(app, setup, now_ms), &names)),
+        ("health-score.json", json_file(crate::health_score::build(app, now_ms, crate::health_score::DEFAULT_DAYS), &names)),
         ("logs.jsonl", redact::text(&logs).into_owned().into_bytes()),
         ("audit-summary.json", json_file(audit, &names)),
     ];
@@ -466,38 +469,7 @@ pub fn build(app: &App, vars: &[(String, String)], setup: Value, now_ms: i64) ->
 
 // Tar
 
-/// A ustar archive of plain files, readable by any `tar`. Names must fit in 100 bytes.
-pub fn tar(entries: &[(String, Vec<u8>)], mtime: u64) -> Vec<u8> {
-    fn octal(field: &mut [u8], v: u64) {
-        let w = field.len() - 1;
-        field[..w].copy_from_slice(format!("{v:0w$o}").as_bytes());
-        field[w] = 0;
-    }
-    let mut out = Vec::new();
-    for (name, data) in entries {
-        assert!(name.len() <= 100, "tar names fit in 100 bytes: {name}");
-        let mut h = [0u8; 512];
-        h[..name.len()].copy_from_slice(name.as_bytes());
-        octal(&mut h[100..108], 0o600);
-        octal(&mut h[108..116], 0);
-        octal(&mut h[116..124], 0);
-        octal(&mut h[124..136], data.len() as u64);
-        octal(&mut h[136..148], mtime);
-        h[148..156].fill(b' ');
-        h[156] = b'0';
-        h[257..263].copy_from_slice(b"ustar\0");
-        h[263..265].copy_from_slice(b"00");
-        h[265..273].copy_from_slice(b"superbot");
-        h[297..305].copy_from_slice(b"superbot");
-        let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
-        h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
-        out.extend_from_slice(&h);
-        out.extend_from_slice(data);
-        out.resize(out.len().div_ceil(512) * 512, 0);
-    }
-    out.resize(out.len() + 1024, 0);
-    out
-}
+pub use crate::ustar::tar;
 
 // HTTP
 

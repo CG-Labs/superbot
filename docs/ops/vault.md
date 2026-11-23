@@ -1,6 +1,6 @@
 # Reading secrets from HashiCorp Vault
 
-botd can read its secrets from HashiCorp Vault (or OpenBao) instead of, or as well as, `.env` and the sealed store. Off by default. Design: [ADR 0125](../adr/0125-external-secrets-backend-vault.md). For Azure Key Vault or GCP Secret Manager, see [cloud-secrets.md](cloud-secrets.md).
+botd can read its secrets from HashiCorp Vault (or OpenBao) instead of, or as well as, `.env` and the sealed store. Off by default. Design: [ADR 0125](../adr/0125-external-secrets-backend-vault.md). For Azure Key Vault, GCP Secret Manager or AWS Secrets Manager, see [cloud-secrets.md](cloud-secrets.md).
 
 ## What goes where
 

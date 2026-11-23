@@ -1,0 +1,36 @@
+{
+  "url": "https://api.github.com/repos/example-org/example-repo/pulls/102",
+  "html_url": "https://github.com/example-org/example-repo/pull/102",
+  "number": 102,
+  "state": "closed",
+  "title": "Add the widget",
+  "user": {
+    "login": "author-a",
+    "id": 73749,
+    "type": "User",
+    "site_admin": false
+  },
+  "body": "Secret body: deploy notes for the reviewer only.",
+  "created_at": "2026-10-18T10:00:00Z",
+  "updated_at": "2026-10-21T08:00:00Z",
+  "closed_at": "2026-10-20T15:04:05Z",
+  "merged_at": "2026-10-20T15:04:05Z",
+  "merge_commit_sha": "b102b102b102b102b102b102b102b102b102b102",
+  "merged_by": {
+    "login": "maintainer-m",
+    "id": 38766,
+    "type": "User",
+    "site_admin": false
+  },
+  "head": {
+    "ref": "feature-102",
+    "sha": "a102a102a102a102a102a102a102a102a102a102"
+  },
+  "base": {
+    "ref": "main",
+    "sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "author_association": "MEMBER",
+  "draft": false,
+  "merged": true
+}

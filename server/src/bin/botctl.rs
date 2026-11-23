@@ -185,10 +185,19 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl deny <id> [--remember | --remember-global]
   botctl audit [<limit>] [filters]                 Recent audit events, newest first
   botctl audit export [filters] > audit.csv        All matching events as CSV, oldest first
-  botctl audit verify [--pin <id>:<hash>]...       Check the audit log's hash chain; names the first
-                                                   broken link, exits 1 if there is one. --pin: a hash
-                                                   kept elsewhere (your SIEM) the row must still have
+  botctl audit verify [--pin <id>:<hash>]... [--from <id>] [--to <id>] [--key <hex>]...
+                                                   Check the audit log's hash chain, its signed
+                                                   checkpoints and their timestamps; names the first
+                                                   break, exits 1 if there is one. --pin: a hash kept
+                                                   elsewhere (your SIEM) the row must still have.
+                                                   --from/--to: only those event ids. --key: trust only
+                                                   this checkpoint key (from botctl audit key)
   botctl audit siem                                The SIEM export: sink, delivered, pending, failing
+  botctl audit chain                               The chain's state: head, last checkpoint and
+                                                   timestamp, export lag, last check
+  botctl audit key                                 The public key checkpoints are signed with
+  botctl audit checkpoint                          Sign a checkpoint of the head now
+  botctl audit checkpoints [<limit>]               Recent checkpoints, with their RFC 3161 tokens
     filters: --from <time> --to <time> --action <a,b.*> --actor <user|bot|system[:id]>
              --actor user:<email> --method <password,code,sso,none,bot_token,scim_token>
              --idp <entra|google|oidc|github|apple|saml> --idp-provider <id> --subject <issuer|sub>
@@ -197,6 +206,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl support-bundle [-o <file>]                Save a support bundle for a ticket (ADR 0131): version,
                                                    redacted settings, health, recent logs and an audit
                                                    summary, in a tar; no secrets, emails or chats
+  botctl health-score [--days <n>] [json]          The customer health score (ADR 0144) for the last 30 days
+                                                   (7 to 90): adoption, Bot runs, sign-in and SCIM, backups,
+                                                   approvals and the license, each ok, watch or at risk
   botctl evidence                                  The evidence bundle schedule (EVIDENCE_BUNDLES), where
                                                    bundles are written and those kept (ADR 0142)
   botctl evidence bundle [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]
@@ -275,7 +287,7 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine removals [<state>]                Teammate removals: open (default), pending, held, done, cancelled, all
   botctl secrets                                   List secret names (never values)
   botctl secrets backend                           Where botd reads secrets from (local, Vault, Azure Key
-                                                   Vault, GCP Secret Manager) and whether it answers now
+                                                   Vault, GCP or AWS Secrets Manager) and whether it answers now
   botctl secret set <NAME> < value-file            Save a secret, encrypted; Bots get it as $NAME
   botctl secret rm <NAME>                          Delete a saved secret
 
@@ -785,18 +797,30 @@ fn audit_query(rest: &[&str]) -> Result<String, String> {
     Ok(if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) })
 }
 
-/// `botctl audit verify [--pin <id>:<hash>]...`: hashes kept elsewhere (a SIEM, an
-/// earlier check) to hold the chain to.
+/// `botctl audit verify [--pin <id>:<hash>]... [--from <id>] [--to <id>] [--key <hex>]...`:
+/// hashes kept elsewhere (a SIEM, an earlier check) to hold the chain to, the event ids
+/// to check, and the checkpoint keys to trust instead of botd's own.
 fn verify_query(rest: &[&str]) -> Result<String, String> {
-    let mut pins = Vec::new();
+    let (mut pins, mut keys, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match *a {
             "--pin" => pins.push(encode(it.next().ok_or("--pin needs <event id>:<hash>")?)),
+            "--key" => keys.push(encode(it.next().ok_or("--key needs a public key in hex (botctl audit key)")?)),
+            o @ ("--from" | "--to") => {
+                let id = it.next().filter(|v| v.parse::<i64>().is_ok()).ok_or_else(|| format!("{o} needs an event id"))?;
+                pairs.push(format!("{}={id}", &o[2..]));
+            }
             other => return Err(format!("Unknown audit verify option \"{other}\". See botctl admin.")),
         }
     }
-    Ok(if pins.is_empty() { String::new() } else { format!("?pin={}", pins.join(",")) })
+    if !pins.is_empty() {
+        pairs.insert(0, format!("pin={}", pins.join(",")));
+    }
+    if !keys.is_empty() {
+        pairs.push(format!("key={}", keys.join(",")));
+    }
+    Ok(if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) })
 }
 
 fn flag<'a>(rest: &[&'a str], name: &str) -> Option<&'a str> {
@@ -1320,7 +1344,7 @@ fn setup_summary(s: &Value) -> String {
     out
 }
 
-/// Where botd reads secrets from and whether it answers (ADR 0125, ADR 0136); an error
+/// Where botd reads secrets from and whether it answers (ADR 0125, ADR 0136, ADR 0146); an error
 /// when it doesn't, so scripts can check it.
 fn backend_summary(b: &Value) -> Result<String, String> {
     if b.is_null() {
@@ -1399,6 +1423,17 @@ fn saml_summary(v: &Value) -> String {
             _ => "off",
         }
     );
+    out += &format!(
+        "  IdP metadata signature:   {}\n",
+        match v["signedMetadata"].as_str() {
+            Some("require") => "required",
+            Some("allow") => "checked when signed",
+            _ => "not checked",
+        }
+    );
+    for c in v["metadataSigningCertificates"].as_array().into_iter().flatten() {
+        out += &format!("    Trusted signer: SHA-256 {} ({}), expires {}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]));
+    }
     let yes = |b: bool| if b { "yes" } else { "no" };
     out += &format!(
         "  Signs AuthnRequests:      {}\n  Single logout:            {}\n",
@@ -1660,6 +1695,11 @@ fn run(args: &[String]) -> Result<String, String> {
         ["approvals", status] => op("GET", &format!("/api/approvals?status={status}"), None),
         [verb @ ("approve" | "deny"), id, rest @ ..] => decide(verb, id, rest),
         ["support-bundle", rest @ ..] => support_bundle(rest),
+        ["health-score", rest @ ..] => {
+            let (path, json) = health_request(rest)?;
+            let res = api(Cred::Operator, "GET", &path, None)?;
+            if json { Ok(pretty(res)) } else { Ok(health_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)) }
+        }
         ["evidence"] => op("GET", "/api/evidence", None),
         ["evidence", "bundle", rest @ ..] => evidence_bundle(rest),
         ["audit", "export", rest @ ..] => api(Cred::Operator, "GET", &format!("/api/audit/export.csv{}", audit_query(rest)?), None),
@@ -1669,6 +1709,14 @@ fn run(args: &[String]) -> Result<String, String> {
             if serde_json::from_str::<Value>(&res).ok().and_then(|v| v["ok"].as_bool()) == Some(false) { Err(res) } else { Ok(res) }
         }
         ["audit", "siem"] => op("GET", "/api/audit/siem", None),
+        ["audit", "chain"] => op("GET", "/api/audit/chain", None),
+        ["audit", "key"] => op("GET", "/api/audit/checkpoints/key", None),
+        ["audit", "checkpoint"] => op("POST", "/api/audit/checkpoints", None),
+        ["audit", "checkpoints"] => op("GET", "/api/audit/checkpoints", None),
+        ["audit", "checkpoints", limit] => {
+            let n: u32 = limit.parse().map_err(|_| format!("{limit} isn't a number of checkpoints"))?;
+            op("GET", &format!("/api/audit/checkpoints?limit={n}"), None)
+        }
         ["audit", rest @ ..] => op("GET", &format!("/api/audit{}", audit_query(rest)?), None),
         ["retention"] => op("GET", "/api/retention", None),
         ["retention", "hold", bot, reason] => op("PUT", &format!("/api/retention/holds/{}", encode(bot)), Some(json!({ "reason": reason }).to_string())),
@@ -1864,6 +1912,61 @@ fn support_bundle(rest: &[&str]) -> Result<String, String> {
     ))
 }
 
+/// `botctl health-score [--days <n>] [json]`: the path, and whether to print the JSON.
+fn health_request(rest: &[&str]) -> Result<(String, bool), String> {
+    let usage = || "Usage: botctl health-score [--days <n>] [json]".to_string();
+    let (mut days, mut json) = (None, false);
+    let mut args = rest.iter();
+    while let Some(a) = args.next() {
+        match *a {
+            "json" if !json => json = true,
+            "--days" if days.is_none() => {
+                let n = args.next().ok_or_else(usage)?;
+                days = Some(n.parse::<u32>().map_err(|_| format!("--days must be a whole number of days, not \"{n}\""))?);
+            }
+            _ => return Err(usage()),
+        }
+    }
+    let path = match days {
+        Some(d) => format!("/api/support/health-score?days={d}"),
+        None => "/api/support/health-score".into(),
+    };
+    Ok((path, json))
+}
+
+/// The health score for a person: the score and band, then each signal on a line.
+fn health_summary(v: &Value) -> String {
+    let score = v["score"].as_u64().map_or("no score".to_string(), |s| format!("{s}/100"));
+    let band = v["band"].as_str().unwrap_or("unknown").replace('_', " ");
+    let mut out = format!("Customer health: {score}, {band} (last {} days)\n", v["windowDays"]);
+    let signals = v["signals"].as_array().cloned().unwrap_or_default();
+    let width = signals.iter().filter_map(|s| s["label"].as_str()).map(str::len).max().unwrap_or(0);
+    for s in &signals {
+        let status = match s["status"].as_str().unwrap_or("") {
+            "risk" => "AT RISK",
+            other => other,
+        };
+        let label = s["label"].as_str().unwrap_or("");
+        out.push_str(&format!("  {status:<7}  {label:<width$}  {:>2}  {}\n", s["weight"].as_u64().unwrap_or(0), s["summary"].as_str().unwrap_or("")));
+    }
+    let named = |key: &str| -> Vec<String> {
+        let ids: Vec<&str> = v[key].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        signals.iter().filter(|s| s["id"].as_str().is_some_and(|id| ids.contains(&id))).filter_map(|s| s["label"].as_str().map(String::from)).collect()
+    };
+    let (risk, watch) = (named("atRisk"), named("watch"));
+    if !risk.is_empty() {
+        out.push_str(&format!("At risk: {}.\n", risk.join(", ")));
+    }
+    if !watch.is_empty() {
+        out.push_str(&format!("Worth a look: {}.\n", watch.join(", ")));
+    }
+    if v["partial"] == true {
+        out.push_str(&format!("The audit log keeps {} days, so its counts cover less than the window.\n", v["auditRetentionDays"]));
+    }
+    out.push_str("Weights are out of 100; n/a signals don't count. What each means and what to do: docs/support/health-score.md\n");
+    out
+}
+
 /// `botctl evidence bundle [--from <date> --to <date>] [-o <file>]`: botd's path and the file to save it as.
 fn evidence_request<'a>(rest: &[&'a str]) -> Result<(String, Option<&'a str>), String> {
     const USE: &str = "Usage: botctl evidence bundle [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]";
@@ -1960,6 +2063,17 @@ mod tests {
     }
 
     #[test]
+    fn health_score_takes_a_window_and_json() {
+        assert_eq!(health_request(&[]), Ok(("/api/support/health-score".into(), false)));
+        assert_eq!(health_request(&["json"]), Ok(("/api/support/health-score".into(), true)));
+        assert_eq!(health_request(&["--days", "90", "json"]), Ok(("/api/support/health-score?days=90".into(), true)));
+        assert_eq!(health_request(&["json", "--days", "7"]), Ok(("/api/support/health-score?days=7".into(), true)));
+        for bad in [&["--days"][..], &["--days", "x"], &["--days", "-3"], &["7"], &["json", "json"], &["--days", "7", "--days", "8"]] {
+            assert!(health_request(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn an_evidence_bundles_check_uses_the_served_folder_and_quotes_paths() {
         let served = "superbot-evidence-2026-10-01_2026-11-01-20261101T000000Z.tar";
         assert_eq!(evidence_check("evidence.tar", Some(served)), "tar -xf 'evidence.tar' && cd 'superbot-evidence-2026-10-01_2026-11-01-20261101T000000Z' && sha256sum -c SHA256SUMS");
@@ -1974,6 +2088,30 @@ mod tests {
         for bad in [&["--from", "2026-10-01"][..], &["--from"], &["--from", "--to"], &["x"], &["-o", "a", "-o", "b"], &["--to", "2026-11-01"]] {
             assert!(evidence_request(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn health_score_reads_as_a_line_per_signal() {
+        let v = json!({
+            "score": 72, "band": "watch", "windowDays": 30, "atRisk": ["runs"], "watch": ["adoption"], "partial": true, "auditRetentionDays": 14,
+            "signals": [
+                { "id": "adoption", "label": "Adoption", "weight": 25, "status": "watch", "summary": "9 of 20 people (45%) signed in." },
+                { "id": "runs", "label": "Bot runs", "weight": 20, "status": "risk", "summary": "20 of 100 runs (20%) failed." },
+                { "id": "license", "label": "License", "weight": 5, "status": "n/a", "summary": "Testing mode." },
+            ],
+        });
+        let out = health_summary(&v);
+        assert_eq!(
+            out,
+            "Customer health: 72/100, watch (last 30 days)\n  \
+             watch    Adoption  25  9 of 20 people (45%) signed in.\n  \
+             AT RISK  Bot runs  20  20 of 100 runs (20%) failed.\n  \
+             n/a      License    5  Testing mode.\n\
+             At risk: Bot runs.\nWorth a look: Adoption.\n\
+             The audit log keeps 14 days, so its counts cover less than the window.\n\
+             Weights are out of 100; n/a signals don't count. What each means and what to do: docs/support/health-score.md\n"
+        );
+        assert!(health_summary(&json!({ "band": "at_risk", "windowDays": 7 })).starts_with("Customer health: no score, at risk (last 7 days)"));
     }
 
     #[test]
@@ -2221,6 +2359,9 @@ mod tests {
         assert_eq!(verify_query(&[]).unwrap(), "");
         assert_eq!(verify_query(&["--pin", "12:ab", "--pin", "13:cd"]).unwrap(), "?pin=12:ab,13:cd");
         assert!(verify_query(&["--pin"]).is_err() && verify_query(&["--all"]).is_err());
+        let key = "ab".repeat(32);
+        assert_eq!(verify_query(&["--from", "10", "--to", "20", "--key", &key, "--pin", "12:ab"]).unwrap(), format!("?pin=12:ab&from=10&to=20&key={key}"));
+        assert!(verify_query(&["--from", "x"]).is_err() && verify_query(&["--to"]).is_err() && verify_query(&["--key"]).is_err());
     }
 
     #[test]
@@ -2475,6 +2616,11 @@ mod tests {
         assert!(out.contains("SP encryption certificate: SHA-256 56:78 (secret), expires 2030-03-17") && out.contains("Encrypted assertions:     required"), "{out}");
         v["spEncryptionKey"] = json!({ "problem": "not offered until SSO_CORP_ENCRYPTION_PRIVATE_KEY is set" });
         assert!(saml_summary(&v).contains("SP encryption key:        not offered until SSO_CORP_ENCRYPTION_PRIVATE_KEY"));
+        assert!(saml_summary(&v).contains("IdP metadata signature:   not checked\n"));
+        v["signedMetadata"] = json!("require");
+        v["metadataSigningCertificates"] = json!([{ "sha256": "9a:bc", "subject": "CN=metadata", "notAfter": 1_900_000_000_000_i64 }]);
+        let out = saml_summary(&v);
+        assert!(out.contains("IdP metadata signature:   required\n    Trusted signer: SHA-256 9a:bc (CN=metadata), expires 2030-03-17"), "{out}");
     }
 
     #[test]

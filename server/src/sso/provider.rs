@@ -3,7 +3,7 @@
 
 use super::github::{self, GitHub};
 use super::jwt::{self, Invalid, Jwks, Token};
-use super::saml_sp::{self, Attributes, Encryption, IdpMetadata, KeyUse, SpKey};
+use super::saml_sp::{self, Attributes, Encryption, IdpMetadata, KeyUse, MetadataRefused, MetadataTrust, SpKey};
 use super::{apple, saml};
 use crate::rbac::Role;
 use serde_json::Value;
@@ -45,7 +45,8 @@ pub enum Kind {
     /// `sign_requests` signs AuthnRequests with the SP key (ADR 0137), which is
     /// `SSO_<ID>_PRIVATE_KEY` with `sp_cert` (base64 DER) when that is set, else generated.
     /// `encryption` takes encrypted assertions (ADR 0150) with a key of their own, likewise
-    /// `SSO_<ID>_ENCRYPTION_PRIVATE_KEY` with `enc_cert`, else generated.
+    /// `SSO_<ID>_ENCRYPTION_PRIVATE_KEY` with `enc_cert`, else generated. With `metadata_trust`,
+    /// the IdP metadata's signature is checked against its certificates (ADR 0151).
     SamlSp {
         entity_id: String,
         sp_entity_id: String,
@@ -56,6 +57,7 @@ pub enum Kind {
         sp_cert: Option<String>,
         encryption: Encryption,
         enc_cert: Option<String>,
+        metadata_trust: Option<MetadataTrust>,
     },
 }
 
@@ -116,6 +118,8 @@ pub struct Provider {
     pub(super) sp_key: Mutex<Option<Arc<SpKey>>>,
     /// Native SAML: our encryption key, likewise (ADR 0150).
     pub(super) enc_key: Mutex<Option<Arc<SpKey>>>,
+    /// Native SAML: metadata from the URL refused for its signature or validity, not yet audited.
+    metadata_refused: Mutex<Option<MetadataRefused>>,
 }
 
 #[derive(Default)]
@@ -260,7 +264,7 @@ async fn get_text(http: &reqwest::Client, url: &str) -> Result<String, Invalid> 
 
 impl Provider {
     pub fn new(id: &str, label: &str, kind: Kind, client_id: &str, scopes: &str, jit_role: Option<Role>) -> Provider {
-        Provider { id: id.into(), label: label.into(), kind, client_id: client_id.into(), scopes: scopes.into(), jit_role, cache: Default::default(), idp: Mutex::default(), sp_key: Mutex::default(), enc_key: Mutex::default() }
+        Provider { id: id.into(), label: label.into(), kind, client_id: client_id.into(), scopes: scopes.into(), jit_role, cache: Default::default(), idp: Mutex::default(), sp_key: Mutex::default(), enc_key: Mutex::default(), metadata_refused: Mutex::default() }
     }
 
     pub fn type_name(&self) -> &'static str {
@@ -429,6 +433,9 @@ impl Provider {
         let var = self.sp_key_var(u);
         let pem = Self::stored(&var).ok_or_else(|| format!("not offered until {var} is set for {file} (env, _FILE, or `botctl secret set`)"))?;
         let key = Arc::new(SpKey::from_pem(pem.expose(), cert).map_err(|e| format!("not offered: {var}: {e}"))?);
+        if u == KeyUse::Encryption && key.decrypting().is_none() {
+            return Err(format!("not offered: {var} must be an RSA key: IdPs encrypt to it with RSA-OAEP"));
+        }
         *held = Some(key.clone());
         Ok(key)
     }
@@ -529,14 +536,27 @@ impl Provider {
         self.idp.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(_, at)| at.elapsed())
     }
 
+    /// Makes the loaded IdP metadata look `by` older, so tests can reach a refresh.
+    #[cfg(test)]
+    pub fn age_idp(&self, by: Duration) {
+        if let Some((_, at)) = self.idp.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            *at = at.checked_sub(by).unwrap_or(*at);
+        }
+    }
+
     pub fn set_idp(&self, m: IdpMetadata) {
         *self.idp.lock().unwrap_or_else(|e| e.into_inner()) = Some((Arc::new(m), Instant::now()));
+    }
+
+    /// Native SAML: metadata from the URL refused since the last call, for the audit log.
+    pub fn take_metadata_refusal(&self) -> Option<MetadataRefused> {
+        self.metadata_refused.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     /// Native SAML: the IdP metadata. From a URL it's fetched again after a day, and after a
     /// failure at most once per `gap`, keeping what we had meanwhile, as for OIDC discovery.
     pub async fn idp_metadata(&self, http: &reqwest::Client, gap: Duration) -> Result<Arc<IdpMetadata>, Invalid> {
-        let Kind::SamlSp { source, entity_id, sign_requests, .. } = &self.kind else {
+        let Kind::SamlSp { source, entity_id, sign_requests, metadata_trust, .. } = &self.kind else {
             return Err(Invalid("not_configured"));
         };
         let (stale, fresh) = match self.idp.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
@@ -562,8 +582,11 @@ impl Provider {
             return stale.ok_or(e);
         }
         let got = get_text(http, url).await.and_then(|xml| {
-            saml_sp::parse_idp_metadata(&xml, entity_id, *sign_requests).map_err(|e| {
+            saml_sp::load_idp_metadata(&xml, entity_id, *sign_requests, metadata_trust.as_ref(), crate::db::now()).map_err(|e| {
                 crate::obs::log::log_warn!("SSO {}: IdP metadata from {url}: {e}", self.id);
+                if e.untrusted() {
+                    *self.metadata_refused.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+                }
                 Invalid("idp_bad_response")
             })
         });

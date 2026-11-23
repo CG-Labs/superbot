@@ -88,4 +88,4 @@ Erased data already in a SIEM isn't erased by botd. The operator's DPA and the S
 - Old rows written after a younger one now wait for it before retention deletes them. With botd stamping rows as it writes them, that only happens around clock changes.
 - Restoring a backup older than the last export shows as `mismatch` for pins taken after it. That's correct: the history on the host differs from the one the SIEM saw.
 - A raw `INSERT INTO audit_events` (a script, a future migration) now fails. Code must use `audit_chain::insert`.
-- Later: S3 batches with Object Lock, external timestamping of checkpoints, signed checkpoints, and a UI for the chain's state.
+- Later: S3 batches with Object Lock. Signed checkpoints, their RFC 3161 timestamps, and a view of the chain's state came in [ADR 0149](0149-signed-and-timestamped-audit-checkpoints.md).

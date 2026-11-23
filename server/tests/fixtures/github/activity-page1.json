@@ -1,0 +1,47 @@
+[
+  {
+    "id": 7,
+    "node_id": "PSH_7",
+    "before": "b102b102b102b102b102b102b102b102b102b102",
+    "after": "b103b103b103b103b103b103b103b103b103b103",
+    "ref": "refs/heads/main",
+    "timestamp": "2026-11-02T08:00:00Z",
+    "activity_type": "pr_merge",
+    "actor": {
+      "login": "maintainer-m",
+      "id": 38766,
+      "type": "User",
+      "site_admin": false
+    }
+  },
+  {
+    "id": 6,
+    "node_id": "PSH_6",
+    "before": "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0",
+    "after": "e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0",
+    "ref": "refs/heads/main",
+    "timestamp": "2026-10-25T12:00:00Z",
+    "activity_type": "force_push",
+    "actor": {
+      "login": "maintainer-m",
+      "id": 38766,
+      "type": "User",
+      "site_admin": false
+    }
+  },
+  {
+    "id": 5,
+    "node_id": "PSH_5",
+    "before": "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0",
+    "after": "b102b102b102b102b102b102b102b102b102b102",
+    "ref": "refs/heads/main",
+    "timestamp": "2026-10-20T15:04:06Z",
+    "activity_type": "pr_merge",
+    "actor": {
+      "login": "maintainer-m",
+      "id": 38766,
+      "type": "User",
+      "site_admin": false
+    }
+  }
+]

@@ -130,6 +130,18 @@ describe("audit log (ADR 0009, 0019)", () => {
     globalThis.fetch = jest.fn(async () => ({ ok: false, status: 403, json: async () => ({ error: "Admins only" }) })) as unknown as typeof fetch;
     await expect(api.auditCsv("")).rejects.toMatchObject({ message: "Admins only", status: 403 });
   });
+
+  it("reads the hash chain's state and checks it (ADR 0149)", async () => {
+    const fetchMock = jest.fn(async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const api = new SuperBotApi({ baseUrl: BASE, token: TOKEN });
+    await api.auditChain();
+    await api.auditVerify();
+    expect(fetchMock.mock.calls.map((c) => [(c as unknown as [string, RequestInit])[0], (c as unknown as [string, RequestInit])[1].method])).toEqual([
+      [`${BASE}/api/audit/chain`, "GET"],
+      [`${BASE}/api/audit/verify`, "GET"],
+    ]);
+  });
 });
 
 describe("access review (ADR 0099)", () => {

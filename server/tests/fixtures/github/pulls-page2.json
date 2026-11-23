@@ -1,0 +1,89 @@
+[
+  {
+    "url": "https://api.github.com/repos/example-org/example-repo/pulls/100",
+    "html_url": "https://github.com/example-org/example-repo/pull/100",
+    "number": 100,
+    "state": "closed",
+    "title": "Abandoned idea",
+    "user": {
+      "login": "author-b",
+      "id": 38182,
+      "type": "User",
+      "site_admin": false
+    },
+    "body": "Secret body: deploy notes for the reviewer only.",
+    "created_at": "2026-10-02T10:00:00Z",
+    "updated_at": "2026-10-06T12:00:00Z",
+    "closed_at": "2026-10-06T12:00:00Z",
+    "merged_at": null,
+    "merge_commit_sha": null,
+    "head": {
+      "ref": "feature-100",
+      "sha": "a100a100a100a100a100a100a100a100a100a100"
+    },
+    "base": {
+      "ref": "main",
+      "sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    "author_association": "MEMBER",
+    "draft": false
+  },
+  {
+    "url": "https://api.github.com/repos/example-org/example-repo/pulls/101",
+    "html_url": "https://github.com/example-org/example-repo/pull/101",
+    "number": 101,
+    "state": "closed",
+    "title": "Fix the docs link",
+    "user": {
+      "login": "author-b",
+      "id": 38182,
+      "type": "User",
+      "site_admin": false
+    },
+    "body": "Secret body: deploy notes for the reviewer only.",
+    "created_at": "2026-10-04T10:00:00Z",
+    "updated_at": "2026-10-06T10:00:00Z",
+    "closed_at": "2026-10-05T09:30:00Z",
+    "merged_at": "2026-10-05T09:30:00Z",
+    "merge_commit_sha": "b101b101b101b101b101b101b101b101b101b101",
+    "head": {
+      "ref": "feature-101",
+      "sha": "a101a101a101a101a101a101a101a101a101a101"
+    },
+    "base": {
+      "ref": "main",
+      "sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    "author_association": "MEMBER",
+    "draft": false
+  },
+  {
+    "url": "https://api.github.com/repos/example-org/example-repo/pulls/99",
+    "html_url": "https://github.com/example-org/example-repo/pull/99",
+    "number": 99,
+    "state": "closed",
+    "title": "Last month's change",
+    "user": {
+      "login": "author-a",
+      "id": 73749,
+      "type": "User",
+      "site_admin": false
+    },
+    "body": "Secret body: deploy notes for the reviewer only.",
+    "created_at": "2026-09-27T10:00:00Z",
+    "updated_at": "2026-09-29T10:00:00Z",
+    "closed_at": "2026-09-28T10:00:00Z",
+    "merged_at": "2026-09-28T10:00:00Z",
+    "merge_commit_sha": "b099b099b099b099b099b099b099b099b099b099",
+    "head": {
+      "ref": "feature-99",
+      "sha": "a099a099a099a099a099a099a099a099a099a099"
+    },
+    "base": {
+      "ref": "main",
+      "sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    "author_association": "MEMBER",
+    "draft": false
+  }
+]
