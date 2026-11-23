@@ -15,6 +15,7 @@ fn spec(label: &str, plan: &str) -> CreateSpec {
         authorized_keys: vec!["ssh-ed25519 AAAAC3Nza admin@example".into()],
         user_data: Some("#cloud-config\nwrite_files: []\n".into()),
         firewall_id: Some("superbot-fw".into()),
+        subnet_id: None,
     }
 }
 

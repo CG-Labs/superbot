@@ -11,6 +11,7 @@ How customers get help with SuperBot, how fast, and how the Provider runs suppor
 | [Escalation](escalation.md) | Who a ticket goes to next, when, and how a customer escalates |
 | [Onboarding and success](onboarding.md) | Getting a new customer live: SSO and SCIM, isolation, backups and residency checklists, then the success cadence |
 | [Support bundle](support-bundle.md) | `botctl support-bundle`: what it collects, what it never collects, and how to send it |
+| [Support check and the offline bundle](support-check.md) | `botd support check` and `botd support bundle`: diagnostics and a bundle without botd, for a server that won't start, before an upgrade and after a restore |
 | [Technical account managers](tam.md) | The named TAM for Enterprise customers: what they do, the cadence from kickoff to renewal, and handover |
 | [Customer health score](health-score.md) | `botctl health-score`: six signals from botd's own records, how they're scored, and what to do about each; its daily [history](health-score.md#history) and the console's Support tab |
 | [Health check](health-check.md) | The TAM's monthly (Enterprise) or quarterly checklist |
@@ -23,6 +24,8 @@ Runbooks for the incidents support sees most:
 |---|---|
 | [Sign-in and SSO failures](runbook-sign-in.md) | People can't sign in, with SSO, a password or a code |
 | [Machine down or restore](runbook-machine-down.md) | A user's machine, an Incus host, or the server itself is down |
+| [Upgrades](runbook-upgrade.md) | Before and after an upgrade, one that left botd down or broken, and going back |
+| [Server restore](runbook-server-restore.md) | The server's own data comes back from a backup: a lost host, a damaged database, deleted data |
 | [Harness or model provider outage](runbook-harness-outage.md) | Bot runs fail or time out on one harness or provider |
 | [Approval queue stuck](runbook-approvals-stuck.md) | Bots wait on approvals nobody sees, or that never resolve |
 | [SAML sign-in](runbook-saml.md) | SAML sign-in fails: signatures, certificates, clocks, metadata |
@@ -41,7 +44,7 @@ A good ticket has:
 2. **Who and how many** are affected: everyone, a team, one person, one Bot.
 3. **Since when**, in UTC, and anything that changed just before (an upgrade, a setting, the identity provider).
 4. **What you see**: the error text, and the `X-Request-Id` of a failing request if you have it (every botd response carries one, and it matches botd's log line).
-5. **A support bundle** for anything on a self-hosted or dedicated server: `botctl support-bundle` on the server, then attach the file ([how](support-bundle.md)). It has no secrets, chats, names or emails, and it answers most of support's first questions.
+5. **A support bundle** for anything on a self-hosted or dedicated server: `botctl support-bundle` on the server, then attach the file ([how](support-bundle.md)). It has no secrets, chats, names or emails, and it answers most of support's first questions. If botd is down, `botd support bundle` makes one without it ([how](support-check.md)).
 
 Never put a password, token, API key, sign-in code or recovery code in a ticket. If one was sent by mistake, say so and rotate it: support deletes it from the ticket, but treats it as exposed.
 

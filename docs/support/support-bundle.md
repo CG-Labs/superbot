@@ -54,4 +54,7 @@ If you find something you'd rather not send, delete it from the bundle and say s
 
 - Logs from before botd last started: the bundle keeps the newest lines in memory. For older ones, `journalctl -u superbot -o cat` (installer) or `docker compose logs botd` (Compose), with `LOG_FORMAT=json`.
 - Users' machines' own logs. Support asks for them when needed.
-- Anything from a server that isn't running. Then send `journalctl -u superbot -n 500` and the output of `systemctl status superbot` instead, read first for the same things.
+
+## When botd is down
+
+botd makes this bundle, so a server that won't start can't. Then make the [offline bundle](support-check.md#the-offline-bundle) on the server instead: `sudo botd support bundle --home /home/superbot` (Compose: [how](support-check.md#run-it)). It has what `botd support check` finds (the database, master key, disk, backups and license), the redacted settings and the service's newest log lines, by the same redaction rules. Send both once botd is back.
