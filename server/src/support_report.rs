@@ -132,7 +132,7 @@ fn hours_text(m: i64) -> String {
 }
 
 /// "45 min", "5 h 10 min", "3 h".
-fn minutes(m: i64) -> String {
+pub fn minutes(m: i64) -> String {
     match (m / 60, m % 60) {
         (0, m) => format!("{m} min"),
         (h, 0) => format!("{h} h"),
@@ -200,7 +200,7 @@ impl Calendar {
     }
 }
 
-fn parse_hours(s: &str) -> Option<(i64, i64)> {
+pub fn parse_hours(s: &str) -> Option<(i64, i64)> {
     let hm = |t: &str| -> Option<i64> {
         let (h, m) = t.split_once(':')?;
         let (h, m): (i64, i64) = (h.parse().ok()?, m.parse().ok()?);
@@ -211,7 +211,7 @@ fn parse_hours(s: &str) -> Option<(i64, i64)> {
     (a < b).then_some((a, b))
 }
 
-fn parse_weekdays(s: &str) -> Option<[bool; 7]> {
+pub fn parse_weekdays(s: &str) -> Option<[bool; 7]> {
     let day = |d: &str| WEEKDAYS.iter().position(|w| d.to_ascii_lowercase().starts_with(w));
     let mut on = [false; 7];
     if s == "all" {
@@ -232,7 +232,7 @@ fn parse_weekdays(s: &str) -> Option<[bool; 7]> {
     on.contains(&true).then_some(on)
 }
 
-fn parse_offset(s: &str) -> Option<FixedOffset> {
+pub fn parse_offset(s: &str) -> Option<FixedOffset> {
     if s.eq_ignore_ascii_case("utc") || s == "Z" {
         return FixedOffset::east_opt(0);
     }
@@ -327,7 +327,7 @@ impl Field {
     }
 }
 
-fn normalize(h: &str) -> String {
+pub fn normalize(h: &str) -> String {
     let s: String = h.trim().trim_start_matches('\u{feff}').to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { ' ' }).collect();
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }

@@ -1,6 +1,6 @@
 # Escalation
 
-Who works a ticket, who it goes to next, and when. Roles, not people: the Provider fills in the placeholders with its own rota and keeps them current. Severity and targets: [severity](severity.md).
+Who works a ticket, who it goes to next, and when. Roles, not people: the Provider fills in the placeholders with its own rota and keeps them current, and checks the rota covers the hours its plans sell with `botctl support-readiness` ([support readiness](readiness.md#the-on-call-rota)). Severity and targets: [severity](severity.md).
 
 ## Inside the Provider
 

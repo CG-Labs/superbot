@@ -6,7 +6,7 @@ Enterprise customers get a named technical account manager (TAM): one person at 
 
 Every Enterprise agreement names a TAM (`<tam-name>`, `<tam-email>`) and a backup TAM (`<backup-tam-name>`) who covers holidays and absences. Other plans don't have one; their customers get the same playbooks from support. A Provider may offer a TAM to a large self-host customer by agreement; this page then applies to them too.
 
-A TAM covers at most `<tam-accounts-per-person>` Enterprise customers, so each one gets the cadence below. When a customer moves to another TAM, the old one writes a handover (below) and joins the next check-in to introduce the new one.
+A TAM covers at most `<tam-accounts-per-person>` Enterprise customers, so each one gets the cadence below. `botctl support-readiness --tams` checks the Provider's TAM list for a customer without a TAM or a different backup, and a TAM over that number ([support readiness](readiness.md#the-tam-list)). When a customer moves to another TAM, the old one writes a handover (below) and joins the next check-in to introduce the new one.
 
 ## What a TAM does
 
