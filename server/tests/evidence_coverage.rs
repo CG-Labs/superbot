@@ -152,14 +152,15 @@ fn coverage_checks_botds_bundles_and_finds_each_missing_day() {
     let kind = |r: &Value, id: &str| r["kinds"].as_array().unwrap().iter().find(|k| k["kind"] == id).unwrap().clone();
     assert_eq!(kind(&r, "evidence")["complete"], true, "{r:#}");
     let days = (m0 - m2).num_days();
-    for id in ["change-management", "vulnerability-management"] {
+    for id in ["change-management", "vulnerability-management", "recovery-drills"] {
         assert_eq!(kind(&r, id)["coveredDays"], 0);
         assert!(r["problems"].as_array().unwrap().iter().any(|p| p.as_str().unwrap().contains(&format!("covers {m2} to {m0} ({days} days)"))), "{r:#}");
     }
-    assert_eq!(r["problems"].as_array().unwrap().len(), 2, "{r:#}");
+    assert_eq!(r["problems"].as_array().unwrap().len(), 3, "{r:#}");
     let row = |r: &Value, id: &str| r["rows"].as_array().unwrap().iter().find(|x| x["row"] == id).unwrap().clone();
     assert_eq!(row(&r, "CC6.3-1")["complete"], true);
     assert_eq!(row(&r, "CC8.1-1")["coveredDays"], 0);
+    assert_eq!(row(&r, "A1.3-1")["coveredDays"], 0, "no drill bundle: the drill row is a gap, not missing");
     assert!(r["checklist"]["noAutomatedEvidence"].as_array().unwrap().iter().any(|x| x["row"] == "CC1.1-1"));
     assert_eq!(listing(&store), before, "the store isn't written to");
 

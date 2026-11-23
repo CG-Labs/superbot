@@ -3,17 +3,20 @@
 //! checks and merge commit, the commits that reached the branch without one, the branch's
 //! protection, and every CI run on the branch. `vulnerabilities` (ADR 0086): every
 //! Dependabot and code scanning alert open in the period, judged against its severity's
-//! remediation window, and the findings accepted with a reason. Each is a dated bundle
-//! with SHA-256 digests beside botd's evidence bundles (ADR 0142). `coverage` (ADR 0169):
+//! remediation window, and the findings accepted with a reason. `drills` (ADR 0177): every
+//! restore drill CI ran on the branch, with its step's result and time and the artifacts
+//! it kept, and the records of drills the operator ran on their own servers. Each is a
+//! dated bundle with SHA-256 digests beside botd's evidence bundles (ADR 0142). `coverage` (ADR 0169):
 //! checks every bundle in an evidence store against its digests and reports the days of
 //! an observation period each kind of bundle, checklist row and criterion has none for.
 //!
 //! Reads GitHub only, with a token from `GITHUB_TOKEN` (or `GH_TOKEN`), never from the
 //! command line. Run by the `change-evidence` workflow each month, or by an operator.
-//! `coverage` reads local files only.
+//! `coverage` reads local files only, and so does `drills --no-ci`.
 
 mod changes;
 mod coverage;
+mod drills;
 mod github;
 #[path = "../../evidence_period.rs"]
 mod period;
@@ -24,13 +27,15 @@ mod vulns;
 use std::io::Write;
 use std::process::ExitCode;
 
-const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0086), and its coverage (ADR 0169).
+const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0086), restore drills (ADR 0177), and its coverage (ADR 0169).
 
   superbot-evidence github --repo <owner/name> [--branch <name>]
                     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>] [--no-titles]
   superbot-evidence vulnerabilities --repo <owner/name> [--branch <name>]
                     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]
                     [--windows critical=30,high=30,medium=90,low=90]
+  superbot-evidence drills --repo <owner/name> [--branch <name>] [--record <drill output>]...
+                    [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>] [--no-ci]
   superbot-evidence coverage <evidence store> [--from <YYYY-MM-DD> --to <YYYY-MM-DD>]
                     [--checklist <soc2-readiness-checklist.md>] [--json] [-o <file>]
 
@@ -55,8 +60,18 @@ reasons. Needs read access to Metadata, Contents, Dependabot alerts and Code sca
 alerts (in a workflow: contents, security-events and vulnerability-alerts read). What the
 token can't read is recorded in the bundle, not skipped silently.
 
+drills writes one bundle for the period of every run on the branch of the restore drills
+CI performs (the installer's restore onto a fresh host in server.yml, the Compose restore
+in docker.yml, and an Incus container's restore and a lost host's in incus-e2e.yml): each
+drill step's result, start and duration, and the drill artifacts the run kept, with
+GitHub's digest and expiry. Needs read access to Metadata and Actions. Each --record is the
+saved output of a drill the operator ran (deploy/backup-drill.sh or
+deploy/machine-restore-drill.sh); its record line, timed against its objective, and the
+output's SHA-256 go in the bundle, and it must have finished in the period. --no-ci reads
+only the records: no --repo, token or network.
+
 coverage reads every bundle in an evidence store (as .tar files or unpacked folders, at any
-depth): botd's evidence bundles and both bundles above. It checks each against its
+depth): botd's evidence bundles and the three bundles above. It checks each against its
 SHA256SUMS and manifest, and reports, for the period (neither: from the first bundle to the
 last), the days each kind of bundle, each checklist row and each criterion has no verified
 evidence for, month by month, with each manifest's SHA-256 to compare with what was recorded
@@ -68,6 +83,7 @@ No token and no network; it writes nothing into the store.";
 enum Kind {
     Changes,
     Vulnerabilities,
+    Drills,
 }
 
 struct Args {
@@ -79,19 +95,30 @@ struct Args {
     out: Option<String>,
     titles: bool,
     windows: Option<String>,
+    records: Vec<String>,
+    ci: bool,
 }
 
 fn parse(args: &[String]) -> Result<Args, String> {
     let (kind, rest) = match args.split_first().map(|(c, r)| (c.as_str(), r)) {
         Some(("github", rest)) => (Kind::Changes, rest),
         Some(("vulnerabilities", rest)) => (Kind::Vulnerabilities, rest),
+        Some(("drills", rest)) => (Kind::Drills, rest),
         _ => return Err(USAGE.into()),
     };
-    let mut a = Args { kind, repo: String::new(), branch: None, from: None, to: None, out: None, titles: true, windows: None };
+    let mut a = Args { kind, repo: String::new(), branch: None, from: None, to: None, out: None, titles: true, windows: None, records: Vec::new(), ci: true };
     let mut it = rest.iter();
     while let Some(flag) = it.next() {
         if flag == "--no-titles" && kind == Kind::Changes {
             a.titles = false;
+            continue;
+        }
+        if flag == "--no-ci" && kind == Kind::Drills {
+            a.ci = false;
+            continue;
+        }
+        if flag == "--record" && kind == Kind::Drills {
+            a.records.push(it.next().filter(|v| !v.starts_with("--") && !v.is_empty()).ok_or("--record needs a file")?.clone());
             continue;
         }
         if matches!(flag.as_str(), "--token" | "-t") {
@@ -110,6 +137,15 @@ fn parse(args: &[String]) -> Result<Args, String> {
             return Err(format!("{flag} is given twice"));
         }
         *slot = it.next().filter(|v| !v.starts_with("--") && !v.is_empty()).ok_or(format!("{flag} needs a value"))?.clone();
+    }
+    if kind == Kind::Drills && !a.ci {
+        if !a.repo.is_empty() || a.branch.is_some() {
+            return Err("--no-ci reads only the drill records: leave out --repo and --branch".into());
+        }
+        if a.records.is_empty() {
+            return Err("--no-ci needs at least one --record".into());
+        }
+        return Ok(a);
     }
     if !changes::valid_repo(&a.repo) {
         return Err(format!("--repo must be owner/name.\n\n{USAGE}"));
@@ -156,11 +192,17 @@ fn run(args: &[String]) -> Result<String, String> {
     let a = parse(args)?;
     let now = chrono::Utc::now();
     let p = period::Period::parse(a.from.as_deref(), a.to.as_deref(), now.date_naive())?;
+    if a.kind == Kind::Drills && !a.ci {
+        return drills(&a, p, None, now);
+    }
     let token = token(&|k| std::env::var(k).ok())?;
     let base = std::env::var("GITHUB_API_URL").unwrap_or_default();
     let mut gh = github::GitHub::new(&base, &token)?;
     if a.kind == Kind::Vulnerabilities {
         return vulnerabilities(&a, p, &mut gh, &token, now);
+    }
+    if a.kind == Kind::Drills {
+        return drills(&a, p, Some((&mut gh, &token)), now);
     }
     let opts = changes::Options { repo: a.repo.clone(), branch: a.branch.clone(), period: p, titles: a.titles };
     let c = changes::collect(&mut gh, &opts).map_err(|f| hint(&f))?;
@@ -211,6 +253,58 @@ fn vulnerabilities(a: &Args, p: period::Period, gh: &mut github::GitHub, token: 
         p.to,
         gh.requests,
         vulns::summary(&c),
+        b.manifest_sha256,
+        b.sha256,
+        quote(&file),
+        quote(&b.name),
+    ))
+}
+
+/// Each `--record`'s drill record, read before GitHub so a wrong file fails fast.
+fn records(files: &[String], p: &period::Period) -> Result<Vec<serde_json::Value>, String> {
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for f in files {
+        let size = std::fs::metadata(f).map_err(|e| format!("{f}: {e}"))?.len();
+        if size > drills::MAX_RECORD_BYTES {
+            return Err(format!("{f} is over {} MiB, larger than any drill's output", drills::MAX_RECORD_BYTES >> 20));
+        }
+        let r = drills::record(f, &std::fs::read(f).map_err(|e| format!("{f}: {e}"))?, p)?;
+        if out.iter().any(|x| x["fileSha256"] == r["fileSha256"]) {
+            return Err(format!("{f} is the same output as another --record"));
+        }
+        out.push(r);
+    }
+    out.sort_by(|a, b| a["finishedAt"].as_str().cmp(&b["finishedAt"].as_str()));
+    Ok(out)
+}
+
+fn drills(a: &Args, p: period::Period, gh: Option<(&mut github::GitHub, &str)>, now: chrono::DateTime<chrono::Utc>) -> Result<String, String> {
+    let recs = records(&a.records, &p)?;
+    let (c, src, token) = match gh {
+        Some((gh, token)) => {
+            let opts = drills::Options { repo: a.repo.clone(), branch: a.branch.clone(), period: p };
+            let c = drills::collect(gh, &opts, now.timestamp_millis()).map_err(|f| hint(&f))?;
+            if gh.scopes.as_deref().is_some_and(changes::can_write) {
+                eprintln!("Warning: this token can write ({}). Use a fine-grained token with read-only access.", gh.scopes.as_deref().unwrap_or_default());
+            }
+            (Some(c), changes::Source { api_host: gh.host(), requests: gh.requests, scopes: gh.scopes.clone() }, Some(token))
+        }
+        None => (None, changes::Source { api_host: String::new(), requests: 0, scopes: None }, None),
+    };
+    let b = drills::build(c.as_ref(), &recs, &p, &src, now.timestamp_millis());
+    if token.is_some_and(|t| b.tar.windows(t.len()).any(|w| w == t.as_bytes())) {
+        return Err("The bundle would contain the token, so it wasn't written.".into());
+    }
+    let file = a.out.clone().unwrap_or_else(|| format!("{}.tar", b.name));
+    save_private(&file, &b.tar)?;
+    let what = c.as_ref().map(|c| c.repo["fullName"].as_str().unwrap_or(&a.repo).to_string()).unwrap_or_else(|| "the operator's drill records".into());
+    Ok(format!(
+        "Saved {file} ({} KB) for {what} from {} to {} (not included), in {} requests.\n{}\nManifest SHA-256: {}\nBundle SHA-256: {}\nKeep it in the evidence store, with each drill output it names; to check it:\n  tar -xf {} && (cd {} && sha256sum -c SHA256SUMS)",
+        b.tar.len().div_ceil(1024),
+        p.from,
+        p.to,
+        src.requests,
+        drills::summary(c.as_ref(), &recs),
         b.manifest_sha256,
         b.sha256,
         quote(&file),
@@ -270,5 +364,13 @@ mod tests {
         assert!(parse(&args(&["vulnerabilities", "--repo", "o/r", "--no-titles"])).is_err(), "titles are the change bundle's");
         assert!(parse(&args(&["github", "--repo", "o/r", "--windows", "high=1"])).is_err(), "windows are the vulnerability bundle's");
         assert!(parse(&args(&["vulnerabilities", "--repo", "o/r", "--token", "x"])).is_err());
+
+        let d = parse(&args(&["drills", "--repo", "o/r", "--record", "a.log", "--record", "b.log"])).unwrap();
+        assert_eq!((d.kind, d.records.clone(), d.ci), (Kind::Drills, vec!["a.log".to_string(), "b.log".to_string()], true));
+        let offline = parse(&args(&["drills", "--no-ci", "--record", "a.log"])).unwrap();
+        assert!(!offline.ci && offline.repo.is_empty());
+        for bad in [&["drills", "--no-ci"][..], &["drills", "--no-ci", "--repo", "o/r", "--record", "a"], &["drills", "--repo", "o/r", "--record"], &["github", "--repo", "o/r", "--record", "a"], &["vulnerabilities", "--repo", "o/r", "--no-ci"], &["drills", "--record", "a"]] {
+            assert!(parse(&args(bad)).is_err(), "{bad:?}");
+        }
     }
 }
