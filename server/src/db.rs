@@ -806,6 +806,8 @@ pub struct CustomRole {
     pub permissions: Vec<String>,
     /// Time-bound (ADR 0197): given only by hand, for at most this many days. None: no limit.
     pub max_days: Option<i64>,
+    /// People may ask for it (ADR 0209). Only ever set on a time-bound role.
+    pub requestable: bool,
     pub created_at: i64,
     pub created_by: Option<String>,
     pub updated_at: i64,
@@ -815,6 +817,81 @@ impl CustomRole {
     pub fn perms(&self) -> crate::rbac::Perms {
         crate::rbac::Perms::from_names(self.permissions.iter().map(String::as_str))
     }
+}
+
+/// A person's request for a requestable role (ADR 0209), for `hours` from when an admin
+/// approves it. `team_id` None: across the server; else within that team, theirs when
+/// they asked. `expires_at`: when it lapses if nobody decides.
+#[derive(Clone, Debug)]
+pub struct RoleRequest {
+    pub id: String,
+    pub user_id: String,
+    pub role_id: String,
+    pub team_id: Option<String>,
+    pub hours: i64,
+    pub reason: String,
+    /// `pending`, `approved`, `denied`, `cancelled` or `lapsed`.
+    pub status: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub decided_at: Option<i64>,
+    pub decided_by: Option<String>,
+    pub note: Option<String>,
+    /// When the role it gave ends. Only once approved.
+    pub granted_until: Option<i64>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum RoleRequestError {
+    /// They have a pending request for this role in this scope already.
+    Duplicate,
+    /// They have this many pending requests, the most there may be.
+    TooMany(usize),
+    /// It was decided, withdrawn or lapsed already: its status.
+    NotPending(String),
+    /// What, read in the same transaction, makes it one that can't be given (`role_requests::why`).
+    Refused(&'static str),
+    /// Longer than the role's limit allows now, in hours.
+    OverLimit(i64),
+    NotFound,
+    Db(String),
+}
+
+/// What an approval is checked against, all read in its transaction (ADR 0209).
+pub struct RequestState<'a> {
+    pub request: &'a RoleRequest,
+    pub role: &'a CustomRole,
+    pub user: &'a User,
+    /// Their team membership, when the request is for a team.
+    pub member: Option<&'a TeamMember>,
+}
+
+/// An approved request, with the role they held in its scope just before (and its end),
+/// and the SCIM or SAML claim on it that giving it by hand ended.
+#[derive(Debug)]
+pub struct ApprovedRequest {
+    pub request: RoleRequest,
+    pub before: (Option<String>, Option<i64>),
+    pub taken: Option<String>,
+    pub taken_saml: Option<String>,
+}
+
+fn role_request_row(r: &Row) -> rusqlite::Result<RoleRequest> {
+    Ok(RoleRequest {
+        id: r.get("id")?,
+        user_id: r.get("user_id")?,
+        role_id: r.get("role_id")?,
+        team_id: r.get("team_id")?,
+        hours: r.get("hours")?,
+        reason: r.get("reason")?,
+        status: r.get("status")?,
+        created_at: r.get("created_at")?,
+        expires_at: r.get("expires_at")?,
+        decided_at: r.get("decided_at")?,
+        decided_by: r.get("decided_by")?,
+        note: r.get("note")?,
+        granted_until: r.get("granted_until")?,
+    })
 }
 
 /// A role given by hand whose end passed, as the sweep took it away (ADR 0197). `team_id`
@@ -916,6 +993,8 @@ pub enum RoleError {
     /// It can't be made time-bound (ADR 0197): this many hold it with no end or a later one
     /// than it would allow, and this many SCIM or SAML groups are mapped to it.
     Standing { held: usize, mapped: usize },
+    /// People may request it (ADR 0209), so it must stay time-bound.
+    Requestable,
     Db(String),
 }
 
@@ -1856,6 +1935,7 @@ fn custom_role_row(r: &Row) -> rusqlite::Result<CustomRole> {
         base: if base == "member" { Role::Member } else { Role::Readonly },
         permissions: serde_json::from_str(&permissions).unwrap_or_default(),
         max_days: r.get("max_days")?,
+        requestable: r.get::<_, Option<bool>>("requestable")?.unwrap_or(false),
         created_at: r.get("created_at")?,
         created_by: r.get("created_by")?,
         updated_at: r.get("updated_at")?,
@@ -2211,7 +2291,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 66] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 67] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -2278,7 +2358,39 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 66] = [
     migrate_saml_cert_notices,
     migrate_time_bound_roles,
     migrate_scim_team_role_groups,
+    migrate_role_requests,
 ];
+
+/// Requests for a role (ADR 0209): a person asks for a requestable, time-bound role for
+/// some hours, across the server or in their team, and an admin approves or denies it.
+/// One pending request per person, role and scope. A request goes with its role, team
+/// or person; the audit log keeps its story.
+fn migrate_role_requests(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('roles') WHERE name = 'requestable'", [], |r| r.get(0))?;
+    if !has {
+        c.execute_batch("ALTER TABLE roles ADD COLUMN requestable INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS role_requests (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          role_id TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+          team_id TEXT REFERENCES teams(id) ON DELETE CASCADE,
+          hours INTEGER NOT NULL CHECK (hours > 0),
+          reason TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'denied', 'cancelled', 'lapsed')),
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          decided_at INTEGER,
+          decided_by TEXT,
+          note TEXT,
+          granted_until INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS role_requests_one_pending ON role_requests(user_id, role_id, COALESCE(team_id, '')) WHERE status = 'pending';
+        CREATE INDEX IF NOT EXISTS role_requests_status ON role_requests(status, created_at);
+        CREATE INDEX IF NOT EXISTS role_requests_user ON role_requests(user_id, created_at);",
+    )
+}
 
 /// Time-bound custom roles (ADR 0197): when a role given by hand ends, across the server
 /// and within a team, and the most days a role may be given for. An end belongs to the
@@ -5444,8 +5556,9 @@ impl Db {
     /// Saves the fields given. A new base applies to everyone who holds the role across the
     /// server, in the same transaction; returns those whose built-in role changed.
     /// `max_days` Some(Some(n)) makes it time-bound (ADR 0197), refused while anyone holds it
-    /// longer than that or a group is mapped to it; Some(None) lifts the limit.
-    pub fn update_custom_role(&self, id: &str, name: Option<&str>, description: Option<&str>, base: Option<Role>, permissions: Option<&[&str]>, max_days: Option<Option<i64>>) -> Result<Vec<String>, RoleError> {
+    /// longer than that or a group is mapped to it; Some(None) lifts the limit. A
+    /// requestable role (ADR 0209) must keep one, checked once both are written.
+    pub fn update_custom_role(&self, id: &str, name: Option<&str>, description: Option<&str>, base: Option<Role>, permissions: Option<&[&str]>, max_days: Option<Option<i64>>, requestable: Option<bool>) -> Result<Vec<String>, RoleError> {
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(|e| RoleError::Db(e.to_string()))?;
         let at = now();
@@ -5497,13 +5610,17 @@ impl Db {
         }
         let res = (|| {
             if tx.execute("UPDATE roles SET updated_at = ?1 WHERE id = ?2", params![at, id])? == 0 {
-                return Ok(None);
+                return Ok(Err(RoleError::NotFound));
             }
             let set = |col: &str, v: &dyn rusqlite::ToSql| tx.execute(&format!("UPDATE roles SET {col} = ?1 WHERE id = ?2"), params![v, id]);
             if let Some(v) = name { set("name", &v)?; }
             if let Some(v) = description { set("description", &v)?; }
             if let Some(v) = permissions { set("permissions", &serde_json::to_string(v).unwrap_or_else(|_| "[]".into()))?; }
             if let Some(v) = max_days { set("max_days", &v)?; }
+            if let Some(v) = requestable { set("requestable", &v)?; }
+            if tx.query_row("SELECT requestable = 1 AND max_days IS NULL FROM roles WHERE id = ?", [id], |r| r.get::<_, bool>(0))? {
+                return Ok(Err(RoleError::Requestable));
+            }
             let mut moved = Vec::new();
             if let Some(b) = base {
                 set("base", &b.as_str())?;
@@ -5513,11 +5630,11 @@ impl Db {
                 moved = s.query_map(params![id, b.as_str(), at], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
                 tx.execute(&format!("UPDATE users SET role = ?2, updated_at = ?3 WHERE {held}"), params![id, b.as_str(), at])?;
             }
-            Ok(Some(moved))
+            Ok(Ok(moved))
         })();
         match res {
-            Ok(Some(moved)) => tx.commit().map(|_| moved).map_err(|e| RoleError::Db(e.to_string())),
-            Ok(None) => Err(RoleError::NotFound),
+            Ok(Ok(moved)) => tx.commit().map(|_| moved).map_err(|e| RoleError::Db(e.to_string())),
+            Ok(Err(e)) => Err(e),
             Err(e) if constraint(&e) => Err(RoleError::NameTaken),
             Err(e) => Err(RoleError::Db(e.to_string())),
         }
@@ -5702,6 +5819,166 @@ impl Db {
         c.prepare(q)
             .and_then(|mut s| s.query_map(params![id, at], |r| Ok(((r.get(0)?, r.get(1)?), r.get(2)?)))?.collect())
             .unwrap_or_default()
+    }
+
+    // Requests for roles (ADR 0209).
+
+    /// Makes a role requestable, or not. Only a time-bound role can be: false when the
+    /// role is gone or (asked to be requestable) has no limit, both read as it's written.
+    pub fn set_role_requestable(&self, id: &str, on: bool) -> bool {
+        self.c()
+            .execute("UPDATE roles SET requestable = ?1, updated_at = ?2 WHERE id = ?3 AND (?1 = 0 OR max_days IS NOT NULL)", params![on, now(), id])
+            .unwrap_or(0)
+            > 0
+    }
+
+    /// Files a pending request, lapsing at `expires_at`. Refused, in the same transaction,
+    /// when the role isn't requestable or allows fewer hours, when they have a pending
+    /// request for it in this scope, or `max_pending` pending requests of any kind.
+    pub fn create_role_request(&self, user_id: &str, role_id: &str, team_id: Option<&str>, hours: i64, reason: &str, expires_at: i64, max_pending: usize) -> Result<RoleRequest, RoleRequestError> {
+        let err = |e: rusqlite::Error| RoleRequestError::Db(e.to_string());
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(err)?;
+        let limit: Option<Option<i64>> = tx.query_row("SELECT max_days FROM roles WHERE id = ?1 AND requestable = 1", [role_id], |r| r.get(0)).optional().map_err(err)?;
+        match limit {
+            None | Some(None) => return Err(RoleRequestError::Refused("not_requestable")),
+            Some(Some(days)) if hours > days * 24 => return Err(RoleRequestError::OverLimit(days * 24)),
+            _ => {}
+        }
+        let pending: i64 = tx.query_row("SELECT COUNT(*) FROM role_requests WHERE user_id = ? AND status = 'pending'", [user_id], |r| r.get(0)).map_err(err)?;
+        if pending as usize >= max_pending {
+            return Err(RoleRequestError::TooMany(pending as usize));
+        }
+        let id = format!("rq{}", crate::random_hex(5));
+        let res = tx.execute(
+            "INSERT INTO role_requests (id, user_id, role_id, team_id, hours, reason, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![id, user_id, role_id, team_id, hours, reason, now(), expires_at],
+        );
+        match res {
+            Ok(_) => {}
+            Err(e) if constraint(&e) => return Err(RoleRequestError::Duplicate),
+            Err(e) => return Err(err(e)),
+        }
+        let r = tx.query_row("SELECT * FROM role_requests WHERE id = ?", [&id], role_request_row).map_err(err)?;
+        tx.commit().map_err(err)?;
+        Ok(r)
+    }
+
+    pub fn role_request(&self, id: &str) -> Option<RoleRequest> {
+        self.c().query_row("SELECT * FROM role_requests WHERE id = ?", [id], role_request_row).optional().ok().flatten()
+    }
+
+    /// Newest first: one person's (`user`), or everyone's; with `status`, only those.
+    pub fn role_requests(&self, user: Option<&str>, status: Option<&str>, limit: usize) -> Vec<RoleRequest> {
+        let c = self.c();
+        c.prepare("SELECT * FROM role_requests WHERE (?1 IS NULL OR user_id = ?1) AND (?2 IS NULL OR status = ?2) ORDER BY created_at DESC, id DESC LIMIT ?3")
+            .and_then(|mut s| s.query_map(params![user, status, limit as i64], role_request_row)?.collect())
+            .unwrap_or_default()
+    }
+
+    /// Denies or withdraws (`status`) a pending request; with `user`, only theirs. None
+    /// when there's no such pending request.
+    pub fn close_role_request(&self, id: &str, status: &str, by: Option<&str>, note: Option<&str>, user: Option<&str>) -> Option<RoleRequest> {
+        self.c()
+            .query_row(
+                "UPDATE role_requests SET status = ?2, decided_at = ?3, decided_by = ?4, note = ?5
+                 WHERE id = ?1 AND status = 'pending' AND (?6 IS NULL OR user_id = ?6) RETURNING *",
+                params![id, status, now(), by, note, user],
+                role_request_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Lapses the pending requests nobody can approve any more, in one transaction: those
+    /// past their time (`expired`), for a role no longer requestable (`not_requestable`),
+    /// or from someone disabled (`disabled`).
+    pub fn lapse_role_requests(&self, at: i64) -> Vec<(RoleRequest, &'static str)> {
+        let c = self.c();
+        let Ok(tx) = c.unchecked_transaction() else { return Vec::new() };
+        let res = (|| {
+            let mut s = tx.prepare(
+                "SELECT q.*, CASE WHEN q.expires_at <= ?1 THEN 'expired' WHEN r.requestable = 0 OR r.max_days IS NULL THEN 'not_requestable' ELSE 'disabled' END AS why
+                 FROM role_requests q JOIN roles r ON r.id = q.role_id JOIN users u ON u.id = q.user_id
+                 WHERE q.status = 'pending' AND (q.expires_at <= ?1 OR r.requestable = 0 OR r.max_days IS NULL OR u.status != 'active')
+                 ORDER BY q.created_at, q.id",
+            )?;
+            let rows = s.query_map([at], |r| Ok((role_request_row(r)?, r.get::<_, String>("why")?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(s);
+            let mut out = Vec::new();
+            for (mut q, why) in rows {
+                tx.execute("UPDATE role_requests SET status = 'lapsed', decided_at = ?2 WHERE id = ?1 AND status = 'pending'", params![q.id, at])?;
+                q.status = "lapsed".into();
+                q.decided_at = Some(at);
+                out.push((q, match why.as_str() { "expired" => "expired", "not_requestable" => "not_requestable", _ => "disabled" }));
+            }
+            Ok::<_, rusqlite::Error>(out)
+        })();
+        match res {
+            Ok(out) if tx.commit().is_ok() => out,
+            _ => Vec::new(),
+        }
+    }
+
+    /// Approves a pending request and gives its role for `hours` (the hours asked for when
+    /// None) from now, in one transaction: the request, the role, the person and their team
+    /// are read in it and handed to `check`, so nothing that changed since the request was
+    /// made can slip through. Across the server their built-in role becomes the role's base,
+    /// which `check` keeps equal to theirs. Given by hand, it ends any SCIM or SAML claim on
+    /// the role in its scope, as `give_user_custom_role_until` does.
+    pub fn approve_role_request(&self, id: &str, hours: Option<i64>, by: Option<&str>, note: Option<&str>, check: impl FnOnce(&RequestState) -> Result<(), &'static str>) -> Result<ApprovedRequest, RoleRequestError> {
+        let err = |e: rusqlite::Error| RoleRequestError::Db(e.to_string());
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(err)?;
+        let at = now();
+        let mut q = tx.query_row("SELECT * FROM role_requests WHERE id = ?", [id], role_request_row).optional().map_err(err)?.ok_or(RoleRequestError::NotFound)?;
+        if q.status != "pending" {
+            return Err(RoleRequestError::NotPending(q.status));
+        }
+        if q.expires_at <= at {
+            return Err(RoleRequestError::NotPending("lapsed".into()));
+        }
+        let role = tx.query_row("SELECT * FROM roles WHERE id = ?", [&q.role_id], custom_role_row).optional().map_err(err)?.ok_or(RoleRequestError::NotFound)?;
+        let user = tx.query_row("SELECT * FROM users WHERE id = ?", [&q.user_id], user_row).optional().map_err(err)?.ok_or(RoleRequestError::NotFound)?;
+        let member = match &q.team_id {
+            Some(t) => tx.query_row("SELECT * FROM team_members WHERE user_id = ?1 AND team_id = ?2", [&q.user_id, t], team_member_row).optional().map_err(err)?,
+            None => None,
+        };
+        check(&RequestState { request: &q, role: &role, user: &user, member: member.as_ref() }).map_err(RoleRequestError::Refused)?;
+        let hours = hours.unwrap_or(q.hours);
+        let limit = role.max_days.map(|d| d * 24).ok_or(RoleRequestError::Refused("not_requestable"))?;
+        if hours > limit {
+            return Err(RoleRequestError::OverLimit(limit));
+        }
+        let until = at + hours * 60 * 60_000;
+        let scope = if q.team_id.is_some() { "team" } else { "org" };
+        let before = match (&q.team_id, &member) {
+            (Some(_), Some(m)) => (m.role_id.clone(), m.role_expires_at),
+            _ => (user.role_id.clone(), user.role_expires_at),
+        };
+        // Two writes, as the role's end is cleared by a trigger whenever `role_id` changes.
+        match &q.team_id {
+            None => {
+                tx.execute("UPDATE users SET role_id = ?1, role = (SELECT base FROM roles WHERE id = ?1), updated_at = ?2 WHERE id = ?3", params![role.id, at, user.id]).map_err(err)?;
+                tx.execute("UPDATE users SET role_expires_at = ?1 WHERE id = ?2", params![until, user.id]).map_err(err)?;
+            }
+            Some(t) => {
+                tx.execute("UPDATE team_members SET role_id = ?1 WHERE team_id = ?2 AND user_id = ?3", params![role.id, t, user.id]).map_err(err)?;
+                tx.execute("UPDATE team_members SET role_expires_at = ?1 WHERE user_id = ?2", params![until, user.id]).map_err(err)?;
+            }
+        }
+        let taken = Self::drop_scim_grant_in(&tx, &user.id, scope).map_err(err)?;
+        let taken_saml = if scope == "org" { Self::drop_saml_grant_in(&tx, &user.id).map_err(err)? } else { None };
+        tx.execute(
+            "UPDATE role_requests SET status = 'approved', decided_at = ?2, decided_by = ?3, note = ?4, granted_until = ?5 WHERE id = ?1",
+            params![q.id, at, by, note, until],
+        )
+        .map_err(err)?;
+        tx.commit().map_err(err)?;
+        q.status = "approved".into();
+        (q.decided_at, q.decided_by, q.note, q.granted_until) = (Some(at), by.map(str::to_string), note.map(str::to_string), Some(until));
+        Ok(ApprovedRequest { request: q, before, taken, taken_saml })
     }
 
     // SCIM groups mapped to custom roles (ADR 0138).
@@ -6714,6 +6991,8 @@ impl Db {
         run("DELETE FROM email_prefs WHERE user_id = ?", &[&user_id])?;
         run("DELETE FROM billing_checkouts WHERE user_id = ?", &[&user_id])?;
         run("DELETE FROM team_members WHERE user_id = ?", &[&user_id])?;
+        run("DELETE FROM role_requests WHERE user_id = ?", &[&user_id])?;
+        run("UPDATE role_requests SET decided_by = ?2 WHERE decided_by = ?1", &[&user_id, &pseudonym])?;
         run("DELETE FROM settings WHERE key = ?", &[&format!("machine_egress_policy:user:{user_id}")])?;
         run("DELETE FROM residency_pins WHERE subject_type = 'user' AND subject_id = ?", &[&user_id])?;
         run("DELETE FROM settings WHERE key = ?", &[&format!("{}{user_id}", crate::machines::egress_policy::USER_KEY)])?;
@@ -11027,6 +11306,11 @@ impl Db {
         Db::on(crate::database_encryption::open_with(path, Some(key)).unwrap()).unwrap()
     }
 
+    /// Moves when a pending request for a role lapses to `at`, as the clock passing it would (ADR 0209).
+    pub fn move_role_request_lapse(&self, id: &str, at: i64) {
+        self.c().execute("UPDATE role_requests SET expires_at = ?1 WHERE id = ?2", params![at, id]).unwrap();
+    }
+
     /// Moves the end of `user_id`'s custom role, across the server and in their team, to
     /// `at`, as the clock passing it would (ADR 0197).
     pub fn move_role_end(&self, user_id: &str, at: i64) {
@@ -11074,7 +11358,7 @@ mod tests {
         assert!(matches!(db.create_saml_role_mapping("corp", "Auditors", &hand.id, None), Err(ScimRoleMapError::Taken)), "one role per group");
         let okta = db.create_saml_role_mapping("okta", "Auditors", &r.id, None).unwrap();
         assert!(matches!(db.delete_custom_role(&r.id), Err(RoleError::Mapped(2))));
-        assert!(matches!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view", "machines.manage"]), None), Err(RoleError::Reaches { via: "saml", .. })), "checked as it's saved");
+        assert!(matches!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view", "machines.manage"]), None, None), Err(RoleError::Reaches { via: "saml", .. })), "checked as it's saved");
 
         assert!(db.grant_saml_role(&m, &a.id));
         assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Member, Some(r.id.clone())));
@@ -11190,7 +11474,7 @@ mod tests {
         let r = db.create_custom_role("Break glass", "", Role::Member, &["users.manage"], None, None).unwrap();
         let sa = db.create_service_account("CI", "", Role::Member, None, None, &owner.id, None).unwrap();
         // The handler checked `r` while it had no limit; one is set before the write.
-        db.update_custom_role(&r.id, None, None, None, None, Some(Some(7))).unwrap();
+        db.update_custom_role(&r.id, None, None, None, None, Some(Some(7)), None).unwrap();
         assert_eq!(db.create_service_account("X", "", Role::Member, Some(&r.id), None, &owner.id, None).err().as_deref(), Some(SA_TIME_BOUND));
         assert_eq!(db.create_service_account("X", "", Role::Member, None, Some((&team.id, Some(&r.id))), &owner.id, None).err().as_deref(), Some(SA_TIME_BOUND));
         let org = ServiceAccountPatch { role: Some((Role::Member, Some(r.id.clone()))), ..Default::default() };
@@ -11223,11 +11507,11 @@ mod tests {
 
         // Held with no end, it can't be made time-bound.
         db.give_user_custom_role_until(&a.id, &r.id, None).unwrap();
-        assert_eq!(db.update_custom_role(&r.id, None, None, None, None, week), Err(RoleError::Standing { held: 1, mapped: 0 }));
+        assert_eq!(db.update_custom_role(&r.id, None, None, None, None, week, None), Err(RoleError::Standing { held: 1, mapped: 0 }));
         db.give_user_custom_role_until(&a.id, &r.id, Some(now() + 8 * crate::roles::DAY)).unwrap();
-        assert_eq!(db.update_custom_role(&r.id, None, None, None, None, week), Err(RoleError::Standing { held: 1, mapped: 0 }), "nor held longer than it allows");
+        assert_eq!(db.update_custom_role(&r.id, None, None, None, None, week, None), Err(RoleError::Standing { held: 1, mapped: 0 }), "nor held longer than it allows");
         db.give_user_custom_role_until(&a.id, &r.id, Some(now() + 6 * crate::roles::DAY)).unwrap();
-        assert!(db.update_custom_role(&r.id, None, None, None, None, week).is_ok());
+        assert!(db.update_custom_role(&r.id, None, None, None, None, week, None).is_ok());
         assert_eq!(db.custom_role(&r.id).unwrap().max_days, Some(7));
 
         // Once it is, it's given only with an end within its limit, checked as it's written.
@@ -11242,9 +11526,9 @@ mod tests {
         let plain = db.create_custom_role("Plain", "", Role::Member, &["users.manage"], None, None).unwrap();
         let g = db.declare_scim_role_group("okta", "org", "Helpdesk", None, &plain.id, None).unwrap();
         assert!(matches!(db.set_scim_role_group_role(&g.id, &r.id), Err(ScimRoleGroupError::TimeBound)));
-        assert_eq!(db.update_custom_role(&plain.id, None, None, None, None, week), Err(RoleError::Standing { held: 0, mapped: 1 }));
+        assert_eq!(db.update_custom_role(&plain.id, None, None, None, None, week, None), Err(RoleError::Standing { held: 0, mapped: 1 }));
         // The limit lifted, it's a role like any other.
-        assert!(db.update_custom_role(&r.id, None, None, None, None, Some(None)).is_ok());
+        assert!(db.update_custom_role(&r.id, None, None, None, None, Some(None), None).is_ok());
         assert!(db.give_user_custom_role_until(&a.id, &r.id, None).is_some());
         assert!(db.create_saml_role_mapping("corp", "Admins", &r.id, None).is_ok());
     }
@@ -11272,8 +11556,8 @@ mod tests {
         assert!(!db.grant_scim_role(&org, &a.id), "once");
         assert!(db.give_user_custom_role(&b.id, &hand.id).is_some());
         assert!(!db.grant_scim_role(&org, &b.id), "never over a role given by hand");
-        assert!(matches!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view", "bots.manage"]), None), Err(RoleError::Reaches { .. })), "checked as it's saved");
-        assert!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view"]), None).is_ok());
+        assert!(matches!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view", "bots.manage"]), None, None), Err(RoleError::Reaches { .. })), "checked as it's saved");
+        assert!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view"]), None, None).is_ok());
         assert!(db.revoke_scim_role(&org, &a.id, true).is_none(), "a leave that a rejoin overtook keeps the server-wide grant");
         assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Member, Some(r.id.clone())));
         assert_eq!(db.scim_role_grants(&org.id).len(), 1);

@@ -345,6 +345,9 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         // Your own billing emails (ADR 0091). Handlers refuse Bots.
         ("PUT", ["me", "emails"]) => Write,
         ("GET", ["me", "emails"]) => Account,
+        // Asking for a requestable role, and withdrawing the ask (ADR 0209). Read-only people
+        // may ask for one built on read-only. Deciding is `role-requests`, for admins.
+        ("GET" | "POST", ["me", "role-requests"]) | ("POST", ["me", "role-requests", _, "cancel"]) => Account,
 
         ("GET", ["state" | "events" | "bots" | "policy"]) => Read,
         ("GET", ["harnesses", _, "models"]) => Read,
@@ -741,6 +744,15 @@ mod tests {
             ("DELETE", "/api/roles/r1/users/u1", Perm::Admin),
             ("PUT", "/api/roles/r1/teams/t1/users/u1", Perm::Admin),
             ("DELETE", "/api/roles/r1/teams/t1/users/u1", Perm::Admin),
+            // Requests for roles (ADR 0209): anyone asks; only admins decide.
+            ("GET", "/api/me/role-requests", Perm::Account),
+            ("POST", "/api/me/role-requests", Perm::Account),
+            ("POST", "/api/me/role-requests/rq1/cancel", Perm::Account),
+            ("DELETE", "/api/me/role-requests/rq1", Perm::Admin),
+            ("POST", "/api/me/role-requests/rq1/approve", Perm::Admin),
+            ("GET", "/api/role-requests", Perm::Admin),
+            ("POST", "/api/role-requests/rq1/approve", Perm::Admin),
+            ("POST", "/api/role-requests/rq1/deny", Perm::Admin),
             // Service accounts (ADR 0143).
             ("GET", "/api/service-accounts", Perm::ManageUsers),
             ("POST", "/api/service-accounts", Perm::ManageUsers),

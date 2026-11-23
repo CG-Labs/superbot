@@ -165,6 +165,9 @@ mod rbac;
 mod retention;
 #[cfg(test)]
 mod retention_http_tests;
+mod role_requests;
+#[cfg(test)]
+mod role_requests_http_tests;
 mod roles;
 #[cfg(test)]
 mod roles_http_tests;
@@ -1153,6 +1156,11 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/roles/{id}", get(roles::get).patch(roles::update).delete(roles::delete))
         .route("/roles/{id}/users/{user}", put(roles::assign).delete(roles::unassign))
         .route("/roles/{id}/teams/{team}/users/{user}", put(roles::assign_in_team).delete(roles::unassign_in_team))
+        .route("/role-requests", get(role_requests::list))
+        .route("/role-requests/{id}/approve", post(role_requests::approve))
+        .route("/role-requests/{id}/deny", post(role_requests::deny))
+        .route("/me/role-requests", get(role_requests::mine).post(role_requests::create))
+        .route("/me/role-requests/{id}/cancel", post(role_requests::cancel))
         .route("/service-accounts", get(service_accounts::list).post(service_accounts::create))
         .route("/service-accounts/{id}", get(service_accounts::get).patch(service_accounts::update).delete(service_accounts::delete))
         .route("/service-accounts/{id}/tokens", get(service_accounts::list_tokens).post(service_accounts::create_token))

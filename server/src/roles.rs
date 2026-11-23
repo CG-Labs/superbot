@@ -42,7 +42,7 @@ fn built_in() -> Value {
 }
 
 /// `{id, name}` of a custom role, or null.
-pub fn summary(app: &AppState, role_id: Option<&str>) -> Value {
+pub fn summary(app: &App, role_id: Option<&str>) -> Value {
     match role_id.and_then(|id| app.db.custom_role(id)) {
         Some(r) => json!({ "id": r.id, "name": r.name }),
         None => Value::Null,
@@ -50,7 +50,7 @@ pub fn summary(app: &AppState, role_id: Option<&str>) -> Value {
 }
 
 /// `summary`, with when it ends if it does (ADR 0197).
-pub fn held(app: &AppState, role_id: Option<&str>, ends: Option<i64>) -> Value {
+pub fn held(app: &App, role_id: Option<&str>, ends: Option<i64>) -> Value {
     let mut v = summary(app, role_id);
     if let (Some(o), Some(t)) = (v.as_object_mut(), ends) {
         o.insert("expiresAt".into(), json!(t));
@@ -75,11 +75,12 @@ pub fn expire_due(app: &App) -> usize {
     gone.len()
 }
 
-/// Sweeps ended roles every minute.
+/// Sweeps ended roles, and requests for roles nobody can approve any more (ADR 0209), every minute.
 pub fn start(app: AppState) {
     tokio::spawn(async move {
         loop {
             expire_due(&app);
+            crate::role_requests::lapse_due(&app);
             tokio::time::sleep(SWEEP).await;
         }
     });
@@ -92,7 +93,7 @@ fn view(app: &AppState, r: &CustomRole) -> Value {
     let unknown: Vec<&String> = r.permissions.iter().filter(|p| Perm::delegable(p).is_none()).collect();
     json!({
         "id": r.id, "name": r.name, "description": r.description, "base": r.base, "builtIn": false,
-        "permissions": perms.names(), "unknown": unknown, "maxDays": r.max_days,
+        "permissions": perms.names(), "unknown": unknown, "maxDays": r.max_days, "requestable": r.requestable,
         "effective": rbac::granted(Principal::User(r.base), perms),
         "users": users.len(), "teamMembers": teams.len(), "scimMappings": app.db.scim_role_mappings_of_role(&r.id).len(),
         "samlMappings": app.db.saml_role_mappings_of_role(&r.id).len(), "scimRoleGroups": app.db.scim_role_groups_of_role(&r.id).len(),
@@ -144,6 +145,7 @@ fn role_error(e: RoleError) -> ApiError {
             }
             conflict(format!("A time-bound role is only ever held until an end within its limit, and {}.", why.join(", and ")))
         }
+        RoleError::Requestable => conflict("People may request this role, so it keeps a time limit. Stop it being requestable first (requestable: false)."),
         RoleError::Db(e) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
@@ -161,7 +163,14 @@ fn parse_max_days(v: &Value) -> Res<Option<i64>> {
     }
 }
 
-fn time(ms: i64) -> String {
+/// `requestable` (ADR 0209): true or false. Only a time-bound role can be.
+fn parse_requestable(v: &Value) -> Res<bool> {
+    v.as_bool().ok_or_else(|| bad("requestable must be true or false"))
+}
+
+const REQUESTABLE_NEEDS_LIMIT: &str = "Only a time-bound role can be requested: give it a time limit (maxDays) too.";
+
+pub(crate) fn time(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms).map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_default()
 }
 
@@ -257,7 +266,7 @@ fn parse_perms(v: &Value) -> Res<Vec<&'static str>> {
     Ok(perms.names())
 }
 
-fn only_fields(v: &Value, fields: &[&str]) -> Res<()> {
+pub(crate) fn only_fields(v: &Value, fields: &[&str]) -> Res<()> {
     let body = v.as_object().ok_or_else(|| bad("Send a JSON object."))?;
     match body.keys().find(|k| !fields.contains(&k.as_str())) {
         Some(k) => Err(bad(format!("Unknown field \"{k}\": send {}.", fields.join(", ")))),
@@ -274,16 +283,26 @@ pub async fn list(State(app): State<AppState>) -> Json<Value> {
 }
 
 /// `POST /api/roles` `{name, description?, base?: "member" | "readonly", permissions, maxDays?}`.
-/// With `maxDays` it is time-bound (ADR 0197).
+/// With `maxDays` it is time-bound (ADR 0197); a time-bound one can be `requestable` (ADR 0209).
 pub async fn create(State(app): State<AppState>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
-    only_fields(&v, &["name", "description", "base", "permissions", "maxDays"])?;
+    only_fields(&v, &["name", "description", "base", "permissions", "maxDays", "requestable"])?;
     let name = parse_name(&v["name"])?;
     let description = parse_description(&v["description"])?;
     let base = if v["base"].is_null() { Role::Member } else { parse_base(&v["base"])? };
     let perms = parse_perms(&v["permissions"])?;
     let max_days = parse_max_days(&v["maxDays"])?;
-    let r = app.db.create_custom_role(&name, &description, base, &perms, max_days, by.actor.id.as_deref()).map_err(role_error)?;
-    app.db.record(&by.event("role.created").target("role", &r.id).details(json!({ "name": r.name, "base": r.base, "permissions": perms, "maxDays": r.max_days })));
+    let requestable = if v["requestable"].is_null() { false } else { parse_requestable(&v["requestable"])? };
+    if requestable && max_days.is_none() {
+        return Err(bad(REQUESTABLE_NEEDS_LIMIT));
+    }
+    let mut r = app.db.create_custom_role(&name, &description, base, &perms, max_days, by.actor.id.as_deref()).map_err(role_error)?;
+    if requestable {
+        if !app.db.set_role_requestable(&r.id, true) {
+            return Err(gone_or_changed(&app, &r.id));
+        }
+        r = need_role(&app, &r.id)?;
+    }
+    app.db.record(&by.event("role.created").target("role", &r.id).details(json!({ "name": r.name, "base": r.base, "permissions": perms, "maxDays": r.max_days, "requestable": r.requestable })));
     Ok((StatusCode::CREATED, Json(view(&app, &r))))
 }
 
@@ -313,9 +332,9 @@ pub async fn get(State(app): State<AppState>, Path(key): Path<String>) -> Res {
 /// `PATCH /api/roles/{id}` `{name?, description?, base?, permissions?, maxDays?}`. A new base
 /// applies at once to everyone who holds the role across the server, handled as any
 /// other change of role is (`users::update_user`). `maxDays` makes it time-bound, or with
-/// null not (ADR 0197).
+/// null not (ADR 0197). `requestable` lets people ask for it, only while it's time-bound (ADR 0209).
 pub async fn update(State(app): State<AppState>, Extension(by): Extension<Who>, Path(key): Path<String>, Json(v): Json<Value>) -> Res {
-    only_fields(&v, &["name", "description", "base", "permissions", "maxDays"])?;
+    only_fields(&v, &["name", "description", "base", "permissions", "maxDays", "requestable"])?;
     expire_due(&app);
     let before = need_role(&app, &key)?;
     let name = (!v["name"].is_null()).then(|| parse_name(&v["name"])).transpose()?;
@@ -323,7 +342,11 @@ pub async fn update(State(app): State<AppState>, Extension(by): Extension<Who>, 
     let base = (!v["base"].is_null()).then(|| parse_base(&v["base"])).transpose()?.filter(|b| *b != before.base);
     let perms = (!v["permissions"].is_null()).then(|| parse_perms(&v["permissions"])).transpose()?;
     let max_days = v.get("maxDays").map(parse_max_days).transpose()?.filter(|m| *m != before.max_days);
-    let moved = app.db.update_custom_role(&before.id, name.as_deref(), description.as_deref(), base, perms.as_deref(), max_days).map_err(role_error)?;
+    let requestable = (!v["requestable"].is_null()).then(|| parse_requestable(&v["requestable"])).transpose()?.filter(|r| *r != before.requestable);
+    if requestable == Some(true) && max_days.unwrap_or(before.max_days).is_none() {
+        return Err(bad(REQUESTABLE_NEEDS_LIMIT));
+    }
+    let moved = app.db.update_custom_role(&before.id, name.as_deref(), description.as_deref(), base, perms.as_deref(), max_days, requestable).map_err(role_error)?;
     let after = need_role(&app, &before.id)?;
     let mut changes = serde_json::Map::new();
     if before.name != after.name {
@@ -340,6 +363,9 @@ pub async fn update(State(app): State<AppState>, Extension(by): Extension<Who>, 
     }
     if before.max_days != after.max_days {
         changes.insert("maxDays".into(), json!({ "from": before.max_days, "to": after.max_days }));
+    }
+    if before.requestable != after.requestable {
+        changes.insert("requestable".into(), json!({ "from": before.requestable, "to": after.requestable }));
     }
     if !changes.is_empty() {
         app.db.record(&by.event("role.updated").target("role", &after.id).details(json!({ "name": after.name, "changes": changes, "usersMoved": moved.len() })));

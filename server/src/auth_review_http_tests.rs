@@ -162,13 +162,15 @@ async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() 
             assert_eq!(call(port, &m, &path, &delegate, "{}").await.0, 403, "delegate: {m} {path}");
         }
         // Read-only people change nothing (signing out, removing this session's phone, and
-        // their own second factor are their own account).
+        // their own second factor are their own account). Asking for a role changes nothing
+        // until an admin approves it (ADR 0209).
         let own_mfa = p.starts_with("/api/auth/mfa/") && p != "/api/auth/mfa/policy";
-        if m != "GET" && p != "/api/auth/logout" && !(m == "DELETE" && p == "/api/me/push") && !own_mfa {
+        let asking = p.starts_with("/api/me/role-requests");
+        if m != "GET" && p != "/api/auth/logout" && !(m == "DELETE" && p == "/api/me/push") && !own_mfa && !asking {
             assert!(!rbac::allows(Principal::User(Role::Readonly), need), "readonly could {m} {p}");
         }
         // The admin portal, the audit log, the access-review report, retention and its holds, server backups, evidence bundles, secrets, signups, the setup wizard, the license, status incidents, custom roles, and SCIM tokens and group links are admin-only: some are delegable to a custom role (ADR 0123), but no other built-in role holds them.
-        if ["/api/users", "/api/sessions", "/api/audit", "/api/access-review", "/api/retention", "/api/backups", "/api/evidence", "/api/secrets", "/api/signups", "/api/policy", "/api/setup", "/api/license", "/api/usage", "/api/status", "/api/scim", "/api/roles"].iter().any(|s| p.starts_with(s)) && !(m == "GET" && p.starts_with("/api/policy")) {
+        if ["/api/users", "/api/sessions", "/api/audit", "/api/access-review", "/api/retention", "/api/backups", "/api/evidence", "/api/secrets", "/api/signups", "/api/policy", "/api/setup", "/api/license", "/api/usage", "/api/status", "/api/scim", "/api/roles", "/api/role-requests"].iter().any(|s| p.starts_with(s)) && !(m == "GET" && p.starts_with("/api/policy")) {
             assert!(!rbac::allows(Principal::User(Role::Member), need), "{m} {p}");
             if !(rbac::DELEGABLE.contains(&need)) {
                 assert_eq!(need, rbac::Perm::Admin, "{m} {p}");
