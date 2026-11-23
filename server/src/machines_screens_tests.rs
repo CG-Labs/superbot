@@ -43,8 +43,18 @@ fn script(dir: &std::path::Path, name: &str, body: &str) {
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+/// `n` (at most 8) free loopback ports in a row, apart from every other block handed out
+/// here, and below Linux's ephemeral range (from 32768), where other tests' listeners on
+/// port 0 can't take them between this check and botd binding them.
+fn free_block(n: u16) -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    loop {
+        let base = 20_000 + NEXT.fetch_add(8, Ordering::Relaxed) % 12_000;
+        if (base..base + n).all(|p| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok()) {
+            return base;
+        }
+    }
 }
 
 /// Screen settings whose programs are stand-ins in a folder of their own.
@@ -58,12 +68,12 @@ fn fake_stack() -> display::Settings {
     script(&bin, "dbus-daemon", "#!/bin/sh\nexec sleep 120\n");
     script(&bin, "openbox", "#!/bin/sh\nexec sleep 120\n");
     script(&bin, "voxl", FAKE_VOXL);
-    display::Settings { path: format!("{}:/usr/bin:/bin", bin.display()), tmp, display_base: 100, port_base: free_port() - 1, max: 2 }
+    display::Settings { path: format!("{}:/usr/bin:/bin", bin.display()), tmp, display_base: 100, port_base: free_block(3), max: 2 }
 }
 
 /// botd's loopback ports for machine screens in these tests.
 fn ports() -> (u16, u16) {
-    let p = free_port();
+    let p = free_block(5);
     (p, p + 4)
 }
 

@@ -8,7 +8,8 @@
 //! With `SECRETS_BACKEND=vault`, `azure-keyvault`, `gcp-secret-manager` or `aws`, an
 //! `external::ExternalStore` over that secrets manager sits between the two (ADR 0125,
 //! ADR 0136, ADR 0146). With Vault, `leases` also makes short-lived credentials for each
-//! run (ADR 0185). Values never leave botd except into a harness's environment;
+//! run (ADR 0185), and with AWS, STS sessions for each run (ADR 0194). Values never
+//! leave botd except into a harness's environment;
 //! the API lists names only. Every known value is redacted from saved text, events,
 //! and the audit log (`redact`). See docs/adr/0010-secrets.md.
 

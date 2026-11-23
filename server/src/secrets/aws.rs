@@ -9,9 +9,14 @@
 //! endpoint (ECS, EKS Pod Identity) or the instance profile (IMDSv2 only). Temporary
 //! keys are renewed two thirds of the way through their life, and once more whenever
 //! Secrets Manager says they have expired.
+//!
+//! It is also the `leases::Issuer` of `AWS_RUN_CREDENTIALS` (ADR 0194): an STS
+//! `AssumeRole` session for each run, signed with the same keys, named after the Bot so
+//! CloudTrail shows whose run did what, and lasting as long as the longest run.
 
 use super::external::{Provider, Scope};
 use super::http::{self, Worker};
+use super::leases::{Field, Issuer, Lease};
 use super::{redact, Error, SecretStore};
 use crate::sigv4;
 use base64::engine::general_purpose::STANDARD;
@@ -19,7 +24,7 @@ use base64::Engine;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 /// Secrets Manager's longest secret name.
@@ -31,6 +36,12 @@ const JSON: &str = "application/x-amz-json-1.1";
 const NOT_FOUND: &str = "ResourceNotFoundException";
 /// What Secrets Manager answers for keys that lapsed or were replaced: sign in again.
 const EXPIRED: [&str; 3] = ["ExpiredTokenException", "UnrecognizedClientException", "InvalidClientTokenId"];
+/// What STS answers for them.
+const STS_EXPIRED: [&str; 2] = ["ExpiredToken", "InvalidClientTokenId"];
+const FORM: &str = "application/x-www-form-urlencoded; charset=utf-8";
+/// The shortest and longest `AssumeRole` session STS makes.
+const MIN_SESSION: u64 = 900;
+const MAX_SESSION: u64 = 43_200;
 
 /// An access key, with the session token temporary ones come with. Never `Debug`.
 #[derive(Clone)]
@@ -105,6 +116,9 @@ pub struct Config {
     pub endpoint: String,
     pub prefix: String,
     pub source: Source,
+    /// `https://sts.<region>.amazonaws.com`, or `AWS_ENDPOINT_URL_STS`: for web identity
+    /// sign-in and runs' sessions.
+    pub sts: String,
 }
 
 /// `eu-west-2`, `us-gov-west-1`, `cn-north-1`: from the first of these that is set.
@@ -196,6 +210,10 @@ impl Config {
             "" => format!("https://secretsmanager.{region}.{dns}"),
             e => http::base_url("AWS_ENDPOINT_URL_SECRETS_MANAGER", e, "https://secretsmanager.eu-west-2.amazonaws.com")?,
         };
+        let sts = match var("AWS_ENDPOINT_URL_STS").trim() {
+            "" => format!("https://sts.{region}.{dns}"),
+            e => http::base_url("AWS_ENDPOINT_URL_STS", e, "https://sts.eu-west-2.amazonaws.com")?,
+        };
         let secret = |k: &str| -> Result<Option<Zeroizing<String>>, String> {
             let v = store.get(k).map_err(|e| format!("{k}: {e}"))?;
             Ok(v.map(|v| Zeroizing::new(v.expose().trim().to_string())).filter(|v| !v.is_empty()))
@@ -234,11 +252,7 @@ impl Config {
                 s if (2..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-".contains(&b)) => s.to_string(),
                 s => return Err(format!("AWS_ROLE_SESSION_NAME must be 2 to 64 letters, digits and +=,.@_-, not {s:?}")),
             };
-            let sts = match var("AWS_ENDPOINT_URL_STS").trim() {
-                "" => format!("https://sts.{region}.{dns}"),
-                e => http::base_url("AWS_ENDPOINT_URL_STS", e, "https://sts.eu-west-2.amazonaws.com")?,
-            };
-            Ok(Some(Source::WebIdentity { role_arn, session_name, token_file: PathBuf::from(file.trim()), sts }))
+            Ok(Some(Source::WebIdentity { role_arn, session_name, token_file: PathBuf::from(file.trim()), sts: sts.clone() }))
         };
         let container = || -> Result<Option<Source>, String> {
             let Some(url) = container_url(var)? else { return Ok(None) };
@@ -285,7 +299,7 @@ impl Config {
             "instance-profile" => instance_profile()?,
             other => return Err(format!("AWS_SECRETS_MANAGER_AUTH must be chain, env, web-identity, container or instance-profile, not {other:?}")),
         };
-        Ok(Config { region, endpoint, prefix: prefix_setting(&var("AWS_SECRETS_MANAGER_PREFIX"))?, source })
+        Ok(Config { region, endpoint, prefix: prefix_setting(&var("AWS_SECRETS_MANAGER_PREFIX"))?, source, sts })
     }
 }
 
@@ -331,11 +345,56 @@ fn keys_from_xml(body: &str, what: &str) -> Result<(Keys, Instant), Error> {
     keys(field("AccessKeyId"), field("SecretAccessKey"), field("SessionToken"), field("Expiration"), what)
 }
 
-/// The short error code in STS's `ErrorResponse`, safe to log.
+/// The short error code in STS's `ErrorResponse`, safe to log, as ` (Code)`.
 fn xml_code(body: &str) -> String {
+    http::code_suffix(&xml_error(body))
+}
+
+/// The error code in STS's `ErrorResponse`, or empty if there is none safe to log.
+fn xml_error(body: &str) -> String {
     let doc = roxmltree::Document::parse(body).ok();
-    let code = doc.as_ref().and_then(|d| d.descendants().find(|n| n.tag_name().name() == "Code")).and_then(|n| n.text());
-    code.map(|c| http::code_suffix(c.trim())).unwrap_or_default()
+    let code = doc.as_ref().and_then(|d| d.descendants().find(|n| n.tag_name().name() == "Code")).and_then(|n| n.text()).map(str::trim).unwrap_or_default();
+    if http::code_suffix(code).is_empty() { String::new() } else { code.to_string() }
+}
+
+/// `superbot-<bot id>-<random>`: STS's session name, at most 64 of `\w+=,.@-`, which
+/// CloudTrail shows on everything the session does.
+fn session_name(bot_id: &str) -> String {
+    let bot: String = bot_id.chars().filter(|c| c.is_ascii_alphanumeric() || "+=,.@_-".contains(*c)).take(46).collect();
+    let bot = if bot.is_empty() { "run".to_string() } else { bot };
+    format!("superbot-{bot}-{}", crate::random_hex(4))
+}
+
+/// A run's session from STS's `AssumeRoleResponse`: the fields asked for, the assumed
+/// role's ARN as its id, and how long it lasts. A session that ends before the run could
+/// is refused.
+fn session_from_xml(body: &str, fields: &[String], run_for: u64, what: &str) -> Result<Lease, Error> {
+    let bad = |why: &str| Error::Unavailable(format!("AWS STS: {what} {why}"));
+    let doc = roxmltree::Document::parse(body).map_err(|_| bad("answered with something that isn't STS's XML"))?;
+    let node = |parent: &str, name: &str| {
+        let p = doc.descendants().find(|n| n.tag_name().name() == parent)?;
+        p.children().find(|n| n.tag_name().name() == name).and_then(|n| n.text()).map(str::trim).filter(|v| plain(v))
+    };
+    let (Some(id), Some(secret), Some(token), Some(expiration)) = (node("Credentials", "AccessKeyId"), node("Credentials", "SecretAccessKey"), node("Credentials", "SessionToken"), node("Credentials", "Expiration")) else {
+        return Err(bad("gave no session"));
+    };
+    let arn = node("AssumedRoleUser", "Arn").filter(|a| a.starts_with("arn:") && a.len() <= 2048).ok_or_else(|| bad("gave no assumed role"))?;
+    let expires = chrono::DateTime::parse_from_rfc3339(expiration).map_err(|_| bad("gave a session with no expiry"))?;
+    let ttl = u64::try_from(expires.timestamp() - chrono::Utc::now().timestamp()).unwrap_or(0);
+    // A minute's slack for clocks; STS makes what was asked for or refuses.
+    if ttl + 60 < run_for {
+        return Err(bad(&format!("gave a session that ends in {ttl} s, but a run may last {run_for} s (RUN_TIMEOUT_MINUTES)")));
+    }
+    let fields = fields
+        .iter()
+        .map(|f| match f.as_str() {
+            "AccessKeyId" => Field::Value(Zeroizing::new(id.to_string())),
+            "SecretAccessKey" => Field::Value(Zeroizing::new(secret.to_string())),
+            "SessionToken" => Field::Value(Zeroizing::new(token.to_string())),
+            _ => Field::Missing,
+        })
+        .collect();
+    Ok(Lease { id: arn.to_string(), ttl, renewable: false, fields })
 }
 
 fn keys(id: Option<&str>, secret: Option<&str>, token: Option<&str>, expiration: Option<&str>, what: &str) -> Result<(Keys, Instant), Error> {
@@ -357,6 +416,8 @@ struct Inner {
     url: url::Url,
     /// What the `Host` header carries, and so what is signed.
     host: String,
+    sts_url: url::Url,
+    sts_host: String,
     http: reqwest::Client,
     /// For IMDS and the container endpoint, never through a proxy, as in AWS's SDKs: both
     /// are on this host or its network, where a proxy may not reach.
@@ -364,23 +425,31 @@ struct Inner {
     keys: Mutex<Option<(Keys, Instant)>>,
 }
 
+#[derive(Clone)]
 pub struct SecretsManager {
     inner: Arc<Inner>,
-    worker: Worker,
+    worker: Arc<Worker>,
+}
+
+/// `endpoint/` and what its `Host` header carries.
+fn url_and_host(key: &str, endpoint: &str) -> Result<(url::Url, String), String> {
+    let url = url::Url::parse(&format!("{endpoint}/")).map_err(|e| format!("{key}: {e}"))?;
+    let host = match (url.host_str(), url.port()) {
+        (Some(h), Some(p)) => format!("{h}:{p}"),
+        (Some(h), None) => h.to_string(),
+        _ => return Err(format!("{key}: {endpoint} has no host")),
+    };
+    Ok((url, host))
 }
 
 impl SecretsManager {
     pub fn new(cfg: Config) -> Result<SecretsManager, String> {
-        let url = url::Url::parse(&format!("{}/", cfg.endpoint)).map_err(|e| format!("AWS_ENDPOINT_URL_SECRETS_MANAGER: {e}"))?;
-        let host = match (url.host_str(), url.port()) {
-            (Some(h), Some(p)) => format!("{h}:{p}"),
-            (Some(h), None) => h.to_string(),
-            _ => return Err(format!("AWS Secrets Manager endpoint {} has no host", cfg.endpoint)),
-        };
+        let (url, host) = url_and_host("AWS_ENDPOINT_URL_SECRETS_MANAGER", &cfg.endpoint)?;
+        let (sts_url, sts_host) = url_and_host("AWS_ENDPOINT_URL_STS", &cfg.sts)?;
         let http = http::client("AWS Secrets Manager", None, false)?;
         let local = http::client("AWS Secrets Manager", None, true)?;
-        let inner = Inner { cfg, url, host, http, local, keys: Mutex::new(None) };
-        Ok(SecretsManager { inner: Arc::new(inner), worker: Worker::new("AWS Secrets Manager", "aws-secrets")? })
+        let inner = Inner { cfg, url, host, sts_url, sts_host, http, local, keys: Mutex::new(None) };
+        Ok(SecretsManager { inner: Arc::new(inner), worker: Arc::new(Worker::new("AWS Secrets Manager", "aws-secrets")?) })
     }
 }
 
@@ -521,6 +590,54 @@ impl Inner {
         unreachable!("the second pass returns")
     }
 
+    /// A new STS session as `role_arn` for one run of `bot_id` (ADR 0194), lasting
+    /// `run_for` (at least STS's 15 minutes), signed with botd's own keys. When STS says
+    /// those have lapsed, gets new ones and asks once more.
+    async fn assume_role(&self, role_arn: &str, fields: &[String], run_for: Duration, bot_id: &str) -> Result<Lease, Error> {
+        let secs = run_for.as_secs().max(MIN_SESSION);
+        if secs > MAX_SESSION {
+            return Err(Error::Unavailable(format!("AWS STS: a run may last {secs} s (RUN_TIMEOUT_MINUTES), longer than STS's longest session ({MAX_SESSION} s), so AWS_RUN_CREDENTIALS can't cover it")));
+        }
+        let what = format!("AssumeRole {role_arn}");
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("Action", "AssumeRole")
+            .append_pair("Version", "2011-06-15")
+            .append_pair("RoleArn", role_arn)
+            .append_pair("RoleSessionName", &session_name(bot_id))
+            .append_pair("DurationSeconds", &secs.to_string())
+            .finish();
+        let payload = sigv4::sha256_hex(body.as_bytes());
+        for fresh in [false, true] {
+            let keys = self.keys(fresh).await?;
+            let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+            let scope = sigv4::Scope { amz_date: &amz_date, region: &self.cfg.region, service: "sts" };
+            let mut headers = vec![("content-type", FORM), ("host", self.sts_host.as_str()), ("x-amz-date", amz_date.as_str())];
+            if let Some(t) = &keys.token {
+                headers.push(("x-amz-security-token", t.as_str()));
+            }
+            let (signed, sig) = sigv4::signature(&keys.secret, &scope, "POST", "/", "", &headers, &payload);
+            let mut req = self.http.post(self.sts_url.clone()).header("authorization", scope.authorization(&keys.id, &signed, &sig)).body(body.clone());
+            for (k, v) in headers.iter().filter(|(k, _)| *k != "host") {
+                req = req.header(*k, *v);
+            }
+            let (status, text) = self.fetch(req, &what).await?;
+            if status.is_success() {
+                return session_from_xml(&text, fields, secs, &what);
+            }
+            let code = xml_error(&text);
+            if !fresh && !matches!(self.cfg.source, Source::Env(_)) && STS_EXPIRED.contains(&code.as_str()) {
+                continue;
+            }
+            let hint = match code.as_str() {
+                "AccessDenied" => "; botd's identity needs sts:AssumeRole on the role, and the role's trust policy must allow it",
+                "ValidationError" => "; is a run (RUN_TIMEOUT_MINUTES) longer than the role's maximum session duration, or than an hour when botd's own identity is a role?",
+                _ => "",
+            };
+            return Err(Error::Unavailable(format!("AWS STS answered {status}{} for {what}{hint}", http::code_suffix(&code))));
+        }
+        unreachable!("the second pass returns")
+    }
+
     async fn read(&self, scope: Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error> {
         let Some(id) = self.secret_id(&scope, name) else { return Ok(None) };
         match self.call("GetSecretValue", &json!({ "SecretId": id }), &id).await? {
@@ -639,6 +756,25 @@ impl Provider for SecretsManager {
     }
 }
 
+impl Issuer for SecretsManager {
+    fn kind(&self) -> &'static str {
+        "aws"
+    }
+
+    fn issue(&self, role_arn: &str, fields: &[String], run_for: Duration, bot_id: &str) -> Result<Lease, Error> {
+        let (inner, role_arn, fields, bot_id) = (Arc::clone(&self.inner), role_arn.to_string(), fields.to_vec(), bot_id.to_string());
+        self.worker.run(async move { inner.assume_role(&role_arn, &fields, run_for, &bot_id).await })
+    }
+
+    fn revoke(&self, _lease_id: &str) -> Result<(), Error> {
+        Err(Error::Unavailable("AWS STS: a session can't be revoked; it lasts until it expires".into()))
+    }
+
+    fn revocable(&self) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::env::EnvStore;
@@ -651,7 +787,7 @@ mod tests {
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::{IntoResponse, Response};
-    use axum::{Form, Json};
+    use axum::Json;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
@@ -680,6 +816,8 @@ mod tests {
         container_auth: Mutex<String>,
         /// The regions requests were signed for.
         regions: Mutex<Vec<String>>,
+        /// Each `AssumeRole`: the key it was signed with, and its form.
+        assumed: Mutex<Vec<(String, HashMap<String, String>)>>,
     }
 
     type F = Arc<Fake>;
@@ -698,34 +836,41 @@ mod tests {
     /// The signature on a request, checked as Secrets Manager does.
     #[allow(clippy::result_large_err)]
     fn verify(f: &Fake, h: &HeaderMap, body: &[u8]) -> Result<(), Response> {
+        signed_by(f, h, body, "secretsmanager").map(|_| ()).map_err(|(status, code)| error(status, code))
+    }
+
+    /// The access key a request was signed with, checked as `service` does; else the
+    /// status and error type it would answer.
+    fn signed_by(f: &Fake, h: &HeaderMap, body: &[u8], want_service: &str) -> Result<String, (StatusCode, &'static str)> {
         let header = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
         let auth = header("authorization");
         let field = |name: &str| auth.split([' ', ',']).find_map(|p| p.strip_prefix(&format!("{name}="))).unwrap_or_default().to_string();
         let credential = field("Credential");
         let c: Vec<&str> = credential.split('/').collect();
-        let [id, date, region, service, "aws4_request"] = c[..] else { return Err(error(StatusCode::BAD_REQUEST, "IncompleteSignature")) };
-        let Some((secret, token)) = f.keys.lock().unwrap().get(id).cloned() else { return Err(error(StatusCode::BAD_REQUEST, "UnrecognizedClientException")) };
+        let [id, date, region, service, "aws4_request"] = c[..] else { return Err((StatusCode::BAD_REQUEST, "IncompleteSignature")) };
+        let Some((secret, token)) = f.keys.lock().unwrap().get(id).cloned() else { return Err((StatusCode::BAD_REQUEST, "UnrecognizedClientException")) };
         if f.expired.lock().unwrap().contains(id) {
-            return Err(error(StatusCode::BAD_REQUEST, "ExpiredTokenException"));
+            return Err((StatusCode::BAD_REQUEST, "ExpiredTokenException"));
         }
         if token.as_deref().unwrap_or_default() != header("x-amz-security-token") {
-            return Err(error(StatusCode::FORBIDDEN, "InvalidClientTokenId"));
+            return Err((StatusCode::FORBIDDEN, "InvalidClientTokenId"));
         }
         let amz_date = header("x-amz-date");
         let names = field("SignedHeaders");
-        let want = if token.is_some() { "content-type;host;x-amz-date;x-amz-security-token;x-amz-target" } else { "content-type;host;x-amz-date;x-amz-target" };
-        if service != "secretsmanager" || !amz_date.starts_with(date) || names != want || header("content-type") != JSON {
-            return Err(error(StatusCode::BAD_REQUEST, "IncompleteSignature"));
+        let (target, content_type) = if want_service == "sts" { ("", FORM) } else { (";x-amz-target", JSON) };
+        let want = format!("content-type;host;x-amz-date{}{target}", if token.is_some() { ";x-amz-security-token" } else { "" });
+        if service != want_service || !amz_date.starts_with(date) || names != want || header("content-type") != content_type {
+            return Err((StatusCode::BAD_REQUEST, "IncompleteSignature"));
         }
         let values: Vec<(String, String)> = names.split(';').map(|n| (n.to_string(), header(n))).collect();
         let pairs: Vec<(&str, &str)> = values.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let scope = sigv4::Scope { amz_date: &amz_date, region, service };
         let (_, sig) = sigv4::signature(&secret, &scope, "POST", "/", "", &pairs, &sigv4::sha256_hex(body));
         if sig != field("Signature") {
-            return Err(error(StatusCode::BAD_REQUEST, "InvalidSignatureException"));
+            return Err((StatusCode::BAD_REQUEST, "InvalidSignatureException"));
         }
         f.regions.lock().unwrap().push(region.to_string());
-        Ok(())
+        Ok(id.to_string())
     }
 
     async fn api(State(f): State<F>, h: HeaderMap, body: Bytes) -> Response {
@@ -839,7 +984,52 @@ mod tests {
         Json(v).into_response()
     }
 
-    async fn sts(State(f): State<F>, Form(form): Form<HashMap<String, String>>) -> (StatusCode, String) {
+    fn sts_error(status: StatusCode, code: &str) -> Response {
+        let xml = format!(r#"<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><Error><Type>Sender</Type><Code>{code}</Code><Message>The stand-in's message, quoting what was sent</Message></Error></ErrorResponse>"#);
+        (status, xml).into_response()
+    }
+
+    /// `AssumeRole` for a run, signed: role `.../denied` is refused, `.../one-hour` allows
+    /// at most an hour, `.../short` gives ten minutes whatever was asked, `.../odd` no session.
+    fn assume_role(f: &Fake, h: &HeaderMap, body: &[u8], form: HashMap<String, String>) -> Response {
+        let signer = match signed_by(f, h, body, "sts") {
+            Ok(id) => id,
+            Err((status, "ExpiredTokenException")) => return sts_error(status, "ExpiredToken"),
+            Err((status, "UnrecognizedClientException")) => return sts_error(status, "InvalidClientTokenId"),
+            Err((status, code)) => return sts_error(status, code),
+        };
+        f.assumed.lock().unwrap().push((signer, form.clone()));
+        let get = |k: &str| form.get(k).cloned().unwrap_or_default();
+        let (arn, session) = (get("RoleArn"), get("RoleSessionName"));
+        let secs: i64 = get("DurationSeconds").parse().unwrap_or(3600);
+        if arn.ends_with("/denied") {
+            return sts_error(StatusCode::FORBIDDEN, "AccessDenied");
+        }
+        if arn.ends_with("/one-hour") && secs > 3600 {
+            return sts_error(StatusCode::BAD_REQUEST, "ValidationError");
+        }
+        if arn.ends_with("/odd") {
+            return (StatusCode::OK, "<AssumeRoleResponse><AssumeRoleResult></AssumeRoleResult></AssumeRoleResponse>").into_response();
+        }
+        let secs = if arn.ends_with("/short") { 600 } else { secs };
+        let (id, secret, token) = issue(f);
+        let expires = (chrono::Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let role = arn.rsplit('/').next().unwrap_or_default();
+        let xml = format!(
+            r#"<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult><AssumedRoleUser><AssumedRoleId>AROAFAKE:{session}</AssumedRoleId><Arn>arn:aws:sts::123456789012:assumed-role/{role}/{session}</Arn></AssumedRoleUser><Credentials><AccessKeyId>{id}</AccessKeyId><SecretAccessKey>{secret}</SecretAccessKey><SessionToken>{token}</SessionToken><Expiration>{expires}</Expiration></Credentials></AssumeRoleResult></AssumeRoleResponse>"#
+        );
+        (StatusCode::OK, xml).into_response()
+    }
+
+    async fn sts(State(f): State<F>, h: HeaderMap, body: Bytes) -> Response {
+        let form: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
+        if form.get("Action").map(String::as_str) == Some("AssumeRole") {
+            return assume_role(&f, &h, &body, form);
+        }
+        web_identity(&f, &form).into_response()
+    }
+
+    fn web_identity(f: &Fake, form: &HashMap<String, String>) -> (StatusCode, String) {
         let get = |k: &str| form.get(k).cloned().unwrap_or_default();
         assert_eq!((get("Action").as_str(), get("Version").as_str(), get("RoleArn").as_str()), ("AssumeRoleWithWebIdentity", "2011-06-15", "arn:aws:iam::123456789012:role/botd"));
         let jwt = get("WebIdentityToken");
@@ -848,7 +1038,7 @@ mod tests {
             let xml = format!(r#"<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><Error><Type>Sender</Type><Code>InvalidIdentityToken</Code><Message>Couldn't verify {jwt}</Message></Error></ErrorResponse>"#);
             return (StatusCode::BAD_REQUEST, xml);
         }
-        let (id, secret, token) = issue(&f);
+        let (id, secret, token) = issue(f);
         let expires = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let xml = format!(
             r#"<AssumeRoleWithWebIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleWithWebIdentityResult><Credentials><SessionToken>{token}</SessionToken><SecretAccessKey>{secret}</SecretAccessKey><Expiration>{expires}</Expiration><AccessKeyId>{id}</AccessKeyId></Credentials><SubjectFromWebIdentityToken>system:serviceaccount:superbot:botd</SubjectFromWebIdentityToken></AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>"#
@@ -1174,5 +1364,126 @@ mod tests {
         }
         redact::forget("aws-secret-from-file-0123456789");
         redact::forget("botd-session-0123456789");
+    }
+
+    use super::super::leases::tests::RUN;
+    use super::super::leases::RunCredentials;
+
+    /// `SECRETS_BACKEND=aws` on the stand-ins, with the instance profile and `AWS_RUN_CREDENTIALS`.
+    fn run_credentials(url: &str, sts_url: &str, roles: &str) -> Arc<RunCredentials> {
+        let pairs = [
+            ("SECRETS_BACKEND", "aws"),
+            ("AWS_REGION", "eu-west-2"),
+            ("AWS_ENDPOINT_URL_SECRETS_MANAGER", url),
+            ("AWS_EC2_METADATA_SERVICE_ENDPOINT", url),
+            ("AWS_ENDPOINT_URL_STS", sts_url),
+            ("AWS_SECRETS_MANAGER_AUTH", "instance-profile"),
+            ("AWS_RUN_CREDENTIALS", roles),
+        ];
+        let x = super::super::external::from_env(&settings(&pairs), &EnvStore::fixed(&pairs)).unwrap().unwrap();
+        Arc::clone(x.run_credentials().expect("AWS_RUN_CREDENTIALS is read with SECRETS_BACKEND=aws"))
+    }
+
+    fn values(env: &[(String, super::super::Secret)]) -> HashMap<String, String> {
+        env.iter().map(|(k, v)| (k.clone(), v.expose().to_string())).collect()
+    }
+
+    #[test]
+    fn each_run_gets_its_own_sts_session_named_after_the_bot() {
+        let (url, sts_url, f) = stand_in();
+        let rc = run_credentials(&url, &sts_url, "arn:aws:iam::123456789012:role/superbot-bots; arn:aws:iam::123456789012:role/u-{owner} OWN_KEY_ID=AccessKeyId OWN_SECRET_KEY=SecretAccessKey");
+        assert!(rc.describe().contains("arn:aws:iam::123456789012:role/superbot-bots, arn:aws:iam::123456789012:role/u-{owner}"));
+        let (e1, l1) = rc.issue("uaws7", "baws7", true, RUN).unwrap();
+        let (e2, l2) = rc.issue("uaws7", "baws7", false, Duration::from_secs(300)).unwrap();
+        let (v1, v2) = (values(&e1), values(&e2));
+        let mut names: Vec<&str> = v1.keys().map(String::as_str).collect();
+        names.sort();
+        assert_eq!(names, ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "OWN_KEY_ID", "OWN_SECRET_KEY"]);
+        assert_eq!(v2.len(), 3, "a run for someone else gets no owner's role");
+        assert_ne!(v1["AWS_ACCESS_KEY_ID"], v2["AWS_ACCESS_KEY_ID"], "each run its own session");
+        let keys = f.keys.lock().unwrap().clone();
+        assert_eq!(keys[&v1["AWS_ACCESS_KEY_ID"]], (v1["AWS_SECRET_ACCESS_KEY"].clone(), Some(v1["AWS_SESSION_TOKEN"].clone())), "the keys STS made");
+        assert_eq!(redact::text(&format!("leaked {}", v1["AWS_SECRET_ACCESS_KEY"])), format!("leaked {}", redact::MARK));
+
+        let assumed = f.assumed.lock().unwrap().clone();
+        assert_eq!(assumed.len(), 3);
+        let botd = keys.keys().find(|k| !v1.values().chain(v2.values()).any(|v| v == *k)).unwrap().clone();
+        assert!(assumed.iter().all(|(signer, _)| *signer == botd), "signed with botd's own keys from the instance profile, checked by the stand-in");
+        let form = |i: usize, k: &str| assumed[i].1.get(k).cloned().unwrap_or_default();
+        assert_eq!((form(0, "RoleArn").as_str(), form(0, "Version").as_str()), ("arn:aws:iam::123456789012:role/superbot-bots", "2011-06-15"));
+        assert_eq!(form(1, "RoleArn"), "arn:aws:iam::123456789012:role/u-uaws7");
+        assert_eq!((form(0, "DurationSeconds").as_str(), form(2, "DurationSeconds").as_str()), ("3600", "900"), "as long as the longest run, at least STS's 15 minutes");
+        let session = form(0, "RoleSessionName");
+        assert!(session.starts_with("superbot-baws7-") && session.len() <= 64 && session != form(1, "RoleSessionName"), "{session}");
+
+        let ev: Vec<_> = audited("arn:aws:iam::123456789012:role/superbot-bots").into_iter().filter(|e| e.bot_id.as_deref() == Some("baws7")).collect();
+        let issued = ev.iter().find(|e| e.action == "secret.lease_issued").unwrap();
+        assert_eq!(issued.details["leaseId"], format!("arn:aws:sts::123456789012:assumed-role/superbot-bots/{session}"), "CloudTrail's ARN for the session");
+        assert_eq!((issued.details["store"].as_str(), issued.details["renewable"].as_bool()), (Some("aws"), Some(false)));
+        assert!((3590..=3600).contains(&issued.details["ttl"].as_u64().unwrap()));
+        assert!(!format!("{ev:?}").contains(&v1["AWS_SECRET_ACCESS_KEY"]) && !format!("{ev:?}").contains(&v1["AWS_SESSION_TOKEN"]), "never a value");
+
+        drop(l1);
+        drop(l2);
+        let released: Vec<_> = audited("arn:aws:iam::123456789012:role/u-uaws7").into_iter().filter(|e| e.action == "secret.lease_released").collect();
+        assert_eq!((released.len(), released[0].details["revocable"].as_bool()), (1, Some(false)));
+        assert!(released[0].details["expiresAt"].as_str().is_some());
+        assert_eq!(redact::text(&v1["AWS_SESSION_TOKEN"]), redact::MARK, "it works until it expires, so it stays redacted");
+    }
+
+    #[test]
+    fn sts_refusing_or_odd_refuses_the_run() {
+        let (url, sts_url, f) = stand_in();
+        let role = |name: &str| format!("arn:aws:iam::123456789012:role/{name}");
+        for (name, run_for, err) in [
+            ("denied", RUN, "403 Forbidden (AccessDenied) for AssumeRole arn:aws:iam::123456789012:role/denied; botd's identity needs sts:AssumeRole"),
+            ("one-hour", Duration::from_secs(7200), "(ValidationError)"),
+            ("short", RUN, "ends in 600 s, but a run may last 3600 s"),
+            ("odd", RUN, "gave no session"),
+            ("long", Duration::from_secs(43_201), "longer than STS's longest session"),
+        ] {
+            let rc = run_credentials(&url, &sts_url, &role(name));
+            let e = rc.issue("uaws8", "baws8", true, run_for).err().unwrap().to_string();
+            assert!(e.contains(err) && !e.contains("quoting"), "{name}: {e}");
+            assert!(audited(&role(name)).iter().any(|e| e.action == "secret.lease_issued" && e.outcome == Outcome::Failure), "{name}");
+        }
+        assert!(!f.assumed.lock().unwrap().iter().any(|(_, form)| form["RoleArn"].ends_with("/long")), "never asked for what STS can't make");
+
+        // botd's keys lapse: it signs in again and asks once more.
+        let rc = run_credentials(&url, &sts_url, &role("superbot-bots"));
+        rc.issue("uaws8", "baws8", true, RUN).unwrap();
+        let signer = f.assumed.lock().unwrap().last().unwrap().0.clone();
+        f.expired.lock().unwrap().insert(signer.clone());
+        let before = f.sign_ins.load(Ordering::SeqCst);
+        rc.issue("uaws8", "baws8", true, RUN).unwrap();
+        assert!(f.sign_ins.load(Ordering::SeqCst) > before);
+        assert_ne!(f.assumed.lock().unwrap().last().unwrap().0, signer);
+    }
+
+    #[test]
+    fn run_credentials_settings_are_checked() {
+        let (url, sts_url, _) = stand_in();
+        let base = [("SECRETS_BACKEND", "aws"), ("AWS_REGION", "eu-west-2"), ("AWS_ENDPOINT_URL_SECRETS_MANAGER", url.as_str()), ("AWS_ENDPOINT_URL_STS", sts_url.as_str())];
+        let keys = [("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE"), ("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")];
+        let with = |extra: &[(&str, &str)]| {
+            let pairs = [&base[..], &keys[..], extra].concat();
+            super::super::external::from_env(&settings(&pairs), &EnvStore::fixed(&pairs))
+        };
+        let x = with(&[("AWS_RUN_CREDENTIALS", "arn:aws:iam::123456789012:role/superbot-bots")]).unwrap().unwrap();
+        assert_eq!(x.run_credentials().unwrap().names(), ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"], "the run's own keys under the SDKs' names, though botd signs in with its own under them");
+        assert!(super::super::check_name("AWS_ACCESS_KEY_ID").is_err(), "still never from a store");
+        assert!(with(&[]).unwrap().unwrap().run_credentials().is_none(), "off unless set");
+        let e = with(&[("AWS_RUN_CREDENTIALS", "aws/creds/bots")]).err().unwrap();
+        assert!(e.contains("AWS_RUN_CREDENTIALS") && e.contains("IAM role's ARN"));
+        let e = with(&[("AWS_ENDPOINT_URL_STS", "http://sts.example.com")]).err().unwrap();
+        assert!(e.contains("AWS_ENDPOINT_URL_STS"));
+        let var = settings(&[("AWS_RUN_CREDENTIALS", "arn:aws:iam::123456789012:role/r")]);
+        assert_eq!(super::super::external::unused_settings(&var, "vault"), ["AWS_RUN_CREDENTIALS"], "only SECRETS_BACKEND=aws reads it");
+        assert!(super::super::external::unused_settings(&var, "aws").is_empty());
+        let name = session_name("b/../x y");
+        assert!(name.starts_with("superbot-b..xy-") && name.len() == "superbot-b..xy-".len() + 8, "{name}");
+        let name = session_name(&"b".repeat(100));
+        assert_eq!(name.len(), 64, "{name}");
+        assert!(session_name("///").starts_with("superbot-run-"));
     }
 }

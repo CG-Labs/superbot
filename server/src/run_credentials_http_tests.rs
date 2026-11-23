@@ -3,7 +3,8 @@
 //! revoked once the run ends; a name whose field is empty is taken out of the run, over
 //! a saved secret of that name; a lease that can't be made refuses the run, audited as
 //! `secrets_unavailable`, and the Bot says so. A plan's model provider key may come only
-//! from a lease; if that lease gives it empty, the run is refused.
+//! from a lease; if that lease gives it empty, the run is refused. A run whose lease
+//! can't be revoked (an STS session, ADR 0194) stops when it expires.
 
 use crate::acl::Visibility;
 use crate::secrets::leases::tests::{fake, set_for_owner, wait_for};
@@ -134,4 +135,30 @@ async fn a_plans_provider_key_may_come_only_from_a_lease() {
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert_eq!(refused[0]["details"]["reason"], "secrets_unavailable");
     wait_for(|| f.revoked.lock().unwrap().len() == 1);
+}
+
+/// A stand-in `claude` that takes longer than its STS session lasts.
+fn slow_claude(app: &App) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = app.cfg.bin_dir.join("claude");
+    std::fs::write(&path, "#!/bin/sh\nsleep 20\necho '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"finished\"}]}}'\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[tokio::test]
+async fn a_run_stops_when_its_sts_session_expires() {
+    let (port, app, admin, _) = serve_app().await;
+    slow_claude(&app);
+    let (ada_id, ada) = user_with(port, &admin, "ada@example.com", "member").await;
+    let bot = app.db.create_bot_owned("Deployer", "#fff", "waddle", "claude", None, false, &ada_id, Visibility::Private);
+    let f = fake(&[("sts/role/short", &[("SessionToken", Some("sts-http-session-4d3c"))])]);
+    f.unrevocable.store(true, Ordering::SeqCst);
+    f.ttl.store(1, Ordering::SeqCst);
+    set_for_owner(&ada_id, RunCredentials::new(f.clone(), parse("sts/role/short STS_HTTP_TOKEN=SessionToken").unwrap()));
+
+    let started = std::time::Instant::now();
+    let reply = run(port, &app, &ada, &bot.id).await;
+    assert!(reply.contains("short-lived cloud credentials for this task expired"), "{reply}");
+    assert!(started.elapsed() < Duration::from_secs(10), "stopped with its session, not at the run timeout");
+    assert!(f.revoked.lock().unwrap().is_empty(), "an STS session is never revoked");
 }
