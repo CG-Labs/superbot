@@ -5,7 +5,7 @@
 //! theirs. Operations run one at a time in the order sent, except that one using
 //! `bulkId:<id>` waits for the POST that defines it. Nothing is rolled back: an
 //! operation that succeeded stays done whatever the rest do.
-//! Design: docs/adr/0149-scim-bulk.md.
+//! Design: docs/adr/0153-scim-bulk.md.
 
 use super::*;
 use std::collections::HashSet;
