@@ -874,6 +874,20 @@ export interface AuditVerification {
   firstBroken: { id: number; reason: string } | null;
   /** Set when only part of the log was checked (`--from`/`--to`); null bounds are open. */
   range?: { from: number | null; to: number | null } | null;
+  /** The archive's part, when the check read it (ADR 0163, 0183). */
+  archive?: AuditArchiveCheck | null;
+}
+
+/** What a check of the S3 archive found: `after` is set when it read only what was new since the last pass. */
+export interface AuditArchiveCheck {
+  ok: boolean;
+  objects: number;
+  skipped?: number;
+  head: ChainLink | null;
+  after?: number | null;
+  problems: number;
+  firstProblem: { key: string | null; id: number | null; reason: string; error: string } | null;
+  error?: string | null;
 }
 
 /** One export sink's progress: a SIEM (`webhook`, `syslog`) or the S3 archive (`s3`). */
@@ -899,6 +913,8 @@ export interface AuditArchiveState {
   lock: "bucket" | "compliance" | "governance" | "off";
   retainDays: number | null;
   batchSeconds: number;
+  /** Whether botd's daily check reads new objects (`AUDIT_EXPORT_S3_CHECK`, ADR 0183). */
+  dailyCheck?: boolean;
   lastObject: { key: string; version: string | null; events: number; lockMode?: string; retainUntil?: number } | null;
 }
 

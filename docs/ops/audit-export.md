@@ -1,6 +1,6 @@
 # Audit log: SIEM export and tamper evidence
 
-Every audit event is sealed onto a hash chain as it is written, so a changed, removed, added or reordered event shows. Every hour botd signs a checkpoint of the chain's head, and can have each one timestamped by an RFC 3161 time-stamping authority (TSA). botd can also send every event to your SIEM as it happens: JSON lines over HTTPS, or RFC 5424 syslog over TLS. Or it can archive them in batches to an S3 bucket with Object Lock, where nobody can change or delete them until their retention ends ([below](#archive-events-to-write-once-s3)), or do both at once ([below](#a-siem-and-an-archive-together)). The chain and checkpoints are always on and need nothing. Timestamps and the export are off until you set them. Design: [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md), [ADR 0149](../adr/0149-signed-and-timestamped-audit-checkpoints.md), [ADR 0154](../adr/0154-write-once-s3-audit-archive.md), [ADR 0163](../adr/0163-checking-the-audit-archive.md) and [ADR 0173](../adr/0173-an-archive-alongside-a-siem.md).
+Every audit event is sealed onto a hash chain as it is written, so a changed, removed, added or reordered event shows. Every hour botd signs a checkpoint of the chain's head, and can have each one timestamped by an RFC 3161 time-stamping authority (TSA). botd can also send every event to your SIEM as it happens: JSON lines over HTTPS, or RFC 5424 syslog over TLS. Or it can archive them in batches to an S3 bucket with Object Lock, where nobody can change or delete them until their retention ends ([below](#archive-events-to-write-once-s3)), or do both at once ([below](#a-siem-and-an-archive-together)). The chain and checkpoints are always on and need nothing. Timestamps and the export are off until you set them. Design: [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md), [ADR 0149](../adr/0149-signed-and-timestamped-audit-checkpoints.md), [ADR 0154](../adr/0154-write-once-s3-audit-archive.md), [ADR 0163](../adr/0163-checking-the-audit-archive.md), [ADR 0173](../adr/0173-an-archive-alongside-a-siem.md) and [ADR 0183](../adr/0183-daily-check-of-new-archive-objects.md).
 
 ## Check the chain
 
@@ -27,7 +27,7 @@ It prints the result and exits 1 if the chain is broken. The same is `GET /api/a
 
 `--from <id>` and `--to <id>` check only those events, which is quicker on a large log. A range starting after the first event takes that event's link as stored. If erased events in the range are named by an erasure after `--to`, the check carries on to the head, and `range` in the answer shows that.
 
-botd also checks itself a minute after starting and then once a day. Each check, and each one through the API, is recorded as `audit.verified` with the result and the head's hash; a failed check's `reason` is the first break's code (`contents`, `link`, `pin`, `unsealed`, `erased`, `checkpoint`, `timestamp`, `archive`) or `unreadable`, which `botctl support-bundle` shows. A broken chain logs a warning that links here.
+botd also checks itself a minute after starting and then once a day, along with what is new in the archive if there is one ([below](#the-daily-check)). Each check, and each one through the API, is recorded as `audit.verified` with the result and the head's hash; a failed check's `reason` is the first break's code (`contents`, `link`, `pin`, `unsealed`, `erased`, `checkpoint`, `timestamp`, `archive`) or `unreadable`, which `botctl support-bundle` shows. A broken chain logs a warning that links here.
 
 `botctl audit chain` (or `GET /api/audit/chain`) shows it all at once: the head, the last checkpoint and timestamp, how many events since, whether timestamping is failing, how far the export is behind, and the last check's result. In the app, the audit log's **Chain** button shows the same, with **Check now**.
 
@@ -215,8 +215,9 @@ AUDIT_EXPORT_S3_SECRET_ACCESS_KEY=<secret>
 | `AUDIT_EXPORT_S3_LOCK` | `bucket` | `bucket`: the bucket's default retention locks each object (botd checks there is one). `compliance` or `governance`: botd locks each object itself for `AUDIT_EXPORT_S3_RETAIN_DAYS`. `off`: a plain bucket, nothing locked |
 | `AUDIT_EXPORT_S3_RETAIN_DAYS` | none | 1 to 36500, with `compliance` or `governance` only |
 | `AUDIT_EXPORT_S3_BATCH_SECONDS` | `300` | A batch goes when its oldest event is this old, or at 10,000 events. 0 sends each batch at once |
+| `AUDIT_EXPORT_S3_CHECK` | `daily` | `daily`: botd's daily self-check also checks the objects written since its last pass ([below](#the-daily-check)). `off`: only when you ask |
 
-The key botd uses needs, on the bucket (`arn:aws:s3:::<bucket>`), `s3:GetBucketObjectLockConfiguration`; and on its objects (`arn:aws:s3:::<bucket>/<prefix>/*`), `s3:PutObject`, `s3:GetObject` and `s3:GetObjectVersion` (botd reads back the version it wrote), `s3:GetObjectRetention` (to see its lock), and with `compliance` or `governance`, `s3:PutObjectRetention`. Don't give it `s3:BypassGovernanceRetention` or any delete rights. Other stores name these differently; MinIO uses the same names.
+The key botd uses needs, on the bucket (`arn:aws:s3:::<bucket>`), `s3:GetBucketObjectLockConfiguration` and, for the daily check ([below](#the-daily-check)), `s3:ListBucketVersions`; and on its objects (`arn:aws:s3:::<bucket>/<prefix>/*`), `s3:PutObject`, `s3:GetObject` and `s3:GetObjectVersion` (botd reads back the version it wrote), `s3:GetObjectRetention` (to see its lock), and with `compliance` or `governance`, `s3:PutObjectRetention`. Don't give it `s3:BypassGovernanceRetention` or any delete rights. Other stores name these differently; MinIO uses the same names.
 
 - **Objects** are `<prefix>/<yyyy>/<mm>/<dd>/<first id>-<last id>.jsonl`, dated by their first event, ids padded to 20 digits so they list in order. Each holds the same lines the webhook gets ([above](#what-arrives)), so each event's `chainPrev` is the previous event's `chainHash` across objects too, and checkpoints can be checked from the archive with OpenSSL. Metadata: `x-amz-meta-superbot-first-id`, `-last-id`, `-events`, `-chain-prev` (the first event's link), `-chain-head` (the last event's hash) and `-schema`.
 - **Proof of the lock.** Before the first batch, botd checks that the bucket has Object Lock on (and a default retention with `bucket`). After writing each object it reads it back, and the object must have a version and a lock: the mode asked for and at least the date asked for, or with `bucket`, a date in the future. If not, nothing counts as delivered, retention keeps the events, and after 3 tries `audit.export_failing` is recorded with `reason` `not_write_once`. A store that takes the lock headers and keeps nothing can't pass.
@@ -255,9 +256,28 @@ The check fails, and exits 1, if any of that doesn't hold. `firstBroken` then na
 | `stray` | A key under the prefix that botd didn't write |
 | `unreadable` | An object couldn't be read or parsed |
 
-`--from` and `--to` read only the objects that hold those events, and every event in that range that botd has delivered must be there (`start` or `behind` otherwise; for an archive started before botd recorded where it began, only when the range reads something or reaches the last event delivered), and `--pin` and `--key` work as usual. The check costs one listing plus one `GET` per object (more for objects with several versions), four at a time. A year of 5-minute batches is about 100,000 objects, so use a range for frequent checks and run the whole archive less often, for example weekly from cron. `audit.verified` records the result.
+`--from` and `--to` read only the objects that hold those events, and every event in that range that botd has delivered must be there (`start` or `behind` otherwise; for an archive started before botd recorded where it began, only when the range reads something or reaches the last event delivered), and `--pin` and `--key` work as usual. The check costs one listing plus one `GET` per object (more for objects with several versions), four at a time. A year of 5-minute batches is about 100,000 objects, so use a range for frequent checks; botd checks what is new every day by itself (next). `audit.verified` records the result. A whole check that passes is also where the daily check carries on from.
 
 For this, the key botd uses also needs `s3:ListBucketVersions` on the bucket; export works without it. Without it the check fails, and the error names the missing right. It still needs no delete rights.
+
+### The daily check
+
+With an archive, botd's daily self-check also checks it, unless `AUDIT_EXPORT_S3_CHECK=off`. It runs the same checks as `--archive`, but only on what is new since its last pass:
+
+- every object past the head the last passing check reached. The chain must carry on from that head with no gap;
+- every object the store says was written to since the last pass began (from the listing's `LastModified`, which no writer can set), whatever events it names. So a forged copy of an old batch, or a new version over an old object, is read the next day;
+- and before reading, the head the last pass reached must still have the same hash here. A log rebuilt from any event, even one already checked, changes that hash, so it fails as `mismatch` (reason `archive`).
+
+The first daily check, with no pass yet, reads the whole archive once. After that it costs one listing plus about one `GET` per batch written that day: about 288 at 5-minute batches. Each check is one `audit.verified`, and its `archive` block has `after` (the head it carried on from) and `skipped` (objects not read again). The app's audit log shows it as `Archive check`. A check that fails doesn't move the last pass, so the next day reads from the same place and fails again until it's resolved. A passing whole check by hand moves it too.
+
+What the daily check doesn't see is an old object deleted for good. In compliance mode nobody can do that. In governance mode, or with the lock off, keep running the whole check from cron too, for example weekly: `botctl audit verify --archive`.
+
+If it fails:
+
+- `error` naming `s3:ListBucketVersions`: grant that right on the bucket (archives set up before the daily check may lack it), or set `AUDIT_EXPORT_S3_CHECK=off`.
+- `mismatch` or `missing` at the head it carried on from, or at an archived event: this server's log no longer says what was archived. Treat it as tampering until shown otherwise: compare the archive's copy of that event with the log, and with your SIEM's copy if there is one.
+- `contents`, `overwritten`, `stray`: someone wrote to the archive with its key. The first version of each object is still what's checked. Find who used the key, then rotate it.
+- `link` or `behind`: new objects are missing. Check the export's status (`botctl audit siem`) first.
 
 Erased users' data stays in locked objects until their lock ends, like a SIEM or a backup: choose the period with your DPA in mind.
 
@@ -279,7 +299,7 @@ AUDIT_EXPORT_S3_SECRET_ACCESS_KEY=<secret>
 - **Retention waits for both.** `AUDIT_RETENTION_DAYS` never deletes an event either sink hasn't taken.
 - **Adding one keeps the other.** Cursors are kept per sink, so adding an archive beside a running SIEM (or the other way round) resumes the one that was there. The new one starts as `AUDIT_EXPORT_START` says: with `all`, the default, the archive starts with the history still in the database.
 - **Status.** `botctl audit siem` (`GET /api/audit/siem`) leads with the sink in the worst state, failing first and then furthest behind, so its `failing` and `pending` cover both, and lists each under `sinks`. The app's audit log shows a `SIEM export` and an `Archive` line. In `/metrics`, each sink is its own series by `kind`.
-- **Checks.** `botctl audit verify --archive` checks the archive as above. Pins from the SIEM (`--pin`) and the archive check can be used together.
+- **Checks.** `botctl audit verify --archive` checks the archive as above, and the daily check reads what is new in it. Pins from the SIEM (`--pin`) and the archive check can be used together.
 
 ## Retention and erasure
 

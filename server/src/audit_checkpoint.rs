@@ -861,7 +861,7 @@ pub fn view(app: &App) -> rusqlite::Result<Value> {
         json!({
             "id": e.id, "at": e.at, "time": e.time, "by": e.actor_name.clone().or(e.actor_id.clone()), "actorKind": e.actor_kind,
             "ok": d["ok"], "reason": d["reason"], "checked": d["checked"], "broken": d["broken"], "firstBroken": d["firstBroken"],
-            "head": d["head"], "range": d["range"], "checkpoints": d["checkpoints"],
+            "head": d["head"], "range": d["range"], "checkpoints": d["checkpoints"], "archive": d.get("archive"),
         })
     });
     let events = app.db.audit_head();
