@@ -53,7 +53,7 @@ Option 3 for headers, option 1 for the cursor, option 1 for the count, option 1 
 - An MDR, a data lake, or the SIEM being moved to, can be added beside the SIEM in use without a proxy fanning events out, and each sees only its own token.
 - All SIEMs get the same lines, so `host`, `id` and `chainHash` match across them, and pins (`--pin`) can come from any of them.
 - Each SIEM down holds retention back. Alert on each sink's `pending`, now by `name`.
-- A Prometheus query that matched a named sink's series with exactly `{kind="webhook"}` and no other labels needs `name` too. Alerts such as `superbot_audit_export_failing == 1` match each sink unchanged.
+- Prometheus selectors such as `{kind="webhook"}` still match named sinks, but with several SIEMs they can return several series, so review aggregations and joins that expect one. Naming a running sink starts a new series (the old one, without `name`, ends). Alerts such as `superbot_audit_export_failing == 1` match each sink unchanged.
 - A typo in `AUDIT_EXPORT_HEADERS_<NAME>` isn't caught at startup (botd can't list every name a secret store holds): that webhook sends no headers, its SIEM refuses the batches, and the export fails loudly, naming the sink.
 - One URL can't be listed twice with two tokens. A collector that needs that can take one token, or two paths.
 - Later: checking checkpoint timestamp tokens from the archive, exporting each event's chain digest so contents can be checked after retention, and gzip.
