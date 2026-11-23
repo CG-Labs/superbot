@@ -5592,6 +5592,11 @@ impl Db {
         self.c().execute("UPDATE service_tokens SET expires_at = ?1 WHERE id = ?2", params![expires_at, id]).unwrap();
     }
 
+    #[cfg(test)]
+    pub fn set_service_token_created(&self, id: &str, created_at: i64) {
+        self.c().execute("UPDATE service_tokens SET created_at = ?1 WHERE id = ?2", params![created_at, id]).unwrap();
+    }
+
     /// Notes a token's use, at most once a minute, so a busy integration doesn't write on
     /// every request.
     pub fn touch_service_token(&self, id: &str, at: i64, ip: Option<&str>) {
