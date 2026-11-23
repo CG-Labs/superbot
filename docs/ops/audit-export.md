@@ -1,6 +1,6 @@
 # Audit log: SIEM export and tamper evidence
 
-Every audit event is sealed onto a hash chain as it is written, so a changed, removed, added or reordered event shows. Every hour botd signs a checkpoint of the chain's head, and can have each one timestamped by an RFC 3161 time-stamping authority (TSA). botd can also send every event to your SIEM as it happens: JSON lines over HTTPS, or RFC 5424 syslog over TLS. The chain and checkpoints are always on and need nothing. Timestamps and the export are off until you set them. Design: [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md) and [ADR 0149](../adr/0149-signed-and-timestamped-audit-checkpoints.md).
+Every audit event is sealed onto a hash chain as it is written, so a changed, removed, added or reordered event shows. Every hour botd signs a checkpoint of the chain's head, and can have each one timestamped by an RFC 3161 time-stamping authority (TSA). botd can also send every event to your SIEM as it happens: JSON lines over HTTPS, or RFC 5424 syslog over TLS. Or it can archive them in batches to an S3 bucket with Object Lock, where nobody can change or delete them until their retention ends ([below](#archive-events-to-write-once-s3)). The chain and checkpoints are always on and need nothing. Timestamps and the export are off until you set them. Design: [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md), [ADR 0149](../adr/0149-signed-and-timestamped-audit-checkpoints.md) and [ADR 0153](../adr/0153-write-once-s3-audit-archive.md).
 
 ## Check the chain
 
@@ -161,7 +161,7 @@ Events are scrubbed when they are recorded: passwords, tokens, message text and 
 - Events go in id order. The last delivered id is saved, so after a restart or an outage botd carries on from there. Delivery is at least once: de-duplicate on `host` and `id`.
 - A failure is retried with backoff from 1 second up to 5 minutes, for as long as it takes. Events wait in the database meanwhile, and retention (`AUDIT_RETENTION_DAYS`) never deletes an event the sink hasn't taken, so a long outage grows the table instead of losing events.
 - An event botd can't read from the database (a damaged row) is a failure too: export stops before it and retries, rather than skip it. `botctl audit verify` names the row.
-- After 3 failures in a row botd logs a warning and records `audit.export_failing` with a `reason` of `delivery_failed`, `unreadable` or `cursor_unsaved`; `audit.export_recovered` follows when delivery resumes.
+- After 3 failures in a row botd logs a warning and records `audit.export_failing` with a `reason` of `delivery_failed`, `unreadable`, `cursor_unsaved` or, for the S3 archive, `not_write_once`; `audit.export_recovered` follows when delivery resumes.
 - `botctl audit siem` (or `GET /api/audit/siem`) shows the sink, the last delivered id, how many are pending, whether it's failing, and the last error. With metrics on, `/metrics` has `superbot_audit_export_pending_events`, `superbot_audit_export_failing` and `superbot_audit_export_last_delivery_timestamp_seconds`. Alert on `superbot_audit_export_failing == 1` or a growing pending count.
 
 ### Examples
@@ -190,6 +190,41 @@ With Compose, run the collector on the `superbot_default` network and set `AUDIT
 ### Changing the sink
 
 The cursor is kept per sink URL. A new URL starts as `AUDIT_EXPORT_START` says; switching back to an old URL resumes where it stopped. To send everything again to the same sink, use a different path or remove its row from `settings` while botd is stopped. The row's key is `audit_export:` and the sink with its port always written, defaults included, and for a webhook its path: `https://<collector>/ingest` is saved as `audit_export:https://<collector>:443/ingest`, and `syslog+tls://<host>` as `audit_export:syslog+tls://<host>:6514`.
+
+## Archive events to write-once S3
+
+Instead of a SIEM, `AUDIT_EXPORT` can name an S3 bucket. botd writes events there in batches, one JSON-lines object per batch, and each object is locked with S3 Object Lock: until its retention ends nobody can change or delete it, not botd, not root on the server, and in compliance mode not even the store account's root. It works with any S3-compatible store with Object Lock: AWS S3, MinIO, Backblaze B2, Wasabi, Ceph.
+
+Make the bucket with Object Lock on (it can only be turned on when the bucket is made, on most stores), and give it a default retention, for example compliance mode for 7 years (2555 days). Then:
+
+```sh
+AUDIT_EXPORT=s3://<bucket>/<prefix>
+AUDIT_EXPORT_S3_ENDPOINT=https://s3.<region>.amazonaws.com
+AUDIT_EXPORT_S3_REGION=<region>
+AUDIT_EXPORT_S3_ACCESS_KEY_ID=<key id>
+AUDIT_EXPORT_S3_SECRET_ACCESS_KEY=<secret>
+```
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `AUDIT_EXPORT` | `off` | `s3://<bucket>[/<prefix>]`. The prefix defaults to `superbot-audit`; give each server its own |
+| `AUDIT_EXPORT_S3_ENDPOINT` | none | The store's address, `https://host[:port]` (`http://` only to loopback, for a local MinIO) |
+| `AUDIT_EXPORT_S3_REGION` | `us-east-1` | The region requests are signed for (`auto` for R2) |
+| `AUDIT_EXPORT_S3_ACCESS_KEY_ID`, `AUDIT_EXPORT_S3_SECRET_ACCESS_KEY` (or `_FILE`) | none | The store's keys. The secret is redacted everywhere and no Bot gets it; with `SECRETS_BACKEND=vault` both can live in Vault |
+| `AUDIT_EXPORT_S3_LOCK` | `bucket` | `bucket`: the bucket's default retention locks each object (botd checks there is one). `compliance` or `governance`: botd locks each object itself for `AUDIT_EXPORT_S3_RETAIN_DAYS`. `off`: a plain bucket, nothing locked |
+| `AUDIT_EXPORT_S3_RETAIN_DAYS` | none | 1 to 36500, with `compliance` or `governance` only |
+| `AUDIT_EXPORT_S3_BATCH_SECONDS` | `300` | A batch goes when its oldest event is this old, or at 10,000 events. 0 sends each batch at once |
+
+The key botd uses needs only `s3:PutObject`, `s3:GetObject` and `s3:GetBucketObjectLockConfiguration` on the bucket. Don't give it `s3:BypassGovernanceRetention` or delete rights.
+
+- **Objects** are `<prefix>/<yyyy>/<mm>/<dd>/<first id>-<last id>.jsonl`, dated by their first event, ids padded to 20 digits so they list in order. Each holds the same lines the webhook gets ([above](#what-arrives)), so each event's `chainPrev` is the previous event's `chainHash` across objects too, and checkpoints can be checked from the archive with OpenSSL. Metadata: `x-amz-meta-superbot-first-id`, `-last-id`, `-events`, `-chain-prev` (the first event's link), `-chain-head` (the last event's hash) and `-schema`.
+- **Proof of the lock.** Before the first batch, botd checks that the bucket has Object Lock on (and a default retention with `bucket`). After writing each object it reads it back, and the object must have a version and a lock: the mode asked for and at least the date asked for, or with `bucket`, a date in the future. If not, nothing counts as delivered, retention keeps the events, and after 3 tries `audit.export_failing` is recorded with `reason` `not_write_once`. A store that takes the lock headers and keeps nothing can't pass.
+- **Retries** write the same events to the same key, so an object written whose cursor wasn't saved gets a second, identical version, not an overlapping object.
+- **Status**: `botctl audit siem` shows `kind: "s3"` and `archive`, with the bucket, lock and the last object written (key, version, events, lock mode and `retainUntil`). The app's audit log says when the last object's lock ends.
+
+Read it back with any S3 tool, for example `aws s3 cp --recursive s3://<bucket>/<prefix>/ ./audit/`, then `cat audit/*/*/*/*.jsonl | jq -c '{id, chainPrev, chainHash}'` to see the chain run through. Pin a hash from it with `botctl audit verify --pin <id>:<chainHash>`.
+
+Erased users' data stays in locked objects until their lock ends, like a SIEM or a backup: choose the period with your DPA in mind.
 
 ## Retention and erasure
 
