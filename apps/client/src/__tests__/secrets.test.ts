@@ -1,4 +1,4 @@
-import { normalizeSecretName, savedLine, secretNameProblem, secretValueProblem } from "../secrets";
+import { managedIn, normalizeSecretName, savedLine, secretNameProblem, secretValueProblem } from "../secrets";
 
 describe("personal secret names and values (ADR 0044)", () => {
   it("turns what people type into an environment variable name", () => {
@@ -32,5 +32,16 @@ describe("personal secret names and values (ADR 0044)", () => {
     expect(savedLine({ name: "A", createdAt: nov3, updatedAt: nov3 + 60 })).toBe("Saved 3 Nov 2026");
     expect(savedLine({ name: "A", createdAt: nov3, updatedAt: nov20 })).toBe("Saved 3 Nov 2026 · replaced 20 Nov 2026");
     expect(savedLine({ name: "A", updatedAt: nov20 })).toBe("Saved 20 Nov 2026");
+    expect(savedLine({ name: "A", store: "sealed", saved: true, createdAt: nov3, updatedAt: nov3 })).toBe("Saved 3 Nov 2026");
+  });
+
+  it("says who keeps a secret held in an external store (ADR 0174)", () => {
+    expect(managedIn({ name: "A", updatedAt: 1 })).toBeNull();
+    expect(managedIn({ name: "A", store: "sealed" })).toBeNull();
+    expect(managedIn({ name: "A", store: "gcp-secret-manager" })).toBe("GCP Secret Manager");
+    expect(managedIn({ name: "A", store: "azure-keyvault" })).toBe("Azure Key Vault");
+    expect(managedIn({ name: "A", store: "new-backend" })).toBe("new-backend");
+    expect(savedLine({ name: "A", store: "vault", saved: false })).toBe("Set for you by an admin in HashiCorp Vault");
+    expect(savedLine({ name: "A" })).toBe("Saved");
   });
 });

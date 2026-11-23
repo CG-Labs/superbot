@@ -205,11 +205,19 @@ export interface BillingEmails {
 /** One of your own secrets, as `/api/me/secrets` lists it (ADR 0029, 0044). Never the value. */
 export interface PersonalSecret {
   name: string;
-  /** Unix seconds. Older servers send only `updatedAt`. */
+  /** Unix seconds. Older servers send only `updatedAt`; neither comes for a value you never saved (`saved: false`). */
   createdAt?: number;
-  updatedAt: number;
+  updatedAt?: number;
   /** The server has a secret of this name for every Bot; yours wins for your Bots. */
   overrides?: boolean;
+  /**
+   * Where the value your Bots get comes from: `sealed` (saved here), or the external store an
+   * admin keeps your folder in (`vault`, `azure-keyvault`, `gcp-secret-manager`, `aws`; ADR 0174),
+   * which you can't change from here. Older servers leave it out: saved here.
+   */
+  store?: string;
+  /** You saved one here. False for a value only in your external folder. */
+  saved?: boolean;
 }
 
 export type Visibility = "private" | "shared";
