@@ -308,6 +308,18 @@ fn yaml_value(s: &str) -> String {
     quoted(s).unwrap_or_else(|| s.to_string())
 }
 
+/// A YAML block scalar's header (`>`, `|-`, `>+2`, then perhaps a comment), unquoted:
+/// Some(true) when its lines fold.
+fn block_header(v: &str) -> Option<bool> {
+    let head = v.split(" #").next().unwrap_or_default().trim();
+    let fold = match head.chars().next()? {
+        '>' => true,
+        '|' => false,
+        _ => return None,
+    };
+    head[1..].chars().all(|c| c == '-' || c == '+' || c.is_ascii_digit()).then_some(fold)
+}
+
 /// `.grype.yaml`'s `ignore:` list: each entry's vulnerability, package, location and reason.
 pub fn grype_accepted(text: &str) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
@@ -348,12 +360,14 @@ pub fn grype_accepted(text: &str) -> Vec<Value> {
         }
         let Some(e) = out.last_mut() else { continue };
         let Some((k, v)) = field.split_once(':') else { continue };
-        let v = yaml_value(v);
-        if k.trim() == "reason" && (v.starts_with('>') || v.starts_with('|')) {
-            let key_at = indent(raw) + if item { 2 } else { 0 };
-            block = Some((key_at, v.starts_with('>'), Vec::new()));
-            continue;
+        if k.trim() == "reason" {
+            if let Some(fold) = block_header(v) {
+                let key_at = indent(raw) + if item { 2 } else { 0 };
+                block = Some((key_at, fold, Vec::new()));
+                continue;
+            }
         }
+        let v = yaml_value(v);
         match k.trim() {
             "vulnerability" if !v.is_empty() => e["id"] = json!(v),
             "name" if !v.is_empty() => e["package"] = json!(v),
@@ -698,6 +712,8 @@ mod tests {
         let blocks = grype_accepted("ignore:\n  - vulnerability: CVE-4\n    reason: >\n      folded over\n      two lines\n    package:\n      name: zlib\n  - vulnerability: CVE-5\n    reason: |-\n      kept\n      apart\n  - vulnerability: CVE-6\n    reason: >\n");
         assert_eq!(blocks.iter().map(|f| (f["id"].as_str().unwrap(), f["reason"].as_str(), f["hasReason"].as_bool().unwrap())).collect::<Vec<_>>(), [("CVE-4", Some("folded over two lines"), true), ("CVE-5", Some("kept\napart"), true), ("CVE-6", None, false)], "block scalars keep their text, and an empty one is no reason");
         assert_eq!(blocks[0]["package"], "zlib");
+        let quoted_marks = grype_accepted("ignore:\n  - vulnerability: CVE-7\n    reason: \"> 30 days needed upstream\"\n  - vulnerability: CVE-8\n    reason: |-  # a comment\n      kept\n");
+        assert_eq!(quoted_marks.iter().map(|f| f["reason"].as_str()).collect::<Vec<_>>(), [Some("> 30 days needed upstream"), Some("kept")], "a quoted reason starting with > is text, not a block");
         let g = grype_accepted("ignore:\n  # CVE-YYYY-NNNNN example\n  - vulnerability: CVE-1\n    package:\n      name: zlib\n  - vulnerability: \"CVE-2\"\n    reason: 'fixed upstream'\nother:\n  - vulnerability: CVE-3\n");
         assert_eq!(g.iter().map(|f| (f["id"].as_str().unwrap(), f["reason"].as_str())).collect::<Vec<_>>(), [("CVE-1", None), ("CVE-2", Some("fixed upstream"))]);
     }
