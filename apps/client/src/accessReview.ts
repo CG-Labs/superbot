@@ -56,6 +56,7 @@ export function machineLabel(p: AccessReviewPerson): string {
 const SERVICE_FLAGS: Record<string, string> = {
   disabled: "Disabled",
   owner_inactive: "Owner inactive",
+  owner_off_team: "Owner off its team",
   unscoped_token: "Token with everything",
   unused_token: "Token unused 90 days",
 };
@@ -72,11 +73,12 @@ export function ownerLabel(s: AccessReviewServiceAccount): string {
   return s.ownerActive ? who : `${who} (inactive)`;
 }
 
-/** "member · Exporter", with its team when it acts in one. */
+/** "member · Exporter", with its team, and whether it acts there (ADR 0188). */
 export function serviceRoleLabel(s: AccessReviewServiceAccount): string {
   const custom = s.customRole ?? s.team?.customRole;
   const role = [s.role, custom?.name].filter(Boolean).join(" · ");
-  return s.team ? `${role}, in ${s.team.name}` : role;
+  if (!s.team) return role;
+  return s.ownerOnTeam === false ? `${role}, in ${s.team.name} (acts in no team)` : `${role}, in ${s.team.name}`;
 }
 
 /** What its tokens can use today, or "Nothing" while it or its owner can't act. */

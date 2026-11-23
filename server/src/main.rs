@@ -175,6 +175,8 @@ mod scim_google_http_tests;
 #[cfg(test)]
 mod scim_group_roles_http_tests;
 #[cfg(test)]
+mod scim_role_groups_http_tests;
+#[cfg(test)]
 mod scim_groups_http_tests;
 #[cfg(test)]
 mod scim_http_tests;
@@ -1062,6 +1064,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/machine/backups", get(machines::backup::list).post(machines::backup::create))
         .route("/users/{key}/machine/restore", get(machines::backup::restore_status).post(machines::backup::restore_request))
         .route("/users/{key}/machine/harnesses", post(machines::upkeep::harnesses_now))
+        .route("/machines/harness-mirror", get(machines::mirror::check_now))
         .route("/users/{key}/machine/bot-user", post(machines::botuser::now_for))
         .route("/users/{key}/machine/screens", get(machines::screens::list))
         .route("/users/{key}/machine/screens/{bot}", axum::routing::delete(machines::screens::close_now))
@@ -1149,6 +1152,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/scim/groups/{team}", delete(scim::groups::unlink))
         .route("/scim/role-mappings", get(scim::roles::list).post(scim::roles::create))
         .route("/scim/role-mappings/{id}", get(scim::roles::get).delete(scim::roles::delete))
+        .route("/scim/role-groups", get(scim::role_groups::list).post(scim::role_groups::create_api))
+        .route("/scim/role-groups/{id}", get(scim::role_groups::get_api).patch(scim::role_groups::update_api).delete(scim::role_groups::delete_api))
         .route("/scim/google", get(scim::google::status))
         .route("/scim/google/sync", post(scim::google::sync))
         .route("/status/incidents", get(status::list).post(status::create))

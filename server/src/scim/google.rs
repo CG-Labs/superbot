@@ -53,6 +53,9 @@ pub struct Settings {
     pub groups: Vec<String>,
     /// Group emails that are teams too (SCIM_GROUPS=on). Their members get an account.
     pub teams: Vec<String>,
+    /// Group emails that are SCIM role groups (ADR 0180), once an admin declares them in
+    /// the tenant by email. Being in one gives no account.
+    pub role_groups: Vec<String>,
     /// A Google SSO provider: each user's Directory id is their subject there, so they
     /// sign in to the account the sync made.
     pub sso: Option<String>,
@@ -90,8 +93,15 @@ impl Settings {
         if !teams.is_empty() && !scim.groups {
             return Err("GOOGLE_DIRECTORY_TEAM_GROUPS needs SCIM_GROUPS=on: those groups become teams.".into());
         }
-        if groups.len() + teams.len() > MAX_GROUPS {
-            return Err(format!("GOOGLE_DIRECTORY_GROUPS and GOOGLE_DIRECTORY_TEAM_GROUPS name at most {MAX_GROUPS} groups together"));
+        let role_groups = group_list("GOOGLE_DIRECTORY_ROLE_GROUPS", &var("GOOGLE_DIRECTORY_ROLE_GROUPS"))?;
+        if !role_groups.is_empty() && !(scim.groups && scim.group_roles) {
+            return Err("GOOGLE_DIRECTORY_ROLE_GROUPS needs SCIM_GROUPS=on and SCIM_GROUP_ROLES=on: those groups give custom roles.".into());
+        }
+        if let Some(g) = role_groups.iter().find(|g| teams.contains(g)) {
+            return Err(format!("{g} is in GOOGLE_DIRECTORY_TEAM_GROUPS and GOOGLE_DIRECTORY_ROLE_GROUPS: a group is a team or a role group, not both"));
+        }
+        if groups.len() + teams.len() + role_groups.len() > MAX_GROUPS {
+            return Err(format!("GOOGLE_DIRECTORY_GROUPS, GOOGLE_DIRECTORY_TEAM_GROUPS and GOOGLE_DIRECTORY_ROLE_GROUPS name at most {MAX_GROUPS} groups together"));
         }
         let sso = match var("GOOGLE_DIRECTORY_SSO").trim().to_ascii_lowercase() {
             p if p.is_empty() => None,
@@ -118,7 +128,12 @@ impl Settings {
         };
         let minutes = number(var, "GOOGLE_DIRECTORY_INTERVAL_MINUTES", 30, 5, 1440)?;
         let max_removals = number(var, "GOOGLE_DIRECTORY_MAX_REMOVALS", 10, 1, 1_000_000)?;
-        Ok(Some(Settings { tenant, customer, groups, teams, sso, admin, api, interval: Duration::from_secs(minutes as u64 * 60), max_removals }))
+        Ok(Some(Settings { tenant, customer, groups, teams, role_groups, sso, admin, api, interval: Duration::from_secs(minutes as u64 * 60), max_removals }))
+    }
+
+    /// Whether the group `key` gives its members an account.
+    fn gives_accounts(&self, key: &str) -> bool {
+        self.groups.iter().chain(&self.teams).any(|g| g == key)
     }
 }
 
@@ -355,13 +370,14 @@ impl Directory {
 
     pub fn describe(&self) -> String {
         let s = &self.settings;
-        let groups = s.groups.iter().chain(&s.teams).collect::<HashSet<_>>().len();
+        let groups = s.groups.iter().chain(&s.teams).chain(&s.role_groups).collect::<HashSet<_>>().len();
         format!(
-            "on, every {} minutes into the SCIM tenant {}; {groups} group{}, {} of them teams; {}; at most {} removals a pass",
+            "on, every {} minutes into the SCIM tenant {}; {groups} group{}, {} of them teams and {} role groups; {}; at most {} removals a pass",
             s.interval.as_secs() / 60,
             s.tenant,
             if groups == 1 { "" } else { "s" },
             s.teams.len(),
+            s.role_groups.len(),
             match &s.sso {
                 Some(p) => format!("users sign in with {p}"),
                 None => "no SSO link (GOOGLE_DIRECTORY_SSO)".into(),
@@ -446,7 +462,7 @@ impl Directory {
     async fn fetch(&self) -> Result<Snapshot, Failure> {
         let token = self.token().await?;
         let mut snap = Snapshot::default();
-        for key in self.settings.groups.iter().chain(&self.settings.teams) {
+        for key in self.settings.groups.iter().chain(&self.settings.teams).chain(&self.settings.role_groups) {
             if snap.groups.contains_key(key) {
                 continue;
             }
@@ -493,6 +509,7 @@ impl Directory {
             "customer": s.customer,
             "groups": s.groups,
             "teamGroups": s.teams,
+            "roleGroups": s.role_groups,
             "sso": s.sso,
             "admin": s.admin,
             "intervalMinutes": s.interval.as_secs() / 60,
@@ -679,6 +696,11 @@ struct Tally {
     teams_created: usize,
     teams_updated: usize,
     teams_deleted: usize,
+    role_groups_created: usize,
+    role_groups_updated: usize,
+    role_groups_deleted: usize,
+    /// Role groups listed that no admin declared: never pushed, or they'd be teams.
+    undeclared: Vec<String>,
     failures: Vec<Value>,
     failed: usize,
 }
@@ -755,9 +777,10 @@ pub async fn run(a: &Arc<Auth>, d: &Directory, trigger: Trigger) -> Result<Value
 async fn apply(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Caller, snap: Snapshot, force: bool) -> Result<Value, Failure> {
     let s = &d.settings;
     let tenant = s.tenant.as_str();
-    let everyone = snap.groups.values().any(|g| g.everyone);
-    let members: HashSet<&str> = snap.groups.values().flat_map(|g| g.users.iter().map(String::as_str)).collect();
-    let outside = members.iter().filter(|id| !snap.people.contains_key(**id)).count() + snap.groups.values().map(|g| g.outside).sum::<usize>();
+    let scoped: Vec<&Group> = snap.groups.iter().filter(|(k, _)| s.gives_accounts(k)).map(|(_, g)| g).collect();
+    let everyone = scoped.iter().any(|g| g.everyone);
+    let members: HashSet<&str> = scoped.iter().flat_map(|g| g.users.iter().map(String::as_str)).collect();
+    let outside = members.iter().filter(|id| !snap.people.contains_key(**id)).count() + scoped.iter().map(|g| g.outside).sum::<usize>();
     let people: Vec<&Person> = snap.people.values().filter(|p| everyone || members.contains(p.id.as_str())).collect();
     let live = all_users(app, tenant);
     // A create takes back a user the tenant deleted, or takes on the one their Google
@@ -819,6 +842,7 @@ async fn apply(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Caller, snap: S
     }
     if a.scim.groups {
         teams(a, app, d, c, &snap, &people, &mut t).await;
+        push_role_groups(a, app, d, c, &snap, &people, &mut t).await;
     }
     let doomed: HashSet<&str> = plan.delete.iter().map(String::as_str).collect();
     let now = all_users(app, tenant);
@@ -850,6 +874,7 @@ async fn apply(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Caller, snap: S
         "heldCount": plan.held.len(),
         "skippedSuspended": plan.skipped,
         "teams": { "created": t.teams_created, "updated": t.teams_updated, "deleted": t.teams_deleted },
+        "roleGroups": { "created": t.role_groups_created, "updated": t.role_groups_updated, "deleted": t.role_groups_deleted, "undeclared": t.undeclared },
         "failed": t.failed,
         "failures": t.failures,
     }))
@@ -983,6 +1008,61 @@ async fn teams(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Caller, snap: &
     }
 }
 
+/// The role groups (ADR 0180): each one an admin declared in the tenant, by the group's
+/// email (or its Directory id as externalId), is pushed with its members who have an
+/// account; one nobody declared is never pushed, as it would become a team, and is named
+/// in the summary instead. A declared group no longer listed is deleted, so its roles go
+/// and the declaration waits again. Unlike teams, people can be in any number of them.
+async fn push_role_groups(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Caller, snap: &Snapshot, people: &[&Person], t: &mut Tally) {
+    let tenant = d.settings.tenant.as_str();
+    let user_of = |gid: &str| app.db.scim_find(tenant, &ScimKey::ExternalId(gid.to_string())).filter(|u| u.deleted_at.is_none()).map(|u| u.user.id);
+    let in_scope: HashSet<&str> = people.iter().map(|p| p.id.as_str()).collect();
+    let st = || State(app.clone());
+    let ex = || Extension(a.clone());
+    let ca = || Extension(c.clone());
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut wanted = Vec::new();
+    for key in &d.settings.role_groups {
+        let Some(g) = snap.groups.get(key) else { continue };
+        if !seen.insert(g.id.as_str()) {
+            continue;
+        }
+        let declared = app.db.scim_role_group_find(tenant, Some(&g.id), None).or_else(|| app.db.scim_role_group_find(tenant, None, Some(key)));
+        let Some(declared) = declared else {
+            t.undeclared.push(key.clone());
+            continue;
+        };
+        let ids: Vec<&str> = if g.everyone { people.iter().map(|p| p.id.as_str()).collect() } else { g.users.iter().map(String::as_str).filter(|id| in_scope.contains(id)).collect() };
+        let mut members: Vec<String> = ids.into_iter().filter_map(user_of).collect();
+        members.sort();
+        members.dedup();
+        wanted.push((key, g, declared, members));
+    }
+    for x in role_groups::all_pushed(app, tenant).into_iter().filter(|x| !x.external_id.as_deref().is_some_and(|e| seen.contains(e))) {
+        let path = format!("/Groups/{}", x.id);
+        let ok = t.note(app, c, "DELETE", &path, groups::delete(st(), ex(), ca(), Path(x.id.clone())).await);
+        t.role_groups_deleted += ok as usize;
+    }
+    for (key, g, declared, members) in wanted {
+        let Some(declared) = app.db.scim_role_group(&declared.id) else { continue };
+        let v = json!({ "schemas": [groups::GROUP_SCHEMA], "displayName": key, "externalId": g.id, "members": members.iter().map(|m| json!({ "value": m })).collect::<Vec<_>>() });
+        let body = Ok(Bytes::from(v.to_string()));
+        if declared.provisioned_at.is_none() {
+            let d = groups::Doc { display_name: key.clone(), external_id: Some(g.id.clone()), members: Some(members) };
+            let ok = t.note(app, c, "POST", "/Groups", role_groups::push_declared(app, a, c, &declared.id, &d).await);
+            t.role_groups_created += ok as usize;
+            continue;
+        }
+        let now = role_groups::member_set(app, &declared);
+        if now == members.iter().cloned().collect() && declared.display_name == *key {
+            continue;
+        }
+        let path = format!("/Groups/{}", declared.id);
+        let ok = t.note(app, c, "PUT", &path, groups::replace(st(), ex(), ca(), HeaderMap::new(), Path(declared.id.clone()), body).await);
+        t.role_groups_updated += ok as usize;
+    }
+}
+
 /// Passes every GOOGLE_DIRECTORY_INTERVAL_MINUTES, the first a minute after start, and
 /// sooner again after one that failed.
 pub fn start(a: Arc<Auth>) {
@@ -1077,6 +1157,10 @@ mod tests {
         assert!(on(&[("GOOGLE_DIRECTORY_GROUPS", "")], &scim(false)).unwrap_err().contains("at least one group"));
         assert!(on(&[("GOOGLE_DIRECTORY_GROUPS", "not a group")], &scim(false)).is_err());
         assert!(on(&[("GOOGLE_DIRECTORY_TEAM_GROUPS", "eng@example.com")], &scim(false)).unwrap_err().contains("SCIM_GROUPS=on"));
+        assert!(on(&[("GOOGLE_DIRECTORY_ROLE_GROUPS", "audit@example.com")], &scim(true)).unwrap_err().contains("SCIM_GROUP_ROLES=on"));
+        let roles = Scim { group_roles: true, ..scim(true) };
+        assert_eq!(on(&[("GOOGLE_DIRECTORY_ROLE_GROUPS", "Audit@example.com")], &roles).unwrap().unwrap().role_groups, vec!["audit@example.com".to_string()]);
+        assert!(on(&[("GOOGLE_DIRECTORY_TEAM_GROUPS", "eng@example.com"), ("GOOGLE_DIRECTORY_ROLE_GROUPS", "eng@example.com")], &roles).unwrap_err().contains("not both"));
         let t = on(&[("GOOGLE_DIRECTORY_GROUPS", ""), ("GOOGLE_DIRECTORY_TEAM_GROUPS", "eng@example.com")], &scim(true)).unwrap().unwrap();
         assert_eq!((t.groups.len(), t.teams.clone()), (0, vec!["eng@example.com".to_string()]));
         assert_eq!(on(&[("GOOGLE_DIRECTORY_SSO", "G")], &scim(false)).unwrap().unwrap().sso.as_deref(), Some("g"));

@@ -51,7 +51,7 @@ fn view(app: &AppState, r: &CustomRole) -> Value {
         "permissions": perms.names(), "unknown": unknown,
         "effective": rbac::granted(Principal::User(r.base), perms),
         "users": users.len(), "teamMembers": teams.len(), "scimMappings": app.db.scim_role_mappings_of_role(&r.id).len(),
-        "samlMappings": app.db.saml_role_mappings_of_role(&r.id).len(),
+        "samlMappings": app.db.saml_role_mappings_of_role(&r.id).len(), "scimRoleGroups": app.db.scim_role_groups_of_role(&r.id).len(),
         "createdAt": r.created_at, "createdBy": r.created_by, "updatedAt": r.updated_at,
     })
 }
@@ -60,9 +60,11 @@ fn person(u: &User) -> Value {
     json!({ "id": u.id, "name": u.name, "email": u.email })
 }
 
-/// The SCIM mapping that gave `user_id` their role in `scope`, if one did (ADR 0138).
+/// The SCIM mapping (ADR 0138) or role group (ADR 0180) that gave `user_id` their role
+/// in `scope`, if one did.
 fn scim_source(app: &AppState, user_id: &str, scope: &str) -> Option<String> {
-    app.db.scim_role_grants_of_user(user_id).into_iter().find(|g| g.scope == scope).map(|g| g.mapping_id)
+    let mapped = app.db.scim_role_grants_of_user(user_id).into_iter().find(|g| g.scope == scope).map(|g| g.mapping_id);
+    mapped.or_else(|| (scope == "org").then(|| app.db.scim_role_group_grant_of_user(user_id)).flatten().map(|g| g.group_id))
 }
 
 /// The SAML mapping that gave `user_id` their role across the server, if one did (ADR 0160).
