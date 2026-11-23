@@ -2145,7 +2145,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 63] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 64] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -2209,7 +2209,37 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 63] = [
     migrate_scim_enterprise,
     migrate_scim_role_groups,
     migrate_scim_token_expiry,
+    migrate_saml_cert_notices,
 ];
+
+/// Which expiry notice was audited for each certificate a native SAML provider uses
+/// (ADR 0198): `expiring`, then `expired`, once each.
+fn migrate_saml_cert_notices(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS saml_cert_notices (
+          provider TEXT NOT NULL,
+          role TEXT NOT NULL,
+          sha256 TEXT NOT NULL,
+          notice TEXT NOT NULL,
+          at INTEGER NOT NULL,
+          PRIMARY KEY (provider, role, sha256)
+        );",
+    )
+}
+
+/// Claims `notice` (`expiring` or `expired`) for one of a SAML provider's certificates, on
+/// `c` (inside the transaction that audits it): `expiring` only if it had no notice, `expired`
+/// only if it hadn't had that one. False when it was already given.
+pub(crate) fn claim_saml_cert_notice(c: &Connection, provider: &str, role: &str, sha256: &str, notice: &str, at: i64) -> rusqlite::Result<bool> {
+    let sql = if notice == "expired" {
+        "INSERT INTO saml_cert_notices (provider, role, sha256, notice, at) VALUES (?1, ?2, ?3, 'expired', ?4)
+         ON CONFLICT (provider, role, sha256) DO UPDATE SET notice = 'expired', at = excluded.at WHERE notice <> 'expired'"
+    } else {
+        "INSERT INTO saml_cert_notices (provider, role, sha256, notice, at) VALUES (?1, ?2, ?3, 'expiring', ?4)
+         ON CONFLICT (provider, role, sha256) DO NOTHING"
+    };
+    Ok(c.execute(sql, params![provider, role, sha256, at])? == 1)
+}
 
 /// SCIM tokens expire and rotate (ADR 0196). Tokens made before this keep a null
 /// `expires_at` and work as before: expiring them on upgrade would stop deprovisioning.

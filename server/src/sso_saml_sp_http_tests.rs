@@ -1576,3 +1576,116 @@ async fn an_idp_initiated_post_restarts_and_the_restarted_sign_in_is_held_to_the
     let (code, _, head) = sp.post(Some(&r.posted()), Some(&relay), &binder).await;
     assert_eq!((code, signed_in_as(sp.port, &head).await), (200, Some(u.id)));
 }
+
+// Certificates ending (ADR 0198)
+
+/// A PEM certificate for a new RSA key, ending `days` from now, and the key.
+fn cert_ending_in(days: i64) -> (String, rcgen::KeyPair) {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name.push(rcgen::DnType::CommonName, "ending");
+    params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(days);
+    (params.self_signed(&key).unwrap().pem(), key)
+}
+
+fn base64_of(pem: &str) -> String {
+    pem.lines().filter(|l| !l.starts_with("-----")).collect()
+}
+
+#[tokio::test]
+async fn certificates_ending_are_shown_and_audited_once_each() {
+    use crate::sso::saml_expiry;
+    use crate::sso::xmldsig::test_signer::signers;
+    let dir = std::env::temp_dir().join(format!("saml-ending-{}", random_hex(4)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (sp_pem, sp_key) = cert_ending_in(10);
+    let cert_file = dir.join("sp.pem");
+    std::fs::write(&cert_file, &sp_pem).unwrap();
+    let mut providers = Vec::new();
+    let sp = serve_with(&[("SP_CERT_FILE", &cert_file.to_string_lossy())], |a| providers = a.sso.providers.clone()).await;
+    crate::secrets::global().put(&format!("SSO_{}_PRIVATE_KEY", sp.id.to_ascii_uppercase()), &sp_key.serialize_pem()).unwrap();
+    let http = reqwest::Client::new();
+    let check = |at: i64| saml_expiry::check(&sp.app, &providers, &http, std::time::Duration::ZERO, at);
+
+    // The IdP's only certificate ends in 5 days.
+    let (idp_pem, _) = cert_ending_in(5);
+    let ending = base64_of(&idp_pem);
+    let import = |xml: String| {
+        let (port, id, admin) = (sp.port, sp.id.clone(), sp.admin.clone());
+        async move { call(port, "PUT", &format!("/api/sso/{id}/saml/idp-metadata"), &admin, &json!({ "xml": xml }).to_string()).await }
+    };
+    assert_eq!(import(test_idp::metadata().replace(&signers()[0].cert, &ending)).await.0, 200);
+    let ending_sha = crate::sso::xmldsig::Cert::from_base64(&ending).unwrap().sha256;
+    let sp_sha = crate::sso::xmldsig::Cert::from_base64(&base64_of(&sp_pem)).unwrap().sha256;
+
+    let v = sp.view().await;
+    assert_eq!((v["spKey"]["certificate"]["expiry"].as_str(), v["spKey"]["certificate"]["daysLeft"].as_i64()), (Some("expiring"), Some(10)), "{v}");
+    assert_eq!((v["idp"]["certificates"][0]["expiry"].as_str(), v["idp"]["certificates"][0]["daysLeft"].as_i64()), (Some("expiring"), Some(5)));
+    let w = v["certificateWarnings"].as_array().unwrap();
+    assert_eq!(w.len(), 2, "{w:?}");
+    let (sp_w, idp_w) = (&w[0], &w[1]);
+    assert_eq!((sp_w["role"].as_str(), sp_w["from"].as_str(), sp_w["certificate"].as_str(), sp_w["replacement"].clone()), (Some("sp_signing"), Some("secret"), Some(sp_sha.as_str()), Value::Null));
+    assert!(sp_w["action"].as_str().unwrap().contains("_SP_CERT_FILE"), "{sp_w}");
+    assert_eq!((idp_w["role"].as_str(), idp_w["from"].as_str(), idp_w["state"].as_str(), idp_w["daysLeft"].as_i64()), (Some("idp_signing"), Some("botctl"), Some("expiring"), Some(5)));
+    assert!(idp_w["action"].as_str().unwrap().contains(&format!("botctl sso saml {} import", sp.id)), "{idp_w}");
+
+    // Audited once each, however often botd looks.
+    let now = db::now();
+    assert_eq!(check(now).await, 2);
+    assert_eq!(check(now + 60_000).await, 0, "already warned");
+    let warned = sp.audit("sso.saml_certificate_expiring").await;
+    assert_eq!(warned.len(), 2);
+    for e in &warned {
+        assert_eq!((e["outcome"].as_str(), e["targetType"].as_str(), e["targetId"].as_str(), e["actorKind"].as_str()), (Some("success"), Some("sso_provider"), Some(sp.id.as_str()), Some("system")), "{e}");
+    }
+    let idp_e = warned.iter().find(|e| e["details"]["role"] == "idp_signing").unwrap();
+    assert_eq!((idp_e["details"]["certificate"].as_str(), idp_e["details"]["daysLeft"].as_i64(), idp_e["details"]["replacement"].clone()), (Some(ending_sha.as_str()), Some(5), Value::Null));
+
+    // Listed twice, it's still one certificate, and one that isn't covered.
+    let and_then = |cert: &str| format!(r#"{ending}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor><md:KeyDescriptor use="signing"><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}"#);
+    assert_eq!(import(test_idp::metadata().replace(&signers()[0].cert, &and_then(&ending))).await.0, 200);
+    let w = sp.view().await["certificateWarnings"].clone();
+    assert_eq!((w.as_array().unwrap().len(), w[1]["replacement"].clone()), (2, Value::Null), "{w}");
+
+    // The IdP publishes its next certificate: the ending one is covered, and nothing more is audited.
+    assert_eq!(import(test_idp::metadata().replace(&signers()[0].cert, &and_then(&signers()[0].cert))).await.0, 200);
+    let w = sp.view().await["certificateWarnings"].clone();
+    let idp_w = w.as_array().unwrap().iter().find(|w| w["role"] == "idp_signing").unwrap();
+    assert_eq!(idp_w["replacement"].as_str(), Some(signers()[0].cert().sha256.as_str()));
+    assert!(idp_w["action"].as_str().unwrap().contains("already has a newer certificate"), "{idp_w}");
+    assert_eq!(check(now + 120_000).await, 0);
+
+    // Past both ends: botd's own certificate is a failure, the IdP's replaced one isn't.
+    let later = now + 11 * 86_400_000;
+    assert_eq!(check(later).await, 2);
+    assert_eq!(check(later + 60_000).await, 0);
+    let expired = sp.audit("sso.saml_certificate_expired").await;
+    let outcome = |role: &str| expired.iter().find(|e| e["details"]["role"] == role).map(|e| (e["outcome"].as_str().unwrap().to_string(), e["details"]["daysLeft"].as_i64()));
+    assert_eq!(outcome("sp_signing"), Some(("failure".into(), Some(0))));
+    assert_eq!(outcome("idp_signing"), Some(("success".into(), Some(0))));
+    assert_eq!(sp.audit("sso.saml_certificate_expiring").await.len(), 2, "no warning after the end");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn generated_keys_and_their_next_keys_are_checked_without_making_any() {
+    use crate::sso::saml_expiry;
+    let mut providers = Vec::new();
+    let sp = serve_with(&[("ENCRYPTED_ASSERTIONS", "allow")], |a| providers = a.sso.providers.clone()).await;
+    let http = reqwest::Client::new();
+    let now = db::now();
+    assert_eq!(saml_expiry::check(&sp.app, &providers, &http, std::time::Duration::ZERO, now).await, 0, "20-year certificates");
+    assert_eq!(sp.key_step("POST", "signing", "next").await.0, 200);
+    let made = sp.audit("sso.saml_sp_key_created").await.len();
+    // Near the end of the generated certificates' 20 years.
+    let late = now + (20 * 365 - 10) * 86_400_000;
+    let n = saml_expiry::check(&sp.app, &providers, &http, std::time::Duration::ZERO, late).await;
+    let warned = sp.audit("sso.saml_certificate_expiring").await;
+    let mut got: Vec<(String, String)> = warned.iter().map(|e| (e["details"]["role"].as_str().unwrap().into(), e["details"]["stage"].as_str().unwrap().into())).collect();
+    got.sort();
+    let want = [("sp_encryption", "current"), ("sp_signing", "current"), ("sp_signing", "next")].map(|(r, s)| (r.to_string(), s.to_string()));
+    assert_eq!(got, want, "the import's view made the encryption key");
+    assert_eq!(n, want.len(), "the test IdP's certificate lasts past then");
+    assert_eq!(sp.audit("sso.saml_sp_key_created").await.len(), made, "checking makes no key");
+    assert_eq!(sp.view().await["certificateWarnings"], json!([]), "not yet, today");
+}

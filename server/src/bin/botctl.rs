@@ -1608,13 +1608,28 @@ fn saml_summary(v: &Value) -> String {
         s("metadataUrl"),
         s("idpEntityId"),
     );
+    let warnings = v["certificateWarnings"].as_array().map(Vec::as_slice).unwrap_or_default();
+    if !warnings.is_empty() {
+        out += "  Certificate warnings:\n";
+    }
+    for w in warnings {
+        let what = match w["role"].as_str() {
+            Some("sp_signing") => "SP signing certificate",
+            Some("sp_encryption") => "SP encryption certificate",
+            Some("idp_signing") => "IdP signing certificate",
+            _ => "IdP metadata signing certificate",
+        };
+        let stage = if w["stage"] == "next" { " (next key)" } else { "" };
+        out += &format!("    {what}{stage} SHA-256 {} expires {}{}\n      {}\n", w["certificate"].as_str().unwrap_or_default(), day(&w["notAfter"]), ending(w), w["action"].as_str().unwrap_or_default());
+    }
     let key = &v["spKey"];
     if let Some(c) = key["certificate"].as_object() {
         out += &format!(
-            "  SP signing certificate:   SHA-256 {} ({}), expires {}\n",
+            "  SP signing certificate:   SHA-256 {} ({}), expires {}{}\n",
             c["sha256"].as_str().unwrap_or_default(),
             key["from"].as_str().unwrap_or_default(),
-            day(&c["notAfter"])
+            day(&c["notAfter"]),
+            ending(&key["certificate"])
         );
     } else if let Some(p) = key["problem"].as_str() {
         out += &format!("  SP signing key:           {p}\n");
@@ -1623,10 +1638,11 @@ fn saml_summary(v: &Value) -> String {
     let enc = &v["spEncryptionKey"];
     if let Some(c) = enc["certificate"].as_object() {
         out += &format!(
-            "  SP encryption certificate: SHA-256 {} ({}), expires {}\n",
+            "  SP encryption certificate: SHA-256 {} ({}), expires {}{}\n",
             c["sha256"].as_str().unwrap_or_default(),
             enc["from"].as_str().unwrap_or_default(),
-            day(&c["notAfter"])
+            day(&c["notAfter"]),
+            ending(&enc["certificate"])
         );
     } else if let Some(p) = enc["problem"].as_str() {
         out += &format!("  SP encryption key:        {p}\n");
@@ -1649,7 +1665,7 @@ fn saml_summary(v: &Value) -> String {
         }
     );
     for c in v["metadataSigningCertificates"].as_array().into_iter().flatten() {
-        out += &format!("    Trusted signer: SHA-256 {} ({}), expires {}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]));
+        out += &format!("    Trusted signer: SHA-256 {} ({}), expires {}{}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]), ending(c));
     }
     let yes = |b: bool| if b { "yes" } else { "no" };
     out += &format!(
@@ -1693,7 +1709,7 @@ fn saml_summary(v: &Value) -> String {
         out += &format!("    Logout URL:  {slo}\n");
     }
     for c in idp["certificates"].as_array().into_iter().flatten() {
-        out += &format!("    Certificate SHA-256 {} ({}), expires {}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]));
+        out += &format!("    Certificate SHA-256 {} ({}), expires {}{}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]), ending(c));
     }
     out
 }
@@ -1714,13 +1730,24 @@ fn rollover_lines(key: &Value) -> String {
     }
     let next = &key["next"];
     if let Some(c) = next["certificate"].as_object() {
-        out += &format!("    Next: SHA-256 {}, expires {}: published, not yet in use{}\n", c["sha256"].as_str().unwrap_or_default(), day(&c["notAfter"]), used(next));
+        out += &format!("    Next: SHA-256 {}, expires {}{}: published, not yet in use{}\n", c["sha256"].as_str().unwrap_or_default(), day(&c["notAfter"]), ending(&next["certificate"]), used(next));
     }
     let prev = &key["previous"];
     if let Some(c) = prev["certificate"].as_object() {
         out += &format!("    Previous: SHA-256 {}: no longer published, still decrypts until retired{}\n", c["sha256"].as_str().unwrap_or_default(), used(prev));
     }
     out
+}
+
+/// After a certificate's end date: nothing while it's far off, else how soon it ends or that
+/// it has (ADR 0198).
+fn ending(c: &Value) -> String {
+    let days = c["daysLeft"].as_i64().unwrap_or_default();
+    match c["expiry"].as_str().or(c["state"].as_str()) {
+        Some("expired") => " (expired)".into(),
+        Some("expiring") => format!(" (in {days} day{})", if days == 1 { "" } else { "s" }),
+        _ => String::new(),
+    }
 }
 
 fn ago(s: u64) -> String {
@@ -3225,6 +3252,29 @@ mod tests {
         v["authnContext"] = json!({ "required": ["mfa", "urn:okta:loa:2fa:any"], "methodsAttribute": "amr", "requested": false });
         let out = saml_summary(&v);
         assert!(out.contains("  Authentication context:   one of mfa, urn:okta:loa:2fa:any\n    Also read from attribute amr\n    Not requested: the IdP's own policy decides\n"), "{out}");
+    }
+
+    #[test]
+    fn saml_summary_warns_of_certificates_that_are_ending() {
+        let end = 1_900_000_000_000_i64;
+        let mut v = json!({ "provider": "corp", "label": "Corp", "idpEntityId": "https://idp.example/saml", "certificateWarnings": [] });
+        assert!(!saml_summary(&v).contains("Certificate warnings"));
+        v["spKey"] = json!({ "from": "secret", "certificate": { "sha256": "12:34", "subject": "CN=sp", "notAfter": end, "expiry": "expiring", "daysLeft": 1 } });
+        v["idp"] = json!({ "ssoUrl": "https://idp.example/sso", "certificates": [
+            { "sha256": "ab:cd", "subject": "CN=idp", "notAfter": end, "expiry": "expired", "daysLeft": 0 },
+            { "sha256": "ef:01", "subject": "CN=idp", "notAfter": end, "expiry": "ok", "daysLeft": 400 },
+        ] });
+        v["certificateWarnings"] = json!([
+            { "role": "sp_signing", "stage": null, "certificate": "12:34", "notAfter": end, "state": "expiring", "daysLeft": 1, "action": "Make a new key." },
+            { "role": "idp_signing", "stage": null, "certificate": "ab:cd", "notAfter": end, "state": "expired", "daysLeft": 0, "action": "Nothing to do." },
+            { "role": "sp_encryption", "stage": "next", "certificate": "56:78", "notAfter": end, "state": "expiring", "daysLeft": 12, "action": "Replace it." },
+        ]);
+        let out = saml_summary(&v);
+        assert!(out.contains("IdP entity ID:            https://idp.example/saml\n  Certificate warnings:\n    SP signing certificate SHA-256 12:34 expires 2030-03-17 (in 1 day)\n      Make a new key.\n"), "{out}");
+        assert!(out.contains("    IdP signing certificate SHA-256 ab:cd expires 2030-03-17 (expired)\n      Nothing to do.\n"), "{out}");
+        assert!(out.contains("    SP encryption certificate (next key) SHA-256 56:78 expires 2030-03-17 (in 12 days)\n"), "{out}");
+        assert!(out.contains("SP signing certificate:   SHA-256 12:34 (secret), expires 2030-03-17 (in 1 day)\n"), "{out}");
+        assert!(out.contains("    Certificate SHA-256 ab:cd (CN=idp), expires 2030-03-17 (expired)\n    Certificate SHA-256 ef:01 (CN=idp), expires 2030-03-17\n"), "{out}");
     }
 
     #[test]
