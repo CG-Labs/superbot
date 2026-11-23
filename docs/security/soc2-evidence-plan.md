@@ -75,7 +75,7 @@ The windows are the policy's unless `--windows` gives others, and the manifest r
 
 ## Checking the store's coverage
 
-Three tools make the bundles above on three schedules, and a month lost from any of them can't be made later. `superbot-evidence coverage` reads every bundle in the store, as a `.tar` or unpacked, at any depth, and reports on a period ([ADR 0166](../adr/0166-evidence-coverage-report.md)). It needs no token or network and never writes into the store.
+Three tools make the bundles above on three schedules, and a month lost from any of them can't be made later. `superbot-evidence coverage` reads every bundle in the store, as a `.tar` or unpacked, at any depth, and reports on a period ([ADR 0169](../adr/0169-evidence-coverage-report.md)). It needs no token or network and never writes into the store.
 
 - **Each bundle is checked** against its `SHA256SUMS` and manifest: every listed file exists with its digest, no file was added, the manifest's kind and period match the bundle's name, and every file its kind always has is there. A file changed after the bundle was made fails it, even with `SHA256SUMS` rewritten to match. The report lists each manifest's SHA-256 to compare with what was recorded when it was made.
 - **Coverage is by day**: for each kind of bundle month by month (complete, partial or missing), and for each checklist row and criterion a bundle names, the days of the period a bundle that checks covers and the gaps. With `--checklist`, also the rows no bundle collects evidence for: their evidence is records people keep.

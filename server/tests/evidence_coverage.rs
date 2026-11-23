@@ -1,4 +1,4 @@
-//! ADR 0166: `superbot-evidence coverage` over an evidence store holding the real botd's
+//! ADR 0169: `superbot-evidence coverage` over an evidence store holding the real botd's
 //! evidence bundles, one kept as its tar and one unpacked, in the evidence plan's
 //! per-criterion, per-month folders. Both check against the digests botd recorded; the
 //! kinds of bundle that aren't there are reported day by day; a file changed after the

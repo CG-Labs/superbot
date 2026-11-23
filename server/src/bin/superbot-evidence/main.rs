@@ -4,7 +4,7 @@
 //! protection, and every CI run on the branch. `vulnerabilities` (ADR 0086): every
 //! Dependabot and code scanning alert open in the period, judged against its severity's
 //! remediation window, and the findings accepted with a reason. Each is a dated bundle
-//! with SHA-256 digests beside botd's evidence bundles (ADR 0142). `coverage` (ADR 0166):
+//! with SHA-256 digests beside botd's evidence bundles (ADR 0142). `coverage` (ADR 0169):
 //! checks every bundle in an evidence store against its digests and reports the days of
 //! an observation period each kind of bundle, checklist row and criterion has none for.
 //!
@@ -24,7 +24,7 @@ mod vulns;
 use std::io::Write;
 use std::process::ExitCode;
 
-const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0086), and its coverage (ADR 0166).
+const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0086), and its coverage (ADR 0169).
 
   superbot-evidence github --repo <owner/name> [--branch <name>]
                     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>] [--no-titles]

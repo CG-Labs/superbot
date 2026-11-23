@@ -1,4 +1,4 @@
-//! `superbot-evidence coverage` (ADR 0166): checks an evidence store against an
+//! `superbot-evidence coverage` (ADR 0169): checks an evidence store against an
 //! observation period. Every bundle in it (botd's evidence bundles, ADR 0142; the
 //! change-management bundles, ADR 0148; the vulnerability bundles, ADR 0086) is checked
 //! against its own `SHA256SUMS` and manifest, and the report says which days of the period
@@ -578,7 +578,7 @@ fn gap_text(v: &Value) -> String {
 pub fn markdown(r: &Value) -> String {
     let s = &r["summary"];
     let mut o = format!(
-        "# SOC 2 evidence coverage, {} to {} (not included)\n\nMade by {} at {} from the bundles in an evidence store ([ADR 0166](https://github.com/CG-Labs/superbot/blob/main/docs/adr/0166-evidence-coverage-report.md)). {} bundles found: {} check, {} don't, {} cover this period; {} other files passed over.\n\n",
+        "# SOC 2 evidence coverage, {} to {} (not included)\n\nMade by {} at {} from the bundles in an evidence store ([ADR 0169](https://github.com/CG-Labs/superbot/blob/main/docs/adr/0169-evidence-coverage-report.md)). {} bundles found: {} check, {} don't, {} cover this period; {} other files passed over.\n\n",
         r["period"]["from"].as_str().unwrap_or_default(),
         r["period"]["to"].as_str().unwrap_or_default(),
         r["tool"].as_str().unwrap_or_default(),

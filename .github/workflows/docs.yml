@@ -84,7 +84,7 @@ jobs:
       # ADR 0148: the change-management bundle matches the evidence plan, and its workflow only reads.
       - run: cargo test --locked --bin superbot-evidence
       - run: cargo test --test change_evidence
-      # ADR 0166: the coverage report over the real botd's evidence bundles.
+      # ADR 0169: the coverage report over the real botd's evidence bundles.
       - run: cargo test --test evidence_coverage
 
   site:
