@@ -268,7 +268,8 @@ async fn run(app: Arc<App>, x: Arc<Exporter>) {
                     continue;
                 };
                 // Delivered only once the cursor is saved; if it can't be, the batch goes again.
-                out.send(&x.sink, &rows, &host)
+                let extras = crate::audit_checkpoint::export_extras(&app.db, &rows);
+                out.send(&x.sink, &rows, &extras, &host)
                     .await
                     .map_err(|e| ("delivery_failed", e))
                     .and_then(|()| app.db.set_audit_export_cursor(&x.sink.id, last).map_err(|e| ("cursor_unsaved", format!("couldn't save the export cursor: {e}"))))
@@ -321,25 +322,37 @@ fn printable(s: &str, max: usize) -> String {
 }
 
 /// One event as a JSON line: the API's shape, plus the schema and this host.
+#[cfg(test)]
 pub fn line(e: &AuditEvent, host: &str) -> String {
+    line_with(e, host, None)
+}
+
+/// [`line`], with a checkpoint event's signed record and token (ADR 0149) as `checkpoint`.
+pub fn line_with(e: &AuditEvent, host: &str, checkpoint: Option<&Value>) -> String {
     let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
     if let Some(o) = v.as_object_mut() {
         o.insert("schema".into(), json!(SCHEMA));
         o.insert("host".into(), json!(host));
+        if let Some(c) = checkpoint {
+            o.insert("checkpoint".into(), c.clone());
+        }
     }
     v.to_string()
 }
 
 /// One event as an RFC 5424 message: facility "log audit", severity by outcome, the
 /// action as MSGID, and the JSON line as the text.
-pub fn syslog(e: &AuditEvent, host: &str) -> String {
+pub fn syslog(e: &AuditEvent, host: &str, checkpoint: Option<&Value>) -> String {
     let severity = match e.outcome.as_str() {
         "denied" => 4,
         "failure" => 5,
         _ => 6,
     };
-    format!("<{}>1 {} {host} superbot {} {} - {}", FACILITY * 8 + severity, e.time, std::process::id(), printable(&e.action, 32), line(e, host))
+    format!("<{}>1 {} {host} superbot {} {} - {}", FACILITY * 8 + severity, e.time, std::process::id(), printable(&e.action, 32), line_with(e, host, checkpoint))
 }
+
+/// Checkpoint records to add to their events, by event id.
+type Extras = std::collections::BTreeMap<i64, Value>;
 
 trait Stream: tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncWrite + Unpin + Send> Stream for T {}
@@ -359,10 +372,10 @@ impl Out {
         }
     }
 
-    async fn send(&mut self, sink: &Sink, rows: &[AuditEvent], host: &str) -> Result<(), String> {
+    async fn send(&mut self, sink: &Sink, rows: &[AuditEvent], extras: &Extras, host: &str) -> Result<(), String> {
         match (self, &sink.kind) {
             (Out::Http(http), Kind::Webhook { url, headers, .. }) => {
-                let body: String = rows.iter().map(|e| line(e, host) + "\n").collect();
+                let body: String = rows.iter().map(|e| line_with(e, host, extras.get(&e.id)) + "\n").collect();
                 let mut req = http.post(url).header(reqwest::header::CONTENT_TYPE, "application/x-ndjson").body(body);
                 for (k, v) in headers {
                     req = req.header(k.as_str(), v.expose());
@@ -376,7 +389,7 @@ impl Out {
                 }
                 let mut frames = Vec::new();
                 for e in rows {
-                    let m = syslog(e, host);
+                    let m = syslog(e, host, extras.get(&e.id));
                     frames.extend(format!("{} ", m.len()).as_bytes());
                     frames.extend(m.as_bytes());
                 }
@@ -527,10 +540,10 @@ mod tests {
         let l: Value = serde_json::from_str(&line(&event("failure"), "host-1")).unwrap();
         assert_eq!((l["schema"].as_str(), l["host"].as_str(), l["id"].as_i64(), l["action"].as_str()), (Some(SCHEMA), Some("host-1"), Some(7), Some("auth.login_failed")));
         assert_eq!((l["chainPrev"].as_str(), l["chainHash"].as_str()), (Some(crate::audit_chain::GENESIS), Some("ab".repeat(32).as_str())));
-        let m = syslog(&event("failure"), "host-1");
+        let m = syslog(&event("failure"), "host-1", None);
         assert!(m.starts_with(&format!("<109>1 1970-01-01T00:00:00.000Z host-1 superbot {} auth.login_failed - {{", std::process::id())), "{m}");
-        assert!(syslog(&event("denied"), "h").starts_with("<108>1 "));
-        assert!(syslog(&event("success"), "h").starts_with("<110>1 "));
+        assert!(syslog(&event("denied"), "h", None).starts_with("<108>1 "));
+        assert!(syslog(&event("success"), "h", None).starts_with("<110>1 "));
         assert!(!m.contains('\n'));
         assert_eq!(printable("a b\u{e9}", 32), "a-b-");
         assert_eq!(printable("", 32), "-");

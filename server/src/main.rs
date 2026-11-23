@@ -18,6 +18,9 @@ mod audit;
 mod audit_chain;
 #[cfg(test)]
 mod audit_chain_http_tests;
+mod audit_checkpoint;
+#[cfg(test)]
+mod audit_checkpoint_http_tests;
 mod audit_export;
 #[cfg(test)]
 mod audit_http_tests;
@@ -186,6 +189,7 @@ mod support;
 mod support_http_tests;
 mod stripe;
 mod tiers;
+mod tsa;
 mod billing;
 mod billing_mail;
 #[cfg(test)]
@@ -269,8 +273,9 @@ fn env(key: &str, default: &str) -> String {
 
 pub fn random_bytes(n: usize) -> Vec<u8> {
     use std::io::Read;
-    let mut b = vec![0u8; n];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).expect("read /dev/urandom");
+    let mut b = Vec::with_capacity(n);
+    std::fs::File::open("/dev/urandom").and_then(|f| f.take(n as u64).read_to_end(&mut b)).expect("read /dev/urandom");
+    assert_eq!(b.len(), n, "short read from /dev/urandom");
     b
 }
 
@@ -357,6 +362,7 @@ async fn main() {
         std::process::exit(1);
     });
     let audit_export = audit_export::Settings::from_env(&|k| env(k, ""), &startup_store).unwrap_or_else(|e| exit(format!("Audit export: {e}")));
+    let audit_checkpoints = audit_checkpoint::Settings::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Audit checkpoints: {e}")));
     let chat_retention = retention::days("CHAT_RETENTION_DAYS", &env("CHAT_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
     let session_retention = retention::days("HARNESS_SESSION_RETENTION_DAYS", &env("HARNESS_SESSION_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
     let teammate_files_retention = retention::days("TEAMMATE_FILES_RETENTION_DAYS", &env("TEAMMATE_FILES_RETENTION_DAYS", "")).unwrap_or_else(|e| exit(e));
@@ -743,6 +749,8 @@ async fn main() {
         "sessionMaxMinutes": sessions.max_ms / 60_000,
         "auditRetentionDays": retention,
         "auditExport": audit_export.sink.as_ref().map(|s| json!({ "kind": s.kind(), "sink": s.shown })),
+        "auditCheckpointMinutes": audit_checkpoints.every,
+        "auditTimestamps": audit_checkpoints.tsa.as_ref().map(|t| json!({ "tsa": t.shown, "trustAnchors": audit_checkpoints.trust.len() })),
         "chatRetentionDays": chat_retention,
         "harnessSessionRetentionDays": session_retention,
         "teammateFilesRetentionDays": teammate_files_retention,
@@ -773,6 +781,8 @@ async fn main() {
     license::start(app.clone());
     log_info!("Audit export: {} (ADR 0122).", audit_export.describe());
     audit_export::start(&app, audit_export);
+    log_info!("Audit checkpoints: {} (ADR 0149).", audit_checkpoints.describe());
+    audit_checkpoint::start(&app, audit_checkpoints);
     audit::start_retention(app.clone(), retention);
     secrets::external::start_audit(app.clone());
     audit_chain::start(app.clone());
@@ -915,6 +925,9 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/audit/export.csv", get(export_audit))
         .route("/audit/verify", get(audit_chain::get))
         .route("/audit/siem", get(audit_export::get))
+        .route("/audit/chain", get(audit_checkpoint::get_chain))
+        .route("/audit/checkpoints", get(audit_checkpoint::get_list).post(audit_checkpoint::post))
+        .route("/audit/checkpoints/key", get(audit_checkpoint::get_key))
         .route("/access-review", get(access_review::get))
         .route("/access-review/export.csv", get(access_review::export))
         .route("/access-review/complete", post(access_review::complete))

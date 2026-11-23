@@ -185,10 +185,19 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl deny <id> [--remember | --remember-global]
   botctl audit [<limit>] [filters]                 Recent audit events, newest first
   botctl audit export [filters] > audit.csv        All matching events as CSV, oldest first
-  botctl audit verify [--pin <id>:<hash>]...       Check the audit log's hash chain; names the first
-                                                   broken link, exits 1 if there is one. --pin: a hash
-                                                   kept elsewhere (your SIEM) the row must still have
+  botctl audit verify [--pin <id>:<hash>]... [--from <id>] [--to <id>] [--key <hex>]...
+                                                   Check the audit log's hash chain, its signed
+                                                   checkpoints and their timestamps; names the first
+                                                   break, exits 1 if there is one. --pin: a hash kept
+                                                   elsewhere (your SIEM) the row must still have.
+                                                   --from/--to: only those event ids. --key: trust only
+                                                   this checkpoint key (from botctl audit key)
   botctl audit siem                                The SIEM export: sink, delivered, pending, failing
+  botctl audit chain                               The chain's state: head, last checkpoint and
+                                                   timestamp, export lag, last check
+  botctl audit key                                 The public key checkpoints are signed with
+  botctl audit checkpoint                          Sign a checkpoint of the head now
+  botctl audit checkpoints [<limit>]               Recent checkpoints, with their RFC 3161 tokens
     filters: --from <time> --to <time> --action <a,b.*> --actor <user|bot|system[:id]>
              --actor user:<email> --method <password,code,sso,none,bot_token,scim_token>
              --idp <entra|google|oidc|github|apple|saml> --idp-provider <id> --subject <issuer|sub>
@@ -788,18 +797,30 @@ fn audit_query(rest: &[&str]) -> Result<String, String> {
     Ok(if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) })
 }
 
-/// `botctl audit verify [--pin <id>:<hash>]...`: hashes kept elsewhere (a SIEM, an
-/// earlier check) to hold the chain to.
+/// `botctl audit verify [--pin <id>:<hash>]... [--from <id>] [--to <id>] [--key <hex>]...`:
+/// hashes kept elsewhere (a SIEM, an earlier check) to hold the chain to, the event ids
+/// to check, and the checkpoint keys to trust instead of botd's own.
 fn verify_query(rest: &[&str]) -> Result<String, String> {
-    let mut pins = Vec::new();
+    let (mut pins, mut keys, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match *a {
             "--pin" => pins.push(encode(it.next().ok_or("--pin needs <event id>:<hash>")?)),
+            "--key" => keys.push(encode(it.next().ok_or("--key needs a public key in hex (botctl audit key)")?)),
+            o @ ("--from" | "--to") => {
+                let id = it.next().filter(|v| v.parse::<i64>().is_ok()).ok_or_else(|| format!("{o} needs an event id"))?;
+                pairs.push(format!("{}={id}", &o[2..]));
+            }
             other => return Err(format!("Unknown audit verify option \"{other}\". See botctl admin.")),
         }
     }
-    Ok(if pins.is_empty() { String::new() } else { format!("?pin={}", pins.join(",")) })
+    if !pins.is_empty() {
+        pairs.insert(0, format!("pin={}", pins.join(",")));
+    }
+    if !keys.is_empty() {
+        pairs.push(format!("key={}", keys.join(",")));
+    }
+    Ok(if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) })
 }
 
 fn flag<'a>(rest: &[&'a str], name: &str) -> Option<&'a str> {
@@ -1677,6 +1698,14 @@ fn run(args: &[String]) -> Result<String, String> {
             if serde_json::from_str::<Value>(&res).ok().and_then(|v| v["ok"].as_bool()) == Some(false) { Err(res) } else { Ok(res) }
         }
         ["audit", "siem"] => op("GET", "/api/audit/siem", None),
+        ["audit", "chain"] => op("GET", "/api/audit/chain", None),
+        ["audit", "key"] => op("GET", "/api/audit/checkpoints/key", None),
+        ["audit", "checkpoint"] => op("POST", "/api/audit/checkpoints", None),
+        ["audit", "checkpoints"] => op("GET", "/api/audit/checkpoints", None),
+        ["audit", "checkpoints", limit] => {
+            let n: u32 = limit.parse().map_err(|_| format!("{limit} isn't a number of checkpoints"))?;
+            op("GET", &format!("/api/audit/checkpoints?limit={n}"), None)
+        }
         ["audit", rest @ ..] => op("GET", &format!("/api/audit{}", audit_query(rest)?), None),
         ["retention"] => op("GET", "/api/retention", None),
         ["retention", "hold", bot, reason] => op("PUT", &format!("/api/retention/holds/{}", encode(bot)), Some(json!({ "reason": reason }).to_string())),
@@ -2319,6 +2348,9 @@ mod tests {
         assert_eq!(verify_query(&[]).unwrap(), "");
         assert_eq!(verify_query(&["--pin", "12:ab", "--pin", "13:cd"]).unwrap(), "?pin=12:ab,13:cd");
         assert!(verify_query(&["--pin"]).is_err() && verify_query(&["--all"]).is_err());
+        let key = "ab".repeat(32);
+        assert_eq!(verify_query(&["--from", "10", "--to", "20", "--key", &key, "--pin", "12:ab"]).unwrap(), format!("?pin=12:ab&from=10&to=20&key={key}"));
+        assert!(verify_query(&["--from", "x"]).is_err() && verify_query(&["--to"]).is_err() && verify_query(&["--key"]).is_err());
     }
 
     #[test]
