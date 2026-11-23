@@ -1,6 +1,6 @@
 # Air-gapped installs
 
-SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md), and signatures and multi-arch indexes in mirrors in [ADR 0147](../adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md).
+SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md), signatures and multi-arch indexes in mirrors in [ADR 0147](../adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md), and how every release's bundles are checked end to end in [ADR 0172](../adr/0172-release-bundles-checked-end-to-end.md).
 
 ## What a bundle holds
 
@@ -69,6 +69,32 @@ Accept no other identity: a signature from a fork or another workflow is not our
 - **Its signature**, if `.sigstore.json` is beside it and `cosign` is installed. Offline, cosign needs Sigstore's trusted root: run `cosign initialize` on a connected machine, copy `~/.sigstore/root/tuf-repo-cdn.sigstore.dev/targets/trusted_root.json` in separately from the bundle, and point `SIGSTORE_TRUSTED_ROOT` at it. A trusted root that came with the bundle is never used.
 
 With neither a SHA-256 nor a verified signature, the installer stops.
+
+## Checking a release end to end
+
+Every release's bundles are checked the way you'll use them, by the [`offline-release-check`](../../.github/workflows/offline-release-check.yml) workflow ([ADR 0172](../adr/0172-release-bundles-checked-end-to-end.md)). It runs once the bundles are attached, again every week on the latest release, and by hand for any release. It checks the files attached to the release, not a rebuild:
+
+- **Connected:**
+  - each bundle's signature and SHA-256;
+  - that each bundle was built from the tag's commit, with binaries for its arch that run on Ubuntu 22.04;
+  - that its images are exactly what ghcr.io's tags name now, signed by the `docker` workflow. ghcr.io is read with no login, as your machine would.
+- **With no network**, against Sigstore's trusted root fetched as [above](#verifying-a-bundle):
+  - the bundles verify;
+  - both go to a registry mirror as the signed multi-arch index, and `cosign verify` and `verify-attestation` pass there;
+  - botd installs from the x86_64 bundle, and its images load.
+
+A green run on the release's tag means all of that held on that day. The run's summary lists each check. If a release's latest run is red, don't install it: use the previous release and tell your CG-Labs contact.
+
+You can run the same check yourself, with the same script (from a checkout of `main`), on the connected machine and then inside your network:
+
+```sh
+deploy/offline-release-check.sh online ./release --version 0.1.0 --commit <the tag's commit> \
+  --image superbot=ghcr.io/cg-labs/superbot:0.1.0 --image caddy=ghcr.io/cg-labs/superbot-caddy:0.1.0
+# carry ./release (now with release-check.expected) and trusted_root.json in, then:
+deploy/offline-release-check.sh offline ./release --mirror registry.corp.example/superbot-check --trusted-root trusted_root.json
+```
+
+`./release` holds both arches' bundles with their `.sha256` and `.sigstore.json`, as attached to the release. `online` writes `release-check.expected`: each bundle's SHA-256 and each image's signed digest, the record to check against inside. `offline` refuses to run where `github.com` answers. It pushes to the mirror path you give, so use a scratch path, not the one Compose pulls from. It needs `cosign`, `skopeo`, `jq` and `curl`.
 
 ## Installing
 

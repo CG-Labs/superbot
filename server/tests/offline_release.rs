@@ -3,8 +3,11 @@
 //! commit on `main`, and attaches them, signed, to the tag's release. Its CI job pushes a
 //! bundle's images to a mirror and checks the digests, and (ADR 0147) pushes both arches'
 //! bundles of a signed image to a mirror with no network, where cosign verifies the signed
-//! index. `deploy/test-offline.sh` tests the bundles themselves; this checks the workflow wires
-//! them up. It reads lines, like `release_workflow.rs`.
+//! index. ADR 0172: what release-bundle attached is then checked end to end by
+//! `offline-release-check.yml` (also weekly and by hand), against ghcr.io and with no network, and
+//! the CI job runs the same check on its own signed release. `deploy/test-offline.sh` and
+//! `deploy/test-offline-release-check.sh` test the scripts themselves; this checks the workflows
+//! wire them up. It reads lines, like `release_workflow.rs`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -114,6 +117,7 @@ fn only_release_bundle_can_write_and_sign() {
         let allowed: &[&str] = match id.as_str() {
             "install-offline" => &[],
             "release-bundle" => &["contents: write", "id-token: write"],
+            "release-check" => &["contents: read"],
             other => panic!("new job `{other}`: give it its permissions here (ADR 0140)"),
         };
         assert_eq!(permissions(&body), allowed, "{id}");
@@ -196,18 +200,103 @@ fn ci_puts_both_arches_signed_index_in_a_mirror_with_no_network() {
     ] {
         assert!(all_steps.contains(want), "install-offline must have `{want}`");
     }
-    let mirror = s.iter().find(|s| s.contains("--registry localhost:5002/mirror")).expect("a push of both arches' bundles");
+    let mirror = s.iter().find(|s| s.contains("--mirror localhost:5002/mirror")).expect("a push of both arches' bundles");
     for want in [
-        "sudo ip netns exec offline bash -c",
+        "sudo ip netns exec offline env PATH=",
         "the network is still up",
-        r#"x86="$bundles/superbot-offline-$version-x86_64.tar.gz" arm="$bundles/superbot-offline-$version-aarch64.tar.gz""#,
-        r#"push "$x86" "$arm" --sha256 "$(cut -c1-64 "$x86.sha256")" --sha256 "$(cut -c1-64 "$arm.sha256")""#,
+        r#"deploy/offline-release-check.sh offline "$bundles" --mirror localhost:5002/mirror --key "$key""#,
         "($index, the signed index for linux/amd64, linux/arm64)",
-        r#""$cosign" verify "${v[@]}" localhost:5002/mirror/superbot-offline-signed:1"#,
-        r#""$cosign" verify "${v[@]}" "localhost:5002/mirror/superbot-offline-signed@$d""#,
-        r#""$cosign" verify-attestation "${v[@]}" --type slsaprovenance1 localhost:5002/mirror/superbot-offline-signed:1"#,
+        "is the signed index $index; it, its 4 manifests and its provenance verify with no network",
+        "attestation-manifest",
     ] {
         assert!(mirror.contains(want), "the mirror step must have `{want}`");
+    }
+}
+
+#[test]
+fn ci_checks_its_own_signed_release_as_a_published_one() {
+    let yaml = read(".github/workflows/offline.yml");
+    let all = jobs(&yaml);
+    let s = steps(job(&all, "install-offline"));
+    let at = |want: &str| s.iter().position(|step| step.contains(want)).unwrap_or_else(|| panic!("install-offline must have `{want}`"));
+    let unit = at("run: deploy/test-offline-release-check.sh");
+    let lint = at("shellcheck -x -S style");
+    assert!(s[lint].contains("deploy/offline-release-check.sh deploy/test-offline-release-check.sh"), "ShellCheck covers the release check");
+    let sign = at(r#"cosign sign-blob --yes --key cosign.key --signing-config signing-config.json --bundle "$f.sigstore.json" "$f""#);
+    let online = at("deploy/offline-release-check.sh\" online signed");
+    let offline = at("deploy/offline-release-check.sh offline");
+    let load = at("deploy/offline-bundle.sh load \"$RUNNER_TEMP/signed/");
+    assert!(lint < unit && load < sign && sign == online && online < offline, "lint, unit test, load unsigned, sign and check connected, then offline");
+    for want in ["--key cosign.pub --any-binary-arch", r#"--commit "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)""#, "signed/release-check.expected"] {
+        assert!(s[online].contains(want), "the connected check must have `{want}`");
+    }
+    let on: String = yaml.lines().take_while(|l| !l.starts_with("permissions:")).collect::<Vec<_>>().join("\n");
+    for path in ["deploy/offline-release-check.sh", "deploy/test-offline-release-check.sh", ".github/workflows/offline-release-check.yml"] {
+        assert_eq!(on.matches(&format!("'{path}'")).count(), 2, "pushes and pull requests that change {path} run offline.yml");
+    }
+}
+
+#[test]
+fn every_release_is_checked_end_to_end_after_its_bundles_are_attached() {
+    let yaml = read(".github/workflows/offline.yml");
+    let all = jobs(&yaml);
+    let check = job(&all, "release-check");
+    assert_eq!(key(check, "needs"), "release-bundle", "the check waits for both arches' bundles");
+    assert_eq!(key(check, "uses"), "./.github/workflows/offline-release-check.yml");
+    assert!(
+        check.join("\n").contains("tag: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.event.workflow_run.head_branch }}"),
+        "it checks the tag release-bundle bundled"
+    );
+}
+
+#[test]
+fn the_release_check_reads_ghcr_anonymously_and_verifies_offline() {
+    let yaml = read(".github/workflows/offline-release-check.yml");
+    assert!(yaml.starts_with("name: offline-release-check\n"));
+    let on: String = yaml.lines().take_while(|l| !l.starts_with("permissions:")).collect::<Vec<_>>().join("\n");
+    for want in ["  workflow_call:\n    inputs:\n      tag:", "  workflow_dispatch:", "  schedule:"] {
+        assert!(on.contains(want), "offline-release-check.yml must run on `{want}`");
+    }
+    let top: Vec<&str> = yaml.lines().take_while(|l| *l != "jobs:").collect();
+    assert_eq!(permissions(&top), ["contents: read"]);
+    let all = jobs(&yaml);
+    assert_eq!(all.len(), 1, "one job");
+    let (id, body) = &all[0];
+    assert_eq!(permissions(body), ["contents: read"], "{id} only reads: no id-token, packages or writes");
+    for login in ["docker login", "skopeo login", "cosign login", "login-action", "packages:"] {
+        assert!(!yaml.contains(login), "no registry login (`{login}`): ghcr.io is read as a customer reads it");
+    }
+    let s = steps(body);
+    for step in &s {
+        if let Some(run) = step.split_once("run:").map(|(_, r)| r) {
+            assert!(!run.contains("${{"), "values reach the shell through env, not `${{{{ }}}}` in a script:\n{step}");
+        }
+    }
+    let at = |want: &str| s.iter().position(|step| step.contains(want)).unwrap_or_else(|| panic!("offline-release-check.yml must have `{want}`"));
+    let download = at(r#"gh release download "$TAG" --pattern 'superbot-offline-*'"#);
+    let root = at("cosign initialize");
+    let online = at(r#"deploy/offline-release-check.sh online "$RUNNER_TEMP/release""#);
+    let netns = at("sudo ip netns add offline");
+    let offline = at(r#"deploy/offline-release-check.sh offline "$release" --mirror localhost:5002/superbot --trusted-root "$root""#);
+    let install = at(r#"--offline "$b" --bundle-sha256 "$sum""#);
+    assert!(download < root && root < online && online < netns && netns < offline && offline < install, "download, trust root, connected, namespace, offline, install");
+    assert!(s[root].contains("tuf-repo-cdn.sigstore.dev/targets/trusted_root.json"), "the trusted root is the one the guide tells operators to copy");
+    for want in [
+        r#"--commit "$COMMIT""#,
+        "--max-glibc 2.35",
+        r#"--image "superbot=ghcr.io/${GITHUB_REPOSITORY,,}:$VERSION""#,
+        r#"--image "caddy=ghcr.io/${GITHUB_REPOSITORY,,}-caddy:$VERSION""#,
+        r#"--image-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/docker.yml@refs/tags/v$VERSION""#,
+    ] {
+        assert!(s[online].contains(want), "the connected check must pass `{want}`");
+    }
+    assert!(!s[online].contains("--key") && !s[online].contains("--any-binary-arch"), "a real release is checked keyless, binaries and all");
+    for i in [offline, install] {
+        assert!(s[i].contains("sudo ip netns exec offline"), "step {i} runs with no network");
+    }
+    assert!(s[offline].contains("the network is still up"), "the offline step checks it has no network");
+    for want in ["SIGSTORE_TRUSTED_ROOT=", "grep -Fq 'Bundle signature verified'", "http://127.0.0.1:3000/healthz", "NetworkNamespacePath"] {
+        assert!(s[install].contains(want) || s[netns].contains(want), "the install must have `{want}`");
     }
 }
 
