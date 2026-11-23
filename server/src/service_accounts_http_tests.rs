@@ -365,6 +365,83 @@ fn body_owner(id: &str) -> String {
     json!({ "owner": id }).to_string()
 }
 
+fn ids_at<'a>(v: &'a Value, key: &str) -> Vec<&'a str> {
+    v[key].as_array().unwrap().iter().map(|r| r.as_str().unwrap_or_else(|| r["id"].as_str().unwrap())).collect()
+}
+
+#[tokio::test]
+async fn delegates_are_offered_only_what_they_may_give_and_only_their_own_team() {
+    let (port, app, admin, _) = serve_app().await;
+    let helpdesk = role(port, &admin, "Helpdesk", "member", &["users.manage"]).await;
+    let auditor = role(port, &admin, "Auditor", "readonly", &["audit.view"]).await;
+    let people = role(port, &admin, "Team people", "member", &["users.manage"]).await;
+    let (ada, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (bea, _) = user_with(port, &admin, "bea@example.com", "member").await;
+    let (ana, ana_auth) = user_with(port, &admin, "ana@example.com", "member").await;
+    assert_eq!(call(port, "PUT", &format!("/api/roles/{helpdesk}/users/{ana}"), &admin, "").await.0, 200);
+    let team = |name: &str, owner: &str| json!({ "name": name, "owner": owner }).to_string();
+    let (_, t) = json_call(port, "POST", "/api/teams", &admin, &team("Alpha", &ada)).await;
+    let alpha = t["id"].as_str().unwrap().to_string();
+    let (_, t) = json_call(port, "POST", "/api/teams", &admin, &team("Beta", &bea)).await;
+    let beta = t["id"].as_str().unwrap().to_string();
+    let (code, v) = json_call(port, "PUT", &format!("/api/teams/{alpha}/members/{ana}"), &admin, "{}").await;
+    assert!(code == 200 || code == 201, "{v}");
+
+    // Ana sees her own, and is offered what she holds and her own team, never Auditor or Beta.
+    let (code, list) = json_call(port, "GET", "/api/service-accounts", &ana_auth, "").await;
+    assert_eq!((code, list["view"].as_str()), (200, Some("own")), "{list}");
+    let ch = &list["choices"];
+    assert_eq!(ids_at(ch, "server"), ["readonly", "member", helpdesk.as_str(), people.as_str()], "{ch}");
+    assert_eq!(ids_at(ch, "teams"), [alpha.as_str()], "{ch}");
+    assert_eq!(ids_at(&ch["teams"][0], "roles"), ["readonly", "member", helpdesk.as_str(), people.as_str()], "a read-only custom role is never offered in a team: {ch}");
+    assert_eq!(ids_at(ch, "roles"), ["readonly", "member", helpdesk.as_str(), people.as_str()], "{ch}");
+    assert_eq!(ch["roles"][2]["permissions"], json!(["users.manage"]));
+    assert!(!ch.to_string().contains(&auditor) && !ch.to_string().contains("Auditor"), "a role she can't give isn't even named: {ch}");
+    // An admin is offered every role but admin, and every team.
+    let (_, all) = json_call(port, "GET", "/api/service-accounts", &admin, "").await;
+    assert_eq!(all["view"].as_str(), Some("all"));
+    assert_eq!(ids_at(&all["choices"], "server"), ["readonly", "member", auditor.as_str(), helpdesk.as_str(), people.as_str()], "by name: {all}");
+    assert_eq!(ids_at(&all["choices"], "teams").len(), 2, "{all}");
+
+    // What she's offered is what the server takes: Beta is refused, Alpha isn't.
+    let body = |team: &str| json!({ "name": "Ana's", "role": "member", "team": team }).to_string();
+    let (code, v) = json_call(port, "POST", "/api/service-accounts", &ana_auth, &body(&beta)).await;
+    assert_eq!(code, 403, "{v}");
+    let denied = events(port, &admin, "access.denied").await;
+    assert_eq!((denied[0]["details"]["limit"].as_str(), denied[0]["details"]["team"].as_str()), (Some("service_account_team"), Some(beta.as_str())));
+    let (code, v) = json_call(port, "POST", "/api/service-accounts", &ana_auth, &body(&alpha)).await;
+    assert_eq!((code, v["ownerOnTeam"].clone()), (201, json!(true)), "{v}");
+    let mine = v["id"].as_str().unwrap().to_string();
+    let moved = json!({ "team": beta }).to_string();
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{mine}"), &ana_auth, &moved).await.0, 403, "nor moved there");
+    let (tok, _) = token(port, &ana_auth, &mine, json!({})).await;
+    let (code, t) = json_call(port, "GET", "/api/team", &tok, "").await;
+    assert_eq!((code, t["id"].as_str()), (200, Some(alpha.as_str())), "{t}");
+
+    // Off the team, she lends it no place there, at once; it can still be renamed, not moved back in.
+    assert_eq!(call(port, "DELETE", &format!("/api/teams/{alpha}/members/{ana}"), &admin, "").await.0, 200);
+    assert_eq!(call(port, "GET", "/api/team", &tok, "").await.0, 404, "its owner left the team");
+    let (code, v) = json_call(port, "PATCH", &format!("/api/service-accounts/{mine}"), &ana_auth, r#"{"name":"Ana's old"}"#).await;
+    assert_eq!((code, v["ownerOnTeam"].clone()), (200, json!(false)), "{v}");
+    let (_, list) = json_call(port, "GET", "/api/service-accounts", &ana_auth, "").await;
+    assert!(ids_at(&list["choices"], "teams").is_empty(), "{list}");
+
+    // An admin may put one anywhere, and hand it to anyone; it sees the team only while its owner can.
+    let ops = account(port, &admin, json!({ "name": "Beta ops", "role": "member", "team": beta })).await;
+    let (tok, _) = token(port, &admin, &ops, json!({})).await;
+    assert_eq!(call(port, "GET", "/api/team", &tok, "").await.0, 200, "an admin owner is on every team");
+    let (code, v) = json_call(port, "PATCH", &format!("/api/service-accounts/{ops}"), &admin, &body_owner(&ana)).await;
+    assert_eq!((code, v["ownerOnTeam"].clone()), (200, json!(false)), "{v}");
+    assert_eq!(call(port, "GET", "/api/team", &tok, "").await.0, 404);
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{ops}"), &admin, &body_owner(&bea)).await.0, 200);
+    assert_eq!(call(port, "GET", "/api/team", &tok, "").await.0, 200, "Bea is on Beta");
+    let (_, v) = json_call(port, "GET", &format!("/api/service-accounts/{ops}"), &admin, "").await;
+    assert_eq!(v["ownerOnTeam"], json!(true));
+    let (_, v) = json_call(port, "PATCH", &format!("/api/service-accounts/{ops}"), &admin, r#"{"team":null}"#).await;
+    assert_eq!(v["ownerOnTeam"], Value::Null, "in no team, there's nothing to be on");
+    assert!(app.db.team_member(&ops).is_none());
+}
+
 #[tokio::test]
 async fn a_team_service_account_acts_only_in_its_team() {
     let (port, app, admin, _) = serve_app().await;

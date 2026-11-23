@@ -4,7 +4,7 @@ import { ServiceAccountsAdmin } from "../ServiceAccountsAdmin";
 import type { SuperBotApi } from "../../src/api";
 import { confirmAsync } from "../../src/dialogs";
 import { copyText } from "../../src/clipboard";
-import type { MintedServiceToken, ServiceAccount, ServiceAccountsView, ServiceToken, Team } from "../../src/types";
+import type { MintedServiceToken, ServiceAccount, ServiceAccountChoices, ServiceAccountsView, ServiceToken, Team } from "../../src/types";
 
 jest.mock("../../src/dialogs", () => ({ confirmAsync: jest.fn(async () => true) }));
 jest.mock("../../src/clipboard", () => ({ COPY_LABEL: "Copy", copyText: jest.fn(async () => true) }));
@@ -77,7 +77,18 @@ function mockApi(view: ServiceAccountsView = VIEW) {
   };
 }
 
-const show = (api: ReturnType<typeof mockApi>) => render(<ServiceAccountsAdmin api={api as unknown as SuperBotApi} onBack={jest.fn()} />);
+const show = (api: ReturnType<typeof mockApi>, admin = true) => render(<ServiceAccountsAdmin api={api as unknown as SuperBotApi} onBack={jest.fn()} admin={admin} />);
+
+const CHOICES: ServiceAccountChoices = {
+  roles: [
+    { id: "readonly", name: "Read-only", base: "readonly", builtIn: true, permissions: [] },
+    { id: "member", name: "Member", base: "member", builtIn: true, permissions: [] },
+    { id: "r1", name: "Help desk", base: "member", builtIn: false, permissions: ["users.manage"] },
+  ],
+  server: ["readonly", "member", "r1"],
+  teams: [{ id: "t1", name: "Ops", roles: ["readonly", "member"] }],
+};
+const OWN: ServiceAccountsView = { ...VIEW, view: "own", choices: CHOICES };
 
 async function open(api: ReturnType<typeof mockApi>, u: ReturnType<typeof userEvent.setup>) {
   await show(api);
@@ -261,5 +272,60 @@ describe("ServiceAccountsAdmin (ADR 0143, 0152)", () => {
     const u = userEvent.setup();
     await open(api, u);
     expect(screen.getByText(/Its owner is disabled or gone/)).toBeTruthy();
+  });
+});
+
+describe("ServiceAccountsAdmin for a delegate (ADR 0182)", () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it("shows their own, and offers only what the server says they may give", async () => {
+    const api = mockApi(OWN);
+    const u = userEvent.setup();
+    await show(api, false);
+    expect(await screen.findByText("Your service accounts")).toBeTruthy();
+    expect(api.roles).not.toHaveBeenCalled();
+    expect(api.teams).not.toHaveBeenCalled();
+
+    await u.press(screen.getByLabelText("New service account"));
+    await u.type(screen.getByLabelText("Service account name"), "Nightly");
+    expect(screen.getByRole("radio", { name: "Help desk" })).toBeTruthy();
+    // In Ops she may give only the built-in roles.
+    await u.press(screen.getByRole("radio", { name: "Ops" }));
+    expect(screen.queryByRole("radio", { name: "Help desk" })).toBeNull();
+    await u.press(screen.getByRole("radio", { name: "Member" }));
+    await u.press(screen.getByLabelText("Create service account"));
+    await waitFor(() => expect(api.createServiceAccount).toHaveBeenCalledWith({ name: "Nightly", description: "", role: "member", team: "t1" }));
+  });
+
+  it("can't change the owner, and keeps a role no longer offered so the account can still be renamed", async () => {
+    const old = { ...SA, customRole: { id: "r9", name: "Old role" } };
+    const api = mockApi({ ...OWN, serviceAccounts: [old] });
+    const u = userEvent.setup();
+    await show(api, false);
+    await u.press(await screen.findByLabelText("Service account HR sync"));
+    await screen.findByLabelText("Revoke CI");
+    expect(screen.queryByLabelText("Owner's email or id")).toBeNull();
+    expect(screen.getByRole("radio", { name: "Old role" })).toBeTruthy();
+    await u.clear(screen.getByLabelText("Service account name"));
+    await u.type(screen.getByLabelText("Service account name"), "Payroll");
+    await u.press(screen.getByLabelText("Save"));
+    await waitFor(() => expect(api.updateServiceAccount).toHaveBeenCalledWith("sa1", { name: "Payroll" }));
+  });
+
+  it("says when its owner isn't on its team", async () => {
+    const off = { ...SA, team: { id: "t1", name: "Ops" }, ownerOnTeam: false };
+    const api = mockApi({ ...OWN, serviceAccounts: [off] });
+    const u = userEvent.setup();
+    await show(api, false);
+    expect(await screen.findByText(" · owner off its team")).toBeTruthy();
+    await u.press(screen.getByLabelText("Service account HR sync"));
+    expect(await screen.findByText(/isn't on Ops, so it acts in no team/)).toBeTruthy();
+  });
+
+  it("gives an admin the server's choices too, without reading every role", async () => {
+    const api = mockApi({ ...VIEW, view: "all", choices: CHOICES });
+    await show(api);
+    expect(await screen.findByText("Service accounts")).toBeTruthy();
+    expect(api.roles).not.toHaveBeenCalled();
   });
 });
