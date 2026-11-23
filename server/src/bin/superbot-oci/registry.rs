@@ -1,0 +1,530 @@
+//! A small OCI distribution client: manifests, blobs, and the referrers API, with the bearer
+//! token and basic logins registries ask for. Logins, CAs and plain HTTP come from config.rs.
+
+use crate::config::{Credentials, Settings};
+use crate::{digest_ok, sha256_digest, tag_ok};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, WWW_AUTHENTICATE};
+use reqwest::{Method, StatusCode};
+use serde_json::Value;
+use std::io::Write;
+use std::path::Path;
+use std::sync::Mutex;
+
+pub const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
+pub const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+const ACCEPT_MANIFESTS: &str = "application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, \
+    application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json";
+/// Registries must take manifests of at least 4 MiB; nothing we copy is near it.
+const MAX_MANIFEST: usize = 4 << 20;
+/// Token service replies and error bodies.
+const MAX_SMALL: usize = 64 << 10;
+/// Referrers a registry may list for one subject, over all its pages, and the pages.
+const MAX_REFERRERS: usize = 1000;
+const MAX_PAGES: usize = 100;
+
+/// A repository: `HOST[:PORT]/PATH`. The host has a dot or a port, or is localhost.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Repo {
+    pub host: String,
+    pub path: String,
+}
+
+impl std::fmt::Display for Repo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.host, self.path)
+    }
+}
+
+fn component_ok(c: &str) -> bool {
+    // [a-z0-9]+ separated by one of . _ __ -+
+    let b = c.as_bytes();
+    !b.is_empty() && b[0].is_ascii_alphanumeric() && b[b.len() - 1].is_ascii_alphanumeric() && c.bytes().all(|x| x.is_ascii_lowercase() || x.is_ascii_digit() || matches!(x, b'.' | b'_' | b'-')) && !c.contains("..")
+}
+
+impl Repo {
+    pub fn parse(s: &str) -> Result<Repo, String> {
+        let bad = || format!("\"{s}\" isn't HOST[:PORT]/PATH (a host with a dot or a port, or localhost; a lowercase path)");
+        let (host, path) = s.split_once('/').ok_or_else(bad)?;
+        let name = host.split(':').next().unwrap_or_default();
+        let host_ok = (host.contains('.') || host.contains(':') || name == "localhost")
+            && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && name.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-'))
+            && host.split_once(':').is_none_or(|(_, p)| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()));
+        if !host_ok || !path.split('/').all(component_ok) {
+            return Err(bad());
+        }
+        let path = if (host == "docker.io") && !path.contains('/') { format!("library/{path}") } else { path.to_string() };
+        Ok(Repo { host: host.to_string(), path })
+    }
+
+    /// `HOST/PATH@sha256:...`
+    pub fn parse_digested(s: &str) -> Result<(Repo, String), String> {
+        let (r, d) = s.split_once('@').ok_or(format!("\"{s}\" isn't HOST/PATH@DIGEST"))?;
+        if !digest_ok(d) {
+            return Err(format!("\"{d}\" isn't a sha256 digest"));
+        }
+        Ok((Repo::parse(r)?, d.to_string()))
+    }
+
+    /// `HOST/PATH:TAG`
+    pub fn parse_tagged(s: &str) -> Result<(Repo, String), String> {
+        let at = s.rfind(':').filter(|&i| !s[i..].contains('/')).ok_or(format!("\"{s}\" isn't HOST/PATH:TAG"))?;
+        let (r, t) = (&s[..at], &s[at + 1..]);
+        if !tag_ok(t) {
+            return Err(format!("\"{t}\" isn't a tag"));
+        }
+        Ok((Repo::parse(r)?, t.to_string()))
+    }
+
+    fn api_host(&self) -> &str {
+        if self.host == "docker.io" { "registry-1.docker.io" } else { &self.host }
+    }
+}
+
+/// Why a redirect can't be followed: it drops from HTTPS to plain HTTP, where a request
+/// body (an image's layers) or a token would go unencrypted.
+fn downgrade(a: &reqwest::redirect::Attempt) -> Option<String> {
+    let from = a.previous().last()?;
+    (from.scheme() == "https" && a.url().scheme() != "https").then(|| format!("{from} redirected to {}, which isn't HTTPS: refusing it", a.url()))
+}
+
+/// Whether URL is on HOST (with its port, if it names one), whatever its scheme.
+fn same_host(url: &url::Url, host: &str) -> bool {
+    url::Url::parse(&format!("{}://{host}", url.scheme())).is_ok_and(|h| h.host_str() == url.host_str() && h.port_or_known_default() == url.port_or_known_default())
+}
+
+/// Splits `Bearer realm="a",service="b"` into its scheme and parameters.
+pub fn parse_challenge(h: &str) -> (String, Vec<(String, String)>) {
+    let h = h.trim();
+    let (scheme, rest) = h.split_once(' ').unwrap_or((h, ""));
+    let mut params = Vec::new();
+    let mut rest = rest.trim();
+    while !rest.is_empty() {
+        let Some((k, after)) = rest.split_once('=') else { break };
+        let k = k.trim().trim_start_matches(',').trim().to_ascii_lowercase();
+        let after = after.trim_start();
+        let (v, next) = if let Some(q) = after.strip_prefix('"') {
+            let end = q.find('"').unwrap_or(q.len());
+            (q[..end].to_string(), q.get(end + 1..).unwrap_or(""))
+        } else {
+            let end = after.find(',').unwrap_or(after.len());
+            (after[..end].trim().to_string(), &after[end..])
+        };
+        params.push((k, v));
+        rest = next.trim_start().trim_start_matches(',').trim_start();
+    }
+    (scheme.to_ascii_lowercase(), params)
+}
+
+fn chain(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut cur = e.source();
+    while let Some(c) = cur {
+        s += &format!(": {c}");
+        cur = c.source();
+    }
+    s
+}
+
+/// A response's body, refused once it passes MAX bytes rather than read whole first.
+async fn read_capped(mut res: reqwest::Response, max: usize, what: &str) -> Result<Vec<u8>, String> {
+    let too_big = || format!("{what} is over {} KiB: refusing it", max >> 10);
+    if res.content_length().is_some_and(|n| n > max as u64) {
+        return Err(too_big());
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = res.chunk().await.map_err(|e| format!("{what}: {}", chain(&e)))? {
+        if out.len() + chunk.len() > max {
+            return Err(too_big());
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
+/// The `rel="next"` target of a `Link` header, as the referrers API pages its lists.
+pub fn next_link(h: &str) -> Option<&str> {
+    h.split(',').find_map(|part| {
+        let (target, params) = part.split_once(';')?;
+        let target = target.trim().strip_prefix('<')?.strip_suffix('>')?;
+        params.split(';').any(|p| matches!(p.trim().replace(' ', "").as_str(), "rel=\"next\"" | "rel=next")).then_some(target)
+    })
+}
+
+pub enum Body<'a> {
+    Empty,
+    Bytes(&'a [u8], &'a str),
+    File(&'a Path),
+}
+
+pub struct Client {
+    /// For the registry itself: with its client certificate, following redirects on its own
+    /// host only.
+    http: reqwest::Client,
+    /// For anywhere else it sends us (an upload address, a redirect): without the certificate.
+    elsewhere: reqwest::Client,
+    base: String,
+    pub repo: Repo,
+    push: bool,
+    creds: Option<Credentials>,
+    authz: Mutex<Option<String>>,
+}
+
+/// What a manifest PUT told us.
+pub struct Put {
+    /// The registry set `OCI-Subject`: it lists the manifest in its referrers API itself.
+    pub indexed_subject: bool,
+}
+
+impl Client {
+    pub async fn new(settings: &Settings, repo: &Repo, push: bool) -> Result<Client, String> {
+        let mut certs = Vec::new();
+        for (path, pem) in settings.ca_pems(&repo.host) {
+            certs.push(reqwest::Certificate::from_pem(&pem).map_err(|e| format!("{}: {e}", path.display()))?);
+        }
+        // As containers/image: an insecure registry's certificate isn't checked, and plain HTTP
+        // is tried only if HTTPS doesn't answer at all.
+        let insecure = settings.insecure(&repo.host, &repo.path);
+        let builder = || {
+            let b = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(30)).user_agent(concat!("superbot-oci/", env!("CARGO_PKG_VERSION")));
+            if certs.is_empty() { b } else { b.tls_certs_merge(certs.clone()) }
+        };
+        // Other hosts trust the registry's CAs too, but `insecure` is for the registry alone:
+        // a token service elsewhere gets the login, so its certificate is always checked.
+        let elsewhere = builder()
+            .redirect(reqwest::redirect::Policy::custom(|a| match downgrade(&a) {
+                Some(e) => a.error(e),
+                None if a.previous().len() >= 10 => a.error("too many redirects"),
+                None => a.follow(),
+            }))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let mut b = builder().tls_danger_accept_invalid_certs(insecure);
+        if let Some((path, pem)) = settings.client_pem(&repo.host)? {
+            b = b.identity(reqwest::Identity::from_pem(&pem).map_err(|e| format!("{}: {e}", path.display()))?);
+        }
+        let me = repo.api_host().to_string();
+        let http = b
+            .redirect(reqwest::redirect::Policy::custom(move |a| match downgrade(&a) {
+                Some(e) => a.error(e),
+                None if same_host(a.url(), &me) && a.previous().len() < 10 => a.follow(),
+                None => a.stop(),
+            }))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let creds = settings.credentials(&repo.host, &repo.path)?;
+        let mut c = Client { http, elsewhere, base: format!("https://{}", repo.api_host()), repo: repo.clone(), push, creds, authz: Mutex::new(None) };
+        if insecure && c.http.get(format!("{}/v2/", c.base)).send().await.is_err() {
+            c.base = format!("http://{}", repo.api_host());
+        }
+        Ok(c)
+    }
+
+    fn url(&self, rest: &str) -> String {
+        format!("{}/v2/{}/{rest}", self.base, self.repo.path)
+    }
+
+    /// Whether URL is the registry itself (scheme, host and port), the only place its login goes.
+    fn ours(&self, url: &str) -> bool {
+        match (url::Url::parse(&self.base), url::Url::parse(url)) {
+            (Ok(a), Ok(b)) => a.origin() == b.origin(),
+            _ => false,
+        }
+    }
+
+    /// A URL the registry gave us (an upload location, a next page), resolved against the
+    /// request it answered, as relative references are. One that would drop from HTTPS to HTTP
+    /// is refused.
+    pub fn resolve(&self, request: &str, target: &str, what: &str) -> Result<url::Url, String> {
+        let base = url::Url::parse(&self.base).map_err(|e| e.to_string())?;
+        let url = url::Url::parse(request)
+            .and_then(|r| r.join(target))
+            .map_err(|e| format!("{}'s {what} {target}: {e}", self.repo.host))?;
+        let was_https = base.scheme() == "https" || request.starts_with("https:");
+        if !matches!(url.scheme(), "https" | "http") || (was_https && url.scheme() != "https") {
+            return Err(format!("{} gave a {what} that isn't HTTPS ({url}): refusing it", self.repo.host));
+        }
+        Ok(url)
+    }
+
+    async fn send(&self, method: Method, url: &str, headers: &[(reqwest::header::HeaderName, String)], body: &Body<'_>) -> Result<reqwest::Response, String> {
+        for attempt in 0..2 {
+            let res = self.request(method.clone(), url, headers, body).await?;
+            if res.status() == StatusCode::UNAUTHORIZED && attempt == 0 && self.ours(url) {
+                let challenge = res.headers().get(WWW_AUTHENTICATE).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+                self.authenticate(&challenge).await?;
+                continue;
+            }
+            if !self.ours(url) || !matches!(res.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                return Ok(res);
+            }
+            // A redirect off the registry's host (blob storage, say): followed without its
+            // client certificate, as a browser would follow it, keeping the method for 307/308.
+            let Some(loc) = res.headers().get(LOCATION).and_then(|v| v.to_str().ok()) else { return Ok(res) };
+            let next = self.resolve(url, loc, "redirect")?;
+            return match res.status().as_u16() {
+                307 | 308 => self.request(method, next.as_str(), headers, body).await,
+                _ => self.request(Method::GET, next.as_str(), headers, &Body::Empty).await,
+            };
+        }
+        unreachable!()
+    }
+
+    /// One request: to the registry with its login and client certificate, elsewhere with neither.
+    async fn request(&self, method: Method, url: &str, headers: &[(reqwest::header::HeaderName, String)], body: &Body<'_>) -> Result<reqwest::Response, String> {
+        let ours = self.ours(url);
+        let mut rb = if ours { &self.http } else { &self.elsewhere }.request(method.clone(), url);
+        for (k, v) in headers {
+            rb = rb.header(k, v);
+        }
+        if ours && let Some(a) = self.authz.lock().unwrap().clone() {
+            rb = rb.header(AUTHORIZATION, a);
+        }
+        rb = match body {
+            Body::Empty => rb,
+            Body::Bytes(b, t) => rb.header(CONTENT_TYPE, *t).body(b.to_vec()),
+            Body::File(p) => {
+                let f = tokio::fs::File::open(p).await.map_err(|e| format!("{}: {e}", p.display()))?;
+                let len = f.metadata().await.map_err(|e| format!("{}: {e}", p.display()))?.len();
+                rb.header(CONTENT_TYPE, "application/octet-stream").header(CONTENT_LENGTH, len).body(reqwest::Body::from(f))
+            }
+        };
+        rb.send().await.map_err(|e| format!("{} {url}: {}", method, chain(&e)))
+    }
+
+    async fn authenticate(&self, challenge: &str) -> Result<(), String> {
+        let host = &self.repo.host;
+        let login = format!("log in with skopeo login {host} (or docker login)");
+        let (scheme, params) = parse_challenge(challenge);
+        let param = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        let header = match scheme.as_str() {
+            "basic" => {
+                let (u, p) = self.creds.as_ref().ok_or(format!("{host} wants a login: {login}"))?;
+                format!("Basic {}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, format!("{u}:{p}")))
+            }
+            "bearer" => {
+                let realm = param("realm").ok_or(format!("{host} asked for a token without saying where to get one"))?;
+                let mut url = url::Url::parse(realm).map_err(|e| format!("{host}'s token realm {realm}: {e}"))?;
+                if self.creds.is_some() && self.base.starts_with("https:") && url.scheme() != "https" {
+                    return Err(format!("{host} sends logins to {realm}, which isn't HTTPS: refusing to send yours there"));
+                }
+                let scope = format!("repository:{}:{}", self.repo.path, if self.push { "pull,push" } else { "pull" });
+                {
+                    let mut q = url.query_pairs_mut();
+                    if let Some(s) = param("service") {
+                        q.append_pair("service", s);
+                    }
+                    q.append_pair("scope", &scope);
+                }
+                // A token service on another host gets the login but not the registry's client
+                // certificate, and may redirect as it likes.
+                let on_registry = same_host(&url, self.repo.api_host());
+                let mut rb = if on_registry { &self.http } else { &self.elsewhere }.get(url.as_str());
+                if let Some((u, p)) = &self.creds {
+                    rb = rb.basic_auth(u, Some(p));
+                }
+                let mut res = rb.send().await.map_err(|e| format!("{host}'s token service: {}", chain(&e)))?;
+                if on_registry
+                    && res.status().is_redirection()
+                    && let Some(loc) = res.headers().get(LOCATION).and_then(|v| v.to_str().ok())
+                {
+                    let next = self.resolve(url.as_str(), loc, "token redirect")?;
+                    // Off the registry's host, so without the login, as any redirect there drops it.
+                    res = self.elsewhere.get(next).send().await.map_err(|e| format!("{host}'s token service: {}", chain(&e)))?;
+                }
+                if !res.status().is_success() {
+                    let why = if self.creds.is_some() { "refused the login" } else { "wants a login" };
+                    return Err(format!("{host} {why} for {scope} (HTTP {}): {login}", res.status().as_u16()));
+                }
+                let body = read_capped(res, MAX_SMALL, &format!("{host}'s token")).await?;
+                let v: Value = serde_json::from_slice(&body).map_err(|e| format!("{host}'s token service: {e}"))?;
+                let token = v["token"].as_str().or(v["access_token"].as_str()).filter(|t| !t.is_empty()).ok_or(format!("{host}'s token service gave no token"))?;
+                format!("Bearer {token}")
+            }
+            _ => return Err(format!("{host} refused the request (HTTP 401): {login}")),
+        };
+        *self.authz.lock().unwrap() = Some(header);
+        Ok(())
+    }
+
+    async fn failure(what: String, res: reqwest::Response) -> String {
+        let code = res.status().as_u16();
+        let body = read_capped(res, MAX_SMALL, "the reply").await.unwrap_or_default();
+        let detail: String = String::from_utf8_lossy(&body).chars().take(300).collect();
+        format!("{what}: HTTP {code} {}", detail.trim())
+    }
+
+    /// A manifest by tag or digest; None if there is none. One asked for by digest is checked.
+    pub async fn manifest(&self, reference: &str) -> Result<Option<Vec<u8>>, String> {
+        let res = self.send(Method::GET, &self.url(&format!("manifests/{reference}")), &[(ACCEPT, ACCEPT_MANIFESTS.into())], &Body::Empty).await?;
+        if res.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !res.status().is_success() {
+            return Err(Self::failure(format!("Couldn't read {}:{reference}", self.repo), res).await);
+        }
+        let bytes = read_capped(res, MAX_MANIFEST, &format!("{}:{reference}", self.repo)).await?;
+        if digest_ok(reference) && sha256_digest(&bytes) != reference {
+            return Err(format!("{}@{reference} came back as {}: refusing it", self.repo, sha256_digest(&bytes)));
+        }
+        Ok(Some(bytes))
+    }
+
+    pub async fn put_manifest(&self, reference: &str, bytes: &[u8], media_type: &str) -> Result<Put, String> {
+        let res = self.send(Method::PUT, &self.url(&format!("manifests/{reference}")), &[], &Body::Bytes(bytes, media_type)).await?;
+        if !res.status().is_success() {
+            return Err(Self::failure(format!("Couldn't push {}:{reference}", self.repo), res).await);
+        }
+        let want = sha256_digest(bytes);
+        if let Some(got) = res.headers().get("docker-content-digest").and_then(|v| v.to_str().ok())
+            && got != want
+        {
+            return Err(format!("{} stored {}:{reference} as {got}, not {want}", self.repo.host, self.repo));
+        }
+        Ok(Put { indexed_subject: res.headers().contains_key("oci-subject") })
+    }
+
+    /// The referrers the registry lists for DIGEST, over every page, or None if it has no
+    /// referrers API. Later pages must come from the registry itself.
+    pub async fn referrers(&self, digest: &str) -> Result<Option<Vec<Value>>, String> {
+        let what = format!("{}'s referrers for {digest}", self.repo);
+        let mut url = self.url(&format!("referrers/{digest}"));
+        let mut all = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut first = true;
+        loop {
+            if !seen.insert(url.clone()) {
+                return Err(format!("{what} link back to a page already read: refusing them"));
+            }
+            if seen.len() > MAX_PAGES {
+                return Err(format!("{what} run over more than {MAX_PAGES} pages: refusing them"));
+            }
+            let res = self.send(Method::GET, &url, &[(ACCEPT, OCI_INDEX.into())], &Body::Empty).await?;
+            if first && matches!(res.status(), StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::BAD_REQUEST) {
+                return Ok(None);
+            }
+            if !res.status().is_success() {
+                return Err(Self::failure(format!("Couldn't list what refers to {}@{digest}", self.repo), res).await);
+            }
+            let is_index = res.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|t| t.starts_with(OCI_INDEX));
+            let next = res.headers().get("link").and_then(|v| v.to_str().ok()).and_then(next_link).map(String::from);
+            let body = read_capped(res, MAX_MANIFEST, &what).await?;
+            let page = match serde_json::from_slice::<Value>(&body) {
+                Ok(v) => v["manifests"].as_array().cloned(),
+                Err(_) => None,
+            };
+            match page {
+                Some(m) => all.extend(m),
+                None if first && !is_index => return Ok(None),
+                None => return Err(format!("{what} aren't an index")),
+            }
+            if all.len() > MAX_REFERRERS {
+                return Err(format!("{what} list more than {MAX_REFERRERS}: refusing them"));
+            }
+            let Some(next) = next else { return Ok(Some(all)) };
+            let u = self.resolve(&url, &next, "next page of referrers")?;
+            if !self.ours(u.as_str()) {
+                return Err(format!("{what} continue on {u}, not on {}: refusing it", self.repo.host));
+            }
+            url = u.to_string();
+            first = false;
+        }
+    }
+
+    pub async fn blob_exists(&self, digest: &str) -> Result<bool, String> {
+        let res = self.send(Method::HEAD, &self.url(&format!("blobs/{digest}")), &[], &Body::Empty).await?;
+        match res.status() {
+            s if s.is_success() => Ok(true),
+            StatusCode::NOT_FOUND => Ok(false),
+            _ => Err(Self::failure(format!("Couldn't check {}@{digest}", self.repo), res).await),
+        }
+    }
+
+    /// Downloads a blob into DEST, refusing it unless it hashes to DIGEST or if it is over MAX.
+    pub async fn fetch_blob(&self, digest: &str, dest: &Path, max: u64) -> Result<(), String> {
+        use sha2::Digest;
+        let mut res = self.send(Method::GET, &self.url(&format!("blobs/{digest}")), &[], &Body::Empty).await?;
+        if !res.status().is_success() {
+            return Err(Self::failure(format!("Couldn't read {}@{digest}", self.repo), res).await);
+        }
+        let part = dest.with_extension("part");
+        let mut f = std::fs::File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?;
+        let mut h = sha2::Sha256::new();
+        let mut n: u64 = 0;
+        while let Some(chunk) = res.chunk().await.map_err(|e| format!("{}@{digest}: {}", self.repo, chain(&e)))? {
+            n += chunk.len() as u64;
+            if n > max {
+                let _ = std::fs::remove_file(&part);
+                return Err(format!("{}@{digest} is over {} MiB: refusing it", self.repo, max >> 20));
+            }
+            h.update(&chunk);
+            f.write_all(&chunk).map_err(|e| format!("{}: {e}", part.display()))?;
+        }
+        let got = format!("sha256:{}", h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>());
+        if got != digest {
+            let _ = std::fs::remove_file(&part);
+            return Err(format!("{}@{digest} came back as {got}: refusing it", self.repo));
+        }
+        std::fs::rename(&part, dest).map_err(|e| format!("{}: {e}", dest.display()))
+    }
+
+    /// A small blob's bytes (a config), checked against DIGEST.
+    pub async fn blob_bytes(&self, digest: &str, max: usize) -> Result<Vec<u8>, String> {
+        let res = self.send(Method::GET, &self.url(&format!("blobs/{digest}")), &[], &Body::Empty).await?;
+        if !res.status().is_success() {
+            return Err(Self::failure(format!("Couldn't read {}@{digest}", self.repo), res).await);
+        }
+        let b = read_capped(res, max, &format!("{}@{digest}", self.repo)).await?;
+        if sha256_digest(&b) != digest {
+            return Err(format!("{}@{digest} came back as {}: refusing it", self.repo, sha256_digest(&b)));
+        }
+        Ok(b)
+    }
+
+    /// Uploads SRC as DIGEST unless the registry has it; the registry checks the digest.
+    pub async fn push_blob(&self, digest: &str, src: &Path) -> Result<(), String> {
+        self.upload(digest, &Body::File(src)).await
+    }
+
+    pub async fn push_bytes(&self, digest: &str, bytes: &[u8]) -> Result<(), String> {
+        self.upload(digest, &Body::Bytes(bytes, "application/octet-stream")).await
+    }
+
+    async fn upload(&self, digest: &str, body: &Body<'_>) -> Result<(), String> {
+        if self.blob_exists(digest).await? {
+            return Ok(());
+        }
+        let start = self.url("blobs/uploads/");
+        let res = self.send(Method::POST, &start, &[(CONTENT_LENGTH, "0".into())], &Body::Empty).await?;
+        if res.status() != StatusCode::ACCEPTED {
+            return Err(Self::failure(format!("Couldn't start an upload to {}", self.repo), res).await);
+        }
+        let loc = res.headers().get(LOCATION).and_then(|v| v.to_str().ok()).ok_or(format!("{} started an upload without a Location", self.repo.host))?;
+        let mut url = self.resolve(&start, loc, "upload location")?;
+        url.query_pairs_mut().append_pair("digest", digest);
+        let res = self.send(Method::PUT, url.as_str(), &[], body).await?;
+        if !res.status().is_success() {
+            return Err(Self::failure(format!("Couldn't upload {}@{digest}", self.repo), res).await);
+        }
+        Ok(())
+    }
+}
+
+/// A manifest's media type: its own `mediaType`, else an index if it lists manifests.
+pub fn media_type(m: &Value) -> &str {
+    m["mediaType"].as_str().unwrap_or(if m.get("manifests").is_some() { OCI_INDEX } else { OCI_MANIFEST })
+}
+
+pub fn is_index(m: &Value) -> bool {
+    m.get("manifests").is_some_and(Value::is_array)
+}
+
+/// The blobs an image manifest names: its config and layers.
+pub fn blobs_of(m: &Value) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = m["config"]["digest"].as_str().into_iter().map(String::from).collect();
+    out.extend(m["layers"].as_array().into_iter().flatten().filter_map(|l| l["digest"].as_str()).map(String::from));
+    if let Some(bad) = out.iter().find(|d| !digest_ok(d)) {
+        return Err(format!("a manifest names {bad}, which isn't a sha256 digest"));
+    }
+    Ok(out)
+}

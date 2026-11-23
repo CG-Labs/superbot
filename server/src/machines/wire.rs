@@ -124,6 +124,9 @@ pub const CAN_EGRESS_POLICY: &str = "egress_policy";
 /// own umask and TMPDIR, and it refuses users with a privileged group or a sudo rule
 /// (ADR 0145).
 pub const CAN_LOCKED_DOWN: &str = "locked_down";
+/// Every such process also runs under a seccomp filter that refuses the kernel
+/// interfaces a run never needs (ADR 0156).
+pub const CAN_SECCOMP: &str = "seccomp";
 
 /// The screen protocol this build speaks (ADR 0045). A request names it, an agent
 /// refuses any other, and botd treats an agent that reports another as outdated.

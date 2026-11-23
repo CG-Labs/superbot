@@ -2,12 +2,13 @@
 # Offline bundles for air-gapped installs (docs/adr/0128-air-gapped-self-host.md,
 # docs/ops/air-gapped.md). Made on a connected machine, carried in, installed with
 # `install.sh --offline`, which checks it the same way `verify` does.
-#   deploy/offline-bundle.sh build --out DIR [--version V] [--bin-dir DIR] [--client-dir DIR]
-#                                  [--image NAME=REF]... [--image-identity ID] [--allow-unsigned]
+#   deploy/offline-bundle.sh build --out DIR [--version V] [--bin-dir DIR] [--client-dir DIR] [--arch A]
+#                                  [--image NAME=REF]... [--image-identity ID | --image-key FILE] [--allow-unsigned]
 #   deploy/offline-bundle.sh verify BUNDLE [--sha256 HEX]
 #   deploy/offline-bundle.sh load BUNDLE [--sha256 HEX]      # docker load its images, no network
-#   deploy/offline-bundle.sh push BUNDLE --registry HOST[:PORT][/PATH] [--sha256 HEX]
-#                                  # copy its images to a registry mirror, digests unchanged
+#   deploy/offline-bundle.sh push BUNDLE... --registry HOST[:PORT][/PATH] [--sha256 HEX]...
+#                                  # copy its images, signatures and attestations to a registry mirror,
+#                                  # digests unchanged; one bundle per arch puts up the signed multi-arch index
 set -euo pipefail
 
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -20,7 +21,35 @@ DOCKER_FILES=(docker-compose.yml Caddyfile .env.example init.sh seccomp-chromium
 IMAGE_ISSUER=https://token.actions.githubusercontent.com
 
 usage() {
-  sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+# The first of SUPERBOT_OCI and CANDIDATES (then superbot-oci on PATH) that runs here: one
+# built for another arch doesn't. superbot-oci copies the signatures and attestations, which
+# skopeo can't (docs/adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md).
+find_oci() {
+  local c
+  for c in "${SUPERBOT_OCI:-}" "$@" "$(command -v superbot-oci 2>/dev/null || true)"; do
+    [[ -n "$c" && -f "$c" && -x "$c" ]] || continue
+    if "$c" --version >/dev/null 2>&1; then
+      printf '%s\n' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Unpacks an OCI layout TAR from a checked bundle into DEST, if it is plain files and folders.
+untar_layout() {
+  local tar=$1 dest=$2 entries names
+  entries=$(tar -tvf "$tar" 2>/dev/null) || die "Couldn't read $tar"
+  names=$(tar -tf "$tar" 2>/dev/null) || die "Couldn't read $tar"
+  local bad=false
+  awk '{ t = substr($0, 1, 1) } t != "-" && t != "d" { bad = 1 } END { exit bad }' <<<"$entries" || bad=true
+  if grep -Eq '^/|(^|/)\.\.(/|$)' <<<"$names"; then bad=true; fi
+  [[ "$bad" == false ]] || die "Refusing $tar: it holds links, special files or paths outside it"
+  mkdir -p "$dest"
+  tar -xf "$tar" -C "$dest" --no-same-owner --no-same-permissions || die "Couldn't unpack $tar"
 }
 
 # The repository root: the checkout this script is in (deploy/..).
@@ -122,10 +151,13 @@ oci_image_archive() {
 
 # NAME=REF: this arch's image, its cosign signature checked (unless --allow-unsigned), saved as
 # an OCI archive with the registry's digests, with what the check printed (certificate, Rekor
-# entry) and its SBOM beside it. An unsigned image of your own comes from the local Docker if
-# it is there, else from its registry.
+# entry) and its SBOM beside it, and its signatures and attestations (an OCI layout, for push)
+# in signatures/NAME.tar.
+# With KEY, the signature is checked against that public key instead of IDENTITY. An unsigned
+# image of your own comes from the local Docker if it is there, else from its registry.
 bundle_image() {
-  local spec=$1 out=$2 arch=$3 identity=$4 unsigned=$5 name ref darch digest got
+  local spec=$1 out=$2 arch=$3 identity=$4 unsigned=$5 key=$6 name ref darch digest got signer sigs
+  local check=(--certificate-identity "$identity" --certificate-oidc-issuer "$IMAGE_ISSUER")
   name=${spec%%=*} ref=${spec#*=}
   [[ "$spec" == *=* && "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "--image wants NAME=REF, e.g. superbot=ghcr.io/cg-labs/superbot:0.1.0"
   image_ref_ok "$ref" || die "--image $name: \"$ref\" isn't a tagged image reference (HOST/PATH:TAG, lowercase, no digest)"
@@ -137,14 +169,30 @@ bundle_image() {
   if [[ "$unsigned" != true ]]; then
     command -v cosign >/dev/null 2>&1 || die "cosign is needed to check $ref's signature (or --allow-unsigned for an image of your own)"
     command -v docker >/dev/null 2>&1 || die "--image needs docker (buildx) to read $ref's SBOM"
+    signer=$identity
+    if [[ -n "$key" ]]; then
+      # A key's signatures have no transparency log entry to check: the key is the trust.
+      check=(--key "$key" --insecure-ignore-tlog=true)
+      signer="the key in $key"
+    fi
     resolve_registry_image "$ref" "$darch"
-    cosign verify "$IMAGE_TOP" --certificate-identity "$identity" --certificate-oidc-issuer "$IMAGE_ISSUER" \
-      --output json >"$out/images/$name.cosign.json" || die "$ref isn't signed by $identity: not bundling it"
-    log "Signature checked: $IMAGE_TOP, signed by $identity"
+    cosign verify "$IMAGE_TOP" "${check[@]}" --output json >"$out/images/$name.cosign.json" || die "$ref isn't signed by $signer: not bundling it"
+    log "Signature checked: $IMAGE_TOP, signed by $signer"
     docker buildx imagetools inspect "$IMAGE_TOP" --format "{{ json (index .SBOM \"linux/$darch\").SPDX }}" >"$out/images/$name.sbom.spdx.json" \
       || die "Couldn't read $ref's SBOM"
     digest=$(oci_image_archive "docker://$IMAGE_PLATFORM" "$ref" "$out/images/$name.tar")
     [[ "$digest" == "${IMAGE_PLATFORM#*@}" ]] || die "Copying $ref changed its digest ($digest, not ${IMAGE_PLATFORM#*@}): not bundling it"
+    sigs=$(mktemp -d "$OFFLINE_TMP/signatures.XXXXXX")
+    rmdir "$sigs"
+    "$OCI_TOOL" fetch --from "$(image_full_name "$IMAGE_TOP")" --image "$digest" --out "$sigs" \
+      || die "Couldn't copy $ref's signatures and attestations into the bundle"
+    # Beside images/, not in it: an older offline-bundle.sh would docker load any images/*.tar.
+    mkdir -p "$out/signatures"
+    tar -C "$sigs" --owner=0 --group=0 --numeric-owner --sort=name -cf "$out/signatures/$name.tar" oci-layout index.json blobs
+    chmod 0644 "$out/signatures/$name.tar"
+    rm -rf -- "$sigs"
+    # The signed index the image came from, which push puts up when it has every arch's bundle.
+    [[ "$IMAGE_TOP" == "$IMAGE_PLATFORM" ]] || printf '%s\n' "${IMAGE_TOP#*@}" >"$out/images/$name.index"
   else
     warn "Bundling $ref without checking a signature (--allow-unsigned)"
     if command -v docker >/dev/null 2>&1 && docker image inspect "$ref" >/dev/null 2>&1; then
@@ -166,7 +214,7 @@ bundle_image() {
 }
 
 cmd_build() {
-  local out="" version="" root bin_dir client_dir arch identity="" unsigned=false images=() stage top f commit name
+  local out="" version="" root bin_dir client_dir arch identity="" key="" unsigned=false images=() stage top f commit name
   root=$(repo_root)
   bin_dir="$root/target/release"
   client_dir="$root/apps/client/dist-app"
@@ -180,6 +228,7 @@ cmd_build() {
       --arch) arch=$2; shift 2 ;;
       --image) images+=("$2"); shift 2 ;;
       --image-identity) identity=$2; shift 2 ;;
+      --image-key) key=$2; shift 2 ;;
       --allow-unsigned) unsigned=true; shift ;;
       -h|--help) usage; exit 0 ;;
       *) die "Unknown option: $1" ;;
@@ -189,6 +238,8 @@ cmd_build() {
   version=${version:-$(cargo_version "$root")}
   [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]] || die "--version \"$version\" isn't a version"
   [[ "$arch" =~ ^(x86_64|aarch64)$ ]] || die "--arch must be x86_64 or aarch64"
+  [[ -z "$key" || -z "$identity" ]] || die "Give --image-identity or --image-key, not both"
+  [[ -z "$key" || -f "$key" ]] || die "--image-key: no file at $key"
   identity=${identity:-https://github.com/CG-Labs/superbot/.github/workflows/docker.yml@refs/tags/v$version}
   commit=$(git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)
 
@@ -202,6 +253,15 @@ cmd_build() {
     [[ -f "$bin_dir/$f" && -x "$bin_dir/$f" ]] || die "No $bin_dir/$f: run cargo build --release first (or give --bin-dir)"
     install -m 0755 "$bin_dir/$f" "$stage/bin/$f"
   done
+  # superbot-oci goes with the images, for push on the mirror's side; the installer doesn't use it.
+  if [[ ${#images[@]} -gt 0 ]]; then
+    [[ -f "$bin_dir/superbot-oci" && -x "$bin_dir/superbot-oci" ]] || die "No $bin_dir/superbot-oci, which a bundle with images carries: cargo build --release --bin superbot-oci"
+  fi
+  [[ ! -f "$bin_dir/superbot-oci" ]] || install -m 0755 "$bin_dir/superbot-oci" "$stage/bin/superbot-oci"
+  if [[ ${#images[@]} -gt 0 && "$unsigned" != true ]]; then
+    OCI_TOOL=$(find_oci "$bin_dir/superbot-oci") \
+      || die "No superbot-oci runs on this machine to copy the images' signatures ($bin_dir/superbot-oci is for $arch): set SUPERBOT_OCI to one built for $(uname -m)"
+  fi
   for f in "${DEPLOY_FILES[@]}" install.sh offline-bundle.sh; do
     install -m "$(script_mode "$f")" "$root/deploy/$f" "$stage/deploy/$f"
   done
@@ -216,7 +276,7 @@ cmd_build() {
 
   local names=()
   for f in "${images[@]}"; do
-    bundle_image "$f" "$stage" "$arch" "$identity" "$unsigned"
+    bundle_image "$f" "$stage" "$arch" "$identity" "$unsigned" "$key"
     names+=("${f%%=*}")
   done
 
@@ -249,7 +309,7 @@ verify_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --sha256) OFFLINE_BUNDLE_SHA256=$2; shift 2 ;;
-      --registry) [[ "${ALLOW_REGISTRY:-}" == 1 ]] || die "--registry is for push"; PUSH_REGISTRY=$2; shift 2 ;;
+      --registry) die "--registry is for push" ;;
       *) die "Unknown option: $1" ;;
     esac
   done
@@ -304,48 +364,135 @@ compose_image_var() {
   esac
 }
 
-# Copies each image to REGISTRY/<its repository's last part>:<its tag> from the OCI archive, as it
-# is: the registry ends up with the digest the bundle recorded (the one whose signature was
-# checked when it was bundled), and that is checked after the push.
+# BUNDLE... [--sha256 HEX]...: each image goes to REGISTRY/<its repository's last part>:<its tag>
+# as it is, with the signatures and attestations bundled with it, through superbot-oci. One
+# bundle per arch of one release puts up the signed multi-arch index the images came from, so
+# the tag names the digest cosign checked; one bundle puts up its image alone. The digest the tag
+# names after the push is checked.
 cmd_push() {
-  local PUSH_REGISTRY=""
-  ALLOW_REGISTRY=1 verify_args "$@"
-  [[ -n "$PUSH_REGISTRY" ]] || die "push needs --registry HOST[:PORT][/PATH], e.g. --registry registry.corp.example/superbot"
-  registry_ok "$PUSH_REGISTRY" || die "--registry \"$PUSH_REGISTRY\" isn't HOST[:PORT][/path] (a host with a dot or a port, or localhost; a lowercase path)"
-  command -v skopeo >/dev/null 2>&1 || die "push needs skopeo (docs/ops/air-gapped.md#registry-mirrors)"
-  OFFLINE_ANY_ARCH=1 offline_unpack_bundle "$BUNDLE" "$OFFLINE_TMP"
-  [[ -n "$(manifest_value "$OFFLINE_DIR/MANIFEST" images)" ]] || die "This bundle has no images: it is for install.sh --offline only"
-  [[ "$(manifest_value "$OFFLINE_DIR/MANIFEST" image_format)" == oci ]] \
-    || die "This bundle's images are docker save archives, which a registry can't take with their digests: use a bundle made by a newer offline-bundle.sh, or docker load and docker push"
-  local tar name ref want dest got var arch envs=() names=() dests=()
-  arch=$(manifest_value "$OFFLINE_DIR/MANIFEST" arch)
-  # Every destination first: two images whose repositories end alike (team-a/app:1, team-b/app:1)
-  # would take the same tag, and the second push would silently replace the first.
+  local registry="" bundles=() sums=() i j s
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --registry) registry=$2; shift 2 ;;
+      --sha256) sums+=("$2"); shift 2 ;;
+      -*) die "Unknown option: $1" ;;
+      *) bundles+=("$1"); shift ;;
+    esac
+  done
+  [[ -n "$registry" ]] || die "push needs --registry HOST[:PORT][/PATH], e.g. --registry registry.corp.example/superbot"
+  registry_ok "$registry" || die "--registry \"$registry\" isn't HOST[:PORT][/path] (a host with a dot or a port, or localhost; a lowercase path)"
+  [[ ${#bundles[@]} -gt 0 ]] || die "Give the bundle, or one bundle per arch"
+  [[ ${#sums[@]} -eq 0 || ${#sums[@]} -eq ${#bundles[@]} ]] || die "Give one --sha256 per bundle, in the bundles' order, or none"
+  for s in "${sums[@]}"; do [[ "$s" =~ ^[0-9a-f]{64}$ ]] || die "--sha256 must be 64 lowercase hex digits"; done
+  OFFLINE_TMP=$(mktemp -d)
+  trap cleanup_offline EXIT
+
+  local dirs=() arches=() trusted=() version="" listed="" dir arch b
+  for i in "${!bundles[@]}"; do
+    b=${bundles[i]}
+    [[ -f "$b" ]] || die "No bundle at $b"
+    mkdir "$OFFLINE_TMP/b$i"
+    OFFLINE_BUNDLE_SHA256=${sums[i]:-}
+    OFFLINE_ANY_ARCH=1 offline_unpack_bundle "$b" "$OFFLINE_TMP/b$i"
+    dir=$OFFLINE_DIR arch=$(manifest_value "$OFFLINE_DIR/MANIFEST" arch)
+    [[ -n "$(manifest_value "$dir/MANIFEST" images)" ]] || die "$b has no images: it is for install.sh --offline only"
+    [[ "$(manifest_value "$dir/MANIFEST" image_format)" == oci ]] \
+      || die "$b's images are docker save archives, which a registry can't take with their digests: use a bundle made by a newer offline-bundle.sh, or docker load and docker push"
+    if [[ $i -gt 0 ]]; then
+      [[ "$OFFLINE_VERSION" == "$version" ]] || die "$b is $OFFLINE_VERSION, but ${bundles[0]} is $version: give bundles of one release, one per arch"
+      [[ "$(manifest_value "$dir/MANIFEST" images)" == "$listed" ]] || die "$b and ${bundles[0]} hold different images: give bundles of one release, one per arch"
+      for s in "${arches[@]}"; do [[ "$s" != "$arch" ]] || die "Two of these bundles are for $arch: give one per arch"; done
+    fi
+    version=$OFFLINE_VERSION listed=$(manifest_value "$dir/MANIFEST" images)
+    dirs+=("$dir") arches+=("$arch")
+    # A bundle's superbot-oci is run only if the bundle was checked against something the
+    # operator chose: its verified signature, or a --sha256 from where it was published. A
+    # .sha256 file beside it could have been replaced with it.
+    if [[ "$OFFLINE_SIGNED" == true || -n "${sums[i]:-}" ]]; then trusted+=("$dir"); fi
+  done
+  local multi=false
+  [[ ${#dirs[@]} -eq 1 ]] || multi=true
+
+  # Everything is checked before anything is pushed: two images whose repositories end alike
+  # (team-a/app:1, team-b/app:1) would take the same tag, and the second push would silently
+  # replace the first; bundles that can't make up an image's signed index would leave it half done.
+  local tar name ref dest index names=() dests=() indexes=()
   declare -A seen=()
-  for tar in "$OFFLINE_DIR"/images/*.tar; do
+  for tar in "${dirs[0]}"/images/*.tar; do
     [[ -f "$tar" ]] || continue
     name=$(basename "$tar" .tar)
-    ref=$(cat "$OFFLINE_DIR/images/$name.ref")
-    image_ref_ok "$ref" || die "Refusing $BUNDLE: images/$name.ref isn't an image reference"
-    [[ "$(cat "$OFFLINE_DIR/images/$name.digest")" =~ ^sha256:[0-9a-f]{64}$ ]] || die "Refusing $BUNDLE: images/$name.digest isn't a digest"
-    dest="$PUSH_REGISTRY/$(basename "$(image_repo "$ref")"):$(image_tag "$ref")"
+    ref=$(cat "${dirs[0]}/images/$name.ref")
+    image_ref_ok "$ref" || die "Refusing ${bundles[0]}: images/$name.ref isn't an image reference"
+    index=""
+    for j in "${!dirs[@]}"; do
+      dir=${dirs[j]} b=${bundles[j]}
+      [[ -f "$dir/images/$name.tar" && "$(cat "$dir/images/$name.ref")" == "$ref" ]] || die "$b doesn't hold the same $name image ($ref) as ${bundles[0]}: give bundles of one release"
+      [[ "$(cat "$dir/images/$name.digest")" =~ ^sha256:[0-9a-f]{64}$ ]] || die "Refusing $b: images/$name.digest isn't a digest"
+      [[ "$multi" == true ]] || { index=$(cat "$dir/images/$name.index" 2>/dev/null || true); continue; }
+      [[ -f "$dir/images/$name.index" && -f "$dir/signatures/$name.tar" ]] \
+        || die "$b's $name image has no signed multi-arch index with it (unsigned, or bundled before ADR 0147), so these bundles can't put one up: push each to its own --registry path"
+      s=$(cat "$dir/images/$name.index")
+      [[ -z "$index" || "$s" == "$index" ]] || die "The bundles' $name images come from different signed indexes ($index, $s): give bundles of one release"
+      index=$s
+    done
+    [[ -z "$index" || "$index" =~ ^sha256:[0-9a-f]{64}$ ]] || die "Refusing ${bundles[0]}: images/$name.index isn't a digest"
+    dest="$registry/$(basename "$(image_repo "$ref")"):$(image_tag "$ref")"
     [[ -z "${seen[$dest]:-}" ]] || die "Images ${seen[$dest]} and $name would both be pushed to $dest: nothing pushed"
     seen[$dest]=$name
-    names+=("$name") dests+=("$dest")
+    names+=("$name") dests+=("$dest") indexes+=("$index")
   done
-  skopeo_copy_args
-  local i
+
+  local oci tools=() untrusted=false
+  for dir in "${trusted[@]}"; do
+    [[ ! -f "$dir/bin/superbot-oci" ]] || { chmod 0755 "$dir/bin/superbot-oci"; tools+=("$dir/bin/superbot-oci"); }
+  done
+  for dir in "${dirs[@]}"; do
+    if [[ -f "$dir/bin/superbot-oci" && ${#tools[@]} -eq 0 ]]; then untrusted=true; fi
+  done
+  if ! oci=$(find_oci "${tools[@]}"); then
+    [[ "$untrusted" == false ]] \
+      || die "push runs the bundle's superbot-oci only when the bundle is checked against its signature (with cosign here) or a --sha256 you give from where it was published, not just the .sha256 file beside it: give --sha256, or set SUPERBOT_OCI to a superbot-oci you trust (docs/ops/air-gapped.md#registry-mirrors)"
+    die "push needs superbot-oci, which bundles with images carry in bin/ (one for this machine's arch, $(uname -m)); or set SUPERBOT_OCI to one (docs/ops/air-gapped.md#registry-mirrors)"
+  fi
+
+  # Every image's layouts are unpacked and checked by superbot-oci (with no network) before the
+  # first push, so one that can't go up leaves the mirror as it was.
+  local u units top want what var envs=() platforms="" wants=() whats=()
+  for arch in "${arches[@]}"; do platforms+="${platforms:+, }linux/$(docker_arch "$arch")"; done
   for i in "${!names[@]}"; do
-    name=${names[i]} dest=${dests[i]} tar="$OFFLINE_DIR/images/${names[i]}.tar"
-    ref=$(cat "$OFFLINE_DIR/images/$name.ref")
-    want=$(cat "$OFFLINE_DIR/images/$name.digest")
-    "${SKOPEO_COPY[@]}" "oci-archive:$tar" "docker://$dest" >/dev/null || die "Couldn't push $name to $dest"
-    skopeo inspect --raw "docker://$dest" >"$OFFLINE_TMP/pushed.json" || die "Couldn't read $dest back from the registry"
-    got="sha256:$(sha256sum <"$OFFLINE_TMP/pushed.json" | awk '{ print $1 }')"
-    [[ "$got" == "$want" ]] || die "$dest is $got after the push, not the bundle's $want: don't use it"
-    log "Pushed $ref to $dest ($want, linux/$(docker_arch "$arch"))"
+    name=${names[i]} dest=${dests[i]} index=${indexes[i]} units=()
+    for j in "${!dirs[@]}"; do
+      u="$OFFLINE_TMP/units/$name/$j"
+      untar_layout "${dirs[j]}/images/$name.tar" "$u/image"
+      [[ ! -f "${dirs[j]}/signatures/$name.tar" ]] || untar_layout "${dirs[j]}/signatures/$name.tar" "$u/signatures"
+      units+=("$u")
+    done
+    top=$("$oci" push --check --to "$dest" "${units[@]}") || die "Can't push $name to $dest: nothing pushed"
+    if [[ "$multi" == true ]]; then
+      want=$index what="the signed index for $platforms"
+    else
+      want=$(cat "${dirs[0]}/images/$name.digest") what="linux/$(docker_arch "${arches[0]}")"
+      # An index that lists this arch alone (and its attestations) is put up whole.
+      [[ -z "$index" || "$top" != "$index" ]] || want=$index what="the signed index for linux/$(docker_arch "${arches[0]}")"
+    fi
+    [[ "$top" == "$want" ]] || die "$dest would name $top, not the bundle's $want: nothing pushed"
+    wants+=("$want") whats+=("$what")
+  done
+
+  for i in "${!names[@]}"; do
+    name=${names[i]} dest=${dests[i]} want=${wants[i]} what=${whats[i]} units=()
+    ref=$(cat "${dirs[0]}/images/$name.ref")
+    for j in "${!dirs[@]}"; do
+      u="$OFFLINE_TMP/units/$name/$j"
+      [[ -d "$u/signatures" ]] \
+        || warn "$name (${arches[j]}) has no signatures in its bundle (unsigned, or bundled before ADR 0147): cosign verify won't find any in the mirror"
+      units+=("$u")
+    done
+    top=$("$oci" push --to "$dest" "${units[@]}") || die "Couldn't push $name to $dest"
+    [[ "$top" == "$want" ]] || die "$dest is $top after the push, not the bundle's $want: don't use it"
+    log "Pushed $ref to $dest ($top, $what)"
     var=$(compose_image_var "$name")
-    [[ -z "$var" ]] || envs+=("$var=$(image_repo "$dest")@$want")
+    [[ -z "$var" ]] || envs+=("$var=$(image_repo "$dest")@$top")
   done
   if [[ ${#envs[@]} -gt 0 ]]; then
     log "For Compose, pin these in .env (docs/ops/air-gapped.md#registry-mirrors):"

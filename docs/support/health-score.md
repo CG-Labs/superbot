@@ -11,7 +11,7 @@ botctl health-score                 # the last 30 days, one line per signal
 botctl health-score --days 90 json  # the full report as JSON
 ```
 
-Or `GET /api/support/health-score?days=30` as an admin. The window is 7 to 90 days, 30 if not given. Members, read-only users, custom roles and Bots get 403. A [support bundle](support-bundle.md) carries the same report for the last 30 days as `health-score.json`.
+Or `GET /api/support/health-score?days=30` as an admin, or the console's **Support** tab, which shows the score, each signal and the history below, with a button for the [support bundle](support-bundle.md). The window is 7 to 90 days, 30 if not given. Members, read-only users, custom roles and Bots get 403. A [support bundle](support-bundle.md) carries the same report for the last 30 days as `health-score.json`.
 
 The report has counts and reason codes only: no names, emails, IP addresses, Bot names, chats or free-text reasons. It can go into a review deck as it is.
 
@@ -74,8 +74,21 @@ Self-hosted servers: watch when the license ends within 30 days or 90% of its se
 
 When it's watch or at risk: renewals and seats go to the account owner; `botctl license` shows the detail. Air-gapped servers need the new key carried in ([air-gapped runbook](runbook-air-gapped.md)).
 
+## History
+
+botd records the 30-day score once a UTC day, within its first hours, and keeps 400 days of them (`HEALTH_SCORE_HISTORY_DAYS`, 1 to 3650; 0 records none). Each day keeps only the score, its band and each signal's status. Design: [ADR 0157](../adr/0157-health-score-history-and-console.md).
+
+```sh
+botctl health-score history             # the last 90 days, a line per day, then the trend
+botctl health-score history --days 365  # a year, for the business review
+```
+
+Or `GET /api/support/health-score/history?days=90` as an admin (1 to 3650 days), or the console's Support tab. The trend compares the newest day with the oldest in the window: the score's change, and the signals that got worse or better (one that was n/a on either day is neither). History starts when botd first runs with this version: past days aren't worked out afterwards, since who was active then can't be read back. A [support bundle](support-bundle.md) carries the last 90 days as `health-score-history.json`.
+
+At a [health check](health-check.md), a fall of 10 points or more since the last check, or a signal that went from ok to at risk, is worth a line in the customer's record even if the band didn't change.
+
 ## What it isn't
 
 - **Not a measure of support.** Tickets, response times and satisfaction live in the support system, which botd can't see. Put them beside the score in the [review](qbr-template.md).
-- **Not history.** botd doesn't keep past scores. Record each health check's score in the customer's record (outside this repository) to see the trend.
+- **Not a full archive.** History keeps each day's score, band and signal statuses, not the counts behind them; the support bundle and the report for a window carry those. Copy the score into the customer's record at each check too, since history goes after `HEALTH_SCORE_HISTORY_DAYS`.
 - **Not the status page.** An outage shows on `/status`; the score shows what the last weeks were like for the customer's people.

@@ -98,6 +98,10 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    Pin their data to a region under an agreement (ADR 0129):
                                                    machines, backups and restores stay there or are refused.
                                                    Refused while any of it is elsewhere. Unpinning needs a reason
+  botctl user|team residency <user|team> report [--from <when>] [--to <when>] [--json] [-o <file>]
+                                                   A residency report for the customer (ADR 0155): where their
+                                                   data is, what the pin refused or held, with a digest.
+                                                   Markdown unless --json; the last 90 days by default
   botctl regions                                   The data regions offered, who and what is in each, the
                                                    hosts and backup store in each, and residency warnings
   botctl tiers                                     Every tier, its routes and limits, and the default
@@ -212,6 +216,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl health-score [--days <n>] [json]          The customer health score (ADR 0144) for the last 30 days
                                                    (7 to 90): adoption, Bot runs, sign-in and SCIM, backups,
                                                    approvals and the license, each ok, watch or at risk
+  botctl health-score history [--days <n>] [json]  The score botd recorded each day (ADR 0157) for the last
+                                                   90 days (1 to 3650), and what got worse or better
   botctl evidence                                  The evidence bundle schedule (EVIDENCE_BUNDLES), where
                                                    bundles are written and those kept (ADR 0142)
   botctl evidence bundle [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]
@@ -850,6 +856,27 @@ fn region_request(args: &[&str]) -> Option<(&'static str, String, Option<String>
         }
         _ => return None,
     })
+}
+
+/// `botctl user|team residency <key> report [--from <when>] [--to <when>] [--json] [-o <file>]`
+/// (ADR 0155): the path, and the file to save it in.
+fn residency_report_request<'a>(kind: &str, key: &str, rest: &[&'a str]) -> Result<(String, Option<&'a str>), String> {
+    let usage = || format!("Usage: botctl {kind} residency <{kind}> report [--from <when>] [--to <when>] [--json] [-o <file>]");
+    let (mut pairs, mut json, mut out) = (Vec::new(), false, None);
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "--json" => json = true,
+            f @ ("--from" | "--to") => pairs.push(format!("{}={}", &f[2..], encode(it.next().ok_or_else(usage)?))),
+            "-o" | "--out" => out = Some(*it.next().ok_or_else(usage)?),
+            _ => return Err(usage()),
+        }
+    }
+    if !json {
+        pairs.push("format=markdown".into());
+    }
+    let q = if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) };
+    Ok((format!("/api/{kind}s/{}/residency/report{q}", encode(key)), out))
 }
 
 /// `botctl machine egress ...` and `botctl user egress ...` (ADR 0135): the request to send.
@@ -1701,6 +1728,11 @@ fn run(args: &[String]) -> Result<String, String> {
         ["approvals", status] => op("GET", &format!("/api/approvals?status={status}"), None),
         [verb @ ("approve" | "deny"), id, rest @ ..] => decide(verb, id, rest),
         ["support-bundle", rest @ ..] => support_bundle(rest),
+        ["health-score", "history", rest @ ..] => {
+            let (path, json) = health_request_at(rest, "/api/support/health-score/history", "Usage: botctl health-score history [--days <n>] [json]")?;
+            let res = api(Cred::Operator, "GET", &path, None)?;
+            if json { Ok(pretty(res)) } else { Ok(history_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)) }
+        }
         ["health-score", rest @ ..] => {
             let (path, json) = health_request(rest)?;
             let res = api(Cred::Operator, "GET", &path, None)?;
@@ -1735,6 +1767,15 @@ fn run(args: &[String]) -> Result<String, String> {
         ["logout"] => op("POST", "/api/auth/logout", None).map(|_| "Signed out. Unset SUPERBOT_TOKEN.".into()),
         ["whoami"] => op("GET", "/api/auth/me", None),
         ["users"] | ["user", "list"] => op("GET", "/api/users", None),
+        [kind @ ("user" | "team"), "residency", key, "report", rest @ ..] => {
+            let (path, out) = residency_report_request(kind, key, rest)?;
+            let res = api(Cred::Operator, "GET", &path, None)?;
+            let res = if path.contains("format=markdown") { res } else { pretty(res) };
+            match out {
+                Some(file) => save_private(file, res.as_bytes()).map(|_| format!("Saved {file}.")),
+                None => Ok(res),
+            }
+        }
         [..] if region_request(&a).is_some() => {
             let (method, path, body) = region_request(&a).unwrap();
             op(method, &path, body)
@@ -1920,7 +1961,11 @@ fn support_bundle(rest: &[&str]) -> Result<String, String> {
 
 /// `botctl health-score [--days <n>] [json]`: the path, and whether to print the JSON.
 fn health_request(rest: &[&str]) -> Result<(String, bool), String> {
-    let usage = || "Usage: botctl health-score [--days <n>] [json]".to_string();
+    health_request_at(rest, "/api/support/health-score", "Usage: botctl health-score [--days <n>] [json]")
+}
+
+fn health_request_at(rest: &[&str], base: &str, usage: &str) -> Result<(String, bool), String> {
+    let usage = || usage.to_string();
     let (mut days, mut json) = (None, false);
     let mut args = rest.iter();
     while let Some(a) = args.next() {
@@ -1934,10 +1979,47 @@ fn health_request(rest: &[&str]) -> Result<(String, bool), String> {
         }
     }
     let path = match days {
-        Some(d) => format!("/api/support/health-score?days={d}"),
-        None => "/api/support/health-score".into(),
+        Some(d) => format!("{base}?days={d}"),
+        None => base.into(),
     };
     Ok((path, json))
+}
+
+/// The recorded days for a person: a line per day with a bar, then the trend.
+fn history_summary(v: &Value) -> String {
+    let points = v["points"].as_array().cloned().unwrap_or_default();
+    let mut out = format!("Customer health history: last {} days, {} recorded\n", v["days"], if points.len() == 1 { "1 day".to_string() } else { format!("{} days", points.len()) });
+    if v["recording"] == false {
+        out.push_str("botd isn't recording the score (HEALTH_SCORE_HISTORY_DAYS=0).\n");
+    }
+    for p in &points {
+        let score = p["score"].as_u64();
+        let at_risk: Vec<&str> = p["signals"].as_object().map(|s| s.iter().filter(|(_, v)| *v == "risk").map(|(k, _)| k.as_str()).collect()).unwrap_or_default();
+        let bar = "#".repeat(score.map_or(0, |s| s.div_ceil(5)) as usize);
+        let line = format!(
+            "  {}  {:>3}  {:<8}  {bar:<20}{}",
+            p["date"].as_str().unwrap_or(""),
+            score.map_or("-".to_string(), |s| s.to_string()),
+            p["band"].as_str().unwrap_or("unknown").replace('_', " "),
+            if at_risk.is_empty() { String::new() } else { format!("  at risk: {}", at_risk.join(", ")) },
+        );
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    let t = &v["trend"];
+    if t.is_object() {
+        let change = t["change"].as_i64().map_or(String::new(), |c| format!(" ({c:+})"));
+        let score = |k: &str| t[k].as_u64().map_or("no score".to_string(), |s| s.to_string());
+        out.push_str(&format!("Since {}: {} to {}{change}.", t["from"].as_str().unwrap_or(""), score("fromScore"), score("toScore")));
+        for (key, said) in [("worse", "Worse"), ("better", "Better")] {
+            let ids: Vec<&str> = t[key].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+            if !ids.is_empty() {
+                out.push_str(&format!(" {said}: {}.", ids.join(", ")));
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// The health score for a person: the score and band, then each signal on a line.
@@ -2094,6 +2176,31 @@ mod tests {
         for bad in [&["--from", "2026-10-01"][..], &["--from"], &["--from", "--to"], &["x"], &["-o", "a", "-o", "b"], &["--to", "2026-11-01"]] {
             assert!(evidence_request(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn health_score_history_reads_as_a_line_per_day() {
+        assert_eq!(health_request_at(&["--days", "30", "json"], "/api/support/health-score/history", "u"), Ok(("/api/support/health-score/history?days=30".into(), true)));
+        assert!(health_request_at(&["x"], "/a", "u").is_err());
+        let v = json!({
+            "days": 90, "recording": true,
+            "points": [
+                { "date": "2026-10-01", "score": 92, "band": "healthy", "signals": { "runs": "ok" } },
+                { "date": "2026-11-01", "score": 41, "band": "at_risk", "signals": { "runs": "risk", "backups": "risk", "adoption": "watch" } },
+                { "date": "2026-11-02", "score": null, "band": "unknown", "signals": {} },
+            ],
+            "trend": { "from": "2026-10-01", "fromScore": 92, "toScore": 41, "change": -51, "worse": ["runs"], "better": [] },
+        });
+        assert_eq!(
+            history_summary(&v),
+            "Customer health history: last 90 days, 3 days recorded\n  \
+             2026-10-01   92  healthy   ###################\n  \
+             2026-11-01   41  at risk   #########             at risk: backups, runs\n  \
+             2026-11-02    -  unknown\n\
+             Since 2026-10-01: 92 to 41 (-51). Worse: runs.\n"
+        );
+        let off = history_summary(&json!({ "days": 7, "recording": false, "points": [], "trend": null }));
+        assert_eq!(off, "Customer health history: last 7 days, 0 days recorded\nbotd isn't recording the score (HEALTH_SCORE_HISTORY_DAYS=0).\n");
     }
 
     #[test]
@@ -2445,6 +2552,19 @@ mod tests {
         for other in [&["user", "residency", "u1", "pin", "gb-lon"][..], &["team", "residency", "t1", "unpin"], &["user", "residency"], &["bot", "residency", "b1"]] {
             assert_eq!(region_request(other), None, "{other:?}");
         }
+    }
+
+    #[test]
+    fn residency_report_commands() {
+        assert_eq!(residency_report_request("user", "ada@example.com", &[]), Ok(("/api/users/ada%40example.com/residency/report?format=markdown".into(), None)));
+        assert_eq!(
+            residency_report_request("team", "t1", &["--from", "2026-08-01", "--to", "2026-10-31", "--json", "-o", "r.json"]),
+            Ok(("/api/teams/t1/residency/report?from=2026-08-01&to=2026-10-31".into(), Some("r.json")))
+        );
+        for bad in [&["--from"][..], &["--json", "extra"], &["-o"]] {
+            assert!(residency_report_request("team", "t1", bad).unwrap_err().starts_with("Usage: botctl team residency <team> report"), "{bad:?}");
+        }
+        assert_eq!(region_request(&["user", "residency", "u1", "report"]), None, "the report isn't a pin or an unpin");
     }
 
     #[test]

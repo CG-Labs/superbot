@@ -5,7 +5,7 @@ What the technical account manager (TAM) checks each month for an Enterprise cus
 ## 1. The score
 
 - [ ] `botctl health-score` for the last 30 days. Note the score, the band and each signal's status ([what they mean](health-score.md)).
-- [ ] Compared with last month's: which signal moved, and why.
+- [ ] Compared with last month's (`botctl health-score history --days 31`): which signal moved, and why.
 - [ ] Each signal at risk has a ticket or an action with an owner and a date; each at watch is on the next check-in's agenda.
 
 ## 2. The deployment

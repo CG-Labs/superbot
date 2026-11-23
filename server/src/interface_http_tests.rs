@@ -130,7 +130,7 @@ async fn the_console_is_an_admin_page_without_chat_bots_or_screens() {
     for part in ["script-src 'self'", "style-src 'self'", "frame-ancestors 'none'", "connect-src 'self'"] {
         assert!(csp.contains(part), "{csp}");
     }
-    for tab in ["Users", "Requests", "Machines", "Teams", "Roles", "Audit log", "Settings", "Setup", "Sign out", r#"href="/app/""#] {
+    for tab in ["Users", "Requests", "Machines", "Teams", "Roles", "Service accounts", "Audit log", "Support", "Settings", "Setup", "Sign out", r#"href="/app/""#] {
         assert!(html.contains(tab), "{tab}");
     }
     // Nothing the CSP would block: one script, from a file, and no inline styles.
@@ -147,7 +147,7 @@ async fn the_console_is_an_admin_page_without_chat_bots_or_screens() {
         assert!(!CONSOLE_JS.contains(gone) && !html.contains(gone), "{gone} is still in the console");
     }
     let calls = api_calls(CONSOLE_JS);
-    for want in ["/api/users", "/api/signups/x/approve", "/api/machines", "/api/users/x/machine/suspend", "/api/audit", "/api/audit/export.csv", "/api/policy", "/api/secrets/x", "/api/scim/tokens", "/api/setup", "/api/license", "/api/teams", "/api/teams/x/members/x", "/api/roles", "/api/roles/x/users/x", "/api/roles/x/teams/x/users/x"] {
+    for want in ["/api/users", "/api/signups/x/approve", "/api/machines", "/api/users/x/machine/suspend", "/api/audit", "/api/audit/export.csv", "/api/policy", "/api/secrets/x", "/api/scim/tokens", "/api/setup", "/api/license", "/api/teams", "/api/teams/x/members/x", "/api/roles", "/api/roles/x/users/x", "/api/roles/x/teams/x/users/x", "/api/service-accounts", "/api/service-accounts/x", "/api/service-accounts/x/tokens", "/api/service-accounts/x/tokens/x", "/api/service-accounts/x/tokens/x/rotate"] {
         assert!(calls.iter().any(|(_, p)| p == want) || html.contains(want), "the console lost {want}: {calls:?}");
     }
 }
@@ -163,6 +163,42 @@ fn the_console_asks_before_taking_a_role_away_and_matches_emails_in_any_case() {
         assert!(lines[n.saturating_sub(1)..=n].iter().any(|l| l.contains("confirm(")), "line {} takes a role away without asking: {}", n + 1, lines[n].trim());
     }
     assert!(!CONSOLE_JS.contains(".email =="), "the console compares emails case-sensitively");
+}
+
+/// ADR 0152: the console asks before it disables or deletes a service account or revokes a
+/// token, and a new token's secret goes only to the shown-once dialog, never to storage.
+#[test]
+fn the_console_asks_before_stopping_a_service_account_and_keeps_no_token() {
+    let lines: Vec<&str> = CONSOLE_JS.lines().collect();
+    let stops: Vec<usize> = (0..lines.len()).filter(|&n| lines[n].contains(r#"api("DELETE", `/api/service-accounts/"#) || (lines[n].contains("/api/service-accounts/") && lines[n].contains(r#"status: "disabled""#))).collect();
+    assert!(stops.len() >= 3, "{stops:?}");
+    for n in stops {
+        assert!(lines[n.saturating_sub(1)..=n].iter().any(|l| l.contains("confirm(")), "line {} stops a service account or token without asking: {}", n + 1, lines[n].trim());
+    }
+    for kept in ["localStorage", "sessionStorage", "document.cookie"] {
+        assert!(!CONSOLE_JS.contains(kept), "the console keeps something in {kept}");
+    }
+    let secret = |l: &str| l.match_indices("r.token").any(|(i, m)| !l[i + m.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_'));
+    let uses: Vec<usize> = (0..lines.len()).filter(|&n| secret(lines[n])).collect();
+    let elsewhere: Vec<usize> = uses.iter().copied().filter(|&n| !lines[n].contains("value: r.token")).map(|n| n + 1).collect();
+    assert!(!uses.is_empty() && elsewhere.is_empty(), "a token's secret goes somewhere but the shown-once dialog, on lines {elsewhere:?}");
+}
+
+/// ADR 0152: when two token requests finish together, the second secret waits until the
+/// first is closed instead of replacing it before it's copied.
+#[test]
+fn the_console_queues_a_second_shown_once_value() {
+    let body = |name: &str| {
+        let start = CONSOLE_JS.find(&format!("function {name}(")).unwrap_or_else(|| panic!("no {name}"));
+        let rest = &CONSOLE_JS[start..];
+        &rest[..rest.find("\n}\n").expect("function end") + 2]
+    };
+    let show = body("showOnce");
+    let guard = show.find(r#"if (!$("once").hidden) return void onceQueue.push(shown);"#).expect("showOnce doesn't queue while the dialog is open");
+    assert!(guard < show.find(r#"$("once-value").textContent"#).unwrap(), "showOnce writes the value before checking the dialog is free");
+    let close = body("closeOnce");
+    let next = close.find("showOnce(onceQueue.shift())").expect("closing doesn't show the next queued value");
+    assert!(close.find(r#"$("once").hidden = true"#).unwrap() < next, "the next value is shown before the dialog is closed");
 }
 
 #[tokio::test]

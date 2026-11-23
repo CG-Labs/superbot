@@ -45,6 +45,9 @@ mod handover;
 mod handover_http_tests;
 #[cfg(test)]
 mod harness_version_http_tests;
+mod health_history;
+#[cfg(test)]
+mod health_history_http_tests;
 mod health_score;
 #[cfg(test)]
 mod health_score_http_tests;
@@ -121,6 +124,8 @@ mod machines_region_tests;
 mod machines_residency_tests;
 #[cfg(test)]
 mod residency_routes_http_tests;
+#[cfg(test)]
+mod residency_report_http_tests;
 mod passwd;
 mod plans;
 #[cfg(test)]
@@ -389,6 +394,7 @@ async fn main() {
     };
     let data_dir = root("DATA_DIR", "data");
     let evidence = evidence::Settings::from_env(&|k| env(k, ""), &data_dir).unwrap_or_else(|e| exit(format!("Evidence bundles: {e}")));
+    let health_history = health_history::Settings::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Health score history: {e}")));
     let workspace = root("WORKSPACE_DIR", "workspace");
     let db_path = paths::child(&data_dir, "app.sqlite").unwrap();
     let data_lock = database_encryption::lock_data_dir(&db_path).unwrap_or_else(|e| exit(format!("Database: {e}")));
@@ -808,6 +814,7 @@ async fn main() {
     retention::start(app.clone(), retention::Settings { chat: chat_retention, sessions: session_retention, teammate_files: teammate_files_retention });
     server_backups::start(app.clone());
     evidence::start(app.clone(), evidence, sessions, mfa_pinned);
+    health_history::start(app.clone(), health_history);
     backup_encryption::start(app.clone());
     database_encryption::start(app.clone());
     users::start_pruning(app.clone(), sessions);
@@ -956,6 +963,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/database", get(database_encryption::get))
         .route("/support/bundle", get(support::bundle))
         .route("/support/health-score", get(health_score::get))
+        .route("/support/health-score/history", get(health_history::get))
         .route("/evidence", get(evidence::get))
         .route("/evidence/bundle", get(evidence::bundle))
         .route("/secrets", get(list_secrets))
@@ -1013,6 +1021,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/region", get(machines::region::get_user).put(machines::region::set_user))
         .route("/users/{key}/machine/egress-policy", get(machines::egress_policy::get_user).put(machines::egress_policy::set_user))
         .route("/users/{key}/residency", get(machines::region::get_user).put(machines::residency::pin_user).delete(machines::residency::unpin_user))
+        .route("/users/{key}/residency/report", get(machines::residency_report::user))
         .route("/users/{key}/machine/suspend", post(machines::suspend))
         .route("/users/{key}/machine/resume", post(machines::resume))
         .route("/users/{key}/machine/resize", get(machines::resize::status).post(machines::resize))
@@ -1064,6 +1073,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/teams/{id}", get(teams::get).patch(teams::update).delete(teams::delete))
         .route("/teams/{id}/region", get(machines::region::get_team).put(machines::region::set_team))
         .route("/teams/{id}/residency", get(machines::region::get_team).put(machines::residency::pin_team).delete(machines::residency::unpin_team))
+        .route("/teams/{id}/residency/report", get(machines::residency_report::team))
         .route("/teams/{id}/members/{user}", put(teams::put_member).delete(teams::delete_member))
         .route("/team", get(teams::mine))
         .route("/team/leave", post(teams::leave_mine))

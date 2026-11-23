@@ -112,6 +112,9 @@ as_svc sudo -n /usr/local/sbin/superbot-userctl ensure t1 >/dev/null
 # A run can't gain privileges again, through sudo or any setuid program (ADR 0145).
 nnp=$(cd "$TEST_DIR/users/t1/workspace" && as_svc sudo -n -E -u sb-u-t1 -- "$LIB/bin/superbot-run" /usr/bin/grep NoNewPrivs /proc/self/status)
 [[ "$(awk '{print $2}' <<<"$nnp")" == 1 ]] || die "a run can gain privileges: $nnp"
+# And it runs under the seccomp filter (ADR 0156).
+sc=$(cd "$TEST_DIR/users/t1/workspace" && as_svc sudo -n -E -u sb-u-t1 -- "$LIB/bin/superbot-run" /usr/bin/grep '^Seccomp:' /proc/self/status)
+[[ "$(awk '{print $2}' <<<"$sc")" == 2 ]] || die "a run isn't under the seccomp filter: $sc"
 # superbot-run refuses to start outside the account's folders, and as any other account.
 (cd "$TEST_DIR/users" && refused as_svc sudo -n -E -u sb-u-t1 -- "$LIB/bin/superbot-run" /usr/bin/true)
 (cd "$TEST_DIR/users/t1/workspace" && refused as_svc "$LIB/bin/superbot-run" /usr/bin/true)

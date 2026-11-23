@@ -517,6 +517,95 @@ export interface RolesView {
   roles: CustomRole[];
 }
 
+/** Someone named in an admin view. */
+export interface PersonRef {
+  id: string;
+  name: string;
+  email: string | null;
+}
+
+/** A service account (ADR 0143): a non-human caller that acts only through its tokens. Never an admin. */
+export interface ServiceAccount {
+  id: string;
+  name: string;
+  description: string;
+  role: RoleBase;
+  status: "active" | "disabled";
+  /** Its custom role across the server; null within a team. */
+  customRole: CustomRoleRef | null;
+  team: { id: string; name: string } | null;
+  /** Its custom role within `team`. */
+  teamRole: CustomRoleRef | null;
+  owner: PersonRef | null;
+  /** False once the owner is disabled or gone: they lend nothing, so its tokens are refused. */
+  ownerActive: boolean;
+  /** What it holds across the server, and within its team. */
+  permissions: string[];
+  teamPermissions: string[];
+  /** What its tokens can use today: what it holds, within what its owner holds now. */
+  effective: string[];
+  /** Live tokens. */
+  tokens: number;
+  lastUsedAt: number | null;
+  createdAt: number;
+  createdBy: string | null;
+  updatedAt: number;
+  /** Only from `GET /api/service-accounts/{id}`, newest first. */
+  tokenList?: ServiceToken[];
+}
+
+/** A service account's API token, never its secret. */
+export interface ServiceToken {
+  id: string;
+  accountId: string;
+  name: string;
+  /** `sbsa_…` and its last four characters. */
+  preview: string;
+  /** Null: all its account holds. */
+  scopes: string[] | null;
+  state: "active" | "expired" | "revoked";
+  createdAt: number;
+  createdBy: string | null;
+  expiresAt: number;
+  lastUsedAt: number | null;
+  lastUsedIp: string | null;
+  revokedAt: number | null;
+  revokedBy: string | null;
+  revokedReason: string | null;
+  /** The token that replaced it; it may still work until `expiresAt`. */
+  rotatedTo: string | null;
+}
+
+/** `GET /api/service-accounts`. */
+export interface ServiceAccountsView {
+  serviceAccounts: ServiceAccount[];
+  /** Every permission a token can be scoped to. */
+  scopes: string[];
+  defaultDays: number;
+  maxDays: number;
+}
+
+/** The form for `POST /api/service-accounts`, and `PATCH` with what changed. */
+export interface ServiceAccountDraft {
+  name: string;
+  description: string;
+  /** `member`, `readonly`, or a custom role's id. */
+  role: string;
+  /** A team's id, or "" for across the server. */
+  team: string;
+  /** The owner's email or id; only admins change it. */
+  owner: string;
+}
+
+/** The reply to making or rotating a token: the only time its secret is sent. */
+export interface MintedServiceToken {
+  token: string;
+  tokenInfo: ServiceToken;
+  serviceAccount: { id: string; name: string };
+  /** On rotate: the old token, and when it stops. */
+  replaced?: { id: string; endsAt: number };
+}
+
 /** `POST /api/roles`, and `PATCH` with any of it. */
 export interface RoleDraft {
   name: string;
