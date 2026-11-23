@@ -90,6 +90,18 @@ describe("audit chain lines (ADR 0149)", () => {
     expect(exportLines({ enabled: false })).toEqual([exportLine({ enabled: false })]);
   });
 
+  it("names each of several SIEMs", () => {
+    const sink = { kind: "webhook", delivered: 43, pending: 0, deliveredAt: null, failing: false, lastError: null };
+    const splunk = { ...sink, name: "splunk", sink: "https://splunk.example" };
+    const sentinel = { ...sink, name: "sentinel", sink: "https://sentinel.example", failing: true, lastError: "answered HTTP 401", pending: 5 };
+    const lines = exportLines({ enabled: true as const, ...sentinel, sinks: [splunk, sentinel] });
+    expect(lines.map((l) => [l.label, l.tone])).toEqual([
+      ["SIEM export (splunk)", "ok"],
+      ["SIEM export (sentinel)", "bad"],
+    ]);
+    expect(lines[1].text).toBe("Failing to https://sentinel.example: answered HTTP 401. 5 waiting.");
+  });
+
   it("lists every part in order", () => {
     expect(chainLines(chainState()).map((l) => l.label)).toEqual(["Last check", "Head", "Last checkpoint", "Timestamps", "SIEM export"]);
   });

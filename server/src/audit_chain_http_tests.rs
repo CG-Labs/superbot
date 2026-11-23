@@ -258,6 +258,48 @@ async fn the_siem_export_delivers_every_event_in_order_and_retries() {
 }
 
 #[tokio::test]
+async fn several_siems_each_get_every_event_with_only_their_own_headers() {
+    let (port, app, admin, _) = serve_app().await;
+    for i in 0..3 {
+        app.db.record(&Event::new(Actor::system("test"), "test.several").details(json!({ "n": i })));
+    }
+    let (splunk, to_splunk) = collector(0).await;
+    let (sentinel, to_sentinel) = collector(usize::MAX).await;
+    let (a, b) = ("splunk-token-5e6f7a8b9c0d", "sentinel-key-1a2b3c4d5e6f");
+    let export = format!("splunk={splunk},sentinel={sentinel}");
+    export_to(&app, &[("AUDIT_EXPORT", &export), ("AUDIT_EXPORT_HEADERS_SPLUNK", &format!("Authorization=Splunk {a}")), ("AUDIT_EXPORT_HEADERS_SENTINEL", &format!("x-api-key={b}"))]);
+    let xs = app.audit_export.get().unwrap().clone();
+    let (first, second) = (xs.sinks[0].clone(), xs.sinks[1].clone());
+
+    // Sentinel is down: Splunk still gets everything, and retention waits for Sentinel.
+    until("sentinel failing", || second.view(app.db.audit_head())["failing"] == true).await;
+    until("splunk caught up", || first.delivered() >= app.db.audit_head()).await;
+    assert_eq!(xs.delivered(), second.delivered());
+    let failing = app.db.audit_events(&crate::audit::Filter { actions: vec!["audit.export_failing".into()], ..Default::default() }, 10, false);
+    assert_eq!((failing.len(), failing[0].details["name"].as_str()), (1, Some("sentinel")), "only Sentinel is failing");
+
+    let (_, lines, headers) = to_splunk.lock().unwrap().clone();
+    assert!(headers.iter().all(|h| h.contains(a) && !h.contains(b)), "Splunk sees only its own key: {headers:?}");
+    assert!(to_sentinel.lock().unwrap().2.iter().all(|h| h.contains(b) && !h.contains(a)), "Sentinel only its own");
+    let ids: Vec<i64> = lines.iter().map(|l| serde_json::from_str::<Value>(l).unwrap()["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids.first(), Some(&1));
+    assert!(ids.windows(2).all(|w| w[1] == w[0] + 1), "in order, each once: {ids:?}");
+
+    let v = parse(&call(port, "GET", "/api/audit/siem", &admin, "").await.1);
+    assert_eq!((v["name"].as_str(), v["failing"].as_bool()), (Some("sentinel"), Some(true)), "the failing sink leads: {v}");
+    let names: Vec<&str> = v["sinks"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["splunk", "sentinel"]);
+    let mut metrics = String::new();
+    crate::audit_export::render(&app, &mut metrics);
+    assert!(
+        metrics.contains("superbot_audit_export_failing{kind=\"webhook\",name=\"splunk\"} 0") && metrics.contains("superbot_audit_export_failing{kind=\"webhook\",name=\"sentinel\"} 1"),
+        "{metrics}"
+    );
+    assert_eq!(app.db.audit_export_cursor(&first.sink.id), Some(first.delivered()), "a cursor each, by URL");
+    assert!(app.db.audit_export_cursor(&second.sink.id).unwrap() < first.delivered());
+}
+
+#[tokio::test]
 async fn syslog_sinks_get_rfc_5424_with_octet_counting() {
     let app = runner::test_app();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();

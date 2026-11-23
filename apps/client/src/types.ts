@@ -893,6 +893,8 @@ export interface AuditArchiveCheck {
 /** One export sink's progress: a SIEM (`webhook`, `syslog`) or the S3 archive (`s3`). */
 export interface AuditExportSink {
   kind: string;
+  /** `<name>=` in `AUDIT_EXPORT`, needed once there are several SIEMs (ADR 0191). */
+  name?: string | null;
   sink: string;
   delivered: number;
   pending: number;
