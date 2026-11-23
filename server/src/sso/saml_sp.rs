@@ -653,9 +653,9 @@ pub struct Checked {
     /// The NameID as sent and the IdP's session, for single logout.
     pub login: SamlLogin,
     pub groups: Groups,
-    /// Which of `Expect::decrypt` opened the assertion or its NameID, if either was encrypted:
-    /// what tells an admin which key the IdP encrypts to (ADR 0181).
-    pub decrypted_with: Option<usize>,
+    /// Which of `Expect::decrypt` opened the assertion and its NameID, for those encrypted: what
+    /// tells an admin which keys the IdP encrypts to (ADR 0181). Both, if they differ.
+    pub decrypted_with: Vec<usize>,
 }
 
 pub(super) fn time(s: &str) -> Result<i64, Refused> {
@@ -984,7 +984,8 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
     };
 
     let (nid, id_with) = name_id_with(subject, e.decrypt)?;
-    let decrypted_with = decrypted_with.or(id_with);
+    let mut decrypted_with: Vec<usize> = decrypted_with.into_iter().chain(id_with).collect();
+    decrypted_with.dedup();
     if nid.format.as_deref() == Some(TRANSIENT) {
         return Err(Refused("transient_subject", None));
     }
@@ -1827,6 +1828,27 @@ mod tests {
         let attributes = Attributes::default();
         let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: &[&ec], require_encrypted: false };
         assert_eq!(check_response(&STANDARD.encode(r.xml()), &e).unwrap_err().0, "no_sp_key", "an ECDSA key can't decrypt");
+    }
+
+    #[test]
+    fn every_key_that_decrypted_part_of_a_response_is_named() {
+        let (keys, idp, attributes) = (enc_keys(), idp(), Attributes::default());
+        let both = [&keys[0], &keys[1]];
+        let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: &both, require_encrypted: false };
+        let with = |assertion: Option<usize>, name_id: Option<usize>| {
+            let mut r = encrypted();
+            match assertion {
+                Some(i) => r.encrypt_to = keys[i].cert.clone(),
+                None => r.encrypt = None,
+            }
+            r.encrypt_name_id_to = name_id.map(|i| keys[i].cert.clone());
+            check_response(&STANDARD.encode(r.xml()), &e).unwrap().decrypted_with
+        };
+        assert_eq!(with(Some(0), Some(1)), [0, 1], "an assertion to one key, its NameID to another: both in use");
+        assert_eq!(with(Some(1), Some(1)), [1]);
+        assert_eq!(with(None, Some(1)), [1]);
+        assert_eq!(with(Some(1), None), [1]);
+        assert!(with(None, None).is_empty());
     }
 
     #[test]

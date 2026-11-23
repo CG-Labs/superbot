@@ -1356,8 +1356,9 @@ async fn an_encryption_key_rolls_over_without_refusing_a_sign_in() {
     let promoted = &sp.audit("sso.saml_sp_key_promoted").await[0];
     let d = &promoted["details"];
     assert_eq!((d["use"].as_str(), d["certificate"].as_str(), d["replaced"].as_str(), d["previousKept"].as_bool()), (Some("encryption"), Some(next_sha.as_str()), Some(sha_of(&old).as_str()), Some(true)));
+    let promoted_view = view(&sp).await;
+    assert!(promoted_view["previous"]["lastUsedSecondsAgo"].is_u64() && promoted_view["lastUsedSecondsAgo"].is_u64(), "each key keeps its history: {promoted_view}");
     assert_eq!(signs_in(&old).await, Ok(u.id.clone()), "an IdP that hasn't refreshed yet");
-    assert!(view(&sp).await["previous"]["lastUsedSecondsAgo"].is_u64());
     assert_eq!(signs_in(&next).await, Ok(u.id.clone()));
     assert!(view(&sp).await["lastUsedSecondsAgo"].is_u64(), "the key in use, too");
 
