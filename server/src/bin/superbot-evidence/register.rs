@@ -943,12 +943,12 @@ impl Check<'_> {
         let mut rows = BTreeSet::new();
         let in_use: Vec<&Vendor> = self.r.vendors.iter().filter(|v| v.since < cut && v.until.is_none_or(|u| u > p.from)).collect();
         for v in &in_use {
-            let assessed_dates = v.assessed.into_iter().chain(v.reviewed.iter().copied()).filter(|d| *d < cut);
-            let last = assessed_dates.max();
+            let assessed = v.assessed.filter(|a| *a < cut);
+            let last = assessed.into_iter().chain(v.reviewed.iter().copied()).filter(|d| *d < cut).max();
             let at_end = v.until.is_none_or(|u| u >= cut);
-            let assessed_by = v.approved_by.as_deref().and_then(|by| self.held(by, &["Security owner", "Management"], v.assessed.unwrap_or(v.since)));
+            let assessed_by = v.approved_by.as_deref().zip(assessed).and_then(|(by, at)| self.held(by, &["Security owner", "Management"], at));
             if v.tier != "low" {
-                if v.assessed.is_none_or(|a| a > v.since) {
+                if assessed.is_none_or(|a| a > v.since) {
                     unassessed.push(json!(format!("{} (in use since {})", v.id, v.since)));
                 }
                 if assessed_by.is_none() {
@@ -966,12 +966,12 @@ impl Check<'_> {
             }
             out.push(json!({
                 "id": v.id, "tier": v.tier, "hosting": v.hosting, "since": ds(v.since), "until": v.until.map(ds), "inUseAtEnd": at_end,
-                "assessed": v.assessed.map(ds), "approvedBy": v.approved_by, "heldRole": assessed_by, "lastReviewed": last.map(ds), "reviewDue": last.map(|d| ds(plus(d, YEAR_DAYS))),
+                "assessed": assessed.map(ds), "approvedBy": assessed.and(v.approved_by.as_deref()), "heldRole": assessed_by, "lastReviewed": last.map(ds), "reviewDue": last.map(|d| ds(plus(d, YEAR_DAYS))),
             }));
         }
         let no_hosting: Vec<Value> = if in_use.iter().any(|v| v.hosting && v.tier != "low") { vec![] } else { vec![json!("no critical or high vendor in use is marked hosting")] };
         let v = json!({
-            "basis": "every critical and high vendor in use in the period is assessed before use and approved by someone holding or deputising the Security owner or Management, and reviewed within a year while in use (vendor management policy); a hosting provider's yearly review of its assurance report covers physical security (CC6.4-1); low vendors are listed only",
+            "basis": "every critical and high vendor in use in the period is assessed before use (an assessment dated on or after the period's end isn't this period's) and approved by someone holding or deputising the Security owner or Management, and reviewed within a year while in use (vendor management policy); a hosting provider's yearly review of its assurance report covers physical security (CC6.4-1); low vendors are listed only",
             "summary": { "inUse": out.len(), "criticalOrHigh": in_use.iter().filter(|v| v.tier != "low").count(), "hosting": in_use.iter().filter(|v| v.hosting).count() },
             "exceptions": { "notAssessedBeforeUse": unassessed, "notApproved": unapproved, "reviewOverdue": overdue, "noHostingVendor": no_hosting },
             "vendors": out,
@@ -1455,6 +1455,12 @@ mod tests {
             assert_eq!(ex["noHostingVendor"], json!([]));
             assert_eq!(x["summary"]["inUse"], 3, "a vendor left before the period isn't listed");
             assert_eq!(rows, ["CC6.4-1", "CC9.2-1"]);
+        });
+        let mut late = good();
+        late["vendors"][0]["assessed"] = json!("2027-04-02");
+        check(&late, &|c| {
+            let ex = &c.vendors().0["exceptions"];
+            assert_eq!((ex["notAssessedBeforeUse"].clone(), ex["notApproved"].clone()), (json!(["linode (in use since 2027-01-15)"]), json!(["linode"])), "an assessment after the period isn't this period's");
         });
     }
 
