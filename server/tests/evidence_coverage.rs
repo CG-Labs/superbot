@@ -161,7 +161,7 @@ fn coverage_checks_botds_bundles_and_finds_each_missing_day() {
     assert_eq!(row(&r, "CC6.3-1")["complete"], true);
     assert_eq!(row(&r, "CC8.1-1")["coveredDays"], 0);
     assert_eq!(row(&r, "A1.3-1")["coveredDays"], 0, "no drill bundle: the drill row is a gap, not missing");
-    assert!(r["checklist"]["noAutomatedEvidence"].as_array().unwrap().iter().any(|x| x["row"] == "CC1.1-1"));
+    assert!(r["checklist"]["noAutomatedEvidence"].as_array().unwrap().iter().any(|x| x["row"] == "CC1.5-1"));
     assert_eq!(listing(&store), before, "the store isn't written to");
 
     // A file changed after the bundle was made fails it and opens a gap.

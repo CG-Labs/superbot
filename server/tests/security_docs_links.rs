@@ -396,7 +396,8 @@ fn the_legal_templates_are_labelled_drafts_with_placeholders() {
     }
 }
 
-/// The policy set the checklist's CC5.3-1 asks for, plus acceptable use (ADR 0130).
+/// The policy set the checklist's CC5.3-1 asks for, plus acceptable use (ADR 0130) and the
+/// code of conduct CC1.1-1 asks for (ADR 0214).
 const POLICIES: &[&str] = &[
     "information-security.md",
     "access-control.md",
@@ -406,6 +407,7 @@ const POLICIES: &[&str] = &[
     "business-continuity.md",
     "data-classification-and-retention.md",
     "acceptable-use.md",
+    "code-of-conduct.md",
 ];
 const CADENCES: &[&str] = &["yearly", "quarterly", "monthly"];
 
@@ -465,7 +467,7 @@ fn the_policy_set_is_complete_and_well_formed() {
             covered.insert(c.to_string());
         }
     }
-    for want in ["CC5.3-1", "CC7.3-1", "CC7.4-1", "CC7.5-1", "CC8.1-2", "CC9.1-2", "CC9.2-1", "C1.1-2"] {
+    for want in ["CC1.1-1", "CC5.3-1", "CC7.3-1", "CC7.4-1", "CC7.5-1", "CC8.1-2", "CC9.1-2", "CC9.2-1", "C1.1-2"] {
         assert!(covered.contains(want), "no policy covers {want}, which asks for one");
     }
 

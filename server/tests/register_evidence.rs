@@ -3,7 +3,8 @@
 //! coverage`, names nobody, flags a policy text changed since its approval and a server
 //! excepting a setting no exception approved, and is refused, writing nothing, for a
 //! register that doesn't hold together, a baseline from outside the period, or a period
-//! longer than a month.
+//! longer than a month. ADR 0214: the code of conduct is acknowledged like the other
+//! policies, and conduct concerns are checked in `conduct.json`, by id only.
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -51,7 +52,7 @@ fn register() -> Value {
     let mut acks = Vec::new();
     let mut training = Vec::new();
     for p in ["p-a", "p-b", "p-c"] {
-        for policy in ["information-security", "acceptable-use"] {
+        for policy in ["information-security", "acceptable-use", "code-of-conduct"] {
             acks.push(json!({ "person": p, "policy": policy, "at": "2026-09-05" }));
         }
         training.push(json!({ "person": p, "course": "security-awareness", "at": "2026-09-05" }));
@@ -81,6 +82,10 @@ fn register() -> Value {
         ],
         "exceptions": [
             { "id": "EX-1", "policy": "information-security", "setting": "TEAMS", "approvedBy": "p-b", "approvedAt": "2026-09-01", "ends": "2027-03-01", "reviewed": ["2026-10-01"], "notes": "a private reason" },
+        ],
+        "conductConcerns": [
+            { "id": "CC-1", "received": "2026-10-02", "triaged": "2026-10-05", "handledBy": "p-a", "closed": "2026-10-20", "outcome": "substantiated", "notes": "Dave said Erin took a gift" },
+            { "id": "CC-2", "received": "2026-10-10" },
         ],
     })
 }
@@ -124,6 +129,7 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
         "management-reviews.json: no exceptions; evidence for CC1.2-1",
         "vendors.json: no exceptions; evidence for CC6.4-1, CC9.2-1",
         "policy-exceptions.json: baselineExceptionNotApproved 1; evidence for CC5.1-1",
+        "conduct.json: triagedLate 1; evidence for CC1.1-1",
     ] {
         assert!(out.contains(want), "{want}\n{out}");
     }
@@ -135,18 +141,21 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
         assert_eq!(fs::metadata(&tar).unwrap().permissions().mode() & 0o777, 0o600, "private to its owner");
     }
     let raw = fs::read(&tar).unwrap();
-    for never in ["Alice", "Bob Example", "Cross-user data leak", "Signup abuse", "a private reason", "Kept by the security owner"] {
+    for never in ["Alice", "Bob Example", "Cross-user data leak", "Signup abuse", "a private reason", "Kept by the security owner", "Dave", "took a gift"] {
         assert!(!raw.windows(never.len()).any(|w| w == never.as_bytes()), "{never:?} is in the bundle");
     }
     let folder = unpack(&dir, &tar);
     let manifest = json_in(&folder, "manifest.json");
-    assert_eq!((manifest["kind"].as_str(), manifest["format"].as_u64(), manifest["source"]["policyTextsChecked"].as_bool(), manifest["source"]["baselineChecks"].as_u64()), (Some("policy-register"), Some(1), Some(true), Some(2)));
+    assert_eq!((manifest["kind"].as_str(), manifest["format"].as_u64(), manifest["source"]["policyTextsChecked"].as_bool(), manifest["source"]["baselineChecks"].as_u64()), (Some("policy-register"), Some(2), Some(true), Some(2)));
     assert_eq!(manifest["source"]["registerSha256"].as_str(), Some(hex(&fs::read(dir.join("register.json")).unwrap()).as_str()), "identifies the register kept beside it");
     let files: Vec<&str> = manifest["files"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
-    assert_eq!(files, ["README.txt", "roles.json", "policies.json", "people.json", "risks.json", "management-reviews.json", "vendors.json", "policy-exceptions.json"]);
+    assert_eq!(files, ["README.txt", "roles.json", "policies.json", "people.json", "risks.json", "management-reviews.json", "vendors.json", "policy-exceptions.json", "conduct.json"]);
     let ex = json_in(&folder, "policy-exceptions.json");
     assert_eq!(ex["exceptions"]["baselineExceptionNotApproved"].as_array().map(Vec::len), Some(1), "{ex:#}");
     assert!(ex["exceptions"]["baselineExceptionNotApproved"][0].as_str().unwrap().contains("AUTH_MFA"), "{ex:#}");
+    let conduct = json_in(&folder, "conduct.json");
+    assert_eq!(conduct["exceptions"]["triagedLate"], json!(["CC-2 (received 2026-10-10, not triaged, due 2026-10-17)"]), "{conduct:#}");
+    assert_eq!((conduct["codeOfConduct"]["acknowledgedWithinAYear"].as_u64(), conduct["summary"]["closedInPeriodByOutcome"]["substantiated"].as_u64()), (Some(3), Some(1)), "{conduct:#}");
     let pols = json_in(&folder, "policies.json");
     assert!(pols["policies"].as_array().unwrap().iter().all(|p| p["textApproved"] == true), "{pols:#}");
 
@@ -159,11 +168,12 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
     let r: Value = serde_json::from_slice(&o.stdout).unwrap();
     let kind = r["kinds"].as_array().unwrap().iter().find(|k| k["kind"] == "policy-register").unwrap();
     assert_eq!((kind["complete"].as_bool(), r["bundles"][0]["verified"].as_bool()), (Some(true), Some(true)), "{r:#}");
-    for row in ["CC1.2-1", "CC1.3-1", "CC3.3-1", "CC6.4-1", "CC9.2-1"] {
+    for row in ["CC1.1-1", "CC1.2-1", "CC1.3-1", "CC3.3-1", "CC6.4-1", "CC9.2-1"] {
         let x = r["rows"].as_array().unwrap().iter().find(|x| x["row"] == row).unwrap_or_else(|| panic!("{row}: {r:#}"));
         assert_eq!(x["complete"], true, "{row}");
     }
     assert_eq!(r["bundles"][0]["exceptions"]["policy-exceptions.json"]["baselineExceptionNotApproved"], 1);
+    assert_eq!(r["bundles"][0]["exceptions"]["conduct.json"]["triagedLate"], 1);
 
     // A policy changed since its approval is flagged; the same command never writes over a file.
     let changed = dir.join("policies");
