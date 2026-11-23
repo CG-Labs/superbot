@@ -138,7 +138,7 @@ async fn the_csv_has_a_dated_row_per_person_and_its_export_is_audited() {
 }
 
 fn service<'a>(r: &'a Value, id: &str) -> &'a Value {
-    r["serviceAccounts"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap_or_else(|| panic!("{id} not in {r}"))
+    r["serviceAccounts"].as_array().unwrap().iter().find(|s| s["id"] == id).expect("the service account is in the report")
 }
 
 #[tokio::test]
@@ -199,8 +199,8 @@ async fn service_accounts_are_reviewed_with_their_owner_tokens_and_bots() {
     // Metadata only: never a token, its hash, or where it was used from.
     let text = used.to_string();
     let secret = audit_tok.strip_prefix("Bearer ").unwrap();
-    for bad in [secret, &users::hash(secret), "tokenHash", "token_hash", "lastUsedIp", "127.0.0.1"] {
-        assert!(!text.contains(bad), "{bad} in {text}");
+    for (what, bad) in [("the token", secret), ("its hash", users::hash(secret).as_str()), ("tokenHash", "tokenHash"), ("token_hash", "token_hash"), ("lastUsedIp", "lastUsedIp"), ("an address", "127.0.0.1")] {
+        assert!(!text.contains(bad), "{what} is in the report");
     }
 
     // A token left unused for 90 days is flagged, and stays in the digest unchanged.
