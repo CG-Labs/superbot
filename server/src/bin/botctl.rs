@@ -232,10 +232,12 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    --archive: also read the write-once S3 archive,
                                                    check it has no gaps, and hold every event here
                                                    to the hash it has there
-  botctl audit verify-lines <file|dir|->... [--key <hex>]...
+  botctl audit verify-lines <file|dir|->... [--key <hex>]... [--digests-after <id>]
                                                    Check exported events (SIEM or archive copies, any
                                                    order) with no botd: each line's hash, the chain
-                                                   between them, signed checkpoints. Exits 1 on a break
+                                                   between them, signed checkpoints. --digests-after:
+                                                   digestsAfter from botctl audit siem, so lines with
+                                                   their digests taken out fail. Exits 1 on a break
   botctl audit siem                                The SIEM export: sink, delivered, pending, failing
   botctl audit chain                               The chain's state: head, last checkpoint and
                                                    timestamp, export lag, last check
@@ -888,24 +890,25 @@ fn verify_query(rest: &[&str]) -> Result<String, String> {
     Ok(if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) })
 }
 
-/// `botctl audit verify-lines <file|dir|->... [--key <hex>]...` (ADR 0199): checks
+/// `botctl audit verify-lines <file|dir|->... [--key <hex>]... [--digests-after <id>]` (ADR 0199): checks
 /// exported events where they landed, with no botd. A directory is read for its
 /// `.jsonl`, `.ndjson`, `.json` and `.log` files, `-` is stdin.
 fn verify_lines(rest: &[&str], stdin: impl std::io::Read) -> Result<String, String> {
-    let (mut paths, mut keys) = (Vec::new(), Vec::new());
+    let (mut paths, mut keys, mut after) = (Vec::new(), Vec::new(), None);
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match *a {
             "--key" => keys.push(audit_line::parse_public_key(it.next().ok_or("--key needs a public key in hex (botctl audit key)")?)?),
+            "--digests-after" => after = Some(it.next().and_then(|v| v.parse::<i64>().ok()).ok_or("--digests-after needs an event id (digestsAfter in botctl audit siem)")?),
             o if o.starts_with("--") => return Err(format!("Unknown audit verify-lines option \"{o}\". See botctl admin.")),
             p => paths.push(p),
         }
     }
     if paths.is_empty() {
-        return Err("Usage: botctl audit verify-lines <file|dir|->... [--key <public key hex>]...".into());
+        return Err("Usage: botctl audit verify-lines <file|dir|->... [--key <public key hex>]... [--digests-after <event id>]".into());
     }
     let pinned = !keys.is_empty();
-    let mut lines = audit_line::Lines::new(pinned.then_some(keys));
+    let mut lines = audit_line::Lines::new(pinned.then_some(keys)).digests_after(after);
     let mut files = 0u64;
     let mut stdin = Some(stdin);
     for p in paths {
@@ -924,8 +927,15 @@ fn verify_lines(rest: &[&str], stdin: impl std::io::Read) -> Result<String, Stri
     }
     let mut v = serde_json::to_value(lines.finish()).map_err(|e| e.to_string())?;
     v["files"] = json!(files);
+    let mut notes = Vec::new();
     if !pinned {
-        v["note"] = json!("No --key given: a checkpoint only shows its lines agree with whoever signed it. Pin botd's key (botctl audit key).");
+        notes.push("No --key given: a checkpoint only shows its lines agree with whoever signed it. Pin botd's key (botctl audit key).");
+    }
+    if after.is_none() {
+        notes.push("No --digests-after given: lines with every chainDigest taken out would bind nothing and still pass. Pin digestsAfter (botctl audit siem).");
+    }
+    if !notes.is_empty() {
+        v["note"] = json!(notes.join(" "));
     }
     let out = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
     if v["ok"] == true { Ok(out) } else { Err(out) }
@@ -2499,6 +2509,17 @@ mod tests {
 
         assert!(verify_lines(&[], std::io::empty()).unwrap_err().starts_with("Usage"));
         assert!(verify_lines(&[d, "--key", "zz"], std::io::empty()).is_err());
+        assert!(verify_lines(&[d, "--digests-after", "x"], std::io::empty()).unwrap_err().contains("--digests-after needs"));
+        std::fs::remove_file(dir.join("c.json")).unwrap();
+        let mut bare: Value = serde_json::from_str(&lines[2]).unwrap();
+        bare.as_object_mut().unwrap().remove("chainDigest");
+        bare.as_object_mut().unwrap().remove("chainSalt");
+        let only = dir.join("only.ndjson");
+        std::fs::write(&only, format!("{bare}\n")).unwrap();
+        let o = only.to_str().unwrap();
+        assert!(verify_lines(&[o], std::io::empty()).is_ok(), "alone, nothing says it had a digest");
+        let err: Value = serde_json::from_str(&verify_lines(&[o, "--digests-after", "2"], std::io::empty()).unwrap_err()).unwrap();
+        assert_eq!((err["digestsAfter"].clone(), err["hosts"][0]["firstProblems"][0]["reason"].clone()), (json!(2), json!("unbound")), "{err}");
         assert!(verify_lines(&[d, "--bogus"], std::io::empty()).unwrap_err().contains("--bogus"));
         std::fs::remove_dir_all(&dir).unwrap();
     }

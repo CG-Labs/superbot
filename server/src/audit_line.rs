@@ -217,6 +217,8 @@ pub struct Report {
     pub ignored: u64,
     /// The checkpoint keys trusted, by id; empty when none were given.
     pub keys: Vec<String>,
+    /// The `digestsAfter` given, if any.
+    pub digests_after: Option<i64>,
     pub hosts: Vec<Host>,
     /// Lines that couldn't be read as events, so no host is known for them.
     pub unreadable: u64,
@@ -241,6 +243,7 @@ struct Copy {
 /// against each other, the chain from event to event, and the signed checkpoints.
 pub struct Lines {
     keys: Option<Vec<Vec<u8>>>,
+    digests_after: Option<i64>,
     hosts: BTreeMap<String, Vec<Copy>>,
     lines: u64,
     ignored: u64,
@@ -251,7 +254,15 @@ impl Lines {
     /// `keys`: the checkpoint keys to trust. None: any, so a checkpoint only shows the
     /// lines are consistent with whoever signed it.
     pub fn new(keys: Option<Vec<Vec<u8>>>) -> Lines {
-        Lines { keys, hosts: BTreeMap::new(), lines: 0, ignored: 0, unreadable: Vec::new() }
+        Lines { keys, digests_after: None, hosts: BTreeMap::new(), lines: 0, ignored: 0, unreadable: Vec::new() }
+    }
+
+    /// Where botd's events start carrying `chainDigest` (`digestsAfter`), kept apart from
+    /// the lines. Without it, that is worked out from the first line with one, so lines
+    /// stripped of every digest bind nothing and still pass.
+    pub fn digests_after(mut self, after: Option<i64>) -> Lines {
+        self.digests_after = after;
+        self
     }
 
     /// One line, `at` saying where it came from. The event starts at its first `{`, so
@@ -288,7 +299,8 @@ impl Lines {
 
     pub fn finish(self) -> Report {
         let keys = self.keys.as_deref();
-        let hosts: Vec<Host> = self.hosts.into_iter().map(|(host, copies)| walk(host, copies, keys)).collect();
+        let after = self.digests_after;
+        let hosts: Vec<Host> = self.hosts.into_iter().map(|(host, copies)| walk(host, copies, keys, after)).collect();
         let mut unreadable = self.unreadable;
         let error = hosts.is_empty().then(|| format!("no {SCHEMA} events in the {} lines read", self.lines));
         let ok = error.is_none() && unreadable.is_empty() && hosts.iter().all(|h| h.ok);
@@ -299,6 +311,7 @@ impl Lines {
             lines: self.lines,
             ignored: self.ignored,
             keys: keys.unwrap_or_default().iter().map(|k| key_id(k)).collect(),
+            digests_after: after,
             hosts,
             unreadable: count,
             first_unreadable: unreadable,
@@ -307,16 +320,21 @@ impl Lines {
     }
 }
 
-fn walk(host: String, mut copies: Vec<Copy>, keys: Option<&[Vec<u8>]>) -> Host {
+fn walk(host: String, mut copies: Vec<Copy>, keys: Option<&[Vec<u8>]>, after: Option<i64>) -> Host {
     copies.sort_by_key(|c| c.id);
     let mut h = Host { host, copies: copies.len() as u64, ..Default::default() };
     let mut problems: Vec<Problem> = Vec::new();
     let mut problem = |c: &Copy, reason: &'static str, error: String| problems.push(Problem { id: Some(c.id), at: c.at.clone(), reason, error });
-    // botd exports every event after the first it gave a digest with one, to every sink.
-    let digests_from = copies.iter().find(|c| c.has_digest).map(|c| c.id);
+    // botd exports every event after the marker with a digest, to every sink.
+    let inferred = copies.iter().find(|c| c.has_digest).map(|c| c.id - 1);
+    let digests_after = match (after, inferred) {
+        (Some(a), Some(i)) => Some(a.min(i)),
+        (a, i) => a.or(i),
+    };
     let mut keys_seen = BTreeSet::new();
     let mut checkpoints = BTreeSet::new();
-    let mut before: Option<&Copy> = None;
+    // The last event read, and the one before it, for the copies after the first.
+    let (mut before, mut prior): (Option<&Copy>, Option<&Copy>) = (None, None);
     for (i, c) in copies.iter().enumerate() {
         match &c.bound {
             Ok(Bound::All) => h.bound += 1,
@@ -324,10 +342,13 @@ fn walk(host: String, mut copies: Vec<Copy>, keys: Option<&[Vec<u8>]>) -> Host {
             Ok(Bound::None) => h.unbound += 1,
             Err(e) => problem(c, "digest", format!("event {}: {e}", c.id)),
         }
-        if let Some(from) = digests_from.filter(|&f| c.id >= f && !c.has_digest) {
-            problem(c, "unbound", format!("event {} has no chainDigest, though every event from {from} on was exported with one: it was taken out, or this isn't botd's", c.id));
+        if let Some(after) = digests_after.filter(|&a| c.id > a && !c.has_digest) {
+            problem(c, "unbound", format!("event {} has no chainDigest, though every event after {after} was exported with one: it was taken out, or this isn't botd's", c.id));
         }
         let first_copy = i == 0 || copies[i - 1].id != c.id;
+        if first_copy {
+            prior = before;
+        }
         if !first_copy {
             let original = before.expect("an earlier copy");
             if (original.prev.as_str(), original.hash.as_str()) != (c.prev.as_str(), c.hash.as_str()) {
@@ -342,7 +363,7 @@ fn walk(host: String, mut copies: Vec<Copy>, keys: Option<&[Vec<u8>]>) -> Host {
             }
             (true, Some(b)) => Some(b.id),
             (true, None) => None,
-            (false, _) => copies[..i].iter().rev().find(|p| p.id != c.id).filter(|p| p.hash == c.prev).map(|p| p.id),
+            (false, _) => prior.filter(|p| p.hash == c.prev).map(|p| p.id),
         };
         if let Some(d) = &c.checkpoint {
             match check_checkpoint(Some(&c.prev), Some(d), linked, keys) {
@@ -508,6 +529,22 @@ pub mod tests {
         }
         let r = report(&older, None);
         assert_eq!((r.ok, r.hosts[0].unbound, r.hosts[0].bound), (true, 2, 4), "{r:?}");
+        // Every digest taken out, and an event changed: nothing in the lines says they
+        // had any, so only `digestsAfter` kept apart from them catches it.
+        let mut bare = chain(6);
+        for v in &mut bare {
+            v.as_object_mut().unwrap().remove("chainDigest");
+            v.as_object_mut().unwrap().remove("chainSalt");
+        }
+        bare[3]["details"] = json!({ "n": "forged" });
+        assert!(report(&bare, None).ok, "the limit --digests-after closes");
+        let mut l = Lines::new(None).digests_after(Some(2));
+        for (n, v) in bare.iter().enumerate() {
+            l.line(&v.to_string(), &format!("f:{}", n + 1));
+        }
+        let r = l.finish();
+        assert_eq!((r.ok, r.digests_after, r.hosts[0].problems, reasons(&r)[0]), (false, Some(2), 4, "unbound"), "{r:?}");
+        assert_eq!(r.hosts[0].first_problems[0].id, Some(3), "{r:?}");
         // A line naming the schema that isn't one of its events.
         let mut l = Lines::new(None);
         l.line(r#"{"schema":"superbot.audit.v1","id":1}"#, "g:1");
