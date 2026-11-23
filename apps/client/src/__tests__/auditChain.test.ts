@@ -70,6 +70,13 @@ describe("audit chain lines (ADR 0149)", () => {
     expect(exportLine({ ...on, failing: true, lastError: "refused" })).toMatchObject({ tone: "bad", text: expect.stringContaining("Failing to https://siem.example: refused") });
   });
 
+  it("says how the S3 archive's objects are locked", () => {
+    const archive = { endpoint: "https://s3.example", bucket: "audit", prefix: "prod", lock: "compliance" as const, retainDays: 400, batchSeconds: 300, lastObject: { key: "prod/x.jsonl", version: "v1", events: 3, lockMode: "compliance", retainUntil: 1_900_000_000_000 } };
+    const on = { enabled: true as const, kind: "s3", sink: "s3://audit/prod", delivered: 40, pending: 0, deliveredAt: null, failing: false, lastError: null, archive };
+    expect(exportLine(on)).toMatchObject({ tone: "ok", text: expect.stringContaining("last object locked (compliance) until") });
+    expect(exportLine({ ...on, archive: { ...archive, lock: "off" as const, lastObject: null } })).toMatchObject({ tone: "warn", text: expect.stringContaining("objects not locked") });
+  });
+
   it("lists every part in order", () => {
     expect(chainLines(chainState()).map((l) => l.label)).toEqual(["Last check", "Head", "Last checkpoint", "Timestamps", "SIEM export"]);
   });

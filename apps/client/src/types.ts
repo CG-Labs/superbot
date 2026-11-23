@@ -754,7 +754,18 @@ export interface AuditVerification {
 /** The SIEM export's progress (`GET /api/audit/siem`). */
 export type AuditExportState =
   | { enabled: false }
-  | { enabled: true; kind: string; sink: string; delivered: number; pending: number; deliveredAt: number | null; failing: boolean; lastError: string | null };
+  | { enabled: true; kind: string; sink: string; delivered: number; pending: number; deliveredAt: number | null; failing: boolean; lastError: string | null; archive?: AuditArchiveState };
+
+/** The S3 archive's settings and last object, when the export is `s3://` (ADR 0153). */
+export interface AuditArchiveState {
+  endpoint: string;
+  bucket: string;
+  prefix: string;
+  lock: "bucket" | "compliance" | "governance" | "off";
+  retainDays: number | null;
+  batchSeconds: number;
+  lastObject: { key: string; version: string | null; events: number; lockMode?: string; retainUntil?: number } | null;
+}
 
 /** `GET /api/audit/chain`: the chain's state for admins (ADR 0149). */
 export interface AuditChainState {
