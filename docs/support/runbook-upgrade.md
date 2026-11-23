@@ -50,14 +50,14 @@ Restore the backup taken just before the upgrade, **with the version it was made
 
 1. **Stop botd and the backup timer**: `sudo systemctl stop superbot superbot-backup.timer` (Compose: `docker compose stop botd backup`). The upgraded botd mustn't write any more, and the timer mustn't take a backup of the upgraded data.
 2. **Restore the archive first**, with the tools installed now ([server restore](runbook-server-restore.md), steps for the same host). Installing the previous version restarts botd, so it must find the restored data, never the upgraded one.
-3. **Then install the previous version**, building that version's code, not just its installer: the installer fetches `main` unless told otherwise, which would build the new version and change the restored database again. Check out the previous tag and install from that checkout, which starts botd again:
+3. **Then install the previous version**, building that version's code, not just its installer: the installer fetches `main` unless told otherwise, which would build the new version and change the restored database again. Give it the previous tag with `--branch`, after fetching that tag into the service's checkout (a shallow clone has no tags of its own). It keeps `.env`, `data` and the workspace, and starts botd again:
 
    ```sh
-   git clone --depth 1 --branch <previous-tag> https://github.com/CG-Labs/superbot.git /tmp/superbot-previous
-   sudo /tmp/superbot-previous/deploy/install.sh --upgrade --source-dir /tmp/superbot-previous
+   sudo -u superbot git -C /home/superbot/superbot fetch --depth 1 origin tag <previous-tag>
+   curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/<previous-tag>/deploy/install.sh | sudo bash -s -- --upgrade --branch <previous-tag>
    ```
 
-   Air-gapped: `sudo ./deploy/install.sh --upgrade --offline <previous-bundle>` from the previous bundle. Compose: set `SUPERBOT_VERSION` back in `.env`, then `docker compose up -d`.
+   Don't use `--source-dir` with a fresh clone here: it syncs that folder over the service's with `rsync --delete`, and a fresh clone has no `.env`, `data` or workspace, so they'd be deleted. Air-gapped: `sudo bash install.sh --offline <previous-bundle> --upgrade`, with the previous bundle's `install.sh`. Compose: set `SUPERBOT_VERSION` back in `.env`, then `docker compose up -d`.
 4. **Check it**: `sudo botd support check --home /home/superbot` (Compose: `docker compose exec botd botd support check`). The database's schema must match this botd's. If it says **made by a newer botd**, the restore didn't take: stop botd at once and restore again. Then run the after-upgrade checks above.
 
 Never start an older botd on a database a newer one has changed, and never set `PRAGMA user_version` by hand: the older botd doesn't know the new tables and columns, and what it writes may not be readable by either version.
