@@ -81,6 +81,16 @@ fn pick(app: &App, u: &User, on: Option<&str>) -> Res<ResidencyPin> {
     }
 }
 
+/// Your own pin's reference, or for one kept from a team you left (ADR 0171) that team
+/// instead: its reference is the team's agreement, which only the team's owners and
+/// admins see (ADR 0129).
+fn own_pin_fields(app: &App, p: &ResidencyPin, v: &mut Value) {
+    match &p.kept_from {
+        Some(t) => v["keptFrom"] = json!({ "team": { "id": t, "name": app.db.team(t).map(|t| t.name) } }),
+        None => v["reference"] = json!(p.reference),
+    }
+}
+
 /// `GET /api/me/residency`: the pin that holds your data (your team's, else your own), or
 /// null; whether your machine and backups are in its region and your plan's model routes
 /// are held there; and which reports you can get.
@@ -101,12 +111,13 @@ pub async fn view(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>,
                 pin["reference"] = json!(p.reference);
             }
         }
-        PinOn::User => pin["reference"] = json!(p.reference),
+        PinOn::User => own_pin_fields(&app, &p, &mut pin),
     }
-    let own_pin = own
-        .as_ref()
-        .filter(|_| p.subject_type == PinOn::Team)
-        .map(|o| json!({ "region": o.region, "pinnedAt": o.pinned_at, "reference": o.reference }));
+    let own_pin = own.as_ref().filter(|_| p.subject_type == PinOn::Team).map(|o| {
+        let mut v = json!({ "region": o.region, "pinnedAt": o.pinned_at });
+        own_pin_fields(&app, o, &mut v);
+        v
+    });
     let mut reports = Vec::new();
     if p.subject_type == PinOn::Team && lead {
         reports.push("team");

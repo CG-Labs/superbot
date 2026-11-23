@@ -14,6 +14,9 @@
 //! a reason. Every pin, unpin and refusal is audited. A pinned person's Bot runs take only
 //! model routes the tiers file marks as in the region, or are refused (ADR 0139, in the
 //! runner). botd's own database is where ADR 0117 says.
+//!
+//! Someone leaving a pinned team keeps its pin as their own (ADR 0171), and with
+//! RESIDENCY_STARTUP=refuse botd won't start while it can't keep a pin.
 
 use super::backup::{self, Offsite};
 use super::{ControlPlane, conflict, event, region};
@@ -288,6 +291,103 @@ pub(super) fn route_gaps(app: &App, people: &[String], region: &str) -> Vec<Stri
     gaps
 }
 
+/// Why this server can't keep `p` now (ADR 0129): its region isn't ready, or some of the
+/// data it holds is outside it, as one line. None: it can, or whom it is on is gone.
+fn unkept_line(app: &App, cp: &ControlPlane, p: &ResidencyPin, name: &str, people: &[String]) -> Option<String> {
+    let mut why = unready(cp, &p.region);
+    for id in people {
+        why.extend(outside(app, cp, id, &p.region));
+    }
+    (!why.is_empty()).then(|| format!("{name} is {}, but {}. Backups, restores and new machines that can't stay there are refused (ADR 0129).", pinned_to(p), why.join("; ")))
+}
+
+/// The pins this server can't keep now, each with why: the regions, hosts and backup
+/// stores it is set up with don't hold their region, or their data is outside it. Model
+/// routes aren't counted: those runs are refused one by one (ADR 0139).
+pub fn unkept(app: &App, cp: &ControlPlane) -> Vec<(ResidencyPin, String)> {
+    app.db
+        .residency_pins()
+        .into_iter()
+        .filter_map(|p| {
+            let (name, people) = held_by(app, &p)?;
+            let why = unkept_line(app, cp, &p, &name, &people)?;
+            Some((p, why))
+        })
+        .collect()
+}
+
+/// What botd does at startup when a pin can't be kept (`RESIDENCY_STARTUP`, ADR 0171):
+/// warn and start (the default), or refuse to start.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Startup {
+    #[default]
+    Warn,
+    Refuse,
+}
+
+impl Startup {
+    pub fn parse(v: &str) -> Result<Startup, String> {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "" | "warn" => Ok(Startup::Warn),
+            "refuse" => Ok(Startup::Refuse),
+            v => Err(format!("RESIDENCY_STARTUP must be warn or refuse, not \"{}\"", crate::audit::clip(v, 20))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Startup::Warn => "warn",
+            Startup::Refuse => "refuse",
+        }
+    }
+}
+
+static STARTUP: std::sync::OnceLock<Startup> = std::sync::OnceLock::new();
+
+/// The `RESIDENCY_STARTUP` botd started with, for `GET /api/regions`.
+pub fn startup() -> Startup {
+    STARTUP.get().copied().unwrap_or_default()
+}
+
+pub fn set_startup(policy: Startup) {
+    let _ = STARTUP.set(policy);
+}
+
+/// At startup: the residency warnings to log, or, with `Startup::Refuse` and a pin this
+/// server can't keep, why botd won't start, audited as `residency.startup_refused`.
+pub fn at_startup(app: &App, cp: &ControlPlane, policy: Startup) -> Result<Vec<String>, String> {
+    let unkept = match policy {
+        Startup::Refuse => unkept(app, cp),
+        Startup::Warn => Vec::new(),
+    };
+    if unkept.is_empty() {
+        return Ok(warnings(app, cp));
+    }
+    let pins: Vec<Value> = unkept
+        .iter()
+        .map(|(p, why)| json!({ "subjectType": p.subject_type, "subjectId": p.subject_id, "region": p.region, "reference": p.reference, "error": why }))
+        .collect();
+    let by = Who::system("startup");
+    app.db.record(&by.event("residency.startup_refused").outcome(Outcome::Denied).details(json!({ "policy": policy.as_str(), "pins": pins })));
+    let lines: Vec<&str> = unkept.iter().map(|(_, why)| why.as_str()).collect();
+    Err(format!(
+        "RESIDENCY_STARTUP=refuse, and this server can't keep {} residency pin{}: {} Put back the regions, host tags or backup stores they need, or start with RESIDENCY_STARTUP=warn to unpin with a reason (botctl user|team residency ... unpin) (ADR 0171).",
+        unkept.len(),
+        if unkept.len() == 1 { "" } else { "s" },
+        lines.join(" ")
+    ))
+}
+
+/// A leaver's data, kept under their former team's pin as a pin of their own (ADR 0171):
+/// audited as `user.residency_pin_kept`.
+pub fn kept_for_leaver(app: &App, by: &Who, team_id: &str, user_id: &str, reason: &str, p: &ResidencyPin) {
+    let d = json!({
+        "region": p.region, "reference": p.reference, "team": team_id, "teamName": app.db.team(team_id).map(|t| t.name),
+        "reason": reason, "userEmail": app.db.user(user_id).and_then(|u| u.email),
+    });
+    app.db.record(&by.event("user.residency_pin_kept").target("user", user_id).details(d));
+}
+
 /// Warnings for startup and admins: pins whose region this server can't keep now, or
 /// whose data is outside it. Their backups and restores are refused until fixed. Also
 /// pins whose people's plans have no model route there (ADR 0139), whose runs are refused.
@@ -295,13 +395,7 @@ pub fn warnings(app: &App, cp: &ControlPlane) -> Vec<String> {
     let mut out: Vec<String> = app.tiers().unknown_regions(&cp.regions).into_iter().map(|w| format!("The tiers file's {w} (ADR 0139).")).collect();
     for p in app.db.residency_pins() {
         let Some((name, people)) = held_by(app, &p) else { continue };
-        let mut why = unready(cp, &p.region);
-        for id in &people {
-            why.extend(outside(app, cp, id, &p.region));
-        }
-        if !why.is_empty() {
-            out.push(format!("{name} is {}, but {}. Backups, restores and new machines that can't stay there are refused (ADR 0129).", pinned_to(&p), why.join("; ")));
-        }
+        out.extend(unkept_line(app, cp, &p, &name, &people));
         let gaps = route_gaps(app, &people, &p.region);
         if !gaps.is_empty() {
             out.push(format!(
@@ -543,6 +637,15 @@ mod tests {
         let cp = ControlPlane { regions: vec!["gb-lon".into()], ..ControlPlane::default() };
         assert!(unready(&cp, "gb-lon").is_empty(), "no hosts and no off-host backups: nothing else to check");
         assert!(unready(&cp, "de-fra-2")[0].contains("isn't one of MACHINE_REGIONS (gb-lon)"));
+    }
+
+    #[test]
+    fn residency_startup_is_warn_unless_set_to_refuse() {
+        assert_eq!(Startup::parse(""), Ok(Startup::Warn));
+        assert_eq!(Startup::parse(" Warn "), Ok(Startup::Warn));
+        assert_eq!(Startup::parse("REFUSE"), Ok(Startup::Refuse));
+        assert!(Startup::parse("strict").unwrap_err().contains("must be warn or refuse, not \"strict\""));
+        assert_eq!(Startup::default().as_str(), "warn");
     }
 
     #[test]

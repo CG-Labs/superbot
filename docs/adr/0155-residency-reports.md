@@ -31,7 +31,7 @@ A pin holds a tenant's machines, backups and model calls to a region, and audits
   - refusals the pin caused, counted by event and kind: `machine.residency_refused` (by `action`), `bot.run_refused` with reason `residency_pinned` (run, or pinned while queued), and region changes, joins and team deletes refused as `residency_pinned`. A refusal counts when it is on the subject, names the pin among a run's pins, or is about one of its people in its region. A run refusal also counts when its `pinnedRegions` include the region and it carried one of the pin's people, whichever pin it named: a member's own pin and their team's agree on the region, and the run names only the team's;
   - runs held to in-region routes: `harness.invoked` with `residency.regions` including the region and `residency.people` (the people the run carried, now recorded on held runs and on residency run refusals) including one of the pin's people. Counting by who was recorded at the time keeps past counts fixed when a Bot is deleted or handed over. Runs recorded before this fall back to the asker and the Bot's owner now;
   - `truncated` when the period has more matching events than one report reads (100,000).
-- **Not covered**: botd's own database and server backups, what Bots' tools send, other subprocessors, and people who have left a pinned team.
+- **Not covered**: botd's own database and server backups, what Bots' tools send, other subprocessors, and people who have left a pinned team. (Since [ADR 0171](0171-residency-startup-and-leavers.md), those people keep the team's pin as their own, with its own report.)
 
 Counts, never chats, prompts or IP addresses. Names and emails of the covered people are in it, since it is about them and goes to their organisation.
 

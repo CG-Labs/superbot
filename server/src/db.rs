@@ -1972,7 +1972,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 59] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 60] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -2032,6 +2032,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 59] = [
     migrate_health_scores,
     migrate_saml_group_roles,
     migrate_machine_host_dedication,
+    migrate_residency_kept_from,
 ];
 
 /// Native SAML groups mapped to custom roles across the server (ADR 0160): one role per
@@ -2242,6 +2243,15 @@ fn migrate_residency_pins(c: &Connection, _fresh: bool) -> rusqlite::Result<()> 
           PRIMARY KEY (subject_type, subject_id)
         );",
     )
+}
+
+/// A user's pin kept from their team's when they left it (ADR 0171): the team it came from.
+fn migrate_residency_kept_from(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('residency_pins') WHERE name = 'kept_from'", [], |r| r.get(0))?;
+    if !has {
+        c.execute_batch("ALTER TABLE residency_pins ADD COLUMN kept_from TEXT;")?;
+    }
+    Ok(())
 }
 
 /// Machines suspended because their user was disabled (ADR 0124), so enabling them
@@ -9519,6 +9529,8 @@ pub struct ResidencyPin {
     pub reference: String,
     pub pinned_by: Option<String>,
     pub pinned_at: i64,
+    /// A user's pin kept from their team's when they left it (ADR 0171): that team's id.
+    pub kept_from: Option<String>,
 }
 
 fn residency_pin_row(r: &Row) -> rusqlite::Result<ResidencyPin> {
@@ -9530,6 +9542,7 @@ fn residency_pin_row(r: &Row) -> rusqlite::Result<ResidencyPin> {
         reference: r.get("reference")?,
         pinned_by: r.get("pinned_by")?,
         pinned_at: r.get("pinned_at")?,
+        kept_from: r.get("kept_from")?,
     })
 }
 
@@ -9688,7 +9701,7 @@ impl Db {
         }
         tx.execute(
             "INSERT INTO residency_pins (subject_type, subject_id, region, reference, pinned_by, pinned_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT (subject_type, subject_id) DO UPDATE SET region = excluded.region, reference = excluded.reference, pinned_by = excluded.pinned_by, pinned_at = excluded.pinned_at",
+             ON CONFLICT (subject_type, subject_id) DO UPDATE SET region = excluded.region, reference = excluded.reference, pinned_by = excluded.pinned_by, pinned_at = excluded.pinned_at, kept_from = NULL",
             params![kind.as_str(), id, region, reference, by, at],
         )
         .map_err(|e| e.to_string())?;
@@ -9761,10 +9774,28 @@ impl Db {
             > 0
     }
 
-    /// Takes a member off a team. With `keep_owner`, not its last owner while others
-    /// remain, in the same statement.
+    /// Takes a member off a team, keeping no pin.
+    #[cfg(test)]
     pub fn remove_team_member(&self, team_id: &str, user_id: &str, keep_owner: bool) -> bool {
-        self.c()
+        self.remove_team_member_keeping_pin(team_id, user_id, keep_owner, false).unwrap().0
+    }
+
+    /// Makes every new residency pin fail to save, or stops that.
+    #[cfg(test)]
+    pub fn fail_pin_saves(&self, on: bool) {
+        let sql = if on { "CREATE TRIGGER pins_full BEFORE INSERT ON residency_pins BEGIN SELECT RAISE(ABORT, 'disk full'); END;" } else { "DROP TRIGGER pins_full;" };
+        self.c().execute_batch(sql).unwrap();
+    }
+
+    /// Takes a member off a team. With `keep_owner`, not its last owner while others
+    /// remain, in the same statement. With `keep_pin`, in the same transaction, the
+    /// team's residency pin is copied to the leaver as their own (ADR 0171), with their
+    /// own data region set to it, unless they have a pin of their own already. Ok:
+    /// whether they were taken off, and the pin kept. Err: nothing changed.
+    pub fn remove_team_member_keeping_pin(&self, team_id: &str, user_id: &str, keep_owner: bool, keep_pin: bool) -> Result<(bool, Option<ResidencyPin>), String> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
+        let gone = tx
             .execute(
                 "DELETE FROM team_members WHERE team_id = ?1 AND user_id = ?2
                  AND (NOT ?3 OR role != 'owner'
@@ -9772,8 +9803,30 @@ impl Db {
                       OR (SELECT COUNT(*) FROM team_members WHERE team_id = ?1) = 1)",
                 params![team_id, user_id, keep_owner],
             )
-            .unwrap()
-            > 0
+            .map_err(|e| e.to_string())?
+            > 0;
+        if !gone {
+            return Ok((false, None));
+        }
+        let pin = |kind: &str, id: &str| {
+            tx.query_row("SELECT * FROM residency_pins WHERE subject_type = ?1 AND subject_id = ?2", params![kind, id], residency_pin_row).optional().map_err(|e| e.to_string())
+        };
+        let kept = match (keep_pin, pin("team", team_id)?, pin("user", user_id)?) {
+            (true, Some(team), None) => {
+                let at = now();
+                tx.execute("UPDATE users SET region = ?1, updated_at = CASE WHEN region IS ?1 THEN updated_at ELSE ?2 END WHERE id = ?3", params![team.region, at, user_id])
+                    .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "INSERT INTO residency_pins (subject_type, subject_id, region, reference, pinned_by, pinned_at, kept_from) VALUES ('user', ?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![user_id, team.region, team.reference, team.pinned_by, at, team_id],
+                )
+                .map_err(|e| e.to_string())?;
+                pin("user", user_id)?
+            }
+            _ => None,
+        };
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok((true, kept))
     }
 
     /// Invites `email`, or renews a pending invite with the new role and expiry.
@@ -10151,6 +10204,50 @@ mod tests {
         assert!(db.residency_pin(PinOn::User, &u.id).is_some());
         db.c().execute_batch("DROP TRIGGER pins_kept;").unwrap();
         assert_eq!((db.unpin_residency(PinOn::User, &u.id), db.unpin_residency(PinOn::User, &u.id)), (Ok(true), Ok(false)));
+    }
+
+    #[test]
+    fn a_leaver_keeps_the_teams_pin_with_the_leave_or_neither_happens() {
+        let db = Db::open(&temp_path("pin-kept").join("app.sqlite")).unwrap();
+        let t = db.create_team("Acme", None);
+        let [ada, bea, cy, dee] = ["ada", "bea", "cy", "dee"].map(|n| db.create_user(None, Some(&format!("{n}@example.com")), n, Role::Member).unwrap());
+        assert!(db.add_team_member(&t.id, &ada.id, "owner", None));
+        for u in [&bea, &cy, &dee] {
+            assert!(db.add_team_member(&t.id, &u.id, "member", None));
+        }
+        db.pin_residency(PinOn::Team, &t.id, "gb-lon", "MSA-7", Some(&ada.id)).unwrap();
+
+        // Kept: the team's region and reference, who pinned it, and where it came from.
+        let (gone, kept) = db.remove_team_member_keeping_pin(&t.id, &bea.id, true, true).unwrap();
+        let kept = kept.unwrap();
+        assert!(gone && db.team_member(&bea.id).is_none());
+        assert_eq!((kept.subject_type, kept.region.as_str(), kept.reference.as_str()), (PinOn::User, "gb-lon", "MSA-7"));
+        assert_eq!((kept.pinned_by.as_deref(), kept.kept_from.as_deref()), (Some(ada.id.as_str()), Some(t.id.as_str())));
+        assert_eq!(db.user(&bea.id).unwrap().region.as_deref(), Some("gb-lon"), "their own region holds it");
+        // An admin renewing it makes it their own pin, no longer kept from the team.
+        db.pin_residency(PinOn::User, &bea.id, "gb-lon", "DPA-bea", None).unwrap();
+        assert_eq!(db.residency_pin(PinOn::User, &bea.id).unwrap().kept_from, None);
+
+        // Their own pin already holds them: left as it is.
+        db.pin_residency(PinOn::User, &cy.id, "gb-lon", "DPA-cy", None).unwrap();
+        assert!(matches!(db.remove_team_member_keeping_pin(&t.id, &cy.id, true, true), Ok((true, None))));
+        assert_eq!(db.residency_pin(PinOn::User, &cy.id).unwrap().reference, "DPA-cy");
+
+        // The pin can't be kept: they stay on the team, and nothing is pinned.
+        db.c().execute_batch("CREATE TRIGGER pins_full BEFORE INSERT ON residency_pins BEGIN SELECT RAISE(ABORT, 'disk full'); END;").unwrap();
+        assert!(db.remove_team_member_keeping_pin(&t.id, &dee.id, true, true).unwrap_err().contains("disk full"));
+        assert!(db.team_member(&dee.id).is_some() && db.residency_pin(PinOn::User, &dee.id).is_none());
+        assert_eq!(db.user(&dee.id).unwrap().region, None, "the region rolled back with it");
+        db.c().execute_batch("DROP TRIGGER pins_full;").unwrap();
+
+        // Not kept when asked not to (an erasure), nor for the last owner who may not go.
+        assert!(!db.remove_team_member_keeping_pin(&t.id, &ada.id, true, true).unwrap().0, "the last owner, with others on the team");
+        assert!(db.residency_pin(PinOn::User, &ada.id).is_none());
+        assert!(matches!(db.remove_team_member_keeping_pin(&t.id, &dee.id, true, false), Ok((true, None))));
+        assert!(db.residency_pin(PinOn::User, &dee.id).is_none());
+        // No team pin: nothing to keep.
+        db.unpin_residency(PinOn::Team, &t.id).unwrap();
+        assert!(matches!(db.remove_team_member_keeping_pin(&t.id, &ada.id, true, true), Ok((true, None))));
     }
 
     #[test]
