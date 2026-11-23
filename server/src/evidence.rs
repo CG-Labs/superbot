@@ -64,7 +64,7 @@ pub const SECTIONS: [Section; 5] = [
         file: "access-review.json",
         criteria: &["CC1.3", "CC6.1", "CC6.2", "CC6.3"],
         rows: &["CC6.1-1", "CC6.2-1", "CC6.3-1", "CC6.3-2"],
-        actions: &["user.*", "session.revoked*", "role.*", "team.invited", "team.member_*", "team.role_changed", "scim.*", "signup.approved", "signup.rejected", "access_review.*", "auth.mfa_policy_updated"],
+        actions: &["user.*", "session.revoked*", "role.*", "team.invited", "team.member_*", "team.role_changed", "scim.*", "signup.approved", "signup.rejected", "access_review.*", "auth.mfa_policy_updated", "service_account.*", "service_token.*"],
     },
     Section {
         file: "changes.json",
@@ -392,6 +392,29 @@ fn person(p: &Value) -> Value {
     })
 }
 
+/// A service account as the bundle keeps it (ADR 0165): ids and permissions, never its
+/// name, description or a token's name.
+fn service_account(s: &Value) -> Value {
+    let custom = |c: &Value| c.is_object().then(|| json!({ "id": c["id"], "permissions": c["permissions"] }));
+    json!({
+        "id": s["id"],
+        "role": s["role"],
+        "customRole": custom(&s["customRole"]),
+        "status": s["status"],
+        "createdAt": s["createdAt"].as_i64().map(rfc3339),
+        "team": s["team"].is_object().then(|| json!({ "id": s["team"]["id"], "customRole": custom(&s["team"]["customRole"]) })),
+        "owner": s["owner"]["id"],
+        "ownerActive": s["ownerActive"],
+        "effective": s["effective"],
+        "botAccess": { "bots": s["botAccess"]["bots"].as_array().map_or(0, Vec::len) },
+        "tokens": s["tokens"].as_array().map(|ts| ts.iter().map(|t| json!({
+            "id": t["id"], "scopes": t["scopes"], "createdAt": t["createdAt"].as_i64().map(rfc3339),
+            "expiresAt": t["expiresAt"].as_i64().map(rfc3339), "lastUsedAt": t["lastUsedAt"].as_i64().map(rfc3339),
+        })).collect::<Vec<_>>()),
+        "flags": s["flags"],
+    })
+}
+
 fn access(app: &App, inputs: &Inputs, t: &Tally) -> Value {
     let r = access_review::build_with(app, &inputs.sessions);
     let reviews = t.counts.get(access_review::COMPLETED).map_or(0, |o| o.values().sum::<u64>());
@@ -401,6 +424,7 @@ fn access(app: &App, inputs: &Inputs, t: &Tally) -> Value {
         "mfaPolicy": inputs.mfa.as_str(),
         "summary": r.summary(),
         "people": r.people().map(person).collect::<Vec<_>>(),
+        "serviceAccounts": r.service_accounts().map(service_account).collect::<Vec<_>>(),
         "reviewsSignedOffInPeriod": reviews,
         "period": t.view(),
     })

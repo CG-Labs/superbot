@@ -338,7 +338,7 @@ fn role_summary(r: Option<&CustomRole>) -> Value {
     r.map_or(Value::Null, |r| json!({ "id": r.id, "name": r.name }))
 }
 
-fn token_state(t: &ServiceToken, at: i64) -> &'static str {
+pub fn token_state(t: &ServiceToken, at: i64) -> &'static str {
     match (t.revoked_at, t.expires_at <= at) {
         (Some(_), _) => "revoked",
         (None, true) => "expired",
@@ -346,27 +346,64 @@ fn token_state(t: &ServiceToken, at: i64) -> &'static str {
     }
 }
 
+/// `sbsa_…` and the token's last four characters: enough to tell tokens apart.
+pub fn token_preview(t: &ServiceToken) -> String {
+    format!("{TOKEN_PREFIX}…{}", t.hint)
+}
+
 fn token_view(t: &ServiceToken, at: i64) -> Value {
     let mut v = serde_json::to_value(t).unwrap_or_default();
     v["state"] = json!(token_state(t, at));
-    v["preview"] = json!(format!("{TOKEN_PREFIX}…{}", t.hint));
+    v["preview"] = json!(token_preview(t));
     v
 }
 
+/// What a service account holds, as the access review (ADR 0165) and its own views show it.
+pub struct Holdings {
+    /// Its custom role across the server, or in its team.
+    pub org_role: Option<CustomRole>,
+    pub team_role: Option<CustomRole>,
+    pub team: Option<crate::db::Team>,
+    /// Across the server, and in its team.
+    pub org: Scope,
+    pub in_team: Scope,
+    /// What its tokens can use today: within its owner, and nothing while it or its owner is inactive.
+    pub effective: Scope,
+    pub owner: Option<User>,
+    pub owner_active: bool,
+}
+
+pub fn holdings(db: &crate::db::Db, sa: &ServiceAccount) -> Holdings {
+    let roles = Roles::of(db, sa);
+    let owner = db.user(&sa.owner_id);
+    let owner_active = owner.as_ref().is_some_and(|o| owner_of(db, &o.id).is_some());
+    let effective = match &owner {
+        Some(o) if owner_active && sa.user.active() => roles.holds().and(ceiling(db, o, roles.team.as_ref().map(|t| t.id.as_str()))),
+        _ => Scope::NONE,
+    };
+    Holdings {
+        org_role: roles.org_role().cloned(),
+        team_role: roles.team_role().cloned(),
+        org: roles.org(),
+        in_team: roles.in_team(),
+        team: roles.team,
+        effective,
+        owner,
+        owner_active,
+    }
+}
+
 fn view(app: &AppState, sa: &ServiceAccount) -> Value {
-    let roles = Roles::of(&app.db, sa);
-    let owner = app.db.user(&sa.owner_id);
-    let live = owner.as_ref().filter(|o| live_owner(app, &o.id).is_some());
+    let h = holdings(&app.db, sa);
     let at = crate::db::now();
     let tokens = app.db.service_tokens(&sa.user.id);
-    let effective = live.map_or(Scope::NONE, |o| roles.holds().and(ceiling(&app.db, o, roles.team.as_ref().map(|t| t.id.as_str()))));
     json!({
         "id": sa.user.id, "name": sa.user.name, "description": sa.description, "role": sa.user.role, "status": sa.user.status,
-        "customRole": role_summary(roles.org_role()), "team": roles.team.as_ref().map(|t| json!({ "id": t.id, "name": t.name })),
-        "teamRole": role_summary(roles.team_role()),
-        "owner": owner.as_ref().map(person), "ownerActive": live.is_some(),
-        "permissions": roles.org().names(), "teamPermissions": roles.in_team().names(),
-        "effective": if sa.user.active() { effective.names() } else { Vec::new() },
+        "customRole": role_summary(h.org_role.as_ref()), "team": h.team.as_ref().map(|t| json!({ "id": t.id, "name": t.name })),
+        "teamRole": role_summary(h.team_role.as_ref()),
+        "owner": h.owner.as_ref().map(person), "ownerActive": h.owner_active,
+        "permissions": h.org.names(), "teamPermissions": h.in_team.names(),
+        "effective": h.effective.names(),
         "tokens": tokens.iter().filter(|t| token_state(t, at) == "active").count(),
         "lastUsedAt": tokens.iter().filter_map(|t| t.last_used_at).max(),
         "createdAt": sa.user.created_at, "createdBy": sa.created_by, "updatedAt": sa.user.updated_at,

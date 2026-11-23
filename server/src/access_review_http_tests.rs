@@ -137,6 +137,123 @@ async fn the_csv_has_a_dated_row_per_person_and_its_export_is_audited() {
     assert!(head.to_ascii_lowercase().contains("access-control-expose-headers: content-disposition"), "{head}");
 }
 
+fn service<'a>(r: &'a Value, id: &str) -> &'a Value {
+    r["serviceAccounts"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap_or_else(|| panic!("{id} not in {r}"))
+}
+
+#[tokio::test]
+async fn service_accounts_are_reviewed_with_their_owner_tokens_and_bots() {
+    use crate::service_accounts_http_tests::{account, role, token};
+    let (port, app, admin, _) = serve_app().await;
+    let before = report(port, &admin).await;
+    assert_eq!((before["serviceAccounts"].clone(), before["summary"]["serviceAccounts"].clone()), (json!([]), json!(0)));
+    // A deleted service account holds nothing: the report and its digest are as if it never was.
+    let temp = account(port, &admin, json!({ "name": "Temp" })).await;
+    assert_ne!(report(port, &admin).await["digest"], before["digest"]);
+    assert_eq!(call(port, "DELETE", &format!("/api/service-accounts/{temp}"), &admin, "").await.0, 200);
+    assert_eq!(report(port, &admin).await["digest"], before["digest"], "reports without service accounts keep their digests");
+
+    let (ada, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (bo, _) = user_with(port, &admin, "bo@example.com", "member").await;
+    let (code, t) = call(port, "POST", "/api/teams", &admin, &json!({ "name": "Alpha", "owner": bo }).to_string()).await;
+    assert_eq!(code, 201, "{t}");
+    let team = parse(&t)["id"].as_str().unwrap().to_string();
+    let shared = app.db.create_bot_owned("Alpha ops", "#fff", "waddle", "claude", None, false, &bo, Visibility::Shared).id;
+    let exporter = role(port, &admin, "Exporter", "readonly", &["audit.view"]).await;
+    let audit = account(port, &admin, json!({ "name": "Audit export", "role": "Exporter" })).await;
+    let (audit_tok, audit_t) = token(port, &admin, &audit, json!({ "name": "SIEM pull", "scopes": ["read", "audit.view"] })).await;
+    let ci = account(port, &admin, json!({ "name": "CI", "role": "member", "team": team })).await;
+    let (_, ci_t) = token(port, &admin, &ci, json!({})).await;
+    let adas = account(port, &admin, json!({ "name": "Ada's report" })).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{adas}"), &admin, &json!({ "owner": ada }).to_string()).await.0, 200);
+    let (_, adas_t) = token(port, &admin, &adas, json!({})).await;
+
+    let r = report(port, &admin).await;
+    let names: Vec<&str> = r["serviceAccounts"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Ada's report", "Audit export", "CI"], "live ones, by name");
+    let a = service(&r, &audit);
+    assert_eq!((a["role"].as_str(), a["status"].as_str(), a["owner"]["id"].as_str(), a["ownerActive"].as_bool()), (Some("readonly"), Some("active"), Some(users::OPERATOR), Some(true)));
+    assert_eq!((a["customRole"]["id"].as_str(), a["customRole"]["permissions"].clone()), (Some(exporter.as_str()), json!(["audit.view"])));
+    assert_eq!(a["effective"], json!(["account", "read", "review", "audit.view"]));
+    let tok = &a["tokens"][0];
+    let hint = audit_t["tokenInfo"]["hint"].as_str().unwrap();
+    assert_eq!((tok["id"].clone(), tok["name"].as_str(), tok["scopes"].clone()), (audit_t["tokenInfo"]["id"].clone(), Some("SIEM pull"), json!(["read", "audit.view"])));
+    assert_eq!((tok["preview"].as_str(), tok["lastUsedAt"].clone(), tok["expiresAt"].is_i64()), (Some(format!("sbsa_…{hint}").as_str()), Value::Null, true));
+    assert_eq!(a["flags"], json!([]), "a scoped token, used or not yet old, needs no second look");
+    // A team's service account: its team, as a plain member, and the team's shared Bots.
+    let c = service(&r, &ci);
+    assert_eq!((c["team"]["id"].as_str(), c["team"]["name"].as_str(), c["team"]["role"].as_str()), (Some(team.as_str()), Some("Alpha"), Some("member")));
+    let bots = c["botAccess"]["bots"].as_array().unwrap();
+    assert!(bots.iter().any(|b| b["id"] == shared.as_str() && b["owner"]["id"] == bo.as_str()), "{bots:?}");
+    assert_eq!(c["flags"], json!(["unscoped_token"]), "a token with all the account holds");
+    assert_eq!(service(&r, &adas)["owner"]["id"].as_str(), Some(ada.as_str()));
+    assert_eq!((r["summary"]["serviceAccounts"].clone(), r["summary"]["serviceApiAccess"].clone(), r["summary"]["serviceAccountsFlagged"].clone()), (json!(3), json!(3), json!(2)));
+    assert_eq!(r["summary"]["people"], 3, "service accounts aren't counted as people");
+    assert!(people(&r).iter().all(|p| p["id"] != audit.as_str() && p["id"] != ci.as_str()));
+
+    // Using a token changes nothing a reviewer signs off on; only when it was last used.
+    assert_eq!(call(port, "GET", "/api/auth/me", &audit_tok, "").await.0, 200);
+    let used = report(port, &admin).await;
+    assert!(service(&used, &audit)["tokens"][0]["lastUsedAt"].is_i64());
+    assert_eq!(used["digest"], r["digest"], "a script calling during the review changes nothing");
+    // Metadata only: never a token, its hash, or where it was used from.
+    let text = used.to_string();
+    let secret = audit_tok.strip_prefix("Bearer ").unwrap();
+    for bad in [secret, &users::hash(secret), "tokenHash", "token_hash", "lastUsedIp", "127.0.0.1"] {
+        assert!(!text.contains(bad), "{bad} in {text}");
+    }
+
+    // A token left unused for 90 days is flagged, and stays in the digest unchanged.
+    app.db.set_service_token_created(ci_t["tokenInfo"]["id"].as_str().unwrap(), db::now() - 91 * 24 * 60 * 60_000);
+    let old = report(port, &admin).await;
+    assert_eq!(service(&old, &ci)["flags"], json!(["unscoped_token", "unused_token"]));
+    assert_eq!(old["digest"], r["digest"]);
+
+    // An owner who's disabled lends nothing: flagged, nothing usable today, and a new digest.
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{ada}"), &admin, r#"{"status":"disabled"}"#).await.0, 200);
+    let off = report(port, &admin).await;
+    let s = service(&off, &adas);
+    assert_eq!((s["ownerActive"].as_bool(), s["effective"].clone(), s["owner"]["status"].as_str()), (Some(false), json!([]), Some("disabled")));
+    assert_eq!(s["flags"], json!(["owner_inactive", "unscoped_token"]));
+    assert_ne!(off["digest"], r["digest"]);
+    // A new token is new access: the old digest no longer signs off.
+    let _ = token(port, &admin, &audit, json!({ "scopes": ["read"] })).await;
+    let (code, res) = call(port, "POST", "/api/access-review/complete", &admin, &json!({ "digest": off["digest"] }).to_string()).await;
+    assert_eq!(code, 409, "{res}");
+    // Revoked tokens leave the report, and the sign-off keeps the counts.
+    assert_eq!(call(port, "DELETE", &format!("/api/service-accounts/{adas}/tokens/{}", adas_t["tokenInfo"]["id"].as_str().unwrap()), &admin, "").await.0, 200);
+    let now = report(port, &admin).await;
+    assert_eq!(service(&now, &adas)["tokens"], json!([]));
+    let (code, res) = call(port, "POST", "/api/access-review/complete", &admin, &json!({ "digest": now["digest"] }).to_string()).await;
+    assert_eq!(code, 201, "{res}");
+    assert_eq!((parse(&res)["review"]["summary"]["serviceAccounts"].clone(), parse(&res)["review"]["summary"]["serviceApiAccess"].clone()), (json!(3), json!(3)));
+}
+
+#[tokio::test]
+async fn the_csv_has_a_row_per_service_account() {
+    use crate::service_accounts_http_tests::{account, token};
+    let (port, _, admin, _) = serve_app().await;
+    let sa = account(port, &admin, json!({ "name": "=Export", "role": "member" })).await;
+    let (tok, t) = token(port, &admin, &sa, json!({ "name": "Nightly", "scopes": ["read", "write"] })).await;
+    let digest = report(port, &admin).await["digest"].as_str().unwrap().to_string();
+    let (code, _, body) = call_with(port, "GET", &format!("/api/access-review/export.csv?digest={digest}"), &admin, "", "").await;
+    assert_eq!(code, 200, "{body}");
+    let lines: Vec<&str> = body.split("\r\n").filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines[0], access_review::CSV_HEADER.trim_end());
+    assert!(lines[0].ends_with(",kind,owner,effective_permissions,service_tokens,report_digest"), "{}", lines[0]);
+    assert_eq!(lines.len(), 3, "the owner and the service account: {body}");
+    let person = lines.iter().find(|l| l.contains(",operator,")).unwrap();
+    assert!(person.contains(&format!(",person,,,,{digest}")), "{person}");
+    let row = lines.iter().find(|l| l.contains(&sa)).unwrap();
+    let hint = t["tokenInfo"]["hint"].as_str().unwrap();
+    assert!(row.contains(",'=Export,"), "formulas are escaped: {row}");
+    assert!(row.contains(",member,active,false,false,,,,,"), "no email, second factor or sign-in: {row}");
+    assert!(row.contains(",service_account,Owner (operator),account read review write approve,"), "{row}");
+    assert!(row.contains(&format!("Nightly sbsa_…{hint} scopes:read write expires:20")) && row.contains("last_used:never"), "{row}");
+    assert!(row.starts_with("20") && row.ends_with(&digest), "{row}");
+    assert!(!body.contains(tok.strip_prefix("Bearer ").unwrap()), "never the token");
+}
+
 #[tokio::test]
 async fn a_reviewer_signs_off_on_the_report_they_saw() {
     let (port, _, admin, _) = serve_app().await;
