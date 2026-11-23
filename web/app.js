@@ -39,7 +39,12 @@ function notice(msg, isError = true) {
 const fail = (err) => notice(err.message || String(err));
 
 // Shown-once values: sign-in codes, SCIM tokens and service account tokens. Closing forgets them; the server keeps only hashes.
-function showOnce({ title, note, value, link, lines = false }) {
+// Two requests can finish while one is open, so later values wait their turn instead of
+// replacing a secret that hasn't been copied yet.
+const onceQueue = [];
+function showOnce(shown) {
+  if (!$("once").hidden) return void onceQueue.push(shown);
+  const { title, note, value, link, lines = false } = shown;
   $("once-title").textContent = title;
   $("once-note").textContent = note;
   $("once-value").textContent = value;
@@ -53,6 +58,7 @@ function closeOnce() {
   $("once").hidden = true;
   $("once-value").textContent = "";
   $("once-copy-link").dataset.link = "";
+  if (onceQueue.length) showOnce(onceQueue.shift());
 }
 async function copy(text, done, shown = $("once-value")) {
   try {

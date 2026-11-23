@@ -184,6 +184,23 @@ fn the_console_asks_before_stopping_a_service_account_and_keeps_no_token() {
     assert!(!uses.is_empty() && elsewhere.is_empty(), "a token's secret goes somewhere but the shown-once dialog, on lines {elsewhere:?}");
 }
 
+/// ADR 0152: when two token requests finish together, the second secret waits until the
+/// first is closed instead of replacing it before it's copied.
+#[test]
+fn the_console_queues_a_second_shown_once_value() {
+    let body = |name: &str| {
+        let start = CONSOLE_JS.find(&format!("function {name}(")).unwrap_or_else(|| panic!("no {name}"));
+        let rest = &CONSOLE_JS[start..];
+        &rest[..rest.find("\n}\n").expect("function end") + 2]
+    };
+    let show = body("showOnce");
+    let guard = show.find(r#"if (!$("once").hidden) return void onceQueue.push(shown);"#).expect("showOnce doesn't queue while the dialog is open");
+    assert!(guard < show.find(r#"$("once-value").textContent"#).unwrap(), "showOnce writes the value before checking the dialog is free");
+    let close = body("closeOnce");
+    let next = close.find("showOnce(onceQueue.shift())").expect("closing doesn't show the next queued value");
+    assert!(close.find(r#"$("once").hidden = true"#).unwrap() < next, "the next value is shown before the dialog is closed");
+}
+
 #[tokio::test]
 async fn every_call_the_console_makes_is_served_and_admin_only() {
     let (port, _, admin, _) = serve_app().await;
