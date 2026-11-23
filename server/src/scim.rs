@@ -6,13 +6,16 @@
 //! with its own bearer tokens (`sbp_`, stored hashed), and sees only the users it
 //! provisioned and the groups it made or an admin linked to it. The IdP never names a
 //! role: with SCIM_GROUP_ROLES=on, an admin may map a group to a custom role, never
-//! admin, and its members get and lose it with the group (`roles`).
+//! admin, and its members get and lose it with the group (`roles`), or declare a group a
+//! role group that gives a role and is no team (`role_groups`).
 //! Design: docs/adr/0023-scim.md, docs/adr/0095-scim-groups-as-teams.md,
-//! docs/adr/0138-scim-group-role-mapping.md, docs/adr/0176-scim-enterprise-user-extension.md.
+//! docs/adr/0138-scim-group-role-mapping.md, docs/adr/0176-scim-enterprise-user-extension.md,
+//! docs/adr/0180-scim-role-groups.md.
 
 pub mod bulk;
 pub mod google;
 pub mod groups;
+pub mod role_groups;
 pub mod roles;
 
 use crate::audit::{Actor, ActorKind, Outcome, Source, Who};
@@ -1066,6 +1069,9 @@ pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Ar
         if found.deleted_at.is_none() {
             return Err(uniqueness(format!("A user with this externalId exists already: {}", found.user.id)));
         }
+        if role_groups::left_behind(&app, &found.user.id) {
+            role_groups::user_deleted(&app, &a, &c.who, &found.user.id).await;
+        }
         let restored = json!({ "tenant": tenant, "externalId": ext, "userName": d.user_name });
         let after = update(&app, &a, &c, &found.user.clone(), Some(&found), &d, Some(("scim.user_restored", restored))).await?;
         return created(&after);
@@ -1087,6 +1093,9 @@ pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Ar
             o => o,
         };
         let linked = json!({ "tenant": tenant, "externalId": d.external_id, "userName": d.user_name, "provider": l.provider, "subject": l.subject });
+        if mine.is_some() && role_groups::left_behind(&app, &user.id) {
+            role_groups::user_deleted(&app, &a, &c.who, &user.id).await;
+        }
         let action = if mine.is_some() { "scim.user_restored" } else { "scim.user_linked" };
         let after = update(&app, &a, &c, &user, None, &d, Some((action, linked))).await?;
         return created(&after);
@@ -1135,11 +1144,19 @@ pub async fn patch_user(State(app): State<AppState>, Extension(a): Extension<Arc
 /// `DELETE /scim/v2/Users/{id}`: the user is disabled, their sessions end, and the tenant
 /// can't see them any more. Nothing is destroyed: the user and its audit history stay.
 /// When taking them off their group's team fails (ADR 0171), the rest still happens and
-/// the answer is a 500. The IdP's retry of that DELETE finishes taking them off.
+/// the answer is a 500. The IdP's retry of that DELETE finishes taking them off, and out
+/// of role groups too if a restart cut that short.
 pub async fn delete_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Path(id): Path<String>) -> ScimRes {
     let Some(before) = app.db.scim_user(&c.token.tenant, &id) else {
-        if groups::left_behind(&app, &a, &c, &id) {
+        let teams = groups::left_behind(&app, &a, &c, &id);
+        let roles = app.db.scim_user_of(&id).is_some_and(|o| o.tenant == c.token.tenant && o.deleted_at.is_some()) && role_groups::left_behind(&app, &id);
+        if roles {
+            role_groups::user_deleted(&app, &a, &c.who, &id).await;
+        }
+        if teams {
             groups::user_deleted(&app, &a, &c, &id).await.map_err(server_error)?;
+        }
+        if teams || roles {
             return Ok(StatusCode::NO_CONTENT.into_response());
         }
         return Err(missing("User"));
@@ -1165,6 +1182,7 @@ pub async fn delete_user(State(app): State<AppState>, Extension(a): Extension<Ar
     crate::machines::offboard::left(&app, &c.who, &id, crate::machines::offboard::DEPROVISIONED);
     let left = groups::user_deleted(&app, &a, &c, &id).await;
     roles::user_deleted(&app, &a, &c.who, &id).await;
+    role_groups::user_deleted(&app, &a, &c.who, &id).await;
     crate::deprovision::user_disabled(&app, &c.who, &id, crate::deprovision::SCIM_DELETE).await;
     left.map_err(server_error)?;
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -1261,6 +1279,7 @@ mod tests {
             assert!(text.contains("SCIM_GROUP_ROLES"), "{name} documents SCIM_GROUP_ROLES");
             assert!(google::Settings::from_env(&|k| get(k).to_string(), &s, &|_| None).unwrap_or_else(|e| panic!("{name}: {e}")).is_none(), "{name}");
             assert!(vars.contains_key("GOOGLE_DIRECTORY_SYNC") && text.contains("GOOGLE_DIRECTORY_GROUPS"), "{name} documents the Google Workspace sync");
+            assert!(text.contains("GOOGLE_DIRECTORY_ROLE_GROUPS"), "{name} documents the sync's role groups");
         }
     }
 

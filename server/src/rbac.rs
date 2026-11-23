@@ -551,6 +551,12 @@ mod tests {
             ("POST", "/api/scim/role-mappings", Perm::Admin),
             ("GET", "/api/scim/role-mappings/sm1", Perm::Admin),
             ("DELETE", "/api/scim/role-mappings/sm1", Perm::Admin),
+            // And SCIM role groups (ADR 0180).
+            ("GET", "/api/scim/role-groups", Perm::Admin),
+            ("POST", "/api/scim/role-groups", Perm::Admin),
+            ("GET", "/api/scim/role-groups/g1", Perm::Admin),
+            ("PATCH", "/api/scim/role-groups/g1", Perm::Admin),
+            ("DELETE", "/api/scim/role-groups/g1", Perm::Admin),
             // And the Google Workspace sync (ADR 0162).
             ("GET", "/api/scim/google", Perm::Admin),
             ("POST", "/api/scim/google/sync", Perm::Admin),
