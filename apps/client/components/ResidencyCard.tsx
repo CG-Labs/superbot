@@ -25,11 +25,14 @@ export function ResidencyCard({ api, save = saveCsv }: Props) {
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState<"user" | "team" | null>(null);
 
+  const [loadError, setLoadError] = useState<string | null>(null);
+
   const load = useCallback(async () => {
+    setLoadError(null);
     try {
       setView(await api.myResidency());
-    } catch {
-      setView(null);
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : String(e));
     }
   }, [api]);
 
@@ -41,7 +44,18 @@ export function ResidencyCard({ api, save = saveCsv }: Props) {
     return (
       <View style={styles.card} accessibilityLabel="Data residency">
         <Text style={styles.cardTitle}>Data residency</Text>
-        <ActivityIndicator color={colors.textDim} />
+        {loadError ? (
+          <>
+            <Text style={styles.error} accessibilityRole="alert">
+              {`Couldn't load your data's residency: ${loadError}`}
+            </Text>
+            <Pressable style={styles.btn} onPress={() => void load()} accessibilityRole="button" accessibilityLabel="Try again">
+              <Text style={styles.btnText}>Try again</Text>
+            </Pressable>
+          </>
+        ) : (
+          <ActivityIndicator color={colors.textDim} />
+        )}
       </View>
     );
   }

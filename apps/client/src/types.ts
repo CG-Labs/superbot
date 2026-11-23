@@ -1185,7 +1185,8 @@ export interface MyResidency {
   /** Your own pin, when your team's holds your data too. */
   ownPin: { region: string; pinnedAt: number; reference: string } | null;
   status?: "kept" | "data_outside";
-  machine?: { id: string; state: string; region: string; inRegion: boolean } | null;
+  /** `inRegion` checks the host it is on too: `hostRegion` is null for a host with no region, `host` null off Incus. */
+  machine?: { id: string; state: string; region: string; inRegion: boolean; host?: string | null; hostRegion?: string | null } | null;
   backups?: { kept: number; inRegion: number; outside: number };
   modelRoutes?: { inRegion: boolean; gap: string | null };
   /** The pins whose residency report you can get. */

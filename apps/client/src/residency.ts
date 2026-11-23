@@ -14,8 +14,11 @@ export function residencyLines(v: MyResidency): { lines: string[]; warnings: str
   if (v.ownPin) lines.push(`Your own data is also pinned to ${v.ownPin.region} under ${v.ownPin.reference}.`);
   const warnings: string[] = [];
   if (v.machine) {
-    if (v.machine.inRegion) lines.push(`Your computer is in ${v.machine.region}.`);
-    else warnings.push(`Your computer is in ${v.machine.region}, not ${p.region}. Your admins see a warning about it.`);
+    const m = v.machine;
+    if (m.inRegion) lines.push(`Your computer is in ${m.region}.`);
+    else if (m.region !== p.region) warnings.push(`Your computer is in ${m.region}, not ${p.region}. Your admins see a warning about it.`);
+    else if (m.hostRegion) warnings.push(`Your computer is on a server in ${m.hostRegion}, not ${p.region}. Your admins see a warning about it.`);
+    else warnings.push(`Your computer is on a server with no data region set, so nothing shows it is in ${p.region}. Your admins see a warning about it.`);
   }
   const b = v.backups;
   if (b && b.kept > 0) {
