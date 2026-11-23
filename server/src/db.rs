@@ -1926,14 +1926,18 @@ pub enum ScimRoleMapError {
 }
 
 /// A SCIM role group (ADR 0180): a tenant's group an admin declared to give one custom
-/// role across the server, and nothing else. It is not a team, so people can be in any
-/// number of them. Its SCIM `id` is `id`. Until the IdP pushes a group with its
-/// `externalId` (or, with none declared, its `displayName`), it waits, unseen by the IdP.
+/// role, across the server or (ADR 0206) within the team each member is on, and nothing
+/// else. It is not a team, so people can be in any number of them. Its SCIM `id` is
+/// `id`. Until the IdP pushes a group with its `externalId` (or, with none declared, its
+/// `displayName`), it waits, unseen by the IdP.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScimRoleGroup {
     pub id: String,
     pub tenant: String,
+    /// `org` (across the server) or `team` (within the member's team, ADR 0206). Fixed
+    /// when declared.
+    pub scope: String,
     pub display_name: String,
     /// What the admin declared, given back when the IdP deletes the group.
     pub declared_display_name: String,
@@ -1953,6 +1957,7 @@ fn scim_role_group_row(r: &Row) -> rusqlite::Result<ScimRoleGroup> {
     Ok(ScimRoleGroup {
         id: r.get("id")?,
         tenant: r.get("tenant")?,
+        scope: r.get("scope")?,
         display_name: r.get("display_name")?,
         declared_display_name: r.get("declared_display_name")?,
         external_id: r.get("external_id")?,
@@ -1977,6 +1982,8 @@ pub struct ScimRoleGroupGrant {
     pub role_id: String,
     pub prior_role: Option<Role>,
     pub granted_at: i64,
+    /// The team it was given in, for a team role group (ADR 0206); None across the server.
+    pub team_id: Option<String>,
 }
 
 fn scim_role_group_grant_row(r: &Row) -> rusqlite::Result<ScimRoleGroupGrant> {
@@ -1987,8 +1994,14 @@ fn scim_role_group_grant_row(r: &Row) -> rusqlite::Result<ScimRoleGroupGrant> {
         role_id: r.get("role_id")?,
         prior_role: prior.as_deref().and_then(Role::parse).filter(|r| *r != Role::Admin),
         granted_at: r.get("granted_at")?,
+        team_id: r.get("team_id")?,
     })
 }
+
+/// Role groups' grants of both scopes, in one shape: a group has one scope, so only one
+/// of the two tables has rows for it.
+const SCIM_ROLE_GROUP_GRANTS: &str = "SELECT group_id, user_id, role_id, prior_role, granted_at, NULL AS team_id FROM scim_role_group_grants
+     UNION ALL SELECT group_id, user_id, role_id, NULL AS prior_role, granted_at, team_id FROM scim_role_group_team_grants";
 
 /// Why a role group wasn't written.
 #[derive(Debug, PartialEq)]
@@ -1997,11 +2010,16 @@ pub enum ScimRoleGroupError {
     ExternalId,
     /// The group, or the role, went meanwhile.
     Gone,
-    /// The role holds these permissions, which reach admins across the server.
+    /// The role holds these permissions, which reach admins in the group's scope.
     Reaches(Vec<&'static str>),
     /// The role is time-bound (ADR 0197): only given by hand, with an end.
     TimeBound,
     Db(String),
+}
+
+/// What reaches admins in a role group's scope: across the server, or within a team.
+fn scim_role_group_reach(perms: crate::rbac::Perms, scope: &str) -> Vec<&'static str> {
+    perms.reaching_admins(scope == "team")
 }
 
 fn scim_role_group_error(e: rusqlite::Error) -> ScimRoleGroupError {
@@ -2193,7 +2211,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 65] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 66] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -2259,6 +2277,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 65] = [
     migrate_scim_token_expiry,
     migrate_saml_cert_notices,
     migrate_time_bound_roles,
+    migrate_scim_team_role_groups,
 ];
 
 /// Time-bound custom roles (ADR 0197): when a role given by hand ends, across the server
@@ -2281,6 +2300,28 @@ fn migrate_time_bound_roles(c: &Connection, _fresh: bool) -> rusqlite::Result<()
         CREATE TRIGGER IF NOT EXISTS team_members_role_end_follows AFTER UPDATE OF role_id ON team_members
           WHEN NEW.role_id IS NOT OLD.role_id AND NEW.role_expires_at IS NOT NULL
           BEGIN UPDATE team_members SET role_expires_at = NULL WHERE user_id = NEW.user_id; END;",
+    )
+}
+
+/// Team role groups (ADR 0206): a role group's scope, `org` for every one made before,
+/// and the team role each team role group gave, one per person, since a person is on one
+/// team and holds one custom role in it. A grant's team is the one it was given in, so it
+/// goes with that team.
+fn migrate_scim_team_role_groups(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('scim_role_groups') WHERE name = 'scope'", [], |r| r.get(0))?;
+    if !has {
+        c.execute_batch("ALTER TABLE scim_role_groups ADD COLUMN scope TEXT NOT NULL DEFAULT 'org' CHECK (scope IN ('org', 'team'));")?;
+    }
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS scim_role_group_team_grants (
+          group_id TEXT NOT NULL REFERENCES scim_role_groups(id) ON DELETE CASCADE,
+          user_id TEXT PRIMARY KEY,
+          team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+          role_id TEXT NOT NULL,
+          granted_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS scim_role_group_team_grants_group ON scim_role_group_team_grants(group_id);
+        CREATE INDEX IF NOT EXISTS scim_role_group_team_grants_team ON scim_role_group_team_grants(team_id);",
     )
 }
 
@@ -5435,11 +5476,12 @@ impl Db {
             if let Some((mapping, scope, perms)) = maps.into_iter().map(|(m, sc)| { let p = new.reaching_admins(sc == "team"); (m, sc, p) }).find(|(_, _, p)| !p.is_empty()) {
                 return Err(RoleError::Reaches { via: "scim", mapping, scope, perms });
             }
-            // Role groups give the role across the server (ADR 0180).
-            let group: Option<String> = tx.query_row("SELECT id FROM scim_role_groups WHERE role_id = ? ORDER BY created_at, id LIMIT 1", [id], |r| r.get(0)).optional().map_err(|e| RoleError::Db(e.to_string()))?;
-            let perms = new.reaching_admins(false);
-            if let Some(mapping) = group.filter(|_| !perms.is_empty()) {
-                return Err(RoleError::Reaches { via: "scim", mapping, scope: "org".into(), perms });
+            // Role groups give the role across the server (ADR 0180) or within a team (ADR 0206).
+            let mut st = tx.prepare("SELECT id, scope FROM scim_role_groups WHERE role_id = ? ORDER BY created_at, id").map_err(|e| RoleError::Db(e.to_string()))?;
+            let groups = st.query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>).map_err(|e| RoleError::Db(e.to_string()))?;
+            drop(st);
+            if let Some((mapping, scope, perms)) = groups.into_iter().map(|(g, sc)| { let p = scim_role_group_reach(new, &sc); (g, sc, p) }).find(|(_, _, p)| !p.is_empty()) {
+                return Err(RoleError::Reaches { via: "scim", mapping, scope, perms });
             }
             // SAML mappings give the role across the server (ADR 0160).
             let saml: Option<String> = tx.query_row("SELECT id FROM saml_role_mappings WHERE role_id = ? ORDER BY created_at, id LIMIT 1", [id], |r| r.get(0)).optional().map_err(|e| RoleError::Db(e.to_string()))?;
@@ -5659,11 +5701,12 @@ impl Db {
 
     // SCIM groups mapped to custom roles (ADR 0138).
 
-    /// Ends a SCIM claim on `user_id`'s role in `scope`: a mapping's, or across the server
-    /// a role group's (ADR 0180). The mapping or role group whose claim it was.
+    /// Ends a SCIM claim on `user_id`'s role in `scope`: a mapping's, or a role group's
+    /// (ADR 0180, and within a team ADR 0206). The mapping or role group whose claim it was.
     fn drop_scim_grant_in(c: &Connection, user_id: &str, scope: &str) -> rusqlite::Result<Option<String>> {
         let mapping: Option<String> = c.query_row("DELETE FROM scim_role_grants WHERE user_id = ?1 AND scope = ?2 RETURNING mapping_id", [user_id, scope], |r| r.get(0)).optional()?;
-        let group: Option<String> = if scope == "org" { c.query_row("DELETE FROM scim_role_group_grants WHERE user_id = ? RETURNING group_id", [user_id], |r| r.get(0)).optional()? } else { None };
+        let table = if scope == "org" { "scim_role_group_grants" } else { "scim_role_group_team_grants" };
+        let group: Option<String> = c.query_row(&format!("DELETE FROM {table} WHERE user_id = ? RETURNING group_id"), [user_id], |r| r.get(0)).optional()?;
         Ok(mapping.or(group))
     }
 
@@ -5855,14 +5898,14 @@ impl Db {
     }
 
     /// An admin declares a role group, waiting for the IdP, while the role exists and its
-    /// permissions, as they are now, don't reach admins across the server.
-    pub fn declare_scim_role_group(&self, tenant: &str, display_name: &str, external_id: Option<&str>, role_id: &str, by: Option<&str>) -> Result<ScimRoleGroup, ScimRoleGroupError> {
+    /// permissions, as they are now, don't reach admins in `scope` (`org` or `team`).
+    pub fn declare_scim_role_group(&self, tenant: &str, scope: &str, display_name: &str, external_id: Option<&str>, role_id: &str, by: Option<&str>) -> Result<ScimRoleGroup, ScimRoleGroupError> {
         let id = format!("g{}", crate::random_hex(5));
         let at = now();
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(scim_role_group_error)?;
         let perms = role_perms_in(&tx, role_id).map_err(scim_role_group_error)?.ok_or(ScimRoleGroupError::Gone)?;
-        let reach = perms.reaching_admins(false);
+        let reach = scim_role_group_reach(perms, scope);
         if !reach.is_empty() {
             return Err(ScimRoleGroupError::Reaches(reach));
         }
@@ -5870,8 +5913,8 @@ impl Db {
             return Err(ScimRoleGroupError::TimeBound);
         }
         tx.execute(
-            "INSERT INTO scim_role_groups (id, tenant, display_name, declared_display_name, external_id, declared_external_id, role_id, created_at, created_by, updated_at) VALUES (?1, ?2, ?3, ?3, ?4, ?4, ?5, ?6, ?7, ?6)",
-            params![id, tenant, display_name, external_id, role_id, at, by],
+            "INSERT INTO scim_role_groups (id, tenant, scope, display_name, declared_display_name, external_id, declared_external_id, role_id, created_at, created_by, updated_at) VALUES (?1, ?2, ?8, ?3, ?3, ?4, ?4, ?5, ?6, ?7, ?6)",
+            params![id, tenant, display_name, external_id, role_id, at, by, scope],
         )
         .map_err(scim_role_group_error)?;
         let g = tx.query_row("SELECT * FROM scim_role_groups WHERE id = ?", [&id], scim_role_group_row).map_err(scim_role_group_error)?;
@@ -5920,12 +5963,13 @@ impl Db {
     }
 
     /// Gives a role group another role, while that role exists and doesn't reach admins
-    /// across the server. What the old one gave must have been taken away first.
+    /// in the group's scope. What the old one gave must have been taken away first.
     pub fn set_scim_role_group_role(&self, id: &str, role_id: &str) -> Result<ScimRoleGroup, ScimRoleGroupError> {
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(scim_role_group_error)?;
+        let scope: String = tx.query_row("SELECT scope FROM scim_role_groups WHERE id = ?", [id], |r| r.get(0)).optional().map_err(scim_role_group_error)?.ok_or(ScimRoleGroupError::Gone)?;
         let perms = role_perms_in(&tx, role_id).map_err(scim_role_group_error)?.ok_or(ScimRoleGroupError::Gone)?;
-        let reach = perms.reaching_admins(false);
+        let reach = scim_role_group_reach(perms, &scope);
         if !reach.is_empty() {
             return Err(ScimRoleGroupError::Reaches(reach));
         }
@@ -5986,12 +6030,24 @@ impl Db {
 
     pub fn scim_role_group_grants(&self, group_id: &str) -> Vec<ScimRoleGroupGrant> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM scim_role_group_grants WHERE group_id = ? ORDER BY granted_at, user_id").unwrap();
+        let mut s = c.prepare(&format!("SELECT * FROM ({SCIM_ROLE_GROUP_GRANTS}) WHERE group_id = ? ORDER BY granted_at, user_id")).unwrap();
         s.query_map([group_id], scim_role_group_grant_row).unwrap().filter_map(Result::ok).collect()
     }
 
     pub fn scim_role_group_grant_of_user(&self, user_id: &str) -> Option<ScimRoleGroupGrant> {
-        self.c().query_row("SELECT * FROM scim_role_group_grants WHERE user_id = ?", [user_id], scim_role_group_grant_row).optional().ok().flatten()
+        self.c().query_row("SELECT *, NULL AS team_id FROM scim_role_group_grants WHERE user_id = ?", [user_id], scim_role_group_grant_row).optional().ok().flatten()
+    }
+
+    /// The team roles team role groups gave in `team_id` (ADR 0206).
+    pub fn scim_team_role_group_grants_in(&self, team_id: &str) -> Vec<ScimRoleGroupGrant> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT *, NULL AS prior_role FROM scim_role_group_team_grants WHERE team_id = ? ORDER BY granted_at, user_id").unwrap();
+        s.query_map([team_id], scim_role_group_grant_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// The team role a team role group gave `user_id` (ADR 0206), if one did.
+    pub fn scim_team_role_group_grant_of_user(&self, user_id: &str) -> Option<ScimRoleGroupGrant> {
+        self.c().query_row("SELECT *, NULL AS prior_role FROM scim_role_group_team_grants WHERE user_id = ?", [user_id], scim_role_group_grant_row).optional().ok().flatten()
     }
 
     /// Gives `user_id` the group's role across the server and records that the group gave
@@ -6051,6 +6107,79 @@ impl Db {
             let after = role(&tx)?;
             let parse = |r: Option<String>| r.as_deref().and_then(Role::parse);
             Ok::<_, rusqlite::Error>(Some((given, ScimRevoked { cleared: n > 0, role_before: parse(before), role_after: parse(after) })))
+        })();
+        match res {
+            Ok(Some(r)) => tx.commit().ok().map(|_| r),
+            _ => None,
+        }
+    }
+
+    /// Gives `user_id` a team role group's role within their team (ADR 0206) and records
+    /// that the group gave it, in one transaction, only while: their team is one of the
+    /// group's tenant's team groups, they're in the group, the IdP has it, it is a team role
+    /// group whose role is still this one and reaches no admin in a team, they aren't
+    /// read-only, and they hold no team role. The team it was given in, or None.
+    pub fn grant_scim_team_role_group(&self, g: &ScimRoleGroup, user_id: &str) -> Option<String> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().ok()?;
+        let res = (|| {
+            if role_perms_in(&tx, &g.role_id)?.is_none_or(|p| !p.reaching_admins(true).is_empty()) {
+                return Ok(None);
+            }
+            let team: Option<String> = tx
+                .query_row("SELECT m.team_id FROM team_members m JOIN scim_groups s ON s.team_id = m.team_id AND s.tenant = ?2 WHERE m.user_id = ?1", [user_id, &g.tenant], |r| r.get(0))
+                .optional()?;
+            let Some(team) = team else { return Ok(None) };
+            let n = tx.execute(
+                "UPDATE team_members SET role_id = ?1 WHERE team_id = ?3 AND user_id = ?2 AND role_id IS NULL
+                   AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND role != 'readonly')
+                   AND EXISTS (SELECT 1 FROM scim_role_group_members WHERE group_id = ?4 AND user_id = ?2)
+                   AND EXISTS (SELECT 1 FROM scim_role_groups WHERE id = ?4 AND role_id = ?1 AND scope = 'team' AND provisioned_at IS NOT NULL)",
+                params![g.role_id, user_id, team, g.id],
+            )?;
+            if n == 0 {
+                return Ok(None);
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO scim_role_group_team_grants (group_id, user_id, team_id, role_id, granted_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![g.id, user_id, team, g.role_id, now()],
+            )?;
+            Ok::<_, rusqlite::Error>(Some(team))
+        })();
+        match res {
+            Ok(Some(team)) => tx.commit().ok().map(|_| team),
+            _ => None,
+        }
+    }
+
+    /// Takes away the team role a team role group gave `user_id`, and forgets the grant, in
+    /// one transaction; only a role they still hold from it, in the team it was given in,
+    /// is cleared. The role and team, or None if it gave them nothing. `left_group`: they
+    /// left the group, so nothing is taken if they're in it again. `left_team`: they left
+    /// this team, so only a grant in it goes, and nothing if they're on it again (a join
+    /// that raced the leave).
+    pub fn revoke_scim_team_role_group(&self, g: &ScimRoleGroup, user_id: &str, left_group: bool, left_team: Option<&str>) -> Option<(String, String, bool)> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().ok()?;
+        let res = (|| {
+            if left_group && tx.query_row("SELECT EXISTS (SELECT 1 FROM scim_role_group_members WHERE group_id = ?1 AND user_id = ?2)", [&g.id, user_id], |r| r.get::<_, bool>(0))? {
+                return Ok(None);
+            }
+            if let Some(t) = left_team
+                && tx.query_row("SELECT EXISTS (SELECT 1 FROM team_members WHERE team_id = ?1 AND user_id = ?2)", [t, user_id], |r| r.get::<_, bool>(0))?
+            {
+                return Ok(None);
+            }
+            let grant: Option<(String, String)> = tx
+                .query_row(
+                    "DELETE FROM scim_role_group_team_grants WHERE group_id = ?1 AND user_id = ?2 AND (?3 IS NULL OR team_id = ?3) RETURNING role_id, team_id",
+                    params![g.id, user_id, left_team],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((given, team)) = grant else { return Ok(None) };
+            let n = tx.execute("UPDATE team_members SET role_id = NULL WHERE team_id = ?1 AND user_id = ?2 AND role_id = ?3", params![team, user_id, given])?;
+            Ok::<_, rusqlite::Error>(Some((given, team, n > 0)))
         })();
         match res {
             Ok(Some(r)) => tx.commit().ok().map(|_| r),
@@ -6599,6 +6728,7 @@ impl Db {
         )?;
         run("DELETE FROM scim_role_grants WHERE user_id = ?", &[&user_id])?;
         run("DELETE FROM scim_role_group_grants WHERE user_id = ?", &[&user_id])?;
+        run("DELETE FROM scim_role_group_team_grants WHERE user_id = ?", &[&user_id])?;
         run("DELETE FROM scim_role_group_members WHERE user_id = ?", &[&user_id])?;
         run("DELETE FROM saml_role_grants WHERE user_id = ?", &[&user_id])?;
         out.audit_events = Self::pseudonymise_audit(&tx, &scrub, &theirs).map_err(db_err)?;
@@ -11067,9 +11197,9 @@ mod tests {
         // And no group is given it: a group holds its role while people are in it.
         assert!(matches!(db.create_scim_role_mapping("okta", &team.id, &r.id, "org", None), Err(ScimRoleMapError::TimeBound)));
         assert!(matches!(db.create_saml_role_mapping("corp", "Admins", &r.id, None), Err(ScimRoleMapError::TimeBound)));
-        assert!(matches!(db.declare_scim_role_group("okta", "Helpdesk", None, &r.id, None), Err(ScimRoleGroupError::TimeBound)));
+        assert!(matches!(db.declare_scim_role_group("okta", "org", "Helpdesk", None, &r.id, None), Err(ScimRoleGroupError::TimeBound)));
         let plain = db.create_custom_role("Plain", "", Role::Member, &["users.manage"], None, None).unwrap();
-        let g = db.declare_scim_role_group("okta", "Helpdesk", None, &plain.id, None).unwrap();
+        let g = db.declare_scim_role_group("okta", "org", "Helpdesk", None, &plain.id, None).unwrap();
         assert!(matches!(db.set_scim_role_group_role(&g.id, &r.id), Err(ScimRoleGroupError::TimeBound)));
         assert_eq!(db.update_custom_role(&plain.id, None, None, None, None, week), Err(RoleError::Standing { held: 0, mapped: 1 }));
         // The limit lifted, it's a role like any other.
@@ -11602,6 +11732,29 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let r = db.machine(&m.id).unwrap();
         assert_eq!((r.rebuild_state, r.rebuild_attempts, r.rebuild_discard), (None, 0, false));
+    }
+
+    #[test]
+    fn role_groups_from_before_team_scope_stay_across_the_server() {
+        let path = temp_path("team-role-groups").join("app.sqlite");
+        let db = Db::open(&path).unwrap();
+        let r = db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None, None).unwrap();
+        let g = db.declare_scim_role_group("okta", "org", "Auditors", None, &r.id, None).unwrap();
+        db.c()
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 CREATE TABLE old AS SELECT id, tenant, display_name, declared_display_name, external_id, declared_external_id, role_id, provisioned_at, created_at, created_by, updated_at FROM scim_role_groups;
+                 DROP TABLE scim_role_groups; ALTER TABLE old RENAME TO scim_role_groups; DROP TABLE scim_role_group_team_grants;
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+        let at = MIGRATIONS.iter().position(|m| std::ptr::fn_addr_eq(*m, migrate_scim_team_role_groups as fn(&Connection, bool) -> rusqlite::Result<()>)).unwrap();
+        db.c().execute_batch(&format!("PRAGMA user_version = {at};")).unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.scim_role_group(&g.id).unwrap().scope, "org");
+        assert!(db.scim_team_role_group_grants_in("t1").is_empty());
+        assert!(db.scim_role_group_grants(&g.id).is_empty());
     }
 
     #[test]

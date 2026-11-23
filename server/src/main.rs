@@ -184,6 +184,8 @@ mod scim_group_roles_http_tests;
 #[cfg(test)]
 mod scim_role_groups_http_tests;
 #[cfg(test)]
+mod scim_team_role_groups_http_tests;
+#[cfg(test)]
 mod scim_groups_http_tests;
 #[cfg(test)]
 mod scim_http_tests;

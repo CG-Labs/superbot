@@ -152,6 +152,12 @@ pub(crate) async fn left(app: &AppState, by: &Who, team_id: &str, user_id: &str)
             take_away(app, by, &m, user_id, LEFT_GROUP).await;
         }
     }
+    super::role_groups::left_team(app, by, team_id, user_id);
+}
+
+/// Whether a mapping of the group `team_id` is gave `user_id` their role across the server.
+pub(crate) fn org_grant_from(app: &AppState, team_id: &str, user_id: &str) -> bool {
+    app.db.scim_role_grants_of_user(user_id).iter().any(|g| g.scope == ORG && app.db.scim_role_mapping(&g.mapping_id).is_some_and(|m| m.team_id == team_id))
 }
 
 /// SCIM deleted `user_id`: every grant they hold from a mapping goes, whatever
@@ -181,11 +187,17 @@ async fn unmap(app: &AppState, by: &Who, m: &ScimRoleMapping, reason: &str) -> V
 }
 
 /// The group `team_id` is ends (the IdP deleted it, or an admin unlinked it): its
-/// mappings go, with what they gave. Callers hold the group write lock.
-pub(crate) async fn group_gone(app: &AppState, by: &Who, team_id: &str) {
+/// mappings go, with what they gave, and so do the team roles team role groups gave in it
+/// (ADR 0206). Whoever stays and lost a role across the server is offered the role groups
+/// they're in. Callers hold the group write lock.
+pub(crate) async fn group_gone(app: &AppState, a: &Auth, by: &Who, team_id: &str) {
     for m in app.db.scim_role_mappings_of_team(team_id) {
-        unmap(app, by, &m, GROUP_GONE).await;
+        let revoked = unmap(app, by, &m, GROUP_GONE).await;
+        if m.scope == ORG {
+            super::role_groups::after_mapping(app, a, by, ORG, &revoked).await;
+        }
     }
+    super::role_groups::team_unlinked(app, by, team_id);
 }
 
 // Admin API (under /api, admins only).
@@ -300,10 +312,12 @@ pub async fn get(State(app): State<AppState>, Path(id): Path<String>) -> Res {
 }
 
 /// `DELETE /api/scim/role-mappings/{id}`: removes the mapping and takes the role away from
-/// everyone it gave it to. Roles given by hand stay.
+/// everyone it gave it to, who are offered the role groups of that scope they're in.
+/// Roles given by hand stay.
 pub async fn delete(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     let _writes = a.scim.group_writes.lock().await;
     let m = need(&app, &id)?;
     let revoked = unmap(&app, &by, &m, UNMAPPED).await;
+    super::role_groups::after_mapping(&app, &a, &by, &m.scope, &revoked).await;
     Ok(Json(json!({ "ok": true, "revoked": revoked })))
 }

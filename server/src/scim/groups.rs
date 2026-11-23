@@ -407,9 +407,13 @@ async fn change_members(app: &AppState, a: &Auth, c: &Caller, team: &Team, gone:
     let mut m = Moved::default();
     for id in gone {
         let owner = app.db.team_member(id).is_some_and(|x| x.team_id == team.id && x.role == teams::OWNER);
+        let mapped = super::roles::org_grant_from(app, &team.id, id);
         if teams::try_leave(app, &c.who, &team.id, id, teams::SCIM).await.map_err(server_error)? {
             m.owner_left |= owner;
             m.removed.push(id.clone());
+            if mapped && !super::roles::org_grant_from(app, &team.id, id) {
+                role_groups::after_mapping(app, a, &c.who, super::roles::ORG, std::slice::from_ref(id)).await;
+            }
         }
     }
     for id in new {
@@ -417,6 +421,7 @@ async fn change_members(app: &AppState, a: &Auth, c: &Caller, team: &Team, gone:
         match teams::join_from_scim(app, &c.who, team, &u).await {
             Ok(_) => {
                 super::roles::joined(app, a, &c.who, &c.token.tenant, &team.id, id).await;
+                role_groups::joined_team(app, a, &c.who, id).await;
                 m.added.push(id.clone())
             }
             Err(e) if e.0 == StatusCode::CONFLICT && app.db.team_id_of(id).as_deref() == Some(team.id.as_str()) => {}
@@ -663,7 +668,7 @@ pub async fn delete(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
     let (g, team) = need(&app, &c, &id)?;
     let members: Vec<String> = app.db.scim_group_members(&c.token.tenant, &team.id, true).into_iter().map(|u| u.id).collect();
     let moved = change_members(&app, &a, &c, &team, &members, &[]).await?;
-    super::roles::group_gone(&app, &c.who, &team.id).await;
+    super::roles::group_gone(&app, &a, &c.who, &team.id).await;
     app.db.unlink_scim_group(&team.id);
     let left = app.db.team_members(&team.id).len();
     let fate = if g.origin == "scim" && left == 0 {
@@ -757,6 +762,7 @@ pub async fn link(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>
         ScimGroupConflict::Db(e) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, e),
     })?;
     app.db.record(&by.event("scim.group_linked").target("team", &team.id).details(json!({ "tenant": tenant, "team": team.id, "externalId": g.external_id, "displayName": g.display_name })));
+    role_groups::team_linked(&app, &a, &by, &team.id).await;
     Ok((StatusCode::CREATED, Json(link_view(&app, &g))))
 }
 
@@ -766,7 +772,7 @@ pub async fn link(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>
 pub async fn unlink(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(team): Path<String>) -> Res {
     let _writes = a.scim.group_writes.lock().await;
     if app.db.scim_group_of_team(&team).is_some() {
-        super::roles::group_gone(&app, &by, &team).await;
+        super::roles::group_gone(&app, &a, &by, &team).await;
     }
     let g = app.db.unlink_scim_group(&team).ok_or_else(|| not_found("SCIM group"))?;
     app.db.record(&by.event("scim.group_unlinked").target("team", &team).details(json!({ "tenant": g.tenant, "team": team, "externalId": g.external_id, "displayName": g.display_name, "origin": g.origin })));
