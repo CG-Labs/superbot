@@ -86,11 +86,15 @@ VAULT_KUBERNETES_TOKEN_FILE=/var/run/secrets/vault/token
 # VAULT_KUBERNETES_MOUNT=kubernetes
 ```
 
-The role above asks for the audience `vault`, so give botd a projected token with that audience, mounted only into botd's container:
+The role above asks for the audience `vault`, so give botd a projected token with that audience, mounted only into botd's container and readable only by botd's user:
 
 ```yaml
 spec:
   serviceAccountName: botd
+  automountServiceAccountToken: false   # no second, world-readable token in the pod
+  securityContext:
+    runAsUser: 10001                    # botd's uid, the same for every container in the pod
+    runAsGroup: 10001
   containers:
     - name: botd
       volumeMounts:
@@ -98,11 +102,14 @@ spec:
   volumes:
     - name: vault-token
       projected:
+        defaultMode: 0400
         sources:
           - serviceAccountToken: { path: token, audience: vault, expirationSeconds: 3600 }
 ```
 
-Without `VAULT_KUBERNETES_TOKEN_FILE`, botd uses the pod's default service account token (`/var/run/secrets/kubernetes.io/serviceaccount/token`), whose audience is the Kubernetes API. That works only if the Vault role sets no `audience`.
+**Check the file's owner and mode.** Projected volumes are mounted `0644`, readable by every user in the container, unless you say otherwise. Separate run users ([ADR 0145](../adr/0145-locked-down-run-users-and-red-team.md)) then don't help: a Bot running as its own user can still read a world-readable token and log in to Vault as botd. With a pod-level `runAsUser`, the kubelet makes the token owned by that user. Without one, `defaultMode: 0400` leaves it owned by root, so botd can't read it and fails to start (closed, not open). In the running container, `ls -ln /var/run/secrets/vault/` must show botd's uid and `-r--------` or `-rw-------`.
+
+Without `VAULT_KUBERNETES_TOKEN_FILE`, botd uses the pod's default service account token (`/var/run/secrets/kubernetes.io/serviceaccount/token`). Its audience is the Kubernetes API, so it works only if the Vault role sets no `audience`. It is also mounted world-readable, so use it only when no Bot runs in botd's container.
 
 **JWT** (Vault checks the signature against an issuer it trusts: a cluster's OIDC issuer, GitHub Actions, SPIFFE, a cloud's workload identity):
 
@@ -128,7 +135,7 @@ VAULT_NAMESPACE=admin/team-a      # where secret/superbot/... is
 VAULT_AUTH_NAMESPACE=admin        # where auth/kubernetes is
 ```
 
-The startup line, `botctl secrets backend` and the setup report say how botd logs in, for example `Kubernetes login as role superbot at auth/kubernetes with the token in /var/run/secrets/vault/token in namespace admin`. Logins are audited as `secret.vault_login` with `method`, `role` and `namespace`, and never the JWT or Vault's token. Bots never get the token file: `VAULT_JWT_FILE` and `VAULT_KUBERNETES_TOKEN_FILE` are removed from everything botd starts. If Bots run locally as botd's own user, they could still read a token file mounted into the same container, so run them as locked-down run users ([ADR 0145](../adr/0145-locked-down-run-users-and-red-team.md)) or on their own machines.
+The startup line, `botctl secrets backend` and the setup report say how botd logs in, for example `Kubernetes login as role superbot at auth/kubernetes with the token in /var/run/secrets/vault/token in namespace admin`. Logins are audited as `secret.vault_login` with `method`, `role` and `namespace`, and never the JWT or Vault's token. Bots never get the token file: `VAULT_JWT_FILE` and `VAULT_KUBERNETES_TOKEN_FILE` are removed from everything botd starts. But a Bot that runs locally can still open the file itself. If it runs as botd's own user, it can always read it. If it runs as a locked-down run user ([ADR 0145](../adr/0145-locked-down-run-users-and-red-team.md)), it can read the file unless only botd's user may (above). The same holds for `VAULT_JWT_FILE`: make it `0400` and owned by botd, or run Bots on their own machines.
 
 When a login fails, botd logs the status (`Kubernetes login at auth/kubernetes answered 403 Forbidden`). Vault's own log, or its audit device, has the reason: a role bound to another service account or namespace, the wrong audience, or a cluster Vault can't reach for TokenReview.
 
