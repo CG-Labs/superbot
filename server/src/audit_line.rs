@@ -399,28 +399,40 @@ pub mod tests {
     use super::*;
     use serde_json::json;
 
-    /// A line as the export writes it, sealed onto `prev` with `salt`.
-    fn sealed(id: i64, prev: &str, details: Value, salt: Option<&str>) -> Value {
+    /// 16 random bytes as hex, as each row's salt is.
+    fn fresh_salt() -> String {
+        let mut b = [0u8; 16];
+        aws_lc_rs::rand::fill(&mut b).unwrap();
+        hex(&b)
+    }
+
+    /// A line as the export writes it, sealed onto `prev` under a fresh salt, which it
+    /// carries when `salted`.
+    fn sealed(id: i64, prev: &str, details: Value, salted: bool) -> Value {
         let mut v = json!({
             "schema": SCHEMA, "host": "h1", "id": id, "at": 1_795_000_000_000i64 + id, "time": "x", "actorKind": "user", "actorId": "u1",
             "actorName": null, "actorSubject": null, "action": "test.x", "targetType": null, "targetId": null, "botId": null, "outcome": "success",
             "ip": "192.0.2.1", "userAgent": null, "details": details, "actorEmail": "ada@example.com", "actorRole": "admin", "authMethod": "sso",
             "idp": null, "idpProvider": null, "sessionId": null, "onBehalfOf": null, "chainPrev": prev,
         });
-        let d = digest(salt.unwrap_or("s"), &v);
-        v["chainHash"] = json!(link(prev, &v, &d));
-        v["chainDigest"] = json!(d);
-        if let Some(s) = salt {
-            v["chainSalt"] = json!(s);
-        }
+        reseal(&mut v, prev, &fresh_salt(), salted);
         v
+    }
+
+    fn reseal(v: &mut Value, prev: &str, salt: &str, salted: bool) {
+        let d = digest(salt, v);
+        v["chainHash"] = json!(link(prev, v, &d));
+        v["chainDigest"] = json!(d);
+        if salted {
+            v["chainSalt"] = json!(salt);
+        }
     }
 
     pub fn chain(n: i64) -> Vec<Value> {
         let mut prev = GENESIS.to_string();
         (1..=n)
             .map(|id| {
-                let v = sealed(id, &prev, json!({ "n": id }), Some(&format!("salt{id}")));
+                let v = sealed(id, &prev, json!({ "n": id }), true);
                 prev = v["chainHash"].as_str().unwrap().to_string();
                 v
             })
@@ -441,7 +453,7 @@ pub mod tests {
 
     #[test]
     fn a_line_is_its_own_proof() {
-        let v = sealed(1, GENESIS, json!({ "name": "Scout", "nested": { "b": [1, 2.5, null] } }), Some("ab12"));
+        let v = sealed(1, GENESIS, json!({ "name": "Scout", "nested": { "b": [1, 2.5, null] } }), true);
         assert_eq!(check(&v), Ok(Bound::All));
         // Any field an erasure may rewrite, changed: the digest no longer follows.
         for (field, value) in [("actorEmail", json!("eve@example.com")), ("details", json!({ "name": "Other" })), ("ip", Value::Null)] {
@@ -511,7 +523,7 @@ pub mod tests {
         assert_eq!(reasons(&report(&gone, None)), ["link"]);
         // Copies that disagree: a fork, whichever is read first.
         let mut forked = lines.clone();
-        forked.push(sealed(4, "1".repeat(64).as_str(), json!({}), Some("x")));
+        forked.push(sealed(4, "1".repeat(64).as_str(), json!({}), true));
         assert_eq!(reasons(&report(&forked, None)), ["conflict"]);
         // Taking the digest out of a copy, to change it unseen, once events carry one.
         let mut stripped = lines.clone();
@@ -571,11 +583,9 @@ pub mod tests {
         let public = pair.public_key().as_ref().to_vec();
         let (kid, seq, hash, at) = (key_id(&public), prev["id"].as_i64().unwrap(), prev["chainHash"].as_str().unwrap(), 1_795_000_000_000i64);
         let sig = hex(pair.sign(statement(seq, hash, at, &kid).as_bytes()).as_ref());
-        let mut v = sealed(id, hash, json!({ "seq": seq, "hash": hash, "at": at, "keyId": kid, "publicKey": hex(&public), "signature": sig }), Some("cp"));
+        let mut v = sealed(id, hash, json!({ "seq": seq, "hash": hash, "at": at, "keyId": kid, "publicKey": hex(&public), "signature": sig }), false);
         v["action"] = json!(CHECKPOINT);
-        let d = digest("cp", &v);
-        v["chainHash"] = json!(link(hash, &v, &d));
-        v["chainDigest"] = json!(d);
+        reseal(&mut v, hash, &fresh_salt(), true);
         v
     }
 
