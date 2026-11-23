@@ -1,6 +1,6 @@
 # Provision users and teams with SCIM (Entra ID, Okta)
 
-Lets your IdP create SuperBot users when people are assigned the app, keep their name and email current, and disable them when they leave. Disabling ends their sessions at once. With `SCIM_GROUPS=on`, the groups it pushes become [teams](#groups-as-teams), and people join and leave them as the IdP says. With `SCIM_GROUP_ROLES=on` as well, an admin can [map a group to a custom role](#groups-to-roles). The [Enterprise User extension](#enterprise-attributes) (employee number, department, manager, …) is kept for admins and access reviews. Design: [ADR 0023](../adr/0023-scim.md), [ADR 0095](../adr/0095-scim-groups-as-teams.md), [ADR 0138](../adr/0138-scim-group-role-mapping.md), [ADR 0176](../adr/0176-scim-enterprise-user-extension.md).
+Lets your IdP create SuperBot users when people are assigned the app, keep their name and email current, and disable them when they leave. Disabling ends their sessions at once. With `SCIM_GROUPS=on`, the groups it pushes become [teams](#groups-as-teams), and people join and leave them as the IdP says. With `SCIM_GROUP_ROLES=on` as well, an admin can [map a group to a custom role](#groups-to-roles), or declare it a [role group](#role-groups) that gives a role and isn't a team. The [Enterprise User extension](#enterprise-attributes) (employee number, department, manager, …) is kept for admins and access reviews. Design: [ADR 0023](../adr/0023-scim.md), [ADR 0095](../adr/0095-scim-groups-as-teams.md), [ADR 0138](../adr/0138-scim-group-role-mapping.md), [ADR 0176](../adr/0176-scim-enterprise-user-extension.md), [ADR 0180](../adr/0180-scim-role-groups.md).
 
 SCIM never gives anyone a role above `SCIM_DEFAULT_ROLE` (member, or readonly), never a team role, and never admin; admins promote people as before. The IdP can't name a role: only an admin's mapping can give one. [Bulk](#bulk) is supported, for clients that batch.
 
@@ -14,7 +14,7 @@ In `.env` (or `deploy/docker/.env`), then restart botd:
 SCIM=on
 # SCIM_DEFAULT_ROLE=member          # or readonly; admin is refused
 # SCIM_GROUPS=on                    # pushed groups become teams (off by default)
-# SCIM_GROUP_ROLES=on               # admins may map groups to custom roles (off by default; needs SCIM_GROUPS=on)
+# SCIM_GROUP_ROLES=on               # admins may map groups to custom roles, and declare role groups (off by default; needs SCIM_GROUPS=on)
 ```
 
 botd logs `SCIM: on at /scim/v2` on start, whether groups are teams, and whether they can carry roles. Off, `/scim/v2` answers 404.
@@ -203,6 +203,29 @@ Each skip is audited as `scim.role_skipped`. Taking a role away clears only one 
 
 **Audit.** `scim.role_mapped`, `scim.role_unmapped` (reason `mapping_removed` or `group_removed`, with who lost the role), `scim.role_map_refused`, `scim.role_skipped`, and each grant as `role.assigned` and `role.unassigned` with `via: "scim"`, the mapping, the tenant and (for team roles) the team, and a reason when taken away (`left_group`, `user_deleted`, `mapping_removed`, `group_removed`). A change of built-in role is `user.role_changed` (reason `scim_group`), with the same offboarding as any other change of role. A join's grant has the SCIM token as its actor; a mapping's, the admin.
 
+## Role groups
+
+Every group the IdP pushes is a team, and a person is on one team at most, so a group that only says who holds a role ("SuperBot Auditors", "Billing admins") can't be pushed next to the team groups its people are in: SCIM answers 409. Declare such a group a **role group** first. When the IdP pushes it, it isn't a team: anyone the tenant provisioned can be in it, and in any number of role groups, whatever team they're on. Its members hold its custom role across the server while they're in it. Needs `SCIM_GROUP_ROLES=on` (and `SCIM_GROUPS=on`). Design: [ADR 0180](../adr/0180-scim-role-groups.md).
+
+```sh
+botctl scim role-group add entra "SuperBot Auditors" Auditor           # by the name the IdP pushes
+botctl scim role-group add entra Auditors Auditor --external-id <id>   # or by its externalId (Entra: the group's object id)
+botctl scim role-groups                                                 # each one, waiting or pushed, and how many hold its role
+botctl scim role-group show <id>                                        # members, and who holds the role through it
+botctl scim role-group set-role <id> "Read-only auditor"                # gives another role: the old one goes, the new one is given
+botctl scim role-group remove <id>                                      # takes its role back; roles given by hand stay
+```
+
+Declare the group before the IdP pushes it. A declaration waits, unseen by the IdP, until it sends a `POST /Groups` with that `externalId` (or, for a declaration without one, that `displayName`, any ASCII case); that group then becomes the role group, with the members it sent. A group that is a team already can't be declared (409): delete it in the IdP, or take it out of provisioning, then declare it and push it again. A tenant's team groups and role groups share names and `externalId`s, so neither can take one the other has. If your IdP sends no `externalId` for groups, declare by name.
+
+The console's SCIM section lists role groups next to the mappings and removes them. Or the admin API: `GET`/`POST /api/scim/role-groups` (`{"tenant": "...", "displayName": "...", "externalId"?: "...", "role": "<id or name>"}`), `GET`/`PATCH` (`{"role": ...}`)/`DELETE /api/scim/role-groups/<id>`.
+
+**One role each.** A person holds one custom role across the server. The oldest role group they're in (by when it was declared) that can give them one does; when it stops (they leave it, it's removed, or its role changes), the next role group they're in is offered. A role group follows the same rules as a [mapping](#groups-to-roles): never admin, a built-in role, or a role that acts on admins (400, `scim.role_map_refused` with `kind: "role_group"`); never over an admin, the owner account, or a custom role they hold already (by hand, a mapping, or another role group), each skip audited as `scim.role_skipped`; only what it gave is taken back, and a role given or changed by hand ends its claim. Losing it puts back the built-in role they had. Its role can't gain permissions that act on admins (409), nor be deleted (409), while a role group gives it.
+
+**When it's taken away.** When they leave the group (by SCIM, or a SCIM `DELETE` of the user), when an admin removes the role group or gives it another role, and when the IdP deletes the group. An IdP `DELETE` empties the group and puts its declaration back to waiting, so pushing it again makes it a role group again, never a team. Removing the declaration (`botctl scim role-group remove`) ends it for good: if the IdP still pushes the group, its next `POST` makes it a team, so take it out of provisioning first. With `SCIM_GROUP_ROLES` off, a declared group the IdP pushes is still a role group, but gives nothing; leaving still takes away what it gave.
+
+**Audit.** `scim.role_group_declared`, `scim.role_group_adopted` (the IdP pushed it), `scim.role_group_changed`, `scim.role_group_removed` (`wasPushed`), `scim.group_updated` and `scim.group_deleted` with `kind: "role"`, and each grant as `role.assigned` / `role.unassigned` with `via: "scim"`, `roleGroup`, `tenant` and a reason when taken away (`left_group`, `user_deleted`, `group_removed`, `role_group_removed`, `role_changed`). The target type is `scim_role_group`.
+
 ## Limits
 
 600 requests a minute per tenant, then 429 with `Retry-After` (Entra and Okta wait and retry). An IP sending 20 bad tokens in 10 minutes gets 429 for its bad tokens for a while; a valid token from that IP still works, since Entra and Okta send from addresses they share with other customers. Bodies are capped at 64 KiB, or 1 MiB for groups (a `PUT` carries every member). Lists return at most 200 users or groups per page. No groups in groups.
@@ -220,7 +243,9 @@ Bulk: at most 100 operations (`maxOperations`) and 1 MiB (`maxPayloadSize`) a re
 - **Group errors (501)**: `SCIM_GROUPS=on` isn't set. Set it, or turn group provisioning off in the IdP.
 - **409 "Mapping SCIM groups to roles is off"**: set `SCIM_GROUP_ROLES=on` (with `SCIM_GROUPS=on`) and restart botd.
 - **A member didn't get the mapped role**: `botctl audit --action scim.role_skipped` says why (`admin`, `owner`, `has_role`, `readonly`, `not_on_team`).
-- **409 on adding a group member**: they're on another team. Take them out of that group (or team) first.
+- **409 on adding a group member**: they're on another team. Take them out of that group (or team) first. If the group only says who holds a role, declare it a [role group](#role-groups) instead.
+- **A role group member didn't get its role**: `botctl audit --action scim.role_skipped` says why (`has_role` means another role group, a mapping or an admin gave them one first).
+- **A group meant as a role group became a team**: it was pushed before it was declared, or its declaration was removed. Delete it in the IdP, declare it, and push it again.
 - **400 "isn't a user this tenant provisioned"**: provision the user before the group, or check the IdP sends the user's SuperBot id (it does once it has provisioned them).
 - **Bulk 200, but nothing changed**: read each operation's `status` and `response`; a 200 only means the request was read.
 - **Bulk 413**: more than 100 operations or 1 MiB. Split the request.
