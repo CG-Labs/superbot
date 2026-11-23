@@ -1823,7 +1823,7 @@ offline_unpack_bundle() {
 # own files. The symbolic links' targets are checked once unpacked (hermes_tree_ok). Sets
 # HERMES_TREE_PROBLEM when it fails.
 hermes_tar_ok() {
-  local tar=$1 entries names
+  local tar=$1 entries names targets
   HERMES_TREE_PROBLEM=""
   if ! entries=$(tar -tvf "$tar" 2>/dev/null) || ! names=$(tar -tf "$tar" 2>/dev/null) || [[ -z "$names" ]]; then
     HERMES_TREE_PROBLEM="hermes.tar can't be read"
@@ -1835,8 +1835,8 @@ hermes_tar_ok() {
     HERMES_TREE_PROBLEM="hermes.tar holds devices, pipes or other special files"
   elif ! awk 'substr($0, 4, 1) ~ /[sS]/ || substr($0, 7, 1) ~ /[sS]/ { bad = 1 } END { exit bad }' <<<"$entries"; then
     HERMES_TREE_PROBLEM="hermes.tar holds a setuid or setgid file"
-  elif grep '^h' <<<"$entries" | sed 's/.* link to //' | grep -Evq '^hermes/' \
-    || grep '^h' <<<"$entries" | sed 's/.* link to //' | grep -Eq '(^|/)\.\.(/|$)'; then
+  elif targets=$(sed -n 's/^h.* link to //p' <<<"$entries") && [[ -n "$targets" ]] \
+    && ! awk '!/^hermes\// || /(^|\/)\.\.(\/|$)/ { bad = 1 } END { exit bad }' <<<"$targets"; then
     HERMES_TREE_PROBLEM="hermes.tar holds a hard link to a file outside it"
   fi
   [[ -z "$HERMES_TREE_PROBLEM" ]]
@@ -2009,7 +2009,7 @@ check_offline_tools() {
   [[ -z "$DOMAIN" ]] || command -v caddy >/dev/null 2>&1 || missing+=(caddy)
   [[ "$ENABLE_UFW" != true ]] || command -v ufw >/dev/null 2>&1 || missing+=(ufw)
   # The Node.js in Hermes Agent's tools needs it; the online installer apt-gets it.
-  [[ "$WITH_HERMES" != true ]] || ldconfig -p 2>/dev/null | grep -q 'libatomic\.so\.1' || missing+=(libatomic1)
+  [[ "$WITH_HERMES" != true ]] || [[ "$(ldconfig -p 2>/dev/null)" == *libatomic.so.1* ]] || missing+=(libatomic1)
   if [[ ${#missing[@]} -gt 0 ]]; then
     if [[ "$DRY_RUN" == true ]]; then
       warn "[dry-run] missing, to install from your mirror first: ${missing[*]}"
