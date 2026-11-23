@@ -524,7 +524,7 @@ export function ServiceAccountsAdmin({ api, onBack }: Props) {
   return (
     <View style={styles.root}>
       <View style={styles.header}>
-        <Pressable onPress={onBack} accessibilityRole="button" accessibilityLabel="Back to Bots">
+        <Pressable onPress={onBack} disabled={busy} accessibilityState={{ disabled: busy }} accessibilityRole="button" accessibilityLabel="Back to Bots">
           <Text style={styles.back}>‹ Bots</Text>
         </Pressable>
         <Text style={styles.title}>Service accounts</Text>

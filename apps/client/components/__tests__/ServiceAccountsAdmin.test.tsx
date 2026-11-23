@@ -191,6 +191,7 @@ describe("ServiceAccountsAdmin (ADR 0143, 0152)", () => {
     await u.press(screen.getByLabelText("Confirm rotate CI"));
     await waitFor(() => expect(screen.getByLabelText("Service account Export")).toBeDisabled());
     expect(screen.getByLabelText("New service account")).toBeDisabled();
+    expect(screen.getByLabelText("Back to Bots")).toBeDisabled();
     await u.press(screen.getByLabelText("Service account Export"));
     expect(api.serviceAccount).not.toHaveBeenCalledWith("sa2");
 
