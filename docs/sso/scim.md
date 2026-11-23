@@ -1,6 +1,6 @@
 # Provision users and teams with SCIM (Entra ID, Okta)
 
-Lets your IdP create SuperBot users when people are assigned the app, keep their name and email current, and disable them when they leave. Disabling ends their sessions at once. With `SCIM_GROUPS=on`, the groups it pushes become [teams](#groups-as-teams), and people join and leave them as the IdP says. With `SCIM_GROUP_ROLES=on` as well, an admin can [map a group to a custom role](#groups-to-roles), or declare it a [role group](#role-groups) that gives a role and isn't a team. The [Enterprise User extension](#enterprise-attributes) (employee number, department, manager, …) is kept for admins and access reviews. Design: [ADR 0023](../adr/0023-scim.md), [ADR 0095](../adr/0095-scim-groups-as-teams.md), [ADR 0138](../adr/0138-scim-group-role-mapping.md), [ADR 0176](../adr/0176-scim-enterprise-user-extension.md), [ADR 0180](../adr/0180-scim-role-groups.md).
+Lets your IdP create SuperBot users when people are assigned the app, keep their name and email current, and disable them when they leave. Disabling ends their sessions at once. With `SCIM_GROUPS=on`, the groups it pushes become [teams](#groups-as-teams), and people join and leave them as the IdP says. With `SCIM_GROUP_ROLES=on` as well, an admin can [map a group to a custom role](#groups-to-roles), or declare it a [role group](#role-groups) that gives a role and isn't a team. The [Enterprise User extension](#enterprise-attributes) (employee number, department, manager, …) is kept for admins and access reviews. Tokens [expire and rotate](#token-expiry-and-rotation). Design: [ADR 0023](../adr/0023-scim.md), [ADR 0095](../adr/0095-scim-groups-as-teams.md), [ADR 0138](../adr/0138-scim-group-role-mapping.md), [ADR 0176](../adr/0176-scim-enterprise-user-extension.md), [ADR 0180](../adr/0180-scim-role-groups.md), [ADR 0195](../adr/0195-scim-token-expiry-and-rotation.md).
 
 SCIM never gives anyone a role above `SCIM_DEFAULT_ROLE` (member, or readonly), never a team role, and never admin; admins promote people as before. The IdP can't name a role: only an admin's mapping can give one. [Bulk](#bulk) is supported, for clients that batch.
 
@@ -31,13 +31,31 @@ botctl scim token create entra --sso entra --label "Entra provisioning"
 # Docker: docker compose exec -e SUPERBOT_PASSWORD botd botctl scim token create entra --sso entra
 ```
 
-It prints an `sbp_…` token **once**. Paste it into the IdP, then forget it. Leave out `--sso` if people sign in with codes, or are linked by hand. A tenant's first token fixes its SSO link; all its tokens share it.
+It prints an `sbp_…` token **once**. Paste it into the IdP, then forget it. Leave out `--sso` if people sign in with codes, or are linked by hand. A tenant's first token fixes its SSO link; all its tokens share it. It expires in a year (`--days N` for 1 to 730); see [Token expiry and rotation](#token-expiry-and-rotation).
 
 ```sh
-botctl scim tokens                                   # ids, tenants, last use; never values
-botctl scim token create entra --sso entra           # a second token, for rotation
+botctl scim tokens                                   # ids, tenants, last use, expiry and state; never values
+botctl scim token rotate <id>                        # a new token; the old one works 24 more hours
 botctl scim token revoke <id>                        # its users stay as they are
 ```
+
+## Token expiry and rotation
+
+A SCIM token can deactivate everyone its tenant provisioned, so it doesn't live forever; but when it stops, **deprovisioning stops** too, so its end is announced well before. Design: [ADR 0195](../adr/0195-scim-token-expiry-and-rotation.md).
+
+- **New tokens expire**, a year after they're made by default (`--days N`, or `expiresInDays` on `POST /api/scim/tokens`, 1 to 730). An expired token gets 401, like a revoked one.
+- **Rotate before then.** `botctl scim token rotate <id>` (or **Rotate** in the console's SCIM section, or `POST /api/scim/tokens/<id>/rotate`) prints a new token for the same tenant, label and SSO link, once. The old one keeps working for 24 hours (`--keep-old-hours N`, 0 to 168; 0 stops it now), never past its own end. Paste the new token into the IdP (Entra: **Admin Credentials → Secret Token**, then **Test Connection**; Okta: **Provisioning → Integration → Authorization**), then check `botctl scim tokens`: the new token's last use shows the IdP switched. A token rotates once.
+- **Tokens from before this** have no end and keep working; they're listed as `no_expiry` ("Never (rotate it)" in the console). Rotate them to give them one.
+- **Warnings.** 14 days before a token ends, botd audits `scim.token_expiring`, and when it ends, `scim.token_expired`, each once, with `tenantWorking` (whether the tenant still has a working token) and `tenantEndsAt` (when its provisioning stops if nobody acts; null when one of its tokens never expires). `botctl scim tokens` lists `expiringTenants`, tenants whose every working token ends within 14 days, the console says so above the token table, and the [health score](../support/health-score.md#identity)'s identity signal is **watch** while any tenant is in it. Alert on `scim.token_expiring` in your SIEM ([ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md)). Rotated and revoked tokens end as planned, without either event.
+
+| `state` | Meaning |
+|---------|---------|
+| `active` | Works; ends more than 14 days from now |
+| `expiring` | Works; ends within 14 days. Rotate it |
+| `rotated` | Replaced; works until its `expiresAt` (the overlap) |
+| `expired` | Ended; 401 |
+| `revoked` | Revoked; 401 |
+| `no_expiry` | Made before tokens expired; works until rotated or revoked |
 
 ## 3a. Microsoft Entra ID
 
@@ -90,7 +108,7 @@ Google pushes SCIM only to apps in its own catalog, so botd reads the Workspace 
 
 **One person, one user.** Email never matches people. If a SuperBot user already has the email, the IdP gets a 409: link that user's SSO identity (`botctl user link <user> <provider> <subject>`) and retry, or change one of the emails. The owner account is never managed by SCIM.
 
-**Audit.** Every change is logged with the token as the actor: `botctl audit --method scim_token`, or `--actor system:scim:<token id>`. Each deactivation or deletion also records `user.deprovisioned`, with the Bots it stopped and what happened to the machine (`suspended`, `held` until it finishes building, `failed` and retried by the reconciler, `already_suspended`, `kept`, or `none`). Bad tokens are logged as `scim.auth_failed` (throttled), with `reason` `missing`, `unknown`, or `revoked`; a revoked token names which one, so you can find the IdP still sending it. A request with a valid token that's refused or fails (not a 404) is logged as `scim.request_failed` with its `status`, `reason` (the `scimType` in snake case, such as `uniqueness` or `invalid_value`, or `status_<code>`), `method` and `resource`, never its body; the [customer health score](../support/health-score.md#identity) counts them. Tokens themselves never are logged.
+**Audit.** Every change is logged with the token as the actor: `botctl audit --method scim_token`, or `--actor system:scim:<token id>`. Each deactivation or deletion also records `user.deprovisioned`, with the Bots it stopped and what happened to the machine (`suspended`, `held` until it finishes building, `failed` and retried by the reconciler, `already_suspended`, `kept`, or `none`). Bad tokens are logged as `scim.auth_failed` (throttled), with `reason` `missing`, `unknown`, `revoked`, or `expired`; a revoked or expired token names which one (and `rotatedTo`, the token that replaced it), so you can find the IdP still sending it. Tokens are logged as `scim.token_created`, `scim.token_rotated` (with `oldEndsAt`), `scim.token_revoked`, `scim.token_expiring` and `scim.token_expired`. A request with a valid token that's refused or fails (not a 404) is logged as `scim.request_failed` with its `status`, `reason` (the `scimType` in snake case, such as `uniqueness` or `invalid_value`, or `status_<code>`), `method` and `resource`, never its body; the [customer health score](../support/health-score.md#identity) counts them. Tokens themselves never are logged.
 
 ## Enterprise attributes
 
@@ -235,7 +253,8 @@ Bulk: at most 100 operations (`maxOperations`) and 1 MiB (`maxPayloadSize`) a re
 ## Troubleshooting
 
 - **404 on every request**: `SCIM=on` isn't set, or botd wasn't restarted.
-- **401**: the token is wrong or revoked. Make a new one; check the IdP sends `Authorization: Bearer sbp_…`.
+- **401**: the token is wrong, revoked, or expired (`botctl audit --action scim.auth_failed` says which). Make a new one, or rotate a working one; check the IdP sends `Authorization: Bearer sbp_…`.
+- **401 just after a rotation**: the overlap ended before the IdP got the new token. Paste the new one into the IdP; if it's lost, rotate again (rotate the new token, which still works) or make one with `botctl scim token create`.
 - **403 "Unknown Host"**: add the public hostname to `ALLOWED_HOSTS` (Compose adds `SUPERBOT_DOMAIN`).
 - **400 "externalId is required" or "externalId: …"**: the tenant links SSO, and the IdP didn't send the person's subject. Entra: map **objectId** to **externalId**.
 - **409 "Another SuperBot user has this email"**: see *One person, one user* above.
