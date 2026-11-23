@@ -860,6 +860,8 @@ mod tests {
             on_behalf_of: Some("u1".into()),
             chain_prev: None,
             chain_hash: None,
+            chain_digest: None,
+            chain_salt: None,
         };
         let row = csv_row(&e);
         assert!(row.ends_with("\r\n"));

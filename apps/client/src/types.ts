@@ -474,6 +474,8 @@ export interface AdminUser {
 export interface CustomRoleRef {
   id: string;
   name: string;
+  /** When a role given by hand ends, in Unix ms; null or absent when it doesn't (ADR 0197). */
+  expiresAt?: number | null;
 }
 
 /** A permission a custom role can hold; `team` ones also apply when given within a team. */
@@ -508,13 +510,15 @@ export interface CustomRole {
   /** How many people have it across the server, and within a team. */
   users: number;
   teamMembers: number;
+  /** Time-bound (ADR 0197): given only by hand, with an end at most this many days away. */
+  maxDays?: number | null;
   createdAt: number;
   createdBy: string | null;
   updatedAt: number;
-  /** Only from `GET /api/roles/{id}`. */
+  /** Only from `GET /api/roles/{id}`. `expiresAt` is when each one's role ends, if it does. */
   holders?: {
-    users: { id: string; name: string; email: string | null }[];
-    teams: { team: { id: string; name: string }; user: { id: string; name: string; email: string | null } }[];
+    users: { id: string; name: string; email: string | null; expiresAt?: number | null }[];
+    teams: { team: { id: string; name: string }; user: { id: string; name: string; email: string | null }; expiresAt?: number | null }[];
   };
 }
 
@@ -648,6 +652,14 @@ export interface RoleDraft {
   description: string;
   base: RoleBase;
   permissions: string[];
+  /** Null: no limit. */
+  maxDays?: number | null;
+}
+
+/** How a role is given by hand (ADR 0197): until when, and why, for the audit log. */
+export interface RoleGiving {
+  expiresAt?: number | null;
+  reason?: string;
 }
 
 /** Who must have a second factor to sign in with a code or password (ADR 0094). */

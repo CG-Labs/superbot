@@ -26,6 +26,9 @@ mod audit_checkpoint;
 #[cfg(test)]
 mod audit_checkpoint_http_tests;
 mod audit_export;
+// botctl's `audit verify-lines` uses the rest.
+#[allow(dead_code)]
+mod audit_line;
 #[cfg(test)]
 mod audit_http_tests;
 #[cfg(test)]
@@ -53,6 +56,9 @@ mod health_history_http_tests;
 mod health_score;
 #[cfg(test)]
 mod health_score_http_tests;
+mod incident_review;
+#[cfg(test)]
+mod incident_review_http_tests;
 mod isolation;
 #[cfg(test)]
 mod isolation_http_tests;
@@ -783,6 +789,7 @@ async fn main() {
         "unencrypted": backup_targets.iter().filter(|t| !t.encrypted).map(|t| t.id).collect::<Vec<_>>(),
     });
     let _ = app.server_backups.set(Arc::new(server_backups));
+    sso::saml_expiry::start(auth_state.clone());
     let router = router(app.clone(), auth_state);
     let policy = app.db.global_policy();
     app.db.record(&Event::new(Actor::system("server"), "server.started").details(json!({
@@ -832,6 +839,7 @@ async fn main() {
     })));
     license::start(app.clone());
     scim::start(app.clone());
+    roles::start(app.clone());
     log_info!("Audit export: {} (ADR 0122).", audit_export.describe());
     audit_export::start(&app, audit_export);
     log_info!("Audit checkpoints: {} (ADR 0149).", audit_checkpoints.describe());
@@ -1169,6 +1177,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/status/incidents", get(status::list).post(status::create))
         .route("/status/incidents/{id}", patch(status::edit).delete(status::delete))
         .route("/status/incidents/{id}/updates", post(status::add_update))
+        .route("/status/incidents/{id}/review", get(incident_review::get))
         .route_layer(middleware::from_fn(obs::note_route));
     // SCIM has its own bearer tokens and error format, so its own guard, not `auth` (ADR 0023).
     let scim_routes = Router::new()

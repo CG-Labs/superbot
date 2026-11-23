@@ -12,7 +12,7 @@ What the technical account manager (TAM) checks each month for an Enterprise cus
 
 - [ ] Version: `botctl whoami` answers, and the [changelog](../../CHANGELOG.md) has no release since theirs with a security fix they lack. If it does, agree an upgrade window ([air-gapped](runbook-air-gapped.md) servers need the bundle carried in).
 - [ ] Setup: `botctl setup` has nothing open that was done at go-live.
-- [ ] Status: `/status.json` shows no open incident, and last month's incidents have their reviews ([escalation](escalation.md#after-a-severity-1)).
+- [ ] Status: `/status.json` shows no open incident, and last month's incidents (`botctl incidents`) have their reviews ([escalation](escalation.md#after-a-severity-1), [drafts](incident-review.md#the-review-draft)), with any missed status page target looked into.
 
 ## 3. Identity
 

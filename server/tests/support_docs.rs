@@ -163,6 +163,7 @@ fn every_link_in_the_playbooks_resolves() {
     files.push(repo().join("docs/adr/0157-health-score-history-and-console.md"));
     files.push(repo().join("docs/adr/0167-support-report-from-ticket-exports.md"));
     files.push(repo().join("docs/adr/0187-offline-support-check-and-bundle.md"));
+    files.push(repo().join("docs/adr/0201-incident-review-drafts.md"));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links:\n{}", bad.join("\n"));
 }
@@ -336,4 +337,29 @@ fn the_support_check_page_documents_every_check_and_option() {
     }
     assert!(read("runbook-upgrade.md").contains("--before-upgrade"), "the upgrade runbook checks before it upgrades");
     assert!(read("support-bundle.md").contains("(support-check.md#the-offline-bundle)"), "the support bundle points at the offline one");
+}
+
+#[test]
+fn the_incidents_page_documents_both_commands_and_the_draft() {
+    let botctl = fs::read_to_string(repo().join("server/src/bin/botctl.rs")).unwrap();
+    let usage = botctl.split("const INCIDENT_USAGE: &str = \"").nth(1).unwrap().split("\";").next().unwrap();
+    let page = read("incident-review.md");
+    let options: HashSet<&str> = usage.split(|c: char| c.is_whitespace() || "[]|".contains(c)).filter(|w| w.starts_with('-') && w.len() > 1).collect();
+    assert!(options.len() >= 9, "the usage's options: {options:?}");
+    for o in options {
+        assert!(page.contains(&format!("`{o}")), "incident-review.md doesn't explain {o}");
+    }
+    let code = fs::read_to_string(repo().join("server/src/incident_review.rs")).unwrap();
+    let sections: Vec<&str> = code.split("## ").skip(1).map(|r| r.split(['\\', '"']).next().unwrap()).collect();
+    assert!(sections.len() >= 8, "the draft's sections: {sections:?}");
+    let lower = page.to_lowercase();
+    for s in sections {
+        assert!(lower.contains(&s.to_lowercase()), "incident-review.md doesn't describe the draft's \"{s}\" section");
+    }
+    let runbook = read("runbook-major-incident.md");
+    for cmd in ["botctl incident open", "botctl incident update", "botctl incident resolve", "botctl incident review", "--detected"] {
+        assert!(runbook.contains(cmd), "the Severity 1 runbook doesn't use {cmd}");
+    }
+    let escalation = read("escalation.md");
+    assert!(escalation.contains("botctl incident review") && escalation.contains("(runbook-major-incident.md)"), "escalation doesn't point at the review draft and the runbook");
 }

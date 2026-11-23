@@ -12,7 +12,7 @@ Who works a ticket, who it goes to next, and when. Roles, not people: the Provid
 | Incident commander | One named person for each Severity 1, usually the on-call engineer until handed over | Every Severity 1, from the first minute | `<incident-channel>` |
 | Management | `<support-manager>`, then `<engineering-manager>` | A Severity 1 past 2 hours without a workaround; any data loss or security incident; a customer escalation (below) | `<escalation-email>` |
 
-The incident commander owns the status page note, the hourly updates and the customer's Severity 1 ticket, and hands work to others rather than doing it. They decide when the incident is over.
+The incident commander owns the status page note, the hourly updates and the customer's Severity 1 ticket, and hands work to others rather than doing it. They decide when the incident is over. Their steps: [running a Severity 1](runbook-major-incident.md); the status page from the server's shell: `botctl incident` ([incidents](incident-review.md#posting-and-updating)).
 
 ### Timed escalation
 
@@ -47,4 +47,4 @@ If a ticket isn't moving as it should:
 
 ## After a Severity 1
 
-Within 5 business days, the incident commander writes a review: timeline in UTC, impact, cause, what went well and badly, and actions with owners. It's linked from the status page note, as the [error budget policy](../slo.md#error-budget-policy) asks, and shared with affected Enterprise customers. Runbooks the review changes are updated in this folder.
+Within 5 business days, the incident commander writes a review: timeline in UTC, impact, cause, what went well and badly, and actions with owners. `botctl incident review <id> --detected <time>` drafts it from botd's records: the status page timeline, botd's starts and configuration changes around it, what failed while it lasted, and whether the status page's targets were kept ([incident reviews](incident-review.md)). It's linked from the status page note, as the [error budget policy](../slo.md#error-budget-policy) asks, and shared with affected Enterprise customers. Runbooks the review changes are updated in this folder.

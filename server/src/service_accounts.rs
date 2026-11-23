@@ -125,7 +125,7 @@ pub fn team_seat(app: &AppState, u: &User) -> Option<TeamMember> {
     if !on_team(&app.db, &owner, &team.id) {
         return None;
     }
-    Some(TeamMember { user_id: u.id.clone(), team_id: team.id, role: crate::teams::MEMBER.into(), joined_at: u.created_at, added_by: sa.created_by, role_id: sa.team_role_id })
+    Some(TeamMember { user_id: u.id.clone(), team_id: team.id, role: crate::teams::MEMBER.into(), joined_at: u.created_at, added_by: sa.created_by, role_id: sa.team_role_id, role_expires_at: None })
 }
 
 /// Whether `owner` can lend a service account a place in `team`: an admin in any, anyone
@@ -257,6 +257,7 @@ fn parse_role(app: &AppState, v: &Value) -> Res<(Role, Option<CustomRole>)> {
         Some(Role::Admin) => Err(bad("A service account can never be an admin. Give it member, readonly, or a custom role.")),
         Some(r) => Ok((r, None)),
         None => match app.db.find_custom_role(key).filter(|_| !key.is_empty()) {
+            Some(r) if r.max_days.is_some() => Err(crate::roles::standing_refused(&r, "a service account")),
             Some(r) => Ok((r.base, Some(r))),
             None => Err(bad("role must be member, readonly, or a custom role's id or name")),
         },
@@ -311,6 +312,14 @@ fn forbidden(msg: impl Into<String>) -> ApiError {
 
 fn conflict(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::CONFLICT, msg.into())
+}
+
+/// A role that became time-bound between its check and the write (ADR 0197) is refused.
+fn write_error(e: String) -> ApiError {
+    if e == crate::db::SA_TIME_BOUND {
+        return conflict("That role is time-bound now, and a service account holds its role with no end. Pick another.");
+    }
+    ApiError(StatusCode::INTERNAL_SERVER_ERROR, e)
 }
 
 fn refuse(app: &AppState, by: &Who, limit: &str, target: Option<&str>, extra: Value, msg: String) -> ApiError {
@@ -384,7 +393,8 @@ fn choices(app: &AppState, me: &User) -> Value {
         let cap = ceiling(db, me, team.map(|t| t.id.as_str()));
         let built_in = [Role::Readonly, Role::Member].into_iter().map(|role| (role.as_str().to_string(), Roles { role, custom: None, team: team.cloned() }));
         // A read-only custom role in a team changes nothing, so `create` refuses it there.
-        let customs = custom.iter().filter(|r| team.is_none() || r.base != Role::Readonly).map(|r| (r.id.clone(), Roles { role: r.base, custom: Some(r.clone()), team: team.cloned() }));
+        // Nor a time-bound one, which only a person holds, until its end (ADR 0197).
+        let customs = custom.iter().filter(|r| r.max_days.is_none() && (team.is_none() || r.base != Role::Readonly)).map(|r| (r.id.clone(), Roles { role: r.base, custom: Some(r.clone()), team: team.cloned() }));
         built_in.chain(customs).filter(|(_, roles)| beyond(roles, cap).is_empty()).map(|(id, _)| id).collect()
     };
     let teams: Vec<crate::db::Team> = if me.role == Role::Admin {
@@ -567,7 +577,7 @@ pub async fn create(State(app): State<AppState>, Extension(c): Extension<Caller>
     within(&app, &by, &owner, &roles, None)?;
     let org = roles.org_role().map(|r| r.id.as_str());
     let team_arg = roles.team.as_ref().map(|t| (t.id.as_str(), roles.team_role().map(|r| r.id.as_str())));
-    let sa = app.db.create_service_account(&name, &description, role, org, team_arg, &owner.id, by.actor.id.as_deref()).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let sa = app.db.create_service_account(&name, &description, role, org, team_arg, &owner.id, by.actor.id.as_deref()).map_err(write_error)?;
     app.db.record(&by.event("service_account.created").target("service_account", &sa.user.id).details(json!({
         "name": sa.user.name, "role": role, "customRole": role_summary(roles.org_role()), "team": roles.team.as_ref().map(|t| &t.id),
         "teamRole": role_summary(roles.team_role()), "owner": owner.id, "permissions": roles.holds().names(),
@@ -640,7 +650,7 @@ pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>
         p.role = Some((role_now, org_now));
         p.team = Some(team_now.map(|t| (t, team_role_now)));
     }
-    app.db.update_service_account(&id, &p).map_err(|_| not_found("Service account"))?;
+    app.db.update_service_account(&id, &p).map_err(|e| if e == "not found" { not_found("Service account") } else { write_error(e) })?;
     let after = app.db.service_account(&id).ok_or_else(|| not_found("Service account"))?;
     let mut changes = Map::new();
     let mut change = |k: &str, from: Value, to: Value| {

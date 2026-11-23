@@ -8,6 +8,9 @@
 
 #[path = "../support_report.rs"]
 mod support_report;
+#[path = "../audit_line.rs"]
+#[allow(dead_code)]
+mod audit_line;
 
 use serde_json::{json, Map, Value};
 use std::io::{BufRead, Read, Write};
@@ -60,15 +63,18 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl roles                                     Custom roles (ADR 0123), the permissions they're built from,
                                                    and the built-in roles as presets of them
   botctl role show <role>                          A role (id or name), its effective permissions, and who has it
-  botctl role add "<name>" [--base member|readonly] [--perms <a,b>] [--description "<text>"]
+  botctl role add "<name>" [--base member|readonly] [--perms <a,b>] [--description "<text>"] [--max-days <n>]
                                                    A role on member (default) or read-only, plus permissions:
                                                    users.manage, bots.manage, audit.view, billing.manage,
-                                                   signups.approve, machines.manage
-  botctl role edit <role> [--name "<name>"] [--base member|readonly] [--perms <a,b>|none] [--description "<text>"]
+                                                   signups.approve, machines.manage. With --max-days it is
+                                                   time-bound (ADR 0197): given only by hand, for at most <n> days
+  botctl role edit <role> [--name "<name>"] [--base member|readonly] [--perms <a,b>|none] [--description "<text>"] [--max-days <n>|none]
                                                    A new base applies at once to everyone who has it
   botctl role rm <role>                            Delete it, once nobody has it
-  botctl role assign <role> <user> [--team <team>] Give it across the server (its base becomes their role), or
-                                                   with --team only in that team (its team permissions)
+  botctl role assign <role> <user> [--team <team>] [--for <n>h|<n>d] [--reason "<text>"]
+                                                   Give it across the server (its base becomes their role), or
+                                                   with --team only in that team (its team permissions). With
+                                                   --for it ends by itself; a time-bound role needs it
   botctl role unassign <role> <user> [--team <team>]  Take it away; across the server they keep its base
   botctl service-accounts                          Service accounts (ADR 0143): non-human callers for scripts
                                                    and integrations. Admins see all; others with users.manage
@@ -229,6 +235,12 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    --archive: also read the write-once S3 archive,
                                                    check it has no gaps, and hold every event here
                                                    to the hash it has there
+  botctl audit verify-lines <file|dir|->... [--key <hex>]... [--digests-after <id>]
+                                                   Check exported events (SIEM or archive copies, any
+                                                   order) with no botd: each line's hash, the chain
+                                                   between them, signed checkpoints. --digests-after:
+                                                   digestsAfter from botctl audit siem, so lines with
+                                                   their digests taken out fail. Exits 1 on a break
   botctl audit siem                                The SIEM export: sink, delivered, pending, failing
   botctl audit chain                               The chain's state: head, last checkpoint and
                                                    timestamp, export lag, last check
@@ -256,6 +268,22 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    ticket system's CSV export: tickets by month and severity,
                                                    response targets met and missed, and what's still open.
                                                    Reads only ids, severities, plans and times
+  botctl incidents [json]                          Status page incidents (ADR 0090), open first
+  botctl incident open "<title>" "<text>" [--impact <none|minor|major|critical|maintenance>]
+    [--component <api|database|machines|runners|notifications>]... [--state <state>]
+                                                   Post one on the public status page (default: minor,
+                                                   investigating). Anyone can read the text
+  botctl incident update <id> <investigating|identified|monitoring|resolved> "<text>"
+  botctl incident resolve <id> "<text>"            A new entry on its timeline; resolve ends it
+  botctl incident edit <id> [--title <title>] [--impact <impact>] [--component <id>]...
+  botctl incident delete <id> --yes                For one posted by mistake. Resolve real ones
+  botctl incident review <id> [--detected <time>] [--lead-hours <n>] [--json] [-o <file>]
+                                                   Draft the incident review (ADR 0201) as Markdown: the
+                                                   status page timeline, botd's starts and changes in the
+                                                   24 h before (1 to 168), runs, sign-ins and denials while
+                                                   it lasted against the time before, and the update
+                                                   targets; --detected judges the 15-minute first post.
+                                                   Names nobody. -o saves it to a new file
   botctl evidence                                  The evidence bundle schedule (EVIDENCE_BUNDLES), where
                                                    bundles are written and those kept (ADR 0142)
   botctl evidence baseline [json]                  Check this server against the configuration baseline
@@ -881,6 +909,84 @@ fn verify_query(rest: &[&str]) -> Result<String, String> {
     Ok(if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) })
 }
 
+/// `botctl audit verify-lines <file|dir|->... [--key <hex>]... [--digests-after <id>]` (ADR 0199): checks
+/// exported events where they landed, with no botd. A directory is read for its
+/// `.jsonl`, `.ndjson`, `.json` and `.log` files, `-` is stdin.
+fn verify_lines(rest: &[&str], stdin: impl std::io::Read) -> Result<String, String> {
+    let (mut paths, mut keys, mut after) = (Vec::new(), Vec::new(), None);
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "--key" => keys.push(audit_line::parse_public_key(it.next().ok_or("--key needs a public key in hex (botctl audit key)")?)?),
+            "--digests-after" => after = Some(it.next().and_then(|v| v.parse::<i64>().ok()).ok_or("--digests-after needs an event id (digestsAfter in botctl audit siem)")?),
+            o if o.starts_with("--") => return Err(format!("Unknown audit verify-lines option \"{o}\". See botctl admin.")),
+            p => paths.push(p),
+        }
+    }
+    if paths.is_empty() {
+        return Err("Usage: botctl audit verify-lines <file|dir|->... [--key <public key hex>]... [--digests-after <event id>]".into());
+    }
+    let pinned = !keys.is_empty();
+    let mut lines = audit_line::Lines::new(pinned.then_some(keys)).digests_after(after);
+    let mut files = 0u64;
+    let mut stdin = Some(stdin);
+    for p in paths {
+        if p == "-" {
+            let mut text = String::new();
+            stdin.take().ok_or("stdin (-) can be read once")?.read_to_string(&mut text).map_err(|e| format!("stdin: {e}"))?;
+            read_lines(&mut lines, &text, "-");
+            files += 1;
+            continue;
+        }
+        for f in line_files(std::path::Path::new(p))? {
+            let bytes = std::fs::read(&f).map_err(|e| format!("{}: {e}", f.display()))?;
+            read_lines(&mut lines, &String::from_utf8_lossy(&bytes), &f.display().to_string());
+            files += 1;
+        }
+    }
+    let mut v = serde_json::to_value(lines.finish()).map_err(|e| e.to_string())?;
+    v["files"] = json!(files);
+    let mut notes = Vec::new();
+    if !pinned {
+        notes.push("No --key given: a checkpoint only shows its lines agree with whoever signed it. Pin botd's key (botctl audit key).");
+    }
+    if after.is_none() {
+        notes.push("No --digests-after given: lines with every chainDigest taken out would bind nothing and still pass. Pin digestsAfter (botctl audit siem).");
+    }
+    if !notes.is_empty() {
+        v["note"] = json!(notes.join(" "));
+    }
+    let out = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+    if v["ok"] == true { Ok(out) } else { Err(out) }
+}
+
+fn read_lines(lines: &mut audit_line::Lines, text: &str, name: &str) {
+    for (n, l) in text.lines().enumerate() {
+        lines.line(l, &format!("{name}:{}", n + 1));
+    }
+}
+
+/// `path` itself, or the event files under it, sorted so the output is stable.
+fn line_files(path: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    if !path.is_dir() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let mut out = Vec::new();
+    let mut dirs = vec![path.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        for entry in std::fs::read_dir(&d).map_err(|e| format!("{}: {e}", d.display()))? {
+            let p = entry.map_err(|e| format!("{}: {e}", d.display()))?.path();
+            if p.is_dir() {
+                dirs.push(p);
+            } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| ["jsonl", "ndjson", "json", "log"].contains(&x)) {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 fn flag<'a>(rest: &[&'a str], name: &str) -> Option<&'a str> {
     rest.windows(2).find(|w| w[0] == name).map(|w| w[1])
 }
@@ -1196,7 +1302,30 @@ fn sso_role_request(args: &[&str]) -> Result<(&'static str, String, Option<Strin
 /// `botctl roles` and `botctl role ...`: custom roles (ADR 0123, 0132). The server checks
 /// every name and permission; this only shapes the request.
 fn role_request(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
-    const USAGE: &str = "Usage: botctl roles | role show <role> | role add \"<name>\" [--base member|readonly] [--perms a,b] [--description TEXT] | role edit <role> [--name NAME] [--base B] [--perms a,b|none] [--description TEXT] | role rm <role> | role assign|unassign <role> <user> [--team <team>]";
+    role_request_at(args, now_ms())
+}
+
+/// `role_request` with `now` (Unix ms) for `--for`.
+fn role_request_at(args: &[&str], now: i64) -> Result<(&'static str, String, Option<String>), String> {
+    const USAGE: &str = "Usage: botctl roles | role show <role> | role add \"<name>\" [--base member|readonly] [--perms a,b] [--description TEXT] [--max-days N] | role edit <role> [--name NAME] [--base B] [--perms a,b|none] [--description TEXT] [--max-days N|none] | role rm <role> | role assign <role> <user> [--team <team>] [--for <n>h|<n>d] [--reason TEXT] | role unassign <role> <user> [--team <team>]";
+    let max_days = |v: &str| -> Result<Value, String> {
+        if v == "none" {
+            return Ok(Value::Null);
+        }
+        v.parse::<u32>().map(|n| json!(n)).map_err(|_| format!("--max-days is a number of days or none. {USAGE}"))
+    };
+    let until = |v: &str| -> Result<i64, String> {
+        let hour = 60 * 60_000;
+        let (n, unit) = match (v.strip_suffix('h'), v.strip_suffix('d')) {
+            (Some(n), _) => (n, hour),
+            (_, Some(n)) => (n, 24 * hour),
+            _ => ("", 0),
+        };
+        match n.parse::<i64>() {
+            Ok(n) if (1..=365 * 24).contains(&n) => Ok(now + n * unit),
+            _ => Err(format!("--for is hours or days, like 8h or 7d. {USAGE}")),
+        }
+    };
     let perms = |v: &str| -> Value {
         if v == "none" {
             return json!([]);
@@ -1221,12 +1350,15 @@ fn role_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
         [] | ["list"] => ("GET", "/api/roles".into(), None),
         ["show", id] => ("GET", at(id), None),
         ["add", name, rest @ ..] if !name.starts_with("--") => {
-            known(rest, &["--base", "--perms", "--description"])?;
-            let body = json!({ "name": name, "base": flag(rest, "--base"), "description": flag(rest, "--description"), "permissions": perms(flag(rest, "--perms").unwrap_or("none")) });
+            known(rest, &["--base", "--perms", "--description", "--max-days"])?;
+            let mut body = json!({ "name": name, "base": flag(rest, "--base"), "description": flag(rest, "--description"), "permissions": perms(flag(rest, "--perms").unwrap_or("none")) });
+            if let Some(v) = flag(rest, "--max-days") {
+                body["maxDays"] = max_days(v)?;
+            }
             ("POST", "/api/roles".into(), Some(body.to_string()))
         }
         ["edit", id, rest @ ..] if !id.starts_with("--") && !rest.is_empty() => {
-            known(rest, &["--name", "--base", "--perms", "--description"])?;
+            known(rest, &["--name", "--base", "--perms", "--description", "--max-days"])?;
             let mut body = Map::new();
             for (opt, field) in [("--name", "name"), ("--base", "base"), ("--description", "description")] {
                 if let Some(v) = flag(rest, opt) {
@@ -1236,12 +1368,26 @@ fn role_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
             if let Some(v) = flag(rest, "--perms") {
                 body.insert("permissions".into(), perms(v));
             }
+            if let Some(v) = flag(rest, "--max-days") {
+                body.insert("maxDays".into(), max_days(v)?);
+            }
             ("PATCH", at(id), Some(Value::Object(body).to_string()))
         }
         ["rm" | "delete", id] => ("DELETE", at(id), None),
-        [verb @ ("assign" | "unassign"), id, user, rest @ ..] if !user.starts_with("--") => {
+        ["assign", id, user, rest @ ..] if !user.starts_with("--") => {
+            known(rest, &["--team", "--for", "--reason"])?;
+            let mut body = Map::new();
+            if let Some(v) = flag(rest, "--for") {
+                body.insert("expiresAt".into(), json!(until(v)?));
+            }
+            if let Some(v) = flag(rest, "--reason") {
+                body.insert("reason".into(), json!(v));
+            }
+            ("PUT", holder(id, user, rest), (!body.is_empty()).then(|| Value::Object(body).to_string()))
+        }
+        ["unassign", id, user, rest @ ..] if !user.starts_with("--") => {
             known(rest, &["--team"])?;
-            (if *verb == "assign" { "PUT" } else { "DELETE" }, holder(id, user, rest), None)
+            ("DELETE", holder(id, user, rest), None)
         }
         _ => return Err(USAGE.into()),
     })
@@ -1251,7 +1397,8 @@ fn role_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
 fn role_assigned(verb: &str, res: &Value) -> String {
     let who = res["user"]["email"].as_str().or(res["user"]["name"].as_str()).unwrap_or_default();
     let team = res["team"]["name"].as_str();
-    match (verb, team) {
+    let ends = res["role"]["expiresAt"].as_i64().and_then(chrono::DateTime::from_timestamp_millis).map(|d| format!(" It ends {}.", d.format("%Y-%m-%d %H:%M UTC"))).unwrap_or_default();
+    let said = match (verb, team) {
         ("assign", Some(t)) => format!(
             "{who} has {} in {t}. There it gives: {}.",
             res["role"]["name"].as_str().unwrap_or_default(),
@@ -1260,7 +1407,8 @@ fn role_assigned(verb: &str, res: &Value) -> String {
         ("assign", None) => format!("{who} has {} now; their role is {}.", res["role"]["name"].as_str().unwrap_or_default(), res["user"]["role"].as_str().unwrap_or_default()),
         (_, Some(t)) => format!("Taken away from {who} in {t}."),
         _ => format!("Taken away. {who} keeps {} as their role.", res["user"]["role"].as_str().unwrap_or_default()),
-    }
+    };
+    if verb == "assign" { said + &ends } else { said }
 }
 
 /// `botctl service-accounts` and `botctl service-account ...` (ADR 0143). The server checks
@@ -1521,13 +1669,28 @@ fn saml_summary(v: &Value) -> String {
         s("metadataUrl"),
         s("idpEntityId"),
     );
+    let warnings = v["certificateWarnings"].as_array().map(Vec::as_slice).unwrap_or_default();
+    if !warnings.is_empty() {
+        out += "  Certificate warnings:\n";
+    }
+    for w in warnings {
+        let what = match w["role"].as_str() {
+            Some("sp_signing") => "SP signing certificate",
+            Some("sp_encryption") => "SP encryption certificate",
+            Some("idp_signing") => "IdP signing certificate",
+            _ => "IdP metadata signing certificate",
+        };
+        let stage = if w["stage"] == "next" { " (next key)" } else { "" };
+        out += &format!("    {what}{stage} SHA-256 {} expires {}{}\n      {}\n", w["certificate"].as_str().unwrap_or_default(), day(&w["notAfter"]), ending(w), w["action"].as_str().unwrap_or_default());
+    }
     let key = &v["spKey"];
     if let Some(c) = key["certificate"].as_object() {
         out += &format!(
-            "  SP signing certificate:   SHA-256 {} ({}), expires {}\n",
+            "  SP signing certificate:   SHA-256 {} ({}), expires {}{}\n",
             c["sha256"].as_str().unwrap_or_default(),
             key["from"].as_str().unwrap_or_default(),
-            day(&c["notAfter"])
+            day(&c["notAfter"]),
+            ending(&key["certificate"])
         );
     } else if let Some(p) = key["problem"].as_str() {
         out += &format!("  SP signing key:           {p}\n");
@@ -1536,10 +1699,11 @@ fn saml_summary(v: &Value) -> String {
     let enc = &v["spEncryptionKey"];
     if let Some(c) = enc["certificate"].as_object() {
         out += &format!(
-            "  SP encryption certificate: SHA-256 {} ({}), expires {}\n",
+            "  SP encryption certificate: SHA-256 {} ({}), expires {}{}\n",
             c["sha256"].as_str().unwrap_or_default(),
             enc["from"].as_str().unwrap_or_default(),
-            day(&c["notAfter"])
+            day(&c["notAfter"]),
+            ending(&enc["certificate"])
         );
     } else if let Some(p) = enc["problem"].as_str() {
         out += &format!("  SP encryption key:        {p}\n");
@@ -1562,7 +1726,7 @@ fn saml_summary(v: &Value) -> String {
         }
     );
     for c in v["metadataSigningCertificates"].as_array().into_iter().flatten() {
-        out += &format!("    Trusted signer: SHA-256 {} ({}), expires {}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]));
+        out += &format!("    Trusted signer: SHA-256 {} ({}), expires {}{}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]), ending(c));
     }
     let yes = |b: bool| if b { "yes" } else { "no" };
     out += &format!(
@@ -1606,7 +1770,7 @@ fn saml_summary(v: &Value) -> String {
         out += &format!("    Logout URL:  {slo}\n");
     }
     for c in idp["certificates"].as_array().into_iter().flatten() {
-        out += &format!("    Certificate SHA-256 {} ({}), expires {}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]));
+        out += &format!("    Certificate SHA-256 {} ({}), expires {}{}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]), ending(c));
     }
     out
 }
@@ -1627,13 +1791,24 @@ fn rollover_lines(key: &Value) -> String {
     }
     let next = &key["next"];
     if let Some(c) = next["certificate"].as_object() {
-        out += &format!("    Next: SHA-256 {}, expires {}: published, not yet in use{}\n", c["sha256"].as_str().unwrap_or_default(), day(&c["notAfter"]), used(next));
+        out += &format!("    Next: SHA-256 {}, expires {}{}: published, not yet in use{}\n", c["sha256"].as_str().unwrap_or_default(), day(&c["notAfter"]), ending(&next["certificate"]), used(next));
     }
     let prev = &key["previous"];
     if let Some(c) = prev["certificate"].as_object() {
         out += &format!("    Previous: SHA-256 {}: no longer published, still decrypts until retired{}\n", c["sha256"].as_str().unwrap_or_default(), used(prev));
     }
     out
+}
+
+/// After a certificate's end date: nothing while it's far off, else how soon it ends or that
+/// it has (ADR 0198).
+fn ending(c: &Value) -> String {
+    let days = c["daysLeft"].as_i64().unwrap_or_default();
+    match c["expiry"].as_str().or(c["state"].as_str()) {
+        Some("expired") => " (expired)".into(),
+        Some("expiring") => format!(" (in {days} day{})", if days == 1 { "" } else { "s" }),
+        _ => String::new(),
+    }
 }
 
 fn ago(s: u64) -> String {
@@ -1909,6 +2084,22 @@ fn run(args: &[String]) -> Result<String, String> {
             let res = api(Cred::Operator, "GET", &path, None)?;
             if json { Ok(pretty(res)) } else { Ok(health_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)) }
         }
+        ["incidents"] => Ok(incidents_summary(&serde_json::from_str(&api(Cred::Operator, "GET", "/api/status/incidents", None)?).map_err(|e| e.to_string())?)),
+        ["incidents", "json"] => op("GET", "/api/status/incidents", None),
+        ["incident", "review", rest @ ..] => {
+            let (path, json, out) = incident_review_request(rest)?;
+            let res = api(Cred::Operator, "GET", &path, None)?;
+            let res = if json { pretty(res) } else { res };
+            match out {
+                Some(file) => save_private(file, res.as_bytes()).map(|_| format!("Saved {file}. Fill in what's marked \"To fill in\" before you share it.")),
+                None => Ok(res),
+            }
+        }
+        ["incident", rest @ ..] => {
+            let (method, path, body) = incident_request(rest)?;
+            let res = api(Cred::Operator, method, &path, body)?;
+            Ok(incident_done(rest, &serde_json::from_str(&res).unwrap_or_default()))
+        }
         ["evidence"] => op("GET", "/api/evidence", None),
         ["evidence", "bundle", rest @ ..] => evidence_bundle(rest),
         ["evidence", "baseline", rest @ ..] => {
@@ -1934,6 +2125,7 @@ fn run(args: &[String]) -> Result<String, String> {
             // A broken chain is a failure, so a cron job or CI step notices.
             if serde_json::from_str::<Value>(&res).ok().and_then(|v| v["ok"].as_bool()) == Some(false) { Err(res) } else { Ok(res) }
         }
+        ["audit", "verify-lines", rest @ ..] => verify_lines(rest, std::io::stdin()),
         ["audit", "siem"] => op("GET", "/api/audit/siem", None),
         ["audit", "chain"] => op("GET", "/api/audit/chain", None),
         ["audit", "key"] => op("GET", "/api/audit/checkpoints/key", None),
@@ -2187,6 +2379,119 @@ fn support_report(rest: &[&str], mut stdin: impl Read) -> Result<String, String>
     })
 }
 
+const INCIDENT_USAGE: &str = "Usage: botctl incident open \"<title>\" \"<text>\" [--impact <impact>] [--component <id>]... [--state <state>] | update <id> <state> \"<text>\" | resolve <id> \"<text>\" | edit <id> [--title <title>] [--impact <impact>] [--component <id>]... | delete <id> --yes | review <id> [--detected <time>] [--lead-hours <n>] [--json] [-o <file>]";
+
+/// `--impact`, `--component` (repeatable), `--state` and `--title` after an incident's
+/// positional arguments, as the JSON botd takes. `allowed` names those the command takes.
+fn incident_flags(rest: &[&str], allowed: &[&str]) -> Result<Map<String, Value>, String> {
+    let mut body = Map::new();
+    let mut components: Vec<Value> = Vec::new();
+    let mut it = rest.iter();
+    while let Some(flag) = it.next() {
+        if !allowed.contains(flag) {
+            return Err(INCIDENT_USAGE.into());
+        }
+        let v = it.next().filter(|v| !v.starts_with("--")).ok_or_else(|| format!("{flag} needs a value"))?;
+        match *flag {
+            "--component" => components.push(json!(v)),
+            f => _ = body.insert(f.trim_start_matches("--").into(), json!(v)),
+        }
+    }
+    if !components.is_empty() {
+        body.insert("components".into(), Value::Array(components));
+    }
+    Ok(body)
+}
+
+/// `botctl incident open|update|resolve|edit|delete`: the method, path and body.
+fn incident_request(rest: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
+    let at = |id: &str, tail: &str| format!("/api/status/incidents/{}{tail}", encode(id));
+    match rest {
+        ["open", title, text, flags @ ..] => {
+            let mut body = incident_flags(flags, &["--impact", "--component", "--state"])?;
+            body.insert("title".into(), json!(title));
+            body.insert("body".into(), json!(text));
+            Ok(("POST", "/api/status/incidents".into(), Some(Value::Object(body).to_string())))
+        }
+        ["update", id, state, text] => Ok(("POST", at(id, "/updates"), Some(json!({ "state": state, "body": text }).to_string()))),
+        ["resolve", id, text] => Ok(("POST", at(id, "/updates"), Some(json!({ "state": "resolved", "body": text }).to_string()))),
+        ["edit", id, flags @ ..] if !flags.is_empty() => {
+            let body = incident_flags(flags, &["--title", "--impact", "--component"])?;
+            Ok(("PATCH", at(id, ""), Some(Value::Object(body).to_string())))
+        }
+        ["delete", id, "--yes"] => Ok(("DELETE", at(id, ""), None)),
+        ["delete", _] => Err("Deleting takes it and its timeline off the status page for good; resolve it if it really happened, or add --yes".into()),
+        _ => Err(INCIDENT_USAGE.into()),
+    }
+}
+
+/// What `botctl incident open|update|resolve|edit|delete` did, and what comes next.
+fn incident_done(rest: &[&str], v: &Value) -> String {
+    let id = v["id"].as_str().unwrap_or_default();
+    let state = v["state"].as_str().unwrap_or_default();
+    match rest.first() {
+        Some(&"open") => format!(
+            "Posted {id} ({state}, {}). It's on the status page now. Update it at least hourly:\n  botctl incident update {id} <investigating|identified|monitoring|resolved> \"<text>\"",
+            v["impact"].as_str().unwrap_or_default()
+        ),
+        Some(&"delete") => "Deleted. It's off the status page.".into(),
+        Some(&"edit") => format!("Saved {id} ({}).", v["impact"].as_str().unwrap_or_default()),
+        _ if state == "resolved" => format!("Resolved {id}. Draft its review (docs/support/incident-review.md):\n  botctl incident review {id} --detected <when it was detected> -o review-{id}.md"),
+        _ => format!("Updated {id}: {state}. Next update within the hour."),
+    }
+}
+
+/// `botctl incident review <id> [--detected <time>] [--lead-hours <n>] [--json] [-o <file>]`:
+/// the path, whether to print JSON, and the file to save to.
+fn incident_review_request<'a>(rest: &[&'a str]) -> Result<(String, bool, Option<&'a str>), String> {
+    let usage = || "Usage: botctl incident review <id> [--detected <time>] [--lead-hours <n>] [--json] [-o <file>]".to_string();
+    let (id, flags) = rest.split_first().filter(|(id, _)| !id.starts_with('-')).ok_or_else(usage)?;
+    let (mut query, mut json, mut out) = (Vec::new(), false, None);
+    let mut it = flags.iter();
+    while let Some(flag) = it.next() {
+        match *flag {
+            "--json" | "json" => json = true,
+            "--detected" => query.push(format!("detected={}", encode(it.next().ok_or("--detected needs a time: YYYY-MM-DD, RFC 3339 or unix ms")?))),
+            "--lead-hours" => {
+                let n: u32 = it.next().and_then(|n| n.parse().ok()).ok_or("--lead-hours needs a number of hours (1 to 168)")?;
+                query.push(format!("lead={n}"));
+            }
+            "-o" | "--out" => out = Some(*it.next().ok_or_else(usage)?),
+            _ => return Err(usage()),
+        }
+    }
+    if !json {
+        query.push("format=markdown".into());
+    }
+    let q = if query.is_empty() { String::new() } else { format!("?{}", query.join("&")) };
+    Ok((format!("/api/status/incidents/{}/review{q}", encode(id)), json, out))
+}
+
+/// `botctl incidents`: one line each, open ones first as botd lists them.
+fn incidents_summary(v: &Value) -> String {
+    let list = v["incidents"].as_array().cloned().unwrap_or_default();
+    if list.is_empty() {
+        return "No incidents.".into();
+    }
+    let when = |ms: &Value| ms.as_i64().and_then(chrono::DateTime::from_timestamp_millis).map(|t| t.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default();
+    let mut out = String::new();
+    for i in &list {
+        let resolved = if i["resolvedAt"].is_null() { String::new() } else { format!(", resolved {}", when(&i["resolvedAt"])) };
+        out.push_str(&format!(
+            "  {}  {:<13} {:<11} {} UTC{resolved}  {}\n",
+            i["id"].as_str().unwrap_or_default(),
+            i["state"].as_str().unwrap_or_default(),
+            i["impact"].as_str().unwrap_or_default(),
+            when(&i["createdAt"]),
+            i["title"].as_str().unwrap_or_default()
+        ));
+    }
+    if v["enabled"] == false {
+        out.push_str("The public status page is off (STATUS_PAGE=off): these show once it's on.\n");
+    }
+    out
+}
+
 /// `botctl health-score [--days <n>] [json]`: the path, and whether to print the JSON.
 fn health_request(rest: &[&str]) -> Result<(String, bool), String> {
     health_request_at(rest, "/api/support/health-score", "Usage: botctl health-score [--days <n>] [json]")
@@ -2398,6 +2703,45 @@ mod tests {
     static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn verify_lines_reads_files_dirs_and_stdin_without_botd() {
+        let lines: Vec<String> = audit_line::tests::chain(4).iter().map(|v| v.to_string()).collect();
+        let dir = std::env::temp_dir().join(format!("botctl-verify-lines-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("2026/11")).unwrap();
+        // Out of order, split across files, one as a syslog line, with a copy and noise.
+        std::fs::write(dir.join("2026/11/b.jsonl"), format!("{}\n{}\n", lines[3], lines[1])).unwrap();
+        std::fs::write(dir.join("a.log"), format!("<110>1 2026-11-01T00:00:00Z h superbot - - - {}\nnot an event\n", lines[0])).unwrap();
+        std::fs::write(dir.join("skip.txt"), "ignored by extension").unwrap();
+        let d = dir.to_str().unwrap();
+        let out: Value = serde_json::from_str(&verify_lines(&[d, "-"], format!("{}\n{}\n", lines[2], lines[1]).as_bytes()).unwrap()).unwrap();
+        assert_eq!((out["ok"].clone(), out["files"].clone(), out["ignored"].clone()), (json!(true), json!(3), json!(1)), "{out}");
+        assert_eq!((out["hosts"][0]["events"].clone(), out["hosts"][0]["copies"].clone(), out["hosts"][0]["bound"].clone()), (json!(4), json!(5), json!(5)), "{out}");
+        assert!(out["note"].as_str().unwrap().contains("botctl audit key"), "{out}");
+
+        let mut changed: Value = serde_json::from_str(&lines[2]).unwrap();
+        changed["details"] = json!({ "n": 99 });
+        std::fs::write(dir.join("c.json"), format!("{changed}\n")).unwrap();
+        let err: Value = serde_json::from_str(&verify_lines(&[d], std::io::empty()).unwrap_err()).unwrap();
+        assert_eq!(err["ok"], json!(false), "{err}");
+        assert_eq!(err["hosts"][0]["firstProblems"][0]["at"], json!(format!("{}:1", dir.join("c.json").display())), "{err}");
+
+        assert!(verify_lines(&[], std::io::empty()).unwrap_err().starts_with("Usage"));
+        assert!(verify_lines(&[d, "--key", "zz"], std::io::empty()).is_err());
+        assert!(verify_lines(&[d, "--digests-after", "x"], std::io::empty()).unwrap_err().contains("--digests-after needs"));
+        std::fs::remove_file(dir.join("c.json")).unwrap();
+        let mut bare: Value = serde_json::from_str(&lines[2]).unwrap();
+        bare.as_object_mut().unwrap().remove("chainDigest");
+        bare.as_object_mut().unwrap().remove("chainSalt");
+        let only = dir.join("only.ndjson");
+        std::fs::write(&only, format!("{bare}\n")).unwrap();
+        let o = only.to_str().unwrap();
+        assert!(verify_lines(&[o], std::io::empty()).is_ok(), "alone, nothing says it had a digest");
+        let err: Value = serde_json::from_str(&verify_lines(&[o, "--digests-after", "2"], std::io::empty()).unwrap_err()).unwrap();
+        assert_eq!((err["digestsAfter"].clone(), err["hosts"][0]["firstProblems"][0]["reason"].clone()), (json!(2), json!("unbound")), "{err}");
+        assert!(verify_lines(&[d, "--bogus"], std::io::empty()).unwrap_err().contains("--bogus"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn support_report_reads_a_file_or_stdin_without_botd() {
         let csv = "id,severity,opened,first response\nT-9,2,2026-09-01T10:00:00Z,2026-09-01T10:30:00Z\n";
         let period = ["--plan", "max", "--from", "2026-09", "--to", "2026-09"];
@@ -2413,6 +2757,59 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         assert!(support_report(&["/nonexistent/tickets.csv", "--plan", "pro"], std::io::empty()).unwrap_err().contains("/nonexistent/tickets.csv"));
         assert!(support_report(&[], std::io::empty()).unwrap_err().starts_with("Usage: botctl support-report"));
+    }
+
+    #[test]
+    fn incident_commands_become_status_page_requests() {
+        let body = |r: Result<(&str, String, Option<String>), String>| {
+            let (m, p, b) = r.unwrap();
+            (m.to_string(), p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap()))
+        };
+        assert_eq!(
+            body(incident_request(&["open", "Runs fail", "We're looking.", "--impact", "critical", "--component", "runners", "--component", "api"])),
+            ("POST".into(), "/api/status/incidents".into(), Some(json!({ "title": "Runs fail", "body": "We're looking.", "impact": "critical", "components": ["runners", "api"] })))
+        );
+        assert_eq!(body(incident_request(&["open", "Upgrade", "Back soon.", "--impact", "maintenance", "--state", "identified"])).2.unwrap()["state"], "identified");
+        assert_eq!(
+            body(incident_request(&["update", "inc_a b", "identified", "Found it."])),
+            ("POST".into(), "/api/status/incidents/inc_a%20b/updates".into(), Some(json!({ "state": "identified", "body": "Found it." })))
+        );
+        assert_eq!(body(incident_request(&["resolve", "inc_1", "Fixed."])).2.unwrap(), json!({ "state": "resolved", "body": "Fixed." }));
+        assert_eq!(body(incident_request(&["edit", "inc_1", "--impact", "major", "--title", "Slow runs"])), ("PATCH".into(), "/api/status/incidents/inc_1".into(), Some(json!({ "impact": "major", "title": "Slow runs" }))));
+        assert_eq!(body(incident_request(&["delete", "inc_1", "--yes"])), ("DELETE".into(), "/api/status/incidents/inc_1".into(), None));
+        assert!(incident_request(&["delete", "inc_1"]).unwrap_err().contains("--yes"));
+        for bad in [&["open", "Title only"][..], &["open", "T", "B", "--state"], &["open", "T", "B", "--title", "x"], &["edit", "inc_1"], &["update", "inc_1", "resolved"], &[]] {
+            assert!(incident_request(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_incident_review_is_markdown_unless_asked_for_json() {
+        assert_eq!(incident_review_request(&["inc_1"]), Ok(("/api/status/incidents/inc_1/review?format=markdown".into(), false, None)));
+        assert_eq!(
+            incident_review_request(&["inc_1", "--detected", "2026-11-20T10:00:00+01:00", "--lead-hours", "6", "-o", "r.md"]),
+            Ok(("/api/status/incidents/inc_1/review?detected=2026-11-20T10:00:00%2B01:00&lead=6&format=markdown".into(), false, Some("r.md")))
+        );
+        assert_eq!(incident_review_request(&["inc_1", "--json"]), Ok(("/api/status/incidents/inc_1/review".into(), true, None)));
+        for bad in [&[][..], &["--json"], &["inc_1", "--lead-hours", "many"], &["inc_1", "--detected"], &["inc_1", "-o"], &["inc_1", "--days", "3"]] {
+            assert!(incident_review_request(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn incidents_read_as_one_line_each_and_say_what_comes_next() {
+        let v = json!({ "enabled": false, "incidents": [
+            { "id": "inc_1", "state": "monitoring", "impact": "major", "title": "Slow runs", "createdAt": 1_795_168_800_000_i64, "resolvedAt": null },
+            { "id": "inc_0", "state": "resolved", "impact": "minor", "title": "Mail late", "createdAt": 1_795_168_800_000_i64, "resolvedAt": 1_795_172_400_000_i64 },
+        ] });
+        let s = incidents_summary(&v);
+        assert!(s.contains("inc_1  monitoring    major       2026-11-20 10:00 UTC  Slow runs"), "{s}");
+        assert!(s.contains("resolved 2026-11-20 11:00  Mail late") && s.contains("STATUS_PAGE=off"), "{s}");
+        assert_eq!(incidents_summary(&json!({ "incidents": [] })), "No incidents.");
+        let i = json!({ "id": "inc_1", "state": "resolved", "impact": "major" });
+        assert!(incident_done(&["resolve"], &i).contains("botctl incident review inc_1"));
+        assert!(incident_done(&["open"], &json!({ "id": "inc_1", "state": "investigating", "impact": "major" })).contains("Posted inc_1 (investigating, major)"));
+        assert!(incident_done(&["update"], &json!({ "id": "inc_1", "state": "identified" })).contains("within the hour"));
     }
 
     #[test]
@@ -3101,6 +3498,29 @@ mod tests {
     }
 
     #[test]
+    fn saml_summary_warns_of_certificates_that_are_ending() {
+        let end = 1_900_000_000_000_i64;
+        let mut v = json!({ "provider": "corp", "label": "Corp", "idpEntityId": "https://idp.example/saml", "certificateWarnings": [] });
+        assert!(!saml_summary(&v).contains("Certificate warnings"));
+        v["spKey"] = json!({ "from": "secret", "certificate": { "sha256": "12:34", "subject": "CN=sp", "notAfter": end, "expiry": "expiring", "daysLeft": 1 } });
+        v["idp"] = json!({ "ssoUrl": "https://idp.example/sso", "certificates": [
+            { "sha256": "ab:cd", "subject": "CN=idp", "notAfter": end, "expiry": "expired", "daysLeft": 0 },
+            { "sha256": "ef:01", "subject": "CN=idp", "notAfter": end, "expiry": "ok", "daysLeft": 400 },
+        ] });
+        v["certificateWarnings"] = json!([
+            { "role": "sp_signing", "stage": null, "certificate": "12:34", "notAfter": end, "state": "expiring", "daysLeft": 1, "action": "Make a new key." },
+            { "role": "idp_signing", "stage": null, "certificate": "ab:cd", "notAfter": end, "state": "expired", "daysLeft": 0, "action": "Nothing to do." },
+            { "role": "sp_encryption", "stage": "next", "certificate": "56:78", "notAfter": end, "state": "expiring", "daysLeft": 12, "action": "Replace it." },
+        ]);
+        let out = saml_summary(&v);
+        assert!(out.contains("IdP entity ID:            https://idp.example/saml\n  Certificate warnings:\n    SP signing certificate SHA-256 12:34 expires 2030-03-17 (in 1 day)\n      Make a new key.\n"), "{out}");
+        assert!(out.contains("    IdP signing certificate SHA-256 ab:cd expires 2030-03-17 (expired)\n      Nothing to do.\n"), "{out}");
+        assert!(out.contains("    SP encryption certificate (next key) SHA-256 56:78 expires 2030-03-17 (in 12 days)\n"), "{out}");
+        assert!(out.contains("SP signing certificate:   SHA-256 12:34 (secret), expires 2030-03-17 (in 1 day)\n"), "{out}");
+        assert!(out.contains("    Certificate SHA-256 ab:cd (CN=idp), expires 2030-03-17 (expired)\n    Certificate SHA-256 ef:01 (CN=idp), expires 2030-03-17\n"), "{out}");
+    }
+
+    #[test]
     fn saml_summary_shows_a_key_rollover_and_botctl_drives_it() {
         let cert = |sha: &str| json!({ "sha256": sha, "subject": "CN=sp", "notAfter": 1_900_000_000_000_i64 });
         let mut v = json!({ "provider": "corp", "label": "Corp", "idp": null, "encryptedAssertions": "allow" });
@@ -3218,6 +3638,17 @@ mod tests {
         assert_eq!(req(&["assign", "r1", "ada@example.com"]), Ok(("PUT", "/api/roles/r1/users/ada%40example.com".into(), None)));
         assert_eq!(req(&["assign", "r1", "u1", "--team", "t1"]), Ok(("PUT", "/api/roles/r1/teams/t1/users/u1".into(), None)));
         assert_eq!(req(&["unassign", "r1", "u1"]), Ok(("DELETE", "/api/roles/r1/users/u1".into(), None)));
+        let at = |a: &[&str]| role_request_at(a, 1_000).map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())));
+        assert_eq!(
+            at(&["assign", "r1", "u1", "--for", "8h", "--reason", "Incident 42"]),
+            Ok(("PUT", "/api/roles/r1/users/u1".into(), Some(json!({ "expiresAt": 1_000 + 8 * 3_600_000, "reason": "Incident 42" }))))
+        );
+        assert_eq!(at(&["assign", "r1", "u1", "--team", "t1", "--for", "7d"]), Ok(("PUT", "/api/roles/r1/teams/t1/users/u1".into(), Some(json!({ "expiresAt": 1_000 + 7 * 86_400_000 })))));
+        assert_eq!(req(&["add", "Break glass", "--max-days", "7"]).unwrap().2.unwrap()["maxDays"], 7);
+        assert_eq!(req(&["edit", "r1", "--max-days", "none"]), Ok(("PATCH", "/api/roles/r1".into(), Some(json!({ "maxDays": null })))));
+        for bad in [&["assign", "r1", "u1", "--for", "8"][..], &["assign", "r1", "u1", "--for", "0d"], &["assign", "r1", "u1", "--for", "1w"], &["assign", "r1", "u1", "--for", "é"], &["unassign", "r1", "u1", "--for", "8h"], &["add", "X", "--max-days", "-1"], &["edit", "r1", "--max-days", "week"]] {
+            assert!(req(bad).is_err(), "{bad:?}");
+        }
         assert_eq!(req(&["unassign", "r1", "u1", "--team", "t1"]), Ok(("DELETE", "/api/roles/r1/teams/t1/users/u1".into(), None)));
         for bad in [&["add"][..], &["add", "--base", "member"], &["add", "X", "--perm", "audit.view"], &["add", "X", "--base"], &["edit", "r1"], &["assign", "r1"], &["assign", "r1", "u1", "--org", "x"], &["show"]] {
             assert!(req(bad).is_err(), "{bad:?}");
@@ -3230,6 +3661,8 @@ mod tests {
         assert_eq!(role_assigned("assign", &team), "ada@example.com has Lead in Ops. There it gives: users.manage.");
         assert!(role_assigned("assign", &json!({ "team": { "name": "Ops" }, "user": {}, "role": {}, "applies": [] })).contains("no team permissions"));
         assert_eq!(role_assigned("unassign", &team), "Taken away from ada@example.com in Ops.");
+        let ends = json!({ "user": { "email": "ada@example.com", "role": "readonly" }, "role": { "name": "Auditor", "expiresAt": 1_795_000_000_000i64 } });
+        assert_eq!(role_assigned("assign", &ends), "ada@example.com has Auditor now; their role is readonly. It ends 2026-11-18 11:06 UTC.");
     }
 
     #[test]

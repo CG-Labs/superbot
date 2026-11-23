@@ -24,6 +24,7 @@ mod github;
 pub mod jwt;
 mod provider;
 mod saml;
+pub(crate) mod saml_expiry;
 pub(crate) mod saml_keys;
 pub(crate) mod saml_roles;
 pub(crate) mod saml_slo;
@@ -1512,7 +1513,11 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
     let Kind::SamlSp { entity_id, sp_entity_id, source, attributes, required_groups, sign_requests, sp_cert, encryption, enc_cert, metadata_trust, idp_initiated, authn_context, .. } = &p.kind else {
         return json!({});
     };
-    let cert = |c: &xmldsig::Cert| json!({ "sha256": c.sha256, "subject": c.subject, "notAfter": c.not_after * 1000 });
+    let now = db::now();
+    // Each certificate says whether it's ending (ADR 0198).
+    let cert = |c: &xmldsig::Cert| {
+        json!({ "sha256": c.sha256, "subject": c.subject, "notAfter": c.not_after * 1000, "expiry": saml_expiry::state(c.not_after, now).as_str(), "daysLeft": saml_expiry::days_left(c.not_after, now) })
+    };
     let idp = p.idp_loaded().map(|m| {
         let certs: Vec<Value> = m.certs.iter().map(cert).collect();
         json!({ "entityId": m.entity_id, "ssoUrl": m.sso_url, "sloUrl": m.slo.as_ref().map(|s| &s.location), "certificates": certs, "loadedSecondsAgo": p.idp_age().map(|d| d.as_secs()) })
@@ -1523,7 +1528,6 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
         use saml_keys::Stage;
         let Some(app) = a.app.as_ref().filter(|_| p.sp_cert_for(u).is_none()) else { return };
         let Ok(h) = saml_keys::held(app, p, u) else { return };
-        let now = db::now();
         // From the same keys as the rest, should a promotion land between the two reads.
         v["certificate"] = cert(&h.current.info);
         v["next"] = saml_keys::view(&h, u, Stage::Next, now, cert);
@@ -1571,6 +1575,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
         "roleMappings": a.app.as_ref().map(|app| app.db.saml_role_mappings_of(&p.id).len()),
         "idpInitiated": idp_initiated.as_str(),
         "authnContext": authn_context.as_ref().map(|c| json!({ "required": c.accepted, "methodsAttribute": attributes.authn_methods, "requested": c.request })),
+        "certificateWarnings": a.app.as_ref().map_or_else(Vec::new, |app| saml_expiry::warnings(app, p, now)),
     })
 }
 

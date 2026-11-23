@@ -124,6 +124,9 @@
               <option value="readonly">Read-only</option>
             </select>
           </label>
+          <label title="Time-bound (ADR 0197): given only by hand, with an end at most this many days away. Never to SCIM or SAML groups or service accounts.">Time limit
+            <input id="role-max-days" type="number" min="1" max="365" step="1" placeholder="None" />
+          </label>
         </div>
         <div class="bar"><input id="role-description" class="wide" placeholder="What it's for (optional)" maxlength="500" /></div>
         <div class="perms" id="role-perms"></div>

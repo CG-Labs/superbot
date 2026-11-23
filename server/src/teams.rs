@@ -207,7 +207,7 @@ fn member_view(app: &AppState, m: &TeamMember, machines: bool) -> Value {
     let mut v = json!({
         "id": m.user_id, "name": u.as_ref().map(|u| u.name.clone()), "email": u.as_ref().and_then(|u| u.email.clone()),
         "role": m.role, "joinedAt": m.joined_at, "active": u.as_ref().is_some_and(User::active),
-        "customRole": crate::roles::summary(app, m.role_id.as_deref()),
+        "customRole": crate::roles::held(app, m.role_id.as_deref(), m.role_expires_at),
     });
     if machines {
         v["machine"] = machine_view(app, &m.team_id, &m.user_id);
@@ -727,7 +727,7 @@ pub async fn mine(State(app): State<AppState>, Extension(c): Extension<Caller>) 
     if v.get("billing").is_some() {
         v["billing"]["canChange"] = json!(sight.billing && c.can(Perm::Write));
     }
-    v["customRole"] = crate::roles::summary(&app, m.role_id.as_deref());
+    v["customRole"] = crate::roles::held(&app, m.role_id.as_deref(), m.role_expires_at);
     v["permissions"] = json!(team_perms(&app.db, &m).names());
     Ok(Json(v))
 }

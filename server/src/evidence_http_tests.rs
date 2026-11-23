@@ -140,6 +140,10 @@ async fn each_file_carries_its_controls_evidence() {
     app.db.record(&Event::new(Actor::system("signin-watch"), "auth.suspicious_sign_in").outcome(Outcome::Denied).details(json!({ "pattern": "burst_ip", "failures": 12 })));
     let sa = crate::service_accounts_http_tests::account(port, &admin, json!({ "name": "Nightly export", "description": "Free text" })).await;
     let _ = crate::service_accounts_http_tests::token(port, &admin, &sa, json!({ "name": "Cron job", "scopes": ["read"] })).await;
+    let auditor = crate::service_accounts_http_tests::role(port, &admin, "Auditor", "readonly", &["audit.view"]).await;
+    let ends = crate::db::now() + crate::roles::DAY;
+    let (code, body) = call(port, "PUT", &format!("/api/roles/{auditor}/users/{plain_id}"), &admin, &json!({ "expiresAt": ends }).to_string()).await;
+    assert_eq!(code, 200, "{body}");
     let (code, body) = call(port, "GET", "/api/access-review", &admin, "").await;
     assert_eq!(code, 200, "{body}");
     let digest = parse(&body)["digest"].as_str().unwrap().to_string();
@@ -155,6 +159,8 @@ async fn each_file_carries_its_controls_evidence() {
     let person = |id: &str| people.iter().find(|p| p["id"] == id).cloned().expect("everyone who can sign in is listed");
     assert_eq!((person(&enrolled)["role"].as_str(), person(&enrolled)["mfa"]["enabled"].as_bool()), (Some("member"), Some(true)));
     assert_eq!((person(&plain_id)["role"].as_str(), person(&plain_id)["mfa"]["enabled"].as_bool()), (Some("readonly"), Some(false)));
+    assert_eq!(person(&plain_id)["customRole"], json!({ "id": auditor, "permissions": ["audit.view"], "expiresAt": ends }), "when a role ends (ADR 0197)");
+    assert!(person(&enrolled)["customRole"].is_null());
     assert_eq!((person(users::OPERATOR)["admin"].as_bool(), person(users::OPERATOR)["breakGlass"].as_bool()), (Some(true), Some(true)));
     assert_eq!(access["summary"]["people"].as_u64(), Some(people.len() as u64));
     assert_eq!(access["reviewsSignedOffInPeriod"], 1);
