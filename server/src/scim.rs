@@ -10,6 +10,7 @@
 //! docs/adr/0138-scim-group-role-mapping.md.
 
 pub mod bulk;
+pub mod google;
 pub mod groups;
 pub mod roles;
 
@@ -64,6 +65,8 @@ pub struct Scim {
     pub group_roles: bool,
     /// One group write at a time, so what a request checked still holds when it writes.
     pub group_writes: tokio::sync::Mutex<()>,
+    /// GOOGLE_DIRECTORY_SYNC=on: Google Workspace's directory, read into one tenant (ADR 0162).
+    pub google: Option<Arc<google::Directory>>,
 }
 
 impl Default for Scim {
@@ -76,6 +79,7 @@ impl Default for Scim {
             groups: false,
             group_roles: false,
             group_writes: tokio::sync::Mutex::new(()),
+            google: None,
         }
     }
 }
@@ -1040,6 +1044,9 @@ pub async fn list_tokens(State(app): State<AppState>, Extension(a): Extension<Ar
 /// good. The token is returned once; only its hash is kept.
 pub async fn create_token(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<Response> {
     let tenant = tenant_name(&v["tenant"])?;
+    if a.scim.google.as_ref().is_some_and(|g| g.settings.tenant == tenant) {
+        return Err(ApiError(StatusCode::CONFLICT, format!("Tenant {tenant} is the Google Workspace sync's (GOOGLE_DIRECTORY_TENANT), and it must be its only writer. Use another tenant name.")));
+    }
     let label = users::clean_label(&v["label"]);
     let sso = match &v["sso"] {
         Value::Null => None,
