@@ -61,7 +61,7 @@ Vulnerabilities from any source (CI scans, reports under [`SECURITY.md`](../../.
 | Critical, High | 30 days |
 | Medium, Low | 90 days |
 
-These match `SECURITY.md`. CI already fails on fixable Critical image findings and on High npm advisories, and accepted findings are listed with their reasons ([ADR 0092](../../adr/0092-dependency-vulnerability-scanning.md), [ADR 0101](../../adr/0101-image-scanning-and-signing.md), [ADR 0115](../../adr/0115-client-markdown-renderer-and-npm-audit-at-high.md)). One that is being exploited is an incident ([incident response plan](incident-response.md)). Overdue items go to the quarterly management review.
+These match `SECURITY.md`. CI already fails on fixable Critical image findings and on High npm advisories, and accepted findings are listed with their reasons ([ADR 0092](../../adr/0092-dependency-vulnerability-scanning.md), [ADR 0101](../../adr/0101-image-scanning-and-signing.md), [ADR 0115](../../adr/0115-client-markdown-renderer-and-npm-audit-at-high.md)). One that is being exploited is an incident ([incident response plan](incident-response.md)). Overdue items go to the quarterly management review; each month's [vulnerability bundle](../soc2-evidence-plan.md#the-vulnerability-bundle) lists the scan findings closed late or overdue against these windows.
 
 ## People
 

@@ -1,0 +1,72 @@
+[
+  {
+    "number": 11,
+    "state": "fixed",
+    "created_at": "2026-10-05T00:00:00Z",
+    "updated_at": "2026-10-06T00:00:00Z",
+    "html_url": "https://github.com/example-org/example-repo/security/code-scanning/11",
+    "fixed_at": "2026-10-06T00:00:00Z",
+    "dismissed_at": null,
+    "dismissed_by": null,
+    "dismissed_reason": null,
+    "dismissed_comment": null,
+    "rule": {
+      "id": "CVE-2026-10011",
+      "severity": "error",
+      "security_severity_level": "critical",
+      "description": "Rule description never kept",
+      "full_description": "Full description never kept"
+    },
+    "tool": {
+      "name": "Grype",
+      "version": "0.90.0"
+    },
+    "most_recent_instance": {
+      "ref": "refs/heads/main",
+      "state": "fixed",
+      "category": "image-scan-botd",
+      "location": {
+        "path": "/usr/lib/libexample.so"
+      },
+      "message": {
+        "text": "Alert message never kept"
+      }
+    }
+  },
+  {
+    "number": 12,
+    "state": "dismissed",
+    "created_at": "2026-10-07T00:00:00Z",
+    "updated_at": "2026-10-08T00:00:00Z",
+    "html_url": "https://github.com/example-org/example-repo/security/code-scanning/12",
+    "fixed_at": null,
+    "dismissed_at": "2026-10-08T00:00:00Z",
+    "dismissed_by": {
+      "login": "maintainer-m"
+    },
+    "dismissed_reason": null,
+    "dismissed_comment": "Code scanning comment never kept",
+    "rule": {
+      "id": "CVE-2026-10012",
+      "severity": "warning",
+      "security_severity_level": null,
+      "description": "Rule description never kept",
+      "full_description": "Full description never kept"
+    },
+    "tool": {
+      "name": "Grype",
+      "version": "0.90.0"
+    },
+    "most_recent_instance": {
+      "ref": "refs/heads/main",
+      "state": "dismissed",
+      "category": "image-scan-botd",
+      "location": {
+        "path": "/usr/lib/libexample.so"
+      },
+      "message": {
+        "text": "Alert message never kept"
+      }
+    }
+  }
+]

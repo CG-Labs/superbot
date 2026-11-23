@@ -26,7 +26,7 @@ What they said they wanted at kickoff or the last review, in their words, and wh
 | Health score and band | | | |
 | Signals at watch or at risk | | | |
 
-Take the scores from the health checks' records. For the quarter as a whole, `botctl health-score --days 90` on the server (or ask the customer's admin for its output).
+Take the scores from the health checks' records. For the quarter as a whole, `botctl health-score --days 90` on the server, and `botctl health-score history --days 90` for how it moved day by day (or ask the customer's admin for their output).
 
 For each signal at watch or at risk this quarter: what it was, what was done, and whether it's fixed.
 

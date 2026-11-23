@@ -71,11 +71,11 @@ on GitHub: download the ones kept as evidence from each run's url.
 
 // Time
 
-fn ms(v: &Value) -> Option<i64> {
+pub fn ms(v: &Value) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(v.as_str()?).ok().map(|t| t.timestamp_millis())
 }
 
-fn rfc3339(ms: i64) -> String {
+pub fn rfc3339(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms).map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_default()
 }
 
@@ -83,18 +83,18 @@ fn in_period(p: &Period, v: &Value) -> bool {
     ms(v).is_some_and(|t| t >= p.start_ms() && t < p.end_ms())
 }
 
-fn enc(s: &str) -> String {
+pub fn enc(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
-fn login(v: &Value) -> Value {
+pub fn login(v: &Value) -> Value {
     v["login"].as_str().map_or(Value::Null, |s| json!(s))
 }
 
 // Reading GitHub
 
 /// Every item of a listing, page by page: the body itself, or its `key` array.
-fn all(api: &mut dyn Api, first: &str, key: Option<&str>) -> Result<Vec<Value>, Failure> {
+pub fn all(api: &mut dyn Api, first: &str, key: Option<&str>) -> Result<Vec<Value>, Failure> {
     let (mut out, mut url) = (Vec::new(), first.to_string());
     for _ in 0..MAX_PAGES {
         let r = api.get(&url)?;
@@ -739,7 +739,7 @@ fn workflow_runs(c: &Collected) -> Value {
     })
 }
 
-fn json_file(v: &Value) -> Vec<u8> {
+pub fn json_file(v: &Value) -> Vec<u8> {
     let mut s = serde_json::to_string_pretty(v).unwrap_or_default();
     s.push('\n');
     s.into_bytes()

@@ -57,6 +57,9 @@ you send it: every file is plain text.
                       license, approvals waiting, runs, machines, database and backups
   health-score.json   the customer health score for the last 30 days and the signals
                       behind it: counts and reason codes only
+  health-score-history.json
+                      the score botd recorded each day for the last 90 days, with
+                      its band and each signal's status
   logs.jsonl          the newest lines botd logged since it started (at most 2,000)
   audit-summary.json  the last 7 days of the audit log, counted by action and outcome,
                       and the newest failures and denials (no names, emails or addresses)
@@ -448,6 +451,7 @@ pub fn build(app: &App, vars: &[(String, String)], setup: Value, now_ms: i64) ->
         ("config.json", json_file(config, &names)),
         ("health.json", json_file(health(app, setup, now_ms), &names)),
         ("health-score.json", json_file(crate::health_score::build(app, now_ms, crate::health_score::DEFAULT_DAYS), &names)),
+        ("health-score-history.json", json_file(crate::health_history::history(app, now_ms, crate::health_history::DEFAULT_DAYS).unwrap_or_else(|e| json!({ "error": e.to_string() })), &names)),
         ("logs.jsonl", redact::text(&logs).into_owned().into_bytes()),
         ("audit-summary.json", json_file(audit, &names)),
     ];

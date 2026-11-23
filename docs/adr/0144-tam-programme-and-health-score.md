@@ -61,7 +61,7 @@ The score needs two things botd didn't keep:
 
 It isn't in the RBAC table, so it takes the default for unlisted routes: admins only, as the support bundle. It isn't audited: it's a read of aggregate counts, like usage. `botctl health-score [--days <n>] [json]` calls it with the operator's credentials and prints one line per signal, then which signals to look at and where the playbook is.
 
-No history is stored: botd doesn't keep past scores. A TAM records each check's score in the customer's record. Storing scores would add a table, a retention question and a background job for something a monthly note does well enough.
+No history is stored: botd doesn't keep past scores (since [ADR 0157](0157-health-score-history-and-console.md), it keeps each day's score and signal statuses). A TAM records each check's score in the customer's record. Storing scores would add a table, a retention question and a background job for something a monthly note does well enough.
 
 ### In the support bundle
 
