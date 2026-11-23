@@ -145,17 +145,28 @@ fn stored(name: &str, v: Sql) -> Sql {
 /// Rows get in no other way: a trigger refuses one without a seal. Outside a
 /// transaction it takes the write lock first, so two writers can't fork the chain.
 pub fn insert(c: &Connection, cols: &[(&str, Sql)]) -> rusqlite::Result<i64> {
+    insert_with(c, cols, |_, _, _| Ok(None))
+}
+
+/// [`insert`], with `details` replaced by what `hook` makes from the new row's id and
+/// the head it seals onto (None for a log that never had a row), if it makes anything.
+/// The hook runs inside the write lock and the same transaction, so what it writes
+/// stands or falls with the row, and nothing else can be sealed in between.
+pub fn insert_with(c: &Connection, cols: &[(&str, Sql)], hook: impl FnOnce(&Connection, i64, Option<&Link>) -> rusqlite::Result<Option<Value>>) -> rusqlite::Result<i64> {
     let tx = if c.is_autocommit() { Some(rusqlite::Transaction::new_unchecked(c, TransactionBehavior::Immediate)?) } else { None };
     let last: Option<(i64, Option<String>)> =
         c.query_row("SELECT id, chain_hash FROM audit_events ORDER BY id DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
     let seq: i64 = c.query_row("SELECT coalesce((SELECT seq FROM sqlite_sequence WHERE name = 'audit_events'), 0)", [], |r| r.get(0))?;
     let id = seq.max(last.as_ref().map_or(0, |l| l.0)) + 1;
-    let prev = match last {
-        Some((_, Some(h))) => h,
-        _ => anchor(c)?.map_or_else(|| GENESIS.to_string(), |a| a.hash),
+    let head = match last {
+        Some((id, Some(h))) => Some(Link { id, hash: h }),
+        _ => anchor(c)?,
     };
+    let prev = head.as_ref().map_or_else(|| GENESIS.to_string(), |h| h.hash.clone());
+    let made = hook(c, id, head.as_ref())?.map(|v| Sql::Text(v.to_string()));
     let get = |name: &str| -> Sql {
         match cols.iter().find(|(k, _)| *k == name) {
+            _ if name == "details" && made.is_some() => made.clone().unwrap_or(Sql::Null),
             Some((_, v)) => stored(name, v.clone()),
             None if name == "details" => Sql::Text("{}".into()),
             None => Sql::Null,
@@ -283,8 +294,10 @@ pub fn seal_existing(c: &Connection) -> rusqlite::Result<(usize, i64)> {
 /// The first row that breaks the chain, and why: `unsealed` (no seal), `link` (its
 /// link to the row before doesn't match: a row before it was removed, added or
 /// changed), `contents` (the row itself changed), `erased` (its salt is gone but no
-/// erasure names it, so its erasable fields can't be checked), or `pin` (it differs
-/// from, or lacks, a hash pinned from a copy kept elsewhere).
+/// erasure names it, so its erasable fields can't be checked), `pin` (it differs
+/// from, or lacks, a hash pinned from a copy kept elsewhere), `checkpoint` (a signed
+/// checkpoint there doesn't hold: see the report's `checkpoints`) or `timestamp` (its
+/// RFC 3161 token doesn't, ADR 0149).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Broken {
     pub id: i64,
@@ -296,9 +309,27 @@ pub struct Broken {
 pub struct Pinned {
     pub id: i64,
     pub hash: String,
-    /// `match`, `mismatch`, `gone` (pruned by retention since) or `missing` (not there,
-    /// and newer than anything retention deleted: a failure).
+    /// `match`, `mismatch`, `gone` (pruned by retention since), `missing` (not there,
+    /// and newer than anything retention deleted: a failure) or `outside` (not in the
+    /// range checked).
     pub result: &'static str,
+}
+
+/// The ids a check is limited to, both inclusive.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct Range {
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+}
+
+impl Range {
+    pub fn is_set(&self) -> bool {
+        self.from.is_some() || self.to.is_some()
+    }
+
+    fn contains(&self, id: i64) -> bool {
+        self.from.is_none_or(|f| id >= f) && self.to.is_none_or(|t| id <= t)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -318,6 +349,13 @@ pub struct Report {
     /// The last pruned row, which the first row left must link to.
     pub anchor: Option<Link>,
     pub pins: Vec<Pinned>,
+    /// The ids checked, when not the whole log. A range that starts after the first row
+    /// takes that row's link as stored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<Range>,
+    /// The signed checkpoints, and their timestamps, on the part of the chain walked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoints: Option<crate::audit_checkpoint::Checked>,
     /// Set when the log couldn't be read to the end; the check then fails.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -333,18 +371,72 @@ impl Report {
     }
 }
 
+/// A row's action, as the chain stores it.
+pub fn action(r: &Row) -> Option<&str> {
+    match r.fixed.get(3) {
+        Some(Sql::Text(a)) => Some(a),
+        _ => None,
+    }
+}
+
+/// A row's details, parsed.
+pub fn details(r: &Row) -> Option<Value> {
+    let i = ERASABLE.iter().position(|c| *c == "details")?;
+    match r.erasable.get(i) {
+        Some(Sql::Text(d)) => serde_json::from_str(d).ok(),
+        _ => None,
+    }
+}
+
 /// Walks the chain one row at a time, oldest first.
-pub struct Verifier {
+pub struct Verifier<'a> {
     report: Report,
     expected: Option<String>,
+    /// The row before the next one (the anchor, or 0, before the first): a checkpoint must
+    /// name it. None when unknown, as a range that starts inside the log is.
+    before: Option<i64>,
+    last: Option<i64>,
     pins: Vec<(Link, Option<&'static str>)>,
     /// Erased rows not yet named by an `audit.erased` event after them.
     unexplained: std::collections::BTreeSet<i64>,
+    /// The first row's link is taken as stored: the check starts after the log's start.
+    inside: bool,
+    range: Range,
+    checks: Option<crate::audit_checkpoint::Checker<'a>>,
 }
 
-impl Verifier {
-    pub fn new(anchor: Option<Link>, pins: Vec<Link>) -> Verifier {
-        Verifier { report: Report { anchor, ..Default::default() }, expected: None, pins: pins.into_iter().map(|p| (p, None)).collect(), unexplained: Default::default() }
+impl<'a> Verifier<'a> {
+    pub fn new(anchor: Option<Link>, pins: Vec<Link>) -> Verifier<'a> {
+        Verifier {
+            before: Some(anchor.as_ref().map_or(0, |a| a.id)),
+            report: Report { anchor, ..Default::default() },
+            expected: None,
+            last: None,
+            pins: pins.into_iter().map(|p| (p, None)).collect(),
+            unexplained: Default::default(),
+            inside: false,
+            range: Range::default(),
+            checks: None,
+        }
+    }
+
+    /// Checks signed checkpoints and their timestamps as it walks.
+    pub fn checking(mut self, c: crate::audit_checkpoint::Checker<'a>) -> Verifier<'a> {
+        self.checks = Some(c);
+        self
+    }
+
+    /// Limits the check to `range`; `inside`: rows come before the first one fed.
+    pub fn within(mut self, range: Range, inside: bool) -> Verifier<'a> {
+        self.range = range;
+        self.inside = inside;
+        if inside {
+            self.before = None;
+        }
+        if range.is_set() {
+            self.report.range = Some(range);
+        }
+        self
     }
 
     pub fn feed(&mut self, r: &Row) {
@@ -354,7 +446,11 @@ impl Verifier {
             Some(e) => e,
             None => {
                 rep.first = Some(r.id);
-                rep.anchor.as_ref().map_or_else(|| GENESIS.to_string(), |a| a.hash.clone())
+                match (&rep.anchor, self.inside) {
+                    (_, true) => r.prev.clone().unwrap_or_default(),
+                    (Some(a), false) => a.hash.clone(),
+                    (None, false) => GENESIS.to_string(),
+                }
             }
         };
         let reason = match (&r.prev, &r.hash, &r.digest) {
@@ -372,6 +468,9 @@ impl Verifier {
             }
             _ => Some("unsealed"),
         };
+        // A checkpoint is judged only on a row the chain holds: a changed one is named already.
+        let before = self.before;
+        let reason = reason.or_else(|| self.checks.as_mut().and_then(|c| c.feed(r, before)));
         let mut pinned_wrong = false;
         for (pin, result) in self.pins.iter_mut().filter(|(p, _)| p.id == r.id) {
             let same = r.hash.as_deref() == Some(pin.hash.as_str());
@@ -383,7 +482,7 @@ impl Verifier {
             self.report.broke(r.id, reason);
         } else if r.salt.is_none() {
             self.unexplained.insert(r.id);
-        } else if r.fixed.get(3) == Some(&Sql::Text(ERASED.into())) {
+        } else if action(r) == Some(ERASED) {
             // Only with its salt are the rows it names checked: an erasure event never
             // loses its salt, so one without could name anything, itself included.
             self.explain(r);
@@ -392,13 +491,13 @@ impl Verifier {
             self.report.head = Some(Link { id: r.id, hash: h.clone() });
         }
         self.expected = Some(r.hash.clone().unwrap_or(expected));
+        self.before = Some(r.id);
+        self.last = Some(r.id);
     }
 
     /// An intact `audit.erased` row: the erased rows it names are accounted for.
     fn explain(&mut self, r: &Row) {
-        let details = ERASABLE.iter().position(|c| *c == "details").and_then(|i| r.erasable.get(i));
-        let Some(Sql::Text(details)) = details else { return };
-        let Ok(v) = serde_json::from_str::<Value>(details) else { return };
+        let Some(v) = details(r) else { return };
         for range in v["rows"].as_array().into_iter().flatten() {
             let (Some(a), Some(b)) = (range[0].as_i64(), range[1].as_i64()) else { continue };
             if a > b {
@@ -411,6 +510,28 @@ impl Verifier {
         }
     }
 
+    pub fn has_unexplained(&self) -> bool {
+        !self.unexplained.is_empty()
+    }
+
+    /// Carries the walk on past the range's end, to the head: erased rows in the range wait
+    /// for an `audit.erased` after it, which counts only as part of a chain checked to the
+    /// head (a rewritten one would hold on its own). The report says how far it went.
+    pub fn extend(&mut self) {
+        self.range.to = None;
+        self.report.range = self.range.is_set().then_some(self.range);
+    }
+
+    /// Checkpoint records kept beside the rows from `lo` to `hi`; `pruned`: the anchor's id.
+    pub fn recorded(&mut self, rows: &[crate::audit_checkpoint::Recorded], lo: i64, hi: i64, pruned: Option<i64>) {
+        let last = self.last;
+        if let Some(c) = self.checks.as_mut() {
+            for (id, reason) in c.recorded(rows, lo, hi, last, pruned) {
+                self.report.broke(id, reason);
+            }
+        }
+    }
+
     /// The log couldn't be read past here.
     pub fn fail(&mut self, error: String) {
         self.report.error = Some(error);
@@ -418,11 +539,13 @@ impl Verifier {
 
     pub fn finish(mut self) -> Report {
         let rep = &mut self.report;
+        rep.checkpoints = self.checks.take().map(|c| c.finish());
         for id in std::mem::take(&mut self.unexplained) {
             rep.broke(id, "erased");
         }
         for (p, result) in self.pins {
             let result = result.unwrap_or_else(|| match &rep.anchor {
+                _ if !self.range.contains(p.id) => "outside",
                 // The last pruned row is gone, but its hash is kept as the anchor.
                 Some(a) if a.id == p.id && a.hash == p.hash => "match",
                 Some(a) if a.id == p.id => {
@@ -443,14 +566,33 @@ impl Verifier {
     }
 }
 
-/// Checks the whole chain, a batch at a time, so other writers aren't held up long.
+/// What a check holds the chain to besides itself.
+#[derive(Clone, Debug, Default)]
+pub struct Options {
+    /// Hashes kept elsewhere, by id.
+    pub pins: Vec<Link>,
+    pub range: Range,
+    /// The checkpoint keys to trust (Ed25519 public keys). None: botd's own, now and before.
+    pub keys: Option<Vec<Vec<u8>>>,
+    /// What a checkpoint's RFC 3161 token must chain to (`AUDIT_TIMESTAMP_CA_FILE`).
+    pub trust: crate::tsa::Trust,
+}
+
+/// Checks the whole chain, with its checkpoints, against `pins`.
+#[cfg(test)]
+pub fn verify(db: &Db, pins: Vec<Link>) -> Report {
+    verify_with(db, &Options { pins, ..Default::default() })
+}
+
+/// Checks the chain, a batch at a time, so other writers aren't held up long.
 /// Retention may prune between batches and move the anchor; a check that fails then is
 /// run again, so pruning never looks like tampering.
-pub fn verify(db: &Db, pins: Vec<Link>) -> Report {
+pub fn verify_with(db: &Db, o: &Options) -> Report {
+    let keys = o.keys.clone().unwrap_or_else(|| crate::audit_checkpoint::trusted_keys(db));
     let mut tries = 0;
     loop {
         let anchor = db.audit_chain_anchor();
-        let r = walk(db, anchor.clone(), pins.clone());
+        let r = walk(db, anchor.clone(), o, &keys);
         tries += 1;
         if r.ok || tries == 3 || db.audit_chain_anchor() == anchor {
             return r;
@@ -458,10 +600,17 @@ pub fn verify(db: &Db, pins: Vec<Link>) -> Report {
     }
 }
 
-fn walk(db: &Db, anchor: Option<Link>, pins: Vec<Link>) -> Report {
-    let mut v = Verifier::new(anchor, pins);
-    let mut after = i64::MIN;
-    loop {
+fn walk(db: &Db, anchor: Option<Link>, o: &Options, keys: &[Vec<u8>]) -> Report {
+    let range = o.range;
+    // Starting after the log's first row, that row's link can't be checked.
+    let inside = range.from.is_some_and(|f| db.audit_chain_rows(i64::MIN, 1).ok().and_then(|r| r.first().map(|r| r.id)).is_some_and(|first| first < f));
+    let lookup = |id: i64| db.with_conn(|c| crate::audit_checkpoint::row(c, id).ok().flatten());
+    let checker = crate::audit_checkpoint::Checker::new(keys.to_vec(), &o.trust, Box::new(lookup));
+    let pruned = anchor.as_ref().map(|a| a.id);
+    let mut v = Verifier::new(anchor, o.pins.clone()).within(range, inside).checking(checker);
+    let mut after = range.from.map_or(i64::MIN, |f| f.saturating_sub(1));
+    let mut to = range.to;
+    'rows: loop {
         let rows = match db.audit_chain_rows(after, BATCH) {
             Ok(rows) => rows,
             Err(e) => {
@@ -472,18 +621,30 @@ fn walk(db: &Db, anchor: Option<Link>, pins: Vec<Link>) -> Report {
         let Some(last) = rows.last() else { break };
         after = last.id;
         for r in &rows {
+            if to.is_some_and(|t| r.id > t) {
+                if !v.has_unexplained() {
+                    break 'rows;
+                }
+                to = None;
+                v.extend();
+            }
             v.feed(r);
         }
         if (rows.len() as i64) < BATCH {
             break;
         }
     }
+    let (lo, hi) = (range.from.unwrap_or(i64::MIN), to.unwrap_or(i64::MAX));
+    match db.with_conn(|c| crate::audit_checkpoint::recorded(c, lo, hi)) {
+        Ok(rows) => v.recorded(&rows, lo, hi, pruned),
+        Err(e) => v.fail(format!("couldn't read the audit checkpoints: {e}")),
+    }
     v.finish()
 }
 
 /// What `audit.verified` records: the result and the head, never row contents. A failed
-/// check's `reason` is a code (`contents`, `link`, `pin`, `unreadable`, ...), which the
-/// support bundle shows.
+/// check's `reason` is a code (`contents`, `link`, `pin`, `checkpoint`, `timestamp`,
+/// `unreadable`, ...), which the support bundle shows.
 pub fn summary(r: &Report) -> Value {
     let reason = match (&r.first_broken, &r.error) {
         _ if r.ok => None,
@@ -491,7 +652,10 @@ pub fn summary(r: &Report) -> Value {
         (None, Some(_)) => Some("unreadable"),
         (None, None) => Some("broken"),
     };
-    json!({ "ok": r.ok, "reason": reason, "checked": r.checked, "erased": r.erased, "broken": r.broken, "firstBroken": r.first_broken, "head": r.head, "anchor": r.anchor, "pins": r.pins, "error": r.error })
+    json!({
+        "ok": r.ok, "reason": reason, "checked": r.checked, "erased": r.erased, "broken": r.broken, "firstBroken": r.first_broken,
+        "head": r.head, "anchor": r.anchor, "pins": r.pins, "range": r.range, "checkpoints": r.checkpoints, "error": r.error,
+    })
 }
 
 /// Checks the chain once a day and records `audit.verified` with the head's hash: a
@@ -501,7 +665,8 @@ pub fn start(app: Arc<App>) {
         tokio::time::sleep(Duration::from_secs(60)).await;
         loop {
             let a = app.clone();
-            if let Ok(r) = tokio::task::spawn_blocking(move || verify(&a.db, Vec::new())).await {
+            let o = Options { trust: crate::audit_checkpoint::trust(&app), ..Default::default() };
+            if let Ok(r) = tokio::task::spawn_blocking(move || verify_with(&a.db, &o)).await {
                 checked(&app, &crate::audit::Who::system("audit"), &r);
             }
             tokio::time::sleep(CHECK_EVERY).await;
@@ -522,21 +687,49 @@ pub fn checked(app: &App, by: &crate::audit::Who, r: &Report) {
     app.db.record(&by.event("audit.verified").target("audit", "chain").outcome(outcome).details(summary(r)));
 }
 
-/// `GET /api/audit/verify[?pin=<id>:<hash>,...]`: checks the chain, and each pinned
-/// hash, from a SIEM or an earlier check, against the row there now. `pin` may repeat;
-/// every one is checked. Admins only.
+/// The options `GET /api/audit/verify` takes: `pin=<id>:<hash>` (repeatable, or split by
+/// commas; at most 100), `from=<id>` and `to=<id>`, and `key=<hex>` (repeatable; at most
+/// 10): the checkpoint keys to trust instead of botd's own.
+pub fn options(q: &[(String, String)]) -> Result<Options, String> {
+    fn all<'q>(q: &'q [(String, String)], name: &'q str) -> impl Iterator<Item = &'q str> {
+        q.iter().filter(move |(k, _)| k == name).flat_map(|(_, v)| v.split(',')).map(str::trim).filter(|s| !s.is_empty())
+    }
+    let pins: Vec<Link> = all(q, "pin").map(Link::parse).collect::<Result<_, _>>()?;
+    if pins.len() > 100 {
+        return Err("At most 100 pins".into());
+    }
+    let id = |name: &str| -> Result<Option<i64>, String> {
+        match all(q, name).collect::<Vec<_>>().as_slice() {
+            [] => Ok(None),
+            [v] => v.parse::<i64>().map(Some).map_err(|_| format!("{name} is an event id, not \"{v}\"")),
+            _ => Err(format!("{name} once at most")),
+        }
+    };
+    let range = Range { from: id("from")?, to: id("to")? };
+    if let (Some(f), Some(t)) = (range.from, range.to) {
+        if f > t {
+            return Err("from is after to".into());
+        }
+    }
+    let keys: Vec<Vec<u8>> = all(q, "key").map(crate::audit_checkpoint::parse_public_key).collect::<Result<_, _>>()?;
+    if keys.len() > 10 {
+        return Err("At most 10 keys".into());
+    }
+    Ok(Options { pins, range, keys: (!keys.is_empty()).then_some(keys), trust: Default::default() })
+}
+
+/// `GET /api/audit/verify[?pin=<id>:<hash>&from=<id>&to=<id>&key=<hex>]`: checks the
+/// chain, each pinned hash, from a SIEM or an earlier check, against the row there now,
+/// and every signed checkpoint and timestamp token on the way. Admins only.
 pub async fn get(
     axum::extract::State(app): axum::extract::State<Arc<App>>,
     axum::Extension(by): axum::Extension<crate::audit::Who>,
     axum::extract::Query(q): axum::extract::Query<Vec<(String, String)>>,
 ) -> Result<axum::Json<Report>, (axum::http::StatusCode, String)> {
-    let bad = |m: String| (axum::http::StatusCode::BAD_REQUEST, m);
-    let pins: Vec<Link> = q.iter().filter(|(k, _)| k == "pin").flat_map(|(_, p)| p.split(',')).filter(|s| !s.trim().is_empty()).map(Link::parse).collect::<Result<_, _>>().map_err(bad)?;
-    if pins.len() > 100 {
-        return Err(bad("At most 100 pins".into()));
-    }
+    let mut o = options(&q).map_err(|m| (axum::http::StatusCode::BAD_REQUEST, m))?;
+    o.trust = crate::audit_checkpoint::trust(&app);
     let a = app.clone();
-    let r = tokio::task::spawn_blocking(move || verify(&a.db, pins)).await.map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let r = tokio::task::spawn_blocking(move || verify_with(&a.db, &o)).await.map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     checked(&app, &by, &r);
     Ok(axum::Json(r))
 }

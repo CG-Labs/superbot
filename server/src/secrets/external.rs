@@ -1,6 +1,6 @@
 //! Secrets kept in an external secrets manager: HashiCorp Vault (`vault`, ADR 0125),
-//! Azure Key Vault (`azure-keyvault`) and GCP Secret Manager (`gcp-secret-manager`,
-//! ADR 0136). Each is a `Provider`; the `ExternalStore` around it is the `SecretStore`
+//! Azure Key Vault (`azure-keyvault`), GCP Secret Manager (`gcp-secret-manager`,
+//! ADR 0136) and AWS Secrets Manager (`aws`, ADR 0146). Each is a `Provider`; the `ExternalStore` around it is the `SecretStore`
 //! botd asks, and does the rest the same way for all of them:
 //!
 //! - Two folders: `bots` holds the server-wide secrets Bots get, `server` holds botd's
@@ -298,7 +298,7 @@ pub fn cache_ttl(raw: &str) -> Result<Duration, String> {
 }
 
 /// `SECRETS_BACKEND`: `local` (the default: the environment and the sealed store only),
-/// `vault`, `azure-keyvault` or `gcp-secret-manager`. None for local. Settings for a
+/// `vault`, `azure-keyvault`, `gcp-secret-manager` or `aws`. None for local. Settings for a
 /// backend that isn't the one chosen are warned about, not used.
 pub fn from_env(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result<Option<Arc<ExternalStore>>, String> {
     let ttl = cache_ttl(&var("SECRETS_CACHE_SECONDS"))?;
@@ -311,7 +311,12 @@ pub fn from_env(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result
         "vault" => Box::new(super::vault::Vault::new(super::vault::Config::from_env(var, store)?)?),
         "azure-keyvault" => Box::new(super::azure::KeyVault::new(super::azure::Config::from_env(var, store)?)?),
         "gcp-secret-manager" => Box::new(super::gcp::SecretManager::new(super::gcp::Config::from_env(var, store)?)?),
-        other => return Err(format!("SECRETS_BACKEND must be local, vault, azure-keyvault or gcp-secret-manager, not {other:?}")),
+        "aws" => {
+            let cfg = super::aws::Config::from_env(var, store)?;
+            super::keep_from_bots(cfg.source.reserved(), cfg.source.settings());
+            Box::new(super::aws::SecretsManager::new(cfg)?)
+        }
+        other => return Err(format!("SECRETS_BACKEND must be local, vault, azure-keyvault, gcp-secret-manager or aws, not {other:?}")),
     };
     warn_unused(var, &chosen);
     Ok(Some(Arc::new(ExternalStore::new(provider, ttl))))
@@ -319,13 +324,15 @@ pub fn from_env(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result
 
 /// The settings of backends other than `chosen` that are set: probably a mistake.
 pub fn unused_settings(var: &dyn Fn(&str) -> String, chosen: &str) -> Vec<&'static str> {
-    const KEYS: [(&str, &str); 6] = [
+    const KEYS: [(&str, &str); 8] = [
         ("vault", "VAULT_ADDR"),
         ("azure-keyvault", "AZURE_KEYVAULT_URL"),
         ("azure-keyvault", "AZURE_KEYVAULT_AUTH"),
         ("gcp-secret-manager", "GCP_SECRET_MANAGER_PROJECT"),
         ("gcp-secret-manager", "GCP_SECRET_MANAGER_AUTH"),
         ("gcp-secret-manager", "GCP_SECRET_MANAGER_LOCATION"),
+        ("aws", "AWS_SECRETS_MANAGER_REGION"),
+        ("aws", "AWS_SECRETS_MANAGER_AUTH"),
     ];
     KEYS.iter().filter(|(b, k)| *b != chosen && !var(k).trim().is_empty()).map(|(_, k)| *k).collect()
 }
@@ -333,7 +340,7 @@ pub fn unused_settings(var: &dyn Fn(&str) -> String, chosen: &str) -> Vec<&'stat
 fn warn_unused(var: &dyn Fn(&str) -> String, chosen: &str) {
     let unused = unused_settings(var, chosen);
     if !unused.is_empty() {
-        crate::obs::log::log_warn!("Secrets backend: {} set, but SECRETS_BACKEND is {chosen}, so they are ignored (ADR 0136).", unused.join(", "));
+        crate::obs::log::log_warn!("Secrets backend: {} set, but SECRETS_BACKEND is {chosen}, so they are ignored (ADR 0136, ADR 0146).", unused.join(", "));
     }
 }
 
@@ -356,7 +363,7 @@ fn diagnose(x: Option<&ExternalStore>) -> serde_json::Value {
             "backend": "local",
             "description": "the environment and the sealed store",
             "ok": true,
-            "detail": "Local: secrets come from the environment and the sealed store. SECRETS_BACKEND=vault, azure-keyvault or gcp-secret-manager adds an external one (ADR 0125, ADR 0136).",
+            "detail": "Local: secrets come from the environment and the sealed store. SECRETS_BACKEND=vault, azure-keyvault, gcp-secret-manager or aws adds an external one (ADR 0125, ADR 0136, ADR 0146).",
         });
     };
     // Straight from the backend, not the cache: whether it answers now.
@@ -519,13 +526,13 @@ pub(crate) mod tests {
         let var = |k: &str| if k == "SECRETS_BACKEND" { "local".to_string() } else { String::new() };
         assert!(from_env(&var, &env).unwrap().is_none(), "local is the default");
         let var = |k: &str| if k == "SECRETS_BACKEND" { "consul".to_string() } else { String::new() };
-        assert!(from_env(&var, &env).err().unwrap().contains("local, vault, azure-keyvault or gcp-secret-manager"));
+        assert!(from_env(&var, &env).err().unwrap().contains("local, vault, azure-keyvault, gcp-secret-manager or aws"));
     }
 
     #[test]
     fn each_backend_is_chosen_and_checked_at_startup() {
         let env = super::super::env::EnvStore::fixed(&[]);
-        for (backend, err) in [("vault", "needs VAULT_ADDR"), ("azure-keyvault", "needs AZURE_KEYVAULT_URL"), ("gcp-secret-manager", "needs GCP_SECRET_MANAGER_PROJECT")] {
+        for (backend, err) in [("vault", "needs VAULT_ADDR"), ("azure-keyvault", "needs AZURE_KEYVAULT_URL"), ("gcp-secret-manager", "needs GCP_SECRET_MANAGER_PROJECT"), ("aws", "needs AWS_SECRETS_MANAGER_REGION")] {
             let var = super::super::http::tests::settings(&[("SECRETS_BACKEND", backend)]);
             assert!(from_env(&var, &env).err().unwrap().contains(err), "{backend}");
         }
@@ -534,9 +541,13 @@ pub(crate) mod tests {
         assert_eq!((x.kind(), x.ttl), ("azure-keyvault", Duration::from_secs(60)));
         let var = super::super::http::tests::settings(&[("SECRETS_BACKEND", "gcp-secret-manager"), ("GCP_SECRET_MANAGER_PROJECT", "proj-1")]);
         assert_eq!(from_env(&var, &env).unwrap().unwrap().kind(), "gcp-secret-manager");
-        let var = super::super::http::tests::settings(&[("VAULT_ADDR", "https://v"), ("GCP_SECRET_MANAGER_PROJECT", "p"), ("AZURE_KEYVAULT_URL", "https://kv")]);
-        assert_eq!(unused_settings(&var, "local"), ["VAULT_ADDR", "AZURE_KEYVAULT_URL", "GCP_SECRET_MANAGER_PROJECT"]);
-        assert_eq!(unused_settings(&var, "vault"), ["AZURE_KEYVAULT_URL", "GCP_SECRET_MANAGER_PROJECT"]);
+        let var = super::super::http::tests::settings(&[("SECRETS_BACKEND", "aws"), ("AWS_REGION", "eu-west-2"), ("SECRETS_CACHE_SECONDS", "0")]);
+        let x = from_env(&var, &env).unwrap().unwrap();
+        assert_eq!((x.kind(), x.ttl), ("aws", Duration::ZERO));
+        let var = super::super::http::tests::settings(&[("VAULT_ADDR", "https://v"), ("GCP_SECRET_MANAGER_PROJECT", "p"), ("AZURE_KEYVAULT_URL", "https://kv"), ("AWS_SECRETS_MANAGER_REGION", "eu-west-2")]);
+        assert_eq!(unused_settings(&var, "local"), ["VAULT_ADDR", "AZURE_KEYVAULT_URL", "GCP_SECRET_MANAGER_PROJECT", "AWS_SECRETS_MANAGER_REGION"]);
+        assert_eq!(unused_settings(&var, "vault"), ["AZURE_KEYVAULT_URL", "GCP_SECRET_MANAGER_PROJECT", "AWS_SECRETS_MANAGER_REGION"]);
+        assert_eq!(unused_settings(&var, "aws"), ["VAULT_ADDR", "AZURE_KEYVAULT_URL", "GCP_SECRET_MANAGER_PROJECT"]);
     }
 
     #[test]

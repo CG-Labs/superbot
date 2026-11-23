@@ -24,14 +24,14 @@ async fn events(port: u16, admin: &str, query: &str) -> Vec<Value> {
     audit_list(&body)
 }
 
-fn export_to(app: &AppState, vars: &[(&str, &str)]) {
+pub(crate) fn export_to(app: &AppState, vars: &[(&str, &str)]) {
     let store = EnvStore::fixed(vars);
     let map: std::collections::HashMap<String, String> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
     let settings = Settings::from_env(&|k| map.get(k).cloned().unwrap_or_default(), &store).unwrap();
     crate::audit_export::start(app, settings);
 }
 
-async fn until(what: &str, f: impl Fn() -> bool) {
+pub(crate) async fn until(what: &str, f: impl Fn() -> bool) {
     for _ in 0..400 {
         if f() {
             return;
@@ -179,10 +179,10 @@ async fn erasure_and_retention_keep_the_chain_whole() {
 }
 
 /// What a collector saw: how many requests, the lines it took, and each request's headers.
-type Collected = Arc<StdMutex<(usize, Vec<String>, Vec<String>)>>;
+pub(crate) type Collected = Arc<StdMutex<(usize, Vec<String>, Vec<String>)>>;
 
 /// A webhook collector: answers 500 to the first `fail` requests, then takes the batches.
-async fn collector(fail: usize) -> (String, Collected) {
+pub(crate) async fn collector(fail: usize) -> (String, Collected) {
     let got: Collected = Default::default();
     let state = got.clone();
     let r = axum::Router::new().route(

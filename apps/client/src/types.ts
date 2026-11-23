@@ -708,6 +708,110 @@ export interface AuditPage {
   nextBefore: number | null;
 }
 
+/** A row on the audit log's hash chain and its hash (ADR 0122). */
+export interface ChainLink {
+  id: number;
+  hash: string;
+}
+
+/** A signed checkpoint of the chain's head, and its RFC 3161 timestamp (ADR 0149). */
+export interface AuditCheckpoint {
+  /** The `audit.checkpoint` event that carries it. */
+  id: number;
+  at: number;
+  /** The event it signs, and that event's hash. */
+  seq: number;
+  hash: string;
+  keyId: string;
+  publicKey: string;
+  signature: string;
+  statement: string;
+  timestamp: {
+    /** "off" (no TSA when it was made), "pending" or "stamped". */
+    status: "off" | "pending" | "stamped";
+    tsa: string | null;
+    time: number | null;
+    tries: number;
+    error: string | null;
+  };
+}
+
+/** The last `audit.verified` check. */
+export interface AuditVerification {
+  id: number;
+  at: number;
+  by: string | null;
+  ok: boolean;
+  /** Why it failed: `contents`, `link`, `pin`, `checkpoint`, `timestamp`, ... */
+  reason: string | null;
+  checked: number;
+  broken: number;
+  firstBroken: { id: number; reason: string } | null;
+  /** Set when only part of the log was checked (`--from`/`--to`); null bounds are open. */
+  range?: { from: number | null; to: number | null } | null;
+}
+
+/** The SIEM export's progress (`GET /api/audit/siem`). */
+export type AuditExportState =
+  | { enabled: false }
+  | { enabled: true; kind: string; sink: string; delivered: number; pending: number; deliveredAt: number | null; failing: boolean; lastError: string | null; archive?: AuditArchiveState };
+
+/** The S3 archive's settings and last object, when the export is `s3://` (ADR 0154). */
+export interface AuditArchiveState {
+  endpoint: string;
+  bucket: string;
+  prefix: string;
+  lock: "bucket" | "compliance" | "governance" | "off";
+  retainDays: number | null;
+  batchSeconds: number;
+  lastObject: { key: string; version: string | null; events: number; lockMode?: string; retainUntil?: number } | null;
+}
+
+/** `GET /api/audit/chain`: the chain's state for admins (ADR 0149). */
+export interface AuditChainState {
+  head: ChainLink | null;
+  events: number;
+  anchor: ChainLink | null;
+  checkpoints: {
+    everyMinutes: number;
+    count: number;
+    key: { id: string; publicKey: string; algorithm: string };
+    last: AuditCheckpoint | null;
+    /** Events since the last checkpoint. */
+    behind: number;
+  };
+  timestamps: {
+    enabled: boolean;
+    tsa: string | null;
+    trustAnchors: number;
+    stamped: number;
+    pending: number;
+    failing: boolean;
+    failingSince: number | null;
+    lastError: string | null;
+    last: { checkpoint: number; event: number | null; time: number | null; tsa: string | null } | null;
+  };
+  export: AuditExportState;
+  verification: AuditVerification | null;
+}
+
+/** `GET /api/audit/verify`: a check of the chain, its checkpoints and timestamps. */
+export interface AuditVerifyReport {
+  ok: boolean;
+  checked: number;
+  broken: number;
+  firstBroken: { id: number; reason: string } | null;
+  head: ChainLink | null;
+  error?: string;
+  checkpoints?: {
+    checked: number;
+    timestamped: number;
+    trustedTimestamps: number | null;
+    broken: number;
+    firstBroken: { id: number; reason: string; error: string } | null;
+  };
+}
+
 /** A live sign-in in the access review: metadata only, never the token. */
 export interface AccessReviewSession {
   id: string;

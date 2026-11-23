@@ -20,6 +20,7 @@ import {
 import { saveCsv } from "../src/saveCsv";
 import { colors } from "../src/theme";
 import type { AuditEvent } from "../src/types";
+import { AuditChainPanel } from "./AuditChainPanel";
 import { AuditEventDetail } from "./AuditEventDetail";
 import { Chips } from "./Chips";
 
@@ -90,7 +91,7 @@ function EventRow({ e, selected, onPress, botName, nameOf }: { e: AuditEvent; se
   );
 }
 
-/** The audit log for admins: filters, paging, event detail, and CSV export (ADR 0009, 0019, 0028, 0060). The server refuses it to everyone else. */
+/** The audit log for admins: filters, paging, event detail, CSV export, and the hash chain's state (ADR 0009, 0019, 0028, 0060, 0149). The server refuses it to everyone else. */
 export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
   const { width } = useWindowDimensions();
   const wide = width >= 900;
@@ -105,6 +106,7 @@ export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
   const [selected, setSelected] = useState<AuditEvent | null>(null);
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [showChain, setShowChain] = useState(false);
   const seq = useRef(0);
   /** The filter the rows on screen came from: Load more and Export use it, not what's half-typed. */
   const shown = useRef("");
@@ -283,6 +285,9 @@ export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
           <Text style={styles.back}>‹ Bots</Text>
         </Pressable>
         <Text style={styles.title}>Audit log</Text>
+        <Pressable onPress={() => setShowChain((s) => !s)} accessibilityRole="button" accessibilityState={{ expanded: showChain }} accessibilityLabel="The hash chain's state">
+          <Text style={styles.link}>{showChain ? "Hide chain" : "Chain"}</Text>
+        </Pressable>
         <Pressable
           style={[styles.primaryBtn, exporting && styles.busy]}
           onPress={() => void exportCsv()}
@@ -293,6 +298,7 @@ export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
           <Text style={styles.primaryText}>{exporting ? "Exporting…" : "Export CSV"}</Text>
         </Pressable>
       </View>
+      {showChain ? <AuditChainPanel api={api} /> : null}
       {wide ? (
         filterPanel
       ) : (
