@@ -66,7 +66,7 @@ Unless the lock is `off`:
 
 ### Delivery
 
-As the other sinks (ADR 0122): one task, in id order, at least once, cursor per sink (`audit_export:s3://<endpoint host>/<bucket>/<prefix>`), backoff from 1 second to 5 minutes, `audit.export_failing` after 3 failures with a `reason` (`delivery_failed`, `not_write_once`, `unreadable`, `cursor_unsaved`) and `audit.export_recovered` after. One difference: a failed batch is retried with exactly the same events, so a retry writes the same key. If an earlier try landed and only the cursor failed, the bucket holds two versions of the same object, both locked, not two overlapping objects.
+As the other sinks (ADR 0122): one task, in id order, at least once, cursor per sink (`audit_export:s3://<endpoint host>/<bucket>/<prefix>`), backoff from 1 second to 5 minutes, `audit.export_failing` after 3 failures with a `reason` (`delivery_failed`, `not_write_once`, `unreadable`, `cursor_unsaved`) and `audit.export_recovered` after. One difference: a batch is retried with exactly the same events, so a retry writes the same key. Its last id is saved in `settings` (`audit_export:<sink>#batch`) before the first try, so this holds across a restart too. If an earlier try landed and only the cursor failed, the bucket holds two versions of the same object, both locked, not two overlapping objects.
 
 ### Status
 
@@ -75,7 +75,7 @@ As the other sinks (ADR 0122): one task, in id order, at least once, cursor per 
 ## What it does and doesn't prove
 
 - **Against root on the host, or anyone with the database and `master.key`**: they can rebuild the chain and sign new checkpoints, but can't change or delete what is already in the archive. Pin hashes from it (`botctl audit verify --pin`), or trust only the checkpoint keys in it (`--key`).
-- **Against someone with the archive's keys**: in compliance mode, they can't shorten the lock or delete a locked version, nor can the store account's root. In governance mode, a principal with `s3:BypassGovernanceRetention` can. They can add objects, but forged events don't link to the real chain and their checkpoints don't verify. Give botd a key that can only `s3:PutObject`, `s3:GetObject` (for `HEAD`) and `s3:GetBucketObjectLockConfiguration` on that bucket.
+- **Against someone with the archive's keys**: in compliance mode, they can't shorten the lock or delete a locked version, nor can the store account's root. In governance mode, a principal with `s3:BypassGovernanceRetention` can. They can add objects, but forged events don't link to the real chain and their checkpoints don't verify. Give botd a key that can only do `s3:GetBucketObjectLockConfiguration` on the bucket, and `s3:PutObject`, `s3:GetObject`, `s3:GetObjectVersion` (the `HEAD` of the version it wrote), `s3:GetObjectRetention` (to see that version's lock) and, with `compliance` or `governance`, `s3:PutObjectRetention` on the prefix's objects. Never `s3:BypassGovernanceRetention` or deletes.
 - **Before a batch goes**: events are in the archive only once their batch is written, up to `AUDIT_EXPORT_S3_BATCH_SECONDS` plus any outage later. Shorter batches narrow that window, at more requests.
 - **Erasure**: the archive keeps erased people's data until the lock ends, like a SIEM or a backup. The operator's DPA and the lock period cover that. Pick the period with that in mind.
 

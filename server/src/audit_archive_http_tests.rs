@@ -136,10 +136,18 @@ async fn compliance_locks_retry_the_same_object_and_catch_a_store_that_drops_the
 async fn a_plain_bucket_with_the_lock_off_and_batches_that_wait() {
     let app = runner::test_app();
     let s = StandIn::start().await;
-    app.db.record(&Event::new(Actor::system("test"), "test.plain"));
+    for _ in 0..4 {
+        app.db.record(&Event::new(Actor::system("test"), "test.plain"));
+    }
+    // A batch of events 1 to 2 was cut before a restart, and maybe written: it goes again as it was.
+    let sink = format!("s3://{}/backups/audit/prod", s.url.trim_start_matches("http://"));
+    app.db.set_audit_export_cursor(&format!("{sink}#batch"), 2).unwrap();
     export_to(&app, &vars(&s, &[("AUDIT_EXPORT", "s3://backups/audit/prod"), ("AUDIT_EXPORT_S3_LOCK", "off"), ("AUDIT_EXPORT_START", "all")]));
     let x = app.audit_export.get().unwrap();
-    until("archived", || x.delivered() >= 1 && !s.keys().is_empty()).await;
+    until("archived", || x.delivered() >= 4).await;
+    let keys = s.keys();
+    assert!(keys[0].ends_with("/00000000000000000001-00000000000000000002.jsonl"), "{keys:?}");
+    assert!(keys[1].contains("/00000000000000000003-"), "the next batch starts after it: {keys:?}");
     {
         let w = s.w();
         assert!(w.locks.is_empty() && !w.calls.iter().any(|c| c.contains("object-lock") || c.starts_with("HEAD")), "{:?}", w.calls);
