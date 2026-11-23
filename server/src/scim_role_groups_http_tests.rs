@@ -283,6 +283,37 @@ async fn an_idp_delete_puts_the_declaration_back_to_waiting() {
 }
 
 #[tokio::test]
+async fn a_user_delete_cut_short_is_finished_by_a_retry_or_a_restore() {
+    let (port, app, admin) = serve(true).await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "entra" })).await;
+    let eve = person(port, &t, "eve@example.com").await;
+    let fay = person(port, &t, "fay@example.com").await;
+    let audit = role(port, &admin, "Auditor", "member", &["audit.view"]).await;
+    let gid = declared(port, &admin, "entra", "Auditors", &audit).await;
+    push(port, &t, "Auditors", &[&eve, &fay]).await;
+    assert_eq!((role_of(&app, &eve), role_of(&app, &fay)), (Some(audit.clone()), Some(audit.clone())));
+
+    // A restart after each was marked deleted, before the role group let go of them.
+    assert!(app.db.delete_scim_user("entra", &eve) && app.db.delete_scim_user("entra", &fay));
+
+    // The IdP's retried DELETE finishes it.
+    let (code, _, _) = scim(port, &t, "DELETE", &format!("/scim/v2/Users/{eve}"), Value::Null).await;
+    assert_eq!(code, 204);
+    assert_eq!(role_of(&app, &eve), None);
+    assert!(!app.db.scim_role_group_has(&gid, &eve) && app.db.scim_role_group_grant_of_user(&eve).is_none());
+    let (code, _, _) = scim(port, &t, "DELETE", &format!("/scim/v2/Users/{eve}"), Value::Null).await;
+    assert_eq!(code, 404, "nothing left to finish");
+
+    // A restore finishes it first: no role comes back with her.
+    let (code, _, u) = scim(port, &t, "POST", "/scim/v2/Users", okta_user("fay@example.com", "fay@example.com")).await;
+    assert_eq!((code, u["id"].as_str()), (201, Some(fay.as_str())), "{u}");
+    assert_eq!(role_of(&app, &fay), None);
+    assert!(!app.db.scim_role_group_has(&gid, &fay) && app.db.scim_role_group_grant_of_user(&fay).is_none());
+    let gone: Vec<_> = events(port, &admin, "action=role.unassigned").await.iter().map(|e| (e["details"]["user"].clone(), e["details"]["reason"].clone())).collect();
+    assert_eq!(gone, [(json!(fay), json!("user_deleted")), (json!(eve), json!("user_deleted"))]);
+}
+
+#[tokio::test]
 async fn a_role_group_never_shares_a_teams_id_and_a_reset_restores_its_declared_name() {
     let (port, app, admin) = serve(true).await;
     let (t, _) = token(port, &admin, json!({ "tenant": "entra" })).await;

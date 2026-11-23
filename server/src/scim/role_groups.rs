@@ -351,12 +351,22 @@ pub(super) async fn delete(app: &AppState, a: &Auth, c: &Caller, g: &ScimRoleGro
 
 /// A SCIM DELETE of `user_id`: they leave every role group, losing what it gave, so
 /// restoring them by `externalId` brings no role back. Works whatever SCIM_GROUP_ROLES says.
+/// Run again, it finishes what a restart cut short, a grant left without its membership too.
 pub(crate) async fn user_deleted(app: &AppState, a: &Auth, by: &Who, user_id: &str) {
     let _writes = a.scim.group_writes.lock().await;
     for g in app.db.scim_role_groups_of_user(user_id) {
         app.db.remove_scim_role_group_member(&g.id, user_id);
         take_away(app, by, &g, user_id, USER_DELETED).await;
     }
+    if let Some(g) = app.db.scim_role_group_grant_of_user(user_id).and_then(|h| app.db.scim_role_group(&h.group_id)) {
+        take_away(app, by, &g, user_id, USER_DELETED).await;
+    }
+}
+
+/// Whether a SCIM DELETE of `user_id` left them in a role group, or holding what one gave:
+/// a restart cut it short, so a retried DELETE or a restore finishes it first.
+pub(crate) fn left_behind(app: &AppState, user_id: &str) -> bool {
+    !app.db.scim_role_groups_of_user(user_id).is_empty() || app.db.scim_role_group_grant_of_user(user_id).is_some()
 }
 
 // Admin API (under /api, admins only).

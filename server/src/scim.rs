@@ -1069,6 +1069,9 @@ pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Ar
         if found.deleted_at.is_none() {
             return Err(uniqueness(format!("A user with this externalId exists already: {}", found.user.id)));
         }
+        if role_groups::left_behind(&app, &found.user.id) {
+            role_groups::user_deleted(&app, &a, &c.who, &found.user.id).await;
+        }
         let restored = json!({ "tenant": tenant, "externalId": ext, "userName": d.user_name });
         let after = update(&app, &a, &c, &found.user.clone(), Some(&found), &d, Some(("scim.user_restored", restored))).await?;
         return created(&after);
@@ -1090,6 +1093,9 @@ pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Ar
             o => o,
         };
         let linked = json!({ "tenant": tenant, "externalId": d.external_id, "userName": d.user_name, "provider": l.provider, "subject": l.subject });
+        if mine.is_some() && role_groups::left_behind(&app, &user.id) {
+            role_groups::user_deleted(&app, &a, &c.who, &user.id).await;
+        }
         let action = if mine.is_some() { "scim.user_restored" } else { "scim.user_linked" };
         let after = update(&app, &a, &c, &user, None, &d, Some((action, linked))).await?;
         return created(&after);
@@ -1138,11 +1144,19 @@ pub async fn patch_user(State(app): State<AppState>, Extension(a): Extension<Arc
 /// `DELETE /scim/v2/Users/{id}`: the user is disabled, their sessions end, and the tenant
 /// can't see them any more. Nothing is destroyed: the user and its audit history stay.
 /// When taking them off their group's team fails (ADR 0171), the rest still happens and
-/// the answer is a 500. The IdP's retry of that DELETE finishes taking them off.
+/// the answer is a 500. The IdP's retry of that DELETE finishes taking them off, and out
+/// of role groups too if a restart cut that short.
 pub async fn delete_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Path(id): Path<String>) -> ScimRes {
     let Some(before) = app.db.scim_user(&c.token.tenant, &id) else {
-        if groups::left_behind(&app, &a, &c, &id) {
+        let teams = groups::left_behind(&app, &a, &c, &id);
+        let roles = app.db.scim_user_of(&id).is_some_and(|o| o.tenant == c.token.tenant && o.deleted_at.is_some()) && role_groups::left_behind(&app, &id);
+        if roles {
+            role_groups::user_deleted(&app, &a, &c.who, &id).await;
+        }
+        if teams {
             groups::user_deleted(&app, &a, &c, &id).await.map_err(server_error)?;
+        }
+        if teams || roles {
             return Ok(StatusCode::NO_CONTENT.into_response());
         }
         return Err(missing("User"));
