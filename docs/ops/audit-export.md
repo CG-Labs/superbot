@@ -332,10 +332,10 @@ A single SIEM needs no name, so settings from before keep working. To move to se
 
 ```sh
 aws s3 cp --recursive s3://<bucket>/<prefix>/ ./audit/
-botctl audit verify-lines ./audit/ --key <checkpoint public key hex>
+botctl audit verify-lines ./audit/ --key <checkpoint public key hex> --digests-after <id>
 
 # A SIEM export, as JSON lines or syslog, from a file or stdin
-zcat siem-export-2026-11.jsonl.gz | botctl audit verify-lines - --key <checkpoint public key hex>
+zcat siem-export-2026-11.jsonl.gz | botctl audit verify-lines - --key <checkpoint public key hex> --digests-after <id>
 ```
 
 `aws s3 cp` takes each key's latest version, while botd's archive check reads the first, which Object Lock keeps. If someone wrote a version over a locked object, this checks theirs; `botctl audit verify --archive` names it as `overwritten`.
@@ -345,7 +345,7 @@ It reads files, directories (their `.jsonl`, `.ndjson`, `.json` and `.log` files
 - each line against its own hash: `chainHash` from `chainPrev`, the fields no erasure changes and `chainDigest`, and with `chainSalt`, `chainDigest` from the other fields (`digest` otherwise);
 - copies of one event against each other (`conflict`);
 - the chain from event to event, with no gap (`link`);
-- that once events carry `chainDigest`, every later one does (`unbound`);
+- that every event after `--digests-after` carries `chainDigest` (`unbound`). Take it from `digestsAfter` in `botctl audit siem` once, and keep it with the checkpoint key. It never changes. Without it, the first line with a digest stands in for it, so lines stripped of every digest bind nothing, and still pass;
 - each signed checkpoint (`checkpoint`), under the keys given with `--key` (from `botctl audit key`, or the `audit.checkpoint_key` events in your SIEM). Without `--key` a checkpoint is checked under the key in it, which only shows it agrees with whoever signed it.
 
 It prints a JSON report: per host, `events`, `copies`, `first` and `firstPrev` (the genesis hash for a log never pruned), `head`, `bound`, `boundFixed` and `unbound` (as for the [archive check](#check-the-archive)), `checkpoints` and their `checkpointKeys`, and the first 20 `firstProblems`, each with `id`, `at` (`<file>:<line>`) and `reason`. It exits 1 if anything doesn't hold, or if no events were found.
