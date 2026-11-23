@@ -353,8 +353,8 @@ pub fn scan(store: &Path) -> Result<(Vec<Found>, Vec<String>), String> {
                         Some(f) => found.push(f),
                         None => other.push(rel(store, &p)),
                     },
-                    Err(why) if kind_of(&name).is_some() => found.push(Found { path: rel(store, &p), name: name.trim_end_matches(".tar").into(), problems: vec![format!("it can't be read: {why}")], ..Found::default() }),
-                    Err(_) => other.push(rel(store, &p)),
+                    // Bundles are renamed in stores, so a damaged tar may be one whatever its name.
+                    Err(why) => found.push(Found { path: rel(store, &p), name: name.trim_end_matches(".tar").into(), problems: vec![format!("it can't be read as a tar, so it can't be checked: {why}")], ..Found::default() }),
                 }
             } else {
                 other.push(rel(store, &p));
@@ -998,12 +998,21 @@ mod tests {
         std::fs::write(damaged.join("backups.json"), &files["backups.json"]).unwrap();
         std::fs::write(store.join("notes.txt"), "by hand").unwrap();
         std::fs::write(store.join(".partial.tar"), "half").unwrap();
-        let (found, other) = scan(&store).unwrap();
+        let entries: Vec<(String, Vec<u8>)> = files.iter().map(|(n, b)| (format!("{name}/{n}"), b.clone())).collect();
+        let mut renamed = crate::ustar::tar(&entries, 0);
+        renamed[1024 + 10] ^= 1;
+        std::fs::write(store.join("october.tar"), &renamed).unwrap();
+        let (mut found, other) = scan(&store).unwrap();
         let _ = std::fs::remove_dir_all(&store);
+        let unreadable = found.pop().unwrap();
+        assert_eq!(unreadable.path, "october.tar");
+        assert!(!unreadable.verified() && unreadable.problems[0].contains("can't be read as a tar"), "{:?}", unreadable.problems);
         assert_eq!(found.len(), 1);
         assert!(!found[0].verified() && found[0].problems.iter().any(|x| x.contains("no SHA256SUMS")) && found[0].problems.iter().any(|x| x.contains("no manifest.json")), "{:?}", found[0].problems);
         assert_eq!(other, ["notes.txt"]);
+        found.push(unreadable);
         let r = report(&found, &other, &p("2027-01-01", "2027-02-01"), None, 0);
+        assert!(strings(&r["problems"]).iter().any(|x| x.starts_with("october.tar: ")));
         assert_eq!((r["bundles"][0]["verified"].as_bool(), r["bundles"][0]["inPeriod"].as_bool()), (Some(false), Some(true)));
         assert_eq!(r["summary"]["otherFiles"], 1);
     }
