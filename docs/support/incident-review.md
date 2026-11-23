@@ -7,7 +7,7 @@ The incident commander's tools ([escalation](escalation.md#inside-the-provider))
 The same incidents as the console's Status tab and `/api/status/incidents` ([ADR 0090](../adr/0090-status-page-and-uptime-slo.md)), for when the console is slow or down, or the commander works from a shell. Admins only, and every change is audited (`status.incident_created`, `status.incident_updated`, `status.incident_deleted`). **Anyone can read what you post**: no customer names, hostnames, error text or internal details.
 
 ```sh
-botctl incidents                                   # open ones first, then the last 14 days'
+botctl incidents                                   # the newest 100, open or not, open ones first
 botctl incident open "Bot runs fail" "Runs are failing for some customers. We're looking into it." \
   --impact major --component runners --component api
 botctl incident update inc_3f2a9c identified "A configuration change broke runs. We're rolling it back."
@@ -56,7 +56,7 @@ Make it once the incident is resolved. A draft of an open one runs to now and sa
 | What went badly | A missed first-post or update target | Add the rest |
 | Actions | | One row each: action, owner by role, due date, ticket |
 
-"Changes" are successful audit events that change how botd behaves: the approval policy and its rules, roles, SSO and MFA settings, the license, notifications, egress policies, setup, tiers and users' tiers and roles, SCIM and service tokens, secrets set or deleted, billing mail settings, Bots' settings, and botd starting. Traffic (runs, sign-ins, API calls) is counted, not listed. For the full log of any stretch: `botctl audit --from <time> --to <time>`.
+"Changes" are successful audit events that change how botd behaves: the approval policy and its rules, roles, SSO and MFA settings, the license, notifications, egress policies, setup, tiers and users' tiers and roles, SCIM and service tokens, secrets set or deleted, billing mail settings, Bots' settings, and botd starting. Traffic (runs, sign-ins, auto-approved tool calls, API calls) is counted, not listed. For the full log of any stretch: `botctl audit --from <time> --to <time>`.
 
 The draft reads at most 20,000 audit events for the lead-in and as many for the incident; on a busier server it says its counts are low.
 

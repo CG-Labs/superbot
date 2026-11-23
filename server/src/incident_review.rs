@@ -39,13 +39,23 @@ const FAILURES_SHOWN: usize = 10;
 const MINUTE: i64 = 60_000;
 
 /// Successful actions that change how botd behaves, as the timeline lists them. A
-/// trailing `*` matches a prefix.
-pub const CHANGES: [&str; 21] = [
+/// trailing `*` matches a prefix, only for prefixes with no routine traffic under them:
+/// `policy.allowed` is every auto-approved tool call and `sso.saml_role_skipped` a
+/// sign-in, so those families are listed one by one.
+pub const CHANGES: [&str; 29] = [
     "server.started",
-    "policy.*",
+    "policy.updated",
+    "policy.reset",
+    "policy.initialized",
+    "policy.sandbox_initialized",
     "rule.*",
     "role.*",
-    "sso.*",
+    "sso.saml_metadata_imported",
+    "sso.saml_role_mapped",
+    "sso.saml_role_unmapped",
+    "sso.saml_sp_key_created",
+    "sso.saml_sp_key_promoted",
+    "sso.saml_sp_key_retired",
     "auth.mfa_policy_updated",
     "license.installed",
     "license.removed",
@@ -118,10 +128,15 @@ pub struct Seen {
     pub failures: u64,
 }
 
+/// How many events one row stands for: a throttled failure also counts the ones it
+/// didn't log since the last (ADR 0144).
+fn weight(e: &AuditEvent) -> u64 {
+    1 + e.details.get("unloggedSinceLast").and_then(Value::as_u64).unwrap_or(0)
+}
+
 impl Seen {
     fn add(&mut self, e: &AuditEvent) {
-        // A throttled failure stands for the ones it didn't log since the last (ADR 0144).
-        let n = 1 + e.details.get("unloggedSinceLast").and_then(Value::as_u64).unwrap_or(0);
+        let n = weight(e);
         self.events += 1;
         if e.action == "bot.run_finished" {
             self.runs_finished += 1;
@@ -273,7 +288,7 @@ pub fn targets(i: &StatusIncident, opts: &Opts, now_ms: i64) -> Targets {
     Targets {
         post_within_minutes: POST_WITHIN_MINUTES,
         posted_after_minutes: posted_after,
-        posted_late: posted_after.map(|m| m > POST_WITHIN_MINUTES),
+        posted_late: opts.detected.map(|d| i.created_at - d > POST_WITHIN_MINUTES * MINUTE),
         update_every_minutes: every,
         longest_gap_minutes: longest,
         late_updates: late,
@@ -344,7 +359,7 @@ pub fn review(i: &StatusIncident, before: &[AuditEvent], during: &[AuditEvent], 
     for e in &during {
         seen_during.add(e);
         if e.outcome != "success" {
-            *failures.entry((e.action.clone(), e.outcome.clone())).or_default() += 1;
+            *failures.entry((e.action.clone(), e.outcome.clone())).or_default() += weight(e);
         }
     }
     let mut seen_before = Seen { minutes: minutes(start - baseline_from), ..Default::default() };
@@ -662,6 +677,8 @@ mod tests {
         assert_eq!(t.to_resolved_minutes, Some(120), "from detection");
         let t = targets(&i, &Opts { detected: Some(T0 - 15 * MINUTE), ..Default::default() }, T0);
         assert_eq!(t.posted_late, Some(false), "15 minutes is on time");
+        let t = targets(&i, &Opts { detected: Some(T0 - 15 * MINUTE - 59_000), ..Default::default() }, T0);
+        assert_eq!((t.posted_after_minutes, t.posted_late), (Some(15), Some(true)), "15 minutes 59 seconds is late");
         let m = incident("maintenance", &[(0, "investigating"), (300, "resolved")], true);
         let t = targets(&m, &Opts::default(), T0);
         assert_eq!((t.update_every_minutes, t.late_updates.len(), t.longest_gap_minutes), (None, 0, 300));
@@ -692,7 +709,8 @@ mod tests {
         assert_eq!((r.changes_before, r.changes_during), (2, 1), "a failed change isn't one, nor one before the lead-in");
         assert_eq!(r.during, Seen { minutes: 90, events: 6, runs_finished: 3, runs_failed: 2, sign_in_failures: 5, denied: 1, failures: 8 });
         assert_eq!(r.before, Seen { minutes: 90, events: 4, runs_finished: 1, runs_failed: 0, sign_in_failures: 0, denied: 0, failures: 1 }, "the same 90 minutes before");
-        assert_eq!(r.top_failures[0], FailureCount { action: "bot.run_finished".into(), outcome: "failure".into(), count: 2 });
+        assert_eq!(r.top_failures[0], FailureCount { action: "auth.login_failed".into(), outcome: "failure".into(), count: 5 }, "a throttled failure counts what it stands for");
+        assert_eq!(r.top_failures[1], FailureCount { action: "bot.run_finished".into(), outcome: "failure".into(), count: 2 });
         assert_eq!(r.incident["components"], json!(["Harness runners", "API"]));
 
         let all = r.json().to_string() + &r.markdown();
@@ -747,7 +765,7 @@ mod tests {
         for yes in ["server.started", "policy.updated", "sso.saml_sp_key_promoted", "scim.token_rotated", "user.role_changed", "license.installed"] {
             assert!(is_change(yes), "{yes}");
         }
-        for no in ["bot.run_finished", "auth.login", "license.refused", "scim.user_deleted", "status.incident_updated", "secret.lease_issued"] {
+        for no in ["bot.run_finished", "auth.login", "license.refused", "scim.user_deleted", "status.incident_updated", "secret.lease_issued", "policy.allowed", "policy.denied", "sso.saml_role_skipped", "sso.saml_metadata_refused"] {
             assert!(!is_change(no), "{no}");
         }
     }
