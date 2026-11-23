@@ -51,6 +51,9 @@ describe("residencyLines (ADR 0168)", () => {
       "1 of your computer's 4 backups are outside gb-lon. Your admins see a warning about it.",
       "Your plan has no AI model in gb-lon, so your Bots don't run until your admin adds one. Nothing is sent outside the region instead.",
     ]);
+    const onHost = (hostRegion: string | null) => residencyLines(view({ status: "data_outside", machine: { id: "m1", state: "running", region: "gb-lon", inRegion: false, host: "b", hostRegion } })).warnings[0];
+    expect(onHost("de-fra-2")).toBe("Your computer is on a server in de-fra-2, not gb-lon. Your admins see a warning about it.");
+    expect(onHost(null)).toBe("Your computer is on a server with no data region set, so nothing shows it is in gb-lon. Your admins see a warning about it.");
     const host = residencyLines(view({ status: "data_outside" }));
     expect(host.warnings).toEqual(["Some of your data is outside gb-lon. Your admins see a warning about it."]);
   });

@@ -33,6 +33,17 @@ describe("ResidencyCard (ADR 0168)", () => {
     }
   });
 
+  it("says when it couldn't load, and tries again", async () => {
+    const api = fakeApi(mine);
+    api.myResidency.mockRejectedValueOnce(new ApiError("Server error", 500));
+    const user = userEvent.setup();
+    await render(<ResidencyCard api={api} />);
+    expect(await screen.findByText("Couldn't load your data's residency: Server error")).toBeOnTheScreen();
+    await user.press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByText(/Your data is pinned to gb-lon/)).toBeOnTheScreen();
+    expect(api.myResidency).toHaveBeenCalledTimes(2);
+  });
+
   it("shows your pin and saves its report as Markdown", async () => {
     const api = fakeApi(mine);
     const save = jest.fn(async () => {});
