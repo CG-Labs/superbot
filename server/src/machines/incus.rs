@@ -196,7 +196,7 @@ impl Rule {
 }
 
 /// An address as a number, and whether it is IPv6.
-fn number(ip: IpAddr) -> (bool, u128) {
+pub(crate) fn number(ip: IpAddr) -> (bool, u128) {
     match ip {
         IpAddr::V4(a) => (false, u32::from(a) as u128),
         IpAddr::V6(a) => (true, u128::from(a)),
@@ -212,7 +212,7 @@ fn address(v6: bool, n: u128) -> IpAddr {
 }
 
 /// A canonical CIDR's first and last address.
-fn span(cidr: &str) -> Option<(bool, u128, u128)> {
+pub(crate) fn span(cidr: &str) -> Option<(bool, u128, u128)> {
     let (ip, len) = cidr.split_once('/')?;
     let (v6, n) = number(ip.parse().ok()?);
     let len: u32 = len.parse().ok()?;

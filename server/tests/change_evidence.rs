@@ -7,7 +7,8 @@
 //! vulnerabilities` against the same stand-in, with Dependabot alerts over two pages and
 //! code scanning alerts judged against their remediation windows, the accepted findings
 //! read from the repository, and a token without Dependabot access recorded, not fatal.
-//! Also checks the workflow that runs both monthly asks for read access only.
+//! Also checks the workflow that runs them monthly (and the drill export, ADR 0177) asks
+//! for read access only.
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri, header};
@@ -414,7 +415,7 @@ fn the_monthly_workflow_reads_only() {
     assert!(!wf.contains("write"), "nothing in it may write");
     assert!(wf.contains("cron:") && wf.contains("workflow_dispatch:"), "monthly, and on demand");
     assert!(wf.contains("--bin superbot-evidence"), "builds the exporter from this commit");
-    assert!(wf.contains("superbot-evidence\" github ") && wf.contains("superbot-evidence\" vulnerabilities "), "exports both bundles");
+    assert!(wf.contains("superbot-evidence\" github ") && wf.contains("superbot-evidence\" vulnerabilities ") && wf.contains("superbot-evidence\" drills "), "exports all three bundles");
     assert!(wf.contains("GITHUB_TOKEN: ${{ github.token }}"), "uses the workflow's own token");
     let indent = |l: &str| l.len() - l.trim_start().len();
     let mut block: Option<usize> = None;

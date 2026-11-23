@@ -24,6 +24,7 @@ A self-hosting customer can use it as a starting point for their own. Settings a
 | `MACHINE_BOT_USER` | `on` (the default) | Bots run as an unprivileged user on their machine, so its egress rules bind them ([ADR 0043](../adr/0043-bots-own-os-user-on-machines.md)) | The settings file |
 | `MACHINE_TEAMMATE_USERS` | `on` | Teammates' runs can't read the owner's files ([ADR 0048](../adr/0048-teammates-own-os-user-on-machines.md)) | The settings file |
 | `MACHINE_FIREWALL` | `on` for Linode machines | Only botd reaches a machine's agent ([ADR 0035](../adr/0035-machine-firewall-auto-enroll.md)) | `machine.firewall_*` audit events |
+| `MACHINE_FIREWALL_EGRESS` | `on` (the default with the firewall) | Linode's firewall keeps the whole machine, root included, off private ranges and `MACHINE_EGRESS_DENY` ([ADR 0179](../adr/0179-outbound-rules-at-the-provider.md)) | `outbound` in `machine.firewall_created` and `machine.firewall_updated` |
 | `MACHINE_ON_DISABLE` | `suspend` (the default) | A disabled user's machine is powered off ([ADR 0124](../adr/0124-deprovisioning-stops-bots-and-machines.md)) | The settings file |
 | `SUPERBOT_CHROMIUM_SANDBOX` | Unset (Chromium's sandbox on) | Browsers stay sandboxed (CC6.8-3, [ADR 0107](../adr/0107-chromium-sandbox-in-the-container.md)) | botd's start-up log line `Chromium sandbox: on` |
 | `METRICS_LISTEN` | Off, loopback, or with `METRICS_TOKEN` | Metrics are never public without a token ([ADR 0089](../adr/0089-metrics-and-structured-logs.md)) | The settings file |

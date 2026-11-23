@@ -1,4 +1,4 @@
-import type { CustomRole, ServiceAccount, ServiceAccountDraft, ServiceAccountsView, ServiceToken } from "./types";
+import type { CustomRole, Me, ServiceAccount, ServiceAccountChoices, ServiceAccountDraft, ServiceAccountsView, ServiceToken, Team } from "./types";
 
 const DAY = 24 * 60 * 60_000;
 
@@ -7,6 +7,64 @@ export const BUILT_IN_ROLES = [
   { value: "readonly", label: "Read-only" },
   { value: "member", label: "Member" },
 ];
+
+/**
+ * Admins manage every service account; anyone whose role holds `users.manage` (a delegate,
+ * ADR 0123) manages the ones they own (ADR 0182). The server checks it again on every call.
+ */
+export function canManageServiceAccounts(me: Pick<Me, "permissions">): boolean {
+  const p = me.permissions ?? [];
+  return p.includes("admin") || p.includes("users.manage");
+}
+
+/**
+ * What the forms offer: the server's `choices` (ADR 0182). A server from before it sends
+ * none, so an admin gets every role and team from `/api/roles` and `/api/teams`, as before.
+ */
+export function formChoices(view: Pick<ServiceAccountsView, "choices">, roles: Pick<CustomRole, "id" | "name" | "base" | "permissions">[], teams: Pick<Team, "id" | "name">[]): ServiceAccountChoices {
+  if (view.choices) return view.choices;
+  const builtIn = BUILT_IN_ROLES.map((r) => ({ id: r.value, name: r.label, base: r.value as "readonly" | "member", builtIn: true, permissions: [] }));
+  const custom = roles.map((r) => ({ id: r.id, name: r.name, base: r.base, builtIn: false, permissions: r.permissions }));
+  const all = [...builtIn, ...custom];
+  const inTeam = all.filter((r) => r.builtIn || r.base !== "readonly").map((r) => r.id);
+  return { roles: all, server: all.map((r) => r.id), teams: teams.map((t) => ({ id: t.id, name: t.name, roles: inTeam })) };
+}
+
+type Ref = { id: string; name: string };
+
+/**
+ * The roles offered where `team` puts it ("" is across the server), with `keep` (the
+ * account's own role) added if it's no longer offered, so the picker still shows it.
+ */
+export function roleOptions(choices: ServiceAccountChoices, team: string, keep?: Ref | null): { value: string; label: string }[] {
+  const ids = team ? (choices.teams.find((t) => t.id === team)?.roles ?? []) : choices.server;
+  const name = (id: string) => choices.roles.find((r) => r.id === id)?.name ?? BUILT_IN_ROLES.find((r) => r.value === id)?.label ?? (keep?.id === id ? keep.name : id);
+  const list = keep && !ids.includes(keep.id) ? [...ids, keep.id] : ids;
+  return list.map((id) => ({ value: id, label: name(id) }));
+}
+
+/** Across the server, and the teams the caller may use, with `keep` (its own team) if it's not among them. */
+export function teamOptions(choices: ServiceAccountChoices, keep?: Ref | null): { value: string; label: string }[] {
+  const teams: Ref[] = keep && !choices.teams.some((t) => t.id === keep.id) ? [...choices.teams, keep] : choices.teams;
+  return [{ value: "", label: "Across the server" }, ...teams.map((t) => ({ value: t.id, label: t.name }))];
+}
+
+/** The account's own role and team, as the pickers need them to keep showing them. */
+export function keptRole(sa: Pick<ServiceAccount, "role" | "customRole" | "teamRole">): Ref {
+  const custom = sa.customRole ?? sa.teamRole;
+  return custom ?? { id: sa.role, name: BUILT_IN_ROLES.find((r) => r.value === sa.role)?.label ?? sa.role };
+}
+
+/**
+ * Why the draft's role or team isn't one the caller may give, or null. Only a role or team
+ * they change is checked, so an account whose own is no longer offered can still be renamed.
+ */
+export function choiceError(draft: Pick<ServiceAccountDraft, "role" | "team">, choices: ServiceAccountChoices, was?: Pick<ServiceAccountDraft, "role" | "team"> | null): string | null {
+  if (was && draft.role === was.role && draft.team === was.team) return null;
+  if (draft.team && !choices.teams.some((t) => t.id === draft.team)) return "You can put a service account only in the team you're on.";
+  if (!roleOptions(choices, draft.team).some((r) => r.value === draft.role)) return draft.team ? "You can't give that role in this team." : "You can't give that role.";
+  return null;
+}
 
 /** How long the old token keeps working after a rotate; the server allows at most a day. */
 export const KEEP_OLD = [

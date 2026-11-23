@@ -70,7 +70,14 @@ It shows the objectives, takes a backup with `--fresh` (otherwise uses the newes
 
 Never point it at a customer's machine: everything on it since the backup is lost.
 
-Keep each run's last line (the JSON with `durationMs` and `rtoMs`) with your drill records. The audit log has the same as `machine.restored`.
+Save each run's whole output and keep it with your drill records. Its record line (the JSON with `superbotDrill`, `durationMs` and `rtoMs`, printed whether the drill passed or not) goes into the month's [drill bundle](../security/soc2-evidence-plan.md#the-drill-bundle) with the output's SHA-256 ([ADR 0177](../adr/0177-restore-drill-evidence.md)):
+
+```bash
+deploy/machine-restore-drill.sh drill@<your-domain> --fresh --yes | tee machine-drill-$(date -u +%F).log
+superbot-evidence drills --no-ci --record machine-drill-<date>.log --from <first day> --to <first day of next month>
+```
+
+The audit log has the same as `machine.restored`.
 
 ## What the RTO doesn't count
 

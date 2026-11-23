@@ -84,7 +84,7 @@ botd still starts. Refusing to start would take every other tenant down for one 
 
 Said plainly in the [DPA annex](../security/dpa-template.md#annex-iv-data-residency) and the [subprocessor list](../security/subprocessors.md):
 
-- **botd's own data.** The database (accounts, chats, routines, the audit log), its files and server backups stay where the operator runs botd. Running botd in the same country is the operator's part.
+- **botd's own data.** The database (accounts, chats, routines, the audit log), its files and server backups stay where the operator runs botd. Running botd in the same country is the operator's part. (Since [ADR 0184](0184-botds-own-data-region.md), the operator states that region and reports show it.)
 - **Model calls.** The harness sends prompts, conversation, tool output and file contents to the model provider its tier routes to. A pin doesn't change or check that route. As of November 2026:
   - Anthropic's own API offers US-only processing or global; there is no UK or EU option there. UK or EU processing of Claude models needs a cloud platform with a regional endpoint (Amazon Bedrock, Google Vertex AI, Microsoft Foundry) in the tiers file.
   - OpenAI offers per-project data residency to eligible API customers: Europe (storage and processing in the EEA or Switzerland) and the UK (storage in the UK; processing isn't promised to stay there). It needs an arrangement with OpenAI and the regional API host in the tiers file.
@@ -104,7 +104,7 @@ Said plainly in the [DPA annex](../security/dpa-template.md#annex-iv-data-reside
 ## Follow-ups (in [#58](https://github.com/CG-Labs/superbot/issues/58))
 
 - Hold a pinned tenant's model routes to providers and endpoints the operator marks as in the region, and refuse runs otherwise. **Done** in [ADR 0139](0139-in-region-model-routes.md).
-- A data region for botd's own database and server backups, or a documented dedicated deployment per region (enterprise dedicated hosting, M5).
+- A data region for botd's own database and server backups, or a documented dedicated deployment per region (enterprise dedicated hosting, M5). **Done** in [ADR 0184](0184-botds-own-data-region.md): the operator states it, reports show it, and `RESIDENCY_SERVER_DATA=require` holds every pin to it.
 - Show the pin to the customer in the app. **Done** in [ADR 0168](0168-residency-in-the-app.md).
 - An option to refuse startup when a pin can't be kept. **Done** in [ADR 0171](0171-residency-startup-and-leavers.md) (`RESIDENCY_STARTUP=refuse`).
 - Keep a leaver's pin, or refuse the leave or a SCIM group delete, when the agreement says so. **Done** in [ADR 0171](0171-residency-startup-and-leavers.md): a leaver always keeps the team's pin as their own.
