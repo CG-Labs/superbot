@@ -586,8 +586,8 @@ async fn put_like(s: &StandIn, like: &str, key: &str, body: String) {
 }
 
 /// Every archived line, checked as `botctl audit verify-lines` would, with no botd.
-fn offline(s: &StandIn) -> crate::audit_line::Report {
-    let mut l = crate::audit_line::Lines::new(None);
+fn offline(s: &StandIn, trust: crate::tsa::Trust) -> crate::audit_line::Report {
+    let mut l = crate::audit_line::Lines::new(None).trust(trust);
     for (key, body) in s.w().objects.iter().filter(|(k, _)| k.starts_with("audit/prod/")) {
         for (n, line) in String::from_utf8_lossy(body).lines().enumerate() {
             l.line(line, &format!("{key}:{}", n + 1));
@@ -621,7 +621,7 @@ async fn archived_lines_vouch_for_themselves_once_retention_has_taken_the_rows()
     assert!(sent.iter().all(|e| e["chainDigest"].is_string() == (e["id"].as_i64().unwrap() > marker)), "{sent:?}");
     assert!(sent.iter().filter(|e| e["id"].as_i64().unwrap() > marker).all(|e| e["chainSalt"].is_string()));
 
-    let r = offline(&s);
+    let r = offline(&s, Default::default());
     assert!(r.ok, "{r:?}");
     assert_eq!((r.hosts.len(), r.hosts[0].first, r.hosts[0].unbound, r.hosts[0].bound as usize), (1, Some(ids[0]), 2, sent.len() - 2), "{r:?}");
     let v = verify_archive(port, &admin, "").await;
@@ -644,7 +644,7 @@ async fn archived_lines_vouch_for_themselves_once_retention_has_taken_the_rows()
     assert_eq!((v["ok"].as_bool(), reasons(&v)), (Some(false), vec!["digest".to_string()]), "{v}");
     assert_eq!(v["archive"]["firstProblems"][0]["id"].as_i64(), Some(ids[2]), "{v}");
     assert!(v["firstBroken"].is_null(), "this server's log is fine: {v}");
-    let r = offline(&s);
+    let r = offline(&s, Default::default());
     assert!(!r.ok && r.hosts[0].first_problems.iter().any(|p| p.reason == "digest" && p.id == Some(ids[2])), "{r:?}");
     machines::s3::S3::new(s.settings()).unwrap().delete(&forged).await.unwrap();
     assert_eq!(verify_archive(port, &admin, "").await["archive"]["ok"], true);
@@ -665,6 +665,66 @@ async fn archived_lines_vouch_for_themselves_once_retention_has_taken_the_rows()
     put_like(&s, &original, &forged, stripped.join("\n") + "\n").await;
     let v = verify_archive(port, &admin, "").await;
     assert_eq!((reasons(&v), v["archive"]["unbound"].as_u64()), (vec!["unbound".to_string()], Some(3)), "{v}");
-    let r = offline(&s);
+    let r = offline(&s, Default::default());
     assert!(!r.ok && r.hosts[0].first_problems.iter().any(|p| p.reason == "unbound" && p.id == Some(ids[2])), "{r:?}");
+}
+
+#[tokio::test]
+async fn checkpoint_timestamps_are_checked_from_the_archive_and_without_botd() {
+    use crate::tsa::{Trust, fake::FakeTsa};
+    use base64::Engine;
+    let (port, app, admin, _) = serve_app().await;
+    let s = StandIn::start().await;
+    let fake = Arc::new(FakeTsa::new());
+    let (url, _) = crate::audit_checkpoint_http_tests::tsa(fake.clone(), 0, None).await;
+    let ca = db::temp_path("archive-tsa").join("ca.pem");
+    std::fs::write(&ca, &fake.ca_pem).unwrap();
+    crate::audit_checkpoint_http_tests::checkpoints_with(&app, &[("AUDIT_CHECKPOINT_MINUTES", "0"), ("AUDIT_TIMESTAMP_URL", &url), ("AUDIT_TIMESTAMP_CA_FILE", ca.to_str().unwrap())]);
+    export_to(&app, &vars(&s, &[("AUDIT_EXPORT_S3_LOCK", "off")]));
+    let x = app.audit_export.get().unwrap().clone();
+    archive_round(&app, &x, 2).await;
+    let (code, body) = call(port, "POST", "/api/audit/checkpoints", &admin, "").await;
+    assert_eq!(code, 201, "{body}");
+    let id = parse(&body)["id"].as_i64().unwrap();
+    let stamped = || app.db.audit_events(&crate::audit::Filter { actions: vec![crate::audit_checkpoint::TIMESTAMPED.into()], ..Default::default() }, 1, true);
+    until("the timestamp", || !stamped().is_empty()).await;
+    let stamp = stamped()[0].id;
+    archive_round(&app, &x, 1).await;
+
+    let v = verify_archive(port, &admin, "").await;
+    let a = &v["archive"];
+    assert_eq!(
+        (a["ok"].as_bool(), a["timestamps"].as_u64(), a["trustedTimestamps"].as_u64(), a["lastTimestamp"]["checkpoint"].as_i64(), a["lastTimestamp"]["id"].as_i64()),
+        (Some(true), Some(1), Some(1), Some(id), Some(stamp)),
+        "{v}"
+    );
+    let trust = || Trust::from_pem(&fake.ca_pem).unwrap();
+    let r = offline(&s, trust());
+    assert_eq!((r.ok, r.hosts[0].timestamps, r.hosts[0].trusted_timestamps, r.hosts[0].unstamped), (true, 1, Some(1), 0), "{r:?}");
+    let r = offline(&s, Trust::from_pem(&FakeTsa::new().ca_pem).unwrap());
+    assert!(!r.ok && r.hosts[0].first_problems[0].reason == "timestamp", "another TSA's CA: {r:?}");
+
+    // A copy of the batch with another token for the checkpoint: no hash covers the token
+    // the line carries, but its event recorded the token's SHA-256.
+    let original = s.keys().into_iter().find(|k| String::from_utf8_lossy(&s.w().objects[k]).contains(crate::audit_checkpoint::TIMESTAMPED)).unwrap();
+    let body = String::from_utf8(s.w().objects[&original].clone()).unwrap();
+    let other = base64::engine::general_purpose::STANDARD.encode(fake.token(&[0; 32], None, db::now()));
+    let swapped: Vec<String> = body
+        .lines()
+        .map(|l| {
+            let mut e: Value = serde_json::from_str(l).unwrap();
+            if e["id"] == stamp {
+                e["checkpoint"]["timestamp"]["token"] = json!(other);
+            }
+            e.to_string()
+        })
+        .collect();
+    let forged = format!("audit/prod/2099/01/01/{}", original.rsplit('/').next().unwrap());
+    put_like(&s, &original, &forged, swapped.join("\n") + "\n").await;
+    let v = verify_archive(port, &admin, "").await;
+    assert_eq!((v["ok"].as_bool(), reasons(&v), v["archive"]["firstProblems"][0]["id"].as_i64()), (Some(false), vec!["timestamp".to_string()], Some(stamp)), "{v}");
+    assert!(v["archive"]["firstProblems"][0]["error"].as_str().unwrap().contains("isn't the one its event recorded"), "{v}");
+    assert!(v["firstBroken"].is_null(), "this server's log is fine: {v}");
+    let r = offline(&s, trust());
+    assert!(!r.ok && r.hosts[0].first_problems.iter().any(|p| p.reason == "timestamp" && p.id == Some(stamp)), "{r:?}");
 }
