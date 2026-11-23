@@ -109,7 +109,7 @@ refused "$T/dots.tar.gz" "not an offline bundle" "a '..' entry"
 ok "changed, extra or missing files, links, '..', other folders, formats, versions and missing parts are refused"
 
 cp "$B" "$T/anchor.tar.gz"
-refused "$T/anchor.tar.gz" "Nothing to check the bundle against" "a bundle with no SHA-256 or signature beside it"
+refused "$T/anchor.tar.gz" "Nothing to check $T/anchor.tar.gz against" "a bundle with no SHA-256 or signature beside it"
 if "$DIR/offline-bundle.sh" verify "$T/anchor.tar.gz" --sha256 "$(printf '0%.0s' {1..64})" >/dev/null 2>&1; then
   fail "a wrong --sha256 was accepted"
 fi
@@ -127,6 +127,149 @@ rm -rf "$T/u" && mkdir "$T/u"
 if (offline_unpack_bundle "$wrong" "$T/u") 2>"$T/arch.err"; then fail "the installer accepted a bundle for $other"; fi
 grep -q "This bundle is for $other" "$T/arch.err" || fail "the arch refusal didn't say why"
 ok "verify reads any arch's bundle; the installer takes only this host's"
+
+# Hermes bundles (docs/adr/0200-hermes-agent-bundle-for-air-gapped-installs.md), from a tree laid
+# out as Hermes's installer leaves one with HOME=/opt/hermes: its checkout at the pinned commit,
+# its install's record, the hermes Bots run, links inside it (relative and absolute), a hard link,
+# and a cache, which isn't bundled. The real install, as root with no network, is in offline.yml.
+pin_of() {
+  awk -v field="$1" 'index($0, "bin: \"hermes\"") { f = 1 } f && index($0, field ": \"") { sub(".*" field ": \"", ""); sub("\".*", ""); print; exit }' \
+    "$DIR/../server/src/adapters/install.rs"
+}
+HTAG=$(pin_of tag)
+[[ "$(pin_of version)" == "$HERMES_COMMIT" ]] || fail "install.sh and install.rs pin different Hermes commits"
+fake_hermes() {
+  local h=$1/hermes
+  mkdir -p "$h/.hermes/hermes-agent/.git" "$h/.hermes/installs/k/environments/g/venv/bin" "$h/.hermes/superbot" \
+    "$h/.local/bin" "$h/.local/share/uv/python/cpython-3.14.9/bin" "$h/.cache/uv" "$h/.hermes/cache/uv"
+  echo "${2:-$HERMES_COMMIT}" >"$h/.hermes/hermes-agent/.git/HEAD"
+  printf '{"environment": "%s/.hermes/installs/k/environments/g/venv"}\n' "${3:-/opt/hermes}" >"$h/.hermes/installs/k/facts.json"
+  printf '#!/bin/sh\necho hermes\n' >"$h/.hermes/superbot/hermes"
+  chmod 0755 "$h/.hermes/superbot/hermes"
+  echo python >"$h/.local/share/uv/python/cpython-3.14.9/bin/python3.14"
+  ln -s ../../.hermes/superbot/hermes "$h/.local/bin/hermes"
+  ln -s /opt/hermes/.local/share/uv/python/cpython-3.14.9/bin/python3.14 "$h/.hermes/installs/k/environments/g/venv/bin/python"
+  ln -s /opt/hermes "$h/.hermes/home"
+  ln "$h/.hermes/superbot/hermes" "$h/.hermes/superbot/hermes.copy"
+  echo cached >"$h/.cache/uv/blob"
+  echo cached >"$h/.hermes/cache/uv/blob"
+}
+fake_hermes "$T/htree"
+"$DIR/offline-bundle.sh" hermes --out "$T/hout" --tree "$T/htree/hermes" >"$T/hbuild.log" 2>&1 \
+  || { cat "$T/hbuild.log" >&2; fail "a Hermes bundle didn't build from a tree"; }
+HTOP="superbot-hermes-$HTAG-$ARCH"
+HB="$T/hout/$HTOP.tar.gz"
+[[ -f "$HB" && -f "$HB.sha256" ]] || fail "no Hermes bundle and .sha256 in $T/hout"
+[[ "$(tar -tf "$HB" | LC_ALL=C sort | tr '\n' ' ')" == "$HTOP/ $HTOP/MANIFEST $HTOP/SHA256SUMS $HTOP/hermes.tar " ]] || fail "the Hermes bundle holds more than MANIFEST, SHA256SUMS and hermes.tar"
+hm=$(tar -xOf "$HB" "$HTOP/MANIFEST")
+for want in format=1 kind=hermes "hermes_tag=$HTAG" "hermes_commit=$HERMES_COMMIT" prefix=/opt/hermes "arch=$ARCH"; do
+  grep -qx "$want" <<<"$hm" || fail "the Hermes bundle's MANIFEST has no $want"
+done
+inner=$(tar -xOf "$HB" "$HTOP/hermes.tar" | tar -tv)
+grep -q ' hermes/.local/bin/hermes -> ../../.hermes/superbot/hermes$' <<<"$inner" || fail "the Hermes bundle lost a relative link"
+grep -q ' hermes/.hermes/superbot/hermes.copy link to hermes/.hermes/superbot/hermes$' <<<"$inner" || fail "the Hermes bundle lost a hard link"
+! grep -Eq ' hermes/(\.cache|\.hermes/cache/uv)/' <<<"$inner" || fail "the Hermes bundle carries caches"
+[[ "$(awk '{ print $2 }' <<<"$inner" | sort -u)" == 0/0 ]] || fail "the Hermes tree's entries aren't owned by 0/0"
+"$DIR/offline-bundle.sh" verify "$HB" >"$T/hverify.log" 2>&1 || { cat "$T/hverify.log" >&2; fail "a good Hermes bundle didn't verify"; }
+grep -q "good Hermes bundle" "$T/hverify.log" || fail "verify didn't say it is a Hermes bundle"
+ok "a Hermes bundle builds from a Hermes tree for /opt/hermes, with its links and without caches, and verifies"
+
+hbrefused() {
+  local why=$1 want=$2 out
+  shift 2
+  rm -rf "$T/hnope"
+  if out=$("$DIR/offline-bundle.sh" hermes --out "$T/hnope" "$@" 2>&1); then fail "$why: bundled"; fi
+  grep -Fq -- "$want" <<<"$out" || { printf '%s\n' "$out" >&2; fail "$why: refused for another reason"; }
+}
+fake_hermes "$T/hother" "$(printf 'b%.0s' {1..40})"
+hbrefused "another Hermes commit" "isn't Hermes Agent $HERMES_COMMIT" --tree "$T/hother/hermes"
+fake_hermes "$T/hhome" "$HERMES_COMMIT" /home/builder/hermes
+hbrefused "a tree installed for another place" "wasn't installed for /opt/hermes" --tree "$T/hhome/hermes"
+mkdir -p "$T/hname" && cp -a "$T/htree/hermes" "$T/hname/elsewhere"
+hbrefused "a folder not named hermes" "a folder named hermes" --tree "$T/hname/elsewhere"
+cp -a "$T/htree" "$T/hout2" && ln -s /etc/shadow "$T/hout2/hermes/.hermes/leak"
+hbrefused "a tree with a link out of it" "points outside /opt/hermes, to /etc/shadow" --tree "$T/hout2/hermes"
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  hbrefused "an install without root" "runs as root"
+  ok "a Hermes bundle is only made of the pinned commit's tree, installed for /opt/hermes, with no link out of it; installing one needs root"
+else
+  ok "a Hermes bundle is only made of the pinned commit's tree, installed for /opt/hermes, with no link out of it"
+fi
+
+# Repacks the Hermes bundle with hermes.tar made from $T/hx/hermes after a change there (or from
+# the change's own tar with HTAR=1), re-hashing SHA256SUMS unless KEEP_SUMS=1.
+hremake() {
+  local name=$1
+  shift
+  rm -rf "$T/hx" "$T/hy" && mkdir -p "$T/hx" "$T/hy"
+  tar -xf "$HB" -C "$T/hy"
+  tar -xf "$T/hy/$HTOP/hermes.tar" -C "$T/hx"
+  if [[ "${HTAR:-}" == 1 ]]; then
+    (cd "$T/hx" && "$@" >"$T/hy/$HTOP/hermes.tar")
+  elif [[ "${HMANIFEST:-}" == 1 ]]; then
+    (cd "$T/hy/$HTOP" && "$@")
+  else
+    (cd "$T/hx" && "$@")
+    tar -C "$T/hx" --sort=name -cf "$T/hy/$HTOP/hermes.tar" hermes
+  fi
+  if [[ "${KEEP_SUMS:-}" != 1 ]]; then
+    (cd "$T/hy/$HTOP" && find . -type f ! -path ./SHA256SUMS -printf '%P\n' | LC_ALL=C sort | xargs -d '\n' sha256sum >SHA256SUMS)
+  fi
+  tar -C "$T/hy" -czf "$T/$name.tar.gz" "$HTOP"
+  (cd "$T" && sha256sum "$name.tar.gz" >"$name.tar.gz.sha256")
+  printf '%s\n' "$T/$name.tar.gz"
+}
+refused "$(KEEP_SUMS=1 hremake hchanged sh -c 'echo evil >>hermes/.hermes/superbot/hermes')" "files don't match SHA256SUMS" "a changed hermes.tar"
+refused "$(hremake hsuid chmod u+s hermes/.hermes/superbot/hermes)" "setuid or setgid" "a setuid file in hermes.tar"
+refused "$(hremake hfifo mkfifo hermes/pipe)" "special files" "a pipe in hermes.tar"
+refused "$(HTAR=1 hremake houtside sh -c 'echo x >other && tar --sort=name -cf - hermes other')" "outside one hermes/ folder" "a file outside hermes/ in hermes.tar"
+refused "$(HTAR=1 hremake hdots tar --sort=name --transform 's,^hermes/.local/bin/hermes$,hermes/../x,' -cf - hermes)" "path with .." "a '..' entry in hermes.tar"
+refused "$(HTAR=1 hremake hhard tar --sort=name --transform 's,^hermes/.hermes/superbot/hermes$,elsewhere/hermes,RSh' -cf - hermes)" "hard link to a file outside" "a hard link out of hermes.tar"
+refused "$(HMANIFEST=1 hremake hkind sed -i 's/^kind=.*/kind=other/' MANIFEST)" "isn't a Hermes bundle's" "a Hermes bundle of another kind"
+refused "$(HMANIFEST=1 hremake hprefix sed -i 's,^prefix=.*,prefix=/home/x/hermes,' MANIFEST)" "installed for /home/x/hermes, not /opt/hermes" "a Hermes bundle for another place"
+refused "$(HMANIFEST=1 hremake hcommit sed -i 's/^hermes_commit=.*/hermes_commit=main/' MANIFEST)" "isn't a full commit" "a Hermes bundle without a commit"
+refused "$(HMANIFEST=1 hremake hnotar rm hermes.tar)" "no hermes.tar" "a Hermes bundle without hermes.tar"
+cp "$HB" "$T/hanchor.tar.gz"
+refused "$T/hanchor.tar.gz" "Nothing to check" "a Hermes bundle with no SHA-256 or signature beside it"
+ok "changed trees, setuid files, special files, paths outside hermes/, '..', hard links out, other kinds, places and commits are refused"
+
+# The tree as files, once unpacked: links must stay inside, read lexically.
+rm -rf "$T/hv" && mkdir -p "$T/hv" && tar -xOf "$HB" "$HTOP/hermes.tar" | tar -x -C "$T/hv"
+hermes_tree_ok "$T/hv/hermes" /opt/hermes || fail "a good Hermes tree was refused: $HERMES_TREE_PROBLEM"
+for bad in /etc ../../.. ../.hermes/../../x /opt/hermes-other/x /opt/hermes/../etc; do
+  ln -sfn "$bad" "$T/hv/hermes/.hermes/bad"
+  if hermes_tree_ok "$T/hv/hermes" /opt/hermes; then fail "a link to $bad was taken"; fi
+  [[ "$HERMES_TREE_PROBLEM" == *"points outside /opt/hermes"* ]] || fail "a link to $bad was refused for another reason: $HERMES_TREE_PROBLEM"
+done
+ln -sfn ../hermes-agent "$T/hv/hermes/.hermes/bad"
+hermes_tree_ok "$T/hv/hermes" /opt/hermes || fail "a relative link inside was refused: $HERMES_TREE_PROBLEM"
+rm "$T/hv/hermes/.hermes/bad" && mkfifo "$T/hv/hermes/pipe"
+if hermes_tree_ok "$T/hv/hermes" /opt/hermes; then fail "a pipe in the tree was taken"; fi
+ok "an unpacked Hermes tree's links stay inside it, absolute ones inside /opt/hermes"
+
+wrong=$(HMANIFEST=1 hremake harch sed -i "s/^arch=.*/arch=$other/" MANIFEST)
+"$DIR/offline-bundle.sh" verify "$wrong" >/dev/null || fail "verify (on any machine) refused another arch's Hermes bundle"
+rm -rf "$T/hu" && mkdir "$T/hu"
+if (hermes_unpack_bundle "$wrong" "$T/hu" "") 2>"$T/harch.err"; then fail "the installer accepted a Hermes bundle for $other"; fi
+grep -q "This Hermes bundle is for $other" "$T/harch.err" || fail "the Hermes arch refusal didn't say why"
+if (DRY_RUN=true HERMES_BUNDLE=$HB HERMES_COMMIT=$(printf 'c%.0s' {1..40}) prepare_hermes_bundle) >"$T/hpin.log" 2>&1; then
+  fail "a Hermes bundle of another commit than the installer pins was taken"
+fi
+grep -Fq "but this installer pins cccccccccccc" "$T/hpin.log" || { cat "$T/hpin.log" >&2; fail "the commit refusal didn't say why"; }
+if (DRY_RUN=true HERMES_BUNDLE=$HB HERMES_BUNDLE_SHA256=$(cut -c1-64 "$B.sha256") prepare_hermes_bundle) >/dev/null 2>&1; then
+  fail "a Hermes bundle was checked against the main bundle's --hermes-bundle-sha256"
+fi
+(DRY_RUN=true HERMES_BUNDLE=$HB HERMES_BUNDLE_SHA256=$(cut -c1-64 "$HB.sha256") OFFLINE_BUNDLE_SHA256=$(cut -c1-64 "$B.sha256") prepare_hermes_bundle) >/dev/null 2>&1 \
+  || fail "a Hermes bundle wasn't checked against its own --hermes-bundle-sha256"
+ok "the installer takes only this host's arch and the commit it pins, checked against the Hermes bundle's own SHA-256"
+
+# An upgrade without --with-hermes says when the Hermes Agent it keeps isn't the one pinned.
+fake_hermes "$T/hpinned" "$(printf 'd%.0s' {1..40})"
+note=$( (HERMES_SHARED_DIR=$T/hpinned/hermes OFFLINE_BUNDLE=$B SUPERBOT_USER=nobody-here DRY_RUN=true; hermes_pin_notice) 2>&1)
+grep -Fq "Hermes Agent dddddddddddd is installed in $T/hpinned/hermes, but this release pins ${HERMES_COMMIT:0:12}: re-run with --with-hermes --hermes-bundle" <<<"$note" \
+  || { printf '%s\n' "$note" >&2; fail "no notice for an installed Hermes Agent that isn't pinned"; }
+[[ -z "$( (HERMES_SHARED_DIR=$T/htree/hermes SUPERBOT_USER=nobody-here DRY_RUN=true; hermes_pin_notice) 2>&1)" ]] || fail "a notice for the pinned Hermes Agent"
+ok "an upgrade that keeps another Hermes Agent than the one pinned says how to replace it"
 
 # Images, with stand-ins for skopeo, docker, cosign and superbot-oci over a registry in $REG: an
 # index with this arch's image, another arch's and an attestation; a local image; a mirror to
@@ -487,17 +630,24 @@ ok "versions order as SemVer: a release candidate upgrades to its release, never
 flags() {
   (
     # shellcheck disable=SC2034
-    OFFLINE_BUNDLE=$B INSTALL_DIR="" WITH_HERMES=false DOMAIN="" TLS_CERT="" OFFLINE_BUNDLE_SHA256=""
+    OFFLINE_BUNDLE=$B INSTALL_DIR="" WITH_HERMES=false DOMAIN="" TLS_CERT="" OFFLINE_BUNDLE_SHA256="" HERMES_BUNDLE="" HERMES_BUNDLE_SHA256=""
     for a in "$@"; do declare "$a"; done
     check_offline_flags
   ) 2>&1
 }
-grep -q "can't run --offline" <<<"$(flags WITH_HERMES=true || true)" || fail "--offline --with-hermes was allowed"
+grep -q "needs --hermes-bundle" <<<"$(flags WITH_HERMES=true HERMES_BUNDLE="" || true)" || fail "--offline --with-hermes was allowed without a Hermes bundle"
+grep -q "needs --with-hermes" <<<"$(flags HERMES_BUNDLE="$HB" || true)" || fail "--hermes-bundle was taken without --with-hermes"
+grep -q "can't read" <<<"$(flags WITH_HERMES=true HERMES_BUNDLE="$T/nope.tar.gz" || true)" || fail "a Hermes bundle that isn't there was taken"
+grep -q "64 lowercase hex" <<<"$(flags WITH_HERMES=true HERMES_BUNDLE="$HB" HERMES_BUNDLE_SHA256=abc || true)" || fail "a bad --hermes-bundle-sha256 was taken"
+grep -q "needs --hermes-bundle" <<<"$(flags HERMES_BUNDLE_SHA256="$(printf '0%.0s' {1..64})" || true)" || fail "--hermes-bundle-sha256 was taken without a Hermes bundle"
+flags WITH_HERMES=true HERMES_BUNDLE="$HB" >/dev/null || fail "--offline --with-hermes --hermes-bundle was refused"
+# shellcheck disable=SC2034
+grep -q "for --offline installs" <<<"$( (OFFLINE_BUNDLE="" OFFLINE_BUNDLE_SHA256="" HERMES_BUNDLE=$HB; check_offline_flags) 2>&1 || true)" || fail "--hermes-bundle was taken without --offline"
 grep -q "needs --tls-cert" <<<"$(flags DOMAIN=bots.example.com || true)" || fail "--offline --domain without a certificate was allowed"
 grep -q "not --source-dir" <<<"$(flags INSTALL_DIR=/srv/src || true)" || fail "--offline --source-dir was allowed"
 # shellcheck disable=SC2034
 grep -q "needs --offline" <<<"$( (OFFLINE_BUNDLE="" OFFLINE_BUNDLE_SHA256=abc; check_offline_flags) 2>&1 || true)" || fail "--bundle-sha256 without --offline was allowed"
-ok "--offline refuses --with-hermes, --source-dir, and --domain without a certificate"
+ok "--offline refuses --with-hermes without a Hermes bundle, --source-dir, and --domain without a certificate; --hermes-bundle needs --offline and --with-hermes"
 
 # Operator certificates.
 cert() {
@@ -580,3 +730,14 @@ if [[ -z "$rec" || -z "$bin" ]] || ((rec > bin)); then
   fail "the bundle's version is recorded after its binaries are installed"
 fi
 ok "a dry run of the offline install uses only the bundle${net:+ (with no network)}"
+
+"${net[@]}" bash "$T/run.sh" "$DIR/install.sh" --dry-run --non-interactive --offline "$B" --with-hermes --hermes-bundle "$HB" \
+  --tz UTC >"$T/hdry.log" 2>&1 || { cat "$T/hdry.log" >&2; fail "the offline dry run with Hermes Agent failed"; }
+for want in "Hermes bundle: Hermes Agent $HTAG (${HERMES_COMMIT:0:12}, $ARCH) checked" \
+  "would install Hermes Agent $HERMES_COMMIT system-wide in /opt/hermes from the Hermes bundle $HB, linked from /usr/local/bin/hermes" "SuperBot is installed."; do
+  grep -Fq -- "$want" "$T/hdry.log" || { cat "$T/hdry.log" >&2; fail "the offline dry run with Hermes Agent didn't say: $want"; }
+done
+if grep -Ei 'apt-get|raw\.githubusercontent|would fetch|git clone' "$T/hdry.log"; then
+  fail "the offline dry run with Hermes Agent reached for the network"
+fi
+ok "a dry run of the offline install with Hermes Agent installs it from the Hermes bundle${net:+ (with no network)}"
