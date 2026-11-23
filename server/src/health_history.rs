@@ -99,7 +99,7 @@ pub fn tick(app: &App, s: Settings, now_ms: i64) -> (bool, usize) {
         crate::obs::log::log_warn!("Health score history: couldn't record today's score: {e}");
         false
     });
-    let pruned = app.db.health_scores_prune(&date_of(now_ms - i64::from(keep) * DAY_MS)).unwrap_or_else(|e| {
+    let pruned = app.db.health_scores_prune(&date_of(now_ms - (i64::from(keep) - 1) * DAY_MS)).unwrap_or_else(|e| {
         crate::obs::log::log_warn!("Health score history: couldn't delete days past {keep}: {e}");
         0
     });
@@ -268,9 +268,11 @@ mod tests {
             assert_eq!(tick(&app, Settings { keep_days: Some(3) }, DAY0 + n * DAY_MS).0, true);
         }
         let kept: Vec<String> = app.db.health_scores_since("2000-01-01").unwrap().into_iter().map(|d| d.day).collect();
-        assert_eq!(kept, [date_of(DAY0 + 2 * DAY_MS), date_of(DAY0 + 3 * DAY_MS), date_of(DAY0 + 4 * DAY_MS), date_of(DAY0 + 5 * DAY_MS)], "today and the 3 days before");
+        assert_eq!(kept, [date_of(DAY0 + 3 * DAY_MS), date_of(DAY0 + 4 * DAY_MS), date_of(DAY0 + 5 * DAY_MS)], "3 days, today included");
+        tick(&app, Settings { keep_days: Some(1) }, DAY0 + 6 * DAY_MS);
+        assert_eq!(app.db.health_scores_since("2000-01-01").unwrap().into_iter().map(|d| d.day).collect::<Vec<_>>(), [date_of(DAY0 + 6 * DAY_MS)], "1 day is today only");
         assert_eq!(tick(&app, Settings { keep_days: None }, DAY0 + 9 * DAY_MS), (false, 0), "off records and deletes nothing");
-        assert_eq!(app.db.health_scores_since("2000-01-01").unwrap().len(), 4);
+        assert_eq!(app.db.health_scores_since("2000-01-01").unwrap().len(), 1);
     }
 
     #[test]
