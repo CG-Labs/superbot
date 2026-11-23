@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
-import type { SuperBotApi } from "../src/api";
+import { ApiError, type SuperBotApi } from "../src/api";
 import { confirmAsync } from "../src/dialogs";
 import {
   approveChoices,
@@ -529,12 +529,16 @@ export function RolesAdmin({ api, meId, onBack }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [picked, setPicked] = useState<Picked>(null);
   const [requests, setRequests] = useState<RoleRequest[]>([]);
+  const [requestsError, setRequestsError] = useState<string | null>(null);
 
   const loadRequests = useCallback(async () => {
     try {
       setRequests((await api.roleRequests("pending")).requests);
-    } catch {
+      setRequestsError(null);
+    } catch (err) {
       setRequests([]);
+      // A server from before requests for roles (ADR 0209) has none to show.
+      setRequestsError(err instanceof ApiError && err.status === 404 ? null : message(err));
     }
   }, [api]);
 
@@ -589,6 +593,12 @@ export function RolesAdmin({ api, meId, onBack }: Props) {
           {!view && !error ? <ActivityIndicator color={colors.textDim} style={{ marginTop: 20 }} /> : null}
           {view ? (
             <ScrollView contentContainerStyle={{ gap: 4, paddingBottom: 24 }}>
+              {requestsError ? (
+                <View style={styles.request}>
+                  <Text style={styles.error} accessibilityRole="alert">{`Couldn't load requests for roles: ${requestsError}`}</Text>
+                  <Button label="Try again" a11y="Load requests again" onPress={() => void loadRequests()} />
+                </View>
+              ) : null}
               {requests.length ? (
                 <>
                   <Text style={styles.sectionTitle}>Requests ({requests.length})</Text>

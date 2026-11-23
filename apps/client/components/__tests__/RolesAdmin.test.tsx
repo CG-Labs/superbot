@@ -1,7 +1,7 @@
 import React from "react";
 import { render, screen, userEvent, waitFor } from "@testing-library/react-native";
 import { RolesAdmin } from "../RolesAdmin";
-import type { SuperBotApi } from "../../src/api";
+import { ApiError, type SuperBotApi } from "../../src/api";
 import type { AdminUser, CustomRole, RoleRequest, RolesView, Team } from "../../src/types";
 
 jest.mock("../../src/dialogs", () => ({ confirmAsync: jest.fn(async () => true) }));
@@ -283,6 +283,26 @@ describe("RolesAdmin: requests for roles (ADR 0209)", () => {
     await u.type(screen.getByLabelText("Note for Rex"), "Use the runbook");
     await u.press(screen.getByLabelText("Deny Rex's request"));
     await waitFor(() => expect(api.denyRoleRequest).toHaveBeenCalledWith("q2", "Use the runbook"));
+  });
+
+  it("says when requests didn't load, and tries again; an older server has none", async () => {
+    const api = mockApi();
+    api.roleRequests.mockRejectedValueOnce(new ApiError("Server error", 500));
+    api.roleRequests.mockResolvedValueOnce({ requests: [request()], pending: 1, pendingDays: 7 });
+    const u = userEvent.setup();
+    await show(api);
+    expect(await screen.findByText("Couldn't load requests for roles: Server error")).toBeTruthy();
+    await u.press(screen.getByLabelText("Load requests again"));
+    expect(await screen.findByText("Requests (1)")).toBeTruthy();
+    expect(screen.queryByText(/Couldn't load requests/)).toBeNull();
+  });
+
+  it("shows nothing for requests on a server from before them", async () => {
+    const api = mockApi();
+    api.roleRequests.mockRejectedValue(new ApiError("Not found", 404));
+    await show(api);
+    await screen.findByLabelText("Role Support");
+    expect(screen.queryByText(/Couldn't load requests/)).toBeNull();
   });
 
   it("leaves your own request to another admin", async () => {

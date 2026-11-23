@@ -716,7 +716,7 @@ $("add-team").addEventListener("submit", async (e) => {
 
 // Roles tab: build, change and delete custom roles, and give them to people.
 
-const rolesTab = { details: {}, people: [], teams: [], requests: [], editing: null };
+const rolesTab = { details: {}, people: [], teams: [], requests: [], requestsError: null, editing: null };
 
 async function loadRoles({ keepForm = false } = {}) {
   try {
@@ -725,13 +725,14 @@ async function loadRoles({ keepForm = false } = {}) {
       Promise.all(roles.roles.map((r) => api("GET", `/api/roles/${key(r.id)}`))),
       api("GET", "/api/users").catch(() => []),
       api("GET", "/api/teams").then((v) => v.teams || []).catch(() => []),
-      // Servers from before requests for roles (ADR 0209) have none.
-      api("GET", "/api/role-requests?status=pending").then((v) => v.requests || []).catch(() => []),
+      // Servers from before requests for roles (ADR 0209) have none; any other failure is shown.
+      api("GET", "/api/role-requests?status=pending").then((v) => ({ list: v.requests || [] }), (err) => ({ list: [], error: err.status === 404 ? null : err.message })),
     ]);
     rolesTab.details = Object.fromEntries(details.map((d) => [d.id, d]));
     rolesTab.people = people;
     rolesTab.teams = allTeams;
-    rolesTab.requests = requests;
+    rolesTab.requests = requests.list;
+    rolesTab.requestsError = requests.error || null;
     $("roles-empty").textContent = "No custom roles yet. Make one below to give part of admin away.";
   } catch (err) {
     $("roles-empty").textContent = err.message;
@@ -808,8 +809,10 @@ function roleCard(r) {
 
 // `keepForm` keeps unsaved edits when only the holders changed.
 function renderRoles(keepForm = false) {
-  $("role-requests").hidden = !rolesTab.requests.length;
-  $("role-requests-list").innerHTML = rolesTab.requests.map(requestCard).join("");
+  $("role-requests").hidden = !rolesTab.requests.length && !rolesTab.requestsError;
+  $("role-requests-list").innerHTML = (rolesTab.requestsError
+    ? `<div class="card"><p class="warn" role="alert">Couldn't load requests for roles: ${esc(rolesTab.requestsError)}</p><div class="bar"><button type="button" class="btn" id="role-requests-retry">Try again</button></div></div>`
+    : "") + rolesTab.requests.map(requestCard).join("");
   $("roles-empty").hidden = roles.roles.length > 0;
   $("roles-list").innerHTML = roles.roles.map(roleCard).join("")
     + `<datalist id="role-people">${rolesTab.people.filter((u) => !u.breakGlass && u.id !== me.user?.id).map((u) => `<option value="${esc(u.email || u.id)}">${esc(u.name)}</option>`).join("")}</datalist>`;
@@ -876,6 +879,9 @@ $("role-form").addEventListener("submit", async (e) => {
 
 const roleOf = (el) => roles.roles.find((r) => r.id === el.closest("[data-role]").dataset.role);
 
+$("role-requests-list").addEventListener("click", (e) => {
+  if (e.target.closest("#role-requests-retry")) loadRoles({ keepForm: true });
+});
 $("role-requests-list").addEventListener("submit", async (e) => {
   const f = e.target.closest("form[data-act=decide-request]");
   if (!f) return;
