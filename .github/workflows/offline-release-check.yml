@@ -129,7 +129,9 @@ jobs:
           for _ in $(seq 1 30); do sudo ip netns exec offline curl -fsS http://127.0.0.1:3000/healthz >/dev/null 2>&1 && break; sleep 1; done
           sudo ip netns exec offline curl -fsS http://127.0.0.1:3000/healthz
           grep -qx "version=$VERSION" /usr/local/share/superbot/offline-release
-          sudo unshare --net -- deploy/offline-bundle.sh load "$b" --sha256 "$sum"
+          sudo unshare --net -- env PATH="$(dirname "$(command -v cosign)"):$PATH" SIGSTORE_TRUSTED_ROOT="$RUNNER_TEMP/trusted_root.json" \
+            deploy/offline-bundle.sh load "$b" --sha256 "$sum" | tee /tmp/offline-load.log
+          grep -Fq 'Bundle signature verified' /tmp/offline-load.log
           for image in "ghcr.io/${GITHUB_REPOSITORY,,}:$VERSION" "ghcr.io/${GITHUB_REPOSITORY,,}-caddy:$VERSION"; do
             [[ $(docker image inspect --format '{{.Architecture}}' "$image") == amd64 ]]
           done

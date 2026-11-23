@@ -90,10 +90,10 @@ stage_bundles() {
 
 # The digest a registry's tag names, read as a customer would: anonymously, unless the
 # operator's own auth file has a login.
+# Hashed from a file, byte for byte: a command substitution would drop a trailing newline.
 registry_digest() {
-  local raw
-  raw=$(skopeo inspect --raw "docker://$1") || return 1
-  printf 'sha256:%s\n' "$(printf '%s' "$raw" | sha256sum | cut -c1-64)"
+  skopeo inspect --raw "docker://$1" >"$WORK/raw.json" || return 1
+  printf 'sha256:%s\n' "$(sha256sum <"$WORK/raw.json" | cut -c1-64)"
 }
 
 cmd_online() {
@@ -199,8 +199,8 @@ cmd_online() {
       [[ -z "$index" || "$got" == "$index" ]] || die "The bundles' $name images come from different indexes ($index, $got)"
       index=$got
     done
-    raw=$(skopeo inspect --raw "docker://$ref") || die "Couldn't read $ref from its registry, as a customer's connected machine would (anonymously)"
-    got="sha256:$(printf '%s' "$raw" | sha256sum | cut -c1-64)"
+    got=$(registry_digest "$ref") || die "Couldn't read $ref from its registry, as a customer's connected machine would (anonymously)"
+    raw=$(cat "$WORK/raw.json")
     [[ "$got" == "$index" ]] || die "$ref names $got now, but the bundles carry $index: the tag has moved since the bundles were made"
     for a in "${ARCHES[@]}"; do
       m="$WORK/x-$a/superbot-offline-$VERSION-$a"
@@ -268,6 +268,15 @@ cmd_offline() {
     log "$(basename "$b"): signature and every file verified with no network"
     push+=("$b") sums+=(--sha256 "$sum")
   done
+
+  # A record cut short must not pass with nothing checked in the mirror: every image the
+  # verified bundles hold needs its record, and every record an image.
+  local listed recorded
+  listed=$(tar -xzOf "$(bundle_path "$dir" "$VERSION" x86_64)" "superbot-offline-$VERSION-x86_64/MANIFEST" | sed -n 's/^images=//p' | tail -n 1 \
+    | tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' ')
+  recorded=$(awk '$1 == "image" { print $2 }' "$expected" | sort | tr '\n' ' ')
+  [[ -n "$listed" ]] || die "The bundles hold no images: nothing to check in a mirror"
+  [[ "$recorded" == "$listed" ]] || die "$expected records images \"${recorded% }\", but the bundles hold \"${listed% }\": run the online check again"
 
   SIGSTORE_TRUSTED_ROOT=$TRUSTED_ROOT "$DIR/offline-bundle.sh" push "${push[@]}" "${sums[@]}" --registry "$mirror" >"$WORK/push.log" 2>&1 \
     || { cat "$WORK/push.log" >&2; die "Pushing both bundles to $mirror failed"; }
