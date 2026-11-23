@@ -223,11 +223,13 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
                     if joined_now(app, cp, n, t, m) {
                         joined += 1;
                     }
-                } else if m.state == State::Running {
+                } else {
                     // Also after a restart of botd, which remembers joins only in memory.
                     joining_set(cp).insert(m.id.clone());
-                    pending += 1;
-                    to_boot.push((n.clone(), t.to_string(), m.clone()));
+                    if m.state == State::Running {
+                        pending += 1;
+                        to_boot.push((n.clone(), t.to_string(), m.clone()));
+                    }
                 }
                 continue;
             }
