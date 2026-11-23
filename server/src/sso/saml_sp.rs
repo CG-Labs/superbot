@@ -53,6 +53,8 @@ pub const ASSERTION: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
 const METADATA: &str = "urn:oasis:names:tc:SAML:2.0:metadata";
 const POST: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST";
 const REDIRECT: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect";
+/// The SOAP binding: back-channel logout, server to server (ADR 0208).
+pub(super) const SOAP: &str = "urn:oasis:names:tc:SAML:2.0:bindings:SOAP";
 pub(super) const SUCCESS: &str = "urn:oasis:names:tc:SAML:2.0:status:Success";
 const BEARER: &str = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
 const PERSISTENT: &str = "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent";
@@ -163,6 +165,9 @@ pub struct IdpMetadata {
     pub certs: Vec<Cert>,
     /// The HTTP-Redirect SingleLogoutService on https, if it has one: single logout is on.
     pub slo: Option<Slo>,
+    /// The SOAP SingleLogoutService on https, if it has one: botd signs out of the IdP over the
+    /// back channel when there's no browser to send (ADR 0208).
+    pub slo_soap: Option<String>,
 }
 
 /// Where the IdP takes logout messages: requests at `location`, our responses at `response`.
@@ -179,10 +184,12 @@ pub struct Sp<'a> {
 }
 
 /// What our metadata adds with an SP key: its certificate (base64 DER) and, during a rollover,
-/// the next key's after it (ADR 0181); our SLO URL; and whether AuthnRequests are signed.
+/// the next key's after it (ADR 0181); our SLO URLs, front channel and SOAP (ADR 0208); and
+/// whether AuthnRequests are signed.
 pub struct SpSigning<'a> {
     pub certs: &'a [&'a str],
     pub slo: &'a str,
+    pub slo_soap: &'a str,
     pub sign_requests: bool,
 }
 
@@ -321,7 +328,14 @@ fn read_idp(entity: Node, entity_id: &str, signs_requests: bool) -> Result<IdpMe
         let response = n.attribute("ResponseLocation").map(str::trim).filter(|r| !r.is_empty()).unwrap_or(&location).to_string();
         (super::secure_url(&location) && super::secure_url(&response)).then_some(Slo { location, response })
     });
-    Ok(IdpMetadata { entity_id: entity_id.into(), sso_url, certs, slo })
+    // SOAP answers on the same connection, so a ResponseLocation means nothing there.
+    let slo_soap = elements(idp)
+        .into_iter()
+        .filter(|n| is(*n, METADATA, "SingleLogoutService") && n.attribute("Binding") == Some(SOAP))
+        .filter_map(|n| n.attribute("Location").map(str::trim))
+        .find(|l| super::secure_url(l))
+        .map(String::from);
+    Ok(IdpMetadata { entity_id: entity_id.into(), sso_url, certs, slo, slo_soap })
 }
 
 /// Whether a native provider takes encrypted assertions (`SSO_<ID>_ENCRYPTED_ASSERTIONS`,
@@ -407,7 +421,12 @@ pub fn sp_metadata(sp: &Sp, signing: Option<&SpSigning>, encryption: &[&str]) ->
         keys += &format!("\n    <md:KeyDescriptor use=\"encryption\">{}{}</md:KeyDescriptor>", key_info(cert), encryption_methods());
     }
     if let Some(s) = signing {
-        keys += &format!("\n    <md:SingleLogoutService Binding=\"{REDIRECT}\" Location=\"{slo}\"/>\n    <md:SingleLogoutService Binding=\"{POST}\" Location=\"{slo}\"/>", slo = escape(s.slo));
+        // SOAP last: IdPs that pick by metadata order (older Shibboleth) keep the front channel.
+        keys += &format!(
+            "\n    <md:SingleLogoutService Binding=\"{REDIRECT}\" Location=\"{slo}\"/>\n    <md:SingleLogoutService Binding=\"{POST}\" Location=\"{slo}\"/>\n    <md:SingleLogoutService Binding=\"{SOAP}\" Location=\"{}\"/>",
+            escape(s.slo_soap),
+            slo = escape(s.slo)
+        );
     }
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -534,6 +553,12 @@ impl SpKey {
             }
             Signing::Ec(pair, _) => pair.sign(&rng, data).expect("ECDSA signing").as_ref().to_vec(),
         }
+    }
+
+    /// `xml`, a message of ours whose `ID` is `id`, with our enveloped signature: what the SOAP
+    /// binding carries instead of a signed query (ADR 0208).
+    pub fn sign_enveloped(&self, xml: &str, id: &str) -> Result<String, String> {
+        xmldsig::sign_enveloped(xml, id, self.sig_alg(), &self.cert, |d| self.sign(d)).map_err(|e| format!("couldn't sign our message ({})", e.0))
     }
 
     /// The key as RSA-OAEP decrypts with it, for encrypted assertions and NameIDs (`xmlenc`).
@@ -1142,6 +1167,11 @@ pub mod test_idp {
         xml.replacen("<md:NameIDFormat>", &format!(r#"<md:SingleLogoutService Binding="{REDIRECT}" Location="{SLO_URL}"/><md:NameIDFormat>"#), 1)
     }
 
+    /// `xml` with a SOAP SingleLogoutService at `location` added (ADR 0208).
+    pub fn with_soap_slo(xml: &str, location: &str) -> String {
+        xml.replacen("<md:NameIDFormat>", &format!(r#"<md:SingleLogoutService Binding="{SOAP}" Location="{location}"/><md:NameIDFormat>"#), 1)
+    }
+
     /// The parts of a response, each one replaceable before it is signed.
     /// An `InResponseTo` value that is sent, but empty.
     pub const EMPTY_IN_RESPONSE_TO: &str = "(empty)";
@@ -1303,7 +1333,7 @@ pub mod test_idp {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::test_idp::*;
     use super::*;
     use crate::sso::xmldsig::test_signer::{Signer, signers};
@@ -1371,6 +1401,15 @@ mod tests {
         assert_eq!(parse_idp_metadata(&with_slo(&metadata()).replace(SLO_URL, "http://idp.example/slo"), IDP, false).unwrap().slo, None, "not over plain http");
         let post_only = with_slo(&metadata()).replacen(&format!(r#"Binding="{REDIRECT}" Location="{SLO_URL}""#), &format!(r#"Binding="{POST}" Location="{SLO_URL}""#), 1);
         assert_eq!(parse_idp_metadata(&post_only, IDP, false).unwrap().slo, None, "only the redirect binding is sent to");
+
+        // The back channel (ADR 0208): a SOAP endpoint of its own, with or without the front one.
+        assert_eq!(idp().slo_soap, None);
+        let soap = "https://idp.example/profile/SAML2/SOAP/SLO";
+        let both = parse_idp_metadata(&with_soap_slo(&with_slo(&metadata()), soap), IDP, false).unwrap();
+        assert_eq!((both.slo.is_some(), both.slo_soap.as_deref()), (true, Some(soap)));
+        let only = parse_idp_metadata(&with_soap_slo(&metadata(), soap), IDP, false).unwrap();
+        assert_eq!((only.slo, only.slo_soap.as_deref()), (None, Some(soap)), "SOAP alone isn't front-channel logout");
+        assert_eq!(parse_idp_metadata(&with_soap_slo(&metadata(), "http://idp.example/soap"), IDP, false).unwrap().slo_soap, None, "not over plain http");
     }
 
     #[test]
@@ -1400,7 +1439,7 @@ mod tests {
     }
 
     /// A configured ECDSA SP key: its PEM and its certificate's PEM.
-    fn ec_sp_key(alg: &'static rcgen::SignatureAlgorithm) -> (String, String) {
+    pub(crate) fn ec_sp_key(alg: &'static rcgen::SignatureAlgorithm) -> (String, String) {
         let key = rcgen::KeyPair::generate_for(alg).unwrap();
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         params.distinguished_name.push(rcgen::DnType::CommonName, "SuperBot SAML SP (okta)");
@@ -1471,17 +1510,18 @@ mod tests {
         let sp = Sp { entity_id: SP, acs: ACS };
         let (key, _) = SpKey::generate("sp").unwrap();
         let slo = "https://bot.example.com/api/auth/sso/okta/slo";
+        let slo_soap = "https://bot.example.com/api/auth/sso/okta/slo/soap";
         for sign_requests in [false, true] {
-            let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&key.cert], slo, sign_requests }), &[]);
+            let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&key.cert], slo, slo_soap, sign_requests }), &[]);
             let doc = roxmltree::Document::parse(&md).unwrap();
             let spsso = doc.descendants().find(|n| is(*n, METADATA, "SPSSODescriptor")).unwrap();
             assert_eq!(spsso.attribute("AuthnRequestsSigned"), Some(if sign_requests { "true" } else { "false" }));
             let cert = doc.descendants().find(|n| is(*n, xmldsig::DSIG, "X509Certificate")).and_then(|n| n.text());
             assert_eq!(cert, Some(key.cert.as_str()));
             let slos: Vec<_> = doc.descendants().filter(|n| is(*n, METADATA, "SingleLogoutService")).map(|n| (n.attribute("Binding").unwrap(), n.attribute("Location").unwrap())).collect();
-            assert_eq!(slos, [(REDIRECT, slo), (POST, slo)]);
+            assert_eq!(slos, [(REDIRECT, slo), (POST, slo), (SOAP, slo_soap)], "SOAP last, so IdPs that go by order keep the front channel");
             let order: Vec<&str> = elements(spsso).iter().map(|n| n.tag_name().name()).collect();
-            assert_eq!(order, ["KeyDescriptor", "SingleLogoutService", "SingleLogoutService", "NameIDFormat", "AssertionConsumerService"], "schema order");
+            assert_eq!(order, ["KeyDescriptor", "SingleLogoutService", "SingleLogoutService", "SingleLogoutService", "NameIDFormat", "AssertionConsumerService"], "schema order");
         }
         assert!(!sp_metadata(&sp, None, &[]).contains("SingleLogoutService"), "no key, no logout");
     }
@@ -2215,11 +2255,11 @@ mod tests {
         let sp = Sp { entity_id: SP, acs: ACS };
         let (sign, _) = SpKey::generate("sp").unwrap();
         let enc = &enc_keys()[0];
-        let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&sign.cert], slo: "https://bot.example.com/slo", sign_requests: false }), &[&enc.cert]);
+        let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&sign.cert], slo: "https://bot.example.com/slo", slo_soap: "https://bot.example.com/slo/soap", sign_requests: false }), &[&enc.cert]);
         let doc = roxmltree::Document::parse(&md).unwrap();
         let spsso = doc.descendants().find(|n| is(*n, METADATA, "SPSSODescriptor")).unwrap();
         let order: Vec<String> = elements(spsso).iter().map(|n| format!("{}{}", n.tag_name().name(), n.attribute("use").map(|u| format!("/{u}")).unwrap_or_default())).collect();
-        assert_eq!(order, ["KeyDescriptor/signing", "KeyDescriptor/encryption", "SingleLogoutService", "SingleLogoutService", "NameIDFormat", "AssertionConsumerService"], "schema order");
+        assert_eq!(order, ["KeyDescriptor/signing", "KeyDescriptor/encryption", "SingleLogoutService", "SingleLogoutService", "SingleLogoutService", "NameIDFormat", "AssertionConsumerService"], "schema order");
         let kd = elements(spsso)[1];
         assert_eq!(kd.descendants().find(|n| is(*n, xmldsig::DSIG, "X509Certificate")).and_then(|n| n.text()), Some(enc.cert.as_str()), "its own key, not the signing one");
         let methods: Vec<&str> = elements(kd).iter().filter(|n| is(**n, METADATA, "EncryptionMethod")).filter_map(|n| n.attribute("Algorithm")).collect();

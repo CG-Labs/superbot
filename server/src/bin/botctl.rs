@@ -1754,6 +1754,11 @@ fn saml_summary(v: &Value) -> String {
         if v["singleLogout"].as_bool().unwrap_or(false) { "yes" } else { "no (the IdP's metadata has no HTTP-Redirect SingleLogoutService)" }
     );
     out += &format!(
+        "  Back-channel logout:      {}\n    SOAP SLO URL:            {}\n",
+        if v["backChannelLogout"].as_bool().unwrap_or(false) { "from the IdP, and to it" } else { "from the IdP only (its metadata has no SOAP SingleLogoutService)" },
+        s("sloSoapUrl")
+    );
+    out += &format!(
         "  IdP-initiated sign-in:    {}\n",
         if v["idpInitiated"].as_str() == Some("restart") { "restarted as SP-initiated" } else { "refused (start from SuperBot)" }
     );
@@ -1787,6 +1792,9 @@ fn saml_summary(v: &Value) -> String {
     out += &format!(":\n    Sign-in URL: {}\n", idp["ssoUrl"].as_str().unwrap_or_default());
     if let Some(slo) = idp["sloUrl"].as_str() {
         out += &format!("    Logout URL:  {slo}\n");
+    }
+    if let Some(slo) = idp["sloSoapUrl"].as_str() {
+        out += &format!("    SOAP logout URL:  {slo}\n");
     }
     for c in idp["certificates"].as_array().into_iter().flatten() {
         out += &format!("    Certificate SHA-256 {} ({}), expires {}{}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]), ending(c));
@@ -3530,19 +3538,24 @@ mod tests {
         assert!(out.contains("ACS URL (reply URL):      https://bots.example/api/auth/sso/corp/acs"), "{out}");
         assert!(out.contains("from botctl: not loaded yet."), "{out}");
         assert!(out.contains("Signs AuthnRequests:      no") && out.contains("Single logout:            no ("), "{out}");
+        assert!(out.contains("Back-channel logout:      from the IdP only ("), "{out}");
         assert!(out.contains("IdP-initiated sign-in:    refused (start from SuperBot)\n"), "{out}");
         v["idpInitiated"] = json!("restart");
         assert!(saml_summary(&v).contains("IdP-initiated sign-in:    restarted as SP-initiated\n"));
-        v["idp"] = json!({ "ssoUrl": "https://idp.example/sso", "sloUrl": "https://idp.example/slo", "certificates": [{ "sha256": "ab:cd", "subject": "CN=idp", "notAfter": 1_900_000_000_000_i64 }] });
+        v["idp"] = json!({ "ssoUrl": "https://idp.example/sso", "sloUrl": "https://idp.example/slo", "sloSoapUrl": "https://idp.example/soap", "certificates": [{ "sha256": "ab:cd", "subject": "CN=idp", "notAfter": 1_900_000_000_000_i64 }] });
         v["sloUrl"] = json!("https://bots.example/api/auth/sso/corp/slo");
+        v["sloSoapUrl"] = json!("https://bots.example/api/auth/sso/corp/slo/soap");
         v["signRequests"] = json!(true);
         v["singleLogout"] = json!(true);
+        v["backChannelLogout"] = json!(true);
         v["spKey"] = json!({ "from": "generated", "certificate": { "sha256": "12:34", "subject": "CN=sp", "notAfter": 1_900_000_000_000_i64 } });
         let out = saml_summary(&v);
         assert!(out.contains("Certificate SHA-256 ab:cd (CN=idp), expires 2030-03-17"), "{out}");
         assert!(out.contains("SLO URL (logout URL):     https://bots.example/api/auth/sso/corp/slo") && out.contains("    Logout URL:  https://idp.example/slo"), "{out}");
         assert!(out.contains("SP signing certificate:   SHA-256 12:34 (generated), expires 2030-03-17"), "{out}");
         assert!(out.contains("Signs AuthnRequests:      yes") && out.contains("Single logout:            yes\n"), "{out}");
+        assert!(out.contains("Back-channel logout:      from the IdP, and to it\n    SOAP SLO URL:            https://bots.example/api/auth/sso/corp/slo/soap\n"), "{out}");
+        assert!(out.contains("    SOAP logout URL:  https://idp.example/soap\n"), "{out}");
         assert!(out.contains("Encrypted assertions:     off") && !out.contains("SP encryption"), "{out}");
         v["encryptedAssertions"] = json!("require");
         v["spEncryptionKey"] = json!({ "from": "secret", "certificate": { "sha256": "56:78", "subject": "CN=enc", "notAfter": 1_900_000_000_000_i64 } });
