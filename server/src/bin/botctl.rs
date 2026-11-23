@@ -256,6 +256,22 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    ticket system's CSV export: tickets by month and severity,
                                                    response targets met and missed, and what's still open.
                                                    Reads only ids, severities, plans and times
+  botctl incidents [json]                          Status page incidents (ADR 0090), open first
+  botctl incident open "<title>" "<text>" [--impact <none|minor|major|critical|maintenance>]
+    [--component <api|database|machines|runners|notifications>]... [--state <state>]
+                                                   Post one on the public status page (default: minor,
+                                                   investigating). Anyone can read the text
+  botctl incident update <id> <investigating|identified|monitoring|resolved> "<text>"
+  botctl incident resolve <id> "<text>"            A new entry on its timeline; resolve ends it
+  botctl incident edit <id> [--title <title>] [--impact <impact>] [--component <id>]...
+  botctl incident delete <id> --yes                For one posted by mistake. Resolve real ones
+  botctl incident review <id> [--detected <time>] [--lead-hours <n>] [--json] [-o <file>]
+                                                   Draft the incident review (ADR 0201) as Markdown: the
+                                                   status page timeline, botd's starts and changes in the
+                                                   24 h before (1 to 168), runs, sign-ins and denials while
+                                                   it lasted against the time before, and the update
+                                                   targets; --detected judges the 15-minute first post.
+                                                   Names nobody. -o saves it to a new file
   botctl evidence                                  The evidence bundle schedule (EVIDENCE_BUNDLES), where
                                                    bundles are written and those kept (ADR 0142)
   botctl evidence baseline [json]                  Check this server against the configuration baseline
@@ -1909,6 +1925,22 @@ fn run(args: &[String]) -> Result<String, String> {
             let res = api(Cred::Operator, "GET", &path, None)?;
             if json { Ok(pretty(res)) } else { Ok(health_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)) }
         }
+        ["incidents"] => Ok(incidents_summary(&serde_json::from_str(&api(Cred::Operator, "GET", "/api/status/incidents", None)?).map_err(|e| e.to_string())?)),
+        ["incidents", "json"] => op("GET", "/api/status/incidents", None),
+        ["incident", "review", rest @ ..] => {
+            let (path, json, out) = incident_review_request(rest)?;
+            let res = api(Cred::Operator, "GET", &path, None)?;
+            let res = if json { pretty(res) } else { res };
+            match out {
+                Some(file) => save_private(file, res.as_bytes()).map(|_| format!("Saved {file}. Fill in what's marked \"To fill in\" before you share it.")),
+                None => Ok(res),
+            }
+        }
+        ["incident", rest @ ..] => {
+            let (method, path, body) = incident_request(rest)?;
+            let res = api(Cred::Operator, method, &path, body)?;
+            Ok(incident_done(rest, &serde_json::from_str(&res).unwrap_or_default()))
+        }
         ["evidence"] => op("GET", "/api/evidence", None),
         ["evidence", "bundle", rest @ ..] => evidence_bundle(rest),
         ["evidence", "baseline", rest @ ..] => {
@@ -2187,6 +2219,119 @@ fn support_report(rest: &[&str], mut stdin: impl Read) -> Result<String, String>
     })
 }
 
+const INCIDENT_USAGE: &str = "Usage: botctl incident open \"<title>\" \"<text>\" [--impact <impact>] [--component <id>]... [--state <state>] | update <id> <state> \"<text>\" | resolve <id> \"<text>\" | edit <id> [--title <title>] [--impact <impact>] [--component <id>]... | delete <id> --yes | review <id> [--detected <time>] [--lead-hours <n>] [--json] [-o <file>]";
+
+/// `--impact`, `--component` (repeatable), `--state` and `--title` after an incident's
+/// positional arguments, as the JSON botd takes. `allowed` names those the command takes.
+fn incident_flags(rest: &[&str], allowed: &[&str]) -> Result<Map<String, Value>, String> {
+    let mut body = Map::new();
+    let mut components: Vec<Value> = Vec::new();
+    let mut it = rest.iter();
+    while let Some(flag) = it.next() {
+        if !allowed.contains(flag) {
+            return Err(INCIDENT_USAGE.into());
+        }
+        let v = it.next().filter(|v| !v.starts_with("--")).ok_or_else(|| format!("{flag} needs a value"))?;
+        match *flag {
+            "--component" => components.push(json!(v)),
+            f => _ = body.insert(f.trim_start_matches("--").into(), json!(v)),
+        }
+    }
+    if !components.is_empty() {
+        body.insert("components".into(), Value::Array(components));
+    }
+    Ok(body)
+}
+
+/// `botctl incident open|update|resolve|edit|delete`: the method, path and body.
+fn incident_request(rest: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
+    let at = |id: &str, tail: &str| format!("/api/status/incidents/{}{tail}", encode(id));
+    match rest {
+        ["open", title, text, flags @ ..] => {
+            let mut body = incident_flags(flags, &["--impact", "--component", "--state"])?;
+            body.insert("title".into(), json!(title));
+            body.insert("body".into(), json!(text));
+            Ok(("POST", "/api/status/incidents".into(), Some(Value::Object(body).to_string())))
+        }
+        ["update", id, state, text] => Ok(("POST", at(id, "/updates"), Some(json!({ "state": state, "body": text }).to_string()))),
+        ["resolve", id, text] => Ok(("POST", at(id, "/updates"), Some(json!({ "state": "resolved", "body": text }).to_string()))),
+        ["edit", id, flags @ ..] if !flags.is_empty() => {
+            let body = incident_flags(flags, &["--title", "--impact", "--component"])?;
+            Ok(("PATCH", at(id, ""), Some(Value::Object(body).to_string())))
+        }
+        ["delete", id, "--yes"] => Ok(("DELETE", at(id, ""), None)),
+        ["delete", _] => Err("Deleting takes it and its timeline off the status page for good; resolve it if it really happened, or add --yes".into()),
+        _ => Err(INCIDENT_USAGE.into()),
+    }
+}
+
+/// What `botctl incident open|update|resolve|edit|delete` did, and what comes next.
+fn incident_done(rest: &[&str], v: &Value) -> String {
+    let id = v["id"].as_str().unwrap_or_default();
+    let state = v["state"].as_str().unwrap_or_default();
+    match rest.first() {
+        Some(&"open") => format!(
+            "Posted {id} ({state}, {}). It's on the status page now. Update it at least hourly:\n  botctl incident update {id} <investigating|identified|monitoring|resolved> \"<text>\"",
+            v["impact"].as_str().unwrap_or_default()
+        ),
+        Some(&"delete") => "Deleted. It's off the status page.".into(),
+        Some(&"edit") => format!("Saved {id} ({}).", v["impact"].as_str().unwrap_or_default()),
+        _ if state == "resolved" => format!("Resolved {id}. Draft its review (docs/support/incident-review.md):\n  botctl incident review {id} --detected <when it was detected> -o review-{id}.md"),
+        _ => format!("Updated {id}: {state}. Next update within the hour."),
+    }
+}
+
+/// `botctl incident review <id> [--detected <time>] [--lead-hours <n>] [--json] [-o <file>]`:
+/// the path, whether to print JSON, and the file to save to.
+fn incident_review_request<'a>(rest: &[&'a str]) -> Result<(String, bool, Option<&'a str>), String> {
+    let usage = || "Usage: botctl incident review <id> [--detected <time>] [--lead-hours <n>] [--json] [-o <file>]".to_string();
+    let (id, flags) = rest.split_first().filter(|(id, _)| !id.starts_with('-')).ok_or_else(usage)?;
+    let (mut query, mut json, mut out) = (Vec::new(), false, None);
+    let mut it = flags.iter();
+    while let Some(flag) = it.next() {
+        match *flag {
+            "--json" | "json" => json = true,
+            "--detected" => query.push(format!("detected={}", encode(it.next().ok_or("--detected needs a time: YYYY-MM-DD, RFC 3339 or unix ms")?))),
+            "--lead-hours" => {
+                let n: u32 = it.next().and_then(|n| n.parse().ok()).ok_or("--lead-hours needs a number of hours (1 to 168)")?;
+                query.push(format!("lead={n}"));
+            }
+            "-o" | "--out" => out = Some(*it.next().ok_or_else(usage)?),
+            _ => return Err(usage()),
+        }
+    }
+    if !json {
+        query.push("format=markdown".into());
+    }
+    let q = if query.is_empty() { String::new() } else { format!("?{}", query.join("&")) };
+    Ok((format!("/api/status/incidents/{}/review{q}", encode(id)), json, out))
+}
+
+/// `botctl incidents`: one line each, open ones first as botd lists them.
+fn incidents_summary(v: &Value) -> String {
+    let list = v["incidents"].as_array().cloned().unwrap_or_default();
+    if list.is_empty() {
+        return "No incidents.".into();
+    }
+    let when = |ms: &Value| ms.as_i64().and_then(chrono::DateTime::from_timestamp_millis).map(|t| t.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default();
+    let mut out = String::new();
+    for i in &list {
+        let resolved = if i["resolvedAt"].is_null() { String::new() } else { format!(", resolved {}", when(&i["resolvedAt"])) };
+        out.push_str(&format!(
+            "  {}  {:<13} {:<11} {} UTC{resolved}  {}\n",
+            i["id"].as_str().unwrap_or_default(),
+            i["state"].as_str().unwrap_or_default(),
+            i["impact"].as_str().unwrap_or_default(),
+            when(&i["createdAt"]),
+            i["title"].as_str().unwrap_or_default()
+        ));
+    }
+    if v["enabled"] == false {
+        out.push_str("The public status page is off (STATUS_PAGE=off): these show once it's on.\n");
+    }
+    out
+}
+
 /// `botctl health-score [--days <n>] [json]`: the path, and whether to print the JSON.
 fn health_request(rest: &[&str]) -> Result<(String, bool), String> {
     health_request_at(rest, "/api/support/health-score", "Usage: botctl health-score [--days <n>] [json]")
@@ -2413,6 +2558,59 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         assert!(support_report(&["/nonexistent/tickets.csv", "--plan", "pro"], std::io::empty()).unwrap_err().contains("/nonexistent/tickets.csv"));
         assert!(support_report(&[], std::io::empty()).unwrap_err().starts_with("Usage: botctl support-report"));
+    }
+
+    #[test]
+    fn incident_commands_become_status_page_requests() {
+        let body = |r: Result<(&str, String, Option<String>), String>| {
+            let (m, p, b) = r.unwrap();
+            (m.to_string(), p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap()))
+        };
+        assert_eq!(
+            body(incident_request(&["open", "Runs fail", "We're looking.", "--impact", "critical", "--component", "runners", "--component", "api"])),
+            ("POST".into(), "/api/status/incidents".into(), Some(json!({ "title": "Runs fail", "body": "We're looking.", "impact": "critical", "components": ["runners", "api"] })))
+        );
+        assert_eq!(body(incident_request(&["open", "Upgrade", "Back soon.", "--impact", "maintenance", "--state", "identified"])).2.unwrap()["state"], "identified");
+        assert_eq!(
+            body(incident_request(&["update", "inc_a b", "identified", "Found it."])),
+            ("POST".into(), "/api/status/incidents/inc_a%20b/updates".into(), Some(json!({ "state": "identified", "body": "Found it." })))
+        );
+        assert_eq!(body(incident_request(&["resolve", "inc_1", "Fixed."])).2.unwrap(), json!({ "state": "resolved", "body": "Fixed." }));
+        assert_eq!(body(incident_request(&["edit", "inc_1", "--impact", "major", "--title", "Slow runs"])), ("PATCH".into(), "/api/status/incidents/inc_1".into(), Some(json!({ "impact": "major", "title": "Slow runs" }))));
+        assert_eq!(body(incident_request(&["delete", "inc_1", "--yes"])), ("DELETE".into(), "/api/status/incidents/inc_1".into(), None));
+        assert!(incident_request(&["delete", "inc_1"]).unwrap_err().contains("--yes"));
+        for bad in [&["open", "Title only"][..], &["open", "T", "B", "--state"], &["open", "T", "B", "--title", "x"], &["edit", "inc_1"], &["update", "inc_1", "resolved"], &[]] {
+            assert!(incident_request(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_incident_review_is_markdown_unless_asked_for_json() {
+        assert_eq!(incident_review_request(&["inc_1"]), Ok(("/api/status/incidents/inc_1/review?format=markdown".into(), false, None)));
+        assert_eq!(
+            incident_review_request(&["inc_1", "--detected", "2026-11-20T10:00:00+01:00", "--lead-hours", "6", "-o", "r.md"]),
+            Ok(("/api/status/incidents/inc_1/review?detected=2026-11-20T10:00:00%2B01:00&lead=6&format=markdown".into(), false, Some("r.md")))
+        );
+        assert_eq!(incident_review_request(&["inc_1", "--json"]), Ok(("/api/status/incidents/inc_1/review".into(), true, None)));
+        for bad in [&[][..], &["--json"], &["inc_1", "--lead-hours", "many"], &["inc_1", "--detected"], &["inc_1", "-o"], &["inc_1", "--days", "3"]] {
+            assert!(incident_review_request(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn incidents_read_as_one_line_each_and_say_what_comes_next() {
+        let v = json!({ "enabled": false, "incidents": [
+            { "id": "inc_1", "state": "monitoring", "impact": "major", "title": "Slow runs", "createdAt": 1_795_168_800_000_i64, "resolvedAt": null },
+            { "id": "inc_0", "state": "resolved", "impact": "minor", "title": "Mail late", "createdAt": 1_795_168_800_000_i64, "resolvedAt": 1_795_172_400_000_i64 },
+        ] });
+        let s = incidents_summary(&v);
+        assert!(s.contains("inc_1  monitoring    major       2026-11-20 10:00 UTC  Slow runs"), "{s}");
+        assert!(s.contains("resolved 2026-11-20 11:00  Mail late") && s.contains("STATUS_PAGE=off"), "{s}");
+        assert_eq!(incidents_summary(&json!({ "incidents": [] })), "No incidents.");
+        let i = json!({ "id": "inc_1", "state": "resolved", "impact": "major" });
+        assert!(incident_done(&["resolve"], &i).contains("botctl incident review inc_1"));
+        assert!(incident_done(&["open"], &json!({ "id": "inc_1", "state": "investigating", "impact": "major" })).contains("Posted inc_1 (investigating, major)"));
+        assert!(incident_done(&["update"], &json!({ "id": "inc_1", "state": "identified" })).contains("within the hour"));
     }
 
     #[test]

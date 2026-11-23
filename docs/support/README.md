@@ -16,12 +16,14 @@ How customers get help with SuperBot, how fast, and how the Provider runs suppor
 | [Customer health score](health-score.md) | `botctl health-score`: six signals from botd's own records, how they're scored, and what to do about each; its daily [history](health-score.md#history) and the console's Support tab |
 | [Health check](health-check.md) | The TAM's monthly (Enterprise) or quarterly checklist |
 | [Quarterly business review](qbr-template.md) | The template for the review with the customer's owner and sponsor |
+| [Incidents and their reviews](incident-review.md) | `botctl incident`: posting and updating the status page from the server, and `botctl incident review`, a draft of the post-incident review from botd's records |
 | [Support report](support-report.md) | `botctl support-report`: tickets by month and severity from the ticket system's export, response targets met and missed, and what's still open |
 
 Runbooks for the incidents support sees most:
 
 | Runbook | When |
 |---|---|
+| [Running a Severity 1](runbook-major-incident.md) | The incident commander's steps: detection, the status page within 15 minutes, hourly updates, resolving, and the review |
 | [Sign-in and SSO failures](runbook-sign-in.md) | People can't sign in, with SSO, a password or a code |
 | [Machine down or restore](runbook-machine-down.md) | A user's machine, an Incus host, or the server itself is down |
 | [Upgrades](runbook-upgrade.md) | Before and after an upgrade, one that left botd down or broken, and going back |
@@ -56,4 +58,5 @@ Check `<status-page-url>` (the server's `/status`) first: a known incident there
 - Name a TAM and a backup for each Enterprise customer before its kickoff ([TAM programme](tam.md)), and keep each TAM's accounts few enough to hold the [cadence](tam.md#cadence).
 - Staff an on-call rota before selling Severity 1 response outside business hours. Response targets are a promise only once the rota exists.
 - Run the [support report](support-report.md#each-month) each month, and look into every missed response target.
+- Draft each Severity 1's review with `botctl incident review` ([incident reviews](incident-review.md#finishing-the-review)), and look into every missed status page target it flags.
 - Review this folder with the rest of the [security pack](../security/README.md) at least once a year, and after any incident whose review changes a runbook.

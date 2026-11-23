@@ -53,6 +53,9 @@ mod health_history_http_tests;
 mod health_score;
 #[cfg(test)]
 mod health_score_http_tests;
+mod incident_review;
+#[cfg(test)]
+mod incident_review_http_tests;
 mod isolation;
 #[cfg(test)]
 mod isolation_http_tests;
@@ -1169,6 +1172,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/status/incidents", get(status::list).post(status::create))
         .route("/status/incidents/{id}", patch(status::edit).delete(status::delete))
         .route("/status/incidents/{id}/updates", post(status::add_update))
+        .route("/status/incidents/{id}/review", get(incident_review::get))
         .route_layer(middleware::from_fn(obs::note_route));
     // SCIM has its own bearer tokens and error format, so its own guard, not `auth` (ADR 0023).
     let scim_routes = Router::new()
