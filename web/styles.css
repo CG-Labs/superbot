@@ -95,6 +95,11 @@ span.sub { display: inline; }
   padding: 1px 7px; border-radius: 8px; background: #262626; color: var(--text-dim); font-size: 12px;
 }
 .empty { color: var(--text-dim); padding: 18px 10px; }
+.score { font-size: 28px; font-weight: 600; }
+.band-healthy, .sig-ok { background: #13241a; color: #b6f0c4; }
+.band-watch, .sig-watch { background: #2a2312; color: var(--amber); }
+.band-at_risk, .sig-risk { background: #2a1415; color: #ffb4b6; }
+meter { width: 90px; vertical-align: middle; }
 
 .card {
   background: var(--bg-card); border: 1px solid var(--border); border-radius: 14px;

@@ -1922,7 +1922,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 56] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 57] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1979,6 +1979,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 56] = [
     migrate_service_accounts,
     migrate_user_last_seen,
     migrate_audit_checkpoints,
+    migrate_health_scores,
 ];
 
 /// Signed checkpoints of the audit chain's head, and their RFC 3161 tokens (ADR 0149). A
@@ -2011,6 +2012,19 @@ fn migrate_audit_checkpoints(c: &Connection, _fresh: bool) -> rusqlite::Result<(
             OR (OLD.tsa_token IS NOT NULL AND (NEW.tsa_token IS NOT OLD.tsa_token OR NEW.tsa_time IS NOT OLD.tsa_time
               OR NEW.tsa_nonce IS NOT OLD.tsa_nonce OR NEW.tsa_event_id IS NOT OLD.tsa_event_id OR NEW.tsa_status IS NOT OLD.tsa_status))
           BEGIN SELECT RAISE(ABORT, 'audit checkpoints are signed: only a missing timestamp can be added'); END;",
+    )
+}
+/// The customer health score once a day (ADR 0157): counts' verdicts only, no one named.
+fn migrate_health_scores(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS health_scores (
+          day TEXT PRIMARY KEY,
+          at INTEGER NOT NULL,
+          window_days INTEGER NOT NULL,
+          score INTEGER,
+          band TEXT NOT NULL,
+          signals TEXT NOT NULL
+        );",
     )
 }
 
@@ -9559,6 +9573,43 @@ impl Db {
     #[cfg(test)]
     pub fn machine_set_enrolled(&self, machine_id: &str) {
         self.c().execute("UPDATE machines SET enrollment = 'enrolled' WHERE id = ?", [machine_id]).unwrap();
+    }
+}
+
+/// One day's customer health score (ADR 0157).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HealthScoreDay {
+    /// The UTC date, `YYYY-MM-DD`.
+    pub day: String,
+    pub at: i64,
+    pub window_days: i64,
+    pub score: Option<u32>,
+    pub band: String,
+    /// Each signal's status by id, as JSON.
+    pub signals: String,
+}
+
+impl Db {
+    /// Records a day's score. False if that day already has one: the first of the day stays.
+    pub fn health_score_record(&self, d: &HealthScoreDay) -> rusqlite::Result<bool> {
+        self.c()
+            .execute(
+                "INSERT OR IGNORE INTO health_scores (day, at, window_days, score, band, signals) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![d.day, d.at, d.window_days, d.score, d.band, d.signals],
+            )
+            .map(|n| n > 0)
+    }
+
+    /// The days from `from` (`YYYY-MM-DD`), oldest first.
+    pub fn health_scores_since(&self, from: &str) -> rusqlite::Result<Vec<HealthScoreDay>> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT day, at, window_days, score, band, signals FROM health_scores WHERE day >= ? ORDER BY day")?;
+        s.query_map([from], |r| Ok(HealthScoreDay { day: r.get(0)?, at: r.get(1)?, window_days: r.get(2)?, score: r.get(3)?, band: r.get(4)?, signals: r.get(5)? }))?.collect()
+    }
+
+    /// Deletes the days before `before` (`YYYY-MM-DD`); how many went.
+    pub fn health_scores_prune(&self, before: &str) -> rusqlite::Result<usize> {
+        self.c().execute("DELETE FROM health_scores WHERE day < ?", [before])
     }
 }
 

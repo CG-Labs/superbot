@@ -11,7 +11,7 @@ botctl support-bundle                    # saves superbot-support-<time>.tar her
 botctl support-bundle -o /tmp/ticket.tar
 ```
 
-Or, from anything that can call the API as an admin: `GET /api/support/bundle`, which answers with the tar file. Each one is in the audit log as `support.bundle_created`.
+Or press **Download support bundle** on the console's Support tab, or, from anything that can call the API as an admin, `GET /api/support/bundle`, which answers with the tar file. Each one is in the audit log as `support.bundle_created`.
 
 The file is saved readable only by you, and never over an existing file.
 
@@ -31,6 +31,7 @@ tar -xOf superbot-support-<time>.tar | less
 | `config.json` | botd's settings from its environment, with secrets redacted (the names of the ones redacted are listed); other variables on the host are only counted. The settings botd started with, the tiers' names and summary, and the approval policy |
 | `health.json` | The status page's checks and open incidents, the setup checklist, the license, approvals waiting and the oldest one's age, runs running and waiting, the last 15 minutes' metrics, machines and hosts, database encryption and server backups |
 | `health-score.json` | The [customer health score](health-score.md) for the last 30 days and its signals: counts and reason codes only |
+| `health-score-history.json` | The score botd recorded each day for the last 90 days ([history](health-score.md#history)): score, band and each signal's status |
 | `logs.jsonl` | The newest lines botd logged since it started (up to 2,000), one JSON object each, whatever `LOG_FORMAT` is |
 | `audit-summary.json` | The last 7 days of the audit log counted by action and outcome, and the newest 100 failures and denials with their reason code (a free-text reason shows as `[text]`) |
 | `manifest.json` | The files and their sizes, and how many settings, log lines and audit events went in |
