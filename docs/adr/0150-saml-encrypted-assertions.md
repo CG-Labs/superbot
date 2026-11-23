@@ -42,4 +42,4 @@ The other item in scope for this slice, IdP metadata refreshed from a URL, alrea
 - An IdP that rotates SuperBot's encryption certificate on its own can't, since botd decrypts only with its own key. Changing keys means giving the IdP the new certificate first. Self-supplied keys are read once, so changing one needs a restart, as for the signing key.
 - Two more settings per native provider that encrypts. Deleting them makes botd generate a new key, which the IdP must then import.
 - `roxmltree` and `aws-lc-rs` (already dependencies) do the parsing, RSA-OAEP and AES-GCM. There is no general XML Encryption library and no new dependency.
-- Still not supported: encrypted NameIDs (`EncryptedID`), ECDSA keys, and verifying signed IdP metadata (metadata is trusted from https or an admin, as in ADR 0127). IdP-initiated sign-in stays off by design.
+- Still not supported: encrypted NameIDs (`EncryptedID`), ECDSA keys, and verifying signed IdP metadata (metadata is trusted from https or an admin, as in ADR 0127). IdP-initiated sign-in stays off by design. The other three came next, in [ADR 0151](0151-saml-encrypted-nameids-ecdsa-and-signed-metadata.md).

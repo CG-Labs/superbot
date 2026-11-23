@@ -128,18 +128,20 @@ People disabled in SuperBot, by an admin or by SCIM deprovisioning ([SCIM](scim.
 | `SSO_<ID>_ENCRYPTED_ASSERTIONS` | `off` | `allow`: take encrypted assertions as well as plain ones; `require`: only encrypted ones ([below](#encrypted-assertions)). `off` refuses them. |
 | `SSO_<ID>_SP_ENCRYPTION_CERT_FILE` | | With `allow` or `require`: your own encryption certificate (PEM), another key than the signing one, with its key as `SSO_<ID>_ENCRYPTION_PRIVATE_KEY`. Without it, botd makes and keeps one. |
 | `SSO_<ID>_ENCRYPTION_PRIVATE_KEY` | | With `SP_ENCRYPTION_CERT_FILE`: its private key (PKCS #8 PEM), as env, `_FILE`, or `botctl secret set`. |
+| `SSO_<ID>_METADATA_SIGNING_CERT_FILE` | | The certificates (PEM, one or more) the IdP signs its metadata with. Metadata is then checked on every load ([below](#signed-idp-metadata)). |
+| `SSO_<ID>_SIGNED_METADATA` | `require` with the file, else `off` | `require`: refuse unsigned metadata; `allow`: take it unchecked. Badly signed metadata is refused either way. |
 
 The bridge's settings (`CLIENT_ID`, `IDP_ALIAS`, `SCOPES`, `*_CLAIM`) are refused on a native provider, and the native ones on a bridge provider, so a provider is never half of each. There is no client secret.
 
 ## The SP key
 
-Each native provider has a signing key and certificate of its own ([ADR 0137](../adr/0137-saml-signed-requests-and-single-logout.md)). botd makes them the first time they're needed (RSA-3072, the certificate valid for 20 years), keeps the key sealed in its database, audits `sso.saml_sp_key_created`, and publishes the certificate and the SLO URL in the SP metadata. `botctl sso saml corp` shows its SHA-256. To use your own, set `SSO_CORP_SP_CERT_FILE=/etc/superbot/corp-sp.pem` and the key as `SSO_CORP_PRIVATE_KEY` (`botctl secret set SSO_CORP_PRIVATE_KEY < corp-sp.key`); the provider isn't offered until the key is set and matches the certificate. botd reads it once, so restart botd after changing it.
+Each native provider has a signing key and certificate of its own ([ADR 0137](../adr/0137-saml-signed-requests-and-single-logout.md)). botd makes them the first time they're needed (RSA-3072, the certificate valid for 20 years), keeps the key sealed in its database, audits `sso.saml_sp_key_created`, and publishes the certificate and the SLO URL in the SP metadata. `botctl sso saml corp` shows its SHA-256. To use your own, set `SSO_CORP_SP_CERT_FILE=/etc/superbot/corp-sp.pem` and the key as `SSO_CORP_PRIVATE_KEY` (`botctl secret set SSO_CORP_PRIVATE_KEY < corp-sp.key`); the provider isn't offered until the key is set and matches the certificate. botd reads it once, so restart botd after changing it. Your own key may be RSA (2048 bits or more) or ECDSA P-256 or P-384 (PKCS #8): botd then signs with `ecdsa-sha256` or `ecdsa-sha384`. Generated keys are always RSA, which every IdP takes.
 
 If your IdP imported SuperBot's metadata before this key existed, import it again (or add the certificate and the SLO URL by hand) before turning on signed requests or single logout.
 
 ## Signed AuthnRequests
 
-Most IdPs don't need them. If yours says it wants signed requests (`WantAuthnRequestsSigned="true"` in its metadata, which botd refuses otherwise), set `SSO_CORP_SIGN_REQUESTS=true` and restart: every AuthnRequest is then signed with RSA-SHA256 over the redirect URL, and the metadata says so. At the IdP, import SuperBot's metadata again or upload the SP certificate (Entra ID: **SAML Certificates → Verification certificates**, with **Require verification certificates** on; Okta: **Signature Certificate** under **Show Advanced Settings**).
+Most IdPs don't need them. If yours says it wants signed requests (`WantAuthnRequestsSigned="true"` in its metadata, which botd refuses otherwise), set `SSO_CORP_SIGN_REQUESTS=true` and restart: every AuthnRequest is then signed with RSA-SHA256 (or ECDSA, with an ECDSA key of your own) over the redirect URL, and the metadata says so. At the IdP, import SuperBot's metadata again or upload the SP certificate (Entra ID: **SAML Certificates → Verification certificates**, with **Require verification certificates** on; Okta: **Signature Certificate** under **Show Advanced Settings**).
 
 ## Encrypted assertions
 
@@ -155,9 +157,29 @@ What botd takes and refuses:
 - **Key transport**: RSA-OAEP (`rsa-oaep-mgf1p`, or XML Encryption 1.1 `rsa-oaep` with SHA-1 to SHA-512). RSA PKCS #1 v1.5 is refused (`weak_key_transport`).
 - **Keys** come only from botd, never from the message. Several `EncryptedKey`s (as during an IdP certificate rollover) are fine; the one for botd's key is used.
 - **The IdP's signature still counts.** Anyone can encrypt to SuperBot's public certificate, so the assertion inside must be signed by the IdP, exactly as a plain one. A signature on the response is checked before anything is decrypted. The decrypted assertion goes through every other check: one assertion only, no assertion inside it, signatures only where they belong, IDs unique across the response and the assertion.
-- **Encrypted NameIDs** (`EncryptedID`) aren't supported (`encrypted_id`): encrypt the whole assertion instead.
+- **Encrypted NameIDs** (`EncryptedID`), in assertions and in the IdP's LogoutRequests, are decrypted the same way, with the same key and algorithms ([ADR 0151](../adr/0151-saml-encrypted-nameids-ecdsa-and-signed-metadata.md)). They need `ENCRYPTED_ASSERTIONS=allow` or `require`, even if the IdP encrypts only the NameID. With it `off`, they're refused (`encrypted_id`). They're read only after the IdP's signature over them is checked. Inside there must be exactly one `NameID`, and a subject with two identifiers is refused (`wrapped`).
 
-To use your own key, set `SSO_CORP_SP_ENCRYPTION_CERT_FILE=/etc/superbot/corp-enc.pem` and `botctl secret set SSO_CORP_ENCRYPTION_PRIVATE_KEY < corp-enc.key`. It must be another key than the signing one. The provider isn't offered until the key is set and matches. To change keys, give the IdP the new certificate first; botd decrypts only with the key it has.
+To use your own key, set `SSO_CORP_SP_ENCRYPTION_CERT_FILE=/etc/superbot/corp-enc.pem` and `botctl secret set SSO_CORP_ENCRYPTION_PRIVATE_KEY < corp-enc.key`. It must be another key than the signing one, and RSA (IdPs encrypt to it with RSA-OAEP). The provider isn't offered until the key is set and matches. To change keys, give the IdP the new certificate first; botd decrypts only with the key it has.
+
+## IdP keys: RSA and ECDSA
+
+The IdP may sign with RSA (2048 bits or more, `rsa-sha256` or `rsa-sha512`) or ECDSA P-256 (`ecdsa-sha256`) or P-384 (`ecdsa-sha384`) keys ([ADR 0151](../adr/0151-saml-encrypted-nameids-ecdsa-and-signed-metadata.md)). Each algorithm verifies only with its own key type and curve. SHA-1 (`rsa-sha1`, `ecdsa-sha1`) is refused as `weak_algorithm`. Certificates with other curves or keys are refused when the metadata is read.
+
+## Signed IdP metadata
+
+By default botd trusts IdP metadata because it comes over https, from a file, or from an admin. If your IdP or federation signs its metadata, botd can check that signature, so a compromised web host or proxy can't swap in another signing certificate ([ADR 0151](../adr/0151-saml-encrypted-nameids-ecdsa-and-signed-metadata.md)):
+
+```bash
+SSO_CORP_METADATA_SIGNING_CERT_FILE=/etc/superbot/corp-idp-metadata.pem
+# SSO_CORP_SIGNED_METADATA=require   # the default with the file; allow takes unsigned metadata too
+```
+
+- Get the metadata signing certificate from your IdP or federation, by a channel you trust. It's often not the certificate that signs assertions. Put several in the file during a rollover.
+- Every load is checked: the URL, refreshed daily; the file, at startup; and `botctl sso saml <id> import`.
+- The signature must be on the `EntityDescriptor`, or on the `EntitiesDescriptor` of an aggregate. It must verify against a certificate in the file, with strong algorithms only. With `require`, unsigned metadata is refused. With `allow`, it's taken unchecked. A bad signature is refused either way.
+- Signed metadata past its `validUntil` is refused, so an old copy can't be served again.
+- A refused copy never replaces the one in use. From a URL, botd keeps the last good copy and tries again later. An import is refused, and the stored copy stays. A bad file stops botd from starting.
+- Refusals are audited as `sso.saml_metadata_refused` (`botctl audit --action sso.saml_metadata_refused`), with the source, the reason (`unsigned`, `bad_signature`, `wrapped`, `weak_algorithm`, `bad_algorithm`, `expired`), and whether a good copy is still in use (`kept`). `botctl sso saml corp` shows the setting and the trusted certificates.
 
 ## Single logout
 
@@ -181,13 +203,14 @@ Every refused sign-in is in the audit log with a reason (`botctl audit --action 
 | `not_linked` | Link the person, or turn on just in time. The event has the `subject` and the IdP's entity ID as `issuer`. |
 | `unsigned` | The IdP signs only the response, or nothing: sign the assertion. |
 | `bad_signature` | The IdP signed with a certificate botd doesn't have: refresh or import the metadata (`botctl sso saml <id>` shows the certificates in use). |
-| `weak_algorithm`, `bad_algorithm` | Use RSA-SHA256 (SHA-1 is refused), and AES-GCM if you encrypt (AES-CBC is refused). |
+| `weak_algorithm`, `bad_algorithm` | Use RSA-SHA256 or ECDSA with SHA-256/384 (SHA-1 is refused), and AES-GCM if you encrypt (AES-CBC is refused). |
 | `encrypted_assertion` | The IdP encrypts but `SSO_<ID>_ENCRYPTED_ASSERTIONS` is `off`: turn it on ([above](#encrypted-assertions)), or turn off encryption at the IdP. |
 | `unencrypted_assertion` | `ENCRYPTED_ASSERTIONS=require`, but the IdP sent a plain assertion: turn on encryption at the IdP. |
 | `bad_encryption` | botd couldn't decrypt: the IdP encrypts to another certificate (import SuperBot's metadata again), or the encrypted data is malformed. |
 | `weak_key_transport` | The IdP wraps the key with RSA PKCS #1 v1.5: choose RSA-OAEP. (AES-CBC content shows as `weak_algorithm`: choose AES-GCM.) |
-| `encrypted_id` | The IdP encrypts the NameID: encrypt the assertion instead. |
+| `encrypted_id` | The IdP encrypts the NameID but `SSO_<ID>_ENCRYPTED_ASSERTIONS` is `off`: set it to `allow`, and give the IdP SuperBot's encryption certificate. |
 | `no_sp_key` | botd has no decryption key: with `SP_ENCRYPTION_CERT_FILE`, set `SSO_<ID>_ENCRYPTION_PRIVATE_KEY` (`botctl sso saml <id>` shows the problem). |
+| `wrapped` | The response is shaped to fool signature checks, or the subject names the person twice (say, a `NameID` and an `EncryptedID`). |
 | `wrong_audience` | The IdP's audience (entity ID) isn't the SP entity ID botctl shows. |
 | `wrong_recipient`, `wrong_destination` | The IdP's ACS (reply) URL isn't the one botctl shows, often because `SSO_PUBLIC_URL` differs from the address people use. |
 | `wrong_issuer` | `SSO_<ID>_IDP_ENTITY_ID` isn't the IdP's entity ID. |
@@ -209,6 +232,7 @@ Refused logout messages are audited as `auth.slo_failed` (`botctl audit --action
 | `expired`, `not_yet_valid` | The message is older than five minutes, or clocks differ by more than two: fix NTP. |
 | `replayed` | The same message arrived twice. |
 | `unknown_request` | A LogoutResponse to a request botd didn't send, or sent over 10 minutes ago. |
-| `encrypted_id` | Turn off NameID encryption for SuperBot at the IdP. |
+| `encrypted_id` | The IdP encrypts the NameID: set `SSO_<ID>_ENCRYPTED_ASSERTIONS=allow` ([above](#encrypted-assertions)). |
+| `bad_encryption` | The NameID is encrypted to another certificate: give the IdP SuperBot's encryption certificate. |
 | `no_slo` | The IdP's metadata in use has no HTTP-Redirect `SingleLogoutService` on https. |
 | `bad_message` | Not a SAML logout message botd can read. |
