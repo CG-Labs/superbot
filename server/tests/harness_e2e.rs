@@ -355,6 +355,49 @@ fn hermes_two_providers() {
     pass("with no fallback left the run ends in an error");
 }
 
+/// A Claude Code route to one of the tiers file's endpoints (ADR 0193), through the real
+/// CLI: every model call goes to that endpoint with its key, even with saved settings in
+/// Claude Code's HOME pointing at another endpoint with another token, key and key helper,
+/// and never to the server's own endpoint.
+fn claude_code_endpoint_route() {
+    if !wanted("claude", "claude") {
+        return;
+    }
+    if real() {
+        println!("SKIP claude: the endpoint-route test needs the fake models");
+        return;
+    }
+    let (uk, decoy) = (fake_provider(Some("uk-api")), fake_provider(Some("decoy-api")));
+    let tiers = json!({
+        "providers": { "uk-api": { "protocol": "anthropic-messages", "baseUrl": format!("http://127.0.0.1:{}", uk.port), "keySecret": "E2E_UK_KEY", "regions": ["gb-lon"] } },
+        "tiers": [{ "name": "uk-plan", "routes": [{ "harness": "claude", "provider": "uk-api", "model": "e2e-claude" }] }]
+    });
+    let file = std::env::temp_dir().join(format!("superbot-e2e-tiers-{}-{}.json", std::process::id(), free_port()));
+    std::fs::write(&file, tiers.to_string()).unwrap();
+    let b = start_with("claude", None, &[("TIERS_FILE", file.to_str().unwrap())]);
+    let _ = std::fs::remove_file(&file);
+    let saved = json!({ "env": {
+        "ANTHROPIC_BASE_URL": format!("http://127.0.0.1:{}", decoy.port),
+        "ANTHROPIC_AUTH_TOKEN": "e2e-decoy-token",
+        "ANTHROPIC_API_KEY": "e2e-decoy-key",
+    }, "apiKeyHelper": "echo e2e-decoy-helper" });
+    std::fs::create_dir_all(b.dir.join("home/.claude")).unwrap();
+    std::fs::write(b.dir.join("home/.claude/settings.json"), saved.to_string()).unwrap();
+    call(&b, "PUT", "/api/policy", json!({ "sandbox": false }));
+    call(&b, "PUT", "/api/secrets/E2E_UK_KEY", json!({ "value": "e2e-uk-key" }));
+    let id = call(&b, "GET", "/api/bots", Value::Null)[0]["id"].as_str().unwrap().to_string();
+    let server = b.model.as_ref().unwrap();
+    let n = |m: &FakeModel| m.calls.load(std::sync::atomic::Ordering::SeqCst);
+
+    let r = run(&b, &id, &prompt("echo e2e-route"), None, &|| {});
+    assert!(r.text.contains(&format!("[uk-api] {DONE}")), "claude on uk-plan (result {}): {}", r.result, r.text);
+    assert!(!uk.keys().is_empty() && uk.keys().iter().all(|k| k == "e2e-uk-key"), "{:?}", uk.keys());
+    assert_eq!((n(&decoy), n(server)), (0, 0), "a Claude Code endpoint route reached another endpoint");
+    let d = details(&audit(&b, "harness.invoked")[0]);
+    assert_eq!((d["tier"].as_str(), d["provider"].as_str(), d["model"].as_str()), (Some("uk-plan"), Some("uk-api"), Some("e2e-claude")), "{d}");
+    println!("PASS claude: an endpoint route reaches only its endpoint, with its key, whatever saved settings say");
+}
+
 /// Tools other than the shell that each harness reports through its hook and that the
 /// canary counts, with the Bot model that makes the CLI offer it (ADR 0063).
 fn other_tools(harness: &str) -> Vec<(&'static str, Option<&'static str>)> {
@@ -385,6 +428,12 @@ fn other_tool_args(tool: &str, path: &Path) -> Value {
 fn claude_code_hooks_hold() {
     approvals_hold("claude", "claude");
     unhooked_runs_stop("claude", "claude");
+}
+
+#[test]
+#[ignore = "needs the Claude Code CLI; see the harness-e2e workflow"]
+fn claude_code_routes_to_an_endpoint() {
+    claude_code_endpoint_route();
 }
 
 #[test]

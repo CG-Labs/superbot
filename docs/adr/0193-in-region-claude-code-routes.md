@@ -33,10 +33,12 @@ Claude Code can send every model call to one Anthropic Messages endpoint: `ANTHR
 Held or not, Claude Code gets:
 
 - `ANTHROPIC_BASE_URL`: the endpoint's `baseUrl`;
-- `ANTHROPIC_API_KEY`: the endpoint's key, over any key of the owner's own. A key that isn't there leaves it empty rather than send the owner's to the endpoint (the run is refused first as `provider_key_missing`, ADR 0077);
-- `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` and `CLAUDE_CODE_USE_FOUNDRY` empty, so no saved secret or login sends the calls to another account or cloud.
+- the endpoint's key, through `apiKeyHelper` (below), over any key of the owner's own. A key that isn't there leaves it empty rather than send the owner's to the endpoint (the run is refused first as `provider_key_missing`, ADR 0077);
+- `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` and `CLAUDE_CODE_USE_FOUNDRY` empty, so no saved secret or login sends the calls to another account or cloud.
 
-The same variables, all but the key, go in the run's flag settings (`--settings` `env`), which outrank the Bot's own settings files, so a `.claude/settings.json` in the workspace or the Bot's home can't point Claude Code elsewhere. The key stays out of the command line.
+The same variables go in the run's flag settings (`--settings` `env`), which outrank the Bot's own settings files, so a `.claude/settings.json` in the workspace or the Bot's home can't point Claude Code elsewhere. The real CLI showed why the environment alone isn't enough: an `env` in saved settings beats the process environment.
+
+The key can't go in flag settings: they are on the command line, where other local users can read them. So flag settings set `apiKeyHelper` to `printf '%s' "$SUPERBOT_CLAUDE_ROUTE_KEY"`, and only the run's environment carries `SUPERBOT_CLAUDE_ROUTE_KEY`. A flag-settings helper also outranks one in saved settings. The harness end-to-end test checks all of this with the real CLI and saved settings that name another endpoint, token, key and helper.
 
 A run held to a region (ADR 0139) also gets:
 
@@ -59,7 +61,7 @@ A run whose route hands the harness its own endpoint's key needs no harness logi
 - A residency customer can use Claude Code, with every model call going to an endpoint the operator marks as in their region, and the audit log showing it.
 - An operator needs an Anthropic Messages endpoint in the region: a gateway there, or a provider's regional endpoint that speaks the API. botd can't check where it really processes, as in ADR 0139.
 - A Claude Code route to an endpoint has no fallback. If the endpoint is down, those runs fail until it is back.
-- The endpoint's key is in Claude Code's environment, so the Bot's shell commands can read it, as they can a server-wide or owner's `ANTHROPIC_API_KEY` today. Hermes hides its key from the shell; Claude Code's own way to do that (`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`) also changes how every command runs, so it is left for a later change. Operators should give each plan's endpoint a key scoped to it.
+- The endpoint's key is in Claude Code's environment (as `SUPERBOT_CLAUDE_ROUTE_KEY`), so the Bot's shell commands can read it, as they can a server-wide or owner's `ANTHROPIC_API_KEY` today. Hermes hides its key from the shell; Claude Code's own way to do that (`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`) also changes how every command runs, so it is left for a later change. Operators should give each plan's endpoint a key scoped to it.
 
 ## Not covered
 

@@ -167,7 +167,8 @@ const CLAUDE_TIERS: &str = r#"{
 }"#;
 
 /// A stand-in `claude` that says where Claude Code would send its calls: the base URL,
-/// the key's length (keys are redacted from chats), whether Bedrock or background
+/// the key's length (its key helper's, else `ANTHROPIC_API_KEY`; keys are redacted from
+/// chats), whether Bedrock or background
 /// traffic is on, and the model and flag settings' base URL it was given.
 fn fake_claude(app: &App) {
     use std::os::unix::fs::PermissionsExt;
@@ -180,7 +181,8 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-text="base=${ANTHROPIC_BASE_URL:-none} flag=${flag:-none} key=${#ANTHROPIC_API_KEY} bedrock=${CLAUDE_CODE_USE_BEDROCK:-off} traffic=${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-on} model=$model"
+key=${SUPERBOT_CLAUDE_ROUTE_KEY:-$ANTHROPIC_API_KEY}
+text="base=${ANTHROPIC_BASE_URL:-none} flag=${flag:-none} key=${#key} bedrock=${CLAUDE_CODE_USE_BEDROCK:-off} traffic=${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-on} model=$model"
 printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$text"
 "#;
     let path = app.cfg.bin_dir.join("claude");

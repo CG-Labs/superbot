@@ -37,9 +37,16 @@ fn endpoint(input: &RunInput) -> Option<&crate::tiers::Endpoint> {
     input.endpoints.iter().find(|e| e.name == p)
 }
 
+/// Where a route's run carries its endpoint's key. Claude Code's saved settings outrank
+/// its environment, so `ANTHROPIC_API_KEY` is emptied in flag settings and the key is
+/// read by `apiKeyHelper` instead, which flag settings set too. Never on the command line.
+const KEY_VAR: &str = "SUPERBOT_CLAUDE_ROUTE_KEY";
+const KEY_HELPER: &str = "printf '%s' \"$SUPERBOT_CLAUDE_ROUTE_KEY\"";
+
 /// Switches that send Claude Code's model calls somewhere other than its base URL, or
 /// authenticate it as someone other than the route's key. A route's run gets them empty.
 const ELSEWHERE: &[&str] = &[
+    "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_USE_BEDROCK",
@@ -82,12 +89,12 @@ impl Adapter for Claude {
         false
     }
 
-    /// The endpoint's key reaches Claude Code as `ANTHROPIC_API_KEY`, over any of the
-    /// owner's own.
+    /// The endpoint's key reaches Claude Code through `KEY_HELPER`, over any of the
+    /// owner's own, which are emptied.
     fn env(&self, input: &RunInput) -> Vec<(String, String)> {
         let Some(e) = endpoint(input) else { return Vec::new() };
         let mut env = endpoint_env(input, e);
-        env.push(("ANTHROPIC_API_KEY".into(), input.env.get(&e.key_secret).cloned().unwrap_or_default()));
+        env.push((KEY_VAR.into(), input.env.get(&e.key_secret).cloned().unwrap_or_default()));
         env
     }
 
@@ -120,6 +127,7 @@ impl Adapter for Claude {
         if let Some(e) = endpoint(input) {
             let env: serde_json::Map<String, Value> = endpoint_env(input, e).into_iter().map(|(k, v)| (k, json!(v))).collect();
             settings.insert("env".into(), Value::Object(env));
+            settings.insert("apiKeyHelper".into(), json!(KEY_HELPER));
             if !input.held_to.is_empty() {
                 // WebFetch otherwise asks Anthropic whether each host is safe to fetch.
                 settings.insert("skipWebFetchPreflight".into(), json!(true));
@@ -311,22 +319,24 @@ mod tests {
         assert_eq!(job.env.get("ANTHROPIC_API_KEY").map(String::as_str), Some("sk-owners-own"));
         assert!(!job.env.contains_key("ANTHROPIC_BASE_URL") && settings(&job.args).is_none(), "{:?}", job.args);
 
-        // On the plan's London endpoint: its URL and key, over the owner's, and nothing
+        // On the plan's London endpoint: its URL and key, the owner's emptied, and nothing
         // that would send the calls to Bedrock, Vertex, Foundry or another account.
         i.provider = Some("uk".into());
         i.endpoints = vec![Endpoint { name: "uk".into(), protocol: Protocol::AnthropicMessages, base_url: "https://uk.claude.example".into(), key_secret: "TIER_UK_KEY".into(), regions: vec!["gb-lon".into()] }];
         let job = super::super::job_for(&mut Claude::default(), &i, &mut Vec::new());
         assert_eq!(job.env.get("ANTHROPIC_BASE_URL").map(String::as_str), Some("https://uk.claude.example"));
-        assert_eq!(job.env.get("ANTHROPIC_API_KEY").map(String::as_str), Some("sk-uk"));
-        assert!(!job.env.contains_key("TIER_UK_KEY"), "only under Claude Code's own name");
+        assert_eq!(job.env.get(KEY_VAR).map(String::as_str), Some("sk-uk"));
+        assert!(!job.env.contains_key("TIER_UK_KEY"), "only where the key helper reads it");
         for k in ELSEWHERE {
             assert_eq!(job.env.get(*k).map(String::as_str), Some(""), "{k}");
         }
-        // The same in flag settings, which outrank the Bot's own settings files. The key isn't.
+        // The same in flag settings, which outrank the Bot's own settings files, with the key
+        // read by the key helper.
         let s = settings(&job.args).unwrap();
         assert_eq!(s["env"]["ANTHROPIC_BASE_URL"], "https://uk.claude.example");
-        assert_eq!(s["env"]["CLAUDE_CODE_USE_BEDROCK"], "");
-        assert!(s["env"].get("ANTHROPIC_API_KEY").is_none() && !job.args.iter().any(|a| a.contains("sk-uk")));
+        assert_eq!((s["env"]["CLAUDE_CODE_USE_BEDROCK"].as_str(), s["env"]["ANTHROPIC_API_KEY"].as_str()), (Some(""), Some("")));
+        assert_eq!(s["apiKeyHelper"], KEY_HELPER);
+        assert!(!job.args.iter().any(|a| a.contains("sk-uk")), "never on the command line");
         // Not held: Claude Code's own background traffic and small model.
         assert!(!job.env.contains_key("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC") && s.get("skipWebFetchPreflight").is_none());
         assert!(!job.env.contains_key("ANTHROPIC_DEFAULT_HAIKU_MODEL"));
@@ -345,7 +355,7 @@ mod tests {
         // A key that isn't there never lets the owner's own go to the endpoint.
         i.env.remove("TIER_UK_KEY");
         let job = super::super::job_for(&mut Claude::default(), &i, &mut Vec::new());
-        assert_eq!(job.env.get("ANTHROPIC_API_KEY").map(String::as_str), Some(""));
+        assert_eq!((job.env.get(KEY_VAR).map(String::as_str), job.env.get("ANTHROPIC_API_KEY").map(String::as_str)), (Some(""), Some("")));
     }
 
     fn usage_of(lines: &[&str]) -> Vec<Usage> {
