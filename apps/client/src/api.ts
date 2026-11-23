@@ -42,6 +42,7 @@ import type {
   PushView,
   Role,
   RoleDraft,
+  RoleGiving,
   RolesView,
   Routine,
   ServerConfig,
@@ -770,9 +771,9 @@ export class SuperBotApi {
     await this.request("DELETE", `/api/roles/${encodeURIComponent(id)}`);
   }
 
-  /** Gives it across the server: its base becomes their role. */
-  async assignRole(id: string, user: string): Promise<{ user: AdminUser; role: CustomRoleRef | null }> {
-    return this.request<{ user: AdminUser; role: CustomRoleRef | null }>("PUT", `/api/roles/${encodeURIComponent(id)}/users/${encodeURIComponent(user)}`);
+  /** Gives it across the server: its base becomes their role. Giving it again moves or clears its end. */
+  async assignRole(id: string, user: string, giving?: RoleGiving): Promise<{ user: AdminUser; role: CustomRoleRef | null }> {
+    return this.request<{ user: AdminUser; role: CustomRoleRef | null }>("PUT", `/api/roles/${encodeURIComponent(id)}/users/${encodeURIComponent(user)}`, giving);
   }
 
   /** Takes it away; they keep its base as their role. */
@@ -781,8 +782,8 @@ export class SuperBotApi {
   }
 
   /** Gives it to a team's member within that team: only its team permissions apply there. */
-  async assignTeamRole(id: string, team: string, user: string): Promise<{ applies: string[] }> {
-    return this.request<{ applies: string[] }>("PUT", `/api/roles/${encodeURIComponent(id)}/teams/${encodeURIComponent(team)}/users/${encodeURIComponent(user)}`);
+  async assignTeamRole(id: string, team: string, user: string, giving?: RoleGiving): Promise<{ applies: string[] }> {
+    return this.request<{ applies: string[] }>("PUT", `/api/roles/${encodeURIComponent(id)}/teams/${encodeURIComponent(team)}/users/${encodeURIComponent(user)}`, giving);
   }
 
   async unassignTeamRole(id: string, team: string, user: string): Promise<void> {

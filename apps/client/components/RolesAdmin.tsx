@@ -5,18 +5,24 @@ import { confirmAsync } from "../src/dialogs";
 import {
   BASES,
   baseChangeWarning,
+  defaultEnd,
   draftChanges,
   draftError,
   draftOf,
   effectivePermissions,
   emptyDraft,
+  endChoices,
+  endsAt,
+  endsLabel,
   holdersLabel,
+  MAX_DAYS_HINT,
+  parseMaxDays,
   permissionLabel,
   teamPermissions,
   togglePermission,
 } from "../src/roles";
 import { colors } from "../src/theme";
-import type { AdminUser, BuiltInRole, CustomRole, RoleDraft, RolesView, Team } from "../src/types";
+import type { AdminUser, BuiltInRole, CustomRole, RoleDraft, RoleGiving, RolesView, Team } from "../src/types";
 import { Chips } from "./Chips";
 
 interface Props {
@@ -89,6 +95,9 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
   const [teams, setTeams] = useState<Team[]>([]);
   const [query, setQuery] = useState("");
   const [teamId, setTeamId] = useState("");
+  const [limit, setLimit] = useState(role?.maxDays ? String(role.maxDays) : "");
+  const [ends, setEnds] = useState(defaultEnd(role?.maxDays));
+  const [reason, setReason] = useState("");
 
   const loadHolders = useCallback(async () => {
     if (!role) return;
@@ -114,8 +123,9 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
     }
   };
 
-  const invalid = draftError(view, draft, role?.id);
-  const changes = role ? draftChanges(role, draft) : null;
+  const maxDays = parseMaxDays(limit);
+  const invalid = draftError(view, draft, role?.id) ?? (maxDays === undefined ? MAX_DAYS_HINT : null);
+  const changes = role ? draftChanges(role, { ...draft, maxDays }) : null;
   const effective = effectivePermissions(view, draft.base, draft.permissions);
   const inTeam = teamPermissions(view, draft.permissions);
 
@@ -125,7 +135,9 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
       if (warning && !(await confirmAsync(`Move ${role.name}'s holders?`, warning, "Save"))) return;
     }
     void run(async () => {
-      const saved = role ? await api.updateRole(role.id, changes ?? {}) : await api.createRole({ ...draft, name: draft.name.trim(), description: draft.description.trim() });
+      const saved = role
+        ? await api.updateRole(role.id, changes ?? {})
+        : await api.createRole({ ...draft, name: draft.name.trim(), description: draft.description.trim(), ...(maxDays ? { maxDays } : {}) });
       await onSaved(saved.id);
     });
   };
@@ -138,15 +150,28 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
     });
   };
 
+  /** The end and reason picked, or nothing when neither is. */
+  const giving = (): RoleGiving | undefined => {
+    const expiresAt = endsAt(ends, Date.now());
+    const why = reason.trim();
+    if (expiresAt == null && !why) return undefined;
+    return { ...(expiresAt != null ? { expiresAt } : {}), ...(why ? { reason: why } : {}) };
+  };
+  const endNote = () => {
+    const at = endsAt(ends, Date.now());
+    return at == null ? "" : ` It ends by itself on ${new Date(at).toLocaleString()}.`;
+  };
+
   const give = async (u: AdminUser) => {
     if (!role) return;
     const body =
       u.role === "admin"
         ? `They stop being an admin: their role becomes ${role.base === "readonly" ? "read-only" : "member"}, with ${role.name}'s permissions on top.`
         : `Their role becomes ${role.base === "readonly" ? "read-only" : "member"}, with ${role.name}'s permissions on top. Any other custom role they have is replaced.`;
-    if (!(await confirmAsync(`Give ${role.name} to ${personName(u)}?`, body, "Give"))) return;
+    if (!(await confirmAsync(`Give ${role.name} to ${personName(u)}?`, body + endNote(), "Give"))) return;
     void run(async () => {
-      await api.assignRole(role.id, u.id);
+      await api.assignRole(role.id, u.id, giving());
+      setReason("");
       setQuery("");
       await onSaved(role.id);
       await loadHolders();
@@ -168,7 +193,8 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
   const giveInTeam = (team: Team, userId: string) => {
     if (!role) return;
     void run(async () => {
-      await api.assignTeamRole(role.id, team.id, userId);
+      await api.assignTeamRole(role.id, team.id, userId, giving());
+      setReason("");
       await onSaved(role.id);
       await loadHolders();
     });
@@ -180,6 +206,7 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
   const team = teams.find((t) => t.id === teamId) ?? teams[0];
   const teamHolders = new Set(holders?.teams.filter((h) => h.team.id === team?.id).map((h) => h.user.id));
   const userRole = (id: string) => users.find((u) => u.id === id)?.role;
+  const now = Date.now();
 
   return (
     <View style={styles.wrap}>
@@ -216,6 +243,25 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
       <Section title="Based on">
         <Chips options={BASES} value={draft.base} onChange={(base) => setDraft({ ...draft, base })} disabled={busy} />
         <Text style={styles.faint}>{draft.base === "member" ? "Uses Bots and decides approvals, like a member." : "Sees, changes nothing, like a read-only user. Team permissions do nothing for them."}</Text>
+      </Section>
+
+      <Section title="Time limit">
+        <TextInput
+          style={styles.input}
+          value={limit}
+          onChangeText={setLimit}
+          placeholder="No limit"
+          placeholderTextColor={colors.textFaint}
+          keyboardType="number-pad"
+          maxLength={3}
+          editable={!busy}
+          accessibilityLabel="Most days it can be given for"
+        />
+        <Text style={styles.faint}>
+          {maxDays
+            ? `Time-bound: given only by hand, for at most ${maxDays} day${maxDays === 1 ? "" : "s"} at a time, then it ends by itself. Never to SCIM or SAML groups or service accounts.`
+            : "Blank: it can be given with no end. Set days to make it time-bound, for elevated access."}
+        </Text>
       </Section>
 
       <Section title="Permissions">
@@ -259,6 +305,23 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
 
       {role ? (
         <>
+          <Section title="Giving it">
+            <Chips options={endChoices(role.maxDays)} value={ends} onChange={setEnds} disabled={busy} />
+            <TextInput
+              style={styles.input}
+              value={reason}
+              onChangeText={setReason}
+              placeholder="Why (optional, kept in the audit log)"
+              placeholderTextColor={colors.textFaint}
+              maxLength={500}
+              editable={!busy}
+              accessibilityLabel="Why it's given"
+            />
+            <Text style={styles.faint}>
+              {role.maxDays ? `Time-bound: it ends by itself within ${role.maxDays} day${role.maxDays === 1 ? "" : "s"}. ` : ""}Giving it again to someone who has it moves the end.
+            </Text>
+          </Section>
+
           <Section title="Across the server">
             {holders == null ? (
               <ActivityIndicator color={colors.textDim} />
@@ -268,6 +331,7 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
                   <Text style={[styles.text, { flex: 1 }]} numberOfLines={1}>
                     {personName(u)}
                     {u.email && u.name ? <Text style={styles.faint}> · {u.email}</Text> : null}
+                    {u.expiresAt ? <Text style={styles.faint}> · {endsLabel(u.expiresAt, now)}</Text> : null}
                   </Text>
                   <Button label="Take away" a11y={`Take away from ${personName(u)}`} disabled={busy} onPress={() => void takeAway(u.id, personName(u))} />
                 </View>
@@ -309,7 +373,11 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
               <View key={`${h.team.id}:${h.user.id}`} style={styles.row}>
                 <Text style={[styles.text, { flex: 1 }]} numberOfLines={1}>
                   {personName(h.user)}
-                  <Text style={styles.faint}> · {h.team.name}</Text>
+                  <Text style={styles.faint}>
+                    {" "}
+                    · {h.team.name}
+                    {h.expiresAt ? ` · ${endsLabel(h.expiresAt, now)}` : ""}
+                  </Text>
                 </Text>
                 <Button label="Take away" a11y={`Take away from ${personName(h.user)} in ${h.team.name}`} disabled={busy} onPress={() => void takeAway(h.user.id, personName(h.user), h.team.id)} />
               </View>

@@ -23,7 +23,63 @@ export function emptyDraft(): RoleDraft {
 }
 
 export function draftOf(r: CustomRole): RoleDraft {
-  return { name: r.name, description: r.description, base: r.base, permissions: [...r.permissions] };
+  return { name: r.name, description: r.description, base: r.base, permissions: [...r.permissions], maxDays: r.maxDays ?? null };
+}
+
+const HOUR = 60 * 60_000;
+const DAY = 24 * HOUR;
+/** The longest a role can be given for, and the most a time-bound role's limit can be (ADR 0197). */
+export const MAX_DAYS = 365;
+
+/** How long a role is given for. "none": until taken away. */
+export const ENDS: { value: string; label: string; ms: number | null }[] = [
+  { value: "none", label: "No end", ms: null },
+  { value: "8h", label: "8 hours", ms: 8 * HOUR },
+  { value: "1d", label: "1 day", ms: DAY },
+  { value: "7d", label: "7 days", ms: 7 * DAY },
+  { value: "30d", label: "30 days", ms: 30 * DAY },
+  { value: "90d", label: "90 days", ms: 90 * DAY },
+];
+
+/** The ends a role can be given with: within its limit, and never "No end" on a time-bound role. */
+export function endChoices(maxDays?: number | null): { value: string; label: string }[] {
+  const limit = maxDays ? maxDays * DAY : null;
+  return ENDS.filter((e) => (limit == null ? true : e.ms != null && e.ms <= limit)).map(({ value, label }) => ({ value, label }));
+}
+
+/** The choice a role starts on: no end, or the shortest on a time-bound role. */
+export function defaultEnd(maxDays?: number | null): string {
+  return endChoices(maxDays)[0].value;
+}
+
+/** When a role given now with `choice` ends, in Unix ms, or null for none. */
+export function endsAt(choice: string, now: number): number | null {
+  const ms = ENDS.find((e) => e.value === choice)?.ms;
+  return ms == null ? null : now + ms;
+}
+
+/** "ends in 3 days", "ends in 5 hours", "ends within the hour", or "" with no end. */
+export function endsLabel(expiresAt: number | null | undefined, now: number): string {
+  if (expiresAt == null) return "";
+  const left = expiresAt - now;
+  if (left <= 0) return "ended";
+  if (left < HOUR) return "ends within the hour";
+  if (left < 2 * DAY) {
+    const h = Math.round(left / HOUR);
+    return `ends in ${h} hour${h === 1 ? "" : "s"}`;
+  }
+  return `ends in ${Math.round(left / DAY)} days`;
+}
+
+export const MAX_DAYS_HINT = `A time limit is 1 to ${MAX_DAYS} days, or blank for none.`;
+
+/** The limit typed in: null for none (blank), or undefined when it isn't 1 to 365 whole days. */
+export function parseMaxDays(text: string): number | null | undefined {
+  const t = text.trim();
+  if (!t) return null;
+  if (!/^\d+$/.test(t)) return undefined;
+  const n = Number(t);
+  return n >= 1 && n <= MAX_DAYS ? n : undefined;
 }
 
 /** Adds or removes a permission, kept in the server's order. */
@@ -68,6 +124,7 @@ export function draftChanges(r: CustomRole, draft: RoleDraft): Partial<RoleDraft
   if (draft.base !== r.base) out.base = draft.base;
   const same = draft.permissions.length === r.permissions.length && draft.permissions.every((p) => r.permissions.includes(p));
   if (!same || r.unknown.length > 0) out.permissions = draft.permissions;
+  if (draft.maxDays !== undefined && draft.maxDays !== (r.maxDays ?? null)) out.maxDays = draft.maxDays;
   return Object.keys(out).length ? out : null;
 }
 

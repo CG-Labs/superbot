@@ -13,6 +13,7 @@ import {
 import type { SuperBotApi } from "../src/api";
 import { relativeTime, ROLES, signInMethod } from "../src/invite";
 import { fetchSsoProviders, type SsoProvider } from "../src/sso";
+import { endsLabel } from "../src/roles";
 import { colors } from "../src/theme";
 import type { AdminUser, CustomRole } from "../src/types";
 import { InviteUserForm } from "./InviteUserForm";
@@ -46,7 +47,12 @@ function UserRow({ u, providers, selected, onPress }: { u: AdminUser; providers:
         </Text>
         <View style={styles.tags}>
           <Text style={[styles.tag, u.role === "admin" && styles.adminTag]}>{ROLE_LABEL[u.role] ?? u.role}</Text>
-          {u.customRole ? <Text style={styles.tag}>{u.customRole.name}</Text> : null}
+          {u.customRole ? (
+            <Text style={styles.tag}>
+              {u.customRole.name}
+              {u.customRole.expiresAt ? ` · ${endsLabel(u.customRole.expiresAt, Date.now())}` : ""}
+            </Text>
+          ) : null}
           {u.status === "disabled" ? <Text style={[styles.tag, styles.disabledTag]}>Disabled</Text> : null}
           {(u.identities ?? []).map((i) => (
             <Text key={i.id} style={styles.tag}>
