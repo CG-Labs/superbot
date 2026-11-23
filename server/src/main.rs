@@ -54,6 +54,7 @@ mod deprovision;
 mod deprovision_http_tests;
 mod erasure;
 mod evidence;
+mod evidence_period;
 #[cfg(test)]
 mod evidence_http_tests;
 mod file_retention;
@@ -201,6 +202,7 @@ mod storage;
 mod storage_http_tests;
 mod sweep;
 mod users;
+mod ustar;
 mod walk;
 #[cfg(test)]
 mod users_http_tests;

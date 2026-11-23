@@ -1,0 +1,14 @@
+{
+  "id": 1,
+  "name": "example-repo",
+  "full_name": "example-org/example-repo",
+  "private": false,
+  "html_url": "https://github.com/example-org/example-repo",
+  "default_branch": "main",
+  "owner": {
+    "login": "example-org",
+    "id": 70644,
+    "type": "Organization",
+    "site_admin": false
+  }
+}

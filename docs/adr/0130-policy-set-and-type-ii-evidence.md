@@ -41,6 +41,6 @@ Option 3.
 
 ## Deferred
 
-- Automating the monthly collection (a `botctl` command or a scheduled job that exports the audit log and CI runs to the evidence store, with digests). The server's part is built: monthly evidence bundles ([ADR 0142](0142-type-ii-evidence-bundles.md)). Exporting CI runs and pull requests from GitHub is still manual.
-- A code of conduct (CC1.1-1), the risk register's template (CC3.2-1) and the configuration baseline document (CC5.1-1).
+- Automating the monthly collection (a `botctl` command or a scheduled job that exports the audit log and CI runs to the evidence store, with digests). The server's part is built: monthly evidence bundles ([ADR 0142](0142-type-ii-evidence-bundles.md)). So is exporting CI runs and pull requests from GitHub: the change-management bundle ([ADR 0148](0148-change-management-evidence-from-github.md)).
+- A code of conduct (CC1.1-1), the risk register's template (CC3.2-1) and the configuration baseline document (CC5.1-1). The baseline is drafted ([ADR 0148](0148-change-management-evidence-from-github.md), [configuration baseline](../security/configuration-baseline.md)).
 - Engaging an auditor and starting the observation period, once the policies are adopted.

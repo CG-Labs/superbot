@@ -1,0 +1,47 @@
+[
+  {
+    "id": 1,
+    "user": {
+      "login": "reviewer-b",
+      "id": 97430,
+      "type": "User",
+      "site_admin": false
+    },
+    "body": "Please rename the helper.",
+    "state": "COMMENTED",
+    "html_url": "https://github.com/example-org/example-repo/pull/1#pullrequestreview-1",
+    "submitted_at": "2026-10-19T09:00:00Z",
+    "commit_id": "c101c101c101c101c101c101c101c101c101c101",
+    "author_association": "MEMBER"
+  },
+  {
+    "id": 2,
+    "user": {
+      "login": "review-bot[bot]",
+      "id": 70843,
+      "type": "Bot",
+      "site_admin": false
+    },
+    "body": "Automated summary with findings.",
+    "state": "COMMENTED",
+    "html_url": "https://github.com/example-org/example-repo/pull/1#pullrequestreview-2",
+    "submitted_at": "2026-10-19T09:05:00Z",
+    "commit_id": "c101c101c101c101c101c101c101c101c101c101",
+    "author_association": "NONE"
+  },
+  {
+    "id": 3,
+    "user": {
+      "login": "reviewer-b",
+      "id": 97430,
+      "type": "User",
+      "site_admin": false
+    },
+    "body": "Looks good.",
+    "state": "APPROVED",
+    "html_url": "https://github.com/example-org/example-repo/pull/1#pullrequestreview-3",
+    "submitted_at": "2026-10-20T14:00:00Z",
+    "commit_id": "a102a102a102a102a102a102a102a102a102a102",
+    "author_association": "MEMBER"
+  }
+]
