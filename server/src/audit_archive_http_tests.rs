@@ -175,7 +175,7 @@ fn reasons(v: &Value) -> Vec<String> {
 }
 
 /// Records `n` events and waits until they are archived, so each round is its own object.
-async fn archive_round(app: &App, x: &crate::audit_export::Exporter, n: usize) {
+async fn archive_round(app: &App, x: &crate::audit_export::Exports, n: usize) {
     for i in 0..n {
         app.db.record(&Event::new(Actor::system("test"), "test.archive").details(json!({ "n": i })));
     }
@@ -379,4 +379,77 @@ async fn checking_the_archive_catches_its_first_objects_gone_and_reads_null_vers
     let v = verify_archive(port, &admin, &format!("&from={from}&to={to}")).await;
     assert_eq!((v["archive"]["objects"].as_u64(), reasons(&v)), (Some(0), vec!["behind".to_string()]), "{v}");
     assert_eq!(v["archive"]["firstProblems"][0]["id"].as_i64(), Some(from), "{v}");
+}
+
+/// A webhook collector that answers 503 while `down` is set, then takes every batch.
+async fn flaky_collector(down: Arc<std::sync::atomic::AtomicBool>) -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
+    let got: Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+    let state = got.clone();
+    let r = axum::Router::new().route(
+        "/ingest",
+        axum::routing::post(move |body: String| {
+            let (state, down) = (state.clone(), down.clone());
+            async move {
+                if down.load(std::sync::atomic::Ordering::SeqCst) {
+                    return axum::http::StatusCode::SERVICE_UNAVAILABLE;
+                }
+                state.lock().unwrap().extend(body.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()));
+                axum::http::StatusCode::OK
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
+    (format!("http://{addr}/ingest"), got)
+}
+
+#[tokio::test]
+async fn an_archive_beside_a_siem_gets_every_event_while_the_siem_is_down() {
+    let (port, app, admin, _) = serve_app().await;
+    let s = StandIn::start().await;
+    s.w().versioning = Some("Enabled");
+    s.w().object_lock = Some(DEFAULT_RETENTION.into());
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (url, got) = flaky_collector(down.clone()).await;
+    for i in 0..5 {
+        app.db.record(&Event::new(Actor::system("test"), "test.both").details(json!({ "n": i })));
+    }
+    let both = format!("{url},s3://backups/audit/prod");
+    export_to(&app, &vars(&s, &[("AUDIT_EXPORT", &both)]));
+    let xs = app.audit_export.get().unwrap().clone();
+    assert_eq!(xs.sinks.iter().map(|x| x.sink.kind()).collect::<Vec<_>>(), ["webhook", "s3"]);
+    let (siem, archive) = (xs.sinks[0].clone(), xs.archive().unwrap().0);
+
+    // The SIEM is down: the archive carries on, and retention waits for the SIEM.
+    until("the SIEM failing", || siem.view(app.db.audit_head())["failing"] == true).await;
+    until("archived while the SIEM is down", || archive.delivered() >= app.db.audit_head()).await;
+    assert_eq!(xs.delivered(), siem.delivered(), "retention keeps what the slowest sink hasn't taken");
+    assert!(xs.delivered() < archive.delivered());
+    let failing = app.db.audit_events(&crate::audit::Filter { actions: vec!["audit.export_failing".into()], ..Default::default() }, 10, false);
+    assert_eq!((failing.len(), failing[0].details["kind"].as_str()), (1, Some("webhook")), "only the SIEM is failing");
+
+    let v = parse(&call(port, "GET", "/api/audit/siem", &admin, "").await.1);
+    assert_eq!((v["kind"].as_str(), v["failing"].as_bool()), (Some("webhook"), Some(true)), "the failing sink leads: {v}");
+    let sinks = v["sinks"].as_array().unwrap();
+    assert_eq!((sinks.len(), sinks[1]["kind"].as_str(), sinks[1]["failing"].as_bool()), (2, Some("s3"), Some(false)), "{v}");
+    assert_eq!(sinks[1]["archive"]["bucket"], "backups");
+    let chain = parse(&call(port, "GET", "/api/audit/chain", &admin, "").await.1);
+    assert_eq!(chain["export"]["sinks"].as_array().map(Vec::len), Some(2), "{chain}");
+    let mut metrics = String::new();
+    crate::audit_export::render(&app, &mut metrics);
+    assert!(metrics.contains("superbot_audit_export_failing{kind=\"webhook\"} 1") && metrics.contains("superbot_audit_export_failing{kind=\"s3\"} 0"), "{metrics}");
+    // The archive check finds the archive among the sinks.
+    let checked = verify_archive(port, &admin, "").await;
+    assert_eq!(checked["archive"]["ok"], true, "{checked}");
+
+    // The SIEM is back: it catches up from its own cursor, and both hold every event once, in order.
+    down.store(false, std::sync::atomic::Ordering::SeqCst);
+    until("both caught up", || xs.sinks.iter().all(|x| x.delivered() >= app.db.audit_head())).await;
+    let ids = |events: &[Value]| events.iter().map(|e| e["id"].as_i64().unwrap()).collect::<Vec<_>>();
+    let (to_siem, to_archive) = (ids(&got.lock().unwrap()), ids(&archived(&s)));
+    let head = app.db.audit_head();
+    assert!(to_siem.windows(2).all(|w| w[1] == w[0] + 1) && to_siem[0] == 1 && *to_siem.last().unwrap() == head, "{to_siem:?}");
+    assert_eq!(to_siem, to_archive);
+    assert_eq!((app.db.audit_export_cursor(&siem.sink.id), app.db.audit_export_cursor(&archive.sink.id)), (Some(head), Some(head)), "a cursor each");
 }

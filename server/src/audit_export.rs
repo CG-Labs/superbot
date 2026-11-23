@@ -1,5 +1,6 @@
 //! SIEM export of the audit log (ADR 0122): every event, as one JSON line in the shape
-//! `GET /api/audit` returns, with its place on the hash chain, sent to one sink:
+//! `GET /api/audit` returns, with its place on the hash chain, sent to a SIEM, an
+//! archive, or both at once (`AUDIT_EXPORT=<siem>,s3://...`, ADR 0173):
 //!
 //! - `https://<host>/<path>`: an HTTPS webhook, `POST`ed in batches as JSON lines
 //!   (`application/x-ndjson`), with headers from the secret `AUDIT_EXPORT_HEADERS`.
@@ -134,7 +135,9 @@ pub enum Start {
 
 #[derive(Debug)]
 pub struct Settings {
-    pub sink: Option<Sink>,
+    /// In the order `AUDIT_EXPORT` lists them: at most one SIEM (webhook or syslog) and
+    /// one S3 archive (ADR 0173).
+    pub sinks: Vec<Sink>,
     pub start: Start,
 }
 
@@ -150,33 +153,51 @@ impl Settings {
             "new" => Start::New,
             other => return Err(format!("AUDIT_EXPORT_START must be all or new, not \"{other}\"")),
         };
-        let sink = match get("AUDIT_EXPORT").trim() {
-            "" | "off" => None,
-            v if v.to_ascii_lowercase().starts_with("s3://") => {
-                if store.get("AUDIT_EXPORT_HEADERS").map_err(|e| e.to_string())?.is_some() {
-                    return Err("AUDIT_EXPORT_HEADERS is for an https sink; the S3 archive signs with AUDIT_EXPORT_S3_ACCESS_KEY_ID and _SECRET_ACCESS_KEY".into());
-                }
-                Some(Sink::from_archive(crate::audit_archive::Archive::from_env(v, get, store)?))
-            }
-            v => {
-                let mut sink = Sink::parse(v, insecure)?;
-                // Read only when export is on, so a leftover _FILE doesn't stop botd starting.
-                let headers = store.get("AUDIT_EXPORT_HEADERS").map_err(|e| e.to_string())?;
-                match (&mut sink.kind, headers) {
-                    (Kind::Webhook { headers, .. }, Some(h)) => *headers = crate::obs::trace::headers("AUDIT_EXPORT_HEADERS", h.expose())?,
-                    (Kind::Syslog { .. }, Some(_)) => return Err("AUDIT_EXPORT_HEADERS is for an https sink; syslog over TLS has no headers".into()),
-                    (_, _) => {}
-                }
-                Some(sink)
-            }
+        let raw = get("AUDIT_EXPORT");
+        let listed: Vec<&str> = match raw.trim() {
+            "" | "off" => Vec::new(),
+            v => v.split(',').map(str::trim).collect(),
         };
-        Ok(Settings { sink, start })
+        if listed.iter().any(|v| v.is_empty()) {
+            return Err("AUDIT_EXPORT lists sinks split by single commas, with none empty".into());
+        }
+        let mut sinks = Vec::new();
+        for v in listed {
+            let sink = match v.to_ascii_lowercase().starts_with("s3://") {
+                true => Sink::from_archive(crate::audit_archive::Archive::from_env(v, get, store)?),
+                false => Sink::parse(v, insecure)?,
+            };
+            sinks.push(sink);
+        }
+        let archives = sinks.iter().filter(|s| s.archive().is_some()).count();
+        if sinks.len() > 2 || archives > 1 || sinks.len() - archives > 1 {
+            return Err("AUDIT_EXPORT takes one SIEM (https:// or syslog+tls://) and one archive (s3://) at most, split by a comma".into());
+        }
+        // Read only when export is on, so a leftover _FILE doesn't stop botd starting.
+        if !sinks.is_empty()
+            && let Some(h) = store.get("AUDIT_EXPORT_HEADERS").map_err(|e| e.to_string())?
+        {
+            let syslog = sinks.iter().any(|s| matches!(s.kind, Kind::Syslog { .. }));
+            match sinks.iter_mut().find_map(|s| match &mut s.kind {
+                Kind::Webhook { headers, .. } => Some(headers),
+                _ => None,
+            }) {
+                Some(headers) => *headers = crate::obs::trace::headers("AUDIT_EXPORT_HEADERS", h.expose())?,
+                None if syslog => return Err("AUDIT_EXPORT_HEADERS is for an https sink; syslog over TLS has no headers".into()),
+                None => return Err("AUDIT_EXPORT_HEADERS is for an https sink; the S3 archive signs with AUDIT_EXPORT_S3_ACCESS_KEY_ID and _SECRET_ACCESS_KEY".into()),
+            }
+        }
+        Ok(Settings { sinks, start })
     }
 
     pub fn describe(&self) -> String {
-        match &self.sink {
-            None => "off (AUDIT_EXPORT)".into(),
-            Some(s) => {
+        if self.sinks.is_empty() {
+            return "off (AUDIT_EXPORT)".into();
+        }
+        let each: Vec<String> = self
+            .sinks
+            .iter()
+            .map(|s| {
                 let how = match &s.kind {
                     Kind::Webhook { headers, plain, .. } => {
                         format!("as JSON lines over {}{}", if *plain { "plain HTTP" } else { "HTTPS" }, if headers.is_empty() { "" } else { ", with headers (AUDIT_EXPORT_HEADERS)" })
@@ -185,9 +206,11 @@ impl Settings {
                     Kind::Syslog { .. } => "as RFC 5424 syslog over plain TCP".into(),
                     Kind::Archive(a) => a.describe(),
                 };
-                format!("every audit event to {} {how}, resuming where it left off", s.shown)
-            }
-        }
+                format!("every audit event to {} {how}", s.shown)
+            })
+            .collect();
+        let also = if each.len() > 1 { ", each on its own and" } else { "" };
+        format!("{}{also}, resuming where it left off", each.join("; and "))
     }
 }
 
@@ -271,23 +294,63 @@ impl Exporter {
     }
 }
 
-/// Starts the export, if a sink is set. Before retention starts, so its first pass
+/// Every running export (ADR 0173): a SIEM, an archive, or both. Each has its own
+/// cursor, retries and status, so one sink's outage never holds up the other.
+pub struct Exports {
+    pub sinks: Vec<Arc<Exporter>>,
+}
+
+impl Exports {
+    /// The last event every sink accepted: retention keeps everything after it.
+    pub fn delivered(&self) -> i64 {
+        self.sinks.iter().map(|x| x.delivered()).min().unwrap_or(0)
+    }
+
+    /// The S3 archive, when one is set.
+    pub fn archive(&self) -> Option<(&Exporter, &crate::audit_archive::Archive)> {
+        self.sinks.iter().find_map(|x| x.sink.archive().map(|a| (x.as_ref(), a)))
+    }
+
+    /// The sink in the worst state (failing, then furthest behind), so a reader of one
+    /// sink's fields never misses another's trouble; and every sink under `sinks`.
+    pub fn view(&self, head: i64) -> Value {
+        let views: Vec<Value> = self.sinks.iter().map(|x| x.view(head)).collect();
+        let worst = views.iter().max_by_key(|v| (v["failing"].as_bool().unwrap_or(false), v["pending"].as_i64().unwrap_or(0))).cloned();
+        let mut v = worst.unwrap_or_else(|| json!({ "enabled": false }));
+        if !views.is_empty() {
+            v["sinks"] = Value::Array(views);
+        }
+        v
+    }
+}
+
+/// Starts the export to each sink set. Before retention starts, so its first pass
 /// already keeps what isn't delivered.
 pub fn start(app: &Arc<App>, settings: Settings) {
-    let Some(sink) = settings.sink else { return };
-    let delivered = app.db.audit_export_cursor(&sink.id).unwrap_or_else(|| {
-        let from = match settings.start {
-            Start::All => 0,
-            Start::New => app.db.audit_head(),
-        };
-        if let Err(e) = app.db.set_audit_export_cursor(&sink.id, from) {
-            log_warn!("Audit export: couldn't save where {} starts ({e}); trying again after the first delivery.", sink.shown);
+    if settings.sinks.is_empty() {
+        return;
+    }
+    let sinks: Vec<Arc<Exporter>> = settings
+        .sinks
+        .into_iter()
+        .map(|sink| {
+            let delivered = app.db.audit_export_cursor(&sink.id).unwrap_or_else(|| {
+                let from = match settings.start {
+                    Start::All => 0,
+                    Start::New => app.db.audit_head(),
+                };
+                if let Err(e) = app.db.set_audit_export_cursor(&sink.id, from) {
+                    log_warn!("Audit export: couldn't save where {} starts ({e}); trying again after the first delivery.", sink.shown);
+                }
+                from
+            });
+            Arc::new(Exporter::new(sink, delivered))
+        })
+        .collect();
+    if app.audit_export.set(Arc::new(Exports { sinks: sinks.clone() })).is_ok() {
+        for x in sinks {
+            tokio::spawn(run(app.clone(), x));
         }
-        from
-    });
-    let x = Arc::new(Exporter::new(sink, delivered));
-    if app.audit_export.set(x.clone()).is_ok() {
-        tokio::spawn(run(app.clone(), x));
     }
 }
 
@@ -357,7 +420,7 @@ async fn run(app: Arc<App>, x: Arc<Exporter>) {
                 if let Some((tries, since)) = x.delivered_to(last) {
                     log_info!("Audit export: {} is taking events again after {tries} failed tries.", x.sink.shown);
                     let e = Event::new(Actor::system("audit_export"), "audit.export_recovered").target("audit", "export");
-                    app.db.record(&e.details(json!({ "sink": x.sink.shown, "failedTries": tries, "failingSince": since })));
+                    app.db.record(&e.details(json!({ "sink": x.sink.shown, "kind": x.sink.kind(), "failedTries": tries, "failingSince": since })));
                 }
                 wait = FIRST_RETRY;
             }
@@ -367,7 +430,7 @@ async fn run(app: Arc<App>, x: Arc<Exporter>) {
                     log_warn!("WARNING: audit export to {} is failing ({e}); events wait in the database and retention keeps them until they are delivered.", x.sink.shown);
                     let pending = (app.db.audit_head() - x.delivered()).max(0);
                     let ev = Event::new(Actor::system("audit_export"), "audit.export_failing").target("audit", "export").outcome(Outcome::Failure);
-                    app.db.record(&ev.details(json!({ "sink": x.sink.shown, "reason": reason, "error": e, "pending": pending })));
+                    app.db.record(&ev.details(json!({ "sink": x.sink.shown, "kind": x.sink.kind(), "reason": reason, "error": e, "pending": pending })));
                 }
                 tokio::time::sleep(jitter(wait)).await;
                 wait = (wait * 2).min(LAST_RETRY);
@@ -549,17 +612,26 @@ pub async fn get(axum::extract::State(app): axum::extract::State<Arc<App>>) -> a
     })
 }
 
-/// How far behind the export is, when it is on.
+/// How far behind each sink is, when the export is on, labelled by its kind (one sink
+/// of each kind at most).
 pub fn render(app: &App, out: &mut String) {
-    let Some(x) = app.audit_export.get() else { return };
-    let v = x.view(app.db.audit_head());
-    metrics::family(out, "superbot_audit_export_pending_events", "gauge", "Audit events not yet delivered to the SIEM sink (ADR 0122).");
-    metrics::sample(out, "superbot_audit_export_pending_events", &[], v["pending"].as_i64().unwrap_or(0) as f64);
-    metrics::family(out, "superbot_audit_export_failing", "gauge", "1 while delivery to the SIEM sink keeps failing.");
-    metrics::sample(out, "superbot_audit_export_failing", &[], v["failing"].as_bool().unwrap_or(false) as u8 as f64);
-    if let Some(t) = v["deliveredAt"].as_i64() {
-        metrics::family(out, "superbot_audit_export_last_delivery_timestamp_seconds", "gauge", "When the SIEM sink last accepted a batch.");
-        metrics::sample(out, "superbot_audit_export_last_delivery_timestamp_seconds", &[], t as f64 / 1000.0);
+    let Some(xs) = app.audit_export.get() else { return };
+    let head = app.db.audit_head();
+    let views: Vec<(&'static str, Value)> = xs.sinks.iter().map(|x| (x.sink.kind(), x.view(head))).collect();
+    metrics::family(out, "superbot_audit_export_pending_events", "gauge", "Audit events not yet delivered to the sink (ADR 0122).");
+    for (kind, v) in &views {
+        metrics::sample(out, "superbot_audit_export_pending_events", &[("kind", kind)], v["pending"].as_i64().unwrap_or(0) as f64);
+    }
+    metrics::family(out, "superbot_audit_export_failing", "gauge", "1 while delivery to the sink keeps failing.");
+    for (kind, v) in &views {
+        metrics::sample(out, "superbot_audit_export_failing", &[("kind", kind)], v["failing"].as_bool().unwrap_or(false) as u8 as f64);
+    }
+    let delivered: Vec<(&str, i64)> = views.iter().filter_map(|(k, v)| v["deliveredAt"].as_i64().map(|t| (*k, t))).collect();
+    if !delivered.is_empty() {
+        metrics::family(out, "superbot_audit_export_last_delivery_timestamp_seconds", "gauge", "When the sink last accepted a batch.");
+        for (kind, t) in delivered {
+            metrics::sample(out, "superbot_audit_export_last_delivery_timestamp_seconds", &[("kind", kind)], t as f64 / 1000.0);
+        }
     }
 }
 
@@ -576,14 +648,14 @@ pub(crate) mod tests {
 
     #[test]
     fn export_is_off_by_default_and_needs_tls_off_loopback() {
-        assert!(settings(&[]).unwrap().sink.is_none());
-        assert!(settings(&[("AUDIT_EXPORT", "off")]).unwrap().sink.is_none());
+        assert!(settings(&[]).unwrap().sinks.is_empty());
+        assert!(settings(&[("AUDIT_EXPORT", "off")]).unwrap().sinks.is_empty());
         assert_eq!(settings(&[]).unwrap().describe(), "off (AUDIT_EXPORT)");
-        let s = settings(&[("AUDIT_EXPORT", "https://siem.example.net/ingest/superbot")]).unwrap().sink.unwrap();
+        let s = settings(&[("AUDIT_EXPORT", "https://siem.example.net/ingest/superbot")]).unwrap().sinks.remove(0);
         assert_eq!((s.kind(), s.shown.as_str(), s.id.as_str()), ("webhook", "https://siem.example.net:443", "https://siem.example.net:443/ingest/superbot"));
-        let s = settings(&[("AUDIT_EXPORT", "syslog+tls://logs.example.net")]).unwrap().sink.unwrap();
+        let s = settings(&[("AUDIT_EXPORT", "syslog+tls://logs.example.net")]).unwrap().sinks.remove(0);
         assert_eq!((s.kind(), s.shown.as_str()), ("syslog", "syslog+tls://logs.example.net:6514"));
-        assert_eq!(settings(&[("AUDIT_EXPORT", "syslog+tcp://127.0.0.1:1514")]).unwrap().sink.unwrap().shown, "syslog+tcp://127.0.0.1:1514");
+        assert_eq!(settings(&[("AUDIT_EXPORT", "syslog+tcp://127.0.0.1:1514")]).unwrap().sinks.remove(0).shown, "syslog+tcp://127.0.0.1:1514");
         assert!(settings(&[("AUDIT_EXPORT", "http://127.0.0.1:8080/x")]).is_ok());
         for plain in ["http://siem.internal/x", "syslog+tcp://logs.internal"] {
             assert!(settings(&[("AUDIT_EXPORT", plain)]).unwrap_err().contains("AUDIT_EXPORT_INSECURE"), "{plain}");
@@ -608,6 +680,57 @@ pub(crate) mod tests {
         assert!(settings(&[("AUDIT_EXPORT", "https://siem.example.net/in"), ("AUDIT_EXPORT_HEADERS", "no-equals")]).is_err());
         // A leftover headers file doesn't matter while export is off.
         assert!(settings(&[("AUDIT_EXPORT_HEADERS_FILE", "/nonexistent/superbot-headers")]).is_ok());
+    }
+
+    fn with_archive(vars: &[(&str, &str)]) -> Result<Settings, String> {
+        let mut all = vec![("AUDIT_EXPORT_S3_ENDPOINT", "https://s3.example.net"), ("AUDIT_EXPORT_S3_ACCESS_KEY_ID", "AKID"), ("AUDIT_EXPORT_S3_SECRET_ACCESS_KEY", "archive-secret-0123456789")];
+        all.extend_from_slice(vars);
+        settings(&all)
+    }
+
+    #[test]
+    fn a_siem_and_an_archive_together() {
+        let s = with_archive(&[("AUDIT_EXPORT", " https://siem.example.net/in , s3://audit-archive/prod "), ("AUDIT_EXPORT_HEADERS", "Authorization=Bearer x")]).unwrap();
+        assert_eq!(s.sinks.iter().map(|s| s.kind()).collect::<Vec<_>>(), ["webhook", "s3"]);
+        let d = s.describe();
+        assert!(d.contains("https://siem.example.net:443 as JSON lines over HTTPS, with headers") && d.contains("; and every audit event to s3://audit-archive/prod") && d.contains("each on its own"), "{d}");
+        let s = with_archive(&[("AUDIT_EXPORT", "s3://audit-archive/prod,syslog+tls://logs.example.net")]).unwrap();
+        assert_eq!(s.sinks.iter().map(|s| s.kind()).collect::<Vec<_>>(), ["s3", "syslog"], "in the order listed");
+
+        for (export, why) in [
+            ("https://a.example.net/in,https://b.example.net/in", "one SIEM"),
+            ("https://a.example.net/in,syslog+tls://logs.example.net", "one SIEM"),
+            ("s3://audit-archive/a,s3://audit-archive/b", "one archive"),
+            ("https://a.example.net/in,s3://audit-archive/a,syslog+tls://logs.example.net", "at most"),
+            ("https://a.example.net/in,", "none empty"),
+            (",s3://audit-archive/a", "none empty"),
+            ("https://a.example.net/in,ftp://x.example.net", "use https"),
+        ] {
+            let e = with_archive(&[("AUDIT_EXPORT", export)]).unwrap_err();
+            assert!(e.contains(why), "{export}: {e}");
+        }
+        // Headers need the webhook, wherever it is listed.
+        assert!(with_archive(&[("AUDIT_EXPORT", "s3://audit-archive/a,https://a.example.net/in"), ("AUDIT_EXPORT_HEADERS", "a=b")]).is_ok());
+        assert!(with_archive(&[("AUDIT_EXPORT", "s3://audit-archive/a,syslog+tls://logs.example.net"), ("AUDIT_EXPORT_HEADERS", "a=b")]).unwrap_err().contains("syslog"));
+        assert!(with_archive(&[("AUDIT_EXPORT", "s3://audit-archive/a"), ("AUDIT_EXPORT_HEADERS", "a=b")]).unwrap_err().contains("S3 archive signs"));
+    }
+
+    #[test]
+    fn retention_waits_for_the_slowest_sink_and_the_view_leads_with_the_worst() {
+        let siem = Arc::new(Exporter::new(Sink::parse("https://siem.example.net/in", false).unwrap(), 9));
+        let other = Arc::new(Exporter::new(Sink::parse("syslog+tls://logs.example.net", false).unwrap(), 4));
+        let xs = Exports { sinks: vec![siem.clone(), other.clone()] };
+        assert_eq!(xs.delivered(), 4);
+        assert!(xs.archive().is_none());
+        let v = xs.view(10);
+        assert_eq!((v["kind"].as_str(), v["pending"].as_i64(), v["sinks"].as_array().map(Vec::len)), (Some("syslog"), Some(6), Some(2)), "furthest behind: {v}");
+        for _ in 0..FAILING_AFTER {
+            siem.failed("down");
+        }
+        let v = xs.view(10);
+        assert_eq!((v["kind"].as_str(), v["failing"].as_bool(), v["lastError"].as_str()), (Some("webhook"), Some(true), Some("down")), "failing comes first: {v}");
+        assert_eq!(v["sinks"][1]["failing"], false);
+        assert_eq!(Exports { sinks: vec![] }.view(1), json!({ "enabled": false }));
     }
 
     pub(crate) fn event(outcome: &str) -> AuditEvent {
