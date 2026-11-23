@@ -371,4 +371,12 @@ async fn checking_the_archive_catches_its_first_objects_gone_and_reads_null_vers
     let v = verify_archive(port, &admin, "").await;
     assert_eq!((v["archive"]["ok"].as_bool(), reasons(&v)), (Some(false), vec!["start".to_string()]), "{v}");
     assert_eq!(v["archive"]["firstProblems"][0]["id"].as_i64(), Some(1), "{v}");
+
+    // A middle object gone, and only its events asked for: nothing is read, yet it's caught.
+    let middle = fresh.keys()[1].clone();
+    let (from, to) = crate::audit_archive_verify::ids("audit/prod", &middle).unwrap();
+    c.delete(&middle).await.unwrap();
+    let v = verify_archive(port, &admin, &format!("&from={from}&to={to}")).await;
+    assert_eq!((v["archive"]["objects"].as_u64(), reasons(&v)), (Some(0), vec!["behind".to_string()]), "{v}");
+    assert_eq!(v["archive"]["firstProblems"][0]["id"].as_i64(), Some(from), "{v}");
 }

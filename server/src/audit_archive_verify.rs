@@ -403,21 +403,32 @@ impl<'a> Walker<'a> {
 
     /// `batches`: botd has cut a batch for this archive, so it has written to it.
     pub fn finish(mut self, range: Range, batches: bool) -> Checked {
-        let d = self.rep.delivered;
+        let (d, start) = (self.rep.delivered, self.rep.start);
         let head = self.rep.head.as_ref().map_or(0, |h| h.id);
-        let in_range = range.from.is_none_or(|f| d >= f) && range.to.is_none_or(|t| d <= t);
-        if self.rep.error.is_none() && in_range && d > head && (head > 0 || batches) {
-            let error = format!("botd delivered events up to {d} to the archive, but it ends at {head}: objects are missing from it");
-            self.problem(None, Some(head + 1), "behind", error);
+        // The part of the range botd has delivered to the archive, which must all be there.
+        let lo = range.from.into_iter().chain(start).max();
+        let hi = range.to.map_or(d, |t| t.min(d));
+        // Without a recorded start, a range ending before `delivered` that read nothing may
+        // lie before the archive began.
+        let can_tell = start.is_some() || head > 0 || range.to.is_none_or(|t| d <= t);
+        if self.rep.error.is_none() && hi > head && lo.is_none_or(|l| hi >= l) && (head > 0 || batches) && can_tell {
+            let from = (head + 1).max(lo.unwrap_or(1));
+            let error = match head {
+                0 => format!("botd delivered events up to {d} to the archive, but it holds none from {from} to {hi}: objects are missing from it"),
+                _ => format!("botd delivered events up to {d} to the archive, but it ends at {head}: objects are missing from it"),
+            };
+            self.problem(None, Some(from), "behind", error);
         }
-        if let (Some(s), Some(first)) = (self.rep.start, self.rep.first)
+        if let (Some(l), Some(first)) = (lo.filter(|_| start.is_some()), self.rep.first)
             && self.rep.error.is_none()
-            && first > s
-            && range.from.is_none_or(|f| f <= s)
-            && range.to.is_none_or(|t| s <= t)
+            && first > l
+            && l <= hi
         {
-            let error = format!("botd's first batch for this archive began at event {s}, but the archive begins at {first}: objects are missing from its start");
-            self.problem(None, Some(s), "start", error);
+            let error = match start == Some(l) {
+                true => format!("botd's first batch for this archive began at event {l}, but the archive begins at {first}: objects are missing from its start"),
+                false => format!("the archive has no events from {l} to {}, which botd delivered to it: objects are missing from it", first - 1),
+            };
+            self.problem(None, Some(l), "start", error);
         }
         let mut rep = self.rep;
         rep.ok = rep.problems == 0 && rep.error.is_none();
@@ -877,5 +888,29 @@ mod tests {
         assert!(walk_from(4, &[(4, 6), (7, 9)], Range::default()).ok, "started later (AUDIT_EXPORT_START=new, or after retention)");
         assert!(walk_from(1, &[(4, 6), (7, 9)], Range { from: Some(4), to: None }).ok, "a range from later doesn't ask");
         assert!(walk(&[(4, 9)], "bucket", 9, &local(9)).ok, "no start recorded");
+    }
+
+    #[test]
+    fn a_range_must_hold_what_botd_delivered_in_it() {
+        let a = archive("bucket");
+        let walk_range = |start: Option<i64>, objects: &[(i64, i64)], range: Range| {
+            let mut w = Walker::new(&a, 9, &[]).starting_at(start);
+            for &(f, t) in objects {
+                w.object(&format!("prod/2026/11/23/{f:020}-{t:020}.jsonl"), (f, t), &meta(f, t), &body(f..=t), &local(9), None);
+            }
+            w.finish(range, true)
+        };
+        // 4 to 6 deleted: the objects either side are outside the range, so nothing is read.
+        let c = walk_range(Some(1), &[], Range { from: Some(4), to: Some(6) });
+        assert_eq!((reasons(&c), c.first_problems[0].id), (vec!["behind"], Some(4)), "{c:?}");
+        assert!(c.first_problems[0].error.contains("none from 4 to 6"), "{c:?}");
+        let c = walk_range(Some(1), &[(1, 3)], Range { from: None, to: Some(6) });
+        assert_eq!((reasons(&c), c.first_problems[0].id), (vec!["behind"], Some(4)), "{c:?}");
+        let c = walk_range(Some(1), &[(7, 9)], Range { from: Some(5), to: None });
+        assert_eq!((reasons(&c), c.first_problems[0].id), (vec!["start"], Some(5)), "{c:?}");
+        assert!(c.first_problems[0].error.contains("no events from 5 to 6"), "{c:?}");
+        assert!(walk_range(Some(1), &[(4, 6)], Range { from: Some(4), to: Some(6) }).ok);
+        assert!(walk_range(Some(7), &[], Range { from: None, to: Some(6) }).ok, "before the archive began");
+        assert!(walk_range(None, &[], Range { from: Some(4), to: Some(6) }).ok, "no start recorded: can't tell");
     }
 }

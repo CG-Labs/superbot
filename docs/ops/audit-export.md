@@ -255,7 +255,7 @@ The check fails, and exits 1, if any of that doesn't hold. `firstBroken` then na
 | `stray` | A key under the prefix that botd didn't write |
 | `unreadable` | An object couldn't be read or parsed |
 
-`--from` and `--to` read only the objects that hold those events, and `--pin` and `--key` work as usual. The check costs one listing plus one `GET` per object (more for objects with several versions), four at a time. A year of 5-minute batches is about 100,000 objects, so use a range for frequent checks and run the whole archive less often, for example weekly from cron. `audit.verified` records the result.
+`--from` and `--to` read only the objects that hold those events, and every event in that range that botd has delivered must be there (`start` or `behind` otherwise; for an archive started before botd recorded where it began, only when the range reads something or reaches the last event delivered), and `--pin` and `--key` work as usual. The check costs one listing plus one `GET` per object (more for objects with several versions), four at a time. A year of 5-minute batches is about 100,000 objects, so use a range for frequent checks and run the whole archive less often, for example weekly from cron. `audit.verified` records the result.
 
 For this, the key botd uses also needs `s3:ListBucketVersions` on the bucket; export works without it. Without it the check fails, and the error names the missing right. It still needs no delete rights.
 
