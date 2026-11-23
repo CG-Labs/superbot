@@ -1863,9 +1863,68 @@ $("incidents-list").addEventListener("click", async (e) => {
   }
 });
 
+// Support (ADR 0131, 0144, 0157): the customer health score, its history, and the support bundle.
+
+const BANDS = { healthy: "Healthy", watch: "Watch", at_risk: "At risk", unknown: "Unknown" };
+const SIGNAL_STATUS = { ok: "OK", watch: "Watch", risk: "At risk", "n/a": "n/a" };
+let signalLabels = {};
+
+function bandTag(band) {
+  return `<span class="tag band-${esc(band)}">${esc(BANDS[band] || band)}</span>`;
+}
+const labelled = (ids) => ids.map((id) => esc(signalLabels[id] || id)).join(", ");
+
+async function loadSupport() {
+  try {
+    const r = await api("GET", "/api/support/health-score");
+    signalLabels = Object.fromEntries(r.signals.map((s) => [s.id, s.label]));
+    $("sup-score").innerHTML = `<div class="bar"><b class="score">${r.score ?? "–"}</b><span class="sub">/ 100</span> ${bandTag(r.band)}
+        <span class="sub push">Last ${esc(r.windowDays)} days${r.partial ? ` · the audit log keeps ${esc(r.auditRetentionDays)} days, so counts cover less` : ""}</span></div>
+      ${r.atRisk.length ? `<p class="warn">At risk: ${labelled(r.atRisk)}.</p>` : ""}
+      ${r.watch.length ? `<p class="hint">Worth a look: ${labelled(r.watch)}.</p>` : ""}`;
+    $("sup-signals").innerHTML = r.signals.map((s) => `<tr>
+        <td>${esc(s.label)}</td><td>${esc(s.weight)}</td>
+        <td><span class="tag sig-${esc(s.status === "n/a" ? "na" : s.status)}">${esc(SIGNAL_STATUS[s.status] || s.status)}</span></td>
+        <td>${esc(s.summary)}</td></tr>`).join("");
+  } catch (err) {
+    $("sup-score").textContent = err.message;
+    $("sup-signals").innerHTML = "";
+  }
+  loadHistory();
+}
+
+async function loadHistory() {
+  try {
+    const h = await api("GET", `/api/support/health-score/history?days=${key($("sup-days").value)}`);
+    const t = h.trend;
+    $("sup-trend").textContent = t
+      ? `Since ${t.from}: ${t.fromScore ?? "no score"} to ${t.toScore ?? "no score"}${t.change == null ? "" : ` (${t.change > 0 ? "+" : ""}${t.change})`}.`
+        + (t.worse.length ? ` Worse: ${t.worse.map((id) => signalLabels[id] || id).join(", ")}.` : "")
+        + (t.better.length ? ` Better: ${t.better.map((id) => signalLabels[id] || id).join(", ")}.` : "")
+      : "";
+    const points = [...h.points].reverse();
+    $("sup-history").innerHTML = points.map((p) => {
+      const ids = (status) => Object.keys(p.signals).filter((id) => p.signals[id] === status);
+      return `<tr><td>${esc(p.date)}</td>
+        <td><meter min="0" max="100" low="50" high="80" optimum="100" value="${esc(p.score ?? 0)}"></meter> ${esc(p.score ?? "–")}</td>
+        <td>${bandTag(p.band)}</td><td>${labelled(ids("risk"))}</td><td>${labelled(ids("watch"))}</td></tr>`;
+    }).join("");
+    $("sup-history-empty").hidden = points.length > 0;
+    $("sup-history-empty").textContent = h.recording
+      ? "No days recorded yet. botd records the score once a day."
+      : "botd isn't recording the score (HEALTH_SCORE_HISTORY_DAYS=0).";
+  } catch (err) {
+    $("sup-history").innerHTML = "";
+    $("sup-history-empty").hidden = false;
+    $("sup-history-empty").textContent = err.message;
+  }
+}
+
+$("sup-days").addEventListener("change", loadHistory);
+
 // Tabs, from the address bar's #fragment so a reload keeps your place.
 
-const TABS = { users: loadUsers, requests: loadRequests, machines: loadMachines, teams: loadTeams, roles: loadRoles, audit: () => loadAudit(), status: loadStatus, settings: loadSettings, setup: loadSetup };
+const TABS = { users: loadUsers, requests: loadRequests, machines: loadMachines, teams: loadTeams, roles: loadRoles, audit: () => loadAudit(), status: loadStatus, support: loadSupport, settings: loadSettings, setup: loadSetup };
 
 // `#audit?target=approval:<id>`: a notification's link to one approval's trail (ADR 0061).
 function showTab() {

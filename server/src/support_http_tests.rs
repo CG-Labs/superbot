@@ -11,7 +11,7 @@ use crate::users_http_tests::{parse, user_with};
 use crate::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const FILES: [&str; 8] = ["README.txt", "version.json", "config.json", "health.json", "health-score.json", "logs.jsonl", "audit-summary.json", "manifest.json"];
+const FILES: [&str; 9] = ["README.txt", "version.json", "config.json", "health.json", "health-score.json", "health-score-history.json", "logs.jsonl", "audit-summary.json", "manifest.json"];
 
 /// `GET /api/support/bundle`: the status, the response head, and the body's bytes.
 async fn fetch(port: u16, auth: &str) -> (u16, String, Vec<u8>) {
@@ -98,6 +98,8 @@ async fn it_carries_what_support_asks_for_first() {
     let ids: Vec<_> = score["signals"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
     assert_eq!(ids, crate::health_score::SIGNALS.iter().map(|s| s.id).collect::<Vec<_>>(), "{score}");
     assert_eq!(score["signals"][4]["facts"]["pendingNow"], 1, "the approval waiting: {score}");
+    let history = parse(file(&f, "health-score-history.json"));
+    assert_eq!((history["days"].as_i64(), history["points"].as_array().map(Vec::len)), (Some(90), Some(0)), "nothing recorded yet: {history}");
     assert!(health["setup"]["checklist"].as_array().is_some_and(|c| c.iter().any(|i| i["id"] == "backups")), "{health}");
     assert!(health["license"]["summary"].is_object(), "{health}");
 
@@ -115,8 +117,8 @@ async fn it_carries_what_support_asks_for_first() {
     let manifest = parse(file(&f, "manifest.json"));
     assert_eq!(manifest["format"], support::FORMAT);
     let listed: Vec<&str> = manifest["files"].as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap()).collect();
-    assert_eq!(listed, FILES[..7], "the manifest lists the files before it");
-    for (name, body) in &f[..7] {
+    assert_eq!(listed, FILES[..FILES.len() - 1], "the manifest lists the files before it");
+    for (name, body) in &f[..FILES.len() - 1] {
         let bytes = manifest["files"].as_array().unwrap().iter().find(|x| x["name"] == name.as_str()).unwrap()["bytes"].as_u64().unwrap();
         assert_eq!(bytes as usize, body.len(), "{name}");
     }

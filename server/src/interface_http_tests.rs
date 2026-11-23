@@ -130,7 +130,7 @@ async fn the_console_is_an_admin_page_without_chat_bots_or_screens() {
     for part in ["script-src 'self'", "style-src 'self'", "frame-ancestors 'none'", "connect-src 'self'"] {
         assert!(csp.contains(part), "{csp}");
     }
-    for tab in ["Users", "Requests", "Machines", "Teams", "Roles", "Audit log", "Settings", "Setup", "Sign out", r#"href="/app/""#] {
+    for tab in ["Users", "Requests", "Machines", "Teams", "Roles", "Audit log", "Support", "Settings", "Setup", "Sign out", r#"href="/app/""#] {
         assert!(html.contains(tab), "{tab}");
     }
     // Nothing the CSP would block: one script, from a file, and no inline styles.

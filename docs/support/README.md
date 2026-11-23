@@ -12,7 +12,7 @@ How customers get help with SuperBot, how fast, and how the Provider runs suppor
 | [Onboarding and success](onboarding.md) | Getting a new customer live: SSO and SCIM, isolation, backups and residency checklists, then the success cadence |
 | [Support bundle](support-bundle.md) | `botctl support-bundle`: what it collects, what it never collects, and how to send it |
 | [Technical account managers](tam.md) | The named TAM for Enterprise customers: what they do, the cadence from kickoff to renewal, and handover |
-| [Customer health score](health-score.md) | `botctl health-score`: six signals from botd's own records, how they're scored, and what to do about each |
+| [Customer health score](health-score.md) | `botctl health-score`: six signals from botd's own records, how they're scored, and what to do about each; its daily [history](health-score.md#history) and the console's Support tab |
 | [Health check](health-check.md) | The TAM's monthly (Enterprise) or quarterly checklist |
 | [Quarterly business review](qbr-template.md) | The template for the review with the customer's owner and sponsor |
 

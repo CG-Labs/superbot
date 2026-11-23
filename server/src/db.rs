@@ -1922,7 +1922,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 55] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 56] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1978,7 +1978,22 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 55] = [
     migrate_scim_group_roles,
     migrate_service_accounts,
     migrate_user_last_seen,
+    migrate_health_scores,
 ];
+
+/// The customer health score once a day (ADR 0157): counts' verdicts only, no one named.
+fn migrate_health_scores(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS health_scores (
+          day TEXT PRIMARY KEY,
+          at INTEGER NOT NULL,
+          window_days INTEGER NOT NULL,
+          score INTEGER,
+          band TEXT NOT NULL,
+          signals TEXT NOT NULL
+        );",
+    )
+}
 
 /// Native SAML sign-ins' NameID and SessionIndex (ADR 0137), for single logout. Gone with
 /// their session, however that goes (pruned, or its user erased).
@@ -9468,6 +9483,46 @@ impl Db {
     #[cfg(test)]
     pub fn machine_set_enrolled(&self, machine_id: &str) {
         self.c().execute("UPDATE machines SET enrollment = 'enrolled' WHERE id = ?", [machine_id]).unwrap();
+    }
+}
+
+/// One day's customer health score (ADR 0157).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HealthScoreDay {
+    /// The UTC date, `YYYY-MM-DD`.
+    pub day: String,
+    pub at: i64,
+    pub window_days: i64,
+    pub score: Option<u32>,
+    pub band: String,
+    /// Each signal's status by id, as JSON.
+    pub signals: String,
+}
+
+impl Db {
+    /// Records a day's score. False if that day already has one: the first of the day stays.
+    pub fn health_score_record(&self, d: &HealthScoreDay) -> bool {
+        self.c()
+            .execute(
+                "INSERT OR IGNORE INTO health_scores (day, at, window_days, score, band, signals) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![d.day, d.at, d.window_days, d.score, d.band, d.signals],
+            )
+            .unwrap_or(0)
+            > 0
+    }
+
+    /// The days from `from` (`YYYY-MM-DD`), oldest first.
+    pub fn health_scores_since(&self, from: &str) -> Vec<HealthScoreDay> {
+        let c = self.c();
+        let Ok(mut s) = c.prepare("SELECT day, at, window_days, score, band, signals FROM health_scores WHERE day >= ? ORDER BY day") else { return Vec::new() };
+        s.query_map([from], |r| Ok(HealthScoreDay { day: r.get(0)?, at: r.get(1)?, window_days: r.get(2)?, score: r.get(3)?, band: r.get(4)?, signals: r.get(5)? }))
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
+    /// Deletes the days before `before` (`YYYY-MM-DD`); how many went.
+    pub fn health_scores_prune(&self, before: &str) -> usize {
+        self.c().execute("DELETE FROM health_scores WHERE day < ?", [before]).unwrap_or(0)
     }
 }
 

@@ -160,6 +160,7 @@ fn every_link_in_the_playbooks_resolves() {
     let mut files = pages();
     files.push(repo().join("docs/adr/0131-support-bundle.md"));
     files.push(repo().join("docs/adr/0144-tam-programme-and-health-score.md"));
+    files.push(repo().join("docs/adr/0157-health-score-history-and-console.md"));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links:\n{}", bad.join("\n"));
 }

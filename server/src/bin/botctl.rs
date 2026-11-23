@@ -200,6 +200,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl health-score [--days <n>] [json]          The customer health score (ADR 0144) for the last 30 days
                                                    (7 to 90): adoption, Bot runs, sign-in and SCIM, backups,
                                                    approvals and the license, each ok, watch or at risk
+  botctl health-score history [--days <n>] [json]  The score botd recorded each day (ADR 0157) for the last
+                                                   90 days (1 to 3650), and what got worse or better
   botctl evidence                                  The evidence bundle schedule (EVIDENCE_BUNDLES), where
                                                    bundles are written and those kept (ADR 0142)
   botctl evidence bundle [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]
@@ -1663,6 +1665,11 @@ fn run(args: &[String]) -> Result<String, String> {
         ["approvals", status] => op("GET", &format!("/api/approvals?status={status}"), None),
         [verb @ ("approve" | "deny"), id, rest @ ..] => decide(verb, id, rest),
         ["support-bundle", rest @ ..] => support_bundle(rest),
+        ["health-score", "history", rest @ ..] => {
+            let (path, json) = health_request_at(rest, "/api/support/health-score/history", "Usage: botctl health-score history [--days <n>] [json]")?;
+            let res = api(Cred::Operator, "GET", &path, None)?;
+            if json { Ok(pretty(res)) } else { Ok(history_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)) }
+        }
         ["health-score", rest @ ..] => {
             let (path, json) = health_request(rest)?;
             let res = api(Cred::Operator, "GET", &path, None)?;
@@ -1874,7 +1881,11 @@ fn support_bundle(rest: &[&str]) -> Result<String, String> {
 
 /// `botctl health-score [--days <n>] [json]`: the path, and whether to print the JSON.
 fn health_request(rest: &[&str]) -> Result<(String, bool), String> {
-    let usage = || "Usage: botctl health-score [--days <n>] [json]".to_string();
+    health_request_at(rest, "/api/support/health-score", "Usage: botctl health-score [--days <n>] [json]")
+}
+
+fn health_request_at(rest: &[&str], base: &str, usage: &str) -> Result<(String, bool), String> {
+    let usage = || usage.to_string();
     let (mut days, mut json) = (None, false);
     let mut args = rest.iter();
     while let Some(a) = args.next() {
@@ -1888,10 +1899,47 @@ fn health_request(rest: &[&str]) -> Result<(String, bool), String> {
         }
     }
     let path = match days {
-        Some(d) => format!("/api/support/health-score?days={d}"),
-        None => "/api/support/health-score".into(),
+        Some(d) => format!("{base}?days={d}"),
+        None => base.into(),
     };
     Ok((path, json))
+}
+
+/// The recorded days for a person: a line per day with a bar, then the trend.
+fn history_summary(v: &Value) -> String {
+    let points = v["points"].as_array().cloned().unwrap_or_default();
+    let mut out = format!("Customer health history: last {} days, {} recorded\n", v["days"], if points.len() == 1 { "1 day".to_string() } else { format!("{} days", points.len()) });
+    if v["recording"] == false {
+        out.push_str("botd isn't recording the score (HEALTH_SCORE_HISTORY_DAYS=0).\n");
+    }
+    for p in &points {
+        let score = p["score"].as_u64();
+        let at_risk: Vec<&str> = p["signals"].as_object().map(|s| s.iter().filter(|(_, v)| *v == "risk").map(|(k, _)| k.as_str()).collect()).unwrap_or_default();
+        let bar = "#".repeat(score.map_or(0, |s| s.div_ceil(5)) as usize);
+        let line = format!(
+            "  {}  {:>3}  {:<8}  {bar:<20}{}",
+            p["date"].as_str().unwrap_or(""),
+            score.map_or("-".to_string(), |s| s.to_string()),
+            p["band"].as_str().unwrap_or("unknown").replace('_', " "),
+            if at_risk.is_empty() { String::new() } else { format!("  at risk: {}", at_risk.join(", ")) },
+        );
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    let t = &v["trend"];
+    if t.is_object() {
+        let change = t["change"].as_i64().map_or(String::new(), |c| format!(" ({c:+})"));
+        let score = |k: &str| t[k].as_u64().map_or("no score".to_string(), |s| s.to_string());
+        out.push_str(&format!("Since {}: {} to {}{change}.", t["from"].as_str().unwrap_or(""), score("fromScore"), score("toScore")));
+        for (key, said) in [("worse", "Worse"), ("better", "Better")] {
+            let ids: Vec<&str> = t[key].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+            if !ids.is_empty() {
+                out.push_str(&format!(" {said}: {}.", ids.join(", ")));
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// The health score for a person: the score and band, then each signal on a line.
@@ -2048,6 +2096,31 @@ mod tests {
         for bad in [&["--from", "2026-10-01"][..], &["--from"], &["--from", "--to"], &["x"], &["-o", "a", "-o", "b"], &["--to", "2026-11-01"]] {
             assert!(evidence_request(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn health_score_history_reads_as_a_line_per_day() {
+        assert_eq!(health_request_at(&["--days", "30", "json"], "/api/support/health-score/history", "u"), Ok(("/api/support/health-score/history?days=30".into(), true)));
+        assert!(health_request_at(&["x"], "/a", "u").is_err());
+        let v = json!({
+            "days": 90, "recording": true,
+            "points": [
+                { "date": "2026-10-01", "score": 92, "band": "healthy", "signals": { "runs": "ok" } },
+                { "date": "2026-11-01", "score": 41, "band": "at_risk", "signals": { "runs": "risk", "backups": "risk", "adoption": "watch" } },
+                { "date": "2026-11-02", "score": null, "band": "unknown", "signals": {} },
+            ],
+            "trend": { "from": "2026-10-01", "fromScore": 92, "toScore": 41, "change": -51, "worse": ["runs"], "better": [] },
+        });
+        assert_eq!(
+            history_summary(&v),
+            "Customer health history: last 90 days, 3 days recorded\n  \
+             2026-10-01   92  healthy   ###################\n  \
+             2026-11-01   41  at risk   #########             at risk: backups, runs\n  \
+             2026-11-02    -  unknown\n\
+             Since 2026-10-01: 92 to 41 (-51). Worse: runs.\n"
+        );
+        let off = history_summary(&json!({ "days": 7, "recording": false, "points": [], "trend": null }));
+        assert_eq!(off, "Customer health history: last 7 days, 0 days recorded\nbotd isn't recording the score (HEALTH_SCORE_HISTORY_DAYS=0).\n");
     }
 
     #[test]
