@@ -80,7 +80,7 @@ pub struct Checked {
     pub lock_expired: u64,
     /// Signed checkpoints in the archive that hold.
     pub checkpoints: u64,
-    /// Their RFC 3161 timestamps whose token holds (ADR 0207), those whose TSA chains to
+    /// Their RFC 3161 timestamps whose token holds in every copy (ADR 0207), those whose TSA chains to
     /// `AUDIT_TIMESTAMP_CA_FILE` (None when it isn't set), and the newest.
     pub timestamps: u64,
     pub trusted_timestamps: Option<u64>,
@@ -264,6 +264,9 @@ pub struct Walker<'a> {
     trust: crate::tsa::Trust,
     /// Each checkpoint's details as the archive first holds them, for its timestamp.
     signed: BTreeMap<i64, Value>,
+    /// Timestamp events with a copy that held, and those with a copy that didn't.
+    stamps: BTreeMap<i64, crate::audit_line::Stamped>,
+    unstamped: std::collections::BTreeSet<i64>,
     /// The last event walked, which the next must link to. None at the start, and after an
     /// object that couldn't be read (already a failure).
     last: Option<Link>,
@@ -271,7 +274,7 @@ pub struct Walker<'a> {
 
 impl<'a> Walker<'a> {
     pub fn new(a: &Archive, delivered: i64, keys: &'a [Vec<u8>]) -> Walker<'a> {
-        Walker { rep: Checked { archive: a.shown(), delivered, ..Default::default() }, lock: a.lock, keys, trust: Default::default(), signed: BTreeMap::new(), last: None }
+        Walker { rep: Checked { archive: a.shown(), delivered, ..Default::default() }, lock: a.lock, keys, trust: Default::default(), signed: BTreeMap::new(), stamps: BTreeMap::new(), unstamped: Default::default(), last: None }
     }
 
     /// The CAs a timestamp's TSA must chain to (`AUDIT_TIMESTAMP_CA_FILE`).
@@ -289,8 +292,7 @@ impl<'a> Walker<'a> {
     }
 
     /// An `audit.checkpoint_timestamped` event's token, from what its line carries, every
-    /// copy of it: no hash covers the token, only its SHA-256 in the event's details. Counted
-    /// unless `repeat`.
+    /// copy of it: no hash covers the token, only its SHA-256 in the event's details.
     fn stamp(&mut self, key: &str, e: &Line, repeat: bool) {
         if e.action != crate::audit_line::TIMESTAMPED {
             return;
@@ -298,19 +300,25 @@ impl<'a> Walker<'a> {
         let cp = e.details["checkpoint"].as_i64();
         let signed = cp.and_then(|id| self.signed.get(&id));
         match crate::audit_line::check_timestamp(&e.raw, signed, Some(self.keys), &self.trust) {
-            Ok(s) if !repeat => {
-                self.rep.timestamps += 1;
-                if let (Some(n), Some(true)) = (self.rep.trusted_timestamps.as_mut(), s.trusted) {
-                    *n += 1;
-                }
-                self.rep.last_timestamp = Some(crate::audit_line::LastStamp { id: e.id, checkpoint: s.checkpoint, time: s.time });
+            Ok(s) => {
+                self.stamps.entry(e.id).or_insert(s);
             }
-            Ok(_) => {}
             Err((reason, why)) => {
+                self.unstamped.insert(e.id);
                 let again = if repeat { format!(", repeated in {key}") } else { String::new() };
                 self.problem(Some(key), Some(e.id), "timestamp", format!("timestamp {} ({reason}){again}: {why}", e.id));
             }
         }
+    }
+
+    /// Timestamps count once, and only if every copy of them held.
+    fn tally_timestamps(&mut self) {
+        let held: Vec<(&i64, &crate::audit_line::Stamped)> = self.stamps.iter().filter(|(id, _)| !self.unstamped.contains(id)).collect();
+        self.rep.timestamps = held.len() as u64;
+        if let Some(n) = self.rep.trusted_timestamps.as_mut() {
+            *n = held.iter().filter(|(_, s)| s.trusted == Some(true)).count() as u64;
+        }
+        self.rep.last_timestamp = held.last().map(|(id, s)| crate::audit_line::LastStamp { id: **id, checkpoint: s.checkpoint, time: s.time });
     }
 
     pub fn starting_at(mut self, start: Option<i64>) -> Walker<'a> {
@@ -531,6 +539,7 @@ impl<'a> Walker<'a> {
 
     /// `batches`: botd has cut a batch for this archive, so it has written to it.
     pub fn finish(mut self, range: Range, batches: bool) -> Checked {
+        self.tally_timestamps();
         let (d, start) = (self.rep.delivered, self.rep.start);
         let head = self.rep.head.as_ref().map_or(0, |h| h.id);
         // The part of the range botd has delivered to the archive, which must all be there.

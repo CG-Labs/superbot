@@ -724,6 +724,8 @@ async fn checkpoint_timestamps_are_checked_from_the_archive_and_without_botd() {
     let v = verify_archive(port, &admin, "").await;
     assert_eq!((v["ok"].as_bool(), reasons(&v), v["archive"]["firstProblems"][0]["id"].as_i64()), (Some(false), vec!["timestamp".to_string()], Some(stamp)), "{v}");
     assert!(v["archive"]["firstProblems"][0]["error"].as_str().unwrap().contains("isn't the one its event recorded"), "{v}");
+    let a = &v["archive"];
+    assert_eq!((a["timestamps"].as_u64(), a["trustedTimestamps"].as_u64(), a["lastTimestamp"].is_null()), (Some(0), Some(0), true), "a copy that fails takes the timestamp out of the count: {v}");
     assert!(v["firstBroken"].is_null(), "this server's log is fine: {v}");
     let r = offline(&s, trust());
     assert!(!r.ok && r.hosts[0].first_problems.iter().any(|p| p.reason == "timestamp" && p.id == Some(stamp)), "{r:?}");
