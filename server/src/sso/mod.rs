@@ -2252,7 +2252,7 @@ mod tests {
         let s = native(&[("SSO_CORP_AUTHN_CONTEXT", "mfa"), ("SSO_CORP_AUTHN_METHODS_ATTRIBUTE", "amr"), ("SSO_CORP_REQUEST_AUTHN_CONTEXT", "True")]).unwrap();
         let (c, m) = required(&s);
         assert_eq!((c.unwrap().request, m.as_deref()), (true, Some("amr")));
-        assert_eq!(required(&native(&[("SSO_CORP_AUTHN_CONTEXT", MFA), ("SSO_CORP_REQUEST_AUTHN_CONTEXT", "false")]).unwrap()).0.unwrap().request, false);
+        assert!(!required(&native(&[("SSO_CORP_AUTHN_CONTEXT", MFA), ("SSO_CORP_REQUEST_AUTHN_CONTEXT", "false")]).unwrap()).0.unwrap().request);
         let many: &'static str = (0..=saml_sp::MAX_AUTHN_CONTEXTS).map(|i| format!("urn:c{i}")).collect::<Vec<_>>().join(",").leak();
         for (vars, why) in [
             (vec![("SSO_CORP_AUTHN_METHODS_ATTRIBUTE", "amr")], "a methods attribute with nothing to require"),
