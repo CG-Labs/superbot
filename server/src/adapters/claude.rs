@@ -2,6 +2,7 @@
 //! Resumes with `--resume <session id>`. The system prompt is applied fresh every run.
 
 use super::{describe, new_uuid, str_of, Adapter, AgentEvent, ModelOption, RunInput, Usage};
+use crate::tiers::{Endpoint, Protocol};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -30,9 +31,50 @@ fn sandbox_settings(s: &super::Sandbox, api: Option<String>) -> Value {
     })
 }
 
+/// The tiers file's endpoint the run's route names (ADR 0192), if any.
+fn endpoint(input: &RunInput) -> Option<&Endpoint> {
+    let p = input.provider.as_deref()?;
+    input.endpoints.iter().find(|e| e.name == p)
+}
+
+/// The environment of a run on a tier endpoint, set in `--settings` too, where it outranks
+/// the user's and the workspace's settings files, so a Bot can't send its calls elsewhere:
+/// the endpoint's URL, every other way Claude Code reaches a model off (a bearer token, a
+/// login's token, Bedrock, Vertex, Foundry), and the key kept from its Bash tool, hooks and
+/// MCP servers. A run held to a data region also stops Claude Code's own traffic to
+/// Anthropic (telemetry, error reports, update and feature checks).
+fn endpoint_env(e: &Endpoint, held: bool) -> Vec<(&'static str, String)> {
+    let mut env = vec![
+        ("ANTHROPIC_BASE_URL", e.base_url.clone()),
+        ("ANTHROPIC_AUTH_TOKEN", String::new()),
+        ("CLAUDE_CODE_OAUTH_TOKEN", String::new()),
+        ("CLAUDE_CODE_USE_BEDROCK", "0".into()),
+        ("CLAUDE_CODE_USE_VERTEX", "0".into()),
+        ("CLAUDE_CODE_USE_FOUNDRY", "0".into()),
+        ("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "1".into()),
+    ];
+    if held {
+        env.push(("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".into()));
+    }
+    env
+}
+
 impl Adapter for Claude {
     fn bin(&self) -> &'static str {
         "claude"
+    }
+
+    fn endpoint_protocols(&self) -> &'static [Protocol] {
+        &[Protocol::AnthropicMessages]
+    }
+
+    /// The endpoint's key, as Claude Code reads an API key, over the person's own; never in
+    /// the arguments, which other accounts on the host can see.
+    fn env(&self, input: &RunInput) -> Vec<(String, String)> {
+        let Some(e) = endpoint(input) else { return Vec::new() };
+        let mut env: Vec<(String, String)> = endpoint_env(e, !input.held_to.is_empty()).into_iter().map(|(k, v)| (k.into(), v)).collect();
+        env.push(("ANTHROPIC_API_KEY".into(), input.env.get(&e.key_secret).cloned().unwrap_or_default()));
+        env
     }
 
     fn args(&mut self, input: &RunInput, _out: &mut Vec<AgentEvent>) -> Vec<String> {
@@ -59,6 +101,15 @@ impl Adapter for Claude {
         // default), whatever SuperBot's retention or holds say (ADR 0112).
         if let Some(days) = input.keep_sessions_days {
             settings.insert("cleanupPeriodDays".into(), json!(days.max(1)));
+        }
+        if let Some(e) = endpoint(input) {
+            let held = !input.held_to.is_empty();
+            let env: serde_json::Map<String, Value> = endpoint_env(e, held).into_iter().map(|(k, v)| (k.into(), json!(v))).collect();
+            settings.insert("env".into(), Value::Object(env));
+            // WebFetch otherwise asks Anthropic's API whether each domain is safe.
+            if held {
+                settings.insert("skipWebFetchPreflight".into(), json!(true));
+            }
         }
         if !settings.is_empty() {
             a.extend(["--settings".into(), Value::Object(settings).to_string()]);

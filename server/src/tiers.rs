@@ -46,6 +46,19 @@ pub enum Protocol {
     AnthropicMessages,
     /// OpenAI's Chat Completions API (`/chat/completions`).
     OpenaiChat,
+    /// OpenAI's Responses API (`/responses`), the only one Codex speaks (ADR 0192).
+    OpenaiResponses,
+}
+
+impl Protocol {
+    /// As the tiers file writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Protocol::AnthropicMessages => "anthropic-messages",
+            Protocol::OpenaiChat => "openai-chat",
+            Protocol::OpenaiResponses => "openai-responses",
+        }
+    }
 }
 
 /// A model endpoint the tiers file names, which routes and fallbacks use as their
@@ -579,8 +592,29 @@ impl Tiers {
                             harness,
                             fallback: Vec::new(),
                         };
-                        if (route.provider.is_some() || !r.fallback.is_empty()) && !adapter.supports_provider() {
-                            return Err(at(format!("the {} harness doesn't take a provider", route.harness)));
+                        let speaks = adapter.endpoint_protocols();
+                        let harness = route.harness.clone();
+                        // An endpoint the harness can't speak to, or (for harnesses with no
+                        // providers of their own) a name that isn't one of the file's.
+                        let usable = |p: &str| -> Result<(), String> {
+                            match providers.iter().find(|e| e.name == p) {
+                                Some(e) if speaks.contains(&e.protocol) => Ok(()),
+                                Some(_) if speaks.is_empty() => Err(format!("the {harness} harness doesn't take a provider")),
+                                Some(e) => {
+                                    let takes: Vec<&str> = speaks.iter().map(|p| p.name()).collect();
+                                    Err(format!("provider {p} speaks {}, and the {harness} harness takes only {} endpoints (ADR 0192)", e.protocol.name(), takes.join(" or ")))
+                                }
+                                None if adapter.supports_provider() => Ok(()),
+                                None if speaks.is_empty() => Err(format!("the {harness} harness doesn't take a provider")),
+                                None => Err(format!("provider {p} isn't one of the file's providers, and the {harness} harness takes only those (ADR 0192)")),
+                            }
+                        };
+                        if let Some(p) = &route.provider {
+                            usable(p).map_err(at)?;
+                        }
+                        if !r.fallback.is_empty() && !adapter.supports_provider() {
+                            let why = if speaks.is_empty() { "doesn't take a provider" } else { "has no fallback chain: name one provider (ADR 0192)" };
+                            return Err(at(format!("the {harness} harness {why}")));
                         }
                         if r.fallback.len() > MAX_FALLBACKS {
                             return Err(at(format!("a route has at most {MAX_FALLBACKS} fallbacks")));
@@ -594,9 +628,12 @@ impl Tiers {
                             if primary || route.fallback.contains(&f) {
                                 return Err(at(format!("fallback {} {} is listed twice", f.provider, f.model)));
                             }
+                            usable(&f.provider).map_err(at)?;
                             route.fallback.push(f);
                         }
-                        if routes.iter().any(|x| x.harness == route.harness && x.model == route.model) {
+                        // The same model may be on two providers, such as an in-region one for
+                        // pinned data (ADR 0192); a Bot set to it gets the first.
+                        if routes.iter().any(|x| x.harness == route.harness && x.model == route.model && x.provider == route.provider) {
                             return Err(at(format!("{} {} is listed twice", route.harness, route.model.as_deref().unwrap_or("(default model)"))));
                         }
                         routes.push(route);
@@ -961,7 +998,8 @@ mod tests {
         assert!(bad(&one(r#"{"name":"a","routes":"all"}"#)).contains("\"any\" or a list"));
         assert!(bad(&one(r#"{"name":"a","routes":[]}"#)).contains("at least one route"));
         assert!(bad(&one(r#"{"name":"a","routes":[{"harness":"gpt"}]}"#)).contains("must be one of"));
-        assert!(bad(&one(r#"{"name":"a","routes":[{"harness":"claude","provider":"openrouter"}]}"#)).contains("doesn't take a provider"));
+        assert!(bad(&one(r#"{"name":"a","routes":[{"harness":"claude","provider":"openrouter"}]}"#)).contains("isn't one of the file's providers"));
+        assert!(bad(&one(r#"{"name":"a","routes":[{"harness":"pi","provider":"openrouter"}]}"#)).contains("doesn't take a provider"));
         assert!(bad(&one(r#"{"name":"a","routes":[{"harness":"claude","model":"--dangerously-skip-permissions"}]}"#)).contains("not starting with -"));
         assert!(bad(&one(r#"{"name":"a","routes":[{"harness":"claude","model":"a b"}]}"#)).contains("model"));
         assert!(bad(&one(r#"{"name":"a","routes":[{"harness":"claude"},{"harness":"claude"}]}"#)).contains("twice"));
@@ -1195,13 +1233,89 @@ mod tests {
         assert!(provider(r#""p":{"protocol":"openai-chat","baseUrl":"https://x.example"}"#).contains("keySecret"));
 
         let route = |r: &str| bad(format!(r#"{{"tiers":[{{"name":"a","routes":[{r}]}}]}}"#));
-        assert!(route(r#"{"harness":"claude","fallback":[{"provider":"p","model":"m"}]}"#).contains("doesn't take a provider"));
+        assert!(route(r#"{"harness":"claude","fallback":[{"provider":"p","model":"m"}]}"#).contains("claude harness has no fallback chain"));
+        assert!(route(r#"{"harness":"pi","fallback":[{"provider":"p","model":"m"}]}"#).contains("doesn't take a provider"));
         assert!(route(r#"{"harness":"hermes","fallback":[{"provider":"p"}]}"#).contains("model"));
         assert!(route(r#"{"harness":"hermes","fallback":[{"provider":"p","model":"--yolo"}]}"#).contains("not starting with -"));
         assert!(route(r#"{"harness":"hermes","provider":"p","model":"m","fallback":[{"provider":"p","model":"m"}]}"#).contains("twice"));
         assert!(route(r#"{"harness":"hermes","fallback":[{"provider":"p","model":"m"},{"provider":"p","model":"m"}]}"#).contains("twice"));
         let four = r#"{"provider":"p","model":"a"},{"provider":"p","model":"b"},{"provider":"p","model":"c"},{"provider":"p","model":"d"}"#;
         assert!(route(&format!(r#"{{"harness":"hermes","fallback":[{four}]}}"#)).contains("at most 3"));
+    }
+
+    const HARNESS_ENDPOINTS: &str = r#"{
+      "providers": {
+        "uk-claude": { "protocol": "anthropic-messages", "baseUrl": "https://uk.claude.example", "keySecret": "TIER_UK_KEY", "regions": ["gb-lon"] },
+        "eu-gpt": { "protocol": "openai-chat", "baseUrl": "https://eu.gpt.example/v1", "keySecret": "TIER_EU_KEY", "regions": ["de-fra-2"] },
+        "eu-responses": { "protocol": "openai-responses", "baseUrl": "https://eu.responses.example/v1", "keySecret": "TIER_EU_RESPONSES_KEY", "regions": ["de-fra-2"] }
+      },
+      "tiers": [
+        { "name": "pro", "label": "Pro", "routes": [
+            { "harness": "claude", "model": "claude-sonnet-5-5" },
+            { "harness": "claude", "provider": "uk-claude", "model": "claude-sonnet-5-5" },
+            { "harness": "codex", "model": "gpt-6-codex" },
+            { "harness": "codex", "provider": "eu-responses", "model": "gpt-6-codex" }
+        ] }
+      ]
+    }"#;
+
+    #[test]
+    fn claude_code_and_codex_take_endpoints_they_speak() {
+        let t = Tiers::parse(HARNESS_ENDPOINTS, None).unwrap();
+        assert_eq!(t.endpoint("eu-responses").unwrap().protocol, Protocol::OpenaiResponses);
+        assert_eq!(t.admin_view()["providers"]["eu-responses"]["protocol"], "openai-responses");
+        let pro = t.get("pro").unwrap();
+        // The same model on two providers: a Bot set to it gets the first.
+        assert_eq!(pro.route("claude", Some("claude-sonnet-5-5"), None).unwrap().provider, None);
+        assert_eq!(pro.route("codex", None, None).unwrap().provider, None);
+        // A route to an endpoint wires only its key, and no fallback.
+        let uk = &pro.routes.as_ref().unwrap()[1];
+        let w = t.wiring(uk, true, |_| true).unwrap();
+        assert_eq!(w.endpoints.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["uk-claude"]);
+        assert_eq!((w.fallback, w.unused_keys.len()), (Some(Vec::new()), 2));
+
+        let bad = |providers: &str, r: &str| {
+            Tiers::parse(&format!(r#"{{"providers":{{{providers}}},"tiers":[{{"name":"a","routes":[{r}]}}]}}"#), None).unwrap_err()
+        };
+        let p = |name: &str, protocol: &str| format!(r#""{name}":{{"protocol":"{protocol}","baseUrl":"https://{name}.example","keySecret":"K_{}"}}"#, name.to_ascii_uppercase());
+        let (anthropic, chat, responses) = (p("a", "anthropic-messages"), p("chat", "openai-chat"), p("resp", "openai-responses"));
+        let all = [anthropic.as_str(), &chat, &responses].join(",");
+        // Each harness takes only the endpoints it speaks to, and Claude Code and Codex only the file's.
+        let e = bad(&all, r#"{"harness":"claude","provider":"chat"}"#);
+        assert!(e.contains("provider chat speaks openai-chat, and the claude harness takes only anthropic-messages endpoints"), "{e}");
+        let e = bad(&all, r#"{"harness":"codex","provider":"chat"}"#);
+        assert!(e.contains("the codex harness takes only openai-responses endpoints"), "{e}");
+        assert!(bad(&all, r#"{"harness":"codex","provider":"a"}"#).contains("takes only openai-responses"));
+        let e = bad(&all, r#"{"harness":"claude","provider":"openrouter"}"#);
+        assert!(e.contains("provider openrouter isn't one of the file's providers, and the claude harness takes only those"), "{e}");
+        assert!(bad(&all, r#"{"harness":"codex","provider":"resp","fallback":[{"provider":"resp","model":"m"}]}"#).contains("codex harness has no fallback chain"));
+        // Hermes takes no Responses endpoint, as its provider or a fallback.
+        assert!(bad(&all, r#"{"harness":"hermes","provider":"resp"}"#).contains("the hermes harness takes only anthropic-messages or openai-chat endpoints"));
+        assert!(bad(&all, r#"{"harness":"hermes","provider":"a","fallback":[{"provider":"resp","model":"m"}]}"#).contains("provider resp speaks openai-responses"));
+        // Pi takes none at all.
+        assert!(bad(&all, r#"{"harness":"pi","provider":"a"}"#).contains("the pi harness doesn't take a provider"));
+        // Two routes of one harness, model and provider are still one too many.
+        assert!(bad(&all, r#"{"harness":"claude","provider":"a","model":"m"},{"harness":"claude","provider":"a","model":"m"}"#).contains("claude m is listed twice"));
+        let ok = Tiers::parse(&format!(r#"{{"providers":{{{all}}},"tiers":[{{"name":"a","routes":[{{"harness":"claude","provider":"a"}},{{"harness":"codex","provider":"resp"}},{{"harness":"hermes","provider":"chat","fallback":[{{"provider":"a","model":"m"}}]}}]}}]}}"#), None);
+        assert!(ok.is_ok(), "{ok:?}");
+    }
+
+    #[test]
+    fn pinned_claude_code_and_codex_runs_hold_to_in_region_endpoints() {
+        let t = Tiers::parse(HARNESS_ENDPOINTS, None).unwrap();
+        let pro = t.get("pro").unwrap();
+        // The Bot's own route has no endpoint: the tier's in-region route for the harness instead.
+        let claude = pro.route("claude", None, None).unwrap();
+        let h = t.held(pro, &claude, &["gb-lon".into()]).unwrap();
+        assert_eq!((h.route.provider.as_deref(), h.route.model.as_deref()), (Some("uk-claude"), Some("claude-sonnet-5-5")));
+        assert_eq!(h.instead_of.as_ref().map(|r| r.provider.is_none()), Some(true));
+        let codex = pro.route("codex", None, None).unwrap();
+        assert_eq!(t.held(pro, &codex, &["de-fra-2".into()]).unwrap().route.provider.as_deref(), Some("eu-responses"));
+        // Each region has only one of them, so the plan has a gap for the other.
+        let e = t.held(pro, &codex, &["gb-lon".into()]).unwrap_err();
+        assert!(e.contains("no codex route whose provider is marked as in gb-lon"), "{e}");
+        assert_eq!(t.residency_gap(pro, "gb-lon").as_deref(), Some("the Pro plan has no model route in gb-lon for codex"));
+        assert_eq!(t.residency_gap(pro, "de-fra-2").as_deref(), Some("the Pro plan has no model route in de-fra-2 for claude"));
     }
 
     const REGIONAL: &str = r#"{

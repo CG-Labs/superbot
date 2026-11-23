@@ -154,6 +154,104 @@ async fn a_team_pin_holds_its_members_runs() {
     assert!(d["error"].as_str().unwrap().contains("us-gpt has no regions"), "{d}");
 }
 
+/// A plan whose Claude Code and Codex routes each have an in-region twin (ADR 0192).
+const HARNESS_TIERS: &str = r#"{
+  "providers": {
+    "uk-claude": { "protocol": "anthropic-messages", "baseUrl": "https://uk.claude.example", "keySecret": "RESIDENCY_E2E_UK_KEY", "regions": ["gb-lon"] },
+    "eu-responses": { "protocol": "openai-responses", "baseUrl": "https://eu.responses.example/v1", "keySecret": "RESIDENCY_E2E_EU_KEY", "regions": ["gb-lon", "de-fra-2"] }
+  },
+  "tiers": [
+    { "name": "pro", "label": "Pro", "routes": [
+        { "harness": "claude", "model": "claude-sonnet-5-5" },
+        { "harness": "claude", "provider": "uk-claude", "model": "claude-sonnet-5-5" },
+        { "harness": "codex", "model": "gpt-6-codex" },
+        { "harness": "codex", "provider": "eu-responses", "model": "gpt-6-codex" }
+    ] }
+  ]
+}"#;
+
+/// A stand-in `claude` that says which key and base URL it was given, and whether its
+/// tools' credentials are scrubbed and its own traffic to Anthropic is off.
+const FAKE_CLAUDE: &str = r#"#!/bin/sh
+[ "$1" = --version ] && { echo "2.1.329 (Claude Code)"; exit 0; }
+case "$ANTHROPIC_API_KEY" in sk-uk-not-real) key=tier ;; sk-own-not-real) key=own ;; *) key=none ;; esac
+if [ -n "$RESIDENCY_E2E_UK_KEY" ]; then named=set; else named=unset; fi
+preflight=on
+for a in "$@"; do case "$a" in *'"skipWebFetchPreflight":true'*) preflight=off ;; esac; done
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"key=%s named=%s base=%s scrub=%s quiet=%s preflight=%s"}]}}\n' \
+  "$key" "$named" "${ANTHROPIC_BASE_URL:-none}" "${CLAUDE_CODE_SUBPROCESS_ENV_SCRUB:-0}" "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-0}" "$preflight"
+"#;
+
+/// A stand-in `codex` that says the model provider it was given, whether its key came
+/// with it, and whether the key is blanked in its shell and its analytics are off.
+const FAKE_CODEX: &str = r#"#!/bin/sh
+[ "$1" = --version ] && { echo "codex-cli 0.171.0"; exit 0; }
+provider=builtin; shell=kept; analytics=on
+for a in "$@"; do
+  case "$a" in
+    model_provider=*) provider=$(printf %s "${a#model_provider=}" | tr -d '"') ;;
+    'shell_environment_policy.set.SUPERBOT_PROVIDER_EU_RESPONSES_API_KEY=""') shell=blank ;;
+    analytics.enabled=false) analytics=off ;;
+  esac
+done
+if [ "$SUPERBOT_PROVIDER_EU_RESPONSES_API_KEY" = sk-eu-not-real ]; then key=tier; else key=none; fi
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"provider=%s key=%s shell=%s analytics=%s"}}\n' "$provider" "$key" "$shell" "$analytics"
+"#;
+
+fn stand_in(app: &App, name: &str, script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = app.cfg.bin_dir.join(name);
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[tokio::test]
+async fn a_pinned_persons_claude_code_and_codex_runs_take_in_region_endpoints() {
+    let (port, app, admin, _) = serve_app().await;
+    app.tiers.set(Arc::new(Tiers::parse(HARNESS_TIERS, None).unwrap())).unwrap();
+    stand_in(&app, "claude", FAKE_CLAUDE);
+    stand_in(&app, "codex", FAKE_CODEX);
+    let (ada_id, ada) = user_with(port, &admin, "ada@example.com", "member").await;
+    for (name, value) in [("RESIDENCY_E2E_UK_KEY", "sk-uk-not-real"), ("RESIDENCY_E2E_EU_KEY", "sk-eu-not-real"), ("ANTHROPIC_API_KEY", "sk-own-not-real")] {
+        let (code, body) = call(port, "PUT", &format!("/api/me/secrets/{name}"), &ada, &json!({ "value": value }).to_string()).await;
+        assert_eq!(code, 200, "{name}: {body}");
+    }
+    let claude = app.db.create_bot_owned("Claude", "#fff", "waddle", "claude", None, false, &ada_id, Visibility::Private);
+    let codex = app.db.create_bot_owned("Codex", "#fff", "waddle", "codex", None, false, &ada_id, Visibility::Private);
+
+    // Unpinned: the plan's first routes, on each harness's own login or key.
+    assert_eq!(run(port, &app, &ada, &claude.id).await, "key=own named=unset base=none scrub=0 quiet=0 preflight=on");
+    assert_eq!(run(port, &app, &ada, &codex.id).await, "provider=builtin key=none shell=kept analytics=on");
+
+    // Pinned to London: the in-region twins, each with only the tier's key.
+    app.db.pin_residency(PinOn::User, &ada_id, "gb-lon", "DPA-7", None).unwrap();
+    assert_eq!(run(port, &app, &ada, &claude.id).await, "key=tier named=unset base=https://uk.claude.example scrub=1 quiet=1 preflight=off");
+    assert_eq!(run(port, &app, &ada, &codex.id).await, "provider=superbot-eu-responses key=tier shell=blank analytics=off");
+    for (bot, provider, model) in [(&claude, "uk-claude", "claude-sonnet-5-5"), (&codex, "eu-responses", "gpt-6-codex")] {
+        let invoked = audit(port, &admin, &format!("action=harness.invoked&bot={}", bot.id)).await;
+        let d = &invoked[0]["details"];
+        assert_eq!((d["provider"].as_str(), d["model"].as_str()), (Some(provider), Some(model)), "{d}");
+        assert_eq!(d["residency"]["regions"], json!(["gb-lon"]), "{d}");
+        assert_eq!(d["residency"]["insteadOf"], json!({ "provider": null, "model": model }), "{d}");
+        assert!(invoked[1]["details"].get("residency").is_none(), "{}", invoked[1]);
+    }
+    assert!(audit(port, &admin, "action=bot.run_refused").await.is_empty(), "nothing refused");
+    let (_, all) = call(port, "GET", "/api/audit?limit=500", &admin, "").await;
+    assert!(!all.contains("sk-uk-not-real") && !all.contains("sk-eu-not-real"), "no key in the audit log");
+
+    // Frankfurt: Codex's endpoint serves it, Claude Code's doesn't, so only Claude Code is refused.
+    app.db.pin_residency(PinOn::User, &ada_id, "de-fra-2", "DPA-8", None).unwrap();
+    assert_eq!(run(port, &app, &ada, &codex.id).await, "provider=superbot-eu-responses key=tier shell=blank analytics=off");
+    let said = run(port, &app, &ada, &claude.id).await;
+    assert!(said.contains("pinned to de-fra-2") && said.contains("for claude"), "{said}");
+    let refused = audit(port, &admin, &format!("action=bot.run_refused&bot={}", claude.id)).await;
+    assert!(refused[0]["details"]["error"].as_str().unwrap().contains("no claude route whose provider is marked as in de-fra-2"), "{}", refused[0]);
+
+    // Unpinned again: as before.
+    assert!(app.db.unpin_residency(PinOn::User, &ada_id).unwrap());
+    assert_eq!(run(port, &app, &ada, &claude.id).await, "key=own named=unset base=none scrub=0 quiet=0 preflight=on");
+}
+
 /// The Bot's first reply after message `before`.
 async fn reply_after(app: &App, bot: &str, before: i64) -> String {
     for _ in 0..300 {

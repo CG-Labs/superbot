@@ -238,9 +238,15 @@ pub trait Adapter: Send + Sync {
     fn on_event(&mut self, e: &Value, out: &mut Vec<AgentEvent>);
     /// Models this harness can run here, with their reasoning efforts. Blocking.
     fn models(&self) -> Vec<ModelOption>;
-    /// Whether it uses `RunInput::provider`. Tiers may name a provider only for these.
+    /// Whether a route may name a provider of the harness's own (Hermes's built-ins, such
+    /// as `openrouter`) and a fallback chain (ADR 0077).
     fn supports_provider(&self) -> bool {
         false
+    }
+    /// The protocols of the tiers file's endpoints a route on this harness may name as its
+    /// provider, handed to it in `RunInput::endpoints` (ADR 0077, ADR 0192). Empty: none.
+    fn endpoint_protocols(&self) -> &'static [crate::tiers::Protocol] {
+        &[]
     }
     /// Checks the server settings this adapter reads from botd's environment, at startup:
     /// botd refuses to start on an error.
@@ -667,6 +673,87 @@ mod tests {
         for name in crate::accounts::LOGINS {
             assert!(get(name).unwrap().login_args().is_some(), "an admin logs {name} in as each user");
         }
+    }
+
+    fn on_endpoint(dir: &std::path::Path, name: &str, protocol: crate::tiers::Protocol, key: &str, held: bool) -> RunInput {
+        let mut i = input(dir, None);
+        i.provider = Some(name.into());
+        i.endpoints = vec![crate::tiers::Endpoint { name: name.into(), protocol, base_url: format!("https://{name}.example/v1"), key_secret: key.into(), regions: vec!["gb-lon".into()] }];
+        i.fallback = Some(Vec::new());
+        i.held_to = if held { vec!["gb-lon".into()] } else { Vec::new() };
+        i.env.extend([
+            (key.to_string(), "sk-tier-not-real".to_string()),
+            ("ANTHROPIC_API_KEY".into(), "sk-own-not-real".into()),
+            ("ANTHROPIC_AUTH_TOKEN".into(), "own-token".into()),
+            ("OPENAI_API_KEY".into(), "sk-own-openai".into()),
+        ]);
+        i
+    }
+
+    #[test]
+    fn claude_code_takes_a_tier_endpoint_its_settings_cant_move() {
+        let dir = std::env::temp_dir();
+        let settings = |job: &JobRequest| {
+            let at = job.args.iter().position(|a| a == "--settings").unwrap();
+            serde_json::from_str::<Value>(&job.args[at + 1]).unwrap()
+        };
+        let i = on_endpoint(&dir, "uk-claude", crate::tiers::Protocol::AnthropicMessages, "TIER_UK_KEY", false);
+        let job = job_for(get("claude").unwrap().as_mut(), &i, &mut Vec::new());
+        // The tier's key as Claude Code's API key, over the person's own; their token cleared.
+        assert_eq!(job.env["ANTHROPIC_API_KEY"], "sk-tier-not-real");
+        assert!(!job.env.contains_key("TIER_UK_KEY"), "only under the name Claude Code reads");
+        assert_eq!((job.env["ANTHROPIC_AUTH_TOKEN"].as_str(), job.env["CLAUDE_CODE_OAUTH_TOKEN"].as_str()), ("", ""));
+        assert_eq!(job.env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1", "kept from its Bash tool, hooks and MCP servers");
+        assert!(!job.args.iter().any(|a| a.contains("sk-tier")), "never in the arguments");
+        // The same in flag settings, which outrank the Bot's own settings files.
+        let s = settings(&job);
+        assert_eq!(s["env"]["ANTHROPIC_BASE_URL"], "https://uk-claude.example/v1");
+        for (k, v) in [("CLAUDE_CODE_USE_BEDROCK", "0"), ("CLAUDE_CODE_USE_VERTEX", "0"), ("CLAUDE_CODE_USE_FOUNDRY", "0"), ("ANTHROPIC_AUTH_TOKEN", "")] {
+            assert_eq!((k, s["env"][k].as_str()), (k, Some(v)));
+        }
+        assert!(s["env"].get("ANTHROPIC_API_KEY").is_none() && s["hooks"].is_object(), "{s}");
+        assert!(s["env"].get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").is_none() && s.get("skipWebFetchPreflight").is_none(), "not held: {s}");
+
+        // Held to a data region: none of Claude Code's own traffic to Anthropic.
+        let held = job_for(get("claude").unwrap().as_mut(), &on_endpoint(&dir, "uk-claude", crate::tiers::Protocol::AnthropicMessages, "TIER_UK_KEY", true), &mut Vec::new());
+        let s = settings(&held);
+        assert_eq!((s["env"]["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"].as_str(), s["skipWebFetchPreflight"].as_bool()), (Some("1"), Some(true)));
+        assert_eq!(held.env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"], "1");
+
+        // No endpoint: the person's own login or key, as before.
+        let mut own = on_endpoint(&dir, "uk-claude", crate::tiers::Protocol::AnthropicMessages, "TIER_UK_KEY", false);
+        (own.provider, own.endpoints) = (None, Vec::new());
+        let job = job_for(get("claude").unwrap().as_mut(), &own, &mut Vec::new());
+        assert_eq!(job.env["ANTHROPIC_API_KEY"], "sk-own-not-real");
+        assert!(!job.env.contains_key("ANTHROPIC_BASE_URL") && settings(&job).get("env").is_none());
+    }
+
+    #[test]
+    fn codex_takes_a_tier_endpoint_as_its_model_provider() {
+        let dir = std::env::temp_dir();
+        let flags = |job: &JobRequest| -> Vec<String> { job.args.windows(2).filter(|w| w[0] == "-c").map(|w| w[1].clone()).collect() };
+        let mut i = on_endpoint(&dir, "eu-gpt", crate::tiers::Protocol::OpenaiResponses, "TIER_EU_KEY", false);
+        let job = job_for(get("codex").unwrap().as_mut(), &i, &mut Vec::new());
+        let c = flags(&job);
+        assert!(c.contains(&r#"model_provider="superbot-eu-gpt""#.to_string()), "{c:?}");
+        let table = r#"model_providers.superbot-eu-gpt={name="superbot-eu-gpt",base_url="https://eu-gpt.example/v1",env_key="SUPERBOT_PROVIDER_EU_GPT_API_KEY",wire_api="responses"}"#;
+        assert!(c.contains(&table.to_string()), "{c:?}");
+        // Its key under the name the provider reads, empty in what its shell commands get.
+        assert_eq!(job.env["SUPERBOT_PROVIDER_EU_GPT_API_KEY"], "sk-tier-not-real");
+        assert!(!job.env.contains_key("TIER_EU_KEY"));
+        assert!(c.contains(&r#"shell_environment_policy.set.SUPERBOT_PROVIDER_EU_GPT_API_KEY="""#.to_string()), "{c:?}");
+        assert!(!job.args.iter().any(|a| a.contains("sk-tier")) && !c.iter().any(|f| f.starts_with("analytics")), "{c:?}");
+        // All before the prompt, on a resumed session too; held, no analytics either.
+        i.session_id = Some("thread-1".into());
+        i.held_to = vec!["gb-lon".into()];
+        let job = job_for(get("codex").unwrap().as_mut(), &i, &mut Vec::new());
+        let end = job.args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(job.args[1], "resume");
+        assert!(job.args[..end].iter().any(|a| a.starts_with("model_providers.")) && job.args[..end].contains(&"analytics.enabled=false".to_string()));
+        // No endpoint: Codex's own provider, as before.
+        (i.provider, i.endpoints) = (None, Vec::new());
+        let job = job_for(get("codex").unwrap().as_mut(), &i, &mut Vec::new());
+        assert!(!job.args.iter().any(|a| a.contains("model_provider")) && !job.env.keys().any(|k| k.starts_with("SUPERBOT_PROVIDER_")));
     }
 
     #[test]
