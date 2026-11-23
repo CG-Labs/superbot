@@ -37,6 +37,7 @@ Acme (corp): ready
   Signs AuthnRequests:      no
   Single logout:            yes
   IdP-initiated sign-in:    refused (start from SuperBot)
+  Authentication context:   not checked (the IdP's MFA isn't required)
   IdP metadata from url (https://acme.okta.example/app/exk1abc/sso/saml/metadata):
     Sign-in URL: https://acme.okta.example/app/acme_superbot_1/exk1abc/sso/saml
     Logout URL:  https://acme.okta.example/app/exk1abc/slo/saml
@@ -188,6 +189,9 @@ If the IdP answers SuperBot's request with another unsolicited response, it igno
 | `SSO_<ID>_GROUPS_ATTRIBUTE` | | The assertion attribute with the person's groups ([above](#groups)). No default: without it, groups aren't read. |
 | `SSO_<ID>_REQUIRED_GROUPS` | | Only people in one of these groups sign in, comma separated (exact). Needs `GROUPS_ATTRIBUTE`. |
 | `SSO_<ID>_IDP_INITIATED` | `off` | `restart`: an unsolicited response from an IdP's app tile starts an SP-initiated sign-in ([above](#idp-initiated-sign-in-app-tiles)). `off` refuses it. |
+| `SSO_<ID>_AUTHN_CONTEXT` | | Only people the IdP says signed in one of these ways get in, comma separated (exact): authentication context classes, or values of `AUTHN_METHODS_ATTRIBUTE` ([below](#require-mfa-at-the-idp)). |
+| `SSO_<ID>_AUTHN_METHODS_ATTRIBUTE` | | The assertion attribute listing how the person signed in, whose values count for `AUTHN_CONTEXT` too (Entra ID: `http://schemas.microsoft.com/claims/authnmethodsreferences`). Needs `AUTHN_CONTEXT`. |
+| `SSO_<ID>_REQUEST_AUTHN_CONTEXT` | `false` | `true`: AuthnRequests ask the IdP for the `AUTHN_CONTEXT` classes (`RequestedAuthnContext`, exact). Needs `AUTHN_CONTEXT`. |
 
 The bridge's settings (`CLIENT_ID`, `IDP_ALIAS`, `SCOPES`, `*_CLAIM`) are refused on a native provider, and the native ones on a bridge provider, so a provider is never half of each. There is no client secret.
 
@@ -273,6 +277,35 @@ At the IdP, set the **logout URL** (single logout URL, SLO endpoint) to the SLO 
 
 SuperBot doesn't ask single sign-on sign-ins for its own second factor: the IdP's MFA is that factor, so require it there (Okta: an authentication policy with a possession factor on the app; Entra ID: a Conditional Access policy requiring MFA for the app). This is your control as the customer (CC6.1-2 in the [SOC 2 readiness checklist](../security/soc2-readiness-checklist.md)).
 
+**Make SuperBot check it too.** A policy that's switched off, scoped to the wrong group, or skipped on a trusted network lets a password alone through. SuperBot can refuse any sign-in the IdP doesn't vouch was made with MFA ([ADR 0190](../adr/0190-saml-required-authn-context.md)). The signed assertion says how the person signed in, as an authentication context class and often as an attribute listing the methods used. Name what to require:
+
+```bash
+# Entra ID: its authnmethodsreferences attribute lists multipleauthn once MFA was done.
+SSO_CORP_AUTHN_CONTEXT=http://schemas.microsoft.com/claims/multipleauthn
+SSO_CORP_AUTHN_METHODS_ATTRIBUTE=http://schemas.microsoft.com/claims/authnmethodsreferences
+```
+
+- **Exact values**, comma separated, case included. Someone gets in if the IdP sends any of them as the `AuthnContextClassRef` of the signed assertion, or as a value of the `AUTHN_METHODS_ATTRIBUTE` attribute (only that one, and only when it's set).
+- **Checked on every sign-in**, after the signature and required groups, and before the account is looked up, so just in time never makes an account for someone without MFA. A refusal is `authn_context` in the audit log. The event lists what the IdP sent (`authnContexts`, and `authnMethods` with an attribute), and the person sees that the sign-in didn't use the method SuperBot requires.
+- **Every sign-in records it.** `auth.login` has `authnContext`: the value that met the requirement or, without one, the class the IdP sent. Look at a few sign-ins before you require anything, to see what your IdP sends (`botctl audit 5 --action auth.login`).
+- **Sessions people already have aren't ended.** The requirement applies from their next sign-in. `botctl sso saml corp` shows the setting.
+
+What to require, by IdP:
+
+| IdP | Settings | Notes |
+|-----|----------|-------|
+| Entra ID | `AUTHN_CONTEXT=http://schemas.microsoft.com/claims/multipleauthn`, `AUTHN_METHODS_ATTRIBUTE=http://schemas.microsoft.com/claims/authnmethodsreferences` | Entra ID sends the attribute in its responses. Don't set `REQUEST_AUTHN_CONTEXT`: Entra ID refuses the sign-in (AADSTS75011) when the person's session used another method. MFA itself comes from your Conditional Access policy. |
+| ADFS | `AUTHN_CONTEXT=http://schemas.microsoft.com/claims/multipleauthn`, `REQUEST_AUTHN_CONTEXT=true` | Asking makes ADFS run its additional authentication, and it returns that class. Without asking, an additional authentication rule on the relying party must require MFA, and its claim rules must pass the `authnmethodsreferences` claim through (then set `AUTHN_METHODS_ATTRIBUTE` as for Entra ID). |
+| Okta | `AUTHN_CONTEXT=mfa`, `AUTHN_METHODS_ATTRIBUTE=amr` | Okta's class is fixed by the app's settings, whatever the person did, so don't require a class. On the app, add an attribute statement named `amr` with the value `session.amr`. Okta then lists `pwd`, `mfa`, `swk` and so on. |
+| Shibboleth, research federations | `AUTHN_CONTEXT=https://refeds.org/profile/mfa`, `REQUEST_AUTHN_CONTEXT=true` | The REFEDS MFA profile. |
+| Keycloak, others | The class or method your IdP documents for MFA | Check what it sends in `auth.login` first. |
+
+`REQUEST_AUTHN_CONTEXT=true` puts the listed values in every AuthnRequest, in order, as `RequestedAuthnContext` with `exact` comparison (with signed requests, inside what's signed). List only classes then, since an IdP may refuse a request for a value it doesn't know. An IdP that can't sign the person in that way answers `NoAuthnContext`: the audit log has `idp_error` with that `idpStatus`, and the person sees the same message. Asking doesn't replace the check: every response is held to the list either way.
+
+App tiles ([above](#idp-initiated-sign-in-app-tiles)) aren't held to it, because their response never signs anyone in. The sign-in they restart is.
+
+If the values are wrong, nobody gets in with this provider. Break-glass and one-time codes still work. Fix the setting from what the audit log says the IdP sent.
+
 ## Troubleshooting
 
 Every refused sign-in is in the audit log with a reason (`botctl audit --action auth.login_failed`, `idp` = `saml`; `idpInitiated` is true for posts from an app tile). Failures nobody vouched for, such as bad signatures, are logged at most once a minute per address, with a count of those skipped. People see a short message on the sign-in page.
@@ -299,7 +332,8 @@ Every refused sign-in is in the audit log with a reason (`botctl audit --action 
 | `replayed` | The same assertion was posted twice. |
 | `transient_subject`, `missing_subject` | Use a persistent NameID. |
 | `email_unverified`, `wrong_domain` | No email attribute was sent, or it isn't in `ALLOWED_DOMAINS`. Set `SSO_<ID>_EMAIL_ATTRIBUTE` if the IdP uses another name. |
-| `idp_error` | The IdP said no (`idpStatus` has its status code), for example someone not assigned to the app. |
+| `idp_error` | The IdP said no (`idpStatus` has its status code), for example someone not assigned to the app. `Responder/NoAuthnContext`: it couldn't sign them in the way `REQUEST_AUTHN_CONTEXT` asked for ([above](#require-mfa-at-the-idp)). |
+| `authn_context` | `SSO_<ID>_AUTHN_CONTEXT` is set and the IdP didn't vouch for any of its values. `authnContexts` and `authnMethods` say what it sent: password only (fix the IdP's MFA policy for the app), or another value for MFA (add it). Check `AUTHN_METHODS_ATTRIBUTE` names the attribute the IdP sends. |
 | `user_disabled` | The person is disabled in SuperBot. |
 | `not_in_group` | `SSO_<ID>_REQUIRED_GROUPS` is set and the assertion lists none of them. Check the name or id (exact, case included) and that the IdP sends the attribute `GROUPS_ATTRIBUTE` names. |
 | `groups_unknown` | The IdP couldn't list the groups: `groups` = `overage` (Entra ID: send only groups assigned to the application) or `too_many` (over 500). |
