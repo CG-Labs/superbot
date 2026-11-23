@@ -923,6 +923,7 @@ impl Agent {
             }
             None => Egress::default(),
         };
+        let cfg_state_dir = cfg.state_dir.clone();
         let a = Arc::new(Agent {
             cfg,
             current: RwLock::new((Arc::new(id), server)),
@@ -939,7 +940,7 @@ impl Agent {
             cgroups,
             egress: Mutex::new(egress),
             egress_loading: tokio::sync::Mutex::new(()),
-            team_rules: Mutex::new(None),
+            team_rules: Mutex::new(last_team_rules(&cfg_state_dir)),
             team_loading: tokio::sync::Mutex::new(()),
         });
         a.home_use.refresh(&a.home_roots(), false);
@@ -1218,6 +1219,7 @@ impl Agent {
         if let Some(e) = &report.error {
             eprintln!("Team network: {e}");
         }
+        save_team_rules(&self.cfg.state_dir, &report);
         *self.team_rules.lock().unwrap_or_else(|e| e.into_inner()) = Some(report.clone());
         report
     }
@@ -1240,6 +1242,21 @@ impl Agent {
 /// Where the egress script, run by the agent, says how it went: the unit's own place,
 /// under /run, is read-only to the agent.
 const TEAM_RULES_STATE: &str = "egress-reload";
+/// How the agent's last change to the team subnet in the egress rules went.
+const TEAM_RULES_LAST: &str = "team-network.json";
+
+/// Kept across restarts of the agent: the script says what it lets through, not
+/// whether it loaded.
+fn save_team_rules(state_dir: &Path, r: &wire::TeamNetworkReport) {
+    if let Ok(b) = serde_json::to_vec(r) {
+        let _ = std::fs::write(state_dir.join(TEAM_RULES_LAST), b);
+    }
+}
+
+fn last_team_rules(state_dir: &Path) -> Option<wire::TeamNetworkReport> {
+    serde_json::from_slice(&std::fs::read(state_dir.join(TEAM_RULES_LAST)).ok()?).ok()
+}
+
 /// The most of an egress script read: the first boot's is a few kilobytes.
 const SCRIPT_MAX: u64 = 256 * 1024;
 
@@ -2740,6 +2757,10 @@ mod tests {
         assert_eq!((r.state.as_str(), r.subnet.as_deref()), (wire::TEAM_RULES_FAILED, Some("10.248.0.0/22")));
         assert!(r.error.as_deref().unwrap().ends_with("nft: syntax error"), "{:?}", r.error);
         assert_eq!(team_report(read_script(&script), Some(&r)), r);
+        // And after the agent restarts: what the script says isn't taken for loaded.
+        assert_eq!(last_team_rules(&state), None);
+        save_team_rules(&state, &r);
+        assert_eq!(team_report(read_script(&script), last_team_rules(&state).as_ref()), r);
         assert_eq!(team_report(read_script(&script), Some(&team_failed(None, "old".into()))).state, wire::TEAM_RULES_ON);
 
         // No script: nothing to let through. Someone else's script: left alone.

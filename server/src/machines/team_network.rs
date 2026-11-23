@@ -269,7 +269,7 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
         }
         if s.join == Join::WhenIdle {
             for (n, team, m) in &to_boot {
-                match restart(app, cp, n, team, m).await {
+                match restart(app, cp, p, n, team, m).await {
                     Restart::Restarting => restarting += 1,
                     Restart::Waiting => {}
                     Restart::Failed => errors += 1,
@@ -337,7 +337,7 @@ async fn join(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, s: &Se
     if !active(m) || m.provider_id.is_none() {
         return Joined::Nothing;
     }
-    if rules_waiting(m, &s.subnet).is_some() {
+    if rules_waiting(m, &s.subnet).is_some() || !behind_firewall(cp, p, m).await {
         return Joined::Waiting;
     }
     let by = system(m);
@@ -375,6 +375,14 @@ async fn join(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, s: &Se
     }
 }
 
+/// Whether the provider says `m` is behind the machines' firewall, whose inbound drops
+/// are what keep teammates' machines apart on the VPC. A machine whose firewall failed
+/// to attach waits until the firewall sweep puts it behind.
+async fn behind_firewall(cp: &ControlPlane, p: &dyn MachineProvider, m: &Machine) -> bool {
+    let (Some(_), Some(fw), Some(pid)) = (&cp.firewall, m.firewall_id.as_deref(), m.provider_id.as_deref()) else { return false };
+    p.firewall_devices(fw).await.is_ok_and(|d| d.machines.iter().any(|x| x == pid))
+}
+
 #[derive(Debug, PartialEq)]
 enum Restart {
     Restarting,
@@ -386,9 +394,9 @@ enum Restart {
 /// nothing, so the sweep powers it on again on the network (MACHINE_TEAM_NETWORK_JOIN=
 /// when-idle). A run that starts between that answer and the power-off ends with it, as
 /// a rebuild's would.
-async fn restart(app: &AppState, cp: &ControlPlane, n: &TeamNetwork, team: &str, m: &Machine) -> Restart {
+async fn restart(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, n: &TeamNetwork, team: &str, m: &Machine) -> Restart {
     let Some(e) = cp.enrollment.as_deref() else { return Restart::Waiting };
-    if m.enrollment != "enrolled" {
+    if m.enrollment != "enrolled" || !behind_firewall(cp, p, m).await {
         return Restart::Waiting;
     }
     match super::enroll::heartbeat(app, e, m).await {

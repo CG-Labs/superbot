@@ -28,14 +28,14 @@ We chose option 3.
 - The agent has a new endpoint, `PUT /v1/team-network {subnet}`, and a new capability, `team_network`. The subnet must be an IPv4 network with no host bits, inside RFC 1918, no smaller than a `/29`; anything else is refused, so nothing but a CIDR ever reaches the script. `null` takes the line out.
 - The agent writes the script atomically (a new file, mode `0755`, renamed over the old) and runs it. The script replaces the rules' table whole, in one transaction, so the machine is never left half-way. It is run with `SUPERBOT_HARDENING_STATE` set to a place under the agent's state directory, since the unit's own place under `/run` is read-only to the agent.
 - Only the first boot's script is edited: one whose deny lists sit in the quoted `cat <<'DENY'` heredoc. A script that isn't is left alone and reported `failed`. A machine with no script (not hardened) reports `none`: it has no deny rules, so nothing needs letting through.
-- Every heartbeat now carries `teamNetwork: {subnet, state: on | failed | none, error}`, read from the script itself. botd keeps it with the machine's other upkeep. A change is audited as `machine.team_network_rules_loaded`, or `machine.team_network_rules_failed` (outcome failure).
+- Every heartbeat now carries `teamNetwork: {subnet, state: on | failed | none, error}`, read from the script itself, with the last load's result. That result is kept in the agent's state directory, so a load that failed still reads as failed after the agent restarts: the script says what it lets through, not whether it loaded. botd keeps it with the machine's other upkeep. A change is audited as `machine.team_network_rules_loaded`, or `machine.team_network_rules_failed` (outcome failure).
 - After each heartbeat, botd sends the agent the subnet it should let through: the team network's if the owner is on a team, else none. It sends only when the agent's rules differ or failed, and at most every 10 minutes for the same answer, as for allow-lists. Machines with no script are never sent anything.
 
 The edited script is exactly the one a first boot on the network would write. A unit test holds the two to that.
 
 ### Then the interface
 
-Each reconcile pass, after the leaving step of ADR 0189, looks at every machine of ours that is running or suspended, whose owner is on a team, and that has no interface on any team network. If its agent says its rules let the team's subnet through, or that it has no rules, then under the lock team changes take, and with the owner's team checked again:
+Each reconcile pass, after the leaving step of ADR 0189, looks at every machine of ours that is running or suspended, whose owner is on a team, and that has no interface on any team network. If its agent says its rules let the team's subnet through, or that it has no rules, and the provider says the machine is behind the machines' firewall (whose inbound drops keep teammates' machines apart on the VPC; one whose firewall failed to attach waits for the firewall sweep), then under the lock team changes take, and with the owner's team checked again:
 
 - The team's VPC is found or made, as for a new machine (`machine.team_network_created`).
 - The machine is given a VPC interface on the team's subnet, for its next boot. On Linode, an empty interface list means "public only", so the public interface is added first, keeping it the primary. This is audited as `machine.team_network_joining`, with the team, VPC, subnet and join mode.
@@ -48,7 +48,7 @@ A machine whose agent hasn't confirmed the subnet yet is counted as `waiting`. A
 `MACHINE_TEAM_NETWORK_JOIN` decides when the interface comes into use:
 
 - **`next-boot`** (the default). botd waits for the machine's next boot, whether its owner's, an admin's, or an upgrade's. Until then the reconciler counts it as `pending`.
-- **`when-idle`**. Once a fresh heartbeat shows no runs on the machine, botd suspends it through the normal suspend path and powers it on again on the next pass, as it does for leaving (ADR 0189). This is audited as `machine.suspended`, then `machine.team_network_restarting`, then `machine.resumed`. A run that starts between that heartbeat and the power-off ends with it, as a rebuild's would. The same rules as leaving apply to powering on: never for a disabled owner, a disable hold or a returned team machine.
+- **`when-idle`**. Once a fresh heartbeat shows no runs on the machine, and it is still behind the firewall, botd suspends it through the normal suspend path and powers it on again on the next pass, as it does for leaving (ADR 0189). This is audited as `machine.suspended`, then `machine.team_network_restarting`, then `machine.resumed`. A run that starts between that heartbeat and the power-off ends with it, as a rebuild's would. The same rules as leaving apply to powering on: never for a disabled owner, a disable hold or a returned team machine.
 - **`off`**. Only new or rebuilt machines join, as before this ADR. No agent is sent a subnet.
 
 It needs `MACHINE_TEAM_NETWORK=vpc`; set without it, botd refuses to start.
@@ -75,9 +75,9 @@ A machine whose owner leaves the team while its interface isn't in use yet loses
 ## Tests
 
 - **Unit** (`machines/team_rules.rs`): only private IPv4 networks no smaller than a `/29` are taken, and nothing else reaches the script; the accept line goes first in the deny lists, only one, and comes out again; scripts that aren't ours and lines outside the heredoc are left alone. (`machines/hardening.rs`): the edited script equals the first boot's script for a team machine.
-- **Agent** (`machines/agent.rs`): the subnet is written in and loaded, read back, and withdrawn; the script keeps its mode and leaves no temporary file; a script that fails says so until a change; a missing script is `none`; someone else's is untouched and `failed`.
+- **Agent** (`machines/agent.rs`): the subnet is written in and loaded, read back, and withdrawn; the script keeps its mode and leaves no temporary file; a script that fails says so until a change, after the agent restarts too; a missing script is `none`; someone else's is untouched and `failed`.
 - **Linode** (`machines/linode.rs`, against the stand-in): members say whether their interface is in use; joining adds public then VPC to a machine with none, VPC alone after a public one, nothing when already on; and it refuses Linode interfaces, two profiles and another VPC, and never sends an id that isn't a number.
-- **End to end, in memory** (`machines_team_network_tests.rs`): a machine made before its owner joined a team waits until its rules let the subnet through, joins for its next boot without being restarted, and loses the interface at once, without a power-off, if its owner leaves first; a refusal is audited once; it is joined once it boots, audited once.
+- **End to end, in memory** (`machines_team_network_tests.rs`): a machine made before its owner joined a team waits until its rules let the subnet through and it is behind the firewall, joins for its next boot without being restarted, and loses the interface at once, without a power-off, if its owner leaves first; a refusal is audited once; it is joined once it boots, audited once.
 - **End to end, real agent** (`machines_team_network_tests.rs`, over mutual TLS): with `when-idle`, the agent lets the subnet through when its owner joins a team, the machine joins, stays on while a run is in progress, and is powered off and on once idle; leaving takes it off and the agent's rules lose the subnet, all audited.
 
 ## Deferred

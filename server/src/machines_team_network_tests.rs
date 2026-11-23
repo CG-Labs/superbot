@@ -273,6 +273,14 @@ async fn a_machine_made_before_its_owner_joined_a_team_joins_its_network_at_its_
     assert_eq!(env.fake.calls("join_team_network"), 0);
     rules_say(&env, &cy, "on", Some(team_network::DEFAULT_SUBNET));
 
+    // Nor while it isn't behind the firewall, whose inbound drops keep teammates apart.
+    let fw = machine(&env, &cy).firewall_id.unwrap();
+    env.fake.detach_firewall(&fw, &cym).await.unwrap();
+    env.fake.fail_next("attach_firewall", crate::machines::provider::ProviderError::Api { status: 500, message: "try later".into() });
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "waiting": 1 }));
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "waiting": 1 }), "put back behind it this pass, after the sweep");
+    assert_eq!(env.fake.calls("join_team_network"), 0);
+
     // Then it is put on, in use from its next boot; botd doesn't restart it for that.
     assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "joining": 1 }));
     let net = env.fake.joining(&cym).expect("on Acme's network from its next boot");
@@ -333,7 +341,10 @@ async fn with_when_idle_a_machine_is_restarted_onto_its_teams_network_once_it_ru
     use crate::machines_mtls_tests::{self as mtls, CHAT, agent_with_config, machine_for, send};
     let mut env = mtls::serve_with_control(
         |e| e,
-        |cp| cp.team_network = Some(team_network::Settings { subnet: team_network::DEFAULT_SUBNET.into(), join: team_network::Join::WhenIdle }),
+        |cp| {
+            cp.firewall_with(Settings { sources: Vec::new(), ssh: Vec::new() }).unwrap();
+            cp.team_network = Some(team_network::Settings { subnet: team_network::DEFAULT_SUBNET.into(), join: team_network::Join::WhenIdle });
+        },
         |_| {},
     )
     .await;
