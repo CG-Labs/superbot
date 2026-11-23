@@ -105,7 +105,7 @@ Said plainly in the [DPA annex](../security/dpa-template.md#annex-iv-data-reside
 
 - Hold a pinned tenant's model routes to providers and endpoints the operator marks as in the region, and refuse runs otherwise. **Done** in [ADR 0139](0139-in-region-model-routes.md).
 - A data region for botd's own database and server backups, or a documented dedicated deployment per region (enterprise dedicated hosting, M5).
-- Show the pin to the customer in the app.
+- Show the pin to the customer in the app. **Done** in [ADR 0166](0166-residency-in-the-app.md).
 - An option to refuse startup when a pin can't be kept.
 - Keep a leaver's pin, or refuse the leave or a SCIM group delete, when the agreement says so.
 
