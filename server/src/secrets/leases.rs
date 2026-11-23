@@ -23,6 +23,8 @@
 //! - With `AWS_RUN_CREDENTIALS` (ADR 0194) the leases are STS `AssumeRole` sessions,
 //!   which nothing can revoke: at run end they are audited as `secret.lease_released`
 //!   with when they expire, and their values stay redacted until then.
+//! - With `GCP_RUN_CREDENTIALS` (ADR 0203) they are access tokens of Google service
+//!   accounts botd impersonates (`generateAccessToken`), which can't be revoked either.
 
 use super::external::{self, Scope};
 use super::{check_name, redact, Error, Secret};
@@ -112,6 +114,15 @@ fn role_arn_ok(p: &str) -> bool {
         && role.bytes().all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-/".contains(&b))
 }
 
+/// A Google service account's email, `<account>@<domain>.gserviceaccount.com`, where
+/// `{owner}` may stand in the account, before the `@`.
+fn service_account_ok(p: &str) -> bool {
+    let Some((account, domain)) = p.split_once('@') else { return false };
+    let account = account.replace(OWNER, "x");
+    let label_ok = |l: &str| !l.is_empty() && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    p.len() <= 254 && label_ok(&account) && domain.strip_suffix(".gserviceaccount.com").is_some_and(|d| d.split('.').all(label_ok))
+}
+
 /// How one backend's run credentials setting is written.
 pub struct Syntax {
     pub key: &'static str,
@@ -150,6 +161,18 @@ pub const AWS: Syntax = Syntax {
     defaults: &AWS_KEYS,
     own: &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"],
     example: "AWS_ACCESS_KEY_ID=AccessKeyId",
+};
+
+/// `GCP_RUN_CREDENTIALS` (ADR 0203): Google service accounts botd impersonates for each
+/// run. A bare entry gives the token under the names gcloud and Terraform read.
+pub const GCP: Syntax = Syntax {
+    key: "GCP_RUN_CREDENTIALS",
+    what: "a service account's email like \"superbot-bots@my-project.iam.gserviceaccount.com\" (with {owner} for the Bot owner's id before the @)",
+    path_ok: service_account_ok,
+    fields: &["accessToken"],
+    defaults: &[("CLOUDSDK_AUTH_ACCESS_TOKEN", "accessToken"), ("GOOGLE_OAUTH_ACCESS_TOKEN", "accessToken")],
+    own: &[],
+    example: "GOOGLE_OAUTH_ACCESS_TOKEN=accessToken",
 };
 
 /// `VAULT_RUN_CREDENTIALS`: entries separated by `;` or new lines, each a path and the
@@ -777,6 +800,44 @@ pub(crate) mod tests {
             let e = parse_as(&AWS, raw).unwrap_err();
             assert!(e.starts_with("AWS_RUN_CREDENTIALS: ") && e.contains(err), "{raw}: {e}");
         }
+    }
+
+    #[test]
+    fn gcp_service_accounts_are_checked_and_default_to_gcloud_and_terraforms_names() {
+        let w = parse_as(&GCP, "superbot-bots@proj-1.iam.gserviceaccount.com;\n superbot-u-{owner}@proj-1.iam.gserviceaccount.com OWN_GCP_TOKEN=accessToken").unwrap();
+        assert_eq!(w[0].path, "superbot-bots@proj-1.iam.gserviceaccount.com");
+        assert_eq!(w[0].names, [pair("CLOUDSDK_AUTH_ACCESS_TOKEN", "accessToken"), pair("GOOGLE_OAUTH_ACCESS_TOKEN", "accessToken")], "one token under both names");
+        assert!(w[1].per_owner() && !w[0].per_owner());
+        assert!(parse_as(&GCP, "123456789-compute@developer.gserviceaccount.com").is_ok(), "the default compute account");
+        for (raw, err) in [
+            ("aws/creds/bots", "service account's email"),
+            ("superbot-bots", "service account's email"),
+            ("Superbot@proj-1.iam.gserviceaccount.com", "service account's email"),
+            ("superbot@proj-1.iam.example.com", "service account's email"),
+            ("superbot@{owner}.iam.gserviceaccount.com", "service account's email"),
+            ("superbot@.gserviceaccount.com", "service account's email"),
+            ("super bot@proj-1.iam.gserviceaccount.com", "service account's email"),
+            ("a@b@proj-1.iam.gserviceaccount.com", "service account's email"),
+            ("superbot@proj-1.iam.gserviceaccount.com X_TOKEN=expireTime", "one of accessToken"),
+            ("superbot@proj-1.iam.gserviceaccount.com X_TOKEN", "like GOOGLE_OAUTH_ACCESS_TOKEN=accessToken"),
+            ("a@p.iam.gserviceaccount.com; b@p.iam.gserviceaccount.com", "CLOUDSDK_AUTH_ACCESS_TOKEN is given twice"),
+            ("superbot@proj-1.iam.gserviceaccount.com GCP_SERVICE_ACCOUNT_KEY=accessToken", "reserved"),
+        ] {
+            let e = parse_as(&GCP, raw).unwrap_err();
+            assert!(e.starts_with("GCP_RUN_CREDENTIALS: ") && e.contains(err), "{raw}: {e}");
+        }
+    }
+
+    #[test]
+    fn one_value_under_two_names_is_redacted_until_its_last_lease_lets_go() {
+        let f = fake(&[("sa/twice", &[("accessToken", Some("ya29.twice-run-token-2b1a"))])]);
+        f.same.store(true, Ordering::SeqCst);
+        let rc = RunCredentials::new(f.clone(), parse("sa/twice TWICE_ONE_TOKEN=accessToken TWICE_TWO_TOKEN=accessToken").unwrap());
+        let (e, l) = rc.issue("utwice7", "btwice7", true, RUN).unwrap();
+        assert_eq!(env(&e), [pair("TWICE_ONE_TOKEN", "ya29.twice-run-token-2b1a"), pair("TWICE_TWO_TOKEN", "ya29.twice-run-token-2b1a")]);
+        drop(l);
+        wait_for(|| f.revoked.lock().unwrap().len() == 1);
+        wait_for(|| redact::text("ya29.twice-run-token-2b1a") == "ya29.twice-run-token-2b1a");
     }
 
     #[test]

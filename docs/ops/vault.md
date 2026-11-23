@@ -165,7 +165,7 @@ The policy above already covers `superbot/users/*`. Who may write each folder is
 
 ## Short-lived credentials for each run
 
-Off by default ([ADR 0185](../adr/0185-short-lived-credentials-per-run.md)). With `VAULT_RUN_CREDENTIALS`, botd asks one of Vault's dynamic secrets engines (AWS, database, GCP, Azure, ...) for a new credential as each run starts. The run gets it as environment variables, and botd revokes the lease when the run ends, however it ends. A key a Bot leaks stops working with the run.
+Off by default ([ADR 0185](../adr/0185-short-lived-credentials-per-run.md)). With `VAULT_RUN_CREDENTIALS`, botd asks one of Vault's dynamic secrets engines (AWS, database, GCP, Azure, ...) for a new credential as each run starts. The run gets it as environment variables, and botd revokes the lease when the run ends, however it ends. A key a Bot leaks stops working with the run. Without Vault, [AWS STS sessions](cloud-secrets.md#short-lived-aws-credentials-for-each-run) and [GCP service account tokens](cloud-secrets.md#short-lived-gcp-credentials-for-each-run) work much the same way, but can't be revoked.
 
 ```sh
 vault secrets enable aws

@@ -451,7 +451,14 @@ pub fn from_env(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result
             Box::new(v)
         }
         "azure-keyvault" => Box::new(super::azure::KeyVault::new(super::azure::Config::from_env(var, store)?)?),
-        "gcp-secret-manager" => Box::new(super::gcp::SecretManager::new(super::gcp::Config::from_env(var, store)?)?),
+        "gcp-secret-manager" => {
+            let sm = super::gcp::SecretManager::new(super::gcp::Config::from_env(var, store)?)?;
+            let wanted = leases::parse_as(&leases::GCP, &var("GCP_RUN_CREDENTIALS"))?;
+            if !wanted.is_empty() {
+                run_credentials = Some(RunCredentials::new(Arc::new(sm.clone()), wanted));
+            }
+            Box::new(sm)
+        }
         "aws" => {
             let cfg = super::aws::Config::from_env(var, store)?;
             super::keep_from_bots(cfg.source.reserved(), cfg.source.settings());
@@ -479,7 +486,7 @@ pub fn user_folders(raw: &str) -> Result<bool, String> {
 
 /// The settings of backends other than `chosen` that are set: probably a mistake.
 pub fn unused_settings(var: &dyn Fn(&str) -> String, chosen: &str) -> Vec<&'static str> {
-    const KEYS: [(&str, &str); 10] = [
+    const KEYS: [(&str, &str); 11] = [
         ("vault", "VAULT_ADDR"),
         ("vault", "VAULT_RUN_CREDENTIALS"),
         ("azure-keyvault", "AZURE_KEYVAULT_URL"),
@@ -487,6 +494,7 @@ pub fn unused_settings(var: &dyn Fn(&str) -> String, chosen: &str) -> Vec<&'stat
         ("gcp-secret-manager", "GCP_SECRET_MANAGER_PROJECT"),
         ("gcp-secret-manager", "GCP_SECRET_MANAGER_AUTH"),
         ("gcp-secret-manager", "GCP_SECRET_MANAGER_LOCATION"),
+        ("gcp-secret-manager", "GCP_RUN_CREDENTIALS"),
         ("aws", "AWS_SECRETS_MANAGER_REGION"),
         ("aws", "AWS_SECRETS_MANAGER_AUTH"),
         ("aws", "AWS_RUN_CREDENTIALS"),
