@@ -842,6 +842,15 @@ pub struct ServiceToken {
     pub rotated_to: Option<String>,
 }
 
+/// How often one service account was refused for one reason (ADR 0170), and when last.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ServiceRefusal {
+    pub account: String,
+    pub reason: String,
+    pub n: u64,
+    pub last_at: i64,
+}
+
 pub struct NewServiceToken<'a> {
     pub account_id: &'a str,
     pub name: &'a str,
@@ -5604,6 +5613,41 @@ impl Db {
             "UPDATE service_tokens SET last_used_at = ?1, last_used_ip = ?2 WHERE id = ?3 AND (last_used_at IS NULL OR last_used_at < ?1 - 60000)",
             params![at, ip, id],
         );
+    }
+
+    /// Service accounts' refusals from `from` (unix ms), by account and reason (ADR 0170):
+    /// requests refused once its token was taken (`access.denied` with the account as the
+    /// actor), and its tokens refused at authentication (`auth.login_failed` naming it),
+    /// with the refusals a throttled one folded in counted under its reason. Just `account`'s
+    /// when it's given.
+    pub fn service_refusals(&self, from: i64, account: Option<&str>) -> Vec<ServiceRefusal> {
+        let c = self.c();
+        let mut s = c
+            .prepare(
+                "SELECT account, reason, SUM(n), MAX(at) FROM (
+                   SELECT actor_id AS account, CASE WHEN json_valid(details) THEN CAST(json_extract(details, '$.reason') AS TEXT) END AS reason, 1 AS n, at
+                     FROM audit_events WHERE at >= ?1 AND action = 'access.denied' AND actor_kind = 'user' AND auth_method = 'service_token'
+                   UNION ALL
+                   SELECT target_id, CASE WHEN json_valid(details) THEN CAST(json_extract(details, '$.reason') AS TEXT) END,
+                     1 + CASE WHEN json_valid(details) THEN max(0, CAST(COALESCE(json_extract(details, '$.unloggedSinceLast'), 0) AS INTEGER)) ELSE 0 END, at
+                     FROM audit_events WHERE at >= ?1 AND action = 'auth.login_failed' AND target_type = 'service_account'
+                 ) WHERE account IS NOT NULL AND (?2 IS NULL OR account = ?2)
+                 GROUP BY account, reason ORDER BY account, reason",
+            )
+            .unwrap();
+        s.query_map(params![from, account], |r| {
+            Ok(ServiceRefusal { account: r.get(0)?, reason: r.get::<_, Option<String>>(1)?.unwrap_or_else(|| "unknown".into()), n: r.get::<_, i64>(2)?.max(0) as u64, last_at: r.get(3)? })
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect()
+    }
+
+    /// The live service accounts that act in `team_id` (ADR 0143).
+    pub fn team_service_accounts(&self, team_id: &str) -> Vec<String> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT user_id FROM service_accounts WHERE team_id = ? AND deleted_at IS NULL ORDER BY user_id").unwrap();
+        s.query_map([team_id], |r| r.get(0)).unwrap().filter_map(Result::ok).collect()
     }
 
     // Erasure (ADR 0102).

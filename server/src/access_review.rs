@@ -119,12 +119,13 @@ fn service_flags(sa: &ServiceAccount, owner_active: bool, live: &[&db::ServiceTo
 }
 
 /// A live service account (ADR 0165): who owns it, what it holds and can use today, the
-/// Bots its role reaches, and its live tokens. Never a token's secret, hash or address.
+/// Bots it reaches (by its role, team and grants, within its owner's), and its live tokens. Never a token's secret, hash or address.
 fn service(app: &App, sa: &ServiceAccount, at: i64, names: &HashMap<&str, &str>, teams: &HashMap<String, String>) -> (Value, Value) {
     let h = crate::service_accounts::holdings(&app.db, sa);
     let u = &sa.user;
     let grants = app.db.user_grants(&u.id);
-    let bots: Vec<Value> = Viewer::User { id: u.id.clone(), role: u.role }.bots(&app.db).into_iter().map(|(b, access)| bot_view(&b, access, &u.id, grants.get(&b.id), names)).collect();
+    // Within its owner's access, as its tokens get it (ADR 0170).
+    let bots: Vec<Value> = Viewer::service(&app.db, &u.id, u.role).bots(&app.db).into_iter().map(|(b, access)| bot_view(&b, access, &u.id, grants.get(&b.id), names)).collect();
     let tokens = app.db.service_tokens(&u.id);
     let live: Vec<&db::ServiceToken> = tokens.iter().filter(|t| crate::service_accounts::token_state(t, at) == "active").collect();
     let role_view = |r: &crate::db::CustomRole, perms: crate::rbac::Perms| json!({ "id": r.id, "name": r.name, "permissions": perms.names() });

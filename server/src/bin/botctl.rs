@@ -73,7 +73,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl service-accounts                          Service accounts (ADR 0143): non-human callers for scripts
                                                    and integrations. Admins see all; others with users.manage
                                                    the ones they own
-  botctl service-account show <sa>                 One, its permissions, and its tokens (never their secrets)
+  botctl service-account show <sa>                 One, its permissions, its tokens (never their secrets), the
+                                                   Bots it reaches, and its refusals in the last 30 days
   botctl service-account add "<name>" [--role member|readonly|<custom role>] [--team <team>] [--description "<text>"]
                                                    Read-only by default; never admin, never more than you hold.
                                                    With --team, a custom role applies only in that team
@@ -180,7 +181,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl bot access <bot>                          Who owns a Bot, who can see it, and their grants
   botctl bot share <bot> | private <bot>           Shared with everyone, or only its owner and grants
   botctl bot owner <bot> <user>                    Give a Bot to another user (admins only)
-  botctl bot grant <bot> <user> <viewer|operator>  viewer: read its chat; operator: also run it
+  botctl bot grant <bot> <user> <viewer|operator>  viewer: read its chat; operator: also run it. <user> may be
+                                                   a service account's id: never more than its owner can do
   botctl bot revoke <bot> <user>
 
   botctl policy [<bot>]                            Show the global or a Bot's policy
