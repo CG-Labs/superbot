@@ -36,6 +36,8 @@ Acme (corp): ready
   Encrypted assertions:     off
   Signs AuthnRequests:      no
   Single logout:            yes
+  Back-channel logout:      from the IdP only (its metadata has no SOAP SingleLogoutService)
+    SOAP SLO URL:            https://superbot.example.com/api/auth/sso/corp/slo/soap
   IdP-initiated sign-in:    refused (start from SuperBot)
   Authentication context:   not checked (the IdP's MFA isn't required)
   IdP metadata from url (https://acme.okta.example/app/exk1abc/sso/saml/metadata):
@@ -305,10 +307,19 @@ SSO_CORP_METADATA_SIGNING_CERT_FILE=/etc/superbot/corp-idp-metadata.pem
 
 When the IdP's metadata has an HTTP-Redirect `SingleLogoutService` on https, botd does single logout over the browser:
 
-- **Signing out of SuperBot** ends the SuperBot session, then takes the browser to the IdP with a signed LogoutRequest, which ends the IdP session too and comes back to the sign-in page. Only browser sessions do this; the phone app and `botctl` end their own session only.
+- **Signing out of SuperBot** ends the SuperBot session, then takes the browser to the IdP with a signed LogoutRequest, which ends the IdP session too and comes back to the sign-in page. The phone app and `botctl` have no browser to send, so they use the [back channel](#back-channel-soap-logout) when the IdP offers one, and otherwise end their own session only.
 - **Signing out at the IdP** (or the IdP ending the session) sends SuperBot a signed LogoutRequest at the SLO URL. botd revokes the SuperBot sessions that IdP session made (or all of that person's sessions from this IdP if it names none), audits `auth.slo` with the sessions revoked, and answers with a signed LogoutResponse.
 
-At the IdP, set the **logout URL** (single logout URL, SLO endpoint) to the SLO URL `botctl` shows, HTTP-Redirect or HTTP-POST, and give it the SP certificate to check our requests (Okta: **Enable Single Logout** and upload the **Signature Certificate**; Entra ID: **Logout Url (Optional)** under **Basic SAML Configuration**). Then refresh or import the IdP's metadata so botd sees its logout URL; `botctl sso saml corp` says `Single logout: yes`. Back-channel (SOAP) logout isn't supported.
+At the IdP, set the **logout URL** (single logout URL, SLO endpoint) to the SLO URL `botctl` shows, HTTP-Redirect or HTTP-POST, and give it the SP certificate to check our requests (Okta: **Enable Single Logout** and upload the **Signature Certificate**; Entra ID: **Logout Url (Optional)** under **Basic SAML Configuration**). Then refresh or import the IdP's metadata so botd sees its logout URL; `botctl sso saml corp` says `Single logout: yes`.
+
+### Back-channel (SOAP) logout
+
+Some IdPs (Shibboleth, PingFederate, some ADFS setups) end sessions server to server, with no browser: the SAML SOAP binding ([ADR 0208](../adr/0208-saml-back-channel-soap-logout.md)). botd does both directions, with nothing to turn on:
+
+- **From the IdP.** SuperBot's metadata lists a SOAP `SingleLogoutService` at the SOAP SLO URL `botctl` shows (`…/slo/soap`), after the browser ones, so IdPs that pick by order keep using the browser. The IdP POSTs a signed LogoutRequest there; botd revokes the sessions as above, audits `auth.slo` with `binding` = `soap`, and answers with a signed LogoutResponse. The request must be signed (botd sits behind a proxy, so it can't use TLS client certificates instead), and its `Destination` must be the SOAP SLO URL.
+- **To the IdP.** When the IdP's metadata has a SOAP `SingleLogoutService` on https, signing out of SuperBot from the phone app or `botctl` sends it a signed LogoutRequest from botd, so the IdP session ends too. A browser uses it only if the IdP has no browser logout URL. botd doesn't wait for the answer to end the session; it audits it as `auth.slo_response` with `binding` = `soap` (and a `reason` when the IdP didn't confirm). The IdP may sign its answer or not (botd reached it over https at the address in its metadata), but a signature must be the IdP's.
+
+Re-import SuperBot's metadata at the IdP so it sees the SOAP endpoint. Shibboleth signs back-channel logout requests only to port 443, so serve SuperBot on 443, or set Shibboleth's `signRequests` for SuperBot's relying party. `botctl sso saml corp` shows `Back-channel logout: from the IdP, and to it` once the IdP's metadata has a SOAP logout URL.
 
 ## Require MFA at the IdP
 
@@ -375,17 +386,20 @@ Every refused sign-in is in the audit log with a reason (`botctl audit --action 
 | `not_in_group` | `SSO_<ID>_REQUIRED_GROUPS` is set and the assertion lists none of them. Check the name or id (exact, case included) and that the IdP sends the attribute `GROUPS_ATTRIBUTE` names. |
 | `groups_unknown` | The IdP couldn't list the groups: `groups` = `overage` (Entra ID: send only groups assigned to the application) or `too_many` (over 500). |
 
-Refused logout messages are audited as `auth.slo_failed` (`botctl audit --action auth.slo_failed`), and the browser sees a short error. Those before the signature check (including `not_ready` and `no_slo`) are throttled the same way.
+Refused logout messages are audited as `auth.slo_failed` (`botctl audit --action auth.slo_failed`, `binding` = `soap` for the back channel), and the browser sees a short error; the back channel gets a SOAP fault with the reason. Those before the signature check (including `not_ready`, `no_slo` and `must_understand`) are throttled the same way.
 
 | Reason | Fix |
 |--------|-----|
 | `unsigned`, `bad_signature` | The IdP must sign logout messages with a certificate in its metadata: refresh or import it. |
 | `wrong_issuer` | The message came from another entity than `SSO_<ID>_IDP_ENTITY_ID`. |
-| `wrong_destination` | The IdP's logout URL for SuperBot isn't the SLO URL botctl shows, or it sends no `Destination`. |
+| `wrong_destination` | The IdP's logout URL for SuperBot isn't the SLO URL botctl shows (the SOAP SLO URL for the back channel), or it sends no `Destination`. |
+| `must_understand` | The IdP's SOAP envelope has a header botd must understand to answer: send none. |
 | `expired`, `not_yet_valid` | The message is older than five minutes, or clocks differ by more than two: fix NTP. |
 | `replayed` | The same message arrived twice. |
 | `unknown_request` | A LogoutResponse to a request botd didn't send, or sent over 10 minutes ago. |
 | `encrypted_id` | The IdP encrypts the NameID: set `SSO_<ID>_ENCRYPTED_ASSERTIONS=allow` ([above](#encrypted-assertions)). |
 | `bad_encryption` | The NameID is encrypted to another certificate: give the IdP SuperBot's encryption certificate. |
 | `no_slo` | The IdP's metadata in use has no HTTP-Redirect `SingleLogoutService` on https. |
-| `bad_message` | Not a SAML logout message botd can read. |
+| `bad_message` | Not a SAML logout message botd can read (over SOAP: not a SOAP 1.1 envelope with one LogoutRequest in its body). |
+
+When botd's own back-channel request fails, `auth.slo_response` is a failure with a `reason`: `unreachable` (botd couldn't reach the IdP's SOAP logout URL), `http_error` (`detail` has the HTTP status), `soap_fault` (the IdP refused it), or one of the reasons above for its answer. An IdP that answers but couldn't end every session gives its SAML `status` instead (say, `…:PartialLogout`). The SuperBot session is ended either way; end the IdP session there if you need to.
