@@ -11,7 +11,7 @@ One KV v2 secret per name, with the value in the field `value`:
 | `secret/superbot/bots/<NAME>` | Server-wide keys for Bots: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`, ... | Yes, at the start of each run |
 | `secret/superbot/server/<NAME>` | botd's own: `LINODE_TOKEN`, `INCUS_CLIENT_KEY`, `SSO_<ID>_CLIENT_SECRET`, `SMTP_PASSWORD`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `TURNSTILE_SECRET`, `METRICS_TOKEN`, `AUDIT_EXPORT_HEADERS`, backup store keys, ... | Never |
 
-A name in the wrong folder is ignored. `AUTH_PASSWORD`, `SUPERBOT_MASTER_KEY` and the Vault credentials stay in `.env`: botd needs them before it can reach Vault. Per-user secrets stay in botd's sealed store for now.
+A name in the wrong folder is ignored. `AUTH_PASSWORD`, `SUPERBOT_MASTER_KEY` and the Vault credentials stay in `.env`: botd needs them before it can reach Vault. Each user's own secrets can be in Vault too: see [each user's own secrets](#each-users-own-secrets).
 
 Order: a value in botd's environment wins, then Vault, then the sealed store (`botctl secret set`). `botctl secrets` shows where each name comes from and what it shadows.
 
@@ -138,6 +138,30 @@ VAULT_AUTH_NAMESPACE=admin        # where auth/kubernetes is
 The startup line, `botctl secrets backend` and the setup report say how botd logs in, for example `Kubernetes login as role superbot at auth/kubernetes with the token in /var/run/secrets/vault/token in namespace admin`. Logins are audited as `secret.vault_login` with `method`, `role` and `namespace`, and never the JWT or Vault's token. Bots never get the token file: `VAULT_JWT_FILE` and `VAULT_KUBERNETES_TOKEN_FILE` are removed from everything botd starts. But a Bot that runs locally can still open the file itself. If it runs as botd's own user, it can always read it. If it runs as a locked-down run user ([ADR 0145](../adr/0145-locked-down-run-users-and-red-team.md)), it can read the file unless only botd's user may (above). The same holds for `VAULT_JWT_FILE`: make it `0400` and owned by botd, or run Bots on their own machines.
 
 When a login fails, botd logs the status (`Kubernetes login at auth/kubernetes answered 403 Forbidden`). Vault's own log, or its audit device, has the reason: a role bound to another service account or namespace, the wrong audience, or a cluster Vault can't reach for TokenReview.
+
+## Each user's own secrets
+
+Off by default ([ADR 0174](../adr/0174-users-secrets-in-the-external-store.md)). With `SECRETS_USER_FOLDERS=1`, botd also reads `secret/superbot/users/<user id>/<NAME>`, and gives those values only to Bots that user owns:
+
+```sh
+botctl users                                          # each user's id, e.g. u1a2b3c4d
+vault kv put secret/superbot/users/u1a2b3c4d/ANTHROPIC_API_KEY value=@ada-anthropic.key
+```
+
+```sh
+# .env
+SECRETS_USER_FOLDERS=1
+```
+
+The policy above already covers `superbot/users/*`. Who may write each folder is up to your own Vault policies and tooling: botd only reads.
+
+- **Order** for a user's Bots: their Vault folder, then what they saved in the app (Your secrets), then the server-wide secrets. Another user's folder is never read.
+- **Which names**: only names a user may save. Reserved names and botd's own (`LINODE_TOKEN`, `SSO_*`, ...) are ignored there. Ids are lowercase letters and digits; a user whose id has anything else gets no folder.
+- **In the app** the user sees each name as set by an admin in HashiCorp Vault, with no way to replace it. A copy they saved before can still be deleted.
+- **Cache, outages and audit** are as for the shared folders. A run whose owner's folder can't be read is refused (`secrets_unavailable`); reads are `secret.read` with `scope: users` and `userId`. Values are redacted from that user's Bots.
+- **When someone leaves**: deleting the user in botd drops what they saved in the app, not their Vault folder. Delete it with `vault kv metadata delete` for each name.
+
+`botctl secrets backend` and the startup line say whether user folders are on. They check only the shared folders.
 
 ## Day to day
 
