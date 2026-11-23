@@ -51,6 +51,8 @@ struct Mode {
     tls: bool,
     /// With `tls`: a client certificate from the fake's own CA is required.
     client_cert: bool,
+    /// Blob downloads redirect to the same fake under another host name, as to blob storage.
+    blob_elsewhere: bool,
 }
 
 struct Fake {
@@ -120,7 +122,8 @@ async fn handle(State(f): State<Arc<Fake>>, method: Method, uri: Uri, headers: H
         let want = format!("Basic {}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, format!("{}:{}", LOGIN.0, LOGIN.1)));
         return if auth == want { reply(StatusCode::OK, &[], json!({ "token": TOKEN }).to_string().into_bytes()) } else { reply(StatusCode::UNAUTHORIZED, &[], vec![]) };
     }
-    let elsewhere = format!("http://localhost:{}", f.addr.rsplit_once(':').unwrap().1);
+    let elsewhere = format!("{}://localhost:{}", if f.mode.tls { "https" } else { "http" }, f.addr.rsplit_once(':').unwrap().1);
+    let came_elsewhere = headers.get("host").and_then(|v| v.to_str().ok()).is_some_and(|h| h.starts_with("localhost"));
     let signed_upload = f.mode.upload_elsewhere && method == Method::PUT && path.contains("/blobs/uploads/") && uri.query().unwrap_or_default().contains("state=x");
     if f.mode.login && auth != format!("Bearer {TOKEN}") && !signed_upload {
         let challenge = format!(r#"Bearer realm="http://{}/token",service="fake",scope="repository:x:pull""#, f.addr);
@@ -219,6 +222,9 @@ async fn handle(State(f): State<Arc<Fake>>, method: Method, uri: Uri, headers: H
         return reply(StatusCode::OK, &h, index.to_string().into_bytes());
     }
     if let Some((_, digest)) = rest.rsplit_once("/blobs/") {
+        if f.mode.blob_elsewhere && method == Method::GET && !came_elsewhere {
+            return reply(StatusCode::TEMPORARY_REDIRECT, &[("location", format!("{elsewhere}{path}"))], vec![]);
+        }
         return match s.blobs.get(digest) {
             Some(b) => reply(StatusCode::OK, &[], if method == Method::HEAD { vec![] } else { b.clone() }),
             None => reply(StatusCode::NOT_FOUND, &[], vec![]),
@@ -838,6 +844,44 @@ async fn a_registry_that_wants_a_client_certificate_gets_the_one_in_certs_d() {
     std::fs::write(host.join("client.key"), key).unwrap();
     let got = fetch::fetch(&cfg, &repo(&src, REPO), &p.index, &p.arm64, &tmp("mtls").join("o")).await.unwrap();
     assert_eq!((got.referrers, got.attestations), (5, 1), "client.cert and client.key from certs.d/HOST, as skopeo uses them");
+}
+
+/// certs.d with each fake's client certificate under its address.
+fn certs_d(regs: &[&Fake]) -> PathBuf {
+    let d = tmp("certs.d");
+    for r in regs {
+        let (cert, key) = r.client.clone().unwrap();
+        std::fs::create_dir_all(d.join(&r.addr)).unwrap();
+        std::fs::write(d.join(&r.addr).join("client.cert"), cert).unwrap();
+        std::fs::write(d.join(&r.addr).join("client.key"), key).unwrap();
+    }
+    d
+}
+
+#[tokio::test]
+async fn the_client_certificate_goes_to_the_registry_alone() {
+    let plain = serve(Mode { blob_elsewhere: true, ..Mode::default() }).await;
+    let p = publish(&plain, false);
+    let got = fetch::fetch(&cfg_for(&plain), &repo(&plain, REPO), &p.index, &p.arm64, &tmp("redir").join("o")).await.unwrap();
+    assert_eq!((got.referrers, got.attestations), (5, 1), "blob downloads redirected to another host are followed");
+
+    // Every fake here wants a client certificate on every host name, so a request that reaches
+    // `localhost` without one fails: that is how these show it isn't sent there.
+    let src = serve(Mode { tls: true, client_cert: true, blob_elsewhere: true, ..Mode::default() }).await;
+    let p = publish(&src, false);
+    let cfg = Settings { cert_dirs: vec![certs_d(&[&src])], ..cfg_for(&src) };
+    let e = fetch::fetch(&cfg, &repo(&src, REPO), &p.index, &p.arm64, &tmp("redir").join("o")).await.unwrap_err();
+    assert!(e.contains("https://localhost:"), "a redirect off the registry's host gets no certificate: {e}");
+
+    let src = serve(Mode::default()).await;
+    let p = publish(&src, false);
+    let mirror = serve(Mode { tls: true, client_cert: true, ..Mode::default() }).await;
+    let away = serve(Mode { tls: true, client_cert: true, upload_elsewhere: true, ..Mode::default() }).await;
+    let cfg = Settings { cert_dirs: vec![certs_d(&[&mirror, &away])], ..settings(&[&src, &mirror, &away], None) };
+    let units = [unit(&src, &p, &p.amd64, &cfg).await, unit(&src, &p, &p.arm64, &cfg).await];
+    assert_eq!(push::push(&cfg, &repo(&mirror, "m/app"), "1", &units, false).await.unwrap(), p.index, "the mirror gets it");
+    let e = push::push(&cfg, &repo(&away, "m/app"), "1", &units, false).await.unwrap_err();
+    assert!(e.contains("https://localhost:"), "an upload address on another host gets no certificate: {e}");
 }
 
 #[tokio::test]

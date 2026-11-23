@@ -81,6 +81,11 @@ impl Repo {
     }
 }
 
+/// Whether URL is on HOST (with its port, if it names one), whatever its scheme.
+fn same_host(url: &url::Url, host: &str) -> bool {
+    url::Url::parse(&format!("{}://{host}", url.scheme())).is_ok_and(|h| h.host_str() == url.host_str() && h.port_or_known_default() == url.port_or_known_default())
+}
+
 /// Splits `Bearer realm="a",service="b"` into its scheme and parameters.
 pub fn parse_challenge(h: &str) -> (String, Vec<(String, String)>) {
     let h = h.trim();
@@ -146,7 +151,11 @@ pub enum Body<'a> {
 }
 
 pub struct Client {
+    /// For the registry itself: with its client certificate, following redirects on its own
+    /// host only.
     http: reqwest::Client,
+    /// For anywhere else it sends us (an upload address, a redirect): without the certificate.
+    elsewhere: reqwest::Client,
     base: String,
     pub repo: Repo,
     push: bool,
@@ -162,26 +171,32 @@ pub struct Put {
 
 impl Client {
     pub async fn new(settings: &Settings, repo: &Repo, push: bool) -> Result<Client, String> {
-        let mut b = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(30)).user_agent(concat!("superbot-oci/", env!("CARGO_PKG_VERSION")));
         let mut certs = Vec::new();
         for (path, pem) in settings.ca_pems(&repo.host) {
             certs.push(reqwest::Certificate::from_pem(&pem).map_err(|e| format!("{}: {e}", path.display()))?);
         }
-        if !certs.is_empty() {
-            b = b.tls_certs_merge(certs);
-        }
-        if let Some((path, pem)) = settings.client_pem(&repo.host)? {
-            b = b.identity(reqwest::Identity::from_pem(&pem).map_err(|e| format!("{}: {e}", path.display()))?);
-        }
         // As containers/image: an insecure registry's certificate isn't checked, and plain HTTP
         // is tried only if HTTPS doesn't answer at all.
         let insecure = settings.insecure(&repo.host, &repo.path);
-        if insecure {
-            b = b.tls_danger_accept_invalid_certs(true);
+        let builder = || {
+            let mut b = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(30)).user_agent(concat!("superbot-oci/", env!("CARGO_PKG_VERSION")));
+            if !certs.is_empty() {
+                b = b.tls_certs_merge(certs.clone());
+            }
+            b.tls_danger_accept_invalid_certs(insecure)
+        };
+        let elsewhere = builder().build().map_err(|e| e.to_string())?;
+        let mut b = builder();
+        if let Some((path, pem)) = settings.client_pem(&repo.host)? {
+            b = b.identity(reqwest::Identity::from_pem(&pem).map_err(|e| format!("{}: {e}", path.display()))?);
         }
-        let http = b.build().map_err(|e| e.to_string())?;
+        let me = repo.api_host().to_string();
+        let http = b
+            .redirect(reqwest::redirect::Policy::custom(move |a| if same_host(a.url(), &me) && a.previous().len() < 10 { a.follow() } else { a.stop() }))
+            .build()
+            .map_err(|e| e.to_string())?;
         let creds = settings.credentials(&repo.host, &repo.path)?;
-        let mut c = Client { http, base: format!("https://{}", repo.api_host()), repo: repo.clone(), push, creds, authz: Mutex::new(None) };
+        let mut c = Client { http, elsewhere, base: format!("https://{}", repo.api_host()), repo: repo.clone(), push, creds, authz: Mutex::new(None) };
         if insecure && c.http.get(format!("{}/v2/", c.base)).send().await.is_err() {
             c.base = format!("http://{}", repo.api_host());
         }
@@ -216,33 +231,50 @@ impl Client {
 
     async fn send(&self, method: Method, url: &str, headers: &[(reqwest::header::HeaderName, String)], body: &Body<'_>) -> Result<reqwest::Response, String> {
         for attempt in 0..2 {
-            let mut rb = self.http.request(method.clone(), url);
-            for (k, v) in headers {
-                rb = rb.header(k, v);
-            }
-            if self.ours(url)
-                && let Some(a) = self.authz.lock().unwrap().clone()
-            {
-                rb = rb.header(AUTHORIZATION, a);
-            }
-            rb = match body {
-                Body::Empty => rb,
-                Body::Bytes(b, t) => rb.header(CONTENT_TYPE, *t).body(b.to_vec()),
-                Body::File(p) => {
-                    let f = tokio::fs::File::open(p).await.map_err(|e| format!("{}: {e}", p.display()))?;
-                    let len = f.metadata().await.map_err(|e| format!("{}: {e}", p.display()))?.len();
-                    rb.header(CONTENT_TYPE, "application/octet-stream").header(CONTENT_LENGTH, len).body(reqwest::Body::from(f))
-                }
-            };
-            let res = rb.send().await.map_err(|e| format!("{} {url}: {}", method, chain(&e)))?;
+            let res = self.request(method.clone(), url, headers, body).await?;
             if res.status() == StatusCode::UNAUTHORIZED && attempt == 0 && self.ours(url) {
                 let challenge = res.headers().get(WWW_AUTHENTICATE).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
                 self.authenticate(&challenge).await?;
                 continue;
             }
-            return Ok(res);
+            if !self.ours(url) || !matches!(res.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                return Ok(res);
+            }
+            // A redirect off the registry's host (blob storage, say): followed without its
+            // client certificate, as a browser would follow it, keeping the method for 307/308.
+            let Some(loc) = res.headers().get(LOCATION).and_then(|v| v.to_str().ok()) else { return Ok(res) };
+            let next = url::Url::parse(url).and_then(|u| u.join(loc)).map_err(|e| format!("{}'s redirect {loc}: {e}", self.repo.host))?;
+            if !matches!(next.scheme(), "https" | "http") {
+                return Err(format!("{} redirected to {next}: refusing it", self.repo.host));
+            }
+            return match res.status().as_u16() {
+                307 | 308 => self.request(method, next.as_str(), headers, body).await,
+                _ => self.request(Method::GET, next.as_str(), headers, &Body::Empty).await,
+            };
         }
         unreachable!()
+    }
+
+    /// One request: to the registry with its login and client certificate, elsewhere with neither.
+    async fn request(&self, method: Method, url: &str, headers: &[(reqwest::header::HeaderName, String)], body: &Body<'_>) -> Result<reqwest::Response, String> {
+        let ours = self.ours(url);
+        let mut rb = if ours { &self.http } else { &self.elsewhere }.request(method.clone(), url);
+        for (k, v) in headers {
+            rb = rb.header(k, v);
+        }
+        if ours && let Some(a) = self.authz.lock().unwrap().clone() {
+            rb = rb.header(AUTHORIZATION, a);
+        }
+        rb = match body {
+            Body::Empty => rb,
+            Body::Bytes(b, t) => rb.header(CONTENT_TYPE, *t).body(b.to_vec()),
+            Body::File(p) => {
+                let f = tokio::fs::File::open(p).await.map_err(|e| format!("{}: {e}", p.display()))?;
+                let len = f.metadata().await.map_err(|e| format!("{}: {e}", p.display()))?.len();
+                rb.header(CONTENT_TYPE, "application/octet-stream").header(CONTENT_LENGTH, len).body(reqwest::Body::from(f))
+            }
+        };
+        rb.send().await.map_err(|e| format!("{} {url}: {}", method, chain(&e)))
     }
 
     async fn authenticate(&self, challenge: &str) -> Result<(), String> {
