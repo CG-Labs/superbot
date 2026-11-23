@@ -1465,6 +1465,8 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
         let Some(app) = a.app.as_ref().filter(|_| p.sp_cert_for(u).is_none()) else { return };
         let Ok(h) = saml_keys::held(app, p, u) else { return };
         let now = db::now();
+        // From the same keys as the rest, should a promotion land between the two reads.
+        v["certificate"] = cert(&h.current.info);
         v["next"] = saml_keys::view(&h, u, Stage::Next, now, cert);
         if u == KeyUse::Encryption {
             v["previous"] = saml_keys::view(&h, u, Stage::Previous, now, cert);
