@@ -14,6 +14,9 @@ pub const BUCKET: &str = "backups";
 pub const ACCESS_KEY: &str = "AKIDSTANDIN";
 pub const SECRET: &str = "standin-secret-key-0123456789";
 
+/// One version's size, `x-amz-meta-*` headers and lock.
+pub type Stored = (usize, Vec<(String, String)>, Option<(String, String)>);
+
 /// An unfinished multipart upload: its key, when it began, and its parts.
 type Unfinished = (String, i64, BTreeMap<u32, Vec<u8>>);
 
@@ -33,6 +36,16 @@ pub struct World {
     /// Old versions and delete markers, `(key, version id, is a marker)`. Current objects
     /// are listed as version `current`.
     pub old: Vec<(String, String, bool)>,
+    /// The bucket's Object Lock configuration (`GET ?object-lock`), if it has one.
+    pub object_lock: Option<String>,
+    /// Takes the lock headers and keeps nothing, as a store without Object Lock might.
+    pub ignore_lock: bool,
+    /// Each current object's lock: `(mode, retain until)`.
+    pub locks: BTreeMap<String, (String, String)>,
+    /// Each current object's `x-amz-meta-*` headers and its version id.
+    pub meta: BTreeMap<String, (Vec<(String, String)>, String)>,
+    /// Every version written with a checksum: `(key, version)` to its size, metadata and lock.
+    pub versions: BTreeMap<(String, String), Stored>,
     next: u32,
 }
 
@@ -167,6 +180,10 @@ async fn handle(State(world): State<Arc<Mutex<World>>>, method: Method, uri: Uri
             out.push_str("</ListMultipartUploadsResult>");
             xml(StatusCode::OK, out)
         }
+        ("GET", true) if query.contains_key("object-lock") => match w.object_lock.clone() {
+            Some(c) => xml(StatusCode::OK, c),
+            None => error(StatusCode::NOT_FOUND, "ObjectLockConfigurationNotFoundError"),
+        },
         ("GET", true) if query.contains_key("versioning") => {
             let status = w.versioning.map(|s| format!("<Status>{s}</Status>")).unwrap_or_default();
             xml(StatusCode::OK, format!("<VersioningConfiguration>{status}</VersioningConfiguration>"))
@@ -209,6 +226,56 @@ async fn handle(State(world): State<Arc<Mutex<World>>>, method: Method, uri: Uri
             out.push_str("</ListBucketResult>");
             xml(StatusCode::OK, out)
         }
+        ("HEAD", false) => match query.get("versionId").cloned().or_else(|| w.meta.get(&key).map(|(_, v)| v.clone())).and_then(|v| w.versions.get(&(key.clone(), v.clone())).map(|s| (v, s.clone()))) {
+            Some((version, (size, meta, lock))) => {
+                let mut h = vec![("content-length".to_string(), size.to_string()), ("x-amz-version-id".to_string(), version)];
+                h.extend(meta);
+                if let Some((mode, until)) = lock {
+                    h.push(("x-amz-object-lock-mode".into(), mode));
+                    h.push(("x-amz-object-lock-retain-until-date".into(), until));
+                }
+                let mut res = StatusCode::OK.into_response();
+                for (k, v) in h {
+                    res.headers_mut().insert(axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+                }
+                res
+            }
+            None => StatusCode::NOT_FOUND.into_response(),
+        },
+        ("PUT", false) if headers.contains_key("x-amz-checksum-sha256") || headers.contains_key("x-amz-object-lock-mode") => {
+            use base64::Engine;
+            let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(String::from);
+            let sum = base64::engine::general_purpose::STANDARD.encode(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &body).as_ref());
+            if h("x-amz-checksum-sha256").as_deref() != Some(sum.as_str()) {
+                return error(StatusCode::BAD_REQUEST, "BadDigest");
+            }
+            let lock = match (w.object_lock.clone(), h("x-amz-object-lock-mode"), h("x-amz-object-lock-retain-until-date")) {
+                _ if w.ignore_lock => None,
+                (Some(_), Some(mode), Some(until)) => Some((mode, until)),
+                (Some(c), None, None) => match (s3::tag(&c, "Mode"), s3::tag(&c, "Days").and_then(|d| d.parse::<i64>().ok())) {
+                    (Some(mode), Some(days)) => Some((mode, (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true))),
+                    _ => None,
+                },
+                (None, Some(_), _) => return error(StatusCode::BAD_REQUEST, "InvalidRequest"),
+                _ => None,
+            };
+            w.keep(&key, false);
+            w.next += 1;
+            let version = format!("v{}", w.next);
+            let meta: Vec<(String, String)> = headers.iter().filter(|(k, _)| k.as_str().starts_with("x-amz-meta-")).map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_string())).collect();
+            w.versions.insert((key.clone(), version.clone()), (body.len(), meta.clone(), lock.clone()));
+            w.meta.insert(key.clone(), (meta, version.clone()));
+            match lock {
+                Some(l) => w.locks.insert(key.clone(), l),
+                None => w.locks.remove(&key),
+            };
+            w.objects.insert(key, body.to_vec());
+            let mut res = StatusCode::OK.into_response();
+            if w.versioning == Some("Enabled") {
+                res.headers_mut().insert("x-amz-version-id", version.parse().unwrap());
+            }
+            res
+        }
         ("PUT", false) => match (query.get("partNumber"), query.get("uploadId")) {
             (Some(n), Some(id)) => {
                 let Some((_, _, parts)) = w.uploads.get_mut(id) else { return error(StatusCode::NOT_FOUND, "NoSuchUpload") };
@@ -250,6 +317,10 @@ async fn handle(State(world): State<Arc<Mutex<World>>>, method: Method, uri: Uri
         }
         ("DELETE", false) if query.contains_key("versionId") => {
             let v = &query["versionId"];
+            let locked = w.versions.get(&(key.clone(), v.clone())).is_some_and(|(_, _, l)| l.is_some());
+            if locked || (v == "current" && w.locks.contains_key(&key)) {
+                return error(StatusCode::FORBIDDEN, "AccessDenied");
+            }
             if v == "current" {
                 w.objects.remove(&key);
             } else {
@@ -357,6 +428,29 @@ mod tests {
         c.delete_version("p/a", "gone").await.unwrap();
         s.w().versioning = Some("Suspended");
         assert!(c.versioned().await.unwrap(), "suspended still keeps what it kept");
+    }
+
+    #[tokio::test]
+    async fn each_locked_version_keeps_its_own_lock() {
+        let s = StandIn::start().await;
+        s.w().versioning = Some("Enabled");
+        s.w().object_lock = Some("<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>".into());
+        let c = S3::new(s.settings()).unwrap();
+        let put = |body: &'static [u8], until: &'static str| {
+            use base64::Engine;
+            let sum = base64::engine::general_purpose::STANDARD.encode(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, body).as_ref());
+            let c = &c;
+            async move {
+                let h = [("x-amz-checksum-sha256", sum), ("x-amz-object-lock-mode", "GOVERNANCE".to_string()), ("x-amz-object-lock-retain-until-date", until.to_string())];
+                c.put_with("a/x", body.to_vec(), &h).await.unwrap().get("x-amz-version-id").unwrap().to_str().unwrap().to_string()
+            }
+        };
+        let first = put(b"one", "2030-01-01T00:00:00Z").await;
+        let second = put(b"three", "2031-01-01T00:00:00Z").await;
+        let h = c.head("a/x", Some(&first)).await.unwrap();
+        assert_eq!((h["content-length"].to_str().unwrap(), h["x-amz-object-lock-retain-until-date"].to_str().unwrap()), ("3", "2030-01-01T00:00:00Z"));
+        assert_eq!(c.head("a/x", None).await.unwrap()["x-amz-version-id"].to_str().unwrap(), second);
+        assert!(c.delete_version("a/x", &first).await.unwrap_err().contains("AccessDenied"), "the older version is locked too");
     }
 
     #[tokio::test]

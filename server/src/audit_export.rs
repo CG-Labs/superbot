@@ -6,6 +6,8 @@
 //! - `syslog+tls://<host>[:6514]`: syslog (RFC 5424) over TLS (RFC 5425), one event a
 //!   message, the JSON line as its text.
 //! - Plain `http://` and `syslog+tcp://` to loopback, or with `AUDIT_EXPORT_INSECURE=on`.
+//! - `s3://<bucket>[/<prefix>]`: batches as JSON-lines objects in an S3-compatible
+//!   store, each locked with S3 Object Lock ([`crate::audit_archive`], ADR 0154).
 //!
 //! Off unless `AUDIT_EXPORT` is set. Delivery is at least once, in id order: a cursor
 //! in the database (per sink) moves only when a batch is accepted, a failed batch is
@@ -39,6 +41,7 @@ const FACILITY: u8 = 13;
 enum Kind {
     Webhook { url: String, plain: bool, headers: Vec<(String, secrets::Secret)> },
     Syslog { host: String, port: u16, tls: bool },
+    Archive(Box<crate::audit_archive::Archive>),
 }
 
 pub struct Sink {
@@ -60,11 +63,28 @@ impl Sink {
         match self.kind {
             Kind::Webhook { .. } => "webhook",
             Kind::Syslog { .. } => "syslog",
+            Kind::Archive(_) => "s3",
         }
     }
 
+    fn archive(&self) -> Option<&crate::audit_archive::Archive> {
+        match &self.kind {
+            Kind::Archive(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// Events a batch takes at most.
+    fn batch(&self) -> i64 {
+        if self.archive().is_some() { crate::audit_archive::MAX_EVENTS } else { BATCH }
+    }
+
+    fn from_archive(a: crate::audit_archive::Archive) -> Sink {
+        Sink { shown: a.shown(), id: a.id(), kind: Kind::Archive(Box::new(a)) }
+    }
+
     pub fn parse(raw: &str, insecure: bool) -> Result<Sink, String> {
-        let bad = |why: &str| format!("AUDIT_EXPORT must be https://<host>/<path> or syslog+tls://<host>[:<port>]: {why}");
+        let bad = |why: &str| format!("AUDIT_EXPORT must be https://<host>/<path>, syslog+tls://<host>[:<port>] or s3://<bucket>[/<prefix>]: {why}");
         let u = url::Url::parse(raw.trim()).map_err(|_| bad("it isn't a URL"))?;
         let host = u.host_str().filter(|h| !h.is_empty()).ok_or_else(|| bad("no host"))?.to_string();
         let loopback = matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]");
@@ -92,12 +112,13 @@ impl Sink {
                 let host = host.trim_start_matches('[').trim_end_matches(']').to_string();
                 (Kind::Syslog { host, port, tls }, Some(port))
             }
-            _ => return Err(bad("use https, syslog+tls or syslog+tcp")),
+            _ => return Err(bad("use https, syslog+tls, syslog+tcp or s3")),
         };
         let port = port.map(|p| format!(":{p}")).unwrap_or_default();
         let (shown, id) = match &kind {
             Kind::Webhook { .. } => (format!("{}://{host}{port}", u.scheme()), format!("{}://{host}{port}{}", u.scheme(), u.path())),
             Kind::Syslog { .. } => (format!("{}://{host}{port}", u.scheme()), format!("{}://{host}{port}", u.scheme())),
+            Kind::Archive(_) => unreachable!("s3:// sinks are read with their settings"),
         };
         Ok(Sink { kind, shown, id })
     }
@@ -131,6 +152,12 @@ impl Settings {
         };
         let sink = match get("AUDIT_EXPORT").trim() {
             "" | "off" => None,
+            v if v.to_ascii_lowercase().starts_with("s3://") => {
+                if store.get("AUDIT_EXPORT_HEADERS").map_err(|e| e.to_string())?.is_some() {
+                    return Err("AUDIT_EXPORT_HEADERS is for an https sink; the S3 archive signs with AUDIT_EXPORT_S3_ACCESS_KEY_ID and _SECRET_ACCESS_KEY".into());
+                }
+                Some(Sink::from_archive(crate::audit_archive::Archive::from_env(v, get, store)?))
+            }
             v => {
                 let mut sink = Sink::parse(v, insecure)?;
                 // Read only when export is on, so a leftover _FILE doesn't stop botd starting.
@@ -138,7 +165,7 @@ impl Settings {
                 match (&mut sink.kind, headers) {
                     (Kind::Webhook { headers, .. }, Some(h)) => *headers = crate::obs::trace::headers("AUDIT_EXPORT_HEADERS", h.expose())?,
                     (Kind::Syslog { .. }, Some(_)) => return Err("AUDIT_EXPORT_HEADERS is for an https sink; syslog over TLS has no headers".into()),
-                    (_, None) => {}
+                    (_, _) => {}
                 }
                 Some(sink)
             }
@@ -156,6 +183,7 @@ impl Settings {
                     }
                     Kind::Syslog { tls: true, .. } => "as RFC 5424 syslog over TLS".into(),
                     Kind::Syslog { .. } => "as RFC 5424 syslog over plain TCP".into(),
+                    Kind::Archive(a) => a.describe(),
                 };
                 format!("every audit event to {} {how}, resuming where it left off", s.shown)
             }
@@ -170,6 +198,8 @@ struct State {
     failures: u32,
     failing_since: Option<i64>,
     last_error: Option<String>,
+    /// The archive's last object (ADR 0154).
+    archived: Option<Value>,
 }
 
 /// The running export: its sink and how far it got.
@@ -203,6 +233,10 @@ impl Exporter {
         was
     }
 
+    fn archived(&self, object: Value) {
+        self.state().archived = Some(object);
+    }
+
     /// True on the try that makes it count as failing.
     fn failed(&self, error: &str) -> bool {
         let mut s = self.state();
@@ -218,7 +252,7 @@ impl Exporter {
     /// `GET /api/audit/siem` and `botctl audit siem`.
     pub fn view(&self, head: i64) -> Value {
         let s = self.state();
-        json!({
+        let mut v = json!({
             "enabled": true,
             "kind": self.sink.kind(),
             "sink": self.sink.shown,
@@ -229,7 +263,11 @@ impl Exporter {
             "failingSince": s.failing_since,
             "failedTries": s.failures,
             "lastError": s.last_error,
-        })
+        });
+        if let Some(a) = self.sink.archive() {
+            v["archive"] = a.view(s.archived.as_ref());
+        }
+        v
     }
 }
 
@@ -257,23 +295,52 @@ async fn run(app: Arc<App>, x: Arc<Exporter>) {
     let mut out = Out::new(&x.sink);
     let host = hostname();
     let mut wait = FIRST_RETRY;
+    // The archive sends a batch as it was first cut, across retries and restarts, so a
+    // retry writes the same object. The batch's last id is saved before its first try.
+    let batch_key = format!("{}#batch", x.sink.id);
+    let mut retry_to: Option<i64> = x.sink.archive().and_then(|_| app.db.audit_export_cursor(&batch_key)).filter(|&b| b > x.delivered());
     loop {
+        if let Some(a) = x.sink.archive()
+            && retry_to.is_none()
+            && !archive_batch_due(&app, a, x.delivered())
+        {
+            tokio::time::sleep(IDLE).await;
+            continue;
+        }
         // A row that can't be read stops the export there, so it's never skipped.
         // Failures carry a reason code for the audit event beside the message.
-        let rows = app.db.try_audit_events(&Filter { after: Some(x.delivered()), ..Default::default() }, BATCH, true).map_err(|e| ("unreadable", format!("couldn't read the audit log: {e}")));
+        let rows = app.db.try_audit_events(&Filter { after: Some(x.delivered()), ..Default::default() }, x.sink.batch(), true).map_err(|e| ("unreadable", format!("couldn't read the audit log: {e}")));
         let sent = match rows {
-            Ok(rows) => {
+            Ok(mut rows) => {
+                if let Some(to) = retry_to {
+                    rows.retain(|e| e.id <= to);
+                }
                 let Some(last) = rows.last().map(|e| e.id) else {
                     tokio::time::sleep(IDLE).await;
                     continue;
                 };
                 // Delivered only once the cursor is saved; if it can't be, the batch goes again.
                 let extras = crate::audit_checkpoint::export_extras(&app.db, &rows);
-                out.send(&x.sink, &rows, &extras, &host)
-                    .await
-                    .map_err(|e| ("delivery_failed", e))
-                    .and_then(|()| app.db.set_audit_export_cursor(&x.sink.id, last).map_err(|e| ("cursor_unsaved", format!("couldn't save the export cursor: {e}"))))
-                    .map(|()| last)
+                let cut = match x.sink.archive().is_some() && retry_to.is_none() {
+                    true => app.db.set_audit_export_cursor(&batch_key, last).map_err(|e| ("cursor_unsaved", format!("couldn't save the archive's next batch: {e}"))),
+                    false => Ok(()),
+                };
+                let r = match cut {
+                    Ok(()) => out
+                        .send(&x.sink, &rows, &extras, &host)
+                        .await
+                        .and_then(|object| app.db.set_audit_export_cursor(&x.sink.id, last).map(|()| object).map_err(|e| ("cursor_unsaved", format!("couldn't save the export cursor: {e}")))),
+                    Err(e) => Err(e),
+                };
+                if x.sink.archive().is_some() {
+                    retry_to = r.is_err().then_some(last);
+                }
+                r.map(|object| {
+                    if let Some(o) = object {
+                        x.archived(o);
+                    }
+                    last
+                })
             }
             Err(e) => Err(e),
         };
@@ -298,6 +365,23 @@ async fn run(app: Arc<App>, x: Arc<Exporter>) {
                 wait = (wait * 2).min(LAST_RETRY);
             }
         }
+    }
+}
+
+/// Whether the archive's next batch should go now: it is full, or its oldest event has
+/// waited `AUDIT_EXPORT_S3_BATCH_SECONDS`. A row that can't be read is due, so the read
+/// that follows fails on it.
+pub(crate) fn archive_batch_due(app: &App, a: &crate::audit_archive::Archive, delivered: i64) -> bool {
+    let pending = app.db.audit_head() - delivered;
+    if pending <= 0 {
+        return false;
+    }
+    if pending >= crate::audit_archive::MAX_EVENTS {
+        return true;
+    }
+    match app.db.try_audit_events(&Filter { after: Some(delivered), ..Default::default() }, 1, true) {
+        Ok(rows) => rows.first().is_some_and(|e| now() - e.at >= a.batch_ms),
+        Err(_) => true,
     }
 }
 
@@ -360,6 +444,7 @@ impl<T: tokio::io::AsyncWrite + Unpin + Send> Stream for T {}
 enum Out {
     Http(reqwest::Client),
     Syslog { conn: Option<Box<dyn Stream>>, tls: Option<Arc<rustls::ClientConfig>> },
+    Archive(crate::audit_archive::Client),
 }
 
 impl Out {
@@ -369,10 +454,21 @@ impl Out {
                 Out::Http(reqwest::Client::builder().https_only(!plain).timeout(TIMEOUT).redirect(reqwest::redirect::Policy::none()).build().expect("HTTP client"))
             }
             Kind::Syslog { tls, .. } => Out::Syslog { conn: None, tls: tls.then(platform_tls) },
+            Kind::Archive(a) => Out::Archive(crate::audit_archive::Client::new(a)),
         }
     }
 
-    async fn send(&mut self, sink: &Sink, rows: &[AuditEvent], extras: &Extras, host: &str) -> Result<(), String> {
+    /// Sends one batch: the archive's object when it wrote one. Failures carry a reason
+    /// code for `audit.export_failing`.
+    async fn send(&mut self, sink: &Sink, rows: &[AuditEvent], extras: &Extras, host: &str) -> Result<Option<Value>, (&'static str, String)> {
+        if let (Out::Archive(client), Kind::Archive(a)) = (&mut *self, &sink.kind) {
+            let body: String = rows.iter().map(|e| line_with(e, host, extras.get(&e.id)) + "\n").collect();
+            return client.send(a, rows, body.into_bytes()).await.map(Some);
+        }
+        self.send_stream(sink, rows, extras, host).await.map(|()| None).map_err(|e| ("delivery_failed", e))
+    }
+
+    async fn send_stream(&mut self, sink: &Sink, rows: &[AuditEvent], extras: &Extras, host: &str) -> Result<(), String> {
         match (self, &sink.kind) {
             (Out::Http(http), Kind::Webhook { url, headers, .. }) => {
                 let body: String = rows.iter().map(|e| line_with(e, host, extras.get(&e.id)) + "\n").collect();
@@ -460,7 +556,7 @@ pub fn render(app: &App, out: &mut String) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::secrets::env::EnvStore;
 
@@ -506,7 +602,7 @@ mod tests {
         assert!(settings(&[("AUDIT_EXPORT_HEADERS_FILE", "/nonexistent/superbot-headers")]).is_ok());
     }
 
-    fn event(outcome: &str) -> AuditEvent {
+    pub(crate) fn event(outcome: &str) -> AuditEvent {
         AuditEvent {
             id: 7,
             at: 0,

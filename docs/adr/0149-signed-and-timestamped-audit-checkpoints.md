@@ -106,4 +106,4 @@ Both checkpoint events go out with the rest, and each carries a `checkpoint` obj
 - An erasure leaves checkpoint and timestamp events alone: they hold hashes and numbers, never personal data, and rewriting them would break the check.
 - Master key rotation with new derived keys starts a new checkpoint key; old checkpoints still verify against the kept key history, or with `--key` for each key.
 - A raw edit of `audit_checkpoints` now shows in `botctl audit verify`, like a raw edit of `audit_events`.
-- Later for #56: S3 batches with write-once storage (Object Lock), and stamping each checkpoint with more than one TSA.
+- Later for #56: stamping each checkpoint with more than one TSA. S3 batches with write-once storage came in [ADR 0154](0154-write-once-s3-audit-archive.md).
