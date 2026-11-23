@@ -295,3 +295,39 @@ async fn checking_the_archive_catches_a_forged_version_a_gap_and_a_stray_key() {
     assert!(reasons(&v).contains(&"behind".to_string()), "{v}");
     assert!(v["archive"]["delivered"].as_i64().unwrap() >= delivered);
 }
+
+#[tokio::test]
+async fn checking_the_archive_reads_null_versions_and_catches_a_missing_start() {
+    let (port, app, admin, _) = serve_app().await;
+    let s = StandIn::start().await;
+    export_to(&app, &vars(&s, &[("AUDIT_EXPORT_S3_LOCK", "off")]));
+    let x = app.audit_export.get().unwrap().clone();
+    for _ in 0..3 {
+        archive_round(&app, &x, 2).await;
+    }
+    let keys = s.keys();
+    assert_eq!(s.w().history[&keys[0]], ["null"], "written before versioning was on");
+    let c = machines::s3::S3::new(s.settings()).unwrap();
+
+    // The first object gone: the rest still links up and reaches what was delivered.
+    c.delete(&keys[0]).await.unwrap();
+    let v = verify_archive(port, &admin, "").await;
+    assert_eq!(reasons(&v), ["start"], "{v}");
+    assert!(v["archive"]["firstProblems"][0]["error"].as_str().unwrap().contains("start of the log"), "{v}");
+    assert_eq!(verify_archive(port, &admin, "&from=3").await["archive"]["ok"], true, "a range starting later doesn't reach it");
+
+    // Versioning turned on later: a new version goes over the `null` one, which is still
+    // what botd wrote and what's checked.
+    s.w().versioning = Some("Enabled");
+    let (meta, _) = s.w().meta[&keys[1]].clone();
+    let body = String::from_utf8(s.w().objects[&keys[1]].clone()).unwrap().replace("test.archive", "test.innocent");
+    use base64::Engine;
+    let sum = base64::engine::general_purpose::STANDARD.encode(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, body.as_bytes()).as_ref());
+    let mut h: Vec<(&str, String)> = meta.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    h.push(("x-amz-checksum-sha256", sum));
+    c.put_with(&keys[1], body.into_bytes(), &h).await.unwrap();
+    assert_eq!(s.w().history[&keys[1]].len(), 2);
+    let v = verify_archive(port, &admin, "&from=3").await;
+    assert_eq!(reasons(&v), ["overwritten"], "{v}");
+    assert!(s.w().calls.iter().any(|c| c.starts_with("GET ") && c.contains("versionId=null")), "the null version is read by its id");
+}

@@ -41,11 +41,12 @@ Reader option 1, version option 2, comparison option 2, on demand.
 
 ### The check
 
-botd lists every version under `<prefix>/` and groups the versions by key. Keys that don't match `<yyyy>/<mm>/<dd>/<20-digit first>-<20-digit last>.jsonl` are `stray`. Objects outside `--from`/`--to` are skipped. The rest are read four at a time, oldest version first, in id order. For each object:
+botd lists every version under `<prefix>/` and groups the versions by key. Keys that don't match `<yyyy>/<mm>/<dd>/<20-digit first>-<20-digit last>.jsonl` are `stray`. Objects outside `--from`/`--to` are skipped. The rest are read four at a time, oldest version first, in id order. Each version is read by its listed id, including `null`, which names a version written before versioning was on; leaving the id off would read the newest. For each object:
 
 - **Shape**: the key's ids, `-first-id`, `-last-id`, `-events`, `-chain-prev`, `-chain-head` and `-schema` match the body (`metadata`), and ids rise within it (`order`).
 - **Lock**: unless the lock is `off`, the version has a lock mode and a retain-until date (`unlocked`). A date that has passed is counted (`lockExpired`) but isn't a failure: the operator chose the period.
-- **Chain**: each event's `chainPrev` is the previous event's `chainHash`, across objects too (`link`). An event at or below the head so far is a repeat that a restarted export can leave. Repeats are counted and still compared with the log, but they don't move the chain.
+- **Chain**: each event's `chainPrev` is the previous event's `chainHash`, across objects too (`link`). An event at or below the head so far is a repeat, as an export sent again leaves. Repeats are counted, compared with the log, and their checkpoints checked, but they don't move the chain.
+- **Start**: when botd first creates an archive's cursor, it saves the link the first object must carry (`audit_export:<sink>#start`, `<id>:<hash>`): the genesis hash, the retention anchor, or with `AUDIT_EXPORT_START=new` the head's hash. A check that starts at the beginning (no `--from`, or one at or before it) needs the first event's `chainPrev` to be that hash (`start`). Without this, deleting the first objects would go unseen, since everything after still links and reaches `delivered`. With no record, the check fails rather than guess. The S3 archive hasn't shipped in a release yet, so only archives begun on unreleased builds lack one.
 - **Checkpoints**: each `audit.checkpoint` must hold its own signature under a trusted key (botd's current and past keys, or `--key`). If it links to the event before it, it must also name that event (`checkpoint`). This reuses `audit_checkpoint::check_signed`, the same code the log check runs. Timestamp tokens aren't checked here.
 - **The log**: each event's hash must equal this server's `chain_hash` for that id (`mismatch`), or the id must be at or below the anchor retention keeps, with the anchor's own hash equal (`gone`). Otherwise it's `missing`.
 - **Completeness**: if the archive ends before the `delivered` cursor read when the check started, it's `behind`. This only applies when botd has cut a batch for this archive and the cursor is in range. With `AUDIT_EXPORT_START=new`, an empty archive is fine.
@@ -62,12 +63,13 @@ botd lists every version under `<prefix>/` and groups the versions by key. Keys 
 
 - **A rebuilt log**: someone with `app.sqlite` changes an event and reseals the chain from there. The log check passes, but every event they changed that the archive holds fails as `mismatch`. They can't change the archive's locked versions.
 - **A forged archive object**: someone with the archive's key adds a version or a new key. The first version still decides, the new version is `overwritten`, and a new key is `stray`, or breaks the chain as `link` if it's named like botd's.
-- **A missing object**: in compliance mode it can't be deleted. In governance mode, or with the lock off, it shows as `link` at the next object, or `behind` at the end.
+- **A missing object**: in compliance mode it can't be deleted. In governance mode, or with the lock off, it shows as `start` at the beginning, `link` in the middle, or `behind` at the end.
 - **It doesn't prove** anything about events not yet archived (up to `AUDIT_EXPORT_S3_BATCH_SECONDS` plus any outage). It doesn't help against someone who controls botd while the check runs, since botd does the reading. For that, use the archive's own copy with checkpoints checked by OpenSSL, as ADR 0149 shows, or pin from a SIEM.
 
 ## Consequences
 
 - One listing (1,000 versions per page) plus one `GET` per version of each object read. A whole year at 5-minute batches is about 105,000 objects, so use `--from` for frequent checks.
 - The archive's key needs `s3:ListBucketVersions` for this check, though export doesn't. Without it the check fails with an error naming the right.
-- The S3 test stand-in now keeps object bodies per version, lists real versions and delete markers, and serves `GET ?versionId=`.
+- The S3 test stand-in now keeps object bodies per version (`null` until versioning is on, as S3), lists real versions and delete markers, and serves `GET ?versionId=`.
+- `settings` gains `audit_export:<sink>#start` for S3 archives.
 - Later: an archive alongside a SIEM (a second cursor), a daily automatic check of new objects, checking checkpoint timestamp tokens from the archive, and gzip.

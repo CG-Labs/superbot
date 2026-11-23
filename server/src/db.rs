@@ -7613,6 +7613,22 @@ impl Db {
         Ok(())
     }
 
+    /// The event the archive at `sink` began after, which its first object must link to
+    /// (ADR 0163). Saved once, when its cursor is.
+    pub fn audit_export_start(&self, sink: &str) -> Option<crate::audit_chain::Link> {
+        let v: String = self.c().query_row("SELECT value FROM settings WHERE key = ?", [format!("audit_export:{sink}#start")], |r| r.get(0)).optional().ok().flatten()?;
+        let (id, hash) = v.split_once(':')?;
+        Some(crate::audit_chain::Link { id: id.parse().ok()?, hash: hash.to_string() })
+    }
+
+    pub fn set_audit_export_start(&self, sink: &str, start: &crate::audit_chain::Link) -> rusqlite::Result<()> {
+        self.c().execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![format!("audit_export:{sink}#start"), format!("{}:{}", start.id, start.hash)],
+        )?;
+        Ok(())
+    }
+
     // Machines (ADR 0025)
 
     /// A new `pending` machine for the user, unless they have a live one already.

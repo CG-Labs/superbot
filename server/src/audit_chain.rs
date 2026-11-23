@@ -767,10 +767,13 @@ pub async fn get(
                 return Err((axum::http::StatusCode::CONFLICT, "There is no archive to check: archive=on needs AUDIT_EXPORT=s3://<bucket>/<prefix>".into()));
             };
             // Read before the listing, so what was delivered by then is in it.
-            let delivered = x.delivered();
-            let batches = app.db.audit_export_cursor(&format!("{}#batch", x.sink.id)).is_some();
+            let p = crate::audit_archive_verify::Progress {
+                delivered: x.delivered(),
+                batches: app.db.audit_export_cursor(&format!("{}#batch", x.sink.id)).is_some(),
+                start: app.db.audit_export_start(&x.sink.id),
+            };
             let keys = o.keys.clone().unwrap_or_else(|| crate::audit_checkpoint::trusted_keys(&app.db));
-            Some(crate::audit_archive_verify::check(&app, a, delivered, batches, o.range, &keys).await)
+            Some(crate::audit_archive_verify::check(&app, a, p, o.range, &keys).await)
         }
     };
     let a = app.clone();

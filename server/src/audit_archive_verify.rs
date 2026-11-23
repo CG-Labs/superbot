@@ -31,8 +31,9 @@ const MAX_LISTED: usize = 20;
 /// botd didn't name), `unreadable`, `overwritten` (a later version of the object differs
 /// from the one botd wrote), `metadata` (its key or metadata doesn't match its events),
 /// `unlocked`, `order` (its events are out of order), `link` (an event doesn't link to the
-/// one before: an object is missing, or isn't botd's), `checkpoint`, `behind` (the archive
-/// ends before the last event botd delivered to it), or, against this server's log,
+/// one before: an object is missing, or isn't botd's), `checkpoint`, `start` (the archive
+/// doesn't start where botd began archiving), `behind` (the archive ends before the last
+/// event botd delivered to it), or, against this server's log,
 /// `mismatch` (the event here has another hash) and `missing` (it's gone, and retention
 /// didn't delete it).
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -176,11 +177,50 @@ pub struct Walker<'a> {
     /// The last event walked, which the next must link to. None at the start, and after an
     /// object that couldn't be read (already a failure).
     last: Option<Link>,
+    /// What the first event walked must link to, when the check starts at the archive's start.
+    start: Option<Start>,
+}
+
+/// Where botd began archiving: after this event, or unknown, which fails.
+enum Start {
+    After(Link),
+    Unrecorded,
+}
+
+/// What botd knows of its writes to the archive when a check begins.
+pub struct Progress {
+    /// The last event delivered, read before the listing.
+    pub delivered: i64,
+    /// Whether it has cut any batch for this archive.
+    pub batches: bool,
+    /// The event it began after, if recorded.
+    pub start: Option<Link>,
 }
 
 impl<'a> Walker<'a> {
     pub fn new(a: &Archive, delivered: i64, keys: &'a [Vec<u8>]) -> Walker<'a> {
-        Walker { rep: Checked { archive: a.shown(), delivered, ..Default::default() }, lock: a.lock, keys, last: None }
+        Walker { rep: Checked { archive: a.shown(), delivered, ..Default::default() }, lock: a.lock, keys, last: None, start: None }
+    }
+
+    /// Holds the first event to where botd began archiving, unless `range` starts later,
+    /// so first objects that went missing show. With no record of it, the check fails.
+    pub fn expect_start(&mut self, start: Option<Link>, range: Range) {
+        let from_start = match (&start, range.from) {
+            (_, None) => true,
+            (Some(s), Some(f)) => f <= s.id + 1,
+            (None, Some(_)) => false,
+        };
+        self.start = from_start.then(|| start.map_or(Start::Unrecorded, Start::After));
+    }
+
+    fn check_start(&mut self, key: &str, e: &Line, start: Start) {
+        let error = match start {
+            Start::After(s) if s.hash == e.prev => return,
+            Start::After(s) if s.id == 0 => format!("the archive starts at event {}, not at the start of the log: its first objects are missing, or aren't botd's", e.id),
+            Start::After(s) => format!("the archive starts at event {}, which doesn't follow event {}, where botd began archiving: its first objects are missing, or aren't botd's", e.id, s.id),
+            Start::Unrecorded => "botd has no record of where it began archiving here, so missing first objects can't be ruled out".into(),
+        };
+        self.problem(Some(key), Some(e.id), "start", error);
     }
 
     fn problem(&mut self, key: Option<&str>, id: Option<i64>, reason: &'static str, error: String) {
@@ -203,6 +243,7 @@ impl<'a> Walker<'a> {
         self.rep.objects += 1;
         self.problem(Some(key), None, "unreadable", error);
         self.last = None;
+        self.start = None;
     }
 
     pub fn overwritten(&mut self, key: &str, error: String) {
@@ -264,11 +305,12 @@ impl<'a> Walker<'a> {
         for e in &events {
             self.rep.events += 1;
             self.compare(key, e, local, anchor);
-            if self.rep.head.as_ref().is_some_and(|h| e.id <= h.id) {
-                self.rep.repeated += 1;
-                continue;
+            if let Some(s) = self.start.take() {
+                self.check_start(key, e, s);
             }
-            let before = self.last.take();
+            // A repeat is checked as any event, but doesn't move the chain on.
+            let repeat = self.rep.head.as_ref().is_some_and(|h| e.id <= h.id);
+            let before = if repeat { None } else { self.last.take() };
             let linked = match &before {
                 Some(l) if l.hash != e.prev => {
                     self.problem(k, Some(e.id), "link", format!("event {} doesn't link to event {} before it: events are missing from the archive, or these aren't botd's", e.id, l.id));
@@ -280,9 +322,13 @@ impl<'a> Walker<'a> {
             if e.action == crate::audit_checkpoint::CHECKPOINT {
                 let seq = before.as_ref().filter(|_| linked).map(|l| l.id);
                 match crate::audit_checkpoint::check_signed(e.id, Some(&e.prev), Some(&e.details), seq, self.keys) {
-                    Ok(()) => self.rep.checkpoints += 1,
+                    Ok(()) => self.rep.checkpoints += !repeat as u64,
                     Err(f) => self.problem(k, Some(e.id), "checkpoint", format!("checkpoint {} ({}): {}", e.id, f.reason, f.error)),
                 }
+            }
+            if repeat {
+                self.rep.repeated += 1;
+                continue;
             }
             self.rep.first.get_or_insert(e.id);
             let link = Link { id: e.id, hash: e.hash.clone() };
@@ -352,9 +398,10 @@ struct Read {
     overwritten: Option<String>,
 }
 
+/// One version, by its id: `null` too, which names the version written before versioning
+/// was on, not the newest.
 async fn body(s3: &S3, key: &str, version: &str) -> Result<(Meta, Vec<u8>), String> {
-    let version = Some(version).filter(|v| *v != "null");
-    let res = s3.get_version(key, version).await?;
+    let res = s3.get_version(key, Some(version)).await?;
     if res.content_length().is_some_and(|n| n as usize > MAX_OBJECT_BYTES) {
         return Err(format!("{key} is larger than any batch botd writes"));
     }
@@ -428,11 +475,12 @@ fn local(app: &App, lo: i64, hi: i64) -> rusqlite::Result<Local> {
 }
 
 /// Checks the archive `a` within `range` against itself and this server's log, trusting
-/// checkpoints signed by `keys`. `delivered`: how far botd says it got, read before the
-/// listing; `batches`: whether it has cut any batch for this archive.
-pub async fn check(app: &App, a: &Archive, delivered: i64, batches: bool, range: Range, keys: &[Vec<u8>]) -> Checked {
+/// checkpoints signed by `keys`.
+pub async fn check(app: &App, a: &Archive, p: Progress, range: Range, keys: &[Vec<u8>]) -> Checked {
     use futures_util::StreamExt;
-    let mut w = Walker::new(a, delivered, keys);
+    let batches = p.batches;
+    let mut w = Walker::new(a, p.delivered, keys);
+    w.expect_start(p.start, range);
     let s3 = match S3::new(a.s3.clone()) {
         Ok(s) => s.called("the audit archive"),
         Err(e) => {
@@ -636,6 +684,33 @@ mod tests {
     }
 
     #[test]
+    fn the_archive_must_start_where_botd_began() {
+        let a = archive("bucket");
+        let starting = |start: Option<Link>, range: Range, objects: &[(i64, i64)]| {
+            let mut w = Walker::new(&a, 6, &[]);
+            w.expect_start(start, range);
+            for &(f, t) in objects {
+                w.object(&format!("prod/2026/11/23/{f:020}-{t:020}.jsonl"), (f, t), &meta(f, t), &body(f..=t), &local(6), None);
+            }
+            w.finish(range, true)
+        };
+        let genesis = Some(Link { id: 0, hash: GENESIS.into() });
+        assert!(starting(genesis.clone(), Range::default(), &[(1, 3), (4, 6)]).ok);
+        // The first objects deleted: the rest links up and reaches what was delivered.
+        let c = starting(genesis.clone(), Range::default(), &[(4, 6)]);
+        assert_eq!((reasons(&c), c.first_problems[0].id), (vec!["start"], Some(4)), "{c:?}");
+        // AUDIT_EXPORT_START=new, or retention before the export began.
+        assert!(starting(Some(Link { id: 3, hash: hash(3) }), Range::default(), &[(4, 6)]).ok);
+        assert_eq!(reasons(&starting(Some(Link { id: 2, hash: hash(2) }), Range::default(), &[(4, 6)])), ["start"]);
+        assert_eq!(reasons(&starting(None, Range::default(), &[(1, 6)])), ["start"], "no record fails");
+        // A range that starts later doesn't reach the start.
+        let later = Range { from: Some(5), to: None };
+        assert!(starting(genesis.clone(), later, &[(4, 6)]).ok);
+        assert!(starting(None, later, &[(4, 6)]).ok);
+        assert_eq!(reasons(&starting(genesis, Range { from: Some(1), to: None }, &[(4, 6)])), ["start"]);
+    }
+
+    #[test]
     fn repeats_are_counted_and_still_compared() {
         let c = walk(&[(1, 5), (1, 3), (4, 6)], "bucket", 6, &local(6));
         assert!(c.ok, "{c:?}");
@@ -674,7 +749,13 @@ mod tests {
         let mut w = Walker::new(&a, 3, &trusted);
         let mut forged = cp(2, &key);
         forged["at"] = json!(1);
-        w.object(key3, (1, 3), &meta(1, 3), &lines_with(forged), &local(3), None);
+        w.object(key3, (1, 3), &meta(1, 3), &lines_with(forged.clone()), &local(3), None);
         assert!(w.finish(Range::default(), true).first_problems[0].error.contains("(signature)"));
+        // A forged checkpoint in an object that repeats real events is checked too.
+        let mut w = Walker::new(&a, 3, &trusted);
+        w.object(key3, (1, 3), &meta(1, 3), &lines_with(cp(2, &key)), &local(3), None);
+        w.object("prod/2026/11/24/00000000000000000001-00000000000000000003.jsonl", (1, 3), &meta(1, 3), &lines_with(forged), &local(3), None);
+        let c = w.finish(Range::default(), true);
+        assert_eq!((reasons(&c), c.repeated, c.checkpoints), (vec!["checkpoint"], 3, 1), "{c:?}");
     }
 }

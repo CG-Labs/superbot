@@ -231,20 +231,21 @@ Read it back with any S3 tool, for example `aws s3 cp --recursive s3://<bucket>/
 botctl audit verify --archive
 ```
 
-This checks the chain as usual and also reads the whole archive (`GET /api/audit/verify?archive=on`). botd lists every version of every object under the prefix. For each object it reads the version written first, which Object Lock keeps whatever was written to that key later. Then it checks:
+This checks the chain as usual and also reads the whole archive (`GET /api/audit/verify?archive=on`). botd lists every version of every object under the prefix. For each object it reads the version written first (by its id, `null` too for one written before versioning was on), which Object Lock keeps whatever was written to that key later. Then it checks:
 
 - each object is what its key and metadata say, and is locked (unless the lock is `off`);
-- the chain runs from event to event and object to object with no gap;
+- the chain runs from event to event and object to object with no gap, from where botd began archiving to the last event it delivered;
 - every signed checkpoint in the archive holds under the trusted keys (botd's own, or `--key`);
 - the archive reaches the last event botd says it delivered;
 - every archived event has the same hash in this server's log. This catches a log rebuilt after an event was changed: its own chain verifies, but it no longer matches what was archived. It's the same as pinning every event (`--pin`).
 
-The check fails, and exits 1, if any of that doesn't hold. `firstBroken` then names the first event here that differs from the archive (reason `archive`). The answer's `archive` block counts `objects`, `events`, `matched`, `gone` (deleted here by retention, with the anchor's hash still checked), `mismatched`, `missing`, `locked`, `lockExpired` and `checkpoints`. It also counts `repeated` (events a restarted export wrote twice), `retried` (extra identical versions of an object) and `hidden` (objects behind a delete marker, which are still read). `firstProblems` lists the first 20 problems, each with a `key`, `id` and one of these reasons:
+The check fails, and exits 1, if any of that doesn't hold. `firstBroken` then names the first event here that differs from the archive (reason `archive`). The answer's `archive` block counts `objects`, `events`, `matched`, `gone` (deleted here by retention, with the anchor's hash still checked), `mismatched`, `missing`, `locked`, `lockExpired` and `checkpoints`. It also counts `repeated` (events written twice, as when the export is sent again; their checkpoints are still checked), `retried` (extra identical versions of an object) and `hidden` (objects behind a delete marker, which are still read). `firstProblems` lists the first 20 problems, each with a `key`, `id` and one of these reasons:
 
 | Reason | Meaning |
 |---|---|
 | `mismatch`, `missing` | An archived event has another hash in this server's log, or isn't in it, and retention didn't delete it |
 | `link` | An event doesn't link to the one before it: an object is missing, or isn't botd's |
+| `start` | The archive doesn't start where botd began archiving: objects are missing at the start. botd records where it began when it first archives to a prefix; an archive begun before botd recorded it fails here too, so start a new prefix |
 | `behind` | The archive ends before the last event botd delivered to it: objects are missing at the end |
 | `overwritten` | A later version of an object differs from the one botd wrote. The first one is what's checked |
 | `metadata`, `order` | An object's key or metadata doesn't match its events, or they're out of order |

@@ -283,12 +283,31 @@ pub fn start(app: &Arc<App>, settings: Settings) {
         if let Err(e) = app.db.set_audit_export_cursor(&sink.id, from) {
             log_warn!("Audit export: couldn't save where {} starts ({e}); trying again after the first delivery.", sink.shown);
         }
+        if sink.archive().is_some()
+            && let Some(link) = start_link(&app.db, from)
+            && let Err(e) = app.db.set_audit_export_start(&sink.id, &link)
+        {
+            log_warn!("Audit export: couldn't save where {} starts ({e}); `botctl audit verify --archive` will say so.", sink.shown);
+        }
         from
     });
     let x = Arc::new(Exporter::new(sink, delivered));
     if app.audit_export.set(x.clone()).is_ok() {
         tokio::spawn(run(app.clone(), x));
     }
+}
+
+/// The link the first event after `from` carries: event `from`'s hash, or the anchor's or
+/// the genesis hash at the start of the log. None if it can't be read.
+fn start_link(db: &crate::db::Db, from: i64) -> Option<crate::audit_chain::Link> {
+    if let Some(a) = db.audit_chain_anchor().filter(|a| from <= a.id) {
+        return Some(a);
+    }
+    if from == 0 {
+        return Some(crate::audit_chain::Link { id: 0, hash: crate::audit_chain::GENESIS.into() });
+    }
+    let row = db.audit_chain_rows(from - 1, 1).ok()?.into_iter().find(|r| r.id == from)?;
+    Some(crate::audit_chain::Link { id: from, hash: row.hash? })
 }
 
 async fn run(app: Arc<App>, x: Arc<Exporter>) {

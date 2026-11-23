@@ -292,11 +292,14 @@ async fn handle(State(world): State<Arc<Mutex<World>>>, method: Method, uri: Uri
             };
             w.keep(&key, false);
             w.next += 1;
-            let version = format!("v{}", w.next);
+            // As S3: until versioning is on, each write replaces the one `null` version.
+            let version = if w.versioning == Some("Enabled") { format!("v{}", w.next) } else { "null".to_string() };
             let meta: Vec<(String, String)> = headers.iter().filter(|(k, _)| k.as_str().starts_with("x-amz-meta-")).map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_string())).collect();
             w.versions.insert((key.clone(), version.clone()), (body.len(), meta.clone(), lock.clone()));
             w.bodies.insert((key.clone(), version.clone()), body.to_vec());
-            w.history.entry(key.clone()).or_default().push(version.clone());
+            let history = w.history.entry(key.clone()).or_default();
+            history.retain(|v| *v != version);
+            history.push(version.clone());
             w.meta.insert(key.clone(), (meta, version.clone()));
             match lock {
                 Some(l) => w.locks.insert(key.clone(), l),
