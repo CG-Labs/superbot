@@ -438,6 +438,7 @@ Admin actions (logins, Bot and routine changes, approvals, policy, handoffs) are
 - Both installs back it up: the bash timer and the Compose `backup` service take a SQLite `.backup` of `app.sqlite`, audit table included, and keep archives for `SUPERBOT_BACKUP_RETENTION_DAYS` (default 14). So a pruned event still exists in backups for that long; shorten it too if you must erase events.
 - Retention deletes from the start of the log only and keeps the last deleted event's hash, so the hash chain still verifies (`botctl audit verify`). With a SIEM export on, nothing is deleted before the SIEM has it.
 - Tamper evidence and SIEM export: every event is on a hash chain, and `AUDIT_EXPORT` (off by default) sends each one to your SIEM as JSON lines over HTTPS or syslog over TLS. See [docs/ops/audit-export.md](../docs/ops/audit-export.md).
+- Checkpoints and timestamps: botd signs the chain's head every hour (`AUDIT_CHECKPOINT_MINUTES`), and with `AUDIT_TIMESTAMP_URL` (off by default) an RFC 3161 time-stamping authority stamps each checkpoint. `botctl audit chain` shows the state. See [checkpoints and timestamps](../docs/ops/audit-export.md#checkpoints-and-timestamps).
 - Source IPs: the installer's Caddy is on loopback, so `botd` trusts its `X-Forwarded-For`. Compose sets `TRUST_FORWARDED_FOR=1`, since `botd` is reachable only through Caddy.
 
 ## Chat history retention

@@ -6,7 +6,9 @@
 //! goes nowhere else: not in errors, logs, or `Debug`.
 
 use crate::secrets::SecretStore;
-use aws_lc_rs::{digest, hmac};
+use crate::sigv4::{self, hex, Scope};
+pub use crate::sigv4::{canonical_query, encode, sha256_hex};
+use aws_lc_rs::digest;
 use reqwest::Method;
 use std::time::Duration;
 
@@ -129,67 +131,6 @@ impl Settings {
     }
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-pub fn sha256_hex(b: &[u8]) -> String {
-    hex(digest::digest(&digest::SHA256, b).as_ref())
-}
-
-fn mac(key: &[u8], msg: &[u8]) -> Vec<u8> {
-    hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), msg).as_ref().to_vec()
-}
-
-/// URI-encodes as SigV4 wants: everything but unreserved characters, and `/` too
-/// unless `keep_slash`.
-pub fn encode(s: &str, keep_slash: bool) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) || (keep_slash && b == b'/') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
-/// The canonical query string: each name and value encoded, sorted.
-pub fn canonical_query(query: &[(&str, &str)]) -> String {
-    let mut q: Vec<(String, String)> = query.iter().map(|(k, v)| (encode(k, false), encode(v, false))).collect();
-    q.sort();
-    q.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")
-}
-
-/// A request's SigV4 signature, and the signed header names. `uri` is already
-/// encoded; `headers` are lowercase names with trimmed values.
-#[allow(clippy::too_many_arguments)]
-pub fn signature(
-    secret: &str,
-    region: &str,
-    amz_date: &str,
-    method: &str,
-    uri: &str,
-    query: &str,
-    headers: &[(&str, &str)],
-    payload_hash: &str,
-) -> (String, String) {
-    let mut h: Vec<(&str, &str)> = headers.to_vec();
-    h.sort();
-    let signed = h.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(";");
-    let canonical_headers: String = h.iter().map(|(k, v)| format!("{k}:{}\n", v.trim())).collect();
-    let canonical = format!("{method}\n{uri}\n{query}\n{canonical_headers}\n{signed}\n{payload_hash}");
-    let date = &amz_date[..8];
-    let scope = format!("{date}/{region}/s3/aws4_request");
-    let to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", sha256_hex(canonical.as_bytes()));
-    let k = mac(format!("AWS4{secret}").as_bytes(), date.as_bytes());
-    let k = mac(&k, region.as_bytes());
-    let k = mac(&k, b"s3");
-    let k = mac(&k, b"aws4_request");
-    (signed, hex(&mac(&k, to_sign.as_bytes())))
-}
-
 /// The text of the first `<tag>` in `xml`, unescaped.
 pub fn tag(xml: &str, name: &str) -> Option<String> {
     let open = format!("<{name}>");
@@ -245,13 +186,9 @@ impl S3 {
         let payload = sha256_hex(&body);
         let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
         let headers = [("host", self.s.host.as_str()), ("x-amz-content-sha256", payload.as_str()), ("x-amz-date", amz_date.as_str())];
-        let (signed, sig) = signature(&self.s.secret, &self.s.region, &amz_date, method.as_str(), &uri, &q, &headers, &payload);
-        let auth = format!(
-            "AWS4-HMAC-SHA256 Credential={}/{}/{}/s3/aws4_request, SignedHeaders={signed}, Signature={sig}",
-            self.s.access_key,
-            &amz_date[..8],
-            self.s.region
-        );
+        let scope = Scope { amz_date: &amz_date, region: &self.s.region, service: "s3" };
+        let (signed, sig) = sigv4::signature(&self.s.secret, &scope, method.as_str(), &uri, &q, &headers, &payload);
+        let auth = scope.authorization(&self.s.access_key, &signed, &sig);
         let url = if q.is_empty() { format!("{}{uri}", self.s.endpoint) } else { format!("{}{uri}?{q}", self.s.endpoint) };
         let res = self
             .http
@@ -486,36 +423,6 @@ impl Upload<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// AWS's own example: GET Object, from the SigV4 documentation for S3.
-    #[test]
-    fn signs_as_aws_documents() {
-        let (signed, sig) = signature(
-            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            "us-east-1",
-            "20130524T000000Z",
-            "GET",
-            "/test.txt",
-            "",
-            &[
-                ("host", "examplebucket.s3.amazonaws.com"),
-                ("range", "bytes=0-9"),
-                ("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
-                ("x-amz-date", "20130524T000000Z"),
-            ],
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        );
-        assert_eq!(signed, "host;range;x-amz-content-sha256;x-amz-date");
-        assert_eq!(sig, "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41");
-    }
-
-    #[test]
-    fn encodes_keys_and_queries() {
-        assert_eq!(encode("a b/c~d+e", true), "a%20b/c~d%2Be");
-        assert_eq!(encode("a/b", false), "a%2Fb");
-        assert_eq!(canonical_query(&[("uploadId", "x/y"), ("partNumber", "2")]), "partNumber=2&uploadId=x%2Fy");
-        assert_eq!(canonical_query(&[("uploads", "")]), "uploads=");
-    }
 
     #[test]
     fn settings_are_checked() {
