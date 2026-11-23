@@ -539,6 +539,8 @@ async fn ends_are_checked_and_a_time_bound_role_needs_one_within_its_limit() {
         (&plain, json!({ "until": now + day }).to_string(), "unknown field"),
         (&plain, json!({ "reason": 5 }).to_string(), "reason is text"),
         (&plain, "[]".to_string(), "an object"),
+        (&plain, "{".to_string(), "JSON"),
+        (&plain, "  ".to_string(), "a body that isn't JSON is never read as none"),
     ] {
         let (code, v) = json_call(port, "PUT", &give(role, &bo), &admin, &body).await;
         assert_eq!(code, 400, "{why}: {v}");

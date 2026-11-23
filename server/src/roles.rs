@@ -13,9 +13,9 @@ use crate::rbac::{self, DELEGABLE, Perm, Perms, Principal, Role, TEAM_SCOPED};
 use crate::users::{self, OPERATOR, need_user_key, user_view};
 use crate::{ApiError, App, AppState, Res, bad, not_found};
 use axum::Json;
-use axum::body::Bytes;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use serde_json::{Value, json};
 
 /// Names a custom role can't take, so a role never reads as a built-in one.
@@ -170,9 +170,21 @@ struct Giving {
     reason: Option<String>,
 }
 
-fn parse_giving(body: &Bytes, r: &CustomRole) -> Res<Giving> {
-    let v: Value = if body.iter().all(u8::is_ascii_whitespace) { json!({}) } else { serde_json::from_slice(body).map_err(|_| bad("Send a JSON object, or nothing."))? };
-    only_fields(&v, &["expiresAt", "reason"])?;
+/// The body of a `PUT` that may have none: no body reads as `{}`, anything else must be JSON.
+fn optional_body(headers: &HeaderMap, body: Result<Json<Value>, JsonRejection>) -> Res<Value> {
+    let empty = match headers.get(header::CONTENT_LENGTH) {
+        Some(n) => n.to_str().is_ok_and(|n| n.trim() == "0"),
+        None => !headers.contains_key(header::TRANSFER_ENCODING),
+    };
+    match body {
+        Ok(Json(v)) => Ok(v),
+        Err(_) if empty => Ok(json!({})),
+        Err(_) => Err(bad("Send a JSON object, or nothing.")),
+    }
+}
+
+fn parse_giving(v: &Value, r: &CustomRole) -> Res<Giving> {
+    only_fields(v, &["expiresAt", "reason"])?;
     let at = crate::db::now();
     let until = match &v["expiresAt"] {
         Value::Null => None,
@@ -356,10 +368,10 @@ pub async fn delete(State(app): State<AppState>, Extension(by): Extension<Who>, 
 /// server, until `expiresAt` or with no end (ADR 0197). Its base becomes their built-in
 /// role, replacing admin if they were one, and stays it when the role ends. Not the owner
 /// account, which stays an admin, and not yourself. Sent again, it moves the end.
-pub async fn assign(State(app): State<AppState>, Extension(by): Extension<Who>, Path((key, user)): Path<(String, String)>, body: Bytes) -> Res {
+pub async fn assign(State(app): State<AppState>, Extension(by): Extension<Who>, Path((key, user)): Path<(String, String)>, headers: HeaderMap, body: Result<Json<Value>, JsonRejection>) -> Res {
     expire_due(&app);
     let r = need_role(&app, &key)?;
-    let giving = parse_giving(&body, &r)?;
+    let giving = parse_giving(&optional_body(&headers, body)?, &r)?;
     let before = need_user_key(&app, &user)?;
     if before.id == OPERATOR {
         return Err(conflict("The owner (break-glass) account stays an admin."));
@@ -410,10 +422,10 @@ fn team_member(app: &AppState, team: &str, user: &str) -> Res<(crate::db::Team, 
 /// a team's member within that team, until `expiresAt` or with no end (ADR 0197). Only its
 /// team permissions apply there (`rbac::TEAM_SCOPED`), and only while they stay on it;
 /// their role across the server doesn't change.
-pub async fn assign_in_team(State(app): State<AppState>, Extension(by): Extension<Who>, Path((key, team, user)): Path<(String, String, String)>, body: Bytes) -> Res {
+pub async fn assign_in_team(State(app): State<AppState>, Extension(by): Extension<Who>, Path((key, team, user)): Path<(String, String, String)>, headers: HeaderMap, body: Result<Json<Value>, JsonRejection>) -> Res {
     expire_due(&app);
     let r = need_role(&app, &key)?;
-    let giving = parse_giving(&body, &r)?;
+    let giving = parse_giving(&optional_body(&headers, body)?, &r)?;
     let (t, u, _) = team_member(&app, &team, &user)?;
     if u.role == Role::Readonly {
         return Err(conflict("They're read-only, so they change nothing, in a team too. Make them a member first."));
