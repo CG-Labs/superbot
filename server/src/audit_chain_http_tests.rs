@@ -251,7 +251,7 @@ async fn the_siem_export_delivers_every_event_in_order_and_retries() {
     assert_eq!((siem["enabled"].as_bool(), siem["kind"].as_str(), siem["failing"].as_bool()), (Some(true), Some("webhook"), Some(false)), "{siem}");
     let mut metrics = String::new();
     crate::audit_export::render(&app, &mut metrics);
-    assert!(metrics.contains("superbot_audit_export_failing 0") && metrics.contains("superbot_audit_export_last_delivery_timestamp_seconds"), "{metrics}");
+    assert!(metrics.contains("superbot_audit_export_failing{kind=\"webhook\"} 0") && metrics.contains("superbot_audit_export_last_delivery_timestamp_seconds"), "{metrics}");
     // The cursor is saved, so a restart resumes after the last delivered event.
     let delivered = app.audit_export.get().unwrap().delivered();
     assert_eq!(app.db.audit_export_cursor(&url), Some(delivered));
