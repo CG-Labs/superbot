@@ -685,14 +685,28 @@ pub fn start(app: Arc<App>) {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(60)).await;
         loop {
-            let a = app.clone();
-            let o = Options { trust: crate::audit_checkpoint::trust(&app), ..Default::default() };
-            if let Ok(r) = tokio::task::spawn_blocking(move || verify_with(&a.db, &o)).await {
-                checked(&app, &crate::audit::Who::system("audit"), &r);
-            }
+            daily(&app).await;
             tokio::time::sleep(CHECK_EVERY).await;
         }
     });
+}
+
+/// One daily check: the whole chain, and, with an archive (unless
+/// `AUDIT_EXPORT_S3_CHECK=off`), what was archived since its last pass (ADR 0183).
+pub async fn daily(app: &Arc<App>) {
+    let archive = match app.audit_export.get().and_then(|x| x.archive()) {
+        Some((x, a)) if a.daily_check => Some(crate::audit_archive_verify::check_new(app, x, a, &crate::audit_checkpoint::trusted_keys(&app.db)).await),
+        _ => None,
+    };
+    let a = app.clone();
+    let o = Options { trust: crate::audit_checkpoint::trust(app), ..Default::default() };
+    if let Ok(r) = tokio::task::spawn_blocking(move || verify_with(&a.db, &o)).await {
+        let r = match archive {
+            Some(c) => r.with_archive(c),
+            None => r,
+        };
+        checked(app, &crate::audit::Who::system("audit"), &r);
+    }
 }
 
 /// Records a check's result, and warns when the chain is broken.
@@ -766,12 +780,8 @@ pub async fn get(
             let Some((x, a)) = app.audit_export.get().and_then(|x| x.archive()) else {
                 return Err((axum::http::StatusCode::CONFLICT, "There is no archive to check: archive=on needs an s3://<bucket>/<prefix> in AUDIT_EXPORT".into()));
             };
-            // Read before the listing, so what was delivered by then is in it.
-            let delivered = x.delivered();
-            let batches = app.db.audit_export_cursor(&format!("{}#batch", x.sink.id)).is_some();
-            let start = app.db.audit_export_cursor(&format!("{}#start", x.sink.id));
             let keys = o.keys.clone().unwrap_or_else(|| crate::audit_checkpoint::trusted_keys(&app.db));
-            Some(crate::audit_archive_verify::check(&app, a, delivered, batches, start, o.range, &keys).await)
+            Some(crate::audit_archive_verify::check_by_hand(&app, x, a, o.range, &keys).await)
         }
     };
     let a = app.clone();
