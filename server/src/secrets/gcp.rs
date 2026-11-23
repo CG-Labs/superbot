@@ -858,9 +858,9 @@ mod tests {
         assert_eq!(x.run_credentials().unwrap().names(), ["CLOUDSDK_AUTH_ACCESS_TOKEN", "GOOGLE_OAUTH_ACCESS_TOKEN"]);
         assert!(with(&[]).unwrap().unwrap().run_credentials().is_none(), "off unless set");
         let e = with(&[("GCP_RUN_CREDENTIALS", "arn:aws:iam::123456789012:role/r")]).err().unwrap();
-        assert!(e.contains("GCP_RUN_CREDENTIALS") && e.contains("service account's email"), "{e}");
+        assert!(e.contains("GCP_RUN_CREDENTIALS") && e.contains("service account's email"));
         let e = with(&[("GCP_IAM_CREDENTIALS_ENDPOINT", "http://iamcredentials.example.com")]).err().unwrap();
-        assert!(e.contains("GCP_IAM_CREDENTIALS_ENDPOINT") && e.contains("must use https"), "{e}");
+        assert!(e.contains("GCP_IAM_CREDENTIALS_ENDPOINT") && e.contains("must use https"));
         let var = settings(&[("GCP_RUN_CREDENTIALS", "superbot-bots@proj-1.iam.gserviceaccount.com")]);
         assert_eq!(super::super::external::unused_settings(&var, "aws"), ["GCP_RUN_CREDENTIALS"], "only SECRETS_BACKEND=gcp-secret-manager reads it");
         assert!(super::super::external::unused_settings(&var, "gcp-secret-manager").is_empty());
