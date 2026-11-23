@@ -82,7 +82,7 @@ pub fn node() -> NodeRuntime {
 /// The plan for `harnesses`, with Node.js when one is an npm package.
 pub fn plan(harnesses: Vec<HarnessInstall>) -> HarnessPlan {
     let npm = harnesses.iter().any(|h| matches!(h.source, InstallSource::Npm { .. }));
-    HarnessPlan { node: npm.then(node), harnesses }
+    HarnessPlan { node: npm.then(node), harnesses, ..Default::default() }
 }
 
 /// How an admin puts `bin` at its pin on a server, for an npm harness: what botd

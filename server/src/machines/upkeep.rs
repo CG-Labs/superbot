@@ -15,6 +15,7 @@
 //! the new agent; the agent puts the old one back if none does in time.
 
 use super::enroll::{self, Enrollment};
+use super::mirror::{self, Mirrors};
 use super::wire::{self, HarnessPlan, HarnessStatus, Heartbeat, UpgradeRequest};
 use super::{ControlPlane, event, system};
 use crate::adapters::install;
@@ -66,6 +67,8 @@ pub struct Upkeep {
     pub unset: bool,
     /// The plan is the managed tiers' default harnesses, not MACHINE_HARNESSES (ADR 0079).
     pub defaulted: bool,
+    /// Where machines fetch the plan's Node.js and npm harnesses instead (ADR 0186).
+    pub mirrors: Option<Mirrors>,
 }
 
 /// `claude,codex@0.172.0,hermes@<commit>=<sha256>`: commas or spaces between. `none`:
@@ -102,7 +105,9 @@ impl Upkeep {
         };
         let rebuilds = super::rebuild::Rebuilds::parse(&var("MACHINE_LEGACY_REBUILDS"))?;
         let raw = var("MACHINE_HARNESSES");
-        Ok(Upkeep { plan: parse_harnesses(&raw)?, upgrades, rebuilds, unset: raw.trim().is_empty(), defaulted: false })
+        let mirrors = Mirrors::from_env(var)?;
+        let plan = parse_harnesses(&raw)?.map(|p| mirrored(&mirrors, p));
+        Ok(Upkeep { plan, upgrades, rebuilds, unset: raw.trim().is_empty(), defaulted: false, mirrors })
     }
 
     /// With MACHINE_HARNESSES unset, every machine gets the managed tiers' default
@@ -112,7 +117,9 @@ impl Upkeep {
         if !self.unset || self.plan.is_some() || harnesses.is_empty() {
             return Ok(());
         }
-        self.plan = parse_harnesses(&harnesses.join(",")).map_err(|e| format!("the managed tiers' default harnesses: {e}"))?;
+        self.plan = parse_harnesses(&harnesses.join(","))
+            .map_err(|e| format!("the managed tiers' default harnesses: {e}"))?
+            .map(|p| mirrored(&self.mirrors, p));
         self.defaulted = self.plan.is_some();
         Ok(())
     }
@@ -125,11 +132,19 @@ impl Upkeep {
     pub fn describe(&self) -> String {
         let harnesses = self.plan.as_ref().map_or("none".into(), |p| names(p).join(", "));
         let harnesses = if self.defaulted { format!("{harnesses} (the managed tiers' default; MACHINE_HARNESSES=none for none)") } else { harnesses };
+        let mirrors = self.mirrors.as_ref().map_or(String::new(), |m| format!("; {}", m.describe(self.plan.as_ref())));
         format!(
-            "harnesses on machines: {harnesses}; agent upgrades: {}; rebuilds of old machines: {}",
+            "harnesses on machines: {harnesses}{mirrors}; agent upgrades: {}; rebuilds of old machines: {}",
             self.upgrades.as_str(),
             self.rebuilds.as_str()
         )
+    }
+}
+
+fn mirrored(mirrors: &Option<Mirrors>, plan: HarnessPlan) -> HarnessPlan {
+    match mirrors {
+        Some(m) => m.apply(plan),
+        None => plan,
     }
 }
 
@@ -353,9 +368,16 @@ async fn send_plan(app: &App, e: &Enrollment, m: &Machine, plan: &HarnessPlan, b
     }
 }
 
+/// Whether an agent that says `can` installs `plan`. One from before ADR 0186 would
+/// refuse a plan with mirrors in it, or fetch it from the internet.
+fn takes(plan: &HarnessPlan, can: &[String]) -> bool {
+    let has = |c: &str| can.iter().any(|x| x == c);
+    has(wire::CAN_HARNESSES) && (!mirror::needs_agent_support(plan) || has(wire::CAN_HARNESS_MIRRORS))
+}
+
 /// Whether the agent should be sent the plan now.
 fn plan_due(plan: &HarnessPlan, m: &Machine, hb: &Heartbeat, at: i64) -> bool {
-    if !hb.can.iter().any(|c| c == wire::CAN_HARNESSES) {
+    if !takes(plan, &hb.can) {
         return false;
     }
     let id = plan.id();
@@ -531,6 +553,12 @@ pub async fn harnesses_now(
             "Its agent can't install harnesses: it was installed before ADR 0039. Rebuild it with today's agent: botctl machine rebuild <user> (ADR 0056).".into(),
         ));
     }
+    if !takes(plan, &hb.can) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Its agent can't fetch harnesses from MACHINE_NPM_REGISTRY or trust MACHINE_MIRROR_CA_FILE: it is older than ADR 0186. Upgrade it first: botctl machine upgrade <user>.".into(),
+        ));
+    }
     send_plan(&app, e, &m, &install::plan_for(plan, &hb.can), &by).await?;
     let m = app.db.machine(&m.id).unwrap_or(m);
     Ok((StatusCode::ACCEPTED, Json(view(e, &m))))
@@ -567,6 +595,33 @@ mod tests {
             let bad = |key: &str| if key == k { v.to_string() } else { String::new() };
             assert!(Upkeep::from_env(&bad).is_err(), "{k}={v}");
         }
+    }
+
+    #[test]
+    fn mirrors_go_into_the_plan_and_only_to_agents_that_take_them() {
+        let env = |k: &str| match k {
+            "MACHINE_HARNESSES" => "claude".into(),
+            "MACHINE_NODE_MIRROR" => "https://mirror.corp.example/nodejs".into(),
+            "MACHINE_NPM_REGISTRY" => "https://mirror.corp.example/npm".into(),
+            _ => String::new(),
+        };
+        let u = Upkeep::from_env(&env).unwrap();
+        let p = u.plan.clone().unwrap();
+        assert_eq!(p.npm_registry.as_deref(), Some("https://mirror.corp.example/npm/"));
+        assert!(p.node.as_ref().unwrap().downloads.values().all(|d| d.url.starts_with("https://mirror.corp.example/nodejs/v")));
+        assert!(u.describe().contains("npm from https://mirror.corp.example/npm/"), "{}", u.describe());
+        let can = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(takes(&p, &can(&[wire::CAN_HARNESSES, wire::CAN_HARNESS_MIRRORS])));
+        assert!(!takes(&p, &can(&[wire::CAN_HARNESSES])), "an agent from before ADR 0186 isn't sent it");
+        let plain = Upkeep::from_env(&|k: &str| if k == "MACHINE_HARNESSES" { "claude".into() } else { String::new() }).unwrap().plan.unwrap();
+        assert!(takes(&plain, &can(&[wire::CAN_HARNESSES])), "without mirrors, older agents get the plan as before");
+
+        // The managed tiers' default goes through the mirrors too, and Hermes is named
+        // as still needing the internet.
+        let mut u = Upkeep::from_env(&|k: &str| if k == "MACHINE_HARNESSES" { String::new() } else { env(k) }).unwrap();
+        u.default_to(&["hermes", "pi"]).unwrap();
+        assert!(u.plan.as_ref().unwrap().npm_registry.is_some());
+        assert!(u.describe().contains("hermes still download"), "{}", u.describe());
     }
 
     #[test]
