@@ -186,9 +186,10 @@ pub(crate) fn secret_env() -> Vec<String> {
 }
 
 /// botd's secrets whose names depend on its settings: SSO providers', Bots' webhooks,
-/// and every machine backup store's, each data region's included (ADR 0117).
+/// every machine backup store's, each data region's included (ADR 0117), and each named
+/// SIEM's audit export headers (ADR 0191).
 fn named_secret(k: &str) -> bool {
-    k.starts_with("SSO_") || k.starts_with(crate::secrets::BOT_WEBHOOK_PREFIX) || k.starts_with("MACHINE_BACKUP_S3_")
+    k.starts_with("SSO_") || k.starts_with(crate::secrets::BOT_WEBHOOK_PREFIX) || k.starts_with("MACHINE_BACKUP_S3_") || k.starts_with(crate::secrets::AUDIT_EXPORT_HEADERS_PREFIX)
 }
 
 /// Tier endpoints' key secrets, and their `_FILE`: a run gets one only when routed to
@@ -789,6 +790,22 @@ mod tests {
             assert!(super::named_secret(k), "{k}");
         }
         assert!(!super::named_secret("MACHINE_REGIONS"));
+    }
+
+    #[test]
+    fn named_siem_headers_are_never_inherited() {
+        for k in ["AUDIT_EXPORT_HEADERS_SPLUNK", "AUDIT_EXPORT_HEADERS_SPLUNK_FILE"] {
+            assert!(super::named_secret(k), "{k}");
+            assert!(crate::secrets::server_secret(k), "{k}: botd's own, never a Bot's");
+        }
+        assert!(!crate::secrets::server_secret("AUDIT_EXPORT_HEADERS_"));
+        // SAFETY: test-only; the name is this test's own and no other test reads it.
+        unsafe { std::env::set_var("AUDIT_EXPORT_HEADERS_E2E_SIEM", "Authorization=Bearer x") };
+        let mut cmd = std::process::Command::new("true");
+        super::strip_secret_env(&mut cmd);
+        assert!(cmd.get_envs().any(|(k, v)| k == "AUDIT_EXPORT_HEADERS_E2E_SIEM" && v.is_none()), "stripped from what botd starts");
+        assert!(super::local_host().remove.iter().any(|k| k == "AUDIT_EXPORT_HEADERS_E2E_SIEM"));
+        unsafe { std::env::remove_var("AUDIT_EXPORT_HEADERS_E2E_SIEM") };
     }
 
     fn sandboxed(dir: &std::path::Path) -> RunInput {

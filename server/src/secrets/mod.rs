@@ -172,7 +172,9 @@ pub fn server_secret(name: &str) -> bool {
     let bot_webhook = name.strip_prefix(BOT_WEBHOOK_PREFIX).is_some_and(|id| !id.is_empty());
     // A data region's own machine backup store (ADR 0117): MACHINE_BACKUP_S3_<REGION>_SECRET_ACCESS_KEY.
     let region_store = name.strip_prefix("MACHINE_BACKUP_S3_").and_then(|n| n.strip_suffix("_SECRET_ACCESS_KEY")).is_some_and(|r| !r.is_empty());
-    env_shaped(name) && (provider("_CLIENT_SECRET") || provider("_PRIVATE_KEY") || SERVER_SECRETS.contains(&name) || bot_webhook || region_store)
+    // Each named SIEM's headers (ADR 0191): AUDIT_EXPORT_HEADERS_<NAME>.
+    let siem_headers = name.strip_prefix(AUDIT_EXPORT_HEADERS_PREFIX).is_some_and(|n| !n.is_empty());
+    env_shaped(name) && (provider("_CLIENT_SECRET") || provider("_PRIVATE_KEY") || SERVER_SECRETS.contains(&name) || bot_webhook || region_store || siem_headers)
 }
 
 /// The Turnstile secret (ADR 0022), the Linode token, which can rent and delete every
@@ -202,6 +204,9 @@ pub const SERVER_SECRETS: [&str; 15] = [
     "AUDIT_EXPORT_S3_SECRET_ACCESS_KEY",
     "GOOGLE_DIRECTORY_CREDENTIALS",
 ];
+
+/// Each named SIEM's headers for the audit export: `AUDIT_EXPORT_HEADERS_<NAME>` (ADR 0191).
+pub const AUDIT_EXPORT_HEADERS_PREFIX: &str = "AUDIT_EXPORT_HEADERS_";
 
 /// Each Bot's own notification webhook URL: `NOTIFY_WEBHOOK_URL_BOT_<ID>` (ADR 0061).
 pub const BOT_WEBHOOK_PREFIX: &str = "NOTIFY_WEBHOOK_URL_BOT_";

@@ -164,6 +164,11 @@ fn named(entry: &str) -> Result<(Option<String>, &str), String> {
     if matches!(name.as_str(), "webhook" | "syslog" | "s3") {
         return Err(format!("AUDIT_EXPORT can't name a sink \"{name}\": that is a kind of sink"));
     }
+    // AUDIT_EXPORT_HEADERS_<NAME>_FILE is the sink's headers file, so a name ending in
+    // `file` would read as another sink's (or the shared) file setting.
+    if name == "file" || name.ends_with("_file") {
+        return Err(format!("AUDIT_EXPORT can't name a sink \"{name}\": a name ending in _file would mean another setting's file (AUDIT_EXPORT_HEADERS_<NAME>_FILE)"));
+    }
     Ok((Some(name), entry[eq + 1..].trim()))
 }
 
@@ -812,6 +817,8 @@ pub(crate) mod tests {
             ("a=https://a.example.net/in,A=https://b.example.net/in", "two sinks \"a\""),
             ("a=https://1.example.net/in,b=https://2.example.net/in,c=https://3.example.net/in,d=https://4.example.net/in,e=https://5.example.net/in", "4 SIEMs"),
             ("webhook=https://a.example.net/in", "kind of sink"),
+            ("file=https://a.example.net/in", "another setting's file"),
+            ("a=https://a.example.net/in,a_file=https://b.example.net/in", "another setting's file"),
             ("1st=https://a.example.net/in", "a letter then"),
             ("my-siem=https://a.example.net/in", "a letter then"),
             ("=https://a.example.net/in", "a letter then"),
@@ -841,6 +848,7 @@ pub(crate) mod tests {
         // The cursor follows the URL, not the name: naming a running sink keeps its place.
         let one = settings(&[("AUDIT_EXPORT", "https://splunk.example.net:8088/services/collector/raw")]).unwrap();
         assert_eq!(one.sinks[0].id, s.sinks[0].id);
+        assert_eq!(settings(&[("AUDIT_EXPORT", "profile=https://a.example.net/in")]).unwrap().sinks[0].name.as_deref(), Some("profile"));
         // A `=` in the URL is the URL's own.
         let s = settings(&[("AUDIT_EXPORT", "https://siem.example.net/in=1")]).unwrap();
         assert_eq!((s.sinks[0].name.as_deref(), s.sinks[0].id.as_str()), (None, "https://siem.example.net:443/in=1"));
