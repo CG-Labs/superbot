@@ -301,11 +301,21 @@ impl Client {
                     }
                     q.append_pair("scope", &scope);
                 }
-                let mut rb = self.http.get(url.as_str());
+                // A token service on another host gets the login but not the registry's client
+                // certificate, and may redirect as it likes.
+                let on_registry = same_host(&url, self.repo.api_host());
+                let mut rb = if on_registry { &self.http } else { &self.elsewhere }.get(url.as_str());
                 if let Some((u, p)) = &self.creds {
                     rb = rb.basic_auth(u, Some(p));
                 }
-                let res = rb.send().await.map_err(|e| format!("{host}'s token service: {}", chain(&e)))?;
+                let mut res = rb.send().await.map_err(|e| format!("{host}'s token service: {}", chain(&e)))?;
+                if on_registry
+                    && res.status().is_redirection()
+                    && let Some(next) = res.headers().get(LOCATION).and_then(|v| v.to_str().ok()).and_then(|l| url.join(l).ok())
+                {
+                    // Off the registry's host, so without the login, as any redirect there drops it.
+                    res = self.elsewhere.get(next).send().await.map_err(|e| format!("{host}'s token service: {}", chain(&e)))?;
+                }
                 if !res.status().is_success() {
                     let why = if self.creds.is_some() { "refused the login" } else { "wants a login" };
                     return Err(format!("{host} {why} for {scope} (HTTP {}): {login}", res.status().as_u16()));

@@ -53,6 +53,9 @@ struct Mode {
     client_cert: bool,
     /// Blob downloads redirect to the same fake under another host name, as to blob storage.
     blob_elsewhere: bool,
+    /// With `login`: the token service is the same fake under another host name, and it
+    /// redirects within itself first.
+    token_elsewhere: bool,
 }
 
 struct Fake {
@@ -118,15 +121,22 @@ async fn handle(State(f): State<Arc<Fake>>, method: Method, uri: Uri, headers: H
     f.store.lock().unwrap().requests += 1;
     let path = uri.path();
     let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default();
+    let elsewhere = format!("{}://localhost:{}", if f.mode.tls { "https" } else { "http" }, f.addr.rsplit_once(':').unwrap().1);
+    if path == "/token-first" {
+        return reply(StatusCode::TEMPORARY_REDIRECT, &[("location", format!("/token?{}", uri.query().unwrap_or_default()))], vec![]);
+    }
     if path == "/token" {
         let want = format!("Basic {}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, format!("{}:{}", LOGIN.0, LOGIN.1)));
         return if auth == want { reply(StatusCode::OK, &[], json!({ "token": TOKEN }).to_string().into_bytes()) } else { reply(StatusCode::UNAUTHORIZED, &[], vec![]) };
     }
-    let elsewhere = format!("{}://localhost:{}", if f.mode.tls { "https" } else { "http" }, f.addr.rsplit_once(':').unwrap().1);
     let came_elsewhere = headers.get("host").and_then(|v| v.to_str().ok()).is_some_and(|h| h.starts_with("localhost"));
     let signed_upload = f.mode.upload_elsewhere && method == Method::PUT && path.contains("/blobs/uploads/") && uri.query().unwrap_or_default().contains("state=x");
     if f.mode.login && auth != format!("Bearer {TOKEN}") && !signed_upload {
-        let challenge = format!(r#"Bearer realm="http://{}/token",service="fake",scope="repository:x:pull""#, f.addr);
+        let realm = match f.mode.token_elsewhere {
+            true => format!("{elsewhere}/token-first"),
+            false => format!("http://{}/token", f.addr),
+        };
+        let challenge = format!(r#"Bearer realm="{realm}",service="fake",scope="repository:x:pull""#);
         return reply(StatusCode::UNAUTHORIZED, &[("www-authenticate", challenge)], vec![]);
     }
     let Some(rest) = path.strip_prefix("/v2/") else { return reply(StatusCode::NOT_FOUND, &[], vec![]) };
@@ -856,6 +866,20 @@ fn certs_d(regs: &[&Fake]) -> PathBuf {
         std::fs::write(d.join(&r.addr).join("client.key"), key).unwrap();
     }
     d
+}
+
+#[tokio::test]
+async fn a_token_service_elsewhere_may_redirect_and_gets_no_client_certificate() {
+    let src = serve(Mode { login: true, token_elsewhere: true, ..Mode::default() }).await;
+    let p = publish(&src, false);
+    let got = fetch::fetch(&settings(&[&src], Some(LOGIN)), &repo(&src, REPO), &p.index, &p.arm64, &tmp("token").join("o")).await.unwrap();
+    assert_eq!((got.referrers, got.attestations), (5, 1), "a redirect within the token service is followed, with the login");
+
+    let src = serve(Mode { login: true, token_elsewhere: true, tls: true, client_cert: true, ..Mode::default() }).await;
+    let p = publish(&src, false);
+    let cfg = Settings { cert_dirs: vec![certs_d(&[&src])], ..settings(&[&src], Some(LOGIN)) };
+    let e = fetch::fetch(&cfg, &repo(&src, REPO), &p.index, &p.arm64, &tmp("token").join("o")).await.unwrap_err();
+    assert!(e.contains("token service"), "the token service on another host gets no certificate (this one wants one): {e}");
 }
 
 #[tokio::test]
