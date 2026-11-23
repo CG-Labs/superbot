@@ -144,19 +144,6 @@ pub(crate) async fn joined(app: &AppState, a: &Auth, by: &Who, tenant: &str, tea
     }
 }
 
-/// [`joined`] again, for `user_id` named again while on the team already: a join a
-/// restart cut short gets its mapped roles. Skips aren't audited; the join audited them.
-pub(crate) async fn rejoined(app: &AppState, a: &Auth, by: &Who, tenant: &str, team_id: &str, user_id: &str) {
-    if !a.scim.group_roles {
-        return;
-    }
-    for m in app.db.scim_role_mappings_of(tenant, team_id) {
-        if let Some(role) = app.db.custom_role(&m.role_id) {
-            let _ = grant(app, by, &m, &role, user_id).await;
-        }
-    }
-}
-
 /// `user_id` left `team_id`, by SCIM or any other way: what its group's mappings gave
 /// them goes.
 pub(crate) async fn left(app: &AppState, by: &Who, team_id: &str, user_id: &str) {
@@ -166,6 +153,7 @@ pub(crate) async fn left(app: &AppState, by: &Who, team_id: &str, user_id: &str)
         }
     }
     super::role_groups::left_team(app, by, team_id, user_id);
+    app.db.end_scim_join(user_id);
 }
 
 /// Whether a mapping of the group `team_id` is gave `user_id` their role across the server.

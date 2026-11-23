@@ -2321,7 +2321,12 @@ fn migrate_scim_team_role_groups(c: &Connection, _fresh: bool) -> rusqlite::Resu
           granted_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS scim_role_group_team_grants_group ON scim_role_group_team_grants(group_id);
-        CREATE INDEX IF NOT EXISTS scim_role_group_team_grants_team ON scim_role_group_team_grants(team_id);",
+        CREATE INDEX IF NOT EXISTS scim_role_group_team_grants_team ON scim_role_group_team_grants(team_id);
+        CREATE TABLE IF NOT EXISTS scim_pending_joins (
+          user_id TEXT PRIMARY KEY,
+          team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+          at INTEGER NOT NULL
+        );",
     )
 }
 
@@ -6019,6 +6024,23 @@ impl Db {
 
     pub fn remove_scim_role_group_member(&self, group_id: &str, user_id: &str) -> bool {
         self.c().execute("DELETE FROM scim_role_group_members WHERE group_id = ? AND user_id = ?", [group_id, user_id]).unwrap_or(0) > 0
+    }
+
+    /// Notes that SCIM is putting `user_id` on `team_id` and hasn't yet offered the roles
+    /// the join gives (ADR 0206): saved before the join, cleared once they're offered.
+    pub fn begin_scim_join(&self, team_id: &str, user_id: &str) -> bool {
+        self.c().execute("INSERT OR REPLACE INTO scim_pending_joins (user_id, team_id, at) VALUES (?1, ?2, ?3)", params![user_id, team_id, now()]).is_ok()
+    }
+
+    pub fn end_scim_join(&self, user_id: &str) {
+        let _ = self.c().execute("DELETE FROM scim_pending_joins WHERE user_id = ?", [user_id]);
+    }
+
+    /// Who SCIM put on `team_id` without finishing the join's role offers: a restart cut it short.
+    pub fn scim_pending_joins(&self, team_id: &str) -> Vec<String> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT user_id FROM scim_pending_joins WHERE team_id = ? ORDER BY at, user_id").unwrap();
+        s.query_map([team_id], |r| r.get(0)).unwrap().filter_map(Result::ok).collect()
     }
 
     /// The role groups `user_id` is in, oldest declared first: the order roles are offered.

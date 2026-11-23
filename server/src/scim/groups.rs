@@ -270,17 +270,15 @@ pub struct Patched {
     pub external_id: Option<String>,
     pub members: HashSet<String>,
     order: Vec<String>,
-    named: Vec<String>,
 }
 
 impl Patched {
     pub fn new(display_name: &str, external_id: Option<&str>, members: &[String]) -> Patched {
-        Patched { display_name: display_name.into(), external_id: external_id.map(String::from), members: members.iter().cloned().collect(), order: members.to_vec(), named: Vec::new() }
+        Patched { display_name: display_name.into(), external_id: external_id.map(String::from), members: members.iter().cloned().collect(), order: members.to_vec() }
     }
 
     fn add(&mut self, ids: Vec<String>) {
         for id in ids {
-            self.named.push(id.clone());
             if self.members.insert(id.clone()) {
                 self.order.push(id);
             }
@@ -305,14 +303,6 @@ impl Patched {
         let mut seen = HashSet::new();
         let new = self.order.iter().filter(|id| self.members.contains(*id) && !was.contains(id) && seen.insert(id.as_str())).cloned().collect();
         (gone, new)
-    }
-
-    /// Who the request adds (or replaces the list with) that it started with and keeps:
-    /// an IdP retrying a change a restart cut short names them again.
-    pub fn again(&self, before: &[String]) -> Vec<String> {
-        let was: HashSet<&String> = before.iter().collect();
-        let mut seen = HashSet::new();
-        self.named.iter().filter(|id| was.contains(id) && self.members.contains(*id) && seen.insert(id.as_str())).cloned().collect()
     }
 }
 
@@ -413,9 +403,10 @@ struct Moved {
 /// leave. A join refused by a race (someone joined another team meanwhile) stops there
 /// with a 409, and a leave that failed (ADR 0171) with a 500; what was done stays done,
 /// and the IdP's retry finishes it. A join is saved before the machine work it waits on,
-/// so `again`, members named again who are on the team already, are offered the team
-/// group's mappings and their team role groups quietly: a restart may have cut theirs short.
-async fn change_members(app: &AppState, a: &Auth, c: &Caller, team: &Team, gone: &[String], new: &[String], again: &[String]) -> ScimRes<Moved> {
+/// so it is noted as pending until its roles are offered: the next change to the team's
+/// members offers them to anyone a restart left pending, and only to them, so a role an
+/// admin took away stays away.
+async fn change_members(app: &AppState, a: &Auth, c: &Caller, team: &Team, gone: &[String], new: &[String]) -> ScimRes<Moved> {
     let mut m = Moved::default();
     for id in gone {
         let owner = app.db.team_member(id).is_some_and(|x| x.team_id == team.id && x.role == teams::OWNER);
@@ -430,21 +421,38 @@ async fn change_members(app: &AppState, a: &Auth, c: &Caller, team: &Team, gone:
     }
     for id in new {
         let Some(u) = app.db.user(id) else { continue };
+        if !app.db.begin_scim_join(&team.id, id) {
+            return Err(server_error("The join wasn't saved"));
+        }
         match teams::join_from_scim(app, &c.who, team, &u).await {
             Ok(_) => {
-                super::roles::joined(app, a, &c.who, &c.token.tenant, &team.id, id).await;
-                role_groups::joined_team(app, a, &c.who, id).await;
+                offer_joined(app, a, c, team, id).await;
                 m.added.push(id.clone())
             }
-            Err(e) if e.0 == StatusCode::CONFLICT && app.db.team_id_of(id).as_deref() == Some(team.id.as_str()) => {}
-            Err(e) => return Err(uniqueness(format!("{id}: {}", e.1))),
+            Err(e) => {
+                app.db.end_scim_join(id);
+                if !(e.0 == StatusCode::CONFLICT && app.db.team_id_of(id).as_deref() == Some(team.id.as_str())) {
+                    return Err(uniqueness(format!("{id}: {}", e.1)));
+                }
+            }
         }
     }
-    for id in again.iter().filter(|id| app.db.team_id_of(id).as_deref() == Some(team.id.as_str())) {
-        super::roles::rejoined(app, a, &c.who, &c.token.tenant, &team.id, id).await;
-        role_groups::joined_team(app, a, &c.who, id).await;
+    for id in app.db.scim_pending_joins(&team.id) {
+        if app.db.team_id_of(&id).as_deref() == Some(team.id.as_str()) {
+            offer_joined(app, a, c, team, &id).await;
+        } else {
+            app.db.end_scim_join(&id);
+        }
     }
     Ok(m)
+}
+
+/// Offers what joining `team` gives `user_id`: the team group's mappings, then their team
+/// role groups. The join is finished.
+async fn offer_joined(app: &AppState, a: &Auth, c: &Caller, team: &Team, user_id: &str) {
+    super::roles::joined(app, a, &c.who, &c.token.tenant, &team.id, user_id).await;
+    role_groups::joined_team(app, a, &c.who, user_id).await;
+    app.db.end_scim_join(user_id);
 }
 
 fn need(app: &AppState, c: &Caller, id: &str) -> ScimRes<(ScimGroup, Team)> {
@@ -565,7 +573,6 @@ pub async fn create(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
                 p.replace(m.clone());
             }
             let (gone, joining) = p.delta(&before);
-            let again = p.again(&before);
             check_new(&app, &c, Some(&link.team_id), &joining)?;
             let g = app.db.save_scim_group(tenant, &link.team_id, d.external_id.as_deref(), &d.display_name, &team_name(&d.display_name), true).map_err(group_conflict)?;
             let team = app.db.team(&g.team_id).ok_or_else(|| missing("Group"))?;
@@ -573,7 +580,7 @@ pub async fn create(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
             app.db.record(&c.who.event(action).target("team", &g.team_id).details(json!({
                 "tenant": tenant, "team": g.team_id, "externalId": g.external_id, "displayName": g.display_name, "linkedBy": link.created_by,
             })));
-            let moved = change_members(&app, &a, &c, &team, &gone, &joining, &again).await.inspect_err(|_| app.db.reopen_scim_group(tenant, &g.team_id))?;
+            let moved = change_members(&app, &a, &c, &team, &gone, &joining).await.inspect_err(|_| app.db.reopen_scim_group(tenant, &g.team_id))?;
             record_update(&app, &c, &link, &g, &moved);
             g
         }
@@ -585,7 +592,7 @@ pub async fn create(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
             app.db.record(&c.who.event("scim.group_created").target("team", &team.id).details(json!({
                 "tenant": tenant, "team": team.id, "externalId": g.external_id, "displayName": g.display_name,
             })));
-            change_members(&app, &a, &c, &team, &[], &new, &[]).await.inspect_err(|_| app.db.reopen_scim_group(tenant, &g.team_id))?;
+            change_members(&app, &a, &c, &team, &[], &new).await.inspect_err(|_| app.db.reopen_scim_group(tenant, &g.team_id))?;
             g
         }
     };
@@ -610,10 +617,9 @@ async fn update(app: &AppState, a: &Auth, c: &Caller, before: &ScimGroup, team: 
         return Err(uniqueness("Another group in this tenant has this displayName or externalId."));
     }
     let (gone, new) = p.delta(members);
-    let again = p.again(members);
     check_new(app, c, Some(&team.id), &new)?;
     let g = app.db.save_scim_group(&c.token.tenant, &team.id, p.external_id.as_deref(), &p.display_name, &team_name(&p.display_name), true).map_err(group_conflict)?;
-    let moved = change_members(app, a, c, team, &gone, &new, &again).await?;
+    let moved = change_members(app, a, c, team, &gone, &new).await?;
     record_update(app, c, before, &g, &moved);
     Ok(app.db.scim_group(&c.token.tenant, &team.id).unwrap_or(g))
 }
@@ -685,7 +691,7 @@ pub async fn delete(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
     }
     let (g, team) = need(&app, &c, &id)?;
     let members: Vec<String> = app.db.scim_group_members(&c.token.tenant, &team.id, true).into_iter().map(|u| u.id).collect();
-    let moved = change_members(&app, &a, &c, &team, &members, &[], &[]).await?;
+    let moved = change_members(&app, &a, &c, &team, &members, &[]).await?;
     super::roles::group_gone(&app, &a, &c.who, &team.id).await;
     app.db.unlink_scim_group(&team.id);
     let left = app.db.team_members(&team.id).len();
