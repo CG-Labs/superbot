@@ -66,6 +66,23 @@ describe("residencyLines (ADR 0168)", () => {
     const host = residencyLines(view({ status: "data_outside" }));
     expect(host.warnings).toEqual(["Some of your data is outside gb-lon. Your admins see a warning about it."]);
   });
+
+  it("says where the server's own copy of your account and chats is, when the server says (ADR 0184)", () => {
+    expect(residencyLines(view({ serverData: { region: "gb-lon", inRegion: true } })).lines).toContain("SuperBot's own copy of your account and chats is in gb-lon.");
+    const elsewhere = residencyLines(view({ serverData: { region: "de-fra-2", inRegion: false } }));
+    expect(elsewhere.lines).toContain("SuperBot's own copy of your account and chats isn't in gb-lon; it is in de-fra-2. Your agreement says where it is.");
+    expect(elsewhere.warnings).toEqual([]);
+    expect(residencyLines(view({ serverData: { region: null, inRegion: false } })).lines).toContain("SuperBot's own copy of your account and chats isn't in gb-lon. Your agreement says where it is.");
+    const backups = residencyLines(view({ serverData: { region: "gb-lon", inRegion: false, backupsInRegion: false } }));
+    expect(backups.lines).toContain("SuperBot's own copy of your account and chats is in gb-lon, but its backups aren't kept there. Your agreement says where it is.");
+    expect(residencyLines(view()).lines.some((l) => l.includes("SuperBot's own copy"))).toBe(false);
+  });
+
+  it("warns, once, when the server holds pins to its own region and isn't in yours (ADR 0184)", () => {
+    const held = residencyLines(view({ status: "data_outside", serverData: { region: "de-fra-2", inRegion: false, backupsInRegion: true, required: true } }));
+    expect(held.warnings).toEqual(["SuperBot's own copy of your account and chats isn't in gb-lon; it is in de-fra-2. Your admins see a warning about it."]);
+    expect(held.lines.some((l) => l.includes("SuperBot's own copy"))).toBe(false);
+  });
 });
 
 describe("reports", () => {

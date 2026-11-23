@@ -450,6 +450,10 @@ async fn main() {
     }
     let server_backups = server_backups::ServerBackups::from_env(&startup_store, &|k| env(k, ""), &data_dir)
         .unwrap_or_else(|e| exit(format!("Server backups: {e}")));
+    let off_host = server_backups.target.as_ref().map(|t| (t.source, t.destination()));
+    control_plane.server_data = machines::server_data::ServerData::from_env(&|k| env(k, ""), &control_plane.regions, off_host)
+        .unwrap_or_else(|e| exit(format!("Server data region: {e}")));
+    log_info!("Server data region: {} (ADR 0184).", control_plane.server_data.describe());
     // Machine enrollment's CA key is derived from the master key (ADR 0031).
     let bin_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
     // Users' machines get the managed tiers' default harnesses unless told otherwise (ADR 0079).

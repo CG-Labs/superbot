@@ -92,8 +92,9 @@ fn own_pin_fields(app: &App, p: &ResidencyPin, v: &mut Value) {
 }
 
 /// `GET /api/me/residency`: the pin that holds your data (your team's, else your own), or
-/// null; whether your machine and backups are in its region and your plan's model routes
-/// are held there; and which reports you can get.
+/// null; whether your machine and backups are in its region, your plan's model routes are
+/// held there, and botd's own copy of your account and chats is (ADR 0184); and which
+/// reports you can get.
 pub async fn view(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>) -> Res {
     let u = me(&c)?;
     let cp = &*a.machines;
@@ -126,7 +127,13 @@ pub async fn view(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>,
         reports.push("user");
     }
     let you = residency_report::person(&app, cp, &u.id, &p.region).unwrap_or(Value::Null);
-    let status = if outside(&app, cp, &u.id, &p.region).is_empty() { "kept" } else { "data_outside" };
+    let kept = outside(&app, cp, &u.id, &p.region).is_empty() && cp.server_data.refuses(&p.region).is_empty();
+    let status = if kept { "kept" } else { "data_outside" };
+    let sd = &cp.server_data;
+    let server_data = json!({
+        "region": sd.region, "inRegion": sd.outside(&p.region).is_empty(), "backupsInRegion": sd.backups_in(&p.region),
+        "required": sd.policy == super::server_data::Policy::Require,
+    });
     Ok(Json(json!({
         "pin": pin,
         "ownPin": own_pin,
@@ -134,6 +141,7 @@ pub async fn view(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>,
         "machine": you["machine"],
         "backups": you["backups"],
         "modelRoutes": { "inRegion": you["modelRoutes"]["inRegion"], "gap": you["modelRoutes"]["gap"] },
+        "serverData": server_data,
         "reports": reports,
     })))
 }

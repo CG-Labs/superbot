@@ -84,6 +84,25 @@ describe("Sidebar admin entries", () => {
     expect(screen.queryByText("Service accounts")).toBeNull();
     expect(screen.getByText("Approvals")).toBeOnTheScreen();
   });
+
+  it("shows a delegate with users.manage their own service accounts, and no admin entries (ADR 0182)", async () => {
+    const props = setup({ name: "Del", role: "member", permissions: ["account", "read", "review", "write", "approve", "users.manage"] });
+    const user = userEvent.setup();
+    await render(<Sidebar {...props} />);
+    await user.press(screen.getByText("Your service accounts"));
+    expect(props.onOpenServiceAccounts).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Users")).toBeNull();
+    expect(screen.queryByText("Roles")).toBeNull();
+  });
+
+  it.each([
+    ["member", { name: "Alex", role: "member", permissions: ["account", "read", "review", "write", "approve"] }],
+    ["an admin", { name: "Owner", role: "admin", permissions: ALL }],
+    ["a server from before roles", { name: "You" }],
+  ] as [string, Me][])("doesn't show %s the delegate's entry", async (_, me) => {
+    await render(<Sidebar {...setup(me)} />);
+    expect(screen.queryByText("Your service accounts")).toBeNull();
+  });
 });
 
 describe("Sidebar plan entry (ADR 0042)", () => {

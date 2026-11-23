@@ -205,13 +205,15 @@ The Provider pins the covered team or users to the Agreed Region in the Service,
 
 (e) Bots' runs for the covered team or users send model calls only to provider endpoints the Provider marks as in the Agreed Region, including fallbacks and the harness's side tasks; a run with no such endpoint is refused ([IV.4](#iv4-model-providers));
 
-(f) every pin, unpin and refusal is recorded in the audit log, with the reference.
+(f) every pin, unpin and refusal is recorded in the audit log, with the reference;
+
+(g) **[Only if the Provider runs the server and its backup store in the Agreed Region; otherwise delete.]** the Service's own data (its database and files, and server backups) is in the Agreed Region: the Provider states so in the Service (`SERVER_DATA_REGION`, and the region of the server backups' off-host store), and the residency report shows it ([ADR 0184](../adr/0184-botds-own-data-region.md)). **[If the Provider runs with `RESIDENCY_SERVER_DATA=require`: the Service refuses any pin to another region and doesn't start unless server backups' off-host copies are in the Agreed Region.]**
 
 ### IV.2 What the pin doesn't cover
 
 | Data | Where it is | Note |
 |------|-------------|------|
-| The control plane: the Service's database (accounts, chat history, routines, sealed secrets, the audit log), the files beside it, and server backups | **[Where the Provider runs the server and keeps its backups, e.g. also London]** | The pin doesn't move or hold these. They are in the Agreed Region only if the Provider runs the server and its backup store there; say so here only if it does. |
+| The control plane: the Service's database (accounts, chat history, routines, sealed secrets, the audit log), the files beside it, and server backups | **[Where the Provider runs the server and keeps its backups, e.g. also London]** | The pin doesn't move these. They are in the Agreed Region only if the Provider runs the server and its backup store there; then IV.1(g) applies and this row can say "covered by IV.1(g)". The residency report's "botd's own data" section shows where the Provider states they are ([ADR 0184](../adr/0184-botds-own-data-region.md)). |
 | Model calls outside the plan's routes | [IV.4](#iv4-model-providers) | The pin holds the plan's routes (IV.1(e)). It doesn't hold what a Bot's own tools send, such as a script calling an API with a key the user saved. |
 | Push notifications, email, webhooks, billing and sign-in | As [Annex III](#annex-iii-subprocessors) says | |
 | Harness logins with a person's own subscription | The model provider, under the person's own account | Not the Provider's Subprocessor (Annex III). |
@@ -245,7 +247,7 @@ Mark an endpoint as in the Agreed Region only if the provider's terms for that e
 
 On request **[or: every [period]]**, under [Section 9](#9-assistance-records-and-audits), the Provider gives the Customer:
 
-- the residency report for each pin (`botctl team residency <team> report`, or the admin API, [ADR 0155](../adr/0155-residency-reports.md)): where each covered person's machine, host and backups are, whether all of it is in the Agreed Region, the pin's changes, what it refused and how many runs it held to in-region routes in the period, and what it doesn't cover, sealed with a SHA-256 digest the Customer can check (`jq -cjS 'del(.digest)' report.json | sha256sum`). The Customer's people a pin covers see it in the app, and can download the report on their own pin, and the team's owners and admins the report on the team's pin, at any time ([ADR 0168](../adr/0168-residency-in-the-app.md));
+- the residency report for each pin (`botctl team residency <team> report`, or the admin API, [ADR 0155](../adr/0155-residency-reports.md)): where each covered person's machine, host and backups are, whether all of it is in the Agreed Region, the pin's changes, what it refused and how many runs it held to in-region routes in the period, where the Provider states the Service's own data is, and what it doesn't cover, sealed with a SHA-256 digest the Customer can check (`jq -cjS 'del(.digest)' report.json | sha256sum`). The Customer's people a pin covers see it in the app, and can download the report on their own pin, and the team's owners and admins the report on the team's pin, at any time ([ADR 0168](../adr/0168-residency-in-the-app.md));
 - the audit log entries for the covered team and users, filtered by action and exported as CSV: `user.residency_pinned`, `team.residency_pinned`, `user.residency_pin_kept` (a leaver keeping the team's pin), `user.residency_unpinned`, `team.residency_unpinned`, the `*_pin_refused` and `*_change_refused` entries, `team.join_refused`, `team.delete_refused` and `machine.residency_refused`, and `bot.run_refused` with reason `residency_pinned`, and `residency.startup_refused`; each run's `harness.invoked` entry shows the regions it was held to and any fallback left out;
 - the regions view (`botctl regions`, or the admin API): each pin, its reference, and any warning that the Service can't keep it;
 - for each machine, its region and host, and for each backup, the store and region it was kept in.
