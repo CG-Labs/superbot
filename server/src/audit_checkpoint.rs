@@ -90,7 +90,7 @@ pub fn statement(seq: i64, hash: &str, at: i64, key: &str) -> String {
 
 /// What a checkpoint's RFC 3161 token stamps: the statement and its signature.
 pub fn imprint(statement: &str, signature: &str) -> [u8; 32] {
-    Sha256::digest(format!("{statement}\nsig={signature}").as_bytes()).into()
+    crate::audit_line::imprint(statement, signature)
 }
 
 /// botd's signing key.
@@ -794,8 +794,9 @@ pub fn check_stamp<'c>(id: i64, d: Option<&Value>, found: Option<&'c Checkpoint>
 }
 
 /// What the SIEM export adds to checkpoint events: the record with its statement and
-/// token, so the SIEM can check both without botd.
-pub fn export_extras(db: &Db, rows: &[crate::db::AuditEvent]) -> BTreeMap<i64, Value> {
+/// token, so the SIEM can check both without botd. A record that can't be read fails the
+/// batch, to be sent again, rather than going out without its token (ADR 0207).
+pub fn export_extras(db: &Db, rows: &[crate::db::AuditEvent]) -> rusqlite::Result<BTreeMap<i64, Value>> {
     let mut out = BTreeMap::new();
     for e in rows {
         let id = match e.action.as_str() {
@@ -803,7 +804,8 @@ pub fn export_extras(db: &Db, rows: &[crate::db::AuditEvent]) -> BTreeMap<i64, V
             TIMESTAMPED => e.details["checkpoint"].as_i64(),
             _ => None,
         };
-        if let Some(c) = id.and_then(|id| db.with_conn(|c| row(c, id)).ok().flatten()) {
+        let Some(id) = id else { continue };
+        if let Some(c) = db.with_conn(|c| row(c, id))? {
             let mut v = c.view();
             if e.action == CHECKPOINT {
                 // Its token comes later, with its own event.
@@ -812,7 +814,7 @@ pub fn export_extras(db: &Db, rows: &[crate::db::AuditEvent]) -> BTreeMap<i64, V
             out.insert(e.id, v);
         }
     }
-    out
+    Ok(out)
 }
 
 fn chain_head(c: &Connection) -> rusqlite::Result<Option<Link>> {
@@ -1235,7 +1237,7 @@ mod tests {
         assert_eq!(prune_to(c.id), Some(c.id));
         assert!(app.db.with_conn(|x| row(x, c.id)).unwrap().is_some(), "kept for its timestamp event");
         let rows = app.db.audit_events(&crate::audit::Filter::default(), 100, true);
-        assert_eq!(export_extras(&app.db, &rows)[&ev]["timestamp"]["token"].as_str(), Some(b64().encode(&token).as_str()));
+        assert_eq!(export_extras(&app.db, &rows).unwrap()[&ev]["timestamp"]["token"].as_str(), Some(b64().encode(&token).as_str()));
         let r = checks(&app, Options::default());
         assert_eq!((r.ok, r.checkpoints.as_ref().unwrap().timestamped), (true, 1), "{r:?}");
         // A pruned checkpoint's record kept with no timestamp event is named.
@@ -1281,7 +1283,7 @@ mod tests {
         some_events(&app, 1);
         let c = create(&app, &Who::system("test"), Trigger::Api).unwrap();
         let rows = app.db.audit_events(&crate::audit::Filter::default(), 100, true);
-        let extras = export_extras(&app.db, &rows);
+        let extras = export_extras(&app.db, &rows).unwrap();
         assert_eq!(extras.len(), 1);
         let v = &extras[&c.id];
         assert_eq!((v["statement"].as_str(), v["timestamp"]["status"].as_str()), (Some(c.statement().as_str()), Some("off")));

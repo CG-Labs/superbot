@@ -45,7 +45,9 @@ export function archiveCheckLine(v: AuditVerification | null): ChainLine | null 
   }
   const read = a.after != null ? `${a.objects} new object${a.objects === 1 ? "" : "s"} read` : `all ${a.objects} objects read`;
   const to = a.head ? `Intact to event ${a.head.id}` : "Intact, nothing archived yet";
-  return { label, text: `${to}: ${read}, ${when(v.at)}`, tone: "ok" };
+  const n = a.timestamps ?? 0;
+  const stamps = n > 0 ? `, ${n} timestamp${n === 1 ? "" : "s"} checked${a.trustedTimestamps != null ? ` (${a.trustedTimestamps} trusted)` : ""}` : "";
+  return { label, text: `${to}: ${read}${stamps}, ${when(v.at)}`, tone: "ok" };
 }
 
 export function checkpointLine(c: AuditCheckpoint | null, everyMinutes: number): ChainLine {

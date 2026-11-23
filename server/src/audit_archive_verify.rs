@@ -6,7 +6,8 @@
 //! version that differs is a failure. Each object must be what its key and metadata say
 //! and be locked; the chain must run on from event to event and object to object with no
 //! gap; each signed checkpoint in it must hold under the trusted keys; and the archive
-//! must reach as far as botd says it delivered. Then every event in it must have the same
+//! must reach as far as botd says it delivered; and each checkpoint's RFC 3161 token in it
+//! must be the one recorded and verify (ADR 0207). Then every event in it must have the same
 //! hash in this server's log, which catches a log rebuilt from a changed event on: its
 //! own chain holds, but it no longer matches what was archived.
 //!
@@ -41,7 +42,8 @@ const MAX_LISTED: usize = 20;
 /// botd didn't name), `unreadable`, `overwritten` (a later version of the object differs
 /// from the one botd wrote), `metadata` (its key or metadata doesn't match its events),
 /// `unlocked`, `order` (its events are out of order), `link` (an event doesn't link to the
-/// one before: an object is missing, or isn't botd's), `checkpoint`, `behind` (the archive
+/// one before: an object is missing, or isn't botd's), `checkpoint`, `timestamp` (a
+/// checkpoint's token doesn't hold, ADR 0207), `behind` (the archive
 /// ends before the last event botd delivered to it), `start` (it begins after the first
 /// event botd sent it), `digest` (an event's hash doesn't follow from what its line says,
 /// ADR 0199), `unbound` (an event botd sent with its digest has none), or, against this
@@ -78,6 +80,11 @@ pub struct Checked {
     pub lock_expired: u64,
     /// Signed checkpoints in the archive that hold.
     pub checkpoints: u64,
+    /// Their RFC 3161 timestamps whose token holds in every copy (ADR 0207), those whose TSA chains to
+    /// `AUDIT_TIMESTAMP_CA_FILE` (None when it isn't set), and the newest.
+    pub timestamps: u64,
+    pub trusted_timestamps: Option<u64>,
+    pub last_timestamp: Option<crate::audit_line::LastStamp>,
     /// The first event, and the newest with its hash.
     pub first: Option<i64>,
     pub head: Option<Link>,
@@ -254,6 +261,12 @@ pub struct Walker<'a> {
     rep: Checked,
     lock: Lock,
     keys: &'a [Vec<u8>],
+    trust: crate::tsa::Trust,
+    /// Each checkpoint's details as the archive first holds them, for its timestamp.
+    signed: BTreeMap<i64, Value>,
+    /// Timestamp events with a copy that held, and those with a copy that didn't.
+    stamps: BTreeMap<i64, crate::audit_line::Stamped>,
+    unstamped: std::collections::BTreeSet<i64>,
     /// The last event walked, which the next must link to. None at the start, and after an
     /// object that couldn't be read (already a failure).
     last: Option<Link>,
@@ -261,7 +274,51 @@ pub struct Walker<'a> {
 
 impl<'a> Walker<'a> {
     pub fn new(a: &Archive, delivered: i64, keys: &'a [Vec<u8>]) -> Walker<'a> {
-        Walker { rep: Checked { archive: a.shown(), delivered, ..Default::default() }, lock: a.lock, keys, last: None }
+        Walker { rep: Checked { archive: a.shown(), delivered, ..Default::default() }, lock: a.lock, keys, trust: Default::default(), signed: BTreeMap::new(), stamps: BTreeMap::new(), unstamped: Default::default(), last: None }
+    }
+
+    /// The CAs a timestamp's TSA must chain to (`AUDIT_TIMESTAMP_CA_FILE`).
+    pub fn trusting(mut self, trust: crate::tsa::Trust) -> Walker<'a> {
+        self.rep.trusted_timestamps = trust.is_set().then_some(0);
+        self.trust = trust;
+        self
+    }
+
+    /// A checkpoint's details, kept for its timestamp, which comes later.
+    fn signed(&mut self, e: &Line) {
+        if e.action == crate::audit_checkpoint::CHECKPOINT {
+            self.signed.entry(e.id).or_insert_with(|| e.details.clone());
+        }
+    }
+
+    /// An `audit.checkpoint_timestamped` event's token, from what its line carries, every
+    /// copy of it: no hash covers the token, only its SHA-256 in the event's details.
+    fn stamp(&mut self, key: &str, e: &Line, repeat: bool) {
+        if e.action != crate::audit_line::TIMESTAMPED {
+            return;
+        }
+        let cp = e.details["checkpoint"].as_i64();
+        let signed = cp.and_then(|id| self.signed.get(&id));
+        match crate::audit_line::check_timestamp(&e.raw, signed, Some(self.keys), &self.trust) {
+            Ok(s) => {
+                self.stamps.entry(e.id).or_insert(s);
+            }
+            Err((reason, why)) => {
+                self.unstamped.insert(e.id);
+                let again = if repeat { format!(", repeated in {key}") } else { String::new() };
+                self.problem(Some(key), Some(e.id), "timestamp", format!("timestamp {} ({reason}){again}: {why}", e.id));
+            }
+        }
+    }
+
+    /// Timestamps count once, and only if every copy of them held.
+    fn tally_timestamps(&mut self) {
+        let held: Vec<(&i64, &crate::audit_line::Stamped)> = self.stamps.iter().filter(|(id, _)| !self.unstamped.contains(id)).collect();
+        self.rep.timestamps = held.len() as u64;
+        if let Some(n) = self.rep.trusted_timestamps.as_mut() {
+            *n = held.iter().filter(|(_, s)| s.trusted == Some(true)).count() as u64;
+        }
+        self.rep.last_timestamp = held.last().map(|(id, s)| crate::audit_line::LastStamp { id: **id, checkpoint: s.checkpoint, time: s.time });
     }
 
     pub fn starting_at(mut self, start: Option<i64>) -> Walker<'a> {
@@ -393,6 +450,8 @@ impl<'a> Walker<'a> {
                 {
                     self.problem(k, Some(e.id), "checkpoint", format!("checkpoint {} ({}), repeated in {key}: {}", e.id, f.reason, f.error));
                 }
+                self.signed(e);
+                self.stamp(key, e, true);
                 continue;
             }
             let before = self.last.take();
@@ -411,6 +470,8 @@ impl<'a> Walker<'a> {
                     Err(f) => self.problem(k, Some(e.id), "checkpoint", format!("checkpoint {} ({}): {}", e.id, f.reason, f.error)),
                 }
             }
+            self.signed(e);
+            self.stamp(key, e, false);
             self.rep.first.get_or_insert(e.id);
             let link = Link { id: e.id, hash: e.hash.clone() };
             self.rep.head = Some(link.clone());
@@ -478,6 +539,7 @@ impl<'a> Walker<'a> {
 
     /// `batches`: botd has cut a batch for this archive, so it has written to it.
     pub fn finish(mut self, range: Range, batches: bool) -> Checked {
+        self.tally_timestamps();
         let (d, start) = (self.rep.delivered, self.rep.start);
         let head = self.rep.head.as_ref().map_or(0, |h| h.id);
         // The part of the range botd has delivered to the archive, which must all be there.
@@ -727,7 +789,7 @@ pub async fn check_new(app: &App, x: &Exporter, a: &Archive, keys: &[Vec<u8>]) -
 pub async fn check(app: &App, a: &Archive, basis: &Basis, range: Range, since: Option<&Since>, keys: &[Vec<u8>]) -> Checked {
     use futures_util::StreamExt;
     let (delivered, batches) = (basis.delivered, basis.batches);
-    let mut w = Walker::new(a, delivered, keys).starting_at(basis.start).digests_after(basis.digests_after).resuming(since);
+    let mut w = Walker::new(a, delivered, keys).trusting(crate::audit_checkpoint::trust(app)).starting_at(basis.start).digests_after(basis.digests_after).resuming(since);
     let s3 = match S3::new(a.s3.clone()) {
         Ok(s) => s.called("the audit archive"),
         Err(e) => {
@@ -794,7 +856,7 @@ pub fn summary(c: &Checked) -> Value {
         "ok": c.ok, "archive": c.archive, "objects": c.objects, "skipped": c.skipped, "events": c.events, "first": c.first, "head": c.head, "delivered": c.delivered, "start": c.start, "after": c.after,
         "matched": c.matched, "altered": c.altered, "gone": c.gone, "mismatched": c.mismatched, "missing": c.missing, "locked": c.locked, "lockExpired": c.lock_expired,
         "bound": c.bound, "boundFixed": c.bound_fixed, "unbound": c.unbound,
-        "checkpoints": c.checkpoints, "problems": c.problems, "firstProblem": c.first_problems.first(), "error": c.error,
+        "checkpoints": c.checkpoints, "timestamps": c.timestamps, "trustedTimestamps": c.trusted_timestamps, "lastTimestamp": c.last_timestamp, "problems": c.problems, "firstProblem": c.first_problems.first(), "error": c.error,
     })
 }
 

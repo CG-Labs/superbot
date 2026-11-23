@@ -496,7 +496,7 @@ async fn run(app: Arc<App>, x: Arc<Exporter>, sealed_after: i64) {
     let batch_key = format!("{}#batch", x.sink.id);
     let start_key = format!("{}#start", x.sink.id);
     let mut retry_to: Option<i64> = x.sink.archive().and_then(|_| app.db.audit_export_cursor(&batch_key)).filter(|&b| b > x.delivered());
-    loop {
+    'export: loop {
         if let Some(a) = x.sink.archive()
             && retry_to.is_none()
             && !archive_batch_due(&app, a, x.delivered())
@@ -508,16 +508,19 @@ async fn run(app: Arc<App>, x: Arc<Exporter>, sealed_after: i64) {
         // Failures carry a reason code for the audit event beside the message.
         let rows = app.db.try_audit_events(&Filter { after: Some(x.delivered()), ..Default::default() }, x.sink.batch(), true).map_err(|e| ("unreadable", format!("couldn't read the audit log: {e}")));
         let sent = match rows {
-            Ok(mut rows) => {
+            Ok(mut rows) => 'batch: {
                 if let Some(to) = retry_to {
                     rows.retain(|e| e.id <= to);
                 }
                 let Some(last) = rows.last().map(|e| e.id) else {
                     tokio::time::sleep(IDLE).await;
-                    continue;
+                    continue 'export;
                 };
                 // Delivered only once the cursor is saved; if it can't be, the batch goes again.
-                let extras = crate::audit_checkpoint::export_extras(&app.db, &rows);
+                let extras = match crate::audit_checkpoint::export_extras(&app.db, &rows) {
+                    Ok(x) => x,
+                    Err(e) => break 'batch Err(("unreadable", format!("couldn't read a checkpoint's record: {e}"))),
+                };
                 let cut = match x.sink.archive().is_some() && retry_to.is_none() {
                     true => {
                         // Where the archive begins (ADR 0163), saved once with the first batch it ever gets.

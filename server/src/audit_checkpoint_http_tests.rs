@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A TSA on loopback: fails the first `fail` requests with HTTP 500, then answers with
 /// `answer` (None: a token for the request). Returns its URL and the request count.
-async fn tsa(fake: Arc<FakeTsa>, fail: usize, answer: Option<Vec<u8>>) -> (String, Arc<AtomicUsize>) {
+pub(crate) async fn tsa(fake: Arc<FakeTsa>, fail: usize, answer: Option<Vec<u8>>) -> (String, Arc<AtomicUsize>) {
     let tries = Arc::new(AtomicUsize::new(0));
     let count = tries.clone();
     let r = axum::Router::new().route(
@@ -37,7 +37,7 @@ async fn tsa(fake: Arc<FakeTsa>, fail: usize, answer: Option<Vec<u8>>) -> (Strin
     (format!("http://{addr}/tsr"), tries)
 }
 
-fn checkpoints_with(app: &AppState, vars: &[(&str, &str)]) {
+pub(crate) fn checkpoints_with(app: &AppState, vars: &[(&str, &str)]) {
     let map: std::collections::HashMap<&str, &str> = vars.iter().copied().collect();
     let s = Settings::from_env(&|k| map.get(k).map(|v| v.to_string()).unwrap_or_default()).unwrap();
     audit_checkpoint::start(app, s);

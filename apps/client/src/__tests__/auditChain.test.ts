@@ -113,6 +113,9 @@ describe("audit chain lines (ADR 0149)", () => {
     const archive = { ok: true, objects: 3, skipped: 40, head: { id: 43, hash: HASH }, after: 37, problems: 0, firstProblem: null };
     expect(archiveCheckLine({ ...v, archive })).toMatchObject({ label: "Archive check", tone: "ok", text: expect.stringContaining("Intact to event 43: 3 new objects read") });
     expect(archiveCheckLine({ ...v, archive: { ...archive, after: null, objects: 43 } })!.text).toContain("all 43 objects read");
+    expect(archiveCheckLine({ ...v, archive: { ...archive, timestamps: 2, trustedTimestamps: 2 } })!.text).toContain("3 new objects read, 2 timestamps checked (2 trusted), ");
+    expect(archiveCheckLine({ ...v, archive: { ...archive, timestamps: 1, trustedTimestamps: null } })!.text).toMatch(/1 timestamp checked, (?!\()/);
+    expect(archiveCheckLine({ ...v, archive: { ...archive, timestamps: 0 } })!.text).not.toContain("timestamp");
     const broken = { ...archive, ok: false, problems: 2, firstProblem: { key: null, id: 37, reason: "mismatch", error: "the log was rebuilt" } };
     expect(archiveCheckLine({ ...v, archive: broken })).toMatchObject({ tone: "bad", text: "Broken, 2 problems. First: mismatch at event 37: the log was rebuilt" });
     expect(archiveCheckLine({ ...v, archive: { ...broken, problems: 0, firstProblem: null, error: "s3:ListBucketVersions" } })!.text).toContain("First: s3:ListBucketVersions");
