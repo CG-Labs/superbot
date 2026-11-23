@@ -648,6 +648,8 @@ mod tests {
             on_behalf_of: None,
             chain_prev: None,
             chain_hash: None,
+            chain_digest: None,
+            chain_salt: None,
         }
     }
 

@@ -8,6 +8,9 @@
 
 #[path = "../support_report.rs"]
 mod support_report;
+#[path = "../audit_line.rs"]
+#[allow(dead_code)]
+mod audit_line;
 
 use serde_json::{json, Map, Value};
 use std::io::{BufRead, Read, Write};
@@ -229,6 +232,12 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    --archive: also read the write-once S3 archive,
                                                    check it has no gaps, and hold every event here
                                                    to the hash it has there
+  botctl audit verify-lines <file|dir|->... [--key <hex>]... [--digests-after <id>]
+                                                   Check exported events (SIEM or archive copies, any
+                                                   order) with no botd: each line's hash, the chain
+                                                   between them, signed checkpoints. --digests-after:
+                                                   digestsAfter from botctl audit siem, so lines with
+                                                   their digests taken out fail. Exits 1 on a break
   botctl audit siem                                The SIEM export: sink, delivered, pending, failing
   botctl audit chain                               The chain's state: head, last checkpoint and
                                                    timestamp, export lag, last check
@@ -897,6 +906,84 @@ fn verify_query(rest: &[&str]) -> Result<String, String> {
     Ok(if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) })
 }
 
+/// `botctl audit verify-lines <file|dir|->... [--key <hex>]... [--digests-after <id>]` (ADR 0199): checks
+/// exported events where they landed, with no botd. A directory is read for its
+/// `.jsonl`, `.ndjson`, `.json` and `.log` files, `-` is stdin.
+fn verify_lines(rest: &[&str], stdin: impl std::io::Read) -> Result<String, String> {
+    let (mut paths, mut keys, mut after) = (Vec::new(), Vec::new(), None);
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "--key" => keys.push(audit_line::parse_public_key(it.next().ok_or("--key needs a public key in hex (botctl audit key)")?)?),
+            "--digests-after" => after = Some(it.next().and_then(|v| v.parse::<i64>().ok()).ok_or("--digests-after needs an event id (digestsAfter in botctl audit siem)")?),
+            o if o.starts_with("--") => return Err(format!("Unknown audit verify-lines option \"{o}\". See botctl admin.")),
+            p => paths.push(p),
+        }
+    }
+    if paths.is_empty() {
+        return Err("Usage: botctl audit verify-lines <file|dir|->... [--key <public key hex>]... [--digests-after <event id>]".into());
+    }
+    let pinned = !keys.is_empty();
+    let mut lines = audit_line::Lines::new(pinned.then_some(keys)).digests_after(after);
+    let mut files = 0u64;
+    let mut stdin = Some(stdin);
+    for p in paths {
+        if p == "-" {
+            let mut text = String::new();
+            stdin.take().ok_or("stdin (-) can be read once")?.read_to_string(&mut text).map_err(|e| format!("stdin: {e}"))?;
+            read_lines(&mut lines, &text, "-");
+            files += 1;
+            continue;
+        }
+        for f in line_files(std::path::Path::new(p))? {
+            let bytes = std::fs::read(&f).map_err(|e| format!("{}: {e}", f.display()))?;
+            read_lines(&mut lines, &String::from_utf8_lossy(&bytes), &f.display().to_string());
+            files += 1;
+        }
+    }
+    let mut v = serde_json::to_value(lines.finish()).map_err(|e| e.to_string())?;
+    v["files"] = json!(files);
+    let mut notes = Vec::new();
+    if !pinned {
+        notes.push("No --key given: a checkpoint only shows its lines agree with whoever signed it. Pin botd's key (botctl audit key).");
+    }
+    if after.is_none() {
+        notes.push("No --digests-after given: lines with every chainDigest taken out would bind nothing and still pass. Pin digestsAfter (botctl audit siem).");
+    }
+    if !notes.is_empty() {
+        v["note"] = json!(notes.join(" "));
+    }
+    let out = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+    if v["ok"] == true { Ok(out) } else { Err(out) }
+}
+
+fn read_lines(lines: &mut audit_line::Lines, text: &str, name: &str) {
+    for (n, l) in text.lines().enumerate() {
+        lines.line(l, &format!("{name}:{}", n + 1));
+    }
+}
+
+/// `path` itself, or the event files under it, sorted so the output is stable.
+fn line_files(path: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    if !path.is_dir() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let mut out = Vec::new();
+    let mut dirs = vec![path.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        for entry in std::fs::read_dir(&d).map_err(|e| format!("{}: {e}", d.display()))? {
+            let p = entry.map_err(|e| format!("{}: {e}", d.display()))?.path();
+            if p.is_dir() {
+                dirs.push(p);
+            } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| ["jsonl", "ndjson", "json", "log"].contains(&x)) {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 fn flag<'a>(rest: &[&'a str], name: &str) -> Option<&'a str> {
     rest.windows(2).find(|w| w[0] == name).map(|w| w[1])
 }
@@ -1537,13 +1624,28 @@ fn saml_summary(v: &Value) -> String {
         s("metadataUrl"),
         s("idpEntityId"),
     );
+    let warnings = v["certificateWarnings"].as_array().map(Vec::as_slice).unwrap_or_default();
+    if !warnings.is_empty() {
+        out += "  Certificate warnings:\n";
+    }
+    for w in warnings {
+        let what = match w["role"].as_str() {
+            Some("sp_signing") => "SP signing certificate",
+            Some("sp_encryption") => "SP encryption certificate",
+            Some("idp_signing") => "IdP signing certificate",
+            _ => "IdP metadata signing certificate",
+        };
+        let stage = if w["stage"] == "next" { " (next key)" } else { "" };
+        out += &format!("    {what}{stage} SHA-256 {} expires {}{}\n      {}\n", w["certificate"].as_str().unwrap_or_default(), day(&w["notAfter"]), ending(w), w["action"].as_str().unwrap_or_default());
+    }
     let key = &v["spKey"];
     if let Some(c) = key["certificate"].as_object() {
         out += &format!(
-            "  SP signing certificate:   SHA-256 {} ({}), expires {}\n",
+            "  SP signing certificate:   SHA-256 {} ({}), expires {}{}\n",
             c["sha256"].as_str().unwrap_or_default(),
             key["from"].as_str().unwrap_or_default(),
-            day(&c["notAfter"])
+            day(&c["notAfter"]),
+            ending(&key["certificate"])
         );
     } else if let Some(p) = key["problem"].as_str() {
         out += &format!("  SP signing key:           {p}\n");
@@ -1552,10 +1654,11 @@ fn saml_summary(v: &Value) -> String {
     let enc = &v["spEncryptionKey"];
     if let Some(c) = enc["certificate"].as_object() {
         out += &format!(
-            "  SP encryption certificate: SHA-256 {} ({}), expires {}\n",
+            "  SP encryption certificate: SHA-256 {} ({}), expires {}{}\n",
             c["sha256"].as_str().unwrap_or_default(),
             enc["from"].as_str().unwrap_or_default(),
-            day(&c["notAfter"])
+            day(&c["notAfter"]),
+            ending(&enc["certificate"])
         );
     } else if let Some(p) = enc["problem"].as_str() {
         out += &format!("  SP encryption key:        {p}\n");
@@ -1578,7 +1681,7 @@ fn saml_summary(v: &Value) -> String {
         }
     );
     for c in v["metadataSigningCertificates"].as_array().into_iter().flatten() {
-        out += &format!("    Trusted signer: SHA-256 {} ({}), expires {}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]));
+        out += &format!("    Trusted signer: SHA-256 {} ({}), expires {}{}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]), ending(c));
     }
     let yes = |b: bool| if b { "yes" } else { "no" };
     out += &format!(
@@ -1622,7 +1725,7 @@ fn saml_summary(v: &Value) -> String {
         out += &format!("    Logout URL:  {slo}\n");
     }
     for c in idp["certificates"].as_array().into_iter().flatten() {
-        out += &format!("    Certificate SHA-256 {} ({}), expires {}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]));
+        out += &format!("    Certificate SHA-256 {} ({}), expires {}{}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]), ending(c));
     }
     out
 }
@@ -1643,13 +1746,24 @@ fn rollover_lines(key: &Value) -> String {
     }
     let next = &key["next"];
     if let Some(c) = next["certificate"].as_object() {
-        out += &format!("    Next: SHA-256 {}, expires {}: published, not yet in use{}\n", c["sha256"].as_str().unwrap_or_default(), day(&c["notAfter"]), used(next));
+        out += &format!("    Next: SHA-256 {}, expires {}{}: published, not yet in use{}\n", c["sha256"].as_str().unwrap_or_default(), day(&c["notAfter"]), ending(&next["certificate"]), used(next));
     }
     let prev = &key["previous"];
     if let Some(c) = prev["certificate"].as_object() {
         out += &format!("    Previous: SHA-256 {}: no longer published, still decrypts until retired{}\n", c["sha256"].as_str().unwrap_or_default(), used(prev));
     }
     out
+}
+
+/// After a certificate's end date: nothing while it's far off, else how soon it ends or that
+/// it has (ADR 0198).
+fn ending(c: &Value) -> String {
+    let days = c["daysLeft"].as_i64().unwrap_or_default();
+    match c["expiry"].as_str().or(c["state"].as_str()) {
+        Some("expired") => " (expired)".into(),
+        Some("expiring") => format!(" (in {days} day{})", if days == 1 { "" } else { "s" }),
+        _ => String::new(),
+    }
 }
 
 fn ago(s: u64) -> String {
@@ -1966,6 +2080,7 @@ fn run(args: &[String]) -> Result<String, String> {
             // A broken chain is a failure, so a cron job or CI step notices.
             if serde_json::from_str::<Value>(&res).ok().and_then(|v| v["ok"].as_bool()) == Some(false) { Err(res) } else { Ok(res) }
         }
+        ["audit", "verify-lines", rest @ ..] => verify_lines(rest, std::io::stdin()),
         ["audit", "siem"] => op("GET", "/api/audit/siem", None),
         ["audit", "chain"] => op("GET", "/api/audit/chain", None),
         ["audit", "key"] => op("GET", "/api/audit/checkpoints/key", None),
@@ -2541,6 +2656,45 @@ mod tests {
 
     /// Held by tests that set botctl's environment variables.
     static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn verify_lines_reads_files_dirs_and_stdin_without_botd() {
+        let lines: Vec<String> = audit_line::tests::chain(4).iter().map(|v| v.to_string()).collect();
+        let dir = std::env::temp_dir().join(format!("botctl-verify-lines-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("2026/11")).unwrap();
+        // Out of order, split across files, one as a syslog line, with a copy and noise.
+        std::fs::write(dir.join("2026/11/b.jsonl"), format!("{}\n{}\n", lines[3], lines[1])).unwrap();
+        std::fs::write(dir.join("a.log"), format!("<110>1 2026-11-01T00:00:00Z h superbot - - - {}\nnot an event\n", lines[0])).unwrap();
+        std::fs::write(dir.join("skip.txt"), "ignored by extension").unwrap();
+        let d = dir.to_str().unwrap();
+        let out: Value = serde_json::from_str(&verify_lines(&[d, "-"], format!("{}\n{}\n", lines[2], lines[1]).as_bytes()).unwrap()).unwrap();
+        assert_eq!((out["ok"].clone(), out["files"].clone(), out["ignored"].clone()), (json!(true), json!(3), json!(1)), "{out}");
+        assert_eq!((out["hosts"][0]["events"].clone(), out["hosts"][0]["copies"].clone(), out["hosts"][0]["bound"].clone()), (json!(4), json!(5), json!(5)), "{out}");
+        assert!(out["note"].as_str().unwrap().contains("botctl audit key"), "{out}");
+
+        let mut changed: Value = serde_json::from_str(&lines[2]).unwrap();
+        changed["details"] = json!({ "n": 99 });
+        std::fs::write(dir.join("c.json"), format!("{changed}\n")).unwrap();
+        let err: Value = serde_json::from_str(&verify_lines(&[d], std::io::empty()).unwrap_err()).unwrap();
+        assert_eq!(err["ok"], json!(false), "{err}");
+        assert_eq!(err["hosts"][0]["firstProblems"][0]["at"], json!(format!("{}:1", dir.join("c.json").display())), "{err}");
+
+        assert!(verify_lines(&[], std::io::empty()).unwrap_err().starts_with("Usage"));
+        assert!(verify_lines(&[d, "--key", "zz"], std::io::empty()).is_err());
+        assert!(verify_lines(&[d, "--digests-after", "x"], std::io::empty()).unwrap_err().contains("--digests-after needs"));
+        std::fs::remove_file(dir.join("c.json")).unwrap();
+        let mut bare: Value = serde_json::from_str(&lines[2]).unwrap();
+        bare.as_object_mut().unwrap().remove("chainDigest");
+        bare.as_object_mut().unwrap().remove("chainSalt");
+        let only = dir.join("only.ndjson");
+        std::fs::write(&only, format!("{bare}\n")).unwrap();
+        let o = only.to_str().unwrap();
+        assert!(verify_lines(&[o], std::io::empty()).is_ok(), "alone, nothing says it had a digest");
+        let err: Value = serde_json::from_str(&verify_lines(&[o, "--digests-after", "2"], std::io::empty()).unwrap_err()).unwrap();
+        assert_eq!((err["digestsAfter"].clone(), err["hosts"][0]["firstProblems"][0]["reason"].clone()), (json!(2), json!("unbound")), "{err}");
+        assert!(verify_lines(&[d, "--bogus"], std::io::empty()).unwrap_err().contains("--bogus"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn support_report_reads_a_file_or_stdin_without_botd() {
@@ -3296,6 +3450,29 @@ mod tests {
         v["authnContext"] = json!({ "required": ["mfa", "urn:okta:loa:2fa:any"], "methodsAttribute": "amr", "requested": false });
         let out = saml_summary(&v);
         assert!(out.contains("  Authentication context:   one of mfa, urn:okta:loa:2fa:any\n    Also read from attribute amr\n    Not requested: the IdP's own policy decides\n"), "{out}");
+    }
+
+    #[test]
+    fn saml_summary_warns_of_certificates_that_are_ending() {
+        let end = 1_900_000_000_000_i64;
+        let mut v = json!({ "provider": "corp", "label": "Corp", "idpEntityId": "https://idp.example/saml", "certificateWarnings": [] });
+        assert!(!saml_summary(&v).contains("Certificate warnings"));
+        v["spKey"] = json!({ "from": "secret", "certificate": { "sha256": "12:34", "subject": "CN=sp", "notAfter": end, "expiry": "expiring", "daysLeft": 1 } });
+        v["idp"] = json!({ "ssoUrl": "https://idp.example/sso", "certificates": [
+            { "sha256": "ab:cd", "subject": "CN=idp", "notAfter": end, "expiry": "expired", "daysLeft": 0 },
+            { "sha256": "ef:01", "subject": "CN=idp", "notAfter": end, "expiry": "ok", "daysLeft": 400 },
+        ] });
+        v["certificateWarnings"] = json!([
+            { "role": "sp_signing", "stage": null, "certificate": "12:34", "notAfter": end, "state": "expiring", "daysLeft": 1, "action": "Make a new key." },
+            { "role": "idp_signing", "stage": null, "certificate": "ab:cd", "notAfter": end, "state": "expired", "daysLeft": 0, "action": "Nothing to do." },
+            { "role": "sp_encryption", "stage": "next", "certificate": "56:78", "notAfter": end, "state": "expiring", "daysLeft": 12, "action": "Replace it." },
+        ]);
+        let out = saml_summary(&v);
+        assert!(out.contains("IdP entity ID:            https://idp.example/saml\n  Certificate warnings:\n    SP signing certificate SHA-256 12:34 expires 2030-03-17 (in 1 day)\n      Make a new key.\n"), "{out}");
+        assert!(out.contains("    IdP signing certificate SHA-256 ab:cd expires 2030-03-17 (expired)\n      Nothing to do.\n"), "{out}");
+        assert!(out.contains("    SP encryption certificate (next key) SHA-256 56:78 expires 2030-03-17 (in 12 days)\n"), "{out}");
+        assert!(out.contains("SP signing certificate:   SHA-256 12:34 (secret), expires 2030-03-17 (in 1 day)\n"), "{out}");
+        assert!(out.contains("    Certificate SHA-256 ab:cd (CN=idp), expires 2030-03-17 (expired)\n    Certificate SHA-256 ef:01 (CN=idp), expires 2030-03-17\n"), "{out}");
     }
 
     #[test]

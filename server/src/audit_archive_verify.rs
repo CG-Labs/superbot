@@ -17,6 +17,7 @@
 use crate::audit_archive::{Archive, Lock};
 use crate::audit_chain::{Link, Range};
 use crate::audit_export::Exporter;
+use crate::audit_line::{Bound, ERASABLE_FIELDS, FIXED_FIELDS};
 use crate::db::now;
 use crate::machines::s3::{ObjectVersion, S3};
 use crate::runner::App;
@@ -42,7 +43,9 @@ const MAX_LISTED: usize = 20;
 /// `unlocked`, `order` (its events are out of order), `link` (an event doesn't link to the
 /// one before: an object is missing, or isn't botd's), `checkpoint`, `behind` (the archive
 /// ends before the last event botd delivered to it), `start` (it begins after the first
-/// event botd sent it), or, against this server's log,
+/// event botd sent it), `digest` (an event's hash doesn't follow from what its line says,
+/// ADR 0199), `unbound` (an event botd sent with its digest has none), or, against this
+/// server's log,
 /// `mismatch` (the event here has another hash), `contents` (it has the same hash, but the
 /// archive's copy says something else) and `missing` (it's gone, and retention didn't delete it).
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -91,6 +94,14 @@ pub struct Checked {
     pub matched: u64,
     /// Events with this server's hash but other contents: a changed copy in the archive.
     pub altered: u64,
+    /// Events whose own line gives their hash (ADR 0199): every field the chain covers
+    /// (`bound`), only those no erasure may change (`boundFixed`: erased, or redacted on
+    /// the way out, before export), or none (`unbound`: exported without a digest).
+    pub bound: u64,
+    pub bound_fixed: u64,
+    pub unbound: u64,
+    /// Events after this one were sent with their digest, so must have it.
+    pub digests_after: Option<i64>,
     pub gone: u64,
     pub mismatched: u64,
     pub missing: u64,
@@ -200,13 +211,9 @@ pub struct Row {
     pub erased: bool,
 }
 
-/// [`crate::audit_chain::FIXED`] and [`crate::audit_chain::ERASABLE`], as the export names them.
-const FIXED_FIELDS: [&str; 11] = ["id", "at", "actorKind", "action", "targetType", "botId", "outcome", "actorRole", "authMethod", "idp", "idpProvider"];
-const ERASABLE_FIELDS: [&str; 10] = ["actorId", "actorName", "actorSubject", "targetId", "ip", "userAgent", "details", "actorEmail", "sessionId", "onBehalfOf"];
-
 /// The first field the hash covers in which the archive's event differs from this server's
-/// row with the same hash. The archive's hashes aren't bound to its contents on their own:
-/// the salted digest that binds them stays here.
+/// row with the same hash. A line without its digest and salt isn't bound to its contents
+/// on its own: the salted digest that binds them stays here.
 fn differing(archived: &Value, row: &Row) -> Option<&'static str> {
     let fields = FIXED_FIELDS.iter().chain(if row.erased { [].iter() } else { ERASABLE_FIELDS.iter() }).chain(["chainPrev"].iter());
     fields.copied().find(|f| {
@@ -260,6 +267,29 @@ impl<'a> Walker<'a> {
     pub fn starting_at(mut self, start: Option<i64>) -> Walker<'a> {
         self.rep.start = start;
         self
+    }
+
+    /// Events after `after` must carry their digest: botd sent them with it (ADR 0199).
+    pub fn digests_after(mut self, after: Option<i64>) -> Walker<'a> {
+        self.rep.digests_after = after;
+        self
+    }
+
+    /// The event's hash, worked out again from its line alone (ADR 0199). This holds after
+    /// retention deleted the row here, when nothing else binds what the archive says.
+    fn sealed(&mut self, key: &str, e: &Line) {
+        match crate::audit_line::check(&e.raw) {
+            Ok(Bound::All) => self.rep.bound += 1,
+            Ok(Bound::Fixed) => self.rep.bound_fixed += 1,
+            Ok(Bound::None) => {
+                self.rep.unbound += 1;
+                if let Some(after) = self.rep.digests_after.filter(|&a| e.id > a) {
+                    let error = format!("event {} in {key} has no chainDigest, though botd sent every event after {after} with one: it was taken out, or the object isn't botd's", e.id);
+                    self.problem(Some(key), Some(e.id), "unbound", error);
+                }
+            }
+            Err(why) => self.problem(Some(key), Some(e.id), "digest", format!("event {} in {key}: {why}", e.id)),
+        }
     }
 
     /// Carries on from the last passing check: the next event must link to its head, and
@@ -353,6 +383,7 @@ impl<'a> Walker<'a> {
 
         for e in &events {
             self.rep.events += 1;
+            self.sealed(key, e);
             self.compare(key, e, local, anchor);
             if self.rep.head.as_ref().is_some_and(|h| e.id <= h.id) {
                 self.rep.repeated += 1;
@@ -608,6 +639,8 @@ pub struct Basis {
     pub batches: bool,
     /// The first event of its first batch, if recorded.
     pub start: Option<i64>,
+    /// The last event sent without its digest (ADR 0199).
+    pub digests_after: Option<i64>,
 }
 
 impl Basis {
@@ -616,6 +649,7 @@ impl Basis {
             delivered: x.delivered(),
             batches: app.db.audit_export_cursor(&format!("{}#batch", x.sink.id)).is_some(),
             start: app.db.audit_export_cursor(&format!("{}#start", x.sink.id)),
+            digests_after: app.db.audit_export_cursor(crate::audit_export::DIGESTS),
         }
     }
 }
@@ -693,7 +727,7 @@ pub async fn check_new(app: &App, x: &Exporter, a: &Archive, keys: &[Vec<u8>]) -
 pub async fn check(app: &App, a: &Archive, basis: &Basis, range: Range, since: Option<&Since>, keys: &[Vec<u8>]) -> Checked {
     use futures_util::StreamExt;
     let (delivered, batches) = (basis.delivered, basis.batches);
-    let mut w = Walker::new(a, delivered, keys).starting_at(basis.start).resuming(since);
+    let mut w = Walker::new(a, delivered, keys).starting_at(basis.start).digests_after(basis.digests_after).resuming(since);
     let s3 = match S3::new(a.s3.clone()) {
         Ok(s) => s.called("the audit archive"),
         Err(e) => {
@@ -759,6 +793,7 @@ pub fn summary(c: &Checked) -> Value {
     serde_json::json!({
         "ok": c.ok, "archive": c.archive, "objects": c.objects, "skipped": c.skipped, "events": c.events, "first": c.first, "head": c.head, "delivered": c.delivered, "start": c.start, "after": c.after,
         "matched": c.matched, "altered": c.altered, "gone": c.gone, "mismatched": c.mismatched, "missing": c.missing, "locked": c.locked, "lockExpired": c.lock_expired,
+        "bound": c.bound, "boundFixed": c.bound_fixed, "unbound": c.unbound,
         "checkpoints": c.checkpoints, "problems": c.problems, "firstProblem": c.first_problems.first(), "error": c.error,
     })
 }
