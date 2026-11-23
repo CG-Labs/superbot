@@ -170,10 +170,16 @@ impl Client {
         if !certs.is_empty() {
             b = b.tls_certs_merge(certs);
         }
+        // As containers/image: an insecure registry's certificate isn't checked, and plain HTTP
+        // is tried only if HTTPS doesn't answer at all.
+        let insecure = settings.insecure(&repo.host, &repo.path);
+        if insecure {
+            b = b.tls_danger_accept_invalid_certs(true);
+        }
         let http = b.build().map_err(|e| e.to_string())?;
         let creds = settings.credentials(&repo.host, &repo.path)?;
         let mut c = Client { http, base: format!("https://{}", repo.api_host()), repo: repo.clone(), push, creds, authz: Mutex::new(None) };
-        if settings.insecure(&repo.host, &repo.path) && c.http.get(format!("{}/v2/", c.base)).send().await.is_err() {
+        if insecure && c.http.get(format!("{}/v2/", c.base)).send().await.is_err() {
             c.base = format!("http://{}", repo.api_host());
         }
         Ok(c)

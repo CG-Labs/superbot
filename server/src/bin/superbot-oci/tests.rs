@@ -45,6 +45,8 @@ struct Mode {
     huge: bool,
     /// Referrers pages are empty and link to themselves.
     page_loop: bool,
+    /// HTTPS only, with a self-signed certificate.
+    tls: bool,
 }
 
 struct Fake {
@@ -219,7 +221,30 @@ async fn serve(mode: Mode) -> Arc<Fake> {
     let addr = listener.local_addr().unwrap().to_string();
     let f = Arc::new(Fake { store: Mutex::new(Store::default()), mode, addr });
     let app = axum::Router::new().fallback(handle).with_state(f.clone());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    if !mode.tls {
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        return f;
+    }
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.signing_key.serialize_der().into());
+    let tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![ck.cert.der().clone()], key)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+    tokio::spawn(async move {
+        loop {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let (acceptor, app) = (acceptor.clone(), app.clone());
+            tokio::spawn(async move {
+                let Ok(stream) = acceptor.accept(tcp).await else { return };
+                let svc = hyper_util::service::TowerToHyperService::new(app);
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(stream), svc).await;
+            });
+        }
+    });
     f
 }
 
@@ -719,6 +744,16 @@ async fn a_registry_that_changes_the_tag_is_caught() {
     let units = [unit(&src, &p, &p.amd64, &cfg).await, unit(&src, &p, &p.arm64, &cfg).await];
     let e = push::push(&cfg, &repo(&mirror, "m/app"), "1.0.0", &units, false).await.unwrap_err();
     assert!(e.contains("after the push, not") && e.contains(&p.index), "{e}");
+}
+
+#[tokio::test]
+async fn an_insecure_registry_on_https_is_reached_without_checking_its_certificate() {
+    let src = serve(Mode { tls: true, ..Mode::default() }).await;
+    let p = publish(&src, false);
+    let got = fetch::fetch(&cfg_for(&src), &repo(&src, REPO), &p.index, &p.arm64, &tmp("tls").join("o")).await.unwrap();
+    assert_eq!((got.referrers, got.attestations), (5, 1), "insecure = true, as skopeo reads it: a self-signed certificate is accepted");
+    let e = fetch::fetch(&Settings::default(), &repo(&src, REPO), &p.index, &p.arm64, &tmp("tls").join("o")).await.unwrap_err();
+    assert!(e.contains("https://") && e.to_lowercase().contains("certificate"), "without it, the certificate is checked: {e}");
 }
 
 #[tokio::test]
