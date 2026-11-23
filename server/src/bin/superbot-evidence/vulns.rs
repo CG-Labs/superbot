@@ -306,12 +306,34 @@ fn quoted(s: &str) -> Option<String> {
 /// A one-line YAML scalar: a quoted string's inside, or plain text up to a ` #` comment.
 fn yaml_value(s: &str) -> String {
     let s = s.trim();
-    if let Some(q) = s.chars().next().filter(|c| *c == '"' || *c == '\'') {
-        if let Some(end) = s[1..].find(q) {
-            return s[1..1 + end].to_string();
+    match s.chars().next() {
+        Some(q @ ('"' | '\'')) => unquote(&s[1..], q).unwrap_or_else(|| s.to_string()),
+        _ => uncomment(s).to_string(),
+    }
+}
+
+/// The text of a one-line quoted YAML scalar after its opening quote: `''` is a quote
+/// inside single quotes, and backslash escapes work inside double quotes. None when it
+/// doesn't close on this line.
+fn unquote(rest: &str, q: char) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = rest.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if q == '\'' && chars.peek() == Some(&'\'') => {
+                chars.next();
+                out.push('\'');
+            }
+            '\\' if q == '"' => match chars.next()? {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                other => out.push(other),
+            },
+            c if c == q => return Some(out),
+            c => out.push(c),
         }
     }
-    uncomment(s).to_string()
+    None
 }
 
 fn uncomment(s: &str) -> &str {
@@ -728,6 +750,8 @@ mod tests {
         let quoted_marks = grype_accepted("ignore:\n  - vulnerability: CVE-7\n    reason: \"> 30 days needed upstream\"\n  - vulnerability: CVE-8\n    reason: |-  # a comment\n      kept\n");
         let commented = grype_accepted("ignore: # accepted findings\n  - vulnerability: CVE-9 # note\n    reason: \"a # in quotes\" # note\n");
         assert_eq!((commented.len(), commented[0]["id"].as_str(), commented[0]["reason"].as_str()), (1, Some("CVE-9"), Some("a # in quotes")), "comments after a key or value are not part of it");
+        let escaped = grype_accepted("ignore:\n  - vulnerability: CVE-10\n    reason: 'It''s unused'\n  - vulnerability: CVE-11\n    reason: \"a \\\"quoted\\\" word\"\n");
+        assert_eq!(escaped.iter().map(|f| f["reason"].as_str()).collect::<Vec<_>>(), [Some("It's unused"), Some("a \"quoted\" word")], "escaped quotes keep the whole reason");
         assert_eq!(quoted_marks.iter().map(|f| f["reason"].as_str()).collect::<Vec<_>>(), [Some("> 30 days needed upstream"), Some("kept")], "a quoted reason starting with > is text, not a block");
         let g = grype_accepted("ignore:\n  # CVE-YYYY-NNNNN example\n  - vulnerability: CVE-1\n    package:\n      name: zlib\n  - vulnerability: \"CVE-2\"\n    reason: 'fixed upstream'\nother:\n  - vulnerability: CVE-3\n");
         assert_eq!(g.iter().map(|f| (f["id"].as_str().unwrap(), f["reason"].as_str())).collect::<Vec<_>>(), [("CVE-1", None), ("CVE-2", Some("fixed upstream"))]);
