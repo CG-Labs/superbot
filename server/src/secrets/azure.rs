@@ -1015,7 +1015,7 @@ mod tests {
             (vec![("AZURE_RUN_CREDENTIALS", "superbot-bots@proj-1.iam.gserviceaccount.com")], "Entra app's client id"),
         ] {
             let e = with(&extra).err().unwrap_or_default();
-            assert!(e.contains(err), "{extra:?}: {e}");
+            assert!(e.contains(err), "expected an error containing {err:?} for {extra:?}");
         }
         let var = settings(&[run]);
         assert_eq!(external::unused_settings(&var, "gcp-secret-manager"), ["AZURE_RUN_CREDENTIALS"], "only SECRETS_BACKEND=azure-keyvault reads it");
