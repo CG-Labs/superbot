@@ -81,6 +81,13 @@ impl Repo {
     }
 }
 
+/// Why a redirect can't be followed: it drops from HTTPS to plain HTTP, where a request
+/// body (an image's layers) or a token would go unencrypted.
+fn downgrade(a: &reqwest::redirect::Attempt) -> Option<String> {
+    let from = a.previous().last()?;
+    (from.scheme() == "https" && a.url().scheme() != "https").then(|| format!("{from} redirected to {}, which isn't HTTPS: refusing it", a.url()))
+}
+
 /// Whether URL is on HOST (with its port, if it names one), whatever its scheme.
 fn same_host(url: &url::Url, host: &str) -> bool {
     url::Url::parse(&format!("{}://{host}", url.scheme())).is_ok_and(|h| h.host_str() == url.host_str() && h.port_or_known_default() == url.port_or_known_default())
@@ -184,14 +191,25 @@ impl Client {
         };
         // Other hosts trust the registry's CAs too, but `insecure` is for the registry alone:
         // a token service elsewhere gets the login, so its certificate is always checked.
-        let elsewhere = builder().build().map_err(|e| e.to_string())?;
+        let elsewhere = builder()
+            .redirect(reqwest::redirect::Policy::custom(|a| match downgrade(&a) {
+                Some(e) => a.error(e),
+                None if a.previous().len() >= 10 => a.error("too many redirects"),
+                None => a.follow(),
+            }))
+            .build()
+            .map_err(|e| e.to_string())?;
         let mut b = builder().tls_danger_accept_invalid_certs(insecure);
         if let Some((path, pem)) = settings.client_pem(&repo.host)? {
             b = b.identity(reqwest::Identity::from_pem(&pem).map_err(|e| format!("{}: {e}", path.display()))?);
         }
         let me = repo.api_host().to_string();
         let http = b
-            .redirect(reqwest::redirect::Policy::custom(move |a| if same_host(a.url(), &me) && a.previous().len() < 10 { a.follow() } else { a.stop() }))
+            .redirect(reqwest::redirect::Policy::custom(move |a| match downgrade(&a) {
+                Some(e) => a.error(e),
+                None if same_host(a.url(), &me) && a.previous().len() < 10 => a.follow(),
+                None => a.stop(),
+            }))
             .build()
             .map_err(|e| e.to_string())?;
         let creds = settings.credentials(&repo.host, &repo.path)?;
@@ -222,7 +240,8 @@ impl Client {
         let url = url::Url::parse(request)
             .and_then(|r| r.join(target))
             .map_err(|e| format!("{}'s {what} {target}: {e}", self.repo.host))?;
-        if !matches!(url.scheme(), "https" | "http") || (base.scheme() == "https" && url.scheme() != "https") {
+        let was_https = base.scheme() == "https" || request.starts_with("https:");
+        if !matches!(url.scheme(), "https" | "http") || (was_https && url.scheme() != "https") {
             return Err(format!("{} gave a {what} that isn't HTTPS ({url}): refusing it", self.repo.host));
         }
         Ok(url)
@@ -242,10 +261,7 @@ impl Client {
             // A redirect off the registry's host (blob storage, say): followed without its
             // client certificate, as a browser would follow it, keeping the method for 307/308.
             let Some(loc) = res.headers().get(LOCATION).and_then(|v| v.to_str().ok()) else { return Ok(res) };
-            let next = url::Url::parse(url).and_then(|u| u.join(loc)).map_err(|e| format!("{}'s redirect {loc}: {e}", self.repo.host))?;
-            if !matches!(next.scheme(), "https" | "http") {
-                return Err(format!("{} redirected to {next}: refusing it", self.repo.host));
-            }
+            let next = self.resolve(url, loc, "redirect")?;
             return match res.status().as_u16() {
                 307 | 308 => self.request(method, next.as_str(), headers, body).await,
                 _ => self.request(Method::GET, next.as_str(), headers, &Body::Empty).await,
@@ -310,8 +326,9 @@ impl Client {
                 let mut res = rb.send().await.map_err(|e| format!("{host}'s token service: {}", chain(&e)))?;
                 if on_registry
                     && res.status().is_redirection()
-                    && let Some(next) = res.headers().get(LOCATION).and_then(|v| v.to_str().ok()).and_then(|l| url.join(l).ok())
+                    && let Some(loc) = res.headers().get(LOCATION).and_then(|v| v.to_str().ok())
                 {
+                    let next = self.resolve(url.as_str(), loc, "token redirect")?;
                     // Off the registry's host, so without the login, as any redirect there drops it.
                     res = self.elsewhere.get(next).send().await.map_err(|e| format!("{host}'s token service: {}", chain(&e)))?;
                 }

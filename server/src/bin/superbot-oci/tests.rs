@@ -58,6 +58,9 @@ struct Mode {
     /// With `login`: the token service is the same fake under another host name, and it
     /// redirects within itself first.
     token_elsewhere: bool,
+    /// Blob downloads end up redirected to plain HTTP: 1, straight to another host; 2, on the
+    /// registry's own host; 3, by storage on another host, after an HTTPS redirect there.
+    to_http: u8,
 }
 
 struct Fake {
@@ -239,6 +242,17 @@ async fn handle(State(f): State<Arc<Fake>>, method: Method, uri: Uri, headers: H
         return reply(StatusCode::OK, &h, index.to_string().into_bytes());
     }
     if let Some((_, digest)) = rest.rsplit_once("/blobs/") {
+        let port = f.addr.rsplit_once(':').unwrap().1;
+        let to_http = match (f.mode.to_http, came_elsewhere) {
+            (1, false) => Some(format!("http://localhost:{port}{path}")),
+            (2, false) => Some(format!("http://{}{path}", f.addr)),
+            (3, false) => Some(format!("https://localhost:{port}{path}")),
+            (3, true) => Some(format!("http://localhost:{port}{path}")),
+            _ => None,
+        };
+        if let Some(to) = to_http.filter(|_| method == Method::GET) {
+            return reply(StatusCode::TEMPORARY_REDIRECT, &[("location", to)], vec![]);
+        }
         if f.mode.blob_elsewhere && method == Method::GET && !came_elsewhere {
             return reply(StatusCode::TEMPORARY_REDIRECT, &[("location", format!("{elsewhere}{path}"))], vec![]);
         }
@@ -881,6 +895,17 @@ fn certs_d(regs: &[&Fake]) -> PathBuf {
         }
     }
     d
+}
+
+#[tokio::test]
+async fn no_redirect_takes_a_request_from_https_to_plain_http() {
+    for to_http in 1..=3 {
+        let src = serve(Mode { tls: true, to_http, ..Mode::default() }).await;
+        let p = publish(&src, false);
+        let cfg = Settings { cert_dirs: vec![certs_d(&[&src])], ..Settings::default() };
+        let e = fetch::fetch(&cfg, &repo(&src, REPO), &p.index, &p.arm64, &tmp("downgrade").join("o")).await.unwrap_err();
+        assert!(e.contains("isn't HTTPS") && e.contains("refusing it"), "case {to_http}: {e}");
+    }
 }
 
 #[tokio::test]
