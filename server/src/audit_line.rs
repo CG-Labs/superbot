@@ -7,10 +7,16 @@
 //! kept anywhere (the write-once archive, a SIEM, a file an auditor downloaded) can then
 //! be checked after botd's retention has deleted the row, and without botd at all.
 //!
+//! A checkpoint's RFC 3161 timestamp is checked from its line too (ADR 0207): the token
+//! the line carries must be the one its event recorded, stamp that checkpoint's signed
+//! statement, and verify under the TSA's certificate, at the time its event says.
+//!
 //! Shared by botd (the export and the archive check) and botctl (`botctl audit
-//! verify-lines`), so it uses nothing from botd's crate.
+//! verify-lines`), so it uses nothing from botd's crate but [`crate::tsa`], which both build.
 
+use crate::tsa;
 use aws_lc_rs::signature::{ED25519, UnparsedPublicKey};
+use base64::Engine;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -20,6 +26,7 @@ pub const SCHEMA: &str = "superbot.audit.v1";
 /// The link before the first event of a log that has never been pruned.
 pub const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 pub const CHECKPOINT: &str = "audit.checkpoint";
+pub const TIMESTAMPED: &str = "audit.checkpoint_timestamped";
 const CHAIN: &str = "superbot-audit-chain-v1";
 const SIGNED: &str = "superbot-audit-checkpoint-v1";
 /// Problems a report lists; it counts them all.
@@ -161,12 +168,74 @@ pub fn check_checkpoint(prev: Option<&str>, d: Option<&Value>, before: Option<i6
     Ok(kid.to_string())
 }
 
+/// What a checkpoint's RFC 3161 token stamps: SHA-256 of its statement, `\nsig=` and its
+/// signature (ADR 0149).
+pub fn imprint(statement: &str, signature: &str) -> [u8; 32] {
+    Sha256::digest(format!("{statement}\nsig={signature}").as_bytes()).into()
+}
+
+/// What an `audit.checkpoint_timestamped` line's token says, once it holds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Stamped {
+    pub checkpoint: i64,
+    /// The TSA's time, unix ms.
+    pub time: i64,
+    /// Whether the TSA's certificate chains to the CAs given; None when none were.
+    pub trusted: Option<bool>,
+}
+
+/// Checks an `audit.checkpoint_timestamped` line's token (ADR 0207). Its `details`, which
+/// its hash covers, name the checkpoint and record the token's SHA-256 and time; its
+/// `checkpoint` object, which the export adds and no hash covers, carries the token. The
+/// token must be the one recorded, stamp the checkpoint's statement and signature, and
+/// verify under the TSA's certificate (chaining to `trust`, when set) at the time recorded.
+/// `signed` is the checkpoint's own event's details when that was read; otherwise the
+/// statement and signature come from the record the line carries, which must then be
+/// signed by one of `keys` (with None, the key it names). Errors are a reason (`malformed`,
+/// `token`, `record`, a checkpoint's `key` or `signature`, or the token's own: `imprint`,
+/// `signature`, `certificate`, `untrusted`, ...) and why.
+pub fn check_timestamp(line: &Value, signed: Option<&Value>, keys: Option<&[Vec<u8>]>, trust: &tsa::Trust) -> Result<Stamped, (&'static str, String)> {
+    let malformed = |what: &str| ("malformed", format!("its {what} is missing"));
+    let d = line.get("details").filter(|d| d.is_object()).ok_or_else(|| malformed("details"))?;
+    let id = d["checkpoint"].as_i64().ok_or_else(|| malformed("checkpoint id"))?;
+    let (seq, hash) = (d["seq"].as_i64().ok_or_else(|| malformed("seq"))?, d["hash"].as_str().ok_or_else(|| malformed("hash"))?);
+    let time = d["time"].as_i64().ok_or_else(|| malformed("time"))?;
+    let recorded = d["timestampSha256"].as_str().ok_or_else(|| malformed("timestampSha256"))?;
+    let record = line.get("checkpoint").filter(|c| c.is_object()).ok_or(("token", "it carries no token: the export sends the checkpoint's record, with it, as `checkpoint`".to_string()))?;
+    if record["id"].as_i64() != Some(id) || record["seq"].as_i64() != Some(seq) || record["hash"].as_str() != Some(hash) {
+        return Err(("record", format!("the record it carries isn't checkpoint {id}'s, which signs event {seq}")));
+    }
+    const SIGNED_FIELDS: [&str; 6] = ["seq", "hash", "at", "keyId", "publicKey", "signature"];
+    if let Some(s) = signed
+        && SIGNED_FIELDS.iter().any(|f| s.get(*f) != record.get(*f))
+    {
+        return Err(("record", format!("the record it carries differs from checkpoint {id}'s own event")));
+    }
+    let c = signed.unwrap_or(record);
+    check_checkpoint(Some(hash), Some(c), None, keys).map_err(|(r, e)| (r, format!("checkpoint {id}: {e}")))?;
+    let (at, kid, signature) = (c["at"].as_i64().unwrap_or_default(), c["keyId"].as_str().unwrap_or_default(), c["signature"].as_str().unwrap_or_default());
+    let stamp = &record["timestamp"];
+    let token = stamp["token"].as_str().and_then(|t| base64::engine::general_purpose::STANDARD.decode(t).ok()).ok_or(("token", "the token it carries is missing or isn't base64".to_string()))?;
+    if hex(&Sha256::digest(&token)) != recorded {
+        return Err(("record", "the token it carries isn't the one its event recorded".into()));
+    }
+    let nonce = stamp["nonce"].as_str().and_then(unhex);
+    let s = tsa::verify(&token, &imprint(&statement(seq, hash, at, kid), signature), nonce.as_deref(), trust).map_err(|e| (e.code, e.message))?;
+    if s.time != time {
+        return Err(("record", "the token's time isn't the one its event recorded".into()));
+    }
+    if d.get("tsaCert").and_then(Value::as_str).is_some_and(|c| c != s.tsa_cert) {
+        return Err(("record", "the token's TSA certificate isn't the one its event recorded".into()));
+    }
+    Ok(Stamped { checkpoint: id, time: s.time, trusted: s.trusted })
+}
+
 /// Something in the lines that doesn't hold: `unreadable` (a line that names the schema
 /// but isn't one of its events), `digest` (its hash doesn't follow from what it says),
 /// `unbound` (no `chainDigest`, after an event that had one: every event botd exports
 /// after the first with one has one), `conflict` (two copies of an event with different
 /// links), `link` (an event doesn't link to the one before: events are missing, or
-/// aren't botd's) or `checkpoint`.
+/// aren't botd's), `checkpoint` or `timestamp`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Problem {
@@ -181,6 +250,15 @@ pub struct Problem {
 pub struct Head {
     pub id: i64,
     pub hash: String,
+}
+
+/// The newest timestamp that holds: its event, the checkpoint it stamps, and the TSA's time.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastStamp {
+    pub id: i64,
+    pub checkpoint: i64,
+    pub time: i64,
 }
 
 /// One host's chain, as the lines hold it.
@@ -204,6 +282,14 @@ pub struct Host {
     /// Signed checkpoints that hold, and the keys that signed them.
     pub checkpoints: u64,
     pub checkpoint_keys: Vec<String>,
+    /// RFC 3161 timestamps whose token holds (ADR 0207), those whose TSA chains to the CAs
+    /// given (None when none were), and the newest.
+    pub timestamps: u64,
+    pub trusted_timestamps: Option<u64>,
+    pub last_timestamp: Option<LastStamp>,
+    /// Checkpoints made with a TSA set whose timestamp isn't among the lines: still waiting
+    /// for one, or stamped after the last line read. Not a failure.
+    pub unstamped: u64,
     pub problems: u64,
     pub first_problems: Vec<Problem>,
 }
@@ -217,6 +303,8 @@ pub struct Report {
     pub ignored: u64,
     /// The checkpoint keys trusted, by id; empty when none were given.
     pub keys: Vec<String>,
+    /// The CA certificates a timestamp's TSA must chain to; 0 when none were given.
+    pub timestamp_cas: usize,
     /// The `digestsAfter` given, if any.
     pub digests_after: Option<i64>,
     pub hosts: Vec<Host>,
@@ -235,14 +323,18 @@ struct Copy {
     bound: Result<Bound, String>,
     /// An `audit.checkpoint`'s details.
     checkpoint: Option<Value>,
+    /// An `audit.checkpoint_timestamped`'s whole line: its details and the token it carries.
+    timestamp: Option<Value>,
     at: String,
 }
 
 /// Exported events read from any number of files, in any order, with copies, checked
 /// against themselves alone: each line against its hash, the copies of each event
-/// against each other, the chain from event to event, and the signed checkpoints.
+/// against each other, the chain from event to event, the signed checkpoints and their
+/// timestamps.
 pub struct Lines {
     keys: Option<Vec<Vec<u8>>>,
+    trust: tsa::Trust,
     digests_after: Option<i64>,
     hosts: BTreeMap<String, Vec<Copy>>,
     lines: u64,
@@ -254,7 +346,14 @@ impl Lines {
     /// `keys`: the checkpoint keys to trust. None: any, so a checkpoint only shows the
     /// lines are consistent with whoever signed it.
     pub fn new(keys: Option<Vec<Vec<u8>>>) -> Lines {
-        Lines { keys, digests_after: None, hosts: BTreeMap::new(), lines: 0, ignored: 0, unreadable: Vec::new() }
+        Lines { keys, trust: tsa::Trust::default(), digests_after: None, hosts: BTreeMap::new(), lines: 0, ignored: 0, unreadable: Vec::new() }
+    }
+
+    /// The CAs a timestamp's TSA must chain to. Without any, a token is checked as far as
+    /// it can be, and counted as neither trusted nor not.
+    pub fn trust(mut self, trust: tsa::Trust) -> Lines {
+        self.trust = trust;
+        self
     }
 
     /// Where botd's events start carrying `chainDigest` (`digestsAfter`), kept apart from
@@ -291,16 +390,21 @@ impl Lines {
         let (Some(id), Some(prev), Some(hash)) = (v.get("id").and_then(Value::as_i64), s("chainPrev"), s("chainHash")) else {
             return self.unreadable.push(unreadable("has no id, chainPrev or chainHash"));
         };
-        let checkpoint = (v.get("action").and_then(Value::as_str) == Some(CHECKPOINT)).then(|| v.get("details").cloned().unwrap_or(Value::Null));
+        let action = v.get("action").and_then(Value::as_str);
+        let checkpoint = (action == Some(CHECKPOINT)).then(|| v.get("details").cloned().unwrap_or(Value::Null));
         let has_digest = v.get("chainDigest").is_some_and(|d| !d.is_null());
-        let copy = Copy { id, prev, hash, has_digest, bound: check(&v), checkpoint, at: at.to_string() };
-        self.hosts.entry(s("host").unwrap_or_default()).or_default().push(copy);
+        let bound = check(&v);
+        let host = s("host").unwrap_or_default();
+        let timestamp = (action == Some(TIMESTAMPED)).then_some(v);
+        let copy = Copy { id, prev, hash, has_digest, bound, checkpoint, timestamp, at: at.to_string() };
+        self.hosts.entry(host).or_default().push(copy);
     }
 
     pub fn finish(self) -> Report {
         let keys = self.keys.as_deref();
         let after = self.digests_after;
-        let hosts: Vec<Host> = self.hosts.into_iter().map(|(host, copies)| walk(host, copies, keys, after)).collect();
+        let trust = &self.trust;
+        let hosts: Vec<Host> = self.hosts.into_iter().map(|(host, copies)| walk(host, copies, keys, trust, after)).collect();
         let mut unreadable = self.unreadable;
         let error = hosts.is_empty().then(|| format!("no {SCHEMA} events in the {} lines read", self.lines));
         let ok = error.is_none() && unreadable.is_empty() && hosts.iter().all(|h| h.ok);
@@ -311,6 +415,7 @@ impl Lines {
             lines: self.lines,
             ignored: self.ignored,
             keys: keys.unwrap_or_default().iter().map(|k| key_id(k)).collect(),
+            timestamp_cas: trust.len(),
             digests_after: after,
             hosts,
             unreadable: count,
@@ -320,7 +425,7 @@ impl Lines {
     }
 }
 
-fn walk(host: String, mut copies: Vec<Copy>, keys: Option<&[Vec<u8>]>, after: Option<i64>) -> Host {
+fn walk(host: String, mut copies: Vec<Copy>, keys: Option<&[Vec<u8>]>, trust: &tsa::Trust, after: Option<i64>) -> Host {
     copies.sort_by_key(|c| c.id);
     let mut h = Host { host, copies: copies.len() as u64, ..Default::default() };
     let mut problems: Vec<Problem> = Vec::new();
@@ -333,6 +438,12 @@ fn walk(host: String, mut copies: Vec<Copy>, keys: Option<&[Vec<u8>]>, after: Op
     };
     let mut keys_seen = BTreeSet::new();
     let mut checkpoints = BTreeSet::new();
+    // Each checkpoint's details as its first copy has them, those made with a TSA set,
+    // the checkpoints a timestamp names, and each timestamp that holds.
+    let mut signed: BTreeMap<i64, &Value> = BTreeMap::new();
+    let mut asked: BTreeSet<i64> = BTreeSet::new();
+    let mut named: BTreeSet<i64> = BTreeSet::new();
+    let mut stamps: BTreeMap<i64, Stamped> = BTreeMap::new();
     // The last event read, and the one before it, for the copies after the first.
     let (mut before, mut prior): (Option<&Copy>, Option<&Copy>) = (None, None);
     for (i, c) in copies.iter().enumerate() {
@@ -373,16 +484,39 @@ fn walk(host: String, mut copies: Vec<Copy>, keys: Option<&[Vec<u8>]>, after: Op
                 }
                 Err((reason, e)) => problem(c, "checkpoint", format!("checkpoint {} ({reason}): {e}", c.id)),
             }
+            if first_copy {
+                signed.insert(c.id, d);
+                if d.get("timestamp").and_then(Value::as_str) == Some("pending") {
+                    asked.insert(c.id);
+                }
+            }
+        }
+        // A checkpoint comes before its timestamp, so its own event, if read, is in `signed`.
+        if let Some(line) = &c.timestamp {
+            let cp = line.get("details").and_then(|d| d.get("checkpoint")).and_then(Value::as_i64);
+            named.extend(cp);
+            match check_timestamp(line, cp.and_then(|id| signed.get(&id).copied()), keys, trust) {
+                Ok(s) => {
+                    stamps.entry(c.id).or_insert(s);
+                }
+                Err((reason, e)) => problem(c, "timestamp", format!("timestamp {} ({reason}): {e}", c.id)),
+            }
         }
         if first_copy {
             h.events += 1;
             before = Some(c);
         }
     }
-    // A checkpoint counts once every copy of it holds.
-    let failed: BTreeSet<i64> = problems.iter().filter(|p| p.reason == "checkpoint").filter_map(|p| p.id).collect();
-    h.checkpoints = checkpoints.difference(&failed).count() as u64;
+    // A checkpoint, or a timestamp, counts once every copy of it holds.
+    let failed = |reason: &str| -> BTreeSet<i64> { problems.iter().filter(|p| p.reason == reason).filter_map(|p| p.id).collect() };
+    let (failed_checkpoints, failed_stamps) = (failed("checkpoint"), failed("timestamp"));
+    h.checkpoints = checkpoints.difference(&failed_checkpoints).count() as u64;
     h.checkpoint_keys = keys_seen.into_iter().collect();
+    stamps.retain(|id, _| !failed_stamps.contains(id));
+    h.timestamps = stamps.len() as u64;
+    h.trusted_timestamps = trust.is_set().then(|| stamps.values().filter(|s| s.trusted == Some(true)).count() as u64);
+    h.last_timestamp = stamps.iter().next_back().map(|(id, s)| LastStamp { id: *id, checkpoint: s.checkpoint, time: s.time });
+    h.unstamped = asked.difference(&named).count() as u64;
     h.first = copies.first().map(|c| c.id);
     h.first_prev = copies.first().map(|c| c.prev.clone());
     h.head = copies.last().map(|c| Head { id: c.id, hash: c.hash.clone() });
@@ -583,10 +717,126 @@ pub mod tests {
         let public = pair.public_key().as_ref().to_vec();
         let (kid, seq, hash, at) = (key_id(&public), prev["id"].as_i64().unwrap(), prev["chainHash"].as_str().unwrap(), 1_795_000_000_000i64);
         let sig = hex(pair.sign(statement(seq, hash, at, &kid).as_bytes()).as_ref());
-        let mut v = sealed(id, hash, json!({ "seq": seq, "hash": hash, "at": at, "keyId": kid, "publicKey": hex(&public), "signature": sig }), false);
+        let details = json!({ "seq": seq, "hash": hash, "at": at, "keyId": kid, "publicKey": hex(&public), "signature": sig, "trigger": "schedule", "timestamp": "pending" });
+        let mut v = sealed(id, hash, details, false);
         v["action"] = json!(CHECKPOINT);
         reseal(&mut v, hash, &fresh_salt(), true);
         v
+    }
+
+    /// The `audit.checkpoint_timestamped` line the export writes for checkpoint `cp`, with
+    /// a token from `tsa` at `time`, sealed onto `prev`.
+    pub fn timestamped(id: i64, cp: &Value, prev: &str, tsa: &tsa::fake::FakeTsa, time: i64) -> Value {
+        let d = &cp["details"];
+        let (seq, hash, at, kid, sig) = (d["seq"].as_i64().unwrap(), d["hash"].as_str().unwrap(), d["at"].as_i64().unwrap(), d["keyId"].as_str().unwrap(), d["signature"].as_str().unwrap());
+        let st = statement(seq, hash, at, kid);
+        let stamped = imprint(&st, sig);
+        let nonce = [0x41u8; 8];
+        let token = tsa.token(&stamped, Some(&nonce), time);
+        let details = json!({
+            "checkpoint": cp["id"], "seq": seq, "hash": hash, "tsa": "tsa.example", "time": time, "serial": "01", "policy": "1.2.3.4.1",
+            "tsaCert": hex(&Sha256::digest(&tsa.leaf)), "tsaSubject": "CN=Test TSA", "trusted": null, "timestampSha256": hex(&Sha256::digest(&token)),
+        });
+        let mut v = sealed(id, prev, details, false);
+        v["action"] = json!(TIMESTAMPED);
+        reseal(&mut v, prev, &fresh_salt(), true);
+        v["checkpoint"] = json!({
+            "id": cp["id"], "seq": seq, "hash": hash, "at": at, "keyId": kid, "publicKey": d["publicKey"], "signature": sig, "statement": st, "algorithm": "Ed25519",
+            "timestamp": { "status": "stamped", "tsa": "tsa.example", "time": time, "token": base64::engine::general_purpose::STANDARD.encode(&token), "nonce": hex(&nonce), "imprint": hex(&stamped) },
+        });
+        v
+    }
+
+    /// The key [`stamped_chain`] signs its checkpoint with.
+    pub fn checkpoint_key() -> aws_lc_rs::signature::Ed25519KeyPair {
+        aws_lc_rs::signature::Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap()
+    }
+
+    pub const STAMPED_AT: i64 = 1_795_000_060_000;
+
+    /// Three events, a checkpoint of them (4), another event, and the checkpoint's timestamp (6).
+    pub fn stamped_chain(tsa: &tsa::fake::FakeTsa) -> Vec<Value> {
+        let mut lines = chain(3);
+        lines.push(checkpoint(4, &lines[2], &checkpoint_key()));
+        lines.push(sealed(5, lines[3]["chainHash"].as_str().unwrap(), json!({ "n": 5 }), true));
+        let ts = timestamped(6, &lines[3], lines[4]["chainHash"].as_str().unwrap(), tsa, STAMPED_AT);
+        lines.push(ts);
+        lines
+    }
+
+    fn report_with(lines: &[Value], keys: Option<Vec<Vec<u8>>>, trust: tsa::Trust) -> Report {
+        let mut l = Lines::new(keys).trust(trust);
+        for (n, v) in lines.iter().enumerate() {
+            l.line(&v.to_string(), &format!("f:{}", n + 1));
+        }
+        l.finish()
+    }
+
+    #[test]
+    fn timestamps_are_checked_from_their_lines() {
+        use aws_lc_rs::signature::KeyPair;
+        use tsa::fake::FakeTsa;
+        let fake = FakeTsa::new();
+        let public = checkpoint_key().public_key().as_ref().to_vec();
+        let keys = || Some(vec![public.clone()]);
+        let lines = stamped_chain(&fake);
+        let first = |r: &Report| r.hosts[0].first_problems.first().map(|p| p.error.clone()).unwrap_or_default();
+
+        // No CA given: the token holds under the certificate it carries, and isn't called trusted.
+        let r = report(&lines, keys());
+        let h = &r.hosts[0];
+        assert!(r.ok, "{r:?}");
+        assert_eq!((h.checkpoints, h.timestamps, h.trusted_timestamps, h.unstamped, r.timestamp_cas), (1, 1, None, 0, 0), "{r:?}");
+        assert_eq!(h.last_timestamp, Some(LastStamp { id: 6, checkpoint: 4, time: STAMPED_AT }));
+        // The TSA's CA: trusted. Another TSA's: not.
+        let r = report_with(&lines, keys(), tsa::Trust::from_pem(&fake.ca_pem).unwrap());
+        assert_eq!((r.ok, r.hosts[0].trusted_timestamps, r.timestamp_cas), (true, Some(1), 1), "{r:?}");
+        let r = report_with(&lines, keys(), tsa::Trust::from_pem(&FakeTsa::new().ca_pem).unwrap());
+        assert_eq!((reasons(&r), r.hosts[0].timestamps), (vec!["timestamp"], 0), "{r:?}");
+        assert!(first(&r).contains("(untrusted)"), "{r:?}");
+
+        // No hash covers the token the line carries, but its event recorded its SHA-256.
+        let mut swapped = lines.clone();
+        swapped[5]["checkpoint"]["timestamp"]["token"] = json!(base64::engine::general_purpose::STANDARD.encode(fake.token(&[0; 32], None, STAMPED_AT)));
+        let r = report(&swapped, keys());
+        assert_eq!(reasons(&r), ["timestamp"]);
+        assert!(first(&r).contains("(record)") && first(&r).contains("isn't the one its event recorded"), "{r:?}");
+        let mut stripped = lines.clone();
+        stripped[5].as_object_mut().unwrap().remove("checkpoint");
+        assert!(first(&report(&stripped, keys())).contains("(token)"));
+        let mut other = lines.clone();
+        other[5]["checkpoint"]["signature"] = json!("00".repeat(64));
+        assert!(first(&report(&other, keys())).contains("differs from checkpoint 4's own event"));
+
+        // A line forged whole, with a real token from a TSA of the forger's own: it holds
+        // together, so only the TSA's CA tells it apart.
+        let mut forged = lines.clone();
+        forged[5] = timestamped(6, &lines[3], lines[4]["chainHash"].as_str().unwrap(), &FakeTsa::new(), STAMPED_AT);
+        assert!(report(&forged, keys()).ok);
+        let r = report_with(&forged, keys(), tsa::Trust::from_pem(&fake.ca_pem).unwrap());
+        assert!(first(&r).contains("(untrusted)"), "{r:?}");
+        // The time recorded must be the token's.
+        let mut late = lines.clone();
+        late[5]["details"]["time"] = json!(STAMPED_AT + 1);
+        reseal(&mut late[5], lines[4]["chainHash"].as_str().unwrap(), &fresh_salt(), true);
+        assert!(first(&report(&late, keys())).contains("the token's time isn't the one its event recorded"), "{:?}", report(&late, keys()));
+
+        // Without the checkpoint's own event, the record the line carries must be signed by a key trusted.
+        let only = vec![lines[5].clone()];
+        let r = report(&only, keys());
+        assert_eq!((r.ok, r.hosts[0].timestamps), (true, 1), "{r:?}");
+        let r = report(&only, Some(vec![vec![1; 32]]));
+        assert!(first(&r).contains("(key)"), "{r:?}");
+        // A checkpoint made with a TSA whose timestamp isn't among the lines: counted, not a failure.
+        let r = report(&lines[..5], keys());
+        assert_eq!((r.ok, r.hosts[0].timestamps, r.hosts[0].unstamped), (true, 0, 1), "{r:?}");
+        // A timestamp counts once, however many copies, and only if every copy holds.
+        let mut copies = lines.clone();
+        copies.push(lines[5].clone());
+        assert_eq!(report(&copies, keys()).hosts[0].timestamps, 1);
+        copies.push(swapped[5].clone());
+        let r = report(&copies, keys());
+        assert_eq!((r.ok, r.hosts[0].timestamps), (false, 0), "{r:?}");
     }
 
     #[test]

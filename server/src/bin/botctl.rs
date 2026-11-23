@@ -11,6 +11,9 @@ mod support_report;
 #[path = "../audit_line.rs"]
 #[allow(dead_code)]
 mod audit_line;
+#[path = "../tsa.rs"]
+#[allow(dead_code)]
+mod tsa;
 
 use serde_json::{json, Map, Value};
 use std::io::{BufRead, Read, Write};
@@ -237,12 +240,14 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    --archive: also read the write-once S3 archive,
                                                    check it has no gaps, and hold every event here
                                                    to the hash it has there
-  botctl audit verify-lines <file|dir|->... [--key <hex>]... [--digests-after <id>]
+  botctl audit verify-lines <file|dir|->... [--key <hex>]... [--digests-after <id>] [--timestamp-ca <pem>]...
                                                    Check exported events (SIEM or archive copies, any
                                                    order) with no botd: each line's hash, the chain
-                                                   between them, signed checkpoints. --digests-after:
-                                                   digestsAfter from botctl audit siem, so lines with
-                                                   their digests taken out fail. Exits 1 on a break
+                                                   between them, signed checkpoints and their RFC 3161
+                                                   timestamps. --digests-after: digestsAfter from
+                                                   botctl audit siem, so lines with their digests
+                                                   taken out fail. --timestamp-ca: the TSA's CA
+                                                   certificates (PEM). Exits 1 on a break
   botctl audit siem                                The SIEM export: sink, delivered, pending, failing
   botctl audit chain                               The chain's state: head, last checkpoint and
                                                    timestamp, export lag, last check
@@ -911,25 +916,33 @@ fn verify_query(rest: &[&str]) -> Result<String, String> {
     Ok(if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) })
 }
 
-/// `botctl audit verify-lines <file|dir|->... [--key <hex>]... [--digests-after <id>]` (ADR 0199): checks
-/// exported events where they landed, with no botd. A directory is read for its
-/// `.jsonl`, `.ndjson`, `.json` and `.log` files, `-` is stdin.
+/// `botctl audit verify-lines <file|dir|->... [--key <hex>]... [--digests-after <id>] [--timestamp-ca <pem>]...`
+/// (ADR 0199, ADR 0207): checks exported events where they landed, with no botd. A
+/// directory is read for its `.jsonl`, `.ndjson`, `.json` and `.log` files, `-` is stdin.
 fn verify_lines(rest: &[&str], stdin: impl std::io::Read) -> Result<String, String> {
-    let (mut paths, mut keys, mut after) = (Vec::new(), Vec::new(), None);
+    let (mut paths, mut keys, mut after, mut cas) = (Vec::new(), Vec::new(), None, String::new());
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match *a {
             "--key" => keys.push(audit_line::parse_public_key(it.next().ok_or("--key needs a public key in hex (botctl audit key)")?)?),
             "--digests-after" => after = Some(it.next().and_then(|v| v.parse::<i64>().ok()).ok_or("--digests-after needs an event id (digestsAfter in botctl audit siem)")?),
+            "--timestamp-ca" => {
+                let f = it.next().ok_or("--timestamp-ca needs a PEM file of the TSA's CA certificates (as AUDIT_TIMESTAMP_CA_FILE)")?;
+                let pem = std::fs::read_to_string(f).map_err(|e| format!("--timestamp-ca {f}: {e}"))?;
+                tsa::Trust::from_pem(&pem).map_err(|e| format!("--timestamp-ca {f}: {e}"))?;
+                cas.push_str(&pem);
+                cas.push('\n');
+            }
             o if o.starts_with("--") => return Err(format!("Unknown audit verify-lines option \"{o}\". See botctl admin.")),
             p => paths.push(p),
         }
     }
     if paths.is_empty() {
-        return Err("Usage: botctl audit verify-lines <file|dir|->... [--key <public key hex>]... [--digests-after <event id>]".into());
+        return Err("Usage: botctl audit verify-lines <file|dir|->... [--key <public key hex>]... [--digests-after <event id>] [--timestamp-ca <pem file>]...".into());
     }
     let pinned = !keys.is_empty();
-    let mut lines = audit_line::Lines::new(pinned.then_some(keys)).digests_after(after);
+    let trust = if cas.is_empty() { tsa::Trust::default() } else { tsa::Trust::from_pem(&cas)? };
+    let mut lines = audit_line::Lines::new(pinned.then_some(keys)).digests_after(after).trust(trust);
     let mut files = 0u64;
     let mut stdin = Some(stdin);
     for p in paths {
@@ -946,11 +959,16 @@ fn verify_lines(rest: &[&str], stdin: impl std::io::Read) -> Result<String, Stri
             files += 1;
         }
     }
-    let mut v = serde_json::to_value(lines.finish()).map_err(|e| e.to_string())?;
+    let report = lines.finish();
+    let stamped = report.hosts.iter().any(|h| h.timestamps > 0);
+    let mut v = serde_json::to_value(&report).map_err(|e| e.to_string())?;
     v["files"] = json!(files);
     let mut notes = Vec::new();
     if !pinned {
         notes.push("No --key given: a checkpoint only shows its lines agree with whoever signed it. Pin botd's key (botctl audit key).");
+    }
+    if stamped && report.timestamp_cas == 0 {
+        notes.push("No --timestamp-ca given: each timestamp holds under the certificate it carries, but nothing says that TSA is one you trust. Give its CA certificates.");
     }
     if after.is_none() {
         notes.push("No --digests-after given: lines with every chainDigest taken out would bind nothing and still pass. Pin digestsAfter (botctl audit siem).");
@@ -2746,6 +2764,38 @@ mod tests {
         let err: Value = serde_json::from_str(&verify_lines(&[o, "--digests-after", "2"], std::io::empty()).unwrap_err()).unwrap();
         assert_eq!((err["digestsAfter"].clone(), err["hosts"][0]["firstProblems"][0]["reason"].clone()), (json!(2), json!("unbound")), "{err}");
         assert!(verify_lines(&[d, "--bogus"], std::io::empty()).unwrap_err().contains("--bogus"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn verify_lines_checks_timestamps_under_the_cas_given() {
+        use aws_lc_rs::signature::KeyPair;
+        let fake = tsa::fake::FakeTsa::new();
+        let lines: String = audit_line::tests::stamped_chain(&fake).iter().map(|v| format!("{v}\n")).collect();
+        let key = audit_line::hex(audit_line::tests::checkpoint_key().public_key().as_ref());
+        let dir = std::env::temp_dir().join(format!("botctl-verify-timestamps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (ca, other) = (dir.join("ca.pem"), dir.join("other.pem"));
+        std::fs::write(&ca, &fake.ca_pem).unwrap();
+        std::fs::write(&other, &tsa::fake::FakeTsa::new().ca_pem).unwrap();
+        let (ca, other) = (ca.to_str().unwrap(), other.to_str().unwrap());
+        let run = |args: &[&str]| verify_lines(&[&["-", "--key", &key, "--digests-after", "0"][..], args].concat(), lines.as_bytes());
+
+        let out: Value = serde_json::from_str(&run(&[]).unwrap()).unwrap();
+        let h = &out["hosts"][0];
+        assert_eq!((h["timestamps"].clone(), h["trustedTimestamps"].clone(), h["lastTimestamp"]["checkpoint"].clone()), (json!(1), Value::Null, json!(4)), "{out}");
+        assert!(out["note"].as_str().unwrap().contains("--timestamp-ca"), "{out}");
+        let out: Value = serde_json::from_str(&run(&["--timestamp-ca", ca]).unwrap()).unwrap();
+        assert_eq!((out["hosts"][0]["trustedTimestamps"].clone(), out["timestampCas"].clone(), out.get("note")), (json!(1), json!(1), None), "{out}");
+        // Two files: trusted if either holds the TSA's CA.
+        let out: Value = serde_json::from_str(&run(&["--timestamp-ca", other, "--timestamp-ca", ca]).unwrap()).unwrap();
+        assert_eq!(out["timestampCas"], json!(2), "{out}");
+        let err: Value = serde_json::from_str(&run(&["--timestamp-ca", other]).unwrap_err()).unwrap();
+        assert_eq!(err["hosts"][0]["firstProblems"][0]["reason"], json!("timestamp"), "{err}");
+        std::fs::write(dir.join("bad.pem"), "not a certificate").unwrap();
+        assert!(run(&["--timestamp-ca", dir.join("bad.pem").to_str().unwrap()]).unwrap_err().contains("bad.pem"));
+        assert!(run(&["--timestamp-ca"]).unwrap_err().contains("needs a PEM file"));
+        assert!(run(&["--timestamp-ca", dir.join("missing.pem").to_str().unwrap()]).unwrap_err().contains("missing.pem"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

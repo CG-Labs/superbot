@@ -20,6 +20,9 @@
 //! library. Signatures: RSA PKCS #1 v1.5, ECDSA P-256 and P-384 with SHA-256, -384 or
 //! -512, and Ed25519. Never SHA-1, except for the hash an ESSCertID (v1) names its
 //! certificate by, which isn't a signature.
+//!
+//! Shared by botd and botctl (`botctl audit verify-lines`, ADR 0207), so it uses nothing
+//! from botd's crate.
 
 use serde::Serialize;
 use sha2::{Digest, Sha256, Sha384, Sha512};
@@ -185,6 +188,22 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// At most `max` characters of text from a TSA or a certificate, without control characters.
+fn clip(s: &str, max: usize) -> String {
+    let mut out: String = s.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').take(max).collect();
+    if s.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
+#[cfg(test)]
+fn random_bytes(n: usize) -> Vec<u8> {
+    let mut b = vec![0u8; n];
+    aws_lc_rs::rand::fill(&mut b).expect("random bytes");
+    b
+}
+
 // A DER writer, for the request (and the tests' TSA).
 
 pub fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
@@ -255,7 +274,7 @@ pub fn token_from_reply(der: &[u8]) -> Result<Vec<u8>, Invalid> {
             }
         }
         let text = text.join("; ");
-        let text = if text.is_empty() { String::new() } else { format!(": {}", crate::audit::clip(&text, 200)) };
+        let text = if text.is_empty() { String::new() } else { format!(": {}", clip(&text, 200)) };
         return Err(bad("refused", format!("the TSA refused the request (status {}){text}", code.last().copied().unwrap_or(0))));
     }
     Ok(r.expect(SEQ).map_err(|_| bad("refused", "the TSA granted the request but sent no token"))?.raw.to_vec())
@@ -421,7 +440,7 @@ fn only_stamping(u: &x509_parser::extensions::ExtendedKeyUsage) -> bool {
 /// that no certificate's extended key usage leaves out time-stamping.
 fn chains(signer: &[u8], pool: &[&[u8]], trust: &Trust, at: i64) -> Result<(), Invalid> {
     use rustls::pki_types::{CertificateDer, UnixTime};
-    let untrusted = |why: String| bad("untrusted", format!("the TSA's certificate doesn't chain to AUDIT_TIMESTAMP_CA_FILE: {why}"));
+    let untrusted = |why: String| bad("untrusted", format!("the TSA's certificate doesn't chain to the CA certificates trusted: {why}"));
     if trust.anchors.iter().any(|a| a.as_slice() == signer) {
         return Ok(());
     }
@@ -565,7 +584,7 @@ pub fn verify(token: &[u8], imprint: &[u8], nonce: Option<&[u8]>, trust: &Trust)
         serial: hex(unsigned(&info.serial)),
         policy: info.policy,
         tsa_cert: hex(&Sha256::digest(signer)),
-        tsa_subject: crate::audit::clip(&cert.subject().to_string(), 200),
+        tsa_subject: clip(&cert.subject().to_string(), 200),
         trusted,
     })
 }
@@ -686,7 +705,7 @@ pub mod fake {
         pub fn token(&self, imprint: &[u8], nonce: Option<&[u8]>, time: i64) -> Vec<u8> {
             let t = chrono::DateTime::from_timestamp_millis(time).unwrap().format("%Y%m%d%H%M%S%.3fZ").to_string();
             let alg = seq(&[&oid(SHA256), &[0x05, 0x00]]);
-            let mut tst = vec![uint(&[1]), oid("1.2.3.4.1"), seq(&[&alg, &tlv(OCTETS, imprint)]), uint(&crate::random_bytes(8)), tlv(GENERALIZED_TIME, t.as_bytes())];
+            let mut tst = vec![uint(&[1]), oid("1.2.3.4.1"), seq(&[&alg, &tlv(OCTETS, imprint)]), uint(&random_bytes(8)), tlv(GENERALIZED_TIME, t.as_bytes())];
             if let Some(n) = nonce {
                 tst.push(uint(n));
             }
@@ -718,7 +737,7 @@ mod tests {
 
     /// A fresh nonce, as `audit_checkpoint::stamp` makes them.
     fn nonce() -> Vec<u8> {
-        let mut n = crate::random_bytes(8);
+        let mut n = random_bytes(8);
         n[0] = (n[0] & 0x7f) | 0x40;
         n
     }
