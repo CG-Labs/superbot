@@ -88,6 +88,9 @@ pub struct Observed<'a> {
     pub other_admins_signed_in: usize,
     /// Whether this server runs users' machines (a control plane with a provider).
     pub machines: bool,
+    /// The age recipients machines' off-host backups are encrypted to, as botd loaded
+    /// them; None when they aren't copied off the host.
+    pub machine_backup_recipients: Option<usize>,
     pub evidence_monthly: bool,
     pub version: &'a str,
 }
@@ -163,10 +166,11 @@ fn judge(setting: &str, o: &Observed) -> (Status, String, &'static str) {
             "off" => (Fail, "off".into(), "server backups stay on this host"),
             _ => invalid(),
         },
-        "MACHINE_BACKUP_AGE_RECIPIENTS" => {
-            let set = ["MACHINE_BACKUP_AGE_RECIPIENTS", "MACHINE_BACKUP_AGE_RECIPIENTS_FILE"].iter().any(|k| !var(k).trim().is_empty());
-            machines((if set { Pass } else { Fail }, if set { "set" } else { "unset" }.into(), "keeping the private key off the host is checked by hand"))
-        }
+        "MACHINE_BACKUP_AGE_RECIPIENTS" => machines(match o.machine_backup_recipients {
+            Some(n) if n > 0 => (Pass, "set".into(), "the recipients botd loaded; keeping the private key off the host is checked by hand"),
+            Some(_) => (Fail, "unset".into(), "machines' backups are stored plain: botd loaded no recipients"),
+            None => (Fail, "unset".into(), "machines' backups aren't copied off the host"),
+        }),
         "ISOLATION" => {
             let users = var("ISOLATION").trim() == "users";
             let value = if users { "users" } else { "off" };
@@ -254,8 +258,13 @@ pub fn check(o: &Observed) -> Report {
         r.findings.push(Finding { setting, status, value, baseline, note });
     }
     for s in listed {
-        if !SETTINGS.iter().any(|(k, _)| *k == s) && !r.unknown_exceptions.contains(&s) {
-            r.unknown_exceptions.push(s);
+        if SETTINGS.iter().any(|(k, _)| *k == s) {
+            continue;
+        }
+        // Only a setting-shaped name is shown: anything else could be a note or a name.
+        let shown = if s.len() <= 64 && s.starts_with(|c: char| c.is_ascii_uppercase()) && s.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_') { s } else { "[text]".to_string() };
+        if !r.unknown_exceptions.contains(&shown) {
+            r.unknown_exceptions.push(shown);
         }
     }
     r
@@ -350,6 +359,7 @@ pub fn run(app: &App, mfa: mfa::Policy) -> Report {
         teammate_days: app.db.retention_days(crate::file_retention::FILES_KEY),
         other_admins_signed_in,
         machines: app.control_plane.get().is_some_and(|cp| cp.enabled()),
+        machine_backup_recipients: app.control_plane.get().and_then(|cp| cp.offsite.as_ref()).map(|o| o.s.recipients.len()),
         evidence_monthly: app.evidence.get().is_some_and(|s| s.monthly),
         version: env!("CARGO_PKG_VERSION"),
     };
@@ -385,6 +395,7 @@ mod tests {
             teammate_days: None,
             other_admins_signed_in: 1,
             machines: true,
+            machine_backup_recipients: Some(1),
             evidence_monthly: true,
             version: "0.9.0",
         }
@@ -454,14 +465,13 @@ mod tests {
 
     #[test]
     fn each_rule_reads_the_value_as_botd_does() {
-        let cases: [(&[(&str, &str)], &str, Status, &str); 18] = [
+        let cases: [(&[(&str, &str)], &str, Status, &str); 17] = [
             (&[("AUTH_BREAK_GLASS", "off")], "AUTH_BREAK_GLASS", Status::Pass, "0"),
             (&[("SIGNIN_ALERTS", "no")], "SIGNIN_ALERTS", Status::Fail, "off"),
             (&[("TESTING_MODE", "yes")], "TESTING_MODE", Status::Fail, "on"),
             (&[("TESTING_MODE", "maybe")], "TESTING_MODE", Status::Fail, "invalid"),
             (&[("SUPERBOT_DATABASE_ENCRYPTION", "Required")], "SUPERBOT_DATABASE_ENCRYPTION", Status::Pass, "required"),
             (&[("SERVER_BACKUP_OFF_HOST", "off")], "SERVER_BACKUP_OFF_HOST", Status::Fail, "off"),
-            (&[("MACHINE_BACKUP_AGE_RECIPIENTS_FILE", "/run/keys/age.pub")], "MACHINE_BACKUP_AGE_RECIPIENTS", Status::Pass, "set"),
             (&[("MACHINE_ROUTING", "on")], "ISOLATION", Status::NotApplicable, "off"),
             (&[("MACHINE_ROUTING", "assigned")], "ISOLATION", Status::Fail, "off"),
             (&[("MACHINE_CONTROL_URL", "https://192.0.2.1:8443"), ("MACHINE_HARDENING", "off")], "MACHINE_HARDENING", Status::Fail, "off"),
@@ -500,6 +510,11 @@ mod tests {
         }
         o.mfa = mfa::Policy::All;
         assert_eq!(status(&check(&o), "AUTH_MFA"), (Status::Pass, "all".into()));
+        // The recipients botd loaded, not whether a setting names a file: an empty one gives none.
+        for (n, want) in [(Some(0), Status::Fail), (None, Status::Fail), (Some(2), Status::Pass)] {
+            o.machine_backup_recipients = n;
+            assert_eq!(status(&check(&o), "MACHINE_BACKUP_AGE_RECIPIENTS").0, want, "{n:?}");
+        }
     }
 
     #[test]
@@ -507,13 +522,13 @@ mod tests {
         let mut v = managed();
         v.insert("TEAMS".into(), String::new());
         v.insert("MACHINE_ON_DISABLE".into(), "keep".into());
-        v.insert(EXCEPTIONS_VAR.into(), "machine_on_disable, TEAMS ,AUTH_MFA,NOT_A_SETTING,NOT_A_SETTING".into());
+        v.insert(EXCEPTIONS_VAR.into(), "machine_on_disable, TEAMS ,AUTH_MFA,NOT_A_SETTING,NOT_A_SETTING,approved by Jane Smith,acme-corp".into());
         let get = |k: &str| v.get(k).cloned().unwrap_or_default();
         let r = check(&observed(&get, &|_| false));
         assert_eq!(status(&r, "MACHINE_ON_DISABLE").0, Status::Excepted);
         assert_eq!(status(&r, "TEAMS").0, Status::Manual, "a judgement isn't a deviation");
         assert_eq!(r.unneeded_exceptions, ["AUTH_MFA"]);
-        assert_eq!(r.unknown_exceptions, ["NOT_A_SETTING"]);
+        assert_eq!(r.unknown_exceptions, ["NOT_A_SETTING", "[text]"], "a note or a name is never shown");
         assert!(!r.ok(), "an unknown exception is a mistake to fix");
         let view = r.view("2027-01-01T00:00:00Z");
         assert_eq!(view["exceptions"]["excepted"], json!(["MACHINE_ON_DISABLE"]));

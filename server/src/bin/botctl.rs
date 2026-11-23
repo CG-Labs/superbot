@@ -1884,8 +1884,13 @@ fn run(args: &[String]) -> Result<String, String> {
             let res = api(Cred::Operator, "GET", "/api/evidence/baseline", None)?;
             let v: Value = serde_json::from_str(&res).map_err(|e| e.to_string())?;
             let out = if json { pretty(res) } else { baseline_summary(&v) };
-            // A deviation is a failure, so a cron job or the change checklist notices.
-            if v["ok"] == false { Err(out) } else { Ok(out) }
+            // A deviation exits non-zero, so a cron job or the change checklist notices,
+            // with the report still on stdout for `> baseline.txt` to keep.
+            if v["ok"] == false {
+                println!("{}", out.trim_end());
+                std::process::exit(2);
+            }
+            Ok(out)
         }
         ["audit", "export", rest @ ..] => api(Cred::Operator, "GET", &format!("/api/audit/export.csv{}", audit_query(rest)?), None),
         ["audit", "verify", rest @ ..] => {
