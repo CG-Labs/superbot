@@ -202,6 +202,8 @@ cargo build --release
 sudo SUPERBOT_DRILL_THROWAWAY=1 deploy/backup-drill.sh target/release
 ```
 
+It ends with a record line (JSON with `superbotDrill`, the restore's `durationMs` and the budget's `rtoMs`); save the whole output, and `superbot-evidence drills --record <saved output>` puts it in the month's [drill bundle](../security/soc2-evidence-plan.md#the-drill-bundle) ([ADR 0177](../adr/0177-restore-drill-evidence.md)).
+
 Don't run a restored copy next to the live server to "test" it: botd would run the same routines and could act twice.
 
 ## Per-user machines (managed hosting)
