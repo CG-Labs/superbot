@@ -172,7 +172,7 @@ function AccountForm({
   );
 }
 
-function NewAccount({ api, view, roles, teams, onBusy, onCreated }: { api: SuperBotApi; view: ServiceAccountsView; roles: CustomRole[]; teams: Team[]; onBusy: (busy: boolean) => void; onCreated: (id: string, minted: MintedServiceToken | null, error: string | null) => Promise<void> }) {
+function NewAccount({ api, view, roles, teams, onBusy, onCreated }: { api: SuperBotApi; view: ServiceAccountsView; roles: CustomRole[]; teams: Team[]; onBusy: (busy: boolean) => void; onCreated: (account: ServiceAccount, minted: MintedServiceToken | null, error: string | null) => Promise<void> }) {
   const [draft, setDraft] = useState<ServiceAccountDraft>(emptyDraft());
   const [firstToken, setFirstToken] = useState(true);
   const [days, setDays] = useState(view.defaultDays);
@@ -196,7 +196,7 @@ function NewAccount({ api, view, roles, teams, onBusy, onCreated }: { api: Super
         }
       }
       onBusy(false);
-      await onCreated(sa.id, minted, tokenError);
+      await onCreated(sa, minted, tokenError);
     } catch (err) {
       setError(message(err));
       setBusy(false);
@@ -510,9 +510,11 @@ export function ServiceAccountsAdmin({ api, onBack }: Props) {
       roles={roles}
       teams={teams}
       onBusy={setBusy}
-      onCreated={async (id, m, tokenError) => {
+      onCreated={async (made, m, tokenError) => {
         await load();
-        setPicked({ kind: "account", id });
+        // If the refresh failed, the list still needs the new account so its token shows.
+        setView((v) => (v && !v.serviceAccounts.some((s) => s.id === made.id) ? { ...v, serviceAccounts: [...v.serviceAccounts, made] } : v));
+        setPicked({ kind: "account", id: made.id });
         setMinted(m);
         setNotice(tokenError);
       }}

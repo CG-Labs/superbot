@@ -122,6 +122,18 @@ describe("ServiceAccountsAdmin (ADR 0143, 0152)", () => {
     expect(screen.queryByText(SECRET)).toBeNull();
   });
 
+  it("still shows the first token when the list doesn't reload", async () => {
+    const api = mockApi({ ...VIEW, serviceAccounts: [] });
+    api.serviceAccounts.mockResolvedValueOnce({ ...VIEW, serviceAccounts: [] }).mockRejectedValueOnce(new Error("offline"));
+    const u = userEvent.setup();
+    await show(api);
+    await u.press(await screen.findByLabelText("New service account"));
+    await u.type(screen.getByLabelText("Service account name"), "HR sync");
+    await u.press(screen.getByLabelText("Create service account"));
+    expect(await screen.findByTestId("token-value")).toHaveTextContent(SECRET);
+    expect(screen.getByLabelText("Service account HR sync")).toBeTruthy();
+  });
+
   it("can make an account without a token", async () => {
     const api = mockApi();
     const u = userEvent.setup();

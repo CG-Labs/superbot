@@ -971,10 +971,27 @@ function saCard(s) {
 // `keepForm` keeps unsaved edits when only tokens or status changed.
 function renderServiceAccounts(keepForm = false) {
   const list = saTab.view.serviceAccounts;
+  const drafts = keepForm ? tokenDrafts() : {};
   $("sa-empty").hidden = list.length > 0;
   $("sa-list").innerHTML = list.map(saCard).join("")
     + `<datalist id="sa-people">${saTab.people.filter((u) => u.status === "active").map((u) => `<option value="${esc(u.email || u.id)}">${esc(u.name)}</option>`).join("")}</datalist>`;
+  for (const [id, d] of Object.entries(drafts)) {
+    const f = $("sa-list").querySelector(`[data-sa="${CSS.escape(id)}"] form[data-act=new-token]`);
+    if (!f) continue;
+    f.elements.name.value = d.name;
+    if ([...f.days.options].some((o) => o.value === d.days)) f.days.value = d.days;
+    for (const i of f.querySelectorAll("input[name=scope]")) i.checked = d.scopes.includes(i.value);
+  }
   renderSaForm(!keepForm);
+}
+
+// What's typed or picked in each account's new-token form, so a refresh keeps it.
+function tokenDrafts() {
+  const out = {};
+  for (const f of $("sa-list").querySelectorAll("form[data-act=new-token]")) {
+    out[f.closest("[data-sa]").dataset.sa] = { name: f.elements.name.value, days: f.days.value, scopes: [...f.querySelectorAll("input[name=scope]:checked")].map((i) => i.value) };
+  }
+  return out;
 }
 
 // `reset` fills the fields from the account being edited (or empties them); without it the
@@ -1076,17 +1093,18 @@ $("sa-list").addEventListener("click", async (e) => {
     return;
   }
   let resetsForm = false;
+  let acted = true;
   b.disabled = true;
   try {
     const row = b.closest("tr[data-token]");
     const t = row && (saTab.details[s.id]?.tokenList || []).find((x) => x.id === row.dataset.token);
     if (b.dataset.act === "disable-sa") {
-      if (!confirm(`Disable ${s.name}? Its tokens stop working and its runs stop until it's enabled again. Its routines pause.`)) return;
+      if (!confirm(`Disable ${s.name}? Its tokens stop working and its runs stop until it's enabled again. Its routines pause.`)) return (acted = false);
       await api("PATCH", `/api/service-accounts/${key(s.id)}`, { status: "disabled" });
     }
     if (b.dataset.act === "enable-sa") await api("PATCH", `/api/service-accounts/${key(s.id)}`, { status: "active" });
     if (b.dataset.act === "delete-sa") {
-      if (!confirm(`Delete ${s.name}? For good: all its tokens are revoked and its runs stop. The audit log keeps naming it.`)) return;
+      if (!confirm(`Delete ${s.name}? For good: all its tokens are revoked and its runs stop. The audit log keeps naming it.`)) return (acted = false);
       await api("DELETE", `/api/service-accounts/${key(s.id)}`);
       if (saTab.editing === s.id) {
         saTab.editing = null;
@@ -1094,12 +1112,12 @@ $("sa-list").addEventListener("click", async (e) => {
       }
     }
     if (b.dataset.act === "revoke-token" && t) {
-      if (!confirm(`Revoke ${t.name}? It stops working at once. Whatever uses it needs a new token.`)) return;
+      if (!confirm(`Revoke ${t.name}? It stops working at once. Whatever uses it needs a new token.`)) return (acted = false);
       await api("DELETE", `/api/service-accounts/${key(s.id)}/tokens/${key(t.id)}`);
     }
     if (b.dataset.act === "rotate-token" && t) {
       const keepOldMinutes = Number(row.querySelector("[name=keep]").value);
-      if (!keepOldMinutes && !confirm(`Rotate ${t.name}? The old token stops at once.`)) return;
+      if (!keepOldMinutes && !confirm(`Rotate ${t.name}? The old token stops at once.`)) return (acted = false);
       const r = await api("POST", `/api/service-accounts/${key(s.id)}/tokens/${key(t.id)}/rotate`, { expiresInDays: Number(row.querySelector("[name=days]").value), keepOldMinutes });
       showToken(r);
     }
@@ -1107,7 +1125,7 @@ $("sa-list").addEventListener("click", async (e) => {
     fail(err);
   } finally {
     b.disabled = false;
-    loadServiceAccounts({ keepForm: !resetsForm });
+    if (acted) loadServiceAccounts({ keepForm: !resetsForm });
   }
 });
 
@@ -1126,6 +1144,7 @@ $("sa-list").addEventListener("submit", async (e) => {
   if (scopes.length) body.scopes = scopes;
   try {
     showToken(await api("POST", `/api/service-accounts/${key(s.id)}/tokens`, body));
+    f.reset();
   } catch (err) {
     fail(err);
   }
