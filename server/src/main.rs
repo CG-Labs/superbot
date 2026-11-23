@@ -102,6 +102,8 @@ mod machines_lockdown_tests;
 #[cfg(test)]
 mod machines_mtls_tests;
 #[cfg(test)]
+mod machines_team_network_tests;
+#[cfg(test)]
 mod machines_logins_tests;
 #[cfg(test)]
 mod machines_upkeep_tests;
@@ -205,6 +207,7 @@ mod status;
 #[cfg(test)]
 mod status_http_tests;
 mod support;
+mod support_check;
 #[cfg(test)]
 mod support_http_tests;
 mod stripe;
@@ -324,6 +327,9 @@ async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "database") {
         std::process::exit(database_encryption::cli(&args[1..]));
+    }
+    if args.first().is_some_and(|a| a == "support") {
+        std::process::exit(support_check::cli(&args[1..]));
     }
     let port: u16 = env("PORT", "3000").parse().expect("PORT must be a number");
     let host = env("HOST", "127.0.0.1");

@@ -53,6 +53,7 @@ pub mod screens;
 pub mod server_data;
 #[cfg(test)]
 pub mod standin_mirror;
+pub mod team_network;
 pub mod teammate;
 #[cfg(test)]
 pub mod teammates;
@@ -225,6 +226,11 @@ pub struct ControlPlane {
     pub suspend_on_disable: bool,
     /// Where botd's own data is, and whether residency pins are held to it (ADR 0184).
     pub server_data: server_data::ServerData,
+    /// A network of its own per team (MACHINE_TEAM_NETWORK, ADR 0189). None: off.
+    pub team_network: Option<team_network::Settings>,
+    /// Machines powered off to take them off a team network they no longer belong on,
+    /// to power on again once they are off it.
+    network_suspended: std::sync::Mutex<std::collections::HashSet<String>>,
     /// One change at a time, from handlers and the reconciler alike, so two can't
     /// race on one machine. Changes are rare and admin-driven; this is cheap.
     ops: tokio::sync::Mutex<()>,
@@ -254,6 +260,8 @@ impl Default for ControlPlane {
             offsite: None,
             suspend_on_disable: true,
             server_data: server_data::ServerData::default(),
+            team_network: None,
+            network_suspended: Default::default(),
             ops: tokio::sync::Mutex::new(()),
             provider_seen: Default::default(),
         }
@@ -399,6 +407,9 @@ impl ControlPlane {
                 return Err(format!("MACHINE_FIREWALL=on needs the control plane: {NEEDS_IT}"));
             }
             firewall::egress_from_env(&var)?;
+            if team_network::Settings::from_env(&var)?.is_some() {
+                return Err(format!("MACHINE_TEAM_NETWORK=vpc needs the control plane: {NEEDS_IT}"));
+            }
             return Ok(ControlPlane::default());
         };
         let token = token.expose().trim().to_string();
@@ -406,14 +417,20 @@ impl ControlPlane {
             return Err("LINODE_TOKEN is empty or has spaces in it".into());
         }
         crate::secrets::redact::register(&token);
+        let team_network = team_network::Settings::from_env(&var)?;
+        if team_network.is_some() && firewall::Settings::from_env(&var)?.is_none() {
+            return Err("MACHINE_TEAM_NETWORK=vpc needs MACHINE_FIREWALL=on: the firewall's inbound drops are what keep teammates' machines apart on their network".into());
+        }
         let mut api = linode::Linode::new(&token, linode::API_URL);
         if firewall::egress_from_env(&var)? {
-            api = api.with_outbound(linode::outbound(
-                &firewall::egress_deny(&var)?,
-                firewall::control_from_env(&var),
-            )?);
+            let mut rules = linode::outbound(&firewall::egress_deny(&var)?, firewall::control_from_env(&var))?;
+            if let Some(n) = &team_network {
+                rules = linode::with_team_subnet(rules, &n.subnet);
+            }
+            api = api.with_outbound(rules);
         }
         let mut cp = ControlPlane::configured(Arc::new(api), &var)?;
+        cp.team_network = team_network;
         cp.regions = list(&var("MACHINE_REGIONS"));
         if cp.regions.is_empty() {
             return Err("MACHINE_REGIONS is needed with LINODE_TOKEN, e.g. gb-lon or gb-lon,de-fra-2 (the first is the default)".into());
@@ -443,6 +460,9 @@ impl ControlPlane {
         }
         if !firewall::egress_from_env(var)? {
             return Err("MACHINE_FIREWALL_EGRESS=off can't be kept with MACHINE_PROVIDER=incus: the network ACL always drops containers' traffic to private addresses and INCUS_EGRESS_DENY".into());
+        }
+        if team_network::Settings::from_env(var)?.is_some() {
+            return Err("MACHINE_TEAM_NETWORK=vpc is for Linode; with MACHINE_PROVIDER=incus there are no team networks yet, and containers are kept apart by port isolation and the network ACL".into());
         }
         let p = incus::fleet::Fleet::from_env(store, var)?;
         let mut tags: Vec<String> = Vec::new();
@@ -777,6 +797,7 @@ impl ControlPlane {
             authorized_keys: self.authorized_keys.clone(),
             user_data,
             firewall_id: m.firewall_id.clone(),
+            subnet_id: None,
         }
     }
 }
@@ -863,6 +884,7 @@ async fn provision(
         // Not there after all: free its room before placing it again.
         app.db.save_machine(&m, m.state);
     }
+    let mut team_network = None;
     let found = if let Some(pm) = earlier {
         Ok((pm, true))
     } else {
@@ -902,6 +924,11 @@ async fn provision(
                 Err(e) => return refused(app, m, by, e, "firewall"),
             },
         };
+        let network = match team_network::ensure(app, cp, on, &m, by).await {
+            Ok(n) => n,
+            Err(e) => return refused(app, m, by, e, "network"),
+        };
+        team_network = network.as_ref().map(|n| n.id.clone());
         m.create_sent_at = Some(now());
         m.placed_on = host.clone();
         app.db.save_machine(&m, m.state);
@@ -912,7 +939,7 @@ async fn provision(
             Some(e) => match e.mint_token(app, &m.id, by.actor.id.as_deref()) {
                 Ok((token, expires_at)) => {
                     app.db.record(&event(by, "machine.enroll_token_issued", &m, json!({ "expiresAt": expires_at, "via": "create" })));
-                    Some(e.user_data(&m, &token))
+                    Some(e.user_data_on(&m, &token, network.as_ref().map(|n| n.subnet.as_str())))
                 }
                 Err(err) => {
                     m.last_error = Some(format!("couldn't make an enrollment token: {err}"));
@@ -921,7 +948,8 @@ async fn provision(
                 }
             },
         };
-        let spec = cp.spec(&m, user_data);
+        let mut spec = cp.spec(&m, user_data);
+        spec.subnet_id = network.as_ref().map(|n| n.subnet_id.clone());
         let made = match (&host, p.hosts()) {
             (Some(h), Some(hosts)) => hosts.create_on(h, &spec).await,
             _ => p.create(&spec).await,
@@ -960,7 +988,7 @@ async fn provision(
                     by,
                     "machine.created",
                     &m,
-                    json!({ "providerId": pm.id, "adopted": adopted, "firewallId": m.firewall_id }),
+                    json!({ "providerId": pm.id, "adopted": adopted, "firewallId": m.firewall_id, "teamNetwork": team_network }),
                 ));
             }
         }
@@ -984,6 +1012,7 @@ fn refused(app: &App, mut m: Machine, by: &Who, e: ProviderError, step: &str) ->
     }
     m.last_error = Some(match step {
         "firewall" => format!("The machine's firewall couldn't be set up: {e}"),
+        "network" => format!("The team's network couldn't be set up: {e}"),
         _ => e.to_string(),
     });
     app.db.save_machine(&m, from);
@@ -1217,10 +1246,14 @@ pub async fn reconcile(app: &AppState, cp: &ControlPlane) -> Value {
     rebuild::reconcile(app, cp).await;
     resize::reconcile(app, cp).await;
     let teams = crate::teams::sweep(app, cp).await;
+    let networks = team_network::sweep(app, cp).await;
     let disabled = crate::deprovision::sweep(app, cp).await;
     let mut out = json!({ "checked": ids.len(), "changed": changed });
     if teams != json!({}) {
         out["teams"] = teams;
+    }
+    if networks != json!({}) {
+        out["teamNetworks"] = networks;
     }
     if disabled != json!({}) {
         out["disabled"] = disabled;
@@ -1943,6 +1976,7 @@ pub async fn substrate(Extension(a): Extension<Arc<Auth>>, Query(q): Query<HashM
         "enrollment": cp.enrollment.is_some(),
         "firewall": cp.firewall.as_ref().map(|f| json!({ "label": f.label, "rules": firewall::rules_json(&f.rules), "outbound": p.firewall_egress() })),
         "settings": p.settings(),
+        "teamNetwork": cp.team_network.as_ref().map(team_network::Settings::view),
     });
     if q.get("check").is_some_and(|c| matches!(c.as_str(), "1" | "true" | "yes")) {
         v["checks"] = match p.preflight().await {
@@ -2230,6 +2264,8 @@ mod tests {
             (&certs, &[("MACHINE_CONTROL_URL", ""), ("MACHINE_FIREWALL", "")][..], "MACHINE_CONTROL_URL"),
             // The network ACL always drops outbound to private addresses (ADR 0179).
             (&certs, &[("MACHINE_FIREWALL_EGRESS", "off")][..], "MACHINE_FIREWALL_EGRESS=off can't be kept"),
+            // No team networks on Incus yet (ADR 0189).
+            (&certs, &[("MACHINE_TEAM_NETWORK", "vpc")][..], "MACHINE_TEAM_NETWORK=vpc is for Linode"),
             (&certs, &[("INCUS_URL", "")][..], "INCUS_URL"),
             (&certs, &[("MACHINE_TIERS", "starter=g6-standard-1")][..], "isn't an Incus plan"),
             (&certs, &[("MACHINE_REGIONS", "Node 1")][..], "MACHINE_REGIONS"),
@@ -2470,5 +2506,36 @@ mod tests {
         let alone = |k: &str| if k == "MACHINE_FIREWALL_EGRESS" { "on".to_string() } else { String::new() };
         let err = ControlPlane::from_env(&EnvStore::fixed(&[]), alone).err().unwrap();
         assert!(err.contains("MACHINE_FIREWALL=on"), "{err}");
+    }
+
+    #[test]
+    fn team_networks_are_linodes_behind_the_firewall_and_let_through_it() {
+        let token = EnvStore::fixed(&[("LINODE_TOKEN", "firewall-test-token-71c3")]);
+        let vars = |fw: &'static str, egress: &'static str, net: &'static str| {
+            move |k: &str| match k {
+                "MACHINE_REGIONS" => "gb-lon".to_string(),
+                "MACHINE_FIREWALL" => fw.to_string(),
+                "MACHINE_FIREWALL_EGRESS" => egress.to_string(),
+                "MACHINE_CONTROL_URL" => "https://10.1.2.3:8443".to_string(),
+                "MACHINE_TEAM_NETWORK" => net.to_string(),
+                _ => String::new(),
+            }
+        };
+        let off = ControlPlane::from_env(&token, vars("on", "", "")).unwrap();
+        assert_eq!(off.team_network, None, "off unless asked");
+        let on = ControlPlane::from_env(&token, vars("on", "", "vpc")).unwrap();
+        assert_eq!(on.team_network.as_ref().map(|s| s.subnet.as_str()), Some(team_network::DEFAULT_SUBNET));
+        let rules = on.need().unwrap().firewall_egress().unwrap();
+        let labels: Vec<&str> = rules.as_array().unwrap().iter().map(|r| r["label"].as_str().unwrap()).collect();
+        assert_eq!(labels, [linode::CONTROL_RULE, "team-network-tcp", "team-network-udp", "no-private-tcp", "no-private-udp"], "{rules}");
+        assert_eq!(rules[1]["to"], json!([team_network::DEFAULT_SUBNET]));
+        let open = ControlPlane::from_env(&token, vars("on", "off", "vpc")).unwrap();
+        assert_eq!(open.need().unwrap().firewall_egress(), Some(json!([])), "outbound open: nothing to let through");
+        let err = ControlPlane::from_env(&token, vars("", "", "vpc")).err().unwrap();
+        assert!(err.contains("needs MACHINE_FIREWALL=on"), "{err}");
+        let err = ControlPlane::from_env(&EnvStore::fixed(&[]), vars("", "", "vpc")).err().unwrap();
+        assert!(err.contains("MACHINE_TEAM_NETWORK=vpc needs the control plane"), "{err}");
+        let err = ControlPlane::from_env(&token, vars("on", "", "mesh")).err().unwrap();
+        assert!(err.contains("off or vpc"), "{err}");
     }
 }

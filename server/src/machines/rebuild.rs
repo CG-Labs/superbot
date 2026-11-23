@@ -233,7 +233,7 @@ async fn send(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, e: &Enrollm
         Err(why) => return retry_later(app, m, from, from, true, "token", &why),
     };
     app.db.record(&event(&by, "machine.enroll_token_issued", m, json!({ "expiresAt": expires, "via": "rebuild", "rebuildId": id })));
-    let spec = RebuildSpec { image: cp.image.clone(), authorized_keys: cp.authorized_keys.clone(), user_data: e.user_data(m, &token) };
+    let spec = RebuildSpec { image: cp.image.clone(), authorized_keys: cp.authorized_keys.clone(), user_data: e.user_data_on(m, &token, super::team_network::subnet_for(app, cp, m)) };
     // Recorded as sent before it is, so a botd that stops mid-call waits for the
     // machine to come back rather than wiping it twice.
     if !app.db.machine_rebuild_sending(&m.id, &id, &[from]) {

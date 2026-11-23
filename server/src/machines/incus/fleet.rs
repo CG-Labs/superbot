@@ -830,6 +830,7 @@ mod tests {
             authorized_keys: vec![],
             user_data: None,
             firewall_id: None,
+            subnet_id: None,
         };
         assert!(matches!(f.create_on("main", &spec).await, Err(ProviderError::Transport(m)) if m.contains("isn't up")));
         assert!(matches!(f.create_on("nowhere", &spec).await, Err(ProviderError::Transport(_))));
