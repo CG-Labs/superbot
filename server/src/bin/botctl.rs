@@ -290,6 +290,10 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    capacity, and where a new machine goes (ADR 0081); check asks each now
   botctl machine host drain <name> [--reason <text>]  Place nothing new on the host; its machines stay until moved (ADR 0081)
   botctl machine host undrain <name>               New machines may go on it again
+  botctl machine host dedicate <name> <team-id> [--reason <text>]
+                                                   Only that team's machines go on the host, and its machines only on
+                                                   hosts dedicated to it (ADR 0166); refused while others' are there
+  botctl machine host share <name> --reason <text> Anyone's machines may go on the host again
   botctl machine host recover <name> [--to <host>] [--identity <age-key-file>] --yes
                                                    Declare a host that doesn't answer lost, and restore its machines from
                                                    their newest off-host backups onto another host; they enroll anew
@@ -1062,12 +1066,20 @@ fn backup_request(args: &[&str], read: impl Fn(&str) -> Result<String, String>) 
             ("PUT", format!("/api/machines/hosts/{}/drain", encode(name)), Some(json!({ "reason": flag(rest, "--reason") }).to_string()))
         }
         ["host", "undrain", name] if !name.starts_with("--") => ("DELETE", format!("/api/machines/hosts/{}/drain", encode(name)), None),
+        ["host", "dedicate", name, team, rest @ ..] if !name.starts_with("--") && !team.starts_with("--") => {
+            let body = json!({ "team": team, "reason": flag(rest, "--reason") });
+            ("PUT", format!("/api/machines/hosts/{}/dedication", encode(name)), Some(body.to_string()))
+        }
+        ["host", "share", name, rest @ ..] if !name.starts_with("--") => {
+            let reason = flag(rest, "--reason").ok_or("A dedication is often a promise to a customer: say why it ends with --reason <text>")?;
+            ("DELETE", format!("/api/machines/hosts/{}/dedication", encode(name)), Some(json!({ "reason": reason }).to_string()))
+        }
         ["host", "recover", _, ..] => {
             return Err("Recovering declares the host lost for good and restores its machines elsewhere from their backups; add --yes".into());
         }
         ["restore", _, _, ..] => return Err("Restoring replaces the machine and everything on it since the backup; add --yes".into()),
         _ => return Err(
-            "Usage: botctl machine backups [<user>] | backup <user> | recovery | restore <user> <backup-id> [--identity <file>] [--host <name>] --yes | restore <user> status | delete-backups <machine-id> --yes | hosts [check] | host drain <name> [--reason <text>] | host undrain <name> | host recover <name> [--to <host>] [--identity <file>] --yes"
+            "Usage: botctl machine backups [<user>] | backup <user> | recovery | restore <user> <backup-id> [--identity <file>] [--host <name>] --yes | restore <user> status | delete-backups <machine-id> --yes | hosts [check] | host drain <name> [--reason <text>] | host undrain <name> | host dedicate <name> <team-id> [--reason <text>] | host share <name> --reason <text> | host recover <name> [--to <host>] [--identity <file>] --yes"
                 .into(),
         ),
     })
@@ -2483,6 +2495,16 @@ mod tests {
         assert_eq!(serde_json::from_str::<serde_json::Value>(&b.unwrap()).unwrap(), json!({ "reason": null }));
         assert_eq!(backup_request(&["host", "undrain", "b"], read).unwrap(), ("DELETE", "/api/machines/hosts/b/drain".into(), None));
         assert!(backup_request(&["host", "undrain"], read).is_err());
+        let (m, p, b) = backup_request(&["host", "dedicate", "b", "t1", "--reason", "MSA-7"], read).unwrap();
+        assert_eq!((m, p.as_str()), ("PUT", "/api/machines/hosts/b/dedication"));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&b.unwrap()).unwrap(), json!({ "team": "t1", "reason": "MSA-7" }));
+        let (_, _, b) = backup_request(&["host", "dedicate", "b", "t1"], read).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&b.unwrap()).unwrap(), json!({ "team": "t1", "reason": null }));
+        assert!(backup_request(&["host", "dedicate", "b"], read).is_err(), "a team is needed");
+        let (m, p, b) = backup_request(&["host", "share", "b", "--reason", "contract ended"], read).unwrap();
+        assert_eq!((m, p.as_str()), ("DELETE", "/api/machines/hosts/b/dedication"));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&b.unwrap()).unwrap(), json!({ "reason": "contract ended" }));
+        assert!(backup_request(&["host", "share", "b"], read).unwrap_err().contains("--reason"));
         assert_eq!(login_base("me"), "/api/machine");
         assert_eq!(login_base("a@example.com"), "/api/users/a%40example.com/machine");
     }

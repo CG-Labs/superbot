@@ -193,6 +193,24 @@ botctl team region <team> gb-lon
 
 New machines go only on a host in their region. If none of them has room, the request is refused, never placed in another region. Restores, recovery and a chosen `--host` keep to the region too. Backups go to the region's store. Without one they go to the default store, and botd warns at startup and in `botctl regions`; with `MACHINE_BACKUP_RESIDENCY=strict` botd won't start until every region has a store. A region change is refused while the user's machine is in another region: destroy it, delete its backups if they must go too, then change the region and request a new machine.
 
+### Hosts dedicated to a team
+
+Containers on a host share its kernel. To keep a customer's machines off hosts that strangers' machines are on, dedicate hosts to their team ([ADR 0166](../adr/0166-incus-hosts-dedicated-to-a-team.md)). The team's id is on the console's Teams page and in `GET /api/teams`.
+
+```bash
+botctl machine host drain b --reason "for Acme"            # optional: keep new machines off while you empty it
+botctl machine host dedicate b <team-id> --reason "MSA-7"  # refused while anyone else's machine is on it
+botctl machine host undrain b
+botctl machine hosts                                       # dedicatedTeam per host, each team's next placement, misplaced machines
+botctl machine host share b --reason "contract ended"      # anyone's machines may go there again
+```
+
+From then on, only that team's machines go on its hosts, and the team's machines go only on its hosts. That covers new machines, retries, restores onto another host (`--host`) and a lost host's recovery. When the team's hosts are full, its next machine waits or is refused, and you are alerted; it is never put on a shared host. People in no team, and other teams, never get a dedicated host. Regions still apply: dedicate hosts in each region the team uses. A team whose only host is lost keeps waiting for one of its own. Dedicate another host, or share the lost one if the customer agrees.
+
+Dedicating a host is refused while anyone else's machine is on it, sent there or being restored there. Move those first with `botctl machine restore <user> <backup-id> --host <other> --yes`. It is also refused while a failed move onto the host may have left someone else's disk there, as a `<label>-restore` container: botd keeps one if it is all that's left of the machine, and may fail to delete one. The refusal names each one. Check it, delete it with `incus delete <name> --project superbot` on that host (or the host's own `INCUS_PROJECT`, if it differs), then try again. If the host doesn't answer within 20 seconds, botd can't tell whether the copies are gone, so it refuses then too. When someone joins or leaves a team, their own machine stays where it is. `botctl machine hosts` then lists it under `misplaced`, botd warns at startup, and `/metrics` counts it (`superbot_incus_machines_misplaced`, alerted after 15 minutes). Move it the same way. Only server admins can dedicate or share hosts.
+
+A dedicated host costs the same as any other host, and the team fills it alone. Price it per host, not per machine. On Linode, every machine already has its own VM; Linode's dedicated CPU plans are a `MACHINE_TIERS` choice, not this setting.
+
 ## Testing against a real host
 
 An end-to-end test runs botd's Incus provider against a real Incus host ([ADR 0069](../adr/0069-validating-incus-containers-on-a-real-host.md)). The `incus-e2e` CI job runs it on GitHub's runners. To run it yourself, use a throwaway Ubuntu 24.04 VM, because the script reconfigures Incus on the host it runs on:
@@ -216,7 +234,7 @@ It cleans up containers and ACLs left by an earlier run. It needs nftables' brid
 
 ## Limits to know
 
-- Containers share the host's kernel. A kernel escape crosses every boundary. Use VMs for tiers that need their own kernel. A server with `MACHINE_OWN_KERNEL_TIERS` set won't start with `MACHINE_PROVIDER=incus`, so unset it here. After moving such users to Linode with it set, their old containers are refused every run until they have new machines. [ADR 0120](../adr/0120-managed-substrate.md) recommends containers only on hosts that serve one organisation until the boundary has been red-teamed.
+- Containers share the host's kernel. A kernel escape crosses every boundary. Use VMs for tiers that need their own kernel. A server with `MACHINE_OWN_KERNEL_TIERS` set won't start with `MACHINE_PROVIDER=incus`, so unset it here. After moving such users to Linode with it set, their old containers are refused every run until they have new machines. [ADR 0120](../adr/0120-managed-substrate.md) recommends containers only on hosts that serve one organisation until the boundary has been red-teamed; [dedicate hosts to a team](#hosts-dedicated-to-a-team) to hold botd to that per customer.
 - Containers can't reach each other at all, ping included. They can ping the gateway. The host itself reaches only their agent port.
 - Snapshots (daily, kept 7 days) stay on the same pool. They don't protect against losing the host; off-host backups (step 7) do.
 - A backup restores only to the same machine, on its host or another. Exports are full each time, so storage grows with disk size times retention.

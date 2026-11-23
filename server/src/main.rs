@@ -87,6 +87,8 @@ mod machines_egress_policy_tests;
 #[cfg(test)]
 mod machines_hardening_tests;
 #[cfg(test)]
+mod machines_dedicated_tests;
+#[cfg(test)]
 mod machines_hosts_tests;
 #[cfg(test)]
 mod machines_http_tests;
@@ -1056,6 +1058,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/machines/hosts", get(machines::hosts::list))
         .route("/machines/hosts/{name}/recover", post(machines::hosts::recover))
         .route("/machines/hosts/{name}/drain", put(machines::hosts::drain).delete(machines::hosts::undrain))
+        .route("/machines/hosts/{name}/dedication", put(machines::hosts::dedicate).delete(machines::hosts::share))
         .route("/machines/legacy", get(machines::rebuild::legacy_list))
         .route("/machines/reconcile", post(machines::reconcile_now))
         .route("/machines/teammate-removals", get(machines::offboard::list_all))
