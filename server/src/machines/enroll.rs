@@ -503,6 +503,12 @@ impl Enrollment {
 
     /// cloud-init user data that installs the agent and enrolls the machine on first boot.
     pub fn user_data(&self, m: &Machine, token: &str) -> String {
+        self.user_data_on(m, token, None)
+    }
+
+    /// `user_data` for a machine on its team's network (ADR 0189), `team` its subnet:
+    /// the harness egress rules let every user reach that subnet.
+    pub fn user_data_on(&self, m: &Machine, token: &str, team: Option<&str>) -> String {
         let indent = |s: &str| {
             s.lines()
                 .map(|l| format!("      {l}\n"))
@@ -550,7 +556,7 @@ impl Enrollment {
                 ),
             };
             let hardening = self.hardening.as_ref().map_or(String::new(), |h| {
-                for (path, mode, content) in h.files() {
+                for (path, mode, content) in h.files(team) {
                     out.push_str(&format!(
                         "\x20 - path: {path}\n\
                          \x20   permissions: \"{mode}\"\n\
