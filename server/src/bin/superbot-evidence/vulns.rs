@@ -281,20 +281,42 @@ pub fn cargo_audit_accepted(text: &str) -> Vec<Value> {
         } else {
             continue;
         };
-        if let Some(c) = line.strip_prefix('#') {
-            notes.push(c.trim().to_string());
+        let (code, comment) = split_outside_quotes(line, '#');
+        let comment = comment.map(str::trim).unwrap_or_default();
+        if code.trim().is_empty() {
+            if !comment.is_empty() {
+                notes.push(comment.to_string());
+            }
             continue;
         }
-        for id in line.split(']').next().unwrap_or_default().split(',').filter_map(quoted) {
-            let reason = notes.join(" ");
+        for id in code.split(']').next().unwrap_or_default().split(',').filter_map(quoted) {
+            let reason = if notes.is_empty() { comment.to_string() } else { notes.join(" ") };
             out.push(json!({ "id": id, "reason": (!reason.is_empty()).then_some(reason.clone()), "hasReason": !reason.is_empty() }));
             notes.clear();
         }
-        if line.contains(']') {
+        if code.contains(']') {
             break;
         }
     }
     out
+}
+
+/// `s` split at the first `at` outside a quoted string.
+fn split_outside_quotes(s: &str, at: char) -> (&str, Option<&str>) {
+    let (mut q, mut escaped) = (None, false);
+    for (i, c) in s.char_indices() {
+        if std::mem::take(&mut escaped) {
+            continue;
+        }
+        match (q, c) {
+            (None, '"' | '\'') => q = Some(c),
+            (Some('"'), '\\') => escaped = true,
+            (Some(open), c) if c == open => q = None,
+            (None, c) if c == at => return (&s[..i], Some(&s[i + c.len_utf8()..])),
+            _ => {}
+        }
+    }
+    (s, None)
 }
 
 fn quoted(s: &str) -> Option<String> {
@@ -394,25 +416,26 @@ pub fn grype_accepted(text: &str) -> Vec<Value> {
             out.push(json!({ "id": Value::Null, "package": Value::Null, "location": Value::Null, "reason": Value::Null, "hasReason": false }));
         }
         let Some(e) = out.last_mut() else { continue };
+        if let Some(inner) = field.strip_prefix('{') {
+            let mut rest = split_outside_quotes(inner, '}').0;
+            while !rest.is_empty() {
+                let (pair, more) = split_outside_quotes(rest, ',');
+                if let Some((k, v)) = pair.split_once(':') {
+                    set_field(e, k.trim(), &yaml_value(v));
+                }
+                rest = more.unwrap_or_default();
+            }
+            continue;
+        }
         let Some((k, v)) = field.split_once(':') else { continue };
-        if k.trim() == "reason" {
-            if let Some(fold) = block_header(v) {
-                let key_at = indent(raw) + if item { 2 } else { 0 };
-                block = Some((key_at, fold, Vec::new()));
-                continue;
-            }
+        if k.trim() == "reason"
+            && let Some(fold) = block_header(v)
+        {
+            let key_at = indent(raw) + if item { 2 } else { 0 };
+            block = Some((key_at, fold, Vec::new()));
+            continue;
         }
-        let v = yaml_value(v);
-        match k.trim() {
-            "vulnerability" if !v.is_empty() => e["id"] = json!(v),
-            "name" if !v.is_empty() => e["package"] = json!(v),
-            "location" if !v.is_empty() => e["location"] = json!(v),
-            "reason" if !v.is_empty() => {
-                e["reason"] = json!(v);
-                e["hasReason"] = json!(true);
-            }
-            _ => {}
-        }
+        set_field(e, k.trim(), &yaml_value(v));
     }
     if let Some((_, fold, lines)) = block {
         let joined = lines.join(if fold { " " } else { "\n" }).trim().to_string();
@@ -422,6 +445,19 @@ pub fn grype_accepted(text: &str) -> Vec<Value> {
         }
     }
     out
+}
+
+fn set_field(e: &mut Value, k: &str, v: &str) {
+    match k {
+        "vulnerability" if !v.is_empty() => e["id"] = json!(v),
+        "name" if !v.is_empty() => e["package"] = json!(v),
+        "location" if !v.is_empty() => e["location"] = json!(v),
+        "reason" if !v.is_empty() => {
+            e["reason"] = json!(v);
+            e["hasReason"] = json!(true);
+        }
+        _ => {}
+    }
 }
 
 fn accepted_file(path: &str, tool: &str, reply: &Result<Value, Unavailable>) -> Value {
@@ -752,6 +788,10 @@ mod tests {
         assert_eq!((commented.len(), commented[0]["id"].as_str(), commented[0]["reason"].as_str()), (1, Some("CVE-9"), Some("a # in quotes")), "comments after a key or value are not part of it");
         let escaped = grype_accepted("ignore:\n  - vulnerability: CVE-10\n    reason: 'It''s unused'\n  - vulnerability: CVE-11\n    reason: \"a \\\"quoted\\\" word\"\n");
         assert_eq!(escaped.iter().map(|f| f["reason"].as_str()).collect::<Vec<_>>(), [Some("It's unused"), Some("a \"quoted\" word")], "escaped quotes keep the whole reason");
+        let inline = cargo_audit_accepted("[advisories]\nignore = [\n  \"RUSTSEC-1\", # first\n  \"RUSTSEC-2\" # last, no comma ]\n]\n");
+        assert_eq!(inline.iter().map(|f| (f["id"].as_str(), f["reason"].as_str())).collect::<Vec<_>>(), [(Some("RUSTSEC-1"), Some("first")), (Some("RUSTSEC-2"), Some("last, no comma ]"))], "a trailing comment is a reason, not part of the id");
+        let flow = grype_accepted("ignore:\n  - {vulnerability: CVE-12, reason: \"accepted, \\\"upstream\\\" {fix}\"}  # note\n  - { vulnerability: 'CVE-13', package: {name: x} }\n");
+        assert_eq!(flow.iter().map(|f| (f["id"].as_str(), f["reason"].as_str())).collect::<Vec<_>>(), [(Some("CVE-12"), Some("accepted, \"upstream\" {fix}")), (Some("CVE-13"), None)], "flow mappings keep their fields");
         assert_eq!(quoted_marks.iter().map(|f| f["reason"].as_str()).collect::<Vec<_>>(), [Some("> 30 days needed upstream"), Some("kept")], "a quoted reason starting with > is text, not a block");
         let g = grype_accepted("ignore:\n  # CVE-YYYY-NNNNN example\n  - vulnerability: CVE-1\n    package:\n      name: zlib\n  - vulnerability: \"CVE-2\"\n    reason: 'fixed upstream'\nother:\n  - vulnerability: CVE-3\n");
         assert_eq!(g.iter().map(|f| (f["id"].as_str().unwrap(), f["reason"].as_str())).collect::<Vec<_>>(), [("CVE-1", None), ("CVE-2", Some("fixed upstream"))]);
