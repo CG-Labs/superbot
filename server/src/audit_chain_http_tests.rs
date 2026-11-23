@@ -257,6 +257,99 @@ async fn the_siem_export_delivers_every_event_in_order_and_retries() {
     assert_eq!(app.db.audit_export_cursor(&url), Some(delivered));
 }
 
+/// A webhook collector that answers 503 while `down` is set, keeping every request's
+/// headers, and the lines of each batch it takes.
+async fn switchable_collector(down: Arc<std::sync::atomic::AtomicBool>) -> (String, Collected) {
+    let got: Collected = Default::default();
+    let state = got.clone();
+    let r = axum::Router::new().route(
+        "/ingest",
+        axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+            let (state, down) = (state.clone(), down.clone());
+            async move {
+                let mut s = state.lock().unwrap();
+                s.0 += 1;
+                s.2.push(format!("{:?}", headers));
+                if down.load(std::sync::atomic::Ordering::SeqCst) {
+                    return axum::http::StatusCode::SERVICE_UNAVAILABLE;
+                }
+                s.1.extend(body.lines().map(String::from));
+                axum::http::StatusCode::OK
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
+    (format!("http://{addr}/ingest"), got)
+}
+
+#[tokio::test]
+async fn several_siems_each_get_their_own_headers_start_and_cursor() {
+    let (port, app, admin, _) = serve_app().await;
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (splunk_url, splunk) = switchable_collector(down.clone()).await;
+    let (elastic_url, elastic) = collector(0).await;
+    for i in 0..3 {
+        app.db.record(&Event::new(Actor::system("test"), "test.several").details(json!({ "n": i })));
+    }
+    let head_at_start = app.db.audit_head();
+    let (splunk_token, elastic_token) = ("sbx-splunk-hec-token-1a2b3c4d5e", "sbx-elastic-api-key-6f7a8b9c0d");
+    let export = format!("splunk={splunk_url},elastic={elastic_url}");
+    export_to(
+        &app,
+        &[
+            ("AUDIT_EXPORT", &export),
+            ("AUDIT_EXPORT_HEADERS_SPLUNK", &format!("Authorization=Splunk {splunk_token}")),
+            ("AUDIT_EXPORT_HEADERS_ELASTIC", &format!("Authorization=ApiKey {elastic_token}")),
+            ("AUDIT_EXPORT_START_ELASTIC", "new"),
+        ],
+    );
+    let xs = app.audit_export.get().unwrap().clone();
+    let (to_splunk, to_elastic) = (xs.sinks[0].clone(), xs.sinks[1].clone());
+    assert_eq!((to_splunk.sink.name.as_deref(), to_elastic.sink.name.as_deref()), (Some("splunk"), Some("elastic")));
+
+    // Splunk is down: Elastic carries on, from where it was told to start.
+    until("splunk failing", || to_splunk.view(app.db.audit_head())["failing"] == true).await;
+    app.db.record(&Event::new(Actor::system("test"), "test.while_down"));
+    until("elastic caught up", || to_elastic.delivered() >= app.db.audit_head()).await;
+    assert_eq!(xs.delivered(), to_splunk.delivered(), "retention waits for the SIEM that's behind");
+    let failing = app.db.audit_events(&crate::audit::Filter { actions: vec!["audit.export_failing".into()], ..Default::default() }, 10, false);
+    assert_eq!(failing.len(), 1, "only splunk is failing");
+    assert_eq!((failing[0].details["name"].as_str(), failing[0].details["kind"].as_str()), (Some("splunk"), Some("webhook")));
+
+    let v = parse(&call(port, "GET", "/api/audit/siem", &admin, "").await.1);
+    assert_eq!((v["name"].as_str(), v["failing"].as_bool()), (Some("splunk"), Some(true)), "the failing sink leads: {v}");
+    let names: Vec<&str> = v["sinks"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["splunk", "elastic"], "{v}");
+    let mut metrics = String::new();
+    crate::audit_export::render(&app, &mut metrics);
+    assert!(
+        metrics.contains("superbot_audit_export_failing{kind=\"webhook\",name=\"splunk\"} 1") && metrics.contains("superbot_audit_export_failing{kind=\"webhook\",name=\"elastic\"} 0"),
+        "a series each: {metrics}"
+    );
+
+    // Splunk is back: it catches up from its own cursor, with the whole history.
+    down.store(false, std::sync::atomic::Ordering::SeqCst);
+    until("splunk caught up", || to_splunk.delivered() >= app.db.audit_head()).await;
+    until("recovery event", || app.db.audit_events(&Default::default(), 1000, false).iter().any(|e| e.action == "audit.export_recovered" && e.details["name"] == "splunk")).await;
+    until("both caught up", || xs.sinks.iter().all(|x| x.delivered() >= app.db.audit_head())).await;
+    let ids = |got: &Collected| got.lock().unwrap().1.iter().map(|l| serde_json::from_str::<Value>(l).unwrap()["id"].as_i64().unwrap()).collect::<Vec<_>>();
+    let (s_ids, e_ids) = (ids(&splunk), ids(&elastic));
+    assert!(s_ids[0] == 1 && s_ids.windows(2).all(|w| w[1] == w[0] + 1), "splunk gets the history (AUDIT_EXPORT_START=all): {s_ids:?}");
+    assert!(e_ids[0] > head_at_start && e_ids.windows(2).all(|w| w[1] == w[0] + 1), "elastic starts after it (AUDIT_EXPORT_START_ELASTIC=new): {e_ids:?}");
+    assert!(e_ids.iter().all(|id| s_ids.contains(id)), "the same events, so host and id match across SIEMs");
+
+    // Each SIEM saw only its own token, and no line carries either.
+    let (s_headers, e_headers) = (splunk.lock().unwrap().2.clone(), elastic.lock().unwrap().2.clone());
+    assert!(s_headers.iter().all(|h| h.contains(&format!("Splunk {splunk_token}")) && !h.contains(elastic_token)), "{s_headers:?}");
+    assert!(e_headers.iter().all(|h| h.contains(&format!("ApiKey {elastic_token}")) && !h.contains(splunk_token)), "{e_headers:?}");
+    let lines = [splunk.lock().unwrap().1.join("\n"), elastic.lock().unwrap().1.join("\n")].join("\n");
+    assert!(!lines.contains(splunk_token) && !lines.contains(elastic_token));
+    let head = app.db.audit_head();
+    assert_eq!((app.db.audit_export_cursor(&splunk_url), app.db.audit_export_cursor(&elastic_url)), (Some(head), Some(head)), "a cursor each, by URL");
+}
+
 #[tokio::test]
 async fn syslog_sinks_get_rfc_5424_with_octet_counting() {
     let app = runner::test_app();
