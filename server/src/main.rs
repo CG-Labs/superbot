@@ -33,6 +33,7 @@ mod auth_review_http_tests;
 #[cfg(test)]
 mod backup_deletion_http_tests;
 mod backup_encryption;
+mod baseline;
 #[cfg(test)]
 mod backup_encryption_http_tests;
 #[cfg(test)]
@@ -984,6 +985,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/support/health-score/history", get(health_history::get))
         .route("/evidence", get(evidence::get))
         .route("/evidence/bundle", get(evidence::bundle))
+        .route("/evidence/baseline", get(baseline::get))
         .route("/secrets", get(list_secrets))
         .route("/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/me/tier", get(my_tier))

@@ -2,7 +2,8 @@
 //! what the server already records about its controls: an access review snapshot (users,
 //! roles, admins, second factors), the versions deployed and configuration changes,
 //! backup and restore runs, retention settings and passes, sign-in and alert events, a
-//! summary of the period's audit log with a digest, and a manifest with every file's
+//! summary of the period's audit log with a digest, the configuration baseline checked
+//! when it was made (ADR 0192), and a manifest with every file's
 //! SHA-256. Made on request by `GET /api/evidence/bundle` (admins), which `botctl evidence
 //! bundle` saves, and, with `EVIDENCE_BUNDLES=monthly`, by botd itself for each month
 //! into `EVIDENCE_DIR`, with retention. Each bundle is audited with its digests.
@@ -109,6 +110,12 @@ pub const SECTIONS: [Section; 5] = [
 /// `audit-summary.json`: every event in the period, counted, with a digest.
 pub const SUMMARY_CRITERIA: [&str; 3] = ["CC2.1", "CC4.1", "CC7.2"];
 
+/// `baseline.json`: every setting of the configuration baseline checked as botd runs
+/// when the bundle is made (ADR 0192).
+pub const BASELINE_FILE: &str = "baseline.json";
+pub const BASELINE_CRITERIA: [&str; 1] = ["CC5.1"];
+pub const BASELINE_ROWS: [&str; 1] = ["CC5.1-1"];
+
 /// Detail fields kept as text when they hold a code (`admin`, `sso`, `burst_ip`), never free text.
 const CODE_KEYS: [&str; 28] = [
     "from", "to", "before", "after", "method", "firstFactor", "kind", "pattern", "mode", "encryption", "policy", "policyMode", "mfaPolicy", "state", "source", "harness", "defaultHarness",
@@ -144,6 +151,9 @@ of createdAt, which is after the period.
                             pass, hold, erasure and deletion in the period
   sign-ins-and-alerts.json  sign-ins, failures, suspicious sign-ins and alerts, by day
   audit-summary.json        every audit event in the period, counted, and a digest of them
+  baseline.json             each setting of the configuration baseline as botd ran when
+                            this bundle was made: meets it, doesn't, excepted, not
+                            applicable, or for a person to judge (ADR 0192)
   manifest.json             what is in this bundle, the period, and each file's SHA-256
   SHA256SUMS                the same digests, for `sha256sum -c SHA256SUMS`
 
@@ -539,11 +549,13 @@ pub fn build(app: &App, inputs: &Inputs, p: &Period, now_ms: i64, scheduled: boo
         ("retention.json", json_file(with_period(retention(app, p, tally("retention.json"))))),
         ("sign-ins-and-alerts.json", json_file(with_period(tally("sign-ins-and-alerts.json").view()))),
         ("audit-summary.json", json_file(summary(app, p, &s))),
+        (BASELINE_FILE, json_file(crate::baseline::run(app, inputs.mfa).view(&rfc3339(now_ms)))),
     ];
     let controls = |file: &str| -> (Vec<&str>, Vec<&str>) {
         match SECTIONS.iter().find(|x| x.file == file) {
             Some(x) => (x.criteria.to_vec(), x.rows.to_vec()),
             None if file == "audit-summary.json" => (SUMMARY_CRITERIA.to_vec(), Vec::new()),
+            None if file == BASELINE_FILE => (BASELINE_CRITERIA.to_vec(), BASELINE_ROWS.to_vec()),
             None => (Vec::new(), Vec::new()),
         }
     };
@@ -864,7 +876,7 @@ mod tests {
         let mapping = include_str!("../../docs/security/soc2-control-mapping.md");
         let checklist = include_str!("../../docs/security/soc2-readiness-checklist.md");
         let plan = include_str!("../../docs/security/soc2-evidence-plan.md");
-        let files: Vec<(&str, Vec<&str>, Vec<&str>)> = SECTIONS.iter().map(|s| (s.file, s.criteria.to_vec(), s.rows.to_vec())).chain([("audit-summary.json", SUMMARY_CRITERIA.to_vec(), Vec::new())]).collect();
+        let files: Vec<(&str, Vec<&str>, Vec<&str>)> = SECTIONS.iter().map(|s| (s.file, s.criteria.to_vec(), s.rows.to_vec())).chain([("audit-summary.json", SUMMARY_CRITERIA.to_vec(), Vec::new()), (BASELINE_FILE, BASELINE_CRITERIA.to_vec(), BASELINE_ROWS.to_vec())]).collect();
         for (file, criteria, rows) in files {
             for c in &criteria {
                 assert!(mapping.contains(&format!("| {c} ")), "{file}: {c} isn't a criterion of the control mapping");
