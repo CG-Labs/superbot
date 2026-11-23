@@ -146,10 +146,12 @@ One JSON object per event, the same shape as `GET /api/audit`, plus:
 | `schema` | `superbot.audit.v1` |
 | `host` | The server's host name |
 | `chainPrev`, `chainHash` | The event's link in the chain. Each event's `chainPrev` is the previous event's `chainHash` |
+| `chainDigest` | The salted digest of the fields an erasure may rewrite, which `chainHash` covers. With it, anyone can work `chainHash` out from the line ([below](#check-exported-events-without-botd)). On every event after `digestsAfter` in `botctl audit siem`: the first export with this version saves where they start |
+| `chainSalt` | The digest's salt, so the personal fields and `details` are checked too. Left out when that would let someone test guesses at something hidden: for erased events, and for events whose details were redacted on the way out |
 | `checkpoint` | Only on `audit.checkpoint` and `audit.checkpoint_timestamped`: the signed statement, signature and key, and on the second the RFC 3161 token ([above](#check-a-checkpoint-without-botd)) |
 
 ```json
-{"id":4182,"at":1795000000000,"time":"2026-11-19T13:46:40.000Z","actorKind":"user","actorId":"u1a2b3c","actorEmail":"ada@example.com","actorRole":"admin","authMethod":"sso","action":"bot.created","targetType":"bot","targetId":"b9f8e7","outcome":"success","details":{"name":"Scout"},"schema":"superbot.audit.v1","host":"<server-host>","chainPrev":"9a0c...","chainHash":"3f1c..."}
+{"id":4182,"at":1795000000000,"time":"2026-11-19T13:46:40.000Z","actorKind":"user","actorId":"u1a2b3c","actorEmail":"ada@example.com","actorRole":"admin","authMethod":"sso","action":"bot.created","targetType":"bot","targetId":"b9f8e7","outcome":"success","details":{"name":"Scout"},"schema":"superbot.audit.v1","host":"<server-host>","chainPrev":"9a0c...","chainHash":"3f1c...","chainDigest":"5e2d...","chainSalt":"b71f..."}
 ```
 
 Events are scrubbed when they are recorded: passwords, tokens, message text and routine instructions are never in them, and known secrets are redacted. The export headers are never in an event.
@@ -240,12 +242,14 @@ This checks the chain as usual and also reads the whole archive (`GET /api/audit
 - the archive begins with the first event botd sent it, and reaches the last event botd says it delivered;
 - every archived event has the same hash in this server's log. This catches a log rebuilt after an event was changed: its own chain verifies, but it no longer matches what was archived. It's the same as pinning every event (`--pin`). While the event is still here, what the archive says it was must also match this server's row: its fields, and, unless an erasure has since rewritten them, the personal ones.
 
-The check fails, and exits 1, if any of that doesn't hold. `firstBroken` then names the first event here that differs from the archive (reason `archive`). The answer's `archive` block counts `objects`, `events`, `matched`, `gone` (deleted here by retention, with the anchor's hash still checked), `mismatched`, `altered`, `missing`, `locked`, `lockExpired` and `checkpoints`. It also counts `repeated` (events a restarted export wrote twice), `retried` (extra identical versions of an object) and `hidden` (objects behind a delete marker, which are still read). `firstProblems` lists the first 20 problems, each with a `key`, `id` and one of these reasons:
+The check fails, and exits 1, if any of that doesn't hold. `firstBroken` then names the first event here that differs from the archive (reason `archive`). The answer's `archive` block counts `objects`, `events`, `matched`, `gone` (deleted here by retention, with the anchor's hash still checked), `mismatched`, `altered`, `missing`, `locked`, `lockExpired` and `checkpoints`. It also counts `repeated` (events a restarted export wrote twice), `retried` (extra identical versions of an object) and `hidden` (objects behind a delete marker, which are still read). `bound`, `boundFixed` and `unbound` count the copies whose hash vouches for every field (they have `chainSalt`), only the fields no erasure changes (erased or redacted on the way out), or nothing (sent before `digestsAfter`). `firstProblems` lists the first 20 problems, each with a `key`, `id` and one of these reasons:
 
 | Reason | Meaning |
 |---|---|
 | `mismatch`, `missing` | An archived event has another hash in this server's log, or isn't in it, and retention didn't delete it |
-| `contents` | An archived event has this server's hash but says something else: the archive's copy was changed. Events retention deleted here can't be compared this way |
+| `contents` | An archived event has this server's hash but says something else: the archive's copy was changed. Events retention deleted here can't be compared this way, but `digest` still catches them |
+| `digest` | An archived event's hash doesn't follow from what it says (its fields, `chainDigest` and, with it, `chainSalt`): the copy was changed. This holds after retention deleted the row here |
+| `unbound` | An event after `digestsAfter` has no `chainDigest`: it was stripped, to hide a change, or the object isn't botd's |
 | `link` | An event doesn't link to the one before it: an object is missing, or isn't botd's |
 | `behind` | The archive ends before the last event botd delivered to it: objects are missing at the end |
 | `start` | The archive begins after the first event botd sent it: objects are missing at the start. Archives started before this check was added aren't asked |
@@ -276,7 +280,7 @@ If it fails:
 
 - `error` naming `s3:ListBucketVersions`: grant that right on the bucket (archives set up before the daily check may lack it), or set `AUDIT_EXPORT_S3_CHECK=off`.
 - `mismatch` or `missing` at the head it carried on from, or at an archived event: this server's log no longer says what was archived. Treat it as tampering until shown otherwise: compare the archive's copy of that event with the log, and with your SIEM's copy if there is one.
-- `contents`, `overwritten`, `stray`: someone wrote to the archive with its key. The first version of each object is still what's checked. Find who used the key, then rotate it.
+- `contents`, `digest`, `unbound`, `overwritten`, `stray`: someone wrote to the archive with its key. The first version of each object is still what's checked. Find who used the key, then rotate it.
 - `link` or `behind`: new objects are missing. Check the export's status (`botctl audit siem`) first.
 
 Erased users' data stays in locked objects until their lock ends, like a SIEM or a backup: choose the period with your DPA in mind.
@@ -321,6 +325,37 @@ AUDIT_EXPORT_START_MDR=new
 - **A misspelt name** in `AUDIT_EXPORT_HEADERS_<NAME>` isn't caught at startup: that webhook sends no headers, its SIEM refuses them, and the export shows as failing for that sink.
 
 A single SIEM needs no name, so settings from before keep working. To move to several, name the one you have (it resumes where it was) and move its `AUDIT_EXPORT_HEADERS` to `AUDIT_EXPORT_HEADERS_<NAME>`.
+
+## Check exported events without botd
+
+`botctl audit verify-lines` checks exported events where they landed: a copy of the archive, a SIEM export, years later, with the server gone. It needs no botd, no database and no network, only the `botctl` binary:
+
+```sh
+aws s3 cp --recursive s3://<bucket>/<prefix>/ ./audit/
+botctl audit verify-lines ./audit/ --key <checkpoint public key hex>
+
+# A SIEM export, as JSON lines or syslog, from a file or stdin
+zcat siem-export-2026-11.jsonl.gz | botctl audit verify-lines - --key <checkpoint public key hex>
+```
+
+`aws s3 cp` takes each key's latest version, while botd's archive check reads the first, which Object Lock keeps. If someone wrote a version over a locked object, this checks theirs; `botctl audit verify --archive` names it as `overwritten`.
+
+It reads files, directories (their `.jsonl`, `.ndjson`, `.json` and `.log` files) and `-` for stdin, in any order, copies and all. A syslog line is read from its first `{`. Lines from other sources are counted as `ignored`. For each `host` it checks:
+
+- each line against its own hash: `chainHash` from `chainPrev`, the fields no erasure changes and `chainDigest`, and with `chainSalt`, `chainDigest` from the other fields (`digest` otherwise);
+- copies of one event against each other (`conflict`);
+- the chain from event to event, with no gap (`link`);
+- that once events carry `chainDigest`, every later one does (`unbound`);
+- each signed checkpoint (`checkpoint`), under the keys given with `--key` (from `botctl audit key`, or the `audit.checkpoint_key` events in your SIEM). Without `--key` a checkpoint is checked under the key in it, which only shows it agrees with whoever signed it.
+
+It prints a JSON report: per host, `events`, `copies`, `first` and `firstPrev` (the genesis hash for a log never pruned), `head`, `bound`, `boundFixed` and `unbound` (as for the [archive check](#check-the-archive)), `checkpoints` and their `checkpointKeys`, and the first 20 `firstProblems`, each with `id`, `at` (`<file>:<line>`) and `reason`. It exits 1 if anything doesn't hold, or if no events were found.
+
+What it can't tell you:
+
+- that nothing is missing at the start or the end. Compare `first` and `head` with what botd says it delivered (`botctl audit siem`), or pin a head kept elsewhere: the last `audit.checkpoint` you trust signs it;
+- what a line without `chainSalt` said in its personal fields and `details`. Those are erased or redacted events, and `boundFixed` counts them;
+- anything about events sent before `digestsAfter`, beyond their links. Check them with `botctl audit verify --archive` while their rows are still here;
+- RFC 3161 timestamps. Check those with OpenSSL ([above](#check-a-checkpoint-without-botd)).
 
 ## Retention and erasure
 
