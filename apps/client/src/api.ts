@@ -25,6 +25,7 @@ import type {
   MfaStatus,
   ModelOption,
   MyTeamInvite,
+  MyResidency,
   MyUsage,
   OffboardingPreview,
   NewPolicyRule,
@@ -524,6 +525,23 @@ export class SuperBotApi {
       if (e instanceof ApiError && [403, 404, 405].includes(e.status)) return null;
       throw e;
     }
+  }
+
+  /** The residency pin on your data (ADR 0166). null from servers before it. */
+  async myResidency(): Promise<MyResidency | null> {
+    try {
+      return await this.request<MyResidency>("GET", "/api/me/residency");
+    } catch (e) {
+      if (e instanceof ApiError && [403, 404, 405].includes(e.status)) return null;
+      throw e;
+    }
+  }
+
+  /** The residency report (ADR 0155) on your own pin or your team's, as Markdown, and the file name the server gave it. */
+  async myResidencyReport(on: "user" | "team"): Promise<{ text: string; fileName: string | null }> {
+    const res = await this.send("GET", `/api/me/residency/report?format=markdown&on=${on}`);
+    const fileName = /filename="([^"]+)"/.exec(res.headers.get("content-disposition") ?? "")?.[1] ?? null;
+    return { text: await res.text(), fileName };
   }
 
   /** A Stripe Checkout page for the plan; open `url` to pay. */

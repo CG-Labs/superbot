@@ -1,0 +1,42 @@
+import type { MyResidency } from "./types";
+
+function day(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+/** What the residency card says about a pin (ADR 0166): whose it is, where your data is against it, and what isn't held. */
+export function residencyLines(v: MyResidency): { lines: string[]; warnings: string[] } {
+  const p = v.pin;
+  if (!p) return { lines: [], warnings: [] };
+  const whose = p.on === "team" ? `Your team${p.team?.name ? `, ${p.team.name},` : ""} has its data` : "Your data is";
+  const under = p.reference ? ` under ${p.reference}` : "";
+  const lines = [`${whose} pinned to ${p.region}${under}, since ${day(p.pinnedAt)}.`];
+  if (v.ownPin) lines.push(`Your own data is also pinned to ${v.ownPin.region} under ${v.ownPin.reference}.`);
+  const warnings: string[] = [];
+  if (v.machine) {
+    if (v.machine.inRegion) lines.push(`Your computer is in ${v.machine.region}.`);
+    else warnings.push(`Your computer is in ${v.machine.region}, not ${p.region}. Your admins see a warning about it.`);
+  }
+  const b = v.backups;
+  if (b && b.kept > 0) {
+    if (b.outside === 0) lines.push(`All ${b.kept} of your computer's backups are in ${p.region}.`);
+    else warnings.push(`${b.outside} of your computer's ${b.kept} backups are outside ${p.region}. Your admins see a warning about it.`);
+  }
+  if (v.status === "data_outside" && warnings.length === 0) warnings.push(`Some of your data is outside ${p.region}. Your admins see a warning about it.`);
+  if (v.modelRoutes && !v.modelRoutes.inRegion) {
+    warnings.push(`Your plan has no AI model in ${p.region}, so your Bots don't run until your admin adds one. Nothing is sent outside the region instead.`);
+  } else if (v.modelRoutes?.inRegion) {
+    lines.push(`Your Bots use AI models in ${p.region} only.`);
+  }
+  return { lines, warnings };
+}
+
+/** The button for one report. */
+export function reportLabel(on: "user" | "team"): string {
+  return on === "team" ? "Download the team's report" : "Download your report";
+}
+
+/** The file to save a report as: the server's name, or a dated one. */
+export function reportFileName(on: "user" | "team", given: string | null, now = Date.now()): string {
+  return given && /^[\w.-]+\.md$/.test(given) ? given : `superbot-residency-${on}-${day(now).replace(/-/g, "")}.md`;
+}

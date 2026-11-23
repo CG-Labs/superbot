@@ -6,7 +6,7 @@ import { SettingsView } from "../components/SettingsView";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 
-/** This device's settings: App lock (ADR 0078) and push notifications (ADR 0080), and your two-factor authentication (ADR 0094). */
+/** This device's settings: App lock (ADR 0078) and push notifications (ADR 0080); your two-factor authentication (ADR 0094) and your data's residency pin (ADR 0166). */
 export default function SettingsScreen() {
   const { ready, api, can } = useSuperBot();
   if (!ready) {
