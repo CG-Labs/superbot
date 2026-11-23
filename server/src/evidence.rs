@@ -1,9 +1,10 @@
 //! Type II evidence bundles (ADR 0142): one dated tarball per observation period holding
 //! what the server already records about its controls: an access review snapshot (users,
 //! roles, admins, second factors), the versions deployed and configuration changes,
-//! backup and restore runs, retention settings and passes, sign-in and alert events, a
-//! summary of the period's audit log with a digest, and a manifest with every file's
-//! SHA-256. Made on request by `GET /api/evidence/bundle` (admins), which `botctl evidence
+//! backup and restore runs, retention settings and passes, sign-in and alert events, the
+//! server checked against the configuration baseline now and every such check in the
+//! period (ADR 0193), a summary of the period's audit log with a digest, and a manifest
+//! with every file's SHA-256. Made on request by `GET /api/evidence/bundle` (admins), which `botctl evidence
 //! bundle` saves, and, with `EVIDENCE_BUNDLES=monthly`, by botd itself for each month
 //! into `EVIDENCE_DIR`, with retention. Each bundle is audited with its digests.
 //!
@@ -35,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Bumped when a file's shape changes, so tools reading bundles can tell them apart.
-pub const FORMAT: u32 = 2;
+pub const FORMAT: u32 = 3;
 pub const CREATED: &str = "evidence.bundle_created";
 pub const FAILED: &str = "evidence.bundle_failed";
 pub const PRUNED: &str = "evidence.bundles_pruned";
@@ -59,7 +60,7 @@ pub struct Section {
     actions: &'static [&'static str],
 }
 
-pub const SECTIONS: [Section; 5] = [
+pub const SECTIONS: [Section; 6] = [
     Section {
         file: "access-review.json",
         criteria: &["CC1.3", "CC6.1", "CC6.2", "CC6.3"],
@@ -104,6 +105,7 @@ pub const SECTIONS: [Section; 5] = [
         rows: &["CC6.1-1", "CC7.2-1"],
         actions: &["auth.*", "mfa.*", "notification.*", "status.incident_*", "server.panic", "machine.host_*", "machine.lost", "machine.hardening_failed", "machine.reboot_required"],
     },
+    Section { file: "baseline.json", criteria: &["CC5.1", "CC7.1"], rows: &["CC5.1-1"], actions: &[crate::config_baseline::CHECKED] },
 ];
 
 /// `audit-summary.json`: every event in the period, counted, with a digest.
@@ -143,6 +145,8 @@ of createdAt, which is after the period.
   retention.json            retention settings, last passes and holds now; every pruning
                             pass, hold, erasure and deletion in the period
   sign-ins-and-alerts.json  sign-ins, failures, suspicious sign-ins and alerts, by day
+  baseline.json             each setting checked against the configuration baseline now,
+                            and every check botd made in the period (ADR 0193)
   audit-summary.json        every audit event in the period, counted, and a digest of them
   manifest.json             what is in this bundle, the period, and each file's SHA-256
   SHA256SUMS                the same digests, for `sha256sum -c SHA256SUMS`
@@ -499,6 +503,21 @@ fn retention(app: &App, p: &Period, t: &Tally) -> Value {
     })
 }
 
+/// The configuration baseline checked now, without auditing it, and each check in the
+/// period, with only its known settings, counts and digest.
+fn baseline(app: &App, p: &Period, t: &Tally, now_ms: i64) -> Value {
+    let f = audit::Filter { actions: vec![crate::config_baseline::CHECKED.into()], from: Some(p.start_ms()), to: Some(p.end_ms()), ..Default::default() };
+    let checks = app.db.audit_events(&f, MAX_LISTED as i64, true);
+    json!({
+        "now": crate::config_baseline::check(app, now_ms).view(),
+        "checksInPeriod": t.total,
+        "byOutcome": t.counts.get(crate::config_baseline::CHECKED),
+        "lastCheckAt": app.db.audit_events(&f, 1, false).first().map(|e| e.time.clone()),
+        "checksListed": checks.len(),
+        "checks": checks.iter().map(crate::config_baseline::entry).collect::<Vec<_>>(),
+    })
+}
+
 fn summary(app: &App, p: &Period, s: &Scan) -> Value {
     json!({
         "events": s.total,
@@ -539,6 +558,7 @@ pub fn build(app: &App, inputs: &Inputs, p: &Period, now_ms: i64, scheduled: boo
         ("backups.json", json_file(with_period(backups(app, tally("backups.json"))))),
         ("retention.json", json_file(with_period(retention(app, p, tally("retention.json"))))),
         ("sign-ins-and-alerts.json", json_file(with_period(tally("sign-ins-and-alerts.json").view()))),
+        ("baseline.json", json_file(with_period(baseline(app, p, tally("baseline.json"), now_ms)))),
         ("audit-summary.json", json_file(summary(app, p, &s))),
     ];
     let controls = |file: &str| -> (Vec<&str>, Vec<&str>) {

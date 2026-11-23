@@ -13,7 +13,7 @@ use crate::*;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const FILES: [&str; 9] = ["README.txt", "access-review.json", "changes.json", "backups.json", "retention.json", "sign-ins-and-alerts.json", "audit-summary.json", "manifest.json", "SHA256SUMS"];
+const FILES: [&str; 10] = ["README.txt", "access-review.json", "changes.json", "backups.json", "retention.json", "sign-ins-and-alerts.json", "baseline.json", "audit-summary.json", "manifest.json", "SHA256SUMS"];
 
 /// A `GET`'s status, response head and body bytes.
 async fn fetch(port: u16, path: &str, auth: &str) -> (u16, String, Vec<u8>) {

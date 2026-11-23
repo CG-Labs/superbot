@@ -24,17 +24,20 @@ pub struct Expected {
     pub file: &'static str,
     pub criteria: &'static [&'static str],
     pub rows: &'static [&'static str],
+    /// The first manifest format that has it: older bundles are complete without it.
+    pub since: u64,
 }
 
 /// botd's evidence bundle (ADR 0142). botd's `evidence::SECTIONS` isn't reachable from
 /// this binary; a test checks this against the evidence plan's table, as botd's does.
-pub const EVIDENCE: [Expected; 6] = [
-    Expected { file: "access-review.json", criteria: &["CC1.3", "CC6.1", "CC6.2", "CC6.3"], rows: &["CC6.1-1", "CC6.2-1", "CC6.3-1", "CC6.3-2"] },
-    Expected { file: "changes.json", criteria: &["CC5.1", "CC5.2", "CC8.1"], rows: &["CC5.1-1", "CC8.1-2"] },
-    Expected { file: "backups.json", criteria: &["A1.2", "A1.3", "CC6.7", "CC7.5", "CC9.1"], rows: &["A1.2-1", "A1.2-2", "CC6.7-2"] },
-    Expected { file: "retention.json", criteria: &["C1.2", "CC6.5"], rows: &["C1.2-1", "CC6.5-1", "CC6.5-2"] },
-    Expected { file: "sign-ins-and-alerts.json", criteria: &["CC6.1", "CC6.6", "CC7.2"], rows: &["CC6.1-1", "CC7.2-1"] },
-    Expected { file: "audit-summary.json", criteria: &["CC2.1", "CC4.1", "CC7.2"], rows: &[] },
+pub const EVIDENCE: [Expected; 7] = [
+    Expected { file: "access-review.json", criteria: &["CC1.3", "CC6.1", "CC6.2", "CC6.3"], rows: &["CC6.1-1", "CC6.2-1", "CC6.3-1", "CC6.3-2"], since: 1 },
+    Expected { file: "changes.json", criteria: &["CC5.1", "CC5.2", "CC8.1"], rows: &["CC5.1-1", "CC8.1-2"], since: 1 },
+    Expected { file: "backups.json", criteria: &["A1.2", "A1.3", "CC6.7", "CC7.5", "CC9.1"], rows: &["A1.2-1", "A1.2-2", "CC6.7-2"], since: 1 },
+    Expected { file: "retention.json", criteria: &["C1.2", "CC6.5"], rows: &["C1.2-1", "CC6.5-1", "CC6.5-2"], since: 1 },
+    Expected { file: "sign-ins-and-alerts.json", criteria: &["CC6.1", "CC6.6", "CC7.2"], rows: &["CC6.1-1", "CC7.2-1"], since: 1 },
+    Expected { file: "audit-summary.json", criteria: &["CC2.1", "CC4.1", "CC7.2"], rows: &[], since: 1 },
+    Expected { file: "baseline.json", criteria: &["CC5.1", "CC7.1"], rows: &["CC5.1-1"], since: 3 },
 ];
 
 /// One kind of bundle the evidence plan collects monthly.
@@ -51,7 +54,7 @@ pub struct Kind {
 }
 
 pub const KINDS: [Kind; 4] = [
-    Kind { id: "evidence", prefix: "superbot-evidence-", manifest_kind: None, format: 2, title: "Evidence bundle", made_by: "botd (EVIDENCE_BUNDLES=monthly, or botctl evidence bundle)" },
+    Kind { id: "evidence", prefix: "superbot-evidence-", manifest_kind: None, format: 3, title: "Evidence bundle", made_by: "botd (EVIDENCE_BUNDLES=monthly, or botctl evidence bundle)" },
     Kind {
         id: "change-management",
         prefix: changes::PREFIX,
@@ -86,6 +89,14 @@ pub fn expected(kind: &str) -> Vec<(&'static str, &'static [&'static str], &'sta
         "vulnerability-management" => vulns::SECTIONS.iter().map(|s| (s.file, s.criteria, s.rows)).collect(),
         "recovery-drills" => drills::SECTIONS.iter().map(|s| (s.file, s.criteria, s.rows)).collect(),
         _ => Vec::new(),
+    }
+}
+
+/// The first format of `kind` that always has `file`.
+fn since(kind: &str, file: &str) -> u64 {
+    match kind {
+        "evidence" => EVIDENCE.iter().find(|e| e.file == file).map_or(1, |e| e.since),
+        _ => 1,
     }
 }
 
@@ -285,7 +296,7 @@ pub fn check(path: String, name: &str, files: &BTreeMap<String, Vec<u8>>) -> Fou
         f.problems.push(format!("{n} isn't in manifest.json"));
     }
     for (file, _, _) in expected(kind.id) {
-        if !in_manifest.contains(file) {
+        if !in_manifest.contains(file) && f.format.is_none_or(|n| n >= since(kind.id, file)) {
             f.problems.push(format!("it has no {file}, which every {} has", kind.title.to_lowercase()));
         }
     }
@@ -894,6 +905,25 @@ mod tests {
         let f = check("x".into(), &name, &fs);
         assert!(f.verified(), "{:?}", f.problems);
         assert!(f.warnings.iter().any(|w| w.contains("newer than this tool")) && f.warnings.iter().any(|w| w.contains("42 days after")), "{:?}", f.warnings);
+    }
+
+    /// `baseline.json` came with botd's format 3 (ADR 0193): bundles made before it still
+    /// check, and newer ones must have it.
+    #[test]
+    fn a_file_a_later_format_added_is_needed_only_from_that_format() {
+        let (name, files) = bundle(&KINDS[0], p("2026-10-01", "2026-11-01"), "2026-11-01T00:01:00Z");
+        for (format, needed) in [(2, false), (3, true), (9, true)] {
+            let mut fs = files.clone();
+            fs.remove("baseline.json");
+            let mut m: Value = serde_json::from_slice(&fs["manifest.json"]).unwrap();
+            m["format"] = json!(format);
+            m["files"].as_array_mut().unwrap().retain(|f| f["name"] != "baseline.json");
+            fs.insert("manifest.json".into(), json_file(&m));
+            seal(&mut fs);
+            let f = check("x".into(), &name, &fs);
+            assert_eq!(f.problems.iter().any(|x| x.contains("it has no baseline.json")), needed, "format {format}: {:?}", f.problems);
+            assert_eq!(f.verified(), !needed, "format {format}: {:?}", f.problems);
+        }
     }
 
     #[test]
