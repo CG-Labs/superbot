@@ -2172,9 +2172,13 @@ async function loadSupport() {
   loadHistory();
 }
 
+// Only the newest request's reply is shown, so a slow year can't replace the 30 days picked after it.
+let historyRequest = 0;
 async function loadHistory() {
+  const mine = ++historyRequest;
   try {
     const h = await api("GET", `/api/support/health-score/history?days=${key($("sup-days").value)}`);
+    if (mine !== historyRequest) return;
     const t = h.trend;
     $("sup-trend").textContent = t
       ? `Since ${t.from}: ${t.fromScore ?? "no score"} to ${t.toScore ?? "no score"}${t.change == null ? "" : ` (${t.change > 0 ? "+" : ""}${t.change})`}.`
@@ -2193,6 +2197,7 @@ async function loadHistory() {
       ? "No days recorded yet. botd records the score once a day."
       : "botd isn't recording the score (HEALTH_SCORE_HISTORY_DAYS=0).";
   } catch (err) {
+    if (mine !== historyRequest) return;
     $("sup-history").innerHTML = "";
     $("sup-history-empty").hidden = false;
     $("sup-history-empty").textContent = err.message;
