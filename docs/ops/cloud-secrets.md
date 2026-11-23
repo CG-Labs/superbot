@@ -138,7 +138,7 @@ botd takes its credentials from the first of these that is set, as AWS's SDKs do
 
 To pin one, set `AWS_SECRETS_MANAGER_AUTH` to `env`, `web-identity`, `container` or `instance-profile`. botd never reads `~/.aws/config` or `~/.aws/credentials`, profiles, SSO or `credential_process`. For a VPC endpoint or FIPS, set `AWS_ENDPOINT_URL_SECRETS_MANAGER` (and `AWS_ENDPOINT_URL_STS` for web identity).
 
-While `SECRETS_BACKEND=aws`, the credentials botd signs in with are its own: with access keys, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` can't be given to Bots by any store, and are removed from everything botd starts; with web identity or container credentials, their token and settings are. To give Bots AWS keys of their own, use other credentials on their own machines, not botd's.
+While `SECRETS_BACKEND=aws`, the credentials botd signs in with are its own: with access keys, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` can't be given to Bots by any store, and are removed from everything botd starts; with web identity or container credentials, their token and settings are. To give Bots AWS keys of their own, use [short-lived credentials for each run](#short-lived-aws-credentials-for-each-run), never botd's.
 
 ## Check it
 
@@ -191,6 +191,43 @@ botd's access above already covers them on Azure and Google; on AWS, add `superb
 - **Cache, outages and audit** are as for the shared folders: a run whose owner's folder can't be read is refused (`secrets_unavailable`), and reads are `secret.read` with `scope: users` and `userId`. Values are redacted from that user's Bots.
 - **Cost**: Key Vault and Secret Manager list every secret in the vault or project to find one user's, once per user per `SECRETS_CACHE_SECONDS`. With thousands of secrets, give SuperBot a vault or project of its own.
 - **When someone leaves**: deleting the user in botd drops what they saved in the app, not their folder. Delete those secrets in the store.
+
+## Short-lived AWS credentials for each run
+
+Off by default ([ADR 0190](../adr/0190-sts-sessions-for-each-run.md)); only with `SECRETS_BACKEND=aws`. With `AWS_RUN_CREDENTIALS`, botd assumes an IAM role with STS (`AssumeRole`) as each run starts and gives the run that session's keys. A key a Bot leaks stops working soon after its run. No Vault is needed; for Vault's engines, see [Vault](vault.md#short-lived-credentials-for-each-run).
+
+Make a role for the Bots, with only what they need, that botd's identity may assume:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{ "Effect": "Allow", "Principal": { "AWS": "arn:aws:iam::<account>:role/botd" }, "Action": "sts:AssumeRole" }]
+}
+```
+
+and let botd's identity assume it (add a statement like this to botd's policy above):
+
+```json
+{ "Effect": "Allow", "Action": "sts:AssumeRole", "Resource": ["arn:aws:iam::<account>:role/superbot-bots", "arn:aws:iam::<account>:role/superbot-u-*"] }
+```
+
+Then in `.env`:
+
+```sh
+AWS_RUN_CREDENTIALS="arn:aws:iam::<account>:role/superbot-bots"
+# or several, naming the variables each gives:
+# AWS_RUN_CREDENTIALS="arn:aws:iam::<account>:role/superbot-bots; arn:aws:iam::<account>:role/superbot-u-{owner} OWN_AWS_ACCESS_KEY_ID=AccessKeyId OWN_AWS_SECRET_ACCESS_KEY=SecretAccessKey OWN_AWS_SESSION_TOKEN=SessionToken"
+```
+
+- **Format**: entries separated by `;` or new lines. Each is a role's ARN, then `NAME=field` pairs, where the field is `AccessKeyId`, `SecretAccessKey` or `SessionToken`. An entry with no pairs gives `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`, which AWS's SDKs and CLI read. These names are allowed even when botd signs in with access keys of its own under them: the run gets the session's keys, never botd's. At most 16 roles; each name once.
+- **`{owner}`** in the role's name is the Bot owner's id (`botctl users`), so each user's Bots can have their own role. Those roles are assumed only for runs that get the owner's own secrets, not a teammate's run of an isolated shared Bot.
+- **Session length**: each session lasts as long as the longest run (`RUN_TIMEOUT_MINUTES`, 60 by default), at least STS's 15 minutes. The role's maximum session duration must be at least that. If botd's own identity is itself a role (web identity, container credentials, instance profile), AWS limits the sessions it makes to an hour, so keep `RUN_TIMEOUT_MINUTES` at 60 or less. A run longer than 12 hours can't be covered and is refused.
+- **CloudTrail**: each session is named `superbot-<bot id>-<random>`, so CloudTrail shows which Bot's run made each call.
+- **Can't be revoked**: STS has no way to end one session early. When the run ends, botd audits `secret.lease_released` with the session's expiry (`expiresAt`), and the keys work until then. A short `RUN_TIMEOUT_MINUTES` keeps that short. To cut off every session of a role at once, use the IAM console's "Revoke active sessions" on the role.
+- **Fails closed**: if STS refuses (no permission, a role it can't assume, a session shorter than the run), the run doesn't start (`bot.run_refused`, reason `secrets_unavailable`). botd makes no session at startup, so a wrong ARN or policy shows on the first run.
+- **Audit**: `botctl audit --action 'secret.lease_*'` shows each session made (`secret.lease_issued`, with the role, the assumed role's ARN as `leaseId`, TTL and the variable names) and let go (`secret.lease_released`), never a key.
+- **Redaction**: the keys are redacted from everything botd saves and shows until the session expires.
+- **Order**: these win over static secrets of the same name, and runs never inherit these names from botd's own environment.
 
 ## Day to day
 
