@@ -11,7 +11,7 @@ Each name is one secret. Its name says which folder it is in:
 | `bots` | Server-wide keys for Bots: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`, ... | Yes, at the start of each run | `superbot-bots-OPENAI-API-KEY` | `superbot-bots-OPENAI_API_KEY` | `superbot/bots/OPENAI_API_KEY` |
 | `server` | botd's own: `LINODE_TOKEN`, `SSO_<ID>_CLIENT_SECRET`, `SMTP_PASSWORD`, `STRIPE_SECRET_KEY`, ... | Never | `superbot-server-LINODE-TOKEN` | `superbot-server-LINODE_TOKEN` | `superbot/server/LINODE_TOKEN` |
 
-Key Vault doesn't allow `_`, so write it as `-`. Case doesn't matter there. On AWS the folders are real paths, and store each value as plain text (`--secret-string`), not as key/value JSON. A name in the wrong folder is ignored. `AUTH_PASSWORD`, `SUPERBOT_MASTER_KEY` and the cloud credentials stay in `.env`, because botd needs them before it can sign in. Per-user secrets stay in botd's sealed store for now.
+Key Vault doesn't allow `_`, so write it as `-`. Case doesn't matter there. On AWS the folders are real paths, and store each value as plain text (`--secret-string`), not as key/value JSON. A name in the wrong folder is ignored. `AUTH_PASSWORD`, `SUPERBOT_MASTER_KEY` and the cloud credentials stay in `.env`, because botd needs them before it can sign in. Each user's own secrets can be here too: see [each user's own secrets](#each-users-own-secrets).
 
 Order: a value in botd's environment wins, then the cloud store, then the sealed store (`botctl secret set`).
 
@@ -110,7 +110,8 @@ Give botd's role or user a policy like this one. It reads SuperBot's two folders
       "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
       "Resource": [
         "arn:aws:secretsmanager:<region>:<account>:secret:superbot/bots/*",
-        "arn:aws:secretsmanager:<region>:<account>:secret:superbot/server/*"
+        "arn:aws:secretsmanager:<region>:<account>:secret:superbot/server/*",
+        "arn:aws:secretsmanager:<region>:<account>:secret:superbot/users/*"
       ]
     },
     { "Effect": "Allow", "Action": "secretsmanager:ListSecrets", "Resource": "*" }
@@ -171,6 +172,25 @@ sudo iptables -A OUTPUT -d 169.254.170.0/24 -m owner ! --uid-owner superbot -j R
 ```
 
 Make the rule persistent with your distribution's tool. On EC2, a hop limit of 1 also keeps containers on the host from reaching IMDS. With a service principal, key, access keys or a token file, botd removes the credentials from every harness's environment, but the file must still be readable only by botd.
+
+## Each user's own secrets
+
+Off by default ([ADR 0174](../adr/0174-users-secrets-in-the-external-store.md)). With `SECRETS_USER_FOLDERS=1`, botd also reads a folder per user, and gives its values only to Bots that user owns. `botctl users` shows each user's id (for example `u1a2b3c4d`):
+
+| Backend | Name for `ANTHROPIC_API_KEY` of user `u1a2b3c4d` |
+|---------|--------------------------------------------------|
+| Azure Key Vault | `superbot-users-u1a2b3c4d-ANTHROPIC-API-KEY` |
+| GCP Secret Manager | `superbot-users-u1a2b3c4d-ANTHROPIC_API_KEY` |
+| AWS Secrets Manager | `superbot/users/u1a2b3c4d/ANTHROPIC_API_KEY` |
+
+botd's access above already covers them on Azure and Google; on AWS, add `superbot/users/*` as in the policy above. botd only reads: your own tooling and policies decide who writes each folder.
+
+- **Order** for a user's Bots: their folder, then what they saved in the app (Your secrets), then the server-wide secrets. Another user's folder is never read.
+- **Which names**: only names a user may save. Reserved names and botd's own (`LINODE_TOKEN`, `SSO_*`, ...) are ignored there. Ids are lowercase letters and digits; a user whose id has anything else gets no folder.
+- **In the app** the user sees each name as set by an admin in that store, with no way to replace it. A copy they saved before can still be deleted.
+- **Cache, outages and audit** are as for the shared folders: a run whose owner's folder can't be read is refused (`secrets_unavailable`), and reads are `secret.read` with `scope: users` and `userId`. Values are redacted from that user's Bots.
+- **Cost**: Key Vault and Secret Manager list every secret in the vault or project to find one user's, once per user per `SECRETS_CACHE_SECONDS`. With thousands of secrets, give SuperBot a vault or project of its own.
+- **When someone leaves**: deleting the user in botd drops what they saved in the app, not their folder. Delete those secrets in the store.
 
 ## Day to day
 

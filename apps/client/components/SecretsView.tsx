@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { confirmAsync } from "../src/dialogs";
-import { normalizeSecretName, savedLine, secretNameProblem, secretValueProblem } from "../src/secrets";
+import { managedIn, normalizeSecretName, savedLine, secretNameProblem, secretValueProblem } from "../src/secrets";
 import { colors } from "../src/theme";
 import type { PersonalSecret } from "../src/types";
 
@@ -43,7 +43,10 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
   }, [load]);
 
   const target = replacing ?? normalizeSecretName(name);
-  const exists = !!list?.some((s) => s.name === target);
+  const existing = list?.find((s) => s.name === target);
+  const exists = !!existing;
+  /** An admin keeps `target` for you elsewhere, so a value saved here wouldn't be used. */
+  const existingIn = existing ? managedIn(existing) : null;
   const problem = (name || replacing ? secretNameProblem(target) : null) ?? (value ? secretValueProblem(value) : null);
 
   const resetForm = () => {
@@ -68,7 +71,13 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
     try {
       const saved = await api.setMySecret(target, sent);
       resetForm();
-      setNotice(exists ? `Replaced ${saved.name}. Your Bots get the new value on their next run.` : `Saved ${saved.name}. Your Bots get it on their next run.`);
+      setNotice(
+        existingIn
+          ? `Saved ${saved.name} here, but your Bots keep the value an admin set for you in ${existingIn}.`
+          : exists
+            ? `Replaced ${saved.name}. Your Bots get the new value on their next run.`
+            : `Saved ${saved.name}. Your Bots get it on their next run.`,
+      );
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -78,7 +87,12 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
   };
 
   const remove = async (s: PersonalSecret) => {
-    const after = s.overrides ? "Your Bots go back to the server's value." : "Your Bots stop getting it.";
+    const store = managedIn(s);
+    const after = store
+      ? `Your Bots keep the value an admin set for you in ${store}.`
+      : s.overrides
+        ? "Your Bots go back to the server's value."
+        : "Your Bots stop getting it.";
     if (!(await confirm(`Delete ${s.name}?`, `${after} This can't be undone.`))) return;
     setBusy(s.name);
     setError(null);
@@ -139,22 +153,24 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
               </Text>
               <Text style={styles.dim}>{savedLine(s)}</Text>
               {s.overrides ? <Text style={styles.dim}>The server has one with this name too; yours wins for your Bots.</Text> : null}
-              {canWrite ? (
+              {canWrite && (!managedIn(s) || s.saved) ? (
                 <View style={styles.row}>
-                  <Pressable
-                    style={[styles.btn, !!busy && styles.busy]}
-                    disabled={!!busy}
-                    onPress={() => {
-                      setReplacing(s.name);
-                      setName("");
-                      setValue("");
-                      setNotice(null);
-                    }}
-                    accessibilityRole="button"
-                    accessibilityLabel={`Replace ${s.name}`}
-                  >
-                    <Text style={styles.btnText}>Replace</Text>
-                  </Pressable>
+                  {managedIn(s) ? null : (
+                    <Pressable
+                      style={[styles.btn, !!busy && styles.busy]}
+                      disabled={!!busy}
+                      onPress={() => {
+                        setReplacing(s.name);
+                        setName("");
+                        setValue("");
+                        setNotice(null);
+                      }}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Replace ${s.name}`}
+                    >
+                      <Text style={styles.btnText}>Replace</Text>
+                    </Pressable>
+                  )}
                   <Pressable
                     style={[styles.btn, !!busy && styles.busy]}
                     disabled={!!busy}
@@ -203,7 +219,13 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
               accessibilityLabel="Secret value"
             />
             {problem ? <Text style={styles.warn}>{problem}</Text> : null}
-            {!replacing && exists ? <Text style={styles.warn}>You already have {target}; saving replaces its value.</Text> : null}
+            {!replacing && existingIn ? (
+              <Text style={styles.warn}>
+                An admin set {target} for you in {existingIn}. That value wins, so one saved here isn&apos;t used.
+              </Text>
+            ) : !replacing && exists ? (
+              <Text style={styles.warn}>You already have {target}; saving replaces its value.</Text>
+            ) : null}
             <View style={styles.row}>
               <Pressable
                 style={[styles.primaryBtn, (!!busy || !!problem || !value || !target) && styles.busy]}
