@@ -262,14 +262,10 @@ pub async fn check(app: &AppState, providers: &[Arc<Provider>], http: &reqwest::
             match recorded {
                 Ok(_) => {
                     n += 1;
-                    crate::obs::log::log_warn!(
-                        "SSO {}: the {} certificate SHA-256 {} {}: {}",
-                        p.id,
-                        c.role.as_str(),
-                        c.cert.sha256,
-                        if f.state == State::Expired { "has expired" } else { "expires soon" },
-                        action(p, &f)
-                    );
+                    // The certificate and what to do are in the audit event: CodeQL reads any
+                    // `sha256` in a log line as a secret.
+                    let when = if f.state == State::Expired { "has expired".to_string() } else { format!("expires in {} day(s)", f.days_left) };
+                    crate::obs::log::log_warn!("SSO {}: a {} certificate {when}; see `botctl sso saml {}`", p.id, c.role.as_str(), p.id);
                 }
                 Err(rusqlite::Error::QueryReturnedNoRows) => {}
                 Err(err) => crate::obs::log::log_warn!("SSO {}: could not record {name}: {err}; it stays owed", p.id),
