@@ -783,6 +783,7 @@ async fn main() {
         "unencrypted": backup_targets.iter().filter(|t| !t.encrypted).map(|t| t.id).collect::<Vec<_>>(),
     });
     let _ = app.server_backups.set(Arc::new(server_backups));
+    sso::saml_expiry::start(auth_state.clone());
     let router = router(app.clone(), auth_state);
     let policy = app.db.global_policy();
     app.db.record(&Event::new(Actor::system("server"), "server.started").details(json!({
