@@ -1080,8 +1080,10 @@ async fn check_saml(a: &Auth, app: &AppState, p: &Provider, posted: &str, reques
         let counts = r.0 != "idp_error";
         (r, counts)
     })?;
-    if let (Some(h), Some(Some(stage))) = (held, checked.decrypted_with.map(|i| decrypt.get(i).and_then(|(s, _)| *s))) {
-        h.used(stage, at);
+    if let Some(h) = held {
+        for stage in checked.decrypted_with.iter().filter_map(|&i| decrypt.get(i).and_then(|(s, _)| *s)) {
+            h.used(stage, at);
+        }
     }
     Ok(checked)
 }

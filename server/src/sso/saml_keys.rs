@@ -21,6 +21,7 @@ use crate::secrets::sealed::{self, SAML_SP_CERT_SETTING, SAML_SP_KEY_SETTING};
 use crate::{ApiError, AppState};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, MutexGuard};
 
@@ -51,14 +52,6 @@ impl Stage {
             Stage::Previous => "_previous",
         }
     }
-
-    fn index(self) -> usize {
-        match self {
-            Stage::Current => 0,
-            Stage::Next => 1,
-            Stage::Previous => 2,
-        }
-    }
 }
 
 /// The settings a generated key and its certificate are kept in: the provider id, `_encryption`
@@ -79,12 +72,39 @@ pub struct Held {
     pub current: Arc<SpKey>,
     pub next: Option<Arc<SpKey>>,
     pub previous: Option<Arc<SpKey>>,
-    /// When each stage's key last decrypted an assertion or NameID that checked out (ms), since
-    /// this was loaded; 0 for not yet.
-    used: [AtomicI64; 3],
+    /// When each key last decrypted an assertion or NameID that checked out (ms), by certificate
+    /// SHA-256; 0 for not yet. Kept per key, not per stage, and handed on to the next `Held` when
+    /// a rollover step reloads the keys, so a promoted or replaced key keeps its history and a
+    /// sign-in that began before the step still counts.
+    used: HashMap<String, Arc<AtomicI64>>,
 }
 
 impl Held {
+    fn new(current: Arc<SpKey>, next: Option<Arc<SpKey>>, previous: Option<Arc<SpKey>>, before: Option<&Held>) -> Held {
+        let used = std::iter::once(&current)
+            .chain(next.as_ref())
+            .chain(previous.as_ref())
+            .map(|k| {
+                let sha = k.info.sha256.clone();
+                let kept = before.and_then(|b| b.used.get(&sha).cloned());
+                (sha, kept.unwrap_or_default())
+            })
+            .collect();
+        Held { current, next, previous, used }
+    }
+
+    fn at(&self, stage: Stage) -> Option<&Arc<SpKey>> {
+        match stage {
+            Stage::Current => Some(&self.current),
+            Stage::Next => self.next.as_ref(),
+            Stage::Previous => self.previous.as_ref(),
+        }
+    }
+
+    fn counter(&self, stage: Stage) -> Option<&AtomicI64> {
+        self.at(stage).and_then(|k| self.used.get(&k.info.sha256)).map(|c| c.as_ref())
+    }
+
     /// The keys tried when decrypting, in order: the one in use, the next, the previous.
     pub fn decrypting(&self) -> Vec<(Stage, Arc<SpKey>)> {
         let mut keys = vec![(Stage::Current, self.current.clone())];
@@ -100,12 +120,14 @@ impl Held {
 
     /// Notes that `stage`'s key decrypted something at `at`.
     pub fn used(&self, stage: Stage, at: i64) {
-        self.used[stage.index()].fetch_max(at, Ordering::Relaxed);
+        if let Some(c) = self.counter(stage) {
+            c.fetch_max(at, Ordering::Relaxed);
+        }
     }
 
     /// When `stage`'s key last decrypted something, if it has since botd loaded it.
     pub fn last_used(&self, stage: Stage) -> Option<i64> {
-        Some(self.used[stage.index()].load(Ordering::Relaxed)).filter(|&t| t > 0)
+        self.counter(stage).map(|c| c.load(Ordering::Relaxed)).filter(|&t| t > 0)
     }
 }
 
@@ -124,7 +146,7 @@ pub(crate) fn held(app: &AppState, p: &Provider, u: KeyUse) -> Result<Arc<Held>,
     if let Some(h) = slot.as_ref() {
         return Ok(h.clone());
     }
-    let h = Arc::new(load(app, p, u)?);
+    let h = Arc::new(load(app, p, u, None)?);
     *slot = Some(h.clone());
     Ok(h)
 }
@@ -141,7 +163,7 @@ fn key_at(app: &AppState, p: &Provider, u: KeyUse, stage: Stage) -> Result<Optio
     opened(app, p, u, stage)?.map(|(der, cert)| SpKey::from_der(&der, &cert)).transpose()
 }
 
-fn load(app: &AppState, p: &Provider, u: KeyUse) -> Result<Held, String> {
+fn load(app: &AppState, p: &Provider, u: KeyUse, before: Option<&Held>) -> Result<Held, String> {
     let current = match key_at(app, p, u, Stage::Current)? {
         Some(k) => k,
         None => make(app, p, u, Stage::Current, &Who::system("sso"))?,
@@ -153,7 +175,7 @@ fn load(app: &AppState, p: &Provider, u: KeyUse) -> Result<Held, String> {
             None
         })
     };
-    Ok(Held { current: Arc::new(current), next: beside(Stage::Next).map(Arc::new), previous: beside(Stage::Previous).map(Arc::new), used: Default::default() })
+    Ok(Held::new(Arc::new(current), beside(Stage::Next).map(Arc::new), beside(Stage::Previous).map(Arc::new), before))
 }
 
 /// Makes a key for `stage`, keeps it sealed with its certificate, and audits it.
@@ -210,7 +232,7 @@ pub(crate) fn change(app: &AppState, p: &Provider, u: KeyUse, c: Change, by: &Wh
     let mut slot = slot(p, u);
     let h = match slot.as_ref() {
         Some(h) => h.clone(),
-        None => Arc::new(load(app, p, u).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e))?),
+        None => Arc::new(load(app, p, u, None).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e))?),
     };
     let id = &p.id;
     let use_ = u.as_str();
@@ -263,7 +285,7 @@ pub(crate) fn change(app: &AppState, p: &Provider, u: KeyUse, c: Change, by: &Wh
             app.db.record(&retired(p, u, stage, gone, by));
         }
     }
-    *slot = Some(Arc::new(load(app, p, u).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e))?));
+    *slot = Some(Arc::new(load(app, p, u, Some(&h)).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e))?));
     Ok(())
 }
 
@@ -274,12 +296,7 @@ fn retired(p: &Provider, u: KeyUse, stage: Stage, k: &SpKey, by: &Who) -> Event 
 /// A next or previous key for `GET /api/sso/{id}/saml`: its certificate, and when it last
 /// decrypted something (encryption keys only).
 pub(crate) fn view(h: &Held, u: KeyUse, stage: Stage, now: i64, cert: impl Fn(&super::xmldsig::Cert) -> Value) -> Value {
-    let k = match stage {
-        Stage::Current => Some(&h.current),
-        Stage::Next => h.next.as_ref(),
-        Stage::Previous => h.previous.as_ref(),
-    };
-    let Some(k) = k else { return Value::Null };
+    let Some(k) = h.at(stage) else { return Value::Null };
     let mut v = json!({ "certificate": cert(&k.info) });
     if u == KeyUse::Encryption {
         v["lastUsedSecondsAgo"] = json!(h.last_used(stage).map(|t| (now - t).max(0) / 1000));
@@ -309,7 +326,7 @@ mod tests {
     fn decrypting_tries_the_key_in_use_first_and_publishes_only_it_and_the_next() {
         let k = || Arc::new(SpKey::generate("k").unwrap().0);
         let (current, next, previous) = (k(), k(), k());
-        let h = Held { current: current.clone(), next: Some(next.clone()), previous: Some(previous.clone()), used: Default::default() };
+        let h = Held::new(current.clone(), Some(next.clone()), Some(previous.clone()), None);
         let order: Vec<(Stage, String)> = h.decrypting().into_iter().map(|(s, k)| (s, k.info.sha256.clone())).collect();
         assert_eq!(order, [(Stage::Current, current.info.sha256.clone()), (Stage::Next, next.info.sha256.clone()), (Stage::Previous, previous.info.sha256.clone())]);
         let published: Vec<String> = h.published().iter().map(|k| k.info.sha256.clone()).collect();
@@ -318,7 +335,17 @@ mod tests {
         h.used(Stage::Next, 2_000);
         h.used(Stage::Next, 1_000);
         assert_eq!((h.last_used(Stage::Next), h.last_used(Stage::Current)), (Some(2_000), None), "the latest use");
-        let alone = Held { current, next: None, previous: None, used: Default::default() };
+        let alone = Held::new(current.clone(), None, None, None);
         assert_eq!((alone.decrypting().len(), alone.published().len()), (1, 1));
+
+        // Promoted: each key keeps its history under its new stage, and a sign-in still holding
+        // the keys from before the step counts toward it.
+        h.used(Stage::Current, 3_000);
+        let promoted = Held::new(next.clone(), None, Some(current.clone()), Some(&h));
+        assert_eq!((promoted.last_used(Stage::Current), promoted.last_used(Stage::Previous)), (Some(2_000), Some(3_000)));
+        h.used(Stage::Current, 4_000);
+        assert_eq!(promoted.last_used(Stage::Previous), Some(4_000));
+        let fresh = Held::new(previous, None, None, Some(&promoted));
+        assert_eq!(fresh.last_used(Stage::Current), None, "a key that's new to it starts with none");
     }
 }
