@@ -15,6 +15,8 @@ mod passwd;
 #[path = "../sandbox.rs"]
 #[allow(dead_code)]
 mod sandbox;
+#[path = "../machines/seccomp.rs"]
+mod seccomp;
 #[path = "../sweep.rs"]
 mod sweep;
 #[path = "../walk.rs"]
@@ -90,6 +92,10 @@ async fn main() -> ExitCode {
     // SAFETY: a plain prctl on this process.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return fail("couldn't give up new privileges");
+    }
+    // And the kernel interfaces a run never needs are refused (ADR 0156).
+    if let Err(e) = seccomp::install() {
+        return fail(&format!("couldn't install the seccomp filter: {e}"));
     }
     // SAFETY: as above.
     if unsafe { libc::getppid() } == 1 {
