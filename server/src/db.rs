@@ -5381,14 +5381,15 @@ impl Db {
         self.c().query_row("SELECT * FROM roles WHERE id = ?1 OR name = ?1 ORDER BY id = ?1 DESC LIMIT 1", [key], custom_role_row).optional().ok().flatten()
     }
 
-    pub fn create_custom_role(&self, name: &str, description: &str, base: Role, permissions: &[&str], by: Option<&str>) -> Result<CustomRole, RoleError> {
+    /// `max_days` is saved with the role, so it is never held without its limit (ADR 0197).
+    pub fn create_custom_role(&self, name: &str, description: &str, base: Role, permissions: &[&str], max_days: Option<i64>, by: Option<&str>) -> Result<CustomRole, RoleError> {
         let id = format!("r{}", crate::random_hex(5));
         let at = now();
         let perms = serde_json::to_string(permissions).unwrap_or_else(|_| "[]".into());
         self.c()
             .execute(
-                "INSERT INTO roles (id, name, description, base, permissions, created_at, created_by, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?6)",
-                params![id, name, description, base.as_str(), perms, at, by],
+                "INSERT INTO roles (id, name, description, base, permissions, max_days, created_at, created_by, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?7)",
+                params![id, name, description, base.as_str(), perms, max_days, at, by],
             )
             .map_err(|e| if constraint(&e) { RoleError::NameTaken } else { RoleError::Db(e.to_string()) })?;
         self.custom_role(&id).ok_or(RoleError::NotFound)
@@ -10893,9 +10894,9 @@ mod tests {
         let a = db.create_user(None, Some("a@example.com"), "A", Role::Readonly).unwrap();
         let b = db.create_user(None, Some("b@example.com"), "B", Role::Member).unwrap();
         let boss = db.create_user(None, Some("boss@example.com"), "Boss", Role::Admin).unwrap();
-        let r = db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None).unwrap();
-        let hand = db.create_custom_role("Hand", "", Role::Member, &["users.manage"], None).unwrap();
-        let ops = db.create_custom_role("Ops", "", Role::Member, &["bots.manage"], None).unwrap();
+        let r = db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None, None).unwrap();
+        let hand = db.create_custom_role("Hand", "", Role::Member, &["users.manage"], None, None).unwrap();
+        let ops = db.create_custom_role("Ops", "", Role::Member, &["bots.manage"], None, None).unwrap();
         assert!(matches!(db.create_saml_role_mapping("corp", "Ops", &ops.id, None), Err(ScimRoleMapError::Reaches(p)) if p == ["bots.manage"]), "never a role that reaches admins");
         assert!(matches!(db.create_saml_role_mapping("corp", "Ghosts", "rnone", None), Err(ScimRoleMapError::Gone)));
         let m = db.create_saml_role_mapping("corp", "Auditors", &r.id, Some("admin")).unwrap();
@@ -10956,8 +10957,8 @@ mod tests {
         let b = db.create_user(None, Some("b@example.com"), "B", Role::Member).unwrap();
         let team = db.create_team("Eng", None);
         assert!(db.add_team_member(&team.id, &b.id, "member", None));
-        let r = db.create_custom_role("Auditor", "", Role::Readonly, &["audit.view"], None).unwrap();
-        let other = db.create_custom_role("Ops", "", Role::Member, &["users.manage"], None).unwrap();
+        let r = db.create_custom_role("Auditor", "", Role::Readonly, &["audit.view"], None, None).unwrap();
+        let other = db.create_custom_role("Ops", "", Role::Member, &["users.manage"], None, None).unwrap();
         let at = now();
         let soon = at + 3_600_000;
 
@@ -11015,7 +11016,7 @@ mod tests {
         let db = Db::open(&temp_path("time-bound-sa").join("app.sqlite")).unwrap();
         let owner = db.create_user(None, Some("o@example.com"), "O", Role::Admin).unwrap();
         let team = db.create_team("Eng", None);
-        let r = db.create_custom_role("Break glass", "", Role::Member, &["users.manage"], None).unwrap();
+        let r = db.create_custom_role("Break glass", "", Role::Member, &["users.manage"], None, None).unwrap();
         let sa = db.create_service_account("CI", "", Role::Member, None, None, &owner.id, None).unwrap();
         // The handler checked `r` while it had no limit; one is set before the write.
         db.update_custom_role(&r.id, None, None, None, None, Some(Some(7))).unwrap();
@@ -11032,13 +11033,21 @@ mod tests {
     }
 
     #[test]
+    fn a_role_is_created_with_its_limit_in_one_write() {
+        let db = Db::open(&temp_path("time-bound-create").join("app.sqlite")).unwrap();
+        let r = db.create_custom_role("Break glass", "", Role::Member, &["users.manage"], Some(7), None).unwrap();
+        assert_eq!(r.max_days, Some(7));
+        assert_eq!(db.custom_role(&r.id).unwrap().max_days, Some(7));
+    }
+
+    #[test]
     fn time_bound_roles_are_never_standing() {
         let db = Db::open(&temp_path("time-bound").join("app.sqlite")).unwrap();
         let a = db.create_user(None, Some("a@example.com"), "A", Role::Member).unwrap();
         let team = db.create_team("Eng", None);
         assert!(db.add_team_member(&team.id, &a.id, "member", None));
         db.link_scim_group("okta", &team.id, None, "Eng", None).unwrap();
-        let r = db.create_custom_role("Break glass", "", Role::Member, &["users.manage"], None).unwrap();
+        let r = db.create_custom_role("Break glass", "", Role::Member, &["users.manage"], None, None).unwrap();
         let week = Some(Some(7));
 
         // Held with no end, it can't be made time-bound.
@@ -11059,7 +11068,7 @@ mod tests {
         assert!(matches!(db.create_scim_role_mapping("okta", &team.id, &r.id, "org", None), Err(ScimRoleMapError::TimeBound)));
         assert!(matches!(db.create_saml_role_mapping("corp", "Admins", &r.id, None), Err(ScimRoleMapError::TimeBound)));
         assert!(matches!(db.declare_scim_role_group("okta", "Helpdesk", None, &r.id, None), Err(ScimRoleGroupError::TimeBound)));
-        let plain = db.create_custom_role("Plain", "", Role::Member, &["users.manage"], None).unwrap();
+        let plain = db.create_custom_role("Plain", "", Role::Member, &["users.manage"], None, None).unwrap();
         let g = db.declare_scim_role_group("okta", "Helpdesk", None, &plain.id, None).unwrap();
         assert!(matches!(db.set_scim_role_group_role(&g.id, &r.id), Err(ScimRoleGroupError::TimeBound)));
         assert_eq!(db.update_custom_role(&plain.id, None, None, None, None, week), Err(RoleError::Standing { held: 0, mapped: 1 }));
@@ -11080,8 +11089,8 @@ mod tests {
             assert!(db.add_team_member(&team.id, &u.id, "member", None));
         }
         db.link_scim_group("okta", &team.id, None, "Eng", None).unwrap();
-        let r = db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None).unwrap();
-        let hand = db.create_custom_role("Hand", "", Role::Member, &["users.manage"], None).unwrap();
+        let r = db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None, None).unwrap();
+        let hand = db.create_custom_role("Hand", "", Role::Member, &["users.manage"], None, None).unwrap();
         assert!(matches!(db.create_scim_role_mapping("okta", &other.id, &r.id, "org", None), Err(ScimRoleMapError::Gone)), "not a group");
         assert!(matches!(db.create_scim_role_mapping("entra", &team.id, &r.id, "org", None), Err(ScimRoleMapError::Gone)), "another tenant's");
         let org = db.create_scim_role_mapping("okta", &team.id, &r.id, "org", None).unwrap();
@@ -11132,7 +11141,7 @@ mod tests {
         assert!(db.remove_team_member(&team.id, &b.id, false));
         assert!(!db.grant_scim_role(&in_team, &b.id), "only on the team");
 
-        let wide = db.create_custom_role("Wide", "", Role::Member, &["bots.manage"], None).unwrap();
+        let wide = db.create_custom_role("Wide", "", Role::Member, &["bots.manage"], None, None).unwrap();
         let ops = db.create_team("Ops2", None);
         db.link_scim_group("okta", &ops.id, None, "Ops2", None).unwrap();
         assert_eq!(db.create_scim_role_mapping("okta", &ops.id, &wide.id, "org", None).err(), Some(ScimRoleMapError::Reaches(vec!["bots.manage"])));

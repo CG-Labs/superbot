@@ -346,7 +346,7 @@ async fn an_email_in_any_case_finds_the_person() {
 async fn names_the_server_doesnt_know_grant_nothing() {
     let (port, app, admin, _) = serve_app().await;
     // As a newer version, or a hand edit, might leave it.
-    let r = app.db.create_custom_role("Future", "", Role::Member, &["audit.view", "secrets.manage", "admin"], None).unwrap();
+    let r = app.db.create_custom_role("Future", "", Role::Member, &["audit.view", "secrets.manage", "admin"], None, None).unwrap();
     let (cy, cy_auth) = user_with(port, &admin, "cy@example.com", "member").await;
     give(port, &admin, &r.id, &cy).await;
     let (_, v) = json_call(port, "GET", &format!("/api/roles/{}", r.id), &admin, "").await;

@@ -281,12 +281,7 @@ pub async fn create(State(app): State<AppState>, Extension(by): Extension<Who>, 
     let base = if v["base"].is_null() { Role::Member } else { parse_base(&v["base"])? };
     let perms = parse_perms(&v["permissions"])?;
     let max_days = parse_max_days(&v["maxDays"])?;
-    let mut r = app.db.create_custom_role(&name, &description, base, &perms, by.actor.id.as_deref()).map_err(role_error)?;
-    // Nobody holds a role just made, so this can't be refused.
-    if max_days.is_some() {
-        app.db.update_custom_role(&r.id, None, None, None, None, Some(max_days)).map_err(role_error)?;
-        r = need_role(&app, &r.id)?;
-    }
+    let r = app.db.create_custom_role(&name, &description, base, &perms, max_days, by.actor.id.as_deref()).map_err(role_error)?;
     app.db.record(&by.event("role.created").target("role", &r.id).details(json!({ "name": r.name, "base": r.base, "permissions": perms, "maxDays": r.max_days })));
     Ok((StatusCode::CREATED, Json(view(&app, &r))))
 }
