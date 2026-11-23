@@ -231,6 +231,7 @@ async fn world(g: &Google, with_sso: bool, tweak: impl FnOnce(&mut Settings)) ->
 }
 
 async fn sync(w: &World, body: &str) -> (u16, Value) {
+    let body = if body.is_empty() { "{}" } else { body };
     let (code, res) = call(w.port, "POST", "/api/scim/google/sync", &w.admin, body).await;
     (code, serde_json::from_str(&res).unwrap_or(json!({ "error": res })))
 }
@@ -483,7 +484,7 @@ async fn the_tenant_is_the_syncs_alone_and_admins_run_it() {
     let (port, app, admin, _) = serve_app_with(|a| a.scim.enabled = true).await;
     let (code, off) = call(port, "GET", "/api/scim/google", &admin, "").await;
     assert_eq!((code, parse(&off)["enabled"].as_bool()), (200, Some(false)));
-    assert_eq!(call(port, "POST", "/api/scim/google/sync", &admin, "").await.0, 409, "off: nothing to run");
+    assert_eq!(call(port, "POST", "/api/scim/google/sync", &admin, "{}").await.0, 409, "off: nothing to run");
     token(port, &admin, json!({ "tenant": TENANT })).await;
     let key = g.key.clone();
     let e = Directory::with_key(&app, settings(&g), Box::new(move || Ok(Some(Zeroizing::new(key.clone()))))).err().unwrap();

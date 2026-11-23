@@ -1102,7 +1102,7 @@ fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
         }
         ["token", "revoke", id] => ("DELETE", format!("/api/scim/tokens/{}", encode(id)), None),
         ["google"] | ["google", "status"] => ("GET", "/api/scim/google".into(), None),
-        ["google", "sync"] => ("POST", "/api/scim/google/sync".into(), None),
+        ["google", "sync"] => ("POST", "/api/scim/google/sync".into(), Some(json!({}).to_string())),
         ["google", "sync", "--force"] => ("POST", "/api/scim/google/sync".into(), Some(json!({ "force": true }).to_string())),
         _ => {
             return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team> | role-mappings | role map <team> <role> [--org] | role show <id> | role unmap <id> | google [status] | google sync [--force]".into());
@@ -2870,7 +2870,7 @@ mod tests {
         assert_eq!(req(&["role", "unmap", "sm1"]), Ok(("DELETE", "/api/scim/role-mappings/sm1".into(), None)));
         assert_eq!(req(&["google"]), Ok(("GET", "/api/scim/google".into(), None)));
         assert_eq!(req(&["google", "status"]), Ok(("GET", "/api/scim/google".into(), None)));
-        assert_eq!(req(&["google", "sync"]), Ok(("POST", "/api/scim/google/sync".into(), None)));
+        assert_eq!(req(&["google", "sync"]), Ok(("POST", "/api/scim/google/sync".into(), Some(json!({})))));
         assert_eq!(req(&["google", "sync", "--force"]), Ok(("POST", "/api/scim/google/sync".into(), Some(json!({ "force": true })))));
         assert!(req(&["google", "sync", "--hard"]).is_err());
         assert!(req(&["role", "map", "t1"]).is_err());

@@ -956,10 +956,9 @@ pub async fn status(Extension(a): Extension<Arc<Auth>>) -> Json<Value> {
 }
 
 /// `POST /api/scim/google/sync` `{"force"?: true}`: a pass now. `force` lets one that
-/// would remove more people than GOOGLE_DIRECTORY_MAX_REMOVALS go ahead.
-pub async fn sync(Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, body: Bytes) -> Res<Json<Value>> {
+/// would remove more people than GOOGLE_DIRECTORY_MAX_REMOVALS go ahead. Send `{}` for none.
+pub async fn sync(Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<Json<Value>> {
     let d = a.scim.google.clone().ok_or_else(|| ApiError(StatusCode::CONFLICT, "The Google Workspace sync is off: set GOOGLE_DIRECTORY_SYNC=on.".into()))?;
-    let v: Value = if body.is_empty() { json!({}) } else { serde_json::from_slice(&body).map_err(|_| bad("Send {\"force\": true}, or nothing"))? };
     let force = match &v["force"] {
         Value::Null => false,
         Value::Bool(b) => *b,
