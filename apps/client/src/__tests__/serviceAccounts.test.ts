@@ -1,5 +1,11 @@
 import {
+  canManageServiceAccounts,
   canRotate,
+  choiceError,
+  formChoices,
+  keptRole,
+  roleOptions,
+  teamOptions,
   createBody,
   draftChanges,
   draftError,
@@ -154,5 +160,52 @@ describe("service accounts (ADR 0143, 0152)", () => {
     const now = { ...was, role: "readonly", owner: "bo@example.com" };
     expect(rebaseDraft({ ...was, name: "Payroll" }, was, now)).toEqual({ ...now, name: "Payroll" });
     expect(rebaseDraft({ ...was, role: "r1" }, was, now)).toEqual({ ...now, role: "r1" });
+  });
+});
+
+describe("a delegate's service accounts (ADR 0182)", () => {
+  const CHOICES = {
+    roles: [
+      { id: "readonly", name: "Read-only", base: "readonly" as const, builtIn: true, permissions: [] },
+      { id: "member", name: "Member", base: "member" as const, builtIn: true, permissions: [] },
+      { id: "r1", name: "Help desk", base: "member" as const, builtIn: false, permissions: ["users.manage"] },
+    ],
+    server: ["readonly", "member", "r1"],
+    teams: [{ id: "t1", name: "Ops", roles: ["readonly", "member"] }],
+  };
+
+  it("is for admins and people holding users.manage", () => {
+    expect(canManageServiceAccounts({ permissions: ["account", "admin"] })).toBe(true);
+    expect(canManageServiceAccounts({ permissions: ["account", "read", "users.manage"] })).toBe(true);
+    expect(canManageServiceAccounts({ permissions: ["account", "read", "write", "audit.view"] })).toBe(false);
+    expect(canManageServiceAccounts({})).toBe(false);
+  });
+
+  it("offers the server's choices by team, keeping the account's own", () => {
+    expect(roleOptions(CHOICES, "").map((o) => o.label)).toEqual(["Read-only", "Member", "Help desk"]);
+    expect(roleOptions(CHOICES, "t1").map((o) => o.value)).toEqual(["readonly", "member"]);
+    expect(roleOptions(CHOICES, "t9")).toEqual([]);
+    expect(roleOptions(CHOICES, "t1", { id: "r9", name: "Old role" }).at(-1)).toEqual({ value: "r9", label: "Old role" });
+    expect(teamOptions(CHOICES).map((o) => o.label)).toEqual(["Across the server", "Ops"]);
+    expect(teamOptions(CHOICES, { id: "t2", name: "Left" }).map((o) => o.value)).toEqual(["", "t1", "t2"]);
+    expect(teamOptions(CHOICES, { id: "t1", name: "Ops" })).toHaveLength(2);
+    expect(keptRole(account({ role: "member", teamRole: { id: "r9", name: "Old role" } }))).toEqual({ id: "r9", name: "Old role" });
+    expect(keptRole(account())).toEqual({ id: "readonly", name: "Read-only" });
+  });
+
+  it("refuses a role or team the caller can't give, but not one they leave alone", () => {
+    expect(choiceError({ role: "r1", team: "" }, CHOICES)).toBeNull();
+    expect(choiceError({ role: "r1", team: "t1" }, CHOICES)).toMatch(/in this team/);
+    expect(choiceError({ role: "member", team: "t2" }, CHOICES)).toMatch(/only in the team you're on/);
+    expect(choiceError({ role: "r9", team: "" }, CHOICES)).toMatch(/can't give that role/);
+    expect(choiceError({ role: "r9", team: "t2" }, CHOICES, { role: "r9", team: "t2" })).toBeNull();
+    expect(choiceError({ role: "member", team: "t2" }, CHOICES, { role: "r9", team: "t2" })).toMatch(/only in the team/);
+  });
+
+  it("falls back to every role and team on a server from before ADR 0182", () => {
+    const choices = formChoices({}, [{ id: "r1", name: "Help desk", base: "member", permissions: ["users.manage"] }, { id: "r2", name: "Viewer", base: "readonly", permissions: ["audit.view"] }], [{ id: "t1", name: "Ops" }]);
+    expect(choices.server).toEqual(["readonly", "member", "r1", "r2"]);
+    expect(choices.teams).toEqual([{ id: "t1", name: "Ops", roles: ["readonly", "member", "r1"] }]);
+    expect(formChoices({ choices: CHOICES }, [], [])).toBe(CHOICES);
   });
 });
