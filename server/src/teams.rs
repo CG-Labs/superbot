@@ -442,8 +442,8 @@ pub async fn try_leave(app: &AppState, by: &Who, team_id: &str, user_id: &str, r
             }
         }
         Err(e) => {
+            crate::obs::log::log_warn!("WARNING: a member couldn't be taken off team {team_id}, so nothing changed (audited as team.member_leave_failed): {e}");
             let error = format!("{user_id} couldn't be taken off team {team_id}, so nothing changed: {e}");
-            crate::obs::log::log_warn!("WARNING: {error}");
             let d = json!({ "user": user_id, "role": member.role, "reason": reason, "error": e });
             app.db.record(&team_event(by, "team.member_leave_failed", team_id, d).outcome(Outcome::Failure));
             return Err(error);
