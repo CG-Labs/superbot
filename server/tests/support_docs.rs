@@ -164,6 +164,7 @@ fn every_link_in_the_playbooks_resolves() {
     files.push(repo().join("docs/adr/0167-support-report-from-ticket-exports.md"));
     files.push(repo().join("docs/adr/0187-offline-support-check-and-bundle.md"));
     files.push(repo().join("docs/adr/0201-incident-review-drafts.md"));
+    files.push(repo().join("docs/adr/0211-support-readiness-check.md"));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links:\n{}", bad.join("\n"));
 }
@@ -362,4 +363,50 @@ fn the_incidents_page_documents_both_commands_and_the_draft() {
     }
     let escalation = read("escalation.md");
     assert!(escalation.contains("botctl incident review") && escalation.contains("(runbook-major-incident.md)"), "escalation doesn't point at the review draft and the runbook");
+}
+
+#[test]
+fn the_readiness_page_documents_every_option_field_and_placeholder() {
+    let code = fs::read_to_string(repo().join("server/src/support_readiness.rs")).unwrap();
+    let usage = code.split("pub const USAGE: &str = \"").nth(1).unwrap().split("\";").next().unwrap();
+    let page = read("readiness.md");
+    let options: HashSet<&str> = usage.split(|c: char| c.is_whitespace() || "[]|".contains(c)).filter(|w| w.starts_with("--")).collect();
+    assert!(options.len() >= 15, "the usage's options: {options:?}");
+    for o in options {
+        assert!(page.contains(&format!("`{o}")), "readiness.md doesn't explain {o}");
+    }
+    let fields = code.split("pub fn name(self) -> &'static str {").nth(1).unwrap().split("\n    }\n").next().unwrap();
+    let fields: Vec<&str> = fields.split("=> \"").skip(1).map(|r| r.split('"').next().unwrap()).collect();
+    assert_eq!(fields.len(), 7, "the fields: {fields:?}");
+    for f in fields {
+        assert!(page.contains(&format!("| `{f}` |")), "readiness.md has no row for the {f} field");
+    }
+
+    let list = |name: &str| -> Vec<String> {
+        let body = code.split(&format!("pub const {name}: [&str; ")).nth(1).unwrap().split("];").next().unwrap();
+        body.split('"').skip(1).step_by(2).map(String::from).collect()
+    };
+    let (provider, per_customer) = (list("PROVIDER_PLACEHOLDERS"), list("PER_CUSTOMER_PLACEHOLDERS"));
+    assert!(provider.len() >= 15 && per_customer.len() == 3, "{provider:?} {per_customer:?}");
+    let all: String = pages().iter().map(|p| fs::read_to_string(p).unwrap()).collect();
+    for p in provider.iter().chain(&per_customer) {
+        assert!(all.contains(p.as_str()), "no playbook uses {p}");
+    }
+    for name in ["README.md", "tiers.md", "severity.md", "escalation.md", "tam.md", "runbook-major-incident.md"] {
+        let md = read(name);
+        for code_span in md.split('`').skip(1).step_by(2) {
+            let is_placeholder = code_span.starts_with('<') && code_span.ends_with('>') && code_span[1..code_span.len() - 1].chars().all(|c| c.is_ascii_lowercase() || c == '-');
+            if is_placeholder {
+                assert!(provider.iter().chain(&per_customer).any(|p| p == code_span), "{name}'s {code_span} isn't on support-readiness's lists");
+            }
+        }
+    }
+    for p in &provider {
+        assert!(!page.contains(p.as_str()), "readiness.md has {p} in brackets, so it would count against itself");
+        assert!(page.contains(&p[1..p.len() - 1]), "readiness.md doesn't name {p}");
+    }
+
+    for (name, needle) in [("README.md", "(readiness.md"), ("tam.md", "botctl support-readiness"), ("escalation.md", "botctl support-readiness"), ("support-report.md", "(readiness.md")] {
+        assert!(read(name).contains(needle), "{name} doesn't point at support readiness");
+    }
 }
