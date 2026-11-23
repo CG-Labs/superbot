@@ -399,12 +399,13 @@ struct Moved {
 
 /// Takes `gone` off the team and puts `new` on it, through the team's own join and
 /// leave. A join refused by a race (someone joined another team meanwhile) stops there
-/// with a 409; what was done stays done, and the IdP's retry finishes it.
+/// with a 409, and a leave that failed (ADR 0171) with a 500; what was done stays done,
+/// and the IdP's retry finishes it.
 async fn change_members(app: &AppState, a: &Auth, c: &Caller, team: &Team, gone: &[String], new: &[String]) -> ScimRes<Moved> {
     let mut m = Moved::default();
     for id in gone {
         let owner = app.db.team_member(id).is_some_and(|x| x.team_id == team.id && x.role == teams::OWNER);
-        if teams::leave(app, &c.who, &team.id, id, teams::SCIM).await {
+        if teams::try_leave(app, &c.who, &team.id, id, teams::SCIM).await.map_err(server_error)? {
             m.owner_left |= owner;
             m.removed.push(id.clone());
         }
@@ -628,19 +629,30 @@ pub async fn delete(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// Whether `user_id`, a user this tenant deleted, is still on a team its group made:
+/// their DELETE couldn't take them off (ADR 0171).
+pub fn left_behind(app: &AppState, a: &Auth, c: &Caller, user_id: &str) -> bool {
+    let tenant = &c.token.tenant;
+    a.scim.groups
+        && app.db.scim_user(tenant, user_id).is_none()
+        && app.db.team_id_of(user_id).is_some_and(|t| app.db.scim_group(tenant, &t).is_some() && app.db.scim_group_members(tenant, &t, true).iter().any(|u| u.id == user_id))
+}
+
 /// A SCIM DELETE of a user takes them off a team their tenant's group put them on: the
-/// IdP has them in no group any more.
-pub async fn user_deleted(app: &AppState, a: &Auth, c: &Caller, user_id: &str) {
+/// IdP has them in no group any more. An error when that failed (ADR 0171): they stay
+/// on the team, disabled.
+pub async fn user_deleted(app: &AppState, a: &Auth, c: &Caller, user_id: &str) -> Result<(), String> {
     if !a.scim.groups {
-        return;
+        return Ok(());
     }
     let _writes = a.scim.group_writes.lock().await;
-    let Some(team_id) = app.db.team_id_of(user_id) else { return };
-    let Some(g) = app.db.scim_group(&c.token.tenant, &team_id) else { return };
+    let Some(team_id) = app.db.team_id_of(user_id) else { return Ok(()) };
+    let Some(g) = app.db.scim_group(&c.token.tenant, &team_id) else { return Ok(()) };
     let owner = app.db.team_member(user_id).is_some_and(|m| m.role == teams::OWNER);
-    if teams::leave(app, &c.who, &team_id, user_id, teams::SCIM).await {
+    if teams::try_leave(app, &c.who, &team_id, user_id, teams::SCIM).await? {
         record_update(app, c, &g, &g, &Moved { removed: vec![user_id.to_string()], owner_left: owner, ..Moved::default() });
     }
+    Ok(())
 }
 
 // Links (admin, under /api): `botctl scim group link`, `unlink`, `groups`.

@@ -316,6 +316,30 @@ async fn people_get_accounts_follow_google_and_leave() {
 }
 
 #[tokio::test]
+async fn a_leaver_whose_pin_cant_be_kept_leaves_on_a_later_pass() {
+    let g = google_stand_in().await;
+    let w = world(&g, false, |_| {}).await;
+    synced(&w).await;
+    let eve = uid(&w, "105");
+    let team = w.app.db.scim_group_find(TENANT, Some("g2"), None).unwrap().team_id;
+    w.app.db.pin_residency(db::PinOn::Team, &team, "gb-lon", "MSA-7", None).unwrap();
+
+    w.app.db.fail_pin_saves(true);
+    g.members("eng@example.com", vec![member("101")]);
+    let (code, res) = sync(&w, "").await;
+    assert_eq!(code, 200, "{res}");
+    assert!(res["failed"].as_u64() >= Some(1), "{res}");
+    assert!(user_of(&w, "105").is_none() && !w.app.db.user(&eve).unwrap().active(), "Eve is deleted all the same");
+    assert_eq!(w.app.db.team_id_of(&eve).as_deref(), Some(team.as_str()), "but stays on the team rather than leaving unpinned");
+
+    w.app.db.fail_pin_saves(false);
+    synced(&w).await;
+    assert_eq!(w.app.db.team_id_of(&eve), None, "the next pass takes her off");
+    assert!(w.app.db.residency_pin(db::PinOn::User, &eve).is_some_and(|p| p.kept_from.as_deref() == Some(team.as_str())), "keeping the team's pin");
+    assert_eq!(team_members(&w), vec!["ada@example.com"]);
+}
+
+#[tokio::test]
 async fn an_admins_disable_holds() {
     let g = google_stand_in().await;
     let w = world(&g, false, |_| {}).await;
@@ -510,4 +534,34 @@ async fn the_tenant_is_the_syncs_alone_and_admins_run_it() {
     assert!(e.contains("only writer"), "{e}");
     let e = Directory::with_key(&app, Settings { tenant: "fresh".into(), ..settings(&g) }, Box::new(|| Ok(None))).err().unwrap();
     assert!(e.contains(google::CREDENTIALS), "{e}");
+}
+
+#[tokio::test]
+async fn departments_and_managers_follow_google() {
+    let g = google_stand_in().await;
+    g.user("102", |u| {
+        u["organizations"] = json!([{ "primary": true, "name": "Example Ltd", "department": "Sales", "costCenter": "CC-1" }]);
+        u["externalIds"] = json!([{ "type": "organization", "value": "E-102" }]);
+        u["relations"] = json!([{ "type": "manager", "value": "ada@example.com" }]);
+    });
+    let w = world(&g, false, |_| {}).await;
+    synced(&w).await;
+    let bob = user_of(&w, "102").unwrap();
+    let want = db::Enterprise { employee_number: Some("E-102".into()), organization: Some("Example Ltd".into()), department: Some("Sales".into()), cost_center: Some("CC-1".into()), ..Default::default() };
+    assert_eq!(bob.enterprise, want, "Ada was made in the same pass, so her manager comes next time");
+    let res = synced(&w).await;
+    assert_eq!(res["updated"], 1, "{res}");
+    let bob = user_of(&w, "102").unwrap();
+    assert_eq!((bob.enterprise.manager.as_deref(), bob.manager_name.as_deref()), (Some(uid(&w, "101").as_str()), Some("Ada Test")));
+    assert_eq!(synced(&w).await["updated"], 0, "nothing changed");
+
+    g.user("102", |u| {
+        u["organizations"] = json!([{ "primary": true, "name": "Example Ltd", "department": "Support" }]);
+        u["relations"] = json!([]);
+    });
+    synced(&w).await;
+    let bob = user_of(&w, "102").unwrap();
+    assert_eq!((bob.enterprise.department.as_deref(), bob.enterprise.cost_center.clone(), bob.enterprise.manager.clone()), (Some("Support"), None, None));
+    let upd = w.app.db.audit_events(&crate::audit::Filter { actions: vec!["user.updated".into()], target_id: Some(bob.user.id.clone()), ..Default::default() }, 1, false);
+    assert_eq!(upd[0].details["changes"]["department"], json!({ "from": "Sales", "to": "Support" }), "{:?}", upd[0].details);
 }

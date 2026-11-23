@@ -1,7 +1,13 @@
-import type { MyResidency } from "./types";
+import type { KeptFrom, MyResidency } from "./types";
 
 function day(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
+}
+
+/** " under <reference>", or for a pin kept from a team you left (ADR 0171), that team. */
+function under(reference?: string, kept?: KeptFrom): string {
+  if (kept) return `, kept from ${kept.team.name ? `${kept.team.name}'s` : "your former team's"} pin when you left it`;
+  return reference ? ` under ${reference}` : "";
 }
 
 /** What the residency card says about a pin (ADR 0168): whose it is, where your data is against it, and what isn't held. */
@@ -9,9 +15,8 @@ export function residencyLines(v: MyResidency): { lines: string[]; warnings: str
   const p = v.pin;
   if (!p) return { lines: [], warnings: [] };
   const whose = p.on === "team" ? `Your team${p.team?.name ? `, ${p.team.name},` : ""} has its data` : "Your data is";
-  const under = p.reference ? ` under ${p.reference}` : "";
-  const lines = [`${whose} pinned to ${p.region}${under}, since ${day(p.pinnedAt)}.`];
-  if (v.ownPin) lines.push(`Your own data is also pinned to ${v.ownPin.region} under ${v.ownPin.reference}.`);
+  const lines = [`${whose} pinned to ${p.region}${under(p.reference, p.keptFrom)}, since ${day(p.pinnedAt)}.`];
+  if (v.ownPin) lines.push(`Your own data is also pinned to ${v.ownPin.region}${under(v.ownPin.reference, v.ownPin.keptFrom)}.`);
   const warnings: string[] = [];
   if (v.machine) {
     const m = v.machine;

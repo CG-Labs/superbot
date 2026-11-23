@@ -51,7 +51,7 @@ async fn the_report_lists_each_persons_access_and_never_a_credential() {
     // Bo: disabled, so his sessions end.
     assert_eq!(call(port, "PATCH", &format!("/api/users/{bo}"), &admin, r#"{"status":"disabled"}"#).await.0, 200);
     // Dee: made by a SCIM tenant.
-    let f = ScimFields { user_name: "dee@example.com", external_id: Some("e1"), given_name: None, family_name: None, scim_display_name: None, formatted: None, display_name: "Dee", email: Some("dee@example.com"), active: Some(true) };
+    let f = ScimFields { user_name: "dee@example.com", external_id: Some("e1"), given_name: None, family_name: None, scim_display_name: None, formatted: None, display_name: "Dee", email: Some("dee@example.com"), active: Some(true), enterprise: &Default::default() };
     let dee = app.db.create_scim_user("okta", &f, Role::Member, None).unwrap().id;
 
     let r = report(port, &admin).await;
@@ -75,7 +75,7 @@ async fn the_report_lists_each_persons_access_and_never_a_credential() {
     assert_eq!((owner["breakGlass"].as_bool(), owner["botAccess"]["all"].as_bool(), owner["role"].as_str()), (Some(true), Some(true), Some("admin")));
     let b = find(&r, &bo);
     assert_eq!((b["status"].as_str(), b["apiTokens"].as_array().unwrap().len()), (Some("disabled"), 0));
-    assert_eq!(find(&r, &dee)["scim"], json!({ "tenant": "okta", "deleted": false }));
+    assert_eq!(find(&r, &dee)["scim"], json!({ "tenant": "okta", "deleted": false, "department": null, "employeeNumber": null, "manager": null }));
     // Grouped by tenant, then team: people in neither come first, then Okta's, then Research.
     let groups: Vec<(Value, Value)> = r["groups"].as_array().unwrap().iter().map(|g| (g["tenant"].clone(), g["team"]["name"].clone())).collect();
     assert_eq!(groups, [(Value::Null, Value::Null), (Value::Null, json!("Research")), (json!("okta"), Value::Null)]);

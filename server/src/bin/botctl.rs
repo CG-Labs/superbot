@@ -1518,6 +1518,10 @@ fn saml_summary(v: &Value) -> String {
         yes(v["signRequests"].as_bool().unwrap_or(false)),
         if v["singleLogout"].as_bool().unwrap_or(false) { "yes" } else { "no (the IdP's metadata has no HTTP-Redirect SingleLogoutService)" }
     );
+    out += &format!(
+        "  IdP-initiated sign-in:    {}\n",
+        if v["idpInitiated"].as_str() == Some("restart") { "restarted as SP-initiated" } else { "refused (start from SuperBot)" }
+    );
     if let Some(g) = v["groupsAttribute"].as_str() {
         let required: Vec<&str> = v["requiredGroups"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
         out += &format!(
@@ -2827,6 +2831,9 @@ mod tests {
         assert!(out.contains("ACS URL (reply URL):      https://bots.example/api/auth/sso/corp/acs"), "{out}");
         assert!(out.contains("from botctl: not loaded yet."), "{out}");
         assert!(out.contains("Signs AuthnRequests:      no") && out.contains("Single logout:            no ("), "{out}");
+        assert!(out.contains("IdP-initiated sign-in:    refused (start from SuperBot)\n"), "{out}");
+        v["idpInitiated"] = json!("restart");
+        assert!(saml_summary(&v).contains("IdP-initiated sign-in:    restarted as SP-initiated\n"));
         v["idp"] = json!({ "ssoUrl": "https://idp.example/sso", "sloUrl": "https://idp.example/slo", "certificates": [{ "sha256": "ab:cd", "subject": "CN=idp", "notAfter": 1_900_000_000_000_i64 }] });
         v["sloUrl"] = json!("https://bots.example/api/auth/sso/corp/slo");
         v["signRequests"] = json!(true);
