@@ -1,4 +1,4 @@
-//! SCIM tokens expire and rotate (ADR 0195): the real router and audit log.
+//! SCIM tokens expire and rotate (ADR 0196): the real router and audit log.
 
 use crate::scim_http_tests::{events, okta_user, scim, token};
 use crate::tests::{call, serve_app_with};

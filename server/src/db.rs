@@ -1476,7 +1476,7 @@ pub struct ScimToken {
     pub last_used_at: Option<i64>,
     pub revoked_at: Option<i64>,
     pub revoked_by: Option<String>,
-    /// When it stops working (ADR 0195). None only for tokens made before tokens expired.
+    /// When it stops working (ADR 0196). None only for tokens made before tokens expired.
     pub expires_at: Option<i64>,
     /// The token that replaced it: a rotated token works until its `expires_at`, at most
     /// the overlap the rotation gave.
@@ -2203,7 +2203,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 63] = [
     migrate_scim_token_expiry,
 ];
 
-/// SCIM tokens expire and rotate (ADR 0195). Tokens made before this keep a null
+/// SCIM tokens expire and rotate (ADR 0196). Tokens made before this keep a null
 /// `expires_at` and work as before: expiring them on upgrade would stop deprovisioning.
 fn migrate_scim_token_expiry(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
     let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('scim_tokens') WHERE name = 'expires_at'", [], |r| r.get(0))?;
@@ -7677,7 +7677,7 @@ impl Db {
     }
 
     /// Replaces a live, unrotated token with a new one of the same tenant, label and SSO
-    /// link, in one transaction (ADR 0195). The old one is revoked now, or with
+    /// link, in one transaction (ADR 0196). The old one is revoked now, or with
     /// `keep_until`, expires then unless it would sooner. None if the old one was revoked,
     /// expired or rotated meanwhile.
     pub fn rotate_scim_token(&self, old: &str, token_hash: &str, expires_at: i64, keep_until: Option<i64>, by: Option<&str>) -> Option<ScimToken> {

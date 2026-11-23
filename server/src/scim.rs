@@ -3,14 +3,14 @@
 //! SCIM_GROUPS=on, pushes groups as teams (`groups`). The core User and Group schemas,
 //! the Enterprise User extension (ADR 0176), and Bulk (`bulk`); sorting and ETags are
 //! not supported. Each IdP connection is a tenant with its own bearer tokens (`sbp_`,
-//! stored hashed, expiring and rotatable, ADR 0195), and sees only the users it
+//! stored hashed, expiring and rotatable, ADR 0196), and sees only the users it
 //! provisioned and the groups it made or an admin linked to it. The IdP never names a
 //! role: with SCIM_GROUP_ROLES=on, an admin may map a group to a custom role, never
 //! admin, and its members get and lose it with the group (`roles`), or declare a group a
 //! role group that gives a role and is no team (`role_groups`).
 //! Design: docs/adr/0023-scim.md, docs/adr/0095-scim-groups-as-teams.md,
 //! docs/adr/0138-scim-group-role-mapping.md, docs/adr/0176-scim-enterprise-user-extension.md,
-//! docs/adr/0180-scim-role-groups.md, docs/adr/0195-scim-token-expiry-and-rotation.md.
+//! docs/adr/0180-scim-role-groups.md, docs/adr/0196-scim-token-expiry-and-rotation.md.
 
 pub mod bulk;
 pub mod google;

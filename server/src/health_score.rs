@@ -166,7 +166,7 @@ pub struct Inputs {
     /// SCIM requests with a valid token that were refused or failed, by reason, and
     /// requests with a revoked or expired token (`revoked_token`, `expired_token`).
     pub scim_failed: Tally,
-    /// SCIM tenants whose every working token ends within `scim::WARN_DAYS` (ADR 0195).
+    /// SCIM tenants whose every working token ends within `scim::WARN_DAYS` (ADR 0196).
     pub scim_expiring: Vec<String>,
     /// Requests with no token or an unknown one: anyone can send those, so they're only counted.
     pub scim_unauthenticated: u64,
