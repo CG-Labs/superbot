@@ -19,6 +19,7 @@ use super::saml_sp::{Encryption, KeyUse};
 use super::xmldsig::Cert;
 use crate::AppState;
 use crate::audit::{Actor, Event, Outcome};
+use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
@@ -135,8 +136,14 @@ fn sp_certs(app: &AppState, p: &Provider, u: KeyUse, role: Role, out: &mut Vec<I
         }
         return;
     }
-    for stage in [Stage::Current, Stage::Next] {
-        let Some(cert) = app.db.setting(&saml_keys::settings(&p.id, u, stage).1) else {
+    // Both stages are read under one lock: a promotion between two reads would show the old
+    // current certificate with no next one to cover it, and its notice is recorded only once.
+    let stages = [Stage::Current, Stage::Next];
+    let kept: Vec<Option<String>> = app
+        .db
+        .with_conn(|c| stages.iter().map(|&stage| c.query_row("SELECT value FROM settings WHERE key = ?", [saml_keys::settings(&p.id, u, stage).1], |r| r.get(0)).optional().ok().flatten()).collect());
+    for (stage, cert) in stages.into_iter().zip(kept) {
+        let Some(cert) = cert else {
             continue;
         };
         match Cert::from_base64(&cert) {
