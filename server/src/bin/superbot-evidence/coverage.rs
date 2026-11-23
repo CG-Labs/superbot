@@ -49,7 +49,7 @@ pub struct Kind {
 }
 
 pub const KINDS: [Kind; 3] = [
-    Kind { id: "evidence", prefix: "superbot-evidence-", manifest_kind: None, format: 1, title: "Evidence bundle", made_by: "botd (EVIDENCE_BUNDLES=monthly, or botctl evidence bundle)" },
+    Kind { id: "evidence", prefix: "superbot-evidence-", manifest_kind: None, format: 2, title: "Evidence bundle", made_by: "botd (EVIDENCE_BUNDLES=monthly, or botctl evidence bundle)" },
     Kind {
         id: "change-management",
         prefix: changes::PREFIX,
