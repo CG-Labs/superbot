@@ -1001,7 +1001,9 @@ impl App {
         let Some((tier, route, wiring, held)) = self.tier_route(&bot, msg, &by, &asker, &people, &period, &space.1, &leased, storage.as_ref()) else { return };
         trace::note("superbot.tier", &tier);
         let placed_at = self.db.placed_at(&bot.owner_id);
-        let Some(place) = self.place(&bot, msg, &by, &period.key, bin, for_other.as_deref()).await else { return };
+        // The route's own endpoint keys the harness, so it needs no login (ADR 0193).
+        let keyed = route.provider.as_ref().is_some_and(|p| wiring.endpoints.iter().any(|e| &e.name == p));
+        let Some(place) = self.place(&bot, msg, &by, &period.key, bin, for_other.as_deref(), keyed).await else { return };
         // Held until the run ends, however it ends: dropping it lets the next run in.
         let Some((_slot, waited)) = self.slot_for(&bot, msg, &by, &period.key, &place).await else { return };
         trace::note("superbot.run.waited_for_slot", waited);
@@ -1068,7 +1070,7 @@ impl App {
         };
         // The owner's own machine runs only their Bots, so only runs here need their account.
         let run_as = match place {
-            Place::Here => match self.isolate(&bot, msg, &by, &period.key, teammate).await {
+            Place::Here => match self.isolate(&bot, msg, &by, &period.key, teammate, keyed).await {
                 Ok(r) => r,
                 Err(()) => return,
             },
@@ -1664,7 +1666,8 @@ impl App {
     /// check and can run it. None: refused (the run is given back), and the Bot said
     /// why. Never another user's machine, and never here instead of an assigned one.
     /// `for_other`: the run is for someone else, so it can't count on the owner's keys.
-    async fn place(&self, bot: &Bot, msg: &Message, by: &Who, period: &str, bin: &str, for_other: Option<&str>) -> Option<Place> {
+    #[allow(clippy::too_many_arguments)]
+    async fn place(&self, bot: &Bot, msg: &Message, by: &Who, period: &str, bin: &str, for_other: Option<&str>, keyed: bool) -> Option<Place> {
         let Some(cp) = self.control_plane.get() else { return Some(Place::Here) };
         // Others read a shared Bot's chat: they learn whose computer it is, not its insides.
         let team = bot.visibility == Visibility::Shared || !self.db.grants(&bot.id).is_empty();
@@ -1691,7 +1694,7 @@ impl App {
         let ready = checked.and_then(|hb| {
             let layout = route::fit(&hb, bin)?;
             let keys = if for_other.is_some() { None } else { Some(bot.owner_id.as_str()) };
-            cp.ready(self, &hb, keys, &to.machine_id, bin, teammate.is_some())?;
+            cp.ready(self, &hb, keys, &to.machine_id, bin, teammate.is_some(), keyed)?;
             Ok((layout, hb.version.clone(), cp.run_limits(self, &hb, &bot.owner_id)))
         });
         let (layout, version, limits) = match ready {
@@ -1709,7 +1712,7 @@ impl App {
                     }
                     crate::machines::offboard::seen(self, &to.machine_id, u);
                     // Their own login there, never the owner's (ADR 0062).
-                    if let Err(r) = cp.teammate_logged_in(bin, &t) {
+                    if !keyed && let Err(r) = cp.teammate_logged_in(bin, &t) {
                         return refused(r, Some(&to.machine_id));
                     }
                     Some(t)
@@ -2036,10 +2039,11 @@ impl App {
     /// With per-user accounts (ADR 0037): the account this run starts as, its owner's,
     /// or for `teammate` under `ISOLATION_TEAMMATES` that teammate's for the owner's Bots
     /// (ADR 0064), made now if it's new. A teammate's run needs their own harness login
-    /// there, or a server-wide key: it never falls back to the owner's. Ok(None):
+    /// there, or a server-wide key, unless its route's endpoint keys it (`keyed`): it
+    /// never falls back to the owner's. Ok(None):
     /// isolation is off. Err: refused, and the Bot said why; it never falls back to
     /// running as botd's account.
-    async fn isolate(&self, bot: &Bot, msg: &Message, by: &Who, period: &str, teammate: Option<&str>) -> Result<Option<RunAs>, ()> {
+    async fn isolate(&self, bot: &Bot, msg: &Message, by: &Who, period: &str, teammate: Option<&str>, keyed: bool) -> Result<Option<RunAs>, ()> {
         let Some(iso) = self.isolation.get().cloned() else { return Ok(None) };
         let space = Space::of(&bot.owner_id, teammate);
         let refused = |reason: &str, text: &str, more: Value| {
@@ -2067,6 +2071,7 @@ impl App {
             return refused("no_account", &format!("I couldn't set up my folders in {whose} on this server, so I didn't run. An admin can check the server log."), json!({}));
         }
         if teammate.is_some()
+            && !keyed
             && let Some(login) = crate::machines::logins::teammate_login_needed(&bot.harness)
         {
             let home = iso.home_in(space).unwrap_or_default();
@@ -3062,7 +3067,7 @@ mod tests {
         let app = test_app();
         let bot = app.db.create_bot("A", "#fff", "waddle", "pi", None, true);
         let msg = app.db.add_message(&bot.id, "user", "hi", None, false, Some("queued"));
-        assert_eq!(app.isolate(&bot, &msg, &Who::system("test"), "2026-11", None).await, Ok(None));
+        assert_eq!(app.isolate(&bot, &msg, &Who::system("test"), "2026-11", None, false).await, Ok(None));
         app.init_bot_files(&bot);
         assert_eq!(app.memory_file(&bot), app.data_memory_file(&bot.id));
         assert_eq!(app.user_file(&bot.owner_id), app.data_user_file(&bot.owner_id));
@@ -3231,7 +3236,7 @@ mod tests {
         // A harness botd doesn't know never runs as botd instead.
         let bot = app.db.create_bot("X", "#fff", "waddle", "aider", None, true);
         let msg = app.db.add_message(&bot.id, "user", "hi", None, false, Some("queued"));
-        assert_eq!(app.isolate(&bot, &msg, &who, "2026-11", None).await, Err(()));
+        assert_eq!(app.isolate(&bot, &msg, &who, "2026-11", None, false).await, Err(()));
         let last = app.db.messages(&bot.id, 1).pop().unwrap();
         assert!(last.error && last.text.contains("another harness"), "{}", last.text);
         assert_eq!(actions(&app, "bot.run_refused")[0].details["reason"], "isolation_harness");
@@ -3241,7 +3246,7 @@ mod tests {
         for harness in crate::accounts::HARNESSES {
             let bot = app.db.create_bot("C", "#fff", "waddle", harness, None, true);
             let msg = app.db.add_message(&bot.id, "user", "hi", None, false, Some("queued"));
-            assert_eq!(app.isolate(&bot, &msg, &who, "2026-11", None).await, Err(()), "{harness}");
+            assert_eq!(app.isolate(&bot, &msg, &who, "2026-11", None, false).await, Err(()), "{harness}");
             let refused = actions(&app, "bot.run_refused");
             assert_eq!(refused.last().unwrap().details["reason"], "no_account", "{harness}");
             assert_eq!(refused.last().unwrap().details["account"], format!("sb-u-{}", bot.owner_id));

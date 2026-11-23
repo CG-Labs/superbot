@@ -242,6 +242,16 @@ pub trait Adapter: Send + Sync {
     fn supports_provider(&self) -> bool {
         false
     }
+    /// For a harness with no providers of its own, the protocols of the tiers file's
+    /// endpoints it can be pointed at: its route's `provider` must name one of those.
+    /// None: any provider name, built-ins included.
+    fn endpoint_protocols(&self) -> Option<&'static [crate::tiers::Protocol]> {
+        None
+    }
+    /// Whether a route may list `fallback` providers for it.
+    fn supports_fallback(&self) -> bool {
+        self.supports_provider()
+    }
     /// Checks the server settings this adapter reads from botd's environment, at startup:
     /// botd refuses to start on an error.
     fn check_env(&self, _get: &dyn Fn(&str) -> String) -> Result<(), String> {

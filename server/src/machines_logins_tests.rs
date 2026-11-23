@@ -177,6 +177,23 @@ async fn a_harness_logs_in_on_the_users_machine_and_only_then_runs_there() {
     crate::secrets::global().user_delete(&user, "ANTHROPIC_API_KEY").unwrap();
 }
 
+/// A plan route to one of the tiers file's endpoints keys Claude Code itself (ADR 0193),
+/// so its runs need no login on the machine.
+#[tokio::test]
+async fn a_claude_code_route_to_an_endpoint_needs_no_login() {
+    let mut env = serve_with(|e| e.with_logins()).await;
+    let tiers = r#"{"providers":{"uk":{"protocol":"anthropic-messages","baseUrl":"https://uk.claude.example","keySecret":"LOGINS_E2E_UK_KEY"}},
+        "tiers":[{"name":"pro","routes":[{"harness":"claude","provider":"uk","model":"claude-opus-5-5"}]}]}"#;
+    env.app.tiers.set(Arc::new(crate::tiers::Tiers::parse(tiers, None).unwrap())).unwrap();
+    let (user, mid, token) = machine_for(&env, "ada@example.com").await;
+    agent_with(&mut env, &mid, &token, CLAUDE).await;
+    let bot = owned_bot(&env, &user);
+    crate::secrets::global().user_put(&user, "LOGINS_E2E_UK_KEY", "sk-test-uk-1c9d").unwrap();
+    let before = send(&env, &bot, "hello").await;
+    assert_eq!(reply_after(&env, &bot, before).await, "ran on the machine");
+    assert_eq!(refusals(&events(&env, "bot.run_refused").await, "harness_not_logged_in"), 0);
+}
+
 #[tokio::test]
 async fn a_login_can_be_stopped_and_only_known_harnesses_log_in() {
     let mut env = serve_with(|e| e.with_logins()).await;

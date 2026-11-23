@@ -30,9 +30,65 @@ fn sandbox_settings(s: &super::Sandbox, api: Option<String>) -> Value {
     })
 }
 
+/// The tiers file's endpoint this run's route names (ADR 0193). None: Claude Code's own
+/// API, login or key, as before.
+fn endpoint(input: &RunInput) -> Option<&crate::tiers::Endpoint> {
+    let p = input.provider.as_deref()?;
+    input.endpoints.iter().find(|e| e.name == p)
+}
+
+/// Switches that send Claude Code's model calls somewhere other than its base URL, or
+/// authenticate it as someone other than the route's key. A route's run gets them empty.
+const ELSEWHERE: &[&str] = &[
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+];
+
+/// What a run on an endpoint gets besides its key, which only the process env carries:
+/// the endpoint as Claude Code's base URL, with every switch that could send calls
+/// elsewhere off. Held to a region (ADR 0139), also no telemetry, error reports or
+/// update checks, and its small model (titles, summaries) is the route's.
+fn endpoint_env(input: &RunInput, e: &crate::tiers::Endpoint) -> Vec<(String, String)> {
+    let mut env = vec![("ANTHROPIC_BASE_URL".to_string(), e.base_url.clone())];
+    env.extend(ELSEWHERE.iter().map(|k| (k.to_string(), String::new())));
+    if !input.held_to.is_empty() {
+        env.push(("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(), "1".into()));
+        if let Some(m) = &input.model {
+            env.extend(["ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL"].map(|k| (k.to_string(), m.clone())));
+        }
+    }
+    env
+}
+
 impl Adapter for Claude {
     fn bin(&self) -> &'static str {
         "claude"
+    }
+
+    /// Only the tiers file's Anthropic Messages endpoints (ADR 0193). Claude Code has no
+    /// fallback to another provider.
+    fn supports_provider(&self) -> bool {
+        true
+    }
+
+    fn endpoint_protocols(&self) -> Option<&'static [crate::tiers::Protocol]> {
+        Some(&[crate::tiers::Protocol::AnthropicMessages])
+    }
+
+    fn supports_fallback(&self) -> bool {
+        false
+    }
+
+    /// The endpoint's key reaches Claude Code as `ANTHROPIC_API_KEY`, over any of the
+    /// owner's own.
+    fn env(&self, input: &RunInput) -> Vec<(String, String)> {
+        let Some(e) = endpoint(input) else { return Vec::new() };
+        let mut env = endpoint_env(input, e);
+        env.push(("ANTHROPIC_API_KEY".into(), input.env.get(&e.key_secret).cloned().unwrap_or_default()));
+        env
     }
 
     fn args(&mut self, input: &RunInput, _out: &mut Vec<AgentEvent>) -> Vec<String> {
@@ -59,6 +115,15 @@ impl Adapter for Claude {
         // default), whatever SuperBot's retention or holds say (ADR 0112).
         if let Some(days) = input.keep_sessions_days {
             settings.insert("cleanupPeriodDays".into(), json!(days.max(1)));
+        }
+        // Here too, so the Bot's own settings files can't point the route elsewhere.
+        if let Some(e) = endpoint(input) {
+            let env: serde_json::Map<String, Value> = endpoint_env(input, e).into_iter().map(|(k, v)| (k, json!(v))).collect();
+            settings.insert("env".into(), Value::Object(env));
+            if !input.held_to.is_empty() {
+                // WebFetch otherwise asks Anthropic whether each host is safe to fetch.
+                settings.insert("skipWebFetchPreflight".into(), json!(true));
+            }
         }
         if !settings.is_empty() {
             a.extend(["--settings".into(), Value::Object(settings).to_string()]);
@@ -209,6 +274,79 @@ fn usage(e: &Value, model: Option<&str>, out: &mut Vec<AgentEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tiers::{Endpoint, Protocol};
+
+    fn input() -> RunInput {
+        let dir = std::env::temp_dir();
+        RunInput {
+            prompt: "hi".into(),
+            system: "You are Ada.".into(),
+            session_id: None,
+            cwd: dir.clone(),
+            provider: None,
+            endpoints: Vec::new(),
+            fallback: None,
+            held_to: Vec::new(),
+            model: Some("claude-opus-5-5".into()),
+            effort: None,
+            env: HashMap::from([("ANTHROPIC_API_KEY".into(), "sk-owners-own".into()), ("TIER_UK_KEY".into(), "sk-uk".into())]),
+            config_dir: dir.clone(),
+            state_dir: dir,
+            guard: None,
+            run_as: None,
+            sandbox: None,
+            keep_sessions_days: None,
+        }
+    }
+
+    fn settings(args: &[String]) -> Option<Value> {
+        args.iter().position(|a| a == "--settings").map(|at| serde_json::from_str(&args[at + 1]).unwrap())
+    }
+
+    #[test]
+    fn a_route_to_an_endpoint_sends_every_call_there() {
+        // No endpoint: Claude Code's own API, with the owner's key, as before.
+        let mut i = input();
+        let job = super::super::job_for(&mut Claude::default(), &i, &mut Vec::new());
+        assert_eq!(job.env.get("ANTHROPIC_API_KEY").map(String::as_str), Some("sk-owners-own"));
+        assert!(!job.env.contains_key("ANTHROPIC_BASE_URL") && settings(&job.args).is_none(), "{:?}", job.args);
+
+        // On the plan's London endpoint: its URL and key, over the owner's, and nothing
+        // that would send the calls to Bedrock, Vertex, Foundry or another account.
+        i.provider = Some("uk".into());
+        i.endpoints = vec![Endpoint { name: "uk".into(), protocol: Protocol::AnthropicMessages, base_url: "https://uk.claude.example".into(), key_secret: "TIER_UK_KEY".into(), regions: vec!["gb-lon".into()] }];
+        let job = super::super::job_for(&mut Claude::default(), &i, &mut Vec::new());
+        assert_eq!(job.env.get("ANTHROPIC_BASE_URL").map(String::as_str), Some("https://uk.claude.example"));
+        assert_eq!(job.env.get("ANTHROPIC_API_KEY").map(String::as_str), Some("sk-uk"));
+        assert!(!job.env.contains_key("TIER_UK_KEY"), "only under Claude Code's own name");
+        for k in ELSEWHERE {
+            assert_eq!(job.env.get(*k).map(String::as_str), Some(""), "{k}");
+        }
+        // The same in flag settings, which outrank the Bot's own settings files. The key isn't.
+        let s = settings(&job.args).unwrap();
+        assert_eq!(s["env"]["ANTHROPIC_BASE_URL"], "https://uk.claude.example");
+        assert_eq!(s["env"]["CLAUDE_CODE_USE_BEDROCK"], "");
+        assert!(s["env"].get("ANTHROPIC_API_KEY").is_none() && !job.args.iter().any(|a| a.contains("sk-uk")));
+        // Not held: Claude Code's own background traffic and small model.
+        assert!(!job.env.contains_key("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC") && s.get("skipWebFetchPreflight").is_none());
+        assert!(!job.env.contains_key("ANTHROPIC_DEFAULT_HAIKU_MODEL"));
+
+        // Held to London: no telemetry, error reports or WebFetch checks with Anthropic,
+        // and side calls on the route's model.
+        i.held_to = vec!["gb-lon".into()];
+        let job = super::super::job_for(&mut Claude::default(), &i, &mut Vec::new());
+        assert_eq!(job.env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").map(String::as_str), Some("1"));
+        for k in ["ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL"] {
+            assert_eq!(job.env.get(k).map(String::as_str), Some("claude-opus-5-5"), "{k}");
+        }
+        let s = settings(&job.args).unwrap();
+        assert_eq!((s["skipWebFetchPreflight"].as_bool(), s["env"]["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"].as_str()), (Some(true), Some("1")));
+
+        // A key that isn't there never lets the owner's own go to the endpoint.
+        i.env.remove("TIER_UK_KEY");
+        let job = super::super::job_for(&mut Claude::default(), &i, &mut Vec::new());
+        assert_eq!(job.env.get("ANTHROPIC_API_KEY").map(String::as_str), Some(""));
+    }
 
     fn usage_of(lines: &[&str]) -> Vec<Usage> {
         let mut c = Claude::default();

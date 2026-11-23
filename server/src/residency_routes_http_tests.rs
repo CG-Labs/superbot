@@ -154,6 +154,85 @@ async fn a_team_pin_holds_its_members_runs() {
     assert!(d["error"].as_str().unwrap().contains("us-gpt has no regions"), "{d}");
 }
 
+const CLAUDE_TIERS: &str = r#"{
+  "providers": {
+    "uk-claude": { "protocol": "anthropic-messages", "baseUrl": "https://uk.claude.example", "keySecret": "RESIDENCY_E2E_UK_KEY", "regions": ["gb-lon"] }
+  },
+  "tiers": [
+    { "name": "pro", "label": "Pro", "routes": [
+        { "harness": "claude", "model": "claude-sonnet-5-5" },
+        { "harness": "claude", "provider": "uk-claude", "model": "claude-opus-5-5" }
+    ] }
+  ]
+}"#;
+
+/// A stand-in `claude` that says where Claude Code would send its calls: the base URL,
+/// the key's length (keys are redacted from chats), whether Bedrock or background
+/// traffic is on, and the model and flag settings' base URL it was given.
+fn fake_claude(app: &App) {
+    use std::os::unix::fs::PermissionsExt;
+    let script = r#"#!/bin/sh
+model=none; flag=none
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model) model=$2; shift ;;
+    --settings) flag=$(printf '%s' "$2" | grep -o '"ANTHROPIC_BASE_URL":"[^"]*"' | cut -d'"' -f4); shift ;;
+  esac
+  shift
+done
+text="base=${ANTHROPIC_BASE_URL:-none} flag=${flag:-none} key=${#ANTHROPIC_API_KEY} bedrock=${CLAUDE_CODE_USE_BEDROCK:-off} traffic=${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-on} model=$model"
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$text"
+"#;
+    let path = app.cfg.bin_dir.join("claude");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Claude Code takes the plan's endpoints (ADR 0193): a pinned person's Claude Code Bot
+/// runs on the London one, with its key, and nothing of Claude Code's own goes elsewhere.
+#[tokio::test]
+async fn a_pinned_claude_code_bot_takes_the_plans_in_region_endpoint() {
+    let (port, app, admin, _) = serve_app().await;
+    app.tiers.set(Arc::new(Tiers::parse(CLAUDE_TIERS, None).unwrap())).unwrap();
+    fake_claude(&app);
+    let (ada_id, ada) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (own, uk) = ("sk-ada-own-key", "sk-test-london-endpoint-key");
+    for (name, value) in [("ANTHROPIC_API_KEY", own), ("CLAUDE_CODE_USE_BEDROCK", "1"), ("RESIDENCY_E2E_UK_KEY", uk)] {
+        let (code, body) = call(port, "PUT", &format!("/api/me/secrets/{name}"), &ada, &json!({ "value": value }).to_string()).await;
+        assert_eq!(code, 200, "{name}: {body}");
+    }
+    let bot = app.db.create_bot_owned("Ada's", "#fff", "waddle", "claude", None, false, &ada_id, Visibility::Private);
+
+    // Unpinned: the plan's first route, on Claude Code's own API with her settings.
+    let said = run(port, &app, &ada, &bot.id).await;
+    assert_eq!(said, format!("base=none flag=none key={} bedrock=1 traffic=on model=claude-sonnet-5-5", own.len()));
+
+    // Pinned to London: the London endpoint instead, with its key, Bedrock off and
+    // Claude Code's background traffic off.
+    app.db.pin_residency(PinOn::User, &ada_id, "gb-lon", "DPA-7", None).unwrap();
+    let said = run(port, &app, &ada, &bot.id).await;
+    let london = "https://uk.claude.example";
+    assert_eq!(said, format!("base={london} flag={london} key={} bedrock=off traffic=1 model=claude-opus-5-5", uk.len()));
+    let invoked = audit(port, &admin, &format!("action=harness.invoked&bot={}", bot.id)).await;
+    let d = &invoked[0]["details"];
+    assert_eq!((d["provider"].as_str(), d["model"].as_str()), (Some("uk-claude"), Some("claude-opus-5-5")), "{d}");
+    assert_eq!(d["residency"]["regions"], json!(["gb-lon"]));
+    assert_eq!(d["residency"]["insteadOf"], json!({ "provider": null, "model": "claude-sonnet-5-5" }));
+    assert!(audit(port, &admin, &format!("action=bot.run_refused&bot={}", bot.id)).await.is_empty());
+
+    // The plan has a London route for every harness it offers, so admins aren't warned.
+    let mut cp = ControlPlane::default();
+    cp.regions = vec!["gb-lon".into()];
+    let warnings = crate::machines::residency::warnings(&app, &cp);
+    assert!(warnings.iter().all(|w| !w.contains("no model route")), "{warnings:?}");
+
+    // Without the endpoint's key, refused rather than sent with hers.
+    let (code, _) = call(port, "DELETE", "/api/me/secrets/RESIDENCY_E2E_UK_KEY", &ada, "").await;
+    assert_eq!(code, 200);
+    let said = run(port, &app, &ada, &bot.id).await;
+    assert!(said.contains("model provider isn't set up"), "{said}");
+}
+
 /// The Bot's first reply after message `before`.
 async fn reply_after(app: &App, bot: &str, before: i64) -> String {
     for _ in 0..300 {

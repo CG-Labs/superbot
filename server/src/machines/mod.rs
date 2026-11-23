@@ -609,7 +609,10 @@ impl ControlPlane {
     /// `teammate`: the run is a teammate's, as their own user (ADR 0048), which the
     /// agent must be able to do, and which a server-wide key logs in, or their own
     /// login there (ADR 0062), checked once their user answers (`teammate_logged_in`).
-    pub fn ready(&self, app: &App, hb: &wire::Heartbeat, keys: Option<&str>, machine_id: &str, bin: &str, teammate: bool) -> Result<(), route::Refusal> {
+    /// `keyed`: the run's route hands the harness its own endpoint's key, so no login
+    /// is needed (ADR 0193).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ready(&self, app: &App, hb: &wire::Heartbeat, keys: Option<&str>, machine_id: &str, bin: &str, teammate: bool, keyed: bool) -> Result<(), route::Refusal> {
         let Some(e) = &self.enrollment else { return Ok(()) };
         botuser::check_run(e, hb)?;
         if let Some(m) = app.db.machine(machine_id) {
@@ -617,10 +620,13 @@ impl ControlPlane {
         }
         if teammate {
             teammate::fit(hb)?;
-            return logins::check_teammate_run(e, hb, bin);
+            return if keyed { Ok(()) } else { logins::check_teammate_run(e, hb, bin) };
         }
         if folder::first_copy_running(app, e, machine_id) {
             return Err(route::Refusal::FolderCopying);
+        }
+        if keyed {
+            return Ok(());
         }
         logins::check_run(e, hb, keys, bin)
     }
