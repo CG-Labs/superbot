@@ -89,7 +89,7 @@ async fn a_teams_machines_share_a_network_of_their_own_and_leave_it_with_the_tea
     let (al, _) = user_with(env.port, &env.admin, "al@example.com", "member").await;
     let (cy, _) = user_with(env.port, &env.admin, "cy@example.com", "member").await;
     let (dee, _) = user_with(env.port, &env.admin, "dee@example.com", "member").await;
-    let (gus, _) = user_with(env.port, &env.admin, "gus@example.com", "member").await;
+    let (_gus, _) = user_with(env.port, &env.admin, "gus@example.com", "member").await;
     let acme = team(&env, "Acme", "ada@example.com").await;
     let globex = team(&env, "Globex", "gus@example.com").await;
     join(&env, &acme, &al).await;
