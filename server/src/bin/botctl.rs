@@ -263,7 +263,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    timestamps. --digests-after: digestsAfter from
                                                    botctl audit siem, so lines with their digests
                                                    taken out fail. --timestamp-ca: the TSA's CA
-                                                   certificates (PEM). Exits 1 on a break
+                                                   certificates (PEM). Reads gzip too. Exits 1 on
+                                                   a break
   botctl audit siem                                The SIEM export: sink, delivered, pending, failing
   botctl audit chain                               The chain's state: head, last checkpoint and
                                                    timestamp, export lag, last check
@@ -949,7 +950,8 @@ fn verify_query(rest: &[&str]) -> Result<String, String> {
 
 /// `botctl audit verify-lines <file|dir|->... [--key <hex>]... [--digests-after <id>] [--timestamp-ca <pem>]...`
 /// (ADR 0199, ADR 0207): checks exported events where they landed, with no botd. A
-/// directory is read for its `.jsonl`, `.ndjson`, `.json` and `.log` files, `-` is stdin.
+/// directory is read for its `.jsonl`, `.ndjson`, `.json` and `.log` files, gzipped or
+/// not (ADR 0227), `-` is stdin.
 fn verify_lines(rest: &[&str], stdin: impl std::io::Read) -> Result<String, String> {
     let (mut paths, mut keys, mut after, mut cas) = (Vec::new(), Vec::new(), None, String::new());
     let mut it = rest.iter();
@@ -978,15 +980,16 @@ fn verify_lines(rest: &[&str], stdin: impl std::io::Read) -> Result<String, Stri
     let mut stdin = Some(stdin);
     for p in paths {
         if p == "-" {
-            let mut text = String::new();
-            stdin.take().ok_or("stdin (-) can be read once")?.read_to_string(&mut text).map_err(|e| format!("stdin: {e}"))?;
-            read_lines(&mut lines, &text, "-");
+            let mut bytes = Vec::new();
+            stdin.take().ok_or("stdin (-) can be read once")?.read_to_end(&mut bytes).map_err(|e| format!("stdin: {e}"))?;
+            read_lines(&mut lines, &unzipped(bytes, "stdin")?, "-");
             files += 1;
             continue;
         }
         for f in line_files(std::path::Path::new(p))? {
-            let bytes = std::fs::read(&f).map_err(|e| format!("{}: {e}", f.display()))?;
-            read_lines(&mut lines, &String::from_utf8_lossy(&bytes), &f.display().to_string());
+            let name = f.display().to_string();
+            let bytes = std::fs::read(&f).map_err(|e| format!("{name}: {e}"))?;
+            read_lines(&mut lines, &unzipped(bytes, &name)?, &name);
             files += 1;
         }
     }
@@ -1011,6 +1014,13 @@ fn verify_lines(rest: &[&str], stdin: impl std::io::Read) -> Result<String, Stri
     if v["ok"] == true { Ok(out) } else { Err(out) }
 }
 
+/// The text of a file or stdin, gunzipped when it is gzip (ADR 0227), as a gzipped archive
+/// object or `cat *.jsonl.gz` is, whatever it is called.
+fn unzipped(bytes: Vec<u8>, name: &str) -> Result<String, String> {
+    let bytes = if audit_line::gzipped(&bytes) { audit_line::gunzip(&bytes, u64::MAX).map_err(|e| format!("{name}: {e}"))? } else { bytes };
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 fn read_lines(lines: &mut audit_line::Lines, text: &str, name: &str) {
     for (n, l) in text.lines().enumerate() {
         lines.line(l, &format!("{name}:{}", n + 1));
@@ -1018,6 +1028,13 @@ fn read_lines(lines: &mut audit_line::Lines, text: &str, name: &str) {
 }
 
 /// `path` itself, or the event files under it, sorted so the output is stable.
+/// A `.jsonl`, `.ndjson`, `.json` or `.log` file, gzipped (`.jsonl.gz`) or not.
+fn line_file(p: &std::path::Path) -> bool {
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let name = name.strip_suffix(".gz").unwrap_or(name);
+    name.rsplit_once('.').is_some_and(|(stem, x)| !stem.is_empty() && ["jsonl", "ndjson", "json", "log"].contains(&x))
+}
+
 fn line_files(path: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
     if !path.is_dir() {
         return Ok(vec![path.to_path_buf()]);
@@ -1029,7 +1046,7 @@ fn line_files(path: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String>
             let p = entry.map_err(|e| format!("{}: {e}", d.display()))?.path();
             if p.is_dir() {
                 dirs.push(p);
-            } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| ["jsonl", "ndjson", "json", "log"].contains(&x)) {
+            } else if line_file(&p) {
                 out.push(p);
             }
         }
@@ -2940,6 +2957,38 @@ mod tests {
         assert_eq!((err["digestsAfter"].clone(), err["hosts"][0]["firstProblems"][0]["reason"].clone()), (json!(2), json!("unbound")), "{err}");
         assert!(verify_lines(&[d, "--bogus"], std::io::empty()).unwrap_err().contains("--bogus"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn verify_lines_reads_gzip_from_files_dirs_and_stdin() {
+        let lines: Vec<String> = audit_line::tests::chain(4).iter().map(|v| v.to_string()).collect();
+        let gz = |ls: &[&String]| audit_line::gzip(ls.iter().map(|l| format!("{l}\n")).collect::<String>().as_bytes());
+        let dir = std::env::temp_dir().join(format!("botctl-verify-lines-gz-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("2026/11/24")).unwrap();
+        // As a gzipped archive downloads: `.jsonl.gz` objects, beside plain ones from before.
+        std::fs::write(dir.join("2026/11/24/00000000000000000001-00000000000000000002.jsonl.gz"), gz(&[&lines[0], &lines[1]])).unwrap();
+        std::fs::write(dir.join("2026/11/24/00000000000000000003-00000000000000000003.jsonl"), format!("{}\n", lines[2])).unwrap();
+        std::fs::write(dir.join("notes.txt.gz"), audit_line::gzip(b"ignored by extension")).unwrap();
+        let d = dir.to_str().unwrap();
+        // `cat *.jsonl.gz | botctl audit verify-lines -`: members one after another.
+        let mut piped = gz(&[&lines[3]]);
+        piped.extend(gz(&[&lines[1]]));
+        let out: Value = serde_json::from_str(&verify_lines(&[d, "-"], piped.as_slice()).unwrap()).unwrap();
+        assert_eq!((out["ok"].clone(), out["files"].clone(), out["hosts"][0]["events"].clone(), out["hosts"][0]["copies"].clone()), (json!(true), json!(3), json!(4), json!(5)), "{out}");
+
+        // Gzip under any name is read as gzip; a cut one names the file.
+        let named = dir.join("export.bin");
+        std::fs::write(&named, gz(&[&lines[0]])).unwrap();
+        let out: Value = serde_json::from_str(&verify_lines(&[named.to_str().unwrap()], std::io::empty()).unwrap()).unwrap();
+        assert_eq!(out["hosts"][0]["events"], json!(1), "{out}");
+        let cut = gz(&[&lines[0], &lines[1]]);
+        std::fs::write(&named, &cut[..cut.len() / 2]).unwrap();
+        let e = verify_lines(&[named.to_str().unwrap()], std::io::empty()).unwrap_err();
+        assert!(e.contains("export.bin: it isn't gzip, or is cut short"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+        for (name, read) in [("a.jsonl.gz", true), ("a.log.gz", true), ("a.ndjson", true), ("a.gz", false), (".jsonl.gz", false), ("a.txt.gz", false), ("a.jsonl.gz.gz", false)] {
+            assert_eq!(line_file(std::path::Path::new(name)), read, "{name}");
+        }
     }
 
     #[test]

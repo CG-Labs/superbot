@@ -576,13 +576,84 @@ async fn an_archive_beside_a_siem_gets_every_event_while_the_siem_is_down() {
 }
 
 /// Writes `body` to `key` as botd would, its metadata copied from `like`.
-async fn put_like(s: &StandIn, like: &str, key: &str, body: String) {
+async fn put_like(s: &StandIn, like: &str, key: &str, body: impl Into<Vec<u8>>) {
     use base64::Engine;
+    let body = body.into();
     let (meta, _) = s.w().meta[like].clone();
-    let sum = base64::engine::general_purpose::STANDARD.encode(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, body.as_bytes()).as_ref());
+    let sum = base64::engine::general_purpose::STANDARD.encode(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &body).as_ref());
     let mut h: Vec<(&str, String)> = meta.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
     h.push(("x-amz-checksum-sha256", sum));
-    machines::s3::S3::new(s.settings()).unwrap().put_with(key, body.into_bytes(), &h).await.unwrap();
+    machines::s3::S3::new(s.settings()).unwrap().put_with(key, body, &h).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_gzipped_archive_is_written_checked_and_read_without_botd() {
+    use crate::audit_line::{gunzip, gzipped};
+    let (port, app, admin, _) = serve_app().await;
+    let s = StandIn::start().await;
+    s.w().versioning = Some("Enabled");
+    s.w().object_lock = Some(DEFAULT_RETENTION.into());
+    export_to(&app, &vars(&s, &[("AUDIT_EXPORT_S3_COMPRESS", "gzip")]));
+    let x = app.audit_export.get().unwrap().clone();
+    for _ in 0..3 {
+        archive_round(&app, &x, 4).await;
+    }
+    let keys = s.keys();
+    assert!(keys.len() >= 3 && keys.iter().all(|k| k.ends_with(".jsonl.gz")), "{keys:?}");
+
+    // Each object is the gzip of the lines a plain one holds, with the same metadata.
+    let mut sent: Vec<Value> = Vec::new();
+    let mut offline = crate::audit_line::Lines::new(None);
+    {
+        let w = s.w();
+        for (key, body) in w.objects.iter().filter(|(k, _)| k.starts_with("audit/prod/")) {
+            assert!(gzipped(body), "{key}");
+            let text = String::from_utf8(gunzip(body, u64::MAX).unwrap()).unwrap();
+            let m = |k: &str| w.meta[key].0.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap();
+            assert_eq!(m("x-amz-meta-superbot-events"), text.lines().count().to_string(), "{key}");
+            for (n, l) in text.lines().enumerate() {
+                offline.line(l, &format!("{key}:{}", n + 1));
+                sent.push(serde_json::from_str(l).unwrap());
+            }
+        }
+    }
+    let ids: Vec<i64> = sent.iter().map(|e| e["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, (1..=ids.len() as i64).collect::<Vec<_>>(), "every event once, in order, across objects");
+    let r = offline.finish();
+    assert!(r.ok && r.hosts[0].events == ids.len() as u64, "botctl audit verify-lines reads what it gunzips: {r:?}");
+
+    let siem = parse(&call(port, "GET", "/api/audit/siem", &admin, "").await.1);
+    let last = &siem["archive"]["lastObject"];
+    assert_eq!((siem["compress"].as_str(), siem["archive"]["compress"].as_str()), (Some("gzip"), Some("gzip")), "{siem}");
+    assert!(last["key"].as_str().unwrap().ends_with(".jsonl.gz") && last["uncompressedBytes"].as_u64() > last["bytes"].as_u64(), "{siem}");
+
+    let v = verify_archive(port, &admin, "").await;
+    let a = &v["archive"];
+    assert_eq!((v["ok"].as_bool(), a["problems"].as_u64()), (Some(true), Some(0)), "{v}");
+    assert_eq!((&a["events"], &a["locked"]), (&a["matched"], &a["objects"]), "{a}");
+
+    // A new version over a locked object holding the same lines, gzipped another way, is a
+    // retry after an upgrade, not a forgery: versions compare by what they hold.
+    let first = keys[0].clone();
+    let plain = gunzip(&s.w().objects[&first], u64::MAX).unwrap();
+    let mut other = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+    std::io::Write::write_all(&mut other, &plain).unwrap();
+    let other = other.finish().unwrap();
+    assert_ne!(other, s.w().objects[&first]);
+    put_like(&s, &first, &first, other).await;
+    let v = verify_archive(port, &admin, "").await;
+    assert_eq!((v["archive"]["ok"].as_bool(), v["archive"]["retried"].as_u64()), (Some(true), Some(1)), "{v}");
+
+    // Other lines are named, and a .gz key that isn't gzip can't be read.
+    let changed = String::from_utf8(plain).unwrap().replace("test.archive", "test.innocent");
+    put_like(&s, &first, &first, crate::audit_line::gzip(changed.as_bytes())).await;
+    let stray = format!("audit/prod/2099/01/01/{}", keys[1].rsplit('/').next().unwrap());
+    put_like(&s, &keys[1], &stray, changed).await;
+    let v = verify_archive(port, &admin, "").await;
+    assert_eq!((v["ok"].as_bool(), reasons(&v)), (Some(false), vec!["overwritten".to_string(), "unreadable".to_string()]), "{v}");
+    let unreadable = &v["archive"]["firstProblems"][1];
+    assert!(unreadable["key"] == stray.as_str() && unreadable["error"].as_str().unwrap().contains("it isn't gzip"), "{v}");
+    assert!(v["firstBroken"].is_null(), "this server's log still matches: {v}");
 }
 
 /// Every archived line, checked as `botctl audit verify-lines` would, with no botd.
