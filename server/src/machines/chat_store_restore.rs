@@ -1361,7 +1361,7 @@ mod tests {
         let me = std::fs::metadata(t.path()).unwrap().uid();
         assert!(same_user(&[t.path()], me).is_ok());
         let e = same_user(&[t.path()], me + 1).unwrap_err();
-        assert!(e.contains(&format!("belongs to uid {me}")) && e.contains("sudo -u"), "{e}");
+        assert!(e.contains(&format!("belongs to uid {me}")) && e.contains("sudo -u"));
     }
 
     #[test]
