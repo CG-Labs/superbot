@@ -803,11 +803,14 @@ async fn a_team_network_nothing_uses_goes_with_its_acl_and_its_name_on_the_acces
     p.create(&CreateSpec { subnet_id: Some(a.subnet_id.clone()), ..spec("superbot-m1", "c1-m2-d20") }).await.unwrap();
     let access = || s.w().projects["superbot"]["restricted.networks.access"].as_str().unwrap().to_string();
 
-    // A container on it, or a NIC elsewhere behind its ACL: kept, nothing deleted.
+    // A container on it, or a NIC elsewhere behind its ACL: kept, nothing deleted. The
+    // view counts what members don't list (ADR 0249): not the member itself.
     assert_eq!(p.remove_team_network(&a).await, Ok(false));
+    assert_eq!((p.team_network_unlisted(&a).await, p.team_network_unlisted(&b).await), (Ok(0), Ok(0)));
     let svc = json!({ "type": "nic", "network": "incusbr0", "name": "eth2", "security.acls": b.id });
     s.w().instances.get_mut("superbot-m1").unwrap().body["devices"]["eth2"] = svc;
     assert_eq!(p.remove_team_network(&b).await, Ok(false), "its ACL is in use");
+    assert_eq!(p.team_network_unlisted(&b).await, Ok(1), "a NIC on another network behind its ACL");
     assert_eq!((s.calls("DELETE", "/1.0/networks/").len(), s.calls("DELETE", "/1.0/network-acls/").len()), (0, 0));
     s.w().instances.get_mut("superbot-m1").unwrap().body["devices"].as_object_mut().unwrap().remove("eth2");
 
@@ -817,9 +820,12 @@ async fn a_team_network_nothing_uses_goes_with_its_acl_and_its_name_on_the_acces
     other.body["devices"] = json!({ "eth0": { "type": "nic", "network": b.id } });
     s.w().instances.insert("operator-svc".into(), other.clone());
     assert_eq!(p.remove_team_network(&b).await, Ok(false), "another project's container is on it");
+    assert!(p.team_network_members(&b.id).await.unwrap().is_empty(), "members are this project's alone");
+    assert_eq!(p.team_network_unlisted(&b).await, Ok(1), "but the view counts it");
     other.body["devices"] = json!({ "eth0": { "type": "nic", "network": "incusbr0", "security.acls": b.id } });
     s.w().instances.insert("operator-svc".into(), other);
     assert_eq!(p.remove_team_network(&b).await, Ok(false), "another project's container uses its ACL");
+    assert_eq!(p.team_network_unlisted(&b).await, Ok(1));
     assert_eq!((s.calls("DELETE", "/1.0/networks/").len(), s.calls("DELETE", "/1.0/network-acls/").len()), (0, 0));
     s.w().instances.remove("operator-svc");
 
@@ -830,6 +836,7 @@ async fn a_team_network_nothing_uses_goes_with_its_acl_and_its_name_on_the_acces
     let order: Vec<String> = s.w().calls.iter().filter(|c| c.method != "GET").map(|c| format!("{} {}", c.method, c.path)).collect();
     assert!(order.ends_with(&[format!("DELETE /1.0/network-acls/{}", b.id), format!("DELETE /1.0/networks/{}", b.id), "PUT /1.0/projects/superbot".into()]), "{order:?}");
     assert_eq!(p.remove_team_network(&b).await, Ok(true), "gone already");
+    assert_eq!(p.team_network_unlisted(&b).await, Ok(0), "nothing uses what is gone");
 
     // Once its member leaves, the other goes too.
     let members = p.team_network_members(&a.id).await.unwrap();
