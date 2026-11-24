@@ -54,6 +54,6 @@ Option 3, then 2, 3 and 2.
 - Sentinel customers send audit events straight from botd, with no collector, no extra secret on Azure or AKS, and the same identity as Key Vault.
 - The copy in the workspace checks itself, line by line and as a chain, like the archive and other SIEMs. The typed columns are for detections and are not what is checked.
 - Each event is stored twice in the workspace (columns and `Line`), roughly doubling ingestion. That buys the self-check; a DCR transformation can drop columns a customer doesn't want.
-- A line over 64 KB would be cut by Azure and then fail `verify-lines` as unreadable. Audit details are clipped (strings to 500 characters, arrays to 100 items), so none come near it today.
+- A line over 64 KB would be cut by Azure and then fail `verify-lines` as unreadable. Audit details are clipped (strings to 500 characters, arrays to 100 items), and an erasure names the rows it cleared in `audit.erased` events of at most 1,000 id ranges each (under 43 KB), however scattered the rows are, so no line comes near it. The check counts the rows named across all of them, as it always did.
 - The chain and checks are unchanged; only where events go is new.
 - Later, if asked: gzip of request bodies (`Content-Encoding: gzip`, which the API takes) and of archive objects, and other SIEMs' native APIs (Google SecOps, Datadog) that also need tokens or their own bodies.

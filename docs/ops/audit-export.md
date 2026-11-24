@@ -414,7 +414,7 @@ A transformation in the rule (`transformKql`) can drop columns you don't want, b
 - **Tokens.** When Azure refuses one (401), botd gets a new one and tries once more; only a second refusal is a failure.
 - **Throttling.** A 429 waits as long as `Retry-After` says, up to 5 minutes, then the usual backoff.
 - **Failures** are recorded as for any sink, with Azure's error code and what to do: `403` needs the role (step 3), `404` a wrong rule, stream or host, `400` a stream that doesn't declare the columns (step 2). A failed sign-in is `sign_in_failed`: check the identity settings, and for a managed identity that botd runs where one is assigned.
-- **Size.** Azure cuts any field over 64 KB. Audit details are clipped well below that, so no `Line` comes near it.
+- **Size.** Azure cuts any field over 64 KB. Audit details are clipped well below that, and an erasure that clears many scattered rows names them across several `audit.erased` events, so no `Line` comes near it.
 
 ### Check the copy in Sentinel
 
@@ -463,4 +463,4 @@ What it can't tell you:
 ## Retention and erasure
 
 - Retention deletes events from the start of the log only, and keeps the last deleted event's hash as the anchor the chain carries on from. An old event written after a newer one waits until the newer one is old enough too. `audit.pruned` records the anchor.
-- Erasing a user ([ADR 0102](../adr/0102-erasing-a-users-data.md)) replaces their personal fields with a pseudonym and drops each event's salt, so its digest says nothing about them. The erasure records `audit.erased` with the ids it changed, and the chain still verifies. A salt cleared any other way fails as `erased`. Copies already in your SIEM aren't erased by botd: cover them with your SIEM's retention and your DPA, as with backups.
+- Erasing a user ([ADR 0102](../adr/0102-erasing-a-users-data.md)) replaces their personal fields with a pseudonym and drops each event's salt, so its digest says nothing about them. The erasure records the ids it changed in `audit.erased` events (several, of at most 1,000 id ranges each, when the rows are scattered), and the chain still verifies. A salt cleared any other way fails as `erased`. Copies already in your SIEM aren't erased by botd: cover them with your SIEM's retention and your DPA, as with backups.
