@@ -29,7 +29,7 @@ The token and the password are read through botd's secrets store: the environmen
 
 botd won't start, and says why, if:
 
-- a login is set without `MACHINE_NPM_REGISTRY` (botd sends a login only to the operator's own registry, never npm's) or without `MACHINE_CONTROL_URL`;
+- a login is set, in the environment, a file or an external store, without `MACHINE_NPM_REGISTRY` (botd sends a login only to the operator's own registry, never npm's) or without `MACHINE_CONTROL_URL`;
 - both kinds are set, or a username without a password, or the reverse;
 - the token isn't 1 to 4096 letters, digits and `- . _ ~ + / = :`. Registry tokens are. This keeps out newlines, `;` and `#` comments, quotes and `${...}`, which npm's ini parser would read as something else. A password can hold anything but control characters, since it goes in base64.
 
@@ -48,10 +48,10 @@ Agents from before this ignore the field and would fail with npm's 401. So agent
 For each npm install, the agent:
 
 1. fetches the login from botd over mutual TLS, and refuses one for a registry other than its plan's, or one with characters outside the set above;
-2. writes one line, `//<host>[:port]/<path>/:_authToken=<token>` (or `:_auth=`), to a new file, `npmrc`, in its download folder, readable by root alone (0600);
+2. writes one line, `//<host>[:port]/<path>/:_authToken=<token>` (or `:_auth=`), to a new file, `npmrc`, readable by root alone (0600), in a folder only root opens (0700) beside its tools folder (`<tools>.login`). Not in the tools folder: the agent opens everything there to Bot users (ADR 0043), whenever it makes or loads the Bots' user, even while npm runs;
 3. points npm at it with `npm_config_userconfig`, beside `npm_config_registry` and the CA;
 4. takes the login's value out of npm's errors before reporting them;
-5. removes the download folder, and the file with it, when the install ends, failed or not.
+5. removes that folder when the install ends, failed or not, before the next one, and when the agent starts, so one a restart cut short is gone before anything opens the tools again.
 
 The key is npm's own "nerf dart" for the registry, so npm sends the login to the registry and to tarball URLs under it, and nowhere else. The login is never saved by the agent, and never passed on the command line or in an environment variable a Bot could read.
 
@@ -75,9 +75,9 @@ The key is npm's own "nerf dart" for the registry, so npm sends the login to the
 - A machine whose agent is older fails nothing new: botd doesn't send it the plan until it is upgraded.
 - Tested:
   - `mirror`: the settings' forms, the token trimmed, `_FILE`, a password with any characters, the refusals above, redaction and the masked `Debug`; the plan flag and its id; the check signing in only under the registry and not across a redirect, its hints for a missing or wrong login.
-  - `tools`: the nerf dart, the `.npmrc` line and the characters it allows, refusing a login for another registry, scrubbing npm's errors, and the agent writing the file 0600 in its download folder, removing it after, and never saving it.
+  - `tools`: the nerf dart, the `.npmrc` line and the characters it allows, refusing a login for another registry, scrubbing npm's errors, and the agent writing the file 0600 in a 0700 folder outside its tools, which stays so when the tools are opened mid-install, removing it after and at start, and never saving it.
   - Upkeep: only agents that say `harness_mirror_login` are sent the plan, and nothing changes without a login. Enrollment: the settings need `MACHINE_CONTROL_URL`. Adapters: no Bot run inherits the secrets.
-  - End to end on loopback: botd with a token and a registry that wants it. The check passes, a caller without a machine certificate is refused, the real agent fetches the login over mutual TLS and npm gets a 0600 userconfig with only the registry's line, and the audit log records the kind but never the token.
+  - End to end on loopback: botd with a token and a registry that wants it. The check passes, a caller without a machine certificate is refused, the real agent fetches the login over mutual TLS and npm gets a 0600 userconfig, in a 0700 folder outside the tools, with only the registry's line, and the audit log records the kind but never the token.
   - With the real npm: installs from a registry that wants a login, as a token and as a username and password, for the package document and every tarball, and a wrong login fails without showing it. CI runs this with no network.
 - Not covered:
   - A login for `MACHINE_NODE_MIRROR`. Node.js tarballs are usually on a plain web server, and the agent's own downloads don't sign in.
