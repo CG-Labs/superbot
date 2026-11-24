@@ -167,6 +167,7 @@ fn every_link_in_the_playbooks_resolves() {
     files.push(repo().join("docs/adr/0211-support-readiness-check.md"));
     files.push(repo().join("docs/adr/0220-support-bundle-triage.md"));
     files.push(repo().join("docs/adr/0233-onboarding-check.md"));
+    files.push(repo().join("docs/adr/0243-onboarding-check-in-the-console-and-the-bundle.md"));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links:\n{}", bad.join("\n"));
 }
@@ -479,5 +480,25 @@ fn the_onboarding_check_page_documents_every_item_status_and_option() {
     assert!(page.contains("support.onboarding_checked") && page.contains("GET /api/support/onboarding"), "the audit action and the route");
     for (name, needle) in [("README.md", "(onboarding-check.md"), ("onboarding.md", "botctl onboarding"), ("tam.md", "botctl onboarding")] {
         assert!(read(name).contains(needle), "{name} doesn't point at the onboarding check");
+    }
+    for (heading, needle) in [("In the console", "Check onboarding"), ("In the support bundle", "onboarding.json")] {
+        assert!(anchors(&page).contains(&heading.to_lowercase().replace(' ', "-")), "onboarding-check.md has no \"{heading}\" section");
+        assert!(page.contains(needle), "onboarding-check.md doesn't mention {needle}");
+    }
+}
+
+/// ADR 0131, 0243: the support bundle's page lists every file `support::build` writes,
+/// and so does the README inside the bundle.
+#[test]
+fn the_support_bundle_page_lists_every_file_in_it() {
+    let code = fs::read_to_string(repo().join("server/src/support.rs")).unwrap();
+    let build = code.split("pub fn build(").nth(1).unwrap().split("\n}\n").next().unwrap();
+    let files: Vec<&str> = quoted_before(build, ", ").into_iter().filter(|n| n.contains('.')).collect();
+    assert!(files.len() >= 10 && files.contains(&"onboarding.json") && files.contains(&"manifest.json"), "the bundle's files: {files:?}");
+    let page = read("support-bundle.md");
+    let readme = code.split("const README: &str = \"").nth(1).unwrap().split("\";").next().unwrap();
+    for f in files {
+        assert!(page.contains(&format!("| `{f}` |")), "support-bundle.md doesn't list {f}");
+        assert!(f == "README.txt" || readme.contains(&format!("  {f}")), "the bundle's README.txt doesn't list {f}");
     }
 }
