@@ -822,10 +822,11 @@ fn check_rules(check: &Value, out: &mut Vec<Finding>) {
         let (Some(id), Some(status)) = (str_at(c, "id"), str_at(c, "status")) else { continue };
         let summary = str_at(c, "summary").map(clean).unwrap_or_default();
         // Down: nothing holds the lock, or it does but /healthz doesn't answer (hung, or still
-        // starting). Only "/healthz answers but no lock" is left a plain warning.
+        // starting). "/healthz answers but no lock" is left a plain warning, and a check run in
+        // a container of its own (info: it can't see botd) is no evidence either way.
         let healthz = c["details"]["healthz"].as_bool();
         let hung = (healthz == Some(false) && !c["details"]["pid"].is_null()) || summary.contains("doesn't answer");
-        let not_running = id == "botd" && status != "ok" && (healthz == Some(false) || summary.contains("isn't running") || summary.contains("doesn't answer"));
+        let not_running = id == "botd" && matches!(status, "warn" | "fail") && (healthz == Some(false) || summary.contains("isn't running") || summary.contains("doesn't answer"));
         let (lvl, sev, book) = match (id, status) {
             ("botd", _) if not_running => (Level::Fail, Some(1), "support/runbook-machine-down.md#the-server-itself"),
             ("data_dir" | "database" | "master_key", "fail") => (Level::Fail, Some(1), "support/runbook-server-restore.md"),
@@ -1457,6 +1458,11 @@ mod tests {
             check(json!([{ "id": "botd", "status": "warn", "summary": "/healthz answers on 127.0.0.1:3000, but nothing holds this DATA_DIR's lock", "details": { "pid": null, "healthz": true } }]));
         let botd = find(&triage(&offline(odd, "x\n"), &opts()).unwrap(), "check.botd").clone();
         assert_eq!((botd.level, botd.severity), (Level::Warn, None));
+        let unseen = check(
+            json!([{ "id": "botd", "status": "info", "summary": "not seen from this container: a separate container can't see the botd service's process or its loopback port", "details": { "pid": null, "healthz": false } }]),
+        );
+        let t = triage(&offline(unseen, "x\n"), &opts()).unwrap();
+        assert!(!ids(&t).contains(&"check.botd") && t.severity().is_none(), "a check from its own container is no outage");
     }
 
     #[test]
