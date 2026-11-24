@@ -159,9 +159,7 @@ impl Enrollment {
                 "MACHINE_NODE_MIRROR",
                 "MACHINE_NPM_REGISTRY",
                 "MACHINE_MIRROR_CA_FILE",
-                "MACHINE_NPM_TOKEN",
                 "MACHINE_NPM_USERNAME",
-                "MACHINE_NPM_PASSWORD",
                 "MACHINE_AGENT_UPGRADES",
                 "MACHINE_LEGACY_REBUILDS",
                 "MACHINE_HARNESS_LOGINS",
@@ -178,6 +176,11 @@ impl Enrollment {
                 "MACHINE_RUN_LIMITS",
             ] {
                 if !var(k).trim().is_empty() {
+                    return Err(format!("{k} needs MACHINE_CONTROL_URL"));
+                }
+            }
+            for k in ["MACHINE_NPM_TOKEN", "MACHINE_NPM_PASSWORD"] {
+                if store.get(k).map_err(|e| format!("{k}: {e}"))?.is_some() {
                     return Err(format!("{k} needs MACHINE_CONTROL_URL"));
                 }
             }
@@ -1855,6 +1858,14 @@ mod tests {
             )
         };
         assert!(with(&[]).unwrap().is_none(), "off unless asked");
+        let secret = crate::db::temp_path("enroll-secret");
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::write(secret.join("v"), "a-registry-login\n").unwrap();
+        let file = secret.join("v").display().to_string();
+        for (k, v) in [("MACHINE_NPM_TOKEN", "a-registry-login"), ("MACHINE_NPM_TOKEN_FILE", file.as_str()), ("MACHINE_NPM_PASSWORD_FILE", file.as_str())] {
+            let err = Enrollment::from_env(&|_| String::new(), &crate::secrets::env::EnvStore::fixed(&[(k, v)]), &cipher, &bin).err();
+            assert!(err.as_deref().is_some_and(|e| e.ends_with("needs MACHINE_CONTROL_URL")), "{k}: {err:?}");
+        }
         assert!(
             with(&[("MACHINE_AGENT_PORT", "7000")]).is_err(),
             "agent settings alone are a mistake"
@@ -1874,7 +1885,7 @@ mod tests {
         assert!(e.unit().contains("StateDirectoryMode=0700"), "{}", e.unit());
         let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443")]).unwrap().unwrap();
         assert!(e.describe().contains("teammates' own users off"), "{}", e.describe());
-        for v in ["MACHINE_HARNESS_LOGINS", "MACHINE_FOLDER_SYNC", "MACHINE_FOLDER_SYNC_MAX_MB", "MACHINE_BOT_USER", "MACHINE_TEAMMATE_USERS", "MACHINE_NPM_TOKEN", "MACHINE_NPM_USERNAME", "MACHINE_NPM_PASSWORD"] {
+        for v in ["MACHINE_HARNESS_LOGINS", "MACHINE_FOLDER_SYNC", "MACHINE_FOLDER_SYNC_MAX_MB", "MACHINE_BOT_USER", "MACHINE_TEAMMATE_USERS", "MACHINE_NPM_USERNAME"] {
             let vars: &'static [(&'static str, &'static str)] = Box::leak(Box::new([(v, "on")]));
             assert!(with(vars).is_err(), "{v} needs enrollment");
         }
