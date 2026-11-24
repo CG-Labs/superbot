@@ -5,7 +5,7 @@ The records the [policy set](policies/README.md) calls for that people keep, in 
 ## Keeping it
 
 - **Private.** The register names people, so it lives in the security owner's evidence store, never in this repository. Start from the [template](policy-register-template.json), replace every `<...>` placeholder, date and zero digest, and give each person an id that isn't their name or email (`person-1`, `p-042`): ids are all the bundle carries.
-- **As things happen.** Add a record when a role changes hands, a policy is approved, someone joins, acknowledges or trains, a risk is found or reviewed, management meets, a vendor is taken on or reviewed, an exception is approved or reviewed, a conduct concern is received, triaged or closed, or a security event is detected, triaged, notified, closed or reviewed, a tabletop is held, or production access is granted, removed or reviewed. Records are only added or closed, never rewritten: the bundle's manifest records the register's SHA-256, and the register as read is kept beside each bundle.
+- **As things happen.** Add a record when a role changes hands, a policy is approved, someone joins, acknowledges or trains, a risk is found or reviewed, management meets, a vendor is taken on or reviewed, an exception is approved or reviewed, a conduct concern is received, triaged or closed, or a security event is detected, triaged, notified, closed or reviewed, a tabletop is held, production access is granted, removed or reviewed, or a vulnerability is received, acknowledged, assessed, fixed or accepted, or a penetration test reports or retests. Records are only added or closed, never rewritten: the bundle's manifest records the register's SHA-256, and the register as read is kept beside each bundle.
 - **Checked monthly**, with the other bundles:
 
 ```sh
@@ -42,6 +42,8 @@ One JSON object. Dates are `YYYY-MM-DD` (UTC days); a record dated on or after t
 | `systems` | Production systems in the [access control policy](policies/access-control.md#scope)'s scope: `id`, `kind` (`superbot` for a managed server, `hosting` for the hosting provider, `other` by default), `since`, `until` (the day it was retired), `notes`. See [production access](#production-access). |
 | `access` | Grants of production access: `person`, `system`, `level` (`admin` or `user`), `requested`, `approved` and `approvedBy` (together; a list of people), `granted`, `removed` (the first day without it), `notes`. |
 | `accessReviews` | Quarterly reviews of each system's users: `system`, `at`, `by`, `listSha256` (the reviewed user list's SHA-256; for a managed server, the access-review report's digest), `mfa` (whether every account needs a second factor; required), `findings` (`id`, `admin`, `fixed`), `notes`. |
+| `vulnerabilities` | Vulnerabilities found outside the CI scans: `id`, `source` (`report`, `pentest`, `vendor` or `internal`), `penTest` (for `pentest`), `incident`, `received`, `acknowledged` (for `report`); `assessed`, `severity` and `owner` (together); `fixed`, or `accepted` and `acceptedBy` (together), `notes`. See [vulnerabilities and penetration tests](#vulnerabilities-and-penetration-tests). |
+| `penTests` | External penetration tests: `id`, `vendor`, `reported`, `reportSha256` (the tester's report's SHA-256), `retested` and `retestSha256` (together), `notes`. One a year. |
 
 ## Conduct concerns
 
@@ -97,4 +99,26 @@ The [access control policy](policies/access-control.md#granting-access) has prod
 - A finding's `id` is unique across the register; `admin` is set when it concerns admin access, which must be fixed within 1 business day rather than 5.
 - The bundle lists each system, grant and review by id, flags each problem above, and maps `access.json` to CC6.1-2, CC6.2-2 and CC6.3-2 only while every system in use at the period's end has been reviewed in time and has its access recorded. Never put names, emails or account names in the register's ids: `notes` never reach the bundle.
 
-The cadences are the policies' ([information security](policies/information-security.md), [vendor management](policies/vendor-management.md), [code of conduct](policies/code-of-conduct.md), [incident response](policies/incident-response.md), [access control](policies/access-control.md), [the policy set](policies/README.md#adopting-them)): a year is 365 days and a quarter 92. Change them in the policies first, then in [`register.rs`](../../server/src/bin/superbot-evidence/register.rs), whose unit tests check the template against the policies.
+## Vulnerabilities and penetration tests
+
+The [information security policy](policies/information-security.md#vulnerability-management) has every vulnerability tracked with a severity, an owner and a due date, and fixed, or accepted by the security owner or Management, within 30 days for Critical and High and 90 for the rest; [`SECURITY.md`](../../SECURITY.md) has reports acknowledged within 3 days and assessed within 10; and the policy has an external penetration test every year, its Critical and High findings retested within 30 days of the last being fixed ([ADR 0241](../adr/0241-vulnerabilities-and-penetration-tests-in-the-register.md)). The monthly [vulnerability bundle](soc2-evidence-plan.md#the-vulnerability-bundle) already covers Dependabot and code scanning alerts, so record only the rest here. The report, the advisory, the fix and the tester's documents stay in the store or the private GitHub security advisory; the register holds only what shows those happened, and when:
+
+```json
+"penTests": [{ "id": "PT-2027", "vendor": "vendor-7", "reported": "2027-05-10",
+  "reportSha256": "<sha256 of the report>", "retested": "2027-06-20", "retestSha256": "<sha256 of the retest letter>" }],
+"vulnerabilities": [
+  { "id": "V-2027-04", "source": "report", "received": "2027-03-02", "acknowledged": "2027-03-03",
+    "assessed": "2027-03-06", "severity": "high", "owner": "Engineering lead", "fixed": "2027-03-20" },
+  { "id": "V-2027-07", "source": "pentest", "penTest": "PT-2027", "received": "2027-05-10",
+    "assessed": "2027-05-12", "severity": "low", "owner": "Operator",
+    "accepted": "2027-06-01", "acceptedBy": "person-1" }]
+```
+
+- `source` is `report` (under `SECURITY.md`), `pentest` (with `penTest` naming the test), `vendor` (a vendor's advisory that affects the service) or `internal` (found by the provider, such as in a review). `incident` names the incident it was triaged as, when it was one; `vendor` names the tester when it is in `vendors`.
+- Every deadline is in calendar days from `received`, the day it was reported or found, as `SECURITY.md`'s are. `acknowledged` is the day the reporter heard back, for reports only. `assessed` is the day its `severity` (`critical`, `high`, `medium`, `low`, or `none` for not a vulnerability) was set and an `owner` role named. Until it is assessed it is held to the shortest window.
+- It is closed by `fixed` (released, or deployed to the managed service) or by `accepted` with `acceptedBy` holding or deputising the Security owner or Management role that day; the reason goes in the advisory or the risk register. One assessed as `none` is closed by being assessed.
+- A penetration test is due a year after the last, the first a year after the information security policy's first approval. Once each of its `critical` and `high` findings is fixed or accepted, a retest of the fixes is due within 30 days of the last fix; `retested` counts only if it is on or after that day.
+- Never put reporters', testers' or customers' names, or what is affected, in the register's ids: `notes` never reach the bundle, and the advisory holds the detail.
+- A register with no vulnerabilities is normal, but a year without a penetration test is not. The bundle counts vulnerabilities by severity and source, flags each acknowledgement, assessment, fix and retest late or overdue, each acceptance by someone not holding the role, and a missing penetration test. It maps `vulnerabilities.json` to CC2.3-1 and CC4.2-1 while the information security policy's approval is current, and to CC3.2-2 while there was a penetration test in the year.
+
+The cadences are the policies' ([information security](policies/information-security.md), [vendor management](policies/vendor-management.md), [code of conduct](policies/code-of-conduct.md), [incident response](policies/incident-response.md), [access control](policies/access-control.md), [the policy set](policies/README.md#adopting-them), and [`SECURITY.md`](../../SECURITY.md)): a year is 365 days and a quarter 92. Change them in the policies first, then in [`register.rs`](../../server/src/bin/superbot-evidence/register.rs), whose unit tests check the template against the policies.

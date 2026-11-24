@@ -8,7 +8,7 @@ The umbrella policy for a managed SuperBot service: who is responsible for secur
 | Approver | Management |
 | Review | Yearly, and after a significant incident or a change to the service's scope |
 | Status | Draft, not yet approved |
-| Controls | CC1.2-1, CC1.3-1, CC1.4-1, CC1.5-1, CC2.2-1, CC3.1-1, CC3.2-1, CC3.3-1, CC4.1-1, CC4.2-1, CC5.1-1, CC5.3-1 |
+| Controls | CC1.2-1, CC1.3-1, CC1.4-1, CC1.5-1, CC2.2-1, CC3.1-1, CC3.2-1, CC3.2-2, CC3.3-1, CC4.1-1, CC4.2-1, CC5.1-1, CC5.3-1 |
 
 ## Scope
 
@@ -61,7 +61,9 @@ Vulnerabilities from any source (CI scans, reports under [`SECURITY.md`](../../.
 | Critical, High | 30 days |
 | Medium, Low | 90 days |
 
-These match `SECURITY.md`. CI already fails on fixable Critical image findings and on High npm advisories, and accepted findings are listed with their reasons ([ADR 0092](../../adr/0092-dependency-vulnerability-scanning.md), [ADR 0101](../../adr/0101-image-scanning-and-signing.md), [ADR 0115](../../adr/0115-client-markdown-renderer-and-npm-audit-at-high.md)). One that is being exploited is an incident ([incident response plan](incident-response.md)). Overdue items go to the quarterly management review; each month's [vulnerability bundle](../soc2-evidence-plan.md#the-vulnerability-bundle) lists the scan findings closed late or overdue against these windows.
+These match `SECURITY.md`, and are counted in calendar days from when the vulnerability is received. One not yet assessed is held to the shortest. CI already fails on fixable Critical image findings and on High npm advisories, and accepted findings are listed with their reasons ([ADR 0092](../../adr/0092-dependency-vulnerability-scanning.md), [ADR 0101](../../adr/0101-image-scanning-and-signing.md), [ADR 0115](../../adr/0115-client-markdown-renderer-and-npm-audit-at-high.md)). One that is being exploited is an incident ([incident response plan](incident-response.md)). Only the security owner or management accepts a vulnerability rather than fixing it. Overdue items go to the quarterly management review; each month's [vulnerability bundle](../soc2-evidence-plan.md#the-vulnerability-bundle) lists the scan findings closed late or overdue against these windows.
+
+The service has an external penetration test at least yearly, the first within a year of this policy's approval. Its Critical and High findings are retested within 30 days of the last of them being fixed, and the retest report kept. Vulnerabilities from outside the CI scans (reports, penetration tests, vendors and internal reviews) and the penetration tests are recorded in the [policy register](../policy-register.md#vulnerabilities-and-penetration-tests), which checks them against these deadlines.
 
 ## People
 
