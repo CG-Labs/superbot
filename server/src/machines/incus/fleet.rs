@@ -670,6 +670,13 @@ impl MachineProvider for Fleet {
         })
     }
 
+    fn team_network_unlisted<'a>(&'a self, net: &'a TeamNetwork) -> Fut<'a, usize> {
+        Box::pin(async move {
+            let (m, n) = self.route(&net.id)?;
+            m.incus.team_network_unlisted(&TeamNetwork { id: n.into(), subnet_id: n.into(), ..net.clone() }).await
+        })
+    }
+
     fn hosts(&self) -> Option<&dyn Hosts> {
         Some(self)
     }
