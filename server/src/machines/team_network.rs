@@ -28,7 +28,7 @@
 //! The network of a team this server deleted is removed once nothing is on it (ADR
 //! 0236): its machines have left it as any leaver's do, and nothing else, ours or
 //! anyone's, is on it. A team is known to be one this server deleted from its own
-//! record of the teams it deleted, kept whatever audit retention prunes (ADR 0249), so
+//! record of the teams it deleted, kept whatever audit retention prunes (ADR 0251), so
 //! another control plane's networks on the same account are never touched. On Incus
 //! its ACL and its name on the project's access list go too. `botctl machine
 //! team-networks` lists every team network, whose it is and what of ours is on it.
@@ -757,7 +757,7 @@ pub(crate) async fn leave(app: &AppState, cp: &ControlPlane, p: &dyn MachineProv
     }
 }
 
-/// `GET /api/machines/team-networks` (ADR 0249): every team network at the provider,
+/// `GET /api/machines/team-networks` (ADR 0251): every team network at the provider,
 /// whose it is (a team here, a team this server deleted, or no team it knows: another
 /// server's), which of our machines are on it, and how many other things are on it or
 /// use it, which keep it from being removed. Read now, changing nothing.
