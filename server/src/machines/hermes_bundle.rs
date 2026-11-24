@@ -1,15 +1,19 @@
-//! Hermes bundles (ADR 0200) on users' machines (ADR 0210). botd reads each one it
-//! serves at start, and an agent unpacks the one botd sends, with the checks
-//! `deploy/install.sh` makes before it installs one on a server. Shared by the agent
-//! binary and botd, so it uses nothing of botd's.
+//! Hermes bundles (ADR 0200) and harness bundles (ADR 0232) on users' machines (ADR
+//! 0210, ADR 0242). botd reads each one it serves at start, and an agent unpacks the one
+//! botd sends, with the checks `deploy/install.sh` makes before it installs one on a
+//! server. Shared by the agent binary and botd, so it uses nothing of botd's but `wire`.
 //!
-//! A bundle is a gzipped tar of one `superbot-hermes-<tag>-<arch>/` folder holding
-//! `MANIFEST`, `SHA256SUMS` and `hermes.tar`: Hermes Agent as its own installer left it
-//! with HOME=/opt/hermes, in one `hermes/` folder. Its tree runs there and only there.
+//! A Hermes bundle is a gzipped tar of one `superbot-hermes-<tag>-<arch>/` folder
+//! holding `MANIFEST`, `SHA256SUMS` and `hermes.tar`: Hermes Agent as its own installer
+//! left it with HOME=/opt/hermes, in one `hermes/` folder. A harness bundle is laid out
+//! the same way, as `superbot-harnesses-<version>-<arch>/` with `harnesses.tar`: Node.js
+//! with Claude Code, Codex and Pi installed into it, in one `superbot-harnesses/` folder
+//! for /opt/superbot-harnesses. Each tree runs where it was made for, and only there.
 
 // Shared by two binaries, each of which uses only part of it.
 #![allow(dead_code)]
 
+use super::wire::BundleKind;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::Metadata;
@@ -27,22 +31,66 @@ const MAX_ENTRIES: usize = 2_000_000;
 const MAX_SMALL: u64 = 64 << 10;
 /// Links followed resolving one link's target, as the kernel's limit.
 const MAX_HOPS: usize = 40;
-/// The folder everything in `hermes.tar` is in.
-pub const TOP: &str = "hermes";
 pub const ARCHES: [&str; 2] = ["x86_64", "aarch64"];
+/// Where harness bundles' wrappers, and the copy of their MANIFEST, are put in the tree:
+/// as `deploy/install.sh` does on a server, never taken from the bundle.
+pub const HARNESS_OWN: &str = "superbot";
+
+/// The folder everything in a bundle's tar is in.
+pub fn top(kind: BundleKind) -> &'static str {
+    match kind {
+        BundleKind::Hermes => "hermes",
+        BundleKind::Harnesses => "superbot-harnesses",
+    }
+}
+
+fn tar_name(kind: BundleKind) -> &'static str {
+    match kind {
+        BundleKind::Hermes => "hermes.tar",
+        BundleKind::Harnesses => "harnesses.tar",
+    }
+}
+
+/// The start of the name of a bundle's one folder.
+fn folder(kind: BundleKind) -> &'static str {
+    match kind {
+        BundleKind::Hermes => "superbot-hermes-",
+        BundleKind::Harnesses => "superbot-harnesses-",
+    }
+}
+
+fn what(kind: BundleKind) -> &'static str {
+    match kind {
+        BundleKind::Hermes => "a Hermes bundle",
+        BundleKind::Harnesses => "a harness bundle",
+    }
+}
+
+fn hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 /// What a bundle's MANIFEST says.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
+    pub kind: BundleKind,
+    /// A Hermes bundle's release tag; a harness bundle's SuperBot version.
     pub tag: String,
+    /// The Hermes commit a Hermes bundle holds. Empty for a harness bundle.
     pub commit: String,
     /// Where its tree was installed, and so the only place it runs.
     pub prefix: String,
     pub arch: String,
+    /// A harness bundle's Node.js: `<version> <sha256 of its tarball>`.
+    pub node: String,
+    /// A harness bundle's harnesses by name: `<version> <package> <integrity>`.
+    pub harnesses: BTreeMap<String, String>,
+    /// The MANIFEST as it is.
+    pub text: String,
 }
 
 impl Manifest {
-    pub fn parse(text: &str) -> Result<Manifest, String> {
+    pub fn parse(text: &str, kind: BundleKind) -> Result<Manifest, String> {
         let get = |k: &str| {
             text.lines()
                 .find_map(|l| l.strip_prefix(k)?.strip_prefix('='))
@@ -53,13 +101,47 @@ impl Manifest {
         if get("format") != "1" {
             return Err("its MANIFEST isn't format=1".into());
         }
-        if get("kind") != "hermes" {
-            return Err("its MANIFEST isn't a Hermes bundle's (kind=hermes)".into());
+        let word = match kind {
+            BundleKind::Hermes => "hermes",
+            BundleKind::Harnesses => "harnesses",
+        };
+        if get("kind") != word {
+            return Err(format!("its MANIFEST isn't {}'s (kind={word})", what(kind)));
         }
-        let commit = get("hermes_commit");
-        if commit.len() != 40 || !commit.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-            return Err(format!("hermes_commit \"{commit}\" isn't a full commit"));
-        }
+        let (mut commit, mut node, mut harnesses) = (String::new(), String::new(), BTreeMap::new());
+        let tag = match kind {
+            BundleKind::Hermes => {
+                commit = get("hermes_commit");
+                if commit.len() != 40 || !commit.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                    return Err(format!("hermes_commit \"{commit}\" isn't a full commit"));
+                }
+                get("hermes_tag")
+            }
+            BundleKind::Harnesses => {
+                let tag = get("version");
+                if tag.is_empty() {
+                    return Err("its MANIFEST has no version".into());
+                }
+                node = get("node");
+                if !node.split_once(' ').is_some_and(|(v, sha)| !v.is_empty() && !v.contains(' ') && hex64(sha)) {
+                    return Err(format!("node \"{node}\" isn't \"<version> <sha256>\""));
+                }
+                for name in get("harnesses").split_whitespace() {
+                    if !name.starts_with(|c: char| c.is_ascii_lowercase()) || !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+                        return Err(format!("its MANIFEST names a harness \"{name}\""));
+                    }
+                    let pin = get(&format!("harness_{name}"));
+                    if pin.split(' ').count() != 3 || pin.split(' ').any(str::is_empty) {
+                        return Err(format!("harness_{name} \"{pin}\" isn't \"<version> <package> <integrity>\""));
+                    }
+                    harnesses.insert(name.to_string(), pin);
+                }
+                if harnesses.is_empty() {
+                    return Err("its MANIFEST names no harnesses".into());
+                }
+                tag
+            }
+        };
         let arch = get("arch");
         if !ARCHES.contains(&arch.as_str()) {
             return Err(format!("arch \"{arch}\" isn't x86_64 or aarch64"));
@@ -68,7 +150,12 @@ impl Manifest {
         if !prefix.starts_with('/') || prefix.len() < 2 || prefix.ends_with('/') || Path::new(&prefix).components().any(|c| matches!(c, Component::ParentDir | Component::CurDir)) {
             return Err(format!("prefix \"{prefix}\" isn't a folder"));
         }
-        Ok(Manifest { tag: get("hermes_tag"), commit, prefix, arch })
+        Ok(Manifest { kind, tag, commit, prefix, arch, node, harnesses, text: text.to_string() })
+    }
+
+    /// The version of `name` a harness bundle holds.
+    pub fn harness_version(&self, name: &str) -> Option<&str> {
+        self.harnesses.get(name).and_then(|p| p.split(' ').next())
     }
 }
 
@@ -90,12 +177,12 @@ impl<R: Read> Read for Hashing<R> {
     }
 }
 
-/// `p` as a path in `hermes.tar` may be: `hermes`, or relative under it, with no `..`.
-fn inside(p: &Path) -> Option<PathBuf> {
+/// `p` as a path in a bundle's tar may be: `top`, or relative under it, with no `..`.
+fn inside(p: &Path, top: &str) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for (i, c) in p.components().enumerate() {
         match c {
-            Component::Normal(s) if i > 0 || s == TOP => out.push(s),
+            Component::Normal(s) if i > 0 || s == top => out.push(s),
             _ => return None,
         }
     }
@@ -103,18 +190,19 @@ fn inside(p: &Path) -> Option<PathBuf> {
 }
 
 /// Reads the bundle at `file`, checking that it is one `superbot-hermes-*` folder of
-/// `MANIFEST`, `SHA256SUMS` and `hermes.tar`, each file matching `SHA256SUMS`, and
-/// `hermes.tar` holding only files, folders and links under `hermes/`, none setuid or
-/// setgid, with hard links only to its own files. With `into` (an empty folder), it
-/// also unpacks the tree there, as `into/hermes`. Answers its MANIFEST and the SHA-256
-/// of the whole file. The symbolic links' targets are checked once unpacked
-/// (`tree_ok`).
-pub fn read(file: &Path, into: Option<&Path>) -> Result<(Manifest, String), String> {
+/// `MANIFEST`, `SHA256SUMS` and `hermes.tar` (for a harness bundle, `superbot-harnesses-*`
+/// and `harnesses.tar`), each file matching `SHA256SUMS`, and the tar holding only files,
+/// folders and links under one `top(kind)` folder, none setuid or setgid, with hard links
+/// only to its own files. With `into` (an empty folder), it also unpacks the tree there,
+/// as `into/<top>`. Answers its MANIFEST and the SHA-256 of the whole file. The symbolic
+/// links' targets are checked once unpacked (`tree_ok`).
+pub fn read(file: &Path, kind: BundleKind, into: Option<&Path>) -> Result<(Manifest, String), String> {
     let f = std::fs::File::open(file).map_err(|e| format!("{}: {e}", file.display()))?;
     let raw = Hashing { inner: io::BufReader::new(f), hash: Sha256::new() };
     let mut outer = tar::Archive::new(flate2::read::GzDecoder::new(raw));
-    let not_one = || "it isn't a Hermes bundle (one superbot-hermes-* folder of plain files)".to_string();
-    let mut top: Option<String> = None;
+    let (tar_name, top) = (tar_name(kind), top(kind));
+    let not_one = || format!("it isn't {} (one {}* folder of plain files)", what(kind), folder(kind));
+    let mut one: Option<String> = None;
     let mut got: BTreeMap<String, String> = BTreeMap::new();
     let (mut manifest, mut sums) = (None, None);
     let entries = outer.entries().map_err(|e| format!("it can't be read: {e}"))?;
@@ -129,10 +217,10 @@ pub fn read(file: &Path, into: Option<&Path>) -> Result<(Manifest, String), Stri
             })
             .collect::<Result<_, _>>()?;
         let Some(first) = parts.first() else { return Err(not_one()) };
-        if !first.starts_with("superbot-hermes-") || top.as_ref().is_some_and(|t| t != first) {
+        if !first.starts_with(folder(kind)) || one.as_ref().is_some_and(|t| t != first) {
             return Err(not_one());
         }
-        top = Some(first.clone());
+        one = Some(first.clone());
         match (parts.len(), e.header().entry_type()) {
             (1, tar::EntryType::Directory) => continue,
             (2, tar::EntryType::Regular) => {}
@@ -143,10 +231,10 @@ pub fn read(file: &Path, into: Option<&Path>) -> Result<(Manifest, String), Stri
             return Err(format!("it holds {name} twice"));
         }
         let sum = match name.as_str() {
-            "hermes.tar" => {
+            n if n == tar_name => {
                 let mut h = Hashing { inner: &mut e, hash: Sha256::new() };
-                unpack(&mut h, into).map_err(|e| format!("hermes.tar {e}"))?;
-                io::copy(&mut h, &mut io::sink()).map_err(|e| format!("hermes.tar can't be read: {e}"))?;
+                unpack(&mut h, top, into).map_err(|e| format!("{tar_name} {e}"))?;
+                io::copy(&mut h, &mut io::sink()).map_err(|e| format!("{tar_name} can't be read: {e}"))?;
                 hex(h.hash.finalize())
             }
             "MANIFEST" | "SHA256SUMS" => {
@@ -160,7 +248,7 @@ pub fn read(file: &Path, into: Option<&Path>) -> Result<(Manifest, String), Stri
                 if name == "MANIFEST" { manifest = Some(text) } else { sums = Some(text) }
                 sum
             }
-            _ => return Err(format!("it holds {name}, which a Hermes bundle doesn't")),
+            _ => return Err(format!("it holds {name}, which {} doesn't", what(kind))),
         };
         got.insert(name, sum);
     }
@@ -169,8 +257,8 @@ pub fn read(file: &Path, into: Option<&Path>) -> Result<(Manifest, String), Stri
     let whole = hex(raw.hash.finalize());
     let sums = sums.ok_or("it has no SHA256SUMS")?;
     let manifest = manifest.ok_or("it has no MANIFEST")?;
-    if !got.contains_key("hermes.tar") {
-        return Err("it has no hermes.tar".into());
+    if !got.contains_key(tar_name) {
+        return Err(format!("it has no {tar_name}"));
     }
     let mut listed = BTreeMap::new();
     for line in sums.lines().filter(|l| !l.trim().is_empty()) {
@@ -188,7 +276,7 @@ pub fn read(file: &Path, into: Option<&Path>) -> Result<(Manifest, String), Stri
     if let Some(name) = listed.keys().next() {
         return Err(format!("its SHA256SUMS lists {name}, which it doesn't hold"));
     }
-    Ok((Manifest::parse(&manifest)?, whole))
+    Ok((Manifest::parse(&manifest, kind)?, whole))
 }
 
 /// Makes each folder of `rel` under `root` that is missing, and fails if one there
@@ -207,10 +295,10 @@ fn real_dirs(root: &Path, rel: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Checks each entry of `hermes.tar`, and with `into`, writes it there. Links are made
-/// last, hard links first, so no path is ever resolved through a link this made; and
-/// folders get their own modes once everything in them is written.
-fn unpack(r: impl Read, into: Option<&Path>) -> Result<(), String> {
+/// Checks each entry of a bundle's tar, all under `top`, and with `into`, writes it
+/// there. Links are made last, hard links first, so no path is ever resolved through a
+/// link this made; and folders get their own modes once everything in them is written.
+fn unpack(r: impl Read, top: &str, into: Option<&Path>) -> Result<(), String> {
     let mut a = tar::Archive::new(r);
     let (mut hard, mut soft, mut dirs) = (Vec::new(), Vec::new(), Vec::new());
     let (mut size, mut count) = (0u64, 0usize);
@@ -222,7 +310,7 @@ fn unpack(r: impl Read, into: Option<&Path>) -> Result<(), String> {
             return Err(format!("holds over {MAX_ENTRIES} entries"));
         }
         let path = e.path().map_err(|e| format!("can't be read: {e}"))?.into_owned();
-        let rel = inside(&path).ok_or("holds files outside one hermes/ folder, or a path with ..")?;
+        let rel = inside(&path, top).ok_or(format!("holds files outside one {top}/ folder, or a path with .."))?;
         let mode = e.header().mode().map_err(|e| format!("can't be read: {e}"))?;
         if mode & 0o6000 != 0 {
             return Err(format!("holds a setuid or setgid file: {}", rel.display()));
@@ -235,7 +323,7 @@ fn unpack(r: impl Read, into: Option<&Path>) -> Result<(), String> {
             tar::EntryType::Regular | tar::EntryType::Directory => None,
             _ => return Err("holds devices, pipes or other special files".into()),
         };
-        if kind == tar::EntryType::Link && link.as_deref().and_then(inside).is_none() {
+        if kind == tar::EntryType::Link && link.as_deref().and_then(|l| inside(l, top)).is_none() {
             return Err(format!("holds a hard link to a file outside it: {}", rel.display()));
         }
         let Some(root) = into else { continue };
@@ -257,7 +345,7 @@ fn unpack(r: impl Read, into: Option<&Path>) -> Result<(), String> {
                     let _ = f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(t));
                 }
             }
-            tar::EntryType::Link => hard.push((rel, link.and_then(|l| inside(&l)).unwrap_or_default())),
+            tar::EntryType::Link => hard.push((rel, link.and_then(|l| inside(&l, top)).unwrap_or_default())),
             _ => soft.push((rel, link.unwrap_or_default())),
         }
     }
@@ -431,7 +519,68 @@ pub fn open_up(root: &Path, readable: &[String], bin: &str) -> Result<(), String
     Ok(())
 }
 
-/// Bundles for tests, as `deploy/offline-bundle.sh hermes` packs them.
+/// The program `<dir>/superbot/<bin>` runs: the CLI with the tree's own Node.js first on
+/// PATH, whatever the host has, or none. Byte for byte what `deploy/install.sh` writes on
+/// a server (`harness_wrapper`), for a tree in `dir`.
+pub fn harness_wrapper(bin: &str, dir: &Path) -> String {
+    let dir = dir.display();
+    format!(
+        "#!/bin/sh\n\
+         # {bin} from SuperBot's harness bundle (docs/adr/0232-harness-cli-bundle-for-air-gapped-servers.md),\n\
+         # on its own Node.js. Claude Code's updater can't change this root-owned tree, and has no network.\n\
+         PATH={dir}/bin:$PATH\n\
+         DISABLE_AUTOUPDATER=1\n\
+         export PATH DISABLE_AUTOUPDATER\n\
+         exec {dir}/bin/{bin} \"$@\"\n"
+    )
+}
+
+/// The file in a harness tree that names the bundle it came from, by its SHA-256.
+fn marker(tree: &Path) -> PathBuf {
+    tree.join(HARNESS_OWN).join("bundle.sha256")
+}
+
+/// Whether the harness tree at `dest` came from the bundle with SHA-256 `sha256`, so
+/// another harness it holds needs no new download.
+pub fn harness_tree_from(dest: &Path, sha256: &str) -> bool {
+    std::fs::read_to_string(marker(dest)).is_ok_and(|s| s.trim() == sha256)
+}
+
+/// Readies an unpacked, checked harness tree (`tree`) to run from `dest`, as
+/// `deploy/install.sh` does: it must have Node.js, each harness its MANIFEST names, and no
+/// `superbot` folder of its own; in that folder go each harness's wrapper, the MANIFEST
+/// and the bundle's SHA-256.
+pub fn ready_harness_tree(tree: &Path, dest: &Path, m: &Manifest, sha256: &str) -> Result<(), String> {
+    let own = tree.join(HARNESS_OWN);
+    if std::fs::symlink_metadata(&own).is_ok() {
+        return Err(format!("its tree has a {HARNESS_OWN} folder, which is SuperBot's"));
+    }
+    let node = tree.join("bin/node");
+    if !std::fs::symlink_metadata(&node).is_ok_and(|n| n.file_type().is_file() && n.mode() & 0o111 != 0) {
+        return Err("its tree has no bin/node".into());
+    }
+    std::fs::DirBuilder::new().mode(0o755).create(&own).map_err(|e| format!("{}: {e}", own.display()))?;
+    let write = |name: &str, body: &str, mode: u32| {
+        let p = own.join(name);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&p)
+            .and_then(|mut f| io::Write::write_all(&mut f, body.as_bytes()))
+            .map_err(|e| format!("{}: {e}", p.display()))
+    };
+    for name in m.harnesses.keys() {
+        if std::fs::symlink_metadata(tree.join("bin").join(name)).is_err() {
+            return Err(format!("its tree has no bin/{name}"));
+        }
+        write(name, &harness_wrapper(name, dest), 0o755)?;
+    }
+    write("MANIFEST", &m.text, 0o644)?;
+    write("bundle.sha256", &format!("{sha256}\n"), 0o644)
+}
+
+/// Bundles for tests, as `deploy/offline-bundle.sh hermes` and `harnesses` pack them.
 #[cfg(test)]
 pub mod standin {
     use super::*;
@@ -538,6 +687,51 @@ pub mod standin {
             None,
         )
     }
+
+    /// A harness bundle's MANIFEST for `arch` and `prefix`, with `pins`: its
+    /// `harnesses=`, `node=` and `harness_<bin>=` lines, as `harness_manifest_lines`
+    /// writes them.
+    pub fn harness_manifest(arch: &str, prefix: &str, pins: &str) -> String {
+        format!("format=1\nkind=harnesses\nversion=0.1.0\nprefix={prefix}\narch={arch}\n{pins}commit=unknown\n")
+    }
+
+    /// `pins` for `clis` (bin, version), on a made-up Node.js and packages.
+    pub fn harness_pins(clis: &[(&str, &str)]) -> String {
+        let names: Vec<&str> = clis.iter().map(|(b, _)| *b).collect();
+        let mut s = format!("harnesses={}\nnode=22.23.5 {}\n", names.join(" "), "a".repeat(64));
+        for (b, v) in clis {
+            s.push_str(&format!("harness_{b}={v} @standin/{b} sha512-{}==\n", "A".repeat(86)));
+        }
+        s
+    }
+
+    /// A harness tree as `npm install -g --prefix` leaves it, in small: Node.js, and each
+    /// of `clis` (bin, version) in `lib/node_modules`, linked from `bin/` by a relative
+    /// link, answering `--version` with its version.
+    pub fn harness_tree(clis: &[(&str, &str)]) -> Vec<u8> {
+        let top = "superbot-harnesses";
+        let mut dirs = vec![top.to_string(), format!("{top}/bin"), format!("{top}/lib"), format!("{top}/lib/node_modules")];
+        let mut files = vec![(format!("{top}/bin/node"), "#!/bin/sh\necho v22.23.5\n".to_string())];
+        let mut links = vec![];
+        for (b, v) in clis {
+            dirs.push(format!("{top}/lib/node_modules/{b}"));
+            files.push((format!("{top}/lib/node_modules/{b}/cli.js"), format!("#!/bin/sh\necho '{v} ({b})'\n")));
+            links.push((format!("{top}/bin/{b}"), format!("../lib/node_modules/{b}/cli.js")));
+        }
+        let mut items: Vec<Item> = dirs.iter().map(|d| Item::Dir(d, 0o755)).collect();
+        items.extend(files.iter().map(|(p, b)| Item::File(p, 0o755, b.as_bytes())));
+        items.extend(links.iter().map(|(p, t)| Item::Symlink(p, t)));
+        tar(&items)
+    }
+
+    /// A harness bundle for `arch` holding `clis`, with a MANIFEST of `pins`.
+    pub fn good_harnesses(arch: &str, clis: &[(&str, &str)], pins: &str) -> Vec<u8> {
+        bundle(
+            &format!("superbot-harnesses-0.1.0-{arch}"),
+            &[("MANIFEST", harness_manifest(arch, "/opt/superbot-harnesses", pins).into_bytes()), ("harnesses.tar", harness_tree(clis))],
+            None,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -546,7 +740,8 @@ mod tests {
     use super::*;
 
     fn temp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("superbot-hb-{name}-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let thread = format!("{:?}", std::thread::current().id()).replace(|c: char| !c.is_ascii_alphanumeric(), "");
+        let d = std::env::temp_dir().join(format!("superbot-hb-{name}-{}-{thread}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -567,14 +762,15 @@ mod tests {
         let dir = temp("good");
         let body = good("x86_64", "#!/bin/sh\necho hermes\n");
         let f = file(&dir, &body);
-        let (m, sha) = read(&f, None).unwrap();
-        assert_eq!(m, Manifest { tag: "v0.23.3".into(), commit: COMMIT.into(), prefix: "/opt/hermes".into(), arch: "x86_64".into() });
+        let (m, sha) = read(&f, BundleKind::Hermes, None).unwrap();
+        assert_eq!((m.kind, m.tag.as_str(), m.commit.as_str(), m.prefix.as_str(), m.arch.as_str()), (BundleKind::Hermes, "v0.23.3", COMMIT, "/opt/hermes", "x86_64"));
+        assert!(m.harnesses.is_empty() && m.node.is_empty() && m.text.contains("kind=hermes"));
         assert_eq!(sha, hex(Sha256::digest(&body)), "the SHA-256 of the whole file");
         assert!(!dir.join("hermes").exists(), "nothing is written without a folder");
 
         let into = dir.join("into");
         std::fs::create_dir(&into).unwrap();
-        read(&f, Some(&into)).unwrap();
+        read(&f, BundleKind::Hermes, Some(&into)).unwrap();
         let t = into.join("hermes");
         assert_eq!(std::fs::read(t.join(".hermes/superbot/hermes")).unwrap(), b"#!/bin/sh\necho hermes\n");
         assert_eq!(mode(&t.join(".hermes/installs/k/facts.json")), 0o600);
@@ -596,12 +792,12 @@ mod tests {
         let m = || manifest(COMMIT, "x86_64", "/opt/hermes").into_bytes();
         let refused = |body: Vec<u8>, why: &str| {
             let f = file(&dir, &body);
-            let err = read(&f, None).unwrap_err();
+            let err = read(&f, BundleKind::Hermes, None).unwrap_err();
             assert!(err.contains(why), "{why}: {err}");
             let into = dir.join("into");
             let _ = std::fs::remove_dir_all(&into);
             std::fs::create_dir(&into).unwrap();
-            assert!(read(&f, Some(&into)).is_err(), "{why}, unpacking");
+            assert!(read(&f, BundleKind::Hermes, Some(&into)).is_err(), "{why}, unpacking");
         };
         let with = |items: &[Item]| bundle(top, &[("MANIFEST", m()), ("hermes.tar", tar(items))], None);
         let dir_ = Item::Dir("hermes", 0o755);
@@ -649,7 +845,7 @@ mod tests {
             let into = dir.join("into");
             let _ = std::fs::remove_dir_all(&into);
             std::fs::create_dir(&into).unwrap();
-            let res = read(&f, Some(&into)).and_then(|_| tree_ok(&into.join("hermes"), "/opt/hermes"));
+            let res = read(&f, BundleKind::Hermes, Some(&into)).and_then(|_| tree_ok(&into.join("hermes"), "/opt/hermes"));
             assert!(res.is_err());
             assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "nothing was written outside");
         }
@@ -704,7 +900,7 @@ mod tests {
         let f = file(&dir, &good("x86_64", "#!/bin/sh\n"));
         let into = dir.join("into");
         std::fs::create_dir(&into).unwrap();
-        read(&f, Some(&into)).unwrap();
+        read(&f, BundleKind::Hermes, Some(&into)).unwrap();
         let t = into.join("hermes");
         std::fs::set_permissions(t.join(".local/share"), std::fs::Permissions::from_mode(0o777)).unwrap();
         open_up(&t, &[".hermes/installs".into(), ".local/share/uv".into(), ".hermes/tools".into()], ".hermes/superbot/hermes").unwrap();
@@ -717,6 +913,90 @@ mod tests {
         assert_eq!(mode(&t.join(".local/share")), 0o755, "nothing stays writable by others");
         assert_eq!(mode(&t.join(".hermes/superbot")), 0o755, "the folder of the program Bots run");
         assert_eq!(mode(&t.join(".hermes/superbot/hermes")), 0o755);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    const CLIS: [(&str, &str); 2] = [("claude", "2.1.329"), ("codex", "0.171.0")];
+
+    #[test]
+    fn a_harness_bundle_is_read_unpacked_and_readied_as_install_sh_does() {
+        let dir = temp("harnesses");
+        let pins = harness_pins(&CLIS);
+        let body = good_harnesses("x86_64", &CLIS, &pins);
+        let f = file(&dir, &body);
+        let (m, sha) = read(&f, BundleKind::Harnesses, None).unwrap();
+        assert_eq!((m.kind, m.tag.as_str(), m.prefix.as_str(), m.arch.as_str()), (BundleKind::Harnesses, "0.1.0", "/opt/superbot-harnesses", "x86_64"));
+        assert_eq!(m.node, format!("22.23.5 {}", "a".repeat(64)));
+        assert_eq!(m.harnesses.keys().collect::<Vec<_>>(), ["claude", "codex"]);
+        assert_eq!(m.harness_version("codex"), Some("0.171.0"));
+        assert_eq!(m.harness_version("pi"), None);
+        assert!(read(&f, BundleKind::Hermes, None).unwrap_err().contains("isn't a Hermes bundle"), "one kind isn't read as the other");
+
+        let into = dir.join("into");
+        std::fs::create_dir(&into).unwrap();
+        read(&f, BundleKind::Harnesses, Some(&into)).unwrap();
+        let t = into.join("superbot-harnesses");
+        tree_ok(&t, "/opt/superbot-harnesses").unwrap();
+        let dest = dir.join("opt/superbot-harnesses");
+        assert!(!harness_tree_from(&t, &sha));
+        ready_harness_tree(&t, &dest, &m, &sha).unwrap();
+        assert!(harness_tree_from(&t, &sha) && !harness_tree_from(&t, &"b".repeat(64)));
+        assert_eq!(std::fs::read_to_string(t.join("superbot/MANIFEST")).unwrap(), m.text);
+        assert_eq!(std::fs::read_to_string(t.join("superbot/claude")).unwrap(), harness_wrapper("claude", &dest));
+        assert_eq!(mode(&t.join("superbot/codex")), 0o755);
+        assert!(harness_wrapper("claude", &dest).contains(&format!("exec {}/bin/claude \"$@\"\n", dest.display())));
+        assert!(ready_harness_tree(&t, &dest, &m, &sha).unwrap_err().contains("superbot folder"), "never twice, nor over the bundle's own");
+
+        // The wrapper runs the CLI on the tree's Node.js, wherever the tree is.
+        std::fs::remove_dir_all(t.join("superbot")).unwrap();
+        ready_harness_tree(&t, &t, &m, &sha).unwrap();
+        let out = std::process::Command::new(t.join("superbot/codex")).arg("--version").env_clear().output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0.171.0 (codex)", "{}", String::from_utf8_lossy(&out.stderr));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn harness_bundles_that_arent_what_they_say_are_refused() {
+        let dir = temp("harnesses-bad");
+        let top = "superbot-harnesses-0.1.0-x86_64";
+        let pins = harness_pins(&CLIS);
+        let m = |pins: &str| harness_manifest("x86_64", "/opt/superbot-harnesses", pins).into_bytes();
+        let refused = |body: Vec<u8>, why: &str| {
+            let err = read(&file(&dir, &body), BundleKind::Harnesses, None).unwrap_err();
+            assert!(err.contains(why), "{why}: {err}");
+        };
+        let tree = harness_tree(&CLIS);
+        refused(bundle(top, &[("MANIFEST", m(&pins)), ("hermes.tar", tree.clone())], None), "which a harness bundle doesn't");
+        refused(bundle(top, &[("MANIFEST", m(&pins))], None), "no harnesses.tar");
+        refused(bundle("superbot-hermes-v1-x86_64", &[("MANIFEST", m(&pins)), ("harnesses.tar", tree.clone())], None), "one superbot-harnesses-* folder");
+        refused(bundle(top, &[("MANIFEST", m(&pins)), ("harnesses.tar", tar(&[Item::File("hermes/x", 0o644, b"")]))], None), "outside one superbot-harnesses/ folder");
+        refused(bundle(top, &[("MANIFEST", manifest(COMMIT, "x86_64", "/opt/superbot-harnesses").into_bytes()), ("harnesses.tar", tree.clone())], None), "kind=harnesses");
+        for (bad, why) in [
+            (pins.replace("harnesses=claude codex", "harnesses="), "names no harnesses"),
+            (pins.replace("harnesses=claude codex", "harnesses=claude Codex"), "a harness \"Codex\""),
+            (pins.replace("harness_codex=0.171.0 ", "harness_codex="), "harness_codex"),
+            (pins.lines().filter(|l| !l.starts_with("harness_claude=")).map(|l| format!("{l}\n")).collect(), "harness_claude \"\""),
+            (pins.replace(&"a".repeat(64), "abc"), "node \"22.23.5 abc\""),
+        ] {
+            refused(bundle(top, &[("MANIFEST", m(&bad)), ("harnesses.tar", tree.clone())], None), why);
+        }
+        let no_version = harness_manifest("x86_64", "/opt/superbot-harnesses", &pins).replace("version=0.1.0\n", "");
+        refused(bundle(top, &[("MANIFEST", no_version.into_bytes()), ("harnesses.tar", tree.clone())], None), "no version");
+
+        // A tree missing what its MANIFEST names, or Node.js, isn't readied.
+        let unpack = |clis: &[(&str, &str)], pins: &str| {
+            let f = file(&dir, &good_harnesses("x86_64", clis, pins));
+            let into = dir.join("into");
+            let _ = std::fs::remove_dir_all(&into);
+            std::fs::create_dir(&into).unwrap();
+            let (m, sha) = read(&f, BundleKind::Harnesses, Some(&into)).unwrap();
+            (into.join("superbot-harnesses"), m, sha)
+        };
+        let (t, m, sha) = unpack(&CLIS[..1], &pins);
+        assert!(ready_harness_tree(&t, &t, &m, &sha).unwrap_err().contains("no bin/codex"));
+        let (t, m, sha) = unpack(&CLIS, &pins);
+        std::fs::remove_file(t.join("bin/node")).unwrap();
+        assert!(ready_harness_tree(&t, &t, &m, &sha).unwrap_err().contains("no bin/node"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

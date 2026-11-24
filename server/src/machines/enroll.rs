@@ -1330,6 +1330,24 @@ async fn hermes_bundle(
     super::hermes_serve::body(&b.file).await.unwrap_or_else(|e| reply(StatusCode::INTERNAL_SERVER_ERROR, &e))
 }
 
+/// `GET /v1/harnesses/{arch}`: a harness bundle from MACHINE_HARNESS_BUNDLE (ADR 0242),
+/// for enrolled machines only, as Hermes bundles are: Claude Code, Codex and Pi are
+/// their makers' builds, not code botd publishes.
+async fn harness_bundle(
+    AxState(p): AxState<Arc<Port>>,
+    Extension(peer): Extension<Peer>,
+    Path(arch): Path<String>,
+) -> Response {
+    let id = peer.cert.as_ref().and_then(|der| p.app.db.machine_cert(&pki::fingerprint(der))).map(|c| c.machine_id);
+    if let Err(r) = authenticate(&p, &peer, id.as_deref().unwrap_or_default()) {
+        return r;
+    }
+    let Some(b) = p.e.upkeep.harness_bundle.as_ref().and_then(|h| h.by_arch.get(&arch)) else {
+        return reply(StatusCode::NOT_FOUND, "This server serves no harness bundle for that arch (MACHINE_HARNESS_BUNDLE).");
+    };
+    super::hermes_serve::body(&b.file).await.unwrap_or_else(|e| reply(StatusCode::INTERNAL_SERVER_ERROR, &e))
+}
+
 /// `GET /v1/npm-login`: MACHINE_NPM_REGISTRY's login (ADR 0219), for enrolled machines
 /// only, asked for each time one installs an npm harness. Audited, since it hands out a
 /// credential; the event names the kind, never the value.
@@ -1445,6 +1463,7 @@ pub fn router(app: AppState, e: Arc<Enrollment>, api: Option<Api>) -> axum::Rout
         .route("/v1/botctl", get(botctl_binary))
         .route("/v1/voxl", get(voxl_binary))
         .route("/v1/hermes/{arch}", get(hermes_bundle))
+        .route("/v1/harnesses/{arch}", get(harness_bundle))
         .route("/v1/npm-login", get(npm_login))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(Arc::new(Port { app, e, api }))
