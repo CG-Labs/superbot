@@ -508,6 +508,9 @@ pub struct Directory {
     running: tokio::sync::Mutex<()>,
     last: std::sync::Mutex<Option<Value>>,
     last_success: std::sync::Mutex<Option<Value>>,
+    /// Each listed role group's Directory id, by email, as the latest pass that read them
+    /// found them (ADR 0253).
+    role_group_ids: std::sync::Mutex<HashMap<String, String>>,
     pub push: push::Push,
 }
 
@@ -530,7 +533,7 @@ impl Directory {
         let loopback = url::Url::parse(&settings.api).ok().and_then(|u| u.host_str().map(crate::is_loopback_host)).unwrap_or(false);
         let http = reqwest::Client::builder().https_only(!loopback).connect_timeout(CONNECT_TIMEOUT).timeout(TIMEOUT).redirect(reqwest::redirect::Policy::none()).build().map_err(|e| e.to_string())?;
         let push = push::Push::new(settings.push.clone(), settings.push_groups);
-        Ok(Directory { settings, key, http, running: tokio::sync::Mutex::new(()), last: std::sync::Mutex::new(None), last_success: std::sync::Mutex::new(None), push })
+        Ok(Directory { settings, key, http, running: tokio::sync::Mutex::new(()), last: std::sync::Mutex::new(None), last_success: std::sync::Mutex::new(None), role_group_ids: Default::default(), push })
     }
 
     pub fn describe(&self) -> String {
@@ -715,6 +718,16 @@ impl Directory {
             "lastSuccess": *self.last_success.lock().unwrap(),
             "push": self.push.status(),
         })
+    }
+
+    /// The listed role groups no declaration matches now, the way a pass matches them: by
+    /// Directory id (known once a pass has read the group) or by email.
+    pub fn undeclared(&self, app: &AppState) -> Vec<String> {
+        let (tenant, ids) = (self.settings.tenant.as_str(), self.role_group_ids.lock().unwrap().clone());
+        let declared = |email: &String| {
+            ids.get(email).is_some_and(|id| app.db.scim_role_group_find(tenant, Some(id), None).is_some()) || app.db.scim_role_group_find(tenant, None, Some(email)).is_some()
+        };
+        self.settings.role_groups.iter().filter(|e| !declared(e)).cloned().collect()
     }
 }
 
@@ -1290,8 +1303,10 @@ async fn push_role_groups(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Call
     let ca = || Extension(c.clone());
     let mut seen: HashSet<&str> = HashSet::new();
     let mut wanted = Vec::new();
+    let mut ids = HashMap::new();
     for key in &d.settings.role_groups {
         let Some(g) = snap.groups.get(key) else { continue };
+        ids.insert(key.clone(), g.id.clone());
         if !seen.insert(g.id.as_str()) {
             continue;
         }
@@ -1306,6 +1321,7 @@ async fn push_role_groups(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Call
         members.dedup();
         wanted.push((key, g, declared, members));
     }
+    *d.role_group_ids.lock().unwrap() = ids;
     for x in role_groups::all_pushed(app, tenant).into_iter().filter(|x| !x.external_id.as_deref().is_some_and(|e| seen.contains(e))) {
         let path = format!("/Groups/{}", x.id);
         let ok = t.note(app, c, "DELETE", &path, groups::delete(st(), ex(), ca(), Path(x.id.clone())).await);

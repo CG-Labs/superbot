@@ -37,6 +37,38 @@ fn role_ref(role: Option<&CustomRole>) -> Value {
     role.map_or(Value::Null, |r| json!({ "id": r.id, "name": r.name }))
 }
 
+/// Whether a mapping or role group may give `role` in `scope`: never one that reaches
+/// admins there, nor a time-bound one (ADR 0197). The routes that save one check the
+/// same, and the database again as it saves.
+pub(crate) fn givable(role: &CustomRole, scope: &str) -> bool {
+    role.max_days.is_none() && reaching(role, scope).is_empty()
+}
+
+/// The custom roles SCIM may give in each scope, with what each gives there, for the
+/// console's pickers (ADR 0253).
+pub(crate) fn role_choices(app: &AppState) -> Value {
+    let roles = app.db.custom_roles();
+    let pick = |scope: &str| roles.iter().filter(|r| givable(r, scope)).map(|r| json!({ "id": r.id, "name": r.name, "applies": applies(r, scope) })).collect::<Vec<_>>();
+    json!({ "org": pick(ORG), "team": pick(TEAM) })
+}
+
+/// What an admin may map now: the roles, and each team group with the scopes it has no
+/// mapping in yet (one mapping per group and scope).
+fn choices(app: &AppState, maps: &[ScimRoleMapping]) -> Value {
+    let groups: Vec<Value> = app
+        .db
+        .all_scim_groups()
+        .iter()
+        .filter_map(|g| {
+            let free: Vec<&str> = [TEAM, ORG].into_iter().filter(|s| !maps.iter().any(|m| m.team_id == g.team_id && m.scope == *s)).collect();
+            (!free.is_empty()).then(|| {
+                json!({ "tenant": g.tenant, "team": { "id": g.team_id, "name": app.db.team(&g.team_id).map(|t| t.name) }, "displayName": g.display_name, "scopes": free })
+            })
+        })
+        .collect();
+    json!({ "roles": role_choices(app), "groups": groups })
+}
+
 fn view(app: &AppState, m: &ScimRoleMapping) -> Value {
     let role = app.db.custom_role(&m.role_id);
     json!({
@@ -217,10 +249,12 @@ fn refused(app: &AppState, by: &Who, reason: &str, details: Value, msg: String) 
     bad(msg)
 }
 
-/// `GET /api/scim/role-mappings`: every mapping, and whether SCIM_GROUP_ROLES is on.
+/// `GET /api/scim/role-mappings`: every mapping, whether SCIM_GROUP_ROLES is on, and
+/// `choices`: the groups and roles a new mapping may name.
 pub async fn list(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>) -> Json<Value> {
-    let all: Vec<Value> = app.db.scim_role_mappings().iter().map(|m| view(&app, m)).collect();
-    Json(json!({ "enabled": a.scim.group_roles, "groups": a.scim.groups, "mappings": all }))
+    let maps = app.db.scim_role_mappings();
+    let all: Vec<Value> = maps.iter().map(|m| view(&app, m)).collect();
+    Json(json!({ "enabled": a.scim.group_roles, "groups": a.scim.groups, "mappings": all, "choices": choices(&app, &maps) }))
 }
 
 /// `POST /api/scim/role-mappings {team, role, scope?: "team" | "org"}`: maps the group

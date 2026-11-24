@@ -126,6 +126,65 @@ async fn role_groups_are_off_by_default_and_never_reach_admins() {
     assert_eq!(scim(port, &t, "GET", &format!("{GROUPS}/{}", g["id"].as_str().unwrap()), Value::Null).await.0, 404);
 }
 
+fn names(v: &Value) -> Vec<&str> {
+    v.as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect()
+}
+
+/// The console offers only what the routes take (ADR 0253): each scope's roles are exactly
+/// the ones a mapping and a role group may give there, and a group's mapped scopes go.
+#[tokio::test]
+async fn choices_offer_exactly_what_mappings_and_role_groups_take() {
+    let (port, _, admin) = serve(true).await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "entra" })).await;
+    let perms: [(&str, &[&str], Option<i64>); 5] = [
+        ("Auditor", &["audit.view"], None),
+        ("Bot keeper", &["bots.manage"], None),
+        ("Machine keeper", &["machines.manage"], None),
+        ("Help desk", &["users.manage"], None),
+        ("Break glass", &["audit.view"], Some(7)),
+    ];
+    let mut ids = Vec::new();
+    for (name, p, days) in perms {
+        let (code, v) = json_call(port, "POST", "/api/roles", &admin, &json!({ "name": name, "base": "member", "permissions": p, "maxDays": days }).to_string()).await;
+        assert_eq!(code, 201, "{v}");
+        ids.push((name, v["id"].as_str().unwrap().to_string()));
+    }
+    let (_, v) = json_call(port, "GET", ROLE_GROUPS, &admin, "").await;
+    let offered = v["choices"]["roles"].clone();
+    assert_eq!(names(&offered["org"]), ["Auditor", "Help desk"], "{offered}");
+    assert_eq!(names(&offered["team"]), ["Auditor", "Bot keeper", "Help desk"], "{offered}");
+    let applies: Vec<Value> = offered["team"].as_array().unwrap().iter().map(|r| r["applies"].clone()).collect();
+    assert_eq!(applies, [json!([]), json!([]), json!(["users.manage"])], "with what each gives there: only team permissions count in a team");
+    assert_eq!(v["choices"]["tenants"], json!(["entra"]), "tenants with a token");
+    assert_eq!(v["choices"]["undeclared"], json!([]), "no Google sync");
+    let (_, m) = json_call(port, "GET", "/api/scim/role-mappings", &admin, "").await;
+    assert_eq!(m["choices"]["roles"], offered, "the same roles for mappings");
+    assert_eq!(m["choices"]["groups"], json!([]), "no team groups yet");
+
+    for (i, (name, id)) in ids.iter().enumerate() {
+        let team = push(port, &t, &format!("Team {i}"), &[]).await;
+        for scope in ["org", "team"] {
+            let shown = names(&offered[scope]).contains(name);
+            let (code, v) = declare(port, &admin, json!({ "tenant": "okta", "displayName": format!("{name} {scope}"), "role": id, "scope": scope })).await;
+            assert_eq!(code == 201, shown, "a role group of {name} in {scope}: {v}");
+            let (code, v) = json_call(port, "POST", "/api/scim/role-mappings", &admin, &json!({ "team": team, "role": id, "scope": scope }).to_string()).await;
+            assert_eq!(code == 201, shown, "a mapping of {name} in {scope}: {v}");
+        }
+    }
+
+    let (_, v) = json_call(port, "GET", ROLE_GROUPS, &admin, "").await;
+    assert_eq!(v["choices"]["tenants"], json!(["entra", "okta"]), "and tenants with a declaration");
+    let (_, m) = json_call(port, "GET", "/api/scim/role-mappings", &admin, "").await;
+    let left: Vec<(&str, Value)> = m["choices"]["groups"].as_array().unwrap().iter().map(|g| (g["displayName"].as_str().unwrap(), g["scopes"].clone())).collect();
+    assert_eq!(
+        left,
+        [("Team 1", json!(["org"])), ("Team 2", json!(["team", "org"])), ("Team 4", json!(["team", "org"]))],
+        "a group with both scopes mapped drops out; one with a scope left offers it"
+    );
+    let g = &m["choices"]["groups"][0];
+    assert_eq!((g["tenant"].as_str(), g["team"]["name"].as_str()), (Some("entra"), Some("Team 1")), "{g}");
+}
+
 #[tokio::test]
 async fn a_pushed_role_group_overlaps_teams_and_gives_the_role_across_the_server() {
     let (port, app, admin) = serve(true).await;
