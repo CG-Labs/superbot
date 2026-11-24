@@ -3,7 +3,8 @@
 //! roles, admins, second factors), the versions deployed and configuration changes,
 //! backup and restore runs, retention settings and passes, sign-in and alert events, a
 //! summary of the period's audit log with a digest, the configuration baseline checked
-//! when it was made (ADR 0195), and a manifest with every file's
+//! when it was made (ADR 0195), the audit log's own integrity checks and export over the
+//! period (ADR 0261), and a manifest with every file's
 //! SHA-256. Made on request by `GET /api/evidence/bundle` (admins), which `botctl evidence
 //! bundle` saves, and, with `EVIDENCE_BUNDLES=monthly`, by botd itself for each month
 //! into `EVIDENCE_DIR`, with retention. Each bundle is audited with its digests.
@@ -36,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Bumped when a file's shape changes, so tools reading bundles can tell them apart.
-pub const FORMAT: u32 = 2;
+pub const FORMAT: u32 = 3;
 pub const CREATED: &str = "evidence.bundle_created";
 pub const FAILED: &str = "evidence.bundle_failed";
 pub const PRUNED: &str = "evidence.bundles_pruned";
@@ -154,6 +155,10 @@ of createdAt, which is after the period.
   baseline.json             each setting of the configuration baseline as botd ran when
                             this bundle was made: meets it, doesn't, excepted, not
                             applicable, or for a person to judge (ADR 0195)
+  audit-integrity.json      the audit log's hash chain checks, signed checkpoints and
+                            export in the period: each check, the gaps past their
+                            deadlines, whether every export took every event, and the
+                            last checkpoint to pin the period's events (ADR 0261)
   manifest.json             what is in this bundle, the period, and each file's SHA-256
   SHA256SUMS                the same digests, for `sha256sum -c SHA256SUMS`
 
@@ -169,7 +174,7 @@ fn date_of(ms: i64) -> NaiveDate {
     chrono::DateTime::from_timestamp_millis(ms).map(|t| t.date_naive()).unwrap_or_default()
 }
 
-fn rfc3339(ms: i64) -> String {
+pub(crate) fn rfc3339(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms).map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_default()
 }
 
@@ -190,7 +195,7 @@ pub fn period_of(file: &str) -> Option<Period> {
 
 // What leaves the audit log
 
-fn matches(pattern: &str, action: &str) -> bool {
+pub(crate) fn matches(pattern: &str, action: &str) -> bool {
     match (pattern.strip_prefix('*'), pattern.strip_suffix('*')) {
         (Some(suffix), _) => action.ends_with(suffix),
         (_, Some(prefix)) => action.starts_with(prefix),
@@ -288,15 +293,15 @@ fn sha256(b: &[u8]) -> String {
 // Reading the period's audit log once
 
 #[derive(Default)]
-struct Tally {
-    counts: BTreeMap<String, BTreeMap<String, u64>>,
+pub(crate) struct Tally {
+    pub(crate) counts: BTreeMap<String, BTreeMap<String, u64>>,
     daily: BTreeMap<String, BTreeMap<String, u64>>,
     events: Vec<Value>,
     total: u64,
 }
 
 impl Tally {
-    fn add(&mut self, e: &AuditEvent) {
+    pub(crate) fn add(&mut self, e: &AuditEvent) {
         *self.counts.entry(e.action.clone()).or_default().entry(e.outcome.clone()).or_default() += 1;
         let day = e.time.get(..10).unwrap_or_default().to_string();
         *self.daily.entry(day).or_default().entry(format!("{} {}", e.action, e.outcome)).or_default() += 1;
@@ -306,7 +311,7 @@ impl Tally {
         self.total += 1;
     }
 
-    fn view(&self) -> Value {
+    pub(crate) fn view(&self) -> Value {
         json!({
             "counts": self.counts,
             "daily": self.daily,
@@ -330,8 +335,8 @@ struct Scan {
 }
 
 /// The period's audit events, oldest first, a page at a time: counted, digested, and
-/// each matching section's tally fed.
-fn scan(app: &App, p: &Period) -> Scan {
+/// each matching section's tally and `audit-integrity.json`'s checks fed.
+fn scan(app: &App, p: &Period, integrity: &mut crate::evidence_integrity::Integrity) -> Scan {
     let mut hash = Sha256::new();
     let mut s = Scan { total: 0, first_id: None, last_id: None, digest: String::new(), truncated: false, starts: Vec::new(), all: BTreeMap::new(), sections: SECTIONS.iter().map(|_| Tally::default()).collect() };
     let mut after = None;
@@ -352,6 +357,7 @@ fn scan(app: &App, p: &Period) -> Scan {
                     t.add(e);
                 }
             }
+            integrity.feed(e);
         }
         if (page.len() as i64) < PAGE {
             break;
@@ -543,7 +549,9 @@ pub struct Bundle {
 /// The whole bundle for `p`, as botd's database stands at `now_ms`.
 pub fn build(app: &App, inputs: &Inputs, p: &Period, now_ms: i64, scheduled: bool) -> Bundle {
     let name = name(p, now_ms);
-    let s = scan(app, p);
+    let mut integrity = crate::evidence_integrity::begin(app, p);
+    let s = scan(app, p, &mut integrity);
+    let (integrity, integrity_criteria, integrity_rows) = integrity.finish(app, s.last_id, now_ms);
     let tally = |file: &str| SECTIONS.iter().position(|x| x.file == file).map(|i| &s.sections[i]).expect("a section");
     let period = json!({ "from": p.from.to_string(), "to": p.to.to_string(), "days": p.days() });
     let with_period = |mut v: Value| {
@@ -559,12 +567,14 @@ pub fn build(app: &App, inputs: &Inputs, p: &Period, now_ms: i64, scheduled: boo
         ("sign-ins-and-alerts.json", json_file(with_period(tally("sign-ins-and-alerts.json").view()))),
         ("audit-summary.json", json_file(summary(app, p, &s))),
         (BASELINE_FILE, json_file(crate::baseline::run(app, inputs.mfa).view(&rfc3339(now_ms)))),
+        (crate::evidence_integrity::FILE, json_file(with_period(integrity))),
     ];
     let controls = |file: &str| -> (Vec<&str>, Vec<&str>) {
         match SECTIONS.iter().find(|x| x.file == file) {
             Some(x) => (x.criteria.to_vec(), x.rows.to_vec()),
             None if file == "audit-summary.json" => (SUMMARY_CRITERIA.to_vec(), Vec::new()),
             None if file == BASELINE_FILE => (BASELINE_CRITERIA.to_vec(), BASELINE_ROWS.to_vec()),
+            None if file == crate::evidence_integrity::FILE => (integrity_criteria.clone(), integrity_rows.clone()),
             None => (Vec::new(), Vec::new()),
         }
     };
@@ -885,7 +895,8 @@ mod tests {
         let mapping = include_str!("../../docs/security/soc2-control-mapping.md");
         let checklist = include_str!("../../docs/security/soc2-readiness-checklist.md");
         let plan = include_str!("../../docs/security/soc2-evidence-plan.md");
-        let files: Vec<(&str, Vec<&str>, Vec<&str>)> = SECTIONS.iter().map(|s| (s.file, s.criteria.to_vec(), s.rows.to_vec())).chain([("audit-summary.json", SUMMARY_CRITERIA.to_vec(), Vec::new()), (BASELINE_FILE, BASELINE_CRITERIA.to_vec(), BASELINE_ROWS.to_vec())]).collect();
+        let integrity = (crate::evidence_integrity::FILE, crate::evidence_integrity::CRITERIA.to_vec(), crate::evidence_integrity::ROWS.to_vec());
+        let files: Vec<(&str, Vec<&str>, Vec<&str>)> = SECTIONS.iter().map(|s| (s.file, s.criteria.to_vec(), s.rows.to_vec())).chain([("audit-summary.json", SUMMARY_CRITERIA.to_vec(), Vec::new()), (BASELINE_FILE, BASELINE_CRITERIA.to_vec(), BASELINE_ROWS.to_vec()), integrity]).collect();
         for (file, criteria, rows) in files {
             for c in &criteria {
                 assert!(mapping.contains(&format!("| {c} ")), "{file}: {c} isn't a criterion of the control mapping");

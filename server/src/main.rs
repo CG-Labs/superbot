@@ -83,6 +83,7 @@ mod deprovision;
 mod deprovision_http_tests;
 mod erasure;
 mod evidence;
+mod evidence_integrity;
 mod evidence_period;
 #[cfg(test)]
 mod evidence_http_tests;
