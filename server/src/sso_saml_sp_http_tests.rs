@@ -2029,6 +2029,22 @@ async fn an_app_sign_in_ends_with_the_idps_session_too() {
     assert_eq!((res["user"]["id"].as_str(), &res["session"]["expiresAt"], res["session"]["kind"].as_str()), (Some(u.id.as_str()), &json!(ends), Some("token")));
     let d = &sp.audit("auth.login").await[0]["details"];
     assert_eq!((d["idpSessionEnds"].as_i64(), d["forceAuthn"].as_bool()), (Some(ends), Some(true)));
+
+    // A code taken as a web session: its cookie ends with the session, not at SESSION_MAX_AGE.
+    let start = format!("/api/auth/sso/{}/start?session=token&redirect=superbot%3A%2F%2Fauth&challenge={}&state=st-2", sp.id, s256(&verifier));
+    let (_, head, _) = crate::tests::call_with(sp.port, "GET", &start, "", "", "").await;
+    let q: HashMap<_, _> = url::Url::parse(&header(&head, "location").unwrap()).unwrap().query_pairs().into_owned().collect();
+    let request = String::from_utf8(miniz_oxide::inflate::decompress_to_vec(&STANDARD.decode(&q["SAMLRequest"]).unwrap()).unwrap()).unwrap();
+    let ends = (db::now() + 2 * HOUR) / 1000 * 1000;
+    let mut r = Response::new(&sp.acs(), &sp.entity(), &request_id(&request), db::now());
+    r.session_not_on_or_after = Some(ends);
+    let (_, to, _) = sp.post(Some(&r.posted()), Some(&q["RelayState"]), "").await;
+    let back: HashMap<_, _> = url::Url::parse(&to).unwrap().query_pairs().into_owned().collect();
+    let body = json!({ "sso": back["code"], "verifier": verifier, "session": "cookie" }).to_string();
+    let (code, head, res) = crate::tests::call_with(sp.port, "POST", "/api/auth/login", "", "", &body).await;
+    assert_eq!(code, 200, "{res}");
+    assert_eq!(serde_json::from_str::<Value>(&res).unwrap()["session"]["expiresAt"], ends);
+    assert!((2 * 3_600 - 10..=2 * 3_600).contains(&max_age(&head)), "{head}");
 }
 
 #[tokio::test]

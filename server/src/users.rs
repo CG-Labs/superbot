@@ -426,7 +426,9 @@ pub fn session_reply(a: &Auth, user: &User, s: &Session, token: &str, extra: Val
     }
     let mut res = Json(body).into_response();
     if cookie {
-        res.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&session_cookie(token, a.sessions.max_ms)).unwrap());
+        // Whole seconds up: `created_at` is stamped a moment after `expires_at` was set.
+        let max_age = (s.expires_at - s.created_at + 999).clamp(0, a.sessions.max_ms);
+        res.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&session_cookie(token, max_age)).unwrap());
     }
     res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     res
