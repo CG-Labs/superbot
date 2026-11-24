@@ -941,11 +941,13 @@ impl Tools {
     }
 
     /// Links `h` to the harness tree in `prefix` if that came from `d` already, and
-    /// checks it answers `--version` there. False if the tree must be swapped in first.
+    /// checks it answers `--version` there. False if the tree must be swapped in first,
+    /// as it must while a swap cut short has left its stage: that tree may not have
+    /// passed its checks, and the swap puts the one before it back.
     async fn from_tree(&self, h: &HarnessInstall, d: &wire::Download, prefix: &str, bin: &str) -> Result<bool, String> {
         let dest = self.rooted(prefix);
         let target = dest.join(bin);
-        if !hermes_bundle::harness_tree_from(&dest, &d.sha256) || !runnable(&target) {
+        if swap_pending(&dest, slot(prefix)) || !hermes_bundle::harness_tree_from(&dest, &d.sha256) || !runnable(&target) {
             return Ok(false);
         }
         let manifest = dest.join(hermes_bundle::HARNESS_OWN).join("MANIFEST");
@@ -991,7 +993,12 @@ impl Tools {
             after,
             path: self.path(),
             probe: dl.join("probe"),
+            others: vec![],
         };
+        let mut swap = swap;
+        if kind == BundleKind::Harnesses {
+            swap.others = self.linked_into(&swap.dest, &h.name);
+        }
         let link = self.bin_dir().join(&h.name);
         let before = std::fs::read_link(&link).ok();
         symlink(&swap.dest.join(bin), &link)?;
@@ -1008,6 +1015,19 @@ impl Tools {
         let old = self.dir.join("scripts").join(&h.name);
         let _ = blocking(move || std::fs::remove_dir_all(old).map_err(|e| e.to_string())).await;
         Ok(())
+    }
+
+    /// The other harnesses linked into the tree at `dest`, which a new tree there
+    /// replaces for them too.
+    fn linked_into(&self, dest: &Path, name: &str) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(self.bin_dir()) else { return vec![] };
+        let mut others: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.file_name() != name && std::fs::read_link(e.path()).is_ok_and(|t| t.starts_with(dest)))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        others.sort();
+        others
     }
 
     /// Waits for a swap of `name` that outlived the agent which started it: its unit
@@ -1073,6 +1093,10 @@ pub struct Swap {
     pub path: String,
     /// An empty home for the `--version` check.
     pub probe: PathBuf,
+    /// Other harnesses that run from a harness tree at `dest` now: the new tree must
+    /// run them too, or it isn't kept.
+    #[serde(default)]
+    pub others: Vec<String>,
 }
 
 /// What a swap into `prefix` is named for: its folder (`hermes`, `superbot-harnesses`).
@@ -1091,6 +1115,13 @@ fn writable_beside(dest: &Path) -> bool {
     let Ok(c) = std::ffi::CString::new(parent.as_os_str().as_bytes()) else { return false };
     // SAFETY: `c` is a valid NUL-terminated path.
     unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
+}
+
+/// Whether a swap into `dest` was cut short and left its stage beside it.
+fn swap_pending(dest: &Path, name: &str) -> bool {
+    let mark = format!(".superbot-{name}.");
+    let Some(parent) = dest.parent() else { return false };
+    std::fs::read_dir(parent).is_ok_and(|mut entries| entries.any(|e| e.is_ok_and(|e| e.file_name().to_string_lossy().starts_with(&mark))))
 }
 
 /// What an install cut short left beside `dest`: the tree before it goes back, and the
@@ -1184,13 +1215,16 @@ async fn settle(s: &Swap, tree: &Path) -> Result<(), String> {
     }
     let (d, r, b) = (dest.clone(), s.readable.clone(), s.bin.clone());
     blocking(move || hermes_bundle::open_up(&d, &r, &b)).await?;
-    let target = dest.join(&s.bin);
-    if !runnable(&target) {
-        return Err(format!("the bundle left no program at {}", s.bin));
-    }
     std::fs::create_dir_all(&s.probe).map_err(|e| format!("{}: {e}", s.probe.display()))?;
     let env = [("PATH", s.path.clone()), ("HOME", s.probe.display().to_string()), ("LANG", "C.UTF-8".into())];
-    run_step(&target.display().to_string(), &["--version"], &env, &s.probe).await?;
+    let others = s.others.iter().map(|o| format!("{}/{o}", hermes_bundle::HARNESS_OWN));
+    for bin in std::iter::once(s.bin.clone()).chain(others) {
+        let target = dest.join(&bin);
+        if !runnable(&target) {
+            return Err(format!("the bundle left no program at {bin}"));
+        }
+        run_step(&target.display().to_string(), &["--version"], &env, &s.probe).await?;
+    }
     Ok(())
 }
 
@@ -1474,6 +1508,7 @@ mod tests {
             after: None,
             path: "/usr/bin:/bin".into(),
             probe: dir.join("probe"),
+            others: vec![],
         };
         let back: Swap = serde_json::from_slice(&serde_json::to_vec(&swap).unwrap()).unwrap();
         assert_eq!((back.dest, back.prefix, back.kind), (dest.clone(), swap.prefix.clone(), BundleKind::Hermes));
@@ -1544,6 +1579,23 @@ mod tests {
         assert!(err.contains("holds pi nothing"), "{err}");
         assert!(hermes_bundle::harness_tree_from(&dest, &sha) && run("codex") == "0.171.0 (codex)");
         assert_eq!(leftovers(), 0);
+
+        // A tree that would leave a CLI already linked to it with nothing to run isn't
+        // kept, even when the CLI being installed runs.
+        let (no_codex, no_codex_sha) = made(&[("claude", "2.2.0")]);
+        let url = serve_once(no_codex).await;
+        let err = t.install(&cli("claude", "2.2.0", &url, &no_codex_sha), None).await.unwrap_err();
+        assert!(err.contains("no program at superbot/codex"), "{err}");
+        assert_eq!((run("claude"), run("codex")), ("2.1.329 (claude)".to_string(), "0.171.0 (codex)".to_string()));
+        assert!(hermes_bundle::harness_tree_from(&dest, &sha));
+        assert_eq!(leftovers(), 0);
+
+        // A swap cut short leaves its stage: the tree in place may not have passed its
+        // checks, so the next CLI swaps it in again rather than only linking to it.
+        std::fs::create_dir_all(opt.join(".superbot-superbot-harnesses.1")).unwrap();
+        let url = serve_once(body.clone()).await;
+        assert_eq!(t.install(&cli("codex", "0.171.0", &url, &sha), None).await.unwrap(), "0.171.0");
+        assert_eq!(leftovers(), 0, "and clears the stage");
 
         // A new bundle swaps the whole tree, and the CLIs linked to it run the new one.
         let (newer, newer_sha) = made(&[("claude", "2.2.0"), ("codex", "0.171.0")]);
