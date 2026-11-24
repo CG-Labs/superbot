@@ -287,6 +287,7 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
             still_on.insert(m.id.clone());
         }
     }
+    let mut outcomes: HashMap<String, Joined> = HashMap::new();
     // A network not looked at may still have a machine to take off: never power one on
     // until every network has been. Nor join one to a network: it may be on another.
     if !unseen {
@@ -300,7 +301,6 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
                 None => {}
             }
         }
-        let mut outcomes: HashMap<String, Joined> = HashMap::new();
         if s.join != Join::Off {
             let off_all: Vec<&Machine> = ours.values().filter(|m| !on_one.contains(&m.id)).collect();
             for m in off_all {
@@ -316,22 +316,6 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
                 outcomes.insert(m.id.clone(), j);
             }
         }
-        // Powered off to join: on again once given the interface, refused it, or no longer
-        // due one; just powered off, or still on its way off at the provider, it waits,
-        // but not for ever.
-        let at = now();
-        let held: Vec<(String, i64)> = join_off(cp).iter().map(|(id, when)| (id.clone(), *when)).collect();
-        for (id, since) in held {
-            if matches!(outcomes.get(&id), Some(Joined::GoingOff | Joined::Restarting)) && at - since < JOIN_OFF_MS {
-                continue;
-            }
-            join_off(cp).remove(&id);
-            match resume(app, cp, &id).await {
-                Some(true) => resumed += 1,
-                Some(false) => errors += 1,
-                None => {}
-            }
-        }
         if s.join == Join::WhenIdle {
             for (n, team, m) in &to_boot {
                 let d = json!({ "team": team, "networkId": n.id, "label": n.label, "subnet": n.subnet });
@@ -341,6 +325,28 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
                     Restart::Failed => errors += 1,
                 }
             }
+        }
+    }
+    // Powered off to join: on again once given the interface, refused it, or no longer
+    // due one. Just powered off, or still on its way off at the provider, it waits, but
+    // not for ever, even while some network can't be read: it was on none when botd
+    // powered it off. Once timed out, it waits for its owner to power it off instead.
+    let at = now();
+    let held: Vec<(String, i64)> = join_off(cp).iter().map(|(id, when)| (id.clone(), *when)).collect();
+    for (id, since) in held {
+        let not_yet = unseen || matches!(outcomes.get(&id), Some(Joined::GoingOff | Joined::Restarting));
+        let timed_out = at - since >= JOIN_OFF_MS;
+        if not_yet && !timed_out {
+            continue;
+        }
+        join_off(cp).remove(&id);
+        if not_yet {
+            gave_up(app, cp, &id, s);
+        }
+        match resume(app, cp, &id).await {
+            Some(true) => resumed += 1,
+            Some(false) => errors += 1,
+            None => {}
         }
     }
     let mut out = json!({});
@@ -529,8 +535,25 @@ fn refusals(cp: &ControlPlane) -> std::sync::MutexGuard<'_, HashMap<String, Stri
     cp.network_join_refused.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Records that `id`, powered off to be given its interface, wasn't off at the provider
+/// in time: audited once, as a refusal, so it isn't powered off again for this.
+fn gave_up(app: &AppState, cp: &ControlPlane, id: &str, s: &Settings) {
+    let Some(m) = app.db.machine(id) else { return };
+    let why = format!("it wasn't off at the provider within {} minutes", JOIN_OFF_MS / 60_000);
+    if refusals(cp).insert(m.id.clone(), why.clone()).as_deref() != Some(why.as_str()) {
+        let d = json!({ "team": app.db.team_id_of(&m.user_id), "join": s.join.as_str(), "error": why });
+        app.db.record(&event(&system(&m), "machine.team_network_joining", &m, d).outcome(Outcome::Failure));
+    }
+}
+
 fn join_off(cp: &ControlPlane) -> std::sync::MutexGuard<'_, HashMap<String, i64>> {
     cp.network_join_off.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// As if every machine powered off to join had been so for `ms` longer.
+#[cfg(test)]
+pub fn age_held_joins(cp: &ControlPlane, ms: i64) {
+    join_off(cp).values_mut().for_each(|since| *since -= ms);
 }
 
 // The team network's subnet in machines' own egress rules (ADR 0202).

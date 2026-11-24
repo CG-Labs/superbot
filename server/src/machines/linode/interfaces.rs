@@ -450,7 +450,7 @@ mod tests {
         .await;
         w.lock().unwrap().devices = vec![(1, FW, "linode_interface", 111, 11), (2, FW, "linode", 13, 13), (3, 78, "linode_interface", 121, 12), (4, FW, "nodebalancer", 3, 3)];
         let d = api.firewall_devices(&FW.to_string()).await.unwrap();
-        assert_eq!((d.machines.clone(), d.others), (vec!["13".to_string()], 2), "11 is only partly behind; the NodeBalancer is another's");
+        assert_eq!((d.machines.clone(), d.partly.clone(), d.others), (vec!["13".to_string()], vec!["11".to_string()], 1), "11 is only partly behind; the NodeBalancer is another's");
         for (m, want) in [("11", false), ("12", false), ("13", true), ("14", false), ("99", false)] {
             assert_eq!(api.firewall_covers(&FW.to_string(), m).await.unwrap(), want, "{m}");
         }
@@ -459,7 +459,7 @@ mod tests {
         api.attach_firewall(&FW.to_string(), "11").await.unwrap();
         assert!(api.firewall_covers(&FW.to_string(), "11").await.unwrap());
         let d = api.firewall_devices(&FW.to_string()).await.unwrap();
-        assert_eq!((d.machines, d.others), (vec!["13".to_string(), "11".to_string()], 1));
+        assert_eq!((d.machines, d.partly, d.others), (vec!["13".to_string(), "11".to_string()], vec![], 1));
         let posted: Vec<Value> = w.lock().unwrap().seen.iter().filter(|s| s.1.ends_with("/devices")).map(|s| s.2.clone()).collect();
         assert_eq!(posted, [json!({ "id": 112, "type": "linode_interface" })], "only the one not behind yet");
         api.attach_firewall(&FW.to_string(), "11").await.unwrap();

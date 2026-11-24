@@ -157,6 +157,9 @@ pub struct ProviderFirewall {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FirewallDevices {
     pub machines: Vec<String>,
+    /// Our machines only some of whose interfaces are behind it, where each takes a
+    /// firewall of its own (ADR 0226): still on it, and the rest go behind it too.
+    pub partly: Vec<String>,
     pub others: usize,
 }
 

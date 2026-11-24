@@ -28,6 +28,8 @@ pub struct FakeFirewall {
     pub foreign: bool,
     pub enabled: bool,
     pub machines: BTreeSet<String>,
+    /// Machines with Linode interfaces only some of which are behind it (ADR 0226).
+    pub partly: BTreeSet<String>,
     /// Devices that aren't machines, e.g. a NodeBalancer someone put behind it.
     pub others: usize,
 }
@@ -85,7 +87,7 @@ fn refused(message: &str) -> ProviderError {
 
 impl State {
     fn firewall_of(&self, machine: &str) -> Option<&FakeFirewall> {
-        self.firewalls.values().find(|f| f.machines.contains(machine))
+        self.firewalls.values().find(|f| f.machines.contains(machine) || f.partly.contains(machine))
     }
 }
 
@@ -221,6 +223,7 @@ impl Fake {
                 foreign: true,
                 enabled: true,
                 machines: machines.iter().map(|m| m.to_string()).collect(),
+                partly: BTreeSet::new(),
                 others: 0,
             },
         );
@@ -594,6 +597,7 @@ impl MachineProvider for Fake {
                     foreign: false,
                     enabled: true,
                     machines: BTreeSet::new(),
+                    partly: BTreeSet::new(),
                     others: 0,
                 };
                 let v = view(&f);
@@ -628,6 +632,7 @@ impl MachineProvider for Fake {
                 let f = s.firewalls.get(id).ok_or(ProviderError::NotFound)?;
                 Ok(FirewallDevices {
                     machines: f.machines.iter().cloned().collect(),
+                    partly: f.partly.iter().cloned().collect(),
                     others: f.others,
                 })
             })
@@ -642,6 +647,13 @@ impl MachineProvider for Fake {
                 }
                 if !s.machines.contains_key(machine) {
                     return Err(refused("id: Linode not found"));
+                }
+                // As Linode's: the rest of its interfaces go behind the one it's partly behind.
+                if s.firewalls[id].partly.contains(machine) {
+                    let f = s.firewalls.get_mut(id).unwrap();
+                    f.partly.remove(machine);
+                    f.machines.insert(machine.into());
+                    return Ok(());
                 }
                 if s.firewall_of(machine).is_some() {
                     return Err(refused("This Linode already has an active Firewall."));
@@ -661,6 +673,7 @@ impl MachineProvider for Fake {
             self.with("detach_firewall", |s| {
                 if let Some(f) = s.firewalls.get_mut(id) {
                     f.machines.remove(machine);
+                    f.partly.remove(machine);
                 }
                 Ok(())
             })

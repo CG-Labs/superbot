@@ -45,8 +45,8 @@ Every create now says which kind it wants, so the account's default never decide
 
 ### The firewall
 
-- **Covered.** A machine with Linode interfaces counts as behind the firewall only if every public and VPC interface it has is behind it. If any is not, or it has none, it is not. A new provider check, `firewall_covers`, asks this for one machine. The machines' firewall sweep and the team network's checks use it. The firewall's device list groups `linode_interface` devices by their Linode, read from the device's parent or URL. A Linode only partly covered counts as some other device, so the firewall is never released while it is still on one of its interfaces.
-- **Attach.** The sweep attaches the firewall to each public and VPC interface not yet behind it. A machine with none is refused, with the reason.
+- **Covered.** A machine with Linode interfaces counts as behind the firewall only if every public and VPC interface it has is behind it. If any is not, or it has none, it is not. A new provider check, `firewall_covers`, asks this for one machine. The machines' firewall sweep and the team network's checks use it. The firewall's device list groups `linode_interface` devices by their Linode, read from the device's parent or URL. A Linode only partly covered is listed apart (`partly`), and the firewall is never released while it is still on one of its interfaces.
+- **Attach.** The sweep attaches the firewall to each public and VPC interface not yet behind it. A machine with none is refused, with the reason. A machine partly behind an older firewall of botd's (one made under another `MACHINE_LABEL_PREFIX`, ADR 0035) gets the rest of its interfaces behind that one, not the current one, since Linode won't put an interface behind a second firewall.
 - **Detach.** Detaching removes every device of the machine, on the Linode or on any of its interfaces.
 
 ### Joining while off
@@ -55,7 +55,7 @@ The rules-first order of ADR 0202 is unchanged. The machine's egress rules must 
 
 - **Off.** botd adds the VPC interface once the provider says the machine is off, not just when botd has asked for it. It is audited `machine.team_network_joining` with `whileOff: true`. The interface has the firewall the public interface is behind, which is the machines' firewall (checked first). A machine already on another VPC, with no public interface, or whose public interface has no enabled firewall, is refused with the reason, audited once.
 - **Running, `MACHINE_TEAM_NETWORK_JOIN=next-boot`.** It waits until its owner or an admin powers it off. botd doesn't power it off for this. The sweep counts it as `awaitingPowerOff`.
-- **Running, `when-idle`.** Once its agent says it runs nothing, botd powers it off (`machine.team_network_restarting` with `toJoin: true`). Once it is off at the provider, botd adds the interface and powers it on again, onto the network. botd powers it on again whatever happens: if the interface is refused, if the owner leaves the team meanwhile, or if it isn't off after 10 minutes. A machine refused once isn't powered off again for this. It waits, as with `next-boot`, until botd restarts.
+- **Running, `when-idle`.** Once its agent says it runs nothing, botd powers it off (`machine.team_network_restarting` with `toJoin: true`). Once it is off at the provider, botd adds the interface and powers it on again, onto the network. botd powers it on again whatever happens: if the interface is refused, if the owner leaves the team meanwhile, or if it isn't off after 10 minutes. The 10 minutes hold even while some team network can't be read, which otherwise holds back every power-on: the machine was on no network when botd powered it off. A machine refused once, or not off in time (audited as a refusal), isn't powered off again for this. It waits, as with `next-boot`, until botd restarts.
 - **Running, `off`.** Nothing joins, as before.
 
 Which machines botd powered off to join is kept in memory, as other joins are (ADR 0202). If botd restarts in between, the machine stays off until its owner powers it on.
@@ -87,7 +87,8 @@ Which machines botd powered off to join is kept in memory, as other joins are (A
 - **End to end** (`machines_team_network_tests.rs`, the in-memory provider, which now refuses to add or remove a Linode interface while the machine is on):
   - Under `next-boot`, a running machine waits (`awaitingPowerOff`), is never powered off by botd, waits again while its provider still says it is shutting down, joins once off, is left off, and uses the network from its next boot.
   - A leaver is powered off, taken off and powered on again. A Linode interface not in use yet is still taken off only while off.
-  - Under `when-idle`, an idle machine is powered off, held off until its provider says it is off, given its interface, and powered on. When refused, it is powered on again without the interface and not powered off again for it. Powered off by its owner later, it joins and is left off.
+  - Under `when-idle`, an idle machine is powered off, held off until its provider says it is off (also while another network can't be read), given its interface, and powered on. When refused, it is powered on again without the interface and not powered off again for it. Powered off by its owner later, it joins and is left off. One never seen off is powered on again after 10 minutes, even while a network can't be read, audited as a refusal, and not powered off again.
+- **Firewall sweep** (`machines_lockdown_tests.rs`): a machine partly behind an older firewall gets the rest behind that one, not the current one.
 
 ## Deferred
 

@@ -921,8 +921,8 @@ impl MachineProvider for Linode {
     }
 
     /// A Linode with Linode interfaces counts as covered only once every public and
-    /// VPC interface it has is behind the firewall; one only partly behind counts among
-    /// `others`, so the sweep attaches the rest (ADR 0226).
+    /// VPC interface it has is behind the firewall; one only partly behind is `partly`,
+    /// so the sweep attaches the rest to this firewall, not another (ADR 0226).
     fn firewall_devices<'a>(&'a self, id: &'a str) -> Fut<'a, FirewallDevices> {
         Box::pin(async move {
             let mut out = FirewallDevices::default();
@@ -939,7 +939,8 @@ impl MachineProvider for Linode {
             for (linode, behind) in by_linode {
                 match self.linode_interfaces(&linode).await {
                     Ok(all) if interfaces::all_behind(&all, &behind) => out.machines.push(linode),
-                    Ok(_) | Err(ProviderError::NotFound) => out.others += 1,
+                    Ok(_) => out.partly.push(linode),
+                    Err(ProviderError::NotFound) => out.others += 1,
                     Err(e) => return Err(e),
                 }
             }
@@ -1521,6 +1522,7 @@ mod tests {
             api.firewall_devices("77").await.unwrap(),
             FirewallDevices {
                 machines: vec!["7".into()],
+                partly: Vec::new(),
                 others: 1
             },
             "Linodes by id; anything else counted"

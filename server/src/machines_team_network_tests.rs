@@ -564,6 +564,13 @@ async fn with_when_idle_a_machine_with_linode_interfaces_is_powered_off_to_join_
     env.fake.set(&pid, |m| m.status = "shutting_down".into());
     assert_eq!(reconcile(&env).await, json!({ "waiting": 1 }), "still on its way off: held off");
     assert_eq!(state(&env), State::Suspended);
+    // Held off too while some other network can't be read, until it times out (below).
+    let stray = team_network::label("superbot", "another-team", "gb-lon").unwrap();
+    env.fake.ensure_team_network(&stray, "gb-lon", team_network::DEFAULT_SUBNET).await.unwrap();
+    let unreadable = || crate::machines::provider::ProviderError::Api { status: 500, message: "try later".into() };
+    env.fake.fail_next("team_network_members", unreadable());
+    assert_eq!(reconcile(&env).await, json!({ "errors": 1 }));
+    assert_eq!(state(&env), State::Suspended);
     env.fake.set(&pid, |m| m.status = "offline".into());
     assert_eq!(reconcile(&env).await, json!({ "joining": 1, "resumed": 1 }));
     assert_eq!(state(&env), State::Running);
@@ -594,4 +601,28 @@ async fn with_when_idle_a_machine_with_linode_interfaces_is_powered_off_to_join_
     assert_eq!(code, 200);
     assert_eq!(reconcile(&env).await, json!({ "joining": 1 }), "off by her hand: given it, and left off");
     assert_eq!((state(&env), env.fake.joining(&pid).as_deref()), (State::Suspended, Some(net.as_str())));
+    assert_eq!(mtls::json_call(&env, "POST", &format!("/api/users/{cy}/machine/resume"), "").await.0, 200);
+    assert_eq!(reconcile(&env).await, json!({ "joined": 1 }));
+
+    // Once more: this time it never shows as off, and a network can't be read when its
+    // time is up. It is powered on again without the interface, and not powered off
+    // again for it.
+    member(&env, "DELETE").await;
+    assert_eq!(reconcile(&env).await, json!({ "leaving": 1 }));
+    assert_eq!(reconcile(&env).await, json!({ "left": 1, "resumed": 1 }));
+    rules(&env, None).await;
+    member(&env, "PUT").await;
+    rules(&env, Some(team_network::DEFAULT_SUBNET)).await;
+    assert_eq!(reconcile(&env).await, json!({ "restarting": 1 }));
+    env.fake.set(&pid, |m| m.status = "shutting_down".into());
+    team_network::age_held_joins(&env.cp, 11 * 60_000);
+    env.fake.fail_next("team_network_members", unreadable());
+    assert_eq!(reconcile(&env).await, json!({ "errors": 1, "resumed": 1 }));
+    assert_eq!((state(&env), env.fake.network_of(&pid)), (State::Running, None));
+    let failed: Vec<Value> = mtls::events(&env, "machine.team_network_joining").await.into_iter().filter(|e| e["outcome"] == "failure").collect();
+    assert!(failed[0]["details"]["error"].as_str().unwrap().contains("wasn't off at the provider within 10 minutes"), "{failed:?}");
+    for _ in 0..2 {
+        assert_eq!(reconcile(&env).await, json!({ "awaitingPowerOff": 1 }));
+    }
+    assert_eq!(mtls::events(&env, "machine.team_network_restarting").await.len(), 3);
 }
