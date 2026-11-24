@@ -306,6 +306,32 @@ impl Provider {
         matches!(self.kind, Kind::SamlSp { .. })
     }
 
+    /// What signing in here reaches, as `(setting, URL, what it is)`: the setting is the
+    /// `SSO_<ID>_...` that names the URL, or would if it weren't the default (`botd offline
+    /// check`, ADR 0257). Native SAML adds the loaded metadata's sign-in and logout URLs; with
+    /// metadata saved by botctl, which isn't loaded yet, it has only those it can name.
+    pub fn reaches(&self) -> Vec<(String, String, &'static str)> {
+        let key = |k: &str| format!("SSO_{}_{k}", self.id.to_ascii_uppercase());
+        match &self.kind {
+            Kind::Entra { authority, .. } => vec![(key("AUTHORITY"), authority.clone(), "authority")],
+            Kind::Google { issuer, .. } | Kind::Oidc { issuer, .. } | Kind::Apple { issuer, .. } | Kind::Saml { issuer, .. } => vec![(key("ISSUER"), issuer.clone(), "issuer")],
+            Kind::GitHub { web, api, .. } => vec![(key("URL"), web.clone(), "sign-in page"), (key("API_URL"), api.clone(), "API")],
+            Kind::SamlSp { source, .. } => {
+                let (mut out, from) = match source {
+                    IdpSource::Url(url) => (vec![(key("IDP_METADATA_URL"), url.clone(), "metadata")], key("IDP_METADATA_URL")),
+                    IdpSource::File(_) => (Vec::new(), key("IDP_METADATA_FILE")),
+                    IdpSource::Saved => return Vec::new(),
+                };
+                if let Some(m) = self.idp_loaded() {
+                    out.push((from.clone(), m.sso_url.clone(), "sign-in page"));
+                    out.extend(m.slo.iter().map(|s| (from.clone(), s.location.clone(), "logout page")));
+                    out.extend(m.slo_soap.iter().map(|u| (from.clone(), u.clone(), "back-channel logout")));
+                }
+                out
+            }
+        }
+    }
+
     /// Native SAML has no client secret: it checks signatures with the IdP's certificates.
     pub fn needs_secret(&self) -> bool {
         !self.saml_sp()

@@ -61,6 +61,11 @@ fn site_ok(s: &str) -> bool {
     DOMAINS.contains(&domain) && letters.len() == 2 && letters.bytes().all(|b| b.is_ascii_lowercase()) && (1..=2).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// The Logs API's intake for `site`, such as `https://http-intake.logs.datadoghq.eu`.
+pub(crate) fn intake(site: &str) -> String {
+    format!("https://http-intake.logs.{site}")
+}
+
 fn intake_url(base: &str) -> String {
     format!("{base}/api/v2/logs")
 }
@@ -80,7 +85,7 @@ impl Datadog {
         if !site_ok(&site) {
             return Err(bad(&format!("\"{site}\" isn't a Datadog site (datadoghq.com, us3.datadoghq.com, us5.datadoghq.com, datadoghq.eu, ap1.datadoghq.com, ap2.datadoghq.com, uk1.datadoghq.com, ddog-gov.com, ...: the site in your Datadog URL, without app.)")));
         }
-        let url = intake_url(&format!("https://http-intake.logs.{site}"));
+        let url = intake_url(&intake(&site));
         Ok(Datadog { site, url, key: None, key_from: String::new(), tags: None })
     }
 

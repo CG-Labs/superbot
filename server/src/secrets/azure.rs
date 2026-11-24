@@ -156,10 +156,7 @@ fn sign_in_settings(var: &dyn Fn(&str) -> String, store: &dyn SecretStore, metho
         }
         other => return Err(format!("{method_var} must be managed-identity, client-secret or workload-identity, not {other:?}")),
     };
-    let authority = match var("AZURE_AUTHORITY_HOST").trim() {
-        "" => AUTHORITY.to_string(),
-        a => http::base_url("AZURE_AUTHORITY_HOST", a, AUTHORITY)?,
-    };
+    let authority = authority_setting(var)?;
     let identity = match (var("IDENTITY_ENDPOINT").trim(), var("IDENTITY_HEADER")) {
         ("", _) => Identity::Imds(IMDS.into()),
         (endpoint, header) if !header.trim().is_empty() => {
@@ -172,6 +169,36 @@ fn sign_in_settings(var: &dyn Fn(&str) -> String, store: &dyn SecretStore, metho
         _ => return Err("IDENTITY_ENDPOINT is set without IDENTITY_HEADER".into()),
     };
     Ok((auth, authority, identity))
+}
+
+fn authority_setting(var: &dyn Fn(&str) -> String) -> Result<String, String> {
+    match var("AZURE_AUTHORITY_HOST").trim() {
+        "" => Ok(AUTHORITY.to_string()),
+        a => http::base_url("AZURE_AUTHORITY_HOST", a, AUTHORITY),
+    }
+}
+
+/// Where signing in to Entra ID as `method_var` says reaches, as `(setting, URL, what)`, for
+/// `botd offline check` (ADR 0257). A managed identity asks the host, and Entra ID only when
+/// `runs` trades its token for runs' apps.
+pub fn sign_in_reaches(var: &dyn Fn(&str) -> String, method_var: &str, method: &str, runs: bool) -> Result<Vec<(&'static str, String, &'static str)>, String> {
+    let authority = authority_setting(var)?;
+    let mut out = Vec::new();
+    match method.trim() {
+        "" | "managed-identity" => {
+            let identity = match var("IDENTITY_ENDPOINT").trim() {
+                "" => IMDS.to_string(),
+                e => e.to_string(),
+            };
+            out.push(("IDENTITY_ENDPOINT", identity, "the managed identity's endpoint"));
+            if runs {
+                out.push(("AZURE_AUTHORITY_HOST", authority, "Entra ID, for runs' credentials"));
+            }
+        }
+        "client-secret" | "workload-identity" => out.push(("AZURE_AUTHORITY_HOST", authority, "Entra ID sign-in")),
+        other => return Err(format!("{method_var} must be managed-identity, client-secret or workload-identity, not {other:?}")),
+    }
+    Ok(out)
 }
 
 fn method_of(auth: &Auth) -> &'static str {
