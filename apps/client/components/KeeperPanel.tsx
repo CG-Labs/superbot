@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 import { keeperChoices, keeperQuestion } from "../src/access";
 import type { SuperBotApi } from "../src/api";
@@ -11,6 +11,8 @@ interface Props {
   api: Pick<SuperBotApi, "getBotAccess" | "keepBot" | "releaseKeptBot">;
   botId: string;
   botName: string;
+  /** Who keeps it, as the Bot list says: when that changes elsewhere, the panel reloads. */
+  keptBy?: string | null;
 }
 
 /**
@@ -18,24 +20,37 @@ interface Props {
  * the account then manages it within its role and tokens; the Bot stays the owner's. The
  * server offers only accounts that could keep it, and none on a primary Bot.
  */
-export function KeeperPanel({ api, botId, botName }: Props) {
+export function KeeperPanel({ api, botId, botName, keptBy }: Props) {
   const [view, setView] = useState<BotAccessView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Only the latest request's answer is shown, so a slow older read can't undo a newer one.
+  const latest = useRef(0);
+  const fetchView = useCallback(
+    async (req: () => Promise<BotAccessView>) => {
+      const mine = ++latest.current;
+      const v = await req();
+      if (mine === latest.current) setView(v);
+    },
+    [],
+  );
 
   const load = useCallback(async () => {
     try {
-      setView(await api.getBotAccess(botId));
+      await fetchView(() => api.getBotAccess(botId));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
-  }, [api, botId]);
+  }, [api, botId, fetchView]);
 
   useEffect(() => {
     setView(null);
+  }, [botId]);
+
+  useEffect(() => {
     void load();
-  }, [load]);
+  }, [load, keptBy]);
 
   if (error && !view) return <Text style={styles.error}>{error}</Text>;
   if (!view?.keepers?.length) return null;
@@ -50,11 +65,11 @@ export function KeeperPanel({ api, botId, botName }: Props) {
     setBusy(true);
     setError(null);
     try {
-      setView(to ? await api.keepBot(botId, to) : await api.releaseKeptBot(botId));
+      await fetchView(() => (to ? api.keepBot(botId, to) : api.releaseKeptBot(botId)));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       // What the server holds now, keeping its refusal on screen.
-      await api.getBotAccess(botId).then(setView, () => {});
+      await fetchView(() => api.getBotAccess(botId)).catch(() => {});
     } finally {
       setBusy(false);
     }

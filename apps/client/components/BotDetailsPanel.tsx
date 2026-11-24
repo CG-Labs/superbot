@@ -304,7 +304,7 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, 
                 />
               </View>
               {api && canManage && !bot.primary && (bot.owner?.id === me.id || can("admin")) ? (
-                <KeeperPanel key={bot.id} api={api} botId={bot.id} botName={bot.name} />
+                <KeeperPanel key={bot.id} api={api} botId={bot.id} botName={bot.name} keptBy={bot.serviceAccount?.id ?? null} />
               ) : null}
             </>
           ) : null}

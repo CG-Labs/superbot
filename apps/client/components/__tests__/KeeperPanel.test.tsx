@@ -66,6 +66,20 @@ describe("KeeperPanel (ADR 0229)", () => {
     expect(api.getBotAccess).toHaveBeenCalledTimes(2);
   });
 
+  it("reloads when another session changes its keeper, and a slower older read doesn't win", async () => {
+    let answerFirst: (v: BotAccessView) => void = () => {};
+    const api = mockApi(view());
+    api.getBotAccess
+      .mockImplementationOnce(() => new Promise<BotAccessView>((resolve) => (answerFirst = resolve)))
+      .mockResolvedValueOnce(view({ serviceAccount: { id: "sa2", name: "Nightly", email: null } }));
+    const { rerender } = await render(<KeeperPanel api={api} botId="b1" botName="Ledger" keptBy={null} />);
+    await rerender(<KeeperPanel api={api} botId="b1" botName="Ledger" keptBy="sa2" />);
+    expect(await screen.findByRole("radio", { name: "Nightly" })).toBeChecked();
+    answerFirst(view());
+    await waitFor(() => expect(api.getBotAccess).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("radio", { name: "Nightly" })).toBeChecked();
+  });
+
   it("shows nothing when the server offers no accounts", async () => {
     const api = mockApi(view({ keepers: undefined }));
     await render(<KeeperPanel api={api} botId="b1" botName="Ledger" />);
