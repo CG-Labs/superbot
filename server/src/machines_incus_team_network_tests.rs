@@ -254,11 +254,12 @@ async fn a_deleted_teams_network_goes_with_its_acl_and_its_name_once_its_contain
         let i = env.incus.instance(&m.label).unwrap();
         assert!(i.body["devices"].get("eth1").is_none() && i.status == "Running", "{}", i.body["devices"]);
     }
-    let w = env.incus.w();
-    assert!(!w.networks.contains_key(&net) && !w.acls.contains_key(&net), "the network and its ACL");
-    assert_eq!(w.projects["superbot"]["restricted.networks.access"], "incusbr0", "and its name on the access list");
-    assert!(w.acls.contains_key("superbot-fw"), "the machines' firewall stays");
-    drop(w);
+    {
+        let w = env.incus.w();
+        assert!(!w.networks.contains_key(&net) && !w.acls.contains_key(&net), "the network and its ACL");
+        assert_eq!(w.projects["superbot"]["restricted.networks.access"], "incusbr0", "and its name on the access list");
+        assert!(w.acls.contains_key("superbot-fw"), "the machines' firewall stays");
+    }
     let removed = events(&env, "machine.team_network_removed").await;
     assert_eq!((removed.len(), removed[0]["targetId"].as_str(), removed[0]["details"]["team"].as_str()), (1, Some(net.as_str()), Some(acme.as_str())), "{removed:?}");
     assert!(reconcile(&env).await.get("teamNetworks").is_none());

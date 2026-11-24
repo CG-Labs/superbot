@@ -228,13 +228,15 @@ No uplink network is needed. In botd's `.env`:
 MACHINE_TEAM_NETWORK=ovn
 MACHINE_TEAM_NETWORK_SUBNET=10.248.0.0/22     # any RFC 1918 range, /29 or larger
 MACHINE_TEAM_NETWORK_JOIN=next-boot           # or off: only new and rebuilt machines join
+MACHINE_TEAM_NETWORK_REMOVE=when-empty        # or off: deleted teams' networks stay
 ```
 
 The subnet must stay apart from the bridge (`superbot0`), botd's address, `INCUS_EGRESS_ALLOW` and `INCUS_EGRESS_DENY`. botd refuses to start, or the `team network` check fails, if it isn't. `botctl machine substrate check` also confirms Incus has `network_ovn_isolated` and `backup_override_config` (Incus 6.17 or later), which lets a team machine's backup be restored onto a host without the team's network.
 
 What botd does:
 
-- Makes `<prefix>-team-<digest>-<region>` the first time a team member's machine needs it, and adds its name to the project's `restricted.networks.access`. It never removes names.
+- Makes `<prefix>-team-<digest>-<region>` the first time a team member's machine needs it, and adds its name to the project's `restricted.networks.access`.
+- Removes a deleted team's network, its ACL and its name on the access list once nothing uses it, in any project ([ADR 0236](../adr/0236-removing-the-networks-of-teams-that-are-gone.md)). Only teams this server deleted count, from its own audit log, so another server's networks on the same host are left alone. A service still on the network keeps it, audited once as `machine.team_network_kept`. The access list is never left empty.
 - Puts an ACL of the same name on `eth1`. It lets nothing in and lets out only to the team's subnet, so teammates' machines can't reach each other, as on Linode. `eth1` has MAC and IP filtering.
 - Plugs `eth1` into a running container when its owner joins the team, and unplugs it when they leave, without restarting it.
 - Refuses containers made before this version, which can't bring `eth1` up, until they are rebuilt. `botctl machine rebuild <user>` does it.

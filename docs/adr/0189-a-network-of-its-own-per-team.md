@@ -80,7 +80,7 @@ The reconciler reports `teamNetworks: {leaving, left, errors}` when any are non-
 - A team's Bots can reach the team's own private services, which the operator puts on the team's VPC, and nothing else private. No other team's machine can reach them.
 - Turning it on changes nothing for existing machines. Only machines made after it join. ([ADR 0202](0202-existing-machines-join-their-teams-network.md) since has existing machines join too.) A rebuilt machine's egress rules let the subnet through if its owner is on a team; if Linode's rebuild drops the interface, the machine is just off the network, which is the safe direction.
 - A member who leaves a team loses reach to its network at once: their machine is powered off and back on within two reconcile passes. A team's machines given back on leaving (ADR 0087) are suspended already.
-- VPCs and their interfaces cost nothing on Linode. botd never deletes a team's VPC, as the team's services may be on it. An empty one can be deleted from Linode's console.
+- VPCs and their interfaces cost nothing on Linode. botd never deletes a team's VPC, as the team's services may be on it. An empty one can be deleted from Linode's console. ([ADR 0236](0236-removing-the-networks-of-teams-that-are-gone.md) since removes a deleted team's VPC once nothing is on it.)
 - More provider calls per reconcile: one list of VPCs, and one list of interfaces per team VPC.
 
 ## Tests
@@ -97,4 +97,4 @@ The reconciler reports `teamNetworks: {leaving, left, errors}` when any are non-
 - **Incus: an OVN network per team**, with dedicated hosts (ADR 0166). Containers there already can't reach each other (port isolation) or private ranges (the network ACL). A team network would need an OVN network per team and the ACL carved for it.
 - **Linode interfaces** (the newer generation), each with a firewall of its own. Configuration-profile interfaces are what one firewall per Linode covers today.
 - Per-team subnets, operator-named VPCs and NAT gateways, should a team need its range to differ or its outbound traffic to leave from its own address.
-- Deleting a team's VPC when the team is deleted, once botd can tell nothing of the team's is still on it.
+- Deleting a team's VPC when the team is deleted, once botd can tell nothing of the team's is still on it. Done in [ADR 0236](0236-removing-the-networks-of-teams-that-are-gone.md): once nothing at all is on it.
