@@ -998,6 +998,8 @@ export interface AuditExportSink {
   deliveredAt: number | null;
   failing: boolean;
   lastError: string | null;
+  /** Whether its request bodies or objects are gzipped (ADR 0227). */
+  compress?: "gzip" | "off";
   archive?: AuditArchiveState;
 }
 
@@ -1014,7 +1016,18 @@ export interface AuditArchiveState {
   batchSeconds: number;
   /** Whether botd's daily check reads new objects (`AUDIT_EXPORT_S3_CHECK`, ADR 0183). */
   dailyCheck?: boolean;
-  lastObject: { key: string; version: string | null; events: number; lockMode?: string; retainUntil?: number } | null;
+  /** `AUDIT_EXPORT_S3_COMPRESS` (ADR 0227). */
+  compress?: "gzip" | "off";
+  lastObject: {
+    key: string;
+    version: string | null;
+    events: number;
+    bytes?: number;
+    /** Only for a gzipped object. */
+    uncompressedBytes?: number;
+    lockMode?: string;
+    retainUntil?: number;
+  } | null;
 }
 
 /** `GET /api/audit/chain`: the chain's state for admins (ADR 0149). */

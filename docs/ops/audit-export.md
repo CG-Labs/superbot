@@ -1,6 +1,6 @@
 # Audit log: SIEM export and tamper evidence
 
-Every audit event is sealed onto a hash chain as it is written, so a changed, removed, added or reordered event shows. Every hour botd signs a checkpoint of the chain's head, and can have each one timestamped by an RFC 3161 time-stamping authority (TSA). botd can also send every event to your SIEM as it happens: JSON lines over HTTPS, or RFC 5424 syslog over TLS. Or it can archive them in batches to an S3 bucket with Object Lock, where nobody can change or delete them until their retention ends ([below](#archive-events-to-write-once-s3)), or do both at once ([below](#a-siem-and-an-archive-together)), and send to up to four SIEMs, each with its own token ([below](#several-siems)), Microsoft Sentinel among them, signed in with Entra ID ([below](#microsoft-sentinel-azure-monitor)). The chain and checkpoints are always on and need nothing. Timestamps and the export are off until you set them. Design: [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md), [ADR 0149](../adr/0149-signed-and-timestamped-audit-checkpoints.md), [ADR 0154](../adr/0154-write-once-s3-audit-archive.md), [ADR 0163](../adr/0163-checking-the-audit-archive.md), [ADR 0173](../adr/0173-an-archive-alongside-a-siem.md), [ADR 0183](../adr/0183-daily-check-of-new-archive-objects.md), [ADR 0191](../adr/0191-several-siems-with-their-own-headers.md), [ADR 0199](../adr/0199-self-checking-audit-lines.md), [ADR 0207](../adr/0207-checking-timestamps-from-exported-lines.md) and [ADR 0217](../adr/0217-audit-export-to-azure-monitor.md).
+Every audit event is sealed onto a hash chain as it is written, so a changed, removed, added or reordered event shows. Every hour botd signs a checkpoint of the chain's head, and can have each one timestamped by an RFC 3161 time-stamping authority (TSA). botd can also send every event to your SIEM as it happens: JSON lines over HTTPS, or RFC 5424 syslog over TLS. Or it can archive them in batches to an S3 bucket with Object Lock, where nobody can change or delete them until their retention ends ([below](#archive-events-to-write-once-s3)), or do both at once ([below](#a-siem-and-an-archive-together)), and send to up to four SIEMs, each with its own token ([below](#several-siems)), Microsoft Sentinel among them, signed in with Entra ID ([below](#microsoft-sentinel-azure-monitor)). Batches and archive objects can be gzipped ([below](#compression)). The chain and checkpoints are always on and need nothing. Timestamps and the export are off until you set them. Design: [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md), [ADR 0149](../adr/0149-signed-and-timestamped-audit-checkpoints.md), [ADR 0154](../adr/0154-write-once-s3-audit-archive.md), [ADR 0163](../adr/0163-checking-the-audit-archive.md), [ADR 0173](../adr/0173-an-archive-alongside-a-siem.md), [ADR 0183](../adr/0183-daily-check-of-new-archive-objects.md), [ADR 0191](../adr/0191-several-siems-with-their-own-headers.md), [ADR 0199](../adr/0199-self-checking-audit-lines.md), [ADR 0207](../adr/0207-checking-timestamps-from-exported-lines.md), [ADR 0217](../adr/0217-audit-export-to-azure-monitor.md) and [ADR 0227](../adr/0227-gzip-for-the-audit-export.md).
 
 ## Check the chain
 
@@ -134,6 +134,7 @@ In `.env` (installer) or `deploy/docker/.env` (Compose), then restart botd:
 | `AUDIT_EXPORT_INSECURE` | `off` | `on` allows `http://` and `syslog+tcp://` to any host, for a collector on a private network such as the Compose network |
 | `AUDIT_EXPORT_HEADERS` or `AUDIT_EXPORT_HEADERS_FILE` | none | HTTPS only: headers, `name=value` pairs split by commas, such as `Authorization=Bearer <token>`. A secret: redacted everywhere, and no Bot's harness gets it. With `SECRETS_BACKEND=vault` it can live in Vault ([vault.md](vault.md)). For one SIEM only; with several, each has its own `AUDIT_EXPORT_HEADERS_<NAME>` |
 | `AUDIT_EXPORT_START` | `all` | For a new sink: `all` sends the history still in the database first, `new` only events from now on. A named sink can have its own, `AUDIT_EXPORT_START_<NAME>` |
+| `AUDIT_EXPORT_COMPRESS` | `off` | `gzip`: webhook and Azure Monitor request bodies go gzipped, with `Content-Encoding: gzip`. A named sink can have its own, `AUDIT_EXPORT_COMPRESS_<NAME>` ([below](#compression)) |
 
 A bad value stops botd at startup with a message naming the setting. URLs with a username, password, query or fragment are refused, so put tokens in `AUDIT_EXPORT_HEADERS`.
 
@@ -156,7 +157,7 @@ One JSON object per event, the same shape as `GET /api/audit`, plus:
 
 Events are scrubbed when they are recorded: passwords, tokens, message text and routine instructions are never in them, and known secrets are redacted. The export headers are never in an event.
 
-- **Webhook**: `POST` with `Content-Type: application/x-ndjson`, up to 200 events per request, one per line. Answer any 2xx to accept the batch. Redirects aren't followed.
+- **Webhook**: `POST` with `Content-Type: application/x-ndjson`, up to 200 events per request, one per line, gzipped with `Content-Encoding: gzip` if you ask ([below](#compression)). Answer any 2xx to accept the batch. Redirects aren't followed.
 - **Azure Monitor**: records of a data collection rule's stream, each with the line whole ([below](#microsoft-sentinel-azure-monitor)).
 - **Syslog**: RFC 5424, facility 13 (log audit), severity 6 (success), 5 (failure) or 4 (denied), APP-NAME `superbot`, MSGID the action, and the JSON object as the message. Octet-counted framing (RFC 5425). The certificate is checked against the system's trusted roots. Syslog has no acknowledgement, so a dropped connection can lose the batch in flight: use the webhook if every event must arrive.
 
@@ -218,16 +219,17 @@ AUDIT_EXPORT_S3_SECRET_ACCESS_KEY=<secret>
 | `AUDIT_EXPORT_S3_LOCK` | `bucket` | `bucket`: the bucket's default retention locks each object (botd checks there is one). `compliance` or `governance`: botd locks each object itself for `AUDIT_EXPORT_S3_RETAIN_DAYS`. `off`: a plain bucket, nothing locked |
 | `AUDIT_EXPORT_S3_RETAIN_DAYS` | none | 1 to 36500, with `compliance` or `governance` only |
 | `AUDIT_EXPORT_S3_BATCH_SECONDS` | `300` | A batch goes when its oldest event is this old, or at 10,000 events. 0 sends each batch at once |
+| `AUDIT_EXPORT_S3_COMPRESS` | `off` | `gzip`: each object is gzipped, `.jsonl.gz` ([below](#compression)) |
 | `AUDIT_EXPORT_S3_CHECK` | `daily` | `daily`: botd's daily self-check also checks the objects written since its last pass ([below](#the-daily-check)). `off`: only when you ask |
 
 The key botd uses needs, on the bucket (`arn:aws:s3:::<bucket>`), `s3:GetBucketObjectLockConfiguration` and, for the daily check ([below](#the-daily-check)), `s3:ListBucketVersions`; and on its objects (`arn:aws:s3:::<bucket>/<prefix>/*`), `s3:PutObject`, `s3:GetObject` and `s3:GetObjectVersion` (botd reads back the version it wrote), `s3:GetObjectRetention` (to see its lock), and with `compliance` or `governance`, `s3:PutObjectRetention`. Don't give it `s3:BypassGovernanceRetention` or any delete rights. Other stores name these differently; MinIO uses the same names.
 
-- **Objects** are `<prefix>/<yyyy>/<mm>/<dd>/<first id>-<last id>.jsonl`, dated by their first event, ids padded to 20 digits so they list in order. Each holds the same lines the webhook gets ([above](#what-arrives)), so each event's `chainPrev` is the previous event's `chainHash` across objects too, and checkpoints can be checked from the archive with OpenSSL. Metadata: `x-amz-meta-superbot-first-id`, `-last-id`, `-events`, `-chain-prev` (the first event's link), `-chain-head` (the last event's hash) and `-schema`.
+- **Objects** are `<prefix>/<yyyy>/<mm>/<dd>/<first id>-<last id>.jsonl` (`.jsonl.gz` with `AUDIT_EXPORT_S3_COMPRESS=gzip`), dated by their first event, ids padded to 20 digits so they list in order. Each holds the same lines the webhook gets ([above](#what-arrives)), so each event's `chainPrev` is the previous event's `chainHash` across objects too, and checkpoints can be checked from the archive with OpenSSL. Metadata: `x-amz-meta-superbot-first-id`, `-last-id`, `-events`, `-chain-prev` (the first event's link), `-chain-head` (the last event's hash) and `-schema`.
 - **Proof of the lock.** Before the first batch, botd checks that the bucket has Object Lock on (and a default retention with `bucket`). After writing each object it reads it back, and the object must have a version and a lock: the mode asked for and at least the date asked for, or with `bucket`, a date in the future. If not, nothing counts as delivered, retention keeps the events, and after 3 tries `audit.export_failing` is recorded with `reason` `not_write_once`. A store that takes the lock headers and keeps nothing can't pass.
 - **Retries** write the same events to the same key, even after a restart (botd saves each batch's last id before writing it), so an object written whose cursor wasn't saved gets a second version of the same events, not an overlapping object.
-- **Status**: `botctl audit siem` shows `kind: "s3"` and `archive`, with the bucket, lock and the last object written (key, version, events, lock mode and `retainUntil`). The app's audit log says when the last object's lock ends.
+- **Status**: `botctl audit siem` shows `kind: "s3"` and `archive`, with the bucket, lock and the last object written (key, version, events, `bytes`, and when gzipped `uncompressedBytes`, lock mode and `retainUntil`), and `compress`. The app's audit log says when the last object's lock ends.
 
-Read it back with any S3 tool, for example `aws s3 cp --recursive s3://<bucket>/<prefix>/ ./audit/`, then `cat audit/*/*/*/*.jsonl | jq -c '{id, chainPrev, chainHash}'` to see the chain run through. Or let botd check all of it (next).
+Read it back with any S3 tool, for example `aws s3 cp --recursive s3://<bucket>/<prefix>/ ./audit/`, then `cat audit/*/*/*/*.jsonl | jq -c '{id, chainPrev, chainHash}'` (`zcat audit/*/*/*/*.jsonl.gz` for a gzipped archive) to see the chain run through. Or let botd check all of it (next).
 
 ### Check the archive
 
@@ -428,6 +430,23 @@ az monitor log-analytics query -w <workspace id> -o tsv \
 
 A query returns at most 500,000 rows, so check a long history a month at a time. `ChainHash` gives pins for `botctl audit verify --pin <EventId>:<ChainHash>`. The typed columns aren't checked: compare them with `Line` if a detection depends on one.
 
+## Compression
+
+Audit lines compress about tenfold. Gzip is off by default, so keys and bodies stay as downstream tools expect; turn it on where they take it. Design: [ADR 0227](../adr/0227-gzip-for-the-audit-export.md).
+
+```sh
+AUDIT_EXPORT=splunk=https://<splunk-host>:8088/services/collector/raw,legacy=https://<collector>/ingest,s3://<bucket>/<prefix>
+AUDIT_EXPORT_COMPRESS=gzip
+AUDIT_EXPORT_COMPRESS_LEGACY=off
+AUDIT_EXPORT_S3_COMPRESS=gzip
+```
+
+- **SIEMs.** `AUDIT_EXPORT_COMPRESS=gzip` gzips every webhook and Azure Monitor request body and adds `Content-Encoding: gzip`; the lines inside are the same. `AUDIT_EXPORT_COMPRESS_<NAME>` (`gzip` or `off`) is that named sink's own and wins, so above every SIEM but `legacy` gets gzip. Splunk HEC, Elastic, Vector, Fluent Bit, Logstash's `http` input and Azure's Logs Ingestion API take it. A collector that doesn't answers an error, often 400 or 415, and the sink shows as failing: turn it off for that sink. Azure's 1 MB limit holds before compression too, so its arrays are cut at 1 MB and then gzipped.
+- **Syslog** has no compression. `AUDIT_EXPORT_COMPRESS_<NAME>=gzip` on a syslog sink stops botd at startup, and so does `AUDIT_EXPORT_COMPRESS=gzip` when no sink is a webhook or Azure Monitor.
+- **Archive.** `AUDIT_EXPORT_S3_COMPRESS=gzip` writes each object as `<first id>-<last id>.jsonl.gz`, one gzip member with `Content-Type: application/gzip` and no `Content-Encoding`, so every S3 client downloads the same bytes. Metadata, the lock and the read-back are as before. Keys change from then on: tools that list `*.jsonl` (an Athena table, Splunk's S3 input) need `*.jsonl.gz` too. `AUDIT_EXPORT_COMPRESS` doesn't touch the archive, and `AUDIT_EXPORT_COMPRESS_<NAME>` naming it stops botd.
+- **Checks.** The [archive check](#check-the-archive) reads `.jsonl` and `.jsonl.gz` keys, so an archive switched part way checks whole, the chain running across both. A `.gz` object must be gzip to its last byte and hold at most 256 MB uncompressed, or it is `unreadable`. Versions of a key are compared by their lines, so a retry that compressed differently is `retried`, not `overwritten`. A batch cut before the switch and retried after it lands on the `.gz` key, and its events show as `repeated`. `botctl audit verify-lines` gunzips by itself ([below](#check-exported-events-without-botd)).
+- **Status.** `botctl audit siem` shows each sink's `compress` (`gzip` or `off`), and the startup log says which are gzipped.
+
 ## Check exported events without botd
 
 `botctl audit verify-lines` checks exported events where they landed: a copy of the archive, a SIEM export, years later, with the server gone. It needs no botd, no database and no network, only the `botctl` binary:
@@ -437,12 +456,12 @@ aws s3 cp --recursive s3://<bucket>/<prefix>/ ./audit/
 botctl audit verify-lines ./audit/ --key <checkpoint public key hex> --digests-after <id> --timestamp-ca <tsa-ca.pem>
 
 # A SIEM export, as JSON lines or syslog, from a file or stdin
-zcat siem-export-2026-11.jsonl.gz | botctl audit verify-lines - --key <checkpoint public key hex> --digests-after <id>
+botctl audit verify-lines siem-export-2026-11.jsonl.gz --key <checkpoint public key hex> --digests-after <id>
 ```
 
 `aws s3 cp` takes each key's latest version, while botd's archive check reads the first, which Object Lock keeps. If someone wrote a version over a locked object, this checks theirs; `botctl audit verify --archive` names it as `overwritten`.
 
-It reads files, directories (their `.jsonl`, `.ndjson`, `.json` and `.log` files) and `-` for stdin, in any order, copies and all. A syslog line is read from its first `{`. Lines from other sources are counted as `ignored`. For each `host` it checks:
+It reads files, directories (their `.jsonl`, `.ndjson`, `.json` and `.log` files, and each of those with `.gz`) and `-` for stdin, in any order, copies and all. It gunzips whatever starts as gzip, so a gzipped archive, `cat audit/*/*/*/*.jsonl.gz | botctl audit verify-lines -` and a `.gz` SIEM export need no `zcat`. A syslog line is read from its first `{`. Lines from other sources are counted as `ignored`. For each `host` it checks:
 
 - each line against its own hash: `chainHash` from `chainPrev`, the fields no erasure changes and `chainDigest`, and with `chainSalt`, `chainDigest` from the other fields (`digest` otherwise);
 - copies of one event against each other (`conflict`);
