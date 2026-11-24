@@ -354,6 +354,10 @@ async fn a_container_made_before_team_networks_is_rebuilt_though_its_agent_upgra
     // A container that can't bring a team NIC up until rebuilt may be rebuilt.
     let pid = env.app.db.machine(&mid).unwrap().provider_id.unwrap();
     env.fake.team_nic_needs_rebuild_for(&pid);
+    env.fake.fail_next("team_nic_needs_rebuild", ProviderError::Transport("timed out".into()));
+    let (code, v) = json_call(&env, "POST", &path, "").await;
+    assert_eq!(code, 502, "no answer is no answer either way: {v}");
+    assert!(rebuild_view(&env, &uid).await["rebuild"].is_null(), "nothing queued");
     let (code, v) = json_call(&env, "POST", &path, "").await;
     assert_eq!(code, 202, "{v}");
     assert_eq!(v["rebuild"]["state"], "rebuilding", "sent at once, not cancelled as not needed: {v}");

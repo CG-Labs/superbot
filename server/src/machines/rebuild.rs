@@ -134,10 +134,13 @@ fn details(m: &Machine, extra: Value) -> Value {
 }
 
 /// Whether `m`, though its agent can upgrade itself, needs a rebuild to join its team's
-/// network: a container made before ADR 0212, with team networks on.
-async fn for_team_nic(cp: &ControlPlane, m: &Machine) -> bool {
-    let (Some(p), Some(pid)) = (cp.provider.as_deref(), m.provider_id.as_deref()) else { return false };
-    cp.team_network.is_some() && p.team_nic_needs_rebuild(pid).await.unwrap_or(false)
+/// network: a container made before ADR 0212, with team networks on. An error is no
+/// answer either way.
+async fn for_team_nic(cp: &ControlPlane, m: &Machine) -> Result<bool, ProviderError> {
+    match (cp.provider.as_deref(), m.provider_id.as_deref()) {
+        (Some(p), Some(pid)) if cp.team_network.is_some() => p.team_nic_needs_rebuild(pid).await,
+        _ => Ok(false),
+    }
 }
 
 /// Why botd can't rebuild machines at all, if it can't.
@@ -315,9 +318,18 @@ pub(super) async fn step(app: &App, cp: &ControlPlane, e: &Enrollment, machine_i
                 Ok(hb) => hb,
                 Err(why) => return retry_later(app, &m, "queued", "queued", true, "offline", &format!("Its agent didn't answer: {why}")),
             };
-            if !legacy(&hb) && !for_team_nic(cp, &m).await {
-                cancel(app, &system(&m), &m, "not_needed");
-                return;
+            if !legacy(&hb) {
+                match for_team_nic(cp, &m).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        cancel(app, &system(&m), &m, "not_needed");
+                        return;
+                    }
+                    Err(err) => {
+                        let why = format!("The provider couldn't say whether it still needs one: {err}");
+                        return retry_later(app, &m, "queued", "queued", true, "provider", &why);
+                    }
+                }
             }
             if hb.jobs > 0 {
                 let id = m.rebuild_id.as_deref().unwrap_or_default();
@@ -559,7 +571,9 @@ pub async fn request(
         Err(_) if again => None,
         Err(err) => return Err(err),
     };
-    if hb.as_ref().is_some_and(|h| !legacy(h)) && !for_team_nic(cp, &m).await {
+    if hb.as_ref().is_some_and(|h| !legacy(h))
+        && !for_team_nic(cp, &m).await.map_err(|err| ApiError(StatusCode::BAD_GATEWAY, format!("The provider couldn't say whether it needs one: {err}")))?
+    {
         return Err(conflict("Its agent can upgrade itself, so it needn't be rebuilt. Use botctl machine upgrade <user>."));
     }
     if !discard && app.db.machine_may_hold_work(&m.id) {
