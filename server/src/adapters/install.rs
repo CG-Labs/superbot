@@ -118,15 +118,33 @@ pub fn pins_text() -> String {
     node.chain(harnesses).collect()
 }
 
-/// `botd harness ...`, which reads no settings: `pins` prints `pins_text`.
+/// Every harness this build pins, in order.
+pub fn bins() -> Vec<&'static str> {
+    PINS.iter().map(|p| p.bin).collect()
+}
+
+/// `botd harness ...`, which reads no settings: `pins` prints `pins_text`, and
+/// `check-bundles` checks Hermes and harness bundles as machines' would be (ADR 0247).
 pub fn cli(args: &[String]) -> i32 {
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["pins"] => {
             print!("{}", pins_text());
             0
         }
+        ["check-bundles", ..] => match crate::machines::hermes_serve::check_files(&args[1..]) {
+            Ok(out) => {
+                print!("{out}");
+                0
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        },
         _ => {
-            eprintln!("Usage: botd harness pins    (the Node.js and harness CLIs this botd pins, ADR 0232)");
+            eprintln!(
+                "Usage: botd harness pins                 (the Node.js and harness CLIs this botd pins, ADR 0232)\n       botd harness check-bundles FILE...  (whether machines would take these Hermes and harness bundles from this botd, ADR 0247)"
+            );
             2
         }
     }

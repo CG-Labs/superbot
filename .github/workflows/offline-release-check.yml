@@ -8,7 +8,10 @@ name: offline-release-check
 # as a customer would. Then, in a network namespace with only loopback, against Sigstore's trusted
 # root fetched beforehand as the guide says: the bundles verify, both go to a registry mirror as the
 # signed multi-arch index, and cosign verifies every image and the build provenance there, keyless.
-# Last, still with no network, it installs botd from the x86_64 bundle and loads its images.
+# Both arches' Hermes and harness bundles are checked the same way, at the pins of the release's
+# own botd, which says machines would take them (docs/adr/0247-hermes-and-harness-bundles-in-the-release-check.md).
+# Last, still with no network, it installs botd from the x86_64 bundle with Hermes Agent and the
+# harness CLIs from theirs, runs each CLI, and loads the images.
 # offline.yml calls it once release-bundle has attached a tag's bundles; it also runs weekly on
 # the latest release (a tag that moved, or a trust root that changed, shows up there) and by hand.
 
@@ -58,8 +61,10 @@ jobs:
             echo "VERSION=${TAG#v}"
             echo "COMMIT=$(git rev-parse "refs/tags/$TAG^{commit}")"
           } >>"$GITHUB_ENV"
-          gh release download "$TAG" --pattern 'superbot-offline-*' --dir "$RUNNER_TEMP/release"
+          gh release download "$TAG" --pattern 'superbot-offline-*' --pattern 'superbot-hermes-*' --pattern 'superbot-harnesses-*' \
+            --dir "$RUNNER_TEMP/release"
           ls -l "$RUNNER_TEMP/release"
+          df -h / | tail -n 1
       - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         if: env.SKIP != '1'
       - name: Packages, and Sigstore's trusted root as an operator fetches it before going offline
@@ -67,7 +72,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq skopeo jq sqlite3 acl age bubblewrap socat
+          sudo apt-get install -y -qq skopeo jq sqlite3 acl age bubblewrap socat libatomic1
           cosign initialize >/dev/null
           cp ~/.sigstore/root/tuf-repo-cdn.sigstore.dev/targets/trusted_root.json "$RUNNER_TEMP/trusted_root.json"
       # Anonymous on purpose: no registry login, so a private package fails here as it would for a customer.
@@ -111,20 +116,36 @@ jobs:
             deploy/offline-release-check.sh offline "$release" --mirror localhost:5002/superbot --trusted-root "$root"
           ' _ "$RUNNER_TEMP/registry" "$RUNNER_TEMP/registry.yml" "$RUNNER_TEMP/release" "$RUNNER_TEMP/trusted_root.json" \
             | tee -a "$RUNNER_TEMP/check.log"
-      - name: With no network, install botd from the x86_64 bundle and load its images
+      - name: With no network, install botd, Hermes Agent and the harness CLIs from the x86_64 bundles, and load the images
         if: env.SKIP != '1'
         run: |
           set -euo pipefail
-          b="$RUNNER_TEMP/release/superbot-offline-$VERSION-x86_64.tar.gz"
-          sum=$(awk '$1 == "bundle" && $2 == "x86_64" { print $3 }' "$RUNNER_TEMP/release/release-check.expected")
+          r="$RUNNER_TEMP/release" exp="$RUNNER_TEMP/release/release-check.expected"
+          b="$r/superbot-offline-$VERSION-x86_64.tar.gz"
+          sum=$(awk '$1 == "bundle" && $2 == "x86_64" { print $3 }' "$exp")
+          read -r hb hsum < <(awk '$1 == "hermes" && $2 == "x86_64" { print $3, $4 }' "$exp")
+          read -r nb nsum < <(awk '$1 == "harnesses" && $2 == "x86_64" { print $3, $4 }' "$exp")
           mkdir -p "$RUNNER_TEMP/installer"
           tar -xzf "$b" -C "$RUNNER_TEMP/installer" --strip-components=1 "superbot-offline-$VERSION-x86_64/deploy"
           sudo ip netns exec offline env PATH="$(dirname "$(command -v cosign)"):$PATH" SIGSTORE_TRUSTED_ROOT="$RUNNER_TEMP/trusted_root.json" \
             bash "$RUNNER_TEMP/installer/deploy/install.sh" --offline "$b" --bundle-sha256 "$sum" --testing-mode --non-interactive --tz UTC \
+              --with-hermes --hermes-bundle "$r/$hb" --hermes-bundle-sha256 "$hsum" --harness-bundle "$r/$nb" --harness-bundle-sha256 "$nsum" \
             | tee /tmp/offline-install.log
           grep -Fq 'Bundle signature verified' /tmp/offline-install.log
           grep -Fq "Offline bundle $VERSION (x86_64" /tmp/offline-install.log
+          grep -Eq 'Installing Hermes Agent [0-9a-f]{12} system-wide in /opt/hermes from the Hermes bundle' /tmp/offline-install.log
+          grep -Fq 'Installing claude codex pi system-wide in /opt/superbot-harnesses from the harness bundle' /tmp/offline-install.log
           grep -Fq 'SuperBot is installed.' /tmp/offline-install.log
+          probe=$(mktemp -d) && chmod 0777 "$probe"
+          sudo ip netns exec offline sudo -u nobody env HOME="$probe" HERMES_HOME="$probe/h" /usr/local/bin/hermes --version | tee /tmp/offline-hermes-version.log
+          grep -q '^Hermes Agent v' /tmp/offline-hermes-version.log
+          for c in claude codex pi; do
+            want=$(sed -n "s/^harness_$c=\([^ ]*\) .*/\1/p" /opt/superbot-harnesses/superbot/MANIFEST)
+            out=$(sudo ip netns exec offline sudo -u nobody env -i HOME="$probe" PATH=/usr/bin:/bin "/usr/local/bin/$c" --version)
+            echo "$c: $out"
+            [[ -n $want && $out == *"$want"* ]]
+          done
+          sudo rm -rf "$probe"
           [[ $(sudo readlink "/proc/$(systemctl show -p MainPID --value superbot)/ns/net") == "$(sudo ip netns exec offline readlink /proc/self/ns/net)" ]]
           for _ in $(seq 1 30); do sudo ip netns exec offline curl -fsS http://127.0.0.1:3000/healthz >/dev/null 2>&1 && break; sleep 1; done
           sudo ip netns exec offline curl -fsS http://127.0.0.1:3000/healthz
