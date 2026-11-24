@@ -112,6 +112,7 @@ The first release: everything merged to `main` up to the M4 public-launch work (
 
 ### Fixed
 
+- The Azure Monitor audit sink waits for a `Retry-After` given as an HTTP date, not only in seconds; it used not to wait at all ([#56](https://github.com/CG-Labs/superbot/issues/56)).
 - The installer no longer deletes or overwrites runtime state when it runs from a separate checkout (or with `--source-dir`): its `rsync --delete` used to remove the install's `.env`, `data/`, `workspace/` and `backups/`, the archives a restore needs. It now leaves out `.env` and `.env.*` (but updates `.env.example`), `data/`, `workspace/`, `backups/`, `logs/`, `secrets/`, the usual key and token files, SQLite files, every `*_DIR` and `*_FILE` the install's `.env` points inside its folder (as written, with any link on the way, and as resolved), and botd's default `BACKUP_DIR` beside a moved `DATA_DIR`; a setting pointing at the folder itself stops the installer. The upgrade runbook and `deploy/README.md` say so ([guide](deploy/README.md#from-a-local-checkout)).
 
 ### Security

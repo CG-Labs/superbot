@@ -707,6 +707,21 @@ fn jitter(d: Duration) -> Duration {
     d.mul_f64(0.75 + 0.25 * r as f64 / 255.0)
 }
 
+/// `Retry-After` as seconds or as an HTTP date (RFC 9110); a date already past is no wait.
+pub(crate) fn retry_after(v: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Duration> {
+    let v = v.trim();
+    if let Ok(secs) = v.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let at = chrono::DateTime::parse_from_rfc2822(v).ok()?;
+    Some((at.with_timezone(&chrono::Utc) - now).to_std().unwrap_or_default())
+}
+
+/// How long a throttled answer asks botd to wait, if it says.
+pub(crate) fn asked_to_wait(r: &reqwest::Response) -> Option<Duration> {
+    r.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|v| retry_after(v, chrono::Utc::now()))
+}
+
 fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: the buffer is valid for its length; gethostname writes at most that.
@@ -1141,6 +1156,16 @@ pub(crate) mod tests {
         assert!(e.contains("AUDIT_EXPORT_COMPRESS_VAULT is for https and azure-monitor sinks; the archive's is AUDIT_EXPORT_S3_COMPRESS"), "{e}");
         let s = with_archive(&[("AUDIT_EXPORT", "s3://audit-archive/prod"), ("AUDIT_EXPORT_S3_COMPRESS", "gzip")]).unwrap();
         assert_eq!(Exporter::new(s.sinks.into_iter().next().unwrap(), 0).view(0)["compress"], "gzip", "the archive's shows the same way");
+    }
+
+    #[test]
+    fn retry_after_is_seconds_or_an_http_date() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-24T12:30:00Z").unwrap().with_timezone(&chrono::Utc);
+        assert_eq!(retry_after(" 45 ", now), Some(Duration::from_secs(45)));
+        assert_eq!(retry_after("Tue, 24 Nov 2026 12:32:00 GMT", now), Some(Duration::from_secs(120)), "an HTTP date, as RFC 9110 allows");
+        assert_eq!(retry_after("Tue, 24 Nov 2026 12:29:00 GMT", now), Some(Duration::ZERO), "already past");
+        assert_eq!(retry_after("soon", now), None);
+        assert_eq!(retry_after("-5", now), None);
     }
 
     #[test]
