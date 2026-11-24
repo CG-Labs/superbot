@@ -5,7 +5,8 @@
 //! bundles of a signed image to a mirror with no network, where cosign verifies the signed
 //! index. ADR 0172: what release-bundle attached is then checked end to end by
 //! `offline-release-check.yml` (also weekly and by hand), against ghcr.io and with no network, and
-//! the CI job runs the same check on its own signed release. `deploy/test-offline.sh` and
+//! the CI job runs the same check on its own signed release; ADR 0247: with the release's Hermes
+//! and harness bundles. `deploy/test-offline.sh` and
 //! `deploy/test-offline-release-check.sh` test the scripts themselves; this checks the workflows
 //! wire them up. It reads lines, like `release_workflow.rs`.
 
@@ -358,6 +359,42 @@ fn harness_bundles_are_signed_released_and_installed_with_no_network() {
         "an upgrade without --harness-bundle touched the harness CLIs",
     ] {
         assert!(s[install].contains(want), "the harness install step must have `{want}`");
+    }
+}
+
+// ADR 0247: the release check takes both arches' Hermes and harness bundles with the offline
+// bundles, and installs Hermes Agent and the harness CLIs from them with no network. CI's own
+// signed release has none, so its check says it skips them.
+#[test]
+fn the_release_check_covers_the_hermes_and_harness_bundles() {
+    let yaml = read(".github/workflows/offline-release-check.yml");
+    let all = jobs(&yaml);
+    let s = steps(&all[0].1);
+    let at = |want: &str| s.iter().position(|step| step.contains(want)).unwrap_or_else(|| panic!("offline-release-check.yml must have `{want}`"));
+    let download = at(r#"gh release download "$TAG" --pattern 'superbot-offline-*'"#);
+    assert!(s[download].contains("--pattern 'superbot-hermes-*' --pattern 'superbot-harnesses-*'"), "the check downloads the Hermes and harness bundles too");
+    assert!(s[at("cosign initialize")].contains("libatomic1"), "install.sh --with-hermes needs libatomic1, which an offline install can't fetch");
+    let online = at(r#"deploy/offline-release-check.sh online "$RUNNER_TEMP/release""#);
+    assert!(!s[online].contains("--without-harness-bundles"), "a real release's Hermes and harness bundles are checked");
+    let install = at(r#"--offline "$b" --bundle-sha256 "$sum""#);
+    for want in [
+        r#"awk '$1 == "hermes" && $2 == "x86_64" { print $3, $4 }' "$exp""#,
+        r#"awk '$1 == "harnesses" && $2 == "x86_64" { print $3, $4 }' "$exp""#,
+        r#"--with-hermes --hermes-bundle "$r/$hb" --hermes-bundle-sha256 "$hsum" --harness-bundle "$r/$nb" --harness-bundle-sha256 "$nsum""#,
+        "system-wide in /opt/hermes from the Hermes bundle",
+        "Installing claude codex pi system-wide in /opt/superbot-harnesses from the harness bundle",
+        "sudo ip netns exec offline sudo -u nobody",
+        "for c in claude codex pi; do",
+    ] {
+        assert!(s[install].contains(want), "the install must have `{want}`");
+    }
+
+    let yaml = read(".github/workflows/offline.yml");
+    let all = jobs(&yaml);
+    let s = steps(job(&all, "install-offline"));
+    let online = s.iter().find(|step| step.contains("deploy/offline-release-check.sh\" online signed")).expect("CI checks its own signed release");
+    for want in ["--without-harness-bundles", "grep -qx 'harness-bundles skipped' signed/release-check.expected"] {
+        assert!(online.contains(want), "CI's signed release has no Hermes or harness bundles: `{want}`");
     }
 }
 
