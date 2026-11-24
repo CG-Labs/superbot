@@ -82,6 +82,7 @@ Every release's bundles are checked the way you'll use them, by the [`offline-re
   - the bundles verify;
   - both go to a registry mirror as the signed multi-arch index, and `cosign verify` and `verify-attestation` pass there;
   - botd installs from the x86_64 bundle, and its images load.
+- **The Hermes and harness bundles**, for both arches ([ADR 0247](../adr/0247-hermes-and-harness-bundles-in-the-release-check.md)): each is signed and from the tag's commit, with programs for its arch, at exactly the pins of the release's own botd, and that botd would serve it to machines. With no network, each verifies, and the x86_64 install takes Hermes Agent, Claude Code, Codex and Pi from them.
 
 A green run on the release's tag means all of that held on that day. The run's summary lists each check. If a release's latest run is red, don't install it: use the previous release and tell your CG-Labs contact.
 
@@ -94,7 +95,7 @@ deploy/offline-release-check.sh online ./release --version 0.1.0 --commit <the t
 deploy/offline-release-check.sh offline ./release --mirror registry.corp.example/superbot-check --trusted-root trusted_root.json
 ```
 
-`./release` holds both arches' bundles with their `.sha256` and `.sigstore.json`, as attached to the release. `online` writes `release-check.expected`: each bundle's SHA-256 and each image's signed digest, the record to check against inside. `offline` refuses to run where `github.com` answers. It pushes to the mirror path you give, so use a scratch path, not the one Compose pulls from. It needs `cosign`, `skopeo`, `jq` and `curl`.
+`./release` holds both arches' offline, Hermes and harness bundles with their `.sha256` and `.sigstore.json`, as attached to the release. `online` runs the release's botd, so run it on x86_64 or aarch64 Linux. It writes `release-check.expected`: each bundle's SHA-256 and each image's signed digest, the record to check against inside. To check bundles you are about to name in `MACHINE_HERMES_BUNDLE` and `MACHINE_HARNESS_BUNDLE`, run `botd harness check-bundles <files>`: it says what machines would install from them, or why botd would refuse them. `offline` refuses to run where `github.com` answers. It pushes to the mirror path you give, so use a scratch path, not the one Compose pulls from. It needs `cosign`, `skopeo`, `jq` and `curl`.
 
 ## Installing
 
