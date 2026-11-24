@@ -633,6 +633,11 @@ export interface ServiceAccountsView {
   view?: "all" | "own";
   /** What the caller may give the ones they own (ADR 0182). Servers from before it leave it out. */
   choices?: ServiceAccountChoices | null;
+  /**
+   * False for an owner without users.manage, who may only see theirs, revoke their tokens and
+   * disable them (ADR 0239). Servers from before it leave it out: only managers got a list.
+   */
+  manage?: boolean;
   /** Every permission a token can be scoped to. */
   scopes: string[];
   defaultDays: number;
@@ -1246,6 +1251,8 @@ export interface Me {
   permissions?: string[];
   session?: boolean;
   tier?: TierView;
+  /** How many live service accounts they own (ADR 0239). */
+  ownedServiceAccounts?: number | null;
 }
 
 export interface AppState {

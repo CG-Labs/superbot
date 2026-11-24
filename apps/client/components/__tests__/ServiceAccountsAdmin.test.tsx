@@ -98,6 +98,15 @@ async function open(api: ReturnType<typeof mockApi>, u: ReturnType<typeof userEv
   await screen.findByLabelText("Revoke CI");
 }
 
+// The first render loads and transforms React Native's lazy modules, which on a cold, busy CI
+// runner takes longer than a test's 5 s; pay for it once here, with the list and a detail open.
+beforeAll(async () => {
+  const { unmount } = await show(mockApi());
+  await userEvent.setup().press(await screen.findByLabelText("Service account HR sync"));
+  await screen.findByLabelText("Revoke CI");
+  await unmount();
+}, 60_000);
+
 describe("ServiceAccountsAdmin (ADR 0143, 0152)", () => {
   beforeEach(() => jest.clearAllMocks());
 
@@ -376,5 +385,45 @@ describe("ServiceAccountsAdmin for a delegate (ADR 0182)", () => {
     await show(api);
     expect(await screen.findByText("Service accounts")).toBeTruthy();
     expect(api.roles).not.toHaveBeenCalled();
+  });
+});
+
+describe("ServiceAccountsAdmin for an owner who manages none (ADR 0239)", () => {
+  beforeEach(() => jest.clearAllMocks());
+  const OWNED: ServiceAccountsView = { ...VIEW, view: "own", manage: false, choices: null };
+
+  it("shows theirs and its tokens, with revoke and disable but nothing that makes or changes one", async () => {
+    const api = mockApi(OWNED);
+    const u = userEvent.setup();
+    await show(api, false);
+    expect(await screen.findByText("Your service accounts")).toBeTruthy();
+    expect(screen.queryByLabelText("New service account")).toBeNull();
+    await u.press(screen.getByLabelText("Service account HR sync"));
+    await screen.findByLabelText("Revoke CI");
+    expect(screen.getByText(/acts with your access/)).toBeTruthy();
+    for (const label of ["Rotate CI", "Make token", "Service account name", "Save", "Delete", "Enable"]) expect(screen.queryByLabelText(label)).toBeNull();
+    expect(api.roles).not.toHaveBeenCalled();
+    expect(api.teams).not.toHaveBeenCalled();
+
+    await u.press(screen.getByLabelText("Revoke CI"));
+    await waitFor(() => expect(api.revokeServiceToken).toHaveBeenCalledWith("sa1", "st1"));
+    await u.press(screen.getByLabelText("Disable"));
+    await waitFor(() => expect(api.updateServiceAccount).toHaveBeenCalledWith("sa1", { status: "disabled" }));
+  });
+
+  it("leaves enabling a disabled one to an admin", async () => {
+    const api = mockApi({ ...OWNED, serviceAccounts: [{ ...SA, status: "disabled" }] });
+    const u = userEvent.setup();
+    await show(api, false);
+    await u.press(await screen.findByLabelText("Service account HR sync"));
+    expect(await screen.findByText(/Ask an admin to enable it again/)).toBeTruthy();
+    expect(screen.queryByLabelText("Enable")).toBeNull();
+    expect(screen.queryByLabelText("Disable")).toBeNull();
+  });
+
+  it("treats a server from before it as managing, since only managers got a list", async () => {
+    const api = mockApi({ ...OWN, manage: undefined });
+    await show(api, false);
+    expect(await screen.findByLabelText("New service account")).toBeTruthy();
   });
 });
