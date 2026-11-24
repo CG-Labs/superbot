@@ -24,7 +24,7 @@ case "$1" in
 pack)
   printf 'registry=%s\n' "${npm_config_registry:-}" > "$here/npm-saw"
   [ -z "${NODE_EXTRA_CA_CERTS:-}" ] || cat "$NODE_EXTRA_CA_CERTS" >> "$here/npm-saw"
-  [ -z "${npm_config_userconfig:-}" ] || { printf 'userconfig %s\n' "$(stat -c %a "$npm_config_userconfig")"; cat "$npm_config_userconfig"; } >> "$here/npm-saw"
+  [ -z "${npm_config_userconfig:-}" ] || { printf 'userconfig %s in %s\n' "$(stat -c %a "$npm_config_userconfig")" "$(stat -c %a "$(dirname "$npm_config_userconfig")")"; cat "$npm_config_userconfig"; } >> "$here/npm-saw"
   cp "$here/pkgs/$2.tgz" "$4/$2.tgz"
   printf '[{"filename":"%s.tgz","integrity":"%s"}]\n' "$2" "$(cat "$here/pkgs/$2.sri")"
   ;;
@@ -355,11 +355,12 @@ async fn machines_sign_in_to_the_operators_registry_with_botds_login() {
     .await;
     assert_eq!(v["agent"]["plan"].as_str(), Some(plan.id().as_str()), "{v}");
 
-    // npm was handed a userconfig only root reads, naming only the plan's registry.
+    // npm was handed a userconfig only root reads, outside the tools Bots read, naming
+    // only the plan's registry.
     let saw = std::fs::read_to_string(m.cfg.tools.join("node-0.0.1/npm-saw")).unwrap();
     let dart = crate::machines::tools::nerf_dart(&mirror.registry()).unwrap();
-    assert!(saw.contains(&format!("userconfig 600\n{dart}:_authToken={token}\n")), "{saw}");
-    assert!(!m.cfg.tools.join(".dl").exists(), "the login goes with the downloads");
+    assert!(saw.contains(&format!("userconfig 600 in 700\n{dart}:_authToken={token}\n")), "{saw}");
+    assert!(!std::path::PathBuf::from(format!("{}.login", m.cfg.tools.display())).exists(), "the login goes when the install ends");
     let state = std::fs::read_to_string(m.cfg.tools.join("state.json")).unwrap_or_default();
     assert!(!state.contains(token), "and the agent never saves it");
 

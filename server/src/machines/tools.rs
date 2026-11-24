@@ -390,7 +390,8 @@ impl Tools {
             root: Default::default(),
             control: Default::default(),
         });
-        // An install a restart cut short starts again.
+        // An install a restart cut short starts again, and its login is gone first.
+        let _ = std::fs::remove_dir_all(t.login_dir());
         {
             let mut s = t.lock();
             for st in s.status.values_mut() {
@@ -614,10 +615,20 @@ impl Tools {
     async fn in_dl(&self, step: impl std::future::Future<Output = Result<(), String>>) -> Result<(), String> {
         let dl = self.dir.join(".dl");
         let _ = std::fs::remove_dir_all(&dl);
+        let _ = std::fs::remove_dir_all(self.login_dir());
         std::fs::create_dir_all(&dl).map_err(|e| e.to_string())?;
         let res = step.await;
         let _ = std::fs::remove_dir_all(&dl);
+        let _ = std::fs::remove_dir_all(self.login_dir());
         res
+    }
+
+    /// Where an install keeps the registry's login (ADR 0219): beside the tools, not in
+    /// them, since `open_up` opens everything in them to Bots, at any time.
+    fn login_dir(&self) -> PathBuf {
+        let mut d = self.dir.clone().into_os_string();
+        d.push(".login");
+        PathBuf::from(d)
     }
 
     async fn install(&self, h: &HarnessInstall, node: Option<&NodeRuntime>) -> Result<String, String> {
@@ -781,7 +792,10 @@ impl Tools {
             let registry = registry.as_deref().ok_or("a login is only for the plan's own npm registry")?;
             let l = self.npm_login(registry).await?;
             hide.extend(l.token.iter().chain(l.auth.iter()).cloned());
-            let file = self.dir.join(".dl").join("npmrc");
+            let dir = self.login_dir();
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            let file = dir.join("npmrc");
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -1568,8 +1582,12 @@ mod tests {
         t.in_dl(async {
             let (env, hide) = t.npm_env().await?;
             let file = env.iter().find(|(k, _)| *k == "npm_config_userconfig").map(|(_, v)| PathBuf::from(v)).unwrap();
-            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
-            *seen.lock().unwrap() = Some((std::fs::read_to_string(&file).unwrap(), mode, hide, env.iter().any(|(k, v)| *k == "npm_config_registry" && v == registry)));
+            // A Bot user made while npm runs opens the tools to Bots; the login isn't in them.
+            t.open_up().unwrap();
+            let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert!(!file.starts_with(&t.dir), "{}", file.display());
+            assert_eq!(mode(file.parent().unwrap()), 0o700, "a folder only root opens");
+            *seen.lock().unwrap() = Some((std::fs::read_to_string(&file).unwrap(), mode(&file), hide, env.iter().any(|(k, v)| *k == "npm_config_registry" && v == registry), file));
             Ok(())
         })
         .await
@@ -1579,8 +1597,16 @@ mod tests {
         assert_eq!(seen.1, 0o600, "root's alone");
         assert_eq!(seen.2, ["tok-1234-abcd"], "taken out of npm's errors");
         assert!(seen.3);
-        assert!(!dir.join(".dl").exists(), "the login goes with the downloads");
+        assert!(!seen.4.parent().unwrap().exists(), "the login goes when the install ends");
         assert!(!std::fs::read_to_string(dir.join(STATE_FILE)).unwrap().contains("tok-1234-abcd"), "and is never saved");
+
+        // One a restart cut short is gone before anything opens the tools again.
+        let left = t.login_dir();
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::write(left.join("npmrc"), "left over").unwrap();
+        drop(t);
+        let t = Tools::new(dir.clone(), None).unwrap();
+        assert!(!t.login_dir().exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
