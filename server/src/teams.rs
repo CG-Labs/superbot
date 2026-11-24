@@ -209,6 +209,10 @@ fn member_view(app: &AppState, m: &TeamMember, machines: bool) -> Value {
         "role": m.role, "joinedAt": m.joined_at, "active": u.as_ref().is_some_and(User::active),
         "customRole": crate::roles::held(app, m.role_id.as_deref(), m.role_expires_at),
     });
+    // A role their IdP gives them (ADR 0206) is changed by the mapping, not the team (ADR 0254).
+    if v["customRole"].is_object() && crate::roles::scim_source(app, &m.user_id, "team").is_some() {
+        v["customRole"]["fromIdp"] = json!(true);
+    }
     if machines {
         v["machine"] = machine_view(app, &m.team_id, &m.user_id);
     }
@@ -729,7 +733,62 @@ pub async fn mine(State(app): State<AppState>, Extension(c): Extension<Caller>) 
     }
     v["customRole"] = crate::roles::held(&app, m.role_id.as_deref(), m.role_expires_at);
     v["permissions"] = json!(team_perms(&app.db, &m).names());
+    if manages(&m.role) && c.can(Perm::Write) {
+        crate::roles::expire_due(&app);
+        v["roleChoices"] = role_choices(&app);
+    }
     Ok(Json(v))
+}
+
+/// The custom roles a team's owners and admins may give in it (ADR 0254): those that add
+/// something there, with what they add. Owners and admins hold every team permission, so
+/// none of these gives more than making someone a team admin would.
+fn role_choices(app: &AppState) -> Value {
+    let roles = app.db.custom_roles().into_iter().filter(|r| r.perms().in_team() != Perms::NONE);
+    json!(roles.map(|r| json!({ "id": r.id, "name": r.name, "description": r.description, "applies": r.perms().in_team().names(), "maxDays": r.max_days })).collect::<Vec<_>>())
+}
+
+/// The teammate a team's owner or admin may give or take a custom role from (ADR 0254):
+/// someone else on the team, whose role there isn't from their identity provider.
+fn role_target(app: &AppState, c: &Caller, key: &str) -> Res<(User, TeamMember, Team)> {
+    let (me_user, _, t) = my_managed_team(app, c)?;
+    crate::roles::expire_due(app);
+    let (u, m) = teammate(app, &t.id, key)?;
+    if u.id == me_user.id {
+        return Err(conflict("You can't change your own role in the team. Ask another of its owners or admins."));
+    }
+    if crate::roles::scim_source(app, &u.id, "team").is_some() {
+        return Err(conflict("Their role in the team comes from your identity provider (a SCIM group). A server admin changes that mapping."));
+    }
+    Ok((u, m, t))
+}
+
+/// `PUT /api/team/members/{user}/custom-role` `{role, expiresAt?, reason?}` (ADR 0254): a
+/// team's owner or admin gives a member of it one of the custom roles that add something
+/// in a team, until `expiresAt` or with no end, as a server admin can (ADR 0123, 0197).
+/// Only its team permissions apply, only there. Not to its owners and admins, who can do
+/// all of that already.
+pub async fn give_custom_role(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(key): Path<String>, Json(v): Json<Value>) -> Res {
+    let (u, m, t) = role_target(&app, &c, &key)?;
+    let mut body = v.as_object().cloned().ok_or_else(|| bad("Send a JSON object."))?;
+    let role = body.remove("role").and_then(|r| r.as_str().map(str::to_string)).ok_or_else(|| bad("Send role: the custom role's id or name."))?;
+    let r = crate::roles::need_role(&app, &role)?;
+    if r.perms().in_team() == Perms::NONE {
+        return Err(conflict(format!("{} adds nothing in a team: it has none of users.manage, billing.manage and machines.manage.", r.name)));
+    }
+    let giving = crate::roles::parse_giving(&Value::Object(body), &r)?;
+    if m.role != MEMBER {
+        return Err(conflict(format!("They're the team's {}, so they can do all of that already.", m.role)));
+    }
+    crate::roles::give_in_team(&app, &by, &r, &t, &u, giving, Some("team")).map(Json)
+}
+
+/// `DELETE /api/team/members/{user}/custom-role` (ADR 0254): takes away the custom role
+/// they hold in the team, whoever gave it.
+pub async fn take_custom_role(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
+    let (u, m, t) = role_target(&app, &c, &key)?;
+    let r = m.role_id.as_deref().and_then(|id| app.db.custom_role(id)).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "They have no custom role in the team.".into()))?;
+    crate::roles::take_in_team(&app, &by, &r, &t, &u, Some("team")).map(Json)
 }
 
 /// `POST /api/team/leave`: off your team. Its last owner can't while others are on it.

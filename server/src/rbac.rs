@@ -338,6 +338,7 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         ("POST", ["team", "billing", "checkout" | "portal"]) => Write,
         ("DELETE", ["team", "invites", _] | ["me", "team-invites", _]) => Write,
         ("PATCH" | "DELETE", ["team", "members", _]) => Write,
+        ("PUT" | "DELETE", ["team", "members", _, "custom-role"]) => Write,
         ("POST", ["team", "members", _, "machine"] | ["team", "members", _, "machine", "suspend" | "resume"]) => Write,
         // This session's phone for push notifications (ADR 0080). Handlers refuse Bots.
         // Read-only people can't decide approvals or run routines, so they don't add one;
@@ -703,6 +704,10 @@ mod tests {
             ("DELETE", "/api/team/members/u1", Perm::Write),
             ("GET", "/api/team/members/u1/offboarding", Perm::Account),
             ("POST", "/api/team/members/u1/offboarding", Perm::Admin),
+            ("PUT", "/api/team/members/u1/custom-role", Perm::Write),
+            ("DELETE", "/api/team/members/u1/custom-role", Perm::Write),
+            ("GET", "/api/team/members/u1/custom-role", Perm::Admin),
+            ("PATCH", "/api/team/members/u1/custom-role", Perm::Admin),
             ("POST", "/api/team/members/u1/machine", Perm::Write),
             ("POST", "/api/team/members/u1/machine/suspend", Perm::Write),
             ("POST", "/api/team/members/u1/machine/resume", Perm::Write),

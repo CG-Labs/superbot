@@ -107,7 +107,7 @@ fn person(u: &User) -> Value {
 
 /// The SCIM mapping (ADR 0138) or role group (ADR 0180, within a team ADR 0206) that
 /// gave `user_id` their role in `scope`, if one did.
-fn scim_source(app: &AppState, user_id: &str, scope: &str) -> Option<String> {
+pub(crate) fn scim_source(app: &AppState, user_id: &str, scope: &str) -> Option<String> {
     let mapped = app.db.scim_role_grants_of_user(user_id).into_iter().find(|g| g.scope == scope).map(|g| g.mapping_id);
     let group = || if scope == "org" { app.db.scim_role_group_grant_of_user(user_id) } else { app.db.scim_team_role_group_grant_of_user(user_id) };
     mapped.or_else(|| group().map(|g| g.group_id))
@@ -118,7 +118,7 @@ fn saml_source(app: &AppState, user_id: &str) -> Option<String> {
     app.db.saml_role_grant_of_user(user_id).map(|g| g.mapping_id)
 }
 
-fn need_role(app: &AppState, key: &str) -> Res<CustomRole> {
+pub(crate) fn need_role(app: &AppState, key: &str) -> Res<CustomRole> {
     app.db.find_custom_role(key).ok_or_else(|| not_found("Role"))
 }
 
@@ -175,7 +175,7 @@ pub(crate) fn time(ms: i64) -> String {
 }
 
 /// A `PUT` giving a role: `{expiresAt?, reason?}`, or no body at all (ADR 0197).
-struct Giving {
+pub(crate) struct Giving {
     until: Option<i64>,
     reason: Option<String>,
 }
@@ -193,7 +193,7 @@ fn optional_body(headers: &HeaderMap, body: Result<Json<Value>, JsonRejection>) 
     }
 }
 
-fn parse_giving(v: &Value, r: &CustomRole) -> Res<Giving> {
+pub(crate) fn parse_giving(v: &Value, r: &CustomRole) -> Res<Giving> {
     only_fields(v, &["expiresAt", "reason"])?;
     let at = crate::db::now();
     let until = match &v["expiresAt"] {
@@ -449,20 +449,29 @@ pub async fn assign_in_team(State(app): State<AppState>, Extension(by): Extensio
     let r = need_role(&app, &key)?;
     let giving = parse_giving(&optional_body(&headers, body)?, &r)?;
     let (t, u, _) = team_member(&app, &team, &user)?;
+    give_in_team(&app, &by, &r, &t, &u, giving, None).map(Json)
+}
+
+/// Gives `r` to `u` within `t`, for a server admin or, `via: "team"`, for the team's own
+/// owners and admins (ADR 0254), who checked first whom and what they may give.
+pub(crate) fn give_in_team(app: &AppState, by: &Who, r: &CustomRole, t: &crate::db::Team, u: &User, giving: Giving, via: Option<&str>) -> Res<Value> {
     if u.role == Role::Readonly {
         return Err(conflict("They're read-only, so they change nothing, in a team too. Make them a member first."));
     }
     let g = app.db.give_team_custom_role_until(&t.id, &u.id, &r.id, giving.until).ok_or_else(|| match app.db.team_member(&u.id).filter(|m| m.team_id == t.id) {
-        Some(_) => gone_or_changed(&app, &r.id),
+        Some(_) => gone_or_changed(app, &r.id),
         None => not_found("Team member"),
     })?;
     let (had, ended) = g.before;
     if had.as_deref() != Some(r.id.as_str()) || ended != giving.until || g.taken.is_some() {
-        let from = held(&app, had.as_deref(), ended);
-        let d = json!({ "name": r.name, "user": u.id, "scope": "team", "team": t.id, "from": from, "applies": r.perms().in_team().names(), "expiresAt": giving.until, "reason": giving.reason, "takenFromScim": g.taken });
+        let from = held(app, had.as_deref(), ended);
+        let mut d = json!({ "name": r.name, "user": u.id, "scope": "team", "team": t.id, "from": from, "applies": r.perms().in_team().names(), "expiresAt": giving.until, "reason": giving.reason, "takenFromScim": g.taken });
+        if let Some(via) = via {
+            d["via"] = json!(via);
+        }
         app.db.record(&by.event("role.assigned").target("role", &r.id).details(d));
     }
-    Ok(Json(json!({ "team": { "id": t.id, "name": t.name }, "user": person(&u), "role": held(&app, Some(&r.id), giving.until), "applies": r.perms().in_team().names() })))
+    Ok(json!({ "team": { "id": t.id, "name": t.name }, "user": person(u), "role": held(app, Some(&r.id), giving.until), "applies": r.perms().in_team().names() }))
 }
 
 /// `DELETE /api/roles/{id}/teams/{team}/users/{user}`.
@@ -470,10 +479,22 @@ pub async fn unassign_in_team(State(app): State<AppState>, Extension(by): Extens
     expire_due(&app);
     let r = need_role(&app, &key)?;
     let (t, u, m) = team_member(&app, &team, &user)?;
-    let scim = scim_source(&app, &u.id, "team");
-    if m.role_id.as_deref() != Some(r.id.as_str()) || !app.db.set_team_custom_role(&t.id, &u.id, None) {
+    if m.role_id.as_deref() != Some(r.id.as_str()) {
         return Err(ApiError(StatusCode::NOT_FOUND, "They don't have this role in the team.".into()));
     }
-    app.db.record(&by.event("role.unassigned").target("role", &r.id).details(json!({ "name": r.name, "user": u.id, "scope": "team", "team": t.id, "scimMapping": scim })));
-    Ok(Json(json!({ "team": { "id": t.id, "name": t.name }, "user": person(&u), "role": Value::Null })))
+    take_in_team(&app, &by, &r, &t, &u, None).map(Json)
+}
+
+/// Takes `r` away from `u` within `t`, as `give_in_team` gives it.
+pub(crate) fn take_in_team(app: &AppState, by: &Who, r: &CustomRole, t: &crate::db::Team, u: &User, via: Option<&str>) -> Res<Value> {
+    let scim = scim_source(app, &u.id, "team");
+    if !app.db.set_team_custom_role(&t.id, &u.id, None) {
+        return Err(ApiError(StatusCode::NOT_FOUND, "They don't have this role in the team.".into()));
+    }
+    let mut d = json!({ "name": r.name, "user": u.id, "scope": "team", "team": t.id, "scimMapping": scim });
+    if let Some(via) = via {
+        d["via"] = json!(via);
+    }
+    app.db.record(&by.event("role.unassigned").target("role", &r.id).details(d));
+    Ok(json!({ "team": { "id": t.id, "name": t.name }, "user": person(u), "role": Value::Null }))
 }

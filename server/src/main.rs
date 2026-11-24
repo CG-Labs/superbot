@@ -297,6 +297,8 @@ mod team_billing;
 mod team_billing_http_tests;
 mod teams;
 #[cfg(test)]
+mod team_roles_http_tests;
+#[cfg(test)]
 mod teams_http_tests;
 #[cfg(test)]
 mod teams_offboard_tests;
@@ -1228,6 +1230,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/team/invites/{id}", delete(teams::uninvite))
         .route("/team/members/{user}", patch(teams::set_role).delete(teams::remove))
         .route("/team/members/{user}/offboarding", get(teams::offboarding))
+        .route("/team/members/{user}/custom-role", put(teams::give_custom_role).delete(teams::take_custom_role))
         .route("/team/members/{user}/machine", post(teams::give_machine))
         .route("/team/members/{user}/machine/suspend", post(teams::suspend))
         .route("/team/members/{user}/machine/resume", post(teams::resume))
