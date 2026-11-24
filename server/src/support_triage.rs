@@ -140,10 +140,12 @@ pub fn read_tar(bytes: &[u8]) -> Result<Bundle, String> {
         if b.files.contains_key(file) {
             return Err(format!("two {file} in the tar: send one bundle at a time"));
         }
-        let data = bounded(entry, file)?;
-        if let Some(folder) = folder {
-            b.name = folder.to_string();
+        let folder = folder.unwrap_or_default();
+        if !b.files.is_empty() && b.name != folder {
+            return Err("files from more than one folder in the tar: send one bundle at a time".into());
         }
+        let data = bounded(entry, file)?;
+        b.name = folder.to_string();
         b.files.insert(file.to_string(), data);
     }
     if b.files.is_empty() {
@@ -761,19 +763,11 @@ fn sounds_bad(msg: &str) -> bool {
 }
 
 fn log_rules(file: &str, text: &str, out: &mut Vec<Finding>) {
-    if text.trim_start().starts_with("# no logs") {
-        out.push(
-            Finding::new("logs.none", Level::Info, None, "No log lines in the bundle", file)
-                .runbook("support/support-check.md#the-offline-bundle")
-                .next("Ask for them: `botd support bundle --logs botd.log` with the service's log saved as botd.log (journalctl -u superbot -o cat, or docker compose logs botd)."),
-        );
-        return;
-    }
     let (mut lines, mut problems, mut panics) = (0u64, 0u64, 0u64);
     let mut top: BTreeMap<String, u64> = BTreeMap::new();
     for (level, msg) in text.lines().filter_map(log_line) {
         lines += 1;
-        let panic = msg.contains("panicked");
+        let panic = msg == "server.panic" || msg.contains("panicked");
         panics += u64::from(panic);
         let bad = panic
             || match level.as_deref() {
@@ -784,6 +778,21 @@ fn log_rules(file: &str, text: &str, out: &mut Vec<Finding>) {
             problems += 1;
             *top.entry(shape(&msg)).or_default() += 1;
         }
+    }
+    // The offline bundle writes why it has no logs as a `#` comment: no --logs, an unreadable
+    // file, a failed or empty journalctl.
+    let why = text.lines().map(str::trim).find_map(|l| l.strip_prefix('#')).map(|w| clean(w.trim()));
+    if lines == 0 && (why.is_some() || file == "logs.txt") {
+        let summary = match why.filter(|w| !w.is_empty()) {
+            Some(w) => format!("No log lines in the bundle: {w}"),
+            None => "No log lines in the bundle".to_string(),
+        };
+        out.push(
+            Finding::new("logs.none", Level::Info, None, summary, file)
+                .runbook("support/support-check.md#the-offline-bundle")
+                .next("Ask for them: `botd support bundle --logs botd.log` with the service's log saved as botd.log (journalctl -u superbot -o cat, or docker compose logs botd)."),
+        );
+        return;
     }
     if panics > 0 {
         out.push(
@@ -812,7 +821,11 @@ fn check_rules(check: &Value, out: &mut Vec<Finding>) {
     for c in check["findings"].as_array().into_iter().flatten() {
         let (Some(id), Some(status)) = (str_at(c, "id"), str_at(c, "status")) else { continue };
         let summary = str_at(c, "summary").map(clean).unwrap_or_default();
-        let not_running = id == "botd" && status != "ok" && summary.contains("isn't running");
+        // Down: nothing holds the lock, or it does but /healthz doesn't answer (hung, or still
+        // starting). Only "/healthz answers but no lock" is left a plain warning.
+        let healthz = c["details"]["healthz"].as_bool();
+        let hung = (healthz == Some(false) && !c["details"]["pid"].is_null()) || summary.contains("doesn't answer");
+        let not_running = id == "botd" && status != "ok" && (healthz == Some(false) || summary.contains("isn't running") || summary.contains("doesn't answer"));
         let (lvl, sev, book) = match (id, status) {
             ("botd", _) if not_running => (Level::Fail, Some(1), "support/runbook-machine-down.md#the-server-itself"),
             ("data_dir" | "database" | "master_key", "fail") => (Level::Fail, Some(1), "support/runbook-server-restore.md"),
@@ -828,7 +841,10 @@ fn check_rules(check: &Value, out: &mut Vec<Finding>) {
         if let Some(fix) = str_at(c, "fix") {
             f = f.next(clean(fix));
         }
-        if not_running {
+        if not_running && hung {
+            f.summary.push_str(" (unless it's still starting: schema changes on a large database take a while)");
+            f = f.runbook("support/runbook-major-incident.md");
+        } else if not_running {
             f.summary.push_str(" (unless it was stopped on purpose, for an upgrade or a restore)");
             f = f.runbook("support/runbook-major-incident.md");
         }
@@ -1129,10 +1145,10 @@ impl Triage {
         out
     }
 
-    /// For the ticket's internal note: escaped so bundle text can't break the table or
-    /// add HTML.
+    /// For the ticket's internal note: escaped so bundle text can't break the table, add
+    /// HTML, or make a link or an image (which a ticket system may fetch).
     pub fn markdown(&self) -> String {
-        let md = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('|', "\\|");
+        let md = |s: &str| s.replace('\\', "\\\\").replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('|', "\\|").replace('[', "\\[").replace(']', "\\]");
         let link = |r: &str| format!("[{}](docs/{r})", r.split('#').next().unwrap_or(r).rsplit('/').next().unwrap_or(r));
         let mut out = format!("## Support triage: {}\n\n", md(&self.name));
         out.push_str(&format!("{} bundle, botd {}, {}.\n\n", self.kind.as_str(), md(self.botd.as_deref().unwrap_or("?")), self.made()));
@@ -1379,6 +1395,10 @@ mod tests {
         let t = triage(&b, &opts()).unwrap();
         assert_eq!(find(&t, "logs.problems").summary, "3 warnings in the newest 4 log lines; most frequent: ×2 model call failed: # after # ms | ×1 thread 'tokio' panicked at src/x.rs:#");
         assert!(find(&t, "logs.panic").next.as_ref().unwrap().contains("level 3"));
+
+        let hook = r#"{"ts":"2026-11-24T05:00:00Z","level":"warn","msg":"server.panic","panic":"index out of bounds","location":"src/x.rs:1:2"}"#;
+        b.files.insert("logs.jsonl".into(), hook.as_bytes().to_vec());
+        assert_eq!(find(&triage(&b, &opts()).unwrap(), "logs.panic").summary, "botd panicked once in its newest 1 log line");
     }
 
     fn offline(check: Value, logs: &str) -> Bundle {
@@ -1416,8 +1436,27 @@ mod tests {
         assert_eq!(t.severity().unwrap().0, 1);
 
         let quiet = check(json!([{ "id": "botd", "status": "ok", "summary": "running, pid 7" }]));
-        let t = triage(&offline(quiet, "# no logs: pass --logs <file>\n"), &opts()).unwrap();
+        let t = triage(&offline(quiet.clone(), "# no logs: pass --logs <file>\n"), &opts()).unwrap();
         assert_eq!(ids(&t), ["logs.none"]);
+        for why in ["# /srv/botd.log: No such file or directory (os error 2)\n", "# journalctl: Failed to connect\n", "# journalctl had no lines for superbot\n", ""] {
+            let t = triage(&offline(quiet.clone(), why), &opts()).unwrap();
+            let none = find(&t, "logs.none");
+            assert!(none.summary.ends_with(why.trim().trim_start_matches("# ")), "{why:?}: {none:?}");
+        }
+        assert!(!ids(&triage(&online(vec![]), &opts()).unwrap()).contains(&"logs.none"), "an online bundle's empty log is a fresh start");
+
+        // Holding the lock with /healthz silent is a hung (or still starting) server.
+        let hung = check(
+            json!([{ "id": "botd", "status": "warn", "summary": "running (pid 7), but /healthz doesn't answer on 127.0.0.1:3000", "details": { "pid": 7, "address": "127.0.0.1:3000", "healthz": false } }]),
+        );
+        let botd = find(&triage(&offline(hung, "x\n"), &opts()).unwrap(), "check.botd").clone();
+        assert_eq!((botd.level, botd.severity), (Level::Fail, Some(1)));
+        assert!(botd.summary.ends_with("(unless it's still starting: schema changes on a large database take a while)"), "{botd:?}");
+        assert!(botd.runbooks.contains(&"support/runbook-major-incident.md"));
+        let odd =
+            check(json!([{ "id": "botd", "status": "warn", "summary": "/healthz answers on 127.0.0.1:3000, but nothing holds this DATA_DIR's lock", "details": { "pid": null, "healthz": true } }]));
+        let botd = find(&triage(&offline(odd, "x\n"), &opts()).unwrap(), "check.botd").clone();
+        assert_eq!((botd.level, botd.severity), (Level::Warn, None));
     }
 
     #[test]
@@ -1485,6 +1524,10 @@ mod tests {
         assert!(!s.contains('\u{1b}') && !s.contains('\n'), "{s:?}");
         let md = t.markdown();
         assert!(md.contains("&lt;script&gt;\\|x\\|") && !md.contains("<script>"), "{md}");
+        let mut h = healthy();
+        h["status"]["incidents"] = json!([{ "title": "![x](https://example.invalid/p) \\[y](https://example.invalid/q) [z][r]", "impact": "minor", "state": "identified" }]);
+        let md = triage(&online(vec![("health.json", h)]), &opts()).unwrap().markdown();
+        assert!(md.contains("!\\[x\\](https://example.invalid/p) \\\\\\[y\\](https://example.invalid/q) \\[z\\]\\[r\\]"), "no link or image survives: {md}");
         assert_eq!(clean(&"a".repeat(TEXT + 5)).chars().count(), TEXT + 1);
     }
 
@@ -1555,6 +1598,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert!(read_tar(&tar_of(&[("a/version.json", &v), ("b/version.json", &v)])).unwrap_err().contains("two version.json"));
+        assert!(read_tar(&tar_of(&[("older/version.json", &v), ("newer/health.json", &h)])).unwrap_err().contains("more than one folder"));
+        assert!(read_tar(&tar_of(&[("version.json", &v), ("newer/health.json", &h)])).unwrap_err().contains("more than one folder"));
+        assert_eq!(read_tar(&tar_of(&[("version.json", &v), ("health.json", &h)])).unwrap().files.len(), 2, "a bundle tarred without its folder");
         assert!(read_tar(&tar_of(&[("readme.md", b"x")])).unwrap_err().contains("no support bundle files"));
         assert!(read_tar(b"definitely not a tar file, just some words that go on for a while").is_err());
     }

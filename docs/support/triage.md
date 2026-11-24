@@ -73,8 +73,8 @@ A server in testing mode isn't production, and Severity 1 and 2 are for producti
 | `score.falling` | `health-score-history.json` | The score fell 15 points or more, or left healthy | | [History](health-score.md#history) |
 | `audit.sign_in`, `audit.scim`, `audit.access`, `audit.residency`, `audit.run_limits`, `audit.machines`, `audit.approvals`, `audit.harness`, `audit.license`, `audit.other` | `audit-summary.json` | Failures and denials in the bundle's 7 days, by the runbook they point at, with the newest reason codes; a warning at 10 or more (not `audit.other`) | | the runbook for each |
 | `audit.truncated` | the same | The summary hit its limit | | |
-| `logs.problems`, `logs.panic`, `logs.none` | `logs.jsonl` or `logs.txt` | Warnings (or, in text logs, lines that report a failure) by message, the most frequent first; a panic, which is a bug for level 3; no logs | | [Escalation](escalation.md) |
-| `check.botd` | `check.json`, the offline bundle | botd isn't running, unless stopped on purpose | 1 | [The server itself](runbook-machine-down.md#the-server-itself), [Severity 1](runbook-major-incident.md) |
+| `logs.problems`, `logs.panic`, `logs.none` | `logs.jsonl` or `logs.txt` | Warnings (or, in text logs, lines that report a failure) by message, the most frequent first; a panic (`server.panic`), which is a bug for level 3; no logs, with the reason the offline bundle gives (no `--logs`, an unreadable file, a failed or empty journal) | | [Escalation](escalation.md) |
+| `check.botd` | `check.json`, the offline bundle | botd isn't running (unless stopped on purpose), or holds its lock but `/healthz` doesn't answer (hung, unless it's still starting) | 1 | [The server itself](runbook-machine-down.md#the-server-itself), [Severity 1](runbook-major-incident.md) |
 | `check.data_dir`, `check.master_key` | the same | Failed | 1 | [Server restore](runbook-server-restore.md) |
 | `check.database` | the same | Failed; warned | 1; 3 | [Server restore](runbook-server-restore.md); [the checks](support-check.md#the-checks) |
 | `check.disk` | the same | Failed; warned | 1; 3 | [The server itself](runbook-machine-down.md#the-server-itself) |
@@ -87,7 +87,7 @@ A check finding brings `botd support check`'s own fix as its next step.
 
 ## Reading a bundle safely
 
-The bundle comes from outside the Provider, so the triage treats it as untrusted. It reads only the files bundles have, only plain files, at most 64 MiB unpacked in all (a gzip that unpacks to more is refused), and never writes the bundle to disk. Text from the bundle (an incident title, a log message) is cut to 240 characters and stripped of control characters, and the Markdown escapes it, so it can't break the table or add HTML to the ticket.
+The bundle comes from outside the Provider, so the triage treats it as untrusted. It reads only the files bundles have, only plain files, all from one folder (two bundles in one tar are refused), at most 64 MiB unpacked in all (a gzip that unpacks to more is refused), and never writes the bundle to disk. Text from the bundle (an incident title, a log message) is cut to 240 characters and stripped of control characters, and the Markdown escapes it, so it can't break the table, add HTML, or make a link or an image the ticket system might fetch.
 
 The triage repeats only what the bundle already has, which botd redacted before the customer sent it ([what's never in it](support-bundle.md#whats-never-in-it)): no secrets, chats, names, emails or IP addresses. If a bundle has one anyway, that's a bug: tell `<security-email>`, and keep the triage out of the ticket until it's removed.
 

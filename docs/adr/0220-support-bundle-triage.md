@@ -30,7 +30,7 @@ The suggestion is the most severe finding's. Support still sets the severity: a 
 
 ### The bundle is untrusted input
 
-Only the eleven file names bundles use are read, only as plain files at most one folder deep; two files with one name are refused rather than guessed between; the whole is at most 64 MiB unpacked, checked while reading, so a gzip bomb stops at the limit; nothing is written to disk. Every string taken from the bundle is cut to 240 characters with control characters removed, so a crafted incident title or log line can't rewrite the terminal, and the Markdown escapes `&`, `<`, `>` and `|`, so it can't add HTML or break the table in a ticket. The triage adds nothing the bundle doesn't have, and botd redacted the bundle before it was sent.
+Only the eleven file names bundles use are read, only as plain files at most one folder deep; two files with one name, or files from two folders, are refused rather than guessed between or mixed; the whole is at most 64 MiB unpacked, checked while reading, so a gzip bomb stops at the limit; nothing is written to disk. Every string taken from the bundle is cut to 240 characters with control characters removed, so a crafted incident title or log line can't rewrite the terminal, and the Markdown escapes `\`, `&`, `<`, `>`, `|`, `[` and `]`, so it can't add HTML, break the table, or make a link or an image a ticket system would fetch. The triage adds nothing the bundle doesn't have, and botd redacted the bundle before it was sent.
 
 ### Kept in step with the bundles
 
