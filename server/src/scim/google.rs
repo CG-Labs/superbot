@@ -8,6 +8,11 @@
 //! one that would remove or disable more people than GOOGLE_DIRECTORY_MAX_REMOVALS (or
 //! everyone) waits for an admin's `--force`. A person an admin disabled stays disabled
 //! even when Google has them active: the sync only enables people it disabled itself.
+//!
+//! With GOOGLE_DIRECTORY_PUSH=on, Google also tells botd when a user changes, and a pass
+//! starts within seconds (`push`, ADR 0216).
+
+pub mod push;
 
 use super::*;
 use crate::db::ScimGroup;
@@ -65,6 +70,9 @@ pub struct Settings {
     pub api: String,
     pub interval: Duration,
     pub max_removals: usize,
+    /// GOOGLE_DIRECTORY_PUSH=on: the https address Google sends user changes to
+    /// (`push::PATH` on PUBLIC_URL), each starting a pass at once (ADR 0216).
+    pub push: Option<String>,
 }
 
 impl Settings {
@@ -128,7 +136,8 @@ impl Settings {
         };
         let minutes = number(var, "GOOGLE_DIRECTORY_INTERVAL_MINUTES", 30, 5, 1440)?;
         let max_removals = number(var, "GOOGLE_DIRECTORY_MAX_REMOVALS", 10, 1, 1_000_000)?;
-        Ok(Some(Settings { tenant, customer, groups, teams, role_groups, sso, admin, api, interval: Duration::from_secs(minutes as u64 * 60), max_removals }))
+        let push = push::address(var)?;
+        Ok(Some(Settings { tenant, customer, groups, teams, role_groups, sso, admin, api, interval: Duration::from_secs(minutes as u64 * 60), max_removals, push }))
     }
 
     /// Whether the group `key` gives its members an account.
@@ -326,6 +335,18 @@ fn google_error(body: &[u8]) -> String {
     }
 }
 
+/// Why the Directory API answered `status` (not 2xx) for `what`.
+fn refused(status: reqwest::StatusCode, body: &[u8], what: &str) -> Failure {
+    let why = google_error(body);
+    match status.as_u16() {
+        401 => fail("sign_in", format!("Google refused the access token for {what} ({why})")),
+        403 => fail("forbidden", format!("Google won't let the service account read {what} ({why}). Check its scopes, and that GOOGLE_DIRECTORY_ADMIN is an admin who may.")),
+        404 => fail("not_found", format!("Google has no {what}, or the service account can't see it ({why})")),
+        429 => fail("rate_limited", format!("Google is rate limiting the Directory API ({why})")),
+        _ => fail("google_error", format!("Google's Directory API answered {status} for {what} ({why})")),
+    }
+}
+
 async fn read(mut res: reqwest::Response, what: &str) -> Result<Vec<u8>, Failure> {
     let mut out = Vec::new();
     while let Some(chunk) = res.chunk().await.map_err(|e| fail("unreachable", format!("Google's answer for {what} was cut off: {}", e.without_url())))? {
@@ -345,6 +366,7 @@ pub struct Directory {
     running: tokio::sync::Mutex<()>,
     last: std::sync::Mutex<Option<Value>>,
     last_success: std::sync::Mutex<Option<Value>>,
+    pub push: push::Push,
 }
 
 impl Directory {
@@ -365,14 +387,15 @@ impl Directory {
         service_account(&json)?;
         let loopback = url::Url::parse(&settings.api).ok().and_then(|u| u.host_str().map(crate::is_loopback_host)).unwrap_or(false);
         let http = reqwest::Client::builder().https_only(!loopback).connect_timeout(CONNECT_TIMEOUT).timeout(TIMEOUT).redirect(reqwest::redirect::Policy::none()).build().map_err(|e| e.to_string())?;
-        Ok(Directory { settings, key, http, running: tokio::sync::Mutex::new(()), last: std::sync::Mutex::new(None), last_success: std::sync::Mutex::new(None) })
+        let push = push::Push::new(settings.push.clone());
+        Ok(Directory { settings, key, http, running: tokio::sync::Mutex::new(()), last: std::sync::Mutex::new(None), last_success: std::sync::Mutex::new(None), push })
     }
 
     pub fn describe(&self) -> String {
         let s = &self.settings;
         let groups = s.groups.iter().chain(&s.teams).chain(&s.role_groups).collect::<HashSet<_>>().len();
         format!(
-            "on, every {} minutes into the SCIM tenant {}; {groups} group{}, {} of them teams and {} role groups; {}; at most {} removals a pass",
+            "on, every {} minutes into the SCIM tenant {}; {groups} group{}, {} of them teams and {} role groups; {}; at most {} removals a pass; {}",
             s.interval.as_secs() / 60,
             s.tenant,
             if groups == 1 { "" } else { "s" },
@@ -382,7 +405,11 @@ impl Directory {
                 Some(p) => format!("users sign in with {p}"),
                 None => "no SSO link (GOOGLE_DIRECTORY_SSO)".into(),
             },
-            s.max_removals
+            s.max_removals,
+            match &s.push {
+                Some(a) => format!("Google pushes user changes to {a} (ADR 0216)"),
+                None => "no push (GOOGLE_DIRECTORY_PUSH=off)".into(),
+            }
         )
     }
 
@@ -417,14 +444,7 @@ impl Directory {
         let status = res.status();
         let body = read(res, what).await?;
         if !status.is_success() {
-            let why = google_error(&body);
-            return Err(match status.as_u16() {
-                401 => fail("sign_in", format!("Google refused the access token for {what} ({why})")),
-                403 => fail("forbidden", format!("Google won't let the service account read {what} ({why}). Check its scopes, and that GOOGLE_DIRECTORY_ADMIN is an admin who may.")),
-                404 => fail("not_found", format!("Google has no {what}, or the service account can't see it ({why})")),
-                429 => fail("rate_limited", format!("Google is rate limiting the Directory API ({why})")),
-                _ => fail("google_error", format!("Google's Directory API answered {status} for {what} ({why})")),
-            });
+            return Err(refused(status, &body, what));
         }
         let v: Value = serde_json::from_slice(&body).map_err(|_| odd(what))?;
         if v["kind"] != kind {
@@ -517,6 +537,7 @@ impl Directory {
             "running": self.running.try_lock().is_err(),
             "last": *self.last.lock().unwrap(),
             "lastSuccess": *self.last_success.lock().unwrap(),
+            "push": self.push.status(),
         })
     }
 }
@@ -728,22 +749,44 @@ impl Tally {
 pub enum Trigger {
     Schedule,
     Admin { force: bool },
+    /// Google said a user changed (ADR 0216).
+    Push,
 }
 
 /// One pass: read the directory, then write what changed. The summary is audited as
 /// `scim.google_sync`; an error means nobody was changed.
 pub async fn run(a: &Arc<Auth>, d: &Directory, trigger: Trigger) -> Result<Value, Failure> {
     let Some(app) = a.app.clone() else { return Err(fail("not_ready", "botd isn't serving yet")) };
-    let _one = d.running.try_lock().map_err(|_| fail("running", "A pass is running already. Try again when it's done."))?;
+    // A pass already running may have read the directory before the change Google
+    // pushed, so a pushed pass waits for it rather than being dropped.
+    let _one = match trigger {
+        Trigger::Push => d.running.lock().await,
+        _ => d.running.try_lock().map_err(|_| fail("running", "A pass is running already. Try again when it's done."))?,
+    };
     let started = Instant::now();
     let force = matches!(trigger, Trigger::Admin { force: true });
     let s = &d.settings;
     let c = caller(a, s);
-    let base = json!({ "tenant": s.tenant, "trigger": if matches!(trigger, Trigger::Schedule) { "schedule" } else { "admin" }, "force": force });
+    let name = match trigger {
+        Trigger::Schedule => "schedule",
+        Trigger::Admin { .. } => "admin",
+        Trigger::Push => "push",
+    };
+    let mut base = json!({ "tenant": s.tenant, "trigger": name, "force": force });
+    // Taken as the pass starts: a change pushed from here on gets a pass of its own.
+    let pushed = d.push.begin();
+    if !pushed.is_empty() {
+        base["pushed"] = json!(pushed);
+    }
     let result = match d.fetch().await {
         Ok(snap) => apply(a, &app, d, &c, snap, force).await,
         Err(f) => Err(f),
     };
+    // The schedule retries its own passes sooner, but not an admin's: one that took a
+    // pushed change and didn't apply it gives the change back for a pushed pass.
+    if matches!(trigger, Trigger::Admin { .. }) && retry_soon(&result) {
+        d.push.give_back(&pushed);
+    }
     let mut details = base;
     details["ms"] = json!(started.elapsed().as_millis() as u64);
     details["at"] = json!(crate::db::now());
@@ -1066,25 +1109,30 @@ async fn push_role_groups(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Call
     }
 }
 
-/// Passes every GOOGLE_DIRECTORY_INTERVAL_MINUTES, the first a minute after start, and
-/// sooner again after one that failed.
+/// Passes every GOOGLE_DIRECTORY_INTERVAL_MINUTES, the first a minute after start,
+/// sooner again after one that failed, and within seconds of Google pushing a change
+/// (ADR 0216), whose channels this starts too.
 pub fn start(a: Arc<Auth>) {
     let Some(d) = a.scim.google.clone() else { return };
+    push::start(a.clone(), d.clone());
     tokio::spawn(async move {
-        tokio::time::sleep(FIRST_PASS).await;
+        let mut trigger = d.push.wait(FIRST_PASS).await;
         loop {
-            let wait = next_wait(&run(&a, &d, Trigger::Schedule).await, d.settings.interval);
-            tokio::time::sleep(wait).await;
+            let wait = next_wait(&run(&a, &d, trigger).await, d.settings.interval);
+            trigger = d.push.wait(wait).await;
         }
     });
 }
 
 /// A pass that failed, or wrote with failures, is tried again sooner than the interval.
 fn next_wait(result: &Result<Value, Failure>, interval: Duration) -> Duration {
+    if retry_soon(result) { RETRY.min(interval) } else { interval }
+}
+
+fn retry_soon(result: &Result<Value, Failure>) -> bool {
     match result {
-        Err(f) if f.reason != "running" => RETRY.min(interval),
-        Ok(summary) if summary["failed"].as_u64().unwrap_or(0) > 0 => RETRY.min(interval),
-        _ => interval,
+        Err(f) => f.reason != "running",
+        Ok(summary) => summary["failed"].as_u64().unwrap_or(0) > 0,
     }
 }
 

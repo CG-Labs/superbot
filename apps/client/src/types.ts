@@ -1407,6 +1407,8 @@ export interface MyResidency {
     /** The server holds every pin to its own region (RESIDENCY_SERVER_DATA=require), so being outside it is a fault. */
     required?: boolean;
   };
+  /** Whether the pin's region keeps chats in a database of its own (ADR 0215), whether all your Bots' chats are in the region, whether some are still to move there, and how many backups of another region's store still hold them from before they moved. Missing from servers before it. */
+  chats?: { store: boolean; inRegion: boolean; moving?: boolean; earlierBackups?: number };
   /** The pins whose residency report you can get. */
   reports: ("user" | "team")[];
 }

@@ -45,7 +45,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use provider::Claims;
 pub use provider::{ClaimMap, ENTRA_AUTHORITY, GOOGLE_ISSUER, IdpSource, Kind, Provider, domain, guid, secure_url};
-use saml_sp::{Encryption, IdpInitiated, KeyUse, Refused, Sp, SpKey, SpSigning};
+use saml_sp::{AesCbc, Encryption, IdpInitiated, KeyUse, Refused, Sp, SpKey, SpSigning};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -405,7 +405,7 @@ const TYPES: [&str; 6] = ["entra", "google", "oidc", "apple", "github", "saml"];
 
 /// Settings that only mean something for some types. Set on another, they would look like
 /// a restriction that isn't there, so they are refused.
-const ONLY_FOR: [(&str, &[&str]); 32] = [
+const ONLY_FOR: [(&str, &[&str]); 33] = [
     ("TENANT", &["entra"]),
     ("ALLOWED_TENANTS", &["entra"]),
     ("AUTHORITY", &["entra"]),
@@ -429,6 +429,7 @@ const ONLY_FOR: [(&str, &[&str]); 32] = [
     ("SIGN_REQUESTS", &["saml"]),
     ("SP_CERT_FILE", &["saml"]),
     ("ENCRYPTED_ASSERTIONS", &["saml"]),
+    ("AES_CBC", &["saml"]),
     ("SP_ENCRYPTION_CERT_FILE", &["saml"]),
     ("METADATA_SIGNING_CERT_FILE", &["saml"]),
     ("SIGNED_METADATA", &["saml"]),
@@ -442,7 +443,7 @@ const ONLY_FOR: [(&str, &[&str]); 32] = [
 
 /// The SAML bridge's settings (with `ISSUER`), and native SAML's (without), so each refuses the other's.
 const SAML_BRIDGE_ONLY: [&str; 6] = ["CLIENT_ID", "IDP_ALIAS", "SCOPES", "SUBJECT_CLAIM", "EMAIL_CLAIM", "NAME_CLAIM"];
-const SAML_NATIVE_ONLY: [&str; 17] = [
+const SAML_NATIVE_ONLY: [&str; 18] = [
     "IDP_METADATA_URL",
     "IDP_METADATA_FILE",
     "SP_ENTITY_ID",
@@ -451,6 +452,7 @@ const SAML_NATIVE_ONLY: [&str; 17] = [
     "SIGN_REQUESTS",
     "SP_CERT_FILE",
     "ENCRYPTED_ASSERTIONS",
+    "AES_CBC",
     "SP_ENCRYPTION_CERT_FILE",
     "METADATA_SIGNING_CERT_FILE",
     "SIGNED_METADATA",
@@ -617,6 +619,13 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
             if encryption == Encryption::Off && enc_cert.is_some() {
                 return Err(format!("{} is only for {}=allow or require", key("SP_ENCRYPTION_CERT_FILE"), key("ENCRYPTED_ASSERTIONS")));
             }
+            let aes_cbc = match var(&key("AES_CBC")) {
+                None => AesCbc::Off,
+                Some(v) => AesCbc::parse(&v).ok_or_else(|| format!("{} must be off or signed-response", key("AES_CBC")))?,
+            };
+            if encryption == Encryption::Off && aes_cbc != AesCbc::Off {
+                return Err(format!("{} is only for {}=allow or require", key("AES_CBC"), key("ENCRYPTED_ASSERTIONS")));
+            }
             let same_key = |a: &str, b: &str| matches!((xmldsig::Cert::from_base64(a), xmldsig::Cert::from_base64(b)), (Ok(a), Ok(b)) if a.same_key(&b));
             if let (Some(e), Some(s)) = (&enc_cert, &sp_cert)
                 && same_key(e, s)
@@ -634,7 +643,7 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
                 Some(v) => IdpInitiated::parse(&v).ok_or_else(|| format!("{} must be off or restart", key("IDP_INITIATED")))?,
             };
             let authn_context = authn_context(&key, var, list, &attributes)?;
-            (Kind::SamlSp { entity_id, sp_entity_id, source, attributes, required_groups, allowed_domains, sign_requests, sp_cert, encryption, enc_cert, metadata_trust, idp_initiated, authn_context }, saml::LABEL)
+            (Kind::SamlSp { entity_id, sp_entity_id, source, attributes, required_groups, allowed_domains, sign_requests, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context }, saml::LABEL)
         }
         "saml" => {
             if let Some(k) = SAML_NATIVE_ONLY.iter().find(|k| var(&key(k)).is_some()) {
@@ -784,6 +793,9 @@ fn claim_details(d: &mut Value, c: &Claims) {
     if let Some(a) = &c.authn_context {
         d["authnContext"] = json!(a);
     }
+    if let Some(e) = c.encryption {
+        d["assertionEncryption"] = json!(e);
+    }
 }
 
 /// The IdP's type (entra, google, oidc, apple, github, saml), beside the configured id.
@@ -793,7 +805,7 @@ pub(crate) fn idp_type(a: &Auth, provider: &str) -> Option<&'static str> {
 
 /// Failures anyone can cause without the IdP's help, by opening a callback URL.
 /// Native SAML's are the ones before the IdP's signature was checked.
-const UNVOUCHED: [&str; 18] = [
+const UNVOUCHED: [&str; 19] = [
     "unknown_state",
     "wrong_provider",
     "binder_mismatch",
@@ -806,6 +818,7 @@ const UNVOUCHED: [&str; 18] = [
     "unencrypted_assertion",
     "bad_encryption",
     "weak_key_transport",
+    "cbc_unsigned_response",
     "no_sp_key",
     "unsigned",
     "bad_signature",
@@ -1098,7 +1111,7 @@ pub async fn acs(Extension(a): Extension<Arc<Auth>>, Extension(source): Extensio
 /// response. A refusal says whether it counts against the client's address.
 async fn check_saml(a: &Auth, app: &AppState, p: &Provider, posted: &str, request_id: Option<&str>, at: i64) -> Result<saml_sp::Checked, (Refused, bool)> {
     let idp = idp_metadata(a, p).await.map_err(|e| (Refused(e.0, None), false))?;
-    let Kind::SamlSp { sp_entity_id, attributes, encryption, .. } = &p.kind else {
+    let Kind::SamlSp { sp_entity_id, attributes, encryption, aes_cbc, .. } = &p.kind else {
         return Err((Refused("wrong_provider", None), true));
     };
     let (decrypt, held) = match encryption {
@@ -1121,6 +1134,7 @@ async fn check_saml(a: &Auth, app: &AppState, p: &Provider, posted: &str, reques
         now_ms: at,
         decrypt: &keys,
         require_encrypted: *encryption == Encryption::Require,
+        aes_cbc: *aes_cbc,
     };
     let checked = saml_sp::check_response(posted, &expect).map_err(|r| {
         let counts = r.0 != "idp_error";
@@ -1290,7 +1304,7 @@ pub async fn saml_metadata(Extension(a): Extension<Arc<Auth>>, Path(id): Path<St
     let Some(p) = a.sso.provider(&id).filter(|p| p.saml_sp()) else {
         return not_found("SAML provider").into_response();
     };
-    let Kind::SamlSp { sp_entity_id, sign_requests, encryption, .. } = &p.kind else {
+    let Kind::SamlSp { sp_entity_id, sign_requests, encryption, aes_cbc, .. } = &p.kind else {
         return not_found("SAML provider").into_response();
     };
     let keys = a.app.as_ref().and_then(|app| published_keys(app, p, KeyUse::Signing).map_err(|e| crate::obs::log::log_warn!("SSO {id}: no SP key for the metadata: {e}")).ok());
@@ -1302,7 +1316,7 @@ pub async fn saml_metadata(Extension(a): Extension<Arc<Auth>>, Path(id): Path<St
     let signing_certs: Vec<&str> = keys.iter().flatten().map(|k| k.cert.as_str()).collect();
     let signing = keys.as_ref().map(|_| SpSigning { certs: &signing_certs, slo: &slo, slo_soap: &slo_soap, sign_requests: *sign_requests });
     let enc_certs: Vec<&str> = enc.iter().map(|k| k.cert.as_str()).collect();
-    let md = saml_sp::sp_metadata(&Sp { entity_id: sp_entity_id, acs: &acs }, signing.as_ref(), &enc_certs);
+    let md = saml_sp::sp_metadata(&Sp { entity_id: sp_entity_id, acs: &acs }, signing.as_ref(), &enc_certs, *aes_cbc);
     ([(header::CONTENT_TYPE, "application/samlmetadata+xml")], md).into_response()
 }
 
@@ -1674,7 +1688,7 @@ fn saml_provider<'a>(a: &'a Auth, id: &str) -> Result<&'a Arc<Provider>, ApiErro
 }
 
 fn saml_view(a: &Auth, p: &Provider) -> Value {
-    let Kind::SamlSp { entity_id, sp_entity_id, source, attributes, required_groups, sign_requests, sp_cert, encryption, enc_cert, metadata_trust, idp_initiated, authn_context, .. } = &p.kind else {
+    let Kind::SamlSp { entity_id, sp_entity_id, source, attributes, required_groups, sign_requests, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, .. } = &p.kind else {
         return json!({});
     };
     let now = db::now();
@@ -1733,7 +1747,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
         "spEntityId": sp_entity_id, "acsUrl": a.sso.acs_url(&p.id), "metadataUrl": a.sso.sp_metadata_url(&p.id),
         "sloUrl": a.sso.slo_url(&p.id), "signRequests": sign_requests, "spKey": sp_key, "singleLogout": slo,
         "sloSoapUrl": a.sso.slo_soap_url(&p.id), "backChannelLogout": back_channel,
-        "encryptedAssertions": encryption.as_str(), "spEncryptionKey": enc_key,
+        "encryptedAssertions": encryption.as_str(), "aesCbc": aes_cbc.as_str(), "spEncryptionKey": enc_key,
         "signedMetadata": metadata_trust.as_ref().map_or("off", |t| if t.require { "require" } else { "allow" }),
         "metadataSigningCertificates": metadata_trust.as_ref().map(|t| t.certs.iter().map(cert).collect::<Vec<_>>()),
         "idpEntityId": entity_id, "source": source.name(), "from": from, "idp": idp,
@@ -2327,7 +2341,7 @@ mod tests {
         let p = s.provider("corp").unwrap();
         assert!(p.saml_sp() && !p.oidc() && !p.needs_secret());
         assert_eq!((p.type_name(), p.jit_role), ("saml", None), "audited as idp=saml, like the bridge");
-        assert!(matches!(&p.kind, Kind::SamlSp { entity_id, sp_entity_id, source: IdpSource::Saved, attributes, required_groups, allowed_domains, sign_requests: false, sp_cert: None, encryption: Encryption::Off, enc_cert: None, metadata_trust: None, idp_initiated: IdpInitiated::Off, authn_context: None }
+        assert!(matches!(&p.kind, Kind::SamlSp { entity_id, sp_entity_id, source: IdpSource::Saved, attributes, required_groups, allowed_domains, sign_requests: false, sp_cert: None, encryption: Encryption::Off, aes_cbc: AesCbc::Off, enc_cert: None, metadata_trust: None, idp_initiated: IdpInitiated::Off, authn_context: None }
             if entity_id == ADFS && sp_entity_id == "https://bot.example.com/api/auth/sso/corp/metadata" && attributes.email.is_none() && attributes.groups.is_none() && required_groups.is_empty() && allowed_domains.is_empty()));
         assert_eq!((p.env_var(), s.slo_url("corp")), ("SSO_CORP_PRIVATE_KEY".to_string(), "https://bot.example.com/api/auth/sso/corp/slo".to_string()));
         assert_eq!(s.callback_url("corp"), "https://bot.example.com/api/auth/sso/corp/acs");
@@ -2498,6 +2512,22 @@ mod tests {
         }
         assert!(native(&[("SSO_CORP_ENCRYPTED_ASSERTIONS", "true")]).err().unwrap().contains("off, allow, or require"));
         assert!(saml(&[("SSO_ADFS_ENCRYPTED_ASSERTIONS", "allow")]).is_err(), "the bridge decrypts in Keycloak");
+
+        // AES-CBC in signed responses (ADR 0218): off unless asked, and only with encryption on.
+        let aes_cbc = |s: &Sso| match &s.providers[0].kind {
+            Kind::SamlSp { aes_cbc, .. } => *aes_cbc,
+            _ => unreachable!(),
+        };
+        assert_eq!(aes_cbc(&native(&[("SSO_CORP_ENCRYPTED_ASSERTIONS", "require")]).unwrap()), AesCbc::Off);
+        for v in ["signed-response", "Signed-Response"] {
+            assert_eq!(aes_cbc(&native(&[("SSO_CORP_ENCRYPTED_ASSERTIONS", "allow"), ("SSO_CORP_AES_CBC", v)]).unwrap()), AesCbc::SignedResponse, "{v}");
+        }
+        assert_eq!(aes_cbc(&native(&[("SSO_CORP_AES_CBC", "off")]).unwrap()), AesCbc::Off, "off needs nothing else");
+        let err = native(&[("SSO_CORP_ENCRYPTED_ASSERTIONS", "allow"), ("SSO_CORP_AES_CBC", "true")]).err().unwrap();
+        assert!(err.contains("SSO_CORP_AES_CBC must be off or signed-response"), "{err}");
+        let err = native(&[("SSO_CORP_AES_CBC", "signed-response")]).err().unwrap();
+        assert!(err.contains("SSO_CORP_AES_CBC is only for SSO_CORP_ENCRYPTED_ASSERTIONS=allow or require"), "{err}");
+        assert!(saml(&[("SSO_ADFS_AES_CBC", "signed-response")]).is_err(), "native SAML only");
 
         let dir = std::env::temp_dir().join(format!("superbot-sp-enc-{}", random_hex()));
         std::fs::create_dir_all(&dir).unwrap();
