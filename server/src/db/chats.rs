@@ -27,6 +27,7 @@ use crate::secrets::sealed::{self, Cipher, StoreApprovals};
 use rusqlite::{Connection, OptionalExtension, ToSql, params};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
 /// A table whose rows are kept, by Bot, in the store of its owner's pin.
 struct Kept {
@@ -82,6 +83,9 @@ pub(super) struct ChatStores {
     stores: Vec<ChatStore>,
     /// Each kept table's columns, quoted, in the order botd's own table has them.
     cols: Vec<String>,
+    /// A checkpoint after rows left a place was blocked by a reader, so their zeroed pages
+    /// may not have replaced the old ones in its file yet. Each pass tries again.
+    unflushed: std::sync::atomic::AtomicBool,
 }
 
 /// What attaching the stores did, for the startup log.
@@ -250,6 +254,12 @@ fn held_in(c: &Connection, schema: &str, filter: &str, p: &[&dyn ToSql]) -> rusq
     Ok(Held::of(n))
 }
 
+/// Checkpoints `schema`'s WAL into its file and empties it, so the zeroed pages replace
+/// the old ones there. False when a reader blocked it.
+fn flush(c: &Connection, schema: &str) -> bool {
+    c.query_row(&format!("PRAGMA {schema}.wal_checkpoint(TRUNCATE)"), [], |r| r.get::<_, i64>(0)).is_ok_and(|busy| busy == 0)
+}
+
 /// Runs `f` with `secure_delete` on for every attached file, so what it deletes or
 /// overwrites is zeroed rather than left in free pages, then sets it back.
 fn zeroing<T>(c: &Connection, f: impl FnOnce() -> rusqlite::Result<T>) -> rusqlite::Result<T> {
@@ -391,12 +401,24 @@ impl Db {
         }
         if !stores.is_empty() {
             for (k, cols) in KEPT.iter().zip(&cols) {
+                // A move stopped between its copy and its delete leaves a row in two places
+                // until the next pass; each id is read from the first place that has it, so
+                // the scheduler doesn't run a routine twice (updates by id keep both alike).
                 let rowid = if k.rowid { ", rowid AS rowid" } else { "" };
-                let parts: Vec<String> = schemas(&stores).map(|s| format!("SELECT {cols}{rowid} FROM {s}.{}", k.name)).collect();
+                let places: Vec<&str> = schemas(&stores).collect();
+                let parts: Vec<String> = places
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        let t = k.name;
+                        let earlier: Vec<String> = places[..i].iter().map(|e| format!(" AND NOT EXISTS (SELECT 1 FROM {e}.{t} WHERE id = x.id)")).collect();
+                        format!("SELECT {cols}{rowid} FROM {s}.{t} AS x WHERE true{}", earlier.concat())
+                    })
+                    .collect();
                 c.execute_batch(&format!("CREATE TEMP VIEW {} AS {}", k.name, parts.join(" UNION ALL "))).map_err(e)?;
             }
         }
-        let _ = self.5.set(ChatStores { stores, cols });
+        let _ = self.5.set(ChatStores { stores, cols, unflushed: Default::default() });
         Ok(out)
     }
 
@@ -546,11 +568,17 @@ impl Db {
             tx.commit()?;
             Ok(moves)
         })?;
-        if !moves.is_empty() {
-            // Busy (another connection reading) leaves the WAL for the next checkpoint.
-            let _ = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0));
+        if !moves.is_empty() || set.unflushed.load(Ordering::Relaxed) {
+            let done = schemas(&set.stores).fold(true, |done, s| flush(&c, s) && done);
+            set.unflushed.store(!done, Ordering::Relaxed);
         }
         Ok(moves)
+    }
+
+    /// True while rows that left a place may still be readable in its file, because a
+    /// reader blocked the checkpoint after the move. The next pass tries again.
+    pub fn chat_stores_unflushed(&self) -> bool {
+        self.5.get().is_some_and(|s| s.unflushed.load(Ordering::Relaxed))
     }
 
     /// What of the Bots `owners` own is in each place: botd's own database first, then each
@@ -616,9 +644,10 @@ impl Db {
                 .map_err(|e| e.to_string())
                 .and_then(|r| r)
                 .map_err(|e| format!("{}'s chat store: {e}", s.region))?;
-            if r.sealed + r.resealed + r.discarded > 0 {
-                // Busy (another connection reading) leaves the WAL for the next checkpoint.
-                let _ = c.query_row(&format!("PRAGMA {}.wal_checkpoint(TRUNCATE)", s.schema), [], |r| r.get::<_, i64>(0));
+            if r.sealed + r.resealed + r.discarded > 0 && !flush(&c, &s.schema) {
+                if let Some(set) = self.5.get() {
+                    set.unflushed.store(true, Ordering::Relaxed);
+                }
             }
             done.add(&r);
         }
@@ -831,7 +860,8 @@ mod tests {
         db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
         // As if the store's commit landed and botd's own didn't.
         db.c().execute("INSERT INTO chats_0.messages SELECT * FROM main.messages WHERE id = ?1", [m.id]).unwrap();
-        assert_eq!(db.message_count(&bot), 2);
+        assert_eq!((count(&db, "main", "messages"), count(&db, "chats_0", "messages")), (1, 1));
+        assert_eq!(db.message_count(&bot), 1, "read once meanwhile");
         db.place_chats().unwrap();
         assert_eq!((db.message_count(&bot), db.chat_place_of(m.id)), (1, Some(Some("gb-lon".into()))));
     }
@@ -1124,6 +1154,7 @@ mod tests {
         CRASH_AFTER_COPY.with(|c| c.set(true));
         assert!(db.place_chats().is_err());
         assert_eq!((count(&db, "chats_0", "routines"), count(&db, "main", "routines")), (1, 1), "copied, original kept");
+        assert_eq!((db.routines(None).len(), db.approvals(None, None, 10).len()), (1, 1), "each read once, so the scheduler doesn't run it twice");
         // A decision meanwhile reaches both copies, so neither is stale.
         assert!(db.finish_approval(&a, "denied", "ada", None, None));
         assert_eq!(db.place_chats().unwrap(), vec![mv(None, Some("gb-lon"), 1, [0, 1, 1])]);
@@ -1158,6 +1189,28 @@ mod tests {
         for w in words {
             assert!(!holds(&lon, w) && !holds(&d.lon.join("chats.sqlite-wal"), w), "{w} left in London's store");
         }
+    }
+
+    #[test]
+    fn a_checkpoint_a_reader_blocked_is_tried_again_on_the_next_pass() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        let bot = bot_of(&db, &ada);
+        let word = "routine-7a41d9-instruction";
+        db.add_routine(&bot, "daily", "0 9 * * *", word);
+        db.c().query_row("PRAGMA main.wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0)).unwrap();
+        let app = d.dir.path().join("app.sqlite");
+        let holds = || std::fs::read(&app).is_ok_and(|b| b.windows(word.len()).any(|x| x == word.as_bytes()));
+        assert!(holds());
+        let reader = Connection::open(&app).unwrap();
+        reader.execute_batch("BEGIN; SELECT COUNT(*) FROM bots;").unwrap();
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        assert_eq!(db.place_chats().unwrap().len(), 1);
+        assert!(db.chat_stores_unflushed() && holds(), "the old page is still in the file");
+        reader.execute_batch("COMMIT").unwrap();
+        assert_eq!(db.place_chats().unwrap(), Vec::new());
+        assert!(!db.chat_stores_unflushed() && !holds(), "a pass with nothing to move finishes it");
     }
 
     #[test]

@@ -27,7 +27,8 @@ Both are per Bot, like chats, and the report listed both as "not covered" in bot
 - A Bot's routines and approvals are kept where its chat is: in the store of its owner's pin region (their team's pin, else their own), else in botd's own database. Every rule of ADR 0215 applies: moves on pins, unpins, every reconcile pass and at startup; copy committed before delete; a crash leaving a row in both places is cleared on the next pass; rows of deleted Bots left in a store are deleted on the same pass.
 - The store gets `routines` and `approvals` tables with botd's columns (adding any botd's tables gain later), `id` as the primary key, and their indexes (`routines(bot_id)`, `approvals(status, created_at)`, `approvals(bot_id)`). Policy rules, run grants and every other table stay in botd's own database.
 - A TEMP view per table puts botd's own rows and each store's together, so every read (the approvals inbox, a Bot's routines, the scheduler, exports, erasure checks) is unchanged.
-- The approvals view also has a `rowid` column (each part's own rowid). A view's rowid is NULL, and the inbox breaks ties in `created_at` by rowid, so two approvals asked in the same millisecond keep the order they were asked in. Rowids aren't unique across places; they only order rows with the same time.
+- Each view reads an id from the first place that has it (botd's own database, then the stores in order). A move stopped between its copy and its delete (a crash, a full disk) leaves a row in two places until the next pass; without this, the scheduler would see a routine twice and run it twice, and the inbox would list an approval twice. Updates by id reach both copies, so the one read is current. This applies to chats too, which ADR 0215 showed twice in that window.
+- The approvals view also has a `rowid` column (each part's own rowid). A view's rowid is NULL, and the inbox breaks ties in `created_at` by rowid, so two approvals asked in the same millisecond in the same place keep the order they were asked in. Rowids are per file: same-millisecond approvals in different places, or moved since, are in a fixed but arbitrary order. A shared sequence would fix that at the cost of a column in botd's own `approvals` and its migrations; one millisecond doesn't warrant it.
 
 ### Ids
 
@@ -45,6 +46,7 @@ Both are per Bot, like chats, and the report listed both as "not covered" in bot
 ### Nothing left behind
 
 - When a move deletes rows from a file, `secure_delete` is on for that transaction, so the deleted rows are zeroed rather than left in free pages, and the WAL is checkpointed and truncated after a pass that moved anything. The same goes for chats. A move out of a store then leaves nothing readable in that file; its backups from before still hold the rows, as ADR 0215 discloses.
+- The zeroed pages only replace the old ones in the file at the checkpoint. A reader on another connection (a store backup, for example) can block it; botd then remembers that, logs a warning, and checkpoints again on every pass, moves or not, until it completes.
 
 ### Sealed input under the master key
 
@@ -88,6 +90,8 @@ Both are per Bot, like chats, and the report listed both as "not covered" in bot
   - erasure deletes a person's routines and clears their decisions in a store;
   - a move stopped between its copy and its delete loses nothing, and the next pass clears the duplicate;
   - moved rows leave no copy in the file they left (raw file bytes, WAL included);
+  - a checkpoint a reader blocked is tried again on the next pass, even with nothing to move;
+  - a row left in two places by a stopped move is read once meanwhile;
   - a dropped store holding routines or approvals stops botd;
   - a store gets the columns botd's tables gained since it was made;
   - startup seals a store's approvals under the current key: plaintext sealed, previous key's values sealed again, unreadable ones left during a rotation, refused outside one, dropped with forget.

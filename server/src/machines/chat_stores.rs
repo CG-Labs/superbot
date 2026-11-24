@@ -215,6 +215,9 @@ pub fn place(db: &Db) -> Vec<ChatMove> {
             return Vec::new();
         }
     };
+    if db.chat_stores_unflushed() {
+        log_warn!("Regional chat stores: a reader kept botd from emptying a database's WAL after rows left it, so they may still be readable in its file; the next pass tries again (ADR 0228).");
+    }
     for m in &moves {
         db.record(&Who::system(ACTOR).event(MOVED).details(json!({
             "from": m.from, "to": m.to, "bots": m.bots, "messages": m.messages, "routines": m.routines, "approvals": m.approvals,
