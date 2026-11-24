@@ -1,6 +1,6 @@
 # Provision users and teams from Google Workspace
 
-botd reads your Google Workspace directory and keeps SuperBot's users in step with it: the people in groups you choose get an account, follow their name, email and suspension in Google, and lose access when they leave the groups. Groups you choose can become teams. Design: [ADR 0162](../adr/0162-google-workspace-directory-sync.md).
+botd reads your Google Workspace directory and keeps SuperBot's users in step with it: the people in groups or organizational units you choose get an account, follow their name, email and suspension in Google, and lose access when they leave them. Groups and organizational units you choose can become teams. Design: [ADR 0162](../adr/0162-google-workspace-directory-sync.md), and [ADR 0234](../adr/0234-google-workspace-organizational-units.md) for organizational units.
 
 **Why not SCIM?** Google Workspace pushes SCIM only to apps in its own catalog. Custom SCIM apps exist only as a limited beta. So botd pulls instead: a service account with read-only access lists users and group members through the [Admin SDK Directory API](https://developers.google.com/workspace/admin/directory/v1/guides), and each pass runs the changes through SuperBot's own SCIM code ([SCIM guide](scim.md)). The rules are the same: same roles, same deprovisioning, same teams, same audit events. If your Workspace has Google's custom SCIM beta, you can point it at `/scim/v2` with a token instead ([SCIM guide](scim.md)). Don't use both on the same tenant.
 
@@ -30,12 +30,25 @@ https://www.googleapis.com/auth/admin.directory.user.readonly,https://www.google
 
 The service account then acts as an admin you name in `GOOGLE_DIRECTORY_ADMIN`. Pick one who can read users and groups. A dedicated admin with a custom role that has only **Users → Read** and **Groups → Read** is best: botd can never do more than that admin can, and never more than the two scopes allow.
 
-**B. An admin role for the service account itself.** In the Admin console: **Account → Admin roles**, make a custom role with **Users → Read** and **Groups → Read**, then **Assign service accounts** and enter the service account's email. Leave `GOOGLE_DIRECTORY_ADMIN` empty. This needs no delegation at all.
+If you choose [organizational units](#3-choose-the-groups-or-organizational-units) (other than `/`), add a third read-only scope, and give that admin **Organizational Units → Read** too:
 
-## 3. Choose the groups
+```text
+https://www.googleapis.com/auth/admin.directory.user.readonly,https://www.googleapis.com/auth/admin.directory.group.readonly,https://www.googleapis.com/auth/admin.directory.orgunit.readonly
+```
+
+**B. An admin role for the service account itself.** In the Admin console: **Account → Admin roles**, make a custom role with **Users → Read** and **Groups → Read** (and **Organizational Units → Read** if you choose organizational units), then **Assign service accounts** and enter the service account's email. Leave `GOOGLE_DIRECTORY_ADMIN` empty. This needs no delegation at all.
+
+## 3. Choose the groups or organizational units
 
 - **Who gets an account**: one or more groups, e.g. `superbot-users@example.com`. Nested groups count. Members from outside your Workspace never get one. A group with everyone in your organization as a member gives everyone an account.
 - **Teams** (optional, needs `SCIM_GROUPS=on`): groups that become SuperBot teams, e.g. `eng@example.com`. Their members get an account too. A person is on one team at most: if they are in two team groups, the first one listed wins. Two addresses of one Google group are one team.
+
+Or, if you organize people by **organizational unit** (OU), choose OUs instead of groups, or as well ([ADR 0234](../adr/0234-google-workspace-organizational-units.md)):
+
+- **Who gets an account**: OUs by path, e.g. `/Sales`, or by id, e.g. `id:03ph8a2z1abcdef` (its `orgUnitId` from the Directory API's [`orgunits.list`](https://developers.google.com/workspace/admin/directory/reference/rest/v1/orgunits/list); an id keeps working when the OU is renamed or moved). An OU includes the OUs below it: `/Engineering` covers `/Engineering/Platform`. `/` is everyone.
+- **Teams** (optional, needs `SCIM_GROUPS=on`): OUs that become teams, named by their path (`Engineering/Platform`). Their people get an account too. Each person is on the team of the deepest team OU they're in, so `/Engineering` and `/Engineering/Platform` can both be teams. Team groups come first: someone on a team group stays on it. `/` can't be a team.
+
+Moving someone to an OU you didn't choose removes them, like leaving every group, and with [push](#6-push-changes-at-once-optional) that happens within seconds: a move is a change to the user, which Google pushes, while group membership isn't.
 
 ## 4. Configure SuperBot
 
@@ -58,6 +71,9 @@ GOOGLE_DIRECTORY_GROUPS=superbot-users@example.com
 # GOOGLE_DIRECTORY_TEAM_GROUPS=eng@example.com,design@example.com
 # SCIM_GROUP_ROLES=on
 # GOOGLE_DIRECTORY_ROLE_GROUPS=auditors@example.com     # role groups: declare each one (below)
+# Organizational units, with or instead of groups (needs the third scope above):
+# GOOGLE_DIRECTORY_ORG_UNITS=/Sales,/Support
+# GOOGLE_DIRECTORY_TEAM_ORG_UNITS=/Engineering,/Engineering/Platform
 # With Sign in with Google (google.md), people sign in to the account the sync made:
 # GOOGLE_DIRECTORY_SSO=google
 ```
@@ -67,9 +83,11 @@ Restart botd. Its log says `Google Workspace sync: on, ...`. botd refuses to sta
 | Setting | Default | |
 |---------|---------|---|
 | `GOOGLE_DIRECTORY_SYNC` | `off` | `on` needs `SCIM=on`. |
-| `GOOGLE_DIRECTORY_GROUPS` | | Group emails, comma separated. Their members get an account. |
+| `GOOGLE_DIRECTORY_GROUPS` | | Group emails, comma separated. Their members get an account. This or `GOOGLE_DIRECTORY_ORG_UNITS` (or a team list) must name at least one. |
 | `GOOGLE_DIRECTORY_TEAM_GROUPS` | | Group emails that become teams too. Needs `SCIM_GROUPS=on`. |
 | `GOOGLE_DIRECTORY_ROLE_GROUPS` | | Group emails that are [role groups](scim.md#role-groups): they give a custom role, across the server or (declared with `--team`) within each member's team, and are no team. Needs `SCIM_GROUPS=on` and `SCIM_GROUP_ROLES=on`. Being in one gives no account. Not also a team group. At most 50 groups across the three lists. |
+| `GOOGLE_DIRECTORY_ORG_UNITS` | | Organizational unit paths (`/Sales`) or ids (`id:...`), comma separated. The people in them, or in OUs below them, get an account. `/` is everyone. |
+| `GOOGLE_DIRECTORY_TEAM_ORG_UNITS` | | OUs that become teams too, each person on their deepest one's. Needs `SCIM_GROUPS=on`. Not `/`. At most 50 OUs across the two lists. |
 | `GOOGLE_DIRECTORY_ADMIN` | | The admin the service account acts as (option A). Empty for option B. |
 | `GOOGLE_DIRECTORY_SSO` | | A Google provider from `SSO_PROVIDERS`. Each user's Directory id is their `sub` there, so their sign-in is linked to the account. |
 | `GOOGLE_DIRECTORY_TENANT` | `google` | The SCIM tenant the users and teams belong to. No SCIM token may use it. |
@@ -115,7 +133,7 @@ Restart botd. About 10 seconds later it asks Google for a channel for each kind 
 What to know:
 
 - **A notification is only a nudge.** botd reads nothing from it but which channel sent it, then runs the same full pass as the schedule, with every check above. A burst of changes (a bulk suspension) becomes one pass, and pushed passes are at least 30 seconds apart. The schedule keeps running: if push stops, nothing is missed, only slower.
-- **Group membership isn't pushed.** Google has no watch for group members, so someone taken out of a chosen group, but not suspended, still waits for the next scheduled pass. Suspend leavers in Google, or run `botctl scim google sync`.
+- **Group membership isn't pushed.** Google has no watch for group members, so someone taken out of a chosen group, but not suspended, still waits for the next scheduled pass. Suspend leavers in Google, move them to an OU you didn't choose (if you [choose OUs](#3-choose-the-groups-or-organizational-units)), or run `botctl scim google sync`.
 - **Each channel has its own secret.** Google sends it back with every notification, and botd refuses (401) any that doesn't match, audited as `scim.google_push_refused` (at most one event per address every few minutes). The secrets are derived from botd's master key, so channels made before a restart still work, and botd stops them when they next deliver. Turning push off stops them the same way.
 - If your proxy only forwards some paths, forward `POST /scim/google/push` to botd. The bundled Caddy forwards everything.
 
@@ -131,12 +149,14 @@ What to know:
 | They leave every chosen group, or are deleted | The user is deleted from the tenant as with a SCIM `DELETE`: disabled, nothing destroyed. Added back, they return as the same user |
 | A team group's members change | People join and leave its team. A renamed group renames its team |
 | A team group leaves `GOOGLE_DIRECTORY_TEAM_GROUPS` | Its people leave the team, as when an IdP deletes a SCIM group, and join the team of any other team group they're in, in the same pass |
+| Someone moves to another organizational unit | They follow it: onto the team of their new deepest team OU, or deleted from the tenant if no chosen OU (or group) holds them any more. Pushed within seconds with push on |
+| A team OU is renamed or moved | Its team is renamed to the new path and keeps its people (it's keyed by the OU's id) |
 | A declared role group's members change | People with an account gain or lose its role, as with a SCIM role group |
 | A suspended person never had an account | Nothing: no account is made for them |
 
 **An admin's disable holds.** Google decides name, email, and who has access, with one exception. If an admin disables someone in SuperBot, the sync leaves them disabled even while Google has them active. It only enables people it disabled itself, also when it takes on someone who signed in with Google before and was disabled; if the audit log no longer shows who disabled someone, they stay disabled too. Each pass lists them as `held`. To let the sync manage them again, enable them (`botctl user enable` or the admin portal).
 
-**Fail-closed.** A pass that can't sign in, reach Google, find a group, or read every page of a list changes nobody, and the next pass tries again (in 5 minutes at most, as after a pass with failed writes). So does a pass that would remove or disable more than `GOOGLE_DIRECTORY_MAX_REMOVALS` people, or leave nobody active in the tenant (people an admin disabled don't count as active), which is what an empty answer looks like. Removals come last, and wait too if earlier writes failed and nobody would stay active. Check the groups in Google, then run `botctl scim google sync --force`.
+**Fail-closed.** A pass that can't sign in, reach Google, find a group or organizational unit, or read every page of a list changes nobody, and the next pass tries again (in 5 minutes at most, as after a pass with failed writes). So does a pass that would remove or disable more than `GOOGLE_DIRECTORY_MAX_REMOVALS` people, or leave nobody active in the tenant (people an admin disabled don't count as active), which is what an empty answer looks like. Removals come last, and wait too if earlier writes failed and nobody would stay active. Check the groups in Google, then run `botctl scim google sync --force`.
 
 **One person, one user.** Email never matches people. If a SuperBot user already has someone's email, that person's create fails (and is listed in the pass) until you link that user's Google identity (`botctl user link <user> <google provider> <directory id>`) or change one of the emails. The owner account is never managed.
 
@@ -144,7 +164,7 @@ What to know:
 
 Every change is audited as the SCIM events of the [SCIM guide](scim.md), with the actor `scim:google-directory`, method `google_directory`. Each pass is also `scim.google_sync` (target `scim_tenant:<tenant>`):
 
-- **success**: what it did: `created`, `updated`, `enabled`, `disabled`, `linked`, `deleted`, `held`, `skippedSuspended`, `outsideDomain`, `teams`, `roleGroups` (with `undeclared`), how long it took, and what started it (`schedule`, `admin` with `force`, or `push` with the changes Google sent in `pushed`).
+- **success**: what it did: `created`, `updated`, `enabled`, `disabled`, `linked`, `deleted`, `held`, `skippedSuspended`, `outsideDomain`, `teams`, `roleGroups` (with `undeclared`), `orgUnits` (each OU chosen, with its path now, how many people it holds, and whether it's a team), how long it took, and what started it (`schedule`, `admin` with `force`, or `push` with the changes Google sent in `pushed`).
 - **failure**: the `reason` and `detail` when nobody was changed, or the SCIM writes that failed (`failed`, `failures`; each also `scim.request_failed`).
 - **denied**: too many removals (`too_many_removals`, `would_remove_everyone`).
 
@@ -155,9 +175,9 @@ With push on: `scim.google_push_watching` when botd first has channels, and agai
 ## Limits
 
 - Changes in Google reach SuperBot within `GOOGLE_DIRECTORY_INTERVAL_MINUTES`, or within seconds for user changes with [push](#6-push-changes-at-once-optional). Run `botctl scim google sync` to apply one now.
-- Users and group membership only: no organizational units, aliases, custom attributes, or roles from Google.
-- At most 50 groups. A Directory list over 2,000 pages, or a page over 16 MiB, fails the pass.
-- The Directory API has [quotas](https://developers.google.com/workspace/admin/directory/v1/limits). A pass reads each group, its members, and the customer's users, 500 at a time. A rate-limited pass fails and is tried again.
+- Users, group membership and organizational units only: no aliases, custom attributes, or roles from Google. OUs give accounts and teams, never roles.
+- At most 50 groups and 50 organizational units. A Directory list over 2,000 pages, or a page over 16 MiB, fails the pass.
+- The Directory API has [quotas](https://developers.google.com/workspace/admin/directory/v1/limits). A pass reads each group, its members, each organizational unit, and the customer's users, 500 at a time. A rate-limited pass fails and is tried again.
 
 ## Troubleshooting
 
@@ -166,9 +186,10 @@ With push on: `scim.google_push_watching` when botd first has channels, and agai
 | `reason` | Fix |
 |----------|-----|
 | `credentials` | The key is missing or isn't a JSON service account key. Save it again. |
-| `sign_in` | Google refused the service account. With option A: the Client ID and both scopes in domain-wide delegation, and `GOOGLE_DIRECTORY_ADMIN` is a real admin. With option B: the role is assigned to the service account, and `GOOGLE_DIRECTORY_ADMIN` is empty. |
-| `forbidden` | The admin (or role) can't read users or groups, or the Admin SDK API is off in the project. |
+| `sign_in` | Google refused the service account. With option A: the Client ID and both scopes (all three with organizational units) in domain-wide delegation, and `GOOGLE_DIRECTORY_ADMIN` is a real admin. With option B: the role is assigned to the service account, and `GOOGLE_DIRECTORY_ADMIN` is empty. |
+| `forbidden` | The admin (or role) can't read users, groups or organizational units, or the Admin SDK API is off in the project. |
 | `group_not_found` | A group email is wrong, or isn't in this Workspace. |
+| `org_unit_not_found` | An organizational unit's path or id is wrong, or it was deleted, renamed or moved (name it by id to follow renames). Nobody in it was removed. |
 | `unreachable`, `google_error`, `rate_limited` | Google couldn't be reached or answered with an error. The next pass tries again. |
 | `odd_answer`, `too_large` | Google's answer wasn't a full Directory API answer. Nobody was changed. |
 | `too_many_removals`, `would_remove_everyone` | See **Fail-closed** above. |

@@ -39,6 +39,10 @@ struct Dir {
     stops: Vec<Value>,
     /// Watches refused (403) once this many have been made.
     watch_limit: Option<usize>,
+    /// Organizational units: (id, path, name).
+    org_units: Vec<(String, String, String)>,
+    /// The scopes each access token was asked for.
+    scopes: Vec<String>,
 }
 
 type D = Arc<Mutex<Dir>>;
@@ -64,7 +68,7 @@ impl Google {
 }
 
 fn person(id: &str, email: &str, given: &str, suspended: bool) -> Value {
-    json!({ "id": id, "primaryEmail": email, "name": { "givenName": given, "familyName": "Test", "fullName": format!("{given} Test") }, "suspended": suspended, "archived": false })
+    json!({ "id": id, "primaryEmail": email, "name": { "givenName": given, "familyName": "Test", "fullName": format!("{given} Test") }, "suspended": suspended, "archived": false, "orgUnitPath": "/" })
 }
 
 fn member(id: &str) -> Value {
@@ -107,7 +111,10 @@ async fn token_endpoint(St(d): St<D>, Form(form): Form<HashMap<String, String>>)
         return bad();
     }
     let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(input.split('.').nth(1).unwrap()).unwrap()).unwrap();
-    assert_eq!((claims["iss"].as_str(), claims["scope"].as_str()), (Some("sync@project-1.iam.gserviceaccount.com"), Some(google::SCOPES)));
+    let scope = claims["scope"].as_str().unwrap_or_default().to_string();
+    assert_eq!(claims["iss"].as_str(), Some("sync@project-1.iam.gserviceaccount.com"));
+    assert!(scope == google::SCOPES || scope == format!("{} {}", google::SCOPES, google::ORG_UNIT_SCOPE), "{scope}");
+    d.scopes.push(scope);
     d.subjects.push(claims["sub"].as_str().map(String::from));
     (StatusCode::OK, Json(json!({ "access_token": TOKEN, "expires_in": 3599, "token_type": "Bearer" })))
 }
@@ -143,6 +150,19 @@ async fn members(St(d): St<D>, h: HeaderMap, UrlPath(id): UrlPath<String>, Query
     assert_eq!(q.get("includeDerivedMembership").map(String::as_str), Some("true"));
     let Some((_, (_, _, m))) = d.groups.iter().find(|(_, (gid, ..))| *gid == id) else { return (StatusCode::NOT_FOUND, Json(json!({}))) };
     (StatusCode::OK, Json(page(m, &q, "admin#directory#members", "members")))
+}
+
+async fn org_unit(St(d): St<D>, h: HeaderMap, UrlPath((customer, key)): UrlPath<(String, String)>) -> (StatusCode, Json<Value>) {
+    let d = d.lock().unwrap();
+    if let Err(e) = gate(&d, &h) {
+        return e;
+    }
+    assert_eq!(customer, "my_customer");
+    let found = d.org_units.iter().find(|(id, path, _)| *id == key || path.eq_ignore_ascii_case(&format!("/{key}")));
+    match found {
+        Some((id, path, name)) => (StatusCode::OK, Json(json!({ "kind": "admin#directory#orgUnit", "orgUnitId": id, "orgUnitPath": path, "name": name }))),
+        None => (StatusCode::NOT_FOUND, Json(json!({ "error": { "code": 404, "message": "Org unit not found", "errors": [{ "reason": "notFound" }] } }))),
+    }
 }
 
 async fn watch(St(d): St<D>, h: HeaderMap, Query(q): Query<HashMap<String, String>>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
@@ -195,6 +215,7 @@ async fn google_stand_in() -> Google {
         .route("/admin/directory/v1/users", get(users))
         .route("/admin/directory/v1/groups/{key}", get(group))
         .route("/admin/directory/v1/groups/{id}/members", get(members))
+        .route("/admin/directory/v1/customer/{customer}/orgunits/{*key}", get(org_unit))
         .route("/admin/directory/v1/users/watch", post(watch))
         .route("/admin/directory_v1/channels/stop", post(stop_channel))
         .with_state(dir.clone());
@@ -211,6 +232,8 @@ fn settings(g: &Google) -> Settings {
         groups: vec!["staff@example.com".into()],
         teams: vec!["eng@example.com".into()],
         role_groups: vec![],
+        org_units: vec![],
+        team_org_units: vec![],
         sso: None,
         admin: Some("admin@example.com".into()),
         api: g.url.clone(),
@@ -487,6 +510,104 @@ async fn team_groups_move_and_aliases_are_one_team() {
     let res = synced(&w).await;
     assert_eq!((res["teams"]["created"].as_u64(), res["teams"]["deleted"].as_u64()), (Some(1), Some(1)), "{res}");
     assert_eq!(team_members(&w), vec!["ada@example.com", "eve@example.com"], "people on a team no longer wanted join the new one in the same pass");
+}
+
+/// The emails on the team whose externalId is `ext`.
+fn team_of(w: &World, ext: &str) -> Vec<String> {
+    let Some(g) = w.app.db.scim_group_find(TENANT, Some(ext), None) else { return vec![] };
+    let mut m: Vec<String> = w.app.db.scim_group_members(TENANT, &g.team_id, false).into_iter().map(|u| u.email.unwrap_or_default()).collect();
+    m.sort();
+    m
+}
+
+#[tokio::test]
+async fn organizational_units_give_accounts_and_teams() {
+    let g = google_stand_in().await;
+    g.set(|d| {
+        d.org_units = vec![
+            ("id:03eng".into(), "/Engineering".into(), "Engineering".into()),
+            ("id:03plat".into(), "/Engineering/Platform".into(), "Platform".into()),
+            ("id:03sales".into(), "/Sales".into(), "Sales".into()),
+        ];
+    });
+    for (id, unit) in [("101", "/Engineering/Platform"), ("102", "/Engineering"), ("103", "/Engineering"), ("104", "/Sales"), ("105", "/Marketing")] {
+        g.user(id, |u| u["orgUnitPath"] = json!(unit));
+    }
+    let w = world(&g, false, |s| {
+        s.groups = vec![];
+        s.teams = vec![];
+        s.org_units = vec!["/Sales".into()];
+        s.team_org_units = vec!["/Engineering".into(), "id:03plat".into()];
+    })
+    .await;
+
+    let res = synced(&w).await;
+    assert_eq!((res["created"].as_u64(), res["skippedSuspended"].as_u64(), res["teams"]["created"].as_u64()), (Some(3), Some(1), Some(2)), "{res}");
+    assert!(user_of(&w, "105").is_none(), "Eve's unit isn't named");
+    assert_eq!(g.dir.lock().unwrap().scopes.last().unwrap(), &format!("{} {}", google::SCOPES, google::ORG_UNIT_SCOPE));
+    assert_eq!(team_of(&w, "id:03plat"), vec!["ada@example.com"], "Ada is on the team of her deepest unit");
+    assert_eq!(team_of(&w, "id:03eng"), vec!["bob@example.com"]);
+    assert_eq!(w.app.db.scim_group_find(TENANT, Some("id:03plat"), None).unwrap().display_name, "Engineering/Platform");
+    assert_eq!(
+        res["orgUnits"],
+        json!([
+            { "orgUnit": "/Sales", "path": "/Sales", "people": 1, "team": false },
+            { "orgUnit": "/Engineering", "path": "/Engineering", "people": 3, "team": true },
+            { "orgUnit": "id:03plat", "path": "/Engineering/Platform", "people": 1, "team": true },
+        ])
+    );
+    let again = synced(&w).await;
+    assert_eq!((again["created"].as_u64(), again["updated"].as_u64(), again["teams"]["updated"].as_u64()), (Some(0), Some(0), Some(0)), "{again}");
+
+    // Moves in Google: Ada up to Engineering, Eve into Platform, Bob out of every unit.
+    g.user("101", |u| u["orgUnitPath"] = json!("/Engineering"));
+    g.user("105", |u| u["orgUnitPath"] = json!("/Engineering/Platform"));
+    g.user("102", |u| u["orgUnitPath"] = json!("/Marketing"));
+    let res = synced(&w).await;
+    assert_eq!((res["created"].as_u64(), res["deleted"].as_u64()), (Some(1), Some(1)), "{res}");
+    assert!(user_of(&w, "102").is_none(), "Bob left every unit");
+    assert_eq!((team_of(&w, "id:03eng"), team_of(&w, "id:03plat")), (vec!["ada@example.com".to_string()], vec!["eve@example.com".to_string()]));
+
+    // Named by id, a renamed unit renames its team and keeps its people.
+    let team = w.app.db.scim_group_find(TENANT, Some("id:03plat"), None).unwrap().team_id;
+    g.set(|d| d.org_units[1].1 = "/Engineering/Core".into());
+    g.user("105", |u| u["orgUnitPath"] = json!("/Engineering/Core"));
+    synced(&w).await;
+    let renamed = w.app.db.scim_group_find(TENANT, Some("id:03plat"), None).unwrap();
+    assert_eq!((renamed.team_id, renamed.display_name.as_str()), (team, "Engineering/Core"));
+    assert_eq!(team_of(&w, "id:03plat"), vec!["eve@example.com"]);
+
+    let (_, status) = call(w.port, "GET", "/api/scim/google", &w.admin, "").await;
+    let status = parse(&status);
+    assert_eq!((status["orgUnits"].clone(), status["teamOrgUnits"].clone()), (json!(["/Sales"]), json!(["/Engineering", "id:03plat"])));
+
+    // A unit Google no longer has changes nobody, rather than removing its people.
+    g.set(|d| _ = d.org_units.remove(2));
+    let (code, res) = sync(&w, "").await;
+    assert_eq!(code, 502, "{res}");
+    assert!(active(&w, "104"), "Dee stays");
+    let ev = events(w.port, &w.admin, "action=scim.google_sync").await;
+    assert_eq!((ev[0]["outcome"].as_str(), ev[0]["details"]["reason"].as_str()), (Some("failure"), Some("org_unit_not_found")), "{}", ev[0]);
+}
+
+#[tokio::test]
+async fn a_user_without_a_unit_fails_the_pass_and_groups_come_before_units() {
+    let g = google_stand_in().await;
+    g.set(|d| d.org_units = vec![("id:03eng".into(), "/R&D".into(), "R&D".into())]);
+    for id in ["101", "102", "105"] {
+        g.user(id, |u| u["orgUnitPath"] = json!("/R&D"));
+    }
+    let w = world(&g, false, |s| s.team_org_units = vec!["/R&D".into()]).await;
+    synced(&w).await;
+    assert_eq!(team_members(&w), vec!["ada@example.com", "eve@example.com"], "the team group eng@ comes first");
+    assert_eq!(team_of(&w, "id:03eng"), vec!["bob@example.com"]);
+
+    g.user("102", |u| _ = u.as_object_mut().unwrap().remove("orgUnitPath"));
+    let (code, res) = sync(&w, "").await;
+    assert_eq!(code, 502, "{res}");
+    assert_eq!(team_of(&w, "id:03eng"), vec!["bob@example.com"], "nobody was changed");
+    let ev = events(w.port, &w.admin, "action=scim.google_sync").await;
+    assert_eq!(ev[0]["details"]["reason"], "odd_answer", "{}", ev[0]);
 }
 
 #[tokio::test]
