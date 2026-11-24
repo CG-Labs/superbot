@@ -11690,6 +11690,11 @@ impl Db {
         Db::on(crate::database_encryption::open_with(path, Some(key)).unwrap()).unwrap()
     }
 
+    /// Drops `table`, so reading it fails as a damaged database's would (ADR 0262).
+    pub fn drop_table(&self, table: &str) {
+        self.c().execute_batch(&format!("DROP TABLE {table}")).unwrap();
+    }
+
     /// Moves when a pending request for a role lapses to `at`, as the clock passing it would (ADR 0209).
     pub fn move_role_request_lapse(&self, id: &str, at: i64) {
         self.c().execute("UPDATE role_requests SET expires_at = ?1 WHERE id = ?2", params![at, id]).unwrap();

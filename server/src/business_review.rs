@@ -381,10 +381,10 @@ fn strings(v: &Value) -> Vec<String> {
 }
 
 /// The draft for the quarter ending with `to`, from botd's records as of `now_ms`.
-pub fn build(app: &App, a: &Auth, to: Ym, now_ms: i64) -> Draft {
+pub fn build(app: &App, a: &Auth, to: Ym, now_ms: i64) -> rusqlite::Result<Draft> {
     let first = to.plus(-2);
     let (start, end) = (first.start_ms(), to.plus(1).start_ms().min(now_ms));
-    let history = app.db.health_scores_since(&date(start)).unwrap_or_default();
+    let history = app.db.health_scores_since(&date(start))?;
     let last_day = date(end - 1);
     let in_quarter: Vec<crate::db::HealthScoreDay> = history.into_iter().filter(|d| d.day <= last_day).collect();
 
@@ -430,7 +430,7 @@ pub fn build(app: &App, a: &Auth, to: Ym, now_ms: i64) -> Draft {
     let mut harnesses: Vec<Harness> = by.into_values().collect();
     harnesses.sort_by(|a, b| b.finished.cmp(&a.finished).then(a.harness.cmp(&b.harness)));
 
-    let posted = app.db.status_incidents_between(start, end).unwrap_or_default();
+    let posted = app.db.status_incidents_between(start, end)?;
     let reviewed = |id: &str| {
         let f = Filter { from: posted.first().map(|i| i.created_at), actions: vec!["status.incident_reviewed".into()], target_id: Some(id.into()), ..Default::default() };
         !app.db.audit_events(&f, 1, false).is_empty()
@@ -477,7 +477,7 @@ pub fn build(app: &App, a: &Auth, to: Ym, now_ms: i64) -> Draft {
         }
     });
 
-    Draft {
+    Ok(Draft {
         format: FORMAT,
         drafted_at: now_ms,
         template: TEMPLATE,
@@ -506,7 +506,7 @@ pub fn build(app: &App, a: &Auth, to: Ym, now_ms: i64) -> Draft {
         changes,
         backups: backups["summary"].as_str().unwrap_or_default().to_string(),
         machines,
-    }
+    })
 }
 
 impl Draft {
@@ -813,6 +813,8 @@ pub async fn get(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>
         tokio::task::spawn_blocking(move || build(&app, &a, to, now_ms))
             .await
             .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't draft the business review: {e}")))?
+            // A record botd can't read isn't one it doesn't have: no draft, rather than one saying "none".
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't read botd's records for the business review: {e}")))?
     };
     app.db.record(&by.event(DRAFTED).target("setup", "server").details(d.audit_details(format)));
     if format == Format::Json {

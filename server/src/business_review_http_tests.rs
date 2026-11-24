@@ -172,3 +172,13 @@ async fn it_drafts_from_what_botd_recorded() {
         assert!(!text.contains("Ada") && !text.contains("example.com"), "no name, email or incident title: {text}");
     }
 }
+
+#[tokio::test]
+async fn records_it_cant_read_are_no_draft_rather_than_none() {
+    let (port, app, admin, _) = serve_app().await;
+    app.db.drop_table("status_incidents");
+    let (code, body) = call(port, "GET", "/api/support/business-review?format=markdown", &admin, "").await;
+    assert_eq!(code, 500, "{body}");
+    assert!(body.contains("Couldn't read botd's records for the business review") && !body.contains("No status page incident"), "{body}");
+    assert!(events(port, &admin, "action=support.business_review_drafted").await.is_empty(), "a draft that failed isn't recorded");
+}
