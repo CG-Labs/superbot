@@ -28,7 +28,7 @@ use axum::response::{IntoResponse, Response};
 use chrono::Datelike;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -39,6 +39,8 @@ pub const TEMPLATE: &str = "docs/support/qbr-template.md";
 const TODO: &str = "_To fill in._";
 const MINUTE: i64 = 60_000;
 const DAY_MS: i64 = 86_400_000;
+/// SQLite's `LIMIT -1`: every row that matches.
+const ALL: i64 = -1;
 /// Runs with no record of their harness whose Bot is gone.
 pub const UNRECORDED: &str = "unrecorded";
 
@@ -66,7 +68,7 @@ pub const CHANGES: [(&str, &[&str]); 5] = [
     ),
     ("scimTokens", &["scim.token_created", "scim.token_rotated", "scim.token_revoked"]),
     ("customRoles", &["role.created", "role.updated", "role.deleted"]),
-    ("roleGrants", &["role.assigned", "role.unassigned", "user.role_changed"]),
+    ("roleGrants", &["role.assigned", "role.unassigned"]),
     ("residencyPins", &["user.residency_pinned", "user.residency_unpinned", "team.residency_pinned", "team.residency_unpinned"]),
 ];
 
@@ -392,14 +394,16 @@ pub fn build(app: &App, a: &Auth, to: Ym, now_ms: i64) -> Draft {
             let (from, until) = (ym.start_ms(), ym.plus(1).start_ms().min(now_ms));
             let prefix = format!("{}-", ym.id());
             let days: Vec<&crate::db::HealthScoreDay> = in_quarter.iter().filter(|d| d.day.starts_with(&prefix)).collect();
-            let checks = app.db.audit_events(&Filter { from: Some(from), to: Some(until), actions: vec![crate::health_check::CHECKED.into()], ..Default::default() }, 1000, false);
+            let checked = Filter { from: Some(from), to: Some(until), actions: vec![crate::health_check::CHECKED.into()], ..Default::default() };
+            let checks: u64 = app.db.audit_counts_between(from, until, &[crate::health_check::CHECKED]).iter().map(|c| c.n).sum();
+            let last = app.db.audit_events(&checked, 1, false);
             let mut m = Month {
                 month: ym.id(),
                 so_far: ym.plus(1).start_ms() > now_ms,
                 score: days.last().map(|d| day_score(d)),
                 days_recorded: days.len(),
-                health_checks: checks.len(),
-                last_check: checks.first().map(|e| Check {
+                health_checks: checks as usize,
+                last_check: last.first().map(|e| Check {
                     date: date(e.at),
                     score: e.details["score"].as_u64().and_then(|s| u32::try_from(s).ok()),
                     band: code(e.details["band"].as_str().unwrap_or("unknown")).to_string(),
@@ -426,15 +430,10 @@ pub fn build(app: &App, a: &Auth, to: Ym, now_ms: i64) -> Draft {
     let mut harnesses: Vec<Harness> = by.into_values().collect();
     harnesses.sort_by(|a, b| b.finished.cmp(&a.finished).then(a.harness.cmp(&b.harness)));
 
-    let posted: Vec<crate::db::StatusIncident> = app.db.status_incidents(start, 1000, 0).unwrap_or_default().into_iter().filter(|i| i.created_at < end).collect();
-    let reviewed: HashSet<String> = match posted.iter().map(|i| i.created_at).min() {
-        None => HashSet::new(),
-        Some(from) => app
-            .db
-            .audit_events(&Filter { from: Some(from), actions: vec!["status.incident_reviewed".into()], ..Default::default() }, 10_000, false)
-            .into_iter()
-            .filter_map(|e| e.target_id)
-            .collect(),
+    let posted = app.db.status_incidents_between(start, end).unwrap_or_default();
+    let reviewed = |id: &str| {
+        let f = Filter { from: posted.first().map(|i| i.created_at), actions: vec!["status.incident_reviewed".into()], target_id: Some(id.into()), ..Default::default() };
+        !app.db.audit_events(&f, 1, false).is_empty()
     };
     let mut incidents: Vec<Incident> = posted
         .iter()
@@ -444,24 +443,25 @@ pub fn build(app: &App, a: &Auth, to: Ym, now_ms: i64) -> Draft {
             posted_at: i.created_at,
             resolved_at: i.resolved_at,
             minutes: (i.resolved_at.unwrap_or(now_ms) - i.created_at).max(0) / MINUTE,
-            reviewed: reviewed.contains(&i.id),
+            reviewed: reviewed(&i.id),
         })
         .collect();
     incidents.sort_by_key(|i| i.posted_at);
 
     let access_reviews: Vec<String> = app
         .db
-        .audit_events(&Filter { from: Some(start), to: Some(end), actions: vec![crate::access_review::COMPLETED.into()], ..Default::default() }, 100, true)
+        .audit_events(&Filter { from: Some(start), to: Some(end), actions: vec![crate::access_review::COMPLETED.into()], ..Default::default() }, ALL, true)
         .iter()
         .map(|e| date(e.at))
         .collect();
 
     let all: Vec<&str> = CHANGES.iter().flat_map(|(_, actions)| actions.iter().copied()).collect();
     let counted = app.db.audit_counts_between(start, end, &all);
-    let changes = CHANGES
+    let mut changes: BTreeMap<String, u64> = CHANGES
         .iter()
         .map(|(kind, actions)| (kind.to_string(), counted.iter().filter(|c| c.outcome == "success" && actions.contains(&c.action.as_str())).map(|c| c.n).sum()))
         .collect();
+    *changes.entry("roleGrants".into()).or_default() += app.db.built_in_role_changes(start, end);
 
     let report = health_score::build(app, now_ms, health_score::DEFAULT_DAYS);
     let signal = |id: &str| report["signals"].as_array().into_iter().flatten().find(|s| s["id"] == id).cloned().unwrap_or(Value::Null);

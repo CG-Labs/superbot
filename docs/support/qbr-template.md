@@ -25,7 +25,7 @@ botctl business-review --to 2026-09 --json
 | `--json` | The figures as botd sends them, from `GET /api/support/business-review?to=<YYYY-MM>` (admins only), instead of Markdown |
 | `-o <file>` | Save it, readable by you only, instead of printing it |
 
-It runs on the customer's server, signed in as an admin (`BOTD_TOKEN`, or the password); on a self-hosted one, the customer's admin runs it and sends the file. The console's Support tab has the same as **Draft business review**, with the month to end on. Each draft is recorded in the audit log as `support.business_review_drafted`, with its months and counts. Design: [ADR 0262](../adr/0262-business-review-draft.md).
+It runs on the customer's server, signed in as an admin (`SUPERBOT_TOKEN`, or the password); on a self-hosted one, the customer's admin runs it and sends the file. The console's Support tab has the same as **Draft business review**, with the month to end on. Each draft is recorded in the audit log as `support.business_review_drafted`, with its months and counts. Design: [ADR 0262](../adr/0262-business-review-draft.md).
 
 What botd fills in, month by month or for the quarter:
 

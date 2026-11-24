@@ -10704,6 +10704,30 @@ impl Db {
             .collect()
     }
 
+    /// Every incident posted before `to` and open at some time from `from` (unix ms), without
+    /// its updates, however many there are (ADR 0262).
+    pub fn status_incidents_between(&self, from: i64, to: i64) -> rusqlite::Result<Vec<StatusIncident>> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM status_incidents WHERE created_at < ? AND (resolved_at IS NULL OR resolved_at >= ?) ORDER BY created_at, id")?;
+        let rows = s.query_map(params![to, from], status_incident_row)?;
+        rows.collect()
+    }
+
+    /// Direct changes to people's built-in roles from `from` up to `to` (unix ms): those
+    /// with no custom role, which go with `role.assigned`, `role.unassigned` or
+    /// `role.updated` and are counted there (ADR 0262).
+    pub fn built_in_role_changes(&self, from: i64, to: i64) -> u64 {
+        self.c()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE action = 'user.role_changed' AND outcome = 'success' AND at >= ? AND at < ?
+                   AND (NOT json_valid(details) OR json_type(details, '$.role') IS NULL)",
+                params![from, to],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            .max(0) as u64
+    }
+
     /// Every open incident's impact and components, however many there are.
     pub fn status_incidents_open(&self) -> rusqlite::Result<Vec<(String, Vec<String>)>> {
         let c = self.c();
@@ -12176,6 +12200,26 @@ mod tests {
         let got: Vec<String> = db.machine_restores_between(1_000, 1_003).into_iter().map(|r| r.id).collect();
         assert_eq!(got, ["r0000", "r0001", "r0002"], "the oldest, behind 1000 newer");
         assert!(db.machine_restores_recent(1000).iter().all(|r| r.created_at >= 1_003));
+    }
+
+    #[test]
+    fn incidents_between_two_times_are_all_of_them_however_many_came_after() {
+        let db = Db::open(&temp_path("incidents-between").join("app.sqlite")).unwrap();
+        // Posted at 10 and resolved at `resolved`, or open.
+        let made = [("before", Some(5)), ("ended_in", Some(100)), ("open", None), ("posted_in", Some(300)), ("after", None)];
+        for (i, (id, resolved)) in made.iter().enumerate() {
+            let n = NewStatusIncident { id, title: "t", impact: "major", components: &[], state: "investigating", body: "b", by: None };
+            db.status_incident_create(&n).unwrap();
+            let posted = if *id == "posted_in" { 150 } else if *id == "after" { 200 } else { 10 + i as i64 };
+            db.c().execute("UPDATE status_incidents SET created_at = ?, resolved_at = ? WHERE id = ?", params![posted, resolved, id]).unwrap();
+        }
+        for i in 0..1001 {
+            let id = format!("newer{i}");
+            db.status_incident_create(&NewStatusIncident { id: &id, title: "t", impact: "minor", components: &[], state: "investigating", body: "b", by: None }).unwrap();
+            db.c().execute("UPDATE status_incidents SET created_at = 500 WHERE id = ?", [&id]).unwrap();
+        }
+        let got: Vec<String> = db.status_incidents_between(50, 200).unwrap().into_iter().map(|i| i.id).collect();
+        assert_eq!(got, ["ended_in", "open", "posted_in"]);
     }
 
     #[test]

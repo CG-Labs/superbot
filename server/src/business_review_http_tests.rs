@@ -115,6 +115,14 @@ async fn it_drafts_from_what_botd_recorded() {
         app.db.record(&Event::new(Actor::system("runner"), "bot.run_refused").outcome(Outcome::Denied).details(json!({ "reason": reason })));
     }
     app.db.record(&Event::new(Actor::system("botd"), access_review::COMPLETED));
+    // One custom role given, which changes the person's built-in role too, and one built-in role changed.
+    let (ada, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (bea, _) = user_with(port, &admin, "bea@example.com", "member").await;
+    let (code, role) = call(port, "POST", "/api/roles", &admin, &json!({ "name": "Auditor", "base": "readonly", "permissions": ["audit.view"] }).to_string()).await;
+    assert_eq!(code, 201, "{role}");
+    assert_eq!(call(port, "PUT", &format!("/api/roles/{}/users/{ada}", parse(&role)["id"].as_str().unwrap()), &admin, "").await.0, 200);
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{bea}"), &admin, r#"{"role":"readonly"}"#).await.0, 200);
+    assert_eq!(events(port, &admin, "action=user.role_changed").await.len(), 2, "the grant wrote role.assigned and user.role_changed");
     let incident = json!({ "title": "Runs failing for Ada Lovelace", "body": "We're looking into it.", "impact": "major" }).to_string();
     let (code, major) = call(port, "POST", "/api/status/incidents", &admin, &incident).await;
     assert_eq!(code, 201, "{major}");
@@ -142,7 +150,7 @@ async fn it_drafts_from_what_botd_recorded() {
     assert_eq!(r["incidents"].as_array().unwrap().len(), 1);
     assert_eq!((r["incidents"][0]["id"].as_str(), r["incidents"][0]["reviewed"].as_bool()), (Some(major.as_str()), Some(false)));
     assert_eq!(r["accessReviews"].as_array().unwrap().len(), 1);
-    assert_eq!(r["changes"]["customRoles"], 0);
+    assert_eq!((r["changes"]["customRoles"].clone(), r["changes"]["roleGrants"].clone()), (json!(1), json!(2)), "each change once: {:#}", r["changes"]);
 
     let (_, md) = call(port, "GET", &format!("{path}&format=markdown"), &admin, "").await;
     for want in [
