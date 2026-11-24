@@ -110,7 +110,7 @@ impl Place {
             let c = database_encryption::open_read_only(&db_path, db_key.as_ref()).ok()?;
             Some(crate::secrets::sealed::SealedStore::new(c, std::sync::Arc::new(crate::secrets::sealed::Cipher::new(k))))
         });
-        let copies = bucket(s, &dirs, Sealed(sealed.collect()));
+        let copies = bucket(s, region, folder, Sealed(sealed.collect()));
         Ok(Place { region: region.to_string(), store, db_path, keys, encrypted, db_key, copies })
     }
 
@@ -153,16 +153,18 @@ impl crate::secrets::SecretStore for Sealed {
     }
 }
 
-/// The region buckets botd would copy to (ADR 0246), with their keys from the settings, or
-/// else from botd's saved server secrets.
-fn bucket(s: &Settings, dirs: &[(String, PathBuf)], sealed: Sealed) -> Result<Option<Copies>, String> {
+/// `region`'s bucket (ADR 0246), with its keys from the settings, or else from botd's saved
+/// server secrets. Only that region's: another region's broken bucket mustn't block it.
+fn bucket(s: &Settings, region: &str, folder: &Path, sealed: Sealed) -> Result<Option<Copies>, String> {
     let vars: HashMap<String, String> = s.vars().into_iter().collect();
+    let var = |k: &str| vars.get(k).cloned().unwrap_or_default();
+    if var(&format!("{}_BUCKET", chat_store_copies::store_name(region))).trim().is_empty() {
+        return Ok(None);
+    }
     let env = crate::secrets::env::EnvStore::vars(vars.clone());
     let store = crate::secrets::external::Layered(vec![&env, &sealed]);
-    let var = |k: &str| vars.get(k).cloned().unwrap_or_default();
-    let named = chat_store_copies::named(vars.keys().cloned());
-    let dirs = chat_stores::Settings { dirs: dirs.to_vec(), ..chat_stores::Settings::default() };
-    chat_store_copies::Settings::from_env(&store, &var, &dirs, &named)?.map(Copies::new).transpose()
+    let dirs = chat_stores::Settings { dirs: vec![(region.to_string(), folder.to_path_buf())], ..chat_stores::Settings::default() };
+    chat_store_copies::Settings::from_env(&store, &var, &dirs, &[region.to_string()])?.map(Copies::new).transpose()
 }
 
 /// Holds botd's data lock and the store's, as botd does while it runs, so nothing changes
@@ -176,10 +178,20 @@ fn lock(place: &Place) -> Result<Locks, String> {
     Ok(Locks(data, store))
 }
 
-/// Deletes the work files a restore that was cut off left in a store's `folder`: they may
-/// hold rows of Bots that have since left the store. At botd's start, before it opens the
-/// store; one that can't be deleted stops botd.
+/// Deletes what a restore that was cut off left in a store's `folder`: its work files, which
+/// may hold rows of Bots that have since left the store, and a backup that is still a link
+/// to the store itself, which writes to the store would change. At botd's start, before it
+/// opens the store; one that can't be deleted stops botd.
 pub fn drop_leftovers(folder: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(store) = std::fs::metadata(folder.join("chats.sqlite")) {
+        for entry in std::fs::read_dir(folder.join("backups")).into_iter().flatten().flatten() {
+            let p = entry.path();
+            if std::fs::metadata(&p).is_ok_and(|m| m.dev() == store.dev() && m.ino() == store.ino()) {
+                std::fs::remove_file(&p).map_err(|e| format!("{}: {e}; a restore that was cut off left it, a link to the store itself (ADR 0256)", p.display()))?;
+            }
+        }
+    }
     let entries = match std::fs::read_dir(folder) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -224,7 +236,10 @@ pub fn audit_restores(db: &Db, dirs: &[(String, PathBuf)]) -> Vec<String> {
                         v => details[k] = v.clone(),
                     }
                 }
-                db.record(&Who::system(ACTOR).event(RESTORED).target("chat_store", region).details(details));
+                if let Err(e) = db.try_record(&Who::system(ACTOR).event(RESTORED).target("chat_store", region).details(details)) {
+                    lines.push(format!("Regional chat stores: the restore of {region}'s store from {backup} couldn't be audited ({e}); its note {} is kept for the next start (ADR 0256).", path.display()));
+                    continue;
+                }
                 lines.push(format!("Regional chat stores: {region}'s store was restored from {backup} while botd was stopped; audited as {RESTORED} (ADR 0256)."));
             } else {
                 lines.push(format!("Regional chat stores: a restore of {region}'s store from {backup} was cut off before it replaced the store, so nothing was restored (ADR 0256)."));
@@ -982,12 +997,15 @@ mod tests {
         assert!(work_files(&w.lon).is_empty() && notes(&w.lon).is_empty());
 
         std::fs::write(w.lon.join(format!("{WORK}cut-off.sqlite")), "chat-2b-moved-to-frankfurt").unwrap();
+        let link = chat_stores::backups_dir(&place.store).join("chats-20200102-000000.sqlite");
+        std::fs::hard_link(w.store(), &link).unwrap();
         let restored_at = now();
         let r = restore(&place, &opts("newest", true), restored_at).await.unwrap();
         assert!(r.done && r.text("gb-lon").starts_with("Restored"), "{}", r.text("gb-lon"));
         assert_eq!(texts(&w.store()), ["chat-1a-from-the-backup"]);
         assert!(!holds(&w.store(), "chat-2b-moved") && !holds(&w.store(), "chat-3c"), "no page of the moved Bot's chat is left in it");
         assert!(work_files(&w.lon).is_empty(), "a cut-off restore's work file is gone");
+        assert!(!link.exists(), "and its backup that was still a link to the store");
         let kept = chat_stores::backups_dir(&place.store).join(r.kept.as_deref().unwrap());
         assert!(texts(&kept).contains(&"chat-3c-after-the-backup".to_string()), "the store it replaced is a backup, so this can be undone");
         assert_eq!(chat_stores::backups_strictly(&place.store).unwrap().len(), 2);
@@ -1085,8 +1103,10 @@ mod tests {
             ("REGION_DATA_S3_GB_LON_ENDPOINT", s3.url.as_str()),
             ("REGION_DATA_S3_GB_LON_ACCESS_KEY_ID", s3_standin::ACCESS_KEY),
             ("REGION_DATA_AGE_RECIPIENTS", public.as_str()),
+            ("REGION_DATA_S3_DE_FRA_2_BUCKET", "fra-chats-with-no-endpoint"),
         ]);
         let place = Place::locate(&s, "gb-lon").unwrap();
+        assert!(Place::locate(&s, "de-fra-2").unwrap().copies().err().unwrap().contains("ENDPOINT"), "Frankfurt's broken bucket is Frankfurt's alone");
         // Mid-rotation, the bucket's saved key is still sealed under the previous master key.
         let next = crate::secrets::key::MasterKey::generate().base64();
         let rotated = |previous: &[(&str, &str)]| {

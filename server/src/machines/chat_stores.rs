@@ -173,15 +173,15 @@ pub fn open(db: &Db, s: &Settings, previous: Option<&DbKey>, keys: Keys) -> Resu
     // Before anything rewrites a restored store, which its restore's note names by inode.
     let restored = super::chat_store_restore::audit_restores(db, &s.dirs);
     for (_, dir) in &s.dirs {
+        super::chat_store_restore::drop_leftovers(dir)?;
+    }
+    for (_, dir) in &s.dirs {
         let path = dir.join("chats.sqlite");
         let was_encrypted = database_encryption::format(&path)? == database_encryption::Format::Encrypted;
         if database_encryption::prepare_store(&path, key, previous)? {
             rekeyed += usize::from(was_encrypted);
             log_info!("Regional chat stores: {} brought under botd's database key (ADR 0215).", path.display());
         }
-    }
-    for (_, dir) in &s.dirs {
-        super::chat_store_restore::drop_leftovers(dir)?;
     }
     let attached = db.attach_chat_stores(&s.dirs, &s.forget, key.map(DbKey::raw))?;
     for (region, path) in &attached.forgotten {
