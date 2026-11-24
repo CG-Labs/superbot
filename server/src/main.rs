@@ -532,6 +532,14 @@ async fn main() {
     control_plane.chat_stores =
         machines::chat_stores::Settings::from_env(&|k| env(k, ""), control_plane.enabled(), &control_plane.regions, &control_plane.server_data, &data_dir)
             .unwrap_or_else(|e| exit(format!("Regional chat stores: {e}")));
+    let chat_buckets = machines::chat_store_copies::named(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()));
+    control_plane.chat_copies = machines::chat_store_copies::Settings::from_env(&startup_store, &|k| env(k, ""), &control_plane.chat_stores, &chat_buckets)
+        .and_then(|s| s.map(machines::chat_store_copies::Copies::new).transpose())
+        .unwrap_or_else(|e| exit(format!("Regional chat stores: {e}")))
+        .map(Arc::new);
+    if let Some(c) = control_plane.chat_copies.as_deref() {
+        log_info!("Regional chat stores: backups copied off the host, {} (ADR 0246).", c.describe());
+    }
     let current_cipher = secrets::sealed::cipher();
     let store_keys = machines::chat_stores::Keys { current: &current_cipher, previous: previous_cipher.as_ref(), forget: secrets::forget_sealed() };
     let opened = machines::chat_stores::open(&db, &control_plane.chat_stores, previous_db_key.as_ref(), store_keys)

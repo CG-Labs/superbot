@@ -53,6 +53,7 @@ pub mod seccomp;
 pub mod s3_standin;
 pub mod screens;
 pub mod server_data;
+pub mod chat_store_copies;
 pub mod chat_stores;
 #[cfg(test)]
 pub mod standin_mirror;
@@ -235,6 +236,9 @@ pub struct ControlPlane {
     pub kept_pins: residency::KeptPins,
     /// Pinned people's chats in a database in their region (REGION_DATA_DIRS, ADR 0215).
     pub chat_stores: chat_stores::Settings,
+    /// Copies of those stores' backups in a bucket in each one's region (REGION_DATA_S3_*,
+    /// ADR 0246). None: no region has one.
+    pub chat_copies: Option<Arc<chat_store_copies::Copies>>,
     /// A network of its own per team (MACHINE_TEAM_NETWORK, ADR 0189). None: off.
     pub team_network: Option<team_network::Settings>,
     /// Machines powered off to take them off a team network they no longer belong on,
@@ -283,6 +287,7 @@ impl Default for ControlPlane {
             server_data: server_data::ServerData::default(),
             kept_pins: residency::KeptPins::default(),
             chat_stores: chat_stores::Settings::default(),
+            chat_copies: None,
             team_network: None,
             network_suspended: Default::default(),
             network_joining: Default::default(),

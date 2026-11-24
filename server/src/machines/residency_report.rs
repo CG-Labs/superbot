@@ -253,7 +253,7 @@ pub fn build(app: &App, cp: &ControlPlane, p: &ResidencyPin, from: i64, to: i64,
         warnings.push(format!("{n} server backup copies were made to a store botd no longer copies to; botd doesn't delete them or know their region (ADR 0184)"));
     }
     let server_in = server_data["inRegion"] == true;
-    let chats = super::chat_stores::against(app, region, &ids, server_in);
+    let chats = super::chat_stores::against(app, cp, region, &ids, server_in);
     warnings.extend(super::chat_stores::report_warnings(&chats, region, crate::db::now()));
     let hosts = cp.hosts().map(|h| h.configured().into_iter().filter(|c| c.region.as_deref() == Some(region)).map(|c| c.name).collect::<Vec<_>>());
     let pinned_by = p.pinned_by.as_deref().map(|id| json!({ "id": id, "name": app.db.user(id).map(|u| u.name) }));
@@ -419,7 +419,17 @@ fn chats_markdown(c: &Value, region: &Value) -> String {
             );
         }
     }
-    out + &format!("- **In the pinned region:** {}\n- **Newest backup of the store:** {backup}\n", if c["inRegion"] == true { "yes" } else { "no" })
+    out += &format!("- **In the pinned region:** {}\n- **Newest backup of the store:** {backup}\n", if c["inRegion"] == true { "yes" } else { "no" });
+    match c.get("offHost") {
+        Some(Value::Null) if c["store"] == true => out += "- **Store's backups copied off the host:** no, they are on the store's own volume\n",
+        Some(o) if o.is_object() => {
+            let newest = o["newestCopyAt"].as_i64().map_or("-".to_string(), rfc3339);
+            let state = if o["failing"] == true { ", though botd's last copy failed" } else { "" };
+            out += &format!("- **Store's backups copied off the host:** {} to a bucket in {}, newest {newest}{state}\n", cell(&o["copies"]), cell(region));
+        }
+        _ => {}
+    }
+    out
 }
 
 /// The longest run of backticks in `s`, so a fence around it is longer.
@@ -547,6 +557,11 @@ mod tests {
             &json!("gb-lon"),
         );
         assert!(md.contains("- **Routines in it:** 1\n") && md.contains("- **Approvals in it:** 2\n- **Approvals in botd's own database:** 1\n") && md.contains("- **In the pinned region:** no"), "{md}");
+        assert!(!md.contains("copied off the host"), "reports from before ADR 0246 have no off-host line: {md}");
+        let off = |o: Value| chats_markdown(&json!({ "store": true, "inRegion": true, "lastBackupAt": null, "offHost": o }), &json!("gb-lon"));
+        assert!(off(Value::Null).contains("- **Store's backups copied off the host:** no, they are on the store's own volume\n"));
+        let md = off(json!({ "copies": 7, "newestCopyAt": 1_795_417_200_000_i64, "lastCopiedAt": 1_795_417_300_000_i64, "failing": true }));
+        assert!(md.contains("- **Store's backups copied off the host:** 7 to a bucket in gb-lon, newest 2026-11-23T07:00:00.000Z, though botd's last copy failed\n"), "{md}");
         assert_eq!(server_data_markdown(&Value::Null), "", "reports from before ADR 0184 have no section");
         let md = server_data_markdown(&json!({ "region": null, "backups": { "offHost": true, "region": null }, "inRegion": false, "policy": "report", "outside": ["a|b"] }));
         assert!(md.contains("- **Region:** not stated by the operator\n- **Server backups:** copied off the host to a store in no stated region\n- **In the pinned region:** no"), "{md}");
