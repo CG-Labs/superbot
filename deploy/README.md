@@ -584,6 +584,8 @@ scrape_configs:
 
 Uptime Kuma or a hosted uptime checker works too: alert when two checks in a row fail.
 
+Each month, `superbot-evidence uptime --prometheus <prometheus-url>` (or `--checks <export>` from another probe) turns the probe's checks into the month's SLO report, as a bundle for a SOC 2 evidence store ([evidence plan](../docs/security/soc2-evidence-plan.md#the-uptime-bundle)).
+
 **Alert rules.** [`deploy/prometheus/superbot-slo.rules.yml`](prometheus/superbot-slo.rules.yml) has error-budget burn-rate alerts on the [metrics](#metrics-and-logs), and alerts for `botd` not being scraped, the probe failing, and Bot runs failing. They assume the scrape jobs are named `superbot` and `superbot-status`, and a 99.9% target (change `superbot:slo_availability:target` for another):
 
 ```sh

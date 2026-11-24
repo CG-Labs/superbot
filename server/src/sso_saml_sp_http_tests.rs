@@ -2272,6 +2272,43 @@ async fn generated_keys_and_their_next_keys_are_checked_without_making_any() {
     assert_eq!(sp.view().await["certificateWarnings"], json!([]), "not yet, today");
 }
 
+/// The monthly health check (ADR 0252) looks 60 days ahead, further than the warnings.
+#[tokio::test]
+async fn the_health_check_sees_certificates_ending_within_60_days() {
+    use crate::sso::xmldsig::test_signer::signers;
+    let sp = serve(&[]).await;
+    let saml = |sp: &Sp| {
+        let (port, admin) = (sp.port, sp.admin.clone());
+        async move {
+            let r: Value = serde_json::from_str(&call(port, "GET", "/api/support/health-check", &admin, "").await.1).unwrap();
+            r["items"].as_array().unwrap().iter().find(|i| i["id"] == "saml").unwrap().clone()
+        }
+    };
+    let import = |xml: String| {
+        let (port, id, admin) = (sp.port, sp.id.clone(), sp.admin.clone());
+        async move { call(port, "PUT", &format!("/api/sso/{id}/saml/idp-metadata"), &admin, &json!({ "xml": xml }).to_string()).await }
+    };
+    let s = saml(&sp).await;
+    assert_eq!(s["status"], "done", "{s}");
+    assert!(s["detail"].as_str().unwrap().ends_with("across 1 provider; none ends within 60 days."), "{s}");
+
+    let ending = base64_of(&cert_ending_in(45).0);
+    assert_eq!(import(test_idp::metadata().replace(&signers()[0].cert, &ending)).await.0, 200);
+    assert_eq!(sp.view().await["certificateWarnings"], json!([]), "45 days is before botd's own warnings start");
+    let s = saml(&sp).await;
+    assert_eq!(s["status"], "open", "{s}");
+    assert_eq!(
+        s["detail"],
+        format!("Ending within 60 days with nothing to replace it: {}'s the IdP's signing certificate in 45 days. Record who rotates each (botctl sso saml <provider>).", sp.id)
+    );
+
+    let and_then = format!(r#"{ending}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor><md:KeyDescriptor use="signing"><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{}"#, signers()[0].cert);
+    assert_eq!(import(test_idp::metadata().replace(&signers()[0].cert, &and_then)).await.0, 200);
+    let s = saml(&sp).await;
+    assert_eq!(s["status"], "done", "the IdP's next certificate is in its metadata: {s}");
+    assert!(s["detail"].as_str().unwrap().contains("each with a newer one already in use"), "{s}");
+}
+
 // AuthnRequests over HTTP-POST (ADR 0235)
 
 /// An HTTP-POST binding page: where its form goes, the message it posts (decoded), and its

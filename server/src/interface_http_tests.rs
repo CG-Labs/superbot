@@ -147,7 +147,7 @@ async fn the_console_is_an_admin_page_without_chat_bots_or_screens() {
         assert!(!CONSOLE_JS.contains(gone) && !html.contains(gone), "{gone} is still in the console");
     }
     let calls = api_calls(CONSOLE_JS);
-    for want in ["/api/users", "/api/signups/x/approve", "/api/machines", "/api/users/x/machine/suspend", "/api/audit", "/api/audit/export.csv", "/api/policy", "/api/secrets/x", "/api/scim/tokens", "/api/setup", "/api/license", "/api/teams", "/api/teams/x/members/x", "/api/roles", "/api/roles/x/users/x", "/api/roles/x/teams/x/users/x", "/api/role-requests", "/api/role-requests/x/approve", "/api/role-requests/x/deny", "/api/service-accounts", "/api/service-accounts/x", "/api/service-accounts/x/tokens", "/api/service-accounts/x/tokens/x", "/api/service-accounts/x/tokens/x/rotate", "/api/support/onboarding"] {
+    for want in ["/api/users", "/api/signups/x/approve", "/api/machines", "/api/users/x/machine/suspend", "/api/audit", "/api/audit/export.csv", "/api/policy", "/api/secrets/x", "/api/scim/tokens", "/api/setup", "/api/license", "/api/teams", "/api/teams/x/members/x", "/api/roles", "/api/roles/x/users/x", "/api/roles/x/teams/x/users/x", "/api/role-requests", "/api/role-requests/x/approve", "/api/role-requests/x/deny", "/api/service-accounts", "/api/service-accounts/x", "/api/service-accounts/x/tokens", "/api/service-accounts/x/tokens/x", "/api/service-accounts/x/tokens/x/rotate", "/api/support/onboarding", "/api/support/health-check"] {
         assert!(calls.iter().any(|(_, p)| p == want) || html.contains(want), "the console lost {want}: {calls:?}");
     }
 }
@@ -167,6 +167,24 @@ fn the_console_checks_onboarding_only_when_asked() {
     assert!(handler.contains("/api/support/onboarding"), "the form's handler makes the call");
     assert!(handler.contains("if (mine === onboardingRequest) renderOnboarding(r);"), "an older check's reply could replace a newer one: {handler}");
     for id in ["sup-onboarding-form", "sup-skip", "sup-onboarding", "sup-onboarding-items", "Check onboarding"] {
+        assert!(CONSOLE_HTML.contains(id), "{id}");
+    }
+}
+
+/// ADR 0252: the Support tab runs the monthly health check only when asked, since each
+/// check is audited too.
+#[test]
+fn the_console_runs_the_health_check_only_when_asked() {
+    let start = CONSOLE_JS.find("async function loadSupport(").expect("loadSupport");
+    let load = &CONSOLE_JS[start..start + CONSOLE_JS[start..].find("\n}\n").expect("function end")];
+    assert!(!load.contains("/api/support/health-check"), "opening the Support tab would record a check");
+    let calls: Vec<&str> = CONSOLE_JS.lines().filter(|l| l.contains("/api/support/health-check")).collect();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let submit = CONSOLE_JS.find(r#"$("sup-health-check-form").addEventListener("submit""#).expect("the check runs from its form");
+    let handler = &CONSOLE_JS[submit..submit + CONSOLE_JS[submit..].find("\n});\n").expect("handler end")];
+    assert!(handler.contains("/api/support/health-check"), "the form's handler makes the call");
+    assert!(handler.contains("if (mine === healthCheckRequest) renderHealthCheck(r);"), "an older check's reply could replace a newer one: {handler}");
+    for id in ["sup-health-check-form", "sup-health-check", "sup-health-check-items", "Run health check"] {
         assert!(CONSOLE_HTML.contains(id), "{id}");
     }
 }
