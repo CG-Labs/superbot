@@ -2055,7 +2055,9 @@ async fn an_idp_session_limit_turned_off_is_ignored() {
     let (code, _, head) = sp.sign_in(|r| r.session_not_on_or_after = Some(db::now() - HOUR)).await;
     assert_eq!(code, 200, "{head}");
     let s = sp.session_of(&head).await;
-    assert_eq!(s["expiresAt"].as_i64().unwrap() - s["createdAt"].as_i64().unwrap(), users::SessionConfig::default().max_ms);
+    // The end is set from the sign-in's clock, a moment before the session row is written.
+    let (lasts, max) = (s["expiresAt"].as_i64().unwrap() - s["createdAt"].as_i64().unwrap(), users::SessionConfig::default().max_ms);
+    assert!((max - 1_000..=max).contains(&lasts), "{lasts} vs {max}");
     assert_eq!(sp.audit("auth.login").await[0]["details"]["idpSessionEnds"], Value::Null);
     assert!(sp.audit("auth.saml_reauthn").await.is_empty());
 }
