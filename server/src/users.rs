@@ -783,14 +783,25 @@ pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Ar
     Ok(Json(user_view(&after)))
 }
 
-/// After a user's status is saved as disabled: their sign-ins end and the routines run for
-/// them pause (ADR 0047), recorded as `user.disabled`.
+/// After a user's status is saved as disabled: their sign-ins end, at native SAML IdPs too
+/// (ADR 0258), and the routines run for them pause (ADR 0047), recorded as `user.disabled`.
 pub(crate) fn disabled(app: &AppState, a: &Auth, by: &Who, user_id: &str) {
     a.sso.forget_user(user_id);
     a.mfa.forget_user(user_id);
-    let n = app.db.revoke_user_sessions(user_id, by.actor.id.as_deref().unwrap_or(""), "user disabled");
+    let ended = app.db.revoke_user_sessions(user_id, by.actor.id.as_deref().unwrap_or(""), "user disabled");
+    let slo = crate::sso::sessions_ended(a, app, &ended, "user disabled");
     let paused = crate::handover::user_disabled(app, by, user_id);
-    app.db.record(&by.event("user.disabled").target("user", user_id).details(json!({ "sessionsRevoked": n, "routinesPaused": paused })));
+    let details = with_idp_logouts(json!({ "sessionsRevoked": ended.len(), "routinesPaused": paused }), slo);
+    app.db.record(&by.event("user.disabled").target("user", user_id).details(details));
+}
+
+/// `idpLogouts` on an event that ended sessions: the back-channel LogoutRequests botd sent
+/// native SAML IdPs for them (ADR 0258), when it sent any.
+pub(crate) fn with_idp_logouts(mut details: Value, slo: Vec<String>) -> Value {
+    if !slo.is_empty() {
+        details["idpLogouts"] = json!(slo);
+    }
+    details
 }
 
 /// After someone loses access: every screen link changes, since links don't know who
@@ -860,7 +871,9 @@ pub async fn list_sessions(State(app): State<AppState>, Extension(a): Extension<
     Ok(Json(json!(list.iter().map(|s| session_view(s, &a.sessions)).collect::<Vec<_>>())))
 }
 
-pub async fn revoke_session(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
+/// Ends one session, and its IdP session too when a native SAML IdP takes back-channel
+/// logout (ADR 0258).
+pub async fn revoke_session(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     let s = app.db.session(&id).filter(|s| s.revoked_at.is_none()).ok_or_else(|| not_found("Session"))?;
     if let Some(u) = app.db.user(&s.user_id) {
         Delegate::new(&app, &c, &by).may_manage(&u)?;
@@ -868,7 +881,9 @@ pub async fn revoke_session(State(app): State<AppState>, Extension(c): Extension
     if !app.db.revoke_session(&id, by.actor.id.as_deref().unwrap_or(""), "revoked by admin") {
         return Err(not_found("Session"));
     }
-    app.db.record(&by.event("session.revoked").target("session", &id).details(json!({ "userId": s.user_id, "kind": s.kind })));
+    let slo = crate::sso::sessions_ended(&a, &app, std::slice::from_ref(&s), "revoked by admin");
+    let details = with_idp_logouts(json!({ "userId": s.user_id, "kind": s.kind }), slo);
+    app.db.record(&by.event("session.revoked").target("session", &id).details(details));
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -879,14 +894,15 @@ pub async fn revoke_user_sessions(State(app): State<AppState>, Extension(a): Ext
     // session is made in time to be revoked below or the code is already gone.
     a.sso.forget_user(&u.id);
     a.mfa.forget_user(&u.id);
-    let n = app.db.revoke_user_sessions(&u.id, by.actor.id.as_deref().unwrap_or(""), "revoked by admin");
+    let ended = app.db.revoke_user_sessions(&u.id, by.actor.id.as_deref().unwrap_or(""), "revoked by admin");
+    let slo = crate::sso::sessions_ended(&a, &app, &ended, "revoked by admin");
     // A screen link doesn't know who opened it, so they all change.
     if let Some(screens) = &app.screens {
         screens.rotate_all().await;
     }
     crate::machines::screens::rotate_all(&app).await;
-    app.db.record(&by.event("session.revoked_all").target("user", &u.id).details(json!({ "count": n })));
-    Ok(Json(json!({ "revoked": n })))
+    app.db.record(&by.event("session.revoked_all").target("user", &u.id).details(with_idp_logouts(json!({ "count": ended.len() }), slo)));
+    Ok(Json(json!({ "revoked": ended.len() })))
 }
 
 /// Deletes sessions and codes that ended over 30 days ago, hourly.
@@ -1050,7 +1066,10 @@ mod tests {
         db.update_user(OPERATOR, UserPatch { status: Some("disabled"), ..Default::default() }).unwrap();
         assert!(!db.session_is_live(&s2.id, s2.created_at, cfg.idle_ms, cfg.max_ms));
         db.update_user(OPERATOR, UserPatch { status: Some("active"), ..Default::default() }).unwrap();
-        assert_eq!(db.revoke_user_sessions(OPERATOR, "x", "test"), 1);
+        let revoked = db.revoke_user_sessions(OPERATOR, "x", "test");
+        assert_eq!(revoked.iter().map(|s| (s.id.as_str(), s.revoke_reason.as_deref())).collect::<Vec<_>>(), [(s2.id.as_str(), Some("test"))]);
+        assert!(revoked[0].unexpired_at(s2.created_at, cfg.idle_ms, cfg.max_ms) && !revoked[0].unexpired_at(s2.created_at + cfg.max_ms, cfg.idle_ms, cfg.max_ms));
+        assert!(db.revoke_user_sessions(OPERATOR, "x", "test").is_empty(), "once");
         assert_eq!(db.prune_sessions(db::now() + 1, cfg.idle_ms, cfg.max_ms), 2);
     }
 

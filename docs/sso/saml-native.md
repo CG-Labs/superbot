@@ -354,6 +354,10 @@ Some IdPs (Shibboleth, PingFederate, some ADFS setups) end sessions server to se
 
 Re-import SuperBot's metadata at the IdP so it sees the SOAP endpoint. Shibboleth signs back-channel logout requests only to port 443, so serve SuperBot on 443, or set Shibboleth's `signRequests` for SuperBot's relying party. `botctl sso saml corp` shows `Back-channel logout: from the IdP, and to it` once the IdP's metadata has a SOAP logout URL.
 
+#### When an admin or SCIM ends sessions
+
+The same back channel ends IdP sessions when SuperBot sessions end without anyone signing out ([ADR 0258](../adr/0258-saml-back-channel-logout-on-revoke-and-deprovisioning.md)): an admin revokes a session or all of someone's sessions, disables or erases them, or SCIM deactivates or deletes them. For each session the IdP vouched for that was still live, botd sends the IdP's SOAP logout URL a signed LogoutRequest naming that IdP session, once per IdP session however many SuperBot sessions it made, so a stolen browser can't just sign back in through the IdP. There is nothing to turn on, and nothing waits for the IdP: the SuperBot sessions end at once either way. Each answer is audited as `auth.slo_response` with `revokeReason` (`revoked by admin`, `user disabled`, `deprovisioned by SCIM` or `deleted by SCIM`), and the admin's or SCIM's own event (`session.revoked`, `session.revoked_all`, `user.disabled`, `scim.user_deleted`) lists the request IDs in `idpLogouts`. An IdP with no SOAP logout URL can't be told without the person's browser, so there the sessions end in SuperBot only, as before.
+
 ## Require MFA at the IdP
 
 SuperBot doesn't ask single sign-on sign-ins for its own second factor: the IdP's MFA is that factor, so require it there (Okta: an authentication policy with a possession factor on the app; Entra ID: a Conditional Access policy requiring MFA for the app). This is your control as the customer (CC6.1-2 in the [SOC 2 readiness checklist](../security/soc2-readiness-checklist.md)).

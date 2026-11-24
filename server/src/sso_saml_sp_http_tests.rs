@@ -758,6 +758,149 @@ async fn a_browser_signs_out_over_soap_when_the_idp_has_no_front_channel() {
     assert_eq!((e["outcome"].as_str(), e["details"]["reason"].as_str()), (Some("failure"), Some("unreachable")));
 }
 
+// Back-channel logout when sessions end without a sign-out (ADR 0258)
+
+impl Sp {
+    /// Imports IdP metadata with both a browser and a SOAP SLO URL.
+    async fn with_soap_idp(&self, soap_url: &str) {
+        let xml = test_idp::with_soap_slo(&test_idp::with_slo(&test_idp::metadata()), soap_url);
+        let (code, view) = call(self.port, "PUT", &format!("/api/sso/{}/saml/idp-metadata", self.id), &self.admin, &json!({ "xml": xml }).to_string()).await;
+        assert_eq!(code, 200, "{view}");
+    }
+
+    /// The id of `user`'s live session in the IdP session `index`.
+    fn session_in(&self, user: &str, index: &str) -> String {
+        let cfg = crate::users::SessionConfig::default();
+        let live = self.app.db.live_sessions(Some(user), db::now(), cfg.idle_ms, cfg.max_ms);
+        live.into_iter().find(|s| self.app.db.saml_session(&s.id).and_then(|l| l.session_index).as_deref() == Some(index)).expect("a session in that IdP session").id
+    }
+}
+
+impl SoapIdp {
+    /// The SessionIndex of each LogoutRequest it got after the first `after`, each signed by `cert`.
+    fn indexes(&self, after: usize, cert: &crate::sso::xmldsig::Cert) -> Vec<String> {
+        let got = self.got.lock().unwrap().clone();
+        got[after..]
+            .iter()
+            .map(|(_, sent)| {
+                let doc = crate::sso::xmldsig::parse(sent).unwrap();
+                let m = doc.descendants().find(|n| crate::sso::xmldsig::is(*n, crate::sso::saml_sp::PROTOCOL, "LogoutRequest")).unwrap();
+                assert_eq!(crate::sso::xmldsig::verify_enveloped(m, std::slice::from_ref(cert)), Ok(true), "signed by our key");
+                assert!(sent.contains(&format!(">{NAME_ID}</saml:NameID>")), "{sent}");
+                sent.split("<samlp:SessionIndex>").nth(1).unwrap().split('<').next().unwrap().to_string()
+            })
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn an_admin_ending_sessions_ends_their_idp_sessions_over_soap() {
+    let (stub, soap_url) = SoapIdp::start().await;
+    let sp = serve(&[]).await;
+    sp.with_soap_idp(&soap_url).await;
+    let u = sp.link();
+    let cert = sp.sp_cert().await;
+
+    // One session revoked by an admin: its IdP session ends too, even with a browser front channel.
+    let first = sp.cookie("_s1").await;
+    let id = sp.session_in(&u.id, "_s1");
+    let (code, body) = call(sp.port, "DELETE", &format!("/api/sessions/{id}"), &sp.admin, "").await;
+    assert_eq!(code, 200, "{body}");
+    let done = sp.audited("auth.slo_response", 0).await;
+    assert_eq!(stub.indexes(0, &cert), ["_s1"]);
+    let revoked = &sp.audit("session.revoked").await[0];
+    let d = &done["details"];
+    assert_eq!(revoked["details"]["idpLogouts"], json!([d["requestId"]]));
+    assert_eq!((done["outcome"].as_str(), done["targetId"].as_str(), d["binding"].as_str(), d["revokeReason"].as_str()), (Some("success"), Some(id.as_str()), Some("soap"), Some("revoked by admin")));
+    assert_eq!(sp.who(&first).await, None);
+
+    // All of someone's sessions: one LogoutRequest per IdP session, not per SuperBot session.
+    let (web, _) = (sp.cookie("_s2").await, sp.app_token("_s2").await);
+    sp.cookie("_s3").await;
+    let (code, body) = call(sp.port, "DELETE", &format!("/api/users/{}/sessions", u.id), &sp.admin, "").await;
+    assert_eq!((code, serde_json::from_str::<Value>(&body).unwrap()["revoked"].as_u64()), (200, Some(3)), "{body}");
+    sp.audited("auth.slo_response", 2).await;
+    let mut sent = stub.indexes(1, &cert);
+    sent.sort();
+    assert_eq!(sent, ["_s2", "_s3"]);
+    let all = &sp.audit("session.revoked_all").await[0]["details"];
+    assert_eq!((all["count"].as_u64(), all["idpLogouts"].as_array().map(Vec::len)), (Some(3), Some(2)));
+    assert!(sp.audit("auth.slo_response").await.iter().take(2).all(|e| e["details"]["revokeReason"] == "revoked by admin"));
+    assert_eq!(sp.who(&web).await, None);
+
+    // A session no IdP vouched for tells nobody.
+    let code_session = session_for(sp.port, &sp.admin, &u.id).await;
+    let (code, body) = call(sp.port, "DELETE", &format!("/api/users/{}/sessions", u.id), &sp.admin, "").await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(call(sp.port, "GET", "/api/auth/me", &code_session, "").await.0, 401);
+    assert!(sp.audit("session.revoked_all").await[0]["details"].get("idpLogouts").is_none());
+
+    // Disabling someone ends their IdP sessions as well.
+    sp.cookie("_s4").await;
+    let (code, body) = call(sp.port, "PATCH", &format!("/api/users/{}", u.id), &sp.admin, &json!({ "status": "disabled" }).to_string()).await;
+    assert_eq!(code, 200, "{body}");
+    let done = sp.audited("auth.slo_response", 3).await;
+    assert_eq!(stub.indexes(3, &cert), ["_s4"], "nothing for the code session");
+    assert_eq!(done["details"]["revokeReason"], "user disabled");
+    assert_eq!(sp.audit("user.disabled").await[0]["details"]["idpLogouts"], json!([done["details"]["requestId"]]));
+}
+
+#[tokio::test]
+async fn an_idp_down_or_without_soap_logout_never_holds_up_an_admin() {
+    // No SOAP SLO URL: the session just ends here, as before.
+    let sp = serve_slo(&[]).await;
+    let u = sp.link();
+    let cookie = sp.cookie("_s1").await;
+    let (code, _) = call(sp.port, "DELETE", &format!("/api/users/{}/sessions", u.id), &sp.admin, "").await;
+    assert_eq!((code, sp.who(&cookie).await), (200, None));
+    assert!(sp.audit("session.revoked_all").await[0]["details"].get("idpLogouts").is_none());
+    assert!(sp.audit("auth.slo_response").await.is_empty());
+
+    // An IdP that is down: the revoke stands, and the failure is audited.
+    let down = serve(&[]).await;
+    down.with_soap_idp("http://127.0.0.1:9/soap").await;
+    let u = down.link();
+    let cookie = down.cookie("_s1").await;
+    let id = down.session_in(&u.id, "_s1");
+    assert_eq!(call(down.port, "DELETE", &format!("/api/sessions/{id}"), &down.admin, "").await.0, 200);
+    assert_eq!(down.who(&cookie).await, None);
+    let e = down.audited("auth.slo_response", 0).await;
+    assert_eq!((e["outcome"].as_str(), e["details"]["reason"].as_str(), e["details"]["revokeReason"].as_str()), (Some("failure"), Some("unreachable"), Some("revoked by admin")));
+}
+
+#[tokio::test]
+async fn scim_deprovisioning_ends_idp_sessions_over_soap() {
+    use crate::scim_http_tests::{okta_user, scim, token};
+    let (stub, soap_url) = SoapIdp::start().await;
+    let sp = serve_with(&[], |a| a.scim.enabled = true).await;
+    sp.with_soap_idp(&soap_url).await;
+    let cert = sp.sp_cert().await;
+    let (scim_token, _) = token(sp.port, &sp.admin, json!({ "tenant": "okta" })).await;
+    let (code, _, created) = scim(sp.port, &scim_token, "POST", "/scim/v2/Users", okta_user("ada@example.com", "ext-1")).await;
+    assert_eq!(code, 201, "{created}");
+    let id = created["id"].as_str().unwrap().to_string();
+    sp.app.db.link_identity(&id, &NewIdentity { provider: &sp.id, issuer: IDP, subject: STORED, tenant: None, email: None, created_by: Some("test") }).unwrap();
+    let active = |on: bool| json!({ "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], "Operations": [{ "op": "replace", "value": { "active": on } }] });
+
+    let cookie = sp.cookie("_s1").await;
+    let (code, _, body) = scim(sp.port, &scim_token, "PATCH", &format!("/scim/v2/Users/{id}"), active(false)).await;
+    assert_eq!(code, 200, "{body}");
+    let done = sp.audited("auth.slo_response", 0).await;
+    assert_eq!(stub.indexes(0, &cert), ["_s1"]);
+    assert_eq!(done["details"]["revokeReason"], "deprovisioned by SCIM");
+    assert_eq!(sp.audit("user.disabled").await[0]["details"]["idpLogouts"], json!([done["details"]["requestId"]]));
+    assert_eq!(sp.who(&cookie).await, None);
+
+    assert_eq!(scim(sp.port, &scim_token, "PATCH", &format!("/scim/v2/Users/{id}"), active(true)).await.0, 200);
+    sp.cookie("_s2").await;
+    let (code, _, body) = scim(sp.port, &scim_token, "DELETE", &format!("/scim/v2/Users/{id}"), Value::Null).await;
+    assert_eq!(code, 204, "{body}");
+    let done = sp.audited("auth.slo_response", 1).await;
+    assert_eq!(stub.indexes(1, &cert), ["_s2"]);
+    assert_eq!(done["details"]["revokeReason"], "deleted by SCIM");
+    assert_eq!(sp.audit("scim.user_deleted").await[0]["details"]["idpLogouts"], json!([done["details"]["requestId"]]));
+}
+
 // Encrypted assertions (ADR 0150)
 
 impl Sp {
