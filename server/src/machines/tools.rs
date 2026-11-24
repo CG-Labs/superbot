@@ -1682,6 +1682,8 @@ mod tests {
             (PathBuf::from(format!("{s}/")), PathBuf::from(format!("{s}/.login"))),
             (PathBuf::from(format!("{s}/.")), dir.join("npm-login")),
             (dir.join("sub/.."), dir.join("npm-login")),
+            (PathBuf::from(format!("{s}/./sub//")), dir.join("sub/.login")),
+            (dir.join("x/../sub"), dir.join("sub/npm-login")),
             (link.clone(), dir.join("npm-login")),
             (dir.clone(), link.join("npm-login")),
             (dir.clone(), dir.clone()),
