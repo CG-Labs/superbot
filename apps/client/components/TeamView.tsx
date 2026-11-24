@@ -3,7 +3,7 @@ import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, 
 import type { SuperBotApi } from "../src/api";
 import { checkoutNotice, limitSummary, openBillingPage } from "../src/billing";
 import { confirmAsync } from "../src/dialogs";
-import { defaultEnd, endChoices, endsAt } from "../src/roles";
+import { defaultEnd, endChoices, endNear, endsAt } from "../src/roles";
 import {
   appliesLine,
   assignableRoles,
@@ -24,7 +24,7 @@ import {
   type Tone,
 } from "../src/team";
 import { colors } from "../src/theme";
-import type { MyTeamInvite, Team, TeamBilling, TeamMember, TeamRole, TeamRoleChoice } from "../src/types";
+import type { CustomRoleRef, MyTeamInvite, Team, TeamBilling, TeamMember, TeamRole, TeamRoleChoice } from "../src/types";
 import { Chips } from "./Chips";
 
 interface Props {
@@ -53,10 +53,23 @@ const TONE: Record<Tone, object> = {
 };
 
 /** Giving a teammate one of the team's custom roles, for how long (ADR 0254). */
-function GiveRole({ choices, busy, onGive, onCancel }: { choices: TeamRoleChoice[]; busy: boolean; onGive: (roleId: string, ends: string) => void; onCancel: () => void }) {
-  const [roleId, setRoleId] = useState(choices[0].id);
+function GiveRole({
+  choices,
+  held,
+  busy,
+  onGive,
+  onCancel,
+}: {
+  choices: TeamRoleChoice[];
+  /** The role they hold now: a change starts on it, and near its end. */
+  held?: CustomRoleRef | null;
+  busy: boolean;
+  onGive: (roleId: string, ends: string) => void;
+  onCancel: () => void;
+}) {
+  const [roleId, setRoleId] = useState((choices.find((c) => c.id === held?.id) ?? choices[0]).id);
   const choice = choices.find((c) => c.id === roleId) ?? choices[0];
-  const [ends, setEnds] = useState(defaultEnd(choice.maxDays));
+  const [ends, setEnds] = useState(() => (held && held.id === choice.id ? endNear(choice.maxDays, held.expiresAt, Date.now()) : defaultEnd(choice.maxDays)));
   const pick = (id: string) => {
     setRoleId(id);
     setEnds(defaultEnd(choices.find((c) => c.id === id)?.maxDays));
@@ -141,6 +154,7 @@ function MemberRow({
       {giving && custom.give ? (
         <GiveRole
           choices={team.roleChoices ?? []}
+          held={m.customRole}
           busy={busy}
           onGive={(roleId, ends) => {
             setGiving(false);

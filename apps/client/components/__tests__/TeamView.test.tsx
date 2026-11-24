@@ -285,10 +285,23 @@ describe("TeamView", () => {
       const team = { ...teamAs("admin"), roleChoices, members: [ada, { ...al, customRole: { id: "r-people", name: "Team people" } }] };
       const { api, user } = await open(team, { meId: "ada" });
       expect(screen.getByTestId("custom-role-al")).toHaveTextContent("Team role: Team people");
-      expect(screen.getByLabelText("Change team role for Al")).toBeOnTheScreen();
+      await user.press(screen.getByLabelText("Change team role for Al"));
+      const panel = within(screen.getByTestId("give-role"));
+      expect(panel.getByRole("radio", { name: "Team people", checked: true })).toBeOnTheScreen();
+      expect(panel.getByRole("radio", { name: "No end", checked: true })).toBeOnTheScreen();
+      await user.press(panel.getByText("Cancel"));
       await user.press(screen.getByLabelText("Take away team role from Al"));
       expect(mockConfirm).toHaveBeenCalledWith("Take Team people away from Al?", expect.any(String), "Take away");
       expect(api.takeTeamCustomRole).toHaveBeenCalledWith("al");
+    });
+
+    it("starts a change of a time-bound role near the end it has now", async () => {
+      const held = { id: "r-ops", name: "On call", expiresAt: Date.now() + 5 * 86_400_000 };
+      const { user } = await open({ ...teamAs("owner"), roleChoices, members: [ada, { ...al, customRole: held }] });
+      await user.press(screen.getByLabelText("Change team role for Al"));
+      const panel = within(screen.getByTestId("give-role"));
+      expect(panel.getByRole("radio", { name: "On call", checked: true })).toBeOnTheScreen();
+      expect(panel.getByRole("radio", { name: "7 days", checked: true })).toBeOnTheScreen();
     });
 
     const fromIdp = { ...al, customRole: { id: "r-b", name: "Billing", fromIdp: true } };

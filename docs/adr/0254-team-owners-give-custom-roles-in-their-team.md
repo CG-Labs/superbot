@@ -34,7 +34,7 @@ Owners and admins already hold every team permission, and can make any member a 
 - **Plain members only.** Giving a role to the team's owners or admins is 409: they can already do all of it. Taking one away from them is allowed, since it only narrows.
 - **Not yourself** (409), for giving or taking. Ask another of the team's owners or admins.
 - **Not read-only people** (409), as for an admin: read-only people change nothing, anywhere.
-- **Not a role from the identity provider** (409). When a SCIM mapping or team role group gave the person their role in the team (ADR 0138, ADR 0206), the IdP owns it. A team owner can't replace or remove it; a server admin changes the mapping. Server admins' own route still overrides it, as before.
+- **Not a role from the identity provider** (409). When a SCIM mapping or team role group gave the person their role in the team (ADR 0138, ADR 0206), the IdP owns it. A team owner can't replace or remove it; a server admin changes the mapping. The check is made again inside the write's transaction, so a SCIM grant that lands between the route's check and the write still wins. Server admins' own route still overrides it, as before.
 - Someone on another team, or no one, is 404, so a team owner learns nothing about people outside their team.
 
 ### Who doesn't
@@ -51,7 +51,7 @@ Both routes write the usual `role.assigned` and `role.unassigned` with `scope: "
 
 - `GET /api/team` adds `roleChoices` for the team's owners and admins who can write: each role that adds something in a team, with its `id`, `name`, `description`, `applies` (its team permissions) and `maxDays`. Members, read-only managers and service accounts get none.
 - A member's `customRole` in the team view adds `fromIdp: true` when their identity provider gave it.
-- **App.** On the Team screen, each teammate's role shows under their name, with when it ends or that it comes from the IdP. Owners and admins get **Give a team role** (or **Change team role**) on plain members: pick a role, see what it adds in the team, pick an end (only those within a time-bound role's limit), and give it. **Take away role** asks first. Nothing is offered on yourself, on owners and admins (except taking away), or on a role from the IdP.
+- **App.** On the Team screen, each teammate's role shows under their name, with when it ends or that it comes from the IdP. Owners and admins get **Give a team role** (or **Change team role**, which starts on the role they hold and the end nearest theirs) on plain members: pick a role, see what it adds in the team, pick an end (only those within a time-bound role's limit), and give it. **Take away role** asks first. Nothing is offered on yourself, on owners and admins (except taking away), or on a role from the IdP.
 - `botctl` has no team commands for owners; server admins keep `botctl role assign --team`. The console stays admin-only.
 
 ## Alternatives considered
