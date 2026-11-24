@@ -10,11 +10,12 @@
 //! once more when Vault refuses it, in `VAULT_AUTH_NAMESPACE` if the auth method is
 //! mounted somewhere other than the secrets. Requests run on a runtime of their own
 //! (`http::Worker`). It is also the `leases::Issuer` of `VAULT_RUN_CREDENTIALS`: a new
-//! lease from a dynamic secrets engine for each run, revoked when the run ends (ADR 0185).
+//! lease from a dynamic secrets engine for each run, renewed while the run lasts (ADR 0221)
+//! and revoked when it ends (ADR 0185).
 
 use super::external::{self, Provider, Scope};
 use super::http::Worker;
-use super::leases::{Field, Issuer, Lease};
+use super::leases::{Field, Issuer, Lease, Renewal};
 use super::{Error, SecretStore};
 use crate::audit::{Event, Outcome};
 use base64::Engine;
@@ -522,11 +523,7 @@ impl Inner {
     /// `PUT sys/leases/revoke/<lease id>`, so botd's policy can allow revoking only the
     /// leases of the paths it reads. When Vault refuses the token, gets a new one and asks once more.
     async fn revoke(&self, lease_id: &str) -> Result<(), Error> {
-        let ok = !lease_id.is_empty() && lease_id.split('/').all(|p| !p.is_empty() && p != "." && p != ".." && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)));
-        if !ok {
-            return Err(Error::Unavailable("Vault: a lease id that can't be part of a path".into()));
-        }
-        let path = format!("sys/leases/revoke/{lease_id}");
+        let path = format!("sys/leases/revoke/{}", lease_path(lease_id)?);
         for fresh in [false, true] {
             let token = self.token(fresh).await?;
             let res = self.request(reqwest::Method::PUT, &path).header("X-Vault-Token", token.as_str()).send().await.map_err(|e| unavailable("sys/leases/revoke", e))?;
@@ -541,6 +538,48 @@ impl Inner {
         }
         unreachable!("the second pass returns")
     }
+
+    /// `PUT sys/leases/renew/<lease id>` for `increment` seconds more (ADR 0221), so botd's
+    /// policy can allow renewing only the leases of the paths it reads. Vault gives less
+    /// than asked at the role's max TTL. A 400 or 404 (the lease is gone or not renewable)
+    /// or a 403 with a fresh token (the policy doesn't allow it) is final; anything else
+    /// may pass and is tried again.
+    async fn renew(&self, lease_id: &str, increment: u64) -> Result<Renewal, Error> {
+        let path = format!("sys/leases/renew/{}", lease_path(lease_id)?);
+        for fresh in [false, true] {
+            let token = self.token(fresh).await?;
+            let res = self
+                .request(reqwest::Method::PUT, &path)
+                .header("X-Vault-Token", token.as_str())
+                .json(&json!({ "increment": increment }))
+                .send()
+                .await
+                .map_err(|e| unavailable("sys/leases/renew", e))?;
+            let status = res.status();
+            if status == reqwest::StatusCode::FORBIDDEN && !fresh {
+                continue;
+            }
+            match status {
+                reqwest::StatusCode::FORBIDDEN => return Ok(Renewal::Refused(format!("Vault answered {status} for sys/leases/renew; botd's policy needs update on sys/leases/renew/<path>/* for each path"))),
+                reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::NOT_FOUND => return Ok(Renewal::Refused(format!("Vault answered {status} for sys/leases/renew: the lease is gone or can't be renewed"))),
+                s if !s.is_success() => return Err(Error::Unavailable(format!("Vault answered {status} for sys/leases/renew"))),
+                _ => {}
+            }
+            let v: Value = res.json().await.map_err(|e| unavailable("sys/leases/renew", e))?;
+            let ttl = v["lease_duration"].as_u64().ok_or_else(|| Error::Unavailable("Vault: sys/leases/renew gave an answer that isn't a lease".into()))?;
+            return Ok(Renewal::Renewed { ttl, renewable: v["renewable"].as_bool().unwrap_or(false) });
+        }
+        unreachable!("the second pass returns")
+    }
+}
+
+/// A lease id as part of a URL path: `/`-separated parts of letters, digits, `.`, `_` and `-`.
+fn lease_path(lease_id: &str) -> Result<&str, Error> {
+    let ok = !lease_id.is_empty() && lease_id.split('/').all(|p| !p.is_empty() && p != "." && p != ".." && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)));
+    if !ok {
+        return Err(Error::Unavailable("Vault: a lease id that can't be part of a path".into()));
+    }
+    Ok(lease_id)
 }
 
 impl Issuer for Vault {
@@ -556,6 +595,11 @@ impl Issuer for Vault {
     fn revoke(&self, lease_id: &str) -> Result<(), Error> {
         let lease_id = lease_id.to_string();
         self.run(move |i| async move { i.revoke(&lease_id).await })
+    }
+
+    fn renew(&self, lease_id: &str, increment: Duration) -> Result<Renewal, Error> {
+        let lease_id = lease_id.to_string();
+        self.run(move |i| async move { i.renew(&lease_id, increment.as_secs()).await })
     }
 }
 
@@ -636,6 +680,14 @@ pub(crate) mod tests {
         max_ttl: AtomicUsize,
         /// (token, TTL asked for) of each `renew-self`.
         renewals: Mutex<Vec<(String, u64)>>,
+        /// The TTL of each lease from a dynamic secrets engine (0: 900 s).
+        creds_ttl: AtomicUsize,
+        /// The most a lease renewal gives (0: no limit), as a role's max TTL.
+        lease_max: AtomicUsize,
+        /// Leases the engines made.
+        made: Mutex<Vec<String>>,
+        /// (lease id, increment asked for) of each `sys/leases/renew`.
+        lease_renewals: Mutex<Vec<(String, u64)>>,
     }
 
     pub(crate) type F = Arc<Fake>;
@@ -767,7 +819,31 @@ pub(crate) mod tests {
         };
         let n = f.issued.fetch_add(1, Ordering::SeqCst);
         let data: serde_json::Map<String, Value> = fields.as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().map_or(Value::Null, |v| json!(format!("{v}-{n}"))))).collect();
-        (StatusCode::OK, Json(json!({ "lease_id": format!("{path}/l{n}"), "lease_duration": 900, "renewable": true, "data": data })))
+        let lease = format!("{path}/l{n}");
+        f.made.lock().unwrap().push(lease.clone());
+        let ttl = match f.creds_ttl.load(Ordering::SeqCst) {
+            0 => 900,
+            t => t,
+        };
+        (StatusCode::OK, Json(json!({ "lease_id": lease, "lease_duration": ttl, "renewable": true, "data": data })))
+    }
+
+    /// `sys/leases/renew/<lease id>`: up to `lease_max`; a lease never made or already revoked is a 400.
+    async fn renew(State(f): State<F>, Path(lease): Path<String>, h: HeaderMap, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+        if let Err(e) = check(&f, &h) {
+            return e;
+        }
+        assert!(body.get("lease_id").is_none(), "the lease id is in the path, where a policy can limit it");
+        let asked = body["increment"].as_u64().unwrap_or(0);
+        f.lease_renewals.lock().unwrap().push((lease.clone(), asked));
+        if !f.made.lock().unwrap().contains(&lease) || f.revoked.lock().unwrap().contains(&lease) {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "errors": ["lease not found"] })));
+        }
+        let ttl = match f.lease_max.load(Ordering::SeqCst) as u64 {
+            0 => asked,
+            max => asked.min(max),
+        };
+        (StatusCode::OK, Json(json!({ "lease_id": lease, "lease_duration": ttl, "renewable": true })))
     }
 
     async fn revoke(State(f): State<F>, Path(lease): Path<String>, h: HeaderMap) -> (StatusCode, Json<Value>) {
@@ -790,6 +866,7 @@ pub(crate) mod tests {
             .route("/v1/auth/token/renew-self", axum::routing::post(renew_self))
             .route("/v1/{engine}/creds/{role}", axum::routing::get(creds))
             .route("/v1/sys/leases/revoke/{*lease}", axum::routing::put(revoke))
+            .route("/v1/sys/leases/renew/{*lease}", axum::routing::put(renew))
             .with_state(Arc::clone(&f));
         (super::super::http::tests::serve(app), f)
     }
@@ -967,6 +1044,53 @@ pub(crate) mod tests {
         drop(rc.issue("uout1", "bout1", false, RUN).unwrap().1);
         assert_eq!(f.issued.load(Ordering::SeqCst), issued + 1);
         super::super::leases::tests::wait_for(|| f.revoked.lock().unwrap().len() == 4);
+    }
+
+    #[test]
+    fn a_runs_leases_are_renewed_through_vault_while_it_lasts() {
+        use super::super::leases::tests::{wait_for, RUN};
+        let (url, f) = stand_in();
+        f.tokens.lock().unwrap().push("hvs.renew".into());
+        f.creds_ttl.store(2, Ordering::SeqCst);
+        f.creds.lock().unwrap().insert("database/creds/renew".into(), json!({ "password": "vault-renew-pass-6e7f" }));
+        let pairs = [("SECRETS_BACKEND", "vault"), ("VAULT_ADDR", url.as_str()), ("VAULT_TOKEN", "hvs.renew"), ("VAULT_NAMESPACE", "admin/team-a"), ("VAULT_RUN_CREDENTIALS", "database/creds/renew RENEW_PGPASSWORD=password")];
+        let x = external::from_env(&settings(&pairs), &EnvStore::fixed(&pairs)).unwrap().unwrap();
+        let rc = x.run_credentials().unwrap();
+        let renewed = || audited("database/creds/renew").into_iter().filter(|e| e.action == "secret.lease_renewed").collect::<Vec<_>>();
+
+        let (_, l) = rc.issue("urv1", "brv1", true, RUN).unwrap();
+        let first = l.expires_first().unwrap();
+        wait_for(|| f.lease_renewals.lock().unwrap().len() >= 2);
+        assert!(f.lease_renewals.lock().unwrap().iter().all(|(id, n)| id == "database/creds/renew/l0" && *n == 2), "{:?}", f.lease_renewals.lock().unwrap());
+        wait_for(|| l.expires_first().is_some_and(|at| at > first + Duration::from_secs(2)));
+        let ev = renewed();
+        assert!(ev.iter().all(|e| e.outcome == Outcome::Success && e.details["store"] == "vault" && e.details["ttl"] == 2), "{ev:?}");
+        assert!(f.namespaces.lock().unwrap().iter().all(|n| n == "admin/team-a"), "renewed where it was made");
+
+        // The role's max TTL: Vault gives less than asked, and the run must stop then.
+        f.lease_max.store(1, Ordering::SeqCst);
+        wait_for(|| renewed().iter().any(|e| e.details["final"] == true && e.details["ttl"] == 1));
+        let n = f.lease_renewals.lock().unwrap().len();
+        drop(l);
+        wait_for(|| f.revoked.lock().unwrap().len() == 1);
+        assert_eq!(f.lease_renewals.lock().unwrap().len(), n, "not asked again after its last");
+
+        let v = Vault::new(Config::from_env(&settings(&pairs), &EnvStore::fixed(&pairs)).unwrap()).unwrap();
+        let refused = |r: Result<Renewal, Error>| match r {
+            Ok(Renewal::Refused(why)) => why,
+            other => panic!("{other:?}"),
+        };
+        assert!(refused(Issuer::renew(&v, "database/creds/renew/l0", Duration::from_secs(2))).contains("400"), "revoked: gone, final");
+        let other = [pairs[0], pairs[1], ("VAULT_TOKEN", "hvs.not-allowed"), pairs[4]];
+        let denied = Vault::new(Config::from_env(&settings(&other), &EnvStore::fixed(&other)).unwrap()).unwrap();
+        assert!(refused(Issuer::renew(&denied, "database/creds/renew/l0", Duration::from_secs(2))).contains("sys/leases/renew/<path>/*"), "a policy without renew is named");
+        f.down.store(true, Ordering::SeqCst);
+        assert!(matches!(Issuer::renew(&v, "database/creds/renew/l0", Duration::from_secs(2)), Err(Error::Unavailable(_))), "Vault down: tried again");
+        f.down.store(false, Ordering::SeqCst);
+        for bad in ["", "../sys/x", "a//b", "a b"] {
+            assert!(Issuer::renew(&v, bad, Duration::from_secs(2)).is_err(), "{bad:?} never reaches a URL");
+        }
+        redact::forget("vault-renew-pass-6e7f-0");
     }
 
     #[test]

@@ -229,6 +229,15 @@ mod support;
 mod support_check;
 #[cfg(test)]
 mod support_http_tests;
+// botctl's support triage and the support report it reuses, built here only to test the
+// triage against the bundles botd makes.
+#[cfg(test)]
+#[allow(dead_code)]
+mod support_report;
+#[cfg(test)]
+mod support_triage;
+#[cfg(test)]
+mod support_triage_tests;
 mod stripe;
 mod tiers;
 mod tsa;

@@ -10,6 +10,8 @@
 mod support_report;
 #[path = "../support_readiness.rs"]
 mod support_readiness;
+#[path = "../support_triage.rs"]
+mod support_triage;
 #[path = "../audit_line.rs"]
 #[allow(dead_code)]
 mod audit_line;
@@ -298,6 +300,12 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    on-call rota for the hours the plans sell, and every
                                                    Enterprise customer with a TAM and a different backup.
                                                    Exits 1 on a failure
+  botctl support-triage <bundle.tar | bundle.tar.gz | folder | -> [--plan <plan>] [--latest <version>]
+    [--production] [--as-of <time>] [--markdown | --json]
+                                                   The Provider's first read of a customer's support bundle
+                                                   (ADR 0220), offline: what it shows, the severity that
+                                                   suggests, the runbook for each, and what to ask next.
+                                                   Exits 1 when it suggests Severity 1 or 2
   botctl incidents [json]                          Status page incidents (ADR 0090), open first
   botctl incident open "<title>" "<text>" [--impact <none|minor|major|critical|maintenance>]
     [--component <api|database|machines|runners|notifications>]... [--state <state>]
@@ -2201,6 +2209,15 @@ fn run(args: &[String]) -> Result<String, String> {
             }
             Ok(out)
         }
+        ["support-triage", rest @ ..] => {
+            let (out, high) = support_triage(rest, std::io::stdin())?;
+            if high {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(out.as_bytes()).and_then(|_| stdout.flush());
+                std::process::exit(1);
+            }
+            Ok(out)
+        }
         ["health-score", "history", rest @ ..] => {
             let (path, json) = health_request_at(rest, "/api/support/health-score/history", "Usage: botctl health-score history [--days <n>] [json]")?;
             let res = api(Cred::Operator, "GET", &path, None)?;
@@ -2531,6 +2548,36 @@ fn support_readiness(rest: &[&str], mut stdin: impl Read) -> Result<(String, boo
         support_readiness::Format::Json => pretty(readiness.json().to_string()),
     };
     Ok((out, readiness.ready()))
+}
+
+/// `botctl support-triage`: needs no botd, only the bundle the customer sent. The triage,
+/// and whether it suggests Severity 1 or 2: then it's still printed on stdout, and botctl
+/// exits 1, so a ticket system's hook can raise the ticket.
+fn support_triage(rest: &[&str], stdin: impl Read) -> Result<(String, bool), String> {
+    let (source, options, format) = support_triage::parse_args(rest, chrono::Utc::now())?;
+    let bundle = if source == "-" {
+        let mut bytes = Vec::new();
+        stdin.take(support_triage::MAX_BYTES + 1).read_to_end(&mut bytes).map_err(|e| format!("stdin: {e}"))?;
+        support_triage::read_tar(&bytes)
+    } else {
+        let path = std::path::Path::new(&source);
+        let meta = std::fs::metadata(path).map_err(|e| format!("{source}: {e}"))?;
+        if meta.is_dir() {
+            support_triage::read_dir(path)
+        } else if meta.len() > support_triage::MAX_BYTES {
+            Err(format!("over {} MiB: not a support bundle", support_triage::MAX_BYTES >> 20))
+        } else {
+            std::fs::read(path).map_err(|e| e.to_string()).and_then(|b| support_triage::read_tar(&b))
+        }
+    }
+    .map_err(|e| format!("{source}: {e}"))?;
+    let triage = support_triage::triage(&bundle, &options)?;
+    let out = match format {
+        support_triage::Format::Text => triage.text(),
+        support_triage::Format::Markdown => triage.markdown(),
+        support_triage::Format::Json => pretty(triage.json().to_string()),
+    };
+    Ok((out, triage.failed()))
 }
 
 const INCIDENT_USAGE: &str = "Usage: botctl incident open \"<title>\" \"<text>\" [--impact <impact>] [--component <id>]... [--state <state>] | update <id> <state> \"<text>\" | resolve <id> \"<text>\" | edit <id> [--title <title>] [--impact <impact>] [--component <id>]... | delete <id> --yes | review <id> [--detected <time>] [--lead-hours <n>] [--json] [-o <file>]";
@@ -2970,6 +3017,44 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(support_readiness(&["--rota", "/nonexistent/rota.csv"], std::io::empty()).unwrap_err().contains("/nonexistent/rota.csv"));
         assert!(support_readiness(&[], std::io::empty()).unwrap_err().contains("Usage: botctl support-readiness"));
+    }
+
+    #[test]
+    fn support_triage_reads_a_tar_a_folder_or_stdin_and_flags_high_severity() {
+        let dir = std::env::temp_dir().join(format!("botctl-support-triage-{}", std::process::id()));
+        let inner = dir.join("superbot-support-offline-20261124T050000Z");
+        std::fs::create_dir_all(&inner).unwrap();
+        let version = json!({ "botd": "1.3.0", "bundleFormat": 1, "createdAt": "2026-11-24T05:00:00Z", "offline": true });
+        let testing = json!({ "id": "license", "status": "info", "summary": "Testing mode", "details": { "edition": "testing" } });
+        let down = json!({ "findings": [{ "id": "botd", "status": "warn", "summary": "isn't running", "fix": "Start it." }, testing] });
+        std::fs::write(inner.join("version.json"), version.to_string()).unwrap();
+        std::fs::write(inner.join("check.json"), down.to_string()).unwrap();
+        std::fs::write(inner.join("logs.txt"), "listening\n").unwrap();
+        let d = dir.to_str().unwrap().to_string();
+        let (out, high) = support_triage(&[&d, "--as-of", "2026-11-24T06:00:00Z"], std::io::empty()).unwrap();
+        assert!(!high, "testing mode holds it to Severity 3: {out}");
+        let (out, high) = support_triage(&[&d, "--production", "--as-of", "2026-11-24T06:00:00Z"], std::io::empty()).unwrap();
+        assert!(high && out.starts_with("Support triage of superbot-support-offline-20261124T050000Z (offline bundle, botd 1.3.0"), "{out}");
+        assert!(out.contains("Suggested severity: 1 (Critical), from check.botd") && out.contains("docs/support/runbook-machine-down.md"), "{out}");
+
+        let status = std::process::Command::new("tar").arg("-cf").arg(dir.join("b.tar")).arg("-C").arg(&dir).arg("superbot-support-offline-20261124T050000Z").status();
+        if status.is_ok_and(|s| s.success()) {
+            let tar = dir.join("b.tar").to_str().unwrap().to_string();
+            let (out, high) = support_triage(&[&tar, "--json", "--production", "--plan", "pro", "--as-of", "2026-11-24T06:00:00Z"], std::io::empty()).unwrap();
+            let v: Value = serde_json::from_str(&out).unwrap();
+            assert!(high);
+            assert_eq!((v["suggestedSeverity"].clone(), v["responseTarget"].clone()), (json!(1), json!("First response for Severity 1 on pro: 1 h, 24×7")), "{v}");
+            let bytes = std::fs::read(dir.join("b.tar")).unwrap();
+            let (out, _) = support_triage(&["-", "--markdown", "--as-of", "2026-11-24T06:00:00Z"], bytes.as_slice()).unwrap();
+            assert!(out.starts_with("## Support triage: superbot-support-offline-20261124T050000Z"), "{out}");
+        }
+        let fine = json!({ "findings": [{ "id": "botd", "status": "ok", "summary": "running" }] });
+        std::fs::write(inner.join("check.json"), fine.to_string()).unwrap();
+        let (_, high) = support_triage(&[&d, "--as-of", "2026-11-24T06:00:00Z"], std::io::empty()).unwrap();
+        assert!(!high);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(support_triage(&["/nonexistent/b.tar"], std::io::empty()).unwrap_err().contains("/nonexistent/b.tar"));
+        assert!(support_triage(&[], std::io::empty()).unwrap_err().contains("Usage: botctl support-triage"));
     }
 
     #[test]

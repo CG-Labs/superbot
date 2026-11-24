@@ -1268,15 +1268,27 @@ impl App {
                 attempt_span.set("gen_ai.request.model", m);
             }
             let _traced = trace::run_attempt(&run_id, &attempt_span);
-            // A run stops when its first STS session expires, if that comes first (ADR 0194).
-            let (timeout, credentials_end) = match leases.expires_first().map(|at| at.saturating_duration_since(Instant::now())) {
-                Some(left) if left < self.cfg.run_timeout => (left, true),
-                _ => (self.cfg.run_timeout, false),
-            };
+            // A run stops when its first short-lived credential ends for good, if that comes
+            // first: an STS session's expiry (ADR 0194), or a Vault lease once it can't be
+            // renewed any more (ADR 0221), which may only be learnt while the run lasts.
+            let credentials_end = Arc::new(AtomicBool::new(false));
             let timer = tokio::spawn({
                 let abort_tx = abort_tx.clone();
+                let credentials_end = Arc::clone(&credentials_end);
+                let mut ends = leases.ends();
+                let timeout_at = tokio::time::Instant::now() + self.cfg.run_timeout;
                 async move {
-                    tokio::time::sleep(timeout).await;
+                    let mut watching = true;
+                    loop {
+                        let end = ends.borrow_and_update().map(tokio::time::Instant::from_std).filter(|e| *e < timeout_at);
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(end.unwrap_or(timeout_at)) => {
+                                credentials_end.store(end.is_some(), Ordering::SeqCst);
+                                break;
+                            }
+                            changed = ends.changed(), if watching => watching = changed.is_ok(),
+                        }
+                    }
                     abort_tx.send_if_modified(|r| r.get_or_insert("timeout") == &"timeout");
                 }
             });
@@ -1532,7 +1544,7 @@ impl App {
                     "I stopped: approvals were turned on while I was working without them. Send the task again and I'll ask before risky steps.",
                     true,
                 ),
-                Some("timeout") if credentials_end => self.say(&id, "The short-lived cloud credentials for this task expired, so I stopped. Send it again and I'll get new ones.", true),
+                Some("timeout") if credentials_end.load(Ordering::SeqCst) => self.say(&id, "The short-lived credentials for this task expired, so I stopped. Send it again and I'll get new ones.", true),
                 Some("timeout") => {
                     let mins = self.cfg.run_timeout.as_secs() / 60;
                     self.say(&id, &format!("I hit the {mins} minute limit for one task and stopped."), true)
