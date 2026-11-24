@@ -1059,17 +1059,17 @@ pub(crate) mod tests {
         let renewed = || audited("database/creds/renew").into_iter().filter(|e| e.action == "secret.lease_renewed").collect::<Vec<_>>();
 
         let (_, l) = rc.issue("urv1", "brv1", true, RUN).unwrap();
+        let first = l.expires_first().unwrap();
         wait_for(|| f.lease_renewals.lock().unwrap().len() >= 2);
         assert!(f.lease_renewals.lock().unwrap().iter().all(|(id, n)| id == "database/creds/renew/l0" && *n == 2), "{:?}", f.lease_renewals.lock().unwrap());
-        assert!(l.expires_first().is_none(), "kept alive: the run goes on");
+        wait_for(|| l.expires_first().is_some_and(|at| at > first + Duration::from_secs(2)));
         let ev = renewed();
         assert!(ev.iter().all(|e| e.outcome == Outcome::Success && e.details["store"] == "vault" && e.details["ttl"] == 2), "{ev:?}");
         assert!(f.namespaces.lock().unwrap().iter().all(|n| n == "admin/team-a"), "renewed where it was made");
 
         // The role's max TTL: Vault gives less than asked, and the run must stop then.
         f.lease_max.store(1, Ordering::SeqCst);
-        wait_for(|| l.expires_first().is_some());
-        assert!(renewed().iter().any(|e| e.details["final"] == true && e.details["ttl"] == 1), "{:?}", renewed());
+        wait_for(|| renewed().iter().any(|e| e.details["final"] == true && e.details["ttl"] == 1));
         let n = f.lease_renewals.lock().unwrap().len();
         drop(l);
         wait_for(|| f.revoked.lock().unwrap().len() == 1);
