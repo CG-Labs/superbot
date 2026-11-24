@@ -8,23 +8,26 @@
 //! unreviewed or accepted without management, a quarter without a management review, a
 //! vendor unassessed or unreviewed, an exception over a year or unreviewed, a server's
 //! baseline exception the register never approved, a conduct concern triaged or closed
-//! late) and writes a dated bundle in the shape
-//! of the others, which the coverage report checks (ADR 0169).
+//! late, a security event triaged late or by someone who can't lead it, a breach notice,
+//! post-incident review or action overdue, a year without a tabletop exercise) and
+//! writes a dated bundle in the shape of the others, which the coverage report checks
+//! (ADR 0169).
 //!
 //! Never in it: names, titles, notes or reasons from the register, nor the register
-//! itself. People, risks, vendors and exceptions are named by their register ids; the
-//! register's SHA-256 identifies the copy kept beside the bundle.
+//! itself. People, risks, vendors, exceptions and incidents are named by their register
+//! ids; the register's SHA-256 identifies the copy kept beside the bundle.
 
 use crate::changes::{Bundle, Section, json_file, rfc3339, sha256};
 use crate::period::Period;
-use chrono::{Datelike, NaiveDate, TimeDelta};
+use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, Utc, Weekday};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-/// Bumped when a file's shape changes: 2 added `conduct.json` (ADR 0214).
-pub const FORMAT: u32 = 2;
+/// Bumped when a file's shape changes: 2 added `conduct.json` (ADR 0214), 3
+/// `incidents.json` (ADR 0223).
+pub const FORMAT: u32 = 3;
 pub const PREFIX: &str = "superbot-register-";
 /// The register's own format, in its `superbotRegister` field.
 pub const REGISTER_FORMAT: u64 = 1;
@@ -52,6 +55,26 @@ pub const CONCERN_OUTCOMES: [&str; 4] = ["substantiated", "not-substantiated", "
 /// The training everyone takes at onboarding and yearly (information security policy).
 pub const AWARENESS: &str = "security-awareness";
 
+/// The incident response plan (CC7.3-1 to CC7.5-1, ADR 0223).
+pub const INCIDENT_RESPONSE: &str = "incident-response";
+/// The plan's severity levels, and `none` for a security event that turned out not to be
+/// an incident (closed with the reason in the incident record).
+pub const SEVERITIES: [&str; 5] = ["SEV-1", "SEV-2", "SEV-3", "SEV-4", "none"];
+/// The roles whose holders or deputies may lead an incident: the security owner, or the
+/// on-call operator until they take over (incident response plan, "Roles").
+pub const COMMANDERS: [&str; 2] = ["Security owner", "Operator"];
+/// The roles a tabletop exercise has present: those of the incident commander,
+/// operations, engineering and communications (incident response plan, "Roles").
+pub const TABLETOP_ROLES: [&str; 4] = ["Security owner", "Operator", "Engineering lead", "Privacy lead"];
+/// A written post-incident review is due within this many business days of closing.
+pub const REVIEW_BUSINESS_DAYS: u32 = 10;
+/// Customers hear of a personal data breach within this many hours of the provider
+/// becoming aware, unless the register sets the DPA's own `[N]` (`breachNoticeHours`).
+pub const BREACH_NOTICE_HOURS: u32 = 48;
+/// The longest breach notice a register may set: a week, past GDPR's 72 hours for the
+/// controller the customer is.
+pub const MAX_BREACH_NOTICE_HOURS: u32 = 168;
+
 /// Yearly: policy reviews, acknowledgements, training, risk and vendor reviews.
 pub const YEAR_DAYS: i64 = 365;
 /// Quarterly: management reviews and exception reviews.
@@ -72,7 +95,7 @@ pub const MAX_PERIOD_DAYS: i64 = 31;
 /// a file to a row only while the register holds a current record for it (a role filled
 /// in the period, an approval within a year, a management review within a quarter), so a
 /// register that stopped being kept shows as a gap in the coverage report.
-pub const SECTIONS: [Section; 8] = [
+pub const SECTIONS: [Section; 9] = [
     Section { file: "roles.json", criteria: &["CC1.3"], rows: &["CC1.3-1"] },
     Section { file: "policies.json", criteria: &["CC3.1", "CC5.3"], rows: &["CC3.1-1", "CC5.3-1"] },
     Section { file: "people.json", criteria: &["CC1.4", "CC2.2"], rows: &["CC1.4-1", "CC2.2-1"] },
@@ -81,11 +104,12 @@ pub const SECTIONS: [Section; 8] = [
     Section { file: "vendors.json", criteria: &["CC6.4", "CC9.2"], rows: &["CC6.4-1", "CC9.2-1"] },
     Section { file: "policy-exceptions.json", criteria: &["CC5.1"], rows: &["CC5.1-1"] },
     Section { file: "conduct.json", criteria: &["CC1.1"], rows: &["CC1.1-1"] },
+    Section { file: "incidents.json", criteria: &["CC7.3", "CC7.4", "CC7.5"], rows: &["CC7.3-1", "CC7.4-1", "CC7.4-2", "CC7.5-1"] },
 ];
 
 /// Files bundles of an older format don't have, and the format that added each, so the
 /// coverage report still verifies bundles made before them.
-pub const SINCE_FORMAT: [(&str, u64); 1] = [("conduct.json", 2)];
+pub const SINCE_FORMAT: [(&str, u64); 2] = [("conduct.json", 2), ("incidents.json", 3)];
 
 const README: &str = "SuperBot policy register bundle
 ===============================
@@ -111,6 +135,9 @@ after the period are left out.
                            reviews, and each server's baseline exceptions held to them
   conduct.json             the code of conduct's approval and acknowledgements, and
                            conduct concerns, triaged and closed in time, by outcome
+  incidents.json           security events and incidents, triaged in time by someone who
+                           may lead them, breach notices, post-incident reviews and
+                           their actions, and the yearly tabletop exercise
   manifest.json            what is in this bundle, the period, the register's SHA-256,
                            and each file's SHA-256
   SHA256SUMS               the same digests, for `sha256sum -c SHA256SUMS`
@@ -136,6 +163,16 @@ fn opt_day<'de, D: Deserializer<'de>>(d: D) -> Result<Option<NaiveDate>, D::Erro
 
 fn days<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<NaiveDate>, D::Error> {
     Vec::<String>::deserialize(d)?.iter().map(|s| parse_day(s)).collect::<Result<_, _>>().map_err(serde::de::Error::custom)
+}
+
+/// A time with its offset (`2027-03-08T10:00:00Z`), for the breach clock, which runs in
+/// hours where every other record is a day.
+fn parse_time(s: &str) -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(s).map(|t| t.with_timezone(&Utc)).map_err(|_| format!("{s:.40} isn't a time: use YYYY-MM-DDTHH:MM:SSZ"))
+}
+
+fn opt_time<'de, D: Deserializer<'de>>(d: D) -> Result<Option<DateTime<Utc>>, D::Error> {
+    Option::<String>::deserialize(d)?.map(|s| parse_time(&s)).transpose().map_err(serde::de::Error::custom)
 }
 
 #[derive(Deserialize, Debug)]
@@ -171,6 +208,13 @@ pub struct Register {
     pub exceptions: Vec<PolicyException>,
     #[serde(default)]
     pub conduct_concerns: Vec<ConductConcern>,
+    /// The DPA's breach notice, in hours; `BREACH_NOTICE_HOURS` when not set.
+    #[serde(default)]
+    pub breach_notice_hours: Option<u32>,
+    #[serde(default)]
+    pub incidents: Vec<Incident>,
+    #[serde(default)]
+    pub tabletops: Vec<Tabletop>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -348,6 +392,76 @@ pub struct ConductConcern {
     pub closed: Option<NaiveDate>,
     #[serde(default)]
     pub outcome: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code, reason = "accepted in the register, never put in evidence")]
+    pub notes: Option<String>,
+}
+
+/// A security event's ticket, by id only: what was seen, the timeline, the evidence and
+/// the notices themselves stay in the provider's incident record.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Incident {
+    pub id: String,
+    /// The day of the first alert or report.
+    #[serde(deserialize_with = "day")]
+    pub detected: NaiveDate,
+    /// The day an incident commander was named and the severity set: these three go together.
+    #[serde(default, deserialize_with = "opt_day")]
+    pub triaged: Option<NaiveDate>,
+    #[serde(default)]
+    pub commander: Option<String>,
+    #[serde(default)]
+    pub severity: Option<String>,
+    /// It may be a personal data breach, so the breach clock runs from `aware_at`.
+    #[serde(default)]
+    pub breach: bool,
+    #[serde(default, deserialize_with = "opt_time")]
+    pub aware_at: Option<DateTime<Utc>>,
+    #[serde(default, deserialize_with = "opt_time")]
+    pub customers_notified_at: Option<DateTime<Utc>>,
+    /// An outage that spent more than a quarter of the SLO's error budget, which needs a
+    /// written review whatever its severity.
+    #[serde(default)]
+    pub error_budget: bool,
+    #[serde(default, deserialize_with = "opt_day")]
+    pub closed: Option<NaiveDate>,
+    /// The written post-incident review: when, and its SHA-256 (the review goes in the store).
+    #[serde(default, deserialize_with = "opt_day")]
+    pub reviewed: Option<NaiveDate>,
+    #[serde(default)]
+    pub review_sha256: Option<String>,
+    #[serde(default)]
+    pub actions: Vec<Action>,
+    #[serde(default)]
+    #[allow(dead_code, reason = "accepted in the register, never put in evidence")]
+    pub notes: Option<String>,
+}
+
+/// An action from a post-incident review or a tabletop, owned by a role, tracked to closure.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Action {
+    pub id: String,
+    pub owner: String,
+    #[serde(deserialize_with = "day")]
+    pub due: NaiveDate,
+    #[serde(default, deserialize_with = "opt_day")]
+    pub done: Option<NaiveDate>,
+}
+
+/// A tabletop exercise of the incident response plan, recorded like a review.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Tabletop {
+    #[serde(deserialize_with = "day")]
+    pub at: NaiveDate,
+    pub attendees: Vec<String>,
+    /// The exercise's written record's SHA-256, kept beside the register.
+    #[serde(default)]
+    pub record_sha256: Option<String>,
+    #[serde(default)]
+    pub actions: Vec<Action>,
     #[serde(default)]
     #[allow(dead_code, reason = "accepted in the register, never put in evidence")]
     pub notes: Option<String>,
@@ -585,6 +699,75 @@ pub fn parse(bytes: &[u8], policies: &[Policy]) -> Result<Register, String> {
             bad.push(format!("{what}: triaged can't be before received, nor closed before triaged"));
         }
     }
+    unique("incident", r.incidents.iter().map(|x| x.id.as_str()).collect(), &mut bad);
+    unique("action", r.incidents.iter().flat_map(|x| &x.actions).chain(r.tabletops.iter().flat_map(|t| &t.actions)).map(|a| a.id.as_str()).collect(), &mut bad);
+    if r.breach_notice_hours.is_some_and(|h| !(1..=MAX_BREACH_NOTICE_HOURS).contains(&h)) {
+        bad.push(format!("breachNoticeHours is the DPA's breach notice, 1 to {MAX_BREACH_NOTICE_HOURS} hours"));
+    }
+    let actions = |what: &str, list: &[Action], start: NaiveDate, bad: &mut Vec<String>| {
+        for a in list {
+            role(&format!("{what}'s action {}", a.id), &a.owner, bad);
+            if a.due < start || a.done.is_some_and(|d| d < start) {
+                bad.push(format!("{what}'s action {}: due and done can't be before {start}", a.id));
+            }
+        }
+    };
+    for x in &r.incidents {
+        let what = format!("incident {}", x.id);
+        if x.triaged.is_some() != x.commander.is_some() || x.triaged.is_some() != x.severity.is_some() {
+            bad.push(format!("{what}: triaged, commander and severity go together"));
+        }
+        if let Some(by) = &x.commander {
+            known(&what, by, &mut bad);
+        }
+        if x.severity.as_deref().is_some_and(|s| !SEVERITIES.contains(&s)) {
+            bad.push(format!("{what}: severity is {}", SEVERITIES.join(", ")));
+        }
+        if x.breach != x.aware_at.is_some() {
+            bad.push(format!("{what}: breach and awareAt go together: a possible personal data breach starts the clock when the provider became aware"));
+        }
+        if x.customers_notified_at.is_some() && !x.breach {
+            bad.push(format!("{what}: customersNotifiedAt is for personal data breaches"));
+        }
+        if x.breach && x.severity.as_deref() == Some("none") {
+            bad.push(format!("{what}: a personal data breach is an incident, so its severity isn't none"));
+        }
+        if x.reviewed.is_some() != x.review_sha256.is_some() {
+            bad.push(format!("{what}: reviewed and reviewSha256 go together"));
+        }
+        if x.review_sha256.as_deref().is_some_and(|s| !hex(s, 64..=64)) {
+            bad.push(format!("{what}: reviewSha256 is the written review's SHA-256, 64 lowercase hex digits"));
+        }
+        if x.closed.is_some() && x.triaged.is_none() {
+            bad.push(format!("{what}: an event is triaged before it is closed, even one that wasn't an incident"));
+        }
+        if x.reviewed.is_some() && x.closed.is_none() {
+            bad.push(format!("{what}: an incident is reviewed after it is closed"));
+        }
+        let aware = x.aware_at.map(|t| t.date_naive());
+        if x.triaged.is_some_and(|t| t < x.detected)
+            || aware.is_some_and(|a| a < x.detected)
+            || x.customers_notified_at.zip(x.aware_at).is_some_and(|(n, a)| n < a)
+            || x.closed.is_some_and(|c| x.triaged.is_some_and(|t| c < t))
+            || x.reviewed.is_some_and(|v| x.closed.is_some_and(|c| v < c))
+        {
+            bad.push(format!("{what}: dates out of order: detected, then triaged and awareAt, customersNotifiedAt after awareAt, closed after triaged, reviewed after closed"));
+        }
+        actions(&what, &x.actions, x.detected, &mut bad);
+    }
+    for t in &r.tabletops {
+        let what = format!("the tabletop on {}", t.at);
+        if t.attendees.is_empty() {
+            bad.push(format!("{what} has no attendees"));
+        }
+        for a in &t.attendees {
+            known(&what, a, &mut bad);
+        }
+        if t.record_sha256.as_deref().is_some_and(|s| !hex(s, 64..=64)) {
+            bad.push(format!("{what}: recordSha256 is the exercise record's SHA-256, 64 lowercase hex digits"));
+        }
+        actions(&what, &t.actions, t.at, &mut bad);
+    }
     if bad.is_empty() {
         return Ok(r);
     }
@@ -632,6 +815,33 @@ pub fn baseline(file: &str, bytes: &[u8], p: &Period) -> Result<Baseline, String
 
 fn plus(d: NaiveDate, n: i64) -> NaiveDate {
     d.checked_add_signed(TimeDelta::days(n)).unwrap_or(d)
+}
+
+/// `n` business days after `d`: Monday to Friday, with no holidays, which differ by country
+/// and are the provider's to plead.
+fn business_days(d: NaiveDate, n: u32) -> NaiveDate {
+    let mut x = d;
+    let mut left = n;
+    while left > 0 {
+        let Some(next) = x.succ_opt() else { break };
+        x = next;
+        if !matches!(x.weekday(), Weekday::Sat | Weekday::Sun) {
+            left -= 1;
+        }
+    }
+    x
+}
+
+/// When an event must have a named commander, by its severity: SEV-1 and SEV-2 (15
+/// minutes and 1 hour) are judged by day, on the day detected or the next; SEV-3 within a
+/// business day; SEV-4, an event that wasn't an incident, and one not yet triaged (whose
+/// severity nobody has set) within 5.
+fn triage_due(severity: Option<&str>, detected: NaiveDate) -> NaiveDate {
+    match severity {
+        Some("SEV-1" | "SEV-2") => plus(detected, 1),
+        Some("SEV-3") => business_days(detected, 1),
+        _ => business_days(detected, 5),
+    }
 }
 
 fn age(cut: NaiveDate, d: NaiveDate) -> i64 {
@@ -712,6 +922,8 @@ impl Check<'_> {
             + r.vendors.iter().filter(|x| x.since >= c).count()
             + r.exceptions.iter().filter(|x| x.approved_at >= c).count()
             + r.conduct_concerns.iter().filter(|x| x.received >= c).count()
+            + r.incidents.iter().filter(|x| x.detected >= c).count()
+            + r.tabletops.iter().filter(|x| x.at >= c).count()
     }
 
     pub fn roles(&self) -> (Value, Vec<&'static str>) {
@@ -1158,6 +1370,150 @@ impl Check<'_> {
         });
         (v, rows)
     }
+
+    /// Each action's state at the period's end: done late in the period, or open past its
+    /// due date, is an exception.
+    fn actions(&self, source: &str, list: &[Action], late: &mut Vec<Value>, overdue: &mut Vec<Value>) -> Vec<Value> {
+        let (p, cut) = (self.p, self.cut());
+        list.iter()
+            .map(|a| {
+                let done = a.done.filter(|d| *d < cut);
+                match done {
+                    Some(d) if d >= p.from && d > a.due => late.push(json!(format!("{} of {source} (due {}, done {d})", a.id, a.due))),
+                    None if a.due < cut => overdue.push(json!(format!("{} of {source} ({}, due {})", a.id, a.owner, a.due))),
+                    _ => {}
+                }
+                json!({ "id": a.id, "owner": a.owner, "due": ds(a.due), "done": done.map(ds), "openAtEnd": done.is_none() })
+            })
+            .collect()
+    }
+
+    /// Security events still being handled in the period (not closed, reviewed, notified
+    /// and with every action done before it began), and the tabletop exercises in the year
+    /// to its end or with actions still open (ADR 0223). Something done late in the period
+    /// is an exception in this period's bundle; something not done past its deadline is one
+    /// in every bundle until it is done.
+    pub fn incidents(&self) -> (Value, Vec<&'static str>) {
+        let (p, cut) = (self.p, self.cut());
+        let (from_ms, cut_ms) = (p.start_ms(), p.end_ms());
+        let in_period = |d: NaiveDate| d >= p.from && d < cut;
+        let recent = |d: NaiveDate| d < cut && age(cut, d) <= YEAR_DAYS;
+        let before = |d: Option<NaiveDate>| d.is_some_and(|d| d < p.from);
+        let hours = self.r.breach_notice_hours.unwrap_or(BREACH_NOTICE_HOURS);
+        let (mut not_triaged, mut triaged_late, mut wrong) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut not_notified, mut notice_late, mut review_overdue, mut review_late) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut action_overdue, mut action_late) = (Vec::new(), Vec::new());
+        let mut by_severity: BTreeMap<&str, usize> = SEVERITIES.iter().copied().chain(["untriaged"]).map(|s| (s, 0)).collect();
+        let mut out = Vec::new();
+        for x in self.r.incidents.iter().filter(|x| x.detected < cut) {
+            let triaged = x.triaged.filter(|d| *d < cut);
+            let severity = triaged.and(x.severity.as_deref());
+            let commander = triaged.and(x.commander.as_deref());
+            let closed = x.closed.filter(|d| *d < cut);
+            let reviewed = x.reviewed.filter(|d| *d < cut);
+            let aware = x.aware_at.filter(|t| t.timestamp_millis() < cut_ms);
+            let notified = x.customers_notified_at.filter(|t| t.timestamp_millis() < cut_ms);
+            let notice_due = aware.map(|a| a + TimeDelta::hours(i64::from(hours)));
+            let review_required = matches!(severity, Some("SEV-1" | "SEV-2")) || aware.is_some() || x.error_budget;
+            let review_due = closed.map(|c| business_days(c, REVIEW_BUSINESS_DAYS));
+            if in_period(x.detected) {
+                *by_severity.entry(severity.unwrap_or("untriaged")).or_default() += 1;
+            }
+            let finished = before(closed) && (!review_required || before(reviewed)) && (aware.is_none() || notified.is_some_and(|n| n.timestamp_millis() < from_ms)) && x.actions.iter().all(|a| before(a.done));
+            if finished {
+                continue;
+            }
+
+            let due = triage_due(severity, x.detected);
+            match triaged {
+                Some(t) if in_period(t) && t > due => triaged_late.push(json!(format!("{} {} (detected {}, triaged {t}, due {due})", x.id, severity.unwrap_or_default(), x.detected))),
+                None if due < cut => not_triaged.push(json!(format!("{} (detected {}, not triaged, due {due} at the latest)", x.id, x.detected))),
+                _ => {}
+            }
+            let held = triaged.zip(commander).and_then(|(t, by)| self.held(by, &COMMANDERS, t));
+            if let (Some(t), Some(by), None) = (triaged.filter(|t| in_period(*t)), commander, &held) {
+                wrong.push(json!(format!("{} on {t}: {by} held neither {}", x.id, COMMANDERS.join(" nor "))));
+            }
+            match (aware, notified, notice_due) {
+                (Some(a), Some(n), Some(due)) if n.timestamp_millis() >= from_ms && n > due => notice_late.push(json!(format!("{} (aware {}, notified {}, due {})", x.id, rfc3339(a.timestamp_millis()), rfc3339(n.timestamp_millis()), rfc3339(due.timestamp_millis())))),
+                (Some(a), None, Some(due)) if due.timestamp_millis() < cut_ms => not_notified.push(json!(format!("{} (aware {}, not notified, due {})", x.id, rfc3339(a.timestamp_millis()), rfc3339(due.timestamp_millis())))),
+                _ => {}
+            }
+            if review_required {
+                match (reviewed, review_due) {
+                    (Some(v), Some(due)) if in_period(v) && v > due => review_late.push(json!(format!("{} (closed {}, reviewed {v}, due {due})", x.id, closed.map(ds).unwrap_or_default()))),
+                    (None, Some(due)) if due < cut => review_overdue.push(json!(format!("{} (closed {}, not reviewed, due {due})", x.id, closed.map(ds).unwrap_or_default()))),
+                    _ => {}
+                }
+            }
+            let actions = self.actions(&format!("incident {}", x.id), &x.actions, &mut action_late, &mut action_overdue);
+            out.push(json!({
+                "id": x.id, "detected": ds(x.detected), "triageDue": ds(due), "triaged": triaged.map(ds), "severity": severity, "commander": commander, "heldRole": held,
+                "breach": x.breach, "awareAt": aware.map(|t| rfc3339(t.timestamp_millis())), "noticeDue": notice_due.map(|t| rfc3339(t.timestamp_millis())), "customersNotifiedAt": notified.map(|t| rfc3339(t.timestamp_millis())),
+                "errorBudget": x.error_budget, "closed": closed.map(ds), "reviewRequired": review_required, "reviewDue": review_due.filter(|_| review_required).map(ds),
+                "reviewed": reviewed.map(ds), "reviewSha256": reviewed.and(x.review_sha256.as_deref()), "actions": actions, "openAtEnd": closed.is_none(),
+            }));
+        }
+
+        let (mut no_tabletop, mut roles_missing, mut no_record) = (Vec::new(), Vec::new(), Vec::new());
+        let mut held_tabletops: Vec<&Tabletop> = self.r.tabletops.iter().filter(|t| t.at < cut && (recent(t.at) || !t.actions.iter().all(|a| before(a.done)))).collect();
+        held_tabletops.sort_by_key(|t| t.at);
+        let tabletops: Vec<Value> = held_tabletops
+            .iter()
+            .map(|t| {
+                let present: Vec<&str> = TABLETOP_ROLES.iter().copied().filter(|role| t.attendees.iter().any(|a| self.held(a, &[*role], t.at).is_some())).collect();
+                let missing: Vec<&str> = TABLETOP_ROLES.iter().copied().filter(|role| !present.contains(role)).collect();
+                if in_period(t.at) {
+                    if !missing.is_empty() {
+                        roles_missing.push(json!(format!("{}: {}", t.at, missing.join(", "))));
+                    }
+                    if t.record_sha256.is_none() {
+                        no_record.push(json!(ds(t.at)));
+                    }
+                }
+                let actions = self.actions(&format!("the tabletop on {}", t.at), &t.actions, &mut action_late, &mut action_overdue);
+                json!({ "at": ds(t.at), "attendees": t.attendees.len(), "rolesPresent": present, "rolesMissing": missing, "recordSha256": t.record_sha256, "actions": actions })
+            })
+            .collect();
+        let last_tabletop = self.r.tabletops.iter().map(|t| t.at).filter(|d| *d < cut).max();
+        let tabletop_due = self.first_approval(INCIDENT_RESPONSE).map(|f| plus(f, YEAR_DAYS));
+        if tabletop_due.is_some_and(|d| d < cut) && last_tabletop.is_none_or(|d| !recent(d)) {
+            no_tabletop.push(json!(format!("none in the year to {cut}{}", last_tabletop.map(|d| format!(" (last {d})")).unwrap_or_default())));
+        }
+
+        let in_set = self.policies.iter().any(|q| q.id == INCIDENT_RESPONSE);
+        let approved = self.r.policy_approvals.iter().filter(|a| a.policy == INCIDENT_RESPONSE && a.approved_at < cut).map(|a| a.approved_at).max();
+        let current = in_set && approved.is_some_and(recent);
+        let exercised = self.r.tabletops.iter().any(|t| recent(t.at) && t.record_sha256.is_some());
+        let rows = match (current, exercised) {
+            (true, true) => vec!["CC7.3-1", "CC7.4-1", "CC7.4-2", "CC7.5-1"],
+            (true, false) => vec!["CC7.3-1", "CC7.4-2", "CC7.5-1"],
+            _ => vec![],
+        };
+        let v = json!({
+            "basis": format!("every security event detected before the period's end and still being handled in it, by register id: a commander named and the severity set (triaged) by someone holding or deputising {} that day, on the day detected or the next for SEV-1 and SEV-2 (their 15-minute and 1-hour targets are judged in the incident record), within a business day for SEV-3, and within 5 for SEV-4, events that weren't incidents and events not yet triaged; customers told of a possible personal data breach within {hours} hours of the provider becoming aware ({}); a written review within {REVIEW_BUSINESS_DAYS} business days of closing every SEV-1, SEV-2, possible breach and outage that spent over a quarter of the error budget; each review's and tabletop's actions done by their due date; a tabletop exercise within a year (from a year after the plan's first approval) with someone holding or deputising {} that day, and its record's SHA-256. Business days are Monday to Friday, with no holidays. Something done late is an exception in the bundle of the period it was done in; something overdue, in every bundle until it is done", COMMANDERS.join(" or "), if self.r.breach_notice_hours.is_some() { "the register's breachNoticeHours" } else { "the DPA template's suggestion, as the register sets none" }, TABLETOP_ROLES.join(", ")),
+            "incidentResponsePlan": { "inPolicySet": in_set, "lastApproved": approved.map(ds), "approvalCurrent": current, "lastTabletop": last_tabletop.map(ds), "tabletopDue": tabletop_due.map(|d| ds(last_tabletop.map_or(d, |l| plus(l, YEAR_DAYS).max(d)))) },
+            "breachNoticeHours": hours,
+            "summary": {
+                "events": out.len(),
+                "detectedInPeriodBySeverity": by_severity,
+                "openAtEnd": out.iter().filter(|x| x["openAtEnd"] == true).count(),
+                "breaches": out.iter().filter(|x| x["breach"] == true).count(),
+                "reviewsRequired": out.iter().filter(|x| x["reviewRequired"] == true).count(),
+                "tabletopsInTheYear": self.r.tabletops.iter().filter(|t| recent(t.at)).count(),
+            },
+            "exceptions": {
+                "notTriaged": not_triaged, "triagedLate": triaged_late, "commanderNotInRole": wrong,
+                "breachNotNotified": not_notified, "breachNoticeLate": notice_late,
+                "reviewOverdue": review_overdue, "reviewLate": review_late,
+                "actionOverdue": action_overdue, "actionDoneLate": action_late,
+                "noTabletop": no_tabletop, "tabletopRolesMissing": roles_missing, "tabletopNoRecord": no_record,
+            },
+            "incidents": out,
+            "tabletops": tabletops,
+        });
+        (v, rows)
+    }
 }
 
 /// The calendar quarters that overlap the period and have ended by its end.
@@ -1196,7 +1552,7 @@ pub fn name(p: &Period, now_ms: i64) -> String {
 /// Each file's JSON and the rows its manifest maps it to.
 pub fn files(c: &Check) -> Vec<(&'static str, Value, Vec<&'static str>)> {
     let period = json!({ "from": c.p.from.to_string(), "to": c.p.to.to_string(), "days": c.p.days() });
-    let parts = [c.roles(), c.policies(), c.people(), c.risks(), c.management_reviews(), c.vendors(), c.exceptions(), c.conduct()];
+    let parts = [c.roles(), c.policies(), c.people(), c.risks(), c.management_reviews(), c.vendors(), c.exceptions(), c.conduct(), c.incidents()];
     SECTIONS
         .iter()
         .zip(parts)
@@ -1411,6 +1767,20 @@ mod tests {
             ],
             "conductConcerns": [
                 { "id": "CC-01", "received": "2027-03-02", "triaged": "2027-03-04", "handledBy": "p-mgmt", "closed": "2027-03-20", "outcome": "not-substantiated", "notes": "raised by Erin about Frank" },
+            ],
+            "breachNoticeHours": 48,
+            "incidents": [
+                { "id": "INC-01", "detected": "2027-03-03", "triaged": "2027-03-03", "commander": "p-sec", "severity": "none", "closed": "2027-03-04", "notes": "a false alarm Grace raised" },
+                {
+                    "id": "INC-02", "detected": "2027-03-08", "triaged": "2027-03-08", "commander": "p-ops", "severity": "SEV-2",
+                    "breach": true, "awareAt": "2027-03-08T10:00:00Z", "customersNotifiedAt": "2027-03-09T15:00:00Z",
+                    "closed": "2027-03-12", "reviewed": "2027-03-19", "reviewSha256": ZERO,
+                    "actions": [{ "id": "A-01", "owner": "Engineering lead", "due": "2027-03-31", "done": "2027-03-30" }, { "id": "A-02", "owner": "Operator", "due": "2027-05-01" }],
+                    "notes": "Acme Corp's export leaked",
+                },
+            ],
+            "tabletops": [
+                { "at": "2027-02-15", "attendees": ["p-sec", "p-ops", "p-eng"], "recordSha256": ZERO, "actions": [{ "id": "T-01", "owner": "Security owner", "due": "2027-04-15" }], "notes": "leaked master key scenario" },
             ],
         })
     }
@@ -1687,6 +2057,147 @@ mod tests {
         let (x, rows) = c.conduct();
         assert_eq!((x["codeOfConduct"]["inPolicySet"].as_bool(), rows.len()), (Some(false), 0), "a policy folder from before the code of conduct");
         assert_eq!(exceptions(&c.people().0), 0, "nobody is chased for a policy not in the set");
+    }
+
+    #[test]
+    fn business_days_skip_weekends() {
+        assert_eq!(business_days(d("2027-03-05"), 1), d("2027-03-08"), "Friday to Monday");
+        assert_eq!(business_days(d("2027-03-06"), 1), d("2027-03-08"), "Saturday to Monday");
+        assert_eq!(business_days(d("2027-03-12"), REVIEW_BUSINESS_DAYS), d("2027-03-26"));
+        assert_eq!(business_days(d("2027-03-08"), 0), d("2027-03-08"));
+        assert_eq!((triage_due(Some("SEV-1"), d("2027-03-05")), triage_due(Some("SEV-2"), d("2027-03-06"))), (d("2027-03-06"), d("2027-03-07")), "by calendar day, weekends included");
+        assert_eq!((triage_due(Some("SEV-3"), d("2027-03-05")), triage_due(Some("SEV-4"), d("2027-03-05")), triage_due(None, d("2027-03-05"))), (d("2027-03-08"), d("2027-03-12"), d("2027-03-12")));
+    }
+
+    #[test]
+    fn incidents_triaged_notified_reviewed_and_acted_on_in_time() {
+        let mut v = good();
+        v["people"].as_array_mut().unwrap().push(json!({ "id": "p-x", "joined": "2026-06-01" }));
+        v["tabletops"].as_array_mut().unwrap().push(json!({ "at": "2027-03-25", "attendees": ["p-sec"] }));
+        let incidents = v["incidents"].as_array_mut().unwrap();
+        incidents.push(json!({ "id": "INC-03", "detected": "2027-03-15", "triaged": "2027-03-17", "commander": "p-x", "severity": "SEV-3", "closed": "2027-03-18" }));
+        incidents.push(json!({ "id": "INC-04", "detected": "2027-03-19" }));
+        incidents.push(json!({ "id": "INC-05", "detected": "2027-03-29" }));
+        incidents.push(json!({ "id": "INC-06", "detected": "2027-03-20", "triaged": "2027-03-21", "commander": "p-sec", "severity": "SEV-1", "breach": true, "awareAt": "2027-03-20T08:00:00Z" }));
+        incidents.push(json!({ "id": "INC-07", "detected": "2027-03-01", "triaged": "2027-03-01", "commander": "p-sec", "severity": "SEV-2", "breach": true, "awareAt": "2027-03-01T09:00:00+01:00", "customersNotifiedAt": "2027-03-03T09:00:00Z", "closed": "2027-03-05" }));
+        incidents.push(json!({
+            "id": "INC-08", "detected": "2027-01-25", "triaged": "2027-01-25", "commander": "p-x", "severity": "SEV-1", "closed": "2027-02-01", "reviewed": "2027-03-02", "reviewSha256": ZERO,
+            "actions": [{ "id": "A-08", "owner": "Operator", "due": "2027-02-20", "done": "2027-03-05" }, { "id": "A-09", "owner": "Engineering lead", "due": "2027-03-10" }, { "id": "A-10", "owner": "Operator", "due": "2027-02-10", "done": "2027-02-20" }],
+        }));
+        incidents.push(json!({ "id": "INC-09", "detected": "2026-12-01", "triaged": "2026-12-20", "commander": "p-x", "severity": "SEV-4", "closed": "2027-01-10" }));
+        incidents.push(json!({ "id": "INC-10", "detected": "2027-04-02" }));
+        incidents.push(json!({ "id": "INC-11", "detected": "2027-03-10", "triaged": "2027-03-10", "commander": "p-sec", "severity": "SEV-3", "errorBudget": true, "closed": "2027-03-11" }));
+        check(&v, &|c| {
+            let (x, rows) = c.incidents();
+            let ex = &x["exceptions"];
+            assert_eq!(ex["triagedLate"], json!(["INC-03 SEV-3 (detected 2027-03-15, triaged 2027-03-17, due 2027-03-16)"]), "INC-06's SEV-1 triaged the next day is on time; INC-09's was before the period");
+            assert_eq!(ex["notTriaged"], json!(["INC-04 (detected 2027-03-19, not triaged, due 2027-03-26 at the latest)"]), "INC-05 isn't due until after the period");
+            assert_eq!(ex["commanderNotInRole"], json!(["INC-03 on 2027-03-17: p-x held neither Security owner nor Operator"]), "INC-08 was triaged before the period");
+            assert_eq!(ex["breachNotNotified"], json!(["INC-06 (aware 2027-03-20T08:00:00Z, not notified, due 2027-03-22T08:00:00Z)"]));
+            assert_eq!(ex["breachNoticeLate"], json!(["INC-07 (aware 2027-03-01T08:00:00Z, notified 2027-03-03T09:00:00Z, due 2027-03-03T08:00:00Z)"]), "the clock runs in UTC hours");
+            assert_eq!(ex["reviewOverdue"], json!(["INC-07 (closed 2027-03-05, not reviewed, due 2027-03-19)", "INC-11 (closed 2027-03-11, not reviewed, due 2027-03-25)"]), "a breach and an outage over a quarter of the error budget need one; INC-03's SEV-3 doesn't");
+            assert_eq!(ex["reviewLate"], json!(["INC-08 (closed 2027-02-01, reviewed 2027-03-02, due 2027-02-15)"]));
+            assert_eq!(ex["actionDoneLate"], json!(["A-08 of incident INC-08 (due 2027-02-20, done 2027-03-05)"]), "A-10 was done late before the period");
+            assert_eq!(ex["actionOverdue"], json!(["A-09 of incident INC-08 (Engineering lead, due 2027-03-10)"]));
+            assert_eq!(ex["tabletopRolesMissing"], json!(["2027-03-25: Operator, Engineering lead"]), "p-sec holds the Security owner and Privacy lead");
+            assert_eq!(ex["tabletopNoRecord"], json!(["2027-03-25"]));
+            assert_eq!(ex["noTabletop"], json!([]));
+            let ids: Vec<&str> = x["incidents"].as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap()).collect();
+            assert_eq!(ids, ["INC-01", "INC-02", "INC-03", "INC-04", "INC-05", "INC-06", "INC-07", "INC-08", "INC-11"], "INC-09 was finished before the period, INC-10 came after it");
+            assert_eq!(x["summary"]["detectedInPeriodBySeverity"], json!({ "SEV-1": 1, "SEV-2": 2, "SEV-3": 2, "SEV-4": 0, "none": 1, "untriaged": 2 }));
+            assert_eq!((x["summary"]["openAtEnd"].as_u64(), x["summary"]["breaches"].as_u64(), x["summary"]["reviewsRequired"].as_u64()), (Some(3), Some(3), Some(5)));
+            let two = &x["incidents"][1];
+            assert_eq!((two["heldRole"].as_str(), two["noticeDue"].as_str(), two["reviewDue"].as_str()), (Some("Operator"), Some("2027-03-10T10:00:00Z"), Some("2027-03-26")));
+            assert_eq!(x["incidents"][0]["reviewDue"], Value::Null, "an event that wasn't an incident needs no review");
+            assert_eq!(rows, ["CC7.3-1", "CC7.4-1", "CC7.4-2", "CC7.5-1"]);
+            assert_eq!(c.after_period(), 1);
+            let s = x.to_string();
+            assert!(!s.contains("Acme") && !s.contains("Grace") && !s.contains("master key"), "no notes: {s}");
+        });
+
+        let mut hours = good();
+        hours["breachNoticeHours"] = json!(24);
+        check(&hours, &|c| {
+            let (x, _) = c.incidents();
+            assert_eq!(x["exceptions"]["breachNoticeLate"], json!(["INC-02 (aware 2027-03-08T10:00:00Z, notified 2027-03-09T15:00:00Z, due 2027-03-09T10:00:00Z)"]));
+            assert_eq!(x["breachNoticeHours"], 24);
+        });
+        hours["breachNoticeHours"] = Value::Null;
+        check(&hours, &|c| assert!(c.incidents().0["basis"].as_str().unwrap().contains("the DPA template's suggestion"), "48 hours when the register sets none"));
+    }
+
+    #[test]
+    fn a_year_without_a_tabletop_and_a_plan_not_in_force() {
+        let mut v = good();
+        v["policyApprovals"].as_array_mut().unwrap().push(json!({ "policy": INCIDENT_RESPONSE, "sha256": ZERO, "approvedBy": "p-mgmt", "approvedAt": "2026-02-01" }));
+        v["tabletops"] = json!([{ "at": "2025-12-01", "attendees": ["p-sec"], "actions": [{ "id": "T-02", "owner": "Security owner", "due": "2026-01-01" }] }]);
+        v["people"][1]["joined"] = json!("2025-06-01");
+        check(&v, &|c| {
+            let (x, rows) = c.incidents();
+            let ex = &x["exceptions"];
+            assert_eq!(ex["noTabletop"], json!(["none in the year to 2027-04-01 (last 2025-12-01)"]), "due a year after the plan's first approval");
+            assert_eq!(ex["actionOverdue"], json!(["T-02 of the tabletop on 2025-12-01 (Security owner, due 2026-01-01)"]), "an old tabletop's open action is still chased");
+            assert_eq!(ex["tabletopRolesMissing"], json!([]), "only tabletops in the period are judged");
+            assert_eq!(x["tabletops"].as_array().unwrap().len(), 1);
+            assert_eq!(x["incidentResponsePlan"]["tabletopDue"], "2027-02-01");
+            assert_eq!(rows, ["CC7.3-1", "CC7.4-2", "CC7.5-1"], "the plan is in force, but untested");
+        });
+        let mut unrecorded = good();
+        unrecorded["tabletops"][0]["recordSha256"] = Value::Null;
+        check(&unrecorded, &|c| assert_eq!(c.incidents().1, ["CC7.3-1", "CC7.4-2", "CC7.5-1"], "a tabletop without its record doesn't count"));
+        let mut stale = good();
+        for a in stale["policyApprovals"].as_array_mut().unwrap().iter_mut().filter(|a| a["policy"] == INCIDENT_RESPONSE) {
+            a["approvedAt"] = json!("2026-02-01");
+        }
+        check(&stale, &|c| assert!(c.incidents().1.is_empty(), "a plan approved over a year ago maps nothing"));
+        let set: Vec<Policy> = builtin_policies().into_iter().filter(|p| p.id != INCIDENT_RESPONSE).collect();
+        let mut older = good();
+        older["policyApprovals"].as_array_mut().unwrap().retain(|a| a["policy"] != INCIDENT_RESPONSE);
+        let r = parse(&serde_json::to_vec(&older).unwrap(), &set).unwrap();
+        let c = Check { r: &r, p: period(), policies: &set, baselines: &[] };
+        let (x, rows) = c.incidents();
+        assert_eq!((x["incidentResponsePlan"]["inPolicySet"].as_bool(), rows.len(), exceptions(&x)), (Some(false), 0, 0), "a policy folder without the plan");
+    }
+
+    #[test]
+    fn incident_records_that_dont_hold_together_are_refused() {
+        let mut v = good();
+        v["breachNoticeHours"] = json!(500);
+        let incidents = v["incidents"].as_array_mut().unwrap();
+        incidents.push(json!({ "id": "INC-01", "detected": "2027-03-05" }));
+        incidents.push(json!({
+            "id": "INC-X1", "detected": "2027-03-05", "triaged": "2027-03-04", "commander": "p-who", "severity": "SEV-9", "breach": true,
+            "closed": "2027-03-06", "reviewed": "2027-03-05", "reviewSha256": "abc", "actions": [{ "id": "A-01", "owner": "CISO", "due": "2027-03-01" }],
+        }));
+        incidents.push(json!({ "id": "INC-X2", "detected": "2027-03-05", "severity": "none", "customersNotifiedAt": "2027-03-06T00:00:00Z", "closed": "2027-03-06", "reviewed": "2027-03-07" }));
+        incidents.push(json!({ "id": "INC-X3", "detected": "2027-03-05", "triaged": "2027-03-05", "commander": "p-sec", "severity": "none", "breach": true, "awareAt": "2027-03-04T23:00:00Z", "reviewed": "2027-03-06", "reviewSha256": ZERO }));
+        v["tabletops"].as_array_mut().unwrap().push(json!({ "at": "2027-03-01", "attendees": [], "recordSha256": "xyz" }));
+        let e = parse(&serde_json::to_vec(&v).unwrap(), &builtin_policies()).unwrap_err();
+        for want in [
+            "breachNoticeHours is the DPA's breach notice, 1 to 168 hours",
+            "incident id INC-01 is used twice",
+            "action id A-01 is used twice",
+            "incident INC-X1 names p-who, who isn't in people",
+            "incident INC-X1: severity is SEV-1, SEV-2, SEV-3, SEV-4, none",
+            "incident INC-X1: breach and awareAt go together",
+            "incident INC-X1: reviewSha256 is the written review's SHA-256",
+            "incident INC-X1: dates out of order",
+            "incident INC-X1's action A-01 names the role CISO",
+            "incident INC-X1's action A-01: due and done can't be before 2027-03-05",
+            "incident INC-X2: triaged, commander and severity go together",
+            "incident INC-X2: customersNotifiedAt is for personal data breaches",
+            "incident INC-X2: an event is triaged before it is closed",
+            "incident INC-X2: reviewed and reviewSha256 go together",
+            "incident INC-X3: a personal data breach is an incident",
+            "incident INC-X3: an incident is reviewed after it is closed",
+            "incident INC-X3: dates out of order",
+            "the tabletop on 2027-03-01 has no attendees",
+            "the tabletop on 2027-03-01: recordSha256 is the exercise record's SHA-256",
+        ] {
+            assert!(e.contains(want), "{want}\n{e}");
+        }
+        let e = parse(&serde_json::to_vec(&json!({ "superbotRegister": 1, "incidents": [{ "id": "i", "detected": "2027-03-05", "breach": true, "awareAt": "5 March" }] })).unwrap(), &builtin_policies()).unwrap_err();
+        assert!(e.contains("isn't a time"), "{e}");
     }
 
     #[test]
