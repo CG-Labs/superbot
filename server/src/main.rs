@@ -2176,8 +2176,13 @@ async fn state(State(app): State<AppState>, Extension(c): Extension<Caller>, Ext
     let me_id = plan_id.as_str();
     let tier = app.tier_of(me_id);
     let harnesses: Vec<&str> = adapters::installed().into_iter().filter(|h| tier.allows_harness(h)).collect();
+    // So the app offers "Your service accounts" to every owner (ADR 0239).
+    let owned = c.user.as_ref().filter(|u| !u.service).map(|u| app.db.owned_service_accounts(&u.id));
     Json(json!({
-        "me": { "name": name, "id": c.user.as_ref().map(|u| &u.id), "email": c.user.as_ref().and_then(|u| u.email.as_ref()), "role": role, "permissions": c.permissions(), "session": c.session.is_some(), "tier": tier.view() },
+        "me": {
+            "name": name, "id": c.user.as_ref().map(|u| &u.id), "email": c.user.as_ref().and_then(|u| u.email.as_ref()), "role": role, "permissions": c.permissions(),
+            "session": c.session.is_some(), "tier": tier.view(), "ownedServiceAccounts": owned,
+        },
         "harnesses": harnesses,
         "defaultHarness": default_harness_for(&app, me_id),
         "bots": bots,

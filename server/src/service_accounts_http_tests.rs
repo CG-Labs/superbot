@@ -286,8 +286,9 @@ async fn delegates_manage_only_their_own_and_never_beyond_what_they_hold() {
     let (_, plain) = user_with(port, &admin, "plain@example.com", "member").await;
     assert_eq!(call(port, "PUT", &format!("/api/roles/{helpdesk}/users/{ana}"), &admin, "").await.0, 200);
 
-    // Without users.manage, nothing.
-    assert_eq!(call(port, "GET", "/api/service-accounts", &plain, "").await.0, 403);
+    // Without users.manage, none to manage, and none made (ADR 0239).
+    let (code, list) = json_call(port, "GET", "/api/service-accounts", &plain, "").await;
+    assert_eq!((code, list["serviceAccounts"].clone(), list["manage"].clone(), list["choices"].clone()), (200, json!([]), json!(false), Value::Null), "{list}");
     assert_eq!(call(port, "POST", "/api/service-accounts", &plain, r#"{"name":"X"}"#).await.0, 403);
 
     // A delegate can make one with what they hold, never more.
@@ -363,6 +364,110 @@ async fn delegates_manage_only_their_own_and_never_beyond_what_they_hold() {
 
 fn body_owner(id: &str) -> String {
     json!({ "owner": id }).to_string()
+}
+
+#[tokio::test]
+async fn owners_who_manage_none_see_theirs_revoke_tokens_and_disable_them_only() {
+    use crate::deprovision_http_tests::{held_claude, run_token, send};
+    let (port, app, admin, _) = serve_app().await;
+    let (ro, ro_auth) = user_with(port, &admin, "ro@example.com", "readonly").await;
+    let (_, pat) = user_with(port, &admin, "pat@example.com", "member").await;
+    let sa = account(port, &admin, json!({ "name": "Ro's export" })).await;
+    let other = account(port, &admin, json!({ "name": "Admin's" })).await;
+    // Made its owner, their open app reloads, so it learns they own one now.
+    let mut s = stream(port, &ro_auth).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, &body_owner(&ro)).await.0, 200);
+    read_until(&mut s, "resync").await;
+    let (t1, made) = token(port, &admin, &sa, json!({ "name": "nightly" })).await;
+    let t1_id = made["tokenInfo"]["id"].as_str().unwrap().to_string();
+    let (t2, _) = token(port, &admin, &sa, json!({})).await;
+    assert_eq!(call(port, "GET", "/api/state", &t1, "").await.0, 200);
+
+    // Every owner is told they own some, so the app offers the screen; others aren't.
+    let (_, me) = json_call(port, "GET", "/api/auth/me", &ro_auth, "").await;
+    assert_eq!(me["ownedServiceAccounts"], json!(1), "{me}");
+    let (_, me) = json_call(port, "GET", "/api/auth/me", &pat, "").await;
+    assert_eq!(me["ownedServiceAccounts"], json!(0), "{me}");
+    let (_, state) = json_call(port, "GET", "/api/state", &ro_auth, "").await;
+    assert_eq!(state["me"]["ownedServiceAccounts"], json!(1), "{state}");
+    let (_, me) = json_call(port, "GET", "/api/auth/me", &t1, "").await;
+    assert!(me.get("ownedServiceAccounts").is_none(), "a service account owns none: {me}");
+
+    // A read-only owner sees theirs, its tokens (never their secrets) and what it reaches.
+    let (code, list) = json_call(port, "GET", "/api/service-accounts", &ro_auth, "").await;
+    assert_eq!((code, list["view"].as_str(), list["manage"].clone(), list["choices"].clone()), (200, Some("own"), json!(false), Value::Null), "{list}");
+    assert_eq!(ids_at(&list, "serviceAccounts"), [sa.as_str()]);
+    let (code, v) = json_call(port, "GET", &format!("/api/service-accounts/{sa}"), &ro_auth, "").await;
+    assert_eq!((code, v["tokenList"].as_array().map(Vec::len)), (200, Some(2)), "{v}");
+    assert!(v["bots"].is_array() && v["keptBotList"].is_array(), "{v}");
+    assert!(!v.to_string().contains(t1.trim_start_matches("Bearer ")), "{v}");
+    assert_eq!(call(port, "GET", &format!("/api/service-accounts/{sa}/tokens"), &ro_auth, "").await.0, 200);
+
+    // Nothing that makes, widens or changes it.
+    for (i, (method, path, body)) in [
+        ("POST", "/api/service-accounts".to_string(), r#"{"name":"Mine"}"#),
+        ("POST", format!("/api/service-accounts/{sa}/tokens"), "{}"),
+        ("POST", format!("/api/service-accounts/{sa}/tokens/{t1_id}/rotate"), "{}"),
+        ("DELETE", format!("/api/service-accounts/{sa}"), ""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(call(port, method, &path, &ro_auth, body).await.0, 403, "{method} call {i}");
+    }
+    for body in [r#"{"name":"Renamed"}"#, r#"{"role":"member"}"#, r#"{"status":"disabled","name":"Renamed"}"#, r#"{"status":"disabled","unexpected":true}"#, body_owner(&ro).as_str(), r#"{"status":"active"}"#] {
+        let (code, v) = json_call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &ro_auth, body).await;
+        assert_eq!(code, 403, "{body}: {v}");
+    }
+    let denied = events(port, &admin, "access.denied").await;
+    assert_eq!((denied[0]["details"]["reason"].as_str(), denied[0]["details"]["limit"].as_str(), denied[0]["targetId"].as_str()), (Some("owner_limit"), Some("service_account_change"), Some(sa.as_str())), "{denied:?}");
+    assert_eq!(denied[0]["details"]["fields"], json!(["status"]));
+    assert!(denied.iter().any(|e| e["details"]["fields"] == json!(["status", "unexpected"])), "an unknown field is refused as a change, and logged: {denied:?}");
+    assert_eq!(app.db.service_account(&sa).unwrap().user.name, "Ro's export");
+
+    // Someone else's is not found, for every route, and nobody learns which exist.
+    for (who, key) in [(&ro_auth, other.as_str()), (&pat, sa.as_str())] {
+        for (method, path, body) in [
+            ("GET", format!("/api/service-accounts/{key}"), ""),
+            ("GET", format!("/api/service-accounts/{key}/tokens"), ""),
+            ("PATCH", format!("/api/service-accounts/{key}"), r#"{"status":"disabled"}"#),
+            ("DELETE", format!("/api/service-accounts/{key}/tokens/{t1_id}"), ""),
+        ] {
+            assert_eq!(call(port, method, &path, who, body).await.0, 404, "{method} {path}");
+        }
+    }
+    let denied = events(port, &admin, "access.denied").await;
+    assert_eq!((denied[0]["details"]["reason"].as_str(), denied[0]["details"]["limit"].as_str()), (Some("owner_limit"), Some("service_account_owner")));
+    assert!(app.db.service_account(&sa).unwrap().user.active() && app.db.service_account(&other).unwrap().user.active());
+
+    // Revoking a token stops it at once, audited as the owner.
+    assert_eq!(call(port, "DELETE", &format!("/api/service-accounts/{sa}/tokens/{t1_id}"), &ro_auth, "").await.0, 200);
+    assert_eq!(call(port, "GET", "/api/state", &t1, "").await.0, 401);
+    let revoked = events(port, &admin, "service_token.revoked").await;
+    assert_eq!((revoked[0]["targetId"].as_str(), revoked[0]["actorId"].as_str()), (Some(t1_id.as_str()), Some(ro.as_str())));
+
+    // Disabling it stops every token; doing it again changes nothing; enabling is an admin's.
+    let path = format!("/api/service-accounts/{sa}");
+    let (code, v) = json_call(port, "PATCH", &path, &ro_auth, r#"{"status":"disabled"}"#).await;
+    assert_eq!((code, v["status"].as_str()), (200, Some("disabled")), "{v}");
+    assert_eq!(call(port, "GET", "/api/state", &t2, "").await.0, 401);
+    let off = events(port, &admin, "service_account.disabled").await;
+    assert_eq!((off.len(), off[0]["actorId"].as_str()), (1, Some(ro.as_str())));
+    assert_eq!(call(port, "PATCH", &path, &ro_auth, r#"{"status":"disabled"}"#).await.0, 200);
+    assert_eq!(events(port, &admin, "service_account.disabled").await.len(), 1);
+    assert_eq!(call(port, "PATCH", &path, &ro_auth, r#"{"status":"active"}"#).await.0, 403);
+    assert_eq!(call(port, "PATCH", &path, &admin, r#"{"status":"active"}"#).await.0, 200);
+    assert_eq!(call(port, "GET", "/api/state", &t2, "").await.0, 200);
+
+    // A Bot's run acts for its owner, but owns nothing here.
+    let env = held_claude(&app);
+    let desk = app.db.create_bot_owned("Desk", "#fff", "waddle", "claude", None, false, users::OPERATOR, Visibility::Shared).id;
+    send(port, &admin, &desk, "hi").await;
+    let bot = run_token(&env).await;
+    for (i, (method, path, body)) in [("GET", "/api/service-accounts".to_string(), ""), ("GET", path.clone(), ""), ("PATCH", path.clone(), r#"{"status":"disabled"}"#)].into_iter().enumerate() {
+        assert_eq!(call(port, method, &path, &bot, body).await.0, 403, "{method} call {i}");
+    }
+    assert!(app.db.service_account(&sa).unwrap().user.active());
 }
 
 fn ids_at<'a>(v: &'a Value, key: &str) -> Vec<&'a str> {

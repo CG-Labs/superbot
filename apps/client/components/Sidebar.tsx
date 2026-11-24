@@ -2,7 +2,7 @@ import React from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { isAdmin } from "../src/admin";
 import { workingLabel } from "../src/runQueue";
-import { canManageServiceAccounts } from "../src/serviceAccounts";
+import { canSeeServiceAccounts } from "../src/serviceAccounts";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 import { BotAvatar } from "./BotAvatar";
@@ -26,7 +26,7 @@ interface Props {
   /** Admins: who has access, to review and sign off (ADR 0099). */
   onOpenAccessReview?: () => void;
   onOpenRoles?: () => void;
-  /** Scripts' and integrations' own identities and tokens (ADR 0143, 0152): admins, and delegates with users.manage for their own (ADR 0182). */
+  /** Scripts' and integrations' own identities and tokens (ADR 0143, 0152): admins, delegates with users.manage for their own (ADR 0182), and any owner (ADR 0239). */
   onOpenServiceAccounts?: () => void;
   /** The server's admin console (ADR 0027), in a new tab or the system browser. */
   onOpenConsole?: () => void;
@@ -195,7 +195,7 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOp
             </Pressable>
           ) : null}
         </>
-      ) : onOpenServiceAccounts && canManageServiceAccounts(me) ? (
+      ) : onOpenServiceAccounts && canSeeServiceAccounts(me) ? (
         <Pressable style={styles.approvalsBtn} onPress={onOpenServiceAccounts} accessibilityRole="button">
           <Text style={styles.hiddenText}>Your service accounts</Text>
         </Pressable>

@@ -233,6 +233,13 @@ async fn every_call_the_console_makes_is_served_and_admin_only() {
             continue;
         }
         let (code, body) = call(port, m, p, &member, "{}").await;
+        // Anyone may see and stop the service accounts they own (ADR 0239). Mia owns none,
+        // so she's shown none and finds none.
+        if p.starts_with("/api/service-accounts") && code != 403 {
+            let none = (m.as_str(), p.as_str()) == ("GET", "/api/service-accounts") && parse(&body)["serviceAccounts"] == json!([]);
+            assert!(code == 404 || (code == 200 && none), "{m} {p}: {code} {body}");
+            continue;
+        }
         assert_eq!(code, 403, "{m} {p}: {body}");
     }
     assert_routed(port, &admin, &calls).await;

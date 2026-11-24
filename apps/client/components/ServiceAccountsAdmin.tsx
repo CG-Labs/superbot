@@ -257,6 +257,7 @@ function AccountDetail({
   account,
   choices,
   admin,
+  manage,
   minted,
   onMinted,
   onDismissMinted,
@@ -270,6 +271,8 @@ function AccountDetail({
   account: ServiceAccount;
   choices: ServiceAccountChoices;
   admin: boolean;
+  /** False for an owner without users.manage: they see it, revoke tokens and disable it, nothing more (ADR 0239). */
+  manage: boolean;
   minted: MintedServiceToken | null;
   onMinted: (m: MintedServiceToken) => void;
   onDismissMinted: () => void;
@@ -414,7 +417,8 @@ function AccountDetail({
       {sa.ownerActive && sa.team && sa.ownerOnTeam === false ? (
         <Text style={styles.warn}>Its owner isn&apos;t on {sa.team.name}, so it acts in no team: it doesn&apos;t see the team or the Bots shared with it until they are.</Text>
       ) : null}
-      {!active ? <Text style={styles.warn}>Disabled: its tokens don&apos;t work. Enable it to use or make tokens.</Text> : null}
+      {!active ? <Text style={styles.warn}>Disabled: its tokens don&apos;t work. {manage ? "Enable it to use or make tokens." : "Ask an admin to enable it again."}</Text> : null}
+      {!manage ? <Text style={styles.faint}>You own it, so it acts with your access. You can revoke its tokens or disable it; an admin makes tokens and changes it.</Text> : null}
 
       <Section title="Can use today">
         <Tags names={sa.effective} empty="Nothing" />
@@ -455,7 +459,7 @@ function AccountDetail({
                 <Text style={[styles.text, { flex: 1 }]} numberOfLines={1}>
                   {t.name} <Text style={styles.mono}>{t.preview}</Text>
                 </Text>
-                {canRotate(t) ? (
+                {canRotate(t) && manage ? (
                   <>
                     <Button label="Rotate" a11y={`Rotate ${t.name}`} disabled={busy || !active} onPress={() => setRotating(rotating === t.id ? null : t.id)} />
                     <Button label="Revoke" a11y={`Revoke ${t.name}`} danger disabled={busy} onPress={() => void revoke(t.id, t.name)} />
@@ -487,7 +491,7 @@ function AccountDetail({
         )}
       </Section>
 
-      {active ? (
+      {active && manage ? (
         <Section title="New token">
           <TextInput
             style={styles.input}
@@ -516,17 +520,19 @@ function AccountDetail({
         </Section>
       ) : null}
 
-      <Section title="Settings">
-        <AccountForm draft={draft} setDraft={setDraft} choices={choices} kept={kept} busy={busy} editing admin={admin} />
-        <View style={styles.row}>
-          <Button label="Save" primary disabled={busy || !!invalid || !changes} onPress={() => void save()} />
-          {invalid ? <Text style={styles.faint}>{invalid}</Text> : null}
-        </View>
-      </Section>
+      {manage ? (
+        <Section title="Settings">
+          <AccountForm draft={draft} setDraft={setDraft} choices={choices} kept={kept} busy={busy} editing admin={admin} />
+          <View style={styles.row}>
+            <Button label="Save" primary disabled={busy || !!invalid || !changes} onPress={() => void save()} />
+            {invalid ? <Text style={styles.faint}>{invalid}</Text> : null}
+          </View>
+        </Section>
+      ) : null}
 
       <View style={styles.row}>
-        {active ? <Button label="Disable" disabled={busy} onPress={() => void setStatus("disabled")} /> : <Button label="Enable" primary disabled={busy} onPress={() => void setStatus("active")} />}
-        <Button label="Delete" danger disabled={busy} onPress={() => void remove()} />
+        {active ? <Button label="Disable" disabled={busy} onPress={() => void setStatus("disabled")} /> : manage ? <Button label="Enable" primary disabled={busy} onPress={() => void setStatus("active")} /> : null}
+        {manage ? <Button label="Delete" danger disabled={busy} onPress={() => void remove()} /> : null}
       </View>
     </View>
   );
@@ -534,7 +540,8 @@ function AccountDetail({
 
 /**
  * Service accounts (ADR 0143, 0152): make them, give them a role, and issue, rotate and revoke
- * their tokens. Admins see every one; a delegate sees and manages the ones they own (ADR 0182).
+ * their tokens. Admins see every one; a delegate sees and manages the ones they own (ADR 0182);
+ * any other owner sees theirs, revokes their tokens and disables them (ADR 0239).
  */
 export function ServiceAccountsAdmin({ api, onBack, admin }: Props) {
   const { width } = useWindowDimensions();
@@ -571,6 +578,7 @@ export function ServiceAccountsAdmin({ api, onBack, admin }: Props) {
 
   const choices = view ? formChoices(view, roles, teams) : null;
   const own = !admin || view?.view === "own";
+  const manage = view?.manage !== false;
 
   const pick = (p: Picked) => {
     if (busy) return;
@@ -588,6 +596,7 @@ export function ServiceAccountsAdmin({ api, onBack, admin }: Props) {
       account={account}
       choices={choices}
       admin={admin}
+      manage={manage}
       minted={minted}
       onMinted={setMinted}
       onDismissMinted={() => setMinted(null)}
@@ -600,7 +609,7 @@ export function ServiceAccountsAdmin({ api, onBack, admin }: Props) {
       onBusy={setBusy}
       notice={notice}
     />
-  ) : picked?.kind === "new" ? (
+  ) : picked?.kind === "new" && manage ? (
     <NewAccount
       api={api}
       view={view}
@@ -625,7 +634,7 @@ export function ServiceAccountsAdmin({ api, onBack, admin }: Props) {
           <Text style={styles.back}>‹ Bots</Text>
         </Pressable>
         <Text style={styles.title}>{own ? "Your service accounts" : "Service accounts"}</Text>
-        <Button label="New service account" primary disabled={!view || busy} onPress={() => pick({ kind: "new" })} />
+        {manage ? <Button label="New service account" primary disabled={!view || busy} onPress={() => pick({ kind: "new" })} /> : null}
       </View>
       <View style={styles.body}>
         <View style={wide ? styles.listPaneWide : styles.listPane}>
@@ -657,7 +666,7 @@ export function ServiceAccountsAdmin({ api, onBack, admin }: Props) {
               ))}
               {!view.serviceAccounts.length ? (
                 <Text style={styles.empty}>
-                  {own ? "You own no service accounts yet. Make one for each script or integration of yours that calls the API." : "No service accounts yet. Make one for each script or integration that calls the API."}
+                  {!manage ? "You own no service accounts." : own ? "You own no service accounts yet. Make one for each script or integration of yours that calls the API." : "No service accounts yet. Make one for each script or integration that calls the API."}
                 </Text>
               ) : null}
             </ScrollView>
@@ -665,7 +674,7 @@ export function ServiceAccountsAdmin({ api, onBack, admin }: Props) {
         </View>
         {wide ? (
           <ScrollView style={styles.detailPane} contentContainerStyle={{ padding: 20 }}>
-            {detail ?? <Text style={styles.empty}>Pick a service account to see its tokens, or make a new one.</Text>}
+            {detail ?? <Text style={styles.empty}>{manage ? "Pick a service account to see its tokens, or make a new one." : "Pick a service account to see its tokens and what it can use."}</Text>}
           </ScrollView>
         ) : null}
       </View>
