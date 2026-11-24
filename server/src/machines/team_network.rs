@@ -24,6 +24,12 @@
 //! each host, which a team member's container joins through a second NIC behind an ACL
 //! of the network's own: inbound dropped, outbound only to the subnet. Incus plugs and
 //! unplugs NICs in running containers, so joining and leaving need no power-off.
+//!
+//! The network of a team this server deleted is removed once nothing is on it (ADR
+//! 0236): its machines have left it as any leaver's do, and nothing else, ours or
+//! anyone's, is on it. A team is known to be one this server deleted by its own
+//! `team.deleted` events, so another control plane's networks on the same account are
+//! never touched. On Incus its ACL and its name on the project's access list go too.
 
 use super::enroll::Enrollment;
 use super::provider::{MachineProvider, NetworkMember, ProviderError, TeamNetwork};
@@ -105,6 +111,34 @@ impl Join {
     }
 }
 
+/// What becomes of the network of a team this server deleted
+/// (MACHINE_TEAM_NETWORK_REMOVE, ADR 0236).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Remove {
+    /// It stays until an admin removes it, as before ADR 0236.
+    Off,
+    /// It is removed once nothing is on it: no machine of ours, and nothing else.
+    #[default]
+    WhenEmpty,
+}
+
+impl Remove {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Remove::Off => "off",
+            Remove::WhenEmpty => "when-empty",
+        }
+    }
+
+    fn parse(v: &str) -> Result<Remove, String> {
+        match v.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "" | "when-empty" => Ok(Remove::WhenEmpty),
+            "off" => Ok(Remove::Off),
+            v => Err(format!("MACHINE_TEAM_NETWORK_REMOVE must be off or when-empty, not \"{}\"", crate::audit::clip(v, 20))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub kind: Kind,
@@ -112,6 +146,7 @@ pub struct Settings {
     /// team networks never route to each other, so the same range on two never meets.
     pub subnet: String,
     pub join: Join,
+    pub remove: Remove,
 }
 
 /// Whether `subnet` meets one of the comma-separated CIDRs in `deny`: the one it meets.
@@ -134,8 +169,10 @@ impl Settings {
                 if !raw.trim().is_empty() {
                     return Err("MACHINE_TEAM_NETWORK_SUBNET needs MACHINE_TEAM_NETWORK=vpc or ovn".into());
                 }
-                if !var("MACHINE_TEAM_NETWORK_JOIN").trim().is_empty() {
-                    return Err("MACHINE_TEAM_NETWORK_JOIN needs MACHINE_TEAM_NETWORK=vpc or ovn".into());
+                for k in ["MACHINE_TEAM_NETWORK_JOIN", "MACHINE_TEAM_NETWORK_REMOVE"] {
+                    if !var(k).trim().is_empty() {
+                        return Err(format!("{k} needs MACHINE_TEAM_NETWORK=vpc or ovn"));
+                    }
                 }
                 return Ok(None);
             }
@@ -160,11 +197,12 @@ impl Settings {
             return Err(format!("MACHINE_TEAM_NETWORK_SUBNET: {subnet} meets MACHINE_EGRESS_DENY's {c}; pick a range the deny list doesn't name"));
         }
         let join = Join::parse(&var("MACHINE_TEAM_NETWORK_JOIN"))?;
-        Ok(Some(Settings { kind, subnet, join }))
+        let remove = Remove::parse(&var("MACHINE_TEAM_NETWORK_REMOVE"))?;
+        Ok(Some(Settings { kind, subnet, join, remove }))
     }
 
     pub fn view(&self) -> Value {
-        json!({ "kind": self.kind.as_str(), "subnet": self.subnet, "join": self.join.as_str() })
+        json!({ "kind": self.kind.as_str(), "subnet": self.subnet, "join": self.join.as_str(), "remove": self.remove.as_str() })
     }
 }
 
@@ -223,8 +261,9 @@ pub async fn ensure(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, 
 /// One pass: every machine of ours on a team network whose team its owner isn't on is
 /// taken off it. Anything else on a network, the team's own services, is left alone.
 /// Machines this powered off are powered on again once nothing has them to leave.
-/// Then, unless MACHINE_TEAM_NETWORK_JOIN=off, a team member's machine on no network
-/// joins its team's (ADR 0202).
+/// A deleted team's network with none of our machines left on it is removed if nothing
+/// else is on it either (ADR 0236). Then, unless MACHINE_TEAM_NETWORK_JOIN=off, a team
+/// member's machine on no network joins its team's (ADR 0202).
 pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
     let (Some(s), Some(p)) = (&cp.team_network, cp.provider.as_deref()) else { return json!({}) };
     let nets: Vec<(String, TeamNetwork)> = match p.team_networks("").await {
@@ -247,6 +286,8 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
     let mut on_one: HashSet<String> = HashSet::new();
     // Running on their team's network's subnet without using it yet: a boot away.
     let mut to_boot: Vec<(TeamNetwork, String, Machine)> = Vec::new();
+    // Networks not read, or with a machine of ours still on them: none is removed yet.
+    let mut busy: HashSet<String> = HashSet::new();
     for (part, n) in &nets {
         let team = teams.get(part).cloned();
         let members = match p.team_network_members(&n.id).await {
@@ -254,6 +295,7 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
             Err(_) => {
                 errors += 1;
                 unseen = true;
+                busy.insert(n.id.clone());
                 continue;
             }
         };
@@ -285,6 +327,20 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
                 Leave::Failed => errors += 1,
             }
             still_on.insert(m.id.clone());
+            busy.insert(n.id.clone());
+        }
+    }
+    let (mut removed, mut kept) = (0, 0);
+    if s.remove == Remove::WhenEmpty {
+        let gone: HashMap<String, (String, i64)> = app.db.deleted_teams().into_iter().map(|(id, at)| (team_part(&id), (id, at))).collect();
+        for (part, n) in &nets {
+            let Some((team, at)) = gone.get(part).filter(|_| !teams.contains_key(part) && !busy.contains(&n.id)) else { continue };
+            match remove(app, cp, p, n, team, *at).await {
+                Removal::Removed => removed += 1,
+                Removal::Kept => kept += 1,
+                Removal::Failed => errors += 1,
+                Removal::Nothing => {}
+            }
         }
     }
     let mut outcomes: HashMap<String, Joined> = HashMap::new();
@@ -360,6 +416,8 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
         ("restarting", restarting),
         ("joined", joined),
         ("waiting", waiting),
+        ("removed", removed),
+        ("kept", kept),
         ("errors", errors),
     ] {
         if v > 0 {
@@ -694,6 +752,55 @@ pub(crate) async fn leave(app: &AppState, cp: &ControlPlane, p: &dyn MachineProv
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum Removal {
+    Removed,
+    /// Something is still on it: the operator's services, or another's machines.
+    Kept,
+    Failed,
+    Nothing,
+}
+
+/// Removes `n`, the network of `team`, which this server deleted at `deleted_at`, if
+/// nothing is on it (ADR 0236). Under the lock team changes and creates take. That it
+/// is kept, and why removing it failed, are audited once per reason, not every pass.
+async fn remove(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, n: &TeamNetwork, team: &str, deleted_at: i64) -> Removal {
+    let _g = cp.lock_ops().await;
+    if app.db.team(team).is_some() {
+        return Removal::Nothing;
+    }
+    let by = Who { actor: crate::audit::Actor::system(super::SYSTEM), source: Default::default() };
+    let d = || json!({ "team": team, "label": n.label, "region": n.region, "subnet": n.subnet, "teamDeletedAt": deleted_at });
+    let note = |why: &str| {
+        let mut noted = cp.network_remove_noted.lock().unwrap_or_else(|e| e.into_inner());
+        noted.entry(n.id.clone()).or_default().insert(why.to_string())
+    };
+    match p.remove_team_network(n).await {
+        Ok(true) => {
+            cp.network_remove_noted.lock().unwrap_or_else(|e| e.into_inner()).remove(&n.id);
+            app.db.record(&by.event("machine.team_network_removed").target("team_network", &n.id).details(d()));
+            Removal::Removed
+        }
+        Ok(false) => {
+            if note("in use") {
+                let mut d = d();
+                d["reason"] = json!("something is still on it");
+                app.db.record(&by.event("machine.team_network_kept").target("team_network", &n.id).details(d));
+            }
+            Removal::Kept
+        }
+        Err(e) => {
+            let why = e.to_string();
+            if note(&why) {
+                let mut d = d();
+                d["error"] = json!(why);
+                app.db.record(&by.event("machine.team_network_removed").target("team_network", &n.id).details(d).outcome(Outcome::Failure));
+            }
+            Removal::Failed
+        }
+    }
+}
+
 fn suspended(cp: &ControlPlane) -> std::sync::MutexGuard<'_, HashSet<String>> {
     cp.network_suspended.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -754,7 +861,7 @@ mod tests {
         assert!(e.contains("off, vpc or ovn"), "{e}");
         let on = Settings::from_env(&vars(&[("MACHINE_TEAM_NETWORK", "VPC")])).unwrap().unwrap();
         assert_eq!(on.subnet, DEFAULT_SUBNET);
-        assert_eq!(on.view(), json!({ "kind": "vpc", "subnet": DEFAULT_SUBNET, "join": "next-boot" }));
+        assert_eq!(on.view(), json!({ "kind": "vpc", "subnet": DEFAULT_SUBNET, "join": "next-boot", "remove": "when-empty" }));
         let with = |s: &str| Settings::from_env(&vars(&[("MACHINE_TEAM_NETWORK", "vpc"), ("MACHINE_TEAM_NETWORK_SUBNET", s)]));
         assert_eq!(with("172.20.0.0/16").unwrap().unwrap().subnet, "172.20.0.0/16");
         assert_eq!(with(" 192.168.4.0/24 ").unwrap().unwrap().subnet, "192.168.4.0/24");
@@ -776,13 +883,26 @@ mod tests {
     fn ovn_takes_any_private_range() {
         let with = |s: &str| Settings::from_env(&vars(&[("MACHINE_TEAM_NETWORK", "ovn"), ("MACHINE_TEAM_NETWORK_SUBNET", s)]));
         let on = Settings::from_env(&vars(&[("MACHINE_TEAM_NETWORK", "OVN")])).unwrap().unwrap();
-        assert_eq!(on.view(), json!({ "kind": "ovn", "subnet": DEFAULT_SUBNET, "join": "next-boot" }));
+        assert_eq!(on.view(), json!({ "kind": "ovn", "subnet": DEFAULT_SUBNET, "join": "next-boot", "remove": "when-empty" }));
         assert_eq!(with("192.168.200.0/24").unwrap().unwrap().subnet, "192.168.200.0/24", "outside Linode's VPC ranges, but private");
         assert_eq!(with("10.0.0.0/8").unwrap().unwrap().subnet, "10.0.0.0/8");
         for (bad, why) in [("203.0.113.0/24", "isn't inside"), ("100.64.0.0/24", "isn't inside"), ("10.1.0.8/30", "smallest")] {
             let e = with(bad).unwrap_err();
             assert!(e.contains(why) && (why != "isn't inside" || e.contains("RFC 1918")), "{bad}: {e}");
         }
+    }
+
+    #[test]
+    fn a_deleted_teams_network_goes_once_empty_unless_turned_off() {
+        let with = |v: &str| Settings::from_env(&vars(&[("MACHINE_TEAM_NETWORK", "vpc"), ("MACHINE_TEAM_NETWORK_REMOVE", v)]));
+        assert_eq!(with("").unwrap().unwrap().remove, Remove::WhenEmpty, "the default");
+        assert_eq!(with("When_Empty").unwrap().unwrap().remove, Remove::WhenEmpty);
+        let off = with(" off ").unwrap().unwrap();
+        assert_eq!((off.remove, off.view()["remove"].as_str()), (Remove::Off, Some("off")));
+        let e = with("always").unwrap_err();
+        assert!(e.contains("off or when-empty"), "{e}");
+        let e = Settings::from_env(&vars(&[("MACHINE_TEAM_NETWORK_REMOVE", "off")])).unwrap_err();
+        assert!(e.contains("MACHINE_TEAM_NETWORK_REMOVE needs MACHINE_TEAM_NETWORK=vpc or ovn"), "{e}");
     }
 
     #[test]

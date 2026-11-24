@@ -381,6 +381,12 @@ pub trait MachineProvider: Send + Sync {
     fn team_nic_needs_rebuild<'a>(&'a self, _id: &'a str) -> Fut<'a, bool> {
         Box::pin(async { Ok(false) })
     }
+    /// Deletes network `n` (ADR 0236) only if nothing is on it, ours or anyone's:
+    /// Ok(false) when something is, and it stays; Ok(true) once it is gone, or was. On
+    /// Incus its ACL goes with it, and the project's network access list stops naming it.
+    fn remove_team_network<'a>(&'a self, _n: &'a TeamNetwork) -> Fut<'a, bool> {
+        Box::pin(async { Err(no_networks()) })
+    }
 
     // Firewalls (ADR 0035). Labels are unique per account, as machines' are.
 

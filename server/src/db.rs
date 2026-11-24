@@ -11256,6 +11256,21 @@ impl Db {
             .map_err(|e| e.to_string())
     }
 
+    /// Teams this server deleted and that aren't here now, with when each was (ADR 0236).
+    /// Read from its own audit log, so only as far back as AUDIT_RETENTION_DAYS keeps it.
+    pub fn deleted_teams(&self) -> Vec<(String, i64)> {
+        let c = self.c();
+        let mut s = c
+            .prepare(
+                "SELECT target_id, MAX(at) FROM audit_events
+                 WHERE action = 'team.deleted' AND target_type = 'team' AND outcome = 'success' AND target_id IS NOT NULL
+                   AND target_id NOT IN (SELECT id FROM teams)
+                 GROUP BY target_id ORDER BY target_id",
+            )
+            .unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(Result::ok).collect()
+    }
+
     /// Deletes the team, its invites and its residency pin (ADR 0129). Its members must
     /// have left first.
     pub fn delete_team(&self, id: &str) -> bool {

@@ -662,6 +662,14 @@ impl MachineProvider for Fleet {
         })
     }
 
+    /// On the network's own host, named `host/name` as `team_networks` lists it.
+    fn remove_team_network<'a>(&'a self, net: &'a TeamNetwork) -> Fut<'a, bool> {
+        Box::pin(async move {
+            let (m, n) = self.route(&net.id)?;
+            m.incus.remove_team_network(&TeamNetwork { id: n.into(), subnet_id: n.into(), ..net.clone() }).await
+        })
+    }
+
     fn hosts(&self) -> Option<&dyn Hosts> {
         Some(self)
     }

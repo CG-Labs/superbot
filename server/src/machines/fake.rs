@@ -250,6 +250,11 @@ impl Fake {
         self.state.lock().unwrap().networks.get_mut(id).unwrap().members.insert(member.into());
     }
 
+    /// Takes `member` off network `id` behind the control plane's back.
+    pub fn leave_network(&self, id: &str, member: &str) {
+        self.state.lock().unwrap().networks.get_mut(id).unwrap().members.remove(member);
+    }
+
     /// As if machine `id` were an Incus container made before ADR 0212.
     pub fn team_nic_needs_rebuild_for(&self, id: &str) {
         self.state.lock().unwrap().team_nic_rebuild.insert(id.into());
@@ -558,6 +563,20 @@ impl MachineProvider for Fake {
 
     fn team_network_needs_power_off<'a>(&'a self, machine: &'a str) -> Fut<'a, bool> {
         Box::pin(async move { self.with("team_network_needs_power_off", |s| Ok(s.linode_interfaces.contains(machine))) })
+    }
+
+    /// As Linode's: only a VPC nothing is on, joining or joined.
+    fn remove_team_network<'a>(&'a self, n: &'a TeamNetwork) -> Fut<'a, bool> {
+        Box::pin(async move {
+            self.with("remove_team_network", |s| match s.networks.get(&n.id) {
+                None => Ok(true),
+                Some(x) if !x.members.is_empty() || !x.pending.is_empty() => Ok(false),
+                Some(_) => {
+                    s.networks.remove(&n.id);
+                    Ok(true)
+                }
+            })
+        })
     }
 
     fn find_firewall<'a>(&'a self, label: &'a str) -> Fut<'a, Option<ProviderFirewall>> {

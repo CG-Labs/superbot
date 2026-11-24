@@ -25,6 +25,10 @@ struct Env {
 const AGENT: &str = "stand-in for the superbot-machine binary";
 
 async fn serve() -> Env {
+    serve_with(team_network::Remove::WhenEmpty).await
+}
+
+async fn serve_with(remove: team_network::Remove) -> Env {
     let machine_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let mport = machine_listener.local_addr().unwrap().port();
     let fake = Arc::new(Fake::default());
@@ -32,7 +36,7 @@ async fn serve() -> Env {
     let mut cp = ControlPlane::for_tests(p);
     let e = cp.enroll_with(Enrollment::for_tests(9, mport, 7443).with_agent(AGENT.as_bytes()).with_hardening()).unwrap();
     cp.firewall_with(Settings { sources: Vec::new(), ssh: Vec::new() }).unwrap();
-    cp.team_network = Some(team_network::Settings { kind: team_network::Kind::Vpc, subnet: team_network::DEFAULT_SUBNET.into(), join: team_network::Join::NextBoot });
+    cp.team_network = Some(team_network::Settings { kind: team_network::Kind::Vpc, subnet: team_network::DEFAULT_SUBNET.into(), join: team_network::Join::NextBoot, remove });
     let cp = Arc::new(cp);
     let held = cp.clone();
     let (port, app, owner, _) = crate::tests::serve_app_with(move |a| a.machines = cp).await;
@@ -128,7 +132,7 @@ async fn a_teams_machines_share_a_network_of_their_own_and_leave_it_with_the_tea
 
     // The substrate says so.
     let (_, s) = json_call(&env, "GET", "/api/machines/substrate", "").await;
-    assert_eq!(s["teamNetwork"], json!({ "kind": "vpc", "subnet": team_network::DEFAULT_SUBNET, "join": "next-boot" }), "{s}");
+    assert_eq!(s["teamNetwork"], json!({ "kind": "vpc", "subnet": team_network::DEFAULT_SUBNET, "join": "next-boot", "remove": "when-empty" }), "{s}");
 
     // Running, and the team's own service on its network: nothing to do.
     env.fake.join_network(&acme_net, "acme-database");
@@ -173,6 +177,99 @@ async fn a_teams_machines_share_a_network_of_their_own_and_leave_it_with_the_tea
         m.sort();
         m
     });
+}
+
+async fn delete_team(env: &Env, team: &str) {
+    let (code, v) = json_call(env, "DELETE", &format!("/api/teams/{team}"), "").await;
+    assert_eq!(code, 200, "{v}");
+}
+
+fn has_network(env: &Env, id: &str) -> bool {
+    env.fake.networks().iter().any(|n| n.id == id)
+}
+
+#[tokio::test]
+async fn a_deleted_teams_network_is_removed_once_nothing_is_on_it() {
+    let env = serve().await;
+    let (ada, _) = user_with(env.port, &env.admin, "ada@example.com", "member").await;
+    let (al, _) = user_with(env.port, &env.admin, "al@example.com", "member").await;
+    let (_gus, _) = user_with(env.port, &env.admin, "gus@example.com", "member").await;
+    let (dee, _) = user_with(env.port, &env.admin, "dee@example.com", "member").await;
+    let acme = team(&env, "Acme", "ada@example.com").await;
+    let globex = team(&env, "Globex", "gus@example.com").await;
+    join(&env, &acme, &al).await;
+    join(&env, &globex, &dee).await;
+    for uid in [&ada, &al, &dee] {
+        ask(&env, uid).await;
+    }
+    let acme_net = env.fake.network_of(&pid(&env, &ada)).unwrap();
+    let globex_net = env.fake.network_of(&pid(&env, &dee)).unwrap();
+    env.fake.join_network(&globex_net, "globex-database");
+    // Empty, labelled as a team network, but for a team this server never had: another
+    // control plane's on the same account. Never touched.
+    let label = team_network::label("otherbot", "t-theirs", "gb-lon").unwrap();
+    let theirs = env.fake.ensure_team_network(&label, "gb-lon", team_network::DEFAULT_SUBNET).await.unwrap();
+
+    // Acme is deleted: its machines leave its network as any leaver's do, then it goes.
+    delete_team(&env, &acme).await;
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "leaving": 2 }));
+    assert!(has_network(&env, &acme_net), "not while machines of ours are on it");
+    assert!(events(&env, "machine.team_network_kept").await.is_empty(), "nor is it said to be kept");
+    let r = reconcile(&env).await;
+    assert_eq!(r["teamNetworks"], json!({ "left": 2, "resumed": 2, "removed": 1 }), "{r}");
+    assert!(!has_network(&env, &acme_net));
+    let removed = events(&env, "machine.team_network_removed").await;
+    assert_eq!(removed.len(), 1, "{removed:?}");
+    let e = &removed[0];
+    assert_eq!((e["targetType"].as_str(), e["targetId"].as_str(), e["outcome"].as_str(), e["actorKind"].as_str()), (Some("team_network"), Some(acme_net.as_str()), Some("success"), Some("system")));
+    assert_eq!((e["details"]["team"].as_str(), e["details"]["region"].as_str()), (Some(acme.as_str()), Some("gb-lon")));
+    assert!(e["details"]["label"].as_str().unwrap().contains("-team-") && e["details"]["teamDeletedAt"].is_i64(), "{e}");
+    assert!(reconcile(&env).await.get("teamNetworks").is_none(), "nothing left to do");
+    assert_eq!((machine(&env, &ada).state, machine(&env, &al).state), (State::Running, State::Running));
+    assert!(has_network(&env, &globex_net) && has_network(&env, &theirs.id), "a live team's, and one not ours");
+
+    // Globex is deleted with its own service still on its network: kept, said once.
+    delete_team(&env, &globex).await;
+    reconcile(&env).await;
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "left": 1, "resumed": 1, "kept": 1 }));
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "kept": 1 }));
+    let kept = events(&env, "machine.team_network_kept").await;
+    assert_eq!((kept.len(), kept[0]["targetId"].as_str()), (1, Some(globex_net.as_str())), "{kept:?}");
+    assert_eq!(kept[0]["details"]["reason"], "something is still on it");
+    assert_eq!(env.fake.networks().into_iter().find(|n| n.id == globex_net).unwrap().members.into_iter().collect::<Vec<_>>(), ["globex-database"]);
+
+    // A failure between passes that find it kept is said once, as is that it is kept.
+    for _ in 0..2 {
+        env.fake.fail_next("remove_team_network", crate::machines::provider::ProviderError::Api { status: 500, message: "try later".into() });
+        assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "errors": 1 }));
+        assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "kept": 1 }));
+    }
+    assert_eq!(events(&env, "machine.team_network_kept").await.len(), 1);
+    let failed: Vec<Value> = events(&env, "machine.team_network_removed").await.into_iter().filter(|e| e["outcome"] == "failure").collect();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(failed[0]["details"]["error"].as_str().unwrap().contains("try later"), "{failed:?}");
+
+    // Once the service is moved off it goes.
+    env.fake.leave_network(&globex_net, "globex-database");
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "removed": 1 }));
+    assert!(!has_network(&env, &globex_net));
+    assert!(reconcile(&env).await.get("teamNetworks").is_none());
+    assert!(has_network(&env, &theirs.id), "still never touched");
+}
+
+#[tokio::test]
+async fn with_remove_off_a_deleted_teams_network_stays() {
+    let env = serve_with(team_network::Remove::Off).await;
+    let (ada, _) = user_with(env.port, &env.admin, "ada@example.com", "member").await;
+    let acme = team(&env, "Acme", "ada@example.com").await;
+    ask(&env, &ada).await;
+    let net = env.fake.network_of(&pid(&env, &ada)).unwrap();
+    delete_team(&env, &acme).await;
+    reconcile(&env).await;
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "left": 1, "resumed": 1 }), "it still leaves");
+    assert!(reconcile(&env).await.get("teamNetworks").is_none());
+    assert!(has_network(&env, &net), "the network stays, empty");
+    assert_eq!(env.fake.calls("remove_team_network"), 0);
 }
 
 #[tokio::test]
@@ -343,7 +440,7 @@ async fn with_when_idle_a_machine_is_restarted_onto_its_teams_network_once_it_ru
         |e| e,
         |cp| {
             cp.firewall_with(Settings { sources: Vec::new(), ssh: Vec::new() }).unwrap();
-            cp.team_network = Some(team_network::Settings { kind: team_network::Kind::Vpc, subnet: team_network::DEFAULT_SUBNET.into(), join: team_network::Join::WhenIdle });
+            cp.team_network = Some(team_network::Settings { kind: team_network::Kind::Vpc, subnet: team_network::DEFAULT_SUBNET.into(), join: team_network::Join::WhenIdle, remove: team_network::Remove::WhenEmpty });
         },
         |_| {},
     )
@@ -511,7 +608,7 @@ async fn with_when_idle_a_machine_with_linode_interfaces_is_powered_off_to_join_
         |e| e,
         |cp| {
             cp.firewall_with(Settings { sources: Vec::new(), ssh: Vec::new() }).unwrap();
-            cp.team_network = Some(team_network::Settings { kind: team_network::Kind::Vpc, subnet: team_network::DEFAULT_SUBNET.into(), join: team_network::Join::WhenIdle });
+            cp.team_network = Some(team_network::Settings { kind: team_network::Kind::Vpc, subnet: team_network::DEFAULT_SUBNET.into(), join: team_network::Join::WhenIdle, remove: team_network::Remove::WhenEmpty });
         },
         |_| {},
     )

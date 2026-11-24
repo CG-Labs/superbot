@@ -1179,6 +1179,29 @@ impl Incus {
         Err(ProviderError::Transport("the project kept changing at Incus".into()))
     }
 
+    /// Takes team network `n` off the project's network access list, once it is gone
+    /// (ADR 0236). Never the last name on it: an empty list lets the project use every
+    /// network.
+    async fn forget_network(&self, n: &str) -> Result<(), ProviderError> {
+        let path = format!("/1.0/projects/{}", self.s.project);
+        for _ in 0..3 {
+            let r = self.call(Method::GET, &path, &[], None, None).await?;
+            let access = r.metadata["config"]["restricted.networks.access"].as_str().unwrap_or_default();
+            let named: Vec<&str> = access.split(',').map(str::trim).filter(|a| !a.is_empty()).collect();
+            let kept: Vec<&str> = named.iter().copied().filter(|a| *a != n).collect();
+            if kept.len() == named.len() || kept.is_empty() {
+                return Ok(());
+            }
+            let mut put = json!({ "config": r.metadata["config"], "description": r.metadata["description"] });
+            put["config"]["restricted.networks.access"] = json!(kept.join(","));
+            match self.call(Method::PUT, &path, &[], Some(&put), r.etag.as_deref()).await {
+                Err(ProviderError::Api { status: 412, .. }) => continue,
+                res => return res.map(drop),
+            }
+        }
+        Err(ProviderError::Transport("the project kept changing at Incus".into()))
+    }
+
     /// The ACL on team network `n`'s NICs, named after it: nothing inbound, so teammates'
     /// machines stay apart as the firewall keeps them on Linode, and only `subnet`
     /// outbound. Replies come back: OVN's ACLs are stateful. Made if missing, and set
@@ -1970,6 +1993,43 @@ impl MachineProvider for Incus {
         Box::pin(async move {
             let v = self.call(Method::GET, &format!("/1.0/instances/{}", name(id)?), &[], None, None).await?.metadata;
             Ok(v["config"][TEAM_NIC_READY] != TEAM_NIC)
+        })
+    }
+
+    /// Only a team network botd made that nothing uses, in any project, whose ACL
+    /// nothing uses either. The ACL goes first, then the network, while the project's
+    /// access list still names it, then its name from the list.
+    fn remove_team_network<'a>(&'a self, t: &'a TeamNetwork) -> Fut<'a, bool> {
+        Box::pin(async move {
+            let n = name(&t.id)?;
+            let used = |v: &Value| v["used_by"].as_array().is_some_and(|u| !u.is_empty());
+            match self.call(Method::GET, &format!("/1.0/networks/{n}"), &[], None, None).await {
+                Ok(r) if Self::team_network(&r.metadata, false).is_none() => {
+                    return Err(api(409, format!("network {n} isn't an OVN network botd made for a team")));
+                }
+                Ok(r) if used(&r.metadata) => return Ok(false),
+                Ok(_) => {}
+                Err(ProviderError::NotFound) => {
+                    self.forget_network(n).await?;
+                    return Ok(true);
+                }
+                Err(e) => return Err(e),
+            }
+            match self.acl(n).await {
+                Ok(r) if used(&r.metadata) => return Ok(false),
+                Ok(_) => match self.call(Method::DELETE, &format!("/1.0/network-acls/{n}"), &[], None, None).await {
+                    Ok(_) | Err(ProviderError::NotFound) => {}
+                    Err(e) => return Err(e),
+                },
+                Err(ProviderError::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+            match self.call(Method::DELETE, &format!("/1.0/networks/{n}"), &[], None, None).await {
+                Ok(_) | Err(ProviderError::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+            self.forget_network(n).await?;
+            Ok(true)
         })
     }
 

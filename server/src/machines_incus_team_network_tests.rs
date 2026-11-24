@@ -39,7 +39,7 @@ async fn serve() -> Env {
     cp.regions = vec!["local".into()];
     let e = cp.enroll_with(Enrollment::for_tests(9, mport, 7443).with_agent(AGENT.as_bytes())).unwrap();
     cp.firewall_with(Settings { sources: Vec::new(), ssh: Vec::new() }).unwrap();
-    cp.team_network = Some(team_network::Settings { kind: team_network::Kind::Ovn, subnet: SUBNET.into(), join: team_network::Join::NextBoot });
+    cp.team_network = Some(team_network::Settings { kind: team_network::Kind::Ovn, subnet: SUBNET.into(), join: team_network::Join::NextBoot, remove: team_network::Remove::WhenEmpty });
     let cp = Arc::new(cp);
     let (port, app, owner, _) = crate::tests::serve_app_with(move |a| a.machines = cp).await;
     tokio::spawn(enroll::serve(machine_listener, app.clone(), e, None));
@@ -233,6 +233,36 @@ async fn a_container_made_before_team_networks_is_refused_once_until_rebuilt() {
     assert_eq!(r["firewallAttached"], 1, "the firewall sweep takes a NIC that isn't a team NIC off first: {r}");
     assert!(devices(&env, &md).get("eth1").is_none());
     assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "joining": 1 }), "then it joins");
+}
+
+#[tokio::test]
+async fn a_deleted_teams_network_goes_with_its_acl_and_its_name_once_its_containers_are_unplugged() {
+    let env = serve().await;
+    let (ada, _) = user_with(env.port, &env.admin, "ada@example.com", "member").await;
+    let (al, _) = user_with(env.port, &env.admin, "al@example.com", "member").await;
+    let acme = team(&env, "Acme", "ada@example.com").await;
+    join(&env, &acme, &al).await;
+    let (ma, ml) = (ask(&env, &ada).await, ask(&env, &al).await);
+    let net = devices(&env, &ma)["eth1"]["network"].as_str().unwrap().to_string();
+    assert_eq!(env.incus.w().projects["superbot"]["restricted.networks.access"], format!("incusbr0,{net}"));
+
+    let (code, v) = json_call(&env, "DELETE", &format!("/api/teams/{acme}"), "").await;
+    assert_eq!(code, 200, "{v}");
+    // Unplugged while running, then nothing is on it: it goes in the same pass.
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "left": 2, "removed": 1 }));
+    for m in [&ma, &ml] {
+        let i = env.incus.instance(&m.label).unwrap();
+        assert!(i.body["devices"].get("eth1").is_none() && i.status == "Running", "{}", i.body["devices"]);
+    }
+    {
+        let w = env.incus.w();
+        assert!(!w.networks.contains_key(&net) && !w.acls.contains_key(&net), "the network and its ACL");
+        assert_eq!(w.projects["superbot"]["restricted.networks.access"], "incusbr0", "and its name on the access list");
+        assert!(w.acls.contains_key("superbot-fw"), "the machines' firewall stays");
+    }
+    let removed = events(&env, "machine.team_network_removed").await;
+    assert_eq!((removed.len(), removed[0]["targetId"].as_str(), removed[0]["details"]["team"].as_str()), (1, Some(net.as_str()), Some(acme.as_str())), "{removed:?}");
+    assert!(reconcile(&env).await.get("teamNetworks").is_none());
 }
 
 #[tokio::test]

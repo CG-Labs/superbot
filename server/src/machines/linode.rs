@@ -851,6 +851,28 @@ impl MachineProvider for Linode {
         })
     }
 
+    /// Only a VPC none of whose subnets lists anything: Linodes, NodeBalancers, or
+    /// whatever else Linode puts on a subnet, by any list it gives. Linode refuses to
+    /// delete one with Linodes on it too.
+    fn remove_team_network<'a>(&'a self, n: &'a TeamNetwork) -> Fut<'a, bool> {
+        Box::pin(async move {
+            let id = path_id(&n.id)?;
+            let subnets = match self.all(&format!("/vpcs/{id}/subnets"), None).await {
+                Ok(s) => s,
+                Err(ProviderError::NotFound) => return Ok(true),
+                Err(e) => return Err(e),
+            };
+            let used = |s: &Value| s.as_object().is_none_or(|o| o.values().any(|v| v.as_array().is_some_and(|a| !a.is_empty())));
+            if subnets.iter().any(used) {
+                return Ok(false);
+            }
+            match self.call(Method::DELETE, &format!("/vpcs/{id}"), None, None).await {
+                Ok(_) | Err(ProviderError::NotFound) => Ok(true),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
     fn find_firewall<'a>(&'a self, label: &'a str) -> Fut<'a, Option<ProviderFirewall>> {
         Box::pin(async move {
             let filter = json!({ "label": label });
@@ -1218,12 +1240,42 @@ mod tests {
                     record(&s, "GET", format!("/vpcs/{id}"), &h, Value::Null);
                     (StatusCode::OK, Json(json!({ "id": id, "label": "superbot-team-bare-gb-lon", "region": "gb-lon",
                         "subnets": [{ "id": 61, "label": "machines", "ipv4": "10.248.0.0/22" }] })))
+                })
+                // Deleting a VPC (ADR 0236): 6 is empty, 2 is gone, and Linode refuses
+                // any other, as it would one with Linodes on it.
+                .delete(move |State(s): State<Seen>, h: HeaderMap, Path(id): Path<u64>| async move {
+                    record(&s, "DELETE", format!("/vpcs/{id}"), &h, Value::Null);
+                    match id {
+                        6 => (StatusCode::OK, Json(json!({}))),
+                        2 => (StatusCode::NOT_FOUND, Json(json!({ "errors": [{ "reason": "Not found" }] }))),
+                        _ => (StatusCode::BAD_REQUEST, Json(json!({ "errors": [{ "reason": "Cannot delete a VPC with Linodes assigned" }] }))),
+                    }
                 }),
             )
             .route(
                 "/v4/vpcs/{id}/subnets",
                 get(move |State(s): State<Seen>, h: HeaderMap, Path(id): Path<u64>| async move {
                     record(&s, "GET", format!("/vpcs/{id}/subnets"), &h, Value::Null);
+                    let empty = |more: Value| {
+                        let mut sub = json!({ "id": 61, "label": "machines", "ipv4": "10.248.0.0/22", "linodes": [], "nodebalancers": [] });
+                        sub.as_object_mut().unwrap().extend(more.as_object().cloned().unwrap_or_default());
+                        Json(json!({ "data": [sub], "page": 1, "pages": 1, "results": 1 }))
+                    };
+                    // 6 has nothing on it; 3 a NodeBalancer, 1 something Linode may list
+                    // one day, 9 a Linode in a second subnet; 2 is gone.
+                    match id {
+                        6 => return (StatusCode::OK, empty(json!({}))),
+                        3 => return (StatusCode::OK, empty(json!({ "nodebalancers": [{ "id": 33, "ipv4_range": "10.248.0.8/30" }] }))),
+                        1 => return (StatusCode::OK, empty(json!({ "databases": [{ "id": 11 }] }))),
+                        9 => {
+                            let mut two = empty(json!({})).0;
+                            two["data"].as_array_mut().unwrap().push(json!({ "id": 91, "label": "services", "ipv4": "10.250.0.0/24",
+                                "linodes": [{ "id": 30, "interfaces": [] }] }));
+                            return (StatusCode::OK, Json(two));
+                        }
+                        2 => return (StatusCode::NOT_FOUND, Json(json!({ "errors": [{ "reason": "Not found" }] }))),
+                        _ => {}
+                    }
                     (StatusCode::OK, Json(json!({ "data": [
                         { "id": 50, "label": "machines", "ipv4": "10.248.0.0/22", "linodes": [
                             { "id": 7, "interfaces": [{ "id": 701, "active": true, "config_id": 70 }] },
@@ -1839,6 +1891,25 @@ mod tests {
             ]
         );
         assert!(seen[0].2.is_none(), "every VPC, filtered here");
+    }
+
+    #[tokio::test]
+    async fn only_a_vpc_with_nothing_on_it_is_deleted() {
+        let (api, seen) = fake_api().await;
+        let n = |id: &str| TeamNetwork { id: id.into(), label: "superbot-team-gone-gb-lon".into(), region: "gb-lon".into(), subnet_id: String::new(), subnet: String::new(), created: false };
+        assert_eq!(api.remove_team_network(&n("6")).await, Ok(true), "empty");
+        assert_eq!(api.remove_team_network(&n("2")).await, Ok(true), "gone already");
+        for (id, what) in [("5", "Linodes"), ("3", "a NodeBalancer"), ("1", "something else Linode lists"), ("9", "a Linode on another subnet")] {
+            assert_eq!(api.remove_team_network(&n(id)).await, Ok(false), "{what}: kept");
+        }
+        assert!(api.remove_team_network(&n("../6")).await.is_err());
+        let seen = seen.lock().unwrap();
+        let calls: Vec<String> = seen.iter().map(|s| format!("{} {}", s.0, s.1)).collect();
+        assert_eq!(
+            calls,
+            ["GET /vpcs/6/subnets", "DELETE /vpcs/6", "GET /vpcs/2/subnets", "GET /vpcs/5/subnets", "GET /vpcs/3/subnets", "GET /vpcs/1/subnets", "GET /vpcs/9/subnets"],
+            "never a delete of one in use"
+        );
     }
 
     #[tokio::test]
