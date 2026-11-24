@@ -228,11 +228,19 @@ async fn a_run_it_started_as_keeper_stops_when_it_lets_the_bot_go_even_if_it_can
     // Its run, as keeper, has Ana's setup; handed to Bea, it can still use the shared Bot, but that run ends.
     send(port, &tok, &ci, "check the PR").await;
     run_token(&env).await;
+    let before = app.db.last_id();
+    send(port, &ana_auth, &ci, "Ana's, behind it").await;
     assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, &owner(&bea)).await.0, 200);
     let (_, list) = json_call(port, "GET", "/api/bots", &tok, "").await;
     assert_eq!(access_of(&list, &ci).as_deref(), Some("operate"), "{list}");
-    until("the keeper's run never stopped", || app.live_run(&ci).is_none()).await;
+    // Ana's queued message still runs, on its own.
+    run_token(&env).await;
     std::fs::write(app.cfg.bin_dir.join("claude.go"), "").unwrap();
+    until("Ana's message was dropped", || !app.busy(&ci)).await;
+    let replies = app.db.replies_after(&ci, before);
+    assert_eq!(replies.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(), ["Stopped.", "done"], "its run stopped, Ana's ran");
+    let invoked = events(port, &admin, &format!("harness.invoked&bot={ci}")).await;
+    assert_eq!(invoked.len(), 2, "{invoked:?}");
 }
 
 /// A stand-in `claude` that says whether it got Ada's key, her fact, a list naming her

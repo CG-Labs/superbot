@@ -526,15 +526,14 @@ fn bots_view(app: &AppState, sa: &ServiceAccount) -> Value {
 pub const MAX_KEPT_BOTS: u32 = 20;
 
 /// Records each Bot in `ids`, which `id` no longer keeps, as `bot.service_account_released`
-/// with `reason`, and stops the runs it asked for there: they started as its owner's, with
-/// their keys (ADR 0222). The triggers of ADR 0222 already let them go. Returns how many.
+/// with `reason`, and stops the run it has going there: that started as its owner's, with
+/// their keys (ADR 0222). Others' queued work stays. The triggers of ADR 0222 already let
+/// them go. Returns how many.
 pub fn note_released(app: &AppState, by: &Who, id: &str, ids: &[String], reason: &str) -> usize {
     for bot in ids {
         let d = json!({ "serviceAccount": id, "reason": reason, "owner": app.db.bot(bot).map(|b| b.owner_id) });
         app.db.record(&by.event("bot.service_account_released").target("bot", bot).bot(bot).details(d));
-        if let Some(b) = app.db.bot(bot).filter(|b| app.live_run(&b.id).is_some() && app.requested_by(b) == id) {
-            app.stop(&b.id);
-        }
+        app.stop_run_for(bot, id);
     }
     ids.len()
 }

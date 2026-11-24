@@ -2556,6 +2556,31 @@ impl App {
         stopped
     }
 
+    /// Stops the Bot's current run if it is for `user_id`, started or not. Its queue
+    /// stays: queued work is checked again when it starts. Whether it stopped one.
+    pub fn stop_run_for(&self, bot_id: &str, user_id: &str) -> bool {
+        {
+            let mut st = self.state();
+            let Some(s) = st.get_mut(bot_id) else { return false };
+            if !s.serving.as_ref().is_some_and(|n| n.iter().any(|u| u == user_id)) {
+                return false;
+            }
+            match &s.run {
+                Some(r) => {
+                    r.abort.send_if_modified(|v| v.get_or_insert("stopped") == &"stopped");
+                }
+                None => {
+                    s.stopped = true;
+                    if let Some(w) = &s.wake {
+                        w.notify_one();
+                    }
+                }
+            }
+        }
+        self.cancel_approvals(bot_id, "The Bot was stopped");
+        true
+    }
+
     /// Whether the Bot has a run going, starting, or queued.
     pub fn busy(&self, bot_id: &str) -> bool {
         self.state().get(bot_id).is_some_and(|s| s.run.is_some() || s.serving.is_some() || !s.queue.is_empty())
