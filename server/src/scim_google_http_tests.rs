@@ -664,9 +664,19 @@ async fn declared_role_groups_give_roles_and_undeclared_ones_are_never_pushed() 
     let (code, v) = call(w.port, "POST", "/api/roles", &w.admin, r#"{"name":"Auditor","base":"member","permissions":["audit.view"]}"#).await;
     assert_eq!(code, 201, "{v}");
     let auditor = parse(&v)["id"].as_str().unwrap().to_string();
+    // The console offers the listed groups nobody declared (ADR 0253), in the sync's tenant.
+    let choices = |w: &World| {
+        let (port, admin) = (w.port, w.admin.clone());
+        async move { parse(&call(port, "GET", "/api/scim/role-groups", &admin, "").await.1)["choices"].clone() }
+    };
+    let c = choices(&w).await;
+    assert_eq!(c["tenants"], json!([TENANT]), "{c}");
+    let both = json!([{ "tenant": TENANT, "displayName": "auditors@example.com" }, { "tenant": TENANT, "displayName": "billing@example.com" }]);
+    assert_eq!(c["undeclared"], both);
     let (code, v) = call(w.port, "POST", "/api/scim/role-groups", &w.admin, &json!({ "tenant": TENANT, "displayName": "Auditors@example.com", "role": "Auditor" }).to_string()).await;
     assert_eq!(code, 201, "{v}");
     let gid = parse(&v)["id"].as_str().unwrap().to_string();
+    assert_eq!(choices(&w).await["undeclared"], json!([{ "tenant": TENANT, "displayName": "billing@example.com" }]), "declared in any case");
 
     let res = synced(&w).await;
     assert_eq!((res["created"].as_u64(), res["teams"]["created"].as_u64()), (Some(3), Some(1)), "{res}");
@@ -683,6 +693,7 @@ async fn declared_role_groups_give_roles_and_undeclared_ones_are_never_pushed() 
 
     let again = synced(&w).await;
     assert_eq!((again["roleGroups"]["created"].as_u64(), again["roleGroups"]["updated"].as_u64()), (Some(0), Some(0)), "{again}");
+    assert_eq!(choices(&w).await["undeclared"].as_array().map(Vec::len), Some(1), "still declared once pushed");
 
     g.members("auditors@example.com", vec![member("102")]);
     let res = synced(&w).await;
@@ -696,6 +707,18 @@ async fn declared_role_groups_give_roles_and_undeclared_ones_are_never_pushed() 
     assert_eq!((res["roleGroups"]["deleted"].as_u64(), res["roleGroups"]["created"].as_u64()), (Some(1), Some(1)), "{res}");
     assert_eq!(w.app.db.scim_role_group(&gid).unwrap().external_id.as_deref(), Some("g3"));
     assert_eq!(w.app.db.user(&bob).unwrap().role_id.as_deref(), Some(auditor.as_str()));
+
+    // Declared by its Directory id under another name: matched by the id a pass read, as
+    // the next pass will match it; removed, it's listed again at once.
+    let body = json!({ "tenant": TENANT, "displayName": "Billing role", "externalId": "g4", "role": "Auditor" });
+    let (code, v) = call(w.port, "POST", "/api/scim/role-groups", &w.admin, &body.to_string()).await;
+    assert_eq!(code, 201, "{v}");
+    let billing = parse(&v)["id"].as_str().unwrap().to_string();
+    assert_eq!(choices(&w).await["undeclared"], json!([]), "declared by id");
+    let res = synced(&w).await;
+    assert_eq!(res["roleGroups"]["undeclared"], json!([]), "and the pass agrees: {res}");
+    assert_eq!(call(w.port, "DELETE", &format!("/api/scim/role-groups/{billing}"), &w.admin, "").await.0, 200);
+    assert_eq!(choices(&w).await["undeclared"], json!([{ "tenant": TENANT, "displayName": "billing@example.com" }]), "removed, it's listed again");
 }
 
 #[tokio::test]

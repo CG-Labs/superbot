@@ -422,6 +422,25 @@
 
       <h3>Group roles</h3>
       <p class="hint" id="scim-roles-info"></p>
+      <form class="bar" id="scim-map-form" autocomplete="off" hidden>
+        <select id="scim-map-group" title="A team's SCIM group with no mapping in some scope yet"></select>
+        <select id="scim-map-scope" title="Where its members hold the role"></select>
+        <select id="scim-map-role" title="Only custom roles SCIM may give there"></select>
+        <button type="submit" class="btn primary">Map group</button>
+      </form>
+      <form class="bar" id="scim-rg-form" autocomplete="off" hidden>
+        <input id="scim-rg-tenant" list="scim-rg-tenants" placeholder="Tenant, e.g. entra" required spellcheck="false" />
+        <datalist id="scim-rg-tenants"></datalist>
+        <input id="scim-rg-name" placeholder="Group name, as the IdP pushes it" required maxlength="256" />
+        <input id="scim-rg-external" placeholder="externalId (optional)" maxlength="256" spellcheck="false" />
+        <select id="scim-rg-scope" title="Where its members hold the role">
+          <option value="org">Across the server</option>
+          <option value="team">In each member's team</option>
+        </select>
+        <select id="scim-rg-role" title="Only custom roles SCIM may give there"></select>
+        <button type="submit" class="btn primary">Declare role group</button>
+      </form>
+      <p class="hint" id="scim-rg-undeclared" hidden></p>
       <table class="grid">
         <thead><tr><th>Group</th><th>Tenant</th><th>Role</th><th>Where</th><th>Holders</th><th></th></tr></thead>
         <tbody id="scim-roles-rows"></tbody>

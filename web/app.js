@@ -1842,32 +1842,155 @@ async function loadScim() {
 }
 
 // SCIM groups mapped to custom roles (ADR 0138), and role groups (ADR 0180, within a
-// team ADR 0206): listed and removed here; made with botctl.
+// team ADR 0206): mapped, declared, changed and removed here (ADR 0253). The pickers hold
+// only what the server's `choices` say it would take; it checks everything again.
+const NO_SCIM_CHOICES = { roles: { org: [], team: [] }, groups: [], tenants: [], undeclared: [] };
+let scimChoices = NO_SCIM_CHOICES, scimRoleGroups = [];
+const SCOPE_NAMES = { org: "Across the server", team: "In its team" };
+const SKIPS = {
+  admin: "admins", owner: "the owner account", has_role: "people holding a custom role already", readonly: "read-only people",
+  not_on_team: "people on none of the tenant's team groups", reaches_admins: "a role that reaches admins",
+};
+
+function scimRoleOptions(scope, current) {
+  const list = scimChoices.roles[scope] || [];
+  const kept = current && !list.some((r) => r.id === current.id) ? [{ ...current, kept: true }] : [];
+  if (!list.length && !kept.length) return `<option value="">No custom role SCIM may give ${scope === "org" ? "across the server" : "in a team"}</option>`;
+  return kept.concat(list).map((r) => `<option value="${esc(r.id)}" ${r.id === current?.id ? "selected" : ""}>${esc(r.name)}${r.kept ? " (no longer allowed)" : ` (${r.applies?.length ? esc(r.applies.join(", ")) : "gives nothing there"})`}</option>`).join("");
+}
+
+function fillScimRoles(id, scope) {
+  const el = $(id), keep = el.value;
+  el.innerHTML = scimRoleOptions(scope);
+  if ((scimChoices.roles[scope] || []).some((r) => r.id === keep)) el.value = keep;
+}
+
+function fillScimMapScopes() {
+  const g = scimChoices.groups.find((x) => x.team.id === $("scim-map-group").value);
+  const s = $("scim-map-scope"), keep = s.value;
+  s.innerHTML = (g ? g.scopes : []).map((v) => `<option value="${v}">${SCOPE_NAMES[v]}</option>`).join("");
+  if (g?.scopes.includes(keep)) s.value = keep;
+  fillScimRoles("scim-map-role", s.value || "team");
+}
+
+function renderScimForms(enabled) {
+  $("scim-map-form").hidden = $("scim-rg-form").hidden = !enabled;
+  const undeclared = enabled ? scimChoices.undeclared : [];
+  $("scim-rg-undeclared").hidden = !undeclared.length;
+  $("scim-rg-undeclared").innerHTML = undeclared.length
+    ? `Listed in GOOGLE_DIRECTORY_ROLE_GROUPS but not declared, so the sync skips them: ${undeclared.map((u) => `<button type="button" class="btn" data-tenant="${esc(u.tenant)}" data-name="${esc(u.displayName)}">${esc(u.displayName)}</button>`).join(" ")}`
+    : "";
+  if (!enabled) return;
+  const g = $("scim-map-group"), keep = g.value;
+  g.innerHTML = scimChoices.groups.length
+    ? scimChoices.groups.map((x) => `<option value="${esc(x.team.id)}">${esc(x.displayName)} (${esc(x.tenant)})</option>`).join("")
+    : '<option value="">No team group left to map</option>';
+  if (scimChoices.groups.some((x) => x.team.id === keep)) g.value = keep;
+  fillScimMapScopes();
+  $("scim-rg-tenants").innerHTML = scimChoices.tenants.map((t) => `<option value="${esc(t)}"></option>`).join("");
+  fillScimRoles("scim-rg-role", $("scim-rg-scope").value);
+}
+
+// Who a mapping or role group gave its role to now, and who it skipped and why.
+function scimGiven(r) {
+  const n = (k) => `${k} ${k === 1 ? "person" : "people"}`;
+  const why = {};
+  for (const s of r.skipped || []) why[s.reason] = (why[s.reason] || 0) + 1;
+  const skips = Object.entries(why).map(([k, c]) => `${c} ${SKIPS[k] || k}`).join(", ");
+  const taken = r.revoked?.length ? ` Taken from ${n(r.revoked.length)}.` : "";
+  return `${r.role?.name || "The role"} given to ${n((r.granted || []).length)}.${taken}${skips ? ` Skipped: ${skips}.` : ""}`;
+}
+
 async function loadScimRoles() {
-  let maps = [], groups = [];
+  let maps = [], enabled = false;
+  scimRoleGroups = [];
   try {
     const [r, g] = await Promise.all([api("GET", "/api/scim/role-mappings"), api("GET", "/api/scim/role-groups")]);
     maps = r.mappings || [];
-    groups = g.roleGroups || [];
+    scimRoleGroups = g.roleGroups || [];
+    enabled = r.enabled;
+    scimChoices = { ...NO_SCIM_CHOICES, ...g.choices, groups: r.choices?.groups || [] };
     $("scim-roles-info").textContent = r.enabled
-      ? "Members of a mapped group, or of a role group, hold its custom role while they're in it. Map a team's group with botctl scim role map <team> <role> [--org]; declare a role group with botctl scim role-group add <tenant> <group> <role> [--team]. Never admin."
+      ? "Members of a mapped group, or of a role group, hold its custom role while they're in it. Map a team's group, or declare a group that only gives a role, before the IdP pushes it: pushed first, it becomes a team. Never admin, nor a role that reaches admins."
       : "Group roles are off (SCIM_GROUP_ROLES=on, with SCIM_GROUPS=on, turns them on). Roles that mappings and role groups gave are still taken back when people leave.";
     $("scim-roles-empty").textContent = "No groups are mapped to roles.";
   } catch (err) {
+    scimChoices = NO_SCIM_CHOICES;
     $("scim-roles-info").textContent = "";
     $("scim-roles-empty").textContent = err.message;
   }
-  $("scim-roles-empty").hidden = maps.length + groups.length > 0;
+  renderScimForms(enabled);
+  $("scim-roles-empty").hidden = maps.length + scimRoleGroups.length > 0;
+  const roleCell = (g) => enabled
+    ? `<select data-act="rg-role" title="The role this group gives">${scimRoleOptions(g.scope, g.role)}</select>`
+    : esc(g.role ? g.role.name : "");
   $("scim-roles-rows").innerHTML = maps.map((m) => `<tr data-mapping="${esc(m.id)}">
       <td>${esc(m.group || m.team.name || m.team.id)}</td><td>${esc(m.tenant)}</td><td>${esc(m.role ? m.role.name : "")}</td>
-      <td>${m.scope === "org" ? "Across the server" : "In its team"}</td><td>${esc(String(m.grants))}</td>
+      <td>${SCOPE_NAMES[m.scope] || esc(m.scope)}</td><td>${esc(String(m.grants))}</td>
       <td class="actions"><button type="button" class="btn" data-act="unmap">Remove</button></td>
-    </tr>`).join("") + groups.map((g) => `<tr data-role-group="${esc(g.id)}">
-      <td>${esc(g.displayName)}</td><td>${esc(g.tenant)}</td><td>${esc(g.role ? g.role.name : "")}</td>
+    </tr>`).join("") + scimRoleGroups.map((g) => `<tr data-role-group="${esc(g.id)}">
+      <td>${esc(g.displayName)}</td><td>${esc(g.tenant)}</td><td>${roleCell(g)}</td>
       <td>Role group, ${g.scope === "team" ? "in each member's team" : "across the server"}${g.state === "waiting" ? " (waiting for the IdP)" : ""}</td><td>${esc(String(g.grants))}</td>
       <td class="actions"><button type="button" class="btn" data-act="unmap">Remove</button></td>
     </tr>`).join("");
 }
+
+$("scim-map-group").addEventListener("change", fillScimMapScopes);
+$("scim-map-scope").addEventListener("change", () => fillScimRoles("scim-map-role", $("scim-map-scope").value));
+$("scim-rg-scope").addEventListener("change", () => fillScimRoles("scim-rg-role", $("scim-rg-scope").value));
+
+$("scim-map-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const team = $("scim-map-group").value, scope = $("scim-map-scope").value, role = $("scim-map-role").value;
+  if (!team || !scope || !role) return notice("Pick a team group, where it applies, and a role SCIM may give there.");
+  try {
+    notice(`Mapped. ${scimGiven(await api("POST", "/api/scim/role-mappings", { team, scope, role }))}`, false);
+  } catch (err) {
+    fail(err);
+  }
+  loadScimRoles();
+});
+
+$("scim-rg-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const role = $("scim-rg-role").value;
+  if (!role) return notice("Pick a role SCIM may give there.");
+  const body = { tenant: $("scim-rg-tenant").value.trim(), displayName: $("scim-rg-name").value.trim(), scope: $("scim-rg-scope").value, role };
+  const externalId = $("scim-rg-external").value.trim();
+  if (externalId) body.externalId = externalId;
+  try {
+    const g = await api("POST", "/api/scim/role-groups", body);
+    for (const id of ["scim-rg-name", "scim-rg-external"]) $(id).value = "";
+    notice(`Declared ${g.displayName} in ${g.tenant}. It gives ${g.role?.name || "its role"} once the IdP pushes the group, so assign the group in the IdP now.`, false);
+  } catch (err) {
+    fail(err);
+  }
+  loadScimRoles();
+});
+
+$("scim-rg-undeclared").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-name]");
+  if (!b) return;
+  $("scim-rg-tenant").value = b.dataset.tenant;
+  $("scim-rg-name").value = b.dataset.name;
+  $("scim-rg-external").value = "";
+  $("scim-rg-role").focus();
+});
+
+$("scim-roles-rows").addEventListener("change", async (e) => {
+  if (e.target.dataset.act !== "rg-role") return;
+  const g = scimRoleGroups.find((x) => x.id === e.target.closest("tr").dataset.roleGroup);
+  const to = (scimChoices.roles[g?.scope] || []).find((r) => r.id === e.target.value);
+  if (!g || !to) return loadScimRoles();
+  if (!confirm(`Make ${g.displayName} give ${to.name} instead of ${g.role?.name || "its role"}? Everyone it gave the old role to loses it, then its members are offered ${to.name}. Roles given by hand stay.`)) return loadScimRoles();
+  try {
+    const r = await api("PATCH", `/api/scim/role-groups/${key(g.id)}`, { role: to.id });
+    notice(r.state === "waiting" ? `Changed. It gives ${to.name} once the IdP pushes the group.` : `Changed. ${scimGiven(r)}`, false);
+  } catch (err) {
+    fail(err);
+  }
+  loadScimRoles();
+});
 
 $("scim-roles-rows").addEventListener("click", async (e) => {
   const t = e.target.closest("button[data-act=unmap]");
