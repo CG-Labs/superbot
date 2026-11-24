@@ -568,12 +568,25 @@ fn respond(world: &Mutex<World>, peer: pki::Peer, method: Method, uri: Uri, head
             if let Some(pool) = header("x-incus-pool") {
                 kept["devices"]["root"]["pool"] = json!(pool);
             }
-            // `<device>,<key>=<value>` entries, space-separated, merged into the saved devices.
-            for entry in header("x-incus-devices").unwrap_or_default().split(' ').filter(|e| !e.is_empty()) {
-                let Some((dev, (k, v))) = entry.split_once(',').and_then(|(d, kv)| Some((d, kv.split_once('=')?))) else {
-                    return err(400, &format!("Failed to parse device <device>,<key>=<value>: {entry:?}"));
-                };
-                kept["devices"][dev][k] = json!(v);
+            // As Incus: `device,key=value` entries, space-separated; an empty value unsets.
+            if let Some(over) = header("x-incus-devices") {
+                if w.missing_extensions.iter().any(|m| m == "backup_override_config") {
+                    return err(400, "backup_override_config isn't supported");
+                }
+                for entry in over.split(' ') {
+                    let Some((dev, (k, v))) = entry.split_once(',').and_then(|(d, kv)| Some((d, kv.split_once('=')?))) else {
+                        return err(400, &format!("Failed to parse device, =: {entry:?}"));
+                    };
+                    if !kept["devices"][dev].is_object() {
+                        kept["devices"][dev] = json!({});
+                    }
+                    let d = kept["devices"][dev].as_object_mut().unwrap();
+                    if v.is_empty() {
+                        d.remove(k);
+                    } else {
+                        d.insert(k.into(), json!(v));
+                    }
+                }
             }
             if let Some(why) = w.refused(&project, &kept).or_else(|| w.acls_exist(&kept)).or_else(|| w.networks_exist(&kept)) {
                 return err(400, &why);

@@ -790,27 +790,42 @@ async fn a_team_network_is_an_isolated_ovn_network_with_its_own_acl() {
 }
 
 #[tokio::test]
-async fn a_team_machine_is_restored_onto_a_host_without_its_teams_network() {
-    let project = json!({ "restricted": "true", "restricted.backups": "allow", "restricted.networks.access": "incusbr0" });
+async fn a_team_members_backup_imports_onto_a_host_that_never_had_the_teams_network() {
     let a = StandIn::start().await;
-    a.w().projects.insert("superbot".into(), project.clone());
-    let p = incus(&a).with_team_subnet("10.248.0.0/22").unwrap();
-    let n = p.ensure_team_network("superbot-team-0123456789ab-local", "local", "10.248.0.0/22").await.unwrap();
-    p.create_firewall("superbot-fw", &[], &[agent_rule()]).await.unwrap();
-    p.create(&CreateSpec { subnet_id: Some(n.subnet_id.clone()), ..spec("superbot-m1", "c1-m2-d20") }).await.unwrap();
-    p.create_backup("superbot-m1", "b1").await.unwrap();
+    let pa = incus(&a).with_team_subnet("10.248.0.0/22").unwrap();
+    let n = pa.ensure_team_network("superbot-team-0123456789ab-local", "local", "10.248.0.0/22").await.unwrap();
+    pa.create_firewall("superbot-fw", &[], &[agent_rule()]).await.unwrap();
+    pa.create(&CreateSpec { subnet_id: Some(n.subnet_id.clone()), ..spec("superbot-m1", "c1-m2-d20") }).await.unwrap();
+    let saved = json!({ "body": a.instance("superbot-m1").unwrap().body, "files": {} });
+    assert_eq!(saved["body"]["devices"]["eth1"]["network"], n.id.as_str());
+    let backup = || -> ByteStream { Box::pin(futures_util::stream::iter([Ok(axum::body::Bytes::from(saved.to_string()))])) };
 
-    // Another host: its firewall, but never this team's network or ACL.
+    // Host b has the firewall but neither the team's network nor its ACL.
     let b = StandIn::start().await;
-    b.w().projects.insert("superbot".into(), project);
-    let off = incus(&b);
-    off.create_firewall("superbot-fw", &[], &[agent_rule()]).await.unwrap();
-    let e = off.import_backup("superbot-m1-r", p.export_backup("superbot-m1", "b1").await.unwrap()).await.unwrap_err();
-    assert!(e.to_string().contains(&format!("Network \"{}\" is not allowed", n.id)), "without the override: {e}");
+    let pb = incus(&b);
+    pb.create_firewall("superbot-fw", &[], &[agent_rule()]).await.unwrap();
+    pb.import_backup("superbot-m1-restore", backup()).await.unwrap();
+    let nic = b.instance("superbot-m1-restore").unwrap().body["devices"]["eth1"].clone();
+    assert_eq!((nic["network"].as_str(), nic["name"].as_str()), (Some("incusbr0"), Some("eth1")), "{nic}");
+    assert!(nic.get("security.acls").is_none() && nic.get("security.acls.default.egress.action").is_none(), "{nic}");
+    let spec = RestoreSpec {
+        plan: "c1-m2-d20".into(),
+        tags: vec!["superbot".into()],
+        authorized_keys: Vec::new(),
+        firewall_id: Some("superbot-fw".into()),
+        files: Vec::new(),
+        remove: Vec::new(),
+    };
+    pb.prepare("superbot-m1-restore", &spec).await.unwrap();
+    let devices = b.instance("superbot-m1-restore").unwrap().body["devices"].clone();
+    assert!(devices.get("eth1").is_none(), "{devices}");
+    assert_eq!(devices["eth0"]["security.acls"], "superbot-fw");
 
-    let on = incus(&b).with_team_subnet("10.248.0.0/22").unwrap();
-    on.import_backup("superbot-m1-r", p.export_backup("superbot-m1", "b1").await.unwrap()).await.unwrap();
-    let eth1 = &b.instance("superbot-m1-r").unwrap().body["devices"]["eth1"];
-    assert_eq!((&eth1["network"], &eth1["security.acls"]), (&json!("incusbr0"), &json!("")), "{eth1}");
-    assert!(!b.w().networks.contains_key(&n.id) && !b.w().acls.contains_key(&n.id), "nothing made for the team here");
+    // An Incus that can't override devices on import is sent none, as before.
+    let c = StandIn::start().await;
+    c.w().missing_extensions = vec!["backup_override_config".into()];
+    let pc = incus(&c);
+    pc.create_firewall("superbot-fw", &[], &[agent_rule()]).await.unwrap();
+    let e = pc.import_backup("superbot-m1-restore", backup()).await.unwrap_err();
+    assert!(e.to_string().contains(n.id.as_str()), "{e}");
 }

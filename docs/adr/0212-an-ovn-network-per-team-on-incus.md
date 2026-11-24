@@ -31,7 +31,7 @@ We chose option 3.
 - `MACHINE_TEAM_NETWORK=ovn` with `MACHINE_PROVIDER=incus`. `vpc` on Incus, or `ovn` on Linode, makes botd refuse to start, naming the right one.
 - `MACHINE_TEAM_NETWORK_SUBNET` (default `10.248.0.0/22`) may be anywhere in RFC 1918, a `/29` or larger. Linode's narrower VPC ranges still apply to `vpc`.
 - The subnet must not meet anything containers reach or are kept off through `eth0`: botd's machine address (`MACHINE_CONTROL_URL`), an `INCUS_EGRESS_ALLOW` address, an `INCUS_EGRESS_DENY` range or an Incus host. The team NIC's route would take that traffic, so botd would be unreachable, or the denied range reachable. botd refuses to start if it does.
-- At each create and in the admin check, botd also asks Incus for `network_ovn_isolated`, `backup_override_config` (Incus 6.17, for restores below) and the bridge's own range. A subnet meeting the bridge's would take over containers' default route. Either failing holds the create back, with the reason on the machine.
+- At each create and in the admin check, botd also asks Incus for `network_ovn_isolated`, `backup_override_config` (Incus 6.17, for restores below) and the bridge's own range. A subnet meeting the bridge's would take over containers' default route. Any of them failing holds the create back, with the reason on the machine.
 
 ### The network
 
@@ -75,7 +75,8 @@ With several Incus hosts (ADR 0076), each host has its own team networks. botd l
 - Incus hosts need OVN: an OVN northbound database Incus is pointed at (`network.ovn.northbound_connection`) and `ovn-controller` on every host. No uplink network is needed, since team networks have none.
 - Joining and leaving don't restart containers on Incus. A run in progress goes on.
 - botd now edits the project's network access list, only to add team networks. It never removes them. The list grows by one name per team and region.
-- A restore or a move to another host (ADR 0076) puts the container back with `eth0` only. The sweep puts `eth1` back on the next pass, unless `MACHINE_TEAM_NETWORK_JOIN=off`. A backup's saved `eth1` names a network and ACL the target host may not have, and Incus checks every device on import, so botd imports it with `eth1` pointed at the bridge and no ACL (`X-Incus-devices`). The copy is stopped then, and `eth1` is replaced before it starts.
+- A restore or a move to another host (ADR 0076) puts the container back with `eth0` only. The sweep puts `eth1` back on the next pass, unless `MACHINE_TEAM_NETWORK_JOIN=off`.
+- A backup's `eth1` names the team network and ACL on the host it came from. Incus won't import a backup whose devices it can't load, and a host that never served the team has neither. So the import sends `X-Incus-devices` (the `backup_override_config` extension), which puts `eth1` on the host's own bridge with no ACL. The copy stays stopped until the restore replaces every device. An Incus without that extension gets no override, as before. Team networks need it (above), so only a host with team networks off can lack it, and a restore of a team member's container onto it fails until the team has a machine there.
 - Networks and ACLs of teams that are gone stay until an admin removes them, as VPCs do.
 
 ## Tests
