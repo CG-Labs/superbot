@@ -7,7 +7,8 @@
 //! since approval or past its yearly review, an acknowledgement or training overdue, a risk
 //! unreviewed or accepted without management, a quarter without a management review, a
 //! vendor unassessed or unreviewed, an exception over a year or unreviewed, a server's
-//! baseline exception the register never approved) and writes a dated bundle in the shape
+//! baseline exception the register never approved, a conduct concern triaged or closed
+//! late) and writes a dated bundle in the shape
 //! of the others, which the coverage report checks (ADR 0169).
 //!
 //! Never in it: names, titles, notes or reasons from the register, nor the register
@@ -22,8 +23,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-/// Bumped when a file's shape changes.
-pub const FORMAT: u32 = 1;
+/// Bumped when a file's shape changes: 2 added `conduct.json` (ADR 0214).
+pub const FORMAT: u32 = 2;
 pub const PREFIX: &str = "superbot-register-";
 /// The register's own format, in its `superbotRegister` field.
 pub const REGISTER_FORMAT: u64 = 1;
@@ -35,9 +36,19 @@ const MAX_BASELINE_BYTES: u64 = 4 << 20;
 /// The roles of the information security policy's roles table.
 pub const ROLES: [&str; 6] = ["Management", "Security owner", "Engineering lead", "Operator", "People lead", "Privacy lead"];
 /// The policy set, by file name, when no `--policies` folder is given.
-pub const POLICIES: [&str; 8] = ["information-security", "access-control", "change-management", "incident-response", "vendor-management", "business-continuity", "data-classification-and-retention", "acceptable-use"];
+pub const POLICIES: [&str; 9] = ["information-security", "access-control", "change-management", "incident-response", "vendor-management", "business-continuity", "data-classification-and-retention", "acceptable-use", "code-of-conduct"];
 /// The policies everyone with access acknowledges at hire and yearly (policy set README).
-pub const ACKNOWLEDGED: [&str; 2] = ["information-security", "acceptable-use"];
+pub const ACKNOWLEDGED: [&str; 3] = ["information-security", "acceptable-use", "code-of-conduct"];
+/// The code of conduct and ethics policy (CC1.1-1, ADR 0214).
+pub const CODE_OF_CONDUCT: &str = "code-of-conduct";
+/// A conduct concern is triaged within this many days of being received, and closed
+/// within the next (code of conduct, "Handling concerns").
+pub const CONCERN_TRIAGE_DAYS: i64 = 7;
+pub const CONCERN_CLOSE_DAYS: i64 = 90;
+/// The roles whose holders or deputies may triage a conduct concern.
+pub const CONCERN_HANDLERS: [&str; 3] = ["People lead", "Management", "Security owner"];
+/// How a conduct concern is closed.
+pub const CONCERN_OUTCOMES: [&str; 4] = ["substantiated", "not-substantiated", "withdrawn", "referred"];
 /// The training everyone takes at onboarding and yearly (information security policy).
 pub const AWARENESS: &str = "security-awareness";
 
@@ -61,7 +72,7 @@ pub const MAX_PERIOD_DAYS: i64 = 31;
 /// a file to a row only while the register holds a current record for it (a role filled
 /// in the period, an approval within a year, a management review within a quarter), so a
 /// register that stopped being kept shows as a gap in the coverage report.
-pub const SECTIONS: [Section; 7] = [
+pub const SECTIONS: [Section; 8] = [
     Section { file: "roles.json", criteria: &["CC1.3"], rows: &["CC1.3-1"] },
     Section { file: "policies.json", criteria: &["CC3.1", "CC5.3"], rows: &["CC3.1-1", "CC5.3-1"] },
     Section { file: "people.json", criteria: &["CC1.4", "CC2.2"], rows: &["CC1.4-1", "CC2.2-1"] },
@@ -69,7 +80,12 @@ pub const SECTIONS: [Section; 7] = [
     Section { file: "management-reviews.json", criteria: &["CC1.2"], rows: &["CC1.2-1"] },
     Section { file: "vendors.json", criteria: &["CC6.4", "CC9.2"], rows: &["CC6.4-1", "CC9.2-1"] },
     Section { file: "policy-exceptions.json", criteria: &["CC5.1"], rows: &["CC5.1-1"] },
+    Section { file: "conduct.json", criteria: &["CC1.1"], rows: &["CC1.1-1"] },
 ];
+
+/// Files bundles of an older format don't have, and the format that added each, so the
+/// coverage report still verifies bundles made before them.
+pub const SINCE_FORMAT: [(&str, u64); 1] = [("conduct.json", 2)];
 
 const README: &str = "SuperBot policy register bundle
 ===============================
@@ -93,6 +109,8 @@ after the period are left out.
   vendors.json             vendors in use, assessed before use and reviewed yearly
   policy-exceptions.json   exceptions in force, their approvals, ends and quarterly
                            reviews, and each server's baseline exceptions held to them
+  conduct.json             the code of conduct's approval and acknowledgements, and
+                           conduct concerns, triaged and closed in time, by outcome
   manifest.json            what is in this bundle, the period, the register's SHA-256,
                            and each file's SHA-256
   SHA256SUMS               the same digests, for `sha256sum -c SHA256SUMS`
@@ -151,6 +169,8 @@ pub struct Register {
     pub vendors: Vec<Vendor>,
     #[serde(default)]
     pub exceptions: Vec<PolicyException>,
+    #[serde(default)]
+    pub conduct_concerns: Vec<ConductConcern>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -312,6 +332,27 @@ pub struct PolicyException {
     pub notes: Option<String>,
 }
 
+/// A concern raised under the code of conduct, by id only: who raised it, who it is about
+/// and what it says stay in the people lead's case file.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ConductConcern {
+    pub id: String,
+    #[serde(deserialize_with = "day")]
+    pub received: NaiveDate,
+    #[serde(default, deserialize_with = "opt_day")]
+    pub triaged: Option<NaiveDate>,
+    #[serde(default)]
+    pub handled_by: Option<String>,
+    #[serde(default, deserialize_with = "opt_day")]
+    pub closed: Option<NaiveDate>,
+    #[serde(default)]
+    pub outcome: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code, reason = "accepted in the register, never put in evidence")]
+    pub notes: Option<String>,
+}
+
 /// A policy the register's approvals and acknowledgements may name.
 #[derive(Clone, Debug)]
 pub struct Policy {
@@ -412,6 +453,7 @@ pub fn parse(bytes: &[u8], policies: &[Policy]) -> Result<Register, String> {
     unique("risk", r.risks.iter().map(|x| x.id.as_str()).collect(), &mut bad);
     unique("vendor", r.vendors.iter().map(|x| x.id.as_str()).collect(), &mut bad);
     unique("exception", r.exceptions.iter().map(|x| x.id.as_str()).collect(), &mut bad);
+    unique("conduct concern", r.conduct_concerns.iter().map(|x| x.id.as_str()).collect(), &mut bad);
     if r.risk_appetite.is_some_and(|a| !(1..=25).contains(&a)) {
         bad.push("riskAppetite is a score from 1 to 25 (likelihood times impact)".into());
     }
@@ -520,6 +562,27 @@ pub fn parse(bytes: &[u8], policies: &[Policy]) -> Result<Register, String> {
         }
         if x.setting.as_deref().is_some_and(|s| !setting_name(s)) {
             bad.push(format!("{what}: setting is a configuration baseline setting's name, as in BASELINE_EXCEPTIONS"));
+        }
+    }
+    for x in &r.conduct_concerns {
+        let what = format!("conduct concern {}", x.id);
+        if x.triaged.is_some() != x.handled_by.is_some() {
+            bad.push(format!("{what}: triaged and handledBy go together"));
+        }
+        if let Some(by) = &x.handled_by {
+            known(&what, by, &mut bad);
+        }
+        if x.closed.is_some() != x.outcome.is_some() {
+            bad.push(format!("{what}: closed and outcome go together"));
+        }
+        if x.outcome.as_deref().is_some_and(|o| !CONCERN_OUTCOMES.contains(&o)) {
+            bad.push(format!("{what}: outcome is {}", CONCERN_OUTCOMES.join(", ")));
+        }
+        if x.closed.is_some() && x.triaged.is_none() {
+            bad.push(format!("{what}: a concern is triaged before it is closed, even one withdrawn"));
+        }
+        if x.triaged.is_some_and(|t| t < x.received) || x.closed.is_some_and(|c| c < x.received || x.triaged.is_some_and(|t| c < t)) {
+            bad.push(format!("{what}: triaged can't be before received, nor closed before triaged"));
         }
     }
     if bad.is_empty() {
@@ -648,6 +711,7 @@ impl Check<'_> {
             + r.management_reviews.iter().filter(|x| x.at >= c).count()
             + r.vendors.iter().filter(|x| x.since >= c).count()
             + r.exceptions.iter().filter(|x| x.approved_at >= c).count()
+            + r.conduct_concerns.iter().filter(|x| x.received >= c).count()
     }
 
     pub fn roles(&self) -> (Value, Vec<&'static str>) {
@@ -1028,6 +1092,72 @@ impl Check<'_> {
         });
         (v, rows)
     }
+
+    /// The code of conduct's approval and acknowledgements, and the conduct concerns open
+    /// at some time in the period. Acknowledgements are judged person by person in
+    /// `people.json`; here they are counted for CC1.1-1.
+    pub fn conduct(&self) -> (Value, Vec<&'static str>) {
+        let (p, cut) = (self.p, self.cut());
+        let recent = |d: NaiveDate| d < cut && age(cut, d) <= YEAR_DAYS;
+        let in_set = self.policies.iter().any(|q| q.id == CODE_OF_CONDUCT);
+        let approved = self.r.policy_approvals.iter().filter(|a| a.policy == CODE_OF_CONDUCT && a.approved_at < cut).map(|a| a.approved_at).max();
+        let at_end: Vec<&Person> = self.r.people.iter().filter(|x| x.joined < cut && x.left.is_none_or(|l| l >= cut)).collect();
+        let acked = |x: &Person| self.r.acknowledgements.iter().any(|a| a.person == x.id && a.policy == CODE_OF_CONDUCT && recent(a.at));
+        let acknowledged = at_end.iter().filter(|x| acked(x)).count();
+
+        let (mut triaged_late, mut closed_late, mut wrong) = (Vec::new(), Vec::new(), Vec::new());
+        let mut outcomes: BTreeMap<&str, usize> = CONCERN_OUTCOMES.iter().map(|o| (*o, 0)).collect();
+        let mut out = Vec::new();
+        for x in self.r.conduct_concerns.iter().filter(|x| x.received < cut && x.closed.is_none_or(|c| c >= p.from)) {
+            let triaged = x.triaged.filter(|d| *d < cut);
+            let closed = x.closed.filter(|d| *d < cut);
+            let (triage_due, close_due) = (plus(x.received, CONCERN_TRIAGE_DAYS), plus(x.received, CONCERN_CLOSE_DAYS));
+            match triaged {
+                Some(t) if t > triage_due => triaged_late.push(json!(format!("{} (received {}, triaged {t}, due {triage_due})", x.id, x.received))),
+                None if triage_due < cut => triaged_late.push(json!(format!("{} (received {}, not triaged, due {triage_due})", x.id, x.received))),
+                _ => {}
+            }
+            match closed {
+                Some(c) if c > close_due => closed_late.push(json!(format!("{} (received {}, closed {c}, due {close_due})", x.id, x.received))),
+                None if close_due < cut => closed_late.push(json!(format!("{} (received {}, still open, due {close_due})", x.id, x.received))),
+                _ => {}
+            }
+            let by = triaged.and(x.handled_by.as_deref());
+            let held = triaged.zip(by).and_then(|(t, by)| self.held(by, &CONCERN_HANDLERS, t));
+            if let (Some(t), Some(by), None) = (triaged, by, &held) {
+                wrong.push(json!(format!("{} on {t}: {by} held none of {}", x.id, CONCERN_HANDLERS.join(", "))));
+            }
+            let outcome = closed.and(x.outcome.as_deref());
+            if let Some(o) = outcome.filter(|_| closed.is_some_and(|c| c >= p.from)) {
+                *outcomes.entry(o).or_default() += 1;
+            }
+            out.push(json!({
+                "id": x.id, "received": ds(x.received), "triageDue": ds(triage_due), "triaged": triaged.map(ds), "handledBy": by, "heldRole": held,
+                "closeDue": ds(close_due), "closed": closed.map(ds), "outcome": outcome, "openAtEnd": closed.is_none(),
+            }));
+        }
+        let current = approved.is_some_and(recent);
+        let rows = if in_set && current && self.r.acknowledgements.iter().any(|a| a.policy == CODE_OF_CONDUCT && recent(a.at)) { vec!["CC1.1-1"] } else { vec![] };
+        let v = json!({
+            "basis": format!("the code of conduct approved within a year (policies.json judges the approval) and acknowledged by everyone with access within {GRACE_DAYS} days of joining and yearly (people.json judges each person); every conduct concern received before the period's end and not closed before it began: triaged within {CONCERN_TRIAGE_DAYS} days of being received by someone holding or deputising {} that day, and closed with an outcome within {CONCERN_CLOSE_DAYS} days; concerns are named by register id only", CONCERN_HANDLERS.join(", ")),
+            "codeOfConduct": {
+                "inPolicySet": in_set,
+                "lastApproved": approved.map(ds),
+                "approvalCurrent": current,
+                "personnelAtEnd": at_end.len(),
+                "acknowledgedWithinAYear": acknowledged,
+            },
+            "summary": {
+                "concerns": out.len(),
+                "receivedInPeriod": self.r.conduct_concerns.iter().filter(|x| x.received >= p.from && x.received < cut).count(),
+                "openAtEnd": out.iter().filter(|x| x["openAtEnd"] == true).count(),
+                "closedInPeriodByOutcome": outcomes,
+            },
+            "exceptions": { "triagedLate": triaged_late, "closedLate": closed_late, "handlerNotInRole": wrong },
+            "concerns": out,
+        });
+        (v, rows)
+    }
 }
 
 /// The calendar quarters that overlap the period and have ended by its end.
@@ -1066,7 +1196,7 @@ pub fn name(p: &Period, now_ms: i64) -> String {
 /// Each file's JSON and the rows its manifest maps it to.
 pub fn files(c: &Check) -> Vec<(&'static str, Value, Vec<&'static str>)> {
     let period = json!({ "from": c.p.from.to_string(), "to": c.p.to.to_string(), "days": c.p.days() });
-    let parts = [c.roles(), c.policies(), c.people(), c.risks(), c.management_reviews(), c.vendors(), c.exceptions()];
+    let parts = [c.roles(), c.policies(), c.people(), c.risks(), c.management_reviews(), c.vendors(), c.exceptions(), c.conduct()];
     SECTIONS
         .iter()
         .zip(parts)
@@ -1279,6 +1409,9 @@ mod tests {
             "exceptions": [
                 { "id": "EX-01", "policy": "information-security", "setting": "MACHINE_ON_DISABLE", "approvedBy": "p-sec", "approvedAt": "2027-02-01", "ends": "2027-08-01", "reviewed": ["2027-03-15"], "notes": "why" },
             ],
+            "conductConcerns": [
+                { "id": "CC-01", "received": "2027-03-02", "triaged": "2027-03-04", "handledBy": "p-mgmt", "closed": "2027-03-20", "outcome": "not-substantiated", "notes": "raised by Erin about Frank" },
+            ],
         })
     }
 
@@ -1367,7 +1500,7 @@ mod tests {
         check(&v, &|c| {
             let (pe, _) = c.people();
             let ex = &pe["exceptions"];
-            assert_eq!(ex["notAcknowledged"], json!(["p-ops acceptable-use (due 2027-02-04)", "p-new acceptable-use (due 2027-03-03)"]));
+            assert_eq!(ex["notAcknowledged"], json!(["p-ops acceptable-use (due 2027-02-04)", "p-new acceptable-use (due 2027-03-03)", "p-new code-of-conduct (due 2027-03-03)"]));
             assert_eq!(ex["acknowledgedLate"], json!(["p-new information-security (2027-03-20, due 2027-03-03)"]));
             assert_eq!(ex["notTrained"], json!(["p-new (due 2027-03-03)"]));
             assert_eq!(ex["trainingOverdue"], json!(["p-mgmt (last 2026-02-01)"]));
@@ -1505,6 +1638,58 @@ mod tests {
     }
 
     #[test]
+    fn conduct_concerns_triaged_and_closed_in_time_by_a_handler() {
+        let mut v = good();
+        v["roles"][1]["from"] = json!("2026-06-01");
+        let concerns = v["conductConcerns"].as_array_mut().unwrap();
+        concerns.push(json!({ "id": "CC-02", "received": "2027-03-10", "triaged": "2027-03-20", "handledBy": "p-eng" }));
+        concerns.push(json!({ "id": "CC-03", "received": "2026-12-01", "triaged": "2026-12-03", "handledBy": "p-sec" }));
+        concerns.push(json!({ "id": "CC-04", "received": "2027-03-28" }));
+        concerns.push(json!({ "id": "CC-05", "received": "2027-03-20" }));
+        concerns.push(json!({ "id": "CC-06", "received": "2026-10-01", "triaged": "2026-10-02", "handledBy": "p-sec", "closed": "2027-02-01", "outcome": "substantiated" }));
+        concerns.push(json!({ "id": "CC-07", "received": "2026-12-15", "triaged": "2026-12-16", "handledBy": "p-sec", "closed": "2027-03-25", "outcome": "withdrawn" }));
+        concerns.push(json!({ "id": "CC-08", "received": "2027-04-02" }));
+        check(&v, &|c| {
+            let (x, rows) = c.conduct();
+            let ex = &x["exceptions"];
+            assert_eq!(ex["triagedLate"], json!(["CC-02 (received 2027-03-10, triaged 2027-03-20, due 2027-03-17)", "CC-05 (received 2027-03-20, not triaged, due 2027-03-27)"]), "CC-04 isn't due until after the period");
+            assert_eq!(ex["closedLate"], json!(["CC-03 (received 2026-12-01, still open, due 2027-03-01)", "CC-07 (received 2026-12-15, closed 2027-03-25, due 2027-03-15)"]));
+            assert_eq!(ex["handlerNotInRole"], json!(["CC-02 on 2027-03-20: p-eng held none of People lead, Management, Security owner"]));
+            assert_eq!(x["summary"], json!({ "concerns": 6, "receivedInPeriod": 4, "openAtEnd": 4, "closedInPeriodByOutcome": { "not-substantiated": 1, "referred": 0, "substantiated": 0, "withdrawn": 1 } }), "CC-06 closed before the period, CC-08 came after it");
+            let first = &x["concerns"][0];
+            assert_eq!((first["id"].as_str(), first["heldRole"].as_str(), first["outcome"].as_str()), (Some("CC-01"), Some("People lead"), Some("not-substantiated")));
+            assert_eq!(x["codeOfConduct"], json!({ "inPolicySet": true, "lastApproved": "2027-01-05", "approvalCurrent": true, "personnelAtEnd": 4, "acknowledgedWithinAYear": 4 }));
+            assert_eq!(rows, ["CC1.1-1"]);
+            assert_eq!(c.after_period(), 1);
+            assert!(!x.to_string().contains("Erin") && !x.to_string().contains("Frank"), "no notes: {x}");
+        });
+
+        let mut unacknowledged = good();
+        unacknowledged["acknowledgements"].as_array_mut().unwrap().retain(|a| a["policy"] != CODE_OF_CONDUCT);
+        check(&unacknowledged, &|c| {
+            let (x, rows) = c.conduct();
+            assert_eq!(x["codeOfConduct"]["acknowledgedWithinAYear"], 0);
+            assert!(rows.is_empty(), "approved but acknowledged by nobody maps nothing");
+            assert_eq!(c.people().0["exceptions"]["notAcknowledged"].as_array().unwrap().len(), 4, "people.json chases each person");
+        });
+        let mut stale = good();
+        for a in stale["policyApprovals"].as_array_mut().unwrap().iter_mut().filter(|a| a["policy"] == CODE_OF_CONDUCT) {
+            a["approvedAt"] = json!("2026-02-01");
+        }
+        check(&stale, &|c| assert!(c.conduct().1.is_empty(), "an approval over a year old maps nothing"));
+
+        let mut older = good();
+        older["policyApprovals"].as_array_mut().unwrap().retain(|a| a["policy"] != CODE_OF_CONDUCT);
+        older["acknowledgements"].as_array_mut().unwrap().retain(|a| a["policy"] != CODE_OF_CONDUCT);
+        let set: Vec<Policy> = builtin_policies().into_iter().filter(|p| p.id != CODE_OF_CONDUCT).collect();
+        let r = parse(&serde_json::to_vec(&older).unwrap(), &set).unwrap();
+        let c = Check { r: &r, p: period(), policies: &set, baselines: &[] };
+        let (x, rows) = c.conduct();
+        assert_eq!((x["codeOfConduct"]["inPolicySet"].as_bool(), rows.len()), (Some(false), 0), "a policy folder from before the code of conduct");
+        assert_eq!(exceptions(&c.people().0), 0, "nobody is chased for a policy not in the set");
+    }
+
+    #[test]
     fn a_register_that_doesnt_hold_together_is_refused_with_every_problem() {
         let mut v = good();
         v["people"].as_array_mut().unwrap().push(json!({ "id": "alice@example.com", "joined": "2026-01-01" }));
@@ -1512,7 +1697,7 @@ mod tests {
         v["roles"][0]["holder"] = json!("p-nobody");
         v["roles"][1]["role"] = json!("CISO");
         v["policyApprovals"][0]["sha256"] = json!("abc");
-        v["policyApprovals"][1]["policy"] = json!("code-of-conduct");
+        v["policyApprovals"][1]["policy"] = json!("whistleblowing");
         v["risks"][0]["likelihood"] = json!(6);
         v["risks"][0]["treatment"] = json!("ignore");
         v["risks"][0]["controls"] = json!(["CC6.1"]);
@@ -1520,6 +1705,9 @@ mod tests {
         v["vendors"][0]["tier"] = json!("medium");
         v["exceptions"][0]["ends"] = json!("2027-01-01");
         v["exceptions"][0]["setting"] = json!("machine_on_disable");
+        v["conductConcerns"].as_array_mut().unwrap().push(json!({ "id": "CC-02", "received": "2027-03-05", "triaged": "2027-03-01", "handledBy": "p-mgmt", "closed": "2027-03-10" }));
+        v["conductConcerns"].as_array_mut().unwrap().push(json!({ "id": "CC-03", "received": "2027-03-05", "handledBy": "p-who", "closed": "2027-03-06", "outcome": "dismissed" }));
+        v["conductConcerns"].as_array_mut().unwrap().push(json!({ "id": "CC-01", "received": "2027-03-05" }));
         let e = parse(&serde_json::to_vec(&v).unwrap(), &builtin_policies()).unwrap_err();
         for want in [
             "person id alice@example.com isn't plain",
@@ -1527,7 +1715,14 @@ mod tests {
             "names p-nobody, who isn't in people",
             "names the role CISO",
             "sha256 is the policy file's SHA-256",
-            "names the policy code-of-conduct",
+            "names the policy whistleblowing",
+            "conduct concern CC-02: closed and outcome go together",
+            "conduct concern CC-02: triaged can't be before received",
+            "conduct concern CC-03: triaged and handledBy go together",
+            "conduct concern CC-03 names p-who, who isn't in people",
+            "conduct concern CC-03: outcome is substantiated, not-substantiated, withdrawn, referred",
+            "conduct concern CC-03: a concern is triaged before it is closed",
+            "conduct concern id CC-01 is used twice",
             "likelihood and impact are 1 to 5",
             "treatment is reduce, accept, transfer or avoid",
             "control CC6.1 isn't a readiness checklist row id",

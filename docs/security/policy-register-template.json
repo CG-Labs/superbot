@@ -23,11 +23,13 @@
     { "policy": "business-continuity", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "approvedBy": "person-1", "approvedAt": "2026-12-01" },
     { "policy": "vendor-management", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "approvedBy": "person-1", "approvedAt": "2026-12-01" },
     { "policy": "data-classification-and-retention", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "approvedBy": "person-1", "approvedAt": "2026-12-01" },
-    { "policy": "acceptable-use", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "approvedBy": "person-1", "approvedAt": "2026-12-01" }
+    { "policy": "acceptable-use", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "approvedBy": "person-1", "approvedAt": "2026-12-01" },
+    { "policy": "code-of-conduct", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "approvedBy": "person-1", "approvedAt": "2026-12-01" }
   ],
   "acknowledgements": [
     { "person": "person-1", "policy": "information-security", "at": "2026-12-01" },
-    { "person": "person-1", "policy": "acceptable-use", "at": "2026-12-01" }
+    { "person": "person-1", "policy": "acceptable-use", "at": "2026-12-01" },
+    { "person": "person-1", "policy": "code-of-conduct", "at": "2026-12-01" }
   ],
   "training": [
     { "person": "person-1", "course": "security-awareness", "at": "2026-12-01" }
@@ -50,5 +52,6 @@
     { "id": "code-host", "tier": "high", "since": "2026-12-01", "assessed": "2026-12-01", "approvedBy": "person-2" },
     { "id": "model-provider", "tier": "high", "since": "2026-12-01", "assessed": "2026-12-01", "approvedBy": "person-2" }
   ],
-  "exceptions": []
+  "exceptions": [],
+  "conductConcerns": []
 }

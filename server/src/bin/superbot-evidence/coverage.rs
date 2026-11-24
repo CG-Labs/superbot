@@ -105,8 +105,16 @@ pub fn expected(kind: &str) -> Vec<(&'static str, &'static [&'static str], &'sta
     }
 }
 
+/// The manifest format from which a kind's bundles have a file; older bundles needn't.
+fn since_format(kind: &str, file: &str) -> u64 {
+    match kind {
+        "policy-register" => register::SINCE_FORMAT.iter().find(|(f, _)| *f == file).map_or(1, |(_, n)| *n),
+        _ => 1,
+    }
+}
+
 /// The files whose `exceptions` an auditor samples first.
-const EXCEPTION_FILES: [&str; 12] = [
+const EXCEPTION_FILES: [&str; 13] = [
     "pull-requests.json",
     "vulnerability-alerts.json",
     "ci-drills.json",
@@ -119,6 +127,7 @@ const EXCEPTION_FILES: [&str; 12] = [
     "management-reviews.json",
     "vendors.json",
     "policy-exceptions.json",
+    "conduct.json",
 ];
 
 /// A bundle file larger than this isn't read: no bundle comes near it.
@@ -275,6 +284,7 @@ pub fn check(path: String, name: &str, files: &BTreeMap<String, Vec<u8>>) -> Fou
     f.format = m["format"].as_u64();
     match f.format {
         None => f.problems.push("manifest.json has no format".into()),
+        Some(0) => f.problems.push("manifest.json's format (0) isn't one any superbot-evidence made".into()),
         Some(n) if n > kind.format => f.warnings.push(format!("its format ({n}) is newer than this tool knows ({}); use a newer superbot-evidence", kind.format)),
         Some(_) => {}
     }
@@ -314,7 +324,7 @@ pub fn check(path: String, name: &str, files: &BTreeMap<String, Vec<u8>>) -> Fou
         f.problems.push(format!("{n} isn't in manifest.json"));
     }
     for (file, _, _) in expected(kind.id) {
-        if !in_manifest.contains(file) {
+        if !in_manifest.contains(file) && f.format.is_some_and(|n| n >= since_format(kind.id, file)) {
             f.problems.push(format!("it has no {file}, which every {} has", kind.title.to_lowercase()));
         }
     }
@@ -871,6 +881,38 @@ mod tests {
         assert!(!check(format!("{name}.tar"), &name, &files).verified(), "changed after it was made");
     }
 
+    /// Register bundles gained `conduct.json` in format 2 (ADR 0214): one of format 1
+    /// without it still checks, one of format 2 must have it, and its exceptions count.
+    #[test]
+    fn register_bundles_have_conduct_json_from_format_2() {
+        let kind = KINDS.iter().find(|k| k.id == "policy-register").unwrap();
+        assert_eq!(kind.format, 2);
+        let (name, files) = bundle(kind, p("2027-01-01", "2027-02-01"), "2027-02-01T00:05:00Z");
+        let with_format = |n: u64, conduct: Option<&[u8]>| {
+            let mut fs = files.clone();
+            let mut m: Value = serde_json::from_slice(&fs["manifest.json"]).unwrap();
+            m["format"] = json!(n);
+            m["files"].as_array_mut().unwrap().retain(|f| f["name"] != "conduct.json");
+            fs.remove("conduct.json");
+            if let Some(body) = conduct {
+                m["files"].as_array_mut().unwrap().push(json!({ "name": "conduct.json", "sha256": sha256(body), "criteria": ["CC1.1"], "checklist": ["CC1.1-1"] }));
+                fs.insert("conduct.json".into(), body.to_vec());
+            }
+            fs.insert("manifest.json".into(), json_file(&m));
+            seal(&mut fs);
+            check(format!("{name}.tar"), &name, &fs)
+        };
+        let old = with_format(1, None);
+        assert!(old.verified(), "made before conduct.json: {:?}", old.problems);
+        let missing = with_format(2, None);
+        assert!(!missing.verified() && missing.problems.iter().any(|x| x.contains("it has no conduct.json")), "{:?}", missing.problems);
+        let body = json_file(&json!({ "exceptions": { "triagedLate": ["CC-1 (received 2027-01-02, not triaged, due 2027-01-09)"], "closedLate": [], "handlerNotInRole": [] } }));
+        let f = with_format(2, Some(&body));
+        assert!(f.verified(), "{:?}", f.problems);
+        assert_eq!(f.exceptions["conduct.json"]["triagedLate"], 1);
+        assert!(f.files.iter().any(|(n, _, rows)| n == "conduct.json" && rows == &["CC1.1-1".to_string()]));
+    }
+
     #[test]
     fn a_bundle_checks_against_its_digests_and_manifest() {
         let f = month(&KINDS[1], "2027-01-01", "2027-02-01");
@@ -922,6 +964,7 @@ mod tests {
         rewrite(&|m| m["files"].as_array_mut().unwrap().retain(|f| f["name"] != "backups.json"), "backups.json isn't in manifest.json");
         rewrite(&|m| m["product"] = json!("Other"), "isn't a SuperBot manifest");
         rewrite(&|m| _ = m.as_object_mut().unwrap().remove("format"), "no format");
+        rewrite(&|m| m["format"] = json!(0), "format (0) isn't one");
         rewrite(&|m| _ = m.as_object_mut().unwrap().remove("createdAt"), "when it was made");
         // A bundle without one of its kind's files, consistently sealed, still fails.
         tamper(
@@ -1120,7 +1163,7 @@ mod tests {
         // Outside the period: checked, not counted.
         found.push(month(&KINDS[0], "2026-12-01", "2027-01-01"));
 
-        let checklist = "| ID | Item | Kind | Owner | Evidence | Status | Where |\n|----|---|---|---|---|---|---|\n| CC8.1-1 | x | Product | E | e | Gap | w |\n| CC1.1-1 | x | Process | M | e | Gap | w |\n| CC6.1-1 | x | Product | E | e | Done | w |\n";
+        let checklist = "| ID | Item | Kind | Owner | Evidence | Status | Where |\n|----|---|---|---|---|---|---|\n| CC8.1-1 | x | Product | E | e | Gap | w |\n| CC1.5-1 | x | Process | M | e | Gap | w |\n| CC6.1-1 | x | Product | E | e | Done | w |\n";
         let r = report(&found, &["notes.txt".into()], &q, Some(checklist), 0);
         assert_eq!(r["complete"], false);
         let problems = strings(&r["problems"]);
@@ -1152,11 +1195,11 @@ mod tests {
 
         let c = &r["checklist"];
         assert_eq!((c["rows"].as_u64(), c["withAutomatedEvidence"].as_u64()), (Some(3), Some(2)));
-        assert_eq!(c["noAutomatedEvidence"], json!([{ "row": "CC1.1-1", "status": "Gap" }]));
+        assert_eq!(c["noAutomatedEvidence"], json!([{ "row": "CC1.5-1", "status": "Gap" }]));
         assert!(strings(&r["warnings"]).iter().any(|w| w.starts_with("CC6.2-1 is named by a bundle")));
 
         let md = markdown(&r);
-        for want in ["**Not complete:** 2 problems", "| 2027-02 | complete | missing | complete | complete | complete |", "| CC8.1-1 | change-management | 31 of 90 | 2027-02-01 to 2027-04-01 |", "| CC1.1-1 | Gap |", "**no**", "yes, outside the period", "noIndependentApproval 2"] {
+        for want in ["**Not complete:** 2 problems", "| 2027-02 | complete | missing | complete | complete | complete |", "| CC8.1-1 | change-management | 31 of 90 | 2027-02-01 to 2027-04-01 |", "| CC1.5-1 | Gap |", "**no**", "yes, outside the period", "noIndependentApproval 2"] {
             assert!(md.contains(want), "{want}\n{md}");
         }
 
