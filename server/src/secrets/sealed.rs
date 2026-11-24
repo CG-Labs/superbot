@@ -408,16 +408,89 @@ fn seal_plaintext(c: &Connection, cipher: &Cipher) -> rusqlite::Result<usize> {
         s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
     };
     for (id, input) in &rows {
-        // Parsed when it's JSON, so a secret with quotes or backslashes matches unescaped.
-        let clean = match serde_json::from_str::<serde_json::Value>(input) {
-            Ok(v) => redact::value(v).to_string(),
-            Err(_) => redact::text(input).to_string(),
-        };
-        let sealed = cipher.seal(&approval_context(id), clean.as_bytes());
+        let sealed = cipher.seal(&approval_context(id), redacted_input(input).as_bytes());
         tx.execute("UPDATE approvals SET input = ? WHERE id = ?", params![sealed, id])?;
     }
     tx.commit()?;
     Ok(rows.len())
+}
+
+/// A plaintext approval input with known secrets redacted. Parsed when it's JSON, so a
+/// secret with quotes or backslashes matches unescaped.
+fn redacted_input(input: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(input) {
+        Ok(v) => redact::value(v).to_string(),
+        Err(_) => redact::text(input).to_string(),
+    }
+}
+
+/// What bringing a regional store's approval inputs under the master key did (ADR 0228).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StoreApprovals {
+    /// Plaintext inputs, redacted and sealed.
+    pub sealed: usize,
+    /// Opened with the previous key and sealed again under the current one.
+    pub resealed: usize,
+    /// Neither key opens them and SUPERBOT_FORGET_SEALED=1 is set: the marker in their place.
+    pub discarded: usize,
+    /// Neither key opens them during a rotation: left as they were, as `rotate` leaves them.
+    pub unreadable: usize,
+}
+
+impl StoreApprovals {
+    pub fn add(&mut self, o: &StoreApprovals) {
+        self.sealed += o.sealed;
+        self.resealed += o.resealed;
+        self.discarded += o.discarded;
+        self.unreadable += o.unreadable;
+    }
+}
+
+/// Brings the approval inputs in `table` (a regional store's `<schema>.approvals`, ADR 0228)
+/// under `current`, as `bootstrap` does botd's own, in one transaction: plaintext sealed,
+/// values `previous` opens (mid-rotation) sealed again, and, with `forget`, values neither
+/// opens dropped. Values `current` opens are left alone, so running it again changes
+/// nothing. A value neither key opens, outside a rotation and without `forget`, refuses
+/// (nothing changed), as a wrong key does for botd's own database.
+pub fn approvals_in(c: &Connection, table: &str, current: &Cipher, previous: Option<&Cipher>, forget: bool) -> Result<StoreApprovals, String> {
+    let db = |e: rusqlite::Error| e.to_string();
+    let tx = c.unchecked_transaction().map_err(db)?;
+    let rows: Vec<(String, String)> = {
+        let mut s = tx.prepare(&format!("SELECT id, input FROM {table}")).map_err(db)?;
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(db)?.collect::<rusqlite::Result<_>>().map_err(db)?
+    };
+    let mut done = StoreApprovals::default();
+    let mut refused = 0;
+    for (id, input) in &rows {
+        let context = approval_context(id);
+        let value = if !is_sealed(input) {
+            done.sealed += 1;
+            current.seal(&context, redacted_input(input).as_bytes())
+        } else if current.open(&context, input).is_ok() {
+            continue;
+        } else if let Some(plain) = previous.and_then(|p| p.open(&context, input).ok()) {
+            done.resealed += 1;
+            current.seal(&context, &plain)
+        } else if forget {
+            done.discarded += 1;
+            current.seal(&context, br#"{"sealed":"discarded"}"#)
+        } else if previous.is_some() {
+            done.unreadable += 1;
+            continue;
+        } else {
+            refused += 1;
+            continue;
+        };
+        tx.execute(&format!("UPDATE {table} SET input = ?1 WHERE id = ?2"), params![value, id]).map_err(db)?;
+    }
+    if refused > 0 {
+        return Err(format!(
+            "{refused} saved tool inputs of approvals in it don't open with the master key. If the key was rotated, set SUPERBOT_MASTER_KEY_PREVIOUS back to the key before \
+             (docs/ops/master-key-rotation.md); if that key is lost for good, start once with SUPERBOT_FORGET_SEALED=1 to drop them (ADR 0228)."
+        ));
+    }
+    tx.commit().map_err(db)?;
+    Ok(done)
 }
 
 /// Whether `cipher` opens what this database has sealed. True when nothing is sealed yet.

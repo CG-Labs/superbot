@@ -677,7 +677,9 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     let settings = Settings { dirs: vec![("gb-lon".into(), lon.clone()), ("de-fra-2".into(), fra.clone())], keep: 7, forget: Vec::new() };
     let set = settings.clone();
     let (port, app, admin, _) = linode_set(move |cp| cp.chat_stores = set).await;
-    let (lines, rekeyed) = chat_stores::open(&app.db, &settings, None).unwrap();
+    let cipher = crate::secrets::sealed::cipher();
+    let opened = chat_stores::open(&app.db, &settings, None, chat_stores::Keys { current: &cipher, previous: None, forget: false }).unwrap();
+    let (lines, rekeyed) = (opened.lines, opened.rekeyed);
     assert_eq!(rekeyed, 0);
     assert!(lines.iter().any(|l| l.contains("made gb-lon's store")) && lines.iter().any(|l| l.contains("made de-fra-2's store")), "{lines:?}");
     let (ada, ada_s) = user_with(port, &admin, "ada@example.com", "member").await;
@@ -734,7 +736,7 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
         .unwrap();
     let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
     assert_eq!(r["status"].as_str(), Some("data_outside"), "{r}");
-    assert!(r["outside"].to_string().contains("1 of their chat messages are in botd's own database, not gb-lon's chat store"), "{r}");
+    assert!(r["outside"].to_string().contains("their Bots have 1 chat message in botd's own database, not gb-lon's chat store"), "{r}");
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
     assert_eq!((me["status"].as_str(), me["chats"]["inRegion"].as_bool(), me["chats"]["moving"].as_bool()), (Some("data_outside"), Some(false), Some(true)), "{me}");
     let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
@@ -755,9 +757,88 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
     let c = &r["chats"];
     assert_eq!((c["inRegion"].as_bool(), c["earlierCopies"][0]["region"].as_str(), c["earlierCopies"][0]["backups"].as_i64()), (Some(false), Some("gb-lon"), Some(1)), "{r}");
-    assert!(r["warnings"].to_string().contains("1 backups of gb-lon's chat store were made before their chats moved out of it"), "{r}");
+    assert!(r["warnings"].to_string().contains("1 backups of gb-lon's chat store were made before their chats, routines or approvals moved out of it"), "{r}");
     assert!(r["notCovered"][0].as_str().unwrap().starts_with("botd's own database (accounts, chats,"), "{r}");
     assert_eq!(r["status"].as_str(), Some("kept"), "old backups are disclosed, not unkept: {r}");
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
     assert_eq!(me["chats"], json!({ "store": true, "inRegion": false, "moving": false, "earlierBackups": 1 }), "the move is done; only old backups are left: {me}");
+}
+
+#[tokio::test]
+async fn a_pinned_persons_routines_and_approvals_are_kept_with_their_chats() {
+    use crate::machines::chat_stores::{self, Settings};
+    let scratch = crate::db::Scratch::new();
+    let lon = scratch.path().join("lon");
+    std::fs::create_dir_all(&lon).unwrap();
+    let settings = Settings { dirs: vec![("gb-lon".into(), lon.clone())], keep: 7, forget: Vec::new() };
+    let set = settings.clone();
+    let (port, app, admin, _) = linode_set(move |cp| cp.chat_stores = set).await;
+    let cipher = crate::secrets::sealed::cipher();
+    chat_stores::open(&app.db, &settings, None, chat_stores::Keys { current: &cipher, previous: None, forget: false }).unwrap();
+    let (ada, ada_s) = user_with(port, &admin, "ada@example.com", "member").await;
+    let bot = app.db.create_bot_owned("B", "#fff", "waddle", "claude", None, false, &ada, crate::acl::Visibility::Private).id;
+    let body = r#"{"name":"Standup","cron":"0 9 * * 1-5","instruction":"summarise the contract"}"#;
+    let (code, r) = call_json(port, "POST", &format!("/api/bots/{bot}/routines"), &ada_s, body).await;
+    assert_eq!(code, 201, "{r}");
+    let asked = |subject: &str| app.db.add_approval(&bot, "claude", "Bash", "command", subject, &json!({ "command": subject }), "risky", "asks", crate::db::now() + 3_600_000).id;
+    let first = asked("git push origin main");
+    let count = |table: &str| rusqlite::Connection::open(lon.join("chats.sqlite")).unwrap().query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get::<_, i64>(0)).unwrap();
+    assert_eq!((count("routines"), count("approvals")), (0, 0), "unpinned: they stay in botd's own database");
+
+    // A pin moves them with her chats, audited; new ones go straight there.
+    assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("gb-lon", "DPA-1")).await.0, 200);
+    assert_eq!((count("routines"), count("approvals")), (1, 1));
+    let moved = audit(port, &admin, chat_stores::MOVED).await;
+    assert_eq!((moved[0]["details"]["routines"].as_i64(), moved[0]["details"]["approvals"].as_i64()), (Some(1), Some(1)), "{moved:?}");
+    let second = asked("rm -rf build");
+    assert_eq!(count("approvals"), 2);
+
+    // Everything that reads or changes them works as before.
+    let (code, routines) = call_json(port, "GET", &format!("/api/bots/{bot}/routines"), &ada_s, "").await;
+    assert_eq!((code, routines.as_array().map(Vec::len)), (200, Some(1)), "{routines}");
+    let rid = routines[0]["id"].as_str().unwrap();
+    assert_eq!(call(port, "PATCH", &format!("/api/routines/{rid}"), &ada_s, r#"{"enabled":false}"#).await.0, 200);
+    let (_, routines) = call_json(port, "GET", &format!("/api/bots/{bot}/routines"), &ada_s, "").await;
+    assert_eq!(routines[0]["enabled"].as_bool(), Some(false), "{routines}");
+    let (_, list) = call_json(port, "GET", "/api/approvals", &admin, "").await;
+    let ids: Vec<&str> = list.as_array().unwrap().iter().filter_map(|a| a["id"].as_str()).collect();
+    assert_eq!(ids, [second.as_str(), first.as_str()], "newest first: {list}");
+    let (code, done) = call_json(port, "POST", &format!("/api/approvals/{first}/approve"), &admin, r#"{"remember":"bot"}"#).await;
+    assert_eq!(code, 200, "{done}");
+    assert_eq!(app.db.approval(&first).unwrap().status, "approved");
+    assert_eq!(app.db.approval(&second).unwrap().input, json!({ "command": "rm -rf build" }), "its sealed input opens where it is kept");
+
+    // The report, the app and the regions page count them.
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    let c = &r["chats"];
+    assert_eq!((c["inRegion"].as_bool(), c["routines"]["inStore"].as_i64(), c["approvals"]["inStore"].as_i64(), c["approvals"]["inServerDatabase"].as_i64()), (Some(true), Some(1), Some(2), Some(0)), "{r}");
+    let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
+    assert!(md.contains("## Chats, routines and approvals") && md.contains("- **Routines in it:** 1") && md.contains("- **Approvals in it:** 2"), "{md}");
+    let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
+    let lon_row = regions["regions"].as_array().unwrap().iter().find(|x| x["id"] == "gb-lon").unwrap();
+    assert_eq!((lon_row["chatStore"]["routines"].as_i64(), lon_row["chatStore"]["approvals"].as_i64()), (Some(1), Some(2)), "{regions}");
+
+    // A routine and an approval left out of the store make the pin unkept until reconcile moves them.
+    app.db
+        .conn_for_tests()
+        .execute_batch(&format!(
+            "INSERT INTO main.routines SELECT * FROM chats_0.routines; DELETE FROM chats_0.routines; \
+             INSERT INTO main.approvals SELECT * FROM chats_0.approvals WHERE id = '{second}'; DELETE FROM chats_0.approvals WHERE id = '{second}';"
+        ))
+        .unwrap();
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!(r["status"].as_str(), Some("data_outside"), "{r}");
+    assert!(r["outside"].to_string().contains("their Bots have 1 routine and 1 approval in botd's own database, not gb-lon's chat store"), "{r}");
+    let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
+    assert_eq!(me["chats"]["moving"].as_bool(), Some(true), "{me}");
+    let done = reconcile_as(port, &admin).await;
+    assert_eq!((done["routinesMoved"].as_i64(), done["approvalsMoved"].as_i64()), (Some(1), Some(1)), "{done}");
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!(r["status"].as_str(), Some("kept"), "{r}");
+
+    // Unpinned, they come back.
+    assert_eq!(call(port, "DELETE", &format!("/api/users/{ada}/residency"), &admin, r#"{"reason":"contract ended"}"#).await.0, 200);
+    assert_eq!((count("routines"), count("approvals")), (0, 0));
+    assert_eq!(app.db.routines(Some(&bot)).len(), 1);
+    assert_eq!(app.db.approval(&second).unwrap().input, json!({ "command": "rm -rf build" }));
 }

@@ -211,18 +211,16 @@ pub fn looks_secret(name: &str) -> bool {
 /// subjects. Safe to run on every start. The audit log is append-only, so its rows are
 /// redacted when read instead; approval inputs are sealed, and redacted before sealing.
 pub fn scrub_rows(c: &Connection) -> rusqlite::Result<usize> {
-    scrub_rows_in(c, &["main.messages"], true)
+    scrub_rows_in(c, &["main.messages"], &["main.approvals"])
 }
 
-/// As `scrub_rows`, over the messages tables named (a region's chat store's too, ADR
-/// 0215), and approval subjects when `approvals`.
-pub fn scrub_rows_in(c: &Connection, messages: &[&str], approvals: bool) -> rusqlite::Result<usize> {
+/// As `scrub_rows`, over the messages tables named and the approvals tables' subjects (a
+/// region's chat store's too, ADR 0215 and ADR 0228).
+pub fn scrub_rows_in(c: &Connection, messages: &[&str], approvals: &[&str]) -> rusqlite::Result<usize> {
     let tx = c.unchecked_transaction()?;
     let mut n = 0;
     let mut tables: Vec<(&str, &str)> = messages.iter().map(|t| (*t, "text")).collect();
-    if approvals {
-        tables.push(("main.approvals", "subject"));
-    }
+    tables.extend(approvals.iter().map(|t| (*t, "subject")));
     // A user's own Bots' rows first, with their secrets and botd's together, longest
     // first (as `text_for`), so a short value of theirs can't split a longer secret.
     for (owner, values) in owned() {

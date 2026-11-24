@@ -1,36 +1,60 @@
-//! Pinned people's chats in a database in their region (ADR 0215), the first part of
-//! splitting botd's database by region. Each region in REGION_DATA_DIRS has a SQLite file
-//! of its own (`chats.sqlite`, keyed like botd's database), attached to botd's connection.
-//! A Bot's messages are kept in the store of its owner's residency pin (their team's,
-//! else their own, as `residency::of_user`), or in botd's own database when that region
-//! has no store or the owner isn't pinned.
+//! Pinned people's chats, routines and approvals in a database in their region (ADR 0215,
+//! ADR 0228), the first part of splitting botd's database by region. Each region in
+//! REGION_DATA_DIRS has a SQLite file of its own (`chats.sqlite`, keyed like botd's
+//! database), attached to botd's connection. A Bot's messages, routines and approvals are
+//! kept in the store of its owner's residency pin (their team's, else their own, as
+//! `residency::of_user`), or in botd's own database when that region has no store or the
+//! owner isn't pinned.
 //!
-//! Reads see every place at once: a TEMP view named `messages` puts botd's own table and
-//! each store's together, and unqualified names find TEMP objects first. Writes name the
-//! table they change: new messages go where their Bot's chat belongs, and updates and
-//! deletes by id run on each place. Ids stay unique across all of them: a store's rows
-//! take the next id after botd's own sequence and every store's highest, and bump that
-//! sequence, so botd's table never hands the same id out again.
+//! Reads see every place at once: a TEMP view per table (`messages`, `routines`,
+//! `approvals`) puts botd's own table and each store's together, and unqualified names
+//! find TEMP objects first. Writes name the table they change: new rows go where their
+//! Bot's data belongs, and updates and deletes by id run on each place. Ids stay unique
+//! across all of them: a store's messages take the next id after botd's own sequence and
+//! every store's highest, and bump that sequence, so botd's table never hands the same id
+//! out again; a routine's or approval's id is drawn again while any place has it.
 //!
 //! `place_chats` moves rows whose Bot belongs elsewhere now (a pin made or ended, a
 //! member joining or leaving a pinned team, a Bot given away): copied and committed, then
-//! deleted from where they were in a second transaction. A transaction across attached
-//! WAL files commits each file on its own, so one transaction could commit the delete
-//! without the copy; two can at worst leave a copy in both places, and the next pass
-//! deletes the one in the wrong place.
+//! deleted from where they were in a second transaction, with freed pages zeroed. A
+//! transaction across attached WAL files commits each file on its own, so one transaction
+//! could commit the delete without the copy; two can at worst leave a copy in both places,
+//! and the next pass deletes the one in the wrong place.
 
 use super::{Db, now};
 use crate::database_encryption::{self, Format};
+use crate::secrets::sealed::{self, Cipher, StoreApprovals};
 use rusqlite::{Connection, OptionalExtension, ToSql, params};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
-/// The token a statement run on every place chats are kept writes for the table.
-pub(super) const TABLE: &str = "{messages}";
+/// A table whose rows are kept, by Bot, in the store of its owner's pin.
+struct Kept {
+    name: &'static str,
+    /// The indexes a store's copy gets, as `(name, columns)`.
+    indexes: &'static [(&'static str, &'static str)],
+    /// Reads order by its rowid, which a view has only as a column of that name.
+    rowid: bool,
+}
+
+const KEPT: [Kept; 3] = [
+    Kept { name: "messages", indexes: &[("messages_bot", "bot_id, id"), ("messages_created", "created_at")], rowid: false },
+    Kept { name: "routines", indexes: &[("routines_bot", "bot_id")], rowid: false },
+    Kept { name: "approvals", indexes: &[("approvals_status", "status, created_at"), ("approvals_bot", "bot_id")], rowid: true },
+];
+const MESSAGES: usize = 0;
+const APPROVALS: usize = 2;
+
+/// The token for `table` in a statement run on every place (`on_places`): `{messages}`,
+/// `{routines}` or `{approvals}`.
+fn token(table: &str) -> String {
+    format!("{{{table}}}")
+}
 
 /// botd's record of each store it has kept chats in, so a store that goes missing (an
 /// unmounted volume, a dropped setting) stops botd instead of hiding those chats; and of
-/// when each Bot's chat last left a store, as that store's earlier backups still hold it.
+/// when each Bot's rows last left a store, as that store's earlier backups still hold them.
 const RECORDS: &str = "CREATE TABLE IF NOT EXISTS main.chat_stores (
   region TEXT PRIMARY KEY,
   store_id TEXT NOT NULL,
@@ -57,8 +81,11 @@ pub struct ChatStore {
 #[derive(Debug, Default)]
 pub(super) struct ChatStores {
     stores: Vec<ChatStore>,
-    /// The messages table's columns, quoted, in the order botd's own table has them.
-    cols: String,
+    /// Each kept table's columns, quoted, in the order botd's own table has them.
+    cols: Vec<String>,
+    /// A checkpoint after rows left a place was blocked by a reader, so their zeroed pages
+    /// may not have replaced the old ones in its file yet. Each pass tries again.
+    unflushed: std::sync::atomic::AtomicBool,
 }
 
 /// What attaching the stores did, for the startup log.
@@ -71,7 +98,46 @@ pub struct Attached {
     pub forgotten: Vec<(String, String)>,
 }
 
-/// Chats one pass moved between two places. `None`: botd's own database.
+/// How many rows of each kept table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Held {
+    pub messages: i64,
+    pub routines: i64,
+    pub approvals: i64,
+}
+
+impl Held {
+    fn of(n: [i64; 3]) -> Held {
+        Held { messages: n[0], routines: n[1], approvals: n[2] }
+    }
+
+    pub fn total(&self) -> i64 {
+        self.messages + self.routines + self.approvals
+    }
+
+    pub fn add(&mut self, o: Held) {
+        self.messages += o.messages;
+        self.routines += o.routines;
+        self.approvals += o.approvals;
+    }
+
+    /// "3 chat messages, 1 routine and 2 approvals", leaving out tables with none.
+    pub fn describe(&self) -> String {
+        let parts: Vec<String> = [(self.messages, "chat message"), (self.routines, "routine"), (self.approvals, "approval")]
+            .into_iter()
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, what)| format!("{n} {what}{}", if n == 1 { "" } else { "s" }))
+            .collect();
+        match parts.as_slice() {
+            [] => "nothing".into(),
+            [one] => one.clone(),
+            [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        }
+    }
+}
+
+/// What one pass moved between two places. `None`: botd's own database.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMove {
@@ -79,14 +145,16 @@ pub struct ChatMove {
     pub to: Option<String>,
     pub bots: usize,
     pub messages: usize,
+    pub routines: usize,
+    pub approvals: usize,
 }
 
-/// One place chats are kept, and how many messages are there.
+/// One place chats are kept, and what of theirs is there.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ChatCount {
     /// None: botd's own database.
     pub region: Option<String>,
-    pub messages: i64,
+    pub held: Held,
 }
 
 struct Col {
@@ -104,17 +172,18 @@ fn literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-fn columns(c: &Connection, schema: &str) -> rusqlite::Result<Vec<Col>> {
-    let mut s = c.prepare(&format!("SELECT name, type, \"notnull\", dflt_value FROM pragma_table_info('messages', {})", literal(schema)))?;
+fn columns(c: &Connection, schema: &str, table: &str) -> rusqlite::Result<Vec<Col>> {
+    let mut s = c.prepare(&format!("SELECT name, type, \"notnull\", dflt_value FROM pragma_table_info({}, {})", literal(table), literal(schema)))?;
     s.query_map([], |r| Ok(Col { name: r.get(0)?, ty: r.get(1)?, notnull: r.get(2)?, default: r.get(3)? }))?.collect()
 }
 
-/// Makes the store's messages table match botd's own: the same columns, `id` its primary
-/// key without AUTOINCREMENT (ids come from botd's sequence), and the same indexes.
-fn ensure_messages(c: &Connection, schema: &str, main: &[Col]) -> rusqlite::Result<()> {
+/// Makes the store's copy of `k` match botd's own table: the same columns, `id` its primary
+/// key (without AUTOINCREMENT: message ids come from botd's sequence), and its indexes. No
+/// foreign key to `bots`, which is in another file: deleting a Bot deletes its rows here.
+fn ensure_table(c: &Connection, schema: &str, k: &Kept, main: &[Col]) -> rusqlite::Result<()> {
     let def = |col: &Col, adding: bool| {
         if col.name == "id" {
-            return "\"id\" INTEGER PRIMARY KEY".to_string();
+            return format!("\"id\" {} PRIMARY KEY", col.ty);
         }
         let default = col.default.as_ref().map(|d| format!(" DEFAULT {d}")).unwrap_or_default();
         // A column added to a table with rows can be NOT NULL only with a default.
@@ -122,15 +191,15 @@ fn ensure_messages(c: &Connection, schema: &str, main: &[Col]) -> rusqlite::Resu
         format!("{} {}{notnull}{default}", quote(&col.name), col.ty)
     };
     let defs: Vec<String> = main.iter().map(|col| def(col, false)).collect();
-    c.execute_batch(&format!("CREATE TABLE IF NOT EXISTS {schema}.messages ({})", defs.join(", ")))?;
-    let have: Vec<String> = columns(c, schema)?.into_iter().map(|c| c.name).collect();
+    c.execute_batch(&format!("CREATE TABLE IF NOT EXISTS {schema}.{} ({})", k.name, defs.join(", ")))?;
+    let have: Vec<String> = columns(c, schema, k.name)?.into_iter().map(|c| c.name).collect();
     for col in main.iter().filter(|col| !have.contains(&col.name)) {
-        c.execute_batch(&format!("ALTER TABLE {schema}.messages ADD COLUMN {}", def(col, true)))?;
+        c.execute_batch(&format!("ALTER TABLE {schema}.{} ADD COLUMN {}", k.name, def(col, true)))?;
     }
-    c.execute_batch(&format!(
-        "CREATE INDEX IF NOT EXISTS {schema}.messages_bot ON messages(bot_id, id);
-         CREATE INDEX IF NOT EXISTS {schema}.messages_created ON messages(created_at);"
-    ))
+    for (index, cols) in k.indexes {
+        c.execute_batch(&format!("CREATE INDEX IF NOT EXISTS {schema}.{index} ON {}({cols})", k.name))?;
+    }
+    Ok(())
 }
 
 /// Raises botd's own sequence for messages to at least `id`, so its table never reuses it.
@@ -170,6 +239,35 @@ fn pinned_region(bot: &str) -> String {
              WHERE tm.user_id = (SELECT owner_id FROM main.bots WHERE id = {bot})),
            (SELECT p.region FROM main.residency_pins p WHERE p.subject_type = 'user' AND p.subject_id = (SELECT owner_id FROM main.bots WHERE id = {bot})))"
     )
+}
+
+/// How many rows of each kept table in `schema` (where they exist) match `filter`, an SQL
+/// condition on the table's columns.
+fn held_in(c: &Connection, schema: &str, filter: &str, p: &[&dyn ToSql]) -> rusqlite::Result<Held> {
+    let mut n = [0; 3];
+    for (i, k) in KEPT.iter().enumerate() {
+        let exists: bool = c.query_row(&format!("SELECT COUNT(*) > 0 FROM {schema}.sqlite_master WHERE type = 'table' AND name = ?1"), [k.name], |r| r.get(0))?;
+        if exists {
+            n[i] = c.query_row(&format!("SELECT COUNT(*) FROM {schema}.{} WHERE {filter}", k.name), p, |r| r.get(0))?;
+        }
+    }
+    Ok(Held::of(n))
+}
+
+/// Checkpoints `schema`'s WAL into its file and empties it, so the zeroed pages replace
+/// the old ones there. False when a reader blocked it.
+fn flush(c: &Connection, schema: &str) -> bool {
+    c.query_row(&format!("PRAGMA {schema}.wal_checkpoint(TRUNCATE)"), [], |r| r.get::<_, i64>(0)).is_ok_and(|busy| busy == 0)
+}
+
+/// Runs `f` with `secure_delete` on for every attached file, so what it deletes or
+/// overwrites is zeroed rather than left in free pages, then sets it back.
+fn zeroing<T>(c: &Connection, f: impl FnOnce() -> rusqlite::Result<T>) -> rusqlite::Result<T> {
+    let was: i64 = c.query_row("PRAGMA main.secure_delete", [], |r| r.get(0))?;
+    c.execute_batch("PRAGMA secure_delete = ON")?;
+    let r = f();
+    let _ = c.execute_batch(&format!("PRAGMA secure_delete = {}", if was == 2 { "FAST".to_string() } else { was.to_string() }));
+    r
 }
 
 impl Db {
@@ -213,36 +311,33 @@ impl Db {
                 }
             } else {
                 c.execute("ATTACH DATABASE ?1 AS chats_dropped KEY ?2", params![path, key.unwrap_or("")]).map_err(|err| not_a_store(p, &err))?;
-                let has = |t: &str| c.query_row("SELECT COUNT(*) FROM chats_dropped.sqlite_master WHERE type = 'table' AND name = ?1", [t], |r| r.get::<_, i64>(0)).map(|n| n > 0);
-                let n = match has("messages") {
-                    Ok(true) => c.query_row("SELECT COUNT(*) FROM chats_dropped.messages", [], |r| r.get::<_, i64>(0)),
-                    Ok(false) => Ok(0),
-                    Err(err) => Err(err),
-                };
-                let own: rusqlite::Result<Option<String>> = match has("chat_store") {
+                let held = held_in(&c, "chats_dropped", "1", &[]);
+                let has = c.query_row("SELECT COUNT(*) FROM chats_dropped.sqlite_master WHERE type = 'table' AND name = 'chat_store'", [], |r| r.get::<_, i64>(0)).map(|n| n > 0);
+                let own: rusqlite::Result<Option<String>> = match has {
                     Ok(true) => c.query_row("SELECT id FROM chats_dropped.chat_store LIMIT 1", [], |r| r.get(0)).optional(),
                     Ok(false) => Ok(None),
                     Err(err) => Err(err),
                 };
                 c.execute("DETACH DATABASE chats_dropped", []).map_err(e)?;
-                let (n, own) = (n.map_err(|err| not_a_store(p, &err))?, own.map_err(|err| not_a_store(p, &err))?);
+                let (held, own) = (held.map_err(|err| not_a_store(p, &err))?, own.map_err(|err| not_a_store(p, &err))?);
                 if own.as_deref() != Some(id.as_str()) && !forget.contains(region) {
                     return Err(format!(
                         "REGION_DATA_DIRS no longer names {region}, and {path} isn't its chat store (store {id}) any more, so nothing shows whether that still held chats. \
                          Put {region}=<its folder> back with the store in it. If its chats are lost for good, add {region} to REGION_DATA_FORGET (ADR 0215)."
                     ));
                 }
-                if n > 0 {
+                if held.total() > 0 {
                     return Err(format!(
-                        "REGION_DATA_DIRS no longer names {region}, but its chat store ({path}) still holds {n} messages of pinned people's chats. \
-                         Put {region}=<its folder> back. To retire a store, end the pins in {region} first, let botd move their chats back, then remove it (ADR 0215)."
+                        "REGION_DATA_DIRS no longer names {region}, but its chat store ({path}) still holds {} of pinned people's Bots. \
+                         Put {region}=<its folder> back. To retire a store, end the pins in {region} first, let botd move their data back, then remove it (ADR 0215, ADR 0228).",
+                        held.describe()
                     ));
                 }
             }
             out.forgotten.push((region.clone(), path.clone()));
         }
-        let main = columns(&c, "main").map_err(e)?;
-        let cols = main.iter().map(|col| quote(&col.name)).collect::<Vec<_>>().join(", ");
+        let mains: Vec<Vec<Col>> = KEPT.iter().map(|k| columns(&c, "main", k.name)).collect::<rusqlite::Result<_>>().map_err(e)?;
+        let cols: Vec<String> = mains.iter().map(|m| m.iter().map(|col| quote(&col.name)).collect::<Vec<_>>().join(", ")).collect();
         let mut stores = Vec::new();
         for (i, (region, dir)) in dirs.iter().enumerate() {
             let path = dir.join("chats.sqlite");
@@ -294,7 +389,9 @@ impl Db {
                 params![region, id, path_str, now()],
             )
             .map_err(e)?;
-            ensure_messages(&c, &schema, &main).map_err(e)?;
+            for (k, main) in KEPT.iter().zip(&mains) {
+                ensure_table(&c, &schema, k, main).map_err(e)?;
+            }
             let top: i64 = c.query_row(&format!("SELECT COALESCE(MAX(id), 0) FROM {schema}.messages"), [], |r| r.get(0)).map_err(e)?;
             bump_sequence(&c, top).map_err(e)?;
             stores.push(ChatStore { region: region.clone(), schema, path, id });
@@ -303,15 +400,30 @@ impl Db {
             c.execute("DELETE FROM main.chat_stores WHERE region = ?1", [region]).map_err(e)?;
         }
         if !stores.is_empty() {
-            let parts: Vec<String> = schemas(&stores).map(|s| format!("SELECT {cols} FROM {s}.messages")).collect();
-            c.execute_batch(&format!("CREATE TEMP VIEW messages AS {}", parts.join(" UNION ALL "))).map_err(e)?;
+            for (k, cols) in KEPT.iter().zip(&cols) {
+                // A move stopped between its copy and its delete leaves a row in two places
+                // until the next pass; each id is read from the first place that has it, so
+                // the scheduler doesn't run a routine twice (updates by id keep both alike).
+                let rowid = if k.rowid { ", rowid AS rowid" } else { "" };
+                let places: Vec<&str> = schemas(&stores).collect();
+                let parts: Vec<String> = places
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        let t = k.name;
+                        let earlier: Vec<String> = places[..i].iter().map(|e| format!(" AND NOT EXISTS (SELECT 1 FROM {e}.{t} WHERE id = x.id)")).collect();
+                        format!("SELECT {cols}{rowid} FROM {s}.{t} AS x WHERE true{}", earlier.concat())
+                    })
+                    .collect();
+                c.execute_batch(&format!("CREATE TEMP VIEW {} AS {}", k.name, parts.join(" UNION ALL "))).map_err(e)?;
+            }
         }
-        let _ = self.5.set(ChatStores { stores, cols });
+        let _ = self.5.set(ChatStores { stores, cols, unflushed: Default::default() });
         Ok(out)
     }
 
-    /// The schema a new message in `bot_id`'s chat goes to.
-    fn chat_schema_for(&self, c: &Connection, bot_id: &str) -> rusqlite::Result<&str> {
+    /// The schema a new row of `bot_id`'s goes to.
+    fn place_for(&self, c: &Connection, bot_id: &str) -> rusqlite::Result<&str> {
         let stores = self.chat_stores_set();
         if stores.is_empty() {
             return Ok("main");
@@ -323,7 +435,7 @@ impl Db {
     /// Inserts a message into the place `bot_id`'s chat belongs: `cols` and `vals` without
     /// the id. Its id.
     pub(super) fn insert_chat_message(&self, c: &Connection, bot_id: &str, cols: &[&str], vals: &[&dyn ToSql]) -> rusqlite::Result<i64> {
-        let schema = self.chat_schema_for(c, bot_id)?;
+        let schema = self.place_for(c, bot_id)?;
         let marks = vec!["?"; vals.len()].join(", ");
         if schema == "main" {
             c.execute(&format!("INSERT INTO main.messages ({}) VALUES ({marks})", cols.join(", ")), vals)?;
@@ -351,12 +463,33 @@ impl Db {
         }
     }
 
-    /// Runs `sql`, which names the messages table as `{messages}`, on every place chats are
-    /// kept. The rows it changed, together.
-    pub(super) fn on_chats(&self, c: &Connection, sql: &str, p: &[&dyn ToSql]) -> rusqlite::Result<usize> {
+    /// Inserts a row of `table` (`routines` or `approvals`, whose ids are text) into the place
+    /// `bot_id`'s data belongs (ADR 0228).
+    pub(super) fn insert_kept(&self, c: &Connection, table: &str, bot_id: &str, cols: &[&str], vals: &[&dyn ToSql]) -> rusqlite::Result<()> {
+        let schema = self.place_for(c, bot_id)?;
+        let marks = vec!["?"; vals.len()].join(", ");
+        c.execute(&format!("INSERT INTO {schema}.{table} ({}) VALUES ({marks})", cols.join(", ")), vals).map(|_| ())
+    }
+
+    /// A new id for a row of `table` that no place uses: each place's primary key holds only
+    /// its own rows, and updates by id run on every place.
+    pub(super) fn unused_id(&self, c: &Connection, table: &str) -> rusqlite::Result<String> {
+        loop {
+            let id = crate::short_id();
+            let used: bool = c.query_row(&format!("SELECT EXISTS (SELECT 1 FROM {table} WHERE id = ?1)"), [&id], |r| r.get(0))?;
+            if !used {
+                return Ok(id);
+            }
+        }
+    }
+
+    /// Runs `sql`, which names kept tables as `{messages}`, `{routines}` or `{approvals}`, on
+    /// every place they are kept. The rows it changed, together.
+    pub(super) fn on_places(&self, c: &Connection, sql: &str, p: &[&dyn ToSql]) -> rusqlite::Result<usize> {
         let mut n = 0;
         for s in schemas(self.chat_stores_set()) {
-            n += c.execute(&sql.replace(TABLE, &format!("{s}.messages")), p)?;
+            let q = KEPT.iter().fold(sql.to_string(), |q, k| q.replace(&token(k.name), &format!("{s}.{}", k.name)));
+            n += c.execute(&q, p)?;
         }
         Ok(n)
     }
@@ -369,8 +502,10 @@ impl Db {
             .unwrap_or(0)
     }
 
-    /// Moves every Bot's chat to where it belongs now, and deletes store rows whose Bot is
-    /// gone (botd's own table loses them with the Bot). What moved, per pair of places.
+    /// Moves every Bot's messages, routines and approvals to where they belong now, and
+    /// deletes store rows whose Bot is gone (botd's own tables lose them with the Bot). What
+    /// moved, per pair of places. The rows deleted from where they were are zeroed in the file
+    /// (`secure_delete`), and its WAL emptied, so no copy is left in a place's free pages.
     pub fn place_chats(&self) -> rusqlite::Result<Vec<ChatMove>> {
         let Some(set) = self.5.get().filter(|s| !s.stores.is_empty()) else {
             return Ok(Vec::new());
@@ -384,63 +519,79 @@ impl Db {
              INSERT INTO temp.chat_place (bot_id, schema) SELECT b.id, CASE {}{case} ELSE 'main' END FROM main.bots b;",
             pinned_region("b.id")
         ))?;
-        let cols = &set.cols;
         let here = |to: &str| format!("bot_id IN (SELECT bot_id FROM temp.chat_place WHERE schema = {})", literal(to));
         let pairs: Vec<(&str, &str)> = schemas(&set.stores).flat_map(|to| schemas(&set.stores).filter(move |f| *f != to).map(move |from| (from, to))).collect();
         for &(from, to) in &pairs {
             let here = here(to);
-            tx.execute(&format!("INSERT OR IGNORE INTO {to}.messages ({cols}) SELECT {cols} FROM {from}.messages WHERE {here}"), [])?;
+            for (k, cols) in KEPT.iter().zip(&set.cols) {
+                tx.execute(&format!("INSERT OR IGNORE INTO {to}.{t} ({cols}) SELECT {cols} FROM {from}.{t} WHERE {here} ORDER BY rowid", t = k.name), [])?;
+            }
         }
         tx.commit()?;
         #[cfg(test)]
         if tests::CRASH_AFTER_COPY.with(|c| c.replace(false)) {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        let tx = c.unchecked_transaction()?;
-        let mut moves = Vec::new();
-        let at = now();
-        for &(from, to) in &pairs {
-            let copied = format!("{} AND id IN (SELECT id FROM {to}.messages)", here(to));
-            let bots: i64 = tx.query_row(&format!("SELECT COUNT(DISTINCT bot_id) FROM {from}.messages WHERE {copied}"), [], |r| r.get(0))?;
-            if bots == 0 {
-                continue;
+        let moves = zeroing(&c, || {
+            let tx = c.unchecked_transaction()?;
+            let mut moves = Vec::new();
+            let at = now();
+            for &(from, to) in &pairs {
+                let copied = |t: &str| format!("{} AND id IN (SELECT id FROM {to}.{t})", here(to));
+                let theirs = KEPT.iter().map(|k| format!("SELECT bot_id FROM {from}.{t} WHERE {w}", t = k.name, w = copied(k.name))).collect::<Vec<_>>().join(" UNION ");
+                let bots: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM ({theirs})"), [], |r| r.get(0))?;
+                if bots == 0 {
+                    continue;
+                }
+                let from_region = region_of(&set.stores, from).map(str::to_string);
+                if let Some(r) = &from_region {
+                    tx.execute(
+                        &format!(
+                            "INSERT INTO main.chat_moves_out (bot_id, region, moved_at) SELECT bot_id, ?1, ?2 FROM ({theirs}) WHERE true
+                             ON CONFLICT(bot_id, region) DO UPDATE SET moved_at = excluded.moved_at"
+                        ),
+                        params![r, at],
+                    )?;
+                }
+                let mut n = [0; 3];
+                for (i, k) in KEPT.iter().enumerate() {
+                    n[i] = tx.execute(&format!("DELETE FROM {from}.{} WHERE {}", k.name, copied(k.name)), [])?;
+                }
+                let to = region_of(&set.stores, to).map(str::to_string);
+                moves.push(ChatMove { from: from_region, to, bots: bots as usize, messages: n[0], routines: n[1], approvals: n[2] });
             }
-            let from_region = region_of(&set.stores, from).map(str::to_string);
-            if let Some(r) = &from_region {
-                tx.execute(
-                    &format!(
-                        "INSERT INTO main.chat_moves_out (bot_id, region, moved_at) SELECT DISTINCT bot_id, ?1, ?2 FROM {from}.messages WHERE {copied}
-                         ON CONFLICT(bot_id, region) DO UPDATE SET moved_at = excluded.moved_at"
-                    ),
-                    params![r, at],
-                )?;
+            for s in &set.stores {
+                for k in &KEPT {
+                    tx.execute(&format!("DELETE FROM {}.{} WHERE bot_id NOT IN (SELECT id FROM main.bots)", s.schema, k.name), [])?;
+                }
             }
-            let messages = tx.execute(&format!("DELETE FROM {from}.messages WHERE {copied}"), [])?;
-            moves.push(ChatMove { from: from_region, to: region_of(&set.stores, to).map(str::to_string), bots: bots as usize, messages });
+            tx.commit()?;
+            Ok(moves)
+        })?;
+        if !moves.is_empty() || set.unflushed.load(Ordering::Relaxed) {
+            let done = schemas(&set.stores).fold(true, |done, s| flush(&c, s) && done);
+            set.unflushed.store(!done, Ordering::Relaxed);
         }
-        for s in &set.stores {
-            tx.execute(&format!("DELETE FROM {}.messages WHERE bot_id NOT IN (SELECT id FROM main.bots)", s.schema), [])?;
-        }
-        tx.commit()?;
         Ok(moves)
     }
 
-    /// How many messages of the chats of Bots `owners` own are in each place: botd's own
-    /// database first, then each store, places with none left out.
+    /// True while rows that left a place may still be readable in its file, because a
+    /// reader blocked the checkpoint after the move. The next pass tries again.
+    pub fn chat_stores_unflushed(&self) -> bool {
+        self.5.get().is_some_and(|s| s.unflushed.load(Ordering::Relaxed))
+    }
+
+    /// What of the Bots `owners` own is in each place: botd's own database first, then each
+    /// store, places with none left out.
     pub fn chat_counts(&self, owners: &[String]) -> Vec<ChatCount> {
         let owners = serde_json::to_string(owners).unwrap_or_else(|_| "[]".into());
         let c = self.c();
         let stores = self.chat_stores_set();
+        let theirs = "bot_id IN (SELECT id FROM main.bots WHERE owner_id IN (SELECT value FROM json_each(?1)))";
         schemas(stores)
             .filter_map(|s| {
-                let n: i64 = c
-                    .query_row(
-                        &format!("SELECT COUNT(*) FROM {s}.messages WHERE bot_id IN (SELECT id FROM main.bots WHERE owner_id IN (SELECT value FROM json_each(?1)))"),
-                        [&owners],
-                        |r| r.get(0),
-                    )
-                    .ok()?;
-                (n > 0).then(|| ChatCount { region: region_of(stores, s).map(str::to_string), messages: n })
+                let held = held_in(&c, s, theirs, &[&owners]).ok()?;
+                (held.total() > 0).then(|| ChatCount { region: region_of(stores, s).map(str::to_string), held })
             })
             .collect()
     }
@@ -459,34 +610,64 @@ impl Db {
         s.query_map(params![owners, except], |r| Ok((r.get(0)?, r.get(1)?))).map(|rows| rows.flatten().collect()).unwrap_or_default()
     }
 
-    /// Every store and how many messages it holds.
-    pub fn chat_store_counts(&self) -> Vec<(ChatStore, i64)> {
+    /// Every store and what it holds.
+    pub fn chat_store_counts(&self) -> Vec<(ChatStore, Held)> {
         let c = self.c();
-        self.chat_stores_set()
-            .iter()
-            .map(|s| (s.clone(), c.query_row(&format!("SELECT COUNT(*) FROM {}.messages", s.schema), [], |r| r.get(0)).unwrap_or(0)))
-            .collect()
+        self.chat_stores_set().iter().map(|s| (s.clone(), held_in(&c, &s.schema, "1", &[]).unwrap_or_default())).collect()
     }
 
-    /// Redacts known secrets from the stores' chats, as startup does for botd's own
-    /// (`redact::scrub_rows`). How many rows changed.
+    /// Redacts known secrets from the stores' chats and approval subjects, as startup does
+    /// for botd's own (`redact::scrub_rows`). How many rows changed.
     pub fn scrub_chat_stores(&self) -> rusqlite::Result<usize> {
-        let tables: Vec<String> = self.chat_stores_set().iter().map(|s| format!("{}.messages", s.schema)).collect();
-        if tables.is_empty() {
+        let stores = self.chat_stores_set();
+        if stores.is_empty() {
             return Ok(0);
         }
-        let tables: Vec<&str> = tables.iter().map(String::as_str).collect();
-        crate::secrets::redact::scrub_rows_in(&self.c(), &tables, false)
+        let table = |k: usize| stores.iter().map(|s| format!("{}.{}", s.schema, KEPT[k].name)).collect::<Vec<_>>();
+        let (messages, approvals) = (table(MESSAGES), table(APPROVALS));
+        let (messages, approvals): (Vec<&str>, Vec<&str>) = (messages.iter().map(String::as_str).collect(), approvals.iter().map(String::as_str).collect());
+        crate::secrets::redact::scrub_rows_in(&self.c(), &messages, &approvals)
+    }
+
+    /// Brings the stores' approval inputs under the master key `current`, as startup does
+    /// botd's own (ADR 0228): those sealed under `previous` (mid-rotation) are sealed again,
+    /// plaintext is sealed, and with `forget` (SUPERBOT_FORGET_SEALED=1) those neither key
+    /// opens are dropped. The values replaced are zeroed and the store's WAL emptied, so they
+    /// don't linger in its free pages. Refuses when an input opens with neither key and
+    /// nothing says what to do about it.
+    pub fn seal_store_approvals(&self, current: &Cipher, previous: Option<&Cipher>, forget: bool) -> Result<StoreApprovals, String> {
+        let c = self.c();
+        let mut done = StoreApprovals::default();
+        for s in self.chat_stores_set() {
+            let table = format!("{}.approvals", s.schema);
+            let r = zeroing(&c, || Ok(sealed::approvals_in(&c, &table, current, previous, forget)))
+                .map_err(|e| e.to_string())
+                .and_then(|r| r)
+                .map_err(|e| format!("{}'s chat store: {e}", s.region))?;
+            if r.sealed + r.resealed + r.discarded > 0 && !flush(&c, &s.schema) {
+                if let Some(set) = self.5.get() {
+                    set.unflushed.store(true, Ordering::Relaxed);
+                }
+            }
+            done.add(&r);
+        }
+        Ok(done)
+    }
+
+    /// Which place row `id` of `table` is in: None for botd's own database.
+    #[cfg(test)]
+    pub fn place_of(&self, table: &str, id: &dyn ToSql) -> Option<Option<String>> {
+        let c = self.c();
+        let stores = self.chat_stores_set();
+        schemas(stores)
+            .find(|s| c.query_row(&format!("SELECT 1 FROM {s}.{table} WHERE id = ?1"), [id], |_| Ok(())).is_ok())
+            .map(|s| region_of(stores, s).map(str::to_string))
     }
 
     /// Which place message `id` is in: None for botd's own database.
     #[cfg(test)]
     pub fn chat_place_of(&self, id: i64) -> Option<Option<String>> {
-        let c = self.c();
-        let stores = self.chat_stores_set();
-        schemas(stores)
-            .find(|s| c.query_row(&format!("SELECT 1 FROM {s}.messages WHERE id = ?1"), [id], |_| Ok(())).is_ok())
-            .map(|s| region_of(stores, s).map(str::to_string))
+        self.place_of("messages", &id)
     }
 }
 
@@ -519,7 +700,7 @@ impl Drop for Scratch {
 mod tests {
     use super::*;
     use crate::acl::Visibility;
-    use crate::db::PinOn;
+    use crate::db::{NewRule, PinOn};
     use crate::rbac::Role;
     use std::cell::Cell;
 
@@ -567,6 +748,10 @@ mod tests {
         db.create_bot_owned("B", "#fff", "waddle", "claude", None, false, owner, Visibility::Private).id
     }
 
+    fn mv(from: Option<&str>, to: Option<&str>, bots: usize, n: [usize; 3]) -> ChatMove {
+        ChatMove { from: from.map(str::to_string), to: to.map(str::to_string), bots, messages: n[0], routines: n[1], approvals: n[2] }
+    }
+
     fn rows_in(path: &Path) -> i64 {
         let c = Connection::open(path).unwrap();
         c.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0)).unwrap()
@@ -609,16 +794,16 @@ mod tests {
         assert_eq!(db.last_id(), other.id);
 
         // A pass moves the older message to London too, once.
-        assert_eq!(db.place_chats().unwrap(), vec![ChatMove { from: None, to: Some("gb-lon".into()), bots: 1, messages: 1 }]);
+        assert_eq!(db.place_chats().unwrap(), vec![mv(None, Some("gb-lon"), 1, [1, 0, 0])]);
         assert!(db.place_chats().unwrap().is_empty());
         assert_eq!((rows_in(&d.lon.join("chats.sqlite")), rows_in(&d.fra.join("chats.sqlite"))), (2, 0));
-        assert_eq!(db.chat_counts(std::slice::from_ref(&ada)), vec![ChatCount { region: Some("gb-lon".into()), messages: 2 }]);
-        assert_eq!(db.chat_counts(std::slice::from_ref(&cy)), vec![ChatCount { region: None, messages: 1 }]);
+        assert_eq!(db.chat_counts(std::slice::from_ref(&ada)), vec![ChatCount { region: Some("gb-lon".into()), held: Held { messages: 2, ..Held::default() } }]);
+        assert_eq!(db.chat_counts(std::slice::from_ref(&cy)), vec![ChatCount { region: None, held: Held { messages: 1, ..Held::default() } }]);
         assert_eq!(db.messages(&ada_bot, 10).len(), 2, "no copy left behind");
 
         // Unpinned, it comes back to botd's own table, ids unchanged.
         db.unpin_residency(PinOn::User, &ada).unwrap();
-        assert_eq!(db.place_chats().unwrap(), vec![ChatMove { from: Some("gb-lon".into()), to: None, bots: 1, messages: 2 }]);
+        assert_eq!(db.place_chats().unwrap(), vec![mv(Some("gb-lon"), None, 1, [2, 0, 0])]);
         assert_eq!(db.chat_place_of(m.id), Some(None));
         // botd's own table never hands out an id a store used.
         assert!(db.add_message(&cy_bot, "user", "next", None, false, None).id > other.id);
@@ -635,7 +820,7 @@ mod tests {
         let m = db.add_message(&bot_of(&db, &ada), "user", "x", None, false, None);
         assert_eq!(db.chat_place_of(m.id), Some(Some("de-fra-2".into())));
         assert!(db.remove_team_member(&t.id, &ada, false));
-        assert_eq!(db.place_chats().unwrap(), vec![ChatMove { from: Some("de-fra-2".into()), to: None, bots: 1, messages: 1 }]);
+        assert_eq!(db.place_chats().unwrap(), vec![mv(Some("de-fra-2"), None, 1, [1, 0, 0])]);
     }
 
     #[test]
@@ -675,7 +860,8 @@ mod tests {
         db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
         // As if the store's commit landed and botd's own didn't.
         db.c().execute("INSERT INTO chats_0.messages SELECT * FROM main.messages WHERE id = ?1", [m.id]).unwrap();
-        assert_eq!(db.message_count(&bot), 2);
+        assert_eq!((count(&db, "main", "messages"), count(&db, "chats_0", "messages")), (1, 1));
+        assert_eq!(db.message_count(&bot), 1, "read once meanwhile");
         db.place_chats().unwrap();
         assert_eq!((db.message_count(&bot), db.chat_place_of(m.id)), (1, Some(Some("gb-lon".into()))));
     }
@@ -725,7 +911,7 @@ mod tests {
 
         // Dropped from REGION_DATA_DIRS while it holds chats.
         let e = start(&d.both()[1..]).unwrap_err();
-        assert!(e.contains("no longer names gb-lon") && e.contains("still holds 1 messages"), "{e}");
+        assert!(e.contains("no longer names gb-lon") && e.contains("still holds 1 chat message of pinned"), "{e}");
         // Its file gone (an unmounted volume): no empty store is made in its place.
         let (lon, kept) = (d.lon.join("chats.sqlite"), d.dir.path().join("kept.sqlite"));
         std::fs::rename(&lon, &kept).unwrap();
@@ -750,7 +936,7 @@ mod tests {
         std::fs::rename(&kept, &lon).unwrap();
         let db = d.db();
         assert_eq!(db.attach_chat_stores(&d.both(), &[], None).unwrap(), Attached::default());
-        assert_eq!(db.chat_store_counts().iter().map(|(s, n)| (s.region.as_str(), *n)).collect::<Vec<_>>(), vec![("gb-lon", 1), ("de-fra-2", 0)]);
+        assert_eq!(db.chat_store_counts().iter().map(|(s, n)| (s.region.as_str(), n.messages)).collect::<Vec<_>>(), vec![("gb-lon", 1), ("de-fra-2", 0)]);
     }
 
     #[test]
@@ -841,5 +1027,259 @@ mod tests {
         let e = prepare_store(&foreign, Some(&new), None).unwrap_err();
         assert!(e.contains("isn't a chat store botd made"), "{e}");
         assert_eq!(std::fs::read(&foreign).unwrap(), before);
+    }
+
+    fn approve(db: &Db, bot: &str, subject: &str) -> String {
+        db.add_approval(bot, "claude", "Bash", "command", subject, &serde_json::json!({ "command": subject }), "write", "asks", now() + 60_000).id
+    }
+
+    fn count(db: &Db, schema: &str, table: &str) -> i64 {
+        db.c().query_row(&format!("SELECT COUNT(*) FROM {schema}.{table}"), [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn a_pinned_owners_routines_and_approvals_are_kept_with_their_chat() {
+        let d = Dirs::new();
+        let db = d.up();
+        let (ada, cy) = (user(&db, "ada"), user(&db, "cy"));
+        let (bot, other) = (bot_of(&db, &ada), bot_of(&db, &cy));
+        let before = db.add_routine(&bot, "before", "0 9 * * *", "made before the pin");
+        let asked = approve(&db, &bot, "ls before");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+
+        // New rows go straight to London; others' stay in botd's own database.
+        let r = db.add_routine_by(&bot, "daily", "0 9 * * *", "summarise the contract", true, Some(&ada));
+        let a = approve(&db, &bot, "cat contract.txt");
+        let theirs = db.add_routine(&other, "x", "0 9 * * *", "not pinned");
+        assert_eq!(db.place_of("routines", &r.id), Some(Some("gb-lon".into())));
+        assert_eq!(db.place_of("approvals", &a), Some(Some("gb-lon".into())));
+        assert_eq!(db.place_of("routines", &theirs.id), Some(None));
+
+        // Reads see every place; the sealed input still opens where it is kept.
+        assert_eq!(db.routines(None).len(), 3);
+        assert_eq!(db.routines(Some(&bot)).iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["before", "daily"]);
+        assert_eq!(db.approval(&a).unwrap().input["command"], "cat contract.txt");
+        assert_eq!(db.approvals(Some("pending"), None, 10).len(), 2);
+        assert_eq!(db.approvals_among(None, std::slice::from_ref(&bot), 10).len(), 2);
+        assert_eq!(db.approvals_pending().0, 2);
+
+        // Writes by id reach the store.
+        db.update_routine(&r.id, Some("weekly"), Some("0 9 * * 1"), Some("summarise it again"), None, Some(&cy));
+        assert!(db.pause_routine(&r.id, "owner_disabled", &ada, now()));
+        assert_eq!(db.routines_paused_for(&ada).len(), 1);
+        assert!(db.resume_routine(&r.id));
+        db.routine_ran(&r.id, 42);
+        let got = db.routine(&r.id).unwrap();
+        assert_eq!((got.name.as_str(), got.instruction.as_str(), got.author_id.as_deref(), got.last_run_at), ("weekly", "summarise it again", Some(cy.as_str()), Some(42)));
+        assert!(db.finish_approval(&a, "approved", "ada", Some("fine"), None));
+        assert!(!db.finish_approval(&a, "denied", "cy", None, None), "first decision wins");
+        assert_eq!(db.approval(&a).unwrap().status, "approved");
+        let rule = NewRule { bot_id: Some(&bot), action: crate::policy::Action::Allow, tool: "Bash", pattern: "ls before", note: "ok" };
+        assert!(db.finish_approval_with_rule(&asked, "approved", "ada", None, &rule).is_some(), "the rule is saved with a decision in the store");
+
+        // A pass moves what was made before the pin; unpinned, all of it comes back.
+        let moves = db.place_chats().unwrap();
+        assert_eq!(moves, vec![mv(None, Some("gb-lon"), 1, [0, 1, 1])]);
+        assert_eq!((count(&db, "chats_0", "routines"), count(&db, "chats_0", "approvals"), count(&db, "main", "routines")), (2, 2, 1));
+        assert_eq!(db.routine(&before.id).unwrap().instruction, "made before the pin");
+        assert_eq!(db.approval(&asked).unwrap().input["command"], "ls before", "sealed by its id, so it opens wherever it is kept");
+        let held = db.chat_counts(std::slice::from_ref(&ada));
+        assert_eq!(held, vec![ChatCount { region: Some("gb-lon".into()), held: Held { messages: 0, routines: 2, approvals: 2 } }]);
+        db.unpin_residency(PinOn::User, &ada).unwrap();
+        assert_eq!(db.place_chats().unwrap(), vec![mv(Some("gb-lon"), None, 1, [0, 2, 2])]);
+        assert_eq!((count(&db, "chats_0", "routines"), count(&db, "chats_0", "approvals")), (0, 0));
+        assert!(db.chat_moves_out(std::slice::from_ref(&ada), "de-fra-2").iter().any(|(r, _)| r == "gb-lon"), "London's earlier backups still hold them");
+        assert_eq!(db.routines(None).len(), 3);
+    }
+
+    #[test]
+    fn approvals_are_newest_first_with_ties_in_the_order_they_were_asked() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        let bot = bot_of(&db, &ada);
+        let ids: Vec<String> = (0..4).map(|i| approve(&db, &bot, &format!("cmd {i}"))).collect();
+        db.c().execute("UPDATE chats_0.approvals SET created_at = 1000", []).unwrap();
+        let listed: Vec<String> = db.approvals(None, Some(&bot), 10).into_iter().map(|a| a.id).collect();
+        assert_eq!(listed, ids.iter().rev().cloned().collect::<Vec<_>>(), "the view keeps each place's rowid for the tie-break");
+    }
+
+    #[test]
+    fn deleting_a_bot_takes_its_routines_and_approvals_out_of_the_store_at_once() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        let bot = bot_of(&db, &ada);
+        db.add_routine(&bot, "daily", "0 9 * * *", "x");
+        approve(&db, &bot, "ls");
+        assert!(db.delete_bot_unless_held(&bot));
+        assert_eq!((count(&db, "chats_0", "routines"), count(&db, "chats_0", "approvals")), (0, 0), "the scheduler never sees a routine whose Bot is gone");
+        // One deleted another way is cleared by the next pass.
+        let other = bot_of(&db, &ada);
+        db.add_routine(&other, "daily", "0 9 * * *", "x");
+        approve(&db, &other, "ls");
+        db.delete_bot(&other);
+        db.place_chats().unwrap();
+        assert_eq!((count(&db, "chats_0", "routines"), count(&db, "chats_0", "approvals")), (0, 0));
+    }
+
+    #[test]
+    fn erasing_someone_reaches_routines_and_approvals_in_a_store() {
+        let d = Dirs::new();
+        let db = d.up();
+        let (ada, cy) = (user(&db, "ada"), user(&db, "cy"));
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        let bot = bot_of(&db, &ada);
+        let r = db.add_routine_by(&bot, "cy's", "0 9 * * *", "written by cy", true, Some(&cy));
+        let a = approve(&db, &bot, "ls");
+        assert!(db.finish_approval(&a, "approved", &cy, Some("cy's note"), None));
+        let out = db.erase_user(&cy, "erased-1", None, &[]).unwrap();
+        assert_eq!((out.routines, out.approvals), (1, 1));
+        assert!(db.routine(&r.id).is_none());
+        let after = db.approval(&a).unwrap();
+        assert_eq!((after.decided_by.as_deref(), after.note), (Some("erased-1"), None));
+    }
+
+    #[test]
+    fn a_move_of_routines_and_approvals_stopped_between_copy_and_delete_loses_nothing() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        let bot = bot_of(&db, &ada);
+        let r = db.add_routine(&bot, "daily", "0 9 * * *", "x");
+        let a = approve(&db, &bot, "ls");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        CRASH_AFTER_COPY.with(|c| c.set(true));
+        assert!(db.place_chats().is_err());
+        assert_eq!((count(&db, "chats_0", "routines"), count(&db, "main", "routines")), (1, 1), "copied, original kept");
+        assert_eq!((db.routines(None).len(), db.approvals(None, None, 10).len()), (1, 1), "each read once, so the scheduler doesn't run it twice");
+        // A decision meanwhile reaches both copies, so neither is stale.
+        assert!(db.finish_approval(&a, "denied", "ada", None, None));
+        assert_eq!(db.place_chats().unwrap(), vec![mv(None, Some("gb-lon"), 1, [0, 1, 1])]);
+        assert_eq!((db.place_of("routines", &r.id), db.approval(&a).unwrap().status.as_str()), (Some(Some("gb-lon".into())), "denied"));
+        assert_eq!(db.routines(None).len(), 1, "no copy left behind");
+    }
+
+    #[test]
+    fn moved_rows_leave_no_copy_in_the_files_they_left() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        let bot = bot_of(&db, &ada);
+        let words = ["chat-4e1d6a-contract", "routine-93bc07-instruction", "approval-c5f2e8-subject"];
+        db.add_message(&bot, "user", words[0], None, false, None);
+        db.add_routine(&bot, "daily", "0 9 * * *", words[1]);
+        approve(&db, &bot, words[2]);
+        let holds = |path: &Path, w: &str| std::fs::read(path).is_ok_and(|b| b.windows(w.len()).any(|x| x == w.as_bytes()));
+        let app = d.dir.path().join("app.sqlite");
+        let wal = d.dir.path().join("app.sqlite-wal");
+        assert!(words.iter().all(|w| holds(&app, w) || holds(&wal, w)), "written to botd's own database first");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        assert_eq!(db.place_chats().unwrap(), vec![mv(None, Some("gb-lon"), 1, [1, 1, 1])]);
+        for w in words {
+            assert!(!holds(&app, w) && !holds(&wal, w), "{w} left in botd's own database's free pages or WAL");
+        }
+        assert_eq!(db.c().query_row("PRAGMA main.secure_delete", [], |r| r.get::<_, i64>(0)).unwrap(), 0, "set back after the move");
+        // And moving back out of London leaves nothing in its store either.
+        let lon = d.lon.join("chats.sqlite");
+        db.unpin_residency(PinOn::User, &ada).unwrap();
+        db.place_chats().unwrap();
+        for w in words {
+            assert!(!holds(&lon, w) && !holds(&d.lon.join("chats.sqlite-wal"), w), "{w} left in London's store");
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_a_reader_blocked_is_tried_again_on_the_next_pass() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        let bot = bot_of(&db, &ada);
+        let word = "routine-7a41d9-instruction";
+        db.add_routine(&bot, "daily", "0 9 * * *", word);
+        db.c().query_row("PRAGMA main.wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0)).unwrap();
+        let app = d.dir.path().join("app.sqlite");
+        let holds = || std::fs::read(&app).is_ok_and(|b| b.windows(word.len()).any(|x| x == word.as_bytes()));
+        assert!(holds());
+        let reader = Connection::open(&app).unwrap();
+        reader.execute_batch("BEGIN; SELECT COUNT(*) FROM bots;").unwrap();
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        assert_eq!(db.place_chats().unwrap().len(), 1);
+        assert!(db.chat_stores_unflushed() && holds(), "the old page is still in the file");
+        reader.execute_batch("COMMIT").unwrap();
+        assert_eq!(db.place_chats().unwrap(), Vec::new());
+        assert!(!db.chat_stores_unflushed() && !holds(), "a pass with nothing to move finishes it");
+    }
+
+    #[test]
+    fn a_dropped_store_holding_routines_or_approvals_stops_botd() {
+        let d = Dirs::new();
+        {
+            let db = d.up();
+            let ada = user(&db, "ada");
+            db.pin_residency(PinOn::User, &ada, "de-fra-2", "DPA-1", None).unwrap();
+            let bot = bot_of(&db, &ada);
+            db.add_routine(&bot, "daily", "0 9 * * *", "x");
+            approve(&db, &bot, "ls");
+            approve(&db, &bot, "pwd");
+        }
+        let e = d.db().attach_chat_stores(&d.both()[..1], &[], None).unwrap_err();
+        assert!(e.contains("still holds 1 routine and 2 approvals of pinned people's Bots"), "{e}");
+    }
+
+    #[test]
+    fn a_store_gets_the_routine_and_approval_columns_botds_tables_gained_since() {
+        let d = Dirs::new();
+        drop(d.up());
+        Connection::open(d.lon.join("chats.sqlite")).unwrap().execute_batch("ALTER TABLE approvals DROP COLUMN scope; ALTER TABLE routines DROP COLUMN paused_at;").unwrap();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        let bot = bot_of(&db, &ada);
+        let a = approve(&db, &bot, "ls");
+        assert!(db.finish_approval_for_run(&a, "ada", None));
+        assert_eq!(db.approval(&a).unwrap().scope.as_deref(), Some("run"));
+        let r = db.add_routine(&bot, "daily", "0 9 * * *", "x");
+        assert!(db.pause_routine(&r.id, "owner_disabled", &ada, 7));
+        assert_eq!(db.routine(&r.id).unwrap().paused_at, Some(7));
+    }
+
+    #[test]
+    fn startup_seals_a_stores_approvals_under_the_current_master_key() {
+        use crate::secrets::key::MasterKey;
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        let bot = bot_of(&db, &ada);
+        let (old, fresh) = (approve(&db, &bot, "under the old key"), approve(&db, &bot, "under the current key"));
+        let current = sealed::cipher();
+        let previous = Cipher::new(&MasterKey::generate());
+        let ctx = sealed::approval_context(&old);
+        let stale = previous.seal(&ctx, br#"{"command":"under the old key"}"#);
+        db.c().execute("UPDATE chats_0.approvals SET input = ?1 WHERE id = ?2", params![stale, old]).unwrap();
+        assert_eq!(db.approval(&old).unwrap().input["sealed"], "unreadable");
+        // Outside a rotation, a value the key doesn't open refuses, changing nothing.
+        let e = db.seal_store_approvals(&current, None, false).unwrap_err();
+        assert!(e.contains("gb-lon's chat store: 1 saved tool inputs of approvals in it don't open with the master key") && e.contains("SUPERBOT_FORGET_SEALED=1"), "{e}");
+        // Mid-rotation it is sealed again under the new key, once.
+        let done = db.seal_store_approvals(&current, Some(&previous), false).unwrap();
+        assert_eq!(done, StoreApprovals { resealed: 1, ..Default::default() });
+        assert_eq!(db.approval(&old).unwrap().input["command"], "under the old key");
+        assert_eq!(db.approval(&fresh).unwrap().input["command"], "under the current key");
+        assert_eq!(db.seal_store_approvals(&current, Some(&previous), false).unwrap(), StoreApprovals::default());
+        // Neither key: left as it was during a rotation, dropped when told to forget.
+        let lost = Cipher::new(&MasterKey::generate()).seal(&ctx, b"{}");
+        db.c().execute("UPDATE chats_0.approvals SET input = ?1 WHERE id = ?2", params![lost, old]).unwrap();
+        assert_eq!(db.seal_store_approvals(&current, Some(&previous), false).unwrap(), StoreApprovals { unreadable: 1, ..Default::default() });
+        assert_eq!(db.seal_store_approvals(&current, None, true).unwrap(), StoreApprovals { discarded: 1, ..Default::default() });
+        assert_eq!(db.approval(&old).unwrap().input, serde_json::json!({ "sealed": "discarded" }));
+        // Plaintext (from a copy made by hand) is redacted and sealed.
+        db.c().execute("UPDATE chats_0.approvals SET input = '{\"command\":\"ls\"}' WHERE id = ?1", [&fresh]).unwrap();
+        assert_eq!(db.seal_store_approvals(&current, None, false).unwrap(), StoreApprovals { sealed: 1, ..Default::default() });
+        let raw: String = db.c().query_row("SELECT input FROM chats_0.approvals WHERE id = ?1", [&fresh], |r| r.get(0)).unwrap();
+        assert!(sealed::is_sealed(&raw) && db.approval(&fresh).unwrap().input["command"] == "ls");
     }
 }
