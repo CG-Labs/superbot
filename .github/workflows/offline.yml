@@ -19,10 +19,13 @@ name: offline
 # (docs/adr/0172-release-bundles-checked-end-to-end.md).
 # It builds a Hermes bundle, connected, and installs Hermes Agent from it with no network; an
 # upgrade without --with-hermes keeps it (docs/adr/0200-hermes-agent-bundle-for-air-gapped-installs.md).
+# It builds a harness bundle (Node.js, Claude Code, Codex and Pi at botd's pins), connected, and
+# installs it with no network; an upgrade without --harness-bundle keeps it
+# (docs/adr/0232-harness-cli-bundle-for-air-gapped-servers.md).
 # release-bundle: for every v* tag, once the docker workflow has published and signed that tag's
 # images (or by hand, for a published release), bundles them for each arch, with a Hermes bundle
-# for each arch, signs each bundle with cosign keylessly under this workflow's identity, and
-# attaches them to the release.
+# and a harness bundle for each arch, signs each bundle with cosign keylessly under this
+# workflow's identity, and attaches them to the release.
 # release-check: then checks what was attached end to end, against ghcr.io and with no network
 # (offline-release-check.yml, which also runs weekly on the latest release).
 
@@ -309,6 +312,51 @@ jobs:
           grep -Fq "Hermes Agent ${commit:0:12} is already installed in /opt/hermes" /tmp/offline-hermes-again.log
           sudo test -e /opt/hermes/.ci-marker
           sudo systemctl is-active --quiet superbot
+      # Connected, as an operator makes it once per release, at the pins of that release's botd
+      # (ADR 0232); then nothing below has a network.
+      - name: A harness bundle, built with the network
+        run: |
+          set -euo pipefail
+          deploy/offline-bundle.sh harnesses --out "$RUNNER_TEMP/n" --version "$NEW"
+          nb=$RUNNER_TEMP/n/superbot-harnesses-$NEW-$(uname -m).tar.gz
+          deploy/offline-bundle.sh verify "$nb"
+          echo "NB=$nb" >>"$GITHUB_ENV"
+          ls -l "$RUNNER_TEMP/n"
+      - name: Install the harness CLIs from their bundle with no network; an upgrade without it keeps them
+        run: |
+          set -euo pipefail
+          arch=$(uname -m)
+          upgrade() {
+            sudo ip netns exec offline bash deploy/install.sh --offline "$RUNNER_TEMP/b/superbot-offline-$NEW-$arch.tar.gz" --upgrade \
+              --domain offline.test --tls-cert "$RUNNER_TEMP/tls.pem" --tls-key "$RUNNER_TEMP/tls.key" --non-interactive --tz UTC "$@"
+          }
+          if sudo ip netns exec offline curl -sS --max-time 5 https://registry.npmjs.org >/dev/null 2>&1; then echo "the network is still up" >&2; exit 1; fi
+          upgrade --harness-bundle "$NB" | tee /tmp/offline-harnesses.log
+          grep -Fq "Harness bundle: claude codex pi on Node.js" /tmp/offline-harnesses.log
+          grep -Fq "Installing claude codex pi system-wide in /opt/superbot-harnesses from the harness bundle" /tmp/offline-harnesses.log
+          [[ $(sudo stat -c '%U %a' /opt/superbot-harnesses) == 'root 755' ]]
+          writable=$(sudo find /opt/superbot-harnesses -perm /022 ! -type l -print -quit)
+          if [[ -n "$writable" ]]; then echo "the harness CLIs are writable by other accounts: $writable" >&2; exit 1; fi
+          if ls -d /opt/.superbot-harnesses.* 2>/dev/null; then echo "the harness bundle's staging was left behind" >&2; exit 1; fi
+          probe=$(mktemp -d) && chmod 0777 "$probe"
+          for b in claude codex pi; do
+            [[ $(readlink "/usr/local/bin/$b") == "/opt/superbot-harnesses/superbot/$b" ]]
+            want=$(sed -n "s/^harness_$b=\([^ ]*\) .*/\1/p" /opt/superbot-harnesses/superbot/MANIFEST)
+            out=$(sudo ip netns exec offline sudo -u nobody env -i HOME="$probe" PATH=/usr/bin:/bin "/usr/local/bin/$b" --version)
+            echo "$b: $out"
+            [[ -n $want && $out == *"$want"* ]]
+          done
+          sudo ip netns exec offline sudo -u superbot -H env HOME="$probe" PATH=/usr/local/bin:/usr/bin:/bin claude --version >/dev/null
+          sudo rm -rf "$probe"
+          sudo systemctl is-active --quiet superbot
+          sudo touch /opt/superbot-harnesses/.ci-marker
+          upgrade | tee /tmp/offline-harnesses-kept.log
+          if grep -E 'Installing claude|Unpacking claude|this release pins' /tmp/offline-harnesses-kept.log; then echo "an upgrade without --harness-bundle touched the harness CLIs" >&2; exit 1; fi
+          sudo test -e /opt/superbot-harnesses/.ci-marker
+          upgrade --harness-bundle "$NB" | tee /tmp/offline-harnesses-again.log
+          grep -Fq "The harness CLIs this release pins are already installed in /opt/superbot-harnesses" /tmp/offline-harnesses-again.log
+          sudo test -e /opt/superbot-harnesses/.ci-marker
+          sudo systemctl is-active --quiet superbot
       - name: Load the bundle's images into Docker with no network
         run: |
           set -euo pipefail
@@ -470,6 +518,19 @@ jobs:
             cat "$f.sha256" >>"$GITHUB_STEP_SUMMARY"
             mv "$f" "$f.sha256" "$f.sigstore.json" dist/
           done
+      # Node.js, Claude Code, Codex and Pi at this release's pins, for --offline --harness-bundle
+      # (ADR 0232).
+      - name: Bundle the harness CLIs, and sign it
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          deploy/offline-bundle.sh harnesses --out "$RUNNER_TEMP/n" --version "$VERSION"
+          f=$RUNNER_TEMP/n/superbot-harnesses-$VERSION-$ARCH.tar.gz
+          cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
+          deploy/offline-bundle.sh verify "$f"
+          cat "$f.sha256" >>"$GITHUB_STEP_SUMMARY"
+          mv "$f" "$f.sha256" "$f.sigstore.json" dist/
       # The release workflow makes the release from the same tag, usually long before this.
       - name: Attach to the release
         env:
@@ -481,6 +542,7 @@ jobs:
           gh release view "$TAG" >/dev/null || { echo "::error::No GitHub release for $TAG: the release workflow makes it"; exit 1; }
           gh release upload "$TAG" dist/superbot-offline-* --clobber
           gh release upload "$TAG" dist/superbot-hermes-* --clobber
+          gh release upload "$TAG" dist/superbot-harnesses-* --clobber
 
   release-check:
     # What release-bundle attached, checked end to end as a customer uses it (ADR 0172).

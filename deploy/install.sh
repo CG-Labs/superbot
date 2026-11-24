@@ -70,6 +70,22 @@ HERMES_STAGE=""
 HERMES_BUNDLE_DIR=""
 # The tree install_hermes_shared moved aside, put back if the new one fails.
 HERMES_PREVIOUS=""
+# --harness-bundle: Claude Code, Codex and Pi with their own Node.js, at the release's pins, for
+# --offline, already installed for HARNESSES_DIR on a connected machine by
+# deploy/offline-bundle.sh harnesses (docs/adr/0232-harness-cli-bundle-for-air-gapped-servers.md).
+HARNESS_BUNDLE=""
+HARNESS_BUNDLE_SHA256=""
+HARNESSES_DIR=/opt/superbot-harnesses
+# Set by prepare_harness_bundle, as for Hermes: the checked bundle's root inside HARNESS_STAGE,
+# and the MANIFEST lines this release's botd pins (harness_manifest_lines).
+HARNESS_STAGE=""
+HARNESS_BUNDLE_DIR=""
+HARNESS_WANTED=""
+# The tree install_harnesses moved aside, whether the new one is in HARNESSES_DIR, and the links
+# it made where there were none: all undone if the new tree fails.
+HARNESS_PREVIOUS=""
+HARNESS_MOVED_IN=false
+HARNESS_LINKED=()
 SHARE_DIR=${SHARE_DIR:-/usr/local/share/superbot}
 SYSTEMD_DIR=${SYSTEMD_DIR:-/etc/systemd/system}
 CLIENT_DIR=${CLIENT_DIR:-/var/www/superbot-app}
@@ -156,6 +172,12 @@ Usage: install.sh [options]
                       (deploy/offline-bundle.sh hermes), checked like the bundle
   --hermes-bundle-sha256 HEX
                       The Hermes bundle's SHA-256, from where it was published (else FILE.sha256)
+  --harness-bundle FILE
+                      With --offline: install Claude Code, Codex and Pi, with their own Node.js,
+                      from this harness bundle (deploy/offline-bundle.sh harnesses) into
+                      /opt/superbot-harnesses, checked like the bundle and against its pins
+  --harness-bundle-sha256 HEX
+                      The harness bundle's SHA-256, from where it was published (else FILE.sha256)
   --tls-cert PATH, --tls-key PATH
                       Serve --domain with this certificate (PEM, full chain) and key instead of
                       getting one from Let's Encrypt
@@ -199,6 +221,8 @@ parse_args() {
       --bundle-sha256) OFFLINE_BUNDLE_SHA256=$2; shift 2 ;;
       --hermes-bundle) HERMES_BUNDLE=$2; shift 2 ;;
       --hermes-bundle-sha256) HERMES_BUNDLE_SHA256=$2; shift 2 ;;
+      --harness-bundle) HARNESS_BUNDLE=$2; shift 2 ;;
+      --harness-bundle-sha256) HARNESS_BUNDLE_SHA256=$2; shift 2 ;;
       --tls-cert) TLS_CERT=$2; shift 2 ;;
       --tls-key) TLS_KEY=$2; shift 2 ;;
       --dry-run) DRY_RUN=true; shift ;;
@@ -1067,20 +1091,22 @@ hermes_installed() { head -n 1 "$1/.hermes/hermes-agent/.git/HEAD" 2>/dev/null |
 # while Hermes's installer runs; install_systemd starts it again
 # (docs/adr/0072-one-hermes-environment-per-computer.md). Everything that can fail
 # beforehand (packages, the installer's download) happens first, and a failure once
-# botd is stopped starts it again before the install gives up.
-HERMES_STOPPED=false
+# botd is stopped starts it again before the install gives up. The harness bundle's
+# tree is swapped the same way.
+BOTD_STOPPED=false
 
-stop_for_hermes() {
+# What is about to change under botd's running Bots, as "Hermes Agent changes" (the default).
+stop_botd_for_swap() {
   if systemctl is-active --quiet superbot.service 2>/dev/null; then
-    log "Stopping superbot while Hermes Agent changes"
+    log "Stopping superbot while ${1:-Hermes Agent changes}"
     systemctl stop superbot.service
-    HERMES_STOPPED=true
+    BOTD_STOPPED=true
   fi
 }
 
 hermes_failed() {
   hermes_put_back || true
-  if [[ "$HERMES_STOPPED" == true ]]; then
+  if [[ "$BOTD_STOPPED" == true ]]; then
     warn "Starting superbot again with the Hermes Agent it had"
     systemctl start superbot.service || true
   fi
@@ -1135,7 +1161,7 @@ install_hermes() {
   else
     apt-get install -y -qq libatomic1 xz-utils
     installer=$(fetch_hermes_installer "$url")
-    stop_for_hermes
+    stop_botd_for_swap
     log "Installing Hermes Agent ${HERMES_COMMIT:0:12} for $SUPERBOT_USER"
     ok=true
     sudo -u "$SUPERBOT_USER" -H bash "$installer" --non-interactive --skip-browser --skip-computer-use \
@@ -1171,7 +1197,7 @@ install_hermes_shared() {
   else
     apt-get install -y -qq libatomic1 xz-utils
     installer=$(fetch_hermes_installer "$url")
-    stop_for_hermes
+    stop_botd_for_swap
     log "Installing Hermes Agent ${HERMES_COMMIT:0:12} system-wide in $HERMES_SHARED_DIR (per-user accounts run it)"
     install -d -m 0755 -o root -g root "$HERMES_SHARED_DIR"
     ok=true
@@ -1210,9 +1236,9 @@ install_hermes_from_bundle() {
   mkdir -m 0700 "$tree"
   tar -xf "$HERMES_BUNDLE_DIR/hermes.tar" -C "$tree" --no-same-owner || die "Couldn't unpack Hermes Agent from $HERMES_BUNDLE"
   rm -f -- "$HERMES_BUNDLE_DIR/hermes.tar"
-  hermes_tree_ok "$tree/hermes" "$HERMES_SHARED_DIR" || die "Refusing $HERMES_BUNDLE: $HERMES_TREE_PROBLEM"
+  bundle_tree_ok "$tree/hermes" "$HERMES_SHARED_DIR" || die "Refusing $HERMES_BUNDLE: $BUNDLE_TREE_PROBLEM"
   [[ "$(hermes_installed "$tree/hermes")" == "$HERMES_COMMIT" ]] || die "Refusing $HERMES_BUNDLE: its checkout isn't Hermes Agent $HERMES_COMMIT"
-  stop_for_hermes
+  stop_botd_for_swap
   log "Installing Hermes Agent ${HERMES_COMMIT:0:12} system-wide in $HERMES_SHARED_DIR from the Hermes bundle"
   if [[ -e "$HERMES_SHARED_DIR" || -L "$HERMES_SHARED_DIR" ]]; then
     mv -- "$HERMES_SHARED_DIR" "$HERMES_STAGE/previous" || hermes_failed "Couldn't move the Hermes Agent in $HERMES_SHARED_DIR aside"
@@ -1566,7 +1592,16 @@ configure_ufw() {
 }
 
 summary() {
-  local home repo_path pass_file url where app backups encryption database upgrade
+  local home repo_path pass_file url where app backups encryption database upgrade clis systemwide
+  clis="npm install -g @anthropic-ai/claude-code  # if you use Claude Code"
+  systemwide="(sudo npm install -g ...)"
+  if [[ -f "$HARNESSES_DIR/superbot/MANIFEST" || -n "$HARNESS_BUNDLE" ]]; then
+    clis="# Claude Code, Codex and Pi are in $HARNESSES_DIR, from the harness bundle"
+    systemwide="(as the harness bundle does)"
+  elif [[ -n "$OFFLINE_BUNDLE" ]]; then
+    clis="# Offline: re-run with --harness-bundle <this release's harness bundle> (docs/ops/air-gapped.md#harness-clis-on-this-server)"
+    systemwide="(with --harness-bundle)"
+  fi
   upgrade="sudo bash -s -- --upgrade < <(curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/install.sh)"
   [[ -z "$OFFLINE_BUNDLE" ]] || upgrade="sudo bash install.sh --offline <newer bundle> --upgrade${DOMAIN:+ --domain $DOMAIN --tls-cert ... --tls-key ...} (docs/ops/air-gapped.md)"
   home=$(user_home)
@@ -1610,7 +1645,7 @@ SuperBot is installed.
 Next steps (as the service user):
   sudo -iu $SUPERBOT_USER
   # Install harness CLIs if needed, then log in, e.g.:
-  npm install -g @anthropic-ai/claude-code  # if you use Claude Code
+  $clis
   claude login
   # or: codex login
   # Hermes Agent (--with-hermes): save its provider key with botctl secret set (docs/backend.md)
@@ -1621,7 +1656,7 @@ EOF
 Per-user accounts are on (ISOLATION=users, docs/adr/0058-harness-os-user-by-default.md):
   each user's Bots run as sb-u-<user id>, in $ISOLATION_DIR/<user id>, and can't read
   botd's .env, database or master key. Install harness CLIs system-wide
-  (sudo npm install -g ...), not in ~/.local, so every account finds them. Then log
+  $systemwide, not in ~/.local, so every account finds them. Then log
   Claude Code or Codex in for each user, as $SUPERBOT_USER, at a terminal:
     botctl user harness-login <user> claude    # or codex
   Pi and Hermes Agent use provider keys saved with botctl secret set.
@@ -1662,8 +1697,12 @@ check_offline_flags() {
   if [[ -z "$OFFLINE_BUNDLE" ]]; then
     [[ -z "$OFFLINE_BUNDLE_SHA256" ]] || die "--bundle-sha256 needs --offline"
     [[ -z "$HERMES_BUNDLE$HERMES_BUNDLE_SHA256" ]] || die "--hermes-bundle is for --offline installs: online, --with-hermes runs Hermes Agent's own installer"
+    [[ -z "$HARNESS_BUNDLE$HARNESS_BUNDLE_SHA256" ]] || die "--harness-bundle is for --offline installs: online, install the harness CLIs with npm"
     return 0
   fi
+  [[ -z "$HARNESS_BUNDLE_SHA256" || -n "$HARNESS_BUNDLE" ]] || die "--harness-bundle-sha256 needs --harness-bundle"
+  [[ -z "$HARNESS_BUNDLE" || ( -f "$HARNESS_BUNDLE" && -r "$HARNESS_BUNDLE" ) ]] || die "--harness-bundle: can't read $HARNESS_BUNDLE"
+  [[ -z "$HARNESS_BUNDLE_SHA256" || "$HARNESS_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--harness-bundle-sha256 must be 64 lowercase hex digits"
   [[ -f "$OFFLINE_BUNDLE" && -r "$OFFLINE_BUNDLE" ]] || die "--offline: can't read $OFFLINE_BUNDLE"
   [[ -z "$INSTALL_DIR" ]] || die "--offline installs from the bundle, not --source-dir"
   [[ "$WITH_HERMES" != true || -n "$HERMES_BUNDLE" ]] \
@@ -1821,29 +1860,31 @@ offline_unpack_bundle() {
 # superbot-hermes-<tag>-<arch>/ with MANIFEST, SHA256SUMS and hermes.tar: Hermes Agent as its
 # own installer left it with HOME=/opt/hermes, made by deploy/offline-bundle.sh hermes.
 
-# A Hermes bundle's hermes.tar, before it is unpacked: one hermes/ folder of files, folders,
-# symbolic and hard links (Hermes's Python and Node.js trees are full of links), with no
+# A Hermes bundle's hermes.tar (or a harness bundle's harnesses.tar, with TOP
+# superbot-harnesses), before it is unpacked: one TOP/ folder (default hermes/) of files,
+# folders, symbolic and hard links (Python and Node.js trees are full of links), with no
 # absolute names, "..", special files or setuid and setgid bits, and hard links only to its
-# own files. The symbolic links' targets are checked once unpacked (hermes_tree_ok). Sets
-# HERMES_TREE_PROBLEM when it fails.
-hermes_tar_ok() {
-  local tar=$1 entries names targets
-  HERMES_TREE_PROBLEM=""
+# own files. The symbolic links' targets are checked once unpacked (bundle_tree_ok). Sets
+# BUNDLE_TREE_PROBLEM when it fails.
+bundle_tar_ok() {
+  local tar=$1 top=${2:-hermes} name entries names targets
+  name=$(basename "$tar")
+  BUNDLE_TREE_PROBLEM=""
   if ! entries=$(tar -tvf "$tar" 2>/dev/null) || ! names=$(tar -tf "$tar" 2>/dev/null) || [[ -z "$names" ]]; then
-    HERMES_TREE_PROBLEM="hermes.tar can't be read"
-  elif grep -Evq '^hermes(/|$)' <<<"$names"; then
-    HERMES_TREE_PROBLEM="hermes.tar holds files outside one hermes/ folder"
+    BUNDLE_TREE_PROBLEM="$name can't be read"
+  elif ! awk -v top="$top" '$0 != top && index($0, top "/") != 1 { bad = 1 } END { exit bad }' <<<"$names"; then
+    BUNDLE_TREE_PROBLEM="$name holds files outside one $top/ folder"
   elif grep -Eq '(^|/)\.\.(/|$)' <<<"$names"; then
-    HERMES_TREE_PROBLEM="hermes.tar names a path with .."
+    BUNDLE_TREE_PROBLEM="$name names a path with .."
   elif ! awk '{ t = substr($0, 1, 1) } t != "-" && t != "d" && t != "l" && t != "h" { bad = 1 } END { exit bad }' <<<"$entries"; then
-    HERMES_TREE_PROBLEM="hermes.tar holds devices, pipes or other special files"
+    BUNDLE_TREE_PROBLEM="$name holds devices, pipes or other special files"
   elif ! awk 'substr($0, 4, 1) ~ /[sS]/ || substr($0, 7, 1) ~ /[sS]/ { bad = 1 } END { exit bad }' <<<"$entries"; then
-    HERMES_TREE_PROBLEM="hermes.tar holds a setuid or setgid file"
+    BUNDLE_TREE_PROBLEM="$name holds a setuid or setgid file"
   elif targets=$(sed -n 's/^h.* link to //p' <<<"$entries") && [[ -n "$targets" ]] \
-    && ! awk '!/^hermes\// || /(^|\/)\.\.(\/|$)/ { bad = 1 } END { exit bad }' <<<"$targets"; then
-    HERMES_TREE_PROBLEM="hermes.tar holds a hard link to a file outside it"
+    && ! awk -v top="$top" 'index($0, top "/") != 1 || /(^|\/)\.\.(\/|$)/ { bad = 1 } END { exit bad }' <<<"$targets"; then
+    BUNDLE_TREE_PROBLEM="$name holds a hard link to a file outside it"
   fi
-  [[ -z "$HERMES_TREE_PROBLEM" ]]
+  [[ -z "$BUNDLE_TREE_PROBLEM" ]]
 }
 
 # Whether the link target $4, in folder $3 of ROOT (a tree to live at DEST), stays inside it,
@@ -1886,20 +1927,20 @@ link_stays_inside() {
 # setuid or setgid, and every link pointing inside it (absolute ones into DEST), so nothing in
 # it reaches the rest of the host or a path from the machine that built it. SKIP... are paths
 # in ROOT left unchecked (they aren't bundled).
-hermes_tree_ok() {
+bundle_tree_ok() {
   local root=$1 dest=$2 odd link target dir skip prune=()
   shift 2
   for skip in "$@"; do prune+=(-path "$root/$skip" -prune -o); done
-  HERMES_TREE_PROBLEM=""
+  BUNDLE_TREE_PROBLEM=""
   odd=$(find "$root" "${prune[@]}" ! -type f ! -type d ! -type l -print -quit)
-  [[ -z "$odd" ]] || { HERMES_TREE_PROBLEM="it holds a special file: ${odd#"$root"/}"; return 1; }
+  [[ -z "$odd" ]] || { BUNDLE_TREE_PROBLEM="it holds a special file: ${odd#"$root"/}"; return 1; }
   odd=$(find "$root" "${prune[@]}" -perm /6000 -print -quit)
-  [[ -z "$odd" ]] || { HERMES_TREE_PROBLEM="it holds a setuid or setgid file: ${odd#"$root"/}"; return 1; }
+  [[ -z "$odd" ]] || { BUNDLE_TREE_PROBLEM="it holds a setuid or setgid file: ${odd#"$root"/}"; return 1; }
   while IFS= read -r -d '' link && IFS= read -r -d '' target; do
     dir=""
     [[ "$link" != */* ]] || dir=${link%/*}
-    [[ "$target" != *$'\n'* ]] || { HERMES_TREE_PROBLEM="the link $link has a newline in its target"; return 1; }
-    link_stays_inside "$root" "$dest" "$dir" "$target" || { HERMES_TREE_PROBLEM="the link $link points outside $dest, to $target"; return 1; }
+    [[ "$target" != *$'\n'* ]] || { BUNDLE_TREE_PROBLEM="the link $link has a newline in its target"; return 1; }
+    link_stays_inside "$root" "$dest" "$dir" "$target" || { BUNDLE_TREE_PROBLEM="the link $link points outside $dest, to $target"; return 1; }
   done < <(find "$root" "${prune[@]}" -type l -printf '%P\0%l\0')
 }
 
@@ -1924,7 +1965,7 @@ hermes_unpack_bundle() {
   [[ "$(manifest_value "$root/MANIFEST" prefix)" == "$HERMES_SHARED_DIR" ]] \
     || die "Refusing $bundle: it was installed for $(manifest_value "$root/MANIFEST" prefix), not $HERMES_SHARED_DIR"
   [[ -f "$root/hermes.tar" ]] || die "Refusing $bundle: no hermes.tar"
-  hermes_tar_ok "$root/hermes.tar" || die "Refusing $bundle: $HERMES_TREE_PROBLEM"
+  bundle_tar_ok "$root/hermes.tar" || die "Refusing $bundle: $BUNDLE_TREE_PROBLEM"
   HERMES_BUNDLE_DIR=$root
   log "Hermes bundle: Hermes Agent $(manifest_value "$root/MANIFEST" hermes_tag) (${commit:0:12}, $arch) checked"
 }
@@ -1951,6 +1992,264 @@ prepare_hermes_bundle() {
     || die "The Hermes bundle holds Hermes Agent ${commit:0:12}, but this installer pins ${HERMES_COMMIT:0:12}: use the Hermes bundle made for this release (docs/ops/air-gapped.md#hermes-agent)"
 }
 
+# --- Harness bundles (docs/adr/0232-harness-cli-bundle-for-air-gapped-servers.md) -----------
+# superbot-harnesses-<version>-<arch>/ with MANIFEST, SHA256SUMS and harnesses.tar: Node.js with
+# Claude Code, Codex and Pi installed into it by npm at the release's pins, for HARNESSES_DIR,
+# made by deploy/offline-bundle.sh harnesses. The pins come from the release's own botd.
+
+# BOTD's harness pins (botd harness pins), if it prints them as this installer reads them:
+# "node <version> <arch> <sha256>", "npm <bin> <version> <package> <integrity>" and
+# "hermes <bin> <commit> <tag> <sha256>", with a Node.js and at least one npm harness.
+harness_pins() {
+  local out
+  out=$("$1" harness pins 2>/dev/null) || return 1
+  awk '
+    $1 == "node" && NF == 4 && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && $3 ~ /^(x86_64|aarch64)$/ && length($4) == 64 && $4 ~ /^[0-9a-f]+$/ { n++; next }
+    $1 == "npm" && NF == 5 && $2 ~ /^[a-z][a-z0-9-]*$/ && $3 ~ /^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$/ \
+      && $4 ~ /^(@[a-z0-9._-]+\/)?[a-z0-9._-]+$/ && $5 ~ /^sha512-[A-Za-z0-9+\/]+=*$/ { m++; next }
+    $1 == "hermes" && NF == 5 { next }
+    { bad = 1 }
+    END { exit bad || !n || !m }
+  ' <<<"$out" || return 1
+  printf '%s\n' "$out"
+}
+
+# The npm harnesses PINS names, space-separated, in its order.
+harness_names() { awk '$1 == "npm" { printf "%s%s", sep, $2; sep = " " } END { print "" }' <<<"$1"; }
+
+# What a harness bundle for ARCH at PINS says it holds, as MANIFEST lines: which harnesses,
+# Node.js's version and the SHA-256 of its tarball, and each harness's version, package and the
+# integrity of its npm tarball.
+harness_manifest_lines() {
+  printf 'harnesses=%s\n' "$(harness_names "$1")"
+  awk -v arch="$2" '
+    $1 == "node" && $3 == arch { print "node=" $2 " " $4 }
+    $1 == "npm" { print "harness_" $2 "=" $3 " " $4 " " $5 }
+  ' <<<"$1"
+}
+
+# The first of WANTED's lines that MANIFEST lacks, as "KEY is <its value there>, not <wanted>";
+# nothing when it has them all (a missing MANIFEST has none).
+harness_mismatch() {
+  local manifest=$1 wanted=$2 line key have=""
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    grep -qxF -- "$line" "$manifest" 2>/dev/null && continue
+    key=${line%%=*}
+    [[ ! -f "$manifest" ]] || have=$(manifest_value "$manifest" "$key")
+    printf '%s is %s, not %s\n' "${key#harness_}" "${have:-missing}" "${line#*=}"
+    return 0
+  done <<<"$wanted"
+}
+
+# The wrapper BIN_DIR/<bin> links to: the CLI with the tree's own Node.js first on PATH, so it
+# runs whatever Node.js the host has, or none. The installer writes it, never the bundle.
+harness_wrapper() {
+  printf '%s\n' '#!/bin/sh' \
+    "# $1 from SuperBot's harness bundle (docs/adr/0232-harness-cli-bundle-for-air-gapped-servers.md)," \
+    "# on its own Node.js. Claude Code's updater can't change this root-owned tree, and has no network." \
+    "PATH=$HARNESSES_DIR/bin:\$PATH" \
+    'DISABLE_AUTOUPDATER=1' \
+    'export PATH DISABLE_AUTOUPDATER' \
+    "exec $HARNESSES_DIR/bin/$1 \"\$@\""
+}
+
+# Checks a harness bundle and unpacks it into DEST (an empty folder), setting HARNESS_BUNDLE_DIR
+# to its root: its signature or SHA-256 (SHA256, else BUNDLE.sha256), one superbot-harnesses-*
+# folder of plain files, SHA256SUMS, its MANIFEST and its harnesses.tar. Leaves the tree packed.
+harness_unpack_bundle() {
+  local bundle=$1 dest=$2 sha=${3:-} top root arch
+  offline_check_origin "$bundle" "$sha"
+  top=$(offline_archive_ok "$bundle" superbot-harnesses) || die "Refusing $bundle: not a harness bundle (one superbot-harnesses-* folder of plain files)"
+  tar -xf "$bundle" -C "$dest" --no-same-owner --no-same-permissions || die "Couldn't unpack $bundle"
+  root="$dest/$top"
+  find "$root" -type d -exec chmod 0755 {} +
+  find "$root" -type f -exec chmod 0644 {} +
+  offline_check_sums "$bundle" "$root"
+  [[ "$(manifest_value "$root/MANIFEST" kind)" == harnesses ]] || die "Refusing $bundle: its MANIFEST isn't a harness bundle's (kind=harnesses)"
+  arch=$(manifest_value "$root/MANIFEST" arch)
+  [[ "$arch" =~ ^(x86_64|aarch64)$ ]] || die "Refusing $bundle: arch \"$arch\" isn't x86_64 or aarch64"
+  [[ "${OFFLINE_ANY_ARCH:-}" == 1 || "$arch" == "$(uname -m)" ]] || die "This harness bundle is for $arch, but this host is $(uname -m)"
+  [[ "$(manifest_value "$root/MANIFEST" prefix)" == "$HARNESSES_DIR" ]] \
+    || die "Refusing $bundle: it was installed for $(manifest_value "$root/MANIFEST" prefix), not $HARNESSES_DIR"
+  [[ -f "$root/harnesses.tar" ]] || die "Refusing $bundle: no harnesses.tar"
+  bundle_tar_ok "$root/harnesses.tar" "$(basename "$HARNESSES_DIR")" || die "Refusing $bundle: $BUNDLE_TREE_PROBLEM"
+  HARNESS_BUNDLE_DIR=$root
+  log "Harness bundle: $(manifest_value "$root/MANIFEST" harnesses) on Node.js $(manifest_value "$root/MANIFEST" node | cut -d' ' -f1) ($arch, SuperBot $(manifest_value "$root/MANIFEST" version)) checked"
+}
+
+# Before anything changes: the harness bundle checked, and holding exactly what the bundle's botd
+# pins, in a root-only folder beside HARNESSES_DIR (so its tree moves into place in one rename).
+prepare_harness_bundle() {
+  [[ -n "$HARNESS_BUNDLE" ]] || return 0
+  local pins problem signed=$OFFLINE_SIGNED
+  pins=$(harness_pins "$OFFLINE_DIR/bin/botd") \
+    || die "The bundle's botd doesn't say which harness CLIs it pins (botd harness pins), so the harness bundle can't be checked against it: use a release that has harness bundles (docs/ops/air-gapped.md#harness-clis-on-this-server)"
+  if [[ "$DRY_RUN" == true ]]; then
+    HARNESS_STAGE=$(mktemp -d)
+  else
+    install -d -m 0755 -o root -g root "$(dirname "$HARNESSES_DIR")"
+    HARNESS_STAGE=$(mktemp -d "$(dirname "$HARNESSES_DIR")/.superbot-harnesses.XXXXXX")
+  fi
+  trap cleanup_offline EXIT
+  chmod 0700 "$HARNESS_STAGE"
+  mkdir "$HARNESS_STAGE/bundle"
+  harness_unpack_bundle "$HARNESS_BUNDLE" "$HARNESS_STAGE/bundle" "$HARNESS_BUNDLE_SHA256"
+  # shellcheck disable=SC2034 # offline-bundle.sh push reads it, for the main bundle
+  OFFLINE_SIGNED=$signed
+  HARNESS_WANTED=$(harness_manifest_lines "$pins" "$(uname -m)")
+  problem=$(harness_mismatch "$HARNESS_BUNDLE_DIR/MANIFEST" "$HARNESS_WANTED")
+  [[ -z "$problem" ]] \
+    || die "The harness bundle doesn't hold what this release pins ($problem): use the harness bundle made for this release (docs/ops/air-gapped.md#harness-clis-on-this-server)"
+}
+
+# The version HARNESS_WANTED pins for harness BIN, or "node" for Node.js.
+harness_wanted_version() {
+  local key=harness_$1
+  [[ "$1" != node ]] || key=node
+  sed -n "s/^$key=\([^ ]*\) .*/\1/p;T;q" <<<"$HARNESS_WANTED"
+}
+
+# Whether Node.js and each of NAMES run from HARNESSES_DIR as an account with no access to
+# anything else, at the versions pinned.
+harness_works() {
+  local probe b out want ok=true
+  want=$(harness_wanted_version node)
+  out=$(timeout 60 "$HARNESSES_DIR/bin/node" --version 2>&1) || true
+  [[ "$out" == "v$want" ]] || { warn "$HARNESSES_DIR/bin/node --version says \"$out\", not v$want"; return 1; }
+  probe=$(mktemp -d)
+  chmod 0777 "$probe"
+  for b in $1; do
+    want=$(harness_wanted_version "$b")
+    out=$(sudo -u nobody env -i HOME="$probe" PATH=/usr/bin:/bin timeout 120 "$BIN_DIR/$b" --version 2>&1) || true
+    [[ -n "$want" && "$out" == *"$want"* ]] || { warn "$BIN_DIR/$b --version, as another account, says \"$(head -c 300 <<<"$out")\", not $want"; ok=false; }
+  done
+  rm -rf -- "$probe"
+  [[ "$ok" == true ]]
+}
+
+# BIN_DIR/<bin> for each of NAMES, linked to its wrapper. Whatever was there is kept in the
+# staging folder until the new tree works (harness_put_back).
+harness_link() {
+  local b link target
+  for b in $1; do
+    link="$BIN_DIR/$b" target="$HARNESSES_DIR/superbot/$b"
+    [[ "$(readlink -- "$link" 2>/dev/null)" != "$target" ]] || continue
+    if [[ -e "$link" || -L "$link" ]]; then
+      warn "Replacing $link ($( [[ -L "$link" ]] && readlink -- "$link" || echo a file)) with the harness bundle's $b"
+      mkdir -p "$HARNESS_STAGE/replaced"
+      mv -- "$link" "$HARNESS_STAGE/replaced/$b" || return 1
+    fi
+    HARNESS_LINKED+=("$link")
+    ln -s -- "$target" "$link" || return 1
+  done
+}
+
+# Undoes install_harnesses: its links (and what they replaced), its tree, and the tree it moved
+# aside, back in HARNESSES_DIR. If that last fails, HARNESS_PREVIOUS stays set, so
+# cleanup_offline keeps it for the operator; so does anything left in replaced/.
+harness_put_back() {
+  local link f stuck=false
+  for link in "${HARNESS_LINKED[@]}"; do rm -f -- "$link"; done
+  HARNESS_LINKED=()
+  for f in "$HARNESS_STAGE"/replaced/*; do
+    [[ -e "$f" || -L "$f" ]] || continue
+    mv -- "$f" "$BIN_DIR/$(basename "$f")" || { warn "Couldn't put $BIN_DIR/$(basename "$f") back: it is in $f"; stuck=true; }
+  done
+  if [[ "$HARNESS_MOVED_IN" == true ]]; then
+    rm -rf -- "$HARNESSES_DIR" || { warn "Couldn't remove the new harness CLIs from $HARNESSES_DIR"; return 1; }
+    HARNESS_MOVED_IN=false
+  fi
+  if [[ -n "$HARNESS_PREVIOUS" && -e "$HARNESS_PREVIOUS" ]]; then
+    warn "Putting back the harness CLIs $HARNESSES_DIR had"
+    if mv -- "$HARNESS_PREVIOUS" "$HARNESSES_DIR"; then
+      HARNESS_PREVIOUS=""
+    else
+      warn "Couldn't put them back: they are in $HARNESS_PREVIOUS; move them to $HARNESSES_DIR by hand"
+      return 1
+    fi
+  fi
+  [[ "$stuck" == false ]]
+}
+
+harness_failed() {
+  harness_put_back || true
+  if [[ "$BOTD_STOPPED" == true ]]; then
+    warn "Starting superbot again with the harness CLIs it had"
+    systemctl start superbot.service || true
+  fi
+  die "$1"
+}
+
+# The checked harness bundle's tree in HARNESSES_DIR, root's, which every account may run but
+# none may change, each CLI linked from BIN_DIR through the installer's own wrapper. As with
+# Hermes, the tree it replaces is kept until the new one runs for other accounts, and Bots keep
+# nothing in it.
+install_harnesses() {
+  if [[ -z "$HARNESS_BUNDLE" ]]; then
+    harness_pin_notice
+    return 0
+  fi
+  local names name tree="$HARNESS_STAGE/tree" b
+  names=$(manifest_value "$HARNESS_BUNDLE_DIR/MANIFEST" harnesses)
+  name=$(basename "$HARNESSES_DIR")
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[dry-run] would install $names system-wide in $HARNESSES_DIR from the harness bundle $HARNESS_BUNDLE, linked from $BIN_DIR"
+    return
+  fi
+  if [[ -z "$(harness_mismatch "$HARNESSES_DIR/superbot/MANIFEST" "$HARNESS_WANTED")" ]] \
+    && harness_link "$names" && harness_works "$names"; then
+    HARNESS_LINKED=()
+    rm -rf -- "$HARNESS_STAGE/replaced"
+    log "The harness CLIs this release pins are already installed in $HARNESSES_DIR ($names)"
+    return
+  fi
+  log "Unpacking $names from $HARNESS_BUNDLE"
+  mkdir -m 0700 "$tree"
+  tar -xf "$HARNESS_BUNDLE_DIR/harnesses.tar" -C "$tree" --no-same-owner || harness_failed "Couldn't unpack the harness CLIs from $HARNESS_BUNDLE"
+  rm -f -- "$HARNESS_BUNDLE_DIR/harnesses.tar"
+  bundle_tree_ok "$tree/$name" "$HARNESSES_DIR" || harness_failed "Refusing $HARNESS_BUNDLE: $BUNDLE_TREE_PROBLEM"
+  [[ -x "$tree/$name/bin/node" ]] || harness_failed "Refusing $HARNESS_BUNDLE: its tree has no bin/node"
+  [[ ! -e "$tree/$name/superbot" && ! -L "$tree/$name/superbot" ]] || harness_failed "Refusing $HARNESS_BUNDLE: its tree has a superbot folder, which is the installer's"
+  install -d -m 0755 "$tree/$name/superbot"
+  for b in $names; do
+    [[ -e "$tree/$name/bin/$b" ]] || harness_failed "Refusing $HARNESS_BUNDLE: its tree has no bin/$b"
+    harness_wrapper "$b" >"$tree/$name/superbot/$b"
+    chmod 0755 "$tree/$name/superbot/$b"
+  done
+  install -m 0644 "$HARNESS_BUNDLE_DIR/MANIFEST" "$tree/$name/superbot/MANIFEST"
+  if ! { chown root:root "$tree/$name" && chmod -R go-w,a+rX "$tree/$name"; }; then
+    harness_failed "Couldn't make the harness CLIs root's, and readable by other accounts"
+  fi
+  stop_botd_for_swap "the harness CLIs change"
+  log "Installing $names system-wide in $HARNESSES_DIR from the harness bundle"
+  if [[ -e "$HARNESSES_DIR" || -L "$HARNESSES_DIR" ]]; then
+    mv -- "$HARNESSES_DIR" "$HARNESS_STAGE/previous" || harness_failed "Couldn't move the harness CLIs in $HARNESSES_DIR aside"
+    HARNESS_PREVIOUS="$HARNESS_STAGE/previous"
+  fi
+  mv -- "$tree/$name" "$HARNESSES_DIR" || harness_failed "Couldn't move the harness CLIs into $HARNESSES_DIR"
+  HARNESS_MOVED_IN=true
+  harness_link "$names" || harness_failed "Couldn't link the harness CLIs from $BIN_DIR"
+  harness_works "$names" || harness_failed "The harness CLIs from $HARNESS_BUNDLE don't run here"
+  HARNESS_MOVED_IN=false HARNESS_LINKED=()
+  if [[ -n "$HARNESS_PREVIOUS" ]]; then
+    rm -rf -- "$HARNESS_PREVIOUS"
+    HARNESS_PREVIOUS=""
+  fi
+  rm -rf -- "$HARNESS_STAGE/replaced"
+}
+
+# An offline upgrade without --harness-bundle keeps the harness CLIs it has; say so when this
+# release pins others.
+harness_pin_notice() {
+  [[ -n "$OFFLINE_DIR" && -f "$HARNESSES_DIR/superbot/MANIFEST" ]] || return 0
+  local pins problem
+  pins=$(harness_pins "$OFFLINE_DIR/bin/botd") || return 0
+  problem=$(harness_mismatch "$HARNESSES_DIR/superbot/MANIFEST" "$(harness_manifest_lines "$pins" "$(uname -m)")")
+  [[ -z "$problem" ]] \
+    || warn "The harness CLIs in $HARNESSES_DIR aren't the ones this release pins ($problem): re-run with --harness-bundle <this release's harness bundle> (docs/ops/air-gapped.md#harness-clis-on-this-server)"
+}
+
 cleanup_offline() {
   [[ -z "${OFFLINE_TMP:-}" ]] || rm -rf -- "$OFFLINE_TMP"
   if [[ -n "${HERMES_STAGE:-}" ]]; then
@@ -1960,12 +2259,27 @@ cleanup_offline() {
     local stuck=false
     if [[ -n "${HERMES_PREVIOUS:-}" ]]; then
       hermes_put_back || stuck=true
-      [[ "$HERMES_STOPPED" != true ]] || systemctl start superbot.service || true
+      [[ "$BOTD_STOPPED" != true ]] || systemctl start superbot.service || true
     fi
     if [[ "$stuck" == true ]]; then
       rm -rf -- "$HERMES_STAGE/bundle" "$HERMES_STAGE/tree"
     else
       rm -rf -- "$HERMES_STAGE"
+    fi
+  fi
+  if [[ -n "${HARNESS_STAGE:-}" ]]; then
+    # The same for the harness CLIs: an exit mid-swap puts back what install_harnesses changed.
+    local hstuck=false
+    if [[ -n "${HARNESS_PREVIOUS:-}" || "${HARNESS_MOVED_IN:-}" == true || ${#HARNESS_LINKED[@]} -gt 0 ]]; then
+      harness_put_back || hstuck=true
+      [[ "$BOTD_STOPPED" != true ]] || systemctl start superbot.service || true
+    fi
+    # harness_failed has already tried to put these back; what it couldn't is the operator's.
+    [[ -z "$(ls -A -- "$HARNESS_STAGE/replaced" 2>/dev/null)" ]] || hstuck=true
+    if [[ "$hstuck" == true ]]; then
+      rm -rf -- "$HARNESS_STAGE/bundle" "$HARNESS_STAGE/tree"
+    else
+      rm -rf -- "$HARNESS_STAGE"
     fi
   fi
 }
@@ -2086,6 +2400,7 @@ main() {
   if [[ -n "$OFFLINE_BUNDLE" ]]; then
     prepare_offline
     prepare_hermes_bundle
+    prepare_harness_bundle
   else
     detect_source_dir
   fi
@@ -2119,6 +2434,7 @@ main() {
   ensure_master_key
   install_license
   install_hermes
+  install_harnesses
   configure_isolation
   machine_bot_user_notice "$(user_home)/superbot/.env"
   install_systemd

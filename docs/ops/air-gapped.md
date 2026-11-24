@@ -1,6 +1,6 @@
 # Air-gapped installs
 
-SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md), signatures and multi-arch indexes in mirrors in [ADR 0147](../adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md), how every release's bundles are checked end to end in [ADR 0172](../adr/0172-release-bundles-checked-end-to-end.md), harness installs on users' machines from your own mirrors in [ADR 0186](../adr/0186-harness-installs-from-internal-mirrors.md), Hermes Agent from a Hermes bundle in [ADR 0200](../adr/0200-hermes-agent-bundle-for-air-gapped-installs.md), and Hermes Agent on users' machines from that bundle in [ADR 0210](../adr/0210-hermes-agent-on-air-gapped-machines.md).
+SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md), signatures and multi-arch indexes in mirrors in [ADR 0147](../adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md), how every release's bundles are checked end to end in [ADR 0172](../adr/0172-release-bundles-checked-end-to-end.md), harness installs on users' machines from your own mirrors in [ADR 0186](../adr/0186-harness-installs-from-internal-mirrors.md), Hermes Agent from a Hermes bundle in [ADR 0200](../adr/0200-hermes-agent-bundle-for-air-gapped-installs.md), Hermes Agent on users' machines from that bundle in [ADR 0210](../adr/0210-hermes-agent-on-air-gapped-machines.md), and Claude Code, Codex and Pi on the server from a harness bundle in [ADR 0232](../adr/0232-harness-cli-bundle-for-air-gapped-servers.md).
 
 ## What a bundle holds
 
@@ -33,7 +33,7 @@ The bundle carries SuperBot, not the operating system. Install these on the serv
 
 The installer lists anything missing and stops before it changes anything.
 
-**Harness CLIs** (Claude Code, Codex, Pi) are not in the bundle for the bash install: install them from your npm mirror, system-wide, as in [deploy/README.md](../../deploy/README.md#one-unix-account-per-user). **Hermes Agent** comes from its own [Hermes bundle](#hermes-agent): `--with-hermes` with `--offline` needs `--hermes-bundle`. Users' own machines install their harness CLIs from your mirrors instead ([below](#harness-clis-on-users-machines)). The published image already has Claude Code, Codex and Pi and the screens, so [Docker Compose](#docker-compose) is the simpler path when you need them. It doesn't have Hermes Agent: for Hermes with Compose, build your own image on the connected side (`docker build --build-arg HARNESSES="claude codex pi hermes" -t superbot-hermes:<version> .`) and bundle it with `--image superbot=superbot-hermes:<version> --allow-unsigned` (it is your image, so there is no release signature to check). After loading it, set `SUPERBOT_IMAGE=superbot-hermes:<version>` in `.env` as well as `SUPERBOT_VERSION`, so Compose runs your image instead of the published one.
+**Harness CLIs** (Claude Code, Codex, Pi) for the bash install come from their own [harness bundle](#harness-clis-on-this-server) (`--harness-bundle`), at the versions the release pins, with their own Node.js. **Hermes Agent** comes from its own [Hermes bundle](#hermes-agent): `--with-hermes` with `--offline` needs `--hermes-bundle`. Users' own machines install their harness CLIs from your mirrors instead ([below](#harness-clis-on-users-machines)). With [Docker Compose](#docker-compose), the published image already has Claude Code, Codex and Pi and the screens. It doesn't have Hermes Agent: for Hermes with Compose, build your own image on the connected side (`docker build --build-arg HARNESSES="claude codex pi hermes" -t superbot-hermes:<version> .`) and bundle it with `--image superbot=superbot-hermes:<version> --allow-unsigned` (it is your image, so there is no release signature to check). After loading it, set `SUPERBOT_IMAGE=superbot-hermes:<version>` in `.env` as well as `SUPERBOT_VERSION`, so Compose runs your image instead of the published one.
 
 ## Getting a bundle
 
@@ -156,6 +156,38 @@ Then it stops botd, swaps the tree into `/opt/hermes` (root-owned, linked from `
 An `--upgrade` without `--with-hermes` keeps the Hermes Agent you have. When the new release pins another commit, the installer says so: re-run with `--with-hermes --hermes-bundle` and that release's Hermes bundle.
 
 Users' own machines get Hermes Agent from the same bundle, through botd ([below](#hermes-agent-on-users-machines)).
+
+## Harness CLIs on this server
+
+Claude Code, Codex and Pi come in a **harness bundle**, `superbot-harnesses-<version>-<arch>.tar.gz`, with `.sha256` and, on a release, `.sigstore.json` beside it ([ADR 0232](../adr/0232-harness-cli-bundle-for-air-gapped-servers.md)). You need no npm mirror and no Node.js on the server. Every release has one per arch, attached to it and signed like the main bundle. It holds Node.js and the three CLIs at the exact versions that release's botd pins, the same pins users' machines install. It is about 400 MB, and 1.1 GB unpacked. The pins can change with any release, so carry in the harness bundle of the release you install.
+
+**Your own**, from a checkout of the same release tag, on a connected machine with the server's arch (any user; it needs `curl`, `xz`, `jq` and `openssl`):
+
+```sh
+cargo build --release --bin botd
+deploy/offline-bundle.sh harnesses --out dist
+```
+
+It takes the pins from that botd (`botd harness pins`). It downloads Node.js from nodejs.org and checks its SHA-256. Each package comes from your npm registry (your npm settings) and must match its pinned integrity. It then checks that each CLI runs at its pinned version, and packs the tree. Your npm login is never put in the bundle. Verify a harness bundle as any other, with `cosign verify-blob` (same identity) and `deploy/offline-bundle.sh verify`, and record its SHA-256.
+
+**Install or upgrade** with the main bundle (it needs about 2.5 GB free under `/opt` while it runs, plus 1.1 GB when it replaces earlier harness CLIs):
+
+```sh
+sudo bash install.sh --offline superbot-offline-0.2.0-x86_64.tar.gz --bundle-sha256 <recorded sha-256> \
+  --harness-bundle superbot-harnesses-0.2.0-x86_64.tar.gz --harness-bundle-sha256 <its recorded sha-256> \
+  --domain bots.corp.example --tls-cert /root/bots.pem --tls-key /root/bots.key
+```
+
+(add `--upgrade` on a server that is already installed; it combines with `--with-hermes --hermes-bundle`). Before anything changes, the installer checks:
+
+- the harness bundle's SHA-256 or signature, as for the main bundle;
+- its files against `SHA256SUMS`;
+- that its `MANIFEST` is for this arch and for `/opt/superbot-harnesses`, and names every version and hash the main bundle's botd pins. A harness bundle from another release is refused, and the installer says which CLI differs;
+- that its tree holds only files, folders and links that stay inside it, none setuid.
+
+Then it stops botd and swaps the tree into `/opt/superbot-harnesses`, root-owned. It links `/usr/local/bin/claude`, `codex` and `pi` to wrappers that run each CLI on the bundle's own Node.js, with Claude Code's auto-updater off. It then checks that another account can run each one at its pinned version. If anything was already at one of those paths (your own `npm install -g`, say), it is replaced, with a warning. If anything fails, the previous tree and links are put back. If the tree already holds this release's pins, the installer says so and leaves it.
+
+An `--upgrade` without `--harness-bundle` keeps the harness CLIs you have. When the new release pins other versions, the installer says which: re-run with `--harness-bundle` and that release's harness bundle. Logging Claude Code and Codex in works as online ([deploy/README.md](../../deploy/README.md#one-unix-account-per-user)).
 
 ## Docker Compose
 
@@ -303,7 +335,7 @@ Logins that go through a vendor's website (`claude login`, `codex login`) don't 
 |---------|---------|
 | License | Works: checked against keys built into botd, no phone-home ([below](#license-and-seats)) |
 | Sign-in | Password, TOTP, and SSO against an identity provider inside your network (ADFS, Keycloak or another OIDC/SAML IdP); cloud IdPs (Entra, Google, GitHub, Apple) only if the server can reach them |
-| Harness CLIs on this server | Claude Code, Codex and Pi download from the internet: install from your npm mirror instead, or use the published image |
+| Harness CLIs on this server | Claude Code, Codex and Pi from the release's harness bundle (`--harness-bundle`, [above](#harness-clis-on-this-server)), or the published image |
 | `--with-hermes` | Downloads Hermes Agent: with `--offline`, give `--hermes-bundle` ([Hermes Agent](#hermes-agent)) |
 | Harness CLIs on users' machines | Claude Code, Codex and Pi from your Node.js and npm mirrors ([above](#harness-clis-on-users-machines)); Hermes Agent from botd's Hermes bundle (`MACHINE_HERMES_BUNDLE`, [above](#hermes-agent-on-users-machines)) |
 | Billing (Stripe), push notifications (`PUSH_PROVIDER=expo`), Turnstile on the sign-up form | Need the internet: leave them off (the default) |
