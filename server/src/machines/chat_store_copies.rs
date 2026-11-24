@@ -107,6 +107,9 @@ struct Status {
     /// When its copies last matched its backups, and the newest of those backups.
     copied_at: Option<i64>,
     newest: Option<i64>,
+    /// The oldest backup the bucket may hold a copy of: the folder's oldest when its copies
+    /// last matched it, since a failed pass may leave copies of backups pruned since.
+    oldest: Option<i64>,
     copies: usize,
     /// Why the last pass failed, and since when passes have.
     error: Option<String>,
@@ -129,6 +132,10 @@ impl Copies {
     pub fn new(s: Settings) -> Result<Copies, String> {
         let clients = s.stores.iter().map(|(r, st)| Ok((r.clone(), S3::new(st.clone())?.called("the chat store's backup bucket")))).collect::<Result<_, String>>()?;
         Ok(Copies { s, clients, hashes: Mutex::default(), status: Mutex::default() })
+    }
+
+    pub fn settings(&self) -> &Settings {
+        &self.s
     }
 
     /// For the startup log.
@@ -195,18 +202,18 @@ impl Copies {
         let mut status = self.status.lock().unwrap();
         let st = status.entry(store.id.clone()).or_default();
         match &r {
-            Ok((c, newest)) => {
-                *st = Status { copied_at: Some(at), newest: *newest, copies: c.copies, error: None, failing_since: None };
+            Ok((c, newest, oldest)) => {
+                *st = Status { copied_at: Some(at), newest: *newest, oldest: *oldest, copies: c.copies, error: None, failing_since: None };
             }
             Err(e) => {
                 st.error = Some(clip(e, 500));
                 st.failing_since.get_or_insert(at);
             }
         }
-        Some(r.map(|(c, _)| c))
+        Some(r.map(|(c, ..)| c))
     }
 
-    async fn sync(&self, s3: &S3, store: &ChatStore, at: i64) -> Result<(Copied, Option<i64>), String> {
+    async fn sync(&self, s3: &S3, store: &ChatStore, at: i64) -> Result<(Copied, Option<i64>, Option<i64>), String> {
         let prefix = self.store_prefix(store);
         // An upload cut off by a restart may hold rows that have since left the store.
         s3.abort_unfinished_under(&prefix, at).await?;
@@ -233,11 +240,19 @@ impl Copies {
             self.upload(s3, path, key, sha).await?;
             done.uploaded += 1;
         }
+        let stale: Vec<&(String, String)> = all.iter().filter(|(key, _)| !want.iter().any(|(k, _, _)| k == key)).collect();
+        // A lost volume (or one mounted empty) must not empty the bucket: its copies are
+        // then the only ones.
+        let hold = match (store.path.exists(), want.is_empty()) {
+            (false, _) => Some(format!("the store {} is missing", store.path.display())),
+            (true, true) => Some("its folder holds no backups".to_string()),
+            _ => None,
+        };
+        if let Some(why) = hold.filter(|_| !stale.is_empty()) {
+            return Err(format!("nothing deleted from its bucket while {why}"));
+        }
         let mut gone: Vec<&str> = Vec::new();
-        for (key, version) in &all {
-            if want.iter().any(|(k, _, _)| k == key) {
-                continue;
-            }
+        for (key, version) in stale {
             match versioned {
                 true => s3.delete_version(key, version).await?,
                 false => s3.delete(key).await?,
@@ -247,7 +262,7 @@ impl Copies {
             }
         }
         done.deleted = gone.len();
-        Ok((done, local.first().map(|(t, _)| *t)))
+        Ok((done, local.first().map(|(t, _)| *t), local.last().map(|(t, _)| *t)))
     }
 
     async fn upload(&self, s3: &S3, path: &Path, key: &str, sha: &str) -> Result<(), String> {
@@ -298,6 +313,18 @@ impl Copies {
     pub fn report_view(&self, store: &ChatStore) -> Option<Value> {
         let v = self.view(store)?;
         Some(json!({ "copies": v["copies"], "newestCopyAt": v["newestCopyAt"], "lastCopiedAt": v["lastCopiedAt"], "failing": !v["error"].is_null() }))
+    }
+
+    /// Whether `store`'s bucket may still hold a copy of a backup made by `at`: its region
+    /// has a bucket and no pass has shown it holds none (one that matched the folder, whose
+    /// oldest backup is later). For reports' earlier copies, which local backups pruned
+    /// while the bucket refused deletes no longer show.
+    pub fn may_hold(&self, store: &ChatStore, at: i64) -> bool {
+        self.bucket(&store.region).is_some()
+            && match self.status.lock().unwrap().get(&store.id) {
+                Some(st) if st.copied_at.is_some() => st.oldest.is_some_and(|o| o <= at),
+                _ => true,
+            }
     }
 
     /// Warnings for admins: stores whose last pass failed.
@@ -544,16 +571,50 @@ mod tests {
         backup_pass(&w.db, 7, start());
         c.pass(&w.db, now()).await;
         let lon = w.db.chat_stores().into_iter().find(|s| s.region == "gb-lon").unwrap();
-        let mine = format!("t/region-data/gb-lon/{}/chats-20261031-030000-abc.sqlite", lon.id);
-        w.s3.leave_unfinished(&mine, 60_000);
+        for n in 0..3 {
+            w.s3.leave_unfinished(&format!("t/region-data/gb-lon/{}/chats-2026103{n}-030000-abc.sqlite", lon.id), 60_000);
+        }
         w.s3.leave_unfinished("t/machines/m1/b1.incus", 60_000);
+        w.s3.w().page = Some(1);
         assert_eq!(c.pass(&w.db, now()).await["gb-lon"].as_ref().map(|c| c.uploaded), Ok(0));
-        assert_eq!(w.s3.unfinished(), ["t/machines/m1/b1.incus"], "only the store's own");
+        assert_eq!(w.s3.unfinished(), ["t/machines/m1/b1.incus"], "only the store's own, on every page");
+        w.s3.w().page = None;
 
         let dir = w.lon.join("backups");
         std::fs::rename(&dir, w.lon.join("aside")).unwrap();
         std::fs::write(&dir, b"not a folder").unwrap();
         assert!(c.pass(&w.db, now()).await["gb-lon"].is_err());
         assert_eq!(w.s3.keys().len(), 1, "the copy is kept");
+    }
+
+    #[tokio::test]
+    async fn a_lost_store_or_an_empty_folder_never_empties_the_bucket() {
+        let w = world().await;
+        let c = copies(&w.s3, Vec::new());
+        let (_, bot) = pinned_bot(&w.db, "ada", "gb-lon");
+        w.db.add_message(&bot, "user", "x", None, false, None);
+        backup_pass(&w.db, 7, start());
+        c.pass(&w.db, now()).await;
+        let lon = w.db.chat_stores().into_iter().find(|s| s.region == "gb-lon").unwrap();
+        assert!(!c.may_hold(&lon, start() - 1) && c.may_hold(&lon, start()), "the bucket holds the backup from start() on");
+
+        // The volume is gone: botd's next backup fails and the folder is empty.
+        let (dir, aside) = (w.lon.join("backups"), w.lon.join("aside"));
+        std::fs::rename(&dir, &aside).unwrap();
+        std::fs::rename(&lon.path, w.lon.join("gone.sqlite")).unwrap();
+        assert!(backup_pass(&w.db, 7, start() + DAY).iter().any(|(r, b)| r == "gb-lon" && b.is_err()));
+        let r = c.pass(&w.db, now()).await;
+        assert!(r["gb-lon"].as_ref().is_err_and(|e| e.contains("nothing deleted from its bucket while the store") && e.contains("is missing")), "{r:?}");
+        assert_eq!(w.s3.keys().len(), 1, "the only copy left is kept");
+        assert!(c.may_hold(&lon, start()), "still held");
+
+        std::fs::rename(w.lon.join("gone.sqlite"), &lon.path).unwrap();
+        let r = c.pass(&w.db, now()).await;
+        assert!(r["gb-lon"].as_ref().is_err_and(|e| e.contains("while its folder holds no backups")), "{r:?}");
+        assert_eq!(w.s3.keys().len(), 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::rename(&aside, &dir).unwrap();
+        assert_eq!(c.pass(&w.db, now()).await["gb-lon"], Ok(Copied { uploaded: 0, deleted: 0, copies: 1 }));
     }
 }

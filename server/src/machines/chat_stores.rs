@@ -596,8 +596,10 @@ pub fn against(app: &App, cp: &ControlPlane, region: &str, owners: &[String], se
         .chat_moves_out(owners, region)
         .into_iter()
         .filter_map(|(r, moved_at)| {
-            let n = stores.iter().find(|s| s.region == r).map_or(0, |s| backups(s).iter().filter(|(t, _)| *t <= moved_at).count());
-            (n > 0).then(|| json!({ "region": r, "backups": n, "movedAt": moved_at }))
+            let s = stores.iter().find(|s| s.region == r);
+            let n = s.map_or(0, |s| backups(s).iter().filter(|(t, _)| *t <= moved_at).count());
+            let off = s.is_some_and(|s| cp.chat_copies.as_deref().is_some_and(|c| c.may_hold(s, moved_at)));
+            (n > 0 || off).then(|| json!({ "region": r, "backups": n, "offHost": off, "movedAt": moved_at }))
         })
         .collect();
     let has = stores.iter().find(|s| s.region == region);
@@ -640,11 +642,14 @@ pub fn report_warnings(chats: &Value, region: &str, at: i64) -> Vec<String> {
         out.push(format!("{region}'s chat store has no backup from the last day (ADR 0215)"));
     }
     for e in chats["earlierCopies"].as_array().into_iter().flatten() {
-        out.push(format!(
-            "{} backups of {}'s chat store were made before their chats, routines or approvals moved out of it and still hold them, until botd clears them out of those backups on its next hourly check (ADR 0215, ADR 0238)",
-            e["backups"],
-            e["region"].as_str().unwrap_or_default(),
-        ));
+        let r = e["region"].as_str().unwrap_or_default();
+        out.push(match (e["backups"].as_i64().unwrap_or(0), e["offHost"] == true) {
+            (0, _) => format!("copies off the host of {r}'s chat store's backups from before their chats, routines or approvals moved out of it may still hold them, until botd clears them out on its next hourly check (ADR 0238, ADR 0246)"),
+            (n, off) => format!(
+                "{n} backups of {r}'s chat store{} were made before their chats, routines or approvals moved out of it and still hold them, until botd clears them out of those backups on its next hourly check (ADR 0215, ADR 0238)",
+                if off { ", and their copies off the host," } else { "" },
+            ),
+        });
     }
     if chats["offHost"]["failing"] == true {
         out.push(format!("{region}'s chat store's backups couldn't all be copied off the host on botd's last check; it tries again each hour (ADR 0246)"));
@@ -904,5 +909,16 @@ mod tests {
         assert_eq!(files_in(&dir), vec![backup.clone()], "the half-made copy is gone");
         assert!(!holds(&dir.join(&backup), word));
         assert!(db.moves_out_to_clear(&db.chat_stores()[0]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reports_warn_of_earlier_copies_off_the_host_once_the_backups_themselves_are_pruned() {
+        let chats = json!({ "earlierCopies": [
+            { "region": "gb-lon", "backups": 2, "offHost": true, "movedAt": 1 },
+            { "region": "nl-ams", "backups": 0, "offHost": true, "movedAt": 1 },
+        ] });
+        let w = report_warnings(&chats, "de-fra-2", 0);
+        assert!(w[0].starts_with("2 backups of gb-lon's chat store, and their copies off the host, were made before"), "{w:?}");
+        assert!(w[1].starts_with("copies off the host of nl-ams's chat store's backups from before their chats") && w[1].contains("ADR 0246"), "{w:?}");
     }
 }
