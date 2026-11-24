@@ -130,11 +130,11 @@ In `.env` (installer) or `deploy/docker/.env` (Compose), then restart botd:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `AUDIT_EXPORT` | `off` | Where to send events. `https://<collector>/<path>`: JSON lines. `syslog+tls://<host>[:6514]`: syslog over TLS. `azure-monitor://<host>/<dcr>/<stream>`: Microsoft Sentinel ([below](#microsoft-sentinel-azure-monitor)). `http://` and `syslog+tcp://` work only to loopback. Add `,s3://<bucket>/<prefix>` to archive them too ([below](#a-siem-and-an-archive-together)). Any entry can be named, `<name>=<url>`, and several SIEMs must be ([below](#several-siems)) |
+| `AUDIT_EXPORT` | `off` | Where to send events. `https://<collector>/<path>`: JSON lines. `syslog+tls://<host>[:6514]`: syslog over TLS. `azure-monitor://<host>/<dcr>/<stream>`: Microsoft Sentinel ([below](#microsoft-sentinel-azure-monitor)). `google-secops://<location>/<project>/<instance>/<log type>`: Google SecOps ([below](#google-secops)). `http://` and `syslog+tcp://` work only to loopback. Add `,s3://<bucket>/<prefix>` to archive them too ([below](#a-siem-and-an-archive-together)). Any entry can be named, `<name>=<url>`, and several SIEMs must be ([below](#several-siems)) |
 | `AUDIT_EXPORT_INSECURE` | `off` | `on` allows `http://` and `syslog+tcp://` to any host, for a collector on a private network such as the Compose network |
 | `AUDIT_EXPORT_HEADERS` or `AUDIT_EXPORT_HEADERS_FILE` | none | HTTPS only: headers, `name=value` pairs split by commas, such as `Authorization=Bearer <token>`. A secret: redacted everywhere, and no Bot's harness gets it. With `SECRETS_BACKEND=vault` it can live in Vault ([vault.md](vault.md)). For one SIEM only; with several, each has its own `AUDIT_EXPORT_HEADERS_<NAME>` |
 | `AUDIT_EXPORT_START` | `all` | For a new sink: `all` sends the history still in the database first, `new` only events from now on. A named sink can have its own, `AUDIT_EXPORT_START_<NAME>` |
-| `AUDIT_EXPORT_COMPRESS` | `off` | `gzip`: webhook and Azure Monitor request bodies go gzipped, with `Content-Encoding: gzip`. A named sink can have its own, `AUDIT_EXPORT_COMPRESS_<NAME>` ([below](#compression)) |
+| `AUDIT_EXPORT_COMPRESS` | `off` | `gzip`: webhook and Azure Monitor request bodies go gzipped (Google SecOps stays plain), with `Content-Encoding: gzip`. A named sink can have its own, `AUDIT_EXPORT_COMPRESS_<NAME>` ([below](#compression)) |
 
 A bad value stops botd at startup with a message naming the setting. URLs with a username, password, query or fragment are refused, so put tokens in `AUDIT_EXPORT_HEADERS`.
 
@@ -159,6 +159,7 @@ Events are scrubbed when they are recorded: passwords, tokens, message text and 
 
 - **Webhook**: `POST` with `Content-Type: application/x-ndjson`, up to 200 events per request, one per line, gzipped with `Content-Encoding: gzip` if you ask ([below](#compression)). Answer any 2xx to accept the batch. Redirects aren't followed.
 - **Azure Monitor**: records of a data collection rule's stream, each with the line whole ([below](#microsoft-sentinel-azure-monitor)).
+- **Google SecOps**: raw logs of a log type, each the line exactly ([below](#google-secops)).
 - **Syslog**: RFC 5424, facility 13 (log audit), severity 6 (success), 5 (failure) or 4 (denied), APP-NAME `superbot`, MSGID the action, and the JSON object as the message. Octet-counted framing (RFC 5425). The certificate is checked against the system's trusted roots. Syslog has no acknowledgement, so a dropped connection can lose the batch in flight: use the webhook if every event must arrive.
 
 ### Delivery and failures
@@ -166,8 +167,8 @@ Events are scrubbed when they are recorded: passwords, tokens, message text and 
 - Events go in id order. The last delivered id is saved, so after a restart or an outage botd carries on from there. Delivery is at least once: de-duplicate on `host` and `id`.
 - A failure is retried with backoff from 1 second up to 5 minutes, for as long as it takes. Events wait in the database meanwhile, and retention (`AUDIT_RETENTION_DAYS`) never deletes an event the sink hasn't taken, so a long outage grows the table instead of losing events.
 - An event botd can't read from the database (a damaged row) is a failure too: export stops before it and retries, rather than skip it. `botctl audit verify` names the row.
-- After 3 failures in a row botd logs a warning and records `audit.export_failing` with a `reason` of `delivery_failed`, `unreadable`, `cursor_unsaved`, for Azure Monitor `sign_in_failed`, or, for the S3 archive, `not_write_once`; `audit.export_recovered` follows when delivery resumes.
-- `botctl audit siem` (or `GET /api/audit/siem`) shows the sink, the last delivered id, how many are pending, whether it's failing, and the last error. With metrics on, `/metrics` has `superbot_audit_export_pending_events`, `superbot_audit_export_failing` and `superbot_audit_export_last_delivery_timestamp_seconds`, each labelled with the sink's `kind` (`webhook`, `syslog`, `azure-monitor` or `s3`) and, for a named sink, its `name`. Alert on `superbot_audit_export_failing == 1` or a growing pending count.
+- After 3 failures in a row botd logs a warning and records `audit.export_failing` with a `reason` of `delivery_failed`, `unreadable`, `cursor_unsaved`, for Azure Monitor and Google SecOps `sign_in_failed`, or, for the S3 archive, `not_write_once`; `audit.export_recovered` follows when delivery resumes.
+- `botctl audit siem` (or `GET /api/audit/siem`) shows the sink, the last delivered id, how many are pending, whether it's failing, and the last error. With metrics on, `/metrics` has `superbot_audit_export_pending_events`, `superbot_audit_export_failing` and `superbot_audit_export_last_delivery_timestamp_seconds`, each labelled with the sink's `kind` (`webhook`, `syslog`, `azure-monitor`, `google-secops` or `s3`) and, for a named sink, its `name`. Alert on `superbot_audit_export_failing == 1` or a growing pending count.
 
 ### Examples
 
@@ -304,7 +305,7 @@ AUDIT_EXPORT_S3_ACCESS_KEY_ID=<key id>
 AUDIT_EXPORT_S3_SECRET_ACCESS_KEY=<secret>
 ```
 
-- **One archive.** One `s3://` archive at most, in any place in the list, beside up to four SIEMs (`https://`, `syslog+tls://`, `azure-monitor://`, or the plain forms; [below](#several-siems)). Two archives or an empty entry stop botd at startup. A comma in a webhook's path is written `%2C`.
+- **One archive.** One `s3://` archive at most, in any place in the list, beside up to four SIEMs (`https://`, `syslog+tls://`, `azure-monitor://`, `google-secops://`, or the plain forms; [below](#several-siems)). Two archives or an empty entry stop botd at startup. A comma in a webhook's path is written `%2C`.
 - **Each on its own.** Each sink has its own cursor, retries, `audit.export_failing` and `audit.export_recovered` (with `kind` in their details), so a SIEM outage doesn't stop the archive, and the archive's batching doesn't slow the SIEM. Both get the same lines, so `host` and `id` match across them.
 - **Retention waits for both.** `AUDIT_RETENTION_DAYS` never deletes an event either sink hasn't taken.
 - **Adding one keeps the other.** Cursors are kept per sink, so adding an archive beside a running SIEM (or the other way round) resumes the one that was there. The new one starts as `AUDIT_EXPORT_START` says: with `all`, the default, the archive starts with the history still in the database.
@@ -323,7 +324,7 @@ AUDIT_EXPORT_START_MDR=new
 ```
 
 - **Names.** `<name>=<url>`: 1 to 24 letters and digits, starting with a letter, case-insensitive (shown in lowercase). Not `file`. With more than one SIEM, every SIEM needs one; the archive may have one too. Two sinks with the same name, or the same URL listed twice, stop botd at startup.
-- **Headers.** `AUDIT_EXPORT_HEADERS_<NAME>` (or `_FILE`), the name in capitals, goes to that webhook and no other. It's a secret like `AUDIT_EXPORT_HEADERS`: redacted, never given to a Bot, and with Vault it lives in the server folder as `AUDIT_EXPORT_HEADERS_<NAME>`. With several SIEMs, `AUDIT_EXPORT_HEADERS` stops botd, since it would go to all of them. A webhook with no headers of its own sends none. Syslog, Azure Monitor and the archive take no headers.
+- **Headers.** `AUDIT_EXPORT_HEADERS_<NAME>` (or `_FILE`), the name in capitals, goes to that webhook and no other. It's a secret like `AUDIT_EXPORT_HEADERS`: redacted, never given to a Bot, and with Vault it lives in the server folder as `AUDIT_EXPORT_HEADERS_<NAME>`. With several SIEMs, `AUDIT_EXPORT_HEADERS` stops botd, since it would go to all of them. A webhook with no headers of its own sends none. Syslog, Azure Monitor, Google SecOps and the archive take no headers.
 - **Where each starts.** `AUDIT_EXPORT_START_<NAME>` (`all` or `new`) is for that sink when it is new; otherwise `AUDIT_EXPORT_START` applies. Above, the MDR gets only what happens from now on, while a new archive still gets the history.
 - **Each on its own.** As with an archive: each SIEM has its own cursor (by URL, so naming a running sink resumes it), retries and failure events, so one outage doesn't hold up the others. `audit.export_failing` and `audit.export_recovered` carry the `name`. Every SIEM gets the same lines, so `host`, `id` and `chainHash` match across them and pins can come from any.
 - **Retention waits for all of them.** A SIEM that stays down grows the table for every sink: alert on each one's `pending`.
@@ -430,6 +431,54 @@ az monitor log-analytics query -w <workspace id> -o tsv \
 
 A query returns at most 500,000 rows, so check a long history a month at a time. `ChainHash` gives pins for `botctl audit verify --pin <EventId>:<ChainHash>`. The typed columns aren't checked: compare them with `Line` if a detection depends on one.
 
+## Google SecOps
+
+Google Security Operations (Chronicle) takes the events as raw logs of a log type, and botd sends them itself through the Chronicle API's `logs:import`, with no forwarder or feed beside it. It signs in to Google as its own Google identity, the one Secret Manager uses ([cloud-secrets.md](cloud-secrets.md)): on Google Cloud the metadata server's service account needs no key at all. Design: [ADR 0237](../adr/0237-audit-export-to-google-secops.md).
+
+```sh
+AUDIT_EXPORT=secops=google-secops://<location>/<project>/<instance id>/SUPERBOT_AUDIT
+AUDIT_EXPORT_GCP_AUTH=metadata
+```
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `AUDIT_EXPORT` | `off` | `google-secops://<location>/<project>/<instance>/<log type>`, alone or beside other sinks (name it then). `<location>` is the instance's region (`us`, `eu`, `europe-west2`, ...), which picks the endpoint, `https://<location>-chronicle.googleapis.com`. `<project>` is the Google Cloud project the instance is bound to (its id or number), `<instance>` the instance's id (the customer id, a UUID), `<log type>` the log type to file events under (capitals, digits and `_`) |
+| `AUDIT_EXPORT_GCP_AUTH` | `GCP_SECRET_MANAGER_AUTH`, else `metadata` | `metadata` (the metadata server's service account, at `GCE_METADATA_HOST` if set) or `service-account-key` (`GCP_SERVICE_ACCOUNT_KEY_FILE` or `GCP_SERVICE_ACCOUNT_KEY`), the same settings as Secret Manager |
+
+It takes no headers, no gzip, and no credentials, port, query or fragment in the URL. Tokens are for the `cloud-platform` scope, kept until near their end, sent only to the Chronicle API's endpoint, and redacted everywhere. The key is a server secret, never given to a Bot.
+
+### Set it up
+
+1. Make a custom log type for the events, such as `SUPERBOT_AUDIT`, as Google's guide to custom log types says (or ask Google SecOps support). botd ships no parser yet, so events are searchable with raw log search; a parser that maps them to UDM is up to you.
+2. Note the instance's region, project and customer id from **SIEM Settings > Profile**.
+3. Give botd's service account `chronicle.logs.import` on the project, and nothing more: a custom role with only that permission, or **Chronicle API Editor** if your policy allows its wider rights. Turn the Chronicle API on in the project if it isn't.
+
+```sh
+gcloud iam roles create superbotAuditImport --project=<project> --title="SuperBot audit import" --permissions=chronicle.logs.import
+gcloud projects add-iam-policy-binding <project> --member=serviceAccount:<botd service account> --role=projects/<project>/roles/superbotAuditImport
+```
+
+4. Set `AUDIT_EXPORT` and restart botd. New events show in raw log search for the log type within a few minutes of the first delivery.
+
+### What arrives
+
+Each event is one raw log: the event's JSON line exactly as every other sink gets it ([above](#what-arrives)), with `logEntryTime` the event's time and `collectionTime` when botd sent it. A raw log search finds them by any field, such as `"action":"auth.login_failed"`.
+
+- **Requests.** A batch of up to 200 events goes as requests of at most 2 MB, in order, which is what Google suggests (its limit is 4 MB). If one fails, the batch goes again whole. SecOps drops a log it already has for the log type, and botd counts a request it answers as a duplicate (409 `ALREADY_EXISTS`) as taken; still, de-duplicate on `host` and `id`.
+- **Tokens.** When Google refuses one (401), botd gets a new one and tries once more; only a second refusal is a failure.
+- **Throttling.** A 429 waits at least 30 seconds, as Google asks, or as long as `Retry-After` says, up to 5 minutes, then the usual backoff.
+- **Failures** are recorded as for any sink, with Google's status (such as `PERMISSION_DENIED`) and what to do: `403` needs the permission or the API turned on (step 3), `404` a wrong location, project, instance or log type, `400` a log type the instance doesn't have (step 1). A failed sign-in is `sign_in_failed`: check the identity settings, and that botd runs where the metadata server has a service account.
+
+### Check the copy in SecOps
+
+Each raw log is the line, byte for byte, so it goes into `botctl audit verify-lines` unchanged ([below](#check-exported-events-without-botd)). Get the log type's raw logs back for a time range with the Data Export API (to a bucket you own), take one raw log per line out of the files it writes, and check them:
+
+```sh
+botctl audit verify-lines secops-raw-logs.jsonl --key <checkpoint public key hex> --digests-after <id>
+```
+
+`chainHash` gives pins for `botctl audit verify --pin <id>:<chainHash>`.
+
 ## Compression
 
 Audit lines compress about tenfold. Gzip is off by default, so keys and bodies stay as downstream tools expect; turn it on where they take it. Design: [ADR 0227](../adr/0227-gzip-for-the-audit-export.md).
@@ -442,7 +491,7 @@ AUDIT_EXPORT_S3_COMPRESS=gzip
 ```
 
 - **SIEMs.** `AUDIT_EXPORT_COMPRESS=gzip` gzips every webhook and Azure Monitor request body and adds `Content-Encoding: gzip`; the lines inside are the same. `AUDIT_EXPORT_COMPRESS_<NAME>` (`gzip` or `off`) is that named sink's own and wins, so above every SIEM but `legacy` gets gzip. Splunk HEC, Elastic, Vector, Fluent Bit, Logstash's `http` input and Azure's Logs Ingestion API take it. A collector that doesn't answers an error, often 400 or 415, and the sink shows as failing: turn it off for that sink. Azure's 1 MB limit holds before compression too, so its arrays are cut at 1 MB and then gzipped.
-- **Syslog** has no compression. `AUDIT_EXPORT_COMPRESS_<NAME>=gzip` on a syslog sink stops botd at startup, and so does `AUDIT_EXPORT_COMPRESS=gzip` when no sink is a webhook or Azure Monitor.
+- **Syslog and Google SecOps** have no compression (Google doesn't document gzip for `logs:import`). `AUDIT_EXPORT_COMPRESS_<NAME>=gzip` on either stops botd at startup, and so does `AUDIT_EXPORT_COMPRESS=gzip` when no sink is a webhook or Azure Monitor. Otherwise `AUDIT_EXPORT_COMPRESS=gzip` leaves them plain.
 - **Archive.** `AUDIT_EXPORT_S3_COMPRESS=gzip` writes each object as `<first id>-<last id>.jsonl.gz`, one gzip member with `Content-Type: application/gzip` and no `Content-Encoding`, so every S3 client downloads the same bytes. Metadata, the lock and the read-back are as before. Keys change from then on: tools that list `*.jsonl` (an Athena table, Splunk's S3 input) need `*.jsonl.gz` too. `AUDIT_EXPORT_COMPRESS` doesn't touch the archive, and `AUDIT_EXPORT_COMPRESS_<NAME>` naming it stops botd.
 - **Checks.** The [archive check](#check-the-archive) reads `.jsonl` and `.jsonl.gz` keys, so an archive switched part way checks whole, the chain running across both. A `.gz` object must be gzip to its last byte and hold at most 256 MB uncompressed, or it is `unreadable`. Versions of a key are compared by their lines, so a retry that compressed differently is `retried`, not `overwritten`. A batch cut before the switch and retried after it lands on the `.gz` key, and its events show as `repeated`. `botctl audit verify-lines` gunzips by itself ([below](#check-exported-events-without-botd)).
 - **Status.** `botctl audit siem` shows each sink's `compress` (`gzip` or `off`), and the startup log says which are gzipped.
