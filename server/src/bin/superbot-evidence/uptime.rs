@@ -17,7 +17,7 @@ use crate::period::Period;
 use crate::prometheus::{self, Api};
 use chrono::{Datelike, NaiveDate};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Bumped when a file's shape changes, so tools reading bundles can tell them apart.
@@ -104,15 +104,109 @@ pub struct Probe {
     pub requests: u64,
 }
 
-/// `--query`: a series selector, since only a selector can be read as a range vector of
-/// raw samples (`probe_success{job="superbot-status"}`).
-pub fn valid_selector(s: &str) -> bool {
+/// One label matcher of a series selector: `location=~"lon|fra"`.
+struct Matcher {
+    label: String,
+    op: &'static str,
+    value: String,
+}
+
+/// A series selector, parsed: the metric name (maybe empty) and its label matchers. Only a
+/// selector can be read as a range vector of raw samples (`probe_success{job="superbot-status"}`).
+/// Values are quoted as PromQL quotes them (`"`, `'` or a raw `` ` ``), so a regex's brackets
+/// are part of its value.
+fn parse_selector(s: &str) -> Option<(String, Vec<Matcher>)> {
+    if s.len() > 512 || s.contains(['\n', '\r']) {
+        return None;
+    }
     let s = s.trim();
-    let name_end = s.find('{').unwrap_or(s.len());
-    let (name, rest) = s.split_at(name_end);
-    let name_ok = name.is_empty() || (name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || c == ':') && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':'));
-    let rest_ok = rest.is_empty() || (rest.starts_with('{') && rest.ends_with('}') && rest.matches('{').count() == 1 && rest.matches('}').count() == 1);
-    !s.is_empty() && s.len() <= 512 && name_ok && rest_ok && (!name.is_empty() || rest.len() > 2) && !s.contains(['[', ']', '(', ')', '\n', '\r'])
+    let name_end = s.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':')).unwrap_or(s.len());
+    let name = &s[..name_end];
+    if name.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let rest = s[name_end..].trim_start();
+    let mut matchers = Vec::new();
+    if !rest.is_empty() {
+        let mut cs = rest.strip_prefix('{')?.chars().peekable();
+        let skip = |cs: &mut std::iter::Peekable<std::str::Chars>| {
+            while cs.next_if(|c| c.is_whitespace()).is_some() {}
+        };
+        loop {
+            skip(&mut cs);
+            if cs.next_if_eq(&'}').is_some() {
+                break;
+            }
+            let mut label = String::new();
+            while let Some(c) = cs.next_if(|c| c.is_ascii_alphanumeric() || *c == '_') {
+                label.push(c);
+            }
+            if label.is_empty() || label.starts_with(|c: char| c.is_ascii_digit()) {
+                return None;
+            }
+            skip(&mut cs);
+            let op = match (cs.next()?, cs.peek().copied()) {
+                ('=', Some('~')) => "=~",
+                ('=', _) => "=",
+                ('!', Some('=')) => "!=",
+                ('!', Some('~')) => "!~",
+                _ => return None,
+            };
+            if op.len() == 2 {
+                cs.next();
+            }
+            skip(&mut cs);
+            let quote = cs.next().filter(|q| ['"', '\'', '`'].contains(q))?;
+            let mut value = String::new();
+            loop {
+                match cs.next()? {
+                    c if c == quote => break,
+                    '\\' if quote != '`' => value.push(cs.next()?),
+                    c => value.push(c),
+                }
+            }
+            matchers.push(Matcher { label, op, value });
+            skip(&mut cs);
+            match cs.next()? {
+                ',' => continue,
+                '}' => break,
+                _ => return None,
+            }
+        }
+        if cs.any(|c| !c.is_whitespace()) {
+            return None;
+        }
+    }
+    (!name.is_empty() || !matchers.is_empty()).then(|| (name.to_string(), matchers))
+}
+
+/// `--query`: a series selector.
+pub fn valid_selector(s: &str) -> bool {
+    parse_selector(s).is_some()
+}
+
+/// The query as the bundle records it: the metric, each matcher's label and operator, and
+/// the values of the job and location labels when plain; any other value (a target's
+/// address, say) is left out.
+fn shown_query(selector: &str) -> String {
+    let Some((name, matchers)) = parse_selector(selector) else { return "<not a selector>".into() };
+    if matchers.is_empty() {
+        return name;
+    }
+    let shown: Vec<String> = matchers
+        .iter()
+        .map(|m| {
+            let value = if SHOWN_LABELS.contains(&m.label.as_str()) && m.value.bytes().all(|c| c.is_ascii_alphanumeric() || b"._:-/|".contains(&c)) { m.value.as_str() } else { "<not recorded>" };
+            format!("{}{}\"{value}\"", m.label, m.op)
+        })
+        .collect();
+    format!("{name}{{{}}}", shown.join(","))
+}
+
+/// Which server a Prometheus series probed: the blackbox exporter's `target`, or the
+/// `instance` it is usually relabelled to.
+fn target_of(labels: &serde_json::Map<String, Value>) -> String {
+    labels.get("target").or_else(|| labels.get("instance")).and_then(Value::as_str).unwrap_or_default().to_string()
 }
 
 fn plain(s: &str, max: usize) -> bool {
@@ -134,7 +228,8 @@ fn series_view(labels: &serde_json::Map<String, Value>) -> Value {
 pub fn fetch(api: &mut dyn Api, selector: &str, p: &Period) -> Result<Probe, String> {
     let (start, end) = (p.start_ms() / 1000, p.end_ms() / 1000);
     let mut keys: BTreeMap<String, usize> = BTreeMap::new();
-    let mut probe = Probe { source: json!({ "kind": "prometheus", "query": selector, "basis": "raw samples of a range vector, read a day at a time" }), ..Probe::default() };
+    let mut targets: BTreeSet<String> = BTreeSet::new();
+    let mut probe = Probe { source: json!({ "kind": "prometheus", "query": shown_query(selector), "basis": "raw samples of a range vector, read a day at a time" }), ..Probe::default() };
     let mut t = start;
     while t < end {
         let to = (t + CHUNK_SECS).min(end);
@@ -145,6 +240,7 @@ pub fn fetch(api: &mut dyn Api, selector: &str, p: &Period) -> Result<Probe, Str
         }
         for r in data["result"].as_array().into_iter().flatten() {
             let labels = r["metric"].as_object().cloned().unwrap_or_default();
+            targets.insert(target_of(&labels));
             let key = serde_json::to_string(&labels.iter().collect::<BTreeMap<_, _>>()).unwrap_or_default();
             let n = keys.len();
             let series = *keys.entry(key).or_insert_with(|| {
@@ -162,6 +258,13 @@ pub fn fetch(api: &mut dyn Api, selector: &str, p: &Period) -> Result<Probe, Str
             }
         }
         t = to;
+    }
+    if targets.len() > 1 {
+        return Err(format!(
+            "{selector} returns the probe of {} servers, and one server's answers would hide another's outages: measure one at a time, adding its target to --query ({}{{job=\"superbot-status\",instance=\"<its status URL>\"}})",
+            targets.len(),
+            parse_selector(selector).map(|(n, _)| n).filter(|n| !n.is_empty()).unwrap_or_else(|| "probe_success".into())
+        ));
     }
     Ok(probe)
 }
@@ -184,27 +287,30 @@ fn parse_ok(s: &str) -> Option<bool> {
 
 /// A checks file any probe can export: one check a line, `<time>,<result>[,<location>]`,
 /// the time as RFC 3339 or Unix seconds, the result `1`, `true` or `up` for a 2xx answer
-/// and `0`, `false` or `down` for anything else; a header line first and `#` comments are
-/// skipped. Each location is a series of its own.
+/// and `0`, `false` or `down` for anything else; `#` comments are skipped, and so is a
+/// first line of column names (letters only, no digits), so a mistyped first check is
+/// refused rather than taken for a header. Each location is a series of its own.
 pub fn read_checks(file: &str, bytes: &[u8], probe: &mut Probe) -> Result<(), String> {
     let text = std::str::from_utf8(bytes).map_err(|_| format!("{file} isn't UTF-8 text"))?;
     let name = Path::new(file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let mut local: BTreeMap<String, usize> = BTreeMap::new();
-    let (mut bad, mut read) = (Vec::new(), 0usize);
+    let (mut bad, mut read, mut first) = (Vec::new(), 0usize, true);
     for (i, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let cells: Vec<&str> = line.split(',').map(str::trim).collect();
+        let header = first && cells.iter().all(|c| !c.is_empty() && c.chars().all(|c| c.is_alphabetic() || " _-()./".contains(c)));
+        first = false;
+        if header {
+            continue;
+        }
         let parsed = match cells.as_slice() {
             [t, r] | [t, r, _] => parse_time(t).zip(parse_ok(r)),
             _ => None,
         };
         let Some((at_ms, ok)) = parsed else {
-            if read == 0 && bad.is_empty() && i == 0 {
-                continue;
-            }
             bad.push(i + 1);
             continue;
         };
@@ -827,12 +933,14 @@ mod tests {
         assert_eq!(pr.checks[1].at_ms, 1_790_812_830_000);
         assert_eq!(pr.series, [json!({ "id": "october.csv:lon", "labels": { "location": "lon" } }), json!({ "id": "october.csv:fra", "labels": { "location": "fra" } })]);
         assert_eq!((pr.source["files"][0]["file"].as_str(), pr.source["files"][0]["checks"].as_u64()), (Some("october.csv"), Some(3)), "the file's name, never its folder");
-        read_checks("second.csv", b"2026-10-02T00:00:00Z,true\n", &mut pr).unwrap();
+        read_checks("second.csv", b"# a comment first\nTimestamp (UTC),Status\n2026-10-02T00:00:00Z,true\n", &mut pr).unwrap();
         assert_eq!((pr.series.len(), pr.source["files"].as_array().unwrap().len()), (3, 2));
         for (bad, want) in [
             ("2026-10-01T00:00:00Z,1\nnot a line\n2026-10-01T00:01:00Z,maybe\n", "line 2, 3 are not"),
             ("2026-10-01T00:00:00Z,1,a location; rm\n", "line 1 is not"),
             ("time,up\n", "holds no checks"),
+            ("2026-10-01T00:00:00Z,dwon\n2026-10-01T00:01:00Z,1\n", "line 1 is not"),
+            ("2026-10-01T00:00:00Z,1\ntime,up\n", "line 2 is not"),
         ] {
             let e = read_checks("x.csv", bad.as_bytes(), &mut Probe::default()).unwrap_err();
             assert!(e.contains(want), "{want}: {e}");
@@ -870,16 +978,26 @@ mod tests {
         assert_eq!(pr.requests, 2);
         let mut vector = Fake { answers: HashMap::from([(d1, json!({ "resultType": "vector", "result": [] }))]), asked: Vec::new() };
         assert!(fetch(&mut vector, "up", &p).unwrap_err().contains("series selector"));
+        let server = |target: &str| json!({ "__name__": "probe_success", "job": "superbot-status", "instance": target, "location": "lon" });
+        let two = json!({ "resultType": "matrix", "result": [series(server("https://a.example.com/status.json"), vec![(d1 - 30, "0")]), series(server("https://b.example.com/status.json"), vec![(d1 - 30, "1")])] });
+        let mut both = Fake { answers: HashMap::from([(d1, two.clone()), (d2, two)]), asked: Vec::new() };
+        let e = fetch(&mut both, DEFAULT_QUERY, &p).unwrap_err();
+        assert!(e.contains("probe of 2 servers") && e.contains("instance=") && !e.contains("example.com"), "one server's answers never hide another's: {e}");
+        let pr = fetch(&mut f, r#"probe_success{job="superbot-status",instance="https://bots.example.com/status.json"}"#, &p).unwrap();
+        assert_eq!(pr.source["query"], r#"probe_success{job="superbot-status",instance="<not recorded>"}"#);
     }
 
     #[test]
     fn selectors_objectives_and_options() {
-        for ok in [DEFAULT_QUERY, "probe_success", r#"{__name__="probe_success",location=~"lon|fra"}"#, "probe_success{}"] {
+        for ok in [DEFAULT_QUERY, "probe_success", r#"{__name__="probe_success",location=~"lon|fra"}"#, "probe_success{}", r#"probe_success{location=~"lon[12]", job = 'superbot-status',}"#, r#"probe_success{instance=~`https://.*\.example\.com/(status)`}"#, r#"probe_success{a="say \"}\" twice"}"#] {
             assert!(valid_selector(ok), "{ok}");
         }
-        for bad in ["", "{}", "avg_over_time(probe_success[5m])", "probe_success[1d]", "probe_success{a=\"b\"} or up", "1x", "probe_success{a=\"b\"}{c=\"d\"}"] {
+        for bad in ["", "{}", "avg_over_time(probe_success[5m])", "probe_success[1d]", "probe_success{a=\"b\"} or up", "1x", "probe_success{a=\"b\"}{c=\"d\"}", "probe_success{a=b}", "probe_success{a=\"b\"", "probe_success{a==\"b\"}", "probe_success{1a=\"b\"}", "probe_success{a=\"b\" c=\"d\"}"] {
             assert!(!valid_selector(bad), "{bad}");
         }
+        assert_eq!(shown_query(DEFAULT_QUERY), DEFAULT_QUERY);
+        assert_eq!(shown_query(r#"probe_success{job="superbot-status",instance="https://bots.example.com/status.json",location=~"lon|fra"}"#), r#"probe_success{job="superbot-status",instance="<not recorded>",location=~"lon|fra"}"#, "never the target's address");
+        assert_eq!(shown_query(r#"probe_success{location=~"lon[12]"}"#), r#"probe_success{location=~"<not recorded>"}"#);
         assert_eq!((parse_objective("99.9"), parse_objective("99.95"), parse_objective("99"), parse_objective("90")), (Ok(9990), Ok(9995), Ok(9900), Ok(9000)));
         for bad in ["100", "89.99", "99.999", "99,9", "-99", "", "99.", "abc"] {
             assert!(parse_objective(bad).is_err(), "{bad}");

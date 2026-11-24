@@ -366,9 +366,12 @@ fn drills(a: &Args, p: period::Period, gh: Option<(&mut github::GitHub, &str)>, 
     ))
 }
 
+/// A command that parses its own options and prints what it saved.
+type Command = fn(&[String], chrono::DateTime<chrono::Utc>) -> Result<String, String>;
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let own: Option<fn(&[String], chrono::DateTime<chrono::Utc>) -> Result<String, String>> = match args.first().map(String::as_str) {
+    let own: Option<Command> = match args.first().map(String::as_str) {
         Some("register") => Some(register::run),
         Some("uptime") => Some(uptime::run),
         _ => None,
