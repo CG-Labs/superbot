@@ -5,6 +5,7 @@
 //! changes nobody.
 
 use crate::db::ScimKey;
+use crate::scim::google::push::Watch::{Groups, Users};
 use crate::scim::google::{self, Directory, Settings};
 use crate::scim_http_tests::{events, session_for, token};
 use crate::tests::{call, call_with, serve_app_and_auth, serve_app_with};
@@ -21,6 +22,9 @@ use std::sync::Mutex;
 use zeroize::Zeroizing;
 
 const TOKEN: &str = "ya29.stand-in";
+/// The access token for the audit scope alone: the Reports API takes only it, the
+/// Directory API never does.
+const AUDIT_TOKEN: &str = "ya29.audit-stand-in";
 const TENANT: &str = "google";
 
 #[derive(Default)]
@@ -43,6 +47,11 @@ struct Dir {
     org_units: Vec<(String, String, String)>,
     /// The scopes each access token was asked for.
     scopes: Vec<String>,
+    /// The audit scope isn't delegated: a token for it is refused.
+    no_audit_scope: bool,
+    /// Each Reports API watch asked for, and each channels.stop there.
+    report_watches: Vec<(HashMap<String, String>, Value)>,
+    report_stops: Vec<Value>,
 }
 
 type D = Arc<Mutex<Dir>>;
@@ -113,10 +122,14 @@ async fn token_endpoint(St(d): St<D>, Form(form): Form<HashMap<String, String>>)
     let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(input.split('.').nth(1).unwrap()).unwrap()).unwrap();
     let scope = claims["scope"].as_str().unwrap_or_default().to_string();
     assert_eq!(claims["iss"].as_str(), Some("sync@project-1.iam.gserviceaccount.com"));
-    assert!(scope == google::SCOPES || scope == format!("{} {}", google::SCOPES, google::ORG_UNIT_SCOPE), "{scope}");
+    let audit = scope == google::push::REPORTS_SCOPE;
+    assert!(audit || scope == google::SCOPES || scope == format!("{} {}", google::SCOPES, google::ORG_UNIT_SCOPE), "{scope}");
     d.scopes.push(scope);
     d.subjects.push(claims["sub"].as_str().map(String::from));
-    (StatusCode::OK, Json(json!({ "access_token": TOKEN, "expires_in": 3599, "token_type": "Bearer" })))
+    if audit && d.no_audit_scope {
+        return bad();
+    }
+    (StatusCode::OK, Json(json!({ "access_token": if audit { AUDIT_TOKEN } else { TOKEN }, "expires_in": 3599, "token_type": "Bearer" })))
 }
 
 async fn users(St(d): St<D>, h: HeaderMap, Query(q): Query<HashMap<String, String>>) -> (StatusCode, Json<Value>) {
@@ -179,6 +192,33 @@ async fn watch(St(d): St<D>, h: HeaderMap, Query(q): Query<HashMap<String, Strin
     (StatusCode::OK, Json(json!({ "kind": "api#channel", "id": body["id"], "resourceId": format!("r-{event}"), "token": body["token"], "expiration": expires.to_string() })))
 }
 
+fn gate_audit(h: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
+    if h.get("authorization").and_then(|v| v.to_str().ok()) != Some(&format!("Bearer {AUDIT_TOKEN}")) {
+        return Err((StatusCode::FORBIDDEN, Json(json!({ "error": { "code": 403, "status": "PERMISSION_DENIED", "message": "Request had insufficient authentication scopes." } }))));
+    }
+    Ok(())
+}
+
+async fn report_watch(St(d): St<D>, h: HeaderMap, Query(q): Query<HashMap<String, String>>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+    let mut d = d.lock().unwrap();
+    if let Err(e) = gate_audit(&h) {
+        return e;
+    }
+    d.report_watches.push((q.clone(), body.clone()));
+    let expires = db::now() + 6 * 3_600_000;
+    let event = q.get("eventName").cloned().unwrap_or_default();
+    (StatusCode::OK, Json(json!({ "kind": "api#channel", "id": body["id"], "resourceId": format!("a-{event}"), "token": body["token"], "expiration": expires.to_string() })))
+}
+
+async fn report_stop(St(d): St<D>, h: HeaderMap, Json(body): Json<Value>) -> (StatusCode, String) {
+    let mut d = d.lock().unwrap();
+    if let Err((code, _)) = gate_audit(&h) {
+        return (code, String::new());
+    }
+    d.report_stops.push(body);
+    (StatusCode::NO_CONTENT, String::new())
+}
+
 async fn stop_channel(St(d): St<D>, h: HeaderMap, Json(body): Json<Value>) -> (StatusCode, String) {
     let mut d = d.lock().unwrap();
     if let Err((code, _)) = gate(&d, &h) {
@@ -218,6 +258,8 @@ async fn google_stand_in() -> Google {
         .route("/admin/directory/v1/customer/{customer}/orgunits/{*key}", get(org_unit))
         .route("/admin/directory/v1/users/watch", post(watch))
         .route("/admin/directory_v1/channels/stop", post(stop_channel))
+        .route("/admin/reports/v1/activity/users/all/applications/admin/watch", post(report_watch))
+        .route("/admin/reports_v1/channels/stop", post(report_stop))
         .with_state(dir.clone());
     tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
     let key =
@@ -240,6 +282,7 @@ fn settings(g: &Google) -> Settings {
         interval: std::time::Duration::from_secs(1800),
         max_removals: 10,
         push: None,
+        push_groups: false,
     }
 }
 
@@ -816,7 +859,7 @@ async fn google_pushes_a_change_and_a_pass_runs_at_once() {
     let w = world(&g, false, |s| s.push = Some(ADDRESS.into())).await;
     synced(&w).await;
 
-    let next = google::push::renew(&w.auth, &w.dir()).await;
+    let next = google::push::renew(&w.auth, &w.dir(), Users).await;
     assert!(next > std::time::Duration::from_secs(4 * 3600), "{next:?}");
     let watches = g.dir.lock().unwrap().watches.clone();
     assert_eq!(watches.iter().map(|(q, _)| q["event"].as_str()).collect::<Vec<_>>(), ["add", "update", "delete", "undelete"]);
@@ -830,7 +873,7 @@ async fn google_pushes_a_change_and_a_pass_runs_at_once() {
     assert_eq!((p["enabled"].as_bool(), p["watching"].as_bool(), p["address"].as_str(), p["channels"].as_array().map(Vec::len)), (Some(true), Some(true), Some(ADDRESS), Some(4)), "{p}");
 
     // New channels before the old ones end, which are then stopped; renewals aren't audited.
-    google::push::renew(&w.auth, &w.dir()).await;
+    google::push::renew(&w.auth, &w.dir(), Users).await;
     let mut gone = stopped(&g);
     gone.sort();
     let mut want: Vec<(String, String)> = first.iter().map(|(id, _, r)| (id.clone(), r.clone())).collect();
@@ -871,7 +914,7 @@ async fn google_pushes_a_change_and_a_pass_runs_at_once() {
 async fn channels_left_from_before_are_stopped_and_push_off_starts_no_pass() {
     let g = google_stand_in().await;
     let w = world(&g, false, |s| s.push = Some(ADDRESS.into())).await;
-    google::push::renew(&w.auth, &w.dir()).await;
+    google::push::renew(&w.auth, &w.dir(), Users).await;
     // A channel botd made before a restart: its token still checks out.
     let old = format!("superbot-{}", "0a".repeat(16));
     let token = google::push::channel_token(&old);
@@ -891,7 +934,7 @@ async fn channels_left_from_before_are_stopped_and_push_off_starts_no_pass() {
     assert_eq!(notify(&off, &old, &token, "update", "r-old").await, 200);
     eventually("the channel is stopped", || stopped(&g2).len() == 1).await;
     assert!(off.dir().push.begin().is_empty());
-    assert_eq!(google::push::renew(&off.auth, &off.dir()).await, std::time::Duration::from_secs(6 * 3600), "nothing to renew");
+    assert_eq!(google::push::renew(&off.auth, &off.dir(), Users).await, std::time::Duration::from_secs(6 * 3600), "nothing to renew");
     assert!(g2.dir.lock().unwrap().watches.is_empty());
 
     // The sync off: nothing there.
@@ -904,12 +947,12 @@ async fn channels_left_from_before_are_stopped_and_push_off_starts_no_pass() {
 async fn a_watch_that_fails_keeps_the_old_channels_and_is_audited_once() {
     let g = google_stand_in().await;
     let w = world(&g, false, |s| s.push = Some(ADDRESS.into())).await;
-    google::push::renew(&w.auth, &w.dir()).await;
+    google::push::renew(&w.auth, &w.dir(), Users).await;
     let old = channels(&g);
 
     // Two new channels, then Google refuses: the two are stopped, the old four kept.
     g.set(|d| d.watch_limit = Some(6));
-    assert_eq!(google::push::renew(&w.auth, &w.dir()).await, std::time::Duration::from_secs(300));
+    assert_eq!(google::push::renew(&w.auth, &w.dir(), Users).await, std::time::Duration::from_secs(300));
     let made: Vec<String> = g.dir.lock().unwrap().watches[4..].iter().map(|(_, b)| b["id"].as_str().unwrap().to_string()).collect();
     assert_eq!(stopped(&g).into_iter().map(|(id, _)| id).collect::<Vec<_>>(), made);
     let p = push_status(&w).await;
@@ -917,16 +960,141 @@ async fn a_watch_that_fails_keeps_the_old_channels_and_is_audited_once() {
     let (id, token, resource) = old[1].clone();
     assert_eq!(notify(&w, &id, &token, "update", &resource).await, 200, "the old channels still deliver");
     assert_eq!(push_status(&w).await["notifications"], 1);
-    google::push::renew(&w.auth, &w.dir()).await;
+    google::push::renew(&w.auth, &w.dir(), Users).await;
     let failed = events(w.port, &w.admin, "action=scim.google_push_failed").await;
     assert_eq!((failed.len(), failed[0]["outcome"].as_str(), failed[0]["details"]["channelsLeft"].as_u64()), (1, Some("failure"), Some(4)), "once per failure: {failed:?}");
 
     // Google lets it again: new channels, the old ones stopped, and it says so.
     g.set(|d| d.watch_limit = None);
-    google::push::renew(&w.auth, &w.dir()).await;
+    google::push::renew(&w.auth, &w.dir(), Users).await;
     let gone = stopped(&g);
     assert!(old.iter().all(|(id, _, _)| gone.iter().any(|(s, _)| s == id)), "{gone:?}");
     let ev = events(w.port, &w.admin, "action=scim.google_push_watching").await;
     assert_eq!((ev.len(), ev[0]["details"]["recovered"].as_bool()), (2, Some(true)), "{ev:?}");
     assert!(push_status(&w).await["failure"].is_null());
+}
+
+// Group push (ADR 0244): the Reports API's admin activity for group members.
+
+/// A Reports API notification: the activity is in the body, which botd doesn't read.
+async fn notify_group(w: &World, id: &str, token: &str, event: &str, resource: &str) -> u16 {
+    let extra = format!("X-Goog-Channel-ID: {id}\r\nX-Goog-Channel-Token: {token}\r\nX-Goog-Resource-State: {event}\r\nX-Goog-Resource-ID: {resource}\r\nX-Goog-Message-Number: 7\r\n");
+    let params = json!([{ "name": "GROUP_EMAIL", "value": "staff@example.com" }, { "name": "USER_EMAIL", "value": "bob@example.com" }]);
+    let body = json!({ "kind": "admin#reports#activity", "id": { "applicationName": "admin" }, "events": [{ "type": "GROUP_SETTINGS", "name": event, "parameters": params }] }).to_string();
+    call_with(w.port, "POST", google::push::PATH, "", &extra, &body).await.0
+}
+
+fn group_channels(g: &Google) -> Vec<(String, String, String)> {
+    let d = g.dir.lock().unwrap();
+    d.report_watches[d.report_watches.len() - 3..].iter().map(|(q, b)| (b["id"].as_str().unwrap().into(), b["token"].as_str().unwrap().into(), format!("a-{}", q["eventName"]))).collect()
+}
+
+fn report_stopped(g: &Google) -> Vec<String> {
+    g.dir.lock().unwrap().report_stops.iter().map(|s| s["id"].as_str().unwrap().to_string()).collect()
+}
+
+#[tokio::test]
+async fn google_pushes_a_group_removal_and_the_leaver_goes_at_once() {
+    let g = google_stand_in().await;
+    let w = world(&g, false, |s| {
+        s.push = Some(ADDRESS.into());
+        s.push_groups = true;
+    })
+    .await;
+    synced(&w).await;
+    assert!(user_of(&w, "102").is_some());
+
+    google::push::renew(&w.auth, &w.dir(), Users).await;
+    let next = google::push::renew(&w.auth, &w.dir(), Groups).await;
+    assert!(next > std::time::Duration::from_secs(4 * 3600), "{next:?}");
+    let watches = g.dir.lock().unwrap().report_watches.clone();
+    assert_eq!(watches.iter().map(|(q, _)| q["eventName"].as_str()).collect::<Vec<_>>(), google::push::GROUP_EVENTS);
+    for (q, b) in &watches {
+        assert!(!q.contains_key("customerId"), "my_customer is the Reports API's default: {q:?}");
+        assert_eq!((b["type"].as_str(), b["address"].as_str(), b["params"]["ttl"].as_str()), (Some("web_hook"), Some(ADDRESS), Some("21600")), "{b}");
+        assert!(b["id"].as_str().unwrap().starts_with("superbot-g-"), "{b}");
+    }
+    // Only the group channels' token carries the audit scope; no pass's does.
+    let scopes = g.dir.lock().unwrap().scopes.clone();
+    assert_eq!(scopes.iter().filter(|s| s.contains("audit")).collect::<Vec<_>>(), [google::push::REPORTS_SCOPE]);
+    let ev = events(w.port, &w.admin, "action=scim.google_push_watching").await;
+    let by = |watch: &str| ev.iter().find(|e| e["details"]["watch"] == watch).map(|e| e["details"]["events"].clone());
+    assert_eq!((ev.len(), by("users"), by("groups")), (2, Some(json!(google::push::EVENTS)), Some(json!(google::push::GROUP_EVENTS))), "{ev:?}");
+    let p = push_status(&w).await;
+    assert_eq!((p["watching"].as_bool(), p["groups"]["watching"].as_bool(), p["channels"].as_array().map(Vec::len)), (Some(true), Some(true), Some(7)), "{p}");
+
+    // Renewing one set leaves the other's channels alone.
+    let users_before = channels(&g);
+    google::push::renew(&w.auth, &w.dir(), Groups).await;
+    assert_eq!(report_stopped(&g), watches.iter().map(|(_, b)| b["id"].as_str().unwrap().to_string()).collect::<Vec<_>>());
+    assert!(stopped(&g).is_empty(), "no user channel was stopped");
+    assert_eq!(channels(&g), users_before);
+    assert_eq!(events(w.port, &w.admin, "action=scim.google_push_watching").await.len(), 2, "renewals aren't audited");
+
+    // A forged group notification starts nothing.
+    let (id, token, resource) = group_channels(&g)[1].clone();
+    assert_eq!(notify_group(&w, &id, "forged", "REMOVE_GROUP_MEMBER", &resource).await, 401);
+    assert_eq!(notify_group(&w, &id, &channels(&g)[0].1, "REMOVE_GROUP_MEMBER", &resource).await, 401, "a user channel's token isn't this one's");
+
+    // Bob is taken out of staff@, and stays active in Google: Google's admin log says so,
+    // and a pass deletes him within seconds instead of at the next schedule.
+    w.dir().push.forget_last_pass();
+    google::start(w.auth.clone());
+    g.set(|d| d.groups.get_mut("staff@example.com").unwrap().2.retain(|m| m["id"] != "102"));
+    assert_eq!(notify_group(&w, &id, &token, "REMOVE_GROUP_MEMBER", &resource).await, 200);
+    eventually("Bob is deleted by a pushed pass", || user_of(&w, "102").is_none()).await;
+    let ev = events(w.port, &w.admin, "action=scim.google_sync").await;
+    assert_eq!((ev[0]["details"]["trigger"].as_str(), ev[0]["details"]["pushed"].clone(), ev[0]["details"]["deleted"].as_u64()), (Some("push"), json!(["REMOVE_GROUP_MEMBER"]), Some(1)), "{}", ev[0]);
+    assert_eq!(push_status(&w).await["notifications"], 1);
+}
+
+#[tokio::test]
+async fn group_push_fails_on_its_own_and_its_leftovers_are_stopped_where_they_live() {
+    let g = google_stand_in().await;
+    g.set(|d| d.no_audit_scope = true);
+    let w = world(&g, false, |s| {
+        s.push = Some(ADDRESS.into());
+        s.push_groups = true;
+        s.customer = "C01abc23".into();
+    })
+    .await;
+
+    // The audit scope isn't delegated: user push and the passes don't care.
+    google::push::renew(&w.auth, &w.dir(), Users).await;
+    assert_eq!(google::push::renew(&w.auth, &w.dir(), Groups).await, std::time::Duration::from_secs(300));
+    google::push::renew(&w.auth, &w.dir(), Groups).await;
+    let p = push_status(&w).await;
+    assert_eq!((p["watching"].as_bool(), p["failure"].clone(), p["groups"]["watching"].as_bool()), (Some(true), Value::Null, Some(false)), "{p}");
+    assert_eq!(p["groups"]["failure"]["reason"], "sign_in", "{p}");
+    assert!(p["groups"]["failure"]["detail"].as_str().unwrap().contains("admin.reports.audit.readonly"), "{p}");
+    let failed = events(w.port, &w.admin, "action=scim.google_push_failed").await;
+    assert_eq!((failed.len(), failed[0]["details"]["watch"].as_str(), failed[0]["details"]["channelsLeft"].as_u64()), (1, Some("groups"), Some(0)), "once: {failed:?}");
+    assert!(g.dir.lock().unwrap().report_watches.is_empty());
+
+    // Delegated: the group channels come, for the customer named, and say they recovered.
+    g.set(|d| d.no_audit_scope = false);
+    google::push::renew(&w.auth, &w.dir(), Groups).await;
+    let watches = g.dir.lock().unwrap().report_watches.clone();
+    assert!(watches.iter().all(|(q, _)| q["customerId"] == "C01abc23"), "{watches:?}");
+    let ev = events(w.port, &w.admin, "action=scim.google_push_watching").await;
+    let groups = ev.iter().find(|e| e["details"]["watch"] == "groups").unwrap();
+    assert_eq!(groups["details"]["recovered"], true, "{groups}");
+    assert!(push_status(&w).await["groups"]["failure"].is_null());
+
+    // A group channel from before a restart is stopped on the Reports API, and still nudges.
+    let old = format!("superbot-g-{}", "0b".repeat(16));
+    let token = google::push::channel_token(&old);
+    assert_eq!(notify_group(&w, &old, &token, "ADD_GROUP_MEMBER", "a-old").await, 200);
+    eventually("the leftover group channel is stopped", || report_stopped(&g).contains(&old)).await;
+    assert!(stopped(&g).is_empty(), "not on the Directory API");
+    assert_eq!(w.dir().push.begin(), vec!["ADD_GROUP_MEMBER"]);
+
+    // Group push off, user push on: group channels from before are stopped, none made.
+    let g2 = google_stand_in().await;
+    let users_only = world(&g2, false, |s| s.push = Some(ADDRESS.into())).await;
+    assert_eq!(push_status(&users_only).await["groups"], json!({ "enabled": false }));
+    assert_eq!(google::push::renew(&users_only.auth, &users_only.dir(), Groups).await, std::time::Duration::from_secs(6 * 3600), "nothing to renew");
+    assert_eq!(notify_group(&users_only, &old, &token, "REMOVE_GROUP_MEMBER", "a-old").await, 200);
+    eventually("the group channel is stopped", || report_stopped(&g2) == [old.clone()]).await;
+    assert!(g2.dir.lock().unwrap().report_watches.is_empty());
 }

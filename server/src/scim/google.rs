@@ -10,7 +10,8 @@
 //! even when Google has them active: the sync only enables people it disabled itself.
 //!
 //! With GOOGLE_DIRECTORY_PUSH=on, Google also tells botd when a user changes, and a pass
-//! starts within seconds (`push`, ADR 0216).
+//! starts within seconds (`push`, ADR 0216); with GOOGLE_DIRECTORY_PUSH_GROUPS=on, when
+//! a group's members change too (ADR 0244).
 
 pub mod push;
 
@@ -85,6 +86,9 @@ pub struct Settings {
     /// GOOGLE_DIRECTORY_PUSH=on: the https address Google sends user changes to
     /// (`push::PATH` on PUBLIC_URL), each starting a pass at once (ADR 0216).
     pub push: Option<String>,
+    /// GOOGLE_DIRECTORY_PUSH_GROUPS=on: group membership changes are pushed too, from
+    /// the Reports API's admin activity (ADR 0244).
+    pub push_groups: bool,
 }
 
 impl Settings {
@@ -163,6 +167,7 @@ impl Settings {
         let minutes = number(var, "GOOGLE_DIRECTORY_INTERVAL_MINUTES", 30, 5, 1440)?;
         let max_removals = number(var, "GOOGLE_DIRECTORY_MAX_REMOVALS", 10, 1, 1_000_000)?;
         let push = push::address(var)?;
+        let push_groups = push::groups(var, push.as_deref(), !(groups.is_empty() && teams.is_empty() && role_groups.is_empty()))?;
         Ok(Some(Settings {
             tenant,
             customer,
@@ -177,6 +182,7 @@ impl Settings {
             interval: Duration::from_secs(minutes as u64 * 60),
             max_removals,
             push,
+            push_groups,
         }))
     }
 
@@ -188,6 +194,14 @@ impl Settings {
     /// The organizational units read from Google: every one named but `/`.
     fn units_to_read(&self) -> impl Iterator<Item = &String> {
         self.org_units.iter().chain(&self.team_org_units).filter(|o| *o != ROOT)
+    }
+
+    fn describe_push(&self) -> String {
+        match &self.push {
+            Some(a) if self.push_groups => format!("Google pushes user and group membership changes to {a} (ADR 0216, ADR 0244)"),
+            Some(a) => format!("Google pushes user changes to {a} (ADR 0216)"),
+            None => "no push (GOOGLE_DIRECTORY_PUSH=off)".into(),
+        }
     }
 
     /// What the service account asks Google for: the org unit scope only when a unit
@@ -515,7 +529,7 @@ impl Directory {
         service_account(&json)?;
         let loopback = url::Url::parse(&settings.api).ok().and_then(|u| u.host_str().map(crate::is_loopback_host)).unwrap_or(false);
         let http = reqwest::Client::builder().https_only(!loopback).connect_timeout(CONNECT_TIMEOUT).timeout(TIMEOUT).redirect(reqwest::redirect::Policy::none()).build().map_err(|e| e.to_string())?;
-        let push = push::Push::new(settings.push.clone());
+        let push = push::Push::new(settings.push.clone(), settings.push_groups);
         Ok(Directory { settings, key, http, running: tokio::sync::Mutex::new(()), last: std::sync::Mutex::new(None), last_success: std::sync::Mutex::new(None), push })
     }
 
@@ -537,18 +551,19 @@ impl Directory {
                 None => "no SSO link (GOOGLE_DIRECTORY_SSO)".into(),
             },
             s.max_removals,
-            match &s.push {
-                Some(a) => format!("Google pushes user changes to {a} (ADR 0216)"),
-                None => "no push (GOOGLE_DIRECTORY_PUSH=off)".into(),
-            }
+            s.describe_push()
         )
     }
 
+    /// A pass's token, with the directory's read-only scopes.
     async fn token(&self) -> Result<Zeroizing<String>, Failure> {
+        self.token_with(&self.settings.scopes()).await
+    }
+
+    async fn token_with(&self, scopes: &str) -> Result<Zeroizing<String>, Failure> {
         let json = (self.key)().map_err(|e| fail("credentials", format!("{CREDENTIALS} couldn't be read: {e}")))?;
         let sa = service_account(&json.ok_or(fail("credentials", format!("{CREDENTIALS} is gone")))?).map_err(|e| fail("credentials", e))?;
-        let scopes = self.settings.scopes();
-        let assertion = jwt(&sa, self.settings.admin.as_deref(), &scopes).map_err(|e| fail("credentials", e))?;
+        let assertion = jwt(&sa, self.settings.admin.as_deref(), scopes).map_err(|e| fail("credentials", e))?;
         let form = [("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", assertion.as_str())];
         let res = self.http.post(&sa.token_uri).form(&form).send().await.map_err(|e| fail("unreachable", format!("Google's token endpoint couldn't be reached: {}", e.without_url())))?;
         let status = res.status();
@@ -557,9 +572,13 @@ impl Directory {
             return Err(fail(
                 "sign_in",
                 format!(
-                    "Google refused the service account ({status}, {}). Check domain-wide delegation of the {} read-only scopes, and GOOGLE_DIRECTORY_ADMIN.",
+                    "Google refused the service account ({status}, {}). Check domain-wide delegation of {}, and GOOGLE_DIRECTORY_ADMIN.",
                     google_error(&body),
-                    if scopes == SCOPES { "two" } else { "three (with the organizational unit scope)" }
+                    match scopes {
+                        SCOPES => "the two read-only scopes",
+                        push::REPORTS_SCOPE => "the read-only audit scope (admin.reports.audit.readonly, for group push)",
+                        _ => "the three read-only scopes (with the organizational unit scope)",
+                    }
                 ),
             ));
         }
@@ -1430,6 +1449,16 @@ mod tests {
         assert!(on(&[("GOOGLE_DIRECTORY_API_URL", "http://directory.example")], &scim(false)).is_err());
         assert!(on(&[("GOOGLE_DIRECTORY_API_URL", "https://directory.example/v1")], &scim(false)).is_err());
         assert!(on(&[("GOOGLE_DIRECTORY_API_URL", "http://127.0.0.1:9")], &scim(false)).is_ok());
+
+        // Group push (ADR 0244): only with push, and never changes a pass's scopes.
+        let push = [("GOOGLE_DIRECTORY_PUSH", "on"), ("PUBLIC_URL", "https://superbot.example.com"), ("GOOGLE_DIRECTORY_PUSH_GROUPS", "on")];
+        let p = on(&push, &scim(false)).unwrap().unwrap();
+        assert_eq!((p.push_groups, p.scopes()), (true, SCOPES.to_string()));
+        assert!(p.describe_push().contains("user and group membership changes"), "{}", p.describe_push());
+        assert!(!on(&push[..2], &scim(false)).unwrap().unwrap().push_groups, "off by default");
+        assert!(on(&[("GOOGLE_DIRECTORY_PUSH_GROUPS", "on")], &scim(false)).unwrap_err().contains("GOOGLE_DIRECTORY_PUSH=on"));
+        let units_only = [&push[..], &[("GOOGLE_DIRECTORY_GROUPS", ""), ("GOOGLE_DIRECTORY_ORG_UNITS", "/Sales")]].concat();
+        assert!(on(&units_only, &scim(false)).unwrap_err().contains("reads no group"));
     }
 
     #[test]
