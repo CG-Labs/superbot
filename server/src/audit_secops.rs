@@ -10,7 +10,8 @@
 //! asked again once when Google refuses it. Tokens go only to that endpoint.
 //!
 //! Each raw log is the exported line exactly, so the copy in SecOps checks itself with
-//! `botctl audit verify-lines`.
+//! `botctl audit verify-lines`. The sink's labels and namespace (`AUDIT_EXPORT_LABELS`,
+//! `AUDIT_EXPORT_NAMESPACE`, ADR 0255) go beside it as ingestion labels.
 
 use crate::secrets::gcp::Google;
 use crate::secrets::SecretStore;
@@ -44,6 +45,10 @@ pub struct SecOps {
     /// Where batches go: `https://<location>-chronicle.googleapis.com/v1/projects/.../logs:import`.
     url: String,
     google: Google,
+    /// Ingestion labels on every log, from `AUDIT_EXPORT_LABELS` (ADR 0255), in order.
+    labels: Vec<(String, String)>,
+    /// The environment namespace of every log, from `AUDIT_EXPORT_NAMESPACE`.
+    namespace: Option<String>,
 }
 
 fn import_url(base: &str, location: &str, project: &str, instance: &str, log_type: &str) -> String {
@@ -112,7 +117,28 @@ impl SecOps {
         };
         let google = Google::from_env(get, store, method_var, &method, LABEL)?;
         let url = import_url(&endpoint(&location), &location, project, &instance, log_type);
-        Ok(SecOps { url, location, project: project.to_string(), instance, log_type: log_type.to_string(), google })
+        Ok(SecOps { url, location, project: project.to_string(), instance, log_type: log_type.to_string(), google, labels: Vec::new(), namespace: None })
+    }
+
+    /// The sink's labels and namespace (already checked, ADR 0255).
+    pub fn set_labels(&mut self, labels: &[(String, String)], namespace: Option<String>) {
+        self.labels = labels.to_vec();
+        self.namespace = namespace;
+    }
+
+    /// One exported line as a raw log: the line exactly, base64 as the API takes `data`, at
+    /// the event's time, with the sink's labels and namespace beside it. Every label may
+    /// define a data RBAC scope (`rbacEnabled`): eligibility restricts no one until a scope
+    /// names it, and an audit log is what scopes are for.
+    pub fn log(&self, text: &str, time: &str, collected: &str) -> Value {
+        let mut l = json!({ "data": STANDARD.encode(text), "logEntryTime": time, "collectionTime": collected });
+        if !self.labels.is_empty() {
+            l["labels"] = self.labels.iter().map(|(k, v)| (k.clone(), json!({ "value": v, "rbacEnabled": true }))).collect::<serde_json::Map<_, _>>().into();
+        }
+        if let Some(ns) = &self.namespace {
+            l["environmentNamespace"] = json!(ns);
+        }
+        l
     }
 
     /// What logs, the API and the audit log show.
@@ -126,12 +152,18 @@ impl SecOps {
     }
 
     pub fn describe(&self) -> String {
-        format!("into Google SecOps through the Chronicle API (project {}, instance {}, log type {}), signing in to Google as {}", self.project, self.instance, self.log_type, self.google.describe())
+        let labelled = match self.labels.is_empty() {
+            true => String::new(),
+            false => format!(", labelled {}", self.labels.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(",")),
+        };
+        let ns = self.namespace.as_deref().map(|n| format!(", in namespace {n}")).unwrap_or_default();
+        format!("into Google SecOps through the Chronicle API (project {}, instance {}, log type {}{labelled}{ns}), signing in to Google as {}", self.project, self.instance, self.log_type, self.google.describe())
     }
 
     /// For `botctl audit siem`.
     pub fn view(&self) -> Value {
-        json!({ "location": self.location, "project": self.project, "instance": self.instance, "logType": self.log_type, "signIn": self.google.method() })
+        let labels: serde_json::Map<String, Value> = self.labels.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+        json!({ "location": self.location, "project": self.project, "instance": self.instance, "logType": self.log_type, "signIn": self.google.method(), "labels": labels, "namespace": self.namespace })
     }
 
     /// Sends to `base` instead, and signs in there: a stand-in for Google.
@@ -146,12 +178,6 @@ impl SecOps {
 pub fn collected(at_ms: i64, now_ms: i64) -> String {
     let ms = now_ms.max(at_ms + 1);
     chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-}
-
-/// One exported line as a raw log: the line exactly, base64 as the API takes `data`, at the
-/// event's time.
-pub fn log(text: &str, time: &str, collected: &str) -> Value {
-    json!({ "data": STANDARD.encode(text), "logEntryTime": time, "collectionTime": collected })
 }
 
 /// The logs as `logs:import` bodies of at most [`MAX_BODY`] bytes each, in order. A log
@@ -348,8 +374,10 @@ mod tests {
         let id = app.db.try_record(&Event::new(Actor::system("test"), "test.secops").target("bot", "b1").details(json!({ "n": 1 }))).unwrap();
         let e = app.db.audit_events(&Default::default(), 1000, false).into_iter().find(|e| e.id == id).unwrap();
         let text = crate::audit_export::line_value(&e, "host-1", None, true).to_string();
-        let l = log(&text, &e.time, &collected(e.at, e.at + 5));
+        let g = secops(&[("AUDIT_EXPORT", &sink_url())]).unwrap();
+        let l = g.log(&text, &e.time, &collected(e.at, e.at + 5));
         assert_eq!(l["logEntryTime"].as_str(), Some(e.time.as_str()));
+        assert!(l.get("labels").is_none() && l.get("environmentNamespace").is_none(), "none unless set: {l}");
         let back = String::from_utf8(STANDARD.decode(l["data"].as_str().unwrap()).unwrap()).unwrap();
         assert_eq!(back, text, "the raw log is the line, byte for byte");
         assert_eq!(crate::audit_line::check(&serde_json::from_str(&back).unwrap()), Ok(crate::audit_line::Bound::All), "so it checks itself in SecOps");
@@ -452,7 +480,7 @@ mod tests {
         for i in 0..30 {
             app.db.record(&Event::new(Actor::system("test"), "test.secops").details(json!({ "n": i, "pad": "p".repeat(200) })));
         }
-        let mut s = settings(&[("AUDIT_EXPORT", &format!("secops={}", sink_url()))]).unwrap();
+        let mut s = settings(&[("AUDIT_EXPORT", &format!("secops={}", sink_url())), ("AUDIT_EXPORT_LABELS", "env=prod,tenant=acme"), ("AUDIT_EXPORT_NAMESPACE_SECOPS", "prod-eu")]).unwrap();
         s.sinks[0].secops_mut().unwrap().point_at(&base);
         crate::audit_export::start(&app, s);
         let xs = app.audit_export.get().unwrap().clone();
@@ -463,6 +491,8 @@ mod tests {
         let logs = google.logs.lock().unwrap().clone();
         let report = lines_of(&logs);
         assert!(report.ok && report.hosts[0].events == logs.len() as u64 && logs.len() >= 30 && report.hosts[0].first == Some(1), "botctl audit verify-lines passes on SecOps's copy, every event once: {report:?}");
+        let labels = json!({ "env": { "value": "prod", "rbacEnabled": true }, "tenant": { "value": "acme", "rbacEnabled": true } });
+        assert!(logs.iter().all(|l| l["labels"] == labels && l["environmentNamespace"] == "prod-eu"), "every log carries the sink's labels and namespace: {}", logs[0]);
 
         // A token Google no longer takes: one new one, and delivery carries on.
         let first = google.tokens.lock().unwrap()[0].clone();
@@ -490,6 +520,7 @@ mod tests {
         assert_eq!(xs.delivered(), before, "the cursor stays");
         let v = xs.view(app.db.audit_head());
         assert_eq!((v["kind"].as_str(), v["failing"].as_bool(), v["googleSecOps"]["logType"].as_str(), v["compress"].as_str()), (Some("google-secops"), Some(true), Some("SUPERBOT_AUDIT"), Some("off")), "{v}");
+        assert_eq!((&v["googleSecOps"]["labels"], &v["googleSecOps"]["namespace"]), (&json!({ "env": "prod", "tenant": "acme" }), &json!("prod-eu")), "{v}");
         let mut metrics = String::new();
         crate::audit_export::render(&app, &mut metrics);
         assert!(metrics.contains("superbot_audit_export_failing{kind=\"google-secops\",name=\"secops\"} 1"), "{metrics}");
