@@ -393,20 +393,33 @@ impl S3 {
     }
 
     async fn abort_where(&self, prefix: &str, before: i64, of: impl Fn(&str) -> bool) -> Result<usize, String> {
-        let res = self.send(Method::GET, None, &[("prefix", prefix), ("uploads", "")], Vec::new()).await?;
-        let xml = self.text(res).await?;
         let mut gone = 0;
-        for u in xml.split("<Upload>").skip(1) {
-            let started = tag(u, "Initiated").and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok()).map(|t| t.timestamp_millis());
-            if let (Some(k), Some(id)) = (tag(u, "Key"), tag(u, "UploadId"))
-                && of(&k)
-                && started.is_some_and(|s| s < before)
-            {
-                self.send(Method::DELETE, Some(&k), &[("uploadId", &id)], Vec::new()).await?;
-                gone += 1;
+        let mut after: Option<(String, String)> = None;
+        loop {
+            let mut q = vec![("prefix", prefix), ("uploads", "")];
+            if let Some((k, id)) = after.as_ref() {
+                q.push(("key-marker", k));
+                q.push(("upload-id-marker", id));
             }
+            let res = self.send(Method::GET, None, &q, Vec::new()).await?;
+            let xml = self.text(res).await?;
+            for u in xml.split("<Upload>").skip(1) {
+                let started = tag(u, "Initiated").and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok()).map(|t| t.timestamp_millis());
+                if let (Some(k), Some(id)) = (tag(u, "Key"), tag(u, "UploadId"))
+                    && of(&k)
+                    && started.is_some_and(|s| s < before)
+                {
+                    self.send(Method::DELETE, Some(&k), &[("uploadId", &id)], Vec::new()).await?;
+                    gone += 1;
+                }
+            }
+            let next = (tag(&xml, "NextKeyMarker"), tag(&xml, "NextUploadIdMarker"));
+            after = match (tag(&xml, "IsTruncated").as_deref(), next) {
+                (Some("true"), (Some(k), Some(id))) if !k.is_empty() && after.as_ref() != Some(&(k.clone(), id.clone())) => Some((k, id)),
+                (Some("true"), _) => return Err(format!("{}'s listing of unfinished uploads was cut off without a way to go on", self.what)),
+                _ => return Ok(gone),
+            };
         }
-        Ok(gone)
     }
 
     /// Starts writing `key` in parts.
