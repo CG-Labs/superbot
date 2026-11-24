@@ -392,7 +392,7 @@ async fn machines_install_hermes_from_botds_bundle_over_mutual_tls() {
             "MACHINE_CONTROL_URL" => url.clone(),
             _ => String::new(),
         };
-        let hermes = Bundles::from_env(&var).unwrap().unwrap();
+        let hermes = Bundles::from_env(&var, crate::machines::wire::BundleKind::Hermes).unwrap().unwrap();
         let mut plan = hermes.apply(install::plan(vec![install::install("hermes", None, None).unwrap()])).unwrap();
         // The stand-in tree has no Hermes for hermes-share.sh to share; its own test
         // runs it.
@@ -438,6 +438,91 @@ async fn machines_install_hermes_from_botds_bundle_over_mutual_tls() {
     assert_eq!(events(&env, "machine.harness_installed").await.len(), 1);
 
     // A file changed on disk after botd checked it is caught by the check.
+    std::fs::write(&file, b"something else").unwrap();
+    let (_, v) = json_call(&env, "GET", "/api/machines/harness-mirror", "").await;
+    assert_eq!(v["ok"], false, "{v}");
+    assert!(v["items"][0]["error"].as_str().unwrap().contains("restart botd"), "{v}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn machines_install_harness_clis_from_botds_bundle_over_mutual_tls() {
+    use crate::adapters::install;
+    use crate::machines::hermes_bundle::standin;
+    use crate::machines::hermes_serve::Bundles;
+    use crate::machines::wire::BundleKind;
+    let arch = std::env::consts::ARCH;
+    let dir = crate::db::temp_path("harness-bundles");
+    std::fs::create_dir_all(&dir).unwrap();
+    // This build's pins, so botd takes the bundle; a stand-in tree, since the real one
+    // is a few hundred MB from npm.
+    let n = install::node();
+    let mut pins = format!("harnesses=claude codex pi\nnode={} {}\n", n.version, n.downloads[arch].sha256);
+    let mut clis = vec![];
+    for b in ["claude", "codex", "pi"] {
+        let h = install::install(b, None, None).unwrap();
+        let InstallSource::Npm { package, integrity: Some(i) } = h.source else { unreachable!() };
+        pins.push_str(&format!("harness_{b}={} {package} {i}\n", h.version));
+        clis.push((b, h.version));
+    }
+    let clis: Vec<(&str, &str)> = clis.iter().map(|(b, v)| (*b, v.as_str())).collect();
+    let body = standin::good_harnesses(arch, &clis, &pins);
+    let file = dir.join(format!("superbot-harnesses-0.1.0-{arch}.tar.gz"));
+    std::fs::write(&file, &body).unwrap();
+    std::fs::write(dir.join(format!("superbot-harnesses-0.1.0-{arch}.tar.gz.sha256")), format!("{}\n", hex(&body))).unwrap();
+    let setting = file.display().to_string();
+    let mut env = serve_with(move |mut e| {
+        let url = e.url.clone();
+        let var = |k: &str| match k {
+            "MACHINE_HARNESS_BUNDLE" => setting.clone(),
+            "MACHINE_CONTROL_URL" => url.clone(),
+            _ => String::new(),
+        };
+        let bundles = Bundles::from_env(&var, BundleKind::Harnesses).unwrap().unwrap();
+        let wanted = ["claude", "codex"].map(|b| install::install(b, None, None).unwrap());
+        let plan = bundles.apply(install::plan(wanted.into())).unwrap();
+        assert!(plan.node.is_none(), "{plan:?}");
+        e.upkeep.plan = Some(plan);
+        e.upkeep.harness_bundle = Some(bundles);
+        e
+    })
+    .await;
+
+    // The check reads the file again, once for both, and finds the SHA-256 the plan pins.
+    let (code, v) = json_call(&env, "GET", "/api/machines/harness-mirror", "").await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["items"].as_array().unwrap().len(), 2, "{v}");
+    assert!(v["items"][1]["note"].as_str().unwrap().contains("MACHINE_HARNESS_BUNDLE"), "{v}");
+
+    // Only a machine with its certificate gets it.
+    let anyone = reqwest::Client::builder()
+        .tls_backend_preconfigured(pki::client_config(&pki::cert_der(env.e.ca_pem()).unwrap(), None).unwrap())
+        .build()
+        .unwrap();
+    let r = anyone.get(format!("{}/v1/harnesses/{arch}", env.e.url)).send().await.unwrap();
+    assert_eq!(r.status(), 401);
+
+    let (uid, mid, token) = machine_for(&env, "ada@example.com").await;
+    let m = agent_on(&mut env, &mid, &token, "#!/bin/sh\n").await;
+    m.agent.tools.set_root(dir.join("root"));
+    beat_until(&env, &uid, "claude and codex installed from the bundle", |v| {
+        let h = &v["agent"]["harnesses"];
+        assert!(h["claude"]["state"] != "failed" && h["codex"]["state"] != "failed", "{v}");
+        h["claude"]["state"] == "installed" && h["codex"]["state"] == "installed"
+    })
+    .await;
+    for (b, version) in &clis[..2] {
+        let out = std::process::Command::new(m.cfg.tools.join("bin").join(b)).arg("--version").env_clear().output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), format!("{version} ({b})"), "{b} runs on the tree's own Node.js");
+    }
+    let prefix = dir.join("root/opt/superbot-harnesses");
+    assert_eq!(std::fs::read_to_string(prefix.join("superbot/bundle.sha256")).unwrap().trim(), hex(&body));
+    let own_node = std::fs::read_dir(&m.cfg.tools).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("node-"));
+    assert!(!own_node && !m.cfg.tools.join("bin/node").exists(), "no Node.js of the agent's own");
+    assert_eq!(std::fs::read_dir(dir.join("root/opt")).unwrap().count(), 1, "nothing is left beside it");
+    assert_eq!(events(&env, "machine.harness_installed").await.len(), 2);
+
     std::fs::write(&file, b"something else").unwrap();
     let (_, v) = json_call(&env, "GET", "/api/machines/harness-mirror", "").await;
     assert_eq!(v["ok"], false, "{v}");
