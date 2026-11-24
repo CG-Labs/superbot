@@ -6,7 +6,8 @@
 //! never gets more than its owner (the person who made it, or an admin's pick) holds now.
 //! Admins manage every service account; someone with `users.manage` only those they own,
 //! and only in the team they're on; a team's account acts there only while its owner is
-//! (ADR 0182).
+//! (ADR 0182). Any other owner sees theirs, revokes their tokens and disables them, and
+//! nothing more (ADR 0239).
 //! A Bot's manager can grant one viewer or operator on the Bot, never beyond what its
 //! owner can do with that Bot (ADR 0170). One can make Bots of its own: private Bots of
 //! its owner that it keeps and manages, run as its owner's would (ADR 0222).
@@ -325,7 +326,12 @@ fn write_error(e: String) -> ApiError {
 }
 
 fn refuse(app: &AppState, by: &Who, limit: &str, target: Option<&str>, extra: Value, msg: String) -> ApiError {
-    let mut d = json!({ "reason": "delegate_limit", "limit": limit });
+    forbidden(deny(app, by, "delegate_limit", limit, target, extra, msg))
+}
+
+/// Logs `access.denied` with `reason` and `limit`, and returns `msg`.
+fn deny(app: &AppState, by: &Who, reason: &str, limit: &str, target: Option<&str>, extra: Value, msg: String) -> String {
+    let mut d = json!({ "reason": reason, "limit": limit });
     if let (Some(o), Value::Object(e)) = (d.as_object_mut(), extra) {
         o.extend(e);
     }
@@ -334,7 +340,7 @@ fn refuse(app: &AppState, by: &Who, limit: &str, target: Option<&str>, extra: Va
         e = e.target("service_account", t);
     }
     app.db.record(&e);
-    forbidden(msg)
+    msg
 }
 
 /// The person calling. Service accounts never get here (`person_only`).
@@ -342,14 +348,53 @@ fn caller_person(c: &Caller) -> Res<User> {
     c.user.clone().filter(|u| !u.service).ok_or_else(|| conflict("Sign in as a person to manage service accounts."))
 }
 
-/// The live service account `key` names, if the caller may manage it: admins any, anyone
-/// else only those they own.
+/// Whether the caller makes and changes service accounts: an admin, or a delegate with
+/// `users.manage` for the ones they own (ADR 0182). Anyone else may only see the ones they
+/// own, revoke their tokens and disable them (ADR 0239).
+fn manages(c: &Caller) -> bool {
+    c.can(Perm::ManageUsers)
+}
+
+/// Refuses Bots on the routes anyone may use for the service accounts they own (ADR 0239):
+/// a Bot's run acts for its owner, but owns nothing here.
+fn need_person(c: &Caller) -> Res<()> {
+    if c.admin() || c.user.as_ref().is_some_and(|u| !u.service) {
+        return Ok(());
+    }
+    Err(forbidden("Only a signed-in person can do this, not a Bot."))
+}
+
+/// The live service account `key` names, if the caller may see it: admins any, anyone
+/// else only those they own. Someone who manages none gets 404 for others' (ADR 0239), so
+/// they don't learn which exist.
 fn need_account(app: &AppState, c: &Caller, by: &Who, key: &str) -> Res<ServiceAccount> {
+    need_person(c)?;
     let sa = app.db.service_account(key).filter(|s| s.deleted_at.is_none()).ok_or_else(|| not_found("Service account"))?;
     if c.admin() || c.user.as_ref().is_some_and(|u| u.id == sa.owner_id) {
         return Ok(sa);
     }
+    if !manages(c) {
+        deny(app, by, "owner_limit", "service_account_owner", Some(&sa.user.id), json!({}), String::new());
+        return Err(not_found("Service account"));
+    }
     Err(refuse(app, by, "service_account_owner", Some(&sa.user.id), json!({}), "Only an admin, or the person who owns it, can manage a service account.".into()))
+}
+
+/// What an owner who doesn't manage service accounts may change on their own (ADR 0239):
+/// only `{status: "disabled"}`, which stops its tokens. Enabling it again, or anything else,
+/// would widen what acts with their access, so it's for an admin or a delegate.
+fn owner_change(app: &AppState, by: &Who, sa: &ServiceAccount, v: &Value) -> Res<()> {
+    let body = v.as_object().ok_or_else(|| bad("Send a JSON object."))?;
+    let fields: Vec<&str> = body.keys().map(String::as_str).collect();
+    if fields == ["status"] && v["status"] == "disabled" {
+        return Ok(());
+    }
+    let msg = if fields == ["status"] && v["status"] == "active" {
+        "Ask an admin to enable it again. As its owner, you can disable it and revoke its tokens."
+    } else {
+        "As its owner, you can disable it and revoke its tokens. Anything else needs an admin, or someone whose role holds users.manage."
+    };
+    Err(forbidden(deny(app, by, "owner_limit", "service_account_change", Some(&sa.user.id), json!({ "fields": fields }), msg.into())))
 }
 
 /// What `roles` hold that `owner` doesn't, where the service account would act.
@@ -574,16 +619,20 @@ fn no_store(code: StatusCode, v: Value) -> Response {
 /// `GET /api/service-accounts`: every live one for admins; for anyone else, the ones they
 /// own (`view` says which). With what a token can be scoped to, how long tokens may last,
 /// and the roles and teams the caller may give the ones they own (`choices`, ADR 0182).
-pub async fn list(State(app): State<AppState>, Extension(c): Extension<Caller>) -> Json<Value> {
+/// `manage` is false for someone who may only see theirs, revoke tokens and disable them
+/// (ADR 0239); they get no `choices`.
+pub async fn list(State(app): State<AppState>, Extension(c): Extension<Caller>) -> Res {
+    need_person(&c)?;
     let me = c.user.as_ref().map(|u| u.id.as_str());
     let refused = app.db.service_refusals(refusals_since(crate::db::now()), None);
     let list: Vec<Value> = app.db.service_accounts().iter().filter(|s| s.deleted_at.is_none() && (c.admin() || Some(s.owner_id.as_str()) == me)).map(|s| view(&app, s, &refused)).collect();
-    Json(json!({
-        "serviceAccounts": list, "view": if c.admin() { "all" } else { "own" },
-        "choices": caller_person(&c).ok().map(|u| choices(&app, &u)),
+    let manage = manages(&c);
+    Ok(Json(json!({
+        "serviceAccounts": list, "view": if c.admin() { "all" } else { "own" }, "manage": manage,
+        "choices": caller_person(&c).ok().filter(|_| manage).map(|u| choices(&app, &u)),
         "scopes": scope_names(), "defaultDays": DEFAULT_DAYS, "maxDays": MAX_DAYS, "refusalDays": REFUSAL_DAYS,
         "maxKeptBots": MAX_KEPT_BOTS,
-    }))
+    })))
 }
 
 /// `POST /api/service-accounts` `{name, description?, role?, team?}`. `role` is member,
@@ -629,10 +678,14 @@ pub async fn get(State(app): State<AppState>, Extension(c): Extension<Caller>, E
 }
 
 /// `PATCH /api/service-accounts/{id}` `{name?, description?, role?, team?, status?, owner?}`.
-/// Only admins change the owner. The result must fit under the (new) owner.
+/// Only admins change the owner. The result must fit under the (new) owner. An owner who
+/// doesn't manage service accounts may only disable theirs (ADR 0239).
 pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(key): Path<String>, Json(v): Json<Value>) -> Res {
-    only_fields(&v, &["name", "description", "role", "team", "status", "owner"])?;
     let before = need_account(&app, &c, &by, &key)?;
+    if !manages(&c) {
+        owner_change(&app, &by, &before, &v)?;
+    }
+    only_fields(&v, &["name", "description", "role", "team", "status", "owner"])?;
     let id = before.user.id.clone();
     let was = Roles::of(&app.db, &before);
     let mut p = ServiceAccountPatch {
@@ -727,7 +780,8 @@ pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>
             }
         }
     }
-    if dropped > 0 || released > 0 {
+    // A new owner's `ownedServiceAccounts` changes, so their app offers the screen (ADR 0239).
+    if dropped > 0 || released > 0 || before.owner_id != after.owner_id {
         app.send(json!({ "type": "resync" }));
     }
     if before.user.status != after.user.status {

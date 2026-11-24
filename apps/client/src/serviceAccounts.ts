@@ -18,6 +18,14 @@ export function canManageServiceAccounts(me: Pick<Me, "permissions">): boolean {
 }
 
 /**
+ * Whether to offer the screen: to those who manage service accounts, and to anyone who owns
+ * one, who may see it, revoke its tokens and disable it (ADR 0239).
+ */
+export function canSeeServiceAccounts(me: Pick<Me, "permissions" | "ownedServiceAccounts">): boolean {
+  return canManageServiceAccounts(me) || (me.ownedServiceAccounts ?? 0) > 0;
+}
+
+/**
  * What the forms offer: the server's `choices` (ADR 0182). A server from before it sends
  * none, so an admin gets every role and team from `/api/roles` and `/api/teams`, as before.
  */

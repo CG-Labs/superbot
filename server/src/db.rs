@@ -6868,6 +6868,11 @@ impl Db {
         self.c().query_row(&format!("{} WHERE u.id = ?", Self::SERVICE_ACCOUNT), [id], service_account_row).optional().ok().flatten()
     }
 
+    /// How many live service accounts `owner` owns.
+    pub fn owned_service_accounts(&self, owner: &str) -> i64 {
+        self.c().query_row("SELECT COUNT(*) FROM service_accounts WHERE owner_id = ? AND deleted_at IS NULL", [owner], |r| r.get(0)).unwrap_or(0)
+    }
+
     /// Every service account, deleted ones too, oldest first.
     pub fn service_accounts(&self) -> Vec<ServiceAccount> {
         let c = self.c();
@@ -8234,8 +8239,13 @@ impl Db {
     // Sessions and sign-in codes. Callers hash tokens; nothing here sees one.
 
     pub fn create_session(&self, s: &NewSession) -> Session {
+        self.create_session_at(s, now())
+    }
+
+    /// `create_session`, made at `at`: the clock reading its `expires_at` was counted from, so
+    /// a millisecond tick between the two can't shorten the session.
+    pub fn create_session_at(&self, s: &NewSession, at: i64) -> Session {
         let id = format!("s{}", crate::random_hex(8));
-        let at = now();
         {
             let c = self.c();
             c.execute(
