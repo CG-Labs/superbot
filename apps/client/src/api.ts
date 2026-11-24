@@ -694,6 +694,16 @@ export class SuperBotApi {
     return this.request<TeamMember>("PATCH", `/api/team/members/${encodeURIComponent(userId)}`, { role });
   }
 
+  /** Gives them a custom role within the team, by its id, until `expiresAt` or with no end (ADR 0254). */
+  async giveTeamCustomRole(userId: string, role: string, opts: { expiresAt?: number | null; reason?: string } = {}): Promise<void> {
+    await this.request("PUT", `/api/team/members/${encodeURIComponent(userId)}/custom-role`, { role, ...opts });
+  }
+
+  /** Takes away the custom role they hold within the team. */
+  async takeTeamCustomRole(userId: string): Promise<void> {
+    await this.request("DELETE", `/api/team/members/${encodeURIComponent(userId)}/custom-role`);
+  }
+
   /** What removing them would do, asked before removing; changes nothing. */
   async offboardingPreview(userId: string): Promise<OffboardingPreview> {
     return this.request<OffboardingPreview>("GET", `/api/team/members/${encodeURIComponent(userId)}/offboarding`);

@@ -55,6 +55,8 @@ function fakeApi(team: Team | null, invites: MyTeamInvite[] = []) {
     setTeamRole: jest.fn(async () => ({})),
     offboardingPreview: jest.fn(async (): Promise<OffboardingPreview> => preview),
     removeTeammate: jest.fn(async () => {}),
+    giveTeamCustomRole: jest.fn(async (..._a: unknown[]) => {}),
+    takeTeamCustomRole: jest.fn(async (_id: string) => {}),
     leaveTeam: jest.fn(async () => {}),
     acceptTeamInvite: jest.fn(async () => {}),
     declineTeamInvite: jest.fn(async () => {}),
@@ -251,6 +253,57 @@ describe("TeamView", () => {
     await user.press(alRow.getByRole("radio", { name: "Owner" }));
     expect(mockConfirm).toHaveBeenCalledWith("Make Al an owner?", expect.any(String), "Make owner");
     expect(api.setTeamRole).toHaveBeenCalledTimes(1);
+  });
+
+  describe("custom roles in the team (ADR 0254)", () => {
+    const roleChoices = [
+      { id: "r-ops", name: "On call", description: "Restarts machines", applies: ["machines.manage"], maxDays: 7 },
+      { id: "r-people", name: "Team people", description: "", applies: ["users.manage"], maxDays: null },
+    ];
+
+    it("gives a plain member a role, for as long as its limit allows", async () => {
+      const { api, user } = await open({ ...teamAs("owner"), roleChoices });
+      expect(screen.queryByLabelText("Give team role for Ada")).toBeNull();
+      await user.press(screen.getByLabelText("Give team role for Al"));
+      const panel = within(screen.getByTestId("give-role"));
+      expect(panel.getByText("Restarts machines")).toBeOnTheScreen();
+      expect(panel.getByText(/In this team: machines.manage/)).toBeOnTheScreen();
+      expect(panel.queryByRole("radio", { name: "No end" })).toBeNull();
+      expect(panel.queryByRole("radio", { name: "30 days" })).toBeNull();
+      await user.press(panel.getByRole("radio", { name: "Team people" }));
+      expect(panel.getByRole("radio", { name: "No end", checked: true })).toBeOnTheScreen();
+      await user.press(panel.getByRole("radio", { name: "7 days" }));
+      const before = Date.now();
+      await user.press(panel.getByText("Give Team people"));
+      expect(api.giveTeamCustomRole).toHaveBeenCalledWith("al", "r-people", { expiresAt: expect.any(Number) });
+      const [, , opts] = api.giveTeamCustomRole.mock.calls[0] as unknown as [string, string, { expiresAt: number }];
+      expect(opts.expiresAt - before).toBeGreaterThanOrEqual(7 * 86_400_000);
+      expect(screen.queryByTestId("give-role")).toBeNull();
+    });
+
+    it("shows a teammate's role and takes it away after asking", async () => {
+      const team = { ...teamAs("admin"), roleChoices, members: [ada, { ...al, customRole: { id: "r-people", name: "Team people" } }] };
+      const { api, user } = await open(team, { meId: "ada" });
+      expect(screen.getByTestId("custom-role-al")).toHaveTextContent("Team role: Team people");
+      expect(screen.getByLabelText("Change team role for Al")).toBeOnTheScreen();
+      await user.press(screen.getByLabelText("Take away team role from Al"));
+      expect(mockConfirm).toHaveBeenCalledWith("Take Team people away from Al?", expect.any(String), "Take away");
+      expect(api.takeTeamCustomRole).toHaveBeenCalledWith("al");
+    });
+
+    const fromIdp = { ...al, customRole: { id: "r-b", name: "Billing", fromIdp: true } };
+
+    it("leaves a role from the identity provider alone", async () => {
+      await open({ ...teamAs("owner"), roleChoices, members: [ada, fromIdp] });
+      expect(screen.getByText("Team role: Billing · from your identity provider")).toBeOnTheScreen();
+      expect(screen.queryByLabelText(/team role for Al/)).toBeNull();
+    });
+
+    it("shows members their teammates' roles, with nothing to change", async () => {
+      await open({ ...teamAs("member"), members: [ada, fromIdp] }, { meId: "al" });
+      expect(screen.getByText("Team role: Billing · from your identity provider")).toBeOnTheScreen();
+      expect(screen.queryByLabelText(/team role for/)).toBeNull();
+    });
   });
 
   it("removes a teammate after a confirmation that says what offboarding removes", async () => {
