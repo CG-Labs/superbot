@@ -41,6 +41,10 @@
 //! - A `GCP_RUN_CREDENTIALS` entry may downscope each run's token (ADR 0240): a Credential
 //!   Access Boundary from a file (`boundary=`), with `{owner}` and `{bot}` filled in the
 //!   same way, limits it to the Cloud Storage buckets, roles and objects it names.
+//! - An `AZURE_RUN_CREDENTIALS` entry may ask another tenant (ADR 0250): `tenant=` for a
+//!   multitenant app provisioned there, and may give each user their own app: `{owner}`
+//!   as the app with `apps=<file>`, a map of user ids to apps (and their tenants) read
+//!   again at each run. A user it doesn't name gets no token from that entry.
 
 use super::external::{self, Scope};
 use super::{check_name, redact, Error, Secret};
@@ -62,6 +66,10 @@ pub const BOT: &str = "{bot}";
 const SESSION_OPTIONS: &[&str] = &["policy", "policy-arn", "tags"];
 /// The entry option that downscopes a Google access token (ADR 0240).
 const BOUNDARY_OPTIONS: &[&str] = &["boundary"];
+/// The entry options that choose an Entra app's tenant, or each user's app (ADR 0250).
+const AZURE_OPTIONS: &[&str] = &["tenant", "apps"];
+/// The largest map of users to apps read: about ten thousand users.
+const MAX_APPS_FILE: u64 = 1024 * 1024;
 /// STS's most managed session policies, and longest inline one, as plain text.
 pub const MAX_POLICY_ARNS: usize = 10;
 pub const MAX_POLICY: usize = 2048;
@@ -129,7 +137,7 @@ pub trait Issuer: Send + Sync {
     /// narrow its leases refuses it rather than make a wider one.
     fn issue_narrowed(&self, path: &str, fields: &[String], run_for: Duration, bot_id: &str, narrowed: &Narrowed) -> Result<Lease, Error> {
         if !narrowed.is_empty() {
-            return Err(Error::Unavailable(format!("{}: leases can't be narrowed with a session policy, tags or an access boundary", self.kind())));
+            return Err(Error::Unavailable(format!("{}: leases can't be narrowed with a session policy, tags or an access boundary, or asked of another tenant", self.kind())));
         }
         self.issue(path, fields, run_for, bot_id)
     }
@@ -152,8 +160,9 @@ impl Tag {
     }
 }
 
-/// How an entry narrows each run's session (ADR 0230) or token (ADR 0240); empty unless
-/// its setting takes `policy=`, `policy-arn=` and `tags=`, or `boundary=`.
+/// How an entry narrows each run's session (ADR 0230) or token (ADR 0240), or which
+/// tenant and app it asks (ADR 0250); empty unless its setting takes `policy=`,
+/// `policy-arn=` and `tags=`, `boundary=`, or `tenant=` and `apps=`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Narrowing {
     /// The inline session policy from `policy=<file>`, read once at startup; `{owner}`
@@ -165,21 +174,27 @@ pub struct Narrowing {
     /// The Credential Access Boundary from `boundary=<file>`, read once at startup;
     /// `{owner}` and `{bot}` filled in as in a policy.
     pub boundary: Option<Value>,
+    /// The Entra tenant from `tenant=`, when it isn't botd's own.
+    pub tenant: Option<String>,
+    /// The file of `apps=`, mapping each user to their own Entra app; read again at each run.
+    pub apps: Option<String>,
 }
 
 /// One run's narrowing, its ids filled in: the policy as sent (compact JSON), the
-/// managed policies' ARNs, the tags (key, value), and the access boundary as sent.
+/// managed policies' ARNs, the tags (key, value), the access boundary as sent, and the
+/// Entra tenant asked.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Narrowed {
     pub policy: Option<String>,
     pub policy_arns: Vec<String>,
     pub tags: Vec<(&'static str, String)>,
     pub boundary: Option<String>,
+    pub tenant: Option<String>,
 }
 
 impl Narrowed {
     pub fn is_empty(&self) -> bool {
-        self.policy.is_none() && self.policy_arns.is_empty() && self.tags.is_empty() && self.boundary.is_none()
+        self.policy.is_none() && self.policy_arns.is_empty() && self.tags.is_empty() && self.boundary.is_none() && self.tenant.is_none()
     }
 
     /// Whether it narrows an STS session: what only AWS can do.
@@ -216,8 +231,19 @@ fn bot_id_ok(id: &str) -> bool {
 }
 
 impl Narrowing {
-    fn is_empty(&self) -> bool {
-        self.policy.is_none() && self.policy_arns.is_empty() && self.tags.is_empty() && self.boundary.is_none()
+    /// What the startup line says of the entry, if anything.
+    fn note(&self) -> Option<String> {
+        let mut notes = Vec::new();
+        if self.policy.is_some() || !self.policy_arns.is_empty() || !self.tags.is_empty() || self.boundary.is_some() {
+            notes.push("narrowed".to_string());
+        }
+        if let Some(t) = &self.tenant {
+            notes.push(format!("tenant {t}"));
+        }
+        if let Some(f) = &self.apps {
+            notes.push(format!("each user's app from {f}"));
+        }
+        (!notes.is_empty()).then(|| notes.join(", "))
     }
 
     fn per_owner(&self) -> bool {
@@ -265,7 +291,7 @@ impl Narrowing {
             Some(b) => Some(serde_json::to_string(&substitute(b, &fill)).map_err(|e| format!("the access boundary can't be written: {e}"))?),
             None => None,
         };
-        Ok(Narrowed { policy, policy_arns: self.policy_arns.iter().map(|a| a.replace(OWNER, owner)).collect(), tags, boundary })
+        Ok(Narrowed { policy, policy_arns: self.policy_arns.iter().map(|a| a.replace(OWNER, owner)).collect(), tags, boundary, tenant: self.tenant.clone() })
     }
 }
 
@@ -337,7 +363,7 @@ fn policy_arn_ok(p: &str) -> bool {
 /// U+00FF. Never quoted in errors.
 fn read_policy(file: &str) -> Result<Value, String> {
     let bad = |why: String| format!("policy={file}: {why}");
-    let v = read_json(file).map_err(bad)?;
+    let v = read_json(file, MAX_POLICY_FILE).map_err(bad)?;
     if !v.get("Statement").is_some_and(|s| s.is_array() || s.is_object()) {
         return Err(bad("must be an IAM policy: a JSON object with a Statement".into()));
     }
@@ -352,22 +378,68 @@ fn read_policy(file: &str) -> Result<Value, String> {
     Ok(v)
 }
 
-/// The JSON in `file`, at most `MAX_POLICY_FILE` bytes. Errors never quote it.
-fn read_json(file: &str) -> Result<Value, String> {
+/// The JSON in `file`, at most `max` bytes. Errors never quote it.
+fn read_json(file: &str, max: u64) -> Result<Value, String> {
     let f = std::fs::File::open(file).map_err(|e| format!("can't be read ({e})"))?;
     let mut text = String::new();
-    f.take(MAX_POLICY_FILE + 1).read_to_string(&mut text).map_err(|e| format!("can't be read ({e})"))?;
-    if text.len() as u64 > MAX_POLICY_FILE {
-        return Err(format!("is over {MAX_POLICY_FILE} bytes"));
+    f.take(max + 1).read_to_string(&mut text).map_err(|e| format!("can't be read ({e})"))?;
+    if text.len() as u64 > max {
+        return Err(format!("is over {max} bytes"));
     }
     serde_json::from_str(&text).map_err(|e| format!("isn't JSON ({e})"))
+}
+
+/// One user's own Entra app from an `apps=` file, and the tenant to ask it in if it
+/// isn't the entry's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserApp {
+    pub app: String,
+    pub tenant: Option<String>,
+}
+
+/// The map of users to apps in `file`: a JSON object whose keys are user ids and whose
+/// values are an app's client id, or `{"app": ..., "tenant": ...}` (tenant optional),
+/// nothing else. Errors name a user id, never a value.
+fn read_apps(file: &str) -> Result<std::collections::HashMap<String, UserApp>, String> {
+    let bad = |why: String| format!("apps={file}: {why}");
+    let v = read_json(file, MAX_APPS_FILE).map_err(bad)?;
+    let map = v.as_object().ok_or_else(|| bad("must be a JSON object of user ids and their apps' client ids".into()))?;
+    let mut out = std::collections::HashMap::with_capacity(map.len());
+    for (user, entry) in map {
+        if Scope::user(user).is_none() {
+            return Err(bad("has a key that isn't a user id (lowercase letters and digits)".into()));
+        }
+        let app = match entry {
+            Value::String(app) => UserApp { app: app.clone(), tenant: None },
+            Value::Object(o) if o.keys().all(|k| k == "app" || k == "tenant") => {
+                let tenant = match o.get("tenant") {
+                    None => None,
+                    Some(Value::String(t)) if tenant_ok(t) => Some(t.clone()),
+                    Some(_) => return Err(bad(format!("{user}'s tenant must be a tenant id (a GUID) or its domain, like \"contoso.onmicrosoft.com\""))),
+                };
+                UserApp { app: o.get("app").and_then(Value::as_str).unwrap_or_default().to_string(), tenant }
+            }
+            _ => return Err(bad(format!("{user} must have an app's client id, or {{\"app\": ..., \"tenant\": ...}} and nothing else"))),
+        };
+        if !guid_ok(&app.app) {
+            return Err(bad(format!("{user}'s app must be an Entra app's client id, a GUID like \"00000000-0000-0000-0000-000000000000\"")));
+        }
+        out.insert(user.clone(), app);
+    }
+    Ok(out)
+}
+
+/// `owner`'s app from the `apps=` file, read now so an edit applies from the next run
+/// and a user taken out loses it then. None if it doesn't name them.
+fn user_app(file: &str, owner: &str) -> Result<Option<UserApp>, String> {
+    Ok(read_apps(file)?.remove(owner))
 }
 
 /// The Credential Access Boundary in `file`, checked as Google's client libraries do
 /// before they send one. Never quoted in errors.
 fn read_boundary(file: &str) -> Result<Value, String> {
     let bad = |why: String| format!("boundary={file}: {why}");
-    let v = read_json(file).map_err(bad)?;
+    let v = read_json(file, MAX_POLICY_FILE).map_err(bad)?;
     check_boundary(&v).map_err(bad)?;
     Ok(v)
 }
@@ -411,9 +483,26 @@ fn check_boundary(v: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// One of `SESSION_OPTIONS` or `BOUNDARY_OPTIONS`, `name=value`, after `role` in an entry.
+/// One of `SESSION_OPTIONS`, `BOUNDARY_OPTIONS` or `AZURE_OPTIONS`, `name=value`, after
+/// `role` in an entry.
 fn session_option(n: &mut Narrowing, role: &str, name: &str, value: &str) -> Result<(), String> {
     match name {
+        "tenant" => {
+            if n.tenant.is_some() {
+                return Err("tenant= is given twice".into());
+            }
+            if !tenant_ok(value) {
+                return Err(format!("tenant={value:?} must be a tenant id (a GUID) or its domain, like \"contoso.onmicrosoft.com\""));
+            }
+            n.tenant = Some(value.to_string());
+        }
+        "apps" => {
+            if n.apps.is_some() {
+                return Err("apps= is given twice; put every user in one file".into());
+            }
+            read_apps(value)?;
+            n.apps = Some(value.to_string());
+        }
         "boundary" => {
             if n.boundary.is_some() {
                 return Err("boundary= is given twice; put every rule in one file".into());
@@ -467,14 +556,30 @@ fn service_account_ok(p: &str) -> bool {
     p.len() <= 254 && label_ok(&account) && domain.strip_suffix(".gserviceaccount.com").is_some_and(|d| d.split('.').all(label_ok))
 }
 
+/// A GUID, as Entra writes app and tenant ids.
+fn guid_ok(s: &str) -> bool {
+    let groups: Vec<&str> = s.split('-').collect();
+    groups.iter().map(|g| g.len()).eq([8, 4, 4, 4, 12]) && groups.iter().all(|g| g.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// A lowercase DNS name with at least two labels.
+fn host_ok(h: &str) -> bool {
+    let label_ok = |l: &str| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    h.len() <= 253 && h.contains('.') && h.split('.').all(label_ok)
+}
+
+/// An Entra tenant's id or one of its domains. Never `common` or `organizations`: an app
+/// signs in as itself in one tenant.
+fn tenant_ok(t: &str) -> bool {
+    guid_ok(t) || host_ok(t)
+}
+
 /// An Entra app's client id (a GUID), optionally `@` the host of the resource its tokens
-/// are for (`storage.azure.com`). No `{owner}`: app ids are GUIDs Entra chooses.
+/// are for (`storage.azure.com`). `{owner}` may be the whole app, for an entry whose
+/// `apps=` file names each user's (ADR 0250): app ids are GUIDs Entra chooses.
 fn entra_app_ok(p: &str) -> bool {
     let (app, resource) = p.split_once('@').map_or((p, None), |(a, r)| (a, Some(r)));
-    let groups: Vec<&str> = app.split('-').collect();
-    let guid = groups.iter().map(|g| g.len()).eq([8, 4, 4, 4, 12]) && groups.iter().all(|g| g.bytes().all(|b| b.is_ascii_hexdigit()));
-    let label_ok = |l: &str| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    guid && resource.is_none_or(|r| r.len() <= 253 && r.contains('.') && r.split('.').all(label_ok))
+    (guid_ok(app) || app == OWNER) && resource.is_none_or(host_ok)
 }
 
 /// How one backend's run credentials setting is written.
@@ -538,15 +643,16 @@ pub const GCP: Syntax = Syntax {
 
 /// `AZURE_RUN_CREDENTIALS` (ADR 0213): Entra apps that trust botd's identity as a
 /// federated credential, a token of one made for each run. No Azure tool reads a token
-/// from the environment, so a bare entry gives it under one plain name.
+/// from the environment, so a bare entry gives it under one plain name. `tenant=` asks
+/// another tenant, and `{owner}` with `apps=` each user's own app (ADR 0250).
 pub const AZURE: Syntax = Syntax {
     key: "AZURE_RUN_CREDENTIALS",
-    what: "an Entra app's client id like \"00000000-0000-0000-0000-000000000000\", optionally @ the resource's host like \"@storage.azure.com\"",
+    what: "an Entra app's client id like \"00000000-0000-0000-0000-000000000000\" (or {owner} with apps=<file>), optionally @ the resource's host like \"@storage.azure.com\"",
     path_ok: entra_app_ok,
     fields: &["accessToken"],
     defaults: &[("AZURE_ACCESS_TOKEN", "accessToken")],
     own: &[],
-    options: &[],
+    options: AZURE_OPTIONS,
     example: "AZURE_ACCESS_TOKEN=accessToken",
 };
 
@@ -574,18 +680,27 @@ pub fn parse_as(syntax: &Syntax, raw: &str) -> Result<Vec<Wanted>, String> {
             let Some((name, field)) = pair.split_once('=') else {
                 return Err(format!("{key}: {pair:?} after {path} must be NAME=field, like {}", syntax.example));
             };
-            if SESSION_OPTIONS.contains(&name) || BOUNDARY_OPTIONS.contains(&name) {
+            if SESSION_OPTIONS.contains(&name) || BOUNDARY_OPTIONS.contains(&name) || AZURE_OPTIONS.contains(&name) {
                 if !syntax.options.contains(&name) {
                     return Err(if SESSION_OPTIONS.contains(&name) {
                         format!("{key}: {name}= narrows AWS STS sessions, so only AWS_RUN_CREDENTIALS takes it")
-                    } else {
+                    } else if BOUNDARY_OPTIONS.contains(&name) {
                         format!("{key}: {name}= downscopes Google access tokens, so only GCP_RUN_CREDENTIALS takes it")
+                    } else {
+                        format!("{key}: {name}= chooses Entra apps and tenants, so only AZURE_RUN_CREDENTIALS takes it")
                     });
                 }
                 session_option(&mut narrowing, path, name, field).map_err(|e| format!("{key}: {path}: {e}"))?;
                 continue;
             }
             pairs.push((name.to_string(), field.to_string()));
+        }
+        if syntax.options.contains(&"apps") {
+            match (path.split('@').next() == Some(OWNER), narrowing.apps.is_some()) {
+                (true, false) => return Err(format!("{key}: {path}: {OWNER} stands for each user's own app, so it needs apps=<file> mapping user ids to apps")),
+                (false, true) => return Err(format!("{key}: {path}: apps= gives each user their own app, so the entry's app must be {OWNER}, like \"{OWNER}@storage.azure.com\"")),
+                _ => {}
+            }
         }
         if pairs.is_empty() {
             pairs = syntax.defaults.iter().map(|(n, f)| (n.to_string(), f.to_string())).collect();
@@ -961,7 +1076,7 @@ impl RunCredentials {
 
     /// For the startup line: paths, and which sessions are narrowed.
     pub fn describe(&self) -> String {
-        let paths: Vec<String> = self.wanted.iter().map(|w| if w.narrowing.is_empty() { w.path.clone() } else { format!("{} (narrowed)", w.path) }).collect();
+        let paths: Vec<String> = self.wanted.iter().map(|w| w.narrowing.note().map_or_else(|| w.path.clone(), |n| format!("{} ({n})", w.path))).collect();
         format!("short-lived credentials for each run from {}", paths.join(", "))
     }
 
@@ -984,11 +1099,29 @@ impl RunCredentials {
             if per_owner && !owner_ok {
                 continue;
             }
-            let path = w.path.replace(OWNER, owner);
             let owner_id = per_owner.then_some(owner);
+            // An `apps=` entry's `{owner}` is the owner's own app (ADR 0250), from the file as it is now.
+            let user_app = match &w.narrowing.apps {
+                Some(file) => match user_app(file, owner) {
+                    Ok(Some(a)) => Some(a),
+                    Ok(None) => {
+                        leases.cleared.extend(w.names.iter().map(|(n, _)| n.clone()));
+                        continue;
+                    }
+                    Err(why) => {
+                        let (e, mut d) = event("secret.lease_issued", self.issuer.kind(), &w.path, bot_id, owner_id);
+                        d["names"] = json!(w.names.iter().map(|(n, _)| n).collect::<Vec<_>>());
+                        d["error"] = json!("apps");
+                        external::audit(e.outcome(Outcome::Failure).details(d));
+                        return Err(Error::Unavailable(format!("{}: {}: {why}", self.issuer.kind(), w.path)));
+                    }
+                },
+                None => None,
+            };
+            let path = w.path.replace(OWNER, user_app.as_ref().map_or(owner, |a| a.app.as_str()));
             let (e, mut d) = event("secret.lease_issued", self.issuer.kind(), &path, bot_id, owner_id);
             d["names"] = json!(w.names.iter().map(|(n, _)| n).collect::<Vec<_>>());
-            let narrowed = match w.narrowing.for_run(owner, bot_id) {
+            let mut narrowed = match w.narrowing.for_run(owner, bot_id) {
                 Ok(n) => n,
                 Err(why) => {
                     d["error"] = json!("narrowing");
@@ -996,6 +1129,12 @@ impl RunCredentials {
                     return Err(Error::Unavailable(format!("{}: {path}: {why}", self.issuer.kind())));
                 }
             };
+            if let Some(t) = user_app.and_then(|a| a.tenant) {
+                narrowed.tenant = Some(t);
+            }
+            if let Some(t) = &narrowed.tenant {
+                d["tenant"] = json!(t);
+            }
             if let Some(p) = &narrowed.policy {
                 d["policySha256"] = json!(crate::sigv4::sha256_hex(p.as_bytes()));
             }
@@ -1941,5 +2080,113 @@ pub(crate) mod tests {
         let (e, _l) = rc.issue("udown2", "bdown2", false, RUN).unwrap();
         assert_eq!(env(&e).into_iter().map(|(k, _)| k).collect::<Vec<_>>(), ["CLOUDSDK_AUTH_ACCESS_TOKEN", "GOOGLE_OAUTH_ACCESS_TOKEN"]);
         assert_eq!(f.narrowed.lock().unwrap().len(), 1);
+    }
+
+    const ENTRA_APP: &str = "11111111-2222-3333-4444-555555555555";
+
+    #[test]
+    fn azure_entries_take_a_tenant_and_each_users_app_and_are_checked() {
+        let apps = policy_file("azure-apps-ok", &json!({ "uaz1": ENTRA_APP, "uaz2": { "app": "AAAAAAAA-0000-0000-0000-00000000CAFE", "tenant": "fabrikam.onmicrosoft.com" }, "uaz3": { "app": ENTRA_APP } }).to_string());
+        let raw = format!("{ENTRA_APP} tenant=22222222-0000-0000-0000-000000000002; {{owner}}@storage.azure.com USER_AZURE_TOKEN=accessToken apps={apps} tenant=contoso.onmicrosoft.com");
+        let w = parse_as(&AZURE, &raw).unwrap();
+        assert_eq!(w[0].names, [pair("AZURE_ACCESS_TOKEN", "accessToken")], "an option isn't a variable");
+        assert_eq!((w[0].narrowing.tenant.as_deref(), w[0].per_owner()), (Some("22222222-0000-0000-0000-000000000002"), false), "another tenant is for every run");
+        assert_eq!((w[1].narrowing.apps.as_deref(), w[1].narrowing.tenant.as_deref(), w[1].per_owner()), (Some(apps.as_str()), Some("contoso.onmicrosoft.com"), true), "each user's app: the owner's runs only");
+        let n = w[0].narrowing.for_run("u1", "b1").unwrap();
+        assert!(!n.is_empty() && !n.narrows_session() && n.boundary.is_none() && n.tenant.as_deref() == Some("22222222-0000-0000-0000-000000000002"));
+        assert_eq!(user_app(&apps, "uaz2").unwrap(), Some(UserApp { app: "AAAAAAAA-0000-0000-0000-00000000CAFE".into(), tenant: Some("fabrikam.onmicrosoft.com".into()) }));
+        assert_eq!(user_app(&apps, "uaz3").unwrap(), Some(UserApp { app: ENTRA_APP.into(), tenant: None }));
+        assert_eq!(user_app(&apps, "uaz9").unwrap(), None);
+
+        for (raw, err) in [
+            (format!("{ENTRA_APP} tenant=common"), "tenant=\"common\" must be a tenant id (a GUID) or its domain"),
+            (format!("{ENTRA_APP} tenant=organizations"), "must be a tenant id"),
+            (format!("{ENTRA_APP} tenant=Contoso.onmicrosoft.com"), "must be a tenant id"),
+            (format!("{ENTRA_APP} tenant=a.example tenant=b.example"), "tenant= is given twice"),
+            ("{owner}".to_string(), "{owner} stands for each user's own app, so it needs apps=<file>"),
+            (format!("{ENTRA_APP} apps={apps}"), "apps= gives each user their own app, so the entry's app must be {owner}"),
+            (format!("{{owner}} apps={apps} apps={apps}"), "apps= is given twice"),
+            ("u-{owner} X_TOKEN=accessToken".to_string(), "must be an Entra app's client id"),
+            ("{owner}x@storage.azure.com".to_string(), "must be an Entra app's client id"),
+        ] {
+            let e = parse_as(&AZURE, &raw).unwrap_err();
+            assert!(e.contains(err), "{raw}: {e}");
+        }
+
+        let secret = "secret-in-a-bad-apps-file-3c2d";
+        for (text, err) in [
+            (format!("{{\"uaz1\": \"{secret}"), "isn't JSON"),
+            (json!([ENTRA_APP]).to_string(), "must be a JSON object of user ids"),
+            (json!({ "Uaz1": ENTRA_APP }).to_string(), "has a key that isn't a user id"),
+            (json!({ "uaz1": secret }).to_string(), "uaz1's app must be an Entra app's client id"),
+            (json!({ "uaz1": 7 }).to_string(), "uaz1 must have an app's client id"),
+            (json!({ "uaz1": { "app": ENTRA_APP, "role": secret } }).to_string(), "uaz1 must have an app's client id, or {\"app\": ..., \"tenant\": ...} and nothing else"),
+            (json!({ "uaz1": { "tenant": "fabrikam.onmicrosoft.com" } }).to_string(), "uaz1's app must be"),
+            (json!({ "uaz1": { "app": ENTRA_APP, "tenant": "common" } }).to_string(), "uaz1's tenant must be a tenant id"),
+        ] {
+            let file = policy_file("azure-apps-bad", &text);
+            let e = parse_as(&AZURE, &format!("{{owner}} apps={file}")).unwrap_err();
+            assert!(e.starts_with(&format!("AZURE_RUN_CREDENTIALS: {{owner}}: apps={file}: ")) && e.contains(err), "{text}: {e}");
+            assert!(!e.contains(secret), "an apps file is never quoted: {e}");
+        }
+        let e = parse_as(&AZURE, "{owner} apps=/nonexistent/superbot/apps.json").unwrap_err();
+        assert!(e.contains("apps=/nonexistent/superbot/apps.json: can't be read"), "{e}");
+
+        for (syntax, raw) in [(&AWS, "arn:aws:iam::123456789012:role/r"), (&VAULT, "azure/creds/bots X_TOKEN=token"), (&GCP, "superbot@p.iam.gserviceaccount.com")] {
+            for option in ["tenant=contoso.onmicrosoft.com", &format!("apps={apps}")] {
+                let e = parse_as(syntax, &format!("{raw} {option}")).unwrap_err();
+                assert!(e.contains("= chooses Entra apps and tenants, so only AZURE_RUN_CREDENTIALS takes it"), "{raw} {option}: {e}");
+            }
+        }
+        let e = parse_as(&AZURE, &format!("{ENTRA_APP} policy={apps}")).unwrap_err();
+        assert!(e.contains("only AWS_RUN_CREDENTIALS takes it"), "{e}");
+    }
+
+    #[test]
+    fn a_tenant_is_refused_by_backends_that_cant_ask_one() {
+        struct Plain;
+        impl Issuer for Plain {
+            fn kind(&self) -> &'static str {
+                "plain"
+            }
+            fn issue(&self, path: &str, _: &[String], _: Duration, _: &str) -> Result<Lease, Error> {
+                Ok(Lease { id: path.into(), ttl: 60, renewable: false, fields: Vec::new() })
+            }
+            fn revoke(&self, _: &str) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        let elsewhere = Narrowed { tenant: Some("contoso.onmicrosoft.com".into()), ..Narrowed::default() };
+        let e = Plain.issue_narrowed("p", &[], RUN, "b1", &elsewhere).err().unwrap().to_string();
+        assert!(e.contains("or asked of another tenant"), "{e}");
+        assert!(!elsewhere.narrows_session());
+    }
+
+    #[test]
+    fn each_users_app_stands_for_owner_and_users_the_file_doesnt_name_get_none() {
+        let token: &[(&str, Option<&str>)] = &[("accessToken", Some("eyJ.user-app-7a8b"))];
+        let f = fake(&[("aaaaaaaa-0000-0000-0000-0000000000a1@storage.azure.com", token), ("aaaaaaaa-0000-0000-0000-0000000000a2@storage.azure.com", token)]);
+        f.unrevocable.store(true, Ordering::SeqCst);
+        f.ttl.store(3600, Ordering::SeqCst);
+        let file = policy_file(
+            "azure-apps-fake",
+            &json!({ "uappf1": "aaaaaaaa-0000-0000-0000-0000000000a1", "uappf2": { "app": "aaaaaaaa-0000-0000-0000-0000000000a2", "tenant": "fabrikam.onmicrosoft.com" } }).to_string(),
+        );
+        let rc = RunCredentials::new(f.clone(), parse_as(&AZURE, &format!("{{owner}}@storage.azure.com apps={file} tenant=contoso.onmicrosoft.com")).unwrap());
+        assert_eq!(rc.names_for("uappf9", true), ["AZURE_ACCESS_TOKEN"], "set or cleared for the owner's runs");
+        assert!(rc.names_for("uappf1", false).is_empty());
+
+        rc.issue("uappf1", "bappf1", true, RUN).unwrap();
+        rc.issue("uappf2", "bappf2", true, RUN).unwrap();
+        let narrowed = f.narrowed.lock().unwrap().clone();
+        let tenants: Vec<(&str, Option<&str>)> = narrowed.iter().map(|(p, n)| (p.as_str(), n.tenant.as_deref())).collect();
+        assert_eq!(
+            tenants,
+            [("aaaaaaaa-0000-0000-0000-0000000000a1@storage.azure.com", Some("contoso.onmicrosoft.com")), ("aaaaaaaa-0000-0000-0000-0000000000a2@storage.azure.com", Some("fabrikam.onmicrosoft.com"))],
+            "the owner's app in {{owner}}'s place; the user's tenant over the entry's"
+        );
+        let (e, l) = rc.issue("uappf9", "bappf9", true, RUN).unwrap();
+        assert!(e.is_empty() && l.is_empty() && l.cleared() == ["AZURE_ACCESS_TOKEN"], "not in the file: no token, and nothing inherited");
+        assert_eq!(f.narrowed.lock().unwrap().len(), 2, "nothing asked for them");
     }
 }
