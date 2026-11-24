@@ -1,7 +1,8 @@
 //! `superbot-evidence coverage` (ADR 0169): checks an evidence store against an
 //! observation period. Every bundle in it (botd's evidence bundles, ADR 0142; the
 //! change-management bundles, ADR 0148; the vulnerability bundles, ADR 0086; the restore
-//! drill bundles, ADR 0177; the policy register bundles, ADR 0204) is checked
+//! drill bundles, ADR 0177; the policy register bundles, ADR 0204; the uptime bundles,
+//! ADR 0249) is checked
 //! against its own `SHA256SUMS` and manifest, and the report says which days of the period
 //! each kind of bundle, each readiness checklist row and each criterion has evidence for,
 //! and where the gaps are. Reads local files only: no token, no network, nothing written
@@ -11,6 +12,7 @@ use crate::changes::{self, json_file, rfc3339, sha256};
 use crate::drills;
 use crate::period::Period;
 use crate::register;
+use crate::uptime;
 use crate::vulns;
 use chrono::{Datelike, NaiveDate};
 use serde_json::{Value, json};
@@ -57,7 +59,7 @@ pub struct Kind {
     pub made_by: &'static str,
 }
 
-pub const KINDS: [Kind; 5] = [
+pub const KINDS: [Kind; 6] = [
     Kind { id: "evidence", prefix: "superbot-evidence-", manifest_kind: None, format: 2, title: "Evidence bundle", made_by: "botd (EVIDENCE_BUNDLES=monthly, or botctl evidence bundle)" },
     Kind {
         id: "change-management",
@@ -91,6 +93,14 @@ pub const KINDS: [Kind; 5] = [
         title: "Register bundle",
         made_by: "superbot-evidence register (from the security owner's private policy register)",
     },
+    Kind {
+        id: "availability",
+        prefix: uptime::PREFIX,
+        manifest_kind: Some("availability"),
+        format: uptime::FORMAT as u64,
+        title: "Uptime bundle",
+        made_by: "superbot-evidence uptime (from the operator's outside probe)",
+    },
 ];
 
 /// Each file a kind always has, with its criteria and rows.
@@ -101,6 +111,7 @@ pub fn expected(kind: &str) -> Vec<(&'static str, &'static [&'static str], &'sta
         "vulnerability-management" => vulns::SECTIONS.iter().map(|s| (s.file, s.criteria, s.rows)).collect(),
         "recovery-drills" => drills::SECTIONS.iter().map(|s| (s.file, s.criteria, s.rows)).collect(),
         "policy-register" => register::SECTIONS.iter().map(|s| (s.file, s.criteria, s.rows)).collect(),
+        "availability" => uptime::SECTIONS.iter().map(|s| (s.file, s.criteria, s.rows)).collect(),
         _ => Vec::new(),
     }
 }
@@ -114,7 +125,7 @@ fn since_format(kind: &str, file: &str) -> u64 {
 }
 
 /// The files whose `exceptions` an auditor samples first.
-const EXCEPTION_FILES: [&str; 16] = [
+const EXCEPTION_FILES: [&str; 17] = [
     "pull-requests.json",
     "vulnerability-alerts.json",
     "ci-drills.json",
@@ -131,6 +142,7 @@ const EXCEPTION_FILES: [&str; 16] = [
     "incidents.json",
     "access.json",
     "vulnerabilities.json",
+    "uptime.json",
 ];
 
 /// A bundle file larger than this isn't read: no bundle comes near it.
@@ -1207,6 +1219,7 @@ mod tests {
             found.push(month(&KINDS[2], from, to));
             found.push(month(&KINDS[3], from, to));
             found.push(month(&KINDS[4], from, to));
+            found.push(month(&KINDS[5], from, to));
         }
         // Change management: January only, and a tampered February.
         found.push(month(&KINDS[1], "2027-01-01", "2027-02-01"));
@@ -1223,9 +1236,9 @@ mod tests {
         assert!(problems.iter().any(|x| x.contains("superbot-changes-2027-02-01") && x.contains("changed after")), "{problems:?}");
         assert!(problems.iter().any(|x| x == "No verified change-management bundle covers 2027-02-01 to 2027-04-01 (59 days)"), "{problems:?}");
         assert_eq!(problems.len(), 2, "{problems:?}");
-        assert_eq!(r["summary"]["inPeriod"], 13);
+        assert_eq!(r["summary"]["inPeriod"], 16);
         assert_eq!(r["summary"]["failed"], 1);
-        assert_eq!(r["summary"]["kindsComplete"], 4);
+        assert_eq!(r["summary"]["kindsComplete"], 5);
         assert_eq!(r["summary"]["exceptionsInBundles"], 2);
 
         let kind = |id: &str| r["kinds"].as_array().unwrap().iter().find(|k| k["kind"] == id).unwrap().clone();
