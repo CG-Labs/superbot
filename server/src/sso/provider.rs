@@ -306,6 +306,20 @@ impl Provider {
         matches!(self.kind, Kind::SamlSp { .. })
     }
 
+    /// What signing in here reaches, as `(setting, URL)`: the setting is the `SSO_<ID>_...`
+    /// that names the URL, or would if it weren't the default (`botd offline check`, ADR
+    /// 0257). Native SAML with its IdP metadata in a file or the database fetches nothing.
+    pub fn reaches(&self) -> Vec<(String, String)> {
+        let key = |k: &str| format!("SSO_{}_{k}", self.id.to_ascii_uppercase());
+        match &self.kind {
+            Kind::Entra { authority, .. } => vec![(key("AUTHORITY"), authority.clone())],
+            Kind::Google { issuer, .. } | Kind::Oidc { issuer, .. } | Kind::Apple { issuer, .. } | Kind::Saml { issuer, .. } => vec![(key("ISSUER"), issuer.clone())],
+            Kind::GitHub { web, api, .. } => vec![(key("URL"), web.clone()), (key("API_URL"), api.clone())],
+            Kind::SamlSp { source: IdpSource::Url(url), .. } => vec![(key("IDP_METADATA_URL"), url.clone())],
+            Kind::SamlSp { .. } => Vec::new(),
+        }
+    }
+
     /// Native SAML has no client secret: it checks signatures with the IdP's certificates.
     pub fn needs_secret(&self) -> bool {
         !self.saml_sp()
