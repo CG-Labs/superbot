@@ -50,7 +50,7 @@ fn import_url(base: &str, location: &str, project: &str, instance: &str, log_typ
     format!("{base}/{API_VERSION}/projects/{project}/locations/{location}/instances/{instance}/logTypes/{log_type}/logs:import")
 }
 
-fn endpoint(location: &str) -> String {
+pub(crate) fn endpoint(location: &str) -> String {
     format!("https://{location}-chronicle.googleapis.com")
 }
 

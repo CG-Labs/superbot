@@ -316,6 +316,22 @@ pub fn place(host: &str, internal: &Internal) -> Place {
 }
 
 /// The host a setting's value names: a URL's, or a bare `host[:port]`. Never its user or path.
+/// `text` with each URL's user and password left out, as a parser's error may quote them.
+fn scrub(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("://") {
+        out.push_str(&rest[..i + 3]);
+        rest = &rest[i + 3..];
+        let end = rest.find(|c: char| matches!(c, '/' | '?' | '#' | '"' | '\'' | ')' | ',' | '>' | '\\') || c.is_whitespace()).unwrap_or(rest.len());
+        if let Some(at) = rest[..end].rfind('@') {
+            rest = &rest[at + 1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn host_of(value: &str) -> Option<String> {
     let v = value.trim();
     if v.is_empty() {
@@ -339,6 +355,7 @@ const INSIDE: &str = "Use one inside your network";
 const MODEL_FIX: &str = "Use a model server inside your network, or a provider's private endpoint (docs/ops/air-gapped.md#model-providers)";
 const S3_FIX: &str = "Use an S3-compatible store inside your network (MinIO, Ceph)";
 const HARNESS_FIX: &str = "Set MACHINE_HARNESS_BUNDLE to this release's harness bundle, or MACHINE_NODE_MIRROR and MACHINE_NPM_REGISTRY to your mirrors (docs/ops/air-gapped.md#harness-clis-on-users-machines)";
+const AUDIT_FIX: &str = "Send it to a SIEM or syslog collector inside your network";
 const SECRETS_FIX: &str = "Use a secrets manager inside your network, a private endpoint, or botd's own store (SECRETS_BACKEND unset)";
 
 struct Judge<'a> {
@@ -357,7 +374,24 @@ impl<'a> Judge<'a> {
     }
 
     fn push(&mut self, area: Area, status: Status, setting: Option<&str>, host: Option<&str>, detail: String) {
-        self.out.push(Finding { area, status, setting: setting.map(String::from), host: host.map(String::from), detail });
+        self.out.push(Finding { area, status, setting: setting.map(String::from), host: host.map(String::from), detail: scrub(&detail) });
+    }
+
+    /// Each address a provider says it reaches, or why its settings don't read.
+    fn reaches(&mut self, area: Area, setting: &str, found: Result<Vec<(&'static str, String, &'static str)>, String>, fix: &str) {
+        match found {
+            Ok(list) => {
+                for (k, url, what) in list {
+                    self.address(area, k, &url, what, fix);
+                }
+            }
+            Err(e) => self.push(area, Status::Check, Some(setting), None, format!("the settings don't read ({e}), so botd won't start with them. Fix them and check again")),
+        }
+    }
+
+    fn var(&self) -> impl Fn(&str) -> String + 'a {
+        let vars = self.vars;
+        move |k: &str| vars.get(k).cloned().unwrap_or_default()
     }
 
     fn ok(&mut self, area: Area, detail: impl Into<String>) {
@@ -399,12 +433,15 @@ impl<'a> Judge<'a> {
             Err(e) => self.push(Area::SignIn, Status::Check, Some("SSO_PROVIDERS"), None, format!("the SSO settings don't read ({e}), so botd won't start with them. Fix them and check again")),
             Ok(sso) => {
                 for p in &sso.providers {
-                    let what = format!("SSO provider {}", p.id);
-                    let reaches = p.reaches();
-                    if reaches.is_empty() {
-                        self.ok(Area::SignIn, format!("{what}: native SAML with the IdP's metadata from a file or botctl, so botd fetches nothing"));
+                    if matches!(&p.kind, crate::sso::Kind::SamlSp { source: crate::sso::IdpSource::Saved, .. }) {
+                        let detail = format!(
+                            "SSO provider {}: native SAML with the IdP's metadata saved with botctl, which this check doesn't read. Check that its sign-in and logout URLs are inside your network",
+                            p.id
+                        );
+                        self.push(Area::SignIn, Status::Check, Some("SSO_PROVIDERS"), None, detail);
                     }
-                    for (setting, url) in reaches {
+                    for (setting, url, what) in p.reaches() {
+                        let what = format!("SSO provider {}'s {what}", p.id);
                         self.address(Area::SignIn, &setting, &url, &what, "Sign in with an identity provider inside your network (ADFS, Keycloak, or another OIDC or SAML IdP)");
                     }
                 }
@@ -644,11 +681,25 @@ impl<'a> Judge<'a> {
                     Some((name, rest)) if !name.contains(['/', ':']) => rest.trim(),
                     _ => entry,
                 };
-                if sink.to_ascii_lowercase().starts_with("s3://") {
+                let lower = sink.to_ascii_lowercase();
+                let var = self.var();
+                if lower.starts_with("s3://") {
                     let v = self.get("AUDIT_EXPORT_S3_ENDPOINT").to_string();
                     self.address(Area::Audit, "AUDIT_EXPORT_S3_ENDPOINT", &v, "The audit archive's S3 store", S3_FIX);
+                } else if let Some(rest) = lower.strip_prefix("google-secops://") {
+                    let location = rest.split(['/', ':']).next().unwrap_or_default();
+                    self.address(Area::Audit, "AUDIT_EXPORT", &crate::audit_secops::endpoint(location), "Audit export to Google SecOps", AUDIT_FIX);
+                    let (k, method) = if self.set("AUDIT_EXPORT_GCP_AUTH") { ("AUDIT_EXPORT_GCP_AUTH", var("AUDIT_EXPORT_GCP_AUTH")) } else { ("GCP_SECRET_MANAGER_AUTH", var("GCP_SECRET_MANAGER_AUTH")) };
+                    self.reaches(Area::Audit, k, crate::secrets::gcp::sign_in_reaches(&var, k, &method), AUDIT_FIX);
+                } else if let Some(rest) = lower.strip_prefix("datadog://") {
+                    let site = rest.split(['/', '?', '#']).next().unwrap_or_default();
+                    self.address(Area::Audit, "AUDIT_EXPORT", &crate::audit_datadog::intake(site), "Audit export to Datadog", AUDIT_FIX);
+                } else if lower.starts_with("azure-monitor://") {
+                    self.address(Area::Audit, "AUDIT_EXPORT", sink, "Audit export to Azure Monitor", AUDIT_FIX);
+                    let (k, method) = if self.set("AUDIT_EXPORT_AZURE_AUTH") { ("AUDIT_EXPORT_AZURE_AUTH", var("AUDIT_EXPORT_AZURE_AUTH")) } else { ("AZURE_KEYVAULT_AUTH", var("AZURE_KEYVAULT_AUTH")) };
+                    self.reaches(Area::Audit, k, crate::secrets::azure::sign_in_reaches(&var, k, &method, false), AUDIT_FIX);
                 } else {
-                    self.address(Area::Audit, "AUDIT_EXPORT", sink, "Audit export", "Send it to a SIEM or syslog collector inside your network");
+                    self.address(Area::Audit, "AUDIT_EXPORT", sink, "Audit export", AUDIT_FIX);
                 }
             }
         }
@@ -690,20 +741,17 @@ impl<'a> Judge<'a> {
             "azure-keyvault" => {
                 let v = self.get("AZURE_KEYVAULT_URL").to_string();
                 self.address(Area::Secrets, "AZURE_KEYVAULT_URL", &v, "Azure Key Vault", SECRETS_FIX);
-                if matches!(self.get("AZURE_KEYVAULT_AUTH"), "client-secret" | "workload-identity") {
-                    let a = self.or("AZURE_AUTHORITY_HOST", "https://login.microsoftonline.com").to_string();
-                    self.address(Area::Secrets, "AZURE_AUTHORITY_HOST", &a, "Key Vault's sign-in", "Sign in with AZURE_KEYVAULT_AUTH=managed-identity, which asks the host");
-                }
+                let var = self.var();
+                let found = crate::secrets::azure::sign_in_reaches(&var, "AZURE_KEYVAULT_AUTH", &var("AZURE_KEYVAULT_AUTH"), self.set("AZURE_RUN_CREDENTIALS"));
+                self.reaches(Area::Secrets, "AZURE_KEYVAULT_AUTH", found, SECRETS_FIX);
             }
             "gcp-secret-manager" => {
-                let v = self.or("GCP_SECRET_MANAGER_ENDPOINT", "https://secretmanager.googleapis.com").to_string();
-                self.address(Area::Secrets, "GCP_SECRET_MANAGER_ENDPOINT", &v, "Google Secret Manager", SECRETS_FIX);
+                let found = crate::secrets::gcp::reaches(&self.var());
+                self.reaches(Area::Secrets, "SECRETS_BACKEND", found, SECRETS_FIX);
             }
             "aws" => {
-                let region = ["AWS_SECRETS_MANAGER_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"].iter().map(|k| self.get(k)).find(|v| !v.is_empty()).unwrap_or("us-east-1");
-                let default = format!("https://secretsmanager.{region}.amazonaws.com");
-                let v = self.or("AWS_ENDPOINT_URL_SECRETS_MANAGER", &default).to_string();
-                self.address(Area::Secrets, "AWS_ENDPOINT_URL_SECRETS_MANAGER", &v, "AWS Secrets Manager", SECRETS_FIX);
+                let found = crate::secrets::aws::reaches(&self.var());
+                self.reaches(Area::Secrets, "SECRETS_BACKEND", found, SECRETS_FIX);
             }
             other => self.push(Area::Secrets, Status::Check, Some("SECRETS_BACKEND"), None, format!("SECRETS_BACKEND={other} isn't one botd knows, so botd won't start with it")),
         }
@@ -1186,6 +1234,72 @@ mod tests {
         assert!(m.detail.ends_with("add --internal corp.example"), "{}", m.detail);
         let google = findings(&[("SSO_PROVIDERS", "google"), ("SSO_PUBLIC_URL", "https://bot.corp.example"), ("SSO_GOOGLE_CLIENT_ID", "c.apps.googleusercontent.com")], &[]);
         assert_eq!((by(&google, "SSO_GOOGLE_ISSUER").status, by(&google, "SSO_GOOGLE_ISSUER").host.as_deref()), (Status::Internet, Some("accounts.google.com")));
+    }
+
+    #[test]
+    fn native_saml_names_the_hosts_its_metadata_sends_people_to() {
+        use crate::sso::saml_sp::test_idp;
+        let xml = temp_file("offline-idp.xml", &test_idp::metadata());
+        let base = [("SSO_PROVIDERS", "corp"), ("SSO_PUBLIC_URL", "https://bot.corp.example"), ("SSO_CORP_TYPE", "saml"), ("SSO_CORP_IDP_ENTITY_ID", test_idp::IDP)];
+        let with_file: Vec<(&str, &str)> = base.iter().copied().chain([("SSO_CORP_IDP_METADATA_FILE", xml.as_str())]).collect();
+        let f = findings(&with_file, &[]);
+        let page = by(&f, "SSO_CORP_IDP_METADATA_FILE");
+        assert_eq!((page.status, page.host.as_deref()), (Status::Check, Some("idp.example")), "{f:#?}");
+        assert!(page.detail.starts_with("SSO provider corp's sign-in page at idp.example"), "{}", page.detail);
+        assert_eq!(by(&findings(&with_file, &["idp.example"]), "SSO_CORP_IDP_METADATA_FILE").status, Status::Ok);
+        let saved = findings(&base, &[]);
+        let s = by(&saved, "SSO_PROVIDERS");
+        assert_eq!(s.status, Status::Check);
+        assert!(s.detail.contains("saved with botctl, which this check doesn't read"), "{}", s.detail);
+    }
+
+    #[test]
+    fn audit_sinks_are_judged_at_the_hosts_they_send_to() {
+        let secops = findings(&[("AUDIT_EXPORT", "google-secops://eu/my-project/01234567-89ab-cdef-0123-456789abcdef/SUPERBOT_AUDIT")], &[]);
+        let to = by(&secops, "AUDIT_EXPORT");
+        assert_eq!((to.status, to.host.as_deref()), (Status::Check, Some("eu-chronicle.googleapis.com")), "{secops:#?}");
+        assert_eq!(by(&secops, "GCE_METADATA_HOST").status, Status::Ok, "the metadata server is link-local");
+        let key = findings(&[("AUDIT_EXPORT", "google-secops://us/my-project/01234567-89ab-cdef-0123-456789abcdef/SUPERBOT_AUDIT"), ("AUDIT_EXPORT_GCP_AUTH", "service-account-key")], &[]);
+        assert_eq!(by(&key, "GCP_SERVICE_ACCOUNT_KEY").host.as_deref(), Some("oauth2.googleapis.com"));
+        let dd = findings(&[("AUDIT_EXPORT", "siem=datadog://datadoghq.eu")], &[]);
+        let to = by(&dd, "AUDIT_EXPORT");
+        assert_eq!((to.status, to.host.as_deref()), (Status::Internet, Some("http-intake.logs.datadoghq.eu")));
+        let azure = findings(&[("AUDIT_EXPORT", "azure-monitor://s.eastus-1.ingest.monitor.azure.com/dcr-00000000000000000000000000000000/Custom-A"), ("AUDIT_EXPORT_AZURE_AUTH", "client-secret")], &[]);
+        assert_eq!(by(&azure, "AUDIT_EXPORT").status, Status::Check);
+        assert_eq!(by(&azure, "AZURE_AUTHORITY_HOST").status, Status::Internet);
+        let bad = by(&findings(&[("AUDIT_EXPORT", "google-secops://eu/p/i/T"), ("AUDIT_EXPORT_GCP_AUTH", "password")], &[]), "AUDIT_EXPORT_GCP_AUTH");
+        assert_eq!(bad.status, Status::Check);
+    }
+
+    #[test]
+    fn secrets_managers_name_the_hosts_they_sign_in_at() {
+        let aws = [("SECRETS_BACKEND", "aws"), ("AWS_REGION", "eu-west-2"), ("AWS_ENDPOINT_URL_SECRETS_MANAGER", "https://vpce.internal"), ("AWS_WEB_IDENTITY_TOKEN_FILE", "/var/run/token"), ("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/botd")];
+        let f = findings(&aws, &[]);
+        assert_eq!(by(&f, "AWS_ENDPOINT_URL_SECRETS_MANAGER").status, Status::Ok);
+        let sts = by(&f, "AWS_ENDPOINT_URL_STS");
+        assert_eq!((sts.status, sts.host.as_deref()), (Status::Check, Some("sts.eu-west-2.amazonaws.com")));
+        let cn = findings(&[("SECRETS_BACKEND", "aws"), ("AWS_REGION", "cn-north-1")], &[]);
+        assert_eq!(by(&cn, "AWS_ENDPOINT_URL_SECRETS_MANAGER").host.as_deref(), Some("secretsmanager.cn-north-1.amazonaws.com.cn"));
+        assert!(cn.iter().all(|x| x.setting.as_deref() != Some("AWS_ENDPOINT_URL_STS")), "STS only for web identity and runs");
+        let none = by(&findings(&[("SECRETS_BACKEND", "aws")], &[]), "SECRETS_BACKEND");
+        assert!(none.status == Status::Check && none.detail.contains("AWS_SECRETS_MANAGER_REGION"), "{}", none.detail);
+        let gcp = findings(&[("SECRETS_BACKEND", "gcp-secret-manager"), ("GCP_SECRET_MANAGER_LOCATION", "europe-west2"), ("GCP_RUN_CREDENTIALS", "sa@p.iam.gserviceaccount.com TOKEN=accessToken boundary=b.json")], &[]);
+        assert_eq!(by(&gcp, "GCP_SECRET_MANAGER_ENDPOINT").host.as_deref(), Some("secretmanager.europe-west2.rep.googleapis.com"));
+        assert_eq!(by(&gcp, "GCP_IAM_CREDENTIALS_ENDPOINT").host.as_deref(), Some("iamcredentials.googleapis.com"));
+        assert_eq!(by(&gcp, "GCP_STS_ENDPOINT").host.as_deref(), Some("sts.googleapis.com"));
+        let azure = findings(&[("SECRETS_BACKEND", "azure-keyvault"), ("AZURE_KEYVAULT_URL", "https://kv1.vault.azure.net"), ("AZURE_RUN_CREDENTIALS", "x")], &[]);
+        assert_eq!(by(&azure, "IDENTITY_ENDPOINT").status, Status::Ok);
+        assert_eq!(by(&azure, "AZURE_AUTHORITY_HOST").status, Status::Internet, "a managed identity trades its token at Entra ID for runs");
+    }
+
+    #[test]
+    fn no_users_or_passwords_reach_the_report() {
+        assert_eq!(scrub("bad https://user:hunter2@host.example/x and s3://k@minio:9000 \"ftp://a@b\""), "bad https://host.example/x and s3://minio:9000 \"ftp://b\"");
+        assert_eq!(scrub("no URL: a@b"), "no URL: a@b");
+        let tiers = temp_file("offline-tiers-creds.json", r#"{"providers":{"x":{"protocol":"openai-chat","baseUrl":"ftp://user:hunter2@llm.example/v1","keySecret":"TIER_X"}},"tiers":[{"name":"t"}]}"#);
+        let f = findings(&[("TIERS_FILE", &tiers), ("VAULT_ADDR", "https://u:hunter2@vault.internal"), ("SECRETS_BACKEND", "vault")], &[]);
+        let all = format!("{f:?}");
+        assert!(by(&f, "TIERS_FILE").status == Status::Check && !all.contains("hunter2"), "{all}");
     }
 
     #[test]

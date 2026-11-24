@@ -202,19 +202,43 @@ fn plain(v: &str) -> bool {
     !v.is_empty() && !v.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
+/// The region, and Secrets Manager's and STS's endpoints in it.
+fn endpoints(var: &dyn Fn(&str) -> String) -> Result<(String, String, String), String> {
+    let region = region_setting(var)?;
+    let dns = dns_suffix(&region);
+    let endpoint = match var("AWS_ENDPOINT_URL_SECRETS_MANAGER").trim() {
+        "" => format!("https://secretsmanager.{region}.{dns}"),
+        e => http::base_url("AWS_ENDPOINT_URL_SECRETS_MANAGER", e, "https://secretsmanager.eu-west-2.amazonaws.com")?,
+    };
+    let sts = match var("AWS_ENDPOINT_URL_STS").trim() {
+        "" => format!("https://sts.{region}.{dns}"),
+        e => http::base_url("AWS_ENDPOINT_URL_STS", e, "https://sts.eu-west-2.amazonaws.com")?,
+    };
+    Ok((region, endpoint, sts))
+}
+
+/// What Secrets Manager reaches with these settings, as `(setting, URL, what)`, for `botd
+/// offline check` (ADR 0257): its endpoint; STS for web identity and runs' sessions; and a
+/// container or metadata endpoint someone named. Keys aren't read.
+pub fn reaches(var: &dyn Fn(&str) -> String) -> Result<Vec<(&'static str, String, &'static str)>, String> {
+    let (_, endpoint, sts) = endpoints(var)?;
+    let mut out = vec![("AWS_ENDPOINT_URL_SECRETS_MANAGER", endpoint, "AWS Secrets Manager")];
+    if !var("AWS_WEB_IDENTITY_TOKEN_FILE").trim().is_empty() || !var("AWS_RUN_CREDENTIALS").trim().is_empty() {
+        out.push(("AWS_ENDPOINT_URL_STS", sts, "AWS STS, for web identity and runs' sessions"));
+    }
+    if let Some(url) = container_url(var)? {
+        out.push(("AWS_CONTAINER_CREDENTIALS_FULL_URI", url, "the container's credentials endpoint"));
+    }
+    if !var("AWS_EC2_METADATA_SERVICE_ENDPOINT").trim().is_empty() {
+        out.push(("AWS_EC2_METADATA_SERVICE_ENDPOINT", metadata_setting(&var("AWS_EC2_METADATA_SERVICE_ENDPOINT"))?, "the instance metadata service"));
+    }
+    Ok(out)
+}
+
 impl Config {
     /// `AWS_*` settings; credentials come from `store` (the environment), so `_FILE` works.
     pub fn from_env(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result<Config, String> {
-        let region = region_setting(var)?;
-        let dns = dns_suffix(&region);
-        let endpoint = match var("AWS_ENDPOINT_URL_SECRETS_MANAGER").trim() {
-            "" => format!("https://secretsmanager.{region}.{dns}"),
-            e => http::base_url("AWS_ENDPOINT_URL_SECRETS_MANAGER", e, "https://secretsmanager.eu-west-2.amazonaws.com")?,
-        };
-        let sts = match var("AWS_ENDPOINT_URL_STS").trim() {
-            "" => format!("https://sts.{region}.{dns}"),
-            e => http::base_url("AWS_ENDPOINT_URL_STS", e, "https://sts.eu-west-2.amazonaws.com")?,
-        };
+        let (region, endpoint, sts) = endpoints(var)?;
         let secret = |k: &str| -> Result<Option<Zeroizing<String>>, String> {
             let v = store.get(k).map_err(|e| format!("{k}: {e}"))?;
             Ok(v.map(|v| Zeroizing::new(v.expose().trim().to_string())).filter(|v| !v.is_empty()))
