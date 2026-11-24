@@ -179,10 +179,21 @@ async fn handle(State(world): State<Arc<Mutex<World>>>, method: Method, uri: Uri
     match (method.as_str(), key.is_empty()) {
         ("GET", true) if query.contains_key("uploads") => {
             let prefix = query.get("prefix").cloned().unwrap_or_default();
+            let after = (query.get("key-marker").cloned().unwrap_or_default(), query.get("upload-id-marker").cloned().unwrap_or_default());
+            let page = w.page.unwrap_or(1000);
+            let mut found: Vec<(&String, &String, i64)> = w.uploads.iter().filter(|(_, (k, _, _))| k.starts_with(&prefix)).map(|(id, (k, at, _))| (k, id, *at)).collect();
+            found.sort();
+            found.retain(|(k, id, _)| after.0.is_empty() || (k.as_str(), id.as_str()) > (after.0.as_str(), after.1.as_str()));
             let mut out = String::from("<ListMultipartUploadsResult>");
-            for (id, (k, at, _)) in w.uploads.iter().filter(|(_, (k, _, _))| k.starts_with(&prefix)) {
+            for (k, id, at) in found.iter().take(page) {
                 let at = chrono::DateTime::from_timestamp_millis(*at).unwrap_or_default().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
                 out.push_str(&format!("<Upload><Key>{k}</Key><UploadId>{id}</UploadId><Initiated>{at}</Initiated></Upload>"));
+            }
+            if found.len() > page {
+                let (k, id, _) = found[page - 1];
+                out.push_str(&format!("<IsTruncated>true</IsTruncated><NextKeyMarker>{k}</NextKeyMarker><NextUploadIdMarker>{id}</NextUploadIdMarker>"));
+            } else {
+                out.push_str("<IsTruncated>false</IsTruncated>");
             }
             out.push_str("</ListMultipartUploadsResult>");
             xml(StatusCode::OK, out)

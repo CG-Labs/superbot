@@ -139,7 +139,7 @@ pub async fn view(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>,
         "region": sd.region, "inRegion": sd.outside(&p.region).is_empty(), "backupsInRegion": sd.backups_in(&p.region),
         "required": sd.policy == super::server_data::Policy::Require,
     });
-    let chats = super::chat_stores::against(&app, &p.region, std::slice::from_ref(&u.id), server_data["inRegion"] == true);
+    let chats = super::chat_stores::against(&app, cp, &p.region, std::slice::from_ref(&u.id), server_data["inRegion"] == true);
     Ok(Json(json!({
         "pin": pin,
         "ownPin": own_pin,

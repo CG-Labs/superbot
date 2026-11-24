@@ -25,6 +25,7 @@ use crate::obs::log::{log_info, log_warn};
 use crate::runner::App;
 use crate::AppState;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -364,6 +365,17 @@ fn clear_backup(path: &Path, bots: &[String], key: Option<&DbKey>) -> Result<Hel
 /// crash left half made (`.partial-*`, of a backup or a rewrite) may hold moved rows too, and
 /// are deleted first; nothing else writes there while the hourly check runs.
 fn backups_to_clear(store: &ChatStore) -> Result<Vec<(i64, PathBuf)>, String> {
+    list_strictly(store, true)
+}
+
+/// A store's finished backups, newest first, to copy off the host (ADR 0246): a folder or
+/// entry botd can't read is an error, so the bucket isn't emptied to match a folder it
+/// couldn't list. Half-made copies are left out.
+pub(super) fn backups_strictly(store: &ChatStore) -> Result<Vec<(i64, PathBuf)>, String> {
+    list_strictly(store, false)
+}
+
+fn list_strictly(store: &ChatStore, drop_partial: bool) -> Result<Vec<(i64, PathBuf)>, String> {
     let dir = backups_dir(store);
     let unreadable = |e: std::io::Error| format!("{}: {e}", dir.display());
     let entries = match std::fs::read_dir(&dir) {
@@ -377,7 +389,9 @@ fn backups_to_clear(store: &ChatStore) -> Result<Vec<(i64, PathBuf)>, String> {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with(".partial-") {
-            std::fs::remove_file(entry.path()).map_err(|e| format!("{}: {e}", entry.path().display()))?;
+            if drop_partial {
+                std::fs::remove_file(entry.path()).map_err(|e| format!("{}: {e}", entry.path().display()))?;
+            }
         } else if let Some(t) = backup_time(&name) {
             out.push((t, entry.path()));
         }
@@ -386,12 +400,27 @@ fn backups_to_clear(store: &ChatStore) -> Result<Vec<(i64, PathBuf)>, String> {
     Ok(out)
 }
 
+/// One store's backups cleared of rows that left it, its moves not yet recorded as cleared.
+pub struct Clearing {
+    store: ChatStore,
+    moves: Vec<(String, i64)>,
+    done: Cleared,
+    failed: Vec<String>,
+}
+
 /// Clears each store's backups of the rows of Bots that left it (`Db::moves_out_to_clear`),
 /// then records those moves as cleared, so reports stop listing the backups as earlier
 /// copies. Each store that had backups rewritten is audited as
 /// `residency.chat_store_backups_cleared`; a failure is audited with it as a failure, the
 /// moves stay uncleared, and the next check tries again.
+#[cfg(test)]
 pub fn clear_pass(db: &Db, at: i64) -> Vec<(String, Result<Cleared, String>)> {
+    finish_clearing::<()>(db, clear_backups(db), &HashMap::new(), at)
+}
+
+/// The first half of `clear_pass`: rewrites each store's backups without the rows of Bots
+/// that left it. By region; an error is a store whose moves couldn't be read.
+pub fn clear_backups(db: &Db) -> Vec<(String, Result<Clearing, String>)> {
     let key = database_encryption::installed();
     let mut out = Vec::new();
     for store in db.chat_stores() {
@@ -419,8 +448,30 @@ pub fn clear_pass(db: &Db, at: i64) -> Vec<(String, Result<Cleared, String>)> {
                 Err(e) => failed.push(e),
             }
         }
+        out.push((store.region.clone(), Ok(Clearing { store, moves, done, failed })));
+    }
+    out
+}
+
+/// The second half of `clear_pass`: records each store's moves as cleared once its backups
+/// are, and, for a store whose backups are copied off the host (ADR 0246), once `copies`
+/// (by region, from a pass after the rewrite) says its bucket matches them, and audits it.
+pub fn finish_clearing<T>(db: &Db, cleared: Vec<(String, Result<Clearing, String>)>, copies: &HashMap<String, Result<T, String>>, at: i64) -> Vec<(String, Result<Cleared, String>)> {
+    let mut out = Vec::new();
+    for (region, c) in cleared {
+        let Clearing { store, moves, done, failed } = match c {
+            Ok(c) => c,
+            Err(e) => {
+                out.push((region, Err(e)));
+                continue;
+            }
+        };
         let details = |done: &Cleared| json!({ "region": store.region, "bots": done.bots, "backups": done.backups, "messages": done.held.messages, "routines": done.held.routines, "approvals": done.held.approvals });
-        let r = if failed.is_empty() { db.moves_out_cleared(&store.region, &moves, at).map(|_| ()).map_err(|e| e.to_string()) } else { Err(failed.join("; ")) };
+        let r = match (failed.is_empty(), copies.get(&store.region)) {
+            (false, _) => Err(failed.join("; ")),
+            (true, Some(Err(e))) => Err(format!("the backups' copies off the host: {e}")),
+            (true, _) => db.moves_out_cleared(&store.region, &moves, at).map(|_| ()).map_err(|e| e.to_string()),
+        };
         match &r {
             Ok(()) if done.backups > 0 => {
                 log_info!("Regional chat stores: took {} of {} Bots that left {}'s store out of {} of its backups (ADR 0238).", done.held.describe(), done.bots, store.region, done.backups);
@@ -439,7 +490,26 @@ pub fn clear_pass(db: &Db, at: i64) -> Vec<(String, Result<Cleared, String>)> {
     out
 }
 
-/// Checks hourly for stores due a backup, then clears backups of rows that left their store.
+/// One hourly check: backs up stores due a backup, clears backups of rows that left their
+/// store, copies them off the host where a region has a bucket (ADR 0246), and only then
+/// records the moves as cleared.
+pub async fn hourly(app: &AppState, cp: &ControlPlane) {
+    let (a, keep) = (app.clone(), cp.chat_stores.keep);
+    let cleared = tokio::task::spawn_blocking(move || {
+        backup_pass(&a.db, keep, now());
+        clear_backups(&a.db)
+    })
+    .await
+    .unwrap_or_default();
+    let copies = match cp.chat_copies.as_deref() {
+        Some(c) => c.pass(&app.db, now()).await,
+        None => HashMap::new(),
+    };
+    let a = app.clone();
+    let _ = tokio::task::spawn_blocking(move || finish_clearing(&a.db, cleared, &copies, now())).await;
+}
+
+/// Runs `hourly` from startup on.
 pub fn start(app: AppState, cp: Arc<ControlPlane>) {
     if cp.chat_stores.dirs.is_empty() {
         return;
@@ -449,40 +519,38 @@ pub fn start(app: AppState, cp: Arc<ControlPlane>) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            let (a, keep) = (app.clone(), cp.chat_stores.keep);
-            let _ = tokio::task::spawn_blocking(move || {
-                backup_pass(&a.db, keep, now());
-                clear_pass(&a.db, now());
-            })
-            .await;
+            hourly(&app, &cp).await;
         }
     });
 }
 
 // Views
 
-fn store_view(store: &ChatStore, held: &Held) -> Value {
+fn store_view(cp: &ControlPlane, store: &ChatStore, held: &Held) -> Value {
     let b = backups(store);
     json!({
         "region": store.region, "messages": held.messages, "routines": held.routines, "approvals": held.approvals,
         "backups": b.len(), "lastBackupAt": b.first().map(|(t, _)| *t),
+        "offHost": cp.chat_copies.as_deref().and_then(|c| c.view(store)),
     })
 }
 
 /// For `GET /api/regions`: each store, what it holds and its backups, and how many are kept.
 pub fn summary(app: &App, cp: &ControlPlane) -> Value {
-    let stores: Vec<Value> = app.db.chat_store_counts().iter().map(|(s, n)| store_view(s, n)).collect();
+    let stores: Vec<Value> = app.db.chat_store_counts().iter().map(|(s, n)| store_view(cp, s, n)).collect();
     json!({ "stores": stores, "keep": cp.chat_stores.keep })
 }
 
 /// The store `region` has, as `summary` shows it. None: it has none.
-pub fn region_view(app: &App, region: &str) -> Option<Value> {
-    app.db.chat_store_counts().iter().find(|(s, _)| s.region == region).map(|(s, n)| store_view(s, n))
+pub fn region_view(app: &App, cp: &ControlPlane, region: &str) -> Option<Value> {
+    app.db.chat_store_counts().iter().find(|(s, _)| s.region == region).map(|(s, n)| store_view(cp, s, n))
 }
 
 /// Warnings for admins: stores whose newest backup is over a day old while they hold
-/// anything, and stores whose backups have held rows that left them for over two checks.
-pub fn warnings(app: &App, at: i64) -> Vec<String> {
+/// anything, stores whose backups have held rows that left them for over two checks, and
+/// stores whose backups' last copy off the host failed (ADR 0246).
+pub fn warnings(app: &App, cp: &ControlPlane, at: i64) -> Vec<String> {
+    let copies = cp.chat_copies.as_deref().map(|c| c.warnings(&app.db.chat_stores())).unwrap_or_default();
     let counts = app.db.chat_store_counts();
     let stale = counts
         .iter()
@@ -496,7 +564,7 @@ pub fn warnings(app: &App, at: i64) -> Vec<String> {
             format!("{}'s chat store's backups may still hold the rows of {bots} that left it; check botd's log for {CLEARED} failures (ADR 0238).", s.region)
         })
     });
-    stale.chain(uncleared).collect()
+    stale.chain(uncleared).chain(copies).collect()
 }
 
 /// What of the Bots `owners` own is in a pin to `region`'s store, in botd's own database,
@@ -517,8 +585,9 @@ fn split(app: &App, region: &str, owners: &[String]) -> (Held, Held, Held) {
 /// `region`: in its store, in botd's own database (in the region only when botd's own data
 /// is, `server_in`), or in another region's store; and the backups of other stores made
 /// before they left them (`earlierCopies`), which hold them until botd clears them out
-/// (ADR 0238).
-pub fn against(app: &App, region: &str, owners: &[String], server_in: bool) -> Value {
+/// (ADR 0238); and the copies of the region's store's backups off the host (`offHost`,
+/// ADR 0246), null when they aren't copied.
+pub fn against(app: &App, cp: &ControlPlane, region: &str, owners: &[String], server_in: bool) -> Value {
     let (store, database, elsewhere) = split(app, region, owners);
     let each = |n: fn(&Held) -> i64| json!({ "inStore": n(&store), "inServerDatabase": n(&database), "elsewhere": n(&elsewhere) });
     let stores = app.db.chat_stores();
@@ -527,8 +596,10 @@ pub fn against(app: &App, region: &str, owners: &[String], server_in: bool) -> V
         .chat_moves_out(owners, region)
         .into_iter()
         .filter_map(|(r, moved_at)| {
-            let n = stores.iter().find(|s| s.region == r).map_or(0, |s| backups(s).iter().filter(|(t, _)| *t <= moved_at).count());
-            (n > 0).then(|| json!({ "region": r, "backups": n, "movedAt": moved_at }))
+            let s = stores.iter().find(|s| s.region == r);
+            let n = s.map_or(0, |s| backups(s).iter().filter(|(t, _)| *t <= moved_at).count());
+            let off = s.is_some_and(|s| cp.chat_copies.as_deref().is_some_and(|c| c.may_hold(s, moved_at)));
+            (n > 0 || off).then(|| json!({ "region": r, "backups": n, "offHost": off, "movedAt": moved_at }))
         })
         .collect();
     let has = stores.iter().find(|s| s.region == region);
@@ -541,6 +612,7 @@ pub fn against(app: &App, region: &str, owners: &[String], server_in: bool) -> V
         "inRegion": elsewhere.total() == 0 && (database.total() == 0 || server_in) && earlier.is_empty(),
         "earlierCopies": earlier,
         "lastBackupAt": last,
+        "offHost": has.and_then(|s| cp.chat_copies.as_deref().and_then(|c| c.report_view(s))),
     })
 }
 
@@ -570,11 +642,17 @@ pub fn report_warnings(chats: &Value, region: &str, at: i64) -> Vec<String> {
         out.push(format!("{region}'s chat store has no backup from the last day (ADR 0215)"));
     }
     for e in chats["earlierCopies"].as_array().into_iter().flatten() {
-        out.push(format!(
-            "{} backups of {}'s chat store were made before their chats, routines or approvals moved out of it and still hold them, until botd clears them out of those backups on its next hourly check (ADR 0215, ADR 0238)",
-            e["backups"],
-            e["region"].as_str().unwrap_or_default(),
-        ));
+        let r = e["region"].as_str().unwrap_or_default();
+        out.push(match (e["backups"].as_i64().unwrap_or(0), e["offHost"] == true) {
+            (0, _) => format!("copies off the host of {r}'s chat store's backups from before their chats, routines or approvals moved out of it may still hold them, until botd clears them out on its next hourly check (ADR 0238, ADR 0246)"),
+            (n, off) => format!(
+                "{n} backups of {r}'s chat store{} were made before their chats, routines or approvals moved out of it and still hold them, until botd clears them out of those backups on its next hourly check (ADR 0215, ADR 0238)",
+                if off { ", and their copies off the host," } else { "" },
+            ),
+        });
+    }
+    if chats["offHost"]["failing"] == true {
+        out.push(format!("{region}'s chat store's backups couldn't all be copied off the host on botd's last check; it tries again each hour (ADR 0246)"));
     }
     out
 }
@@ -831,5 +909,16 @@ mod tests {
         assert_eq!(files_in(&dir), vec![backup.clone()], "the half-made copy is gone");
         assert!(!holds(&dir.join(&backup), word));
         assert!(db.moves_out_to_clear(&db.chat_stores()[0]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reports_warn_of_earlier_copies_off_the_host_once_the_backups_themselves_are_pruned() {
+        let chats = json!({ "earlierCopies": [
+            { "region": "gb-lon", "backups": 2, "offHost": true, "movedAt": 1 },
+            { "region": "nl-ams", "backups": 0, "offHost": true, "movedAt": 1 },
+        ] });
+        let w = report_warnings(&chats, "de-fra-2", 0);
+        assert!(w[0].starts_with("2 backups of gb-lon's chat store, and their copies off the host, were made before"), "{w:?}");
+        assert!(w[1].starts_with("copies off the host of nl-ams's chat store's backups from before their chats") && w[1].contains("ADR 0246"), "{w:?}");
     }
 }
