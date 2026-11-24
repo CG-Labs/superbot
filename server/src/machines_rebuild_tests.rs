@@ -339,7 +339,7 @@ async fn a_refused_rebuild_fails_and_auto_never_wipes_a_machine_that_may_hold_wo
 async fn a_container_made_before_team_networks_is_rebuilt_though_its_agent_upgrades_itself() {
     use crate::machines::team_network::{DEFAULT_SUBNET, Join, Kind, Settings};
     let ovn = |cp: &mut crate::machines::ControlPlane| {
-        cp.team_network = Some(Settings { kind: Kind::Ovn, subnet: DEFAULT_SUBNET.into(), join: Join::NextBoot })
+        cp.team_network = Some(Settings { kind: Kind::Ovn, subnet: DEFAULT_SUBNET.into(), join: Join::NextBoot, remove: Default::default() })
     };
     let mut env = crate::machines_mtls_tests::serve_with_control(|e| e, ovn, |_| {}).await;
     let (uid, mid, token) = machine_for(&env, "ed@example.com").await;

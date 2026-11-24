@@ -793,6 +793,53 @@ async fn a_team_network_is_an_isolated_ovn_network_with_its_own_acl() {
 }
 
 #[tokio::test]
+async fn a_team_network_nothing_uses_goes_with_its_acl_and_its_name_on_the_access_list() {
+    let s = StandIn::start().await;
+    s.w().projects.insert("superbot".into(), json!({ "restricted": "true", "restricted.networks.access": "incusbr0" }));
+    let p = incus(&s).with_team_subnet("10.248.0.0/22").unwrap();
+    let a = p.ensure_team_network("superbot-team-0123456789ab-local", "local", "10.248.0.0/22").await.unwrap();
+    let b = p.ensure_team_network("superbot-team-bbbbbbbbbbbb-local", "local", "10.248.0.0/22").await.unwrap();
+    p.create_firewall("superbot-fw", &[], &[agent_rule()]).await.unwrap();
+    p.create(&CreateSpec { subnet_id: Some(a.subnet_id.clone()), ..spec("superbot-m1", "c1-m2-d20") }).await.unwrap();
+    let access = || s.w().projects["superbot"]["restricted.networks.access"].as_str().unwrap().to_string();
+
+    // A container on it, or a NIC elsewhere behind its ACL: kept, nothing deleted.
+    assert_eq!(p.remove_team_network(&a).await, Ok(false));
+    let svc = json!({ "type": "nic", "network": "incusbr0", "name": "eth2", "security.acls": b.id });
+    s.w().instances.get_mut("superbot-m1").unwrap().body["devices"]["eth2"] = svc;
+    assert_eq!(p.remove_team_network(&b).await, Ok(false), "its ACL is in use");
+    assert_eq!((s.calls("DELETE", "/1.0/networks/").len(), s.calls("DELETE", "/1.0/network-acls/").len()), (0, 0));
+    s.w().instances.get_mut("superbot-m1").unwrap().body["devices"].as_object_mut().unwrap().remove("eth2");
+
+    // Nothing uses it: the ACL, the network, then its name on the list.
+    assert_eq!(p.remove_team_network(&b).await, Ok(true));
+    assert!(!s.w().networks.contains_key(&b.id) && !s.w().acls.contains_key(&b.id));
+    assert_eq!(access(), format!("incusbr0,{}", a.id), "only its own name taken off");
+    let order: Vec<String> = s.w().calls.iter().filter(|c| c.method != "GET").map(|c| format!("{} {}", c.method, c.path)).collect();
+    assert!(order.ends_with(&[format!("DELETE /1.0/network-acls/{}", b.id), format!("DELETE /1.0/networks/{}", b.id), "PUT /1.0/projects/superbot".into()]), "{order:?}");
+    assert_eq!(p.remove_team_network(&b).await, Ok(true), "gone already");
+
+    // Once its member leaves, the other goes too.
+    let members = p.team_network_members(&a.id).await.unwrap();
+    p.leave_team_network(&members[0]).await.unwrap();
+    assert_eq!(p.remove_team_network(&a).await, Ok(true));
+    assert_eq!(access(), "incusbr0");
+
+    // An access list is never left empty, which would let the project use every network.
+    let c = p.ensure_team_network("superbot-team-cccccccccccc-local", "local", "10.248.0.0/22").await.unwrap();
+    s.w().projects.insert("superbot".into(), json!({ "restricted": "true", "restricted.networks.access": c.id }));
+    assert_eq!(p.remove_team_network(&c).await, Ok(true));
+    assert!(!s.w().networks.contains_key(&c.id));
+    assert_eq!(access(), c.id, "left naming the gone network rather than nothing");
+
+    // One botd didn't make is refused.
+    s.w().networks.insert("superbot-team-ffffffffffff-local".into(), json!({ "type": "ovn", "config": { "ipv4.address": "10.248.0.1/22" } }));
+    let e = p.remove_team_network(&TeamNetwork { id: "superbot-team-ffffffffffff-local".into(), ..c.clone() }).await.unwrap_err();
+    assert!(e.to_string().contains("isn't an OVN network botd made for a team"), "{e}");
+    assert!(s.w().networks.contains_key("superbot-team-ffffffffffff-local"));
+}
+
+#[tokio::test]
 async fn a_team_members_backup_imports_onto_a_host_that_never_had_the_teams_network() {
     let a = StandIn::start().await;
     let pa = incus(&a).with_team_subnet("10.248.0.0/22").unwrap();

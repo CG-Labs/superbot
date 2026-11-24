@@ -249,6 +249,9 @@ pub struct ControlPlane {
     /// adds only while they are off (ADR 0226), and when: powered on again once given it
     /// or refused it, never left off by the sweep.
     network_join_off: std::sync::Mutex<std::collections::HashMap<String, i64>>,
+    /// Why each deleted team's network was last kept or failed to go (ADR 0236),
+    /// audited once.
+    network_remove_noted: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// One change at a time, from handlers and the reconciler alike, so two can't
     /// race on one machine. Changes are rare and admin-driven; this is cheap.
     ops: tokio::sync::Mutex<()>,
@@ -285,6 +288,7 @@ impl Default for ControlPlane {
             network_joining: Default::default(),
             network_join_refused: Default::default(),
             network_join_off: Default::default(),
+            network_remove_noted: Default::default(),
             ops: tokio::sync::Mutex::new(()),
             provider_seen: Default::default(),
         }

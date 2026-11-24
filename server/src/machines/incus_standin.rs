@@ -406,6 +406,15 @@ impl World {
             .collect()
     }
 
+    /// Instances in any project with a NIC on network `net`, as its `used_by` lists them.
+    fn on_network(&self, net: &str) -> Vec<String> {
+        self.instances
+            .iter()
+            .filter(|(_, i)| i.body["devices"].as_object().is_some_and(|d| d.values().any(|dev| dev["type"] == "nic" && dev["network"] == net)))
+            .map(|(n, i)| instance_url(n, &i.project))
+            .collect()
+    }
+
     fn instance_json(&self, n: &str, i: &Instance, state: bool) -> Value {
         let mut v = i.body.clone();
         v["name"] = json!(n);
@@ -677,7 +686,18 @@ fn respond(world: &Mutex<World>, peer: pki::Peer, method: Method, uri: Uri, head
         ("GET", ["1.0", "networks", n]) if w.networks.contains_key(*n) => {
             let mut v = w.networks[*n].clone();
             v["name"] = json!(n);
+            v["used_by"] = json!(w.on_network(n));
             sync(v)
+        }
+        ("DELETE", ["1.0", "networks", n]) => {
+            if !w.networks.contains_key(*n) {
+                return err(404, "Network not found");
+            }
+            if !w.on_network(n).is_empty() {
+                return err(400, "The network is currently in use");
+            }
+            w.networks.remove(*n);
+            sync(json!({}))
         }
         ("GET", ["1.0", "resources"]) => sync(w.resources.clone()),
         ("GET", ["1.0", "storage-pools", "default", "resources"]) if !w.pool_resources.is_null() => sync(w.pool_resources.clone()),
