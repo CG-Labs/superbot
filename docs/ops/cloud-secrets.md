@@ -229,6 +229,44 @@ AWS_RUN_CREDENTIALS="arn:aws:iam::<account>:role/superbot-bots"
 - **Redaction**: the keys are redacted from everything botd saves and shows until the session expires.
 - **Order**: these win over static secrets of the same name, and runs never inherit these names from botd's own environment.
 
+### Narrowing each run's session
+
+Off by default ([ADR 0230](../adr/0230-session-policies-and-tags-for-each-run.md)). An entry can narrow each run's session below what its role allows, so one role can serve every Bot and user without a role per owner. Add any of these after the role's ARN, among its `NAME=field` pairs:
+
+- **`policy=<file>`**: an inline session policy, a JSON IAM policy in a file botd can read (no spaces in the path). The session gets only what both the role and this policy allow. `{owner}` and `{bot}` in its strings are the run's owner id and Bot id. botd reads it once at startup, and won't start if it isn't JSON with a `Statement`, is over STS's 2048 characters with spaces taken out, or has characters past U+00FF. Restart botd after editing it.
+- **`policy-arn=<arn>`**: a managed policy, used the same way (up to 10, in the role's partition; `{owner}` allowed in its name). Use these when the inline policy gets too long.
+- **`tags=bot`, `tags=owner` or `tags=bot,owner`**: session tags `superbot-bot=<bot id>` and `superbot-owner=<owner id>`, so the role's own policies can match on `aws:PrincipalTag/superbot-owner`. They are transitive: a session the run chains from this one keeps them and can't set its own under those keys. Tags need `sts:TagSession` as well as `sts:AssumeRole`, in botd's policy and in the role's trust policy.
+
+```sh
+AWS_RUN_CREDENTIALS="arn:aws:iam::<account>:role/superbot-users policy=/etc/superbot/run-policy.json tags=bot,owner"
+```
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{ "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": "arn:aws:s3:::<bucket>/users/{owner}/*" }]
+}
+```
+
+The trust policy for tags:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{ "Effect": "Allow", "Principal": { "AWS": "arn:aws:iam::<account>:role/botd" }, "Action": ["sts:AssumeRole", "sts:TagSession"] }]
+}
+```
+
+And a role policy that limits each user's runs to their own folder by tag, with no session policy at all:
+
+```json
+{ "Effect": "Allow", "Action": "s3:*", "Resource": "arn:aws:s3:::<bucket>/users/${aws:PrincipalTag/superbot-owner}/*" }
+```
+
+- **The owner's runs only**: an entry whose policy, managed policy or tags name the owner (`{owner}`, `tags=owner`) is used only for runs that get the owner's own secrets, like a role with `{owner}`. A teammate's run of an isolated shared Bot gets no session from it.
+- **Fails closed**: if a run's policy is over 2048 characters once its ids are in, or a Bot's id isn't letters, digits, `-` and `_`, the run is refused (`secrets_unavailable`) before STS is asked. If STS refuses, the error names the likely cause: `sts:TagSession` for `AccessDenied` with tags, the policies for `MalformedPolicyDocument`, and their size for `PackedPolicyTooLarge` (STS packs the policies and tags together, so use `policy-arn=` or fewer tags).
+- **Audit**: `secret.lease_issued` adds `policySha256` (the SHA-256 of the policy as sent: compact, keys sorted, the run's ids in, as `jq -jcS . <file>` prints it once you put them in), `policyArns` and `tags`. Never the policy file's path or a key.
+
 ## Short-lived GCP credentials for each run
 
 Off by default ([ADR 0203](../adr/0203-gcp-service-account-tokens-for-each-run.md)); only with `SECRETS_BACKEND=gcp-secret-manager`. With `GCP_RUN_CREDENTIALS`, botd impersonates a service account as each run starts (IAM Credentials' `generateAccessToken`) and gives the run that account's access token. No service account key is made or stored, and a token a Bot leaks stops working soon after its run. No Vault is needed; for Vault's GCP engine, see [Vault](vault.md#short-lived-credentials-for-each-run).

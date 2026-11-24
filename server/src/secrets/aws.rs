@@ -12,11 +12,12 @@
 //!
 //! It is also the `leases::Issuer` of `AWS_RUN_CREDENTIALS` (ADR 0194): an STS
 //! `AssumeRole` session for each run, signed with the same keys, named after the Bot so
-//! CloudTrail shows whose run did what, and lasting as long as the longest run.
+//! CloudTrail shows whose run did what, and lasting as long as the longest run. An entry
+//! may narrow it with a session policy and transitive tags with the run's ids (ADR 0230).
 
 use super::external::{Provider, Scope};
 use super::http::{self, Worker};
-use super::leases::{Field, Issuer, Lease};
+use super::leases::{Field, Issuer, Lease, Narrowed};
 use super::{redact, Error, SecretStore};
 use crate::sigv4;
 use base64::engine::general_purpose::STANDARD;
@@ -591,21 +592,35 @@ impl Inner {
     }
 
     /// A new STS session as `role_arn` for one run of `bot_id` (ADR 0194), lasting
-    /// `run_for` (at least STS's 15 minutes), signed with botd's own keys. When STS says
-    /// those have lapsed, gets new ones and asks once more.
-    async fn assume_role(&self, role_arn: &str, fields: &[String], run_for: Duration, bot_id: &str) -> Result<Lease, Error> {
+    /// `run_for` (at least STS's 15 minutes), signed with botd's own keys, and narrowed
+    /// by a session policy and tags if the entry says so (ADR 0230). When STS says
+    /// those keys have lapsed, gets new ones and asks once more.
+    async fn assume_role(&self, role_arn: &str, fields: &[String], run_for: Duration, bot_id: &str, narrowed: &Narrowed) -> Result<Lease, Error> {
         let secs = run_for.as_secs().max(MIN_SESSION);
         if secs > MAX_SESSION {
             return Err(Error::Unavailable(format!("AWS STS: a run may last {secs} s (RUN_TIMEOUT_MINUTES), longer than STS's longest session ({MAX_SESSION} s), so AWS_RUN_CREDENTIALS can't cover it")));
         }
         let what = format!("AssumeRole {role_arn}");
-        let body = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("Action", "AssumeRole")
-            .append_pair("Version", "2011-06-15")
-            .append_pair("RoleArn", role_arn)
-            .append_pair("RoleSessionName", &session_name(bot_id))
-            .append_pair("DurationSeconds", &secs.to_string())
-            .finish();
+        let body = {
+            let mut form = url::form_urlencoded::Serializer::new(String::new());
+            form.append_pair("Action", "AssumeRole")
+                .append_pair("Version", "2011-06-15")
+                .append_pair("RoleArn", role_arn)
+                .append_pair("RoleSessionName", &session_name(bot_id))
+                .append_pair("DurationSeconds", &secs.to_string());
+            if let Some(p) = &narrowed.policy {
+                form.append_pair("Policy", p);
+            }
+            for (i, arn) in narrowed.policy_arns.iter().enumerate() {
+                form.append_pair(&format!("PolicyArns.member.{}.arn", i + 1), arn);
+            }
+            // Transitive, so a session the run chains from this one keeps them and can't
+            // set its own under the same keys.
+            for (i, (k, v)) in narrowed.tags.iter().enumerate() {
+                form.append_pair(&format!("Tags.member.{}.Key", i + 1), k).append_pair(&format!("Tags.member.{}.Value", i + 1), v).append_pair(&format!("TransitiveTagKeys.member.{}", i + 1), k);
+            }
+            form.finish()
+        };
         let payload = sigv4::sha256_hex(body.as_bytes());
         for fresh in [false, true] {
             let keys = self.keys(fresh).await?;
@@ -629,8 +644,11 @@ impl Inner {
                 continue;
             }
             let hint = match code.as_str() {
+                "AccessDenied" if !narrowed.tags.is_empty() => "; botd's identity needs sts:AssumeRole and sts:TagSession on the role, and the role's trust policy must allow both",
                 "AccessDenied" => "; botd's identity needs sts:AssumeRole on the role, and the role's trust policy must allow it",
                 "ValidationError" => "; is a run (RUN_TIMEOUT_MINUTES) longer than the role's maximum session duration, or than an hour when botd's own identity is a role?",
+                "MalformedPolicyDocument" => "; IAM won't take the session policy (policy=) or a managed one (policy-arn=)",
+                "PackedPolicyTooLarge" => "; the session policy and tags are too large once STS packs them: shorten the policy, or move statements to a managed policy (policy-arn=)",
                 _ => "",
             };
             return Err(Error::Unavailable(format!("AWS STS answered {status}{} for {what}{hint}", http::code_suffix(&code))));
@@ -762,8 +780,12 @@ impl Issuer for SecretsManager {
     }
 
     fn issue(&self, role_arn: &str, fields: &[String], run_for: Duration, bot_id: &str) -> Result<Lease, Error> {
-        let (inner, role_arn, fields, bot_id) = (Arc::clone(&self.inner), role_arn.to_string(), fields.to_vec(), bot_id.to_string());
-        self.worker.run(async move { inner.assume_role(&role_arn, &fields, run_for, &bot_id).await })
+        self.issue_narrowed(role_arn, fields, run_for, bot_id, &Narrowed::default())
+    }
+
+    fn issue_narrowed(&self, role_arn: &str, fields: &[String], run_for: Duration, bot_id: &str, narrowed: &Narrowed) -> Result<Lease, Error> {
+        let (inner, role_arn, fields, bot_id, narrowed) = (Arc::clone(&self.inner), role_arn.to_string(), fields.to_vec(), bot_id.to_string(), narrowed.clone());
+        self.worker.run(async move { inner.assume_role(&role_arn, &fields, run_for, &bot_id, &narrowed).await })
     }
 
     fn revoke(&self, _lease_id: &str) -> Result<(), Error> {
@@ -1002,8 +1024,15 @@ mod tests {
         let get = |k: &str| form.get(k).cloned().unwrap_or_default();
         let (arn, session) = (get("RoleArn"), get("RoleSessionName"));
         let secs: i64 = get("DurationSeconds").parse().unwrap_or(3600);
-        if arn.ends_with("/denied") {
+        let tagged = form.contains_key("Tags.member.1.Key");
+        if arn.ends_with("/denied") || (arn.ends_with("/no-tag-session") && tagged) {
             return sts_error(StatusCode::FORBIDDEN, "AccessDenied");
+        }
+        if arn.ends_with("/malformed") && form.contains_key("Policy") {
+            return sts_error(StatusCode::BAD_REQUEST, "MalformedPolicyDocument");
+        }
+        if arn.ends_with("/packed") && tagged {
+            return sts_error(StatusCode::BAD_REQUEST, "PackedPolicyTooLarge");
         }
         if arn.ends_with("/one-hour") && secs > 3600 {
             return sts_error(StatusCode::BAD_REQUEST, "ValidationError");
@@ -1458,6 +1487,51 @@ mod tests {
         rc.issue("uaws8", "baws8", true, RUN).unwrap();
         assert!(f.sign_ins.load(Ordering::SeqCst) > before);
         assert_ne!(f.assumed.lock().unwrap().last().unwrap().0, signer);
+    }
+
+    #[test]
+    fn sessions_are_narrowed_by_a_session_policy_and_transitive_tags() {
+        let (url, sts_url, f) = stand_in();
+        let policy = super::super::leases::tests::policy_file(
+            "aws-session-policy",
+            r#"{ "Version": "2012-10-17", "Statement": [{ "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": "arn:aws:s3:::acme-data/users/{owner}/bots/{bot}/*" }] }"#,
+        );
+        let roles = format!(
+            "arn:aws:iam::123456789012:role/superbot-users policy={policy} policy-arn=arn:aws:iam::aws:policy/ReadOnlyAccess policy-arn=arn:aws:iam::123456789012:policy/u-{{owner}} tags=bot,owner;\
+             arn:aws:iam::123456789012:role/superbot-plain PLAIN_KEY_ID=AccessKeyId PLAIN_SECRET=SecretAccessKey PLAIN_TOKEN=SessionToken"
+        );
+        let rc = run_credentials(&url, &sts_url, &roles);
+        let (e, _l) = rc.issue("uaws9", "baws9", true, RUN).unwrap();
+        assert_eq!(values(&e).len(), 6);
+        let assumed = f.assumed.lock().unwrap().clone();
+        let form = |i: usize, k: &str| assumed[i].1.get(k).cloned();
+        let sent: Value = serde_json::from_str(&form(0, "Policy").unwrap()).unwrap();
+        assert_eq!(sent["Statement"][0]["Resource"], "arn:aws:s3:::acme-data/users/uaws9/bots/baws9/*", "signed and checked by the stand-in, with this run's ids");
+        assert_eq!(sent["Statement"][0]["Action"], json!(["s3:GetObject", "s3:PutObject"]));
+        assert_eq!(form(0, "PolicyArns.member.1.arn").as_deref(), Some("arn:aws:iam::aws:policy/ReadOnlyAccess"));
+        assert_eq!(form(0, "PolicyArns.member.2.arn").as_deref(), Some("arn:aws:iam::123456789012:policy/u-uaws9"));
+        assert_eq!((form(0, "Tags.member.1.Key").as_deref(), form(0, "Tags.member.1.Value").as_deref()), (Some("superbot-bot"), Some("baws9")));
+        assert_eq!((form(0, "Tags.member.2.Key").as_deref(), form(0, "Tags.member.2.Value").as_deref()), (Some("superbot-owner"), Some("uaws9")));
+        assert_eq!((form(0, "TransitiveTagKeys.member.1").as_deref(), form(0, "TransitiveTagKeys.member.2").as_deref()), (Some("superbot-bot"), Some("superbot-owner")), "so a chained session keeps them");
+        assert!(assumed[1].1.keys().all(|k| !k.starts_with("Policy") && !k.starts_with("Tags") && !k.starts_with("TransitiveTagKeys")), "an entry with no options is as before: {:?}", assumed[1].1);
+
+        // A run for someone else gets no session the owner's tags or policy would scope.
+        let before = f.assumed.lock().unwrap().len();
+        let (e, _l) = rc.issue("uaws9", "baws9", false, RUN).unwrap();
+        assert_eq!(values(&e).len(), 3);
+        assert_eq!(f.assumed.lock().unwrap().len(), before + 1);
+        assert!(f.assumed.lock().unwrap().last().unwrap().1["RoleArn"].ends_with("/superbot-plain"));
+
+        let role = |name: &str, opts: &str| format!("arn:aws:iam::123456789012:role/{name} {opts}");
+        for (raw, err) in [
+            (role("no-tag-session", "tags=bot"), "(AccessDenied) for AssumeRole arn:aws:iam::123456789012:role/no-tag-session; botd's identity needs sts:AssumeRole and sts:TagSession on the role"),
+            (role("malformed", &format!("policy={policy}")), "(MalformedPolicyDocument) for AssumeRole arn:aws:iam::123456789012:role/malformed; IAM won't take the session policy"),
+            (role("packed", "tags=bot,owner"), "(PackedPolicyTooLarge) for AssumeRole arn:aws:iam::123456789012:role/packed; the session policy and tags are too large"),
+        ] {
+            let e = run_credentials(&url, &sts_url, &raw).issue("uaws9", "baws9", true, RUN).err().unwrap().to_string();
+            assert!(e.contains(err) && !e.contains("quoting") && !e.contains("acme-data"), "{raw}: {e}");
+        }
+        assert!(run_credentials(&url, &sts_url, &role("no-tag-session", "")).issue("uaws9", "baws9", true, RUN).is_ok(), "the same role, untagged");
     }
 
     #[test]

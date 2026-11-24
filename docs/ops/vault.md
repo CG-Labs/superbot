@@ -202,6 +202,7 @@ VAULT_RUN_CREDENTIALS="aws/creds/bots AWS_ACCESS_KEY_ID=access_key AWS_SECRET_AC
 - **Model provider keys**: a plan's provider key (`keySecret` in the tiers file) can come from a lease alone. If the lease gives it empty, the run is refused as above.
 - **Audit**: `botctl audit --action 'secret.lease_*'` shows each lease made (`secret.lease_issued`, with path, lease id, TTL and the variable names), renewed (`secret.lease_renewed`) and revoked (`secret.lease_revoked`), never a value. For a lease botd couldn't revoke, `vault lease revoke <lease id>` ends it now.
 - **Redaction**: the values are redacted from everything botd saves and shows while a lease that has them lives, and forgotten once Vault has revoked the last one (unless botd knew the value already).
+- **Narrowing**: `policy=`, `policy-arn=` and `tags=` narrow each run's session only for [AWS STS without Vault](cloud-secrets.md#narrowing-each-runs-session), and botd won't start with them here. With Vault's AWS engine, narrow on the Vault role (`policy_document`, `policy_arns`, and `session_tags` for `assumed_role`), with a role per owner through `{owner}` if each user needs their own.
 
 botd doesn't make a lease at startup, so a wrong path or missing policy shows on the first run. The startup line and `botctl secrets backend` list the paths (`runCredentials`). Only `SECRETS_BACKEND=vault` reads the setting.
 
