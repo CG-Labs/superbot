@@ -775,7 +775,7 @@ async fn a_team_network_is_an_isolated_ovn_network_with_its_own_acl() {
     p.create(&CreateSpec { subnet_id: Some(n.subnet_id.clone()), ..spec("superbot-m1", "c1-m2-d20") }).await.unwrap();
     p.create(&spec("superbot-m2", "c1-m2-d20")).await.unwrap();
     let members = p.team_network_members(&n.id).await.unwrap();
-    assert_eq!(members, [NetworkMember { machine: "superbot-m1".into(), config: String::new(), interface: "eth1".into(), active: true }]);
+    assert_eq!(members, [NetworkMember { machine: "superbot-m1".into(), config: String::new(), interface: "eth1".into(), active: true, needs_power_off: false }]);
     let e = p.leave_team_network(&NetworkMember { interface: "eth0".into(), ..members[0].clone() }).await.unwrap_err();
     assert!(e.to_string().contains("eth0 is the machine's own NIC"), "{e}");
     p.leave_team_network(&members[0]).await.unwrap();

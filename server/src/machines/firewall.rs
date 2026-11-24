@@ -318,6 +318,9 @@ pub async fn sync(app: &App, fw: &Firewall, p: &dyn MachineProvider) -> usize {
         }
     };
     let mut covers: HashMap<String, Option<Vec<String>>> = HashMap::new();
+    // Machines partly behind an older firewall, each interface with its own (ADR 0226):
+    // the rest go behind that one, since Linode won't put an interface behind two.
+    let mut partly: HashMap<String, Vec<String>> = HashMap::new();
     match p.firewall_devices(&id).await {
         Ok(c) => covers.insert(id.clone(), Some(c.machines)),
         Err(e) => {
@@ -334,11 +337,12 @@ pub async fn sync(app: &App, fw: &Firewall, p: &dyn MachineProvider) -> usize {
         let found = async {
             let f = p.get_firewall(&old).await?;
             repair(app, fw, p, &Who::system(SYSTEM), &f).await?;
-            Ok(p.firewall_devices(&old).await?.machines)
+            p.firewall_devices(&old).await
         };
         match found.await {
             Ok(c) => {
-                covers.insert(old, Some(c));
+                partly.insert(old.clone(), c.partly);
+                covers.insert(old, Some(c.machines));
             }
             // Gone: its machines join the current one.
             Err(ProviderError::NotFound) => {}
@@ -358,6 +362,7 @@ pub async fn sync(app: &App, fw: &Firewall, p: &dyn MachineProvider) -> usize {
                 .is_some_and(|c| c.iter().any(|c| c == pid))
         };
         let saved = m.firewall_id.as_deref().filter(|f| *f != id);
+        let mut tried = id.as_str();
         // Where it is behind, and whether we just put it there.
         let res = if behind(&id) {
             Ok((id.clone(), false))
@@ -370,6 +375,11 @@ pub async fn sync(app: &App, fw: &Firewall, p: &dyn MachineProvider) -> usize {
         {
             // Couldn't read it this pass; attaching would fail if it's still there.
             continue;
+        } else if let Some(old) = saved
+            && partly.get(old).is_some_and(|c| c.iter().any(|c| c == pid))
+        {
+            tried = old;
+            p.attach_firewall(old, pid).await.map(|()| (old.to_string(), true))
         } else {
             p.attach_firewall(&id, pid).await.map(|()| (id.clone(), true))
         };
@@ -385,7 +395,7 @@ pub async fn sync(app: &App, fw: &Firewall, p: &dyn MachineProvider) -> usize {
                         &system(&m),
                         "machine.firewall_attached",
                         &m,
-                        json!({ "firewallId": id, "providerId": pid }),
+                        json!({ "firewallId": home, "providerId": pid }),
                     ));
                 }
             }
@@ -393,7 +403,7 @@ pub async fn sync(app: &App, fw: &Firewall, p: &dyn MachineProvider) -> usize {
                 let msg = e.to_string();
                 let before = fw.failed.lock().unwrap().insert(m.id.clone(), msg.clone());
                 if before.as_deref() != Some(msg.as_str()) {
-                    failed(app, &system(&m), &m, &id, "attach", &e);
+                    failed(app, &system(&m), &m, tried, "attach", &e);
                 }
             }
         }
@@ -425,7 +435,7 @@ pub async fn release(app: &App, p: &dyn MachineProvider, m: &Machine, by: &Who) 
         return;
     }
     match p.firewall_devices(fw).await {
-        Ok(left) if left.machines.is_empty() && left.others == 0 => {}
+        Ok(left) if left.machines.is_empty() && left.partly.is_empty() && left.others == 0 => {}
         // It covers devices this control plane doesn't know; leave it be.
         Ok(_) | Err(ProviderError::NotFound) => return,
         Err(e) => return failed(app, by, m, fw, "delete", &e),

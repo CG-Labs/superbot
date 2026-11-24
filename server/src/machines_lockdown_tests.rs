@@ -288,6 +288,32 @@ async fn an_older_firewall_is_kept_right_until_its_machines_go() {
     assert_eq!(left, [new.id], "the older one goes with its last machine");
 }
 
+/// A machine with Linode interfaces only some of which are behind its older firewall
+/// gets the rest put behind that one (ADR 0226): Linode won't put an interface behind
+/// a second firewall, so attaching the current one would fail every pass.
+#[tokio::test]
+async fn a_machine_partly_behind_an_older_firewall_is_covered_by_that_one() {
+    let env = serve(on(), None).await;
+    let (_, _, a) = request(&env, "ada@example.com").await;
+    let pa = machine(&env, &a).provider_id.unwrap();
+    let old = env.fake.firewalls()[0].id.clone();
+    env.fake.set_firewall(&old, |f| {
+        f.label = "oldprefix-fw".into();
+        f.machines.remove(&pa);
+        f.partly.insert(pa.clone());
+    });
+
+    reconcile(&env).await;
+    let o = env.fake.firewalls().into_iter().find(|f| f.id == old).unwrap();
+    assert!(o.machines.contains(&pa) && o.partly.is_empty(), "{o:?}");
+    let new = env.fake.firewalls().into_iter().find(|f| f.label == "superbot-fw").unwrap();
+    assert!(new.machines.is_empty() && new.partly.is_empty(), "{new:?}");
+    assert_eq!(machine(&env, &a).firewall_id.as_deref(), Some(old.as_str()));
+    assert!(events(&env, "machine.firewall_failed").await.is_empty());
+    let attached = events(&env, "machine.firewall_attached").await;
+    assert_eq!((attached.len(), attached[0]["details"]["firewallId"].as_str()), (1, Some(old.as_str())), "{attached:?}");
+}
+
 #[tokio::test]
 async fn no_firewall_no_machine() {
     let env = serve(on(), None).await;
