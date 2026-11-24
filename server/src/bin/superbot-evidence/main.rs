@@ -11,8 +11,8 @@
 //! an observation period each kind of bundle, checklist row and criterion has none for.
 //! `register` (ADR 0204): checks the security owner's private policy register (role
 //! holders, policy approvals, acknowledgements and training, risks, management reviews,
-//! vendors, exceptions, conduct concerns) against the policies' cadences, as a bundle
-//! naming people by id.
+//! vendors, exceptions, conduct concerns, security incidents and tabletop exercises)
+//! against the policies' cadences, as a bundle naming people by id.
 //!
 //! Reads GitHub only, with a token from `GITHUB_TOKEN` (or `GH_TOKEN`), never from the
 //! command line. Run by the `change-evidence` workflow each month, or by an operator.
@@ -92,8 +92,11 @@ most, judged as of its end) of what it shows: each role's holder and deputy ever
 role its header names, within a year, and with --policies, of the text in force),
 everyone's acknowledgements and training, the open risks and their reviews, a management
 review each quarter, vendors assessed before use and reviewed yearly, exceptions
-approved, ended within a year and reviewed quarterly, and conduct concerns triaged within
-7 days and closed within 90 (ADR 0214); with each --baseline (botctl
+approved, ended within a year and reviewed quarterly, conduct concerns triaged within
+7 days and closed within 90 (ADR 0214), and security events triaged in time by the
+security owner or operator, breach notices sent within the DPA's hours, post-incident
+reviews within 10 business days of closing, their actions done on time and a tabletop
+exercise each year (ADR 0223); with each --baseline (botctl
 evidence baseline json, or the month's evidence bundle's baseline.json, checked in the
 period or the 7 days after it), every setting the server excepted held to an exception in
 force. Refuses a register that
