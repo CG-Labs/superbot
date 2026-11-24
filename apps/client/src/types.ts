@@ -236,6 +236,23 @@ export interface BotAccessView {
   visibility: Visibility;
   access: BotAccess;
   grants?: { user: { id: string; name: string | null; email: string | null }; level: "viewer" | "operator" }[];
+  /**
+   * The owner's service accounts that could keep it (ADR 0229), only for its owner and
+   * admins, and never on a primary Bot. Servers from before leave it out.
+   */
+  keepers?: BotKeeper[];
+  maxKeptBots?: number;
+}
+
+/** One of a Bot owner's service accounts, as a keeper for the Bot (ADR 0229). */
+export interface BotKeeper {
+  id: string;
+  name: string;
+  role: RoleBase;
+  status: "active" | "disabled";
+  keptBots: number;
+  /** It keeps as many Bots as one may, so it can't take this one. */
+  full: boolean;
 }
 
 export type PolicyMode = "ask" | "bypass";
@@ -578,6 +595,13 @@ export interface ServiceAccount {
   updatedAt: number;
   /** Only from `GET /api/service-accounts/{id}`, newest first. */
   tokenList?: ServiceToken[];
+  /** Only from `GET /api/service-accounts/{id}`: every Bot it keeps (ADR 0222, 0229). */
+  keptBotList?: { id: string; name: string; visibility: Visibility }[];
+  /**
+   * Only from `GET /api/service-accounts/{id}`: the owner's Bots you may hand it (ADR 0229).
+   * `keptBy` is another of the owner's accounts keeping one now; handing it over moves it.
+   */
+  keepable?: { id: string; name: string; visibility: Visibility; keptBy: { id: string; name: string } | null }[];
 }
 
 /** A service account's API token, never its secret. */

@@ -10,6 +10,7 @@ How customers get help with SuperBot, how fast, and how the Provider runs suppor
 | [Severity and response targets](severity.md) | Severity 1 to 4, with examples, and response and update targets per plan |
 | [Escalation](escalation.md) | Who a ticket goes to next, when, and how a customer escalates |
 | [Onboarding and success](onboarding.md) | Getting a new customer live: SSO and SCIM, isolation, backups and residency checklists, then the success cadence |
+| [Onboarding check](onboarding-check.md) | `botctl onboarding`: each onboarding checklist item judged from botd's records: done, open with its guide, or for a person to confirm; and whether the customer is ready to go live |
 | [Support bundle](support-bundle.md) | `botctl support-bundle`: what it collects, what it never collects, and how to send it |
 | [Bundle triage](triage.md) | `botctl support-triage`: the first read of a customer's bundle, offline: what it shows, the severity that suggests, the runbook for each problem, and what to ask next |
 | [Support check and the offline bundle](support-check.md) | `botd support check` and `botd support bundle`: diagnostics and a bundle without botd, for a server that won't start, before an upgrade and after a restore |
@@ -60,6 +61,7 @@ Check `<status-page-url>` (the server's `/status`) first: a known incident there
 - Name a TAM and a backup for each Enterprise customer before its kickoff ([TAM programme](tam.md)), and keep each TAM's accounts few enough to hold the [cadence](tam.md#cadence).
 - Staff an on-call rota before selling Severity 1 response outside business hours. Response targets are a promise only once the rota exists.
 - Check all three with `botctl support-readiness` before selling a plan and each month ([support readiness](readiness.md#when-to-run-it)): the contacts filled in, the rota without gaps, and the TAM list.
+- Check each new customer's server with `botctl onboarding` ([onboarding check](onboarding-check.md#where-it-fits)) at kickoff, weekly until go-live, and before confirming go-live: nothing open, and every item to confirm confirmed.
 - Triage each bundle a ticket brings with `botctl support-triage` ([bundle triage](triage.md#where-it-fits)) before the first response, and paste it into the ticket's internal note.
 - Run the [support report](support-report.md#each-month) each month, and look into every missed response target.
 - Draft each Severity 1's review with `botctl incident review` ([incident reviews](incident-review.md#finishing-the-review)), and look into every missed status page target it flags.

@@ -54,6 +54,26 @@ pub enum KeptBotRefusal {
     Account,
 }
 
+/// Why an existing Bot wasn't handed to a service account to keep (ADR 0229).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeepRefusal {
+    /// The Bot is gone, or no longer the owner's.
+    Bot,
+    /// The account was deleted, or isn't a service account of the Bot's owner.
+    Account,
+    /// The account keeps as many Bots as one may.
+    Limit,
+}
+
+/// What handing a Bot to a service account changed (ADR 0229).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Handed {
+    /// The account that kept it before, which may be the same one.
+    pub from: Option<String>,
+    /// The account's grant on the Bot, taken away: keeping it gives more.
+    pub grant: Option<Grant>,
+}
+
 /// One user's grant on one Bot (ADR 0017).
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -4851,6 +4871,51 @@ impl Db {
     /// The ids of the Bots service account `account` keeps (ADR 0222), oldest first.
     pub fn kept_bots(&self, account: &str) -> Vec<String> {
         kept_in(&self.c(), account).unwrap_or_default()
+    }
+
+    /// Hands `bot`, while `owner` owns it, to their live service account `account` to keep
+    /// (ADR 0229), and takes away the account's grant on it, in one transaction. The owner,
+    /// the account and its `max_kept` are checked in the same statement as the change, so a
+    /// request racing another, a new owner or a deleted account can't overshoot or link a
+    /// stranger's account.
+    pub fn keep_bot(&self, bot: &str, owner: &str, account: &str, max_kept: u32) -> Result<Handed, KeepRefusal> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(|_| KeepRefusal::Bot)?;
+        let res = (|| {
+            let Some(from) = tx.query_row("SELECT service_account_id FROM bots WHERE id = ?1 AND owner_id = ?2", [bot, owner], |r| r.get::<_, Option<String>>(0)).optional()? else {
+                return Ok(Err(KeepRefusal::Bot));
+            };
+            if from.as_deref() == Some(account) {
+                return Ok(Ok(Handed { from, grant: None }));
+            }
+            let n = tx.execute(
+                "UPDATE bots SET service_account_id = ?3 WHERE id = ?1 AND owner_id = ?2
+                   AND EXISTS (SELECT 1 FROM service_accounts WHERE user_id = ?3 AND owner_id = ?2 AND deleted_at IS NULL)
+                   AND (SELECT COUNT(*) FROM bots WHERE service_account_id = ?3 AND id <> ?1) < ?4",
+                params![bot, owner, account, max_kept],
+            )?;
+            if n == 0 {
+                let live: bool = tx.query_row("SELECT EXISTS (SELECT 1 FROM service_accounts WHERE user_id = ?1 AND owner_id = ?2 AND deleted_at IS NULL)", [account, owner], |r| r.get(0))?;
+                return Ok(Err(if live { KeepRefusal::Limit } else { KeepRefusal::Account }));
+            }
+            let grant = tx
+                .query_row("SELECT * FROM bot_grants WHERE bot_id = ?1 AND user_id = ?2", [bot, account], grant_row)
+                .optional()?
+                .map(|g| g.level);
+            tx.execute("DELETE FROM bot_grants WHERE bot_id = ?1 AND user_id = ?2", [bot, account])?;
+            Ok::<_, rusqlite::Error>(Ok(Handed { from, grant }))
+        })();
+        match res {
+            Ok(Ok(h)) => tx.commit().map(|_| h).map_err(|_| KeepRefusal::Bot),
+            Ok(Err(why)) => Err(why),
+            Err(_) => Err(KeepRefusal::Bot),
+        }
+    }
+
+    /// Stops `account` keeping `bot` (ADR 0229); the Bot stays its owner's. False when it
+    /// didn't keep it (any more).
+    pub fn release_kept_bot(&self, bot: &str, account: &str) -> bool {
+        self.c().execute("UPDATE bots SET service_account_id = NULL WHERE id = ?1 AND service_account_id = ?2", [bot, account]).unwrap() > 0
     }
 
     // Bot ACLs (ADR 0017)
@@ -11812,6 +11877,44 @@ mod tests {
         assert_eq!(db.delete_service_account(&sa.user.id, None), None);
         assert!(db.service_token(&rotated.id).unwrap().revoked_at.is_some());
         assert!(!db.user(&sa.user.id).unwrap().active());
+    }
+
+    #[test]
+    fn an_existing_bot_is_handed_only_to_a_live_service_account_of_its_owner_within_its_limit() {
+        let db = Db::open(&temp_path("keep-bot").join("app.sqlite")).unwrap();
+        let ana = db.create_user(None, Some("ana@example.com"), "Ana", Role::Member).unwrap();
+        let bea = db.create_user(None, Some("bea@example.com"), "Bea", Role::Member).unwrap();
+        let ci = db.create_service_account("CI", "", Role::Member, None, None, &ana.id, None).unwrap().user.id;
+        let nightly = db.create_service_account("Nightly", "", Role::Member, None, None, &ana.id, None).unwrap().user.id;
+        let beas = db.create_service_account("Bea's CI", "", Role::Member, None, None, &bea.id, None).unwrap().user.id;
+        let bot = |name: &str, owner: &str| db.create_bot_owned(name, "#fff", "waddle", "claude", None, false, owner, Visibility::Shared).id;
+        let (ledger, notes, other) = (bot("Ledger", &ana.id), bot("Notes", &ana.id), bot("Bea's", &bea.id));
+
+        // Its grant goes in the same transaction: keeping it gives more.
+        db.set_grant(&ledger, &ci, Grant::Operator, &ana.id);
+        assert_eq!(db.keep_bot(&ledger, &ana.id, &ci, 1), Ok(Handed { from: None, grant: Some(Grant::Operator) }));
+        assert_eq!((db.bot(&ledger).unwrap().service_account_id.as_deref(), db.grant(&ledger, &ci)), (Some(ci.as_str()), None));
+        assert_eq!(db.keep_bot(&ledger, &ana.id, &ci, 1), Ok(Handed { from: Some(ci.clone()), grant: None }), "again changes nothing");
+
+        // Counted with the ones it keeps, the Bot itself aside.
+        assert_eq!(db.keep_bot(&notes, &ana.id, &ci, 1), Err(KeepRefusal::Limit));
+        assert_eq!(db.bot(&notes).unwrap().service_account_id, None);
+        // Only the owner's own accounts, and only while the owner still owns it.
+        assert_eq!(db.keep_bot(&notes, &ana.id, &beas, 9), Err(KeepRefusal::Account));
+        assert_eq!(db.keep_bot(&other, &ana.id, &ci, 9), Err(KeepRefusal::Bot), "not Ana's Bot");
+        assert_eq!(db.keep_bot(&other, &bea.id, &ci, 9), Err(KeepRefusal::Account), "not Bea's account");
+        assert_eq!(db.keep_bot("gone", &ana.id, &ci, 9), Err(KeepRefusal::Bot));
+
+        // Another of Ana's accounts takes it over; letting go only works for the one keeping it.
+        assert_eq!(db.keep_bot(&ledger, &ana.id, &nightly, 9), Ok(Handed { from: Some(ci.clone()), grant: None }));
+        assert!(!db.release_kept_bot(&ledger, &ci));
+        assert!(db.release_kept_bot(&ledger, &nightly));
+        assert!(!db.release_kept_bot(&ledger, &nightly), "once");
+        assert_eq!(db.bot(&ledger).unwrap().owner_id, ana.id, "it stays Ana's");
+
+        // A deleted account keeps nothing, and takes nothing.
+        assert!(db.delete_service_account(&nightly, None).is_some());
+        assert_eq!(db.keep_bot(&ledger, &ana.id, &nightly, 9), Err(KeepRefusal::Account));
     }
 
     #[test]

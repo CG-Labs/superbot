@@ -56,5 +56,20 @@
   "conductConcerns": [],
   "breachNoticeHours": 48,
   "incidents": [],
-  "tabletops": []
+  "tabletops": [],
+  "systems": [
+    { "id": "superbot-1", "kind": "superbot", "since": "2026-12-01", "notes": "<the managed SuperBot server; reviewed with its access-review report>" },
+    { "id": "hosting", "kind": "hosting", "since": "2026-12-01", "notes": "<the hosting provider's console>" },
+    { "id": "code-host", "kind": "other", "since": "2026-12-01", "notes": "<the code host's organisation>" }
+  ],
+  "access": [
+    { "person": "person-2", "system": "superbot-1", "level": "admin", "requested": "2026-12-01", "approved": "2026-12-01", "approvedBy": ["person-1"], "granted": "2026-12-01", "notes": "<the security owner's own access: approved by Management, who deputises the security owner>" },
+    { "person": "person-3", "system": "hosting", "level": "admin", "requested": "2026-12-01", "approved": "2026-12-01", "approvedBy": ["person-1", "person-2"], "granted": "2026-12-01" },
+    { "person": "person-3", "system": "code-host", "level": "user", "requested": "2026-12-01", "approved": "2026-12-01", "approvedBy": ["person-2"], "granted": "2026-12-01" }
+  ],
+  "accessReviews": [
+    { "system": "superbot-1", "at": "2026-12-01", "by": "person-1", "listSha256": "0000000000000000000000000000000000000000000000000000000000000000", "mfa": true, "notes": "<the access-review report's digest, as signed off in SuperBot>" },
+    { "system": "hosting", "at": "2026-12-01", "by": "person-2", "listSha256": "0000000000000000000000000000000000000000000000000000000000000000", "mfa": true },
+    { "system": "code-host", "at": "2026-12-01", "by": "person-2", "listSha256": "0000000000000000000000000000000000000000000000000000000000000000", "mfa": true, "findings": [{ "id": "AF-01", "fixed": "2026-12-02" }] }
+  ]
 }

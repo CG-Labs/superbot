@@ -235,6 +235,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl bot grant <bot> <user> <viewer|operator>  viewer: read its chat; operator: also run it. <user> may be
                                                    a service account's id: never more than its owner can do
   botctl bot revoke <bot> <user>
+  botctl bot keep <bot> <service-account>          One of the Bot owner's service accounts keeps and manages it
+                                                   (owner or admin); it stays the owner's. Takes over from another
+  botctl bot release <bot>                         The service account keeping it stops; it stays the owner's
 
   botctl policy [<bot>]                            Show the global or a Bot's policy
   botctl policy set <global|bot> [mode=ask|bypass] [sandbox=on|off] [timeout=<minutes>] [<class>=allow|ask|deny]...
@@ -290,6 +293,11 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    approvals and the license, each ok, watch or at risk
   botctl health-score history [--days <n>] [json]  The score botd recorded each day (ADR 0157) for the last
                                                    90 days (1 to 3650), and what got worse or better
+  botctl onboarding [--skip <item,...>] [markdown | json]
+                                                   The onboarding checklist (ADR 0233) judged from botd: each
+                                                   item done, open, to confirm, n/a or skipped, with its guide.
+                                                   --skip: items agreed at kickoff not to need. Exits 1 while
+                                                   any item is open
   botctl support-report <tickets.csv | -> [--plan <plan>] [--customer <name>] [--from <YYYY-MM> --to <YYYY-MM>]
     [--hours <HH:MM-HH:MM>] [--weekdays <mon-fri>] [--utc-offset <+HH:MM>] [--holidays <dates>]
     [--target <sev>=<30m|1h|4bh|1bd>]... [--column <field>=<header>]... [--as-of <time>] [--markdown | --json]
@@ -1153,6 +1161,7 @@ fn move_bots_request(args: &[&str]) -> Result<(String, String), String> {
 fn bot_access(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
     let access = |bot: &str| format!("/api/bots/{}/access", encode(bot));
     let grant = |bot: &str, user: &str| format!("/api/bots/{}/grants/{}", encode(bot), encode(user));
+    let keeper = |bot: &str| format!("/api/bots/{}/keeper", encode(bot));
     Ok(match args {
         ["access", bot] => ("GET", access(bot), None),
         [v @ ("share" | "private"), bot] => {
@@ -1163,6 +1172,10 @@ fn bot_access(args: &[&str]) -> Result<(&'static str, String, Option<String>), S
         ["grant", bot, user, level @ ("viewer" | "operator")] => ("PUT", grant(bot, user), Some(json!({ "level": level }).to_string())),
         ["grant", ..] => return Err("Usage: botctl bot grant <bot> <user> <viewer|operator>".into()),
         ["revoke", bot, user] => ("DELETE", grant(bot, user), None),
+        // ADR 0229: the account's id, as `bot grant` takes it.
+        ["keep", bot, account] => ("PUT", keeper(bot), Some(json!({ "serviceAccount": account }).to_string())),
+        ["keep", ..] => return Err("Usage: botctl bot keep <bot> <service-account>".into()),
+        ["release", bot] => ("DELETE", keeper(bot), None),
         _ => return Err("Unknown bot command. See botctl admin.".into()),
     })
 }
@@ -2295,6 +2308,23 @@ fn run(args: &[String]) -> Result<String, String> {
             let res = api(Cred::Operator, "GET", &path, None)?;
             if json { Ok(pretty(res)) } else { Ok(health_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)) }
         }
+        ["onboarding", rest @ ..] => {
+            let (path, shape) = onboarding_request(rest)?;
+            let res = api(Cred::Operator, "GET", &path, None)?;
+            let v: Value = serde_json::from_str(&res).map_err(|e| e.to_string())?;
+            let out = match shape {
+                Shape::Json => pretty(res),
+                Shape::Markdown => onboarding_markdown(&v),
+                Shape::Text => onboarding_summary(&v),
+            };
+            // Open items exit 1, so a script can wait for go-live, with the report still on stdout.
+            if v["ready"] != true {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(out.as_bytes()).and_then(|_| stdout.flush());
+                std::process::exit(1);
+            }
+            Ok(out)
+        }
         ["incidents"] => Ok(incidents_summary(&serde_json::from_str(&api(Cred::Operator, "GET", "/api/status/incidents", None)?).map_err(|e| e.to_string())?)),
         ["incidents", "json"] => op("GET", "/api/status/incidents", None),
         ["incident", "review", rest @ ..] => {
@@ -2896,6 +2926,132 @@ fn health_summary(v: &Value) -> String {
     out
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Shape {
+    Text,
+    Markdown,
+    Json,
+}
+
+/// `botctl onboarding [--skip <item,...>] [markdown | json]`: botd's path and how to print it.
+fn onboarding_request(rest: &[&str]) -> Result<(String, Shape), String> {
+    const USE: &str = "Usage: botctl onboarding [--skip <item,...>] [markdown | json]";
+    let (mut skip, mut shape) = (None, None);
+    let mut args = rest.iter();
+    while let Some(a) = args.next() {
+        match *a {
+            "json" | "--json" if shape.is_none() => shape = Some(Shape::Json),
+            "markdown" | "--markdown" if shape.is_none() => shape = Some(Shape::Markdown),
+            "--skip" if skip.is_none() => {
+                let list = args.next().ok_or(USE)?;
+                if !list.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b',') {
+                    return Err(format!("--skip takes item ids separated by commas, such as scim,database_encryption, not \"{list}\""));
+                }
+                skip = Some(*list);
+            }
+            _ => return Err(USE.into()),
+        }
+    }
+    let path = match skip {
+        Some(s) => format!("/api/support/onboarding?skip={s}"),
+        None => "/api/support/onboarding".into(),
+    };
+    Ok((path, shape.unwrap_or(Shape::Text)))
+}
+
+fn onboarding_counts(c: &Value) -> String {
+    format!("{} done, {} open, {} to confirm, {} n/a, {} skipped", c["done"], c["open"], c["confirm"], c["notApplicable"], c["skipped"])
+}
+
+/// The items botd returned under each section's title, in order.
+fn onboarding_sections(v: &Value) -> Vec<(String, Vec<Value>)> {
+    let items = v["items"].as_array().cloned().unwrap_or_default();
+    v["sections"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|s| (s["title"].as_str().unwrap_or("").to_string(), items.iter().filter(|i| i["section"] == s["id"]).cloned().collect()))
+        .collect()
+}
+
+/// The onboarding check for a person: each section's items, a status each, then what's open with its guide.
+fn onboarding_summary(v: &Value) -> String {
+    let mut out = format!("Onboarding ({}), checked {}: {}\n", v["checklist"].as_str().unwrap_or(""), v["checkedAt"].as_str().unwrap_or("now"), onboarding_counts(&v["counts"]));
+    let width = v["items"].as_array().into_iter().flatten().filter_map(|i| i["id"].as_str()).map(str::len).max().unwrap_or(0);
+    for (title, items) in onboarding_sections(v) {
+        out.push_str(&format!("{title}\n"));
+        for i in items {
+            let status = match i["status"].as_str().unwrap_or("") {
+                "open" => "OPEN",
+                "confirm" => "CONFIRM",
+                "done" => "done",
+                other => other,
+            };
+            out.push_str(&format!("  {status:<7}  {:<width$}  {}\n", i["id"].as_str().unwrap_or(""), i["detail"].as_str().unwrap_or("")));
+        }
+    }
+    let open: Vec<&Value> = v["items"].as_array().into_iter().flatten().filter(|i| i["status"] == "open").collect();
+    if open.is_empty() {
+        out.push_str("Nothing open: confirm each CONFIRM item with the customer, then confirm go-live in writing.\n");
+    } else {
+        out.push_str("Open, with the guide for each:\n");
+        for i in open {
+            out.push_str(&format!("  {:<width$}  {}\n", i["id"].as_str().unwrap_or(""), i["guide"].as_str().unwrap_or("")));
+        }
+    }
+    let names = |a: &Value| a.as_array().map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+    let unneeded = names(&v["unneededSkips"]);
+    if !unneeded.is_empty() {
+        out.push_str(&format!("Skipped but done or not applicable anyway, so the skip can go: {unneeded}.\n"));
+    }
+    out
+}
+
+/// Text from botd, safe in a Markdown list: no HTML, links, images or table breaks.
+fn md_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars().map(|c| if c.is_control() { ' ' } else { c }) {
+        if matches!(c, '\\' | '&' | '<' | '>' | '|' | '[' | ']' | '*' | '`') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A repository path for a code span, or nothing if it has anything else in it.
+fn md_path(s: &str) -> &str {
+    if s.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-#".contains(&b)) { s } else { "" }
+}
+
+/// The onboarding check for the customer's onboarding record: a checklist per section.
+fn onboarding_markdown(v: &Value) -> String {
+    let c = &v["counts"];
+    let verdict = if v["ready"] == true { "Nothing open.".to_string() } else { format!("**Not ready to go live: {} open.**", c["open"]) };
+    let mut out = format!(
+        "## Onboarding check\n\nChecked {} against `{}`: {}. {verdict}\n",
+        md_text(v["checkedAt"].as_str().unwrap_or("now")),
+        md_path(v["checklist"].as_str().unwrap_or("")),
+        onboarding_counts(c)
+    );
+    for (title, items) in onboarding_sections(v) {
+        out.push_str(&format!("\n### {}\n\n", md_text(&title)));
+        for i in items {
+            let (label, detail, guide) = (md_text(i["label"].as_str().unwrap_or("")), md_text(i["detail"].as_str().unwrap_or("")), md_path(i["guide"].as_str().unwrap_or("")));
+            let line = match i["status"].as_str().unwrap_or("") {
+                "done" => format!("- [x] {label}. {detail}"),
+                "open" => format!("- [ ] **Open:** {label}. {detail} See `{guide}`."),
+                "confirm" => format!("- [ ] **To confirm:** {label}. {detail}"),
+                "skipped" => format!("- [ ] *Skipped, agreed at kickoff:* {label}. {detail}"),
+                _ => format!("- ~~{label}~~ (not applicable). {detail}"),
+            };
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// `botctl evidence bundle [--from <date> --to <date>] [-o <file>]`: botd's path and the file to save it as.
 fn evidence_request<'a>(rest: &[&'a str]) -> Result<(String, Option<&'a str>), String> {
     const USE: &str = "Usage: botctl evidence bundle [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]";
@@ -3355,6 +3511,73 @@ mod tests {
     }
 
     #[test]
+    fn onboarding_takes_skips_and_a_shape() {
+        assert_eq!(onboarding_request(&[]), Ok(("/api/support/onboarding".into(), Shape::Text)));
+        assert_eq!(onboarding_request(&["markdown"]), Ok(("/api/support/onboarding".into(), Shape::Markdown)));
+        assert_eq!(onboarding_request(&["--skip", "scim,database_encryption", "json"]), Ok(("/api/support/onboarding?skip=scim,database_encryption".into(), Shape::Json)));
+        for bad in [&["json", "markdown"][..], &["--skip"], &["--skip", "a", "--skip", "b"], &["--days", "30"]] {
+            assert!(onboarding_request(bad).is_err(), "{bad:?}");
+        }
+        let e = onboarding_request(&["--skip", "scim&x=1"]).unwrap_err();
+        assert!(e.starts_with("--skip takes item ids"), "{e}");
+    }
+
+    fn onboarding_view() -> Value {
+        json!({
+            "checklist": "docs/support/onboarding.md", "checkedAt": "2027-01-04T09:00:00Z", "ready": false,
+            "counts": { "done": 1, "open": 1, "confirm": 1, "notApplicable": 1, "skipped": 1 },
+            "unneededSkips": ["idp"],
+            "sections": [{ "id": "kickoff", "title": "1. Kickoff" }, { "id": "go_live", "title": "6. Monitoring and go-live" }],
+            "items": [
+                { "id": "plan", "section": "kickoff", "label": "Plan confirmed", "status": "confirm", "detail": "3 plans.", "guide": "docs/support/tiers.md" },
+                { "id": "region", "section": "kickoff", "label": "Data region chosen", "status": "n/a", "detail": "No regions.", "guide": "docs/support/onboarding.md#5-data-residency" },
+                { "id": "scim", "section": "kickoff", "label": "SCIM tested", "status": "skipped", "detail": "SCIM is off.", "guide": "docs/sso/scim.md" },
+                { "id": "metrics", "section": "go_live", "label": "Metrics", "status": "done", "detail": "On <b>|[x](http://e)</b>", "guide": "deploy/README.md#metrics-and-logs" },
+                { "id": "first_bundle", "section": "go_live", "label": "A first bundle", "status": "open", "detail": "None made yet.", "guide": "docs/support/support-bundle.md" },
+            ],
+        })
+    }
+
+    #[test]
+    fn onboarding_reads_as_a_line_per_item_then_what_is_open() {
+        assert_eq!(
+            onboarding_summary(&onboarding_view()),
+            "Onboarding (docs/support/onboarding.md), checked 2027-01-04T09:00:00Z: 1 done, 1 open, 1 to confirm, 1 n/a, 1 skipped\n\
+             1. Kickoff\n  \
+             CONFIRM  plan          3 plans.\n  \
+             n/a      region        No regions.\n  \
+             skipped  scim          SCIM is off.\n\
+             6. Monitoring and go-live\n  \
+             done     metrics       On <b>|[x](http://e)</b>\n  \
+             OPEN     first_bundle  None made yet.\n\
+             Open, with the guide for each:\n  \
+             first_bundle  docs/support/support-bundle.md\n\
+             Skipped but done or not applicable anyway, so the skip can go: idp.\n"
+        );
+        let mut v = onboarding_view();
+        v["items"][4]["status"] = json!("done");
+        v["unneededSkips"] = json!([]);
+        assert!(onboarding_summary(&v).ends_with("Nothing open: confirm each CONFIRM item with the customer, then confirm go-live in writing.\n"));
+    }
+
+    #[test]
+    fn onboarding_markdown_is_a_checklist_with_nothing_live_in_it() {
+        let md = onboarding_markdown(&onboarding_view());
+        assert!(md.starts_with("## Onboarding check\n\nChecked 2027-01-04T09:00:00Z against `docs/support/onboarding.md`: 1 done, 1 open, 1 to confirm, 1 n/a, 1 skipped. **Not ready to go live: 1 open.**\n"), "{md}");
+        for line in [
+            "- [ ] **To confirm:** Plan confirmed. 3 plans.\n",
+            "- ~~Data region chosen~~ (not applicable). No regions.\n",
+            "- [ ] *Skipped, agreed at kickoff:* SCIM tested. SCIM is off.\n",
+            "- [x] Metrics. On \\<b\\>\\|\\[x\\](http://e)\\</b\\>\n",
+            "- [ ] **Open:** A first bundle. None made yet. See `docs/support/support-bundle.md`.\n",
+        ] {
+            assert!(md.contains(line), "{line}\n{md}");
+        }
+        assert_eq!(md_path("docs/a.md#b"), "docs/a.md#b");
+        assert_eq!(md_path("x` <img>"), "", "a guide that isn't a plain path is left out");
+    }
+
+    #[test]
     fn a_saved_bundle_is_private_and_never_overwrites() {
         let path = std::env::temp_dir().join(format!("botctl-bundle-{}.tar", std::process::id()));
         let p = path.to_str().unwrap();
@@ -3716,6 +3939,9 @@ mod tests {
         assert_eq!(req(&["grant", "b1", "a+b@example.com", "operator"]), Ok(("PUT", "/api/bots/b1/grants/a%2Bb%40example.com".into(), Some(json!({ "level": "operator" })))));
         assert_eq!(req(&["revoke", "b1", "u1"]), Ok(("DELETE", "/api/bots/b1/grants/u1".into(), None)));
         assert!(req(&["grant", "b1", "u1", "owner"]).is_err());
+        assert_eq!(req(&["keep", "b1", "sa1"]), Ok(("PUT", "/api/bots/b1/keeper".into(), Some(json!({ "serviceAccount": "sa1" })))));
+        assert_eq!(req(&["release", "b/1"]), Ok(("DELETE", "/api/bots/b%2F1/keeper".into(), None)));
+        assert!(req(&["keep", "b1"]).unwrap_err().starts_with("Usage: botctl bot keep"));
         assert!(req(&["share"]).is_err());
         assert!(req(&[]).is_err());
     }

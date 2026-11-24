@@ -363,6 +363,9 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         // Bot ACLs. Handlers also require the Bot's owner or an admin (ADR 0017).
         ("PATCH", ["bots", _, "access"]) => Write,
         ("PUT" | "DELETE", ["bots", _, "grants", _]) => Write,
+        // Which of its owner's service accounts keeps it (ADR 0229). Handlers also require
+        // the Bot's owner or an admin.
+        ("PUT" | "DELETE", ["bots", _, "keeper"]) => Write,
         ("POST", ["ask" | "handoff"]) => Write,
         ("POST", ["approvals", "check"]) => Write,
 
@@ -476,6 +479,8 @@ mod tests {
             ("PATCH", "/api/bots/b1/access", Perm::Write),
             ("PUT", "/api/bots/b1/grants/u1", Perm::Write),
             ("DELETE", "/api/bots/b1/grants/a%40example.com", Perm::Write),
+            ("PUT", "/api/bots/b1/keeper", Perm::Write),
+            ("DELETE", "/api/bots/b1/keeper", Perm::Write),
             ("GET", "/api/policy", Perm::Read),
             ("GET", "/api/policy/rules", Perm::Read),
             ("GET", "/api/approvals", Perm::Review),
@@ -802,6 +807,8 @@ mod tests {
         assert_eq!(classify(&Method::PUT, "/api/bots/b1/access"), Perm::Admin);
         assert_eq!(classify(&Method::GET, "/api/bots/b1/grants/u1"), Perm::Admin);
         assert_eq!(classify(&Method::PUT, "/api/bots/b1/grants"), Perm::Admin);
+        assert_eq!(classify(&Method::GET, "/api/bots/b1/keeper"), Perm::Admin);
+        assert_eq!(classify(&Method::PUT, "/api/bots/b1/keeper/sa1"), Perm::Admin);
         assert_eq!(classify(&Method::POST, "/"), Perm::Admin);
         assert_eq!(classify(&Method::POST, "/api/machine"), Perm::Admin);
         assert_eq!(classify(&Method::GET, "/api/machine/m1"), Perm::Admin);

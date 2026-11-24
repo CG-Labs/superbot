@@ -57,12 +57,18 @@ mod health_history_http_tests;
 mod health_score;
 #[cfg(test)]
 mod health_score_http_tests;
+mod onboarding;
+#[cfg(test)]
+mod onboarding_http_tests;
 mod incident_review;
 #[cfg(test)]
 mod incident_review_http_tests;
 mod isolation;
 #[cfg(test)]
 mod isolation_http_tests;
+mod kept_bots;
+#[cfg(test)]
+mod kept_bots_http_tests;
 mod database_encryption;
 #[cfg(test)]
 mod database_encryption_http_tests;
@@ -1033,6 +1039,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/bots/{id}", patch(update_bot).delete(delete_bot))
         .route("/bots/{id}/access", get(get_access).patch(update_access))
         .route("/bots/{id}/grants/{user}", put(put_grant).delete(delete_grant))
+        .route("/bots/{id}/keeper", put(kept_bots::put).delete(kept_bots::delete))
         .route("/bots/{id}/messages", get(list_messages).post(send_message))
         .route("/bots/{id}/read", post(mark_read))
         .route("/bots/{id}/stop", post(stop_bot))
@@ -1068,6 +1075,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/support/bundle", get(support::bundle))
         .route("/support/health-score", get(health_score::get))
         .route("/support/health-score/history", get(health_history::get))
+        .route("/support/onboarding", get(onboarding::get))
         .route("/evidence", get(evidence::get))
         .route("/evidence/bundle", get(evidence::bundle))
         .route("/evidence/baseline", get(baseline::get))
@@ -2794,7 +2802,7 @@ pub(crate) async fn give_bot(app: &AppState, by: &Who, bot: &db::Bot, to: &db::U
 
 async fn get_access(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     let (bot, access) = need_bot_access(&app, &c, &by, &id, Access::View)?;
-    Ok(Json(access_view(&app, &bot, access)))
+    Ok(Json(kept_bots::access_view(&app, &c, &bot, access)))
 }
 
 /// Body: `{visibility?: "private" | "shared", owner?: <user id or email>}`. The owner
