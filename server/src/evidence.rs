@@ -551,7 +551,7 @@ pub fn build(app: &App, inputs: &Inputs, p: &Period, now_ms: i64, scheduled: boo
     let name = name(p, now_ms);
     let mut integrity = crate::evidence_integrity::begin(app, p);
     let s = scan(app, p, &mut integrity);
-    let (integrity, integrity_criteria, integrity_rows) = integrity.finish(app, s.last_id, now_ms);
+    let (integrity, integrity_criteria, integrity_rows) = integrity.finish(app, s.last_id, !s.truncated, now_ms);
     let tally = |file: &str| SECTIONS.iter().position(|x| x.file == file).map(|i| &s.sections[i]).expect("a section");
     let period = json!({ "from": p.from.to_string(), "to": p.to.to_string(), "days": p.days() });
     let with_period = |mut v: Value| {

@@ -162,6 +162,9 @@ impl Integrity {
                 v["headId"] = e.details["head"]["id"].clone();
                 self.checks.push(v);
                 if whole(e) {
+                    if !Self::open(&self.check_gaps) && e.at > self.check_from + CHECK_WITHIN_MS {
+                        self.check_gaps.push(Gap { from: self.check_from, late: e.at, to: None });
+                    }
                     Self::close(&mut self.check_gaps, e.at);
                     self.check_from = e.at;
                     self.last_check = Some(c);
@@ -169,6 +172,9 @@ impl Integrity {
             }
             CHECKPOINT => {
                 self.day(e, "checkpoints");
+                if let Some(t) = self.unsealed_since.filter(|t| self.every_ms > 0 && !Self::open(&self.seal_gaps) && e.at > t + self.every_ms + CHECKPOINT_GRACE_MS) {
+                    self.seal_gaps.push(Gap { from: t, late: e.at, to: None });
+                }
                 Self::close(&mut self.seal_gaps, e.at);
                 self.unsealed_since = None;
             }
@@ -194,9 +200,12 @@ impl Integrity {
     }
 
     /// The file, and the criteria and rows its manifest entry names. `last_id` is the
-    /// period's last event, which every export must have taken.
-    pub fn finish(self, app: &App, last_id: Option<i64>, snapshot_ms: i64) -> (Value, Vec<&'static str>, Vec<&'static str>) {
+    /// period's last event, which every export must have taken; `read_all` is false when
+    /// the scan stopped before the period's end, which leaves both unproven.
+    pub fn finish(self, app: &App, last_id: Option<i64>, read_all: bool, snapshot_ms: i64) -> (Value, Vec<&'static str>, Vec<&'static str>) {
         let now = audit_checkpoint::view(app).unwrap_or_else(|e| json!({ "error": e.to_string() }));
+        // A later check that fails says the period's rows may have changed since.
+        let latest = app.db.audit_events(&Filter { actions: vec![VERIFIED.to_string()], ..Default::default() }, 50, false).iter().find(|e| whole(e)).map(check_of);
         let through = last_id.unwrap_or(0);
         let export = &now["export"];
         let sinks: Vec<Value> = export["sinks"]
@@ -214,11 +223,13 @@ impl Integrity {
             })
             .collect();
         let behind: Vec<Value> = sinks.iter().filter(|s| s["deliveredThroughPeriod"] != true).map(|s| json!({ "kind": s["kind"], "name": s["name"], "delivered": s["delivered"], "pending": s["pending"] })).collect();
-        let exported = !sinks.is_empty() && behind.is_empty();
+        let exported = read_all && !sinks.is_empty() && behind.is_empty();
         let checkpoints_on = self.every_ms > 0;
-        let last_failed: Vec<Value> = self.last_check.iter().filter(|c| !c.ok).map(Check::view).collect();
+        let mut last_failed: Vec<&Check> = self.last_check.iter().chain(&latest).filter(|c| !c.ok).collect();
+        last_failed.dedup_by_key(|c| c.id);
         let failed: Vec<Value> = self.checks.iter().filter(|c| c["ok"] != true).cloned().collect();
-        let sealed = exported && checkpoints_on && self.check_gaps.is_empty() && self.seal_gaps.is_empty() && self.last_check.as_ref().is_some_and(|c| c.ok);
+        let sealed = exported && checkpoints_on && self.check_gaps.is_empty() && self.seal_gaps.is_empty() && self.last_check.as_ref().is_some_and(|c| c.ok) && last_failed.is_empty();
+        let unread: Vec<Value> = if read_all { Vec::new() } else { vec![json!({ "readThrough": last_id })] };
         let mut off = Vec::new();
         if !checkpoints_on {
             off.push("checkpoints");
@@ -252,7 +263,8 @@ impl Integrity {
                 "head": now["head"].get("id").map(|_| json!({ "id": now["head"]["id"], "hash": now["head"]["hash"] })),
                 "events": now["events"],
                 "anchor": now["anchor"].get("id").map(|_| json!({ "id": now["anchor"]["id"], "hash": now["anchor"]["hash"] })),
-                "lastCheck": self.last_check.as_ref().map(Check::view),
+                "lastCheck": latest.as_ref().map(Check::view),
+                "periodLastCheck": self.last_check.as_ref().map(Check::view),
             },
             "periodEndCheckpoint": pin,
             "checkpoints": {
@@ -269,7 +281,8 @@ impl Integrity {
             "exceptions": {
                 "off": off,
                 "failedChecks": failed,
-                "lastCheckFailed": last_failed,
+                "lastCheckFailed": last_failed.iter().map(|c| c.view()).collect::<Vec<_>>(),
+                "periodNotFullyRead": unread,
                 "checkGaps": self.check_gaps.iter().map(|g| g.view("nextCheck")).collect::<Vec<_>>(),
                 "checkpointGaps": self.seal_gaps.iter().map(|g| g.view("nextCheckpoint")).collect::<Vec<_>>(),
                 "exportBehind": behind,
@@ -378,6 +391,9 @@ mod tests {
         let g = &i.check_gaps[0];
         assert_eq!((g.from, g.late, g.to), (H, 27 * H, Some(40 * H)), "from the last check, through the first late event, to the next check");
         assert!(!Integrity::open(&i.check_gaps));
+        let mut i = fresh(60);
+        run(&mut i, &[(1, VERIFIED), (20, "user.created"), (30, VERIFIED)]);
+        assert_eq!(i.check_gaps.iter().map(|g| (g.from, g.late, g.to)).collect::<Vec<_>>(), [(H, 30 * H, Some(30 * H))], "a check that came late is a gap too");
     }
 
     #[test]
@@ -409,6 +425,9 @@ mod tests {
         let mut i = fresh(60);
         run(&mut i, &[(0, CHECKPOINT), (1, TIMESTAMPED), (3, TIMESTAMPED), (4, CHECKPOINT)]);
         assert!(i.seal_gaps.is_empty(), "checkpoints' own events need no checkpoint");
+        let mut i = fresh(60);
+        run(&mut i, &[(0, "user.created"), (4, CHECKPOINT)]);
+        assert_eq!(i.seal_gaps.iter().map(|g| (g.from, g.late, g.to)).collect::<Vec<_>>(), [(0, 4 * H, Some(4 * H))], "a checkpoint that came late is a gap too");
         let mut i = fresh(0);
         run(&mut i, &[(0, "user.created"), (30, "user.created")]);
         assert!(i.seal_gaps.is_empty(), "off is reported as off, not as gaps");

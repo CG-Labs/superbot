@@ -442,8 +442,23 @@ async fn the_audit_logs_guarding_is_evidence_only_while_it_held() {
     assert_eq!((pin["event"].as_i64(), pin["seq"].as_i64(), pin["hash"].as_str()), (Some(cp.id), Some(cp.seq), Some(cp.hash.as_str())), "{v}");
     assert_eq!(pin["signature"].as_str(), Some(cp.signature.as_str()), "the signature survives the bundle's scrubbing");
     assert_eq!((v["chain"]["head"]["hash"].as_str().map(str::len), v["chain"]["lastCheck"]["ok"].as_bool()), (Some(64), Some(true)), "{v}");
+    let (cut, criteria, rows) = crate::evidence_integrity::begin(&app, &p).finish(&app, Some(app.db.audit_head()), false, db::now());
+    assert_eq!((criteria.len(), rows.len(), cut["summary"]["exportedEveryEvent"].as_bool()), (0, 0, Some(false)), "a scan cut short proves neither: {cut}");
+    assert_eq!(cut["exceptions"]["periodNotFullyRead"].as_array().map(Vec::len), Some(1), "{cut}");
     let (code, body) = call(port, "GET", &format!("/api/audit/verify?pin={}:{}", cp.seq, cp.hash), &admin, "").await;
     assert_eq!((code, parse(&body)["pins"][0]["result"].as_str().map(String::from)), (200, Some("match".into())), "the month's pin holds the log: {body}");
+
+    // An earlier period, checked within it and shipped.
+    let earlier = Period { from: today().pred_opt().unwrap(), to: today() };
+    let check = Event::new(Actor::system("audit_chain"), "audit.verified").details(json!({ "ok": true, "checked": 1 }));
+    app.db.record_at(&check, earlier.start_ms() + 12 * 3_600_000).unwrap();
+    crate::audit_chain_http_tests::until("delivery", delivered).await;
+    let before = |app: &AppState| {
+        let (_, f) = files(&evidence::build(app, &inputs, &earlier, db::now(), false).tar);
+        (parse(file(&f, "audit-integrity.json")), parse(file(&f, "manifest.json")))
+    };
+    let (v, m) = before(&app);
+    assert_eq!(listed(&m, "audit-integrity.json"), (json!(["CC2.1", "CC7.2"]), json!(["CC2.1-2", "CC7.2-2"])), "{v}");
 
     // A row changed: the next check fails, so the log wasn't guarded, though it was shipped.
     app.db.execute_raw("DROP TRIGGER audit_events_no_update").unwrap();
@@ -455,4 +470,10 @@ async fn the_audit_logs_guarding_is_evidence_only_while_it_held() {
     assert_eq!(listed(&m, "audit-integrity.json"), (json!(["CC2.1"]), json!(["CC2.1-2"])));
     assert_eq!(v["exceptions"]["lastCheckFailed"][0]["reason"], "contents", "{v}");
     assert_eq!(v["exceptions"]["failedChecks"].as_array().unwrap().len(), 1, "{v}");
+
+    // That later failure takes CC7.2-2 back from the earlier period too.
+    let (v, m) = before(&app);
+    assert_eq!(listed(&m, "audit-integrity.json"), (json!(["CC2.1"]), json!(["CC2.1-2"])), "{v}");
+    assert_eq!((v["chain"]["lastCheck"]["reason"].as_str(), v["chain"]["periodLastCheck"]["ok"].as_bool()), (Some("contents"), Some(true)), "{v}");
+    assert_eq!(v["exceptions"]["lastCheckFailed"][0]["reason"], "contents", "{v}");
 }
