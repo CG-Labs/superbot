@@ -135,6 +135,7 @@ In `.env` (installer) or `deploy/docker/.env` (Compose), then restart botd:
 | `AUDIT_EXPORT_HEADERS` or `AUDIT_EXPORT_HEADERS_FILE` | none | HTTPS only: headers, `name=value` pairs split by commas, such as `Authorization=Bearer <token>`. A secret: redacted everywhere, and no Bot's harness gets it. With `SECRETS_BACKEND=vault` it can live in Vault ([vault.md](vault.md)). For one SIEM only; with several, each has its own `AUDIT_EXPORT_HEADERS_<NAME>` |
 | `AUDIT_EXPORT_START` | `all` | For a new sink: `all` sends the history still in the database first, `new` only events from now on. A named sink can have its own, `AUDIT_EXPORT_START_<NAME>` |
 | `AUDIT_EXPORT_COMPRESS` | `off` | `gzip`: webhook, Azure Monitor and Datadog request bodies go gzipped (Google SecOps stays plain), with `Content-Encoding: gzip`. A named sink can have its own, `AUDIT_EXPORT_COMPRESS_<NAME>` ([below](#compression)) |
+| `AUDIT_EXPORT_LABELS` | none | Datadog and Google SecOps only: `key=value` pairs split by commas, such as `env=prod,tenant=acme`, sent beside each event as Datadog tags or SecOps ingestion labels. A named sink can have its own, `AUDIT_EXPORT_LABELS_<NAME>`; `AUDIT_EXPORT_NAMESPACE` is SecOps's namespace ([below](#labels)) |
 
 A bad value stops botd at startup with a message naming the setting. URLs with a username, password, query or fragment are refused, so put tokens in `AUDIT_EXPORT_HEADERS`.
 
@@ -445,6 +446,7 @@ AUDIT_EXPORT_GCP_AUTH=metadata
 |---|---|---|
 | `AUDIT_EXPORT` | `off` | `google-secops://<location>/<project>/<instance>/<log type>`, alone or beside other sinks (name it then). `<location>` is the instance's region (`us`, `eu`, `europe-west2`, ...), which picks the endpoint, `https://<location>-chronicle.googleapis.com`. `<project>` is the Google Cloud project the instance is bound to (its id or number), `<instance>` the instance's id (the customer id, a UUID), `<log type>` the log type to file events under (capitals, digits and `_`) |
 | `AUDIT_EXPORT_GCP_AUTH` | `GCP_SECRET_MANAGER_AUTH`, else `metadata` | `metadata` (the metadata server's service account, at `GCE_METADATA_HOST` if set) or `service-account-key` (`GCP_SERVICE_ACCOUNT_KEY_FILE` or `GCP_SERVICE_ACCOUNT_KEY`), the same settings as Secret Manager |
+| `AUDIT_EXPORT_LABELS`, `AUDIT_EXPORT_NAMESPACE` (or `_<NAME>`) | none | Ingestion labels and the environment namespace on each raw log, for data RBAC scopes ([below](#labels)) |
 
 It takes no headers, no gzip, and no credentials, port, query or fragment in the URL. Tokens are for the `cloud-platform` scope, kept until near their end, sent only to the Chronicle API's endpoint, and redacted everywhere. The key is a server secret, never given to a Bot.
 
@@ -472,7 +474,7 @@ Each event is one raw log: the event's JSON line exactly as every other sink get
 
 ### Check the copy in SecOps
 
-Each raw log is the line, byte for byte, so it goes into `botctl audit verify-lines` unchanged ([below](#check-exported-events-without-botd)). Get the log type's raw logs back for a time range with the Data Export API (to a bucket you own), take one raw log per line out of the files it writes, and check them:
+Each raw log's `data` is the line, byte for byte, so it goes into `botctl audit verify-lines` unchanged ([below](#check-exported-events-without-botd)). Get the log type's raw logs back for a time range with the Data Export API (to a bucket you own), take one raw log per line out of the files it writes, and check them:
 
 ```sh
 botctl audit verify-lines secops-raw-logs.jsonl --key <checkpoint public key hex> --digests-after <id>
@@ -495,6 +497,7 @@ AUDIT_EXPORT_COMPRESS_DD=gzip
 | `AUDIT_EXPORT` | `off` | `datadog://<site>`, alone or beside other sinks (name it then). `<site>` is your Datadog site, as in its URL without `app.`: `datadoghq.com`, `us3.datadoghq.com`, `us5.datadoghq.com`, `datadoghq.eu`, `ap1.datadoghq.com`, `ap2.datadoghq.com`, `uk1.datadoghq.com`, `ddog-gov.com` or `us2.ddog-gov.com`. botd sends to `https://http-intake.logs.<site>` and nowhere else |
 | `AUDIT_EXPORT_HEADERS` or `AUDIT_EXPORT_HEADERS_<NAME>` | none | `DD-API-KEY=<API key>` and nothing else: an API key from **Organization Settings > API Keys** (not an application key, which isn't needed). Required. A server secret, in the env or Vault, never given to a Bot |
 | `AUDIT_EXPORT_COMPRESS` or `AUDIT_EXPORT_COMPRESS_<NAME>` | `off` | `gzip`, which Datadog recommends ([below](#compression)) |
+| `AUDIT_EXPORT_LABELS` or `AUDIT_EXPORT_LABELS_<NAME>` | none | Tags on each log, `ddtags` ([below](#labels)) |
 
 No credentials, port, path, query or fragment in the URL. Use a key made for botd alone, so you can revoke it without touching anything else.
 
@@ -531,6 +534,25 @@ zcat archive/dt=*/hour=*/*.json.gz | jq -r 'select(.service == "superbot") | .at
 ```
 
 `@superbot.chainHash` gives pins for `botctl audit verify --pin <id>:<chainHash>`. The other attributes aren't checked: compare them with `line` if a detection depends on one.
+
+## Labels
+
+With more than one botd, or one per tenant or environment, labels tell their events apart in Datadog and Google SecOps and let you fence them off. Design: [ADR 0255](../adr/0255-labels-on-datadog-and-secops-logs.md).
+
+```sh
+AUDIT_EXPORT=dd=datadog://datadoghq.eu,secops=google-secops://eu/<project>/<instance id>/SUPERBOT_AUDIT
+AUDIT_EXPORT_HEADERS_DD=DD-API-KEY=<API key>
+AUDIT_EXPORT_LABELS=env=prod,tenant=acme
+AUDIT_EXPORT_LABELS_DD=env=prod,tenant=acme,team=security
+AUDIT_EXPORT_NAMESPACE_SECOPS=prod-eu
+```
+
+- **Settings.** `AUDIT_EXPORT_LABELS` is up to 10 `key=value` pairs split by commas, for every Datadog and SecOps sink. `AUDIT_EXPORT_LABELS_<NAME>` is a named sink's own and wins, whole (above, `dd` gets three labels and `secops` two); `off` gives that sink none. Keys are 1 to 63 lowercase letters, digits, `_` and `-`, starting with a letter, and not `host`, `source`, `service` or `device`; values are 1 to 128 lowercase letters, digits and `_-.:/`. Lowercase because Datadog lowercases tags, so a label reads the same in both. `AUDIT_EXPORT_NAMESPACE` (or `_<NAME>`, or `off`) is the SecOps environment namespace: up to 63 letters, digits, `_` and `-`, starting with a letter. They aren't secrets: every log carries them.
+- **Datadog.** Each log gets `ddtags`, such as `env:prod,tenant:acme,team:security`. Use them in index and archive filters, log restriction queries (**Organization Settings > Data Access**) and usage attribution, such as `service:superbot env:prod tenant:acme`.
+- **Google SecOps.** Each raw log gets the labels as ingestion labels, each eligible for data RBAC (`rbacEnabled`), and the namespace as its `environmentNamespace`. Use them in data RBAC scopes (**Settings > Access Management > Data Access**), such as a scope allowing log type `SUPERBOT_AUDIT` and namespace `prod-eu`. Eligibility restricts no one until a scope names the label.
+- **Elsewhere.** Webhook, syslog and archive sinks send the line alone, and Azure Monitor's columns are its DCR's, so `AUDIT_EXPORT_LABELS_<NAME>` naming one stops botd at startup, as does `AUDIT_EXPORT_LABELS` when no sink is Datadog or SecOps. A namespace for anything but SecOps does too.
+- **Not evidence.** Labels go beside the line, never in it or on the chain: `botctl audit verify-lines` neither needs nor checks them. Changing them doesn't restart a sink, and events already sent keep the labels they had.
+- **Status.** The startup log says `tagged ...` or `labelled ..., in namespace ...`, and `botctl audit siem` shows `datadog.tags`, `googleSecOps.labels` and `googleSecOps.namespace`.
 
 ## Compression
 
