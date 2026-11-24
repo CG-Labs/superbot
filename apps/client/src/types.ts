@@ -1417,7 +1417,7 @@ export interface MyResidency {
   machine?: { id: string; state: string; region: string; inRegion: boolean; host?: string | null; hostRegion?: string | null } | null;
   backups?: { kept: number; inRegion: number; outside: number };
   modelRoutes?: { inRegion: boolean; gap: string | null };
-  /** Where the server's own copy of your account and chats is, as its operator states it (ADR 0184). Missing from servers before it. */
+  /** Where the server's own copy of your account, chats, routines and approvals is, as its operator states it (ADR 0184). Missing from servers before it. */
   serverData?: {
     region: string | null;
     inRegion: boolean;
@@ -1426,7 +1426,7 @@ export interface MyResidency {
     /** The server holds every pin to its own region (RESIDENCY_SERVER_DATA=require), so being outside it is a fault. */
     required?: boolean;
   };
-  /** Whether the pin's region keeps chats in a database of its own (ADR 0215), whether all your Bots' chats are in the region, whether some are still to move there, and how many backups of another region's store still hold them from before they moved. Missing from servers before it. */
+  /** Whether the pin's region keeps chats, routines and approvals in a database of its own (ADR 0215, ADR 0228), whether all of your Bots' are in the region, whether some are still to move there, and how many backups of another region's store still hold them from before they moved. Missing from servers before it. */
   chats?: { store: boolean; inRegion: boolean; moving?: boolean; earlierBackups?: number };
   /** The pins whose residency report you can get. */
   reports: ("user" | "team")[];
