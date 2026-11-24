@@ -187,9 +187,10 @@ pub fn server_secret(name: &str) -> bool {
 /// headers sent to the trace collector (ADR 0118) and the audit log's SIEM sink (ADR
 /// 0122; each named sink's are `AUDIT_EXPORT_HEADERS_<NAME>`, ADR 0191), and the keys to
 /// the stores that hold every machine's backups (ADR 0071), the
-/// server's own (ADR 0109) and the audit archive (ADR 0154), and the service account
-/// key that reads the Google Workspace directory (ADR 0162).
-pub const SERVER_SECRETS: [&str; 15] = [
+/// server's own (ADR 0109) and the audit archive (ADR 0154), the service account
+/// key that reads the Google Workspace directory (ADR 0162), and the login to the
+/// operator's npm registry that botd hands only to enrolled machines (ADR 0219).
+pub const SERVER_SECRETS: [&str; 17] = [
     "TURNSTILE_SECRET",
     "LINODE_TOKEN",
     "INCUS_CLIENT_KEY",
@@ -205,6 +206,8 @@ pub const SERVER_SECRETS: [&str; 15] = [
     "SERVER_BACKUP_S3_SECRET_ACCESS_KEY",
     "AUDIT_EXPORT_S3_SECRET_ACCESS_KEY",
     "GOOGLE_DIRECTORY_CREDENTIALS",
+    "MACHINE_NPM_TOKEN",
+    "MACHINE_NPM_PASSWORD",
 ];
 
 /// Each Bot's own notification webhook URL: `NOTIFY_WEBHOOK_URL_BOT_<ID>` (ADR 0061).

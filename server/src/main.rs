@@ -517,7 +517,7 @@ async fn main() {
     let bin_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
     // Users' machines get the managed tiers' default harnesses unless told otherwise (ADR 0079).
     let managed_bins: Vec<&str> = tiers.managed_defaults().into_iter().filter_map(|h| adapters::get(h).map(|a| a.bin())).collect();
-    let enrollment = machines::enroll::Enrollment::from_env(&|k| env(k, ""), &secrets::sealed::cipher(), &bin_dir)
+    let enrollment = machines::enroll::Enrollment::from_env(&|k| env(k, ""), &startup_store, &secrets::sealed::cipher(), &bin_dir)
         .unwrap_or_else(|e| exit(format!("Machine enrollment: {e}")))
         .map(|mut e| {
             e.upkeep.default_to(&managed_bins).unwrap_or_else(|err| exit(format!("Machine enrollment: {err}")));

@@ -20,7 +20,7 @@
 use super::hermes_bundle;
 use super::wire::{self, HarnessInstall, HarnessPlan, HarnessStatus, InstallSource, NodeRuntime};
 use base64::Engine;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::BTreeMap;
@@ -158,6 +158,56 @@ pub fn registry_url(url: &str) -> bool {
     https(url) && url.ends_with('/') && url::Url::parse(url).is_ok_and(|u| u.query().is_none() && u.fragment().is_none())
 }
 
+/// The longest npm registry login botd sends (ADR 0219).
+pub const MAX_LOGIN: usize = 4096;
+
+/// A value npm's `.npmrc` takes as it is: 1 to `MAX_LOGIN` of the characters registry
+/// tokens and base64 use. Nothing that ends a line, starts a comment (`;`, `#`), quotes
+/// or asks npm to expand a variable (`${...}`).
+pub fn npmrc_value(s: &str) -> bool {
+    !s.is_empty() && s.len() <= MAX_LOGIN && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~+/=:".contains(&b))
+}
+
+/// npm's key for `url` (its "nerf dart"): `//host[:port]/path`, with no scheme, login,
+/// query or fragment, and the path up to its last `/`. npm sends a registry's login
+/// with requests whose key starts with the registry's.
+pub fn nerf_dart(url: &str) -> Option<String> {
+    let u = url::Url::parse(url).ok()?;
+    let host = u.host_str()?;
+    let port = u.port().map_or(String::new(), |p| format!(":{p}"));
+    let path = u.path();
+    let dir = &path[..=path.rfind('/')?];
+    Some(format!("//{host}{port}{dir}"))
+}
+
+/// Why the agent won't take `l` as the login for `registry`, if it won't.
+pub fn check_login(l: &wire::NpmLogin, registry: &str) -> Result<(), String> {
+    if l.registry != registry {
+        return Err(format!("botd's npm login is for {}, not the plan's registry {registry}", l.registry));
+    }
+    match (&l.token, &l.auth) {
+        (Some(v), None) | (None, Some(v)) if npmrc_value(v) => Ok(()),
+        _ => Err("botd's npm login isn't one token, or one user and password, that npm can read".into()),
+    }
+}
+
+/// The `.npmrc` line that signs npm in to `l.registry`, and nothing else.
+pub fn npmrc(l: &wire::NpmLogin) -> Result<String, String> {
+    check_login(l, &l.registry)?;
+    let dart = nerf_dart(&l.registry).ok_or("the npm registry isn't a URL")?;
+    let (key, v) = match (&l.token, &l.auth) {
+        (Some(t), _) => ("_authToken", t),
+        (_, Some(a)) => ("_auth", a),
+        _ => unreachable!("check_login takes exactly one"),
+    };
+    Ok(format!("{dart}:{key}={v}\n"))
+}
+
+/// `text` with every value in `hide` taken out, for an error that leaves the machine.
+fn scrub(text: String, hide: &[String]) -> String {
+    hide.iter().filter(|h| !h.is_empty()).fold(text, |t, h| t.replace(h.as_str(), "[redacted]"))
+}
+
 /// How many certificates `pem` holds: one or more, each one X.509 can parse, and
 /// nothing else but whitespace between them.
 pub fn ca_bundle(pem: &str) -> Result<usize, String> {
@@ -246,6 +296,9 @@ pub fn check(plan: &HarnessPlan) -> Result<(), String> {
     }
     if let Some(ca) = &plan.ca {
         ca_bundle(ca).map_err(|e| format!("The mirrors' CA: {e}."))?;
+    }
+    if plan.npm_login && plan.npm_registry.is_none() {
+        return Err("a login is only for the plan's own npm registry, and it names none.".into());
     }
     match &plan.node {
         None if npm => Err("npm harnesses need Node.js in the plan.".into()),
@@ -685,9 +738,34 @@ impl Tools {
         self.lock().plan.as_ref().and_then(|p| p.ca.clone())
     }
 
-    /// npm's environment. With the plan's registry, npm asks it and nothing else; with
-    /// its CA, written into `.dl`, Node trusts that besides its own roots.
-    fn npm_env(&self) -> Result<Vec<(&'static str, String)>, String> {
+    /// The plan's registry's login, from botd over the machine port (ADR 0219). Fetched
+    /// for each install, never saved: botd's copy is the one that counts.
+    async fn npm_login(&self, registry: &str) -> Result<wire::NpmLogin, String> {
+        let c = self.control.get().ok_or("the plan's npm registry needs a login, and this agent has no control plane to fetch it from")?;
+        let url = format!("{}/v1/npm-login", c.url);
+        let mut r = (c.client)()?
+            .get(&url)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|e| format!("couldn't fetch the npm registry's login from botd: {}", e.without_url()))?;
+        let mut body = Vec::new();
+        while let Some(chunk) = r.chunk().await.map_err(|e| format!("the npm registry's login from botd: {}", e.without_url()))? {
+            if body.len() + chunk.len() > 4 * MAX_LOGIN {
+                return Err("botd's npm login is too long".into());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let login: wire::NpmLogin = serde_json::from_slice(&body).map_err(|_| "botd's npm login isn't one this agent reads".to_string())?;
+        check_login(&login, registry)?;
+        Ok(login)
+    }
+
+    /// npm's environment, and what to take out of its errors. With the plan's registry,
+    /// npm asks it and nothing else; with its CA, written into `.dl`, Node trusts that
+    /// besides its own roots; with its login, written into `.dl` for root alone, npm
+    /// signs in to that registry and nowhere else.
+    async fn npm_env(&self) -> Result<(Vec<(&'static str, String)>, Vec<String>), String> {
         let mut env = vec![
             ("PATH", self.path()),
             ("HOME", self.dir.display().to_string()),
@@ -697,7 +775,22 @@ impl Tools {
             ("npm_config_fund", "false".into()),
             ("npm_config_audit", "false".into()),
         ];
-        let (registry, ca) = self.lock().plan.as_ref().map_or((None, None), |p| (p.npm_registry.clone(), p.ca.clone()));
+        let (registry, ca, login) = self.lock().plan.as_ref().map_or((None, None, false), |p| (p.npm_registry.clone(), p.ca.clone(), p.npm_login));
+        let mut hide = Vec::new();
+        if login {
+            let registry = registry.as_deref().ok_or("a login is only for the plan's own npm registry")?;
+            let l = self.npm_login(registry).await?;
+            hide.extend(l.token.iter().chain(l.auth.iter()).cloned());
+            let file = self.dir.join(".dl").join("npmrc");
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&file)
+                .map_err(|e| format!("{}: {e}", file.display()))?;
+            std::io::Write::write_all(&mut f, npmrc(&l)?.as_bytes()).map_err(|e| format!("{}: {e}", file.display()))?;
+            env.push(("npm_config_userconfig", file.display().to_string()));
+        }
         if let Some(r) = registry {
             env.push(("npm_config_registry", r));
         }
@@ -706,18 +799,19 @@ impl Tools {
             std::fs::write(&file, ca).map_err(|e| format!("{}: {e}", file.display()))?;
             env.push(("NODE_EXTRA_CA_CERTS", file.display().to_string()));
         }
-        Ok(env)
+        Ok((env, hide))
     }
 
     /// `npm pack`s the package, checks the tarball against the pinned SHA-512 (or, with
     /// none pinned, against what the registry says), then installs that tarball.
     async fn npm(&self, package: &str, version: &str, integrity: Option<&str>) -> Result<(), String> {
         let npm = self.bin_dir().join("npm").display().to_string();
-        let (env, dl) = (self.npm_env()?, self.dir.join(".dl"));
+        let ((env, hide), dl) = (self.npm_env().await?, self.dir.join(".dl"));
         let spec = format!("{package}@{version}");
         let out = self
             .run(&npm, &["pack", &spec, "--pack-destination", &dl.display().to_string(), "--json"], &env, &dl)
-            .await?;
+            .await
+            .map_err(|e| scrub(e, &hide))?;
         #[derive(Deserialize)]
         struct Packed {
             filename: String,
@@ -738,7 +832,8 @@ impl Tools {
         let f = file.display().to_string();
         let prefix = self.dir.display().to_string();
         self.run(&npm, &["install", "-g", "--prefix", &prefix, "--omit=dev", "--no-fund", "--no-audit", &f], &env, &dl)
-            .await?;
+            .await
+            .map_err(|e| scrub(e, &hide))?;
         let manifest = self.dir.join("lib/node_modules").join(package).join("package.json");
         let installed = std::fs::read(&manifest)
             .ok()
@@ -1398,6 +1493,95 @@ mod tests {
         let _ = done_tx.send(());
         install.await.unwrap();
         assert!(t.job_permit().is_some());
+    }
+
+    #[test]
+    fn a_registry_login_becomes_one_npmrc_line_for_that_registry_alone() {
+        assert_eq!(nerf_dart("https://npm.corp.example/").as_deref(), Some("//npm.corp.example/"));
+        assert_eq!(nerf_dart("https://mirror.corp.example:8443/api/npm/remote/").as_deref(), Some("//mirror.corp.example:8443/api/npm/remote/"));
+        assert_eq!(nerf_dart("https://npm.corp.example:443/a/b").as_deref(), Some("//npm.corp.example/a/"), "the default port and the last segment go, as npm's");
+        assert_eq!(nerf_dart("https://[fd00::20]:8443/npm/").as_deref(), Some("//[fd00::20]:8443/npm/"));
+        assert_eq!(nerf_dart("not a url"), None);
+
+        let registry = "https://mirror.corp.example:8443/api/npm/remote/";
+        let token = wire::NpmLogin { registry: registry.into(), token: Some("glpat-AbC_1.2~3+4/5=:6".into()), auth: None };
+        assert_eq!(npmrc(&token).unwrap(), "//mirror.corp.example:8443/api/npm/remote/:_authToken=glpat-AbC_1.2~3+4/5=:6\n");
+        let basic = wire::NpmLogin { registry: registry.into(), token: None, auth: Some("c3ZjOnBhc3M=".into()) };
+        assert_eq!(npmrc(&basic).unwrap(), "//mirror.corp.example:8443/api/npm/remote/:_auth=c3ZjOnBhc3M=\n");
+        check_login(&token, registry).unwrap();
+
+        let other = check_login(&token, "https://npm.corp.example/").unwrap_err();
+        assert!(other.contains("not the plan's registry"), "{other}");
+        for (t, a, why) in [
+            (None, None, "neither"),
+            (Some("a"), Some("b"), "both"),
+            (Some("a\n//evil.example/:_authToken=x"), None, "a second line"),
+            (Some("a;b"), None, "a comment"),
+            (Some("${HOME}"), None, "a variable"),
+            (Some("\"quoted\""), None, "quotes"),
+            (Some(""), None, "empty"),
+        ] {
+            let l = wire::NpmLogin { registry: registry.into(), token: t.map(String::from), auth: a.map(String::from) };
+            assert!(check_login(&l, registry).is_err() && npmrc(&l).is_err(), "{why}");
+        }
+        assert!(!npmrc_value(&"a".repeat(MAX_LOGIN + 1)) && npmrc_value(&"a".repeat(MAX_LOGIN)));
+
+        let err = scrub("npm error 401 for Bearer glpat-xyz123 and _auth=c3Zj".into(), &["glpat-xyz123".into(), "c3Zj".into(), String::new()]);
+        assert_eq!(err, "npm error 401 for Bearer [redacted] and _auth=[redacted]");
+    }
+
+    #[tokio::test]
+    async fn npm_signs_in_with_botds_login_from_a_root_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let registry = "https://mirror.corp.example:8443/api/npm/remote/";
+        let node = NodeRuntime { version: "0.0.1".into(), downloads: BTreeMap::from([(std::env::consts::ARCH.into(), wire::Download { url: "https://mirror.corp.example/n.tar.xz".into(), sha256: "a".repeat(64) })]) };
+        let plan = HarnessPlan { node: Some(node), harnesses: vec![npm("pi", "p", "1.0.0")], npm_registry: Some(registry.into()), ca: None, npm_login: true };
+        // A machine whose botd answers `/v1/npm-login` with `body`, or none at all.
+        let machine = |n: u32, control: Option<String>| {
+            let dir = std::env::temp_dir().join(format!("superbot-tools-login-{}-{n}", now_ms()));
+            let t = Tools::new(dir.clone(), None).unwrap();
+            t.set_plan(plan.clone()).unwrap();
+            if let Some(url) = control {
+                t.set_control(&url, Box::new(|| download_client(None, None)));
+            }
+            (t, dir)
+        };
+        let control = |body: String| async move { serve_once(body).await.trim_end_matches("/install.sh").to_string() };
+        let env_of = |t: Arc<Tools>| async move { t.in_dl(async { t.npm_env().await.map(|_| ()) }).await };
+
+        let (t, _) = machine(1, None);
+        assert!(env_of(t).await.unwrap_err().contains("no control plane"));
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let gone = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let (t, _) = machine(2, Some(gone));
+        assert!(env_of(t).await.unwrap_err().contains("couldn't fetch the npm registry's login from botd"));
+        let elsewhere = serde_json::to_string(&wire::NpmLogin { registry: "https://elsewhere.example/".into(), token: Some("tok-elsewhere".into()), auth: None }).unwrap();
+        let (t, _) = machine(3, Some(control(elsewhere).await));
+        assert!(env_of(t).await.unwrap_err().contains("not the plan's registry"));
+        let (t, _) = machine(4, Some(control("{\"registry\":\"x\",\"password\":\"y\"}".into()).await));
+        assert!(env_of(t).await.unwrap_err().contains("isn't one this agent reads"));
+
+        let good = serde_json::to_string(&wire::NpmLogin { registry: registry.into(), token: Some("tok-1234-abcd".into()), auth: None }).unwrap();
+        let (t, dir) = machine(5, Some(control(good).await));
+        let seen = std::sync::Mutex::new(None);
+        t.in_dl(async {
+            let (env, hide) = t.npm_env().await?;
+            let file = env.iter().find(|(k, _)| *k == "npm_config_userconfig").map(|(_, v)| PathBuf::from(v)).unwrap();
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            *seen.lock().unwrap() = Some((std::fs::read_to_string(&file).unwrap(), mode, hide, env.iter().any(|(k, v)| *k == "npm_config_registry" && v == registry)));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let seen = seen.into_inner().unwrap().unwrap();
+        assert_eq!(seen.0, "//mirror.corp.example:8443/api/npm/remote/:_authToken=tok-1234-abcd\n");
+        assert_eq!(seen.1, 0o600, "root's alone");
+        assert_eq!(seen.2, ["tok-1234-abcd"], "taken out of npm's errors");
+        assert!(seen.3);
+        assert!(!dir.join(".dl").exists(), "the login goes with the downloads");
+        assert!(!std::fs::read_to_string(dir.join(STATE_FILE)).unwrap().contains("tok-1234-abcd"), "and is never saved");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

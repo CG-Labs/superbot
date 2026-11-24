@@ -6,9 +6,15 @@
 //! SHA-512 wherever it comes from, so a mirror can serve them but not change them.
 //! `GET /api/machines/harness-mirror` fetches everything the plan names from where
 //! machines would, and checks each against its pin, before any machine needs it.
+//!
+//! A registry that needs a login (ADR 0219) gets MACHINE_NPM_TOKEN, or
+//! MACHINE_NPM_USERNAME and MACHINE_NPM_PASSWORD, from botd's secrets. The plan only
+//! says one is needed (`npmLogin`); agents fetch it from botd's machine port for each
+//! install, and the check signs in with it as npm would.
 
 use super::tools::{self, MAX_CA};
-use super::wire::{HarnessPlan, InstallSource};
+use super::wire::{self, HarnessPlan, InstallSource};
+use crate::secrets::SecretStore;
 use crate::{ApiError, AppState, Res};
 use axum::Json;
 use axum::extract::State as AppS;
@@ -17,6 +23,7 @@ use base64::Engine;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256, Sha512};
 use std::sync::{Arc, Mutex};
+use zeroize::Zeroizing;
 
 /// npm's own registry, what a plan without MACHINE_NPM_REGISTRY uses.
 pub const NPM_REGISTRY: &str = "https://registry.npmjs.org/";
@@ -33,6 +40,106 @@ pub struct Mirrors {
     pub npm: Option<String>,
     /// MACHINE_MIRROR_CA_FILE's certificates, and the file they came from.
     pub ca: Option<(String, String)>,
+    /// How machines sign in to `npm` (ADR 0219).
+    pub login: Option<Login>,
+}
+
+/// How machines, and botd's check, sign in to MACHINE_NPM_REGISTRY (ADR 0219).
+#[derive(Clone, PartialEq)]
+pub enum Login {
+    /// MACHINE_NPM_TOKEN: npm's `_authToken`, sent as `Bearer`.
+    Token(Zeroizing<String>),
+    /// MACHINE_NPM_USERNAME and MACHINE_NPM_PASSWORD: npm's `_auth` (base64 of
+    /// `user:password`), sent as `Basic`.
+    Basic { username: String, auth: Zeroizing<String> },
+}
+
+impl std::fmt::Debug for Login {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Login::Token(_) => f.write_str("Login::Token(…)"),
+            Login::Basic { username, .. } => write!(f, "Login::Basic({username}, …)"),
+        }
+    }
+}
+
+/// The longest MACHINE_NPM_USERNAME.
+const MAX_USERNAME: usize = 256;
+
+impl Login {
+    fn from_env(store: &dyn SecretStore, var: &dyn Fn(&str) -> String) -> Result<Option<Login>, String> {
+        let secret = |k: &str| store.get(k).map_err(|e| format!("{k}: {e}")).map(|s| s.map(|s| Zeroizing::new(s.expose().to_string())));
+        let token = secret("MACHINE_NPM_TOKEN")?;
+        let password = secret("MACHINE_NPM_PASSWORD")?;
+        let username = var("MACHINE_NPM_USERNAME").trim().to_string();
+        let login = match (token, username.is_empty(), password) {
+            (None, true, None) => return Ok(None),
+            (Some(_), false, _) | (Some(_), _, Some(_)) => {
+                return Err("set MACHINE_NPM_TOKEN, or MACHINE_NPM_USERNAME and MACHINE_NPM_PASSWORD, not both".into());
+            }
+            (None, false, None) => return Err("MACHINE_NPM_USERNAME needs MACHINE_NPM_PASSWORD".into()),
+            (None, true, Some(_)) => return Err("MACHINE_NPM_PASSWORD needs MACHINE_NPM_USERNAME".into()),
+            (Some(t), true, None) => {
+                let t = Zeroizing::new(t.trim().to_string());
+                if !tools::npmrc_value(&t) {
+                    return Err(format!(
+                        "MACHINE_NPM_TOKEN must be 1 to {} letters, digits and - . _ ~ + / = :, as registry tokens are",
+                        tools::MAX_LOGIN
+                    ));
+                }
+                crate::secrets::redact::register(&t);
+                Login::Token(t)
+            }
+            (None, false, Some(p)) => {
+                if username.len() > MAX_USERNAME || username.contains(':') || username.chars().any(char::is_control) {
+                    return Err(format!("MACHINE_NPM_USERNAME must be up to {MAX_USERNAME} characters, without : or control characters"));
+                }
+                if p.is_empty() || p.chars().any(char::is_control) {
+                    return Err("MACHINE_NPM_PASSWORD must have no control characters".into());
+                }
+                let auth = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(format!("{username}:{}", p.as_str())));
+                if !tools::npmrc_value(&auth) {
+                    return Err(format!("MACHINE_NPM_USERNAME and MACHINE_NPM_PASSWORD are over {} bytes together", tools::MAX_LOGIN * 3 / 4));
+                }
+                crate::secrets::redact::register(&p);
+                crate::secrets::redact::register(&auth);
+                Login::Basic { username, auth }
+            }
+        };
+        Ok(Some(login))
+    }
+
+    /// `token` or `basic`, for the check and the audit log: never the value.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Login::Token(_) => "token",
+            Login::Basic { .. } => "basic",
+        }
+    }
+
+    /// The `Authorization` header npm would send.
+    pub fn header(&self) -> String {
+        match self {
+            Login::Token(t) => format!("Bearer {}", t.as_str()),
+            Login::Basic { auth, .. } => format!("Basic {}", auth.as_str()),
+        }
+    }
+
+    /// What `GET /v1/npm-login` sends an enrolled machine for `registry`.
+    pub fn wire(&self, registry: &str) -> wire::NpmLogin {
+        let (token, auth) = match self {
+            Login::Token(t) => (Some(t.as_str().to_string()), None),
+            Login::Basic { auth, .. } => (None, Some(auth.as_str().to_string())),
+        };
+        wire::NpmLogin { registry: registry.into(), token, auth }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Login::Token(_) => "signing in with MACHINE_NPM_TOKEN".into(),
+            Login::Basic { username, .. } => format!("signing in as {username} (MACHINE_NPM_USERNAME)"),
+        }
+    }
 }
 
 /// An https URL with no login, query or fragment, without its trailing `/`.
@@ -50,10 +157,15 @@ fn base(key: &str, raw: &str) -> Result<Option<String>, String> {
 }
 
 impl Mirrors {
-    pub fn from_env(var: &dyn Fn(&str) -> String) -> Result<Option<Mirrors>, String> {
+    /// Settings from `var`; the registry's login from `store`, botd's secrets.
+    pub fn from_env(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result<Option<Mirrors>, String> {
         let node = base("MACHINE_NODE_MIRROR", &var("MACHINE_NODE_MIRROR"))?;
         let npm = base("MACHINE_NPM_REGISTRY", &var("MACHINE_NPM_REGISTRY"))?.map(|u| format!("{u}/"));
         let file = var("MACHINE_MIRROR_CA_FILE").trim().to_string();
+        let login = Login::from_env(store, var)?;
+        if login.is_some() && npm.is_none() {
+            return Err("MACHINE_NPM_TOKEN, MACHINE_NPM_USERNAME and MACHINE_NPM_PASSWORD need MACHINE_NPM_REGISTRY: botd sends a registry login only to the operator's own registry".into());
+        }
         if node.is_none() && npm.is_none() {
             if !file.is_empty() {
                 return Err("MACHINE_MIRROR_CA_FILE needs MACHINE_NODE_MIRROR or MACHINE_NPM_REGISTRY".into());
@@ -71,7 +183,7 @@ impl Mirrors {
             tools::ca_bundle(&pem).map_err(|e| format!("MACHINE_MIRROR_CA_FILE ({file}): {e}"))?;
             Some((pem, file))
         };
-        Ok(Some(Mirrors { node, npm, ca }))
+        Ok(Some(Mirrors { node, npm, ca, login }))
     }
 
     /// `plan` as machines fetch it here: the same pins, from the mirrors. A plan with
@@ -88,6 +200,7 @@ impl Mirrors {
         }
         if npm && let Some(r) = &self.npm {
             plan.npm_registry = Some(r.clone());
+            plan.npm_login = self.login.is_some();
             mirrored = true;
         }
         if mirrored {
@@ -102,6 +215,9 @@ impl Mirrors {
             self.node.as_deref().unwrap_or("nodejs.org"),
             self.npm.as_deref().unwrap_or("npm's registry")
         );
+        if let Some(l) = &self.login {
+            s.push_str(&format!(" {}", l.describe()));
+        }
         if let Some((_, file)) = &self.ca {
             s.push_str(&format!(", their CA from {file}"));
         }
@@ -126,14 +242,45 @@ pub fn needs_agent_support(plan: &HarnessPlan) -> bool {
     plan.npm_registry.is_some() || plan.ca.is_some()
 }
 
+/// Whether npm would send `registry`'s login with a request for `url`: its key starts
+/// with the registry's (host, port and path; not the scheme).
+pub fn under_registry(url: &str, registry: &str) -> bool {
+    matches!((tools::nerf_dart(url), tools::nerf_dart(registry)), (Some(u), Some(r)) if u.starts_with(&r))
+}
+
+/// The check's requests, signed in to the registry as npm would be, and nowhere else.
+/// A redirect to another host or port drops the login (reqwest does), as npm does.
+struct Fetch<'a> {
+    http: reqwest::Client,
+    registry: &'a str,
+    login: Option<&'a Login>,
+}
+
+impl Fetch<'_> {
+    async fn get(&self, url: &str, accept: Option<&str>) -> Result<reqwest::Response, String> {
+        let mut req = self.http.get(url);
+        if let Some(a) = accept {
+            req = req.header("accept", a);
+        }
+        let ours = under_registry(url, self.registry);
+        if let Some(l) = self.login.filter(|_| ours) {
+            req = req.header("authorization", l.header());
+        }
+        let r = req.send().await.map_err(|e| format!("couldn't fetch {url}: {}", error_chain(&e.without_url())))?;
+        let code = r.status();
+        if ours && (code == StatusCode::UNAUTHORIZED || code == StatusCode::FORBIDDEN) {
+            return Err(match self.login {
+                Some(l) => format!("the registry refused botd's login ({code}) for {url}: check {}", if l.kind() == "token" { "MACHINE_NPM_TOKEN" } else { "MACHINE_NPM_USERNAME and MACHINE_NPM_PASSWORD" }),
+                None => format!("the registry wants a login ({code}) for {url}: set MACHINE_NPM_TOKEN, or MACHINE_NPM_USERNAME and MACHINE_NPM_PASSWORD"),
+            });
+        }
+        r.error_for_status().map_err(|e| format!("couldn't fetch {url}: {}", error_chain(&e.without_url())))
+    }
+}
+
 /// `url`'s SHA-256 (hex) and SHA-512 (npm's `sha512-<base64>`), read up to `max` bytes.
-async fn digests(http: &reqwest::Client, url: &str, max: u64) -> Result<(String, String), String> {
-    let mut r = http
-        .get(url)
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| format!("couldn't fetch {url}: {}", error_chain(&e.without_url())))?;
+async fn digests(http: &Fetch<'_>, url: &str, max: u64) -> Result<(String, String), String> {
+    let mut r = http.get(url, None).await?;
     let (mut a, mut b, mut n) = (Sha256::new(), Sha512::new(), 0u64);
     while let Some(chunk) = r.chunk().await.map_err(|e| format!("{url}: {}", error_chain(&e.without_url())))? {
         n += chunk.len() as u64;
@@ -162,15 +309,9 @@ fn error_chain(e: &dyn std::error::Error) -> String {
 }
 
 /// The registry's tarball and SHA-512 for `package@version`.
-async fn listed(http: &reqwest::Client, registry: &str, package: &str, version: &str) -> Result<(String, Option<String>), String> {
-    let url = format!("{registry}{}", package.replace('/', "%2f"));
-    let mut r = http
-        .get(&url)
-        .header("accept", "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8")
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| format!("couldn't fetch {url}: {}", error_chain(&e.without_url())))?;
+async fn listed(http: &Fetch<'_>, package: &str, version: &str) -> Result<(String, Option<String>), String> {
+    let url = format!("{}{}", http.registry, package.replace('/', "%2f"));
+    let mut r = http.get(&url, Some("application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8")).await?;
     let mut body = Vec::new();
     while let Some(chunk) = r.chunk().await.map_err(|e| format!("{url}: {}", error_chain(&e.without_url())))? {
         if (body.len() + chunk.len()) as u64 > MAX_PACKUMENT {
@@ -185,8 +326,8 @@ async fn listed(http: &reqwest::Client, registry: &str, package: &str, version: 
 }
 
 /// One npm harness: listed with its pinned SHA-512, and its tarball really that.
-async fn npm(http: &reqwest::Client, registry: &str, package: &str, version: &str, pin: Option<&str>) -> (Option<String>, Result<(), String>) {
-    let (tarball, integrity) = match listed(http, registry, package, version).await {
+async fn npm(http: &Fetch<'_>, package: &str, version: &str, pin: Option<&str>) -> (Option<String>, Result<(), String>) {
+    let (tarball, integrity) = match listed(http, package, version).await {
         Ok(l) => l,
         Err(e) => return (None, Err(e)),
     };
@@ -211,9 +352,10 @@ async fn npm(http: &reqwest::Client, registry: &str, package: &str, version: &st
 }
 
 /// Fetches everything `plan` names from where machines would, with the CA they'd
-/// trust, and checks each against its pin. The Hermes bundles botd serves (`hermes`)
-/// are read again from disk: machines fetch them from botd itself.
-pub async fn check(plan: &HarnessPlan, hermes: Option<&super::hermes_serve::Bundles>) -> Value {
+/// trust and, when the plan says the registry needs one, the login they'd use (`login`),
+/// and checks each against its pin. The Hermes bundles botd serves (`hermes`) are read
+/// again from disk: machines fetch them from botd itself.
+pub async fn check(plan: &HarnessPlan, hermes: Option<&super::hermes_serve::Bundles>, login: Option<&Login>) -> Value {
     // Every redirect followed, so `reach` checks where the files really came from.
     let hops = Arc::new(Mutex::new(Vec::<String>::new()));
     let seen = hops.clone();
@@ -226,6 +368,10 @@ pub async fn check(plan: &HarnessPlan, hermes: Option<&super::hermes_serve::Bund
         Err(e) => return json!({ "ok": false, "error": format!("the mirrors' CA: {e}"), "items": [] }),
     };
     let registry = plan.npm_registry.as_deref().unwrap_or(NPM_REGISTRY);
+    if plan.npm_login && login.is_none() {
+        return json!({ "ok": false, "error": "the plan's registry needs a login, and botd has none (MACHINE_NPM_TOKEN)", "items": [] });
+    }
+    let http = Fetch { http, registry, login: login.filter(|_| plan.npm_login) };
     let item = |mut v: Value, res: Result<(), String>| {
         v["ok"] = json!(res.is_ok());
         if let Err(e) = res {
@@ -245,7 +391,7 @@ pub async fn check(plan: &HarnessPlan, hermes: Option<&super::hermes_serve::Bund
     for h in &plan.harnesses {
         match &h.source {
             InstallSource::Npm { package, integrity } => {
-                let (url, res) = npm(&http, registry, package, &h.version, integrity.as_deref()).await;
+                let (url, res) = npm(&http, package, &h.version, integrity.as_deref()).await;
                 items.push(item(json!({ "name": h.name, "version": h.version, "package": package, "url": url }), res));
             }
             InstallSource::Script { url, sha256, .. } => {
@@ -273,7 +419,7 @@ pub async fn check(plan: &HarnessPlan, hermes: Option<&super::hermes_serve::Bund
     let mut redirects = hops.lock().unwrap().clone();
     redirects.sort();
     redirects.dedup();
-    json!({ "ok": ok, "npmRegistry": registry, "ca": plan.ca.is_some(), "items": items, "redirects": redirects })
+    json!({ "ok": ok, "npmRegistry": registry, "npmLogin": http.login.map(Login::kind), "ca": plan.ca.is_some(), "items": items, "redirects": redirects })
 }
 
 /// The provider firewall's outbound rules for machines, when they bind root: the
@@ -365,7 +511,7 @@ pub async fn check_now(AppS(app): AppS<AppState>) -> Res<Json<Value>> {
         .plan
         .clone()
         .ok_or_else(|| ApiError(StatusCode::CONFLICT, "MACHINE_HARNESSES is none, so machines get no harnesses to check.".into()))?;
-    let mut v = check(&plan, e.upkeep.hermes.as_ref()).await;
+    let mut v = check(&plan, e.upkeep.hermes.as_ref(), e.upkeep.mirrors.as_ref().and_then(|m| m.login.as_ref())).await;
     if let Some(out) = Outbound::from_env(&|k| std::env::var(k).unwrap_or_default()) {
         reach(&mut v, &out).await;
     }
@@ -373,6 +519,7 @@ pub async fn check_now(AppS(app): AppS<AppState>) -> Res<Json<Value>> {
         "node": e.upkeep.mirrors.as_ref().and_then(|m| m.node.clone()),
         "npm": e.upkeep.mirrors.as_ref().and_then(|m| m.npm.clone()),
         "caFile": e.upkeep.mirrors.as_ref().and_then(|m| m.ca.as_ref().map(|(_, f)| f.clone())),
+        "npmLogin": e.upkeep.mirrors.as_ref().and_then(|m| m.login.as_ref().map(Login::kind)),
     });
     Ok(Json(v))
 }
@@ -381,19 +528,24 @@ pub async fn check_now(AppS(app): AppS<AppState>) -> Res<Json<Value>> {
 mod tests {
     use super::*;
     use crate::machines::standin_mirror::Mirror;
+    use crate::secrets::env::EnvStore;
 
     fn env(pairs: &[(&str, String)]) -> impl Fn(&str) -> String {
         let pairs: Vec<(String, String)> = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
         move |k: &str| pairs.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone()).unwrap_or_default()
     }
 
+    fn from(pairs: &[(&str, String)]) -> Result<Option<Mirrors>, String> {
+        Mirrors::from_env(&env(pairs), &EnvStore::fixed(&[]))
+    }
+
     #[test]
     fn settings_are_checked_at_start() {
-        assert_eq!(Mirrors::from_env(&env(&[])).unwrap(), None, "off by default");
-        let m = Mirrors::from_env(&env(&[
+        assert_eq!(from(&[]).unwrap(), None, "off by default");
+        let m = from(&[
             ("MACHINE_NODE_MIRROR", " https://mirror.corp.example/nodejs/dist/ ".into()),
             ("MACHINE_NPM_REGISTRY", "https://mirror.corp.example/api/npm/npm-remote".into()),
-        ]))
+        ])
         .unwrap()
         .unwrap();
         assert_eq!(m.node.as_deref(), Some("https://mirror.corp.example/nodejs/dist"));
@@ -406,9 +558,9 @@ mod tests {
             ("MACHINE_NPM_REGISTRY", "https://mirror.corp.example/npm/?token=x"),
             ("MACHINE_NPM_REGISTRY", "https://mirror.corp.example/npm/#x"),
         ] {
-            assert!(Mirrors::from_env(&env(&[(k, v.into())])).is_err(), "{k}={v}");
+            assert!(from(&[(k, v.into())]).is_err(), "{k}={v}");
         }
-        let alone = Mirrors::from_env(&env(&[("MACHINE_MIRROR_CA_FILE", "/etc/ssl/corp.pem".into())])).unwrap_err();
+        let alone = from(&[("MACHINE_MIRROR_CA_FILE", "/etc/ssl/corp.pem".into())]).unwrap_err();
         assert!(alone.contains("needs MACHINE_NODE_MIRROR"), "{alone}");
 
         let dir = crate::db::temp_path("mirror-ca");
@@ -416,7 +568,7 @@ mod tests {
         let mirror = Mirror::ca_only();
         let good = dir.join("ca.pem");
         std::fs::write(&good, format!("{}\n{}", mirror.ca_pem(), Mirror::ca_only().ca_pem())).unwrap();
-        let with = |file: &std::path::Path| Mirrors::from_env(&env(&[("MACHINE_NPM_REGISTRY", "https://npm.corp.example".into()), ("MACHINE_MIRROR_CA_FILE", file.display().to_string())]));
+        let with = |file: &std::path::Path| from(&[("MACHINE_NPM_REGISTRY", "https://npm.corp.example".into()), ("MACHINE_MIRROR_CA_FILE", file.display().to_string())]);
         let m = with(&good).unwrap().unwrap();
         assert_eq!(m.ca.as_ref().map(|(_, f)| f.as_str()), Some(good.to_str().unwrap()));
         assert_eq!(tools::ca_bundle(&m.ca.unwrap().0), Ok(2), "a bundle of two CAs");
@@ -443,6 +595,7 @@ mod tests {
             node: Some("https://mirror.corp.example/nodejs".into()),
             npm: Some("https://npm.corp.example/".into()),
             ca: Some((Mirror::ca_only().ca_pem(), "/etc/ssl/corp.pem".into())),
+            login: None,
         };
         let out = m.apply(plan.clone());
         let n = out.node.as_ref().unwrap();
@@ -458,7 +611,7 @@ mod tests {
         assert_eq!(unmirrored(Some(&out)), ["hermes"]);
         assert!(m.describe(Some(&out)).contains("hermes still download"), "{}", m.describe(Some(&out)));
 
-        let only_node = Mirrors { node: m.node.clone(), npm: None, ca: None };
+        let only_node = Mirrors { node: m.node.clone(), ..Default::default() };
         let out = only_node.apply(plan.clone());
         assert!(!needs_agent_support(&out), "agents from before ADR 0186 can fetch Node.js from a mirror");
         assert_eq!(serde_json::to_value(&out).unwrap().get("npmRegistry"), None);
@@ -466,6 +619,135 @@ mod tests {
         let hermes_only = crate::adapters::install::plan(vec![hermes]);
         assert_eq!(m.apply(hermes_only.clone()), hermes_only, "nothing to mirror, so the plan and its id stay");
         assert_eq!(plan.id(), crate::adapters::install::plan(vec![claude, crate::adapters::install::install("hermes", None, None).unwrap()]).id());
+    }
+
+    #[test]
+    fn a_registry_login_comes_from_botds_secrets_and_is_checked_at_start() {
+        let registry = ("MACHINE_NPM_REGISTRY", "https://npm.corp.example/api/npm/remote".to_string());
+        let with = |vars: &[(&str, String)], secrets: &[(&str, &str)]| Mirrors::from_env(&env(vars), &EnvStore::fixed(secrets));
+        assert_eq!(with(std::slice::from_ref(&registry), &[]).unwrap().unwrap().login, None, "none by default");
+
+        let token = "eyJ2ZXIiOiIyIn0.cmVmdGtu-_~+/=:Zm9v";
+        let m = with(std::slice::from_ref(&registry), &[("MACHINE_NPM_TOKEN", &format!(" {token}\n"))]).unwrap().unwrap();
+        assert_eq!(m.login, Some(Login::Token(Zeroizing::new(token.into()))), "trimmed");
+        assert_eq!(m.login.as_ref().unwrap().header(), format!("Bearer {token}"));
+        assert_eq!(format!("{:?}", m.login), "Some(Login::Token(…))", "never printed");
+        assert!(crate::secrets::redact::text(&format!("saw {token}")).contains(crate::secrets::redact::MARK), "redacted wherever botd writes it");
+        let w = m.login.as_ref().unwrap().wire("https://npm.corp.example/api/npm/remote/");
+        assert_eq!((w.token.as_deref(), w.auth.as_deref()), (Some(token), None));
+        assert!(!format!("{w:?}").contains(token));
+
+        // From a file, as a Docker or systemd secret.
+        let dir = crate::db::temp_path("npm-login");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("token");
+        std::fs::write(&file, format!("{token}\n")).unwrap();
+        let m = with(std::slice::from_ref(&registry), &[("MACHINE_NPM_TOKEN_FILE", file.to_str().unwrap())]).unwrap().unwrap();
+        assert_eq!(m.login.unwrap().kind(), "token");
+
+        // A user and password: npm's `_auth`.
+        let user = ("MACHINE_NPM_USERNAME", "svc-superbot@corp.example".to_string());
+        let m = with(&[registry.clone(), user.clone()], &[("MACHINE_NPM_PASSWORD", "p@ss word;#${HOME}")]).unwrap().unwrap();
+        let auth = base64::engine::general_purpose::STANDARD.encode("svc-superbot@corp.example:p@ss word;#${HOME}");
+        let login = m.login.unwrap();
+        assert_eq!(login.header(), format!("Basic {auth}"));
+        assert_eq!(login.wire("r").auth.as_deref(), Some(auth.as_str()), "base64, so nothing in the password reaches npm's config as it is");
+        assert_eq!(format!("{login:?}"), "Login::Basic(svc-superbot@corp.example, …)");
+
+        for (vars, secrets, why) in [
+            (vec![], vec![("MACHINE_NPM_TOKEN", "abc")], "need MACHINE_NPM_REGISTRY"),
+            (vec![registry.clone(), user.clone()], vec![("MACHINE_NPM_TOKEN", "abc"), ("MACHINE_NPM_PASSWORD", "x")], "not both"),
+            (vec![registry.clone()], vec![("MACHINE_NPM_TOKEN", "abc"), ("MACHINE_NPM_PASSWORD", "x")], "not both"),
+            (vec![registry.clone(), user.clone()], vec![], "needs MACHINE_NPM_PASSWORD"),
+            (vec![registry.clone()], vec![("MACHINE_NPM_PASSWORD", "x")], "needs MACHINE_NPM_USERNAME"),
+            (vec![registry.clone()], vec![("MACHINE_NPM_TOKEN", "a\nb")], "as registry tokens are"),
+            (vec![registry.clone()], vec![("MACHINE_NPM_TOKEN", "abc;comment")], "as registry tokens are"),
+            (vec![registry.clone()], vec![("MACHINE_NPM_TOKEN", "${NPM_TOKEN}")], "as registry tokens are"),
+            (vec![registry.clone()], vec![("MACHINE_NPM_TOKEN", "a b")], "as registry tokens are"),
+            (vec![registry.clone(), ("MACHINE_NPM_USERNAME", "a:b".into())], vec![("MACHINE_NPM_PASSWORD", "x")], "without :"),
+            (vec![registry.clone(), user.clone()], vec![("MACHINE_NPM_PASSWORD", "a\nb")], "no control characters"),
+            (vec![registry.clone(), user.clone()], vec![("MACHINE_NPM_PASSWORD", &"x".repeat(4000))], "over"),
+        ] {
+            let err = with(&vars, &secrets).unwrap_err();
+            assert!(err.contains(why), "{vars:?} {:?}: {err}", secrets.iter().map(|(k, _)| k).collect::<Vec<_>>());
+            assert!(!err.contains("a\nb") && !err.contains("abc"), "the value isn't in the error: {err}");
+        }
+        assert!(with(&[registry], &[("MACHINE_NPM_TOKEN", &"t".repeat(tools::MAX_LOGIN + 1))]).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_login_only_flags_the_plan_and_only_for_the_registry() {
+        let claude = crate::adapters::install::install("claude", None, None).unwrap();
+        let hermes = crate::adapters::install::install("hermes", None, None).unwrap();
+        let plan = crate::adapters::install::plan(vec![claude.clone()]);
+        let token = "s3cr3t-registry-token-0001";
+        let m = Mirrors { npm: Some("https://npm.corp.example/".into()), login: Some(Login::Token(Zeroizing::new(token.into()))), ..Default::default() };
+        let out = m.apply(plan.clone());
+        assert!(out.npm_login && needs_agent_support(&out));
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(json.contains("\"npmLogin\":true") && !json.contains(token), "the plan says a login is needed, never what it is: {json}");
+        tools::check(&out).unwrap();
+        assert!(m.describe(Some(&out)).contains("npm from https://npm.corp.example/ signing in with MACHINE_NPM_TOKEN"), "{}", m.describe(Some(&out)));
+        let without = Mirrors { login: None, ..m.clone() }.apply(plan.clone());
+        assert!(!without.npm_login && serde_json::to_value(&without).unwrap().get("npmLogin").is_none(), "left out, so the plan's id stays");
+        assert_ne!(out.id(), without.id());
+        let hermes_only = crate::adapters::install::plan(vec![hermes]);
+        assert!(!m.apply(hermes_only).npm_login, "no npm harness, no registry, no login");
+        assert!(tools::check(&HarnessPlan { npm_registry: None, ..out }).unwrap_err().contains("names none"));
+
+        assert!(under_registry("https://npm.corp.example/@corp%2fx", "https://npm.corp.example/"));
+        assert!(under_registry("http://npm.corp.example/x/-/x-1.0.0.tgz", "https://npm.corp.example/"), "npm matches without the scheme");
+        let r = "https://mirror.corp.example:8443/api/npm/remote/";
+        assert!(under_registry("https://mirror.corp.example:8443/api/npm/remote/x/-/x-1.tgz", r));
+        for url in [
+            "https://mirror.corp.example:8443/api/npm/remote2/x",
+            "https://mirror.corp.example:8443/api/generic/node/v24/node.tar.xz",
+            "https://mirror.corp.example/api/npm/remote/x",
+            "https://storage.corp.example/api/npm/remote/x",
+            "not a url",
+        ] {
+            assert!(!under_registry(url, r), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_check_signs_in_to_the_registry_as_machines_would_and_nowhere_else() {
+        let mirror = Mirror::serve().await;
+        let node = mirror.node("0.0.1", b"a node tarball");
+        let pin = mirror.package("@corp/fake-claude", "9.9.9", b"claude's tarball");
+        mirror.package("fake-codex", "1.0.0", b"codex's tarball");
+        mirror.redirect_to_other("/npm/fake-codex/-/fake-codex-1.0.0.tgz");
+        let token = Login::Token(Zeroizing::new("stand-in-token-7c1e".into()));
+        mirror.require(&token.header());
+        let plan = mirror.plan(&node, vec![("claude", "@corp/fake-claude", "9.9.9", Some(pin)), ("codex", "fake-codex", "1.0.0", None)]);
+        assert!(plan.npm_login);
+
+        let v = check(&plan, None, Some(&token)).await;
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["npmLogin"], "token", "{v}");
+        let authorized = mirror.authorized();
+        assert!(authorized.iter().any(|p| p == "/npm/@corp%2ffake-claude") && authorized.iter().any(|p| p == "/npm/@corp/fake-claude/-/fake-claude-9.9.9.tgz"), "{authorized:?}");
+        assert!(authorized.iter().all(|p| p.starts_with("/npm/")), "not to Node.js's mirror, nor to the storage a redirect sends it to: {authorized:?}");
+        assert!(mirror.calls().iter().any(|p| p.starts_with("/stored/")), "{:?}", mirror.calls());
+
+        // No login where the plan wants one, a login the registry refuses, and one the
+        // plan doesn't ask for (not sent).
+        let v = check(&plan, None, None).await;
+        assert_eq!(v["ok"], false);
+        assert!(v["error"].as_str().unwrap().contains("MACHINE_NPM_TOKEN"), "{v}");
+        let wrong = Login::Basic { username: "svc".into(), auth: Zeroizing::new("c3ZjOm5vcGU=".into()) };
+        let v = check(&plan, None, Some(&wrong)).await;
+        assert_eq!(v["ok"], false);
+        let err = v["items"][1]["error"].as_str().unwrap();
+        assert!(err.contains("refused botd's login (401 Unauthorized)") && err.contains("MACHINE_NPM_USERNAME and MACHINE_NPM_PASSWORD"), "{err}");
+        assert!(!v.to_string().contains("c3ZjOm5vcGU="), "{v}");
+        let before = mirror.authorized().len();
+        let v = check(&HarnessPlan { npm_login: false, ..plan.clone() }, None, Some(&token)).await;
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["npmLogin"], Value::Null);
+        assert!(v["items"][1]["error"].as_str().unwrap().contains("the registry wants a login (401 Unauthorized)"), "{v}");
+        assert_eq!(mirror.authorized().len(), before, "a plan without a login sends none");
     }
 
     #[test]
@@ -482,7 +764,7 @@ mod tests {
         mirror.package("fake-codex", "1.0.0", b"codex's tarball");
         let plan = mirror.plan(&node, vec![("claude", "@corp/fake-claude", "9.9.9", Some(good.clone())), ("codex", "fake-codex", "1.0.0", None)]);
 
-        let v = check(&plan, None).await;
+        let v = check(&plan, None, None).await;
         assert_eq!(v["ok"], true, "{v}");
         assert_eq!(v["items"].as_array().unwrap().len(), 3, "{v}");
         assert!(v["items"][1]["url"].as_str().unwrap().starts_with(&mirror.url), "{v}");
@@ -490,7 +772,7 @@ mod tests {
         assert!(calls.iter().any(|c| c == "/npm/@corp%2ffake-claude"), "scoped packages are asked for as npm does: {calls:?}");
 
         // No CA: the mirror's certificate isn't trusted.
-        let v = check(&HarnessPlan { ca: None, ..plan.clone() }, None).await;
+        let v = check(&HarnessPlan { ca: None, ..plan.clone() }, None, None).await;
         assert_eq!(v["ok"], false);
         assert!(v["items"][0]["error"].as_str().unwrap().contains("couldn't fetch"), "{v}");
 
@@ -500,7 +782,7 @@ mod tests {
         let wrong_pin = format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode([1u8; 64]));
         let mut bad = mirror.plan(&node, vec![("claude", "@corp/fake-claude", "9.9.9", Some(wrong_pin)), ("codex", "fake-codex", "1.0.0", None), ("pi", "fake-codex", "2.0.0", None)]);
         bad.node.as_mut().unwrap().downloads.values_mut().for_each(|d| d.sha256 = "b".repeat(64));
-        let v = check(&bad, None).await;
+        let v = check(&bad, None, None).await;
         assert_eq!(v["ok"], false);
         let errors: Vec<&str> = v["items"].as_array().unwrap().iter().map(|i| i["error"].as_str().unwrap_or("")).collect();
         assert!(errors[0].contains("not the pinned"), "{errors:?}");
@@ -527,7 +809,7 @@ mod tests {
             .unwrap()
         };
 
-        let mut v = check(&plan, None).await;
+        let mut v = check(&plan, None, None).await;
         assert_eq!(v["ok"], true, "{v}");
         reach(&mut v, &incus("")).await;
         assert_eq!(v["ok"], false, "{v}");
@@ -535,7 +817,7 @@ mod tests {
         assert_eq!(blocked.len(), 1, "one place, however many files: {v}");
         assert!(blocked[0]["error"].as_str().unwrap().contains(&format!("add {here} to INCUS_EGRESS_ALLOW")), "{v}");
 
-        let mut v = check(&plan, None).await;
+        let mut v = check(&plan, None, None).await;
         reach(&mut v, &incus(&here)).await;
         assert_eq!(v["ok"], true, "{v}");
         assert_eq!(v["blocked"], json!([]));
@@ -549,7 +831,7 @@ mod tests {
                 ("MACHINE_FIREWALL_EGRESS", egress.to_string()),
             ]))
         };
-        let mut v = check(&plan, None).await;
+        let mut v = check(&plan, None, None).await;
         reach(&mut v, &linode("").unwrap()).await;
         assert_eq!(v["ok"], false, "{v}");
         assert!(v["blocked"][0]["error"].as_str().unwrap().contains("MACHINE_FIREWALL_EGRESS=off"), "{v}");
@@ -563,7 +845,7 @@ mod tests {
             ("INCUS_HOSTS", "b=https://127.0.0.1:8443".into()),
         ]))
         .unwrap();
-        let mut v = check(&plan, None).await;
+        let mut v = check(&plan, None, None).await;
         reach(&mut v, &fleet).await;
         assert_eq!(v["blocked"].as_array().unwrap().len(), 1, "{v}");
     }
@@ -580,7 +862,7 @@ mod tests {
         let other = url::Url::parse(&mirror.other).unwrap();
         let there = format!("{}:{}", other.host_str().unwrap(), other.port().unwrap());
 
-        let mut v = check(&plan, None).await;
+        let mut v = check(&plan, None, None).await;
         assert_eq!(v["ok"], true, "the redirected tarball is still the pinned one: {v}");
         assert_eq!(v["redirects"], json!([format!("{}/stored/npm/fake-codex/-/fake-codex-1.0.0.tgz", mirror.other)]));
         let incus = Outbound::from_env(&env(&[

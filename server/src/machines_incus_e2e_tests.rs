@@ -174,7 +174,7 @@ async fn serve_with(extra: Vec<(&'static str, String)>) -> Env {
     }
     let var = settings(&fixed);
     let mut cp = crate::machines::ControlPlane::from_env(&EnvStore::process(), var.clone()).unwrap();
-    let e = Enrollment::from_env(&var, &crate::secrets::sealed::cipher(), &bin_dir()).unwrap().unwrap();
+    let e = Enrollment::from_env(&var, &EnvStore::process(), &crate::secrets::sealed::cipher(), &bin_dir()).unwrap().unwrap();
     assert!(
         e.agent_sha256().is_some(),
         "superbot-machine must be built next to the tests ({}): cargo build --bin superbot-machine",
