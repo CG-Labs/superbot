@@ -8239,8 +8239,13 @@ impl Db {
     // Sessions and sign-in codes. Callers hash tokens; nothing here sees one.
 
     pub fn create_session(&self, s: &NewSession) -> Session {
+        self.create_session_at(s, now())
+    }
+
+    /// `create_session`, made at `at`: the clock reading its `expires_at` was counted from, so
+    /// a millisecond tick between the two can't shorten the session.
+    pub fn create_session_at(&self, s: &NewSession, at: i64) -> Session {
         let id = format!("s{}", crate::random_hex(8));
-        let at = now();
         {
             let c = self.c();
             c.execute(

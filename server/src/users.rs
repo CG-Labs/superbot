@@ -391,10 +391,11 @@ pub fn start_session(a: &Auth, user: &User, method: &str, idp: Option<(&str, &st
 #[allow(clippy::too_many_arguments)]
 pub fn start_session_ending(a: &Auth, user: &User, method: &str, idp: Option<(&str, &str)>, mfa: Option<&str>, cookie: bool, label: Option<&str>, source: &Source, ends: Option<i64>) -> (Session, String) {
     let token = new_secret(SESSION_PREFIX);
-    let max = db::now() + a.sessions.max_ms;
+    let at = db::now();
+    let max = at + a.sessions.max_ms;
     let app = a.app.as_ref().expect("sessions need the database");
     let new_network = crate::signin_watch::new_network(a, user, source);
-    let s = app.db.create_session(&NewSession {
+    let s = app.db.create_session_at(&NewSession {
         user_id: &user.id,
         token_hash: &hash(&token),
         kind: if cookie { "cookie" } else { "token" },
@@ -406,7 +407,7 @@ pub fn start_session_ending(a: &Auth, user: &User, method: &str, idp: Option<(&s
         user_agent: source.user_agent.as_deref(),
         expires_at: ends.map_or(max, |e| e.min(max)),
         mfa,
-    });
+    }, at);
     crate::signin_watch::succeeded(a, source, &user.id, method, new_network, Some(&s.id));
     (s, token)
 }
