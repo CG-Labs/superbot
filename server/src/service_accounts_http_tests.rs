@@ -404,13 +404,16 @@ async fn owners_who_manage_none_see_theirs_revoke_tokens_and_disable_them_only()
     assert_eq!(call(port, "GET", &format!("/api/service-accounts/{sa}/tokens"), &ro_auth, "").await.0, 200);
 
     // Nothing that makes, widens or changes it.
-    for (method, path, body) in [
+    for (i, (method, path, body)) in [
         ("POST", "/api/service-accounts".to_string(), r#"{"name":"Mine"}"#),
         ("POST", format!("/api/service-accounts/{sa}/tokens"), "{}"),
         ("POST", format!("/api/service-accounts/{sa}/tokens/{t1_id}/rotate"), "{}"),
         ("DELETE", format!("/api/service-accounts/{sa}"), ""),
-    ] {
-        assert_eq!(call(port, method, &path, &ro_auth, body).await.0, 403, "{method} {path}");
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(call(port, method, &path, &ro_auth, body).await.0, 403, "{method} call {i}");
     }
     for body in [r#"{"name":"Renamed"}"#, r#"{"role":"member"}"#, r#"{"status":"disabled","name":"Renamed"}"#, r#"{"status":"disabled","unexpected":true}"#, body_owner(&ro).as_str(), r#"{"status":"active"}"#] {
         let (code, v) = json_call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &ro_auth, body).await;
@@ -461,8 +464,8 @@ async fn owners_who_manage_none_see_theirs_revoke_tokens_and_disable_them_only()
     let desk = app.db.create_bot_owned("Desk", "#fff", "waddle", "claude", None, false, users::OPERATOR, Visibility::Shared).id;
     send(port, &admin, &desk, "hi").await;
     let bot = run_token(&env).await;
-    for (method, path, body) in [("GET", "/api/service-accounts".to_string(), ""), ("GET", path.clone(), ""), ("PATCH", path.clone(), r#"{"status":"disabled"}"#)] {
-        assert_eq!(call(port, method, &path, &bot, body).await.0, 403, "{method} {path}");
+    for (i, (method, path, body)) in [("GET", "/api/service-accounts".to_string(), ""), ("GET", path.clone(), ""), ("PATCH", path.clone(), r#"{"status":"disabled"}"#)].into_iter().enumerate() {
+        assert_eq!(call(port, method, &path, &bot, body).await.0, 403, "{method} call {i}");
     }
     assert!(app.db.service_account(&sa).unwrap().user.active());
 }
