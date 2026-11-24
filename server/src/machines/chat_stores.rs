@@ -359,6 +359,33 @@ fn clear_backup(path: &Path, bots: &[String], key: Option<&DbKey>) -> Result<Hel
     r
 }
 
+/// A store's finished backups, newest first, for clearing: unlike `backups`, a folder or
+/// entry botd can't read is an error, so nothing is taken as cleared unchecked. Copies a
+/// crash left half made (`.partial-*`, of a backup or a rewrite) may hold moved rows too, and
+/// are deleted first; nothing else writes there while the hourly check runs.
+fn backups_to_clear(store: &ChatStore) -> Result<Vec<(i64, PathBuf)>, String> {
+    let dir = backups_dir(store);
+    let unreadable = |e: std::io::Error| format!("{}: {e}", dir.display());
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(unreadable(e)),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(unreadable)?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(".partial-") {
+            std::fs::remove_file(entry.path()).map_err(|e| format!("{}: {e}", entry.path().display()))?;
+        } else if let Some(t) = backup_time(&name) {
+            out.push((t, entry.path()));
+        }
+    }
+    out.sort_by(|a, b| b.cmp(a));
+    Ok(out)
+}
+
 /// Clears each store's backups of the rows of Bots that left it (`Db::moves_out_to_clear`),
 /// then records those moves as cleared, so reports stop listing the backups as earlier
 /// copies. Each store that had backups rewritten is audited as
@@ -378,8 +405,11 @@ pub fn clear_pass(db: &Db, at: i64) -> Vec<(String, Result<Cleared, String>)> {
         };
         let bots: Vec<String> = moves.iter().map(|(b, _)| b.clone()).collect();
         let mut done = Cleared { bots: bots.len(), ..Cleared::default() };
-        let mut failed = Vec::new();
-        for (_, path) in backups(&store) {
+        let (listed, mut failed) = match backups_to_clear(&store) {
+            Ok(b) => (b, Vec::new()),
+            Err(e) => (Vec::new(), vec![e]),
+        };
+        for (_, path) in listed {
             match clear_backup(&path, &bots, key) {
                 Ok(h) if h.total() > 0 => {
                     done.backups += 1;
@@ -770,5 +800,36 @@ mod tests {
         std::fs::remove_file(&bad).unwrap();
         assert!(clear_pass(&db, now())[0].1.is_ok());
         assert!(db.chat_moves_out(std::slice::from_ref(&ada), "de-fra-2").is_empty());
+    }
+
+    #[test]
+    fn a_backup_folder_botd_cant_read_isnt_taken_as_cleared_and_half_made_copies_go() {
+        let Two { t: _t, db, lon } = two();
+        let (ada, bot) = pinned_bot(&db, "ada", "gb-lon");
+        let word = "chat-a8e04d-left-behind";
+        db.add_message(&bot, "user", word, None, false, None);
+        backup_pass(&db, 7, now());
+        let dir = lon.join("backups");
+        db.unpin_residency(crate::db::PinOn::User, &ada).unwrap();
+        db.place_chats().unwrap();
+        // The folder can't be listed: nothing shows what its backups hold.
+        let aside = lon.join("backups-aside");
+        std::fs::rename(&dir, &aside).unwrap();
+        std::fs::write(&dir, b"not a folder").unwrap();
+        let r = clear_pass(&db, now());
+        assert!(r[0].1.as_ref().unwrap_err().contains("backups"), "{r:?}");
+        assert_eq!(db.moves_out_to_clear(&db.chat_stores()[0]).unwrap().len(), 1, "not cleared unchecked");
+        std::fs::remove_file(&dir).unwrap();
+        std::fs::rename(&aside, &dir).unwrap();
+        // A copy a crash left half made, of a backup or a rewrite, holds her rows too.
+        let backup = files_in(&dir).pop().unwrap();
+        let partial = dir.join(format!(".partial-{backup}"));
+        std::fs::copy(dir.join(&backup), &partial).unwrap();
+        assert!(holds(&partial, word));
+        let r = clear_pass(&db, now());
+        assert_eq!(r[0].1.as_ref().map(|c| c.backups), Ok(1), "{r:?}");
+        assert_eq!(files_in(&dir), vec![backup.clone()], "the half-made copy is gone");
+        assert!(!holds(&dir.join(&backup), word));
+        assert!(db.moves_out_to_clear(&db.chat_stores()[0]).unwrap().is_empty());
     }
 }

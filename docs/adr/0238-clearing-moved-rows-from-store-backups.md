@@ -36,6 +36,7 @@ For a customer pinned to Frankfurt whose data used to be in London, that is a we
 
 - On the same hourly check as the store backups, right after them (in the same task, so no backup of botd's is made while one is rewritten), and on the first check after startup.
 - Once every backup of a store is done, its moves are recorded as cleared, only if each is still the move that was read (a Bot that moved out again meanwhile keeps its newer one).
+- Clearing lists the backups strictly: a `backups/` folder or entry botd can't read is a failure, never an empty list, so nothing is taken as cleared unchecked. Copies a crash left half made (`.partial-*`, of a backup or a rewrite) may hold the moved rows too; they are deleted before the backups are checked, and one that can't be deleted is a failure.
 - A backup that can't be rewritten (it doesn't open with botd's key, for example one made before a master key rotation, or fails its check) leaves the store's moves uncleared; the others are still rewritten. It is tried again each hour, and goes by itself once it is older than the newest `REGION_DATA_BACKUPS`, after which the moves are cleared.
 
 ### Evidence and visibility
@@ -65,7 +66,8 @@ For a customer pinned to Frankfurt whose data used to be in London, that is a we
 - Unit (`machines/chat_stores.rs`):
   - a Bot's rows that left London are taken out of both its backups, the other person's rows stay, each file keeps its name, passes its integrity check and stays one self-contained file, no partial copy is left, and the move stops being an earlier copy; a second pass does nothing; moving out again clears again;
   - a move back into the store, or one still pending, isn't cleared; a moved Bot deleted since is;
-  - a backup that can't be opened keeps the moves uncleared while the others are rewritten, and once it is gone the next pass clears them.
+  - a backup that can't be opened keeps the moves uncleared while the others are rewritten, and once it is gone the next pass clears them;
+  - a `backups/` folder botd can't list keeps the moves uncleared, and a half-made copy left by a crash is deleted before they are cleared.
 - Unit (`db/chats.rs`): move records from before this change gain `cleared_at` and still count as earlier copies until cleared.
 - End to end on the real router (`machines_residency_tests.rs`): pinned from London to Frankfurt, London's backup is an earlier copy; left for hours, `GET /api/regions` warns; the hourly pass takes her messages out of it, the backup still says it is London's store, the clearing is audited with counts, and the report (`earlierCopies` empty, `inRegion` true, digest), `GET /api/me/residency` (`earlierBackups: 0`) and `GET /api/regions` show it.
 - Client (`residency.test.ts`): the line about older backups.
