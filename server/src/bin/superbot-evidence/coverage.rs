@@ -2,7 +2,7 @@
 //! observation period. Every bundle in it (botd's evidence bundles, ADR 0142; the
 //! change-management bundles, ADR 0148; the vulnerability bundles, ADR 0086; the restore
 //! drill bundles, ADR 0177; the policy register bundles, ADR 0204; the uptime bundles,
-//! ADR 0251) is checked
+//! ADR 0249) is checked
 //! against its own `SHA256SUMS` and manifest, and the report says which days of the period
 //! each kind of bundle, each readiness checklist row and each criterion has evidence for,
 //! and where the gaps are. Reads local files only: no token, no network, nothing written

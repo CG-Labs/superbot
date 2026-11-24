@@ -103,7 +103,7 @@ jobs:
       - run: cargo test --test drill_evidence
       # ADR 0204: the register bundle from a register, the real policy files and baseline checks.
       - run: cargo test --test register_evidence
-      # ADR 0251: the uptime bundle from a stand-in Prometheus and from a checks file.
+      # ADR 0249: the uptime bundle from a stand-in Prometheus and from a checks file.
       - run: cargo test --test uptime_evidence
 
   site:

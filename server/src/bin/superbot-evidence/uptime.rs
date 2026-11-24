@@ -1,4 +1,4 @@
-//! Uptime evidence (ADR 0251): the availability SLO (docs/slo.md) measured from the
+//! Uptime evidence (ADR 0249): the availability SLO (docs/slo.md) measured from the
 //! outside probe's own checks of `/status.json`, for a period. Each minute is up when any
 //! check in it succeeded, down when it had checks and all of them failed, and unmeasured
 //! when it had none; announced maintenance doesn't count, up to 4 hours a month. Each
@@ -63,7 +63,7 @@ const README: &str = "SuperBot uptime evidence bundle
 ===============================
 
 Made by superbot-evidence, for a SOC 2 Type II evidence store
-(docs/security/soc2-evidence-plan.md, ADR 0251). It covers the period in manifest.json:
+(docs/security/soc2-evidence-plan.md, ADR 0249). It covers the period in manifest.json:
 from its first day (00:00 UTC) up to, not including, its last.
 
   uptime.json    the availability SLO (docs/slo.md) measured from the outside probe's
