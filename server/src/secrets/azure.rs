@@ -301,7 +301,8 @@ impl Entra {
             return Ok(t.value.clone());
         }
         let t = sign_in(self.label, &self.http, &self.local, &self.auth, &self.authority, &self.identity, &self.resource).await.map_err(|e| e.to_string())?;
-        // Masked wherever an error might quote it, while this or anyone else uses it.
+        // Masked wherever an error might quote it, while this or another holder uses it:
+        // Entra and the instance metadata service can hand out the same token again.
         super::redact::hold(&t.value);
         let value = t.value.clone();
         if let Some(old) = self.token.lock().unwrap_or_else(|e| e.into_inner()).replace(t) {

@@ -9,7 +9,7 @@ use rusqlite::{params, Connection};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::sync::{Mutex, RwLock};
+use std::sync::RwLock;
 
 pub const MARK: &str = "[redacted]";
 /// Shorter values are too likely to be ordinary words.
@@ -44,30 +44,31 @@ pub fn forget(value: &str) {
     KNOWN.write().unwrap_or_else(|e| e.into_inner()).retain(|k| k != value.trim());
 }
 
-/// Short-lived values (access tokens) by how many hold them, and whether each was known
-/// before the first hold. A sign-in can hand back the token it gave before, or the same
-/// one to two holders, so a value is masked until its last holder lets go.
-static HELD: Mutex<BTreeMap<String, (usize, bool)>> = Mutex::new(BTreeMap::new());
+/// Values masked only while something holds them, such as a token in use: by holders,
+/// and whether the first hold registered it (one already known stays known).
+static HELD: std::sync::Mutex<BTreeMap<String, (usize, bool)>> = std::sync::Mutex::new(BTreeMap::new());
 
-/// Masks `value` while it is held; pair each call with [`release`].
+/// Masks `value` until each [`hold`] of it is [`release`]d: the same token handed out
+/// again, or to two holders, stays masked while any still has it.
 pub fn hold(value: &str) {
-    let v = value.trim();
+    let v = value.trim().to_string();
     let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = held.entry(v.to_string()).or_insert_with(|| (0, known().iter().any(|k| k == v)));
+    let entry = held.entry(v).or_insert_with_key(|v| (0, !known().contains(v)));
     entry.0 += 1;
-    register(v);
+    if entry.0 == 1 {
+        register(value);
+    }
 }
 
-/// Forgets a held value once no one holds it, unless it was known before it was held.
 pub fn release(value: &str) {
     let v = value.trim();
     let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
     let Some(entry) = held.get_mut(v) else { return };
     entry.0 -= 1;
     if entry.0 == 0 {
-        let was_known = entry.1;
+        let added = entry.1;
         held.remove(v);
-        if !was_known {
+        if added {
             forget(v);
         }
     }
@@ -290,29 +291,23 @@ mod tests {
     }
 
     #[test]
-    fn a_held_token_stays_masked_until_its_last_holder_lets_go() {
-        let masked = |v: &str| text(v) == MARK;
-        let token = unique("access-token-held");
+    fn a_held_value_stays_masked_until_every_holder_lets_go() {
+        let token = unique("eyJ.held");
         hold(&token);
-        // A renewal that hands back the same token: held again, then the old copy released.
-        hold(&token);
-        release(&token);
-        assert!(masked(&token), "the token in use is still masked");
-        // A second holder of the same identity's token.
+        // The same token again, as a refresh can return: the new hold, then the old release.
         hold(&token);
         release(&token);
-        assert!(masked(&token));
+        assert_eq!(text(&format!("x {token}")), "x [redacted]", "still in use");
         release(&token);
-        assert!(!masked(&token), "forgotten with the last holder");
+        assert!(text(&token).contains(&token), "no one holds it");
         release(&token);
-        assert!(!masked(&token), "a stray release changes nothing");
 
-        let stored = unique("stored-secret");
-        register(&stored);
-        hold(&stored);
-        release(&stored);
-        assert!(masked(&stored), "a value known for good stays known");
-        forget(&stored);
+        let kept = unique("sk-kept");
+        register(&kept);
+        hold(&kept);
+        release(&kept);
+        assert_eq!(text(&kept), MARK, "known before it was held, so still known");
+        forget(&kept);
     }
 
     #[test]

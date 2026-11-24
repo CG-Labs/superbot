@@ -21,6 +21,10 @@ use std::time::Duration;
 pub const API_VERSION: &str = "2023-01-01";
 /// The Logs Ingestion API's limit for one request, compressed or not.
 const MAX_BODY: usize = if cfg!(test) { 4_096 } else { 1_000_000 };
+/// The longest `Line` sent whole, well under Azure's 64 KB for one field.
+const MAX_LINE: usize = if cfg!(test) { 1_000 } else { 32_000 };
+/// How much of a longer line each part carries: JSON escaping at most doubles it.
+const PART: usize = if cfg!(test) { 500 } else { 16_000 };
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest `Retry-After` botd waits for before trying again.
 const MAX_RETRY_AFTER: u64 = 300;
@@ -130,16 +134,36 @@ impl Monitor {
     }
 }
 
-/// One exported line as a record of the stream: `TimeGenerated` from the event's time,
-/// the typed columns from the line's own fields, and the line whole.
-pub fn record(line: &Value, text: &str) -> Value {
+/// One exported line as records of the stream: `TimeGenerated` from the event's time,
+/// the typed columns from the line's own fields, and the line whole in `Line` with
+/// `LinePart` 0. Azure cuts any field over 64 KB, so a line over [`MAX_LINE`] (an
+/// `audit.erased` listing many rows) goes as several records instead, `LinePart` 1 to n,
+/// each `Line` a [`crate::audit_line::part`] that `botctl audit verify-lines` puts back
+/// together. Their `Details` is empty: it is as big as the line.
+pub fn records(line: &Value, text: &str) -> Vec<Value> {
     let mut r = serde_json::Map::new();
     r.insert("TimeGenerated".into(), line["time"].clone());
     for (column, field) in COLUMNS {
         r.insert(column.into(), line.get(field).cloned().unwrap_or(Value::Null));
     }
-    r.insert("Line".into(), json!(text));
-    Value::Object(r)
+    if text.len() <= MAX_LINE {
+        r.insert("LinePart".into(), json!(0));
+        r.insert("Line".into(), json!(text));
+        return vec![Value::Object(r)];
+    }
+    r.insert("Details".into(), Value::Null);
+    let id = line["id"].as_i64().unwrap_or_default();
+    let host = line["host"].as_str().unwrap_or_default();
+    crate::audit_line::parts(id, host, text, PART)
+        .into_iter()
+        .enumerate()
+        .map(|(i, part)| {
+            let mut r = r.clone();
+            r.insert("LinePart".into(), json!(i + 1));
+            r.insert("Line".into(), json!(part));
+            Value::Object(r)
+        })
+        .collect()
 }
 
 /// The records as JSON arrays of at most [`MAX_BODY`] bytes each, in order. A record
@@ -241,7 +265,7 @@ mod tests {
     use axum::extract::{Path, Query, State};
     use axum::http::{HeaderMap, StatusCode};
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     const DCR: &str = "dcr-0123456789abcdef0123456789abcdef";
@@ -338,11 +362,13 @@ mod tests {
         let e = app.db.audit_events(&Default::default(), 1000, false).into_iter().find(|e| e.id == id).unwrap();
         let v = crate::audit_export::line_value(&e, "host-1", None, true);
         let text = v.to_string();
-        let r = record(&v, &text);
+        let rs = records(&v, &text);
+        assert_eq!(rs.len(), 1, "a short line goes whole");
+        let r = &rs[0];
         assert_eq!((r["TimeGenerated"].as_str(), r["EventId"].as_i64(), r["Host"].as_str(), r["Action"].as_str()), (Some(e.time.as_str()), Some(id), Some("host-1"), Some("test.monitor")));
         assert_eq!((r["TargetType"].as_str(), r["TargetId"].as_str(), &r["Details"], r["ChainHash"].as_str()), (Some("bot"), Some("b1"), &json!({ "n": 1 }), e.chain_hash.as_deref()));
-        assert_eq!(r["ActorEmail"], Value::Null);
-        assert_eq!(r.as_object().unwrap().len(), COLUMNS.len() + 2);
+        assert_eq!((&r["ActorEmail"], r["LinePart"].as_i64()), (&Value::Null, Some(0)));
+        assert_eq!(r.as_object().unwrap().len(), COLUMNS.len() + 3);
         let line: Value = serde_json::from_str(r["Line"].as_str().unwrap()).unwrap();
         assert_eq!(crate::audit_line::check(&line), Ok(crate::audit_line::Bound::All), "the line in the workspace checks itself");
         for (column, _) in COLUMNS {
@@ -364,6 +390,68 @@ mod tests {
         assert!(bodies(&[]).is_empty());
     }
 
+    #[test]
+    fn a_line_too_long_for_one_field_goes_in_pieces_that_check_once_joined() {
+        let app = crate::runner::test_app();
+        let pad = "quoted \"é\" ".repeat(400);
+        let id = app.db.try_record(&Event::new(Actor::system("test"), "test.long").details(json!({ "pad": pad }))).unwrap();
+        let e = app.db.audit_events(&Default::default(), 1000, false).into_iter().find(|e| e.id == id).unwrap();
+        let v = crate::audit_export::line_value(&e, "host-1", None, true);
+        let text = v.to_string();
+        assert!(text.len() > MAX_LINE, "{}", text.len());
+        let rs = records(&v, &text);
+        assert!(rs.len() > 2, "{}", rs.len());
+        for (i, r) in rs.iter().enumerate() {
+            let line = r["Line"].as_str().unwrap();
+            assert!(line.len() <= 2 * PART + 200, "piece {}: {} bytes", i + 1, line.len());
+            assert_eq!((r["LinePart"].as_u64(), r["EventId"].as_i64(), r["Action"].as_str(), &r["Details"]), (Some(i as u64 + 1), Some(id), Some("test.long"), &Value::Null));
+        }
+        let pieces: Vec<&str> = rs.iter().map(|r| r["Line"].as_str().unwrap()).collect();
+        let check = |lines: &[&str]| {
+            let mut l = crate::audit_line::Lines::new(None);
+            for (n, line) in lines.iter().enumerate() {
+                l.line(line, &format!("workspace:{}", n + 1));
+            }
+            l.finish()
+        };
+        // In any order, with a retry's copies.
+        let mut shuffled = pieces.clone();
+        shuffled.reverse();
+        shuffled.push(pieces[1]);
+        let report = check(&shuffled);
+        assert!(report.ok && report.unreadable == 0, "{report:?}");
+        assert_eq!((report.hosts[0].events, report.hosts[0].copies), (1, 1), "one event, put together once");
+
+        let missing = check(&pieces[1..]);
+        assert!(!missing.ok && missing.first_unreadable[0].error.contains(&format!("has {} of the {} pieces of event {id}'s line", pieces.len() - 1, pieces.len())), "{missing:?}");
+        let changed = pieces[0].replace("quoted", "QUOTED");
+        let mut differ = pieces.clone();
+        differ.push(&changed);
+        let differ = check(&differ);
+        assert!(!differ.ok && differ.first_unreadable[0].error.contains("disagree"), "{differ:?}");
+    }
+
+    #[tokio::test]
+    async fn a_token_handed_out_again_stays_masked() {
+        let (base, azure) = stand_in().await;
+        azure.same.store(true, Ordering::SeqCst);
+        let url = format!("azure-monitor://{HOST}/{DCR}/Custom-SuperBotAudit");
+        let mut a = monitor(&[("AUDIT_EXPORT", &url)]).unwrap();
+        let mut b = monitor(&[("AUDIT_EXPORT", &url)]).unwrap();
+        a.point_at(&base);
+        b.point_at(&base);
+        let token = a.entra.token(false).await.unwrap();
+        assert_eq!(*a.entra.token(true).await.unwrap(), *token, "the same token on a refresh");
+        let masked = |t: &str| !crate::secrets::redact::text(&format!("x {t}")).contains(t);
+        assert!(masked(&token), "still masked after a refresh that returned it");
+        // Another sink with the same identity gets the same token; dropping one keeps it masked.
+        assert_eq!(*b.entra.token(false).await.unwrap(), *token);
+        drop(a);
+        assert!(masked(&token), "the other sink still uses it");
+        drop(b);
+        assert!(!masked(&token), "no one uses it");
+    }
+
     /// A stand-in for the instance metadata service, Entra ID and the Logs Ingestion API.
     #[derive(Default)]
     struct Azure {
@@ -375,6 +463,8 @@ mod tests {
         requests: AtomicUsize,
         /// Answers this status to every upload while set.
         refuse: AtomicUsize,
+        /// Hands out the first token again, as the instance metadata service does from its cache.
+        same: AtomicBool,
     }
 
     type A = Arc<Azure>;
@@ -383,7 +473,8 @@ mod tests {
         if h.get("metadata").and_then(|v| v.to_str().ok()) != Some("true") {
             return (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": "invalid_request" })));
         }
-        let token = format!("eyJ.monitor-{}", crate::random_hex(6));
+        let first = a.tokens.lock().unwrap().first().cloned().filter(|_| a.same.load(Ordering::SeqCst));
+        let token = first.unwrap_or_else(|| format!("eyJ.monitor-{}", crate::random_hex(6)));
         a.tokens.lock().unwrap().push(token.clone());
         a.asked.lock().unwrap().push(q);
         (StatusCode::OK, axum::Json(json!({ "access_token": token, "expires_in": "86399", "token_type": "Bearer" })))
@@ -426,6 +517,9 @@ mod tests {
         for i in 0..30 {
             app.db.record(&Event::new(Actor::system("test"), "test.sentinel").details(json!({ "n": i, "pad": "p".repeat(200) })));
         }
+        // An erasure naming many scattered rows: a line longer than one field takes.
+        let scattered: Vec<i64> = (1_000..1_600).step_by(2).collect();
+        let erased = app.db.with_conn(|c| crate::audit_chain::insert_erased(c, "p", &scattered)).unwrap();
         let url = format!("sentinel=azure-monitor://{HOST}/{DCR}/Custom-SuperBotAudit");
         let mut s = settings(&[("AUDIT_EXPORT", &url), ("AZURE_CLIENT_ID", "user-assigned-1")]).unwrap();
         s.sinks[0].monitor_mut().unwrap().point_at(&base);
@@ -438,15 +532,19 @@ mod tests {
         assert_eq!(azure.tokens.lock().unwrap().len(), 1, "one token, kept while it lasts");
         let records = azure.records.lock().unwrap().clone();
         assert!(azure.requests.load(Ordering::SeqCst) > 1, "a batch over 1 MB goes in several requests");
-        let ids: Vec<i64> = records.iter().map(|r| r["EventId"].as_i64().unwrap()).collect();
+        let ids: Vec<i64> = records.iter().filter(|r| r["LinePart"].as_i64() <= Some(1)).map(|r| r["EventId"].as_i64().unwrap()).collect();
         assert_eq!(ids, (1..=*ids.last().unwrap()).collect::<Vec<_>>(), "every event once, in order, history first");
+        let pieces: Vec<&Value> = records.iter().filter(|r| r["EventId"].as_i64() == Some(erased)).collect();
+        assert!(pieces.len() > 1 && pieces.iter().all(|r| r["Line"].as_str().unwrap().len() <= 2 * PART + 200), "the erasure's line in pieces: {}", pieces.len());
         let mut lines = crate::audit_line::Lines::new(None);
         for (n, r) in records.iter().enumerate() {
-            assert_eq!(r["TimeGenerated"], serde_json::from_str::<Value>(r["Line"].as_str().unwrap()).unwrap()["time"]);
+            if r["LinePart"].as_i64() == Some(0) {
+                assert_eq!(r["TimeGenerated"], serde_json::from_str::<Value>(r["Line"].as_str().unwrap()).unwrap()["time"]);
+            }
             lines.line(r["Line"].as_str().unwrap(), &format!("workspace:{}", n + 1));
         }
         let report = lines.finish();
-        assert!(report.ok, "botctl audit verify-lines passes on the workspace's copy: {report:?}");
+        assert!(report.ok && report.hosts[0].events == ids.len() as u64, "botctl audit verify-lines passes on the workspace's copy, the erasure put back together: {report:?}");
 
         // A token Azure no longer takes: one new one, and delivery carries on.
         let first = azure.tokens.lock().unwrap()[0].clone();

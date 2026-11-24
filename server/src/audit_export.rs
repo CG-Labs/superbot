@@ -729,9 +729,9 @@ impl Out {
         if let (Out::Monitor(client), Kind::Monitor(m)) = (&mut *self, &sink.kind) {
             let records: Vec<Value> = rows
                 .iter()
-                .map(|e| {
+                .flat_map(|e| {
                     let v = line_value(e, host, extras.get(&e.id), e.id > sealed_after);
-                    crate::audit_azure::record(&v, &v.to_string())
+                    crate::audit_azure::records(&v, &v.to_string())
                 })
                 .collect();
             return client.send(m, &records).await.map(|()| None);
