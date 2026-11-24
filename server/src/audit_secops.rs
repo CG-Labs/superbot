@@ -187,16 +187,6 @@ fn status_of(body: &[u8]) -> Option<String> {
     (!s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')).then(|| s.to_string())
 }
 
-/// `Retry-After` as seconds or as an HTTP date; a date already past is no wait.
-fn retry_after(v: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Duration> {
-    let v = v.trim();
-    if let Ok(secs) = v.parse::<u64>() {
-        return Some(Duration::from_secs(secs));
-    }
-    let at = chrono::DateTime::parse_from_rfc2822(v).ok()?;
-    Some((at.with_timezone(&chrono::Utc) - now).to_std().unwrap_or_default())
-}
-
 fn hint(status: u16) -> &'static str {
     match status {
         400 => ": is the log type one the instance has (make SUPERBOT_AUDIT a custom log type)? See docs/ops/audit-export.md",
@@ -240,10 +230,7 @@ impl Client {
                     fresh = true;
                     continue;
                 }
-                let wait = (status == reqwest::StatusCode::TOO_MANY_REQUESTS).then(|| {
-                    let asked = r.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|v| retry_after(v, chrono::Utc::now()));
-                    asked.unwrap_or_default().clamp(MIN_THROTTLE, MAX_RETRY_AFTER)
-                });
+                let wait = (status == reqwest::StatusCode::TOO_MANY_REQUESTS).then(|| crate::audit_export::asked_to_wait(&r).unwrap_or_default().clamp(MIN_THROTTLE, MAX_RETRY_AFTER));
                 let answer = r.bytes().await.unwrap_or_default();
                 let code = status_of(&answer);
                 if status == reqwest::StatusCode::CONFLICT && code.as_deref() == Some("ALREADY_EXISTS") {
@@ -347,7 +334,7 @@ mod tests {
         let e = settings(&[("AUDIT_EXPORT", &named), ("AUDIT_EXPORT_HEADERS_SECOPS", "X=1")]).unwrap_err();
         assert!(e.contains("AUDIT_EXPORT_HEADERS_SECOPS is for an https sink; Google SecOps signs in to Google as botd"), "{e}");
         let e = settings(&[("AUDIT_EXPORT", &named), ("AUDIT_EXPORT_COMPRESS_SECOPS", "gzip")]).unwrap_err();
-        assert!(e.contains("AUDIT_EXPORT_COMPRESS_SECOPS is for https and azure-monitor sinks; the Chronicle API takes no compressed bodies"), "{e}");
+        assert!(e.contains("AUDIT_EXPORT_COMPRESS_SECOPS is for https, azure-monitor and datadog sinks; the Chronicle API takes no compressed bodies"), "{e}");
         // It is one of the SIEMs: with another, both need names; a server-wide gzip leaves it plain.
         let e = settings(&[("AUDIT_EXPORT", &format!("{url},https://siem.example.net/in"))]).unwrap_err();
         assert!(e.contains("name each"), "{e}");
@@ -383,12 +370,6 @@ mod tests {
         assert!(bodies(&[]).is_empty());
         assert_eq!(status_of(br#"{"error":{"code":403,"message":"Permission denied on quoting-the-request","status":"PERMISSION_DENIED"}}"#).as_deref(), Some("PERMISSION_DENIED"));
         assert_eq!(status_of(br#"{"error":{"status":"has spaces"}}"#), None);
-
-        let now = chrono::DateTime::parse_from_rfc3339("2026-11-24T12:30:00Z").unwrap().with_timezone(&chrono::Utc);
-        assert_eq!(retry_after(" 45 ", now), Some(Duration::from_secs(45)));
-        assert_eq!(retry_after("Tue, 24 Nov 2026 12:32:00 GMT", now), Some(Duration::from_secs(120)), "an HTTP date, as RFC 9110 allows");
-        assert_eq!(retry_after("Tue, 24 Nov 2026 12:29:00 GMT", now), Some(Duration::ZERO), "already past");
-        assert_eq!(retry_after("soon", now), None);
     }
 
     /// A stand-in for the metadata server and the Chronicle API's `logs:import`.
