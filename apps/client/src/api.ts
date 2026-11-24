@@ -282,6 +282,20 @@ export class SuperBotApi {
     return this.request<BotAccessView>("PATCH", `/api/bots/${id}/access`, body);
   }
 
+  async getBotAccess(id: string): Promise<BotAccessView> {
+    return this.request<BotAccessView>("GET", `/api/bots/${encodeURIComponent(id)}/access`);
+  }
+
+  /** One of the Bot owner's service accounts keeps and manages it from now on (ADR 0229). Owner or admin. */
+  async keepBot(id: string, serviceAccount: string): Promise<BotAccessView> {
+    return this.request<BotAccessView>("PUT", `/api/bots/${encodeURIComponent(id)}/keeper`, { serviceAccount });
+  }
+
+  /** The service account keeping it stops; it stays its owner's (ADR 0229). */
+  async releaseKeptBot(id: string): Promise<BotAccessView> {
+    return this.request<BotAccessView>("DELETE", `/api/bots/${encodeURIComponent(id)}/keeper`);
+  }
+
   async messages(id: string): Promise<Message[]> {
     return this.request<Message[]>("GET", `/api/bots/${id}/messages`);
   }

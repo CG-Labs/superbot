@@ -74,6 +74,8 @@ function mockApi(view: ServiceAccountsView = VIEW) {
     createServiceToken: jest.fn(async () => minted(SECRET)),
     rotateServiceToken: jest.fn(async () => minted(ROTATED, {}, { id: "st1", endsAt: Date.now() + 60 * 60_000 })),
     revokeServiceToken: jest.fn(async () => {}),
+    keepBot: jest.fn(async () => ({})),
+    releaseKeptBot: jest.fn(async () => ({})),
   };
 }
 
@@ -114,6 +116,46 @@ describe("ServiceAccountsAdmin (ADR 0143, 0152)", () => {
     await show(api);
     expect(await screen.findByText(/Member · 1 live token · keeps 2 Bots · last used/)).toBeTruthy();
     expect(screen.getByText(/Member · 1 live token · keeps 1 Bot · last used/)).toBeTruthy();
+  });
+
+  it("hands it one of its owner's Bots, and takes one back, after asking (ADR 0229)", async () => {
+    const api = mockApi({ ...VIEW, maxKeptBots: 20 });
+    api.serviceAccount.mockImplementation(async () => ({
+      ...SA,
+      tokenList: [TOKEN],
+      keptBotList: [{ id: "b1", name: "Ledger", visibility: "private" as const }],
+      keepable: [{ id: "b2", name: "Notes", visibility: "private" as const, keptBy: { id: "sa9", name: "Nightly" } }],
+    }));
+    const u = userEvent.setup();
+    await open(api, u);
+    expect(screen.getByText("Bots it keeps (1 of 20)")).toBeTruthy();
+
+    await u.press(screen.getByLabelText("Take Ledger back"));
+    await waitFor(() => expect(api.releaseKeptBot).toHaveBeenCalledWith("b1"));
+    expect(confirmAsync).toHaveBeenLastCalledWith("Take Ledger back from HR sync?", expect.stringMatching(/stay with its owner/), "Take it back");
+
+    expect(screen.getByLabelText("Hand it over")).toBeDisabled();
+    await u.press(screen.getByText("Notes (from Nightly)"));
+    await u.press(screen.getByLabelText("Hand it over"));
+    await waitFor(() => expect(api.keepBot).toHaveBeenCalledWith("b2", "sa1"));
+    expect(confirmAsync).toHaveBeenLastCalledWith("Let HR sync keep Notes?", expect.stringMatching(/owner's keys and memory.*Nightly stops keeping it/), "Hand it over");
+  });
+
+  it("doesn't take a Bot back when they say no, and offers none past the limit", async () => {
+    const api = mockApi({ ...VIEW, maxKeptBots: 1 });
+    api.serviceAccount.mockImplementation(async () => ({
+      ...SA,
+      tokenList: [TOKEN],
+      keptBotList: [{ id: "b1", name: "Ledger", visibility: "private" as const }],
+      keepable: [{ id: "b2", name: "Notes", visibility: "private" as const, keptBy: null }],
+    }));
+    (confirmAsync as jest.Mock).mockResolvedValueOnce(false);
+    const u = userEvent.setup();
+    await open(api, u);
+    await u.press(screen.getByLabelText("Take Ledger back"));
+    await waitFor(() => expect(confirmAsync).toHaveBeenCalled());
+    expect(api.releaseKeptBot).not.toHaveBeenCalled();
+    expect(screen.queryByText("Notes")).toBeNull();
   });
 
   it("makes an account with its first token, and shows the secret once", async () => {

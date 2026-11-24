@@ -181,6 +181,15 @@ fn service(app: &App, sa: &ServiceAccount, at: i64, names: &HashMap<&str, &str>,
             a.push(json!({ "ownerOnTeam": false }));
         }
     }
+    // Which Bots it keeps (ADR 0229): handing one over or taking it back may leave its
+    // access as it was (a read-only account viewing a shared Bot), yet the report changed.
+    // Only when it keeps some, so accounts that keep none keep their digests.
+    let kept: Vec<&Value> = bots.iter().filter(|b| b["kept"] == true).map(|b| &b["id"]).collect();
+    if !kept.is_empty() {
+        if let Some(a) = stable.as_array_mut() {
+            a.push(json!({ "kept": kept }));
+        }
+    }
     (view, stable)
 }
 

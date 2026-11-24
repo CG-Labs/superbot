@@ -1,4 +1,4 @@
-import { botAccess, hasAccess, keptBy, sharingLabel, whereItRuns, whoseKeys } from "../access";
+import { botAccess, hasAccess, keeperChoices, keeperQuestion, keptBy, sharingLabel, whereItRuns, whoseKeys } from "../access";
 
 describe("Bot access", () => {
   it("follows what the server says", () => {
@@ -57,5 +57,23 @@ describe("Bot access", () => {
     expect(keptBy({})).toBeNull();
     expect(keptBy({ serviceAccount: null })).toBeNull();
     expect(keptBy({ serviceAccount: { id: "sa1", name: "CI" } })).toBe("Kept by service account CI: its runs reach only what that account may");
+  });
+
+  it("offers the owner's accounts that could keep it, and the one that does (ADR 0229)", () => {
+    const k = (id: string, name: string, extra = {}) => ({ id, name, role: "member" as const, status: "active" as const, keptBots: 0, full: false, ...extra });
+    expect(keeperChoices({})).toEqual([{ value: "", label: "Nobody" }]);
+    const keepers = [k("sa1", "CI"), k("sa2", "Nightly", { full: true }), k("sa3", "Old", { status: "disabled" })];
+    expect(keeperChoices({ keepers })).toEqual([
+      { value: "", label: "Nobody" },
+      { value: "sa1", label: "CI" },
+      { value: "sa3", label: "Old (disabled)" },
+    ]);
+    expect(keeperChoices({ keepers, serviceAccount: { id: "sa2", name: "Nightly", email: null } }).map((c) => c.value)).toEqual(["", "sa1", "sa2", "sa3"]);
+  });
+
+  it("says what handing a Bot over means, and taking it back", () => {
+    expect(keeperQuestion("Ledger", "CI", null)).toEqual({ title: "Let CI keep Ledger?", body: expect.stringMatching(/^CI can rename it.*The Bot stays the owner's\.$/) });
+    expect(keeperQuestion("Ledger", "CI", "Nightly").body).toMatch(/Nightly stops keeping it\.$/);
+    expect(keeperQuestion("Ledger", null, "CI")).toEqual({ title: "Take Ledger back from CI?", body: expect.stringMatching(/its run there stops/) });
   });
 });
