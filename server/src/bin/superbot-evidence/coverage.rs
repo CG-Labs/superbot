@@ -114,7 +114,7 @@ fn since_format(kind: &str, file: &str) -> u64 {
 }
 
 /// The files whose `exceptions` an auditor samples first.
-const EXCEPTION_FILES: [&str; 14] = [
+const EXCEPTION_FILES: [&str; 15] = [
     "pull-requests.json",
     "vulnerability-alerts.json",
     "ci-drills.json",
@@ -129,6 +129,7 @@ const EXCEPTION_FILES: [&str; 14] = [
     "policy-exceptions.json",
     "conduct.json",
     "incidents.json",
+    "access.json",
 ];
 
 /// A bundle file larger than this isn't read: no bundle comes near it.
@@ -919,7 +920,6 @@ mod tests {
     /// without it still checks, one of format 3 must have it, and its exceptions count.
     #[test]
     fn register_bundles_have_incidents_json_from_format_3() {
-        assert_eq!(KINDS.iter().find(|k| k.id == "policy-register").unwrap().format, 3);
         let old = register_bundle_with(2, "incidents.json", None);
         assert!(old.verified(), "made before incidents.json: {:?}", old.problems);
         let missing = register_bundle_with(3, "incidents.json", None);
@@ -930,6 +930,23 @@ mod tests {
         assert!(f.verified(), "{:?}", f.problems);
         assert_eq!((f.exceptions["incidents.json"]["reviewOverdue"], f.exceptions["incidents.json"]["actionOverdue"]), (1, 2));
         assert!(f.files.iter().any(|(n, _, r)| n == "incidents.json" && r == &rows.iter().map(|s| s.to_string()).collect::<Vec<_>>()));
+    }
+
+    /// Register bundles gained `access.json` in format 4 (ADR 0231): one of format 3
+    /// without it still checks, one of format 4 must have it, and its exceptions count.
+    #[test]
+    fn register_bundles_have_access_json_from_format_4() {
+        assert_eq!(KINDS.iter().find(|k| k.id == "policy-register").unwrap().format, 4);
+        let old = register_bundle_with(3, "access.json", None);
+        assert!(old.verified(), "made before access.json: {:?}", old.problems);
+        let missing = register_bundle_with(4, "access.json", None);
+        assert!(!missing.verified() && missing.problems.iter().any(|x| x.contains("it has no access.json")), "{:?}", missing.problems);
+        let body = json_file(&json!({ "exceptions": { "leaverNotRemoved": ["p-1 on github (user): left 2027-01-05, not removed"], "reviewOverdue": [], "signOffNotFound": ["botd-1 on 2027-01-10: no sign-off"] } }));
+        let rows: &[&str] = &["CC6.2-2"];
+        let f = register_bundle_with(4, "access.json", Some((&body, &["CC6.2"], rows)));
+        assert!(f.verified(), "{:?}", f.problems);
+        assert_eq!((f.exceptions["access.json"]["leaverNotRemoved"], f.exceptions["access.json"]["signOffNotFound"]), (1, 1));
+        assert!(f.files.iter().any(|(n, _, r)| n == "access.json" && r == &["CC6.2-2".to_string()]));
     }
 
     #[test]
@@ -1040,7 +1057,7 @@ mod tests {
         let d = drills::Collected { repo: json!({ "fullName": "example-org/example-repo" }), branch: "main".into(), workflows: vec![], executions: vec![] };
         let reg = register::parse(br#"{ "superbotRegister": 1 }"#, &register::builtin_policies()).unwrap();
         let policies = register::builtin_policies();
-        let rc = register::Check { r: &reg, p: period, policies: &policies, baselines: &[] };
+        let rc = register::Check { r: &reg, p: period, policies: &policies, baselines: &[], sign_offs: &[] };
         let rsrc = register::Source { file: "register.json".into(), bytes: 24, sha256: sha256(b"register") };
         for tar in [
             changes::build(&c, &period, &src, now).tar,
