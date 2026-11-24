@@ -730,6 +730,31 @@ async fn a_pass_that_cant_read_everything_changes_nobody() {
 }
 
 #[tokio::test]
+async fn the_health_check_counts_the_sync_as_provisioning() {
+    let g = google_stand_in().await;
+    let w = world(&g, false, |_| {}).await;
+    let scim = || async {
+        let (code, res) = call(w.port, "GET", "/api/support/health-check", &w.admin, "").await;
+        assert_eq!(code, 200, "{res}");
+        let r = parse(&res);
+        let it = r["items"].as_array().unwrap().iter().find(|i| i["id"] == "scim").unwrap().clone();
+        (it["status"].as_str().unwrap().to_string(), it["detail"].as_str().unwrap().to_string())
+    };
+    let (status, detail) = scim().await;
+    assert_eq!((status.as_str(), detail.as_str()), ("open", "The Google Workspace sync has no successful pass in the last 30 days: botctl scim google."));
+
+    synced(&w).await;
+    let (status, detail) = scim().await;
+    assert_eq!(status, "confirm", "no SCIM token is needed: {detail}");
+    assert!(detail.starts_with("The Google Workspace sync passing in the last 30 days"), "{detail}");
+
+    g.set(|d| d.down = true);
+    assert_eq!(sync(&w, "").await.0, 502);
+    let (status, detail) = scim().await;
+    assert_eq!((status.as_str(), detail.as_str()), ("open", "The Google Workspace sync's latest pass didn't succeed (google_error): botctl scim google."));
+}
+
+#[tokio::test]
 async fn mass_removals_wait_for_force() {
     let g = google_stand_in().await;
     let w = world(&g, false, |s| s.max_removals = 1).await;

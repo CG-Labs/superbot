@@ -26,6 +26,8 @@ use std::sync::Arc;
 /// Bumped when the report's shape changes.
 pub const FORMAT: u32 = 1;
 pub const CHECKED: &str = "support.health_checked";
+/// What the Google Workspace sync audits each pass as (`scim::google`).
+const GOOGLE_SYNC: &str = "scim.google_sync";
 const DAY_MS: i64 = 86_400_000;
 /// The health score's window, as the checklist runs it.
 pub const SCORE_DAYS: i64 = 30;
@@ -181,6 +183,16 @@ pub struct Scim {
     /// A working token was used in the score's window.
     pub used_recently: bool,
     pub tenants_expiring: usize,
+    /// GOOGLE_DIRECTORY_SYNC=on: its tenant takes no SCIM token, so its passes stand in for one.
+    pub google: Option<GoogleSync>,
+}
+
+/// The Google Workspace sync's passes in the score's window, from the audit log.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GoogleSync {
+    /// Why the latest pass didn't succeed, when it didn't.
+    pub last_failed: Option<String>,
+    pub passed_recently: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -407,22 +419,37 @@ fn judge(id: &str, i: &Inputs) -> (Status, String) {
         },
         "scim" => match &i.scim {
             None => (NotApplicable, "SCIM is off.".into()),
-            Some(c) if c.working_tokens == 0 => (Open, "SCIM is on, but no tenant has a working token: botctl scim token create.".into()),
+            Some(Scim { google: Some(GoogleSync { last_failed: Some(why), .. }), .. }) => {
+                (Open, format!("The Google Workspace sync's latest pass didn't succeed ({why}): botctl scim google."))
+            }
+            Some(Scim { google: Some(GoogleSync { passed_recently: false, .. }), .. }) => {
+                (Open, format!("The Google Workspace sync has no successful pass in the last {SCORE_DAYS} days: botctl scim google."))
+            }
+            Some(c) if c.working_tokens == 0 && c.google.is_none() => (Open, "SCIM is on, but no tenant has a working token: botctl scim token create.".into()),
             Some(c) if c.tenants_expiring > 0 => {
                 (Open, format!("Every token of {} ends within {} days: botctl scim token rotate.", plural(c.tenants_expiring as u64, "tenant", "tenants"), crate::scim::WARN_DAYS))
             }
-            Some(c) if !c.used_recently => (Open, format!("No SCIM request in the last {SCORE_DAYS} days: check provisioning is still on at the identity provider.")),
+            Some(c) if c.working_tokens > 0 && !c.used_recently => (Open, format!("No SCIM request in the last {SCORE_DAYS} days: check provisioning is still on at the identity provider.")),
             Some(_) if s.scim_failed > 0 => (
                 Open,
                 format!("{} failed in the last {SCORE_DAYS} days: see the score's identity reasons and the IdP's provisioning log.", plural(s.scim_failed, "SCIM request", "SCIM requests")),
             ),
-            Some(c) => (
-                Confirm,
-                format!(
-                    "{}, used in the last {SCORE_DAYS} days, and no request failed: confirm the IdP's provisioning log shows no errors and people who left are disabled.",
-                    plural(c.working_tokens as u64, "working token", "working tokens")
-                ),
-            ),
+            Some(c) => {
+                let mut sources = Vec::new();
+                if c.google.is_some() {
+                    sources.push("The Google Workspace sync passing".to_string());
+                }
+                if c.working_tokens > 0 {
+                    sources.push(format!("{}, used", plural(c.working_tokens as u64, "working token", "working tokens")));
+                }
+                (
+                    Confirm,
+                    format!(
+                        "{} in the last {SCORE_DAYS} days, and no request failed: confirm the IdP's provisioning log shows no errors and people who left are disabled.",
+                        sentence(&sources.join("; "))
+                    ),
+                )
+            }
         },
         "roles" => match i.custom_roles {
             0 => (Confirm, "No custom roles: confirm the built-in roles (botctl roles) are what the customer expects.".into()),
@@ -691,6 +718,17 @@ pub fn gather(app: &AppState, a: &Auth, setup: &Value, now_ms: i64) -> Inputs {
             working_tokens: tokens.iter().filter(working).count(),
             used_recently: tokens.iter().filter(working).any(|t| t.last_used_at.is_some_and(|u| u >= window)),
             tenants_expiring: crate::scim::tenants_expiring(&tokens, now_ms).len(),
+            google: a.scim.google.as_ref().map(|_| {
+                let passes = |outcome: Option<&str>| {
+                    let f = Filter { from: Some(window), actions: vec![GOOGLE_SYNC.into()], outcome: outcome.map(String::from), ..Default::default() };
+                    app.db.audit_events(&f, 1, false)
+                };
+                let last_failed = passes(None).into_iter().next().filter(|e| e.outcome != "success").map(|e| match e.details["reason"].as_str() {
+                    Some(r) => r.to_string(),
+                    None => plural(e.details["failed"].as_u64().unwrap_or(0), "write failed", "writes failed"),
+                });
+                GoogleSync { last_failed, passed_recently: !passes(Some("success")).is_empty() }
+            }),
         }
     });
 
@@ -815,7 +853,7 @@ mod tests {
             setup_open: Vec::new(),
             incidents: Incidents { open: Vec::new(), resolved: 1, unreviewed: Vec::new() },
             saml: Some(Saml { providers: 1, certs: 3, ending: Vec::new() }),
-            scim: Some(Scim { working_tokens: 1, used_recently: true, tenants_expiring: 0 }),
+            scim: Some(Scim { working_tokens: 1, used_recently: true, ..Default::default() }),
             custom_roles: 2,
             role_holders: 3,
             role_holders_time_bound: 1,
@@ -937,13 +975,38 @@ mod tests {
         let mut i = healthy();
         let cases = [
             (Scim { working_tokens: 0, ..Default::default() }, 0, "SCIM is on, but no tenant has a working token"),
-            (Scim { working_tokens: 2, tenants_expiring: 1, used_recently: true }, 0, "Every token of 1 tenant ends within 14 days"),
+            (Scim { working_tokens: 2, tenants_expiring: 1, used_recently: true, ..Default::default() }, 0, "Every token of 1 tenant ends within 14 days"),
             (Scim { working_tokens: 1, ..Default::default() }, 0, "No SCIM request in the last 30 days"),
             (Scim { working_tokens: 1, used_recently: true, ..Default::default() }, 3, "3 SCIM requests failed in the last 30 days"),
         ];
         for (s, failed, want) in cases {
             i.scim = Some(s);
             i.score.scim_failed = failed;
+            let (st, d) = status(&check(&i), "scim");
+            assert!(st == Status::Open && d.starts_with(want), "{d}");
+        }
+    }
+
+    #[test]
+    fn the_google_sync_stands_in_for_a_token() {
+        let mut i = healthy();
+        let google = |last_failed: Option<&str>, passed_recently| Scim { google: Some(GoogleSync { last_failed: last_failed.map(String::from), passed_recently }), ..Default::default() };
+        i.scim = Some(google(None, true));
+        assert_eq!(
+            status(&check(&i), "scim"),
+            (
+                Status::Confirm,
+                "The Google Workspace sync passing in the last 30 days, and no request failed: confirm the IdP's provisioning log shows no errors and people who left are disabled.".into()
+            )
+        );
+        i.scim = Some(Scim { working_tokens: 1, used_recently: true, ..google(None, true) });
+        assert!(status(&check(&i), "scim").1.starts_with("The Google Workspace sync passing; 1 working token, used in the last 30 days"));
+        for (s, want) in [
+            (google(Some("too_many_removals"), true), "The Google Workspace sync's latest pass didn't succeed (too_many_removals): botctl scim google."),
+            (google(None, false), "The Google Workspace sync has no successful pass in the last 30 days: botctl scim google."),
+            (Scim { working_tokens: 1, ..google(None, true) }, "No SCIM request in the last 30 days"),
+        ] {
+            i.scim = Some(s);
             let (st, d) = status(&check(&i), "scim");
             assert!(st == Status::Open && d.starts_with(want), "{d}");
         }
