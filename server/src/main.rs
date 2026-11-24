@@ -324,6 +324,33 @@ fn random_hex(n: usize) -> String {
     random_bytes(n).iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// The startup lines on a master key rotation (ADR 0096), as `(warning, line)`: logged once
+/// botd's database, its sealed secrets and every regional chat store (ADR 0215, `stores`
+/// re-encrypted from the previous key) are under the new key.
+fn rotation_lines(r: &secrets::Report, stores: usize) -> Vec<(bool, String)> {
+    let mut out = Vec::new();
+    let and_stores = if stores > 0 { format!(", and re-encrypted {stores} regional chat stores") } else { String::new() };
+    if let Some((from, done)) = &r.rotated {
+        out.push((
+            false,
+            format!(
+                "Master key rotated from {from}: sealed {} values again under the new key ({} already were){and_stores}. Remove the previous key now (docs/ops/master-key-rotation.md).",
+                done.resealed, done.current
+            ),
+        ));
+        if done.unreadable > 0 {
+            out.push((true, format!("Master key rotation: {} sealed values open with neither key and were left as they were.", done.unreadable)));
+        }
+    }
+    if let Some(from) = &r.previous_unused {
+        out.push(match stores {
+            0 => (true, format!("{from} is set, but the master key already opens everything, so there is nothing to rotate. Remove it.")),
+            n => (false, format!("Master key rotation from {from}: re-encrypted {n} regional chat stores under the new key. Remove the previous key now (docs/ops/master-key-rotation.md).")),
+        });
+    }
+    out
+}
+
 pub fn short_id() -> String {
     random_hex(4)
 }
@@ -434,6 +461,8 @@ async fn main() {
     let mut keys = secrets::Keys::locate(&data_dir).unwrap_or_else(|e| exit(format!("Secrets: {e}")));
     let (db_key, db_start) =
         database_encryption::prepare(&db_path, db_policy, &mut keys).unwrap_or_else(|e| exit(format!("Database encryption: {e}")));
+    // Regional chat stores mid-rotation are re-encrypted under the new key too (ADR 0215).
+    let previous_db_key = keys.previous.as_ref().map(|(k, _)| database_encryption::DbKey::derive(k));
     if let Some(k) = db_key {
         database_encryption::install(k);
     }
@@ -444,32 +473,20 @@ async fn main() {
         log_warn!("WARNING: {w}");
     }
     let db = Db::open(&db_path).expect("open database");
-    match secrets::init(&db_path, keys, external) {
+    let secrets_report = match secrets::init(&db_path, keys, external) {
         Ok(r) => {
             log_info!("Master key: {}{}.", r.key_source, if r.created { " (new)" } else { "" });
             if r.sealed + r.redacted + r.discarded > 0 {
                 log_info!("Secrets: sealed {} saved tool inputs, redacted {} saved rows, discarded {} sealed values.", r.sealed, r.redacted, r.discarded);
             }
             log_info!("Stored secrets: {}.", r.stored);
-            if let Some((from, done)) = &r.rotated {
-                log_info!(
-                    "Master key rotated from {from}: sealed {} values again under the new key ({} already were). Remove the previous key now (docs/ops/master-key-rotation.md).",
-                    done.resealed,
-                    done.current
-                );
-                if done.unreadable > 0 {
-                    log_warn!("Master key rotation: {} sealed values open with neither key and were left as they were.", done.unreadable);
-                }
-            }
-            if let Some(from) = &r.previous_unused {
-                log_warn!("{from} is set, but the master key already opens everything, so there is nothing to rotate. Remove it.");
-            }
+            r
         }
         Err(e) => {
             log_warn!("Secrets: {e}");
             std::process::exit(1);
         }
-    }
+    };
     let server_backups = server_backups::ServerBackups::from_env(&startup_store, &|k| env(k, ""), &data_dir)
         .unwrap_or_else(|e| exit(format!("Server backups: {e}")));
     let off_host = server_backups.target.as_ref().map(|t| (t.source, t.destination()));
@@ -477,6 +494,22 @@ async fn main() {
         .unwrap_or_else(|e| exit(format!("Server data region: {e}")));
     log_info!("Server data region: {} (ADR 0184).", control_plane.server_data.describe());
     control_plane.kept_pins = machines::residency::KeptPins::parse(&env("RESIDENCY_KEPT_PINS", "")).unwrap_or_else(|e| exit(e));
+    control_plane.chat_stores =
+        machines::chat_stores::Settings::from_env(&|k| env(k, ""), control_plane.enabled(), &control_plane.regions, &control_plane.server_data, &data_dir)
+            .unwrap_or_else(|e| exit(format!("Regional chat stores: {e}")));
+    let (store_lines, stores_rekeyed) =
+        machines::chat_stores::open(&db, &control_plane.chat_stores, previous_db_key.as_ref()).unwrap_or_else(|e| exit(format!("Regional chat stores: {e}")));
+    for line in store_lines {
+        log_info!("{line}");
+    }
+    // Only once every regional chat store opens under the new key can the previous one go.
+    for (warn, line) in rotation_lines(&secrets_report, stores_rekeyed) {
+        if warn {
+            log_warn!("{line}");
+        } else {
+            log_info!("{line}");
+        }
+    }
     // Machine enrollment's CA key is derived from the master key (ADR 0031).
     let bin_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
     // Users' machines get the managed tiers' default harnesses unless told otherwise (ADR 0079).
@@ -866,6 +899,7 @@ async fn main() {
         app.db.metrics().want_tiers();
     }
     app.db.tracer().start(&observe.traces);
+    machines::chat_stores::start(app.clone(), control_plane.clone());
     machines::start(app.clone(), control_plane);
     if policy.mode == policy::Mode::Bypass {
         log_warn!(
@@ -3536,6 +3570,30 @@ async fn delete_user_secrets(State(app): State<AppState>, Extension(by): Extensi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rotation_says_to_remove_the_previous_key_after_the_regional_chat_stores_too() {
+        let report = |rotated: bool, unused: bool| secrets::Report {
+            key_source: "file".into(),
+            created: false,
+            sealed: 0,
+            redacted: 0,
+            discarded: 0,
+            stored: 0,
+            rotated: rotated.then(|| ("SUPERBOT_MASTER_KEY_PREVIOUS".into(), secrets::sealed::Rotation { resealed: 3, current: 1, unreadable: 0 })),
+            previous_unused: unused.then(|| "SUPERBOT_MASTER_KEY_PREVIOUS".into()),
+        };
+        assert!(rotation_lines(&report(false, false), 0).is_empty());
+        let l = rotation_lines(&report(true, false), 2);
+        assert_eq!(l.len(), 1);
+        assert!(!l[0].0 && l[0].1.contains("sealed 3 values again under the new key (1 already were), and re-encrypted 2 regional chat stores. Remove the previous key now"), "{l:?}");
+        assert!(!rotation_lines(&report(true, false), 0)[0].1.contains("chat stores"));
+        // botd's own data was rotated on an earlier start; a store the previous key still opened isn't "nothing to rotate".
+        let l = rotation_lines(&report(false, true), 1);
+        assert!(!l[0].0 && l[0].1.contains("re-encrypted 1 regional chat stores under the new key. Remove the previous key now"), "{l:?}");
+        let l = rotation_lines(&report(false, true), 0);
+        assert!(l[0].0 && l[0].1.contains("nothing to rotate"), "{l:?}");
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Auth in front of a stub route, with no app. Returns the port and a Bot's bearer
