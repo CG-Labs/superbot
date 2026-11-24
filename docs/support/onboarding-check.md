@@ -2,7 +2,7 @@
 
 Where a customer stands on the [onboarding checklist](onboarding.md), worked out from botd's own settings and records ([ADR 0233](../adr/0233-onboarding-check.md)). For each of the 32 items it says whether botd sees it done, what's still open with the guide that does it, and what's left for a person to confirm with the customer. It's for the technical account manager or support engineer taking a customer from signed to live: run it at kickoff, at each weekly onboarding call, and before go-live is confirmed in writing.
 
-`botctl onboarding` does it, on the customer's server, signed in as an admin (`BOTD_TOKEN`, or the password). The console's API serves the same report at `GET /api/support/onboarding`.
+`botctl onboarding` does it, on the customer's server, signed in as an admin (`BOTD_TOKEN`, or the password). The console's API serves the same report at `GET /api/support/onboarding`, and the console's Support tab shows it ([below](#in-the-console)). Every [support bundle](support-bundle.md) carries it too, as `onboarding.json` ([ADR 0243](../adr/0243-onboarding-check-in-the-console-and-the-bundle.md)).
 
 ## Running it
 
@@ -122,6 +122,14 @@ In the checklist's order. "botd sees" is what turns an item `done`; anything els
 - `open`, `skipped` and `unneededSkips`: item ids;
 - `sections`: each section's `id` and `title`, in order;
 - `items`: each item's `id`, `section`, `label`, `status`, `detail` and `guide` (a path in this repository, with an anchor where the page has one).
+
+## In the console
+
+The console's Support tab has an **Onboarding** section under the health score. Type any skips agreed at kickoff (the same ids as `--skip`, comma-separated) and press **Check onboarding**: it shows the counts, whether anything is open, and each item by section with its status, what botd saw and its guide. It checks only when you press the button, not when the tab opens, since each check is recorded as `support.onboarding_checked`. For the onboarding record, use `botctl onboarding markdown`.
+
+## In the support bundle
+
+Each [support bundle](support-bundle.md) has `onboarding.json`: this report with no skips, since skips aren't kept anywhere. The bundle's own `support.bundle_created` event records it; it isn't a separate `support.onboarding_checked`. [Bundle triage](triage.md) lists the items open in it as `onboarding.open`, for the TAM, with no severity: an open onboarding item isn't an incident. It leaves out `first_bundle`, since the bundle is one, and items agreed at kickoff show as open there, so check them against the onboarding record.
 
 ## Where it fits
 

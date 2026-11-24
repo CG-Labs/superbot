@@ -32,6 +32,7 @@ tar -xOf superbot-support-<time>.tar | less
 | `health.json` | The status page's checks and open incidents, the setup checklist, the license, approvals waiting and the oldest one's age, runs running and waiting, the last 15 minutes' metrics, machines and hosts, database encryption and server backups |
 | `health-score.json` | The [customer health score](health-score.md) for the last 30 days and its signals: counts and reason codes only |
 | `health-score-history.json` | The score botd recorded each day for the last 90 days ([history](health-score.md#history)): score, band and each signal's status |
+| `onboarding.json` | The [onboarding check](onboarding-check.md) as `botctl onboarding json` gives it, with no skips: each checklist item done, open, to confirm or not applicable, with codes and counts only. It runs before this bundle is recorded, so on the first bundle `first_bundle` is open |
 | `logs.jsonl` | The newest lines botd logged since it started (up to 2,000), one JSON object each, whatever `LOG_FORMAT` is |
 | `audit-summary.json` | The last 7 days of the audit log counted by action and outcome, and the newest 100 failures and denials with their reason code (a free-text reason shows as `[text]`) |
 | `manifest.json` | The files and their sizes, and how many settings, log lines and audit events went in |
