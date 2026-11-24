@@ -259,11 +259,13 @@ impl Push {
         self.state().last_started = None;
     }
 
-    fn note(&self, change: &str) {
+    /// `channel`: the event the notifying channel was made for, if this process made it,
+    /// named when the resource state isn't an event (a generic `exists`, say).
+    fn note(&self, change: &str, channel: Option<&'static str>) {
         let mut s = self.state();
         s.notifications += 1;
         s.last_notification = Some(crate::db::now());
-        s.pending.insert(EVENTS.into_iter().chain(GROUP_EVENTS).find(|e| *e == change).unwrap_or("other"));
+        s.pending.insert(EVENTS.into_iter().chain(GROUP_EVENTS).find(|e| *e == change).or(channel).unwrap_or("other"));
         drop(s);
         self.nudge.notify_one();
     }
@@ -538,15 +540,18 @@ pub async fn receive(Extension(a): Extension<Arc<Auth>>, req: Request) -> Respon
             return StatusCode::UNAUTHORIZED.into_response();
         }
     };
-    let current = d.push.watches(watch) && {
+    let (current, event) = if d.push.watches(watch) {
         let st = d.push.state();
-        st.made.contains(id) || st.channels.iter().any(|c| c.id == id)
+        let event = st.channels.iter().find(|c| c.id == id).map(|c| c.event);
+        (event.is_some() || st.made.contains(id), event)
+    } else {
+        (false, None)
     };
     if !current {
         stop_leftover(&d, watch, id, resource);
     }
     if d.push.address.is_some() && change != "sync" {
-        d.push.note(change);
+        d.push.note(change, event);
     }
     StatusCode::OK.into_response()
 }
@@ -605,11 +610,16 @@ mod tests {
     #[test]
     fn group_changes_are_named_in_the_pass_they_start() {
         let p = Push::new(Some("https://superbot.example.com/scim/google/push".into()), true);
-        p.note("REMOVE_GROUP_MEMBER");
-        p.note("DELETE_GROUP");
-        p.note("CHANGE_GROUP_NAME");
-        p.note("update");
+        p.note("REMOVE_GROUP_MEMBER", None);
+        p.note("DELETE_GROUP", None);
+        p.note("CHANGE_GROUP_NAME", None);
+        p.note("update", None);
         assert_eq!(p.begin(), vec!["DELETE_GROUP", "REMOVE_GROUP_MEMBER", "other", "update"]);
+        // A generic state names the event the channel was made for, or "other" from a leftover.
+        p.note("exists", Some("ADD_GROUP_MEMBER"));
+        p.note("exists", None);
+        p.note("REMOVE_GROUP_MEMBER", Some("ADD_GROUP_MEMBER"));
+        assert_eq!(p.begin(), vec!["ADD_GROUP_MEMBER", "REMOVE_GROUP_MEMBER", "other"]);
         assert!(!Push::new(None, true).watches(Watch::Groups), "group push needs push");
         assert!(!Push::new(Some("https://superbot.example.com/scim/google/push".into()), false).watches(Watch::Groups));
     }
@@ -631,9 +641,9 @@ mod tests {
         let p = Push::new(Some("https://superbot.example.com/scim/google/push".into()), false);
         let hour = Duration::from_secs(3600);
         assert!(matches!(p.wait(Duration::from_secs(1)).await, Trigger::Schedule));
-        p.note("update");
-        p.note("delete");
-        p.note("makeAdmin");
+        p.note("update", None);
+        p.note("delete", None);
+        p.note("makeAdmin", None);
         let t = Instant::now();
         assert!(matches!(p.wait(hour).await, Trigger::Push), "a change pushed before the wait began still counts");
         assert!((SETTLE..SETTLE + Duration::from_secs(1)).contains(&t.elapsed()), "{:?}", t.elapsed());
@@ -650,7 +660,7 @@ mod tests {
         tokio::time::sleep(MIN_GAP).await;
         let started = Instant::now();
         p.begin();
-        p.note("add");
+        p.note("add", None);
         assert!(matches!(p.wait(hour).await, Trigger::Push));
         assert!((MIN_GAP..MIN_GAP + Duration::from_secs(1)).contains(&started.elapsed()), "{:?}", started.elapsed());
     }
@@ -658,7 +668,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_change_a_failed_pass_took_gets_another() {
         let p = Push::new(Some("https://superbot.example.com/scim/google/push".into()), false);
-        p.note("update");
+        p.note("update", None);
         let taken = p.begin();
         p.give_back(&[]);
         assert!(matches!(p.wait(Duration::from_secs(60)).await, Trigger::Schedule), "the note's nudge was spent by that pass");
@@ -673,12 +683,12 @@ mod tests {
     async fn an_admin_pass_while_a_burst_settles_restarts_the_gap() {
         use tokio::time::{sleep, Instant};
         let p = Push::new(Some("https://superbot.example.com/scim/google/push".into()), false);
-        p.note("add");
+        p.note("add", None);
         let admin = async {
             sleep(SETTLE / 2).await;
             let began = Instant::now();
             assert_eq!(p.begin(), vec!["add"]);
-            p.note("update");
+            p.note("update", None);
             began
         };
         let (trigger, began) = tokio::join!(p.wait(Duration::from_secs(3600)), admin);

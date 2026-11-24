@@ -1041,7 +1041,8 @@ async fn google_pushes_a_group_removal_and_the_leaver_goes_at_once() {
     w.dir().push.forget_last_pass();
     google::start(w.auth.clone());
     g.set(|d| d.groups.get_mut("staff@example.com").unwrap().2.retain(|m| m["id"] != "102"));
-    assert_eq!(notify_group(&w, &id, &token, "REMOVE_GROUP_MEMBER", &resource).await, 200);
+    // A generic resource state still names the event the channel was made for.
+    assert_eq!(notify_group(&w, &id, &token, "exists", &resource).await, 200);
     eventually("Bob is deleted by a pushed pass", || user_of(&w, "102").is_none()).await;
     let ev = events(w.port, &w.admin, "action=scim.google_sync").await;
     assert_eq!((ev[0]["details"]["trigger"].as_str(), ev[0]["details"]["pushed"].clone(), ev[0]["details"]["deleted"].as_u64()), (Some("push"), json!(["REMOVE_GROUP_MEMBER"]), Some(1)), "{}", ev[0]);
