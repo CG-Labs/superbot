@@ -416,13 +416,13 @@ mod tests {
         (StatusCode::OK, axum::Json(json!({ "access_token": token, "expires_in": 3599, "token_type": "Bearer" })))
     }
 
-    async fn import(State(g): State<G>, Path(rest): Path<String>, h: HeaderMap, raw: axum::body::Bytes) -> (StatusCode, axum::Json<Value>) {
+    async fn import(State(g): State<G>, Path(rest): Path<String>, h: HeaderMap, axum::Json(body): axum::Json<Value>) -> (StatusCode, axum::Json<Value>) {
         g.requests.fetch_add(1, Ordering::SeqCst);
         assert_eq!(rest, format!("{PROJECT}/locations/eu/instances/{INSTANCE}/logTypes/SUPERBOT_AUDIT/logs:import"));
         assert_eq!(h.get("content-type").and_then(|v| v.to_str().ok()), Some("application/json"));
         assert!(h.get("content-encoding").is_none());
-        assert!(raw.len() <= MAX_BODY, "{}", raw.len());
-        let body: Value = serde_json::from_slice(&raw).expect("JSON");
+        let size: usize = h.get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).expect("a request's size");
+        assert!(size <= MAX_BODY, "{size}");
         let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
         let known = g.tokens.lock().unwrap().iter().any(|t| auth == format!("Bearer {t}"));
         if !known || g.revoked.lock().unwrap().iter().any(|t| auth == format!("Bearer {t}")) {
