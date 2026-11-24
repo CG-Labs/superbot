@@ -3296,6 +3296,29 @@ mod tests {
         accepted_later["penTests"][0]["retested"] = json!("2027-03-10");
         check(&accepted_later, &|c| assert_eq!(c.vulnerabilities().0["exceptions"]["retestLate"], json!(["PT-01 (last fixed 2027-01-10, retested 2027-03-10, due 2027-03-06)"])));
 
+        let mut month_apart = good();
+        month_apart["penTests"][0]["reported"] = json!("2026-12-20");
+        month_apart["penTests"][0]["retested"] = json!("2027-02-15");
+        for (k, d) in [("received", "2026-12-20"), ("assessed", "2026-12-21"), ("fixed", "2027-01-01")] {
+            month_apart["vulnerabilities"][1][k] = json!(d);
+        }
+        month_apart["vulnerabilities"].as_array_mut().unwrap().push(json!({ "id": "V-12", "source": "pentest", "penTest": "PT-01", "received": "2026-12-20", "assessed": "2026-12-21", "severity": "high", "owner": "Engineering lead", "accepted": "2027-03-01", "acceptedBy": "p-sec" }));
+        let retests = |v: &Value, from: &str, to: &str| {
+            let r = parse(&serde_json::to_vec(v).unwrap(), &builtin_policies()).unwrap();
+            let x = Check { r: &r, p: Period { from: d(from), to: d(to) }, policies: &builtin_policies(), baselines: &[], sign_offs: &[] }.vulnerabilities().0;
+            (x["exceptions"]["retestLate"].clone(), x["exceptions"]["retestOverdue"].clone(), x["penTests"][0]["retestDue"].clone())
+        };
+        let none = (json!([]), json!([]));
+        for (from, to, due) in [("2027-01-01", "2027-02-01", Value::Null), ("2027-02-01", "2027-03-01", Value::Null), ("2027-03-01", "2027-04-01", json!("2027-03-31"))] {
+            let (late, overdue, got) = retests(&month_apart, from, to);
+            assert_eq!(((late, overdue), got), (none.clone(), due), "{from}: a retest before the last acceptance is due 30 days after it, so February's isn't late");
+        }
+        month_apart["penTests"][0]["retested"] = json!("2027-04-05");
+        let (late, overdue, _) = retests(&month_apart, "2027-03-01", "2027-04-01");
+        assert_eq!((late, overdue), (json!([]), json!(["PT-01 (last fixed 2027-01-01, not retested since, due 2027-03-31)"])));
+        let (late, overdue, _) = retests(&month_apart, "2027-04-01", "2027-05-01");
+        assert_eq!((late, overdue), (json!(["PT-01 (last fixed 2027-01-01, retested 2027-04-05, due 2027-03-31)"]), json!([])), "a retest past the deadline is late in its own month");
+
         let mut old = good();
         old["penTests"][0]["reported"] = json!("2026-01-10");
         old["policyApprovals"].as_array_mut().unwrap().push(json!({ "policy": INFORMATION_SECURITY, "sha256": ZERO, "approvedBy": "p-mgmt", "approvedAt": "2026-02-01" }));
