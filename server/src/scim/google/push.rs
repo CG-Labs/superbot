@@ -128,7 +128,7 @@ impl Push {
     /// says which. A change pushed while a pass ran ends the wait at once.
     pub async fn wait(&self, wait: Duration) -> Trigger {
         let deadline = tokio::time::Instant::now() + wait;
-        loop {
+        'nudged: loop {
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => return Trigger::Schedule,
                 _ = self.nudge.notified() => {}
@@ -136,9 +136,15 @@ impl Push {
             // A nudge whose change a pass has since read (one pushed while the last burst
             // settled, say) starts nothing.
             let Some(gap) = self.pass_due() else { continue };
-            tokio::time::sleep(SETTLE.max(gap)).await;
-            if self.pass_due().is_some() {
-                return Trigger::Push;
+            let mut sleep = SETTLE.max(gap);
+            // An admin's pass may begin meanwhile, which restarts the gap.
+            loop {
+                tokio::time::sleep(sleep).await;
+                match self.pass_due() {
+                    None => continue 'nudged,
+                    Some(gap) if gap.is_zero() => return Trigger::Push,
+                    Some(gap) => sleep = gap,
+                }
             }
         }
     }
@@ -491,6 +497,24 @@ mod tests {
         let t = tokio::time::Instant::now();
         assert!(matches!(p.wait(Duration::from_secs(3600)).await, Trigger::Push));
         assert!(t.elapsed() < MIN_GAP + SETTLE, "{:?}", t.elapsed());
+        assert_eq!(p.begin(), vec!["update"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_admin_pass_while_a_burst_settles_restarts_the_gap() {
+        use tokio::time::{sleep, Instant};
+        let p = Push::new(Some("https://superbot.example.com/scim/google/push".into()));
+        p.note("add");
+        let admin = async {
+            sleep(SETTLE / 2).await;
+            let began = Instant::now();
+            assert_eq!(p.begin(), vec!["add"]);
+            p.note("update");
+            began
+        };
+        let (trigger, began) = tokio::join!(p.wait(Duration::from_secs(3600)), admin);
+        assert!(matches!(trigger, Trigger::Push));
+        assert!((MIN_GAP..MIN_GAP + Duration::from_secs(1)).contains(&began.elapsed()), "{:?}", began.elapsed());
         assert_eq!(p.begin(), vec!["update"]);
     }
 
