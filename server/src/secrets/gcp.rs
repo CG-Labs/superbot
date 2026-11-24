@@ -448,12 +448,12 @@ impl Inner {
             }
             let reply = Zeroizing::new(res.bytes().await.map_err(|e| iam_unavailable(&what, e))?.to_vec());
             if status.is_success() {
-                let (token, ttl) = access_token(&reply, secs, &what)?;
-                let (token, ttl) = match boundary {
-                    Some(b) => self.downscope(&token, b, ttl, secs, email).await?,
-                    None => (token, ttl),
+                let (token, expires) = access_token(&reply, secs, &what)?;
+                let (token, expires) = match boundary {
+                    Some(b) => self.downscope(&token, b, expires, secs, email).await?,
+                    None => (token, expires),
                 };
-                return Ok(token_lease(token, ttl, email, fields, bot_id));
+                return Ok(token_lease(token, secs_until(expires), email, fields, bot_id));
             }
             let hint = match status.as_u16() {
                 403 => "; botd's service account needs roles/iam.serviceAccountTokenCreator on it, and the IAM Service Account Credentials API must be on in botd's project".to_string(),
@@ -468,10 +468,10 @@ impl Inner {
 
     /// `token`, of `email`, traded at Google's Security Token Service for one that can do
     /// only what `boundary` (a Credential Access Boundary, as JSON) allows. It ends when
-    /// `token` does (`ttl`), or sooner if STS says so; one that ends more than a minute
+    /// `token` does (`expires`), or sooner if STS says so; one that ends more than a minute
     /// before the run could (`run_for`) is refused. The exchange needs no other credential:
     /// `token` is its own proof.
-    async fn downscope(&self, token: &str, boundary: &str, ttl: u64, run_for: u64, email: &str) -> Result<(Zeroizing<String>, u64), Error> {
+    async fn downscope(&self, token: &str, boundary: &str, expires: chrono::DateTime<chrono::Utc>, run_for: u64, email: &str) -> Result<(Zeroizing<String>, chrono::DateTime<chrono::Utc>), Error> {
         let what = format!("downscoping the token of {email}");
         let url = format!("{}/v1/token", self.cfg.sts_endpoint);
         let form = [("grant_type", TOKEN_EXCHANGE), ("subject_token_type", ACCESS_TOKEN_TYPE), ("requested_token_type", ACCESS_TOKEN_TYPE), ("subject_token", token), ("options", boundary)];
@@ -493,11 +493,15 @@ impl Inner {
         if down == token {
             return Err(bad("gave back the token it was sent, not a downscoped one"));
         }
-        let ttl = http::seconds(&v["expires_in"]).map_or(ttl, |s| s.min(ttl));
+        // Counted from the source token's own expiry, not its TTL before the exchange, so the
+        // time the exchange took isn't added back.
+        let stated = http::seconds(&v["expires_in"]).and_then(|s| i64::try_from(s).ok()).map(|s| chrono::Utc::now() + chrono::Duration::seconds(s));
+        let expires = stated.map_or(expires, |at| at.min(expires));
+        let ttl = secs_until(expires);
         if ttl + 60 < run_for {
             return Err(bad(&format!("gave a token that ends in {ttl} s, but a run may last {run_for} s (RUN_TIMEOUT_MINUTES)")));
         }
-        Ok((Zeroizing::new(down.to_string()), ttl))
+        Ok((Zeroizing::new(down.to_string()), expires))
     }
 }
 
@@ -505,19 +509,25 @@ fn iam_unavailable(what: &str, e: impl std::fmt::Display) -> Error {
     Error::Unavailable(format!("GCP IAM: {what}: {e}"))
 }
 
-/// The token in `generateAccessToken`'s answer, and how long it lasts. A token that ends
+/// The token in `generateAccessToken`'s answer, and when it expires. A token that ends
 /// before the run could is refused.
-fn access_token(body: &[u8], run_for: u64, what: &str) -> Result<(Zeroizing<String>, u64), Error> {
+fn access_token(body: &[u8], run_for: u64, what: &str) -> Result<(Zeroizing<String>, chrono::DateTime<chrono::Utc>), Error> {
     let bad = |why: &str| Error::Unavailable(format!("GCP IAM: {what} {why}"));
     let v: Value = serde_json::from_slice(body).map_err(|_| bad("answered with something that isn't JSON"))?;
     let token = v["accessToken"].as_str().filter(|t| !t.is_empty() && t.len() <= 8192 && t.bytes().all(|b| b.is_ascii_graphic())).ok_or_else(|| bad("gave no access token"))?;
     let expires = v["expireTime"].as_str().and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok()).ok_or_else(|| bad("gave a token with no expiry"))?;
-    let ttl = u64::try_from(expires.timestamp() - chrono::Utc::now().timestamp()).unwrap_or(0);
+    let expires = expires.with_timezone(&chrono::Utc);
+    let ttl = secs_until(expires);
     // A minute's slack for clocks; Google makes what was asked for or refuses.
     if ttl + 60 < run_for {
         return Err(bad(&format!("gave a token that ends in {ttl} s, but a run may last {run_for} s (RUN_TIMEOUT_MINUTES)")));
     }
-    Ok((Zeroizing::new(token.to_string()), ttl))
+    Ok((Zeroizing::new(token.to_string()), expires))
+}
+
+/// Whole seconds from now until `at`; 0 if it has passed.
+fn secs_until(at: chrono::DateTime<chrono::Utc>) -> u64 {
+    u64::try_from(at.timestamp() - chrono::Utc::now().timestamp()).unwrap_or(0)
 }
 
 /// A run's lease of `token`: under each field asked for, lasting `ttl`. Google gives a
@@ -753,7 +763,8 @@ mod tests {
 
     /// STS's `v1/token`: trades a run token IAM Credentials made, and nothing else, for a
     /// downscoped one, as Google does for a service account's token (no `expires_in`). The
-    /// first rule's bucket picks an odd answer: `refused`, `forbidden`, `short`, `echo`, `odd`.
+    /// first rule's bucket picks an odd answer: `refused`, `forbidden`, `short`, `echo`, `odd`,
+    /// or `slow` (two seconds late).
     async fn sts(State(f): State<F>, Form(form): Form<HashMap<String, String>>) -> (StatusCode, Json<Value>) {
         let refuse = |code: StatusCode, error: &str| (code, Json(json!({ "error": error, "error_description": "quoting-the-request" })));
         if f.down.load(Ordering::SeqCst) {
@@ -775,6 +786,9 @@ mod tests {
             _ => format!("ya29.down-{}", crate::random_hex(8)),
         };
         f.downscoped.lock().unwrap().push((subject, get("options"), token.clone()));
+        if bucket == "slow" {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
         match bucket.as_str() {
             "refused" => refuse(StatusCode::BAD_REQUEST, "invalid_request"),
             "forbidden" => refuse(StatusCode::FORBIDDEN, "access_denied"),
@@ -1090,6 +1104,18 @@ mod tests {
         let tagged = Narrowed { tags: vec![("superbot-bot", "b1".into())], ..Narrowed::default() };
         let e = sm.issue_narrowed("superbot-bots@proj-1.iam.gserviceaccount.com", &["accessToken".into()], RUN, "b1", &tagged).err().unwrap().to_string();
         assert!(e.contains("can't be narrowed with a session policy or tags"), "{e}");
+    }
+
+    #[test]
+    fn a_slow_exchange_isnt_added_to_the_tokens_life() {
+        let (url, _f) = stand_in();
+        let file = policy_file("gcp-sts-slow", &BOUNDARY.replace("acme-bots", "slow"));
+        let rc = run_credentials(&url, &format!("superbot-bots@proj-1.iam.gserviceaccount.com boundary={file}"));
+        let _l = rc.issue("ugcp11", "bsts-slow", true, RUN).unwrap().1;
+        let ev = audited("superbot-bots@proj-1.iam.gserviceaccount.com");
+        let issued = ev.iter().find(|e| e.action == "secret.lease_issued" && e.bot_id.as_deref() == Some("bsts-slow")).unwrap();
+        let ttl = issued.details["ttl"].as_u64().unwrap();
+        assert!((3590..=3598).contains(&ttl), "ends when the source token does, not its TTL after the exchange: {ttl}");
     }
 
     #[test]
