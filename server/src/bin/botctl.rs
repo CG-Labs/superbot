@@ -1928,6 +1928,17 @@ fn saml_summary(v: &Value) -> String {
         }
         None => out += "  Authentication context:   not checked (the IdP's MFA isn't required)\n",
     }
+    let age = |s: u64| match s {
+        s if s % 86_400 == 0 => format!("{}d", s / 86_400),
+        s if s % 3_600 == 0 => format!("{}h", s / 3_600),
+        s => format!("{}m", s / 60),
+    };
+    out += &match (v["forceAuthn"].as_bool().unwrap_or(false), v["maxAuthnAgeSeconds"].as_u64()) {
+        (true, _) => "  Re-authentication:        every sign-in (ForceAuthn)\n".to_string(),
+        (false, Some(s)) => format!("  Re-authentication:        within {} of signing in at the IdP, else asked again (ForceAuthn)\n", age(s)),
+        (false, None) => "  Re-authentication:        not required (the IdP's session decides)\n".to_string(),
+    };
+    out += if v["idpSessionLimit"].as_bool().unwrap_or(true) { "  IdP session limit:        ends sessions (SessionNotOnOrAfter)\n" } else { "  IdP session limit:        ignored (IDP_SESSION_LIMIT=off)\n" };
     if let Some(g) = v["groupsAttribute"].as_str() {
         let required: Vec<&str> = v["requiredGroups"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
         out += &format!(
@@ -3908,6 +3919,22 @@ mod tests {
         v["authnContext"] = json!({ "required": ["mfa", "urn:okta:loa:2fa:any"], "methodsAttribute": "amr", "requested": false });
         let out = saml_summary(&v);
         assert!(out.contains("  Authentication context:   one of mfa, urn:okta:loa:2fa:any\n    Also read from attribute amr\n    Not requested: the IdP's own policy decides\n"), "{out}");
+    }
+
+    #[test]
+    fn saml_summary_shows_re_authentication_and_the_idps_session_limit() {
+        let mut v = json!({ "provider": "corp", "label": "Corp", "idp": null, "forceAuthn": false, "maxAuthnAgeSeconds": null, "idpSessionLimit": true });
+        let out = saml_summary(&v);
+        assert!(out.contains("  Re-authentication:        not required (the IdP's session decides)\n  IdP session limit:        ends sessions (SessionNotOnOrAfter)\n"), "{out}");
+        for (secs, shown) in [(28_800, "8h"), (1_800, "30m"), (604_800, "7d")] {
+            v["maxAuthnAgeSeconds"] = json!(secs);
+            assert!(saml_summary(&v).contains(&format!("  Re-authentication:        within {shown} of signing in at the IdP, else asked again (ForceAuthn)\n")), "{secs}");
+        }
+        v["maxAuthnAgeSeconds"] = Value::Null;
+        v["forceAuthn"] = json!(true);
+        v["idpSessionLimit"] = json!(false);
+        let out = saml_summary(&v);
+        assert!(out.contains("  Re-authentication:        every sign-in (ForceAuthn)\n  IdP session limit:        ignored (IDP_SESSION_LIMIT=off)\n"), "{out}");
     }
 
     #[test]

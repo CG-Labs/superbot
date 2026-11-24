@@ -3,7 +3,7 @@
 
 use super::github::{self, GitHub};
 use super::jwt::{self, Invalid, Jwks, Token};
-use super::saml_sp::{self, AesCbc, Attributes, AuthnContext, Encryption, IdpInitiated, IdpMetadata, KeyUse, MetadataRefused, MetadataTrust, SpKey};
+use super::saml_sp::{self, AesCbc, Attributes, AuthnContext, Encryption, Freshness, IdpInitiated, IdpMetadata, KeyUse, MetadataRefused, MetadataTrust, SpKey};
 use super::{apple, saml};
 use crate::rbac::Role;
 use serde_json::Value;
@@ -52,6 +52,8 @@ pub enum Kind {
     /// group-to-role mappings apply (ADR 0160). `idp_initiated` says what an unsolicited
     /// response does (ADR 0175). With `authn_context`, only people the IdP says signed in one
     /// of those ways get in, read from the assertion and `attributes.authn_methods` (ADR 0190).
+    /// `freshness` says how recently they must have signed in at the IdP, and whether its
+    /// session limit ends ours (ADR 0225).
     SamlSp {
         entity_id: String,
         sp_entity_id: String,
@@ -67,6 +69,7 @@ pub enum Kind {
         metadata_trust: Option<MetadataTrust>,
         idp_initiated: IdpInitiated,
         authn_context: Option<AuthnContext>,
+        freshness: Freshness,
     },
 }
 

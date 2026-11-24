@@ -33,6 +33,10 @@
 //! - **How they signed in** (ADR 0190): every `AuthnContextClassRef` of the verified
 //!   assertion's `AuthnStatement`s, and every value of the authentication methods attribute
 //!   when the provider names one. The caller holds them to `SSO_<ID>_AUTHN_CONTEXT`.
+//! - **When they signed in, and for how long** (ADR 0225): the latest `AuthnInstant` and the
+//!   earliest `SessionNotOnOrAfter` of the verified assertion's `AuthnStatement`s; a malformed
+//!   one is refused. The caller holds the first to `FORCE_AUTHN` and `MAX_AUTHN_AGE`
+//!   (`Freshness`), and ends the session by the second.
 //!
 //! With a provider's SP key (ADR 0137), AuthnRequests can be signed with the HTTP-Redirect
 //! binding's query signature, and our metadata publishes the key's certificate. The key may
@@ -135,6 +139,53 @@ pub fn authn_context_value(v: &str) -> Result<String, String> {
         return Err(format!("{v:?} is not an authentication context: a URI like urn:oasis:names:tc:SAML:2.0:ac:classes:MobileTwoFactorContract, or a method like mfa"));
     }
     Ok(v.to_string())
+}
+
+/// How recently the person must have signed in at the IdP, and whether the IdP's session
+/// limit ends ours (ADR 0225).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Freshness {
+    /// `FORCE_AUTHN`: every AuthnRequest asks the IdP to sign the person in again
+    /// (`ForceAuthn`), and the assertion's `AuthnInstant` must be no earlier than the request.
+    pub force_authn: bool,
+    /// `MAX_AUTHN_AGE`: the assertion's `AuthnInstant` must be at most this old. An older one
+    /// is asked for again once, with `ForceAuthn`.
+    pub max_authn_age_ms: Option<i64>,
+    /// `IDP_SESSION_LIMIT` (on by default): a session ends by the assertion's
+    /// `SessionNotOnOrAfter`, as the Web Browser SSO profile says it should.
+    pub idp_session_limit: bool,
+}
+
+impl Default for Freshness {
+    fn default() -> Freshness {
+        Freshness { force_authn: false, max_authn_age_ms: None, idp_session_limit: true }
+    }
+}
+
+impl Freshness {
+    /// The earliest `AuthnInstant` a response may carry: no earlier than the AuthnRequest sent
+    /// at `requested_ms` when it asked for `ForceAuthn` (`forced`), and no older than
+    /// `MAX_AUTHN_AGE`. None: any.
+    pub fn authn_since(&self, requested_ms: i64, forced: bool, now_ms: i64) -> Option<i64> {
+        forced.then_some(requested_ms).max(self.max_authn_age_ms.map(|age| now_ms - age))
+    }
+}
+
+/// Whether a sign-in the IdP made at `instant` meets `since` (`Freshness::authn_since`), with
+/// `SKEW_MS` either way. Without an instant it can't, and one ahead of our clock is no sign-in.
+pub fn authn_fresh(instant: Option<i64>, since: Option<i64>, now_ms: i64) -> bool {
+    let Some(since) = since else { return true };
+    instant.is_some_and(|i| i + SKEW_MS >= since && i <= now_ms + SKEW_MS)
+}
+
+/// When a session from this sign-in must end by the IdP's word (ADR 0225): its
+/// `SessionNotOnOrAfter`, if it sent one and the provider holds to it. Err when that's already
+/// past, or too close to be worth a session: within `SKEW_MS`.
+pub fn idp_session_end(ends: Option<i64>, limit: bool, now_ms: i64) -> Result<Option<i64>, ()> {
+    match ends.filter(|_| limit) {
+        Some(e) if e <= now_ms + SKEW_MS => Err(()),
+        e => Ok(e),
+    }
 }
 
 /// The groups a signed assertion puts the person in (ADR 0160).
@@ -708,6 +759,11 @@ pub(super) fn instant(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
+#[cfg(test)]
+pub(crate) fn test_instant(ms: i64) -> String {
+    instant(ms)
+}
+
 /// A new AuthnRequest ID: an NCName, so it starts with `_`.
 pub fn request_id() -> String {
     format!("_{}", crate::random_hex(20))
@@ -715,14 +771,16 @@ pub fn request_id() -> String {
 
 /// The AuthnRequest XML. The NameID format is left to the IdP's settings for the app. With
 /// `authn` (ADR 0190), it asks for one of those classes, in that order, with `exact`
-/// comparison: the one comparison every IdP takes (Entra ID refuses the others).
-pub fn authn_request(sp: &Sp, id: &str, destination: &str, now_ms: i64, authn: Option<&AuthnContext>) -> String {
+/// comparison: the one comparison every IdP takes (Entra ID refuses the others). With `force`
+/// (ADR 0225), it asks the IdP to sign the person in again rather than reuse its session.
+pub fn authn_request(sp: &Sp, id: &str, destination: &str, now_ms: i64, authn: Option<&AuthnContext>, force: bool) -> String {
     let requested = match authn.filter(|a| a.request && !a.accepted.is_empty()) {
         Some(a) => format!(r#"<samlp:RequestedAuthnContext Comparison="exact">{}</samlp:RequestedAuthnContext>"#, a.accepted.iter().map(|c| format!("<saml:AuthnContextClassRef>{}</saml:AuthnContextClassRef>", escape(c))).collect::<String>()),
         None => String::new(),
     };
+    let force = if force { r#" ForceAuthn="true""# } else { "" };
     format!(
-        r#"<samlp:AuthnRequest xmlns:samlp="{PROTOCOL}" xmlns:saml="{ASSERTION}" ID="{id}" Version="2.0" IssueInstant="{}" Destination="{}" AssertionConsumerServiceURL="{}" ProtocolBinding="{POST}"><saml:Issuer>{}</saml:Issuer><samlp:NameIDPolicy AllowCreate="true"/>{requested}</samlp:AuthnRequest>"#,
+        r#"<samlp:AuthnRequest xmlns:samlp="{PROTOCOL}" xmlns:saml="{ASSERTION}" ID="{id}" Version="2.0" IssueInstant="{}" Destination="{}"{force} AssertionConsumerServiceURL="{}" ProtocolBinding="{POST}"><saml:Issuer>{}</saml:Issuer><samlp:NameIDPolicy AllowCreate="true"/>{requested}</samlp:AuthnRequest>"#,
         instant(now_ms),
         escape(destination),
         escape(sp.acs),
@@ -777,6 +835,10 @@ pub struct Checked {
     /// tells an admin which keys the IdP encrypts to (ADR 0181). Both, if they differ.
     pub decrypted_with: Vec<usize>,
     pub authn: Authn,
+    /// When the IdP signed the person in: the latest `AuthnInstant` (ADR 0225).
+    pub authn_instant: Option<i64>,
+    /// When the IdP says sessions from this sign-in must end: the earliest `SessionNotOnOrAfter`.
+    pub idp_session_ends: Option<i64>,
 }
 
 pub(super) fn time(s: &str) -> Result<i64, Refused> {
@@ -1148,6 +1210,16 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
     let Some(authn) = assertion.children().find(|c| is(*c, ASSERTION, "AuthnStatement")) else {
         return Err(bad());
     };
+    let (mut authn_instant, mut idp_session_ends) = (None, None);
+    for s in assertion.children().filter(|c| is(*c, ASSERTION, "AuthnStatement")) {
+        if let Some(t) = s.attribute("AuthnInstant") {
+            authn_instant = authn_instant.max(Some(time(t)?));
+        }
+        if let Some(t) = s.attribute("SessionNotOnOrAfter") {
+            let t = time(t)?;
+            idp_session_ends = Some(idp_session_ends.map_or(t, |e: i64| e.min(t)));
+        }
+    }
 
     let (nid, id_with) = name_id_with(subject, e.decrypt)?;
     let mut decrypted_with: Vec<usize> = decrypted_with.into_iter().chain(id_with).collect();
@@ -1167,7 +1239,7 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
     let session_index = kept(authn, "SessionIndex");
     let login = SamlLogin { name_id: nid.value, format: nid.format, name_qualifier: nid.name_qualifier, sp_name_qualifier: nid.sp_name_qualifier, session_index };
     let groups = e.attributes.groups.as_deref().map_or(Groups::NotRead, |n| groups(assertion, n));
-    Ok(Checked { claims, assertion_id, until_ms: until.min(now + 24 * 3600 * 1000), login, groups, decrypted_with, authn: how })
+    Ok(Checked { claims, assertion_id, until_ms: until.min(now + 24 * 3600 * 1000), login, groups, decrypted_with, authn: how, authn_instant, idp_session_ends })
 }
 
 #[cfg(test)]
@@ -1266,6 +1338,11 @@ pub mod test_idp {
         /// One `AuthnStatement` per class, in order. One starting with `<` is put in the
         /// `AuthnContext` as it is, in place of a class.
         pub authn_contexts: Vec<String>,
+        /// Each `AuthnStatement`'s `AuthnInstant`, and its `SessionNotOnOrAfter` if any.
+        pub authn_instant: i64,
+        pub session_not_on_or_after: Option<i64>,
+        /// More after the `AuthnStatement`s, before signing.
+        pub extra_statements: String,
     }
 
     pub const PASSWORD_PROTECTED: &str = "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport";
@@ -1298,6 +1375,9 @@ pub mod test_idp {
                 encrypt_to: String::new(),
                 encrypt_name_id_to: None,
                 authn_contexts: vec![PASSWORD_PROTECTED.into()],
+                authn_instant: now_ms,
+                session_not_on_or_after: None,
+                extra_statements: String::new(),
             }
         }
 
@@ -1319,8 +1399,12 @@ pub mod test_idp {
                 .authn_contexts
                 .iter()
                 .map(|c| if c.starts_with('<') { c.clone() } else { format!("<saml:AuthnContextClassRef>{c}</saml:AuthnContextClassRef>") })
-                .map(|c| format!(r#"<saml:AuthnStatement AuthnInstant="{now}" SessionIndex="{si}"><saml:AuthnContext>{c}</saml:AuthnContext></saml:AuthnStatement>"#, now = instant(self.not_before + 60_000), si = self.session_index))
-                .collect();
+                .map(|c| {
+                    let ends = self.session_not_on_or_after.map(|e| format!(r#" SessionNotOnOrAfter="{}""#, instant(e))).unwrap_or_default();
+                    format!(r#"<saml:AuthnStatement AuthnInstant="{at}" SessionIndex="{si}"{ends}><saml:AuthnContext>{c}</saml:AuthnContext></saml:AuthnStatement>"#, at = instant(self.authn_instant), si = self.session_index)
+                })
+                .collect::<String>()
+                + &self.extra_statements;
             format!(
                 r#"<saml:Assertion ID="{aid}" Version="2.0" IssueInstant="{now}"><saml:Issuer>{iss}</saml:Issuer><saml:Subject>{nid}<saml:SubjectConfirmation Method="{BEARER}"><saml:SubjectConfirmationData{cirt} NotOnOrAfter="{cna}" Recipient="{rcp}"/></saml:SubjectConfirmation></saml:Subject><saml:Conditions NotBefore="{nb}" NotOnOrAfter="{na}"><saml:AudienceRestriction><saml:Audience>{aud}</saml:Audience></saml:AudienceRestriction>{extra}</saml:Conditions>{statements}<saml:AttributeStatement>{attrs}</saml:AttributeStatement></saml:Assertion>"#,
                 aid = self.assertion_id,
@@ -1500,7 +1584,7 @@ pub(crate) mod tests {
             let key = SpKey::from_pem(&key_pem, &cert_pem).unwrap();
             assert_eq!(key.sig_alg(), sig_alg);
             assert!(key.decrypting().is_none(), "IdPs encrypt with RSA-OAEP only");
-            let xml = authn_request(&Sp { entity_id: SP, acs: ACS }, REQ, SSO_URL, NOW, None);
+            let xml = authn_request(&Sp { entity_id: SP, acs: ACS }, REQ, SSO_URL, NOW, None, false);
             let q = redirect_query("SAMLRequest", &xml, Some("s"), Some(&key));
             assert!(q.contains(&format!("SigAlg={}", form(sig_alg))), "{q}");
             let r = from_redirect(&q).unwrap();
@@ -1516,7 +1600,7 @@ pub(crate) mod tests {
     #[test]
     fn redirect_messages_are_signed_over_the_query_as_sent() {
         let (key, _) = SpKey::generate("sp").unwrap();
-        let xml = authn_request(&Sp { entity_id: SP, acs: ACS }, REQ, SSO_URL, NOW, None);
+        let xml = authn_request(&Sp { entity_id: SP, acs: ACS }, REQ, SSO_URL, NOW, None, false);
         let q = redirect_query("SAMLRequest", &xml, Some("state+/="), Some(&key));
         let names: Vec<&str> = q.split('&').map(|p| p.split('=').next().unwrap()).collect();
         assert_eq!(names, ["SAMLRequest", "RelayState", "SigAlg", "Signature"], "in the order the binding signs them");
@@ -1586,7 +1670,7 @@ pub(crate) mod tests {
 
         let id = request_id();
         assert!(id.starts_with('_') && id.len() == 41);
-        let xml = authn_request(&sp, &id, SSO_URL, NOW, None);
+        let xml = authn_request(&sp, &id, SSO_URL, NOW, None, false);
         let encoded = redirect_encode(&xml);
         let inflated = miniz_oxide::inflate::decompress_to_vec(&STANDARD.decode(encoded).unwrap()).unwrap();
         assert_eq!(String::from_utf8(inflated).unwrap(), xml, "raw DEFLATE, as the binding says");
@@ -1599,7 +1683,7 @@ pub(crate) mod tests {
         );
         assert_eq!(r.attribute("IssueInstant"), Some("2027-01-15T08:00:00Z"));
         assert_eq!(doc.descendants().find(|n| is(*n, ASSERTION, "Issuer")).and_then(|n| n.text()), Some(SP));
-        let odd = authn_request(&Sp { entity_id: "urn:a&b<c>", acs: ACS }, &id, SSO_URL, NOW, None);
+        let odd = authn_request(&Sp { entity_id: "urn:a&b<c>", acs: ACS }, &id, SSO_URL, NOW, None, false);
         assert!(roxmltree::Document::parse(&odd).is_ok(), "escaped");
     }
 
@@ -1781,14 +1865,88 @@ pub(crate) mod tests {
     fn authn_requests_ask_for_the_classes_only_when_told_to() {
         let sp = Sp { entity_id: SP, acs: ACS };
         let mut c = required(&[MFA, "urn:a&b"]);
-        assert!(!authn_request(&sp, REQ, SSO_URL, NOW, Some(&c)).contains("RequestedAuthnContext"), "required, but not requested");
+        assert!(!authn_request(&sp, REQ, SSO_URL, NOW, Some(&c), false).contains("RequestedAuthnContext"), "required, but not requested");
         c.request = true;
-        let xml = authn_request(&sp, REQ, SSO_URL, NOW, Some(&c));
+        let xml = authn_request(&sp, REQ, SSO_URL, NOW, Some(&c), false);
         assert!(xml.contains(&format!(r#"<samlp:NameIDPolicy AllowCreate="true"/><samlp:RequestedAuthnContext Comparison="exact"><saml:AuthnContextClassRef>{MFA}</saml:AuthnContextClassRef><saml:AuthnContextClassRef>urn:a&amp;b</saml:AuthnContextClassRef></samlp:RequestedAuthnContext></samlp:AuthnRequest>"#)), "after NameIDPolicy, as the schema orders them, in the admin's order: {xml}");
         let doc = roxmltree::Document::parse(&xml).unwrap();
         let refs: Vec<&str> = doc.descendants().filter(|n| is(*n, ASSERTION, "AuthnContextClassRef")).filter_map(|n| n.text()).collect();
         assert_eq!(refs, [MFA, "urn:a&b"]);
-        assert!(!authn_request(&sp, REQ, SSO_URL, NOW, None).contains("RequestedAuthnContext"));
+        assert!(!authn_request(&sp, REQ, SSO_URL, NOW, None, false).contains("RequestedAuthnContext"));
+    }
+
+    #[test]
+    fn authn_requests_ask_the_idp_to_sign_in_again_only_when_told_to() {
+        let sp = Sp { entity_id: SP, acs: ACS };
+        assert!(!authn_request(&sp, REQ, SSO_URL, NOW, None, false).contains("ForceAuthn"));
+        let xml = authn_request(&sp, REQ, SSO_URL, NOW, Some(&AuthnContext { accepted: vec![MFA.into()], request: true }), true);
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        assert_eq!(doc.root_element().attribute("ForceAuthn"), Some("true"));
+        assert!(xml.contains("RequestedAuthnContext"), "beside a requested class: {xml}");
+    }
+
+    /// An `AuthnStatement` to add with `extra_statements`.
+    fn statement(attrs: &str) -> String {
+        format!(r#"<saml:AuthnStatement {attrs}><saml:AuthnContext><saml:AuthnContextClassRef>{PASSWORD_PROTECTED}</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement>"#)
+    }
+
+    #[test]
+    fn reads_when_the_idp_signed_the_person_in_and_until_when() {
+        let c = check(&base().xml()).unwrap();
+        assert_eq!((c.authn_instant, c.idp_session_ends), (Some(NOW), None));
+        let mut r = base();
+        r.authn_instant = NOW - 3_600_000;
+        r.session_not_on_or_after = Some(NOW + 8 * 3_600_000);
+        let c = check(&r.xml()).unwrap();
+        assert_eq!((c.authn_instant, c.idp_session_ends), (Some(NOW - 3_600_000), Some(NOW + 8 * 3_600_000)));
+        // Several statements: the latest sign-in, and the earliest end.
+        r.extra_statements = statement(&format!(r#"AuthnInstant="{}" SessionNotOnOrAfter="{}""#, instant(NOW - 60_000), instant(NOW + 600_000)));
+        let c = check(&r.xml()).unwrap();
+        assert_eq!((c.authn_instant, c.idp_session_ends), (Some(NOW - 60_000), Some(NOW + 600_000)));
+        let mut no_instant = base();
+        no_instant.authn_contexts = vec![];
+        no_instant.extra_statements = statement("");
+        assert_eq!(check(&no_instant.xml()).unwrap().authn_instant, None, "none sent: nothing to hold it to");
+        for attrs in [r#"AuthnInstant="yesterday""#, r#"AuthnInstant="2027-01-15T08:00:00Z" SessionNotOnOrAfter="soon""#] {
+            let mut r = base();
+            r.extra_statements = statement(attrs);
+            assert_eq!(check(&r.xml()).unwrap_err().0, "bad_response", "{attrs}");
+        }
+        // Only the signed assertion counts: a limit taken out, or an instant moved, breaks it.
+        let mut r = base();
+        r.session_not_on_or_after = Some(NOW + 600_000);
+        let ends = format!(r#" SessionNotOnOrAfter="{}""#, instant(NOW + 600_000));
+        assert_eq!(check(&r.xml_with(|a| a.replace(&ends, ""))).unwrap_err().0, "bad_signature");
+        assert_eq!(check(&r.xml_with(|a| a.replace(&instant(NOW), &instant(NOW + 1000)))).unwrap_err().0, "bad_signature");
+        // Outside the assertion, it isn't read.
+        let outside = base().xml().replace("</samlp:Response>", &format!("{}</samlp:Response>", statement(&format!(r#"AuthnInstant="{}" SessionNotOnOrAfter="{}""#, instant(NOW + 60_000), instant(NOW + 1000)))));
+        let c = check(&outside).unwrap();
+        assert_eq!((c.authn_instant, c.idp_session_ends), (Some(NOW), None));
+    }
+
+    #[test]
+    fn freshness_and_the_idps_session_limit() {
+        let hour = 3_600_000;
+        let aged = Freshness { max_authn_age_ms: Some(hour), ..Freshness::default() };
+        assert!(Freshness::default().idp_session_limit, "on unless turned off");
+        assert_eq!(Freshness::default().authn_since(NOW - 5_000, false, NOW), None);
+        assert_eq!(Freshness::default().authn_since(NOW - 5_000, true, NOW), Some(NOW - 5_000), "forced: since the request");
+        assert_eq!(aged.authn_since(NOW - 5_000, false, NOW), Some(NOW - hour));
+        assert_eq!(aged.authn_since(NOW - 5_000, true, NOW), Some(NOW - 5_000), "the stricter of the two");
+
+        assert!(authn_fresh(None, None, NOW), "nothing required");
+        assert!(!authn_fresh(None, Some(NOW - hour), NOW), "no instant proves nothing");
+        assert!(authn_fresh(Some(NOW - hour), Some(NOW - hour), NOW));
+        assert!(authn_fresh(Some(NOW - SKEW_MS), Some(NOW), NOW), "within the clocks' skew");
+        assert!(!authn_fresh(Some(NOW - SKEW_MS - 1), Some(NOW), NOW));
+        assert!(!authn_fresh(Some(NOW + SKEW_MS + 1), Some(NOW - hour), NOW), "ahead of our clock");
+
+        assert_eq!(idp_session_end(None, true, NOW), Ok(None));
+        assert_eq!(idp_session_end(Some(NOW + 8 * hour), true, NOW), Ok(Some(NOW + 8 * hour)));
+        assert_eq!(idp_session_end(Some(NOW + 8 * hour), false, NOW), Ok(None), "IDP_SESSION_LIMIT=off");
+        assert_eq!(idp_session_end(Some(NOW + SKEW_MS), true, NOW), Err(()), "too close to be worth a session");
+        assert_eq!(idp_session_end(Some(NOW - hour), true, NOW), Err(()));
+        assert_eq!(idp_session_end(Some(NOW - hour), false, NOW), Ok(None));
     }
 
     #[test]

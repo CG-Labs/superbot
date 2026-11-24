@@ -1864,6 +1864,296 @@ async fn an_idp_initiated_post_restarts_and_the_restarted_sign_in_is_held_to_the
     assert_eq!((code, signed_in_as(sp.port, &head).await), (200, Some(u.id)));
 }
 
+// When they signed in, and for how long (ADR 0225)
+
+const HOUR: i64 = 3_600_000;
+
+/// Where an ACS answer sent the browser back to the IdP: its AuthnRequest, RelayState, and the
+/// new binder cookie, which the ACS doesn't clear.
+fn sent_back(to: &str, head: &str) -> (String, String, String) {
+    let to_idp = url::Url::parse(to).unwrap();
+    assert_eq!(format!("{}://{}{}", to_idp.scheme(), to_idp.host_str().unwrap(), to_idp.path()), SSO_URL, "{to}");
+    let q: HashMap<_, _> = to_idp.query_pairs().into_owned().collect();
+    let request = String::from_utf8(miniz_oxide::inflate::decompress_to_vec(&STANDARD.decode(&q["SAMLRequest"]).unwrap()).unwrap()).unwrap();
+    let binders: Vec<_> = set_cookies(head).into_iter().filter(|c| c.starts_with("__Host-superbot_saml=")).collect();
+    assert_eq!(binders.len(), 1, "one new binder, not cleared: {head}");
+    assert!(!binders[0].starts_with("__Host-superbot_saml=;") && binders[0].contains("SameSite=None"), "{}", binders[0]);
+    (request, q["RelayState"].clone(), binders[0].split(';').next().unwrap().to_string())
+}
+
+fn request_id(request: &str) -> String {
+    request.split(" ID=\"").nth(1).unwrap().split('"').next().unwrap().to_string()
+}
+
+impl Sp {
+    /// `/api/auth/me` for the session `head` set.
+    async fn session_of(&self, head: &str) -> Value {
+        let session = set_cookies(head).into_iter().find(|c| c.starts_with("__Host-superbot_session=sbs_")).expect("a session cookie");
+        let (_, _, me) = crate::tests::call_with(self.port, "GET", "/api/auth/me", "", &format!("Cookie: {}\r\n", session.split(';').next().unwrap()), "").await;
+        serde_json::from_str::<Value>(&me).unwrap()["session"].clone()
+    }
+}
+
+fn max_age(head: &str) -> i64 {
+    let session = set_cookies(head).into_iter().find(|c| c.starts_with("__Host-superbot_session=sbs_")).unwrap();
+    session.split("Max-Age=").nth(1).unwrap().split(';').next().unwrap().trim().parse().unwrap()
+}
+
+#[tokio::test]
+async fn the_idps_session_limit_ends_the_session_it_makes() {
+    let sp = serve_with(&[], |a| a.limiter = users::Limiter::new(1000, 60_000)).await;
+    let u = sp.link();
+    let v = sp.view().await;
+    assert_eq!((&v["forceAuthn"], &v["maxAuthnAgeSeconds"], &v["idpSessionLimit"]), (&json!(false), &Value::Null, &json!(true)));
+    assert!(!sp.authn_request().await.contains("ForceAuthn"), "not asked for unless set");
+
+    // No limit: the server's own, as before; when they signed in at the IdP is recorded.
+    let instant = db::now() - 10 * 60_000;
+    let (code, _, head) = sp.sign_in(|r| r.authn_instant = instant).await;
+    assert_eq!(code, 200, "{head}");
+    let s = sp.session_of(&head).await;
+    assert_eq!(s["expiresAt"].as_i64().unwrap() - s["createdAt"].as_i64().unwrap(), users::SessionConfig::default().max_ms);
+    let d = &sp.audit("auth.login").await[0]["details"];
+    assert_eq!((d["authnInstant"].as_i64(), &d["idpSessionEnds"], &d["forceAuthn"]), (Some(instant / 1000 * 1000), &Value::Null, &Value::Null));
+
+    // SessionNotOnOrAfter in two hours: the session, and its cookie, end then.
+    let ends = (db::now() + 2 * HOUR) / 1000 * 1000;
+    let (code, _, head) = sp.sign_in(|r| r.session_not_on_or_after = Some(ends)).await;
+    assert_eq!((code, signed_in_as(sp.port, &head).await), (200, Some(u.id.clone())));
+    assert_eq!(sp.session_of(&head).await["expiresAt"], ends);
+    assert!((2 * 3_600 - 10..=2 * 3_600).contains(&max_age(&head)), "{head}");
+    assert_eq!(sp.audit("auth.login").await[0]["details"]["idpSessionEnds"], ends);
+    // Longer than the server's own limit: the server's holds.
+    let (_, _, head) = sp.sign_in(|r| r.session_not_on_or_after = Some(db::now() + 400 * 24 * HOUR)).await;
+    let s = sp.session_of(&head).await;
+    assert_eq!(s["expiresAt"].as_i64().unwrap() - s["createdAt"].as_i64().unwrap(), users::SessionConfig::default().max_ms);
+
+    // Already over (or about to be): asked once to sign in again, not given a dead session.
+    let logins = sp.audit("auth.login").await.len();
+    let (request, relay, binder) = sp.start().await;
+    let mut r = Response::new(&sp.acs(), &sp.entity(), &request, db::now());
+    r.session_not_on_or_after = Some(db::now() + 60_000);
+    let (code, to, head) = sp.post(Some(&r.posted()), Some(&relay), &binder).await;
+    assert_eq!(code, 303);
+    assert!(signed_in_as(sp.port, &head).await.is_none());
+    let (again, relay, new_binder) = sent_back(&to, &head);
+    assert!(again.contains(r#" ForceAuthn="true""#), "{again}");
+    assert_ne!(new_binder, binder);
+    let asked = &sp.audit("auth.saml_reauthn").await[0];
+    let d = &asked["details"];
+    assert_eq!((d["reason"].as_str(), d["outcome"].as_str(), d["subject"].as_str(), d["forceAuthn"].as_bool()), (Some("idp_session_ended"), Some("asked_again"), Some(STORED), Some(false)));
+    assert_eq!((asked["targetType"].as_str(), asked["targetId"].as_str(), asked["idpProvider"].as_str()), (Some("sso_provider"), Some(sp.id.as_str()), Some(sp.id.as_str())));
+    // The old binder doesn't answer the new request: only the browser that was sent back does.
+    let fresh = Response::new(&sp.acs(), &sp.entity(), &request_id(&again), db::now());
+    let (_, to, _) = sp.post(Some(&fresh.posted()), Some(&relay), &binder).await;
+    assert_eq!((to.as_str(), sp.last_failure().await["reason"].as_str()), ("/login?error=sso_expired", Some("binder_mismatch")));
+
+    // An IdP that answers the forced request with its ended session again: refused, and told why.
+    let (request, relay, binder) = sp.start().await;
+    let mut r = Response::new(&sp.acs(), &sp.entity(), &request, db::now());
+    r.session_not_on_or_after = Some(db::now() - 60 * 60_000);
+    let (_, to, head) = sp.post(Some(&r.posted()), Some(&relay), &binder).await;
+    let (again, relay, binder) = sent_back(&to, &head);
+    let mut r = Response::new(&sp.acs(), &sp.entity(), &request_id(&again), db::now());
+    r.session_not_on_or_after = Some(db::now() - 60 * 60_000);
+    let (code, to, head) = sp.post(Some(&r.posted()), Some(&relay), &binder).await;
+    assert_eq!((code, to.as_str()), (303, "/login?error=sso_reauth_required"));
+    assert!(signed_in_as(sp.port, &head).await.is_none());
+    let f = sp.last_failure().await;
+    assert_eq!((f["reason"].as_str(), f["forceAuthn"].as_bool(), f["subject"].as_str()), (Some("idp_session_ended"), Some(true), Some(STORED)));
+    assert!(set_cookies(&head).iter().any(|c| c.starts_with("__Host-superbot_saml=;")), "the binder goes once it's answered");
+
+    // One that signs them in again: in, until its new limit.
+    let (request, relay, binder) = sp.start().await;
+    let mut r = Response::new(&sp.acs(), &sp.entity(), &request, db::now());
+    r.session_not_on_or_after = Some(db::now());
+    let (_, to, head) = sp.post(Some(&r.posted()), Some(&relay), &binder).await;
+    let (again, relay, binder) = sent_back(&to, &head);
+    let ends = (db::now() + 8 * HOUR) / 1000 * 1000;
+    let mut r = Response::new(&sp.acs(), &sp.entity(), &request_id(&again), db::now());
+    r.session_not_on_or_after = Some(ends);
+    let (code, _, head) = sp.post(Some(&r.posted()), Some(&relay), &binder).await;
+    assert_eq!((code, signed_in_as(sp.port, &head).await), (200, Some(u.id.clone())));
+    assert_eq!(sp.session_of(&head).await["expiresAt"], ends);
+    let d = &sp.audit("auth.login").await[0]["details"];
+    assert_eq!((d["idpSessionEnds"].as_i64(), d["forceAuthn"].as_bool()), (Some(ends), Some(true)));
+    assert_eq!(sp.audit("auth.login").await.len(), logins + 1, "the refused and redirected answers signed nobody in");
+    // The earliest of several statements' limits holds.
+    let soon = (db::now() + HOUR) / 1000 * 1000;
+    let (_, _, head) = sp
+        .sign_in(|r| {
+            r.session_not_on_or_after = Some(db::now() + 4 * HOUR);
+            r.extra_statements = format!(
+                r#"<saml:AuthnStatement AuthnInstant="{}" SessionNotOnOrAfter="{}"><saml:AuthnContext><saml:AuthnContextClassRef>{}</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement>"#,
+                crate::sso::saml_sp::test_instant(db::now()),
+                crate::sso::saml_sp::test_instant(soon),
+                test_idp::PASSWORD_PROTECTED
+            );
+        })
+        .await;
+    assert_eq!(sp.session_of(&head).await["expiresAt"], soon);
+}
+
+#[tokio::test]
+async fn an_app_sign_in_ends_with_the_idps_session_too() {
+    let sp = serve(&[]).await;
+    let u = sp.link();
+    let verifier = "v".repeat(64);
+    let start = format!("/api/auth/sso/{}/start?session=token&redirect=superbot%3A%2F%2Fauth&challenge={}&state=st-1&label=Phone", sp.id, s256(&verifier));
+    let (_, head, _) = crate::tests::call_with(sp.port, "GET", &start, "", "", "").await;
+    let q: HashMap<_, _> = url::Url::parse(&header(&head, "location").unwrap()).unwrap().query_pairs().into_owned().collect();
+    let request = String::from_utf8(miniz_oxide::inflate::decompress_to_vec(&STANDARD.decode(&q["SAMLRequest"]).unwrap()).unwrap()).unwrap();
+
+    // Over already: the app's browser goes back to the IdP, with no binder cookie (it has none).
+    let mut r = Response::new(&sp.acs(), &sp.entity(), &request_id(&request), db::now());
+    r.session_not_on_or_after = Some(db::now() - HOUR);
+    let (code, to, head) = sp.post(Some(&r.posted()), Some(&q["RelayState"]), "").await;
+    assert_eq!(code, 303, "{to}");
+    assert!(to.starts_with(SSO_URL), "{to}");
+    assert!(!set_cookies(&head).iter().any(|c| c.starts_with("__Host-superbot_saml=") && !c.starts_with("__Host-superbot_saml=;")), "{head}");
+    let q: HashMap<_, _> = url::Url::parse(&to).unwrap().query_pairs().into_owned().collect();
+    let again = String::from_utf8(miniz_oxide::inflate::decompress_to_vec(&STANDARD.decode(&q["SAMLRequest"]).unwrap()).unwrap()).unwrap();
+    assert!(again.contains(r#" ForceAuthn="true""#), "{again}");
+
+    // Signed in again, for an hour: the app's code becomes a token session ending then.
+    let ends = (db::now() + HOUR) / 1000 * 1000;
+    let mut r = Response::new(&sp.acs(), &sp.entity(), &request_id(&again), db::now());
+    r.session_not_on_or_after = Some(ends);
+    let (code, to, _) = sp.post(Some(&r.posted()), Some(&q["RelayState"]), "").await;
+    assert_eq!(code, 303, "{to}");
+    let back: HashMap<_, _> = url::Url::parse(&to).unwrap().query_pairs().into_owned().collect();
+    assert_eq!(back["state"], "st-1", "the app's own state, kept through the second request");
+    let (code, res) = call(sp.port, "POST", "/api/auth/login", "", &json!({ "sso": back["code"], "verifier": verifier }).to_string()).await;
+    assert_eq!(code, 200, "{res}");
+    let res: Value = serde_json::from_str(&res).unwrap();
+    assert_eq!((res["user"]["id"].as_str(), &res["session"]["expiresAt"], res["session"]["kind"].as_str()), (Some(u.id.as_str()), &json!(ends), Some("token")));
+    let d = &sp.audit("auth.login").await[0]["details"];
+    assert_eq!((d["idpSessionEnds"].as_i64(), d["forceAuthn"].as_bool()), (Some(ends), Some(true)));
+
+    // A code taken as a web session: its cookie ends with the session, not at SESSION_MAX_AGE.
+    let start = format!("/api/auth/sso/{}/start?session=token&redirect=superbot%3A%2F%2Fauth&challenge={}&state=st-2", sp.id, s256(&verifier));
+    let (_, head, _) = crate::tests::call_with(sp.port, "GET", &start, "", "", "").await;
+    let q: HashMap<_, _> = url::Url::parse(&header(&head, "location").unwrap()).unwrap().query_pairs().into_owned().collect();
+    let request = String::from_utf8(miniz_oxide::inflate::decompress_to_vec(&STANDARD.decode(&q["SAMLRequest"]).unwrap()).unwrap()).unwrap();
+    let ends = (db::now() + 2 * HOUR) / 1000 * 1000;
+    let mut r = Response::new(&sp.acs(), &sp.entity(), &request_id(&request), db::now());
+    r.session_not_on_or_after = Some(ends);
+    let (_, to, _) = sp.post(Some(&r.posted()), Some(&q["RelayState"]), "").await;
+    let back: HashMap<_, _> = url::Url::parse(&to).unwrap().query_pairs().into_owned().collect();
+    let body = json!({ "sso": back["code"], "verifier": verifier, "session": "cookie" }).to_string();
+    let (code, head, res) = crate::tests::call_with(sp.port, "POST", "/api/auth/login", "", "", &body).await;
+    assert_eq!(code, 200, "{res}");
+    assert_eq!(serde_json::from_str::<Value>(&res).unwrap()["session"]["expiresAt"], ends);
+    assert!((2 * 3_600 - 10..=2 * 3_600).contains(&max_age(&head)), "{head}");
+}
+
+#[tokio::test]
+async fn an_idp_session_limit_turned_off_is_ignored() {
+    let sp = serve(&[("IDP_SESSION_LIMIT", "off")]).await;
+    sp.link();
+    assert_eq!(sp.view().await["idpSessionLimit"], false);
+    let (code, _, head) = sp.sign_in(|r| r.session_not_on_or_after = Some(db::now() - HOUR)).await;
+    assert_eq!(code, 200, "{head}");
+    let s = sp.session_of(&head).await;
+    assert_eq!(s["expiresAt"].as_i64().unwrap() - s["createdAt"].as_i64().unwrap(), users::SessionConfig::default().max_ms);
+    assert_eq!(sp.audit("auth.login").await[0]["details"]["idpSessionEnds"], Value::Null);
+    assert!(sp.audit("auth.saml_reauthn").await.is_empty());
+}
+
+#[tokio::test]
+async fn force_authn_asks_every_time_and_refuses_an_older_sign_in() {
+    let sp = serve_with(&[("FORCE_AUTHN", "true"), ("SIGN_REQUESTS", "true")], |a| a.limiter = users::Limiter::new(1000, 60_000)).await;
+    let u = sp.link();
+    assert_eq!(sp.view().await["forceAuthn"], true);
+    let (code, head, _) = crate::tests::call_with(sp.port, "GET", &format!("/api/auth/sso/{}/start", sp.id), "", "", "").await;
+    assert_eq!(code, 303);
+    let (_, redirected) = signed_redirect(&header(&head, "location").unwrap(), &sp.sp_cert().await);
+    assert!(redirected.xml.contains(r#" ForceAuthn="true""#), "asked for, in the signed request: {}", redirected.xml);
+
+    // An IdP that ignores it and answers from its old session: refused, not asked again.
+    let (code, to, head) = sp.sign_in(|r| r.authn_instant = db::now() - 10 * 60_000).await;
+    assert_eq!((code, to.as_str()), (303, "/login?error=sso_reauth_required"));
+    assert!(signed_in_as(sp.port, &head).await.is_none());
+    let f = sp.last_failure().await;
+    assert_eq!((f["reason"].as_str(), f["forceAuthn"].as_bool(), f["subject"].as_str()), (Some("stale_authn"), Some(true), Some(STORED)));
+    assert!(f["authnSince"].as_i64().unwrap() > f["authnInstant"].as_i64().unwrap() + crate::sso::saml_sp::SKEW_MS, "{f}");
+    assert!(sp.audit("auth.saml_reauthn").await.is_empty());
+    // Signed in just now: in.
+    let (code, _, head) = sp.sign_in(|_| {}).await;
+    assert_eq!((code, signed_in_as(sp.port, &head).await), (200, Some(u.id)));
+    assert_eq!(sp.audit("auth.login").await[0]["details"]["forceAuthn"], true);
+}
+
+#[tokio::test]
+async fn a_sign_in_older_than_max_authn_age_asks_the_idp_once_to_sign_in_again() {
+    let sp = serve_with(&[("MAX_AUTHN_AGE", "1h"), ("ALLOWED_DOMAINS", "example.com"), ("JIT_ROLE", "member")], |a| a.limiter = users::Limiter::new(1000, 60_000)).await;
+    assert_eq!(sp.view().await["maxAuthnAgeSeconds"], 3_600);
+    assert!(!sp.authn_request().await.contains("ForceAuthn"), "only asked for once a sign-in is too old");
+
+    // Too old, before anyone is made just in time: sent back, and nobody made yet.
+    let (request, relay, binder) = sp.start().await;
+    let mut r = Response::new(&sp.acs(), &sp.entity(), &request, db::now());
+    r.authn_instant = db::now() - 2 * HOUR;
+    let (code, to, head) = sp.post(Some(&r.posted()), Some(&relay), &binder).await;
+    assert_eq!(code, 303);
+    assert!(sp.app.db.identity(IDP, STORED).is_none(), "no account made");
+    let (again, new_relay, new_binder) = sent_back(&to, &head);
+    assert!(again.contains(r#" ForceAuthn="true""#), "{again}");
+    assert_ne!((&new_relay, &new_binder), (&relay, &binder));
+    let d = &sp.audit("auth.saml_reauthn").await[0]["details"];
+    assert_eq!(d["reason"], "stale_authn");
+    assert!(d["authnSince"].as_i64().unwrap() > d["authnInstant"].as_i64().unwrap() + HOUR, "{d}");
+    // The first request is spent: its RelayState answers nothing now.
+    let (_, to, _) = sp.post(Some(&Response::new(&sp.acs(), &sp.entity(), &request, db::now()).posted()), Some(&relay), &binder).await;
+    assert_eq!(to, "/login?error=sso_expired");
+    // The IdP still answers from its old session: refused this time.
+    let mut r = Response::new(&sp.acs(), &sp.entity(), &request_id(&again), db::now());
+    r.authn_instant = db::now() - 2 * HOUR;
+    let (_, to, _) = sp.post(Some(&r.posted()), Some(&new_relay), &new_binder).await;
+    assert_eq!(to, "/login?error=sso_reauth_required");
+    assert_eq!(sp.last_failure().await["reason"], "stale_authn");
+    assert_eq!(sp.audit("auth.saml_reauthn").await.len(), 1, "asked once per sign-in");
+
+    // Within the hour: in, just in time, without asking again.
+    let (code, _, head) = sp.sign_in(|r| r.authn_instant = db::now() - 30 * 60_000).await;
+    assert_eq!(code, 200, "{head}");
+    assert!(signed_in_as(sp.port, &head).await.is_some());
+    assert_eq!(sp.audit("auth.saml_reauthn").await.len(), 1);
+    // Too old, then signed in again when asked: in, and the login says it was asked for.
+    let (request, relay, binder) = sp.start().await;
+    let mut r = Response::new(&sp.acs(), &sp.entity(), &request, db::now());
+    r.authn_instant = db::now() - 2 * HOUR;
+    let (_, to, head) = sp.post(Some(&r.posted()), Some(&relay), &binder).await;
+    let (again, relay, binder) = sent_back(&to, &head);
+    let (code, _, head) = sp.post(Some(&Response::new(&sp.acs(), &sp.entity(), &request_id(&again), db::now()).posted()), Some(&relay), &binder).await;
+    assert_eq!(code, 200, "{head}");
+    assert!(signed_in_as(sp.port, &head).await.is_some());
+    assert_eq!(sp.audit("auth.login").await[0]["details"]["forceAuthn"], true);
+}
+
+#[tokio::test]
+async fn an_idp_initiated_post_restarts_and_the_restarted_sign_in_is_held_to_max_authn_age() {
+    let sp = serve_with(&[("IDP_INITIATED", "restart"), ("MAX_AUTHN_AGE", "1h")], |a| a.limiter = users::Limiter::new(1000, 60_000)).await;
+    let u = sp.link();
+    // The tile's response signs nobody in, so an old sign-in in it only restarts.
+    let mut tile = sp.unsolicited();
+    tile.authn_instant = db::now() - 2 * HOUR;
+    let (code, to, _) = sp.post(Some(&tile.posted()), None, "").await;
+    assert_eq!((code, to.ends_with("/start")), (303, true), "{to}");
+    assert!(sp.audit("auth.saml_reauthn").await.is_empty());
+    // The restarted sign-in is: sent back with ForceAuthn, the restart marker kept for the loop check.
+    let (request, relay, binder) = sp.start().await;
+    let mut r = Response::new(&sp.acs(), &sp.entity(), &request, db::now());
+    r.authn_instant = db::now() - 2 * HOUR;
+    let (code, to, head) = sp.post(Some(&r.posted()), Some(&relay), &format!("{binder}; {RESTART}={}", sp.id)).await;
+    assert_eq!(code, 303);
+    assert!(!set_cookies(&head).iter().any(|c| c.starts_with(&format!("{RESTART}="))), "{head}");
+    let (again, relay, binder) = sent_back(&to, &head);
+    let (code, _, head) = sp.post(Some(&Response::new(&sp.acs(), &sp.entity(), &request_id(&again), db::now()).posted()), Some(&relay), &format!("{binder}; {RESTART}={}", sp.id)).await;
+    assert_eq!((code, signed_in_as(sp.port, &head).await), (200, Some(u.id)));
+    assert!(set_cookies(&head).iter().any(|c| c.starts_with(&format!("{RESTART}=;"))), "{head}");
+}
+
 // Certificates ending (ADR 0198)
 
 /// A PEM certificate for a new RSA key, ending `days` from now, and the key.
