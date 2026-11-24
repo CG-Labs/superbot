@@ -266,18 +266,21 @@ pub struct IdpMetadata {
     pub sso_url: String,
     pub sso_binding: Binding,
     pub certs: Vec<Cert>,
-    /// The HTTP-Redirect SingleLogoutService on https, if it has one: single logout is on.
+    /// The browser SingleLogoutService on https, HTTP-Redirect or HTTP-POST, if it has one:
+    /// single logout is on.
     pub slo: Option<Slo>,
     /// The SOAP SingleLogoutService on https, if it has one: botd signs out of the IdP over the
     /// back channel when there's no browser to send (ADR 0208).
     pub slo_soap: Option<String>,
 }
 
-/// Where the IdP takes logout messages: requests at `location`, our responses at `response`.
+/// Where the IdP takes logout messages: requests at `location`, our responses at `response`,
+/// both over `binding` (ADR 0248).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Slo {
     pub location: String,
     pub response: String,
+    pub binding: Binding,
 }
 
 /// This service provider, as the IdP knows it.
@@ -426,11 +429,15 @@ fn read_idp(entity: Node, entity_id: &str, signs_requests: bool, binding: Reques
     if certs.is_empty() {
         return Err("the metadata has no signing certificate".into());
     }
-    // Only over HTTP-Redirect and https; without one, sign-out stays local to SuperBot.
-    let slo = elements(idp).into_iter().find(|n| is(*n, METADATA, "SingleLogoutService") && n.attribute("Binding") == Some(REDIRECT)).and_then(|n| {
+    // Over the browser, on https; without one, sign-out stays local to SuperBot (or goes over
+    // SOAP). HTTP-Redirect first, as before, unless AuthnRequests go over HTTP-POST by choice;
+    // either way the other binding when that's all the IdP offers (ADR 0248).
+    let order = if binding == RequestBinding::Post { [(POST, Binding::Post), (REDIRECT, Binding::Redirect)] } else { [(REDIRECT, Binding::Redirect), (POST, Binding::Post)] };
+    let slo = order.into_iter().find_map(|(uri, binding)| {
+        let n = elements(idp).into_iter().find(|n| is(*n, METADATA, "SingleLogoutService") && n.attribute("Binding") == Some(uri))?;
         let location = n.attribute("Location")?.trim().to_string();
         let response = n.attribute("ResponseLocation").map(str::trim).filter(|r| !r.is_empty()).unwrap_or(&location).to_string();
-        (super::secure_url(&location) && super::secure_url(&response)).then_some(Slo { location, response })
+        (super::secure_url(&location) && super::secure_url(&response)).then_some(Slo { location, response, binding })
     });
     // SOAP answers on the same connection, so a ResponseLocation means nothing there.
     let slo_soap = elements(idp)
@@ -738,16 +745,21 @@ pub fn redirect_query(param: &str, xml: &str, relay: Option<&str>, key: Option<&
 /// The one script a POST binding page runs. `post_csp` allows only it, by hash.
 const POST_SCRIPT: &str = "document.forms[0].submit()";
 
+/// What a `post_form` page says without script, before its button: where it goes.
+pub const TO_SIGN_IN: &str = "Continue to your organization's sign-in page.";
+pub const TO_SIGN_OUT: &str = "Continue to sign out at your organization.";
+
 /// An HTTP-POST binding message (SAML Bindings 3.5.4): a page whose form posts `param`
-/// (`SAMLRequest`) with `xml` base64 encoded (not DEFLATEd), and RelayState, to `url`. Script
-/// submits it on load; without script, a button does. A signed message carries its signature
-/// inside `xml`: this binding has no signed query.
-pub fn post_form(url: &str, param: &str, xml: &str, relay: Option<&str>) -> String {
+/// (`SAMLRequest` or `SAMLResponse`) with `xml` base64 encoded (not DEFLATEd), and RelayState,
+/// to `url`. Script submits it on load; without script, a button does, after `to`. A signed
+/// message carries its signature inside `xml`: this binding has no signed query.
+pub fn post_form(url: &str, param: &str, xml: &str, relay: Option<&str>, to: &str) -> String {
     let relay = relay.map(|r| format!(r#"<input type="hidden" name="RelayState" value="{}">"#, escape(r))).unwrap_or_default();
     format!(
-        r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>SuperBot</title><form method="post" action="{}"><input type="hidden" name="{param}" value="{}">{relay}<noscript><p>Continue to your organization's sign-in page.</p><button type="submit">Continue</button></noscript></form><script>{POST_SCRIPT}</script>"#,
+        r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>SuperBot</title><form method="post" action="{}"><input type="hidden" name="{param}" value="{}">{relay}<noscript><p>{}</p><button type="submit">Continue</button></noscript></form><script>{POST_SCRIPT}</script>"#,
         escape(url),
-        STANDARD.encode(xml)
+        STANDARD.encode(xml),
+        escape(to)
     )
 }
 
@@ -1363,6 +1375,11 @@ pub mod test_idp {
         xml.replacen("<md:NameIDFormat>", &format!(r#"<md:SingleLogoutService Binding="{REDIRECT}" Location="{SLO_URL}"/><md:NameIDFormat>"#), 1)
     }
 
+    /// `xml` with an HTTP-POST SingleLogoutService at `SLO_URL/post` added (ADR 0248).
+    pub fn with_post_slo(xml: &str) -> String {
+        xml.replacen("<md:NameIDFormat>", &format!(r#"<md:SingleLogoutService Binding="{POST}" Location="{SLO_URL}/post"/><md:NameIDFormat>"#), 1)
+    }
+
     /// `xml` with a SOAP SingleLogoutService at `location` added (ADR 0208).
     pub fn with_soap_slo(xml: &str, location: &str) -> String {
         xml.replacen("<md:NameIDFormat>", &format!(r#"<md:SingleLogoutService Binding="{SOAP}" Location="{location}"/><md:NameIDFormat>"#), 1)
@@ -1603,13 +1620,10 @@ pub(crate) mod tests {
         assert!(parse_idp_metadata(&wants, IDP, true).is_ok(), "a provider that signs its requests takes it");
         assert_eq!(idp().slo, None, "no SingleLogoutService: sign-out stays local");
         let slo = parse_idp_metadata(&with_slo(&metadata()), IDP, false).unwrap().slo.unwrap();
-        assert_eq!((slo.location.as_str(), slo.response.as_str()), (SLO_URL, SLO_URL), "responses go to Location without a ResponseLocation");
+        assert_eq!((slo.location.as_str(), slo.response.as_str(), slo.binding), (SLO_URL, SLO_URL, Binding::Redirect), "responses go to Location without a ResponseLocation");
         let split = with_slo(&metadata()).replace(&format!(r#"Location="{SLO_URL}""#), &format!(r#"Location="{SLO_URL}" ResponseLocation="{SLO_URL}/done""#));
         assert_eq!(parse_idp_metadata(&split, IDP, false).unwrap().slo.unwrap().response, format!("{SLO_URL}/done"));
         assert_eq!(parse_idp_metadata(&with_slo(&metadata()).replace(SLO_URL, "http://idp.example/slo"), IDP, false).unwrap().slo, None, "not over plain http");
-        let post_only = with_slo(&metadata()).replacen(&format!(r#"Binding="{REDIRECT}" Location="{SLO_URL}""#), &format!(r#"Binding="{POST}" Location="{SLO_URL}""#), 1);
-        assert_eq!(parse_idp_metadata(&post_only, IDP, false).unwrap().slo, None, "only the redirect binding is sent to");
-
         // The back channel (ADR 0208): a SOAP endpoint of its own, with or without the front one.
         assert_eq!(idp().slo_soap, None);
         let soap = "https://idp.example/profile/SAML2/SOAP/SLO";
@@ -1618,6 +1632,29 @@ pub(crate) mod tests {
         let only = parse_idp_metadata(&with_soap_slo(&metadata(), soap), IDP, false).unwrap();
         assert_eq!((only.slo, only.slo_soap.as_deref()), (None, Some(soap)), "SOAP alone isn't front-channel logout");
         assert_eq!(parse_idp_metadata(&with_soap_slo(&metadata(), "http://idp.example/soap"), IDP, false).unwrap().slo_soap, None, "not over plain http");
+    }
+
+    #[test]
+    fn logout_goes_over_http_post_when_thats_all_the_idp_offers() {
+        let slo = |xml: &str, b: RequestBinding| load_idp_metadata(xml, IDP, false, b, None, 0).unwrap().slo.map(|s| (s.location, s.binding));
+        let (redirect, post) = ((SLO_URL.to_string(), Binding::Redirect), (format!("{SLO_URL}/post"), Binding::Post));
+        let only_post = with_post_slo(&metadata());
+        let both = with_post_slo(&with_slo(&metadata()));
+        for b in [RequestBinding::Auto, RequestBinding::Redirect, RequestBinding::Post] {
+            assert_eq!(slo(&only_post, b), Some(post.clone()), "{b:?}: never refused for logout, only sign-in is");
+            assert_eq!(slo(&with_slo(&metadata()), b), Some(redirect.clone()), "{b:?}");
+        }
+        assert_eq!(slo(&both, RequestBinding::Auto), Some(redirect.clone()), "HTTP-Redirect first, as before");
+        assert_eq!(slo(&both, RequestBinding::Redirect), Some(redirect.clone()));
+        assert_eq!(slo(&both, RequestBinding::Post), Some(post.clone()), "an admin who chose POST for requests gets it for logout too");
+
+        let split = only_post.replace(&format!(r#"Location="{SLO_URL}/post""#), &format!(r#"Location="{SLO_URL}/post" ResponseLocation="{SLO_URL}/post/done""#));
+        let s = parse_idp_metadata(&split, IDP, false).unwrap().slo.unwrap();
+        assert_eq!((s.response, s.binding), (format!("{SLO_URL}/post/done"), Binding::Post));
+        let plain = only_post.replace(&format!("{SLO_URL}/post"), "http://idp.example/slo/post");
+        assert_eq!(slo(&plain, RequestBinding::Auto), None, "not over plain http");
+        let plain_redirect = with_post_slo(&with_slo(&metadata()).replace(&format!(r#"Location="{SLO_URL}""#), r#"Location="http://idp.example/slo""#));
+        assert_eq!(slo(&plain_redirect, RequestBinding::Auto), Some(post), "the https one when the other isn't");
     }
 
     #[test]
@@ -1751,13 +1788,14 @@ pub(crate) mod tests {
         let changed = signed.replace(r#"ForceAuthn="true""#, r#"ForceAuthn="false""#);
         assert!(xmldsig::verify_enveloped(roxmltree::Document::parse(&changed).unwrap().root_element(), std::slice::from_ref(&key.info)).is_err(), "ForceAuthn is inside the signature");
 
-        let page = post_form("https://idp.example/sso/post?app=1&x=2", "SAMLRequest", &signed, Some(r#"st"ate<"#));
+        let page = post_form("https://idp.example/sso/post?app=1&x=2", "SAMLRequest", &signed, Some(r#"st"ate<"#), TO_SIGN_IN);
         let value = |name: &str| page.split(&format!(r#"name="{name}" value=""#)).nth(1).map(|v| v.split('"').next().unwrap().to_string());
         assert_eq!(STANDARD.decode(value("SAMLRequest").unwrap()).map(String::from_utf8), Ok(Ok(signed.clone())), "base64, not DEFLATEd");
         assert_eq!(value("RelayState").as_deref(), Some("st&quot;ate&lt;"), "escaped");
         assert!(page.contains(r#"<form method="post" action="https://idp.example/sso/post?app=1&amp;x=2">"#), "{page}");
-        assert!(page.contains("<noscript>") && page.contains(r#"<button type="submit">"#), "works without script");
-        assert!(!post_form(SSO_URL, "SAMLRequest", &xml, None).contains("RelayState"));
+        assert!(page.contains("<noscript>") && page.contains(r#"<button type="submit">"#) && page.contains(&escape(TO_SIGN_IN)), "works without script");
+        assert!(!post_form(SSO_URL, "SAMLRequest", &xml, None, TO_SIGN_IN).contains("RelayState"));
+        assert!(post_form(SSO_URL, "SAMLResponse", &xml, None, TO_SIGN_OUT).contains(r#"name="SAMLResponse""#) && !post_form(SSO_URL, "SAMLResponse", &xml, None, TO_SIGN_OUT).contains("sign-in"));
 
         // Only the page's own script runs, and the form goes nowhere but https.
         use sha2::{Digest, Sha256};

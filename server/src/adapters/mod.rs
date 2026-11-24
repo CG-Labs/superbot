@@ -189,10 +189,15 @@ pub(crate) fn secret_env() -> Vec<String> {
 }
 
 /// botd's secrets whose names depend on its settings: SSO providers', Bots' webhooks,
-/// every machine backup store's, each data region's included (ADR 0117), and each named
-/// audit export sink's headers (ADR 0191).
+/// every machine backup store's, each data region's included (ADR 0117), each region's
+/// bucket for its chat store's backups (ADR 0246), and each named audit export sink's
+/// headers (ADR 0191).
 fn named_secret(k: &str) -> bool {
-    k.starts_with("SSO_") || k.starts_with(crate::secrets::BOT_WEBHOOK_PREFIX) || k.starts_with("MACHINE_BACKUP_S3_") || k.starts_with("AUDIT_EXPORT_HEADERS_")
+    k.starts_with("SSO_")
+        || k.starts_with(crate::secrets::BOT_WEBHOOK_PREFIX)
+        || k.starts_with("MACHINE_BACKUP_S3_")
+        || k.starts_with("REGION_DATA_S3_")
+        || k.starts_with("AUDIT_EXPORT_HEADERS_")
 }
 
 /// Tier endpoints' key secrets, and their `_FILE`: a run gets one only when routed to
@@ -892,7 +897,13 @@ mod tests {
 
     #[test]
     fn region_backup_keys_are_never_inherited() {
-        for k in ["MACHINE_BACKUP_S3_DE_FRA_2_SECRET_ACCESS_KEY", "MACHINE_BACKUP_S3_DE_FRA_2_SECRET_ACCESS_KEY_FILE", "MACHINE_BACKUP_S3_GB_LON_ACCESS_KEY_ID"] {
+        for k in [
+            "MACHINE_BACKUP_S3_DE_FRA_2_SECRET_ACCESS_KEY",
+            "MACHINE_BACKUP_S3_DE_FRA_2_SECRET_ACCESS_KEY_FILE",
+            "MACHINE_BACKUP_S3_GB_LON_ACCESS_KEY_ID",
+            "REGION_DATA_S3_DE_FRA_2_SECRET_ACCESS_KEY",
+            "REGION_DATA_S3_DE_FRA_2_SECRET_ACCESS_KEY_FILE",
+        ] {
             assert!(super::named_secret(k), "{k}");
         }
         assert!(!super::named_secret("MACHINE_REGIONS"));

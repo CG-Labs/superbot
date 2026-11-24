@@ -867,3 +867,81 @@ async fn a_pinned_persons_routines_and_approvals_are_kept_with_their_chats() {
     assert_eq!(app.db.routines(Some(&bot)).len(), 1);
     assert_eq!(app.db.approval(&second).unwrap().input, json!({ "command": "rm -rf build" }));
 }
+
+#[tokio::test]
+async fn a_pinned_persons_store_backups_are_copied_off_the_host_into_a_bucket_in_their_region() {
+    use crate::machines::chat_store_copies::{self, COPIED, Copies};
+    use crate::machines::chat_stores::{self, CLEARED, Settings};
+    use crate::machines::s3_standin::{self, StandIn};
+    let scratch = crate::db::Scratch::new();
+    let (lon, fra) = (scratch.path().join("lon"), scratch.path().join("fra"));
+    std::fs::create_dir_all(&lon).unwrap();
+    std::fs::create_dir_all(&fra).unwrap();
+    let settings = Settings { dirs: vec![("gb-lon".into(), lon.clone()), ("de-fra-2".into(), fra.clone())], keep: 7, forget: Vec::new() };
+    let bucket = StandIn::start().await;
+    let copies = Copies::new(chat_store_copies::Settings { stores: vec![("gb-lon".into(), bucket.settings())], prefix: "acme/".into(), recipients: Vec::new() }).unwrap();
+    let set = settings.clone();
+    let (port, app, admin, cp) = linode_set(move |cp| {
+        cp.chat_stores = set;
+        cp.chat_copies = Some(Arc::new(copies));
+    })
+    .await;
+    let cipher = crate::secrets::sealed::cipher();
+    chat_stores::open(&app.db, &settings, None, chat_stores::Keys { current: &cipher, previous: None, forget: false }).unwrap();
+    let (ada, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let bot = app.db.create_bot_owned("B", "#fff", "waddle", "claude", None, false, &ada, crate::acl::Visibility::Private).id;
+    let word = "chat-5d70-contract-terms";
+    app.db.add_message(&bot, "user", word, None, false, None);
+    assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("gb-lon", "DPA-1")).await.0, 200);
+
+    // The hourly check backs London's store up in its folder and copies it to London's bucket.
+    chat_stores::hourly(&app, &cp).await;
+    let keys = bucket.keys();
+    let store = app.db.chat_stores().into_iter().find(|s| s.region == "gb-lon").unwrap();
+    assert!(keys.len() == 1 && keys[0].starts_with(&format!("acme/region-data/gb-lon/{}/chats-", store.id)), "{keys:?}");
+    let has = |k: &str| bucket.w().objects[k].windows(word.len()).any(|x| x == word.as_bytes());
+    assert!(has(&keys[0]));
+    let copied = audit(port, &admin, COPIED).await;
+    assert_eq!((copied[0]["details"]["region"].as_str(), copied[0]["details"]["uploaded"].as_i64(), copied[0]["actorId"].as_str()), (Some("gb-lon"), Some(1), Some("residency")), "{copied:?}");
+    let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
+    let row = |regions: &Value, r: &str| regions["regions"].as_array().unwrap().iter().find(|x| x["id"] == r).unwrap()["chatStore"].clone();
+    let off = row(&regions, "gb-lon")["offHost"].clone();
+    assert_eq!((off["copies"].as_i64(), off["bucket"].as_str(), off["error"].is_null()), (Some(1), Some(s3_standin::BUCKET), true), "{regions}");
+    assert!(row(&regions, "de-fra-2")["offHost"].is_null(), "Frankfurt has no bucket: {regions}");
+    assert!(!regions.to_string().contains(s3_standin::SECRET));
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!((r["chats"]["offHost"]["copies"].as_i64(), r["chats"]["offHost"]["failing"].as_bool()), (Some(1), Some(false)), "{r}");
+    assert!(r["chats"]["offHost"]["bucket"].is_null(), "no bucket names for customers: {r}");
+    assert_eq!(r["digest"].as_str(), Some(crate::machines::residency_report::digest(&r).as_str()));
+    let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
+    assert!(md.contains("- **Store's backups copied off the host:** 1 to a bucket in gb-lon, newest "), "{md}");
+
+    // Pinned to Frankfurt, her chat leaves London. The bucket refuses on the next check:
+    // London's backup is rewritten, but its copy still holds her chat, so the move stays
+    // an earlier copy, and admins and the report are told.
+    assert_eq!(call(port, "DELETE", &format!("/api/users/{ada}/residency"), &admin, r#"{"reason":"moving to Frankfurt"}"#).await.0, 200);
+    assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("de-fra-2", "DPA-2")).await.0, 200);
+    bucket.w().fail = Some(("POST".into(), 503));
+    chat_stores::hourly(&app, &cp).await;
+    assert!(has(&keys[0]), "the old copy is still there");
+    let cleared = audit(port, &admin, CLEARED).await;
+    assert_eq!(cleared[0]["outcome"].as_str(), Some("failure"), "{cleared:?}");
+    assert!(cleared[0]["details"]["error"].as_str().unwrap().contains("the backups' copies off the host"), "{cleared:?}");
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!((r["chats"]["inRegion"].as_bool(), r["chats"]["earlierCopies"][0]["region"].as_str()), (Some(false), Some("gb-lon")), "{r}");
+    assert!(r["chats"]["offHost"].is_null(), "Frankfurt's store isn't copied: {r}");
+    let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
+    assert!(regions["residency"]["warnings"].to_string().contains("gb-lon's chat store's backups couldn't all be copied off the host"), "{regions}");
+    assert!(row(&regions, "gb-lon")["offHost"]["error"].as_str().unwrap().contains("503"), "{regions}");
+
+    // The next check replaces the copy and only then records the move as cleared.
+    chat_stores::hourly(&app, &cp).await;
+    let now_keys = bucket.keys();
+    assert!(now_keys.len() == 1 && now_keys != keys && !has(&now_keys[0]), "{now_keys:?}");
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!((r["chats"]["inRegion"].as_bool(), r["chats"]["earlierCopies"].as_array().map(Vec::len)), (Some(true), Some(0)), "{r}");
+    let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
+    assert!(!regions["residency"]["warnings"].to_string().contains("copied off the host"), "{regions}");
+    let copied = audit(port, &admin, COPIED).await;
+    assert_eq!((copied[0]["details"]["uploaded"].as_i64(), copied[0]["details"]["deleted"].as_i64()), (Some(1), Some(1)), "{copied:?}");
+}

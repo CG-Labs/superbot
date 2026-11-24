@@ -90,34 +90,34 @@ fn each_target_says_whether_it_is_encrypted_and_how_to_fix_it() {
     let dir = temp_dir("be-targets");
     let mut sb = ServerBackups::with(&dir, None);
     // Nothing set, no archives yet: the one target is plain.
-    let ts = backup_encryption::targets(&sb, None);
+    let ts = backup_encryption::targets(&sb, None, None);
     assert_eq!(plain(&ts), ["server_archives"]);
     assert!(ts[0].detail.contains("SUPERBOT_BACKUP_AGE_RECIPIENTS"), "{ts:?}");
     // Recipients set before the first archive: encrypted.
     sb.archive_recipients = true;
-    assert!(plain(&backup_encryption::targets(&sb, None)).is_empty());
+    assert!(plain(&backup_encryption::targets(&sb, None, None)).is_empty());
     // An archive written plain before the upgrade is plain until the next one.
     let old = archive(&dir, 2 * HOUR, false, b"old");
-    let ts = backup_encryption::targets(&sb, None);
+    let ts = backup_encryption::targets(&sb, None, None);
     assert_eq!(plain(&ts), ["server_archives"]);
     assert!(ts[0].detail.contains(&old) && ts[0].detail.contains("encrypts the next one"), "{ts:?}");
     archive(&dir, HOUR, true, b"new");
-    assert!(plain(&backup_encryption::targets(&sb, None)).is_empty(), "the newest archive is what counts");
+    assert!(plain(&backup_encryption::targets(&sb, None, None)).is_empty(), "the newest archive is what counts");
 
     // Off-host copies: encrypted when the archives are, or botd encrypts them on the way.
     sb.target = Some(store(""));
-    assert!(plain(&backup_encryption::targets(&sb, None)).is_empty());
+    assert!(plain(&backup_encryption::targets(&sb, None, None)).is_empty());
     let dir2 = temp_dir("be-targets-plain");
     let mut sb2 = ServerBackups::with(&dir2, Some(store("")));
     archive(&dir2, HOUR, false, b"plain");
-    assert_eq!(plain(&backup_encryption::targets(&sb2, None)), ["server_archives", "server_copies"]);
+    assert_eq!(plain(&backup_encryption::targets(&sb2, None, None)), ["server_archives", "server_copies"]);
     sb2.target = Some(store(&public().1));
-    assert_eq!(plain(&backup_encryption::targets(&sb2, None)), ["server_archives"], "botd encrypts plain archives on the way");
+    assert_eq!(plain(&backup_encryption::targets(&sb2, None, None)), ["server_archives"], "botd encrypts plain archives on the way");
 
     // Machines' backups: by their own recipients.
     let (_, r) = public();
-    assert!(plain(&backup_encryption::targets(&sb, Some(&machines(&r)))).is_empty());
-    let ts = backup_encryption::targets(&sb, Some(&machines("")));
+    assert!(plain(&backup_encryption::targets(&sb, Some(&machines(&r)), None)).is_empty());
+    let ts = backup_encryption::targets(&sb, Some(&machines("")), None);
     assert_eq!(plain(&ts), ["machines"]);
     assert!(ts.last().unwrap().detail.contains("MACHINE_BACKUP_AGE_RECIPIENTS"), "{ts:?}");
 }
@@ -126,33 +126,55 @@ fn each_target_says_whether_it_is_encrypted_and_how_to_fix_it() {
 fn required_refuses_to_start_with_any_target_set_to_be_plain() {
     let dir = temp_dir("be-required");
     let mut sb = ServerBackups::with(&dir, None);
-    assert!(backup_encryption::check(&sb, None).is_ok(), "auto never refuses");
+    assert!(backup_encryption::check(&sb, None, None).is_ok(), "auto never refuses");
     sb.encryption = Policy::Required;
-    let e = backup_encryption::check(&sb, None).err().unwrap();
+    let e = backup_encryption::check(&sb, None, None).err().unwrap();
     assert!(e.contains("server archives (set SUPERBOT_BACKUP_AGE_RECIPIENTS)"), "{e}");
     sb.archive_recipients = true;
-    assert!(backup_encryption::check(&sb, None).is_ok());
+    assert!(backup_encryption::check(&sb, None, None).is_ok());
     // A plain archive from before the recipients were set doesn't stop botd.
     archive(&dir, HOUR, false, b"old");
-    assert!(backup_encryption::check(&sb, None).is_ok());
-    let e = backup_encryption::check(&sb, Some(&machines(""))).err().unwrap();
+    assert!(backup_encryption::check(&sb, None, None).is_ok());
+    let e = backup_encryption::check(&sb, Some(&machines("")), None).err().unwrap();
     assert!(e.contains("MACHINE_BACKUP_AGE_RECIPIENTS") && !e.contains("server archives"), "{e}");
-    assert!(backup_encryption::check(&sb, Some(&machines(&public().1))).is_ok());
+    assert!(backup_encryption::check(&sb, Some(&machines(&public().1)), None).is_ok());
     // Copies without archive recipients need botd's own.
     sb.archive_recipients = false;
     sb.target = Some(store(""));
-    let e = backup_encryption::check(&sb, None).err().unwrap();
+    let e = backup_encryption::check(&sb, None, None).err().unwrap();
     assert!(e.contains("server archives") && e.contains("off this host"), "{e}");
     sb.target = Some(store(&public().1));
-    let e = backup_encryption::check(&sb, None).err().unwrap();
+    let e = backup_encryption::check(&sb, None, None).err().unwrap();
     assert!(e.contains("server archives") && !e.contains("off this host"), "{e}");
+}
+
+fn regional(recipients: Vec<age::x25519::Recipient>) -> machines::chat_store_copies::Settings {
+    let bucket = machines::s3::Settings::new("https://s3.example.com", "lon-chats", "us-east-1", "AKIDEXAMPLE", "example-secret-0123456789").unwrap();
+    machines::chat_store_copies::Settings { stores: vec![("gb-lon".into(), bucket)], prefix: "superbot/".into(), recipients }
+}
+
+#[test]
+fn regional_chat_stores_copies_are_a_target_that_required_holds_to_its_own_recipients() {
+    let dir = temp_dir("be-regional");
+    let mut sb = ServerBackups::with(&dir, None);
+    sb.archive_recipients = true;
+    let ts = backup_encryption::targets(&sb, None, Some(&regional(Vec::new())));
+    assert_eq!(plain(&ts), ["chat_stores"]);
+    assert!(ts.last().unwrap().detail.contains("REGION_DATA_AGE_RECIPIENTS"), "{ts:?}");
+    let sealed = regional(vec![public().0.to_public()]);
+    assert!(plain(&backup_encryption::targets(&sb, None, Some(&sealed))).is_empty());
+
+    sb.encryption = Policy::Required;
+    let e = backup_encryption::check(&sb, None, Some(&regional(Vec::new()))).err().unwrap();
+    assert!(e.contains("regional chat stores' off-host copies (set REGION_DATA_AGE_RECIPIENTS)") && !e.contains("server archives"), "{e}");
+    assert!(backup_encryption::check(&sb, None, Some(&sealed)).is_ok());
 }
 
 #[test]
 fn startup_warns_per_plain_target_unless_plaintext_was_chosen() {
     let dir = temp_dir("be-lines");
     let sb = ServerBackups::with(&dir, None);
-    let ts = backup_encryption::targets(&sb, Some(&machines("")));
+    let ts = backup_encryption::targets(&sb, Some(&machines("")), None);
     let (line, warnings) = backup_encryption::startup_lines(Policy::Auto, &ts);
     assert!(line.contains("2 of 2 targets are plain"), "{line}");
     assert_eq!(warnings.len(), 2);
@@ -160,7 +182,7 @@ fn startup_warns_per_plain_target_unless_plaintext_was_chosen() {
     let (line, warnings) = backup_encryption::startup_lines(Policy::Off, &ts);
     assert!(line.contains("plain by choice (SUPERBOT_BACKUP_ENCRYPTION=off): server_archives, machines"), "{line}");
     assert!(warnings.is_empty());
-    let ts = backup_encryption::targets(&sb, Some(&machines(&public().1))).into_iter().filter(|t| t.encrypted).collect::<Vec<_>>();
+    let ts = backup_encryption::targets(&sb, Some(&machines(&public().1)), None).into_iter().filter(|t| t.encrypted).collect::<Vec<_>>();
     let (line, warnings) = backup_encryption::startup_lines(Policy::Auto, &ts);
     assert!(line.starts_with("every target is encrypted (machines)") && warnings.is_empty(), "{line}");
 }

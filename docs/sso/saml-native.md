@@ -181,7 +181,7 @@ If the IdP answers SuperBot's request with another unsolicited response, it igno
 | `SSO_<ID>_JIT_ROLE` | `off` | `readonly`, `member` or `admin`: create a user at first sign-in. Needs `ALLOWED_DOMAINS`. |
 | `SSO_<ID>_LABEL` | `Company SSO` | Button text: "Sign in with …". |
 | `SSO_<ID>_SIGN_REQUESTS` | `false` | `true`: sign AuthnRequests with the SP key ([below](#signed-authnrequests)). |
-| `SSO_<ID>_REQUEST_BINDING` | `auto` | How AuthnRequests reach the IdP: `auto` uses HTTP-Redirect when the IdP's metadata offers it, else HTTP-POST; `redirect` or `post` uses only that one ([below](#authnrequests-over-http-post)). |
+| `SSO_<ID>_REQUEST_BINDING` | `auto` | How AuthnRequests reach the IdP: `auto` uses HTTP-Redirect when the IdP's metadata offers it, else HTTP-POST; `redirect` or `post` uses only that one ([below](#authnrequests-over-http-post)). `post` also puts logout over HTTP-POST when the IdP offers both ([logout](#logout-over-http-post)). |
 | `SSO_<ID>_SP_CERT_FILE` | | Your own SP certificate (PEM), with its key as `SSO_<ID>_PRIVATE_KEY`. Without it, botd makes and keeps one. |
 | `SSO_<ID>_PRIVATE_KEY` | | With `SP_CERT_FILE`: the SP's private key (PKCS #8 PEM), as env, `_FILE`, or `botctl secret set`. |
 | `SSO_<ID>_ENCRYPTED_ASSERTIONS` | `off` | `allow`: take encrypted assertions as well as plain ones; `require`: only encrypted ones ([below](#encrypted-assertions)). `off` refuses them. |
@@ -329,12 +329,21 @@ SSO_CORP_METADATA_SIGNING_CERT_FILE=/etc/superbot/corp-idp-metadata.pem
 
 ## Single logout
 
-When the IdP's metadata has an HTTP-Redirect `SingleLogoutService` on https, botd does single logout over the browser:
+When the IdP's metadata has an HTTP-Redirect or HTTP-POST `SingleLogoutService` on https, botd does single logout over the browser ([HTTP-POST below](#logout-over-http-post)):
 
 - **Signing out of SuperBot** ends the SuperBot session, then takes the browser to the IdP with a signed LogoutRequest, which ends the IdP session too and comes back to the sign-in page. The phone app and `botctl` have no browser to send, so they use the [back channel](#back-channel-soap-logout) when the IdP offers one, and otherwise end their own session only.
 - **Signing out at the IdP** (or the IdP ending the session) sends SuperBot a signed LogoutRequest at the SLO URL. botd revokes the SuperBot sessions that IdP session made (or all of that person's sessions from this IdP if it names none), audits `auth.slo` with the sessions revoked, and answers with a signed LogoutResponse.
 
 At the IdP, set the **logout URL** (single logout URL, SLO endpoint) to the SLO URL `botctl` shows, HTTP-Redirect or HTTP-POST, and give it the SP certificate to check our requests (Okta: **Enable Single Logout** and upload the **Signature Certificate**; Entra ID: **Logout Url (Optional)** under **Basic SAML Configuration**). Then refresh or import the IdP's metadata so botd sees its logout URL; `botctl sso saml corp` says `Single logout: yes`.
+
+### Logout over HTTP-POST
+
+Some IdPs list only an HTTP-POST `SingleLogoutService` (some Shibboleth, PingFederate and government IdPs). botd uses it with no setting ([ADR 0248](../adr/0248-saml-logout-over-http-post.md)); with both bindings listed it still uses HTTP-Redirect, unless `SSO_CORP_REQUEST_BINDING=post`, which then takes HTTP-POST for logout too.
+
+- **Signing out of SuperBot** answers with a link to a one-time page on SuperBot (`…/api/auth/sso/corp/logout?h=…`) instead of the IdP's URL. The browser opens it as it would the IdP's, and the page posts the signed LogoutRequest to the IdP, like the [AuthnRequest page](#authnrequests-over-http-post). Each link works once, for five minutes. The SuperBot session has already ended by then, whatever happens next.
+- **Signing out at the IdP**: botd's signed LogoutResponse goes back to the IdP on a page that posts it, with the IdP's RelayState, whichever binding the IdP's request came by.
+
+Messages over HTTP-POST carry their signature inside the XML, made with the same SP key. `botctl sso saml corp` says `Single logout: yes, over HTTP-POST`, and `auth.logout` and `auth.slo_response` record `post` as the binding.
 
 ### Back-channel (SOAP) logout
 
