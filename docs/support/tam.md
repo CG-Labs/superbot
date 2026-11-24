@@ -26,7 +26,7 @@ A TAM doesn't replace support: tickets still go to `<support-email>` or `<suppor
 | Within 5 business days of signing | Kickoff ([agenda](#kickoff-agenda)) | The customer's owner, IdP admin and security contact | Onboarding plan and dates, in the customer's record |
 | Weekly until go-live | Onboarding check-in: the checklists' open items (`botctl onboarding`, [onboarding check](onboarding-check.md)), blockers | The customer's owner | Updated checklists |
 | Week 1 after go-live | Check-in: sign-in, approvals, first runs, open tickets | The customer's owner and pilot team | Issues raised as tickets |
-| Monthly | [Health check](health-check.md), with the [health score](health-score.md) | The TAM alone, then a short call with the customer's owner if anything is watch or at risk | Score and notes in the customer's record |
+| Monthly | [Health check](health-check.md) (`botctl health-check` judges it from botd's records), with the [health score](health-score.md) | The TAM alone, then a short call with the customer's owner if anything is watch or at risk | Score and notes in the customer's record |
 | Quarterly | [Business review](qbr-template.md) | The customer's sponsor and owner | The review document, actions with owners |
 | Twice a year | Restore drill on their deployment, times recorded against the RTO | The Provider's on-call engineer and the customer's owner | Drill record |
 | Before each upgrade | Release notes and any action needed; the change window | The customer's owner | Agreed window |
@@ -56,4 +56,4 @@ When a customer changes TAM, or the TAM is away for more than two weeks, write i
 
 ## Records
 
-Everything about a customer (contacts, the onboarding record, health checks, reviews, handovers) is kept in the Provider's support system or CRM, with access limited to the people who work with them. Not in this repository, not in a ticket other customers' staff can see, and not in a Bot's chat. The health score, onboarding check and support bundle carry no personal data, so they can be attached; anything copied from the console or the audit log can, so trim it first.
+Everything about a customer (contacts, the onboarding record, health checks, reviews, handovers) is kept in the Provider's support system or CRM, with access limited to the people who work with them. Not in this repository, not in a ticket other customers' staff can see, and not in a Bot's chat. The health score, onboarding check, health check and support bundle carry no personal data, so they can be attached; anything copied from the console or the audit log can, so trim it first.

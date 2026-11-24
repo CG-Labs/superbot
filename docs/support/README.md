@@ -16,7 +16,7 @@ How customers get help with SuperBot, how fast, and how the Provider runs suppor
 | [Support check and the offline bundle](support-check.md) | `botd support check` and `botd support bundle`: diagnostics and a bundle without botd, for a server that won't start, before an upgrade and after a restore |
 | [Technical account managers](tam.md) | The named TAM for Enterprise customers: what they do, the cadence from kickoff to renewal, and handover |
 | [Customer health score](health-score.md) | `botctl health-score`: six signals from botd's own records, how they're scored, and what to do about each; its daily [history](health-score.md#history) and the console's Support tab |
-| [Health check](health-check.md) | The TAM's monthly (Enterprise) or quarterly checklist |
+| [Health check](health-check.md) | The TAM's monthly (Enterprise) or quarterly checklist, judged from botd's records by `botctl health-check` |
 | [Quarterly business review](qbr-template.md) | The template for the review with the customer's owner and sponsor |
 | [Incidents and their reviews](incident-review.md) | `botctl incident`: posting and updating the status page from the server, and `botctl incident review`, a draft of the post-incident review from botd's records |
 | [Support report](support-report.md) | `botctl support-report`: tickets by month and severity from the ticket system's export, response targets met and missed, and what's still open |
