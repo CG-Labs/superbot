@@ -214,16 +214,16 @@ pub(super) fn person(app: &App, cp: &ControlPlane, id: &str, region: &str) -> Op
 }
 
 /// What the pin doesn't cover. botd's own data is listed, with why, unless the operator
-/// states it is in the pin's region (ADR 0184); without chats when they are all in the
-/// region's own chat store (ADR 0215).
+/// states it is in the pin's region (ADR 0184); without chats, routines and approvals when
+/// they are all in the region's own chat store (ADR 0215, ADR 0228).
 fn not_covered(server_data: &Value, chats: &Value) -> Vec<String> {
     let mut out = Vec::new();
     if server_data["inRegion"] != true {
         let why: Vec<&str> = server_data["outside"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
         let what = if chats["store"] == true && chats["inRegion"] == true {
-            "botd's own database apart from chats, which are in the region's chat store (accounts, routines, approvals, the audit log; its server backups also hold chats from before they moved there)"
+            "botd's own database apart from chats, routines and approvals, which are in the region's chat store (accounts, sessions, the audit log; its server backups also hold chats, routines and approvals from before they moved there)"
         } else {
-            "botd's own database (accounts, chats, routines, the audit log)"
+            "botd's own database (accounts, chats, routines, approvals, the audit log)"
         };
         out.push(format!("{what}, its files and server backups, which are where the operator runs botd: {} (ADR 0129, ADR 0184).", why.join("; ")));
     }
@@ -385,7 +385,7 @@ fn server_data_markdown(s: &Value) -> String {
         _ => "kept on botd's host".to_string(),
     };
     let mut out = format!(
-        "\n## botd's own data\n\nAccounts, chats, routines and the audit log, in botd's database and files.\n\n- **Region:** {region}\n- **Server backups:** {copies}\n- **In the pinned region:** {}\n- **Held to it:** {}\n",
+        "\n## botd's own data\n\nAccounts, chats, routines, approvals and the audit log, in botd's database and files.\n\n- **Region:** {region}\n- **Server backups:** {copies}\n- **In the pinned region:** {}\n- **Held to it:** {}\n",
         if s["inRegion"] == true { "yes" } else { "no" },
         if s["policy"] == "require" { "yes, every pin on this server is (RESIDENCY_SERVER_DATA=require)" } else { "no, it is shown, not enforced (RESIDENCY_SERVER_DATA=report)" }
     );
@@ -395,21 +395,31 @@ fn server_data_markdown(s: &Value) -> String {
     out
 }
 
-/// The report's "Chats" section (ADR 0215). Empty for reports without one.
+/// The report's "Chats" section (ADR 0215), with routines and approvals (ADR 0228) when the
+/// report has them. Empty for reports without one.
 fn chats_markdown(c: &Value, region: &Value) -> String {
     if !c.is_object() {
         return String::new();
     }
-    let m = &c["messages"];
-    let store = if c["store"] == true { format!("yes, {} has a chat store of its own", cell(region)) } else { format!("no, {} has none, so chats are in botd's own database", cell(region)) };
+    let store = if c["store"] == true {
+        format!("yes, {} has a chat store of its own", cell(region))
+    } else {
+        format!("no, {} has none, so chats, routines and approvals are in botd's own database", cell(region))
+    };
     let backup = c["lastBackupAt"].as_i64().map_or("-".to_string(), rfc3339);
-    format!(
-        "\n## Chats\n\nTheir Bots' chat messages, by where they are kept.\n\n- **Regional chat store:** {store}\n- **Messages in it:** {}\n- **Messages in botd's own database:** {}\n- **Messages in another region's store:** {}\n- **In the pinned region:** {}\n- **Newest backup of the store:** {backup}\n",
-        cell(&m["inStore"]),
-        cell(&m["inServerDatabase"]),
-        cell(&m["elsewhere"]),
-        if c["inRegion"] == true { "yes" } else { "no" },
-    )
+    let mut out = format!("\n## Chats, routines and approvals\n\nTheir Bots' chat messages, routines and approvals, by where they are kept.\n\n- **Regional chat store:** {store}\n");
+    for (key, what) in [("messages", "Messages"), ("routines", "Routines"), ("approvals", "Approvals")] {
+        let m = &c[key];
+        if m.is_object() {
+            out += &format!(
+                "- **{what} in it:** {}\n- **{what} in botd's own database:** {}\n- **{what} in another region's store:** {}\n",
+                cell(&m["inStore"]),
+                cell(&m["inServerDatabase"]),
+                cell(&m["elsewhere"])
+            );
+        }
+    }
+    out + &format!("- **In the pinned region:** {}\n- **Newest backup of the store:** {backup}\n", if c["inRegion"] == true { "yes" } else { "no" })
 }
 
 /// The longest run of backticks in `s`, so a fence around it is longer.
@@ -522,12 +532,21 @@ mod tests {
         assert_eq!(not_covered(&Value::Null, &none).len(), NOT_COVERED.len() + 1, "no server data section: not covered");
         // Chats all in the region's own store are left out of what isn't covered (ADR 0215).
         let held = not_covered(&out, &json!({ "store": true, "inRegion": true }));
-        assert!(held[0].starts_with("botd's own database apart from chats, which are in the region's chat store (accounts, routines"), "{held:?}");
+        assert!(held[0].starts_with("botd's own database apart from chats, routines and approvals, which are in the region's chat store (accounts, sessions"), "{held:?}");
         let moving = not_covered(&out, &json!({ "store": true, "inRegion": false }));
-        assert!(moving[0].starts_with("botd's own database (accounts, chats,"), "{moving:?}");
+        assert!(moving[0].starts_with("botd's own database (accounts, chats, routines, approvals,"), "{moving:?}");
         assert_eq!(chats_markdown(&Value::Null, &json!("gb-lon")), "", "reports from before ADR 0215 have no section");
         let md = chats_markdown(&json!({ "store": true, "inRegion": true, "lastBackupAt": null, "messages": { "inStore": 4, "inServerDatabase": 0, "elsewhere": 0 } }), &json!("gb-lon"));
         assert!(md.contains("## Chats") && md.contains("- **Regional chat store:** yes, gb-lon has a chat store of its own\n- **Messages in it:** 4") && md.contains("- **Newest backup of the store:** -"), "{md}");
+        assert!(!md.contains("Routines in it"), "reports from before ADR 0228 have no routine or approval lines: {md}");
+        let md = chats_markdown(
+            &json!({ "store": true, "inRegion": false, "lastBackupAt": null,
+                "messages": { "inStore": 4, "inServerDatabase": 0, "elsewhere": 0 },
+                "routines": { "inStore": 1, "inServerDatabase": 0, "elsewhere": 0 },
+                "approvals": { "inStore": 2, "inServerDatabase": 1, "elsewhere": 0 } }),
+            &json!("gb-lon"),
+        );
+        assert!(md.contains("- **Routines in it:** 1\n") && md.contains("- **Approvals in it:** 2\n- **Approvals in botd's own database:** 1\n") && md.contains("- **In the pinned region:** no"), "{md}");
         assert_eq!(server_data_markdown(&Value::Null), "", "reports from before ADR 0184 have no section");
         let md = server_data_markdown(&json!({ "region": null, "backups": { "offHost": true, "region": null }, "inRegion": false, "policy": "report", "outside": ["a|b"] }));
         assert!(md.contains("- **Region:** not stated by the operator\n- **Server backups:** copied off the host to a store in no stated region\n- **In the pinned region:** no"), "{md}");

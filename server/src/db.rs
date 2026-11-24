@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 mod chats;
-pub use chats::{ChatMove, ChatStore};
+pub use chats::{ChatMove, ChatStore, Held};
 #[cfg(test)]
 pub(crate) use chats::Scratch;
 
@@ -1633,9 +1633,12 @@ pub struct ScimToken {
     /// The last expiry notice audited for it: `expiring`, then `expired`.
     #[serde(skip)]
     pub expiry_notice: Option<String>,
+    /// What it may do (ADR 0224). All four for tokens made before scopes.
+    pub scopes: crate::scim::scopes::Scopes,
 }
 
 fn scim_token_row(r: &Row) -> rusqlite::Result<ScimToken> {
+    let scopes: Option<String> = r.get("scopes")?;
     Ok(ScimToken {
         id: r.get("id")?,
         tenant: r.get("tenant")?,
@@ -1649,6 +1652,7 @@ fn scim_token_row(r: &Row) -> rusqlite::Result<ScimToken> {
         expires_at: r.get("expires_at")?,
         rotated_to: r.get("rotated_to")?,
         expiry_notice: r.get("expiry_notice")?,
+        scopes: crate::scim::scopes::Scopes::from_stored(scopes.as_deref()),
     })
 }
 
@@ -2314,7 +2318,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 68] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 69] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -2383,7 +2387,18 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 68] = [
     migrate_scim_team_role_groups,
     migrate_role_requests,
     migrate_service_account_bots,
+    migrate_scim_token_scopes,
 ];
+
+/// SCIM token scopes (ADR 0224): a JSON list of scope names. Tokens made before keep a
+/// null, which is every scope, so upgrading changes nothing an IdP can do.
+fn migrate_scim_token_scopes(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('scim_tokens') WHERE name = 'scopes'", [], |r| r.get(0))?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch("ALTER TABLE scim_tokens ADD COLUMN scopes TEXT;")
+}
 
 /// Service accounts' own Bots (ADR 0222): a Bot a service account made names it. The Bot
 /// is still its owner's (machine, plan, keys, memory); the account keeps it only while it's
@@ -4995,7 +5010,7 @@ impl Db {
     }
 
     pub fn set_status(&self, id: i64, status: &str) {
-        self.on_chats(&self.c(), "UPDATE {messages} SET status = ? WHERE id = ?", params![status, id]).unwrap();
+        self.on_places(&self.c(), "UPDATE {messages} SET status = ? WHERE id = ?", params![status, id]).unwrap();
     }
 
     /// Free text (name, email, user agent) is masked as `record` masks it.
@@ -5005,13 +5020,13 @@ impl Db {
             *v = audit::redact_text(v);
         }
         let who = serde_json::to_value(&who).map(|v| redact::value(v).to_string()).unwrap_or_default();
-        self.on_chats(&self.c(), "UPDATE {messages} SET requested_by = ? WHERE id = ?", params![who, id]).unwrap();
+        self.on_places(&self.c(), "UPDATE {messages} SET requested_by = ? WHERE id = ?", params![who, id]).unwrap();
     }
 
     pub fn set_question(&self, id: i64, q: &Value) {
         let owner = self.message(id).and_then(|m| self.bot_owner(&m.bot_id));
         let q = redact::value_for(owner.as_deref().as_slice(), q.clone()).to_string();
-        self.on_chats(&self.c(), "UPDATE {messages} SET question = ? WHERE id = ?", params![q, id]).unwrap();
+        self.on_places(&self.c(), "UPDATE {messages} SET question = ? WHERE id = ?", params![q, id]).unwrap();
     }
 
     /// Who owns a Bot: whose own secrets are redacted from what it writes (ADR 0029).
@@ -5115,7 +5130,7 @@ impl Db {
         };
         let mut deleted = 0;
         for (_, id) in &ids {
-            deleted += self.on_chats(&tx, "DELETE FROM {messages} WHERE id = ?", &[id])?;
+            deleted += self.on_places(&tx, "DELETE FROM {messages} WHERE id = ?", &[id])?;
         }
         tx.commit()?;
         Ok((deleted, ids.last().copied()))
@@ -5170,7 +5185,9 @@ impl Db {
         let c = self.c();
         let gone = c.execute(&format!("DELETE FROM bots WHERE id = ?1 AND NOT {HELD_CHAT}"), [id]).unwrap() > 0;
         if gone {
-            self.on_chats(&c, "DELETE FROM {messages} WHERE bot_id = ?1", &[&id]).unwrap();
+            for table in ["{messages}", "{routines}", "{approvals}"] {
+                self.on_places(&c, &format!("DELETE FROM {table} WHERE bot_id = ?1"), &[&id]).unwrap();
+            }
         }
         gone
     }
@@ -5193,7 +5210,7 @@ impl Db {
 
     #[cfg(test)]
     pub fn set_message_time(&self, id: i64, at: i64) {
-        self.on_chats(&self.c(), "UPDATE {messages} SET created_at = ?1 WHERE id = ?2", params![at, id]).unwrap();
+        self.on_places(&self.c(), "UPDATE {messages} SET created_at = ?1 WHERE id = ?2", params![at, id]).unwrap();
     }
 
     #[cfg(test)]
@@ -5223,13 +5240,11 @@ impl Db {
     /// A routine whose runs are for `author` (ADR 0046), written whole so the scheduler
     /// never sees it without its author.
     pub fn add_routine_by(&self, bot_id: &str, name: &str, cron: &str, instruction: &str, enabled: bool, author: Option<&str>) -> Routine {
-        let id = crate::short_id();
-        self.c()
-            .execute(
-                "INSERT INTO routines (id, bot_id, name, cron, instruction, enabled, author_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                params![id, bot_id, name, cron, instruction, enabled, author, now()],
-            )
-            .unwrap();
+        let c = self.c();
+        let id = self.unused_id(&c, "routines").unwrap();
+        let cols = ["id", "bot_id", "name", "cron", "instruction", "enabled", "author_id", "created_at"];
+        self.insert_kept(&c, "routines", bot_id, &cols, params![id, bot_id, name, cron, instruction, enabled, author, now()]).unwrap();
+        drop(c);
         self.routine(&id).unwrap()
     }
 
@@ -5238,29 +5253,29 @@ impl Db {
     pub fn update_routine(&self, id: &str, name: Option<&str>, cron: Option<&str>, instruction: Option<&str>, enabled: Option<bool>, author: Option<&str>) {
         let c = self.c();
         let set = |col: &str, v: &dyn rusqlite::ToSql| {
-            c.execute(&format!("UPDATE routines SET {col} = ? WHERE id = ?"), params![v, id]).unwrap();
+            self.on_places(&c, &format!("UPDATE {{routines}} SET {col} = ? WHERE id = ?"), params![v, id]).unwrap();
         };
         if let Some(v) = name { set("name", &v) }
         if let Some(v) = cron { set("cron", &v) }
         if let Some(v) = instruction {
             if let Some(a) = author {
-                c.execute("UPDATE routines SET author_id = ? WHERE id = ? AND instruction != ?", params![a, id, v]).unwrap();
+                self.on_places(&c, "UPDATE {routines} SET author_id = ? WHERE id = ? AND instruction != ?", params![a, id, v]).unwrap();
             }
             set("instruction", &v)
         }
         if let Some(v) = enabled {
-            c.execute("UPDATE routines SET enabled = ?, paused_reason = NULL, paused_for = NULL, paused_at = NULL WHERE id = ?", params![v, id]).unwrap();
+            self.on_places(&c, "UPDATE {routines} SET enabled = ?, paused_reason = NULL, paused_for = NULL, paused_at = NULL WHERE id = ?", params![v, id]).unwrap();
         }
     }
 
     /// Turns a routine off for a disabled user (ADR 0047). False when it was already off.
     pub fn pause_routine(&self, id: &str, reason: &str, for_user: &str, at: i64) -> bool {
-        self.c()
-            .execute(
-                "UPDATE routines SET enabled = 0, paused_reason = ?, paused_for = ?, paused_at = ? WHERE id = ? AND enabled = 1",
-                params![reason, for_user, at, id],
-            )
-            .unwrap()
+        self.on_places(
+            &self.c(),
+            "UPDATE {routines} SET enabled = 0, paused_reason = ?, paused_for = ?, paused_at = ? WHERE id = ? AND enabled = 1",
+            params![reason, for_user, at, id],
+        )
+        .unwrap()
             > 0
     }
 
@@ -5273,39 +5288,38 @@ impl Db {
 
     /// Turns a paused routine back on. False when it isn't paused any more.
     pub fn resume_routine(&self, id: &str) -> bool {
-        self.c()
-            .execute(
-                "UPDATE routines SET enabled = 1, paused_reason = NULL, paused_for = NULL, paused_at = NULL WHERE id = ? AND enabled = 0 AND paused_reason IS NOT NULL",
-                [id],
-            )
-            .unwrap()
+        self.on_places(
+            &self.c(),
+            "UPDATE {routines} SET enabled = 1, paused_reason = NULL, paused_for = NULL, paused_at = NULL WHERE id = ? AND enabled = 0 AND paused_reason IS NOT NULL",
+            &[&id],
+        )
+        .unwrap()
             > 0
     }
 
     /// Keeps a paused routine off, now for someone else who is still disabled.
     pub fn repause_routine(&self, id: &str, reason: &str, for_user: &str) {
-        self.c()
-            .execute("UPDATE routines SET paused_reason = ?, paused_for = ? WHERE id = ? AND enabled = 0 AND paused_reason IS NOT NULL", params![reason, for_user, id])
+        self.on_places(&self.c(), "UPDATE {routines} SET paused_reason = ?, paused_for = ? WHERE id = ? AND enabled = 0 AND paused_reason IS NOT NULL", params![reason, for_user, id])
             .unwrap();
     }
 
     /// Moves what a routine holds for `from` (its authorship, its pause) to `to`.
     pub fn hand_over_routine(&self, id: &str, from: &str, to: &str) {
-        self.c()
-            .execute(
-                "UPDATE routines SET author_id = CASE WHEN author_id = ?1 THEN ?2 ELSE author_id END,
-                   paused_for = CASE WHEN paused_for = ?1 THEN ?2 ELSE paused_for END WHERE id = ?3",
-                params![from, to, id],
-            )
-            .unwrap();
+        self.on_places(
+            &self.c(),
+            "UPDATE {routines} SET author_id = CASE WHEN author_id = ?1 THEN ?2 ELSE author_id END,
+               paused_for = CASE WHEN paused_for = ?1 THEN ?2 ELSE paused_for END WHERE id = ?3",
+            params![from, to, id],
+        )
+        .unwrap();
     }
 
     pub fn routine_ran(&self, id: &str, at: i64) {
-        self.c().execute("UPDATE routines SET last_run_at = ? WHERE id = ?", params![at, id]).unwrap();
+        self.on_places(&self.c(), "UPDATE {routines} SET last_run_at = ? WHERE id = ?", params![at, id]).unwrap();
     }
 
     pub fn delete_routine(&self, id: &str) {
-        self.c().execute("DELETE FROM routines WHERE id = ?", [id]).unwrap();
+        self.on_places(&self.c(), "DELETE FROM {routines} WHERE id = ?", &[&id]).unwrap();
     }
 
     // Harness policy
@@ -5420,7 +5434,6 @@ impl Db {
         expires_at: i64,
         run: Option<(&str, Option<&crate::policy::RunScope>)>,
     ) -> Approval {
-        let id = crate::short_id();
         // Keep the row small: a huge file write is summarized by its subject anyway.
         let owner = self.bot_owner(bot_id);
         let owners: Vec<&str> = owner.as_deref().into_iter().collect();
@@ -5429,20 +5442,21 @@ impl Db {
         if input.len() > 20_000 {
             input = serde_json::json!({ "truncated": input.chars().take(20_000).collect::<String>() }).to_string();
         }
-        // Tool input can hold anything a Bot wrote (file contents, commands), so it is sealed at rest.
-        let input = sealed::seal_field(&sealed::approval_context(&id), &input);
         let run_id = run.map(|(r, _)| r);
         let run_scope = run.and_then(|(_, s)| s).map(|s| {
             let covers: Vec<String> = s.covers_text().iter().map(|w| redact::text_for(owners, w).into_owned()).collect();
             serde_json::json!({ "covers": covers, "exact": s.exact.is_some() }).to_string()
         });
-        self.c()
-            .execute(
-                "INSERT INTO approvals (id, bot_id, harness, tool, kind, subject, input, class, reason, status, created_at, expires_at, run_id, run_scope)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
-                params![id, bot_id, harness, tool, kind, redact::text_for(owners, subject), input, class, reason, now(), expires_at, run_id, run_scope],
-            )
+        let subject = redact::text_for(owners, subject);
+        let c = self.c();
+        let id = self.unused_id(&c, "approvals").unwrap();
+        // Tool input can hold anything a Bot wrote (file contents, commands), so it is sealed at rest.
+        let input = sealed::seal_field(&sealed::approval_context(&id), &input);
+        let cols = ["id", "bot_id", "harness", "tool", "kind", "subject", "input", "class", "reason", "status", "created_at", "expires_at", "run_id", "run_scope"];
+        let at = now();
+        self.insert_kept(&c, "approvals", bot_id, &cols, params![id, bot_id, harness, tool, kind, subject, input, class, reason, "pending", at, expires_at, run_id, run_scope])
             .unwrap();
+        drop(c);
         self.approval(&id).unwrap()
     }
 
@@ -5488,13 +5502,13 @@ impl Db {
     }
 
     fn finish_approval_scoped(&self, id: &str, status: &str, by: &str, note: Option<&str>, rule_id: Option<&str>, scope: Option<&str>) -> bool {
-        self.c()
-            .execute(
-                "UPDATE approvals SET status = ?, decided_by = ?, note = ?, rule_id = ?, scope = ?, decided_at = ? WHERE id = ? AND status = 'pending'",
-                params![status, by, note, rule_id, scope, now(), id],
-            )
-            .unwrap()
-            == 1
+        self.on_places(
+            &self.c(),
+            "UPDATE {approvals} SET status = ?, decided_by = ?, note = ?, rule_id = ?, scope = ?, decided_at = ? WHERE id = ? AND status = 'pending'",
+            params![status, by, note, rule_id, scope, now(), id],
+        )
+        .unwrap()
+            > 0
     }
 
     /// Closes a pending approval and saves its remembered rule in one transaction,
@@ -5505,13 +5519,14 @@ impl Db {
         let c = self.c();
         let tx = c.unchecked_transaction().ok()?;
         let scope = (status == "approved").then_some("once");
-        let closed = tx
-            .execute(
-                "UPDATE approvals SET status = ?, decided_by = ?, note = ?, rule_id = ?, scope = ?, decided_at = ? WHERE id = ? AND status = 'pending'",
+        let closed = self
+            .on_places(
+                &tx,
+                "UPDATE {approvals} SET status = ?, decided_by = ?, note = ?, rule_id = ?, scope = ?, decided_at = ? WHERE id = ? AND status = 'pending'",
                 params![status, by, note, rule_id, scope, now(), id],
             )
             .ok()?;
-        if closed != 1 {
+        if closed == 0 {
             return None;
         }
         let action = if rule.action == Action::Allow { "allow" } else { "deny" };
@@ -7133,9 +7148,9 @@ impl Db {
                 run("UPDATE residency_pins SET reference = ?3 WHERE subject_type = ?1 AND subject_id = ?2", &[&kind, &id, &r])?;
             }
         }
-        out.routines = run("DELETE FROM routines WHERE author_id = ?", &[&user_id])?;
+        out.routines = self.on_places(&tx, "DELETE FROM {routines} WHERE author_id = ?", &[&user_id]).map_err(db_err)?;
         out.messages = self
-            .on_chats(
+            .on_places(
                 &tx,
                 &format!(
                     "UPDATE {{messages}} SET text = '{ERASED_TEXT}', question = NULL, requested_by = NULL
@@ -7145,8 +7160,8 @@ impl Db {
                 &[&user_id, &bots_json],
             )
             .map_err(db_err)?;
-        self.on_chats(&tx, &format!("UPDATE {{messages}} SET requested_by = NULL WHERE {SENT_BY_ANY}"), &[&user_id]).map_err(db_err)?;
-        out.approvals = run("UPDATE approvals SET decided_by = ?2, note = NULL WHERE decided_by = ?1", &[&user_id, &pseudonym])?;
+        self.on_places(&tx, &format!("UPDATE {{messages}} SET requested_by = NULL WHERE {SENT_BY_ANY}"), &[&user_id]).map_err(db_err)?;
+        out.approvals = self.on_places(&tx, "UPDATE {approvals} SET decided_by = ?2, note = NULL WHERE decided_by = ?1", &[&user_id, &pseudonym]).map_err(db_err)?;
         out.disk_reports = run(
             "UPDATE machines SET disk_files = NULL, disk_files_partial = 0, disk_files_at = NULL WHERE user_id = ? AND (disk_files IS NOT NULL OR disk_files_at IS NOT NULL)",
             &[&user_id],
@@ -8425,7 +8440,17 @@ impl Db {
 
     /// A tenant's first token sets its SSO provider for good: a token naming another gets
     /// `Err` with the tenant's provider. Checked and written in one transaction.
-    pub fn create_scim_token(&self, tenant: &str, label: Option<&str>, sso_provider: Option<&str>, token_hash: &str, by: Option<&str>, expires_at: i64) -> Result<ScimToken, Option<String>> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_scim_token(
+        &self,
+        tenant: &str,
+        label: Option<&str>,
+        sso_provider: Option<&str>,
+        token_hash: &str,
+        by: Option<&str>,
+        expires_at: i64,
+        scopes: crate::scim::scopes::Scopes,
+    ) -> Result<ScimToken, Option<String>> {
         let id = format!("st{}", crate::random_hex(4));
         let c = self.c();
         let tx = c.unchecked_transaction().unwrap();
@@ -8437,8 +8462,8 @@ impl Db {
             return Err(first);
         }
         tx.execute(
-            "INSERT INTO scim_tokens (id, tenant, label, sso_provider, token_hash, created_at, created_by, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            params![id, tenant, label, sso_provider, token_hash, now(), by, expires_at],
+            "INSERT INTO scim_tokens (id, tenant, label, sso_provider, token_hash, created_at, created_by, expires_at, scopes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![id, tenant, label, sso_provider, token_hash, now(), by, expires_at, scopes.to_stored()],
         )
         .unwrap();
         let t = tx.query_row("SELECT * FROM scim_tokens WHERE id = ?", [&id], scim_token_row).unwrap();
@@ -8479,10 +8504,10 @@ impl Db {
     }
 
     /// Replaces a live, unrotated token with a new one of the same tenant, label and SSO
-    /// link, in one transaction (ADR 0196). The old one is revoked now, or with
-    /// `keep_until`, expires then unless it would sooner. None if the old one was revoked,
-    /// expired or rotated meanwhile.
-    pub fn rotate_scim_token(&self, old: &str, token_hash: &str, expires_at: i64, keep_until: Option<i64>, by: Option<&str>) -> Option<ScimToken> {
+    /// link, with `scopes`, in one transaction (ADR 0196). The old one is revoked now, or
+    /// with `keep_until`, expires then unless it would sooner. None if the old one was
+    /// revoked, expired or rotated meanwhile.
+    pub fn rotate_scim_token(&self, old: &str, token_hash: &str, expires_at: i64, keep_until: Option<i64>, by: Option<&str>, scopes: crate::scim::scopes::Scopes) -> Option<ScimToken> {
         let id = format!("st{}", crate::random_hex(4));
         let at = now();
         let c = self.c();
@@ -8504,9 +8529,9 @@ impl Db {
             return None;
         }
         tx.execute(
-            "INSERT INTO scim_tokens (id, tenant, label, sso_provider, token_hash, created_at, created_by, expires_at)
-             SELECT ?1, tenant, label, sso_provider, ?2, ?3, ?4, ?5 FROM scim_tokens WHERE id = ?6",
-            params![id, token_hash, at, by, expires_at, old],
+            "INSERT INTO scim_tokens (id, tenant, label, sso_provider, token_hash, created_at, created_by, expires_at, scopes)
+             SELECT ?1, tenant, label, sso_provider, ?2, ?3, ?4, ?5, ?7 FROM scim_tokens WHERE id = ?6",
+            params![id, token_hash, at, by, expires_at, old, scopes.to_stored()],
         )
         .ok()?;
         let t = tx.query_row("SELECT * FROM scim_tokens WHERE id = ?", [&id], scim_token_row).ok()?;
@@ -8543,6 +8568,11 @@ impl Db {
     #[cfg(test)]
     pub fn set_scim_token_notice(&self, id: &str, notice: Option<&str>) {
         self.c().execute("UPDATE scim_tokens SET expiry_notice = ?1 WHERE id = ?2", params![notice, id]).unwrap();
+    }
+
+    #[cfg(test)]
+    pub fn set_scim_token_scopes(&self, id: &str, scopes: Option<&str>) {
+        self.c().execute("UPDATE scim_tokens SET scopes = ?1 WHERE id = ?2", params![scopes, id]).unwrap();
     }
 
     #[cfg(test)]

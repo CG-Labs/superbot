@@ -554,6 +554,7 @@ impl MachineProvider for Fleet {
                 match m.incus.firewall_devices(id).await {
                     Ok(d) => {
                         out.machines.extend(d.machines.into_iter().map(|n| format!("{}/{n}", m.name)));
+                        out.partly.extend(d.partly.into_iter().map(|n| format!("{}/{n}", m.name)));
                         out.others += d.others;
                     }
                     Err(ProviderError::NotFound) => missing += 1,

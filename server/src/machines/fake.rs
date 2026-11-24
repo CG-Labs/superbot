@@ -28,6 +28,8 @@ pub struct FakeFirewall {
     pub foreign: bool,
     pub enabled: bool,
     pub machines: BTreeSet<String>,
+    /// Machines with Linode interfaces only some of which are behind it (ADR 0226).
+    pub partly: BTreeSet<String>,
     /// Devices that aren't machines, e.g. a NodeBalancer someone put behind it.
     pub others: usize,
 }
@@ -68,6 +70,9 @@ struct State {
     networks: BTreeMap<String, FakeNetwork>,
     /// Machines that take a team network's interface only once rebuilt (ADR 0212).
     team_nic_rebuild: BTreeSet<String>,
+    /// Machines with Linode interfaces (ADR 0226): theirs are added and removed only
+    /// while they are off.
+    linode_interfaces: BTreeSet<String>,
 }
 
 /// Linode's disks for the default tiers' plans, in GiB.
@@ -82,7 +87,7 @@ fn refused(message: &str) -> ProviderError {
 
 impl State {
     fn firewall_of(&self, machine: &str) -> Option<&FakeFirewall> {
-        self.firewalls.values().find(|f| f.machines.contains(machine))
+        self.firewalls.values().find(|f| f.machines.contains(machine) || f.partly.contains(machine))
     }
 }
 
@@ -218,6 +223,7 @@ impl Fake {
                 foreign: true,
                 enabled: true,
                 machines: machines.iter().map(|m| m.to_string()).collect(),
+                partly: BTreeSet::new(),
                 others: 0,
             },
         );
@@ -247,6 +253,11 @@ impl Fake {
     /// As if machine `id` were an Incus container made before ADR 0212.
     pub fn team_nic_needs_rebuild_for(&self, id: &str) {
         self.state.lock().unwrap().team_nic_rebuild.insert(id.into());
+    }
+
+    /// As if machine `id` were a Linode with Linode interfaces (ADR 0226).
+    pub fn linode_interfaces_for(&self, id: &str) {
+        self.state.lock().unwrap().linode_interfaces.insert(id.into());
     }
 
     /// As if network `id` was made under another label, e.g. another MACHINE_LABEL_PREFIX.
@@ -492,7 +503,11 @@ impl MachineProvider for Fake {
         Box::pin(async move {
             self.with("team_network_members", |s| {
                 let n = s.networks.get(id).ok_or(ProviderError::NotFound)?;
-                let member = |m: &String, active: bool| NetworkMember { machine: m.clone(), config: format!("{m}-config"), interface: format!("{m}-vpc"), active };
+                let member = |m: &String, active: bool| {
+                    let needs_power_off = s.linode_interfaces.contains(m);
+                    let config = if needs_power_off { String::new() } else { format!("{m}-config") };
+                    NetworkMember { machine: m.clone(), config, interface: format!("{m}-vpc"), active, needs_power_off }
+                };
                 let on = |m: &String| s.machines.get(m).is_none_or(|x| x.status != "offline");
                 Ok(n.members.iter().map(|m| member(m, on(m))).chain(n.pending.iter().map(|m| member(m, false))).collect())
             })
@@ -504,6 +519,9 @@ impl MachineProvider for Fake {
         Box::pin(async move {
             self.with("leave_team_network", |s| {
                 let on = s.machines.get(&m.machine).is_some_and(|x| x.status != "offline");
+                if on && s.linode_interfaces.contains(&m.machine) {
+                    return Err(refused("The Linode must be powered off to delete interfaces."));
+                }
                 if on && s.networks.values().any(|n| n.members.contains(&m.machine)) {
                     return Err(refused("Cannot delete an active interface."));
                 }
@@ -520,8 +538,11 @@ impl MachineProvider for Fake {
     fn join_team_network<'a>(&'a self, machine: &'a str, network: &'a TeamNetwork) -> Fut<'a, ()> {
         Box::pin(async move {
             self.with("join_team_network", |s| {
-                if !s.machines.contains_key(machine) {
+                let Some(m) = s.machines.get(machine) else {
                     return Err(ProviderError::NotFound);
+                };
+                if s.linode_interfaces.contains(machine) && m.status != "offline" {
+                    return Err(refused("The Linode must be powered off to add interfaces."));
                 }
                 if s.networks.values().any(|n| n.id != network.id && (n.members.contains(machine) || n.pending.contains(machine))) {
                     return Err(ProviderError::Api { status: 409, message: "it is on another VPC; it leaves that one first".into() });
@@ -533,6 +554,10 @@ impl MachineProvider for Fake {
                 Ok(())
             })
         })
+    }
+
+    fn team_network_needs_power_off<'a>(&'a self, machine: &'a str) -> Fut<'a, bool> {
+        Box::pin(async move { self.with("team_network_needs_power_off", |s| Ok(s.linode_interfaces.contains(machine))) })
     }
 
     fn find_firewall<'a>(&'a self, label: &'a str) -> Fut<'a, Option<ProviderFirewall>> {
@@ -572,6 +597,7 @@ impl MachineProvider for Fake {
                     foreign: false,
                     enabled: true,
                     machines: BTreeSet::new(),
+                    partly: BTreeSet::new(),
                     others: 0,
                 };
                 let v = view(&f);
@@ -606,6 +632,7 @@ impl MachineProvider for Fake {
                 let f = s.firewalls.get(id).ok_or(ProviderError::NotFound)?;
                 Ok(FirewallDevices {
                     machines: f.machines.iter().cloned().collect(),
+                    partly: f.partly.iter().cloned().collect(),
                     others: f.others,
                 })
             })
@@ -620,6 +647,13 @@ impl MachineProvider for Fake {
                 }
                 if !s.machines.contains_key(machine) {
                     return Err(refused("id: Linode not found"));
+                }
+                // As Linode's: the rest of its interfaces go behind the one it's partly behind.
+                if s.firewalls[id].partly.contains(machine) {
+                    let f = s.firewalls.get_mut(id).unwrap();
+                    f.partly.remove(machine);
+                    f.machines.insert(machine.into());
+                    return Ok(());
                 }
                 if s.firewall_of(machine).is_some() {
                     return Err(refused("This Linode already has an active Firewall."));
@@ -639,6 +673,7 @@ impl MachineProvider for Fake {
             self.with("detach_firewall", |s| {
                 if let Some(f) = s.firewalls.get_mut(id) {
                     f.machines.remove(machine);
+                    f.partly.remove(machine);
                 }
                 Ok(())
             })
