@@ -33,7 +33,7 @@ const MAX_ID: usize = 255;
 const METADATA_HOST: &str = "169.254.169.254";
 const TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 const SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
-const IAM_CREDENTIALS: &str = "https://iamcredentials.googleapis.com";
+pub(crate) const IAM_CREDENTIALS: &str = "https://iamcredentials.googleapis.com";
 const STS: &str = "https://sts.googleapis.com";
 const TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
@@ -227,6 +227,32 @@ impl Google {
             super::redact::release(&old.value);
         }
         Ok(value)
+    }
+
+    /// The client to call Google's APIs with.
+    pub fn client(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    /// The email of the service account botd signs in as: the key's, or the metadata
+    /// server's default account's.
+    pub async fn email(&self) -> Result<String, String> {
+        let host = match &self.auth {
+            Auth::Key(sa) => return Ok(sa.email.clone()),
+            Auth::Metadata { host } => host,
+        };
+        let what = format!("{}: the metadata server's service account", self.label);
+        let res = self.local.get(format!("http://{host}/computeMetadata/v1/instance/service-accounts/default/email")).header("Metadata-Flavor", "Google").send().await.map_err(|e| format!("{what}: {e}"))?;
+        let status = res.status();
+        let text = res.text().await.map_err(|e| format!("{what}: {e}"))?;
+        let email = text.trim();
+        if !status.is_success() {
+            return Err(format!("{what} answered {status}"));
+        }
+        if email.is_empty() || email.len() > 254 || !email.contains('@') || !email.bytes().all(|b| b.is_ascii_alphanumeric() || b"@.-_".contains(&b)) {
+            return Err(format!("{what} isn't an email"));
+        }
+        Ok(email.to_string())
     }
 
     /// Signs in at `base` instead: a stand-in for the metadata server.

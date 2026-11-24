@@ -745,6 +745,8 @@ impl<'a> Judge<'a> {
             "vault" => {
                 let v = self.get("VAULT_ADDR").to_string();
                 self.address(Area::Secrets, "VAULT_ADDR", &v, "HashiCorp Vault", SECRETS_FIX);
+                let found = crate::secrets::vault::sign_in_reaches(&self.var());
+                self.reaches(Area::Secrets, "VAULT_AUTH", found, SECRETS_FIX);
             }
             "azure-keyvault" => {
                 let v = self.get("AZURE_KEYVAULT_URL").to_string();
@@ -1301,6 +1303,25 @@ mod tests {
         let azure = findings(&[("SECRETS_BACKEND", "azure-keyvault"), ("AZURE_KEYVAULT_URL", "https://kv1.vault.azure.net"), ("AZURE_RUN_CREDENTIALS", "x")], &[]);
         assert_eq!(by(&azure, "IDENTITY_ENDPOINT").status, Status::Ok);
         assert_eq!(by(&azure, "AZURE_AUTHORITY_HOST").status, Status::Internet, "a managed identity trades its token at Entra ID for runs");
+    }
+
+    #[test]
+    fn vaults_cloud_sign_in_names_the_hosts_botd_reaches() {
+        let vault = |extra: &[(&'static str, &'static str)]| {
+            let mut pairs = vec![("SECRETS_BACKEND", "vault"), ("VAULT_ADDR", "https://vault.internal:8200")];
+            pairs.extend_from_slice(extra);
+            findings(&pairs, &[])
+        };
+        let gcp = vault(&[("VAULT_AUTH", "gcp")]);
+        assert_eq!(by(&gcp, "GCE_METADATA_HOST").status, Status::Ok);
+        assert_eq!(by(&gcp, "GCP_IAM_CREDENTIALS_ENDPOINT").host.as_deref(), Some("iamcredentials.googleapis.com"), "signJwt is botd's");
+        let aws = vault(&[("VAULT_AUTH", "aws"), ("VAULT_AWS_REGION", "eu-west-2"), ("AWS_WEB_IDENTITY_TOKEN_FILE", "/var/run/token"), ("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/botd")]);
+        assert_eq!(by(&aws, "AWS_ENDPOINT_URL_STS").host.as_deref(), Some("sts.eu-west-2.amazonaws.com"));
+        assert!(vault(&[("VAULT_AUTH", "aws")]).iter().all(|x| x.setting.as_deref() != Some("AWS_ENDPOINT_URL_STS")), "Vault sends the login's STS request, not botd");
+        let azure = vault(&[("VAULT_AUTH", "azure"), ("VAULT_AZURE_CREDENTIALS", "client-secret")]);
+        assert_eq!(by(&azure, "AZURE_AUTHORITY_HOST").status, Status::Internet);
+        assert!(vault(&[]).iter().all(|x| x.area != Area::Secrets || x.setting.as_deref() == Some("VAULT_ADDR")), "a token reaches only Vault");
+        assert_eq!(by(&vault(&[("VAULT_AUTH", "aws"), ("VAULT_AWS_REGION", "west")]), "VAULT_AUTH").status, Status::Check);
     }
 
     #[test]
