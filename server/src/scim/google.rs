@@ -27,12 +27,18 @@ use zeroize::Zeroizing;
 pub const CREDENTIALS: &str = "GOOGLE_DIRECTORY_CREDENTIALS";
 /// Read-only: botd never writes to the directory.
 pub const SCOPES: &str = "https://www.googleapis.com/auth/admin.directory.user.readonly https://www.googleapis.com/auth/admin.directory.group.readonly";
+/// Asked for only when an organizational unit is named (ADR 0234), so servers that
+/// don't use them need no change to their delegation.
+pub const ORG_UNIT_SCOPE: &str = "https://www.googleapis.com/auth/admin.directory.orgunit.readonly";
 /// The audit actor of every change a pass makes.
 pub const ACTOR_ID: &str = "scim:google-directory";
 const METHOD: &str = "google_directory";
 const API: &str = "https://admin.googleapis.com";
 const TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 const MAX_GROUPS: usize = 50;
+const MAX_ORG_UNITS: usize = 50;
+/// The top-level organizational unit: everyone in the customer.
+const ROOT: &str = "/";
 /// Pages per list and bytes per page: a directory bigger than this is an error, never a
 /// partial read that would look like people leaving.
 const MAX_PAGES: usize = 2000;
@@ -61,6 +67,12 @@ pub struct Settings {
     /// Group emails that are SCIM role groups (ADR 0180), once an admin declares them in
     /// the tenant by email. Being in one gives no account.
     pub role_groups: Vec<String>,
+    /// Organizational units, as paths (`/Sales`) or ids (`id:03ph8a2z...`): the people in
+    /// them, or in units below them, get an account (ADR 0234). `/` is everyone.
+    pub org_units: Vec<String>,
+    /// Organizational units that are teams too (SCIM_GROUPS=on). Each person is on the
+    /// team of the deepest one they're in.
+    pub team_org_units: Vec<String>,
     /// A Google SSO provider: each user's Directory id is their subject there, so they
     /// sign in to the account the sync made.
     pub sso: Option<String>,
@@ -95,11 +107,25 @@ impl Settings {
         };
         let groups = group_list("GOOGLE_DIRECTORY_GROUPS", &var("GOOGLE_DIRECTORY_GROUPS"))?;
         let teams = group_list("GOOGLE_DIRECTORY_TEAM_GROUPS", &var("GOOGLE_DIRECTORY_TEAM_GROUPS"))?;
-        if groups.is_empty() && teams.is_empty() {
-            return Err("GOOGLE_DIRECTORY_GROUPS must name at least one group by its email: only the people in these groups get an account.".into());
+        let org_units = org_unit_list("GOOGLE_DIRECTORY_ORG_UNITS", &var("GOOGLE_DIRECTORY_ORG_UNITS"))?;
+        let team_org_units = org_unit_list("GOOGLE_DIRECTORY_TEAM_ORG_UNITS", &var("GOOGLE_DIRECTORY_TEAM_ORG_UNITS"))?;
+        if groups.is_empty() && teams.is_empty() && org_units.is_empty() && team_org_units.is_empty() {
+            return Err(
+                "GOOGLE_DIRECTORY_GROUPS (group emails) or GOOGLE_DIRECTORY_ORG_UNITS (organizational units) must name at least one: only the people in them get an account."
+                    .into(),
+            );
         }
         if !teams.is_empty() && !scim.groups {
             return Err("GOOGLE_DIRECTORY_TEAM_GROUPS needs SCIM_GROUPS=on: those groups become teams.".into());
+        }
+        if !team_org_units.is_empty() && !scim.groups {
+            return Err("GOOGLE_DIRECTORY_TEAM_ORG_UNITS needs SCIM_GROUPS=on: those organizational units become teams.".into());
+        }
+        if team_org_units.iter().any(|o| o == ROOT) {
+            return Err("GOOGLE_DIRECTORY_TEAM_ORG_UNITS can't be / (everyone). Name the units that are teams; GOOGLE_DIRECTORY_ORG_UNITS=/ gives everyone an account.".into());
+        }
+        if org_units.len() + team_org_units.len() > MAX_ORG_UNITS {
+            return Err(format!("GOOGLE_DIRECTORY_ORG_UNITS and GOOGLE_DIRECTORY_TEAM_ORG_UNITS name at most {MAX_ORG_UNITS} organizational units together"));
         }
         let role_groups = group_list("GOOGLE_DIRECTORY_ROLE_GROUPS", &var("GOOGLE_DIRECTORY_ROLE_GROUPS"))?;
         if !role_groups.is_empty() && !(scim.groups && scim.group_roles) {
@@ -137,13 +163,73 @@ impl Settings {
         let minutes = number(var, "GOOGLE_DIRECTORY_INTERVAL_MINUTES", 30, 5, 1440)?;
         let max_removals = number(var, "GOOGLE_DIRECTORY_MAX_REMOVALS", 10, 1, 1_000_000)?;
         let push = push::address(var)?;
-        Ok(Some(Settings { tenant, customer, groups, teams, role_groups, sso, admin, api, interval: Duration::from_secs(minutes as u64 * 60), max_removals, push }))
+        Ok(Some(Settings {
+            tenant,
+            customer,
+            groups,
+            teams,
+            role_groups,
+            org_units,
+            team_org_units,
+            sso,
+            admin,
+            api,
+            interval: Duration::from_secs(minutes as u64 * 60),
+            max_removals,
+            push,
+        }))
     }
 
     /// Whether the group `key` gives its members an account.
     fn gives_accounts(&self, key: &str) -> bool {
         self.groups.iter().chain(&self.teams).any(|g| g == key)
     }
+
+    /// The organizational units read from Google: every one named but `/`.
+    fn units_to_read(&self) -> impl Iterator<Item = &String> {
+        self.org_units.iter().chain(&self.team_org_units).filter(|o| *o != ROOT)
+    }
+
+    /// What the service account asks Google for: the org unit scope only when a unit
+    /// must be read.
+    pub fn scopes(&self) -> String {
+        if self.units_to_read().next().is_some() { format!("{SCOPES} {ORG_UNIT_SCOPE}") } else { SCOPES.to_string() }
+    }
+}
+
+/// Organizational units, each once, in order: `/`, a path (`/Sales/EMEA`, kept as
+/// written but for a trailing `/`), or an id (`id:` and letters or digits), which still
+/// names the unit after it's renamed or moved.
+fn org_unit_list(name: &str, v: &str) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for o in v.split(',').map(str::trim).filter(|o| !o.is_empty()) {
+        let o = match o.strip_prefix("id:") {
+            Some(id) if !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric()) => o.to_string(),
+            Some(_) => return Err(format!("{name}: \"{o}\" isn't an organizational unit id (id: and letters or digits)")),
+            None if o == ROOT => o.to_string(),
+            None => {
+                let path = o.strip_suffix('/').unwrap_or(o);
+                let ok = path.starts_with('/')
+                    && path.len() <= 1024
+                    && !path.chars().any(char::is_control)
+                    && path[1..].split('/').all(|s| !s.trim().is_empty() && s != "." && s != "..");
+                if !ok {
+                    return Err(format!("{name} must be organizational unit paths starting with / (like /Sales/EMEA) or ids (id:...), separated by commas; \"{o}\" isn't one"));
+                }
+                path.to_string()
+            }
+        };
+        if !out.iter().any(|x| x.to_lowercase() == o.to_lowercase()) {
+            out.push(o);
+        }
+    }
+    Ok(out)
+}
+
+/// Whether the unit at `unit` (a lowercase path) holds someone in `person`: it's their
+/// unit or one above it.
+fn holds(unit: &str, person: &str) -> bool {
+    unit == ROOT || person == unit || person.strip_prefix(unit).is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Group emails, lowercase, each once, in order.
@@ -202,13 +288,13 @@ fn service_account(json: &str) -> Result<ServiceAccount, String> {
 }
 
 /// The signed assertion, as `subject` when the service account acts as an admin.
-fn jwt(sa: &ServiceAccount, subject: Option<&str>) -> Result<Zeroizing<String>, String> {
+fn jwt(sa: &ServiceAccount, subject: Option<&str>, scopes: &str) -> Result<Zeroizing<String>, String> {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs();
     let mut header = json!({ "alg": "RS256", "typ": "JWT" });
     if let Some(kid) = &sa.key_id {
         header["kid"] = json!(kid);
     }
-    let mut claims = json!({ "iss": sa.email, "scope": SCOPES, "aud": sa.token_uri, "iat": now, "exp": now + 3600 });
+    let mut claims = json!({ "iss": sa.email, "scope": scopes, "aud": sa.token_uri, "iat": now, "exp": now + 3600 });
     if let Some(s) = subject {
         claims["sub"] = json!(s);
     }
@@ -260,6 +346,8 @@ struct Person {
     cost_center: Option<String>,
     /// The manager's primary email, from a `manager` relation.
     manager: Option<String>,
+    /// Their organizational unit's path, lowercase (`/` for the top level).
+    org_unit: Option<String>,
 }
 
 #[derive(Debug)]
@@ -273,10 +361,43 @@ struct Group {
     outside: usize,
 }
 
+/// An organizational unit as Google has it now.
+#[derive(Clone, Debug, PartialEq)]
+struct OrgUnit {
+    /// `id:` and letters or digits: a team's `externalId`, kept across renames.
+    id: String,
+    /// As Google writes it, for the team's name and the summary.
+    path: String,
+    /// Lowercase, to compare with people's.
+    lower: String,
+    name: Option<String>,
+}
+
+impl OrgUnit {
+    /// The team's name: its path without the leading `/`, unique in the customer, or
+    /// the unit's own name for the top level. A path too long for a group's name is cut
+    /// and ends with the unit's id, so two long paths never share one.
+    fn team_name(&self) -> String {
+        const MAX: usize = 256;
+        let p = self.path.trim_start_matches('/');
+        if p.is_empty() {
+            return self.name.clone().unwrap_or_else(|| "Everyone".into());
+        }
+        if p.chars().count() <= MAX {
+            return p.to_string();
+        }
+        let suffix = format!(" ({})", self.id);
+        let kept: String = p.chars().take(MAX - suffix.chars().count()).collect();
+        format!("{kept}{suffix}")
+    }
+}
+
 #[derive(Debug, Default)]
 struct Snapshot {
     people: BTreeMap<String, Person>,
     groups: BTreeMap<String, Group>,
+    /// Each unit named in the settings but `/`, by the name the settings give it.
+    org_units: BTreeMap<String, OrgUnit>,
 }
 
 /// Google ids are digits (users) or letters and digits (groups).
@@ -313,7 +434,14 @@ fn person(v: &Value) -> Option<Person> {
         department: clean(&org["department"], 128),
         cost_center: clean(&org["costCenter"], 128),
         manager,
+        org_unit: v["orgUnitPath"].as_str().filter(|p| p.starts_with('/') && !p.chars().any(char::is_control)).map(str::to_lowercase),
     })
+}
+
+fn org_unit(v: &Value) -> Option<OrgUnit> {
+    let id = v["orgUnitId"].as_str().filter(|i| i.strip_prefix("id:").is_some_and(|x| !x.is_empty() && x.len() <= 64 && x.bytes().all(|b| b.is_ascii_alphanumeric())))?;
+    let path = v["orgUnitPath"].as_str().filter(|p| p.starts_with('/') && p.len() <= 1024 && !p.chars().any(char::is_control))?;
+    Some(OrgUnit { id: id.to_string(), path: path.to_string(), lower: path.to_lowercase(), name: clean(&v["name"], 256) })
 }
 
 /// A short, safe reason from an error body: Google's status and message, or OAuth's
@@ -394,13 +522,16 @@ impl Directory {
     pub fn describe(&self) -> String {
         let s = &self.settings;
         let groups = s.groups.iter().chain(&s.teams).chain(&s.role_groups).collect::<HashSet<_>>().len();
+        let units = s.org_units.iter().chain(&s.team_org_units).map(|o| o.to_lowercase()).collect::<HashSet<_>>().len();
         format!(
-            "on, every {} minutes into the SCIM tenant {}; {groups} group{}, {} of them teams and {} role groups; {}; at most {} removals a pass; {}",
+            "on, every {} minutes into the SCIM tenant {}; {groups} group{}, {} of them teams and {} role groups; {units} organizational unit{}, {} of them teams; {}; at most {} removals a pass; {}",
             s.interval.as_secs() / 60,
             s.tenant,
             if groups == 1 { "" } else { "s" },
             s.teams.len(),
             s.role_groups.len(),
+            if units == 1 { "" } else { "s" },
+            s.team_org_units.len(),
             match &s.sso {
                 Some(p) => format!("users sign in with {p}"),
                 None => "no SSO link (GOOGLE_DIRECTORY_SSO)".into(),
@@ -416,7 +547,8 @@ impl Directory {
     async fn token(&self) -> Result<Zeroizing<String>, Failure> {
         let json = (self.key)().map_err(|e| fail("credentials", format!("{CREDENTIALS} couldn't be read: {e}")))?;
         let sa = service_account(&json.ok_or(fail("credentials", format!("{CREDENTIALS} is gone")))?).map_err(|e| fail("credentials", e))?;
-        let assertion = jwt(&sa, self.settings.admin.as_deref()).map_err(|e| fail("credentials", e))?;
+        let scopes = self.settings.scopes();
+        let assertion = jwt(&sa, self.settings.admin.as_deref(), &scopes).map_err(|e| fail("credentials", e))?;
         let form = [("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", assertion.as_str())];
         let res = self.http.post(&sa.token_uri).form(&form).send().await.map_err(|e| fail("unreachable", format!("Google's token endpoint couldn't be reached: {}", e.without_url())))?;
         let status = res.status();
@@ -424,7 +556,11 @@ impl Directory {
         if !status.is_success() {
             return Err(fail(
                 "sign_in",
-                format!("Google refused the service account ({status}, {}). Check domain-wide delegation of the two read-only scopes, and GOOGLE_DIRECTORY_ADMIN.", google_error(&body)),
+                format!(
+                    "Google refused the service account ({status}, {}). Check domain-wide delegation of the {} read-only scopes, and GOOGLE_DIRECTORY_ADMIN.",
+                    google_error(&body),
+                    if scopes == SCOPES { "two" } else { "three (with the organizational unit scope)" }
+                ),
             ));
         }
         let v: Value = serde_json::from_slice(&body).map_err(|_| odd("the access token"))?;
@@ -509,11 +645,30 @@ impl Directory {
             }
             snap.groups.insert(key.clone(), group);
         }
-        let fields = "kind,nextPageToken,users(id,primaryEmail,name(givenName,familyName,fullName),suspended,archived,organizations(primary,name,department,costCenter),externalIds(type,value),relations(type,value))";
+        for key in self.settings.units_to_read() {
+            if snap.org_units.contains_key(key) {
+                continue;
+            }
+            let what = format!("the organizational unit {key}");
+            // A path goes in as its segments, an id as one: Google takes either.
+            let mut segments = vec!["customer", self.settings.customer.as_str(), "orgunits"];
+            segments.extend(key.trim_start_matches('/').split('/'));
+            let v = match self.get(&token, self.url(&segments, &[("fields", "kind,orgUnitId,orgUnitPath,name")])?, "admin#directory#orgUnit", &what).await {
+                Err(f) if f.reason == "not_found" => return Err(fail("org_unit_not_found", format!("{}. Nobody was changed.", f.detail))),
+                r => r?,
+            };
+            snap.org_units.insert(key.clone(), org_unit(&v).ok_or_else(|| odd(&what))?);
+        }
+        let units = !self.settings.org_units.is_empty() || !self.settings.team_org_units.is_empty();
+        let fields = "kind,nextPageToken,users(id,primaryEmail,name(givenName,familyName,fullName),suspended,archived,orgUnitPath,organizations(primary,name,department,costCenter),externalIds(type,value),relations(type,value))";
         let query = [("customer", self.settings.customer.as_str()), ("maxResults", "500"), ("projection", "basic"), ("fields", fields)];
         let what = "the directory's users";
         for u in self.pages(&token, self.url(&["users"], &query)?, "admin#directory#users", "users", what).await? {
             let p = person(&u).ok_or_else(|| odd(what))?;
+            // Someone without a unit would look like someone who left every unit.
+            if units && p.org_unit.is_none() {
+                return Err(odd(what));
+            }
             if snap.people.insert(p.id.clone(), p).is_some() {
                 return Err(odd(what));
             }
@@ -530,6 +685,8 @@ impl Directory {
             "groups": s.groups,
             "teamGroups": s.teams,
             "roleGroups": s.role_groups,
+            "orgUnits": s.org_units,
+            "teamOrgUnits": s.team_org_units,
             "sso": s.sso,
             "admin": s.admin,
             "intervalMinutes": s.interval.as_secs() / 60,
@@ -828,7 +985,10 @@ async fn apply(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Caller, snap: S
     let everyone = scoped.iter().any(|g| g.everyone);
     let members: HashSet<&str> = scoped.iter().flat_map(|g| g.users.iter().map(String::as_str)).collect();
     let outside = members.iter().filter(|id| !snap.people.contains_key(**id)).count() + scoped.iter().map(|g| g.outside).sum::<usize>();
-    let people: Vec<&Person> = snap.people.values().filter(|p| everyone || members.contains(p.id.as_str())).collect();
+    let everyone = everyone || s.org_units.iter().any(|o| o == ROOT);
+    let units: Vec<&OrgUnit> = s.org_units.iter().chain(&s.team_org_units).filter_map(|k| snap.org_units.get(k)).collect();
+    let in_unit = |p: &Person| p.org_unit.as_deref().is_some_and(|path| units.iter().any(|u| holds(&u.lower, path)));
+    let people: Vec<&Person> = snap.people.values().filter(|p| everyone || members.contains(p.id.as_str()) || in_unit(p)).collect();
     let live = all_users(app, tenant);
     // A create takes back a user the tenant deleted, or takes on the one their Google
     // identity is linked to already (as after a just-in-time sign-in).
@@ -888,7 +1048,9 @@ async fn apply(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Caller, snap: S
         link(a, app, c, &people, &all_users(app, tenant), &mut t);
     }
     if a.scim.groups {
-        teams(a, app, d, c, &snap, &people, &mut t).await;
+        let unit_teams = org_unit_teams(s, &snap, &people);
+        let sources: Vec<&Group> = s.teams.iter().filter_map(|k| snap.groups.get(k)).chain(&unit_teams).collect();
+        teams(a, app, d, c, &sources, &people, &mut t).await;
         push_role_groups(a, app, d, c, &snap, &people, &mut t).await;
     }
     let doomed: HashSet<&str> = plan.delete.iter().map(String::as_str).collect();
@@ -922,9 +1084,51 @@ async fn apply(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Caller, snap: S
         "skippedSuspended": plan.skipped,
         "teams": { "created": t.teams_created, "updated": t.teams_updated, "deleted": t.teams_deleted },
         "roleGroups": { "created": t.role_groups_created, "updated": t.role_groups_updated, "deleted": t.role_groups_deleted, "undeclared": t.undeclared },
+        "orgUnits": unit_summary(s, &snap, &people),
         "failed": t.failed,
         "failures": t.failures,
     }))
+}
+
+/// Each unit named, with its path now (it may have been renamed or moved since it was
+/// named by id) and how many people in scope it holds.
+fn unit_summary(s: &Settings, snap: &Snapshot, people: &[&Person]) -> Vec<Value> {
+    let team_ids: HashSet<&str> = s.team_org_units.iter().filter_map(|k| snap.org_units.get(k)).map(|u| u.id.as_str()).collect();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for key in s.org_units.iter().chain(&s.team_org_units) {
+        if !seen.insert(key.to_lowercase()) {
+            continue;
+        }
+        let unit = snap.org_units.get(key);
+        let (path, lower) = unit.map_or((ROOT, ROOT), |u| (u.path.as_str(), u.lower.as_str()));
+        let n = people.iter().filter(|p| p.org_unit.as_deref().is_some_and(|o| holds(lower, o))).count();
+        // By id, so a unit named one way for accounts and another for teams shows as a team.
+        let team = unit.is_some_and(|u| team_ids.contains(u.id.as_str()));
+        out.push(json!({ "orgUnit": key, "path": path, "people": n, "team": team }));
+    }
+    out
+}
+
+/// The team organizational units as team groups, in the order named: each person in
+/// scope is on the team of the deepest one they're in, so nested team units never
+/// share anyone. Two names (a path and an id) of one unit are one team.
+fn org_unit_teams(s: &Settings, snap: &Snapshot, people: &[&Person]) -> Vec<Group> {
+    let mut units: Vec<&OrgUnit> = Vec::new();
+    for u in s.team_org_units.iter().filter_map(|k| snap.org_units.get(k)) {
+        if !units.iter().any(|x| x.id == u.id) {
+            units.push(u);
+        }
+    }
+    let mut out: Vec<Group> = units.iter().map(|u| Group { id: u.id.clone(), name: u.team_name(), users: Vec::new(), everyone: false, outside: 0 }).collect();
+    for p in people {
+        let Some(path) = p.org_unit.as_deref() else { continue };
+        let deepest = units.iter().enumerate().filter(|(_, u)| holds(&u.lower, path)).max_by_key(|(_, u)| u.lower.len());
+        if let Some((i, _)) = deepest {
+            out[i].users.push(p.id.clone());
+        }
+    }
+    out
 }
 
 /// Links each user in scope to their Google identity, if they don't have it yet: as
@@ -982,18 +1186,16 @@ fn all_users(app: &AppState, tenant: &str) -> Vec<ScimUser> {
 /// The team groups: teams no longer wanted go and people leave first, so someone who
 /// moved between two of them joins the new one in the same pass; then each team gets its
 /// name and members. A person is on one team at most, so the first team group listed
-/// wins, and someone on a team the sync doesn't manage stays there. Two addresses of one
-/// Google group are one team.
-async fn teams(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Caller, snap: &Snapshot, people: &[&Person], t: &mut Tally) {
-    let s = &d.settings;
-    let tenant = s.tenant.as_str();
+/// wins (team groups before team organizational units), and someone on a team the sync
+/// doesn't manage stays there. Two addresses of one Google group are one team.
+async fn teams(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Caller, sources: &[&Group], people: &[&Person], t: &mut Tally) {
+    let tenant = d.settings.tenant.as_str();
     let user_of = |gid: &str| app.db.scim_find(tenant, &ScimKey::ExternalId(gid.to_string())).filter(|u| u.deleted_at.is_none()).map(|u| u.user.id);
     let in_scope: HashSet<&str> = people.iter().map(|p| p.id.as_str()).collect();
     let mut claimed: HashSet<String> = HashSet::new();
     let mut seen: HashSet<&str> = HashSet::new();
     let mut wanted: Vec<(&Group, Option<ScimGroup>, Vec<String>)> = Vec::new();
-    for key in &s.teams {
-        let Some(g) = snap.groups.get(key) else { continue };
+    for &g in sources {
         if !seen.insert(g.id.as_str()) {
             continue;
         }
@@ -1206,7 +1408,7 @@ mod tests {
         assert_eq!((s.tenant.as_str(), s.customer.as_str(), s.groups.clone()), ("google", "my_customer", vec!["staff@example.com".to_string(), "eng@example.com".to_string()]));
         assert_eq!((s.interval, s.max_removals, s.api.as_str(), s.sso.clone(), s.admin.clone()), (Duration::from_secs(1800), 10, API, None, None));
         assert!(on(&[], &Scim::default()).unwrap_err().contains("SCIM=on"));
-        assert!(on(&[("GOOGLE_DIRECTORY_GROUPS", "")], &scim(false)).unwrap_err().contains("at least one group"));
+        assert!(on(&[("GOOGLE_DIRECTORY_GROUPS", "")], &scim(false)).unwrap_err().contains("at least one"));
         assert!(on(&[("GOOGLE_DIRECTORY_GROUPS", "not a group")], &scim(false)).is_err());
         assert!(on(&[("GOOGLE_DIRECTORY_TEAM_GROUPS", "eng@example.com")], &scim(false)).unwrap_err().contains("SCIM_GROUPS=on"));
         assert!(on(&[("GOOGLE_DIRECTORY_ROLE_GROUPS", "audit@example.com")], &scim(true)).unwrap_err().contains("SCIM_GROUP_ROLES=on"));
@@ -1228,6 +1430,74 @@ mod tests {
         assert!(on(&[("GOOGLE_DIRECTORY_API_URL", "http://directory.example")], &scim(false)).is_err());
         assert!(on(&[("GOOGLE_DIRECTORY_API_URL", "https://directory.example/v1")], &scim(false)).is_err());
         assert!(on(&[("GOOGLE_DIRECTORY_API_URL", "http://127.0.0.1:9")], &scim(false)).is_ok());
+    }
+
+    #[test]
+    fn organizational_units_are_paths_or_ids() {
+        let on = |extra: &[(&str, &str)], s: &Scim| {
+            let mut all = vec![("GOOGLE_DIRECTORY_SYNC", "on")];
+            all.extend_from_slice(extra);
+            Settings::from_env(&vars(&all), s, &|_| None)
+        };
+        let s = on(&[("GOOGLE_DIRECTORY_ORG_UNITS", "/Sales/, /sales, id:03ph8a2z1, /"), ("GOOGLE_DIRECTORY_TEAM_ORG_UNITS", "/Engineering/Platform")], &scim(true)).unwrap().unwrap();
+        assert_eq!(s.org_units, vec!["/Sales", "id:03ph8a2z1", "/"], "trailing slashes go, each once in any case");
+        assert_eq!((s.groups.len(), s.team_org_units.clone()), (0, vec!["/Engineering/Platform".to_string()]), "units alone are enough");
+        assert_eq!(s.scopes(), format!("{SCOPES} {ORG_UNIT_SCOPE}"));
+        let root = on(&[("GOOGLE_DIRECTORY_ORG_UNITS", "/")], &scim(false)).unwrap().unwrap();
+        assert_eq!(root.scopes(), SCOPES, "/ is read from no unit, so it needs no new scope");
+        let groups = on(&[("GOOGLE_DIRECTORY_GROUPS", "staff@example.com")], &scim(false)).unwrap().unwrap();
+        assert_eq!((groups.scopes(), groups.org_units.len()), (SCOPES.to_string(), 0), "without units, the scopes are as before");
+        for bad in ["Sales", "/Sales//EMEA", "/Sales/../Eng", "id:", "id:03-ph", "/a\u{7}b"] {
+            assert!(on(&[("GOOGLE_DIRECTORY_ORG_UNITS", bad)], &scim(false)).is_err(), "{bad}");
+        }
+        assert!(on(&[("GOOGLE_DIRECTORY_TEAM_ORG_UNITS", "/Eng")], &scim(false)).unwrap_err().contains("SCIM_GROUPS=on"));
+        assert!(on(&[("GOOGLE_DIRECTORY_TEAM_ORG_UNITS", "/")], &scim(true)).unwrap_err().contains("can't be /"));
+        let many = (0..51).map(|i| format!("/u{i}")).collect::<Vec<_>>().join(",");
+        assert!(on(&[("GOOGLE_DIRECTORY_ORG_UNITS", &many)], &scim(false)).unwrap_err().contains("at most 50"));
+    }
+
+    #[test]
+    fn a_unit_holds_the_units_below_it() {
+        assert!(holds("/eng", "/eng") && holds("/eng", "/eng/platform") && holds("/", "/sales"));
+        assert!(!holds("/eng", "/engineering") && !holds("/eng/platform", "/eng"));
+        let p = person(&json!({ "id": "1", "primaryEmail": "a@example.com", "orgUnitPath": "/Eng/Platform" })).unwrap();
+        assert_eq!(p.org_unit.as_deref(), Some("/eng/platform"));
+        assert_eq!(person(&json!({ "id": "1", "primaryEmail": "a@example.com", "orgUnitPath": "Eng" })).unwrap().org_unit, None);
+        assert_eq!(org_unit(&json!({ "orgUnitId": "id:03ab", "orgUnitPath": "/Eng", "name": "Eng" })).map(|u| u.team_name()), Some("Eng".into()));
+        assert_eq!(org_unit(&json!({ "orgUnitId": "id:03ab", "orgUnitPath": "/", "name": "Example Ltd" })).map(|u| u.team_name()), Some("Example Ltd".into()));
+        assert!(org_unit(&json!({ "orgUnitId": "03ab", "orgUnitPath": "/Eng" })).is_none());
+
+        let long = format!("/{}", "x".repeat(256));
+        let (parent, child) = (org_unit(&json!({ "orgUnitId": "id:03p", "orgUnitPath": long })).unwrap(), org_unit(&json!({ "orgUnitId": "id:03c", "orgUnitPath": format!("{long}/y") })).unwrap());
+        assert_eq!(parent.team_name(), "x".repeat(256), "a path that fits is kept whole");
+        let (a, b) = (org_unit(&json!({ "orgUnitId": "id:03a", "orgUnitPath": format!("{long}/a") })).unwrap().team_name(), child.team_name());
+        assert!(a != b && a.ends_with(" (id:03a)") && b.ends_with(" (id:03c)"), "{a} / {b}");
+        assert_eq!((a.chars().count(), b.chars().count()), (256, 256));
+    }
+
+    #[test]
+    fn each_person_is_on_the_team_of_their_deepest_unit() {
+        let unit = |id: &str, path: &str| OrgUnit { id: id.into(), path: path.into(), lower: path.to_lowercase(), name: None };
+        let mut snap = Snapshot::default();
+        snap.org_units.insert("/Eng".into(), unit("id:e", "/Eng"));
+        snap.org_units.insert("id:p".into(), unit("id:p", "/Eng/Platform"));
+        snap.org_units.insert("/Eng/Platform".into(), unit("id:p", "/Eng/Platform"));
+        let s = Settings { team_org_units: vec!["/Eng".into(), "id:p".into(), "/Eng/Platform".into()], ..Settings::from_env(&vars(&[("GOOGLE_DIRECTORY_SYNC", "on"), ("GOOGLE_DIRECTORY_ORG_UNITS", "/")]), &scim(true), &no_sso).unwrap().unwrap() };
+        let at = |id: &str, path: &str| Person { id: id.into(), org_unit: Some(path.to_lowercase()), ..Default::default() };
+        let (ada, bob, cy, dee) = (at("1", "/Eng/Platform/Infra"), at("2", "/Eng"), at("3", "/Sales"), at("4", "/Eng/Platformer"));
+        let teams = org_unit_teams(&s, &snap, &[&ada, &bob, &cy, &dee]);
+        let got: Vec<(&str, &str, Vec<&str>)> = teams.iter().map(|g| (g.id.as_str(), g.name.as_str(), g.users.iter().map(String::as_str).collect())).collect();
+        assert_eq!(got, vec![("id:e", "Eng", vec!["2", "4"]), ("id:p", "Eng/Platform", vec!["1"])], "a path and an id of one unit are one team");
+
+        // Named for accounts one way and for teams another, a unit shows once, as a team.
+        snap.org_units.insert("/eng".into(), unit("id:e", "/Eng"));
+        snap.org_units.insert("/Sales".into(), unit("id:s", "/Sales"));
+        let s = Settings { org_units: vec!["/Eng".into(), "/Sales".into()], team_org_units: vec!["/eng".into()], ..s };
+        let summary = unit_summary(&s, &snap, &[&ada, &bob, &cy, &dee]);
+        assert_eq!(
+            summary,
+            vec![json!({ "orgUnit": "/Eng", "path": "/Eng", "people": 3, "team": true }), json!({ "orgUnit": "/Sales", "path": "/Sales", "people": 1, "team": false })]
+        );
     }
 
     #[test]
@@ -1357,10 +1627,10 @@ mod tests {
         let key = json!({ "type": "service_account", "client_email": "sync@project.iam.gserviceaccount.com", "private_key": pem, "private_key_id": "k1" }).to_string();
         let sa = service_account(&key).unwrap();
         assert_eq!(sa.token_uri, TOKEN_URI);
-        let t = jwt(&sa, Some("admin@example.com")).unwrap();
+        let t = jwt(&sa, Some("admin@example.com"), SCOPES).unwrap();
         let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(t.split('.').nth(1).unwrap()).unwrap()).unwrap();
         assert_eq!((claims["sub"].as_str(), claims["scope"].as_str(), claims["aud"].as_str()), (Some("admin@example.com"), Some(SCOPES), Some(TOKEN_URI)));
-        assert!(jwt(&sa, None).unwrap().split('.').nth(1).map(|c| !String::from_utf8(URL_SAFE_NO_PAD.decode(c).unwrap()).unwrap().contains("\"sub\"")).unwrap());
+        assert!(jwt(&sa, None, SCOPES).unwrap().split('.').nth(1).map(|c| !String::from_utf8(URL_SAFE_NO_PAD.decode(c).unwrap()).unwrap().contains("\"sub\"")).unwrap());
         assert!(service_account(&json!({ "type": "authorized_user" }).to_string()).is_err());
         assert!(service_account(&json!({ "type": "service_account", "client_email": "a@b", "private_key": pem, "token_uri": "http://token.example" }).to_string()).is_err());
     }
