@@ -1818,12 +1818,13 @@ fn saml_summary(v: &Value) -> String {
     }
     out += &rollover_lines(enc);
     out += &format!(
-        "  Encrypted assertions:     {}\n",
+        "  Encrypted assertions:     {}{}\n",
         match v["encryptedAssertions"].as_str() {
             Some("allow") => "allowed",
             Some("require") => "required",
             _ => "off",
-        }
+        },
+        if v["aesCbc"].as_str() == Some("signed-response") { "; AES-CBC too, in signed responses only" } else { "" }
     );
     out += &format!(
         "  IdP metadata signature:   {}\n",
@@ -3682,7 +3683,10 @@ mod tests {
         v["encryptedAssertions"] = json!("require");
         v["spEncryptionKey"] = json!({ "from": "secret", "certificate": { "sha256": "56:78", "subject": "CN=enc", "notAfter": 1_900_000_000_000_i64 } });
         let out = saml_summary(&v);
-        assert!(out.contains("SP encryption certificate: SHA-256 56:78 (secret), expires 2030-03-17") && out.contains("Encrypted assertions:     required"), "{out}");
+        assert!(out.contains("SP encryption certificate: SHA-256 56:78 (secret), expires 2030-03-17") && out.contains("Encrypted assertions:     required\n"), "{out}");
+        v["aesCbc"] = json!("signed-response");
+        assert!(saml_summary(&v).contains("Encrypted assertions:     required; AES-CBC too, in signed responses only\n"));
+        v["aesCbc"] = json!("off");
         v["spEncryptionKey"] = json!({ "problem": "not offered until SSO_CORP_ENCRYPTION_PRIVATE_KEY is set" });
         assert!(saml_summary(&v).contains("SP encryption key:        not offered until SSO_CORP_ENCRYPTION_PRIVATE_KEY"));
         assert!(saml_summary(&v).contains("IdP metadata signature:   not checked\n"));
