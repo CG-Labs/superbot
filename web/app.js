@@ -2350,16 +2350,7 @@ function renderOnboarding(r) {
       <span class="sub">${esc(c.done)} done · ${esc(c.confirm)} to confirm with the customer · ${esc(c.notApplicable)} not applicable · ${esc(c.skipped)} skipped</span>
       <span class="sub push">Checked ${esc(fmt(r.checkedAt))}</span></div>
     <p class="hint">${r.ready ? "Confirm each item marked Confirm with the customer, then go-live in writing." : "Go-live waits until nothing is open."} <code>botctl onboarding markdown</code> prints this for the onboarding record.</p>${skips}`;
-  const rows = [];
-  for (const s of r.sections) {
-    rows.push(`<tr class="section"><td colspan="4">${esc(s.title)}</td></tr>`);
-    for (const i of r.items.filter((i) => i.section === s.id)) {
-      const [label, cls] = ONBOARDING_STATUS[i.status] || [i.status, ""];
-      rows.push(`<tr><td>${esc(i.label)} <span class="sub"><code>${esc(i.id)}</code></span></td>
-        <td><span class="tag ${cls}">${esc(label)}</span></td><td>${esc(i.detail)}</td><td><code>${esc(i.guide)}</code></td></tr>`);
-    }
-  }
-  $("sup-onboarding-items").innerHTML = rows.join("");
+  $("sup-onboarding-items").innerHTML = checklistRows(r);
   $("sup-onboarding").hidden = $("sup-onboarding-table").hidden = false;
 }
 
@@ -2374,6 +2365,43 @@ $("sup-onboarding-form").addEventListener("submit", async (e) => {
     if (mine === onboardingRequest) renderOnboarding(r);
   } catch (err) {
     if (mine === onboardingRequest) fail(err);
+  }
+});
+
+// The monthly health check (ADR 0252): on request too, since each check is audited.
+function checklistRows(r) {
+  const rows = [];
+  for (const s of r.sections) {
+    rows.push(`<tr class="section"><td colspan="4">${esc(s.title)}</td></tr>`);
+    for (const i of r.items.filter((i) => i.section === s.id)) {
+      const [label, cls] = ONBOARDING_STATUS[i.status] || [i.status, ""];
+      rows.push(`<tr><td>${esc(i.label)} <span class="sub"><code>${esc(i.id)}</code></span></td>
+        <td><span class="tag ${cls}">${esc(label)}</span></td><td>${esc(i.detail)}</td><td><code>${esc(i.guide)}</code></td></tr>`);
+    }
+  }
+  return rows.join("");
+}
+
+function renderHealthCheck(r) {
+  const c = r.counts;
+  const score = r.score == null ? "No score" : `Score ${esc(r.score)}`;
+  $("sup-health-check").innerHTML = `<div class="bar"><b>${r.clear ? "Nothing open" : `${esc(c.open)} open`}</b>
+      <span class="sub">${score}, ${esc(String(r.band).replace("_", " "))} · ${esc(c.done)} done · ${esc(c.confirm)} to confirm with the customer · ${esc(c.notApplicable)} not applicable</span>
+      <span class="sub push">Checked ${esc(fmt(r.checkedAt))}</span></div>
+    <p class="hint">${r.clear ? "Confirm each item marked Confirm with the customer, then send their owner the score and what changed." : "Act on each open item this month, with an owner and a date."} <code>botctl health-check markdown</code> prints this for the customer's record.</p>`;
+  $("sup-health-check-items").innerHTML = checklistRows(r);
+  $("sup-health-check").hidden = $("sup-health-check-table").hidden = false;
+}
+
+let healthCheckRequest = 0;
+$("sup-health-check-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const mine = ++healthCheckRequest;
+  try {
+    const r = await api("GET", "/api/support/health-check");
+    if (mine === healthCheckRequest) renderHealthCheck(r);
+  } catch (err) {
+    if (mine === healthCheckRequest) fail(err);
   }
 });
 
