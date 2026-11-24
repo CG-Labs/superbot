@@ -229,7 +229,7 @@ MACHINE_MIRROR_CA_FILE=/etc/superbot/mirror-ca.pem
 - **`MACHINE_NODE_MIRROR`** is laid out as `https://nodejs.org/dist`: machines fetch `<mirror>/v<version>/node-v<version>-linux-x64.tar.xz` (or `-arm64`). An Artifactory or Nexus generic remote of `https://nodejs.org/dist`, or a folder of those files on any web server inside the network, does.
 - **`MACHINE_NPM_REGISTRY`** is an npm registry: an Artifactory, Nexus or Verdaccio remote of `https://registry.npmjs.org`, or one you filled on the connected side. Machines fetch the harnesses and everything they depend on from it, and nothing from npm's registry.
 - **`MACHINE_MIRROR_CA_FILE`** (optional) is the CA, PEM, one or more certificates, that the mirrors' certificates are signed by, if machines don't already trust it. Machines trust it besides their own roots, for these downloads only; botd checks it at start.
-- Both must be `https://`, with no login in the URL: the mirrors must serve these files to machines without one. All three need `MACHINE_CONTROL_URL`, and botd won't start with a value it can't use.
+- Both must be `https://`, with no login in the URL. The Node.js mirror must serve its files without one; for a registry that wants one, see [below](#registries-that-need-a-login). All three need `MACHINE_CONTROL_URL`, and botd won't start with a value it can't use.
 - **Incus containers** never reach private addresses ([guide](incus-containers.md)), so open each mirror's address and port, exactly, with `INCUS_EGRESS_ALLOW=10.0.0.20:443` (comma-separated, IPv6 as `[fd00::20]:443`). Only TCP to those ports opens. `botctl machine mirror` fails, naming the address to add, while one is still closed.
 - **Linode machines'** outbound rules ([ADR 0179](../adr/0179-outbound-rules-at-the-provider.md)) drop private addresses too, with no per-address exception; `botctl machine mirror` says so. Put the mirrors on addresses those rules don't hold, or set `MACHINE_FIREWALL_EGRESS=off`.
 
@@ -244,6 +244,32 @@ botctl machine mirror
 botd fetches every file the harness plan names, from where machines would and trusting what they would: each arch's Node.js tarball, and each npm harness's package document and tarball. It checks each against its pin and answers with an entry per file (`ok`, and an `error` saying what is missing or different), and `"ok": true` only when every one passed. `blocked` lists any mirror address the machines' firewall would drop, which botd, outside it, still reaches, including where the mirror redirects (`redirects`) and any Incus host's address. Nothing is installed or changed. botd must reach the mirrors as machines do. With a remote that fetches from upstream on first use, this fills it too. Run it after every upgrade, since a release can move a pin, then `botctl machine harnesses <user>` sends a machine the plan now.
 
 **Agents:** a machine's agent needs this release or later to use the npm registry or the CA, since older ones would refuse the plan or fetch from npm's registry: botd doesn't send them a plan with mirrors in it, and `botctl machine harnesses <user>` says to upgrade first. Agents upgrade from botd itself, over the control plane, so `botctl machine upgrade <user>` (or `MACHINE_AGENT_UPGRADES=auto`) works with no internet. A mirror for Node.js alone needs no upgrade.
+
+### Registries that need a login
+
+If your registry asks for a login even to read (Artifactory, Nexus, GitLab, Verdaccio with `htpasswd`), give botd one, read-only, for machines to use ([ADR 0219](../adr/0219-npm-registry-logins-for-air-gapped-machines.md)). Either a token:
+
+```sh
+MACHINE_NPM_TOKEN_FILE=/run/secrets/npm-token
+```
+
+or a username and password:
+
+```sh
+MACHINE_NPM_USERNAME=svc-superbot
+MACHINE_NPM_PASSWORD_FILE=/run/secrets/npm-password
+```
+
+- `MACHINE_NPM_TOKEN` is sent as `Bearer` (npm's `_authToken`); the username and password as `Basic` (npm's `_auth`). Use whichever your registry takes from npm: an Artifactory identity token or API key, a Nexus user token, a GitLab deploy token, a Verdaccio user.
+- The token and password are secrets: set them as above, as `MACHINE_NPM_TOKEN` and `MACHINE_NPM_PASSWORD`, or in an [external store](vault.md) (`<prefix>/server/MACHINE_NPM_TOKEN`). botd keeps them from every Bot run and redacts them from its logs.
+- They need `MACHINE_NPM_REGISTRY` and `MACHINE_CONTROL_URL`. botd won't start with both kinds set, half of the username and password, or a token with characters registry tokens don't have (only letters, digits and `- . _ ~ + / = :`).
+- The plan only says a login is needed, never what it is. For each npm install, a machine's agent fetches it from botd over the machine port's mutual TLS, writes it for root alone beside the download, points npm at that file, and removes it when the install ends. npm sends it to your registry and to tarballs under it, and nowhere else. Its errors never show it.
+- Each fetch is in the audit log as `machine.npm_login_sent`, with the user, the registry and the login's kind, never its value.
+- `botctl machine mirror` signs in as machines will (`"npmLogin": "token"` or `"basic"`), only to URLs under the registry. A 401 or 403 says to check the login; a 401 with none set says your registry wants one.
+- To rotate it, change the secret and restart botd. Plans don't change, so nothing reinstalls.
+- Agents need this release or later. botd doesn't send older ones the plan, and `botctl machine harnesses <user>` says to upgrade first (`botctl machine upgrade <user>`).
+
+The Node.js mirror can't take a login: serve its tarballs to machines without one.
 
 ### Hermes Agent on users' machines
 
