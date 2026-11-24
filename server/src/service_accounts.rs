@@ -681,11 +681,11 @@ pub async fn get(State(app): State<AppState>, Extension(c): Extension<Caller>, E
 /// Only admins change the owner. The result must fit under the (new) owner. An owner who
 /// doesn't manage service accounts may only disable theirs (ADR 0239).
 pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(key): Path<String>, Json(v): Json<Value>) -> Res {
-    only_fields(&v, &["name", "description", "role", "team", "status", "owner"])?;
     let before = need_account(&app, &c, &by, &key)?;
     if !manages(&c) {
         owner_change(&app, &by, &before, &v)?;
     }
+    only_fields(&v, &["name", "description", "role", "team", "status", "owner"])?;
     let id = before.user.id.clone();
     let was = Roles::of(&app.db, &before);
     let mut p = ServiceAccountPatch {
@@ -780,7 +780,8 @@ pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>
             }
         }
     }
-    if dropped > 0 || released > 0 {
+    // A new owner's `ownedServiceAccounts` changes, so their app offers the screen (ADR 0239).
+    if dropped > 0 || released > 0 || before.owner_id != after.owner_id {
         app.send(json!({ "type": "resync" }));
     }
     if before.user.status != after.user.status {

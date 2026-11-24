@@ -51,7 +51,7 @@ The five routes above are now classified `account` instead of `users.manage`. Ev
 
 ### Where it shows
 
-- `GET /api/state` (`me`) and `GET /api/auth/me` add `ownedServiceAccounts`: how many live service accounts the person owns. Service accounts and Bots get none.
+- `GET /api/state` (`me`) and `GET /api/auth/me` add `ownedServiceAccounts`: how many live service accounts the person owns. Service accounts and Bots get none. Changing an account's owner sends a `resync`, so an open app picks up the new count.
 - **App.** The sidebar offers **Your service accounts** to anyone who manages service accounts or owns one. For an owner who doesn't manage them, the screen lists theirs. There's no **New service account** button. The page shows the account, what it can use today, its tokens with **Revoke**, and **Disable**, with a note that it acts with their access. There's no new token, rotate, settings, enable or delete. A disabled one says to ask an admin to enable it. They can still hand it their Bots and take them back there, as from the Bot's Sharing section (ADR 0229).
 - A server from before this change sends no `manage`. The app then treats the caller as managing, since only managers got a list.
 - `botctl service-accounts`, `service-account show`, `service-account disable` and `service-account token list|revoke` now work for any owner. The commands haven't changed.

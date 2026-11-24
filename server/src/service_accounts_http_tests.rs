@@ -374,7 +374,10 @@ async fn owners_who_manage_none_see_theirs_revoke_tokens_and_disable_them_only()
     let (_, pat) = user_with(port, &admin, "pat@example.com", "member").await;
     let sa = account(port, &admin, json!({ "name": "Ro's export" })).await;
     let other = account(port, &admin, json!({ "name": "Admin's" })).await;
+    // Made its owner, their open app reloads, so it learns they own one now.
+    let mut s = stream(port, &ro_auth).await;
     assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, &body_owner(&ro)).await.0, 200);
+    read_until(&mut s, "resync").await;
     let (t1, made) = token(port, &admin, &sa, json!({ "name": "nightly" })).await;
     let t1_id = made["tokenInfo"]["id"].as_str().unwrap().to_string();
     let (t2, _) = token(port, &admin, &sa, json!({})).await;
@@ -409,13 +412,14 @@ async fn owners_who_manage_none_see_theirs_revoke_tokens_and_disable_them_only()
     ] {
         assert_eq!(call(port, method, &path, &ro_auth, body).await.0, 403, "{method} {path}");
     }
-    for body in [r#"{"name":"Renamed"}"#, r#"{"role":"member"}"#, r#"{"status":"disabled","name":"Renamed"}"#, body_owner(&ro).as_str(), r#"{"status":"active"}"#] {
+    for body in [r#"{"name":"Renamed"}"#, r#"{"role":"member"}"#, r#"{"status":"disabled","name":"Renamed"}"#, r#"{"status":"disabled","unexpected":true}"#, body_owner(&ro).as_str(), r#"{"status":"active"}"#] {
         let (code, v) = json_call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &ro_auth, body).await;
         assert_eq!(code, 403, "{body}: {v}");
     }
     let denied = events(port, &admin, "access.denied").await;
     assert_eq!((denied[0]["details"]["reason"].as_str(), denied[0]["details"]["limit"].as_str(), denied[0]["targetId"].as_str()), (Some("owner_limit"), Some("service_account_change"), Some(sa.as_str())), "{denied:?}");
     assert_eq!(denied[0]["details"]["fields"], json!(["status"]));
+    assert!(denied.iter().any(|e| e["details"]["fields"] == json!(["status", "unexpected"])), "an unknown field is refused as a change, and logged: {denied:?}");
     assert_eq!(app.db.service_account(&sa).unwrap().user.name, "Ro's export");
 
     // Someone else's is not found, for every route, and nobody learns which exist.
