@@ -817,7 +817,7 @@ fn plus(d: NaiveDate, n: i64) -> NaiveDate {
     d.checked_add_signed(TimeDelta::days(n)).unwrap_or(d)
 }
 
-/// `n` business days after `d`: Monday to Friday, with no holidays, which differ by country
+/// `n` business days after `d`: Monday to Friday, not excluding public holidays, which differ by country
 /// and are the provider's to plead.
 fn business_days(d: NaiveDate, n: u32) -> NaiveDate {
     let mut x = d;
@@ -1491,7 +1491,7 @@ impl Check<'_> {
             _ => vec![],
         };
         let v = json!({
-            "basis": format!("every security event detected before the period's end and still being handled in it, by register id: a commander named and the severity set (triaged) by someone holding or deputising {} that day, on the day detected or the next for SEV-1 and SEV-2 (their 15-minute and 1-hour targets are judged in the incident record), within a business day for SEV-3, and within 5 for SEV-4, events that weren't incidents and events not yet triaged; customers told of a possible personal data breach within {hours} hours of the provider becoming aware ({}); a written review within {REVIEW_BUSINESS_DAYS} business days of closing every SEV-1, SEV-2, possible breach and outage that spent over a quarter of the error budget; each review's and tabletop's actions done by their due date; a tabletop exercise within a year (from a year after the plan's first approval) with someone holding or deputising {} that day, and its record's SHA-256. Business days are Monday to Friday, with no holidays. Something done late is an exception in the bundle of the period it was done in; something overdue, in every bundle until it is done", COMMANDERS.join(" or "), if self.r.breach_notice_hours.is_some() { "the register's breachNoticeHours" } else { "the DPA template's suggestion, as the register sets none" }, TABLETOP_ROLES.join(", ")),
+            "basis": format!("every security event detected before the period's end and still being handled in it, by register id: a commander named and the severity set (triaged) by someone holding or deputising {} that day, on the day detected or the next for SEV-1 and SEV-2 (their 15-minute and 1-hour targets are judged in the incident record), within a business day for SEV-3, and within 5 for SEV-4, events that weren't incidents and events not yet triaged; customers told of a possible personal data breach within {hours} hours of the provider becoming aware ({}); a written review within {REVIEW_BUSINESS_DAYS} business days of closing every SEV-1, SEV-2, possible breach and outage that spent over a quarter of the error budget; each review's and tabletop's actions done by their due date; a tabletop exercise within a year (from a year after the plan's first approval) with someone holding or deputising {} that day, and its record's SHA-256. Business days are Monday to Friday; public holidays are not excluded. Something done late is an exception in the bundle of the period it was done in; something overdue, in every bundle until it is done", COMMANDERS.join(" or "), if self.r.breach_notice_hours.is_some() { "the register's breachNoticeHours" } else { "the DPA template's suggestion, as the register sets none" }, TABLETOP_ROLES.join(", ")),
             "incidentResponsePlan": { "inPolicySet": in_set, "lastApproved": approved.map(ds), "approvalCurrent": current, "lastTabletop": last_tabletop.map(ds), "tabletopDue": tabletop_due.map(|d| ds(last_tabletop.map_or(d, |l| plus(l, YEAR_DAYS).max(d)))) },
             "breachNoticeHours": hours,
             "summary": {

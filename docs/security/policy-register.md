@@ -65,7 +65,7 @@ The [incident response plan](policies/incident-response.md) has every security e
 ```
 
 - Record every security event, including one triaged as not an incident (`"severity": "none"`): that it was looked at, in time, is the evidence. `commander` is who triaged it and took command; they must hold or deputise the Security owner or Operator role that day.
-- Triage is due on the day detected or the next for SEV-1 and SEV-2 (their 15-minute and 1-hour targets are judged in the incident record, which has the times), within a business day for SEV-3, and within 5 for the rest and for an event nobody has triaged yet. Business days are Monday to Friday; holidays aren't counted, since they differ by country.
+- Triage is due on the day detected or the next for SEV-1 and SEV-2 (their 15-minute and 1-hour targets are judged in the incident record, which has the times), within a business day for SEV-3, and within 5 for the rest and for an event nobody has triaged yet. Business days are Monday to Friday; public holidays are not excluded, since they differ by country.
 - `breach` is a possible personal data breach; `awareAt` and `customersNotifiedAt` are UTC times (`YYYY-MM-DDTHH:MM:SSZ`), since the DPA's commitment is in hours. A breach has a severity other than `none`.
 - `errorBudget` is an outage that spent over a quarter of the month's error budget. It, a breach, SEV-1 and SEV-2 need a written review; `reviewSha256` is the review document's SHA-256.
 - `actions` are the review's (or tabletop's) follow-ups: `id` (unique across the register), `owner` (a role), `due`, and `done` when finished.

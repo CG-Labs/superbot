@@ -26,7 +26,7 @@ The register holds no customer, user, attacker or data description. Those go in 
 
 ### Days, except for breach notices
 
-Every date is a UTC day, like the rest of the register. SEV-1 and SEV-2 must be triaged on the day detected or the next: 15 minutes and 1 hour can't be judged from days, and the incident record's timeline, which the auditor samples, has the minutes. SEV-3 has a business day and the rest 5. An event not yet triaged has no severity, so it is held to 5 business days, the longest. Business days are Monday to Friday with no holidays, which differ by country; a provider who missed a deadline only because of a holiday explains it to the auditor.
+Every date is a UTC day, like the rest of the register. SEV-1 and SEV-2 must be triaged on the day detected or the next: 15 minutes and 1 hour can't be judged from days, and the incident record's timeline, which the auditor samples, has the minutes. SEV-3 has a business day and the rest 5. An event not yet triaged has no severity, so it is held to 5 business days, the longest. Business days are Monday to Friday, and public holidays are not excluded, since they differ by country; a provider who missed a deadline only because of a holiday explains it to the auditor.
 
 Breach notices are the one place hours matter: a DPA commits to "within 48 hours", and a regulator's 72 hours start from the same awareness. So `awareAt` and `customersNotifiedAt` are RFC 3339 times, and the notice is due `breachNoticeHours` after `awareAt`.
 
