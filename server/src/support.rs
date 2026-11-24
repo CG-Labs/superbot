@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// Bumped when a file's shape changes, so support tools can tell bundles apart.
-pub const FORMAT: u32 = 2;
+pub const FORMAT: u32 = 3;
 const AUDIT_DAYS: i64 = 7;
 /// Newest events read for the summary; older ones in the window are counted as truncated.
 const AUDIT_SCAN: i64 = 20_000;
@@ -60,6 +60,8 @@ you send it: every file is plain text.
   health-score-history.json
                       the score botd recorded each day for the last 90 days, with
                       its band and each signal's status
+  onboarding.json     the onboarding checklist's items as botd judges them: done,
+                      open, to confirm or not applicable, with codes and counts
   logs.jsonl          the newest lines botd logged since it started (at most 2,000)
   audit-summary.json  the last 7 days of the audit log, counted by action and outcome,
                       and the newest failures and denials (no names, emails or addresses)
@@ -436,8 +438,9 @@ pub struct Bundle {
     pub audit_events: usize,
 }
 
-/// The whole bundle. `vars` is botd's environment; `setup`, the setup wizard's checklist.
-pub fn build(app: &App, vars: &[(String, String)], setup: Value, now_ms: i64) -> Bundle {
+/// The whole bundle. `vars` is botd's environment; `setup`, the setup wizard's checklist;
+/// `onboarding`, the onboarding check's view with no skips (ADR 0243).
+pub fn build(app: &App, vars: &[(String, String)], setup: Value, onboarding: Value, now_ms: i64) -> Bundle {
     let stamp = chrono::DateTime::from_timestamp_millis(now_ms).map(|t| t.format("%Y%m%dT%H%M%SZ").to_string()).unwrap_or_default();
     let name = format!("superbot-support-{stamp}");
     let started = last_start(app);
@@ -452,6 +455,7 @@ pub fn build(app: &App, vars: &[(String, String)], setup: Value, now_ms: i64) ->
         ("health.json", json_file(health(app, setup, now_ms), &names)),
         ("health-score.json", json_file(crate::health_score::build(app, now_ms, crate::health_score::DEFAULT_DAYS), &names)),
         ("health-score-history.json", json_file(crate::health_history::history(app, now_ms, crate::health_history::DEFAULT_DAYS).unwrap_or_else(|e| json!({ "error": e.to_string() })), &names)),
+        ("onboarding.json", json_file(onboarding, &names)),
         ("logs.jsonl", redact::text(&logs).into_owned().into_bytes()),
         ("audit-summary.json", json_file(audit, &names)),
     ];
@@ -481,12 +485,17 @@ type Peer = Option<Extension<ConnectInfo<SocketAddr>>>;
 
 /// `GET /api/support/bundle` (admins): the bundle as a tarball to save. Audited.
 pub async fn bundle(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, headers: HeaderMap, peer: Peer) -> Res<Response> {
-    let setup = crate::setup::report(&app, &a, &headers, peer.map(|Extension(ConnectInfo(p))| p.ip()));
-    let setup = json!({ "checklist": setup["checklist"], "done": setup["done"], "total": setup["total"] });
+    let report = crate::setup::report(&app, &a, &headers, peer.map(|Extension(ConnectInfo(p))| p.ip()));
+    let setup = json!({ "checklist": report["checklist"], "done": report["done"], "total": report["total"] });
     let vars: Vec<(String, String)> = std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect();
     let built = {
         let app = app.clone();
-        tokio::task::spawn_blocking(move || build(&app, &vars, setup, now())).await
+        tokio::task::spawn_blocking(move || {
+            let now_ms = now();
+            let onboarding = crate::onboarding::check(&crate::onboarding::gather(&app, &a, &report, now_ms), &[]).view(&rfc3339(now_ms));
+            build(&app, &vars, setup, onboarding, now_ms)
+        })
+        .await
     }
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't make the support bundle: {e}")))?;
     app.db.record(&by.event("support.bundle_created").details(json!({
