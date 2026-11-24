@@ -384,7 +384,7 @@ It exits 1 while anything is `internet`, else 0, and 2 for a usage error. `insta
 | Area | What it reads |
 |------|---------------|
 | License | Nothing: the license is checked offline |
-| Sign-in | Each SSO provider's issuer, authority or metadata URL (`SSO_*`), defaults included |
+| Sign-in | Each SSO provider's issuer, authority or metadata URL (`SSO_*`), defaults included; for native SAML, the sign-in and logout URLs in its metadata file (metadata saved with botctl is to check) |
 | Model providers | The tiers file's `providers` and routes, `SUPERBOT_HERMES_BASE_URL`, `ANTHROPIC_BASE_URL`, or an API key with no base URL |
 | Machines | `LINODE_TOKEN`; `INCUS_URL`, `INCUS_HOSTS` and `INCUS_IMAGE_SERVER` |
 | Harnesses on machines | `MACHINE_HARNESSES` (or the managed tiers' harnesses), `MACHINE_HARNESS_BUNDLE`, `MACHINE_NODE_MIRROR`, `MACHINE_NPM_REGISTRY`, `MACHINE_HERMES_BUNDLE`, `MACHINE_HARNESS_LOGINS` |
@@ -394,9 +394,9 @@ It exits 1 while anything is `internet`, else 0, and 2 for a usage error. `insta
 | Email | `SMTP_HOST` |
 | Approval webhooks | `NOTIFY_WEBHOOK_URL` and each `NOTIFY_WEBHOOK_URL_BOT_*` |
 | Backups | `SERVER_BACKUP_S3_*` and each `MACHINE_BACKUP_S3_*_ENDPOINT` |
-| Audit export | `AUDIT_EXPORT`, `AUDIT_EXPORT_S3_ENDPOINT`, `AUDIT_TIMESTAMP_URL` |
+| Audit export | `AUDIT_EXPORT` at the host each sink sends to (Google SecOps' and Datadog's regional intake), with its sign-in; `AUDIT_EXPORT_S3_ENDPOINT`, `AUDIT_TIMESTAMP_URL` |
 | Errors and traces | `ERROR_REPORT_DSN`, `TRACES_OTLP_ENDPOINT` |
-| Secrets manager | `SECRETS_BACKEND` and its address |
+| Secrets manager | `SECRETS_BACKEND`: its endpoint and where botd signs in to it (STS, Entra ID, a metadata server, a key's token URI), as the backend builds them |
 | Directory sync | `GOOGLE_DIRECTORY_SYNC` |
 
 It reads only botd's settings. Secrets saved with `botctl secret set` or kept in a secrets manager (a Linode token or error-report DSN there, for example) aren't read, nor a Bot's own Codex or Pi configuration on its machine. An OIDC provider's discovery document may name token and key endpoints on other hosts. So treat a clean check as the start, and test sign-in, a Bot run and a backup from inside the network.
