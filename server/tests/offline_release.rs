@@ -327,6 +327,40 @@ fn hermes_bundles_are_signed_released_and_installed_with_no_network() {
     assert_eq!(on.matches("'deploy/hermes-share.sh'").count(), 2, "pushes and pull requests that change hermes-share.sh, which Hermes bundles run, run offline.yml");
 }
 
+// ADR 0232: a harness bundle per arch, at the pins of the botd built from the tag, is made,
+// signed and attached with the release's bundles, and CI installs the harness CLIs from one
+// with no network.
+#[test]
+fn harness_bundles_are_signed_released_and_installed_with_no_network() {
+    let yaml = read(".github/workflows/offline.yml");
+    let all = jobs(&yaml);
+    let s = steps(job(&all, "release-bundle"));
+    let at = |want: &str| s.iter().position(|step| step.contains(want)).unwrap_or_else(|| panic!("release-bundle must have `{want}`"));
+    let botd = at("cargo build --release --bin botd");
+    let harnesses = at(r#"deploy/offline-bundle.sh harnesses --out "$RUNNER_TEMP/n" --version "$VERSION""#);
+    let upload = at(r#"gh release upload "$TAG" dist/superbot-harnesses-* --clobber"#);
+    assert!(botd < harnesses && harnesses < upload, "the tag's botd is built, then its pins bundled, then attached");
+    for want in [r#"cosign sign-blob --yes --bundle "$f.sigstore.json" "$f""#, r#"deploy/offline-bundle.sh verify "$f""#, r#"mv "$f" "$f.sha256" "$f.sigstore.json" dist/"#] {
+        assert!(s[harnesses].contains(want), "each harness bundle is signed, verified and attached with its signature: `{want}`");
+    }
+    let s = steps(job(&all, "install-offline"));
+    let at = |want: &str| s.iter().position(|step| step.contains(want)).unwrap_or_else(|| panic!("install-offline must have `{want}`"));
+    let build = at("deploy/offline-bundle.sh harnesses --out");
+    let install = at(r#"--harness-bundle "$NB""#);
+    assert!(at("Install from the bundle with no network") < build && build < install, "botd installs offline, then the harness CLIs are bundled, then installed offline");
+    assert!(s[build].contains(r#"deploy/offline-bundle.sh verify "$nb""#), "CI verifies the harness bundle it made");
+    for want in [
+        "sudo ip netns exec offline bash deploy/install.sh",
+        "the network is still up",
+        "sudo -u nobody",
+        "for b in claude codex pi; do",
+        "are already installed in /opt/superbot-harnesses",
+        "an upgrade without --harness-bundle touched the harness CLIs",
+    ] {
+        assert!(s[install].contains(want), "the harness install step must have `{want}`");
+    }
+}
+
 #[test]
 fn the_reader_joins_folded_values() {
     let job = ["  a:", "    if: >-", "      one ||", "      two", "    runs-on: x", "    steps:", "      - run: true"];
