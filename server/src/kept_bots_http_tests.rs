@@ -221,3 +221,27 @@ async fn the_access_review_sees_a_handed_bot_as_kept_and_delegates_dont_choose()
     assert_eq!(call(port, "PUT", &format!("/api/roles/{helpdesk}/users/{cam}"), &admin, "").await.0, 200);
     assert_eq!(call(port, "DELETE", &format!("/api/bots/{ledger}/keeper"), &cam_auth, "").await.0, 404, "Ledger is private to Ana");
 }
+
+#[tokio::test]
+async fn keeping_a_bot_its_access_already_covers_still_makes_an_earlier_sign_off_stale() {
+    let (port, _, admin, _) = serve_app().await;
+    let (ana, ana_auth) = user_with(port, &admin, "ana@example.com", "member").await;
+    let sa = account(port, &admin, json!({ "name": "Ana's reader", "role": "readonly" })).await;
+    let (code, v) = json_call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, &json!({ "owner": ana }).to_string()).await;
+    assert_eq!(code, 200, "{v}");
+    let (tok, _) = token(port, &admin, &sa, json!({})).await;
+    let shared = bot(port, &ana_auth, "Shared", "shared").await;
+    let access = |list: Value| access_of(&list, &shared);
+    assert_eq!(access(json_call(port, "GET", "/api/bots", &tok, "").await.1).as_deref(), Some("view"));
+    let before = digest(port, &admin).await;
+
+    // Read-only, it only views the Bot it keeps: the same access, but the report says "kept".
+    assert_eq!(keep(port, &ana_auth, &shared, &sa).await.0, 200);
+    assert_eq!(access(json_call(port, "GET", "/api/bots", &tok, "").await.1).as_deref(), Some("view"));
+    let kept = digest(port, &admin).await;
+    assert_ne!(kept, before, "the report changed, so an earlier sign-off is stale");
+
+    // Taken back, the report is as it was, and so is its digest.
+    assert_eq!(call(port, "DELETE", &format!("/api/bots/{shared}/keeper"), &ana_auth, "").await.0, 200);
+    assert_eq!(digest(port, &admin).await, before);
+}

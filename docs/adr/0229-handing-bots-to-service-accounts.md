@@ -43,7 +43,7 @@ Only a person: **the Bot's owner, or an admin**. Never a service account (its ow
 - App: the Bot's Sharing section has a "Kept by a service account" picker (owner or admin, non-primary), with a plain confirmation that says what the account can do with it. The service account screen lists the Bots it keeps with "Take back", and offers the owner's other Bots with "Hand it over".
 - Console: unchanged; its service account card still lists kept Bots. The console is admin-only and never calls Bot routes (ADR 0032), so handing over and taking back are the app's.
 - `botctl bot keep <bot> <service-account>` and `botctl bot release <bot>`.
-- The access review needs no change: it already marks kept Bots `kept`, and the account's access and grant on the Bot are in the sign-off digest, so handing one over or taking it back makes an earlier sign-off stale.
+- The access review's sign-off digest now covers which Bots each service account keeps, alongside its access and grant on each. ADR 0222 left `kept` out, because a Bot the account made was new access anyway. A handover can leave access as it was (a read-only account that already viewed a shared Bot still only views it), yet the report changed, so without this an earlier sign-off would stay valid. It's added only for accounts that keep Bots, so other reports keep their digests; a server whose accounts already keep Bots gets a new digest once, on upgrade.
 
 The account is now a person-only route for service accounts (`/api/bots/{id}/keeper` joins `grants`), and the route is classified `write`.
 
