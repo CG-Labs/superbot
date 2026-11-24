@@ -245,10 +245,13 @@ async fn admins_see_team_networks_checked_on_the_host() {
     let check = |s: &Value| s["checks"].as_array().unwrap().iter().find(|c| c["check"] == "team network").cloned().unwrap();
     assert_eq!(check(&s)["ok"], true, "{s}");
 
-    // An Incus without isolated OVN networks, or a bridge on the same range, fails it.
-    env.incus.w().missing_extensions = vec!["network_ovn_isolated".into()];
-    let (_, s) = json_call(&env, "GET", "/api/machines/substrate?check=true", "").await;
-    assert!(check(&s)["ok"] == false && check(&s).to_string().contains("network_ovn_isolated"), "{s}");
+    // An Incus without isolated OVN networks or backup device overrides, or a bridge on
+    // the same range, fails it.
+    for x in ["network_ovn_isolated", "backup_override_config"] {
+        env.incus.w().missing_extensions = vec![x.into()];
+        let (_, s) = json_call(&env, "GET", "/api/machines/substrate?check=true", "").await;
+        assert!(check(&s)["ok"] == false && check(&s).to_string().contains(x), "{x}: {s}");
+    }
     env.incus.w().missing_extensions.clear();
     env.incus.w().networks.get_mut("incusbr0").unwrap()["config"]["ipv4.address"] = json!("10.248.1.1/24");
     let (_, s) = json_call(&env, "GET", "/api/machines/substrate?check=true", "").await;

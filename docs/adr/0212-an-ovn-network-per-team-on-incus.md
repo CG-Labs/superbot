@@ -31,7 +31,7 @@ We chose option 3.
 - `MACHINE_TEAM_NETWORK=ovn` with `MACHINE_PROVIDER=incus`. `vpc` on Incus, or `ovn` on Linode, makes botd refuse to start, naming the right one.
 - `MACHINE_TEAM_NETWORK_SUBNET` (default `10.248.0.0/22`) may be anywhere in RFC 1918, a `/29` or larger. Linode's narrower VPC ranges still apply to `vpc`.
 - The subnet must not meet anything containers reach or are kept off through `eth0`: botd's machine address (`MACHINE_CONTROL_URL`), an `INCUS_EGRESS_ALLOW` address, an `INCUS_EGRESS_DENY` range or an Incus host. The team NIC's route would take that traffic, so botd would be unreachable, or the denied range reachable. botd refuses to start if it does.
-- At each create and in the admin check, botd also asks Incus for `network_ovn_isolated` and for the bridge's own range. A subnet meeting the bridge's would take over containers' default route. Either failing holds the create back, with the reason on the machine.
+- At each create and in the admin check, botd also asks Incus for `network_ovn_isolated`, `backup_override_config` (Incus 6.17, for restores below) and the bridge's own range. A subnet meeting the bridge's would take over containers' default route. Either failing holds the create back, with the reason on the machine.
 
 ### The network
 
@@ -75,12 +75,12 @@ With several Incus hosts (ADR 0076), each host has its own team networks. botd l
 - Incus hosts need OVN: an OVN northbound database Incus is pointed at (`network.ovn.northbound_connection`) and `ovn-controller` on every host. No uplink network is needed, since team networks have none.
 - Joining and leaving don't restart containers on Incus. A run in progress goes on.
 - botd now edits the project's network access list, only to add team networks. It never removes them. The list grows by one name per team and region.
-- A restore or a move to another host (ADR 0076) puts the container back with `eth0` only. The sweep puts `eth1` back on the next pass, unless `MACHINE_TEAM_NETWORK_JOIN=off`.
+- A restore or a move to another host (ADR 0076) puts the container back with `eth0` only. The sweep puts `eth1` back on the next pass, unless `MACHINE_TEAM_NETWORK_JOIN=off`. A backup's saved `eth1` names a network and ACL the target host may not have, and Incus checks every device on import, so botd imports it with `eth1` pointed at the bridge and no ACL (`X-Incus-devices`). The copy is stopped then, and `eth1` is replaced before it starts.
 - Networks and ACLs of teams that are gone stay until an admin removes them, as VPCs do.
 
 ## Tests
 
-- **Unit** (`machines/team_network.rs`): `ovn` takes any RFC 1918 range of a `/29` or more and nothing else. (`machines/incus/tests.rs`): router and subnet arithmetic; a subnet meeting botd's address or `INCUS_EGRESS_DENY` is refused. Against the stand-in: a team network is an isolated OVN network with the router first, no gateway, the mark and region, and the project's access list extended once. It is made once, and refused for another subnet or region or an unmarked network of the same name. A project with networks of its own is left alone. Members are containers with a NIC on it. Leaving unplugs from a running container and never takes `eth0`. Joining plugs the exact team NIC once.
+- **Unit** (`machines/team_network.rs`): `ovn` takes any RFC 1918 range of a `/29` or more and nothing else. (`machines/incus/tests.rs`): router and subnet arithmetic; a subnet meeting botd's address or `INCUS_EGRESS_DENY` is refused. Against the stand-in: a team network is an isolated OVN network with the router first, no gateway, the mark and region, and the project's access list extended once. It is made once, and refused for another subnet or region or an unmarked network of the same name. A project with networks of its own is left alone. Members are containers with a NIC on it. Leaving unplugs from a running container and never takes `eth0`. Joining plugs the exact team NIC once. A team machine's backup imports onto a host without the team's network or ACL, which fails without the device override.
 - **Several hosts** (`machines/incus/fleet.rs`): networks and members are listed as `host/name`, made only on a host directly, and joined only on the machine's own host.
 - **Startup** (`machines/mod.rs`): `ovn` on Incus is taken and shown, and the provider says it hot-plugs. `vpc` on Incus, `ovn` on Linode, and subnets meeting botd's address, an allowed address, a denied range or an Incus host are refused.
 - **End to end** (`machines_incus_team_network_tests.rs`, the Incus provider over mutual TLS to the stand-in, which now refuses networks a restricted project's list doesn't name):
@@ -89,7 +89,7 @@ With several Incus hosts (ADR 0076), each host has its own team networks. botd l
   - A leaver is unplugged while running, never powered off, audited `inUse: true`.
   - The ACL is set back at the next create.
   - A container made before this change is refused once until rebuilt.
-  - The admin check fails without `network_ovn_isolated` or with a bridge on the same range, and then nothing is made.
+  - The admin check fails without `network_ovn_isolated` or `backup_override_config`, or with a bridge on the same range, and then nothing is made.
 - **Baseline** (`baseline.rs`): `ovn` on Incus passes; `vpc` on Incus and `ovn` on Linode fail.
 
 ## Deferred

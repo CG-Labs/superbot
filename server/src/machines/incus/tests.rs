@@ -788,3 +788,29 @@ async fn a_team_network_is_an_isolated_ovn_network_with_its_own_acl() {
     assert_eq!(s.calls("PUT", "/1.0/instances/superbot-m2").len(), 1, "on it already: nothing asked");
     assert!(p.team_network_hotplug());
 }
+
+#[tokio::test]
+async fn a_team_machine_is_restored_onto_a_host_without_its_teams_network() {
+    let project = json!({ "restricted": "true", "restricted.backups": "allow", "restricted.networks.access": "incusbr0" });
+    let a = StandIn::start().await;
+    a.w().projects.insert("superbot".into(), project.clone());
+    let p = incus(&a).with_team_subnet("10.248.0.0/22").unwrap();
+    let n = p.ensure_team_network("superbot-team-0123456789ab-local", "local", "10.248.0.0/22").await.unwrap();
+    p.create_firewall("superbot-fw", &[], &[agent_rule()]).await.unwrap();
+    p.create(&CreateSpec { subnet_id: Some(n.subnet_id.clone()), ..spec("superbot-m1", "c1-m2-d20") }).await.unwrap();
+    p.create_backup("superbot-m1", "b1").await.unwrap();
+
+    // Another host: its firewall, but never this team's network or ACL.
+    let b = StandIn::start().await;
+    b.w().projects.insert("superbot".into(), project);
+    let off = incus(&b);
+    off.create_firewall("superbot-fw", &[], &[agent_rule()]).await.unwrap();
+    let e = off.import_backup("superbot-m1-r", p.export_backup("superbot-m1", "b1").await.unwrap()).await.unwrap_err();
+    assert!(e.to_string().contains(&format!("Network \"{}\" is not allowed", n.id)), "without the override: {e}");
+
+    let on = incus(&b).with_team_subnet("10.248.0.0/22").unwrap();
+    on.import_backup("superbot-m1-r", p.export_backup("superbot-m1", "b1").await.unwrap()).await.unwrap();
+    let eth1 = &b.instance("superbot-m1-r").unwrap().body["devices"]["eth1"];
+    assert_eq!((&eth1["network"], &eth1["security.acls"]), (&json!("incusbr0"), &json!("")), "{eth1}");
+    assert!(!b.w().networks.contains_key(&n.id) && !b.w().acls.contains_key(&n.id), "nothing made for the team here");
+}

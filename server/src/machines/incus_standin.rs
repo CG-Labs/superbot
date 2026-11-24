@@ -283,7 +283,15 @@ fn reply(status: StatusCode, v: Value, etag: Option<String>) -> Response {
 }
 
 fn extensions(missing: &[String]) -> Vec<&'static str> {
-    ["network_acl", "network_bridge_acl_devices", "instances_rebuild", "instance_create_start", "instance_get_full", "network_ovn_isolated"]
+    [
+        "network_acl",
+        "network_bridge_acl_devices",
+        "instances_rebuild",
+        "instance_create_start",
+        "instance_get_full",
+        "network_ovn_isolated",
+        "backup_override_config",
+    ]
         .into_iter()
         .filter(|x| !missing.iter().any(|m| m == x))
         .collect()
@@ -559,6 +567,13 @@ fn respond(world: &Mutex<World>, peer: pki::Peer, method: Method, uri: Uri, head
             let mut kept = saved["body"].clone();
             if let Some(pool) = header("x-incus-pool") {
                 kept["devices"]["root"]["pool"] = json!(pool);
+            }
+            // `<device>,<key>=<value>` entries, space-separated, merged into the saved devices.
+            for entry in header("x-incus-devices").unwrap_or_default().split(' ').filter(|e| !e.is_empty()) {
+                let Some((dev, (k, v))) = entry.split_once(',').and_then(|(d, kv)| Some((d, kv.split_once('=')?))) else {
+                    return err(400, &format!("Failed to parse device <device>,<key>=<value>: {entry:?}"));
+                };
+                kept["devices"][dev][k] = json!(v);
             }
             if let Some(why) = w.refused(&project, &kept).or_else(|| w.acls_exist(&kept)).or_else(|| w.networks_exist(&kept)) {
                 return err(400, &why);

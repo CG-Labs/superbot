@@ -230,7 +230,7 @@ MACHINE_TEAM_NETWORK_SUBNET=10.248.0.0/22     # any RFC 1918 range, /29 or large
 MACHINE_TEAM_NETWORK_JOIN=next-boot           # or off: only new and rebuilt machines join
 ```
 
-The subnet must stay apart from the bridge (`superbot0`), botd's address, `INCUS_EGRESS_ALLOW` and `INCUS_EGRESS_DENY`. botd refuses to start, or the `team network` check fails, if it isn't. `botctl machine substrate check` also confirms Incus has `network_ovn_isolated`.
+The subnet must stay apart from the bridge (`superbot0`), botd's address, `INCUS_EGRESS_ALLOW` and `INCUS_EGRESS_DENY`. botd refuses to start, or the `team network` check fails, if it isn't. `botctl machine substrate check` also confirms Incus has `network_ovn_isolated` and `backup_override_config` (Incus 6.17 or later), which lets a team machine's backup be restored onto a host without the team's network.
 
 What botd does:
 

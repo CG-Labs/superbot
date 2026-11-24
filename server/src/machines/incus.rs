@@ -1133,12 +1133,18 @@ impl Incus {
     }
 
     /// That team networks can be made here with `subnet` (ADR 0212): Incus makes isolated
-    /// OVN networks (`network_ovn_isolated`), and `subnet` is apart from the bridge
-    /// containers' eth0 is on, whose route the team NIC's would otherwise take over.
+    /// OVN networks (`network_ovn_isolated`) and overrides a backup's devices on import
+    /// (`backup_override_config`), and `subnet` is apart from the bridge containers' eth0
+    /// is on, whose route the team NIC's would otherwise take over.
     async fn check_team(&self, subnet: &str) -> Result<String, ProviderError> {
         let v = self.call(Method::GET, "/1.0", &[], None, None).await?.metadata;
-        if !v["api_extensions"].as_array().is_some_and(|a| a.iter().any(|e| e == "network_ovn_isolated")) {
-            return Err(api(400, "Incus lacks the network_ovn_isolated API extension, which team networks (isolated OVN networks) need"));
+        for (x, why) in [
+            ("network_ovn_isolated", "team networks (isolated OVN networks) need"),
+            ("backup_override_config", "restoring a team's machine onto another host needs"),
+        ] {
+            if !v["api_extensions"].as_array().is_some_and(|a| a.iter().any(|e| e == x)) {
+                return Err(api(400, format!("Incus lacks the {x} API extension, which {why}")));
+            }
         }
         let bridge = &self.s.network;
         let b = self.call(Method::GET, &format!("/1.0/networks/{bridge}"), &[], None, None).await?.metadata;
@@ -1775,18 +1781,24 @@ impl MachineProvider for Incus {
         })
     }
 
-    /// Into the project and pool botd uses, whatever the backup says.
+    /// Into the project and pool botd uses, whatever the backup says. With team networks
+    /// on, a saved team NIC is pointed at the bridge without an ACL for the import: Incus
+    /// checks every device then, and this host may not have the team's network or ACL.
+    /// `prepare` replaces it before the copy starts.
     fn import_backup<'a>(&'a self, n: &'a str, data: ByteStream) -> Fut<'a, ()> {
         Box::pin(async move {
             self.check_server().await?;
             self.check_project().await?;
-            let req = self
+            let mut req = self
                 .stream
                 .post(self.url("/1.0/instances", &[]))
                 .header("Content-Type", "application/octet-stream")
                 .header("X-Incus-name", name(n)?)
-                .header("X-Incus-pool", &self.s.pool)
-                .body(reqwest::Body::wrap_stream(data));
+                .header("X-Incus-pool", &self.s.pool);
+            if self.team_subnet.is_some() {
+                req = req.header("X-Incus-devices", format!("{TEAM_NIC},type=nic {TEAM_NIC},network={} {TEAM_NIC},security.acls=", self.s.network));
+            }
+            let req = req.body(reqwest::Body::wrap_stream(data));
             let r = self.reply(req).await?;
             self.finish_long(r, BACKUP_WAIT, "importing the backup").await
         })
