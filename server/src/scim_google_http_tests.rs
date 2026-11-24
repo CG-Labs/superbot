@@ -708,15 +708,17 @@ async fn declared_role_groups_give_roles_and_undeclared_ones_are_never_pushed() 
     assert_eq!(w.app.db.scim_role_group(&gid).unwrap().external_id.as_deref(), Some("g3"));
     assert_eq!(w.app.db.user(&bob).unwrap().role_id.as_deref(), Some(auditor.as_str()));
 
-    // Declared by its Directory id under another name: only a pass can tell, so the
-    // console's list follows the latest pass.
+    // Declared by its Directory id under another name: matched by the id a pass read, as
+    // the next pass will match it; removed, it's listed again at once.
     let body = json!({ "tenant": TENANT, "displayName": "Billing role", "externalId": "g4", "role": "Auditor" });
     let (code, v) = call(w.port, "POST", "/api/scim/role-groups", &w.admin, &body.to_string()).await;
     assert_eq!(code, 201, "{v}");
-    assert_eq!(choices(&w).await["undeclared"].as_array().map(Vec::len), Some(1), "until a pass reads it");
+    let billing = parse(&v)["id"].as_str().unwrap().to_string();
+    assert_eq!(choices(&w).await["undeclared"], json!([]), "declared by id");
     let res = synced(&w).await;
-    assert_eq!(res["roleGroups"]["undeclared"], json!([]), "{res}");
-    assert_eq!(choices(&w).await["undeclared"], json!([]), "the pass found it by id");
+    assert_eq!(res["roleGroups"]["undeclared"], json!([]), "and the pass agrees: {res}");
+    assert_eq!(call(w.port, "DELETE", &format!("/api/scim/role-groups/{billing}"), &w.admin, "").await.0, 200);
+    assert_eq!(choices(&w).await["undeclared"], json!([{ "tenant": TENANT, "displayName": "billing@example.com" }]), "removed, it's listed again");
 }
 
 #[tokio::test]
