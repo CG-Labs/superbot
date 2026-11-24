@@ -76,6 +76,7 @@ Restart botd. Its log says `Google Workspace sync: on, ...`. botd refuses to sta
 | `GOOGLE_DIRECTORY_CUSTOMER` | `my_customer` | Or your customer ID (`C0...`). |
 | `GOOGLE_DIRECTORY_INTERVAL_MINUTES` | `30` | 5 to 1440. The first pass runs a minute after botd starts. |
 | `GOOGLE_DIRECTORY_MAX_REMOVALS` | `10` | A pass that would remove or disable more people than this changes nobody until an admin forces it. |
+| `GOOGLE_DIRECTORY_PUSH` | `off` | `on`: Google tells botd when a user changes, and a pass runs within seconds ([below](#6-push-changes-at-once-optional)). Needs an https `PUBLIC_URL` Google can reach. |
 
 New users get `SCIM_DEFAULT_ROLE` (member, or readonly). The sync never makes admins. Promote people with `botctl user role`.
 
@@ -97,6 +98,26 @@ botctl users                    # the people it made
 ```
 
 With `GOOGLE_DIRECTORY_SSO`, have someone in the group sign in with Google: they land in the account the sync made for them.
+
+## 6. Push changes at once (optional)
+
+By default a suspension in Google reaches SuperBot at the next pass, up to `GOOGLE_DIRECTORY_INTERVAL_MINUTES` later. With push, Google tells botd as soon as a user is added, changed (suspended, archived, renamed), deleted or undeleted, and a pass runs within seconds, so a leaver's sessions, Bots and machine stop at once ([ADR 0216](../adr/0216-google-workspace-push.md)).
+
+It needs nothing new in Google: the read-only user scope already lets the service account watch users. botd must be reachable from the internet over https, with a certificate from a public CA (Google refuses self-signed ones), at `PUBLIC_URL`:
+
+```bash
+PUBLIC_URL=https://superbot.example.com
+GOOGLE_DIRECTORY_PUSH=on
+```
+
+Restart botd. About 10 seconds later it asks Google for a channel for each kind of change (`add`, `update`, `delete`, `undelete`), sent to `https://superbot.example.com/scim/google/push`, and audits `scim.google_push_watching`. Channels end after a few hours, so botd makes new ones before they do. `botctl scim google` shows `push`: whether it's watching, when each channel ends, how many changes Google has sent, and the last failure.
+
+What to know:
+
+- **A notification is only a nudge.** botd reads nothing from it but which channel sent it, then runs the same full pass as the schedule, with every check above. A burst of changes (a bulk suspension) becomes one pass, and pushed passes are at least 30 seconds apart. The schedule keeps running: if push stops, nothing is missed, only slower.
+- **Group membership isn't pushed.** Google has no watch for group members, so someone taken out of a chosen group, but not suspended, still waits for the next scheduled pass. Suspend leavers in Google, or run `botctl scim google sync`.
+- **Each channel has its own secret.** Google sends it back with every notification, and botd refuses (401) any that doesn't match, audited as `scim.google_push_refused` (at most one event per address every few minutes). The secrets are derived from botd's master key, so channels made before a restart still work, and botd stops them when they next deliver. Turning push off stops them the same way.
+- If your proxy only forwards some paths, forward `POST /scim/google/push` to botd. The bundled Caddy forwards everything.
 
 ## What happens
 
@@ -123,15 +144,17 @@ With `GOOGLE_DIRECTORY_SSO`, have someone in the group sign in with Google: they
 
 Every change is audited as the SCIM events of the [SCIM guide](scim.md), with the actor `scim:google-directory`, method `google_directory`. Each pass is also `scim.google_sync` (target `scim_tenant:<tenant>`):
 
-- **success**: what it did: `created`, `updated`, `enabled`, `disabled`, `linked`, `deleted`, `held`, `skippedSuspended`, `outsideDomain`, `teams`, `roleGroups` (with `undeclared`), how long it took, and what started it (`schedule` or `admin`, with `force`).
+- **success**: what it did: `created`, `updated`, `enabled`, `disabled`, `linked`, `deleted`, `held`, `skippedSuspended`, `outsideDomain`, `teams`, `roleGroups` (with `undeclared`), how long it took, and what started it (`schedule`, `admin` with `force`, or `push` with the changes Google sent in `pushed`).
 - **failure**: the `reason` and `detail` when nobody was changed, or the SCIM writes that failed (`failed`, `failures`; each also `scim.request_failed`).
 - **denied**: too many removals (`too_many_removals`, `would_remove_everyone`).
 
 An admin's `botctl scim google sync` is `scim.google_sync_requested` first, by that admin. `GET /api/scim/google` (admins only) shows the settings and the last passes. It never shows the key.
 
+With push on: `scim.google_push_watching` when botd first has channels, and again once they work after a failure (`recovered`); `scim.google_push_failed` (failure) once when Google refuses a channel, with `reason`, `detail` and how many old channels still work (`channelsLeft`, until `channelsEnd`); and `scim.google_push_refused` (failure) for a notification botd didn't ask for (`reason`: `missing`, `unknown_channel` or `bad_token`). Renewals aren't audited.
+
 ## Limits
 
-- Polling, not push: changes in Google reach SuperBot within `GOOGLE_DIRECTORY_INTERVAL_MINUTES`. Run `botctl scim google sync` to apply one now.
+- Changes in Google reach SuperBot within `GOOGLE_DIRECTORY_INTERVAL_MINUTES`, or within seconds for user changes with [push](#6-push-changes-at-once-optional). Run `botctl scim google sync` to apply one now.
 - Users and group membership only: no organizational units, aliases, custom attributes, or roles from Google.
 - At most 50 groups. A Directory list over 2,000 pages, or a page over 16 MiB, fails the pass.
 - The Directory API has [quotas](https://developers.google.com/workspace/admin/directory/v1/limits). A pass reads each group, its members, and the customer's users, 500 at a time. A rate-limited pass fails and is tried again.
@@ -150,3 +173,5 @@ An admin's `botctl scim google sync` is `scim.google_sync_requested` first, by t
 | `odd_answer`, `too_large` | Google's answer wasn't a full Directory API answer. Nobody was changed. |
 | `too_many_removals`, `would_remove_everyone` | See **Fail-closed** above. |
 | `running` | A pass was already running. |
+
+With push on, `push.failure` shows why Google refused a channel. `forbidden` or `sign_in`: the same checks as above (the read-only user scope is enough). A channel that Google makes but never delivers to usually means botd isn't reachable at `PUBLIC_URL` over https with a public certificate. botd keeps trying every 5 minutes, and the schedule runs meanwhile.
