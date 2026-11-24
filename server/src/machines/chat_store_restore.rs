@@ -105,7 +105,12 @@ impl Place {
             return Err(format!("botd has no chat store recorded for {region}, so there is no store to restore (ADR 0215)"));
         };
         let store = ChatStore { region: region.to_string(), schema: String::new(), path: folder.join("chats.sqlite"), id };
-        let copies = bucket(s, &dirs, c, masters.first());
+        drop(c);
+        let sealed = masters.iter().filter_map(|k| {
+            let c = database_encryption::open_read_only(&db_path, db_key.as_ref()).ok()?;
+            Some(crate::secrets::sealed::SealedStore::new(c, std::sync::Arc::new(crate::secrets::sealed::Cipher::new(k))))
+        });
+        let copies = bucket(s, &dirs, Sealed(sealed.collect()));
         Ok(Place { region: region.to_string(), store, db_path, keys, encrypted, db_key, copies })
     }
 
@@ -122,18 +127,38 @@ impl Place {
     }
 }
 
+/// botd's saved server secrets, opened with each master key in turn (the current one, then
+/// the previous one), since a rotation cut short leaves some sealed under the previous one.
+struct Sealed(Vec<crate::secrets::sealed::SealedStore>);
+
+impl crate::secrets::SecretStore for Sealed {
+    fn kind(&self) -> &'static str {
+        "sealed"
+    }
+
+    fn get(&self, name: &str) -> Result<Option<crate::secrets::Secret>, crate::secrets::Error> {
+        let mut failed = None;
+        for s in &self.0 {
+            match s.get(name) {
+                Ok(Some(v)) => return Ok(Some(v)),
+                Ok(None) => return Ok(None),
+                Err(e) => failed = Some(e),
+            }
+        }
+        failed.map_or(Ok(None), Err)
+    }
+
+    fn names(&self) -> Result<Vec<String>, crate::secrets::Error> {
+        self.0.first().map_or(Ok(Vec::new()), |s| s.names())
+    }
+}
+
 /// The region buckets botd would copy to (ADR 0246), with their keys from the settings, or
-/// else from botd's saved server secrets (sealed with `master` in botd's database `db`).
-fn bucket(s: &Settings, dirs: &[(String, PathBuf)], db: Connection, master: Option<&crate::secrets::key::MasterKey>) -> Result<Option<Copies>, String> {
-    use crate::secrets::sealed::{Cipher, SealedStore};
+/// else from botd's saved server secrets.
+fn bucket(s: &Settings, dirs: &[(String, PathBuf)], sealed: Sealed) -> Result<Option<Copies>, String> {
     let vars: HashMap<String, String> = s.vars().into_iter().collect();
     let env = crate::secrets::env::EnvStore::vars(vars.clone());
-    let sealed = master.map(|k| SealedStore::new(db, std::sync::Arc::new(Cipher::new(k))));
-    let mut layers: Vec<&dyn crate::secrets::SecretStore> = vec![&env];
-    if let Some(sealed) = &sealed {
-        layers.push(sealed);
-    }
-    let store = crate::secrets::external::Layered(layers);
+    let store = crate::secrets::external::Layered(vec![&env, &sealed]);
     let var = |k: &str| vars.get(k).cloned().unwrap_or_default();
     let named = chat_store_copies::named(vars.keys().cloned());
     let dirs = chat_stores::Settings { dirs: dirs.to_vec(), ..chat_stores::Settings::default() };
@@ -977,10 +1002,12 @@ mod tests {
         std::fs::write(w.lon.join(format!("{NOTE}1.json")), json!({ "backup": "chats-20200101-000000.sqlite", "file": 1 }).to_string()).unwrap();
         assert_eq!(notes(&w.lon).len(), 3);
 
-        // botd's next start audits each once, oldest first.
+        // botd's next start audits each once, oldest first, before it touches the store.
         let db = Db::open(&w.app).unwrap();
-        db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
-        let lines = audit_restores(&db, &w.dirs());
+        let settings = chat_stores::Settings { dirs: w.dirs(), ..chat_stores::Settings::default() };
+        let cipher = crate::secrets::sealed::cipher();
+        let opened = chat_stores::open(&db, &settings, None, chat_stores::Keys { current: &cipher, previous: None, forget: false }).unwrap();
+        let lines: Vec<&String> = opened.lines.iter().filter(|l| l.contains("restore")).collect();
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert!(lines[0].contains("was cut off before it replaced the store, so nothing was restored"), "{lines:?}");
         assert!(lines[1].contains("gb-lon's store was restored from chats-") && lines[2].contains(r.kept.as_deref().unwrap()), "{lines:?}");
@@ -1060,6 +1087,16 @@ mod tests {
             ("REGION_DATA_AGE_RECIPIENTS", public.as_str()),
         ]);
         let place = Place::locate(&s, "gb-lon").unwrap();
+        // Mid-rotation, the bucket's saved key is still sealed under the previous master key.
+        let next = crate::secrets::key::MasterKey::generate().base64();
+        let rotated = |previous: &[(&str, &str)]| {
+            let mut vars: Vec<(String, String)> = s.vars().into_iter().filter(|(k, _)| k.starts_with("REGION_DATA") || k == "DATA_DIR").collect();
+            vars.push(("SUPERBOT_MASTER_KEY".into(), next.to_string()));
+            vars.extend(previous.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+            Settings::new(None, Some(w.t.path().join("home")), vars.into_iter().collect())
+        };
+        assert!(Place::locate(&rotated(&[]), "gb-lon").unwrap().copies().is_err(), "the new key alone doesn't open it");
+        assert!(Place::locate(&rotated(&[("SUPERBOT_MASTER_KEY_PREVIOUS", key.as_str())]), "gb-lon").unwrap().copies().unwrap().is_some());
         let (_, ada) = pinned_bot(&db, "ada", "gb-lon");
         db.add_message(&ada, "user", "chat-9i-off-the-host", None, false, None);
         backup_pass(&db, 7, now() - DAY);

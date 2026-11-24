@@ -168,8 +168,12 @@ pub fn open(db: &Db, s: &Settings, previous: Option<&DbKey>, keys: Keys) -> Resu
     let key = database_encryption::installed();
     let mut rekeyed = 0;
     for (_, dir) in &s.dirs {
+        std::mem::forget(database_encryption::lock_data_dir(&dir.join("chats.sqlite"))?);
+    }
+    // Before anything rewrites a restored store, which its restore's note names by inode.
+    let restored = super::chat_store_restore::audit_restores(db, &s.dirs);
+    for (_, dir) in &s.dirs {
         let path = dir.join("chats.sqlite");
-        std::mem::forget(database_encryption::lock_data_dir(&path)?);
         let was_encrypted = database_encryption::format(&path)? == database_encryption::Format::Encrypted;
         if database_encryption::prepare_store(&path, key, previous)? {
             rekeyed += usize::from(was_encrypted);
@@ -185,7 +189,7 @@ pub fn open(db: &Db, s: &Settings, previous: Option<&DbKey>, keys: Keys) -> Resu
     }
     let approvals = db.seal_store_approvals(keys.current, keys.previous, keys.forget)?;
     let mut lines = vec![format!("Regional chat stores: {} (ADR 0215).", s.describe())];
-    lines.extend(super::chat_store_restore::audit_restores(db, &s.dirs));
+    lines.extend(restored);
     lines.extend(attached.created.iter().map(|r| format!("Regional chat stores: made {r}'s store.")));
     lines.extend(attached.forgotten.iter().map(|(r, p)| {
         let why = if s.forget.contains(r) { format!("is named in {FORGET}") } else { "held no chats".into() };
