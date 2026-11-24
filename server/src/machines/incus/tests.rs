@@ -788,3 +788,44 @@ async fn a_team_network_is_an_isolated_ovn_network_with_its_own_acl() {
     assert_eq!(s.calls("PUT", "/1.0/instances/superbot-m2").len(), 1, "on it already: nothing asked");
     assert!(p.team_network_hotplug());
 }
+
+#[tokio::test]
+async fn a_team_members_backup_imports_onto_a_host_that_never_had_the_teams_network() {
+    let a = StandIn::start().await;
+    let pa = incus(&a).with_team_subnet("10.248.0.0/22").unwrap();
+    let n = pa.ensure_team_network("superbot-team-0123456789ab-local", "local", "10.248.0.0/22").await.unwrap();
+    pa.create_firewall("superbot-fw", &[], &[agent_rule()]).await.unwrap();
+    pa.create(&CreateSpec { subnet_id: Some(n.subnet_id.clone()), ..spec("superbot-m1", "c1-m2-d20") }).await.unwrap();
+    let saved = json!({ "body": a.instance("superbot-m1").unwrap().body, "files": {} });
+    assert_eq!(saved["body"]["devices"]["eth1"]["network"], n.id.as_str());
+    let backup = || -> ByteStream { Box::pin(futures_util::stream::iter([Ok(axum::body::Bytes::from(saved.to_string()))])) };
+
+    // Host b has the firewall but neither the team's network nor its ACL.
+    let b = StandIn::start().await;
+    let pb = incus(&b);
+    pb.create_firewall("superbot-fw", &[], &[agent_rule()]).await.unwrap();
+    pb.import_backup("superbot-m1-restore", backup()).await.unwrap();
+    let nic = b.instance("superbot-m1-restore").unwrap().body["devices"]["eth1"].clone();
+    assert_eq!((nic["network"].as_str(), nic["name"].as_str()), (Some("incusbr0"), Some("eth1")), "{nic}");
+    assert!(nic.get("security.acls").is_none() && nic.get("security.acls.default.egress.action").is_none(), "{nic}");
+    let spec = RestoreSpec {
+        plan: "c1-m2-d20".into(),
+        tags: vec!["superbot".into()],
+        authorized_keys: Vec::new(),
+        firewall_id: Some("superbot-fw".into()),
+        files: Vec::new(),
+        remove: Vec::new(),
+    };
+    pb.prepare("superbot-m1-restore", &spec).await.unwrap();
+    let devices = b.instance("superbot-m1-restore").unwrap().body["devices"].clone();
+    assert!(devices.get("eth1").is_none(), "{devices}");
+    assert_eq!(devices["eth0"]["security.acls"], "superbot-fw");
+
+    // An Incus that can't override devices on import is sent none, as before.
+    let c = StandIn::start().await;
+    c.w().missing_extensions = vec!["backup_override_config".into()];
+    let pc = incus(&c);
+    pc.create_firewall("superbot-fw", &[], &[agent_rule()]).await.unwrap();
+    let e = pc.import_backup("superbot-m1-restore", backup()).await.unwrap_err();
+    assert!(e.to_string().contains(n.id.as_str()), "{e}");
+}

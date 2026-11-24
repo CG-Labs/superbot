@@ -76,6 +76,7 @@ With several Incus hosts (ADR 0076), each host has its own team networks. botd l
 - Joining and leaving don't restart containers on Incus. A run in progress goes on.
 - botd now edits the project's network access list, only to add team networks. It never removes them. The list grows by one name per team and region.
 - A restore or a move to another host (ADR 0076) puts the container back with `eth0` only. The sweep puts `eth1` back on the next pass, unless `MACHINE_TEAM_NETWORK_JOIN=off`.
+- A backup's `eth1` names the team network and ACL on the host it came from. Incus won't import a backup whose devices it can't load, and a host that never served the team has neither. So the import sends `X-Incus-devices` (the `backup_override_config` extension), which puts `eth1` on the host's own bridge with no ACL. The copy stays stopped until the restore replaces every device. An Incus without that extension gets no override, as before, so a restore of a team member's container onto such a host fails until the team has a machine there.
 - Networks and ACLs of teams that are gone stay until an admin removes them, as VPCs do.
 
 ## Tests

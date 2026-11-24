@@ -283,7 +283,15 @@ fn reply(status: StatusCode, v: Value, etag: Option<String>) -> Response {
 }
 
 fn extensions(missing: &[String]) -> Vec<&'static str> {
-    ["network_acl", "network_bridge_acl_devices", "instances_rebuild", "instance_create_start", "instance_get_full", "network_ovn_isolated"]
+    [
+        "network_acl",
+        "network_bridge_acl_devices",
+        "instances_rebuild",
+        "instance_create_start",
+        "instance_get_full",
+        "network_ovn_isolated",
+        "backup_override_config",
+    ]
         .into_iter()
         .filter(|x| !missing.iter().any(|m| m == x))
         .collect()
@@ -559,6 +567,26 @@ fn respond(world: &Mutex<World>, peer: pki::Peer, method: Method, uri: Uri, head
             let mut kept = saved["body"].clone();
             if let Some(pool) = header("x-incus-pool") {
                 kept["devices"]["root"]["pool"] = json!(pool);
+            }
+            // As Incus: `device,key=value` entries, space-separated; an empty value unsets.
+            if let Some(over) = header("x-incus-devices") {
+                if w.missing_extensions.iter().any(|m| m == "backup_override_config") {
+                    return err(400, "backup_override_config isn't supported");
+                }
+                for entry in over.split(' ') {
+                    let Some((dev, (k, v))) = entry.split_once(',').and_then(|(d, kv)| Some((d, kv.split_once('=')?))) else {
+                        return err(400, &format!("Failed to parse device, =: {entry:?}"));
+                    };
+                    if !kept["devices"][dev].is_object() {
+                        kept["devices"][dev] = json!({});
+                    }
+                    let d = kept["devices"][dev].as_object_mut().unwrap();
+                    if v.is_empty() {
+                        d.remove(k);
+                    } else {
+                        d.insert(k.into(), json!(v));
+                    }
+                }
             }
             if let Some(why) = w.refused(&project, &kept).or_else(|| w.acls_exist(&kept)).or_else(|| w.networks_exist(&kept)) {
                 return err(400, &why);

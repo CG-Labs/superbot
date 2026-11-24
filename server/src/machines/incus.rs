@@ -1263,6 +1263,18 @@ impl Incus {
         })
     }
 
+    /// `X-Incus-devices` for a backup import: the team NIC, whether the backup had one
+    /// or not, on the bridge every container may use, with no ACL to look up. An empty
+    /// value unsets a key.
+    fn team_nic_on_import(&self) -> String {
+        let keys = ["security.acls", "security.acls.default.ingress.action", "security.acls.default.egress.action"];
+        [format!("{TEAM_NIC},type=nic"), format!("{TEAM_NIC},name={TEAM_NIC}"), format!("{TEAM_NIC},network={}", self.s.network)]
+            .into_iter()
+            .chain(keys.iter().map(|k| format!("{TEAM_NIC},{k}=")))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// Whether `dev`, as device `key`, is exactly a team NIC.
     fn is_team_nic(&self, key: &str, dev: &Value) -> bool {
         key == TEAM_NIC && dev["network"].as_str().is_some_and(|n| slug(n) && *dev == self.team_nic(n))
@@ -1775,18 +1787,27 @@ impl MachineProvider for Incus {
         })
     }
 
-    /// Into the project and pool botd uses, whatever the backup says.
+    /// Into the project and pool botd uses, whatever the backup says. A saved team NIC
+    /// names its network and ACL on the host it was made on, which a host that never
+    /// served the team lacks, and Incus refuses a backup whose devices it can't load:
+    /// where it can override them, the copy comes in with that NIC on this host's
+    /// bridge behind no ACL, stopped, until `prepare` replaces every device.
     fn import_backup<'a>(&'a self, n: &'a str, data: ByteStream) -> Fut<'a, ()> {
         Box::pin(async move {
             self.check_server().await?;
             self.check_project().await?;
-            let req = self
+            let v = self.call(Method::GET, "/1.0", &[], None, None).await?.metadata;
+            let overrides = v["api_extensions"].as_array().is_some_and(|a| a.iter().any(|e| e == "backup_override_config"));
+            let mut req = self
                 .stream
                 .post(self.url("/1.0/instances", &[]))
                 .header("Content-Type", "application/octet-stream")
                 .header("X-Incus-name", name(n)?)
-                .header("X-Incus-pool", &self.s.pool)
-                .body(reqwest::Body::wrap_stream(data));
+                .header("X-Incus-pool", &self.s.pool);
+            if overrides {
+                req = req.header("X-Incus-devices", self.team_nic_on_import());
+            }
+            let req = req.body(reqwest::Body::wrap_stream(data));
             let r = self.reply(req).await?;
             self.finish_long(r, BACKUP_WAIT, "importing the backup").await
         })
