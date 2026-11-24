@@ -27,9 +27,11 @@
 //!
 //! The network of a team this server deleted is removed once nothing is on it (ADR
 //! 0236): its machines have left it as any leaver's do, and nothing else, ours or
-//! anyone's, is on it. A team is known to be one this server deleted by its own
-//! `team.deleted` events, so another control plane's networks on the same account are
-//! never touched. On Incus its ACL and its name on the project's access list go too.
+//! anyone's, is on it. A team is known to be one this server deleted from its own
+//! record of the teams it deleted, kept whatever audit retention prunes (ADR 0249), so
+//! another control plane's networks on the same account are never touched. On Incus
+//! its ACL and its name on the project's access list go too. `botctl machine
+//! team-networks` lists every team network, whose it is and what of ours is on it.
 
 use super::enroll::Enrollment;
 use super::provider::{MachineProvider, NetworkMember, ProviderError, TeamNetwork};
@@ -38,11 +40,14 @@ use super::{ControlPlane, State, Step, event, system};
 use crate::audit::{Outcome, Who};
 use crate::db::{Machine, now};
 use crate::runner::App;
-use crate::AppState;
+use crate::{ApiError, AppState, Auth, Res};
+use axum::Json;
+use axum::extract::{Extension, State as AppS};
+use axum::http::StatusCode;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub const DEFAULT_SUBNET: &str = "10.248.0.0/22";
 /// Where Linode lets a VPC subnet be: RFC 1918, but for 192.168.128.0/17, which its
@@ -750,6 +755,69 @@ pub(crate) async fn leave(app: &AppState, cp: &ControlPlane, p: &dyn MachineProv
         // Being made, being destroyed or in error: once it is suspended or gone.
         _ => Leave::Waiting,
     }
+}
+
+/// `GET /api/machines/team-networks` (ADR 0249): every team network at the provider,
+/// whose it is (a team here, a team this server deleted, or no team it knows: another
+/// server's), which of our machines are on it, and how many other things are on it or
+/// use it, which keep it from being removed. Read now, changing nothing.
+pub async fn list(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>) -> Res {
+    let cp = &a.machines;
+    let p = cp.need()?;
+    let s = cp.team_network.as_ref().ok_or_else(|| ApiError(StatusCode::CONFLICT, "Team networks are off (MACHINE_TEAM_NETWORK).".into()))?;
+    let mut nets: Vec<(String, TeamNetwork)> = p
+        .team_networks("")
+        .await
+        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("The provider didn't list team networks: {e}")))?
+        .into_iter()
+        .filter_map(|n| Some((team_part_of(&n.label)?.to_string(), n)))
+        .collect();
+    nets.sort_by(|(_, a), (_, b)| (&a.region, &a.label).cmp(&(&b.region, &b.label)));
+    let teams: HashMap<String, crate::db::Team> = app.db.teams().into_iter().map(|t| (team_part(&t.id), t)).collect();
+    let gone: HashMap<String, (String, i64)> = app.db.deleted_teams().into_iter().map(|(id, at)| (team_part(&id), (id, at))).collect();
+    let ours: HashMap<String, Machine> = app
+        .db
+        .machines(None)
+        .into_iter()
+        .filter(|m| m.state != State::Destroyed && cp.owns(m))
+        .filter_map(|m| Some((m.provider_id.clone()?, m)))
+        .collect();
+    let mut out = Vec::new();
+    for (part, n) in &nets {
+        let mut v = json!({ "id": n.id, "label": n.label, "region": n.region, "subnet": n.subnet });
+        let team = if let Some(t) = teams.get(part) {
+            v["status"] = json!("team");
+            v["team"] = json!({ "id": t.id, "name": t.name });
+            Some(t.id.as_str())
+        } else if let Some((id, at)) = gone.get(part) {
+            v["status"] = json!("deleted");
+            v["team"] = json!({ "id": id, "deletedAt": at });
+            None
+        } else {
+            v["status"] = json!("unknown");
+            None
+        };
+        let read = async { Ok::<_, ProviderError>((p.team_network_members(&n.id).await?, p.team_network_unlisted(n).await?)) };
+        match read.await {
+            Ok((members, unlisted)) => {
+                let mut machines = Vec::new();
+                let mut others = unlisted;
+                for mem in &members {
+                    let Some(m) = ours.get(&mem.machine) else {
+                        others += 1;
+                        continue;
+                    };
+                    let leaving = team.is_none() || app.db.team_id_of(&m.user_id).as_deref() != team;
+                    machines.push(json!({ "id": m.id, "userId": m.user_id, "state": m.state.as_str(), "inUse": mem.active, "leaving": leaving }));
+                }
+                v["machines"] = json!(machines);
+                v["others"] = json!(others);
+            }
+            Err(e) => v["error"] = json!(e.to_string()),
+        }
+        out.push(v);
+    }
+    Ok(Json(json!({ "teamNetwork": s.view(), "networks": out })))
 }
 
 #[derive(Debug, PartialEq)]

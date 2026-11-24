@@ -2033,6 +2033,31 @@ impl MachineProvider for Incus {
         })
     }
 
+    /// What the network's and its ACL's `used_by` list, in any project, that isn't one
+    /// of this project's containers with a NIC on the network: an operator's service in
+    /// `default`, a profile, or a NIC elsewhere behind its ACL.
+    fn team_network_unlisted<'a>(&'a self, t: &'a TeamNetwork) -> Fut<'a, usize> {
+        Box::pin(async move {
+            let n = name(&t.id)?;
+            let members: std::collections::HashSet<String> = self.team_network_members(n).await?.into_iter().map(|m| m.machine).collect();
+            let mut others = std::collections::HashSet::new();
+            for path in [format!("/1.0/networks/{n}"), format!("/1.0/network-acls/{n}")] {
+                let used_by = match self.call(Method::GET, &path, &[], None, None).await {
+                    Ok(r) => r.metadata["used_by"].clone(),
+                    Err(ProviderError::NotFound) => continue,
+                    Err(e) => return Err(e),
+                };
+                for u in used_by.as_array().into_iter().flatten().filter_map(Value::as_str) {
+                    let listed = instance_of(u).is_some_and(|(i, project)| project == self.s.project && members.contains(&i));
+                    if !listed {
+                        others.insert(u.to_string());
+                    }
+                }
+            }
+            Ok(others.len())
+        })
+    }
+
     fn find_firewall<'a>(&'a self, label: &'a str) -> Fut<'a, Option<ProviderFirewall>> {
         Box::pin(async move {
             match self.acl(label).await {

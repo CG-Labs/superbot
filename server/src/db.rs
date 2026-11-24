@@ -2338,7 +2338,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 69] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 70] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -2408,7 +2408,31 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 69] = [
     migrate_role_requests,
     migrate_service_account_bots,
     migrate_scim_token_scopes,
+    migrate_deleted_teams,
 ];
+
+/// Teams this server deleted (ADR 0249), kept outside the audit log so audit retention
+/// never makes a gone team's network look like another server's. A trigger writes one
+/// whatever deletes the team. Only the id and when: no name, nothing about anyone.
+/// Teams deleted before this are read once from the audit log, as far back as it goes.
+fn migrate_deleted_teams(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS deleted_teams (
+          id TEXT PRIMARY KEY,
+          deleted_at INTEGER NOT NULL
+        );
+        CREATE TRIGGER IF NOT EXISTS teams_deleted AFTER DELETE ON teams
+        BEGIN
+          INSERT OR IGNORE INTO deleted_teams (id, deleted_at)
+          VALUES (OLD.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+        END;
+        INSERT OR IGNORE INTO deleted_teams (id, deleted_at)
+          SELECT target_id, MAX(at) FROM audit_events
+          WHERE action = 'team.deleted' AND target_type = 'team' AND outcome = 'success' AND target_id IS NOT NULL
+            AND target_id NOT IN (SELECT id FROM teams)
+          GROUP BY target_id;",
+    )
+}
 
 /// SCIM token scopes (ADR 0224): a JSON list of scope names. Tokens made before keep a
 /// null, which is every scope, so upgrading changes nothing an IdP can do.
@@ -11302,17 +11326,10 @@ impl Db {
     }
 
     /// Teams this server deleted and that aren't here now, with when each was (ADR 0236).
-    /// Read from its own audit log, so only as far back as AUDIT_RETENTION_DAYS keeps it.
+    /// From its own record of them (ADR 0249), which audit retention doesn't prune.
     pub fn deleted_teams(&self) -> Vec<(String, i64)> {
         let c = self.c();
-        let mut s = c
-            .prepare(
-                "SELECT target_id, MAX(at) FROM audit_events
-                 WHERE action = 'team.deleted' AND target_type = 'team' AND outcome = 'success' AND target_id IS NOT NULL
-                   AND target_id NOT IN (SELECT id FROM teams)
-                 GROUP BY target_id ORDER BY target_id",
-            )
-            .unwrap();
+        let mut s = c.prepare("SELECT id, deleted_at FROM deleted_teams WHERE id NOT IN (SELECT id FROM teams) ORDER BY id").unwrap();
         s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(Result::ok).collect()
     }
 
@@ -13249,5 +13266,51 @@ mod tests {
         assert!(db.team(&ops.id).is_some());
         assert!(db.delete_team(&eng.team_id));
         assert!(db.scim_group("okta", &eng.team_id).is_none() && db.scim_groups("okta").is_empty());
+    }
+
+    #[test]
+    fn deleted_teams_outlive_audit_retention_and_an_upgrade_reads_the_log_once() {
+        let path = temp_path("deleted-teams").join("app.sqlite");
+        let db = Db::open(&path).unwrap();
+        // Retention prunes from the log's start: the old deletion goes first.
+        db.c().execute_batch(&format!("DROP TRIGGER audit_events_no_delete; DELETE FROM audit_events; {}", audit_delete_trigger())).unwrap();
+        let old = now() - 40 * 86_400_000;
+        let (acme, globex) = (db.create_team("Acme", None), db.create_team("Globex", None));
+        let deleted = |id: &str, outcome: audit::Outcome| audit::Event::new(audit::Actor::system("test"), "team.deleted").target("team", id).outcome(outcome);
+        db.record_at(&deleted(&acme.id, audit::Outcome::Success), old).unwrap();
+        // Said to be deleted, but still here; and a deletion that failed.
+        db.record_at(&deleted(&globex.id, audit::Outcome::Success), now()).unwrap();
+        db.record_at(&deleted("t-refused", audit::Outcome::Failure), now()).unwrap();
+        assert!(db.deleted_teams().is_empty());
+
+        let before = now();
+        assert!(db.delete_team(&acme.id));
+        let got = db.deleted_teams();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].0 == acme.id && got[0].1 >= before - 1 && got[0].1 <= now() + 1, "recorded as it goes: {got:?}");
+        assert!(!db.delete_team(&acme.id));
+        assert_eq!(db.deleted_teams(), got, "once");
+
+        // An install from before the record reads its audit log once, on upgrade.
+        let at = MIGRATIONS.iter().position(|m| std::ptr::fn_addr_eq(*m, migrate_deleted_teams as fn(&Connection, bool) -> rusqlite::Result<()>)).unwrap();
+        db.c().execute_batch(&format!("DROP TRIGGER teams_deleted; DROP TABLE deleted_teams; PRAGMA user_version = {at};")).unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.deleted_teams(), vec![(acme.id.clone(), old)], "the live one and the failure aren't");
+
+        // Retention prunes the event; the record stays.
+        db.set_audit_retention(Some(30));
+        assert_eq!(db.prune_audit(None).unwrap().0, 1);
+        let n: i64 = db.c().query_row("SELECT COUNT(*) FROM audit_events WHERE target_id = ?", [&acme.id], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(db.deleted_teams(), vec![(acme.id.clone(), old)]);
+
+        // And the trigger is back for the next.
+        assert!(db.delete_team(&globex.id));
+        let mut ids: Vec<String> = db.deleted_teams().into_iter().map(|(id, _)| id).collect();
+        ids.sort();
+        let mut want = vec![acme.id, globex.id];
+        want.sort();
+        assert_eq!(ids, want);
     }
 }

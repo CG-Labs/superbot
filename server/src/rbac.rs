@@ -296,7 +296,7 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         ("GET", ["users", _, "machine", "agent"]) | ("POST", ["users", _, "machine", "agent", "upgrade"]) => ManageMachines,
         ("PUT" | "DELETE", ["users", _, "machine", "agent", "hold"]) => ManageMachines,
         ("GET" | "PUT" | "DELETE", ["users", _, "placement"]) | ("GET" | "PUT", ["users", _, "region"]) => ManageMachines,
-        ("GET", ["machines"] | ["machines", "placements" | "resizes" | "backups" | "recovery" | "substrate" | "hosts" | "legacy"] | ["regions"]) => ManageMachines,
+        ("GET", ["machines"] | ["machines", "placements" | "resizes" | "backups" | "recovery" | "substrate" | "team-networks" | "hosts" | "legacy"] | ["regions"]) => ManageMachines,
         ("POST", ["machines", "reconcile"] | ["machines", "hosts", _, "recover"]) | ("PUT" | "DELETE", ["machines", "hosts", _, "drain"]) => ManageMachines,
 
         // The admin portal (ADR 0021): users, sign-in codes, identities, sessions, and a
@@ -612,6 +612,7 @@ mod tests {
             ("POST", "/api/machines/reconcile", Perm::ManageMachines),
             ("GET", "/api/machines/placements", Perm::ManageMachines),
             ("GET", "/api/machines/substrate", Perm::ManageMachines),
+            ("GET", "/api/machines/team-networks", Perm::ManageMachines),
             ("GET", "/api/machines/hosts", Perm::ManageMachines),
             ("POST", "/api/machines/hosts/main/recover", Perm::ManageMachines),
             ("PUT", "/api/machines/hosts/main/drain", Perm::ManageMachines),
