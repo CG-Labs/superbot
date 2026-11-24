@@ -434,7 +434,7 @@ const TYPES: [&str; 6] = ["entra", "google", "oidc", "apple", "github", "saml"];
 
 /// Settings that only mean something for some types. Set on another, they would look like
 /// a restriction that isn't there, so they are refused.
-const ONLY_FOR: [(&str, &[&str]); 36] = [
+const ONLY_FOR: [(&str, &[&str]); 37] = [
     ("TENANT", &["entra"]),
     ("ALLOWED_TENANTS", &["entra"]),
     ("AUTHORITY", &["entra"]),
@@ -456,6 +456,7 @@ const ONLY_FOR: [(&str, &[&str]); 36] = [
     ("EMAIL_ATTRIBUTE", &["saml"]),
     ("NAME_ATTRIBUTE", &["saml"]),
     ("SIGN_REQUESTS", &["saml"]),
+    ("REQUEST_BINDING", &["saml"]),
     ("SP_CERT_FILE", &["saml"]),
     ("ENCRYPTED_ASSERTIONS", &["saml"]),
     ("AES_CBC", &["saml"]),
@@ -2593,6 +2594,8 @@ mod tests {
         let e = native(&[("SSO_CORP_REQUEST_BINDING", "artifact")]).err().unwrap();
         assert!(e.contains("SSO_CORP_REQUEST_BINDING must be auto, redirect, or post"), "{e}");
         assert!(saml(&[("SSO_ADFS_REQUEST_BINDING", "post")]).is_err(), "the broker sends the bridge's");
+        let e = with_base(&[("SSO_PROVIDERS", "corp"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_CORP_TYPE", "oidc"), ("SSO_CORP_ISSUER", "https://idp.example"), ("SSO_CORP_CLIENT_ID", "x")], &[("SSO_CORP_REQUEST_BINDING", "post")]).err().unwrap();
+        assert!(e.contains("SSO_CORP_REQUEST_BINDING is only for SSO_CORP_TYPE=saml"), "{e}");
     }
 
     #[test]
