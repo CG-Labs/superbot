@@ -168,6 +168,7 @@ fn every_link_in_the_playbooks_resolves() {
     files.push(repo().join("docs/adr/0220-support-bundle-triage.md"));
     files.push(repo().join("docs/adr/0233-onboarding-check.md"));
     files.push(repo().join("docs/adr/0243-onboarding-check-in-the-console-and-the-bundle.md"));
+    files.push(repo().join("docs/adr/0252-monthly-health-check.md"));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links:\n{}", bad.join("\n"));
 }
@@ -484,6 +485,38 @@ fn the_onboarding_check_page_documents_every_item_status_and_option() {
     for (heading, needle) in [("In the console", "Check onboarding"), ("In the support bundle", "onboarding.json")] {
         assert!(anchors(&page).contains(&heading.to_lowercase().replace(' ', "-")), "onboarding-check.md has no \"{heading}\" section");
         assert!(page.contains(needle), "onboarding-check.md doesn't mention {needle}");
+    }
+}
+
+/// ADR 0252: the health check page explains every item `botctl health-check` judges, its
+/// statuses and options, the route and the audit action, and the TAM's cadence points at it.
+#[test]
+fn the_health_check_page_documents_every_item_status_and_option() {
+    let full = fs::read_to_string(repo().join("server/src/health_check.rs")).unwrap();
+    let code = full.split("#[cfg(test)]\nmod tests").next().unwrap();
+    let page = read("health-check.md");
+    let ids: Vec<&str> = code.split("    item(\"").skip(1).map(|r| r.split('"').next().unwrap()).collect();
+    assert_eq!(ids.len(), 22, "the items: {ids:?}");
+    let reads = page.split("## What botd reads").nth(1).expect("health-check.md has a \"What botd reads\" section");
+    let rows: Vec<&str> = reads.lines().filter_map(|l| l.strip_prefix("| `")).filter_map(|l| l.split('`').next()).collect();
+    assert_eq!(rows, ids, "health-check.md's table of what botd reads, in the checklist's order");
+    let as_str = code.split("pub fn as_str").nth(1).unwrap().split("\n    }\n").next().unwrap();
+    let statuses: Vec<&str> = as_str.split("=> \"").skip(1).map(|r| r.split('"').next().unwrap()).collect();
+    assert_eq!(statuses, ["done", "open", "confirm", "n/a"], "the statuses");
+    for s in &statuses {
+        assert!(page.contains(&format!("| `{s}` |")), "health-check.md doesn't explain {s}");
+    }
+    let botctl = fs::read_to_string(repo().join("server/src/bin/botctl.rs")).unwrap();
+    let usage = botctl.lines().find(|l| l.contains("botctl health-check [")).expect("botctl's usage has health-check");
+    for o in ["markdown", "json"] {
+        assert!(usage.contains(o), "botctl's usage lacks {o}");
+        assert!(page.contains(&format!("| `{o}")), "health-check.md doesn't explain {o}");
+    }
+    for needle in ["support.health_checked", "GET /api/support/health-check", "Run health check"] {
+        assert!(page.contains(needle), "health-check.md doesn't mention {needle}");
+    }
+    for (name, needle) in [("README.md", "botctl health-check"), ("tam.md", "botctl health-check")] {
+        assert!(read(name).contains(needle), "{name} doesn't point at botctl health-check");
     }
 }
 
