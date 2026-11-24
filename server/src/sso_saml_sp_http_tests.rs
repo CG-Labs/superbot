@@ -856,6 +856,20 @@ async fn an_idp_down_or_without_soap_logout_never_holds_up_an_admin() {
     assert!(sp.audit("session.revoked_all").await[0]["details"].get("idpLogouts").is_none());
     assert!(sp.audit("auth.slo_response").await.is_empty());
 
+    // A sign-in whose assertion named no IdP session: a NameID-only request would end the
+    // person's IdP sessions on every device, so the IdP isn't told.
+    let (stub, soap_url) = SoapIdp::start().await;
+    let quiet = serve(&[]).await;
+    quiet.with_soap_idp(&soap_url).await;
+    let u = quiet.link();
+    let cookie = quiet.cookie("").await;
+    let (code, body) = call(quiet.port, "DELETE", &format!("/api/users/{}/sessions", u.id), &quiet.admin, "").await;
+    assert_eq!((code, serde_json::from_str::<Value>(&body).unwrap()["revoked"].as_u64()), (200, Some(1)), "{body}");
+    assert_eq!(quiet.who(&cookie).await, None);
+    assert!(quiet.audit("session.revoked_all").await[0]["details"].get("idpLogouts").is_none());
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(stub.got.lock().unwrap().is_empty() && quiet.audit("auth.slo_response").await.is_empty());
+
     // An IdP that is down: the revoke stands, and the failure is audited.
     let down = serve(&[]).await;
     down.with_soap_idp("http://127.0.0.1:9/soap").await;

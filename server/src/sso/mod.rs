@@ -1710,7 +1710,9 @@ pub fn sessions_ended(a: &Auth, app: &AppState, sessions: &[db::Session], reason
         let Kind::SamlSp { sp_entity_id, .. } = &p.kind else { continue };
         let Some(idp) = p.idp_loaded() else { continue };
         let Some(soap) = idp.slo_soap.clone() else { continue };
-        let Some(login) = app.db.saml_session(&s.id) else { continue };
+        // Without a SessionIndex the request would name only the person, ending IdP sessions
+        // on devices nobody revoked.
+        let Some(login) = app.db.saml_session(&s.id).filter(|l| l.session_index.is_some()) else { continue };
         if !seen.insert((p.id.clone(), login.name_id.clone(), login.session_index.clone())) {
             continue;
         }
