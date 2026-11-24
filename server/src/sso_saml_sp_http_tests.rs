@@ -1894,6 +1894,14 @@ impl Sp {
     }
 }
 
+/// Asserts the session lasts the server's own limit, not an IdP's. Its end is set from the
+/// sign-in's clock, a moment before the session row is written, so it may come in up to a
+/// second short.
+fn lasts_the_servers_limit(s: &Value) {
+    let (lasts, max) = (s["expiresAt"].as_i64().unwrap() - s["createdAt"].as_i64().unwrap(), users::SessionConfig::default().max_ms);
+    assert!((max - 1_000..=max).contains(&lasts), "{lasts} vs {max}");
+}
+
 fn max_age(head: &str) -> i64 {
     let session = set_cookies(head).into_iter().find(|c| c.starts_with("__Host-superbot_session=sbs_")).unwrap();
     session.split("Max-Age=").nth(1).unwrap().split(';').next().unwrap().trim().parse().unwrap()
@@ -1911,8 +1919,7 @@ async fn the_idps_session_limit_ends_the_session_it_makes() {
     let instant = db::now() - 10 * 60_000;
     let (code, _, head) = sp.sign_in(|r| r.authn_instant = instant).await;
     assert_eq!(code, 200, "{head}");
-    let s = sp.session_of(&head).await;
-    assert_eq!(s["expiresAt"].as_i64().unwrap() - s["createdAt"].as_i64().unwrap(), users::SessionConfig::default().max_ms);
+    lasts_the_servers_limit(&sp.session_of(&head).await);
     let d = &sp.audit("auth.login").await[0]["details"];
     assert_eq!((d["authnInstant"].as_i64(), &d["idpSessionEnds"], &d["forceAuthn"]), (Some(instant / 1000 * 1000), &Value::Null, &Value::Null));
 
@@ -1925,8 +1932,7 @@ async fn the_idps_session_limit_ends_the_session_it_makes() {
     assert_eq!(sp.audit("auth.login").await[0]["details"]["idpSessionEnds"], ends);
     // Longer than the server's own limit: the server's holds.
     let (_, _, head) = sp.sign_in(|r| r.session_not_on_or_after = Some(db::now() + 400 * 24 * HOUR)).await;
-    let s = sp.session_of(&head).await;
-    assert_eq!(s["expiresAt"].as_i64().unwrap() - s["createdAt"].as_i64().unwrap(), users::SessionConfig::default().max_ms);
+    lasts_the_servers_limit(&sp.session_of(&head).await);
 
     // Already over (or about to be): asked once to sign in again, not given a dead session.
     let logins = sp.audit("auth.login").await.len();
@@ -2054,10 +2060,7 @@ async fn an_idp_session_limit_turned_off_is_ignored() {
     assert_eq!(sp.view().await["idpSessionLimit"], false);
     let (code, _, head) = sp.sign_in(|r| r.session_not_on_or_after = Some(db::now() - HOUR)).await;
     assert_eq!(code, 200, "{head}");
-    let s = sp.session_of(&head).await;
-    // The end is set from the sign-in's clock, a moment before the session row is written.
-    let (lasts, max) = (s["expiresAt"].as_i64().unwrap() - s["createdAt"].as_i64().unwrap(), users::SessionConfig::default().max_ms);
-    assert!((max - 1_000..=max).contains(&lasts), "{lasts} vs {max}");
+    lasts_the_servers_limit(&sp.session_of(&head).await);
     assert_eq!(sp.audit("auth.login").await[0]["details"]["idpSessionEnds"], Value::Null);
     assert!(sp.audit("auth.saml_reauthn").await.is_empty());
 }
