@@ -6,6 +6,8 @@ Accepted (24 Nov 2026). Ninth slice of enterprise support playbooks in M5, [#60]
 
 Numbering: this number was reserved for this work.
 
+Amended by [ADR 0243](0243-onboarding-check-in-the-console-and-the-bundle.md): the check is now in the console's Support tab and in the support bundle.
+
 ## Context
 
 [Onboarding](../support/onboarding.md) is a 32-item checklist across six sections: kickoff, identity, isolation, backups, residency, and monitoring and go-live. The technical account manager ticks it in the customer's onboarding record, item by item, by asking the customer or reading settings off the server. Most items are things botd already knows: whether an SSO provider is ready, whether an admin has signed in with SSO, whether SCIM has deprovisioned anyone, whether break-glass is off, where Bots run, whether backups are copied off the host within their RPO and encrypted, whether residency has warnings, whether metrics are on, whether a support bundle has been made. Asking the customer for them is slow, and a box ticked from memory is how a customer goes live with break-glass on or backups that never left the host.

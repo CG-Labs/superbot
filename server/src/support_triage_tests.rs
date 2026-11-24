@@ -40,7 +40,9 @@ fn it_reads_the_online_bundle_botd_makes() {
     let bot = app.db.create_bot("Walker", "#fff", "waddle", "claude", None, false);
     app.db.add_approval(&bot.id, "claude", "Bash", "shell", "rm -rf build", &json!({}), "shell_destructive", "asks", db::now() + 600_000);
     let setup = json!({ "checklist": [{ "id": "backups", "label": "Server backups copied off this host", "done": false }], "done": 0, "total": 1 });
-    let built = crate::support::build(&app, &[], setup, db::now());
+    let auth = crate::Auth::new(Some(app.clone()));
+    let onboarding = crate::onboarding::check(&crate::onboarding::gather(&app, &auth, &setup, db::now()), &[]).view("2026-11-24T05:00:00Z");
+    let built = crate::support::build(&app, &[], setup, onboarding, db::now());
     for n in names(&built.tar) {
         assert!(support_triage::FILES.contains(&n.as_str()), "support_triage doesn't read {n}");
     }
@@ -60,6 +62,13 @@ fn it_reads_the_online_bundle_botd_makes() {
     assert_eq!(sign_in.runbooks, ["support/runbook-saml.md#reasons-and-fixes"]);
     assert_eq!(find(&t, "setup.open").summary, "Setup checklist 0 of 1 done; open: Server backups copied off this host");
     assert_eq!(find(&t, "signal.backups").level, Level::Warn, "server backups aren't set up");
+    let onboarding = find(&t, "onboarding.open");
+    assert_eq!((onboarding.level, onboarding.severity), (Level::Info, None), "onboarding sets no severity");
+    assert!(onboarding.summary.starts_with("Onboarding check ") && onboarding.summary.contains(&format!(" of {} items open: ", crate::onboarding::ITEMS.len())), "{}", onboarding.summary);
+    for open in ["Identity provider set up (idp)", "Server backups off the host, encrypted (server_backups)"] {
+        assert!(onboarding.summary.contains(open), "{open}: {}", onboarding.summary);
+    }
+    assert!(!onboarding.summary.contains("first_bundle"), "the bundle is one");
 
     assert!(t.testing, "tests run in testing mode");
     let v: Value = t.json();

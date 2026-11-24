@@ -11,7 +11,8 @@ use crate::users_http_tests::{parse, user_with};
 use crate::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const FILES: [&str; 9] = ["README.txt", "version.json", "config.json", "health.json", "health-score.json", "health-score-history.json", "logs.jsonl", "audit-summary.json", "manifest.json"];
+const FILES: [&str; 10] =
+    ["README.txt", "version.json", "config.json", "health.json", "health-score.json", "health-score-history.json", "onboarding.json", "logs.jsonl", "audit-summary.json", "manifest.json"];
 
 /// `GET /api/support/bundle`: the status, the response head, and the body's bytes.
 async fn fetch(port: u16, auth: &str) -> (u16, String, Vec<u8>) {
@@ -102,6 +103,14 @@ async fn it_carries_what_support_asks_for_first() {
     assert_eq!((history["days"].as_i64(), history["points"].as_array().map(Vec::len)), (Some(90), Some(0)), "nothing recorded yet: {history}");
     assert!(health["setup"]["checklist"].as_array().is_some_and(|c| c.iter().any(|i| i["id"] == "backups")), "{health}");
     assert!(health["license"]["summary"].is_object(), "{health}");
+
+    let onboarding = parse(file(&f, "onboarding.json"));
+    assert_eq!(onboarding["format"], onboarding::FORMAT, "{onboarding}");
+    let ids: Vec<_> = onboarding["items"].as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, onboarding::ITEMS.iter().map(|i| i.id).collect::<Vec<_>>());
+    assert_eq!((onboarding["skipped"].clone(), onboarding["ready"].clone()), (json!([]), json!(false)), "no skips in a bundle: {onboarding}");
+    let first = onboarding["items"].as_array().unwrap().iter().find(|i| i["id"] == "first_bundle").unwrap();
+    assert_eq!(first["status"], "open", "checked before this bundle was recorded: {first}");
 
     let config = parse(file(&f, "config.json"));
     assert!(config["environment"].is_object() && config["redacted"].is_array(), "{config}");
@@ -211,7 +220,7 @@ async fn settings_are_redacted_by_name_shape_and_known_value() {
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
     .collect();
-    let b = support::build(&app, &vars, json!({}), db::now());
+    let b = support::build(&app, &vars, json!({}), json!({}), db::now());
     let text = String::from_utf8_lossy(&b.tar);
     for v in [known.as_str(), api_key.as_str(), s3.as_str(), generated.as_str(), "owner@customer.example.com", "mailer:"] {
         assert!(!text.contains(v), "{v} is in the bundle");

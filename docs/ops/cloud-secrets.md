@@ -298,6 +298,41 @@ GCP_RUN_CREDENTIALS="superbot-bots@<project>.iam.gserviceaccount.com"
 - **Order**: these win over static secrets of the same name, and runs never inherit these names from botd's own environment.
 - **Private Service Connect**: set `GCP_IAM_CREDENTIALS_ENDPOINT` to its endpoint (https only).
 
+### Downscoping each run's GCP token
+
+Off by default ([ADR 0240](../adr/0240-downscoped-gcp-tokens-for-each-run.md)). An entry can limit each run's token to some Cloud Storage buckets, roles and objects with a [Credential Access Boundary](https://cloud.google.com/iam/docs/downscoping-short-lived-credentials), so one service account can serve every Bot and user without an account per owner. botd makes the account's token as above, trades it at Google's Security Token Service for a downscoped one, and gives the run only that one.
+
+Add `boundary=<file>` after the email: a boundary in Google's JSON, in a file botd can read (no spaces in the path). `{owner}` and `{bot}` in its strings are the run's owner id and Bot id. The token can do only what both the account's roles and the boundary allow.
+
+```sh
+gcloud services enable sts.googleapis.com
+GCP_RUN_CREDENTIALS="superbot-users@<project>.iam.gserviceaccount.com boundary=/etc/superbot/run-boundary.json"
+```
+
+```json
+{
+  "accessBoundary": {
+    "accessBoundaryRules": [{
+      "availableResource": "//storage.googleapis.com/projects/_/buckets/<bucket>",
+      "availablePermissions": ["inRole:roles/storage.objectAdmin"],
+      "availabilityCondition": {
+        "expression": "resource.name.startsWith('projects/_/buckets/<bucket>/objects/users/{owner}/') || api.getAttribute('storage.googleapis.com/objectListPrefix', '').startsWith('users/{owner}/')"
+      }
+    }]
+  }
+}
+```
+
+Grant the account the bucket roles once (here `roles/storage.objectAdmin` on `<bucket>`); the boundary keeps each run to its owner's folder. The second half of the condition lets a run list its own folder (`gcloud storage ls gs://<bucket>/users/<owner id>/`), since listing is checked against the bucket, not an object.
+
+- **Checked at startup**: botd won't start unless the file is JSON of exactly this shape: 1 to 10 rules, each a bucket (`//storage.googleapis.com/projects/_/buckets/<bucket>`), a list of `inRole:<role>`, and optionally an `availabilityCondition` with an `expression` (and a `title` and `description`). A key botd doesn't know stops it, rather than letting Google drop it. Restart botd after editing the file.
+- **Cloud Storage only**: Google honours boundaries for Cloud Storage alone, so other APIs refuse a downscoped token. For Bots that need both, add a second entry without a boundary, for an account with only the other roles, with its own variable names.
+- **The owner's runs only**: an entry whose boundary names the owner (`{owner}`) is used only for runs that get the owner's own secrets, like an account with `{owner}`.
+- **Fails closed**: a Bot id that isn't letters, digits, `-` and `_` refuses a run whose boundary names `{bot}`, before Google is asked. If STS refuses, the run doesn't start (`secrets_unavailable`): 400 points at the boundary (a role Google doesn't know, a condition that isn't CEL), 403 at the Security Token Service API. botd never gives the run the wider token instead.
+- **Audit**: `secret.lease_issued` adds `boundarySha256` (the SHA-256 of the boundary as sent: compact, keys sorted, the run's ids in, as `jq -jcS . <file>` prints it once you put them in). Never the file's path or a token.
+- **Token length**: the downscoped token ends when the impersonated one does (as long as the longest run), and can't be revoked either.
+- **Private Service Connect**: set `GCP_STS_ENDPOINT` to its endpoint (https only).
+
 ## Short-lived Azure credentials for each run
 
 Off by default ([ADR 0213](../adr/0213-entra-app-tokens-for-each-run.md)); only with `SECRETS_BACKEND=azure-keyvault`. With `AZURE_RUN_CREDENTIALS`, botd gets an access token of an Entra app as each run starts and gives it to the run. The app trusts botd's managed identity (or its AKS workload identity) as a federated credential, so no client secret is made or stored, and a token a Bot leaks stops working about an hour after its run started. No Vault is needed; for Vault's Azure engine, see [Vault](vault.md#short-lived-credentials-for-each-run).

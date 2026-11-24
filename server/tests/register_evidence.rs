@@ -7,7 +7,8 @@
 //! policies, and conduct concerns are checked in `conduct.json`, by id only. ADR 0223:
 //! security incidents, breach notices, reviews, actions and tabletops in `incidents.json`.
 //! ADR 0231: production access in `access.json`, with a managed server's review matched to
-//! the sign-off in its evidence bundle's `access-review.json`.
+//! the sign-off in its evidence bundle's `access-review.json`. ADR 0241: vulnerabilities
+//! found outside the scans and penetration tests in `vulnerabilities.json`.
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -117,6 +118,12 @@ fn register() -> Value {
             { "system": "hosting", "at": "2026-10-10", "by": "p-b", "listSha256": hex(b"hosting users"), "mfa": true },
             { "system": "code-host", "at": "2026-09-20", "by": "p-b", "listSha256": hex(b"code host users"), "mfa": true },
         ],
+        "penTests": [{ "id": "PT-1", "reported": "2026-08-01", "reportSha256": hex(b"pentest report"), "retested": "2026-09-10", "retestSha256": hex(b"retest letter"), "notes": "Hooli's testers" }],
+        "vulnerabilities": [
+            { "id": "V-1", "source": "report", "received": "2026-10-02", "acknowledged": "2026-10-08", "assessed": "2026-10-06", "severity": "high", "owner": "Engineering lead", "fixed": "2026-10-20", "notes": "Grace found it" },
+            { "id": "V-2", "source": "pentest", "penTest": "PT-1", "received": "2026-08-01", "assessed": "2026-08-03", "severity": "critical", "owner": "Engineering lead", "fixed": "2026-08-20" },
+            { "id": "V-3", "source": "vendor", "received": "2026-09-15", "assessed": "2026-09-16", "severity": "medium", "owner": "Operator" },
+        ],
     })
 }
 
@@ -174,6 +181,7 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
         "conduct.json: triagedLate 1; evidence for CC1.1-1",
         "incidents.json: reviewOverdue 1; evidence for CC7.3-1, CC7.4-1, CC7.4-2, CC7.5-1",
         "access.json: leaverNotRemoved 1; evidence for CC6.1-2, CC6.2-2, CC6.3-2",
+        "vulnerabilities.json: acknowledgedLate 1; evidence for CC2.3-1, CC3.2-2, CC4.2-1",
     ] {
         assert!(out.contains(want), "{want}\n{out}");
     }
@@ -185,16 +193,20 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
         assert_eq!(fs::metadata(&tar).unwrap().permissions().mode() & 0o777, 0o600, "private to its owner");
     }
     let raw = fs::read(&tar).unwrap();
-    for never in ["Alice", "Bob Example", "Cross-user data leak", "Signup abuse", "a private reason", "Kept by the security owner", "Dave", "took a gift", "Frank", "Globex", "Initech", "carol-gh", "initech.test"] {
+    for never in ["Alice", "Bob Example", "Cross-user data leak", "Signup abuse", "a private reason", "Kept by the security owner", "Dave", "took a gift", "Frank", "Globex", "Initech", "carol-gh", "initech.test", "Hooli", "Grace"] {
         assert!(!raw.windows(never.len()).any(|w| w == never.as_bytes()), "{never:?} is in the bundle");
     }
     let folder = unpack(&dir, &tar);
     let manifest = json_in(&folder, "manifest.json");
-    assert_eq!((manifest["kind"].as_str(), manifest["format"].as_u64(), manifest["source"]["policyTextsChecked"].as_bool(), manifest["source"]["baselineChecks"].as_u64()), (Some("policy-register"), Some(4), Some(true), Some(2)));
+    assert_eq!((manifest["kind"].as_str(), manifest["format"].as_u64(), manifest["source"]["policyTextsChecked"].as_bool(), manifest["source"]["baselineChecks"].as_u64()), (Some("policy-register"), Some(5), Some(true), Some(2)));
     assert_eq!(manifest["source"]["accessReviewFiles"], 1);
     assert_eq!(manifest["source"]["registerSha256"].as_str(), Some(hex(&fs::read(dir.join("register.json")).unwrap()).as_str()), "identifies the register kept beside it");
     let files: Vec<&str> = manifest["files"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
-    assert_eq!(files, ["README.txt", "roles.json", "policies.json", "people.json", "risks.json", "management-reviews.json", "vendors.json", "policy-exceptions.json", "conduct.json", "incidents.json", "access.json"]);
+    assert_eq!(files, ["README.txt", "roles.json", "policies.json", "people.json", "risks.json", "management-reviews.json", "vendors.json", "policy-exceptions.json", "conduct.json", "incidents.json", "access.json", "vulnerabilities.json"]);
+    let vulns = json_in(&folder, "vulnerabilities.json");
+    assert_eq!(vulns["exceptions"]["acknowledgedLate"], json!(["V-1 (received 2026-10-02, acknowledged 2026-10-08, due 2026-10-05)"]), "{vulns:#}");
+    assert_eq!(vulns["vulnerabilities"].as_array().unwrap().iter().map(|v| v["id"].as_str().unwrap()).collect::<Vec<_>>(), ["V-1", "V-3"], "V-2 was finished before the period: {vulns:#}");
+    assert_eq!((vulns["penTests"][0]["retestCoversFixes"].as_bool(), vulns["summary"]["openAtEnd"].as_u64(), vulns["informationSecurityPolicy"]["penTestDue"].as_str()), (Some(true), Some(1), Some("2027-09-01")), "{vulns:#}");
     let access = json_in(&folder, "access.json");
     assert_eq!(access["exceptions"]["leaverNotRemoved"], json!(["p-d on code-host (user): left 2026-10-15, not removed"]), "{access:#}");
     let botd = access["reviews"].as_array().unwrap().iter().find(|r| r["system"] == "botd-1").unwrap();
@@ -223,7 +235,7 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
     let r: Value = serde_json::from_slice(&o.stdout).unwrap();
     let kind = r["kinds"].as_array().unwrap().iter().find(|k| k["kind"] == "policy-register").unwrap();
     assert_eq!((kind["complete"].as_bool(), r["bundles"][0]["verified"].as_bool()), (Some(true), Some(true)), "{r:#}");
-    for row in ["CC1.1-1", "CC1.2-1", "CC1.3-1", "CC3.3-1", "CC6.4-1", "CC9.2-1", "CC7.3-1", "CC7.4-1", "CC7.4-2", "CC7.5-1", "CC6.1-2", "CC6.2-2", "CC6.3-2"] {
+    for row in ["CC1.1-1", "CC1.2-1", "CC1.3-1", "CC3.3-1", "CC6.4-1", "CC9.2-1", "CC7.3-1", "CC7.4-1", "CC7.4-2", "CC7.5-1", "CC6.1-2", "CC6.2-2", "CC6.3-2", "CC2.3-1", "CC3.2-2", "CC4.2-1"] {
         let x = r["rows"].as_array().unwrap().iter().find(|x| x["row"] == row).unwrap_or_else(|| panic!("{row}: {r:#}"));
         assert_eq!(x["complete"], true, "{row}");
     }
@@ -231,6 +243,7 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
     assert_eq!(r["bundles"][0]["exceptions"]["conduct.json"]["triagedLate"], 1);
     assert_eq!(r["bundles"][0]["exceptions"]["incidents.json"]["reviewOverdue"], 1);
     assert_eq!(r["bundles"][0]["exceptions"]["access.json"]["leaverNotRemoved"], 1);
+    assert_eq!(r["bundles"][0]["exceptions"]["vulnerabilities.json"]["acknowledgedLate"], 1);
 
     // A managed server's review with no sign-off that day in botd is flagged.
     write(&dir, "other-day.json", &access_review("2026-10-13T09:00:00Z"));

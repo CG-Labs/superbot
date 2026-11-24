@@ -71,5 +71,7 @@
     { "system": "superbot-1", "at": "2026-12-01", "by": "person-1", "listSha256": "0000000000000000000000000000000000000000000000000000000000000000", "mfa": true, "notes": "<the access-review report's digest, as signed off in SuperBot>" },
     { "system": "hosting", "at": "2026-12-01", "by": "person-2", "listSha256": "0000000000000000000000000000000000000000000000000000000000000000", "mfa": true },
     { "system": "code-host", "at": "2026-12-01", "by": "person-2", "listSha256": "0000000000000000000000000000000000000000000000000000000000000000", "mfa": true, "findings": [{ "id": "AF-01", "fixed": "2026-12-02" }] }
-  ]
+  ],
+  "vulnerabilities": [],
+  "penTests": []
 }
