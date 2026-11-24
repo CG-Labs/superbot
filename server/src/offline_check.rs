@@ -644,6 +644,22 @@ impl<'a> Judge<'a> {
         }
     }
 
+    /// Each region's store `<prefix>_<REGION>_BUCKET` names, at its `_ENDPOINT`.
+    fn regional_stores(&mut self, prefix: &str, what: &str) -> bool {
+        let regions: Vec<String> = self
+            .vars
+            .iter()
+            .filter(|(_, v)| !v.trim().is_empty())
+            .filter_map(|(k, _)| k.strip_prefix(prefix)?.strip_prefix('_')?.strip_suffix("_BUCKET").filter(|r| !r.is_empty()).map(String::from))
+            .collect();
+        for r in &regions {
+            let k = format!("{prefix}_{r}_ENDPOINT");
+            let v = self.get(&k).to_string();
+            self.address(Area::Backups, &k, &v, &format!("{what} for {}", r.to_ascii_lowercase().replace('_', "-")), S3_FIX);
+        }
+        !regions.is_empty()
+    }
+
     fn backups(&mut self) {
         let mut any = false;
         if !self.get("SERVER_BACKUP_OFF_HOST").eq_ignore_ascii_case("off") && self.set("SERVER_BACKUP_S3_BUCKET") {
@@ -653,19 +669,11 @@ impl<'a> Judge<'a> {
         }
         if self.set("MACHINE_BACKUP_S3_BUCKET") {
             any = true;
-            let stores: Vec<(String, String)> = self
-                .vars
-                .iter()
-                .filter(|(k, v)| k.starts_with("MACHINE_BACKUP_S3_") && k.ends_with("_ENDPOINT") && !v.trim().is_empty())
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            if !stores.iter().any(|(k, _)| k == "MACHINE_BACKUP_S3_ENDPOINT") {
-                self.address(Area::Backups, "MACHINE_BACKUP_S3_ENDPOINT", "", "Machine backups' S3 store", S3_FIX);
-            }
-            for (k, v) in stores {
-                self.address(Area::Backups, &k, &v, "Machine backups' S3 store", S3_FIX);
-            }
+            let v = self.get("MACHINE_BACKUP_S3_ENDPOINT").to_string();
+            self.address(Area::Backups, "MACHINE_BACKUP_S3_ENDPOINT", &v, "Machine backups' S3 store", S3_FIX);
         }
+        any |= self.regional_stores(crate::machines::s3::MACHINES, "Machine backups' S3 store");
+        any |= self.regional_stores(crate::machines::chat_store_copies::NAME, "Chat store backups' S3 store");
         if !any {
             self.ok(Area::Backups, "no off-host store: server backups stay on this host");
         }
@@ -1141,6 +1149,8 @@ mod tests {
                 ("MACHINE_BACKUP_S3_ENDPOINT", "https://minio.internal:9000"),
                 ("MACHINE_BACKUP_S3_GB_LON_BUCKET", "machines-lon"),
                 ("MACHINE_BACKUP_S3_GB_LON_ENDPOINT", "https://10.1.0.10:9000"),
+                ("REGION_DATA_S3_DE_FRA_2_BUCKET", "chats-fra"),
+                ("REGION_DATA_S3_DE_FRA_2_ENDPOINT", "https://minio-fra.internal"),
                 ("AUDIT_EXPORT", "splunk=https://siem.corp.example:8088/services/collector,s3://audit/superbot"),
                 ("AUDIT_EXPORT_S3_ENDPOINT", "https://minio.internal:9000"),
                 ("AUDIT_TIMESTAMP_URL", "http://tsa.internal/tsr"),
@@ -1164,6 +1174,7 @@ mod tests {
             "SERVER_BACKUP_S3_ENDPOINT",
             "MACHINE_BACKUP_S3_ENDPOINT",
             "MACHINE_BACKUP_S3_GB_LON_ENDPOINT",
+            "REGION_DATA_S3_DE_FRA_2_ENDPOINT",
             "AUDIT_EXPORT",
             "AUDIT_EXPORT_S3_ENDPOINT",
             "AUDIT_TIMESTAMP_URL",
@@ -1317,6 +1328,27 @@ mod tests {
         let gcp = findings(&[("SECRETS_BACKEND", "gcp-secret-manager")], &[]);
         assert_eq!(by(&gcp, "GCP_SECRET_MANAGER_ENDPOINT").host.as_deref(), Some("secretmanager.googleapis.com"));
         assert_eq!(by(&findings(&[("SECRETS_BACKEND", "consul")], &[]), "SECRETS_BACKEND").status, Status::Check);
+    }
+
+    #[test]
+    fn every_regions_backup_store_is_judged() {
+        let f = findings(
+            &[
+                ("REGION_DATA_S3_GB_LON_BUCKET", "chats"),
+                ("REGION_DATA_S3_GB_LON_ENDPOINT", "https://s3.eu-central-003.backblazeb2.com"),
+                ("REGION_DATA_S3_DE_FRA_2_BUCKET", "chats-fra"),
+                ("MACHINE_BACKUP_S3_US_EAST_BUCKET", "m"),
+                ("MACHINE_BACKUP_S3_US_EAST_ENDPOINT", "https://us-east-1.linodeobjects.com"),
+                ("REGION_DATA_S3_PREFIX", "superbot/"),
+            ],
+            &[],
+        );
+        let b2 = by(&f, "REGION_DATA_S3_GB_LON_ENDPOINT");
+        assert_eq!(b2.status, Status::Internet);
+        assert!(b2.detail.starts_with("Chat store backups' S3 store for gb-lon at s3.eu-central-003.backblazeb2.com"), "{}", b2.detail);
+        assert_eq!(by(&f, "REGION_DATA_S3_DE_FRA_2_ENDPOINT").status, Status::Check, "a bucket with no endpoint");
+        assert_eq!(by(&f, "MACHINE_BACKUP_S3_US_EAST_ENDPOINT").status, Status::Internet);
+        assert_eq!(of(&f, Area::Backups).len(), 3, "{f:#?}");
     }
 
     #[test]

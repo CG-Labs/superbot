@@ -393,7 +393,7 @@ It exits 1 while anything is `internet`, else 0, and 2 for a usage error. `insta
 | Sign-up form | `TURNSTILE_SITE_KEY` |
 | Email | `SMTP_HOST` |
 | Approval webhooks | `NOTIFY_WEBHOOK_URL` and each `NOTIFY_WEBHOOK_URL_BOT_*` |
-| Backups | `SERVER_BACKUP_S3_*` and each `MACHINE_BACKUP_S3_*_ENDPOINT` |
+| Backups | `SERVER_BACKUP_S3_ENDPOINT`, `MACHINE_BACKUP_S3_ENDPOINT`, and each region's `MACHINE_BACKUP_S3_<REGION>_ENDPOINT` and `REGION_DATA_S3_<REGION>_ENDPOINT` with a bucket set |
 | Audit export | `AUDIT_EXPORT` at the host each sink sends to (Google SecOps' and Datadog's regional intake), with its sign-in; `AUDIT_EXPORT_S3_ENDPOINT`, `AUDIT_TIMESTAMP_URL` |
 | Errors and traces | `ERROR_REPORT_DSN`, `TRACES_OTLP_ENDPOINT` |
 | Secrets manager | `SECRETS_BACKEND`: its endpoint and where botd signs in to it (STS, Entra ID, a metadata server, a key's token URI), as the backend builds them |
