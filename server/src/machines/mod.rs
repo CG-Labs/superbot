@@ -1275,13 +1275,19 @@ pub async fn reconcile(app: &AppState, cp: &ControlPlane) -> Value {
     let networks = team_network::sweep(app, cp).await;
     let disabled = crate::deprovision::sweep(app, cp).await;
     let kept_pins_ended = residency::end_kept(app, cp).await;
-    let chats_moved: usize = chat_stores::place(&app.db).iter().map(|m| m.messages).sum();
+    let moves = chat_stores::place(&app.db);
     let mut out = json!({ "checked": ids.len(), "changed": changed });
     if kept_pins_ended > 0 {
         out["keptPinsEnded"] = kept_pins_ended.into();
     }
-    if chats_moved > 0 {
-        out["chatsMoved"] = chats_moved.into();
+    for (key, n) in [
+        ("chatsMoved", moves.iter().map(|m| m.messages).sum::<usize>()),
+        ("routinesMoved", moves.iter().map(|m| m.routines).sum()),
+        ("approvalsMoved", moves.iter().map(|m| m.approvals).sum()),
+    ] {
+        if n > 0 {
+            out[key] = n.into();
+        }
     }
     if teams != json!({}) {
         out["teams"] = teams;
