@@ -1,8 +1,10 @@
 //! What a SCIM token may do (ADR 0224): read or write Users, read or write Groups. A
 //! write scope includes reading the same resource, since an IdP looks a resource up
-//! before it changes it. Discovery is open to every token. The guard checks each request
-//! under `/scim/v2` and Bulk checks each operation, so neither path gets round the other.
-//! Tokens made before scopes have all four.
+//! before it changes it. Discovery is open to every token; any other path neither Users
+//! nor Groups needs every scope, so a route added later is closed to narrowed tokens
+//! until it's given a scope. The guard checks each request under `/scim/v2` and Bulk
+//! checks each operation, so neither path gets round the other. Tokens made before
+//! scopes have all four.
 //! Design: docs/adr/0224-scim-token-scopes.md.
 
 use axum::http::Method;
@@ -133,20 +135,44 @@ impl Serialize for Scopes {
     }
 }
 
-/// The scope a request under `/scim/v2` needs, from its method and path. None for
-/// discovery, for paths no handler serves (404 whatever the token), and for Bulk, whose
-/// operations are checked one by one. Matched more loosely than the router (any case,
-/// empty segments skipped), so a path that reaches a Users or Groups handler is never
-/// missed.
-pub fn needed(method: &Method, path: &str) -> Option<Scope> {
-    let rest = path.strip_prefix("/scim/v2")?;
-    let resource = match rest.split('/').find(|s| !s.is_empty())? {
-        s if s.eq_ignore_ascii_case("Users") => Resource::Users,
-        s if s.eq_ignore_ascii_case("Groups") => Resource::Groups,
-        _ => return None,
+/// What a request under `/scim/v2` needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Need {
+    /// Discovery, and Bulk, whose operations are checked one by one.
+    Open,
+    One(Scope),
+    /// Any other path: none is served today (404), and one added later without a scope
+    /// is for tokens with every scope until it's given one.
+    All,
+}
+
+/// Paths under `/scim/v2` whose first segment is exactly one of these are open.
+const OPEN: [&str; 4] = ["ServiceProviderConfig", "ResourceTypes", "Schemas", "Bulk"];
+
+/// What a request needs, from its method and path. Users and Groups are matched more
+/// loosely than the router (any case, empty segments skipped), and open paths exactly,
+/// so a path that reaches a handler is never under-checked.
+pub fn needed(method: &Method, path: &str) -> Need {
+    let first = path.strip_prefix("/scim/v2").and_then(|rest| rest.split('/').find(|s| !s.is_empty()));
+    let resource = match first {
+        Some(s) if s.eq_ignore_ascii_case("Users") => Resource::Users,
+        Some(s) if s.eq_ignore_ascii_case("Groups") => Resource::Groups,
+        Some(s) if OPEN.contains(&s) => return Need::Open,
+        _ => return Need::All,
     };
     let access = if *method == Method::GET || *method == Method::HEAD { Access::Read } else { Access::Write };
-    Some(Scope(resource, access))
+    Need::One(Scope(resource, access))
+}
+
+impl Scopes {
+    /// The first scope `need` asks for that these don't have.
+    pub fn lacks(self, need: Need) -> Option<Scope> {
+        match need {
+            Need::Open => None,
+            Need::One(s) => (!self.allows(s)).then_some(s),
+            Need::All => EVERY.into_iter().find(|s| !self.allows(*s)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -188,19 +214,36 @@ mod tests {
 
     #[test]
     fn requests_need_the_scope_of_their_resource() {
-        let need = |m: Method, p: &str| needed(&m, p).map(Scope::name);
-        assert_eq!(need(Method::GET, "/scim/v2/Users"), Some("users:read"));
-        assert_eq!(need(Method::HEAD, "/scim/v2/Users/u1"), Some("users:read"));
-        assert_eq!(need(Method::POST, "/scim/v2/Users"), Some("users:write"));
+        let need = |m: Method, p: &str| match needed(&m, p) {
+            Need::One(s) => s.name(),
+            Need::Open => "open",
+            Need::All => "all",
+        };
+        assert_eq!(need(Method::GET, "/scim/v2/Users"), "users:read");
+        assert_eq!(need(Method::HEAD, "/scim/v2/Users/u1"), "users:read");
+        assert_eq!(need(Method::POST, "/scim/v2/Users"), "users:write");
         for m in [Method::PUT, Method::PATCH, Method::DELETE, Method::OPTIONS] {
-            assert_eq!(need(m.clone(), "/scim/v2/Users/u1"), Some("users:write"), "{m}");
-            assert_eq!(need(m.clone(), "/scim/v2/Groups/g1"), Some("groups:write"), "{m}");
+            assert_eq!(need(m.clone(), "/scim/v2/Users/u1"), "users:write", "{m}");
+            assert_eq!(need(m.clone(), "/scim/v2/Groups/g1"), "groups:write", "{m}");
         }
-        assert_eq!(need(Method::GET, "/scim/v2/Groups"), Some("groups:read"));
-        assert_eq!(need(Method::GET, "/scim/v2//groups/"), Some("groups:read"), "looser than the router");
-        assert_eq!(need(Method::GET, "/scim/v2/USERS/x/y"), Some("users:read"));
-        for open in ["/scim/v2/ServiceProviderConfig", "/scim/v2/ResourceTypes/User", "/scim/v2/Schemas", "/scim/v2/Bulk", "/scim/v2", "/scim/v2/", "/scim/v2/Me", "/api/users"] {
-            assert_eq!(need(Method::POST, open), None, "{open}");
+        assert_eq!(need(Method::GET, "/scim/v2/Groups"), "groups:read");
+        assert_eq!(need(Method::GET, "/scim/v2//groups/"), "groups:read", "looser than the router");
+        assert_eq!(need(Method::GET, "/scim/v2/USERS/x/y"), "users:read");
+        for open in ["/scim/v2/ServiceProviderConfig", "/scim/v2/ResourceTypes/User", "/scim/v2/Schemas/urn:x", "/scim/v2/Bulk", "/scim/v2//Bulk"] {
+            assert_eq!(need(Method::POST, open), "open", "{open}");
         }
+        for closed in ["/scim/v2", "/scim/v2/", "/scim/v2/Me", "/scim/v2/bulk", "/scim/v2/schemas", "/scim/v2/%55sers", "/api/users"] {
+            assert_eq!(need(Method::GET, closed), "all", "fails closed: {closed}");
+        }
+    }
+
+    #[test]
+    fn a_token_lacks_the_first_scope_it_doesnt_have() {
+        let users = Scopes::of(&[Scope(Resource::Users, Access::Write)]);
+        assert_eq!(users.lacks(Need::Open), None);
+        assert_eq!(users.lacks(Need::One(Scope(Resource::Users, Access::Read))), None);
+        assert_eq!(users.lacks(Need::One(Scope(Resource::Groups, Access::Read))).map(Scope::name), Some("groups:read"));
+        assert_eq!(users.lacks(Need::All).map(Scope::name), Some("groups:read"));
+        assert_eq!(Scopes::ALL.lacks(Need::All), None);
     }
 }

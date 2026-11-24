@@ -390,7 +390,7 @@ pub async fn guard(State(a): State<Arc<Auth>>, mut req: Request, next: Next) -> 
     }
     let who = Who { actor: actor(&a, &t), source };
     let (tenant, method, path) = (t.tenant.clone(), req.method().to_string(), req.uri().path().to_string());
-    let lacking = scopes::needed(req.method(), &path).filter(|s| !t.scopes.allows(*s));
+    let lacking = t.scopes.lacks(scopes::needed(req.method(), &path));
     let r = match lacking {
         Some(need) => insufficient_scope(t.scopes, need).into_response(),
         None => {

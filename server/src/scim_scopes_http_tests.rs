@@ -207,6 +207,13 @@ async fn every_route_needs_the_scope_of_what_it_reaches() {
             let (code, _, res) = scim(port, &t, method, path, Value::Null).await;
             assert!(code == 403 || code == 404, "{scope} {method} {path}: {code} {res}");
         }
+        for path in ["/scim/v2", "/scim/v2/Me", "/scim/v2/bulk"] {
+            assert_eq!(scim(port, &t, "GET", path, Value::Null).await.0, 403, "a path with no scope is for full tokens only: {scope} {path}");
+        }
+    }
+    let (full, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    for path in ["/scim/v2", "/scim/v2/Me", "/scim/v2/bulk"] {
+        assert_eq!(scim(port, &full, "GET", path, Value::Null).await.0, 404, "{path}");
     }
 }
 
