@@ -298,6 +298,10 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    item done, open, to confirm, n/a or skipped, with its guide.
                                                    --skip: items agreed at kickoff not to need. Exits 1 while
                                                    any item is open
+  botctl health-check [markdown | json]            The monthly health check (ADR 0252) judged from botd: each
+                                                   item of the TAM's checklist done, open, to confirm or n/a,
+                                                   from the health score and botd's records. Exits 1 while any
+                                                   item is open
   botctl support-report <tickets.csv | -> [--plan <plan>] [--customer <name>] [--from <YYYY-MM> --to <YYYY-MM>]
     [--hours <HH:MM-HH:MM>] [--weekdays <mon-fri>] [--utc-offset <+HH:MM>] [--holidays <dates>]
     [--target <sev>=<30m|1h|4bh|1bd>]... [--column <field>=<header>]... [--as-of <time>] [--markdown | --json]
@@ -2332,6 +2336,23 @@ fn run(args: &[String]) -> Result<String, String> {
             }
             Ok(out)
         }
+        ["health-check", rest @ ..] => {
+            let shape = health_check_request(rest)?;
+            let res = api(Cred::Operator, "GET", "/api/support/health-check", None)?;
+            let v: Value = serde_json::from_str(&res).map_err(|e| e.to_string())?;
+            let out = match shape {
+                Shape::Json => pretty(res),
+                Shape::Markdown => health_check_markdown(&v),
+                Shape::Text => health_check_summary(&v),
+            };
+            // Open items exit 1, so a monthly job can raise a task, with the report still on stdout.
+            if v["clear"] != true {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(out.as_bytes()).and_then(|_| stdout.flush());
+                std::process::exit(1);
+            }
+            Ok(out)
+        }
         ["incidents"] => Ok(incidents_summary(&serde_json::from_str(&api(Cred::Operator, "GET", "/api/status/incidents", None)?).map_err(|e| e.to_string())?)),
         ["incidents", "json"] => op("GET", "/api/status/incidents", None),
         ["incident", "review", rest @ ..] => {
@@ -2971,7 +2992,7 @@ fn onboarding_counts(c: &Value) -> String {
 }
 
 /// The items botd returned under each section's title, in order.
-fn onboarding_sections(v: &Value) -> Vec<(String, Vec<Value>)> {
+fn checklist_sections(v: &Value) -> Vec<(String, Vec<Value>)> {
     let items = v["items"].as_array().cloned().unwrap_or_default();
     v["sections"]
         .as_array()
@@ -2985,7 +3006,7 @@ fn onboarding_sections(v: &Value) -> Vec<(String, Vec<Value>)> {
 fn onboarding_summary(v: &Value) -> String {
     let mut out = format!("Onboarding ({}), checked {}: {}\n", v["checklist"].as_str().unwrap_or(""), v["checkedAt"].as_str().unwrap_or("now"), onboarding_counts(&v["counts"]));
     let width = v["items"].as_array().into_iter().flatten().filter_map(|i| i["id"].as_str()).map(str::len).max().unwrap_or(0);
-    for (title, items) in onboarding_sections(v) {
+    for (title, items) in checklist_sections(v) {
         out.push_str(&format!("{title}\n"));
         for i in items {
             let status = match i["status"].as_str().unwrap_or("") {
@@ -3041,7 +3062,7 @@ fn onboarding_markdown(v: &Value) -> String {
         md_path(v["checklist"].as_str().unwrap_or("")),
         onboarding_counts(c)
     );
-    for (title, items) in onboarding_sections(v) {
+    for (title, items) in checklist_sections(v) {
         out.push_str(&format!("\n### {}\n\n", md_text(&title)));
         for i in items {
             let (label, detail, guide) = (md_text(i["label"].as_str().unwrap_or("")), md_text(i["detail"].as_str().unwrap_or("")), md_path(i["guide"].as_str().unwrap_or("")));
@@ -3050,6 +3071,86 @@ fn onboarding_markdown(v: &Value) -> String {
                 "open" => format!("- [ ] **Open:** {label}. {detail} See `{guide}`."),
                 "confirm" => format!("- [ ] **To confirm:** {label}. {detail}"),
                 "skipped" => format!("- [ ] *Skipped, agreed at kickoff:* {label}. {detail}"),
+                _ => format!("- ~~{label}~~ (not applicable). {detail}"),
+            };
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// `botctl health-check [markdown | json]`: how to print it.
+fn health_check_request(rest: &[&str]) -> Result<Shape, String> {
+    match rest {
+        [] => Ok(Shape::Text),
+        ["markdown" | "--markdown"] => Ok(Shape::Markdown),
+        ["json" | "--json"] => Ok(Shape::Json),
+        _ => Err("Usage: botctl health-check [markdown | json]".into()),
+    }
+}
+
+fn health_check_counts(c: &Value) -> String {
+    format!("{} done, {} open, {} to confirm, {} n/a", c["done"], c["open"], c["confirm"], c["notApplicable"])
+}
+
+fn health_check_score(v: &Value) -> String {
+    let score = v["score"].as_u64().map_or("no score".to_string(), |s| format!("score {s}"));
+    format!("{score}, {}", v["band"].as_str().unwrap_or("unknown").replace('_', " "))
+}
+
+/// The monthly health check for the TAM: each section's items, a status each, then what's open with its guide.
+fn health_check_summary(v: &Value) -> String {
+    let mut out = format!(
+        "Monthly health check ({}), checked {}: {}; {}\n",
+        v["checklist"].as_str().unwrap_or(""),
+        v["checkedAt"].as_str().unwrap_or("now"),
+        health_check_score(v),
+        health_check_counts(&v["counts"])
+    );
+    let width = v["items"].as_array().into_iter().flatten().filter_map(|i| i["id"].as_str()).map(str::len).max().unwrap_or(0);
+    for (title, items) in checklist_sections(v) {
+        out.push_str(&format!("{title}\n"));
+        for i in items {
+            let status = match i["status"].as_str().unwrap_or("") {
+                "open" => "OPEN",
+                "confirm" => "CONFIRM",
+                other => other,
+            };
+            out.push_str(&format!("  {status:<7}  {:<width$}  {}\n", i["id"].as_str().unwrap_or(""), i["detail"].as_str().unwrap_or("")));
+        }
+    }
+    let open: Vec<&Value> = v["items"].as_array().into_iter().flatten().filter(|i| i["status"] == "open").collect();
+    if open.is_empty() {
+        out.push_str("Nothing open: confirm each CONFIRM item with the customer, then send their owner the score and what changed.\n");
+    } else {
+        out.push_str("Open, with the guide for each:\n");
+        for i in open {
+            out.push_str(&format!("  {:<width$}  {}\n", i["id"].as_str().unwrap_or(""), i["guide"].as_str().unwrap_or("")));
+        }
+    }
+    out
+}
+
+/// The monthly health check for the customer's record: a checklist per section.
+fn health_check_markdown(v: &Value) -> String {
+    let c = &v["counts"];
+    let verdict = if v["clear"] == true { "Nothing open.".to_string() } else { format!("**{} open.**", c["open"]) };
+    let mut out = format!(
+        "## Monthly health check\n\nChecked {} against `{}`: {}; {}. {verdict}\n",
+        md_text(v["checkedAt"].as_str().unwrap_or("now")),
+        md_path(v["checklist"].as_str().unwrap_or("")),
+        md_text(&health_check_score(v)),
+        health_check_counts(c)
+    );
+    for (title, items) in checklist_sections(v) {
+        out.push_str(&format!("\n### {}\n\n", md_text(&title)));
+        for i in items {
+            let (label, detail, guide) = (md_text(i["label"].as_str().unwrap_or("")), md_text(i["detail"].as_str().unwrap_or("")), md_path(i["guide"].as_str().unwrap_or("")));
+            let line = match i["status"].as_str().unwrap_or("") {
+                "done" => format!("- [x] {label}. {detail}"),
+                "open" => format!("- [ ] **Open:** {label}. {detail} See `{guide}`."),
+                "confirm" => format!("- [ ] **To confirm:** {label}. {detail}"),
                 _ => format!("- ~~{label}~~ (not applicable). {detail}"),
             };
             out.push_str(&line);
@@ -3582,6 +3683,66 @@ mod tests {
         }
         assert_eq!(md_path("docs/a.md#b"), "docs/a.md#b");
         assert_eq!(md_path("x` <img>"), "", "a guide that isn't a plain path is left out");
+    }
+
+    #[test]
+    fn health_check_takes_a_shape_only() {
+        assert_eq!(health_check_request(&[]), Ok(Shape::Text));
+        assert_eq!((health_check_request(&["markdown"]), health_check_request(&["--json"])), (Ok(Shape::Markdown), Ok(Shape::Json)));
+        for bad in [&["json", "markdown"][..], &["--days", "30"], &["--skip", "scim"]] {
+            assert!(health_check_request(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    fn health_check_view() -> Value {
+        json!({
+            "checklist": "docs/support/health-check.md", "checkedAt": "2027-02-01T09:00:00Z", "clear": false, "score": 64, "band": "watch",
+            "counts": { "done": 1, "open": 1, "confirm": 1, "notApplicable": 1 },
+            "sections": [{ "id": "score", "title": "1. The score" }, { "id": "data", "title": "4. Data and backups" }],
+            "items": [
+                { "id": "score", "section": "score", "label": "Health score and band", "status": "open", "detail": "Score 64, watch; worth a look: runs.", "guide": "docs/support/health-score.md" },
+                { "id": "actions", "section": "score", "label": "Signals have an action", "status": "confirm", "detail": "Confirm runs <b>|[x](http://e)</b>.", "guide": "docs/support/health-score.md#the-signals" },
+                { "id": "backups", "section": "data", "label": "Server backups", "status": "done", "detail": "3 hours old.", "guide": "docs/ops/backup-restore.md" },
+                { "id": "residency", "section": "data", "label": "No residency warnings", "status": "n/a", "detail": "No regions.", "guide": "x` <img>" },
+            ],
+        })
+    }
+
+    #[test]
+    fn health_check_reads_as_a_line_per_item_then_what_is_open() {
+        assert_eq!(
+            health_check_summary(&health_check_view()),
+            "Monthly health check (docs/support/health-check.md), checked 2027-02-01T09:00:00Z: score 64, watch; 1 done, 1 open, 1 to confirm, 1 n/a\n\
+             1. The score\n  \
+             OPEN     score      Score 64, watch; worth a look: runs.\n  \
+             CONFIRM  actions    Confirm runs <b>|[x](http://e)</b>.\n\
+             4. Data and backups\n  \
+             done     backups    3 hours old.\n  \
+             n/a      residency  No regions.\n\
+             Open, with the guide for each:\n  \
+             score      docs/support/health-score.md\n"
+        );
+        let mut v = health_check_view();
+        v["items"][0]["status"] = json!("done");
+        (v["score"], v["band"]) = (Value::Null, json!("at_risk"));
+        let out = health_check_summary(&v);
+        assert!(out.contains(": no score, at risk; "), "{out}");
+        assert!(out.ends_with("Nothing open: confirm each CONFIRM item with the customer, then send their owner the score and what changed.\n"), "{out}");
+    }
+
+    #[test]
+    fn health_check_markdown_is_a_checklist_with_nothing_live_in_it() {
+        let md = health_check_markdown(&health_check_view());
+        assert!(md.starts_with("## Monthly health check\n\nChecked 2027-02-01T09:00:00Z against `docs/support/health-check.md`: score 64, watch; 1 done, 1 open, 1 to confirm, 1 n/a. **1 open.**\n"), "{md}");
+        for line in [
+            "\n### 1. The score\n\n- [ ] **Open:** Health score and band. Score 64, watch; worth a look: runs. See `docs/support/health-score.md`.\n",
+            "- [ ] **To confirm:** Signals have an action. Confirm runs \\<b\\>\\|\\[x\\](http://e)\\</b\\>.\n",
+            "- [x] Server backups. 3 hours old.\n",
+            "- ~~No residency warnings~~ (not applicable). No regions.\n",
+        ] {
+            assert!(md.contains(line), "{line}\n{md}");
+        }
+        assert!(!md.contains("<img>"), "{md}");
     }
 
     #[test]
