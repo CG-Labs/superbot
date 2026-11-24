@@ -170,9 +170,14 @@ impl Copies {
     }
 
     /// The key of the copy of the backup named `name` whose SHA-256 is `sha`.
+    /// Encrypted copies also carry who can read them, so new recipients replace every copy
+    /// and none is left that only a retired identity opens.
     fn key(&self, store: &ChatStore, name: &str, sha: &str) -> String {
         let stem = name.strip_suffix(".sqlite").unwrap_or(name);
-        format!("{}{stem}-{sha}.sqlite{}", self.store_prefix(store), if self.s.recipients.is_empty() { "" } else { ".age" })
+        match recipients_id(&self.s.recipients) {
+            None => format!("{}{stem}-{sha}.sqlite", self.store_prefix(store)),
+            Some(id) => format!("{}{stem}-{sha}.{id}.sqlite.age", self.store_prefix(store)),
+        }
     }
 
     async fn sha(&self, path: &Path) -> Result<String, String> {
@@ -347,6 +352,16 @@ impl Copies {
             .map(|s| format!("{}'s chat store's backups couldn't all be copied off the host to its bucket in {}; check botd's log for {COPIED} failures (ADR 0246).", s.region, s.region))
             .collect()
     }
+}
+
+/// The first 16 hex digits of the SHA-256 of the sorted recipients. None: no recipients.
+fn recipients_id(recipients: &[age::x25519::Recipient]) -> Option<String> {
+    if recipients.is_empty() {
+        return None;
+    }
+    let mut each: Vec<String> = recipients.iter().map(|r| r.to_string()).collect();
+    each.sort();
+    Some(crate::sigv4::hex(digest::digest(&digest::SHA256, each.join(",").as_bytes()).as_ref())[..16].to_string())
 }
 
 fn recorded(store: &ChatStore) -> String {
@@ -563,6 +578,17 @@ mod tests {
         let local = std::fs::read(chat_stores::backups_strictly(&w.db.chat_stores()[0]).unwrap()[0].1.clone()).unwrap();
         assert_eq!(plain, local, "the backup, decrypted with the operator's identity");
         assert!(key.contains(&s3::sha256_hex(&local)), "named by the plain file's SHA-256");
+
+        // New recipients: every copy is replaced by one they can read.
+        let next = age::x25519::Identity::generate();
+        let c = copies(&w.s3, vec![next.to_public()]);
+        assert_eq!(c.pass(&w.db, now()).await["gb-lon"], Ok(Copied { uploaded: 1, deleted: 1, copies: 1 }));
+        let (again, body) = w.s3.w().objects.iter().next().map(|(k, v)| (k.clone(), v.clone())).unwrap();
+        assert!(again != key && again.contains(&s3::sha256_hex(&local)), "{again}");
+        let d = age::Decryptor::new(&body[..]).unwrap();
+        assert!(d.decrypt(std::iter::once(&next as &dyn age::Identity)).is_ok());
+        let d = age::Decryptor::new(&body[..]).unwrap();
+        assert!(d.decrypt(std::iter::once(&id as &dyn age::Identity)).is_err(), "the retired identity opens none");
     }
 
     #[tokio::test]

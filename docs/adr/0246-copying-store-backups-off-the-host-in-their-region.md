@@ -31,7 +31,7 @@ The copy has to stay in the region, or it breaks the pin it serves. It also has 
 ### The bucket mirrors the folder
 
 - Each store's copies are under `<prefix>region-data/<region>/<store id>/`. The store id is the one written into the store when it was made (ADR 0215), so a store made again in the region never mixes with an earlier one's.
-- Each backup `chats-<UTC time>.sqlite` is copied to `chats-<UTC time>-<SHA-256 of the file>.sqlite` (`.age` added when encrypted). A backup ADR 0238 rewrote is a new file with a new hash, so it is a new object.
+- Each backup `chats-<UTC time>.sqlite` is copied to `chats-<UTC time>-<SHA-256 of the file>.sqlite`, or, encrypted, `chats-<UTC time>-<SHA-256>.<recipients>.sqlite.age`, where `<recipients>` is the first 16 hex digits of the SHA-256 of the sorted age recipients. A backup ADR 0238 rewrote is a new file with a new hash, so it is a new object; new recipients make every copy a new object too, so none is left that only a retired identity can open.
 - On every hourly check (the same task as the store backups and their clearing, and on the first one after startup), for each store whose region has a bucket:
   - unfinished multipart uploads under the store's prefix are aborted, since one cut off by a restart may hold rows that have since left the store;
   - the folder's backups are listed strictly (a folder or entry botd can't read is a failure, so the bucket isn't emptied to match a folder it couldn't list) and hashed, with each hash kept in memory while the file's size, time and inode are the same;
@@ -70,7 +70,7 @@ The copy has to stay in the region, or it breaks the pin it serves. It also has 
 - Unit (`machines/chat_store_copies.rs`):
   - settings: a bucket per region with a store and no other, the endpoint and keys each region needs, the shared prefix and age recipients, nothing set without a bucket, and the secret key kept as botd's own;
   - each backup is copied once, named by its SHA-256, byte for byte; a pass that changes nothing only lists; a backup pruned from the folder is deleted from the bucket; only changes are audited;
-  - with age recipients, copies are encrypted, decrypt with the identity to the backup, and are named by the plain file's hash;
+  - with age recipients, copies are encrypted, decrypt with the identity to the backup, and are named by the plain file's hash; new recipients replace every copy with one only they open;
   - in a versioned bucket, a backup rewritten without a moved Bot's rows replaces its copy, every version of the old copy is deleted, and the move is recorded as cleared only then: a bucket that refuses keeps it uncleared, warns, marks the report failing, audits the failure and leaves no parts;
   - unfinished uploads under the store's prefix are aborted, on every page of the listing, and others' are left; a folder botd can't list fails the pass and deletes nothing;
   - a store whose file is gone, or whose folder is empty, deletes nothing from its bucket, and the bucket is known to hold its backups from the oldest on;
