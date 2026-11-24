@@ -1318,6 +1318,17 @@ mod tests {
         let aws = vault(&[("VAULT_AUTH", "aws"), ("VAULT_AWS_REGION", "eu-west-2"), ("AWS_WEB_IDENTITY_TOKEN_FILE", "/var/run/token"), ("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/botd")]);
         assert_eq!(by(&aws, "AWS_ENDPOINT_URL_STS").host.as_deref(), Some("sts.eu-west-2.amazonaws.com"));
         assert!(vault(&[("VAULT_AUTH", "aws")]).iter().all(|x| x.setting.as_deref() != Some("AWS_ENDPOINT_URL_STS")), "Vault sends the login's STS request, not botd");
+        // Only the source botd takes its keys from is judged: settings for others can't fail the check.
+        let unused = [("AWS_CONTAINER_CREDENTIALS_FULL_URI", "not a url"), ("AWS_EC2_METADATA_SERVICE_ENDPOINT", "http://imds.example.com"), ("AWS_WEB_IDENTITY_TOKEN_FILE", "/var/run/token")];
+        for method in [("VAULT_AWS_CREDENTIALS", "env"), ("VAULT_AWS_CREDENTIALS", "chain")] {
+            let mut pairs = vec![("VAULT_AUTH", "aws"), method, ("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")];
+            pairs.extend_from_slice(&unused);
+            let f = vault(&pairs);
+            assert!(f.iter().all(|x| x.area != Area::Secrets || x.setting.as_deref() == Some("VAULT_ADDR")), "{method:?}: {f:?}");
+        }
+        let container = vault(&[("VAULT_AUTH", "aws"), ("AWS_CONTAINER_CREDENTIALS_FULL_URI", "https://creds.example.com/v1"), ("AWS_EC2_METADATA_SERVICE_ENDPOINT", "http://imds.example.com")]);
+        assert_eq!(by(&container, "AWS_CONTAINER_CREDENTIALS_FULL_URI").host.as_deref(), Some("creds.example.com"));
+        assert!(container.iter().all(|x| x.setting.as_deref() != Some("AWS_EC2_METADATA_SERVICE_ENDPOINT")), "the chain stops at the container");
         let azure = vault(&[("VAULT_AUTH", "azure"), ("VAULT_AZURE_CREDENTIALS", "client-secret")]);
         assert_eq!(by(&azure, "AZURE_AUTHORITY_HOST").status, Status::Internet);
         assert!(vault(&[]).iter().all(|x| x.area != Area::Secrets || x.setting.as_deref() == Some("VAULT_ADDR")), "a token reaches only Vault");

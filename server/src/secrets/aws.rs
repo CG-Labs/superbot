@@ -227,19 +227,41 @@ pub fn reaches(var: &dyn Fn(&str) -> String) -> Result<Vec<(&'static str, String
     if !var("AWS_WEB_IDENTITY_TOKEN_FILE").trim().is_empty() || !var("AWS_RUN_CREDENTIALS").trim().is_empty() {
         out.push(("AWS_ENDPOINT_URL_STS", sts, "AWS STS, for web identity and runs' sessions"));
     }
-    out.extend(credentials_reach(var)?);
+    out.extend(credentials_reach(var, "AWS_SECRETS_MANAGER_AUTH")?);
     Ok(out)
 }
 
-/// Where AWS's chain takes botd's keys from, beyond STS for web identity: the container's
-/// endpoint, and the instance metadata service when it is set (its default is link-local).
-pub fn credentials_reach(var: &dyn Fn(&str) -> String) -> Result<Vec<(&'static str, String, &'static str)>, String> {
+/// The source `source_from_env` takes botd's keys from, judged from the settings alone:
+/// the one `method_var` names, or for `chain` the first that is set, as it picks them.
+pub fn chosen_source(var: &dyn Fn(&str) -> String, method_var: &str) -> Result<&'static str, String> {
+    let set = |k: &str| !var(k).trim().is_empty();
+    Ok(match var(method_var).trim() {
+        "" | "chain" if set("AWS_ACCESS_KEY_ID") || set("AWS_ACCESS_KEY_ID_FILE") => "env",
+        "" | "chain" if set("AWS_WEB_IDENTITY_TOKEN_FILE") => "web-identity",
+        "" | "chain" if set("AWS_CONTAINER_CREDENTIALS_FULL_URI") || set("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") => "container",
+        "" | "chain" | "instance-profile" => "instance-profile",
+        "env" => "env",
+        "web-identity" => "web-identity",
+        "container" => "container",
+        other => return Err(format!("{method_var} must be chain, env, web-identity, container or instance-profile, not {other:?}")),
+    })
+}
+
+/// Where botd's keys come from beyond STS for web identity, for the source `method_var`
+/// chooses only: the container's endpoint, or the instance metadata service when it is set
+/// (its default is link-local).
+pub fn credentials_reach(var: &dyn Fn(&str) -> String, method_var: &str) -> Result<Vec<(&'static str, String, &'static str)>, String> {
     let mut out = Vec::new();
-    if let Some(url) = container_url(var)? {
-        out.push(("AWS_CONTAINER_CREDENTIALS_FULL_URI", url, "the container's credentials endpoint"));
-    }
-    if !var("AWS_EC2_METADATA_SERVICE_ENDPOINT").trim().is_empty() {
-        out.push(("AWS_EC2_METADATA_SERVICE_ENDPOINT", metadata_setting(&var("AWS_EC2_METADATA_SERVICE_ENDPOINT"))?, "the instance metadata service"));
+    match chosen_source(var, method_var)? {
+        "container" => {
+            if let Some(url) = container_url(var)? {
+                out.push(("AWS_CONTAINER_CREDENTIALS_FULL_URI", url, "the container's credentials endpoint"));
+            }
+        }
+        "instance-profile" if !var("AWS_EC2_METADATA_SERVICE_ENDPOINT").trim().is_empty() => {
+            out.push(("AWS_EC2_METADATA_SERVICE_ENDPOINT", metadata_setting(&var("AWS_EC2_METADATA_SERVICE_ENDPOINT"))?, "the instance metadata service"));
+        }
+        _ => {}
     }
     Ok(out)
 }

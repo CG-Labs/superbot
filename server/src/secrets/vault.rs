@@ -162,10 +162,10 @@ pub fn sign_in_reaches(var: &dyn Fn(&str) -> String) -> Result<Vec<(&'static str
     match var("VAULT_AUTH").trim() {
         "aws" => {
             let (_, _, sts) = aws_sts(var)?;
-            if !var("AWS_WEB_IDENTITY_TOKEN_FILE").trim().is_empty() && matches!(var("VAULT_AWS_CREDENTIALS").trim(), "" | "chain" | "web-identity") {
+            if aws::chosen_source(var, "VAULT_AWS_CREDENTIALS")? == "web-identity" {
                 out.push(("AWS_ENDPOINT_URL_STS", sts, "AWS STS, for botd's web identity"));
             }
-            out.extend(aws::credentials_reach(var)?);
+            out.extend(aws::credentials_reach(var, "VAULT_AWS_CREDENTIALS")?);
         }
         "gcp" => {
             out.extend(gcp::sign_in_reaches(var, "VAULT_GCP_CREDENTIALS", &var("VAULT_GCP_CREDENTIALS"))?);
