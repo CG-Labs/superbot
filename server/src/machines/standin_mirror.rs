@@ -148,6 +148,15 @@ impl Mirror {
         w.redirects.insert(path.into(), format!("{}/stored{path}", self.other));
     }
 
+    /// Answers `path` with a redirect to `/stored<path>` on this same host and port:
+    /// outside the registry's path, though npm's key for the host still matches.
+    pub fn redirect_within(&self, path: &str) {
+        let mut w = self.world.lock().unwrap();
+        let body = w.files[path].clone();
+        w.files.insert(format!("/stored{path}"), body);
+        w.redirects.insert(path.into(), format!("{}/stored{path}", self.url));
+    }
+
     pub fn ca_pem(&self) -> String {
         self.ca_pem.clone()
     }

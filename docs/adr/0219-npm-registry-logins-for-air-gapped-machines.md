@@ -57,7 +57,7 @@ The key is npm's own "nerf dart" for the registry, so npm sends the login to the
 
 ### `botctl machine mirror` signs in too
 
-`GET /api/machines/harness-mirror` fetches each package document and tarball with the login, as npm would. It sends it only to URLs under the registry, and not across a redirect to another host or port. A 401 or 403 from the registry says to check `MACHINE_NPM_TOKEN` or the username and password. A 401 with no login set says the registry wants one. Its output names the login's kind (`npmLogin`), never its value.
+`GET /api/machines/harness-mirror` fetches each package document and tarball with the login, as npm would. It sends it only to https URLs under the registry. With a login, it follows each redirect itself and checks where it goes first, so a redirect off the registry's path, even on the same host and port (where an HTTP client would keep the header), gets no login. Every hop is still listed for the firewall check. On machines, npm follows its own rules, which drop the login on another host. A 401 or 403 from the registry says to check `MACHINE_NPM_TOKEN` or the username and password. A 401 with no login set says the registry wants one. Its output names the login's kind (`npmLogin`), never its value.
 
 ### Considered
 
@@ -74,7 +74,7 @@ The key is npm's own "nerf dart" for the registry, so npm sends the login to the
 - Each machine install fetches the login once and records it in the audit log.
 - A machine whose agent is older fails nothing new: botd doesn't send it the plan until it is upgraded.
 - Tested:
-  - `mirror`: the settings' forms, the token trimmed, `_FILE`, a password with any characters, the refusals above, redaction and the masked `Debug`; the plan flag and its id; the check signing in only under the registry and not across a redirect, its hints for a missing or wrong login.
+  - `mirror`: the settings' forms, the token trimmed, `_FILE`, a password with any characters, the refusals above, redaction and the masked `Debug`; the plan flag and its id; the check signing in only under the registry and not across a redirect to another port or to another path on the same port, its hints for a missing or wrong login.
   - `tools`: the nerf dart, the `.npmrc` line and the characters it allows, refusing a login for another registry, scrubbing npm's errors, and the agent writing the file 0600 in a 0700 folder outside its tools, which stays so when the tools are opened mid-install, removing it after, and never saving it. A restart mid-install, with the login and an old `.dl/npmrc` left, opens the tools as loading the Bots' user does, and finds both gone and no readable file holding it. A login folder in the tools is refused, written with a trailing `/`, `.`, `..` or a link.
   - Upkeep: only agents that say `harness_mirror_login` are sent the plan, and nothing changes without a login. Enrollment: the settings need `MACHINE_CONTROL_URL`. Adapters: no Bot run inherits the secrets.
   - End to end on loopback: botd with a token and a registry that wants it. The check passes, a caller without a machine certificate is refused, the real agent fetches the login over mutual TLS and npm gets a 0600 userconfig, in a 0700 folder outside the tools, gone after the install, with only the registry's line, and the audit log records the kind but never the token.

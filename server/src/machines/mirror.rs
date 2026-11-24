@@ -248,25 +248,45 @@ pub fn under_registry(url: &str, registry: &str) -> bool {
     matches!((tools::nerf_dart(url), tools::nerf_dart(registry)), (Some(u), Some(r)) if u.starts_with(&r))
 }
 
-/// The check's requests, signed in to the registry as npm would be, and nowhere else.
-/// A redirect to another host or port drops the login (reqwest does), as npm does.
+/// The check's requests, signed in to the registry as npm would be, and nowhere else:
+/// not to a redirect off its host, port or path, nor over plain http.
 struct Fetch<'a> {
     http: reqwest::Client,
+    /// With a login: the same client, following no redirects, so each hop is checked
+    /// before the login goes with it.
+    by_hand: reqwest::Client,
+    hops: Arc<Mutex<Vec<String>>>,
     registry: &'a str,
     login: Option<&'a Login>,
 }
 
+/// The most redirects the check follows, as reqwest's policy below.
+const MAX_HOPS: usize = 10;
+
 impl Fetch<'_> {
     async fn get(&self, url: &str, accept: Option<&str>) -> Result<reqwest::Response, String> {
-        let mut req = self.http.get(url);
-        if let Some(a) = accept {
-            req = req.header("accept", a);
-        }
-        let ours = under_registry(url, self.registry);
-        if let Some(l) = self.login.filter(|_| ours) {
-            req = req.header("authorization", l.header());
-        }
-        let r = req.send().await.map_err(|e| format!("couldn't fetch {url}: {}", error_chain(&e.without_url())))?;
+        let fail = |e: reqwest::Error| format!("couldn't fetch {url}: {}", error_chain(&e.without_url()));
+        let (r, ours) = match self.login {
+            None => (self.send(&self.http, url, accept, None).await.map_err(fail)?, under_registry(url, self.registry)),
+            // A redirect may stay on the registry's host and port but leave its path,
+            // where reqwest would keep the login: so every hop is followed here.
+            Some(l) => {
+                let mut at = url::Url::parse(url).map_err(|e| format!("{url}: {e}"))?;
+                let mut hops = 0;
+                loop {
+                    let ours = at.scheme() == "https" && under_registry(at.as_str(), self.registry);
+                    let r = self.send(&self.by_hand, at.as_str(), accept, ours.then_some(l)).await.map_err(fail)?;
+                    let next = r.status().is_redirection().then(|| r.headers().get("location").and_then(|v| v.to_str().ok()).and_then(|v| at.join(v).ok())).flatten();
+                    let Some(next) = next else { break (r, ours) };
+                    hops += 1;
+                    if hops > MAX_HOPS {
+                        return Err(format!("couldn't fetch {url}: too many redirects"));
+                    }
+                    self.hops.lock().unwrap().push(next.to_string());
+                    at = next;
+                }
+            }
+        };
         let code = r.status();
         if ours && (code == StatusCode::UNAUTHORIZED || code == StatusCode::FORBIDDEN) {
             return Err(match self.login {
@@ -274,7 +294,18 @@ impl Fetch<'_> {
                 None => format!("the registry wants a login ({code}) for {url}: set MACHINE_NPM_TOKEN, or MACHINE_NPM_USERNAME and MACHINE_NPM_PASSWORD"),
             });
         }
-        r.error_for_status().map_err(|e| format!("couldn't fetch {url}: {}", error_chain(&e.without_url())))
+        r.error_for_status().map_err(fail)
+    }
+
+    async fn send(&self, http: &reqwest::Client, url: &str, accept: Option<&str>, login: Option<&Login>) -> reqwest::Result<reqwest::Response> {
+        let mut req = http.get(url);
+        if let Some(a) = accept {
+            req = req.header("accept", a);
+        }
+        if let Some(l) = login {
+            req = req.header("authorization", l.header());
+        }
+        req.send().await
     }
 }
 
@@ -361,9 +392,10 @@ pub async fn check(plan: &HarnessPlan, hermes: Option<&super::hermes_serve::Bund
     let seen = hops.clone();
     let follow = reqwest::redirect::Policy::custom(move |a| {
         seen.lock().unwrap().push(a.url().to_string());
-        if a.previous().len() >= 10 { a.error("too many redirects") } else { a.follow() }
+        if a.previous().len() >= MAX_HOPS { a.error("too many redirects") } else { a.follow() }
     });
-    let http = match tools::download_builder(None, plan.ca.as_deref()).and_then(|b| b.redirect(follow).build().map_err(|e| e.to_string())) {
+    let build = |policy| tools::download_builder(None, plan.ca.as_deref()).and_then(|b| b.redirect(policy).build().map_err(|e| e.to_string()));
+    let (http, by_hand) = match build(follow).and_then(|h| Ok((h, build(reqwest::redirect::Policy::none())?))) {
         Ok(h) => h,
         Err(e) => return json!({ "ok": false, "error": format!("the mirrors' CA: {e}"), "items": [] }),
     };
@@ -371,7 +403,7 @@ pub async fn check(plan: &HarnessPlan, hermes: Option<&super::hermes_serve::Bund
     if plan.npm_login && login.is_none() {
         return json!({ "ok": false, "error": "the plan's registry needs a login, and botd has none (MACHINE_NPM_TOKEN)", "items": [] });
     }
-    let http = Fetch { http, registry, login: login.filter(|_| plan.npm_login) };
+    let http = Fetch { http, by_hand, hops: hops.clone(), registry, login: login.filter(|_| plan.npm_login) };
     let item = |mut v: Value, res: Result<(), String>| {
         v["ok"] = json!(res.is_ok());
         if let Err(e) = res {
@@ -718,6 +750,7 @@ mod tests {
         let pin = mirror.package("@corp/fake-claude", "9.9.9", b"claude's tarball");
         mirror.package("fake-codex", "1.0.0", b"codex's tarball");
         mirror.redirect_to_other("/npm/fake-codex/-/fake-codex-1.0.0.tgz");
+        mirror.redirect_within("/npm/@corp/fake-claude/-/fake-claude-9.9.9.tgz");
         let token = Login::Token(Zeroizing::new("stand-in-token-7c1e".into()));
         mirror.require(&token.header());
         let plan = mirror.plan(&node, vec![("claude", "@corp/fake-claude", "9.9.9", Some(pin)), ("codex", "fake-codex", "1.0.0", None)]);
@@ -728,8 +761,11 @@ mod tests {
         assert_eq!(v["npmLogin"], "token", "{v}");
         let authorized = mirror.authorized();
         assert!(authorized.iter().any(|p| p == "/npm/@corp%2ffake-claude") && authorized.iter().any(|p| p == "/npm/@corp/fake-claude/-/fake-claude-9.9.9.tgz"), "{authorized:?}");
-        assert!(authorized.iter().all(|p| p.starts_with("/npm/")), "not to Node.js's mirror, nor to the storage a redirect sends it to: {authorized:?}");
-        assert!(mirror.calls().iter().any(|p| p.starts_with("/stored/")), "{:?}", mirror.calls());
+        assert!(authorized.iter().all(|p| p.starts_with("/npm/")), "not to Node.js's mirror, nor to the storage a redirect sends it to, on another port or this one: {authorized:?}");
+        let calls = mirror.calls();
+        assert!(calls.iter().any(|p| p == "/stored/npm/fake-codex/-/fake-codex-1.0.0.tgz") && calls.iter().any(|p| p == "/stored/npm/@corp/fake-claude/-/fake-claude-9.9.9.tgz"), "{calls:?}");
+        let within = format!("{}/stored/npm/@corp/fake-claude/-/fake-claude-9.9.9.tgz", mirror.url);
+        assert!(v["redirects"].as_array().unwrap().iter().any(|r| r == &json!(within)), "followed by hand, still checked for the firewall: {v}");
 
         // No login where the plan wants one, a login the registry refuses, and one the
         // plan doesn't ask for (not sent).
