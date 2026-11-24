@@ -10,7 +10,8 @@
 //! A log carries the exported line exactly (`line`), so the copy in Datadog checks itself
 //! with `botctl audit verify-lines`, and the line's fields as attributes (`superbot.*`,
 //! and Datadog's standard `evt`, `usr` and `network.client.ip`) for search and detections.
-//! Those come from the line as exported, so they never say more than it does.
+//! Those come from the line as exported, so they never say more than it does. The sink's
+//! labels (`AUDIT_EXPORT_LABELS`, ADR 0255) go as `ddtags`, beside the line.
 
 use crate::secrets::Secret;
 use serde_json::{json, Map, Value};
@@ -45,6 +46,8 @@ pub struct Datadog {
     key: Option<Secret>,
     /// The setting the key came from, for the startup line and status.
     key_from: String,
+    /// `ddtags` on every log, `key:value,...`, from `AUDIT_EXPORT_LABELS` (ADR 0255).
+    tags: Option<String>,
 }
 
 /// `datadoghq.com`, `datadoghq.eu`, `ddog-gov.com`, or a region of one: two letters and a
@@ -83,7 +86,7 @@ impl Datadog {
             return Err(bad(&format!("\"{site}\" isn't a Datadog site (datadoghq.com, us3.datadoghq.com, us5.datadoghq.com, datadoghq.eu, ap1.datadoghq.com, ap2.datadoghq.com, uk1.datadoghq.com, ddog-gov.com, ...: the site in your Datadog URL, without app.)")));
         }
         let url = intake_url(&intake(&site));
-        Ok(Datadog { site, url, key: None, key_from: String::new() })
+        Ok(Datadog { site, url, key: None, key_from: String::new(), tags: None })
     }
 
     /// The key from `var`, a header setting: `DD-API-KEY=<API key>` and nothing else.
@@ -107,6 +110,15 @@ impl Datadog {
         self.key.is_some()
     }
 
+    /// Tags every log carries, from the sink's labels (already checked, ADR 0255).
+    pub fn set_tags(&mut self, labels: &[(String, String)]) {
+        self.tags = (!labels.is_empty()).then(|| labels.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(","));
+    }
+
+    pub fn tags(&self) -> Option<&str> {
+        self.tags.as_deref()
+    }
+
     /// What logs, the API and the audit log show.
     pub fn shown(&self) -> String {
         format!("datadog://http-intake.logs.{}", self.site)
@@ -118,12 +130,14 @@ impl Datadog {
     }
 
     pub fn describe(&self) -> String {
-        format!("into Datadog Log Management through the Logs API (site {}), with the API key in {}", self.site, self.key_from)
+        let tagged = self.tags.as_deref().map(|t| format!(", tagged {t}")).unwrap_or_default();
+        format!("into Datadog Log Management through the Logs API (site {}), with the API key in {}{tagged}", self.site, self.key_from)
     }
 
     /// For `botctl audit siem`.
     pub fn view(&self) -> Value {
-        json!({ "site": self.site, "source": SOURCE, "apiKeyFrom": self.key_from })
+        let tags: Vec<&str> = self.tags.as_deref().map(|t| t.split(',').collect()).unwrap_or_default();
+        json!({ "site": self.site, "source": SOURCE, "apiKeyFrom": self.key_from, "tags": tags })
     }
 
     /// Sends to `base` instead: a stand-in for Datadog.
@@ -165,12 +179,16 @@ fn standard(line: &Value, log: &mut Map<String, Value>) {
 /// takes ([`MAX_AGE_MS`]). A line over [`MAX_LINE`] (an `audit.erased` listing many rows)
 /// goes as several logs instead, `linePart` 1 to n, each `line` a
 /// [`crate::audit_line::part`] that `botctl audit verify-lines` puts back together. Their
-/// `superbot.details` is left out: it is as big as the line.
-pub fn logs(line: &Value, text: &str, now_ms: i64) -> Vec<Value> {
+/// `superbot.details` is left out: it is as big as the line. `tags` are the sink's
+/// `ddtags`, the same on every log and never from the line.
+pub fn logs(line: &Value, text: &str, now_ms: i64, tags: Option<&str>) -> Vec<Value> {
     let action = line["action"].as_str().unwrap_or_default();
     let mut log = Map::new();
     log.insert("ddsource".into(), json!(SOURCE));
     log.insert("service".into(), json!(SOURCE));
+    if let Some(tags) = tags {
+        log.insert("ddtags".into(), json!(tags));
+    }
     if let Some(host) = line["host"].as_str() {
         log.insert("hostname".into(), json!(host));
     }
@@ -394,7 +412,7 @@ mod tests {
     #[test]
     fn logs_carry_the_line_whole_and_its_fields_as_attributes() {
         let (v, text, at) = event_line(json!({ "reason": "bad_password" }));
-        let ls = logs(&v, &text, at + 5_000);
+        let ls = logs(&v, &text, at + 5_000, None);
         assert_eq!(ls.len(), 1, "a short line goes whole");
         let l = &ls[0];
         assert_eq!((l["ddsource"].as_str(), l["service"].as_str(), l["hostname"].as_str(), l["message"].as_str()), (Some("superbot"), Some("superbot"), Some("host-1"), Some("auth.login_failed")));
@@ -405,13 +423,18 @@ mod tests {
         assert_eq!(l["line"].as_str(), Some(text.as_str()), "the line, byte for byte");
         assert_eq!(crate::audit_line::check(&serde_json::from_str(&text).unwrap()), Ok(crate::audit_line::Bound::All), "so it checks itself in Datadog");
 
-        let old = logs(&v, &text, at + 18 * 60 * 60 * 1000);
+        assert!(l.get("ddtags").is_none(), "no tags unless the sink has labels");
+        let tagged = &logs(&v, &text, at + 5_000, Some("env:prod,tenant:acme"))[0];
+        assert_eq!(tagged["ddtags"].as_str(), Some("env:prod,tenant:acme"));
+        assert_eq!((&tagged["line"], &tagged["superbot"]), (&l["line"], &l["superbot"]), "tags go beside the line, never in it");
+
+        let old = logs(&v, &text, at + 18 * 60 * 60 * 1000, None);
         assert!(old[0].get("timestamp").is_none(), "Datadog drops logs dated over 18 hours ago, so an old event goes undated");
         assert_eq!(old[0]["superbot"]["time"], v["time"]);
         assert_eq!(status("denied"), "warn");
         assert_eq!(status("success"), "info");
         let system = json!({ "action": "audit.checkpoint", "outcome": "success", "actorKind": "system" });
-        let l = &logs(&system, &system.to_string(), 0)[0];
+        let l = &logs(&system, &system.to_string(), 0, None)[0];
         assert!(l.get("usr").is_none() && l.get("network").is_none() && l.get("hostname").is_none(), "{l}");
 
         let many: Vec<Value> = (0..40).map(|i| json!({ "n": i, "line": "x".repeat(300) })).collect();
@@ -434,7 +457,7 @@ mod tests {
     fn a_line_too_long_for_one_log_goes_in_pieces_that_check_once_joined() {
         let (v, text, at) = event_line(json!({ "pad": "quoted \"é\" ".repeat(400) }));
         assert!(text.len() > MAX_LINE, "{}", text.len());
-        let ls = logs(&v, &text, at);
+        let ls = logs(&v, &text, at, None);
         assert!(ls.len() > 2, "{}", ls.len());
         for (i, l) in ls.iter().enumerate() {
             assert!(l["line"].as_str().unwrap().len() <= 2 * PART + 200, "piece {}", i + 1);
@@ -520,7 +543,7 @@ mod tests {
         }
         let scattered: Vec<i64> = (1_000..1_600).step_by(2).collect();
         let erased = app.db.with_conn(|c| crate::audit_chain::insert_erased(c, "p", &scattered)).unwrap();
-        let mut s = settings(&[("AUDIT_EXPORT", "dd=datadog://datadoghq.com"), ("AUDIT_EXPORT_HEADERS_DD", &header()), ("AUDIT_EXPORT_COMPRESS_DD", "gzip")]).unwrap();
+        let mut s = settings(&[("AUDIT_EXPORT", "dd=datadog://datadoghq.com"), ("AUDIT_EXPORT_HEADERS_DD", &header()), ("AUDIT_EXPORT_COMPRESS_DD", "gzip"), ("AUDIT_EXPORT_LABELS_DD", "env=prod,team=security")]).unwrap();
         s.sinks[0].datadog_mut().unwrap().point_at(&base);
         crate::audit_export::start(&app, s);
         let xs = app.audit_export.get().unwrap().clone();
@@ -535,6 +558,7 @@ mod tests {
         let report = lines_of(&logs);
         assert!(report.ok && report.hosts[0].events == ids.len() as u64, "botctl audit verify-lines passes on Datadog's copy: {report:?}");
         assert!(!serde_json::to_string(&logs).unwrap().contains(KEY), "no key in what was sent");
+        assert!(logs.iter().all(|l| l["ddtags"].as_str() == Some("env:prod,team:security")), "every log, pieces too, carries the sink's tags");
 
         // A key Datadog refuses: it fails with what to do, and waits.
         let failing = || app.db.audit_events(&crate::audit::Filter { actions: vec!["audit.export_failing".into()], ..Default::default() }, 10, false);
@@ -549,6 +573,7 @@ mod tests {
         assert_eq!(xs.delivered(), before, "the cursor stays");
         let v = xs.view(app.db.audit_head());
         assert_eq!((v["kind"].as_str(), v["failing"].as_bool(), v["datadog"]["site"].as_str(), v["datadog"]["apiKeyFrom"].as_str(), v["compress"].as_str()), (Some("datadog"), Some(true), Some("datadoghq.com"), Some("AUDIT_EXPORT_HEADERS_DD"), Some("gzip")), "{v}");
+        assert_eq!(v["datadog"]["tags"], json!(["env:prod", "team:security"]), "{v}");
         let mut metrics = String::new();
         crate::audit_export::render(&app, &mut metrics);
         assert!(metrics.contains("superbot_audit_export_failing{kind=\"datadog\",name=\"dd\"} 1"), "{metrics}");

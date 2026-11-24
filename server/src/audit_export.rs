@@ -121,6 +121,68 @@ pub(crate) fn compress_from(var: &str, raw: &str) -> Result<Option<bool>, String
     }
 }
 
+/// Labels a sink takes at most (ADR 0255).
+const MAX_LABELS: usize = 10;
+/// Keys a Datadog log already has, or that Datadog reserves for its own correlation.
+const RESERVED_LABELS: [&str; 4] = ["host", "source", "service", "device"];
+
+/// `key=value,key=value` for a Datadog or Google SecOps sink (ADR 0255), in order; `off`
+/// for none, so a named sink can opt out of the server-wide setting. None when unset.
+/// Keys are lowercase letters, digits, `_` and `-`, starting with a letter; values are
+/// lowercase letters, digits and `_-.:/`. Lowercase because Datadog lowercases tags, so a
+/// label reads the same in both.
+pub(crate) fn labels_from(var: &str, raw: &str) -> Result<Option<Vec<(String, String)>>, String> {
+    let raw = raw.trim();
+    match raw.to_ascii_lowercase().as_str() {
+        "" => return Ok(None),
+        "off" => return Ok(Some(Vec::new())),
+        _ => {}
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    for pair in raw.split(',').map(str::trim) {
+        let shown = crate::audit::clip(pair, 40);
+        let Some((k, v)) = pair.split_once('=').map(|(k, v)| (k.trim(), v.trim())) else {
+            return Err(format!("{var} is key=value pairs split by commas, such as env=prod,tenant=acme, not \"{shown}\""));
+        };
+        let key_ok = (1..=63).contains(&k.len()) && k.starts_with(|c: char| c.is_ascii_lowercase()) && k.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+        if !key_ok {
+            return Err(format!("{var}: a label's key is 1 to 63 lowercase letters, digits, _ and -, starting with a letter, not \"{}\"", crate::audit::clip(k, 40)));
+        }
+        if RESERVED_LABELS.contains(&k) {
+            return Err(format!("{var}: \"{k}\" is botd's or Datadog's own (host, source, service and device are), so pick another key"));
+        }
+        let value_ok = (1..=128).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-.:/".contains(&b));
+        if !value_ok {
+            return Err(format!("{var}: the value of {k} is 1 to 128 lowercase letters, digits and _-.:/, not \"{}\"", crate::audit::clip(v, 40)));
+        }
+        if out.iter().any(|(o, _)| o == k) {
+            return Err(format!("{var} gives {k} twice"));
+        }
+        out.push((k.to_string(), v.to_string()));
+    }
+    if out.len() > MAX_LABELS {
+        return Err(format!("{var} has {} labels; a sink takes up to {MAX_LABELS}", out.len()));
+    }
+    Ok(Some(out))
+}
+
+/// A Google SecOps environment namespace (ADR 0255): letters, digits, `_` and `-`, starting
+/// with a letter; `off` for none. None when unset.
+pub(crate) fn namespace_from(var: &str, raw: &str) -> Result<Option<Option<String>>, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if raw.eq_ignore_ascii_case("off") {
+        return Ok(Some(None));
+    }
+    let ok = raw.len() <= 63 && raw.starts_with(|c: char| c.is_ascii_alphabetic()) && raw.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if !ok {
+        return Err(format!("{var} is a SecOps namespace, 1 to 63 letters, digits, _ and -, starting with a letter, not \"{}\"", crate::audit::clip(raw, 40)));
+    }
+    Ok(Some(Some(raw.to_string())))
+}
+
 impl std::fmt::Debug for Sink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Sink({})", self.shown)
@@ -287,6 +349,59 @@ fn compression(sinks: &mut [Sink], get: &dyn Fn(&str) -> String) -> Result<(), S
     Ok(())
 }
 
+/// `AUDIT_EXPORT_LABELS` for every Datadog and Google SecOps sink, and
+/// `AUDIT_EXPORT_LABELS_<NAME>` for a named one, which wins; `AUDIT_EXPORT_NAMESPACE` and
+/// `_<NAME>` the same for SecOps (ADR 0255). They go beside the line, never in it, so a sink
+/// that sends the line alone has nowhere to put them, and a setting for one stops botd
+/// rather than look as if it did something.
+fn labelling(sinks: &mut [Sink], get: &dyn Fn(&str) -> String) -> Result<(), String> {
+    const LABELS_FOR: &str = "is for datadog and google-secops sinks";
+    const NAMESPACE_FOR: &str = "is for google-secops sinks";
+    let all = labels_from("AUDIT_EXPORT_LABELS", &get("AUDIT_EXPORT_LABELS"))?;
+    let all_ns = namespace_from("AUDIT_EXPORT_NAMESPACE", &get("AUDIT_EXPORT_NAMESPACE"))?;
+    for s in sinks.iter_mut() {
+        let labels = match s.name.as_deref().map(|n| own("AUDIT_EXPORT_LABELS", n)) {
+            Some(var) => labels_from(&var, &get(&var))?.map(|l| (var, l)),
+            None => None,
+        };
+        let ns = match s.name.as_deref().map(|n| own("AUDIT_EXPORT_NAMESPACE", n)) {
+            Some(var) => namespace_from(&var, &get(&var))?.map(|n| (var, n)),
+            None => None,
+        };
+        let why = match &s.kind {
+            Kind::Webhook { .. } | Kind::Syslog { .. } => "webhook and syslog sinks send the line alone",
+            Kind::Monitor(_) => "Azure Monitor's columns are its DCR's",
+            Kind::Archive(_) => "the archive's objects are the lines alone",
+            Kind::Datadog(_) => "Datadog has no namespaces; use a label",
+            Kind::SecOps(_) => "",
+        };
+        match &mut s.kind {
+            Kind::Datadog(d) => {
+                if let Some((var, _)) = ns {
+                    return Err(format!("{var} {NAMESPACE_FOR}; {why}"));
+                }
+                d.set_tags(&labels.map(|(_, l)| l).or(all.clone()).unwrap_or_default());
+            }
+            Kind::SecOps(g) => g.set_labels(&labels.map(|(_, l)| l).or(all.clone()).unwrap_or_default(), ns.map(|(_, n)| n).or(all_ns.clone()).flatten()),
+            _ => {
+                if let Some((var, _)) = labels {
+                    return Err(format!("{var} {LABELS_FOR}; {why}"));
+                }
+                if let Some((var, _)) = ns {
+                    return Err(format!("{var} {NAMESPACE_FOR}; {why}"));
+                }
+            }
+        }
+    }
+    if all.as_ref().is_some_and(|l| !l.is_empty()) && !sinks.iter().any(|s| matches!(s.kind, Kind::Datadog(_) | Kind::SecOps(_))) {
+        return Err(format!("AUDIT_EXPORT_LABELS {LABELS_FOR}, and AUDIT_EXPORT has none: webhook, syslog and archive sinks send the line alone, and Azure Monitor's columns are its DCR's"));
+    }
+    if all_ns.as_ref().is_some_and(Option::is_some) && !sinks.iter().any(|s| matches!(s.kind, Kind::SecOps(_))) {
+        return Err(format!("AUDIT_EXPORT_NAMESPACE {NAMESPACE_FOR}, and AUDIT_EXPORT has none"));
+    }
+    Ok(())
+}
+
 /// Where to start a sink the database has no cursor for: every event kept (`all`, the
 /// default) or only those from now on (`new`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -413,6 +528,7 @@ impl Settings {
             }
         }
         compression(&mut sinks, get)?;
+        labelling(&mut sinks, get)?;
         Ok(Settings { sinks, start })
     }
 
@@ -868,7 +984,7 @@ impl Out {
         }
         if let (Out::SecOps(client), Kind::SecOps(g)) = (&mut *self, &sink.kind) {
             let at = now();
-            let logs: Vec<Value> = rows.iter().map(|e| crate::audit_secops::log(&line_with(e, host, extras.get(&e.id), e.id > sealed_after), &e.time, &crate::audit_secops::collected(e.at, at))).collect();
+            let logs: Vec<Value> = rows.iter().map(|e| g.log(&line_with(e, host, extras.get(&e.id), e.id > sealed_after), &e.time, &crate::audit_secops::collected(e.at, at))).collect();
             return client.send(g, &logs).await.map(|()| None);
         }
         if let (Out::Datadog(client), Kind::Datadog(d)) = (&mut *self, &sink.kind) {
@@ -877,7 +993,7 @@ impl Out {
                 .iter()
                 .flat_map(|e| {
                     let v = line_value(e, host, extras.get(&e.id), e.id > sealed_after);
-                    crate::audit_datadog::logs(&v, &v.to_string(), at)
+                    crate::audit_datadog::logs(&v, &v.to_string(), at, d.tags())
                 })
                 .collect();
             return client.send(d, &logs, sink.gzip).await.map(|()| None);
@@ -1205,6 +1321,78 @@ pub(crate) mod tests {
         assert!(e.contains("AUDIT_EXPORT_COMPRESS_VAULT is for https, azure-monitor and datadog sinks; the archive's is AUDIT_EXPORT_S3_COMPRESS"), "{e}");
         let s = with_archive(&[("AUDIT_EXPORT", "s3://audit-archive/prod"), ("AUDIT_EXPORT_S3_COMPRESS", "gzip")]).unwrap();
         assert_eq!(Exporter::new(s.sinks.into_iter().next().unwrap(), 0).view(0)["compress"], "gzip", "the archive's shows the same way");
+    }
+
+    #[test]
+    fn labels_are_for_datadog_and_secops_and_a_named_sinks_own_wins() {
+        const DD: &str = "DD-API-KEY=0a1b2c3d4e5f60718293a4b5c6d7e8f9";
+        const SECOPS: &str = "google-secops://eu/proj-secops-1/01234567-89ab-cdef-0123-456789abcdef/SUPERBOT_AUDIT";
+        let list = format!("dd=datadog://datadoghq.eu,us=datadog://datadoghq.com,secops={SECOPS},splunk=https://hec.example.net/raw");
+        let s = with_archive(&[
+            ("AUDIT_EXPORT", &format!("{list},s3://audit-archive/prod")),
+            ("AUDIT_EXPORT_HEADERS_DD", DD),
+            ("AUDIT_EXPORT_HEADERS_US", DD),
+            ("AUDIT_EXPORT_LABELS", " env=prod , tenant=acme "),
+            ("AUDIT_EXPORT_LABELS_US", "off"),
+            ("AUDIT_EXPORT_NAMESPACE", "Prod-EU"),
+        ])
+        .unwrap();
+        let views: Vec<Value> = s.sinks.into_iter().map(|s| Exporter::new(s, 0).view(0)).collect();
+        assert_eq!(views[0]["datadog"]["tags"], json!(["env:prod", "tenant:acme"]), "the server-wide labels");
+        assert_eq!(views[1]["datadog"]["tags"], json!([]), "off for this sink");
+        assert_eq!((&views[2]["googleSecOps"]["labels"], &views[2]["googleSecOps"]["namespace"]), (&json!({ "env": "prod", "tenant": "acme" }), &json!("Prod-EU")));
+        assert!(views[3].get("datadog").is_none() && views[4].get("archive").is_some(), "the webhook and the archive send the line alone");
+
+        let s = settings(&[
+            ("AUDIT_EXPORT", &format!("dd=datadog://datadoghq.eu,secops={SECOPS}")),
+            ("AUDIT_EXPORT_HEADERS_DD", DD),
+            ("AUDIT_EXPORT_LABELS_DD", "team:security=soc"),
+            ("AUDIT_EXPORT_LABELS_SECOPS", "tenant=acme,region=eu-west/2"),
+            ("AUDIT_EXPORT_NAMESPACE_SECOPS", "prod"),
+        ]);
+        assert!(s.unwrap_err().contains("AUDIT_EXPORT_LABELS_DD: a label's key is 1 to 63 lowercase letters"), "a colon would split a Datadog tag elsewhere");
+        let s = settings(&[
+            ("AUDIT_EXPORT", &format!("dd=datadog://datadoghq.eu,secops={SECOPS}")),
+            ("AUDIT_EXPORT_HEADERS_DD", DD),
+            ("AUDIT_EXPORT_LABELS_DD", "team=security"),
+            ("AUDIT_EXPORT_LABELS_SECOPS", "tenant=acme,region=eu-west/2"),
+            ("AUDIT_EXPORT_NAMESPACE_SECOPS", "prod"),
+        ])
+        .unwrap();
+        let d = s.describe();
+        assert!(d.contains("with the API key in AUDIT_EXPORT_HEADERS_DD, tagged team:security"), "{d}");
+        assert!(d.contains("log type SUPERBOT_AUDIT, labelled tenant=acme,region=eu-west/2, in namespace prod)"), "{d}");
+        for leftover in [("AUDIT_EXPORT_LABELS", "env=prod"), ("AUDIT_EXPORT_NAMESPACE", "prod"), ("AUDIT_EXPORT_LABELS", "BAD")] {
+            assert!(settings(&[leftover]).is_ok(), "a leftover setting doesn't matter while export is off: {leftover:?}");
+        }
+        assert!(settings(&[("AUDIT_EXPORT", "https://siem.example.net/in"), ("AUDIT_EXPORT_LABELS", "off")]).is_ok(), "off asks for nothing");
+
+        let dd = "dd=datadog://datadoghq.eu";
+        let eleven = (0..11).map(|i| format!("k{i}=v")).collect::<Vec<_>>().join(",");
+        for (vars, why) in [
+            (vec![("AUDIT_EXPORT", "https://siem.example.net/in"), ("AUDIT_EXPORT_LABELS", "env=prod")], "AUDIT_EXPORT_LABELS is for datadog and google-secops sinks, and AUDIT_EXPORT has none"),
+            (vec![("AUDIT_EXPORT", "https://siem.example.net/in"), ("AUDIT_EXPORT_NAMESPACE", "prod")], "AUDIT_EXPORT_NAMESPACE is for google-secops sinks, and AUDIT_EXPORT has none"),
+            (vec![("AUDIT_EXPORT", "a=https://a.example.net/in"), ("AUDIT_EXPORT_LABELS_A", "env=prod")], "AUDIT_EXPORT_LABELS_A is for datadog and google-secops sinks; webhook and syslog sinks send the line alone"),
+            (vec![("AUDIT_EXPORT", "soc=syslog+tls://soc.example.net"), ("AUDIT_EXPORT_NAMESPACE_SOC", "prod")], "AUDIT_EXPORT_NAMESPACE_SOC is for google-secops sinks"),
+            (vec![("AUDIT_EXPORT", dd), ("AUDIT_EXPORT_HEADERS_DD", DD), ("AUDIT_EXPORT_NAMESPACE_DD", "prod")], "AUDIT_EXPORT_NAMESPACE_DD is for google-secops sinks; Datadog has no namespaces; use a label"),
+            (vec![("AUDIT_EXPORT", dd), ("AUDIT_EXPORT_HEADERS_DD", DD), ("AUDIT_EXPORT_LABELS", "env")], "AUDIT_EXPORT_LABELS is key=value pairs split by commas"),
+            (vec![("AUDIT_EXPORT", dd), ("AUDIT_EXPORT_HEADERS_DD", DD), ("AUDIT_EXPORT_LABELS", "env=prod,,x=y")], "is key=value pairs"),
+            (vec![("AUDIT_EXPORT", dd), ("AUDIT_EXPORT_HEADERS_DD", DD), ("AUDIT_EXPORT_LABELS", "Env=prod")], "a label's key is 1 to 63 lowercase letters"),
+            (vec![("AUDIT_EXPORT", dd), ("AUDIT_EXPORT_HEADERS_DD", DD), ("AUDIT_EXPORT_LABELS", "1env=prod")], "starting with a letter"),
+            (vec![("AUDIT_EXPORT", dd), ("AUDIT_EXPORT_HEADERS_DD", DD), ("AUDIT_EXPORT_LABELS", "env=Prod")], "the value of env is 1 to 128 lowercase letters"),
+            (vec![("AUDIT_EXPORT", dd), ("AUDIT_EXPORT_HEADERS_DD", DD), ("AUDIT_EXPORT_LABELS", "env=a b")], "the value of env"),
+            (vec![("AUDIT_EXPORT", dd), ("AUDIT_EXPORT_HEADERS_DD", DD), ("AUDIT_EXPORT_LABELS", "env=")], "the value of env"),
+            (vec![("AUDIT_EXPORT", dd), ("AUDIT_EXPORT_HEADERS_DD", DD), ("AUDIT_EXPORT_LABELS", "service=x")], "\"service\" is botd's or Datadog's own"),
+            (vec![("AUDIT_EXPORT", dd), ("AUDIT_EXPORT_HEADERS_DD", DD), ("AUDIT_EXPORT_LABELS", "env=a,env=b")], "gives env twice"),
+            (vec![("AUDIT_EXPORT", dd), ("AUDIT_EXPORT_HEADERS_DD", DD), ("AUDIT_EXPORT_LABELS", &eleven)], "has 11 labels; a sink takes up to 10"),
+            (vec![("AUDIT_EXPORT", SECOPS), ("AUDIT_EXPORT_NAMESPACE", "1prod")], "AUDIT_EXPORT_NAMESPACE is a SecOps namespace"),
+            (vec![("AUDIT_EXPORT", SECOPS), ("AUDIT_EXPORT_NAMESPACE", "prod eu")], "is a SecOps namespace"),
+        ] {
+            let e = settings(&vars).unwrap_err();
+            assert!(e.contains(why), "{vars:?}: {e}");
+        }
+        let e = with_archive(&[("AUDIT_EXPORT", "vault=s3://audit-archive/prod"), ("AUDIT_EXPORT_LABELS_VAULT", "env=prod")]).unwrap_err();
+        assert!(e.contains("AUDIT_EXPORT_LABELS_VAULT is for datadog and google-secops sinks; the archive's objects are the lines alone"), "{e}");
     }
 
     #[test]
