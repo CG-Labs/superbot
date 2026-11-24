@@ -171,21 +171,23 @@ Off by default ([ADR 0185](../adr/0185-short-lived-credentials-per-run.md)). Wit
 vault secrets enable aws
 vault write aws/config/root access_key=... secret_key=... region=eu-west-2
 vault write aws/roles/bots credential_type=iam_user policy_arns=arn:aws:iam::aws:policy/ReadOnlyAccess \
-  default_ttl=75m max_ttl=75m
+  default_ttl=15m max_ttl=75m
 
 vault secrets enable database
-vault write database/roles/u-u1a2b3c4d db_name=app default_ttl=75m max_ttl=75m \
+vault write database/roles/u-u1a2b3c4d db_name=app default_ttl=15m max_ttl=75m \
   creation_statements="CREATE ROLE \"{{name}}\" LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}'; GRANT app_read TO \"{{name}}\";"
 
 vault policy write superbot-runs - <<'EOF'
 path "aws/creds/bots"                       { capabilities = ["read"] }
 path "database/creds/u-*"                   { capabilities = ["read"] }
+path "sys/leases/renew/aws/creds/bots/*"    { capabilities = ["update"] }
+path "sys/leases/renew/database/creds/u-*"  { capabilities = ["update"] }
 path "sys/leases/revoke/aws/creds/bots/*"   { capabilities = ["update"] }
 path "sys/leases/revoke/database/creds/u-*" { capabilities = ["update"] }
 EOF
 ```
 
-botd revokes with `sys/leases/revoke/<lease id>`, so the policy lets it revoke only leases from its own paths. Add `superbot-runs` to botd's role (`token_policies=superbot,superbot-runs`), then in `.env`:
+botd renews with `sys/leases/renew/<lease id>` and revokes with `sys/leases/revoke/<lease id>`, so the policy lets it renew and revoke only leases from its own paths. Add `superbot-runs` to botd's role (`token_policies=superbot,superbot-runs`), then in `.env`:
 
 ```sh
 VAULT_RUN_CREDENTIALS="aws/creds/bots AWS_ACCESS_KEY_ID=access_key AWS_SECRET_ACCESS_KEY=secret_key AWS_SESSION_TOKEN=security_token; database/creds/u-{owner} PGUSER=username PGPASSWORD=password"
@@ -194,14 +196,26 @@ VAULT_RUN_CREDENTIALS="aws/creds/bots AWS_ACCESS_KEY_ID=access_key AWS_SECRET_AC
 - **Format**: entries separated by `;` or new lines. Each is a Vault path, then `NAME=field` pairs: the variable the run gets and the field of Vault's answer it comes from. At most 16 paths; each name once.
 - **`{owner}`** is the Bot owner's id (`botctl users`), so each user's Bots can get their own role. Those paths are read only for runs that get the owner's own secrets, not a teammate's run of an isolated shared Bot.
 - **Order**: these win over static secrets of the same name, and runs never inherit these names from botd's own environment. A field that is null or empty (`security_token` for an IAM user) leaves the name unset in the run, even if a static secret has it; a field that isn't in the answer refuses the run, as it is probably a typo.
-- **TTL**: botd revokes each lease when its run ends. If it can't (Vault down, botd stopped mid-run), the lease ends at the role's TTL. Set `default_ttl` a little over your longest run (`RUN_TIMEOUT_MINUTES`, 60 by default), not a day, and no shorter, or a credential can lapse mid-run.
+- **TTL**: botd revokes each lease when its run ends. If it can't (Vault down, botd stopped mid-run), the lease ends at its TTL. Keep `default_ttl` short (minutes) and set `max_ttl` over your longest run (`RUN_TIMEOUT_MINUTES`, 60 by default) plus five minutes: botd renews the lease while the run lasts (see [below](#renewing-leases-for-long-runs)), so a lease it can't revoke ends within `default_ttl` of its last renewal.
 - **botd's own token**: Vault revokes a token's leases when the token ends. Before each lease botd makes sure its token lives past the longest run (`RUN_TIMEOUT_MINUTES` plus five minutes), renewing it or logging in again. If the token can't (its `token_max_ttl` or `-period` is shorter), the run is refused. Keep botd's `token_max_ttl` well over the longest run, and Vault's `default` policy on botd's token, which allows `lookup-self` and `renew-self`.
 - **Fails closed**: if a lease can't be made, the run doesn't start (`bot.run_refused`, reason `secrets_unavailable`) and leases already made for it are revoked.
 - **Model provider keys**: a plan's provider key (`keySecret` in the tiers file) can come from a lease alone. If the lease gives it empty, the run is refused as above.
-- **Audit**: `botctl audit --action 'secret.lease_*'` shows each lease made (`secret.lease_issued`, with path, lease id, TTL and the variable names) and revoked (`secret.lease_revoked`), never a value. For a lease botd couldn't revoke, `vault lease revoke <lease id>` ends it now.
+- **Audit**: `botctl audit --action 'secret.lease_*'` shows each lease made (`secret.lease_issued`, with path, lease id, TTL and the variable names), renewed (`secret.lease_renewed`) and revoked (`secret.lease_revoked`), never a value. For a lease botd couldn't revoke, `vault lease revoke <lease id>` ends it now.
 - **Redaction**: the values are redacted from everything botd saves and shows while a lease that has them lives, and forgotten once Vault has revoked the last one (unless botd knew the value already).
 
 botd doesn't make a lease at startup, so a wrong path or missing policy shows on the first run. The startup line and `botctl secrets backend` list the paths (`runCredentials`). Only `SECRETS_BACKEND=vault` reads the setting.
+
+### Renewing leases for long runs
+
+([ADR 0221](../adr/0221-renewing-vault-leases-for-long-runs.md).) A renewable lease whose TTL is shorter than the longest run (`RUN_TIMEOUT_MINUTES` plus five minutes) is renewed while its run lasts. Nothing to turn on; leases that already last that long aren't renewed.
+
+- **When**: two thirds of the way through each TTL, asking for the TTL the lease was made with (the role's `default_ttl`), and never past the run's latest end. When the run ends botd stops renewing, then revokes.
+- **Max TTL**: Vault won't renew a lease past the role's `max_ttl`. When it gives less than asked, that renewal is the last, and if the lease then ends before the run could, **the run stops** when it does: the Bot says its short-lived credentials expired. So keep `max_ttl` over `RUN_TIMEOUT_MINUTES` plus five minutes. The same goes for a lease Vault made not renewable (AWS `assumed_role` and `federation_token` credentials): its TTL must cover a run, or the run stops when it ends.
+- **Policy**: botd needs `update` on `sys/leases/renew/<path>/*` for each listed path, as above. Without it the first renewal is refused (`error: refused`, and the server log names the missing capability), and the run stops when its lease ends.
+- **Vault down**: a failed renewal is tried again, every few seconds up to thirty, until the lease runs out; then the run stops. The lease never outlives its TTL because botd couldn't reach Vault, and a renewal that hangs doesn't hold the run past the lease's current end.
+- **Audit**: each renewal is `secret.lease_renewed` with the lease id, the `increment` asked for, the `ttl` Vault gave and `expiresAt`; the one that hit the max TTL has `final: true`. Failures have `error`: `refused`, `unavailable`, or `expired` when the lease ran out while renewals failed. A one-hour run with a 15-minute `default_ttl` renews each lease about six times.
+
+botd's own token must still outlive the run (see above): Vault ends a token's leases with it, renewed or not.
 
 ## Day to day
 

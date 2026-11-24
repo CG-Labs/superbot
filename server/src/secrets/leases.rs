@@ -27,13 +27,20 @@
 //!   accounts botd impersonates (`generateAccessToken`), which can't be revoked either.
 //! - With `AZURE_RUN_CREDENTIALS` (ADR 0213) they are Entra access tokens of apps that
 //!   trust botd's managed identity or workload identity, which can't be revoked either.
+//! - A renewable lease that would end before the run could (ADR 0221) is renewed while
+//!   the run lasts, two thirds of the way through each TTL, by the TTL it was made with,
+//!   so a role's short `default_ttl` bounds how long a credential outlives botd. Each
+//!   renewal is audited (`secret.lease_renewed`). A lease the backend won't renew past a
+//!   point (its `max_ttl`), or that ends while renewals fail, stops the run when it ends,
+//!   as an STS session does.
 
 use super::external::{self, Scope};
 use super::{check_name, redact, Error, Secret};
 use crate::audit::{Event, Outcome};
 use serde_json::json;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 use zeroize::Zeroizing;
 
 /// The most paths one run asks for.
@@ -42,6 +49,11 @@ pub const MAX_PATHS: usize = 16;
 pub const OWNER: &str = "{owner}";
 /// A lease's TTL as kept here, at most a year, so arithmetic on it can't overflow.
 const MAX_TTL: u64 = 86_400 * 366;
+/// How much longer than a run renewals keep its leases alive: the run's end, its
+/// harness's exit and the revoke all come after the timeout.
+const RENEW_MARGIN: Duration = Duration::from_secs(300);
+/// The longest wait before a failed renewal is tried again.
+const RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// One field of a lease, as the backend answered.
 #[derive(Debug)]
@@ -62,6 +74,15 @@ pub struct Lease {
     pub fields: Vec<Field>,
 }
 
+/// What the backend said to a renewal.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Renewal {
+    /// The lease now lasts `ttl` seconds more; not `renewable` if that was its last.
+    Renewed { ttl: u64, renewable: bool },
+    /// The backend won't renew it (gone, not renewable, not allowed): it ends when it would have.
+    Refused(String),
+}
+
 /// A backend that makes and revokes leases. Errors carry no value.
 pub trait Issuer: Send + Sync {
     fn kind(&self) -> &'static str;
@@ -72,6 +93,11 @@ pub trait Issuer: Send + Sync {
     /// False when leases can't be ended early (STS sessions): they last their TTL.
     fn revocable(&self) -> bool {
         true
+    }
+    /// Asks for `lease_id` to last `increment` more. An error may pass (the backend is
+    /// down) and is tried again; `Refused` is final.
+    fn renew(&self, _lease_id: &str, _increment: Duration) -> Result<Renewal, Error> {
+        Ok(Renewal::Refused(format!("{} leases can't be renewed", self.kind())))
     }
 }
 
@@ -259,6 +285,48 @@ pub struct Leases {
     held: Vec<Held>,
     /// Names whose field was empty: the run must not have them at all.
     cleared: Vec<String>,
+    /// When the first of these leases ends for good, once that is known: it can't be
+    /// revoked, can't be renewed (any more), or ran out while renewals failed.
+    ends: Arc<watch::Sender<Option<Instant>>>,
+    /// Keeps renewable leases alive while the run lasts; stopped before they are revoked.
+    renewer: Option<Renewer>,
+}
+
+struct Renewer {
+    /// Dropped to stop the thread.
+    stop: mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl Renewer {
+    fn stop(self) {
+        drop(self.stop);
+        let _ = self.thread.join();
+    }
+}
+
+/// A run's lease that is renewed while the run lasts.
+struct Renewing {
+    id: String,
+    path: String,
+    bot_id: String,
+    owner: Option<String>,
+    /// The TTL it was made with, asked for again at each renewal, so a lease botd stops
+    /// renewing ends no later than that.
+    increment: Duration,
+    expires: Instant,
+    due: Instant,
+}
+
+/// Moves `ends` to `at` if that is sooner.
+fn end_by(ends: &watch::Sender<Option<Instant>>, at: Instant) {
+    ends.send_if_modified(|e| {
+        let sooner = e.is_none_or(|e| at < e);
+        if sooner {
+            *e = Some(at);
+        }
+        sooner
+    });
 }
 
 struct Held {
@@ -274,7 +342,7 @@ struct Held {
 
 impl Leases {
     pub fn none() -> Leases {
-        Leases { issuer: None, held: Vec::new(), cleared: Vec::new() }
+        Leases { issuer: None, held: Vec::new(), cleared: Vec::new(), ends: Arc::new(watch::channel(None).0), renewer: None }
     }
 
     /// Names to take out of the run's environment: their lease gave no value, and an
@@ -283,14 +351,33 @@ impl Leases {
         &self.cleared
     }
 
-    /// When the first of these leases that can't be revoked expires (STS sessions): the run
-    /// must stop by then, or it would go on with keys that no longer work. None for leases
-    /// that are revoked at run end.
+    /// When the first of these leases ends as things stand: the run must stop by then, or
+    /// it would go on with credentials that no longer work. A renewed lease's end moves
+    /// later only once a renewal succeeds, so a hung or failing renewal never outlasts it.
+    /// None when no lease ends by itself (those revoked at run end with no TTL).
+    #[cfg(test)]
     pub fn expires_first(&self) -> Option<Instant> {
-        if self.issuer.as_ref().is_none_or(|i| i.revocable()) {
-            return None;
+        *self.ends.borrow()
+    }
+
+    /// `expires_first`, as it changes while the run lasts.
+    pub fn ends(&self) -> watch::Receiver<Option<Instant>> {
+        self.ends.subscribe()
+    }
+
+    /// Starts renewing `due` leases until `deadline`, or the run ends; `fixed` is when the
+    /// first of the run's other leases ends. If no thread can be started they can't be
+    /// renewed, and the run stops when the first ends, as `ends` already says.
+    fn renew(&mut self, issuer: Arc<dyn Issuer>, due: Vec<Renewing>, fixed: Option<Instant>, deadline: Instant) {
+        if due.is_empty() {
+            return;
         }
-        self.held.iter().map(|h| h.expires).min()
+        let (stop, stopped) = mpsc::channel();
+        let ends = Arc::clone(&self.ends);
+        match std::thread::Builder::new().name("lease-renewer".into()).spawn(move || renew_until(issuer.as_ref(), due, fixed, deadline, &ends, &stopped)) {
+            Ok(thread) => self.renewer = Some(Renewer { stop, thread }),
+            Err(e) => crate::obs::log::log_warn!("Secrets: a run's leases can't be renewed ({e}), so it stops when the first ends"),
+        }
     }
 
     #[cfg(test)]
@@ -306,6 +393,7 @@ impl Leases {
 
 impl Drop for Leases {
     fn drop(&mut self) {
+        let renewer = self.renewer.take();
         let (Some(issuer), held) = (self.issuer.take(), std::mem::take(&mut self.held)) else { return };
         forget_expired();
         if held.is_empty() {
@@ -317,12 +405,104 @@ impl Drop for Leases {
             }
             return;
         }
-        // Off the run's task: revoking waits on Vault, and the run has already ended.
+        // Off the run's task: revoking waits on Vault, and the run has already ended. The
+        // renewer stops first, so it never renews a lease being revoked.
         std::thread::spawn(move || {
+            if let Some(r) = renewer {
+                r.stop();
+            }
             for h in held {
                 revoke(issuer.as_ref(), h);
             }
         });
+    }
+}
+
+/// Renews each of `leases` when due, until it lasts past `deadline`, can't be renewed any
+/// more, or `stop` says the run has ended. After each, `ends` is when the first of the
+/// run's leases ends now: `fixed` for those not renewed, and each renewed one's current
+/// expiry, which only a renewal Vault answered moves.
+fn renew_until(issuer: &dyn Issuer, mut leases: Vec<Renewing>, mut fixed: Option<Instant>, deadline: Instant, ends: &watch::Sender<Option<Instant>>, stop: &mpsc::Receiver<()>) {
+    let ended = || !matches!(stop.try_recv(), Err(mpsc::TryRecvError::Empty));
+    loop {
+        let Some(next) = leases.iter().map(|l| l.due).min() else { return };
+        if !matches!(stop.recv_timeout(next.saturating_duration_since(Instant::now())), Err(mpsc::RecvTimeoutError::Timeout)) {
+            return;
+        }
+        let mut i = 0;
+        while i < leases.len() {
+            if ended() {
+                return;
+            }
+            if leases[i].due > Instant::now() || renew_one(issuer, &mut leases[i], deadline) {
+                i += 1;
+            } else {
+                let done = leases.swap_remove(i);
+                fixed = Some(fixed.map_or(done.expires, |f| f.min(done.expires)));
+            }
+            let first = leases.iter().map(|l| l.expires).chain(fixed).min();
+            ends.send_if_modified(|e| std::mem::replace(e, first) != first);
+        }
+    }
+}
+
+fn rfc3339_in(d: Duration) -> String {
+    (chrono::Utc::now() + chrono::Duration::from_std(d).unwrap_or_default()).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Renews one lease that is due. False once it needs no more renewals: it lasts past
+/// `deadline`, or it can't be renewed past its `expires`.
+fn renew_one(issuer: &dyn Issuer, l: &mut Renewing, deadline: Instant) -> bool {
+    let (e, mut d) = event("secret.lease_renewed", issuer.kind(), &l.path, &l.bot_id, l.owner.as_deref());
+    d["leaseId"] = json!(l.id);
+    let now = Instant::now();
+    if now >= l.expires {
+        crate::obs::log::log_warn!("Secrets: a run's lease from {} ran out before it could be renewed, so the run stops", l.path);
+        d["error"] = json!("expired");
+        external::audit(e.outcome(Outcome::Failure).details(d));
+        return false;
+    }
+    // Never past the deadline, so the last renewal ends with it rather than an increment later.
+    let ask = l.increment.min(deadline.saturating_duration_since(now)).as_secs_f64().ceil().max(1.0) as u64;
+    d["increment"] = json!(ask);
+    match issuer.renew(&l.id, Duration::from_secs(ask)) {
+        Ok(Renewal::Renewed { ttl, renewable }) => {
+            let ttl = ttl.min(MAX_TTL);
+            l.expires = now + Duration::from_secs(ttl);
+            d["ttl"] = json!(ttl);
+            d["expiresAt"] = json!(rfc3339_in(Duration::from_secs(ttl)));
+            if l.expires >= deadline {
+                external::audit(e.details(d));
+                return false;
+            }
+            // Short of what was asked: the role's max TTL (or the token's) is reached.
+            if ttl < ask || !renewable {
+                crate::obs::log::log_warn!(
+                    "Secrets: a run's lease from {} can't be renewed past {ttl} s more, so the run stops then; raise the role's max_ttl over RUN_TIMEOUT_MINUTES",
+                    l.path
+                );
+                d["final"] = json!(true);
+                external::audit(e.details(d));
+                return false;
+            }
+            external::audit(e.details(d));
+            l.due = now + (Duration::from_secs(ttl) * 2 / 3).max(Duration::from_millis(500));
+            true
+        }
+        Ok(Renewal::Refused(why)) => {
+            crate::obs::log::log_warn!("Secrets: a run's lease from {} wasn't renewed, so the run stops when it ends: {why}", l.path);
+            d["error"] = json!("refused");
+            external::audit(e.outcome(Outcome::Failure).details(d));
+            false
+        }
+        Err(err) => {
+            crate::obs::log::log_warn!("Secrets: a run's lease from {} couldn't be renewed yet, trying again: {err}", l.path);
+            d["error"] = json!(err.kind());
+            external::audit(e.outcome(Outcome::Failure).details(d));
+            let left = l.expires.saturating_duration_since(Instant::now());
+            l.due = Instant::now() + (left / 3).clamp(Duration::from_secs(1), RETRY_MAX);
+            true
+        }
     }
 }
 
@@ -413,11 +593,19 @@ fn revoke(issuer: &dyn Issuer, h: Held) {
 pub struct RunCredentials {
     issuer: Arc<dyn Issuer>,
     wanted: Vec<Wanted>,
+    /// How long past the longest run renewals keep leases alive.
+    margin: Duration,
 }
 
 impl RunCredentials {
     pub fn new(issuer: Arc<dyn Issuer>, wanted: Vec<Wanted>) -> RunCredentials {
-        RunCredentials { issuer, wanted }
+        RunCredentials { issuer, wanted, margin: RENEW_MARGIN }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_margin(mut self, margin: Duration) -> RunCredentials {
+        self.margin = margin;
+        self
     }
 
     /// Every variable a run may get from a lease.
@@ -446,7 +634,12 @@ impl RunCredentials {
     /// leases already made are revoked.
     pub fn issue(&self, owner: &str, bot_id: &str, owner_keys: bool, run_for: Duration) -> Result<(Vec<(String, Secret)>, Leases), Error> {
         forget_expired();
-        let mut leases = Leases { issuer: Some(Arc::clone(&self.issuer)), held: Vec::new(), cleared: Vec::new() };
+        let deadline = Instant::now() + run_for + self.margin;
+        let mut leases = Leases::none();
+        leases.issuer = Some(Arc::clone(&self.issuer));
+        let mut due = Vec::new();
+        // When the first lease that isn't renewed ends.
+        let mut fixed: Option<Instant> = None;
         let mut env = Vec::new();
         let owner_ok = owner_keys && Scope::user(owner).is_some();
         for w in &self.wanted {
@@ -492,6 +685,23 @@ impl RunCredentials {
                     Field::Missing => missing.push(field.as_str()),
                 }
             }
+            // A revocable lease with no TTL (0) is ended by the revoke alone.
+            if !(self.issuer.revocable() && ttl == 0) {
+                end_by(&leases.ends, held.expires);
+                if self.issuer.revocable() && lease.renewable && held.expires < deadline {
+                    due.push(Renewing {
+                        id: held.id.clone(),
+                        path: path.clone(),
+                        bot_id: bot_id.to_string(),
+                        owner: held.owner.clone(),
+                        increment: Duration::from_secs(ttl),
+                        expires: held.expires,
+                        due: Instant::now() + Duration::from_secs(ttl) * 2 / 3,
+                    });
+                } else {
+                    fixed = Some(fixed.map_or(held.expires, |f: Instant| f.min(held.expires)));
+                }
+            }
             leases.held.push(held);
             if !missing.is_empty() {
                 d["error"] = json!("missing_fields");
@@ -501,6 +711,7 @@ impl RunCredentials {
             }
             external::audit(e.details(d));
         }
+        leases.renew(Arc::clone(&self.issuer), due, fixed, deadline);
         Ok((env, leases))
     }
 }
@@ -563,6 +774,16 @@ pub(crate) mod tests {
         /// Leases can't be revoked and last `ttl` seconds (900 if 0), as STS sessions.
         pub unrevocable: AtomicBool,
         pub ttl: AtomicU64,
+        /// Leases are made not renewable.
+        pub not_renewable: AtomicBool,
+        /// (lease id, increment asked for) of each renewal.
+        pub renewals: Mutex<Vec<(String, u64)>>,
+        /// The most a renewal gives (0: what was asked), as a role's max TTL.
+        pub renew_cap: AtomicU64,
+        pub renew_refused: AtomicBool,
+        pub renew_down: AtomicBool,
+        /// How long each renewal takes to answer.
+        pub renew_delay_ms: AtomicU64,
     }
 
     /// The longest a test's run may last.
@@ -596,7 +817,7 @@ pub(crate) mod tests {
                 0 => 900,
                 t => t,
             };
-            Ok(Lease { id: format!("{path}/lease{n}"), ttl, renewable: true, fields })
+            Ok(Lease { id: format!("{path}/lease{n}"), ttl, renewable: !self.not_renewable.load(Ordering::SeqCst), fields })
         }
         fn revoke(&self, lease_id: &str) -> Result<(), Error> {
             if self.revoke_down.load(Ordering::SeqCst) {
@@ -604,6 +825,22 @@ pub(crate) mod tests {
             }
             self.revoked.lock().unwrap().push(lease_id.to_string());
             Ok(())
+        }
+        fn renew(&self, lease_id: &str, increment: Duration) -> Result<Renewal, Error> {
+            if self.renew_down.load(Ordering::SeqCst) {
+                return Err(Error::Unavailable("fake can't renew".into()));
+            }
+            let asked = increment.as_secs();
+            self.renewals.lock().unwrap().push((lease_id.to_string(), asked));
+            std::thread::sleep(Duration::from_millis(self.renew_delay_ms.load(Ordering::SeqCst)));
+            if self.renew_refused.load(Ordering::SeqCst) || self.revoked.lock().unwrap().iter().any(|r| r == lease_id) {
+                return Ok(Renewal::Refused("fake won't renew it".into()));
+            }
+            let ttl = match self.renew_cap.load(Ordering::SeqCst) {
+                0 => asked,
+                cap => asked.min(cap),
+            };
+            Ok(Renewal::Renewed { ttl, renewable: true })
         }
     }
 
@@ -690,7 +927,7 @@ pub(crate) mod tests {
         );
         assert_ne!(env(&e1), env(&e2), "each run its own");
         assert_eq!((l1.len(), l2.len()), (2, 2));
-        assert!(l1.expires_first().is_none() && Leases::none().expires_first().is_none(), "revoked at run end: no deadline of their own");
+        assert!(l1.expires_first().is_some_and(|at| at <= Instant::now() + Duration::from_secs(900)) && Leases::none().expires_first().is_none(), "when the first ends as things stand");
         assert_eq!(l1.cleared(), ["CLOUD_SESSION_TOKEN"], "an empty field is taken out of the run, not left to an older value");
         assert_eq!(redact::text("key aws-run-secret-0a1b-0 here"), "key [redacted] here", "redacted while the lease lives");
 
@@ -932,5 +1169,138 @@ pub(crate) mod tests {
         }
         forget_expired();
         assert_eq!(redact::text("sts-run-session-6c5d"), "sts-run-session-6c5d", "forgotten once every lease that had it expired");
+    }
+
+    fn renewed(path: &str) -> Vec<crate::audit::Event> {
+        external::tests::audited(path).into_iter().filter(|e| e.action == "secret.lease_renewed").collect()
+    }
+
+    #[test]
+    fn renewable_leases_are_renewed_while_the_run_lasts_and_not_after() {
+        let f = fake(&[("renew/creds/r", &[("token", Some("renew-run-token-1a2b"))])]);
+        f.ttl.store(2, Ordering::SeqCst);
+        let rc = RunCredentials::new(f.clone(), parse("renew/creds/r RENEW_TOKEN=token").unwrap());
+        let (_, l) = rc.issue("urenew1", "brenew1", true, RUN).unwrap();
+        let first = l.expires_first().expect("its TTL, until a renewal moves it");
+        assert!(first <= Instant::now() + Duration::from_secs(2));
+        wait_for(|| f.renewals.lock().unwrap().len() >= 2);
+        assert!(f.renewals.lock().unwrap().iter().all(|(id, n)| id == "renew/creds/r/lease0" && *n == 2), "by the TTL it was made with, never more: {:?}", f.renewals.lock().unwrap());
+        wait_for(|| l.expires_first().is_some_and(|at| at > first + Duration::from_secs(2)));
+        assert_eq!(redact::text("renew-run-token-1a2b-0"), redact::MARK, "still live, still redacted");
+        let ev = renewed("renew/creds/r");
+        assert!(ev.len() >= 2 && ev.iter().all(|e| e.outcome == Outcome::Success && e.bot_id.as_deref() == Some("brenew1")), "{ev:?}");
+        assert_eq!((ev[0].details["leaseId"].as_str(), ev[0].details["increment"].as_u64(), ev[0].details["ttl"].as_u64()), (Some("renew/creds/r/lease0"), Some(2), Some(2)));
+        let at = chrono::DateTime::parse_from_rfc3339(ev[0].details["expiresAt"].as_str().unwrap()).unwrap();
+        assert!((at.timestamp() - chrono::Utc::now().timestamp()).abs() <= 3, "{at}");
+        assert!(ev[0].details.get("final").is_none() && !format!("{ev:?}").contains("renew-run-token"), "never a value");
+
+        drop(l);
+        wait_for(|| f.revoked.lock().unwrap().len() == 1);
+        let n = f.renewals.lock().unwrap().len();
+        std::thread::sleep(Duration::from_millis(1600));
+        assert_eq!(f.renewals.lock().unwrap().len(), n, "the renewer stopped before the revoke, and nothing renews it after");
+    }
+
+    #[test]
+    fn renewals_stop_once_a_lease_outlasts_the_run() {
+        let f = fake(&[("renew/creds/edge", &[("token", Some("edge-run-token-3c4d"))])]);
+        f.ttl.store(3, Ordering::SeqCst);
+        let rc = RunCredentials::new(f.clone(), parse("renew/creds/edge EDGE_TOKEN=token").unwrap()).with_margin(Duration::ZERO);
+        let started = Instant::now();
+        let (_, l) = rc.issue("uedge2", "bedge2", true, Duration::from_secs(4)).unwrap();
+        wait_for(|| !f.renewals.lock().unwrap().is_empty());
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!(*f.renewals.lock().unwrap(), [("renew/creds/edge/lease0".to_string(), 2)], "the last renewal asks only up to the run's end, then none");
+        assert!(l.expires_first().is_some_and(|at| at >= started + Duration::from_secs(4)), "it lasts the run");
+
+        // A lease that already outlasts the run, or has no TTL, needs none.
+        f.ttl.store(900, Ordering::SeqCst);
+        let (_, l) = rc.issue("uedge2", "bedge2", true, Duration::from_secs(60)).unwrap();
+        assert!(l.renewer.is_none() && l.expires_first().is_some_and(|at| at > Instant::now() + Duration::from_secs(800)));
+    }
+
+    #[test]
+    fn a_lease_that_cant_be_renewed_far_enough_ends_the_run_with_it() {
+        let f = fake(&[("renew/creds/capped", &[("token", Some("capped-run-token-5e6f"))])]);
+        f.ttl.store(2, Ordering::SeqCst);
+        f.renew_cap.store(1, Ordering::SeqCst);
+        let rc = RunCredentials::new(f.clone(), parse("renew/creds/capped CAPPED_TOKEN=token").unwrap());
+        let started = Instant::now();
+        let (_, l) = rc.issue("ucap3", "bcap3", true, RUN).unwrap();
+        let mut ends = l.ends();
+        assert!(ends.borrow_and_update().is_some_and(|at| at <= Instant::now() + Duration::from_secs(2)));
+        wait_for(|| ends.has_changed().unwrap());
+        let at = l.expires_first().unwrap();
+        assert!(at > started + Duration::from_millis(2200) && at < started + Duration::from_secs(4), "when the short renewal ends: {:?}", at - started);
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(f.renewals.lock().unwrap().len(), 1, "no point asking again");
+        let ev = renewed("renew/creds/capped");
+        assert_eq!((ev.len(), ev[0].outcome, ev[0].details["ttl"].as_u64(), ev[0].details["final"].as_bool()), (1, Outcome::Success, Some(1), Some(true)), "{ev:?}");
+
+        // Leases made not renewable end the run when they do, with no renewal tried.
+        let f = fake(&[("renew/creds/fixed", &[("token", Some("fixed-run-token-5e6f"))])]);
+        f.ttl.store(30, Ordering::SeqCst);
+        f.not_renewable.store(true, Ordering::SeqCst);
+        let rc = RunCredentials::new(f.clone(), parse("renew/creds/fixed FIXED_TOKEN=token").unwrap());
+        let (_, l) = rc.issue("ucap3", "bcap3", true, RUN).unwrap();
+        assert!(l.expires_first().is_some_and(|at| at <= Instant::now() + Duration::from_secs(30)));
+        assert!(l.renewer.is_none() && f.renewals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_refused_renewal_ends_the_run_when_the_lease_does() {
+        let f = fake(&[("renew/creds/refused", &[("token", Some("refused-run-token-7a8b"))])]);
+        f.ttl.store(2, Ordering::SeqCst);
+        f.renew_refused.store(true, Ordering::SeqCst);
+        let rc = RunCredentials::new(f.clone(), parse("renew/creds/refused REFUSED_TOKEN=token").unwrap());
+        let started = Instant::now();
+        let (_, l) = rc.issue("uref4", "bref4", true, RUN).unwrap();
+        wait_for(|| !renewed("renew/creds/refused").is_empty());
+        assert!(l.expires_first().unwrap() <= started + Duration::from_secs(3), "when it would have ended anyway");
+        let ev = renewed("renew/creds/refused");
+        assert_eq!((ev.len(), ev[0].outcome, ev[0].details["error"].as_str()), (1, Outcome::Failure, Some("refused")), "{ev:?}");
+    }
+
+    #[test]
+    fn failed_renewals_are_tried_again_until_the_lease_runs_out() {
+        let f = fake(&[("renew/creds/flaky", &[("token", Some("flaky-run-token-9c0d"))]), ("renew/creds/gone", &[("token", Some("gone-run-token-9c0d"))])]);
+        f.ttl.store(6, Ordering::SeqCst);
+        f.renew_down.store(true, Ordering::SeqCst);
+        let rc = RunCredentials::new(f.clone(), parse("renew/creds/flaky FLAKY_TOKEN=token").unwrap());
+        let (_, l) = rc.issue("uflaky5", "bflaky5", true, RUN).unwrap();
+        let first = l.expires_first().unwrap();
+        wait_for(|| !renewed("renew/creds/flaky").is_empty());
+        assert_eq!(l.expires_first(), Some(first), "a failed renewal doesn't move it");
+        f.renew_down.store(false, Ordering::SeqCst);
+        wait_for(|| renewed("renew/creds/flaky").iter().any(|e| e.outcome == Outcome::Success));
+        let ev = renewed("renew/creds/flaky");
+        assert_eq!((ev[0].outcome, ev[0].details["error"].as_str()), (Outcome::Failure, Some("unavailable")), "{ev:?}");
+        wait_for(|| l.expires_first().is_some_and(|at| at > first));
+        drop(l);
+
+        // Down until the lease runs out: the run stops then.
+        f.ttl.store(3, Ordering::SeqCst);
+        f.renew_down.store(true, Ordering::SeqCst);
+        let rc = RunCredentials::new(f.clone(), parse("renew/creds/gone GONE_TOKEN=token").unwrap());
+        let (_, l) = rc.issue("uflaky5", "bflaky5", true, RUN).unwrap();
+        wait_for(|| renewed("renew/creds/gone").last().is_some_and(|e| e.details["error"] == "expired"));
+        assert!(l.expires_first().unwrap() <= Instant::now());
+        let ev = renewed("renew/creds/gone");
+        assert!(ev.iter().any(|e| e.details["error"] == "unavailable") && ev.last().unwrap().details["error"] == "expired", "{ev:?}");
+    }
+
+    #[test]
+    fn a_renewal_that_hangs_never_holds_the_runs_end_past_the_lease() {
+        let f = fake(&[("renew/creds/hung", &[("token", Some("hung-run-token-1e2f"))])]);
+        f.ttl.store(2, Ordering::SeqCst);
+        f.renew_delay_ms.store(4000, Ordering::SeqCst);
+        let rc = RunCredentials::new(f.clone(), parse("renew/creds/hung HUNG_TOKEN=token").unwrap());
+        let (_, l) = rc.issue("uhung6", "bhung6", true, RUN).unwrap();
+        let issued = Instant::now();
+        wait_for(|| !f.renewals.lock().unwrap().is_empty());
+        std::thread::sleep(Duration::from_millis(1000));
+        assert!(renewed("renew/creds/hung").is_empty(), "the renewal is still waiting on the backend");
+        let at = l.expires_first().unwrap();
+        assert!(at <= issued + Duration::from_secs(2) && at <= Instant::now(), "the run's end is the lease's, past now, though the renewal hasn't answered");
     }
 }
