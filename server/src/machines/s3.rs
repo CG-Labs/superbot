@@ -384,16 +384,25 @@ impl S3 {
     /// Aborts unfinished multipart uploads of exactly `key` started before `before` (ms),
     /// such as one cut off by a restart. Returns how many went.
     pub async fn abort_unfinished(&self, key: &str, before: i64) -> Result<usize, String> {
-        let res = self.send(Method::GET, None, &[("prefix", key), ("uploads", "")], Vec::new()).await?;
+        self.abort_where(key, before, |k| k == key).await
+    }
+
+    /// `abort_unfinished`, for every key under `prefix`.
+    pub async fn abort_unfinished_under(&self, prefix: &str, before: i64) -> Result<usize, String> {
+        self.abort_where(prefix, before, |k| k.starts_with(prefix)).await
+    }
+
+    async fn abort_where(&self, prefix: &str, before: i64, of: impl Fn(&str) -> bool) -> Result<usize, String> {
+        let res = self.send(Method::GET, None, &[("prefix", prefix), ("uploads", "")], Vec::new()).await?;
         let xml = self.text(res).await?;
         let mut gone = 0;
         for u in xml.split("<Upload>").skip(1) {
             let started = tag(u, "Initiated").and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok()).map(|t| t.timestamp_millis());
             if let (Some(k), Some(id)) = (tag(u, "Key"), tag(u, "UploadId"))
-                && k == key
+                && of(&k)
                 && started.is_some_and(|s| s < before)
             {
-                self.send(Method::DELETE, Some(key), &[("uploadId", &id)], Vec::new()).await?;
+                self.send(Method::DELETE, Some(&k), &[("uploadId", &id)], Vec::new()).await?;
                 gone += 1;
             }
         }
