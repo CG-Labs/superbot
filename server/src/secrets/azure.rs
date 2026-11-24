@@ -301,11 +301,11 @@ impl Entra {
             return Ok(t.value.clone());
         }
         let t = sign_in(self.label, &self.http, &self.local, &self.auth, &self.authority, &self.identity, &self.resource).await.map_err(|e| e.to_string())?;
-        // Masked wherever an error might quote it, and only while it is the one in use.
-        super::redact::register(&t.value);
+        // Masked wherever an error might quote it, while this or anyone else uses it.
+        super::redact::hold(&t.value);
         let value = t.value.clone();
         if let Some(old) = self.token.lock().unwrap_or_else(|e| e.into_inner()).replace(t) {
-            super::redact::forget(&old.value);
+            super::redact::release(&old.value);
         }
         Ok(value)
     }
@@ -316,6 +316,14 @@ impl Entra {
         self.authority = base.to_string();
         if let Identity::Imds(_) = self.identity {
             self.identity = Identity::Imds(base.to_string());
+        }
+    }
+}
+
+impl Drop for Entra {
+    fn drop(&mut self) {
+        if let Some(t) = self.token.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            super::redact::release(&t.value);
         }
     }
 }
