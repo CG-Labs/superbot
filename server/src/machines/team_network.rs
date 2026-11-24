@@ -759,7 +759,8 @@ pub(crate) async fn leave(app: &AppState, cp: &ControlPlane, p: &dyn MachineProv
 
 /// `GET /api/machines/team-networks` (ADR 0249): every team network at the provider,
 /// whose it is (a team here, a team this server deleted, or no team it knows: another
-/// server's), and which of our machines are on it. Read now, changing nothing.
+/// server's), which of our machines are on it, and how many other things are on it or
+/// use it, which keep it from being removed. Read now, changing nothing.
 pub async fn list(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>) -> Res {
     let cp = &a.machines;
     let p = cp.need()?;
@@ -796,10 +797,11 @@ pub async fn list(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>)
             v["status"] = json!("unknown");
             None
         };
-        match p.team_network_members(&n.id).await {
-            Ok(members) => {
+        let read = async { Ok::<_, ProviderError>((p.team_network_members(&n.id).await?, p.team_network_unlisted(n).await?)) };
+        match read.await {
+            Ok((members, unlisted)) => {
                 let mut machines = Vec::new();
-                let mut others = 0;
+                let mut others = unlisted;
                 for mem in &members {
                     let Some(m) = ours.get(&mem.machine) else {
                         others += 1;
@@ -809,7 +811,7 @@ pub async fn list(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>)
                     machines.push(json!({ "id": m.id, "userId": m.user_id, "state": m.state.as_str(), "inUse": mem.active, "leaving": leaving }));
                 }
                 v["machines"] = json!(machines);
-                v["otherInterfaces"] = json!(others);
+                v["others"] = json!(others);
             }
             Err(e) => v["error"] = json!(e.to_string()),
         }

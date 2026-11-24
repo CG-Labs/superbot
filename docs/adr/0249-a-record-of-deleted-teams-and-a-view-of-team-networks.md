@@ -46,7 +46,7 @@ The rows are kept for ever. Each is a random id and a time, with no name and not
 - `id`, `label`, `region` and `subnet`.
 - `status`: `team` (with `team.id` and `team.name`), `deleted` (with `team.id` and `team.deletedAt`, from the record; no name, which this server no longer keeps), or `unknown` (no team this server has or deleted: another server's, or one deleted before this record and pruned from the log).
 - `machines`: our machines on it, each with its `id`, `userId`, `state`, `inUse` (booted with the interface) and `leaving` (its owner isn't on the network's team, so the sweep takes it off).
-- `otherInterfaces`: how many interfaces on it aren't our machines' (the team's own services, or another server's machines).
+- `others`: how many other things are on it or use it, each of which keeps it from being removed: interfaces that aren't our machines' (the team's own services, or another server's machines) and, on Incus, anything in another project on the network or behind its ACL (from both `used_by` lists, which removal checks too, read separately so the machines the sweep may change are still only botd's own project's).
 - `error` instead of the last two when its members couldn't be read.
 
 The view also returns the `teamNetwork` settings, so `remove: off` explains a deleted team's network that stays. It doesn't list what Linode says is on a subnet besides interfaces (NodeBalancers, databases); removal still checks those itself.
@@ -62,7 +62,8 @@ The view also returns the `teamNetwork` settings, so `remove: off` explains a de
 ## Tests
 
 - **Unit** (`db.rs`): deleting a team writes one record at that time, a second delete writes nothing, a live team said to be deleted and a failed deletion aren't recorded, an install from before reads its audit log once on upgrade (at the event's time), and the record outlives pruning the event under retention.
-- **End to end** (`machines_team_network_tests.rs`, the in-memory provider): with the `team.deleted` events pruned, a deleted team's machines leave its network and it is removed; another with its own service on it is kept; another server's network is never touched. The view shows each as `team`, `deleted` or `unknown`, with our machines (and whether each is leaving) and the count of other interfaces; members get 403, and with team networks off it is 409.
+- **End to end** (`machines_team_network_tests.rs`, the in-memory provider): with the `team.deleted` events pruned, a deleted team's machines leave its network and it is removed; another with its own service on it is kept; another server's network is never touched. The view shows each as `team`, `deleted` or `unknown`, with our machines (and whether each is leaving) and the count of others; members get 403, and with team networks off it is 409.
+- **Incus** (`incus/tests.rs`, `machines_incus_team_network_tests.rs`, the stand-in): a container in another project on the network, or a NIC behind its ACL, isn't a member but is counted in `others`, and the view shows a deleted team's network kept by an operator's service in the `default` project until it is moved off.
 - **botctl**: `machine team-networks` sends the request; extra arguments are refused.
 
 ## Deferred

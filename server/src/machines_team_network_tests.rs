@@ -293,9 +293,9 @@ async fn a_deleted_teams_network_goes_after_audit_retention_has_pruned_its_delet
     assert_eq!((a["status"].as_str(), a["team"]["id"].as_str(), a["team"]["name"].as_str()), (Some("team"), Some(acme.as_str()), Some("Acme")), "{a}");
     let m = machine(&env, &ada);
     assert_eq!(a["machines"], json!([{ "id": m.id, "userId": ada, "state": m.state.as_str(), "inUse": true, "leaving": false }]));
-    assert_eq!((a["subnet"].as_str(), a["region"].as_str(), a["otherInterfaces"].as_i64()), (Some(team_network::DEFAULT_SUBNET), Some("gb-lon"), Some(0)));
+    assert_eq!((a["subnet"].as_str(), a["region"].as_str(), a["others"].as_i64()), (Some(team_network::DEFAULT_SUBNET), Some("gb-lon"), Some(0)));
     let g = find(&nets, &globex_net).unwrap();
-    assert_eq!((g["status"].as_str(), g["otherInterfaces"].as_i64(), g["machines"].as_array().unwrap().len()), (Some("team"), Some(1), 1), "{g}");
+    assert_eq!((g["status"].as_str(), g["others"].as_i64(), g["machines"].as_array().unwrap().len()), (Some("team"), Some(1), 1), "{g}");
     let t = find(&nets, &theirs.id).unwrap();
     assert_eq!((t["status"].as_str(), &t["team"], &t["machines"]), (Some("unknown"), &Value::Null, &json!([])), "another server's: {t}");
 
@@ -323,7 +323,7 @@ async fn a_deleted_teams_network_goes_after_audit_retention_has_pruned_its_delet
     let nets = view().await;
     assert_eq!(nets.len(), 2, "{nets:?}");
     let g = find(&nets, &globex_net).unwrap();
-    assert_eq!((g["status"].as_str(), &g["machines"], g["otherInterfaces"].as_i64()), (Some("deleted"), &json!([]), Some(1)), "{g}");
+    assert_eq!((g["status"].as_str(), &g["machines"], g["others"].as_i64()), (Some("deleted"), &json!([]), Some(1)), "{g}");
     assert!(has_network(&env, &theirs.id), "never touched");
     assert_eq!(find(&nets, &theirs.id).unwrap()["status"], "unknown");
 
