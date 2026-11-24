@@ -76,7 +76,7 @@ async fn it_follows_what_botd_recorded() {
 
     // A SCIM connection that has deprovisioned someone, a support bundle, metrics on,
     // a machine restore, and a team.
-    let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    let (t, old_id) = token(port, &admin, json!({ "tenant": "okta" })).await;
     let (code, _, user) = scim(port, &t, "POST", "/scim/v2/Users", okta_user("ada@customer.example.com", "00u1")).await;
     assert_eq!(code, 201, "{user}");
     let patch = json!({ "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], "Operations": [{ "op": "replace", "value": { "active": false } }] });
@@ -98,6 +98,15 @@ async fn it_follows_what_botd_recorded() {
     assert!(item(&r, "teams")["detail"].as_str().unwrap().starts_with("1 team on this server"), "{r:#}");
     assert!(!body.contains("customer.example.com") && !body.contains("Ada") && !body.contains("Research"), "no name or email: {body}");
 
+    // A replacement token nobody has used yet, and the used one revoked: SCIM isn't
+    // working until the identity provider sends the new one.
+    token(port, &admin, json!({ "tenant": "okta" })).await;
+    assert_eq!(call(port, "DELETE", &format!("/api/scim/tokens/{old_id}"), &admin, "").await.0, 200);
+    let r = parse(&call(port, "GET", "/api/support/onboarding", &admin, "").await.1);
+    assert_eq!(item(&r, "scim")["status"], "open", "{:#}", item(&r, "scim"));
+    assert!(item(&r, "scim")["detail"].as_str().unwrap().starts_with("No SCIM request in the last 30 days"), "{r:#}");
+
+    assert_eq!(item(&r, "approvals")["status"], "open", "no email address, webhook or phone hears an approval: {:#}", item(&r, "approvals"));
     // Bypass turns approvals open.
     let (code, res) = call(port, "PUT", "/api/policy", &admin, &json!({ "mode": "bypass" }).to_string()).await;
     assert_eq!(code, 200, "{res}");

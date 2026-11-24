@@ -69,7 +69,7 @@ In the checklist's order. "botd sees" is what turns an item `done`; anything els
 | `sso_admin` | `done` when an active admin besides the owner account has signed in with SSO (an `auth.login` by SSO in the audit log) |
 | `jit_allow_list` | `done` when just-in-time sign-up is off, or on with the allow-list botd requires before it starts; `n/a` with no provider |
 | `mfa` | `done` when SuperBot requires a second factor (`AUTH_MFA=admins` or `all`); `confirm` when SSO relies on the identity provider's MFA, which botd can't see; `open` with neither |
-| `scim` | `done` when SCIM has a working token (not revoked, expired or ending within 14 days), was used in the last 30 days, and has deprovisioned someone, which is the test the checklist asks for; `confirm` when SCIM is off |
+| `scim` | `done` when SCIM has a working token (not revoked, expired or ending within 14 days), a working token was used in the last 30 days (a revoked one's use doesn't count), and SCIM has deprovisioned someone, which is the test the checklist asks for; `confirm` when SCIM is off |
 | `break_glass` | `done` when break-glass sign-in is off (`AUTH_BREAK_GLASS=0`) |
 | `signin_alerts` | `done` when suspicious sign-ins are reported (`SIGNIN_ALERTS`) |
 
@@ -79,14 +79,14 @@ In the checklist's order. "botd sees" is what turns an item `done`; anything els
 |---|---|
 | `isolation` | `done` when every Bot runs on its owner's machine (`MACHINE_ROUTING=on`) or as its user's own Unix account (`ISOLATION=users`); `open` while any runs as botd's own account |
 | `hardening` | `done` when machines are hardened at first boot (`MACHINE_HARDENING`), with the count of plans in `MACHINE_OWN_KERNEL_TIERS`; `n/a` with no machines |
-| `approvals` | `confirm` when Bots ask before risky actions and a notice reaches someone (email, a webhook or push); `open` when approvals are off (bypass) or no notice reaches anyone |
+| `approvals` | `confirm` when Bots ask before risky actions and every Bot's approval notice reaches someone: an email address, a webhook, or a decider's registered phone (with no Bots yet, the global settings); `open` when approvals are off (bypass) or some Bot's notice reaches no one |
 | `teams` | Always `confirm`, with the count of teams |
 
 ### 4. Backups and recovery
 
 | Item | botd sees |
 |---|---|
-| `server_backups` | `done` when server backups are copied off the host (`SERVER_BACKUP_S3_BUCKET`), the newest copy is within its RPO, and every backup is encrypted (`botctl backups`) |
+| `server_backups` | `done` when server backups are copied off the host (`SERVER_BACKUP_S3_BUCKET`), the newest copy is within its RPO and was itself encrypted, and every backup target is encrypted (`botctl backups`) |
 | `keys_off_host` | Always `confirm`: where the age identity and master key are kept is for two people to know |
 | `database_encryption` | `done` when the database is encrypted at rest. Skip it if the customer doesn't require it |
 | `machine_backups` | `done` when machines are backed up (off-host, or the provider's) and none is past its RPO (`botctl machine recovery`); `n/a` with no machines |

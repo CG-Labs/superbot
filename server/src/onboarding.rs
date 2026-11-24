@@ -128,7 +128,7 @@ pub struct Provider {
 pub struct Scim {
     /// Tokens neither revoked nor expired.
     pub working_tokens: usize,
-    /// A token was used in the last `SCIM_RECENT_DAYS`.
+    /// A working token was used in the last `SCIM_RECENT_DAYS`.
     pub used_recently: bool,
     /// Tenants whose every working token ends within `scim::WARN_DAYS`.
     pub tenants_expiring: usize,
@@ -140,6 +140,8 @@ pub struct Scim {
 pub struct ServerBackups {
     pub off_host: bool,
     pub copied: bool,
+    /// The newest copy off the host was encrypted, by superbot-backup or by botd on its way.
+    pub copy_encrypted: bool,
     pub breach: bool,
     pub rpo_hours: i64,
 }
@@ -203,7 +205,8 @@ pub struct Inputs {
     pub bots_run: Where,
     pub machines: Option<Machines>,
     pub approvals_ask: bool,
-    /// A notice of a pending approval reaches someone: email, a webhook or push.
+    /// A notice of a pending approval reaches someone (an email address, a webhook or a
+    /// registered phone) for every Bot, or, with no Bots yet, from the global settings.
     pub notices: bool,
     pub teams: usize,
     pub server_backups: Option<ServerBackups>,
@@ -319,7 +322,7 @@ fn judge(id: &str, i: &Inputs) -> (Status, String) {
         },
         "approvals" => match (i.approvals_ask, i.notices) {
             (false, _) => (Open, "Approvals are off (bypass): Bots run risky actions without asking.".into()),
-            (true, false) => (Open, "Bots ask before risky actions, but no notice reaches anyone: set up email, a webhook or push in the console's Notifications.".into()),
+            (true, false) => (Open, "Bots ask before risky actions, but a notice of an approval reaches no one for some Bot (no email address, webhook or registered phone): set them up in the console's Notifications.".into()),
             (true, true) => (Confirm, "Bots ask before risky actions and notices go out: review the risky classes, the timeout and who's notified with the customer.".into()),
         },
         "teams" => (Confirm, format!("{} on this server: confirm shared Bots and teams match how the customer works.", plural(i.teams as u64, "team", "teams"))),
@@ -328,6 +331,7 @@ fn judge(id: &str, i: &Inputs) -> (Status, String) {
             Some(b) if !b.off_host => (Open, "Server backups stay on this host: set SERVER_BACKUP_S3_BUCKET to copy them off.".into()),
             Some(b) if b.breach => (Open, format!("The newest copy off the host is past its RPO of {} hours: see botctl backups.", b.rpo_hours)),
             Some(b) if !b.copied => (Open, "Copies are set up, but none has been made yet: see botctl backups.".into()),
+            Some(b) if !b.copy_encrypted => (Open, "The newest copy off the host is plain: encrypt backups (SERVER_BACKUP_AGE_RECIPIENTS) and check the next copy is encrypted in botctl backups.".into()),
             Some(_) if !i.backups_encrypted => (Open, "Copied off the host within the RPO, but not every backup is encrypted: see botctl backups.".into()),
             Some(b) => (Done, format!("Copied off the host within the RPO of {} hours, and encrypted.", b.rpo_hours)),
         },
@@ -511,12 +515,13 @@ pub fn gather(app: &App, a: &Auth, setup: &Value, now_ms: i64) -> Inputs {
         .count();
     let scim = a.scim.enabled.then(|| {
         let tokens = app.db.scim_tokens();
+        let working = |t: &&crate::db::ScimToken| !matches!(crate::scim::token_state(t, now_ms), "revoked" | "expired");
         let from = now_ms - SCIM_RECENT_DAYS * DAY_MS;
         let f = Filter { actions: vec!["user.deprovisioned".into()], ..Default::default() };
         let via_scim = |e: &crate::db::AuditEvent| e.details["via"].as_str().is_some_and(|v| v == crate::deprovision::SCIM || v == crate::deprovision::SCIM_DELETE);
         Scim {
-            working_tokens: tokens.iter().filter(|t| !matches!(crate::scim::token_state(t, now_ms), "revoked" | "expired")).count(),
-            used_recently: tokens.iter().any(|t| t.last_used_at.is_some_and(|u| u >= from)),
+            working_tokens: tokens.iter().filter(working).count(),
+            used_recently: tokens.iter().filter(working).any(|t| t.last_used_at.is_some_and(|u| u >= from)),
             tenants_expiring: crate::scim::tenants_expiring(&tokens, now_ms).len(),
             deprovisions: app.db.audit_events(&f, 10_000, false).iter().filter(|e| via_scim(e)).count() as u64,
         }
@@ -548,7 +553,7 @@ pub fn gather(app: &App, a: &Auth, setup: &Value, now_ms: i64) -> Inputs {
     });
     let server_backups = app.server_backups.get().map(|sb| {
         let st = crate::server_backups::status(app, sb);
-        ServerBackups { off_host: sb.target.is_some(), copied: st.last.is_some(), breach: st.breach, rpo_hours: sb.rpo_ms / HOUR_MS }
+        ServerBackups { off_host: sb.target.is_some(), copied: st.last.is_some(), copy_encrypted: st.last.as_ref().is_some_and(|b| b.encrypted), breach: st.breach, rpo_hours: sb.rpo_ms / HOUR_MS }
     });
     let started = app.db.audit_events(&Filter { actions: vec!["server.started".into()], ..Default::default() }, 1, false);
     let metrics = started.first().and_then(|e| e.details.get("metrics")).filter(|m| m.is_object()).map(|m| m["token"] != true);
@@ -572,7 +577,11 @@ pub fn gather(app: &App, a: &Auth, setup: &Value, now_ms: i64) -> Inputs {
         bots_run,
         machines,
         approvals_ask: app.db.global_policy().mode == crate::policy::Mode::Ask,
-        notices: app.notifier.get().is_some_and(|n| n.any_channel(&app.db, &crate::notify::load(&app.db))),
+        notices: app.notifier.get().is_some_and(|n| {
+            let s = crate::notify::load(&app.db);
+            let bots = app.db.bots();
+            if bots.is_empty() { !n.plan(&app.db, None, &s).is_empty() } else { bots.iter().all(|b| !n.plan(&app.db, Some(b), &s).is_empty()) }
+        }),
         teams: app.db.teams().len(),
         server_backups,
         backups_encrypted: crate::backup_encryption::checklist(app).0,
@@ -649,7 +658,7 @@ mod tests {
             approvals_ask: true,
             notices: true,
             teams: 4,
-            server_backups: Some(ServerBackups { off_host: true, copied: true, breach: false, rpo_hours: 26 }),
+            server_backups: Some(ServerBackups { off_host: true, copied: true, copy_encrypted: true, breach: false, rpo_hours: 26 }),
             backups_encrypted: true,
             database_encrypted: true,
             machine_restores: 2,
@@ -786,16 +795,19 @@ mod tests {
     #[test]
     fn server_backups_need_a_copy_within_the_rpo_and_encryption() {
         let mut i = live();
-        let base = ServerBackups { off_host: true, copied: true, breach: false, rpo_hours: 26 };
+        let base = ServerBackups { off_host: true, copied: true, copy_encrypted: true, breach: false, rpo_hours: 26 };
         for (b, want) in [
             (ServerBackups { off_host: false, ..base.clone() }, "Server backups stay on this host"),
             (ServerBackups { breach: true, ..base.clone() }, "The newest copy off the host is past its RPO of 26 hours"),
             (ServerBackups { copied: false, ..base.clone() }, "Copies are set up, but none has been made yet"),
+            (ServerBackups { copy_encrypted: false, ..base.clone() }, "The newest copy off the host is plain"),
         ] {
             i.server_backups = Some(b);
             let (s, d) = status(&check(&i, &[]), "server_backups");
             assert!(s == Status::Open && d.starts_with(want), "{d}");
         }
+        i.server_backups = Some(ServerBackups { copy_encrypted: false, ..base.clone() });
+        assert_eq!(status(&check(&i, &[]), "server_backups").0, Status::Open, "encryption turned on after a plain copy: still open until an encrypted copy");
         i.server_backups = Some(base);
         i.backups_encrypted = false;
         assert!(status(&check(&i, &[]), "server_backups").1.contains("not every backup is encrypted"));
