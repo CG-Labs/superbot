@@ -111,26 +111,135 @@ fn service_account(json: &str) -> Result<(ServiceAccount, Option<String>), Strin
     Ok((ServiceAccount { email, key_id, key, token_uri }, v["project_id"].as_str().map(String::from)))
 }
 
+/// How botd signs in to Google as itself: the method `method_var` names (with `method` its
+/// value), with `GCE_METADATA_HOST` or `GCP_SERVICE_ACCOUNT_KEY`, and the key's project.
+/// Secret Manager reads `GCP_SECRET_MANAGER_AUTH`; the audit export's Google SecOps sink,
+/// `AUDIT_EXPORT_GCP_AUTH` (ADR 0237).
+fn sign_in_settings(var: &dyn Fn(&str) -> String, store: &dyn SecretStore, method_var: &str, method: &str) -> Result<(Auth, Option<String>), String> {
+    Ok(match method.trim() {
+        "" | "metadata" => {
+            let host = match var("GCE_METADATA_HOST").trim() {
+                "" => METADATA_HOST.to_string(),
+                h if h.bytes().all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b)) => h.to_string(),
+                h => return Err(format!("GCE_METADATA_HOST must be a host[:port], not {h:?}")),
+            };
+            (Auth::Metadata { host }, None)
+        }
+        "service-account-key" => {
+            let key = store.get("GCP_SERVICE_ACCOUNT_KEY").map_err(|e| format!("GCP_SERVICE_ACCOUNT_KEY: {e}"))?;
+            let key = key.ok_or(format!("{method_var}=service-account-key needs GCP_SERVICE_ACCOUNT_KEY_FILE (or GCP_SERVICE_ACCOUNT_KEY)"))?;
+            let (sa, project) = service_account(key.expose())?;
+            (Auth::Key(Box::new(sa)), project)
+        }
+        other => return Err(format!("{method_var} must be metadata or service-account-key, not {other:?}")),
+    })
+}
+
+fn method_of(auth: &Auth) -> &'static str {
+    match auth {
+        Auth::Metadata { .. } => "metadata",
+        Auth::Key(_) => "service-account-key",
+    }
+}
+
+/// Who botd signs in as, for startup lines: never a credential.
+fn signs_in_as(auth: &Auth) -> String {
+    match auth {
+        Auth::Metadata { host } if host == METADATA_HOST => "the metadata server's service account".to_string(),
+        Auth::Metadata { host } => format!("the metadata server's service account at {host}"),
+        Auth::Key(sa) => format!("service account key for {}", sa.email),
+    }
+}
+
+/// botd's own access token, from the metadata server or by trading a JWT signed with its
+/// service account key. `label` names the service in errors.
+async fn sign_in(label: &str, http: &reqwest::Client, local: &reqwest::Client, auth: &Auth) -> Result<Bearer, Error> {
+    let what = format!("{} sign-in", method_of(auth));
+    let failed = |e: &dyn std::fmt::Display| Error::Unavailable(format!("{label}: {what}: {e}"));
+    let req = match auth {
+        Auth::Metadata { host } => local.get(format!("http://{host}/computeMetadata/v1/instance/service-accounts/default/token")).header("Metadata-Flavor", "Google"),
+        Auth::Key(sa) => {
+            let assertion = jwt(sa).map_err(|e| failed(&e))?;
+            http.post(&sa.token_uri).form(&[("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", assertion.as_str())])
+        }
+    };
+    let res = req.send().await.map_err(|e| failed(&e))?;
+    let status = res.status();
+    let body = Zeroizing::new(res.bytes().await.map_err(|e| failed(&e))?.to_vec());
+    if !status.is_success() {
+        return Err(Error::Unavailable(format!("{label}: {what} answered {status}{}", http::error_code(&body))));
+    }
+    let v: Value = serde_json::from_slice(&body).map_err(|e| failed(&e))?;
+    let token = v["access_token"].as_str().filter(|t| !t.is_empty()).ok_or_else(|| Error::Unavailable(format!("{label}: {what} gave no token")))?;
+    Ok(Bearer::new(token, http::seconds(&v["expires_in"])))
+}
+
+/// botd signed in to Google as itself for a service other than Secret Manager, the token
+/// kept while it lasts: the audit export's Google SecOps sink (ADR 0237). It reads the same
+/// `GCE_METADATA_HOST` and `GCP_SERVICE_ACCOUNT_KEY` as Secret Manager, so it is the same
+/// identity.
+pub struct Google {
+    label: &'static str,
+    auth: Auth,
+    http: reqwest::Client,
+    local: reqwest::Client,
+    token: Mutex<Option<Bearer>>,
+}
+
+impl Google {
+    pub fn from_env(var: &dyn Fn(&str) -> String, store: &dyn SecretStore, method_var: &str, method: &str, label: &'static str) -> Result<Google, String> {
+        let (auth, _) = sign_in_settings(var, store, method_var, method)?;
+        let http = http::client(label, None, false)?;
+        let local = http::client(label, None, true)?;
+        Ok(Google { label, auth, http, local, token: Mutex::new(None) })
+    }
+
+    pub fn method(&self) -> &'static str {
+        method_of(&self.auth)
+    }
+
+    /// Who botd signs in as, never a credential.
+    pub fn describe(&self) -> String {
+        signs_in_as(&self.auth)
+    }
+
+    /// The token to send; a new one if `fresh` (the service refused the last) or it is due.
+    pub async fn token(&self, fresh: bool) -> Result<Zeroizing<String>, String> {
+        if !fresh && let Some(t) = self.token.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|t| t.fresh()) {
+            return Ok(t.value.clone());
+        }
+        let t = sign_in(self.label, &self.http, &self.local, &self.auth).await.map_err(|e| e.to_string())?;
+        // Masked wherever an error might quote it, while this or another holder uses it:
+        // the metadata server hands out the same token until it is near its end.
+        super::redact::hold(&t.value);
+        let value = t.value.clone();
+        if let Some(old) = self.token.lock().unwrap_or_else(|e| e.into_inner()).replace(t) {
+            super::redact::release(&old.value);
+        }
+        Ok(value)
+    }
+
+    /// Signs in at `base` instead: a stand-in for the metadata server.
+    #[cfg(test)]
+    pub fn point_at(&mut self, base: &str) {
+        if let Auth::Metadata { host } = &mut self.auth {
+            *host = base.trim_start_matches("http://").to_string();
+        }
+    }
+}
+
+impl Drop for Google {
+    fn drop(&mut self) {
+        if let Some(t) = self.token.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            super::redact::release(&t.value);
+        }
+    }
+}
+
 impl Config {
     /// `GCP_*` settings; the key comes from `store` (the environment), so `_FILE` works.
     pub fn from_env(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result<Config, String> {
-        let (auth, key_project) = match var("GCP_SECRET_MANAGER_AUTH").trim() {
-            "" | "metadata" => {
-                let host = match var("GCE_METADATA_HOST").trim() {
-                    "" => METADATA_HOST.to_string(),
-                    h if h.bytes().all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b)) => h.to_string(),
-                    h => return Err(format!("GCE_METADATA_HOST must be a host[:port], not {h:?}")),
-                };
-                (Auth::Metadata { host }, None)
-            }
-            "service-account-key" => {
-                let key = store.get("GCP_SERVICE_ACCOUNT_KEY").map_err(|e| format!("GCP_SERVICE_ACCOUNT_KEY: {e}"))?;
-                let key = key.ok_or("GCP_SECRET_MANAGER_AUTH=service-account-key needs GCP_SERVICE_ACCOUNT_KEY_FILE (or GCP_SERVICE_ACCOUNT_KEY)")?;
-                let (sa, project) = service_account(key.expose())?;
-                (Auth::Key(Box::new(sa)), project)
-            }
-            other => return Err(format!("GCP_SECRET_MANAGER_AUTH must be metadata or service-account-key, not {other:?}")),
-        };
+        let (auth, key_project) = sign_in_settings(var, store, "GCP_SECRET_MANAGER_AUTH", &var("GCP_SECRET_MANAGER_AUTH"))?;
         let project = match (var("GCP_SECRET_MANAGER_PROJECT").trim(), key_project) {
             ("", Some(p)) => p,
             ("", None) => return Err("SECRETS_BACKEND=gcp-secret-manager needs GCP_SECRET_MANAGER_PROJECT, the project id the secrets are in".into()),
@@ -207,42 +316,19 @@ impl Inner {
     }
 
     fn method(&self) -> &'static str {
-        match self.cfg.auth {
-            Auth::Metadata { .. } => "metadata",
-            Auth::Key(_) => "service-account-key",
-        }
+        method_of(&self.cfg.auth)
     }
 
     async fn token(&self, fresh: bool) -> Result<Zeroizing<String>, Error> {
         if !fresh && let Some(t) = self.token.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|t| t.fresh()) {
             return Ok(t.value.clone());
         }
-        let result = self.sign_in().await;
+        let result = sign_in("GCP Secret Manager", &self.http, &self.local, &self.cfg.auth).await;
         http::audit_login("gcp-secret-manager", self.method(), &result);
         let t = result?;
         let value = t.value.clone();
         *self.token.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
         Ok(value)
-    }
-
-    async fn sign_in(&self) -> Result<Bearer, Error> {
-        let what = format!("{} sign-in", self.method());
-        let req = match &self.cfg.auth {
-            Auth::Metadata { host } => self.local.get(format!("http://{host}/computeMetadata/v1/instance/service-accounts/default/token")).header("Metadata-Flavor", "Google"),
-            Auth::Key(sa) => {
-                let assertion = jwt(sa).map_err(|e| unavailable(&what, e))?;
-                self.http.post(&sa.token_uri).form(&[("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", assertion.as_str())])
-            }
-        };
-        let res = req.send().await.map_err(|e| unavailable(&what, e))?;
-        let status = res.status();
-        let body = Zeroizing::new(res.bytes().await.map_err(|e| unavailable(&what, e))?.to_vec());
-        if !status.is_success() {
-            return Err(Error::Unavailable(format!("GCP Secret Manager: {what} answered {status}{}", http::error_code(&body))));
-        }
-        let v: Value = serde_json::from_slice(&body).map_err(|e| unavailable(&what, e))?;
-        let token = v["access_token"].as_str().filter(|t| !t.is_empty()).ok_or_else(|| Error::Unavailable(format!("GCP Secret Manager: {what} gave no token")))?;
-        Ok(Bearer::new(token, http::seconds(&v["expires_in"])))
     }
 
     /// GETs `path` under the endpoint; when Secret Manager refuses the token, gets a new
@@ -404,11 +490,7 @@ impl Provider for SecretManager {
 
     fn describe(&self) -> String {
         let c = &self.inner.cfg;
-        let auth = match &c.auth {
-            Auth::Metadata { host } if host == METADATA_HOST => "the metadata server's service account".to_string(),
-            Auth::Metadata { host } => format!("the metadata server's service account at {host}"),
-            Auth::Key(sa) => format!("service account key for {}", sa.email),
-        };
+        let auth = signs_in_as(&c.auth);
         format!("GCP Secret Manager at {}, {}/secrets/{}-{{bots,server}}-<NAME>, {auth}", c.endpoint, c.parent, c.prefix)
     }
 
@@ -704,6 +786,30 @@ mod tests {
         assert!(logins.iter().any(|e| e.outcome == Outcome::Failure && e.details["method"] == "service-account-key"));
         assert!(!format!("{logins:?}").contains("PRIVATE KEY"));
         redact::forget("smtp-from-gcp-1");
+    }
+
+    #[tokio::test]
+    async fn another_service_signs_in_as_the_same_identity_and_masks_its_tokens_while_held() {
+        let (url, f) = stand_in();
+        let key = key_file(&f, &format!("{url}/token"));
+        let vars = [("GCP_SERVICE_ACCOUNT_KEY", key.as_str())];
+        let g = Google::from_env(&settings(&vars), &EnvStore::fixed(&vars), "AUDIT_EXPORT_GCP_AUTH", "service-account-key", "Google SecOps").unwrap();
+        assert_eq!((g.method(), g.describe().as_str()), ("service-account-key", "service account key for botd@proj-1.iam.gserviceaccount.com"));
+        let first = g.token(false).await.unwrap();
+        assert_eq!(*g.token(false).await.unwrap(), *first, "kept while it lasts");
+        assert_eq!(redact::text(&format!("x {} y", first.as_str())), format!("x {} y", redact::MARK));
+        let second = g.token(true).await.unwrap();
+        assert_ne!(*second, *first, "asked again when refused");
+        assert_eq!(f.sign_ins.load(Ordering::SeqCst), 2);
+        assert_eq!(redact::text(second.as_str()), redact::MARK);
+
+        let other = key_file(&Fake::default(), &format!("{url}/token"));
+        let vars = [("GCP_SERVICE_ACCOUNT_KEY", other.as_str())];
+        let g = Google::from_env(&settings(&vars), &EnvStore::fixed(&vars), "AUDIT_EXPORT_GCP_AUTH", "service-account-key", "Google SecOps").unwrap();
+        let e = g.token(false).await.unwrap_err();
+        assert!(e.starts_with("Google SecOps: service-account-key sign-in answered 400") && e.contains("invalid_grant") && !e.contains("Signature"), "{e}");
+        let e = Google::from_env(&settings(&[]), &EnvStore::fixed(&[]), "AUDIT_EXPORT_GCP_AUTH", "key", "Google SecOps").err().unwrap();
+        assert_eq!(e, "AUDIT_EXPORT_GCP_AUTH must be metadata or service-account-key, not \"key\"");
     }
 
     #[test]
