@@ -796,6 +796,10 @@ struct Bot {
 
 const BOT_USER_FILE: &str = "bot-user.json";
 
+/// The folder, in the state folder, where an install keeps the npm registry's login
+/// (ADR 0219): apart from the tools and the home, which are opened or handed to Bots.
+pub const NPM_LOGIN_DIR: &str = "npm-login";
+
 /// The Bots' user, saved before it's handed the home, so a restart part-way picks up
 /// where it stopped rather than running as root in a home that may already be its.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -884,7 +888,11 @@ impl Agent {
     /// upgrade, the clock on the new agent's trial.
     pub fn new(cfg: Config, id: Identity) -> Result<Arc<Agent>, String> {
         let server = Arc::new(server_config(&cfg, &id)?);
-        let tools = Tools::new(cfg.tools.clone(), Some(cfg.ca_pem.as_str()).filter(|p| !p.is_empty()))?;
+        let login = cfg.state_dir.join(NPM_LOGIN_DIR);
+        if super::tools::inside(&login, &cfg.home) {
+            return Err(format!("{} is in SUPERBOT_HOME, which is the Bots'; set it apart from the state folder", login.display()));
+        }
+        let tools = Tools::new(cfg.tools.clone(), Some(cfg.ca_pem.as_str()).filter(|p| !p.is_empty()), login)?;
         let bot = load_bot_user(&cfg, &tools);
         if bot.status.is_none() {
             std::fs::DirBuilder::new()

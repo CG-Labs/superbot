@@ -77,6 +77,9 @@ pub struct Tools {
     root: std::sync::OnceLock<PathBuf>,
     /// Downloads from botd itself (ADR 0210).
     control: std::sync::OnceLock<Control>,
+    /// Where an install keeps the registry's login (ADR 0219): never in the tools,
+    /// since `open_up` opens everything in them to Bots, at any time.
+    login: PathBuf,
 }
 
 /// Downloads from botd's machine port, which wants this machine's certificate: `url`
@@ -201,6 +204,21 @@ pub fn npmrc(l: &wire::NpmLogin) -> Result<String, String> {
         _ => unreachable!("check_login takes exactly one"),
     };
     Ok(format!("{dart}:{key}={v}\n"))
+}
+
+/// Whether `p` is `root` or in it, as the file system resolves them (links, `.`, `..`,
+/// a trailing `/`). Neither needs to exist: what doesn't is taken as written.
+pub fn inside(p: &Path, root: &Path) -> bool {
+    fn real(p: &Path) -> PathBuf {
+        if let Ok(r) = p.canonicalize() {
+            return r;
+        }
+        match (p.parent(), p.file_name()) {
+            (Some(d), Some(n)) => real(d).join(n),
+            _ => p.to_path_buf(),
+        }
+    }
+    real(p).starts_with(real(root))
 }
 
 /// `text` with every value in `hide` taken out, for an error that leaves the machine.
@@ -370,9 +388,13 @@ pub fn download_builder(extra_root: Option<&str>, ca: Option<&str>) -> Result<re
 
 impl Tools {
     /// `extra_root`: a CA trusted for downloads besides the system's (the control
-    /// plane's, so botd could serve them too).
-    pub fn new(dir: PathBuf, extra_root: Option<&str>) -> Result<Arc<Tools>, String> {
+    /// plane's, so botd could serve them too). `login`: a folder, apart from the tools,
+    /// for the registry's login while npm runs.
+    pub fn new(dir: PathBuf, extra_root: Option<&str>, login: PathBuf) -> Result<Arc<Tools>, String> {
         std::fs::create_dir_all(dir.join("bin")).map_err(|e| format!("{}: {e}", dir.display()))?;
+        if inside(&login, &dir) {
+            return Err(format!("{} is in the tools folder {}, which Bots read; the npm login can't be kept there", login.display(), dir.display()));
+        }
         let http = download_client(extra_root, None)?;
         let saved = std::fs::read(dir.join(STATE_FILE))
             .ok()
@@ -389,9 +411,12 @@ impl Tools {
             open: Default::default(),
             root: Default::default(),
             control: Default::default(),
+            login,
         });
-        // An install a restart cut short starts again, and its login is gone first.
-        let _ = std::fs::remove_dir_all(t.login_dir());
+        // An install a restart cut short starts again. Its login, and the downloads
+        // folder agents before this kept one in, are gone before anything opens the tools.
+        let _ = std::fs::remove_dir_all(&t.login);
+        let _ = std::fs::remove_dir_all(t.dir.join(".dl"));
         {
             let mut s = t.lock();
             for st in s.status.values_mut() {
@@ -615,20 +640,12 @@ impl Tools {
     async fn in_dl(&self, step: impl std::future::Future<Output = Result<(), String>>) -> Result<(), String> {
         let dl = self.dir.join(".dl");
         let _ = std::fs::remove_dir_all(&dl);
-        let _ = std::fs::remove_dir_all(self.login_dir());
+        let _ = std::fs::remove_dir_all(&self.login);
         std::fs::create_dir_all(&dl).map_err(|e| e.to_string())?;
         let res = step.await;
         let _ = std::fs::remove_dir_all(&dl);
-        let _ = std::fs::remove_dir_all(self.login_dir());
+        let _ = std::fs::remove_dir_all(&self.login);
         res
-    }
-
-    /// Where an install keeps the registry's login (ADR 0219): beside the tools, not in
-    /// them, since `open_up` opens everything in them to Bots, at any time.
-    fn login_dir(&self) -> PathBuf {
-        let mut d = self.dir.clone().into_os_string();
-        d.push(".login");
-        PathBuf::from(d)
     }
 
     async fn install(&self, h: &HarnessInstall, node: Option<&NodeRuntime>) -> Result<String, String> {
@@ -774,8 +791,8 @@ impl Tools {
 
     /// npm's environment, and what to take out of its errors. With the plan's registry,
     /// npm asks it and nothing else; with its CA, written into `.dl`, Node trusts that
-    /// besides its own roots; with its login, written into `.dl` for root alone, npm
-    /// signs in to that registry and nowhere else.
+    /// besides its own roots; with its login, written into the login folder for root
+    /// alone, npm signs in to that registry and nowhere else.
     async fn npm_env(&self) -> Result<(Vec<(&'static str, String)>, Vec<String>), String> {
         let mut env = vec![
             ("PATH", self.path()),
@@ -792,8 +809,8 @@ impl Tools {
             let registry = registry.as_deref().ok_or("a login is only for the plan's own npm registry")?;
             let l = self.npm_login(registry).await?;
             hide.extend(l.token.iter().chain(l.auth.iter()).cloned());
-            let dir = self.login_dir();
-            let _ = std::fs::remove_dir_all(&dir);
+            let dir = &self.login;
+            let _ = std::fs::remove_dir_all(dir);
             std::fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
             let file = dir.join("npmrc");
             let mut f = std::fs::OpenOptions::new()
@@ -1137,6 +1154,11 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, String> + Sen
 mod tests {
     use super::*;
 
+    /// A login folder for the tools in `dir`, apart from them, as the agent's is.
+    fn login_for(dir: &Path) -> PathBuf {
+        PathBuf::from(format!("{}-login", dir.display()))
+    }
+
     fn npm(name: &str, package: &str, version: &str) -> HarnessInstall {
         HarnessInstall {
             name: name.into(),
@@ -1249,7 +1271,7 @@ mod tests {
         const AFTER: &str = "mkdir -p \"$HOME/shared\" && printf '#!/bin/sh\\necho shared\\n' > \"$HOME/shared/tool\" && chmod +x \"$HOME/shared/tool\"\n";
         let sha: String = Sha256::digest(INSTALLER).iter().map(|b| format!("{b:02x}")).collect();
         let dir = std::env::temp_dir().join(format!("superbot-tools-after-{}", now_ms()));
-        let t = Tools::new(dir.clone(), None).unwrap();
+        let t = Tools::new(dir.clone(), None, login_for(&dir)).unwrap();
         let url = serve_once(INSTALLER).await;
         t.in_dl(t.script("hermes", &url, &sha, &[], "shared/tool", Some(AFTER))).await.unwrap();
         let out = std::process::Command::new(dir.join("bin/hermes")).output().unwrap();
@@ -1268,7 +1290,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let arch = std::env::consts::ARCH;
         let dir = std::env::temp_dir().join(format!("superbot-tools-bundle-{}", now_ms()));
-        let t = Tools::new(dir.join("tools"), None).unwrap();
+        let t = Tools::new(dir.join("tools"), None, dir.join("login")).unwrap();
         t.set_root(dir.join("root"));
         let body = hermes_bundle::standin::good(arch, "#!/bin/sh\necho hermes 0.23.3\n");
         let sha: String = Sha256::digest(&body).iter().map(|b| format!("{b:02x}")).collect();
@@ -1366,7 +1388,7 @@ mod tests {
     #[test]
     fn a_recipe_corrected_mid_install_is_installed_again() {
         let dir = std::env::temp_dir().join(format!("superbot-tools-corrected-{}", now_ms()));
-        let t = Tools::new(dir, None).unwrap();
+        let t = Tools::new(dir.clone(), None, login_for(&dir)).unwrap();
         let node = NodeRuntime {
             version: "24.22.3".into(),
             downloads: BTreeMap::from([("x86_64".into(), wire::Download { url: "https://nodejs.org/n.tar.xz".into(), sha256: "a".repeat(64) })]),
@@ -1396,7 +1418,7 @@ mod tests {
     fn a_new_node_or_pin_installs_again() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("superbot-tools-node-{}", now_ms()));
-        let t = Tools::new(dir, None).unwrap();
+        let t = Tools::new(dir.clone(), None, login_for(&dir)).unwrap();
         let claude = t.bin_dir().join("claude");
         std::fs::write(&claude, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1458,7 +1480,7 @@ mod tests {
     fn a_new_pin_for_an_installed_version_is_checked() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("superbot-tools-pin-{}", now_ms()));
-        let t = Tools::new(dir, None).unwrap();
+        let t = Tools::new(dir.clone(), None, login_for(&dir)).unwrap();
         let claude = t.bin_dir().join("claude");
         std::fs::write(&claude, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1489,7 +1511,7 @@ mod tests {
     #[tokio::test]
     async fn replacing_waits_for_running_jobs_and_holds_new_ones() {
         let dir = std::env::temp_dir().join(format!("superbot-tools-gate-{}", now_ms()));
-        let t = Tools::new(dir, None).unwrap();
+        let t = Tools::new(dir.clone(), None, login_for(&dir)).unwrap();
         let job = t.job_permit().unwrap();
         let (got_tx, got_rx) = tokio::sync::oneshot::channel();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1553,7 +1575,7 @@ mod tests {
         // A machine whose botd answers `/v1/npm-login` with `body`, or none at all.
         let machine = |n: u32, control: Option<String>| {
             let dir = std::env::temp_dir().join(format!("superbot-tools-login-{}-{n}", now_ms()));
-            let t = Tools::new(dir.clone(), None).unwrap();
+            let t = Tools::new(dir.clone(), None, login_for(&dir)).unwrap();
             t.set_plan(plan.clone()).unwrap();
             if let Some(url) = control {
                 t.set_control(&url, Box::new(|| download_client(None, None)));
@@ -1600,14 +1622,76 @@ mod tests {
         assert!(!seen.4.parent().unwrap().exists(), "the login goes when the install ends");
         assert!(!std::fs::read_to_string(dir.join(STATE_FILE)).unwrap().contains("tok-1234-abcd"), "and is never saved");
 
-        // One a restart cut short is gone before anything opens the tools again.
-        let left = t.login_dir();
-        std::fs::create_dir_all(&left).unwrap();
-        std::fs::write(left.join("npmrc"), "left over").unwrap();
-        drop(t);
-        let t = Tools::new(dir.clone(), None).unwrap();
-        assert!(!t.login_dir().exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The agent stops while npm runs, and starts again: it opens the tools to Bots
+    /// (loading the Bots' user) before any install runs. No login is left for them.
+    #[tokio::test]
+    async fn a_login_a_restart_cut_short_is_gone_before_the_tools_open() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let registry = "https://mirror.corp.example/";
+        let token = "tok-left-over-9z";
+        let dir = std::env::temp_dir().join(format!("superbot-tools-restart-{}", now_ms()));
+        let login = login_for(&dir);
+        let t = Tools::new(dir.clone(), None, login.clone()).unwrap();
+        let node = NodeRuntime { version: "0.0.1".into(), downloads: BTreeMap::from([(std::env::consts::ARCH.into(), wire::Download { url: "https://mirror.corp.example/n.tar.xz".into(), sha256: "a".repeat(64) })]) };
+        t.set_plan(HarnessPlan { node: Some(node), harnesses: vec![npm("pi", "p", "1.0.0")], npm_registry: Some(registry.into()), ca: None, npm_login: true }).unwrap();
+        let body = serde_json::to_string(&wire::NpmLogin { registry: registry.into(), token: Some(token.into()), auth: None }).unwrap();
+        t.set_control(serve_once(body).await.trim_end_matches("/install.sh"), Box::new(|| download_client(None, None)));
+        // Mid-install: the login is written, and the agent stops before removing it.
+        std::fs::create_dir_all(dir.join(".dl")).unwrap();
+        let (env, _) = t.npm_env().await.unwrap();
+        let file = env.iter().find(|(k, _)| *k == "npm_config_userconfig").map(|(_, v)| PathBuf::from(v)).unwrap();
+        assert!(file.starts_with(&login) && std::fs::read_to_string(&file).unwrap().contains(token));
+        // An agent before this kept it in `.dl`.
+        let old = dir.join(".dl/npmrc");
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&old).unwrap();
+        std::io::Write::write_all(&mut f, format!("//mirror.corp.example/:_authToken={token}\n").as_bytes()).unwrap();
+        drop((f, t));
+
+        let t = Tools::new(dir.clone(), None, login.clone()).unwrap();
+        t.open_up().unwrap();
+        assert!(!login.exists() && !dir.join(".dl").exists(), "both are gone");
+        fn readable(p: &Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(p).unwrap().flatten() {
+                let (path, m) = (e.path(), std::fs::symlink_metadata(e.path()).unwrap());
+                if m.is_dir() {
+                    readable(&path, out);
+                } else if m.is_file() && m.permissions().mode() & 0o004 != 0 {
+                    out.push(path);
+                }
+            }
+        }
+        let mut open = Vec::new();
+        readable(&dir, &mut open);
+        for p in open {
+            assert!(!std::fs::read_to_string(&p).unwrap_or_default().contains(token), "{} holds the login", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_login_folder_is_never_in_the_tools_however_their_path_is_written() {
+        let dir = std::env::temp_dir().join(format!("superbot-tools-apart-{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = PathBuf::from(format!("{}-link", dir.display()));
+        symlink(&dir, &link).unwrap();
+        let s = dir.display().to_string();
+        for (tools, login) in [
+            (PathBuf::from(format!("{s}/")), PathBuf::from(format!("{s}/.login"))),
+            (PathBuf::from(format!("{s}/.")), dir.join("npm-login")),
+            (dir.join("sub/.."), dir.join("npm-login")),
+            (link.clone(), dir.join("npm-login")),
+            (dir.clone(), link.join("npm-login")),
+            (dir.clone(), dir.clone()),
+        ] {
+            let err = Tools::new(tools.clone(), None, login.clone()).err().unwrap_or_else(|| panic!("{} in {}", login.display(), tools.display()));
+            assert!(err.contains("which Bots read"), "{err}");
+        }
+        assert!(Tools::new(PathBuf::from(format!("{s}/")), None, login_for(&dir)).is_ok(), "beside them is apart");
+        assert!(inside(&dir.join("a/b"), &dir) && !inside(&login_for(&dir), &dir) && !inside(&dir, &dir.join("a")));
+        let _ = (std::fs::remove_dir_all(&dir), std::fs::remove_file(&link), std::fs::remove_dir_all(login_for(&dir)));
     }
 
     #[test]
