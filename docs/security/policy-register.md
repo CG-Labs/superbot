@@ -5,7 +5,7 @@ The records the [policy set](policies/README.md) calls for that people keep, in 
 ## Keeping it
 
 - **Private.** The register names people, so it lives in the security owner's evidence store, never in this repository. Start from the [template](policy-register-template.json), replace every `<...>` placeholder, date and zero digest, and give each person an id that isn't their name or email (`person-1`, `p-042`): ids are all the bundle carries.
-- **As things happen.** Add a record when a role changes hands, a policy is approved, someone joins, acknowledges or trains, a risk is found or reviewed, management meets, a vendor is taken on or reviewed, or an exception is approved or reviewed. Records are only added or closed, never rewritten: the bundle's manifest records the register's SHA-256, and the register as read is kept beside each bundle.
+- **As things happen.** Add a record when a role changes hands, a policy is approved, someone joins, acknowledges or trains, a risk is found or reviewed, management meets, a vendor is taken on or reviewed, an exception is approved or reviewed, or a conduct concern is received, triaged or closed. Records are only added or closed, never rewritten: the bundle's manifest records the register's SHA-256, and the register as read is kept beside each bundle.
 - **Checked monthly**, with the other bundles:
 
 ```sh
@@ -27,12 +27,26 @@ One JSON object. Dates are `YYYY-MM-DD` (UTC days); a record dated on or after t
 | `people` | Everyone with access to production systems or customer data: `id`, `name` (never in the bundle), `joined`, and `left` when they go. |
 | `roles` | Assignments of the policies' roles (Management, Security owner, Engineering lead, Operator, People lead, Privacy lead): `role`, `holder`, `deputy`, `from`, and `until` when it ends. End the old assignment with `until` when a role changes hands, since a role's assignments mustn't overlap; each role needs a holder and a deputy, not the same person, every day. |
 | `policyApprovals` | `policy` (its file name, such as `access-control`), `sha256` (`sha256sum` of the file as approved), `commit`, `approvedBy`, `approvedAt`. Each policy needs one within a year. |
-| `acknowledgements` | `person`, `policy`, `at`. Everyone acknowledges the information security and acceptable use policies within 30 days of joining (or of the policy's first approval) and yearly. |
+| `acknowledgements` | `person`, `policy`, `at`. Everyone acknowledges the information security, acceptable use and code of conduct policies within 30 days of joining (or of the policy's first approval) and yearly. |
 | `training` | `person`, `course`, `at`. Everyone takes `security-awareness` on the same terms. |
 | `risks` | `id`, `title` (never in the bundle), `owner` (a role), `likelihood` and `impact` (1 to 5), `treatment` (`reduce`, `accept`, `transfer` or `avoid`), `controls` (readiness checklist row ids, such as `CC6.1-1`; a reduced risk needs one), `fraud`, `identified`, `reviewed` (dates), `closed`, `notes`; for an accepted risk, `acceptedBy` (the owner role's holder, or Management; only Management above the appetite), `acceptedAt` and `acceptedUntil`, its next review. An accepted risk without a dated acceptance is reported. Each open risk is reviewed yearly, and at least one is a fraud risk. |
 | `riskReviews` | Full reviews of the register: `at`, `by`. One a year. |
 | `managementReviews` | `at`, `attendees`, `minutesSha256` (the minutes' SHA-256; the minutes go in the store). One a quarter, with Management and the security owner. |
 | `vendors` | `id`, `tier` (`critical`, `high` or `low`), `hosting` (it runs the service, so its assurance report covers CC6.4), `since`, `until`, `assessed`, `approvedBy` (the security owner or Management), `reviewed` (dates), `notes`. Assessed before use and reviewed yearly. |
 | `exceptions` | Exceptions to a policy: `id`, `policy`, `setting` (a [configuration baseline](configuration-baseline.md) setting, as in `BASELINE_EXCEPTIONS`), `approvedBy` (the security owner or Management), `approvedAt`, `ends` (within a year), `reviewed` (dates, each quarter), `closed`, `notes`. |
+| `conductConcerns` | Concerns raised under the [code of conduct](policies/code-of-conduct.md#raising-a-concern): `id`, `received`, `triaged` and `handledBy` (together), `closed` and `outcome` (together), `notes`. See [conduct concerns](#conduct-concerns). |
 
-The cadences are the policies' ([information security](policies/information-security.md), [vendor management](policies/vendor-management.md), [the policy set](policies/README.md#adopting-them)): a year is 365 days and a quarter 92. Change them in the policies first, then in [`register.rs`](../../server/src/bin/superbot-evidence/register.rs), whose unit tests check the template against the policies.
+## Conduct concerns
+
+The [code of conduct](policies/code-of-conduct.md#handling-concerns) has every concern recorded when it is received, triaged within 7 days by someone holding (or deputising) the People lead, Management or Security owner role, and closed within 90 days ([ADR 0214](../adr/0214-code-of-conduct-and-concerns-in-the-register.md)). The register holds only what shows that happened:
+
+```json
+{ "id": "CC-2027-01", "received": "2027-03-02", "triaged": "2027-03-04", "handledBy": "person-1",
+  "closed": "2027-04-10", "outcome": "not-substantiated" }
+```
+
+- `outcome` is `substantiated`, `not-substantiated`, `withdrawn` or `referred` (to an incident, the authorities or another process). A concern is triaged before it is closed, even one withdrawn.
+- Never put who raised a concern, who it is about, or what it says in the register, its ids or its `notes`: they go in the people lead's confidential case file. `notes` never reach the bundle, but the register is kept beside it.
+- A register with no concerns is normal. The bundle counts concerns by outcome and flags each triaged or closed late, or still open past its deadline, and each handled by someone not holding one of those roles that day.
+
+The cadences are the policies' ([information security](policies/information-security.md), [vendor management](policies/vendor-management.md), [code of conduct](policies/code-of-conduct.md), [the policy set](policies/README.md#adopting-them)): a year is 365 days and a quarter 92. Change them in the policies first, then in [`register.rs`](../../server/src/bin/superbot-evidence/register.rs), whose unit tests check the template against the policies.
