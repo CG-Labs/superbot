@@ -98,6 +98,15 @@ async function open(api: ReturnType<typeof mockApi>, u: ReturnType<typeof userEv
   await screen.findByLabelText("Revoke CI");
 }
 
+// The first render loads and transforms React Native's lazy modules, which on a cold, busy CI
+// runner takes longer than a test's 5 s; pay for it once here, with the list and a detail open.
+beforeAll(async () => {
+  const { unmount } = await show(mockApi());
+  await userEvent.setup().press(await screen.findByLabelText("Service account HR sync"));
+  await screen.findByLabelText("Revoke CI");
+  await unmount();
+}, 60_000);
+
 describe("ServiceAccountsAdmin (ADR 0143, 0152)", () => {
   beforeEach(() => jest.clearAllMocks());
 
