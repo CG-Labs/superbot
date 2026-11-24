@@ -574,10 +574,33 @@ fn off() -> ApiError {
     conflict("SCIM role groups are off on this server (SCIM_GROUP_ROLES=on turns them on, with SCIM_GROUPS=on).")
 }
 
-/// `GET /api/scim/role-groups`: every tenant's role groups, and whether SCIM_GROUP_ROLES is on.
+/// What an admin may declare now (ADR 0253): the roles each scope may give; the tenants
+/// botd knows (from SCIM tokens, the Google sync and groups already there), as
+/// suggestions, since a group may be declared before its tenant has a token; and the
+/// Google sync's role groups nobody has declared, which a pass never pushes.
+fn choices(app: &AppState, a: &Auth, all: &[ScimRoleGroup]) -> Value {
+    let google = a.scim.google.as_ref().map(|d| &d.settings);
+    let mut tenants: Vec<String> = app.db.scim_tokens().into_iter().map(|t| t.tenant).collect();
+    tenants.extend(google.map(|s| s.tenant.clone()));
+    tenants.extend(app.db.all_scim_groups().into_iter().map(|g| g.tenant));
+    tenants.extend(all.iter().map(|g| g.tenant.clone()));
+    tenants.sort();
+    tenants.dedup();
+    let undeclared: Vec<Value> = google
+        .map(|s| {
+            let declared = |email: &str| all.iter().any(|g| g.tenant == s.tenant && (g.display_name.eq_ignore_ascii_case(email) || g.declared_display_name.eq_ignore_ascii_case(email)));
+            s.role_groups.iter().filter(|e| !declared(e)).map(|e| json!({ "tenant": s.tenant, "displayName": e })).collect()
+        })
+        .unwrap_or_default();
+    json!({ "roles": super::roles::role_choices(app), "tenants": tenants, "undeclared": undeclared })
+}
+
+/// `GET /api/scim/role-groups`: every tenant's role groups, whether SCIM_GROUP_ROLES is
+/// on, and `choices` for declaring one.
 pub async fn list(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>) -> Json<Value> {
-    let all: Vec<Value> = app.db.all_scim_role_groups().iter().map(|g| view(&app, g)).collect();
-    Json(json!({ "enabled": a.scim.group_roles, "groups": a.scim.groups, "roleGroups": all }))
+    let groups = app.db.all_scim_role_groups();
+    let all: Vec<Value> = groups.iter().map(|g| view(&app, g)).collect();
+    Json(json!({ "enabled": a.scim.group_roles, "groups": a.scim.groups, "roleGroups": all, "choices": choices(&app, &a, &groups) }))
 }
 
 /// `POST /api/scim/role-groups {tenant, displayName, externalId?, role, scope?}`: declares
