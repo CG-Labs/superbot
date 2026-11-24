@@ -169,6 +169,7 @@ fn every_link_in_the_playbooks_resolves() {
     files.push(repo().join("docs/adr/0233-onboarding-check.md"));
     files.push(repo().join("docs/adr/0243-onboarding-check-in-the-console-and-the-bundle.md"));
     files.push(repo().join("docs/adr/0252-monthly-health-check.md"));
+    files.push(repo().join("docs/adr/0262-business-review-draft.md"));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links:\n{}", bad.join("\n"));
 }
@@ -517,6 +518,33 @@ fn the_health_check_page_documents_every_item_status_and_option() {
     }
     for (name, needle) in [("README.md", "botctl health-check"), ("tam.md", "botctl health-check")] {
         assert!(read(name).contains(needle), "{name} doesn't point at botctl health-check");
+    }
+}
+
+/// ADR 0262: the business review template explains `botctl business-review`, each of its
+/// options, the route, the audit action and the console's link, and says what botd fills in
+/// for each of its sections; the index and the TAM's cadence point at the command.
+#[test]
+fn the_business_review_template_documents_its_draft() {
+    let page = read("qbr-template.md");
+    let botctl = fs::read_to_string(repo().join("server/src/bin/botctl.rs")).unwrap();
+    let usage = botctl.lines().find(|l| l.contains("botctl business-review [")).expect("botctl's usage has business-review");
+    let options: Vec<&str> = usage.split(|c: char| c.is_whitespace() || "[]".contains(c)).filter(|w| w.starts_with('-')).collect();
+    assert_eq!(options, ["--to", "--json", "-o"], "the usage's options");
+    for o in options {
+        assert!(page.contains(&format!("| `{o}")), "qbr-template.md doesn't explain {o}");
+    }
+    for needle in ["support.business_review_drafted", "GET /api/support/business-review", "Draft business review", "## Draft it first"] {
+        assert!(page.contains(needle), "qbr-template.md doesn't mention {needle}");
+    }
+    let sections: Vec<&str> = page.lines().filter_map(|l| l.strip_prefix("### ")).filter(|l| l.starts_with(|c: char| c.is_ascii_digit())).collect();
+    assert_eq!(sections.len(), 7, "the template's sections: {sections:?}");
+    let fills = page.split("## Draft it first").nth(1).unwrap().split("\n---").next().unwrap();
+    for s in sections {
+        assert!(fills.contains(&format!("| {s} |")), "the draft's table doesn't say what botd fills in for {s}");
+    }
+    for (name, needle) in [("README.md", "botctl business-review"), ("tam.md", "botctl business-review")] {
+        assert!(read(name).contains(needle), "{name} doesn't point at botctl business-review");
     }
 }
 

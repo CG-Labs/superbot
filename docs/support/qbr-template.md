@@ -4,6 +4,44 @@ A template for the review the technical account manager (TAM) holds each quarter
 
 Keep it free of personal data that isn't needed: people by role, Bots by purpose, incidents by ticket number. The [health score](health-score.md) report has no names or emails and can be pasted as it is.
 
+Start with `botctl business-review` ([below](#draft-it-first)): it fills in what botd recorded over the quarter, so the TAM's time goes on goals, tickets and what's next.
+
+## Draft it first
+
+```sh
+# The last three whole months, as this template in Markdown
+botctl business-review -o review-2026-q3.md
+
+# A quarter ending with another month (this month at the latest)
+botctl business-review --to 2026-09 -o review-2026-q3.md
+
+# For a CRM or a deck
+botctl business-review --to 2026-09 --json
+```
+
+| Option | What it does |
+|---|---|
+| `--to <YYYY-MM>` | The quarter's last month, UTC. The last whole month by default; this month shows its figures so far and says so |
+| `--json` | The figures as botd sends them, from `GET /api/support/business-review?to=<YYYY-MM>` (admins only), instead of Markdown |
+| `-o <file>` | Save it, readable by you only, instead of printing it |
+
+It runs on the customer's server, signed in as an admin (`BOTD_TOKEN`, or the password); on a self-hosted one, the customer's admin runs it and sends the file. The console's Support tab has the same as **Draft business review**, with the month to end on. Each draft is recorded in the audit log as `support.business_review_drafted`, with its months and counts. Design: [ADR 0262](../adr/0262-business-review-draft.md).
+
+What botd fills in, month by month or for the quarter:
+
+| Section | From botd's records | Left to fill in |
+|---|---|---|
+| Heading | botd's version and data regions | The customer, attendees, deployment type |
+| 1. Their goals | Nothing | All of it |
+| 2. Health | The score and band botd recorded at each month's end ([history](health-score.md#history)), the signals at watch or at risk then, the month's health checks (`support.health_checked`) with the last one's open items, the quarter's trend, and each signal flagged | What was done about each signal |
+| 3. Adoption and usage | People active in the last 30 days and licensed seats now; runs finished, failed or timed out, refused at a plan's limit, token limits reached and runs held to run limits, by month; runs and failures by harness for the quarter | Seats bought, teams that grew or stopped (`botctl usage`) |
+| 4. Support and incidents | Status page incidents posted in the quarter or still open: impact, times, duration and whether a review was drafted ([drafts](incident-review.md#the-review-draft)); the `botctl support-report` command for the quarter's months | Tickets, each Severity 1 and 2's cause and actions |
+| 5. Security, compliance and data | Access reviews signed off; changes to native SAML, SCIM tokens, custom roles, role grants and residency pins; single sign-on, SCIM and approval failures, machine backup failures and residency refusals by month; backups now, machine restores and residency warnings | The last restore drill, security pack and DPA changes |
+| 6. What's next | botd's version, and when the license ends | Releases that matter, roadmap asks, their plans |
+| 7. Actions | A row for each signal at watch or at risk at the quarter's end, each incident still open and each major or critical one with no review | Owners, dates, the rest |
+
+Like the health check, it holds codes, counts, dates, harness names, region ids and incident ids: never a person's name or email, an incident's title, an address or a bucket. Months are calendar months in UTC. When the audit log keeps less than the quarter reaches back (`AUDIT_RETENTION_DAYS`), the draft says its earliest months show fewer events than happened.
+
 ---
 
 ## `<customer>`: business review, `<quarter>`
