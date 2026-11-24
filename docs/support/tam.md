@@ -24,7 +24,7 @@ A TAM doesn't replace support: tickets still go to `<support-email>` or `<suppor
 | When | What | With | Output |
 |---|---|---|---|
 | Within 5 business days of signing | Kickoff ([agenda](#kickoff-agenda)) | The customer's owner, IdP admin and security contact | Onboarding plan and dates, in the customer's record |
-| Weekly until go-live | Onboarding check-in: the checklists' open items, blockers | The customer's owner | Updated checklists |
+| Weekly until go-live | Onboarding check-in: the checklists' open items (`botctl onboarding`, [onboarding check](onboarding-check.md)), blockers | The customer's owner | Updated checklists |
 | Week 1 after go-live | Check-in: sign-in, approvals, first runs, open tickets | The customer's owner and pilot team | Issues raised as tickets |
 | Monthly | [Health check](health-check.md), with the [health score](health-score.md) | The TAM alone, then a short call with the customer's owner if anything is watch or at risk | Score and notes in the customer's record |
 | Quarterly | [Business review](qbr-template.md) | The customer's sponsor and owner | The review document, actions with owners |
@@ -39,7 +39,7 @@ The health score is a prompt, not a verdict: a TAM who sees a signal at risk cal
 1. Introductions: the TAM, the backup TAM, the customer's owner, IdP admin, security contact, and who may raise Severity 1.
 2. What they bought: plan, seats, support tier and the Enterprise targets in the order form ([severity](severity.md#enterprise-defaults)).
 3. The deployment: where it runs, who operates it, network limits (air-gapped, proxies, an outbound allow-list), and the data region.
-4. The [onboarding checklists](onboarding.md), who does each part, and the dates.
+4. The [onboarding checklists](onboarding.md), who does each part, and the dates. Run `botctl onboarding` on their server to see what's already done, and agree which items they don't need ([skips](onboarding-check.md#running-it)).
 5. The pilot team and what success looks like for them in the first month: who uses it, for what, and how they'll tell.
 6. How to get help: channels, severity, escalation, the status page, and a first [support bundle](support-bundle.md) made together.
 7. The cadence above, and the first dates in calendars.
@@ -56,4 +56,4 @@ When a customer changes TAM, or the TAM is away for more than two weeks, write i
 
 ## Records
 
-Everything about a customer (contacts, the onboarding record, health checks, reviews, handovers) is kept in the Provider's support system or CRM, with access limited to the people who work with them. Not in this repository, not in a ticket other customers' staff can see, and not in a Bot's chat. The health score and support bundle carry no personal data, so they can be attached; anything copied from the console or the audit log can, so trim it first.
+Everything about a customer (contacts, the onboarding record, health checks, reviews, handovers) is kept in the Provider's support system or CRM, with access limited to the people who work with them. Not in this repository, not in a ticket other customers' staff can see, and not in a Bot's chat. The health score, onboarding check and support bundle carry no personal data, so they can be attached; anything copied from the console or the audit log can, so trim it first.
