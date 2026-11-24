@@ -14,6 +14,9 @@
 //! - `azure-monitor://<host>/<dcr>/<stream>`: records in a Log Analytics workspace, for
 //!   Microsoft Sentinel, through Azure Monitor's Logs Ingestion API, signed in with
 //!   Entra ID ([`crate::audit_azure`], ADR 0217).
+//! - `google-secops://<location>/<project>/<instance>/<log type>`: raw logs in a Google
+//!   SecOps instance through the Chronicle API's `logs:import`, signed in as botd's
+//!   Google identity ([`crate::audit_secops`], ADR 0237).
 //!
 //! Off unless `AUDIT_EXPORT` is set. Delivery is at least once, in id order: a cursor
 //! in the database (per sink) moves only when a batch is accepted, a failed batch is
@@ -48,6 +51,7 @@ const FACILITY: u8 = 13;
 pub const MAX_SIEMS: usize = 4;
 const MAX_NAME: usize = 24;
 const MONITOR_SIGNS_IN: &str = "Azure Monitor signs in with Entra ID (AUDIT_EXPORT_AZURE_AUTH)";
+const SECOPS_SIGNS_IN: &str = "Google SecOps signs in to Google as botd (AUDIT_EXPORT_GCP_AUTH)";
 
 enum Kind {
     /// `headers_from` names the setting the headers came from, for the startup line.
@@ -55,6 +59,7 @@ enum Kind {
     Syslog { host: String, port: u16, tls: bool },
     Archive(Box<crate::audit_archive::Archive>),
     Monitor(Box<crate::audit_azure::Monitor>),
+    SecOps(Box<crate::audit_secops::SecOps>),
 }
 
 pub struct Sink {
@@ -126,6 +131,7 @@ impl Sink {
             Kind::Syslog { .. } => "syslog",
             Kind::Archive(_) => "s3",
             Kind::Monitor(_) => "azure-monitor",
+            Kind::SecOps(_) => "google-secops",
         }
     }
 
@@ -133,6 +139,14 @@ impl Sink {
     pub(crate) fn monitor_mut(&mut self) -> Option<&mut crate::audit_azure::Monitor> {
         match &mut self.kind {
             Kind::Monitor(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn secops_mut(&mut self) -> Option<&mut crate::audit_secops::SecOps> {
+        match &mut self.kind {
+            Kind::SecOps(g) => Some(g),
             _ => None,
         }
     }
@@ -162,7 +176,7 @@ impl Sink {
     }
 
     /// Whether what goes to it is gzipped: its request bodies, or the archive's objects.
-    fn gzipped(&self) -> bool {
+    pub(crate) fn gzipped(&self) -> bool {
         self.gzip || self.archive().is_some_and(|a| a.gzip)
     }
 
@@ -183,8 +197,12 @@ impl Sink {
         Sink { shown: m.shown(), id: m.id(), kind: Kind::Monitor(Box::new(m)), name: None, start: None, gzip: false }
     }
 
+    fn from_secops(g: crate::audit_secops::SecOps) -> Sink {
+        Sink { shown: g.shown(), id: g.id(), kind: Kind::SecOps(Box::new(g)), name: None, start: None, gzip: false }
+    }
+
     pub fn parse(raw: &str, insecure: bool) -> Result<Sink, String> {
-        let bad = |why: &str| format!("AUDIT_EXPORT must be https://<host>/<path>, syslog+tls://<host>[:<port>], azure-monitor://<host>/<dcr>/<stream> or s3://<bucket>[/<prefix>]: {why}");
+        let bad = |why: &str| format!("AUDIT_EXPORT must be https://<host>/<path>, syslog+tls://<host>[:<port>], azure-monitor://<host>/<dcr>/<stream>, google-secops://<location>/<project>/<instance>/<log type> or s3://<bucket>[/<prefix>]: {why}");
         let u = url::Url::parse(raw.trim()).map_err(|_| bad("it isn't a URL"))?;
         let host = u.host_str().filter(|h| !h.is_empty()).ok_or_else(|| bad("no host"))?.to_string();
         let loopback = matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]");
@@ -212,22 +230,23 @@ impl Sink {
                 let host = host.trim_start_matches('[').trim_end_matches(']').to_string();
                 (Kind::Syslog { host, port, tls }, Some(port))
             }
-            _ => return Err(bad("use https, syslog+tls, syslog+tcp, azure-monitor or s3")),
+            _ => return Err(bad("use https, syslog+tls, syslog+tcp, azure-monitor, google-secops or s3")),
         };
         let port = port.map(|p| format!(":{p}")).unwrap_or_default();
         let (shown, id) = match &kind {
             Kind::Webhook { .. } => (format!("{}://{host}{port}", u.scheme()), format!("{}://{host}{port}{}", u.scheme(), u.path())),
             Kind::Syslog { .. } => (format!("{}://{host}{port}", u.scheme()), format!("{}://{host}{port}", u.scheme())),
-            Kind::Archive(_) | Kind::Monitor(_) => unreachable!("s3:// and azure-monitor:// sinks are read with their settings"),
+            Kind::Archive(_) | Kind::Monitor(_) | Kind::SecOps(_) => unreachable!("s3://, azure-monitor:// and google-secops:// sinks are read with their settings"),
         };
         Ok(Sink { kind, shown, id, name: None, start: None, gzip: false })
     }
 }
 
 /// `AUDIT_EXPORT_COMPRESS` for every webhook and Azure Monitor sink, and
-/// `AUDIT_EXPORT_COMPRESS_<NAME>` for a named one, which wins (ADR 0227). Syslog has no
-/// compression and the archive has its own `AUDIT_EXPORT_S3_COMPRESS`, so a setting that
-/// would do nothing stops botd rather than look as if it did.
+/// `AUDIT_EXPORT_COMPRESS_<NAME>` for a named one, which wins (ADR 0227). Syslog and Google
+/// SecOps have no compression and the archive has its own `AUDIT_EXPORT_S3_COMPRESS`, so a
+/// setting that would do nothing stops botd rather than look as if it did. The server-wide
+/// one leaves a SecOps sink plain (ADR 0237).
 fn compression(sinks: &mut [Sink], get: &dyn Fn(&str) -> String) -> Result<(), String> {
     const FOR: &str = "is for https and azure-monitor sinks";
     let all = compress_from("AUDIT_EXPORT_COMPRESS", &get("AUDIT_EXPORT_COMPRESS"))?;
@@ -241,12 +260,13 @@ fn compression(sinks: &mut [Sink], get: &dyn Fn(&str) -> String) -> Result<(), S
         match (&s.kind, mine) {
             (Kind::Webhook { .. } | Kind::Monitor(_), mine) => s.gzip = mine.or(all).unwrap_or(false),
             (Kind::Syslog { .. }, Some(true)) => return Err(format!("{var} {FOR}; syslog has no compression")),
+            (Kind::SecOps(_), Some(true)) => return Err(format!("{var} {FOR}; the Chronicle API takes no compressed bodies")),
             (Kind::Archive(_), Some(_)) => return Err(format!("{var} {FOR}; the archive's is AUDIT_EXPORT_S3_COMPRESS")),
             _ => {}
         }
     }
     if all == Some(true) && !sinks.iter().any(|s| matches!(s.kind, Kind::Webhook { .. } | Kind::Monitor(_))) {
-        return Err(format!("AUDIT_EXPORT_COMPRESS {FOR}, and AUDIT_EXPORT has none: syslog has no compression, and the archive's is AUDIT_EXPORT_S3_COMPRESS"));
+        return Err(format!("AUDIT_EXPORT_COMPRESS {FOR}, and AUDIT_EXPORT has none: syslog and Google SecOps have no compression, and the archive's is AUDIT_EXPORT_S3_COMPRESS"));
     }
     Ok(())
 }
@@ -292,6 +312,8 @@ impl Settings {
                 Sink::from_archive(crate::audit_archive::Archive::from_env(v, get, store)?)
             } else if lower.starts_with("azure-monitor://") {
                 Sink::from_monitor(crate::audit_azure::Monitor::from_env(v, get, store)?)
+            } else if lower.starts_with("google-secops://") {
+                Sink::from_secops(crate::audit_secops::SecOps::from_env(v, get, store)?)
             } else {
                 Sink::parse(v, insecure)?
             };
@@ -312,7 +334,7 @@ impl Settings {
         let archives = sinks.iter().filter(|s| s.archive().is_some()).count();
         let siems = sinks.len() - archives;
         if archives > 1 || siems > MAX_SIEMS {
-            return Err(format!("AUDIT_EXPORT takes up to {MAX_SIEMS} SIEMs (https://, syslog+tls:// or azure-monitor://) and one archive (s3://) at most, split by commas"));
+            return Err(format!("AUDIT_EXPORT takes up to {MAX_SIEMS} SIEMs (https://, syslog+tls://, azure-monitor:// or google-secops://) and one archive (s3://) at most, split by commas"));
         }
         if siems > 1 && let Some(s) = sinks.iter().find(|s| s.siem() && s.name.is_none()) {
             return Err(format!(
@@ -336,6 +358,7 @@ impl Settings {
                 Kind::Syslog { .. } => return Err(format!("{var} is for an https sink; syslog over TLS has no headers")),
                 Kind::Archive(_) => return Err(format!("{var} is for an https sink; the S3 archive signs with AUDIT_EXPORT_S3_ACCESS_KEY_ID and _SECRET_ACCESS_KEY")),
                 Kind::Monitor(_) => return Err(format!("{var} is for an https sink; {MONITOR_SIGNS_IN}")),
+                Kind::SecOps(_) => return Err(format!("{var} is for an https sink; {SECOPS_SIGNS_IN}")),
             }
         }
         if let Some(h) = store.get("AUDIT_EXPORT_HEADERS").map_err(|e| e.to_string())? {
@@ -351,6 +374,7 @@ impl Settings {
                     *headers_from = "AUDIT_EXPORT_HEADERS".into();
                 }
                 Some((_, Kind::Monitor(_))) => return Err(format!("AUDIT_EXPORT_HEADERS is for an https sink; {MONITOR_SIGNS_IN}")),
+                Some((_, Kind::SecOps(_))) => return Err(format!("AUDIT_EXPORT_HEADERS is for an https sink; {SECOPS_SIGNS_IN}")),
                 Some(_) => return Err("AUDIT_EXPORT_HEADERS is for an https sink; syslog over TLS has no headers".into()),
                 None => return Err("AUDIT_EXPORT_HEADERS is for an https sink; the S3 archive signs with AUDIT_EXPORT_S3_ACCESS_KEY_ID and _SECRET_ACCESS_KEY".into()),
             }
@@ -378,6 +402,7 @@ impl Settings {
                     Kind::Archive(a) => a.describe(),
                     Kind::Monitor(m) if s.gzip => format!("{}, gzipped", m.describe()),
                     Kind::Monitor(m) => m.describe(),
+                    Kind::SecOps(g) => g.describe(),
                 };
                 let from = match (s.start, &s.name) {
                     (Some(Start::All), Some(n)) => format!(", starting with the history kept ({})", own("AUDIT_EXPORT_START", n)),
@@ -470,6 +495,7 @@ impl Exporter {
         match &self.sink.kind {
             Kind::Archive(a) => v["archive"] = a.view(s.archived.as_ref()),
             Kind::Monitor(m) => v["azureMonitor"] = m.view(),
+            Kind::SecOps(g) => v["googleSecOps"] = g.view(),
             _ => {}
         }
         v
@@ -753,6 +779,7 @@ enum Out {
     Syslog { conn: Option<Box<dyn Stream>>, tls: Option<Arc<rustls::ClientConfig>> },
     Archive(crate::audit_archive::Client),
     Monitor(crate::audit_azure::Client),
+    SecOps(crate::audit_secops::Client),
 }
 
 impl Out {
@@ -764,6 +791,7 @@ impl Out {
             Kind::Syslog { tls, .. } => Out::Syslog { conn: None, tls: tls.then(platform_tls) },
             Kind::Archive(a) => Out::Archive(crate::audit_archive::Client::new(a)),
             Kind::Monitor(m) => Out::Monitor(crate::audit_azure::Client::new(m)),
+            Kind::SecOps(g) => Out::SecOps(crate::audit_secops::Client::new(g)),
         }
     }
 
@@ -784,6 +812,11 @@ impl Out {
                 })
                 .collect();
             return client.send(m, &records, sink.gzip).await.map(|()| None);
+        }
+        if let (Out::SecOps(client), Kind::SecOps(g)) = (&mut *self, &sink.kind) {
+            let at = now();
+            let logs: Vec<Value> = rows.iter().map(|e| crate::audit_secops::log(&line_with(e, host, extras.get(&e.id), e.id > sealed_after), &e.time, &crate::audit_secops::collected(e.at, at))).collect();
+            return client.send(g, &logs).await.map(|()| None);
         }
         self.send_stream(sink, rows, extras, host, sealed_after).await.map(|()| None).map_err(|e| ("delivery_failed", e))
     }
@@ -1096,7 +1129,7 @@ pub(crate) mod tests {
         for (vars, why) in [
             (vec![("AUDIT_EXPORT", "https://siem.example.net/in"), ("AUDIT_EXPORT_COMPRESS", "br")], "AUDIT_EXPORT_COMPRESS must be gzip or off, not \"br\""),
             (vec![("AUDIT_EXPORT", "a=https://a.example.net/in"), ("AUDIT_EXPORT_COMPRESS_A", "yes")], "AUDIT_EXPORT_COMPRESS_A must be gzip or off"),
-            (vec![("AUDIT_EXPORT", "syslog+tls://logs.example.net"), ("AUDIT_EXPORT_COMPRESS", "gzip")], "AUDIT_EXPORT has none: syslog has no compression"),
+            (vec![("AUDIT_EXPORT", "syslog+tls://logs.example.net"), ("AUDIT_EXPORT_COMPRESS", "gzip")], "AUDIT_EXPORT has none: syslog and Google SecOps have no compression"),
             (vec![("AUDIT_EXPORT", "a=https://a.example.net/in,soc=syslog+tls://soc.example.net"), ("AUDIT_EXPORT_COMPRESS_SOC", "gzip")], "AUDIT_EXPORT_COMPRESS_SOC is for https and azure-monitor sinks; syslog has no compression"),
         ] {
             let e = settings(&vars).unwrap_err();

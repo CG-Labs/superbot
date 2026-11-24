@@ -32,6 +32,7 @@ mod audit_export;
 mod audit_line;
 #[cfg(test)]
 mod audit_http_tests;
+mod audit_secops;
 #[cfg(test)]
 mod auth_review_http_tests;
 #[cfg(test)]
