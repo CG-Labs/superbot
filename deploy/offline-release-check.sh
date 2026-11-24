@@ -132,33 +132,38 @@ verify_offline() {
   log "$name: signature and every file verified with no network"
 }
 
-# The programs matching PATTERNS (tar wildcards, * stopping at /) in a tree bundle's TAR, a
-# member of BUNDLE, read without unpacking the tree: at least one ELF file, each for ARCH and,
-# with MAX_GLIBC, asking for no newer glibc. Scripts among them are skipped.
+# A tree bundle's TAR, a member of BUNDLE, unpacked in scratch space and never run. The programs
+# matching PATTERNS (globs in the unpacked folder) are ELF files for ARCH, at least one. With
+# MAX_GLIBC, no ELF file for ARCH anywhere in the tree asks for a newer glibc: npm and Python
+# packages bring native programs and libraries of their own. Packages also ship other
+# platforms' builds beside their own, which never load on ARCH, so those are skipped.
 tree_programs_ok() {
-  local bundle=$1 member=$2 arch=$3 max_glibc=$4 out p name got n=0
+  local bundle=$1 member=$2 arch=$3 max_glibc=$4 out pattern p got n=0
   shift 4
-  out="$WORK/programs"
+  out="$WORK/tree"
   rm -rf "$out" && mkdir -p "$out"
-  # Only regular files go to the command, so the tree's links are never made here.
-  # shellcheck disable=SC2016 # expanded by tar's shell, once per file
-  tar -xzOf "$bundle" "$member" | PROGRAMS=$out tar -x --wildcards --no-wildcards-match-slash \
-    --to-command='cat >"$PROGRAMS/$(printf %s "$TAR_FILENAME" | tr / :)"' "$@" 2>/dev/null || true
-  for p in "$out"/*; do
-    [[ -f "$p" ]] || continue
-    name=$(basename "$p" | tr : /)
-    got=$(elf_arch "$p")
-    [[ "$got" != not-elf ]] || continue
-    n=$((n + 1))
-    [[ "$got" == "$arch" ]] || die "$(basename "$bundle")'s $name is built for $got, not $arch"
-    if [[ -n "$max_glibc" ]]; then
+  tar -xzOf "$bundle" "$member" | tar -x -C "$out" --no-same-owner --no-same-permissions 2>/dev/null \
+    || die "Couldn't read $member from $(basename "$bundle")"
+  for pattern in "$@"; do
+    for p in "$out"/$pattern; do
+      [[ -f "$p" && ! -L "$p" ]] || continue
+      got=$(elf_arch "$p")
+      [[ "$got" != not-elf ]] || continue
+      n=$((n + 1))
+      [[ "$got" == "$arch" ]] || die "$(basename "$bundle")'s ${p#"$out"/} is built for $got, not $arch"
+    done
+  done
+  ((n > 0)) || die "$(basename "$bundle") has no program to check the arch of ($*)"
+  if [[ -n "$max_glibc" ]]; then
+    # grep -r, unlike -R, never follows the tree's links.
+    while IFS= read -r -d '' p; do
+      [[ -f "$p" && ! -L "$p" && "$(elf_arch "$p")" == "$arch" ]] || continue
       got=$(glibc_needed "$p")
       [[ -z "$got" ]] || version_le "$got" "$max_glibc" \
-        || die "$(basename "$bundle")'s $name needs glibc $got, newer than $max_glibc: it won't run on every supported Ubuntu"
-    fi
-  done
-  rm -rf "$out"
-  ((n > 0)) || die "$(basename "$bundle") has no program to check the arch of ($*)"
+        || die "$(basename "$bundle")'s ${p#"$out"/} needs glibc $got, newer than $max_glibc: it won't run on every supported Ubuntu"
+    done < <(LC_ALL=C grep -rlZa $'^\x7fELF' "$out" 2>/dev/null || true)
+  fi
+  chmod -R u+rwX "$out" && rm -rf "$out"
 }
 
 # The release's Hermes and harness bundles for each arch, as install.sh --offline takes them
@@ -280,7 +285,7 @@ cmd_online() {
   IMAGE_IDENTITY=${IMAGE_IDENTITY:-https://github.com/CG-Labs/superbot/.github/workflows/docker.yml@refs/tags/v$VERSION}
   need cosign skopeo jq tar sha256sum od
   WORK=$(mktemp -d)
-  trap 'rm -rf "$WORK"' EXIT
+  trap 'chmod -R u+rwX "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
   blob_check_args
   image_check_args
   stage_bundles "$dir"
@@ -397,7 +402,7 @@ cmd_offline() {
   [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]] || die "$expected has no version"
   IMAGE_IDENTITY=${IMAGE_IDENTITY:-https://github.com/CG-Labs/superbot/.github/workflows/docker.yml@refs/tags/v$VERSION}
   WORK=$(mktemp -d)
-  trap 'rm -rf "$WORK"' EXIT
+  trap 'chmod -R u+rwX "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
   blob_check_args
   image_check_args
   stage_bundles "$dir"

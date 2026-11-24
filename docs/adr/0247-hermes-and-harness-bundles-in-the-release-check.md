@@ -18,7 +18,9 @@ After the offline bundles, the check reads the pins from the release's own botd 
 
 - the same published-file checks as the offline bundle: the file, its `.sha256` and `.sigstore.json` are attached, the SHA-256 matches, the signature verifies against the offline workflow's identity, and `offline-bundle.sh verify` accepts it with the signature checked. That shared code is now one function.
 - its `MANIFEST`: its arch, the tag's commit, and for Hermes the pinned commit and tag. For the harness bundle, the release's version, and every line `install.sh` wants at botd's pins (`harness_mismatch`), so a pin that differs is named the way the installer names it.
-- its programs are built for its arch and need no newer glibc than `--max-glibc`: Node.js in the harness tree, and `.local/bin/*` and uv's Python in the Hermes tree. The inner tar is streamed, never unpacked. Only regular files are read, so the tree's links are never made. At least one program must be found.
+- its tree, unpacked in scratch space and never run:
+  - its programs are built for its arch: Node.js in the harness tree, and `.local/bin/*` and uv's Python in the Hermes tree. At least one must be found.
+  - no ELF file for its arch anywhere in the tree needs a newer glibc than `--max-glibc`. npm and Python packages bring native programs and libraries of their own (Claude Code's ripgrep, compiled wheels), and the builder's checks run them on a newer Ubuntu. Packages also ship other platforms' builds beside their own. Those never load on this arch, so they are skipped, and only the named programs must be its arch. The search doesn't follow the tree's links.
 - the file is hashed once more at the end, so a file changed while it was read is caught.
 
 Then the release's botd checks all four as machines would take them: `botd harness check-bundles FILE...`. It is a new subcommand that runs the code botd runs at start for `MACHINE_HERMES_BUNDLE` and `MACHINE_HARNESS_BUNDLE` (`Bundles::from_env` and `apply`), against the plan for every harness it pins, and then the agent's own plan check. It prints one line per bundle with its SHA-256, and which harnesses machines would install from them. The check wants each bundle named with the SHA-256 it checked, and every pinned harness from the bundles.
@@ -41,7 +43,8 @@ CI's own signed release (offline.yml `install-offline`) has no Hermes or harness
 
 - **Check pins in shell only.** The shell can compare `MANIFEST` lines, but botd's start-up check also reads every tree entry, refuses two bundles for one arch, and builds the plan machines get. Running botd's own code gives the same answer botd gives at start, and needs no running server.
 - **Check against `install.rs` pins from the checkout.** The workflow checks out the tag, but the bundles must match the botd that ships in the release. Reading them from that binary is what `install.sh` does.
-- **Unpack each tree to check its programs.** A Hermes tree is large. Streaming the inner tar and keeping only the program paths is cheaper, and makes no links on the runner.
+- **Check only the named programs, streamed from the tar.** Cheaper, but a native file in an npm or Python package that needs a newer glibc would pass, and the CLI would fail on Ubuntu 22.04.
+- **Refuse every ELF file for another arch.** Packages vendor other platforms' builds on purpose, so good bundles would fail.
 - **Install aarch64 too.** The runner is x86_64, so the aarch64 bundles are checked but not installed.
 
 ## Consequences
@@ -51,7 +54,7 @@ CI's own signed release (offline.yml `install-offline`) has no Hermes or harness
 - `botd harness check-bundles` is also a way for an operator to check bundles before setting `MACHINE_HERMES_BUNDLE` and `MACHINE_HARNESS_BUNDLE`.
 - Tested:
   - Rust: `check-bundles` names each bundle with its SHA-256 and says what machines would take. It says what would still come from the internet. It refuses no file, a file not named as either kind, two bundles for one arch, another Hermes commit, a harness bundle missing a pinned CLI, a harness bundle named as a Hermes one, and a missing or wrong `.sha256`.
-  - Shell, with stand-ins for cosign, skopeo and botd: a release with both kinds passes both phases and records them. The check refuses a missing bundle or signature, a wrong SHA-256 or signature, a bundle `verify` refuses, another Hermes commit, a missing or other harness pin, another commit or arch, a botd that won't say its pins, pins no Hermes, or won't serve the bundles, and programs for another arch or a newer glibc. Offline, it refuses a record missing a bundle, naming a file outside the folder, or with another SHA-256. `--without-harness-bundles` is recorded and said.
+  - Shell, with stand-ins for cosign, skopeo and botd: a release with both kinds passes both phases and records them. The check refuses a missing bundle or signature, a wrong SHA-256 or signature, a bundle `verify` refuses, another Hermes commit, a missing or other harness pin, another commit or arch, a botd that won't say its pins, pins no Hermes, or won't serve the bundles, programs for another arch or a newer glibc, and an npm or Python package's native file for the bundle's arch needing a newer glibc, while skipping other platforms' builds. Offline, it refuses a record missing a bundle, naming a file outside the folder, or with another SHA-256. `--without-harness-bundles` is recorded and said.
   - Wiring: the workflow downloads and installs both kinds, never skips them for a real release, and CI's own release says it skips them.
 - Not covered:
   - The workflow's run against a real release. No release has been tagged yet, so it skips. It first runs on the first tag.

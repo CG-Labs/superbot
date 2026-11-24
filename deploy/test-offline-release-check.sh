@@ -14,7 +14,7 @@ set -euo pipefail
 
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT
+trap 'chmod -R u+rwX "$T" 2>/dev/null; rm -rf "$T"' EXIT
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 ok() { printf 'ok - %s\n' "$*"; }
@@ -114,11 +114,15 @@ machine() { case $1 in x86_64) printf '%s\n' '\x3e' ;; *) printf '%s\n' '\xb7' ;
 
 # A Hermes or harness bundle in OUT for ARCH as offline-bundle.sh hermes and harnesses make them,
 # at the stand-in botd's pins, with ELF stand-ins for its programs (for TREE_ARCH, needing
-# TREE_GLIBC) and a script beside them. CMD runs in its folder before it is summed.
+# TREE_GLIBC) and a script beside them. Its packages' native files are its arch's, needing
+# NATIVE_GLIBC, and the other arch's, needing a glibc no Ubuntu has, in a read-only folder.
+# CMD runs in its folder before it is summed.
 tool_bundle() {
-  local out=$1 kind=$2 a=$3 x="$T/tool" top t name inner
+  local out=$1 kind=$2 a=$3 x="$T/tool" top t name inner pkg other
   shift 3
+  if [[ -d "$x" ]]; then chmod -R u+w "$x"; fi
   rm -rf "$x" && mkdir -p "$x"
+  other=$([[ $a == x86_64 ]] && echo aarch64 || echo x86_64)
   if [[ $kind == hermes ]]; then
     top="superbot-hermes-$HTAG-$a" name=hermes inner=hermes.tar
     t="$x/tree/hermes" && mkdir -p "$t/.local/bin" "$t/.local/share/uv/python/cpython-3.14.9/bin"
@@ -126,12 +130,21 @@ tool_bundle() {
     elf "$t/.local/share/uv/python/cpython-3.14.9/bin/python3.14" "$(machine "${TREE_ARCH:-$a}")" 2.17
     ln -s python3.14 "$t/.local/share/uv/python/cpython-3.14.9/bin/python3"
     printf '#!/bin/sh\n' >"$t/.local/bin/hermes"
+    pkg="$t/.hermes/installs/k/environments/g/venv/lib/python3.14/site-packages/native"
+    mkdir -p "$pkg"
+    elf "$pkg/_core.$a.so" "$(machine "$a")" "${NATIVE_GLIBC:-2.17}"
+    elf "$pkg/_core.$other.so" "$(machine "$other")" 2.99
   else
     top="superbot-harnesses-$VERSION-$a" name=superbot-harnesses inner=harnesses.tar
     t="$x/tree/superbot-harnesses" && mkdir -p "$t/bin"
     elf "$t/bin/node" "$(machine "${TREE_ARCH:-$a}")" "${TREE_GLIBC:-2.28}"
     printf '#!/bin/sh\n' >"$t/bin/claude"
+    pkg="$t/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep"
+    mkdir -p "$pkg/$a-linux" "$pkg/$other-linux"
+    elf "$pkg/$a-linux/rg" "$(machine "$a")" "${NATIVE_GLIBC:-2.17}"
+    elf "$pkg/$other-linux/rg" "$(machine "$other")" 2.99
   fi
+  chmod a-w "$pkg"
   mkdir -p "$x/$top"
   tar -C "$x/tree" --owner=0 --group=0 --numeric-owner --sort=name -cf "$x/$top/$inner" "$name"
   (
@@ -362,8 +375,15 @@ TREE_ARCH=x86_64 tool_bundle "$T/trees" hermes aarch64 true
 refused "an aarch64 Hermes bundle of x86_64 programs" "$HB's hermes/.local/bin/uv is built for x86_64, not aarch64" tree_ok "$T/trees/$HB" "${hermes_programs[@]}"
 TREE_GLIBC=2.39 tool_bundle "$T/trees" hermes aarch64 true
 refused "a Hermes bundle needing a newer glibc" "needs glibc 2.39, newer than 2.35" tree_ok "$T/trees/$HB" "${hermes_programs[@]}"
+NATIVE_GLIBC=2.39 tool_bundle "$T/trees" harnesses x86_64 true
+refused "a harness bundle whose npm package needs a newer glibc" \
+  "$NB's superbot-harnesses/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x86_64-linux/rg needs glibc 2.39, newer than 2.35" \
+  tree_ok "$T/trees/$NB" "superbot-harnesses-$VERSION-x86_64/harnesses.tar" x86_64 2.35 superbot-harnesses/bin/node
+NATIVE_GLIBC=2.39 tool_bundle "$T/trees" hermes aarch64 true
+refused "a Hermes bundle whose Python package needs a newer glibc" "site-packages/native/_core.aarch64.so needs glibc 2.39, newer than 2.35" \
+  tree_ok "$T/trees/$HB" "${hermes_programs[@]}"
 refused "a tree without the programs" "has no program to check the arch of (nothing/*)" tree_ok "$T/trees/$NB" "superbot-harnesses-$VERSION-x86_64/harnesses.tar" x86_64 "" 'nothing/*'
-ok "a Hermes or harness bundle's programs built for another arch, or needing a newer glibc, are refused, as is a tree without them"
+ok "a Hermes or harness bundle's programs for another arch, or native files for its arch needing a newer glibc, are refused (other platforms' builds are skipped), as is a tree without them"
 
 out=$(online "$T/tools" --any-binary-arch) || { printf '%s\n' "$out" >&2; fail "the release failed the online check"; }
 cp "$T/tools/release-check.expected" "$T/exp.bak"
