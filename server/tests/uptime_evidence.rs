@@ -1,4 +1,4 @@
-//! ADR 0251: `superbot-evidence uptime` against a stand-in for Prometheus' query API: the
+//! ADR 0249: `superbot-evidence uptime` against a stand-in for Prometheus' query API: the
 //! probe's raw samples read a day at a time with the token on every request, an outage
 //! that needs a written review, a gap in the probe's record and announced maintenance, the
 //! token and the probe's target never written. Then the same from a checks file, with no

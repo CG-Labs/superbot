@@ -12,7 +12,7 @@
 //! `register` (ADR 0204): checks the security owner's private policy register (role
 //! holders, policy approvals, acknowledgements and training, risks, management reviews,
 //! vendors, exceptions, conduct concerns, security incidents and tabletop exercises)
-//! against the policies' cadences, as a bundle naming people by id. `uptime` (ADR 0251):
+//! against the policies' cadences, as a bundle naming people by id. `uptime` (ADR 0249):
 //! the availability SLO measured from the outside probe's checks, from Prometheus or the
 //! probe's exported files, month by month against the objectives.
 //!
@@ -37,7 +37,7 @@ mod vulns;
 use std::io::Write;
 use std::process::ExitCode;
 
-const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0086), restore drills (ADR 0177), the policy register (ADR 0204), uptime (ADR 0251), and its coverage (ADR 0169).
+const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0086), restore drills (ADR 0177), the policy register (ADR 0204), uptime (ADR 0249), and its coverage (ADR 0169).
 
   superbot-evidence github --repo <owner/name> [--branch <name>]
                     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>] [--no-titles]
