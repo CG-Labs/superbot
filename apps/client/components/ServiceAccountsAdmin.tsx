@@ -600,7 +600,8 @@ export function ServiceAccountsAdmin({ api, onBack, admin }: Props) {
                     {s.ownerActive && s.ownerOnTeam === false ? <Text style={styles.warn}> · owner off its team</Text> : null}
                   </Text>
                   <Text style={styles.faint}>
-                    {roleLabel(s)} · {s.tokens} live {s.tokens === 1 ? "token" : "tokens"} · {lastUsedLabel(s.lastUsedAt).toLowerCase()}
+                    {roleLabel(s)} · {s.tokens} live {s.tokens === 1 ? "token" : "tokens"}
+                    {s.keptBots ? ` · keeps ${s.keptBots} ${s.keptBots === 1 ? "Bot" : "Bots"}` : ""} · {lastUsedLabel(s.lastUsedAt).toLowerCase()}
                   </Text>
                 </Pressable>
               ))}

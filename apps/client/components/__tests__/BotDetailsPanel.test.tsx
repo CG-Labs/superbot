@@ -257,4 +257,11 @@ describe("BotDetailsPanel", () => {
     expect(screen.queryByText("Your Claude Code login")).not.toBeOnTheScreen();
     Object.assign(mockCtx, { api: undefined, me: { name: "Ada", id: "u1" } });
   });
+
+  it("names the service account that keeps the Bot (ADR 0222)", async () => {
+    const kept = { ...shared("manage"), visibility: "private" as const, serviceAccount: { id: "sa1", name: "CI" } };
+    Object.assign(mockCtx, { bots: [kept], activeId: "b", fetchRoutines: jest.fn(async () => []) });
+    await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+    expect(await screen.findByText("Kept by service account CI: its runs reach only what that account may")).toBeOnTheScreen();
+  });
 });

@@ -36,7 +36,7 @@ export function botAccessLabel(p: Pick<AccessReviewPerson, "botAccess">): string
   return p.botAccess.bots
     .map((b) => {
       const whose = b.own ? "own" : `${b.owner.name ?? b.owner.id}'s`;
-      return `${b.name} (${b.access}, ${whose}${b.grant ? `, granted ${b.grant}` : ""})`;
+      return `${b.name} (${b.access}, ${whose}${b.grant ? `, granted ${b.grant}` : ""}${b.kept ? ", kept" : ""})`;
     })
     .join("; ");
 }

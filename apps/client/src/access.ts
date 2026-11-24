@@ -32,6 +32,12 @@ export function whereItRuns(bot: Pick<BotView, "runsOn" | "owner">, meId?: strin
   return `Can't run yet: ${whose} computer isn't set up`;
 }
 
+/** Which of its owner's service accounts made and keeps it (ADR 0222). Null for a person's Bot. */
+export function keptBy(bot: Pick<BotView, "serviceAccount">): string | null {
+  if (!bot.serviceAccount) return null;
+  return `Kept by service account ${bot.serviceAccount.name}: its runs reach only what that account may`;
+}
+
 /** What a run for someone other than its owner gets, when the server isolates them.
  *  With `teammateLogins` (ADR 0062) that includes their own harness login. */
 export function whoseKeys(bot: Pick<BotView, "sharedBots" | "owner" | "visibility" | "teammateLogins">, meId?: string | null): string | null {
