@@ -364,13 +364,39 @@ AZURE_RUN_CREDENTIALS="<app id>"
 # AZURE_RUN_CREDENTIALS="<app id>; <storage app id>@storage.azure.com BLOB_TOKEN=accessToken"
 ```
 
-- **Format**: entries separated by `;` or new lines. Each is an app's client id, optionally `@` the host of the resource its tokens are for (`storage.azure.com`, `vault.azure.net`, `graph.microsoft.com`, ...), then `NAME=accessToken` pairs. With no resource, tokens are for Azure Resource Manager in botd's cloud. An entry with no pairs gives the token as `AZURE_ACCESS_TOKEN`. No Azure tool reads a token from the environment by itself: use `Connect-AzAccount -AccessToken $env:AZURE_ACCESS_TOKEN -AccountId <app id>`, `curl -H "Authorization: Bearer $AZURE_ACCESS_TOKEN"`, or a static token credential in code. At most 16 apps; each name once. There is no `{owner}`, since Entra picks app ids.
+- **Format**: entries separated by `;` or new lines. Each is an app's client id, optionally `@` the host of the resource its tokens are for (`storage.azure.com`, `vault.azure.net`, `graph.microsoft.com`, ...), then `NAME=accessToken` pairs. With no resource, tokens are for Azure Resource Manager in botd's cloud. An entry with no pairs gives the token as `AZURE_ACCESS_TOKEN`. No Azure tool reads a token from the environment by itself: use `Connect-AzAccount -AccessToken $env:AZURE_ACCESS_TOKEN -AccountId <app id>`, `curl -H "Authorization: Bearer $AZURE_ACCESS_TOKEN"`, or a static token credential in code. At most 16 apps; each name once. For another tenant, or an app per user, see [below](#another-tenant-or-each-users-own-app).
 - **Token length**: Entra chooses it: 60 to 90 minutes by default. A token that ends before the longest run could (`RUN_TIMEOUT_MINUTES`, 60 by default) refuses the run, so keep `RUN_TIMEOUT_MINUTES` at 60 or less, or give the app a token lifetime policy that covers it. A run also stops when its token expires, and the Bot says its credentials expired and to send the task again.
 - **Can't be revoked**: Entra can't end one token early. When the run ends, botd audits `secret.lease_released` with the token's expiry (`expiresAt`), and the token works until then. In an emergency, remove the app's federated credential or disable its service principal: no new tokens are made, and those out there run out.
 - **Fails closed**: if Entra refuses (no federated credential trusting botd, an app not in the tenant, a resource that doesn't exist, a token shorter than a run), the run doesn't start (`bot.run_refused`, reason `secrets_unavailable`), and the error names what to check, never Entra's own description. botd makes no token at startup, so a wrong app id or trust shows on the first run.
 - **Audit**: `botctl audit --action 'secret.lease_*'` shows each token made (`secret.lease_issued`, with the entry, a `leaseId` of `<entry>/superbot-<bot id>-<random>`, TTL and the variable names) and let go (`secret.lease_released`), never a token. The managed identity token botd trades is audited as `secret.backend_login` with its `audience`. Entra's sign-in logs show the app's service principal signing in with botd's managed identity as its credential.
 - **Redaction**: the token is redacted from everything botd saves and shows until it expires.
 - **Order**: these win over static secrets of the same name, and runs never inherit these names from botd's own environment.
+
+### Another tenant, or each user's own app
+
+Off by default ([ADR 0250](../adr/0250-cross-tenant-and-per-user-entra-apps-for-each-run.md)). Two entry options, after the app:
+
+- **`tenant=<tenant id or domain>`**: tokens of a **multitenant** app from another tenant it is provisioned in. Register the app in botd's tenant as multitenant (`az ad app create --sign-in-audience AzureADMultipleOrgs ...`), keep its federated credential trusting botd there as above (issuer still `https://login.microsoftonline.com/<botd's tenant>/v2.0`), and have an admin of the other tenant consent to it (`https://login.microsoftonline.com/<other tenant>/adminconsent?client_id=<app id>`) and give its service principal the roles the Bots need there. Same cloud only.
+- **`{owner}` as the app, with `apps=<file>`**: each user's Bots get a token of their own app. The file maps user ids (from `botctl users` or the admin console) to apps, and optionally each user's tenant:
+
+```sh
+AZURE_RUN_CREDENTIALS="{owner} apps=/etc/superbot/azure-apps.json; <shared app id> tenant=contoso.onmicrosoft.com SHARED_AZURE_TOKEN=accessToken"
+```
+
+```json
+{
+  "<user id>": "<their app id>",
+  "<another user id>": { "app": "<their app id>", "tenant": "<their tenant id or domain>" }
+}
+```
+
+Each app needs the federated credential trusting botd, like any other. A user's `tenant` wins over the entry's `tenant=`, which wins over botd's own.
+
+- **Checked at startup, read at each run**: botd won't start unless the file is a JSON object of user ids and app client ids (or `{"app": ..., "tenant": ...}`, nothing else), at most 1 MiB. It reads it again as each run that uses it starts, so adding or taking out a user needs no restart. Write it in one go (to a new file, then rename it over the old one).
+- **Users it doesn't name** get no token from that entry, and its variables are kept out of their runs. Runs for someone other than the owner never use it, as with any `{owner}` entry.
+- **Fails closed**: if the file can't be read or checked when a run starts, that run doesn't start (`secrets_unavailable`), and botd never uses the map it read earlier. An app not consented in the other tenant gives `unauthorized_client`, and the error asks whether the app is multitenant and consented there.
+- **Audit**: `secret.lease_issued` names the actual app in its `path`, the `userId` for an `apps=` entry, and `tenant` when it isn't botd's own.
+- **Who decides**: whoever can edit the file decides which app each user's Bots act as. Keep it with botd's configuration, writable only by its admins. It holds no secret.
 
 ## Day to day
 

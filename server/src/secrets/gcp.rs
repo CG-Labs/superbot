@@ -584,8 +584,8 @@ impl Issuer for SecretManager {
     }
 
     fn issue_narrowed(&self, email: &str, fields: &[String], run_for: Duration, bot_id: &str, narrowed: &Narrowed) -> Result<Lease, Error> {
-        if narrowed.narrows_session() {
-            return Err(Error::Unavailable("GCP IAM: a token can't be narrowed with a session policy or tags, only an access boundary".into()));
+        if narrowed.narrows_session() || narrowed.tenant.is_some() {
+            return Err(Error::Unavailable("GCP IAM: a token can't be narrowed with a session policy or tags, or asked of an Entra tenant, only an access boundary".into()));
         }
         let (inner, email, fields, bot_id, boundary) = (Arc::clone(&self.inner), email.to_string(), fields.to_vec(), bot_id.to_string(), narrowed.boundary.clone());
         self.worker.run(async move { inner.impersonate(&email, &fields, run_for, &bot_id, boundary.as_deref()).await })
