@@ -99,7 +99,9 @@ reviews within 10 business days of closing, their actions done on time and a tab
 exercise each year (ADR 0223), and production access granted on the security owner's
 (and for admin to a managed server or the hosting provider, Management's) approval,
 removed by a leaver's last day, and reviewed each quarter with MFA recorded and findings
-fixed in time (ADR 0231); with each --baseline (botctl
+fixed in time (ADR 0231), and vulnerabilities found outside the scans acknowledged,
+assessed and fixed or accepted within SECURITY.md's targets, and a penetration test each
+year with its critical and high findings retested (ADR 0241); with each --baseline (botctl
 evidence baseline json, or the month's evidence bundle's baseline.json, checked in the
 period or the 7 days after it), every setting the server excepted held to an exception in
 force; with each --access-review <system>=<file> (a managed server's register id and its

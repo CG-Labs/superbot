@@ -114,7 +114,7 @@ fn since_format(kind: &str, file: &str) -> u64 {
 }
 
 /// The files whose `exceptions` an auditor samples first.
-const EXCEPTION_FILES: [&str; 15] = [
+const EXCEPTION_FILES: [&str; 16] = [
     "pull-requests.json",
     "vulnerability-alerts.json",
     "ci-drills.json",
@@ -130,6 +130,7 @@ const EXCEPTION_FILES: [&str; 15] = [
     "conduct.json",
     "incidents.json",
     "access.json",
+    "vulnerabilities.json",
 ];
 
 /// A bundle file larger than this isn't read: no bundle comes near it.
@@ -936,7 +937,6 @@ mod tests {
     /// without it still checks, one of format 4 must have it, and its exceptions count.
     #[test]
     fn register_bundles_have_access_json_from_format_4() {
-        assert_eq!(KINDS.iter().find(|k| k.id == "policy-register").unwrap().format, 4);
         let old = register_bundle_with(3, "access.json", None);
         assert!(old.verified(), "made before access.json: {:?}", old.problems);
         let missing = register_bundle_with(4, "access.json", None);
@@ -947,6 +947,23 @@ mod tests {
         assert!(f.verified(), "{:?}", f.problems);
         assert_eq!((f.exceptions["access.json"]["leaverNotRemoved"], f.exceptions["access.json"]["signOffNotFound"]), (1, 1));
         assert!(f.files.iter().any(|(n, _, r)| n == "access.json" && r == &["CC6.2-2".to_string()]));
+    }
+
+    /// Register bundles gained `vulnerabilities.json` in format 5 (ADR 0241): one of format 4
+    /// without it still checks, one of format 5 must have it, and its exceptions count.
+    #[test]
+    fn register_bundles_have_vulnerabilities_json_from_format_5() {
+        assert_eq!(KINDS.iter().find(|k| k.id == "policy-register").unwrap().format, 5);
+        let old = register_bundle_with(4, "vulnerabilities.json", None);
+        assert!(old.verified(), "made before vulnerabilities.json: {:?}", old.problems);
+        let missing = register_bundle_with(5, "vulnerabilities.json", None);
+        assert!(!missing.verified() && missing.problems.iter().any(|x| x.contains("it has no vulnerabilities.json")), "{:?}", missing.problems);
+        let body = json_file(&json!({ "exceptions": { "notAcknowledged": [], "fixOverdue": ["V-1 high (received 2027-01-02, open, due 2027-02-01)"], "noPenTest": ["none in the year to 2027-02-01 (last 2025-12-01)"], "retestOverdue": [] } }));
+        let rows: &[&str] = &["CC2.3-1", "CC4.2-1"];
+        let f = register_bundle_with(5, "vulnerabilities.json", Some((&body, &["CC2.3", "CC3.2", "CC4.2"], rows)));
+        assert!(f.verified(), "{:?}", f.problems);
+        assert_eq!((f.exceptions["vulnerabilities.json"]["fixOverdue"], f.exceptions["vulnerabilities.json"]["noPenTest"]), (1, 1));
+        assert!(f.files.iter().any(|(n, _, r)| n == "vulnerabilities.json" && r == &rows.iter().map(|s| s.to_string()).collect::<Vec<_>>()));
     }
 
     #[test]

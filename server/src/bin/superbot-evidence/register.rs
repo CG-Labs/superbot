@@ -12,13 +12,15 @@
 //! post-incident review or action overdue, a year without a tabletop exercise, production
 //! access granted without the approvals the access control policy asks for or kept past
 //! a leaver's last day, a production system not reviewed in a quarter, a review finding
-//! not fixed in time, a SuperBot review with no sign-off in botd's audit log) and
-//! writes a dated bundle in the shape of the others, which the coverage report checks
-//! (ADR 0169).
+//! not fixed in time, a SuperBot review with no sign-off in botd's audit log, a
+//! vulnerability found outside the scans acknowledged, assessed, or fixed or accepted
+//! late, a year without a penetration test or a retest overdue) and writes a dated
+//! bundle in the shape of the others, which the coverage report checks (ADR 0169).
 //!
 //! Never in it: names, titles, notes or reasons from the register, nor the register
-//! itself. People, risks, vendors, exceptions, incidents and systems are named by their
-//! register ids; the register's SHA-256 identifies the copy kept beside the bundle.
+//! itself. People, risks, vendors, exceptions, incidents, systems, vulnerabilities and
+//! penetration tests are named by their register ids; the register's SHA-256 identifies
+//! the copy kept beside the bundle.
 
 use crate::changes::{Bundle, Section, json_file, rfc3339, sha256};
 use crate::period::Period;
@@ -29,8 +31,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Bumped when a file's shape changes: 2 added `conduct.json` (ADR 0214), 3
-/// `incidents.json` (ADR 0223), 4 `access.json` (ADR 0231).
-pub const FORMAT: u32 = 4;
+/// `incidents.json` (ADR 0223), 4 `access.json` (ADR 0231), 5 `vulnerabilities.json`
+/// (ADR 0241).
+pub const FORMAT: u32 = 5;
 pub const PREFIX: &str = "superbot-register-";
 /// The register's own format, in its `superbotRegister` field.
 pub const REGISTER_FORMAT: u64 = 1;
@@ -101,6 +104,28 @@ pub const ADMIN_FINDING_BUSINESS_DAYS: u32 = 1;
 /// The audit event botd records when an admin signs off its access-review report (ADR 0099).
 pub const SIGN_OFF_ACTION: &str = "access_review.completed";
 
+/// Vulnerabilities found outside the scans (ADR 0241), whose alerts the vulnerability
+/// bundle judges: reported under `SECURITY.md`, found by a penetration test, told by a
+/// vendor, or found by the provider itself (a review, an engineer, an incident).
+pub const VULNERABILITY_SOURCES: [&str; 4] = ["report", "pentest", "vendor", "internal"];
+/// A vulnerability's severity once assessed, and `none` for one that turned out not to be
+/// a vulnerability (closed with the reason in the advisory or tracker).
+pub const VULNERABILITY_SEVERITIES: [&str; 5] = ["critical", "high", "medium", "low", "none"];
+/// `SECURITY.md`'s targets, in calendar days from the report: acknowledged within 3 (a
+/// report only) and its severity confirmed within 10. Fixing or accepting it is due by the
+/// information security policy's windows, the vulnerability bundle's (`vulns::Windows`).
+pub const ACKNOWLEDGE_DAYS: i64 = 3;
+pub const ASSESS_DAYS: i64 = 10;
+/// The roles whose holders or deputies may accept a vulnerability rather than fix it, as
+/// for any other exception to the information security policy.
+pub const VULNERABILITY_ACCEPTERS: [&str; 2] = ["Security owner", "Management"];
+/// The information security policy, whose vulnerability management section sets the
+/// windows and the yearly penetration test.
+pub const INFORMATION_SECURITY: &str = "information-security";
+/// A penetration test's critical and high findings are retested within this many days of
+/// the last of them being fixed.
+pub const RETEST_DAYS: i64 = 30;
+
 /// Yearly: policy reviews, acknowledgements, training, risk and vendor reviews.
 pub const YEAR_DAYS: i64 = 365;
 /// Quarterly: management reviews and exception reviews.
@@ -121,7 +146,7 @@ pub const MAX_PERIOD_DAYS: i64 = 31;
 /// a file to a row only while the register holds a current record for it (a role filled
 /// in the period, an approval within a year, a management review within a quarter), so a
 /// register that stopped being kept shows as a gap in the coverage report.
-pub const SECTIONS: [Section; 10] = [
+pub const SECTIONS: [Section; 11] = [
     Section { file: "roles.json", criteria: &["CC1.3"], rows: &["CC1.3-1"] },
     Section { file: "policies.json", criteria: &["CC3.1", "CC5.3"], rows: &["CC3.1-1", "CC5.3-1"] },
     Section { file: "people.json", criteria: &["CC1.4", "CC2.2"], rows: &["CC1.4-1", "CC2.2-1"] },
@@ -132,11 +157,12 @@ pub const SECTIONS: [Section; 10] = [
     Section { file: "conduct.json", criteria: &["CC1.1"], rows: &["CC1.1-1"] },
     Section { file: "incidents.json", criteria: &["CC7.3", "CC7.4", "CC7.5"], rows: &["CC7.3-1", "CC7.4-1", "CC7.4-2", "CC7.5-1"] },
     Section { file: "access.json", criteria: &["CC6.1", "CC6.2", "CC6.3"], rows: &["CC6.1-2", "CC6.2-2", "CC6.3-2"] },
+    Section { file: "vulnerabilities.json", criteria: &["CC2.3", "CC3.2", "CC4.2"], rows: &["CC2.3-1", "CC3.2-2", "CC4.2-1"] },
 ];
 
 /// Files bundles of an older format don't have, and the format that added each, so the
 /// coverage report still verifies bundles made before them.
-pub const SINCE_FORMAT: [(&str, u64); 3] = [("conduct.json", 2), ("incidents.json", 3), ("access.json", 4)];
+pub const SINCE_FORMAT: [(&str, u64); 4] = [("conduct.json", 2), ("incidents.json", 3), ("access.json", 4), ("vulnerabilities.json", 5)];
 
 const README: &str = "SuperBot policy register bundle
 ===============================
@@ -169,6 +195,10 @@ after the period are left out.
                            leavers' access removed by their last day, each system
                            reviewed every quarter with MFA recorded, findings fixed in
                            time, and SuperBot reviews matched to botd's sign-offs
+  vulnerabilities.json     vulnerabilities found outside the scans (reports, penetration
+                           tests, vendors), acknowledged, assessed, and fixed or accepted
+                           within their windows, and the yearly penetration test and
+                           its retest
   manifest.json            what is in this bundle, the period, the register's SHA-256,
                            and each file's SHA-256
   SHA256SUMS               the same digests, for `sha256sum -c SHA256SUMS`
@@ -252,6 +282,10 @@ pub struct Register {
     pub access: Vec<Grant>,
     #[serde(default)]
     pub access_reviews: Vec<AccessReview>,
+    #[serde(default)]
+    pub vulnerabilities: Vec<Vulnerability>,
+    #[serde(default)]
+    pub pen_tests: Vec<PenTest>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -580,6 +614,67 @@ pub struct Finding {
     pub admin: bool,
     #[serde(default, deserialize_with = "opt_day")]
     pub fixed: Option<NaiveDate>,
+}
+
+/// A vulnerability found outside the scans, by id only: the report, what it affects, the
+/// advisory and the fix stay in the provider's tracker and the GitHub security advisory.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Vulnerability {
+    pub id: String,
+    pub source: String,
+    /// The penetration test that found it, for `pentest` only.
+    #[serde(default)]
+    pub pen_test: Option<String>,
+    /// The security event it was triaged as, when it was one.
+    #[serde(default)]
+    pub incident: Option<String>,
+    /// The day it was reported or found; every deadline runs from it.
+    #[serde(deserialize_with = "day")]
+    pub received: NaiveDate,
+    /// The day the reporter heard back, for `report` only.
+    #[serde(default, deserialize_with = "opt_day")]
+    pub acknowledged: Option<NaiveDate>,
+    /// The day its severity was set and an owner role named: these three go together.
+    #[serde(default, deserialize_with = "opt_day")]
+    pub assessed: Option<NaiveDate>,
+    #[serde(default)]
+    pub severity: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default, deserialize_with = "opt_day")]
+    pub fixed: Option<NaiveDate>,
+    /// Accepted with a reason instead of fixed: when, and by whom (together).
+    #[serde(default, deserialize_with = "opt_day")]
+    pub accepted: Option<NaiveDate>,
+    #[serde(default)]
+    pub accepted_by: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code, reason = "accepted in the register, never put in evidence")]
+    pub notes: Option<String>,
+}
+
+/// An external penetration test, by id: the tester's report and retest letter stay in
+/// the store, identified by their SHA-256.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct PenTest {
+    pub id: String,
+    /// The tester, when it is in the register's vendors.
+    #[serde(default)]
+    pub vendor: Option<String>,
+    /// The day of the tester's report.
+    #[serde(deserialize_with = "day")]
+    pub reported: NaiveDate,
+    pub report_sha256: String,
+    /// The day of the retest of its fixed findings, and the letter's SHA-256: together.
+    #[serde(default, deserialize_with = "opt_day")]
+    pub retested: Option<NaiveDate>,
+    #[serde(default)]
+    pub retest_sha256: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code, reason = "accepted in the register, never put in evidence")]
+    pub notes: Option<String>,
 }
 
 /// A policy the register's approvals and acknowledgements may name.
@@ -935,6 +1030,69 @@ pub fn parse(bytes: &[u8], policies: &[Policy]) -> Result<Register, String> {
             }
         }
     }
+    unique("penetration test", r.pen_tests.iter().map(|t| t.id.as_str()).collect(), &mut bad);
+    for t in &r.pen_tests {
+        let what = format!("penetration test {}", t.id);
+        if t.vendor.as_deref().is_some_and(|v| !r.vendors.iter().any(|x| x.id == v)) {
+            bad.push(format!("{what} names the vendor {:.64}, which isn't in vendors", t.vendor.as_deref().unwrap_or_default()));
+        }
+        if !hex(&t.report_sha256, 64..=64) {
+            bad.push(format!("{what}: reportSha256 is the tester's report's SHA-256, 64 lowercase hex digits"));
+        }
+        if t.retested.is_some() != t.retest_sha256.is_some() {
+            bad.push(format!("{what}: retested and retestSha256 go together"));
+        }
+        if t.retest_sha256.as_deref().is_some_and(|s| !hex(s, 64..=64)) {
+            bad.push(format!("{what}: retestSha256 is the retest letter's SHA-256, 64 lowercase hex digits"));
+        }
+        if t.retested.is_some_and(|x| x < t.reported) {
+            bad.push(format!("{what}: retested can't be before reported"));
+        }
+    }
+    unique("vulnerability", r.vulnerabilities.iter().map(|x| x.id.as_str()).collect(), &mut bad);
+    for x in &r.vulnerabilities {
+        let what = format!("vulnerability {}", x.id);
+        if !VULNERABILITY_SOURCES.contains(&x.source.as_str()) {
+            bad.push(format!("{what}: source is {}", VULNERABILITY_SOURCES.join(", ")));
+        }
+        if x.pen_test.is_some() != (x.source == "pentest") {
+            bad.push(format!("{what}: penTest names the penetration test that found it, for source pentest only"));
+        }
+        if x.pen_test.as_deref().is_some_and(|t| !r.pen_tests.iter().any(|p| p.id == t)) {
+            bad.push(format!("{what} names the penetration test {:.64}, which isn't in penTests", x.pen_test.as_deref().unwrap_or_default()));
+        }
+        if x.incident.as_deref().is_some_and(|i| !r.incidents.iter().any(|p| p.id == i)) {
+            bad.push(format!("{what} names the incident {:.64}, which isn't in incidents", x.incident.as_deref().unwrap_or_default()));
+        }
+        if x.acknowledged.is_some() && x.source != "report" {
+            bad.push(format!("{what}: acknowledged is for reports under SECURITY.md (source report)"));
+        }
+        if x.assessed.is_some() != x.severity.is_some() || x.assessed.is_some() != x.owner.is_some() {
+            bad.push(format!("{what}: assessed, severity and owner go together"));
+        }
+        if x.severity.as_deref().is_some_and(|s| !VULNERABILITY_SEVERITIES.contains(&s)) {
+            bad.push(format!("{what}: severity is {}", VULNERABILITY_SEVERITIES.join(", ")));
+        }
+        if let Some(o) = &x.owner {
+            role(&what, o, &mut bad);
+        }
+        if x.accepted.is_some() != x.accepted_by.is_some() {
+            bad.push(format!("{what}: accepted and acceptedBy go together"));
+        }
+        if let Some(by) = &x.accepted_by {
+            known(&what, by, &mut bad);
+        }
+        if x.fixed.is_some() && x.accepted.is_some() {
+            bad.push(format!("{what}: a vulnerability is fixed or accepted, not both"));
+        }
+        let closed = x.fixed.or(x.accepted);
+        if closed.is_some() && (x.assessed.is_none() || x.severity.as_deref() == Some("none")) {
+            bad.push(format!("{what}: a vulnerability is assessed before it is fixed or accepted, and one assessed as none needs neither"));
+        }
+        if x.acknowledged.is_some_and(|a| a < x.received) || x.assessed.is_some_and(|a| a < x.received) || closed.is_some_and(|c| x.assessed.is_some_and(|a| c < a)) {
+            bad.push(format!("{what}: dates out of order: received, then acknowledged and assessed, then fixed or accepted"));
+        }
+    }
     if bad.is_empty() {
         return Ok(r);
     }
@@ -1139,6 +1297,8 @@ impl Check<'_> {
             + r.systems.iter().filter(|x| x.since >= c).count()
             + r.access.iter().filter(|x| x.granted >= c).count()
             + r.access_reviews.iter().filter(|x| x.at >= c).count()
+            + r.vulnerabilities.iter().filter(|x| x.received >= c).count()
+            + r.pen_tests.iter().filter(|x| x.reported >= c).count()
     }
 
     pub fn roles(&self) -> (Value, Vec<&'static str>) {
@@ -1921,6 +2081,147 @@ impl Check<'_> {
         });
         (v, rows)
     }
+
+    /// Vulnerabilities found outside the scans and the yearly penetration test (ADR 0241):
+    /// each report acknowledged within 3 days, every vulnerability assessed within 10 and
+    /// fixed, or accepted by the security owner or Management, within its severity's
+    /// window from the day it was received (the strictest until it is assessed); a
+    /// penetration test within a year of the last (the first a year after the information
+    /// security policy's first approval), and its critical and high findings retested
+    /// within 30 days of the last being fixed or accepted. Something done late is an exception in the
+    /// bundle of the period it was done in; something overdue, in every bundle until done.
+    pub fn vulnerabilities(&self) -> (Value, Vec<&'static str>) {
+        let (p, cut) = (self.p, self.cut());
+        let in_period = |d: NaiveDate| d >= p.from && d < cut;
+        let recent = |d: NaiveDate| d < cut && age(cut, d) <= YEAR_DAYS;
+        let before = |d: Option<NaiveDate>| d.is_some_and(|d| d < p.from);
+        let windows = crate::vulns::Windows::default();
+        let closed_on = |x: &Vulnerability| {
+            let assessed = x.assessed.filter(|d| *d < cut);
+            if assessed.is_some() && x.severity.as_deref() == Some("none") { assessed } else { x.fixed.or(x.accepted).filter(|d| *d < cut) }
+        };
+        let (mut not_acknowledged, mut acknowledged_late, mut not_assessed, mut assessed_late) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut fix_overdue, mut closed_late, mut wrong) = (Vec::new(), Vec::new(), Vec::new());
+        let mut by_severity: BTreeMap<&str, usize> = VULNERABILITY_SEVERITIES.iter().copied().chain(["unassessed"]).map(|s| (s, 0)).collect();
+        let mut by_source: BTreeMap<&str, usize> = VULNERABILITY_SOURCES.iter().map(|s| (*s, 0)).collect();
+        let mut out = Vec::new();
+        for x in self.r.vulnerabilities.iter().filter(|x| x.received < cut) {
+            let report = x.source == "report";
+            let acknowledged = x.acknowledged.filter(|d| *d < cut);
+            let assessed = x.assessed.filter(|d| *d < cut);
+            let severity = assessed.and(x.severity.as_deref());
+            let closed = closed_on(x);
+            if in_period(x.received) {
+                *by_severity.entry(severity.unwrap_or("unassessed")).or_default() += 1;
+                *by_source.entry(x.source.as_str()).or_default() += 1;
+            }
+            if before(closed) && (!report || before(acknowledged)) {
+                continue;
+            }
+            let ack_due = report.then(|| plus(x.received, ACKNOWLEDGE_DAYS));
+            match (acknowledged, ack_due) {
+                (Some(a), Some(due)) if in_period(a) && a > due => acknowledged_late.push(json!(format!("{} (received {}, acknowledged {a}, due {due})", x.id, x.received))),
+                (None, Some(due)) if due < cut => not_acknowledged.push(json!(format!("{} (received {}, not acknowledged, due {due})", x.id, x.received))),
+                _ => {}
+            }
+            let assess_due = plus(x.received, ASSESS_DAYS);
+            match assessed {
+                Some(a) if in_period(a) && a > assess_due => assessed_late.push(json!(format!("{} (received {}, assessed {a}, due {assess_due})", x.id, x.received))),
+                None if assess_due < cut => not_assessed.push(json!(format!("{} (received {}, not assessed, due {assess_due})", x.id, x.received))),
+                _ => {}
+            }
+            let fix_due = (severity != Some("none")).then(|| plus(x.received, windows.days(severity.unwrap_or("unknown"))));
+            let label = severity.unwrap_or("unassessed");
+            match (closed, fix_due) {
+                (Some(c), Some(due)) if in_period(c) && c > due => closed_late.push(json!(format!("{} {label} (received {}, {} {c}, due {due})", x.id, x.received, if x.fixed.is_some() { "fixed" } else { "accepted" }))),
+                (None, Some(due)) if due < cut => fix_overdue.push(json!(format!("{} {label} (received {}, open, due {due})", x.id, x.received))),
+                _ => {}
+            }
+            let accepted = x.accepted.filter(|d| *d < cut);
+            let accepted_by = accepted.and(x.accepted_by.as_deref());
+            let held = accepted.zip(accepted_by).and_then(|(at, by)| self.held(by, &VULNERABILITY_ACCEPTERS, at));
+            if let (Some(at), Some(by), None) = (accepted.filter(|a| in_period(*a)), accepted_by, &held) {
+                wrong.push(json!(format!("{} on {at}: {by} held neither {}", x.id, VULNERABILITY_ACCEPTERS.join(" nor "))));
+            }
+            out.push(json!({
+                "id": x.id, "source": x.source, "penTest": x.pen_test, "incident": x.incident, "received": ds(x.received),
+                "acknowledgeDue": ack_due.map(ds), "acknowledged": acknowledged.map(ds), "assessDue": ds(assess_due), "assessed": assessed.map(ds),
+                "severity": severity, "owner": assessed.and(x.owner.as_deref()), "fixDue": fix_due.map(ds),
+                "fixed": x.fixed.filter(|d| *d < cut).map(ds), "accepted": accepted.map(ds), "acceptedBy": accepted_by, "heldRole": held, "openAtEnd": closed.is_none(),
+            }));
+        }
+
+        let (mut retest_overdue, mut retest_late) = (Vec::new(), Vec::new());
+        let mut tests: Vec<&PenTest> = self.r.pen_tests.iter().filter(|t| t.reported < cut).collect();
+        tests.sort_by(|a, b| (a.reported, &a.id).cmp(&(b.reported, &b.id)));
+        let mut listed = Vec::new();
+        for t in tests {
+            let findings: Vec<&Vulnerability> = self.r.vulnerabilities.iter().filter(|x| x.pen_test.as_deref() == Some(t.id.as_str()) && x.received < cut).collect();
+            let serious: Vec<&&Vulnerability> = findings.iter().filter(|x| x.assessed.is_some_and(|a| a < cut) && matches!(x.severity.as_deref(), Some("critical" | "high"))).collect();
+            let last_fix = serious.iter().filter_map(|x| x.fixed.filter(|d| *d < cut)).max();
+            let all_closed = !serious.is_empty() && serious.iter().all(|x| closed_on(x).is_some());
+            let last_closed = serious.iter().filter_map(|x| closed_on(x)).max();
+            let retest_due = last_fix.zip(last_closed).filter(|_| all_closed).map(|(f, c)| plus(f.max(c), RETEST_DAYS));
+            let retested = t.retested.filter(|d| *d < cut);
+            let covering = retested.filter(|r| last_fix.is_none_or(|f| *r >= f));
+            match (covering, retest_due) {
+                (Some(r), Some(due)) if in_period(r) && r > due => retest_late.push(json!(format!("{} (last fixed {}, retested {r}, due {due})", t.id, last_fix.map(ds).unwrap_or_default()))),
+                (None, Some(due)) if due < cut => retest_overdue.push(json!(format!("{} (last fixed {}, not retested since, due {due})", t.id, last_fix.map(ds).unwrap_or_default()))),
+                _ => {}
+            }
+            let pending = retest_due.is_some() && !before(covering);
+            if !recent(t.reported) && !pending {
+                continue;
+            }
+            listed.push(json!({
+                "id": t.id, "vendor": t.vendor, "reported": ds(t.reported), "reportSha256": t.report_sha256,
+                "findings": findings.len(), "criticalOrHigh": serious.len(), "openAtEnd": findings.iter().filter(|x| closed_on(x).is_none()).count(),
+                "retestDue": retest_due.map(ds), "retested": retested.map(ds), "retestSha256": retested.and(t.retest_sha256.as_deref()), "retestCoversFixes": retest_due.map(|_| covering.is_some()),
+            }));
+        }
+        let last_test = self.r.pen_tests.iter().map(|t| t.reported).filter(|d| *d < cut).max();
+        let test_due = self.first_approval(INFORMATION_SECURITY).map(|f| plus(f, YEAR_DAYS));
+        let mut no_test = Vec::new();
+        if test_due.is_some_and(|d| d < cut) && last_test.is_none_or(|d| !recent(d)) {
+            no_test.push(json!(format!("none in the year to {cut}{}", last_test.map(|d| format!(" (last {d})")).unwrap_or_default())));
+        }
+
+        let in_set = self.policies.iter().any(|q| q.id == INFORMATION_SECURITY);
+        let approved = self.r.policy_approvals.iter().filter(|a| a.policy == INFORMATION_SECURITY && a.approved_at < cut).map(|a| a.approved_at).max();
+        let current = in_set && approved.is_some_and(recent);
+        let mut rows = Vec::new();
+        if current {
+            rows.push("CC2.3-1");
+        }
+        if last_test.is_some_and(recent) {
+            rows.push("CC3.2-2");
+        }
+        if current {
+            rows.push("CC4.2-1");
+        }
+        let v = json!({
+            "basis": format!("every vulnerability found outside the scans (reported under SECURITY.md, by a penetration test, by a vendor, or by the provider) received before the period's end and still being handled in it, by register id: a report acknowledged within {ACKNOWLEDGE_DAYS} days of being received; its severity set and an owner role named (assessed) within {ASSESS_DAYS}; and fixed, or accepted by someone holding or deputising {} that day, within its severity's window from the day it was received ({}; the strictest until it is assessed; none for one assessed as not a vulnerability); an external penetration test within a year (from a year after the information security policy's first approval), and its critical and high findings, once each is fixed or accepted, retested within {RETEST_DAYS} days of the last being fixed or accepted (a retest counting only on or after the last fix). Calendar days, as SECURITY.md's targets are. Something done late is an exception in the bundle of the period it was done in; something overdue, in every bundle until it is done", VULNERABILITY_ACCEPTERS.join(" or "), windows.0.iter().map(|(k, d)| format!("{k} {d} days")).collect::<Vec<_>>().join(", ")),
+            "informationSecurityPolicy": { "inPolicySet": in_set, "lastApproved": approved.map(ds), "approvalCurrent": current, "lastPenTest": last_test.map(ds), "penTestDue": test_due.map(|d| ds(last_test.map_or(d, |l| plus(l, YEAR_DAYS).max(d)))) },
+            "windows": windows.0,
+            "summary": {
+                "vulnerabilities": out.len(),
+                "receivedInPeriodBySeverity": by_severity,
+                "receivedInPeriodBySource": by_source,
+                "openAtEnd": out.iter().filter(|x| x["openAtEnd"] == true).count(),
+                "acceptedInPeriod": self.r.vulnerabilities.iter().filter(|x| x.accepted.is_some_and(in_period)).count(),
+                "penTestsInTheYear": self.r.pen_tests.iter().filter(|t| recent(t.reported)).count(),
+            },
+            "exceptions": {
+                "notAcknowledged": not_acknowledged, "acknowledgedLate": acknowledged_late,
+                "notAssessed": not_assessed, "assessedLate": assessed_late,
+                "fixOverdue": fix_overdue, "closedLate": closed_late, "accepterNotInRole": wrong,
+                "noPenTest": no_test, "retestOverdue": retest_overdue, "retestLate": retest_late,
+            },
+            "vulnerabilities": out,
+            "penTests": listed,
+        });
+        (v, rows)
+    }
 }
 
 /// The calendar quarters that overlap the period and have ended by its end.
@@ -1959,7 +2260,7 @@ pub fn name(p: &Period, now_ms: i64) -> String {
 /// Each file's JSON and the rows its manifest maps it to.
 pub fn files(c: &Check) -> Vec<(&'static str, Value, Vec<&'static str>)> {
     let period = json!({ "from": c.p.from.to_string(), "to": c.p.to.to_string(), "days": c.p.days() });
-    let parts = [c.roles(), c.policies(), c.people(), c.risks(), c.management_reviews(), c.vendors(), c.exceptions(), c.conduct(), c.incidents(), c.access()];
+    let parts = [c.roles(), c.policies(), c.people(), c.risks(), c.management_reviews(), c.vendors(), c.exceptions(), c.conduct(), c.incidents(), c.access(), c.vulnerabilities()];
     SECTIONS
         .iter()
         .zip(parts)
@@ -2222,6 +2523,13 @@ mod tests {
                 { "system": "github", "at": "2027-03-15", "by": "p-sec", "listSha256": ZERO, "mfa": true, "findings": [{ "id": "AF-01", "fixed": "2027-03-18" }] },
                 { "system": "linode", "at": "2027-02-20", "by": "p-sec", "listSha256": ZERO, "mfa": true },
                 { "system": "botd-eu", "at": "2027-03-16", "by": "p-sec", "listSha256": SIGNED, "mfa": true },
+            ],
+            "penTests": [{ "id": "PT-01", "reported": "2027-02-10", "reportSha256": ZERO, "retested": "2027-03-20", "retestSha256": ZERO, "notes": "Initrode's testers" }],
+            "vulnerabilities": [
+                { "id": "V-01", "source": "report", "incident": "INC-01", "received": "2027-03-02", "acknowledged": "2027-03-03", "assessed": "2027-03-05", "severity": "none", "owner": "Security owner", "notes": "reported by Mallory" },
+                { "id": "V-02", "source": "pentest", "penTest": "PT-01", "received": "2027-02-10", "assessed": "2027-02-12", "severity": "high", "owner": "Engineering lead", "fixed": "2027-03-01" },
+                { "id": "V-03", "source": "vendor", "received": "2027-03-10", "assessed": "2027-03-12", "severity": "medium", "owner": "Operator" },
+                { "id": "V-04", "source": "pentest", "penTest": "PT-01", "received": "2027-02-10", "assessed": "2027-02-12", "severity": "low", "owner": "Engineering lead", "accepted": "2027-03-15", "acceptedBy": "p-sec" },
             ],
         })
     }
@@ -2913,6 +3221,161 @@ mod tests {
     }
 
     #[test]
+    fn vulnerabilities_acknowledged_assessed_and_fixed_or_accepted_in_time() {
+        let mut v = good();
+        let list = v["vulnerabilities"].as_array_mut().unwrap();
+        list.push(json!({ "id": "V-05", "source": "report", "received": "2027-03-10", "acknowledged": "2027-03-15" }));
+        list.push(json!({ "id": "V-06", "source": "report", "received": "2027-03-25" }));
+        list.push(json!({ "id": "V-07", "source": "internal", "received": "2027-01-20", "assessed": "2027-02-05", "severity": "critical", "owner": "Engineering lead" }));
+        list.push(json!({ "id": "V-08", "source": "vendor", "received": "2026-12-01", "assessed": "2026-12-05", "severity": "medium", "owner": "Operator", "fixed": "2027-03-05" }));
+        list.push(json!({ "id": "V-09", "source": "internal", "received": "2027-03-01", "assessed": "2027-03-14", "severity": "low", "owner": "Operator", "accepted": "2027-03-20", "acceptedBy": "p-eng" }));
+        list.push(json!({ "id": "V-10", "source": "internal", "received": "2026-10-01", "assessed": "2026-10-02", "severity": "high", "owner": "Operator", "fixed": "2026-10-20" }));
+        list.push(json!({ "id": "V-11", "source": "report", "received": "2027-04-02" }));
+        check(&v, &|c| {
+            let (x, rows) = c.vulnerabilities();
+            let ex = &x["exceptions"];
+            assert_eq!(ex["acknowledgedLate"], json!(["V-05 (received 2027-03-10, acknowledged 2027-03-15, due 2027-03-13)"]));
+            assert_eq!(ex["notAcknowledged"], json!(["V-06 (received 2027-03-25, not acknowledged, due 2027-03-28)"]));
+            assert_eq!(ex["notAssessed"], json!(["V-05 (received 2027-03-10, not assessed, due 2027-03-20)"]), "V-06 isn't due until after the period");
+            assert_eq!(ex["assessedLate"], json!(["V-09 (received 2027-03-01, assessed 2027-03-14, due 2027-03-11)"]), "V-07 was assessed late before the period");
+            assert_eq!(ex["fixOverdue"], json!(["V-07 critical (received 2027-01-20, open, due 2027-02-19)"]));
+            assert_eq!(ex["closedLate"], json!(["V-08 medium (received 2026-12-01, fixed 2027-03-05, due 2027-03-01)"]));
+            assert_eq!(ex["accepterNotInRole"], json!(["V-09 on 2027-03-20: p-eng held neither Security owner nor Management"]));
+            assert_eq!(exceptions(&x), 7, "{ex}");
+            let ids: Vec<&str> = x["vulnerabilities"].as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap()).collect();
+            assert_eq!(ids, ["V-01", "V-02", "V-03", "V-04", "V-05", "V-06", "V-07", "V-08", "V-09"], "V-10 was finished before the period, V-11 came after it");
+            assert_eq!(x["summary"]["receivedInPeriodBySeverity"], json!({ "critical": 0, "high": 0, "medium": 1, "low": 1, "none": 1, "unassessed": 2 }));
+            assert_eq!(x["summary"]["receivedInPeriodBySource"], json!({ "report": 3, "pentest": 0, "vendor": 1, "internal": 1 }));
+            assert_eq!((x["summary"]["openAtEnd"].as_u64(), x["summary"]["acceptedInPeriod"].as_u64()), (Some(4), Some(2)));
+            let first = &x["vulnerabilities"][0];
+            assert_eq!((first["fixDue"].clone(), first["openAtEnd"].as_bool(), first["incident"].as_str()), (Value::Null, Some(false), Some("INC-01")), "not a vulnerability: nothing to fix");
+            let accepted = &x["vulnerabilities"][3];
+            assert_eq!((accepted["heldRole"].as_str(), accepted["fixDue"].as_str()), (Some("Security owner"), Some("2027-05-11")), "low: 90 days");
+            assert_eq!(x["vulnerabilities"][5]["fixDue"], "2027-04-24", "unassessed: the strictest window");
+            assert_eq!(rows, ["CC2.3-1", "CC3.2-2", "CC4.2-1"], "late work is an exception, not a gap");
+            assert_eq!(c.after_period(), 1);
+            assert!(!x.to_string().contains("Mallory"), "no notes: {x}");
+        });
+    }
+
+    #[test]
+    fn penetration_tests_yearly_and_their_fixes_retested() {
+        let mut unretested = good();
+        unretested["penTests"][0].as_object_mut().unwrap().retain(|k, _| !k.starts_with("retest"));
+        check(&unretested, &|c| {
+            let (x, rows) = c.vulnerabilities();
+            assert_eq!(x["exceptions"]["retestOverdue"], json!(["PT-01 (last fixed 2027-03-01, not retested since, due 2027-03-31)"]));
+            assert_eq!((x["penTests"][0]["criticalOrHigh"].as_u64(), x["penTests"][0]["retestCoversFixes"].as_bool()), (Some(1), Some(false)));
+            assert_eq!(rows, ["CC2.3-1", "CC3.2-2", "CC4.2-1"]);
+        });
+        let mut early = good();
+        early["penTests"][0]["retested"] = json!("2027-02-20");
+        check(&early, &|c| assert_eq!(c.vulnerabilities().0["exceptions"]["retestOverdue"].as_array().map(Vec::len), Some(1), "a retest before the last fix doesn't cover it"));
+        let mut late = good();
+        late["vulnerabilities"][1]["fixed"] = json!("2027-02-15");
+        check(&late, &|c| assert_eq!(c.vulnerabilities().0["exceptions"]["retestLate"], json!(["PT-01 (last fixed 2027-02-15, retested 2027-03-20, due 2027-03-17)"])));
+        let mut open = good();
+        open["vulnerabilities"][1].as_object_mut().unwrap().remove("fixed");
+        open["penTests"][0].as_object_mut().unwrap().retain(|k, _| !k.starts_with("retest"));
+        check(&open, &|c| {
+            let ex = &c.vulnerabilities().0["exceptions"];
+            assert_eq!((ex["retestOverdue"].clone(), ex["fixOverdue"].clone()), (json!([]), json!(["V-02 high (received 2027-02-10, open, due 2027-03-12)"])), "no retest is due while a finding is open: the finding is overdue");
+        });
+        let mut accepted_later = good();
+        accepted_later["penTests"][0]["reported"] = json!("2027-01-05");
+        accepted_later["penTests"][0]["retested"] = json!("2027-02-15");
+        for (k, d) in [("received", "2027-01-05"), ("assessed", "2027-01-06"), ("fixed", "2027-01-10")] {
+            accepted_later["vulnerabilities"][1][k] = json!(d);
+        }
+        accepted_later["vulnerabilities"].as_array_mut().unwrap().push(json!({ "id": "V-12", "source": "pentest", "penTest": "PT-01", "received": "2027-01-05", "assessed": "2027-01-06", "severity": "high", "owner": "Engineering lead", "accepted": "2027-02-04", "acceptedBy": "p-sec" }));
+        check(&accepted_later, &|c| {
+            let x = c.vulnerabilities().0;
+            assert_eq!((x["penTests"][0]["retestDue"].as_str(), x["penTests"][0]["retestCoversFixes"].as_bool()), (Some("2027-03-06"), Some(true)), "due 30 days after the last finding is closed, here accepted: {x:#}");
+            assert_eq!(exceptions(&x), 0, "the retest was within 30 days of the last closing: {x:#}");
+        });
+        accepted_later["penTests"][0]["retested"] = json!("2027-03-10");
+        check(&accepted_later, &|c| assert_eq!(c.vulnerabilities().0["exceptions"]["retestLate"], json!(["PT-01 (last fixed 2027-01-10, retested 2027-03-10, due 2027-03-06)"])));
+
+        let mut old = good();
+        old["penTests"][0]["reported"] = json!("2026-01-10");
+        old["policyApprovals"].as_array_mut().unwrap().push(json!({ "policy": INFORMATION_SECURITY, "sha256": ZERO, "approvedBy": "p-mgmt", "approvedAt": "2026-02-01" }));
+        old["people"][0]["joined"] = json!("2025-06-01");
+        check(&old, &|c| {
+            let (x, rows) = c.vulnerabilities();
+            assert_eq!(x["exceptions"]["noPenTest"], json!(["none in the year to 2027-04-01 (last 2026-01-10)"]), "due a year after the policy's first approval");
+            assert_eq!(x["informationSecurityPolicy"]["penTestDue"], "2027-02-01");
+            assert_eq!(x["penTests"][0]["id"], "PT-01", "an old test is listed while its retest is this period's");
+            assert_eq!(rows, ["CC2.3-1", "CC4.2-1"], "no test within a year: CC3.2-2 is a gap");
+        });
+        let mut none = good();
+        none["penTests"] = json!([]);
+        none["vulnerabilities"].as_array_mut().unwrap().retain(|x| x["source"] != "pentest");
+        check(&none, &|c| {
+            let (x, rows) = c.vulnerabilities();
+            assert_eq!((exceptions(&x), rows), (0, vec!["CC2.3-1", "CC4.2-1"]), "the first test is due a year after the policy's first approval");
+        });
+        let mut stale = good();
+        for a in stale["policyApprovals"].as_array_mut().unwrap().iter_mut().filter(|a| a["policy"] == INFORMATION_SECURITY) {
+            a["approvedAt"] = json!("2026-02-01");
+        }
+        check(&stale, &|c| assert_eq!(c.vulnerabilities().1, ["CC3.2-2"], "a policy approved over a year ago maps only the test"));
+    }
+
+    #[test]
+    fn vulnerability_records_that_dont_hold_together_are_refused() {
+        let mut v = good();
+        v["penTests"].as_array_mut().unwrap().push(json!({ "id": "PT-01", "vendor": "acme-sec", "reported": "2027-03-01", "reportSha256": "abc", "retested": "2027-02-01" }));
+        v["penTests"].as_array_mut().unwrap().push(json!({ "id": "PT-02", "vendor": "linode", "reported": "2027-03-01", "reportSha256": ZERO, "retestSha256": "xyz" }));
+        let list = v["vulnerabilities"].as_array_mut().unwrap();
+        list.push(json!({ "id": "V-01", "source": "internal", "received": "2027-03-05" }));
+        list.push(json!({ "id": "V-X1", "source": "scan", "penTest": "PT-09", "incident": "INC-99", "received": "2027-03-05", "acknowledged": "2027-03-06", "severity": "urgent", "owner": "CISO", "fixed": "2027-03-06", "accepted": "2027-03-06" }));
+        list.push(json!({ "id": "V-X2", "source": "report", "received": "2027-03-05", "acknowledged": "2027-03-04", "assessed": "2027-03-04", "severity": "none", "owner": "Operator", "fixed": "2027-03-06", "acceptedBy": "p-who" }));
+        list.push(json!({ "id": "V-X3", "source": "pentest", "received": "2027-03-05", "assessed": "2027-03-06", "severity": "high", "owner": "Operator", "fixed": "2027-03-05" }));
+        let e = parse(&serde_json::to_vec(&v).unwrap(), &builtin_policies()).unwrap_err();
+        for want in [
+            "penetration test id PT-01 is used twice",
+            "penetration test PT-01 names the vendor acme-sec, which isn't in vendors",
+            "penetration test PT-01: reportSha256 is the tester's report's SHA-256",
+            "penetration test PT-01: retested and retestSha256 go together",
+            "penetration test PT-01: retested can't be before reported",
+            "penetration test PT-02: retested and retestSha256 go together",
+            "penetration test PT-02: retestSha256 is the retest letter's SHA-256",
+            "vulnerability id V-01 is used twice",
+            "vulnerability V-X1: source is report, pentest, vendor, internal",
+            "vulnerability V-X1: penTest names the penetration test that found it, for source pentest only",
+            "vulnerability V-X1 names the penetration test PT-09, which isn't in penTests",
+            "vulnerability V-X1 names the incident INC-99, which isn't in incidents",
+            "vulnerability V-X1: acknowledged is for reports",
+            "vulnerability V-X1: assessed, severity and owner go together",
+            "vulnerability V-X1: severity is critical, high, medium, low, none",
+            "vulnerability V-X1 names the role CISO",
+            "vulnerability V-X1: accepted and acceptedBy go together",
+            "vulnerability V-X1: a vulnerability is fixed or accepted, not both",
+            "vulnerability V-X1: a vulnerability is assessed before it is fixed or accepted",
+            "vulnerability V-X2 names p-who, who isn't in people",
+            "vulnerability V-X2: accepted and acceptedBy go together",
+            "vulnerability V-X2: a vulnerability is assessed before it is fixed or accepted, and one assessed as none needs neither",
+            "vulnerability V-X2: dates out of order",
+            "vulnerability V-X3: penTest names the penetration test that found it",
+            "vulnerability V-X3: dates out of order",
+        ] {
+            assert!(e.contains(want), "{want}\n{e}");
+        }
+    }
+
+    /// The deadlines are `SECURITY.md`'s and the information security policy's.
+    #[test]
+    fn the_vulnerability_deadlines_are_the_policys() {
+        let security = include_str!("../../../../SECURITY.md");
+        let policy = include_str!("../../../../docs/security/policies/information-security.md");
+        assert!(security.contains(&format!("| We acknowledge the report | {ACKNOWLEDGE_DAYS} days |")), "SECURITY.md's acknowledgement target");
+        assert!(security.contains(&format!("| We confirm whether it's a vulnerability and its severity (CVSS) | {ASSESS_DAYS} days |")), "SECURITY.md's assessment target");
+        assert!(policy.contains(&format!("retested within {RETEST_DAYS} days of the last of them being fixed")), "the policy's retest");
+        assert!(policy.contains("external penetration test at least yearly"), "the policy's yearly test");
+        assert!(policy.contains("[policy register](../policy-register.md#vulnerabilities-and-penetration-tests)"), "the policy says where they are recorded");
+    }
+
+    #[test]
     fn records_after_the_period_are_left_out() {
         let mut v = good();
         v["managementReviews"].as_array_mut().unwrap().push(json!({ "at": "2027-04-02", "attendees": ["p-mgmt"] }));
@@ -2940,7 +3403,7 @@ mod tests {
         assert!(![crate::changes::PREFIX, crate::vulns::PREFIX, crate::drills::PREFIX, "superbot-evidence-"].iter().any(|p| b.name.starts_with(p)));
         let entries = crate::coverage::untar(&b.tar).unwrap();
         let all: String = entries.iter().map(|(_, x)| String::from_utf8_lossy(x).into_owned()).collect();
-        for never in ["Alice", "Example", "Cross-user", "secret reasoning", "Signup abuse", "on-call login", "code host's organisation"] {
+        for never in ["Alice", "Example", "Cross-user", "secret reasoning", "Signup abuse", "on-call login", "code host's organisation", "Mallory", "Initrode"] {
             assert!(!all.contains(never), "{never:?} is in the bundle");
         }
         let manifest: Value = serde_json::from_slice(&entries.iter().find(|(n, _)| n.ends_with("/manifest.json")).unwrap().1).unwrap();
