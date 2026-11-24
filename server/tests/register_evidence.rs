@@ -159,7 +159,7 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
     write(&dir, "baseline-b.json", &baseline("2026-11-01T00:00:05Z", &["AUTH_MFA"]));
     write(&dir, "access-review.json", &access_review("2026-10-12T15:00:00Z"));
     let pol = policies();
-    let o = evidence(&dir, &[&["register", "register.json", "--policies", pol.to_str().unwrap(), "--baseline", "baseline-a.json", "--baseline", "baseline-b.json", "--access-review", "access-review.json", "-o", "register.tar"][..], &PERIOD].concat());
+    let o = evidence(&dir, &[&["register", "register.json", "--policies", pol.to_str().unwrap(), "--baseline", "baseline-a.json", "--baseline", "baseline-b.json", "--access-review", "botd-1=access-review.json", "-o", "register.tar"][..], &PERIOD].concat());
     let out = text(&o);
     assert!(o.status.success(), "{out}");
     for want in [
@@ -199,6 +199,7 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
     assert_eq!(access["exceptions"]["leaverNotRemoved"], json!(["p-d on code-host (user): left 2026-10-15, not removed"]), "{access:#}");
     let botd = access["reviews"].as_array().unwrap().iter().find(|r| r["system"] == "botd-1").unwrap();
     assert_eq!((botd["signOffChecked"].as_bool(), botd["signedOffAt"].as_str()), (Some(true), Some("2026-10-12T15:00:00Z")), "{access:#}");
+    assert_eq!(access["signOffFiles"][0]["system"], "botd-1");
     assert_eq!((access["signOffFiles"][0]["sha256"].as_str(), access["summary"]["grantedInPeriod"].as_u64()), (Some(hex(&fs::read(dir.join("access-review.json")).unwrap()).as_str()), Some(1)), "{access:#}");
     let incidents = json_in(&folder, "incidents.json");
     assert_eq!(incidents["exceptions"]["reviewOverdue"], json!(["INC-2 (closed 2026-10-14, not reviewed, due 2026-10-28)"]), "a possible breach needs a written review: {incidents:#}");
@@ -233,7 +234,7 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
 
     // A managed server's review with no sign-off that day in botd is flagged.
     write(&dir, "other-day.json", &access_review("2026-10-13T09:00:00Z"));
-    let o = evidence(&dir, &[&["register", "register.json", "--access-review", "other-day.json", "-o", "other-day.tar"][..], &PERIOD].concat());
+    let o = evidence(&dir, &[&["register", "register.json", "--access-review", "botd-1=other-day.json", "-o", "other-day.tar"][..], &PERIOD].concat());
     assert!(o.status.success() && text(&o).contains("access.json: leaverNotRemoved 1, signOffNotFound 1"), "{}", text(&o));
 
     // A policy changed since its approval is flagged; the same command never writes over a file.
@@ -272,13 +273,18 @@ fn a_register_that_doesnt_hold_together_or_a_baseline_from_another_month_writes_
     assert!(!dir.join("out.tar").exists());
 
     write(&dir, "not-access-review.json", &json!({ "format": 1 }));
-    let o = evidence(&dir, &[&["register", "register.json", "--access-review", "not-access-review.json", "-o", "out.tar"][..], &PERIOD].concat());
+    let o = evidence(&dir, &[&["register", "register.json", "--access-review", "botd-1=not-access-review.json", "-o", "out.tar"][..], &PERIOD].concat());
     assert!(o.status.code() == Some(1) && text(&o).contains("has no snapshotAt or reportDigest"), "{}", text(&o));
     assert!(!dir.join("out.tar").exists());
     write(&dir, "access-review.json", &access_review("2026-10-12T15:00:00Z"));
-    let o = evidence(&dir, &[&["register", "register.json", "--access-review", "access-review.json", "--access-review", "access-review.json", "-o", "out.tar"][..], &PERIOD].concat());
+    let o = evidence(&dir, &[&["register", "register.json", "--access-review", "botd-1=access-review.json", "--access-review", "botd-1=access-review.json", "-o", "out.tar"][..], &PERIOD].concat());
     assert!(o.status.code() == Some(1) && text(&o).contains("same file as another --access-review"), "{}", text(&o));
     assert!(!dir.join("out.tar").exists());
+    for (given, want) in [("access-review.json", "give --access-review <system>=<file>"), ("hosting=access-review.json", "hosting isn't a system of kind superbot"), ("botd-9=access-review.json", "botd-9 isn't a system of kind superbot")] {
+        let o = evidence(&dir, &[&["register", "register.json", "--access-review", given, "-o", "out.tar"][..], &PERIOD].concat());
+        assert!(o.status.code() == Some(1) && text(&o).contains(want), "{given}: {}", text(&o));
+        assert!(!dir.join("out.tar").exists());
+    }
 
     let o = evidence(&dir, &["register", "register.json", "--from", "2026-05-01", "--to", "2026-11-01", "-o", "out.tar"]);
     assert!(o.status.code() == Some(1) && text(&o).contains("one month at most"), "a late record can't cover earlier months: {}", text(&o));
