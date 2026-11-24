@@ -784,6 +784,9 @@ impl Issuer for SecretsManager {
     }
 
     fn issue_narrowed(&self, role_arn: &str, fields: &[String], run_for: Duration, bot_id: &str, narrowed: &Narrowed) -> Result<Lease, Error> {
+        if narrowed.boundary.is_some() {
+            return Err(Error::Unavailable("AWS STS: a session can't be narrowed with a Google access boundary".into()));
+        }
         let (inner, role_arn, fields, bot_id, narrowed) = (Arc::clone(&self.inner), role_arn.to_string(), fields.to_vec(), bot_id.to_string(), narrowed.clone());
         self.worker.run(async move { inner.assume_role(&role_arn, &fields, run_for, &bot_id, &narrowed).await })
     }
