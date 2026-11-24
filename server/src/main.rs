@@ -24,6 +24,7 @@ mod audit_chain;
 #[cfg(test)]
 mod audit_chain_http_tests;
 mod audit_checkpoint;
+mod audit_datadog;
 #[cfg(test)]
 mod audit_checkpoint_http_tests;
 mod audit_export;

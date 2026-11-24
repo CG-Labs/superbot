@@ -334,7 +334,7 @@ mod tests {
         let e = settings(&[("AUDIT_EXPORT", &named), ("AUDIT_EXPORT_HEADERS_SECOPS", "X=1")]).unwrap_err();
         assert!(e.contains("AUDIT_EXPORT_HEADERS_SECOPS is for an https sink; Google SecOps signs in to Google as botd"), "{e}");
         let e = settings(&[("AUDIT_EXPORT", &named), ("AUDIT_EXPORT_COMPRESS_SECOPS", "gzip")]).unwrap_err();
-        assert!(e.contains("AUDIT_EXPORT_COMPRESS_SECOPS is for https and azure-monitor sinks; the Chronicle API takes no compressed bodies"), "{e}");
+        assert!(e.contains("AUDIT_EXPORT_COMPRESS_SECOPS is for https, azure-monitor and datadog sinks; the Chronicle API takes no compressed bodies"), "{e}");
         // It is one of the SIEMs: with another, both need names; a server-wide gzip leaves it plain.
         let e = settings(&[("AUDIT_EXPORT", &format!("{url},https://siem.example.net/in"))]).unwrap_err();
         assert!(e.contains("name each"), "{e}");
