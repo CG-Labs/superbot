@@ -429,6 +429,9 @@ mod tests {
         differ.push(&changed);
         let differ = check(&differ);
         assert!(!differ.ok && differ.first_unreadable[0].error.contains("disagree"), "{differ:?}");
+        let cut: Vec<&str> = pieces.iter().map(|p| &p[..p.len() / 2]).collect();
+        let cut = check(&cut);
+        assert!(!cut.ok && cut.unreadable == pieces.len() as u64 && cut.first_unreadable.iter().all(|p| p.error.contains("names the schema but isn't JSON")), "every damaged piece is named: {cut:?}");
     }
 
     #[tokio::test]

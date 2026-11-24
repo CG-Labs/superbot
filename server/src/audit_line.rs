@@ -415,7 +415,7 @@ impl Lines {
         let unreadable = |why: &str| Problem { id: None, at: at.to_string(), reason: "unreadable", error: format!("{at} {why}") };
         let v: Value = match serde_json::from_str(&text[start..]) {
             Ok(v) => v,
-            Err(_) if text.contains(SCHEMA) => return self.unreadable.push(unreadable("names the schema but isn't JSON")),
+            Err(_) if text.contains(SCHEMA) || text.contains(PART_SCHEMA) => return self.unreadable.push(unreadable("names the schema but isn't JSON")),
             Err(_) => {
                 self.ignored += 1;
                 return;
