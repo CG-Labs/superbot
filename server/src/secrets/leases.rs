@@ -216,8 +216,9 @@ impl Narrowing {
         let policy = match &self.policy {
             Some(p) => {
                 let text = serde_json::to_string(&substitute(p, &fill)).map_err(|e| format!("the session policy can't be written: {e}"))?;
-                if text.len() > MAX_POLICY {
-                    return Err(format!("the session policy is {} characters with this run's ids in it, over STS's {MAX_POLICY}", text.len()));
+                let chars = text.chars().count();
+                if chars > MAX_POLICY {
+                    return Err(format!("the session policy is {chars} characters with this run's ids in it, over STS's {MAX_POLICY}"));
                 }
                 Some(text)
             }
@@ -320,8 +321,9 @@ fn read_policy(file: &str) -> Result<Value, String> {
     if compact.chars().any(|c| u32::from(c) > 0xFF) {
         return Err(bad("has characters STS won't take in a policy (only up to U+00FF)".into()));
     }
-    if compact.len() > MAX_POLICY {
-        return Err(bad(format!("is {} characters with spaces taken out, over STS's {MAX_POLICY}; move statements to a managed policy (policy-arn=)", compact.len())));
+    let chars = compact.chars().count();
+    if chars > MAX_POLICY {
+        return Err(bad(format!("is {chars} characters with spaces taken out, over STS's {MAX_POLICY}; move statements to a managed policy (policy-arn=)")));
     }
     Ok(v)
 }
@@ -1605,6 +1607,10 @@ pub(crate) mod tests {
         let notjson = policy_file("narrow-notjson", "Statement: allow everything, secret-in-a-bad-file-1f2e");
         let huge = policy_file("narrow-huge", &" ".repeat(MAX_POLICY_FILE as usize + 1));
         assert!(parse_as(&AWS, &format!("arn:aws:iam::123456789012:role/r policy={latin}")).is_ok(), "Latin-1 is what STS takes");
+        let accents = policy_file("narrow-accents", &format!(r#"{{"Statement":[{{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::{}"}}]}}"#, "é".repeat(1900)));
+        let w = parse_as(&AWS, &format!("arn:aws:iam::123456789012:role/r policy={accents}")).unwrap();
+        let sent = w[0].narrowing.for_run("u1", "b1").unwrap().policy.unwrap();
+        assert!(sent.len() > MAX_POLICY && sent.chars().count() <= MAX_POLICY, "STS's limit is in characters, not UTF-8 bytes");
         let role = "arn:aws:iam::123456789012:role/r";
         let arn = |n: usize| format!("arn:aws:iam::123456789012:policy/p{n}");
         let eleven: Vec<String> = (0..=MAX_POLICY_ARNS).map(|n| format!("policy-arn={}", arn(n))).collect();
