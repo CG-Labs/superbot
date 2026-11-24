@@ -470,12 +470,14 @@ impl Tools {
     /// Whether installing `h` replaces files a running job may use: an installed
     /// harness, or the Node.js npm harnesses run on.
     /// A bundle replaces the tree in its prefix, which other harnesses may run from,
-    /// unless it is a harness tree already from that very bundle.
+    /// unless it is a harness tree already from that very bundle, with no swap into it
+    /// cut short.
     fn replaces(&self, h: &HarnessInstall, node: Option<&NodeRuntime>) -> bool {
         let tree = match &h.source {
             InstallSource::Bundle { holds: kind, downloads, prefix, .. } => {
                 let dest = self.rooted(prefix);
                 let same = *kind == BundleKind::Harnesses
+                    && !swap_pending(&dest, slot(prefix))
                     && downloads.get(std::env::consts::ARCH).is_some_and(|d| hermes_bundle::harness_tree_from(&dest, &d.sha256));
                 !same && std::fs::symlink_metadata(&dest).is_ok()
             }
@@ -1593,6 +1595,7 @@ mod tests {
         // A swap cut short leaves its stage: the tree in place may not have passed its
         // checks, so the next CLI swaps it in again rather than only linking to it.
         std::fs::create_dir_all(opt.join(".superbot-superbot-harnesses.1")).unwrap();
+        assert!(t.replaces(&cli("codex", "0.171.0", "http://127.0.0.1:9/x", &sha), None), "and waits for running jobs to do it");
         let url = serve_once(body.clone()).await;
         assert_eq!(t.install(&cli("codex", "0.171.0", &url, &sha), None).await.unwrap(), "0.171.0");
         assert_eq!(leftovers(), 0, "and clears the stage");
