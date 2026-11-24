@@ -2363,13 +2363,17 @@ function renderOnboarding(r) {
   $("sup-onboarding").hidden = $("sup-onboarding-table").hidden = false;
 }
 
+// Only the newest check's reply is shown, so a slow earlier one can't replace it with other skips.
+let onboardingRequest = 0;
 $("sup-onboarding-form").addEventListener("submit", async (e) => {
   e.preventDefault();
+  const mine = ++onboardingRequest;
   const skip = $("sup-skip").value.split(",").map((s) => s.trim()).filter(Boolean).join(",");
   try {
-    renderOnboarding(await api("GET", `/api/support/onboarding${skip ? `?skip=${key(skip)}` : ""}`));
+    const r = await api("GET", `/api/support/onboarding${skip ? `?skip=${key(skip)}` : ""}`);
+    if (mine === onboardingRequest) renderOnboarding(r);
   } catch (err) {
-    fail(err);
+    if (mine === onboardingRequest) fail(err);
   }
 });
 

@@ -161,9 +161,11 @@ fn the_console_checks_onboarding_only_when_asked() {
     assert!(!load.contains("/api/support/onboarding"), "opening the Support tab would record a check");
     let calls: Vec<&str> = CONSOLE_JS.lines().filter(|l| l.contains("/api/support/onboarding")).collect();
     assert_eq!(calls.len(), 1, "{calls:?}");
-    assert!(calls[0].contains("renderOnboarding(") && calls[0].contains("?skip=${key(skip)}"), "{}", calls[0]);
+    assert!(calls[0].contains("?skip=${key(skip)}"), "{}", calls[0]);
     let submit = CONSOLE_JS.find(r#"$("sup-onboarding-form").addEventListener("submit""#).expect("the check runs from its form");
-    assert!(CONSOLE_JS[submit..].find("/api/support/onboarding").is_some_and(|n| n < 400), "the form's handler makes the call");
+    let handler = &CONSOLE_JS[submit..submit + CONSOLE_JS[submit..].find("\n});\n").expect("handler end")];
+    assert!(handler.contains("/api/support/onboarding"), "the form's handler makes the call");
+    assert!(handler.contains("if (mine === onboardingRequest) renderOnboarding(r);"), "an older check's reply could replace a newer one: {handler}");
     for id in ["sup-onboarding-form", "sup-skip", "sup-onboarding", "sup-onboarding-items", "Check onboarding"] {
         assert!(CONSOLE_HTML.contains(id), "{id}");
     }
