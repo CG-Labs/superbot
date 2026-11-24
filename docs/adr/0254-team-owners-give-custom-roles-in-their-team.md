@@ -51,6 +51,7 @@ Both routes write the usual `role.assigned` and `role.unassigned` with `scope: "
 
 - `GET /api/team` adds `roleChoices` for the team's owners and admins who can write: each role that adds something in a team, with its `id`, `name`, `description`, `applies` (its team permissions) and `maxDays`. Members, read-only managers and service accounts get none.
 - A member's `customRole` in the team view adds `fromIdp: true` when their identity provider gave it.
+- Those who manage the team's members also see `readOnly: true` on read-only teammates, so the app doesn't offer them a role it can't give.
 - **App.** On the Team screen, each teammate's role shows under their name, with when it ends or that it comes from the IdP. Owners and admins get **Give a team role** (or **Change team role**, which starts on the role they hold and the end nearest theirs) on plain members: pick a role, see what it adds in the team, pick an end (only those within a time-bound role's limit), and give it. **Take away role** asks first. Nothing is offered on yourself, on owners and admins (except taking away), or on a role from the IdP.
 - `botctl` has no team commands for owners; server admins keep `botctl role assign --team`. The console stays admin-only.
 

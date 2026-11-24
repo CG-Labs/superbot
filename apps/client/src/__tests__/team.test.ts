@@ -161,6 +161,7 @@ describe("team rules (mirroring the server's, ADR 0087)", () => {
     expect(customRoleActions(team, member("cy", "member"), "me")).toEqual({ give: true, take: false });
     expect(customRoleActions(team, { ...member("cy", "member"), customRole: held }, "me")).toEqual({ give: true, take: true });
     expect(customRoleActions(team, { ...member("cy", "member"), customRole: { ...held, fromIdp: true } }, "me")).toEqual({ give: false, take: false });
+    expect(customRoleActions(team, { ...member("cy", "member"), readOnly: true }, "me")).toEqual({ give: false, take: false });
     expect(customRoleActions(team, { ...member("ev", "admin"), customRole: held }, "me")).toEqual({ give: false, take: true });
     expect(customRoleActions(team, member("ev", "owner"), "me")).toEqual({ give: false, take: false });
     expect(customRoleActions(team, member("me", "member"), "me")).toEqual({ give: false, take: false });

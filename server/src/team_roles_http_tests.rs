@@ -61,9 +61,12 @@ async fn team_owners_and_admins_give_roles_in_their_team() {
         let p = choices.iter().find(|c| c["id"] == people.as_str()).unwrap();
         assert_eq!((p["applies"].clone(), p["maxDays"].clone()), (json!(["users.manage"]), Value::Null), "{p}");
         assert_eq!(choices.iter().find(|c| c["id"] == ops.as_str()).unwrap()["maxDays"], 7);
+        let read_only = |id: &str| mine["members"].as_array().unwrap().iter().find(|m| m["id"] == id).unwrap()["readOnly"].clone();
+        assert_eq!((read_only(&ro), read_only(&dee)), (json!(true), Value::Null), "{mine}");
     }
     let (_, mine) = json_call(port, "GET", "/api/team", &cy_auth, "").await;
     assert!(mine.get("roleChoices").is_none(), "members aren't offered any: {mine}");
+    assert!(mine["members"].as_array().unwrap().iter().all(|m| m.get("readOnly").is_none()), "nor told who's read-only: {mine}");
 
     // A plain member gives nothing.
     assert_eq!(call(port, "PUT", &path(&dee), &cy_auth, &json!({ "role": people }).to_string()).await.0, 403);

@@ -42,16 +42,16 @@ export function canRemove(myRole: TeamRole | undefined, member: Pick<TeamMember,
 
 /**
  * What you may do with `member`'s custom role in the team (ADR 0254): owners and admins
- * give one to its other plain members, and take one away from anyone else, but never a
- * role their identity provider gives them.
+ * give one to its other plain members who aren't read-only, and take one away from anyone
+ * else, but never a role their identity provider gives them.
  */
 export function customRoleActions(
   team: Pick<Team, "role" | "roleChoices">,
-  member: Pick<TeamMember, "id" | "role" | "customRole">,
+  member: Pick<TeamMember, "id" | "role" | "customRole" | "readOnly">,
   meId: string | null | undefined,
 ): { give: boolean; take: boolean } {
   if (!managesTeam(team.role) || member.id === meId || member.customRole?.fromIdp) return { give: false, take: false };
-  return { give: member.role === "member" && !!team.roleChoices?.length, take: !!member.customRole };
+  return { give: member.role === "member" && !member.readOnly && !!team.roleChoices?.length, take: !!member.customRole };
 }
 
 /** A teammate's custom role in a few words: "Team people · ends in 3 days", or null with none. */

@@ -222,7 +222,19 @@ fn member_view(app: &AppState, m: &TeamMember, machines: bool) -> Value {
 /// The team as a member sees it, with what `sight` allows: teammates' machines, invites,
 /// and the plan's details.
 fn team_view(app: &AppState, t: &Team, me: Option<&TeamMember>, sight: Sight) -> Value {
-    let members: Vec<Value> = app.db.team_members(&t.id).iter().map(|m| member_view(app, m, sight.machines)).collect();
+    let members: Vec<Value> = app
+        .db
+        .team_members(&t.id)
+        .iter()
+        .map(|m| {
+            let mut v = member_view(app, m, sight.machines);
+            // Those who manage members see who can't take a custom role (ADR 0254).
+            if sight.invites && app.db.user(&m.user_id).is_some_and(|u| u.role == crate::rbac::Role::Readonly) {
+                v["readOnly"] = json!(true);
+            }
+            v
+        })
+        .collect();
     let mut v = json!({ "id": t.id, "name": t.name, "machines": t.machines, "region": t.region, "createdAt": t.created_at, "members": members });
     // A contractual pin (ADR 0129): its reference only for those who manage its members.
     if let Some(p) = app.db.residency_pin(crate::db::PinOn::Team, &t.id) {

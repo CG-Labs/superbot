@@ -1361,6 +1361,8 @@ export interface TeamMember {
   active: boolean;
   /** A custom role given within this team (ADR 0123): only its team permissions apply here. */
   customRole?: CustomRoleRef | null;
+  /** Read-only across the server, so no custom role in the team; shown to those who manage members (ADR 0254). */
+  readOnly?: boolean;
   /** Only for the team's owners and admins; null when they have none. */
   machine?: TeamMachine | null;
 }
