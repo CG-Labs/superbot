@@ -459,6 +459,14 @@ for bad in "node 22.0 x86_64 $nsha" "node 22.0.1 x86_64 ${nsha:1}" "node 22.0.1 
   if harness_pins "$T/noff/bin/botd" >/dev/null; then fail "harness pins with \"$bad\" were taken"; fi
 done
 pins_botd "$T/noff/bin/botd"
+# Ubuntu 22.04's awk is mawk, which reads fewer regular expressions than gawk.
+if command -v mawk >/dev/null 2>&1; then
+  mkdir -p "$T/mawk" && ln -sf "$(command -v mawk)" "$T/mawk/awk"
+  # shellcheck disable=SC2016 # expanded by the inner bash
+  mpins=$(env PATH="$T/mawk:$PATH" bash -c 'SUPERBOT_INSTALL_NO_MAIN=1 source "$1" && harness_pins "$2"' _ "$DIR/install.sh" "$T/noff/bin/botd") \
+    || fail "mawk refused good harness pins"
+  grep -q '^node ' <<<"$mpins" || fail "mawk lost the Node.js pins"
+fi
 ok "the installer takes a harness bundle only at the pins of the release's botd, checked against its own SHA-256"
 
 # The wrapper puts the tree's Node.js first, and runs the CLI from the tree.
