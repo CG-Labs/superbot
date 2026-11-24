@@ -82,5 +82,5 @@ Each change is SCIM's own events by `scim:google-directory`. Each pass is `scim.
 ## Not done
 
 - Organizational units, aliases, custom schema attributes, and Google admin roles mapped to SuperBot roles (roles stay with admins and ADR 0138's group mappings).
-- Push notifications (above), and syncing several Workspace customers (one tenant per server for now).
+- Push notifications (above; later done as a nudge to this pass, [ADR 0216](0216-google-workspace-push.md)), and syncing several Workspace customers (one tenant per server for now).
 - A setting to let the sync re-enable people an admin disabled.

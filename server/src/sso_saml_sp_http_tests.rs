@@ -877,6 +877,66 @@ async fn encryption_is_off_unless_asked_and_allow_takes_both() {
     assert_eq!(signed_in_as(allow.port, &head).await, Some(u.id));
 }
 
+// AES-CBC in signed responses, for Entra ID and ADFS (ADR 0218)
+
+/// An assertion encrypted as Entra ID and ADFS do (AES-256-CBC, RSA-OAEP), in a response that
+/// is signed too ("Sign SAML response and assertion", `MessageAndAssertion`) or not.
+fn cbc_to(cert: &str, sign_response: bool) -> impl FnOnce(&mut Response) {
+    let cert = cert.to_string();
+    move |r| {
+        r.encrypt = Some(Encrypt { data_alg: crate::sso::xmlenc::AES256_CBC.into(), ..Default::default() });
+        r.encrypt_to = cert;
+        r.sign_response = sign_response;
+    }
+}
+
+#[tokio::test]
+async fn aes_cbc_assertions_sign_in_only_in_a_signed_response() {
+    let sp = serve(&[("ENCRYPTED_ASSERTIONS", "require"), ("AES_CBC", "signed-response")]).await;
+    let cert = sp.enc_cert().await;
+    let md = http().get(format!("http://127.0.0.1:{}/api/auth/sso/{}/metadata", sp.port, sp.id)).send().await.unwrap().text().await.unwrap();
+    let (gcm, cbc) = (md.find("xmlenc11#aes256-gcm").unwrap(), md.find("xmlenc#aes256-cbc").expect("CBC offered"));
+    assert!(gcm < cbc, "after GCM: {md}");
+    assert_eq!(sp.view().await["aesCbc"], "signed-response");
+    let u = sp.link();
+
+    // Only the assertion signed: nothing covers the ciphertext, so it isn't decrypted.
+    let (_, to, head) = sp.sign_in(cbc_to(&cert, false)).await;
+    assert_eq!(to, "/login?error=sso_failed");
+    assert!(signed_in_as(sp.port, &head).await.is_none());
+    assert_eq!(sp.last_failure().await["reason"], "cbc_unsigned_response");
+    // The response signed too: signed in, with the cipher in the audit log.
+    let (code, _, head) = sp.sign_in(cbc_to(&cert, true)).await;
+    assert_eq!(code, 200, "{head}");
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(u.id.clone()));
+    assert_eq!(sp.audit("auth.login").await[0]["details"]["assertionEncryption"], "aes256-cbc");
+    // An IdP that moves to GCM shows it, so the admin knows CBC can go.
+    let (code, _, _) = sp.sign_in(encrypted_to(&cert)).await;
+    assert_eq!(code, 200);
+    assert_eq!(sp.audit("auth.login").await[0]["details"]["assertionEncryption"], "aes256-gcm");
+    // A response signed by someone else around it: refused.
+    let (_, to, head) = sp
+        .sign_in(|r| {
+            cbc_to(&cert, true)(r);
+            r.signer = 1;
+        })
+        .await;
+    assert_eq!(to, "/login?error=sso_failed");
+    assert!(signed_in_as(sp.port, &head).await.is_none());
+
+    // Without the setting, CBC stays refused, however it's signed.
+    let off = serve(&[("ENCRYPTED_ASSERTIONS", "require")]).await;
+    let cert = off.enc_cert().await;
+    let md = http().get(format!("http://127.0.0.1:{}/api/auth/sso/{}/metadata", off.port, off.id)).send().await.unwrap().text().await.unwrap();
+    assert!(!md.contains("cbc"), "{md}");
+    assert_eq!(off.view().await["aesCbc"], "off");
+    off.link();
+    let (_, to, head) = off.sign_in(cbc_to(&cert, true)).await;
+    assert_eq!(to, "/login?error=sso_failed");
+    assert!(signed_in_as(off.port, &head).await.is_none());
+    assert_eq!(off.last_failure().await["reason"], "weak_algorithm");
+}
+
 // Encrypted NameIDs, ECDSA, and signed IdP metadata (ADR 0151)
 
 #[tokio::test]
