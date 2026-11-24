@@ -7,7 +7,11 @@
 #   deploy/offline-bundle.sh hermes --out DIR [--tree /opt/hermes]
 #                                  # a Hermes bundle: Hermes Agent at the pinned commit, installed here for
 #                                  # /opt/hermes (as root, connected), for install.sh --offline --with-hermes
-#   deploy/offline-bundle.sh verify BUNDLE [--sha256 HEX]   # an offline bundle or a Hermes bundle
+#   deploy/offline-bundle.sh harnesses --out DIR [--version V] [--bin-dir DIR] [--tree /opt/superbot-harnesses]
+#                                  # a harness bundle: Node.js, Claude Code, Codex and Pi at the pins of
+#                                  # --bin-dir's botd, installed here for /opt/superbot-harnesses (connected),
+#                                  # for install.sh --offline --harness-bundle
+#   deploy/offline-bundle.sh verify BUNDLE [--sha256 HEX]   # an offline, Hermes or harness bundle
 #   deploy/offline-bundle.sh load BUNDLE [--sha256 HEX]      # docker load its images, no network
 #   deploy/offline-bundle.sh push BUNDLE... --registry HOST[:PORT][/PATH] [--sha256 HEX]...
 #                                  # copy its images, signatures and attestations to a registry mirror,
@@ -24,7 +28,7 @@ DOCKER_FILES=(docker-compose.yml Caddyfile .env.example init.sh seccomp-chromium
 IMAGE_ISSUER=https://token.actions.githubusercontent.com
 
 usage() {
-  sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # The first of SUPERBOT_OCI and CANDIDATES (then superbot-oci on PATH) that runs here: one
@@ -330,6 +334,12 @@ cmd_verify() {
     log "$BUNDLE is a good Hermes bundle"
     return
   fi
+  if offline_archive_ok "$BUNDLE" superbot-harnesses >/dev/null; then
+    OFFLINE_ANY_ARCH=1 harness_unpack_bundle "$BUNDLE" "$OFFLINE_TMP" "$OFFLINE_BUNDLE_SHA256"
+    sed 's/^/    /' "$HARNESS_BUNDLE_DIR/MANIFEST"
+    log "$BUNDLE is a good harness bundle"
+    return
+  fi
   OFFLINE_ANY_ARCH=1 offline_unpack_bundle "$BUNDLE" "$OFFLINE_TMP"
   sed 's/^/    /' "$OFFLINE_DIR/MANIFEST"
   log "$BUNDLE is a good bundle"
@@ -421,7 +431,7 @@ cmd_hermes() {
   fi
   [[ -x "$parent/hermes/.hermes/superbot/hermes" ]] || die "$parent/hermes has no .hermes/superbot/hermes: run deploy/hermes-share.sh with HOME=$HERMES_SHARED_DIR"
 
-  hermes_tree_ok "$parent/hermes" "$HERMES_SHARED_DIR" "${unbundled[@]}" || die "Not bundling $parent/hermes: $HERMES_TREE_PROBLEM"
+  bundle_tree_ok "$parent/hermes" "$HERMES_SHARED_DIR" "${unbundled[@]}" || die "Not bundling $parent/hermes: $BUNDLE_TREE_PROBLEM"
 
   top="superbot-hermes-$tag-$arch"
   stage="$OFFLINE_TMP/$top"
@@ -431,7 +441,7 @@ cmd_hermes() {
   tar -C "$parent" --owner=0 --group=0 --numeric-owner --sort=name --anchored "${excludes[@]}" \
     -cf "$stage/hermes.tar" hermes || die "Couldn't pack $parent/hermes"
   if [[ -z "$tree" ]]; then rm -rf -- "$parent"; fi
-  hermes_tar_ok "$stage/hermes.tar" || die "Not bundling $parent/hermes: $HERMES_TREE_PROBLEM"
+  bundle_tar_ok "$stage/hermes.tar" || die "Not bundling $parent/hermes: $BUNDLE_TREE_PROBLEM"
   {
     echo format=1
     echo kind=hermes
@@ -450,6 +460,142 @@ cmd_hermes() {
   (cd "$out" && sha256sum "$name" >"$name.sha256")
   log "Hermes bundle: $out/$name"
   log "SHA-256: $(awk '{ print $1 }' "$out/$name.sha256") (publish this where the operator can check it)"
+}
+
+# Runs a command from a harness tree being bundled, with no network when this is root, and a
+# HOME of its own, so a CLI's --version writes nothing of the builder's.
+harness_probe() {
+  local home="$OFFLINE_TMP/probe-home"
+  mkdir -p "$home"
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]] && command -v unshare >/dev/null 2>&1; then
+    unshare --net -- env HOME="$home" "$@"
+  else
+    env HOME="$home" "$@"
+  fi
+}
+
+# Node.js for ARCH at PINS, checked against its pinned SHA-256, with each npm harness PINS
+# names installed into it at its pinned version, as machines install them (ADR 0039): npm packs
+# the package, its tarball is checked against the pinned integrity, and npm installs that file
+# with the registry's hashes for its dependencies. npm's registry and login are the builder's
+# own npm settings; its cache is left out of the tree.
+harness_install_tree() {
+  local tree=$1 pins=$2 arch=$3 c node sha dist url bin version package integrity file got cache dl
+  for c in curl tar xz sha256sum openssl base64 jq; do command -v "$c" >/dev/null 2>&1 || die "harnesses needs $c"; done
+  read -r node sha < <(awk -v a="$arch" '$1 == "node" && $3 == a { print $2, $4 }' <<<"$pins")
+  [[ -n "$node" && -n "$sha" ]] || die "botd pins no Node.js for $arch"
+  case $arch in x86_64) dist=x64 ;; aarch64) dist=arm64 ;; esac
+  url="https://nodejs.org/dist/v$node/node-v$node-linux-$dist.tar.xz"
+  log "Downloading Node.js $node for $arch"
+  curl -fsSL --retry 3 "$url" -o "$OFFLINE_TMP/node.tar.xz" || die "Couldn't download $url"
+  printf '%s  %s\n' "$sha" "$OFFLINE_TMP/node.tar.xz" | sha256sum -c --quiet - || die "Node.js $node for $arch doesn't match the pinned SHA-256 ($sha)"
+  tar -xJf "$OFFLINE_TMP/node.tar.xz" -C "$tree" --strip-components=1 --no-same-owner || die "Couldn't unpack Node.js $node"
+  rm -f -- "$OFFLINE_TMP/node.tar.xz"
+  cache="$OFFLINE_TMP/npm-cache" dl="$OFFLINE_TMP/npm-packs"
+  mkdir -p "$cache" "$dl"
+  export npm_config_update_notifier=false
+  while read -r bin version package integrity; do
+    log "Installing $package@$version ($bin)"
+    file=$(cd "$dl" && PATH="$tree/bin:$PATH" npm pack "$package@$version" --json --cache "$cache" --loglevel=error | jq -r 'if length == 1 then .[0].filename else empty end') \
+      || die "npm pack failed for $package@$version"
+    file=$(basename "$file")
+    [[ -n "$file" && -f "$dl/$file" ]] || die "npm pack made no single tarball for $package@$version"
+    got="sha512-$(openssl dgst -sha512 -binary "$dl/$file" | base64 -w0)"
+    [[ "$got" == "$integrity" ]] || die "$package@$version from your npm registry is $got, but botd pins $integrity: not bundling it"
+    PATH="$tree/bin:$PATH" npm install -g --prefix "$tree" --omit=dev --no-fund --no-audit --cache "$cache" --loglevel=error "$dl/$file" >/dev/null \
+      || die "npm install failed for $package@$version"
+  done < <(awk '$1 == "npm" { print $2, $3, $4, $5 }' <<<"$pins")
+}
+
+# Whether TREE holds Node.js and each npm harness at PINS, and runs them: what is bundled is what
+# was asked for, whoever made the tree. Sets BUNDLE_TREE_PROBLEM when it doesn't.
+harness_tree_pinned() {
+  local tree=$1 pins=$2 arch=$3 node out bin version package
+  BUNDLE_TREE_PROBLEM=""
+  node=$(awk -v a="$arch" '$1 == "node" && $3 == a { print $2 }' <<<"$pins")
+  if [[ -e "$tree/etc/npmrc" ]]; then
+    BUNDLE_TREE_PROBLEM="it has npm's global settings, etc/npmrc, which may hold a registry login"
+    return 1
+  fi
+  [[ -x "$tree/bin/node" ]] || { BUNDLE_TREE_PROBLEM="it has no bin/node"; return 1; }
+  out=$(harness_probe "$tree/bin/node" --version 2>&1) || true
+  [[ "$out" == "v$node" ]] || { BUNDLE_TREE_PROBLEM="its Node.js is \"$out\", not v$node"; return 1; }
+  while read -r bin version package; do
+    out=$(jq -r .version "$tree/lib/node_modules/$package/package.json" 2>/dev/null) || true
+    [[ "$out" == "$version" ]] || { BUNDLE_TREE_PROBLEM="its $package is \"$out\", not $version"; return 1; }
+    [[ -x "$tree/bin/$bin" ]] || { BUNDLE_TREE_PROBLEM="it has no bin/$bin"; return 1; }
+    out=$(harness_probe env PATH="$tree/bin:$PATH" "$tree/bin/$bin" --version 2>&1) || true
+    [[ "$out" == *"$version"* ]] || { BUNDLE_TREE_PROBLEM="$bin --version says \"$(head -c 300 <<<"$out")\", not $version"; return 1; }
+  done < <(awk '$1 == "npm" { print $2, $3, $4 }' <<<"$pins")
+}
+
+# A harness bundle: Node.js with Claude Code, Codex and Pi installed into it at the pins of the
+# release's botd, for install.sh --offline --harness-bundle. The tree is relocatable (npm's and
+# Node.js's links are relative), so it is built anywhere, as any user; it runs from
+# $HARNESSES_DIR once installed, through the wrappers the installer writes.
+cmd_harnesses() {
+  local out="" version="" root bin_dir tree="" arch pins botd name parent top stage f
+  root=$(repo_root)
+  bin_dir="$root/target/release"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --out) out=$2; shift 2 ;;
+      --version) version=$2; shift 2 ;;
+      --bin-dir) bin_dir=$2; shift 2 ;;
+      --tree) tree=$2; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$out" ]] || die "harnesses needs --out DIR"
+  version=${version:-$(cargo_version "$root")}
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]] || die "--version \"$version\" isn't a version"
+  arch=$(uname -m)
+  [[ "$arch" =~ ^(x86_64|aarch64)$ ]] || die "Harness bundles are for x86_64 or aarch64, not $arch"
+  botd="$bin_dir/botd"
+  [[ -f "$botd" && -x "$botd" ]] || die "No $botd: run cargo build --release --bin botd first (or give --bin-dir); its pins are what is bundled"
+  pins=$(harness_pins "$botd") || die "$botd doesn't say which harness CLIs it pins (botd harness pins): build botd from this checkout"
+  command -v jq >/dev/null 2>&1 || die "harnesses needs jq"
+  OFFLINE_TMP=$(mktemp -d)
+  trap cleanup_offline EXIT
+  chmod 0755 "$OFFLINE_TMP"
+  name=$(basename "$HARNESSES_DIR")
+  if [[ -z "$tree" ]]; then
+    parent="$OFFLINE_TMP/root"
+    mkdir -p "$parent/$name"
+    harness_install_tree "$parent/$name" "$pins" "$arch"
+  else
+    [[ "$(basename "$tree")" == "$name" && -d "$tree" ]] || die "--tree must be a folder named $name, as $HARNESSES_DIR is"
+    parent=$(cd "$(dirname "$tree")" && pwd)
+  fi
+  harness_tree_pinned "$parent/$name" "$pins" "$arch" || die "Not bundling $parent/$name: $BUNDLE_TREE_PROBLEM"
+  bundle_tree_ok "$parent/$name" "$HARNESSES_DIR" || die "Not bundling $parent/$name: $BUNDLE_TREE_PROBLEM"
+
+  top="superbot-harnesses-$version-$arch"
+  stage="$OFFLINE_TMP/$top"
+  mkdir -p "$stage"
+  log "Packing $(harness_names "$pins")"
+  tar -C "$parent" --owner=0 --group=0 --numeric-owner --sort=name -cf "$stage/harnesses.tar" "$name" || die "Couldn't pack $parent/$name"
+  if [[ -z "$tree" ]]; then rm -rf -- "$parent"; fi
+  bundle_tar_ok "$stage/harnesses.tar" "$name" || die "Not bundling $parent/$name: $BUNDLE_TREE_PROBLEM"
+  {
+    echo format=1
+    echo kind=harnesses
+    echo "version=$version"
+    echo "prefix=$HARNESSES_DIR"
+    echo "arch=$arch"
+    harness_manifest_lines "$pins" "$arch"
+    echo "commit=$(git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } >"$stage/MANIFEST"
+  (cd "$stage" && sha256sum harnesses.tar MANIFEST) >"$OFFLINE_TMP/SHA256SUMS"
+  mv "$OFFLINE_TMP/SHA256SUMS" "$stage/SHA256SUMS"
+  mkdir -p "$out"
+  f="$top.tar.gz"
+  tar -C "$OFFLINE_TMP" --owner=0 --group=0 --numeric-owner --sort=name -czf "$out/$f" "$top"
+  (cd "$out" && sha256sum "$f" >"$f.sha256")
+  log "Harness bundle: $out/$f"
+  log "SHA-256: $(awk '{ print $1 }' "$out/$f.sha256") (publish this where the operator can check it)"
 }
 
 cmd_load() {
@@ -629,9 +775,10 @@ cmd_push() {
 case "${1:-}" in
   build) shift; cmd_build "$@" ;;
   hermes) shift; cmd_hermes "$@" ;;
+  harnesses) shift; cmd_harnesses "$@" ;;
   verify) shift; cmd_verify "$@" ;;
   load) shift; cmd_load "$@" ;;
   push) shift; cmd_push "$@" ;;
   -h|--help|"") usage ;;
-  *) die "Unknown command: $1 (build, hermes, verify, load or push)" ;;
+  *) die "Unknown command: $1 (build, hermes, harnesses, verify, load or push)" ;;
 esac

@@ -28,6 +28,19 @@ for b in "${OFFLINE_BINARIES[@]}"; do
   printf '#!/bin/sh\necho %s\n' "$b" >"$T/bin/$b"
   chmod 0755 "$T/bin/$b"
 done
+# The stand-in botd pins harness CLIs as the real one does (botd harness pins, ADR 0232).
+NODE_PIN=22.0.1
+pins_botd() {
+  {
+    printf '#!/bin/sh\n[ "$*" = "harness pins" ] || { echo botd; exit 0; }\ncat <<EOF\n'
+    printf 'node %s x86_64 %s\nnode %s aarch64 %s\n' "$NODE_PIN" "$(printf 'a%.0s' {1..64})" "$NODE_PIN" "$(printf 'b%.0s' {1..64})"
+    printf 'npm claude %s @anthropic-ai/claude-code sha512-Y2xhdWRl\n' "${2:-2.1.0}"
+    printf 'npm codex 0.1.0 @openai/codex sha512-Y29kZXg=\nnpm pi 1.0.0 @earendil-works/pi-coding-agent sha512-cGk=\n'
+    printf 'hermes hermes %s v0.0.1 %s\nEOF\n' "$(printf 'e%.0s' {1..40})" "$(printf 'f%.0s' {1..64})"
+  } >"$1"
+  chmod 0755 "$1"
+}
+pins_botd "$T/bin/botd"
 echo '<!doctype html><script src="/app/_expo/static/js/web/entry-abc.js"></script>' >"$T/client/index.html"
 echo 'console.log(1)' >"$T/client/_expo/static/js/web/entry-abc.js"
 echo font >"$T/client/assets/node_modules/@expo/icons.ttf"
@@ -235,28 +248,28 @@ ok "changed trees, setuid files, special files, paths outside hermes/, '..', har
 
 # The tree as files, once unpacked: links must stay inside, followed through other links.
 rm -rf "$T/hv" && mkdir -p "$T/hv" && tar -xOf "$HB" "$HTOP/hermes.tar" | tar -x -C "$T/hv"
-hermes_tree_ok "$T/hv/hermes" /opt/hermes || fail "a good Hermes tree was refused: $HERMES_TREE_PROBLEM"
+bundle_tree_ok "$T/hv/hermes" /opt/hermes || fail "a good Hermes tree was refused: $BUNDLE_TREE_PROBLEM"
 for bad in /etc ../../.. ../.hermes/../../x /opt/hermes-other/x /opt/hermes/../etc; do
   ln -sfn "$bad" "$T/hv/hermes/.hermes/bad"
-  if hermes_tree_ok "$T/hv/hermes" /opt/hermes; then fail "a link to $bad was taken"; fi
-  [[ "$HERMES_TREE_PROBLEM" == *"points outside /opt/hermes"* ]] || fail "a link to $bad was refused for another reason: $HERMES_TREE_PROBLEM"
+  if bundle_tree_ok "$T/hv/hermes" /opt/hermes; then fail "a link to $bad was taken"; fi
+  [[ "$BUNDLE_TREE_PROBLEM" == *"points outside /opt/hermes"* ]] || fail "a link to $bad was refused for another reason: $BUNDLE_TREE_PROBLEM"
 done
 ln -sfn ../hermes-agent "$T/hv/hermes/.hermes/bad"
-hermes_tree_ok "$T/hv/hermes" /opt/hermes || fail "a relative link inside was refused: $HERMES_TREE_PROBLEM"
+bundle_tree_ok "$T/hv/hermes" /opt/hermes || fail "a relative link inside was refused: $BUNDLE_TREE_PROBLEM"
 ln -sfn . "$T/hv/hermes/.hermes/dot"
 ln -sfn dot/../hermes-agent "$T/hv/hermes/.hermes/bad"
-hermes_tree_ok "$T/hv/hermes" /opt/hermes || fail "a link through a link inside was refused: $HERMES_TREE_PROBLEM"
+bundle_tree_ok "$T/hv/hermes" /opt/hermes || fail "a link through a link inside was refused: $BUNDLE_TREE_PROBLEM"
 for chain in "dot/../../.. dot" "dot/../../x dot" "up/../x /opt/hermes" "up/../../x .." "loop loop2"; do
   read -r bad via <<<"$chain"
   rm -f "$T/hv/hermes/.hermes/bad" "$T/hv/hermes/.hermes/up" "$T/hv/hermes/.hermes/loop" "$T/hv/hermes/.hermes/loop2"
   [[ $via == dot ]] || ln -sfn "$via" "$T/hv/hermes/.hermes/${bad%%/*}"
   [[ $bad != loop ]] || ln -sfn loop "$T/hv/hermes/.hermes/loop2"
   ln -sfn "$bad" "$T/hv/hermes/.hermes/bad"
-  if hermes_tree_ok "$T/hv/hermes" /opt/hermes; then fail "a link out through another link was taken: bad -> $bad, via $via"; fi
+  if bundle_tree_ok "$T/hv/hermes" /opt/hermes; then fail "a link out through another link was taken: bad -> $bad, via $via"; fi
 done
 rm -f "$T/hv/hermes/.hermes/bad" "$T/hv/hermes/.hermes/up" "$T/hv/hermes/.hermes/loop" "$T/hv/hermes/.hermes/loop2" "$T/hv/hermes/.hermes/dot"
 mkfifo "$T/hv/hermes/pipe"
-if hermes_tree_ok "$T/hv/hermes" /opt/hermes; then fail "a pipe in the tree was taken"; fi
+if bundle_tree_ok "$T/hv/hermes" /opt/hermes; then fail "a pipe in the tree was taken"; fi
 ok "an unpacked Hermes tree's links stay inside it, absolute ones inside /opt/hermes, even followed through other links"
 
 wrong=$(HMANIFEST=1 hremake harch sed -i "s/^arch=.*/arch=$other/" MANIFEST)
@@ -284,7 +297,7 @@ swap() {
   echo new >"$T/hswap/opt/hermes/marker"
 }
 swap
-out=$( (HERMES_SHARED_DIR=$T/hswap/opt/hermes HERMES_STAGE=$T/hswap/stage HERMES_PREVIOUS=$T/hswap/stage/previous HERMES_STOPPED=true OFFLINE_TMP=""
+out=$( (HERMES_SHARED_DIR=$T/hswap/opt/hermes HERMES_STAGE=$T/hswap/stage HERMES_PREVIOUS=$T/hswap/stage/previous BOTD_STOPPED=true OFFLINE_TMP=""
   systemctl() { echo "systemctl $*"; }
   cleanup_offline) 2>&1)
 grep -q "systemctl start superbot.service" <<<"$out" || fail "botd wasn't started again after the old Hermes Agent was put back"
@@ -292,7 +305,7 @@ grep -q "systemctl start superbot.service" <<<"$out" || fail "botd wasn't starte
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   swap
   chmod 0555 "$T/hswap/opt"
-  out=$( (HERMES_SHARED_DIR=$T/hswap/opt/hermes HERMES_STAGE=$T/hswap/stage HERMES_PREVIOUS=$T/hswap/stage/previous HERMES_STOPPED=true OFFLINE_TMP=""
+  out=$( (HERMES_SHARED_DIR=$T/hswap/opt/hermes HERMES_STAGE=$T/hswap/stage HERMES_PREVIOUS=$T/hswap/stage/previous BOTD_STOPPED=true OFFLINE_TMP=""
     systemctl() { echo "systemctl $*"; }
     cleanup_offline) 2>&1)
   chmod 0755 "$T/hswap/opt"
@@ -309,6 +322,182 @@ grep -Fq "Hermes Agent dddddddddddd is installed in $T/hpinned/hermes, but this 
   || { printf '%s\n' "$note" >&2; fail "no notice for an installed Hermes Agent that isn't pinned"; }
 [[ -z "$( (HERMES_SHARED_DIR=$T/htree/hermes SUPERBOT_USER=nobody-here DRY_RUN=true; hermes_pin_notice) 2>&1)" ]] || fail "a notice for the pinned Hermes Agent"
 ok "an upgrade that keeps another Hermes Agent than the one pinned says how to replace it"
+
+# Harness bundles (docs/adr/0232-harness-cli-bundle-for-air-gapped-servers.md), from a tree laid
+# out as Node.js's tarball and npm install -g --prefix leave one: bin/node, each CLI linked from
+# bin/ into lib/node_modules, and its package.json. The real one, built with the network and
+# installed as root with none, is in offline.yml.
+fake_harnesses() {
+  local h=$1/superbot-harnesses b v p
+  mkdir -p "$h/bin" "$h/include/node"
+  printf '#!/bin/sh\necho v%s\n' "${2:-$NODE_PIN}" >"$h/bin/node"
+  chmod 0755 "$h/bin/node"
+  echo header >"$h/include/node/node.h"
+  ln "$h/bin/node" "$h/include/node/node.copy"
+  for b in "claude ${3:-2.1.0} @anthropic-ai/claude-code" "codex 0.1.0 @openai/codex" "pi 1.0.0 @earendil-works/pi-coding-agent"; do
+    read -r b v p <<<"$b"
+    mkdir -p "$h/lib/node_modules/$p/node_modules/dep"
+    printf '{"name": "%s", "version": "%s"}\n' "$p" "$v" >"$h/lib/node_modules/$p/package.json"
+    printf '#!/usr/bin/env node\n' >"$h/lib/node_modules/$p/node_modules/dep/index.js"
+    # A CLI that runs only with the tree's Node.js first on PATH, as its wrapper puts it.
+    # shellcheck disable=SC2016 # expanded by the CLI
+    printf '#!/bin/sh\n[ "$(command -v node)" = "%s" ] || { echo "no node"; exit 1; }\necho "%s (%s)"\n' "${4:-/opt/superbot-harnesses}/bin/node" "$v" "$b" \
+      >"$h/lib/node_modules/$p/cli.js"
+    chmod 0755 "$h/lib/node_modules/$p/cli.js"
+    ln -s "../lib/node_modules/$p/cli.js" "$h/bin/$b"
+  done
+}
+# The builder runs the tree's CLIs from where it is, so these check for their own node.
+fake_harnesses "$T/ntree" "$NODE_PIN" 2.1.0 "$T/ntree/superbot-harnesses"
+"$DIR/offline-bundle.sh" harnesses --out "$T/nout" --version "$VERSION" --bin-dir "$T/bin" --tree "$T/ntree/superbot-harnesses" >"$T/nbuild.log" 2>&1 \
+  || { cat "$T/nbuild.log" >&2; fail "a harness bundle didn't build from a tree"; }
+NTOP="superbot-harnesses-$VERSION-$ARCH"
+NB="$T/nout/$NTOP.tar.gz"
+[[ -f "$NB" && -f "$NB.sha256" ]] || fail "no harness bundle and .sha256 in $T/nout"
+[[ "$(tar -tf "$NB" | LC_ALL=C sort | tr '\n' ' ')" == "$NTOP/ $NTOP/MANIFEST $NTOP/SHA256SUMS $NTOP/harnesses.tar " ]] || fail "the harness bundle holds more than MANIFEST, SHA256SUMS and harnesses.tar"
+nm=$(tar -xOf "$NB" "$NTOP/MANIFEST")
+nsha=$(printf 'a%.0s' {1..64})
+[[ "$ARCH" == x86_64 ]] || nsha=$(printf 'b%.0s' {1..64})
+for want in format=1 kind=harnesses "version=$VERSION" prefix=/opt/superbot-harnesses "arch=$ARCH" "harnesses=claude codex pi" "node=$NODE_PIN $nsha" \
+  "harness_claude=2.1.0 @anthropic-ai/claude-code sha512-Y2xhdWRl" "harness_codex=0.1.0 @openai/codex sha512-Y29kZXg=" "harness_pi=1.0.0 @earendil-works/pi-coding-agent sha512-cGk="; do
+  grep -qxF -- "$want" <<<"$nm" || fail "the harness bundle's MANIFEST has no $want"
+done
+! grep -q hermes <<<"$nm" || fail "the harness bundle's MANIFEST names Hermes, which has its own bundle"
+inner=$(tar -xOf "$NB" "$NTOP/harnesses.tar" | tar -tv)
+grep -q ' superbot-harnesses/bin/codex -> ../lib/node_modules/@openai/codex/cli.js$' <<<"$inner" || fail "the harness bundle lost a CLI's link"
+grep -q ' superbot-harnesses/include/node/node.copy link to superbot-harnesses/bin/node$' <<<"$inner" || fail "the harness bundle lost a hard link"
+[[ "$(awk '{ print $2 }' <<<"$inner" | sort -u)" == 0/0 ]] || fail "the harness tree's entries aren't owned by 0/0"
+"$DIR/offline-bundle.sh" verify "$NB" >"$T/nverify.log" 2>&1 || { cat "$T/nverify.log" >&2; fail "a good harness bundle didn't verify"; }
+grep -q "good harness bundle" "$T/nverify.log" || fail "verify didn't say it is a harness bundle"
+grep -q "Harness bundle: claude codex pi on Node.js $NODE_PIN ($ARCH, SuperBot $VERSION) checked" "$T/nverify.log" || fail "verify didn't say what the harness bundle holds"
+ok "a harness bundle builds from a tree at botd's pins, for /opt/superbot-harnesses, with its links, and verifies"
+
+nbrefused() {
+  local why=$1 want=$2 out
+  shift 2
+  rm -rf "$T/nnope"
+  if out=$("$DIR/offline-bundle.sh" harnesses --out "$T/nnope" --version "$VERSION" "$@" 2>&1); then fail "$why: bundled"; fi
+  grep -Fq -- "$want" <<<"$out" || { printf '%s\n' "$out" >&2; fail "$why: refused for another reason"; }
+}
+ntree() { rm -rf "${T:?}/${1:?}" && fake_harnesses "$T/$1" "${2:-$NODE_PIN}" "${3:-2.1.0}" "$T/$1/superbot-harnesses"; }
+ntree nnode 20.0.0
+nbrefused "another Node.js" "its Node.js is \"v20.0.0\", not v$NODE_PIN" --bin-dir "$T/bin" --tree "$T/nnode/superbot-harnesses"
+ntree nclaude "$NODE_PIN" 2.0.9
+nbrefused "another Claude Code" "its @anthropic-ai/claude-code is \"2.0.9\", not 2.1.0" --bin-dir "$T/bin" --tree "$T/nclaude/superbot-harnesses"
+ntree nrun && sed -i 's/^echo "0.1.0 (codex)"$/echo 0.0.9/' "$T/nrun/superbot-harnesses/lib/node_modules/@openai/codex/cli.js"
+nbrefused "a CLI that says another version" "codex --version says \"0.0.9\", not 0.1.0" --bin-dir "$T/bin" --tree "$T/nrun/superbot-harnesses"
+ntree nnpmrc && mkdir -p "$T/nnpmrc/superbot-harnesses/etc" && echo "//registry.example/:_authToken=secret" >"$T/nnpmrc/superbot-harnesses/etc/npmrc"
+nbrefused "a tree with npm's global settings" "etc/npmrc, which may hold a registry login" --bin-dir "$T/bin" --tree "$T/nnpmrc/superbot-harnesses"
+ntree nleak && ln -s /etc/shadow "$T/nleak/superbot-harnesses/lib/leak"
+nbrefused "a tree with a link out of it" "points outside /opt/superbot-harnesses, to /etc/shadow" --bin-dir "$T/bin" --tree "$T/nleak/superbot-harnesses"
+mkdir -p "$T/nname" && cp -a "$T/ntree/superbot-harnesses" "$T/nname/elsewhere"
+nbrefused "a folder not named superbot-harnesses" "a folder named superbot-harnesses" --bin-dir "$T/bin" --tree "$T/nname/elsewhere"
+mkdir -p "$T/nopins" && cp "$T/bin"/* "$T/nopins/" && printf '#!/bin/sh\necho botd\n' >"$T/nopins/botd"
+nbrefused "a botd that pins nothing" "doesn't say which harness CLIs it pins" --bin-dir "$T/nopins" --tree "$T/ntree/superbot-harnesses"
+nbrefused "no botd" "No $T/nnope-bin/botd" --bin-dir "$T/nnope-bin" --tree "$T/ntree/superbot-harnesses"
+ok "a harness bundle is only made of a tree at botd's pins that runs them, with no npm login and no link out of it"
+
+# Repacks the harness bundle as hremake does the Hermes one.
+nremake() {
+  local name=$1
+  shift
+  rm -rf "$T/nx" "$T/ny" && mkdir -p "$T/nx" "$T/ny"
+  tar -xf "$NB" -C "$T/ny"
+  tar -xf "$T/ny/$NTOP/harnesses.tar" -C "$T/nx"
+  if [[ "${HTAR:-}" == 1 ]]; then
+    (cd "$T/nx" && "$@" >"$T/ny/$NTOP/harnesses.tar")
+  elif [[ "${HMANIFEST:-}" == 1 ]]; then
+    (cd "$T/ny/$NTOP" && "$@")
+  else
+    (cd "$T/nx" && "$@")
+    tar -C "$T/nx" --sort=name -cf "$T/ny/$NTOP/harnesses.tar" superbot-harnesses
+  fi
+  if [[ "${KEEP_SUMS:-}" != 1 ]]; then
+    (cd "$T/ny/$NTOP" && find . -type f ! -path ./SHA256SUMS -printf '%P\n' | LC_ALL=C sort | xargs -d '\n' sha256sum >SHA256SUMS)
+  fi
+  tar -C "$T/ny" -czf "$T/$name.tar.gz" "$NTOP"
+  (cd "$T" && sha256sum "$name.tar.gz" >"$name.tar.gz.sha256")
+  printf '%s\n' "$T/$name.tar.gz"
+}
+refused "$(KEEP_SUMS=1 nremake nchanged sh -c 'echo evil >>superbot-harnesses/bin/node')" "files don't match SHA256SUMS" "a changed harnesses.tar"
+refused "$(nremake nsuid chmod u+s superbot-harnesses/bin/node)" "setuid or setgid" "a setuid file in harnesses.tar"
+refused "$(nremake nfifo mkfifo superbot-harnesses/pipe)" "special files" "a pipe in harnesses.tar"
+refused "$(HTAR=1 nremake noutside sh -c 'echo x >other && tar --sort=name -cf - superbot-harnesses other')" "outside one superbot-harnesses/ folder" "a file outside superbot-harnesses/ in harnesses.tar"
+refused "$(HTAR=1 nremake nhard tar --sort=name --transform 's,^superbot-harnesses/bin/node$,elsewhere/node,RSh' -cf - superbot-harnesses)" "hard link to a file outside" "a hard link out of harnesses.tar"
+refused "$(HMANIFEST=1 nremake nkind sed -i 's/^kind=.*/kind=hermes/' MANIFEST)" "isn't a harness bundle's" "a harness bundle of another kind"
+refused "$(HMANIFEST=1 nremake nprefix sed -i 's,^prefix=.*,prefix=/usr/local,' MANIFEST)" "installed for /usr/local, not /opt/superbot-harnesses" "a harness bundle for another place"
+refused "$(HMANIFEST=1 nremake nnotar rm harnesses.tar)" "no harnesses.tar" "a harness bundle without harnesses.tar"
+cp "$NB" "$T/nanchor.tar.gz"
+refused "$T/nanchor.tar.gz" "Nothing to check" "a harness bundle with no SHA-256 or signature beside it"
+nwrong=$(HMANIFEST=1 nremake narch sed -i "s/^arch=.*/arch=$other/" MANIFEST)
+"$DIR/offline-bundle.sh" verify "$nwrong" >/dev/null || fail "verify (on any machine) refused another arch's harness bundle"
+rm -rf "$T/nu" && mkdir "$T/nu"
+if (harness_unpack_bundle "$nwrong" "$T/nu" "") 2>"$T/narch.err"; then fail "the installer accepted a harness bundle for $other"; fi
+grep -q "This harness bundle is for $other" "$T/narch.err" || fail "the harness arch refusal didn't say why"
+ok "changed trees, setuid files, special files, paths outside superbot-harnesses/, hard links out, other kinds, places and arches are refused"
+
+# The installer checks the harness bundle against the pins of the main bundle's own botd.
+mkdir -p "$T/noff/bin"
+nprep() { (DRY_RUN=true OFFLINE_DIR=$T/noff HARNESS_BUNDLE=$1 HARNESS_BUNDLE_SHA256=${2:-}; prepare_harness_bundle; echo "wanted: $HARNESS_WANTED") 2>&1; }
+pins_botd "$T/noff/bin/botd"
+out=$(nprep "$NB") || { printf '%s\n' "$out" >&2; fail "a harness bundle at the release's pins was refused"; }
+grep -qxF "wanted: harnesses=claude codex pi" <<<"$out" || fail "the installer didn't take the release's pins"
+pins_botd "$T/noff/bin/botd" 2.1.1
+out=$(nprep "$NB") && fail "a harness bundle of another Claude Code than the release pins was taken"
+grep -Fq "doesn't hold what this release pins (claude is 2.1.0 @anthropic-ai/claude-code sha512-Y2xhdWRl, not 2.1.1 @anthropic-ai/claude-code sha512-Y2xhdWRl)" <<<"$out" \
+  || { printf '%s\n' "$out" >&2; fail "the pin refusal didn't say why"; }
+printf '#!/bin/sh\necho botd\n' >"$T/noff/bin/botd"
+out=$(nprep "$NB") && fail "a harness bundle was taken with a botd that pins nothing"
+grep -Fq "doesn't say which harness CLIs it pins" <<<"$out" || { printf '%s\n' "$out" >&2; fail "the no-pins refusal didn't say why"; }
+pins_botd "$T/noff/bin/botd"
+out=$(nprep "$(HMANIFEST=1 nremake nless sed -i '/^harness_pi=/d' MANIFEST)") && fail "a harness bundle without Pi was taken"
+grep -Fq "(pi is missing, not 1.0.0" <<<"$out" || { printf '%s\n' "$out" >&2; fail "the missing-harness refusal didn't say why"; }
+nprep "$NB" "$(cut -c1-64 "$B.sha256")" >/dev/null && fail "a harness bundle was checked against another bundle's SHA-256"
+nprep "$NB" "$(cut -c1-64 "$NB.sha256")" >/dev/null || fail "a harness bundle wasn't checked against its own --harness-bundle-sha256"
+for bad in "node 22.0 x86_64 $nsha" "npm Claude 2.1.0 @a/b sha512-x" "npm claude latest @a/b sha512-x" "npm claude 2.1.0 @a/b md5-x" "npm claude 2.1.0 '@a/b;id' sha512-x" "npm claude 2.1.0 @a/b"; do
+  printf '#!/bin/sh\nprintf "%%s\\n" "node 22.0.1 x86_64 %s" "npm codex 0.1.0 @openai/codex sha512-Y29kZXg=" "%s"\n' "$nsha" "$bad" >"$T/noff/bin/botd"
+  if harness_pins "$T/noff/bin/botd" >/dev/null; then fail "harness pins with \"$bad\" were taken"; fi
+done
+pins_botd "$T/noff/bin/botd"
+ok "the installer takes a harness bundle only at the pins of the release's botd, checked against its own SHA-256"
+
+# The wrapper puts the tree's Node.js first, and runs the CLI from the tree.
+w=$(HARNESSES_DIR=/opt/superbot-harnesses; harness_wrapper codex)
+# shellcheck disable=SC2016 # the wrapper's own text
+for want in 'PATH=/opt/superbot-harnesses/bin:$PATH' 'exec /opt/superbot-harnesses/bin/codex "$@"' 'DISABLE_AUTOUPDATER=1'; do
+  grep -qxF -- "$want" <<<"$w" || { printf '%s\n' "$w" >&2; fail "the harness wrapper doesn't say: $want"; }
+done
+sh -n <<<"$w" || fail "the harness wrapper isn't sh"
+ok "each harness CLI runs through the installer's wrapper, on the tree's Node.js, with its updater off"
+
+# An exit mid-swap puts the old harness tree back, removes the new links, puts back what they
+# replaced, and starts botd again.
+rm -rf "$T/nswap" && mkdir -p "$T/nswap/stage/previous" "$T/nswap/stage/replaced" "$T/nswap/stage/bundle" "$T/nswap/opt/superbot-harnesses" "$T/nswap/bin"
+echo old >"$T/nswap/stage/previous/marker"
+echo new >"$T/nswap/opt/superbot-harnesses/marker"
+echo "operator's own claude" >"$T/nswap/stage/replaced/claude"
+ln -s "$T/nswap/opt/superbot-harnesses/superbot/claude" "$T/nswap/bin/claude"
+ln -s "$T/nswap/opt/superbot-harnesses/superbot/codex" "$T/nswap/bin/codex"
+out=$( (HARNESSES_DIR=$T/nswap/opt/superbot-harnesses BIN_DIR=$T/nswap/bin HARNESS_STAGE=$T/nswap/stage HARNESS_PREVIOUS=$T/nswap/stage/previous
+  HARNESS_MOVED_IN=true HARNESS_LINKED=("$T/nswap/bin/claude" "$T/nswap/bin/codex") BOTD_STOPPED=true OFFLINE_TMP=""
+  systemctl() { echo "systemctl $*"; }
+  cleanup_offline) 2>&1)
+grep -q "systemctl start superbot.service" <<<"$out" || fail "botd wasn't started again after the old harness CLIs were put back"
+[[ "$(cat "$T/nswap/opt/superbot-harnesses/marker")" == old && ! -e "$T/nswap/stage" ]] || fail "the old harness CLIs weren't put back, or the staging was left"
+[[ "$(cat "$T/nswap/bin/claude")" == "operator's own claude" && ! -L "$T/nswap/bin/claude" && ! -e "$T/nswap/bin/codex" ]] || fail "the new links weren't undone, or what they replaced wasn't put back"
+ok "an exit mid-swap puts the old harness CLIs and the operator's own links back, and starts botd again"
+
+# An offline upgrade without --harness-bundle keeps the harness CLIs it has, and says when
+# they aren't the release's.
+mkdir -p "$T/nkept/superbot"
+(cd "$T/noff" && harness_manifest_lines "$(harness_pins bin/botd)" "$ARCH" | sed 's/^harness_codex=0.1.0/harness_codex=0.0.5/') >"$T/nkept/superbot/MANIFEST"
+note=$( (HARNESSES_DIR=$T/nkept OFFLINE_DIR=$T/noff; harness_pin_notice) 2>&1)
+grep -Fq "The harness CLIs in $T/nkept aren't the ones this release pins (codex is 0.0.5 @openai/codex sha512-Y29kZXg=, not 0.1.0 @openai/codex sha512-Y29kZXg=): re-run with --harness-bundle" <<<"$note" \
+  || { printf '%s\n' "$note" >&2; fail "no notice for kept harness CLIs that aren't pinned"; }
+(cd "$T/noff" && harness_manifest_lines "$(harness_pins bin/botd)" "$ARCH") >"$T/nkept/superbot/MANIFEST"
+[[ -z "$( (HARNESSES_DIR=$T/nkept OFFLINE_DIR=$T/noff; harness_pin_notice) 2>&1)" ]] || fail "a notice for the pinned harness CLIs"
+[[ -z "$( (HARNESSES_DIR=$T/nothing-here OFFLINE_DIR=$T/noff; harness_pin_notice) 2>&1)" ]] || fail "a notice on a server without harness CLIs from a bundle"
+ok "an upgrade that keeps other harness CLIs than the ones pinned says how to replace them"
 
 # Images, with stand-ins for skopeo, docker, cosign and superbot-oci over a registry in $REG: an
 # index with this arch's image, another arch's and an attestation; a local image; a mirror to
@@ -669,7 +858,8 @@ ok "versions order as SemVer: a release candidate upgrades to its release, never
 flags() {
   (
     # shellcheck disable=SC2034
-    OFFLINE_BUNDLE=$B INSTALL_DIR="" WITH_HERMES=false DOMAIN="" TLS_CERT="" OFFLINE_BUNDLE_SHA256="" HERMES_BUNDLE="" HERMES_BUNDLE_SHA256=""
+    OFFLINE_BUNDLE=$B INSTALL_DIR="" WITH_HERMES=false DOMAIN="" TLS_CERT="" OFFLINE_BUNDLE_SHA256="" HERMES_BUNDLE="" HERMES_BUNDLE_SHA256="" \
+      HARNESS_BUNDLE="" HARNESS_BUNDLE_SHA256=""
     for a in "$@"; do declare "$a"; done
     check_offline_flags
   ) 2>&1
@@ -687,6 +877,15 @@ grep -q "not --source-dir" <<<"$(flags INSTALL_DIR=/srv/src || true)" || fail "-
 # shellcheck disable=SC2034
 grep -q "needs --offline" <<<"$( (OFFLINE_BUNDLE="" OFFLINE_BUNDLE_SHA256=abc; check_offline_flags) 2>&1 || true)" || fail "--bundle-sha256 without --offline was allowed"
 ok "--offline refuses --with-hermes without a Hermes bundle, --source-dir, and --domain without a certificate; --hermes-bundle needs --offline and --with-hermes"
+flags HARNESS_BUNDLE="$NB" >/dev/null || fail "--offline --harness-bundle was refused"
+flags HARNESS_BUNDLE="$NB" HARNESS_BUNDLE_SHA256="$(cut -c1-64 "$NB.sha256")" >/dev/null || fail "--harness-bundle with its SHA-256 was refused"
+grep -q "can't read" <<<"$(flags HARNESS_BUNDLE="$T/nope.tar.gz" || true)" || fail "a harness bundle that isn't there was taken"
+grep -q "64 lowercase hex" <<<"$(flags HARNESS_BUNDLE="$NB" HARNESS_BUNDLE_SHA256=ABC || true)" || fail "a bad --harness-bundle-sha256 was taken"
+grep -q "needs --harness-bundle" <<<"$(flags HARNESS_BUNDLE_SHA256="$(printf '0%.0s' {1..64})" || true)" || fail "--harness-bundle-sha256 was taken without a harness bundle"
+# shellcheck disable=SC2034
+grep -q "for --offline installs" <<<"$( (OFFLINE_BUNDLE="" OFFLINE_BUNDLE_SHA256="" HERMES_BUNDLE="" HARNESS_BUNDLE=$NB; check_offline_flags) 2>&1 || true)" \
+  || fail "--harness-bundle was taken without --offline"
+ok "--harness-bundle needs --offline and a readable bundle, and --harness-bundle-sha256 needs it and 64 hex digits"
 
 # Operator certificates.
 cert() {
@@ -780,3 +979,16 @@ if grep -Ei 'apt-get|raw\.githubusercontent|would fetch|git clone' "$T/hdry.log"
   fail "the offline dry run with Hermes Agent reached for the network"
 fi
 ok "a dry run of the offline install with Hermes Agent installs it from the Hermes bundle${net:+ (with no network)}"
+
+"${net[@]}" bash "$T/run.sh" "$DIR/install.sh" --dry-run --non-interactive --offline "$B" --harness-bundle "$NB" \
+  --tz UTC >"$T/ndry.log" 2>&1 || { cat "$T/ndry.log" >&2; fail "the offline dry run with the harness bundle failed"; }
+for want in "Harness bundle: claude codex pi on Node.js $NODE_PIN ($ARCH, SuperBot $VERSION) checked" \
+  "would install claude codex pi system-wide in /opt/superbot-harnesses from the harness bundle $NB, linked from /usr/local/bin" \
+  "Claude Code, Codex and Pi are in /opt/superbot-harnesses, from the harness bundle" "SuperBot is installed."; do
+  grep -Fq -- "$want" "$T/ndry.log" || { cat "$T/ndry.log" >&2; fail "the offline dry run with the harness bundle didn't say: $want"; }
+done
+if grep -Ei 'apt-get|registry\.npmjs|npm install|nodejs\.org|would fetch|git clone' "$T/ndry.log"; then
+  fail "the offline dry run with the harness bundle reached for the network"
+fi
+grep -Fq "re-run with --harness-bundle" "$T/dry.log" || fail "an offline install without the harness bundle didn't say how to add the harness CLIs"
+ok "a dry run of the offline install with the harness bundle installs the harness CLIs from it${net:+ (with no network)}"

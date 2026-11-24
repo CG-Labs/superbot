@@ -104,6 +104,34 @@ pub fn server_hint(bin: &str) -> String {
     }
 }
 
+/// This build's pins, one per line, for `botd harness pins`: what `deploy/offline-bundle.sh
+/// harnesses` bundles and `deploy/install.sh --harness-bundle` checks a harness bundle against
+/// (ADR 0232). Words are single-space separated and never empty:
+/// `node <version> <arch> <sha256>`, `npm <bin> <version> <package> <integrity>` and
+/// `hermes <bin> <commit> <tag> <sha256>`.
+pub fn pins_text() -> String {
+    let node = NODE_SHA256.iter().map(|(arch, _, sha256)| format!("node {NODE} {arch} {sha256}\n"));
+    let harnesses = PINS.iter().map(|p| match p.source {
+        Source::Npm { package, integrity } => format!("npm {} {} {package} {integrity}\n", p.bin, p.version),
+        Source::Hermes { tag, sha256 } => format!("hermes {} {} {tag} {sha256}\n", p.bin, p.version),
+    });
+    node.chain(harnesses).collect()
+}
+
+/// `botd harness ...`, which reads no settings: `pins` prints `pins_text`.
+pub fn cli(args: &[String]) -> i32 {
+    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["pins"] => {
+            print!("{}", pins_text());
+            0
+        }
+        _ => {
+            eprintln!("Usage: botd harness pins    (the Node.js and harness CLIs this botd pins, ADR 0232)");
+            2
+        }
+    }
+}
+
 /// Whether `v` is an exact semver version, not a tag or range.
 fn exact(v: &str) -> bool {
     let (core, pre) = v.split_once('-').map_or((v, None), |(c, p)| (c, Some(p)));
@@ -393,6 +421,66 @@ mod tests {
         }
         assert_eq!(server_update("codex"), Some("npm install -g @openai/codex@0.171.0".into()));
         assert_eq!(server_update("hermes"), None);
+    }
+
+    /// `botd harness pins` says what machines are sent, and deploy/install.sh reads it into the
+    /// MANIFEST lines a harness bundle must carry (ADR 0232).
+    #[test]
+    fn harness_pins_are_what_machines_install_and_what_install_sh_reads() {
+        let text = pins_text();
+        let n = node();
+        let mut bins = vec![];
+        for line in text.lines() {
+            let w: Vec<&str> = line.split(' ').collect();
+            assert!(w.iter().all(|w| !w.is_empty()), "{line}");
+            match w[..] {
+                ["node", version, arch, sha256] => {
+                    assert_eq!(version, n.version);
+                    assert_eq!(n.downloads[arch].sha256, sha256, "{arch}");
+                }
+                ["npm", bin, version, package, integrity] => {
+                    let h = install(bin, None, None).unwrap();
+                    assert_eq!(h.version, version);
+                    let InstallSource::Npm { package: p, integrity: Some(i) } = h.source else { panic!("{bin}") };
+                    assert_eq!((p.as_str(), i.as_str()), (package, integrity));
+                    bins.push(bin);
+                }
+                ["hermes", bin, commit, tag, sha256] => {
+                    assert_eq!(install(bin, None, None).unwrap().version, commit);
+                    assert!(tag.starts_with('v') && sha256.len() == 64, "{line}");
+                }
+                _ => panic!("{line}"),
+            }
+        }
+        assert_eq!(text.lines().filter(|l| l.starts_with("node ")).count(), n.downloads.len());
+        assert_eq!(bins, ["claude", "codex", "pi"]);
+        assert_eq!(cli(&["pins".into()]), 0);
+        assert_eq!(cli(&[]), 2);
+        assert_eq!(cli(&["pins".into(), "x".into()]), 2);
+
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::db::temp_path("harness-pins");
+        std::fs::create_dir_all(&dir).unwrap();
+        let botd = dir.join("botd");
+        std::fs::write(&botd, format!("#!/bin/sh\n[ \"$*\" = 'harness pins' ] || exit 2\ncat <<'EOF'\n{text}EOF\n")).unwrap();
+        std::fs::set_permissions(&botd, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("SUPERBOT_INSTALL_NO_MAIN=1 source deploy/install.sh && p=$(harness_pins \"$1\") && harness_manifest_lines \"$p\" aarch64")
+            .arg("bash")
+            .arg(&botd)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let mut want = vec!["harnesses=claude codex pi".to_string(), format!("node={} {}", n.version, n.downloads["aarch64"].sha256)];
+        for b in ["claude", "codex", "pi"] {
+            let h = install(b, None, None).unwrap();
+            let InstallSource::Npm { package, integrity: Some(i) } = h.source else { unreachable!() };
+            want.push(format!("harness_{b}={} {package} {i}", h.version));
+        }
+        assert_eq!(String::from_utf8_lossy(&out.stdout).lines().collect::<Vec<_>>(), want);
     }
 
     /// The pins, really installed: `cargo test -- --ignored real_harness_installs`.
