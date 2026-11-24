@@ -58,7 +58,7 @@ Sources the product already gives the operator:
 2. Name the incident commander, set the severity, and decide whether it may be a personal data breach. If it may be, start the breach clock: the time the provider became aware.
 3. Bring in the roles the severity needs.
 
-An event that turns out not to be an incident is closed in the record with the reason, so every security event has a ticket.
+An event that turns out not to be an incident is closed in the record with the reason, so every security event has a ticket. The security owner also enters each event in the [policy register](../policy-register.md#incidents), by id, with when it was detected and triaged, its commander and severity, and for a possible breach when the provider became aware and when customers were told; the monthly register bundle checks them against this plan.
 
 ### 3. Keep evidence
 
@@ -114,7 +114,8 @@ Notices say what happened, when, what data and customers it affects, what the pr
 - Reviews are blameless: they look for what let the incident happen and what would stop it next time, not for someone to blame.
 - Each review has: summary and impact; the timeline; how it was detected and how long that took; the cause; what went well and what didn't; and actions, each with an owner and a due date, tracked as issues to closure.
 - Reviews feed the risk register and are listed in the quarterly management review. An availability incident's review is linked from its status page note.
+- The incident's register entry records when it closed, when it was reviewed with the review's SHA-256, and each action's owner role, due date and completion.
 
 ## Testing the plan
 
-A tabletop exercise at least yearly, with every role, on a scenario such as a leaked master key, a compromised admin, a lost Incus host or a breach in a model provider. The exercise is recorded like a review, and its actions tracked. Containment commands are tried on a non-production server at the same time.
+A tabletop exercise at least yearly, with every role, on a scenario such as a leaked master key, a compromised admin, a lost Incus host or a breach in a model provider. The exercise is recorded like a review, and its actions tracked. Containment commands are tried on a non-production server at the same time. The register records the date, who attended (someone holding each of the security owner, operator, engineering lead and privacy lead roles), the record's SHA-256 and the actions.
