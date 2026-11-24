@@ -2055,7 +2055,9 @@ async fn an_idp_session_limit_turned_off_is_ignored() {
     let (code, _, head) = sp.sign_in(|r| r.session_not_on_or_after = Some(db::now() - HOUR)).await;
     assert_eq!(code, 200, "{head}");
     let s = sp.session_of(&head).await;
-    assert_eq!(s["expiresAt"].as_i64().unwrap() - s["createdAt"].as_i64().unwrap(), users::SessionConfig::default().max_ms);
+    // The end is set from the sign-in's clock, a moment before the session row is written.
+    let (lasts, max) = (s["expiresAt"].as_i64().unwrap() - s["createdAt"].as_i64().unwrap(), users::SessionConfig::default().max_ms);
+    assert!((max - 1_000..=max).contains(&lasts), "{lasts} vs {max}");
     assert_eq!(sp.audit("auth.login").await[0]["details"]["idpSessionEnds"], Value::Null);
     assert!(sp.audit("auth.saml_reauthn").await.is_empty());
 }
@@ -2265,4 +2267,146 @@ async fn generated_keys_and_their_next_keys_are_checked_without_making_any() {
     assert_eq!(n, want.len(), "the test IdP's certificate lasts past then");
     assert_eq!(sp.audit("sso.saml_sp_key_created").await.len(), made, "checking makes no key");
     assert_eq!(sp.view().await["certificateWarnings"], json!([]), "not yet, today");
+}
+
+// AuthnRequests over HTTP-POST (ADR 0235)
+
+/// An HTTP-POST binding page: where its form goes, the message it posts (decoded), and its
+/// RelayState.
+fn posted_form(body: &str) -> (String, String, Option<String>) {
+    let value = |name: &str| body.split(&format!(r#"name="{name}" value=""#)).nth(1).map(|v| v.split('"').next().unwrap().to_string());
+    let action = body.split(r#"<form method="post" action=""#).nth(1).expect("a form").split('"').next().unwrap().replace("&amp;", "&");
+    let xml = String::from_utf8(STANDARD.decode(value("SAMLRequest").expect("a SAMLRequest")).unwrap()).unwrap();
+    (action, xml, value("RelayState"))
+}
+
+/// What a page that posts an AuthnRequest must be: HTML that runs only its own script, kept
+/// nowhere, and sends no Referer.
+fn post_page_headers(head: &str) {
+    assert_eq!(header(head, "content-type").as_deref(), Some("text/html; charset=utf-8"), "{head}");
+    assert_eq!((header(head, "cache-control").as_deref(), header(head, "referrer-policy").as_deref()), (Some("no-store"), Some("no-referrer")), "{head}");
+    let csp = header(head, "content-security-policy").expect("a CSP");
+    assert!(csp.starts_with("default-src 'none'; script-src 'sha256-") && csp.contains("form-action https:;") && csp.contains("frame-ancestors 'none'"), "{csp}");
+}
+
+/// `xml`'s enveloped signature, checked against `cert`. False when it has none.
+fn signed_inside(xml: &str, cert: &crate::sso::xmldsig::Cert) -> bool {
+    let doc = roxmltree::Document::parse(xml).unwrap();
+    crate::sso::xmldsig::verify_enveloped(doc.root_element(), std::slice::from_ref(cert)).unwrap()
+}
+
+/// The test IdP's metadata with only its HTTP-POST SingleSignOnService.
+fn post_only_metadata() -> String {
+    let redirect = format!(r#"<md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="{SSO_URL}"/>"#);
+    let xml = test_idp::metadata();
+    assert!(xml.contains(&redirect));
+    xml.replace(&redirect, "")
+}
+
+impl Sp {
+    /// Starts a web sign-in over HTTP-POST: the AuthnRequest, the RelayState, and the binder cookie.
+    async fn start_post(&self) -> (String, String, String) {
+        let (code, head, body) = crate::tests::call_with(self.port, "GET", &format!("/api/auth/sso/{}/start", self.id), "", "", "").await;
+        assert_eq!(code, 200, "{head}\n{body}");
+        post_page_headers(&head);
+        let (action, request, relay) = posted_form(&body);
+        assert_eq!(action, format!("{SSO_URL}/post"));
+        assert!(request.contains(&format!(r#"Destination="{SSO_URL}/post""#)) && request.contains(&format!(r#"AssertionConsumerServiceURL="{}""#, self.acs())), "{request}");
+        let binder = set_cookies(&head).into_iter().find(|c| c.starts_with("__Host-superbot_saml=")).expect("binder cookie");
+        (request, relay.expect("RelayState"), binder.split(';').next().unwrap().to_string())
+    }
+
+    async fn import(&self, xml: &str) -> (u16, String) {
+        call(self.port, "PUT", &format!("/api/sso/{}/saml/idp-metadata", self.id), &self.admin, &json!({ "xml": xml }).to_string()).await
+    }
+}
+
+#[tokio::test]
+async fn authn_requests_go_over_http_post_signed_inside_when_asked() {
+    let sp = serve(&[("REQUEST_BINDING", "post"), ("SIGN_REQUESTS", "true")]).await;
+    let u = sp.link();
+    let v = sp.view().await;
+    assert_eq!((v["requestBinding"].as_str(), v["idp"]["ssoBinding"].as_str(), v["idp"]["ssoUrl"].as_str()), (Some("post"), Some("post"), Some(format!("{SSO_URL}/post").as_str())), "{v}");
+
+    let (request, relay, binder) = sp.start_post().await;
+    assert!(signed_inside(&request, &sp.sp_cert().await), "signed by our published key: {request}");
+    let r = Response::new(&sp.acs(), &sp.entity(), &request_id(&request), db::now());
+    let (code, _, head) = sp.post(Some(&r.posted()), Some(&relay), &binder).await;
+    assert_eq!(code, 200, "{head}");
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(u.id));
+
+    // The same checks as over redirect: another browser's answer is refused.
+    let (request, relay, _) = sp.start_post().await;
+    let r = Response::new(&sp.acs(), &sp.entity(), &request_id(&request), db::now());
+    assert_eq!(sp.post(Some(&r.posted()), Some(&relay), "").await.1, "/login?error=sso_expired");
+    assert_eq!(sp.last_failure().await["reason"], "binder_mismatch");
+}
+
+#[tokio::test]
+async fn an_idp_that_takes_only_http_post_needs_no_setting() {
+    let sp = serve(&[]).await;
+    let u = sp.link();
+    let (code, view) = sp.import(&post_only_metadata()).await;
+    assert_eq!(code, 200, "{view}");
+    let v: Value = serde_json::from_str(&view).unwrap();
+    assert_eq!((v["requestBinding"].as_str(), v["idp"]["ssoBinding"].as_str()), (Some("auto"), Some("post")), "{v}");
+    let imported = sp.audit("sso.saml_metadata_imported").await;
+    assert_eq!(imported[0]["details"]["ssoBinding"], "post");
+
+    let (request, relay, binder) = sp.start_post().await;
+    assert!(!request.contains("<ds:Signature"), "unsigned without SIGN_REQUESTS: {request}");
+    let r = Response::new(&sp.acs(), &sp.entity(), &request_id(&request), db::now());
+    let (code, _, head) = sp.post(Some(&r.posted()), Some(&relay), &binder).await;
+    assert_eq!((code, signed_in_as(sp.port, &head).await), (200, Some(u.id)));
+
+    // An app sign-in goes the same way, with its own state.
+    let path = format!("/api/auth/sso/{}/start?session=token&redirect=superbot%3A%2F%2Fauth&challenge={}&state=app-state", sp.id, s256(&"v".repeat(64)));
+    let (code, head, body) = crate::tests::call_with(sp.port, "GET", &path, "", "", "").await;
+    assert_eq!(code, 200, "{head}\n{body}");
+    post_page_headers(&head);
+    assert!(set_cookies(&head).iter().all(|c| !c.starts_with("__Host-superbot_saml=")), "no binder for the app: {head}");
+    let (_, request, relay) = posted_form(&body);
+    assert!(request.contains(&format!(r#"Destination="{SSO_URL}/post""#)) && relay.is_some_and(|r| r != "app-state"), "RelayState is botd's own state");
+
+    // Back to the redirect binding when the IdP offers it again.
+    assert_eq!(sp.import(&test_idp::metadata()).await.0, 200);
+    assert!(!sp.start().await.0.is_empty(), "a 303 to the HTTP-Redirect URL");
+}
+
+#[tokio::test]
+async fn a_binding_the_idp_does_not_offer_is_refused_with_what_to_set() {
+    let sp = serve(&[("REQUEST_BINDING", "redirect")]).await;
+    let (code, e) = sp.import(&post_only_metadata()).await;
+    assert_eq!(code, 400, "{e}");
+    assert!(e.contains("no HTTP-Redirect SingleSignOnService: set SSO_<ID>_REQUEST_BINDING=auto or post"), "{e}");
+    assert_eq!(sp.view().await["idp"]["ssoBinding"], "redirect", "the metadata in use is kept");
+    let sp = serve(&[("REQUEST_BINDING", "post")]).await;
+    let redirect_only = test_idp::metadata().replace(&format!(r#"<md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="{SSO_URL}/post"/>"#), "");
+    let (code, e) = sp.import(&redirect_only).await;
+    assert_eq!(code, 400, "{e}");
+    assert!(e.contains("no HTTP-POST SingleSignOnService"), "{e}");
+}
+
+#[tokio::test]
+async fn asking_again_for_a_recent_sign_in_posts_too() {
+    let sp = serve_with(&[("REQUEST_BINDING", "post"), ("MAX_AUTHN_AGE", "1h")], |a| a.limiter = users::Limiter::new(1000, 60_000)).await;
+    let u = sp.link();
+    let (request, relay, binder) = sp.start_post().await;
+    assert!(!request.contains("ForceAuthn"), "{request}");
+    let mut r = Response::new(&sp.acs(), &sp.entity(), &request_id(&request), db::now());
+    r.authn_instant = db::now() - 2 * HOUR;
+    let res = http().post(sp.acs()).header("cookie", &binder).form(&[("SAMLResponse", r.posted()), ("RelayState", relay.clone())]).send().await.unwrap();
+    let head: String = res.headers().iter().map(|(k, v)| format!("{k}: {}\n", v.to_str().unwrap())).collect();
+    assert_eq!(res.status().as_u16(), 200, "{head}");
+    post_page_headers(&head);
+    let binders: Vec<_> = set_cookies(&head).into_iter().filter(|c| c.starts_with("__Host-superbot_saml=")).collect();
+    assert!(binders.len() == 1 && !binders[0].starts_with("__Host-superbot_saml=;"), "a new binder, not cleared: {head}");
+    let (action, again, new_relay) = posted_form(&res.text().await.unwrap());
+    assert_eq!(action, format!("{SSO_URL}/post"));
+    assert!(again.contains(r#" ForceAuthn="true""#) && new_relay.as_deref() != Some(relay.as_str()), "{again}");
+    assert_eq!(sp.audit("auth.saml_reauthn").await[0]["details"]["reason"], "stale_authn");
+
+    let r = Response::new(&sp.acs(), &sp.entity(), &request_id(&again), db::now());
+    let (code, _, head) = sp.post(Some(&r.posted()), new_relay.as_deref(), binders[0].split(';').next().unwrap()).await;
+    assert_eq!((code, signed_in_as(sp.port, &head).await), (200, Some(u.id)));
 }

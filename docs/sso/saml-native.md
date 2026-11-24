@@ -181,6 +181,7 @@ If the IdP answers SuperBot's request with another unsolicited response, it igno
 | `SSO_<ID>_JIT_ROLE` | `off` | `readonly`, `member` or `admin`: create a user at first sign-in. Needs `ALLOWED_DOMAINS`. |
 | `SSO_<ID>_LABEL` | `Company SSO` | Button text: "Sign in with …". |
 | `SSO_<ID>_SIGN_REQUESTS` | `false` | `true`: sign AuthnRequests with the SP key ([below](#signed-authnrequests)). |
+| `SSO_<ID>_REQUEST_BINDING` | `auto` | How AuthnRequests reach the IdP: `auto` uses HTTP-Redirect when the IdP's metadata offers it, else HTTP-POST; `redirect` or `post` uses only that one ([below](#authnrequests-over-http-post)). |
 | `SSO_<ID>_SP_CERT_FILE` | | Your own SP certificate (PEM), with its key as `SSO_<ID>_PRIVATE_KEY`. Without it, botd makes and keeps one. |
 | `SSO_<ID>_PRIVATE_KEY` | | With `SP_CERT_FILE`: the SP's private key (PKCS #8 PEM), as env, `_FILE`, or `botctl secret set`. |
 | `SSO_<ID>_ENCRYPTED_ASSERTIONS` | `off` | `allow`: take encrypted assertions as well as plain ones; `require`: only encrypted ones ([below](#encrypted-assertions)). `off` refuses them. |
@@ -210,6 +211,12 @@ If your IdP imported SuperBot's metadata before this key existed, import it agai
 ## Signed AuthnRequests
 
 Most IdPs don't need them. If yours says it wants signed requests (`WantAuthnRequestsSigned="true"` in its metadata, which botd refuses otherwise), set `SSO_CORP_SIGN_REQUESTS=true` and restart: every AuthnRequest is then signed with RSA-SHA256 (or ECDSA, with an ECDSA key of your own) over the redirect URL, and the metadata says so. At the IdP, import SuperBot's metadata again or upload the SP certificate (Entra ID: **SAML Certificates → Verification certificates**, with **Require verification certificates** on; Okta: **Signature Certificate** under **Show Advanced Settings**).
+
+## AuthnRequests over HTTP-POST
+
+botd sends AuthnRequests over HTTP-Redirect (in the URL) when the IdP's metadata lists an HTTP-Redirect `SingleSignOnService`, which nearly every IdP does. For an IdP that lists only HTTP-POST (some Shibboleth, PingFederate and government IdPs), botd uses that with no setting: the browser gets a page that posts the AuthnRequest to the IdP and moves on at once. To use HTTP-POST even when the IdP offers both (say, it wants signed requests in the message itself), set `SSO_CORP_REQUEST_BINDING=post`; `redirect` refuses metadata without an HTTP-Redirect URL, as before. `botctl sso saml corp` shows the binding in use.
+
+Over HTTP-POST, a signed AuthnRequest ([above](#signed-authnrequests)) carries its signature inside the XML (an enveloped XML signature after the Issuer, RSA-SHA256 or your ECDSA key's), with the same SP certificate. The page loads nothing, runs only its own script and sends no Referer; without script, it shows a **Continue** button. The IdP's answer comes back to the ACS as before, held to the same checks.
 
 ## Encrypted assertions
 
