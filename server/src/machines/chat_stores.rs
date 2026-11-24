@@ -11,7 +11,9 @@
 //! The storage itself is `db::chats`. This module reads the settings, opens the stores
 //! at startup (sealing their approvals' tool inputs under the master key), audits each
 //! move (`residency.chats_moved`), backs each store up daily in its folder, and says where
-//! a pin's data is for reports, the app and admins.
+//! a pin's data is for reports, the app and admins. Once a Bot's rows have left a store,
+//! botd rewrites that store's backups without them (ADR 0238), so a pin's data isn't left
+//! in another region's backups until they age out.
 
 use super::ControlPlane;
 use super::server_data::{Policy, ServerData};
@@ -43,7 +45,11 @@ const ACTOR: &str = "residency";
 pub const MOVED: &str = "residency.chats_moved";
 pub const BACKUP_FAILED: &str = "residency.chat_store_backup_failed";
 pub const FORGOTTEN: &str = "residency.chat_store_forgotten";
+pub const CLEARED: &str = "residency.chat_store_backups_cleared";
 const FORGET: &str = "REGION_DATA_FORGET";
+/// Admins are warned once rows that left a store have been in its backups this long (two
+/// hourly checks, plus slack).
+const CLEAR_STALE_MS: i64 = 3 * 3_600_000;
 
 /// REGION_DATA_DIRS, REGION_DATA_BACKUPS and REGION_DATA_FORGET.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -302,7 +308,108 @@ pub fn backup_pass(db: &Db, keep: usize, at: i64) -> Vec<(String, Result<PathBuf
     out
 }
 
-/// Checks hourly for stores due a backup.
+/// What clearing one store's backups of rows that left it did (ADR 0238).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Cleared {
+    /// Bots whose rows left the store and were looked for.
+    pub bots: usize,
+    /// Backups that held some of them and were rewritten.
+    pub backups: usize,
+    /// What was taken out of them, together.
+    pub held: Held,
+}
+
+/// Rewrites the backup at `path` without the rows of `bots`, under the same key: copied
+/// beside it, cleared, checked and renamed over it, so a crash leaves the old file or the
+/// new one, never half of either. Left as it is when it holds none of them. What it took out.
+fn clear_backup(path: &Path, bots: &[String], key: Option<&DbKey>) -> Result<Held, String> {
+    let db = |e: rusqlite::Error| format!("clearing {}: {e}", path.display());
+    fn io(p: &Path) -> impl Fn(std::io::Error) -> String + '_ {
+        move |e| format!("{}: {e}", p.display())
+    }
+    let held = crate::db::held_in_copy(&database_encryption::open_read_only(path, key).map_err(db)?, bots).map_err(db)?;
+    if held.total() == 0 {
+        return Ok(held);
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| format!("{}: not a backup's name", path.display()))?;
+    let partial = path.with_file_name(format!(".partial-{name}"));
+    let r = (|| {
+        let _ = std::fs::remove_file(&partial);
+        std::fs::copy(path, &partial).map_err(io(&partial))?;
+        let c = database_encryption::open_with(&partial, key).map_err(db)?;
+        // VACUUM's working copy would otherwise go to the host's temp folder, outside the region.
+        c.execute_batch("PRAGMA temp_store = MEMORY").map_err(db)?;
+        c.query_row("PRAGMA journal_mode = MEMORY", [], |_| Ok(())).map_err(db)?;
+        let dropped = crate::db::drop_from_copy(&c, bots).map_err(db)?;
+        let check: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0)).map_err(db)?;
+        if check != "ok" {
+            return Err(format!("clearing {}: the rewritten copy failed its integrity check ({check})", path.display()));
+        }
+        drop(c);
+        std::fs::File::open(&partial).and_then(|f| f.sync_all()).map_err(io(&partial))?;
+        std::fs::rename(&partial, path).map_err(io(path))?;
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::File::open(dir).and_then(|f| f.sync_all());
+        }
+        Ok(dropped)
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    r
+}
+
+/// Clears each store's backups of the rows of Bots that left it (`Db::moves_out_to_clear`),
+/// then records those moves as cleared, so reports stop listing the backups as earlier
+/// copies. Each store that had backups rewritten is audited as
+/// `residency.chat_store_backups_cleared`; a failure is audited with it as a failure, the
+/// moves stay uncleared, and the next check tries again.
+pub fn clear_pass(db: &Db, at: i64) -> Vec<(String, Result<Cleared, String>)> {
+    let key = database_encryption::installed();
+    let mut out = Vec::new();
+    for store in db.chat_stores() {
+        let moves = match db.moves_out_to_clear(&store) {
+            Ok(m) if m.is_empty() => continue,
+            Ok(m) => m,
+            Err(e) => {
+                out.push((store.region.clone(), Err(format!("{}'s chat store: {e}", store.region))));
+                continue;
+            }
+        };
+        let bots: Vec<String> = moves.iter().map(|(b, _)| b.clone()).collect();
+        let mut done = Cleared { bots: bots.len(), ..Cleared::default() };
+        let mut failed = Vec::new();
+        for (_, path) in backups(&store) {
+            match clear_backup(&path, &bots, key) {
+                Ok(h) if h.total() > 0 => {
+                    done.backups += 1;
+                    done.held.add(h);
+                }
+                Ok(_) => {}
+                Err(e) => failed.push(e),
+            }
+        }
+        let details = |done: &Cleared| json!({ "region": store.region, "bots": done.bots, "backups": done.backups, "messages": done.held.messages, "routines": done.held.routines, "approvals": done.held.approvals });
+        let r = if failed.is_empty() { db.moves_out_cleared(&store.region, &moves, at).map(|_| ()).map_err(|e| e.to_string()) } else { Err(failed.join("; ")) };
+        match &r {
+            Ok(()) if done.backups > 0 => {
+                log_info!("Regional chat stores: took {} of {} Bots that left {}'s store out of {} of its backups (ADR 0238).", done.held.describe(), done.bots, store.region, done.backups);
+                db.record(&Who::system(ACTOR).event(CLEARED).details(details(&done)));
+            }
+            Ok(()) => {}
+            Err(e) => {
+                log_warn!("Regional chat stores: {}'s backups couldn't all be cleared of rows that left the store; the next check tries again: {e} (ADR 0238).", store.region);
+                let mut d = details(&done);
+                d["error"] = json!(clip(e, 500));
+                db.record(&Who::system(ACTOR).event(CLEARED).outcome(Outcome::Failure).details(d));
+            }
+        }
+        out.push((store.region.clone(), r.map(|()| done)));
+    }
+    out
+}
+
+/// Checks hourly for stores due a backup, then clears backups of rows that left their store.
 pub fn start(app: AppState, cp: Arc<ControlPlane>) {
     if cp.chat_stores.dirs.is_empty() {
         return;
@@ -313,7 +420,11 @@ pub fn start(app: AppState, cp: Arc<ControlPlane>) {
         loop {
             tick.tick().await;
             let (a, keep) = (app.clone(), cp.chat_stores.keep);
-            let _ = tokio::task::spawn_blocking(move || backup_pass(&a.db, keep, now())).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                backup_pass(&a.db, keep, now());
+                clear_pass(&a.db, now());
+            })
+            .await;
         }
     });
 }
@@ -339,14 +450,23 @@ pub fn region_view(app: &App, region: &str) -> Option<Value> {
     app.db.chat_store_counts().iter().find(|(s, _)| s.region == region).map(|(s, n)| store_view(s, n))
 }
 
-/// Warnings for admins: stores whose newest backup is over a day old while they hold anything.
+/// Warnings for admins: stores whose newest backup is over a day old while they hold
+/// anything, and stores whose backups have held rows that left them for over two checks.
 pub fn warnings(app: &App, at: i64) -> Vec<String> {
-    app.db
-        .chat_store_counts()
+    let counts = app.db.chat_store_counts();
+    let stale = counts
         .iter()
         .filter(|(s, n)| n.total() > 0 && backups(s).first().is_none_or(|(t, _)| at - t > BACKUP_STALE_MS))
-        .map(|(s, _)| format!("{}'s chat store has no backup from the last day in its folder's backups/; check botd's log for {BACKUP_FAILED} (ADR 0215).", s.region))
-        .collect()
+        .map(|(s, _)| format!("{}'s chat store has no backup from the last day in its folder's backups/; check botd's log for {BACKUP_FAILED} (ADR 0215).", s.region));
+    let uncleared = counts.iter().filter_map(|(s, _)| {
+        let moves = app.db.moves_out_to_clear(s).ok()?;
+        let late = moves.iter().filter(|(_, moved_at)| at - moved_at > CLEAR_STALE_MS).count();
+        (late > 0 && !backups(s).is_empty()).then(|| {
+            let bots = if late == 1 { "1 Bot".to_string() } else { format!("{late} Bots") };
+            format!("{}'s chat store's backups may still hold the rows of {bots} that left it; check botd's log for {CLEARED} failures (ADR 0238).", s.region)
+        })
+    });
+    stale.chain(uncleared).collect()
 }
 
 /// What of the Bots `owners` own is in a pin to `region`'s store, in botd's own database,
@@ -366,7 +486,8 @@ fn split(app: &App, region: &str, owners: &[String]) -> (Held, Held, Held) {
 /// Where the chats, routines and approvals of Bots `owners` own are against a pin to
 /// `region`: in its store, in botd's own database (in the region only when botd's own data
 /// is, `server_in`), or in another region's store; and the backups of other stores made
-/// before they left them (`earlierCopies`), which hold them until they age out.
+/// before they left them (`earlierCopies`), which hold them until botd clears them out
+/// (ADR 0238).
 pub fn against(app: &App, region: &str, owners: &[String], server_in: bool) -> Value {
     let (store, database, elsewhere) = split(app, region, owners);
     let each = |n: fn(&Held) -> i64| json!({ "inStore": n(&store), "inServerDatabase": n(&database), "elsewhere": n(&elsewhere) });
@@ -420,7 +541,7 @@ pub fn report_warnings(chats: &Value, region: &str, at: i64) -> Vec<String> {
     }
     for e in chats["earlierCopies"].as_array().into_iter().flatten() {
         out.push(format!(
-            "{} backups of {}'s chat store were made before their chats, routines or approvals moved out of it and still hold them, until botd deletes them as newer ones are made (REGION_DATA_BACKUPS, ADR 0215)",
+            "{} backups of {}'s chat store were made before their chats, routines or approvals moved out of it and still hold them, until botd clears them out of those backups on its next hourly check (ADR 0215, ADR 0238)",
             e["backups"],
             e["region"].as_str().unwrap_or_default(),
         ));
@@ -510,5 +631,144 @@ mod tests {
         assert_eq!(mode, "delete", "one self-contained file");
         let files: Vec<String> = std::fs::read_dir(dir.join("backups")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         assert_eq!(files.len(), 2, "no -wal, -shm or partial copies left: {files:?}");
+    }
+
+    struct Two {
+        t: crate::db::Scratch,
+        db: Db,
+        lon: PathBuf,
+    }
+
+    /// botd with London's and Frankfurt's stores.
+    fn two() -> Two {
+        let t = crate::db::Scratch::new();
+        let db = Db::open(&t.path().join("app.sqlite")).unwrap();
+        let (lon, fra) = (t.path().join("lon"), t.path().join("fra"));
+        std::fs::create_dir_all(&lon).unwrap();
+        std::fs::create_dir_all(&fra).unwrap();
+        db.attach_chat_stores(&[("gb-lon".into(), lon.clone()), ("de-fra-2".into(), fra)], &[], None).unwrap();
+        Two { t, db, lon }
+    }
+
+    fn pinned_bot(db: &Db, name: &str, region: &str) -> (String, String) {
+        let u = db.create_user(None, Some(&format!("{name}@example.com")), name, crate::rbac::Role::Member).unwrap().id;
+        db.pin_residency(crate::db::PinOn::User, &u, region, "DPA-1", None).unwrap();
+        let bot = db.create_bot_owned("B", "#fff", "waddle", "claude", None, false, &u, crate::acl::Visibility::Private).id;
+        (u, bot)
+    }
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    fn holds(path: &Path, w: &str) -> bool {
+        std::fs::read(path).is_ok_and(|b| b.windows(w.len()).any(|x| x == w.as_bytes()))
+    }
+
+    #[test]
+    fn backups_are_cleared_of_rows_that_left_the_store_and_keep_everyone_elses() {
+        let Two { t: _t, db, lon } = two();
+        let (ada, bot) = pinned_bot(&db, "ada", "gb-lon");
+        let (_, cys) = pinned_bot(&db, "cy", "gb-lon");
+        let words = ["chat-0b5e1f-contract", "routine-6d2a90-instruction", "approval-f31c7e-subject"];
+        db.add_message(&bot, "user", words[0], None, false, None);
+        db.add_routine(&bot, "daily", "0 9 * * *", words[1]);
+        db.add_approval(&bot, "claude", "Bash", "command", words[2], &json!({ "command": words[2] }), "write", "asks", now() + 60_000);
+        db.add_message(&cys, "user", "cy-stays-in-london", None, false, None);
+        let start = chrono::DateTime::parse_from_rfc3339("2026-11-01T03:00:00Z").unwrap().timestamp_millis();
+        backup_pass(&db, 7, start);
+        backup_pass(&db, 7, start + BACKUP_EVERY_MS);
+        let dir = lon.join("backups");
+        let before = files_in(&dir);
+        assert_eq!(before.len(), 2);
+        assert!(before.iter().all(|f| words.iter().all(|w| holds(&dir.join(f), w))));
+        assert!(clear_pass(&db, now()).is_empty(), "nothing has left London yet");
+
+        // Pinned to Frankfurt, her rows move; London's backups are rewritten without them.
+        db.unpin_residency(crate::db::PinOn::User, &ada).unwrap();
+        db.pin_residency(crate::db::PinOn::User, &ada, "de-fra-2", "DPA-2", None).unwrap();
+        db.place_chats().unwrap();
+        assert_eq!(db.chat_moves_out(std::slice::from_ref(&ada), "de-fra-2").len(), 1, "listed as an earlier copy until cleared");
+        let r = clear_pass(&db, now());
+        let want = Cleared { bots: 1, backups: 2, held: Held { messages: 2, routines: 2, approvals: 2 } };
+        assert_eq!(r, vec![("gb-lon".to_string(), Ok(want))]);
+        assert_eq!(files_in(&dir), before, "the same restore points, no partial copies left");
+        for f in &before {
+            let path = dir.join(f);
+            for w in words {
+                assert!(!holds(&path, w), "{w} left in {f}");
+            }
+            let c = rusqlite::Connection::open(&path).unwrap();
+            let check: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+            let texts: Vec<String> = c.prepare("SELECT text FROM messages").unwrap().query_map([], |r| r.get(0)).unwrap().flatten().collect();
+            assert_eq!((check.as_str(), texts), ("ok", vec!["cy-stays-in-london".to_string()]), "{f}");
+            let mode: String = c.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+            assert_eq!(mode, "delete", "still one self-contained file");
+        }
+        assert!(db.chat_moves_out(std::slice::from_ref(&ada), "de-fra-2").is_empty(), "no earlier copies once cleared");
+        assert!(clear_pass(&db, now()).is_empty(), "done once");
+
+        // Moving out again makes the newer move uncleared, even with nothing left to take out.
+        db.unpin_residency(crate::db::PinOn::User, &ada).unwrap();
+        db.pin_residency(crate::db::PinOn::User, &ada, "gb-lon", "DPA-3", None).unwrap();
+        db.place_chats().unwrap();
+        db.unpin_residency(crate::db::PinOn::User, &ada).unwrap();
+        db.place_chats().unwrap();
+        let r = clear_pass(&db, now());
+        assert!(r.contains(&("gb-lon".to_string(), Ok(Cleared { bots: 1, ..Cleared::default() }))), "{r:?}");
+        assert!(r.contains(&("de-fra-2".to_string(), Ok(Cleared { bots: 1, ..Cleared::default() }))), "Frankfurt has no backups to clear: {r:?}");
+        assert!(clear_pass(&db, now()).is_empty());
+    }
+
+    #[test]
+    fn a_move_still_pending_or_back_into_the_store_isnt_cleared_from_its_backups() {
+        let Two { t: _t, db, lon: _ } = two();
+        let (ada, bot) = pinned_bot(&db, "ada", "gb-lon");
+        db.add_message(&bot, "user", "x", None, false, None);
+        db.unpin_residency(crate::db::PinOn::User, &ada).unwrap();
+        db.place_chats().unwrap();
+        // Back in London: its backups hold her rows in her own region.
+        db.pin_residency(crate::db::PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        db.place_chats().unwrap();
+        let store = db.chat_stores()[0].clone();
+        assert!(db.moves_out_to_clear(&store).unwrap().is_empty());
+        backup_pass(&db, 7, now());
+        // Unpinned, but not moved yet: the backup may be the only other copy of what London still holds.
+        db.unpin_residency(crate::db::PinOn::User, &ada).unwrap();
+        assert!(db.moves_out_to_clear(&store).unwrap().is_empty());
+        assert!(clear_pass(&db, now()).is_empty());
+        let backup = &backups(&store)[0].1;
+        assert_eq!(crate::db::held_in_copy(&rusqlite::Connection::open(backup).unwrap(), std::slice::from_ref(&bot)).unwrap().messages, 1);
+        // Moved, then the Bot deleted: still taken out of London's backups.
+        db.place_chats().unwrap();
+        db.delete_bot(&bot);
+        assert_eq!(db.moves_out_to_clear(&store).unwrap().len(), 1);
+        assert_eq!(clear_pass(&db, now())[0].1.as_ref().unwrap().held.messages, 1);
+        assert_eq!(rusqlite::Connection::open(backup).unwrap().query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_backup_that_cant_be_cleared_keeps_the_move_uncleared_until_it_can() {
+        let Two { t: _t, db, lon } = two();
+        let (ada, bot) = pinned_bot(&db, "ada", "gb-lon");
+        db.add_message(&bot, "user", "x", None, false, None);
+        backup_pass(&db, 7, now());
+        let bad = lon.join("backups").join("chats-20200101-000000.sqlite");
+        std::fs::write(&bad, b"not a database").unwrap();
+        db.unpin_residency(crate::db::PinOn::User, &ada).unwrap();
+        db.place_chats().unwrap();
+        let r = clear_pass(&db, now());
+        let e = r[0].1.as_ref().unwrap_err();
+        assert!(e.contains("chats-20200101-000000.sqlite"), "{e}");
+        assert_eq!(db.moves_out_to_clear(&db.chat_stores()[0]).unwrap().len(), 1, "tried again on the next check");
+        assert_eq!(db.chat_moves_out(std::slice::from_ref(&ada), "de-fra-2").len(), 1, "still an earlier copy");
+        let good = &backups(&db.chat_stores()[0]).into_iter().find(|(_, p)| *p != bad).unwrap().1;
+        assert_eq!(rusqlite::Connection::open(good).unwrap().query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0)).unwrap(), 0, "the others are cleared meanwhile");
+        assert_eq!(files_in(&lon.join("backups")).len(), 2, "no partial copies left");
+        std::fs::remove_file(&bad).unwrap();
+        assert!(clear_pass(&db, now())[0].1.is_ok());
+        assert!(db.chat_moves_out(std::slice::from_ref(&ada), "de-fra-2").is_empty());
     }
 }

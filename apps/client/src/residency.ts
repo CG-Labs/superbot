@@ -39,7 +39,7 @@ export function residencyLines(v: MyResidency): { lines: string[]; warnings: str
   else if (c?.store) {
     lines.push(`Your chats, routines and approvals are kept in ${p.region}, in a database of their own there.`);
     const n = c.earlierBackups ?? 0;
-    if (n > 0) lines.push(`${n === 1 ? "A backup" : `${n} backups`} from before they moved still ${n === 1 ? "holds" : "hold"} earlier copies in another region until ${n === 1 ? "it is" : "they are"} deleted.`);
+    if (n > 0) lines.push(`${n === 1 ? "A backup" : `${n} backups`} from before they moved still ${n === 1 ? "holds" : "hold"} earlier copies in another region until SuperBot clears them out.`);
   }
   const what = chatsHeld ? "account" : "account, chats, routines and approvals";
   if (s?.inRegion) lines.push(`SuperBot's own copy of your ${what} is in ${p.region}.`);

@@ -54,7 +54,8 @@ fn token(table: &str) -> String {
 
 /// botd's record of each store it has kept chats in, so a store that goes missing (an
 /// unmounted volume, a dropped setting) stops botd instead of hiding those chats; and of
-/// when each Bot's rows last left a store, as that store's earlier backups still hold them.
+/// when each Bot's rows last left a store, as that store's earlier backups still hold them
+/// until botd clears them out of those backups (`cleared_at`, ADR 0238).
 const RECORDS: &str = "CREATE TABLE IF NOT EXISTS main.chat_stores (
   region TEXT PRIMARY KEY,
   store_id TEXT NOT NULL,
@@ -65,6 +66,7 @@ CREATE TABLE IF NOT EXISTS main.chat_moves_out (
   bot_id TEXT NOT NULL,
   region TEXT NOT NULL,
   moved_at INTEGER NOT NULL,
+  cleared_at INTEGER,
   PRIMARY KEY (bot_id, region)
 );";
 
@@ -294,6 +296,9 @@ impl Db {
         let c = self.c();
         let e = |err: rusqlite::Error| format!("chat stores: {err}");
         c.execute_batch(RECORDS).map_err(e)?;
+        if !columns(&c, "main", "chat_moves_out").map_err(e)?.iter().any(|col| col.name == "cleared_at") {
+            c.execute_batch("ALTER TABLE main.chat_moves_out ADD COLUMN cleared_at INTEGER").map_err(e)?;
+        }
         let recorded: Vec<(String, String, String)> = {
             let mut s = c.prepare("SELECT region, store_id, path FROM main.chat_stores ORDER BY region").map_err(e)?;
             s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(e)?.collect::<rusqlite::Result<_>>().map_err(e)?
@@ -548,7 +553,7 @@ impl Db {
                     tx.execute(
                         &format!(
                             "INSERT INTO main.chat_moves_out (bot_id, region, moved_at) SELECT bot_id, ?1, ?2 FROM ({theirs}) WHERE true
-                             ON CONFLICT(bot_id, region) DO UPDATE SET moved_at = excluded.moved_at"
+                             ON CONFLICT(bot_id, region) DO UPDATE SET moved_at = excluded.moved_at, cleared_at = NULL"
                         ),
                         params![r, at],
                     )?;
@@ -597,17 +602,51 @@ impl Db {
     }
 
     /// When the chats of Bots `owners` own last left each store other than `except`'s, as
-    /// `(region, moved_at)`: that store's backups from before then still hold them.
+    /// `(region, moved_at)`: that store's backups from before then still hold them, until
+    /// botd has cleared them out of those backups (ADR 0238).
     pub fn chat_moves_out(&self, owners: &[String], except: &str) -> Vec<(String, i64)> {
         let owners = serde_json::to_string(owners).unwrap_or_else(|_| "[]".into());
         let c = self.c();
         let Ok(mut s) = c.prepare(
-            "SELECT region, MAX(moved_at) FROM main.chat_moves_out WHERE region != ?2
+            "SELECT region, MAX(moved_at) FROM main.chat_moves_out WHERE region != ?2 AND cleared_at IS NULL
              AND bot_id IN (SELECT id FROM main.bots WHERE owner_id IN (SELECT value FROM json_each(?1))) GROUP BY region ORDER BY region",
         ) else {
             return Vec::new();
         };
         s.query_map(params![owners, except], |r| Ok((r.get(0)?, r.get(1)?))).map(|rows| rows.flatten().collect()).unwrap_or_default()
+    }
+
+    /// The Bots whose rows left `store` and that its backups may still hold, as `(bot_id,
+    /// moved_at)` (ADR 0238): not yet cleared, kept somewhere else now (or deleted since),
+    /// and with nothing of theirs left in the store itself, so a move still pending never
+    /// takes the only other copy.
+    pub fn moves_out_to_clear(&self, store: &ChatStore) -> rusqlite::Result<Vec<(String, i64)>> {
+        let none_left: String = KEPT.iter().map(|k| format!(" AND NOT EXISTS (SELECT 1 FROM {}.{} WHERE bot_id = m.bot_id)", store.schema, k.name)).collect();
+        let c = self.c();
+        let mut s = c.prepare(&format!(
+            "SELECT m.bot_id, m.moved_at FROM main.chat_moves_out m
+             WHERE m.region = ?1 AND m.cleared_at IS NULL AND ({}) IS NOT ?1{none_left}
+             ORDER BY m.bot_id",
+            pinned_region("m.bot_id")
+        ))?;
+        s.query_map([&store.region], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+    }
+
+    /// Records that `region`'s backups no longer hold the rows of these moves (from
+    /// `moves_out_to_clear`). A Bot that moved out again since keeps its newer move. How
+    /// many were recorded.
+    pub fn moves_out_cleared(&self, region: &str, moves: &[(String, i64)], at: i64) -> rusqlite::Result<usize> {
+        let c = self.c();
+        let tx = c.unchecked_transaction()?;
+        let mut n = 0;
+        for (bot, moved_at) in moves {
+            n += tx.execute(
+                "UPDATE main.chat_moves_out SET cleared_at = ?4 WHERE region = ?1 AND bot_id = ?2 AND moved_at = ?3 AND cleared_at IS NULL",
+                params![region, bot, moved_at, at],
+            )?;
+        }
+        tx.commit()?;
+        Ok(n)
     }
 
     /// Every store and what it holds.
@@ -671,6 +710,31 @@ impl Db {
     }
 }
 
+
+/// How many rows of `bots` a copy of a store opened on `c` (one of its backups) holds.
+pub fn held_in_copy(c: &Connection, bots: &[String]) -> rusqlite::Result<Held> {
+    let bots = serde_json::to_string(bots).unwrap_or_else(|_| "[]".into());
+    held_in(c, "main", "bot_id IN (SELECT value FROM json_each(?1))", &[&bots])
+}
+
+/// Deletes the rows of `bots` from a copy of a store opened on `c`, zeroing them
+/// (`secure_delete`), and rebuilds the file so no page of theirs is left in it (ADR 0238).
+/// What was deleted.
+pub fn drop_from_copy(c: &Connection, bots: &[String]) -> rusqlite::Result<Held> {
+    let list = serde_json::to_string(bots).unwrap_or_else(|_| "[]".into());
+    c.execute_batch("PRAGMA secure_delete = ON")?;
+    let tx = c.unchecked_transaction()?;
+    let mut n = [0; 3];
+    for (i, k) in KEPT.iter().enumerate() {
+        let exists: bool = tx.query_row("SELECT COUNT(*) > 0 FROM main.sqlite_master WHERE type = 'table' AND name = ?1", [k.name], |r| r.get(0))?;
+        if exists {
+            n[i] = tx.execute(&format!("DELETE FROM main.{} WHERE bot_id IN (SELECT value FROM json_each(?1))", k.name), [&list])? as i64;
+        }
+    }
+    tx.commit()?;
+    c.execute_batch("VACUUM")?;
+    Ok(Held::of(n))
+}
 
 /// A temporary folder for tests, removed when dropped.
 #[cfg(test)]
@@ -896,6 +960,28 @@ mod tests {
         let out = db.chat_moves_out(std::slice::from_ref(&ada), "de-fra-2");
         assert!(out.len() == 1 && out[0].0 == "gb-lon" && now() - out[0].1 < 60_000, "{out:?}");
         assert!(db.chat_moves_out(std::slice::from_ref(&ada), "gb-lon").is_empty(), "not a copy outside a pin back to gb-lon");
+    }
+
+    #[test]
+    fn move_records_from_before_clearing_backups_gain_its_column() {
+        let d = Dirs::new();
+        let ada = {
+            let db = d.up();
+            let ada = user(&db, "ada");
+            db.add_message(&bot_of(&db, &ada), "user", "x", None, false, None);
+            db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+            db.place_chats().unwrap();
+            db.unpin_residency(PinOn::User, &ada).unwrap();
+            db.place_chats().unwrap();
+            ada
+        };
+        Connection::open(d.dir.path().join("app.sqlite")).unwrap().execute_batch("ALTER TABLE chat_moves_out DROP COLUMN cleared_at").unwrap();
+        let db = d.up();
+        assert_eq!(db.chat_moves_out(std::slice::from_ref(&ada), "de-fra-2").len(), 1, "an older move is still an earlier copy");
+        let lon = db.chat_stores()[0].clone();
+        let moves = db.moves_out_to_clear(&lon).unwrap();
+        assert_eq!(db.moves_out_cleared("gb-lon", &moves, now()).unwrap(), 1);
+        assert!(db.chat_moves_out(std::slice::from_ref(&ada), "de-fra-2").is_empty());
     }
 
     #[test]
