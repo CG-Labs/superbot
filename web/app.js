@@ -1047,9 +1047,7 @@ function saCard(s) {
   const tokens = d.tokenList || [];
   const held = heldScopes(s);
   const owner = s.owner ? s.owner.name || s.owner.email || s.owner.id : "nobody";
-  const kept = d.keptBotList || (d.bots || []).filter((b) => b.kept);
-  const keepable = d.keepable || [];
-  const max = saTab.view.maxKeptBots || 20;
+  const kept = (d.bots || []).filter((b) => b.kept).map((b) => b.name);
   return `<div class="card" data-sa="${esc(s.id)}">
     <div class="bar"><b>${esc(s.name)}</b> <span class="sub">${esc(saRoleText(s))} · ${active ? "active" : "disabled"} · owned by ${esc(owner)} · ${esc(lastUsed(s.lastUsedAt))}</span>
       <button type="button" class="btn push" data-act="edit-sa">Edit</button>
@@ -1060,11 +1058,7 @@ function saCard(s) {
     ${!active ? '<p class="warn">Disabled: its tokens don\'t work. Enable it to use or make tokens.</p>' : ""}
     <span class="sub">Can use today:</span>${s.effective.length ? tags(s.effective) : ' <span class="sub">nothing</span>'}
     ${s.team ? `<span class="sub">In ${esc(s.team.name)}: ${esc(permNames(s.teamPermissions))}</span>` : ""}
-    ${s.keptBots ? `<p class="hint">Keeps ${s.keptBots} of ${esc(owner)}'s Bots (at most ${max}). They stay ${esc(owner)}'s if it's deleted, changes owner or a Bot is taken back.</p>` : ""}
-    ${kept.length ? `<table class="grid"><thead><tr><th>Bot it keeps</th><th></th></tr></thead><tbody>${kept.map((b) => `<tr data-kept="${esc(b.id)}"><td>${esc(b.name)}</td><td class="actions"><button type="button" class="btn" data-act="release-bot">Take back</button></td></tr>`).join("")}</tbody></table>` : ""}
-    ${keepable.length && kept.length < max ? `<div class="bar"><span class="sub">Hand it one of ${esc(owner)}'s Bots to manage:</span>
-      <select name="keep-bot" title="Bot">${keepable.map((b) => `<option value="${esc(b.id)}">${esc(b.name)}${b.keptBy ? ` (from ${esc(b.keptBy.name)})` : ""}</option>`).join("")}</select>
-      <button type="button" class="btn" data-act="keep-bot">Hand over</button></div>` : ""}
+    ${s.keptBots ? `<p class="hint">Keeps ${s.keptBots} of ${esc(owner)}'s Bots${kept.length ? `: ${esc(kept.join(", "))}` : ""}. They stay ${esc(owner)}'s if it's deleted or changes owner.</p>` : ""}
     ${d.loadFailed ? '<p class="warn">Its tokens didn\'t load. <button type="button" class="btn" data-act="reload-sa">Reload</button></p>' : tokens.length ? `<table class="grid"><thead><tr><th>Token</th><th>Scopes</th><th>State</th><th>Use</th><th></th></tr></thead><tbody>${tokens.map((t) => tokenRow(t, active)).join("")}</tbody></table>` : '<p class="hint">No tokens yet.</p>'}
     ${active ? `<form class="bar" data-act="new-token" autocomplete="off">
       <input name="name" placeholder="Token name (optional), e.g. CI" maxlength="60" />
@@ -1218,20 +1212,6 @@ $("sa-list").addEventListener("click", async (e) => {
         saTab.editing = null;
         resetsForm = true;
       }
-    }
-    // ADR 0229: one of its owner's Bots for it to keep, or one taken back; the Bot stays the owner's.
-    if (b.dataset.act === "keep-bot") {
-      const bot = (saTab.details[s.id]?.keepable || []).find((x) => x.id === b.closest(".bar").querySelector("[name=keep-bot]").value);
-      if (!bot) return (acted = false);
-      const from = bot.keptBy ? ` ${bot.keptBy.name} stops keeping it.` : "";
-      if (!confirm(`Let ${s.name} keep ${bot.name}? It can rename it, change its settings, run it and delete it, within its role and tokens. Its runs use the owner's keys and memory. The Bot stays the owner's.${from}`)) return (acted = false);
-      await api("PUT", `/api/bots/${key(bot.id)}/keeper`, { serviceAccount: s.id });
-    }
-    if (b.dataset.act === "release-bot") {
-      const id = b.closest("tr[data-kept]").dataset.kept;
-      const bot = (saTab.details[s.id]?.keptBotList || []).find((x) => x.id === id);
-      if (!confirm(`Take ${bot ? bot.name : "this Bot"} back from ${s.name}? It stops managing the Bot, and its run there stops. The Bot and its chat stay with its owner.`)) return (acted = false);
-      await api("DELETE", `/api/bots/${key(id)}/keeper`);
     }
     if (b.dataset.act === "revoke-token" && t) {
       if (!confirm(`Revoke ${t.name}? It stops working at once. Whatever uses it needs a new token.`)) return (acted = false);

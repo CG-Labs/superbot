@@ -41,7 +41,7 @@ Only a person: **the Bot's owner, or an admin**. Never a service account (its ow
 - `GET /api/bots/{id}/access` adds `keepers` (the owner's live accounts: id, name, role, status, `keptBots`, `full`) and `maxKeptBots`, only for those who may decide and only for non-primary Bots, so the apps offer the choice only when it would work.
 - `GET /api/service-accounts/{id}` adds `keptBotList` (the Bots it keeps) and `keepable` (the owner's Bots the caller may hand it, each with `keptBy` if another account keeps it now).
 - App: the Bot's Sharing section has a "Kept by a service account" picker (owner or admin, non-primary), with a plain confirmation that says what the account can do with it. The service account screen lists the Bots it keeps with "Take back", and offers the owner's other Bots with "Hand it over".
-- Console: the service account card lists kept Bots with "Take back" and a "Hand over" picker.
+- Console: unchanged; its service account card still lists kept Bots. The console is admin-only and never calls Bot routes (ADR 0032), so handing over and taking back are the app's.
 - `botctl bot keep <bot> <service-account>` and `botctl bot release <bot>`.
 - The access review needs no change: it already marks kept Bots `kept`, and the account's access and grant on the Bot are in the sign-off digest, so handing one over or taking it back makes an earlier sign-off stale.
 
