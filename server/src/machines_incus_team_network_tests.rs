@@ -246,10 +246,30 @@ async fn a_deleted_teams_network_goes_with_its_acl_and_its_name_once_its_contain
     let net = devices(&env, &ma)["eth1"]["network"].as_str().unwrap().to_string();
     assert_eq!(env.incus.w().projects["superbot"]["restricted.networks.access"], format!("incusbr0,{net}"));
 
+    // The operator's service for the team, in the default project, which botd's own
+    // project doesn't list (ADR 0249).
+    let mut svc = env.incus.instance(&ma.label).unwrap();
+    svc.project = "default".into();
+    svc.body["devices"] = json!({ "eth0": { "type": "nic", "network": net } });
+    env.incus.w().instances.insert("acme-svc".into(), svc);
+    let view = async || {
+        let (code, v) = json_call(&env, "GET", "/api/machines/team-networks", "").await;
+        assert_eq!(code, 200, "{v}");
+        v["networks"].as_array().unwrap().iter().find(|n| n["id"] == net.as_str()).cloned()
+    };
+    let n = view().await.unwrap();
+    assert_eq!((n["status"].as_str(), n["machines"].as_array().unwrap().len(), n["others"].as_i64()), (Some("team"), 2, Some(1)), "{n}");
+
     let (code, v) = json_call(&env, "DELETE", &format!("/api/teams/{acme}"), "").await;
     assert_eq!(code, 200, "{v}");
-    // Unplugged while running, then nothing is on it: it goes in the same pass.
-    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "left": 2, "removed": 1 }));
+    // Unplugged while running; the service keeps it, and the view says so.
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "left": 2, "kept": 1 }));
+    let n = view().await.unwrap();
+    assert_eq!((n["status"].as_str(), &n["machines"], n["others"].as_i64()), (Some("deleted"), &json!([]), Some(1)), "{n}");
+    // Moved off, nothing is on it: it goes on the next pass.
+    env.incus.w().instances.remove("acme-svc");
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "removed": 1 }));
+    assert!(view().await.is_none());
     for m in [&ma, &ml] {
         let i = env.incus.instance(&m.label).unwrap();
         assert!(i.body["devices"].get("eth1").is_none() && i.status == "Running", "{}", i.body["devices"]);
