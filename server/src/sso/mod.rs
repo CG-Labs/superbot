@@ -103,6 +103,10 @@ struct Pending {
     ret: Return,
     /// The name Apple posted beside the code (first sign-in only).
     name: Option<String>,
+    /// When the sign-in was sent to the IdP, and, for native SAML, whether its AuthnRequest
+    /// asked for `ForceAuthn` (ADR 0225).
+    requested: i64,
+    forced: bool,
 }
 
 struct Handoff {
@@ -111,9 +115,34 @@ struct Handoff {
     claims: Claims,
     /// Native SAML: kept with the session it becomes, for single logout.
     saml: Option<db::SamlLogin>,
+    lifetime: Lifetime,
     challenge: String,
     label: Option<String>,
     expires: i64,
+}
+
+/// What a native SAML sign-in says about the session it makes (ADR 0225): when the IdP signed
+/// the person in, when the IdP's session limit ends the session, and whether the IdP was asked
+/// to sign them in again. Nothing, for other providers.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Lifetime {
+    authn_instant: Option<i64>,
+    ends: Option<i64>,
+    forced: bool,
+}
+
+impl Lifetime {
+    fn details(&self, d: &mut Value) {
+        if let Some(t) = self.authn_instant {
+            d["authnInstant"] = json!(t);
+        }
+        if let Some(t) = self.ends {
+            d["idpSessionEnds"] = json!(t);
+        }
+        if self.forced {
+            d["forceAuthn"] = json!(true);
+        }
+    }
 }
 
 /// A LogoutRequest we sent the IdP, until it answers.
@@ -405,7 +434,7 @@ const TYPES: [&str; 6] = ["entra", "google", "oidc", "apple", "github", "saml"];
 
 /// Settings that only mean something for some types. Set on another, they would look like
 /// a restriction that isn't there, so they are refused.
-const ONLY_FOR: [(&str, &[&str]); 33] = [
+const ONLY_FOR: [(&str, &[&str]); 36] = [
     ("TENANT", &["entra"]),
     ("ALLOWED_TENANTS", &["entra"]),
     ("AUTHORITY", &["entra"]),
@@ -439,11 +468,14 @@ const ONLY_FOR: [(&str, &[&str]); 33] = [
     ("AUTHN_CONTEXT", &["saml"]),
     ("AUTHN_METHODS_ATTRIBUTE", &["saml"]),
     ("REQUEST_AUTHN_CONTEXT", &["saml"]),
+    ("FORCE_AUTHN", &["saml"]),
+    ("MAX_AUTHN_AGE", &["saml"]),
+    ("IDP_SESSION_LIMIT", &["saml"]),
 ];
 
 /// The SAML bridge's settings (with `ISSUER`), and native SAML's (without), so each refuses the other's.
 const SAML_BRIDGE_ONLY: [&str; 6] = ["CLIENT_ID", "IDP_ALIAS", "SCOPES", "SUBJECT_CLAIM", "EMAIL_CLAIM", "NAME_CLAIM"];
-const SAML_NATIVE_ONLY: [&str; 18] = [
+const SAML_NATIVE_ONLY: [&str; 21] = [
     "IDP_METADATA_URL",
     "IDP_METADATA_FILE",
     "SP_ENTITY_ID",
@@ -462,6 +494,9 @@ const SAML_NATIVE_ONLY: [&str; 18] = [
     "AUTHN_CONTEXT",
     "AUTHN_METHODS_ATTRIBUTE",
     "REQUEST_AUTHN_CONTEXT",
+    "FORCE_AUTHN",
+    "MAX_AUTHN_AGE",
+    "IDP_SESSION_LIMIT",
 ];
 
 /// Claims people or their admins can change, so they can't be the subject.
@@ -643,7 +678,8 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
                 Some(v) => IdpInitiated::parse(&v).ok_or_else(|| format!("{} must be off or restart", key("IDP_INITIATED")))?,
             };
             let authn_context = authn_context(&key, var, list, &attributes)?;
-            (Kind::SamlSp { entity_id, sp_entity_id, source, attributes, required_groups, allowed_domains, sign_requests, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context }, saml::LABEL)
+            let freshness = freshness(&key, var)?;
+            (Kind::SamlSp { entity_id, sp_entity_id, source, attributes, required_groups, allowed_domains, sign_requests, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, freshness }, saml::LABEL)
         }
         "saml" => {
             if let Some(k) = SAML_NATIVE_ONLY.iter().find(|k| var(&key(k)).is_some()) {
@@ -781,6 +817,26 @@ fn authn_context(key: &dyn Fn(&str) -> String, var: &Var, list: &List, attribute
     Ok(Some(saml_sp::AuthnContext { accepted, request }))
 }
 
+/// Native SAML: `FORCE_AUTHN`, `MAX_AUTHN_AGE` and `IDP_SESSION_LIMIT` (ADR 0225).
+fn freshness(key: &dyn Fn(&str) -> String, var: &Var) -> Result<saml_sp::Freshness, String> {
+    let switch = |k: &str, yes: &str, no: &str, default: bool| match var(&key(k)).map(|v| v.to_ascii_lowercase()) {
+        None => Ok(default),
+        Some(v) if v == yes => Ok(true),
+        Some(v) if v == no => Ok(false),
+        Some(_) => Err(format!("{} must be {yes} or {no}", key(k))),
+    };
+    let force_authn = switch("FORCE_AUTHN", "true", "false", false)?;
+    let idp_session_limit = switch("IDP_SESSION_LIMIT", "on", "off", true)?;
+    let max_authn_age_ms = match var(&key("MAX_AUTHN_AGE")).filter(|v| !v.trim().is_empty()) {
+        Some(raw) => Some(users::parse_duration(&key("MAX_AUTHN_AGE"), &raw, 0)?),
+        None => None,
+    };
+    if force_authn && max_authn_age_ms.is_some() {
+        return Err(format!("{} already asks for a new sign-in every time, newer than any {}: remove one of them", key("FORCE_AUTHN"), key("MAX_AUTHN_AGE")));
+    }
+    Ok(saml_sp::Freshness { force_authn, max_authn_age_ms, idp_session_limit })
+}
+
 // Audit
 
 fn claim_details(d: &mut Value, c: &Claims) {
@@ -847,9 +903,10 @@ fn failed(a: &Auth, source: &Source, provider: &str, reason: &str, c: Option<&Cl
     a.record(Who { actor, source: source.clone() }.event("auth.login_failed").outcome(Outcome::Failure).details(d));
 }
 
-fn signed_in(a: &Auth, user: &User, s: &db::Session, provider: &str, c: &Claims, source: &Source) {
+fn signed_in(a: &Auth, user: &User, s: &db::Session, provider: &str, c: &Claims, lifetime: &Lifetime, source: &Source) {
     let mut d = json!({ "method": "sso", "provider": provider, "idp": idp_type(a, provider), "kind": s.kind, "label": s.label });
     claim_details(&mut d, c);
+    lifetime.details(&mut d);
     let who = Who { actor: users::actor(a, user, Some(s), "sso"), source: source.clone() };
     a.record(who.event("auth.login").target("session", &s.id).details(d));
 }
@@ -915,30 +972,15 @@ pub async fn start(
         r => r,
     };
     let label = users::clean_label(&json!(q.get("label")));
-    let pending = Pending { provider: id.clone(), nonce: nonce.clone(), verifier: verifier.clone(), ip, label, expires: at + PENDING_TTL_MS, ret: ret.clone(), name: None };
+    let forced = matches!(&p.kind, Kind::SamlSp { freshness, .. } if freshness.force_authn);
+    let pending = Pending { provider: id.clone(), nonce: nonce.clone(), verifier: verifier.clone(), ip, label, expires: at + PENDING_TTL_MS, ret: ret.clone(), name: None, requested: at, forced };
     if !sso.hold(&state, pending, at) {
         return no_store(ret.fail("sso_too_many"));
     }
     let mut url = Url::parse(&endpoint).expect("checked by secure_url");
-    if let Kind::SamlSp { sp_entity_id, sign_requests, authn_context, .. } = &p.kind {
-        let key = match (sign_requests, a.app.as_ref()) {
-            (false, _) => None,
-            (true, Some(app)) => match sp_key(app, p) {
-                Ok(k) => Some(k),
-                Err(e) => {
-                    crate::obs::log::log_warn!("SSO {id}: can't sign the AuthnRequest: {e}");
-                    return no_store(ret.fail("sso_failed"));
-                }
-            },
-            (true, None) => return no_store(ret.fail("sso_failed")),
-        };
-        let request = saml_sp::authn_request(&Sp { entity_id: sp_entity_id, acs: &sso.acs_url(&id) }, &nonce, &endpoint, at, authn_context.as_ref());
-        let query = saml_sp::redirect_query("SAMLRequest", &request, Some(&state), key.as_deref());
-        let mut res = see(&saml_sp::with_redirect_query(&endpoint, &query));
-        if matches!(ret, Return::Cookie { .. }) {
-            res.headers_mut().insert(header::SET_COOKIE, saml_binder_cookie(&binder, PENDING_TTL_MS / 1000));
-        }
-        return no_store(res);
+    if p.saml_sp() {
+        let binder = matches!(ret, Return::Cookie { .. }).then_some(binder.as_str());
+        return saml_redirect(&a, p, &endpoint, &nonce, &state, &ret, binder, forced, at);
     }
     url.query_pairs_mut().extend_pairs([
         ("client_id", p.client_id.as_str()),
@@ -958,6 +1000,34 @@ pub async fn start(
     let mut res = see(url.as_str());
     if matches!(ret, Return::Cookie { .. }) {
         res.headers_mut().insert(header::SET_COOKIE, binder_cookie(&binder, PENDING_TTL_MS / 1000));
+    }
+    no_store(res)
+}
+
+/// Native SAML: the browser off to the IdP with an AuthnRequest whose ID is `request_id` and
+/// whose RelayState is `state`, signed when the provider signs them, with `binder` set as a web
+/// sign-in's cookie. `force` asks the IdP to sign the person in again (ADR 0225).
+#[allow(clippy::too_many_arguments)]
+fn saml_redirect(a: &Auth, p: &Provider, endpoint: &str, request_id: &str, state: &str, ret: &Return, binder: Option<&str>, force: bool, at: i64) -> Response {
+    let Kind::SamlSp { sp_entity_id, sign_requests, authn_context, .. } = &p.kind else {
+        return no_store(ret.fail("sso_failed"));
+    };
+    let key = match (sign_requests, a.app.as_ref()) {
+        (false, _) => None,
+        (true, Some(app)) => match sp_key(app, p) {
+            Ok(k) => Some(k),
+            Err(e) => {
+                crate::obs::log::log_warn!("SSO {}: can't sign the AuthnRequest: {e}", p.id);
+                return no_store(ret.fail("sso_failed"));
+            }
+        },
+        (true, None) => return no_store(ret.fail("sso_failed")),
+    };
+    let request = saml_sp::authn_request(&Sp { entity_id: sp_entity_id, acs: &a.sso.acs_url(&p.id) }, request_id, endpoint, at, authn_context.as_ref(), force);
+    let query = saml_sp::redirect_query("SAMLRequest", &request, Some(state), key.as_deref());
+    let mut res = see(&saml_sp::with_redirect_query(endpoint, &query));
+    if let Some(b) = binder {
+        res.headers_mut().insert(header::SET_COOKIE, saml_binder_cookie(b, PENDING_TTL_MS / 1000));
     }
     no_store(res)
 }
@@ -1042,15 +1112,16 @@ async fn finish(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, q: &Ha
             return ret.fail(if matches!(e.0, "wrong_domain" | "email_unverified" | "wrong_org" | "not_brokered") { "sso_wrong_account" } else { "sso_failed" });
         }
     };
-    complete(a, app, source, id, p, &pending, claims, None, None, at).await
+    complete(a, app, source, id, p, &pending, claims, None, None, Lifetime::default(), at).await
 }
 
 /// The end of every sign-in, once the IdP vouched for `claims`: the linked (or just-in-time)
 /// user, if active, gets a session cookie, or a one-time code for the app that started.
 /// `saml` is a native SAML sign-in's NameID and IdP session, kept with the session, and
-/// `groups` the groups its assertion listed, which its role mappings follow (ADR 0160).
+/// `groups` the groups its assertion listed, which its role mappings follow (ADR 0160), and
+/// `lifetime` when its session must end (ADR 0225).
 #[allow(clippy::too_many_arguments)]
-async fn complete(a: &Auth, app: &AppState, source: &Source, id: &str, p: &Provider, pending: &Pending, mut claims: Claims, saml: Option<db::SamlLogin>, groups: Option<&saml_sp::Groups>, at: i64) -> Response {
+async fn complete(a: &Auth, app: &AppState, source: &Source, id: &str, p: &Provider, pending: &Pending, mut claims: Claims, saml: Option<db::SamlLogin>, groups: Option<&saml_sp::Groups>, lifetime: Lifetime, at: i64) -> Response {
     let (sso, ret) = (&a.sso, &pending.ret);
     if claims.name.is_none() {
         claims.name = pending.name.clone();
@@ -1072,18 +1143,19 @@ async fn complete(a: &Auth, app: &AppState, source: &Source, id: &str, p: &Provi
     match ret {
         Return::Cookie { .. } => {
             let label = pending.label.as_deref().or(Some("Web"));
-            let (s, token) = users::start_session(a, &user, "sso", Some((id, &claims.key())), None, true, label, source);
+            let (s, token) = users::start_session_ending(a, &user, "sso", Some((id, &claims.key())), None, true, label, source, lifetime.ends);
             if let Some(l) = &saml {
                 app.db.add_saml_session(&s.id, l);
             }
-            signed_in(a, &user, &s, id, &claims, source);
+            signed_in(a, &user, &s, id, &claims, &lifetime, source);
+            let max_age = lifetime.ends.map_or(a.sessions.max_ms, |e| (e - at).min(a.sessions.max_ms));
             let mut res = Html(signed_in_page(user.role)).into_response();
-            res.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&users::session_cookie(&token, a.sessions.max_ms)).unwrap());
+            res.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&users::session_cookie(&token, max_age)).unwrap());
             res
         }
         Return::App { redirect, challenge, state } => {
             let code = users::new_secret(HANDOFF_PREFIX);
-            let h = Handoff { user_id: user.id, provider: id.into(), claims, saml, challenge: challenge.clone(), label: pending.label.clone(), expires: at + HANDOFF_TTL_MS };
+            let h = Handoff { user_id: user.id, provider: id.into(), claims, saml, lifetime, challenge: challenge.clone(), label: pending.label.clone(), expires: at + HANDOFF_TTL_MS };
             let mut m = sso.handoffs.lock().unwrap_or_else(|e| e.into_inner());
             m.retain(|_, h| h.expires > at);
             if m.len() >= MAX_PENDING {
@@ -1098,9 +1170,14 @@ async fn complete(a: &Auth, app: &AppState, source: &Source, id: &str, p: &Provi
 /// `POST /api/auth/sso/{id}/acs`: the IdP posts its SAML response here (HTTP-POST binding).
 pub async fn acs(Extension(a): Extension<Arc<Auth>>, Extension(source): Extension<Source>, headers: HeaderMap, Path(id): Path<String>, Form(f): Form<HashMap<String, String>>) -> Response {
     let mut res = finish_saml(&a, &source, &headers, &id, &f).await;
-    let restarting = res.headers().get_all(header::SET_COOKIE).iter().any(|c| c.as_bytes().starts_with(SAML_RESTART.as_bytes()));
-    res.headers_mut().append(header::SET_COOKIE, saml_binder_cookie("", 0));
-    if !restarting {
+    let sets = |name: &str| res.headers().get_all(header::SET_COOKIE).iter().any(|c| c.as_bytes().starts_with(format!("{name}=").as_bytes()));
+    let restarting = sets(SAML_RESTART);
+    // Asked to sign in again (ADR 0225): the new binder stays, for the IdP's next answer.
+    let reauthenticating = sets(SAML_BINDER);
+    if !reauthenticating {
+        res.headers_mut().append(header::SET_COOKIE, saml_binder_cookie("", 0));
+    }
+    if !restarting && !reauthenticating {
         res.headers_mut().append(header::SET_COOKIE, saml_restart_cookie("", 0));
     }
     no_store(res)
@@ -1240,7 +1317,81 @@ async fn finish_saml(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, f
             }
         }
     }
-    complete(a, app, source, id, p, &pending, claims, Some(checked.login), Some(&checked.groups), at).await
+    // Last before anyone is made just in time: a sign-in recent enough, in an IdP session that
+    // hasn't ended (ADR 0225). Otherwise the IdP is asked once to sign the person in again.
+    let freshness = match &p.kind {
+        Kind::SamlSp { freshness, .. } => freshness.clone(),
+        _ => saml_sp::Freshness::default(),
+    };
+    let since = freshness.authn_since(pending.requested, pending.forced, at);
+    let ends = saml_sp::idp_session_end(checked.idp_session_ends, freshness.idp_session_limit, at);
+    let stale = if !saml_sp::authn_fresh(checked.authn_instant, since, at) {
+        Some("stale_authn")
+    } else if ends.is_err() {
+        Some("idp_session_ended")
+    } else {
+        None
+    };
+    if let Some(reason) = stale {
+        let extra = json!({ "authnInstant": checked.authn_instant, "authnSince": since, "idpSessionEnds": checked.idp_session_ends, "forceAuthn": pending.forced });
+        if !pending.forced {
+            reauthn_asked(a, source, id, reason, &claims, extra);
+            return reauthenticate(a, p, &pending, at).await;
+        }
+        a.limiter.fail(&ip, at);
+        failed(a, source, id, reason, Some(&claims), extra);
+        return ret.fail("sso_reauth_required");
+    }
+    let lifetime = Lifetime { authn_instant: checked.authn_instant, ends: ends.ok().flatten(), forced: pending.forced };
+    complete(a, app, source, id, p, &pending, claims, Some(checked.login), Some(&checked.groups), lifetime, at).await
+}
+
+/// `auth.saml_reauthn`: a sign-in's answer was too old, or its IdP session had ended, so the
+/// IdP is asked to sign the person in again (ADR 0225).
+fn reauthn_asked(a: &Auth, source: &Source, id: &str, reason: &str, claims: &Claims, extra: Value) {
+    let mut d = json!({ "method": "sso", "provider": id, "idp": "saml", "reason": reason, "outcome": "asked_again" });
+    claim_details(&mut d, claims);
+    if let (Value::Object(d), Value::Object(e)) = (&mut d, extra) {
+        d.extend(e);
+    }
+    let actor = Actor { kind: ActorKind::User, subject: Some(claims.key()), method: Some("sso".into()), idp: Some("saml".into()), idp_provider: Some(id.into()), ..Default::default() };
+    a.record(Who { actor, source: source.clone() }.event("auth.saml_reauthn").target("sso_provider", id).details(d));
+}
+
+/// Sends the browser (or the app's) that started `pending` back to the IdP with a new
+/// AuthnRequest asking for `ForceAuthn`, under a new state and binder. Its answer is held to
+/// that request, and isn't asked again.
+async fn reauthenticate(a: &Auth, p: &Provider, pending: &Pending, at: i64) -> Response {
+    let endpoint = match p.authorization_endpoint(a.sso.http(), a.sso.refresh_gap).await {
+        Ok(e) => e,
+        Err(e) => {
+            crate::obs::log::log_warn!("SSO {}: discovery failed: {e}", p.id);
+            return pending.ret.fail("sso_failed");
+        }
+    };
+    let (state, binder) = (random(), random());
+    let ret = match &pending.ret {
+        Return::Cookie { .. } => Return::Cookie { binder: hash(&binder) },
+        r => r.clone(),
+    };
+    let request_id = saml_sp::request_id();
+    let again = Pending {
+        provider: pending.provider.clone(),
+        nonce: request_id.clone(),
+        verifier: random(),
+        ip: pending.ip.clone(),
+        label: pending.label.clone(),
+        expires: at + PENDING_TTL_MS,
+        ret: ret.clone(),
+        name: None,
+        requested: at,
+        forced: true,
+    };
+    if !a.sso.hold(&state, again, at) {
+        return ret.fail("sso_too_many");
+    }
+    let binder = matches!(ret, Return::Cookie { .. }).then_some(binder.as_str());
+    saml_redirect(a, p, &endpoint, &request_id, &state, &ret, binder, true, at)
 }
 
 /// A post that answers no sign-in this server holds. Refused as `unknown_state`, unless the
@@ -1688,7 +1839,7 @@ fn saml_provider<'a>(a: &'a Auth, id: &str) -> Result<&'a Arc<Provider>, ApiErro
 }
 
 fn saml_view(a: &Auth, p: &Provider) -> Value {
-    let Kind::SamlSp { entity_id, sp_entity_id, source, attributes, required_groups, sign_requests, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, .. } = &p.kind else {
+    let Kind::SamlSp { entity_id, sp_entity_id, source, attributes, required_groups, sign_requests, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, freshness, .. } = &p.kind else {
         return json!({});
     };
     let now = db::now();
@@ -1756,6 +1907,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
         "roleMappings": a.app.as_ref().map(|app| app.db.saml_role_mappings_of(&p.id).len()),
         "idpInitiated": idp_initiated.as_str(),
         "authnContext": authn_context.as_ref().map(|c| json!({ "required": c.accepted, "methodsAttribute": attributes.authn_methods, "requested": c.request })),
+        "forceAuthn": freshness.force_authn, "maxAuthnAgeSeconds": freshness.max_authn_age_ms.map(|ms| ms / 1000), "idpSessionLimit": freshness.idp_session_limit,
         "certificateWarnings": a.app.as_ref().map_or_else(Vec::new, |app| saml_expiry::warnings(app, p, now)),
     })
 }
@@ -1884,7 +2036,8 @@ pub fn redeem(a: &Auth, source: Source, code: &str, verifier: &str, cookie: bool
     let mut handoffs = a.sso.handoffs.lock().unwrap_or_else(|e| e.into_inner());
     // Taken out first, so a wrong verifier spends the code too.
     let h = handoffs.remove(&hash(code));
-    let h = h.filter(|h| h.expires > at && crate::same(s256(verifier).as_bytes(), h.challenge.as_bytes()));
+    // A code outliving the IdP's session limit (ADR 0225) makes no session.
+    let h = h.filter(|h| h.expires > at && h.lifetime.ends.is_none_or(|e| e > at) && crate::same(s256(verifier).as_bytes(), h.challenge.as_bytes()));
     // Looked up again: an admin may have unlinked the identity or disabled the user since.
     let found = h.and_then(|h| {
         let (_, user) = app.db.identity(&h.claims.issuer, &h.claims.subject)?;
@@ -1897,12 +2050,12 @@ pub fn redeem(a: &Auth, source: Source, code: &str, verifier: &str, cookie: bool
         return ApiError(StatusCode::UNAUTHORIZED, "That sign-in expired or was already used. Try again.".into()).into_response();
     };
     let label = label.or(h.label.as_deref());
-    let (s, token) = users::start_session(a, &user, "sso", Some((&h.provider, &h.claims.key())), None, cookie, label, &source);
+    let (s, token) = users::start_session_ending(a, &user, "sso", Some((&h.provider, &h.claims.key())), None, cookie, label, &source, h.lifetime.ends);
     if let Some(l) = &h.saml {
         app.db.add_saml_session(&s.id, l);
     }
     drop(handoffs);
-    signed_in(a, &user, &s, &h.provider, &h.claims, &source);
+    signed_in(a, &user, &s, &h.provider, &h.claims, &h.lifetime, &source);
     users::session_response(a, &user, &s, &token)
 }
 
@@ -2341,8 +2494,8 @@ mod tests {
         let p = s.provider("corp").unwrap();
         assert!(p.saml_sp() && !p.oidc() && !p.needs_secret());
         assert_eq!((p.type_name(), p.jit_role), ("saml", None), "audited as idp=saml, like the bridge");
-        assert!(matches!(&p.kind, Kind::SamlSp { entity_id, sp_entity_id, source: IdpSource::Saved, attributes, required_groups, allowed_domains, sign_requests: false, sp_cert: None, encryption: Encryption::Off, aes_cbc: AesCbc::Off, enc_cert: None, metadata_trust: None, idp_initiated: IdpInitiated::Off, authn_context: None }
-            if entity_id == ADFS && sp_entity_id == "https://bot.example.com/api/auth/sso/corp/metadata" && attributes.email.is_none() && attributes.groups.is_none() && required_groups.is_empty() && allowed_domains.is_empty()));
+        assert!(matches!(&p.kind, Kind::SamlSp { entity_id, sp_entity_id, source: IdpSource::Saved, attributes, required_groups, allowed_domains, sign_requests: false, sp_cert: None, encryption: Encryption::Off, aes_cbc: AesCbc::Off, enc_cert: None, metadata_trust: None, idp_initiated: IdpInitiated::Off, authn_context: None, freshness }
+            if *freshness == saml_sp::Freshness::default() && entity_id == ADFS && sp_entity_id == "https://bot.example.com/api/auth/sso/corp/metadata" && attributes.email.is_none() && attributes.groups.is_none() && required_groups.is_empty() && allowed_domains.is_empty()));
         assert_eq!((p.env_var(), s.slo_url("corp")), ("SSO_CORP_PRIVATE_KEY".to_string(), "https://bot.example.com/api/auth/sso/corp/slo".to_string()));
         assert_eq!(s.callback_url("corp"), "https://bot.example.com/api/auth/sso/corp/acs");
         assert!(p.not_ready().unwrap().contains("botctl sso saml corp import"), "not offered until its metadata is imported");
@@ -2455,6 +2608,36 @@ mod tests {
         assert!(e.contains("SSO_CORP_AUTHN_METHODS_ATTRIBUTE needs SSO_CORP_AUTHN_CONTEXT"), "{e}");
         assert!(saml(&[("SSO_ADFS_AUTHN_CONTEXT", MFA)]).is_err(), "native only: the broker decides how people sign in");
         assert!(entra(&[("SSO_ENTRA_AUTHN_CONTEXT", MFA)]).is_err(), "SAML only");
+    }
+
+    #[test]
+    fn reads_how_fresh_a_sign_in_must_be_and_refuses_unclear_settings() {
+        let freshness = |s: &Sso| match &s.providers[0].kind {
+            Kind::SamlSp { freshness, .. } => freshness.clone(),
+            _ => unreachable!(),
+        };
+        let f = freshness(&native(&[]).unwrap());
+        assert_eq!(f, saml_sp::Freshness { force_authn: false, max_authn_age_ms: None, idp_session_limit: true }, "the IdP's session limit holds by default");
+        assert!(freshness(&native(&[("SSO_CORP_FORCE_AUTHN", "True")]).unwrap()).force_authn);
+        assert_eq!(freshness(&native(&[("SSO_CORP_MAX_AUTHN_AGE", "8h")]).unwrap()).max_authn_age_ms, Some(8 * 3_600_000));
+        assert_eq!(freshness(&native(&[("SSO_CORP_MAX_AUTHN_AGE", " ")]).unwrap()).max_authn_age_ms, None, "empty is unset, not zero");
+        assert!(!freshness(&native(&[("SSO_CORP_IDP_SESSION_LIMIT", "OFF")]).unwrap()).idp_session_limit);
+        for (vars, why) in [
+            (vec![("SSO_CORP_FORCE_AUTHN", "yes")], "not true or false"),
+            (vec![("SSO_CORP_IDP_SESSION_LIMIT", "false")], "not on or off"),
+            (vec![("SSO_CORP_MAX_AUTHN_AGE", "1m")], "shorter than a sign-in takes"),
+            (vec![("SSO_CORP_MAX_AUTHN_AGE", "8 hours")], "not a duration"),
+            (vec![("SSO_CORP_MAX_AUTHN_AGE", "400d")], "longer than a year"),
+        ] {
+            assert!(native(&vars).is_err(), "{why}");
+        }
+        let e = native(&[("SSO_CORP_FORCE_AUTHN", "true"), ("SSO_CORP_MAX_AUTHN_AGE", "1h")]).err().unwrap();
+        assert!(e.contains("SSO_CORP_FORCE_AUTHN already asks for a new sign-in every time") && e.contains("remove one of them"), "{e}");
+        for k in ["FORCE_AUTHN", "MAX_AUTHN_AGE", "IDP_SESSION_LIMIT"] {
+            let v = if k == "MAX_AUTHN_AGE" { "1h" } else if k == "IDP_SESSION_LIMIT" { "off" } else { "true" };
+            assert!(saml(&[(format!("SSO_ADFS_{k}").leak(), v)]).is_err(), "{k}: native only, the broker keeps its own session");
+            assert!(entra(&[(format!("SSO_ENTRA_{k}").leak(), v)]).is_err(), "{k}: SAML only");
+        }
     }
 
     #[test]
@@ -2714,7 +2897,7 @@ mod tests {
     #[test]
     fn pending_sign_ins_are_single_use_expire_and_are_capped_per_ip() {
         let s = Sso::default();
-        let p = |ip: &str, expires| Pending { provider: "entra".into(), nonce: "n".into(), verifier: "v".into(), ip: ip.into(), label: None, expires, ret: Return::Cookie { binder: String::new() }, name: None };
+        let p = |ip: &str, expires| Pending { provider: "entra".into(), nonce: "n".into(), verifier: "v".into(), ip: ip.into(), label: None, expires, ret: Return::Cookie { binder: String::new() }, name: None, requested: 0, forced: false };
         assert!(s.hold("s1", p("1.1.1.1", 100), 0));
         assert!(s.take("s1", 50).is_some());
         assert!(s.take("s1", 50).is_none(), "replayed");

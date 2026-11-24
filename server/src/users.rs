@@ -383,7 +383,15 @@ fn session_view(s: &Session, cfg: &SessionConfig) -> Value {
 /// `issuer|subject` for SSO sign-ins; `mfa` the second factor a local sign-in passed.
 #[allow(clippy::too_many_arguments)]
 pub fn start_session(a: &Auth, user: &User, method: &str, idp: Option<(&str, &str)>, mfa: Option<&str>, cookie: bool, label: Option<&str>, source: &Source) -> (Session, String) {
+    start_session_ending(a, user, method, idp, mfa, cookie, label, source, None)
+}
+
+/// `start_session`, ending by `ends` when that's sooner than `SESSION_MAX_AGE`: the session
+/// limit a native SAML IdP set (ADR 0225).
+#[allow(clippy::too_many_arguments)]
+pub fn start_session_ending(a: &Auth, user: &User, method: &str, idp: Option<(&str, &str)>, mfa: Option<&str>, cookie: bool, label: Option<&str>, source: &Source, ends: Option<i64>) -> (Session, String) {
     let token = new_secret(SESSION_PREFIX);
+    let max = db::now() + a.sessions.max_ms;
     let app = a.app.as_ref().expect("sessions need the database");
     let new_network = crate::signin_watch::new_network(a, user, source);
     let s = app.db.create_session(&NewSession {
@@ -396,7 +404,7 @@ pub fn start_session(a: &Auth, user: &User, method: &str, idp: Option<(&str, &st
         label,
         ip: source.ip.as_deref(),
         user_agent: source.user_agent.as_deref(),
-        expires_at: db::now() + a.sessions.max_ms,
+        expires_at: ends.map_or(max, |e| e.min(max)),
         mfa,
     });
     crate::signin_watch::succeeded(a, source, &user.id, method, new_network, Some(&s.id));

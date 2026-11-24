@@ -44,7 +44,7 @@ const AUDIT_WARN: u64 = 10;
 /// The reason codes only SAML sign-in gives (runbook-saml.md's reasons table). Codes both
 /// runbooks have (`not_linked`, `idp_error`, `wrong_audience`, `unknown_state`) go to the
 /// sign-in one, and to the SAML one too when the failures were SAML sign-ins.
-pub const SAML_REASONS: [&str; 14] = [
+pub const SAML_REASONS: [&str; 16] = [
     "authn_context",
     "bad_encryption",
     "bad_signature",
@@ -52,8 +52,10 @@ pub const SAML_REASONS: [&str; 14] = [
     "encrypted_assertion",
     "expired",
     "idp_initiated_loop",
+    "idp_session_ended",
     "in_response_to_mismatch",
     "not_yet_valid",
+    "stale_authn",
     "transient_subject",
     "unsigned",
     "weak_algorithm",
@@ -677,7 +679,7 @@ fn audit_rules(audit: &Value, out: &mut Vec<Finding>) {
         let g = groups.entry(key).or_insert_with(|| Group { what, book, actions: BTreeMap::new(), reasons: BTreeMap::new(), saml: false });
         let n = g.actions.entry(clean(action)).or_default();
         *n = n.saturating_add(bad);
-        g.saml |= action.starts_with("sso.saml") || action.starts_with("auth.slo") || action == "auth.saml_idp_initiated";
+        g.saml |= action.starts_with("sso.saml") || action.starts_with("auth.slo") || action == "auth.saml_idp_initiated" || action == "auth.saml_reauthn";
     }
     for p in audit["recentProblems"].as_array().into_iter().flatten() {
         let Some(action) = str_at(p, "action") else { continue };
