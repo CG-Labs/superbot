@@ -695,6 +695,7 @@ fn caller(a: &Auth, s: &Settings) -> Caller {
         expires_at: None,
         rotated_to: None,
         expiry_notice: None,
+        scopes: super::scopes::Scopes::ALL,
     };
     let actor = Actor {
         kind: ActorKind::System,
