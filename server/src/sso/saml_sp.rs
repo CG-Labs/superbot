@@ -40,7 +40,9 @@
 //!
 //! With a provider's SP key (ADR 0137), AuthnRequests can be signed with the HTTP-Redirect
 //! binding's query signature, and our metadata publishes the key's certificate. The key may
-//! be ECDSA when it's configured (ADR 0151); generated ones are RSA.
+//! be ECDSA when it's configured (ADR 0151); generated ones are RSA. AuthnRequests may go over
+//! HTTP-POST instead (ADR 0235), signed inside the message, when the IdP's metadata offers
+//! only that or the provider asks for it.
 //!
 //! IdP metadata can be held to a signature by a configured certificate (ADR 0151): see
 //! `load_idp_metadata`.
@@ -210,12 +212,59 @@ impl Groups {
     }
 }
 
+/// How a native provider sends AuthnRequests (`SSO_<ID>_REQUEST_BINDING`, ADR 0235). Auto:
+/// HTTP-Redirect when the IdP's metadata offers it, else HTTP-POST. Redirect or Post: only
+/// that one, and metadata without it is refused.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum RequestBinding {
+    #[default]
+    Auto,
+    Redirect,
+    Post,
+}
+
+impl RequestBinding {
+    pub fn parse(s: &str) -> Option<RequestBinding> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" => Some(RequestBinding::Auto),
+            "redirect" => Some(RequestBinding::Redirect),
+            "post" => Some(RequestBinding::Post),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RequestBinding::Auto => "auto",
+            RequestBinding::Redirect => "redirect",
+            RequestBinding::Post => "post",
+        }
+    }
+}
+
+/// The binding AuthnRequests go to the IdP's SingleSignOnService over.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Binding {
+    Redirect,
+    Post,
+}
+
+impl Binding {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Binding::Redirect => "redirect",
+            Binding::Post => "post",
+        }
+    }
+}
+
 /// What we need from the IdP's metadata.
 #[derive(Debug)]
 pub struct IdpMetadata {
     pub entity_id: String,
-    /// The HTTP-Redirect SingleSignOnService.
+    /// The SingleSignOnService AuthnRequests go to, over `sso_binding`.
     pub sso_url: String,
+    pub sso_binding: Binding,
     pub certs: Vec<Cert>,
     /// The HTTP-Redirect SingleLogoutService on https, if it has one: single logout is on.
     pub slo: Option<Slo>,
@@ -288,7 +337,7 @@ impl std::fmt::Display for MetadataRefused {
 /// `load_idp_metadata` without a trust anchor, for tests that don't care about one.
 #[cfg(test)]
 pub fn parse_idp_metadata(xml: &str, entity_id: &str, signs_requests: bool) -> Result<IdpMetadata, String> {
-    load_idp_metadata(xml, entity_id, signs_requests, None, 0).map_err(|e| e.message)
+    load_idp_metadata(xml, entity_id, signs_requests, RequestBinding::Auto, None, 0).map_err(|e| e.message)
 }
 
 /// The text of an element, all of it: a comment inside doesn't cut it short. Exclusive C14N
@@ -328,10 +377,10 @@ fn check_signed(root: Node, entity: Node, t: &MetadataTrust, now_ms: i64) -> Res
 
 /// The IdP `entity_id` in `xml` (an `EntityDescriptor`, or one inside `EntitiesDescriptor`).
 /// `signs_requests`: this provider signs its AuthnRequests (`SIGN_REQUESTS`), so an IdP that
-/// wants them signed is fine. With `trust` (ADR 0151), only metadata signed by its
-/// certificate, and not expired at `now_ms`, is read (`check_signed`). The message says what
-/// to fix, for the admin who set it up.
-pub fn load_idp_metadata(xml: &str, entity_id: &str, signs_requests: bool, trust: Option<&MetadataTrust>, now_ms: i64) -> Result<IdpMetadata, MetadataRefused> {
+/// wants them signed is fine. `binding` picks the SingleSignOnService (ADR 0235). With `trust`
+/// (ADR 0151), only metadata signed by its certificate, and not expired at `now_ms`, is read
+/// (`check_signed`). The message says what to fix, for the admin who set it up.
+pub fn load_idp_metadata(xml: &str, entity_id: &str, signs_requests: bool, binding: RequestBinding, trust: Option<&MetadataTrust>, now_ms: i64) -> Result<IdpMetadata, MetadataRefused> {
     if xml.len() > MAX_METADATA {
         return Err(MetadataRefused::bad("the metadata is over 1 MB"));
     }
@@ -345,11 +394,11 @@ pub fn load_idp_metadata(xml: &str, entity_id: &str, signs_requests: bool, trust
     if let Some(t) = trust {
         check_signed(doc.root_element(), entity, t, now_ms).map_err(|e| MetadataRefused { message: format!("the metadata can't be trusted: {}", e.message), ..e })?;
     }
-    read_idp(entity, entity_id, signs_requests).map_err(MetadataRefused::bad)
+    read_idp(entity, entity_id, signs_requests, binding).map_err(MetadataRefused::bad)
 }
 
 /// What we need from the IdP's `EntityDescriptor`.
-fn read_idp(entity: Node, entity_id: &str, signs_requests: bool) -> Result<IdpMetadata, String> {
+fn read_idp(entity: Node, entity_id: &str, signs_requests: bool, binding: RequestBinding) -> Result<IdpMetadata, String> {
     let idp = elements(entity)
         .into_iter()
         .find(|n| is(*n, METADATA, "IDPSSODescriptor") && n.attribute("protocolSupportEnumeration").is_some_and(|p| p.split_ascii_whitespace().any(|p| p == PROTOCOL)))
@@ -357,13 +406,14 @@ fn read_idp(entity: Node, entity_id: &str, signs_requests: bool) -> Result<IdpMe
     if idp.attribute("WantAuthnRequestsSigned") == Some("true") && !signs_requests {
         return Err("the IdP wants signed AuthnRequests: set SSO_<ID>_SIGN_REQUESTS=true for this provider, or turn that off for this app at the IdP".into());
     }
-    let sso_url = elements(idp)
-        .into_iter()
-        .find(|n| is(*n, METADATA, "SingleSignOnService") && n.attribute("Binding") == Some(REDIRECT))
-        .and_then(|n| n.attribute("Location"))
-        .ok_or("the metadata has no HTTP-Redirect SingleSignOnService")?
-        .trim()
-        .to_string();
+    let sso = |b: &str| elements(idp).into_iter().find(|n| is(*n, METADATA, "SingleSignOnService") && n.attribute("Binding") == Some(b)).and_then(|n| n.attribute("Location")).map(|l| l.trim().to_string());
+    let (sso_url, sso_binding) = match (binding, sso(REDIRECT), sso(POST)) {
+        (RequestBinding::Auto | RequestBinding::Redirect, Some(url), _) => (url, Binding::Redirect),
+        (RequestBinding::Auto | RequestBinding::Post, _, Some(url)) => (url, Binding::Post),
+        (RequestBinding::Auto, None, None) => return Err("the metadata has no HTTP-Redirect or HTTP-POST SingleSignOnService".into()),
+        (RequestBinding::Redirect, None, _) => return Err("the metadata has no HTTP-Redirect SingleSignOnService: set SSO_<ID>_REQUEST_BINDING=auto or post for this provider".into()),
+        (RequestBinding::Post, _, None) => return Err("the metadata has no HTTP-POST SingleSignOnService: set SSO_<ID>_REQUEST_BINDING=auto or redirect for this provider".into()),
+    };
     if !super::secure_url(&sso_url) {
         return Err(format!("the SingleSignOnService {sso_url} isn't https"));
     }
@@ -389,7 +439,7 @@ fn read_idp(entity: Node, entity_id: &str, signs_requests: bool) -> Result<IdpMe
         .filter_map(|n| n.attribute("Location").map(str::trim))
         .find(|l| super::secure_url(l))
         .map(String::from);
-    Ok(IdpMetadata { entity_id: entity_id.into(), sso_url, certs, slo, slo_soap })
+    Ok(IdpMetadata { entity_id: entity_id.into(), sso_url, sso_binding, certs, slo, slo_soap })
 }
 
 /// Whether a native provider takes encrypted assertions (`SSO_<ID>_ENCRYPTED_ASSERTIONS`,
@@ -683,6 +733,33 @@ pub fn redirect_query(param: &str, xml: &str, relay: Option<&str>, key: Option<&
         q += &format!("&Signature={}", form(&sig));
     }
     q
+}
+
+/// The one script a POST binding page runs. `post_csp` allows only it, by hash.
+const POST_SCRIPT: &str = "document.forms[0].submit()";
+
+/// An HTTP-POST binding message (SAML Bindings 3.5.4): a page whose form posts `param`
+/// (`SAMLRequest`) with `xml` base64 encoded (not DEFLATEd), and RelayState, to `url`. Script
+/// submits it on load; without script, a button does. A signed message carries its signature
+/// inside `xml`: this binding has no signed query.
+pub fn post_form(url: &str, param: &str, xml: &str, relay: Option<&str>) -> String {
+    let relay = relay.map(|r| format!(r#"<input type="hidden" name="RelayState" value="{}">"#, escape(r))).unwrap_or_default();
+    format!(
+        r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>SuperBot</title><form method="post" action="{}"><input type="hidden" name="{param}" value="{}">{relay}<noscript><p>Continue to your organization's sign-in page.</p><button type="submit">Continue</button></noscript></form><script>{POST_SCRIPT}</script>"#,
+        escape(url),
+        STANDARD.encode(xml)
+    )
+}
+
+/// The Content-Security-Policy of a `post_form` page to `url`: nothing loads, only its script
+/// runs, and the form goes only to https (or http, for an IdP on loopback, which `secure_url`
+/// allows). Not to the IdP's origin alone: browsers hold the redirects after the post to
+/// `form-action` too, and IdPs send the browser on to their login pages.
+pub fn post_csp(url: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = STANDARD.encode(Sha256::digest(POST_SCRIPT.as_bytes()));
+    let to = if url.starts_with("http:") { "https: http:" } else { "https:" };
+    format!("default-src 'none'; script-src 'sha256-{hash}'; form-action {to}; base-uri 'none'; frame-ancestors 'none'")
 }
 
 /// `base` with `query` after any query it has.
@@ -1510,7 +1587,7 @@ pub(crate) mod tests {
         for (xml, want) in [
             (metadata_with(IDP, &[], ""), "no signing certificate"),
             (metadata_with(IDP, &[a], r#" WantAuthnRequestsSigned="true""#), "signed AuthnRequests"),
-            (metadata().replace(&format!(r#"Binding="{REDIRECT}""#), r#"Binding="urn:x""#), "no HTTP-Redirect"),
+            (metadata().replace(&format!(r#"Binding="{REDIRECT}""#), r#"Binding="urn:x""#).replace(&format!(r#"Binding="{POST}""#), r#"Binding="urn:x""#), "no HTTP-Redirect or HTTP-POST"),
             (metadata().replace(SSO_URL, "http://idp.example/sso"), "isn't https"),
             (metadata().replace(PROTOCOL, "urn:oasis:names:tc:SAML:1.1:protocol"), "no SAML 2.0"),
             (format!(r#"<!DOCTYPE x [<!ENTITY e SYSTEM "file:///etc/passwd">]>{}"#, metadata().replace(r#"<?xml version="1.0"?>"#, "")), "no DTDs"),
@@ -1634,6 +1711,62 @@ pub(crate) mod tests {
         }
         assert_eq!(with_redirect_query("https://idp.example/sso", "a=1"), "https://idp.example/sso?a=1");
         assert_eq!(with_redirect_query("https://idp.example/sso?app=2", "a=1"), "https://idp.example/sso?app=2&a=1");
+    }
+
+    #[test]
+    fn the_request_binding_picks_the_single_sign_on_service() {
+        let load = |xml: &str, b: RequestBinding| load_idp_metadata(xml, IDP, false, b, None, 0).map_err(|e| e.message);
+        let post = format!("{SSO_URL}/post");
+        let post_only = metadata().replace(&format!(r#"<md:SingleSignOnService Binding="{REDIRECT}" Location="{SSO_URL}"/>"#), "");
+        let redirect_only = metadata().replace(&format!(r#"<md:SingleSignOnService Binding="{POST}" Location="{post}"/>"#), "");
+        assert!(!post_only.contains(REDIRECT) && !redirect_only.contains(POST));
+        let picked = |xml: &str, b| load(xml, b).map(|m| (m.sso_url, m.sso_binding));
+        assert_eq!(picked(&metadata(), RequestBinding::Auto), Ok((SSO_URL.into(), Binding::Redirect)), "redirect first, as before");
+        assert_eq!(picked(&post_only, RequestBinding::Auto), Ok((post.clone(), Binding::Post)), "an IdP with only POST");
+        assert_eq!(picked(&metadata(), RequestBinding::Post), Ok((post.clone(), Binding::Post)));
+        assert_eq!(picked(&metadata(), RequestBinding::Redirect), Ok((SSO_URL.into(), Binding::Redirect)));
+        assert_eq!(picked(&redirect_only, RequestBinding::Auto), Ok((SSO_URL.into(), Binding::Redirect)));
+        let err = load(&post_only, RequestBinding::Redirect).unwrap_err();
+        assert!(err.contains("no HTTP-Redirect SingleSignOnService: set SSO_<ID>_REQUEST_BINDING=auto or post"), "{err}");
+        let err = load(&redirect_only, RequestBinding::Post).unwrap_err();
+        assert!(err.contains("no HTTP-POST SingleSignOnService: set SSO_<ID>_REQUEST_BINDING=auto or redirect"), "{err}");
+        let err = load(&post_only.replace(&post, "http://idp.example/sso/post"), RequestBinding::Auto).unwrap_err();
+        assert!(err.contains("isn't https"), "{err}");
+        assert_eq!(load(&post_only.replace(&post, "http://localhost:8080/sso/post"), RequestBinding::Auto).map(|m| m.sso_binding), Ok(Binding::Post), "loopback, as for every IdP URL");
+        assert_eq!([RequestBinding::parse("AUTO"), RequestBinding::parse("redirect"), RequestBinding::parse("Post"), RequestBinding::parse("artifact")], [Some(RequestBinding::Auto), Some(RequestBinding::Redirect), Some(RequestBinding::Post), None]);
+        assert_eq!(RequestBinding::default(), RequestBinding::Auto);
+    }
+
+    #[test]
+    fn post_messages_carry_the_request_signed_inside() {
+        let (key, _) = SpKey::generate("sp").unwrap();
+        let xml = authn_request(&Sp { entity_id: SP, acs: ACS }, REQ, SSO_URL, NOW, None, true);
+        let signed = key.sign_enveloped(&xml, REQ).unwrap();
+        let doc = roxmltree::Document::parse(&signed).unwrap();
+        let root = doc.root_element();
+        let order: Vec<&str> = elements(root).iter().map(|n| n.tag_name().name()).collect();
+        assert_eq!(order, ["Issuer", "Signature", "NameIDPolicy"], "the signature after the Issuer, as the schema says");
+        assert_eq!(xmldsig::verify_enveloped(root, std::slice::from_ref(&key.info)), Ok(true), "verifies as an IdP would");
+        assert!(xmldsig::verify_enveloped(root, &[signers()[0].cert()]).is_err(), "someone else's key");
+        let changed = signed.replace(r#"ForceAuthn="true""#, r#"ForceAuthn="false""#);
+        assert!(xmldsig::verify_enveloped(roxmltree::Document::parse(&changed).unwrap().root_element(), std::slice::from_ref(&key.info)).is_err(), "ForceAuthn is inside the signature");
+
+        let page = post_form("https://idp.example/sso/post?app=1&x=2", "SAMLRequest", &signed, Some(r#"st"ate<"#));
+        let value = |name: &str| page.split(&format!(r#"name="{name}" value=""#)).nth(1).map(|v| v.split('"').next().unwrap().to_string());
+        assert_eq!(STANDARD.decode(value("SAMLRequest").unwrap()).map(String::from_utf8), Ok(Ok(signed.clone())), "base64, not DEFLATEd");
+        assert_eq!(value("RelayState").as_deref(), Some("st&quot;ate&lt;"), "escaped");
+        assert!(page.contains(r#"<form method="post" action="https://idp.example/sso/post?app=1&amp;x=2">"#), "{page}");
+        assert!(page.contains("<noscript>") && page.contains(r#"<button type="submit">"#), "works without script");
+        assert!(!post_form(SSO_URL, "SAMLRequest", &xml, None).contains("RelayState"));
+
+        // Only the page's own script runs, and the form goes nowhere but https.
+        use sha2::{Digest, Sha256};
+        let (scripts, script) = (page.matches("<script").count(), page.split("<script>").nth(1).unwrap().split("</script>").next().unwrap());
+        let csp = post_csp(SSO_URL);
+        assert_eq!(scripts, 1);
+        assert!(csp.contains(&format!("script-src 'sha256-{}';", STANDARD.encode(Sha256::digest(script.as_bytes())))), "{csp}");
+        assert!(csp.starts_with("default-src 'none';") && csp.contains("form-action https:;") && csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(post_csp("http://localhost:8080/sso").contains("form-action https: http:;"), "a loopback IdP");
     }
 
     #[test]
@@ -2384,7 +2517,7 @@ pub(crate) mod tests {
     }
 
     fn load(xml: &str, t: &MetadataTrust) -> Result<IdpMetadata, &'static str> {
-        load_idp_metadata(xml, IDP, false, Some(t), NOW).map_err(|e| e.reason)
+        load_idp_metadata(xml, IDP, false, RequestBinding::Auto, Some(t), NOW).map_err(|e| e.reason)
     }
 
     #[test]
@@ -2411,7 +2544,7 @@ pub(crate) mod tests {
         assert_eq!(load(&commented, &required).unwrap().certs[0].sha256, signers()[0].cert().sha256);
         let sha1 = signed.replace(xmldsig::RSA_SHA256, "http://www.w3.org/2000/09/xmldsig#rsa-sha1");
         assert_eq!(load(&sha1, &required).unwrap_err(), "weak_algorithm");
-        assert_eq!(load_idp_metadata(&metadata(), IDP, false, Some(&required), NOW).unwrap_err().message, "the metadata can't be trusted: it isn't signed, and signed metadata is required");
+        assert_eq!(load_idp_metadata(&metadata(), IDP, false, RequestBinding::Auto, Some(&required), NOW).unwrap_err().message, "the metadata can't be trusted: it isn't signed, and signed metadata is required");
     }
 
     #[test]
