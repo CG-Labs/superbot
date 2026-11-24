@@ -13,7 +13,7 @@ use crate::*;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const FILES: [&str; 10] = ["README.txt", "access-review.json", "changes.json", "backups.json", "retention.json", "sign-ins-and-alerts.json", "audit-summary.json", "baseline.json", "manifest.json", "SHA256SUMS"];
+const FILES: [&str; 11] = ["README.txt", "access-review.json", "changes.json", "backups.json", "retention.json", "sign-ins-and-alerts.json", "audit-summary.json", "baseline.json", "audit-integrity.json", "manifest.json", "SHA256SUMS"];
 
 /// A `GET`'s status, response head and body bytes.
 async fn fetch(port: u16, path: &str, auth: &str) -> (u16, String, Vec<u8>) {
@@ -389,4 +389,91 @@ async fn a_month_already_past_retention_is_never_written() {
     let f = audit::Filter { actions: vec!["evidence.*".into()], ..Default::default() };
     let actions: Vec<String> = app.db.audit_events(&f, 10, true).into_iter().map(|e| e.action).collect();
     assert_eq!(actions, [evidence::CREATED, evidence::PRUNED], "once each, not every hour");
+}
+
+fn listed(manifest: &Value, name: &str) -> (Value, Value) {
+    let x = manifest["files"].as_array().unwrap().iter().find(|x| x["name"] == name).cloned().unwrap();
+    (x["criteria"].clone(), x["checklist"].clone())
+}
+
+/// `audit-integrity.json` (ADR 0261): the chain's checks, checkpoints and export over the
+/// period, naming CC2.1-2 and CC7.2-2 only while the period shows them holding, and the
+/// period's last checkpoint, which a later check holds the log to.
+#[tokio::test]
+async fn the_audit_logs_guarding_is_evidence_only_while_it_held() {
+    let (port, app, admin, _) = serve_app().await;
+    let p = Period { from: today(), to: today().succ_opt().unwrap() };
+    let inputs = Inputs { sessions: users::SessionConfig::default(), mfa: mfa::Policy::Off };
+    let integrity = |app: &AppState| {
+        let (_, f) = files(&evidence::build(app, &inputs, &p, db::now(), false).tar);
+        (parse(file(&f, "audit-integrity.json")), parse(file(&f, "manifest.json")))
+    };
+    let by = audit::Who::system("audit_checkpoint");
+    app.db.record(&Event::new(Actor::system("test"), "user.created"));
+    crate::audit_chain::daily(&app).await;
+    crate::audit_checkpoint::create(&app, &by, crate::audit_checkpoint::Trigger::Schedule).unwrap();
+
+    // Checked and signed, but nothing ships it off the server: neither row.
+    let (v, m) = integrity(&app);
+    assert_eq!((v["summary"]["exportedEveryEvent"].clone(), v["summary"]["guardedThroughout"].clone()), (json!(false), json!(false)), "{v}");
+    assert_eq!(v["exceptions"]["off"], json!(["export"]));
+    assert_eq!(listed(&m, "audit-integrity.json"), (json!([]), json!([])));
+    assert_eq!((v["checks"][0]["ok"].clone(), v["checks"][0]["whole"].clone(), v["daily"][today().to_string()]["checkpoints"].clone()), (json!(true), json!(true), json!(1)), "{v}");
+
+    // A webhook that fails three times, then takes everything.
+    let token = "siem-token-for-evidence-7c6b5a49";
+    let (url, _) = crate::audit_chain_http_tests::collector(3).await;
+    crate::audit_chain_http_tests::export_to(&app, &[("AUDIT_EXPORT", &url), ("AUDIT_EXPORT_HEADERS", &format!("Authorization=Bearer {token}"))]);
+    let delivered = || app.audit_export.get().is_some_and(|x| x.delivered() >= app.db.audit_head());
+    crate::audit_chain_http_tests::until("recovery", || app.db.audit_events(&Default::default(), 1000, false).iter().any(|e| e.action == "audit.export_recovered")).await;
+    crate::audit_chain::daily(&app).await;
+    let cp = crate::audit_checkpoint::create(&app, &by, crate::audit_checkpoint::Trigger::Schedule).unwrap();
+    crate::audit_chain_http_tests::until("delivery", delivered).await;
+    let (v, m) = integrity(&app);
+    assert_eq!((v["summary"]["exportedEveryEvent"].clone(), v["summary"]["guardedThroughout"].clone()), (json!(true), json!(true)), "{v}");
+    assert_eq!(listed(&m, "audit-integrity.json"), (json!(["CC2.1", "CC7.2"]), json!(["CC2.1-2", "CC7.2-2"])));
+    let sink = &v["export"]["sinks"][0];
+    assert_eq!((sink["kind"].as_str(), sink["deliveredThroughPeriod"].as_bool()), (Some("webhook"), Some(true)), "{v}");
+    let failure = &v["exceptions"]["exportFailures"][0];
+    assert_eq!((failure["kind"].as_str(), failure["reason"].as_str()), (Some("webhook"), Some("delivery_failed")), "{v}");
+    let text = v.to_string();
+    assert!(!text.contains("127.0.0.1") && !text.contains(token) && !text.contains("ingest"), "no sink address or header: {text}");
+    let pin = &v["periodEndCheckpoint"];
+    assert_eq!((pin["event"].as_i64(), pin["seq"].as_i64(), pin["hash"].as_str()), (Some(cp.id), Some(cp.seq), Some(cp.hash.as_str())), "{v}");
+    assert_eq!(pin["signature"].as_str(), Some(cp.signature.as_str()), "the signature survives the bundle's scrubbing");
+    assert_eq!((v["chain"]["head"]["hash"].as_str().map(str::len), v["chain"]["lastCheck"]["ok"].as_bool()), (Some(64), Some(true)), "{v}");
+    let (cut, criteria, rows) = crate::evidence_integrity::begin(&app, &p).finish(&app, Some(app.db.audit_head()), false, db::now());
+    assert_eq!((criteria.len(), rows.len(), cut["summary"]["exportedEveryEvent"].as_bool()), (0, 0, Some(false)), "a scan cut short proves neither: {cut}");
+    assert_eq!(cut["exceptions"]["periodNotFullyRead"].as_array().map(Vec::len), Some(1), "{cut}");
+    let (code, body) = call(port, "GET", &format!("/api/audit/verify?pin={}:{}", cp.seq, cp.hash), &admin, "").await;
+    assert_eq!((code, parse(&body)["pins"][0]["result"].as_str().map(String::from)), (200, Some("match".into())), "the month's pin holds the log: {body}");
+
+    // An earlier period, checked within it and shipped.
+    let earlier = Period { from: today().pred_opt().unwrap(), to: today() };
+    let check = Event::new(Actor::system("audit_chain"), "audit.verified").details(json!({ "ok": true, "checked": 1 }));
+    app.db.record_at(&check, earlier.start_ms() + 12 * 3_600_000).unwrap();
+    crate::audit_chain_http_tests::until("delivery", delivered).await;
+    let before = |app: &AppState| {
+        let (_, f) = files(&evidence::build(app, &inputs, &earlier, db::now(), false).tar);
+        (parse(file(&f, "audit-integrity.json")), parse(file(&f, "manifest.json")))
+    };
+    let (v, m) = before(&app);
+    assert_eq!(listed(&m, "audit-integrity.json"), (json!(["CC2.1", "CC7.2"]), json!(["CC2.1-2", "CC7.2-2"])), "{v}");
+
+    // A row changed: the next check fails, so the log wasn't guarded, though it was shipped.
+    app.db.execute_raw("DROP TRIGGER audit_events_no_update").unwrap();
+    app.db.execute_raw("UPDATE audit_events SET action = 'user.updated' WHERE action = 'user.created'").unwrap();
+    crate::audit_chain::daily(&app).await;
+    crate::audit_chain_http_tests::until("delivery", delivered).await;
+    let (v, m) = integrity(&app);
+    assert_eq!(v["summary"]["guardedThroughout"], false, "{v}");
+    assert_eq!(listed(&m, "audit-integrity.json"), (json!(["CC2.1"]), json!(["CC2.1-2"])));
+    assert_eq!(v["exceptions"]["lastCheckFailed"][0]["reason"], "contents", "{v}");
+    assert_eq!(v["exceptions"]["failedChecks"].as_array().unwrap().len(), 1, "{v}");
+
+    // That later failure takes CC7.2-2 back from the earlier period too.
+    let (v, m) = before(&app);
+    assert_eq!(listed(&m, "audit-integrity.json"), (json!(["CC2.1"]), json!(["CC2.1-2"])), "{v}");
+    assert_eq!((v["chain"]["lastCheck"]["reason"].as_str(), v["chain"]["periodLastCheck"]["ok"].as_bool()), (Some("contents"), Some(true)), "{v}");
+    assert_eq!(v["exceptions"]["lastCheckFailed"][0]["reason"], "contents", "{v}");
 }

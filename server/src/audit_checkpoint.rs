@@ -37,7 +37,7 @@ pub const KEY_ADDED: &str = "audit.checkpoint_key";
 pub const FAILING: &str = "audit.timestamp_failing";
 pub const RECOVERED: &str = "audit.timestamp_recovered";
 /// Events about checkpoints: on their own they don't make another checkpoint due.
-const OWN: [&str; 5] = [CHECKPOINT, TIMESTAMPED, KEY_ADDED, FAILING, RECOVERED];
+pub const OWN: [&str; 5] = [CHECKPOINT, TIMESTAMPED, KEY_ADDED, FAILING, RECOVERED];
 
 const DOMAIN: &str = "superbot-audit-checkpoint-v1";
 /// What the signing key is derived for from the master key's root (ADR 0099).
