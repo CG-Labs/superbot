@@ -319,7 +319,7 @@ pub async fn list(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>)
             if let Some(b) = backups.as_ref().and_then(|b| b.as_array()).and_then(|b| b.iter().find(|x| x["region"] == json!(r))) {
                 v["backups"] = b.clone();
             }
-            if let Some(c) = super::chat_stores::region_view(&app, r) {
+            if let Some(c) = super::chat_stores::region_view(&app, cp, r) {
                 v["chatStore"] = c;
             }
             v
