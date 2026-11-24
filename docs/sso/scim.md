@@ -1,6 +1,6 @@
 # Provision users and teams with SCIM (Entra ID, Okta)
 
-Lets your IdP create SuperBot users when people are assigned the app, keep their name and email current, and disable them when they leave. Disabling ends their sessions at once. With `SCIM_GROUPS=on`, the groups it pushes become [teams](#groups-as-teams), and people join and leave them as the IdP says. With `SCIM_GROUP_ROLES=on` as well, an admin can [map a group to a custom role](#groups-to-roles), or declare it a [role group](#role-groups) that gives a role and isn't a team. The [Enterprise User extension](#enterprise-attributes) (employee number, department, manager, …) is kept for admins and access reviews. Tokens [expire and rotate](#token-expiry-and-rotation). Design: [ADR 0023](../adr/0023-scim.md), [ADR 0095](../adr/0095-scim-groups-as-teams.md), [ADR 0138](../adr/0138-scim-group-role-mapping.md), [ADR 0176](../adr/0176-scim-enterprise-user-extension.md), [ADR 0180](../adr/0180-scim-role-groups.md), [ADR 0196](../adr/0196-scim-token-expiry-and-rotation.md).
+Lets your IdP create SuperBot users when people are assigned the app, keep their name and email current, and disable them when they leave. Disabling ends their sessions at once. With `SCIM_GROUPS=on`, the groups it pushes become [teams](#groups-as-teams), and people join and leave them as the IdP says. With `SCIM_GROUP_ROLES=on` as well, an admin can [map a group to a custom role](#groups-to-roles), or declare it a [role group](#role-groups) that gives a role and isn't a team. The [Enterprise User extension](#enterprise-attributes) (employee number, department, manager, …) is kept for admins and access reviews. Tokens [expire and rotate](#token-expiry-and-rotation), and can be [scoped](#token-scopes) to users or groups, read or write. Design: [ADR 0023](../adr/0023-scim.md), [ADR 0095](../adr/0095-scim-groups-as-teams.md), [ADR 0138](../adr/0138-scim-group-role-mapping.md), [ADR 0176](../adr/0176-scim-enterprise-user-extension.md), [ADR 0180](../adr/0180-scim-role-groups.md), [ADR 0196](../adr/0196-scim-token-expiry-and-rotation.md), [ADR 0224](../adr/0224-scim-token-scopes.md).
 
 SCIM never gives anyone a role above `SCIM_DEFAULT_ROLE` (member, or readonly), never a team role, and never admin; admins promote people as before. The IdP can't name a role: only an admin's mapping can give one. [Bulk](#bulk) is supported, for clients that batch.
 
@@ -31,11 +31,11 @@ botctl scim token create entra --sso entra --label "Entra provisioning"
 # Docker: docker compose exec -e SUPERBOT_PASSWORD botd botctl scim token create entra --sso entra
 ```
 
-It prints an `sbp_…` token **once**. Paste it into the IdP, then forget it. Leave out `--sso` if people sign in with codes, or are linked by hand. A tenant's first token fixes its SSO link; all its tokens share it. It expires in a year (`--days N` for 1 to 730); see [Token expiry and rotation](#token-expiry-and-rotation).
+It prints an `sbp_…` token **once**. Paste it into the IdP, then forget it. Leave out `--sso` if people sign in with codes, or are linked by hand. A tenant's first token fixes its SSO link; all its tokens share it. It expires in a year (`--days N` for 1 to 730); see [Token expiry and rotation](#token-expiry-and-rotation). It can do everything SCIM does unless you [scope](#token-scopes) it, such as `--scopes users:write` for a connection that doesn't push groups.
 
 ```sh
-botctl scim tokens                                   # ids, tenants, last use, expiry and state; never values
-botctl scim token rotate <id>                        # a new token; the old one works 24 more hours
+botctl scim tokens                                   # ids, tenants, scopes, last use, expiry and state; never values
+botctl scim token rotate <id>                        # a new token with the same scopes; the old one works 24 more hours
 botctl scim token revoke <id>                        # its users stay as they are
 ```
 
@@ -56,6 +56,31 @@ A SCIM token can deactivate everyone its tenant provisioned, so it doesn't live 
 | `expired` | Ended; 401 |
 | `revoked` | Revoked; 401 |
 | `no_expiry` | Made before tokens expired; works until rotated or revoked |
+
+## Token scopes
+
+Give each IdP connection only what it needs. A token's **scopes** say which SCIM requests it may send; everything else about SCIM (tenants, the rate limit, `SCIM_GROUPS`, `SCIM_GROUP_ROLES`, never a role from the IdP) is unchanged. Design: [ADR 0224](../adr/0224-scim-token-scopes.md).
+
+| Scope | Allows |
+|-------|--------|
+| `users:read` | Listing, filtering and reading users |
+| `users:write` | Creating, updating, deactivating and deleting users, and reading them |
+| `groups:read` | Listing and reading groups |
+| `groups:write` | Creating, updating and deleting groups and their members, and reading them |
+
+```sh
+botctl scim token create entra --sso entra --scopes users:write             # people only: no teams, so no roles through groups
+botctl scim token create audit --scopes users:read,groups:read               # a governance or reconciliation tool: can't deprovision anyone
+botctl scim token rotate <id> --scopes users:write                           # narrow (or widen) a token: the new one has these scopes
+```
+
+- **Default: all four.** Left out (`scopes` on `POST /api/scim/tokens`), a token can do everything, as before. The console's SCIM form offers **Users and groups**, **Users only** and **Read only**; other combinations are `botctl` or the API. A write scope includes its read, and is listed with it.
+- **Discovery is open.** `ServiceProviderConfig`, `ResourceTypes` and `Schemas` answer any valid token, so the IdP's **Test Connection** works whatever the scopes. Any other path outside `/Users`, `/Groups` and `/Bulk` is refused to a token without every scope.
+- **Refused requests** get `403` with the SCIM error schema, a detail naming the scope missing, and `WWW-Authenticate: Bearer error="insufficient_scope", scope="groups:write"`. They're audited as `scim.request_failed` with `reason: "insufficient_scope"` and `scope`, and count in the [health score](../support/health-score.md#identity). In [Bulk](#bulk), each operation is checked as its own request would be: a users-only token's group operations get a `403` result each, and the rest run.
+- **A users-only token on a connection that pushes groups** fails every group push. Turn group provisioning off in the IdP (Entra: **Mappings → Provision Microsoft Entra ID Groups → Enabled: No**; Okta: leave **Push Groups** off), or rotate the token with `--scopes users:write,groups:write`.
+- **Rotation keeps the scopes** unless `--scopes` (or `scopes` on `POST /api/scim/tokens/<id>/rotate`) says otherwise. A token's scopes never change in place.
+- **Tokens from before scopes** have all four, and are listed so. Rotate them with `--scopes` to narrow them.
+- **Audit.** `scim.token_created` and `scim.token_rotated` record `scopes`, and a rotation that changes them, `oldScopes`.
 
 ## 3a. Microsoft Entra ID
 
@@ -108,7 +133,7 @@ Google pushes SCIM only to apps in its own catalog, so botd reads the Workspace 
 
 **One person, one user.** Email never matches people. If a SuperBot user already has the email, the IdP gets a 409: link that user's SSO identity (`botctl user link <user> <provider> <subject>`) and retry, or change one of the emails. The owner account is never managed by SCIM.
 
-**Audit.** Every change is logged with the token as the actor: `botctl audit --method scim_token`, or `--actor system:scim:<token id>`. Each deactivation or deletion also records `user.deprovisioned`, with the Bots it stopped and what happened to the machine (`suspended`, `held` until it finishes building, `failed` and retried by the reconciler, `already_suspended`, `kept`, or `none`). Bad tokens are logged as `scim.auth_failed` (throttled), with `reason` `missing`, `unknown`, `revoked`, or `expired`; a revoked or expired token names which one (and `rotatedTo`, the token that replaced it), so you can find the IdP still sending it. Tokens are logged as `scim.token_created`, `scim.token_rotated` (with `oldEndsAt`), `scim.token_revoked`, `scim.token_expiring` and `scim.token_expired`. A request with a valid token that's refused or fails (not a 404) is logged as `scim.request_failed` with its `status`, `reason` (the `scimType` in snake case, such as `uniqueness` or `invalid_value`, or `status_<code>`), `method` and `resource`, never its body; the [customer health score](../support/health-score.md#identity) counts them. Tokens themselves never are logged.
+**Audit.** Every change is logged with the token as the actor: `botctl audit --method scim_token`, or `--actor system:scim:<token id>`. Each deactivation or deletion also records `user.deprovisioned`, with the Bots it stopped and what happened to the machine (`suspended`, `held` until it finishes building, `failed` and retried by the reconciler, `already_suspended`, `kept`, or `none`). Bad tokens are logged as `scim.auth_failed` (throttled), with `reason` `missing`, `unknown`, `revoked`, or `expired`; a revoked or expired token names which one (and `rotatedTo`, the token that replaced it), so you can find the IdP still sending it. Tokens are logged as `scim.token_created` (with `scopes`), `scim.token_rotated` (with `oldEndsAt`, `scopes`, and `oldScopes` when they change), `scim.token_revoked`, `scim.token_expiring` and `scim.token_expired`. A request with a valid token that's refused or fails (not a 404) is logged as `scim.request_failed` with its `status`, `reason` (`insufficient_scope` with the `scope` the token lacks, the `scimType` in snake case, such as `uniqueness` or `invalid_value`, or `status_<code>`), `method` and `resource`, never its body; the [customer health score](../support/health-score.md#identity) counts them. Tokens themselves never are logged.
 
 ## Enterprise attributes
 
@@ -176,7 +201,7 @@ The IdP takes the team on when it pushes the group with that `externalId` (or, w
 }
 ```
 
-**Each operation is its own request.** It goes through exactly what `POST /Users`, `PATCH /Groups/<id>` and the rest would do, with the same token: the same checks, the same tenant (another tenant's user or group is 404), the same deprovisioning when someone is deactivated or deleted, and the same audit events. Group operations need `SCIM_GROUPS=on`, as without Bulk.
+**Each operation is its own request.** It goes through exactly what `POST /Users`, `PATCH /Groups/<id>` and the rest would do, with the same token: the same checks, the same tenant (another tenant's user or group is 404), the same deprovisioning when someone is deactivated or deleted, and the same audit events. Group operations need `SCIM_GROUPS=on`, as without Bulk, and every operation needs its write [scope](#token-scopes) (`users:write` or `groups:write`).
 
 **What runs, and in what order.**
 
@@ -266,6 +291,7 @@ Bulk: at most 100 operations (`maxOperations`) and 1 MiB (`maxPayloadSize`) a re
 - **404 on every request**: `SCIM=on` isn't set, or botd wasn't restarted.
 - **401**: the token is wrong, revoked, or expired (`botctl audit --action scim.auth_failed` says which). Make a new one, or rotate a working one; check the IdP sends `Authorization: Bearer sbp_…`.
 - **401 just after a rotation**: the overlap ended before the IdP got the new token. Paste the new one into the IdP; if it's lost, rotate again (rotate the new token, which still works) or make one with `botctl scim token create`.
+- **403 "This SCIM token's scopes (…) don't include …"**: the token can't do that; see [Token scopes](#token-scopes). Usually a users-only token on a connection that pushes groups: turn group provisioning off in the IdP, or rotate the token with the scope it needs (`botctl scim token rotate <id> --scopes users:write,groups:write`).
 - **403 "Unknown Host"**: add the public hostname to `ALLOWED_HOSTS` (Compose adds `SUPERBOT_DOMAIN`).
 - **400 "externalId is required" or "externalId: …"**: the tenant links SSO, and the IdP didn't send the person's subject. Entra: map **objectId** to **externalId**.
 - **409 "Another SuperBot user has this email"**: see *One person, one user* above.
