@@ -2,11 +2,12 @@
 //! sends us, or an `EncryptedID` (ADR 0151), with our own SP encryption key, and nothing looser.
 //!
 //! It takes only what is still sound: AES-GCM for the assertion (XML Encryption 1.1), and
-//! RSA-OAEP for the key that encrypts it. AES-CBC and Triple DES are refused (the CBC padding
-//! oracle of "How to Break XML Encryption", and the backwards-compatibility attack that turns
-//! a GCM key into a CBC oracle), as is RSA PKCS #1 v1.5 key transport (Bleichenbacher's
-//! oracle). Every algorithm is checked before anything is decrypted, so a refusal never
-//! depends on a secret.
+//! RSA-OAEP for the key that encrypts it. AES-CBC is refused (the CBC padding oracle of "How
+//! to Break XML Encryption", and the backwards-compatibility attack that turns a GCM key into
+//! a CBC oracle) unless the caller has verified the IdP's signature over the ciphertext
+//! (`Cbc::Signed`, ADR 0218): then nobody can change it to probe the padding. Triple DES is
+//! always refused, as is RSA PKCS #1 v1.5 key transport (Bleichenbacher's oracle). Every
+//! algorithm is checked before anything is decrypted, so a refusal never depends on a secret.
 //!
 //! Decryption itself fails one way only, `bad_encryption`: a content key that doesn't decrypt,
 //! or decrypts to the wrong length, is replaced by a random one, so a bad key and a bad
@@ -20,6 +21,8 @@
 use super::jwt::Invalid;
 use super::xmldsig::{self, DSIG, elements, is};
 use aws_lc_rs::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
+use aws_lc_rs::cipher::{self, DecryptionContext, PaddedBlockDecryptingKey, UnboundCipherKey};
+use aws_lc_rs::iv::FixedLength;
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use aws_lc_rs::rsa::{OAEP_SHA1_MGF1SHA1, OAEP_SHA256_MGF1SHA256, OAEP_SHA384_MGF1SHA384, OAEP_SHA512_MGF1SHA512, OaepAlgorithm, OaepPrivateDecryptingKey};
 use roxmltree::Node;
@@ -33,7 +36,7 @@ pub const AES192_GCM: &str = "http://www.w3.org/2009/xmlenc11#aes192-gcm";
 pub const AES256_GCM: &str = "http://www.w3.org/2009/xmlenc11#aes256-gcm";
 pub const AES128_CBC: &str = "http://www.w3.org/2001/04/xmlenc#aes128-cbc";
 pub const AES256_CBC: &str = "http://www.w3.org/2001/04/xmlenc#aes256-cbc";
-const AES192_CBC: &str = "http://www.w3.org/2001/04/xmlenc#aes192-cbc";
+pub const AES192_CBC: &str = "http://www.w3.org/2001/04/xmlenc#aes192-cbc";
 const TRIPLEDES_CBC: &str = "http://www.w3.org/2001/04/xmlenc#tripledes-cbc";
 /// RSA-OAEP with MGF1-SHA1; its digest defaults to SHA-1 (XML Encryption 1.0).
 pub const RSA_OAEP_MGF1P: &str = "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p";
@@ -52,21 +55,62 @@ const MGF1_SHA512: &str = "http://www.w3.org/2009/xmlenc11#mgf1sha512";
 const MAX_KEYS: usize = 4;
 const GCM_IV: usize = 12;
 const GCM_TAG: usize = 16;
+const AES_BLOCK: usize = 16;
 
 fn bad() -> Invalid {
     Invalid("bad_encryption")
 }
 
-/// The AES-GCM `EncryptionMethod` of the data. CBC modes are weak, anything else unknown.
-fn content_cipher(method: Node) -> Result<&'static aead::Algorithm, Invalid> {
+/// Whether AES-CBC content may be decrypted (ADR 0218). CBC carries no integrity of its own, so
+/// whoever can change the ciphertext and watch what happens can read it, a byte at a time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Cbc {
+    /// Refused as `weak_algorithm`: the default, and always for an `EncryptedID`.
+    Refused,
+    /// The provider takes it, but no verified signature of the IdP covers this ciphertext:
+    /// refused as `cbc_unsigned_response`.
+    Unsigned,
+    /// The IdP's verified signature covers the ciphertext and its keys, so nobody can change them.
+    Signed,
+}
+
+enum Content {
+    Gcm(&'static aead::Algorithm),
+    /// The cipher, and its key length.
+    Cbc(&'static cipher::Algorithm, usize),
+}
+
+impl Content {
+    fn key_len(&self) -> usize {
+        match self {
+            Content::Gcm(a) => a.key_len(),
+            Content::Cbc(_, len) => *len,
+        }
+    }
+}
+
+/// The content `EncryptionMethod` of the data, and its name for the audit log: AES-GCM, or
+/// AES-CBC as `cbc` allows. Triple DES is weak, anything else unknown.
+fn content_cipher(method: Node, cbc: Cbc) -> Result<(Content, &'static str), Invalid> {
     if !is(method, XENC, "EncryptionMethod") || !elements(method).is_empty() {
         return Err(bad());
     }
-    match method.attribute("Algorithm") {
-        Some(AES128_GCM) => Ok(&aead::AES_128_GCM),
-        Some(AES192_GCM) => Ok(&aead::AES_192_GCM),
-        Some(AES256_GCM) => Ok(&aead::AES_256_GCM),
-        Some(AES128_CBC | AES192_CBC | AES256_CBC | TRIPLEDES_CBC) => Err(Invalid("weak_algorithm")),
+    let alg = method.attribute("Algorithm");
+    if matches!(alg, Some(AES128_CBC | AES192_CBC | AES256_CBC)) {
+        match cbc {
+            Cbc::Refused => return Err(Invalid("weak_algorithm")),
+            Cbc::Unsigned => return Err(Invalid("cbc_unsigned_response")),
+            Cbc::Signed => {}
+        }
+    }
+    match alg {
+        Some(AES128_GCM) => Ok((Content::Gcm(&aead::AES_128_GCM), "aes128-gcm")),
+        Some(AES192_GCM) => Ok((Content::Gcm(&aead::AES_192_GCM), "aes192-gcm")),
+        Some(AES256_GCM) => Ok((Content::Gcm(&aead::AES_256_GCM), "aes256-gcm")),
+        Some(AES128_CBC) => Ok((Content::Cbc(&cipher::AES_128, cipher::AES_128_KEY_LEN), "aes128-cbc")),
+        Some(AES192_CBC) => Ok((Content::Cbc(&cipher::AES_192, cipher::AES_192_KEY_LEN), "aes192-cbc")),
+        Some(AES256_CBC) => Ok((Content::Cbc(&cipher::AES_256, cipher::AES_256_KEY_LEN), "aes256-cbc")),
+        Some(TRIPLEDES_CBC) => Err(Invalid("weak_algorithm")),
         _ => Err(Invalid("bad_algorithm")),
     }
 }
@@ -127,12 +171,22 @@ fn encrypted_key(k: Node) -> Result<(&'static OaepAlgorithm, Vec<u8>), Invalid> 
     Ok((alg, cipher_value(value.ok_or_else(bad)?)?))
 }
 
+/// What `decrypt` opened.
+pub struct Opened {
+    /// The serialized element, still to be checked.
+    pub plaintext: Zeroizing<Vec<u8>>,
+    /// Which of our keys opened it.
+    pub key: usize,
+    /// The content cipher, as XML Encryption names it (`aes256-gcm`, `aes256-cbc`).
+    pub cipher: &'static str,
+}
+
 /// Decrypts `encrypted` (a `saml:EncryptedAssertion` or `EncryptedID`) with one of `ours` (several
 /// during a rollover of our key, ADR 0181). Its children are one `EncryptedData` and, beside it
 /// or in its `KeyInfo`, the `EncryptedKey`s that carry its content key. Every key of ours is
-/// tried on every `EncryptedKey`, so the work doesn't depend on which one opens. Returns the
-/// plaintext (the serialized element, still to be checked) and the index of the key that opened it.
-pub fn decrypt(encrypted: Node, ours: &[&OaepPrivateDecryptingKey]) -> Result<(Zeroizing<Vec<u8>>, usize), Invalid> {
+/// tried on every `EncryptedKey`, so the work doesn't depend on which one opens. AES-CBC content
+/// is opened only as `cbc` says.
+pub fn decrypt(encrypted: Node, ours: &[&OaepPrivateDecryptingKey], cbc: Cbc) -> Result<Opened, Invalid> {
     let mut data = None;
     let mut keys = Vec::new();
     for c in elements(encrypted) {
@@ -148,15 +202,15 @@ pub fn decrypt(encrypted: Node, ours: &[&OaepPrivateDecryptingKey]) -> Result<(Z
     if data.attribute("Type").is_some_and(|t| t != ELEMENT) {
         return Err(bad());
     }
-    let (method, key_info, cipher) = match elements(data).as_slice() {
+    let (method, key_info, cipher_data) = match elements(data).as_slice() {
         [m, c] => (*m, None, *c),
         [m, k, c] if is(*k, DSIG, "KeyInfo") => (*m, Some(*k), *c),
         _ => return Err(bad()),
     };
-    if !is(cipher, XENC, "CipherData") {
+    if !is(cipher_data, XENC, "CipherData") {
         return Err(bad());
     }
-    let cipher_alg = content_cipher(method)?;
+    let (content, cipher) = content_cipher(method, cbc)?;
     for c in key_info.map(elements).unwrap_or_default() {
         match (c.tag_name().namespace(), c.tag_name().name()) {
             (Some(XENC), "EncryptedKey") => keys.push(c),
@@ -169,12 +223,8 @@ pub fn decrypt(encrypted: Node, ours: &[&OaepPrivateDecryptingKey]) -> Result<(Z
     }
     let keys: Vec<(&OaepAlgorithm, Vec<u8>)> = keys.into_iter().map(encrypted_key).collect::<Result<_, _>>()?;
     // Opened in place: the plaintext never leaves this zeroizing buffer.
-    let mut sealed = Zeroizing::new(cipher_value(cipher)?);
-    if sealed.len() < GCM_IV + GCM_TAG {
-        return Err(bad());
-    }
-
-    let len = cipher_alg.key_len();
+    let mut sealed = Zeroizing::new(cipher_value(cipher_data)?);
+    let len = content.key_len();
     let mut content_key = Zeroizing::new(vec![0u8; len]);
     SystemRandom::new().fill(&mut content_key).map_err(|_| bad())?;
     let mut found = None;
@@ -190,13 +240,31 @@ pub fn decrypt(encrypted: Node, ours: &[&OaepPrivateDecryptingKey]) -> Result<(Z
             }
         }
     }
-    let opener = LessSafeKey::new(UnboundKey::new(cipher_alg, &content_key).map_err(|_| bad())?);
-    let (iv, body) = sealed.split_at_mut(GCM_IV);
-    let nonce = Nonce::try_assume_unique_for_key(iv).map_err(|_| bad())?;
-    let n = opener.open_in_place(nonce, Aad::empty(), body).map_err(|_| bad())?.len();
-    sealed.copy_within(GCM_IV..GCM_IV + n, 0);
+    let (iv_len, n) = match content {
+        Content::Gcm(alg) => {
+            if sealed.len() < GCM_IV + GCM_TAG {
+                return Err(bad());
+            }
+            let opener = LessSafeKey::new(UnboundKey::new(alg, &content_key).map_err(|_| bad())?);
+            let (iv, body) = sealed.split_at_mut(GCM_IV);
+            let nonce = Nonce::try_assume_unique_for_key(iv).map_err(|_| bad())?;
+            (GCM_IV, opener.open_in_place(nonce, Aad::empty(), body).map_err(|_| bad())?.len())
+        }
+        // The IV, then whole blocks. XML Encryption pads like ISO 10126: only the last byte (the
+        // padding's length) means anything, so only it is checked.
+        Content::Cbc(alg, _) => {
+            if found.is_none() || sealed.len() < 2 * AES_BLOCK || sealed.len() % AES_BLOCK != 0 {
+                return Err(bad());
+            }
+            let opener = PaddedBlockDecryptingKey::cbc_iso10126(UnboundCipherKey::new(alg, &content_key).map_err(|_| bad())?).map_err(|_| bad())?;
+            let (iv, body) = sealed.split_at_mut(AES_BLOCK);
+            let iv: [u8; AES_BLOCK] = (*iv).try_into().map_err(|_| bad())?;
+            (AES_BLOCK, opener.decrypt(body, DecryptionContext::Iv128(FixedLength::from(iv))).map_err(|_| bad())?.len())
+        }
+    };
+    sealed.copy_within(iv_len..iv_len + n, 0);
     sealed.truncate(n);
-    Ok((sealed, found.unwrap_or(0)))
+    Ok(Opened { plaintext: sealed, key: found.unwrap_or(0), cipher })
 }
 
 #[cfg(test)]
@@ -211,7 +279,8 @@ pub mod test_encrypter {
 
     #[derive(Clone)]
     pub struct Encrypt {
-        /// The data's `EncryptionMethod`; only the GCM ones really encrypt.
+        /// The data's `EncryptionMethod`; the AES-GCM and AES-CBC ones really encrypt, others
+        /// are named over AES-GCM.
         pub data_alg: String,
         /// The key's `EncryptionMethod` and what goes in it.
         pub key_alg: String,
@@ -257,12 +326,37 @@ pub mod test_encrypter {
         STANDARD.encode([iv.as_slice(), &body].concat())
     }
 
+    /// `plaintext` under AES-CBC with `content_key`, as .NET's `EncryptedXml` does it (Entra ID,
+    /// ADFS): a random IV, then the ciphertext of the plaintext padded with random bytes and
+    /// the padding's length (ISO 10126).
+    pub fn seal_cbc(content_key: &[u8], plaintext: &[u8]) -> String {
+        use aws_lc_rs::cipher::{AES_128, AES_192, AES_256, EncryptingKey, EncryptionContext};
+        let alg = match content_key.len() {
+            16 => &AES_128,
+            24 => &AES_192,
+            _ => &AES_256,
+        };
+        let pad = AES_BLOCK - plaintext.len() % AES_BLOCK;
+        let mut filler = vec![0u8; pad - 1];
+        SystemRandom::new().fill(&mut filler).unwrap();
+        let mut body = [plaintext, &filler, &[pad as u8]].concat();
+        let mut iv = [0u8; AES_BLOCK];
+        SystemRandom::new().fill(&mut iv).unwrap();
+        let key = EncryptingKey::cbc(UnboundCipherKey::new(alg, content_key).unwrap()).unwrap();
+        key.less_safe_encrypt(&mut body, EncryptionContext::Iv128(FixedLength::from(iv))).unwrap();
+        STANDARD.encode([iv.as_slice(), &body].concat())
+    }
+
     pub fn key_len(data_alg: &str) -> usize {
         match data_alg {
             AES128_GCM | AES128_CBC => 16,
-            AES192_GCM => 24,
+            AES192_GCM | AES192_CBC => 24,
             _ => 32,
         }
+    }
+
+    fn is_cbc(data_alg: &str) -> bool {
+        matches!(data_alg, AES128_CBC | AES192_CBC | AES256_CBC)
     }
 
     impl Encrypt {
@@ -295,7 +389,7 @@ pub mod test_encrypter {
 
         fn encrypt_element(&self, element: &str, plaintext: &str, cert_b64: &str, content_key: &[u8]) -> String {
             let ek = self.encrypted_key(cert_b64, content_key);
-            let value = seal(content_key, plaintext.as_bytes());
+            let value = if is_cbc(&self.data_alg) { seal_cbc(content_key, plaintext.as_bytes()) } else { seal(content_key, plaintext.as_bytes()) };
             let (inside, beside) = if self.key_inside { (format!(r#"<ds:KeyInfo xmlns:ds="{DSIG}">{ek}</ds:KeyInfo>"#), String::new()) } else { (String::new(), ek) };
             format!(
                 r#"<{element}><xenc:EncryptedData xmlns:xenc="{XENC}" Type="{ELEMENT}"><xenc:EncryptionMethod Algorithm="{}"/>{inside}<xenc:CipherData><xenc:CipherValue>{value}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>{beside}</{element}>"#,
@@ -326,10 +420,14 @@ mod tests {
     }
 
     fn open_with(xml: &str, ours: &[&SpKey]) -> Result<(String, usize), &'static str> {
+        open_cbc(xml, ours, Cbc::Refused).map(|(p, i, _)| (p, i))
+    }
+
+    fn open_cbc(xml: &str, ours: &[&SpKey], cbc: Cbc) -> Result<(String, usize, &'static str), &'static str> {
         let doc = roxmltree::Document::parse(xml).map_err(|_| "xml")?;
         let enc = doc.descendants().find(|n| n.tag_name().name() == "EncryptedAssertion").unwrap();
         let ours: Vec<_> = ours.iter().map(|k| k.decrypting().unwrap()).collect();
-        decrypt(enc, &ours).map(|(p, i)| (String::from_utf8(p.to_vec()).unwrap(), i)).map_err(|e| e.0)
+        decrypt(enc, &ours, cbc).map(|o| (String::from_utf8(o.plaintext.to_vec()).unwrap(), o.key, o.cipher)).map_err(|e| e.0)
     }
 
     fn sealed(e: &Encrypt) -> String {
@@ -389,6 +487,59 @@ mod tests {
         let weak = Encrypt { key_alg: RSA_1_5.into(), ..Default::default() }.encrypted_key(&key.cert, &[0; 32]);
         let two = xml.replacen("</xenc:EncryptedData>", &format!("</xenc:EncryptedData>{weak}"), 1);
         assert_eq!(open(&two, key), Err("weak_key_transport"));
+    }
+
+    #[test]
+    fn decrypts_aes_cbc_only_under_the_idps_signature() {
+        let [key, other] = keys();
+        for (data_alg, name) in [(AES128_CBC, "aes128-cbc"), (AES192_CBC, "aes192-cbc"), (AES256_CBC, "aes256-cbc")] {
+            for key_inside in [true, false] {
+                let xml = sealed(&Encrypt { data_alg: data_alg.into(), key_inside, ..Default::default() });
+                assert_eq!(open_cbc(&xml, &[key], Cbc::Signed), Ok((ASSERTION.to_string(), 0, name)), "{data_alg} {key_inside}");
+                assert_eq!(open_cbc(&xml, &[key], Cbc::Refused), Err("weak_algorithm"), "{data_alg}: off by default");
+                assert_eq!(open_cbc(&xml, &[key], Cbc::Unsigned), Err("cbc_unsigned_response"), "{data_alg}: nothing the IdP signed covers it");
+            }
+        }
+        // Every plaintext length pads to whole blocks, a full block of padding included.
+        for n in [0, 1, 15, 16, 17, 31, 32] {
+            let plaintext = format!("{ASSERTION}{}", " ".repeat(n));
+            let xml = format!("{WRAP}{}</r>", Encrypt { data_alg: AES256_CBC.into(), ..Default::default() }.encrypt(&plaintext, &key.cert));
+            assert_eq!(open_cbc(&xml, &[key], Cbc::Signed).map(|(p, ..)| p), Ok(plaintext), "{n} more bytes");
+        }
+        // GCM is unchanged, and Triple DES is refused however it's signed.
+        assert_eq!(open_cbc(&sealed(&Encrypt::default()), &[key], Cbc::Signed).map(|(.., c)| c), Ok("aes256-gcm"));
+        assert_eq!(open_cbc(&sealed(&Encrypt { data_alg: TRIPLEDES_CBC.into(), ..Default::default() }), &[key], Cbc::Signed), Err("weak_algorithm"));
+        // RSA PKCS #1 v1.5 stays refused under CBC too.
+        let v15 = sealed(&Encrypt { data_alg: AES256_CBC.into(), key_alg: RSA_1_5.into(), ..Default::default() });
+        assert_eq!(open_cbc(&v15, &[key], Cbc::Signed), Err("weak_key_transport"));
+        // A rollover's other key opens it and says which.
+        let xml = sealed(&Encrypt { data_alg: AES256_CBC.into(), ..Default::default() });
+        assert_eq!(open_cbc(&xml, &[other, key], Cbc::Signed).map(|(_, i, _)| i), Ok(1));
+        assert_eq!(open_cbc(&xml, &[other], Cbc::Signed), Err("bad_encryption"), "encrypted to someone else");
+    }
+
+    #[test]
+    fn cbc_is_malleable_which_is_why_it_needs_the_signature() {
+        let key = &keys()[0];
+        let xml = sealed(&Encrypt { data_alg: AES256_CBC.into(), ..Default::default() });
+        let value = xml.rsplit("<xenc:CipherValue>").next().unwrap().split('<').next().unwrap();
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, value).unwrap();
+        let with = |bytes: &[u8]| xml.replace(value, &base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes));
+        // Flipping a bit of one block flips the same bit of the next block's plaintext: no tag
+        // notices. Here it zeroes the padding length, which only the padding check catches.
+        let pad = (AES_BLOCK - ASSERTION.len() % AES_BLOCK) as u8;
+        let mut flipped = bytes.clone();
+        let last_of_previous = flipped.len() - AES_BLOCK - 1;
+        flipped[last_of_previous] ^= pad;
+        assert_eq!(open_cbc(&with(&flipped), &[key], Cbc::Signed), Err("bad_encryption"));
+        // A flip in the IV changes the first character, with nothing to say so.
+        let mut changed = bytes.clone();
+        changed[0] ^= 1;
+        let (p, ..) = open_cbc(&with(&changed), &[key], Cbc::Signed).unwrap();
+        assert_eq!(p, ASSERTION.replacen('<', "=", 1));
+        // Not whole blocks, or no more than an IV: refused before decrypting.
+        assert_eq!(open_cbc(&with(&bytes[..bytes.len() - 1]), &[key], Cbc::Signed), Err("bad_encryption"));
+        assert_eq!(open_cbc(&with(&bytes[..AES_BLOCK]), &[key], Cbc::Signed), Err("bad_encryption"));
     }
 
     #[test]
