@@ -166,6 +166,7 @@ fn every_link_in_the_playbooks_resolves() {
     files.push(repo().join("docs/adr/0201-incident-review-drafts.md"));
     files.push(repo().join("docs/adr/0211-support-readiness-check.md"));
     files.push(repo().join("docs/adr/0220-support-bundle-triage.md"));
+    files.push(repo().join("docs/adr/0233-onboarding-check.md"));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links:\n{}", bad.join("\n"));
 }
@@ -450,5 +451,33 @@ fn the_triage_page_documents_every_option_and_finding() {
     }
     for (name, needle) in [("README.md", "(triage.md"), ("support-bundle.md", "botctl support-triage"), ("escalation.md", "botctl support-triage")] {
         assert!(read(name).contains(needle), "{name} doesn't point at bundle triage");
+    }
+}
+
+#[test]
+fn the_onboarding_check_page_documents_every_item_status_and_option() {
+    let full = fs::read_to_string(repo().join("server/src/onboarding.rs")).unwrap();
+    let code = full.split("#[cfg(test)]\nmod tests").next().unwrap();
+    let page = read("onboarding-check.md");
+    let ids: Vec<&str> = code.split("    item(\"").skip(1).map(|r| r.split('"').next().unwrap()).collect();
+    assert_eq!(ids.len(), 32, "the items: {ids:?}");
+    for id in &ids {
+        assert!(page.contains(&format!("| `{id}` |")), "onboarding-check.md doesn't explain the {id} item");
+    }
+    let as_str = code.split("pub fn as_str").nth(1).unwrap().split("\n    }\n").next().unwrap();
+    let statuses: Vec<&str> = as_str.split("=> \"").skip(1).map(|r| r.split('"').next().unwrap()).collect();
+    assert_eq!(statuses, ["done", "open", "confirm", "n/a", "skipped"], "the statuses");
+    for s in &statuses {
+        assert!(page.contains(&format!("| `{s}` |")), "onboarding-check.md doesn't explain {s}");
+    }
+    let botctl = fs::read_to_string(repo().join("server/src/bin/botctl.rs")).unwrap();
+    let usage = botctl.lines().find(|l| l.contains("botctl onboarding [")).expect("botctl's usage has onboarding");
+    for o in ["--skip", "markdown", "json"] {
+        assert!(usage.contains(o), "botctl's usage lacks {o}");
+        assert!(page.contains(&format!("| `{o}")), "onboarding-check.md doesn't explain {o}");
+    }
+    assert!(page.contains("support.onboarding_checked") && page.contains("GET /api/support/onboarding"), "the audit action and the route");
+    for (name, needle) in [("README.md", "(onboarding-check.md"), ("onboarding.md", "botctl onboarding"), ("tam.md", "botctl onboarding")] {
+        assert!(read(name).contains(needle), "{name} doesn't point at the onboarding check");
     }
 }

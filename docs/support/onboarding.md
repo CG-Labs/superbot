@@ -1,6 +1,6 @@
 # Onboarding and success
 
-How a new customer goes from signed to live, and how they're looked after once they are. Each checklist links the guide that does the work; this page doesn't repeat them. For managed plans the Provider does the server-side items and the customer does the identity provider's; for self-host and Enterprise deployments, agree who does what at kickoff. Tick each box in the customer's onboarding record, not here.
+How a new customer goes from signed to live, and how they're looked after once they are. Each checklist links the guide that does the work; this page doesn't repeat them. For managed plans the Provider does the server-side items and the customer does the identity provider's; for self-host and Enterprise deployments, agree who does what at kickoff. Tick each box in the customer's onboarding record, not here. `botctl onboarding` shows which boxes botd already sees done, what's open with its guide, and what's left to confirm with the customer ([onboarding check](onboarding-check.md)); run it at kickoff, weekly, and before go-live.
 
 ## 1. Kickoff
 
@@ -53,6 +53,8 @@ Within 5 business days of signing (Enterprise: led by the technical account mana
 - [ ] A first support bundle made and read with the customer, so both sides know what one looks like ([support bundle](support-bundle.md)).
 - [ ] The pilot team uses it for a week; their questions go into the first review.
 - [ ] Go-live confirmed in writing, with the support channels and escalation contacts.
+
+Before confirming go-live, `botctl onboarding` should show nothing open, with every item it lists to confirm confirmed with the customer.
 
 ## Success cadence
 
